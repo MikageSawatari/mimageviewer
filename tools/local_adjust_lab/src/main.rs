@@ -15,8 +15,8 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
-    AnamorphicFlareParams, ArtisticMediaMode, ArtisticMediaParams, BloomParams, BlurParams,
-    BrushStrokeMode, BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams,
+    AnamorphicFlareParams, ArtisticMediaMode, ArtisticMediaParams, AuroraParams, BloomParams,
+    BlurParams, BrushStrokeMode, BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams,
     ClarityParams, CloudFogMode, CloudFogParams, CmykPlateShiftParams, ColorBalanceParams,
     ColorBalanceRange, ColorDodgeGlowParams, ColorFillParams, ColorGradeWheel, ColorHalftoneParams,
     ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask,
@@ -1053,6 +1053,7 @@ enum EffectKind {
     CloudFog,
     WaterCaustics,
     ParticleOverlay,
+    Aurora,
     Spotlight,
     Vignette,
     FilmGrain,
@@ -1085,6 +1086,8 @@ enum RgbPickTarget {
     SpeedLinesColor,
     CloudFogColor,
     ParticleOverlayColor,
+    AuroraColor,
+    AuroraSecondaryColor,
     SpotlightTint,
     OutlineStrokeColor,
     RimLightColor,
@@ -1110,6 +1113,8 @@ impl RgbPickTarget {
             Self::SpeedLinesColor => "集中線/スピード線の線色",
             Self::CloudFogColor => "雲/霧の色",
             Self::ParticleOverlayColor => "雨/雪/花びらの色",
+            Self::AuroraColor => "オーロラの主色",
+            Self::AuroraSecondaryColor => "オーロラの副色",
             Self::SpotlightTint => "スポットライトの光色",
             Self::OutlineStrokeColor => "縁取りの線色",
             Self::RimLightColor => "リムライトの光色",
@@ -1197,6 +1202,7 @@ impl EffectKind {
             LocalEffect::CloudFog(_) => Self::CloudFog,
             LocalEffect::WaterCaustics(_) => Self::WaterCaustics,
             LocalEffect::ParticleOverlay(_) => Self::ParticleOverlay,
+            LocalEffect::Aurora(_) => Self::Aurora,
             LocalEffect::Spotlight(_) => Self::Spotlight,
             LocalEffect::Vignette(_) => Self::Vignette,
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
@@ -1290,6 +1296,7 @@ impl EffectKind {
             Self::CloudFog => "雲/霧",
             Self::WaterCaustics => "水中コースティクス",
             Self::ParticleOverlay => "雨/雪/花びら",
+            Self::Aurora => "オーロラ",
             Self::Spotlight => "スポットライト",
             Self::Vignette => "ビネット",
             Self::FilmGrain => "フィルム粒子",
@@ -1319,6 +1326,7 @@ impl EffectKind {
             Self::AnamorphicFlare => "アナモルフフレア",
             Self::WaterCaustics => "水中光網",
             Self::ParticleOverlay => "天候粒子",
+            Self::Aurora => "オーロラ",
             _ => self.label(),
         }
     }
@@ -1469,6 +1477,7 @@ impl EffectKind {
                 "水面越しの揺らぐ光網を重ね、水中やプール、反射光の演出を作ります。"
             }
             Self::ParticleOverlay => "雨、雪、花びらの粒子を重ね、天候や舞い散る演出を作ります。",
+            Self::Aurora => "縦に揺れる発光カーテンを重ね、夜空や幻想的な背景の光を作ります。",
             Self::Spotlight => "指定した中心を照らし、周辺を落として局所的な光を作ります。",
             Self::Vignette => "周辺を暗く、または明るくして視線を中央へ誘導します。",
             Self::FilmGrain => "粒状感を加え、フィルムや紙っぽい質感を作ります。",
@@ -1664,6 +1673,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::CloudFog,
             EffectKind::WaterCaustics,
             EffectKind::ParticleOverlay,
+            EffectKind::Aurora,
             EffectKind::Spotlight,
             EffectKind::StarGlow,
             EffectKind::Vignette,
@@ -8611,6 +8621,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
             particle_overlay_mode_label(params.mode),
             params.strength * 100.0
         ),
+        LocalEffect::Aurora(params) => format!("オーロラ {:.0}%", params.strength * 100.0),
         LocalEffect::Spotlight(params) => format!(
             "スポットライト +{:.0}% / 影 {:.0}%",
             params.light_strength * 100.0,
@@ -8956,6 +8967,14 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
         }
         (LocalEffect::ParticleOverlay(params), RgbPickTarget::ParticleOverlayColor) => {
             params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::Aurora(params), RgbPickTarget::AuroraColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::Aurora(params), RgbPickTarget::AuroraSecondaryColor) => {
+            params.secondary_rgb = rgb;
             true
         }
         (LocalEffect::Spotlight(params), RgbPickTarget::SpotlightTint) => {
@@ -15360,6 +15379,143 @@ fn draw_effect_params(
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から粒子オーバーレイ結果へどれだけ近づけるかです。");
         }
+        LocalEffect::Aurora(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "緑紫") {
+                    *params = AuroraParams {
+                        band_count: 5.0,
+                        scale_px: 120.0,
+                        height: 0.72,
+                        waviness: 0.58,
+                        softness: 0.46,
+                        brightness: 0.92,
+                        color_rgb: [80, 255, 170],
+                        secondary_rgb: [150, 105, 255],
+                        phase: params.phase,
+                        seed: params.seed,
+                        strength: 0.78,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "青緑") {
+                    *params = AuroraParams {
+                        band_count: 6.0,
+                        scale_px: 100.0,
+                        height: 0.68,
+                        waviness: 0.70,
+                        softness: 0.42,
+                        brightness: 1.05,
+                        color_rgb: [70, 230, 255],
+                        secondary_rgb: [90, 255, 160],
+                        phase: params.phase,
+                        seed: params.seed,
+                        strength: 0.82,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強い光") {
+                    *params = AuroraParams {
+                        band_count: 8.0,
+                        scale_px: 72.0,
+                        height: 0.86,
+                        waviness: 0.86,
+                        softness: 0.34,
+                        brightness: 1.45,
+                        color_rgb: [90, 255, 145],
+                        secondary_rgb: [210, 95, 255],
+                        phase: params.phase,
+                        seed: params.seed,
+                        strength: 0.92,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡い空気") {
+                    *params = AuroraParams {
+                        band_count: 4.0,
+                        scale_px: 170.0,
+                        height: 0.58,
+                        waviness: 0.42,
+                        softness: 0.72,
+                        brightness: 0.58,
+                        color_rgb: [130, 255, 205],
+                        secondary_rgb: [135, 170, 255],
+                        phase: params.phase,
+                        seed: params.seed,
+                        strength: 0.58,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "縦に揺れる発光カーテンをスクリーン合成します。夜空や幻想的な背景に向きます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let bands =
+                ui.add(egui::Slider::new(&mut params.band_count, 1.0..=12.0).text("カーテン数"));
+            changed |= bands.changed();
+            bands.lab_hover_tip("横方向に並ぶ光の帯の数です。");
+            let scale = ui.add(
+                egui::Slider::new(&mut params.scale_px, 24.0..=480.0)
+                    .text("幅")
+                    .suffix("px"),
+            );
+            changed |= scale.changed();
+            scale.lab_hover_tip("光の帯と揺らぎの大きさです。大きいほどゆったりします。");
+            let height = ui.add(egui::Slider::new(&mut params.height, 0.08..=1.0).text("高さ"));
+            changed |= height.changed();
+            height.lab_hover_tip("上側からどこまで光を伸ばすかです。");
+            let waviness =
+                ui.add(egui::Slider::new(&mut params.waviness, 0.0..=1.0).text("揺らぎ"));
+            changed |= waviness.changed();
+            waviness.lab_hover_tip("光の帯をどれだけ波打たせるかです。");
+            let softness =
+                ui.add(egui::Slider::new(&mut params.softness, 0.0..=1.0).text("柔らかさ"));
+            changed |= softness.changed();
+            softness.lab_hover_tip("帯の境界と縦方向フェードを柔らかくします。");
+            let brightness =
+                ui.add(egui::Slider::new(&mut params.brightness, 0.0..=2.0).text("明るさ"));
+            changed |= brightness.changed();
+            brightness.lab_hover_tip("オーロラの発光量です。暗い背景ほど見えやすくなります。");
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "主色",
+                    &mut params.color_rgb,
+                    RgbPickTarget::AuroraColor,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "副色",
+                    &mut params.secondary_rgb,
+                    RgbPickTarget::AuroraSecondaryColor,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let phase = ui.add(egui::Slider::new(&mut params.phase, 0.0..=1.0).text("位相"));
+            changed |= phase.changed();
+            phase.lab_hover_tip("光の揺らぎ位置を変えます。静止画では模様違いとして使えます。");
+            let mut seed = params.seed as i32;
+            let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
+            changed |= seed_response.changed();
+            seed_response.lab_hover_tip("光カーテンの乱数を変えます。");
+            params.seed = seed.max(0) as u32;
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からオーロラ合成結果へどれだけ近づけるかです。");
+        }
         LocalEffect::Spotlight(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -17951,6 +18107,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ParticleOverlay => {
             LocalEffect::ParticleOverlay(ParticleOverlayParams::default())
         }
+        EffectKind::Aurora => LocalEffect::Aurora(AuroraParams::default()),
         EffectKind::Spotlight => LocalEffect::Spotlight(SpotlightParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
         EffectKind::FilmGrain => LocalEffect::FilmGrain(FilmGrainParams::default()),
@@ -20301,6 +20458,7 @@ mod tests {
             EffectKind::CloudFog,
             EffectKind::WaterCaustics,
             EffectKind::ParticleOverlay,
+            EffectKind::Aurora,
             EffectKind::Spotlight,
             EffectKind::Vignette,
             EffectKind::FilmGrain,
@@ -20616,6 +20774,23 @@ mod tests {
             panic!("expected particle overlay effect");
         };
         assert_eq!(particle_overlay_params.color_rgb, [210, 190, 255]);
+
+        let mut aurora = LocalEffect::Aurora(AuroraParams::default());
+        assert!(set_rgb_pick_target(
+            &mut aurora,
+            RgbPickTarget::AuroraColor,
+            [70, 240, 180],
+        ));
+        assert!(set_rgb_pick_target(
+            &mut aurora,
+            RgbPickTarget::AuroraSecondaryColor,
+            [150, 90, 255],
+        ));
+        let LocalEffect::Aurora(aurora_params) = aurora else {
+            panic!("expected aurora effect");
+        };
+        assert_eq!(aurora_params.color_rgb, [70, 240, 180]);
+        assert_eq!(aurora_params.secondary_rgb, [150, 90, 255]);
 
         let mut spotlight = LocalEffect::Spotlight(SpotlightParams::default());
         assert!(set_rgb_pick_target(

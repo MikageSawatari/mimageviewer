@@ -605,6 +605,7 @@ pub enum LocalEffect {
     OldFilm(OldFilmParams),
     WaterCaustics(WaterCausticsParams),
     ParticleOverlay(ParticleOverlayParams),
+    Aurora(AuroraParams),
     Halftone(HalftoneParams),
     ScreenTone(ScreenToneParams),
     ColorHalftone(ColorHalftoneParams),
@@ -698,6 +699,7 @@ impl LocalEffect {
             Self::OldFilm(_) => "オールドフィルム",
             Self::WaterCaustics(_) => "水中コースティクス",
             Self::ParticleOverlay(_) => "雨/雪/花びら",
+            Self::Aurora(_) => "オーロラ",
             Self::Halftone(_) => "ハーフトーン",
             Self::ScreenTone(_) => "スクリーントーン",
             Self::ColorHalftone(_) => "カラーハーフトーン",
@@ -3093,6 +3095,39 @@ impl Default for ParticleOverlayParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AuroraParams {
+    pub band_count: f32,
+    pub scale_px: f32,
+    pub height: f32,
+    pub waviness: f32,
+    pub softness: f32,
+    pub brightness: f32,
+    pub color_rgb: [u8; 3],
+    pub secondary_rgb: [u8; 3],
+    pub phase: f32,
+    pub seed: u32,
+    pub strength: f32,
+}
+
+impl Default for AuroraParams {
+    fn default() -> Self {
+        Self {
+            band_count: 5.0,
+            scale_px: 120.0,
+            height: 0.68,
+            waviness: 0.55,
+            softness: 0.45,
+            brightness: 0.85,
+            color_rgb: [80, 255, 170],
+            secondary_rgb: [150, 105, 255],
+            phase: 0.0,
+            seed: 1,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HalftoneParams {
     pub cell_px: u32,
     pub strength: f32,
@@ -3784,6 +3819,9 @@ where
             }
             LocalEffect::ParticleOverlay(params) => {
                 apply_particle_overlay(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Aurora(params) => {
+                apply_aurora(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::Halftone(params) => {
                 apply_halftone(&image.pixels, image.width, image.height, *params)
@@ -10783,6 +10821,129 @@ fn cell_noise01(x: i32, y: i32, seed: u32) -> f32 {
     h as f32 / u32::MAX as f32
 }
 
+fn apply_aurora(src: &[u8], width: usize, height: usize, params: AuroraParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let brightness = params.brightness.clamp(0.0, 2.0);
+    if strength <= f32::EPSILON || brightness <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let band_count = params.band_count.clamp(1.0, 12.0);
+    let scale = params.scale_px.clamp(24.0, 480.0);
+    let height_extent = params.height.clamp(0.08, 1.0);
+    let waviness = params.waviness.clamp(0.0, 1.0);
+    let softness = params.softness.clamp(0.0, 1.0);
+    let phase = params.phase.rem_euclid(1.0) * std::f32::consts::TAU;
+    let primary = [
+        params.color_rgb[0] as f32 / 255.0,
+        params.color_rgb[1] as f32 / 255.0,
+        params.color_rgb[2] as f32 / 255.0,
+    ];
+    let secondary = [
+        params.secondary_rgb[0] as f32 / 255.0,
+        params.secondary_rgb[1] as f32 / 255.0,
+        params.secondary_rgb[2] as f32 / 255.0,
+    ];
+    let mut out = src.to_vec();
+    let width_denom = width.saturating_sub(1).max(1) as f32;
+    let height_denom = height.saturating_sub(1).max(1) as f32;
+
+    for y in 0..height {
+        let y_norm = y as f32 / height_denom;
+        let vertical = aurora_vertical_weight(y_norm, height_extent, softness);
+        if vertical <= f32::EPSILON {
+            continue;
+        }
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+
+            let x_norm = x as f32 / width_denom;
+            let u = x as f32 / scale;
+            let v = y as f32 / scale;
+            let curtain = aurora_curtain_value(
+                x_norm,
+                y_norm,
+                u,
+                v,
+                band_count,
+                waviness,
+                softness,
+                phase,
+                params.seed,
+            );
+            let luma = luma01(
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            );
+            let visibility = 0.34 + (1.0 - luma) * 0.66;
+            let amount = (curtain * vertical * brightness * visibility).clamp(0.0, 1.0);
+            if amount <= f32::EPSILON {
+                continue;
+            }
+            let mix = aurora_color_mix(x_norm, y_norm, phase, params.seed);
+            for c in 0..3 {
+                let color = lerp_f32(primary[c], secondary[c], mix);
+                let base = src[i + c] as f32 / 255.0;
+                let target = screen_channel(base, (color * amount).clamp(0.0, 1.0));
+                out[i + c] = to_u8(lerp_f32(base, target, strength));
+            }
+        }
+    }
+    out
+}
+
+fn aurora_vertical_weight(y_norm: f32, height_extent: f32, softness: f32) -> f32 {
+    let lower = height_extent * (0.18 + softness * 0.20);
+    let upper = height_extent;
+    let fade_down = 1.0 - smoothstep(lower, upper, y_norm);
+    let top_lift = smoothstep(0.0, 0.03 + softness * 0.10, y_norm);
+    (fade_down * (0.72 + top_lift * 0.28)).clamp(0.0, 1.0)
+}
+
+fn aurora_curtain_value(
+    x_norm: f32,
+    y_norm: f32,
+    u: f32,
+    v: f32,
+    band_count: f32,
+    waviness: f32,
+    softness: f32,
+    phase: f32,
+    seed: u32,
+) -> f32 {
+    let drift = ((y_norm * (2.4 + waviness * 5.8) + phase * 0.18).sin() * 0.20
+        + (y_norm * (6.2 + waviness * 4.5) - phase * 0.12).sin() * 0.08)
+        * waviness;
+    let noise = glass_value_noise(
+        u * 0.64 + phase * 0.11,
+        v * 1.55 - phase * 0.07,
+        seed ^ 0x3F2D_A91B,
+    ) * waviness
+        * 0.18;
+    let phase_x = x_norm * band_count + drift + noise + phase * 0.035;
+    let fold = (phase_x * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+    let ridge = smoothstep(0.46 - softness * 0.18, 1.0, fold);
+    let veil = smoothstep(0.12, 0.88, fold) * (0.20 + softness * 0.22);
+    let shimmer = 0.68
+        + glass_value_noise(
+            u * 2.1 + 9.7 - phase * 0.17,
+            v * 3.0 + 4.2 + phase * 0.13,
+            seed ^ 0x87C1_59E3,
+        ) * 0.32;
+    ((ridge * (0.80 + softness * 0.18) + veil) * shimmer).clamp(0.0, 1.0)
+}
+
+fn aurora_color_mix(x_norm: f32, y_norm: f32, phase: f32, seed: u32) -> f32 {
+    let wave =
+        ((x_norm * 2.6 + y_norm * 0.9 + phase * 0.08) * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+    let noise = glass_value_noise(x_norm * 3.4 + 2.0, y_norm * 1.7 - phase * 0.1, seed);
+    (wave * 0.62 + (noise * 0.5 + 0.5) * 0.38).clamp(0.0, 1.0)
+}
+
 fn apply_halftone(src: &[u8], width: usize, height: usize, params: HalftoneParams) -> Vec<u8> {
     let cell = params.cell_px.clamp(2, 96) as usize;
     let strength = params.strength.clamp(0.0, 1.0);
@@ -13847,6 +14008,7 @@ mod tests {
             LocalEffect::OldFilm(OldFilmParams::default()),
             LocalEffect::WaterCaustics(WaterCausticsParams::default()),
             LocalEffect::ParticleOverlay(ParticleOverlayParams::default()),
+            LocalEffect::Aurora(AuroraParams::default()),
             LocalEffect::Halftone(HalftoneParams::default()),
             LocalEffect::ScreenTone(ScreenToneParams::default()),
             LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
@@ -14589,6 +14751,22 @@ mod tests {
                     opacity: 1.0,
                     color_rgb: [255, 180, 220],
                     seed: 23,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "aurora max curtains",
+                LocalEffect::Aurora(AuroraParams {
+                    band_count: 12.0,
+                    scale_px: 24.0,
+                    height: 1.0,
+                    waviness: 1.0,
+                    softness: 1.0,
+                    brightness: 2.0,
+                    color_rgb: [80, 255, 180],
+                    secondary_rgb: [180, 80, 255],
+                    phase: 0.75,
+                    seed: 24,
                     strength: 1.0,
                 }),
             ),
@@ -16910,6 +17088,90 @@ LUT_3D_SIZE 2
                 opacity: 1.0,
                 color_rgb: [255, 255, 255],
                 seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn aurora_lifts_dark_pixels_and_preserves_alpha() {
+        let src = solid(24, 24, [12, 18, 28, 219]);
+        let layer = LocalAdjustmentLayer::new(
+            "aurora",
+            LocalMask::Full,
+            LocalEffect::Aurora(AuroraParams {
+                band_count: 6.0,
+                scale_px: 32.0,
+                height: 1.0,
+                waviness: 0.8,
+                softness: 0.55,
+                brightness: 2.0,
+                color_rgb: [80, 255, 160],
+                secondary_rgb: [160, 90, 255],
+                phase: 0.0,
+                seed: 2,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(
+            out.pixels
+                .chunks_exact(4)
+                .any(|px| px[0] > 12 || px[1] > 18 || px[2] > 28)
+        );
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 219));
+    }
+
+    #[test]
+    fn aurora_phase_changes_curtain_pattern() {
+        let src = solid(24, 24, [30, 34, 44, 255]);
+        let params = AuroraParams {
+            band_count: 5.0,
+            scale_px: 36.0,
+            height: 1.0,
+            waviness: 0.9,
+            softness: 0.45,
+            brightness: 1.5,
+            color_rgb: [70, 250, 170],
+            secondary_rgb: [160, 80, 255],
+            phase: 0.0,
+            seed: 4,
+            strength: 1.0,
+        };
+        let first =
+            LocalAdjustmentLayer::new("aurora", LocalMask::Full, LocalEffect::Aurora(params));
+        let second = LocalAdjustmentLayer::new(
+            "aurora",
+            LocalMask::Full,
+            LocalEffect::Aurora(AuroraParams {
+                phase: 0.42,
+                ..params
+            }),
+        );
+        let out_first = apply_layers(src.as_ref(), &[first]).unwrap();
+        let out_second = apply_layers(src.as_ref(), &[second]).unwrap();
+        assert_ne!(out_first.pixels, out_second.pixels);
+    }
+
+    #[test]
+    fn aurora_skips_transparent_pixels() {
+        let src = RgbaImageBuf::new(1, 1, vec![255, 0, 0, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "aurora",
+            LocalMask::Full,
+            LocalEffect::Aurora(AuroraParams {
+                band_count: 12.0,
+                scale_px: 24.0,
+                height: 1.0,
+                waviness: 1.0,
+                softness: 1.0,
+                brightness: 2.0,
+                color_rgb: [80, 255, 180],
+                secondary_rgb: [180, 80, 255],
+                phase: 0.5,
+                seed: 8,
                 strength: 1.0,
             }),
         );
