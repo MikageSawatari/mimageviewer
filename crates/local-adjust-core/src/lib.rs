@@ -1856,6 +1856,12 @@ pub struct ColorFillParams {
     pub midpoint: f32,
     #[serde(default = "default_color_fill_angle_degrees")]
     pub angle_degrees: f32,
+    #[serde(default)]
+    pub linear_points_enabled: bool,
+    #[serde(default = "default_color_fill_linear_start")]
+    pub linear_start: [f32; 2],
+    #[serde(default = "default_color_fill_linear_end")]
+    pub linear_end: [f32; 2],
     #[serde(default = "default_color_fill_center")]
     pub center: [f32; 2],
     #[serde(default = "default_color_fill_radius")]
@@ -1876,6 +1882,9 @@ impl Default for ColorFillParams {
             middle_enabled: false,
             midpoint: default_color_fill_midpoint(),
             angle_degrees: default_color_fill_angle_degrees(),
+            linear_points_enabled: false,
+            linear_start: default_color_fill_linear_start(),
+            linear_end: default_color_fill_linear_end(),
             center: default_color_fill_center(),
             radius: default_color_fill_radius(),
             softness: default_color_fill_softness(),
@@ -1906,6 +1915,14 @@ fn default_color_fill_midpoint() -> f32 {
 
 fn default_color_fill_angle_degrees() -> f32 {
     -20.0
+}
+
+fn default_color_fill_linear_start() -> [f32; 2] {
+    [0.0, 0.5]
+}
+
+fn default_color_fill_linear_end() -> [f32; 2] {
+    [1.0, 0.5]
 }
 
 fn default_color_fill_center() -> [f32; 2] {
@@ -1953,6 +1970,12 @@ pub struct ColorOverlayParams {
     pub end_rgb: [u8; 3],
     #[serde(default = "default_color_overlay_angle_degrees")]
     pub angle_degrees: f32,
+    #[serde(default)]
+    pub linear_points_enabled: bool,
+    #[serde(default = "default_color_overlay_linear_start")]
+    pub linear_start: [f32; 2],
+    #[serde(default = "default_color_overlay_linear_end")]
+    pub linear_end: [f32; 2],
     #[serde(default = "default_color_overlay_center")]
     pub center: [f32; 2],
     #[serde(default = "default_color_overlay_radius")]
@@ -1971,6 +1994,9 @@ impl Default for ColorOverlayParams {
             start_rgb: default_color_overlay_start_rgb(),
             end_rgb: default_color_overlay_end_rgb(),
             angle_degrees: default_color_overlay_angle_degrees(),
+            linear_points_enabled: false,
+            linear_start: default_color_overlay_linear_start(),
+            linear_end: default_color_overlay_linear_end(),
             center: default_color_overlay_center(),
             radius: default_color_overlay_radius(),
             softness: default_color_overlay_softness(),
@@ -1989,6 +2015,14 @@ fn default_color_overlay_end_rgb() -> [u8; 3] {
 
 fn default_color_overlay_angle_degrees() -> f32 {
     -25.0
+}
+
+fn default_color_overlay_linear_start() -> [f32; 2] {
+    [0.0, 0.5]
+}
+
+fn default_color_overlay_linear_end() -> [f32; 2] {
+    [1.0, 0.5]
 }
 
 fn default_color_overlay_center() -> [f32; 2] {
@@ -6430,6 +6464,9 @@ fn apply_color_overlay(
                 ny,
                 params.shape,
                 params.angle_degrees,
+                params.linear_points_enabled,
+                params.linear_start,
+                params.linear_end,
                 params.center,
                 params.radius,
                 params.softness,
@@ -6467,6 +6504,9 @@ fn apply_color_fill(src: &[u8], width: usize, height: usize, params: ColorFillPa
                 ny,
                 params.shape,
                 params.angle_degrees,
+                params.linear_points_enabled,
+                params.linear_start,
+                params.linear_end,
                 params.center,
                 params.radius,
                 params.softness,
@@ -6502,6 +6542,9 @@ fn color_shape_gradient_t(
     ny: f32,
     shape: ColorOverlayShape,
     angle_degrees: f32,
+    linear_points_enabled: bool,
+    linear_start: [f32; 2],
+    linear_end: [f32; 2],
     center: [f32; 2],
     radius: f32,
     softness: f32,
@@ -6509,12 +6552,25 @@ fn color_shape_gradient_t(
     let raw = match shape {
         ColorOverlayShape::Solid => 0.0,
         ColorOverlayShape::Linear => {
-            let angle = angle_degrees.to_radians();
-            let dx = angle.cos();
-            let dy = angle.sin();
-            let span = 0.5 * (dx.abs() + dy.abs()).max(f32::EPSILON);
-            let projected = (nx - 0.5) * dx + (ny - 0.5) * dy;
-            (projected / (span * 2.0) + 0.5).clamp(0.0, 1.0)
+            if linear_points_enabled {
+                let sx = linear_start[0];
+                let sy = linear_start[1];
+                let dx = linear_end[0] - sx;
+                let dy = linear_end[1] - sy;
+                let denom = dx * dx + dy * dy;
+                if denom <= f32::EPSILON {
+                    1.0
+                } else {
+                    (((nx - sx) * dx + (ny - sy) * dy) / denom).clamp(0.0, 1.0)
+                }
+            } else {
+                let angle = angle_degrees.to_radians();
+                let dx = angle.cos();
+                let dy = angle.sin();
+                let span = 0.5 * (dx.abs() + dy.abs()).max(f32::EPSILON);
+                let projected = (nx - 0.5) * dx + (ny - 0.5) * dy;
+                (projected / (span * 2.0) + 0.5).clamp(0.0, 1.0)
+            }
         }
         ColorOverlayShape::Radial => {
             let cx = center[0].clamp(0.0, 1.0);
@@ -9116,6 +9172,29 @@ mod tests {
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(&out.pixels[0..4], &[255, 0, 0, 255]);
         assert_eq!(&out.pixels[4..8], &[0, 255, 0, 255]);
+        assert_eq!(&out.pixels[8..12], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn color_fill_linear_gradient_can_use_dragged_points() {
+        let src = RgbaImageBuf::new(1, 3, vec![8, 8, 8, 255, 8, 8, 8, 255, 8, 8, 8, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "fill",
+            LocalMask::Full,
+            LocalEffect::ColorFill(ColorFillParams {
+                shape: ColorOverlayShape::Linear,
+                start_rgb: [255, 0, 0],
+                end_rgb: [0, 0, 255],
+                linear_points_enabled: true,
+                linear_start: [0.5, 0.0],
+                linear_end: [0.5, 1.0],
+                opacity: 1.0,
+                softness: 0.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[255, 0, 0, 255]);
         assert_eq!(&out.pixels[8..12], &[0, 0, 255, 255]);
     }
 

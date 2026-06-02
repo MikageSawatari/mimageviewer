@@ -1325,7 +1325,7 @@ struct EffectGroup {
 const EFFECT_GROUPS: &[EffectGroup] = &[
     EffectGroup {
         title: "基本",
-        kinds: &[EffectKind::None],
+        kinds: &[EffectKind::None, EffectKind::ColorFill],
     },
     EffectGroup {
         title: "色調補正",
@@ -1407,10 +1407,6 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
         ],
     },
     EffectGroup {
-        title: "描画・塗り",
-        kinds: &[EffectKind::ColorFill],
-    },
-    EffectGroup {
         title: "隠蔽・加工",
         kinds: &[EffectKind::Mosaic],
     },
@@ -1460,6 +1456,7 @@ struct LocalAdjustLabApp {
     prev_paint_pos: Option<Pos2>,
     last_paint_pos: Option<Pos2>,
     radial_gradient_drag_active: bool,
+    effect_gradient_drag_active: bool,
     tilt_shift_drag_active: bool,
     boundary_edge_threshold: f32,
     boundary_ink_threshold: f32,
@@ -1541,6 +1538,7 @@ impl LocalAdjustLabApp {
             prev_paint_pos: None,
             last_paint_pos: None,
             radial_gradient_drag_active: false,
+            effect_gradient_drag_active: false,
             tilt_shift_drag_active: false,
             boundary_edge_threshold: 24.0,
             boundary_ink_threshold: 28.0,
@@ -1630,6 +1628,7 @@ impl LocalAdjustLabApp {
                 self.workflow_panel = LabWorkflowPanel::Adjust;
                 self.override_edit_panel = None;
                 self.radial_gradient_drag_active = false;
+                self.effect_gradient_drag_active = false;
                 self.tilt_shift_drag_active = false;
                 self.edge_brush_seed = None;
                 self.selective_color_pick_active = false;
@@ -4244,11 +4243,19 @@ impl LocalAdjustLabApp {
         {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
-        let gradient_handle_used = if pan_mode || !adjust_panel_active || dialog_open {
-            false
-        } else {
-            self.draw_gradient_handles(ui, rect)
-        };
+        let effect_gradient_active = self.selected_effect_gradient_shape().is_some();
+        let effect_gradient_handle_used =
+            if pan_mode || !adjust_panel_active || dialog_open || !effect_gradient_active {
+                false
+            } else {
+                self.draw_effect_gradient_handles(ui, rect)
+            };
+        let gradient_handle_used =
+            if pan_mode || !adjust_panel_active || dialog_open || effect_gradient_active {
+                false
+            } else {
+                self.draw_gradient_handles(ui, rect)
+            };
         let tilt_shift_handle_used = if pan_mode || !adjust_panel_active || dialog_open {
             false
         } else {
@@ -4277,7 +4284,8 @@ impl LocalAdjustLabApp {
             let pointer = ui.input(|i| i.pointer.interact_pos());
             if let Some(pointer_screen) = pointer {
                 let pos = screen_to_image(rect, img_w, img_h, pointer_screen);
-                if !gradient_handle_used && !tilt_shift_handle_used {
+                if !effect_gradient_handle_used && !gradient_handle_used && !tilt_shift_handle_used
+                {
                     if let Some(pos) = pos {
                         if self.selective_color_pick_active {
                             if response.clicked() || ui.input(|i| i.pointer.primary_pressed()) {
@@ -5355,6 +5363,7 @@ impl LocalAdjustLabApp {
                 self.selective_color_pick_active = false;
             }
             self.rgb_pick_active = None;
+            self.effect_gradient_drag_active = false;
             self.status = format!("加工内容を「{}」に変更しました。", kind.label());
             self.mark_dirty();
         }
@@ -5440,6 +5449,43 @@ impl LocalAdjustLabApp {
         self.view_zoom = new_zoom;
     }
 
+    fn selected_effect_gradient_shape(&self) -> Option<ColorOverlayShape> {
+        self.selected_layer_ref()
+            .and_then(|layer| match &layer.effect {
+                LocalEffect::ColorFill(params) => Some(params.shape),
+                LocalEffect::ColorOverlay(params) => Some(params.shape),
+                _ => None,
+            })
+            .filter(|shape| *shape != ColorOverlayShape::Solid)
+    }
+
+    fn reset_selected_effect_gradient_geometry(&mut self) -> bool {
+        let Some(layer) = self.selected_layer_mut() else {
+            return false;
+        };
+        match &mut layer.effect {
+            LocalEffect::ColorFill(params) => {
+                let mut geometry = color_fill_gradient_geometry(params);
+                if reset_color_gradient_geometry(&mut geometry) {
+                    apply_color_fill_gradient_geometry(params, geometry);
+                    true
+                } else {
+                    false
+                }
+            }
+            LocalEffect::ColorOverlay(params) => {
+                let mut geometry = color_overlay_gradient_geometry(params);
+                if reset_color_gradient_geometry(&mut geometry) {
+                    apply_color_overlay_gradient_geometry(params, geometry);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     fn handle_canvas_input(
         &mut self,
         ui: &mut egui::Ui,
@@ -5476,6 +5522,29 @@ impl LocalAdjustLabApp {
                     .unwrap_or(false);
             if override_editing_active {
                 return;
+            }
+            if let Some(effect_gradient_shape) = self.selected_effect_gradient_shape() {
+                if secondary_pressed {
+                    self.push_undo_snapshot();
+                    if self.reset_selected_effect_gradient_geometry() {
+                        self.effect_gradient_drag_active = false;
+                        self.status = format!(
+                            "{}を初期位置へ戻しました。",
+                            color_overlay_shape_label(effect_gradient_shape)
+                        );
+                        self.mark_dirty();
+                    }
+                    return;
+                }
+                if primary_down {
+                    let started = !self.effect_gradient_drag_active;
+                    if started {
+                        self.push_undo_snapshot();
+                        self.effect_gradient_drag_active = true;
+                    }
+                    self.drag_effect_gradient_line(pos, started);
+                    return;
+                }
             }
             let tilt_shift_range_initialized = self.selected_layer_ref().and_then(|layer| {
                 if let LocalEffect::TiltShift(params) = &layer.effect {
@@ -6132,40 +6201,26 @@ impl LocalAdjustLabApp {
         let mut changed = false;
         let mut used = false;
         let painter = ui.painter().clone();
-        let stroke = egui::Stroke::new(2.0, Color32::from_rgb(255, 220, 80));
-        let handle_fill = Color32::from_rgb(255, 250, 210);
-        let handle_stroke = egui::Stroke::new(2.0, Color32::from_rgb(40, 30, 10));
+        let visuals = mask_gradient_visuals();
+        let stroke = visuals.stroke;
+        let handle_fill = visuals.center_fill;
+        let handle_stroke = visuals.handle_stroke;
 
         match &mut self.layers[layer_idx].mask {
             LocalMask::LinearGradient(mask) => {
                 if !mask.initialized {
                     return false;
                 }
-                let start = norm_to_screen(rect, mask.start);
-                let end = norm_to_screen(rect, mask.end);
-                painter.line_segment([start, end], stroke);
-                let (start_changed, start_used) = drag_norm_handle(
+                let (linear_changed, linear_used) = draw_linear_gradient_handles(
                     ui,
                     rect,
-                    ui.id().with(("linear_start", layer_idx)),
-                    start,
+                    ui.id().with(("mask_linear_gradient", layer_idx)),
                     &mut mask.start,
-                    "min",
-                );
-                let (end_changed, end_used) = drag_norm_handle(
-                    ui,
-                    rect,
-                    ui.id().with(("linear_end", layer_idx)),
-                    end,
                     &mut mask.end,
-                    "max",
+                    visuals,
                 );
-                changed |= start_changed || end_changed;
-                painter.circle_filled(start, 6.0, handle_fill);
-                painter.circle_stroke(start, 6.0, handle_stroke);
-                painter.circle_filled(end, 6.0, Color32::from_rgb(255, 190, 110));
-                painter.circle_stroke(end, 6.0, handle_stroke);
-                used = start_used || end_used;
+                changed |= linear_changed;
+                used = linear_used;
             }
             LocalMask::RadialGradient(mask) => {
                 if !mask.initialized {
@@ -6294,6 +6349,60 @@ impl LocalAdjustLabApp {
 
         if changed {
             self.mark_mask_changed();
+        }
+        used
+    }
+
+    fn draw_effect_gradient_handles(&mut self, ui: &mut egui::Ui, rect: Rect) -> bool {
+        let Some(layer_idx) = self
+            .layers
+            .get(self.selected_layer)
+            .map(|_| self.selected_layer)
+        else {
+            return false;
+        };
+        let mut changed = false;
+        let mut used = false;
+        let visuals = effect_gradient_visuals();
+
+        match &mut self.layers[layer_idx].effect {
+            LocalEffect::ColorFill(params) => {
+                let mut geometry = color_fill_gradient_geometry(params);
+                let (geometry_changed, geometry_used) = draw_color_gradient_geometry_handles(
+                    ui,
+                    rect,
+                    layer_idx,
+                    "fill",
+                    &mut geometry,
+                    visuals,
+                );
+                if geometry_changed {
+                    apply_color_fill_gradient_geometry(params, geometry);
+                }
+                changed |= geometry_changed;
+                used |= geometry_used;
+            }
+            LocalEffect::ColorOverlay(params) => {
+                let mut geometry = color_overlay_gradient_geometry(params);
+                let (geometry_changed, geometry_used) = draw_color_gradient_geometry_handles(
+                    ui,
+                    rect,
+                    layer_idx,
+                    "overlay",
+                    &mut geometry,
+                    visuals,
+                );
+                if geometry_changed {
+                    apply_color_overlay_gradient_geometry(params, geometry);
+                }
+                changed |= geometry_changed;
+                used |= geometry_used;
+            }
+            _ => {}
+        }
+
+        if changed {
+            self.mark_dirty();
         }
         used
     }
@@ -6782,6 +6891,41 @@ impl LocalAdjustLabApp {
         }
     }
 
+    fn drag_effect_gradient_line(&mut self, image_pos: Pos2, started: bool) {
+        let Some((w, h)) = self.image_dims() else {
+            return;
+        };
+        let n = [
+            (image_pos.x / w.max(1) as f32).clamp(0.0, 1.0),
+            (image_pos.y / h.max(1) as f32).clamp(0.0, 1.0),
+        ];
+        let Some(layer) = self.selected_layer_mut() else {
+            return;
+        };
+        let changed = match &mut layer.effect {
+            LocalEffect::ColorFill(params) => {
+                let mut geometry = color_fill_gradient_geometry(params);
+                let changed = drag_color_gradient_geometry(&mut geometry, n, started);
+                if changed {
+                    apply_color_fill_gradient_geometry(params, geometry);
+                }
+                changed
+            }
+            LocalEffect::ColorOverlay(params) => {
+                let mut geometry = color_overlay_gradient_geometry(params);
+                let changed = drag_color_gradient_geometry(&mut geometry, n, started);
+                if changed {
+                    apply_color_overlay_gradient_geometry(params, geometry);
+                }
+                changed
+            }
+            _ => false,
+        };
+        if changed {
+            self.mark_dirty();
+        }
+    }
+
     fn drag_tilt_shift_range(&mut self, image_pos: Pos2, started: bool) {
         let Some((w, h)) = self.image_dims() else {
             return;
@@ -6874,6 +7018,7 @@ impl eframe::App for LocalAdjustLabApp {
         if !ctx.input(|i| i.pointer.primary_down()) {
             self.edge_brush_seed = None;
             self.radial_gradient_drag_active = false;
+            self.effect_gradient_drag_active = false;
             self.tilt_shift_drag_active = false;
         }
 
@@ -11860,8 +12005,13 @@ fn draw_effect_params(
                         .text("角度")
                         .suffix("°"),
                 );
-                changed |= angle.changed();
-                angle.lab_hover_tip("線形グラデーションの方向です。0°で左から右へ色が変わります。");
+                if angle.changed() {
+                    params.linear_points_enabled = false;
+                    changed = true;
+                }
+                angle.lab_hover_tip(
+                    "線形グラデーションの方向です。0°で左から右へ色が変わります。画像上をドラッグすると開始点と終了点も設定できます。",
+                );
             }
             if params.shape == ColorOverlayShape::Radial {
                 let center_x =
@@ -11875,7 +12025,7 @@ fn draw_effect_params(
                 let radius = ui.add(egui::Slider::new(&mut params.radius, 0.02..=2.0).text("半径"));
                 changed |= radius.changed();
                 radius.lab_hover_tip(
-                    "中心色から終了色へ変わる範囲です。1.0で画像の正規化座標ほぼ全体を覆います。",
+                    "中心色から終了色へ変わる範囲です。画像上をドラッグすると中心と半径を設定できます。",
                 );
             }
             if params.shape != ColorOverlayShape::Solid {
@@ -12031,8 +12181,13 @@ fn draw_effect_params(
                         .text("角度")
                         .suffix("°"),
                 );
-                changed |= angle.changed();
-                angle.lab_hover_tip("線形グラデーションの方向です。0°で左から右へ色が変わります。");
+                if angle.changed() {
+                    params.linear_points_enabled = false;
+                    changed = true;
+                }
+                angle.lab_hover_tip(
+                    "線形グラデーションの方向です。0°で左から右へ色が変わります。画像上をドラッグすると開始点と終了点も設定できます。",
+                );
             }
             if params.shape == ColorOverlayShape::Radial {
                 let center_x =
@@ -12046,7 +12201,7 @@ fn draw_effect_params(
                 let radius = ui.add(egui::Slider::new(&mut params.radius, 0.02..=2.0).text("半径"));
                 changed |= radius.changed();
                 radius.lab_hover_tip(
-                    "中心色から終了色へ変わる範囲です。1.0で画像の正規化座標ほぼ全体を覆います。",
+                    "中心色から終了色へ変わる範囲です。画像上をドラッグすると中心と半径を設定できます。",
                 );
             }
             if params.shape != ColorOverlayShape::Solid {
@@ -15520,6 +15675,324 @@ fn screen_to_norm(rect: Rect, p: Pos2) -> [f32; 2] {
     ]
 }
 
+#[derive(Clone, Copy)]
+struct GradientHandleVisuals {
+    stroke: egui::Stroke,
+    soft_stroke: egui::Stroke,
+    start_fill: Color32,
+    end_fill: Color32,
+    center_fill: Color32,
+    handle_stroke: egui::Stroke,
+}
+
+fn mask_gradient_visuals() -> GradientHandleVisuals {
+    GradientHandleVisuals {
+        stroke: egui::Stroke::new(2.0, Color32::from_rgb(255, 220, 80)),
+        soft_stroke: egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 220, 80, 100)),
+        start_fill: Color32::from_rgb(255, 250, 210),
+        end_fill: Color32::from_rgb(255, 190, 110),
+        center_fill: Color32::from_rgb(255, 250, 210),
+        handle_stroke: egui::Stroke::new(2.0, Color32::from_rgb(40, 30, 10)),
+    }
+}
+
+fn effect_gradient_visuals() -> GradientHandleVisuals {
+    GradientHandleVisuals {
+        stroke: egui::Stroke::new(2.0, Color32::from_rgb(120, 220, 255)),
+        soft_stroke: egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 220, 255, 110)),
+        start_fill: Color32::from_rgb(215, 250, 255),
+        end_fill: Color32::from_rgb(120, 220, 255),
+        center_fill: Color32::from_rgb(215, 250, 255),
+        handle_stroke: egui::Stroke::new(2.0, Color32::from_rgb(10, 30, 36)),
+    }
+}
+
+fn draw_linear_gradient_handles(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    id: egui::Id,
+    start: &mut [f32; 2],
+    end: &mut [f32; 2],
+    visuals: GradientHandleVisuals,
+) -> (bool, bool) {
+    let painter = ui.painter().clone();
+    let start_screen = norm_to_screen(rect, *start);
+    let end_screen = norm_to_screen(rect, *end);
+    painter.line_segment([start_screen, end_screen], visuals.stroke);
+    let (start_changed, start_used) = drag_norm_handle(
+        ui,
+        rect,
+        id.with("linear_start"),
+        start_screen,
+        start,
+        "開始",
+    );
+    let (end_changed, end_used) =
+        drag_norm_handle(ui, rect, id.with("linear_end"), end_screen, end, "終了");
+    let start_screen = norm_to_screen(rect, *start);
+    let end_screen = norm_to_screen(rect, *end);
+    painter.circle_filled(start_screen, 6.0, visuals.start_fill);
+    painter.circle_stroke(start_screen, 6.0, visuals.handle_stroke);
+    painter.circle_filled(end_screen, 6.0, visuals.end_fill);
+    painter.circle_stroke(end_screen, 6.0, visuals.handle_stroke);
+    (start_changed || end_changed, start_used || end_used)
+}
+
+fn draw_radial_circle_gradient_handles(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    id: egui::Id,
+    center: &mut [f32; 2],
+    radius: &mut f32,
+    visuals: GradientHandleVisuals,
+) -> (bool, bool) {
+    let painter = ui.painter().clone();
+    let center_screen = norm_to_screen(rect, *center);
+    let radius_x = radius.max(0.001) * rect.width();
+    let radius_handle = Pos2::new(center_screen.x + radius_x, center_screen.y);
+    let (center_changed, center_used) = drag_norm_handle(
+        ui,
+        rect,
+        id.with("radial_center"),
+        center_screen,
+        center,
+        "中心",
+    );
+    let radius_resp = ui
+        .interact(
+            Rect::from_center_size(radius_handle, egui::vec2(28.0, 28.0)),
+            id.with("radial_radius"),
+            Sense::drag(),
+        )
+        .lab_hover_tip("半径");
+    let mut radius_changed = false;
+    if radius_resp.dragged()
+        && let Some(pos) = radius_resp.interact_pointer_pos()
+    {
+        let n = screen_to_norm(rect, pos);
+        let dx = n[0] - center[0];
+        let dy = n[1] - center[1];
+        *radius = (dx * dx + dy * dy).sqrt().clamp(0.02, 2.0);
+        radius_changed = true;
+    }
+    let center_screen = norm_to_screen(rect, *center);
+    let radius_x = radius.max(0.001) * rect.width();
+    let radius_y = radius.max(0.001) * rect.height();
+    let radius_handle = Pos2::new(center_screen.x + radius_x, center_screen.y);
+    draw_ellipse_stroke(&painter, center_screen, radius_x, radius_y, visuals.stroke);
+    painter.line_segment([center_screen, radius_handle], visuals.soft_stroke);
+    painter.circle_filled(center_screen, 6.0, visuals.center_fill);
+    painter.circle_stroke(center_screen, 6.0, visuals.handle_stroke);
+    painter.circle_filled(radius_handle, 6.0, visuals.end_fill);
+    painter.circle_stroke(radius_handle, 6.0, visuals.handle_stroke);
+    (
+        center_changed || radius_changed,
+        center_used || radius_resp.hovered() || radius_resp.dragged(),
+    )
+}
+
+fn linear_points_from_angle(angle_degrees: f32) -> ([f32; 2], [f32; 2]) {
+    let angle = angle_degrees.to_radians();
+    let dx = angle.cos();
+    let dy = angle.sin();
+    let tx = if dx.abs() <= f32::EPSILON {
+        f32::INFINITY
+    } else {
+        0.5 / dx.abs()
+    };
+    let ty = if dy.abs() <= f32::EPSILON {
+        f32::INFINITY
+    } else {
+        0.5 / dy.abs()
+    };
+    let t = tx.min(ty).max(0.001);
+    (
+        [
+            (0.5 - dx * t).clamp(0.0, 1.0),
+            (0.5 - dy * t).clamp(0.0, 1.0),
+        ],
+        [
+            (0.5 + dx * t).clamp(0.0, 1.0),
+            (0.5 + dy * t).clamp(0.0, 1.0),
+        ],
+    )
+}
+
+fn angle_from_linear_points(start: [f32; 2], end: [f32; 2]) -> Option<f32> {
+    let dx = end[0] - start[0];
+    let dy = end[1] - start[1];
+    if dx * dx + dy * dy <= 0.000001 {
+        None
+    } else {
+        Some(dy.atan2(dx).to_degrees())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ColorGradientGeometry {
+    shape: ColorOverlayShape,
+    angle_degrees: f32,
+    linear_points_enabled: bool,
+    linear_start: [f32; 2],
+    linear_end: [f32; 2],
+    center: [f32; 2],
+    radius: f32,
+}
+
+fn color_fill_gradient_geometry(params: &ColorFillParams) -> ColorGradientGeometry {
+    ColorGradientGeometry {
+        shape: params.shape,
+        angle_degrees: params.angle_degrees,
+        linear_points_enabled: params.linear_points_enabled,
+        linear_start: params.linear_start,
+        linear_end: params.linear_end,
+        center: params.center,
+        radius: params.radius,
+    }
+}
+
+fn apply_color_fill_gradient_geometry(
+    params: &mut ColorFillParams,
+    geometry: ColorGradientGeometry,
+) {
+    params.angle_degrees = geometry.angle_degrees;
+    params.linear_points_enabled = geometry.linear_points_enabled;
+    params.linear_start = geometry.linear_start;
+    params.linear_end = geometry.linear_end;
+    params.center = geometry.center;
+    params.radius = geometry.radius;
+}
+
+fn color_overlay_gradient_geometry(params: &ColorOverlayParams) -> ColorGradientGeometry {
+    ColorGradientGeometry {
+        shape: params.shape,
+        angle_degrees: params.angle_degrees,
+        linear_points_enabled: params.linear_points_enabled,
+        linear_start: params.linear_start,
+        linear_end: params.linear_end,
+        center: params.center,
+        radius: params.radius,
+    }
+}
+
+fn apply_color_overlay_gradient_geometry(
+    params: &mut ColorOverlayParams,
+    geometry: ColorGradientGeometry,
+) {
+    params.angle_degrees = geometry.angle_degrees;
+    params.linear_points_enabled = geometry.linear_points_enabled;
+    params.linear_start = geometry.linear_start;
+    params.linear_end = geometry.linear_end;
+    params.center = geometry.center;
+    params.radius = geometry.radius;
+}
+
+fn color_gradient_linear_points(geometry: ColorGradientGeometry) -> ([f32; 2], [f32; 2]) {
+    if geometry.linear_points_enabled {
+        (geometry.linear_start, geometry.linear_end)
+    } else {
+        linear_points_from_angle(geometry.angle_degrees)
+    }
+}
+
+fn set_color_gradient_linear_points(
+    geometry: &mut ColorGradientGeometry,
+    start: [f32; 2],
+    end: [f32; 2],
+) {
+    geometry.linear_points_enabled = true;
+    geometry.linear_start = start;
+    geometry.linear_end = end;
+    if let Some(angle) = angle_from_linear_points(start, end) {
+        geometry.angle_degrees = angle;
+    }
+}
+
+fn drag_color_gradient_geometry(
+    geometry: &mut ColorGradientGeometry,
+    n: [f32; 2],
+    started: bool,
+) -> bool {
+    match geometry.shape {
+        ColorOverlayShape::Solid => false,
+        ColorOverlayShape::Linear => {
+            if started || !geometry.linear_points_enabled {
+                set_color_gradient_linear_points(geometry, n, n);
+            } else {
+                set_color_gradient_linear_points(geometry, geometry.linear_start, n);
+            }
+            true
+        }
+        ColorOverlayShape::Radial => {
+            if started {
+                geometry.center = n;
+                geometry.radius = 0.02;
+            } else {
+                let dx = n[0] - geometry.center[0];
+                let dy = n[1] - geometry.center[1];
+                geometry.radius = (dx * dx + dy * dy).sqrt().clamp(0.02, 2.0);
+            }
+            true
+        }
+    }
+}
+
+fn reset_color_gradient_geometry(geometry: &mut ColorGradientGeometry) -> bool {
+    match geometry.shape {
+        ColorOverlayShape::Solid => false,
+        ColorOverlayShape::Linear => {
+            geometry.linear_points_enabled = false;
+            let (start, end) = linear_points_from_angle(geometry.angle_degrees);
+            geometry.linear_start = start;
+            geometry.linear_end = end;
+            true
+        }
+        ColorOverlayShape::Radial => {
+            geometry.center = [0.5, 0.5];
+            geometry.radius = 0.85;
+            true
+        }
+    }
+}
+
+fn draw_color_gradient_geometry_handles(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    layer_idx: usize,
+    id_label: &'static str,
+    geometry: &mut ColorGradientGeometry,
+    visuals: GradientHandleVisuals,
+) -> (bool, bool) {
+    match geometry.shape {
+        ColorOverlayShape::Solid => (false, false),
+        ColorOverlayShape::Linear => {
+            let (mut start, mut end) = color_gradient_linear_points(*geometry);
+            let (changed, used) = draw_linear_gradient_handles(
+                ui,
+                rect,
+                ui.id()
+                    .with(("effect_linear_gradient", id_label, layer_idx)),
+                &mut start,
+                &mut end,
+                visuals,
+            );
+            if changed {
+                set_color_gradient_linear_points(geometry, start, end);
+            }
+            (changed, used)
+        }
+        ColorOverlayShape::Radial => draw_radial_circle_gradient_handles(
+            ui,
+            rect,
+            ui.id()
+                .with(("effect_radial_gradient", id_label, layer_idx)),
+            &mut geometry.center,
+            &mut geometry.radius,
+            visuals,
+        ),
+    }
+}
+
 fn hue_degrees_from_rgb(rgb: [u8; 3]) -> f32 {
     let r = rgb[0] as f32 / 255.0;
     let g = rgb[1] as f32 / 255.0;
@@ -15673,7 +16146,6 @@ mod tests {
                 "シャープ・ディテール",
                 "変形・歪み",
                 "表現・絵画調",
-                "描画・塗り",
                 "隠蔽・加工",
                 "光・雰囲気",
             ]
@@ -15685,6 +16157,7 @@ mod tests {
             .collect();
         let expected = vec![
             EffectKind::None,
+            EffectKind::ColorFill,
             EffectKind::Tone,
             EffectKind::ToneCurve,
             EffectKind::RgbToneCurve,
@@ -15718,7 +16191,6 @@ mod tests {
             EffectKind::Solarize,
             EffectKind::GlowingEdges,
             EffectKind::OilPaint,
-            EffectKind::ColorFill,
             EffectKind::SoftFocus,
             EffectKind::Mosaic,
             EffectKind::Sharpen,

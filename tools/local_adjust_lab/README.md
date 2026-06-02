@@ -116,6 +116,8 @@ the window.
 - RGB color parameters in Color Fill, Color Overlay, and Neon Glow share a
   control with a color button, HEX readout, RGB sliders, and an image-click
   eyedropper.
+- Linear and radial gradients in Color Fill and Color Overlay can be adjusted
+  with the same canvas drag handles used by gradient-like mask/effect controls.
 - 3D LUT sample files are available under `tools/local_adjust_lab/sample_luts/`.
   They are small self-made `.cube` files for quick testing of the LUT loader and
   effect strength slider.
