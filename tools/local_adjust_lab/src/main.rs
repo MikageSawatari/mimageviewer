@@ -21,11 +21,11 @@ use local_adjust_core::{
     HslParams, InvertParams, LensBlurAperture, LensBlurParams, LineKind, LinearGradientMask,
     LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
     MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, PosterizeParams,
-    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
-    RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams,
-    StarGlowParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
-    ToneCurveParams, ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size,
-    evaluate_layer_mask, parse_cube_lut,
+    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
+    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
+    SharpenParams, SoftFocusParams, StarGlowParams, ThreeWayColorGradingParams, ThresholdParams,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, VignetteParams, apply_layers,
+    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -942,6 +942,7 @@ enum EffectKind {
     MotionBlur,
     TiltShift,
     LensBlur,
+    RadialBlur,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -982,6 +983,7 @@ impl EffectKind {
             LocalEffect::MotionBlur(_) => Self::MotionBlur,
             LocalEffect::TiltShift(_) => Self::TiltShift,
             LocalEffect::LensBlur(_) => Self::LensBlur,
+            LocalEffect::RadialBlur(_) => Self::RadialBlur,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1022,6 +1024,7 @@ impl EffectKind {
             Self::MotionBlur => "移動ぼかし",
             Self::TiltShift => "チルトシフト",
             Self::LensBlur => "レンズぼかし",
+            Self::RadialBlur => "放射/回転ぼかし",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1066,6 +1069,9 @@ impl EffectKind {
                 "焦点帯を残して周囲をぼかし、浅い被写界深度やジオラマ風の見た目を作ります。"
             }
             Self::LensBlur => "絞り形状でぼかし、明るい点を玉ボケのように膨らませます。",
+            Self::RadialBlur => {
+                "中心から外へ伸びるズームぼかし、または中心周りの回転ぼかしを作ります。"
+            }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
@@ -1137,6 +1143,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::MotionBlur,
             EffectKind::TiltShift,
             EffectKind::LensBlur,
+            EffectKind::RadialBlur,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Sharpen,
@@ -6492,6 +6499,10 @@ fn effect_summary(effect: &LocalEffect) -> String {
             };
             format!("レンズぼかし {aperture} {:.0}px", params.radius_px)
         }
+        LocalEffect::RadialBlur(params) => match params.mode {
+            RadialBlurMode::Zoom => format!("ズームぼかし {:.0}px", params.zoom_px),
+            RadialBlurMode::Spin => format!("回転ぼかし {:+.0}°", params.spin_degrees),
+        },
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -7988,6 +7999,109 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からレンズぼかし結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::RadialBlur(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "ズーム弱") {
+                    *params = RadialBlurParams {
+                        mode: RadialBlurMode::Zoom,
+                        center: [0.5, 0.5],
+                        zoom_px: 28.0,
+                        spin_degrees: 0.0,
+                        samples: 21,
+                        strength: 0.65,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "集中") {
+                    *params = RadialBlurParams {
+                        mode: RadialBlurMode::Zoom,
+                        center: [0.5, 0.5],
+                        zoom_px: 78.0,
+                        spin_degrees: 0.0,
+                        samples: 33,
+                        strength: 0.95,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "回転") {
+                    *params = RadialBlurParams {
+                        mode: RadialBlurMode::Spin,
+                        center: [0.5, 0.5],
+                        zoom_px: 0.0,
+                        spin_degrees: 24.0,
+                        samples: 25,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強回転") {
+                    *params = RadialBlurParams {
+                        mode: RadialBlurMode::Spin,
+                        center: [0.5, 0.5],
+                        zoom_px: 0.0,
+                        spin_degrees: 64.0,
+                        samples: 41,
+                        strength: 0.9,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "中心から外へ伸びるズームぼかし、または中心周りに回るぼかしです。集中線的な速度感や渦巻き感に使えます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal(|ui| {
+                let zoom = params.mode == RadialBlurMode::Zoom;
+                if ui.selectable_label(zoom, "ズーム").clicked() && !zoom {
+                    params.mode = RadialBlurMode::Zoom;
+                    changed = true;
+                }
+                let spin = params.mode == RadialBlurMode::Spin;
+                if ui.selectable_label(spin, "回転").clicked() && !spin {
+                    params.mode = RadialBlurMode::Spin;
+                    changed = true;
+                }
+            });
+            let center_x =
+                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
+            changed |= center_x.changed();
+            center_x.lab_hover_tip(
+                "ぼかしの中心位置です。ズームでは集中点、回転では回転中心になります。",
+            );
+            let center_y =
+                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
+            changed |= center_y.changed();
+            center_y.lab_hover_tip("ぼかしの中心位置です。");
+            match params.mode {
+                RadialBlurMode::Zoom => {
+                    let zoom =
+                        ui.add(egui::Slider::new(&mut params.zoom_px, 0.0..=160.0).text("距離"));
+                    changed |= zoom.changed();
+                    zoom.lab_hover_tip("画像の端でどれだけ外向きにサンプルを伸ばすかです。");
+                }
+                RadialBlurMode::Spin => {
+                    let spin = ui.add(
+                        egui::Slider::new(&mut params.spin_degrees, -180.0..=180.0)
+                            .text("回転角")
+                            .suffix("°"),
+                    );
+                    changed |= spin.changed();
+                    spin.lab_hover_tip("画像の端でどれだけ回転方向にサンプルを広げるかです。符号で回転方向が変わります。");
+                }
+            }
+            let samples = ui.add(egui::Slider::new(&mut params.samples, 3..=65).text("サンプル数"));
+            changed |= samples.changed();
+            samples.lab_hover_tip(
+                "ぼかしの滑らかさです。大きいほど滑らかですが再合成は重くなります。",
+            );
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から放射/回転ぼかし結果へどれだけ近づけるかです。");
         }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -10233,6 +10347,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::MotionBlur => LocalEffect::MotionBlur(MotionBlurParams::default()),
         EffectKind::TiltShift => LocalEffect::TiltShift(TiltShiftParams::default()),
         EffectKind::LensBlur => LocalEffect::LensBlur(LensBlurParams::default()),
+        EffectKind::RadialBlur => LocalEffect::RadialBlur(RadialBlurParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),

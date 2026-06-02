@@ -415,6 +415,7 @@ pub enum LocalEffect {
     MotionBlur(MotionBlurParams),
     TiltShift(TiltShiftParams),
     LensBlur(LensBlurParams),
+    RadialBlur(RadialBlurParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -788,6 +789,37 @@ impl Default for LensBlurParams {
             rotation_degrees: 0.0,
             highlight_threshold: 0.96,
             highlight_boost: 0.0,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RadialBlurMode {
+    #[default]
+    Zoom,
+    Spin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RadialBlurParams {
+    pub mode: RadialBlurMode,
+    pub center: [f32; 2],
+    pub zoom_px: f32,
+    pub spin_degrees: f32,
+    pub samples: u32,
+    pub strength: f32,
+}
+
+impl Default for RadialBlurParams {
+    fn default() -> Self {
+        Self {
+            mode: RadialBlurMode::Zoom,
+            center: [0.5, 0.5],
+            zoom_px: 0.0,
+            spin_degrees: 0.0,
+            samples: 25,
             strength: 0.0,
         }
     }
@@ -1415,6 +1447,9 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         }
         LocalEffect::LensBlur(params) => {
             apply_lens_blur(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::RadialBlur(params) => {
+            apply_radial_blur(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -2539,6 +2574,82 @@ fn aperture_radius_at_angle(aperture: LensBlurAperture, angle: f32, rotation: f3
     let sector = std::f32::consts::PI * 2.0 / sides;
     let local = (angle - rotation + sector * 0.5).rem_euclid(sector) - sector * 0.5;
     (std::f32::consts::PI / sides).cos() / local.cos().max(0.001)
+}
+
+fn apply_radial_blur(src: &[u8], width: usize, height: usize, params: RadialBlurParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+
+    let samples = params.samples.clamp(3, 65) as usize;
+    let zoom_px = params.zoom_px.clamp(0.0, 240.0);
+    let spin_radians = params.spin_degrees.clamp(-180.0, 180.0).to_radians();
+    match params.mode {
+        RadialBlurMode::Zoom if zoom_px <= 0.5 => return src.to_vec(),
+        RadialBlurMode::Spin if spin_radians.abs() <= 0.001 => return src.to_vec(),
+        _ => {}
+    }
+
+    let cx = (width.saturating_sub(1)) as f32 * params.center[0].clamp(0.0, 1.0);
+    let cy = (height.saturating_sub(1)) as f32 * params.center[1].clamp(0.0, 1.0);
+    let max_dist = farthest_corner_distance(width, height, cx, cy).max(1.0);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= f32::EPSILON {
+                continue;
+            }
+            let dist_factor = (dist / max_dist).clamp(0.0, 1.0);
+            let mut sum = [0.0_f32; 3];
+            for sample in 0..samples {
+                let t = if samples <= 1 {
+                    0.0
+                } else {
+                    sample as f32 / (samples - 1) as f32 - 0.5
+                };
+                let (sx, sy) = match params.mode {
+                    RadialBlurMode::Zoom => {
+                        let offset = zoom_px * dist_factor * t;
+                        (x as f32 + dx / dist * offset, y as f32 + dy / dist * offset)
+                    }
+                    RadialBlurMode::Spin => {
+                        let theta = spin_radians * dist_factor * t;
+                        let cos_t = theta.cos();
+                        let sin_t = theta.sin();
+                        (cx + dx * cos_t - dy * sin_t, cy + dx * sin_t + dy * cos_t)
+                    }
+                };
+                let rgb = sample_rgb_bilinear(src, width, height, sx, sy);
+                sum[0] += rgb[0];
+                sum[1] += rgb[1];
+                sum[2] += rgb[2];
+            }
+            let inv_samples = 1.0 / samples as f32;
+            let oi = (y * width + x) * 4;
+            for c in 0..3 {
+                let blurred = to_u8(sum[c] * inv_samples);
+                out[oi + c] = lerp_u8(src[oi + c], blurred, strength);
+            }
+        }
+    }
+    out
+}
+
+fn farthest_corner_distance(width: usize, height: usize, cx: f32, cy: f32) -> f32 {
+    let max_x = width.saturating_sub(1) as f32;
+    let max_y = height.saturating_sub(1) as f32;
+    [(0.0, 0.0), (max_x, 0.0), (0.0, max_y), (max_x, max_y)]
+        .iter()
+        .map(|(x, y)| {
+            let dx = x - cx;
+            let dy = y - cy;
+            (dx * dx + dy * dy).sqrt()
+        })
+        .fold(0.0_f32, f32::max)
 }
 
 fn apply_soft_focus(
@@ -3837,6 +3948,31 @@ fn sample_channel_nearest(
     src[(yy * width + xx) * 4 + channel.min(3)]
 }
 
+fn sample_rgb_bilinear(src: &[u8], width: usize, height: usize, x: f32, y: f32) -> [f32; 3] {
+    if width == 0 || height == 0 {
+        return [0.0; 3];
+    }
+    let x = x.clamp(0.0, width.saturating_sub(1) as f32);
+    let y = y.clamp(0.0, height.saturating_sub(1) as f32);
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let tx = x - x0 as f32;
+    let ty = y - y0 as f32;
+    let i00 = (y0 * width + x0) * 4;
+    let i10 = (y0 * width + x1) * 4;
+    let i01 = (y1 * width + x0) * 4;
+    let i11 = (y1 * width + x1) * 4;
+    let mut out = [0.0_f32; 3];
+    for c in 0..3 {
+        let top = lerp_f32(src[i00 + c] as f32 / 255.0, src[i10 + c] as f32 / 255.0, tx);
+        let bottom = lerp_f32(src[i01 + c] as f32 / 255.0, src[i11 + c] as f32 / 255.0, tx);
+        out[c] = lerp_f32(top, bottom, ty);
+    }
+    out
+}
+
 fn nearest_pixel_index(width: usize, height: usize, x: f32, y: f32) -> usize {
     let xx = x.round().clamp(0.0, width.saturating_sub(1) as f32) as usize;
     let yy = y.round().clamp(0.0, height.saturating_sub(1) as f32) as usize;
@@ -4168,6 +4304,32 @@ mod tests {
     }
 
     #[test]
+    fn radial_zoom_blur_spreads_from_center_and_preserves_alpha() {
+        let mut pixels = vec![0_u8; 5 * 4];
+        for px in pixels.chunks_exact_mut(4) {
+            px[3] = 99;
+        }
+        pixels[0..4].copy_from_slice(&[255, 255, 255, 99]);
+        let src = RgbaImageBuf::new(5, 1, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "radial zoom",
+            LocalMask::Full,
+            LocalEffect::RadialBlur(RadialBlurParams {
+                mode: RadialBlurMode::Zoom,
+                center: [0.0, 0.5],
+                zoom_px: 8.0,
+                spin_degrees: 0.0,
+                samples: 5,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let neighbor = 4;
+        assert!(out.pixels[neighbor] > 0);
+        assert_eq!(out.pixels[neighbor + 3], 99);
+    }
+
+    #[test]
     fn shadow_lift_brightens_dark_pixel() {
         let src = solid(1, 1, [24, 24, 24, 255]);
         let layer = LocalAdjustmentLayer::new(
@@ -4220,6 +4382,7 @@ mod tests {
             LocalEffect::MotionBlur(MotionBlurParams::default()),
             LocalEffect::TiltShift(TiltShiftParams::default()),
             LocalEffect::LensBlur(LensBlurParams::default()),
+            LocalEffect::RadialBlur(RadialBlurParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),
