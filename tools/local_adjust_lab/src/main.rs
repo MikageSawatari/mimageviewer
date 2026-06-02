@@ -17,22 +17,22 @@ use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     ArtisticMediaMode, ArtisticMediaParams, BloomParams, BlurParams, BrushStrokeMode,
     BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams, CloudFogMode,
-    CloudFogParams, ColorBalanceParams, ColorBalanceRange, ColorFillParams, ColorGradeWheel,
-    ColorHalftoneParams, ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams,
-    ColorOverlayShape, ColorRangeMask, ColorTraceParams, ContactShadowParams, CubeLutParams,
-    CutoutParams, DehazeParams, DespeckleParams, DiffuseGlowParams, DuotoneParams, DuotonePreset,
-    EdgeSmoothParams, EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
-    GlassDisplacementParams, GlowingEdgesParams, GodRaysParams, GradientMapParams,
-    GradientMapPreset, HalationParams, HalftoneParams, HighPassParams, HighlightsShadowsParams,
-    HslParams, InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams,
-    LensFlareParams, LineExtractMode, LineExtractParams, LineKind, LinearGradientMask,
-    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
-    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
-    NeonGlowParams, NoiseDistribution, NoiseParams, OilPaintParams, OutlineStrokeParams,
-    OutlineStrokePlacement, PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams,
-    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
-    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
-    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams, ScreenToneMode,
+    CloudFogParams, ColorBalanceParams, ColorBalanceRange, ColorDodgeGlowParams, ColorFillParams,
+    ColorGradeWheel, ColorHalftoneParams, ColorMixerParams, ColorOverlayBlendMode,
+    ColorOverlayParams, ColorOverlayShape, ColorRangeMask, ColorTraceParams, ContactShadowParams,
+    CubeLutParams, CutoutParams, DehazeParams, DespeckleParams, DiffuseGlowParams, DuotoneParams,
+    DuotonePreset, EdgeSmoothParams, EmbossParams, EqualizeParams, FilmGrainParams,
+    GlassDisplacementMode, GlassDisplacementParams, GlowingEdgesParams, GodRaysParams,
+    GradientMapParams, GradientMapPreset, HalationParams, HalftoneParams, HighPassParams,
+    HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
+    LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams, LineKind,
+    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
+    ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
+    MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams, OilPaintParams,
+    OutlineStrokeParams, OutlineStrokePlacement, PinchSpherizeParams, PixelStylizeMode,
+    PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
+    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
+    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams, ScreenToneMode,
     ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
     SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
     StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
@@ -1037,6 +1037,7 @@ enum EffectKind {
     DiffuseGlow,
     Bloom,
     Halation,
+    ColorDodgeGlow,
     GodRays,
     LensFlare,
     CloudFog,
@@ -1070,6 +1071,7 @@ enum RgbPickTarget {
     OutlineStrokeColor,
     RimLightColor,
     ContactShadowColor,
+    ColorDodgeGlowColor,
     HalationTint,
     ToonShadeShadowTint,
     ToonShadeLightTint,
@@ -1091,6 +1093,7 @@ impl RgbPickTarget {
             Self::OutlineStrokeColor => "縁取りの線色",
             Self::RimLightColor => "リムライトの光色",
             Self::ContactShadowColor => "接触影の影色",
+            Self::ColorDodgeGlowColor => "覆い焼き発光の光色",
             Self::HalationTint => "ハレーションの暖色",
             Self::ToonShadeShadowTint => "トゥーン影色",
             Self::ToonShadeLightTint => "トゥーン光色",
@@ -1161,6 +1164,7 @@ impl EffectKind {
             LocalEffect::DiffuseGlow(_) => Self::DiffuseGlow,
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::Halation(_) => Self::Halation,
+            LocalEffect::ColorDodgeGlow(_) => Self::ColorDodgeGlow,
             LocalEffect::GodRays(_) => Self::GodRays,
             LocalEffect::LensFlare(_) => Self::LensFlare,
             LocalEffect::CloudFog(_) => Self::CloudFog,
@@ -1242,6 +1246,7 @@ impl EffectKind {
             Self::DiffuseGlow => "拡散光彩",
             Self::Bloom => "ブルーム",
             Self::Halation => "ハレーション",
+            Self::ColorDodgeGlow => "覆い焼き発光",
             Self::GodRays => "光芒",
             Self::LensFlare => "レンズフレア",
             Self::CloudFog => "雲/霧",
@@ -1384,6 +1389,9 @@ impl EffectKind {
             Self::Bloom => "明るい部分を周囲へにじませ、発光感を足します。",
             Self::Halation => {
                 "明るい部分と中間調の境界を暖色の白でにじませ、アニメ風の光浮きを作ります。"
+            }
+            Self::ColorDodgeGlow => {
+                "明るい部分から色付きの光を作り、スクリーンと覆い焼きを混ぜて強い発光感を足します。"
             }
             Self::GodRays => "明るい部分から光源方向に沿った放射状の光芒を作ります。",
             Self::LensFlare => "光源のにじみ、ハロー、レンズ内反射のゴーストを重ねます。",
@@ -1551,6 +1559,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
             EffectKind::Halation,
+            EffectKind::ColorDodgeGlow,
             EffectKind::RimLight,
             EffectKind::ContactShadow,
             EffectKind::GodRays,
@@ -8455,6 +8464,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::DiffuseGlow(params) => format!("拡散光彩 {:.0}px", params.radius_px),
         LocalEffect::Bloom(params) => format!("ブルーム {:.0}px", params.radius_px),
         LocalEffect::Halation(params) => format!("ハレーション {:.0}px", params.radius_px),
+        LocalEffect::ColorDodgeGlow(params) => format!(
+            "覆い焼き発光 {:.0}px {:.0}%",
+            params.radius_px,
+            params.strength * 100.0
+        ),
         LocalEffect::GodRays(params) => format!("光芒 {:.0}px", params.length_px),
         LocalEffect::LensFlare(params) => {
             format!("レンズフレア {:.0}%", params.strength * 100.0)
@@ -8788,6 +8802,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
             true
         }
         (LocalEffect::ContactShadow(params), RgbPickTarget::ContactShadowColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::ColorDodgeGlow(params), RgbPickTarget::ColorDodgeGlowColor) => {
             params.color_rgb = rgb;
             true
         }
@@ -14195,6 +14213,96 @@ fn draw_effect_params(
             changed |= screen_blend.changed();
             screen_blend.lab_hover_tip("ONにすると、加算より白飛びを抑えながら発光感を出します。");
         }
+        LocalEffect::ColorDodgeGlow(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "魔法光") {
+                    *params = ColorDodgeGlowParams {
+                        threshold: 0.36,
+                        radius_px: 34.0,
+                        strength: 0.88,
+                        dodge_amount: 0.72,
+                        color_rgb: [82, 190, 255],
+                        color_strength: 0.68,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "暖色発光") {
+                    *params = ColorDodgeGlowParams {
+                        threshold: 0.42,
+                        radius_px: 42.0,
+                        strength: 0.75,
+                        dodge_amount: 0.55,
+                        color_rgb: [255, 178, 80],
+                        color_strength: 0.58,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強い覆い焼き") {
+                    *params = ColorDodgeGlowParams {
+                        threshold: 0.26,
+                        radius_px: 24.0,
+                        strength: 1.05,
+                        dodge_amount: 1.0,
+                        color_rgb: [255, 255, 255],
+                        color_strength: 0.08,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡い感情光") {
+                    *params = ColorDodgeGlowParams {
+                        threshold: 0.18,
+                        radius_px: 72.0,
+                        strength: 0.46,
+                        dodge_amount: 0.34,
+                        color_rgb: [255, 124, 212],
+                        color_strength: 0.78,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "明るい部分を発光源にして、スクリーンと覆い焼きを混ぜた色付きの強い光を重ねます。初期状態では前ON/後OFFなので光がマスク外へ広がります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let threshold =
+                ui.add(egui::Slider::new(&mut params.threshold, 0.0..=0.995).text("発光しきい値"));
+            changed |= threshold.changed();
+            threshold.lab_hover_tip("どの明るさから発光源として拾うかです。低いほど広く光ります。");
+            let radius = ui.add(
+                egui::Slider::new(&mut params.radius_px, 0.0..=180.0)
+                    .text("光の半径")
+                    .suffix("px"),
+            );
+            changed |= radius.changed();
+            radius.lab_hover_tip("色付きの光をどれだけ周囲へ広げるかです。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=2.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("発光を元画像へ重ねる強さです。");
+            let dodge =
+                ui.add(egui::Slider::new(&mut params.dodge_amount, 0.0..=1.0).text("覆い焼き量"));
+            changed |= dodge.changed();
+            dodge.lab_hover_tip("0で柔らかいスクリーン寄り、1で強い覆い焼き寄りになります。");
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "光色",
+                    &mut params.color_rgb,
+                    RgbPickTarget::ColorDodgeGlowColor,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let color_strength =
+                ui.add(egui::Slider::new(&mut params.color_strength, 0.0..=1.0).text("着色量"));
+            changed |= color_strength.changed();
+            color_strength.lab_hover_tip("元の明部色から、指定した光色へどれだけ寄せるかです。");
+        }
         LocalEffect::GodRays(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -16557,6 +16665,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::DiffuseGlow => LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::Halation => LocalEffect::Halation(HalationParams::default()),
+        EffectKind::ColorDodgeGlow => LocalEffect::ColorDodgeGlow(ColorDodgeGlowParams::default()),
         EffectKind::GodRays => LocalEffect::GodRays(GodRaysParams::default()),
         EffectKind::LensFlare => LocalEffect::LensFlare(LensFlareParams::default()),
         EffectKind::CloudFog => LocalEffect::CloudFog(CloudFogParams::default()),
@@ -18885,6 +18994,7 @@ mod tests {
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
             EffectKind::Halation,
+            EffectKind::ColorDodgeGlow,
             EffectKind::GodRays,
             EffectKind::LensFlare,
             EffectKind::CloudFog,
@@ -19195,6 +19305,17 @@ mod tests {
             panic!("expected contact shadow effect");
         };
         assert_eq!(contact_shadow_params.color_rgb, [24, 18, 36]);
+
+        let mut color_dodge_glow = LocalEffect::ColorDodgeGlow(ColorDodgeGlowParams::default());
+        assert!(set_rgb_pick_target(
+            &mut color_dodge_glow,
+            RgbPickTarget::ColorDodgeGlowColor,
+            [255, 140, 80],
+        ));
+        let LocalEffect::ColorDodgeGlow(color_dodge_glow_params) = color_dodge_glow else {
+            panic!("expected color dodge glow effect");
+        };
+        assert_eq!(color_dodge_glow_params.color_rgb, [255, 140, 80]);
 
         let mut halation = LocalEffect::Halation(HalationParams::default());
         assert!(set_rgb_pick_target(

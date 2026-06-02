@@ -585,6 +585,7 @@ pub enum LocalEffect {
     DiffuseGlow(DiffuseGlowParams),
     Bloom(BloomParams),
     Halation(HalationParams),
+    ColorDodgeGlow(ColorDodgeGlowParams),
     GodRays(GodRaysParams),
     LensFlare(LensFlareParams),
     SpeedLines(SpeedLinesParams),
@@ -666,6 +667,7 @@ impl LocalEffect {
             Self::DiffuseGlow(_) => "拡散光彩",
             Self::Bloom(_) => "ブルーム",
             Self::Halation(_) => "ハレーション",
+            Self::ColorDodgeGlow(_) => "覆い焼き発光",
             Self::GodRays(_) => "光芒",
             Self::LensFlare(_) => "レンズフレア",
             Self::SpeedLines(_) => "集中線/スピード線",
@@ -695,6 +697,7 @@ pub fn default_mask_application_for_effect(effect: &LocalEffect) -> MaskApplicat
         | LocalEffect::DiffuseGlow(_)
         | LocalEffect::Bloom(_)
         | LocalEffect::Halation(_)
+        | LocalEffect::ColorDodgeGlow(_)
         | LocalEffect::GodRays(_)
         | LocalEffect::StarGlow(_)
         | LocalEffect::OutlineStroke(_)
@@ -2450,6 +2453,29 @@ fn default_neon_glow_source_feather() -> f32 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ColorDodgeGlowParams {
+    pub threshold: f32,
+    pub radius_px: f32,
+    pub strength: f32,
+    pub dodge_amount: f32,
+    pub color_rgb: [u8; 3],
+    pub color_strength: f32,
+}
+
+impl Default for ColorDodgeGlowParams {
+    fn default() -> Self {
+        Self {
+            threshold: 0.55,
+            radius_px: 0.0,
+            strength: 0.0,
+            dodge_amount: 0.65,
+            color_rgb: [255, 220, 128],
+            color_strength: 0.35,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DiffuseGlowParams {
     pub threshold: f32,
     pub radius_px: f32,
@@ -3355,6 +3381,9 @@ where
             }
             LocalEffect::Halation(params) => {
                 apply_halation(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::ColorDodgeGlow(params) => {
+                apply_color_dodge_glow(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::GodRays(params) => {
                 apply_god_rays(&image.pixels, image.width, image.height, *params)
@@ -8028,6 +8057,15 @@ fn screen_channel(base: f32, overlay: f32) -> f32 {
     (1.0 - (1.0 - base) * (1.0 - overlay)).clamp(0.0, 1.0)
 }
 
+fn color_dodge_channel(base: f32, blend: f32) -> f32 {
+    let blend = blend.clamp(0.0, 0.98);
+    if blend >= 0.98 {
+        1.0
+    } else {
+        (base / (1.0 - blend)).clamp(0.0, 1.0)
+    }
+}
+
 fn overlay_blend_channel(base: f32, overlay: f32) -> f32 {
     if base < 0.5 {
         2.0 * base * overlay
@@ -8420,6 +8458,67 @@ fn apply_halation(src: &[u8], width: usize, height: usize, params: HalationParam
             } else {
                 (base + add).clamp(0.0, 1.0)
             };
+            out[i + c] = to_u8(target);
+        }
+    }
+    out
+}
+
+fn apply_color_dodge_glow(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: ColorDodgeGlowParams,
+) -> Vec<u8> {
+    let radius = params.radius_px.round().clamp(0.0, 180.0) as usize;
+    let strength = params.strength.clamp(0.0, 2.0);
+    if radius == 0 || strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let threshold = params.threshold.clamp(0.0, 0.995);
+    let tint = rgb_u8_to_f32(params.color_rgb);
+    let color_strength = params.color_strength.clamp(0.0, 1.0);
+    let mut bright = vec![0_u8; src.len()];
+    for i in (0..src.len()).step_by(4) {
+        let alpha = src[i + 3] as f32 / 255.0;
+        if alpha <= f32::EPSILON {
+            continue;
+        }
+        let base = [
+            src[i] as f32 / 255.0,
+            src[i + 1] as f32 / 255.0,
+            src[i + 2] as f32 / 255.0,
+        ];
+        let luma = luma01(base[0], base[1], base[2]);
+        let gate = smoothstep(threshold, (threshold + 0.32).min(1.0), luma) * alpha;
+        if gate <= f32::EPSILON {
+            continue;
+        }
+        let glow_rgb = [
+            lerp_f32(base[0], tint[0], color_strength),
+            lerp_f32(base[1], tint[1], color_strength),
+            lerp_f32(base[2], tint[2], color_strength),
+        ];
+        for c in 0..3 {
+            bright[i + c] = to_u8(glow_rgb[c] * gate);
+        }
+        bright[i + 3] = src[i + 3];
+    }
+
+    let glow = box_blur_rgba(&bright, width, height, radius);
+    let dodge_amount = params.dodge_amount.clamp(0.0, 1.0);
+    let mut out = src.to_vec();
+    for i in (0..src.len()).step_by(4) {
+        for c in 0..3 {
+            let base = src[i + c] as f32 / 255.0;
+            let glow_signal = (glow[i + c] as f32 / 255.0 * strength).clamp(0.0, 1.0);
+            if glow_signal <= f32::EPSILON {
+                continue;
+            }
+            let screened = screen_channel(base, glow_signal);
+            let dodged = color_dodge_channel(base, glow_signal * dodge_amount);
+            let target = (screened + (dodged - base).max(0.0) * dodge_amount).clamp(0.0, 1.0);
             out[i + c] = to_u8(target);
         }
     }
@@ -10125,6 +10224,14 @@ mod tests {
         );
         assert!(contact_shadow.mask_before_effect);
         assert!(contact_shadow.mask_after_effect);
+
+        let color_dodge_glow = LocalAdjustmentLayer::new(
+            "color dodge glow",
+            LocalMask::Full,
+            LocalEffect::ColorDodgeGlow(ColorDodgeGlowParams::default()),
+        );
+        assert!(color_dodge_glow.mask_before_effect);
+        assert!(!color_dodge_glow.mask_after_effect);
 
         let wave = LocalAdjustmentLayer::new(
             "wave",
@@ -11889,6 +11996,7 @@ mod tests {
             LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
             LocalEffect::Halation(HalationParams::default()),
+            LocalEffect::ColorDodgeGlow(ColorDodgeGlowParams::default()),
             LocalEffect::GodRays(GodRaysParams::default()),
             LocalEffect::LensFlare(LensFlareParams::default()),
             LocalEffect::SpeedLines(SpeedLinesParams::default()),
@@ -12424,6 +12532,17 @@ mod tests {
                     tint_rgb: [255, 232, 196],
                     edge_bias: 1.0,
                     screen_blend: true,
+                }),
+            ),
+            full(
+                "color dodge glow max radius",
+                LocalEffect::ColorDodgeGlow(ColorDodgeGlowParams {
+                    threshold: 0.0,
+                    radius_px: 180.0,
+                    strength: 2.0,
+                    dodge_amount: 1.0,
+                    color_rgb: [255, 220, 128],
+                    color_strength: 1.0,
                 }),
             ),
             full(
@@ -13660,6 +13779,66 @@ LUT_3D_SIZE 2
         assert!(out.pixels[0] > src.pixels[0]);
         assert!(out.pixels[0] >= out.pixels[2]);
         assert_eq!(out.pixels[3], 77);
+    }
+
+    #[test]
+    fn color_dodge_glow_spreads_tinted_light_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![24, 24, 24, 99, 255, 255, 255, 99, 24, 24, 24, 99],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "color dodge glow",
+            LocalMask::Full,
+            LocalEffect::ColorDodgeGlow(ColorDodgeGlowParams {
+                threshold: 0.0,
+                radius_px: 1.0,
+                strength: 1.0,
+                dodge_amount: 0.75,
+                color_rgb: [255, 80, 32],
+                color_strength: 1.0,
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert!(out.pixels[0] > out.pixels[2]);
+        assert_eq!(out.pixels[3], 99);
+    }
+
+    #[test]
+    fn color_dodge_glow_can_escape_mask_when_post_mask_is_off() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![24, 24, 24, 255, 255, 255, 255, 255, 24, 24, 24, 255],
+        )
+        .unwrap();
+        let mask = LocalMask::Raster(RasterMask {
+            width: 3,
+            height: 1,
+            alpha: vec![0.0, 1.0, 0.0],
+        });
+        let layer = LocalAdjustmentLayer::new(
+            "color dodge glow",
+            mask,
+            LocalEffect::ColorDodgeGlow(ColorDodgeGlowParams {
+                threshold: 0.0,
+                radius_px: 1.0,
+                strength: 1.0,
+                dodge_amount: 0.0,
+                color_rgb: [255, 255, 255],
+                color_strength: 0.0,
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert_eq!(out.pixels[3], 255);
     }
 
     #[test]
