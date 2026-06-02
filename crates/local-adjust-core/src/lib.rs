@@ -432,6 +432,7 @@ pub enum LocalEffect {
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
+    SmartSharpen(SmartSharpenParams),
     Hsl(HslParams),
     ColorMixer(ColorMixerParams),
     Look(LookParams),
@@ -476,6 +477,7 @@ impl LocalEffect {
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
+            Self::SmartSharpen(_) => "スマートシャープ",
             Self::Hsl(_) => "色相/HSL",
             Self::ColorMixer(_) => "カラーミキサー",
             Self::Look(_) => "ルック",
@@ -1057,6 +1059,25 @@ impl Default for SharpenParams {
             amount: 0.0,
             radius_px: 1.0,
             threshold: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SmartSharpenParams {
+    pub amount: f32,
+    pub radius_px: f32,
+    pub edge_threshold: f32,
+    pub halo_suppression: f32,
+}
+
+impl Default for SmartSharpenParams {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            radius_px: 2.0,
+            edge_threshold: 0.08,
+            halo_suppression: 0.5,
         }
     }
 }
@@ -1685,6 +1706,15 @@ where
             params.radius_px.round().max(0.0) as usize,
             params.amount.clamp(0.0, 2.0),
             params.threshold.clamp(0.0, 255.0),
+        ),
+        LocalEffect::SmartSharpen(params) => apply_smart_sharpen(
+            &image.pixels,
+            image.width,
+            image.height,
+            params.radius_px.round().max(0.0) as usize,
+            params.amount.clamp(0.0, 2.0),
+            params.edge_threshold.clamp(0.0, 1.0),
+            params.halo_suppression.clamp(0.0, 1.0),
         ),
         LocalEffect::Hsl(params) => apply_hsl(&image.pixels, *params),
         LocalEffect::ColorMixer(params) => apply_color_mixer(&image.pixels, *params),
@@ -3085,6 +3115,75 @@ fn apply_sharpen(
         }
     }
     out
+}
+
+fn apply_smart_sharpen(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    radius: usize,
+    amount: f32,
+    edge_threshold: f32,
+    halo_suppression: f32,
+) -> Vec<u8> {
+    if radius == 0 || amount <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let blur = box_blur_rgba(src, width, height, radius);
+    let mut out = src.to_vec();
+    let edge_softness = 0.12_f32.max(edge_threshold * 0.75);
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let edge = luma_edge_strength(src, width, height, x, y);
+            let edge_weight = smoothstep(edge_threshold, edge_threshold + edge_softness, edge);
+            if edge_weight <= f32::EPSILON {
+                continue;
+            }
+            let base_luma = luma01(
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            );
+            for c in 0..3 {
+                let base = src[i + c] as f32;
+                let detail = base - blur[i + c] as f32;
+                let headroom = if detail >= 0.0 {
+                    1.0 - base_luma
+                } else {
+                    base_luma
+                };
+                let halo_gate = lerp_f32(1.0, smoothstep(0.02, 0.42, headroom), halo_suppression);
+                out[i + c] = (base + detail * amount * edge_weight * halo_gate)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+fn luma_edge_strength(src: &[u8], width: usize, height: usize, x: usize, y: usize) -> f32 {
+    let xm = x.saturating_sub(1);
+    let xp = (x + 1).min(width - 1);
+    let ym = y.saturating_sub(1);
+    let yp = (y + 1).min(height - 1);
+    let left = pixel_luma01(src, width, xm, y);
+    let right = pixel_luma01(src, width, xp, y);
+    let top = pixel_luma01(src, width, x, ym);
+    let bottom = pixel_luma01(src, width, x, yp);
+    let dx = right - left;
+    let dy = bottom - top;
+    (dx * dx + dy * dy).sqrt().min(1.0)
+}
+
+fn pixel_luma01(src: &[u8], width: usize, x: usize, y: usize) -> f32 {
+    let i = (y * width + x) * 4;
+    luma01(
+        src[i] as f32 / 255.0,
+        src[i + 1] as f32 / 255.0,
+        src[i + 2] as f32 / 255.0,
+    )
 }
 
 fn apply_hsl(src: &[u8], params: HslParams) -> Vec<u8> {
@@ -4939,6 +5038,75 @@ mod tests {
     }
 
     #[test]
+    fn smart_sharpen_preserves_flat_image() {
+        let src = solid(4, 4, [100, 120, 140, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "smart sharpen",
+            LocalMask::Full,
+            LocalEffect::SmartSharpen(SmartSharpenParams {
+                amount: 1.2,
+                radius_px: 2.0,
+                edge_threshold: 0.02,
+                halo_suppression: 0.5,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn smart_sharpen_threshold_ignores_weak_texture() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                100, 100, 100, 255, 102, 102, 102, 255, 100, 100, 100, 255, 102, 102, 102, 255,
+                100, 100, 100, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "smart sharpen",
+            LocalMask::Full,
+            LocalEffect::SmartSharpen(SmartSharpenParams {
+                amount: 2.0,
+                radius_px: 1.0,
+                edge_threshold: 0.08,
+                halo_suppression: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn smart_sharpen_emphasizes_strong_edges() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                40, 40, 40, 255, 40, 40, 40, 255, 180, 180, 180, 255, 180, 180, 180, 255, 180, 180,
+                180, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "smart sharpen",
+            LocalMask::Full,
+            LocalEffect::SmartSharpen(SmartSharpenParams {
+                amount: 1.2,
+                radius_px: 1.0,
+                edge_threshold: 0.05,
+                halo_suppression: 0.2,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[4] < src.pixels[4]);
+        assert!(out.pixels[8] > src.pixels[8]);
+        assert_eq!(out.pixels[11], 255);
+    }
+
+    #[test]
     fn default_adjustment_effects_are_identity() {
         let src = RgbaImageBuf::new(
             3,
@@ -4967,6 +5135,7 @@ mod tests {
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),
+            LocalEffect::SmartSharpen(SmartSharpenParams::default()),
             LocalEffect::Hsl(HslParams::default()),
             LocalEffect::ColorMixer(ColorMixerParams::default()),
             LocalEffect::Look(LookParams::default()),

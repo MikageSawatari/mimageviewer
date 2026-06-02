@@ -24,10 +24,10 @@ use local_adjust_core::{
     ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
     MotionBlurParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
     RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
-    RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
-    TextureParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
-    ToneCurveParams, ToneParams, VignetteParams, apply_layers, apply_layers_with_progress,
-    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, VignetteParams, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -973,6 +973,7 @@ enum EffectKind {
     SoftFocus,
     Mosaic,
     Sharpen,
+    SmartSharpen,
     Hsl,
     ColorMixer,
     Look,
@@ -1017,6 +1018,7 @@ impl EffectKind {
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
+            LocalEffect::SmartSharpen(_) => Self::SmartSharpen,
             LocalEffect::Hsl(_) => Self::Hsl,
             LocalEffect::ColorMixer(_) => Self::ColorMixer,
             LocalEffect::Look(_) => Self::Look,
@@ -1061,6 +1063,7 @@ impl EffectKind {
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
+            Self::SmartSharpen => "スマートシャープ",
             Self::Hsl => "色相/HSL",
             Self::ColorMixer => "カラーミキサー",
             Self::Look => "ルック",
@@ -1115,6 +1118,9 @@ impl EffectKind {
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
+            Self::SmartSharpen => {
+                "輪郭を検出してシャープをかけ、白フチや黒フチを抑えながら細部を引き締めます。"
+            }
             Self::Hsl => "色相、彩度、明度を調整し、髪色変更などの色替えに使います。",
             Self::ColorMixer => "赤、黄、緑、青などの色帯ごとに色相、彩度、明度を調整します。",
             Self::Look => "夕焼け、夜景、フィルム風などのまとまった色味を適用します。",
@@ -1214,6 +1220,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Texture,
             EffectKind::HighPass,
             EffectKind::Sharpen,
+            EffectKind::SmartSharpen,
             EffectKind::EdgeSmooth,
             EffectKind::Median,
         ],
@@ -7122,6 +7129,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 format!("シャープ {:.0}%", params.amount * 100.0)
             }
         }
+        LocalEffect::SmartSharpen(params) => {
+            format!("スマートシャープ {:.0}%", params.amount * 100.0)
+        }
         LocalEffect::Hsl(params) => format!("色相 {:+.0}°", params.hue_degrees),
         LocalEffect::ColorMixer(params) => {
             format!("カラーミキサー {}色", color_mixer_adjusted_count(params))
@@ -9039,6 +9049,67 @@ fn draw_effect_params(
             threshold.lab_hover_tip(
                 "小さな明暗差を無視する量です。値を上げるとノイズや微妙なざらつきに効きにくくなります。",
             );
+        }
+        LocalEffect::SmartSharpen(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "自然") {
+                    *params = SmartSharpenParams {
+                        amount: 0.65,
+                        radius_px: 2.0,
+                        edge_threshold: 0.08,
+                        halo_suppression: 0.65,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "細部") {
+                    *params = SmartSharpenParams {
+                        amount: 0.95,
+                        radius_px: 1.2,
+                        edge_threshold: 0.05,
+                        halo_suppression: 0.45,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "輪郭") {
+                    *params = SmartSharpenParams {
+                        amount: 1.15,
+                        radius_px: 3.0,
+                        edge_threshold: 0.12,
+                        halo_suppression: 0.75,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "フチ抑制") {
+                    *params = SmartSharpenParams {
+                        amount: 1.2,
+                        radius_px: 2.4,
+                        edge_threshold: 0.08,
+                        halo_suppression: 1.0,
+                    };
+                    changed = true;
+                }
+            });
+            let amount = ui.add(egui::Slider::new(&mut params.amount, 0.0..=2.0).text("量"));
+            changed |= amount.changed();
+            amount.lab_hover_tip(
+                "輪郭に足し戻す強さです。通常のシャープよりエッジを選んで効きます。",
+            );
+            let radius = ui.add(egui::Slider::new(&mut params.radius_px, 0.0..=16.0).text("半径"));
+            changed |= radius.changed();
+            radius.lab_hover_tip(
+                "復元する輪郭の幅です。細部は小さく、太い線や境界は大きめにします。",
+            );
+            let edge_threshold =
+                ui.add(egui::Slider::new(&mut params.edge_threshold, 0.0..=0.5).text("エッジ判定"));
+            changed |= edge_threshold.changed();
+            edge_threshold.lab_hover_tip(
+                "どれだけ明暗差がある場所を輪郭として扱うかです。上げると平坦部に効きにくくなります。",
+            );
+            let halo =
+                ui.add(egui::Slider::new(&mut params.halo_suppression, 0.0..=1.0).text("フチ抑制"));
+            changed |= halo.changed();
+            halo.lab_hover_tip("明るいフチや暗いフチが立ちすぎる方向の強調を抑えます。");
         }
         LocalEffect::Hsl(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -11160,6 +11231,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
+        EffectKind::SmartSharpen => LocalEffect::SmartSharpen(SmartSharpenParams::default()),
         EffectKind::Hsl => LocalEffect::Hsl(HslParams::default()),
         EffectKind::ColorMixer => LocalEffect::ColorMixer(ColorMixerParams::default()),
         EffectKind::Look => LocalEffect::Look(LookParams::default()),
