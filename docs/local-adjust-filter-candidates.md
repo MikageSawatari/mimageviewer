@@ -48,14 +48,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、60種)
+### `LocalEffect` (部分補正レイヤー、61種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorFill, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
+GradientMap, ColorFill, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, GodRays, LensFlare, CloudFog, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -144,7 +144,7 @@ LightLeak / 減色8機種 / CRT 3種＋複合 / カラーグレード11種
 - [x] **光芒 / God rays (放射状ボリューム光 / `GodRays`)** ★★★ **中** — 木漏れ日・差し込む光。明部を拾い、指定中心から外側へ伸びる暖色寄りの光芒を生成できる
 - [x] **レンズフレア (`LensFlare`)** ★★ **中** — 光源演出の定番。指定光源からコア、ハロー、ゴースト、光条を重ねられるようにした (PS Render)
 - [x] **集中線 / スピード線 (`SpeedLines`)** ★ **中** — 放射/平行の線を自動生成オーバーレイ。線色、線数、線幅、中心抜き、線長、seed を調整できる (manga) (CSP)
-- [ ] **雲 / 霧 (procedural fog)** **中** — 大気・遠近感 (PS Clouds)
+- [x] **雲 / 霧 (`CloudFog`)** **中** — 大気・遠近感。霧/雲モード、色、密度、コントラスト、上下フェード、seed を調整できる procedural fog/clouds として追加 (PS Clouds)
 - [ ] **ライティング (スポットライト)** **難** — 局所光源 (PS Lighting Effects)
 
 ---

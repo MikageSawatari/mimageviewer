@@ -16,22 +16,22 @@ use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     ArtisticMediaMode, ArtisticMediaParams, BloomParams, BlurParams, BrushStrokeMode,
-    BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
-    ColorBalanceParams, ColorBalanceRange, ColorFillParams, ColorGradeWheel, ColorMixerParams,
-    ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask, CubeLutParams,
-    CutoutParams, DehazeParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
-    EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
-    GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalftoneParams,
-    HighPassParams, HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture,
-    LensBlurParams, LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams,
-    LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
-    LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
-    MosaicTileMode, MotionBlurParams, NeonGlowParams, OilPaintParams, PinchSpherizeParams,
-    PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
-    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
-    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
-    SolarizeParams, SpeedLinesMode, SpeedLinesParams, StarGlowParams, SubjectMask,
+    BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams, CloudFogMode,
+    CloudFogParams, ColorBalanceParams, ColorBalanceRange, ColorFillParams, ColorGradeWheel,
+    ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask,
+    CubeLutParams, CutoutParams, DehazeParams, DiffuseGlowParams, DuotoneParams, DuotonePreset,
+    EdgeSmoothParams, EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
+    GlassDisplacementParams, GlowingEdgesParams, GodRaysParams, GradientMapParams,
+    GradientMapPreset, HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams,
+    InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LensFlareParams,
+    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer,
+    LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams,
+    MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams, OilPaintParams,
+    PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
+    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
+    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
+    RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, StarGlowParams, SubjectMask,
     SubjectMaskRefinement, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
     TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams,
     WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
@@ -1020,6 +1020,7 @@ enum EffectKind {
     Bloom,
     GodRays,
     LensFlare,
+    CloudFog,
     Vignette,
     FilmGrain,
     ChromaticAberration,
@@ -1039,6 +1040,7 @@ enum RgbPickTarget {
     NeonGlowSource,
     NeonGlowTint,
     SpeedLinesColor,
+    CloudFogColor,
 }
 
 impl RgbPickTarget {
@@ -1052,6 +1054,7 @@ impl RgbPickTarget {
             Self::NeonGlowSource => "ネオングローの発光源色",
             Self::NeonGlowTint => "ネオングローの着色",
             Self::SpeedLinesColor => "集中線/スピード線の線色",
+            Self::CloudFogColor => "雲/霧の色",
         }
     }
 }
@@ -1115,6 +1118,7 @@ impl EffectKind {
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::GodRays(_) => Self::GodRays,
             LocalEffect::LensFlare(_) => Self::LensFlare,
+            LocalEffect::CloudFog(_) => Self::CloudFog,
             LocalEffect::Vignette(_) => Self::Vignette,
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
             LocalEffect::ChromaticAberration(_) => Self::ChromaticAberration,
@@ -1183,6 +1187,7 @@ impl EffectKind {
             Self::Bloom => "ブルーム",
             Self::GodRays => "光芒",
             Self::LensFlare => "レンズフレア",
+            Self::CloudFog => "雲/霧",
             Self::Vignette => "ビネット",
             Self::FilmGrain => "フィルム粒子",
             Self::ChromaticAberration => "色収差",
@@ -1303,6 +1308,7 @@ impl EffectKind {
             Self::Bloom => "明るい部分を周囲へにじませ、発光感を足します。",
             Self::GodRays => "明るい部分から光源方向に沿った放射状の光芒を作ります。",
             Self::LensFlare => "光源のにじみ、ハロー、レンズ内反射のゴーストを重ねます。",
+            Self::CloudFog => "手続き型のノイズで霧や雲を重ね、大気感と遠近感を加えます。",
             Self::Vignette => "周辺を暗く、または明るくして視線を中央へ誘導します。",
             Self::FilmGrain => "粒状感を加え、フィルムや紙っぽい質感を作ります。",
             Self::ChromaticAberration => "RGBを少しずらし、レンズやデジタル風の色ズレを作ります。",
@@ -1441,6 +1447,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Bloom,
             EffectKind::GodRays,
             EffectKind::LensFlare,
+            EffectKind::CloudFog,
             EffectKind::StarGlow,
             EffectKind::Vignette,
             EffectKind::FilmGrain,
@@ -7934,6 +7941,10 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::LensFlare(params) => {
             format!("レンズフレア {:.0}%", params.strength * 100.0)
         }
+        LocalEffect::CloudFog(params) => match params.mode {
+            CloudFogMode::Fog => format!("霧 {:.0}%", params.opacity * 100.0),
+            CloudFogMode::Clouds => format!("雲 {:.0}%", params.opacity * 100.0),
+        },
         LocalEffect::Vignette(params) => format!("ビネット {:.0}%", params.strength * 100.0),
         LocalEffect::FilmGrain(params) => format!("粒子 {:.0}%", params.amount * 100.0),
         LocalEffect::ChromaticAberration(params) => {
@@ -8163,6 +8174,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
             true
         }
         (LocalEffect::SpeedLines(params), RgbPickTarget::SpeedLinesColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::CloudFog(params), RgbPickTarget::CloudFogColor) => {
             params.color_rgb = rgb;
             true
         }
@@ -13097,6 +13112,125 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.warm_tint, 0.0..=1.0).text("暖色"))
                 .changed();
         }
+        LocalEffect::CloudFog(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "薄霧") {
+                    *params = CloudFogParams {
+                        mode: CloudFogMode::Fog,
+                        scale_px: 220.0,
+                        detail: 0.35,
+                        density: 0.42,
+                        contrast: 0.16,
+                        height_fade: 0.35,
+                        opacity: 0.30,
+                        color_rgb: [235, 244, 255],
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "濃霧") {
+                    *params = CloudFogParams {
+                        mode: CloudFogMode::Fog,
+                        scale_px: 150.0,
+                        detail: 0.48,
+                        density: 0.78,
+                        contrast: 0.10,
+                        height_fade: 0.08,
+                        opacity: 0.58,
+                        color_rgb: [232, 238, 246],
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "雲") {
+                    *params = CloudFogParams {
+                        mode: CloudFogMode::Clouds,
+                        scale_px: 96.0,
+                        detail: 0.78,
+                        density: 0.66,
+                        contrast: 0.62,
+                        height_fade: 0.0,
+                        opacity: 0.72,
+                        color_rgb: [255, 255, 255],
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "夕霧") {
+                    *params = CloudFogParams {
+                        mode: CloudFogMode::Fog,
+                        scale_px: 190.0,
+                        detail: 0.42,
+                        density: 0.55,
+                        contrast: 0.22,
+                        height_fade: 0.22,
+                        opacity: 0.42,
+                        color_rgb: [255, 220, 176],
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "手続き型のノイズで霧や雲を重ねます。マスクと組み合わせて遠景や背景に大気感を足せます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let fog = params.mode == CloudFogMode::Fog;
+                if ui.selectable_label(fog, "霧").clicked() && !fog {
+                    params.mode = CloudFogMode::Fog;
+                    changed = true;
+                }
+                let clouds = params.mode == CloudFogMode::Clouds;
+                if ui.selectable_label(clouds, "雲").clicked() && !clouds {
+                    params.mode = CloudFogMode::Clouds;
+                    changed = true;
+                }
+            });
+            let scale =
+                ui.add(egui::Slider::new(&mut params.scale_px, 8.0..=640.0).text("スケール"));
+            changed |= scale.changed();
+            scale.lab_hover_tip("ノイズの大きさです。大きいほど広くなだらかな霧になります。");
+            let detail = ui.add(egui::Slider::new(&mut params.detail, 0.0..=1.0).text("細部"));
+            changed |= detail.changed();
+            detail.lab_hover_tip("細かい揺らぎを足します。雲では高め、薄霧では低めが向きます。");
+            let density = ui.add(egui::Slider::new(&mut params.density, 0.0..=1.0).text("密度"));
+            changed |= density.changed();
+            density.lab_hover_tip("霧や雲が画面を覆う量です。");
+            let contrast =
+                ui.add(egui::Slider::new(&mut params.contrast, 0.0..=1.0).text("コントラスト"));
+            changed |= contrast.changed();
+            contrast.lab_hover_tip("雲の濃淡差です。霧では低めにすると自然です。");
+            let height_fade =
+                ui.add(egui::Slider::new(&mut params.height_fade, -1.0..=1.0).text("上下フェード"));
+            changed |= height_fade.changed();
+            height_fade.lab_hover_tip("正の値で上側、負の値で下側に霧や雲を寄せます。");
+            let opacity =
+                ui.add(egui::Slider::new(&mut params.opacity, 0.0..=1.0).text("不透明度"));
+            changed |= opacity.changed();
+            opacity.lab_hover_tip("元画像から霧/雲の色へどれだけ近づけるかです。");
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "色",
+                    &mut params.color_rgb,
+                    RgbPickTarget::CloudFogColor,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let mut seed = params.seed as i32;
+            let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
+            changed |= seed_response.changed();
+            seed_response.lab_hover_tip("霧や雲のパターンを変えます。");
+            params.seed = seed.max(0) as u32;
+        }
         LocalEffect::Vignette(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -14724,6 +14858,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::GodRays => LocalEffect::GodRays(GodRaysParams::default()),
         EffectKind::LensFlare => LocalEffect::LensFlare(LensFlareParams::default()),
+        EffectKind::CloudFog => LocalEffect::CloudFog(CloudFogParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
         EffectKind::FilmGrain => LocalEffect::FilmGrain(FilmGrainParams::default()),
         EffectKind::ChromaticAberration => {
@@ -16959,6 +17094,7 @@ mod tests {
             EffectKind::Bloom,
             EffectKind::GodRays,
             EffectKind::LensFlare,
+            EffectKind::CloudFog,
             EffectKind::Vignette,
             EffectKind::FilmGrain,
             EffectKind::ChromaticAberration,
@@ -17155,6 +17291,17 @@ mod tests {
             panic!("expected speed lines effect");
         };
         assert_eq!(speed_lines_params.color_rgb, [12, 34, 56]);
+
+        let mut cloud_fog = LocalEffect::CloudFog(CloudFogParams::default());
+        assert!(set_rgb_pick_target(
+            &mut cloud_fog,
+            RgbPickTarget::CloudFogColor,
+            [90, 120, 180],
+        ));
+        let LocalEffect::CloudFog(cloud_fog_params) = cloud_fog else {
+            panic!("expected cloud fog effect");
+        };
+        assert_eq!(cloud_fog_params.color_rgb, [90, 120, 180]);
 
         let mut tone = LocalEffect::Tone(ToneParams::default());
         assert!(!set_rgb_pick_target(

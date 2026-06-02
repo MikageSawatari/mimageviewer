@@ -114,6 +114,7 @@ the window.
   - Bloom
   - God rays
   - Lens flare
+  - Cloud/fog
   - Vignette
   - Film grain
   - Chromatic aberration
@@ -124,7 +125,8 @@ the window.
 - Effect parameters start from near-identity values. Use the per-effect preset
   buttons for practical starting points, or Reset to return the current effect
   to its default values.
-- RGB color parameters in Color Fill, Color Overlay, Neon Glow, and Speed Lines share a
+- RGB color parameters in Color Fill, Color Overlay, Neon Glow, Speed Lines,
+  and Cloud/Fog share a
   control with a color button, HEX readout, RGB sliders, and an image-click
   eyedropper.
 - Color Fill starts with a shape placeholder and full opacity. Choosing Solid,

@@ -564,6 +564,7 @@ pub enum LocalEffect {
     GodRays(GodRaysParams),
     LensFlare(LensFlareParams),
     SpeedLines(SpeedLinesParams),
+    CloudFog(CloudFogParams),
     Vignette(VignetteParams),
     FilmGrain(FilmGrainParams),
     ChromaticAberration(ChromaticAberrationParams),
@@ -632,6 +633,7 @@ impl LocalEffect {
             Self::GodRays(_) => "光芒",
             Self::LensFlare(_) => "レンズフレア",
             Self::SpeedLines(_) => "集中線/スピード線",
+            Self::CloudFog(_) => "雲/霧",
             Self::Vignette(_) => "ビネット",
             Self::FilmGrain(_) => "フィルム粒子",
             Self::ChromaticAberration(_) => "色収差",
@@ -2378,6 +2380,43 @@ impl Default for SpeedLinesParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudFogMode {
+    #[default]
+    Fog,
+    Clouds,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CloudFogParams {
+    pub mode: CloudFogMode,
+    pub scale_px: f32,
+    pub detail: f32,
+    pub density: f32,
+    pub contrast: f32,
+    pub height_fade: f32,
+    pub opacity: f32,
+    pub color_rgb: [u8; 3],
+    pub seed: u32,
+}
+
+impl Default for CloudFogParams {
+    fn default() -> Self {
+        Self {
+            mode: CloudFogMode::Fog,
+            scale_px: 180.0,
+            detail: 0.45,
+            density: 0.45,
+            contrast: 0.25,
+            height_fade: 0.0,
+            opacity: 0.0,
+            color_rgb: [235, 242, 255],
+            seed: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VignetteParams {
     /// Positive values darken the edge; negative values brighten it.
@@ -2812,6 +2851,9 @@ where
         }
         LocalEffect::SpeedLines(params) => {
             apply_speed_lines(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::CloudFog(params) => {
+            apply_cloud_fog(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::Vignette(params) => {
             apply_vignette(&image.pixels, image.width, image.height, *params)
@@ -7542,6 +7584,83 @@ fn blend_speed_line_pixel(out: &mut [u8], src: &[u8], i: usize, color: [f32; 3],
     }
 }
 
+fn apply_cloud_fog(src: &[u8], width: usize, height: usize, params: CloudFogParams) -> Vec<u8> {
+    let opacity = params.opacity.clamp(0.0, 1.0);
+    if opacity <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let scale = params.scale_px.clamp(8.0, 640.0);
+    let detail = params.detail.clamp(0.0, 1.0);
+    let density = params.density.clamp(0.0, 1.0);
+    let contrast = params.contrast.clamp(0.0, 1.0);
+    let height_fade = params.height_fade.clamp(-1.0, 1.0);
+    let color = [
+        params.color_rgb[0] as f32 / 255.0,
+        params.color_rgb[1] as f32 / 255.0,
+        params.color_rgb[2] as f32 / 255.0,
+    ];
+    let mut out = src.to_vec();
+    for y in 0..height {
+        let vertical = cloud_fog_vertical_weight(y, height, height_fade);
+        if vertical <= f32::EPSILON {
+            continue;
+        }
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let alpha = src[i + 3] as f32 / 255.0;
+            if alpha <= f32::EPSILON {
+                continue;
+            }
+            let noise = cloud_fog_noise(x as f32, y as f32, scale, detail, params.seed);
+            let shaped = ((noise - 0.5) * (1.0 + contrast * 3.0) + 0.5 + (density - 0.5) * 0.55)
+                .clamp(0.0, 1.0);
+            let coverage = match params.mode {
+                CloudFogMode::Fog => (0.35 + shaped * 0.65) * (0.25 + density * 0.75),
+                CloudFogMode::Clouds => {
+                    let threshold = (0.92 - density * 0.70).clamp(0.12, 0.94);
+                    let billow = (1.0 - (shaped * 2.0 - 1.0).abs()).powf(0.65);
+                    let cloud = smoothstep(threshold, 1.0, shaped);
+                    (cloud * 0.72 + billow * cloud * 0.28).clamp(0.0, 1.0)
+                }
+            };
+            let amount = (coverage * vertical * opacity * alpha).clamp(0.0, 1.0);
+            if amount <= f32::EPSILON {
+                continue;
+            }
+            for c in 0..3 {
+                let base = src[i + c] as f32 / 255.0;
+                out[i + c] = to_u8(lerp_f32(base, color[c], amount));
+            }
+        }
+    }
+    out
+}
+
+fn cloud_fog_noise(x: f32, y: f32, scale: f32, detail: f32, seed: u32) -> f32 {
+    let u = x / scale;
+    let v = y / scale;
+    let fine = detail.clamp(0.0, 1.0);
+    let coarse = glass_value_noise(u, v, seed);
+    let mid = glass_value_noise(u * 2.17 + 13.4, v * 2.17 - 7.1, seed ^ 0x7F4A_7C15);
+    let high = glass_value_noise(u * 4.63 - 5.7, v * 4.63 + 19.2, seed ^ 0xC10D_F06A);
+    let weight_mid = fine * 0.58;
+    let weight_high = fine * fine * 0.28;
+    let sum = coarse + mid * weight_mid + high * weight_high;
+    let denom = 1.0 + weight_mid + weight_high;
+    (sum / denom * 0.5 + 0.5).clamp(0.0, 1.0)
+}
+
+fn cloud_fog_vertical_weight(y: usize, height: usize, fade: f32) -> f32 {
+    let amount = fade.abs().clamp(0.0, 1.0);
+    if amount <= f32::EPSILON {
+        return 1.0;
+    }
+    let denom = height.saturating_sub(1).max(1) as f32;
+    let y_norm = y as f32 / denom;
+    let gradient = if fade >= 0.0 { 1.0 - y_norm } else { y_norm };
+    lerp_f32(1.0, gradient.clamp(0.0, 1.0), amount)
+}
+
 fn apply_vignette(src: &[u8], width: usize, height: usize, params: VignetteParams) -> Vec<u8> {
     let strength = params.strength.clamp(-1.0, 1.0);
     if strength.abs() <= f32::EPSILON || width == 0 || height == 0 {
@@ -9666,6 +9785,7 @@ mod tests {
             LocalEffect::GodRays(GodRaysParams::default()),
             LocalEffect::LensFlare(LensFlareParams::default()),
             LocalEffect::SpeedLines(SpeedLinesParams::default()),
+            LocalEffect::CloudFog(CloudFogParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
             LocalEffect::FilmGrain(FilmGrainParams::default()),
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
@@ -10821,6 +10941,61 @@ LUT_3D_SIZE 2
         assert!(out.pixels[edge] < src.pixels[edge]);
         assert_eq!(out.pixels[center], src.pixels[center]);
         assert_eq!(out.pixels[edge + 3], 180);
+    }
+
+    #[test]
+    fn cloud_fog_lifts_dark_pixels_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(3, 1, vec![20, 20, 20, 80, 20, 20, 20, 120, 20, 20, 20, 160])
+            .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "fog",
+            LocalMask::Full,
+            LocalEffect::CloudFog(CloudFogParams {
+                mode: CloudFogMode::Fog,
+                scale_px: 64.0,
+                detail: 0.0,
+                density: 1.0,
+                contrast: 0.0,
+                height_fade: 0.0,
+                opacity: 1.0,
+                color_rgb: [240, 240, 240],
+                seed: 1,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert!(out.pixels[4] > src.pixels[4]);
+        assert_eq!(out.pixels[3], 80);
+        assert_eq!(out.pixels[11], 160);
+    }
+
+    #[test]
+    fn cloud_fog_height_fade_can_limit_lower_pixels() {
+        let src = RgbaImageBuf::new(
+            1,
+            3,
+            vec![40, 40, 40, 255, 40, 40, 40, 255, 40, 40, 40, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "clouds",
+            LocalMask::Full,
+            LocalEffect::CloudFog(CloudFogParams {
+                mode: CloudFogMode::Fog,
+                scale_px: 64.0,
+                detail: 0.0,
+                density: 1.0,
+                contrast: 0.0,
+                height_fade: 1.0,
+                opacity: 1.0,
+                color_rgb: [255, 255, 255],
+                seed: 1,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > out.pixels[4]);
+        assert_eq!(out.pixels[8], src.pixels[8]);
+        assert_eq!(out.pixels[11], 255);
     }
 
     #[test]
