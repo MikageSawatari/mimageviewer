@@ -113,6 +113,9 @@ the window.
 - Effect parameters start from near-identity values. Use the per-effect preset
   buttons for practical starting points, or Reset to return the current effect
   to its default values.
+- RGB color parameters in Color Fill, Color Overlay, and Neon Glow share a
+  control with a color button, HEX readout, RGB sliders, and an image-click
+  eyedropper.
 - 3D LUT sample files are available under `tools/local_adjust_lab/sample_luts/`.
   They are small self-made `.cube` files for quick testing of the LUT loader and
   effect strength slider.

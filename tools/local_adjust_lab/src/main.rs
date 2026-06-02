@@ -1021,6 +1021,31 @@ enum EffectKind {
     Median,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RgbPickTarget {
+    ColorFillStart,
+    ColorFillMiddle,
+    ColorFillEnd,
+    ColorOverlayStart,
+    ColorOverlayEnd,
+    NeonGlowSource,
+    NeonGlowTint,
+}
+
+impl RgbPickTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ColorFillStart => "塗りつぶしの開始色",
+            Self::ColorFillMiddle => "塗りつぶしの中間色",
+            Self::ColorFillEnd => "塗りつぶしの終了色",
+            Self::ColorOverlayStart => "塗り/グラデーションの開始色",
+            Self::ColorOverlayEnd => "塗り/グラデーションの終了色",
+            Self::NeonGlowSource => "ネオングローの発光源色",
+            Self::NeonGlowTint => "ネオングローの着色",
+        }
+    }
+}
+
 impl EffectKind {
     fn from_effect(effect: &LocalEffect) -> Self {
         match effect {
@@ -1465,6 +1490,7 @@ struct LocalAdjustLabApp {
     add_layer_mask_kind: MaskKind,
     effect_picker_dialog_open: bool,
     selective_color_pick_active: bool,
+    rgb_pick_active: Option<RgbPickTarget>,
     recent_files: Vec<PathBuf>,
     status: String,
     view_zoom: f32,
@@ -1545,6 +1571,7 @@ impl LocalAdjustLabApp {
             add_layer_mask_kind: MaskKind::Full,
             effect_picker_dialog_open: false,
             selective_color_pick_active: false,
+            rgb_pick_active: None,
             recent_files,
             status: "JPEG / PNG をドロップしてください。".to_string(),
             view_zoom: 1.0,
@@ -1606,6 +1633,7 @@ impl LocalAdjustLabApp {
                 self.tilt_shift_drag_active = false;
                 self.edge_brush_seed = None;
                 self.selective_color_pick_active = false;
+                self.rgb_pick_active = None;
                 let load_status = format!("読み込み: {}", path.display());
                 self.status = load_status.clone();
                 let sidecar_path = sidecar_path_for_image(path);
@@ -3507,6 +3535,28 @@ impl LocalAdjustLabApp {
         self.mark_dirty();
     }
 
+    fn pick_effect_rgb_target(&mut self, p: Pos2, target: RgbPickTarget) {
+        let Some((rgb, x, y)) = self.source_rgb_at_image_pos(p) else {
+            return;
+        };
+        let label = target.label();
+        let Some(layer) = self.selected_layer_mut() else {
+            self.rgb_pick_active = None;
+            return;
+        };
+        let picked = set_rgb_pick_target(&mut layer.effect, target, rgb);
+        self.rgb_pick_active = None;
+        if picked {
+            self.status = format!(
+                "{label}: #{:02X}{:02X}{:02X} (x:{x}, y:{y})",
+                rgb[0], rgb[1], rgb[2]
+            );
+            self.mark_dirty();
+        } else {
+            self.status = "スポイト対象の効果が切り替わったため解除しました。".to_string();
+        }
+    }
+
     fn source_rgb_at_image_pos(&self, p: Pos2) -> Option<([u8; 3], usize, usize)> {
         let image = self.image.as_ref()?;
         let x = p.x.round().clamp(0.0, image.source.width as f32 - 1.0) as usize;
@@ -4183,10 +4233,11 @@ impl LocalAdjustLabApp {
             && !panel_blocks_pointer
             && !dialog_open
             && !self.selective_color_pick_active
+            && self.rgb_pick_active.is_none()
         {
             self.draw_brush_cursor(ui, rect, pointer_screen);
         }
-        if self.selective_color_pick_active
+        if (self.selective_color_pick_active || self.rgb_pick_active.is_some())
             && !panel_blocks_pointer
             && !dialog_open
             && pointer_screen.map(|p| rect.contains(p)).unwrap_or(false)
@@ -4231,6 +4282,12 @@ impl LocalAdjustLabApp {
                         if self.selective_color_pick_active {
                             if response.clicked() || ui.input(|i| i.pointer.primary_pressed()) {
                                 self.pick_selective_color_target(pos);
+                            }
+                            return;
+                        }
+                        if let Some(target) = self.rgb_pick_active {
+                            if response.clicked() || ui.input(|i| i.pointer.primary_pressed()) {
+                                self.pick_effect_rgb_target(pos, target);
                             }
                             return;
                         }
@@ -4782,12 +4839,23 @@ impl LocalAdjustLabApp {
         let mut request_cube_lut_load = false;
         let mut request_selective_color_pick = false;
         let mut request_selective_color_pick_cancel = false;
+        let mut request_rgb_pick = None;
+        let mut request_rgb_pick_cancel = false;
         let selective_color_pick_active = self.selective_color_pick_active;
+        let rgb_pick_active = self.rgb_pick_active;
         if let Some(layer) = self.selected_layer_mut() {
-            let response = draw_effect_params(ui, layer, dims, selective_color_pick_active);
+            let response = draw_effect_params(
+                ui,
+                layer,
+                dims,
+                selective_color_pick_active,
+                rgb_pick_active,
+            );
             request_cube_lut_load = response.load_cube_lut;
             request_selective_color_pick = response.start_selective_color_pick;
             request_selective_color_pick_cancel = response.cancel_selective_color_pick;
+            request_rgb_pick = response.start_rgb_pick;
+            request_rgb_pick_cancel = response.cancel_rgb_pick;
             if response.changed {
                 self.mark_dirty();
             }
@@ -4797,6 +4865,7 @@ impl LocalAdjustLabApp {
         }
         if request_selective_color_pick {
             self.selective_color_pick_active = true;
+            self.rgb_pick_active = None;
             self.tool = MaskTool::Select;
             self.status =
                 "画像上をクリックして、セレクティブカラーの対象色を取得します。".to_string();
@@ -4804,6 +4873,16 @@ impl LocalAdjustLabApp {
         if request_selective_color_pick_cancel {
             self.selective_color_pick_active = false;
             self.status = "セレクティブカラーのスポイトを解除しました。".to_string();
+        }
+        if let Some(target) = request_rgb_pick {
+            self.rgb_pick_active = Some(target);
+            self.selective_color_pick_active = false;
+            self.tool = MaskTool::Select;
+            self.status = format!("画像上をクリックして、{}を取得します。", target.label());
+        }
+        if request_rgb_pick_cancel {
+            self.rgb_pick_active = None;
+            self.status = "RGBスポイトを解除しました。".to_string();
         }
     }
 
@@ -5275,6 +5354,7 @@ impl LocalAdjustLabApp {
             if kind != EffectKind::SelectiveColor {
                 self.selective_color_pick_active = false;
             }
+            self.rgb_pick_active = None;
             self.status = format!("加工内容を「{}」に変更しました。", kind.label());
             self.mark_dirty();
         }
@@ -7548,19 +7628,117 @@ fn color_overlay_blend_mode_label(mode: ColorOverlayBlendMode) -> &'static str {
     }
 }
 
-fn draw_rgb_color_control(ui: &mut egui::Ui, label: &str, rgb: &mut [u8; 3]) -> bool {
+#[derive(Debug, Default)]
+struct RgbColorControlResponse {
+    changed: bool,
+    start_pick: Option<RgbPickTarget>,
+    cancel_pick: bool,
+}
+
+fn draw_rgb_color_control(
+    ui: &mut egui::Ui,
+    label: &str,
+    rgb: &mut [u8; 3],
+    target: RgbPickTarget,
+    active_pick: Option<RgbPickTarget>,
+) -> RgbColorControlResponse {
     let before = *rgb;
+    let mut start_pick = None;
+    let mut cancel_pick = false;
+    let pick_active = active_pick == Some(target);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).color(Color32::from_gray(190)));
-        let response = ui.color_edit_button_srgb(rgb);
-        response.lab_hover_tip(format!("{label}を選びます。"));
         ui.label(
             egui::RichText::new(format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]))
                 .monospace()
                 .color(Color32::from_gray(170)),
         );
+        let response = ui.color_edit_button_srgb(rgb);
+        response.lab_hover_tip(format!("{label}を選びます。"));
+        let button_text = if pick_active {
+            "スポイト解除"
+        } else {
+            "スポイト"
+        };
+        let pick_response = ui.selectable_label(pick_active, button_text);
+        if pick_response.clicked() {
+            if pick_active {
+                cancel_pick = true;
+            } else {
+                start_pick = Some(target);
+            }
+        }
+        pick_response.lab_hover_tip("画像上をクリックしてこの色へ取り込みます。");
     });
-    *rgb != before
+    ui.indent((label, "rgb_sliders"), |ui| {
+        let mut r = rgb[0] as i32;
+        let mut g = rgb[1] as i32;
+        let mut b = rgb[2] as i32;
+        let red = ui.add(egui::Slider::new(&mut r, 0..=255).text("R"));
+        let green = ui.add(egui::Slider::new(&mut g, 0..=255).text("G"));
+        let blue = ui.add(egui::Slider::new(&mut b, 0..=255).text("B"));
+        if red.changed() || green.changed() || blue.changed() {
+            *rgb = [r as u8, g as u8, b as u8];
+        }
+        red.lab_hover_tip("赤チャンネルです。");
+        green.lab_hover_tip("緑チャンネルです。");
+        blue.lab_hover_tip("青チャンネルです。");
+    });
+    RgbColorControlResponse {
+        changed: *rgb != before,
+        start_pick,
+        cancel_pick,
+    }
+}
+
+fn merge_rgb_color_response(
+    response: RgbColorControlResponse,
+    changed: &mut bool,
+    start_rgb_pick: &mut Option<RgbPickTarget>,
+    cancel_rgb_pick: &mut bool,
+) {
+    *changed |= response.changed;
+    if response.cancel_pick {
+        *cancel_rgb_pick = true;
+    }
+    if response.start_pick.is_some() {
+        *start_rgb_pick = response.start_pick;
+    }
+}
+
+fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8; 3]) -> bool {
+    match (effect, target) {
+        (LocalEffect::ColorFill(params), RgbPickTarget::ColorFillStart) => {
+            params.start_rgb = rgb;
+            true
+        }
+        (LocalEffect::ColorFill(params), RgbPickTarget::ColorFillMiddle) => {
+            params.middle_rgb = rgb;
+            true
+        }
+        (LocalEffect::ColorFill(params), RgbPickTarget::ColorFillEnd) => {
+            params.end_rgb = rgb;
+            true
+        }
+        (LocalEffect::ColorOverlay(params), RgbPickTarget::ColorOverlayStart) => {
+            params.start_rgb = rgb;
+            true
+        }
+        (LocalEffect::ColorOverlay(params), RgbPickTarget::ColorOverlayEnd) => {
+            params.end_rgb = rgb;
+            true
+        }
+        (LocalEffect::NeonGlow(params), RgbPickTarget::NeonGlowSource) => {
+            params.source_rgb = rgb;
+            params.source_color_enabled = true;
+            true
+        }
+        (LocalEffect::NeonGlow(params), RgbPickTarget::NeonGlowTint) => {
+            params.tint_rgb = rgb;
+            true
+        }
+        _ => false,
+    }
 }
 
 fn duotone_preset_label(preset: DuotonePreset) -> &'static str {
@@ -7753,6 +7931,8 @@ struct EffectParamResponse {
     load_cube_lut: bool,
     start_selective_color_pick: bool,
     cancel_selective_color_pick: bool,
+    start_rgb_pick: Option<RgbPickTarget>,
+    cancel_rgb_pick: bool,
 }
 
 fn draw_effect_params(
@@ -7760,11 +7940,14 @@ fn draw_effect_params(
     layer: &mut LocalAdjustmentLayer,
     image_dims: (usize, usize),
     selective_color_pick_active: bool,
+    rgb_pick_active: Option<RgbPickTarget>,
 ) -> EffectParamResponse {
     let mut changed = false;
     let mut load_cube_lut = false;
     let mut start_selective_color_pick = false;
     let mut cancel_selective_color_pick = false;
+    let mut start_rgb_pick = None;
+    let mut cancel_rgb_pick = false;
     let effect_kind = EffectKind::from_effect(&layer.effect);
     let has_effect = !matches!(&layer.effect, LocalEffect::None);
     ui.horizontal(|ui| {
@@ -7789,6 +7972,8 @@ fn draw_effect_params(
             load_cube_lut,
             start_selective_color_pick,
             cancel_selective_color_pick,
+            start_rgb_pick,
+            cancel_rgb_pick,
         };
     }
     match &mut layer.effect {
@@ -10586,6 +10771,13 @@ fn draw_effect_params(
             changed |= glow_strength.changed();
             glow_strength.lab_hover_tip("ぼかした発光をどれだけ加えるかです。");
             ui.horizontal_wrapped(|ui| {
+                let hue = ui.add(
+                    egui::Slider::new(&mut params.hue_degrees, 0.0..=360.0)
+                        .text("色相")
+                        .suffix("°"),
+                );
+                changed |= hue.changed();
+                hue.lab_hover_tip("ネオン色の色相です。");
                 let swatch = hsl_swatch_color(params.hue_degrees, 1.0, 0.55);
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), Sense::hover());
                 ui.painter().rect_filled(rect, 4.0, swatch);
@@ -10595,13 +10787,6 @@ fn draw_effect_params(
                     egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
                     egui::StrokeKind::Inside,
                 );
-                let hue = ui.add(
-                    egui::Slider::new(&mut params.hue_degrees, 0.0..=360.0)
-                        .text("色相")
-                        .suffix("°"),
-                );
-                changed |= hue.changed();
-                hue.lab_hover_tip("ネオン色の色相です。");
             });
             let color = ui.add(egui::Slider::new(&mut params.color_amount, 0.0..=1.0).text("色量"));
             changed |= color.changed();
@@ -11616,7 +11801,18 @@ fn draw_effect_params(
             } else {
                 "開始色"
             };
-            changed |= draw_rgb_color_control(ui, color_label, &mut params.start_rgb);
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    color_label,
+                    &mut params.start_rgb,
+                    RgbPickTarget::ColorFillStart,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
             if params.shape != ColorOverlayShape::Solid {
                 let middle = ui.checkbox(&mut params.middle_enabled, "中間色を使う");
                 changed |= middle.changed();
@@ -11624,13 +11820,35 @@ fn draw_effect_params(
                     "ONにすると、開始色・中間色・終了色の3色グラデーションになります。",
                 );
                 if params.middle_enabled {
-                    changed |= draw_rgb_color_control(ui, "中間色", &mut params.middle_rgb);
+                    merge_rgb_color_response(
+                        draw_rgb_color_control(
+                            ui,
+                            "中間色",
+                            &mut params.middle_rgb,
+                            RgbPickTarget::ColorFillMiddle,
+                            rgb_pick_active,
+                        ),
+                        &mut changed,
+                        &mut start_rgb_pick,
+                        &mut cancel_rgb_pick,
+                    );
                     let midpoint = ui
                         .add(egui::Slider::new(&mut params.midpoint, 0.01..=0.99).text("中間位置"));
                     changed |= midpoint.changed();
                     midpoint.lab_hover_tip("グラデーション内で中間色が出る位置です。");
                 }
-                changed |= draw_rgb_color_control(ui, "終了色", &mut params.end_rgb);
+                merge_rgb_color_response(
+                    draw_rgb_color_control(
+                        ui,
+                        "終了色",
+                        &mut params.end_rgb,
+                        RgbPickTarget::ColorFillEnd,
+                        rgb_pick_active,
+                    ),
+                    &mut changed,
+                    &mut start_rgb_pick,
+                    &mut cancel_rgb_pick,
+                );
             }
             let opacity =
                 ui.add(egui::Slider::new(&mut params.opacity, 0.0..=1.0).text("不透明度"));
@@ -11777,9 +11995,31 @@ fn draw_effect_params(
             } else {
                 "開始色"
             };
-            changed |= draw_rgb_color_control(ui, color_label, &mut params.start_rgb);
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    color_label,
+                    &mut params.start_rgb,
+                    RgbPickTarget::ColorOverlayStart,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
             if params.shape != ColorOverlayShape::Solid {
-                changed |= draw_rgb_color_control(ui, "終了色", &mut params.end_rgb);
+                merge_rgb_color_response(
+                    draw_rgb_color_control(
+                        ui,
+                        "終了色",
+                        &mut params.end_rgb,
+                        RgbPickTarget::ColorOverlayEnd,
+                        rgb_pick_active,
+                    ),
+                    &mut changed,
+                    &mut start_rgb_pick,
+                    &mut cancel_rgb_pick,
+                );
             }
             let opacity =
                 ui.add(egui::Slider::new(&mut params.opacity, 0.0..=1.0).text("不透明度"));
@@ -11915,7 +12155,18 @@ fn draw_effect_params(
             source_color
                 .lab_hover_tip("ONにすると、指定色に近い線や面だけを発光源として拾います。");
             if params.source_color_enabled {
-                changed |= draw_rgb_color_control(ui, "発光源の色", &mut params.source_rgb);
+                merge_rgb_color_response(
+                    draw_rgb_color_control(
+                        ui,
+                        "発光源の色",
+                        &mut params.source_rgb,
+                        RgbPickTarget::NeonGlowSource,
+                        rgb_pick_active,
+                    ),
+                    &mut changed,
+                    &mut start_rgb_pick,
+                    &mut cancel_rgb_pick,
+                );
                 let tolerance = ui
                     .add(egui::Slider::new(&mut params.source_tolerance, 0.0..=1.0).text("色許容"));
                 changed |= tolerance.changed();
@@ -11956,7 +12207,18 @@ fn draw_effect_params(
                 ui.add(egui::Slider::new(&mut params.glow_saturation, -1.0..=2.0).text("光の彩度"));
             changed |= glow_saturation.changed();
             glow_saturation.lab_hover_tip("光輪の色をどれだけ鮮やかにするかです。");
-            changed |= draw_rgb_color_control(ui, "着色", &mut params.tint_rgb);
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "着色",
+                    &mut params.tint_rgb,
+                    RgbPickTarget::NeonGlowTint,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
             let tint_strength =
                 ui.add(egui::Slider::new(&mut params.tint_strength, 0.0..=1.0).text("着色量"));
             changed |= tint_strength.changed();
@@ -12356,6 +12618,8 @@ fn draw_effect_params(
         load_cube_lut,
         start_selective_color_pick,
         cancel_selective_color_pick,
+        start_rgb_pick,
+        cancel_rgb_pick,
     }
 }
 
@@ -15526,6 +15790,77 @@ mod tests {
         assert!((hue_degrees_from_rgb([255, 0, 0]) - 0.0).abs() < 0.1);
         assert!((hue_degrees_from_rgb([0, 255, 0]) - 120.0).abs() < 0.1);
         assert!((hue_degrees_from_rgb([0, 0, 255]) - 240.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn rgb_eyedropper_assigns_effect_color_targets() {
+        let mut fill = LocalEffect::ColorFill(ColorFillParams::default());
+        assert!(set_rgb_pick_target(
+            &mut fill,
+            RgbPickTarget::ColorFillStart,
+            [10, 20, 30],
+        ));
+        assert!(set_rgb_pick_target(
+            &mut fill,
+            RgbPickTarget::ColorFillMiddle,
+            [40, 50, 60],
+        ));
+        assert!(set_rgb_pick_target(
+            &mut fill,
+            RgbPickTarget::ColorFillEnd,
+            [70, 80, 90],
+        ));
+        let LocalEffect::ColorFill(fill_params) = fill else {
+            panic!("expected color fill effect");
+        };
+        assert_eq!(fill_params.start_rgb, [10, 20, 30]);
+        assert_eq!(fill_params.middle_rgb, [40, 50, 60]);
+        assert_eq!(fill_params.end_rgb, [70, 80, 90]);
+
+        let mut overlay = LocalEffect::ColorOverlay(ColorOverlayParams::default());
+        assert!(set_rgb_pick_target(
+            &mut overlay,
+            RgbPickTarget::ColorOverlayStart,
+            [11, 22, 33],
+        ));
+        assert!(set_rgb_pick_target(
+            &mut overlay,
+            RgbPickTarget::ColorOverlayEnd,
+            [44, 55, 66],
+        ));
+        let LocalEffect::ColorOverlay(overlay_params) = overlay else {
+            panic!("expected color overlay effect");
+        };
+        assert_eq!(overlay_params.start_rgb, [11, 22, 33]);
+        assert_eq!(overlay_params.end_rgb, [44, 55, 66]);
+
+        let mut neon = LocalEffect::NeonGlow(NeonGlowParams {
+            source_color_enabled: false,
+            ..Default::default()
+        });
+        assert!(set_rgb_pick_target(
+            &mut neon,
+            RgbPickTarget::NeonGlowSource,
+            [0, 210, 255],
+        ));
+        assert!(set_rgb_pick_target(
+            &mut neon,
+            RgbPickTarget::NeonGlowTint,
+            [255, 80, 180],
+        ));
+        let LocalEffect::NeonGlow(neon_params) = neon else {
+            panic!("expected neon glow effect");
+        };
+        assert_eq!(neon_params.source_rgb, [0, 210, 255]);
+        assert!(neon_params.source_color_enabled);
+        assert_eq!(neon_params.tint_rgb, [255, 80, 180]);
+
+        let mut tone = LocalEffect::Tone(ToneParams::default());
+        assert!(!set_rgb_pick_target(
+            &mut tone,
+            RgbPickTarget::NeonGlowSource,
+            [1, 2, 3],
+        ));
     }
 
     #[test]
