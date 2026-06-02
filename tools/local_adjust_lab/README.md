@@ -118,6 +118,7 @@ the window.
   - Spotlight
   - Vignette
   - Film grain
+  - Noise
   - Chromatic aberration
   - Halftone
   - Screen tone

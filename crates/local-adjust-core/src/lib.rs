@@ -585,6 +585,7 @@ pub enum LocalEffect {
     Spotlight(SpotlightParams),
     Vignette(VignetteParams),
     FilmGrain(FilmGrainParams),
+    Noise(NoiseParams),
     ChromaticAberration(ChromaticAberrationParams),
     Halftone(HalftoneParams),
     ScreenTone(ScreenToneParams),
@@ -658,6 +659,7 @@ impl LocalEffect {
             Self::Spotlight(_) => "スポットライト",
             Self::Vignette(_) => "ビネット",
             Self::FilmGrain(_) => "フィルム粒子",
+            Self::Noise(_) => "ノイズ",
             Self::ChromaticAberration(_) => "色収差",
             Self::Halftone(_) => "ハーフトーン",
             Self::ScreenTone(_) => "スクリーントーン",
@@ -2521,6 +2523,38 @@ impl Default for FilmGrainParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoiseDistribution {
+    Uniform,
+    Gaussian,
+}
+
+impl Default for NoiseDistribution {
+    fn default() -> Self {
+        Self::Uniform
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NoiseParams {
+    pub amount: f32,
+    pub distribution: NoiseDistribution,
+    pub monochrome: bool,
+    pub seed: u32,
+}
+
+impl Default for NoiseParams {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            distribution: NoiseDistribution::Uniform,
+            monochrome: true,
+            seed: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ChromaticAberrationParams {
     pub offset_px: f32,
@@ -3088,6 +3122,9 @@ where
             }
             LocalEffect::FilmGrain(params) => {
                 apply_film_grain(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Noise(params) => {
+                apply_noise(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::ChromaticAberration(params) => apply_chromatic_aberration(
                 &image.pixels,
@@ -8046,6 +8083,49 @@ fn apply_film_grain(src: &[u8], width: usize, height: usize, params: FilmGrainPa
     out
 }
 
+fn apply_noise(src: &[u8], width: usize, height: usize, params: NoiseParams) -> Vec<u8> {
+    let amount = params.amount.clamp(0.0, 1.0);
+    if amount <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let mut out = src.to_vec();
+    let amplitude = amount * 0.45;
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let mono_noise = noise_sample(x as u32, y as u32, 0, params);
+            for c in 0..3 {
+                let noise = if params.monochrome {
+                    mono_noise
+                } else {
+                    noise_sample(x as u32, y as u32, c as u32, params)
+                };
+                out[i + c] = to_u8(src[i + c] as f32 / 255.0 + noise * amplitude);
+            }
+        }
+    }
+    out
+}
+
+fn noise_sample(x: u32, y: u32, channel: u32, params: NoiseParams) -> f32 {
+    let seed = params.seed ^ channel.wrapping_mul(0x9E37_79B9);
+    match params.distribution {
+        NoiseDistribution::Uniform => signed_noise(x, y, seed),
+        NoiseDistribution::Gaussian => {
+            let mut sum = 0.0;
+            for idx in 0..6 {
+                sum += signed_noise(
+                    x,
+                    y,
+                    seed ^ (idx as u32).wrapping_mul(0xA511_E9B3) ^ 0x632B_E59B,
+                );
+            }
+            (sum / 6.0).clamp(-1.0, 1.0)
+        }
+    }
+}
+
 fn apply_chromatic_aberration(src: &[u8], width: usize, height: usize, offset_px: f32) -> Vec<u8> {
     if offset_px <= f32::EPSILON || width == 0 || height == 0 {
         return src.to_vec();
@@ -10494,6 +10574,7 @@ mod tests {
             LocalEffect::Spotlight(SpotlightParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
             LocalEffect::FilmGrain(FilmGrainParams::default()),
+            LocalEffect::Noise(NoiseParams::default()),
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
             LocalEffect::Halftone(HalftoneParams::default()),
             LocalEffect::ScreenTone(ScreenToneParams::default()),
@@ -11845,6 +11926,68 @@ LUT_3D_SIZE 2
         let out2 = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out1.pixels, out2.pixels);
         assert_ne!(out1.pixels, src.pixels);
+    }
+
+    #[test]
+    fn noise_is_deterministic_and_preserves_alpha() {
+        let src = solid(4, 4, [128, 128, 128, 203]);
+        let layer = LocalAdjustmentLayer::new(
+            "noise",
+            LocalMask::Full,
+            LocalEffect::Noise(NoiseParams {
+                amount: 0.45,
+                distribution: NoiseDistribution::Uniform,
+                monochrome: true,
+                seed: 42,
+            }),
+        );
+        let out1 = apply_layers(src.as_ref(), &[layer.clone()]).unwrap();
+        let out2 = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out1.pixels, out2.pixels);
+        assert_ne!(out1.pixels, src.pixels);
+        assert!(out1.pixels.chunks_exact(4).all(|px| px[3] == 203));
+    }
+
+    #[test]
+    fn monochrome_noise_keeps_gray_channels_equal() {
+        let src = solid(3, 3, [128, 128, 128, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "noise",
+            LocalMask::Full,
+            LocalEffect::Noise(NoiseParams {
+                amount: 0.70,
+                distribution: NoiseDistribution::Gaussian,
+                monochrome: true,
+                seed: 7,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(
+            out.pixels
+                .chunks_exact(4)
+                .all(|px| px[0] == px[1] && px[1] == px[2])
+        );
+    }
+
+    #[test]
+    fn color_noise_can_shift_channels_independently() {
+        let src = solid(4, 4, [128, 128, 128, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "noise",
+            LocalMask::Full,
+            LocalEffect::Noise(NoiseParams {
+                amount: 0.70,
+                distribution: NoiseDistribution::Uniform,
+                monochrome: false,
+                seed: 99,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(
+            out.pixels
+                .chunks_exact(4)
+                .any(|px| px[0] != px[1] || px[1] != px[2])
+        );
     }
 
     #[test]

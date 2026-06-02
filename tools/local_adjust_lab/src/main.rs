@@ -27,18 +27,19 @@ use local_adjust_core::{
     LensBlurParams, LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams,
     LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
     LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
-    MosaicTileMode, MotionBlurParams, NeonGlowParams, OilPaintParams, PinchSpherizeParams,
-    PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
-    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, ScreenToneMode,
-    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
-    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
-    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
-    ToneCurveParams, ToneParams, TwirlParams, VignetteParams, WaveDistortionMode,
-    WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
-    evaluate_layer_mask, parse_cube_lut,
+    MosaicTileMode, MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams,
+    OilPaintParams, PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams,
+    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
+    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
+    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, ScreenToneMode, ScreenToneParams,
+    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
+    SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask,
+    SubjectMaskRefinement, TextureParams, TextureizerMode, TextureizerParams,
+    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
+    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
+    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
+    compute_mosaic_tile_size, default_mask_application_for_effect, evaluate_layer_mask,
+    parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1035,6 +1036,7 @@ enum EffectKind {
     Spotlight,
     Vignette,
     FilmGrain,
+    Noise,
     ChromaticAberration,
     Halftone,
     ScreenTone,
@@ -1139,6 +1141,7 @@ impl EffectKind {
             LocalEffect::Spotlight(_) => Self::Spotlight,
             LocalEffect::Vignette(_) => Self::Vignette,
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
+            LocalEffect::Noise(_) => Self::Noise,
             LocalEffect::ChromaticAberration(_) => Self::ChromaticAberration,
             LocalEffect::Halftone(_) => Self::Halftone,
             LocalEffect::ScreenTone(_) => Self::ScreenTone,
@@ -1212,6 +1215,7 @@ impl EffectKind {
             Self::Spotlight => "スポットライト",
             Self::Vignette => "ビネット",
             Self::FilmGrain => "フィルム粒子",
+            Self::Noise => "ノイズ付加",
             Self::ChromaticAberration => "色収差",
             Self::Halftone => "ハーフトーン",
             Self::ScreenTone => "スクリーントーン",
@@ -1337,6 +1341,9 @@ impl EffectKind {
             Self::Spotlight => "指定した中心を照らし、周辺を落として局所的な光を作ります。",
             Self::Vignette => "周辺を暗く、または明るくして視線を中央へ誘導します。",
             Self::FilmGrain => "粒状感を加え、フィルムや紙っぽい質感を作ります。",
+            Self::Noise => {
+                "均一またはガウス分布のノイズを加え、単色/カラーのざらつきやデジタルノイズを作ります。"
+            }
             Self::ChromaticAberration => "RGBを少しずらし、レンズやデジタル風の色ズレを作ります。",
             Self::Halftone => "明るさをドットパターンに変換し、漫画や印刷風にします。",
             Self::ScreenTone => {
@@ -1490,6 +1497,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::StarGlow,
             EffectKind::Vignette,
             EffectKind::FilmGrain,
+            EffectKind::Noise,
             EffectKind::ChromaticAberration,
         ],
     },
@@ -4685,7 +4693,7 @@ impl LocalAdjustLabApp {
 
     fn draw_layer_list(&mut self, ui: &mut egui::Ui, panel_w: f32) {
         let btn_w = ((panel_w - 20.0 - 4.0) / 2.0).max(96.0);
-        let btn_size = egui::vec2(btn_w, 24.0);
+        let action_row_w = btn_w * 2.0 + 4.0;
         ui.label(
             egui::RichText::new("レイヤー")
                 .size(14.0)
@@ -4846,26 +4854,23 @@ impl LocalAdjustLabApp {
         }
 
         ui.horizontal(|ui| {
-            if ui
-                .add_sized(egui::vec2(58.0, 22.0), egui::Button::new("↑"))
-                .clicked()
-            {
+            let gap = 4.0;
+            ui.spacing_mut().item_spacing.x = gap;
+            let unit_w = ((action_row_w - gap * 3.0) / 6.0).max(24.0);
+            let small_btn = egui::vec2(unit_w, 22.0);
+            let wide_btn = egui::vec2(unit_w * 2.0, 22.0);
+            if ui.add_sized(small_btn, egui::Button::new("↑")).clicked() {
                 self.move_selected_layer(-1);
             }
-            if ui
-                .add_sized(egui::vec2(58.0, 22.0), egui::Button::new("↓"))
-                .clicked()
-            {
+            if ui.add_sized(small_btn, egui::Button::new("↓")).clicked() {
                 self.move_selected_layer(1);
             }
-        });
-        ui.horizontal(|ui| {
-            if ui.add_sized(btn_size, egui::Button::new("複製")).clicked() {
+            if ui.add_sized(wide_btn, egui::Button::new("複製")).clicked() {
                 self.duplicate_layer();
             }
             if ui
                 .add_sized(
-                    btn_size,
+                    wide_btn,
                     egui::Button::new("削除").fill(Color32::from_rgb(120, 50, 50)),
                 )
                 .clicked()
@@ -8349,6 +8354,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
         ),
         LocalEffect::Vignette(params) => format!("ビネット {:.0}%", params.strength * 100.0),
         LocalEffect::FilmGrain(params) => format!("粒子 {:.0}%", params.amount * 100.0),
+        LocalEffect::Noise(params) => format!(
+            "ノイズ {} {:.0}%",
+            noise_distribution_label(params.distribution),
+            params.amount * 100.0
+        ),
         LocalEffect::ChromaticAberration(params) => {
             format!("色収差 {:.1}px", params.offset_px)
         }
@@ -8400,6 +8410,13 @@ fn screen_tone_mode_label(mode: ScreenToneMode) -> &'static str {
         ScreenToneMode::Dots => "網点",
         ScreenToneMode::Lines => "線",
         ScreenToneMode::CrossHatch => "カケアミ",
+    }
+}
+
+fn noise_distribution_label(distribution: NoiseDistribution) -> &'static str {
+    match distribution {
+        NoiseDistribution::Uniform => "均一",
+        NoiseDistribution::Gaussian => "ガウス",
     }
 }
 
@@ -13860,6 +13877,63 @@ fn draw_effect_params(
                 .changed();
             params.seed = seed.max(0) as u32;
         }
+        LocalEffect::Noise(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "微量") {
+                    *params = NoiseParams {
+                        amount: 0.08,
+                        distribution: NoiseDistribution::Uniform,
+                        monochrome: true,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ガウス") {
+                    *params = NoiseParams {
+                        amount: 0.22,
+                        distribution: NoiseDistribution::Gaussian,
+                        monochrome: true,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "カラー") {
+                    *params = NoiseParams {
+                        amount: 0.18,
+                        distribution: NoiseDistribution::Uniform,
+                        monochrome: false,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
+            changed |= ui
+                .add(egui::Slider::new(&mut params.amount, 0.0..=1.0).text("量"))
+                .changed();
+            let previous_distribution = params.distribution;
+            ComboBox::from_label("分布")
+                .selected_text(noise_distribution_label(params.distribution))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut params.distribution,
+                        NoiseDistribution::Uniform,
+                        "均一",
+                    );
+                    ui.selectable_value(
+                        &mut params.distribution,
+                        NoiseDistribution::Gaussian,
+                        "ガウス",
+                    );
+                });
+            changed |= params.distribution != previous_distribution;
+            changed |= ui.checkbox(&mut params.monochrome, "単色ノイズ").changed();
+            let mut seed = params.seed as i32;
+            changed |= ui
+                .add(egui::Slider::new(&mut seed, 0..=9999).text("seed"))
+                .changed();
+            params.seed = seed.max(0) as u32;
+        }
         LocalEffect::ChromaticAberration(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -15674,6 +15748,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Spotlight => LocalEffect::Spotlight(SpotlightParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
         EffectKind::FilmGrain => LocalEffect::FilmGrain(FilmGrainParams::default()),
+        EffectKind::Noise => LocalEffect::Noise(NoiseParams::default()),
         EffectKind::ChromaticAberration => {
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default())
         }
@@ -17990,6 +18065,7 @@ mod tests {
             EffectKind::Spotlight,
             EffectKind::Vignette,
             EffectKind::FilmGrain,
+            EffectKind::Noise,
             EffectKind::ChromaticAberration,
             EffectKind::Halftone,
             EffectKind::ScreenTone,
