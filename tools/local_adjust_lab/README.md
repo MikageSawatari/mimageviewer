@@ -57,8 +57,9 @@ the window.
     available. The generated soft matte can be refined for cutout work by
     thresholding it toward a binary mask, optionally shrinking/expanding it, and
     smoothing only the boundary band. The original generated matte is kept with
-    the layer, so the cutout sliders regenerate from that matte instead of
-    destructively editing the current mask.
+    the layer, and cutout refinement is enabled with a checkbox. When enabled,
+    the sliders regenerate from that matte instead of destructively editing the
+    current mask; turning it off restores the original matte.
   - Region segmentation mask with color-coded candidates that can be toggled by
     clicking or dragging on the image. Creating a region layer starts one
     default full-image segmentation pass automatically; the tool panel can

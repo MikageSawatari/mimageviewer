@@ -4965,66 +4965,92 @@ impl LocalAdjustLabApp {
             let mut restore_source = false;
             let mut apply_refinement = false;
             let mut push_undo = false;
-            ui.horizontal_wrapped(|ui| {
-                if preset_button(ui, "元マット") {
+            let mut refinement_controls_enabled = refinement_enabled;
+            let enable_response = ui.checkbox(&mut refinement_controls_enabled, "マスクを整形");
+            let enable_changed = enable_response.changed();
+            enable_response.lab_hover_tip(
+                "ONにすると、生成直後の元マットから切り抜き向けのマスクを再生成します。",
+            );
+            if enable_changed {
+                push_undo = true;
+                if refinement_controls_enabled {
+                    refinement.enabled = true;
+                    apply_refinement = true;
+                } else {
                     restore_source = true;
-                    push_undo = true;
                 }
-                if preset_button(ui, "標準") {
-                    refinement = SubjectMaskRefinement {
-                        enabled: true,
-                        threshold: 0.52,
-                        expand_px: 0,
-                        feather_px: 1,
-                    };
-                    apply_refinement = true;
-                    push_undo = true;
-                }
-                if preset_button(ui, "硬め") {
-                    refinement = SubjectMaskRefinement {
-                        enabled: true,
-                        threshold: 0.58,
-                        expand_px: -1,
-                        feather_px: 0,
-                    };
-                    apply_refinement = true;
-                    push_undo = true;
-                }
-                if preset_button(ui, "柔らかめ") {
-                    refinement = SubjectMaskRefinement {
-                        enabled: true,
-                        threshold: 0.45,
-                        expand_px: 0,
-                        feather_px: 2,
-                    };
-                    apply_refinement = true;
-                    push_undo = true;
-                }
+            }
+            ui.add_enabled_ui(refinement_controls_enabled, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if preset_button(ui, "標準") {
+                        refinement = SubjectMaskRefinement {
+                            enabled: true,
+                            threshold: 0.52,
+                            expand_px: 0,
+                            feather_px: 1,
+                        };
+                        apply_refinement = true;
+                        push_undo = true;
+                    }
+                    if preset_button(ui, "硬め") {
+                        refinement = SubjectMaskRefinement {
+                            enabled: true,
+                            threshold: 0.58,
+                            expand_px: -1,
+                            feather_px: 0,
+                        };
+                        apply_refinement = true;
+                        push_undo = true;
+                    }
+                    if preset_button(ui, "柔らかめ") {
+                        refinement = SubjectMaskRefinement {
+                            enabled: true,
+                            threshold: 0.45,
+                            expand_px: 0,
+                            feather_px: 2,
+                        };
+                        apply_refinement = true;
+                        push_undo = true;
+                    }
+                });
             });
-            let threshold =
-                ui.add(egui::Slider::new(&mut refinement.threshold, 0.05..=0.95).text("しきい値"));
-            let threshold_started = threshold.drag_started();
-            let threshold_changed = threshold.changed();
-            let threshold_stopped = threshold.drag_stopped();
-            threshold.lab_hover_tip(
-                "この値以上を被写体として残します。上げるほど背景側の半透明が減ります。",
-            );
-            let expand =
-                ui.add(egui::Slider::new(&mut refinement.expand_px, -4..=4).text("収縮/拡張"));
-            let expand_started = expand.drag_started();
-            let expand_changed = expand.changed();
-            let expand_stopped = expand.drag_stopped();
-            expand.lab_hover_tip(
-                "マイナスで少し内側へ縮め、プラスで外側へ広げます。背景のにじみがある時は -1 が効きます。",
-            );
-            let feather =
-                ui.add(egui::Slider::new(&mut refinement.feather_px, 0..=8).text("境界なめらか"));
-            let feather_started = feather.drag_started();
-            let feather_changed = feather.changed();
-            let feather_stopped = feather.drag_stopped();
-            feather.lab_hover_tip(
-                "2値化後の境界だけをなじませます。0は完全な2値、1〜2は切り抜き向けの軽い境界です。",
-            );
+            let mut threshold_started = false;
+            let mut threshold_changed = false;
+            let mut threshold_stopped = false;
+            let mut expand_started = false;
+            let mut expand_changed = false;
+            let mut expand_stopped = false;
+            let mut feather_started = false;
+            let mut feather_changed = false;
+            let mut feather_stopped = false;
+            ui.add_enabled_ui(refinement_controls_enabled, |ui| {
+                let threshold = ui.add(
+                    egui::Slider::new(&mut refinement.threshold, 0.05..=0.95).text("しきい値"),
+                );
+                threshold_started = threshold.drag_started();
+                threshold_changed = threshold.changed();
+                threshold_stopped = threshold.drag_stopped();
+                threshold.lab_hover_tip(
+                    "この値以上を被写体として残します。上げるほど背景側の半透明が減ります。",
+                );
+                let expand =
+                    ui.add(egui::Slider::new(&mut refinement.expand_px, -4..=4).text("収縮/拡張"));
+                expand_started = expand.drag_started();
+                expand_changed = expand.changed();
+                expand_stopped = expand.drag_stopped();
+                expand.lab_hover_tip(
+                    "マイナスで少し内側へ縮め、プラスで外側へ広げます。背景のにじみがある時は -1 が効きます。",
+                );
+                let feather = ui.add(
+                    egui::Slider::new(&mut refinement.feather_px, 0..=8).text("境界なめらか"),
+                );
+                feather_started = feather.drag_started();
+                feather_changed = feather.changed();
+                feather_stopped = feather.drag_stopped();
+                feather.lab_hover_tip(
+                    "2値化後の境界だけをなじませます。0は完全な2値、1〜2は切り抜き向けの軽い境界です。",
+                );
+            });
             let slider_started = threshold_started || expand_started || feather_started;
             let slider_changed = threshold_changed || expand_changed || feather_changed;
             let slider_stopped = threshold_stopped || expand_stopped || feather_stopped;
@@ -5048,7 +5074,11 @@ impl LocalAdjustLabApp {
             if slider_stopped {
                 self.subject_cutout_edit_active = false;
             }
-            let mode_label = if refinement_enabled {
+            let (display_stats, display_enabled) = self
+                .selected_subject_cutout_state()
+                .map(|(stats, _, enabled)| (stats, enabled))
+                .unwrap_or((stats, refinement_controls_enabled));
+            let mode_label = if display_enabled {
                 "整形済み"
             } else {
                 "元マット"
@@ -5056,7 +5086,7 @@ impl LocalAdjustLabApp {
             ui.label(
                 egui::RichText::new(format!(
                     "{mode_label} / 前景 {:.1}% / 半透明 {:.1}%",
-                    stats.foreground_percent, stats.soft_percent
+                    display_stats.foreground_percent, display_stats.soft_percent
                 ))
                 .size(10.0)
                 .color(Color32::from_gray(170)),

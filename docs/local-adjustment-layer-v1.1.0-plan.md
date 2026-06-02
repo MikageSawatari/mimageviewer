@@ -879,7 +879,8 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   を使って U²-Netp の被写体 / 背景マスクを worker thread で生成する初期実装まで接続済み。
   生成結果は `Subject(SubjectMask)` として保持し、背景選択はマスク反転で扱う。
   `SubjectMask` は現在の alpha に加えて生成直後の soft matte も保持し、切り抜き向け整形の
-  しきい値 / 収縮拡張 / 境界なめらかスライダーは、その元 matte から現在 alpha を再生成する
+  `マスクを整形` チェックが ON のときだけ、しきい値 / 収縮拡張 / 境界なめらかスライダーで
+  その元 matte から現在 alpha を再生成する。OFF に戻すと元 matte へ復帰する
 - `local_adjust_lab` の領域分割は、色差 / 境界 / 連結領域による候補生成を worker thread で行う。
   生成結果は `Segmentation(RegionMask)` として保持し、生成直後は未選択にする。未選択候補は
   アニメーションする境界線だけで表示し、クリック / ドラッグで個別に選択 / 解除できる。
