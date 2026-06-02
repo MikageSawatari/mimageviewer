@@ -61,21 +61,21 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、90種)
+### `LocalEffect` (部分補正レイヤー、91種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), PartColor(指定色だけ残す白黒化), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, HeatHaze, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, CloudFog, WaterCaustics, ParticleOverlay, Aurora, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Defringe, ScanlineGlitch, Vhs, PixelSort, OldFilm, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Lithograph, Engraving, NewspaperPrint, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
+GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, LightLeak, CloudFog, WaterCaustics, ParticleOverlay, Aurora, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Defringe, ScanlineGlitch, Vhs, PixelSort, OldFilm, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Lithograph, Engraving, NewspaperPrint, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
 Subject(被写体分離) / Segmentation
 
 ### グローバル `PostFilter` 側にあって local には無いもの (= local へ移植候補)
-LightLeak / 減色8機種 / CRT 3種＋複合 / カラーグレード11種
+減色8機種 / CRT 3種＋複合 / カラーグレード11種
 
 ---
 

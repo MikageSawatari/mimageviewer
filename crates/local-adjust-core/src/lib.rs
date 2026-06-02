@@ -592,6 +592,7 @@ pub enum LocalEffect {
     GodRays(GodRaysParams),
     LensFlare(LensFlareParams),
     AnamorphicFlare(AnamorphicFlareParams),
+    LightLeak(LightLeakParams),
     SpeedLines(SpeedLinesParams),
     CloudFog(CloudFogParams),
     Spotlight(SpotlightParams),
@@ -690,6 +691,7 @@ impl LocalEffect {
             Self::GodRays(_) => "光芒",
             Self::LensFlare(_) => "レンズフレア",
             Self::AnamorphicFlare(_) => "アナモルフィックフレア",
+            Self::LightLeak(_) => "ライトリーク",
             Self::SpeedLines(_) => "集中線/スピード線",
             Self::CloudFog(_) => "雲/霧",
             Self::Spotlight(_) => "スポットライト",
@@ -2715,6 +2717,37 @@ impl Default for AnamorphicFlareParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LightLeakParams {
+    pub center: [f32; 2],
+    pub color_rgb: [u8; 3],
+    pub radius: f32,
+    pub intensity: f32,
+    pub falloff: f32,
+    pub haze: f32,
+    pub streak_strength: f32,
+    pub streak_angle_degrees: f32,
+    pub strength: f32,
+    pub seed: u32,
+}
+
+impl Default for LightLeakParams {
+    fn default() -> Self {
+        Self {
+            center: [0.08, 0.10],
+            color_rgb: [255, 146, 72],
+            radius: 0.70,
+            intensity: 0.85,
+            falloff: 2.6,
+            haze: 0.28,
+            streak_strength: 0.30,
+            streak_angle_degrees: -28.0,
+            strength: 0.0,
+            seed: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeedLinesMode {
@@ -3903,6 +3936,9 @@ where
             }
             LocalEffect::AnamorphicFlare(params) => {
                 apply_anamorphic_flare(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::LightLeak(params) => {
+                apply_light_leak(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::SpeedLines(params) => {
                 apply_speed_lines(&image.pixels, image.width, image.height, *params)
@@ -9559,6 +9595,76 @@ fn apply_anamorphic_flare(
     out
 }
 
+fn apply_light_leak(src: &[u8], width: usize, height: usize, params: LightLeakParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let intensity = params.intensity.clamp(0.0, 2.0);
+    if strength <= f32::EPSILON || intensity <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let color = rgb_u8_to_f32(params.color_rgb);
+    let radius = params.radius.clamp(0.05, 1.6);
+    let falloff = params.falloff.clamp(0.35, 6.0);
+    let haze = params.haze.clamp(0.0, 1.0);
+    let streak_strength = params.streak_strength.clamp(0.0, 1.0);
+    let angle = params.streak_angle_degrees.to_radians();
+    let dir = (angle.cos(), angle.sin());
+    let perp = (-dir.1, dir.0);
+    let cx = params.center[0].clamp(-0.5, 1.5) * width.saturating_sub(1).max(1) as f32;
+    let cy = params.center[1].clamp(-0.5, 1.5) * height.saturating_sub(1).max(1) as f32;
+    let diag = (width as f32).hypot(height as f32).max(1.0);
+    let radius_px = radius * diag;
+    let mut out = src.to_vec();
+
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = dx.hypot(dy);
+            let radial = (1.0 - dist / radius_px).clamp(0.0, 1.0).powf(falloff);
+            let broad = (1.0 - dist / (radius_px * 1.85)).clamp(0.0, 1.0).powf(1.25) * haze;
+            let along = dx * dir.0 + dy * dir.1;
+            let across = dx * perp.0 + dy * perp.1;
+            let streak_decay = (1.0 - along.abs() / (radius_px * 1.28).max(1.0)).clamp(0.0, 1.0);
+            let stripe = ((across / 19.0)
+                + glass_value_noise(x as f32 / 42.0, y as f32 / 42.0, params.seed) * 1.2)
+                .sin()
+                .abs();
+            let stripe = 1.0 - smoothstep(0.20, 0.72, stripe);
+            let streak = stripe * streak_decay.powf(1.6) * streak_strength;
+            let noise = glass_value_noise(
+                x as f32 / 24.0 + 11.0,
+                y as f32 / 24.0 - 7.0,
+                params.seed ^ 0x1EAF_5EED,
+            );
+            let leak = ((radial + broad + streak) * intensity * strength)
+                * (1.0 + noise * 0.10 * (haze + streak_strength).clamp(0.0, 1.0));
+            let leak = leak.clamp(0.0, 1.0);
+            if leak <= f32::EPSILON {
+                continue;
+            }
+
+            let warm_edge = radial.powf(0.55) * 0.22 + streak * 0.12;
+            let overlay = [
+                (color[0] * leak + warm_edge).clamp(0.0, 1.0),
+                (color[1] * leak + warm_edge * 0.32).clamp(0.0, 1.0),
+                (color[2] * leak).clamp(0.0, 1.0),
+            ];
+            for c in 0..3 {
+                let base = src[i + c] as f32 / 255.0;
+                out[i + c] = to_u8(screen_channel(base, overlay[c]));
+            }
+        }
+    }
+
+    out
+}
+
 fn horizontal_streak_rgb_f32(src: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
     if radius == 0 || width == 0 || height == 0 {
         return src.to_vec();
@@ -14643,6 +14749,7 @@ mod tests {
             LocalEffect::GodRays(GodRaysParams::default()),
             LocalEffect::LensFlare(LensFlareParams::default()),
             LocalEffect::AnamorphicFlare(AnamorphicFlareParams::default()),
+            LocalEffect::LightLeak(LightLeakParams::default()),
             LocalEffect::SpeedLines(SpeedLinesParams::default()),
             LocalEffect::CloudFog(CloudFogParams::default()),
             LocalEffect::Spotlight(SpotlightParams::default()),
@@ -15256,6 +15363,21 @@ mod tests {
                     strength: 3.0,
                     color_rgb: [80, 150, 255],
                     color_strength: 1.0,
+                }),
+            ),
+            full(
+                "light leak max haze streaks",
+                LocalEffect::LightLeak(LightLeakParams {
+                    center: [-0.25, 0.20],
+                    color_rgb: [255, 120, 60],
+                    radius: 1.6,
+                    intensity: 2.0,
+                    falloff: 0.35,
+                    haze: 1.0,
+                    streak_strength: 1.0,
+                    streak_angle_degrees: -180.0,
+                    strength: 1.0,
+                    seed: 28,
                 }),
             ),
             full(
@@ -16894,6 +17016,97 @@ LUT_3D_SIZE 2
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(&out.pixels[0..4], &[0, 0, 0, 255]);
         assert_eq!(&out.pixels[8..12], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn light_leak_brightens_near_source_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            4,
+            1,
+            vec![
+                24, 24, 24, 201, 24, 24, 24, 202, 24, 24, 24, 203, 24, 24, 24, 204,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "light leak",
+            LocalMask::Full,
+            LocalEffect::LightLeak(LightLeakParams {
+                center: [0.0, 0.0],
+                color_rgb: [255, 130, 60],
+                radius: 0.95,
+                intensity: 1.0,
+                falloff: 1.2,
+                haze: 0.0,
+                streak_strength: 0.0,
+                streak_angle_degrees: 0.0,
+                strength: 1.0,
+                seed: 3,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert!(out.pixels[0] > out.pixels[12]);
+        assert!(out.pixels[0] > out.pixels[2]);
+        assert_eq!(out.pixels[3], 201);
+        assert_eq!(out.pixels[15], 204);
+    }
+
+    #[test]
+    fn light_leak_position_moves_bright_corner() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 20, 20, 255, 20, 20, 20, 255, 20, 20, 20, 255],
+        )
+        .unwrap();
+        let left = LocalAdjustmentLayer::new(
+            "light leak",
+            LocalMask::Full,
+            LocalEffect::LightLeak(LightLeakParams {
+                center: [0.0, 0.0],
+                radius: 0.70,
+                intensity: 1.0,
+                falloff: 1.0,
+                haze: 0.0,
+                streak_strength: 0.0,
+                strength: 1.0,
+                ..LightLeakParams::default()
+            }),
+        );
+        let right = LocalAdjustmentLayer::new(
+            "light leak",
+            LocalMask::Full,
+            LocalEffect::LightLeak(LightLeakParams {
+                center: [1.0, 0.0],
+                radius: 0.70,
+                intensity: 1.0,
+                falloff: 1.0,
+                haze: 0.0,
+                streak_strength: 0.0,
+                strength: 1.0,
+                ..LightLeakParams::default()
+            }),
+        );
+        let left_out = apply_layers(src.as_ref(), &[left]).unwrap();
+        let right_out = apply_layers(src.as_ref(), &[right]).unwrap();
+        assert!(left_out.pixels[0] > left_out.pixels[8]);
+        assert!(right_out.pixels[8] > right_out.pixels[0]);
+    }
+
+    #[test]
+    fn light_leak_keeps_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(1, 1, vec![200, 80, 20, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "light leak",
+            LocalMask::Full,
+            LocalEffect::LightLeak(LightLeakParams {
+                strength: 1.0,
+                ..LightLeakParams::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
     }
 
     #[test]

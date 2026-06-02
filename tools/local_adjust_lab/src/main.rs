@@ -26,12 +26,12 @@ use local_adjust_core::{
     GlassDisplacementMode, GlassDisplacementParams, GlowingEdgesParams, GodRaysParams,
     GradientMapParams, GradientMapPreset, HalationParams, HalftoneParams, HeatHazeParams,
     HighPassParams, HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture,
-    LensBlurParams, LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams,
-    LineKind, LinearGradientMask, LithographParams, LocalAdjustmentLayer, LocalEffect, LocalMask,
-    LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary,
-    MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams, NewspaperPrintParams,
-    NoiseDistribution, NoiseParams, OilPaintParams, OldFilmParams, OrtonParams,
-    OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, ParticleOverlayMode,
+    LensBlurParams, LensCorrectionParams, LensFlareParams, LightLeakParams, LineExtractMode,
+    LineExtractParams, LineKind, LinearGradientMask, LithographParams, LocalAdjustmentLayer,
+    LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams,
+    MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams,
+    NewspaperPrintParams, NoiseDistribution, NoiseParams, OilPaintParams, OldFilmParams,
+    OrtonParams, OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, ParticleOverlayMode,
     ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection, PixelSortOrder,
     PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
     PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
@@ -1069,6 +1069,7 @@ enum EffectKind {
     GodRays,
     LensFlare,
     AnamorphicFlare,
+    LightLeak,
     CloudFog,
     WaterCaustics,
     ParticleOverlay,
@@ -1117,6 +1118,7 @@ enum RgbPickTarget {
     ContactShadowColor,
     ColorDodgeGlowColor,
     AnamorphicFlareColor,
+    LightLeakColor,
     LithographInkA,
     LithographInkB,
     LithographPaper,
@@ -1149,6 +1151,7 @@ impl RgbPickTarget {
             Self::ContactShadowColor => "接触影の影色",
             Self::ColorDodgeGlowColor => "覆い焼き発光の光色",
             Self::AnamorphicFlareColor => "アナモルフィックフレアの色",
+            Self::LightLeakColor => "ライトリークの光色",
             Self::LithographInkA => "リソグラフのインク1",
             Self::LithographInkB => "リソグラフのインク2",
             Self::LithographPaper => "リソグラフの紙色",
@@ -1232,6 +1235,7 @@ impl EffectKind {
             LocalEffect::GodRays(_) => Self::GodRays,
             LocalEffect::LensFlare(_) => Self::LensFlare,
             LocalEffect::AnamorphicFlare(_) => Self::AnamorphicFlare,
+            LocalEffect::LightLeak(_) => Self::LightLeak,
             LocalEffect::CloudFog(_) => Self::CloudFog,
             LocalEffect::WaterCaustics(_) => Self::WaterCaustics,
             LocalEffect::ParticleOverlay(_) => Self::ParticleOverlay,
@@ -1330,6 +1334,7 @@ impl EffectKind {
             Self::GodRays => "光芒",
             Self::LensFlare => "レンズフレア",
             Self::AnamorphicFlare => "アナモルフィックフレア",
+            Self::LightLeak => "ライトリーク",
             Self::CloudFog => "雲/霧",
             Self::WaterCaustics => "水中コースティクス",
             Self::ParticleOverlay => "雨/雪/花びら",
@@ -1512,6 +1517,9 @@ impl EffectKind {
             Self::LensFlare => "光源のにじみ、ハロー、レンズ内反射のゴーストを重ねます。",
             Self::AnamorphicFlare => {
                 "明るい部分から横方向の青い光条を伸ばし、シネマ調のフレアを作ります。"
+            }
+            Self::LightLeak => {
+                "指定した位置から暖色の光漏れ、薄いヘイズ、斜めの漏れ筋を重ねて古いフィルム風にします。"
             }
             Self::CloudFog => "手続き型のノイズで霧や雲を重ね、大気感と遠近感を加えます。",
             Self::WaterCaustics => {
@@ -1725,6 +1733,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::GodRays,
             EffectKind::LensFlare,
             EffectKind::AnamorphicFlare,
+            EffectKind::LightLeak,
             EffectKind::CloudFog,
             EffectKind::WaterCaustics,
             EffectKind::ParticleOverlay,
@@ -7474,6 +7483,27 @@ impl LocalAdjustLabApp {
                     guide_stroke,
                 );
             }
+            LocalEffect::LightLeak(params) => {
+                let (center_changed, center_used, center) = draw_effect_center_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("light_leak_center", layer_idx)),
+                    &mut params.center,
+                    "ライトリーク光源位置",
+                    Color32::from_rgb(255, 188, 120),
+                );
+                changed |= center_changed;
+                used |= center_used;
+
+                let diag = rect.width().hypot(rect.height()).max(1.0);
+                let radius_px = diag * params.radius.clamp(0.05, 1.6);
+                let ring_stroke =
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 178, 110, 145));
+                let haze_stroke =
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 224, 160, 85));
+                painter.circle_stroke(center, radius_px.max(2.0), ring_stroke);
+                painter.circle_stroke(center, (radius_px * 1.85).max(2.0), haze_stroke);
+            }
             LocalEffect::SpeedLines(params) => {
                 let (center_changed, center_used, center) = draw_effect_center_handle(
                     ui,
@@ -8877,6 +8907,12 @@ fn effect_summary(effect: &LocalEffect) -> String {
             params.length_px,
             params.strength * 100.0
         ),
+        LocalEffect::LightLeak(params) => format!(
+            "ライトリーク {:.2},{:.2} {:.0}%",
+            params.center[0],
+            params.center[1],
+            params.strength * 100.0
+        ),
         LocalEffect::CloudFog(params) => match params.mode {
             CloudFogMode::Fog => format!("霧 {:.0}%", params.opacity * 100.0),
             CloudFogMode::Clouds => format!("雲 {:.0}%", params.opacity * 100.0),
@@ -8977,6 +9013,7 @@ fn effect_has_position_handles(effect: &LocalEffect) -> bool {
             | LocalEffect::LensCorrection(_)
             | LocalEffect::GodRays(_)
             | LocalEffect::LensFlare(_)
+            | LocalEffect::LightLeak(_)
             | LocalEffect::SpeedLines(_)
             | LocalEffect::Spotlight(_)
     )
@@ -9288,6 +9325,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
             true
         }
         (LocalEffect::AnamorphicFlare(params), RgbPickTarget::AnamorphicFlareColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::LightLeak(params), RgbPickTarget::LightLeakColor) => {
             params.color_rgb = rgb;
             true
         }
@@ -15347,6 +15388,130 @@ fn draw_effect_params(
             changed |= color_strength.changed();
             color_strength.lab_hover_tip("元の明部色から指定したフレア色へどれだけ寄せるかです。");
         }
+        LocalEffect::LightLeak(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "左上") {
+                    *params = LightLeakParams {
+                        center: [0.06, 0.08],
+                        color_rgb: [255, 146, 72],
+                        radius: 0.72,
+                        intensity: 0.90,
+                        falloff: 2.3,
+                        haze: 0.30,
+                        streak_strength: 0.25,
+                        streak_angle_degrees: -28.0,
+                        strength: 0.78,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "フィルム端") {
+                    *params = LightLeakParams {
+                        center: [0.0, 0.50],
+                        color_rgb: [255, 92, 70],
+                        radius: 0.58,
+                        intensity: 1.30,
+                        falloff: 1.4,
+                        haze: 0.18,
+                        streak_strength: 0.62,
+                        streak_angle_degrees: -6.0,
+                        strength: 0.85,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "斜め筋") {
+                    *params = LightLeakParams {
+                        center: [0.20, 0.02],
+                        color_rgb: [255, 180, 92],
+                        radius: 0.90,
+                        intensity: 0.95,
+                        falloff: 1.7,
+                        haze: 0.24,
+                        streak_strength: 0.85,
+                        streak_angle_degrees: -36.0,
+                        strength: 0.82,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "柔らかい") {
+                    *params = LightLeakParams {
+                        center: [0.78, 0.18],
+                        color_rgb: [255, 205, 145],
+                        radius: 1.05,
+                        intensity: 0.62,
+                        falloff: 3.2,
+                        haze: 0.48,
+                        streak_strength: 0.10,
+                        streak_angle_degrees: -18.0,
+                        strength: 0.58,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "指定位置からスクリーン合成の暖色光、薄いヘイズ、斜めの漏れ筋を重ねます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            changed |= draw_effect_center_controls(
+                ui,
+                &mut params.center,
+                "光漏れが始まる横位置です。",
+                "光漏れが始まる縦位置です。",
+                effect_position_handles_visible,
+                &mut set_effect_position_handles_visible,
+            );
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "光色",
+                    &mut params.color_rgb,
+                    RgbPickTarget::LightLeakColor,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let radius = ui.add(egui::Slider::new(&mut params.radius, 0.05..=1.6).text("範囲"));
+            changed |= radius.changed();
+            radius.lab_hover_tip("光漏れが広がる範囲です。画像の対角線に対する比率です。");
+            let intensity =
+                ui.add(egui::Slider::new(&mut params.intensity, 0.0..=2.0).text("明るさ"));
+            changed |= intensity.changed();
+            intensity.lab_hover_tip("光漏れ自体の明るさです。高いほど白く飛びやすくなります。");
+            let falloff = ui.add(egui::Slider::new(&mut params.falloff, 0.35..=6.0).text("減衰"));
+            changed |= falloff.changed();
+            falloff.lab_hover_tip("中心から離れたときの弱まり方です。低いほど広く残ります。");
+            let haze = ui.add(egui::Slider::new(&mut params.haze, 0.0..=1.0).text("ヘイズ"));
+            changed |= haze.changed();
+            haze.lab_hover_tip("広い薄いかぶり光を足す量です。");
+            let streak =
+                ui.add(egui::Slider::new(&mut params.streak_strength, 0.0..=1.0).text("漏れ筋"));
+            changed |= streak.changed();
+            streak.lab_hover_tip("斜めのフィルム漏れ筋を足す量です。");
+            let angle = ui.add(
+                egui::Slider::new(&mut params.streak_angle_degrees, -180.0..=180.0)
+                    .text("筋角度")
+                    .suffix("°"),
+            );
+            changed |= angle.changed();
+            angle.lab_hover_tip("漏れ筋の向きです。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からライトリーク結果へどれだけ近づけるかです。");
+            let mut seed = params.seed as i32;
+            let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
+            changed |= seed_response.changed();
+            seed_response.lab_hover_tip("漏れ筋や細かな揺らぎの乱数です。");
+            params.seed = seed.max(0) as u32;
+        }
         LocalEffect::CloudFog(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -18875,6 +19040,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::AnamorphicFlare => {
             LocalEffect::AnamorphicFlare(AnamorphicFlareParams::default())
         }
+        EffectKind::LightLeak => LocalEffect::LightLeak(LightLeakParams::default()),
         EffectKind::CloudFog => LocalEffect::CloudFog(CloudFogParams::default()),
         EffectKind::WaterCaustics => LocalEffect::WaterCaustics(WaterCausticsParams::default()),
         EffectKind::ParticleOverlay => {
@@ -21273,6 +21439,7 @@ mod tests {
             EffectKind::GodRays,
             EffectKind::LensFlare,
             EffectKind::AnamorphicFlare,
+            EffectKind::LightLeak,
             EffectKind::CloudFog,
             EffectKind::WaterCaustics,
             EffectKind::ParticleOverlay,
@@ -21358,6 +21525,7 @@ mod tests {
             LocalEffect::LensCorrection(LensCorrectionParams::default()),
             LocalEffect::GodRays(GodRaysParams::default()),
             LocalEffect::LensFlare(LensFlareParams::default()),
+            LocalEffect::LightLeak(LightLeakParams::default()),
             LocalEffect::SpeedLines(SpeedLinesParams::default()),
             LocalEffect::Spotlight(SpotlightParams::default()),
         ];
@@ -21678,6 +21846,17 @@ mod tests {
             panic!("expected anamorphic flare effect");
         };
         assert_eq!(anamorphic_flare_params.color_rgb, [80, 160, 255]);
+
+        let mut light_leak = LocalEffect::LightLeak(LightLeakParams::default());
+        assert!(set_rgb_pick_target(
+            &mut light_leak,
+            RgbPickTarget::LightLeakColor,
+            [255, 150, 90],
+        ));
+        let LocalEffect::LightLeak(light_leak_params) = light_leak else {
+            panic!("expected light leak effect");
+        };
+        assert_eq!(light_leak_params.color_rgb, [255, 150, 90]);
 
         let mut lithograph = LocalEffect::Lithograph(LithographParams::default());
         assert!(set_rgb_pick_target(
