@@ -299,6 +299,24 @@ struct RenderPending {
     started_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayerBypassPreviewKey {
+    generation: u64,
+    layer_idx: usize,
+}
+
+struct LayerBypassPreviewPending {
+    key: LayerBypassPreviewKey,
+    rx: mpsc::Receiver<Result<RgbaImageBuf, String>>,
+    cancel: Arc<AtomicBool>,
+    started_at: Instant,
+}
+
+struct LayerBypassPreviewCache {
+    key: LayerBypassPreviewKey,
+    texture: TextureHandle,
+}
+
 struct RenderProgress {
     generation: u64,
     layer_index: usize,
@@ -1700,6 +1718,7 @@ struct LocalAdjustLabApp {
     image: Option<LoadedImage>,
     source_texture: Option<TextureHandle>,
     result_texture: Option<TextureHandle>,
+    layer_bypass_preview: Option<LayerBypassPreviewCache>,
     mask_tiles: Option<MaskTilePreview>,
     mask_dirty_tiles: Option<BTreeSet<(usize, usize)>>,
     edge_mask: Option<EdgeMaskCache>,
@@ -1708,6 +1727,7 @@ struct LocalAdjustLabApp {
     selected_layer: usize,
     result: Option<RgbaImageBuf>,
     pending: Option<RenderPending>,
+    layer_bypass_pending: Option<LayerBypassPreviewPending>,
     segmentation_pending: Option<SegmentationPending>,
     lut_load_pending: Option<LutLoadPending>,
     generation: u64,
@@ -1784,6 +1804,7 @@ impl LocalAdjustLabApp {
             image: None,
             source_texture: None,
             result_texture: None,
+            layer_bypass_preview: None,
             mask_tiles: None,
             mask_dirty_tiles: None,
             edge_mask: None,
@@ -1792,6 +1813,7 @@ impl LocalAdjustLabApp {
             selected_layer: 0,
             result: None,
             pending: None,
+            layer_bypass_pending: None,
             segmentation_pending: None,
             lut_load_pending: None,
             generation: 0,
@@ -1875,6 +1897,7 @@ impl LocalAdjustLabApp {
                     TextureOptions::LINEAR,
                 ));
                 self.result_texture = None;
+                self.layer_bypass_preview = None;
                 self.mask_tiles = None;
                 self.mask_dirty_tiles = None;
                 self.edge_mask = None;
@@ -1883,6 +1906,7 @@ impl LocalAdjustLabApp {
                 self.selected_layer = 0;
                 self.result = None;
                 self.cancel_pending_render();
+                self.cancel_pending_layer_bypass_preview();
                 self.segmentation_pending = None;
                 self.lut_load_pending = None;
                 self.image = Some(loaded);
@@ -1988,10 +2012,12 @@ impl LocalAdjustLabApp {
 
     fn mark_dirty(&mut self) {
         self.cancel_pending_render();
+        self.cancel_pending_layer_bypass_preview();
         self.generation = self.generation.wrapping_add(1);
         self.result_dirty = true;
         self.mask_dirty = true;
         self.mask_dirty_tiles = None;
+        self.layer_bypass_preview = None;
         self.last_edit = Instant::now();
     }
 
@@ -2015,8 +2041,10 @@ impl LocalAdjustLabApp {
 
     fn mark_dirty_tiles(&mut self, new_tiles: BTreeSet<(usize, usize)>) {
         self.cancel_pending_render();
+        self.cancel_pending_layer_bypass_preview();
         self.generation = self.generation.wrapping_add(1);
         self.result_dirty = true;
+        self.layer_bypass_preview = None;
         if new_tiles.is_empty() {
             self.mask_dirty = true;
             self.mask_dirty_tiles = None;
@@ -2035,6 +2063,12 @@ impl LocalAdjustLabApp {
 
     fn cancel_pending_render(&mut self) {
         if let Some(pending) = self.pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn cancel_pending_layer_bypass_preview(&mut self) {
+        if let Some(pending) = self.layer_bypass_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
     }
@@ -2376,6 +2410,30 @@ impl LocalAdjustLabApp {
         self.layers[..self.preview_layer_count()].to_vec()
     }
 
+    fn layer_bypass_preview_key(&self) -> Option<LayerBypassPreviewKey> {
+        if self.image.is_none() || self.layers.is_empty() {
+            return None;
+        }
+        Some(LayerBypassPreviewKey {
+            generation: self.generation,
+            layer_idx: self.selected_layer.min(self.layers.len() - 1),
+        })
+    }
+
+    fn layer_bypass_preview_requested(&self, ctx: &egui::Context) -> bool {
+        self.workflow_panel == LabWorkflowPanel::Adjust
+            && ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift)
+            && self.layer_bypass_preview_key().is_some()
+    }
+
+    fn layer_bypass_preview_texture_id(&self) -> Option<egui::TextureId> {
+        let key = self.layer_bypass_preview_key()?;
+        self.layer_bypass_preview
+            .as_ref()
+            .filter(|cache| cache.key == key)
+            .map(|cache| cache.texture.id())
+    }
+
     fn selected_mask_kind(&self) -> Option<MaskKind> {
         self.selected_layer_ref()
             .map(|layer| MaskKind::from_mask(&layer.mask))
@@ -2661,6 +2719,124 @@ impl LocalAdjustLabApp {
         }
         if self.pending.is_some() {
             ctx.request_repaint();
+        }
+    }
+
+    fn poll_layer_bypass_preview(&mut self, ctx: &egui::Context) {
+        let recv_result = {
+            let Some(pending) = self.layer_bypass_pending.as_ref() else {
+                return;
+            };
+            pending.rx.try_recv()
+        };
+
+        match recv_result {
+            Ok(result) => {
+                let Some(pending) = self.layer_bypass_pending.take() else {
+                    return;
+                };
+                let key = pending.key;
+                if self.layer_bypass_preview_key() != Some(key) {
+                    self.status = "古い選択レイヤー除外プレビューを破棄しました。".to_string();
+                    return;
+                }
+                match result {
+                    Ok(result) => {
+                        let color_image = color_image_from_rgba(&result);
+                        if let Some(cache) = &mut self.layer_bypass_preview
+                            && cache.key == key
+                        {
+                            cache.texture.set(color_image, TextureOptions::LINEAR);
+                        } else {
+                            self.layer_bypass_preview = Some(LayerBypassPreviewCache {
+                                key,
+                                texture: ctx.load_texture(
+                                    "local_adjust_layer_bypass_preview",
+                                    color_image,
+                                    TextureOptions::LINEAR,
+                                ),
+                            });
+                        }
+                        let elapsed_ms = pending.started_at.elapsed().as_secs_f64() * 1000.0;
+                        if self.layer_bypass_preview_requested(ctx) {
+                            self.status =
+                                format!("選択レイヤー除外プレビュー準備完了 ({elapsed_ms:.0}ms)");
+                        }
+                        ctx.request_repaint();
+                    }
+                    Err(e) if e == "cancelled" => {}
+                    Err(e) => {
+                        self.status = format!("選択レイヤー除外プレビュー失敗: {e}");
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.layer_bypass_pending = None;
+                self.status = "選択レイヤー除外プレビュー worker が停止しました。".to_string();
+            }
+        }
+    }
+
+    fn maybe_start_layer_bypass_preview(&mut self, ctx: &egui::Context) {
+        let Some(key) = self.layer_bypass_preview_key() else {
+            return;
+        };
+        if self
+            .layer_bypass_preview
+            .as_ref()
+            .map(|cache| cache.key == key)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if self
+            .layer_bypass_pending
+            .as_ref()
+            .map(|pending| pending.key == key)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        self.cancel_pending_layer_bypass_preview();
+        let Some(image) = &self.image else {
+            return;
+        };
+        let source = image.source.clone();
+        let layers = layers_with_selected_layer_bypassed(&self.layers, key.layer_idx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("local-adjust-lab-layer-bypass-preview".to_string())
+            .spawn(move || {
+                let result = apply_layers_with_progress(
+                    source.as_ref(),
+                    &layers,
+                    Some(worker_cancel.as_ref()),
+                    |_| {},
+                )
+                .map_err(|e| e.to_string());
+                let _ = tx.send(result);
+            });
+
+        match spawn_result {
+            Ok(_) => {
+                self.layer_bypass_pending = Some(LayerBypassPreviewPending {
+                    key,
+                    rx,
+                    cancel,
+                    started_at: Instant::now(),
+                });
+                self.status = "選択レイヤー除外プレビューを生成中...".to_string();
+                ctx.request_repaint();
+            }
+            Err(e) => {
+                self.status = format!("選択レイヤー除外プレビュー worker 起動失敗: {e}");
+            }
         }
     }
 
@@ -3207,6 +3383,12 @@ impl LocalAdjustLabApp {
         }
         if self.mask_dirty {
             return ("マスク更新", Color32::from_rgb(90, 210, 255));
+        }
+        if self.layer_bypass_preview_requested(ctx) {
+            if self.layer_bypass_preview_texture_id().is_some() {
+                return ("選択OFF", Color32::from_rgb(120, 190, 255));
+            }
+            return ("選択OFF生成", Color32::from_rgb(255, 210, 80));
         }
         if self.preview_to_selected_layer && self.preview_layer_count() < self.layers.len() {
             return ("選択まで", Color32::from_rgb(120, 190, 255));
@@ -4088,7 +4270,7 @@ impl LocalAdjustLabApp {
                 egui::RichText::new(
                     "ホイール/Ctrl+ホイール:ズーム  Space+ドラッグ/中ボタン:パン\n\
                      Q:元画像  W:マスク表示\n\
-                     Ctrl:元画像を一時表示  Alt:マスク表示を一時反転  Shift:ルーペ\n\
+                     Ctrl:元画像  Ctrl+Shift:選択レイヤー除外  Alt:マスク反転  Shift:ルーペ\n\
                      境界筆[A]:境界で止めながら近い色を塗る  Ctrl中は境界表示+通常筆\n\
                      隙間補完[G]:細い未塗り部分を補完\n\
                      切り取り:黄色枠/ハンドルをドラッグ、保存時に最後段で切り出し\n\
@@ -4452,10 +4634,20 @@ impl LocalAdjustLabApp {
         let crop_panel_active = self.workflow_panel == LabWorkflowPanel::Crop;
         let (ctrl_down, alt_down, shift_down) =
             ui.input(|i| (i.modifiers.ctrl, i.modifiers.alt, i.modifiers.shift));
-        let source_preview_active = adjust_panel_active && (self.show_source || ctrl_down);
+        let layer_bypass_preview_active =
+            adjust_panel_active && ctrl_down && shift_down && !self.layers.is_empty();
+        let source_preview_active =
+            adjust_panel_active && !layer_bypass_preview_active && (self.show_source || ctrl_down);
         let mask_preview_active =
             mask_preview_active(adjust_panel_active, self.show_mask, alt_down);
-        let active_texture_id = if source_preview_active {
+        let layer_bypass_texture_id = if layer_bypass_preview_active {
+            self.layer_bypass_preview_texture_id()
+        } else {
+            None
+        };
+        let active_texture_id = if let Some(texture_id) = layer_bypass_texture_id {
+            texture_id
+        } else if source_preview_active {
             source_texture.id()
         } else {
             self.result_texture
@@ -4494,7 +4686,7 @@ impl LocalAdjustLabApp {
         if mask_preview_active {
             self.draw_mask_tile_preview(ui, rect);
         }
-        if ctrl_down && self.edge_overlay_enabled() {
+        if ctrl_down && !layer_bypass_preview_active && self.edge_overlay_enabled() {
             if let Some(edge_texture) = self.ensure_edge_preview_texture(ui.ctx()) {
                 ui.painter().image(
                     edge_texture.id(),
@@ -4569,7 +4761,7 @@ impl LocalAdjustLabApp {
             pointer_screen,
             crop_panel_active && !panel_blocks_pointer && !pan_mode && !dialog_open,
         );
-        if shift_down && !panel_blocks_pointer && !dialog_open {
+        if shift_down && !layer_bypass_preview_active && !panel_blocks_pointer && !dialog_open {
             self.draw_loupe(ui, canvas_rect, rect, active_texture_id, pointer_screen);
         }
         let secondary_pressed = ui.input(|i| i.pointer.secondary_pressed());
@@ -8039,8 +8231,15 @@ impl eframe::App for LocalAdjustLabApp {
         self.poll_segmentation(ctx);
         self.poll_lut_load(ctx);
         self.poll_render(ctx);
+        self.poll_layer_bypass_preview(ctx);
+        if self.layer_bypass_preview_requested(ctx) {
+            self.maybe_start_layer_bypass_preview(ctx);
+        } else {
+            self.cancel_pending_layer_bypass_preview();
+        }
         self.maybe_start_render(ctx);
         if self.pending.is_some()
+            || self.layer_bypass_pending.is_some()
             || self.segmentation_pending.is_some()
             || self.lut_load_pending.is_some()
         {
@@ -8065,6 +8264,7 @@ impl eframe::App for LocalAdjustLabApp {
         if self.result_dirty
             || self.mask_dirty
             || self.pending.is_some()
+            || self.layer_bypass_pending.is_some()
             || self.segmentation_pending.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -20080,6 +20280,17 @@ fn mask_preview_active(adjust_panel_active: bool, show_mask: bool, alt_down: boo
     adjust_panel_active && (show_mask != alt_down)
 }
 
+fn layers_with_selected_layer_bypassed(
+    layers: &[LocalAdjustmentLayer],
+    selected_layer: usize,
+) -> Vec<LocalAdjustmentLayer> {
+    let mut preview_layers = layers.to_vec();
+    if let Some(layer) = preview_layers.get_mut(selected_layer) {
+        layer.enabled = false;
+    }
+    preview_layers
+}
+
 fn effect_picker_button_width(available_width: f32) -> f32 {
     let spacing = 6.0;
     let available_width = available_width.max(EFFECT_PICKER_BUTTON_MIN_W);
@@ -20538,6 +20749,35 @@ mod tests {
         assert!(mask_preview_active(true, false, true));
         assert!(!mask_preview_active(false, true, false));
         assert!(!mask_preview_active(false, false, true));
+    }
+
+    #[test]
+    fn selected_layer_bypass_preview_disables_only_selected_layer() {
+        let source = RgbaImageBuf::new(1, 1, vec![64, 96, 128, 255]).unwrap();
+        let first = LocalAdjustmentLayer::new(
+            "invert",
+            LocalMask::Full,
+            LocalEffect::Invert(InvertParams { strength: 1.0 }),
+        );
+        let second = LocalAdjustmentLayer::new(
+            "brighten",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams {
+                brightness: 0.35,
+                ..ToneParams::default()
+            }),
+        );
+        let layers = vec![first, second];
+
+        let full = apply_layers(source.as_ref(), &layers).unwrap();
+        let bypass_layers = layers_with_selected_layer_bypassed(&layers, 1);
+        let bypass = apply_layers(source.as_ref(), &bypass_layers).unwrap();
+        let expected = apply_layers(source.as_ref(), &layers[..1]).unwrap();
+
+        assert!(bypass_layers[0].enabled);
+        assert!(!bypass_layers[1].enabled);
+        assert_ne!(bypass.pixels, full.pixels);
+        assert_eq!(bypass.pixels, expected.pixels);
     }
 
     #[test]

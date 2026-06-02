@@ -35,6 +35,8 @@ the window.
   - Ctrl + mouse wheel: zoom around the pointer
   - Mouse wheel: zoom around the pointer
   - Ctrl while hovering the canvas: temporarily show the source image
+  - Ctrl + Shift while hovering the canvas: temporarily show the full result
+    with only the selected adjustment layer bypassed
   - Alt while hovering the canvas: temporarily invert the mask preview
   - Shift while hovering the canvas: show a loupe around the pointer
   - Zoom can go below fit-to-window, which is useful when editing final-stage
