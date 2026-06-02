@@ -70,7 +70,7 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), PartColor(指定色だけ残す白黒化), ChannelMixer(白黒/チャンネル混合),
-Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定), RetroPalette(固定パレット減色),
+Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定), RetroPalette(固定/適応パレット減色),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, FrequencySeparation, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, RadialFlash, TiltShift, LensBlur, BokehSprite, LensDirt, RadialBlur, WaveDistortion, HeatHaze, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
 GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, LightLeak, BacklightHaze, CloudFog, WaterCaustics, ParticleOverlay, Aurora, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Defringe, ScanlineGlitch, Vhs, DataMosh, PixelSort, OldFilm, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Lithograph, Engraving, NewspaperPrint, Textureizer, StarGlow, DiffractionStarburst, EdgeSmooth, Despeckle, Median
@@ -80,8 +80,8 @@ Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / Col
 Subject(被写体分離) / Segmentation
 
 ### グローバル `PostFilter` 側にあって local には無いもの (= local へ移植候補)
-減色の固定パレット系は `RetroPalette` として一部移植済み (1bit / GameBoy / ファミコン / MSX2+)。
-残りは適応パレット系 (PC-98 / メガドライブ / SFC など) / CRT 3種＋複合 / カラーグレード11種。
+減色系は `RetroPalette` として移植済み (1bit / GameBoy / ファミコン / MSX2+ / PC-98 / ゲームギア / メガドライブ / SFC)。
+残りは CRT 3種＋複合 / カラーグレード11種。
 
 ---
 
@@ -98,7 +98,7 @@ Subject(被写体分離) / Segmentation
 - [x] **チャンネルミキサー / 本格白黒変換 (色別の明度寄与)** ★ **易** — モノクロ化を色ごとに制御 (PS / Krita)
 - [x] **3D LUT (.cube) 読み込み** ★ **中** (infra は軽い) — 外部シネマ LUT を取り込み (PS Color Lookup)
 - [x] **ポスタリゼーション (階調数指定)** ★ **易** — フラット/グラフィック調。減色フィルタとは別物 (PS / CSP / Krita)
-- [x] **レトロ減色 (`RetroPalette`)** ★ **易〜中** — 1bit / GameBoy / ファミコン / MSX2+ の固定パレットへ減色し、Bayer ディザと強度を調整できる local 版レトロ色変換
+- [x] **レトロ減色 (`RetroPalette`)** ★ **易〜中** — 1bit / GameBoy / ファミコン / MSX2+ の固定パレット、PC-98 / ゲームギア / メガドライブ / SFC の適応パレットへ減色し、Bayer ディザと強度を調整できる local 版レトロ色変換
 - [x] **2値化 (しきい値)** ★ **易** — 線画・モノクロ化 (manga) (PS / CSP / Krita)
 - [x] **階調反転 / ネガ** **易** — 反転。local に無い (全ソフト)
 - [x] **ダブルトーン / トライトーン** **易** — グラデマップの特殊化。ポスター調 (PS)

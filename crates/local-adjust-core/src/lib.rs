@@ -2162,6 +2162,10 @@ pub enum RetroPaletteMode {
     GameBoy,
     Famicom,
     Msx2Plus,
+    Pc98,
+    GameGear,
+    MegaDrive,
+    Sfc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -8789,6 +8793,11 @@ fn apply_retro_palette(
         return src.to_vec();
     }
     let dither = params.dither.clamp(0.0, 1.0);
+    let adaptive_palette = retro_adaptive_palette_spec(params.mode)
+        .map(|(colors, bit_depth)| generate_retro_adaptive_palette(src, colors, bit_depth));
+    let adaptive_lut = adaptive_palette
+        .as_ref()
+        .map(|palette| build_retro_palette_lut(palette));
     let mut out = src.to_vec();
     for y in 0..height {
         for x in 0..width {
@@ -8797,12 +8806,13 @@ fn apply_retro_palette(
                 continue;
             }
             let offset = bayer4_offset(x, y);
-            let quantized = retro_palette_rgb(
-                [src[i], src[i + 1], src[i + 2]],
-                params.mode,
-                offset,
-                dither,
-            );
+            let rgb = [src[i], src[i + 1], src[i + 2]];
+            let quantized = match (adaptive_palette.as_deref(), adaptive_lut.as_deref()) {
+                (Some(palette), Some(lut)) => {
+                    retro_palette_lut_rgb(rgb, palette, lut, offset, dither)
+                }
+                _ => retro_palette_rgb(rgb, params.mode, offset, dither),
+            };
             for c in 0..3 {
                 out[i + c] = lerp_u8(src[i + c], quantized[c], strength);
             }
@@ -8879,6 +8889,7 @@ const RETRO_LUT_BITS: u32 = 5;
 const RETRO_LUT_DIM: u32 = 1 << RETRO_LUT_BITS;
 const RETRO_LUT_MAX: u32 = RETRO_LUT_DIM - 1;
 const RETRO_LUT_SIZE: usize = (RETRO_LUT_DIM * RETRO_LUT_DIM * RETRO_LUT_DIM) as usize;
+const RETRO_ADAPTIVE_SAMPLE_LIMIT: usize = 50_000;
 
 static RETRO_FAMICOM_LUT: OnceLock<Vec<u8>> = OnceLock::new();
 
@@ -8930,6 +8941,10 @@ fn retro_palette_rgb(
                 quantize_retro_channel(rgb[2], 4, offset),
             ]
         }
+        RetroPaletteMode::Pc98
+        | RetroPaletteMode::GameGear
+        | RetroPaletteMode::MegaDrive
+        | RetroPaletteMode::Sfc => rgb,
     }
 }
 
@@ -8937,6 +8952,161 @@ fn quantize_retro_channel(channel: u8, levels: u32, offset: f32) -> u8 {
     let max_level = (levels - 1) as f32;
     let value = ((channel as f32 + offset).clamp(0.0, 255.0) / 255.0 * max_level).round();
     ((value / max_level) * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn quantize_retro_channel_bits(channel: u8, bits: u8) -> u8 {
+    let levels = ((1_u32 << bits) - 1).max(1);
+    let level = ((channel as u32 * levels + 127) / 255).min(levels);
+    ((level * 255 + levels / 2) / levels) as u8
+}
+
+fn quantize_retro_color_bits(rgb: [u8; 3], bits: u8) -> [u8; 3] {
+    [
+        quantize_retro_channel_bits(rgb[0], bits),
+        quantize_retro_channel_bits(rgb[1], bits),
+        quantize_retro_channel_bits(rgb[2], bits),
+    ]
+}
+
+fn retro_adaptive_palette_spec(mode: RetroPaletteMode) -> Option<(usize, Option<u8>)> {
+    match mode {
+        RetroPaletteMode::Pc98 => Some((16, None)),
+        RetroPaletteMode::GameGear => Some((32, Some(4))),
+        RetroPaletteMode::MegaDrive => Some((61, Some(3))),
+        RetroPaletteMode::Sfc => Some((256, Some(5))),
+        RetroPaletteMode::Dither1Bit
+        | RetroPaletteMode::GameBoy
+        | RetroPaletteMode::Famicom
+        | RetroPaletteMode::Msx2Plus => None,
+    }
+}
+
+fn retro_palette_lut_rgb(
+    rgb: [u8; 3],
+    palette: &[[u8; 3]],
+    lut: &[u8],
+    dither_offset: f32,
+    dither: f32,
+) -> [u8; 3] {
+    if palette.is_empty() {
+        return rgb;
+    }
+    let offset = dither_offset * dither * 255.0;
+    let r = (rgb[0] as f32 + offset).round().clamp(0.0, 255.0) as u32;
+    let g = (rgb[1] as f32 + offset).round().clamp(0.0, 255.0) as u32;
+    let b = (rgb[2] as f32 + offset).round().clamp(0.0, 255.0) as u32;
+    let idx = lut[retro_lut_index(r, g, b)] as usize;
+    palette[idx.min(palette.len() - 1)]
+}
+
+fn generate_retro_adaptive_palette(
+    src: &[u8],
+    target_colors: usize,
+    bit_depth: Option<u8>,
+) -> Vec<[u8; 3]> {
+    if target_colors <= 1 || src.len() < 4 {
+        return vec![[0, 0, 0]];
+    }
+    let visible_count = src.chunks_exact(4).filter(|px| px[3] > 0).count();
+    if visible_count == 0 {
+        return vec![[0, 0, 0]];
+    }
+    let stride = visible_count.div_ceil(RETRO_ADAPTIVE_SAMPLE_LIMIT).max(1);
+    let mut samples = Vec::with_capacity(visible_count.min(RETRO_ADAPTIVE_SAMPLE_LIMIT));
+    let mut visible_seen = 0_usize;
+    for px in src.chunks_exact(4) {
+        if px[3] == 0 {
+            continue;
+        }
+        if visible_seen % stride == 0 {
+            let rgb = [px[0], px[1], px[2]];
+            samples.push(match bit_depth {
+                Some(bits) => quantize_retro_color_bits(rgb, bits),
+                None => rgb,
+            });
+        }
+        visible_seen += 1;
+    }
+    if samples.is_empty() {
+        return vec![[0, 0, 0]];
+    }
+
+    let mut boxes = vec![samples];
+    while boxes.len() < target_colors {
+        let Some(idx) = boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, colors)| colors.len() >= 2)
+            .max_by_key(|(_, colors)| retro_palette_box_range(colors))
+            .map(|(idx, _)| idx)
+        else {
+            break;
+        };
+        let colors = boxes.swap_remove(idx);
+        let (left, right) = split_retro_palette_box(colors);
+        boxes.push(left);
+        boxes.push(right);
+    }
+
+    let mut palette: Vec<[u8; 3]> = boxes
+        .iter()
+        .map(|colors| {
+            let avg = average_retro_palette_color(colors);
+            match bit_depth {
+                Some(bits) => quantize_retro_color_bits(avg, bits),
+                None => avg,
+            }
+        })
+        .collect();
+    palette.sort_unstable();
+    palette.dedup();
+    if palette.is_empty() {
+        vec![[0, 0, 0]]
+    } else {
+        palette
+    }
+}
+
+fn retro_palette_box_range(colors: &[[u8; 3]]) -> u32 {
+    let (min, max) = retro_palette_box_bounds(colors);
+    (max[0] - min[0]).max(max[1] - min[1]).max(max[2] - min[2]) as u32
+}
+
+fn split_retro_palette_box(mut colors: Vec<[u8; 3]>) -> (Vec<[u8; 3]>, Vec<[u8; 3]>) {
+    let (min, max) = retro_palette_box_bounds(&colors);
+    let ranges = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    let channel = (0..3).max_by_key(|&idx| ranges[idx]).unwrap_or(0);
+    colors.sort_unstable_by_key(|rgb| rgb[channel]);
+    let mid = colors.len() / 2;
+    let right = colors.split_off(mid);
+    (colors, right)
+}
+
+fn retro_palette_box_bounds(colors: &[[u8; 3]]) -> ([u8; 3], [u8; 3]) {
+    let mut min = [255_u8; 3];
+    let mut max = [0_u8; 3];
+    for rgb in colors {
+        for channel in 0..3 {
+            min[channel] = min[channel].min(rgb[channel]);
+            max[channel] = max[channel].max(rgb[channel]);
+        }
+    }
+    (min, max)
+}
+
+fn average_retro_palette_color(colors: &[[u8; 3]]) -> [u8; 3] {
+    let len = colors.len().max(1) as u64;
+    let mut sum = [0_u64; 3];
+    for rgb in colors {
+        sum[0] += rgb[0] as u64;
+        sum[1] += rgb[1] as u64;
+        sum[2] += rgb[2] as u64;
+    }
+    [
+        (sum[0] / len) as u8,
+        (sum[1] / len) as u8,
+        (sum[2] / len) as u8,
+    ]
 }
 
 fn bayer4_offset(x: usize, y: usize) -> f32 {
@@ -16706,6 +16876,14 @@ mod tests {
                 }),
             ),
             full(
+                "retro palette sfc adaptive",
+                LocalEffect::RetroPalette(RetroPaletteParams {
+                    mode: RetroPaletteMode::Sfc,
+                    dither: 1.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
                 "dehaze max radius",
                 LocalEffect::Dehaze(DehazeParams {
                     amount: 1.0,
@@ -18502,6 +18680,78 @@ LUT_3D_SIZE 2
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(&out.pixels[0..4], &[255, 0, 0, 0]);
         assert_eq!(out.pixels[7], 255);
+    }
+
+    #[test]
+    fn retro_palette_pc98_adaptive_limits_visible_colors() {
+        let mut pixels = Vec::new();
+        for y in 0..8 {
+            for x in 0..8 {
+                pixels.extend_from_slice(&[
+                    (x * 31 + y * 7) as u8,
+                    (y * 29 + x * 5) as u8,
+                    ((x + y) * 17) as u8,
+                    255,
+                ]);
+            }
+        }
+        let src = RgbaImageBuf::new(8, 8, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "retro palette",
+            LocalMask::Full,
+            LocalEffect::RetroPalette(RetroPaletteParams {
+                mode: RetroPaletteMode::Pc98,
+                dither: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let colors = out
+            .pixels
+            .chunks_exact(4)
+            .map(|px| [px[0], px[1], px[2]])
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            colors.len() <= 16,
+            "PC-98 adaptive used {} colors",
+            colors.len()
+        );
+        assert!(
+            colors.len() > 1,
+            "PC-98 adaptive should keep image-specific color variety"
+        );
+    }
+
+    #[test]
+    fn retro_palette_mega_drive_uses_3bit_channel_grid() {
+        let src = RgbaImageBuf::new(
+            4,
+            1,
+            vec![
+                10, 60, 130, 255, 80, 140, 220, 255, 150, 30, 90, 255, 250, 200, 40, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "retro palette",
+            LocalMask::Full,
+            LocalEffect::RetroPalette(RetroPaletteParams {
+                mode: RetroPaletteMode::MegaDrive,
+                dither: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        for px in out.pixels.chunks_exact(4) {
+            assert!(retro_palette_channel_is_bit_grid(px[0], 3));
+            assert!(retro_palette_channel_is_bit_grid(px[1], 3));
+            assert!(retro_palette_channel_is_bit_grid(px[2], 3));
+        }
+    }
+
+    fn retro_palette_channel_is_bit_grid(channel: u8, bits: u8) -> bool {
+        let levels = ((1_u32 << bits) - 1).max(1);
+        (0..=levels).any(|level| ((level * 255 + levels / 2) / levels) as u8 == channel)
     }
 
     #[test]

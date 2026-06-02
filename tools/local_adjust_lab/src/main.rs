@@ -1540,7 +1540,7 @@ impl EffectKind {
             }
             Self::Posterize => "色の階調数を減らし、フラットでグラフィックな見た目にします。",
             Self::RetroPalette => {
-                "1bit、GameBoy、ファミコン、MSX2+ 風の固定パレットへ減色し、レトロゲーム風の色味を作ります。"
+                "固定パレットや画像ごとの適応パレットへ減色し、レトロゲーム風の色味を作ります。"
             }
             Self::Threshold => "明るさをしきい値で黒と白に分け、線画やモノクロ風にします。",
             Self::Invert => "RGBの明暗を反転し、ネガフィルムのような見た目にします。",
@@ -9516,6 +9516,10 @@ fn retro_palette_mode_label(mode: RetroPaletteMode) -> &'static str {
         RetroPaletteMode::GameBoy => "GameBoy",
         RetroPaletteMode::Famicom => "ファミコン",
         RetroPaletteMode::Msx2Plus => "MSX2+",
+        RetroPaletteMode::Pc98 => "PC-98",
+        RetroPaletteMode::GameGear => "ゲームギア",
+        RetroPaletteMode::MegaDrive => "メガドライブ",
+        RetroPaletteMode::Sfc => "SFC",
     }
 }
 
@@ -14581,10 +14585,42 @@ fn draw_effect_params(
                     };
                     changed = true;
                 }
+                if preset_button(ui, "PC-98") {
+                    *params = RetroPaletteParams {
+                        mode: RetroPaletteMode::Pc98,
+                        dither: 0.18,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ゲームギア") {
+                    *params = RetroPaletteParams {
+                        mode: RetroPaletteMode::GameGear,
+                        dither: 0.14,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "メガドラ") {
+                    *params = RetroPaletteParams {
+                        mode: RetroPaletteMode::MegaDrive,
+                        dither: 0.14,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "SFC") {
+                    *params = RetroPaletteParams {
+                        mode: RetroPaletteMode::Sfc,
+                        dither: 0.06,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
             });
             ui.label(
                 egui::RichText::new(
-                    "ポスタリゼーションと違い、実機風の固定パレットへ色を寄せます。ディザを上げると階調は滑らかになりますが、網目感が増えます。",
+                    "ポスタリゼーションと違い、実機風の固定パレットや画像に合わせた適応パレットへ色を寄せます。ディザを上げると階調は滑らかになりますが、網目感が増えます。",
                 )
                 .size(10.0)
                 .color(Color32::from_gray(170)),
@@ -14600,6 +14636,10 @@ fn draw_effect_params(
                         RetroPaletteMode::GameBoy,
                         RetroPaletteMode::Famicom,
                         RetroPaletteMode::Msx2Plus,
+                        RetroPaletteMode::Pc98,
+                        RetroPaletteMode::GameGear,
+                        RetroPaletteMode::MegaDrive,
+                        RetroPaletteMode::Sfc,
                     ] {
                         ui.selectable_value(&mut params.mode, mode, retro_palette_mode_label(mode));
                     }
