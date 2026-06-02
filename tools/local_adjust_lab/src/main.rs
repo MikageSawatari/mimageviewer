@@ -30,13 +30,13 @@ use local_adjust_core::{
     PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
     PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
     RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
-    RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
-    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, ThreeWayColorGradingParams,
-    ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams,
-    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
-    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    evaluate_layer_mask, parse_cube_lut,
+    RgbaImageRef, ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams,
+    SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams,
+    SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
+    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
+    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
+    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
+    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1027,6 +1027,7 @@ enum EffectKind {
     FilmGrain,
     ChromaticAberration,
     Halftone,
+    ScreenTone,
     StarGlow,
     EdgeSmooth,
     Median,
@@ -1128,6 +1129,7 @@ impl EffectKind {
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
             LocalEffect::ChromaticAberration(_) => Self::ChromaticAberration,
             LocalEffect::Halftone(_) => Self::Halftone,
+            LocalEffect::ScreenTone(_) => Self::ScreenTone,
             LocalEffect::StarGlow(_) => Self::StarGlow,
             LocalEffect::EdgeSmooth(_) => Self::EdgeSmooth,
             LocalEffect::Median(_) => Self::Median,
@@ -1198,6 +1200,7 @@ impl EffectKind {
             Self::FilmGrain => "フィルム粒子",
             Self::ChromaticAberration => "色収差",
             Self::Halftone => "ハーフトーン",
+            Self::ScreenTone => "スクリーントーン",
             Self::StarGlow => "クロス光",
             Self::EdgeSmooth => "エッジ保持ぼかし",
             Self::Median => "メディアン",
@@ -1320,6 +1323,9 @@ impl EffectKind {
             Self::FilmGrain => "粒状感を加え、フィルムや紙っぽい質感を作ります。",
             Self::ChromaticAberration => "RGBを少しずらし、レンズやデジタル風の色ズレを作ります。",
             Self::Halftone => "明るさをドットパターンに変換し、漫画や印刷風にします。",
+            Self::ScreenTone => {
+                "網点、平行線、カケアミを重ね、濃度と元画像の明暗追従で漫画用のトーンを作ります。"
+            }
             Self::StarGlow => "明るい部分から十字や多方向の光線を描写します。",
             Self::EdgeSmooth => "輪郭をなるべく残しながら面をなめらかにします。",
             Self::Median => "孤立した点ノイズや細かいゴミを、周囲の中央値で目立ちにくくします。",
@@ -1439,6 +1445,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::GlowingEdges,
             EffectKind::OilPaint,
             EffectKind::Halftone,
+            EffectKind::ScreenTone,
         ],
     },
     EffectGroup {
@@ -8073,6 +8080,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
             format!("色収差 {:.1}px", params.offset_px)
         }
         LocalEffect::Halftone(params) => format!("ハーフトーン {}px", params.cell_px),
+        LocalEffect::ScreenTone(params) => format!(
+            "スクリーントーン {} {:.0}px",
+            screen_tone_mode_label(params.mode),
+            params.cell_px
+        ),
         LocalEffect::StarGlow(params) => {
             format!("クロス光 {}本 {:.0}px", params.ray_count, params.length_px)
         }
@@ -8080,6 +8092,14 @@ fn effect_summary(effect: &LocalEffect) -> String {
             format!("エッジ保持ぼかし {:.0}px", params.radius_px)
         }
         LocalEffect::Median(params) => format!("メディアン {:.0}px", params.radius_px),
+    }
+}
+
+fn screen_tone_mode_label(mode: ScreenToneMode) -> &'static str {
+    match mode {
+        ScreenToneMode::Dots => "網点",
+        ScreenToneMode::Lines => "線",
+        ScreenToneMode::CrossHatch => "カケアミ",
     }
 }
 
@@ -13589,6 +13609,95 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
                 .changed();
         }
+        LocalEffect::ScreenTone(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "網点") {
+                    *params = ScreenToneParams {
+                        mode: ScreenToneMode::Dots,
+                        cell_px: 8.0,
+                        angle_degrees: 45.0,
+                        density: 0.60,
+                        gradation: 0.60,
+                        softness: 0.08,
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "細線") {
+                    *params = ScreenToneParams {
+                        mode: ScreenToneMode::Lines,
+                        cell_px: 6.0,
+                        angle_degrees: -35.0,
+                        density: 0.34,
+                        gradation: 0.35,
+                        softness: 0.03,
+                        strength: 0.70,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "カケアミ") {
+                    *params = ScreenToneParams {
+                        mode: ScreenToneMode::CrossHatch,
+                        cell_px: 8.0,
+                        angle_degrees: 30.0,
+                        density: 0.55,
+                        gradation: 0.45,
+                        softness: 0.02,
+                        strength: 0.80,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡い背景") {
+                    *params = ScreenToneParams {
+                        mode: ScreenToneMode::Dots,
+                        cell_px: 12.0,
+                        angle_degrees: 45.0,
+                        density: 0.26,
+                        gradation: 0.0,
+                        softness: 0.10,
+                        strength: 0.55,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "漫画用のトーンです。階調追従を下げると均一なトーン、上げると元画像の明暗に沿ったトーンになります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                changed |= ui
+                    .selectable_value(&mut params.mode, ScreenToneMode::Dots, "網点")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut params.mode, ScreenToneMode::Lines, "線")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut params.mode, ScreenToneMode::CrossHatch, "カケアミ")
+                    .changed();
+            });
+            changed |= ui
+                .add(egui::Slider::new(&mut params.cell_px, 2.0..=128.0).text("セル(px)"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0).text("角度"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.density, 0.0..=1.0).text("濃度"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.gradation, 0.0..=1.0).text("階調追従"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.softness, 0.0..=1.0).text("柔らかさ"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
+                .changed();
+        }
         LocalEffect::StarGlow(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -15111,6 +15220,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default())
         }
         EffectKind::Halftone => LocalEffect::Halftone(HalftoneParams::default()),
+        EffectKind::ScreenTone => LocalEffect::ScreenTone(ScreenToneParams::default()),
         EffectKind::StarGlow => LocalEffect::StarGlow(StarGlowParams::default()),
         EffectKind::EdgeSmooth => LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
         EffectKind::Median => LocalEffect::Median(MedianParams::default()),
@@ -17346,6 +17456,7 @@ mod tests {
             EffectKind::FilmGrain,
             EffectKind::ChromaticAberration,
             EffectKind::Halftone,
+            EffectKind::ScreenTone,
             EffectKind::ColorOverlay,
             EffectKind::StarGlow,
             EffectKind::EdgeSmooth,

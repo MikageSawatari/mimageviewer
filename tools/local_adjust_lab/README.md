@@ -120,6 +120,7 @@ the window.
   - Film grain
   - Chromatic aberration
   - Halftone
+  - Screen tone
   - Cross/star glow
   - Edge-preserving smooth
   - Median

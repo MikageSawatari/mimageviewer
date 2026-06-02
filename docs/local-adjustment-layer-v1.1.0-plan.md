@@ -117,6 +117,7 @@ enum LocalEffect {
     FilmGrain(LocalFilmGrainParams),
     ChromaticAberration(LocalChromaticAberrationParams),
     Halftone(LocalHalftoneParams),
+    ScreenTone(LocalScreenToneParams),
     EdgePreservingSmooth(LocalEdgeSmoothParams),
 }
 ```
@@ -277,7 +278,7 @@ v1.1.0 の最小構成:
 - ビネット
 - フィルム粒子 / ノイズ追加
 - 色収差
-- ハーフトーン / 漫画調 / 印刷風
+- ハーフトーン / 漫画調 / 印刷風 / スクリーントーン
 - エッジ保持ぼかし / 滑らか化
 
 モザイクは隠蔽加工にも存在するが、補正レイヤーにも置けるようにすると「最終隠蔽」と
@@ -302,7 +303,7 @@ v1.1.0 の最小構成:
 | フィルム粒子 / ノイズ追加 | 中-高 | AI 絵のつるっとした質感を軽く崩す | seed 固定で再現性を持たせる |
 | Orton / Soft Glow | 中 | 写真・イラストの柔らかい仕上げ | SoftFocus と近いがルック寄り |
 | 色収差 | 中 | 演出系。軽く使うと画面効果になる | 強度上限を控えめにする |
-| ハーフトーン / 漫画調 / 印刷風 | 中 | ポストフィルタ的な見た目を範囲・強度付きで使う | 既存ポストフィルタと重複しない UI にする |
+| ハーフトーン / 漫画調 / 印刷風 / スクリーントーン | 中 | ポストフィルタ的な見た目を範囲・強度付きで使う | `Halftone` は簡易網点、`ScreenTone` は網点 / 線 / カケアミと濃度・階調追従を持つ漫画用トーン |
 | エッジ保持ぼかし / 滑らか化 | 中 | 背景なじませ、美肌、ノイズ感の低減 | bilateral / guided filter 系。重いので worker 前提 |
 
 Look / LUT は「プリセット名 + 強度 + 適用色空間」を持つ。内蔵プリセットは、最初は少数に絞る。
@@ -618,7 +619,7 @@ conceal source:
 
 - レイヤー効果はマスクの bbox と効果半径ぶんだけ処理する。
 - ぼかしやソフトフォーカスは separable blur を使う。
-- Look / LUT、Bloom、粒子、ハーフトーン、エッジ保持ぼかしなどの仕上げ系は、全体画像補正ではなく
+- Look / LUT、Bloom、粒子、ハーフトーン、スクリーントーン、エッジ保持ぼかしなどの仕上げ系は、全体画像補正ではなく
   補正レイヤー側へ置く。サムネイルには反映せず、表示 / 書き出し用の worker で処理する。
 - UI 操作自体を妨げないことを優先する。表示への反映が数百ミリ秒遅れることは許容し、
   操作中の入力、ドラッグ、パネル描画を止めない。
@@ -679,7 +680,7 @@ conceal source:
 - フィルム粒子 / ノイズ追加
 - Orton / Soft Glow
 - 色収差
-- ハーフトーン / 漫画調 / 印刷風
+- ハーフトーン / 漫画調 / 印刷風 / スクリーントーン
 - エッジ保持ぼかし / 滑らか化
 
 実装順は、見た目の価値が分かりやすく実装リスクが低いものから始める。
@@ -687,7 +688,7 @@ conceal source:
 エッジ保持ぼかし。
 
 プロトタイプでは `local-adjust-core` と `local_adjust_lab` に、内蔵 Look、Bloom、
-ビネット、フィルム粒子、色収差、ハーフトーン、エッジ保持ぼかしを追加済み。
+ビネット、フィルム粒子、色収差、ハーフトーン、スクリーントーン、エッジ保持ぼかしを追加済み。
 Orton / Soft Glow は既存の Soft Focus と Bloom の組み合わせで検証し、必要なら
 専用パラメータとして分離する。
 
@@ -849,7 +850,7 @@ v1.1.0 では、まず案 B の「最後段の非破壊 crop」を推奨する�
 12. Glow / Bloom
 13. ビネット
 14. フィルム粒子 / ノイズ追加
-15. 色収差 / ハーフトーン / エッジ保持ぼかし
+15. 色収差 / ハーフトーン / スクリーントーン / エッジ保持ぼかし
 16. 最後段 crop preview / export crop
 
 この順なら、今回のフィードバックにあった「背景をぼかしてキャラクターを強調する」用途に
@@ -894,7 +895,7 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
 - 効果: Tone (自然な彩度・tint を含む) / Tone Curve / RGB Curve / Color Balance /
   3-way Color Grading / Selective Color / Channel Mixer / Color Mixer / Clarity / Highlights-Shadows /
   Texture / HighPass / Blur / Motion Blur / Wind / SpeedLines / Tilt Shift / Lens Blur / Radial Blur / WaveDistortion / PinchSpherize / Twirl / PolarCoordinates / GlassDisplacement / LensCorrection / LineExtract / ArtisticMedia / BrushStroke / Cutout / Emboss / PixelStylize / Solarize / GlowingEdges / OilPaint / Soft Focus / Mosaic / Sharpen(radius/threshold) / SmartSharpen(edge-aware) / HSL / Dehaze / Look / 3D LUT / Posterize / Threshold / Invert / Duotone / Equalize / Gradient Map / ColorFill / ColorOverlay / NeonGlow / DiffuseGlow / Bloom / GodRays / LensFlare / CloudFog / Spotlight /
-  Vignette / Film Grain / Chromatic Aberration / Halftone / Cross-Star Glow /
+  Vignette / Film Grain / Chromatic Aberration / Halftone / ScreenTone / Cross-Star Glow /
   Edge-preserving Smooth / Median
 - 3D LUT は `.cube` の `LUT_3D_SIZE` / `DOMAIN_MIN` / `DOMAIN_MAX` / `LUT_3D_INPUT_RANGE` を読み取り、RGB 3D table
   をレイヤー設定に保持する。ファイル読み込みは worker thread で行い、UI スレッドでは重い I/O

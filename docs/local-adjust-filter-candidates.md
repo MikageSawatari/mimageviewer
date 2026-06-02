@@ -48,14 +48,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、62種)
+### `LocalEffect` (部分補正レイヤー、63種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorFill, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, GodRays, LensFlare, CloudFog, Spotlight, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
+GradientMap, ColorFill, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, GodRays, LensFlare, CloudFog, Spotlight, Vignette, FilmGrain, ChromaticAberration, Halftone, ScreenTone, StarGlow, EdgeSmooth, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -151,7 +151,7 @@ LightLeak / 減色8機種 / CRT 3種＋複合 / カラーグレード11種
 
 ## 7. ノイズ・テクスチャ系
 
-- [ ] **網点 / スクリーントーン (線・濃度・グラデ)** ★★ **中** — 漫画仕上げの中核。現 `Halftone` (輝度ドット) を超えた本格トーン (CSP トーン)
+- [x] **網点 / スクリーントーン (線・濃度・グラデ)** ★★ **中** — `ScreenTone`。網点 / 線 / カケアミ、セル、角度、濃度、元画像の明暗への階調追従、柔らかさ、強度を調整できる漫画用トーン (CSP トーン)
 - [ ] **カラーハーフトーン (CMYK 4版ドット)** ★ **中** — ポップアート/アメコミ調。現 `Halftone` はグレーのみ (PS Pixelate)
 - [ ] **テクスチャライザ (紙/キャンバス重ね)** ★ **易〜中** — 紙質・手描き感 (PS Texture)
 - [ ] **ノイズ付加 (Gaussian/Uniform, mono 指定)** **易** — 汎用ノイズ。FilmGrain と別系統 (PS / Krita)
@@ -195,7 +195,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 - [ ] **覆い焼きカラー発光 (color dodge glow)** ★ **易〜中** — 光源・エフェクトを発光合成。魔法/エモーション演出
 
 ### 9-D. 漫画の陰影表現
-- [ ] **カケアミ / ハッチング (線の陰影)** ★ **中** — `スクリーントーン` (ドット) とは別の線パターン陰影。モノクロ漫画
+- [x] **カケアミ / ハッチング (線の陰影)** ★ **中** — `ScreenTone` の線 / カケアミモードとして吸収。モノクロ漫画向けの線パターン陰影
 - [ ] **集中線フラッシュ (白黒反転フラッシュ)** ★ **中** — 中心から放射する白/黒フラッシュ。`集中線` の演出強化版
 
 ### 9-E. 自然現象 / 大気エフェクト ★背景イラスト
@@ -433,7 +433,7 @@ pub struct RimLightParams {
 7. **線画抽出 (Find Edges 強化)** — フォト/3D からの線画起こし、CSP の領域 (§5)
 8. **光芒 (God rays) / レンズフレア** — 光源演出、見栄えのインパクト大 (§6)
 9. **RGB 独立トーンカーブ** — グレーディングの底力、既存 `ToneCurve` 拡張 (§1)
-10. **網点 / スクリーントーン** — 漫画ユーザー向けの差別化 (§7)
+10. **網点 / スクリーントーン** — `ScreenTone` として実装済み。漫画ユーザー向けの差別化 (§7)
 
 実装観点では §1 と 9 は per-pixel LUT で既存高速色調パイプラインに相乗り、
 §2/5/6/§A/§B はカーネル/多パス系で既存 OilPaint/Bloom/StarGlow と同じ実装パターンが流用可能。

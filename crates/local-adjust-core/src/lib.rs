@@ -570,6 +570,7 @@ pub enum LocalEffect {
     FilmGrain(FilmGrainParams),
     ChromaticAberration(ChromaticAberrationParams),
     Halftone(HalftoneParams),
+    ScreenTone(ScreenToneParams),
     StarGlow(StarGlowParams),
     EdgeSmooth(EdgeSmoothParams),
     Median(MedianParams),
@@ -640,6 +641,7 @@ impl LocalEffect {
             Self::FilmGrain(_) => "フィルム粒子",
             Self::ChromaticAberration(_) => "色収差",
             Self::Halftone(_) => "ハーフトーン",
+            Self::ScreenTone(_) => "スクリーントーン",
             Self::StarGlow(_) => "クロス光",
             Self::EdgeSmooth(_) => "エッジ保持ぼかし",
             Self::Median(_) => "メディアンフィルタ",
@@ -2505,6 +2507,45 @@ impl Default for HalftoneParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenToneMode {
+    Dots,
+    Lines,
+    CrossHatch,
+}
+
+impl Default for ScreenToneMode {
+    fn default() -> Self {
+        Self::Dots
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ScreenToneParams {
+    pub mode: ScreenToneMode,
+    pub cell_px: f32,
+    pub angle_degrees: f32,
+    pub density: f32,
+    pub gradation: f32,
+    pub softness: f32,
+    pub strength: f32,
+}
+
+impl Default for ScreenToneParams {
+    fn default() -> Self {
+        Self {
+            mode: ScreenToneMode::Dots,
+            cell_px: 8.0,
+            angle_degrees: 45.0,
+            density: 0.45,
+            gradation: 0.65,
+            softness: 0.08,
+            strength: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StarGlowParams {
     pub ray_count: u32,
@@ -2899,6 +2940,9 @@ where
         ),
         LocalEffect::Halftone(params) => {
             apply_halftone(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::ScreenTone(params) => {
+            apply_screen_tone(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::StarGlow(params) => {
             apply_star_glow(&image.pixels, image.width, image.height, *params)
@@ -7895,6 +7939,95 @@ fn apply_halftone(src: &[u8], width: usize, height: usize, params: HalftoneParam
     out
 }
 
+fn apply_screen_tone(src: &[u8], width: usize, height: usize, params: ScreenToneParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let cell = params.cell_px.clamp(2.0, 128.0);
+    let density = params.density.clamp(0.0, 1.0);
+    let gradation = params.gradation.clamp(0.0, 1.0);
+    let edge = 0.01 + params.softness.clamp(0.0, 1.0) * 0.35;
+    let angle = params.angle_degrees.to_radians();
+    let cos = angle.cos();
+    let sin = angle.sin();
+    let cx = width as f32 * 0.5;
+    let cy = height as f32 * 0.5;
+    let mut out = src.to_vec();
+
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let r = src[i] as f32 / 255.0;
+            let g = src[i + 1] as f32 / 255.0;
+            let b = src[i + 2] as f32 / 255.0;
+            let source_tone = 1.0 - luma01(r, g, b);
+            let tone = density * lerp_f32(1.0, source_tone, gradation);
+            let tone = tone.clamp(0.0, 1.0);
+            let fx = x as f32 + 0.5 - cx;
+            let fy = y as f32 + 0.5 - cy;
+            let u = fx * cos + fy * sin;
+            let v = -fx * sin + fy * cos;
+            let ink = screen_tone_ink_mask(params.mode, u, v, cell, tone, edge);
+            if ink <= 0.0 {
+                continue;
+            }
+
+            let darken = (ink * strength).clamp(0.0, 1.0);
+            for c in 0..3 {
+                let base = src[i + c] as f32 / 255.0;
+                out[i + c] = to_u8(base * (1.0 - darken));
+            }
+        }
+    }
+
+    out
+}
+
+fn screen_tone_ink_mask(
+    mode: ScreenToneMode,
+    u: f32,
+    v: f32,
+    cell: f32,
+    tone: f32,
+    edge: f32,
+) -> f32 {
+    if tone <= 0.001 {
+        return 0.0;
+    }
+    match mode {
+        ScreenToneMode::Dots => {
+            let du = centered_periodic_distance(u, cell);
+            let dv = centered_periodic_distance(v, cell);
+            let dist = (du * du + dv * dv).sqrt();
+            let radius = tone.sqrt() * 0.96;
+            1.0 - smoothstep(radius, radius + edge, dist)
+        }
+        ScreenToneMode::Lines => line_tone_ink(v, cell, tone, edge),
+        ScreenToneMode::CrossHatch => {
+            let primary = line_tone_ink(v, cell, tone, edge);
+            let secondary_tone = smoothstep(0.18, 1.0, tone);
+            let secondary = line_tone_ink(u, cell, secondary_tone, edge);
+            (primary + secondary * (1.0 - primary)).clamp(0.0, 1.0)
+        }
+    }
+}
+
+fn line_tone_ink(coord: f32, cell: f32, tone: f32, edge: f32) -> f32 {
+    let width = tone.clamp(0.0, 1.0) * 0.98;
+    if width <= 0.001 {
+        return 0.0;
+    }
+    let dist = centered_periodic_distance(coord, cell);
+    1.0 - smoothstep(width, width + edge, dist)
+}
+
+fn centered_periodic_distance(coord: f32, cell: f32) -> f32 {
+    let phase = (coord / cell).rem_euclid(1.0);
+    (phase - 0.5).abs() * 2.0
+}
+
 fn apply_star_glow(src: &[u8], width: usize, height: usize, params: StarGlowParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 3.0);
     let length = params.length_px.clamp(1.0, 240.0);
@@ -9875,6 +10008,7 @@ mod tests {
             LocalEffect::FilmGrain(FilmGrainParams::default()),
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
             LocalEffect::Halftone(HalftoneParams::default()),
+            LocalEffect::ScreenTone(ScreenToneParams::default()),
             LocalEffect::StarGlow(StarGlowParams::default()),
             LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
             LocalEffect::Median(MedianParams::default()),
@@ -11251,6 +11385,49 @@ LUT_3D_SIZE 2
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_ne!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn screen_tone_dots_darken_mid_gray_and_preserve_alpha() {
+        let src = solid(8, 8, [160, 160, 160, 203]);
+        let layer = LocalAdjustmentLayer::new(
+            "screen tone",
+            LocalMask::Full,
+            LocalEffect::ScreenTone(ScreenToneParams {
+                mode: ScreenToneMode::Dots,
+                cell_px: 4.0,
+                angle_degrees: 0.0,
+                density: 0.85,
+                gradation: 0.25,
+                softness: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels.chunks_exact(4).any(|px| px[0] < 160));
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 203));
+    }
+
+    #[test]
+    fn screen_tone_lines_create_directional_stripes() {
+        let src = solid(8, 8, [180, 180, 180, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "screen tone",
+            LocalMask::Full,
+            LocalEffect::ScreenTone(ScreenToneParams {
+                mode: ScreenToneMode::Lines,
+                cell_px: 4.0,
+                angle_degrees: 0.0,
+                density: 0.45,
+                gradation: 0.0,
+                softness: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let row0 = out.pixels[0];
+        let row2 = out.pixels[(2 * 8) * 4];
+        assert_ne!(row0, row2);
     }
 
     #[test]
