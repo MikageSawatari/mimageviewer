@@ -437,6 +437,7 @@ pub enum LocalEffect {
     GlassDisplacement(GlassDisplacementParams),
     LensCorrection(LensCorrectionParams),
     LineExtract(LineExtractParams),
+    ArtisticMedia(ArtisticMediaParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -491,6 +492,7 @@ impl LocalEffect {
             Self::GlassDisplacement(_) => "ガラス変位",
             Self::LensCorrection(_) => "レンズ補正",
             Self::LineExtract(_) => "線画抽出",
+            Self::ArtisticMedia(_) => "絵画調",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -1190,6 +1192,40 @@ impl Default for LineExtractParams {
             softness: 0.1,
             thickness_px: 1.0,
             strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtisticMediaMode {
+    #[default]
+    Watercolor,
+    ColoredPencil,
+    PencilSketch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ArtisticMediaParams {
+    pub mode: ArtisticMediaMode,
+    pub radius_px: f32,
+    pub edge_strength: f32,
+    pub texture: f32,
+    pub color_amount: f32,
+    pub strength: f32,
+    pub seed: u32,
+}
+
+impl Default for ArtisticMediaParams {
+    fn default() -> Self {
+        Self {
+            mode: ArtisticMediaMode::Watercolor,
+            radius_px: 5.0,
+            edge_strength: 0.35,
+            texture: 0.25,
+            color_amount: 0.85,
+            strength: 0.0,
+            seed: 1,
         }
     }
 }
@@ -1989,6 +2025,9 @@ where
         }
         LocalEffect::LineExtract(params) => {
             apply_line_extract(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::ArtisticMedia(params) => {
+            apply_artistic_media(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -3871,6 +3910,175 @@ fn line_extract_max_edge(
         }
     }
     best
+}
+
+fn apply_artistic_media(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: ArtisticMediaParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let radius = params.radius_px.round().clamp(0.0, 48.0) as usize;
+    let edge_strength = params.edge_strength.clamp(0.0, 1.0);
+    let texture = params.texture.clamp(0.0, 1.0);
+    let color_amount = params.color_amount.clamp(0.0, 1.0);
+    let smooth = if radius == 0 {
+        src.to_vec()
+    } else {
+        box_blur_rgba(src, width, height, radius)
+    };
+
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let soft = [
+                smooth[i] as f32 / 255.0,
+                smooth[i + 1] as f32 / 255.0,
+                smooth[i + 2] as f32 / 255.0,
+            ];
+            let luma = luma01(base[0], base[1], base[2]);
+            let edge = luma_edge_strength(src, width, height, x, y);
+            let paper = signed_noise((x / 2) as u32, (y / 2) as u32, params.seed);
+            let target = match params.mode {
+                ArtisticMediaMode::Watercolor => artistic_watercolor(
+                    base,
+                    soft,
+                    edge,
+                    paper,
+                    edge_strength,
+                    texture,
+                    color_amount,
+                ),
+                ArtisticMediaMode::ColoredPencil => artistic_colored_pencil(
+                    base,
+                    soft,
+                    luma,
+                    edge,
+                    x,
+                    y,
+                    params.seed,
+                    edge_strength,
+                    texture,
+                    color_amount,
+                ),
+                ArtisticMediaMode::PencilSketch => artistic_pencil_sketch(
+                    base,
+                    luma,
+                    edge,
+                    x,
+                    y,
+                    params.seed,
+                    edge_strength,
+                    texture,
+                    color_amount,
+                ),
+            };
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], to_u8(target[c]), strength);
+            }
+        }
+    }
+    out
+}
+
+fn artistic_watercolor(
+    base: [f32; 3],
+    soft: [f32; 3],
+    edge: f32,
+    paper: f32,
+    edge_strength: f32,
+    texture: f32,
+    color_amount: f32,
+) -> [f32; 3] {
+    let mut wash = [
+        lerp_f32(soft[0], base[0], 0.22),
+        lerp_f32(soft[1], base[1], 0.22),
+        lerp_f32(soft[2], base[2], 0.22),
+    ];
+    wash = adjust_saturation(wash, 0.78 + color_amount * 0.52);
+    let edge_darken = edge * edge_strength * 0.42;
+    let paper_delta = paper * texture * 0.055;
+    for c in &mut wash {
+        let lifted = *c + (1.0 - *c) * 0.08;
+        *c = (lifted * (1.0 - edge_darken) + paper_delta).clamp(0.0, 1.0);
+        *c = quantize_unit(*c, 18.0);
+    }
+    wash
+}
+
+fn artistic_colored_pencil(
+    base: [f32; 3],
+    soft: [f32; 3],
+    luma: f32,
+    edge: f32,
+    x: usize,
+    y: usize,
+    seed: u32,
+    edge_strength: f32,
+    texture: f32,
+    color_amount: f32,
+) -> [f32; 3] {
+    let mut color = [
+        lerp_f32(base[0], soft[0], 0.35),
+        lerp_f32(base[1], soft[1], 0.35),
+        lerp_f32(base[2], soft[2], 0.35),
+    ];
+    color = adjust_saturation(color, 0.85 + color_amount * 0.55);
+    let hatch = pencil_hatch(x, y, seed);
+    let shade = ((1.0 - luma) * 0.35 + edge * edge_strength).clamp(0.0, 1.0);
+    let paper = signed_noise(x as u32, y as u32, seed ^ 0xC0A7_EA11) * texture * 0.045;
+    for c in &mut color {
+        let lifted = *c + (1.0 - *c) * 0.10;
+        *c = (lifted * (1.0 - hatch * shade * texture * 0.65) + paper).clamp(0.0, 1.0);
+        *c = quantize_unit(*c, 24.0);
+    }
+    color
+}
+
+fn artistic_pencil_sketch(
+    base: [f32; 3],
+    luma: f32,
+    edge: f32,
+    x: usize,
+    y: usize,
+    seed: u32,
+    edge_strength: f32,
+    texture: f32,
+    color_amount: f32,
+) -> [f32; 3] {
+    let hatch = pencil_hatch(x, y, seed);
+    let paper = 0.94 + signed_noise((x / 2) as u32, (y / 2) as u32, seed) * texture * 0.055;
+    let line =
+        (edge * edge_strength * 1.7 + hatch * (1.0 - luma) * texture * 0.72).clamp(0.0, 0.92);
+    let gray = (paper * (1.0 - line)).clamp(0.0, 1.0);
+    let color = adjust_saturation(base, 0.25);
+    [
+        lerp_f32(gray, color[0], color_amount * 0.35),
+        lerp_f32(gray, color[1], color_amount * 0.35),
+        lerp_f32(gray, color[2], color_amount * 0.35),
+    ]
+}
+
+fn pencil_hatch(x: usize, y: usize, seed: u32) -> f32 {
+    let phase = (seed % 11) as usize;
+    let a = ((x + y * 2 + phase) % 9) as f32 / 8.0;
+    let b = ((x * 2 + y + phase * 3) % 13) as f32 / 12.0;
+    (smoothstep(0.0, 0.32, 1.0 - a) * 0.65 + smoothstep(0.0, 0.22, 1.0 - b) * 0.35).clamp(0.0, 1.0)
+}
+
+fn quantize_unit(v: f32, levels: f32) -> f32 {
+    let steps = (levels.max(2.0) - 1.0).max(1.0);
+    (v.clamp(0.0, 1.0) * steps).round() / steps
 }
 
 fn farthest_corner_distance(width: usize, height: usize, cx: f32, cy: f32) -> f32 {
@@ -6347,6 +6555,76 @@ mod tests {
     }
 
     #[test]
+    fn artistic_media_watercolor_smooths_color_and_preserves_alpha() {
+        let src =
+            RgbaImageBuf::new(3, 1, vec![40, 40, 40, 55, 220, 60, 30, 77, 40, 40, 40, 99]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "watercolor",
+            LocalMask::Full,
+            LocalEffect::ArtisticMedia(ArtisticMediaParams {
+                mode: ArtisticMediaMode::Watercolor,
+                radius_px: 1.0,
+                edge_strength: 0.0,
+                texture: 0.0,
+                color_amount: 0.8,
+                strength: 1.0,
+                seed: 1,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let center = 4;
+        assert!(out.pixels[center] < src.pixels[center]);
+        assert_eq!(out.pixels[center + 3], 77);
+    }
+
+    #[test]
+    fn artistic_media_pencil_sketch_outputs_gray_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(1, 1, vec![210, 40, 80, 123]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "pencil",
+            LocalMask::Full,
+            LocalEffect::ArtisticMedia(ArtisticMediaParams {
+                mode: ArtisticMediaMode::PencilSketch,
+                radius_px: 0.0,
+                edge_strength: 0.0,
+                texture: 0.0,
+                color_amount: 0.0,
+                strength: 1.0,
+                seed: 1,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels[0], out.pixels[1]);
+        assert_eq!(out.pixels[1], out.pixels[2]);
+        assert_eq!(out.pixels[3], 123);
+    }
+
+    #[test]
+    fn artistic_media_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "art",
+            LocalMask::Full,
+            LocalEffect::ArtisticMedia(ArtisticMediaParams {
+                mode: ArtisticMediaMode::ColoredPencil,
+                radius_px: 12.0,
+                edge_strength: 1.0,
+                texture: 1.0,
+                color_amount: 1.0,
+                strength: 0.0,
+                seed: 7,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn median_removes_isolated_speckle_and_preserves_alpha() {
         let mut pixels = vec![0_u8; 3 * 3 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -6634,6 +6912,7 @@ mod tests {
             LocalEffect::GlassDisplacement(GlassDisplacementParams::default()),
             LocalEffect::LensCorrection(LensCorrectionParams::default()),
             LocalEffect::LineExtract(LineExtractParams::default()),
+            LocalEffect::ArtisticMedia(ArtisticMediaParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),

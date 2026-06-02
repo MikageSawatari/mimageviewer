@@ -15,23 +15,23 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
-    BloomParams, BlurParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
-    ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
-    CubeLutParams, DehazeParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
-    EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
-    GradientMapParams, GradientMapPreset, HalftoneParams, HighPassParams, HighlightsShadowsParams,
-    HslParams, InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams,
-    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer,
-    LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams,
-    MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, PinchSpherizeParams,
-    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
-    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
-    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams,
-    SmartSharpenParams, SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams,
-    ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams,
-    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
-    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    evaluate_layer_mask, parse_cube_lut,
+    ArtisticMediaMode, ArtisticMediaParams, BloomParams, BlurParams, ChannelMixerParams,
+    ChromaticAberrationParams, ClarityParams, ColorBalanceParams, ColorBalanceRange,
+    ColorGradeWheel, ColorMixerParams, ColorRangeMask, CubeLutParams, DehazeParams,
+    DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EqualizeParams,
+    FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams, GradientMapParams,
+    GradientMapPreset, HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams,
+    InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LineExtractMode,
+    LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
+    LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary,
+    MosaicParams, MosaicTileMode, MotionBlurParams, PinchSpherizeParams, PolarCoordinatesMode,
+    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
+    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
+    RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams,
+    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -982,6 +982,7 @@ enum EffectKind {
     GlassDisplacement,
     LensCorrection,
     LineExtract,
+    ArtisticMedia,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1036,6 +1037,7 @@ impl EffectKind {
             LocalEffect::GlassDisplacement(_) => Self::GlassDisplacement,
             LocalEffect::LensCorrection(_) => Self::LensCorrection,
             LocalEffect::LineExtract(_) => Self::LineExtract,
+            LocalEffect::ArtisticMedia(_) => Self::ArtisticMedia,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1090,6 +1092,7 @@ impl EffectKind {
             Self::GlassDisplacement => "ガラス/変位",
             Self::LensCorrection => "レンズ補正",
             Self::LineExtract => "線画抽出",
+            Self::ArtisticMedia => "水彩/鉛筆",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1170,6 +1173,7 @@ impl EffectKind {
             Self::LineExtract => {
                 "明るさのエッジを検出して線画を作り、白地・黒地・元画像への重ねに使えます。"
             }
+            Self::ArtisticMedia => "水彩、色鉛筆、鉛筆画の質感で、写真や3D素材を絵画調に寄せます。",
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
@@ -1281,6 +1285,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::GlassDisplacement,
             EffectKind::LensCorrection,
             EffectKind::LineExtract,
+            EffectKind::ArtisticMedia,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Texture,
@@ -7236,6 +7241,14 @@ fn effect_summary(effect: &LocalEffect) -> String {
             };
             format!("線画抽出 {mode}")
         }
+        LocalEffect::ArtisticMedia(params) => {
+            let mode = match params.mode {
+                ArtisticMediaMode::Watercolor => "水彩",
+                ArtisticMediaMode::ColoredPencil => "色鉛筆",
+                ArtisticMediaMode::PencilSketch => "鉛筆画",
+            };
+            format!("絵画調 {mode}")
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -9744,6 +9757,110 @@ fn draw_effect_params(
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から線画抽出結果へどれだけ近づけるかです。");
         }
+        LocalEffect::ArtisticMedia(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "水彩") {
+                    *params = ArtisticMediaParams {
+                        mode: ArtisticMediaMode::Watercolor,
+                        radius_px: 5.0,
+                        edge_strength: 0.35,
+                        texture: 0.24,
+                        color_amount: 0.85,
+                        strength: 1.0,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡彩") {
+                    *params = ArtisticMediaParams {
+                        mode: ArtisticMediaMode::Watercolor,
+                        radius_px: 8.0,
+                        edge_strength: 0.18,
+                        texture: 0.12,
+                        color_amount: 0.55,
+                        strength: 0.85,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "色鉛筆") {
+                    *params = ArtisticMediaParams {
+                        mode: ArtisticMediaMode::ColoredPencil,
+                        radius_px: 2.0,
+                        edge_strength: 0.55,
+                        texture: 0.48,
+                        color_amount: 0.95,
+                        strength: 1.0,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "鉛筆画") {
+                    *params = ArtisticMediaParams {
+                        mode: ArtisticMediaMode::PencilSketch,
+                        radius_px: 1.0,
+                        edge_strength: 0.75,
+                        texture: 0.55,
+                        color_amount: 0.0,
+                        strength: 1.0,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "色をなじませ、輪郭と紙目を足して絵画調に寄せます。鉛筆画では色量を上げると淡い色付きになります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let watercolor = params.mode == ArtisticMediaMode::Watercolor;
+                if ui.selectable_label(watercolor, "水彩").clicked() && !watercolor {
+                    params.mode = ArtisticMediaMode::Watercolor;
+                    changed = true;
+                }
+                let colored_pencil = params.mode == ArtisticMediaMode::ColoredPencil;
+                if ui.selectable_label(colored_pencil, "色鉛筆").clicked() && !colored_pencil {
+                    params.mode = ArtisticMediaMode::ColoredPencil;
+                    changed = true;
+                }
+                let pencil = params.mode == ArtisticMediaMode::PencilSketch;
+                if ui.selectable_label(pencil, "鉛筆画").clicked() && !pencil {
+                    params.mode = ArtisticMediaMode::PencilSketch;
+                    changed = true;
+                }
+            });
+            let radius = ui.add(
+                egui::Slider::new(&mut params.radius_px, 0.0..=24.0)
+                    .text("なじませ")
+                    .suffix("px"),
+            );
+            changed |= radius.changed();
+            radius.lab_hover_tip(
+                "色を面としてなじませる量です。水彩では大きめ、鉛筆では小さめが向いています。",
+            );
+            let edge = ui.add(egui::Slider::new(&mut params.edge_strength, 0.0..=1.0).text("輪郭"));
+            changed |= edge.changed();
+            edge.lab_hover_tip("輪郭や筆致をどれだけ強調するかです。");
+            let texture =
+                ui.add(egui::Slider::new(&mut params.texture, 0.0..=1.0).text("紙目/筆致"));
+            changed |= texture.changed();
+            texture.lab_hover_tip("紙目ノイズや鉛筆のハッチング量です。");
+            let color = ui.add(egui::Slider::new(&mut params.color_amount, 0.0..=1.0).text("色量"));
+            changed |= color.changed();
+            color.lab_hover_tip("色の残し方です。鉛筆画では 0 にすると白黒寄りになります。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から絵画調結果へどれだけ近づけるかです。");
+            let mut seed = params.seed as i32;
+            let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
+            changed |= seed_response.changed();
+            seed_response.lab_hover_tip("紙目や鉛筆線のパターンを変えます。");
+            params.seed = seed.max(0) as u32;
+        }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -12197,6 +12314,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         }
         EffectKind::LensCorrection => LocalEffect::LensCorrection(LensCorrectionParams::default()),
         EffectKind::LineExtract => LocalEffect::LineExtract(LineExtractParams::default()),
+        EffectKind::ArtisticMedia => LocalEffect::ArtisticMedia(ArtisticMediaParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
