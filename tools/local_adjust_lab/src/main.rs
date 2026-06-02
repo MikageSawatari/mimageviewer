@@ -5112,6 +5112,7 @@ impl LocalAdjustLabApp {
                         && let LocalEffect::TiltShift(params) = &mut layer.effect
                     {
                         params.range_initialized = false;
+                        params.mode_selected = true;
                     }
                     self.tilt_shift_drag_active = false;
                     self.status = "チルトぼかし範囲をクリアしました。".to_string();
@@ -6417,7 +6418,7 @@ impl LocalAdjustLabApp {
             return;
         };
         if started {
-            params.mode_selected = true;
+            params.mode_selected = false;
             params.range_initialized = true;
             params.center = n;
             if params.strength <= f32::EPSILON {
@@ -8240,6 +8241,9 @@ fn draw_effect_params(
             strength.lab_hover_tip("元画像から移動ぼかし結果へどれだけ近づけるかです。");
         }
         LocalEffect::TiltShift(params) => {
+            if !params.range_initialized && !params.mode_selected {
+                params.mode_selected = true;
+            }
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "奥ぼかし") {
@@ -8314,25 +8318,38 @@ fn draw_effect_params(
                 .size(10.0)
                 .color(Color32::from_gray(170)),
             );
+            ui.horizontal_wrapped(|ui| {
+                let linear_create_active = !params.range_initialized
+                    && params.mode_selected
+                    && params.mode == TiltShiftMode::Linear;
+                if ui
+                    .selectable_label(linear_create_active, "線形範囲を作成")
+                    .clicked()
+                {
+                    params.mode = TiltShiftMode::Linear;
+                    params.mode_selected = true;
+                    params.range_initialized = false;
+                    changed = true;
+                }
+                let radial_create_active = !params.range_initialized
+                    && params.mode_selected
+                    && params.mode == TiltShiftMode::Radial;
+                if ui
+                    .selectable_label(radial_create_active, "円形範囲を作成")
+                    .clicked()
+                {
+                    params.mode = TiltShiftMode::Radial;
+                    params.mode_selected = true;
+                    params.range_initialized = false;
+                    changed = true;
+                }
+                if ui.button("範囲クリア").clicked() {
+                    params.range_initialized = false;
+                    params.mode_selected = true;
+                    changed = true;
+                }
+            });
             if params.range_initialized {
-                ui.horizontal(|ui| {
-                    let linear_selected = params.mode == TiltShiftMode::Linear;
-                    if ui.selectable_label(linear_selected, "線形").clicked() && !linear_selected
-                    {
-                        params.mode = TiltShiftMode::Linear;
-                        changed = true;
-                    }
-                    let radial_selected = params.mode == TiltShiftMode::Radial;
-                    if ui.selectable_label(radial_selected, "円形").clicked() && !radial_selected
-                    {
-                        params.mode = TiltShiftMode::Radial;
-                        changed = true;
-                    }
-                    if ui.button("範囲クリア").clicked() {
-                        params.range_initialized = false;
-                        changed = true;
-                    }
-                });
                 let center_x =
                     ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
                 changed |= center_x.changed();
@@ -8374,33 +8391,11 @@ fn draw_effect_params(
             } else {
                 ui.label(
                     egui::RichText::new(
-                        "範囲未設定です。作成したい形を選び、画像上をドラッグして範囲を作成します。",
+                        "範囲未設定です。アクティブな作成ボタンの形で、画像上をドラッグして範囲を作成します。",
                     )
                     .size(10.0)
                     .color(Color32::from_gray(190)),
                 );
-                ui.horizontal(|ui| {
-                    let linear_selected =
-                        params.mode_selected && params.mode == TiltShiftMode::Linear;
-                    if ui
-                        .selectable_label(linear_selected, "線形範囲を作成")
-                        .clicked()
-                    {
-                        params.mode = TiltShiftMode::Linear;
-                        params.mode_selected = true;
-                        changed = true;
-                    }
-                    let radial_selected =
-                        params.mode_selected && params.mode == TiltShiftMode::Radial;
-                    if ui
-                        .selectable_label(radial_selected, "円形範囲を作成")
-                        .clicked()
-                    {
-                        params.mode = TiltShiftMode::Radial;
-                        params.mode_selected = true;
-                        changed = true;
-                    }
-                });
             }
             let max_radius =
                 ui.add(egui::Slider::new(&mut params.max_radius_px, 0.0..=80.0).text("最大半径"));

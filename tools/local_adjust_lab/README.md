@@ -89,9 +89,11 @@ the window.
   - Motion blur
   - Tilt shift
     - New tilt-shift effects start with no focus range, so they are visually
-      unchanged until the user drags on the canvas. Pick Linear Range or Radial
-      Range as the creation mode, drag to place the range, then adjust center /
-      focus / falloff handles. Use Clear Range to remove it and drag again.
+      unchanged until the user drags on the canvas. Linear Range creation is
+      active by default; press Radial Range creation before dragging when a
+      radial focus area is desired. After a range is placed, creation buttons
+      become inactive until the user starts a new range or clears the current
+      one. Clear Range keeps the current range type active for the next drag.
   - Lens blur
   - Radial blur
   - Soft focus

@@ -792,7 +792,7 @@ pub enum TiltShiftMode {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TiltShiftParams {
     pub mode: TiltShiftMode,
-    #[serde(default)]
+    #[serde(default = "default_tilt_shift_mode_selected")]
     pub mode_selected: bool,
     #[serde(default = "default_tilt_shift_range_initialized")]
     pub range_initialized: bool,
@@ -810,11 +810,15 @@ fn default_tilt_shift_range_initialized() -> bool {
     true
 }
 
+fn default_tilt_shift_mode_selected() -> bool {
+    true
+}
+
 impl Default for TiltShiftParams {
     fn default() -> Self {
         Self {
             mode: TiltShiftMode::Linear,
-            mode_selected: false,
+            mode_selected: true,
             range_initialized: false,
             center: [0.5, 0.5],
             angle_degrees: -90.0,
