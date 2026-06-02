@@ -20,17 +20,17 @@ use local_adjust_core::{
     CubeLutParams, DehazeParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EqualizeParams,
     FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams, GradientMapParams,
     GradientMapPreset, HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams,
-    InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LineKind,
-    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
-    ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
-    MotionBlurParams, PinchSpherizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
-    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
-    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
-    StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
-    TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams, WaveDistortionMode,
-    WaveDistortionParams, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    evaluate_layer_mask, parse_cube_lut,
+    InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LineExtractMode,
+    LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
+    LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary,
+    MosaicParams, MosaicTileMode, MotionBlurParams, PinchSpherizeParams, PolarCoordinatesMode,
+    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
+    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
+    RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams,
+    WaveDistortionMode, WaveDistortionParams, apply_layers, apply_layers_with_progress,
+    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -979,6 +979,7 @@ enum EffectKind {
     PolarCoordinates,
     GlassDisplacement,
     LensCorrection,
+    LineExtract,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1030,6 +1031,7 @@ impl EffectKind {
             LocalEffect::PolarCoordinates(_) => Self::PolarCoordinates,
             LocalEffect::GlassDisplacement(_) => Self::GlassDisplacement,
             LocalEffect::LensCorrection(_) => Self::LensCorrection,
+            LocalEffect::LineExtract(_) => Self::LineExtract,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1081,6 +1083,7 @@ impl EffectKind {
             Self::PolarCoordinates => "極座標",
             Self::GlassDisplacement => "ガラス/変位",
             Self::LensCorrection => "レンズ補正",
+            Self::LineExtract => "線画抽出",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1153,6 +1156,9 @@ impl EffectKind {
             }
             Self::LensCorrection => {
                 "樽型・糸巻き型のレンズ歪みを補正し、必要なら周辺減光も持ち上げます。"
+            }
+            Self::LineExtract => {
+                "明るさのエッジを検出して線画を作り、白地・黒地・元画像への重ねに使えます。"
             }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
@@ -1260,6 +1266,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::PolarCoordinates,
             EffectKind::GlassDisplacement,
             EffectKind::LensCorrection,
+            EffectKind::LineExtract,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Texture,
@@ -7196,6 +7203,15 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 format!("周辺減光補正 {:.0}%", params.vignette_correction * 100.0)
             }
         }
+        LocalEffect::LineExtract(params) => {
+            let mode = match params.mode {
+                LineExtractMode::BlackOnWhite => "黒線",
+                LineExtractMode::WhiteOnBlack => "白線",
+                LineExtractMode::DarkenOriginal => "元画像に黒線",
+                LineExtractMode::LightenOriginal => "元画像に白線",
+            };
+            format!("線画抽出 {mode}")
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -9469,6 +9485,109 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からレンズ補正結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::LineExtract(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "白地黒線") {
+                    *params = LineExtractParams {
+                        mode: LineExtractMode::BlackOnWhite,
+                        threshold: 0.18,
+                        softness: 0.1,
+                        thickness_px: 1.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "黒地白線") {
+                    *params = LineExtractParams {
+                        mode: LineExtractMode::WhiteOnBlack,
+                        threshold: 0.18,
+                        softness: 0.1,
+                        thickness_px: 1.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "元画像に黒線") {
+                    *params = LineExtractParams {
+                        mode: LineExtractMode::DarkenOriginal,
+                        threshold: 0.16,
+                        softness: 0.12,
+                        thickness_px: 1.0,
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "太線") {
+                    *params = LineExtractParams {
+                        mode: LineExtractMode::BlackOnWhite,
+                        threshold: 0.12,
+                        softness: 0.08,
+                        thickness_px: 2.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Sobel エッジから線を作ります。しきい値を下げるほど薄い差も線になり、柔らかさで境界をなじませます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let black_on_white = params.mode == LineExtractMode::BlackOnWhite;
+                if ui.selectable_label(black_on_white, "白地黒線").clicked() && !black_on_white
+                {
+                    params.mode = LineExtractMode::BlackOnWhite;
+                    changed = true;
+                }
+                let white_on_black = params.mode == LineExtractMode::WhiteOnBlack;
+                if ui.selectable_label(white_on_black, "黒地白線").clicked() && !white_on_black
+                {
+                    params.mode = LineExtractMode::WhiteOnBlack;
+                    changed = true;
+                }
+                let darken_original = params.mode == LineExtractMode::DarkenOriginal;
+                if ui
+                    .selectable_label(darken_original, "元画像に黒線")
+                    .clicked()
+                    && !darken_original
+                {
+                    params.mode = LineExtractMode::DarkenOriginal;
+                    changed = true;
+                }
+                let lighten_original = params.mode == LineExtractMode::LightenOriginal;
+                if ui
+                    .selectable_label(lighten_original, "元画像に白線")
+                    .clicked()
+                    && !lighten_original
+                {
+                    params.mode = LineExtractMode::LightenOriginal;
+                    changed = true;
+                }
+            });
+            let threshold =
+                ui.add(egui::Slider::new(&mut params.threshold, 0.0..=1.0).text("しきい値"));
+            changed |= threshold.changed();
+            threshold
+                .lab_hover_tip("線として拾うエッジの強さです。低いほど細かい差も線になります。");
+            let softness =
+                ui.add(egui::Slider::new(&mut params.softness, 0.001..=0.5).text("柔らかさ"));
+            changed |= softness.changed();
+            softness.lab_hover_tip("しきい値付近の線をどれだけなだらかに出すかです。");
+            let thickness = ui.add(
+                egui::Slider::new(&mut params.thickness_px, 1.0..=8.0)
+                    .text("太さ")
+                    .suffix("px"),
+            );
+            changed |= thickness.changed();
+            thickness.lab_hover_tip("検出したエッジを周囲へ広げる量です。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から線画抽出結果へどれだけ近づけるかです。");
         }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -11849,6 +11968,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
             LocalEffect::GlassDisplacement(GlassDisplacementParams::default())
         }
         EffectKind::LensCorrection => LocalEffect::LensCorrection(LensCorrectionParams::default()),
+        EffectKind::LineExtract => LocalEffect::LineExtract(LineExtractParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),

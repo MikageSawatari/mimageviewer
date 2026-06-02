@@ -435,6 +435,7 @@ pub enum LocalEffect {
     PolarCoordinates(PolarCoordinatesParams),
     GlassDisplacement(GlassDisplacementParams),
     LensCorrection(LensCorrectionParams),
+    LineExtract(LineExtractParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -486,6 +487,7 @@ impl LocalEffect {
             Self::PolarCoordinates(_) => "極座標",
             Self::GlassDisplacement(_) => "ガラス変位",
             Self::LensCorrection(_) => "レンズ補正",
+            Self::LineExtract(_) => "線画抽出",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -1106,6 +1108,37 @@ impl Default for LensCorrectionParams {
             zoom: 0.0,
             center: [0.5, 0.5],
             vignette_correction: 0.0,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LineExtractMode {
+    #[default]
+    BlackOnWhite,
+    WhiteOnBlack,
+    DarkenOriginal,
+    LightenOriginal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LineExtractParams {
+    pub mode: LineExtractMode,
+    pub threshold: f32,
+    pub softness: f32,
+    pub thickness_px: f32,
+    pub strength: f32,
+}
+
+impl Default for LineExtractParams {
+    fn default() -> Self {
+        Self {
+            mode: LineExtractMode::BlackOnWhite,
+            threshold: 0.18,
+            softness: 0.1,
+            thickness_px: 1.0,
             strength: 0.0,
         }
     }
@@ -1879,6 +1912,9 @@ where
         }
         LocalEffect::LensCorrection(params) => {
             apply_lens_correction(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::LineExtract(params) => {
+            apply_line_extract(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -3544,6 +3580,125 @@ fn apply_lens_correction(
         }
     }
     out
+}
+
+fn apply_line_extract(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: LineExtractParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let threshold = params.threshold.clamp(0.0, 1.0);
+    let softness = params.softness.clamp(0.001, 1.0);
+    let radius = params.thickness_px.round().clamp(1.0, 8.0) as usize - 1;
+
+    let luma = src
+        .chunks_exact(4)
+        .map(|px| {
+            let alpha = px[3] as f32 / 255.0;
+            luma01(
+                px[0] as f32 / 255.0,
+                px[1] as f32 / 255.0,
+                px[2] as f32 / 255.0,
+            ) * alpha
+        })
+        .collect::<Vec<_>>();
+
+    let mut edges = vec![0.0_f32; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            edges[y * width + x] = line_extract_sobel_edge(&luma, width, height, x, y);
+        }
+    }
+
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let edge = if radius == 0 {
+                edges[y * width + x]
+            } else {
+                line_extract_max_edge(&edges, width, height, x, y, radius)
+            };
+            let line = smoothstep(threshold, (threshold + softness).min(1.0), edge);
+            if line <= f32::EPSILON
+                && matches!(
+                    params.mode,
+                    LineExtractMode::DarkenOriginal | LineExtractMode::LightenOriginal
+                )
+            {
+                continue;
+            }
+
+            let i = (y * width + x) * 4;
+            let target = match params.mode {
+                LineExtractMode::BlackOnWhite => {
+                    let v = 1.0 - line;
+                    [v, v, v]
+                }
+                LineExtractMode::WhiteOnBlack => [line, line, line],
+                LineExtractMode::DarkenOriginal => [
+                    src[i] as f32 / 255.0 * (1.0 - line),
+                    src[i + 1] as f32 / 255.0 * (1.0 - line),
+                    src[i + 2] as f32 / 255.0 * (1.0 - line),
+                ],
+                LineExtractMode::LightenOriginal => [
+                    src[i] as f32 / 255.0 + (1.0 - src[i] as f32 / 255.0) * line,
+                    src[i + 1] as f32 / 255.0 + (1.0 - src[i + 1] as f32 / 255.0) * line,
+                    src[i + 2] as f32 / 255.0 + (1.0 - src[i + 2] as f32 / 255.0) * line,
+                ],
+            };
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], to_u8(target[c]), strength);
+            }
+        }
+    }
+    out
+}
+
+fn line_extract_sobel_edge(luma: &[f32], width: usize, height: usize, x: usize, y: usize) -> f32 {
+    let max_x = width.saturating_sub(1) as isize;
+    let max_y = height.saturating_sub(1) as isize;
+    let sample = |x: isize, y: isize| -> f32 {
+        let x = x.clamp(0, max_x) as usize;
+        let y = y.clamp(0, max_y) as usize;
+        luma[y * width + x]
+    };
+    let x = x as isize;
+    let y = y as isize;
+    let gx = -sample(x - 1, y - 1) + sample(x + 1, y - 1) - 2.0 * sample(x - 1, y)
+        + 2.0 * sample(x + 1, y)
+        - sample(x - 1, y + 1)
+        + sample(x + 1, y + 1);
+    let gy = -sample(x - 1, y - 1) - 2.0 * sample(x, y - 1) - sample(x + 1, y - 1)
+        + sample(x - 1, y + 1)
+        + 2.0 * sample(x, y + 1)
+        + sample(x + 1, y + 1);
+    ((gx * gx + gy * gy).sqrt() * 0.25).min(1.0)
+}
+
+fn line_extract_max_edge(
+    edges: &[f32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    radius: usize,
+) -> f32 {
+    let y0 = y.saturating_sub(radius);
+    let y1 = (y + radius).min(height - 1);
+    let x0 = x.saturating_sub(radius);
+    let x1 = (x + radius).min(width - 1);
+    let mut best = 0.0_f32;
+    for yy in y0..=y1 {
+        for xx in x0..=x1 {
+            best = best.max(edges[yy * width + xx]);
+        }
+    }
+    best
 }
 
 fn farthest_corner_distance(width: usize, height: usize, cx: f32, cy: f32) -> f32 {
@@ -5790,6 +5945,82 @@ mod tests {
     }
 
     #[test]
+    fn line_extract_black_on_white_draws_dark_edges_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 20, 20, 77, 128, 128, 128, 77, 240, 240, 240, 77],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "lines",
+            LocalMask::Full,
+            LocalEffect::LineExtract(LineExtractParams {
+                mode: LineExtractMode::BlackOnWhite,
+                threshold: 0.05,
+                softness: 0.02,
+                thickness_px: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let edge = 4;
+        assert!(out.pixels[edge] < 64);
+        assert_eq!(out.pixels[edge + 3], 77);
+    }
+
+    #[test]
+    fn line_extract_darken_original_leaves_flat_area_and_darkens_edge() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                100, 100, 100, 255, 100, 100, 100, 255, 100, 100, 100, 255, 240, 240, 240, 255,
+                240, 240, 240, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "lines",
+            LocalMask::Full,
+            LocalEffect::LineExtract(LineExtractParams {
+                mode: LineExtractMode::DarkenOriginal,
+                threshold: 0.05,
+                softness: 0.02,
+                thickness_px: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels[0], src.pixels[0]);
+        let edge = 2 * 4;
+        assert!(out.pixels[edge] < src.pixels[edge]);
+    }
+
+    #[test]
+    fn line_extract_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "lines",
+            LocalMask::Full,
+            LocalEffect::LineExtract(LineExtractParams {
+                mode: LineExtractMode::WhiteOnBlack,
+                threshold: 0.0,
+                softness: 0.001,
+                thickness_px: 8.0,
+                strength: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn median_removes_isolated_speckle_and_preserves_alpha() {
         let mut pixels = vec![0_u8; 3 * 3 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -6075,6 +6306,7 @@ mod tests {
             LocalEffect::PolarCoordinates(PolarCoordinatesParams::default()),
             LocalEffect::GlassDisplacement(GlassDisplacementParams::default()),
             LocalEffect::LensCorrection(LensCorrectionParams::default()),
+            LocalEffect::LineExtract(LineExtractParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),

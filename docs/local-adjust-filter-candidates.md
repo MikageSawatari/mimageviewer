@@ -47,13 +47,13 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、45種)
+### `LocalEffect` (部分補正レイヤー、46種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
-HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
+HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
 GradientMap, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
 
 ### マスク種別 (併用可能・差別化の武器)
@@ -61,7 +61,7 @@ Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / Col
 Subject(被写体分離) / Segmentation
 
 ### グローバル `PostFilter` 側にあって local には無いもの (= local へ移植候補)
-OilPaint(Kuwahara) / Sketch(Sobel) / LightLeak / 減色8機種 / CRT 3種＋複合 / カラーグレード11種
+OilPaint(Kuwahara) / LightLeak / 減色8機種 / CRT 3種＋複合 / カラーグレード11種
 
 ---
 
@@ -122,7 +122,7 @@ OilPaint(Kuwahara) / Sketch(Sobel) / LightLeak / 減色8機種 / CRT 3種＋複�
 
 ## 5. スタイライズ・絵画調系 ★イラスト重要
 
-- [ ] **線画抽出 (Extract lines / Find Edges 強化)** ★★★ **中** — 写真/3D 描画を線画化してトレース・合成。CSP がイラスト向けに専用機能化している領域。グローバルの Sketch を制御付き＆ local 化 (CSP 線画抽出 / PS)
+- [x] **線画抽出 (Extract lines / Find Edges 強化)** ★★★ **中** — `LineExtract`。Sobel エッジから線画を生成し、白地黒線 / 黒地白線 / 元画像への黒線・白線重ね、しきい値・柔らかさ・太さに対応 (CSP 線画抽出 / PS)
 - [ ] **拡散光彩 (Diffuse Glow)** ★ **易〜中** — 粒状感のある夢幻的グロー。Bloom とは別の柔らかさ (PS)
 - [ ] **風 / スピード (Wind)** ★ **易** — 横方向の流線。動き・エフェクト (PS)
 - [ ] **水彩 / 色鉛筆 / 鉛筆画** **中** — フォトを絵画調に。背景素材化 (PS / CSP Artistic)
