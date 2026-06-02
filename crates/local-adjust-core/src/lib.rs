@@ -3,6 +3,7 @@
 //! The public boundary is intentionally small: RGBA input plus an ordered list
 //! of local adjustment layers returns an RGBA image with the same dimensions.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3235,9 +3236,21 @@ where
             LocalEffect::ColorFill(params) => {
                 apply_color_fill(&image.pixels, image.width, image.height, *params)
             }
-            LocalEffect::OutlineStroke(params) => {
-                apply_outline_stroke(&image.pixels, image.width, image.height, *params)
-            }
+            LocalEffect::OutlineStroke(params) => apply_outline_stroke(
+                &image.pixels,
+                image.width,
+                image.height,
+                *params,
+                cancel,
+                |percent| {
+                    progress(LocalAdjustProgress {
+                        layer_index,
+                        layer_count,
+                        effect_name: layer.effect.progress_label(),
+                        percent,
+                    });
+                },
+            )?,
             LocalEffect::ColorTrace(params) => {
                 apply_color_trace(&image.pixels, image.width, image.height, *params)
             }
@@ -3706,29 +3719,95 @@ fn morph_alpha(src: &[f32], width: usize, height: usize, radius: i32) -> Vec<f32
     if r == 0 {
         return src.to_vec();
     }
-    let offsets = circle_offsets(r);
-    let mut out = vec![0.0; src.len()];
-    let dilate = radius > 0;
-    for y in 0..height {
-        for x in 0..width {
-            let mut v = if dilate { 0.0_f32 } else { 1.0_f32 };
-            for (ox, oy) in &offsets {
-                let nx = x as i32 + *ox;
-                let ny = y as i32 + *oy;
-                if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
-                    continue;
+    morph_alpha_disk(src, width, height, r, radius > 0, None, |_| {})
+        .expect("morph_alpha without cancellation cannot fail")
+}
+
+fn morph_alpha_disk<F>(
+    src: &[f32],
+    width: usize,
+    height: usize,
+    radius: i32,
+    dilate: bool,
+    cancel: Option<&AtomicBool>,
+    mut progress: F,
+) -> Result<Vec<f32>>
+where
+    F: FnMut(f32),
+{
+    let r = radius.max(0);
+    if r == 0 || width == 0 || height == 0 {
+        progress(1.0);
+        return Ok(src.to_vec());
+    }
+
+    let mut out: Vec<f32> = vec![if dilate { 0.0_f32 } else { 1.0_f32 }; src.len()];
+    let mut row: Vec<f32> = vec![0.0_f32; width];
+    let r2 = r * r;
+    let dy_count = (r * 2 + 1).max(1) as f32;
+    for (dy_index, dy) in (-r..=r).enumerate() {
+        if dy_index % 4 == 0 {
+            check_cancel(cancel)?;
+            progress((dy_index as f32 / dy_count).clamp(0.0, 1.0));
+        }
+        let hx = ((r2 - dy * dy) as f32).sqrt().floor() as usize;
+        let target_start = if dy < 0 { (-dy) as usize } else { 0 };
+        let target_end = if dy > 0 {
+            height.saturating_sub(dy as usize)
+        } else {
+            height
+        };
+        for y in target_start..target_end {
+            let sy = (y as i32 + dy) as usize;
+            let src_row = &src[sy * width..(sy + 1) * width];
+            sliding_row_extreme(src_row, hx, dilate, &mut row);
+            let out_row = &mut out[y * width..(y + 1) * width];
+            if dilate {
+                for (dst, sample) in out_row.iter_mut().zip(row.iter()) {
+                    *dst = (*dst).max(*sample);
                 }
-                let sample = src[ny as usize * width + nx as usize];
-                if dilate {
-                    v = v.max(sample);
-                } else {
-                    v = v.min(sample);
+            } else {
+                for (dst, sample) in out_row.iter_mut().zip(row.iter()) {
+                    *dst = (*dst).min(*sample);
                 }
             }
-            out[y * width + x] = v;
         }
     }
-    out
+    check_cancel(cancel)?;
+    progress(1.0);
+    Ok(out)
+}
+
+fn sliding_row_extreme(src: &[f32], radius: usize, dilate: bool, out: &mut [f32]) {
+    debug_assert_eq!(src.len(), out.len());
+    if src.is_empty() {
+        return;
+    }
+    let mut deque: VecDeque<usize> = VecDeque::new();
+    let mut right = 0usize;
+    for x in 0..src.len() {
+        let right_limit = (x + radius).min(src.len() - 1);
+        while right <= right_limit {
+            while let Some(&back) = deque.back() {
+                let remove = if dilate {
+                    src[back] <= src[right]
+                } else {
+                    src[back] >= src[right]
+                };
+                if !remove {
+                    break;
+                }
+                deque.pop_back();
+            }
+            deque.push_back(right);
+            right += 1;
+        }
+        let left_limit = x.saturating_sub(radius);
+        while deque.front().is_some_and(|&front| front < left_limit) {
+            deque.pop_front();
+        }
+        out[x] = src[*deque.front().expect("sliding window is never empty")];
+    }
 }
 
 fn circle_offsets(radius: i32) -> Vec<(i32, i32)> {
@@ -7365,34 +7444,91 @@ fn apply_outline_stroke(
     width: usize,
     height: usize,
     params: OutlineStrokeParams,
-) -> Vec<u8> {
+    cancel: Option<&AtomicBool>,
+    mut progress: impl FnMut(f32),
+) -> Result<Vec<u8>> {
     let mut out = vec![0; src.len()];
     let opacity = params.opacity.clamp(0.0, 1.0);
     let radius = params.width_px.round().clamp(0.0, 96.0) as i32;
     if width == 0 || height == 0 || radius == 0 || opacity <= f32::EPSILON {
-        return out;
+        progress(1.0);
+        return Ok(out);
     }
 
+    check_cancel(cancel)?;
     let alpha: Vec<f32> = src.chunks_exact(4).map(|px| px[3] as f32 / 255.0).collect();
-    let dilated = morph_alpha(&alpha, width, height, radius);
-    let eroded = morph_alpha(&alpha, width, height, -radius);
-    let mut stroke: Vec<f32> = alpha
-        .iter()
-        .zip(dilated.iter())
-        .zip(eroded.iter())
-        .map(|((a, dilated), eroded)| match params.placement {
-            OutlineStrokePlacement::Outside => (dilated - a).clamp(0.0, 1.0),
-            OutlineStrokePlacement::Inside => (a - eroded).clamp(0.0, 1.0),
-            OutlineStrokePlacement::Center => (dilated - eroded).clamp(0.0, 1.0),
-        })
-        .collect();
+    progress(0.02);
+    let needs_dilate = matches!(
+        params.placement,
+        OutlineStrokePlacement::Outside | OutlineStrokePlacement::Center
+    );
+    let needs_erode = matches!(
+        params.placement,
+        OutlineStrokePlacement::Inside | OutlineStrokePlacement::Center
+    );
+    let (dilate_start, dilate_span, erode_start, erode_span) = if needs_dilate && needs_erode {
+        (0.02, 0.40, 0.42, 0.40)
+    } else {
+        (0.02, 0.72, 0.02, 0.72)
+    };
+    let dilated = if needs_dilate {
+        Some(morph_alpha_disk(
+            &alpha,
+            width,
+            height,
+            radius,
+            true,
+            cancel,
+            |p| progress(dilate_start + p * dilate_span),
+        )?)
+    } else {
+        None
+    };
+    let eroded = if needs_erode {
+        Some(morph_alpha_disk(
+            &alpha,
+            width,
+            height,
+            radius,
+            false,
+            cancel,
+            |p| progress(erode_start + p * erode_span),
+        )?)
+    } else {
+        None
+    };
+    check_cancel(cancel)?;
+    progress(0.84);
+
+    let mut stroke = vec![0.0; alpha.len()];
+    for idx in 0..alpha.len() {
+        stroke[idx] = match params.placement {
+            OutlineStrokePlacement::Outside => {
+                (dilated.as_ref().expect("outside stroke has dilation")[idx] - alpha[idx])
+                    .clamp(0.0, 1.0)
+            }
+            OutlineStrokePlacement::Inside => (alpha[idx]
+                - eroded.as_ref().expect("inside stroke has erosion")[idx])
+                .clamp(0.0, 1.0),
+            OutlineStrokePlacement::Center => {
+                (dilated.as_ref().expect("center stroke has dilation")[idx]
+                    - eroded.as_ref().expect("center stroke has erosion")[idx])
+                    .clamp(0.0, 1.0)
+            }
+        };
+    }
 
     let softness = params.softness_px.round().clamp(0.0, 32.0) as usize;
     if softness > 0 {
         stroke = box_blur_alpha(&stroke, width, height, softness);
     }
+    check_cancel(cancel)?;
+    progress(0.92);
 
     for (idx, amount) in stroke.iter().enumerate() {
+        if idx % 8192 == 0 {
+            check_cancel(cancel)?;
+        }
         let amount = (amount * opacity).clamp(0.0, 1.0);
         if amount <= f32::EPSILON {
             continue;
@@ -7403,7 +7539,8 @@ fn apply_outline_stroke(
         out[o + 2] = params.color_rgb[2];
         out[o + 3] = to_u8(amount);
     }
-    out
+    progress(1.0);
+    Ok(out)
 }
 
 fn apply_color_trace(src: &[u8], width: usize, height: usize, params: ColorTraceParams) -> Vec<u8> {
@@ -9760,6 +9897,45 @@ mod tests {
         assert_eq!(&out.pixels[top_center..top_center + 3], &[0, 0, 0]);
         assert_eq!(&out.pixels[center..center + 3], &[200, 200, 200]);
         assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    #[test]
+    fn outline_stroke_reports_incremental_progress_for_large_width() {
+        let src = solid(32, 32, [200, 200, 200, 255]);
+        let mut alpha = vec![0.0; 32 * 32];
+        for y in 12..20 {
+            for x in 12..20 {
+                alpha[y * 32 + x] = 1.0;
+            }
+        }
+        let mask = LocalMask::Raster(RasterMask {
+            width: 32,
+            height: 32,
+            alpha,
+        });
+        let layer = LocalAdjustmentLayer::new(
+            "outline",
+            mask,
+            LocalEffect::OutlineStroke(OutlineStrokeParams {
+                placement: OutlineStrokePlacement::Outside,
+                width_px: 24.0,
+                softness_px: 0.0,
+                opacity: 1.0,
+                color_rgb: [0, 0, 0],
+            }),
+        );
+
+        let mut progress = Vec::new();
+        apply_layers_with_progress(src.as_ref(), &[layer], None, |p| {
+            if p.effect_name == "縁取り" {
+                progress.push(p.percent);
+            }
+        })
+        .unwrap();
+
+        assert!(progress.first().copied().unwrap_or(1.0) <= f32::EPSILON);
+        assert!(progress.iter().any(|&p| p > 0.10 && p < 0.95));
+        assert!(progress.last().copied().unwrap_or(0.0) >= 1.0);
     }
 
     #[test]
