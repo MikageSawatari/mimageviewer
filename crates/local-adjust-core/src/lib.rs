@@ -433,6 +433,7 @@ pub enum LocalEffect {
     PinchSpherize(PinchSpherizeParams),
     Twirl(TwirlParams),
     PolarCoordinates(PolarCoordinatesParams),
+    GlassDisplacement(GlassDisplacementParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -482,6 +483,7 @@ impl LocalEffect {
             Self::PinchSpherize(_) => "つまむ/魚眼",
             Self::Twirl(_) => "渦巻き",
             Self::PolarCoordinates(_) => "極座標",
+            Self::GlassDisplacement(_) => "ガラス変位",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -1046,6 +1048,40 @@ impl Default for PolarCoordinatesParams {
             radius_px: 0.0,
             angle_offset_degrees: 0.0,
             invert_radius: false,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GlassDisplacementMode {
+    #[default]
+    Frosted,
+    Ripple,
+    Faceted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GlassDisplacementParams {
+    pub mode: GlassDisplacementMode,
+    pub displacement_px: f32,
+    pub scale_px: f32,
+    pub detail: f32,
+    pub angle_degrees: f32,
+    pub seed: u32,
+    pub strength: f32,
+}
+
+impl Default for GlassDisplacementParams {
+    fn default() -> Self {
+        Self {
+            mode: GlassDisplacementMode::Frosted,
+            displacement_px: 0.0,
+            scale_px: 48.0,
+            detail: 0.5,
+            angle_degrees: 0.0,
+            seed: 1,
             strength: 0.0,
         }
     }
@@ -1813,6 +1849,9 @@ where
         }
         LocalEffect::PolarCoordinates(params) => {
             apply_polar_coordinates(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::GlassDisplacement(params) => {
+            apply_glass_displacement(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -3310,6 +3349,118 @@ fn apply_polar_coordinates(
         }
     }
     out
+}
+
+fn apply_glass_displacement(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: GlassDisplacementParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let displacement = params.displacement_px.clamp(0.0, 128.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON || displacement <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let scale = params.scale_px.max(2.0);
+    let detail = params.detail.clamp(0.0, 1.0);
+    let angle = params.angle_degrees.to_radians();
+    let cos_a = angle.cos();
+    let sin_a = angle.sin();
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let (dx, dy) = glass_displacement_vector(
+                x as f32,
+                y as f32,
+                params.mode,
+                scale,
+                detail,
+                cos_a,
+                sin_a,
+                params.seed,
+            );
+            let sx = x as f32 + dx * displacement;
+            let sy = y as f32 + dy * displacement;
+            let sampled = sample_rgb_bilinear(src, width, height, sx, sy);
+            let i = (y * width + x) * 4;
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], to_u8(sampled[c]), strength);
+            }
+        }
+    }
+    out
+}
+
+fn glass_displacement_vector(
+    x: f32,
+    y: f32,
+    mode: GlassDisplacementMode,
+    scale: f32,
+    detail: f32,
+    cos_a: f32,
+    sin_a: f32,
+    seed: u32,
+) -> (f32, f32) {
+    let u = (x * cos_a + y * sin_a) / scale;
+    let v = (-x * sin_a + y * cos_a) / scale;
+    let (local_x, local_y) = match mode {
+        GlassDisplacementMode::Frosted => {
+            let fine_scale = 2.0 + detail * 3.0;
+            let fine_weight = detail * 0.45;
+            let coarse_weight = 1.0 - fine_weight * 0.5;
+            let dx = glass_value_noise(u, v, seed) * coarse_weight
+                + glass_value_noise(
+                    u * fine_scale + 13.7,
+                    v * fine_scale - 5.3,
+                    seed ^ 0xA511_E9B3,
+                ) * fine_weight;
+            let dy = glass_value_noise(u + 31.2, v - 17.9, seed ^ 0x63D8_3511) * coarse_weight
+                + glass_value_noise(
+                    u * fine_scale - 19.1,
+                    v * fine_scale + 7.4,
+                    seed ^ 0xB529_7A4D,
+                ) * fine_weight;
+            (dx, dy)
+        }
+        GlassDisplacementMode::Ripple => {
+            let primary = (u * std::f32::consts::TAU).sin();
+            let cross = ((v + u * 0.35) * std::f32::consts::TAU).sin() * detail;
+            (primary, cross)
+        }
+        GlassDisplacementMode::Faceted => {
+            let cell_x = u.floor() as i32;
+            let cell_y = v.floor() as i32;
+            (
+                signed_noise(cell_x as u32, cell_y as u32, seed),
+                signed_noise(cell_x as u32, cell_y as u32, seed ^ 0x9E37_79B9),
+            )
+        }
+    };
+    let x = local_x * cos_a - local_y * sin_a;
+    let y = local_x * sin_a + local_y * cos_a;
+    let len = (x * x + y * y).sqrt();
+    if len > 1.0 {
+        (x / len, y / len)
+    } else {
+        (x, y)
+    }
+}
+
+fn glass_value_noise(x: f32, y: f32, seed: u32) -> f32 {
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let x1 = x0.wrapping_add(1);
+    let y1 = y0.wrapping_add(1);
+    let tx = smoothstep(0.0, 1.0, x - x0 as f32);
+    let ty = smoothstep(0.0, 1.0, y - y0 as f32);
+    let n00 = signed_noise(x0 as u32, y0 as u32, seed);
+    let n10 = signed_noise(x1 as u32, y0 as u32, seed);
+    let n01 = signed_noise(x0 as u32, y1 as u32, seed);
+    let n11 = signed_noise(x1 as u32, y1 as u32, seed);
+    let top = lerp_f32(n00, n10, tx);
+    let bottom = lerp_f32(n01, n11, tx);
+    lerp_f32(top, bottom, ty)
 }
 
 fn farthest_corner_distance(width: usize, height: usize, cx: f32, cy: f32) -> f32 {
@@ -5430,6 +5581,61 @@ mod tests {
     }
 
     #[test]
+    fn glass_displacement_ripple_offsets_pixels_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                10, 10, 10, 99, 40, 40, 40, 99, 80, 80, 80, 99, 120, 120, 120, 99, 160, 160, 160,
+                99,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "glass",
+            LocalMask::Full,
+            LocalEffect::GlassDisplacement(GlassDisplacementParams {
+                mode: GlassDisplacementMode::Ripple,
+                displacement_px: 1.0,
+                scale_px: 4.0,
+                detail: 0.0,
+                angle_degrees: 0.0,
+                seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let shifted = 4;
+        assert_eq!(out.pixels[shifted], src.pixels[8]);
+        assert_eq!(out.pixels[shifted + 3], 99);
+    }
+
+    #[test]
+    fn glass_displacement_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "glass",
+            LocalMask::Full,
+            LocalEffect::GlassDisplacement(GlassDisplacementParams {
+                mode: GlassDisplacementMode::Frosted,
+                displacement_px: 8.0,
+                scale_px: 16.0,
+                detail: 1.0,
+                angle_degrees: 35.0,
+                seed: 42,
+                strength: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn median_removes_isolated_speckle_and_preserves_alpha() {
         let mut pixels = vec![0_u8; 3 * 3 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -5713,6 +5919,7 @@ mod tests {
             LocalEffect::PinchSpherize(PinchSpherizeParams::default()),
             LocalEffect::Twirl(TwirlParams::default()),
             LocalEffect::PolarCoordinates(PolarCoordinatesParams::default()),
+            LocalEffect::GlassDisplacement(GlassDisplacementParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),

@@ -18,18 +18,19 @@ use local_adjust_core::{
     BloomParams, BlurParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
     ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
     CubeLutParams, DehazeParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EqualizeParams,
-    FilmGrainParams, GradientMapParams, GradientMapPreset, HalftoneParams, HighPassParams,
-    HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams, LineKind,
-    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
-    ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
-    MotionBlurParams, PinchSpherizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
-    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
-    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
-    StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
-    TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams, WaveDistortionMode,
-    WaveDistortionParams, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    evaluate_layer_mask, parse_cube_lut,
+    FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams, GradientMapParams,
+    GradientMapPreset, HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams,
+    InvertParams, LensBlurAperture, LensBlurParams, LineKind, LinearGradientMask,
+    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
+    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
+    PinchSpherizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
+    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
+    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
+    SharpenParams, SmartSharpenParams, SoftFocusParams, StarGlowParams, TextureParams,
+    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
+    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
+    apply_layers, apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask,
+    parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -976,6 +977,7 @@ enum EffectKind {
     PinchSpherize,
     Twirl,
     PolarCoordinates,
+    GlassDisplacement,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1025,6 +1027,7 @@ impl EffectKind {
             LocalEffect::PinchSpherize(_) => Self::PinchSpherize,
             LocalEffect::Twirl(_) => Self::Twirl,
             LocalEffect::PolarCoordinates(_) => Self::PolarCoordinates,
+            LocalEffect::GlassDisplacement(_) => Self::GlassDisplacement,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1074,6 +1077,7 @@ impl EffectKind {
             Self::PinchSpherize => "つまむ/魚眼",
             Self::Twirl => "渦巻き",
             Self::PolarCoordinates => "極座標",
+            Self::GlassDisplacement => "ガラス/変位",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1140,6 +1144,9 @@ impl EffectKind {
             }
             Self::PolarCoordinates => {
                 "矩形画像を円形構図へ巻き、または円形構図を横長の極座標画像へ展開します。"
+            }
+            Self::GlassDisplacement => {
+                "手続き型の変位マップで画像をずらし、すりガラスや波打つガラス越しの歪みを作ります。"
             }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
@@ -1245,6 +1252,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::PinchSpherize,
             EffectKind::Twirl,
             EffectKind::PolarCoordinates,
+            EffectKind::GlassDisplacement,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Texture,
@@ -7161,6 +7169,14 @@ fn effect_summary(effect: &LocalEffect) -> String {
             };
             format!("極座標 {mode}")
         }
+        LocalEffect::GlassDisplacement(params) => {
+            let mode = match params.mode {
+                GlassDisplacementMode::Frosted => "すりガラス",
+                GlassDisplacementMode::Ripple => "波ガラス",
+                GlassDisplacementMode::Faceted => "面ガラス",
+            };
+            format!("ガラス変位 {mode} {:.0}px", params.displacement_px)
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -9243,6 +9259,119 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から極座標変換結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::GlassDisplacement(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "すりガラス") {
+                    *params = GlassDisplacementParams {
+                        mode: GlassDisplacementMode::Frosted,
+                        displacement_px: 7.0,
+                        scale_px: 28.0,
+                        detail: 0.7,
+                        angle_degrees: 0.0,
+                        seed: params.seed,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "水面ガラス") {
+                    *params = GlassDisplacementParams {
+                        mode: GlassDisplacementMode::Ripple,
+                        displacement_px: 14.0,
+                        scale_px: 64.0,
+                        detail: 0.45,
+                        angle_degrees: 0.0,
+                        seed: params.seed,
+                        strength: 0.9,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "面ガラス") {
+                    *params = GlassDisplacementParams {
+                        mode: GlassDisplacementMode::Faceted,
+                        displacement_px: 18.0,
+                        scale_px: 46.0,
+                        detail: 0.0,
+                        angle_degrees: 0.0,
+                        seed: params.seed,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "細かい歪み") {
+                    *params = GlassDisplacementParams {
+                        mode: GlassDisplacementMode::Frosted,
+                        displacement_px: 4.0,
+                        scale_px: 12.0,
+                        detail: 1.0,
+                        angle_degrees: 18.0,
+                        seed: params.seed,
+                        strength: 0.8,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "ノイズや波形を変位マップとして使い、元画像のサンプル位置をずらします。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let frosted = params.mode == GlassDisplacementMode::Frosted;
+                if ui.selectable_label(frosted, "すりガラス").clicked() && !frosted {
+                    params.mode = GlassDisplacementMode::Frosted;
+                    changed = true;
+                }
+                let ripple = params.mode == GlassDisplacementMode::Ripple;
+                if ui.selectable_label(ripple, "波ガラス").clicked() && !ripple {
+                    params.mode = GlassDisplacementMode::Ripple;
+                    changed = true;
+                }
+                let faceted = params.mode == GlassDisplacementMode::Faceted;
+                if ui.selectable_label(faceted, "面ガラス").clicked() && !faceted {
+                    params.mode = GlassDisplacementMode::Faceted;
+                    changed = true;
+                }
+            });
+            let displacement = ui.add(
+                egui::Slider::new(&mut params.displacement_px, 0.0..=64.0)
+                    .text("変位量")
+                    .suffix("px"),
+            );
+            changed |= displacement.changed();
+            displacement.lab_hover_tip("サンプル位置を最大でどれだけずらすかです。");
+            let scale = ui
+                .add(egui::Slider::new(&mut params.scale_px, 2.0..=240.0).text("テクスチャサイズ"));
+            changed |= scale.changed();
+            scale.lab_hover_tip(
+                "変位マップの大きさです。小さいほど細かく、大きいほど大きく歪みます。",
+            );
+            let detail =
+                ui.add(egui::Slider::new(&mut params.detail, 0.0..=1.0).text("ディテール"));
+            changed |= detail.changed();
+            detail.lab_hover_tip(
+                "すりガラスでは細かいノイズ量、波ガラスでは交差方向の波量として働きます。",
+            );
+            let angle = ui.add(
+                egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                    .text("角度")
+                    .suffix("°"),
+            );
+            changed |= angle.changed();
+            angle.lab_hover_tip(
+                "変位マップの向きを回します。波や面ガラスの流れを合わせるときに使います。",
+            );
+            let mut seed = params.seed as i32;
+            let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
+            changed |= seed_response.changed();
+            seed_response.lab_hover_tip("ノイズや面ガラスの模様を変えます。");
+            params.seed = seed.max(0) as u32;
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からガラス変位結果へどれだけ近づけるかです。");
         }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -11618,6 +11747,9 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Twirl => LocalEffect::Twirl(TwirlParams::default()),
         EffectKind::PolarCoordinates => {
             LocalEffect::PolarCoordinates(PolarCoordinatesParams::default())
+        }
+        EffectKind::GlassDisplacement => {
+            LocalEffect::GlassDisplacement(GlassDisplacementParams::default())
         }
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
