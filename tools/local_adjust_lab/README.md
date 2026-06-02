@@ -103,6 +103,7 @@ the window.
   - Halftone
   - Cross/star glow
   - Edge-preserving smooth
+  - Median
 - Effect parameters start from near-identity values. Use the per-effect preset
   buttons for practical starting points, or Reset to return the current effect
   to its default values.

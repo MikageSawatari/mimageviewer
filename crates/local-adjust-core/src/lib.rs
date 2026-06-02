@@ -436,6 +436,7 @@ pub enum LocalEffect {
     Halftone(HalftoneParams),
     StarGlow(StarGlowParams),
     EdgeSmooth(EdgeSmoothParams),
+    Median(MedianParams),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1321,6 +1322,21 @@ impl Default for EdgeSmoothParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MedianParams {
+    pub radius_px: f32,
+    pub strength: f32,
+}
+
+impl Default for MedianParams {
+    fn default() -> Self {
+        Self {
+            radius_px: 1.0,
+            strength: 0.0,
+        }
+    }
+}
+
 pub fn apply_layers(
     src: RgbaImageRef<'_>,
     layers: &[LocalAdjustmentLayer],
@@ -1499,6 +1515,9 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         }
         LocalEffect::EdgeSmooth(params) => {
             apply_edge_smooth(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::Median(params) => {
+            apply_median(&image.pixels, image.width, image.height, *params)
         }
     };
     blend_rgb_with_mask(&mut image.pixels, &effected, &mask);
@@ -3827,6 +3846,44 @@ fn apply_edge_smooth(src: &[u8], width: usize, height: usize, params: EdgeSmooth
     out
 }
 
+fn apply_median(src: &[u8], width: usize, height: usize, params: MedianParams) -> Vec<u8> {
+    let radius = params.radius_px.round().clamp(0.0, 8.0) as i32;
+    let strength = params.strength.clamp(0.0, 1.0);
+    if radius == 0 || strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let offsets = circle_offsets(radius);
+    let mut out = src.to_vec();
+    let mut red = Vec::with_capacity(offsets.len());
+    let mut green = Vec::with_capacity(offsets.len());
+    let mut blue = Vec::with_capacity(offsets.len());
+    for y in 0..height {
+        for x in 0..width {
+            red.clear();
+            green.clear();
+            blue.clear();
+            for (dx, dy) in &offsets {
+                let xx = (x as i32 + *dx).clamp(0, width as i32 - 1) as usize;
+                let yy = (y as i32 + *dy).clamp(0, height as i32 - 1) as usize;
+                let i = (yy * width + xx) * 4;
+                red.push(src[i]);
+                green.push(src[i + 1]);
+                blue.push(src[i + 2]);
+            }
+            red.sort_unstable();
+            green.sort_unstable();
+            blue.sort_unstable();
+            let mid = offsets.len() / 2;
+            let i = (y * width + x) * 4;
+            out[i] = lerp_u8(src[i], red[mid], strength);
+            out[i + 1] = lerp_u8(src[i + 1], green[mid], strength);
+            out[i + 2] = lerp_u8(src[i + 2], blue[mid], strength);
+        }
+    }
+    out
+}
+
 fn blend_rgb_with_mask(base: &mut [u8], effected: &[u8], mask: &[f32]) {
     for (i, amount) in mask.iter().enumerate() {
         let o = i * 4;
@@ -4330,6 +4387,30 @@ mod tests {
     }
 
     #[test]
+    fn median_removes_isolated_speckle_and_preserves_alpha() {
+        let mut pixels = vec![0_u8; 3 * 3 * 4];
+        for px in pixels.chunks_exact_mut(4) {
+            px[3] = 88;
+        }
+        let center = (3 + 1) * 4;
+        pixels[center..center + 4].copy_from_slice(&[255, 255, 255, 88]);
+        let src = RgbaImageBuf::new(3, 3, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "median",
+            LocalMask::Full,
+            LocalEffect::Median(MedianParams {
+                radius_px: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels[center], 0);
+        assert_eq!(out.pixels[center + 1], 0);
+        assert_eq!(out.pixels[center + 2], 0);
+        assert_eq!(out.pixels[center + 3], 88);
+    }
+
+    #[test]
     fn shadow_lift_brightens_dark_pixel() {
         let src = solid(1, 1, [24, 24, 24, 255]);
         let layer = LocalAdjustmentLayer::new(
@@ -4403,6 +4484,7 @@ mod tests {
             LocalEffect::Halftone(HalftoneParams::default()),
             LocalEffect::StarGlow(StarGlowParams::default()),
             LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
+            LocalEffect::Median(MedianParams::default()),
         ];
         for effect in effects {
             let layer = LocalAdjustmentLayer::new("identity", LocalMask::Full, effect);

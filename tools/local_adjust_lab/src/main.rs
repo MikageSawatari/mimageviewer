@@ -20,12 +20,13 @@ use local_adjust_core::{
     FilmGrainParams, GradientMapParams, GradientMapPreset, HalftoneParams, HighlightsShadowsParams,
     HslParams, InvertParams, LensBlurAperture, LensBlurParams, LineKind, LinearGradientMask,
     LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
-    MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, PosterizeParams,
-    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
-    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
-    SharpenParams, SoftFocusParams, StarGlowParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, VignetteParams, apply_layers,
-    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
+    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
+    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
+    SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
+    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
+    ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size, evaluate_layer_mask,
+    parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -963,6 +964,7 @@ enum EffectKind {
     Halftone,
     StarGlow,
     EdgeSmooth,
+    Median,
 }
 
 impl EffectKind {
@@ -1004,6 +1006,7 @@ impl EffectKind {
             LocalEffect::Halftone(_) => Self::Halftone,
             LocalEffect::StarGlow(_) => Self::StarGlow,
             LocalEffect::EdgeSmooth(_) => Self::EdgeSmooth,
+            LocalEffect::Median(_) => Self::Median,
         }
     }
 
@@ -1045,6 +1048,7 @@ impl EffectKind {
             Self::Halftone => "ハーフトーン",
             Self::StarGlow => "クロス光",
             Self::EdgeSmooth => "エッジ保持ぼかし",
+            Self::Median => "メディアン",
         }
     }
 
@@ -1098,6 +1102,7 @@ impl EffectKind {
             Self::Halftone => "明るさをドットパターンに変換し、漫画や印刷風にします。",
             Self::StarGlow => "明るい部分から十字や多方向の光線を描写します。",
             Self::EdgeSmooth => "輪郭をなるべく残しながら面をなめらかにします。",
+            Self::Median => "孤立した点ノイズや細かいゴミを、周囲の中央値で目立ちにくくします。",
         }
     }
 }
@@ -1148,6 +1153,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Clarity,
             EffectKind::Sharpen,
             EffectKind::EdgeSmooth,
+            EffectKind::Median,
         ],
     },
     EffectGroup {
@@ -6550,6 +6556,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::EdgeSmooth(params) => {
             format!("エッジ保持ぼかし {:.0}px", params.radius_px)
         }
+        LocalEffect::Median(params) => format!("メディアン {:.0}px", params.radius_px),
     }
 }
 
@@ -9138,6 +9145,47 @@ fn draw_effect_params(
                 )
                 .changed();
         }
+        LocalEffect::Median(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "点ノイズ") {
+                    *params = MedianParams {
+                        radius_px: 1.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "弱く") {
+                    *params = MedianParams {
+                        radius_px: 1.0,
+                        strength: 0.45,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強め") {
+                    *params = MedianParams {
+                        radius_px: 2.0,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "周囲の中央値に置き換えることで、孤立した白点・黒点や細かいゴミを落とします。線や細部も丸まりやすいので小さめの半径から試してください。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let radius = ui.add(egui::Slider::new(&mut params.radius_px, 0.0..=8.0).text("半径"));
+            changed |= radius.changed();
+            radius.lab_hover_tip(
+                "中央値を取る範囲です。1pxは点ノイズ除去向け、大きい値は細部も消えやすくなります。",
+            );
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から中央値処理後の色へどれだけ近づけるかです。");
+        }
     }
     EffectParamResponse {
         changed,
@@ -10370,6 +10418,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Halftone => LocalEffect::Halftone(HalftoneParams::default()),
         EffectKind::StarGlow => LocalEffect::StarGlow(StarGlowParams::default()),
         EffectKind::EdgeSmooth => LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
+        EffectKind::Median => LocalEffect::Median(MedianParams::default()),
     }
 }
 

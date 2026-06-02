@@ -888,7 +888,7 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   3-way Color Grading / Selective Color / Channel Mixer / Color Mixer / Clarity / Highlights-Shadows /
   Blur / Motion Blur / Tilt Shift / Lens Blur / Radial Blur / Soft Focus / Mosaic / Sharpen / HSL / Dehaze / Look / 3D LUT / Posterize / Threshold / Invert / Duotone / Equalize / Gradient Map / Bloom /
   Vignette / Film Grain / Chromatic Aberration / Halftone / Cross-Star Glow /
-  Edge-preserving Smooth
+  Edge-preserving Smooth / Median
 - 3D LUT は `.cube` の `LUT_3D_SIZE` / `DOMAIN_MIN` / `DOMAIN_MAX` / `LUT_3D_INPUT_RANGE` を読み取り、RGB 3D table
   をレイヤー設定に保持する。ファイル読み込みは worker thread で行い、UI スレッドでは重い I/O
   をしない。設定保存時は LUT データも含まれるため、外部 LUT ファイルが移動しても効果は再現できるが、
