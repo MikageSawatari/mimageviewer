@@ -2219,6 +2219,12 @@ impl LocalAdjustLabApp {
     }
 
     fn add_layer_with_mask_and_auto_generate(&mut self, mask_kind: MaskKind, ctx: &egui::Context) {
+        if mask_kind == MaskKind::Subject && !subject_model_available() {
+            self.status =
+                "被写体選択には U²-Netp モデルが必要です。保存済み被写体マスクは利用できます。"
+                    .to_string();
+            return;
+        }
         self.add_layer_with_mask(mask_kind);
         match mask_kind {
             MaskKind::Subject => self.start_subject_segmentation(ctx),
@@ -5063,7 +5069,15 @@ impl LocalAdjustLabApp {
         );
         let pending = self.segmentation_pending.is_some();
         let model_path = segmentation_model_path();
-        if model_path.is_file() {
+        let model_available = subject_model_available();
+        let generated_mask_available = self
+            .selected_layer_ref()
+            .and_then(|layer| match &layer.mask {
+                LocalMask::Subject(mask) => Some(subject_mask_has_content(mask)),
+                _ => None,
+            })
+            .unwrap_or(false);
+        if model_available {
             ui.label(
                 egui::RichText::new("U²-Netp: 利用可能")
                     .size(11.0)
@@ -5076,17 +5090,27 @@ impl LocalAdjustLabApp {
                     .color(Color32::from_rgb(255, 170, 100)),
             );
         }
-        if ui
-            .add_enabled(
-                !pending,
-                egui::Button::new(if pending {
-                    "被写体マスク生成中..."
-                } else {
-                    "被写体マスク生成"
-                }),
-            )
-            .clicked()
-        {
+        let generate_label = if pending {
+            "被写体マスク生成中..."
+        } else if generated_mask_available {
+            "元画像から再生成"
+        } else {
+            "被写体マスク生成"
+        };
+        let generate_response = ui.add_enabled(
+            !pending && model_available,
+            egui::Button::new(generate_label),
+        );
+        let generate_tip = if model_available {
+            if generated_mask_available {
+                "保存済みまたは現在の被写体マスクを破棄し、元画像からモデルで再生成します。"
+            } else {
+                "元画像から被写体マスクを生成します。"
+            }
+        } else {
+            "U²-Netp モデルがないため生成/再生成はできません。保存済みマスクの編集と適用は可能です。"
+        };
+        if generate_response.lab_hover_tip(generate_tip).clicked() {
             self.start_subject_segmentation(ui.ctx());
         }
         ui.horizontal(|ui| {
@@ -5510,6 +5534,7 @@ impl LocalAdjustLabApp {
         let mut open = self.add_layer_dialog_open;
         let current_kind = self.add_layer_mask_kind;
         let mut add_requested = None;
+        let subject_model_available = subject_model_available();
         let dialog_frame = egui::Frame::window(ctx.style().as_ref())
             .fill(Color32::from_rgba_unmultiplied(24, 24, 26, 245))
             .stroke(egui::Stroke::new(
@@ -5549,17 +5574,28 @@ impl LocalAdjustLabApp {
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                                 for &kind in group.kinds {
-                                    let fill = if kind == current_kind {
+                                    let enabled =
+                                        kind != MaskKind::Subject || subject_model_available;
+                                    let fill = if !enabled {
+                                        Color32::from_rgba_unmultiplied(54, 54, 54, 150)
+                                    } else if kind == current_kind {
                                         Color32::from_rgb(36, 112, 150)
                                     } else {
                                         Color32::from_rgba_unmultiplied(70, 70, 70, 190)
                                     };
+                                    let tip = if enabled {
+                                        kind.description().to_string()
+                                    } else {
+                                        "被写体選択の新規生成には U²-Netp モデルが必要です。保存済みの被写体マスクは読み込んで利用できます。".to_string()
+                                    };
                                     let response = ui
-                                        .add_sized(
-                                            egui::vec2(156.0, 30.0),
-                                            egui::Button::new(kind.label()).fill(fill),
+                                        .add_enabled(
+                                            enabled,
+                                            egui::Button::new(kind.label())
+                                                .fill(fill)
+                                                .min_size(egui::vec2(156.0, 30.0)),
                                         )
-                                        .lab_hover_tip(kind.description());
+                                        .lab_hover_tip(tip);
                                     if response.clicked() {
                                         add_requested = Some(kind);
                                     }
@@ -15454,6 +15490,14 @@ fn subject_mask_stats(mask: &SubjectMask) -> SubjectMaskStats {
     }
 }
 
+fn subject_mask_has_content(mask: &SubjectMask) -> bool {
+    mask.alpha.iter().any(|&alpha| alpha > 0.02)
+        || mask
+            .source_alpha
+            .as_ref()
+            .is_some_and(|alpha| alpha.iter().any(|&value| value > 0.02))
+}
+
 fn subject_cutout_refined_alpha(
     mask: &RasterMask,
     threshold: f32,
@@ -16146,6 +16190,10 @@ fn resize_mask_bilinear(
 
 fn segmentation_model_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/u2netp.onnx")
+}
+
+fn subject_model_available() -> bool {
+    segmentation_model_path().is_file()
 }
 
 fn lab_ort_dll_path() -> PathBuf {

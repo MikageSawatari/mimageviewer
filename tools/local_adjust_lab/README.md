@@ -52,14 +52,16 @@ the window.
   - Radial gradient with canvas handles
   - Luma range
   - Color range with click picker
-  - Subject selection mask using an optional U²-Netp ONNX model. Creating a
-    subject layer starts one generation pass automatically when the model is
-    available. The generated soft matte can be refined for cutout work by
-    thresholding it toward a binary mask, optionally shrinking/expanding it, and
-    smoothing only the boundary band. The original generated matte is kept with
-    the layer, and cutout refinement is enabled with a checkbox. When enabled,
-    the sliders regenerate from that matte instead of destructively editing the
-    current mask; turning it off restores the original matte.
+  - Subject selection mask using an optional U²-Netp ONNX model. Creating or
+    regenerating a subject layer requires the model and starts one generation
+    pass automatically when available. Saved subject masks are stored in the
+    sidecar and remain usable without the model. The generated soft matte can be
+    refined for cutout work by thresholding it toward a binary mask, optionally
+    shrinking/expanding it, and smoothing only the boundary band. The original
+    generated matte is kept with the layer, and cutout refinement is enabled
+    with a checkbox. When enabled, the sliders regenerate from that matte
+    instead of destructively editing the current mask; turning it off restores
+    the original matte.
   - Region segmentation mask with color-coded candidates that can be toggled by
     clicking or dragging on the image. Creating a region layer starts one
     default full-image segmentation pass automatically; the tool panel can
@@ -192,9 +194,12 @@ outside the mask, matching the conceal workflow.
 Subject selection masks are implemented as an optional prototype path. Place
 downloaded models under `tools/local_adjust_lab/models/`; the prototype looks
 for `u2netp.onnx` as a lightweight Apache-2.0 salient-object /
-foreground-background segmentation candidate. It generates a foreground/subject
-matte on a worker thread. Use mask inversion, or the "background" button in the
-tool panel, when applying an effect to the background instead of the subject.
+foreground-background segmentation candidate. New subject mask generation and
+regeneration are disabled when the model is missing, but saved subject masks in
+`.miv` sidecars can still be loaded, edited, and applied. It generates a
+foreground/subject matte on a worker thread. Use mask inversion, or the
+"background" button in the tool panel, when applying an effect to the background
+instead of the subject.
 
 Region segmentation masks are a separate mask source. They currently use a
 lightweight color/connectivity/boundary based algorithm, optionally constrained

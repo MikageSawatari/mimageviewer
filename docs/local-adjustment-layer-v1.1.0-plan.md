@@ -895,7 +895,9 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
 - マスク生成元: Full / Raster / Linear Gradient / Radial Gradient / Luma Range / Color Range / Subject / Segmentation
 - `local_adjust_lab` の被写体選択は、任意配置の `tools/local_adjust_lab/models/u2netp.onnx`
   を使って U²-Netp の被写体 / 背景マスクを worker thread で生成する初期実装まで接続済み。
-  生成結果は `Subject(SubjectMask)` として保持し、背景選択はマスク反転で扱う。
+  新規生成 / 再生成にはモデルが必要だが、生成済みマスクは `.miv` sidecar に保存されるため、
+  モデル未配置環境でも読み込み、編集、適用は継続できる。生成結果は `Subject(SubjectMask)`
+  として保持し、背景選択はマスク反転で扱う。
   `SubjectMask` は現在の alpha に加えて生成直後の soft matte も保持し、切り抜き向け整形の
   `マスクを整形` チェックが ON のときだけ、しきい値 / 収縮拡張 / 境界なめらかスライダーで
   その元 matte から現在 alpha を再生成する。OFF に戻すと元 matte へ復帰する
