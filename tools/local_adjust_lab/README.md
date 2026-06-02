@@ -138,6 +138,7 @@ the window.
   - Defringe / chromatic fringe removal
   - Scanline glitch / hologram
   - VHS / analog video
+  - Data mosh / block glitch
   - Pixel sort
   - Old film / aged photo
   - Halftone

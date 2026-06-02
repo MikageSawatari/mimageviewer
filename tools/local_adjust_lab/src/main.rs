@@ -21,19 +21,20 @@ use local_adjust_core::{
     CmykPlateShiftParams, ColorBalanceParams, ColorBalanceRange, ColorDodgeGlowParams,
     ColorFillParams, ColorGradeWheel, ColorHalftoneParams, ColorMixerParams, ColorOverlayBlendMode,
     ColorOverlayParams, ColorOverlayShape, ColorRangeMask, ColorTraceParams, ContactShadowParams,
-    CubeLutParams, CutoutParams, DefringeParams, DehazeParams, DespeckleParams, DiffuseGlowParams,
-    DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams, EngravingParams, EqualizeParams,
-    FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams, GlowingEdgesParams,
-    GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams, HalftoneParams,
-    HeatHazeParams, HighPassParams, HighlightsShadowsParams, HslParams, InvertParams,
-    LensBlurAperture, LensBlurParams, LensCorrectionParams, LensFlareParams, LightLeakParams,
-    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LithographParams,
-    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
-    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
-    NeonGlowParams, NewspaperPrintParams, NoiseDistribution, NoiseParams, OilPaintParams,
-    OldFilmParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement, PartColorParams,
-    ParticleOverlayMode, ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection,
-    PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
+    CubeLutParams, CutoutParams, DataMoshParams, DefringeParams, DehazeParams, DespeckleParams,
+    DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams,
+    EngravingParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
+    GlassDisplacementParams, GlowingEdgesParams, GodRaysParams, GradientMapParams,
+    GradientMapPreset, HalationParams, HalftoneParams, HeatHazeParams, HighPassParams,
+    HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
+    LensCorrectionParams, LensFlareParams, LightLeakParams, LineExtractMode, LineExtractParams,
+    LineKind, LinearGradientMask, LithographParams, LocalAdjustmentLayer, LocalEffect, LocalMask,
+    LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary,
+    MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams, NewspaperPrintParams,
+    NoiseDistribution, NoiseParams, OilPaintParams, OldFilmParams, OrtonParams,
+    OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, ParticleOverlayMode,
+    ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection, PixelSortOrder,
+    PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
     PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
     RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
     RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode, ScreenToneParams,
@@ -1083,6 +1084,7 @@ enum EffectKind {
     Defringe,
     ScanlineGlitch,
     Vhs,
+    DataMosh,
     PixelSort,
     OldFilm,
     Halftone,
@@ -1252,6 +1254,7 @@ impl EffectKind {
             LocalEffect::Defringe(_) => Self::Defringe,
             LocalEffect::ScanlineGlitch(_) => Self::ScanlineGlitch,
             LocalEffect::Vhs(_) => Self::Vhs,
+            LocalEffect::DataMosh(_) => Self::DataMosh,
             LocalEffect::PixelSort(_) => Self::PixelSort,
             LocalEffect::OldFilm(_) => Self::OldFilm,
             LocalEffect::Halftone(_) => Self::Halftone,
@@ -1352,6 +1355,7 @@ impl EffectKind {
             Self::Defringe => "色フチ除去",
             Self::ScanlineGlitch => "走査線グリッチ",
             Self::Vhs => "VHS/アナログ",
+            Self::DataMosh => "データモッシュ",
             Self::PixelSort => "ピクセルソート",
             Self::OldFilm => "オールドフィルム",
             Self::Halftone => "ハーフトーン",
@@ -1549,6 +1553,9 @@ impl EffectKind {
             Self::Vhs => {
                 "色にじみ、横ゴースト、トラッキング帯、走査線を重ねて古いアナログビデオ風にします。"
             }
+            Self::DataMosh => {
+                "ブロック単位のずれ、スメア、RGB分離、ノイズでデータモッシュ風の破綻を作ります。"
+            }
             Self::PixelSort => {
                 "明るさ範囲で区切った行または列の画素を並べ替え、グリッチアート風の崩れを作ります。"
             }
@@ -1719,6 +1726,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Textureizer,
             EffectKind::ScanlineGlitch,
             EffectKind::Vhs,
+            EffectKind::DataMosh,
             EffectKind::PixelSort,
             EffectKind::OldFilm,
         ],
@@ -8979,6 +8987,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
             format!("走査線グリッチ {:.0}%", params.strength * 100.0)
         }
         LocalEffect::Vhs(params) => format!("VHS {:.0}%", params.strength * 100.0),
+        LocalEffect::DataMosh(params) => format!(
+            "データモッシュ {:.0}px {:.0}%",
+            params.block_size_px,
+            params.strength * 100.0
+        ),
         LocalEffect::PixelSort(params) => format!("ピクセルソート {:.0}%", params.strength * 100.0),
         LocalEffect::OldFilm(params) => format!("オールドフィルム {:.0}%", params.strength * 100.0),
         LocalEffect::Halftone(params) => format!("ハーフトーン {}px", params.cell_px),
@@ -16667,6 +16680,143 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
                 .changed();
         }
+        LocalEffect::DataMosh(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "軽い破綻") {
+                    *params = DataMoshParams {
+                        block_size_px: 18.0,
+                        displacement_px: 7.0,
+                        direction_degrees: 0.0,
+                        low_threshold: 0.08,
+                        high_threshold: 0.96,
+                        freeze: 0.25,
+                        smear: 0.12,
+                        rgb_shift_px: 0.9,
+                        noise: 0.05,
+                        seed: params.seed,
+                        strength: 0.55,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ブロック") {
+                    *params = DataMoshParams {
+                        block_size_px: 24.0,
+                        displacement_px: 22.0,
+                        direction_degrees: 0.0,
+                        low_threshold: 0.05,
+                        high_threshold: 0.98,
+                        freeze: 0.65,
+                        smear: 0.35,
+                        rgb_shift_px: 0.5,
+                        noise: 0.08,
+                        seed: params.seed,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "RGB崩れ") {
+                    *params = DataMoshParams {
+                        block_size_px: 12.0,
+                        displacement_px: 8.0,
+                        direction_degrees: 0.0,
+                        low_threshold: 0.0,
+                        high_threshold: 1.0,
+                        freeze: 0.35,
+                        smear: 0.15,
+                        rgb_shift_px: 6.0,
+                        noise: 0.16,
+                        seed: params.seed,
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強い") {
+                    *params = DataMoshParams {
+                        block_size_px: 10.0,
+                        displacement_px: 34.0,
+                        direction_degrees: -8.0,
+                        low_threshold: 0.0,
+                        high_threshold: 1.0,
+                        freeze: 0.90,
+                        smear: 0.75,
+                        rgb_shift_px: 9.0,
+                        noise: 0.28,
+                        seed: params.seed,
+                        strength: 0.95,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "ブロック単位のずれ、フリーズ、RGB分離、ノイズを重ねるデジタル破損演出です。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let block_size = ui.add(
+                egui::Slider::new(&mut params.block_size_px, 2.0..=128.0)
+                    .text("ブロック")
+                    .suffix("px"),
+            );
+            changed |= block_size.changed();
+            block_size.lab_hover_tip(
+                "破損をまとめるブロックの大きさです。大きいほど粗い崩れになります。",
+            );
+            let displacement = ui.add(
+                egui::Slider::new(&mut params.displacement_px, 0.0..=128.0)
+                    .text("ずれ")
+                    .suffix("px"),
+            );
+            changed |= displacement.changed();
+            displacement.lab_hover_tip("ブロックが指定方向へ引きずられる距離です。");
+            let direction = ui.add(
+                egui::Slider::new(&mut params.direction_degrees, -180.0..=180.0)
+                    .text("方向")
+                    .suffix("°"),
+            );
+            changed |= direction.changed();
+            direction.lab_hover_tip("ブロックずれとRGB分離の基準方向です。");
+            let low =
+                ui.add(egui::Slider::new(&mut params.low_threshold, 0.0..=1.0).text("明るさ下限"));
+            changed |= low.changed();
+            low.lab_hover_tip(
+                "この明るさ以上を破損対象にします。上限より大きい場合は内部で入れ替えます。",
+            );
+            let high =
+                ui.add(egui::Slider::new(&mut params.high_threshold, 0.0..=1.0).text("明るさ上限"));
+            changed |= high.changed();
+            high.lab_hover_tip(
+                "この明るさ以下を破損対象にします。明部だけ、暗部だけの崩し分けに使えます。",
+            );
+            let freeze = ui.add(egui::Slider::new(&mut params.freeze, 0.0..=1.0).text("フリーズ"));
+            changed |= freeze.changed();
+            freeze.lab_hover_tip(
+                "ブロック単位のずれが出る量です。上げるほど破損ブロックが増えます。",
+            );
+            let smear = ui.add(egui::Slider::new(&mut params.smear, 0.0..=1.0).text("スメア"));
+            changed |= smear.changed();
+            smear.lab_hover_tip("ずれた方向へ色を引きずる量です。");
+            let rgb = ui.add(
+                egui::Slider::new(&mut params.rgb_shift_px, 0.0..=32.0)
+                    .text("RGBずれ")
+                    .suffix("px"),
+            );
+            changed |= rgb.changed();
+            rgb.lab_hover_tip("赤と青のチャンネルを逆方向へずらします。");
+            let noise = ui.add(egui::Slider::new(&mut params.noise, 0.0..=1.0).text("ノイズ"));
+            changed |= noise.changed();
+            noise.lab_hover_tip("デジタル破損らしい細かな色ノイズを足します。");
+            let mut seed = params.seed as i32;
+            let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
+            changed |= seed_response.changed();
+            seed_response.lab_hover_tip("破損パターンを切り替えます。");
+            params.seed = seed.max(0) as u32;
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からデータモッシュ結果へどれだけ近づけるかです。");
+        }
         LocalEffect::PixelSort(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -19218,6 +19368,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Defringe => LocalEffect::Defringe(DefringeParams::default()),
         EffectKind::ScanlineGlitch => LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
         EffectKind::Vhs => LocalEffect::Vhs(VhsParams::default()),
+        EffectKind::DataMosh => LocalEffect::DataMosh(DataMoshParams::default()),
         EffectKind::PixelSort => LocalEffect::PixelSort(PixelSortParams::default()),
         EffectKind::OldFilm => LocalEffect::OldFilm(OldFilmParams::default()),
         EffectKind::Halftone => LocalEffect::Halftone(HalftoneParams::default()),
@@ -21621,6 +21772,7 @@ mod tests {
             EffectKind::Textureizer,
             EffectKind::ScanlineGlitch,
             EffectKind::Vhs,
+            EffectKind::DataMosh,
             EffectKind::PixelSort,
             EffectKind::OldFilm,
             EffectKind::ColorOverlay,

@@ -604,6 +604,7 @@ pub enum LocalEffect {
     Defringe(DefringeParams),
     ScanlineGlitch(ScanlineGlitchParams),
     Vhs(VhsParams),
+    DataMosh(DataMoshParams),
     PixelSort(PixelSortParams),
     OldFilm(OldFilmParams),
     WaterCaustics(WaterCausticsParams),
@@ -704,6 +705,7 @@ impl LocalEffect {
             Self::Defringe(_) => "色フチ除去",
             Self::ScanlineGlitch(_) => "走査線グリッチ",
             Self::Vhs(_) => "VHS/アナログビデオ",
+            Self::DataMosh(_) => "データモッシュ",
             Self::PixelSort(_) => "ピクセルソート",
             Self::OldFilm(_) => "オールドフィルム",
             Self::WaterCaustics(_) => "水中コースティクス",
@@ -3043,6 +3045,39 @@ impl Default for VhsParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DataMoshParams {
+    pub block_size_px: f32,
+    pub displacement_px: f32,
+    pub direction_degrees: f32,
+    pub low_threshold: f32,
+    pub high_threshold: f32,
+    pub freeze: f32,
+    pub smear: f32,
+    pub rgb_shift_px: f32,
+    pub noise: f32,
+    pub seed: u32,
+    pub strength: f32,
+}
+
+impl Default for DataMoshParams {
+    fn default() -> Self {
+        Self {
+            block_size_px: 16.0,
+            displacement_px: 10.0,
+            direction_degrees: 0.0,
+            low_threshold: 0.08,
+            high_threshold: 0.96,
+            freeze: 0.35,
+            smear: 0.25,
+            rgb_shift_px: 2.0,
+            noise: 0.10,
+            seed: 1,
+            strength: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PixelSortDirection {
@@ -4008,6 +4043,9 @@ where
             }
             LocalEffect::Vhs(params) => {
                 apply_vhs(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::DataMosh(params) => {
+                apply_data_mosh(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::PixelSort(params) => {
                 apply_pixel_sort(&image.pixels, image.width, image.height, *params)
@@ -10690,6 +10728,197 @@ fn vhs_ycbcr_to_rgb(y: f32, cb: f32, cr: f32) -> [f32; 3] {
     [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]
 }
 
+fn apply_data_mosh(src: &[u8], width: usize, height: usize, params: DataMoshParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let block_size = params.block_size_px.clamp(2.0, 128.0).round() as usize;
+    let displacement_px = params.displacement_px.clamp(0.0, 128.0);
+    let base_angle = params.direction_degrees.to_radians();
+    let base_dir_x = base_angle.cos();
+    let base_dir_y = base_angle.sin();
+    let low = params
+        .low_threshold
+        .clamp(0.0, 1.0)
+        .min(params.high_threshold.clamp(0.0, 1.0));
+    let high = params
+        .low_threshold
+        .clamp(0.0, 1.0)
+        .max(params.high_threshold.clamp(0.0, 1.0));
+    let freeze = params.freeze.clamp(0.0, 1.0);
+    let smear = params.smear.clamp(0.0, 1.0);
+    let rgb_shift_px = params.rgb_shift_px.clamp(0.0, 32.0);
+    let noise = params.noise.clamp(0.0, 1.0);
+    if displacement_px <= f32::EPSILON
+        && freeze <= f32::EPSILON
+        && smear <= f32::EPSILON
+        && rgb_shift_px <= f32::EPSILON
+        && noise <= f32::EPSILON
+    {
+        return src.to_vec();
+    }
+
+    let mut out = src.to_vec();
+    for y in 0..height {
+        let by = (y / block_size) as u32;
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let range_gate = data_mosh_luma_gate(luma01(base[0], base[1], base[2]), low, high);
+            if range_gate <= f32::EPSILON {
+                continue;
+            }
+
+            let bx = (x / block_size) as u32;
+            let block_noise = signed_noise(bx, by, params.seed ^ 0x46D7_2B11);
+            let freeze_gate = if freeze <= f32::EPSILON {
+                0.0
+            } else {
+                (freeze * 0.28 + smoothstep(1.0 - freeze * 0.9, 1.0, block_noise.abs()) * 0.72)
+                    .clamp(0.0, 1.0)
+            };
+            let local_gate = range_gate * freeze_gate;
+            let angle = base_angle + signed_noise(bx, by, params.seed ^ 0xD153_8F5D) * 0.55;
+            let dir_x = angle.cos();
+            let dir_y = angle.sin();
+            let offset = displacement_px
+                * local_gate
+                * (0.45 + signed_noise(by, bx, params.seed ^ 0xA9B4_3C17).abs() * 0.55);
+            let mut sx = x as f32 - dir_x * offset;
+            let mut sy = y as f32 - dir_y * offset;
+            let mut target = data_mosh_sample_rgb_or_base(src, width, height, sx, sy, base);
+
+            if smear > f32::EPSILON && offset > f32::EPSILON {
+                let smear_offset = block_size as f32
+                    * smear
+                    * (0.45
+                        + signed_noise(bx, by, params.seed ^ 0x7C31_9E93 ^ block_size as u32)
+                            .abs()
+                            * 0.85);
+                sx -= dir_x * smear_offset;
+                sy -= dir_y * smear_offset;
+                let smeared = data_mosh_sample_rgb_or_base(src, width, height, sx, sy, target);
+                for c in 0..3 {
+                    target[c] = lerp_f32(target[c], smeared[c], smear * local_gate);
+                }
+            }
+
+            if rgb_shift_px > f32::EPSILON {
+                let shift = rgb_shift_px * range_gate;
+                target[0] = data_mosh_sample_channel_or_base(
+                    src,
+                    width,
+                    height,
+                    x as f32 + base_dir_x * shift,
+                    y as f32 + base_dir_y * shift,
+                    0,
+                    target[0],
+                );
+                target[2] = data_mosh_sample_channel_or_base(
+                    src,
+                    width,
+                    height,
+                    x as f32 - base_dir_x * shift,
+                    y as f32 - base_dir_y * shift,
+                    2,
+                    target[2],
+                );
+            }
+
+            if noise > f32::EPSILON {
+                for (c, channel) in target.iter_mut().enumerate() {
+                    let n = signed_noise(
+                        x as u32,
+                        y as u32,
+                        params.seed ^ (c as u32).wrapping_mul(0x9E37_79B9) ^ 0x6B8B_4567,
+                    ) * noise
+                        * range_gate
+                        * 0.18;
+                    *channel = (*channel + n).clamp(0.0, 1.0);
+                }
+            }
+
+            let amount = strength * range_gate;
+            for c in 0..3 {
+                out[i + c] = to_u8(lerp_f32(base[c], target[c], amount));
+            }
+        }
+    }
+    out
+}
+
+fn data_mosh_luma_gate(luma: f32, low: f32, high: f32) -> f32 {
+    let feather = 0.055;
+    let lower = if low <= f32::EPSILON {
+        1.0
+    } else {
+        smoothstep((low - feather).max(0.0), low, luma)
+    };
+    let upper = if high >= 1.0 - f32::EPSILON {
+        1.0
+    } else {
+        1.0 - smoothstep(high, (high + feather).min(1.0), luma)
+    };
+    (lower * upper).clamp(0.0, 1.0)
+}
+
+fn data_mosh_sample_rgb_or_base(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: f32,
+    y: f32,
+    fallback: [f32; 3],
+) -> [f32; 3] {
+    if width == 0
+        || height == 0
+        || x < 0.0
+        || y < 0.0
+        || x > width.saturating_sub(1) as f32
+        || y > height.saturating_sub(1) as f32
+    {
+        return fallback;
+    }
+    let (rgb, alpha) = sample_rgb_bilinear_alpha_aware(src, width, height, x, y);
+    if alpha > f32::EPSILON { rgb } else { fallback }
+}
+
+fn data_mosh_sample_channel_or_base(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: f32,
+    y: f32,
+    channel: usize,
+    fallback: f32,
+) -> f32 {
+    if width == 0
+        || height == 0
+        || x < 0.0
+        || y < 0.0
+        || x > width.saturating_sub(1) as f32
+        || y > height.saturating_sub(1) as f32
+    {
+        return fallback;
+    }
+    let (rgb, alpha) = sample_rgb_bilinear_alpha_aware(src, width, height, x, y);
+    if alpha > f32::EPSILON {
+        rgb[channel.min(2)]
+    } else {
+        fallback
+    }
+}
+
 fn apply_pixel_sort(src: &[u8], width: usize, height: usize, params: PixelSortParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 1.0);
     if strength <= f32::EPSILON || width == 0 || height == 0 {
@@ -14881,6 +15110,7 @@ mod tests {
             LocalEffect::Defringe(DefringeParams::default()),
             LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
             LocalEffect::Vhs(VhsParams::default()),
+            LocalEffect::DataMosh(DataMoshParams::default()),
             LocalEffect::PixelSort(PixelSortParams::default()),
             LocalEffect::OldFilm(OldFilmParams::default()),
             LocalEffect::WaterCaustics(WaterCausticsParams::default()),
@@ -15620,6 +15850,22 @@ mod tests {
                     noise: 1.0,
                     desaturation: 1.0,
                     seed: 20,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "data mosh max block shift",
+                LocalEffect::DataMosh(DataMoshParams {
+                    block_size_px: 2.0,
+                    displacement_px: 128.0,
+                    direction_degrees: 180.0,
+                    low_threshold: 0.0,
+                    high_threshold: 1.0,
+                    freeze: 1.0,
+                    smear: 1.0,
+                    rgb_shift_px: 32.0,
+                    noise: 1.0,
+                    seed: 21,
                     strength: 1.0,
                 }),
             ),
@@ -17928,6 +18174,94 @@ LUT_3D_SIZE 2
                 scanline_strength: 0.0,
                 noise: 0.0,
                 desaturation: 0.0,
+                seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn data_mosh_offsets_blocks_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            5,
+            3,
+            vec![
+                20, 20, 20, 91, 80, 40, 40, 92, 160, 40, 40, 93, 220, 80, 40, 94, 40, 220, 40, 95,
+                20, 20, 20, 96, 80, 40, 40, 97, 160, 40, 40, 98, 220, 80, 40, 99, 40, 220, 40, 100,
+                20, 20, 20, 101, 80, 40, 40, 102, 160, 40, 40, 103, 220, 80, 40, 104, 40, 220, 40,
+                105,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "data mosh",
+            LocalMask::Full,
+            LocalEffect::DataMosh(DataMoshParams {
+                block_size_px: 2.0,
+                displacement_px: 1.0,
+                direction_degrees: 0.0,
+                low_threshold: 0.0,
+                high_threshold: 1.0,
+                freeze: 1.0,
+                smear: 0.0,
+                rgb_shift_px: 0.0,
+                noise: 0.0,
+                seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_ne!(out.pixels, src.pixels);
+        for i in (3..out.pixels.len()).step_by(4) {
+            assert_eq!(out.pixels[i], src.pixels[i]);
+        }
+    }
+
+    #[test]
+    fn data_mosh_rgb_shift_separates_channels() {
+        let src =
+            RgbaImageBuf::new(3, 1, vec![0, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "data mosh",
+            LocalMask::Full,
+            LocalEffect::DataMosh(DataMoshParams {
+                block_size_px: 2.0,
+                displacement_px: 0.0,
+                direction_degrees: 0.0,
+                low_threshold: 0.0,
+                high_threshold: 1.0,
+                freeze: 0.0,
+                smear: 0.0,
+                rgb_shift_px: 1.0,
+                noise: 0.0,
+                seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > 180);
+        assert_eq!(out.pixels[1], 0);
+        assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn data_mosh_ignores_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(3, 1, vec![0, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "data mosh",
+            LocalMask::Full,
+            LocalEffect::DataMosh(DataMoshParams {
+                block_size_px: 2.0,
+                displacement_px: 0.0,
+                direction_degrees: 0.0,
+                low_threshold: 0.0,
+                high_threshold: 1.0,
+                freeze: 0.0,
+                smear: 0.0,
+                rgb_shift_px: 1.0,
+                noise: 0.0,
                 seed: 1,
                 strength: 1.0,
             }),
