@@ -17,7 +17,7 @@ use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     ArtisticMediaMode, ArtisticMediaParams, BloomParams, BlurParams, BrushStrokeMode,
     BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
-    ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams,
+    ColorBalanceParams, ColorBalanceRange, ColorFillParams, ColorGradeWheel, ColorMixerParams,
     ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask, CubeLutParams,
     CutoutParams, DehazeParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
     EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
@@ -1007,6 +1007,7 @@ enum EffectKind {
     Duotone,
     Equalize,
     GradientMap,
+    ColorFill,
     ColorOverlay,
     NeonGlow,
     DiffuseGlow,
@@ -1071,6 +1072,7 @@ impl EffectKind {
             LocalEffect::Duotone(_) => Self::Duotone,
             LocalEffect::Equalize(_) => Self::Equalize,
             LocalEffect::GradientMap(_) => Self::GradientMap,
+            LocalEffect::ColorFill(_) => Self::ColorFill,
             LocalEffect::ColorOverlay(_) => Self::ColorOverlay,
             LocalEffect::NeonGlow(_) => Self::NeonGlow,
             LocalEffect::DiffuseGlow(_) => Self::DiffuseGlow,
@@ -1135,6 +1137,7 @@ impl EffectKind {
             Self::Duotone => "ダブルトーン",
             Self::Equalize => "ヒストグラム平坦化",
             Self::GradientMap => "グラデーションマップ",
+            Self::ColorFill => "塗りつぶし",
             Self::ColorOverlay => "塗り/グラデーション",
             Self::NeonGlow => "ネオングロー",
             Self::DiffuseGlow => "拡散光彩",
@@ -1240,6 +1243,9 @@ impl EffectKind {
             }
             Self::GradientMap => {
                 "明るさを指定したグラデーションの色へ置き換え、色設計や色トレス風に使います。"
+            }
+            Self::ColorFill => {
+                "マスク範囲を単色、線形グラデーション、円形グラデーションで塗りつぶします。"
             }
             Self::ColorOverlay => {
                 "単色やグラデーションの色面を、乗算・スクリーン・ソフトライトなどで重ねます。"
@@ -1374,6 +1380,10 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::OilPaint,
             EffectKind::Halftone,
         ],
+    },
+    EffectGroup {
+        title: "描画・塗り",
+        kinds: &[EffectKind::ColorFill],
     },
     EffectGroup {
         title: "隠蔽・加工",
@@ -7402,6 +7412,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 gradient_map_preset_label(params.preset)
             )
         }
+        LocalEffect::ColorFill(params) => format!(
+            "塗りつぶし {} {:.0}%",
+            color_overlay_shape_label(params.shape),
+            params.opacity * 100.0
+        ),
         LocalEffect::ColorOverlay(params) => format!(
             "塗り {} {:.0}%",
             color_overlay_blend_mode_label(params.blend_mode),
@@ -11510,6 +11525,149 @@ fn draw_effect_params(
             contrast_response
                 .lab_hover_tip("色を割り当てる前に、明るさの差を締めたり広げたりします。");
         }
+        LocalEffect::ColorFill(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "白背景") {
+                    *params = ColorFillParams {
+                        shape: ColorOverlayShape::Solid,
+                        start_rgb: [255, 255, 255],
+                        opacity: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "黒背景") {
+                    *params = ColorFillParams {
+                        shape: ColorOverlayShape::Solid,
+                        start_rgb: [18, 18, 20],
+                        opacity: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡色") {
+                    *params = ColorFillParams {
+                        shape: ColorOverlayShape::Solid,
+                        start_rgb: [246, 238, 224],
+                        opacity: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "青グラデ") {
+                    *params = ColorFillParams {
+                        shape: ColorOverlayShape::Linear,
+                        start_rgb: [232, 242, 255],
+                        end_rgb: [128, 170, 245],
+                        angle_degrees: -18.0,
+                        softness: 0.45,
+                        opacity: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "3色背景") {
+                    *params = ColorFillParams {
+                        shape: ColorOverlayShape::Radial,
+                        start_rgb: [255, 247, 230],
+                        middle_rgb: [255, 206, 222],
+                        end_rgb: [170, 195, 255],
+                        middle_enabled: true,
+                        midpoint: 0.48,
+                        center: [0.46, 0.34],
+                        radius: 0.92,
+                        softness: 0.70,
+                        opacity: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+            });
+            let before_shape = params.shape;
+            lab_combo_box(
+                ui,
+                "color_fill_shape",
+                color_overlay_shape_label(params.shape),
+                |ui| {
+                    for shape in [
+                        ColorOverlayShape::Solid,
+                        ColorOverlayShape::Linear,
+                        ColorOverlayShape::Radial,
+                    ] {
+                        ui.selectable_value(
+                            &mut params.shape,
+                            shape,
+                            color_overlay_shape_label(shape),
+                        );
+                    }
+                },
+            );
+            changed |= params.shape != before_shape;
+            ui.label(
+                egui::RichText::new(
+                    "マスク範囲の元画像RGBを、指定した色またはグラデーション色へ置き換えます。被写体切り抜きの背景作成や確認用に向きます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let color_label = if params.shape == ColorOverlayShape::Solid {
+                "塗り色"
+            } else {
+                "開始色"
+            };
+            changed |= draw_rgb_color_control(ui, color_label, &mut params.start_rgb);
+            if params.shape != ColorOverlayShape::Solid {
+                let middle = ui.checkbox(&mut params.middle_enabled, "中間色を使う");
+                changed |= middle.changed();
+                middle.lab_hover_tip(
+                    "ONにすると、開始色・中間色・終了色の3色グラデーションになります。",
+                );
+                if params.middle_enabled {
+                    changed |= draw_rgb_color_control(ui, "中間色", &mut params.middle_rgb);
+                    let midpoint = ui
+                        .add(egui::Slider::new(&mut params.midpoint, 0.01..=0.99).text("中間位置"));
+                    changed |= midpoint.changed();
+                    midpoint.lab_hover_tip("グラデーション内で中間色が出る位置です。");
+                }
+                changed |= draw_rgb_color_control(ui, "終了色", &mut params.end_rgb);
+            }
+            let opacity =
+                ui.add(egui::Slider::new(&mut params.opacity, 0.0..=1.0).text("不透明度"));
+            changed |= opacity.changed();
+            opacity.lab_hover_tip("元画像から塗りつぶし色へどれだけ置き換えるかです。");
+            if params.shape == ColorOverlayShape::Linear {
+                let angle = ui.add(
+                    egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                        .text("角度")
+                        .suffix("°"),
+                );
+                changed |= angle.changed();
+                angle.lab_hover_tip("線形グラデーションの方向です。0°で左から右へ色が変わります。");
+            }
+            if params.shape == ColorOverlayShape::Radial {
+                let center_x =
+                    ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
+                changed |= center_x.changed();
+                center_x.lab_hover_tip("円形グラデーション中心の横位置です。");
+                let center_y =
+                    ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心Y"));
+                changed |= center_y.changed();
+                center_y.lab_hover_tip("円形グラデーション中心の縦位置です。");
+                let radius = ui.add(egui::Slider::new(&mut params.radius, 0.02..=2.0).text("半径"));
+                changed |= radius.changed();
+                radius.lab_hover_tip(
+                    "中心色から終了色へ変わる範囲です。1.0で画像の正規化座標ほぼ全体を覆います。",
+                );
+            }
+            if params.shape != ColorOverlayShape::Solid {
+                let softness =
+                    ui.add(egui::Slider::new(&mut params.softness, 0.0..=1.0).text("なめらかさ"));
+                changed |= softness.changed();
+                softness
+                    .lab_hover_tip("グラデーションの変化を直線的にするか、なだらかにするかです。");
+            }
+        }
         LocalEffect::ColorOverlay(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -13438,6 +13596,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Duotone => LocalEffect::Duotone(DuotoneParams::default()),
         EffectKind::Equalize => LocalEffect::Equalize(EqualizeParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
+        EffectKind::ColorFill => LocalEffect::ColorFill(ColorFillParams::default()),
         EffectKind::ColorOverlay => LocalEffect::ColorOverlay(ColorOverlayParams::default()),
         EffectKind::NeonGlow => LocalEffect::NeonGlow(NeonGlowParams::default()),
         EffectKind::DiffuseGlow => LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
@@ -15250,6 +15409,7 @@ mod tests {
                 "シャープ・ディテール",
                 "変形・歪み",
                 "表現・絵画調",
+                "描画・塗り",
                 "隠蔽・加工",
                 "光・雰囲気",
             ]
@@ -15294,6 +15454,7 @@ mod tests {
             EffectKind::Solarize,
             EffectKind::GlowingEdges,
             EffectKind::OilPaint,
+            EffectKind::ColorFill,
             EffectKind::SoftFocus,
             EffectKind::Mosaic,
             EffectKind::Sharpen,
@@ -15308,7 +15469,6 @@ mod tests {
             EffectKind::Duotone,
             EffectKind::Equalize,
             EffectKind::GradientMap,
-            EffectKind::ColorOverlay,
             EffectKind::NeonGlow,
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
@@ -15316,6 +15476,7 @@ mod tests {
             EffectKind::FilmGrain,
             EffectKind::ChromaticAberration,
             EffectKind::Halftone,
+            EffectKind::ColorOverlay,
             EffectKind::StarGlow,
             EffectKind::EdgeSmooth,
             EffectKind::Median,

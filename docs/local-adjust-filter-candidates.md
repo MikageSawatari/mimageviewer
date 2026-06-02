@@ -25,7 +25,7 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 - `効果選択` ボタンで、画面中央のダイアログを開く。
 - ダイアログ右上の閉じるボタンでキャンセルできる。
 - ダイアログ内では、効果を「色調補正」「色変換・ルック」「ぼかし・フォーカス」
-  「シャープ・ディテール」「変形・歪み」「表現・絵画調」「光・雰囲気」などの
+  「シャープ・ディテール」「変形・歪み」「表現・絵画調」「描画・塗り」「光・雰囲気」などの
   グループに分け、ボタンとして並べる。
 - 効果ボタンをホバーすると、「明るい部分から光の線を十字などで描写する効果です」のように、
   何が起きるかを説明する。
@@ -48,14 +48,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、58種)
+### `LocalEffect` (部分補正レイヤー、59種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
+GradientMap, ColorFill, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -164,6 +164,7 @@ LightLeak / 減色8機種 / CRT 3種＋複合 / カラーグレード11種
 mIV は既に Subject(被写体分離) / Segmentation / LumaRange / ColorRange マスクを持つので、これらと組み合わせると差別化になる。
 
 - [ ] **縁取り / アウトラインストローク** ★★ **中** — Subject マスクの外周に色枠を生成 (ステッカー風/キャラ分離)。既存 seg マスクをそのまま活用
+- [x] **マスク塗りつぶし / 背景塗り (`ColorFill`)** ★★ **易** — マスク範囲を単色、線形2〜3色、円形2〜3色グラデーションで置き換える。被写体切り抜き背景や確認用の単純な色面作成に使う
 - [ ] **色トレス (線画の色を下地に馴染ませる)** ★ **中** — アニメ塗りの定番処理
 - [ ] **空気感 / 逆光合成** **易〜中** — gradient overlay + glow + マスクの複合プリセット
 
