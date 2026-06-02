@@ -18,21 +18,21 @@ use local_adjust_core::{
     ArtisticMediaMode, ArtisticMediaParams, BloomParams, BlurParams, BrushStrokeMode,
     BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
     ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
-    CubeLutParams, DehazeParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
-    EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
-    GradientMapParams, GradientMapPreset, HalftoneParams, HighPassParams, HighlightsShadowsParams,
-    HslParams, InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams,
-    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer,
-    LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams,
-    MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, PinchSpherizeParams,
-    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
-    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
-    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams,
-    SmartSharpenParams, SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams,
-    ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams,
-    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
-    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    evaluate_layer_mask, parse_cube_lut,
+    CubeLutParams, CutoutParams, DehazeParams, DiffuseGlowParams, DuotoneParams, DuotonePreset,
+    EdgeSmoothParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
+    GlassDisplacementParams, GradientMapParams, GradientMapPreset, HalftoneParams, HighPassParams,
+    HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
+    LensCorrectionParams, LineExtractMode, LineExtractParams, LineKind, LinearGradientMask,
+    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
+    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
+    PinchSpherizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
+    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
+    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
+    SharpenParams, SmartSharpenParams, SoftFocusParams, StarGlowParams, TextureParams,
+    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
+    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
+    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
+    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -985,6 +985,7 @@ enum EffectKind {
     LineExtract,
     ArtisticMedia,
     BrushStroke,
+    Cutout,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1041,6 +1042,7 @@ impl EffectKind {
             LocalEffect::LineExtract(_) => Self::LineExtract,
             LocalEffect::ArtisticMedia(_) => Self::ArtisticMedia,
             LocalEffect::BrushStroke(_) => Self::BrushStroke,
+            LocalEffect::Cutout(_) => Self::Cutout,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1097,6 +1099,7 @@ impl EffectKind {
             Self::LineExtract => "線画抽出",
             Self::ArtisticMedia => "水彩/鉛筆",
             Self::BrushStroke => "ドライブラシ/塗料",
+            Self::Cutout => "切り絵",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1180,6 +1183,9 @@ impl EffectKind {
             Self::ArtisticMedia => "水彩、色鉛筆、鉛筆画の質感で、写真や3D素材を絵画調に寄せます。",
             Self::BrushStroke => {
                 "方向のある筆跡で、ドライブラシ、厚塗り、パレットナイフ風の質感を作ります。"
+            }
+            Self::Cutout => {
+                "色面をなじませて階調を減らし、切り絵やフラットなベクター調の見た目にします。"
             }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
@@ -1322,6 +1328,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::LineExtract,
             EffectKind::ArtisticMedia,
             EffectKind::BrushStroke,
+            EffectKind::Cutout,
             EffectKind::Halftone,
         ],
     },
@@ -5155,7 +5162,7 @@ impl LocalAdjustLabApp {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
             .resizable(true)
-            .default_width(520.0)
+            .default_width(720.0)
             .default_height(520.0)
             .open(&mut open)
             .show(ctx, |ui| {
@@ -7285,6 +7292,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
             };
             format!("筆致 {mode}")
         }
+        LocalEffect::Cutout(params) => format!("切り絵 {}段", params.levels),
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -10020,6 +10028,80 @@ fn draw_effect_params(
             seed_response.lab_hover_tip("筆致テクスチャのパターンを変えます。");
             params.seed = seed.max(0) as u32;
         }
+        LocalEffect::Cutout(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "フラット") {
+                    *params = CutoutParams {
+                        levels: 5,
+                        radius_px: 6.0,
+                        edge_strength: 0.22,
+                        color_amount: 0.9,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ポスター") {
+                    *params = CutoutParams {
+                        levels: 4,
+                        radius_px: 3.0,
+                        edge_strength: 0.12,
+                        color_amount: 1.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "柔らかめ") {
+                    *params = CutoutParams {
+                        levels: 6,
+                        radius_px: 10.0,
+                        edge_strength: 0.08,
+                        color_amount: 0.75,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "輪郭強め") {
+                    *params = CutoutParams {
+                        levels: 5,
+                        radius_px: 5.0,
+                        edge_strength: 0.55,
+                        color_amount: 0.85,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "色面をなじませて階調を減らし、切り絵やフラットなベクター調に寄せます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let mut levels = params.levels as i32;
+            let levels_response = ui.add(egui::Slider::new(&mut levels, 2..=12).text("階調"));
+            changed |= levels_response.changed();
+            levels_response.lab_hover_tip("色面の明るさを何段階にまとめるかです。");
+            params.levels = levels.clamp(2, 12) as u8;
+            let radius = ui.add(
+                egui::Slider::new(&mut params.radius_px, 0.0..=24.0)
+                    .text("面のなじませ")
+                    .suffix("px"),
+            );
+            changed |= radius.changed();
+            radius
+                .lab_hover_tip("階調化の前に色をなじませる量です。大きいほど大きな面になります。");
+            let edge = ui.add(egui::Slider::new(&mut params.edge_strength, 0.0..=1.0).text("輪郭"));
+            changed |= edge.changed();
+            edge.lab_hover_tip("面の境界や元画像のエッジをどれだけ締めるかです。");
+            let color = ui.add(egui::Slider::new(&mut params.color_amount, 0.0..=1.0).text("色量"));
+            changed |= color.changed();
+            color.lab_hover_tip("元の色の鮮やかさをどれだけ残すかです。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から切り絵結果へどれだけ近づけるかです。");
+        }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -12475,6 +12557,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::LineExtract => LocalEffect::LineExtract(LineExtractParams::default()),
         EffectKind::ArtisticMedia => LocalEffect::ArtisticMedia(ArtisticMediaParams::default()),
         EffectKind::BrushStroke => LocalEffect::BrushStroke(BrushStrokeParams::default()),
+        EffectKind::Cutout => LocalEffect::Cutout(CutoutParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
@@ -14337,6 +14420,7 @@ mod tests {
             EffectKind::LineExtract,
             EffectKind::ArtisticMedia,
             EffectKind::BrushStroke,
+            EffectKind::Cutout,
             EffectKind::SoftFocus,
             EffectKind::Mosaic,
             EffectKind::Sharpen,

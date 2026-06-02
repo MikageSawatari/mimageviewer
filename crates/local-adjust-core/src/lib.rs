@@ -439,6 +439,7 @@ pub enum LocalEffect {
     LineExtract(LineExtractParams),
     ArtisticMedia(ArtisticMediaParams),
     BrushStroke(BrushStrokeParams),
+    Cutout(CutoutParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -495,6 +496,7 @@ impl LocalEffect {
             Self::LineExtract(_) => "線画抽出",
             Self::ArtisticMedia(_) => "絵画調",
             Self::BrushStroke(_) => "筆致",
+            Self::Cutout(_) => "切り絵",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -1266,6 +1268,27 @@ impl Default for BrushStrokeParams {
             color_amount: 0.85,
             strength: 0.0,
             seed: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CutoutParams {
+    pub levels: u8,
+    pub radius_px: f32,
+    pub edge_strength: f32,
+    pub color_amount: f32,
+    pub strength: f32,
+}
+
+impl Default for CutoutParams {
+    fn default() -> Self {
+        Self {
+            levels: 5,
+            radius_px: 6.0,
+            edge_strength: 0.25,
+            color_amount: 0.85,
+            strength: 0.0,
         }
     }
 }
@@ -2071,6 +2094,9 @@ where
         }
         LocalEffect::BrushStroke(params) => {
             apply_brush_stroke(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::Cutout(params) => {
+            apply_cutout(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -4334,6 +4360,54 @@ fn brush_stroke_palette_knife(
         *c = quantize_unit((contrast + ridge).clamp(0.0, 1.0), 10.0);
     }
     color
+}
+
+fn apply_cutout(src: &[u8], width: usize, height: usize, params: CutoutParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let levels = params.levels.clamp(2, 12) as f32;
+    let radius = params.radius_px.round().clamp(0.0, 32.0) as usize;
+    let edge_strength = params.edge_strength.clamp(0.0, 1.0);
+    let color_amount = params.color_amount.clamp(0.0, 1.0);
+    let smooth = if radius == 0 {
+        src.to_vec()
+    } else {
+        box_blur_rgba(src, width, height, radius)
+    };
+
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let soft = [
+                smooth[i] as f32 / 255.0,
+                smooth[i + 1] as f32 / 255.0,
+                smooth[i + 2] as f32 / 255.0,
+            ];
+            let (h, s, l) = rgb_to_hsl(soft[0], soft[1], soft[2]);
+            let l = quantize_unit(l, levels);
+            let sat_levels = (levels * 0.7 + 2.0).clamp(3.0, 10.0);
+            let s = quantize_unit(s * (0.65 + color_amount * 0.55), sat_levels).clamp(0.0, 1.0);
+            let hue_steps = (levels * 4.0).clamp(8.0, 36.0);
+            let h = if s <= 0.035 {
+                h
+            } else {
+                ((h * hue_steps).round() / hue_steps).rem_euclid(1.0)
+            };
+            let mut target = hsl_to_rgb(h, s, l);
+            target = adjust_saturation(target, 0.8 + color_amount * 0.35);
+
+            let edge = luma_edge_strength(src, width, height, x, y);
+            let edge_darken = edge * edge_strength * 0.58;
+            for c in 0..3 {
+                target[c] = (target[c] * (1.0 - edge_darken)).clamp(0.0, 1.0);
+                out[i + c] = lerp_u8(src[i + c], to_u8(target[c]), strength);
+            }
+        }
+    }
+    out
 }
 
 fn farthest_corner_distance(width: usize, height: usize, cx: f32, cy: f32) -> f32 {
@@ -6954,6 +7028,81 @@ mod tests {
     }
 
     #[test]
+    fn cutout_reduces_luminance_levels_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                20, 20, 20, 55, 80, 80, 80, 66, 140, 140, 140, 77, 200, 200, 200, 88, 250, 250,
+                250, 99,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "cutout",
+            LocalMask::Full,
+            LocalEffect::Cutout(CutoutParams {
+                levels: 3,
+                radius_px: 0.0,
+                edge_strength: 0.0,
+                color_amount: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let mut values: Vec<u8> = out.pixels.chunks_exact(4).map(|px| px[0]).collect();
+        values.sort_unstable();
+        values.dedup();
+        assert!(values.len() <= 3);
+        assert_eq!(out.pixels[3], 55);
+        assert_eq!(out.pixels[19], 99);
+    }
+
+    #[test]
+    fn cutout_radius_smooths_before_quantizing() {
+        let src =
+            RgbaImageBuf::new(3, 1, vec![0, 0, 0, 201, 255, 255, 255, 202, 0, 0, 0, 203]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "cutout",
+            LocalMask::Full,
+            LocalEffect::Cutout(CutoutParams {
+                levels: 3,
+                radius_px: 1.0,
+                edge_strength: 0.0,
+                color_amount: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[4] < src.pixels[4]);
+        assert!(out.pixels[4] > src.pixels[0]);
+        assert_eq!(out.pixels[7], 202);
+    }
+
+    #[test]
+    fn cutout_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "cutout",
+            LocalMask::Full,
+            LocalEffect::Cutout(CutoutParams {
+                levels: 3,
+                radius_px: 12.0,
+                edge_strength: 1.0,
+                color_amount: 1.0,
+                strength: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn median_removes_isolated_speckle_and_preserves_alpha() {
         let mut pixels = vec![0_u8; 3 * 3 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -7243,6 +7392,7 @@ mod tests {
             LocalEffect::LineExtract(LineExtractParams::default()),
             LocalEffect::ArtisticMedia(ArtisticMediaParams::default()),
             LocalEffect::BrushStroke(BrushStrokeParams::default()),
+            LocalEffect::Cutout(CutoutParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),
