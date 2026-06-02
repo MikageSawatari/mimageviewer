@@ -20,20 +20,20 @@ use local_adjust_core::{
     ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
     CubeLutParams, CutoutParams, DehazeParams, DiffuseGlowParams, DuotoneParams, DuotonePreset,
     EdgeSmoothParams, EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
-    GlassDisplacementParams, GradientMapParams, GradientMapPreset, HalftoneParams, HighPassParams,
-    HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
-    LensCorrectionParams, LineExtractMode, LineExtractParams, LineKind, LinearGradientMask,
-    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
-    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
-    PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
-    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
-    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
-    RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, SolarizeParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams,
-    ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams,
-    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
-    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    evaluate_layer_mask, parse_cube_lut,
+    GlassDisplacementParams, GlowingEdgesParams, GradientMapParams, GradientMapPreset,
+    HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams, InvertParams,
+    LensBlurAperture, LensBlurParams, LensCorrectionParams, LineExtractMode, LineExtractParams,
+    LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
+    LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
+    MosaicTileMode, MotionBlurParams, PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams,
+    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
+    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
+    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams,
+    SmartSharpenParams, SoftFocusParams, SolarizeParams, StarGlowParams, TextureParams,
+    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
+    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
+    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
+    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -990,6 +990,7 @@ enum EffectKind {
     Emboss,
     PixelStylize,
     Solarize,
+    GlowingEdges,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1050,6 +1051,7 @@ impl EffectKind {
             LocalEffect::Emboss(_) => Self::Emboss,
             LocalEffect::PixelStylize(_) => Self::PixelStylize,
             LocalEffect::Solarize(_) => Self::Solarize,
+            LocalEffect::GlowingEdges(_) => Self::GlowingEdges,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1110,6 +1112,7 @@ impl EffectKind {
             Self::Emboss => "エンボス",
             Self::PixelStylize => "粒状スタイル",
             Self::Solarize => "ソラリゼーション",
+            Self::GlowingEdges => "エッジ光彩",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1200,6 +1203,9 @@ impl EffectKind {
             Self::Emboss => "明るさの傾きから陰影を作り、紙や金属の浮き彫りのような質感にします。",
             Self::PixelStylize => "結晶化、点描、Facet、メゾチントの粒状スタイライズを作ります。",
             Self::Solarize => "明るい部分を反転させ、写真暗室風のトーン反転や特殊色を作ります。",
+            Self::GlowingEdges => {
+                "輪郭を抽出してネオン色で光らせ、黒背景や元画像上の発光線を作ります。"
+            }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
@@ -1345,6 +1351,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Emboss,
             EffectKind::PixelStylize,
             EffectKind::Solarize,
+            EffectKind::GlowingEdges,
             EffectKind::Halftone,
         ],
     },
@@ -7322,6 +7329,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::Solarize(params) => {
             format!("ソラリゼーション {:.0}%", params.threshold * 100.0)
         }
+        LocalEffect::GlowingEdges(params) => {
+            format!("エッジ光彩 {:.0}px", params.glow_radius_px)
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -10391,6 +10401,137 @@ fn draw_effect_params(
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からソラリゼーション結果へどれだけ近づけるかです。");
         }
+        LocalEffect::GlowingEdges(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "シアン") {
+                    *params = GlowingEdgesParams {
+                        threshold: 0.18,
+                        softness: 0.10,
+                        edge_width_px: 1.0,
+                        glow_radius_px: 8.0,
+                        edge_brightness: 1.20,
+                        glow_strength: 0.90,
+                        hue_degrees: 190.0,
+                        color_amount: 0.90,
+                        background_amount: 0.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "紫ネオン") {
+                    *params = GlowingEdgesParams {
+                        threshold: 0.15,
+                        softness: 0.12,
+                        edge_width_px: 2.0,
+                        glow_radius_px: 12.0,
+                        edge_brightness: 1.25,
+                        glow_strength: 1.05,
+                        hue_degrees: 285.0,
+                        color_amount: 0.95,
+                        background_amount: 0.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "元画像") {
+                    *params = GlowingEdgesParams {
+                        threshold: 0.20,
+                        softness: 0.12,
+                        edge_width_px: 1.0,
+                        glow_radius_px: 7.0,
+                        edge_brightness: 0.95,
+                        glow_strength: 0.75,
+                        hue_degrees: 200.0,
+                        color_amount: 0.65,
+                        background_amount: 0.65,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "細線") {
+                    *params = GlowingEdgesParams {
+                        threshold: 0.28,
+                        softness: 0.04,
+                        edge_width_px: 1.0,
+                        glow_radius_px: 3.0,
+                        edge_brightness: 1.55,
+                        glow_strength: 0.35,
+                        hue_degrees: 145.0,
+                        color_amount: 1.0,
+                        background_amount: 0.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "明るさの輪郭を抽出し、黒背景または元画像上にネオン色の線と光彩を重ねます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let threshold =
+                ui.add(egui::Slider::new(&mut params.threshold, 0.0..=1.0).text("しきい値"));
+            changed |= threshold.changed();
+            threshold.lab_hover_tip("光らせる輪郭の強さです。上げるほど強い輪郭だけが残ります。");
+            let softness =
+                ui.add(egui::Slider::new(&mut params.softness, 0.0..=0.5).text("柔らかさ"));
+            changed |= softness.changed();
+            softness.lab_hover_tip("しきい値付近の輪郭をどれだけなだらかに出すかです。");
+            let edge_width = ui.add(
+                egui::Slider::new(&mut params.edge_width_px, 1.0..=12.0)
+                    .text("線幅")
+                    .suffix("px"),
+            );
+            changed |= edge_width.changed();
+            edge_width.lab_hover_tip("抽出した輪郭を広げる幅です。");
+            let glow_radius = ui.add(
+                egui::Slider::new(&mut params.glow_radius_px, 0.0..=80.0)
+                    .text("光彩半径")
+                    .suffix("px"),
+            );
+            changed |= glow_radius.changed();
+            glow_radius.lab_hover_tip("輪郭の周囲へ広げる発光の大きさです。");
+            let edge_brightness = ui
+                .add(egui::Slider::new(&mut params.edge_brightness, 0.0..=3.0).text("線の明るさ"));
+            changed |= edge_brightness.changed();
+            edge_brightness.lab_hover_tip("輪郭線そのものの明るさです。");
+            let glow_strength =
+                ui.add(egui::Slider::new(&mut params.glow_strength, 0.0..=3.0).text("光彩"));
+            changed |= glow_strength.changed();
+            glow_strength.lab_hover_tip("ぼかした発光をどれだけ加えるかです。");
+            ui.horizontal_wrapped(|ui| {
+                let swatch = hsl_swatch_color(params.hue_degrees, 1.0, 0.55);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), Sense::hover());
+                ui.painter().rect_filled(rect, 4.0, swatch);
+                ui.painter().rect_stroke(
+                    rect,
+                    4.0,
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
+                    egui::StrokeKind::Inside,
+                );
+                let hue = ui.add(
+                    egui::Slider::new(&mut params.hue_degrees, 0.0..=360.0)
+                        .text("色相")
+                        .suffix("°"),
+                );
+                changed |= hue.changed();
+                hue.lab_hover_tip("ネオン色の色相です。");
+            });
+            let color = ui.add(egui::Slider::new(&mut params.color_amount, 0.0..=1.0).text("色量"));
+            changed |= color.changed();
+            color.lab_hover_tip("0では元画像の輪郭色、上げると指定したネオン色へ寄せます。");
+            let background = ui.add(
+                egui::Slider::new(&mut params.background_amount, 0.0..=1.0).text("背景を残す"),
+            );
+            changed |= background.changed();
+            background.lab_hover_tip("0では黒背景、上げると元画像を背景として残します。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からエッジ光彩結果へどれだけ近づけるかです。");
+        }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -12850,6 +12991,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Emboss => LocalEffect::Emboss(EmbossParams::default()),
         EffectKind::PixelStylize => LocalEffect::PixelStylize(PixelStylizeParams::default()),
         EffectKind::Solarize => LocalEffect::Solarize(SolarizeParams::default()),
+        EffectKind::GlowingEdges => LocalEffect::GlowingEdges(GlowingEdgesParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
@@ -14716,6 +14858,7 @@ mod tests {
             EffectKind::Emboss,
             EffectKind::PixelStylize,
             EffectKind::Solarize,
+            EffectKind::GlowingEdges,
             EffectKind::SoftFocus,
             EffectKind::Mosaic,
             EffectKind::Sharpen,

@@ -443,6 +443,7 @@ pub enum LocalEffect {
     Emboss(EmbossParams),
     PixelStylize(PixelStylizeParams),
     Solarize(SolarizeParams),
+    GlowingEdges(GlowingEdgesParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -503,6 +504,7 @@ impl LocalEffect {
             Self::Emboss(_) => "エンボス",
             Self::PixelStylize(_) => "粒状スタイル",
             Self::Solarize(_) => "ソラリゼーション",
+            Self::GlowingEdges(_) => "エッジ光彩",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -1379,6 +1381,37 @@ impl Default for SolarizeParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GlowingEdgesParams {
+    pub threshold: f32,
+    pub softness: f32,
+    pub edge_width_px: f32,
+    pub glow_radius_px: f32,
+    pub edge_brightness: f32,
+    pub glow_strength: f32,
+    pub hue_degrees: f32,
+    pub color_amount: f32,
+    pub background_amount: f32,
+    pub strength: f32,
+}
+
+impl Default for GlowingEdgesParams {
+    fn default() -> Self {
+        Self {
+            threshold: 0.18,
+            softness: 0.10,
+            edge_width_px: 1.0,
+            glow_radius_px: 8.0,
+            edge_brightness: 1.15,
+            glow_strength: 0.85,
+            hue_degrees: 190.0,
+            color_amount: 0.85,
+            background_amount: 0.0,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SoftFocusParams {
     pub radius_px: f32,
     pub strength: f32,
@@ -2190,6 +2223,9 @@ where
             apply_pixel_stylize(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::Solarize(params) => apply_solarize(&image.pixels, *params),
+        LocalEffect::GlowingEdges(params) => {
+            apply_glowing_edges(&image.pixels, image.width, image.height, *params)
+        }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
             image.width,
@@ -4071,6 +4107,109 @@ fn line_extract_max_edge(
         }
     }
     best
+}
+
+fn apply_glowing_edges(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: GlowingEdgesParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let threshold = params.threshold.clamp(0.0, 1.0);
+    let softness = params.softness.clamp(0.0, 1.0);
+    let edge_radius = params.edge_width_px.round().clamp(1.0, 12.0) as usize - 1;
+    let glow_radius = params.glow_radius_px.round().clamp(0.0, 120.0) as usize;
+    let edge_brightness = params.edge_brightness.clamp(0.0, 3.0);
+    let glow_strength = params.glow_strength.clamp(0.0, 3.0);
+    let color_amount = params.color_amount.clamp(0.0, 1.0);
+    let background_amount = params.background_amount.clamp(0.0, 1.0);
+    let neon = hsl_to_rgb((params.hue_degrees / 360.0).rem_euclid(1.0), 1.0, 0.55);
+
+    let luma = src
+        .chunks_exact(4)
+        .map(|px| {
+            let alpha = px[3] as f32 / 255.0;
+            luma01(
+                px[0] as f32 / 255.0,
+                px[1] as f32 / 255.0,
+                px[2] as f32 / 255.0,
+            ) * alpha
+        })
+        .collect::<Vec<_>>();
+
+    let mut edges = vec![0.0_f32; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            edges[y * width + x] = line_extract_sobel_edge(&luma, width, height, x, y);
+        }
+    }
+
+    let mut edge_plate = vec![0_u8; src.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let edge = if edge_radius == 0 {
+                edges[y * width + x]
+            } else {
+                line_extract_max_edge(&edges, width, height, x, y, edge_radius)
+            };
+            let edge_alpha = glowing_edges_gate(edge, threshold, softness);
+            let i = (y * width + x) * 4;
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let source_color = adjust_saturation(base, 1.25);
+            let edge_color = [
+                lerp_f32(source_color[0], neon[0], color_amount),
+                lerp_f32(source_color[1], neon[1], color_amount),
+                lerp_f32(source_color[2], neon[2], color_amount),
+            ];
+            for c in 0..3 {
+                edge_plate[i + c] = to_u8(edge_color[c] * edge_alpha * edge_brightness);
+            }
+            edge_plate[i + 3] = src[i + 3];
+        }
+    }
+
+    let glow = if glow_radius > 0 && glow_strength > f32::EPSILON {
+        Some(box_blur_rgba(&edge_plate, width, height, glow_radius))
+    } else {
+        None
+    };
+
+    let mut out = src.to_vec();
+    for i in (0..src.len()).step_by(4) {
+        let base = [
+            src[i] as f32 / 255.0,
+            src[i + 1] as f32 / 255.0,
+            src[i + 2] as f32 / 255.0,
+        ];
+        for c in 0..3 {
+            let background = base[c] * background_amount;
+            let core = edge_plate[i + c] as f32 / 255.0;
+            let glow_add = glow
+                .as_ref()
+                .map(|glow| glow[i + c] as f32 / 255.0 * glow_strength)
+                .unwrap_or(0.0);
+            let light = (core + glow_add).clamp(0.0, 1.0);
+            let target = 1.0 - (1.0 - background) * (1.0 - light);
+            out[i + c] = to_u8(lerp_f32(base[c], target, strength));
+        }
+    }
+    out
+}
+
+fn glowing_edges_gate(edge: f32, threshold: f32, softness: f32) -> f32 {
+    if softness <= f32::EPSILON {
+        if edge >= threshold { 1.0 } else { 0.0 }
+    } else {
+        smoothstep(threshold, (threshold + softness).min(1.0), edge)
+    }
 }
 
 fn apply_artistic_media(
@@ -8097,6 +8236,7 @@ mod tests {
             LocalEffect::Emboss(EmbossParams::default()),
             LocalEffect::PixelStylize(PixelStylizeParams::default()),
             LocalEffect::Solarize(SolarizeParams::default()),
+            LocalEffect::GlowingEdges(GlowingEdgesParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),
@@ -8651,6 +8791,89 @@ LUT_3D_SIZE 2
         assert_eq!(out.pixels[0], out.pixels[1]);
         assert_eq!(out.pixels[1], out.pixels[2]);
         assert_eq!(out.pixels[3], 99);
+    }
+
+    #[test]
+    fn glowing_edges_draws_colored_edges_and_preserves_alpha() {
+        let src =
+            RgbaImageBuf::new(3, 1, vec![0, 0, 0, 55, 255, 255, 255, 66, 0, 0, 0, 77]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "glowing edges",
+            LocalMask::Full,
+            LocalEffect::GlowingEdges(GlowingEdgesParams {
+                threshold: 0.1,
+                softness: 0.0,
+                edge_width_px: 1.0,
+                glow_radius_px: 0.0,
+                edge_brightness: 1.0,
+                glow_strength: 0.0,
+                hue_degrees: 180.0,
+                color_amount: 1.0,
+                background_amount: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[1] > out.pixels[0]);
+        assert!(out.pixels[2] > out.pixels[0]);
+        assert_eq!(&out.pixels[4..7], &[0, 0, 0]);
+        assert!(out.pixels[9] > out.pixels[8]);
+        assert!(out.pixels[10] > out.pixels[8]);
+        assert_eq!(out.pixels[3], 55);
+        assert_eq!(out.pixels[11], 77);
+    }
+
+    #[test]
+    fn glowing_edges_radius_spreads_light_to_neighbor() {
+        let src =
+            RgbaImageBuf::new(3, 1, vec![0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "glowing edges",
+            LocalMask::Full,
+            LocalEffect::GlowingEdges(GlowingEdgesParams {
+                threshold: 0.5,
+                softness: 0.0,
+                edge_width_px: 1.0,
+                glow_radius_px: 1.0,
+                edge_brightness: 1.0,
+                glow_strength: 1.0,
+                hue_degrees: 180.0,
+                color_amount: 1.0,
+                background_amount: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[5] > 0, "green glow should reach center pixel");
+        assert!(out.pixels[6] > 0, "blue glow should reach center pixel");
+    }
+
+    #[test]
+    fn glowing_edges_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "glowing edges",
+            LocalMask::Full,
+            LocalEffect::GlowingEdges(GlowingEdgesParams {
+                threshold: 0.0,
+                softness: 0.0,
+                edge_width_px: 12.0,
+                glow_radius_px: 24.0,
+                edge_brightness: 3.0,
+                glow_strength: 3.0,
+                hue_degrees: 300.0,
+                color_amount: 1.0,
+                background_amount: 0.0,
+                strength: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
     }
 
     #[test]
