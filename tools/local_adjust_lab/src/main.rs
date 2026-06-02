@@ -51,6 +51,9 @@ const PANEL_MARGIN_X: f32 = 16.0;
 const PANEL_MARGIN_Y: f32 = 60.0;
 const PANEL_BOTTOM_MARGIN: f32 = 20.0;
 const PANEL_MIN_BODY_H: f32 = 160.0;
+const EFFECT_PICKER_BUTTON_MIN_W: f32 = 146.0;
+const EFFECT_PICKER_BUTTON_MAX_W: f32 = 172.0;
+const EFFECT_PICKER_BUTTON_H: f32 = 34.0;
 const ZOOM_MIN: f32 = 0.05;
 const ZOOM_MAX: f32 = 12.0;
 const NUDGE_PIXELS: f32 = 1.0;
@@ -1283,6 +1286,16 @@ impl EffectKind {
             Self::EdgeSmooth => "エッジ保持ぼかし",
             Self::Despeckle => "ディスペックル",
             Self::Median => "メディアン",
+        }
+    }
+
+    fn picker_label(self) -> &'static str {
+        match self {
+            Self::ThreeWayColorGrading => "3-wayカラー",
+            Self::HighlightsShadows => "ハイライト/影",
+            Self::Equalize => "ヒスト平坦化",
+            Self::AnamorphicFlare => "アナモルフフレア",
+            _ => self.label(),
         }
     }
 
@@ -5749,11 +5762,11 @@ impl LocalAdjustLabApp {
         egui::Window::new("効果選択")
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_pos(ctx.content_rect().min + egui::vec2(80.0, 50.0))
             .collapsible(false)
             .resizable(true)
-            .default_width(720.0)
-            .default_height(520.0)
+            .default_size(egui::vec2(860.0, 560.0))
+            .min_size(egui::vec2(560.0, 360.0))
             .open(&mut open)
             .show(ctx, |ui| {
                 apply_lab_dark_ui(ui);
@@ -5765,8 +5778,9 @@ impl LocalAdjustLabApp {
                     .color(Color32::from_gray(180)),
                 );
                 ui.separator();
+                let picker_body_height = ui.available_height().clamp(240.0, 680.0);
                 egui::ScrollArea::vertical()
-                    .max_height(440.0)
+                    .max_height(picker_body_height)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for group in EFFECT_GROUPS {
@@ -5776,6 +5790,7 @@ impl LocalAdjustLabApp {
                                     .strong()
                                     .color(Color32::WHITE),
                             );
+                            let button_width = effect_picker_button_width(ui.available_width());
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                                 for &kind in group.kinds {
@@ -5787,8 +5802,12 @@ impl LocalAdjustLabApp {
                                     };
                                     let response = ui
                                         .add_sized(
-                                            egui::vec2(130.0, 28.0),
-                                            egui::Button::new(kind.label()).fill(fill),
+                                            egui::vec2(button_width, EFFECT_PICKER_BUTTON_H),
+                                            egui::Button::new(
+                                                egui::RichText::new(kind.picker_label()).size(11.0),
+                                            )
+                                            .fill(fill)
+                                            .wrap(),
                                         )
                                         .lab_hover_tip(kind.description());
                                     if response.clicked() {
@@ -18994,6 +19013,16 @@ fn mask_preview_active(adjust_panel_active: bool, show_mask: bool, alt_down: boo
     adjust_panel_active && (show_mask != alt_down)
 }
 
+fn effect_picker_button_width(available_width: f32) -> f32 {
+    let spacing = 6.0;
+    let available_width = available_width.max(EFFECT_PICKER_BUTTON_MIN_W);
+    let columns = ((available_width + spacing) / (EFFECT_PICKER_BUTTON_MIN_W + spacing))
+        .floor()
+        .clamp(1.0, 5.0);
+    ((available_width - spacing * (columns - 1.0)) / columns)
+        .clamp(EFFECT_PICKER_BUTTON_MIN_W, EFFECT_PICKER_BUTTON_MAX_W)
+}
+
 #[derive(Clone, Copy)]
 struct GradientHandleVisuals {
     stroke: egui::Stroke,
@@ -19577,6 +19606,41 @@ mod tests {
             let count = grouped.iter().filter(|&&item| item == kind).count();
             assert_eq!(count, 1, "effect group count for {}", kind.label());
         }
+    }
+
+    #[test]
+    fn effect_picker_shortens_long_button_labels() {
+        assert_eq!(
+            EffectKind::ThreeWayColorGrading.picker_label(),
+            "3-wayカラー"
+        );
+        assert_eq!(
+            EffectKind::HighlightsShadows.picker_label(),
+            "ハイライト/影"
+        );
+        assert_eq!(EffectKind::Equalize.picker_label(), "ヒスト平坦化");
+        assert_eq!(
+            EffectKind::AnamorphicFlare.picker_label(),
+            "アナモルフフレア"
+        );
+        for kind in [
+            EffectKind::ThreeWayColorGrading,
+            EffectKind::HighlightsShadows,
+            EffectKind::Equalize,
+            EffectKind::AnamorphicFlare,
+        ] {
+            assert!(kind.picker_label().chars().count() <= 10);
+        }
+    }
+
+    #[test]
+    fn effect_picker_button_width_is_bounded_and_responsive() {
+        for available_width in [320.0, 520.0, 720.0, 860.0, 1200.0] {
+            let width = effect_picker_button_width(available_width);
+            assert!(width >= EFFECT_PICKER_BUTTON_MIN_W);
+            assert!(width <= EFFECT_PICKER_BUTTON_MAX_W);
+        }
+        assert!(effect_picker_button_width(860.0) > effect_picker_button_width(320.0));
     }
 
     #[test]
