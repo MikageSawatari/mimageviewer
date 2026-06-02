@@ -600,6 +600,7 @@ pub enum LocalEffect {
     Noise(NoiseParams),
     ChromaticAberration(ChromaticAberrationParams),
     ScanlineGlitch(ScanlineGlitchParams),
+    Vhs(VhsParams),
     Halftone(HalftoneParams),
     ScreenTone(ScreenToneParams),
     ColorHalftone(ColorHalftoneParams),
@@ -688,6 +689,7 @@ impl LocalEffect {
             Self::Noise(_) => "ノイズ",
             Self::ChromaticAberration(_) => "色収差",
             Self::ScanlineGlitch(_) => "走査線グリッチ",
+            Self::Vhs(_) => "VHS/アナログビデオ",
             Self::Halftone(_) => "ハーフトーン",
             Self::ScreenTone(_) => "スクリーントーン",
             Self::ColorHalftone(_) => "カラーハーフトーン",
@@ -2906,6 +2908,37 @@ impl Default for ScanlineGlitchParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VhsParams {
+    pub chroma_bleed_px: f32,
+    pub chroma_shift_px: f32,
+    pub ghost_offset_px: f32,
+    pub ghost_strength: f32,
+    pub tracking_strength: f32,
+    pub scanline_strength: f32,
+    pub noise: f32,
+    pub desaturation: f32,
+    pub seed: u32,
+    pub strength: f32,
+}
+
+impl Default for VhsParams {
+    fn default() -> Self {
+        Self {
+            chroma_bleed_px: 4.0,
+            chroma_shift_px: 0.0,
+            ghost_offset_px: 0.0,
+            ghost_strength: 0.0,
+            tracking_strength: 0.0,
+            scanline_strength: 0.0,
+            noise: 0.0,
+            desaturation: 0.0,
+            seed: 1,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HalftoneParams {
     pub cell_px: u32,
     pub strength: f32,
@@ -3582,6 +3615,9 @@ where
             ),
             LocalEffect::ScanlineGlitch(params) => {
                 apply_scanline_glitch(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Vhs(params) => {
+                apply_vhs(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::Halftone(params) => {
                 apply_halftone(&image.pixels, image.width, image.height, *params)
@@ -9757,6 +9793,248 @@ fn sample_scanline_glitch_channel(
     }
 }
 
+fn apply_vhs(src: &[u8], width: usize, height: usize, params: VhsParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let chroma_bleed_px = params.chroma_bleed_px.clamp(0.0, 32.0);
+    let chroma_shift_px = params.chroma_shift_px.clamp(-24.0, 24.0);
+    let ghost_offset_px = params.ghost_offset_px.clamp(0.0, 64.0);
+    let ghost_strength = params.ghost_strength.clamp(0.0, 1.0);
+    let tracking_strength = params.tracking_strength.clamp(0.0, 1.0);
+    let scanline_strength = params.scanline_strength.clamp(0.0, 1.0);
+    let noise = params.noise.clamp(0.0, 1.0);
+    let desaturation = params.desaturation.clamp(0.0, 1.0);
+    if chroma_bleed_px <= f32::EPSILON
+        && chroma_shift_px.abs() <= f32::EPSILON
+        && ghost_offset_px <= f32::EPSILON
+        && ghost_strength <= f32::EPSILON
+        && tracking_strength <= f32::EPSILON
+        && scanline_strength <= f32::EPSILON
+        && noise <= f32::EPSILON
+        && desaturation <= f32::EPSILON
+    {
+        return src.to_vec();
+    }
+
+    let chroma_rows = if chroma_bleed_px > f32::EPSILON || chroma_shift_px.abs() > f32::EPSILON {
+        Some(build_vhs_chroma_rows(
+            src,
+            width,
+            height,
+            chroma_bleed_px.round() as usize,
+        ))
+    } else {
+        None
+    };
+
+    let mut out = src.to_vec();
+    let height_scale = height.saturating_sub(1).max(1) as f32;
+    for y in 0..height {
+        let row_block = (y / 3) as u32;
+        let row_noise = signed_noise(0, row_block, params.seed ^ 0x621D_4A33);
+        let band_gate = smoothstep(0.58, 0.96, row_noise.abs());
+        let y_norm = y as f32 / height_scale;
+        let head_switch = smoothstep(0.82, 0.98, y_norm);
+        let tracking = (band_gate * 0.75 + head_switch * 0.65).clamp(0.0, 1.0) * tracking_strength;
+        let row_shift = (signed_noise(row_block, 1, params.seed ^ 0xA53B_72C1) * tracking * 8.0
+            + signed_noise(2, row_block, params.seed ^ 0xC2B2_AE35)
+                * head_switch
+                * tracking
+                * 14.0)
+            .round();
+        let tracking_luma = (row_noise * band_gate * 0.16 - head_switch * 0.10) * tracking_strength;
+
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let shifted = sample_vhs_rgb_or_fallback(
+                src,
+                width,
+                height,
+                x as f32 + row_shift,
+                y as f32,
+                base,
+            );
+            let (mut luma, mut cb, mut cr) = vhs_rgb_to_ycbcr(shifted[0], shifted[1], shifted[2]);
+            if let Some(chroma_rows) = chroma_rows.as_ref() {
+                let sampled = sample_vhs_chroma(
+                    chroma_rows,
+                    width,
+                    x as f32 + row_shift + chroma_shift_px,
+                    y,
+                    [cb, cr],
+                );
+                cb = sampled[0];
+                cr = sampled[1];
+            }
+
+            let chroma_scale = 1.0 - desaturation * 0.78;
+            cb *= chroma_scale;
+            cr *= chroma_scale;
+            luma = (luma + tracking_luma).clamp(0.0, 1.0);
+            let mut target = vhs_ycbcr_to_rgb(luma, cb, cr);
+
+            if ghost_strength > f32::EPSILON
+                && ghost_offset_px > f32::EPSILON
+                && let Some(ghost) =
+                    sample_vhs_rgb(src, width, height, x as f32 - ghost_offset_px, y as f32)
+            {
+                for c in 0..3 {
+                    target[c] = screen_channel(target[c], ghost[c] * ghost_strength * 0.62);
+                }
+            }
+
+            let scan_mask = if y % 2 == 1 { 1.0 } else { 0.18 };
+            let scan_dark = 1.0 - scan_mask * scanline_strength * 0.22;
+            for c in 0..3 {
+                let mono_noise =
+                    signed_noise(x as u32, y as u32, params.seed ^ 0x34A6_E7B1) * noise * 0.16;
+                let color_noise = signed_noise(
+                    x as u32,
+                    y as u32,
+                    params.seed ^ (c as u32).wrapping_mul(0x9E37_79B9) ^ 0x41C6_4E6D,
+                ) * noise
+                    * 0.055;
+                target[c] = (target[c] * scan_dark + mono_noise + color_noise).clamp(0.0, 1.0);
+                out[i + c] = to_u8(lerp_f32(base[c], target[c], strength));
+            }
+        }
+    }
+    out
+}
+
+struct VhsChromaRows {
+    cb: Vec<f32>,
+    cr: Vec<f32>,
+    coverage: Vec<f32>,
+}
+
+fn build_vhs_chroma_rows(src: &[u8], width: usize, height: usize, radius: usize) -> VhsChromaRows {
+    let radius = radius.min(32);
+    let mut cb = vec![0.0; width * height];
+    let mut cr = vec![0.0; width * height];
+    let mut coverage = vec![0.0; width * height];
+    let mut prefix_cb = vec![0.0; width + 1];
+    let mut prefix_cr = vec![0.0; width + 1];
+    let mut prefix_alpha = vec![0.0; width + 1];
+
+    for y in 0..height {
+        prefix_cb.fill(0.0);
+        prefix_cr.fill(0.0);
+        prefix_alpha.fill(0.0);
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let alpha = src[i + 3] as f32 / 255.0;
+            let (pixel_cb, pixel_cr) = if alpha > f32::EPSILON {
+                let (_, pixel_cb, pixel_cr) = vhs_rgb_to_ycbcr(
+                    src[i] as f32 / 255.0,
+                    src[i + 1] as f32 / 255.0,
+                    src[i + 2] as f32 / 255.0,
+                );
+                (pixel_cb * alpha, pixel_cr * alpha)
+            } else {
+                (0.0, 0.0)
+            };
+            prefix_cb[x + 1] = prefix_cb[x] + pixel_cb;
+            prefix_cr[x + 1] = prefix_cr[x] + pixel_cr;
+            prefix_alpha[x + 1] = prefix_alpha[x] + alpha;
+        }
+
+        for x in 0..width {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius + 1).min(width);
+            let alpha_sum = prefix_alpha[x1] - prefix_alpha[x0];
+            let o = y * width + x;
+            if alpha_sum > f32::EPSILON {
+                cb[o] = (prefix_cb[x1] - prefix_cb[x0]) / alpha_sum;
+                cr[o] = (prefix_cr[x1] - prefix_cr[x0]) / alpha_sum;
+                coverage[o] = alpha_sum / (x1 - x0).max(1) as f32;
+            }
+        }
+    }
+
+    VhsChromaRows { cb, cr, coverage }
+}
+
+fn sample_vhs_chroma(
+    rows: &VhsChromaRows,
+    width: usize,
+    x: f32,
+    y: usize,
+    fallback: [f32; 2],
+) -> [f32; 2] {
+    if width == 0 || x < 0.0 || x > width.saturating_sub(1) as f32 {
+        return fallback;
+    }
+    let x0 = x.floor() as usize;
+    let x1 = (x0 + 1).min(width - 1);
+    let tx = x - x0 as f32;
+    let i0 = y * width + x0;
+    let i1 = y * width + x1;
+    let coverage = lerp_f32(rows.coverage[i0], rows.coverage[i1], tx);
+    if coverage <= f32::EPSILON {
+        return fallback;
+    }
+    [
+        lerp_f32(rows.cb[i0], rows.cb[i1], tx),
+        lerp_f32(rows.cr[i0], rows.cr[i1], tx),
+    ]
+}
+
+fn sample_vhs_rgb_or_fallback(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: f32,
+    y: f32,
+    fallback: [f32; 3],
+) -> [f32; 3] {
+    sample_vhs_rgb(src, width, height, x, y).unwrap_or(fallback)
+}
+
+fn sample_vhs_rgb(src: &[u8], width: usize, height: usize, x: f32, y: f32) -> Option<[f32; 3]> {
+    if width == 0
+        || height == 0
+        || x < 0.0
+        || y < 0.0
+        || x > width.saturating_sub(1) as f32
+        || y > height.saturating_sub(1) as f32
+    {
+        return None;
+    }
+    let (rgb, alpha) = sample_rgb_bilinear_alpha_aware(src, width, height, x, y);
+    if alpha > f32::EPSILON {
+        Some(rgb)
+    } else {
+        None
+    }
+}
+
+fn vhs_rgb_to_ycbcr(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let y = luma01(r, g, b);
+    let cb = (b - y) * 0.565;
+    let cr = (r - y) * 0.713;
+    (y, cb, cr)
+}
+
+fn vhs_ycbcr_to_rgb(y: f32, cb: f32, cr: f32) -> [f32; 3] {
+    let r = y + cr * 1.403;
+    let b = y + cb * 1.770;
+    let g = (y - 0.299 * r - 0.114 * b) / 0.587;
+    [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]
+}
+
 fn apply_halftone(src: &[u8], width: usize, height: usize, params: HalftoneParams) -> Vec<u8> {
     let cell = params.cell_px.clamp(2, 96) as usize;
     let strength = params.strength.clamp(0.0, 1.0);
@@ -12816,6 +13094,7 @@ mod tests {
             LocalEffect::Noise(NoiseParams::default()),
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
             LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
+            LocalEffect::Vhs(VhsParams::default()),
             LocalEffect::Halftone(HalftoneParams::default()),
             LocalEffect::ScreenTone(ScreenToneParams::default()),
             LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
@@ -13492,6 +13771,21 @@ mod tests {
                     block_strength: 1.0,
                     noise: 1.0,
                     seed: 19,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "vhs max analog artifacts",
+                LocalEffect::Vhs(VhsParams {
+                    chroma_bleed_px: 32.0,
+                    chroma_shift_px: 24.0,
+                    ghost_offset_px: 64.0,
+                    ghost_strength: 1.0,
+                    tracking_strength: 1.0,
+                    scanline_strength: 1.0,
+                    noise: 1.0,
+                    desaturation: 1.0,
+                    seed: 20,
                     strength: 1.0,
                 }),
             ),
@@ -15359,6 +15653,108 @@ LUT_3D_SIZE 2
                 rgb_shift_px: 1.0,
                 block_strength: 0.0,
                 noise: 0.0,
+                seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn vhs_desaturates_chroma_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(1, 1, vec![255, 0, 0, 201]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "vhs",
+            LocalMask::Full,
+            LocalEffect::Vhs(VhsParams {
+                chroma_bleed_px: 0.0,
+                chroma_shift_px: 0.0,
+                ghost_offset_px: 0.0,
+                ghost_strength: 0.0,
+                tracking_strength: 0.0,
+                scanline_strength: 0.0,
+                noise: 0.0,
+                desaturation: 1.0,
+                seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] < src.pixels[0]);
+        assert!(out.pixels[1] > src.pixels[1]);
+        assert_eq!(out.pixels[3], 201);
+    }
+
+    #[test]
+    fn vhs_chroma_bleed_spreads_neighbor_color() {
+        let src =
+            RgbaImageBuf::new(3, 1, vec![0, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "vhs",
+            LocalMask::Full,
+            LocalEffect::Vhs(VhsParams {
+                chroma_bleed_px: 1.0,
+                chroma_shift_px: 0.0,
+                ghost_offset_px: 0.0,
+                ghost_strength: 0.0,
+                tracking_strength: 0.0,
+                scanline_strength: 0.0,
+                noise: 0.0,
+                desaturation: 0.0,
+                seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn vhs_ghost_offsets_bright_pixel() {
+        let src = RgbaImageBuf::new(
+            4,
+            1,
+            vec![255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "vhs",
+            LocalMask::Full,
+            LocalEffect::Vhs(VhsParams {
+                chroma_bleed_px: 0.0,
+                chroma_shift_px: 0.0,
+                ghost_offset_px: 2.0,
+                ghost_strength: 1.0,
+                tracking_strength: 0.0,
+                scanline_strength: 0.0,
+                noise: 0.0,
+                desaturation: 0.0,
+                seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[8] > 120);
+        assert_eq!(out.pixels[11], 255);
+    }
+
+    #[test]
+    fn vhs_ignores_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(3, 1, vec![0, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "vhs",
+            LocalMask::Full,
+            LocalEffect::Vhs(VhsParams {
+                chroma_bleed_px: 1.0,
+                chroma_shift_px: 0.0,
+                ghost_offset_px: 0.0,
+                ghost_strength: 0.0,
+                tracking_strength: 0.0,
+                scanline_strength: 0.0,
+                noise: 0.0,
+                desaturation: 0.0,
                 seed: 1,
                 strength: 1.0,
             }),

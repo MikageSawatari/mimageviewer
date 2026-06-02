@@ -39,7 +39,7 @@ use local_adjust_core::{
     SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement,
     TextureParams, TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams,
     TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams,
-    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
+    VhsParams, VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
     WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
     default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
 };
@@ -1055,6 +1055,7 @@ enum EffectKind {
     Noise,
     ChromaticAberration,
     ScanlineGlitch,
+    Vhs,
     Halftone,
     ScreenTone,
     ColorHalftone,
@@ -1192,6 +1193,7 @@ impl EffectKind {
             LocalEffect::Noise(_) => Self::Noise,
             LocalEffect::ChromaticAberration(_) => Self::ChromaticAberration,
             LocalEffect::ScanlineGlitch(_) => Self::ScanlineGlitch,
+            LocalEffect::Vhs(_) => Self::Vhs,
             LocalEffect::Halftone(_) => Self::Halftone,
             LocalEffect::ScreenTone(_) => Self::ScreenTone,
             LocalEffect::ColorHalftone(_) => Self::ColorHalftone,
@@ -1280,6 +1282,7 @@ impl EffectKind {
             Self::Noise => "ノイズ付加",
             Self::ChromaticAberration => "色収差",
             Self::ScanlineGlitch => "走査線グリッチ",
+            Self::Vhs => "VHS/アナログ",
             Self::Halftone => "ハーフトーン",
             Self::ScreenTone => "スクリーントーン",
             Self::ColorHalftone => "カラーハーフトーン",
@@ -1454,6 +1457,9 @@ impl EffectKind {
             Self::ScanlineGlitch => {
                 "横走査線、行ごとの揺れ、RGBずれ、ノイズを重ねてホログラムやデジタル破損の演出を作ります。"
             }
+            Self::Vhs => {
+                "色にじみ、横ゴースト、トラッキング帯、走査線を重ねて古いアナログビデオ風にします。"
+            }
             Self::Halftone => "明るさをドットパターンに変換し、漫画や印刷風にします。",
             Self::ScreenTone => {
                 "網点、平行線、カケアミを重ね、濃度と元画像の明暗追従で漫画用のトーンを作ります。"
@@ -1604,6 +1610,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::CmykPlateShift,
             EffectKind::Textureizer,
             EffectKind::ScanlineGlitch,
+            EffectKind::Vhs,
         ],
     },
     EffectGroup {
@@ -8582,6 +8589,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::ScanlineGlitch(params) => {
             format!("走査線グリッチ {:.0}%", params.strength * 100.0)
         }
+        LocalEffect::Vhs(params) => format!("VHS {:.0}%", params.strength * 100.0),
         LocalEffect::Halftone(params) => format!("ハーフトーン {}px", params.cell_px),
         LocalEffect::ScreenTone(params) => format!(
             "スクリーントーン {} {:.0}px",
@@ -15387,6 +15395,120 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
                 .changed();
         }
+        LocalEffect::Vhs(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "VHS標準") {
+                    *params = VhsParams {
+                        chroma_bleed_px: 4.0,
+                        chroma_shift_px: 1.5,
+                        ghost_offset_px: 5.0,
+                        ghost_strength: 0.22,
+                        tracking_strength: 0.25,
+                        scanline_strength: 0.25,
+                        noise: 0.08,
+                        desaturation: 0.25,
+                        seed: params.seed,
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "古いテープ") {
+                    *params = VhsParams {
+                        chroma_bleed_px: 8.0,
+                        chroma_shift_px: 2.0,
+                        ghost_offset_px: 10.0,
+                        ghost_strength: 0.35,
+                        tracking_strength: 0.55,
+                        scanline_strength: 0.45,
+                        noise: 0.18,
+                        desaturation: 0.45,
+                        seed: params.seed,
+                        strength: 0.90,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "色にじみ") {
+                    *params = VhsParams {
+                        chroma_bleed_px: 12.0,
+                        chroma_shift_px: 3.0,
+                        ghost_offset_px: 2.0,
+                        ghost_strength: 0.10,
+                        tracking_strength: 0.10,
+                        scanline_strength: 0.10,
+                        noise: 0.04,
+                        desaturation: 0.15,
+                        seed: params.seed,
+                        strength: 0.70,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "トラッキング") {
+                    *params = VhsParams {
+                        chroma_bleed_px: 3.0,
+                        chroma_shift_px: 1.0,
+                        ghost_offset_px: 4.0,
+                        ghost_strength: 0.16,
+                        tracking_strength: 0.85,
+                        scanline_strength: 0.35,
+                        noise: 0.22,
+                        desaturation: 0.30,
+                        seed: params.seed,
+                        strength: 0.90,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "輝度は残し、色成分だけを横ににじませるアナログビデオ風の演出です。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.chroma_bleed_px, 0.0..=32.0).text("色にじみ(px)"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.chroma_shift_px, -24.0..=24.0).text("色ずれ(px)"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.ghost_offset_px, 0.0..=64.0)
+                        .text("ゴースト距離(px)"),
+                )
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.ghost_strength, 0.0..=1.0).text("ゴースト"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.tracking_strength, 0.0..=1.0)
+                        .text("トラッキング"),
+                )
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.scanline_strength, 0.0..=1.0).text("走査線"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.noise, 0.0..=1.0).text("ノイズ"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.desaturation, 0.0..=1.0).text("退色"))
+                .changed();
+            let mut seed = params.seed as i32;
+            changed |= ui
+                .add(egui::Slider::new(&mut seed, 0..=9999).text("seed"))
+                .changed();
+            params.seed = seed.max(0) as u32;
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
+                .changed();
+        }
         LocalEffect::Halftone(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -17349,6 +17471,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default())
         }
         EffectKind::ScanlineGlitch => LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
+        EffectKind::Vhs => LocalEffect::Vhs(VhsParams::default()),
         EffectKind::Halftone => LocalEffect::Halftone(HalftoneParams::default()),
         EffectKind::ScreenTone => LocalEffect::ScreenTone(ScreenToneParams::default()),
         EffectKind::ColorHalftone => LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
@@ -19697,6 +19820,7 @@ mod tests {
             EffectKind::CmykPlateShift,
             EffectKind::Textureizer,
             EffectKind::ScanlineGlitch,
+            EffectKind::Vhs,
             EffectKind::ColorOverlay,
             EffectKind::StarGlow,
             EffectKind::EdgeSmooth,

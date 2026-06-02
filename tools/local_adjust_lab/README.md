@@ -129,6 +129,7 @@ the window.
   - Noise
   - Chromatic aberration
   - Scanline glitch / hologram
+  - VHS / analog video
   - Halftone
   - Screen tone
   - Color halftone
