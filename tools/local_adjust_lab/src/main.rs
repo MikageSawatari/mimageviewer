@@ -36,7 +36,7 @@ use local_adjust_core::{
     SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
     StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
     TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
-    ToneCurveParams, ToneParams, TwirlParams, VignetteParams, WaveDistortionMode,
+    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VignetteParams, WaveDistortionMode,
     WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
     apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
     evaluate_layer_mask, parse_cube_lut,
@@ -1006,6 +1006,7 @@ enum EffectKind {
     ArtisticMedia,
     BrushStroke,
     Cutout,
+    ToonShade,
     Emboss,
     PixelStylize,
     Solarize,
@@ -1065,6 +1066,8 @@ enum RgbPickTarget {
     SpotlightTint,
     OutlineStrokeColor,
     HalationTint,
+    ToonShadeShadowTint,
+    ToonShadeLightTint,
 }
 
 impl RgbPickTarget {
@@ -1082,6 +1085,8 @@ impl RgbPickTarget {
             Self::SpotlightTint => "スポットライトの光色",
             Self::OutlineStrokeColor => "縁取りの線色",
             Self::HalationTint => "ハレーションの暖色",
+            Self::ToonShadeShadowTint => "トゥーン影色",
+            Self::ToonShadeLightTint => "トゥーン光色",
         }
     }
 }
@@ -1119,6 +1124,7 @@ impl EffectKind {
             LocalEffect::ArtisticMedia(_) => Self::ArtisticMedia,
             LocalEffect::BrushStroke(_) => Self::BrushStroke,
             LocalEffect::Cutout(_) => Self::Cutout,
+            LocalEffect::ToonShade(_) => Self::ToonShade,
             LocalEffect::Emboss(_) => Self::Emboss,
             LocalEffect::PixelStylize(_) => Self::PixelStylize,
             LocalEffect::Solarize(_) => Self::Solarize,
@@ -1197,6 +1203,7 @@ impl EffectKind {
             Self::ArtisticMedia => "水彩/鉛筆",
             Self::BrushStroke => "ドライブラシ/塗料",
             Self::Cutout => "切り絵",
+            Self::ToonShade => "トゥーンシェード",
             Self::Emboss => "エンボス",
             Self::PixelStylize => "粒状スタイル",
             Self::Solarize => "ソラリゼーション",
@@ -1306,6 +1313,9 @@ impl EffectKind {
             }
             Self::Cutout => {
                 "色面をなじませて階調を減らし、切り絵やフラットなベクター調の見た目にします。"
+            }
+            Self::ToonShade => {
+                "明度だけを段階化して色相を保ち、セル画風のフラットな影と光の面を作ります。"
             }
             Self::Emboss => "明るさの傾きから陰影を作り、紙や金属の浮き彫りのような質感にします。",
             Self::PixelStylize => "結晶化、点描、Facet、メゾチントの粒状スタイライズを作ります。",
@@ -1500,6 +1510,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ArtisticMedia,
             EffectKind::BrushStroke,
             EffectKind::Cutout,
+            EffectKind::ToonShade,
             EffectKind::Emboss,
             EffectKind::PixelStylize,
             EffectKind::Solarize,
@@ -8320,6 +8331,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
             format!("筆致 {mode}")
         }
         LocalEffect::Cutout(params) => format!("切り絵 {}段", params.levels),
+        LocalEffect::ToonShade(params) => format!("トゥーン {}段", params.bands),
         LocalEffect::Emboss(params) => format!("エンボス {:.0}°", params.angle_degrees),
         LocalEffect::PixelStylize(params) => {
             let mode = match params.mode {
@@ -8745,6 +8757,14 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
         }
         (LocalEffect::Halation(params), RgbPickTarget::HalationTint) => {
             params.tint_rgb = rgb;
+            true
+        }
+        (LocalEffect::ToonShade(params), RgbPickTarget::ToonShadeShadowTint) => {
+            params.shadow_tint_rgb = rgb;
+            true
+        }
+        (LocalEffect::ToonShade(params), RgbPickTarget::ToonShadeLightTint) => {
+            params.light_tint_rgb = rgb;
             true
         }
         _ => false,
@@ -11686,6 +11706,129 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から切り絵結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::ToonShade(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "セル塗り") {
+                    *params = ToonShadeParams {
+                        bands: 4,
+                        softness: 0.06,
+                        preserve_hue: true,
+                        shadow_tint_rgb: [92, 116, 210],
+                        shadow_tint_strength: 0.18,
+                        light_tint_rgb: [255, 226, 176],
+                        light_tint_strength: 0.12,
+                        outline_strength: 0.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "硬い影") {
+                    *params = ToonShadeParams {
+                        bands: 3,
+                        softness: 0.0,
+                        preserve_hue: true,
+                        shadow_tint_rgb: [72, 92, 190],
+                        shadow_tint_strength: 0.28,
+                        light_tint_rgb: [255, 228, 182],
+                        light_tint_strength: 0.08,
+                        outline_strength: 0.12,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "柔らかめ") {
+                    *params = ToonShadeParams {
+                        bands: 5,
+                        softness: 0.34,
+                        preserve_hue: true,
+                        shadow_tint_rgb: [100, 128, 220],
+                        shadow_tint_strength: 0.12,
+                        light_tint_rgb: [255, 236, 202],
+                        light_tint_strength: 0.10,
+                        outline_strength: 0.0,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "境界線") {
+                    *params = ToonShadeParams {
+                        bands: 4,
+                        softness: 0.02,
+                        preserve_hue: true,
+                        shadow_tint_rgb: [84, 104, 198],
+                        shadow_tint_strength: 0.16,
+                        light_tint_rgb: [255, 228, 188],
+                        light_tint_strength: 0.10,
+                        outline_strength: 0.55,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "明度だけを段階化して色相を保ち、セル画風の影面と光面を作ります。影色・光色を少し混ぜるとアニメ塗りらしくなります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let mut bands = params.bands as i32;
+            let bands_response = ui.add(egui::Slider::new(&mut bands, 2..=8).text("階調数"));
+            changed |= bands_response.changed();
+            bands_response.lab_hover_tip(
+                "明るさを何段階の面にまとめるかです。少ないほどセル塗りが強くなります。",
+            );
+            params.bands = bands.clamp(2, 8) as u8;
+            let softness =
+                ui.add(egui::Slider::new(&mut params.softness, 0.0..=1.0).text("境界の柔らかさ"));
+            changed |= softness.changed();
+            softness.lab_hover_tip("0で硬いセル影、上げるほど帯境界をなめらかにつなぎます。");
+            let preserve_hue = ui.checkbox(&mut params.preserve_hue, "色相を維持");
+            changed |= preserve_hue.changed();
+            preserve_hue.lab_hover_tip(
+                "ONでは明度だけを段階化します。OFFではRGBも段階化し、よりグラフィックになります。",
+            );
+            let shadow_strength =
+                ui.add(egui::Slider::new(&mut params.shadow_tint_strength, 0.0..=1.0).text("影色"));
+            changed |= shadow_strength.changed();
+            shadow_strength.lab_hover_tip("暗い帯へ指定した影色を混ぜる量です。");
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "影色",
+                    &mut params.shadow_tint_rgb,
+                    RgbPickTarget::ToonShadeShadowTint,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let light_strength =
+                ui.add(egui::Slider::new(&mut params.light_tint_strength, 0.0..=1.0).text("光色"));
+            changed |= light_strength.changed();
+            light_strength.lab_hover_tip("明るい帯へ指定した光色を混ぜる量です。");
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "光色",
+                    &mut params.light_tint_rgb,
+                    RgbPickTarget::ToonShadeLightTint,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let outline =
+                ui.add(egui::Slider::new(&mut params.outline_strength, 0.0..=1.0).text("段差線"));
+            changed |= outline.changed();
+            outline.lab_hover_tip("明度帯の境界をどれだけ暗く締めるかです。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からトゥーンシェード結果へどれだけ近づけるかです。");
         }
         LocalEffect::Emboss(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -16162,6 +16305,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ArtisticMedia => LocalEffect::ArtisticMedia(ArtisticMediaParams::default()),
         EffectKind::BrushStroke => LocalEffect::BrushStroke(BrushStrokeParams::default()),
         EffectKind::Cutout => LocalEffect::Cutout(CutoutParams::default()),
+        EffectKind::ToonShade => LocalEffect::ToonShade(ToonShadeParams::default()),
         EffectKind::Emboss => LocalEffect::Emboss(EmbossParams::default()),
         EffectKind::PixelStylize => LocalEffect::PixelStylize(PixelStylizeParams::default()),
         EffectKind::Solarize => LocalEffect::Solarize(SolarizeParams::default()),
@@ -18490,6 +18634,7 @@ mod tests {
             EffectKind::ArtisticMedia,
             EffectKind::BrushStroke,
             EffectKind::Cutout,
+            EffectKind::ToonShade,
             EffectKind::Emboss,
             EffectKind::PixelStylize,
             EffectKind::Solarize,
@@ -18812,6 +18957,23 @@ mod tests {
             panic!("expected halation effect");
         };
         assert_eq!(halation_params.tint_rgb, [255, 230, 190]);
+
+        let mut toon = LocalEffect::ToonShade(ToonShadeParams::default());
+        assert!(set_rgb_pick_target(
+            &mut toon,
+            RgbPickTarget::ToonShadeShadowTint,
+            [20, 40, 180],
+        ));
+        assert!(set_rgb_pick_target(
+            &mut toon,
+            RgbPickTarget::ToonShadeLightTint,
+            [255, 240, 180],
+        ));
+        let LocalEffect::ToonShade(toon_params) = toon else {
+            panic!("expected toon shade effect");
+        };
+        assert_eq!(toon_params.shadow_tint_rgb, [20, 40, 180]);
+        assert_eq!(toon_params.light_tint_rgb, [255, 240, 180]);
 
         let mut tone = LocalEffect::Tone(ToneParams::default());
         assert!(!set_rgb_pick_target(

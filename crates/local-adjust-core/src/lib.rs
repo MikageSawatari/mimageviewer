@@ -554,6 +554,7 @@ pub enum LocalEffect {
     ArtisticMedia(ArtisticMediaParams),
     BrushStroke(BrushStrokeParams),
     Cutout(CutoutParams),
+    ToonShade(ToonShadeParams),
     Emboss(EmbossParams),
     PixelStylize(PixelStylizeParams),
     Solarize(SolarizeParams),
@@ -632,6 +633,7 @@ impl LocalEffect {
             Self::ArtisticMedia(_) => "絵画調",
             Self::BrushStroke(_) => "筆致",
             Self::Cutout(_) => "切り絵",
+            Self::ToonShade(_) => "トゥーンシェード",
             Self::Emboss(_) => "エンボス",
             Self::PixelStylize(_) => "粒状スタイル",
             Self::Solarize(_) => "ソラリゼーション",
@@ -1465,6 +1467,35 @@ impl Default for CutoutParams {
             radius_px: 6.0,
             edge_strength: 0.25,
             color_amount: 0.85,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ToonShadeParams {
+    pub bands: u8,
+    pub softness: f32,
+    pub preserve_hue: bool,
+    pub shadow_tint_rgb: [u8; 3],
+    pub shadow_tint_strength: f32,
+    pub light_tint_rgb: [u8; 3],
+    pub light_tint_strength: f32,
+    pub outline_strength: f32,
+    pub strength: f32,
+}
+
+impl Default for ToonShadeParams {
+    fn default() -> Self {
+        Self {
+            bands: 4,
+            softness: 0.08,
+            preserve_hue: true,
+            shadow_tint_rgb: [92, 116, 210],
+            shadow_tint_strength: 0.0,
+            light_tint_rgb: [255, 226, 176],
+            light_tint_strength: 0.0,
+            outline_strength: 0.0,
             strength: 0.0,
         }
     }
@@ -3140,6 +3171,9 @@ where
             }
             LocalEffect::Cutout(params) => {
                 apply_cutout(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::ToonShade(params) => {
+                apply_toon_shade(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::Emboss(params) => {
                 apply_emboss(&image.pixels, image.width, image.height, *params)
@@ -5573,6 +5607,23 @@ fn quantize_unit(v: f32, levels: f32) -> f32 {
     (v.clamp(0.0, 1.0) * steps).round() / steps
 }
 
+fn soft_quantize_unit(v: f32, levels: f32, softness: f32) -> f32 {
+    let steps = (levels.max(2.0) - 1.0).max(1.0);
+    let scaled = v.clamp(0.0, 1.0) * steps;
+    if softness <= f32::EPSILON {
+        return scaled.round() / steps;
+    }
+    let lower = scaled.floor().min(steps);
+    if lower >= steps {
+        return 1.0;
+    }
+    let upper = (lower + 1.0).min(steps);
+    let frac = scaled - lower;
+    let half_width = (softness.clamp(0.0, 1.0) * 0.5).clamp(0.001, 0.49);
+    let t = smoothstep(0.5 - half_width, 0.5 + half_width, frac);
+    (lower + (upper - lower) * t) / steps
+}
+
 fn apply_brush_stroke(
     src: &[u8],
     width: usize,
@@ -5831,6 +5882,98 @@ fn apply_cutout(src: &[u8], width: usize, height: usize, params: CutoutParams) -
         }
     }
     out
+}
+
+fn apply_toon_shade(src: &[u8], width: usize, height: usize, params: ToonShadeParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+
+    let bands = params.bands.clamp(2, 8) as f32;
+    let softness = params.softness.clamp(0.0, 1.0);
+    let shadow_tint = rgb_u8_to_f32(params.shadow_tint_rgb);
+    let shadow_strength = params.shadow_tint_strength.clamp(0.0, 1.0);
+    let light_tint = rgb_u8_to_f32(params.light_tint_rgb);
+    let light_strength = params.light_tint_strength.clamp(0.0, 1.0);
+    let outline_strength = params.outline_strength.clamp(0.0, 1.0);
+    let mut band_lightness = vec![0.0; width.saturating_mul(height)];
+
+    for (idx, px) in src.chunks_exact(4).enumerate() {
+        if px[3] == 0 {
+            continue;
+        }
+        let (_, _, lightness) = rgb_to_hsl(
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        );
+        band_lightness[idx] = soft_quantize_unit(lightness, bands, softness);
+    }
+
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let i = idx * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let band = band_lightness[idx];
+            let mut target = if params.preserve_hue {
+                let (h, s, _) = rgb_to_hsl(base[0], base[1], base[2]);
+                hsl_to_rgb(h, s, band)
+            } else {
+                [
+                    soft_quantize_unit(base[0], bands, softness),
+                    soft_quantize_unit(base[1], bands, softness),
+                    soft_quantize_unit(base[2], bands, softness),
+                ]
+            };
+
+            let shadow_mix = shadow_strength * (1.0 - band).powf(1.25);
+            let light_mix = light_strength * band.powf(1.35);
+            for c in 0..3 {
+                target[c] = lerp_f32(target[c], shadow_tint[c], shadow_mix);
+                target[c] = lerp_f32(target[c], light_tint[c], light_mix);
+            }
+
+            let edge = toon_band_edge_signal(&band_lightness, width, height, x, y, bands);
+            let darken = edge * outline_strength * 0.65;
+            for c in 0..3 {
+                target[c] = (target[c] * (1.0 - darken)).clamp(0.0, 1.0);
+                out[i + c] = lerp_u8(src[i + c], to_u8(target[c]), strength);
+            }
+        }
+    }
+    out
+}
+
+fn toon_band_edge_signal(
+    band_lightness: &[f32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    bands: f32,
+) -> f32 {
+    let idx = y * width + x;
+    let center = band_lightness[idx];
+    let left = band_lightness[y * width + x.saturating_sub(1)];
+    let right = band_lightness[y * width + (x + 1).min(width - 1)];
+    let top = band_lightness[y.saturating_sub(1) * width + x];
+    let bottom = band_lightness[(y + 1).min(height - 1) * width + x];
+    let delta = (center - left)
+        .abs()
+        .max((center - right).abs())
+        .max((center - top).abs())
+        .max((center - bottom).abs());
+    (delta * (bands - 1.0)).clamp(0.0, 1.0)
 }
 
 fn apply_emboss(src: &[u8], width: usize, height: usize, params: EmbossParams) -> Vec<u8> {
@@ -10577,6 +10720,77 @@ mod tests {
     }
 
     #[test]
+    fn toon_shade_quantizes_lightness_and_preserves_hue() {
+        let src = RgbaImageBuf::new(2, 1, vec![120, 60, 60, 201, 60, 120, 60, 77]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "toon",
+            LocalMask::Full,
+            LocalEffect::ToonShade(ToonShadeParams {
+                bands: 3,
+                softness: 0.0,
+                preserve_hue: true,
+                shadow_tint_rgb: [92, 116, 210],
+                shadow_tint_strength: 0.0,
+                light_tint_rgb: [255, 226, 176],
+                light_tint_strength: 0.0,
+                outline_strength: 0.0,
+                strength: 1.0,
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        assert_ne!(out.pixels[0], src.pixels[0]);
+        assert!(out.pixels[0] > out.pixels[1]);
+        assert!(out.pixels[5] > out.pixels[4]);
+        assert_eq!(out.pixels[3], 201);
+        assert_eq!(out.pixels[7], 77);
+    }
+
+    #[test]
+    fn toon_shade_can_tint_shadows_and_draw_band_edges() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![60, 60, 60, 255, 130, 130, 130, 255, 220, 220, 220, 255],
+        )
+        .unwrap();
+        let mut params = ToonShadeParams {
+            bands: 3,
+            softness: 0.0,
+            preserve_hue: true,
+            shadow_tint_rgb: [30, 70, 255],
+            shadow_tint_strength: 0.85,
+            light_tint_rgb: [255, 235, 180],
+            light_tint_strength: 0.35,
+            outline_strength: 0.0,
+            strength: 1.0,
+        };
+        let without_outline = apply_layers(
+            src.as_ref(),
+            &[LocalAdjustmentLayer::new(
+                "toon",
+                LocalMask::Full,
+                LocalEffect::ToonShade(params),
+            )],
+        )
+        .unwrap();
+        params.outline_strength = 1.0;
+        let with_outline = apply_layers(
+            src.as_ref(),
+            &[LocalAdjustmentLayer::new(
+                "toon",
+                LocalMask::Full,
+                LocalEffect::ToonShade(params),
+            )],
+        )
+        .unwrap();
+
+        assert!(with_outline.pixels[2] > with_outline.pixels[0]);
+        assert!(with_outline.pixels[4] < without_outline.pixels[4]);
+    }
+
+    #[test]
     fn emboss_lights_gradient_direction_and_preserves_alpha() {
         let src = RgbaImageBuf::new(
             3,
@@ -11029,6 +11243,7 @@ mod tests {
             LocalEffect::ArtisticMedia(ArtisticMediaParams::default()),
             LocalEffect::BrushStroke(BrushStrokeParams::default()),
             LocalEffect::Cutout(CutoutParams::default()),
+            LocalEffect::ToonShade(ToonShadeParams::default()),
             LocalEffect::Emboss(EmbossParams::default()),
             LocalEffect::PixelStylize(PixelStylizeParams::default()),
             LocalEffect::Solarize(SolarizeParams::default()),

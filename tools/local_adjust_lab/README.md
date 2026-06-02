@@ -133,11 +133,12 @@ the window.
   - Median
   - Outline stroke
   - Color trace
+  - Toon shade
 - Effect parameters start from near-identity values. Use the per-effect preset
   buttons for practical starting points, or Reset to return the current effect
   to its default values.
 - RGB color parameters in Color Fill, Outline Stroke, Color Overlay, Neon Glow,
-  Halation, Speed Lines, Cloud/Fog, and Spotlight share a
+  Halation, Toon Shade, Speed Lines, Cloud/Fog, and Spotlight share a
   control with a color button, HEX readout, RGB sliders, and an image-click
   eyedropper.
 - Color Fill starts with a shape placeholder and full opacity. Choosing Solid,
