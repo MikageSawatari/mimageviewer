@@ -54,7 +54,9 @@ the window.
   - Color range with click picker
   - Subject selection mask using an optional U²-Netp ONNX model. Creating a
     subject layer starts one generation pass automatically when the model is
-    available.
+    available. The generated soft matte can be refined for cutout work by
+    thresholding it toward a binary mask, optionally shrinking/expanding it, and
+    smoothing only the boundary band.
   - Region segmentation mask with color-coded candidates that can be toggled by
     clicking or dragging on the image. Creating a region layer starts one
     default full-image segmentation pass automatically; the tool panel can

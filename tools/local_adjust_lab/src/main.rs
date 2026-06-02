@@ -1464,6 +1464,9 @@ struct LocalAdjustLabApp {
     edge_snap_radius: f32,
     region_color_tolerance: f32,
     region_min_area: usize,
+    subject_cutout_threshold: f32,
+    subject_cutout_expand_px: i32,
+    subject_cutout_feather_px: i32,
     line_width: f32,
     lasso_points: Vec<[f32; 2]>,
     shape_drag_start: Option<[f32; 2]>,
@@ -1546,6 +1549,9 @@ impl LocalAdjustLabApp {
             edge_snap_radius: 16.0,
             region_color_tolerance: 42.0,
             region_min_area: 64,
+            subject_cutout_threshold: 0.52,
+            subject_cutout_expand_px: 0,
+            subject_cutout_feather_px: 1,
             line_width: 28.0,
             lasso_points: Vec::new(),
             shape_drag_start: None,
@@ -4943,6 +4949,61 @@ impl LocalAdjustLabApp {
                 self.mark_mask_changed();
             }
         });
+        if let Some(stats) = self.selected_subject_mask_stats() {
+            ui.separator();
+            ui.label(
+                egui::RichText::new("切り抜き向け整形")
+                    .size(12.0)
+                    .strong()
+                    .color(Color32::from_gray(210)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "標準") {
+                    self.subject_cutout_threshold = 0.52;
+                    self.subject_cutout_expand_px = 0;
+                    self.subject_cutout_feather_px = 1;
+                }
+                if preset_button(ui, "硬め") {
+                    self.subject_cutout_threshold = 0.58;
+                    self.subject_cutout_expand_px = -1;
+                    self.subject_cutout_feather_px = 0;
+                }
+                if preset_button(ui, "柔らかめ") {
+                    self.subject_cutout_threshold = 0.45;
+                    self.subject_cutout_expand_px = 0;
+                    self.subject_cutout_feather_px = 2;
+                }
+            });
+            let threshold = ui.add(
+                egui::Slider::new(&mut self.subject_cutout_threshold, 0.05..=0.95).text("しきい値"),
+            );
+            threshold.lab_hover_tip(
+                "この値以上を被写体として残します。上げるほど背景側の半透明が減ります。",
+            );
+            let expand = ui.add(
+                egui::Slider::new(&mut self.subject_cutout_expand_px, -4..=4).text("収縮/拡張"),
+            );
+            expand.lab_hover_tip(
+                "マイナスで少し内側へ縮め、プラスで外側へ広げます。背景のにじみがある時は -1 が効きます。",
+            );
+            let feather = ui.add(
+                egui::Slider::new(&mut self.subject_cutout_feather_px, 0..=8).text("境界なめらか"),
+            );
+            feather.lab_hover_tip(
+                "2値化後の境界だけをなじませます。0は完全な2値、1〜2は切り抜き向けの軽い境界です。",
+            );
+            if ui.button("切り抜き向けに整形").clicked() {
+                self.apply_subject_cutout_refinement();
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "前景 {:.1}% / 半透明 {:.1}%",
+                    stats.foreground_percent, stats.soft_percent
+                ))
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+        }
         ui.label(
             egui::RichText::new(
                 "生成結果は前景マットです。背景を加工したい場合は「背景を選択」またはマスク反転を使います。",
@@ -5484,6 +5545,43 @@ impl LocalAdjustLabApp {
             }
             _ => false,
         }
+    }
+
+    fn selected_subject_mask_stats(&self) -> Option<SubjectMaskStats> {
+        let layer = self.selected_layer_ref()?;
+        let LocalMask::Subject(mask) = &layer.mask else {
+            return None;
+        };
+        Some(subject_mask_stats(mask))
+    }
+
+    fn apply_subject_cutout_refinement(&mut self) {
+        let layer_idx = self.selected_layer;
+        if !matches!(
+            self.layers.get(layer_idx).map(|layer| &layer.mask),
+            Some(LocalMask::Subject(_))
+        ) {
+            self.status = "被写体選択レイヤーを選択してください。".to_string();
+            return;
+        }
+        let threshold = self.subject_cutout_threshold;
+        let expand_px = self.subject_cutout_expand_px;
+        let feather_px = self.subject_cutout_feather_px.max(0) as usize;
+        self.push_undo_snapshot();
+        let Some(layer) = self.layers.get_mut(layer_idx) else {
+            return;
+        };
+        let LocalMask::Subject(mask) = &mut layer.mask else {
+            return;
+        };
+        let alpha = subject_cutout_refined_alpha(mask, threshold, expand_px, feather_px);
+        mask.alpha = alpha;
+        let stats = subject_mask_stats(mask);
+        self.status = format!(
+            "被写体マスクを切り抜き向けに整形しました。前景 {:.1}% / 半透明 {:.1}%",
+            stats.foreground_percent, stats.soft_percent
+        );
+        self.mark_mask_changed();
     }
 
     fn handle_canvas_input(
@@ -13780,6 +13878,102 @@ fn morph_alpha(src: &[f32], width: usize, height: usize, dilate: bool) -> Vec<f3
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SubjectMaskStats {
+    foreground_percent: f32,
+    soft_percent: f32,
+}
+
+fn subject_mask_stats(mask: &RasterMask) -> SubjectMaskStats {
+    if mask.alpha.is_empty() {
+        return SubjectMaskStats {
+            foreground_percent: 0.0,
+            soft_percent: 0.0,
+        };
+    }
+    let mut foreground = 0usize;
+    let mut soft = 0usize;
+    for &alpha in &mask.alpha {
+        let alpha = alpha.clamp(0.0, 1.0);
+        if alpha >= 0.5 {
+            foreground += 1;
+        }
+        if alpha > 0.02 && alpha < 0.98 {
+            soft += 1;
+        }
+    }
+    let total = mask.alpha.len() as f32;
+    SubjectMaskStats {
+        foreground_percent: foreground as f32 * 100.0 / total,
+        soft_percent: soft as f32 * 100.0 / total,
+    }
+}
+
+fn subject_cutout_refined_alpha(
+    mask: &RasterMask,
+    threshold: f32,
+    expand_px: i32,
+    feather_px: usize,
+) -> Vec<f32> {
+    let mut alpha: Vec<f32> = mask
+        .alpha
+        .iter()
+        .map(|&value| {
+            if value.clamp(0.0, 1.0) >= threshold.clamp(0.0, 1.0) {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let steps = expand_px.unsigned_abs().min(16);
+    for _ in 0..steps {
+        alpha = if expand_px >= 0 {
+            dilate_alpha(&alpha, mask.width, mask.height)
+        } else {
+            erode_alpha(&alpha, mask.width, mask.height)
+        };
+    }
+    if feather_px > 0 {
+        alpha = box_blur_alpha_local(&alpha, mask.width, mask.height, feather_px.min(16));
+    }
+    alpha
+}
+
+fn box_blur_alpha_local(src: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
+    if radius == 0 || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let mut tmp = vec![0.0; src.len()];
+    let mut out = vec![0.0; src.len()];
+    let mut prefix = vec![0.0; width.max(height) + 1];
+    for y in 0..height {
+        prefix[0] = 0.0;
+        for x in 0..width {
+            prefix[x + 1] = prefix[x] + src[y * width + x];
+        }
+        for x in 0..width {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius).min(width - 1);
+            let sum = prefix[x1 + 1] - prefix[x0];
+            tmp[y * width + x] = sum / (x1 - x0 + 1) as f32;
+        }
+    }
+    for x in 0..width {
+        prefix[0] = 0.0;
+        for y in 0..height {
+            prefix[y + 1] = prefix[y] + tmp[y * width + x];
+        }
+        for y in 0..height {
+            let y0 = y.saturating_sub(radius);
+            let y1 = (y + radius).min(height - 1);
+            let sum = prefix[y1 + 1] - prefix[y0];
+            out[y * width + x] = sum / (y1 - y0 + 1) as f32;
+        }
+    }
+    out
+}
+
 fn push_freehand_point(points: &mut Vec<[f32; 2]>, point: [f32; 2]) -> bool {
     if points
         .last()
@@ -16262,6 +16456,58 @@ mod tests {
         assert!((hue_degrees_from_rgb([255, 0, 0]) - 0.0).abs() < 0.1);
         assert!((hue_degrees_from_rgb([0, 255, 0]) - 120.0).abs() < 0.1);
         assert!((hue_degrees_from_rgb([0, 0, 255]) - 240.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn subject_cutout_refinement_binarizes_soft_alpha() {
+        let mask = RasterMask {
+            width: 4,
+            height: 1,
+            alpha: vec![0.20, 0.49, 0.52, 0.90],
+        };
+        let refined = subject_cutout_refined_alpha(&mask, 0.5, 0, 0);
+        assert_eq!(refined, vec![0.0, 0.0, 1.0, 1.0]);
+        let stats = subject_mask_stats(&RasterMask {
+            width: 4,
+            height: 1,
+            alpha: refined,
+        });
+        assert_eq!(stats.foreground_percent, 50.0);
+        assert_eq!(stats.soft_percent, 0.0);
+    }
+
+    #[test]
+    fn subject_cutout_refinement_smooths_only_boundary_band() {
+        let mask = RasterMask {
+            width: 5,
+            height: 1,
+            alpha: vec![0.0, 1.0, 1.0, 1.0, 0.0],
+        };
+        let refined = subject_cutout_refined_alpha(&mask, 0.5, 0, 1);
+        assert!((refined[0] - 0.5).abs() < 0.001);
+        assert!((refined[1] - (2.0 / 3.0)).abs() < 0.001);
+        assert!((refined[2] - 1.0).abs() < 0.001);
+        assert!((refined[3] - (2.0 / 3.0)).abs() < 0.001);
+        assert!((refined[4] - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn subject_cutout_refinement_can_expand_or_shrink_binary_mask() {
+        let mask = RasterMask {
+            width: 5,
+            height: 1,
+            alpha: vec![0.0, 0.0, 1.0, 0.0, 0.0],
+        };
+        let expanded = subject_cutout_refined_alpha(&mask, 0.5, 1, 0);
+        assert_eq!(expanded, vec![0.0, 1.0, 1.0, 1.0, 0.0]);
+
+        let mask = RasterMask {
+            width: 5,
+            height: 1,
+            alpha: vec![0.0, 1.0, 1.0, 1.0, 0.0],
+        };
+        let shrunk = subject_cutout_refined_alpha(&mask, 0.5, -1, 0);
+        assert_eq!(shrunk, vec![0.0, 0.0, 1.0, 0.0, 0.0]);
     }
 
     #[test]
