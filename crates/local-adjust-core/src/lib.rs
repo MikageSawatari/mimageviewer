@@ -460,6 +460,7 @@ pub enum LocalEffect {
     Equalize(EqualizeParams),
     GradientMap(GradientMapParams),
     ColorOverlay(ColorOverlayParams),
+    NeonGlow(NeonGlowParams),
     DiffuseGlow(DiffuseGlowParams),
     Bloom(BloomParams),
     Vignette(VignetteParams),
@@ -523,6 +524,7 @@ impl LocalEffect {
             Self::Equalize(_) => "ヒストグラム均等化",
             Self::GradientMap(_) => "グラデーションマップ",
             Self::ColorOverlay(_) => "塗り/グラデーション",
+            Self::NeonGlow(_) => "ネオングロー",
             Self::DiffuseGlow(_) => "拡散光彩",
             Self::Bloom(_) => "ブルーム",
             Self::Vignette(_) => "ビネット",
@@ -1920,6 +1922,106 @@ fn default_color_overlay_softness() -> f32 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NeonGlowParams {
+    #[serde(default = "default_neon_glow_threshold")]
+    pub threshold: f32,
+    #[serde(default = "default_true")]
+    pub by_saturation: bool,
+    #[serde(default = "default_neon_glow_inner_radius")]
+    pub inner_radius_px: f32,
+    #[serde(default = "default_neon_glow_outer_radius")]
+    pub outer_radius_px: f32,
+    #[serde(default)]
+    pub strength: f32,
+    #[serde(default = "default_neon_glow_inner_amount")]
+    pub inner_amount: f32,
+    #[serde(default = "default_neon_glow_outer_amount")]
+    pub outer_amount: f32,
+    #[serde(default = "default_neon_glow_saturation")]
+    pub glow_saturation: f32,
+    #[serde(default = "default_neon_glow_tint_rgb")]
+    pub tint_rgb: [u8; 3],
+    #[serde(default)]
+    pub tint_strength: f32,
+    #[serde(default = "default_true")]
+    pub screen_blend: bool,
+    #[serde(default)]
+    pub source_color_enabled: bool,
+    #[serde(default = "default_neon_glow_source_rgb")]
+    pub source_rgb: [u8; 3],
+    #[serde(default = "default_neon_glow_source_tolerance")]
+    pub source_tolerance: f32,
+    #[serde(default = "default_neon_glow_source_feather")]
+    pub source_feather: f32,
+}
+
+impl Default for NeonGlowParams {
+    fn default() -> Self {
+        Self {
+            threshold: default_neon_glow_threshold(),
+            by_saturation: true,
+            inner_radius_px: default_neon_glow_inner_radius(),
+            outer_radius_px: default_neon_glow_outer_radius(),
+            strength: 0.0,
+            inner_amount: default_neon_glow_inner_amount(),
+            outer_amount: default_neon_glow_outer_amount(),
+            glow_saturation: default_neon_glow_saturation(),
+            tint_rgb: default_neon_glow_tint_rgb(),
+            tint_strength: 0.0,
+            screen_blend: true,
+            source_color_enabled: false,
+            source_rgb: default_neon_glow_source_rgb(),
+            source_tolerance: default_neon_glow_source_tolerance(),
+            source_feather: default_neon_glow_source_feather(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_neon_glow_threshold() -> f32 {
+    0.55
+}
+
+fn default_neon_glow_inner_radius() -> f32 {
+    5.0
+}
+
+fn default_neon_glow_outer_radius() -> f32 {
+    28.0
+}
+
+fn default_neon_glow_inner_amount() -> f32 {
+    0.85
+}
+
+fn default_neon_glow_outer_amount() -> f32 {
+    0.75
+}
+
+fn default_neon_glow_saturation() -> f32 {
+    0.55
+}
+
+fn default_neon_glow_tint_rgb() -> [u8; 3] {
+    [0, 220, 255]
+}
+
+fn default_neon_glow_source_rgb() -> [u8; 3] {
+    [0, 220, 255]
+}
+
+fn default_neon_glow_source_tolerance() -> f32 {
+    0.28
+}
+
+fn default_neon_glow_source_feather() -> f32 {
+    0.12
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DiffuseGlowParams {
     pub threshold: f32,
     pub radius_px: f32,
@@ -2372,6 +2474,9 @@ where
         LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
         LocalEffect::ColorOverlay(params) => {
             apply_color_overlay(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::NeonGlow(params) => {
+            apply_neon_glow(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::DiffuseGlow(params) => {
             apply_diffuse_glow(&image.pixels, image.width, image.height, *params)
@@ -6457,6 +6562,100 @@ fn adjust_saturation(rgb: [f32; 3], scale: f32) -> [f32; 3] {
     ]
 }
 
+fn apply_neon_glow(src: &[u8], width: usize, height: usize, params: NeonGlowParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 2.0);
+    let inner_radius = params.inner_radius_px.round().clamp(0.0, 96.0) as usize;
+    let outer_radius = params.outer_radius_px.round().clamp(0.0, 180.0) as usize;
+    if width == 0
+        || height == 0
+        || strength <= f32::EPSILON
+        || (inner_radius == 0 && outer_radius == 0)
+    {
+        return src.to_vec();
+    }
+
+    let threshold = params.threshold.clamp(0.05, 0.999);
+    let inner_amount = params.inner_amount.clamp(0.0, 2.0);
+    let outer_amount = params.outer_amount.clamp(0.0, 2.0);
+    let saturation_scale = 1.0 + params.glow_saturation.clamp(-1.0, 2.0);
+    let tint = rgb_u8_to_f32(params.tint_rgb);
+    let tint_strength = params.tint_strength.clamp(0.0, 1.0);
+    let source_rgb = rgb_u8_to_f32(params.source_rgb);
+    let source_tolerance = params.source_tolerance.clamp(0.0, 1.0);
+    let source_feather = params.source_feather.clamp(0.001, 1.0);
+    let mut bright = vec![0_u8; src.len()];
+
+    for i in (0..src.len()).step_by(4) {
+        let alpha = src[i + 3] as f32 / 255.0;
+        if alpha <= f32::EPSILON {
+            continue;
+        }
+        let r = src[i] as f32 / 255.0;
+        let g = src[i + 1] as f32 / 255.0;
+        let b = src[i + 2] as f32 / 255.0;
+        let base_rgb = [r, g, b];
+        let signal = neon_source_signal(base_rgb, params.by_saturation);
+        let mut gate = smoothstep(threshold, (threshold + 0.32).min(1.0), signal);
+        if params.source_color_enabled {
+            gate *= color_range_gate(base_rgb, source_rgb, source_tolerance, source_feather);
+        }
+        if gate <= f32::EPSILON {
+            continue;
+        }
+        let mut glow_rgb = adjust_saturation(base_rgb, saturation_scale);
+        glow_rgb = [
+            lerp_f32(glow_rgb[0], tint[0], tint_strength),
+            lerp_f32(glow_rgb[1], tint[1], tint_strength),
+            lerp_f32(glow_rgb[2], tint[2], tint_strength),
+        ];
+        for c in 0..3 {
+            bright[i + c] = to_u8(glow_rgb[c] * gate * alpha);
+        }
+        bright[i + 3] = src[i + 3];
+    }
+
+    let inner = box_blur_rgba(&bright, width, height, inner_radius);
+    let outer = box_blur_rgba(&bright, width, height, outer_radius);
+    let mut out = src.to_vec();
+    for i in (0..src.len()).step_by(4) {
+        if src[i + 3] == 0 {
+            continue;
+        }
+        for c in 0..3 {
+            let base = src[i + c] as f32 / 255.0;
+            let glow = ((inner[i + c] as f32 / 255.0) * inner_amount
+                + (outer[i + c] as f32 / 255.0) * outer_amount)
+                * strength;
+            let target = if params.screen_blend {
+                screen_channel(base, glow.clamp(0.0, 1.0))
+            } else {
+                (base + glow).clamp(0.0, 1.0)
+            };
+            out[i + c] = to_u8(target);
+        }
+    }
+    out
+}
+
+fn neon_source_signal(rgb: [f32; 3], by_saturation: bool) -> f32 {
+    let luma = luma01(rgb[0], rgb[1], rgb[2]);
+    if !by_saturation {
+        return luma;
+    }
+    let max_channel = rgb[0].max(rgb[1]).max(rgb[2]);
+    let min_channel = rgb[0].min(rgb[1]).min(rgb[2]);
+    let chroma = max_channel - min_channel;
+    luma.max(max_channel * 0.72 + chroma * 0.28).clamp(0.0, 1.0)
+}
+
+fn color_range_gate(rgb: [f32; 3], target: [f32; 3], tolerance: f32, feather: f32) -> f32 {
+    let dr = rgb[0] - target[0];
+    let dg = rgb[1] - target[1];
+    let db = rgb[2] - target[2];
+    let dist = (dr * dr + dg * dg + db * db).sqrt() / 3.0_f32.sqrt();
+    (1.0 - smoothstep(tolerance, (tolerance + feather).min(1.0), dist)).clamp(0.0, 1.0)
+}
+
 fn apply_diffuse_glow(
     src: &[u8],
     width: usize,
@@ -8671,6 +8870,7 @@ mod tests {
             LocalEffect::Equalize(EqualizeParams::default()),
             LocalEffect::GradientMap(GradientMapParams::default()),
             LocalEffect::ColorOverlay(ColorOverlayParams::default()),
+            LocalEffect::NeonGlow(NeonGlowParams::default()),
             LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
@@ -8771,6 +8971,98 @@ mod tests {
                 blend_mode: ColorOverlayBlendMode::Normal,
                 start_rgb: [255, 0, 0],
                 opacity: 1.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn neon_glow_spreads_saturated_color_below_luma_threshold() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                0, 0, 0, 255, 0, 0, 0, 255, 0, 200, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "neon",
+            LocalMask::Full,
+            LocalEffect::NeonGlow(NeonGlowParams {
+                threshold: 0.82,
+                by_saturation: true,
+                inner_radius_px: 1.0,
+                outer_radius_px: 0.0,
+                strength: 1.0,
+                inner_amount: 1.0,
+                outer_amount: 0.0,
+                glow_saturation: 0.4,
+                screen_blend: true,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(
+            out.pixels[5] > src.pixels[5],
+            "neighbor should receive green glow"
+        );
+        assert!(
+            out.pixels[6] > src.pixels[6],
+            "neighbor should receive blue glow"
+        );
+        assert_eq!(out.pixels[7], 255);
+    }
+
+    #[test]
+    fn neon_glow_can_filter_source_color() {
+        let src = RgbaImageBuf::new(3, 1, vec![255, 32, 32, 255, 0, 0, 0, 255, 32, 80, 255, 255])
+            .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "neon",
+            LocalMask::Full,
+            LocalEffect::NeonGlow(NeonGlowParams {
+                threshold: 0.4,
+                by_saturation: true,
+                inner_radius_px: 0.0,
+                outer_radius_px: 1.0,
+                strength: 1.0,
+                inner_amount: 0.0,
+                outer_amount: 1.0,
+                glow_saturation: 0.0,
+                source_color_enabled: true,
+                source_rgb: [255, 32, 32],
+                source_tolerance: 0.05,
+                source_feather: 0.02,
+                screen_blend: false,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(
+            out.pixels[4] > src.pixels[4],
+            "red source should glow into center"
+        );
+        assert_eq!(
+            out.pixels[10], src.pixels[10],
+            "blue source should be excluded by source color"
+        );
+    }
+
+    #[test]
+    fn neon_glow_ignores_transparent_hidden_rgb() {
+        let src =
+            RgbaImageBuf::new(3, 1, vec![0, 0, 0, 255, 0, 255, 255, 0, 0, 0, 0, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "neon",
+            LocalMask::Full,
+            LocalEffect::NeonGlow(NeonGlowParams {
+                threshold: 0.2,
+                inner_radius_px: 1.0,
+                outer_radius_px: 0.0,
+                strength: 1.0,
                 ..Default::default()
             }),
         );

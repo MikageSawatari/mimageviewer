@@ -26,7 +26,7 @@ use local_adjust_core::{
     LensCorrectionParams, LineExtractMode, LineExtractParams, LineKind, LinearGradientMask,
     LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
     MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
-    OilPaintParams, PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams,
+    NeonGlowParams, OilPaintParams, PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams,
     PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
     RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
     RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams,
@@ -1008,6 +1008,7 @@ enum EffectKind {
     Equalize,
     GradientMap,
     ColorOverlay,
+    NeonGlow,
     DiffuseGlow,
     Bloom,
     Vignette,
@@ -1071,6 +1072,7 @@ impl EffectKind {
             LocalEffect::Equalize(_) => Self::Equalize,
             LocalEffect::GradientMap(_) => Self::GradientMap,
             LocalEffect::ColorOverlay(_) => Self::ColorOverlay,
+            LocalEffect::NeonGlow(_) => Self::NeonGlow,
             LocalEffect::DiffuseGlow(_) => Self::DiffuseGlow,
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::Vignette(_) => Self::Vignette,
@@ -1134,6 +1136,7 @@ impl EffectKind {
             Self::Equalize => "ヒストグラム平坦化",
             Self::GradientMap => "グラデーションマップ",
             Self::ColorOverlay => "塗り/グラデーション",
+            Self::NeonGlow => "ネオングロー",
             Self::DiffuseGlow => "拡散光彩",
             Self::Bloom => "ブルーム",
             Self::Vignette => "ビネット",
@@ -1240,6 +1243,9 @@ impl EffectKind {
             }
             Self::ColorOverlay => {
                 "単色やグラデーションの色面を、乗算・スクリーン・ソフトライトなどで重ねます。"
+            }
+            Self::NeonGlow => {
+                "明るい部分や高彩度の色を拾い、色付きの内側グローと外側ハローを作ります。"
             }
             Self::DiffuseGlow => {
                 "明るい部分を白く柔らかく拡散し、粒状感のある夢幻的な光彩を作ります。"
@@ -1377,6 +1383,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
         title: "光・雰囲気",
         kinds: &[
             EffectKind::ColorOverlay,
+            EffectKind::NeonGlow,
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
             EffectKind::StarGlow,
@@ -7400,6 +7407,12 @@ fn effect_summary(effect: &LocalEffect) -> String {
             color_overlay_blend_mode_label(params.blend_mode),
             params.opacity * 100.0
         ),
+        LocalEffect::NeonGlow(params) => format!(
+            "ネオングロー {:.0}/{:.0}px {:.0}%",
+            params.inner_radius_px,
+            params.outer_radius_px,
+            params.strength * 100.0
+        ),
         LocalEffect::DiffuseGlow(params) => format!("拡散光彩 {:.0}px", params.radius_px),
         LocalEffect::Bloom(params) => format!("ブルーム {:.0}px", params.radius_px),
         LocalEffect::Vignette(params) => format!("ビネット {:.0}%", params.strength * 100.0),
@@ -11646,6 +11659,154 @@ fn draw_effect_params(
                     .lab_hover_tip("グラデーションの変化を直線的にするか、なだらかにするかです。");
             }
         }
+        LocalEffect::NeonGlow(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "シアン管") {
+                    *params = NeonGlowParams {
+                        threshold: 0.72,
+                        by_saturation: true,
+                        inner_radius_px: 5.0,
+                        outer_radius_px: 34.0,
+                        strength: 0.95,
+                        inner_amount: 0.95,
+                        outer_amount: 0.85,
+                        glow_saturation: 0.85,
+                        tint_rgb: [0, 220, 255],
+                        tint_strength: 0.28,
+                        screen_blend: true,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "マゼンタ") {
+                    *params = NeonGlowParams {
+                        threshold: 0.68,
+                        by_saturation: true,
+                        inner_radius_px: 4.0,
+                        outer_radius_px: 26.0,
+                        strength: 0.90,
+                        inner_amount: 1.0,
+                        outer_amount: 0.72,
+                        glow_saturation: 0.95,
+                        tint_rgb: [255, 58, 210],
+                        tint_strength: 0.38,
+                        screen_blend: true,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "広いハロー") {
+                    *params = NeonGlowParams {
+                        threshold: 0.50,
+                        by_saturation: true,
+                        inner_radius_px: 7.0,
+                        outer_radius_px: 64.0,
+                        strength: 0.70,
+                        inner_amount: 0.62,
+                        outer_amount: 1.15,
+                        glow_saturation: 0.55,
+                        tint_strength: 0.0,
+                        screen_blend: true,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "色指定") {
+                    *params = NeonGlowParams {
+                        threshold: 0.36,
+                        by_saturation: true,
+                        inner_radius_px: 5.0,
+                        outer_radius_px: 24.0,
+                        strength: 0.85,
+                        inner_amount: 0.85,
+                        outer_amount: 0.75,
+                        glow_saturation: 0.45,
+                        source_color_enabled: true,
+                        source_rgb: [0, 220, 255],
+                        source_tolerance: 0.24,
+                        source_feather: 0.12,
+                        tint_rgb: [0, 220, 255],
+                        tint_strength: 0.18,
+                        screen_blend: true,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "輝度だけでなく高彩度の色も発光源として拾い、芯のにじみと広いハローを二段で重ねます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let threshold =
+                ui.add(egui::Slider::new(&mut params.threshold, 0.05..=0.999).text("発光しきい値"));
+            changed |= threshold.changed();
+            threshold.lab_hover_tip(
+                "どの明るさ/鮮やかさから発光源として拾うかです。低いほど広く光ります。",
+            );
+            let by_saturation = ui.checkbox(&mut params.by_saturation, "鮮やかな色も拾う");
+            changed |= by_saturation.changed();
+            by_saturation.lab_hover_tip(
+                "ONにすると、白くないシアンやマゼンタのネオン色も発光源になります。",
+            );
+            let source_color = ui.checkbox(&mut params.source_color_enabled, "発光色を指定する");
+            changed |= source_color.changed();
+            source_color
+                .lab_hover_tip("ONにすると、指定色に近い線や面だけを発光源として拾います。");
+            if params.source_color_enabled {
+                changed |= draw_rgb_color_control(ui, "発光源の色", &mut params.source_rgb);
+                let tolerance = ui
+                    .add(egui::Slider::new(&mut params.source_tolerance, 0.0..=1.0).text("色許容"));
+                changed |= tolerance.changed();
+                tolerance
+                    .lab_hover_tip("発光源として拾う色の近さです。低いほど指定色だけに絞ります。");
+                let feather = ui.add(
+                    egui::Slider::new(&mut params.source_feather, 0.001..=1.0).text("色ぼかし"),
+                );
+                changed |= feather.changed();
+                feather.lab_hover_tip("指定色の範囲境界をどれだけなだらかにするかです。");
+            }
+            let inner_radius = ui.add(
+                egui::Slider::new(&mut params.inner_radius_px, 0.0..=96.0)
+                    .text("芯の半径")
+                    .suffix("px"),
+            );
+            changed |= inner_radius.changed();
+            inner_radius.lab_hover_tip("光源の近くに出る強いにじみの半径です。");
+            let outer_radius = ui.add(
+                egui::Slider::new(&mut params.outer_radius_px, 0.0..=180.0)
+                    .text("ハロー半径")
+                    .suffix("px"),
+            );
+            changed |= outer_radius.changed();
+            outer_radius.lab_hover_tip("周囲へ広く漂う外側の光の半径です。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=2.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("内側グローと外側ハローを元画像へ重ねる強さです。");
+            let inner_amount =
+                ui.add(egui::Slider::new(&mut params.inner_amount, 0.0..=2.0).text("芯の強さ"));
+            changed |= inner_amount.changed();
+            inner_amount.lab_hover_tip("光源近くの強いグローの量です。");
+            let outer_amount =
+                ui.add(egui::Slider::new(&mut params.outer_amount, 0.0..=2.0).text("ハロー量"));
+            changed |= outer_amount.changed();
+            outer_amount.lab_hover_tip("外側へ広がる柔らかいハローの量です。");
+            let glow_saturation =
+                ui.add(egui::Slider::new(&mut params.glow_saturation, -1.0..=2.0).text("光の彩度"));
+            changed |= glow_saturation.changed();
+            glow_saturation.lab_hover_tip("光輪の色をどれだけ鮮やかにするかです。");
+            changed |= draw_rgb_color_control(ui, "着色", &mut params.tint_rgb);
+            let tint_strength =
+                ui.add(egui::Slider::new(&mut params.tint_strength, 0.0..=1.0).text("着色量"));
+            changed |= tint_strength.changed();
+            tint_strength.lab_hover_tip("元の発光色から、着色で指定した色へどれだけ寄せるかです。");
+            let screen_blend = ui.checkbox(&mut params.screen_blend, "スクリーン合成");
+            changed |= screen_blend.changed();
+            screen_blend.lab_hover_tip("ONにすると、加算より白飛びを抑えながら発光感を出します。");
+        }
         LocalEffect::DiffuseGlow(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -13278,6 +13439,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Equalize => LocalEffect::Equalize(EqualizeParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
         EffectKind::ColorOverlay => LocalEffect::ColorOverlay(ColorOverlayParams::default()),
+        EffectKind::NeonGlow => LocalEffect::NeonGlow(NeonGlowParams::default()),
         EffectKind::DiffuseGlow => LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
@@ -15147,6 +15309,7 @@ mod tests {
             EffectKind::Equalize,
             EffectKind::GradientMap,
             EffectKind::ColorOverlay,
+            EffectKind::NeonGlow,
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
             EffectKind::Vignette,
