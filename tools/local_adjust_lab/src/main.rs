@@ -58,6 +58,10 @@ const PANEL_MIN_BODY_H: f32 = 160.0;
 const EFFECT_PICKER_BUTTON_MIN_W: f32 = 146.0;
 const EFFECT_PICKER_BUTTON_MAX_W: f32 = 172.0;
 const EFFECT_PICKER_BUTTON_H: f32 = 30.0;
+const PANEL_SECTION_MARGIN_LEFT: i8 = 10;
+const PANEL_SECTION_MARGIN_RIGHT: i8 = 6;
+const PANEL_SECTION_CONTENT_W_SHRINK: f32 =
+    (PANEL_SECTION_MARGIN_LEFT + PANEL_SECTION_MARGIN_RIGHT) as f32;
 const ZOOM_MIN: f32 = 0.05;
 const ZOOM_MAX: f32 = 12.0;
 const NUDGE_PIXELS: f32 = 1.0;
@@ -1002,18 +1006,20 @@ impl MaskKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolPanelSection {
+enum PanelSection {
+    General,
     Tool,
     Mask,
     Effect,
 }
 
-impl ToolPanelSection {
+impl PanelSection {
     fn accent_color(self) -> Color32 {
         match self {
+            Self::General => Color32::from_rgb(115, 115, 122),
             Self::Tool => Color32::from_rgb(110, 145, 220),
             Self::Mask => Color32::from_rgb(80, 190, 165),
-            Self::Effect => Color32::from_rgb(220, 160, 84),
+            Self::Effect => Color32::from_rgb(225, 185, 80),
         }
     }
 }
@@ -4272,25 +4278,45 @@ impl LocalAdjustLabApp {
     fn draw_controls(&mut self, ui: &mut egui::Ui) {
         apply_lab_dark_ui(ui);
 
-        let btn_w = ((PANEL_W - 20.0 - 4.0) / 2.0).max(96.0);
+        let section_panel_w = PANEL_W - PANEL_SECTION_CONTENT_W_SHRINK;
+        let btn_w = ((section_panel_w - 20.0 - 4.0) / 2.0).max(96.0);
         let btn_size = egui::vec2(btn_w, 24.0);
-        self.draw_workflow_selector(ui);
+        draw_panel_section(ui, PanelSection::General, |ui| {
+            self.draw_workflow_selector(ui, section_panel_w);
+        });
 
-        ui.separator();
         match self.workflow_panel {
-            LabWorkflowPanel::Eraser => self.draw_placeholder_stage_panel(
-                ui,
-                "消しゴム",
-                "本体統合時に既存の消しゴム処理を接続します。",
-            ),
-            LabWorkflowPanel::Adjust => self.draw_adjust_layer_controls(ui, btn_size),
-            LabWorkflowPanel::Conceal => self.draw_placeholder_stage_panel(
-                ui,
-                "隠蔽加工",
-                "本体統合時に既存の隠蔽加工処理を接続します。",
-            ),
-            LabWorkflowPanel::Crop => self.draw_crop_controls(ui),
-            LabWorkflowPanel::Save => self.draw_save_controls(ui, btn_size),
+            LabWorkflowPanel::Eraser => {
+                draw_panel_section(ui, PanelSection::General, |ui| {
+                    self.draw_placeholder_stage_panel(
+                        ui,
+                        "消しゴム",
+                        "本体統合時に既存の消しゴム処理を接続します。",
+                    );
+                });
+            }
+            LabWorkflowPanel::Adjust => {
+                self.draw_adjust_layer_controls(ui, btn_size, section_panel_w)
+            }
+            LabWorkflowPanel::Conceal => {
+                draw_panel_section(ui, PanelSection::General, |ui| {
+                    self.draw_placeholder_stage_panel(
+                        ui,
+                        "隠蔽加工",
+                        "本体統合時に既存の隠蔽加工処理を接続します。",
+                    );
+                });
+            }
+            LabWorkflowPanel::Crop => {
+                draw_panel_section(ui, PanelSection::General, |ui| {
+                    self.draw_crop_controls(ui, section_panel_w);
+                });
+            }
+            LabWorkflowPanel::Save => {
+                draw_panel_section(ui, PanelSection::General, |ui| {
+                    self.draw_save_controls(ui, btn_size);
+                });
+            }
         }
     }
 
@@ -4341,9 +4367,9 @@ impl LocalAdjustLabApp {
         });
     }
 
-    fn draw_workflow_selector(&mut self, ui: &mut egui::Ui) {
+    fn draw_workflow_selector(&mut self, ui: &mut egui::Ui, panel_w: f32) {
         ui.label(egui::RichText::new("処理順:").color(Color32::from_gray(200)));
-        let button_w = ((PANEL_W - 28.0) / 5.0).max(52.0);
+        let button_w = ((panel_w - 28.0) / 5.0).max(52.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for panel in LabWorkflowPanel::ALL {
@@ -4376,22 +4402,31 @@ impl LocalAdjustLabApp {
         );
     }
 
-    fn draw_adjust_layer_controls(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
-        self.draw_display_controls(ui, btn_size);
-        ui.separator();
-        self.draw_layer_list(ui, PANEL_W);
+    fn draw_adjust_layer_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        btn_size: egui::Vec2,
+        panel_w: f32,
+    ) {
+        draw_panel_section(ui, PanelSection::General, |ui| {
+            self.draw_display_controls(ui, btn_size);
+        });
+        draw_panel_section(ui, PanelSection::General, |ui| {
+            self.draw_layer_list(ui, panel_w);
+        });
         if self.layers.is_empty() {
             return;
         }
 
-        ui.separator();
-        self.draw_effect_selector(ui);
-
-        ui.separator();
-        self.draw_manual_tool_selector(ui, btn_size);
+        draw_panel_section(ui, PanelSection::Effect, |ui| {
+            self.draw_effect_selector(ui, panel_w);
+        });
+        draw_panel_section(ui, PanelSection::Mask, |ui| {
+            self.draw_manual_tool_selector(ui, btn_size);
+        });
     }
 
-    fn draw_effect_selector(&mut self, ui: &mut egui::Ui) {
+    fn draw_effect_selector(&mut self, ui: &mut egui::Ui, panel_w: f32) {
         ui.label(egui::RichText::new("加工内容:").color(Color32::from_gray(200)));
         let label = self
             .layers
@@ -4400,7 +4435,7 @@ impl LocalAdjustLabApp {
             .unwrap_or_else(|| "効果なし".to_string());
         ui.horizontal(|ui| {
             ui.add_sized(
-                egui::vec2((PANEL_W - 82.0).max(160.0), 24.0),
+                egui::vec2((panel_w - 82.0).max(160.0), 24.0),
                 egui::Label::new(
                     egui::RichText::new(label)
                         .size(12.0)
@@ -4476,11 +4511,11 @@ impl LocalAdjustLabApp {
         );
     }
 
-    fn draw_crop_controls(&mut self, ui: &mut egui::Ui) {
+    fn draw_crop_controls(&mut self, ui: &mut egui::Ui, panel_w: f32) {
         let Some((w, h)) = self.image_dims() else {
             return;
         };
-        let btn_w = ((PANEL_W - 20.0 - 4.0) / 2.0).max(96.0);
+        let btn_w = ((panel_w - 20.0 - 4.0) / 2.0).max(96.0);
         ui.label(
             egui::RichText::new("切り取り")
                 .size(14.0)
@@ -5508,7 +5543,7 @@ impl LocalAdjustLabApp {
         let manual_edit_controls_visible =
             raster_vector_edit_controls_visible(selected_mask_kind, self.override_edit_panel);
 
-        draw_tool_panel_section(ui, ToolPanelSection::Tool, |ui| {
+        draw_panel_section(ui, PanelSection::Tool, |ui| {
             if manual_edit_controls_visible {
                 self.draw_tool_controls(ui);
             } else {
@@ -5561,7 +5596,7 @@ impl LocalAdjustLabApp {
             }
         });
 
-        draw_tool_panel_section(ui, ToolPanelSection::Mask, |ui| {
+        draw_panel_section(ui, PanelSection::Mask, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("マスク設定")
@@ -5647,7 +5682,7 @@ impl LocalAdjustLabApp {
         let rgb_pick_active = self.rgb_pick_active;
         let effect_position_handles_visible = self.effect_position_handles_visible;
         let effect_clipboard_available = self.effect_clipboard.is_some();
-        draw_tool_panel_section(ui, ToolPanelSection::Effect, |ui| {
+        draw_panel_section(ui, PanelSection::Effect, |ui| {
             let dims = self.image_dims().unwrap_or((1, 1));
             if let Some(layer) = self.selected_layer_mut() {
                 let response = draw_effect_params(
@@ -19528,13 +19563,18 @@ fn panel_toggle_button(
     }
 }
 
-fn draw_tool_panel_section<R>(
+fn draw_panel_section<R>(
     ui: &mut egui::Ui,
-    section: ToolPanelSection,
+    section: PanelSection,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     let response = egui::Frame::new()
-        .inner_margin(6.0)
+        .inner_margin(egui::Margin {
+            left: PANEL_SECTION_MARGIN_LEFT,
+            right: PANEL_SECTION_MARGIN_RIGHT,
+            top: 6,
+            bottom: 6,
+        })
         .show(ui, |ui| add_contents(ui));
     let rect = response.response.rect;
     let line_rect = Rect::from_min_max(
