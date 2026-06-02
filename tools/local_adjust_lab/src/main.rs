@@ -22,8 +22,8 @@ use local_adjust_core::{
     ColorFillParams, ColorGradeWheel, ColorHalftoneParams, ColorMixerParams, ColorOverlayBlendMode,
     ColorOverlayParams, ColorOverlayShape, ColorRangeMask, ColorTraceParams, ContactShadowParams,
     CubeLutParams, CutoutParams, DataMoshParams, DefringeParams, DehazeParams, DespeckleParams,
-    DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams,
-    EngravingParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
+    DiffractionStarburstParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
+    EmbossParams, EngravingParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
     GlassDisplacementParams, GlowingEdgesParams, GodRaysParams, GradientMapParams,
     GradientMapPreset, HalationParams, HalftoneParams, HeatHazeParams, HighPassParams,
     HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
@@ -1119,6 +1119,7 @@ enum EffectKind {
     NewspaperPrint,
     Textureizer,
     StarGlow,
+    DiffractionStarburst,
     EdgeSmooth,
     Despeckle,
     Median,
@@ -1289,6 +1290,7 @@ impl EffectKind {
             LocalEffect::NewspaperPrint(_) => Self::NewspaperPrint,
             LocalEffect::Textureizer(_) => Self::Textureizer,
             LocalEffect::StarGlow(_) => Self::StarGlow,
+            LocalEffect::DiffractionStarburst(_) => Self::DiffractionStarburst,
             LocalEffect::EdgeSmooth(_) => Self::EdgeSmooth,
             LocalEffect::Despeckle(_) => Self::Despeckle,
             LocalEffect::Median(_) => Self::Median,
@@ -1390,6 +1392,7 @@ impl EffectKind {
             Self::NewspaperPrint => "新聞印刷",
             Self::Textureizer => "テクスチャライザ",
             Self::StarGlow => "クロス光",
+            Self::DiffractionStarburst => "回折スターバースト",
             Self::EdgeSmooth => "エッジ保持ぼかし",
             Self::Despeckle => "ディスペックル",
             Self::Median => "メディアン",
@@ -1402,6 +1405,7 @@ impl EffectKind {
             Self::HighlightsShadows => "ハイライト/影",
             Self::Equalize => "ヒスト平坦化",
             Self::AnamorphicFlare => "アナモルフフレア",
+            Self::DiffractionStarburst => "回折スター",
             Self::WaterCaustics => "水中光網",
             Self::ParticleOverlay => "天候粒子",
             Self::Aurora => "オーロラ",
@@ -1608,6 +1612,9 @@ impl EffectKind {
                 "紙目、キャンバス、リネンの手続き型テクスチャをソフトライトで重ね、手描き感や紙質を足します。"
             }
             Self::StarGlow => "明るい部分から十字や多方向の光線を描写します。",
+            Self::DiffractionStarburst => {
+                "点光源から絞り羽根数に応じた細い光条を伸ばし、カメラの回折スター風にします。"
+            }
             Self::EdgeSmooth => "輪郭をなるべく残しながら面をなめらかにします。",
             Self::Despeckle => {
                 "周囲から大きく外れた孤立点だけを中央値へ寄せ、スキャンの白点・黒点を目立ちにくくします。"
@@ -1780,6 +1787,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Aurora,
             EffectKind::Spotlight,
             EffectKind::StarGlow,
+            EffectKind::DiffractionStarburst,
             EffectKind::Vignette,
             EffectKind::FilmGrain,
             EffectKind::Noise,
@@ -9283,6 +9291,10 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::StarGlow(params) => {
             format!("クロス光 {}本 {:.0}px", params.ray_count, params.length_px)
         }
+        LocalEffect::DiffractionStarburst(params) => format!(
+            "回折スター {}羽 {:.0}px",
+            params.blade_count, params.length_px
+        ),
         LocalEffect::EdgeSmooth(params) => {
             format!("エッジ保持ぼかし {:.0}px", params.radius_px)
         }
@@ -18109,6 +18121,101 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.strength, 0.0..=3.0).text("強さ"))
                 .changed();
         }
+        LocalEffect::DiffractionStarburst(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "6羽スター") {
+                    *params = DiffractionStarburstParams {
+                        blade_count: 6,
+                        rotation_degrees: 0.0,
+                        threshold: 0.995,
+                        length_px: 96.0,
+                        width_px: 1.4,
+                        halo_radius_px: 12.0,
+                        chromatic_shift: 0.20,
+                        strength: 0.80,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "5羽きらめき") {
+                    *params = DiffractionStarburstParams {
+                        blade_count: 5,
+                        rotation_degrees: -8.0,
+                        threshold: 0.996,
+                        length_px: 76.0,
+                        width_px: 1.1,
+                        halo_radius_px: 8.0,
+                        chromatic_shift: 0.35,
+                        strength: 0.72,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "長い光条") {
+                    *params = DiffractionStarburstParams {
+                        blade_count: 8,
+                        rotation_degrees: 12.0,
+                        threshold: 0.993,
+                        length_px: 150.0,
+                        width_px: 1.8,
+                        halo_radius_px: 18.0,
+                        chromatic_shift: 0.30,
+                        strength: 0.90,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "点光源だけ") {
+                    *params = DiffractionStarburstParams {
+                        blade_count: 7,
+                        rotation_degrees: 0.0,
+                        threshold: 0.998,
+                        length_px: 104.0,
+                        width_px: 0.9,
+                        halo_radius_px: 6.0,
+                        chromatic_shift: 0.18,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "明るい点から絞り羽根状の細い光条を伸ばします。奇数羽根では光条が倍になります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let mut blade_count = params.blade_count as i32;
+            changed |= ui
+                .add(egui::Slider::new(&mut blade_count, 3..=12).text("絞り羽根数"))
+                .changed();
+            params.blade_count = blade_count.clamp(3, 12) as u32;
+            changed |= ui
+                .add(egui::Slider::new(&mut params.rotation_degrees, -180.0..=180.0).text("回転"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.threshold, 0.90..=0.9999)
+                        .text("明部しきい値")
+                        .fixed_decimals(4)
+                        .smart_aim(false),
+                )
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.length_px, 1.0..=360.0).text("光条長"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.width_px, 0.4..=12.0).text("光条幅"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.halo_radius_px, 0.0..=96.0).text("点光源ハロー"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.chromatic_shift, 0.0..=1.0).text("色ズレ"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=3.0).text("強さ"))
+                .changed();
+        }
         LocalEffect::EdgeSmooth(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -19748,6 +19855,9 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::NewspaperPrint => LocalEffect::NewspaperPrint(NewspaperPrintParams::default()),
         EffectKind::Textureizer => LocalEffect::Textureizer(TextureizerParams::default()),
         EffectKind::StarGlow => LocalEffect::StarGlow(StarGlowParams::default()),
+        EffectKind::DiffractionStarburst => {
+            LocalEffect::DiffractionStarburst(DiffractionStarburstParams::default())
+        }
         EffectKind::EdgeSmooth => LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
         EffectKind::Despeckle => LocalEffect::Despeckle(DespeckleParams::default()),
         EffectKind::Median => LocalEffect::Median(MedianParams::default()),
@@ -22264,6 +22374,7 @@ mod tests {
             EffectKind::OldFilm,
             EffectKind::ColorOverlay,
             EffectKind::StarGlow,
+            EffectKind::DiffractionStarburst,
             EffectKind::EdgeSmooth,
             EffectKind::Despeckle,
             EffectKind::Median,

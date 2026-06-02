@@ -619,6 +619,7 @@ pub enum LocalEffect {
     NewspaperPrint(NewspaperPrintParams),
     Textureizer(TextureizerParams),
     StarGlow(StarGlowParams),
+    DiffractionStarburst(DiffractionStarburstParams),
     EdgeSmooth(EdgeSmoothParams),
     Despeckle(DespeckleParams),
     Median(MedianParams),
@@ -720,6 +721,7 @@ impl LocalEffect {
             Self::NewspaperPrint(_) => "新聞印刷",
             Self::Textureizer(_) => "テクスチャライザ",
             Self::StarGlow(_) => "クロス光",
+            Self::DiffractionStarburst(_) => "回折スターバースト",
             Self::EdgeSmooth(_) => "エッジ保持ぼかし",
             Self::Despeckle(_) => "ディスペックル",
             Self::Median(_) => "メディアンフィルタ",
@@ -739,6 +741,7 @@ pub fn default_mask_application_for_effect(effect: &LocalEffect) -> MaskApplicat
         | LocalEffect::GodRays(_)
         | LocalEffect::AnamorphicFlare(_)
         | LocalEffect::StarGlow(_)
+        | LocalEffect::DiffractionStarburst(_)
         | LocalEffect::OutlineStroke(_)
         | LocalEffect::RimLight(_) => MaskApplication {
             before_effect: true,
@@ -3515,6 +3518,33 @@ impl Default for StarGlowParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DiffractionStarburstParams {
+    pub blade_count: u32,
+    pub rotation_degrees: f32,
+    pub threshold: f32,
+    pub length_px: f32,
+    pub width_px: f32,
+    pub halo_radius_px: f32,
+    pub chromatic_shift: f32,
+    pub strength: f32,
+}
+
+impl Default for DiffractionStarburstParams {
+    fn default() -> Self {
+        Self {
+            blade_count: 6,
+            rotation_degrees: 0.0,
+            threshold: 0.995,
+            length_px: 96.0,
+            width_px: 1.6,
+            halo_radius_px: 14.0,
+            chromatic_shift: 0.25,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EdgeSmoothParams {
     pub radius_px: f32,
     pub strength: f32,
@@ -4088,6 +4118,9 @@ where
             }
             LocalEffect::StarGlow(params) => {
                 apply_star_glow(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::DiffractionStarburst(params) => {
+                apply_diffraction_starburst(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::EdgeSmooth(params) => {
                 apply_edge_smooth(&image.pixels, image.width, image.height, *params)
@@ -12560,6 +12593,163 @@ fn normalize_star_ray_count(ray_count: u32) -> u32 {
     count.clamp(2, 12)
 }
 
+fn apply_diffraction_starburst(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: DiffractionStarburstParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 3.0);
+    let length = params.length_px.clamp(1.0, 360.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let blade_count = normalize_diffraction_blade_count(params.blade_count);
+    let ray_count = diffraction_ray_count(blade_count);
+    let max_steps = length.round().clamp(1.0, 360.0) as usize;
+    let width_px = params.width_px.clamp(0.4, 12.0);
+    let threshold = params.threshold.clamp(0.0, 0.9999);
+    let inv_range = 1.0 / (1.0 - threshold).max(0.001);
+    let rotation = params.rotation_degrees.to_radians();
+    let halo_radius = params.halo_radius_px.round().clamp(0.0, 96.0) as usize;
+    let chromatic_shift = params.chromatic_shift.clamp(0.0, 1.0);
+    let mut dirs = Vec::with_capacity(ray_count as usize);
+    for ray in 0..ray_count {
+        let angle = rotation + std::f32::consts::TAU * ray as f32 / ray_count as f32;
+        dirs.push((angle.cos(), angle.sin()));
+    }
+
+    let mut streak = vec![0.0_f32; width * height * 3];
+    let mut bright = vec![0_u8; src.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let o = (y * width + x) * 4;
+            let alpha = src[o + 3] as f32 / 255.0;
+            if alpha <= f32::EPSILON {
+                continue;
+            }
+            let r = src[o] as f32 / 255.0;
+            let g = src[o + 1] as f32 / 255.0;
+            let b = src[o + 2] as f32 / 255.0;
+            let signal = luma01(r, g, b).max(r.max(g).max(b) * 0.92);
+            let weight = ((signal - threshold) * inv_range).clamp(0.0, 1.0);
+            let weight = weight * weight * alpha;
+            if weight <= 0.001 {
+                continue;
+            }
+
+            let color = [
+                (r + (1.0 - r) * 0.20) * weight,
+                (g + (1.0 - g) * 0.20) * weight,
+                (b + (1.0 - b) * 0.20) * weight,
+            ];
+            for c in 0..3 {
+                bright[o + c] = to_u8(color[c]);
+            }
+            bright[o + 3] = src[o + 3];
+
+            for &(dx, dy) in &dirs {
+                let px = -dy;
+                let py = dx;
+                for step in 1..=max_steps {
+                    let distance = step as f32;
+                    let linear = 1.0 - distance / (max_steps as f32 + 1.0);
+                    if linear <= 0.0 {
+                        break;
+                    }
+                    let falloff = linear.powf(1.25) * (-distance / (length * 0.62)).exp();
+                    if falloff <= 0.0001 {
+                        continue;
+                    }
+                    let base_x = x as f32 + dx * distance;
+                    let base_y = y as f32 + dy * distance;
+                    if base_x < -width_px
+                        || base_y < -width_px
+                        || base_x > width as f32 - 1.0 + width_px
+                        || base_y > height as f32 - 1.0 + width_px
+                    {
+                        break;
+                    }
+
+                    let side_offsets = [
+                        (0.0, 1.0),
+                        (-0.42 * width_px, 0.46),
+                        (0.42 * width_px, 0.46),
+                    ];
+                    for (side, side_weight) in side_offsets {
+                        let sx = base_x + px * side;
+                        let sy = base_y + py * side;
+                        if sx < -0.001
+                            || sy < -0.001
+                            || sx > width as f32 - 1.0 + 0.001
+                            || sy > height as f32 - 1.0 + 0.001
+                        {
+                            continue;
+                        }
+                        let mut ray_color = color;
+                        if chromatic_shift > 0.0 {
+                            let phase = (distance / length).clamp(0.0, 1.0);
+                            let blue_bias = phase * chromatic_shift * 0.28;
+                            let red_bias = (1.0 - phase * 0.4) * chromatic_shift * 0.10;
+                            ray_color[0] *= 1.0 + red_bias;
+                            ray_color[1] *= 1.0 - blue_bias * 0.25;
+                            ray_color[2] *= 1.0 + blue_bias;
+                        }
+                        add_bilinear_rgb(
+                            &mut streak,
+                            width,
+                            height,
+                            sx,
+                            sy,
+                            ray_color,
+                            falloff * side_weight,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let halo = if halo_radius > 0 {
+        Some(box_blur_rgba(&bright, width, height, halo_radius))
+    } else {
+        None
+    };
+    let mut out = src.to_vec();
+    let ray_scale = strength / (ray_count as f32 * 0.42).max(1.0);
+    let halo_scale = strength * 0.35;
+    for i in 0..width * height {
+        let si = i * 3;
+        let oi = i * 4;
+        if src[oi + 3] == 0 {
+            continue;
+        }
+        for c in 0..3 {
+            let base = src[oi + c] as f32 / 255.0;
+            let ray = streak[si + c] * ray_scale;
+            let halo_add = halo
+                .as_ref()
+                .map(|h| h[oi + c] as f32 / 255.0 * halo_scale)
+                .unwrap_or(0.0);
+            out[oi + c] = to_u8(base + ray + halo_add);
+        }
+    }
+    out
+}
+
+fn normalize_diffraction_blade_count(blade_count: u32) -> u32 {
+    blade_count.clamp(3, 12)
+}
+
+fn diffraction_ray_count(blade_count: u32) -> u32 {
+    if blade_count % 2 == 0 {
+        blade_count
+    } else {
+        blade_count * 2
+    }
+}
+
 fn add_bilinear_rgb(
     dst: &mut [f32],
     width: usize,
@@ -13277,6 +13467,14 @@ mod tests {
         );
         assert!(anamorphic_flare.mask_before_effect);
         assert!(!anamorphic_flare.mask_after_effect);
+
+        let diffraction_starburst = LocalAdjustmentLayer::new(
+            "diffraction starburst",
+            LocalMask::Full,
+            LocalEffect::DiffractionStarburst(DiffractionStarburstParams::default()),
+        );
+        assert!(diffraction_starburst.mask_before_effect);
+        assert!(!diffraction_starburst.mask_after_effect);
 
         let wave = LocalAdjustmentLayer::new(
             "wave",
@@ -15125,6 +15323,7 @@ mod tests {
             LocalEffect::NewspaperPrint(NewspaperPrintParams::default()),
             LocalEffect::Textureizer(TextureizerParams::default()),
             LocalEffect::StarGlow(StarGlowParams::default()),
+            LocalEffect::DiffractionStarburst(DiffractionStarburstParams::default()),
             LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
             LocalEffect::Despeckle(DespeckleParams::default()),
             LocalEffect::Median(MedianParams::default()),
@@ -16043,6 +16242,19 @@ mod tests {
                     rotation_degrees: 15.0,
                     threshold: 0.0,
                     length_px: 240.0,
+                    strength: 3.0,
+                }),
+            ),
+            full(
+                "diffraction starburst max rays",
+                LocalEffect::DiffractionStarburst(DiffractionStarburstParams {
+                    blade_count: 12,
+                    rotation_degrees: 15.0,
+                    threshold: 0.0,
+                    length_px: 360.0,
+                    width_px: 12.0,
+                    halo_radius_px: 96.0,
+                    chromatic_shift: 1.0,
                     strength: 3.0,
                 }),
             ),
@@ -19148,6 +19360,41 @@ LUT_3D_SIZE 2
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert!(out.pixels[(2 * 3 + 2) * 4] > src.pixels[(2 * 3 + 2) * 4]);
+    }
+
+    #[test]
+    fn diffraction_starburst_odd_blades_produce_double_rays() {
+        assert_eq!(diffraction_ray_count(5), 10);
+        assert_eq!(diffraction_ray_count(6), 6);
+    }
+
+    #[test]
+    fn diffraction_starburst_extends_bright_pixel_and_keeps_alpha() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "diffraction",
+            LocalMask::Full,
+            LocalEffect::DiffractionStarburst(DiffractionStarburstParams {
+                blade_count: 6,
+                rotation_degrees: 0.0,
+                threshold: 0.5,
+                length_px: 4.0,
+                width_px: 0.5,
+                halo_radius_px: 0.0,
+                chromatic_shift: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[4] > src.pixels[4]);
+        assert_eq!(out.pixels[3], 255);
     }
 
     #[test]
