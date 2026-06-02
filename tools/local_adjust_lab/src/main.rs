@@ -27,23 +27,24 @@ use local_adjust_core::{
     GradientMapPreset, HalationParams, HalftoneParams, HeatHazeParams, HighPassParams,
     HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
     LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams, LineKind,
-    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
-    ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
-    MotionBlurParams, NeonGlowParams, NewspaperPrintParams, NoiseDistribution, NoiseParams,
-    OilPaintParams, OldFilmParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement,
-    PartColorParams, ParticleOverlayMode, ParticleOverlayParams, PinchSpherizeParams,
-    PixelSortDirection, PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams,
-    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
-    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
-    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams,
-    ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams,
-    SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams,
-    SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
-    TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
-    TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams,
-    VignetteParams, WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection,
-    WindParams, WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
+    LinearGradientMask, LithographParams, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
+    LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
+    MosaicTileMode, MotionBlurParams, NeonGlowParams, NewspaperPrintParams, NoiseDistribution,
+    NoiseParams, OilPaintParams, OldFilmParams, OrtonParams, OutlineStrokeParams,
+    OutlineStrokePlacement, PartColorParams, ParticleOverlayMode, ParticleOverlayParams,
+    PinchSpherizeParams, PixelSortDirection, PixelSortOrder, PixelSortParams, PixelStylizeMode,
+    PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
+    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
+    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams,
+    ScanlineGlitchParams, ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp,
+    SharpenParams, SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode,
+    SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement,
+    TextureParams, TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams,
+    VhsParams, VignetteParams, WaterCausticsParams, WaveDistortionMode, WaveDistortionParams,
+    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
+    compute_mosaic_tile_size, default_mask_application_for_effect, evaluate_layer_mask,
+    parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1086,6 +1087,7 @@ enum EffectKind {
     ScreenTone,
     ColorHalftone,
     CmykPlateShift,
+    Lithograph,
     NewspaperPrint,
     Textureizer,
     StarGlow,
@@ -1114,6 +1116,9 @@ enum RgbPickTarget {
     ContactShadowColor,
     ColorDodgeGlowColor,
     AnamorphicFlareColor,
+    LithographInkA,
+    LithographInkB,
+    LithographPaper,
     PartColorTarget,
     HalationTint,
     ToonShadeShadowTint,
@@ -1141,6 +1146,9 @@ impl RgbPickTarget {
             Self::ContactShadowColor => "接触影の影色",
             Self::ColorDodgeGlowColor => "覆い焼き発光の光色",
             Self::AnamorphicFlareColor => "アナモルフィックフレアの色",
+            Self::LithographInkA => "リソグラフのインク1",
+            Self::LithographInkB => "リソグラフのインク2",
+            Self::LithographPaper => "リソグラフの紙色",
             Self::PartColorTarget => "パートカラーの対象色",
             Self::HalationTint => "ハレーションの暖色",
             Self::ToonShadeShadowTint => "トゥーン影色",
@@ -1237,6 +1245,7 @@ impl EffectKind {
             LocalEffect::ScreenTone(_) => Self::ScreenTone,
             LocalEffect::ColorHalftone(_) => Self::ColorHalftone,
             LocalEffect::CmykPlateShift(_) => Self::CmykPlateShift,
+            LocalEffect::Lithograph(_) => Self::Lithograph,
             LocalEffect::NewspaperPrint(_) => Self::NewspaperPrint,
             LocalEffect::Textureizer(_) => Self::Textureizer,
             LocalEffect::StarGlow(_) => Self::StarGlow,
@@ -1333,6 +1342,7 @@ impl EffectKind {
             Self::ScreenTone => "スクリーントーン",
             Self::ColorHalftone => "カラーハーフトーン",
             Self::CmykPlateShift => "CMYK版ズレ",
+            Self::Lithograph => "リソグラフ",
             Self::NewspaperPrint => "新聞印刷",
             Self::Textureizer => "テクスチャライザ",
             Self::StarGlow => "クロス光",
@@ -1532,6 +1542,9 @@ impl EffectKind {
             Self::CmykPlateShift => {
                 "CMYKの色版を少しずらし、印刷物やリソグラフ風の色ズレを作ります。"
             }
+            Self::Lithograph => {
+                "2色のスポットインク、紙色、版ズレ、粒状感でリソグラフやシルクスクリーン風にします。"
+            }
             Self::NewspaperPrint => {
                 "粗い網点、黄ばんだ紙色、紙目、インクのにじみを重ねて新聞紙や古印刷物風にします。"
             }
@@ -1674,6 +1687,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ScreenTone,
             EffectKind::ColorHalftone,
             EffectKind::CmykPlateShift,
+            EffectKind::Lithograph,
             EffectKind::NewspaperPrint,
             EffectKind::Textureizer,
             EffectKind::ScanlineGlitch,
@@ -8899,6 +8913,13 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::CmykPlateShift(params) => {
             format!("CMYK版ズレ {:.1}px", params.offset_px)
         }
+        LocalEffect::Lithograph(params) => {
+            format!(
+                "リソグラフ {:.1}px {:.0}%",
+                params.misregistration_px,
+                params.strength * 100.0
+            )
+        }
         LocalEffect::NewspaperPrint(params) => {
             format!(
                 "新聞印刷 {:.0}px 紙 {:.0}%",
@@ -9250,6 +9271,18 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
         }
         (LocalEffect::AnamorphicFlare(params), RgbPickTarget::AnamorphicFlareColor) => {
             params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::Lithograph(params), RgbPickTarget::LithographInkA) => {
+            params.ink_a_rgb = rgb;
+            true
+        }
+        (LocalEffect::Lithograph(params), RgbPickTarget::LithographInkB) => {
+            params.ink_b_rgb = rgb;
+            true
+        }
+        (LocalEffect::Lithograph(params), RgbPickTarget::LithographPaper) => {
+            params.paper_rgb = rgb;
             true
         }
         (LocalEffect::PartColor(params), RgbPickTarget::PartColorTarget) => {
@@ -16753,6 +16786,155 @@ fn draw_effect_params(
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から版ズレ再合成結果へどれだけ近づけるかです。");
         }
+        LocalEffect::Lithograph(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "ピンク×シアン") {
+                    *params = LithographParams {
+                        ink_a_rgb: [238, 64, 95],
+                        ink_b_rgb: [32, 163, 197],
+                        paper_rgb: [248, 238, 210],
+                        ink_density: 0.92,
+                        posterization: 0.50,
+                        grain: 0.36,
+                        misregistration_px: 2.2,
+                        angle_degrees: -12.0,
+                        paper_texture: 0.28,
+                        strength: 0.88,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "青×黄") {
+                    *params = LithographParams {
+                        ink_a_rgb: [34, 87, 180],
+                        ink_b_rgb: [245, 190, 42],
+                        paper_rgb: [248, 240, 220],
+                        ink_density: 0.86,
+                        posterization: 0.42,
+                        grain: 0.32,
+                        misregistration_px: 1.6,
+                        angle_degrees: 18.0,
+                        paper_texture: 0.24,
+                        strength: 0.82,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "赤×黒") {
+                    *params = LithographParams {
+                        ink_a_rgb: [210, 35, 45],
+                        ink_b_rgb: [34, 32, 30],
+                        paper_rgb: [246, 234, 205],
+                        ink_density: 1.08,
+                        posterization: 0.62,
+                        grain: 0.48,
+                        misregistration_px: 1.2,
+                        angle_degrees: 0.0,
+                        paper_texture: 0.36,
+                        strength: 0.90,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡色") {
+                    *params = LithographParams {
+                        ink_a_rgb: [240, 115, 135],
+                        ink_b_rgb: [72, 180, 170],
+                        paper_rgb: [250, 242, 220],
+                        ink_density: 0.62,
+                        posterization: 0.28,
+                        grain: 0.24,
+                        misregistration_px: 0.8,
+                        angle_degrees: 8.0,
+                        paper_texture: 0.18,
+                        strength: 0.68,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "元画像を2色のスポットインクと紙色へ寄せ、少しの版ズレと粒状感を足します。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let ink_a = draw_rgb_color_control(
+                ui,
+                "インク1",
+                &mut params.ink_a_rgb,
+                RgbPickTarget::LithographInkA,
+                rgb_pick_active,
+            );
+            merge_rgb_color_response(
+                ink_a,
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let ink_b = draw_rgb_color_control(
+                ui,
+                "インク2",
+                &mut params.ink_b_rgb,
+                RgbPickTarget::LithographInkB,
+                rgb_pick_active,
+            );
+            merge_rgb_color_response(
+                ink_b,
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let paper = draw_rgb_color_control(
+                ui,
+                "紙色",
+                &mut params.paper_rgb,
+                RgbPickTarget::LithographPaper,
+                rgb_pick_active,
+            );
+            merge_rgb_color_response(
+                paper,
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            changed |= ui
+                .add(egui::Slider::new(&mut params.ink_density, 0.0..=1.6).text("インク濃度"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.posterization, 0.0..=1.0).text("階調の荒さ"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.grain, 0.0..=1.0).text("粒状感"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.misregistration_px, 0.0..=32.0)
+                        .text("版ズレ")
+                        .suffix("px"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                        .text("ズレ方向")
+                        .suffix("°"),
+                )
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.paper_texture, 0.0..=1.0).text("紙目"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
+                .changed();
+            let mut seed = params.seed as i32;
+            changed |= ui
+                .add(egui::Slider::new(&mut seed, 0..=9999).text("seed"))
+                .changed();
+            params.seed = seed.max(0) as u32;
+        }
         LocalEffect::NewspaperPrint(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -18548,6 +18730,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ScreenTone => LocalEffect::ScreenTone(ScreenToneParams::default()),
         EffectKind::ColorHalftone => LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
         EffectKind::CmykPlateShift => LocalEffect::CmykPlateShift(CmykPlateShiftParams::default()),
+        EffectKind::Lithograph => LocalEffect::Lithograph(LithographParams::default()),
         EffectKind::NewspaperPrint => LocalEffect::NewspaperPrint(NewspaperPrintParams::default()),
         EffectKind::Textureizer => LocalEffect::Textureizer(TextureizerParams::default()),
         EffectKind::StarGlow => LocalEffect::StarGlow(StarGlowParams::default()),
@@ -20935,6 +21118,7 @@ mod tests {
             EffectKind::ScreenTone,
             EffectKind::ColorHalftone,
             EffectKind::CmykPlateShift,
+            EffectKind::Lithograph,
             EffectKind::NewspaperPrint,
             EffectKind::Textureizer,
             EffectKind::ScanlineGlitch,
@@ -21325,6 +21509,29 @@ mod tests {
             panic!("expected anamorphic flare effect");
         };
         assert_eq!(anamorphic_flare_params.color_rgb, [80, 160, 255]);
+
+        let mut lithograph = LocalEffect::Lithograph(LithographParams::default());
+        assert!(set_rgb_pick_target(
+            &mut lithograph,
+            RgbPickTarget::LithographInkA,
+            [235, 70, 110],
+        ));
+        assert!(set_rgb_pick_target(
+            &mut lithograph,
+            RgbPickTarget::LithographInkB,
+            [40, 170, 210],
+        ));
+        assert!(set_rgb_pick_target(
+            &mut lithograph,
+            RgbPickTarget::LithographPaper,
+            [250, 238, 210],
+        ));
+        let LocalEffect::Lithograph(lithograph_params) = lithograph else {
+            panic!("expected lithograph effect");
+        };
+        assert_eq!(lithograph_params.ink_a_rgb, [235, 70, 110]);
+        assert_eq!(lithograph_params.ink_b_rgb, [40, 170, 210]);
+        assert_eq!(lithograph_params.paper_rgb, [250, 238, 210]);
 
         let mut part_color = LocalEffect::PartColor(PartColorParams::default());
         assert!(set_rgb_pick_target(

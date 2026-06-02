@@ -142,6 +142,7 @@ the window.
   - Screen tone
   - Color halftone
   - CMYK plate shift
+  - Lithograph / risograph print
   - Newspaper print / aged paper
   - Textureizer
   - Cross/star glow
@@ -158,7 +159,7 @@ the window.
   to its default values.
 - RGB color parameters in Color Fill, Outline Stroke, Rim Light, Contact
   Shadow, Color Overlay, Neon Glow, Color Dodge Glow, Anamorphic Flare,
-  Part Color, Halation, Toon Shade, Speed Lines, Cloud/Fog, Particle Overlay, Aurora, and Spotlight share a control with a color button,
+  Lithograph, Part Color, Halation, Toon Shade, Speed Lines, Cloud/Fog, Particle Overlay, Aurora, and Spotlight share a control with a color button,
   HEX readout, RGB sliders, and an image-click eyedropper.
 - Color Fill starts with a shape placeholder and full opacity. Choosing Solid,
   Linear Gradient, or Radial Gradient immediately makes the fill visible.

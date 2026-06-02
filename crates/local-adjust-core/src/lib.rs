@@ -611,6 +611,7 @@ pub enum LocalEffect {
     ScreenTone(ScreenToneParams),
     ColorHalftone(ColorHalftoneParams),
     CmykPlateShift(CmykPlateShiftParams),
+    Lithograph(LithographParams),
     NewspaperPrint(NewspaperPrintParams),
     Textureizer(TextureizerParams),
     StarGlow(StarGlowParams),
@@ -707,6 +708,7 @@ impl LocalEffect {
             Self::ScreenTone(_) => "スクリーントーン",
             Self::ColorHalftone(_) => "カラーハーフトーン",
             Self::CmykPlateShift(_) => "CMYK版ズレ",
+            Self::Lithograph(_) => "リソグラフ",
             Self::NewspaperPrint(_) => "新聞印刷",
             Self::Textureizer(_) => "テクスチャライザ",
             Self::StarGlow(_) => "クロス光",
@@ -3253,6 +3255,39 @@ impl Default for CmykPlateShiftParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LithographParams {
+    pub ink_a_rgb: [u8; 3],
+    pub ink_b_rgb: [u8; 3],
+    pub paper_rgb: [u8; 3],
+    pub ink_density: f32,
+    pub posterization: f32,
+    pub grain: f32,
+    pub misregistration_px: f32,
+    pub angle_degrees: f32,
+    pub paper_texture: f32,
+    pub strength: f32,
+    pub seed: u32,
+}
+
+impl Default for LithographParams {
+    fn default() -> Self {
+        Self {
+            ink_a_rgb: [238, 64, 95],
+            ink_b_rgb: [32, 163, 197],
+            paper_rgb: [248, 238, 210],
+            ink_density: 0.88,
+            posterization: 0.45,
+            grain: 0.35,
+            misregistration_px: 2.0,
+            angle_degrees: 0.0,
+            paper_texture: 0.25,
+            strength: 0.0,
+            seed: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct NewspaperPrintParams {
     pub cell_px: f32,
     pub dot_gain: f32,
@@ -3891,6 +3926,9 @@ where
             }
             LocalEffect::CmykPlateShift(params) => {
                 apply_cmyk_plate_shift(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Lithograph(params) => {
+                apply_lithograph(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::NewspaperPrint(params) => {
                 apply_newspaper_print(&image.pixels, image.width, image.height, *params)
@@ -11428,6 +11466,148 @@ fn sample_cmyk_ink_alpha_aware(
     (cyan * alpha, magenta * alpha, yellow * alpha, black * alpha)
 }
 
+fn apply_lithograph(src: &[u8], width: usize, height: usize, params: LithographParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let ink_a = rgb_u8_to_unit(params.ink_a_rgb);
+    let ink_b = rgb_u8_to_unit(params.ink_b_rgb);
+    let paper_base = rgb_u8_to_unit(params.paper_rgb);
+    let density = params.ink_density.clamp(0.0, 1.6);
+    let posterization = params.posterization.clamp(0.0, 1.0);
+    let grain = params.grain.clamp(0.0, 1.0);
+    let paper_texture = params.paper_texture.clamp(0.0, 1.0);
+    let offset = params.misregistration_px.clamp(0.0, 32.0);
+    let angle = params.angle_degrees.to_radians();
+    let offset_dir = (angle.cos() * offset, angle.sin() * offset);
+    let texture_scale = 12.0_f32;
+    let mut out = src.to_vec();
+
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let (shifted_b, shifted_alpha) = sample_rgb_bilinear_alpha_aware(
+                src,
+                width,
+                height,
+                x as f32 + offset_dir.0,
+                y as f32 + offset_dir.1,
+            );
+            let (mut amount_a, _) = lithograph_ink_amounts(base, ink_a, ink_b);
+            let (_, mut amount_b) = lithograph_ink_amounts(shifted_b, ink_a, ink_b);
+            amount_b *= shifted_alpha;
+            amount_a = lithograph_quantize_ink(amount_a * density, posterization);
+            amount_b = lithograph_quantize_ink(amount_b * density, posterization);
+
+            let grain_a = glass_value_noise(
+                x as f32 / 2.5 + 17.0,
+                y as f32 / 2.5 - 11.0,
+                params.seed ^ 0xA7E5_135B,
+            );
+            let grain_b = glass_value_noise(
+                x as f32 / 2.8 - 23.0,
+                y as f32 / 2.8 + 19.0,
+                params.seed ^ 0x5EED_6A1D,
+            );
+            amount_a = lithograph_apply_grain(amount_a, grain_a, grain);
+            amount_b = lithograph_apply_grain(amount_b, grain_b, grain);
+
+            let paper_noise = textureizer_value(
+                TextureizerMode::Paper,
+                x as f32,
+                y as f32,
+                texture_scale,
+                1.15,
+                params.seed ^ 0x1771_0BAD,
+            );
+            let paper = [
+                (paper_base[0] + paper_noise * paper_texture * 0.070).clamp(0.0, 1.0),
+                (paper_base[1] + paper_noise * paper_texture * 0.055).clamp(0.0, 1.0),
+                (paper_base[2] + paper_noise * paper_texture * 0.035).clamp(0.0, 1.0),
+            ];
+            let mut target = paper;
+            target = lithograph_overprint(target, ink_a, amount_a);
+            target = lithograph_overprint(target, ink_b, amount_b);
+
+            for c in 0..3 {
+                out[i + c] = to_u8(lerp_f32(base[c], target[c], strength));
+            }
+        }
+    }
+
+    out
+}
+
+fn rgb_u8_to_unit(rgb: [u8; 3]) -> [f32; 3] {
+    [
+        rgb[0] as f32 / 255.0,
+        rgb[1] as f32 / 255.0,
+        rgb[2] as f32 / 255.0,
+    ]
+}
+
+fn lithograph_ink_amounts(rgb: [f32; 3], ink_a: [f32; 3], ink_b: [f32; 3]) -> (f32, f32) {
+    let luma = luma01(rgb[0], rgb[1], rgb[2]);
+    let (_, saturation, _) = rgb_to_hsl(rgb[0], rgb[1], rgb[2]);
+    let tone = (1.0 - luma).clamp(0.0, 1.0);
+    if tone <= f32::EPSILON {
+        return (0.0, 0.0);
+    }
+
+    let dist_a = rgb_distance_sq(rgb, ink_a);
+    let dist_b = rgb_distance_sq(rgb, ink_b);
+    let affinity_a = dist_b / (dist_a + dist_b + 0.0001);
+    let affinity_b = 1.0 - affinity_a;
+    let neutral = (1.0 - saturation) * tone * 0.44;
+    let chroma = saturation * tone;
+    (
+        (neutral + chroma * affinity_a).clamp(0.0, 1.0),
+        (neutral + chroma * affinity_b).clamp(0.0, 1.0),
+    )
+}
+
+fn rgb_distance_sq(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let dr = a[0] - b[0];
+    let dg = a[1] - b[1];
+    let db = a[2] - b[2];
+    dr * dr + dg * dg + db * db
+}
+
+fn lithograph_quantize_ink(amount: f32, posterization: f32) -> f32 {
+    let amount = amount.clamp(0.0, 1.0);
+    if posterization <= f32::EPSILON {
+        return amount;
+    }
+    let steps = lerp_f32(12.0, 3.0, posterization).round().max(2.0);
+    let quantized = (amount * steps).round() / steps;
+    lerp_f32(amount, quantized, posterization)
+}
+
+fn lithograph_apply_grain(amount: f32, noise: f32, grain: f32) -> f32 {
+    let dropout = smoothstep(0.68, 0.96, -noise) * grain * 0.42;
+    (amount * (1.0 + noise * grain * 0.28) * (1.0 - dropout)).clamp(0.0, 1.0)
+}
+
+fn lithograph_overprint(base: [f32; 3], ink: [f32; 3], amount: f32) -> [f32; 3] {
+    let amount = amount.clamp(0.0, 1.0);
+    [
+        lerp_f32(base[0], base[0] * ink[0], amount * 0.74),
+        lerp_f32(base[1], base[1] * ink[1], amount * 0.74),
+        lerp_f32(base[2], base[2] * ink[2], amount * 0.74),
+    ]
+}
+
 fn apply_newspaper_print(
     src: &[u8],
     width: usize,
@@ -14256,6 +14436,7 @@ mod tests {
             LocalEffect::ScreenTone(ScreenToneParams::default()),
             LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
             LocalEffect::CmykPlateShift(CmykPlateShiftParams::default()),
+            LocalEffect::Lithograph(LithographParams::default()),
             LocalEffect::NewspaperPrint(NewspaperPrintParams::default()),
             LocalEffect::Textureizer(TextureizerParams::default()),
             LocalEffect::StarGlow(StarGlowParams::default()),
@@ -15063,6 +15244,22 @@ mod tests {
                     black_generation: 1.0,
                     ink_gain: 0.35,
                     strength: 1.0,
+                }),
+            ),
+            full(
+                "lithograph max grain offset",
+                LocalEffect::Lithograph(LithographParams {
+                    ink_a_rgb: [255, 40, 80],
+                    ink_b_rgb: [0, 175, 210],
+                    paper_rgb: [250, 235, 205],
+                    ink_density: 1.6,
+                    posterization: 1.0,
+                    grain: 1.0,
+                    misregistration_px: 32.0,
+                    angle_degrees: 180.0,
+                    paper_texture: 1.0,
+                    strength: 1.0,
+                    seed: 26,
                 }),
             ),
             full(
@@ -17661,6 +17858,80 @@ LUT_3D_SIZE 2
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(&out.pixels[0..4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn lithograph_maps_colors_to_two_spot_inks_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(2, 1, vec![220, 30, 60, 211, 30, 130, 220, 212]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "lithograph",
+            LocalMask::Full,
+            LocalEffect::Lithograph(LithographParams {
+                ink_a_rgb: [235, 35, 72],
+                ink_b_rgb: [30, 145, 220],
+                paper_rgb: [248, 238, 214],
+                ink_density: 1.0,
+                posterization: 0.0,
+                grain: 0.0,
+                misregistration_px: 0.0,
+                angle_degrees: 0.0,
+                paper_texture: 0.0,
+                strength: 1.0,
+                seed: 2,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_ne!(out.pixels, src.pixels);
+        assert_eq!(out.pixels[3], 211);
+        assert_eq!(out.pixels[7], 212);
+        assert!(out.pixels[0] > out.pixels[1]);
+        assert!(out.pixels[6] > out.pixels[4]);
+    }
+
+    #[test]
+    fn lithograph_misregistration_offsets_second_ink() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![255, 255, 255, 255, 30, 130, 220, 255, 255, 255, 255, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "lithograph",
+            LocalMask::Full,
+            LocalEffect::Lithograph(LithographParams {
+                ink_a_rgb: [235, 35, 72],
+                ink_b_rgb: [30, 145, 220],
+                paper_rgb: [248, 238, 214],
+                ink_density: 1.0,
+                posterization: 0.0,
+                grain: 0.0,
+                misregistration_px: 1.0,
+                angle_degrees: 0.0,
+                paper_texture: 0.0,
+                strength: 1.0,
+                seed: 3,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] < 248);
+        assert!(out.pixels[1] < 238);
+        assert!(out.pixels[2] > out.pixels[0]);
+    }
+
+    #[test]
+    fn lithograph_keeps_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(1, 1, vec![20, 120, 220, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "lithograph",
+            LocalMask::Full,
+            LocalEffect::Lithograph(LithographParams {
+                strength: 1.0,
+                ..LithographParams::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
     }
 
     #[test]
