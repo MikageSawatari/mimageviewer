@@ -61,14 +61,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、83種)
+### `LocalEffect` (部分補正レイヤー、84種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), PartColor(指定色だけ残す白黒化), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, HeatHaze, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, CloudFog, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, ScanlineGlitch, Vhs, PixelSort, OldFilm, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
+GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, CloudFog, WaterCaustics, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, ScanlineGlitch, Vhs, PixelSort, OldFilm, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -159,6 +159,7 @@ LightLeak / 減色8機種 / CRT 3種＋複合 / カラーグレード11種
 - [x] **アナモルフィックフレア (`AnamorphicFlare`)** ★ **中** — 明部から横方向の色付きストリークを生成する。しきい値、長さ、太さ、強さ、光色、着色量を調整でき、`前ON/後OFF` をデフォルトにしてマスク外へ光が伸びるようにした
 - [x] **集中線 / スピード線 (`SpeedLines`)** ★ **中** — 放射/平行の線を自動生成オーバーレイ。線色、線数、線幅、中心抜き、線長、seed を調整できる (manga) (CSP)
 - [x] **雲 / 霧 (`CloudFog`)** **中** — 大気・遠近感。霧/雲モード、色、密度、コントラスト、上下フェード、seed を調整できる procedural fog/clouds として追加 (PS Clouds)
+- [x] **水中コースティクス (`WaterCaustics`)** ★ **中** — 水面越しの揺らぐ光網。スケール、光量、コントラスト、水色、陰影、位相、seed、強度を調整できる
 - [x] **ライティング / スポットライト (`Spotlight`)** **中** — 局所光源。指定中心を明るくし、周辺影と光色を調整できるスポットライトとして追加 (PS Lighting Effects)
 
 ---
@@ -215,7 +216,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 
 ### 9-E. 自然現象 / 大気エフェクト ★背景イラスト
 - [x] **陽炎 / 熱揺らぎ (`HeatHaze`)** ★★ **中** — 局所の上昇する波打ち歪み。夏・炎・砂漠の空気。横揺れ、上昇、乱れ、にじみ、位相、強さを調整でき、透明ピクセルの隠しRGBを拾わない alpha-aware サンプリングにした
-- [ ] **水中コースティクス (光の網)** ★ **中** — 水面越しの揺らぐ光網。水中シーン
+- [x] **水中コースティクス (光の網 / `WaterCaustics`)** ★ **中** — 水面越しの揺らぐ光網。水中シーンやプールの反射光向けに追加
 - [ ] **雨 / 雪 / 花びら 粒子オーバーレイ** ★ **中** — 方向・密度付きの粒子。`雲/霧` の粒子版
 - [ ] **オーロラ / 光のカーテン** **中** — 縦の発光カーテン
 

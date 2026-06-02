@@ -40,8 +40,8 @@ use local_adjust_core::{
     SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
     TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
     TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams,
-    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
-    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    VignetteParams, WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection,
+    WindParams, WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
     default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
@@ -1050,6 +1050,7 @@ enum EffectKind {
     LensFlare,
     AnamorphicFlare,
     CloudFog,
+    WaterCaustics,
     Spotlight,
     Vignette,
     FilmGrain,
@@ -1190,6 +1191,7 @@ impl EffectKind {
             LocalEffect::LensFlare(_) => Self::LensFlare,
             LocalEffect::AnamorphicFlare(_) => Self::AnamorphicFlare,
             LocalEffect::CloudFog(_) => Self::CloudFog,
+            LocalEffect::WaterCaustics(_) => Self::WaterCaustics,
             LocalEffect::Spotlight(_) => Self::Spotlight,
             LocalEffect::Vignette(_) => Self::Vignette,
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
@@ -1281,6 +1283,7 @@ impl EffectKind {
             Self::LensFlare => "レンズフレア",
             Self::AnamorphicFlare => "アナモルフィックフレア",
             Self::CloudFog => "雲/霧",
+            Self::WaterCaustics => "水中コースティクス",
             Self::Spotlight => "スポットライト",
             Self::Vignette => "ビネット",
             Self::FilmGrain => "フィルム粒子",
@@ -1308,6 +1311,7 @@ impl EffectKind {
             Self::HighlightsShadows => "ハイライト/影",
             Self::Equalize => "ヒスト平坦化",
             Self::AnamorphicFlare => "アナモルフフレア",
+            Self::WaterCaustics => "水中光網",
             _ => self.label(),
         }
     }
@@ -1454,6 +1458,9 @@ impl EffectKind {
                 "明るい部分から横方向の青い光条を伸ばし、シネマ調のフレアを作ります。"
             }
             Self::CloudFog => "手続き型のノイズで霧や雲を重ね、大気感と遠近感を加えます。",
+            Self::WaterCaustics => {
+                "水面越しの揺らぐ光網を重ね、水中やプール、反射光の演出を作ります。"
+            }
             Self::Spotlight => "指定した中心を照らし、周辺を落として局所的な光を作ります。",
             Self::Vignette => "周辺を暗く、または明るくして視線を中央へ誘導します。",
             Self::FilmGrain => "粒状感を加え、フィルムや紙っぽい質感を作ります。",
@@ -1647,6 +1654,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::LensFlare,
             EffectKind::AnamorphicFlare,
             EffectKind::CloudFog,
+            EffectKind::WaterCaustics,
             EffectKind::Spotlight,
             EffectKind::StarGlow,
             EffectKind::Vignette,
@@ -8586,6 +8594,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
             CloudFogMode::Fog => format!("霧 {:.0}%", params.opacity * 100.0),
             CloudFogMode::Clouds => format!("雲 {:.0}%", params.opacity * 100.0),
         },
+        LocalEffect::WaterCaustics(params) => {
+            format!("水中コースティクス {:.0}%", params.strength * 100.0)
+        }
         LocalEffect::Spotlight(params) => format!(
             "スポットライト +{:.0}% / 影 {:.0}%",
             params.light_strength * 100.0,
@@ -15100,6 +15111,102 @@ fn draw_effect_params(
             seed_response.lab_hover_tip("霧や雲のパターンを変えます。");
             params.seed = seed.max(0) as u32;
         }
+        LocalEffect::WaterCaustics(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "水面") {
+                    *params = WaterCausticsParams {
+                        scale_px: 48.0,
+                        intensity: 0.75,
+                        contrast: 0.70,
+                        tint: 0.45,
+                        depth: 0.18,
+                        phase: params.phase,
+                        seed: params.seed,
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "水中") {
+                    *params = WaterCausticsParams {
+                        scale_px: 36.0,
+                        intensity: 1.10,
+                        contrast: 0.85,
+                        tint: 0.75,
+                        depth: 0.25,
+                        phase: params.phase,
+                        seed: params.seed,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強い光網") {
+                    *params = WaterCausticsParams {
+                        scale_px: 22.0,
+                        intensity: 1.55,
+                        contrast: 1.0,
+                        tint: 0.55,
+                        depth: 0.35,
+                        phase: params.phase,
+                        seed: params.seed,
+                        strength: 0.90,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡い背景") {
+                    *params = WaterCausticsParams {
+                        scale_px: 76.0,
+                        intensity: 0.45,
+                        contrast: 0.45,
+                        tint: 0.35,
+                        depth: 0.10,
+                        phase: params.phase,
+                        seed: params.seed,
+                        strength: 0.45,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "水面越しの揺らぐ光網を重ねます。背景や水中、プールの反射光に向きます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let scale = ui.add(
+                egui::Slider::new(&mut params.scale_px, 8.0..=240.0)
+                    .text("スケール")
+                    .suffix("px"),
+            );
+            changed |= scale.changed();
+            scale.lab_hover_tip("光網の大きさです。小さいほど細かい波紋になります。");
+            let intensity =
+                ui.add(egui::Slider::new(&mut params.intensity, 0.0..=2.0).text("光量"));
+            changed |= intensity.changed();
+            intensity.lab_hover_tip("光網の明るさです。暗い場所ほど効果が見えやすくなります。");
+            let contrast =
+                ui.add(egui::Slider::new(&mut params.contrast, 0.0..=1.0).text("網のコントラスト"));
+            changed |= contrast.changed();
+            contrast.lab_hover_tip("光網の線をどれだけ細く強く出すかです。");
+            let tint = ui.add(egui::Slider::new(&mut params.tint, 0.0..=1.0).text("水色"));
+            changed |= tint.changed();
+            tint.lab_hover_tip("光を白から水色へ寄せる量です。");
+            let depth = ui.add(egui::Slider::new(&mut params.depth, 0.0..=1.0).text("陰影"));
+            changed |= depth.changed();
+            depth.lab_hover_tip("光網の隙間を少し暗くして、水中の奥行きを足します。");
+            let phase = ui.add(egui::Slider::new(&mut params.phase, 0.0..=1.0).text("位相"));
+            changed |= phase.changed();
+            phase.lab_hover_tip("光網の揺らぎ位置を変えます。静止画では模様違いとして使えます。");
+            let mut seed = params.seed as i32;
+            let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
+            changed |= seed_response.changed();
+            seed_response.lab_hover_tip("光網パターンの乱数を変えます。");
+            params.seed = seed.max(0) as u32;
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から水中コースティクス結果へどれだけ近づけるかです。");
+        }
         LocalEffect::Spotlight(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -17687,6 +17794,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
             LocalEffect::AnamorphicFlare(AnamorphicFlareParams::default())
         }
         EffectKind::CloudFog => LocalEffect::CloudFog(CloudFogParams::default()),
+        EffectKind::WaterCaustics => LocalEffect::WaterCaustics(WaterCausticsParams::default()),
         EffectKind::Spotlight => LocalEffect::Spotlight(SpotlightParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
         EffectKind::FilmGrain => LocalEffect::FilmGrain(FilmGrainParams::default()),
@@ -20035,6 +20143,7 @@ mod tests {
             EffectKind::LensFlare,
             EffectKind::AnamorphicFlare,
             EffectKind::CloudFog,
+            EffectKind::WaterCaustics,
             EffectKind::Spotlight,
             EffectKind::Vignette,
             EffectKind::FilmGrain,

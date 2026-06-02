@@ -603,6 +603,7 @@ pub enum LocalEffect {
     Vhs(VhsParams),
     PixelSort(PixelSortParams),
     OldFilm(OldFilmParams),
+    WaterCaustics(WaterCausticsParams),
     Halftone(HalftoneParams),
     ScreenTone(ScreenToneParams),
     ColorHalftone(ColorHalftoneParams),
@@ -694,6 +695,7 @@ impl LocalEffect {
             Self::Vhs(_) => "VHS/アナログビデオ",
             Self::PixelSort(_) => "ピクセルソート",
             Self::OldFilm(_) => "オールドフィルム",
+            Self::WaterCaustics(_) => "水中コースティクス",
             Self::Halftone(_) => "ハーフトーン",
             Self::ScreenTone(_) => "スクリーントーン",
             Self::ColorHalftone(_) => "カラーハーフトーン",
@@ -3019,6 +3021,33 @@ impl Default for OldFilmParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WaterCausticsParams {
+    pub scale_px: f32,
+    pub intensity: f32,
+    pub contrast: f32,
+    pub tint: f32,
+    pub depth: f32,
+    pub phase: f32,
+    pub seed: u32,
+    pub strength: f32,
+}
+
+impl Default for WaterCausticsParams {
+    fn default() -> Self {
+        Self {
+            scale_px: 52.0,
+            intensity: 0.55,
+            contrast: 0.65,
+            tint: 0.35,
+            depth: 0.18,
+            phase: 0.0,
+            seed: 1,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HalftoneParams {
     pub cell_px: u32,
     pub strength: f32,
@@ -3704,6 +3733,9 @@ where
             }
             LocalEffect::OldFilm(params) => {
                 apply_old_film(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::WaterCaustics(params) => {
+                apply_water_caustics(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::Halftone(params) => {
                 apply_halftone(&image.pixels, image.width, image.height, *params)
@@ -10401,6 +10433,82 @@ fn apply_old_film(src: &[u8], width: usize, height: usize, params: OldFilmParams
     out
 }
 
+fn apply_water_caustics(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: WaterCausticsParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let scale = params.scale_px.clamp(8.0, 240.0);
+    let intensity = params.intensity.clamp(0.0, 2.0);
+    let contrast = params.contrast.clamp(0.0, 1.0);
+    let tint = params.tint.clamp(0.0, 1.0);
+    let depth = params.depth.clamp(0.0, 1.0);
+    let phase = params.phase.rem_euclid(1.0);
+    if intensity <= f32::EPSILON && depth <= f32::EPSILON {
+        return src.to_vec();
+    }
+
+    let tint_rgb = [0.42, 0.88, 1.0];
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let u = x as f32 / scale;
+            let v = y as f32 / scale;
+            let raw = water_caustics_pattern(u, v, phase, params.seed);
+            let threshold = 0.70 - contrast * 0.50;
+            let caustic = smoothstep(threshold, 1.0, raw);
+            let gap_shadow = (1.0 - raw).powf(1.6) * depth * 0.18;
+            let luma = luma01(base[0], base[1], base[2]);
+            let light_amount = caustic * intensity * (0.32 + (1.0 - luma) * 0.48);
+            let mut target = base;
+            for c in 0..3 {
+                let light_color = lerp_f32(1.0, tint_rgb[c], tint);
+                target[c] *= 1.0 - gap_shadow;
+                target[c] = screen_channel(target[c], light_color * light_amount);
+                out[i + c] = to_u8(lerp_f32(base[c], target[c], strength));
+            }
+        }
+    }
+    out
+}
+
+fn water_caustics_pattern(u: f32, v: f32, phase: f32, seed: u32) -> f32 {
+    let phase = phase * std::f32::consts::TAU;
+    let ox = signed_noise(17, 3, seed) * 4.0;
+    let oy = signed_noise(5, 29, seed ^ 0x9E37_79B9) * 4.0;
+    let u = u + ox;
+    let v = v + oy;
+    let a = (u * 1.34 + (v * 0.73 + phase).sin() * 0.78 + phase * 0.34)
+        .sin()
+        .abs();
+    let b = (v * 1.18 + (u * 0.61 - phase * 0.7).sin() * 0.70 - phase * 0.22)
+        .sin()
+        .abs();
+    let c = ((u + v) * 0.82 + ((u - v) * 0.54 + phase * 0.5).sin() * 0.54)
+        .sin()
+        .abs();
+    let distance = a.min(b).min(c);
+    let line = 1.0 - smoothstep(0.035, 0.22, distance);
+    let intersection = 1.0 - smoothstep(0.0, 0.16, (a - b).abs().min((b - c).abs()));
+    (line * (0.72 + intersection * 0.28)).clamp(0.0, 1.0)
+}
+
 fn apply_halftone(src: &[u8], width: usize, height: usize, params: HalftoneParams) -> Vec<u8> {
     let cell = params.cell_px.clamp(2, 96) as usize;
     let strength = params.strength.clamp(0.0, 1.0);
@@ -13463,6 +13571,7 @@ mod tests {
             LocalEffect::Vhs(VhsParams::default()),
             LocalEffect::PixelSort(PixelSortParams::default()),
             LocalEffect::OldFilm(OldFilmParams::default()),
+            LocalEffect::WaterCaustics(WaterCausticsParams::default()),
             LocalEffect::Halftone(HalftoneParams::default()),
             LocalEffect::ScreenTone(ScreenToneParams::default()),
             LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
@@ -14178,6 +14287,19 @@ mod tests {
                     dust: 1.0,
                     scratches: 1.0,
                     seed: 21,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "water caustics max contrast",
+                LocalEffect::WaterCaustics(WaterCausticsParams {
+                    scale_px: 8.0,
+                    intensity: 2.0,
+                    contrast: 1.0,
+                    tint: 1.0,
+                    depth: 1.0,
+                    phase: 0.75,
+                    seed: 22,
                     strength: 1.0,
                 }),
             ),
@@ -16346,6 +16468,84 @@ LUT_3D_SIZE 2
                 dust: 1.0,
                 scratches: 1.0,
                 seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn water_caustics_lifts_dark_pixels_and_preserves_alpha() {
+        let src = solid(8, 8, [32, 48, 60, 213]);
+        let layer = LocalAdjustmentLayer::new(
+            "water caustics",
+            LocalMask::Full,
+            LocalEffect::WaterCaustics(WaterCausticsParams {
+                scale_px: 8.0,
+                intensity: 2.0,
+                contrast: 1.0,
+                tint: 0.8,
+                depth: 0.0,
+                phase: 0.0,
+                seed: 3,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(
+            out.pixels
+                .chunks_exact(4)
+                .any(|px| px[0] > 32 || px[1] > 48 || px[2] > 60)
+        );
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 213));
+    }
+
+    #[test]
+    fn water_caustics_phase_changes_pattern() {
+        let src = solid(8, 8, [64, 80, 96, 255]);
+        let params = WaterCausticsParams {
+            scale_px: 8.0,
+            intensity: 1.4,
+            contrast: 1.0,
+            tint: 0.5,
+            depth: 0.0,
+            phase: 0.0,
+            seed: 3,
+            strength: 1.0,
+        };
+        let first = LocalAdjustmentLayer::new(
+            "water caustics",
+            LocalMask::Full,
+            LocalEffect::WaterCaustics(params),
+        );
+        let second = LocalAdjustmentLayer::new(
+            "water caustics",
+            LocalMask::Full,
+            LocalEffect::WaterCaustics(WaterCausticsParams {
+                phase: 0.37,
+                ..params
+            }),
+        );
+        let out_first = apply_layers(src.as_ref(), &[first]).unwrap();
+        let out_second = apply_layers(src.as_ref(), &[second]).unwrap();
+        assert_ne!(out_first.pixels, out_second.pixels);
+    }
+
+    #[test]
+    fn water_caustics_skips_transparent_pixels() {
+        let src = RgbaImageBuf::new(1, 1, vec![255, 0, 0, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "water caustics",
+            LocalMask::Full,
+            LocalEffect::WaterCaustics(WaterCausticsParams {
+                scale_px: 8.0,
+                intensity: 2.0,
+                contrast: 1.0,
+                tint: 1.0,
+                depth: 1.0,
+                phase: 0.4,
+                seed: 9,
                 strength: 1.0,
             }),
         );

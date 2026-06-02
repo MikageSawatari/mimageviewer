@@ -123,6 +123,7 @@ the window.
   - Lens flare
   - Anamorphic flare
   - Cloud/fog
+  - Water caustics
   - Spotlight
   - Vignette
   - Film grain
