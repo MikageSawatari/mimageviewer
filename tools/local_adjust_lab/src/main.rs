@@ -37,16 +37,16 @@ use local_adjust_core::{
     PinchSpherizeParams, PixelSortDirection, PixelSortOrder, PixelSortParams, PixelStylizeMode,
     PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
     RadialBlurMode, RadialBlurParams, RadialFlashParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams,
-    ScanlineGlitchParams, ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp,
-    SharpenParams, SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode,
-    SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement,
-    TextureParams, TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams,
-    VhsParams, VignetteParams, WaterCausticsParams, WaveDistortionMode, WaveDistortionParams,
-    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
-    compute_mosaic_tile_size, default_mask_application_for_effect, evaluate_layer_mask,
-    parse_cube_lut,
+    RasterVectorMask, RegionMask, RetroPaletteMode, RetroPaletteParams, RgbToneCurveParams,
+    RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode,
+    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
+    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
+    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
+    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams,
+    WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
+    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1078,6 +1078,7 @@ enum EffectKind {
     Look,
     CubeLut,
     Posterize,
+    RetroPalette,
     Threshold,
     Invert,
     Duotone,
@@ -1253,6 +1254,7 @@ impl EffectKind {
             LocalEffect::Look(_) => Self::Look,
             LocalEffect::CubeLut(_) => Self::CubeLut,
             LocalEffect::Posterize(_) => Self::Posterize,
+            LocalEffect::RetroPalette(_) => Self::RetroPalette,
             LocalEffect::Threshold(_) => Self::Threshold,
             LocalEffect::Invert(_) => Self::Invert,
             LocalEffect::Duotone(_) => Self::Duotone,
@@ -1359,6 +1361,7 @@ impl EffectKind {
             Self::Look => "ルック",
             Self::CubeLut => "3D LUT",
             Self::Posterize => "ポスタリゼーション",
+            Self::RetroPalette => "レトロ減色",
             Self::Threshold => "2値化",
             Self::Invert => "階調反転/ネガ",
             Self::Duotone => "ダブルトーン",
@@ -1421,6 +1424,7 @@ impl EffectKind {
             Self::BokehSprite => "玉ボケ粒子",
             Self::LensDirt => "レンズ汚れ",
             Self::FrequencySeparation => "周波数分離",
+            Self::RetroPalette => "レトロ減色",
             Self::DiffractionStarburst => "回折スター",
             Self::WaterCaustics => "水中光網",
             Self::ParticleOverlay => "天候粒子",
@@ -1535,6 +1539,9 @@ impl EffectKind {
                 ".cube 形式の外部3D LUTを読み込み、配布LUTや映画風の色味を適用します。"
             }
             Self::Posterize => "色の階調数を減らし、フラットでグラフィックな見た目にします。",
+            Self::RetroPalette => {
+                "1bit、GameBoy、ファミコン、MSX2+ 風の固定パレットへ減色し、レトロゲーム風の色味を作ります。"
+            }
             Self::Threshold => "明るさをしきい値で黒と白に分け、線画やモノクロ風にします。",
             Self::Invert => "RGBの明暗を反転し、ネガフィルムのような見た目にします。",
             Self::Duotone => "明暗を2色または3色へ置き換え、印刷やポスターのような色味にします。",
@@ -1715,6 +1722,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::CubeLut,
             EffectKind::GradientMap,
             EffectKind::Posterize,
+            EffectKind::RetroPalette,
             EffectKind::Threshold,
             EffectKind::Invert,
             EffectKind::Duotone,
@@ -9194,6 +9202,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
             }
         }
         LocalEffect::Posterize(params) => format!("ポスタリゼーション {}段", params.levels),
+        LocalEffect::RetroPalette(params) => format!(
+            "レトロ減色 {} {:.0}%",
+            retro_palette_mode_label(params.mode),
+            params.strength * 100.0
+        ),
         LocalEffect::Threshold(params) => {
             let suffix = if params.invert { " 反転" } else { "" };
             format!("2値化 {:.0}%{suffix}", params.threshold * 100.0)
@@ -9494,6 +9507,15 @@ fn look_preset_label(preset: LookPreset) -> &'static str {
         LookPreset::LowKey => "ローキー",
         LookPreset::Sepia => "セピア",
         LookPreset::Cyberpunk => "サイバーパンク",
+    }
+}
+
+fn retro_palette_mode_label(mode: RetroPaletteMode) -> &'static str {
+    match mode {
+        RetroPaletteMode::Dither1Bit => "1bitディザ",
+        RetroPaletteMode::GameBoy => "GameBoy",
+        RetroPaletteMode::Famicom => "ファミコン",
+        RetroPaletteMode::Msx2Plus => "MSX2+",
     }
 }
 
@@ -14523,6 +14545,80 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から階調を減らした色へどれだけ近づけるかです。");
+        }
+        LocalEffect::RetroPalette(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "1bit") {
+                    *params = RetroPaletteParams {
+                        mode: RetroPaletteMode::Dither1Bit,
+                        dither: 0.70,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "GameBoy") {
+                    *params = RetroPaletteParams {
+                        mode: RetroPaletteMode::GameBoy,
+                        dither: 0.28,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ファミコン") {
+                    *params = RetroPaletteParams {
+                        mode: RetroPaletteMode::Famicom,
+                        dither: 0.30,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "MSX2+") {
+                    *params = RetroPaletteParams {
+                        mode: RetroPaletteMode::Msx2Plus,
+                        dither: 0.16,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "ポスタリゼーションと違い、実機風の固定パレットへ色を寄せます。ディザを上げると階調は滑らかになりますが、網目感が増えます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let before_mode = params.mode;
+            lab_combo_box(
+                ui,
+                "retro_palette_mode",
+                retro_palette_mode_label(params.mode),
+                |ui| {
+                    for mode in [
+                        RetroPaletteMode::Dither1Bit,
+                        RetroPaletteMode::GameBoy,
+                        RetroPaletteMode::Famicom,
+                        RetroPaletteMode::Msx2Plus,
+                    ] {
+                        ui.selectable_value(&mut params.mode, mode, retro_palette_mode_label(mode));
+                    }
+                },
+            );
+            if params.mode != before_mode {
+                if params.strength <= f32::EPSILON {
+                    params.strength = 1.0;
+                }
+                changed = true;
+            }
+            let dither = ui.add(egui::Slider::new(&mut params.dither, 0.0..=1.0).text("ディザ"));
+            changed |= dither.changed();
+            dither.lab_hover_tip(
+                "Bayer ディザの強さです。0で硬い減色、上げると階調が網点で補われます。",
+            );
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からレトロ減色後の色へどれだけ近づけるかです。");
         }
         LocalEffect::Threshold(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -20323,6 +20419,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Look => LocalEffect::Look(LookParams::default()),
         EffectKind::CubeLut => LocalEffect::CubeLut(CubeLutParams::default()),
         EffectKind::Posterize => LocalEffect::Posterize(PosterizeParams::default()),
+        EffectKind::RetroPalette => LocalEffect::RetroPalette(RetroPaletteParams::default()),
         EffectKind::Threshold => LocalEffect::Threshold(ThresholdParams::default()),
         EffectKind::Invert => LocalEffect::Invert(InvertParams::default()),
         EffectKind::Duotone => LocalEffect::Duotone(DuotoneParams::default()),
@@ -22853,6 +22950,7 @@ mod tests {
             EffectKind::Look,
             EffectKind::CubeLut,
             EffectKind::Posterize,
+            EffectKind::RetroPalette,
             EffectKind::Threshold,
             EffectKind::Invert,
             EffectKind::Duotone,

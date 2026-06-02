@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -576,6 +577,7 @@ pub enum LocalEffect {
     Look(LookParams),
     CubeLut(CubeLutParams),
     Posterize(PosterizeParams),
+    RetroPalette(RetroPaletteParams),
     Threshold(ThresholdParams),
     Invert(InvertParams),
     Duotone(DuotoneParams),
@@ -682,6 +684,7 @@ impl LocalEffect {
             Self::Look(_) => "ルック",
             Self::CubeLut(_) => "LUT",
             Self::Posterize(_) => "ポスタライズ",
+            Self::RetroPalette(_) => "レトロ減色",
             Self::Threshold(_) => "しきい値",
             Self::Invert(_) => "ネガ",
             Self::Duotone(_) => "デュオトーン",
@@ -2147,6 +2150,33 @@ impl Default for PosterizeParams {
         Self {
             levels: 256,
             strength: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RetroPaletteMode {
+    Dither1Bit,
+    #[default]
+    GameBoy,
+    Famicom,
+    Msx2Plus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RetroPaletteParams {
+    pub mode: RetroPaletteMode,
+    pub dither: f32,
+    pub strength: f32,
+}
+
+impl Default for RetroPaletteParams {
+    fn default() -> Self {
+        Self {
+            mode: RetroPaletteMode::GameBoy,
+            dither: 0.14,
+            strength: 0.0,
         }
     }
 }
@@ -4102,6 +4132,9 @@ where
             LocalEffect::Look(params) => apply_look(&image.pixels, *params),
             LocalEffect::CubeLut(params) => apply_cube_lut(&image.pixels, params),
             LocalEffect::Posterize(params) => apply_posterize(&image.pixels, *params),
+            LocalEffect::RetroPalette(params) => {
+                apply_retro_palette(&image.pixels, image.width, image.height, *params)
+            }
             LocalEffect::Threshold(params) => apply_threshold(&image.pixels, *params),
             LocalEffect::Invert(params) => apply_invert(&image.pixels, *params),
             LocalEffect::Duotone(params) => apply_duotone(&image.pixels, *params),
@@ -8743,6 +8776,208 @@ fn apply_posterize(src: &[u8], params: PosterizeParams) -> Vec<u8> {
         }
     }
     out
+}
+
+fn apply_retro_palette(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: RetroPaletteParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let dither = params.dither.clamp(0.0, 1.0);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+            let offset = bayer4_offset(x, y);
+            let quantized = retro_palette_rgb(
+                [src[i], src[i + 1], src[i + 2]],
+                params.mode,
+                offset,
+                dither,
+            );
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], quantized[c], strength);
+            }
+        }
+    }
+    out
+}
+
+const RETRO_GAMEBOY_PALETTE: [[u8; 3]; 4] = [
+    [0x0F, 0x38, 0x0F],
+    [0x30, 0x62, 0x30],
+    [0x8B, 0xAC, 0x0F],
+    [0x9B, 0xBC, 0x0F],
+];
+
+const RETRO_FAMICOM_PALETTE: &[[u8; 3]] = &[
+    [0x7C, 0x7C, 0x7C],
+    [0x00, 0x00, 0xFC],
+    [0x00, 0x00, 0xBC],
+    [0x44, 0x28, 0xBC],
+    [0x94, 0x00, 0x84],
+    [0xA8, 0x00, 0x20],
+    [0xA8, 0x10, 0x00],
+    [0x88, 0x14, 0x00],
+    [0x50, 0x30, 0x00],
+    [0x00, 0x78, 0x00],
+    [0x00, 0x68, 0x00],
+    [0x00, 0x58, 0x00],
+    [0x00, 0x40, 0x58],
+    [0x00, 0x00, 0x00],
+    [0xBC, 0xBC, 0xBC],
+    [0x00, 0x78, 0xF8],
+    [0x00, 0x58, 0xF8],
+    [0x68, 0x44, 0xFC],
+    [0xD8, 0x00, 0xCC],
+    [0xE4, 0x00, 0x58],
+    [0xF8, 0x38, 0x00],
+    [0xE4, 0x5C, 0x10],
+    [0xAC, 0x7C, 0x00],
+    [0x00, 0xB8, 0x00],
+    [0x00, 0xA8, 0x00],
+    [0x00, 0xA8, 0x44],
+    [0x00, 0x88, 0x88],
+    [0xF8, 0xF8, 0xF8],
+    [0x3C, 0xBC, 0xFC],
+    [0x68, 0x88, 0xFC],
+    [0x98, 0x78, 0xF8],
+    [0xF8, 0x78, 0xF8],
+    [0xF8, 0x58, 0x98],
+    [0xF8, 0x78, 0x58],
+    [0xFC, 0xA0, 0x44],
+    [0xF8, 0xB8, 0x00],
+    [0xB8, 0xF8, 0x18],
+    [0x58, 0xD8, 0x54],
+    [0x58, 0xF8, 0x98],
+    [0x00, 0xE8, 0xD8],
+    [0x78, 0x78, 0x78],
+    [0xFC, 0xFC, 0xFC],
+    [0xA4, 0xE4, 0xFC],
+    [0xB8, 0xB8, 0xF8],
+    [0xD8, 0xB8, 0xF8],
+    [0xF8, 0xB8, 0xF8],
+    [0xF8, 0xA4, 0xC0],
+    [0xF0, 0xD0, 0xB0],
+    [0xFC, 0xE0, 0xA8],
+    [0xF8, 0xD8, 0x78],
+    [0xD8, 0xF8, 0x78],
+    [0xB8, 0xF8, 0xB8],
+    [0xB8, 0xF8, 0xD8],
+];
+
+const RETRO_BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+const RETRO_LUT_BITS: u32 = 5;
+const RETRO_LUT_DIM: u32 = 1 << RETRO_LUT_BITS;
+const RETRO_LUT_MAX: u32 = RETRO_LUT_DIM - 1;
+const RETRO_LUT_SIZE: usize = (RETRO_LUT_DIM * RETRO_LUT_DIM * RETRO_LUT_DIM) as usize;
+
+static RETRO_FAMICOM_LUT: OnceLock<Vec<u8>> = OnceLock::new();
+
+fn retro_palette_rgb(
+    rgb: [u8; 3],
+    mode: RetroPaletteMode,
+    dither_offset: f32,
+    dither: f32,
+) -> [u8; 3] {
+    match mode {
+        RetroPaletteMode::Dither1Bit => {
+            let luma = luma01(
+                rgb[0] as f32 / 255.0,
+                rgb[1] as f32 / 255.0,
+                rgb[2] as f32 / 255.0,
+            );
+            let v = if luma + dither_offset * dither * 0.75 >= 0.5 {
+                255
+            } else {
+                0
+            };
+            [v, v, v]
+        }
+        RetroPaletteMode::GameBoy => {
+            let luma = luma01(
+                rgb[0] as f32 / 255.0,
+                rgb[1] as f32 / 255.0,
+                rgb[2] as f32 / 255.0,
+            );
+            let idx =
+                ((luma + dither_offset * dither * 0.45).clamp(0.0, 1.0) * 3.0).round() as usize;
+            RETRO_GAMEBOY_PALETTE[idx.min(3)]
+        }
+        RetroPaletteMode::Famicom => {
+            let offset = dither_offset * dither * 255.0;
+            let r = (rgb[0] as f32 + offset).round().clamp(0.0, 255.0) as u32;
+            let g = (rgb[1] as f32 + offset).round().clamp(0.0, 255.0) as u32;
+            let b = (rgb[2] as f32 + offset).round().clamp(0.0, 255.0) as u32;
+            let lut =
+                RETRO_FAMICOM_LUT.get_or_init(|| build_retro_palette_lut(RETRO_FAMICOM_PALETTE));
+            let idx = lut[retro_lut_index(r, g, b)] as usize;
+            RETRO_FAMICOM_PALETTE[idx]
+        }
+        RetroPaletteMode::Msx2Plus => {
+            let offset = dither_offset * dither * 255.0;
+            [
+                quantize_retro_channel(rgb[0], 8, offset),
+                quantize_retro_channel(rgb[1], 8, offset),
+                quantize_retro_channel(rgb[2], 4, offset),
+            ]
+        }
+    }
+}
+
+fn quantize_retro_channel(channel: u8, levels: u32, offset: f32) -> u8 {
+    let max_level = (levels - 1) as f32;
+    let value = ((channel as f32 + offset).clamp(0.0, 255.0) / 255.0 * max_level).round();
+    ((value / max_level) * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn bayer4_offset(x: usize, y: usize) -> f32 {
+    (RETRO_BAYER4[y & 3][x & 3] as f32 + 0.5) / 16.0 - 0.5
+}
+
+fn retro_lut_index(r: u32, g: u32, b: u32) -> usize {
+    let ri = (r * RETRO_LUT_MAX + 127) / 255;
+    let gi = (g * RETRO_LUT_MAX + 127) / 255;
+    let bi = (b * RETRO_LUT_MAX + 127) / 255;
+    ((ri * RETRO_LUT_DIM + gi) * RETRO_LUT_DIM + bi) as usize
+}
+
+fn build_retro_palette_lut(palette: &[[u8; 3]]) -> Vec<u8> {
+    let mut lut = vec![0_u8; RETRO_LUT_SIZE];
+    for (bin, slot) in lut.iter_mut().enumerate() {
+        let bi = bin as u32 % RETRO_LUT_DIM;
+        let gi = (bin as u32 / RETRO_LUT_DIM) % RETRO_LUT_DIM;
+        let ri = bin as u32 / (RETRO_LUT_DIM * RETRO_LUT_DIM);
+        let r = (ri * 255 / RETRO_LUT_MAX) as f32;
+        let g = (gi * 255 / RETRO_LUT_MAX) as f32;
+        let b = (bi * 255 / RETRO_LUT_MAX) as f32;
+        *slot = nearest_retro_palette_idx(palette, r, g, b) as u8;
+    }
+    lut
+}
+
+fn nearest_retro_palette_idx(palette: &[[u8; 3]], r: f32, g: f32, b: f32) -> usize {
+    let mut best = 0;
+    let mut best_distance = f32::MAX;
+    for (idx, color) in palette.iter().enumerate() {
+        let dr = r - color[0] as f32;
+        let dg = g - color[1] as f32;
+        let db = b - color[2] as f32;
+        let distance = dr * dr + dg * dg + db * db;
+        if distance < best_distance {
+            best_distance = distance;
+            best = idx;
+        }
+    }
+    best
 }
 
 fn apply_threshold(src: &[u8], params: ThresholdParams) -> Vec<u8> {
@@ -16347,6 +16582,7 @@ mod tests {
             LocalEffect::Look(LookParams::default()),
             LocalEffect::CubeLut(CubeLutParams::default()),
             LocalEffect::Posterize(PosterizeParams::default()),
+            LocalEffect::RetroPalette(RetroPaletteParams::default()),
             LocalEffect::Threshold(ThresholdParams::default()),
             LocalEffect::Invert(InvertParams::default()),
             LocalEffect::Duotone(DuotoneParams::default()),
@@ -16458,6 +16694,14 @@ mod tests {
                     low_smoothing: 1.0,
                     detail_amount: 2.0,
                     detail_contrast: 2.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "retro palette famicom dither",
+                LocalEffect::RetroPalette(RetroPaletteParams {
+                    mode: RetroPaletteMode::Famicom,
+                    dither: 1.0,
                     strength: 1.0,
                 }),
             ),
@@ -18197,6 +18441,67 @@ LUT_3D_SIZE 2
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out.pixels, vec![85, 170, 255, 255]);
+    }
+
+    #[test]
+    fn retro_palette_gameboy_maps_to_green_palette_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(2, 1, vec![16, 16, 16, 77, 240, 240, 240, 99]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "retro palette",
+            LocalMask::Full,
+            LocalEffect::RetroPalette(RetroPaletteParams {
+                mode: RetroPaletteMode::GameBoy,
+                dither: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..3], &RETRO_GAMEBOY_PALETTE[0]);
+        assert_eq!(&out.pixels[4..7], &RETRO_GAMEBOY_PALETTE[3]);
+        assert_eq!(out.pixels[3], 77);
+        assert_eq!(out.pixels[7], 99);
+    }
+
+    #[test]
+    fn retro_palette_dither_1bit_outputs_monochrome() {
+        let src = RgbaImageBuf::new(2, 1, vec![40, 90, 130, 255, 220, 210, 200, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "retro palette",
+            LocalMask::Full,
+            LocalEffect::RetroPalette(RetroPaletteParams {
+                mode: RetroPaletteMode::Dither1Bit,
+                dither: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        for px in out.pixels.chunks_exact(4) {
+            assert_eq!(px[0], px[1]);
+            assert_eq!(px[1], px[2]);
+            assert!(px[0] == 0 || px[0] == 255);
+        }
+    }
+
+    #[test]
+    fn retro_palette_keeps_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![255, 0, 0, 0, 120, 150, 180, 255, 60, 90, 120, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "retro palette",
+            LocalMask::Full,
+            LocalEffect::RetroPalette(RetroPaletteParams {
+                mode: RetroPaletteMode::Famicom,
+                dither: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[255, 0, 0, 0]);
+        assert_eq!(out.pixels[7], 255);
     }
 
     #[test]
