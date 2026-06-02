@@ -120,6 +120,7 @@ the window.
   - Color dodge glow
   - God rays
   - Lens flare
+  - Anamorphic flare
   - Cloud/fog
   - Spotlight
   - Vignette
@@ -143,8 +144,8 @@ the window.
   buttons for practical starting points, or Reset to return the current effect
   to its default values.
 - RGB color parameters in Color Fill, Outline Stroke, Rim Light, Contact
-  Shadow, Color Overlay, Neon Glow, Color Dodge Glow, Part Color, Halation,
-  Toon Shade, Speed Lines, Cloud/Fog, and Spotlight share a control with a color button,
+  Shadow, Color Overlay, Neon Glow, Color Dodge Glow, Anamorphic Flare,
+  Part Color, Halation, Toon Shade, Speed Lines, Cloud/Fog, and Spotlight share a control with a color button,
   HEX readout, RGB sliders, and an image-click eyedropper.
 - Color Fill starts with a shape placeholder and full opacity. Choosing Solid,
   Linear Gradient, or Radial Gradient immediately makes the fill visible.
@@ -161,8 +162,9 @@ the window.
   input to the mask before calculation; `後` clips the calculated result by the
   mask. Existing-style local adjustments use `前` off / `後` on, while spreading
   effects such as Wind, Outline Stroke, Rim Light, Neon Glow, Diffuse Glow,
-  Bloom, Halation, Color Dodge Glow, God Rays, Glowing Edges, and Cross/Star
-  Glow default to `前` on / `後` off so the effect can extend past the mask.
+  Bloom, Halation, Color Dodge Glow, God Rays, Anamorphic Flare, Glowing
+  Edges, and Cross/Star Glow default to `前` on / `後` off so the effect can
+  extend past the mask.
   Inner-mask effects such as Contact Shadow default to `前` on / `後` on so they
   can read the mask shape before calculation while keeping the result inside
   the mask.

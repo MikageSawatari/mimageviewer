@@ -15,32 +15,32 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
-    ArtisticMediaMode, ArtisticMediaParams, BloomParams, BlurParams, BrushStrokeMode,
-    BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams, CloudFogMode,
-    CloudFogParams, ColorBalanceParams, ColorBalanceRange, ColorDodgeGlowParams, ColorFillParams,
-    ColorGradeWheel, ColorHalftoneParams, ColorMixerParams, ColorOverlayBlendMode,
-    ColorOverlayParams, ColorOverlayShape, ColorRangeMask, ColorTraceParams, ContactShadowParams,
-    CubeLutParams, CutoutParams, DehazeParams, DespeckleParams, DiffuseGlowParams, DuotoneParams,
-    DuotonePreset, EdgeSmoothParams, EmbossParams, EqualizeParams, FilmGrainParams,
-    GlassDisplacementMode, GlassDisplacementParams, GlowingEdgesParams, GodRaysParams,
-    GradientMapParams, GradientMapPreset, HalationParams, HalftoneParams, HighPassParams,
-    HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
-    LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams, LineKind,
-    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
-    ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
-    MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams, OilPaintParams, OrtonParams,
-    OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, PinchSpherizeParams,
-    PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
-    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams,
-    ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams,
-    SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams,
-    SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
-    TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
-    TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VignetteParams,
-    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
-    evaluate_layer_mask, parse_cube_lut,
+    AnamorphicFlareParams, ArtisticMediaMode, ArtisticMediaParams, BloomParams, BlurParams,
+    BrushStrokeMode, BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams,
+    ClarityParams, CloudFogMode, CloudFogParams, ColorBalanceParams, ColorBalanceRange,
+    ColorDodgeGlowParams, ColorFillParams, ColorGradeWheel, ColorHalftoneParams, ColorMixerParams,
+    ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask, ColorTraceParams,
+    ContactShadowParams, CubeLutParams, CutoutParams, DehazeParams, DespeckleParams,
+    DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams,
+    EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
+    GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams,
+    HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams, InvertParams,
+    LensBlurAperture, LensBlurParams, LensCorrectionParams, LensFlareParams, LineExtractMode,
+    LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
+    LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary,
+    MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams,
+    OilPaintParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement, PartColorParams,
+    PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
+    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
+    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
+    RgbaImageRef, RimLightParams, ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp,
+    SharpenParams, SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode,
+    SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement,
+    TextureParams, TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams,
+    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
+    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1042,6 +1042,7 @@ enum EffectKind {
     ColorDodgeGlow,
     GodRays,
     LensFlare,
+    AnamorphicFlare,
     CloudFog,
     Spotlight,
     Vignette,
@@ -1074,6 +1075,7 @@ enum RgbPickTarget {
     RimLightColor,
     ContactShadowColor,
     ColorDodgeGlowColor,
+    AnamorphicFlareColor,
     PartColorTarget,
     HalationTint,
     ToonShadeShadowTint,
@@ -1097,6 +1099,7 @@ impl RgbPickTarget {
             Self::RimLightColor => "リムライトの光色",
             Self::ContactShadowColor => "接触影の影色",
             Self::ColorDodgeGlowColor => "覆い焼き発光の光色",
+            Self::AnamorphicFlareColor => "アナモルフィックフレアの色",
             Self::PartColorTarget => "パートカラーの対象色",
             Self::HalationTint => "ハレーションの暖色",
             Self::ToonShadeShadowTint => "トゥーン影色",
@@ -1173,6 +1176,7 @@ impl EffectKind {
             LocalEffect::ColorDodgeGlow(_) => Self::ColorDodgeGlow,
             LocalEffect::GodRays(_) => Self::GodRays,
             LocalEffect::LensFlare(_) => Self::LensFlare,
+            LocalEffect::AnamorphicFlare(_) => Self::AnamorphicFlare,
             LocalEffect::CloudFog(_) => Self::CloudFog,
             LocalEffect::Spotlight(_) => Self::Spotlight,
             LocalEffect::Vignette(_) => Self::Vignette,
@@ -1257,6 +1261,7 @@ impl EffectKind {
             Self::ColorDodgeGlow => "覆い焼き発光",
             Self::GodRays => "光芒",
             Self::LensFlare => "レンズフレア",
+            Self::AnamorphicFlare => "アナモルフィックフレア",
             Self::CloudFog => "雲/霧",
             Self::Spotlight => "スポットライト",
             Self::Vignette => "ビネット",
@@ -1409,6 +1414,9 @@ impl EffectKind {
             }
             Self::GodRays => "明るい部分から光源方向に沿った放射状の光芒を作ります。",
             Self::LensFlare => "光源のにじみ、ハロー、レンズ内反射のゴーストを重ねます。",
+            Self::AnamorphicFlare => {
+                "明るい部分から横方向の青い光条を伸ばし、シネマ調のフレアを作ります。"
+            }
             Self::CloudFog => "手続き型のノイズで霧や雲を重ね、大気感と遠近感を加えます。",
             Self::Spotlight => "指定した中心を照らし、周辺を落として局所的な光を作ります。",
             Self::Vignette => "周辺を暗く、または明るくして視線を中央へ誘導します。",
@@ -1580,6 +1588,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ContactShadow,
             EffectKind::GodRays,
             EffectKind::LensFlare,
+            EffectKind::AnamorphicFlare,
             EffectKind::CloudFog,
             EffectKind::Spotlight,
             EffectKind::StarGlow,
@@ -8500,6 +8509,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::LensFlare(params) => {
             format!("レンズフレア {:.0}%", params.strength * 100.0)
         }
+        LocalEffect::AnamorphicFlare(params) => format!(
+            "アナモルフ {:.0}px {:.0}%",
+            params.length_px,
+            params.strength * 100.0
+        ),
         LocalEffect::CloudFog(params) => match params.mode {
             CloudFogMode::Fog => format!("霧 {:.0}%", params.opacity * 100.0),
             CloudFogMode::Clouds => format!("雲 {:.0}%", params.opacity * 100.0),
@@ -8833,6 +8847,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
             true
         }
         (LocalEffect::ColorDodgeGlow(params), RgbPickTarget::ColorDodgeGlowColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::AnamorphicFlare(params), RgbPickTarget::AnamorphicFlareColor) => {
             params.color_rgb = rgb;
             true
         }
@@ -14674,6 +14692,104 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.warm_tint, 0.0..=1.0).text("暖色"))
                 .changed();
         }
+        LocalEffect::AnamorphicFlare(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "シネマ青") {
+                    *params = AnamorphicFlareParams {
+                        threshold: 0.62,
+                        length_px: 220.0,
+                        thickness_px: 3.0,
+                        strength: 0.85,
+                        color_rgb: [70, 150, 255],
+                        color_strength: 0.92,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強い横光") {
+                    *params = AnamorphicFlareParams {
+                        threshold: 0.35,
+                        length_px: 320.0,
+                        thickness_px: 5.0,
+                        strength: 1.25,
+                        color_rgb: [90, 180, 255],
+                        color_strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡い青") {
+                    *params = AnamorphicFlareParams {
+                        threshold: 0.72,
+                        length_px: 180.0,
+                        thickness_px: 2.0,
+                        strength: 0.48,
+                        color_rgb: [120, 190, 255],
+                        color_strength: 0.70,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "暖色") {
+                    *params = AnamorphicFlareParams {
+                        threshold: 0.58,
+                        length_px: 180.0,
+                        thickness_px: 4.0,
+                        strength: 0.62,
+                        color_rgb: [255, 190, 95],
+                        color_strength: 0.65,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "明るい部分を拾い、横方向へ色付きのストリークを伸ばします。初期状態では前ON/後OFFなので光がマスク外へ広がります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let threshold = ui.add(
+                egui::Slider::new(&mut params.threshold, 0.0..=0.98)
+                    .text("明部しきい値")
+                    .fixed_decimals(3),
+            );
+            changed |= threshold.changed();
+            threshold.lab_hover_tip(
+                "どの明るさからフレアの発生源として拾うかです。低いほど広く反応します。",
+            );
+            let length = ui.add(
+                egui::Slider::new(&mut params.length_px, 1.0..=480.0)
+                    .text("長さ")
+                    .suffix("px"),
+            );
+            changed |= length.changed();
+            length.lab_hover_tip("水平ストリークをどれだけ長く伸ばすかです。");
+            let thickness = ui.add(
+                egui::Slider::new(&mut params.thickness_px, 0.0..=48.0)
+                    .text("太さ")
+                    .suffix("px"),
+            );
+            changed |= thickness.changed();
+            thickness.lab_hover_tip("横光を上下方向にどれだけぼかして太くするかです。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=3.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("横光を元画像へ重ねる強さです。");
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "色",
+                    &mut params.color_rgb,
+                    RgbPickTarget::AnamorphicFlareColor,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let color_strength =
+                ui.add(egui::Slider::new(&mut params.color_strength, 0.0..=1.0).text("着色量"));
+            changed |= color_strength.changed();
+            color_strength.lab_hover_tip("元の明部色から指定したフレア色へどれだけ寄せるかです。");
+        }
         LocalEffect::CloudFog(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -16889,6 +17005,9 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ColorDodgeGlow => LocalEffect::ColorDodgeGlow(ColorDodgeGlowParams::default()),
         EffectKind::GodRays => LocalEffect::GodRays(GodRaysParams::default()),
         EffectKind::LensFlare => LocalEffect::LensFlare(LensFlareParams::default()),
+        EffectKind::AnamorphicFlare => {
+            LocalEffect::AnamorphicFlare(AnamorphicFlareParams::default())
+        }
         EffectKind::CloudFog => LocalEffect::CloudFog(CloudFogParams::default()),
         EffectKind::Spotlight => LocalEffect::Spotlight(SpotlightParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
@@ -19220,6 +19339,7 @@ mod tests {
             EffectKind::ColorDodgeGlow,
             EffectKind::GodRays,
             EffectKind::LensFlare,
+            EffectKind::AnamorphicFlare,
             EffectKind::CloudFog,
             EffectKind::Spotlight,
             EffectKind::Vignette,
@@ -19539,6 +19659,17 @@ mod tests {
             panic!("expected color dodge glow effect");
         };
         assert_eq!(color_dodge_glow_params.color_rgb, [255, 140, 80]);
+
+        let mut anamorphic_flare = LocalEffect::AnamorphicFlare(AnamorphicFlareParams::default());
+        assert!(set_rgb_pick_target(
+            &mut anamorphic_flare,
+            RgbPickTarget::AnamorphicFlareColor,
+            [80, 160, 255],
+        ));
+        let LocalEffect::AnamorphicFlare(anamorphic_flare_params) = anamorphic_flare else {
+            panic!("expected anamorphic flare effect");
+        };
+        assert_eq!(anamorphic_flare_params.color_rgb, [80, 160, 255]);
 
         let mut part_color = LocalEffect::PartColor(PartColorParams::default());
         assert!(set_rgb_pick_target(

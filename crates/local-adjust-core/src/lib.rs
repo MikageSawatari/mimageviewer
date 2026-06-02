@@ -590,6 +590,7 @@ pub enum LocalEffect {
     ColorDodgeGlow(ColorDodgeGlowParams),
     GodRays(GodRaysParams),
     LensFlare(LensFlareParams),
+    AnamorphicFlare(AnamorphicFlareParams),
     SpeedLines(SpeedLinesParams),
     CloudFog(CloudFogParams),
     Spotlight(SpotlightParams),
@@ -674,6 +675,7 @@ impl LocalEffect {
             Self::ColorDodgeGlow(_) => "覆い焼き発光",
             Self::GodRays(_) => "光芒",
             Self::LensFlare(_) => "レンズフレア",
+            Self::AnamorphicFlare(_) => "アナモルフィックフレア",
             Self::SpeedLines(_) => "集中線/スピード線",
             Self::CloudFog(_) => "雲/霧",
             Self::Spotlight(_) => "スポットライト",
@@ -703,6 +705,7 @@ pub fn default_mask_application_for_effect(effect: &LocalEffect) -> MaskApplicat
         | LocalEffect::Halation(_)
         | LocalEffect::ColorDodgeGlow(_)
         | LocalEffect::GodRays(_)
+        | LocalEffect::AnamorphicFlare(_)
         | LocalEffect::StarGlow(_)
         | LocalEffect::OutlineStroke(_)
         | LocalEffect::RimLight(_) => MaskApplication {
@@ -2638,6 +2641,29 @@ impl Default for LensFlareParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AnamorphicFlareParams {
+    pub threshold: f32,
+    pub length_px: f32,
+    pub thickness_px: f32,
+    pub strength: f32,
+    pub color_rgb: [u8; 3],
+    pub color_strength: f32,
+}
+
+impl Default for AnamorphicFlareParams {
+    fn default() -> Self {
+        Self {
+            threshold: 0.82,
+            length_px: 180.0,
+            thickness_px: 3.0,
+            strength: 0.0,
+            color_rgb: [80, 150, 255],
+            color_strength: 0.85,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeedLinesMode {
@@ -3442,6 +3468,9 @@ where
             }
             LocalEffect::LensFlare(params) => {
                 apply_lens_flare(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::AnamorphicFlare(params) => {
+                apply_anamorphic_flare(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::SpeedLines(params) => {
                 apply_speed_lines(&image.pixels, image.width, image.height, *params)
@@ -8909,6 +8938,119 @@ fn apply_lens_flare(src: &[u8], width: usize, height: usize, params: LensFlarePa
     out
 }
 
+fn apply_anamorphic_flare(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: AnamorphicFlareParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 3.0);
+    let length = params.length_px.round().clamp(1.0, 480.0) as usize;
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let threshold = params.threshold.clamp(0.0, 0.995);
+    let thickness = params.thickness_px.round().clamp(0.0, 48.0) as usize;
+    let tint = rgb_u8_to_f32(params.color_rgb);
+    let color_strength = params.color_strength.clamp(0.0, 1.0);
+    let mut bright = vec![0.0_f32; width.saturating_mul(height).saturating_mul(3)];
+    for idx in 0..width * height {
+        let si = idx * 4;
+        let di = idx * 3;
+        let alpha = src[si + 3] as f32 / 255.0;
+        if alpha <= f32::EPSILON {
+            continue;
+        }
+        let rgb = [
+            src[si] as f32 / 255.0,
+            src[si + 1] as f32 / 255.0,
+            src[si + 2] as f32 / 255.0,
+        ];
+        let luma = luma01(rgb[0], rgb[1], rgb[2]);
+        let gate = smoothstep(threshold, (threshold + 0.28).min(1.0), luma).powf(1.25) * alpha;
+        if gate <= 0.001 {
+            continue;
+        }
+        for c in 0..3 {
+            let color = lerp_f32(rgb[c], tint[c], color_strength);
+            bright[di + c] = color * gate;
+        }
+    }
+
+    let streak = horizontal_streak_rgb_f32(&bright, width, height, length);
+    let streak = if thickness > 0 {
+        vertical_blur_rgb_f32(&streak, width, height, thickness)
+    } else {
+        streak
+    };
+    let mut out = src.to_vec();
+    let scale = strength * 0.85;
+    for idx in 0..width * height {
+        let si = idx * 3;
+        let oi = idx * 4;
+        for c in 0..3 {
+            let base = src[oi + c] as f32 / 255.0;
+            let flare = (streak[si + c] * scale).clamp(0.0, 1.0);
+            out[oi + c] = to_u8(screen_channel(base, flare));
+        }
+    }
+    out
+}
+
+fn horizontal_streak_rgb_f32(src: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
+    if radius == 0 || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let mut out = vec![0.0_f32; src.len()];
+    for y in 0..height {
+        let mut prefix = vec![[0.0_f32; 3]; width + 1];
+        for x in 0..width {
+            let si = (y * width + x) * 3;
+            for c in 0..3 {
+                prefix[x + 1][c] = prefix[x][c] + src[si + c];
+            }
+        }
+        for x in 0..width {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius).min(width - 1);
+            let count = (x1 - x0 + 1) as f32;
+            let normalizer = count.powf(0.55).max(1.0);
+            let oi = (y * width + x) * 3;
+            for c in 0..3 {
+                out[oi + c] = (prefix[x1 + 1][c] - prefix[x0][c]) / normalizer;
+            }
+        }
+    }
+    out
+}
+
+fn vertical_blur_rgb_f32(src: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
+    if radius == 0 || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let mut out = vec![0.0_f32; src.len()];
+    for x in 0..width {
+        let mut prefix = vec![[0.0_f32; 3]; height + 1];
+        for y in 0..height {
+            let si = (y * width + x) * 3;
+            for c in 0..3 {
+                prefix[y + 1][c] = prefix[y][c] + src[si + c];
+            }
+        }
+        for y in 0..height {
+            let y0 = y.saturating_sub(radius);
+            let y1 = (y + radius).min(height - 1);
+            let count = (y1 - y0 + 1) as f32;
+            let oi = (y * width + x) * 3;
+            for c in 0..3 {
+                out[oi + c] = (prefix[y1 + 1][c] - prefix[y0][c]) / count;
+            }
+        }
+    }
+    out
+}
+
 fn radial_falloff(distance: f32, radius: f32) -> f32 {
     (1.0 - distance / radius.max(0.001)).clamp(0.0, 1.0)
 }
@@ -10393,6 +10535,14 @@ mod tests {
         );
         assert!(color_dodge_glow.mask_before_effect);
         assert!(!color_dodge_glow.mask_after_effect);
+
+        let anamorphic_flare = LocalAdjustmentLayer::new(
+            "anamorphic flare",
+            LocalMask::Full,
+            LocalEffect::AnamorphicFlare(AnamorphicFlareParams::default()),
+        );
+        assert!(anamorphic_flare.mask_before_effect);
+        assert!(!anamorphic_flare.mask_after_effect);
 
         let wave = LocalAdjustmentLayer::new(
             "wave",
@@ -12162,6 +12312,7 @@ mod tests {
             LocalEffect::ColorDodgeGlow(ColorDodgeGlowParams::default()),
             LocalEffect::GodRays(GodRaysParams::default()),
             LocalEffect::LensFlare(LensFlareParams::default()),
+            LocalEffect::AnamorphicFlare(AnamorphicFlareParams::default()),
             LocalEffect::SpeedLines(SpeedLinesParams::default()),
             LocalEffect::CloudFog(CloudFogParams::default()),
             LocalEffect::Spotlight(SpotlightParams::default()),
@@ -12740,6 +12891,17 @@ mod tests {
                     ghost_strength: 2.0,
                     streak_strength: 2.0,
                     warm_tint: 1.0,
+                }),
+            ),
+            full(
+                "anamorphic flare max length",
+                LocalEffect::AnamorphicFlare(AnamorphicFlareParams {
+                    threshold: 0.0,
+                    length_px: 480.0,
+                    thickness_px: 48.0,
+                    strength: 3.0,
+                    color_rgb: [80, 150, 255],
+                    color_strength: 1.0,
                 }),
             ),
             full(
@@ -14132,6 +14294,89 @@ LUT_3D_SIZE 2
         );
         assert_eq!(out.pixels[3], 91);
         assert_eq!(out.pixels[35], 99);
+    }
+
+    #[test]
+    fn anamorphic_flare_extends_bright_pixel_horizontally() {
+        let mut pixels = vec![0_u8; 7 * 3 * 4];
+        for (idx, px) in pixels.chunks_exact_mut(4).enumerate() {
+            px[3] = 201 + (idx / 7) as u8;
+        }
+        let center = (7 + 3) * 4;
+        pixels[center..center + 4].copy_from_slice(&[255, 255, 255, 202]);
+        let src = RgbaImageBuf::new(7, 3, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "anamorphic flare",
+            LocalMask::Full,
+            LocalEffect::AnamorphicFlare(AnamorphicFlareParams {
+                threshold: 0.2,
+                length_px: 3.0,
+                thickness_px: 0.0,
+                strength: 1.0,
+                color_rgb: [64, 140, 255],
+                color_strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let left = (1 * 7 + 1) * 4;
+        let above = (0 * 7 + 3) * 4;
+        assert!(out.pixels[left + 2] > src.pixels[left + 2]);
+        assert!(out.pixels[left + 2] > out.pixels[left]);
+        assert_eq!(&out.pixels[above..above + 3], &src.pixels[above..above + 3]);
+        assert_eq!(out.pixels[3], 201);
+        assert_eq!(out.pixels[83], 203);
+    }
+
+    #[test]
+    fn anamorphic_flare_can_escape_mask_when_post_mask_is_off() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255,
+            ],
+        )
+        .unwrap();
+        let mask = LocalMask::Raster(RasterMask {
+            width: 5,
+            height: 1,
+            alpha: vec![0.0, 1.0, 0.0, 0.0, 0.0],
+        });
+        let layer = LocalAdjustmentLayer::new(
+            "anamorphic flare",
+            mask,
+            LocalEffect::AnamorphicFlare(AnamorphicFlareParams {
+                threshold: 0.0,
+                length_px: 3.0,
+                thickness_px: 0.0,
+                strength: 1.0,
+                color_rgb: [255, 255, 255],
+                color_strength: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[8] > src.pixels[8]);
+        assert_eq!(out.pixels[19], 255);
+    }
+
+    #[test]
+    fn anamorphic_flare_ignores_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(3, 1, vec![0, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "anamorphic flare",
+            LocalMask::Full,
+            LocalEffect::AnamorphicFlare(AnamorphicFlareParams {
+                threshold: 0.0,
+                length_px: 2.0,
+                thickness_px: 0.0,
+                strength: 2.0,
+                color_rgb: [64, 140, 255],
+                color_strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&out.pixels[8..12], &[0, 0, 0, 255]);
     }
 
     #[test]

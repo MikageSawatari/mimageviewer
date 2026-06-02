@@ -61,14 +61,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、76種)
+### `LocalEffect` (部分補正レイヤー、77種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), PartColor(指定色だけ残す白黒化), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, CloudFog, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Halftone, ScreenTone, ColorHalftone, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
+GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, CloudFog, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Halftone, ScreenTone, ColorHalftone, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -156,6 +156,7 @@ LightLeak / 減色8機種 / CRT 3種＋複合 / カラーグレード11種
 - [x] **ネオングロー (`NeonGlow`)** ★★★ **中** — 明るい/鮮やかな部分の光を周囲へにじませる。色付きネオン、二段ハロー、発光源の色指定に対応。**§B で詳細設計**
 - [x] **光芒 / God rays (放射状ボリューム光 / `GodRays`)** ★★★ **中** — 木漏れ日・差し込む光。明部を拾い、指定中心から外側へ伸びる暖色寄りの光芒を生成できる
 - [x] **レンズフレア (`LensFlare`)** ★★ **中** — 光源演出の定番。指定光源からコア、ハロー、ゴースト、光条を重ねられるようにした (PS Render)
+- [x] **アナモルフィックフレア (`AnamorphicFlare`)** ★ **中** — 明部から横方向の色付きストリークを生成する。しきい値、長さ、太さ、強さ、光色、着色量を調整でき、`前ON/後OFF` をデフォルトにしてマスク外へ光が伸びるようにした
 - [x] **集中線 / スピード線 (`SpeedLines`)** ★ **中** — 放射/平行の線を自動生成オーバーレイ。線色、線数、線幅、中心抜き、線長、seed を調整できる (manga) (CSP)
 - [x] **雲 / 霧 (`CloudFog`)** **中** — 大気・遠近感。霧/雲モード、色、密度、コントラスト、上下フェード、seed を調整できる procedural fog/clouds として追加 (PS Clouds)
 - [x] **ライティング / スポットライト (`Spotlight`)** **中** — 局所光源。指定中心を明るくし、周辺影と光色を調整できるスポットライトとして追加 (PS Lighting Effects)
@@ -196,7 +197,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 
 ### 9-B. アナログ実機 / レトロ系
 - [ ] **VHS / アナログビデオ風** ★★ **中** — 色にじみ (chroma bleed)・トラッキングノイズ・ゴースト・ヘッドスイッチング帯。CRT (既存グローバル) とは別系統
-- [ ] **アナモルフィックフレア (横方向の青い光条)** ★ **中** — シネマ調の水平ストリーク。`レンズフレア` の特化版
+- [x] **アナモルフィックフレア (横方向の青い光条 / `AnamorphicFlare`)** ★ **中** — シネマ調の水平ストリーク。明部抽出から横方向に色付きフレアを伸ばし、しきい値、長さ、太さ、強さ、色、着色量を調整できる
 - [ ] **回折スターバースト (絞り点光源の光条)** **中** — 点光源の絞り羽根状の光芒。`StarGlow` (十字) とは別の絞り再現
 - [ ] **オールドフィルム / 古写真** ★ **易** — 傷＋退色＋ビネット＋粒状の複合プリセット (既存要素の束ね)
 
