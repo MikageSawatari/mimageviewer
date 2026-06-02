@@ -61,13 +61,13 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、75種)
+### `LocalEffect` (部分補正レイヤー、76種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), PartColor(指定色だけ残す白黒化), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
-HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
+HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
 GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, CloudFog, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Halftone, ScreenTone, ColorHalftone, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
 
 ### マスク種別 (併用可能・差別化の武器)
@@ -227,7 +227,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 - [x] **パートカラー (1色だけ残してグレー化)** ★ **易** — `PartColor`。指定RGBの色相だけを残し、他の色をグレー化する。対象色はRGB共有コントロールと画像クリックのスポイトで指定でき、残す範囲、境界ぼかし、グレー化強度、対象色の彩度/明度を調整できる
 - [ ] **周波数分離 / ウェーブレット分解** **中** — 質感と色を分離してレタッチ (Krita wavelet decompose 相当)。スキャン補修
 - [ ] **色収差除去 / Defringe** **易〜中** — `ChromaticAberration` の逆。輪郭の色フチ取り
-- [ ] **オートン効果 (Orton)** ★ **易** — ボケコピーを乗せる夢幻グロー。`拡散光彩` に近いが彩度・コントラスト挙動が独特
+- [x] **オートン効果 (Orton)** ★ **易** — `Orton`。alpha を考慮したボケコピーを明るくし、彩度/コントラストを整えてスクリーン合成する夢幻グロー。SoftFocus よりルック寄りで、半径、強さ、明るさ、コントラスト、彩度を調整できる
 
 ### 9-H. 立体視 / 特殊光学
 - [ ] **レンズ汚れ / 水滴 / レンズダスト オーバーレイ** **中** — レンズ越し演出

@@ -28,7 +28,7 @@ use local_adjust_core::{
     LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams, LineKind,
     LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
     ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
-    MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams, OilPaintParams,
+    MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams, OilPaintParams, OrtonParams,
     OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, PinchSpherizeParams,
     PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
     PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
@@ -1015,6 +1015,7 @@ enum EffectKind {
     GlowingEdges,
     OilPaint,
     SoftFocus,
+    Orton,
     Mosaic,
     Sharpen,
     SmartSharpen,
@@ -1145,6 +1146,7 @@ impl EffectKind {
             LocalEffect::GlowingEdges(_) => Self::GlowingEdges,
             LocalEffect::OilPaint(_) => Self::OilPaint,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
+            LocalEffect::Orton(_) => Self::Orton,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
             LocalEffect::SmartSharpen(_) => Self::SmartSharpen,
@@ -1228,6 +1230,7 @@ impl EffectKind {
             Self::GlowingEdges => "エッジ光彩",
             Self::OilPaint => "油彩",
             Self::SoftFocus => "ソフトフォーカス",
+            Self::Orton => "オートン効果",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
             Self::SmartSharpen => "スマートシャープ",
@@ -1351,6 +1354,9 @@ impl EffectKind {
                 "Kuwahara フィルタで色面を選択的になじませ、油彩のような塗り感を作ります。"
             }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
+            Self::Orton => {
+                "明るくしたボケコピーを重ね、夢のように柔らかいコントラストと光のにじみを作ります。"
+            }
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
             Self::SmartSharpen => {
@@ -1508,6 +1514,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::LensBlur,
             EffectKind::RadialBlur,
             EffectKind::SoftFocus,
+            EffectKind::Orton,
             EffectKind::EdgeSmooth,
             EffectKind::Despeckle,
             EffectKind::Median,
@@ -8391,6 +8398,13 @@ fn effect_summary(effect: &LocalEffect) -> String {
         }
         LocalEffect::OilPaint(params) => format!("油彩 {:.0}px", params.radius_px),
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
+        LocalEffect::Orton(params) => {
+            format!(
+                "オートン {:.0}px {:.0}%",
+                params.radius_px,
+                params.strength * 100.0
+            )
+        }
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
             mosaic_tile_mode_label(params.effective_tile_mode())
@@ -12493,6 +12507,83 @@ fn draw_effect_params(
             changed |= ui
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"))
                 .changed();
+        }
+        LocalEffect::Orton(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "自然") {
+                    *params = OrtonParams {
+                        radius_px: 24.0,
+                        strength: 0.32,
+                        brightness: 0.28,
+                        contrast: 0.12,
+                        saturation: 0.08,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "夢幻") {
+                    *params = OrtonParams {
+                        radius_px: 42.0,
+                        strength: 0.58,
+                        brightness: 0.48,
+                        contrast: 0.18,
+                        saturation: 0.18,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡い逆光") {
+                    *params = OrtonParams {
+                        radius_px: 64.0,
+                        strength: 0.44,
+                        brightness: 0.62,
+                        contrast: -0.12,
+                        saturation: -0.08,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "高彩度") {
+                    *params = OrtonParams {
+                        radius_px: 30.0,
+                        strength: 0.50,
+                        brightness: 0.40,
+                        contrast: 0.28,
+                        saturation: 0.35,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "ぼかして明るくしたコピーをスクリーン合成し、柔らかい光と少し濃い色を足します。Soft Focus よりルック寄りの仕上げです。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let radius = ui.add(
+                egui::Slider::new(&mut params.radius_px, 0.0..=160.0)
+                    .text("半径")
+                    .suffix("px"),
+            );
+            changed |= radius.changed();
+            radius.lab_hover_tip(
+                "重ねるボケコピーの半径です。大きいほど全体に柔らかく回り込みます。",
+            );
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からオートン効果へどれだけ近づけるかです。");
+            let brightness =
+                ui.add(egui::Slider::new(&mut params.brightness, 0.0..=1.0).text("明るさ"));
+            changed |= brightness.changed();
+            brightness.lab_hover_tip("ボケコピーをどれだけ明るく持ち上げるかです。");
+            let contrast =
+                ui.add(egui::Slider::new(&mut params.contrast, -1.0..=1.0).text("コントラスト"));
+            changed |= contrast.changed();
+            contrast
+                .lab_hover_tip("ボケコピー側の明暗差です。正で締まり、負でさらに淡くなります。");
+            let saturation =
+                ui.add(egui::Slider::new(&mut params.saturation, -1.0..=1.0).text("彩度"));
+            changed |= saturation.changed();
+            saturation.lab_hover_tip("ボケコピー側の鮮やかさです。");
         }
         LocalEffect::Mosaic(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -16772,6 +16863,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::GlowingEdges => LocalEffect::GlowingEdges(GlowingEdgesParams::default()),
         EffectKind::OilPaint => LocalEffect::OilPaint(OilPaintParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
+        EffectKind::Orton => LocalEffect::Orton(OrtonParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
         EffectKind::SmartSharpen => LocalEffect::SmartSharpen(SmartSharpenParams::default()),
@@ -19105,6 +19197,7 @@ mod tests {
             EffectKind::GlowingEdges,
             EffectKind::OilPaint,
             EffectKind::SoftFocus,
+            EffectKind::Orton,
             EffectKind::Mosaic,
             EffectKind::Sharpen,
             EffectKind::SmartSharpen,

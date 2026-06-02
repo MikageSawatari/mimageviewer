@@ -108,6 +108,7 @@ the window.
   - Lens blur
   - Radial blur
   - Soft focus
+  - Orton / soft glow
   - Mosaic with long-edge-ratio / fixed-pixel tile sizing and the same three
     boundary modes as the conceal mosaic tool
   - Speed lines / radial focus lines

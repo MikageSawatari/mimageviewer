@@ -705,9 +705,8 @@ conceal source:
 エッジ保持ぼかし。
 
 プロトタイプでは `local-adjust-core` と `local_adjust_lab` に、内蔵 Look、Bloom、
-ビネット、フィルム粒子、色収差、ハーフトーン、スクリーントーン、カラーハーフトーン、テクスチャライザ、エッジ保持ぼかしを追加済み。
-Orton / Soft Glow は既存の Soft Focus と Bloom の組み合わせで検証し、必要なら
-専用パラメータとして分離する。
+ビネット、フィルム粒子、色収差、ハーフトーン、スクリーントーン、カラーハーフトーン、テクスチャライザ、エッジ保持ぼかし、Orton / Soft Glow を追加済み。
+Orton / Soft Glow は Soft Focus と Bloom とは別に、ボケコピーの明るさ、コントラスト、彩度を調整できるルック寄りの専用効果として扱う。
 
 ### Phase 4: 被写体選択 / 領域分割マスクの検証
 
@@ -913,7 +912,7 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   に残す
 - 効果: Tone (自然な彩度・tint を含む) / Tone Curve / RGB Curve / Color Balance /
   3-way Color Grading / Selective Color / Part Color / Channel Mixer / Color Mixer / Clarity / Highlights-Shadows /
-  Texture / HighPass / Blur / Motion Blur / Wind / SpeedLines / Tilt Shift / Lens Blur / Radial Blur / WaveDistortion / PinchSpherize / Twirl / PolarCoordinates / GlassDisplacement / LensCorrection / LineExtract / ColorTrace / ArtisticMedia / BrushStroke / Cutout / ToonShade / Emboss / PixelStylize / Solarize / GlowingEdges / OilPaint / Soft Focus / Mosaic / Sharpen(radius/threshold) / SmartSharpen(edge-aware) / HSL / Dehaze / Look / 3D LUT / Posterize / Threshold / Invert / Duotone / Equalize / Gradient Map / ColorFill / OutlineStroke / RimLight / ContactShadow / ColorOverlay / NeonGlow / DiffuseGlow / Bloom / Halation / ColorDodgeGlow / GodRays / LensFlare / CloudFog / Spotlight /
+  Texture / HighPass / Blur / Motion Blur / Wind / SpeedLines / Tilt Shift / Lens Blur / Radial Blur / WaveDistortion / PinchSpherize / Twirl / PolarCoordinates / GlassDisplacement / LensCorrection / LineExtract / ColorTrace / ArtisticMedia / BrushStroke / Cutout / ToonShade / Emboss / PixelStylize / Solarize / GlowingEdges / OilPaint / Soft Focus / Orton / Mosaic / Sharpen(radius/threshold) / SmartSharpen(edge-aware) / HSL / Dehaze / Look / 3D LUT / Posterize / Threshold / Invert / Duotone / Equalize / Gradient Map / ColorFill / OutlineStroke / RimLight / ContactShadow / ColorOverlay / NeonGlow / DiffuseGlow / Bloom / Halation / ColorDodgeGlow / GodRays / LensFlare / CloudFog / Spotlight /
   Vignette / Film Grain / Chromatic Aberration / Halftone / ScreenTone / ColorHalftone / Textureizer / Cross-Star Glow /
   Edge-preserving Smooth / Median
 - 3D LUT は `.cube` の `LUT_3D_SIZE` / `DOMAIN_MIN` / `DOMAIN_MAX` / `LUT_3D_INPUT_RANGE` を読み取り、RGB 3D table

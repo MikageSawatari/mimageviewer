@@ -563,6 +563,7 @@ pub enum LocalEffect {
     GlowingEdges(GlowingEdgesParams),
     OilPaint(OilPaintParams),
     SoftFocus(SoftFocusParams),
+    Orton(OrtonParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
     SmartSharpen(SmartSharpenParams),
@@ -646,6 +647,7 @@ impl LocalEffect {
             Self::GlowingEdges(_) => "エッジ光彩",
             Self::OilPaint(_) => "油彩",
             Self::SoftFocus(_) => "ソフトフォーカス",
+            Self::Orton(_) => "オートン効果",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
             Self::SmartSharpen(_) => "スマートシャープ",
@@ -1679,6 +1681,27 @@ impl Default for SoftFocusParams {
         Self {
             radius_px: 16.0,
             strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OrtonParams {
+    pub radius_px: f32,
+    pub strength: f32,
+    pub brightness: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+}
+
+impl Default for OrtonParams {
+    fn default() -> Self {
+        Self {
+            radius_px: 28.0,
+            strength: 0.0,
+            brightness: 0.35,
+            contrast: 0.20,
+            saturation: 0.15,
         }
     }
 }
@@ -3304,6 +3327,9 @@ where
                 params.radius_px.round().max(0.0) as usize,
                 params.strength.clamp(0.0, 1.0),
             ),
+            LocalEffect::Orton(params) => {
+                apply_orton(&image.pixels, image.width, image.height, *params)
+            }
             LocalEffect::Mosaic(params) => {
                 let full_mask = vec![1.0; image.width.saturating_mul(image.height)];
                 apply_mosaic_with_mask(
@@ -6674,6 +6700,69 @@ fn apply_soft_focus(
             out[i + c] = lerp_u8(src[i + c], screen as u8, strength);
         }
     }
+    out
+}
+
+fn apply_orton(src: &[u8], width: usize, height: usize, params: OrtonParams) -> Vec<u8> {
+    let radius = params.radius_px.round().clamp(0.0, 160.0) as usize;
+    let strength = params.strength.clamp(0.0, 1.0);
+    if radius == 0 || strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let brightness = params.brightness.clamp(0.0, 1.0);
+    let contrast = params.contrast.clamp(-1.0, 1.0);
+    let saturation = params.saturation.clamp(-1.0, 1.0);
+    let mut premultiplied = vec![0_u8; src.len()];
+    for i in (0..src.len()).step_by(4) {
+        let alpha = src[i + 3] as f32 / 255.0;
+        premultiplied[i] = to_u8(src[i] as f32 / 255.0 * alpha);
+        premultiplied[i + 1] = to_u8(src[i + 1] as f32 / 255.0 * alpha);
+        premultiplied[i + 2] = to_u8(src[i + 2] as f32 / 255.0 * alpha);
+        premultiplied[i + 3] = src[i + 3];
+    }
+
+    let blur = box_blur_rgba(&premultiplied, width, height, radius);
+    let contrast_scale = if contrast >= 0.0 {
+        1.0 + contrast * 1.35
+    } else {
+        1.0 + contrast * 0.75
+    }
+    .max(0.05);
+    let saturation_scale = (1.0 + saturation).max(0.0);
+    let glow_scale = (0.45 + brightness * 0.70).clamp(0.0, 1.25);
+    let mut out = src.to_vec();
+
+    for i in (0..src.len()).step_by(4) {
+        let base = [
+            src[i] as f32 / 255.0,
+            src[i + 1] as f32 / 255.0,
+            src[i + 2] as f32 / 255.0,
+        ];
+        let blur_alpha = blur[i + 3] as f32 / 255.0;
+        if blur_alpha <= 1.0 / 255.0 {
+            continue;
+        }
+        let inv_alpha = 1.0 / blur_alpha;
+        let mut glow = [
+            (blur[i] as f32 / 255.0 * inv_alpha).clamp(0.0, 1.0),
+            (blur[i + 1] as f32 / 255.0 * inv_alpha).clamp(0.0, 1.0),
+            (blur[i + 2] as f32 / 255.0 * inv_alpha).clamp(0.0, 1.0),
+        ];
+
+        glow = adjust_saturation(glow, saturation_scale);
+        for channel in &mut glow {
+            *channel = ((*channel - 0.5) * contrast_scale + 0.5).clamp(0.0, 1.0);
+            *channel = screen_channel(*channel, brightness * 0.45);
+            *channel = (*channel * glow_scale).clamp(0.0, 1.0);
+        }
+
+        for c in 0..3 {
+            let screened = screen_channel(base[c], glow[c]);
+            out[i + c] = to_u8(lerp_f32(base[c], screened, strength));
+        }
+    }
+
     out
 }
 
@@ -12046,6 +12135,7 @@ mod tests {
             LocalEffect::GlowingEdges(GlowingEdgesParams::default()),
             LocalEffect::OilPaint(OilPaintParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
+            LocalEffect::Orton(OrtonParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),
             LocalEffect::SmartSharpen(SmartSharpenParams::default()),
@@ -12486,6 +12576,16 @@ mod tests {
                 LocalEffect::SoftFocus(SoftFocusParams {
                     radius_px: 240.0,
                     strength: 1.0,
+                }),
+            ),
+            full(
+                "orton max radius",
+                LocalEffect::Orton(OrtonParams {
+                    radius_px: 160.0,
+                    strength: 1.0,
+                    brightness: 1.0,
+                    contrast: 1.0,
+                    saturation: 1.0,
                 }),
             ),
             masked(
@@ -14257,6 +14357,55 @@ LUT_3D_SIZE 2
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn orton_lifts_neighbors_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 20, 20, 203, 230, 210, 170, 203, 20, 20, 20, 203],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "orton",
+            LocalMask::Full,
+            LocalEffect::Orton(OrtonParams {
+                radius_px: 1.0,
+                strength: 0.85,
+                brightness: 0.45,
+                contrast: 0.25,
+                saturation: 0.20,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert!(out.pixels[8] > src.pixels[8]);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 203));
+    }
+
+    #[test]
+    fn orton_ignores_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(3, 1, vec![0, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "orton",
+            LocalMask::Full,
+            LocalEffect::Orton(OrtonParams {
+                radius_px: 1.0,
+                strength: 1.0,
+                brightness: 0.7,
+                contrast: 0.2,
+                saturation: 0.8,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels[0], out.pixels[1]);
+        assert_eq!(out.pixels[1], out.pixels[2]);
+        assert_eq!(out.pixels[8], out.pixels[9]);
+        assert_eq!(out.pixels[9], out.pixels[10]);
+        assert_eq!(out.pixels[3], 255);
+        assert_eq!(out.pixels[7], 0);
+        assert_eq!(out.pixels[11], 255);
     }
 
     #[test]
