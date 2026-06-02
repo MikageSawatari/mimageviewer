@@ -25,14 +25,14 @@ use local_adjust_core::{
     LensCorrectionParams, LineExtractMode, LineExtractParams, LineKind, LinearGradientMask,
     LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
     MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
-    PinchSpherizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
-    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
-    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
-    SharpenParams, SmartSharpenParams, SoftFocusParams, StarGlowParams, TextureParams,
-    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
-    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
-    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
-    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
+    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
+    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
+    RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams,
+    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -987,6 +987,7 @@ enum EffectKind {
     BrushStroke,
     Cutout,
     Emboss,
+    PixelStylize,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1045,6 +1046,7 @@ impl EffectKind {
             LocalEffect::BrushStroke(_) => Self::BrushStroke,
             LocalEffect::Cutout(_) => Self::Cutout,
             LocalEffect::Emboss(_) => Self::Emboss,
+            LocalEffect::PixelStylize(_) => Self::PixelStylize,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1103,6 +1105,7 @@ impl EffectKind {
             Self::BrushStroke => "ドライブラシ/塗料",
             Self::Cutout => "切り絵",
             Self::Emboss => "エンボス",
+            Self::PixelStylize => "粒状スタイル",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1191,6 +1194,7 @@ impl EffectKind {
                 "色面をなじませて階調を減らし、切り絵やフラットなベクター調の見た目にします。"
             }
             Self::Emboss => "明るさの傾きから陰影を作り、紙や金属の浮き彫りのような質感にします。",
+            Self::PixelStylize => "結晶化、点描、Facet、メゾチントの粒状スタイライズを作ります。",
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
@@ -1334,6 +1338,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::BrushStroke,
             EffectKind::Cutout,
             EffectKind::Emboss,
+            EffectKind::PixelStylize,
             EffectKind::Halftone,
         ],
     },
@@ -7299,6 +7304,15 @@ fn effect_summary(effect: &LocalEffect) -> String {
         }
         LocalEffect::Cutout(params) => format!("切り絵 {}段", params.levels),
         LocalEffect::Emboss(params) => format!("エンボス {:.0}°", params.angle_degrees),
+        LocalEffect::PixelStylize(params) => {
+            let mode = match params.mode {
+                PixelStylizeMode::Crystallize => "結晶化",
+                PixelStylizeMode::Pointillize => "点描",
+                PixelStylizeMode::Facet => "Facet",
+                PixelStylizeMode::Mezzotint => "メゾチント",
+            };
+            format!("粒状スタイル {mode}")
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -10180,6 +10194,113 @@ fn draw_effect_params(
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からエンボス結果へどれだけ近づけるかです。");
         }
+        LocalEffect::PixelStylize(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "結晶化") {
+                    *params = PixelStylizeParams {
+                        mode: PixelStylizeMode::Crystallize,
+                        cell_px: 16.0,
+                        edge_strength: 0.35,
+                        color_amount: 0.9,
+                        randomness: 0.65,
+                        strength: 1.0,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "点描") {
+                    *params = PixelStylizeParams {
+                        mode: PixelStylizeMode::Pointillize,
+                        cell_px: 11.0,
+                        edge_strength: 0.08,
+                        color_amount: 1.0,
+                        randomness: 0.55,
+                        strength: 1.0,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "Facet") {
+                    *params = PixelStylizeParams {
+                        mode: PixelStylizeMode::Facet,
+                        cell_px: 18.0,
+                        edge_strength: 0.25,
+                        color_amount: 0.95,
+                        randomness: 0.35,
+                        strength: 1.0,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "メゾチント") {
+                    *params = PixelStylizeParams {
+                        mode: PixelStylizeMode::Mezzotint,
+                        cell_px: 3.0,
+                        edge_strength: 0.0,
+                        color_amount: 0.0,
+                        randomness: 0.8,
+                        strength: 1.0,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "セルや粒で色を再構成します。結晶化/Facet は面、点描/メゾチントは粒の表現に向いています。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let crystallize = params.mode == PixelStylizeMode::Crystallize;
+                if ui.selectable_label(crystallize, "結晶化").clicked() && !crystallize {
+                    params.mode = PixelStylizeMode::Crystallize;
+                    changed = true;
+                }
+                let pointillize = params.mode == PixelStylizeMode::Pointillize;
+                if ui.selectable_label(pointillize, "点描").clicked() && !pointillize {
+                    params.mode = PixelStylizeMode::Pointillize;
+                    changed = true;
+                }
+                let facet = params.mode == PixelStylizeMode::Facet;
+                if ui.selectable_label(facet, "Facet").clicked() && !facet {
+                    params.mode = PixelStylizeMode::Facet;
+                    changed = true;
+                }
+                let mezzotint = params.mode == PixelStylizeMode::Mezzotint;
+                if ui.selectable_label(mezzotint, "メゾチント").clicked() && !mezzotint {
+                    params.mode = PixelStylizeMode::Mezzotint;
+                    changed = true;
+                }
+            });
+            let size = ui.add(
+                egui::Slider::new(&mut params.cell_px, 1.0..=48.0)
+                    .text("サイズ")
+                    .suffix("px"),
+            );
+            changed |= size.changed();
+            size.lab_hover_tip("結晶や点の大きさです。メゾチントでは粒の粗さとして働きます。");
+            let edge = ui.add(egui::Slider::new(&mut params.edge_strength, 0.0..=1.0).text("輪郭"));
+            changed |= edge.changed();
+            edge.lab_hover_tip("面や粒の境界、元画像の輪郭をどれだけ締めるかです。");
+            let color = ui.add(egui::Slider::new(&mut params.color_amount, 0.0..=1.0).text("色量"));
+            changed |= color.changed();
+            color.lab_hover_tip("0ではモノクロ寄り、上げると元画像の色を強く残します。");
+            let randomness =
+                ui.add(egui::Slider::new(&mut params.randomness, 0.0..=1.0).text("ばらつき"));
+            changed |= randomness.changed();
+            randomness.lab_hover_tip("セル位置や粒のランダムさです。下げると規則的になります。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から粒状スタイル結果へどれだけ近づけるかです。");
+            let mut seed = params.seed as i32;
+            let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
+            changed |= seed_response.changed();
+            seed_response.lab_hover_tip("セルや粒の配置パターンを変えます。");
+            params.seed = seed.max(0) as u32;
+        }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -12637,6 +12758,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::BrushStroke => LocalEffect::BrushStroke(BrushStrokeParams::default()),
         EffectKind::Cutout => LocalEffect::Cutout(CutoutParams::default()),
         EffectKind::Emboss => LocalEffect::Emboss(EmbossParams::default()),
+        EffectKind::PixelStylize => LocalEffect::PixelStylize(PixelStylizeParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
@@ -14501,6 +14623,7 @@ mod tests {
             EffectKind::BrushStroke,
             EffectKind::Cutout,
             EffectKind::Emboss,
+            EffectKind::PixelStylize,
             EffectKind::SoftFocus,
             EffectKind::Mosaic,
             EffectKind::Sharpen,

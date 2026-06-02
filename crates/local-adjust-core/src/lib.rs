@@ -441,6 +441,7 @@ pub enum LocalEffect {
     BrushStroke(BrushStrokeParams),
     Cutout(CutoutParams),
     Emboss(EmbossParams),
+    PixelStylize(PixelStylizeParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -499,6 +500,7 @@ impl LocalEffect {
             Self::BrushStroke(_) => "筆致",
             Self::Cutout(_) => "切り絵",
             Self::Emboss(_) => "エンボス",
+            Self::PixelStylize(_) => "粒状スタイル",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -1316,6 +1318,41 @@ impl Default for EmbossParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PixelStylizeMode {
+    #[default]
+    Crystallize,
+    Pointillize,
+    Facet,
+    Mezzotint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PixelStylizeParams {
+    pub mode: PixelStylizeMode,
+    pub cell_px: f32,
+    pub edge_strength: f32,
+    pub color_amount: f32,
+    pub randomness: f32,
+    pub strength: f32,
+    pub seed: u32,
+}
+
+impl Default for PixelStylizeParams {
+    fn default() -> Self {
+        Self {
+            mode: PixelStylizeMode::Crystallize,
+            cell_px: 12.0,
+            edge_strength: 0.25,
+            color_amount: 0.9,
+            randomness: 0.55,
+            strength: 0.0,
+            seed: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SoftFocusParams {
     pub radius_px: f32,
@@ -2123,6 +2160,9 @@ where
         }
         LocalEffect::Emboss(params) => {
             apply_emboss(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::PixelStylize(params) => {
+            apply_pixel_stylize(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -4504,6 +4544,328 @@ fn emboss_luma_at(src: &[u8], width: usize, height: usize, x: isize, y: isize) -
         src[i] as f32 / 255.0,
         src[i + 1] as f32 / 255.0,
         src[i + 2] as f32 / 255.0,
+    )
+}
+
+fn apply_pixel_stylize(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: PixelStylizeParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let cell = params.cell_px.clamp(1.0, 80.0);
+    let edge_strength = params.edge_strength.clamp(0.0, 1.0);
+    let color_amount = params.color_amount.clamp(0.0, 1.0);
+    let randomness = params.randomness.clamp(0.0, 1.0);
+
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let target = match params.mode {
+                PixelStylizeMode::Crystallize => pixel_stylize_crystallize(
+                    src,
+                    width,
+                    height,
+                    x,
+                    y,
+                    cell.max(2.0),
+                    edge_strength,
+                    color_amount,
+                    randomness,
+                    params.seed,
+                    base,
+                ),
+                PixelStylizeMode::Pointillize => pixel_stylize_pointillize(
+                    src,
+                    width,
+                    height,
+                    x,
+                    y,
+                    cell.max(2.0),
+                    edge_strength,
+                    color_amount,
+                    randomness,
+                    params.seed,
+                    base,
+                ),
+                PixelStylizeMode::Facet => pixel_stylize_facet(
+                    src,
+                    width,
+                    height,
+                    x,
+                    y,
+                    cell.max(2.0),
+                    edge_strength,
+                    color_amount,
+                    randomness,
+                    params.seed,
+                    base,
+                ),
+                PixelStylizeMode::Mezzotint => pixel_stylize_mezzotint(
+                    src,
+                    width,
+                    height,
+                    x,
+                    y,
+                    cell,
+                    edge_strength,
+                    color_amount,
+                    randomness,
+                    params.seed,
+                    base,
+                ),
+            };
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], to_u8(target[c]), strength);
+            }
+        }
+    }
+    out
+}
+
+fn pixel_stylize_crystallize(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    cell: f32,
+    edge_strength: f32,
+    color_amount: f32,
+    randomness: f32,
+    seed: u32,
+    base: [f32; 3],
+) -> [f32; 3] {
+    let (cx, cy, best_dist, second_dist) =
+        pixel_nearest_cell_center(x, y, cell, width, height, randomness, seed);
+    let sampled = sample_rgb_bilinear(src, width, height, cx, cy);
+    let mut target = adjust_saturation(
+        [
+            lerp_f32(base[0], sampled[0], 0.70 + color_amount * 0.30),
+            lerp_f32(base[1], sampled[1], 0.70 + color_amount * 0.30),
+            lerp_f32(base[2], sampled[2], 0.70 + color_amount * 0.30),
+        ],
+        0.72 + color_amount * 0.58,
+    );
+    let gap = (second_dist.sqrt() - best_dist.sqrt()).max(0.0);
+    let boundary = 1.0 - smoothstep(0.0, cell * 0.18, gap);
+    let source_edge = luma_edge_strength(src, width, height, x, y);
+    let darken = (boundary * 0.34 + source_edge * 0.10) * edge_strength;
+    for c in &mut target {
+        *c = (*c * (1.0 - darken)).clamp(0.0, 1.0);
+    }
+    target
+}
+
+fn pixel_stylize_pointillize(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    cell: f32,
+    edge_strength: f32,
+    color_amount: f32,
+    randomness: f32,
+    seed: u32,
+    base: [f32; 3],
+) -> [f32; 3] {
+    let (cx, cy, best_dist, _) =
+        pixel_nearest_cell_center(x, y, cell, width, height, randomness, seed ^ 0x0D07_51A7);
+    let mut ink = sample_rgb_bilinear(src, width, height, cx, cy);
+    ink = adjust_saturation(ink, 0.86 + color_amount * 0.64);
+    let radius = (cell * (0.30 + randomness * 0.20)).max(0.5);
+    let dot = 1.0 - smoothstep(0.72, 1.08, best_dist.sqrt() / radius);
+    let paper_noise = signed_noise((x / 2) as u32, (y / 2) as u32, seed ^ 0xFADE_1201)
+        * (0.012 + randomness * 0.026);
+    let paper = [
+        lerp_f32(0.93 + paper_noise, base[0], 0.18 + color_amount * 0.20),
+        lerp_f32(0.93 + paper_noise, base[1], 0.18 + color_amount * 0.20),
+        lerp_f32(0.93 + paper_noise, base[2], 0.18 + color_amount * 0.20),
+    ];
+    let edge = luma_edge_strength(src, width, height, x, y) * edge_strength * 0.18;
+    [
+        lerp_f32(paper[0], ink[0] * (1.0 - edge), dot).clamp(0.0, 1.0),
+        lerp_f32(paper[1], ink[1] * (1.0 - edge), dot).clamp(0.0, 1.0),
+        lerp_f32(paper[2], ink[2] * (1.0 - edge), dot).clamp(0.0, 1.0),
+    ]
+}
+
+fn pixel_stylize_facet(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    cell: f32,
+    edge_strength: f32,
+    color_amount: f32,
+    randomness: f32,
+    seed: u32,
+    base: [f32; 3],
+) -> [f32; 3] {
+    let fx = x as f32 + 0.5;
+    let fy = y as f32 + 0.5;
+    let cell_x = (fx / cell).floor() as i32;
+    let cell_y = (fy / cell).floor() as i32;
+    let local_x = (fx / cell - cell_x as f32).clamp(0.0, 1.0);
+    let local_y = (fy / cell - cell_y as f32).clamp(0.0, 1.0);
+    let flip = signed_noise(cell_x as u32, cell_y as u32, seed ^ 0xFACE_7A1E) > 0.0;
+    let upper = if flip {
+        local_x + local_y < 1.0
+    } else {
+        local_x > local_y
+    };
+    let (tri_x, tri_y) = match (flip, upper) {
+        (true, true) => (0.34, 0.34),
+        (true, false) => (0.66, 0.66),
+        (false, true) => (0.68, 0.32),
+        (false, false) => (0.32, 0.68),
+    };
+    let jitter_x =
+        signed_noise(cell_x as u32, cell_y as u32, seed ^ 0xA11C_E551) * randomness * 0.11;
+    let jitter_y =
+        signed_noise(cell_x as u32, cell_y as u32, seed ^ 0x51C0_1A7E) * randomness * 0.11;
+    let sx = (cell_x as f32 * cell + (tri_x + jitter_x) * cell)
+        .clamp(0.0, width.saturating_sub(1) as f32);
+    let sy = (cell_y as f32 * cell + (tri_y + jitter_y) * cell)
+        .clamp(0.0, height.saturating_sub(1) as f32);
+    let sampled = sample_rgb_bilinear(src, width, height, sx, sy);
+    let mut target = adjust_saturation(
+        [
+            lerp_f32(base[0], sampled[0], 0.74 + color_amount * 0.18),
+            lerp_f32(base[1], sampled[1], 0.74 + color_amount * 0.18),
+            lerp_f32(base[2], sampled[2], 0.74 + color_amount * 0.18),
+        ],
+        0.78 + color_amount * 0.46,
+    );
+
+    let diagonal = if flip {
+        (local_x + local_y - 1.0).abs() / 2.0_f32.sqrt()
+    } else {
+        (local_x - local_y).abs() / 2.0_f32.sqrt()
+    };
+    let border = local_x.min(1.0 - local_x).min(local_y).min(1.0 - local_y);
+    let line = (1.0 - smoothstep(0.0, 0.055, diagonal)).max(1.0 - smoothstep(0.0, 0.045, border));
+    let shade = signed_noise(cell_x as u32, cell_y as u32, seed ^ 0xC011_A9E5) * 0.035;
+    for c in &mut target {
+        *c = (*c + shade - line * edge_strength * 0.24).clamp(0.0, 1.0);
+    }
+    target
+}
+
+fn pixel_stylize_mezzotint(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    cell: f32,
+    edge_strength: f32,
+    color_amount: f32,
+    randomness: f32,
+    seed: u32,
+    base: [f32; 3],
+) -> [f32; 3] {
+    let grain = cell.round().clamp(1.0, 12.0) as usize;
+    let gx = (x / grain) as u32;
+    let gy = (y / grain) as u32;
+    let coarse = signed_noise(gx, gy, seed ^ 0x0E22_071D);
+    let fine = signed_noise(x as u32, y as u32, seed ^ 0x7111_9A1D);
+    let noise = ((coarse * (0.54 + randomness * 0.20) + fine * (0.26 + randomness * 0.24))
+        / (0.80 + randomness * 0.44)
+        * 0.5
+        + 0.5)
+        .clamp(0.0, 1.0);
+    let luma = luma01(base[0], base[1], base[2]).clamp(0.0, 1.0);
+    let softness = (0.018 + (1.0 - randomness) * 0.085).clamp(0.01, 0.12);
+    let white = 1.0 - smoothstep(luma - softness, luma + softness, noise);
+    let gray = lerp_f32(0.07, 0.94, white);
+    let scale = gray / luma.max(0.06);
+    let tinted = [
+        (base[0] * scale).clamp(0.0, 1.0),
+        (base[1] * scale).clamp(0.0, 1.0),
+        (base[2] * scale).clamp(0.0, 1.0),
+    ];
+    let edge = luma_edge_strength(src, width, height, x, y) * edge_strength * 0.26;
+    [
+        lerp_f32(gray, tinted[0], color_amount) * (1.0 - edge),
+        lerp_f32(gray, tinted[1], color_amount) * (1.0 - edge),
+        lerp_f32(gray, tinted[2], color_amount) * (1.0 - edge),
+    ]
+}
+
+fn pixel_nearest_cell_center(
+    x: usize,
+    y: usize,
+    cell: f32,
+    width: usize,
+    height: usize,
+    randomness: f32,
+    seed: u32,
+) -> (f32, f32, f32, f32) {
+    let fx = x as f32 + 0.5;
+    let fy = y as f32 + 0.5;
+    let cell_x = (fx / cell).floor() as i32;
+    let cell_y = (fy / cell).floor() as i32;
+    let max_cell_x = (width.saturating_sub(1) as f32 / cell).floor() as i32;
+    let max_cell_y = (height.saturating_sub(1) as f32 / cell).floor() as i32;
+    let mut best = (0.0, 0.0, f32::MAX);
+    let mut second_dist = f32::MAX;
+    for cy in cell_y - 1..=cell_y + 1 {
+        if cy < 0 || cy > max_cell_y {
+            continue;
+        }
+        for cx in cell_x - 1..=cell_x + 1 {
+            if cx < 0 || cx > max_cell_x {
+                continue;
+            }
+            let (center_x, center_y) =
+                pixel_cell_center(cx, cy, cell, width, height, randomness, seed);
+            let dx = fx - center_x;
+            let dy = fy - center_y;
+            let dist = dx * dx + dy * dy;
+            if dist < best.2 {
+                second_dist = best.2;
+                best = (center_x, center_y, dist);
+            } else {
+                second_dist = second_dist.min(dist);
+            }
+        }
+    }
+    if second_dist == f32::MAX {
+        second_dist = best.2 + cell * cell;
+    }
+    (best.0, best.1, best.2, second_dist)
+}
+
+fn pixel_cell_center(
+    cell_x: i32,
+    cell_y: i32,
+    cell: f32,
+    width: usize,
+    height: usize,
+    randomness: f32,
+    seed: u32,
+) -> (f32, f32) {
+    let jitter = (randomness * 0.42).clamp(0.0, 0.42);
+    let jx = signed_noise(cell_x as u32, cell_y as u32, seed) * jitter;
+    let jy = signed_noise(cell_x as u32, cell_y as u32, seed ^ 0x9E37_79B9) * jitter;
+    let x = (cell_x as f32 + 0.5 + jx) * cell;
+    let y = (cell_y as f32 + 0.5 + jy) * cell;
+    (
+        x.clamp(0.0, width.saturating_sub(1) as f32),
+        y.clamp(0.0, height.saturating_sub(1) as f32),
     )
 }
 
@@ -7271,6 +7633,97 @@ mod tests {
     }
 
     #[test]
+    fn pixel_stylize_crystallize_groups_cell_color_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            4,
+            1,
+            vec![
+                20, 30, 40, 55, 80, 90, 100, 66, 160, 120, 80, 77, 240, 210, 180, 88,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "crystallize",
+            LocalMask::Full,
+            LocalEffect::PixelStylize(PixelStylizeParams {
+                mode: PixelStylizeMode::Crystallize,
+                cell_px: 8.0,
+                edge_strength: 0.0,
+                color_amount: 1.0,
+                randomness: 0.0,
+                strength: 1.0,
+                seed: 1,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let first_rgb = &out.pixels[0..3];
+        for px in out.pixels.chunks_exact(4) {
+            assert_eq!(&px[0..3], first_rgb);
+        }
+        assert_ne!(first_rgb, &src.pixels[0..3]);
+        assert_eq!(out.pixels[3], 55);
+        assert_eq!(out.pixels[15], 88);
+    }
+
+    #[test]
+    fn pixel_stylize_mezzotint_outputs_gray_grain_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            4,
+            1,
+            vec![
+                40, 70, 110, 51, 120, 120, 120, 62, 200, 170, 130, 73, 250, 250, 250, 84,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "mezzotint",
+            LocalMask::Full,
+            LocalEffect::PixelStylize(PixelStylizeParams {
+                mode: PixelStylizeMode::Mezzotint,
+                cell_px: 1.0,
+                edge_strength: 0.0,
+                color_amount: 0.0,
+                randomness: 1.0,
+                strength: 1.0,
+                seed: 3,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_ne!(out.pixels, src.pixels);
+        for px in out.pixels.chunks_exact(4) {
+            assert_eq!(px[0], px[1]);
+            assert_eq!(px[1], px[2]);
+        }
+        assert_eq!(out.pixels[3], 51);
+        assert_eq!(out.pixels[15], 84);
+    }
+
+    #[test]
+    fn pixel_stylize_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "pixel stylize",
+            LocalMask::Full,
+            LocalEffect::PixelStylize(PixelStylizeParams {
+                mode: PixelStylizeMode::Pointillize,
+                cell_px: 24.0,
+                edge_strength: 1.0,
+                color_amount: 1.0,
+                randomness: 1.0,
+                strength: 0.0,
+                seed: 9,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn median_removes_isolated_speckle_and_preserves_alpha() {
         let mut pixels = vec![0_u8; 3 * 3 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -7562,6 +8015,7 @@ mod tests {
             LocalEffect::BrushStroke(BrushStrokeParams::default()),
             LocalEffect::Cutout(CutoutParams::default()),
             LocalEffect::Emboss(EmbossParams::default()),
+            LocalEffect::PixelStylize(PixelStylizeParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),
