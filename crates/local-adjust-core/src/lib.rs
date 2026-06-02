@@ -412,6 +412,7 @@ pub enum LocalEffect {
     HighlightsShadows(HighlightsShadowsParams),
     Dehaze(DehazeParams),
     Blur(BlurParams),
+    MotionBlur(MotionBlurParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -701,6 +702,23 @@ pub struct BlurParams {
 impl Default for BlurParams {
     fn default() -> Self {
         Self { radius_px: 0.0 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MotionBlurParams {
+    pub distance_px: f32,
+    pub angle_degrees: f32,
+    pub strength: f32,
+}
+
+impl Default for MotionBlurParams {
+    fn default() -> Self {
+        Self {
+            distance_px: 0.0,
+            angle_degrees: 0.0,
+            strength: 0.0,
+        }
     }
 }
 
@@ -1318,6 +1336,9 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
             image.height,
             params.radius_px.round().max(0.0) as usize,
         ),
+        LocalEffect::MotionBlur(params) => {
+            apply_motion_blur(&image.pixels, image.width, image.height, *params)
+        }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
             image.width,
@@ -2251,6 +2272,47 @@ fn box_blur_rgba(src: &[u8], width: usize, height: usize, radius: usize) -> Vec<
             let o = (y * width + x) * 4;
             for c in 0..4 {
                 out[o + c] = (sum[c] / count) as u8;
+            }
+        }
+    }
+    out
+}
+
+fn apply_motion_blur(src: &[u8], width: usize, height: usize, params: MotionBlurParams) -> Vec<u8> {
+    let distance = params.distance_px.clamp(0.0, 240.0);
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || distance <= 0.5 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+
+    let sample_count = ((distance.ceil() as usize) + 1).clamp(3, 65);
+    let half = distance * 0.5;
+    let angle = params.angle_degrees.to_radians();
+    let dir_x = angle.cos();
+    let dir_y = angle.sin();
+    let mut out = src.to_vec();
+
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = [0.0_f32; 4];
+            for i in 0..sample_count {
+                let t = if sample_count <= 1 {
+                    0.0
+                } else {
+                    i as f32 / (sample_count - 1) as f32
+                };
+                let offset = lerp_f32(-half, half, t);
+                let sx = x as f32 + dir_x * offset;
+                let sy = y as f32 + dir_y * offset;
+                let si = nearest_pixel_index(width, height, sx, sy);
+                for c in 0..4 {
+                    sum[c] += src[si + c] as f32;
+                }
+            }
+            let oi = (y * width + x) * 4;
+            for c in 0..4 {
+                let blurred = (sum[c] / sample_count as f32).round() as u8;
+                out[oi + c] = lerp_u8(src[oi + c], blurred, strength);
             }
         }
     }
@@ -3553,6 +3615,12 @@ fn sample_channel_nearest(
     src[(yy * width + xx) * 4 + channel.min(3)]
 }
 
+fn nearest_pixel_index(width: usize, height: usize, x: f32, y: f32) -> usize {
+    let xx = x.round().clamp(0.0, width.saturating_sub(1) as f32) as usize;
+    let yy = y.round().clamp(0.0, height.saturating_sub(1) as f32) as usize;
+    (yy * width + xx) * 4
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3792,6 +3860,32 @@ mod tests {
     }
 
     #[test]
+    fn motion_blur_spreads_bright_pixel_horizontally() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "motion",
+            LocalMask::Full,
+            LocalEffect::MotionBlur(MotionBlurParams {
+                distance_px: 4.0,
+                angle_degrees: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > 0);
+        assert!(out.pixels[8] < 255);
+        assert!(out.pixels[16] > 0);
+        assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
     fn shadow_lift_brightens_dark_pixel() {
         let src = solid(1, 1, [24, 24, 24, 255]);
         let layer = LocalAdjustmentLayer::new(
@@ -3841,6 +3935,7 @@ mod tests {
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default()),
             LocalEffect::Dehaze(DehazeParams::default()),
             LocalEffect::Blur(BlurParams::default()),
+            LocalEffect::MotionBlur(MotionBlurParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),

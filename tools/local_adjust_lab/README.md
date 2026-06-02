@@ -86,6 +86,7 @@ the window.
   - Highlights/Shadows
   - Dehaze
   - Blur
+  - Motion blur
   - Soft focus
   - Mosaic with long-edge-ratio / fixed-pixel tile sizing and the same three
     boundary modes as the conceal mosaic tool

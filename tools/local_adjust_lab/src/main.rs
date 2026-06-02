@@ -20,11 +20,11 @@ use local_adjust_core::{
     FilmGrainParams, GradientMapParams, GradientMapPreset, HalftoneParams, HighlightsShadowsParams,
     HslParams, InvertParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect,
     LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams,
-    MosaicTileMode, PosterizeParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
-    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
-    SharpenParams, SoftFocusParams, StarGlowParams, ThreeWayColorGradingParams, ThresholdParams,
-    ToneCurveParams, ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size,
-    evaluate_layer_mask, parse_cube_lut,
+    MosaicTileMode, MotionBlurParams, PosterizeParams, RadialGradientMask, RangeMask, RasterMask,
+    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
+    SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
+    ThreeWayColorGradingParams, ThresholdParams, ToneCurveParams, ToneParams, VignetteParams,
+    apply_layers, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -938,6 +938,7 @@ enum EffectKind {
     HighlightsShadows,
     Dehaze,
     Blur,
+    MotionBlur,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -975,6 +976,7 @@ impl EffectKind {
             LocalEffect::HighlightsShadows(_) => Self::HighlightsShadows,
             LocalEffect::Dehaze(_) => Self::Dehaze,
             LocalEffect::Blur(_) => Self::Blur,
+            LocalEffect::MotionBlur(_) => Self::MotionBlur,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1012,6 +1014,7 @@ impl EffectKind {
             Self::HighlightsShadows => "ハイライト/シャドウ",
             Self::Dehaze => "かすみ除去",
             Self::Blur => "ぼかし",
+            Self::MotionBlur => "移動ぼかし",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1051,6 +1054,7 @@ impl EffectKind {
             Self::HighlightsShadows => "明るい部分と暗い部分を個別に持ち上げたり抑えたりします。",
             Self::Dehaze => "白っぽさを減らし、遠景や薄いコントラストを締めます。",
             Self::Blur => "選択範囲を均一にぼかします。背景ぼかしや軽い隠しに使います。",
+            Self::MotionBlur => "指定した方向へ流れるようにぼかし、動きや速度感を加えます。",
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
@@ -1119,6 +1123,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
         title: "ぼかし・ディテール",
         kinds: &[
             EffectKind::Blur,
+            EffectKind::MotionBlur,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Sharpen,
@@ -6453,6 +6458,12 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::HighlightsShadows(_) => "ハイライト/シャドウ".to_string(),
         LocalEffect::Dehaze(params) => format!("かすみ除去 {:.0}%", params.amount * 100.0),
         LocalEffect::Blur(params) => format!("ぼかし {:.0}px", params.radius_px),
+        LocalEffect::MotionBlur(params) => {
+            format!(
+                "移動ぼかし {:.0}px {:.0}°",
+                params.distance_px, params.angle_degrees
+            )
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -7665,6 +7676,65 @@ fn draw_effect_params(
             changed |= ui
                 .add(egui::Slider::new(&mut params.radius_px, 0.0..=80.0).text("半径"))
                 .changed();
+        }
+        LocalEffect::MotionBlur(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "横") {
+                    *params = MotionBlurParams {
+                        distance_px: 24.0,
+                        angle_degrees: 0.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "縦") {
+                    *params = MotionBlurParams {
+                        distance_px: 24.0,
+                        angle_degrees: 90.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "斜め") {
+                    *params = MotionBlurParams {
+                        distance_px: 30.0,
+                        angle_degrees: -35.0,
+                        strength: 0.9,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "高速感") {
+                    *params = MotionBlurParams {
+                        distance_px: 56.0,
+                        angle_degrees: 0.0,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "指定方向へ画像を流すぼかしです。背景やエフェクトに部分適用すると動きの表現に使えます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let distance =
+                ui.add(egui::Slider::new(&mut params.distance_px, 0.0..=160.0).text("距離"));
+            changed |= distance.changed();
+            distance
+                .lab_hover_tip("ぼかしを伸ばす長さです。値を大きくすると流れる幅が長くなります。");
+            let angle = ui.add(
+                egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                    .text("角度")
+                    .suffix("°"),
+            );
+            changed |= angle.changed();
+            angle.lab_hover_tip("ぼかしの方向です。0°で横方向、90°で縦方向になります。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から移動ぼかし結果へどれだけ近づけるかです。");
         }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -9907,6 +9977,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         }
         EffectKind::Dehaze => LocalEffect::Dehaze(DehazeParams::default()),
         EffectKind::Blur => LocalEffect::Blur(BlurParams::default()),
+        EffectKind::MotionBlur => LocalEffect::MotionBlur(MotionBlurParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
