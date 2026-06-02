@@ -15,25 +15,25 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
-    AnamorphicFlareParams, ArtisticMediaMode, ArtisticMediaParams, AuroraParams, BloomParams,
-    BlurParams, BrushStrokeMode, BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams,
-    ClarityParams, CloudFogMode, CloudFogParams, CmykPlateShiftParams, ColorBalanceParams,
-    ColorBalanceRange, ColorDodgeGlowParams, ColorFillParams, ColorGradeWheel, ColorHalftoneParams,
-    ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask,
-    ColorTraceParams, ContactShadowParams, CubeLutParams, CutoutParams, DefringeParams,
-    DehazeParams, DespeckleParams, DiffuseGlowParams, DuotoneParams, DuotonePreset,
-    EdgeSmoothParams, EmbossParams, EngravingParams, EqualizeParams, FilmGrainParams,
-    GlassDisplacementMode, GlassDisplacementParams, GlowingEdgesParams, GodRaysParams,
-    GradientMapParams, GradientMapPreset, HalationParams, HalftoneParams, HeatHazeParams,
-    HighPassParams, HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture,
-    LensBlurParams, LensCorrectionParams, LensFlareParams, LightLeakParams, LineExtractMode,
-    LineExtractParams, LineKind, LinearGradientMask, LithographParams, LocalAdjustmentLayer,
-    LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams,
-    MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams,
-    NewspaperPrintParams, NoiseDistribution, NoiseParams, OilPaintParams, OldFilmParams,
-    OrtonParams, OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, ParticleOverlayMode,
-    ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection, PixelSortOrder,
-    PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
+    AnamorphicFlareParams, ArtisticMediaMode, ArtisticMediaParams, AuroraParams,
+    BacklightHazeParams, BloomParams, BlurParams, BrushStrokeMode, BrushStrokeParams,
+    ChannelMixerParams, ChromaticAberrationParams, ClarityParams, CloudFogMode, CloudFogParams,
+    CmykPlateShiftParams, ColorBalanceParams, ColorBalanceRange, ColorDodgeGlowParams,
+    ColorFillParams, ColorGradeWheel, ColorHalftoneParams, ColorMixerParams, ColorOverlayBlendMode,
+    ColorOverlayParams, ColorOverlayShape, ColorRangeMask, ColorTraceParams, ContactShadowParams,
+    CubeLutParams, CutoutParams, DefringeParams, DehazeParams, DespeckleParams, DiffuseGlowParams,
+    DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams, EngravingParams, EqualizeParams,
+    FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams, GlowingEdgesParams,
+    GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams, HalftoneParams,
+    HeatHazeParams, HighPassParams, HighlightsShadowsParams, HslParams, InvertParams,
+    LensBlurAperture, LensBlurParams, LensCorrectionParams, LensFlareParams, LightLeakParams,
+    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LithographParams,
+    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
+    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
+    NeonGlowParams, NewspaperPrintParams, NoiseDistribution, NoiseParams, OilPaintParams,
+    OldFilmParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement, PartColorParams,
+    ParticleOverlayMode, ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection,
+    PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
     PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
     RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
     RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode, ScreenToneParams,
@@ -1070,6 +1070,7 @@ enum EffectKind {
     LensFlare,
     AnamorphicFlare,
     LightLeak,
+    BacklightHaze,
     CloudFog,
     WaterCaustics,
     ParticleOverlay,
@@ -1119,6 +1120,7 @@ enum RgbPickTarget {
     ColorDodgeGlowColor,
     AnamorphicFlareColor,
     LightLeakColor,
+    BacklightHazeColor,
     LithographInkA,
     LithographInkB,
     LithographPaper,
@@ -1152,6 +1154,7 @@ impl RgbPickTarget {
             Self::ColorDodgeGlowColor => "覆い焼き発光の光色",
             Self::AnamorphicFlareColor => "アナモルフィックフレアの色",
             Self::LightLeakColor => "ライトリークの光色",
+            Self::BacklightHazeColor => "逆光ヘイズの光色",
             Self::LithographInkA => "リソグラフのインク1",
             Self::LithographInkB => "リソグラフのインク2",
             Self::LithographPaper => "リソグラフの紙色",
@@ -1236,6 +1239,7 @@ impl EffectKind {
             LocalEffect::LensFlare(_) => Self::LensFlare,
             LocalEffect::AnamorphicFlare(_) => Self::AnamorphicFlare,
             LocalEffect::LightLeak(_) => Self::LightLeak,
+            LocalEffect::BacklightHaze(_) => Self::BacklightHaze,
             LocalEffect::CloudFog(_) => Self::CloudFog,
             LocalEffect::WaterCaustics(_) => Self::WaterCaustics,
             LocalEffect::ParticleOverlay(_) => Self::ParticleOverlay,
@@ -1335,6 +1339,7 @@ impl EffectKind {
             Self::LensFlare => "レンズフレア",
             Self::AnamorphicFlare => "アナモルフィックフレア",
             Self::LightLeak => "ライトリーク",
+            Self::BacklightHaze => "逆光ヘイズ",
             Self::CloudFog => "雲/霧",
             Self::WaterCaustics => "水中コースティクス",
             Self::ParticleOverlay => "雨/雪/花びら",
@@ -1520,6 +1525,9 @@ impl EffectKind {
             }
             Self::LightLeak => {
                 "指定した位置から暖色の光漏れ、薄いヘイズ、斜めの漏れ筋を重ねて古いフィルム風にします。"
+            }
+            Self::BacklightHaze => {
+                "光源位置からの逆光色、薄い空気かぶり、影の持ち上げで背景や被写体に大気感を足します。"
             }
             Self::CloudFog => "手続き型のノイズで霧や雲を重ね、大気感と遠近感を加えます。",
             Self::WaterCaustics => {
@@ -1734,6 +1742,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::LensFlare,
             EffectKind::AnamorphicFlare,
             EffectKind::LightLeak,
+            EffectKind::BacklightHaze,
             EffectKind::CloudFog,
             EffectKind::WaterCaustics,
             EffectKind::ParticleOverlay,
@@ -7504,6 +7513,27 @@ impl LocalAdjustLabApp {
                 painter.circle_stroke(center, radius_px.max(2.0), ring_stroke);
                 painter.circle_stroke(center, (radius_px * 1.85).max(2.0), haze_stroke);
             }
+            LocalEffect::BacklightHaze(params) => {
+                let (center_changed, center_used, center) = draw_effect_center_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("backlight_haze_center", layer_idx)),
+                    &mut params.center,
+                    "逆光ヘイズ光源位置",
+                    Color32::from_rgb(255, 226, 165),
+                );
+                changed |= center_changed;
+                used |= center_used;
+
+                let diag = rect.width().hypot(rect.height()).max(1.0);
+                let radius_px = diag * params.radius.clamp(0.05, 1.6);
+                let ring_stroke =
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 230, 175, 145));
+                let haze_stroke =
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 245, 210, 90));
+                painter.circle_stroke(center, radius_px.max(2.0), ring_stroke);
+                painter.circle_stroke(center, (radius_px * 1.55).max(2.0), haze_stroke);
+            }
             LocalEffect::SpeedLines(params) => {
                 let (center_changed, center_used, center) = draw_effect_center_handle(
                     ui,
@@ -8913,6 +8943,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
             params.center[1],
             params.strength * 100.0
         ),
+        LocalEffect::BacklightHaze(params) => {
+            format!("逆光ヘイズ {:.0}%", params.strength * 100.0)
+        }
         LocalEffect::CloudFog(params) => match params.mode {
             CloudFogMode::Fog => format!("霧 {:.0}%", params.opacity * 100.0),
             CloudFogMode::Clouds => format!("雲 {:.0}%", params.opacity * 100.0),
@@ -9014,6 +9047,7 @@ fn effect_has_position_handles(effect: &LocalEffect) -> bool {
             | LocalEffect::GodRays(_)
             | LocalEffect::LensFlare(_)
             | LocalEffect::LightLeak(_)
+            | LocalEffect::BacklightHaze(_)
             | LocalEffect::SpeedLines(_)
             | LocalEffect::Spotlight(_)
     )
@@ -9329,6 +9363,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
             true
         }
         (LocalEffect::LightLeak(params), RgbPickTarget::LightLeakColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::BacklightHaze(params), RgbPickTarget::BacklightHazeColor) => {
             params.color_rgb = rgb;
             true
         }
@@ -15512,6 +15550,128 @@ fn draw_effect_params(
             seed_response.lab_hover_tip("漏れ筋や細かな揺らぎの乱数です。");
             params.seed = seed.max(0) as u32;
         }
+        LocalEffect::BacklightHaze(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "夕逆光") {
+                    *params = BacklightHazeParams {
+                        center: [0.54, 0.10],
+                        color_rgb: [255, 214, 156],
+                        radius: 0.92,
+                        falloff: 1.45,
+                        haze: 0.46,
+                        glow: 0.58,
+                        shadow_lift: 0.32,
+                        contrast_fade: 0.22,
+                        saturation_fade: 0.08,
+                        strength: 0.82,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "朝もや") {
+                    *params = BacklightHazeParams {
+                        center: [0.42, 0.04],
+                        color_rgb: [255, 238, 205],
+                        radius: 1.08,
+                        falloff: 2.0,
+                        haze: 0.54,
+                        glow: 0.22,
+                        shadow_lift: 0.28,
+                        contrast_fade: 0.34,
+                        saturation_fade: 0.18,
+                        strength: 0.72,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "柔らかい") {
+                    *params = BacklightHazeParams {
+                        center: [0.68, 0.18],
+                        color_rgb: [255, 226, 186],
+                        radius: 0.82,
+                        falloff: 2.6,
+                        haze: 0.30,
+                        glow: 0.32,
+                        shadow_lift: 0.18,
+                        contrast_fade: 0.16,
+                        saturation_fade: 0.08,
+                        strength: 0.55,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "青い空気") {
+                    *params = BacklightHazeParams {
+                        center: [0.50, 0.00],
+                        color_rgb: [190, 220, 255],
+                        radius: 1.20,
+                        falloff: 1.75,
+                        haze: 0.42,
+                        glow: 0.28,
+                        shadow_lift: 0.18,
+                        contrast_fade: 0.26,
+                        saturation_fade: 0.22,
+                        strength: 0.68,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "光源方向の薄い空気かぶり、グロー、影の持ち上げをまとめて足します。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            changed |= draw_effect_center_controls(
+                ui,
+                &mut params.center,
+                "逆光や空気かぶりの光源横位置です。",
+                "逆光や空気かぶりの光源縦位置です。",
+                effect_position_handles_visible,
+                &mut set_effect_position_handles_visible,
+            );
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "光色",
+                    &mut params.color_rgb,
+                    RgbPickTarget::BacklightHazeColor,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let radius = ui.add(egui::Slider::new(&mut params.radius, 0.05..=1.6).text("範囲"));
+            changed |= radius.changed();
+            radius.lab_hover_tip("逆光ヘイズが広がる範囲です。画像の対角線に対する比率です。");
+            let falloff = ui.add(egui::Slider::new(&mut params.falloff, 0.35..=5.0).text("減衰"));
+            changed |= falloff.changed();
+            falloff.lab_hover_tip("光源から離れたときの弱まり方です。低いほど広く残ります。");
+            let haze = ui.add(egui::Slider::new(&mut params.haze, 0.0..=1.0).text("ヘイズ"));
+            changed |= haze.changed();
+            haze.lab_hover_tip("薄い空気かぶりを足す量です。");
+            let glow = ui.add(egui::Slider::new(&mut params.glow, 0.0..=2.0).text("グロー"));
+            changed |= glow.changed();
+            glow.lab_hover_tip("明るい部分を中心にスクリーン合成で発光感を足す量です。");
+            let shadow_lift =
+                ui.add(egui::Slider::new(&mut params.shadow_lift, 0.0..=1.0).text("影持ち上げ"));
+            changed |= shadow_lift.changed();
+            shadow_lift
+                .lab_hover_tip("暗部を光色で持ち上げ、逆光で黒つぶれしすぎないようにします。");
+            let contrast = ui.add(
+                egui::Slider::new(&mut params.contrast_fade, 0.0..=1.0).text("コントラスト低下"),
+            );
+            changed |= contrast.changed();
+            contrast.lab_hover_tip("光源付近のコントラストを少し浅くして、空気感を出します。");
+            let saturation =
+                ui.add(egui::Slider::new(&mut params.saturation_fade, 0.0..=1.0).text("彩度低下"));
+            changed |= saturation.changed();
+            saturation
+                .lab_hover_tip("光源付近の彩度を少し落として、もやの中にある見た目へ寄せます。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から逆光ヘイズ結果へどれだけ近づけるかです。");
+        }
         LocalEffect::CloudFog(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -19041,6 +19201,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
             LocalEffect::AnamorphicFlare(AnamorphicFlareParams::default())
         }
         EffectKind::LightLeak => LocalEffect::LightLeak(LightLeakParams::default()),
+        EffectKind::BacklightHaze => LocalEffect::BacklightHaze(BacklightHazeParams::default()),
         EffectKind::CloudFog => LocalEffect::CloudFog(CloudFogParams::default()),
         EffectKind::WaterCaustics => LocalEffect::WaterCaustics(WaterCausticsParams::default()),
         EffectKind::ParticleOverlay => {
@@ -21440,6 +21601,7 @@ mod tests {
             EffectKind::LensFlare,
             EffectKind::AnamorphicFlare,
             EffectKind::LightLeak,
+            EffectKind::BacklightHaze,
             EffectKind::CloudFog,
             EffectKind::WaterCaustics,
             EffectKind::ParticleOverlay,
@@ -21526,6 +21688,7 @@ mod tests {
             LocalEffect::GodRays(GodRaysParams::default()),
             LocalEffect::LensFlare(LensFlareParams::default()),
             LocalEffect::LightLeak(LightLeakParams::default()),
+            LocalEffect::BacklightHaze(BacklightHazeParams::default()),
             LocalEffect::SpeedLines(SpeedLinesParams::default()),
             LocalEffect::Spotlight(SpotlightParams::default()),
         ];
@@ -21857,6 +22020,17 @@ mod tests {
             panic!("expected light leak effect");
         };
         assert_eq!(light_leak_params.color_rgb, [255, 150, 90]);
+
+        let mut backlight_haze = LocalEffect::BacklightHaze(BacklightHazeParams::default());
+        assert!(set_rgb_pick_target(
+            &mut backlight_haze,
+            RgbPickTarget::BacklightHazeColor,
+            [255, 220, 170],
+        ));
+        let LocalEffect::BacklightHaze(backlight_haze_params) = backlight_haze else {
+            panic!("expected backlight haze effect");
+        };
+        assert_eq!(backlight_haze_params.color_rgb, [255, 220, 170]);
 
         let mut lithograph = LocalEffect::Lithograph(LithographParams::default());
         assert!(set_rgb_pick_target(

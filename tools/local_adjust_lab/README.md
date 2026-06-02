@@ -125,6 +125,7 @@ the window.
   - Lens flare
   - Anamorphic flare
   - Light leak
+  - Backlight haze
   - Cloud/fog
   - Water caustics
   - Particle overlay (rain/snow/petals)
@@ -161,14 +162,14 @@ the window.
   to its default values.
 - RGB color parameters in Color Fill, Outline Stroke, Rim Light, Contact
   Shadow, Color Overlay, Neon Glow, Color Dodge Glow, Anamorphic Flare,
-  Light Leak, Lithograph, Engraving, Part Color, Halation, Toon Shade, Speed Lines, Cloud/Fog, Particle Overlay, Aurora, and Spotlight share a control with a color button,
+  Light Leak, Backlight Haze, Lithograph, Engraving, Part Color, Halation, Toon Shade, Speed Lines, Cloud/Fog, Particle Overlay, Aurora, and Spotlight share a control with a color button,
   HEX readout, RGB sliders, and an image-click eyedropper.
 - Color Fill starts with a shape placeholder and full opacity. Choosing Solid,
   Linear Gradient, or Radial Gradient immediately makes the fill visible.
 - Linear and radial gradients in Color Fill and Color Overlay can be adjusted
   with the same canvas drag handles used by gradient-like mask/effect controls.
 - Effects with image-space center or light-source parameters can show canvas
-  handles for direct dragging on the image. God Rays, Lens Flare, Light Leak, Spotlight,
+  handles for direct dragging on the image. God Rays, Lens Flare, Light Leak, Backlight Haze, Spotlight,
   Speed Lines, Radial Blur, Ripple Wave Distortion, Pinch/Spherize, Twirl,
   Polar Coordinates, and Lens Correction share the `画像ハンドルを表示` toggle;
   turn it off from the effect panel when it gets in the way. Gradient-like

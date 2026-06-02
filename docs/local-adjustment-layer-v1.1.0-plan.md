@@ -135,6 +135,7 @@ enum LocalEffect {
     ParticleOverlay(LocalParticleOverlayParams),
     Aurora(LocalAuroraParams),
     LightLeak(LocalLightLeakParams),
+    BacklightHaze(LocalBacklightHazeParams),
     Halftone(LocalHalftoneParams),
     ScreenTone(LocalScreenToneParams),
     ColorHalftone(LocalColorHalftoneParams),
@@ -332,7 +333,7 @@ v1.1.0 の最小構成:
 | ビネット | 高 | 周辺を暗く / 明るくして視線誘導 | 専用効果にすると円形マスクより手早い |
 | フィルム粒子 / ノイズ追加 | 中-高 | AI 絵のつるっとした質感を軽く崩す | seed 固定で再現性を持たせる |
 | Orton / Soft Glow | 中 | 写真・イラストの柔らかい仕上げ | SoftFocus と近いがルック寄り |
-| 色収差 / ライトリーク | 中 | レンズ・フィルム系の演出を範囲付きで使う | `LightLeak` は位置ハンドル、光色、範囲、ヘイズ、漏れ筋を持つローカル光漏れとして追加 |
+| 色収差 / ライトリーク / 逆光ヘイズ | 中 | レンズ・フィルム・大気系の演出を範囲付きで使う | `LightLeak` は位置ハンドル、光色、範囲、ヘイズ、漏れ筋を持つローカル光漏れ、`BacklightHaze` は光源位置、光色、範囲、ヘイズ、グロー、影持ち上げを持つ逆光・空気感フィルタとして追加 |
 | ハーフトーン / 漫画調 / 印刷風 / スクリーントーン | 中 | ポストフィルタ的な見た目を範囲・強度付きで使う | `Halftone` は簡易網点、`ScreenTone` は網点 / 線 / カケアミ、`ColorHalftone` は CMYK 4版ドット、`CmykPlateShift` は版ズレ、`Lithograph` は2色スポットインクの版画風、`Engraving` は線彫り/クロスハッチの古典挿絵風、`NewspaperPrint` は古新聞/古印刷物風、`Textureizer` は紙目 / キャンバス / リネン質感を持つ印刷・紙質系フィルタ |
 | エッジ保持ぼかし / 滑らか化 | 中 | 背景なじませ、美肌、ノイズ感の低減 | bilateral / guided filter 系。重いので worker 前提 |
 
@@ -928,7 +929,7 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   に残す
 - 効果: Tone (自然な彩度・tint を含む) / Tone Curve / RGB Curve / Color Balance /
   3-way Color Grading / Selective Color / Part Color / Channel Mixer / Color Mixer / Clarity / Highlights-Shadows /
-  Texture / HighPass / Blur / Motion Blur / Wind / SpeedLines / Tilt Shift / Lens Blur / Radial Blur / WaveDistortion / HeatHaze / PinchSpherize / Twirl / PolarCoordinates / GlassDisplacement / LensCorrection / LineExtract / ColorTrace / ArtisticMedia / BrushStroke / Cutout / ToonShade / Emboss / PixelStylize / Solarize / GlowingEdges / OilPaint / Soft Focus / Orton / Mosaic / Sharpen(radius/threshold) / SmartSharpen(edge-aware) / HSL / Dehaze / Look / 3D LUT / Posterize / Threshold / Invert / Duotone / Equalize / Gradient Map / ColorFill / OutlineStroke / RimLight / ContactShadow / ColorOverlay / NeonGlow / DiffuseGlow / Bloom / Halation / ColorDodgeGlow / GodRays / LensFlare / Anamorphic Flare / LightLeak / CloudFog / WaterCaustics / ParticleOverlay / Aurora / Spotlight /
+  Texture / HighPass / Blur / Motion Blur / Wind / SpeedLines / Tilt Shift / Lens Blur / Radial Blur / WaveDistortion / HeatHaze / PinchSpherize / Twirl / PolarCoordinates / GlassDisplacement / LensCorrection / LineExtract / ColorTrace / ArtisticMedia / BrushStroke / Cutout / ToonShade / Emboss / PixelStylize / Solarize / GlowingEdges / OilPaint / Soft Focus / Orton / Mosaic / Sharpen(radius/threshold) / SmartSharpen(edge-aware) / HSL / Dehaze / Look / 3D LUT / Posterize / Threshold / Invert / Duotone / Equalize / Gradient Map / ColorFill / OutlineStroke / RimLight / ContactShadow / ColorOverlay / NeonGlow / DiffuseGlow / Bloom / Halation / ColorDodgeGlow / GodRays / LensFlare / Anamorphic Flare / LightLeak / BacklightHaze / CloudFog / WaterCaustics / ParticleOverlay / Aurora / Spotlight /
   Vignette / Film Grain / Chromatic Aberration / Defringe / Scanline Glitch / VHS / Pixel Sort / Old Film / Halftone / ScreenTone / ColorHalftone / CmykPlateShift / Lithograph / Engraving / NewspaperPrint / Textureizer / Cross-Star Glow /
   Edge-preserving Smooth / Median
 - 3D LUT は `.cube` の `LUT_3D_SIZE` / `DOMAIN_MIN` / `DOMAIN_MAX` / `LUT_3D_INPUT_RANGE` を読み取り、RGB 3D table

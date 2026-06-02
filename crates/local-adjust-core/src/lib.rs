@@ -593,6 +593,7 @@ pub enum LocalEffect {
     LensFlare(LensFlareParams),
     AnamorphicFlare(AnamorphicFlareParams),
     LightLeak(LightLeakParams),
+    BacklightHaze(BacklightHazeParams),
     SpeedLines(SpeedLinesParams),
     CloudFog(CloudFogParams),
     Spotlight(SpotlightParams),
@@ -692,6 +693,7 @@ impl LocalEffect {
             Self::LensFlare(_) => "レンズフレア",
             Self::AnamorphicFlare(_) => "アナモルフィックフレア",
             Self::LightLeak(_) => "ライトリーク",
+            Self::BacklightHaze(_) => "逆光ヘイズ",
             Self::SpeedLines(_) => "集中線/スピード線",
             Self::CloudFog(_) => "雲/霧",
             Self::Spotlight(_) => "スポットライト",
@@ -2748,6 +2750,37 @@ impl Default for LightLeakParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BacklightHazeParams {
+    pub center: [f32; 2],
+    pub color_rgb: [u8; 3],
+    pub radius: f32,
+    pub falloff: f32,
+    pub haze: f32,
+    pub glow: f32,
+    pub shadow_lift: f32,
+    pub contrast_fade: f32,
+    pub saturation_fade: f32,
+    pub strength: f32,
+}
+
+impl Default for BacklightHazeParams {
+    fn default() -> Self {
+        Self {
+            center: [0.50, 0.12],
+            color_rgb: [255, 224, 174],
+            radius: 0.90,
+            falloff: 1.65,
+            haze: 0.35,
+            glow: 0.28,
+            shadow_lift: 0.24,
+            contrast_fade: 0.18,
+            saturation_fade: 0.10,
+            strength: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeedLinesMode {
@@ -3939,6 +3972,9 @@ where
             }
             LocalEffect::LightLeak(params) => {
                 apply_light_leak(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::BacklightHaze(params) => {
+                apply_backlight_haze(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::SpeedLines(params) => {
                 apply_speed_lines(&image.pixels, image.width, image.height, *params)
@@ -9665,6 +9701,90 @@ fn apply_light_leak(src: &[u8], width: usize, height: usize, params: LightLeakPa
     out
 }
 
+fn apply_backlight_haze(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: BacklightHazeParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let color = rgb_u8_to_f32(params.color_rgb);
+    let radius = params.radius.clamp(0.05, 1.6);
+    let falloff = params.falloff.clamp(0.35, 5.0);
+    let haze = params.haze.clamp(0.0, 1.0);
+    let glow = params.glow.clamp(0.0, 2.0);
+    let shadow_lift = params.shadow_lift.clamp(0.0, 1.0);
+    let contrast_fade = params.contrast_fade.clamp(0.0, 1.0);
+    let saturation_fade = params.saturation_fade.clamp(0.0, 1.0);
+    if haze <= f32::EPSILON
+        && glow <= f32::EPSILON
+        && shadow_lift <= f32::EPSILON
+        && contrast_fade <= f32::EPSILON
+        && saturation_fade <= f32::EPSILON
+    {
+        return src.to_vec();
+    }
+
+    let cx = params.center[0].clamp(0.0, 1.0) * width.saturating_sub(1).max(1) as f32;
+    let cy = params.center[1].clamp(0.0, 1.0) * height.saturating_sub(1).max(1) as f32;
+    let diag = (width as f32).hypot(height as f32).max(1.0);
+    let radius_px = radius * diag;
+    let mut out = src.to_vec();
+
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let luma = luma01(base[0], base[1], base[2]);
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = dx.hypot(dy);
+            let radial = (1.0 - dist / radius_px).clamp(0.0, 1.0).powf(falloff);
+            let broad = (1.0 - dist / (radius_px * 1.55))
+                .clamp(0.0, 1.0)
+                .powf((falloff * 0.55).max(0.35));
+            let air = (radial * 0.68 + broad * 0.32).clamp(0.0, 1.0);
+            if air <= f32::EPSILON {
+                continue;
+            }
+
+            let mut target = base;
+            let contrast_amount = contrast_fade * air;
+            for channel in &mut target {
+                *channel = lerp_f32(0.5, *channel, 1.0 - contrast_amount * 0.72);
+            }
+            let faded_luma = luma01(target[0], target[1], target[2]);
+            for channel in &mut target {
+                *channel = lerp_f32(*channel, faded_luma, saturation_fade * air * 0.85);
+            }
+
+            let shadow = (1.0 - luma).powf(0.72) * shadow_lift * air;
+            let haze_amount = haze * air * (0.42 + (1.0 - luma) * 0.28);
+            let glow_amount = glow * radial.powf(0.62) * (0.28 + luma * 0.72);
+            for c in 0..3 {
+                target[c] = screen_channel(target[c], color[c] * shadow * 0.70);
+                target[c] = screen_channel(target[c], color[c] * haze_amount * 0.78);
+                target[c] = screen_channel(target[c], color[c] * glow_amount * 0.60);
+                out[i + c] = to_u8(lerp_f32(base[c], target[c], strength));
+            }
+        }
+    }
+
+    out
+}
+
 fn horizontal_streak_rgb_f32(src: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
     if radius == 0 || width == 0 || height == 0 {
         return src.to_vec();
@@ -14750,6 +14870,7 @@ mod tests {
             LocalEffect::LensFlare(LensFlareParams::default()),
             LocalEffect::AnamorphicFlare(AnamorphicFlareParams::default()),
             LocalEffect::LightLeak(LightLeakParams::default()),
+            LocalEffect::BacklightHaze(BacklightHazeParams::default()),
             LocalEffect::SpeedLines(SpeedLinesParams::default()),
             LocalEffect::CloudFog(CloudFogParams::default()),
             LocalEffect::Spotlight(SpotlightParams::default()),
@@ -15378,6 +15499,21 @@ mod tests {
                     streak_angle_degrees: -180.0,
                     strength: 1.0,
                     seed: 28,
+                }),
+            ),
+            full(
+                "backlight haze max glow",
+                LocalEffect::BacklightHaze(BacklightHazeParams {
+                    center: [0.5, 0.0],
+                    color_rgb: [255, 230, 180],
+                    radius: 1.6,
+                    falloff: 0.35,
+                    haze: 1.0,
+                    glow: 2.0,
+                    shadow_lift: 1.0,
+                    contrast_fade: 1.0,
+                    saturation_fade: 1.0,
+                    strength: 1.0,
                 }),
             ),
             full(
@@ -17103,6 +17239,78 @@ LUT_3D_SIZE 2
             LocalEffect::LightLeak(LightLeakParams {
                 strength: 1.0,
                 ..LightLeakParams::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn backlight_haze_lifts_near_light_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            4,
+            1,
+            vec![
+                32, 32, 32, 210, 32, 32, 32, 211, 32, 32, 32, 212, 32, 32, 32, 213,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "backlight haze",
+            LocalMask::Full,
+            LocalEffect::BacklightHaze(BacklightHazeParams {
+                center: [0.0, 0.0],
+                color_rgb: [255, 226, 180],
+                radius: 0.85,
+                falloff: 1.0,
+                haze: 0.75,
+                glow: 0.55,
+                shadow_lift: 0.70,
+                contrast_fade: 0.35,
+                saturation_fade: 0.15,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert!(out.pixels[0] > out.pixels[12]);
+        assert_eq!(out.pixels[3], 210);
+        assert_eq!(out.pixels[15], 213);
+    }
+
+    #[test]
+    fn backlight_haze_tints_toward_light_color() {
+        let src = RgbaImageBuf::new(1, 1, vec![80, 80, 80, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "backlight haze",
+            LocalMask::Full,
+            LocalEffect::BacklightHaze(BacklightHazeParams {
+                center: [0.0, 0.0],
+                color_rgb: [255, 180, 80],
+                radius: 1.0,
+                falloff: 1.0,
+                haze: 1.0,
+                glow: 0.0,
+                shadow_lift: 0.0,
+                contrast_fade: 0.0,
+                saturation_fade: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > out.pixels[2]);
+        assert!(out.pixels[1] > out.pixels[2]);
+    }
+
+    #[test]
+    fn backlight_haze_keeps_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(1, 1, vec![250, 80, 20, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "backlight haze",
+            LocalMask::Full,
+            LocalEffect::BacklightHaze(BacklightHazeParams {
+                strength: 1.0,
+                ..BacklightHazeParams::default()
             }),
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
