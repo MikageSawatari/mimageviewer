@@ -131,6 +131,7 @@ the window.
   - Despeckle
   - Median
   - Outline stroke
+  - Color trace
 - Effect parameters start from near-identity values. Use the per-effect preset
   buttons for practical starting points, or Reset to return the current effect
   to its default values.

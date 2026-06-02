@@ -575,6 +575,7 @@ pub enum LocalEffect {
     GradientMap(GradientMapParams),
     ColorFill(ColorFillParams),
     OutlineStroke(OutlineStrokeParams),
+    ColorTrace(ColorTraceParams),
     ColorOverlay(ColorOverlayParams),
     NeonGlow(NeonGlowParams),
     DiffuseGlow(DiffuseGlowParams),
@@ -651,6 +652,7 @@ impl LocalEffect {
             Self::GradientMap(_) => "グラデーションマップ",
             Self::ColorFill(_) => "塗りつぶし",
             Self::OutlineStroke(_) => "縁取り",
+            Self::ColorTrace(_) => "色トレス",
             Self::ColorOverlay(_) => "塗り/グラデーション",
             Self::NeonGlow(_) => "ネオングロー",
             Self::DiffuseGlow(_) => "拡散光彩",
@@ -2133,6 +2135,29 @@ impl Default for OutlineStrokeParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ColorTraceParams {
+    pub strength: f32,
+    pub line_threshold: f32,
+    pub softness: f32,
+    pub sample_radius_px: f32,
+    pub darkness: f32,
+    pub saturation: f32,
+}
+
+impl Default for ColorTraceParams {
+    fn default() -> Self {
+        Self {
+            strength: 0.0,
+            line_threshold: 0.34,
+            softness: 0.14,
+            sample_radius_px: 6.0,
+            darkness: 0.55,
+            saturation: 0.12,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ColorOverlayShape {
@@ -3150,6 +3175,9 @@ where
             }
             LocalEffect::OutlineStroke(params) => {
                 apply_outline_stroke(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::ColorTrace(params) => {
+                apply_color_trace(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::ColorOverlay(params) => {
                 apply_color_overlay(&image.pixels, image.width, image.height, *params)
@@ -7204,6 +7232,78 @@ fn apply_outline_stroke(
     out
 }
 
+fn apply_color_trace(src: &[u8], width: usize, height: usize, params: ColorTraceParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let radius = params.sample_radius_px.round().clamp(1.0, 64.0) as usize;
+    if width == 0 || height == 0 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+
+    let len = width.saturating_mul(height);
+    let threshold = params.line_threshold.clamp(0.02, 0.95);
+    let softness = params.softness.clamp(0.001, 0.60);
+    let darkness = params.darkness.clamp(0.0, 1.0);
+    let saturation_scale = 1.0 + params.saturation.clamp(-1.0, 2.0);
+    let mut line = vec![0.0; len];
+    let mut weight = vec![0.0; len];
+    let mut weighted_r = vec![0.0; len];
+    let mut weighted_g = vec![0.0; len];
+    let mut weighted_b = vec![0.0; len];
+
+    for (idx, px) in src.chunks_exact(4).enumerate() {
+        let alpha = px[3] as f32 / 255.0;
+        if alpha <= f32::EPSILON {
+            continue;
+        }
+        let r = px[0] as f32 / 255.0;
+        let g = px[1] as f32 / 255.0;
+        let b = px[2] as f32 / 255.0;
+        let luma = luma01(r, g, b);
+        let line_weight = (1.0 - smoothstep(threshold, threshold + softness, luma)) * alpha;
+        let sample_weight = (1.0 - line_weight).max(0.04) * alpha;
+        line[idx] = line_weight.clamp(0.0, 1.0);
+        weight[idx] = sample_weight;
+        weighted_r[idx] = r * sample_weight;
+        weighted_g[idx] = g * sample_weight;
+        weighted_b[idx] = b * sample_weight;
+    }
+
+    let blur_weight = box_blur_alpha(&weight, width, height, radius);
+    let blur_r = box_blur_alpha(&weighted_r, width, height, radius);
+    let blur_g = box_blur_alpha(&weighted_g, width, height, radius);
+    let blur_b = box_blur_alpha(&weighted_b, width, height, radius);
+    let mut out = src.to_vec();
+
+    for idx in 0..len {
+        let amount = (line[idx] * strength).clamp(0.0, 1.0);
+        if amount <= f32::EPSILON {
+            continue;
+        }
+        let o = idx * 4;
+        let denom = blur_weight[idx];
+        let mut sampled = if denom > 0.0001 {
+            [
+                (blur_r[idx] / denom).clamp(0.0, 1.0),
+                (blur_g[idx] / denom).clamp(0.0, 1.0),
+                (blur_b[idx] / denom).clamp(0.0, 1.0),
+            ]
+        } else {
+            [
+                src[o] as f32 / 255.0,
+                src[o + 1] as f32 / 255.0,
+                src[o + 2] as f32 / 255.0,
+            ]
+        };
+        sampled = adjust_saturation(sampled, saturation_scale);
+        let darken = 1.0 - darkness;
+        for c in 0..3 {
+            let target = sampled[c] * darken;
+            out[o + c] = to_u8(lerp_f32(src[o + c] as f32 / 255.0, target, amount));
+        }
+    }
+    out
+}
+
 fn normalized_pixel_coord(index: usize, size: usize) -> f32 {
     if size <= 1 {
         0.5
@@ -9387,6 +9487,39 @@ mod tests {
     }
 
     #[test]
+    fn color_trace_recolors_dark_line_from_neighbor_color() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                240, 80, 40, 255, 240, 80, 40, 255, 0, 0, 0, 255, 240, 80, 40, 255, 240, 80, 40,
+                255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "color trace",
+            LocalMask::Full,
+            LocalEffect::ColorTrace(ColorTraceParams {
+                strength: 1.0,
+                line_threshold: 0.20,
+                softness: 0.05,
+                sample_radius_px: 2.0,
+                darkness: 0.50,
+                saturation: 0.0,
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        let line = 2 * 4;
+        assert!(out.pixels[line] > out.pixels[line + 1]);
+        assert!(out.pixels[line] > 32);
+        assert_eq!(&out.pixels[0..4], &src.pixels[0..4]);
+        assert_eq!(out.pixels[line + 3], 255);
+    }
+
+    #[test]
     fn raster_vector_rect_adds_editable_shape_alpha() {
         let src = solid(5, 5, [0, 0, 0, 255]);
         let mut mask = RasterVectorMask::empty(5, 5);
@@ -10784,6 +10917,7 @@ mod tests {
             LocalEffect::GradientMap(GradientMapParams::default()),
             LocalEffect::ColorFill(ColorFillParams::default()),
             LocalEffect::OutlineStroke(OutlineStrokeParams::default()),
+            LocalEffect::ColorTrace(ColorTraceParams::default()),
             LocalEffect::ColorOverlay(ColorOverlayParams::default()),
             LocalEffect::NeonGlow(NeonGlowParams::default()),
             LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),

@@ -19,9 +19,9 @@ use local_adjust_core::{
     BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams, CloudFogMode,
     CloudFogParams, ColorBalanceParams, ColorBalanceRange, ColorFillParams, ColorGradeWheel,
     ColorHalftoneParams, ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams,
-    ColorOverlayShape, ColorRangeMask, CubeLutParams, CutoutParams, DehazeParams, DespeckleParams,
-    DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams,
-    EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
+    ColorOverlayShape, ColorRangeMask, ColorTraceParams, CubeLutParams, CutoutParams, DehazeParams,
+    DespeckleParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
+    EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
     GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalftoneParams,
     HighPassParams, HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture,
     LensBlurParams, LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams,
@@ -1027,6 +1027,7 @@ enum EffectKind {
     GradientMap,
     ColorFill,
     OutlineStroke,
+    ColorTrace,
     ColorOverlay,
     NeonGlow,
     DiffuseGlow,
@@ -1136,6 +1137,7 @@ impl EffectKind {
             LocalEffect::GradientMap(_) => Self::GradientMap,
             LocalEffect::ColorFill(_) => Self::ColorFill,
             LocalEffect::OutlineStroke(_) => Self::OutlineStroke,
+            LocalEffect::ColorTrace(_) => Self::ColorTrace,
             LocalEffect::ColorOverlay(_) => Self::ColorOverlay,
             LocalEffect::NeonGlow(_) => Self::NeonGlow,
             LocalEffect::DiffuseGlow(_) => Self::DiffuseGlow,
@@ -1212,6 +1214,7 @@ impl EffectKind {
             Self::GradientMap => "グラデーションマップ",
             Self::ColorFill => "塗りつぶし",
             Self::OutlineStroke => "縁取り",
+            Self::ColorTrace => "色トレス",
             Self::ColorOverlay => "塗り/グラデーション",
             Self::NeonGlow => "ネオングロー",
             Self::DiffuseGlow => "拡散光彩",
@@ -1336,6 +1339,7 @@ impl EffectKind {
             Self::OutlineStroke => {
                 "マスク境界から外側・内側・中央の色枠を作り、被写体のステッカー風分離に使えます。"
             }
+            Self::ColorTrace => "暗い線画を検出し、周辺の下地色を少し暗くした色へなじませます。",
             Self::ColorOverlay => {
                 "単色やグラデーションの色面を、乗算・スクリーン・ソフトライトなどで重ねます。"
             }
@@ -1484,6 +1488,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Wind,
             EffectKind::SpeedLines,
             EffectKind::LineExtract,
+            EffectKind::ColorTrace,
             EffectKind::ArtisticMedia,
             EffectKind::BrushStroke,
             EffectKind::Cutout,
@@ -8386,6 +8391,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
             outline_stroke_placement_label(params.placement),
             params.width_px
         ),
+        LocalEffect::ColorTrace(params) => format!("色トレス {:.0}%", params.strength * 100.0),
         LocalEffect::ColorOverlay(params) => format!(
             "塗り {} {:.0}%",
             color_overlay_blend_mode_label(params.blend_mode),
@@ -11286,6 +11292,85 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から線画抽出結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::ColorTrace(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "柔らかく") {
+                    *params = ColorTraceParams {
+                        strength: 0.65,
+                        line_threshold: 0.34,
+                        softness: 0.18,
+                        sample_radius_px: 7.0,
+                        darkness: 0.50,
+                        saturation: 0.10,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "濃いめ") {
+                    *params = ColorTraceParams {
+                        strength: 0.85,
+                        line_threshold: 0.40,
+                        softness: 0.10,
+                        sample_radius_px: 5.0,
+                        darkness: 0.68,
+                        saturation: 0.18,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡色線") {
+                    *params = ColorTraceParams {
+                        strength: 0.75,
+                        line_threshold: 0.32,
+                        softness: 0.16,
+                        sample_radius_px: 10.0,
+                        darkness: 0.35,
+                        saturation: 0.24,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "暗い線画を拾い、線を除外してぼかした周辺色を暗めにして線色へ混ぜます。黒線を下地になじませる仕上げ向けです。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip(
+                "元の線色から、周辺色を使った色トレス結果へどれだけ近づけるかです。",
+            );
+            let threshold =
+                ui.add(egui::Slider::new(&mut params.line_threshold, 0.02..=0.95).text("線の暗さ"));
+            changed |= threshold.changed();
+            threshold.lab_hover_tip(
+                "線として拾う暗さの上限です。上げると濃い中間色も線として扱います。",
+            );
+            let softness =
+                ui.add(egui::Slider::new(&mut params.softness, 0.001..=0.6).text("判定ぼかし"));
+            changed |= softness.changed();
+            softness.lab_hover_tip("線検出の境界をどれだけなだらかにするかです。");
+            let sample_radius = ui.add(
+                egui::Slider::new(&mut params.sample_radius_px, 1.0..=64.0)
+                    .text("色サンプル半径")
+                    .suffix("px"),
+            );
+            changed |= sample_radius.changed();
+            sample_radius
+                .lab_hover_tip("線の周囲から下地色を拾う範囲です。大きいほど広い色になじみます。");
+            let darkness =
+                ui.add(egui::Slider::new(&mut params.darkness, 0.0..=1.0).text("線の濃さ"));
+            changed |= darkness.changed();
+            darkness.lab_hover_tip(
+                "周辺色をどれだけ暗くして線色に使うかです。高いほど暗い線になります。",
+            );
+            let saturation =
+                ui.add(egui::Slider::new(&mut params.saturation, -1.0..=2.0).text("色の鮮やかさ"));
+            changed |= saturation.changed();
+            saturation
+                .lab_hover_tip("色トレス後の線色の彩度です。負で控えめ、正で鮮やかになります。");
         }
         LocalEffect::ArtisticMedia(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -15960,6 +16045,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         }
         EffectKind::LensCorrection => LocalEffect::LensCorrection(LensCorrectionParams::default()),
         EffectKind::LineExtract => LocalEffect::LineExtract(LineExtractParams::default()),
+        EffectKind::ColorTrace => LocalEffect::ColorTrace(ColorTraceParams::default()),
         EffectKind::ArtisticMedia => LocalEffect::ArtisticMedia(ArtisticMediaParams::default()),
         EffectKind::BrushStroke => LocalEffect::BrushStroke(BrushStrokeParams::default()),
         EffectKind::Cutout => LocalEffect::Cutout(CutoutParams::default()),
@@ -18286,6 +18372,7 @@ mod tests {
             EffectKind::GlassDisplacement,
             EffectKind::LensCorrection,
             EffectKind::LineExtract,
+            EffectKind::ColorTrace,
             EffectKind::ArtisticMedia,
             EffectKind::BrushStroke,
             EffectKind::Cutout,
