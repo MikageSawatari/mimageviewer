@@ -612,6 +612,7 @@ pub enum LocalEffect {
     ColorHalftone(ColorHalftoneParams),
     CmykPlateShift(CmykPlateShiftParams),
     Lithograph(LithographParams),
+    Engraving(EngravingParams),
     NewspaperPrint(NewspaperPrintParams),
     Textureizer(TextureizerParams),
     StarGlow(StarGlowParams),
@@ -709,6 +710,7 @@ impl LocalEffect {
             Self::ColorHalftone(_) => "カラーハーフトーン",
             Self::CmykPlateShift(_) => "CMYK版ズレ",
             Self::Lithograph(_) => "リソグラフ",
+            Self::Engraving(_) => "銅版画",
             Self::NewspaperPrint(_) => "新聞印刷",
             Self::Textureizer(_) => "テクスチャライザ",
             Self::StarGlow(_) => "クロス光",
@@ -3288,6 +3290,41 @@ impl Default for LithographParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EngravingParams {
+    pub ink_rgb: [u8; 3],
+    pub paper_rgb: [u8; 3],
+    pub line_spacing_px: f32,
+    pub line_width: f32,
+    pub angle_degrees: f32,
+    pub crosshatch: f32,
+    pub contour_strength: f32,
+    pub tone_levels: f32,
+    pub ink_density: f32,
+    pub paper_texture: f32,
+    pub strength: f32,
+    pub seed: u32,
+}
+
+impl Default for EngravingParams {
+    fn default() -> Self {
+        Self {
+            ink_rgb: [42, 35, 28],
+            paper_rgb: [247, 238, 216],
+            line_spacing_px: 7.0,
+            line_width: 0.60,
+            angle_degrees: -18.0,
+            crosshatch: 0.35,
+            contour_strength: 0.30,
+            tone_levels: 7.0,
+            ink_density: 0.90,
+            paper_texture: 0.28,
+            strength: 0.0,
+            seed: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct NewspaperPrintParams {
     pub cell_px: f32,
     pub dot_gain: f32,
@@ -3929,6 +3966,9 @@ where
             }
             LocalEffect::Lithograph(params) => {
                 apply_lithograph(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Engraving(params) => {
+                apply_engraving(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::NewspaperPrint(params) => {
                 apply_newspaper_print(&image.pixels, image.width, image.height, *params)
@@ -11608,6 +11648,192 @@ fn lithograph_overprint(base: [f32; 3], ink: [f32; 3], amount: f32) -> [f32; 3] 
     ]
 }
 
+fn apply_engraving(src: &[u8], width: usize, height: usize, params: EngravingParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let ink = rgb_u8_to_unit(params.ink_rgb);
+    let paper_base = rgb_u8_to_unit(params.paper_rgb);
+    let spacing = params.line_spacing_px.clamp(2.0, 48.0);
+    let line_width = params.line_width.clamp(0.05, 1.0);
+    let angle = params.angle_degrees.to_radians();
+    let crosshatch = params.crosshatch.clamp(0.0, 1.0);
+    let contour_strength = params.contour_strength.clamp(0.0, 1.0);
+    let tone_levels = params.tone_levels.clamp(2.0, 16.0).round();
+    let ink_density = params.ink_density.clamp(0.0, 1.8);
+    let paper_texture = params.paper_texture.clamp(0.0, 1.0);
+    let mut out = src.to_vec();
+
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let luma = luma01(base[0], base[1], base[2]);
+            let tone = engraving_quantized_tone(1.0 - luma, tone_levels);
+            let xf = x as f32;
+            let yf = y as f32;
+            let main_line = engraving_line_amount(
+                xf,
+                yf,
+                spacing,
+                line_width,
+                angle,
+                tone,
+                params.seed ^ 0xE9A7_1351,
+            );
+            let deep_shadow = smoothstep(0.35, 0.86, tone) * crosshatch;
+            let cross_line = engraving_line_amount(
+                xf,
+                yf,
+                spacing * 0.88,
+                line_width * 0.86,
+                angle + 1.570_796_4,
+                tone,
+                params.seed ^ 0xB047_C0DE,
+            ) * deep_shadow;
+            let contour = engraving_contour_amount(
+                src,
+                width,
+                height,
+                x,
+                y,
+                luma,
+                tone_levels,
+                contour_strength,
+            );
+            let mut ink_amount = 1.0 - (1.0 - main_line) * (1.0 - cross_line) * (1.0 - contour);
+            let fiber_noise =
+                glass_value_noise(xf / 2.2 + 9.0, yf / 2.2 - 13.0, params.seed ^ 0xA11C_E771);
+            ink_amount = (ink_amount * (1.0 + fiber_noise * paper_texture * 0.16) * ink_density)
+                .clamp(0.0, 1.0);
+
+            let paper_noise = textureizer_value(
+                TextureizerMode::Paper,
+                xf,
+                yf,
+                10.0,
+                1.1,
+                params.seed ^ 0x3D17_5EED,
+            );
+            let paper = [
+                (paper_base[0] + paper_noise * paper_texture * 0.060).clamp(0.0, 1.0),
+                (paper_base[1] + paper_noise * paper_texture * 0.052).clamp(0.0, 1.0),
+                (paper_base[2] + paper_noise * paper_texture * 0.040).clamp(0.0, 1.0),
+            ];
+            let target = engraving_overprint(paper, ink, ink_amount);
+
+            for c in 0..3 {
+                out[i + c] = to_u8(lerp_f32(base[c], target[c], strength));
+            }
+        }
+    }
+
+    out
+}
+
+fn engraving_quantized_tone(tone: f32, levels: f32) -> f32 {
+    let tone = tone.clamp(0.0, 1.0);
+    let levels = levels.max(2.0);
+    let stepped = (tone * levels).round() / levels;
+    lerp_f32(tone, stepped, 0.55).clamp(0.0, 1.0)
+}
+
+fn engraving_line_amount(
+    x: f32,
+    y: f32,
+    spacing: f32,
+    line_width: f32,
+    angle: f32,
+    tone: f32,
+    seed: u32,
+) -> f32 {
+    if tone <= f32::EPSILON {
+        return 0.0;
+    }
+    let spacing = spacing.max(2.0);
+    let wobble = glass_value_noise(x / 18.0, y / 18.0, seed) * spacing * 0.05;
+    let u = x * angle.cos() + y * angle.sin() + wobble;
+    let phase = (u / spacing).rem_euclid(1.0);
+    let dist = phase.min(1.0 - phase) * 2.0;
+    let width = lerp_f32(0.05, line_width.clamp(0.05, 1.0), tone).clamp(0.02, 0.98);
+    let feather = 0.06 + (1.0 - tone) * 0.08;
+    (1.0 - smoothstep(width, (width + feather).min(1.0), dist)) * tone
+}
+
+fn engraving_contour_amount(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    luma: f32,
+    tone_levels: f32,
+    strength: f32,
+) -> f32 {
+    if strength <= f32::EPSILON {
+        return 0.0;
+    }
+    let xi = x as isize;
+    let yi = y as isize;
+    let left = engraving_luma_at(src, width, height, xi - 1, yi, luma);
+    let right = engraving_luma_at(src, width, height, xi + 1, yi, luma);
+    let up = engraving_luma_at(src, width, height, xi, yi - 1, luma);
+    let down = engraving_luma_at(src, width, height, xi, yi + 1, luma);
+    let gradient = ((right - left).abs() + (down - up).abs()).clamp(0.0, 1.0);
+    let band = (luma * tone_levels.max(2.0)).fract();
+    let distance = band.min(1.0 - band);
+    let isoline = 1.0 - smoothstep(0.015, 0.085, distance);
+    let edge_boost = smoothstep(0.03, 0.24, gradient);
+    let shadow_bias = 0.35 + (1.0 - luma).clamp(0.0, 1.0) * 0.65;
+    (isoline * (0.20 + edge_boost * 0.80) * shadow_bias * strength).clamp(0.0, 1.0)
+}
+
+fn engraving_luma_at(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: isize,
+    y: isize,
+    fallback: f32,
+) -> f32 {
+    if x < 0 || y < 0 {
+        return fallback;
+    }
+    let x = x as usize;
+    let y = y as usize;
+    if x >= width || y >= height {
+        return fallback;
+    }
+    let i = (y * width + x) * 4;
+    if src[i + 3] == 0 {
+        return fallback;
+    }
+    luma01(
+        src[i] as f32 / 255.0,
+        src[i + 1] as f32 / 255.0,
+        src[i + 2] as f32 / 255.0,
+    )
+}
+
+fn engraving_overprint(base: [f32; 3], ink: [f32; 3], amount: f32) -> [f32; 3] {
+    let amount = amount.clamp(0.0, 1.0);
+    [
+        lerp_f32(base[0], base[0] * ink[0], amount * 0.88),
+        lerp_f32(base[1], base[1] * ink[1], amount * 0.88),
+        lerp_f32(base[2], base[2] * ink[2], amount * 0.88),
+    ]
+}
+
 fn apply_newspaper_print(
     src: &[u8],
     width: usize,
@@ -14437,6 +14663,7 @@ mod tests {
             LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
             LocalEffect::CmykPlateShift(CmykPlateShiftParams::default()),
             LocalEffect::Lithograph(LithographParams::default()),
+            LocalEffect::Engraving(EngravingParams::default()),
             LocalEffect::NewspaperPrint(NewspaperPrintParams::default()),
             LocalEffect::Textureizer(TextureizerParams::default()),
             LocalEffect::StarGlow(StarGlowParams::default()),
@@ -15260,6 +15487,23 @@ mod tests {
                     paper_texture: 1.0,
                     strength: 1.0,
                     seed: 26,
+                }),
+            ),
+            full(
+                "engraving dense crosshatch",
+                LocalEffect::Engraving(EngravingParams {
+                    ink_rgb: [20, 15, 10],
+                    paper_rgb: [250, 238, 210],
+                    line_spacing_px: 2.0,
+                    line_width: 1.0,
+                    angle_degrees: -180.0,
+                    crosshatch: 1.0,
+                    contour_strength: 1.0,
+                    tone_levels: 16.0,
+                    ink_density: 1.8,
+                    paper_texture: 1.0,
+                    strength: 1.0,
+                    seed: 27,
                 }),
             ),
             full(
@@ -17928,6 +18172,85 @@ LUT_3D_SIZE 2
             LocalEffect::Lithograph(LithographParams {
                 strength: 1.0,
                 ..LithographParams::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn engraving_draws_hatch_lines_and_preserves_alpha() {
+        let src = solid(4, 2, [150, 150, 150, 210]);
+        let layer = LocalAdjustmentLayer::new(
+            "engraving",
+            LocalMask::Full,
+            LocalEffect::Engraving(EngravingParams {
+                ink_rgb: [30, 24, 18],
+                paper_rgb: [246, 238, 216],
+                line_spacing_px: 2.0,
+                line_width: 0.82,
+                angle_degrees: 0.0,
+                crosshatch: 0.0,
+                contour_strength: 0.0,
+                tone_levels: 6.0,
+                ink_density: 1.0,
+                paper_texture: 0.0,
+                strength: 1.0,
+                seed: 4,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_ne!(out.pixels, src.pixels);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 210));
+        assert!(out.pixels[0] < out.pixels[4]);
+        assert!(out.pixels[0] < 180);
+        assert!(out.pixels[4] > 220);
+    }
+
+    #[test]
+    fn engraving_crosshatch_adds_secondary_lines() {
+        let src = solid(3, 3, [50, 50, 50, 255]);
+        let base_params = EngravingParams {
+            ink_rgb: [30, 24, 18],
+            paper_rgb: [246, 238, 216],
+            line_spacing_px: 2.0,
+            line_width: 0.55,
+            angle_degrees: 0.0,
+            crosshatch: 0.0,
+            contour_strength: 0.0,
+            tone_levels: 6.0,
+            ink_density: 1.0,
+            paper_texture: 0.0,
+            strength: 1.0,
+            seed: 5,
+        };
+        let no_cross = LocalAdjustmentLayer::new(
+            "engraving",
+            LocalMask::Full,
+            LocalEffect::Engraving(base_params),
+        );
+        let with_cross = LocalAdjustmentLayer::new(
+            "engraving",
+            LocalMask::Full,
+            LocalEffect::Engraving(EngravingParams {
+                crosshatch: 1.0,
+                ..base_params
+            }),
+        );
+        let without = apply_layers(src.as_ref(), &[no_cross]).unwrap();
+        let with = apply_layers(src.as_ref(), &[with_cross]).unwrap();
+        assert!(with.pixels[4] < without.pixels[4]);
+    }
+
+    #[test]
+    fn engraving_keeps_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(1, 1, vec![12, 34, 56, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "engraving",
+            LocalMask::Full,
+            LocalEffect::Engraving(EngravingParams {
+                strength: 1.0,
+                ..EngravingParams::default()
             }),
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();

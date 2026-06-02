@@ -22,29 +22,29 @@ use local_adjust_core::{
     ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask,
     ColorTraceParams, ContactShadowParams, CubeLutParams, CutoutParams, DefringeParams,
     DehazeParams, DespeckleParams, DiffuseGlowParams, DuotoneParams, DuotonePreset,
-    EdgeSmoothParams, EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
-    GlassDisplacementParams, GlowingEdgesParams, GodRaysParams, GradientMapParams,
-    GradientMapPreset, HalationParams, HalftoneParams, HeatHazeParams, HighPassParams,
-    HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
-    LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams, LineKind,
-    LinearGradientMask, LithographParams, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
-    LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
-    MosaicTileMode, MotionBlurParams, NeonGlowParams, NewspaperPrintParams, NoiseDistribution,
-    NoiseParams, OilPaintParams, OldFilmParams, OrtonParams, OutlineStrokeParams,
-    OutlineStrokePlacement, PartColorParams, ParticleOverlayMode, ParticleOverlayParams,
-    PinchSpherizeParams, PixelSortDirection, PixelSortOrder, PixelSortParams, PixelStylizeMode,
-    PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
-    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
-    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams,
-    ScanlineGlitchParams, ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp,
-    SharpenParams, SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode,
-    SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement,
-    TextureParams, TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams,
-    VhsParams, VignetteParams, WaterCausticsParams, WaveDistortionMode, WaveDistortionParams,
-    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
-    compute_mosaic_tile_size, default_mask_application_for_effect, evaluate_layer_mask,
-    parse_cube_lut,
+    EdgeSmoothParams, EmbossParams, EngravingParams, EqualizeParams, FilmGrainParams,
+    GlassDisplacementMode, GlassDisplacementParams, GlowingEdgesParams, GodRaysParams,
+    GradientMapParams, GradientMapPreset, HalationParams, HalftoneParams, HeatHazeParams,
+    HighPassParams, HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture,
+    LensBlurParams, LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams,
+    LineKind, LinearGradientMask, LithographParams, LocalAdjustmentLayer, LocalEffect, LocalMask,
+    LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary,
+    MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams, NewspaperPrintParams,
+    NoiseDistribution, NoiseParams, OilPaintParams, OldFilmParams, OrtonParams,
+    OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, ParticleOverlayMode,
+    ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection, PixelSortOrder,
+    PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
+    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
+    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
+    RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode, ScreenToneParams,
+    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
+    SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask,
+    SubjectMaskRefinement, TextureParams, TextureizerMode, TextureizerParams,
+    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
+    ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams, WaterCausticsParams,
+    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1088,6 +1088,7 @@ enum EffectKind {
     ColorHalftone,
     CmykPlateShift,
     Lithograph,
+    Engraving,
     NewspaperPrint,
     Textureizer,
     StarGlow,
@@ -1119,6 +1120,8 @@ enum RgbPickTarget {
     LithographInkA,
     LithographInkB,
     LithographPaper,
+    EngravingInk,
+    EngravingPaper,
     PartColorTarget,
     HalationTint,
     ToonShadeShadowTint,
@@ -1149,6 +1152,8 @@ impl RgbPickTarget {
             Self::LithographInkA => "リソグラフのインク1",
             Self::LithographInkB => "リソグラフのインク2",
             Self::LithographPaper => "リソグラフの紙色",
+            Self::EngravingInk => "銅版画のインク",
+            Self::EngravingPaper => "銅版画の紙色",
             Self::PartColorTarget => "パートカラーの対象色",
             Self::HalationTint => "ハレーションの暖色",
             Self::ToonShadeShadowTint => "トゥーン影色",
@@ -1246,6 +1251,7 @@ impl EffectKind {
             LocalEffect::ColorHalftone(_) => Self::ColorHalftone,
             LocalEffect::CmykPlateShift(_) => Self::CmykPlateShift,
             LocalEffect::Lithograph(_) => Self::Lithograph,
+            LocalEffect::Engraving(_) => Self::Engraving,
             LocalEffect::NewspaperPrint(_) => Self::NewspaperPrint,
             LocalEffect::Textureizer(_) => Self::Textureizer,
             LocalEffect::StarGlow(_) => Self::StarGlow,
@@ -1343,6 +1349,7 @@ impl EffectKind {
             Self::ColorHalftone => "カラーハーフトーン",
             Self::CmykPlateShift => "CMYK版ズレ",
             Self::Lithograph => "リソグラフ",
+            Self::Engraving => "銅版画",
             Self::NewspaperPrint => "新聞印刷",
             Self::Textureizer => "テクスチャライザ",
             Self::StarGlow => "クロス光",
@@ -1545,6 +1552,9 @@ impl EffectKind {
             Self::Lithograph => {
                 "2色のスポットインク、紙色、版ズレ、粒状感でリソグラフやシルクスクリーン風にします。"
             }
+            Self::Engraving => {
+                "紙色の上に平行線、クロスハッチ、等高線状の線を重ねて銅版画や古典挿絵風にします。"
+            }
             Self::NewspaperPrint => {
                 "粗い網点、黄ばんだ紙色、紙目、インクのにじみを重ねて新聞紙や古印刷物風にします。"
             }
@@ -1688,6 +1698,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ColorHalftone,
             EffectKind::CmykPlateShift,
             EffectKind::Lithograph,
+            EffectKind::Engraving,
             EffectKind::NewspaperPrint,
             EffectKind::Textureizer,
             EffectKind::ScanlineGlitch,
@@ -8920,6 +8931,13 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 params.strength * 100.0
             )
         }
+        LocalEffect::Engraving(params) => {
+            format!(
+                "銅版画 {:.1}px {:.0}%",
+                params.line_spacing_px,
+                params.strength * 100.0
+            )
+        }
         LocalEffect::NewspaperPrint(params) => {
             format!(
                 "新聞印刷 {:.0}px 紙 {:.0}%",
@@ -9282,6 +9300,14 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
             true
         }
         (LocalEffect::Lithograph(params), RgbPickTarget::LithographPaper) => {
+            params.paper_rgb = rgb;
+            true
+        }
+        (LocalEffect::Engraving(params), RgbPickTarget::EngravingInk) => {
+            params.ink_rgb = rgb;
+            true
+        }
+        (LocalEffect::Engraving(params), RgbPickTarget::EngravingPaper) => {
             params.paper_rgb = rgb;
             true
         }
@@ -16935,6 +16961,147 @@ fn draw_effect_params(
                 .changed();
             params.seed = seed.max(0) as u32;
         }
+        LocalEffect::Engraving(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "古典") {
+                    *params = EngravingParams {
+                        ink_rgb: [42, 35, 28],
+                        paper_rgb: [247, 238, 216],
+                        line_spacing_px: 7.0,
+                        line_width: 0.62,
+                        angle_degrees: -18.0,
+                        crosshatch: 0.35,
+                        contour_strength: 0.32,
+                        tone_levels: 7.0,
+                        ink_density: 0.92,
+                        paper_texture: 0.30,
+                        strength: 0.86,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "細密") {
+                    *params = EngravingParams {
+                        ink_rgb: [28, 25, 22],
+                        paper_rgb: [246, 240, 224],
+                        line_spacing_px: 4.0,
+                        line_width: 0.54,
+                        angle_degrees: -28.0,
+                        crosshatch: 0.25,
+                        contour_strength: 0.42,
+                        tone_levels: 10.0,
+                        ink_density: 0.98,
+                        paper_texture: 0.18,
+                        strength: 0.82,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "クロス") {
+                    *params = EngravingParams {
+                        ink_rgb: [35, 30, 26],
+                        paper_rgb: [248, 236, 210],
+                        line_spacing_px: 5.0,
+                        line_width: 0.70,
+                        angle_degrees: -35.0,
+                        crosshatch: 0.82,
+                        contour_strength: 0.26,
+                        tone_levels: 6.0,
+                        ink_density: 1.08,
+                        paper_texture: 0.34,
+                        strength: 0.90,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡色") {
+                    *params = EngravingParams {
+                        ink_rgb: [84, 70, 56],
+                        paper_rgb: [250, 242, 224],
+                        line_spacing_px: 8.0,
+                        line_width: 0.48,
+                        angle_degrees: -12.0,
+                        crosshatch: 0.15,
+                        contour_strength: 0.18,
+                        tone_levels: 5.0,
+                        ink_density: 0.62,
+                        paper_texture: 0.20,
+                        strength: 0.68,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "明暗を線の太さとクロスハッチに置き換え、紙色とインクで古典挿絵の線彫り感を作ります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let ink = draw_rgb_color_control(
+                ui,
+                "インク",
+                &mut params.ink_rgb,
+                RgbPickTarget::EngravingInk,
+                rgb_pick_active,
+            );
+            merge_rgb_color_response(ink, &mut changed, &mut start_rgb_pick, &mut cancel_rgb_pick);
+            let paper = draw_rgb_color_control(
+                ui,
+                "紙色",
+                &mut params.paper_rgb,
+                RgbPickTarget::EngravingPaper,
+                rgb_pick_active,
+            );
+            merge_rgb_color_response(
+                paper,
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.line_spacing_px, 2.0..=48.0)
+                        .text("線間隔")
+                        .suffix("px"),
+                )
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.line_width, 0.05..=1.0).text("線幅"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                        .text("線角度")
+                        .suffix("°"),
+                )
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.crosshatch, 0.0..=1.0).text("クロス線"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.contour_strength, 0.0..=1.0).text("等高線"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.tone_levels, 2.0..=16.0).text("階調数"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.ink_density, 0.0..=1.8).text("インク濃度"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.paper_texture, 0.0..=1.0).text("紙目"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
+                .changed();
+            let mut seed = params.seed as i32;
+            changed |= ui
+                .add(egui::Slider::new(&mut seed, 0..=9999).text("seed"))
+                .changed();
+            params.seed = seed.max(0) as u32;
+        }
         LocalEffect::NewspaperPrint(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -18731,6 +18898,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ColorHalftone => LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
         EffectKind::CmykPlateShift => LocalEffect::CmykPlateShift(CmykPlateShiftParams::default()),
         EffectKind::Lithograph => LocalEffect::Lithograph(LithographParams::default()),
+        EffectKind::Engraving => LocalEffect::Engraving(EngravingParams::default()),
         EffectKind::NewspaperPrint => LocalEffect::NewspaperPrint(NewspaperPrintParams::default()),
         EffectKind::Textureizer => LocalEffect::Textureizer(TextureizerParams::default()),
         EffectKind::StarGlow => LocalEffect::StarGlow(StarGlowParams::default()),
@@ -21119,6 +21287,7 @@ mod tests {
             EffectKind::ColorHalftone,
             EffectKind::CmykPlateShift,
             EffectKind::Lithograph,
+            EffectKind::Engraving,
             EffectKind::NewspaperPrint,
             EffectKind::Textureizer,
             EffectKind::ScanlineGlitch,
@@ -21532,6 +21701,23 @@ mod tests {
         assert_eq!(lithograph_params.ink_a_rgb, [235, 70, 110]);
         assert_eq!(lithograph_params.ink_b_rgb, [40, 170, 210]);
         assert_eq!(lithograph_params.paper_rgb, [250, 238, 210]);
+
+        let mut engraving = LocalEffect::Engraving(EngravingParams::default());
+        assert!(set_rgb_pick_target(
+            &mut engraving,
+            RgbPickTarget::EngravingInk,
+            [36, 28, 20],
+        ));
+        assert!(set_rgb_pick_target(
+            &mut engraving,
+            RgbPickTarget::EngravingPaper,
+            [248, 240, 220],
+        ));
+        let LocalEffect::Engraving(engraving_params) = engraving else {
+            panic!("expected engraving effect");
+        };
+        assert_eq!(engraving_params.ink_rgb, [36, 28, 20]);
+        assert_eq!(engraving_params.paper_rgb, [248, 240, 220]);
 
         let mut part_color = LocalEffect::PartColor(PartColorParams::default());
         assert!(set_rgb_pick_target(

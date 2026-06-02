@@ -61,14 +61,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、89種)
+### `LocalEffect` (部分補正レイヤー、90種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), PartColor(指定色だけ残す白黒化), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, HeatHaze, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, CloudFog, WaterCaustics, ParticleOverlay, Aurora, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Defringe, ScanlineGlitch, Vhs, PixelSort, OldFilm, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Lithograph, NewspaperPrint, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
+GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, CloudFog, WaterCaustics, ParticleOverlay, Aurora, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Defringe, ScanlineGlitch, Vhs, PixelSort, OldFilm, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Lithograph, Engraving, NewspaperPrint, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -225,7 +225,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 ### 9-F. 印刷 / 版画 / 質感系 ★トレンド
 - [x] **リソグラフ / シルクスクリーン風 (`Lithograph`)** ★★ **中** — 2色スポットインク、紙色、版ズレ、粒状感、紙目を調整できる印刷/版画風フィルタとして追加
 - [x] **CMYK 版ズレ / 印刷ズレ (`CmykPlateShift`)** ★ **中** — 4 版を微妙にずらす印刷物風。`カラーハーフトーン` と相性。版ズレ0・インク増減0では元色へ戻る減法再合成にした
-- [ ] **銅版画 / エングレービング (線彫り調)** **中** — 等高線状の線で陰影。古典挿絵
+- [x] **銅版画 / エングレービング (`Engraving`)** **中** — 平行線、クロスハッチ、等高線状の線、紙色、インク色で陰影を作る古典挿絵風フィルタとして追加
 - [x] **新聞印刷 / 古印刷物 (`NewspaperPrint`)** **易〜中** — 粗い網点、黄ばんだ紙色、紙目、インクにじみ、退色を調整できる新聞紙・古印刷物風フィルタとして追加
 
 ### 9-G. 補正系の特殊ツール
