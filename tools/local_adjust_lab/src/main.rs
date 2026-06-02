@@ -31,11 +31,11 @@ use local_adjust_core::{
     PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
     RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
     SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
-    SolarizeParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
-    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
-    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
-    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
-    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    SolarizeParams, SpeedLinesMode, SpeedLinesParams, StarGlowParams, SubjectMask,
+    SubjectMaskRefinement, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams,
+    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -980,6 +980,7 @@ enum EffectKind {
     Blur,
     MotionBlur,
     Wind,
+    SpeedLines,
     TiltShift,
     LensBlur,
     RadialBlur,
@@ -1037,6 +1038,7 @@ enum RgbPickTarget {
     ColorOverlayEnd,
     NeonGlowSource,
     NeonGlowTint,
+    SpeedLinesColor,
 }
 
 impl RgbPickTarget {
@@ -1049,6 +1051,7 @@ impl RgbPickTarget {
             Self::ColorOverlayEnd => "塗り/グラデーションの終了色",
             Self::NeonGlowSource => "ネオングローの発光源色",
             Self::NeonGlowTint => "ネオングローの着色",
+            Self::SpeedLinesColor => "集中線/スピード線の線色",
         }
     }
 }
@@ -1072,6 +1075,7 @@ impl EffectKind {
             LocalEffect::Blur(_) => Self::Blur,
             LocalEffect::MotionBlur(_) => Self::MotionBlur,
             LocalEffect::Wind(_) => Self::Wind,
+            LocalEffect::SpeedLines(_) => Self::SpeedLines,
             LocalEffect::TiltShift(_) => Self::TiltShift,
             LocalEffect::LensBlur(_) => Self::LensBlur,
             LocalEffect::RadialBlur(_) => Self::RadialBlur,
@@ -1139,6 +1143,7 @@ impl EffectKind {
             Self::Blur => "ぼかし",
             Self::MotionBlur => "移動ぼかし",
             Self::Wind => "風/スピード",
+            Self::SpeedLines => "集中線/スピード線",
             Self::TiltShift => "チルトシフト",
             Self::LensBlur => "レンズぼかし",
             Self::RadialBlur => "放射/回転ぼかし",
@@ -1213,6 +1218,9 @@ impl EffectKind {
             Self::MotionBlur => "指定した方向へ流れるようにぼかし、動きや速度感を加えます。",
             Self::Wind => {
                 "明部・暗部・輪郭を片方向へ引きずり、風やスピード感のある流線を作ります。"
+            }
+            Self::SpeedLines => {
+                "中心へ向かう集中線や、指定方向へ流れる平行スピード線を自動生成します。"
             }
             Self::TiltShift => {
                 "焦点帯を残して周囲をぼかし、浅い被写界深度やジオラマ風の見た目を作ります。"
@@ -1407,6 +1415,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
         title: "表現・絵画調",
         kinds: &[
             EffectKind::Wind,
+            EffectKind::SpeedLines,
             EffectKind::LineExtract,
             EffectKind::ArtisticMedia,
             EffectKind::BrushStroke,
@@ -7746,6 +7755,10 @@ fn effect_summary(effect: &LocalEffect) -> String {
             };
             format!("風 {direction} {:.0}px", params.distance_px)
         }
+        LocalEffect::SpeedLines(params) => match params.mode {
+            SpeedLinesMode::Radial => format!("集中線 {}本", params.line_count),
+            SpeedLinesMode::Parallel => format!("スピード線 {}本", params.line_count),
+        },
         LocalEffect::TiltShift(params) => {
             let mode = match params.mode {
                 TiltShiftMode::Linear => "線形",
@@ -8147,6 +8160,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
         }
         (LocalEffect::NeonGlow(params), RgbPickTarget::NeonGlowTint) => {
             params.tint_rgb = rgb;
+            true
+        }
+        (LocalEffect::SpeedLines(params), RgbPickTarget::SpeedLinesColor) => {
+            params.color_rgb = rgb;
             true
         }
         _ => false,
@@ -9518,6 +9535,164 @@ fn draw_effect_params(
             let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
             changed |= seed_response.changed();
             seed_response.lab_hover_tip("乱れのパターンを変えます。");
+            params.seed = seed.max(0) as u32;
+        }
+        LocalEffect::SpeedLines(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "白集中") {
+                    *params = SpeedLinesParams {
+                        mode: SpeedLinesMode::Radial,
+                        center: [0.5, 0.5],
+                        angle_degrees: 0.0,
+                        line_count: 96,
+                        line_width_px: 2.4,
+                        length: 0.92,
+                        inner_radius: 0.18,
+                        outer_radius: 1.0,
+                        softness: 0.25,
+                        strength: 0.82,
+                        color_rgb: [255, 255, 255],
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "黒集中") {
+                    *params = SpeedLinesParams {
+                        mode: SpeedLinesMode::Radial,
+                        center: [0.5, 0.5],
+                        angle_degrees: 0.0,
+                        line_count: 72,
+                        line_width_px: 2.0,
+                        length: 0.86,
+                        inner_radius: 0.22,
+                        outer_radius: 1.0,
+                        softness: 0.18,
+                        strength: 0.78,
+                        color_rgb: [0, 0, 0],
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "横流れ") {
+                    *params = SpeedLinesParams {
+                        mode: SpeedLinesMode::Parallel,
+                        center: [0.5, 0.5],
+                        angle_degrees: 0.0,
+                        line_count: 44,
+                        line_width_px: 2.2,
+                        length: 0.90,
+                        inner_radius: 0.08,
+                        outer_radius: 1.0,
+                        softness: 0.30,
+                        strength: 0.68,
+                        color_rgb: [255, 255, 255],
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "斜め流れ") {
+                    *params = SpeedLinesParams {
+                        mode: SpeedLinesMode::Parallel,
+                        center: [0.5, 0.5],
+                        angle_degrees: -28.0,
+                        line_count: 58,
+                        line_width_px: 1.8,
+                        length: 0.72,
+                        inner_radius: 0.04,
+                        outer_radius: 1.0,
+                        softness: 0.22,
+                        strength: 0.74,
+                        color_rgb: [255, 255, 255],
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "放射状の集中線、または指定方向へ流れる平行スピード線を自動生成します。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let radial = params.mode == SpeedLinesMode::Radial;
+                if ui.selectable_label(radial, "放射").clicked() && !radial {
+                    params.mode = SpeedLinesMode::Radial;
+                    changed = true;
+                }
+                let parallel = params.mode == SpeedLinesMode::Parallel;
+                if ui.selectable_label(parallel, "平行").clicked() && !parallel {
+                    params.mode = SpeedLinesMode::Parallel;
+                    changed = true;
+                }
+            });
+            if params.mode == SpeedLinesMode::Radial {
+                let center_x =
+                    ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
+                changed |= center_x.changed();
+                center_x.lab_hover_tip("集中点の横位置です。");
+                let center_y =
+                    ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心Y"));
+                changed |= center_y.changed();
+                center_y.lab_hover_tip("集中点の縦位置です。");
+            } else {
+                let angle = ui.add(
+                    egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                        .text("角度")
+                        .suffix("°"),
+                );
+                changed |= angle.changed();
+                angle.lab_hover_tip("スピード線が流れる方向です。0°で横方向、90°で縦方向です。");
+            }
+            let mut line_count = params.line_count as i32;
+            let line_count_response =
+                ui.add(egui::Slider::new(&mut line_count, 4..=240).text("線数"));
+            changed |= line_count_response.changed();
+            line_count_response.lab_hover_tip("生成する線の本数です。");
+            params.line_count = line_count.clamp(4, 240) as u32;
+            let line_width =
+                ui.add(egui::Slider::new(&mut params.line_width_px, 0.25..=24.0).text("線幅"));
+            changed |= line_width.changed();
+            line_width.lab_hover_tip("1本あたりの太さです。");
+            let length = ui.add(egui::Slider::new(&mut params.length, 0.05..=1.0).text("線長"));
+            changed |= length.changed();
+            length.lab_hover_tip("線をどれだけ長く伸ばすかです。");
+            let inner =
+                ui.add(egui::Slider::new(&mut params.inner_radius, 0.0..=0.98).text("中心抜き"));
+            changed |= inner.changed();
+            inner.lab_hover_tip("放射では中央の空白、平行では中央付近の弱まりを調整します。");
+            let outer =
+                ui.add(egui::Slider::new(&mut params.outer_radius, 0.02..=1.0).text("外側範囲"));
+            changed |= outer.changed();
+            outer.lab_hover_tip("線が出る外側の範囲です。");
+            if params.outer_radius < params.inner_radius {
+                params.outer_radius = (params.inner_radius + 0.02).min(1.0);
+            }
+            let softness =
+                ui.add(egui::Slider::new(&mut params.softness, 0.0..=1.0).text("柔らかさ"));
+            changed |= softness.changed();
+            softness.lab_hover_tip("線の縁をぼかします。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から線色へどれだけ近づけるかです。");
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "線色",
+                    &mut params.color_rgb,
+                    RgbPickTarget::SpeedLinesColor,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let mut seed = params.seed as i32;
+            let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
+            changed |= seed_response.changed();
+            seed_response.lab_hover_tip("線のばらつきパターンを変えます。");
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::TiltShift(params) => {
@@ -14505,6 +14680,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Blur => LocalEffect::Blur(BlurParams::default()),
         EffectKind::MotionBlur => LocalEffect::MotionBlur(MotionBlurParams::default()),
         EffectKind::Wind => LocalEffect::Wind(WindParams::default()),
+        EffectKind::SpeedLines => LocalEffect::SpeedLines(SpeedLinesParams::default()),
         EffectKind::TiltShift => LocalEffect::TiltShift(TiltShiftParams::default()),
         EffectKind::LensBlur => LocalEffect::LensBlur(LensBlurParams::default()),
         EffectKind::RadialBlur => LocalEffect::RadialBlur(RadialBlurParams::default()),
@@ -16745,6 +16921,7 @@ mod tests {
             EffectKind::Blur,
             EffectKind::MotionBlur,
             EffectKind::Wind,
+            EffectKind::SpeedLines,
             EffectKind::TiltShift,
             EffectKind::LensBlur,
             EffectKind::RadialBlur,
@@ -16967,6 +17144,17 @@ mod tests {
         assert_eq!(neon_params.source_rgb, [0, 210, 255]);
         assert!(neon_params.source_color_enabled);
         assert_eq!(neon_params.tint_rgb, [255, 80, 180]);
+
+        let mut speed_lines = LocalEffect::SpeedLines(SpeedLinesParams::default());
+        assert!(set_rgb_pick_target(
+            &mut speed_lines,
+            RgbPickTarget::SpeedLinesColor,
+            [12, 34, 56],
+        ));
+        let LocalEffect::SpeedLines(speed_lines_params) = speed_lines else {
+            panic!("expected speed lines effect");
+        };
+        assert_eq!(speed_lines_params.color_rgb, [12, 34, 56]);
 
         let mut tone = LocalEffect::Tone(ToneParams::default());
         assert!(!set_rgb_pick_target(

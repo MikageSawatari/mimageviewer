@@ -563,6 +563,7 @@ pub enum LocalEffect {
     Bloom(BloomParams),
     GodRays(GodRaysParams),
     LensFlare(LensFlareParams),
+    SpeedLines(SpeedLinesParams),
     Vignette(VignetteParams),
     FilmGrain(FilmGrainParams),
     ChromaticAberration(ChromaticAberrationParams),
@@ -630,6 +631,7 @@ impl LocalEffect {
             Self::Bloom(_) => "ブルーム",
             Self::GodRays(_) => "光芒",
             Self::LensFlare(_) => "レンズフレア",
+            Self::SpeedLines(_) => "集中線/スピード線",
             Self::Vignette(_) => "ビネット",
             Self::FilmGrain(_) => "フィルム粒子",
             Self::ChromaticAberration(_) => "色収差",
@@ -2333,6 +2335,49 @@ impl Default for LensFlareParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeedLinesMode {
+    #[default]
+    Radial,
+    Parallel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SpeedLinesParams {
+    pub mode: SpeedLinesMode,
+    pub center: [f32; 2],
+    pub angle_degrees: f32,
+    pub line_count: u32,
+    pub line_width_px: f32,
+    pub length: f32,
+    pub inner_radius: f32,
+    pub outer_radius: f32,
+    pub softness: f32,
+    pub strength: f32,
+    pub color_rgb: [u8; 3],
+    pub seed: u32,
+}
+
+impl Default for SpeedLinesParams {
+    fn default() -> Self {
+        Self {
+            mode: SpeedLinesMode::Radial,
+            center: [0.5, 0.5],
+            angle_degrees: 0.0,
+            line_count: 72,
+            line_width_px: 2.0,
+            length: 0.82,
+            inner_radius: 0.16,
+            outer_radius: 1.0,
+            softness: 0.25,
+            strength: 0.0,
+            color_rgb: [255, 255, 255],
+            seed: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VignetteParams {
     /// Positive values darken the edge; negative values brighten it.
@@ -2764,6 +2809,9 @@ where
         }
         LocalEffect::LensFlare(params) => {
             apply_lens_flare(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::SpeedLines(params) => {
+            apply_speed_lines(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::Vignette(params) => {
             apply_vignette(&image.pixels, image.width, image.height, *params)
@@ -7362,6 +7410,138 @@ fn radial_ring(distance: f32, radius: f32, width: f32) -> f32 {
     (1.0 - (distance - radius).abs() / width.max(0.001)).clamp(0.0, 1.0)
 }
 
+fn apply_speed_lines(src: &[u8], width: usize, height: usize, params: SpeedLinesParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let color = [
+        params.color_rgb[0] as f32 / 255.0,
+        params.color_rgb[1] as f32 / 255.0,
+        params.color_rgb[2] as f32 / 255.0,
+    ];
+    let line_count = params.line_count.clamp(4, 360);
+    let line_width = params.line_width_px.clamp(0.25, 32.0);
+    let softness_px = (line_width * params.softness.clamp(0.0, 1.0) * 2.5).max(0.35);
+    let mut inner = params.inner_radius.clamp(0.0, 1.0);
+    let mut outer = params.outer_radius.clamp(0.0, 1.0);
+    if outer < inner {
+        std::mem::swap(&mut inner, &mut outer);
+    }
+    outer = outer.max(inner + 0.001).min(1.0);
+    let length = params.length.clamp(0.05, 1.0);
+    let cx = params.center[0].clamp(0.0, 1.0) * width.saturating_sub(1) as f32;
+    let cy = params.center[1].clamp(0.0, 1.0) * height.saturating_sub(1) as f32;
+    let max_dist = farthest_corner_distance(width, height, cx, cy).max(1.0);
+    let mut out = src.to_vec();
+    match params.mode {
+        SpeedLinesMode::Radial => {
+            for y in 0..height {
+                for x in 0..width {
+                    let px = x as f32 + 0.5;
+                    let py = y as f32 + 0.5;
+                    let dx = px - cx;
+                    let dy = py - cy;
+                    let dist = dx.hypot(dy);
+                    if dist <= 0.25 {
+                        continue;
+                    }
+                    let dist_norm = (dist / max_dist).clamp(0.0, 1.0);
+                    let angle = dy.atan2(dx);
+                    let turns = (angle / std::f32::consts::TAU).rem_euclid(1.0);
+                    let line_pos = turns * line_count as f32;
+                    let nearest_line = line_pos.round();
+                    let line_index = (nearest_line as i32).rem_euclid(line_count as i32) as u32;
+                    let line_center_noise =
+                        signed_noise(line_index, 0, params.seed ^ 0x5FEE_D1A5) * 0.20;
+                    let centered = (line_pos - nearest_line - line_center_noise).abs();
+                    let angular_gap = centered / line_count as f32 * std::f32::consts::TAU;
+                    let distance_to_line = angular_gap * dist;
+                    let line =
+                        1.0 - smoothstep(line_width, line_width + softness_px, distance_to_line);
+                    if line <= f32::EPSILON {
+                        continue;
+                    }
+                    let length_noise =
+                        (0.72 + signed_noise(line_index, 1, params.seed) * 0.28).clamp(0.35, 1.0);
+                    let span = (outer - inner) * length * length_noise;
+                    let start = (outer - span).max(inner);
+                    let radial = smoothstep(start, (start + 0.04).min(outer), dist_norm)
+                        * (1.0 - smoothstep((outer - 0.05).max(start), outer, dist_norm));
+                    let intensity_noise = (0.76
+                        + signed_noise(line_index, 2, params.seed ^ 0xB1A5_E111) * 0.24)
+                        .clamp(0.35, 1.0);
+                    let amount = (line * radial * intensity_noise * strength).clamp(0.0, 1.0);
+                    if amount > f32::EPSILON {
+                        blend_speed_line_pixel(&mut out, src, (y * width + x) * 4, color, amount);
+                    }
+                }
+            }
+        }
+        SpeedLinesMode::Parallel => {
+            let angle = params.angle_degrees.to_radians();
+            let dir_x = angle.cos();
+            let dir_y = angle.sin();
+            let perp_x = -dir_y;
+            let perp_y = dir_x;
+            let diag = (width as f32).hypot(height as f32).max(1.0);
+            let period = (diag / line_count as f32).max(line_width + softness_px + 0.5);
+            let origin = diag * 0.5;
+            for y in 0..height {
+                for x in 0..width {
+                    let px = x as f32 + 0.5 - cx;
+                    let py = y as f32 + 0.5 - cy;
+                    let across = px * perp_x + py * perp_y + origin;
+                    let line_pos = across / period;
+                    let line_index = line_pos.round() as i32;
+                    let jitter = signed_noise(line_index as u32, 0, params.seed) * 0.18;
+                    let centered = (line_pos - line_index as f32 - jitter).abs();
+                    let distance_to_line = centered * period;
+                    let line =
+                        1.0 - smoothstep(line_width, line_width + softness_px, distance_to_line);
+                    if line <= f32::EPSILON {
+                        continue;
+                    }
+                    let along = px * dir_x + py * dir_y;
+                    let length_noise = (0.70
+                        + signed_noise(line_index as u32, 1, params.seed) * 0.30)
+                        .clamp(0.30, 1.0);
+                    let half = diag * 0.5 * length * length_noise;
+                    let offset = signed_noise(line_index as u32, 2, params.seed ^ 0x51E2_D71A)
+                        * diag
+                        * (1.0 - length)
+                        * 0.45;
+                    let longitudinal =
+                        1.0 - smoothstep(half * 0.78, half.max(1.0), (along - offset).abs());
+                    let edge = {
+                        let edge_x =
+                            (x as f32 / width.saturating_sub(1).max(1) as f32 - 0.5).abs() * 2.0;
+                        let edge_y =
+                            (y as f32 / height.saturating_sub(1).max(1) as f32 - 0.5).abs() * 2.0;
+                        smoothstep(inner, outer, edge_x.max(edge_y).clamp(0.0, 1.0))
+                    };
+                    let intensity_noise = (0.72
+                        + signed_noise(line_index as u32, 3, params.seed ^ 0xA71C_2027) * 0.28)
+                        .clamp(0.35, 1.0);
+                    let amount =
+                        (line * longitudinal * edge * intensity_noise * strength).clamp(0.0, 1.0);
+                    if amount > f32::EPSILON {
+                        blend_speed_line_pixel(&mut out, src, (y * width + x) * 4, color, amount);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn blend_speed_line_pixel(out: &mut [u8], src: &[u8], i: usize, color: [f32; 3], amount: f32) {
+    for c in 0..3 {
+        let base = src[i + c] as f32 / 255.0;
+        out[i + c] = to_u8(lerp_f32(base, color[c], amount));
+    }
+}
+
 fn apply_vignette(src: &[u8], width: usize, height: usize, params: VignetteParams) -> Vec<u8> {
     let strength = params.strength.clamp(-1.0, 1.0);
     if strength.abs() <= f32::EPSILON || width == 0 || height == 0 {
@@ -9485,6 +9665,7 @@ mod tests {
             LocalEffect::Bloom(BloomParams::default()),
             LocalEffect::GodRays(GodRaysParams::default()),
             LocalEffect::LensFlare(LensFlareParams::default()),
+            LocalEffect::SpeedLines(SpeedLinesParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
             LocalEffect::FilmGrain(FilmGrainParams::default()),
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
@@ -10574,6 +10755,72 @@ LUT_3D_SIZE 2
         );
         assert_eq!(out.pixels[3], 91);
         assert_eq!(out.pixels[35], 99);
+    }
+
+    #[test]
+    fn radial_speed_lines_keep_center_blank_and_draw_rays() {
+        let mut pixels = vec![20_u8; 7 * 7 * 4];
+        for chunk in pixels.chunks_exact_mut(4) {
+            chunk[3] = 255;
+        }
+        let src = RgbaImageBuf::new(7, 7, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "radial speed lines",
+            LocalMask::Full,
+            LocalEffect::SpeedLines(SpeedLinesParams {
+                mode: SpeedLinesMode::Radial,
+                center: [0.5, 0.5],
+                angle_degrees: 0.0,
+                line_count: 4,
+                line_width_px: 4.0,
+                length: 1.0,
+                inner_radius: 0.25,
+                outer_radius: 1.0,
+                softness: 0.0,
+                strength: 1.0,
+                color_rgb: [255, 255, 255],
+                seed: 1,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let center = (3 * 7 + 3) * 4;
+        let ray = (3 * 7 + 6) * 4;
+        assert_eq!(out.pixels[center], src.pixels[center]);
+        assert!(out.pixels[ray] > src.pixels[ray]);
+        assert_eq!(out.pixels[ray + 3], 255);
+    }
+
+    #[test]
+    fn parallel_speed_lines_can_darken_edge_lines() {
+        let mut pixels = vec![220_u8; 5 * 5 * 4];
+        for (idx, chunk) in pixels.chunks_exact_mut(4).enumerate() {
+            chunk[3] = 180 + idx as u8;
+        }
+        let src = RgbaImageBuf::new(5, 5, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "parallel speed lines",
+            LocalMask::Full,
+            LocalEffect::SpeedLines(SpeedLinesParams {
+                mode: SpeedLinesMode::Parallel,
+                center: [0.5, 0.5],
+                angle_degrees: 0.0,
+                line_count: 4,
+                line_width_px: 8.0,
+                length: 1.0,
+                inner_radius: 0.0,
+                outer_radius: 1.0,
+                softness: 0.0,
+                strength: 1.0,
+                color_rgb: [0, 0, 0],
+                seed: 1,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let edge = 0;
+        let center = (2 * 5 + 2) * 4;
+        assert!(out.pixels[edge] < src.pixels[edge]);
+        assert_eq!(out.pixels[center], src.pixels[center]);
+        assert_eq!(out.pixels[edge + 3], 180);
     }
 
     #[test]

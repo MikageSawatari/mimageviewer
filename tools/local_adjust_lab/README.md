@@ -107,6 +107,7 @@ the window.
   - Soft focus
   - Mosaic with long-edge-ratio / fixed-pixel tile sizing and the same three
     boundary modes as the conceal mosaic tool
+  - Speed lines / radial focus lines
   - Sharpen
   - HSL / hue shift
   - Look presets
@@ -123,7 +124,7 @@ the window.
 - Effect parameters start from near-identity values. Use the per-effect preset
   buttons for practical starting points, or Reset to return the current effect
   to its default values.
-- RGB color parameters in Color Fill, Color Overlay, and Neon Glow share a
+- RGB color parameters in Color Fill, Color Overlay, Neon Glow, and Speed Lines share a
   control with a color button, HEX readout, RGB sliders, and an image-click
   eyedropper.
 - Color Fill starts with a shape placeholder and full opacity. Choosing Solid,
