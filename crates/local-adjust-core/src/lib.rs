@@ -547,6 +547,7 @@ pub enum LocalEffect {
     LensBlur(LensBlurParams),
     RadialBlur(RadialBlurParams),
     WaveDistortion(WaveDistortionParams),
+    HeatHaze(HeatHazeParams),
     PinchSpherize(PinchSpherizeParams),
     Twirl(TwirlParams),
     PolarCoordinates(PolarCoordinatesParams),
@@ -632,6 +633,7 @@ impl LocalEffect {
             Self::LensBlur(_) => "レンズぼかし",
             Self::RadialBlur(_) => "放射ぼかし",
             Self::WaveDistortion(_) => "波形ゆがみ",
+            Self::HeatHaze(_) => "陽炎/熱揺らぎ",
             Self::PinchSpherize(_) => "つまむ/魚眼",
             Self::Twirl(_) => "渦巻き",
             Self::PolarCoordinates(_) => "極座標",
@@ -1260,6 +1262,31 @@ impl Default for WaveDistortionParams {
             wavelength_px: 64.0,
             phase_degrees: 0.0,
             center: [0.5, 0.5],
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HeatHazeParams {
+    pub amplitude_px: f32,
+    pub wavelength_px: f32,
+    pub rise_px: f32,
+    pub turbulence: f32,
+    pub blur_px: f32,
+    pub phase_degrees: f32,
+    pub strength: f32,
+}
+
+impl Default for HeatHazeParams {
+    fn default() -> Self {
+        Self {
+            amplitude_px: 0.0,
+            wavelength_px: 72.0,
+            rise_px: 0.0,
+            turbulence: 0.35,
+            blur_px: 0.0,
+            phase_degrees: 0.0,
             strength: 0.0,
         }
     }
@@ -3303,6 +3330,9 @@ where
             LocalEffect::WaveDistortion(params) => {
                 apply_wave_distortion(&image.pixels, image.width, image.height, *params)
             }
+            LocalEffect::HeatHaze(params) => {
+                apply_heat_haze(&image.pixels, image.width, image.height, *params)
+            }
             LocalEffect::PinchSpherize(params) => {
                 apply_pinch_spherize(&image.pixels, image.width, image.height, *params)
             }
@@ -5051,6 +5081,99 @@ fn zigzag_wave(t: f32) -> f32 {
     } else {
         3.0 - t * 4.0
     }
+}
+
+fn apply_heat_haze(src: &[u8], width: usize, height: usize, params: HeatHazeParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let amplitude = params.amplitude_px.clamp(-160.0, 160.0);
+    let rise = params.rise_px.clamp(-160.0, 160.0);
+    let blur = params.blur_px.clamp(0.0, 12.0);
+    if width == 0
+        || height == 0
+        || strength <= f32::EPSILON
+        || (amplitude.abs() <= f32::EPSILON && rise.abs() <= f32::EPSILON && blur <= f32::EPSILON)
+    {
+        return src.to_vec();
+    }
+
+    let wavelength = params.wavelength_px.clamp(4.0, 360.0);
+    let turbulence = params.turbulence.clamp(0.0, 1.0);
+    let phase = params.phase_degrees.to_radians();
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let xf = x as f32;
+            let yf = y as f32;
+            let wave = (yf / wavelength * std::f32::consts::TAU + phase).sin();
+            let cross = ((yf * 1.73 + xf * 0.41) / (wavelength * 0.58).max(4.0)
+                * std::f32::consts::TAU
+                + phase * 1.31)
+                .sin();
+            let shimmer = lerp_f32(
+                wave,
+                (wave * 0.58 + cross * 0.42).clamp(-1.0, 1.0),
+                turbulence,
+            );
+            let vertical_wobble = (cross * 0.5 + 0.5) * turbulence;
+            let sx = xf + amplitude * shimmer;
+            let sy = yf + rise * (0.55 + vertical_wobble * 0.45);
+            let i = (y * width + x) * 4;
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let sampled = sample_heat_haze_rgb(src, width, height, sx, sy, blur, base);
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], to_u8(sampled[c]), strength);
+            }
+        }
+    }
+    out
+}
+
+fn sample_heat_haze_rgb(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: f32,
+    y: f32,
+    blur: f32,
+    fallback: [f32; 3],
+) -> [f32; 3] {
+    if blur <= 0.05 {
+        let (rgb, alpha) = sample_rgb_bilinear_alpha_aware(src, width, height, x, y);
+        return if alpha > f32::EPSILON { rgb } else { fallback };
+    }
+
+    let taps = [
+        (0.0_f32, 0.0_f32, 0.44_f32),
+        (blur, 0.0, 0.14),
+        (-blur, 0.0, 0.14),
+        (0.0, blur, 0.14),
+        (0.0, -blur, 0.14),
+    ];
+    let mut sum = [0.0_f32; 3];
+    let mut weight_sum = 0.0_f32;
+    for (ox, oy, weight) in taps {
+        let (rgb, alpha) = sample_rgb_bilinear_alpha_aware(src, width, height, x + ox, y + oy);
+        let weighted_alpha = weight * alpha;
+        if weighted_alpha <= f32::EPSILON {
+            continue;
+        }
+        for c in 0..3 {
+            sum[c] += rgb[c] * weighted_alpha;
+        }
+        weight_sum += weighted_alpha;
+    }
+    if weight_sum <= f32::EPSILON {
+        return fallback;
+    }
+    [
+        sum[0] / weight_sum,
+        sum[1] / weight_sum,
+        sum[2] / weight_sum,
+    ]
 }
 
 fn apply_pinch_spherize(
@@ -10230,6 +10353,56 @@ fn sample_rgb_bilinear(src: &[u8], width: usize, height: usize, x: f32, y: f32) 
     out
 }
 
+fn sample_rgb_bilinear_alpha_aware(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: f32,
+    y: f32,
+) -> ([f32; 3], f32) {
+    if width == 0 || height == 0 {
+        return ([0.0; 3], 0.0);
+    }
+    let x = x.clamp(0.0, width.saturating_sub(1) as f32);
+    let y = y.clamp(0.0, height.saturating_sub(1) as f32);
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let tx = x - x0 as f32;
+    let ty = y - y0 as f32;
+    let samples = [
+        ((y0 * width + x0) * 4, (1.0 - tx) * (1.0 - ty)),
+        ((y0 * width + x1) * 4, tx * (1.0 - ty)),
+        ((y1 * width + x0) * 4, (1.0 - tx) * ty),
+        ((y1 * width + x1) * 4, tx * ty),
+    ];
+    let mut rgb_sum = [0.0_f32; 3];
+    let mut alpha_sum = 0.0_f32;
+    for (i, weight) in samples {
+        let alpha = src[i + 3] as f32 / 255.0;
+        let weighted_alpha = weight * alpha;
+        if weighted_alpha <= f32::EPSILON {
+            continue;
+        }
+        for c in 0..3 {
+            rgb_sum[c] += src[i + c] as f32 / 255.0 * weighted_alpha;
+        }
+        alpha_sum += weighted_alpha;
+    }
+    if alpha_sum <= f32::EPSILON {
+        return ([0.0; 3], 0.0);
+    }
+    (
+        [
+            rgb_sum[0] / alpha_sum,
+            rgb_sum[1] / alpha_sum,
+            rgb_sum[2] / alpha_sum,
+        ],
+        alpha_sum,
+    )
+}
+
 fn nearest_pixel_index(width: usize, height: usize, x: f32, y: f32) -> usize {
     let xx = x.round().clamp(0.0, width.saturating_sub(1) as f32) as usize;
     let yy = y.round().clamp(0.0, height.saturating_sub(1) as f32) as usize;
@@ -11147,6 +11320,56 @@ mod tests {
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn heat_haze_offsets_pixels_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                10, 10, 10, 91, 40, 40, 40, 92, 80, 80, 80, 93, 120, 120, 120, 94, 160, 160, 160,
+                95,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "heat haze",
+            LocalMask::Full,
+            LocalEffect::HeatHaze(HeatHazeParams {
+                amplitude_px: 1.0,
+                wavelength_px: 72.0,
+                rise_px: 0.0,
+                turbulence: 0.0,
+                blur_px: 0.0,
+                phase_degrees: 90.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels[0], src.pixels[4]);
+        assert_eq!(out.pixels[3], 91);
+        assert_eq!(out.pixels[19], 95);
+    }
+
+    #[test]
+    fn heat_haze_ignores_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(3, 1, vec![0, 0, 0, 255, 0, 0, 0, 255, 255, 0, 0, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "heat haze",
+            LocalMask::Full,
+            LocalEffect::HeatHaze(HeatHazeParams {
+                amplitude_px: 1.0,
+                wavelength_px: 72.0,
+                rise_px: 0.0,
+                turbulence: 0.0,
+                blur_px: 0.0,
+                phase_degrees: 90.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[4..8], &[0, 0, 0, 255]);
     }
 
     #[test]
@@ -12269,6 +12492,7 @@ mod tests {
             LocalEffect::LensBlur(LensBlurParams::default()),
             LocalEffect::RadialBlur(RadialBlurParams::default()),
             LocalEffect::WaveDistortion(WaveDistortionParams::default()),
+            LocalEffect::HeatHaze(HeatHazeParams::default()),
             LocalEffect::PinchSpherize(PinchSpherizeParams::default()),
             LocalEffect::Twirl(TwirlParams::default()),
             LocalEffect::PolarCoordinates(PolarCoordinatesParams::default()),
@@ -12478,6 +12702,18 @@ mod tests {
                     wavelength_px: 2.0,
                     phase_degrees: 180.0,
                     center: [0.5, 0.5],
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "heat haze max shimmer",
+                LocalEffect::HeatHaze(HeatHazeParams {
+                    amplitude_px: 160.0,
+                    wavelength_px: 4.0,
+                    rise_px: 160.0,
+                    turbulence: 1.0,
+                    blur_px: 12.0,
+                    phase_degrees: 180.0,
                     strength: 1.0,
                 }),
             ),

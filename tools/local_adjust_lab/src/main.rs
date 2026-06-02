@@ -24,23 +24,24 @@ use local_adjust_core::{
     DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams,
     EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
     GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams,
-    HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams, InvertParams,
-    LensBlurAperture, LensBlurParams, LensCorrectionParams, LensFlareParams, LineExtractMode,
-    LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
-    LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary,
-    MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams,
-    OilPaintParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement, PartColorParams,
-    PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
-    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
-    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
-    RgbaImageRef, RimLightParams, ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp,
-    SharpenParams, SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode,
-    SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement,
-    TextureParams, TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams,
-    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
-    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
+    HalftoneParams, HeatHazeParams, HighPassParams, HighlightsShadowsParams, HslParams,
+    InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LensFlareParams,
+    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer,
+    LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams,
+    MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams,
+    NoiseDistribution, NoiseParams, OilPaintParams, OrtonParams, OutlineStrokeParams,
+    OutlineStrokePlacement, PartColorParams, PinchSpherizeParams, PixelStylizeMode,
+    PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
+    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
+    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams, ScreenToneMode,
+    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
+    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
+    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
+    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VignetteParams, WaveDistortionMode,
+    WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -999,6 +1000,7 @@ enum EffectKind {
     LensBlur,
     RadialBlur,
     WaveDistortion,
+    HeatHaze,
     PinchSpherize,
     Twirl,
     PolarCoordinates,
@@ -1133,6 +1135,7 @@ impl EffectKind {
             LocalEffect::LensBlur(_) => Self::LensBlur,
             LocalEffect::RadialBlur(_) => Self::RadialBlur,
             LocalEffect::WaveDistortion(_) => Self::WaveDistortion,
+            LocalEffect::HeatHaze(_) => Self::HeatHaze,
             LocalEffect::PinchSpherize(_) => Self::PinchSpherize,
             LocalEffect::Twirl(_) => Self::Twirl,
             LocalEffect::PolarCoordinates(_) => Self::PolarCoordinates,
@@ -1218,6 +1221,7 @@ impl EffectKind {
             Self::LensBlur => "レンズぼかし",
             Self::RadialBlur => "放射/回転ぼかし",
             Self::WaveDistortion => "波形ゆがみ",
+            Self::HeatHaze => "陽炎/熱揺らぎ",
             Self::PinchSpherize => "つまむ/魚眼",
             Self::Twirl => "渦巻き",
             Self::PolarCoordinates => "極座標",
@@ -1320,6 +1324,9 @@ impl EffectKind {
             }
             Self::WaveDistortion => {
                 "波やさざ波のように画像を揺らし、水面・反射・熱気の表現に使います。"
+            }
+            Self::HeatHaze => {
+                "上昇する空気のゆらぎで画像を揺らし、炎・夏空・排熱の陽炎を作ります。"
             }
             Self::PinchSpherize => {
                 "中心を基準にふくらませたり、つまんだりして、魚眼レンズや誇張表現を作ります。"
@@ -1542,6 +1549,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
         title: "変形・歪み",
         kinds: &[
             EffectKind::WaveDistortion,
+            EffectKind::HeatHaze,
             EffectKind::PinchSpherize,
             EffectKind::Twirl,
             EffectKind::PolarCoordinates,
@@ -8327,6 +8335,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::WaveDistortion(params) => {
             format!("波形ゆがみ {:.0}px", params.amplitude_px)
         }
+        LocalEffect::HeatHaze(params) => format!(
+            "陽炎 {:.0}px {:.0}%",
+            params.amplitude_px,
+            params.strength * 100.0
+        ),
         LocalEffect::PinchSpherize(params) => {
             if params.amount >= 0.0 {
                 format!("魚眼 {:.0}%", params.amount * 100.0)
@@ -11020,6 +11033,106 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からゆがみ結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::HeatHaze(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "炎のゆらぎ") {
+                    *params = HeatHazeParams {
+                        amplitude_px: 16.0,
+                        wavelength_px: 42.0,
+                        rise_px: 10.0,
+                        turbulence: 0.82,
+                        blur_px: 1.2,
+                        phase_degrees: 20.0,
+                        strength: 0.92,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "夏空") {
+                    *params = HeatHazeParams {
+                        amplitude_px: 7.0,
+                        wavelength_px: 96.0,
+                        rise_px: 4.0,
+                        turbulence: 0.42,
+                        blur_px: 0.7,
+                        phase_degrees: 0.0,
+                        strength: 0.58,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "排熱") {
+                    *params = HeatHazeParams {
+                        amplitude_px: 22.0,
+                        wavelength_px: 58.0,
+                        rise_px: 18.0,
+                        turbulence: 1.0,
+                        blur_px: 1.8,
+                        phase_degrees: -35.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "水面反射") {
+                    *params = HeatHazeParams {
+                        amplitude_px: 10.0,
+                        wavelength_px: 34.0,
+                        rise_px: 0.0,
+                        turbulence: 0.25,
+                        blur_px: 0.5,
+                        phase_degrees: 90.0,
+                        strength: 0.74,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "上昇する空気のように横へ揺らし、必要に応じて下側の画素を少し引き上げます。マスクで炎や排熱の範囲を切ると使いやすい効果です。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let amplitude =
+                ui.add(egui::Slider::new(&mut params.amplitude_px, -80.0..=80.0).text("揺れ幅"));
+            changed |= amplitude.changed();
+            amplitude.lab_hover_tip(
+                "横方向へどれだけ大きく揺らすかです。符号で揺れの向きが反転します。",
+            );
+            let wavelength =
+                ui.add(egui::Slider::new(&mut params.wavelength_px, 4.0..=240.0).text("揺れ間隔"));
+            changed |= wavelength.changed();
+            wavelength.lab_hover_tip(
+                "揺れの間隔です。小さい値ほど細かく、大きい値ほどゆったり揺れます。",
+            );
+            let rise = ui.add(
+                egui::Slider::new(&mut params.rise_px, -80.0..=80.0)
+                    .text("上昇")
+                    .suffix("px"),
+            );
+            changed |= rise.changed();
+            rise.lab_hover_tip("正の値で下側の画素を上へ引き上げるように見せます。");
+            let turbulence =
+                ui.add(egui::Slider::new(&mut params.turbulence, 0.0..=1.0).text("乱れ"));
+            changed |= turbulence.changed();
+            turbulence.lab_hover_tip("揺れに斜め方向の細かな変化を混ぜます。");
+            let blur = ui.add(
+                egui::Slider::new(&mut params.blur_px, 0.0..=12.0)
+                    .text("にじみ")
+                    .suffix("px"),
+            );
+            changed |= blur.changed();
+            blur.lab_hover_tip("熱で輪郭が少しぼけるような柔らかさを加えます。");
+            let phase = ui.add(
+                egui::Slider::new(&mut params.phase_degrees, -180.0..=180.0)
+                    .text("位相")
+                    .suffix("°"),
+            );
+            changed |= phase.changed();
+            phase.lab_hover_tip("揺れの開始位置をずらします。静止画の位置合わせ用です。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から陽炎結果へどれだけ近づけるかです。");
         }
         LocalEffect::PinchSpherize(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -16958,6 +17071,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::LensBlur => LocalEffect::LensBlur(LensBlurParams::default()),
         EffectKind::RadialBlur => LocalEffect::RadialBlur(RadialBlurParams::default()),
         EffectKind::WaveDistortion => LocalEffect::WaveDistortion(WaveDistortionParams::default()),
+        EffectKind::HeatHaze => LocalEffect::HeatHaze(HeatHazeParams::default()),
         EffectKind::PinchSpherize => LocalEffect::PinchSpherize(PinchSpherizeParams::default()),
         EffectKind::Twirl => LocalEffect::Twirl(TwirlParams::default()),
         EffectKind::PolarCoordinates => {
@@ -19299,6 +19413,7 @@ mod tests {
             EffectKind::LensBlur,
             EffectKind::RadialBlur,
             EffectKind::WaveDistortion,
+            EffectKind::HeatHaze,
             EffectKind::PinchSpherize,
             EffectKind::Twirl,
             EffectKind::PolarCoordinates,

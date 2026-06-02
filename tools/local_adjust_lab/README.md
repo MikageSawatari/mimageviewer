@@ -107,6 +107,7 @@ the window.
       one. Clear Range keeps the current range type active for the next drag.
   - Lens blur
   - Radial blur
+  - Heat haze
   - Soft focus
   - Orton / soft glow
   - Mosaic with long-edge-ratio / fixed-pixel tile sizing and the same three

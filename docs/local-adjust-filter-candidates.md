@@ -61,13 +61,13 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、77種)
+### `LocalEffect` (部分補正レイヤー、78種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), PartColor(指定色だけ残す白黒化), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
-HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
+HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, HeatHaze, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
 GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, CloudFog, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Halftone, ScreenTone, ColorHalftone, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
 
 ### マスク種別 (併用可能・差別化の武器)
@@ -213,7 +213,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 - [ ] **集中線フラッシュ (白黒反転フラッシュ)** ★ **中** — 中心から放射する白/黒フラッシュ。`集中線` の演出強化版
 
 ### 9-E. 自然現象 / 大気エフェクト ★背景イラスト
-- [ ] **陽炎 / 熱揺らぎ (heat haze)** ★★ **中** — 局所の上昇する波打ち歪み。夏・炎・砂漠の空気
+- [x] **陽炎 / 熱揺らぎ (`HeatHaze`)** ★★ **中** — 局所の上昇する波打ち歪み。夏・炎・砂漠の空気。横揺れ、上昇、乱れ、にじみ、位相、強さを調整でき、透明ピクセルの隠しRGBを拾わない alpha-aware サンプリングにした
 - [ ] **水中コースティクス (光の網)** ★ **中** — 水面越しの揺らぐ光網。水中シーン
 - [ ] **雨 / 雪 / 花びら 粒子オーバーレイ** ★ **中** — 方向・密度付きの粒子。`雲/霧` の粒子版
 - [ ] **オーロラ / 光のカーテン** **中** — 縦の発光カーテン
@@ -239,7 +239,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 2. **トゥーンシェード量子化** — `ToonShade` として実装済み。フォト/3D をアニメ塗り風に (§D)
 3. **リムライト追加** — `RimLight` として実装済み。既存 Subject マスク資産が活きる (§E)
 4. **リソグラフ風** — 近年人気の質感、差別化になる (9-F)
-5. **陽炎 / 熱揺らぎ** — 背景イラストの空気感 (9-E)
+5. **陽炎 / 熱揺らぎ** — `HeatHaze` として実装済み。背景イラストの空気感 (9-E)
 6. **グリッチ / VHS** — サイバー/レトロ演出の鉄板 (9-A/9-B)
 7. **パートカラー** — 一発で映える、実装は易 (9-G)
 
