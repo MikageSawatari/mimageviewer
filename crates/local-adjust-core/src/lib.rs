@@ -414,6 +414,7 @@ pub enum LocalEffect {
     Blur(BlurParams),
     MotionBlur(MotionBlurParams),
     TiltShift(TiltShiftParams),
+    LensBlur(LensBlurParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -756,6 +757,38 @@ impl Default for TiltShiftParams {
             max_radius_px: 20.0,
             strength: 0.0,
             far_only: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LensBlurAperture {
+    #[default]
+    Circular,
+    Hexagon,
+    Octagon,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LensBlurParams {
+    pub radius_px: f32,
+    pub aperture: LensBlurAperture,
+    pub rotation_degrees: f32,
+    pub highlight_threshold: f32,
+    pub highlight_boost: f32,
+    pub strength: f32,
+}
+
+impl Default for LensBlurParams {
+    fn default() -> Self {
+        Self {
+            radius_px: 0.0,
+            aperture: LensBlurAperture::Circular,
+            rotation_degrees: 0.0,
+            highlight_threshold: 0.96,
+            highlight_boost: 0.0,
+            strength: 0.0,
         }
     }
 }
@@ -1379,6 +1412,9 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         }
         LocalEffect::TiltShift(params) => {
             apply_tilt_shift(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::LensBlur(params) => {
+            apply_lens_blur(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -2425,6 +2461,84 @@ fn normalized_coord(value: usize, size: usize) -> f32 {
     } else {
         value as f32 / (size - 1) as f32
     }
+}
+
+fn apply_lens_blur(src: &[u8], width: usize, height: usize, params: LensBlurParams) -> Vec<u8> {
+    let radius = params.radius_px.clamp(0.0, 96.0);
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || radius <= 0.5 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+
+    let offsets = lens_blur_offsets(radius, params.aperture, params.rotation_degrees);
+    if offsets.len() <= 1 {
+        return src.to_vec();
+    }
+
+    let threshold = params.highlight_threshold.clamp(0.0, 0.999);
+    let inv_highlight_range = 1.0 / (1.0 - threshold).max(0.001);
+    let highlight_boost = params.highlight_boost.clamp(0.0, 3.0);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = [0.0_f32; 3];
+            for (dx, dy) in &offsets {
+                let si = nearest_pixel_index(width, height, x as f32 + *dx, y as f32 + *dy);
+                let r = src[si] as f32 / 255.0;
+                let g = src[si + 1] as f32 / 255.0;
+                let b = src[si + 2] as f32 / 255.0;
+                let luma = luma01(r, g, b);
+                let highlight = ((luma - threshold) * inv_highlight_range).clamp(0.0, 1.0);
+                let boost = 1.0 + highlight_boost * highlight.powf(1.5);
+                sum[0] += r * boost;
+                sum[1] += g * boost;
+                sum[2] += b * boost;
+            }
+
+            let inv_count = 1.0 / offsets.len() as f32;
+            let oi = (y * width + x) * 4;
+            for c in 0..3 {
+                let blurred = to_u8(sum[c] * inv_count);
+                out[oi + c] = lerp_u8(src[oi + c], blurred, strength);
+            }
+        }
+    }
+    out
+}
+
+fn lens_blur_offsets(
+    radius: f32,
+    aperture: LensBlurAperture,
+    rotation_degrees: f32,
+) -> Vec<(f32, f32)> {
+    let ring_count = ((radius / 10.0).ceil() as usize).clamp(1, 5);
+    let tau = std::f32::consts::PI * 2.0;
+    let rotation = rotation_degrees.to_radians();
+    let mut offsets = Vec::with_capacity(1 + ring_count * 24);
+    offsets.push((0.0, 0.0));
+    for ring in 1..=ring_count {
+        let ring_t = ring as f32 / ring_count as f32;
+        let samples = (ring * 8).clamp(8, 40);
+        let stagger = if ring % 2 == 0 { 0.5 } else { 0.0 };
+        for sample in 0..samples {
+            let angle = tau * ((sample as f32 + stagger) / samples as f32);
+            let aperture_radius = aperture_radius_at_angle(aperture, angle, rotation);
+            let sample_radius = radius * ring_t.sqrt() * aperture_radius;
+            offsets.push((sample_radius * angle.cos(), sample_radius * angle.sin()));
+        }
+    }
+    offsets
+}
+
+fn aperture_radius_at_angle(aperture: LensBlurAperture, angle: f32, rotation: f32) -> f32 {
+    let sides = match aperture {
+        LensBlurAperture::Circular => return 1.0,
+        LensBlurAperture::Hexagon => 6.0,
+        LensBlurAperture::Octagon => 8.0,
+    };
+    let sector = std::f32::consts::PI * 2.0 / sides;
+    let local = (angle - rotation + sector * 0.5).rem_euclid(sector) - sector * 0.5;
+    (std::f32::consts::PI / sides).cos() / local.cos().max(0.001)
 }
 
 fn apply_soft_focus(
@@ -4026,6 +4140,34 @@ mod tests {
     }
 
     #[test]
+    fn lens_blur_spreads_highlight_and_preserves_alpha() {
+        let mut pixels = vec![0_u8; 5 * 5 * 4];
+        for px in pixels.chunks_exact_mut(4) {
+            px[3] = 123;
+        }
+        let center = (2 * 5 + 2) * 4;
+        pixels[center..center + 4].copy_from_slice(&[255, 255, 255, 123]);
+        let src = RgbaImageBuf::new(5, 5, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "lens",
+            LocalMask::Full,
+            LocalEffect::LensBlur(LensBlurParams {
+                radius_px: 1.0,
+                aperture: LensBlurAperture::Circular,
+                rotation_degrees: 0.0,
+                highlight_threshold: 0.5,
+                highlight_boost: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let neighbor = (2 * 5 + 1) * 4;
+        assert!(out.pixels[neighbor] > 0);
+        assert!(out.pixels[center] < 255);
+        assert_eq!(out.pixels[neighbor + 3], 123);
+    }
+
+    #[test]
     fn shadow_lift_brightens_dark_pixel() {
         let src = solid(1, 1, [24, 24, 24, 255]);
         let layer = LocalAdjustmentLayer::new(
@@ -4077,6 +4219,7 @@ mod tests {
             LocalEffect::Blur(BlurParams::default()),
             LocalEffect::MotionBlur(MotionBlurParams::default()),
             LocalEffect::TiltShift(TiltShiftParams::default()),
+            LocalEffect::LensBlur(LensBlurParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),

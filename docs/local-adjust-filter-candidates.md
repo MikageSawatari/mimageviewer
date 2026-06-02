@@ -47,13 +47,13 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、33種)
+### `LocalEffect` (部分補正レイヤー、34種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
-HighlightsShadows, Clarity, Dehaze, Blur(box), MotionBlur, TiltShift, SoftFocus, Mosaic, Sharpen, Look(15プリセット),
+HighlightsShadows, Clarity, Dehaze, Blur(box), MotionBlur, TiltShift, LensBlur, SoftFocus, Mosaic, Sharpen, Look(15プリセット),
 GradientMap, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth
 
 ### マスク種別 (併用可能・差別化の武器)
@@ -88,11 +88,11 @@ OilPaint(Kuwahara) / Sketch(Sobel) / LightLeak / 減色8機種 / CRT 3種＋複�
 
 ## 2. ぼかし・フォーカス系 ★イラスト重要
 
-現状: Blur(box), MotionBlur, TiltShift, SoftFocus を実装済み。box blur は半径非依存コスト (積算和 O(n)) なので可変半径ぼかしの土台に最適。
+現状: Blur(box), MotionBlur, TiltShift, LensBlur, SoftFocus を実装済み。box blur は半径非依存コスト (積算和 O(n)) なので可変半径ぼかしの土台に最適。
 
 - [x] **移動ぼかし (モーションブラー・方向指定)** ★★★ **易〜中** — 動きの表現。イラスト/漫画で必須級 (CSP / PS / Krita)
 - [x] **被写界深度 / チルトシフト (`TiltShift`)** ★★★ **中** — 奥行きの向きを指定して奥をぼかす + ジオラマ風。**§A で詳細設計**
-- [ ] **レンズぼかし / 玉ボケ (Bokeh)** ★★★ **中** — 絞り形状ボケ＋ハイライト滲み。Gaussian/box とは見た目が別物 (CSP Lens / PS Lens Blur)
+- [x] **レンズぼかし / 玉ボケ (Bokeh)** ★★★ **中** — 絞り形状ボケ＋ハイライト滲み。Gaussian/box とは見た目が別物 (CSP Lens / PS Lens Blur)
 - [ ] **回転ぼかし / ズーム (放射) ぼかし** ★★ **中** — 躍動感・集中線的フォーカス (CSP Radial / PS Spin)
 - [ ] **表面ぼかし / バイラテラル (エッジ保持平滑)** ★★ **中** — 平面を滑らかに・線は残す。塗りの均し/スキャン整え (PS Surface / Smart Blur)
 - [ ] **メディアン (中央値)** **易** — 微ノイズ・ディテール除去 (PS)

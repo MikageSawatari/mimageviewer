@@ -88,6 +88,7 @@ the window.
   - Blur
   - Motion blur
   - Tilt shift
+  - Lens blur
   - Soft focus
   - Mosaic with long-edge-ratio / fixed-pixel tile sizing and the same three
     boundary modes as the conceal mosaic tool

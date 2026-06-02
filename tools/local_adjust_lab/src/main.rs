@@ -18,14 +18,14 @@ use local_adjust_core::{
     ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
     CubeLutParams, DehazeParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EqualizeParams,
     FilmGrainParams, GradientMapParams, GradientMapPreset, HalftoneParams, HighlightsShadowsParams,
-    HslParams, InvertParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect,
-    LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams,
-    MosaicTileMode, MotionBlurParams, PosterizeParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
-    SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
-    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
-    ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size, evaluate_layer_mask,
-    parse_cube_lut,
+    HslParams, InvertParams, LensBlurAperture, LensBlurParams, LineKind, LinearGradientMask,
+    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
+    MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, PosterizeParams,
+    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
+    RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams,
+    StarGlowParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
+    ToneCurveParams, ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -941,6 +941,7 @@ enum EffectKind {
     Blur,
     MotionBlur,
     TiltShift,
+    LensBlur,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -980,6 +981,7 @@ impl EffectKind {
             LocalEffect::Blur(_) => Self::Blur,
             LocalEffect::MotionBlur(_) => Self::MotionBlur,
             LocalEffect::TiltShift(_) => Self::TiltShift,
+            LocalEffect::LensBlur(_) => Self::LensBlur,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1019,6 +1021,7 @@ impl EffectKind {
             Self::Blur => "ぼかし",
             Self::MotionBlur => "移動ぼかし",
             Self::TiltShift => "チルトシフト",
+            Self::LensBlur => "レンズぼかし",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1062,6 +1065,7 @@ impl EffectKind {
             Self::TiltShift => {
                 "焦点帯を残して周囲をぼかし、浅い被写界深度やジオラマ風の見た目を作ります。"
             }
+            Self::LensBlur => "絞り形状でぼかし、明るい点を玉ボケのように膨らませます。",
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
@@ -1132,6 +1136,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Blur,
             EffectKind::MotionBlur,
             EffectKind::TiltShift,
+            EffectKind::LensBlur,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Sharpen,
@@ -6479,6 +6484,14 @@ fn effect_summary(effect: &LocalEffect) -> String {
             };
             format!("チルトシフト {mode} {:.0}px", params.max_radius_px)
         }
+        LocalEffect::LensBlur(params) => {
+            let aperture = match params.aperture {
+                LensBlurAperture::Circular => "円",
+                LensBlurAperture::Hexagon => "6角",
+                LensBlurAperture::Octagon => "8角",
+            };
+            format!("レンズぼかし {aperture} {:.0}px", params.radius_px)
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -7874,6 +7887,107 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からチルトシフト結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::LensBlur(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "弱") {
+                    *params = LensBlurParams {
+                        radius_px: 10.0,
+                        aperture: LensBlurAperture::Circular,
+                        rotation_degrees: 0.0,
+                        highlight_threshold: 0.94,
+                        highlight_boost: 0.3,
+                        strength: 0.55,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "背景ぼかし") {
+                    *params = LensBlurParams {
+                        radius_px: 24.0,
+                        aperture: LensBlurAperture::Circular,
+                        rotation_degrees: 0.0,
+                        highlight_threshold: 0.94,
+                        highlight_boost: 0.5,
+                        strength: 0.9,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "玉ボケ") {
+                    *params = LensBlurParams {
+                        radius_px: 34.0,
+                        aperture: LensBlurAperture::Circular,
+                        rotation_degrees: 0.0,
+                        highlight_threshold: 0.86,
+                        highlight_boost: 1.2,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "6角光") {
+                    *params = LensBlurParams {
+                        radius_px: 32.0,
+                        aperture: LensBlurAperture::Hexagon,
+                        rotation_degrees: 30.0,
+                        highlight_threshold: 0.88,
+                        highlight_boost: 1.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "絞り形状で画像を集めるぼかしです。明るい点がある背景に使うと、通常のぼかしよりレンズらしい玉ボケになります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal(|ui| {
+                let circular = params.aperture == LensBlurAperture::Circular;
+                if ui.selectable_label(circular, "円形").clicked() && !circular {
+                    params.aperture = LensBlurAperture::Circular;
+                    changed = true;
+                }
+                let hexagon = params.aperture == LensBlurAperture::Hexagon;
+                if ui.selectable_label(hexagon, "6角").clicked() && !hexagon {
+                    params.aperture = LensBlurAperture::Hexagon;
+                    changed = true;
+                }
+                let octagon = params.aperture == LensBlurAperture::Octagon;
+                if ui.selectable_label(octagon, "8角").clicked() && !octagon {
+                    params.aperture = LensBlurAperture::Octagon;
+                    changed = true;
+                }
+            });
+            let radius = ui.add(egui::Slider::new(&mut params.radius_px, 0.0..=64.0).text("半径"));
+            changed |= radius.changed();
+            radius.lab_hover_tip("ぼかしの大きさです。値を大きくすると玉ボケも大きくなります。");
+            if params.aperture != LensBlurAperture::Circular {
+                let rotation = ui.add(
+                    egui::Slider::new(&mut params.rotation_degrees, -180.0..=180.0)
+                        .text("絞り回転")
+                        .suffix("°"),
+                );
+                changed |= rotation.changed();
+                rotation.lab_hover_tip("6角・8角の絞り形状の向きを回転します。");
+            }
+            let threshold = ui.add(
+                egui::Slider::new(&mut params.highlight_threshold, 0.50..=0.995)
+                    .text("明部しきい値"),
+            );
+            changed |= threshold.changed();
+            threshold.lab_hover_tip(
+                "玉ボケとして膨らませる明るさのしきい値です。低いほど多くの明部が強調されます。",
+            );
+            let boost = ui.add(
+                egui::Slider::new(&mut params.highlight_boost, 0.0..=3.0).text("明部ブースト"),
+            );
+            changed |= boost.changed();
+            boost.lab_hover_tip("しきい値を超えた明るい点を、ぼかし内でどれだけ強く扱うかです。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からレンズぼかし結果へどれだけ近づけるかです。");
         }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -10118,6 +10232,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Blur => LocalEffect::Blur(BlurParams::default()),
         EffectKind::MotionBlur => LocalEffect::MotionBlur(MotionBlurParams::default()),
         EffectKind::TiltShift => LocalEffect::TiltShift(TiltShiftParams::default()),
+        EffectKind::LensBlur => LocalEffect::LensBlur(LensBlurParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
