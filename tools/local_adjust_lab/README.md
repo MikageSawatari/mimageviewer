@@ -122,6 +122,7 @@ the window.
   - Halftone
   - Screen tone
   - Color halftone
+  - Textureizer
   - Cross/star glow
   - Edge-preserving smooth
   - Median

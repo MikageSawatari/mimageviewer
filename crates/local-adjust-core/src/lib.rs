@@ -572,6 +572,7 @@ pub enum LocalEffect {
     Halftone(HalftoneParams),
     ScreenTone(ScreenToneParams),
     ColorHalftone(ColorHalftoneParams),
+    Textureizer(TextureizerParams),
     StarGlow(StarGlowParams),
     EdgeSmooth(EdgeSmoothParams),
     Median(MedianParams),
@@ -644,6 +645,7 @@ impl LocalEffect {
             Self::Halftone(_) => "ハーフトーン",
             Self::ScreenTone(_) => "スクリーントーン",
             Self::ColorHalftone(_) => "カラーハーフトーン",
+            Self::Textureizer(_) => "テクスチャライザ",
             Self::StarGlow(_) => "クロス光",
             Self::EdgeSmooth(_) => "エッジ保持ぼかし",
             Self::Median(_) => "メディアンフィルタ",
@@ -2571,6 +2573,45 @@ impl Default for ColorHalftoneParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextureizerMode {
+    Paper,
+    Canvas,
+    Linen,
+}
+
+impl Default for TextureizerMode {
+    fn default() -> Self {
+        Self::Paper
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextureizerParams {
+    pub mode: TextureizerMode,
+    pub scale_px: f32,
+    pub depth: f32,
+    pub contrast: f32,
+    pub warmth: f32,
+    pub strength: f32,
+    pub seed: u32,
+}
+
+impl Default for TextureizerParams {
+    fn default() -> Self {
+        Self {
+            mode: TextureizerMode::Paper,
+            scale_px: 10.0,
+            depth: 0.45,
+            contrast: 1.0,
+            warmth: 0.15,
+            strength: 0.0,
+            seed: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StarGlowParams {
     pub ray_count: u32,
@@ -2971,6 +3012,9 @@ where
         }
         LocalEffect::ColorHalftone(params) => {
             apply_color_halftone(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::Textureizer(params) => {
+            apply_textureizer(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::StarGlow(params) => {
             apply_star_glow(&image.pixels, image.width, image.height, *params)
@@ -8152,6 +8196,113 @@ fn color_halftone_plate_mask(
     1.0 - smoothstep(radius, radius + edge, dist)
 }
 
+fn apply_textureizer(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: TextureizerParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let depth = params.depth.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || depth <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let scale = params.scale_px.clamp(2.0, 96.0);
+    let contrast = params.contrast.clamp(0.0, 2.0);
+    let warmth = params.warmth.clamp(-1.0, 1.0);
+    let mut out = src.to_vec();
+
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let texture = textureizer_value(
+                params.mode,
+                x as f32,
+                y as f32,
+                scale,
+                contrast,
+                params.seed,
+            );
+            let plate = (0.5 + texture * depth * 0.48).clamp(0.0, 1.0);
+            let mut target = [
+                soft_light_channel(base[0], plate),
+                soft_light_channel(base[1], plate),
+                soft_light_channel(base[2], plate),
+            ];
+            apply_textureizer_warmth(&mut target, warmth, texture);
+            for c in 0..3 {
+                out[i + c] = to_u8(lerp_f32(base[c], target[c], strength));
+            }
+        }
+    }
+
+    out
+}
+
+fn textureizer_value(
+    mode: TextureizerMode,
+    x: f32,
+    y: f32,
+    scale: f32,
+    contrast: f32,
+    seed: u32,
+) -> f32 {
+    let raw = match mode {
+        TextureizerMode::Paper => {
+            let coarse = glass_value_noise(x / scale, y / scale, seed);
+            let mid = glass_value_noise(
+                x / (scale * 0.43) + 19.3,
+                y / (scale * 0.43) - 7.1,
+                seed ^ 0xCAFE_71E5,
+            );
+            let fiber = signed_noise((x / 2.0) as u32, y as u32, seed ^ 0xA11C_E5E1);
+            coarse * 0.58 + mid * 0.30 + fiber * 0.12
+        }
+        TextureizerMode::Canvas => {
+            let warp = (x / scale * std::f32::consts::TAU).sin().abs();
+            let weft = (y / scale * std::f32::consts::TAU).sin().abs();
+            let weave_phase = if ((x / scale).floor() as i32 + (y / scale).floor() as i32) & 1 == 0
+            {
+                1.0
+            } else {
+                -1.0
+            };
+            let weave = (warp + weft - 1.0) * 0.72 + (warp - weft) * weave_phase * 0.26;
+            let rough = glass_value_noise(x / (scale * 1.7), y / (scale * 1.7), seed);
+            weave + rough * 0.22
+        }
+        TextureizerMode::Linen => {
+            let vertical = (x / (scale * 0.42) * std::f32::consts::TAU).sin().abs() * 2.0 - 1.0;
+            let horizontal = (y / (scale * 1.15) * std::f32::consts::TAU).sin().abs() * 2.0 - 1.0;
+            let long_fiber = glass_value_noise(x / (scale * 0.6), y / (scale * 3.2), seed);
+            vertical * 0.46 + horizontal * 0.22 + long_fiber * 0.32
+        }
+    };
+    (raw * contrast).clamp(-1.0, 1.0)
+}
+
+fn apply_textureizer_warmth(rgb: &mut [f32; 3], warmth: f32, texture: f32) {
+    let amount = warmth.abs() * (0.35 + texture.abs() * 0.65);
+    if amount <= f32::EPSILON {
+        return;
+    }
+    if warmth >= 0.0 {
+        rgb[0] = (rgb[0] + (1.0 - rgb[0]) * amount * 0.050).clamp(0.0, 1.0);
+        rgb[1] = (rgb[1] + (1.0 - rgb[1]) * amount * 0.026).clamp(0.0, 1.0);
+        rgb[2] = (rgb[2] * (1.0 - amount * 0.055)).clamp(0.0, 1.0);
+    } else {
+        rgb[0] = (rgb[0] * (1.0 - amount * 0.040)).clamp(0.0, 1.0);
+        rgb[1] = (rgb[1] + (1.0 - rgb[1]) * amount * 0.012).clamp(0.0, 1.0);
+        rgb[2] = (rgb[2] + (1.0 - rgb[2]) * amount * 0.052).clamp(0.0, 1.0);
+    }
+}
+
 fn apply_star_glow(src: &[u8], width: usize, height: usize, params: StarGlowParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 3.0);
     let length = params.length_px.clamp(1.0, 240.0);
@@ -10134,6 +10285,7 @@ mod tests {
             LocalEffect::Halftone(HalftoneParams::default()),
             LocalEffect::ScreenTone(ScreenToneParams::default()),
             LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
+            LocalEffect::Textureizer(TextureizerParams::default()),
             LocalEffect::StarGlow(StarGlowParams::default()),
             LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
             LocalEffect::Median(MedianParams::default()),
@@ -11578,6 +11730,27 @@ LUT_3D_SIZE 2
                 .chunks_exact(4)
                 .any(|px| px[0] != px[1] || px[1] != px[2])
         );
+    }
+
+    #[test]
+    fn textureizer_adds_paper_texture_and_preserves_alpha() {
+        let src = solid(8, 8, [170, 160, 145, 207]);
+        let layer = LocalAdjustmentLayer::new(
+            "textureizer",
+            LocalMask::Full,
+            LocalEffect::Textureizer(TextureizerParams {
+                mode: TextureizerMode::Paper,
+                scale_px: 4.0,
+                depth: 0.85,
+                contrast: 1.3,
+                warmth: 0.25,
+                strength: 1.0,
+                seed: 7,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_ne!(out.pixels, src.pixels);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 207));
     }
 
     #[test]

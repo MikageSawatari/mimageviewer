@@ -119,6 +119,7 @@ enum LocalEffect {
     Halftone(LocalHalftoneParams),
     ScreenTone(LocalScreenToneParams),
     ColorHalftone(LocalColorHalftoneParams),
+    Textureizer(LocalTextureizerParams),
     EdgePreservingSmooth(LocalEdgeSmoothParams),
 }
 ```
@@ -304,7 +305,7 @@ v1.1.0 の最小構成:
 | フィルム粒子 / ノイズ追加 | 中-高 | AI 絵のつるっとした質感を軽く崩す | seed 固定で再現性を持たせる |
 | Orton / Soft Glow | 中 | 写真・イラストの柔らかい仕上げ | SoftFocus と近いがルック寄り |
 | 色収差 | 中 | 演出系。軽く使うと画面効果になる | 強度上限を控えめにする |
-| ハーフトーン / 漫画調 / 印刷風 / スクリーントーン | 中 | ポストフィルタ的な見た目を範囲・強度付きで使う | `Halftone` は簡易網点、`ScreenTone` は網点 / 線 / カケアミ、`ColorHalftone` は CMYK 4版ドットを持つ印刷調フィルタ |
+| ハーフトーン / 漫画調 / 印刷風 / スクリーントーン | 中 | ポストフィルタ的な見た目を範囲・強度付きで使う | `Halftone` は簡易網点、`ScreenTone` は網点 / 線 / カケアミ、`ColorHalftone` は CMYK 4版ドット、`Textureizer` は紙目 / キャンバス / リネン質感を持つ印刷・紙質系フィルタ |
 | エッジ保持ぼかし / 滑らか化 | 中 | 背景なじませ、美肌、ノイズ感の低減 | bilateral / guided filter 系。重いので worker 前提 |
 
 Look / LUT は「プリセット名 + 強度 + 適用色空間」を持つ。内蔵プリセットは、最初は少数に絞る。
@@ -689,7 +690,7 @@ conceal source:
 エッジ保持ぼかし。
 
 プロトタイプでは `local-adjust-core` と `local_adjust_lab` に、内蔵 Look、Bloom、
-ビネット、フィルム粒子、色収差、ハーフトーン、スクリーントーン、カラーハーフトーン、エッジ保持ぼかしを追加済み。
+ビネット、フィルム粒子、色収差、ハーフトーン、スクリーントーン、カラーハーフトーン、テクスチャライザ、エッジ保持ぼかしを追加済み。
 Orton / Soft Glow は既存の Soft Focus と Bloom の組み合わせで検証し、必要なら
 専用パラメータとして分離する。
 
@@ -896,7 +897,7 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
 - 効果: Tone (自然な彩度・tint を含む) / Tone Curve / RGB Curve / Color Balance /
   3-way Color Grading / Selective Color / Channel Mixer / Color Mixer / Clarity / Highlights-Shadows /
   Texture / HighPass / Blur / Motion Blur / Wind / SpeedLines / Tilt Shift / Lens Blur / Radial Blur / WaveDistortion / PinchSpherize / Twirl / PolarCoordinates / GlassDisplacement / LensCorrection / LineExtract / ArtisticMedia / BrushStroke / Cutout / Emboss / PixelStylize / Solarize / GlowingEdges / OilPaint / Soft Focus / Mosaic / Sharpen(radius/threshold) / SmartSharpen(edge-aware) / HSL / Dehaze / Look / 3D LUT / Posterize / Threshold / Invert / Duotone / Equalize / Gradient Map / ColorFill / ColorOverlay / NeonGlow / DiffuseGlow / Bloom / GodRays / LensFlare / CloudFog / Spotlight /
-  Vignette / Film Grain / Chromatic Aberration / Halftone / ScreenTone / ColorHalftone / Cross-Star Glow /
+  Vignette / Film Grain / Chromatic Aberration / Halftone / ScreenTone / ColorHalftone / Textureizer / Cross-Star Glow /
   Edge-preserving Smooth / Median
 - 3D LUT は `.cube` の `LUT_3D_SIZE` / `DOMAIN_MIN` / `DOMAIN_MAX` / `LUT_3D_INPUT_RANGE` を読み取り、RGB 3D table
   をレイヤー設定に保持する。ファイル読み込みは worker thread で行い、UI スレッドでは重い I/O

@@ -33,11 +33,11 @@ use local_adjust_core::{
     RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, ScreenToneMode,
     ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
     SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
-    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, ThreeWayColorGradingParams,
-    ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams,
-    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
-    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    evaluate_layer_mask, parse_cube_lut,
+    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
+    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
+    ToneCurveParams, ToneParams, TwirlParams, VignetteParams, WaveDistortionMode,
+    WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1030,6 +1030,7 @@ enum EffectKind {
     Halftone,
     ScreenTone,
     ColorHalftone,
+    Textureizer,
     StarGlow,
     EdgeSmooth,
     Median,
@@ -1133,6 +1134,7 @@ impl EffectKind {
             LocalEffect::Halftone(_) => Self::Halftone,
             LocalEffect::ScreenTone(_) => Self::ScreenTone,
             LocalEffect::ColorHalftone(_) => Self::ColorHalftone,
+            LocalEffect::Textureizer(_) => Self::Textureizer,
             LocalEffect::StarGlow(_) => Self::StarGlow,
             LocalEffect::EdgeSmooth(_) => Self::EdgeSmooth,
             LocalEffect::Median(_) => Self::Median,
@@ -1205,6 +1207,7 @@ impl EffectKind {
             Self::Halftone => "ハーフトーン",
             Self::ScreenTone => "スクリーントーン",
             Self::ColorHalftone => "カラーハーフトーン",
+            Self::Textureizer => "テクスチャライザ",
             Self::StarGlow => "クロス光",
             Self::EdgeSmooth => "エッジ保持ぼかし",
             Self::Median => "メディアン",
@@ -1333,6 +1336,9 @@ impl EffectKind {
             Self::ColorHalftone => {
                 "CMYK 4版の角度違いドットで、ポップアートやアメコミ風の印刷網点を作ります。"
             }
+            Self::Textureizer => {
+                "紙目、キャンバス、リネンの手続き型テクスチャをソフトライトで重ね、手描き感や紙質を足します。"
+            }
             Self::StarGlow => "明るい部分から十字や多方向の光線を描写します。",
             Self::EdgeSmooth => "輪郭をなるべく残しながら面をなめらかにします。",
             Self::Median => "孤立した点ノイズや細かいゴミを、周囲の中央値で目立ちにくくします。",
@@ -1454,6 +1460,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Halftone,
             EffectKind::ScreenTone,
             EffectKind::ColorHalftone,
+            EffectKind::Textureizer,
         ],
     },
     EffectGroup {
@@ -8096,6 +8103,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::ColorHalftone(params) => {
             format!("カラーハーフトーン {:.0}px", params.cell_px)
         }
+        LocalEffect::Textureizer(params) => format!(
+            "テクスチャ {} {:.0}px",
+            textureizer_mode_label(params.mode),
+            params.scale_px
+        ),
         LocalEffect::StarGlow(params) => {
             format!("クロス光 {}本 {:.0}px", params.ray_count, params.length_px)
         }
@@ -8111,6 +8123,14 @@ fn screen_tone_mode_label(mode: ScreenToneMode) -> &'static str {
         ScreenToneMode::Dots => "網点",
         ScreenToneMode::Lines => "線",
         ScreenToneMode::CrossHatch => "カケアミ",
+    }
+}
+
+fn textureizer_mode_label(mode: TextureizerMode) -> &'static str {
+    match mode {
+        TextureizerMode::Paper => "紙目",
+        TextureizerMode::Canvas => "キャンバス",
+        TextureizerMode::Linen => "リネン",
     }
 }
 
@@ -13775,6 +13795,97 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
                 .changed();
         }
+        LocalEffect::Textureizer(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "紙目") {
+                    *params = TextureizerParams {
+                        mode: TextureizerMode::Paper,
+                        scale_px: 9.0,
+                        depth: 0.55,
+                        contrast: 1.05,
+                        warmth: 0.22,
+                        strength: 0.60,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "キャンバス") {
+                    *params = TextureizerParams {
+                        mode: TextureizerMode::Canvas,
+                        scale_px: 7.0,
+                        depth: 0.60,
+                        contrast: 1.20,
+                        warmth: 0.10,
+                        strength: 0.65,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "リネン") {
+                    *params = TextureizerParams {
+                        mode: TextureizerMode::Linen,
+                        scale_px: 8.0,
+                        depth: 0.50,
+                        contrast: 1.15,
+                        warmth: 0.16,
+                        strength: 0.58,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "冷たい紙目") {
+                    *params = TextureizerParams {
+                        mode: TextureizerMode::Paper,
+                        scale_px: 12.0,
+                        depth: 0.42,
+                        contrast: 0.90,
+                        warmth: -0.22,
+                        strength: 0.50,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "手続き型の紙目や織り目をソフトライトで重ねます。フィルム粒子より大きな面の質感向けです。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                changed |= ui
+                    .selectable_value(&mut params.mode, TextureizerMode::Paper, "紙目")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut params.mode, TextureizerMode::Canvas, "キャンバス")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut params.mode, TextureizerMode::Linen, "リネン")
+                    .changed();
+            });
+            changed |= ui
+                .add(egui::Slider::new(&mut params.scale_px, 2.0..=96.0).text("スケール(px)"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.depth, 0.0..=1.0).text("凹凸"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.contrast, 0.0..=2.0).text("コントラスト"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.warmth, -1.0..=1.0).text("紙色"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
+                .changed();
+            let mut seed = params.seed as i32;
+            changed |= ui
+                .add(egui::Slider::new(&mut seed, 0..=9999).text("seed"))
+                .changed();
+            params.seed = seed.max(0) as u32;
+        }
         LocalEffect::StarGlow(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -15299,6 +15410,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Halftone => LocalEffect::Halftone(HalftoneParams::default()),
         EffectKind::ScreenTone => LocalEffect::ScreenTone(ScreenToneParams::default()),
         EffectKind::ColorHalftone => LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
+        EffectKind::Textureizer => LocalEffect::Textureizer(TextureizerParams::default()),
         EffectKind::StarGlow => LocalEffect::StarGlow(StarGlowParams::default()),
         EffectKind::EdgeSmooth => LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
         EffectKind::Median => LocalEffect::Median(MedianParams::default()),
@@ -17536,6 +17648,7 @@ mod tests {
             EffectKind::Halftone,
             EffectKind::ScreenTone,
             EffectKind::ColorHalftone,
+            EffectKind::Textureizer,
             EffectKind::ColorOverlay,
             EffectKind::StarGlow,
             EffectKind::EdgeSmooth,
