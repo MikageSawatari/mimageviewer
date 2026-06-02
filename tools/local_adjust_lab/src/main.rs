@@ -29,20 +29,20 @@ use local_adjust_core::{
     LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer,
     LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams,
     MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams,
-    NoiseDistribution, NoiseParams, OilPaintParams, OrtonParams, OutlineStrokeParams,
-    OutlineStrokePlacement, PartColorParams, PinchSpherizeParams, PixelSortDirection,
-    PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
-    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
-    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
-    RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode, ScreenToneParams,
-    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
-    SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask,
-    SubjectMaskRefinement, TextureParams, TextureizerMode, TextureizerParams,
-    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
-    ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams, WaveDistortionMode,
-    WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
-    evaluate_layer_mask, parse_cube_lut,
+    NoiseDistribution, NoiseParams, OilPaintParams, OldFilmParams, OrtonParams,
+    OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, PinchSpherizeParams,
+    PixelSortDirection, PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams,
+    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
+    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
+    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams,
+    ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams,
+    SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams,
+    SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
+    TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
+    TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams,
+    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
+    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1058,6 +1058,7 @@ enum EffectKind {
     ScanlineGlitch,
     Vhs,
     PixelSort,
+    OldFilm,
     Halftone,
     ScreenTone,
     ColorHalftone,
@@ -1197,6 +1198,7 @@ impl EffectKind {
             LocalEffect::ScanlineGlitch(_) => Self::ScanlineGlitch,
             LocalEffect::Vhs(_) => Self::Vhs,
             LocalEffect::PixelSort(_) => Self::PixelSort,
+            LocalEffect::OldFilm(_) => Self::OldFilm,
             LocalEffect::Halftone(_) => Self::Halftone,
             LocalEffect::ScreenTone(_) => Self::ScreenTone,
             LocalEffect::ColorHalftone(_) => Self::ColorHalftone,
@@ -1287,6 +1289,7 @@ impl EffectKind {
             Self::ScanlineGlitch => "走査線グリッチ",
             Self::Vhs => "VHS/アナログ",
             Self::PixelSort => "ピクセルソート",
+            Self::OldFilm => "オールドフィルム",
             Self::Halftone => "ハーフトーン",
             Self::ScreenTone => "スクリーントーン",
             Self::ColorHalftone => "カラーハーフトーン",
@@ -1467,6 +1470,9 @@ impl EffectKind {
             Self::PixelSort => {
                 "明るさ範囲で区切った行または列の画素を並べ替え、グリッチアート風の崩れを作ります。"
             }
+            Self::OldFilm => {
+                "セピア、退色、ビネット、粒子、ホコリ、縦傷を重ねて古写真や古いフィルム風にします。"
+            }
             Self::Halftone => "明るさをドットパターンに変換し、漫画や印刷風にします。",
             Self::ScreenTone => {
                 "網点、平行線、カケアミを重ね、濃度と元画像の明暗追従で漫画用のトーンを作ります。"
@@ -1619,6 +1625,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ScanlineGlitch,
             EffectKind::Vhs,
             EffectKind::PixelSort,
+            EffectKind::OldFilm,
         ],
     },
     EffectGroup {
@@ -8599,6 +8606,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
         }
         LocalEffect::Vhs(params) => format!("VHS {:.0}%", params.strength * 100.0),
         LocalEffect::PixelSort(params) => format!("ピクセルソート {:.0}%", params.strength * 100.0),
+        LocalEffect::OldFilm(params) => format!("オールドフィルム {:.0}%", params.strength * 100.0),
         LocalEffect::Halftone(params) => format!("ハーフトーン {}px", params.cell_px),
         LocalEffect::ScreenTone(params) => format!(
             "スクリーントーン {} {:.0}px",
@@ -15637,6 +15645,94 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
                 .changed();
         }
+        LocalEffect::OldFilm(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "古写真") {
+                    *params = OldFilmParams {
+                        sepia: 0.75,
+                        fade: 0.55,
+                        vignette: 0.45,
+                        grain: 0.20,
+                        dust: 0.10,
+                        scratches: 0.06,
+                        seed: params.seed,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "傷フィルム") {
+                    *params = OldFilmParams {
+                        sepia: 0.30,
+                        fade: 0.35,
+                        vignette: 0.35,
+                        grain: 0.25,
+                        dust: 0.30,
+                        scratches: 0.55,
+                        seed: params.seed,
+                        strength: 0.90,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "退色") {
+                    *params = OldFilmParams {
+                        sepia: 0.45,
+                        fade: 0.80,
+                        vignette: 0.20,
+                        grain: 0.10,
+                        dust: 0.08,
+                        scratches: 0.05,
+                        seed: params.seed,
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "白黒古フィルム") {
+                    *params = OldFilmParams {
+                        sepia: 0.05,
+                        fade: 0.95,
+                        vignette: 0.45,
+                        grain: 0.25,
+                        dust: 0.20,
+                        scratches: 0.35,
+                        seed: params.seed,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new("セピア調の退色、周辺落ち、粒子、ホコリ、縦傷を重ねます。")
+                    .size(10.0)
+                    .color(Color32::from_gray(170)),
+            );
+            changed |= ui
+                .add(egui::Slider::new(&mut params.sepia, 0.0..=1.0).text("セピア"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.fade, 0.0..=1.0).text("退色"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.vignette, 0.0..=1.0).text("ビネット"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.grain, 0.0..=1.0).text("粒子"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.dust, 0.0..=1.0).text("ホコリ"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.scratches, 0.0..=1.0).text("縦傷"))
+                .changed();
+            let mut seed = params.seed as i32;
+            changed |= ui
+                .add(egui::Slider::new(&mut seed, 0..=9999).text("seed"))
+                .changed();
+            params.seed = seed.max(0) as u32;
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
+                .changed();
+        }
         LocalEffect::Halftone(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -17601,6 +17697,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ScanlineGlitch => LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
         EffectKind::Vhs => LocalEffect::Vhs(VhsParams::default()),
         EffectKind::PixelSort => LocalEffect::PixelSort(PixelSortParams::default()),
+        EffectKind::OldFilm => LocalEffect::OldFilm(OldFilmParams::default()),
         EffectKind::Halftone => LocalEffect::Halftone(HalftoneParams::default()),
         EffectKind::ScreenTone => LocalEffect::ScreenTone(ScreenToneParams::default()),
         EffectKind::ColorHalftone => LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
@@ -19951,6 +20048,7 @@ mod tests {
             EffectKind::ScanlineGlitch,
             EffectKind::Vhs,
             EffectKind::PixelSort,
+            EffectKind::OldFilm,
             EffectKind::ColorOverlay,
             EffectKind::StarGlow,
             EffectKind::EdgeSmooth,

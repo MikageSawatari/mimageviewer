@@ -131,6 +131,7 @@ the window.
   - Scanline glitch / hologram
   - VHS / analog video
   - Pixel sort
+  - Old film / aged photo
   - Halftone
   - Screen tone
   - Color halftone

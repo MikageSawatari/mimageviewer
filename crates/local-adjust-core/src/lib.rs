@@ -602,6 +602,7 @@ pub enum LocalEffect {
     ScanlineGlitch(ScanlineGlitchParams),
     Vhs(VhsParams),
     PixelSort(PixelSortParams),
+    OldFilm(OldFilmParams),
     Halftone(HalftoneParams),
     ScreenTone(ScreenToneParams),
     ColorHalftone(ColorHalftoneParams),
@@ -692,6 +693,7 @@ impl LocalEffect {
             Self::ScanlineGlitch(_) => "走査線グリッチ",
             Self::Vhs(_) => "VHS/アナログビデオ",
             Self::PixelSort(_) => "ピクセルソート",
+            Self::OldFilm(_) => "オールドフィルム",
             Self::Halftone(_) => "ハーフトーン",
             Self::ScreenTone(_) => "スクリーントーン",
             Self::ColorHalftone(_) => "カラーハーフトーン",
@@ -2990,6 +2992,33 @@ impl Default for PixelSortParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OldFilmParams {
+    pub sepia: f32,
+    pub fade: f32,
+    pub vignette: f32,
+    pub grain: f32,
+    pub dust: f32,
+    pub scratches: f32,
+    pub seed: u32,
+    pub strength: f32,
+}
+
+impl Default for OldFilmParams {
+    fn default() -> Self {
+        Self {
+            sepia: 0.35,
+            fade: 0.35,
+            vignette: 0.25,
+            grain: 0.0,
+            dust: 0.0,
+            scratches: 0.0,
+            seed: 1,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HalftoneParams {
     pub cell_px: u32,
     pub strength: f32,
@@ -3672,6 +3701,9 @@ where
             }
             LocalEffect::PixelSort(params) => {
                 apply_pixel_sort(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::OldFilm(params) => {
+                apply_old_film(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::Halftone(params) => {
                 apply_halftone(&image.pixels, image.width, image.height, *params)
@@ -10255,6 +10287,120 @@ fn apply_pixel_sort_segment(
     }
 }
 
+fn apply_old_film(src: &[u8], width: usize, height: usize, params: OldFilmParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let sepia = params.sepia.clamp(0.0, 1.0);
+    let fade = params.fade.clamp(0.0, 1.0);
+    let vignette = params.vignette.clamp(0.0, 1.0);
+    let grain = params.grain.clamp(0.0, 1.0);
+    let dust = params.dust.clamp(0.0, 1.0);
+    let scratches = params.scratches.clamp(0.0, 1.0);
+    if sepia <= f32::EPSILON
+        && fade <= f32::EPSILON
+        && vignette <= f32::EPSILON
+        && grain <= f32::EPSILON
+        && dust <= f32::EPSILON
+        && scratches <= f32::EPSILON
+    {
+        return src.to_vec();
+    }
+
+    let cx = (width.saturating_sub(1)) as f32 * 0.5;
+    let cy = (height.saturating_sub(1)) as f32 * 0.5;
+    let max_dist = (cx * cx + cy * cy).sqrt().max(1.0);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let luma = luma01(base[0], base[1], base[2]);
+            let sepia_rgb = [
+                (luma * 1.10 + 0.035).clamp(0.0, 1.0),
+                (luma * 0.91 + 0.030).clamp(0.0, 1.0),
+                (luma * 0.62 + 0.018).clamp(0.0, 1.0),
+            ];
+            let paper = [0.86, 0.78, 0.58];
+            let mut target = base;
+            for c in 0..3 {
+                target[c] = lerp_f32(target[c], sepia_rgb[c], sepia);
+                target[c] = lerp_f32(target[c], luma, fade * 0.40);
+                target[c] = lerp_f32(target[c], paper[c], fade * 0.26);
+                target[c] = lerp_f32(0.5, target[c], 1.0 - fade * 0.22).clamp(0.0, 1.0);
+            }
+
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = ((dx * dx + dy * dy).sqrt() / max_dist).clamp(0.0, 1.0);
+            let vignette_amount = smoothstep(0.42, 1.0, dist) * vignette;
+            for c in 0..3 {
+                target[c] *= 1.0 - vignette_amount * 0.62;
+            }
+
+            if scratches > f32::EPSILON {
+                let line_noise = signed_noise(x as u32, 0, params.seed ^ 0x4C52_4B1D).abs();
+                let line_gate = smoothstep(0.56, 0.96, line_noise) * scratches;
+                let gap_noise =
+                    signed_noise(x as u32, (y / 9) as u32, params.seed ^ 0x912F_A33B).abs();
+                let gap = smoothstep(0.12, 0.62, gap_noise);
+                let scratch_amount = line_gate * gap;
+                if scratch_amount > f32::EPSILON {
+                    let dark_line = signed_noise(x as u32, 1, params.seed ^ 0x3C6E_F372) > 0.52;
+                    for channel in &mut target {
+                        *channel = if dark_line {
+                            *channel * (1.0 - scratch_amount * 0.55)
+                        } else {
+                            screen_channel(*channel, scratch_amount * 0.82)
+                        };
+                    }
+                }
+            }
+
+            if dust > f32::EPSILON {
+                let white_gate = smoothstep(
+                    1.0 - dust * 0.075,
+                    1.0,
+                    signed_noise(x as u32, y as u32, params.seed ^ 0x7A37_95D1).abs(),
+                );
+                let black_gate = smoothstep(
+                    1.0 - dust * 0.050,
+                    1.0,
+                    signed_noise(x as u32, y as u32, params.seed ^ 0xA4B1_83F5).abs(),
+                );
+                if white_gate > f32::EPSILON || black_gate > f32::EPSILON {
+                    for channel in &mut target {
+                        *channel = screen_channel(*channel, white_gate * 0.70);
+                        *channel *= 1.0 - black_gate * 0.50;
+                    }
+                }
+            }
+
+            if grain > f32::EPSILON {
+                let n = signed_noise(x as u32, y as u32, params.seed ^ 0xB529_7A4D) * grain * 0.15;
+                for channel in &mut target {
+                    *channel = (*channel + n).clamp(0.0, 1.0);
+                }
+            }
+
+            for c in 0..3 {
+                out[i + c] = to_u8(lerp_f32(base[c], target[c], strength));
+            }
+        }
+    }
+    out
+}
+
 fn apply_halftone(src: &[u8], width: usize, height: usize, params: HalftoneParams) -> Vec<u8> {
     let cell = params.cell_px.clamp(2, 96) as usize;
     let strength = params.strength.clamp(0.0, 1.0);
@@ -13316,6 +13462,7 @@ mod tests {
             LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
             LocalEffect::Vhs(VhsParams::default()),
             LocalEffect::PixelSort(PixelSortParams::default()),
+            LocalEffect::OldFilm(OldFilmParams::default()),
             LocalEffect::Halftone(HalftoneParams::default()),
             LocalEffect::ScreenTone(ScreenToneParams::default()),
             LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
@@ -14018,6 +14165,19 @@ mod tests {
                     low_threshold: 0.0,
                     high_threshold: 1.0,
                     max_segment_px: 512,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "old film max artifacts",
+                LocalEffect::OldFilm(OldFilmParams {
+                    sepia: 1.0,
+                    fade: 1.0,
+                    vignette: 1.0,
+                    grain: 1.0,
+                    dust: 1.0,
+                    scratches: 1.0,
+                    seed: 21,
                     strength: 1.0,
                 }),
             ),
@@ -16097,6 +16257,95 @@ LUT_3D_SIZE 2
                 low_threshold: 0.0,
                 high_threshold: 1.0,
                 max_segment_px: 16,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn old_film_sepia_warms_gray_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(1, 1, vec![120, 120, 120, 207]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "old film",
+            LocalMask::Full,
+            LocalEffect::OldFilm(OldFilmParams {
+                sepia: 1.0,
+                fade: 0.0,
+                vignette: 0.0,
+                grain: 0.0,
+                dust: 0.0,
+                scratches: 0.0,
+                seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > out.pixels[1]);
+        assert!(out.pixels[1] > out.pixels[2]);
+        assert_eq!(out.pixels[3], 207);
+    }
+
+    #[test]
+    fn old_film_vignette_darkens_corner_more_than_center() {
+        let src = solid(3, 3, [200, 200, 200, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "old film",
+            LocalMask::Full,
+            LocalEffect::OldFilm(OldFilmParams {
+                sepia: 0.0,
+                fade: 0.0,
+                vignette: 1.0,
+                grain: 0.0,
+                dust: 0.0,
+                scratches: 0.0,
+                seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let center = (3 + 1) * 4;
+        assert!(out.pixels[0] < out.pixels[center]);
+        assert_eq!(out.pixels[center + 3], 255);
+    }
+
+    #[test]
+    fn old_film_grain_changes_flat_image_and_preserves_alpha() {
+        let src = solid(4, 4, [128, 128, 128, 77]);
+        let layer = LocalAdjustmentLayer::new(
+            "old film",
+            LocalMask::Full,
+            LocalEffect::OldFilm(OldFilmParams {
+                sepia: 0.0,
+                fade: 0.0,
+                vignette: 0.0,
+                grain: 1.0,
+                dust: 0.0,
+                scratches: 0.0,
+                seed: 33,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels.chunks_exact(4).any(|px| px[0] != 128));
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 77));
+    }
+
+    #[test]
+    fn old_film_skips_transparent_pixels() {
+        let src = RgbaImageBuf::new(1, 1, vec![255, 0, 0, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "old film",
+            LocalMask::Full,
+            LocalEffect::OldFilm(OldFilmParams {
+                sepia: 1.0,
+                fade: 1.0,
+                vignette: 1.0,
+                grain: 1.0,
+                dust: 1.0,
+                scratches: 1.0,
+                seed: 1,
                 strength: 1.0,
             }),
         );
