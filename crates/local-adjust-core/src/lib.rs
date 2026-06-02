@@ -431,6 +431,7 @@ pub enum LocalEffect {
     RadialBlur(RadialBlurParams),
     WaveDistortion(WaveDistortionParams),
     PinchSpherize(PinchSpherizeParams),
+    Twirl(TwirlParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -478,6 +479,7 @@ impl LocalEffect {
             Self::RadialBlur(_) => "放射ぼかし",
             Self::WaveDistortion(_) => "波形ゆがみ",
             Self::PinchSpherize(_) => "つまむ/魚眼",
+            Self::Twirl(_) => "渦巻き",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -990,6 +992,25 @@ impl Default for PinchSpherizeParams {
     fn default() -> Self {
         Self {
             amount: 0.0,
+            radius_px: 0.0,
+            center: [0.5, 0.5],
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TwirlParams {
+    pub angle_degrees: f32,
+    pub radius_px: f32,
+    pub center: [f32; 2],
+    pub strength: f32,
+}
+
+impl Default for TwirlParams {
+    fn default() -> Self {
+        Self {
+            angle_degrees: 0.0,
             radius_px: 0.0,
             center: [0.5, 0.5],
             strength: 0.0,
@@ -1753,6 +1774,9 @@ where
         }
         LocalEffect::PinchSpherize(params) => {
             apply_pinch_spherize(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::Twirl(params) => {
+            apply_twirl(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -3136,6 +3160,45 @@ fn apply_pinch_spherize(
             let warped_dist = radius * t.powf(exponent);
             let sx = cx + dx / dist * warped_dist;
             let sy = cy + dy / dist * warped_dist;
+            let sampled = sample_rgb_bilinear(src, width, height, sx, sy);
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], to_u8(sampled[c]), strength);
+            }
+        }
+    }
+    out
+}
+
+fn apply_twirl(src: &[u8], width: usize, height: usize, params: TwirlParams) -> Vec<u8> {
+    let angle = params.angle_degrees.clamp(-1080.0, 1080.0).to_radians();
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || angle.abs() <= f32::EPSILON || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let cx = (width.saturating_sub(1)) as f32 * params.center[0].clamp(0.0, 1.0);
+    let cy = (height.saturating_sub(1)) as f32 * params.center[1].clamp(0.0, 1.0);
+    let max_radius = farthest_corner_distance(width, height, cx, cy).max(1.0);
+    let radius = if params.radius_px > 0.0 {
+        params.radius_px.min(max_radius).max(1.0)
+    } else {
+        max_radius
+    };
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= f32::EPSILON || dist >= radius {
+                continue;
+            }
+            let t = (dist / radius).clamp(0.0, 1.0);
+            let theta = angle * (1.0 - t) * (1.0 - t);
+            let cos_t = theta.cos();
+            let sin_t = theta.sin();
+            let sx = cx + dx * cos_t - dy * sin_t;
+            let sy = cy + dx * sin_t + dy * cos_t;
             let sampled = sample_rgb_bilinear(src, width, height, sx, sy);
             for c in 0..3 {
                 out[i + c] = lerp_u8(src[i + c], to_u8(sampled[c]), strength);
@@ -5132,6 +5195,55 @@ mod tests {
     }
 
     #[test]
+    fn twirl_rotates_pixels_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            3,
+            3,
+            vec![
+                10, 0, 0, 77, 20, 0, 0, 77, 30, 0, 0, 77, 40, 0, 0, 77, 50, 0, 0, 77, 60, 0, 0, 77,
+                70, 0, 0, 77, 80, 0, 0, 77, 90, 0, 0, 77,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "twirl",
+            LocalMask::Full,
+            LocalEffect::Twirl(TwirlParams {
+                angle_degrees: 360.0,
+                radius_px: 2.0,
+                center: [0.5, 0.5],
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let right_of_center = (1 * 3 + 2) * 4;
+        assert_ne!(out.pixels[right_of_center], src.pixels[right_of_center]);
+        assert_eq!(out.pixels[right_of_center + 3], 77);
+    }
+
+    #[test]
+    fn twirl_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "twirl",
+            LocalMask::Full,
+            LocalEffect::Twirl(TwirlParams {
+                angle_degrees: 360.0,
+                radius_px: 8.0,
+                center: [0.5, 0.5],
+                strength: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn median_removes_isolated_speckle_and_preserves_alpha() {
         let mut pixels = vec![0_u8; 3 * 3 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -5413,6 +5525,7 @@ mod tests {
             LocalEffect::RadialBlur(RadialBlurParams::default()),
             LocalEffect::WaveDistortion(WaveDistortionParams::default()),
             LocalEffect::PinchSpherize(PinchSpherizeParams::default()),
+            LocalEffect::Twirl(TwirlParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),

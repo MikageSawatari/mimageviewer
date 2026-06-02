@@ -26,7 +26,7 @@ use local_adjust_core::{
     RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
     RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
     SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, VignetteParams,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams,
     WaveDistortionMode, WaveDistortionParams, apply_layers, apply_layers_with_progress,
     compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
@@ -973,6 +973,7 @@ enum EffectKind {
     RadialBlur,
     WaveDistortion,
     PinchSpherize,
+    Twirl,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1020,6 +1021,7 @@ impl EffectKind {
             LocalEffect::RadialBlur(_) => Self::RadialBlur,
             LocalEffect::WaveDistortion(_) => Self::WaveDistortion,
             LocalEffect::PinchSpherize(_) => Self::PinchSpherize,
+            LocalEffect::Twirl(_) => Self::Twirl,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1067,6 +1069,7 @@ impl EffectKind {
             Self::RadialBlur => "放射/回転ぼかし",
             Self::WaveDistortion => "波形ゆがみ",
             Self::PinchSpherize => "つまむ/魚眼",
+            Self::Twirl => "渦巻き",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1127,6 +1130,9 @@ impl EffectKind {
             }
             Self::PinchSpherize => {
                 "中心を基準にふくらませたり、つまんだりして、魚眼レンズや誇張表現を作ります。"
+            }
+            Self::Twirl => {
+                "中心を基準に画像を渦巻き状に回転させ、渦や魔法陣のような演出を作ります。"
             }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
@@ -1230,6 +1236,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::RadialBlur,
             EffectKind::WaveDistortion,
             EffectKind::PinchSpherize,
+            EffectKind::Twirl,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Texture,
@@ -7138,6 +7145,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 format!("つまむ {:.0}%", -params.amount * 100.0)
             }
         }
+        LocalEffect::Twirl(params) => format!("渦巻き {:+.0}°", params.angle_degrees),
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -9059,6 +9067,75 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から変形結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::Twirl(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "渦弱") {
+                    *params = TwirlParams {
+                        angle_degrees: 120.0,
+                        radius_px: 0.0,
+                        center: [0.5, 0.5],
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "渦強") {
+                    *params = TwirlParams {
+                        angle_degrees: 360.0,
+                        radius_px: 0.0,
+                        center: [0.5, 0.5],
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "逆回転") {
+                    *params = TwirlParams {
+                        angle_degrees: -260.0,
+                        radius_px: 0.0,
+                        center: [0.5, 0.5],
+                        strength: 0.95,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "魔法陣") {
+                    *params = TwirlParams {
+                        angle_degrees: 540.0,
+                        radius_px: 320.0,
+                        center: [0.5, 0.5],
+                        strength: 0.9,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "中心に近いほど強く回転させ、外側へ自然に弱まる渦巻き変形を作ります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let angle = ui.add(
+                egui::Slider::new(&mut params.angle_degrees, -720.0..=720.0)
+                    .text("回転量")
+                    .suffix("°"),
+            );
+            changed |= angle.changed();
+            angle.lab_hover_tip("中心で最大になる回転量です。符号を変えると渦の向きが反転します。");
+            let radius = ui.add(egui::Slider::new(&mut params.radius_px, 0.0..=800.0).text("半径"));
+            changed |= radius.changed();
+            radius.lab_hover_tip("効果の範囲です。0 のときは中心から画像の角までを使います。");
+            let center_x =
+                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
+            changed |= center_x.changed();
+            center_x.lab_hover_tip("渦巻きの中心位置です。");
+            let center_y =
+                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
+            changed |= center_y.changed();
+            center_y.lab_hover_tip("渦巻きの中心位置です。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から渦巻き結果へどれだけ近づけるかです。");
         }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -11431,6 +11508,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::RadialBlur => LocalEffect::RadialBlur(RadialBlurParams::default()),
         EffectKind::WaveDistortion => LocalEffect::WaveDistortion(WaveDistortionParams::default()),
         EffectKind::PinchSpherize => LocalEffect::PinchSpherize(PinchSpherizeParams::default()),
+        EffectKind::Twirl => LocalEffect::Twirl(TwirlParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
