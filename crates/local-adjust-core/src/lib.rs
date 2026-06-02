@@ -538,6 +538,7 @@ pub enum LocalEffect {
     Clarity(ClarityParams),
     Texture(TextureParams),
     HighPass(HighPassParams),
+    FrequencySeparation(FrequencySeparationParams),
     HighlightsShadows(HighlightsShadowsParams),
     Dehaze(DehazeParams),
     Blur(BlurParams),
@@ -643,6 +644,7 @@ impl LocalEffect {
             Self::Clarity(_) => "明瞭度",
             Self::Texture(_) => "テクスチャ",
             Self::HighPass(_) => "ハイパス",
+            Self::FrequencySeparation(_) => "周波数分離",
             Self::HighlightsShadows(_) => "ハイライト/シャドウ",
             Self::Dehaze(_) => "かすみ除去",
             Self::Blur(_) => "ぼかし",
@@ -1046,6 +1048,32 @@ impl Default for HighPassParams {
             radius_px: 8.0,
             contrast: 1.0,
             detail_only: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FrequencySeparationParams {
+    /// Blur radius used to split the low-frequency color/tone layer from detail.
+    pub radius_px: f32,
+    /// Extra smoothing applied to the low-frequency layer to reduce broader blotches.
+    pub low_smoothing: f32,
+    /// Scale for the extracted high-frequency detail. 1.0 keeps the original detail.
+    pub detail_amount: f32,
+    /// Additional contrast applied to the detail layer before recomposition.
+    pub detail_contrast: f32,
+    /// Final blend amount of the recomposed image.
+    pub strength: f32,
+}
+
+impl Default for FrequencySeparationParams {
+    fn default() -> Self {
+        Self {
+            radius_px: 12.0,
+            low_smoothing: 0.0,
+            detail_amount: 1.0,
+            detail_contrast: 1.0,
+            strength: 1.0,
         }
     }
 }
@@ -3947,6 +3975,9 @@ where
                 params.contrast.clamp(0.1, 4.0),
                 params.detail_only,
             ),
+            LocalEffect::FrequencySeparation(params) => {
+                apply_frequency_separation(&image.pixels, image.width, image.height, *params)
+            }
             LocalEffect::HighlightsShadows(params) => {
                 apply_highlights_shadows(&image.pixels, *params)
             }
@@ -5147,6 +5178,88 @@ fn apply_high_pass(
         }
     }
     out
+}
+
+fn apply_frequency_separation(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: FrequencySeparationParams,
+) -> Vec<u8> {
+    let radius = params.radius_px.round().clamp(1.0, 128.0) as usize;
+    let low_smoothing = params.low_smoothing.clamp(0.0, 1.0);
+    let detail_amount = params.detail_amount.clamp(0.0, 2.0);
+    let detail_contrast = params.detail_contrast.clamp(0.25, 2.0);
+    let strength = params.strength.clamp(0.0, 1.0);
+    let detail_scale = detail_amount * detail_contrast;
+    if width == 0
+        || height == 0
+        || strength <= f32::EPSILON
+        || (low_smoothing <= f32::EPSILON && (detail_scale - 1.0).abs() <= f32::EPSILON)
+    {
+        return src.to_vec();
+    }
+
+    let premultiplied = premultiply_rgba(src);
+    let low = box_blur_rgba(&premultiplied, width, height, radius);
+    let smoothed_low = if low_smoothing > f32::EPSILON {
+        let smooth_radius = ((radius as f32 * 1.75).round() as usize).clamp(1, 192);
+        Some(box_blur_rgba(&low, width, height, smooth_radius))
+    } else {
+        None
+    };
+    let mut out = src.to_vec();
+
+    for i in (0..src.len()).step_by(4) {
+        let alpha = src[i + 3];
+        if alpha == 0 {
+            continue;
+        }
+        let base = [
+            src[i] as f32 / 255.0,
+            src[i + 1] as f32 / 255.0,
+            src[i + 2] as f32 / 255.0,
+        ];
+        let low_rgb = unpremultiply_rgb(&low, i).unwrap_or(base);
+        let smooth_rgb = smoothed_low
+            .as_ref()
+            .and_then(|smooth| unpremultiply_rgb(smooth, i))
+            .unwrap_or(low_rgb);
+        for c in 0..3 {
+            let low_adjusted = lerp_f32(low_rgb[c], smooth_rgb[c], low_smoothing);
+            let detail = (base[c] - low_rgb[c]) * detail_scale;
+            let target = (low_adjusted + detail).clamp(0.0, 1.0);
+            out[i + c] = to_u8(lerp_f32(base[c], target, strength));
+        }
+        out[i + 3] = alpha;
+    }
+
+    out
+}
+
+fn premultiply_rgba(src: &[u8]) -> Vec<u8> {
+    let mut out = vec![0_u8; src.len()];
+    for i in (0..src.len()).step_by(4) {
+        let alpha = src[i + 3] as f32 / 255.0;
+        out[i] = to_u8(src[i] as f32 / 255.0 * alpha);
+        out[i + 1] = to_u8(src[i + 1] as f32 / 255.0 * alpha);
+        out[i + 2] = to_u8(src[i + 2] as f32 / 255.0 * alpha);
+        out[i + 3] = src[i + 3];
+    }
+    out
+}
+
+fn unpremultiply_rgb(src: &[u8], i: usize) -> Option<[f32; 3]> {
+    let alpha = src[i + 3] as f32 / 255.0;
+    if alpha <= 1.0 / 255.0 {
+        return None;
+    }
+    let inv_alpha = 1.0 / alpha;
+    Some([
+        (src[i] as f32 / 255.0 * inv_alpha).clamp(0.0, 1.0),
+        (src[i + 1] as f32 / 255.0 * inv_alpha).clamp(0.0, 1.0),
+        (src[i + 2] as f32 / 255.0 * inv_alpha).clamp(0.0, 1.0),
+    ])
 }
 
 fn overlay_channel(base: u8, blend: u8) -> u8 {
@@ -15979,6 +16092,85 @@ mod tests {
     }
 
     #[test]
+    fn frequency_separation_reduces_high_frequency_detail() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                80, 80, 80, 255, 80, 80, 80, 255, 190, 190, 190, 255, 80, 80, 80, 255, 80, 80, 80,
+                255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "frequency separation",
+            LocalMask::Full,
+            LocalEffect::FrequencySeparation(FrequencySeparationParams {
+                radius_px: 1.0,
+                low_smoothing: 0.0,
+                detail_amount: 0.0,
+                detail_contrast: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[8] < src.pixels[8]);
+        assert_eq!(out.pixels[11], 255);
+    }
+
+    #[test]
+    fn frequency_separation_can_enhance_detail() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                80, 80, 80, 255, 80, 80, 80, 255, 150, 150, 150, 255, 80, 80, 80, 255, 80, 80, 80,
+                255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "frequency separation",
+            LocalMask::Full,
+            LocalEffect::FrequencySeparation(FrequencySeparationParams {
+                radius_px: 1.0,
+                low_smoothing: 0.0,
+                detail_amount: 1.45,
+                detail_contrast: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[8] > src.pixels[8]);
+        assert_eq!(out.pixels[11], 255);
+    }
+
+    #[test]
+    fn frequency_separation_keeps_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![255, 0, 0, 0, 100, 100, 100, 255, 100, 100, 100, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "frequency separation",
+            LocalMask::Full,
+            LocalEffect::FrequencySeparation(FrequencySeparationParams {
+                radius_px: 1.0,
+                low_smoothing: 1.0,
+                detail_amount: 0.0,
+                detail_contrast: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[255, 0, 0, 0]);
+        assert!(out.pixels[4] <= 110);
+        assert_eq!(out.pixels[7], 255);
+    }
+
+    #[test]
     fn sharpen_threshold_suppresses_low_contrast_detail() {
         let src = RgbaImageBuf::new(
             5,
@@ -16117,6 +16309,7 @@ mod tests {
             LocalEffect::Clarity(ClarityParams::default()),
             LocalEffect::Texture(TextureParams::default()),
             LocalEffect::HighPass(HighPassParams::default()),
+            LocalEffect::FrequencySeparation(FrequencySeparationParams::default()),
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default()),
             LocalEffect::Dehaze(DehazeParams::default()),
             LocalEffect::Blur(BlurParams::default()),
@@ -16256,6 +16449,16 @@ mod tests {
                     radius_px: 96.0,
                     contrast: 4.0,
                     detail_only: false,
+                }),
+            ),
+            full(
+                "frequency separation max radii",
+                LocalEffect::FrequencySeparation(FrequencySeparationParams {
+                    radius_px: 128.0,
+                    low_smoothing: 1.0,
+                    detail_amount: 2.0,
+                    detail_contrast: 2.0,
+                    strength: 1.0,
                 }),
             ),
             full(

@@ -24,11 +24,11 @@ use local_adjust_core::{
     ColorTraceParams, ContactShadowParams, CubeLutParams, CutoutParams, DataMoshParams,
     DefringeParams, DehazeParams, DespeckleParams, DiffractionStarburstParams, DiffuseGlowParams,
     DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams, EngravingParams, EqualizeParams,
-    FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams, GlowingEdgesParams,
-    GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams, HalftoneParams,
-    HeatHazeParams, HighPassParams, HighlightsShadowsParams, HslParams, InvertParams,
-    LensBlurAperture, LensBlurParams, LensCorrectionParams, LensDirtMode, LensDirtParams,
-    LensFlareParams, LightLeakParams, LineExtractMode, LineExtractParams, LineKind,
+    FilmGrainParams, FrequencySeparationParams, GlassDisplacementMode, GlassDisplacementParams,
+    GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams,
+    HalftoneParams, HeatHazeParams, HighPassParams, HighlightsShadowsParams, HslParams,
+    InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LensDirtMode,
+    LensDirtParams, LensFlareParams, LightLeakParams, LineExtractMode, LineExtractParams, LineKind,
     LinearGradientMask, LithographParams, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
     LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
     MosaicTileMode, MotionBlurParams, NeonGlowParams, NewspaperPrintParams, NoiseDistribution,
@@ -1039,6 +1039,7 @@ enum EffectKind {
     Clarity,
     Texture,
     HighPass,
+    FrequencySeparation,
     HighlightsShadows,
     Dehaze,
     Blur,
@@ -1213,6 +1214,7 @@ impl EffectKind {
             LocalEffect::Clarity(_) => Self::Clarity,
             LocalEffect::Texture(_) => Self::Texture,
             LocalEffect::HighPass(_) => Self::HighPass,
+            LocalEffect::FrequencySeparation(_) => Self::FrequencySeparation,
             LocalEffect::HighlightsShadows(_) => Self::HighlightsShadows,
             LocalEffect::Dehaze(_) => Self::Dehaze,
             LocalEffect::Blur(_) => Self::Blur,
@@ -1318,6 +1320,7 @@ impl EffectKind {
             Self::Clarity => "明瞭度",
             Self::Texture => "テクスチャ",
             Self::HighPass => "ハイパス",
+            Self::FrequencySeparation => "周波数分離",
             Self::HighlightsShadows => "ハイライト/シャドウ",
             Self::Dehaze => "かすみ除去",
             Self::Blur => "ぼかし",
@@ -1417,6 +1420,7 @@ impl EffectKind {
             Self::AnamorphicFlare => "アナモルフフレア",
             Self::BokehSprite => "玉ボケ粒子",
             Self::LensDirt => "レンズ汚れ",
+            Self::FrequencySeparation => "周波数分離",
             Self::DiffractionStarburst => "回折スター",
             Self::WaterCaustics => "水中光網",
             Self::ParticleOverlay => "天候粒子",
@@ -1447,6 +1451,9 @@ impl EffectKind {
             }
             Self::HighPass => {
                 "中間グレーのハイパス抽出を使い、輪郭や細部をオーバーレイ合成で引き締めます。"
+            }
+            Self::FrequencySeparation => {
+                "低周波の色むらと高周波の質感を分け、塗り面を均したり細部だけを抑えたり強めたりします。"
             }
             Self::HighlightsShadows => "明るい部分と暗い部分を個別に持ち上げたり抑えたりします。",
             Self::Dehaze => "白っぽさを減らし、遠景や薄いコントラストを締めます。",
@@ -1735,6 +1742,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Clarity,
             EffectKind::Texture,
             EffectKind::HighPass,
+            EffectKind::FrequencySeparation,
             EffectKind::Sharpen,
             EffectKind::SmartSharpen,
         ],
@@ -9006,6 +9014,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 format!("ハイパス {:.0}%", params.amount * 100.0)
             }
         }
+        LocalEffect::FrequencySeparation(params) => format!(
+            "周波数分離 質感{:.0}% {:.0}px",
+            params.detail_amount * 100.0,
+            params.radius_px
+        ),
         LocalEffect::HighlightsShadows(_) => "ハイライト/シャドウ".to_string(),
         LocalEffect::Dehaze(params) => format!("かすみ除去 {:.0}%", params.amount * 100.0),
         LocalEffect::Blur(params) => format!("ぼかし {:.0}px", params.radius_px),
@@ -10972,6 +10985,86 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.contrast, 0.25..=4.0).text("抽出コントラスト"));
             changed |= contrast.changed();
             contrast.lab_hover_tip("抽出したディテールを中間グレーからどれだけ離すかです。");
+        }
+        LocalEffect::FrequencySeparation(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "塗り面なめらか") {
+                    *params = FrequencySeparationParams {
+                        radius_px: 14.0,
+                        low_smoothing: 0.24,
+                        detail_amount: 0.55,
+                        detail_contrast: 1.0,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "色むら均し") {
+                    *params = FrequencySeparationParams {
+                        radius_px: 26.0,
+                        low_smoothing: 0.42,
+                        detail_amount: 1.0,
+                        detail_contrast: 1.0,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "質感だけ抑える") {
+                    *params = FrequencySeparationParams {
+                        radius_px: 10.0,
+                        low_smoothing: 0.0,
+                        detail_amount: 0.35,
+                        detail_contrast: 1.0,
+                        strength: 0.9,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "細部くっきり") {
+                    *params = FrequencySeparationParams {
+                        radius_px: 8.0,
+                        low_smoothing: 0.0,
+                        detail_amount: 1.35,
+                        detail_contrast: 1.25,
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "低周波の色/明暗と高周波の質感を分けて再合成します。肌や塗り面のざらつき、スキャンの色むら補修に使います。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let radius = ui.add(
+                egui::Slider::new(&mut params.radius_px, 1.0..=80.0)
+                    .text("分離半径")
+                    .suffix("px"),
+            );
+            changed |= radius.changed();
+            radius.lab_hover_tip(
+                "低周波と質感を分ける大きさです。小さい値は細部、大きい値は広い色むらに効きます。",
+            );
+            let low_smoothing =
+                ui.add(egui::Slider::new(&mut params.low_smoothing, 0.0..=1.0).text("色むら均し"));
+            changed |= low_smoothing.changed();
+            low_smoothing.lab_hover_tip(
+                "低周波レイヤーをさらに均して、広めの色むらや明暗むらを目立ちにくくします。",
+            );
+            let detail_amount =
+                ui.add(egui::Slider::new(&mut params.detail_amount, 0.0..=2.0).text("質感量"));
+            changed |= detail_amount.changed();
+            detail_amount
+                .lab_hover_tip("1.0で元の質感、下げると細かい質感を抑え、上げると細部を強めます。");
+            let detail_contrast = ui.add(
+                egui::Slider::new(&mut params.detail_contrast, 0.25..=2.0).text("質感コントラスト"),
+            );
+            changed |= detail_contrast.changed();
+            detail_contrast.lab_hover_tip("抽出した質感の濃淡をどれだけ強く再合成するかです。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("周波数分離で再合成した結果へ近づける強さです。");
         }
         LocalEffect::HighlightsShadows(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -20181,6 +20274,9 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Clarity => LocalEffect::Clarity(ClarityParams::default()),
         EffectKind::Texture => LocalEffect::Texture(TextureParams::default()),
         EffectKind::HighPass => LocalEffect::HighPass(HighPassParams::default()),
+        EffectKind::FrequencySeparation => {
+            LocalEffect::FrequencySeparation(FrequencySeparationParams::default())
+        }
         EffectKind::HighlightsShadows => {
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default())
         }
@@ -22717,6 +22813,7 @@ mod tests {
             EffectKind::Clarity,
             EffectKind::Texture,
             EffectKind::HighPass,
+            EffectKind::FrequencySeparation,
             EffectKind::HighlightsShadows,
             EffectKind::Dehaze,
             EffectKind::Blur,
