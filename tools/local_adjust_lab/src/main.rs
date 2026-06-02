@@ -1829,7 +1829,11 @@ struct LocalAdjustLabApp {
     crop_create_drag: Option<CropCreateDrag>,
     add_layer_dialog_open: bool,
     add_layer_mask_kind: MaskKind,
+    change_mask_dialog_open: bool,
+    change_mask_kind: MaskKind,
+    change_mask_keep_manual_override: bool,
     effect_picker_dialog_open: bool,
+    effect_clipboard: Option<LocalEffect>,
     selective_color_pick_active: bool,
     rgb_pick_active: Option<RgbPickTarget>,
     recent_files: Vec<PathBuf>,
@@ -1915,7 +1919,11 @@ impl LocalAdjustLabApp {
             crop_create_drag: None,
             add_layer_dialog_open: false,
             add_layer_mask_kind: MaskKind::Full,
+            change_mask_dialog_open: false,
+            change_mask_kind: MaskKind::Full,
+            change_mask_keep_manual_override: true,
             effect_picker_dialog_open: false,
+            effect_clipboard: None,
             selective_color_pick_active: false,
             rgb_pick_active: None,
             recent_files,
@@ -2535,6 +2543,121 @@ impl LocalAdjustLabApp {
             }
             _ => {}
         }
+    }
+
+    fn open_change_mask_dialog(&mut self) {
+        let Some(mask_kind) = self.selected_mask_kind() else {
+            return;
+        };
+        self.change_mask_kind = mask_kind;
+        self.change_mask_keep_manual_override = true;
+        self.change_mask_dialog_open = true;
+    }
+
+    fn change_selected_layer_mask_and_auto_generate(
+        &mut self,
+        mask_kind: MaskKind,
+        keep_manual_override: bool,
+        ctx: &egui::Context,
+    ) {
+        if mask_kind == MaskKind::Subject && !subject_model_available() {
+            self.status =
+                "被写体選択には U²-Netp モデルが必要です。保存済み被写体マスクは利用できます。"
+                    .to_string();
+            return;
+        }
+        let Some((width, height)) = self.image_dims() else {
+            return;
+        };
+        let Some(current_kind) = self.selected_mask_kind() else {
+            return;
+        };
+        if current_kind == mask_kind {
+            self.change_mask_dialog_open = false;
+            self.status = format!("マスク種類はすでに「{}」です。", mask_kind.label());
+            return;
+        }
+
+        self.push_undo_snapshot();
+        if let Some(layer) = self.selected_layer_mut() {
+            replace_layer_base_mask(layer, mask_kind, width, height, keep_manual_override);
+        }
+        self.change_mask_kind = mask_kind;
+        self.change_mask_dialog_open = false;
+        self.selected_shape = None;
+        self.subject_cutout_edit_active = false;
+        self.reset_override_edit_state_for_selected_layer();
+        self.status = if keep_manual_override {
+            format!(
+                "マスク種類を「{}」に変更しました。追加/削除マスクは保持しました。",
+                mask_kind.label()
+            )
+        } else {
+            format!(
+                "マスク種類を「{}」に変更しました。追加/削除マスクはクリアしました。",
+                mask_kind.label()
+            )
+        };
+        self.mark_mask_changed();
+        match mask_kind {
+            MaskKind::Subject => self.start_subject_segmentation(ctx),
+            MaskKind::Segmentation => {
+                self.start_region_segmentation(ctx, RegionSegmentationScope::Full);
+            }
+            _ => {}
+        }
+    }
+
+    fn copy_selected_effect(&mut self) {
+        let Some(effect) = self.selected_layer_ref().map(|layer| layer.effect.clone()) else {
+            return;
+        };
+        let summary = effect_summary(&effect);
+        self.effect_clipboard = Some(effect);
+        self.status = format!("加工パラメータをコピーしました: {summary}");
+    }
+
+    fn paste_effect_to_selected_layer(&mut self) {
+        let Some(effect) = self.effect_clipboard.clone() else {
+            self.status = "コピー済みの加工パラメータがありません。".to_string();
+            return;
+        };
+        if self.selected_layer_ref().is_none() {
+            return;
+        }
+        self.push_undo_snapshot();
+        let copied_kind = EffectKind::from_effect(&effect);
+        if let Some(layer) = self.selected_layer_mut() {
+            paste_layer_effect(layer, effect);
+        }
+        self.selective_color_pick_active = false;
+        self.rgb_pick_active = None;
+        self.effect_gradient_drag_active = false;
+        self.hide_mask_preview();
+        self.status = format!("加工パラメータを貼り付けました: {}", copied_kind.label());
+        self.mark_dirty();
+    }
+
+    fn reset_selected_effect_params(&mut self) {
+        let Some(kind) = self
+            .selected_layer_ref()
+            .map(|layer| EffectKind::from_effect(&layer.effect))
+        else {
+            return;
+        };
+        if kind == EffectKind::None {
+            return;
+        }
+        self.push_undo_snapshot();
+        if let Some(layer) = self.selected_layer_mut() {
+            reset_layer_effect_params(layer);
+        }
+        self.selective_color_pick_active = false;
+        self.rgb_pick_active = None;
+        self.effect_gradient_drag_active = false;
+        self.hide_mask_preview();
+        self.status = format!("加工パラメータをリセットしました: {}", kind.label());
+        self.mark_dirty();
     }
 
     fn toggle_override_edit_panel(&mut self, target: OverrideEditTarget) {
@@ -4277,6 +4400,54 @@ impl LocalAdjustLabApp {
         });
     }
 
+    fn draw_effect_parameter_header(&mut self, ui: &mut egui::Ui) {
+        let has_layer = self.selected_layer_ref().is_some();
+        let can_paste = has_layer && self.effect_clipboard.is_some();
+        let can_reset = self
+            .selected_layer_ref()
+            .map(|layer| EffectKind::from_effect(&layer.effect) != EffectKind::None)
+            .unwrap_or(false);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("加工パラメータ")
+                    .size(14.0)
+                    .strong()
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(6.0);
+            if ui
+                .add_enabled(
+                    has_layer,
+                    egui::Button::new("コピー").min_size(egui::vec2(52.0, 24.0)),
+                )
+                .lab_hover_tip("現在の効果種類とパラメータをコピーします。")
+                .clicked()
+            {
+                self.copy_selected_effect();
+            }
+            if ui
+                .add_enabled(
+                    can_paste,
+                    egui::Button::new("ペースト").min_size(egui::vec2(62.0, 24.0)),
+                )
+                .lab_hover_tip("コピーした効果種類とパラメータを、選択中レイヤーへ貼り付けます。")
+                .clicked()
+            {
+                self.paste_effect_to_selected_layer();
+            }
+            if ui
+                .add_enabled(
+                    can_reset,
+                    egui::Button::new("リセット").min_size(egui::vec2(62.0, 24.0)),
+                )
+                .lab_hover_tip("現在の効果種類のパラメータだけを初期値へ戻します。")
+                .clicked()
+            {
+                self.reset_selected_effect_params();
+            }
+        });
+    }
+
     fn draw_save_controls(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
         let btn_w = btn_size.x;
         if ui
@@ -5412,12 +5583,22 @@ impl LocalAdjustLabApp {
             );
         }
 
-        ui.label(
-            egui::RichText::new("マスク設定")
-                .size(14.0)
-                .strong()
-                .color(Color32::WHITE),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("マスク設定")
+                    .size(14.0)
+                    .strong()
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(8.0);
+            if ui
+                .add_sized(egui::vec2(112.0, 24.0), egui::Button::new("マスク種類変更"))
+                .lab_hover_tip("加工内容を残したまま、ベースマスクの種類を変更します。")
+                .clicked()
+            {
+                self.open_change_mask_dialog();
+            }
+        });
         let dims = self.image_dims().unwrap_or((1, 1));
         let mut changed = false;
         if let Some(layer) = self.selected_layer_mut() {
@@ -5468,6 +5649,7 @@ impl LocalAdjustLabApp {
         }
 
         ui.separator();
+        self.draw_effect_parameter_header(ui);
         let dims = self.image_dims().unwrap_or((1, 1));
         let mut request_cube_lut_load = false;
         let mut request_selective_color_pick = false;
@@ -6031,51 +6213,77 @@ impl LocalAdjustLabApp {
                     .max_height(320.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for group in MASK_GROUPS {
-                            ui.label(
-                                egui::RichText::new(group.title)
-                                    .size(13.0)
-                                    .strong()
-                                    .color(Color32::WHITE),
-                            );
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                                for &kind in group.kinds {
-                                    let enabled =
-                                        kind != MaskKind::Subject || subject_model_available;
-                                    let fill = if !enabled {
-                                        Color32::from_rgba_unmultiplied(54, 54, 54, 150)
-                                    } else if kind == current_kind {
-                                        Color32::from_rgb(36, 112, 150)
-                                    } else {
-                                        Color32::from_rgba_unmultiplied(70, 70, 70, 190)
-                                    };
-                                    let tip = if enabled {
-                                        kind.description().to_string()
-                                    } else {
-                                        "被写体選択の新規生成には U²-Netp モデルが必要です。保存済みの被写体マスクは読み込んで利用できます。".to_string()
-                                    };
-                                    let response = ui
-                                        .add_enabled(
-                                            enabled,
-                                            egui::Button::new(kind.label())
-                                                .fill(fill)
-                                                .min_size(egui::vec2(156.0, 30.0)),
-                                        )
-                                        .lab_hover_tip(tip);
-                                    if response.clicked() {
-                                        add_requested = Some(kind);
-                                    }
-                                }
-                            });
-                            ui.add_space(8.0);
-                        }
+                        add_requested =
+                            draw_mask_kind_picker(ui, current_kind, subject_model_available, false);
                     });
             });
 
         self.add_layer_dialog_open = open;
         if let Some(kind) = add_requested {
             self.add_layer_with_mask_and_auto_generate(kind, ctx);
+        }
+    }
+
+    fn draw_change_mask_dialog(&mut self, ctx: &egui::Context) {
+        if !self.change_mask_dialog_open {
+            return;
+        }
+        if self.layers.is_empty() {
+            self.change_mask_dialog_open = false;
+            return;
+        }
+        let current_kind = self.selected_mask_kind().unwrap_or(self.change_mask_kind);
+        self.change_mask_kind = current_kind;
+        let mut open = self.change_mask_dialog_open;
+        let mut keep_manual_override = self.change_mask_keep_manual_override;
+        let mut selected_kind = None;
+        let subject_model_available = subject_model_available();
+        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+            .fill(Color32::from_rgba_unmultiplied(24, 24, 26, 245))
+            .stroke(egui::Stroke::new(
+                1.0,
+                Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+            ));
+        egui::Window::new("マスク種類変更")
+            .order(egui::Order::Foreground)
+            .frame(dialog_frame)
+            .default_pos(ctx.content_rect().min + egui::vec2(90.0, 60.0))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .default_height(430.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                apply_lab_dark_ui(ui);
+                ui.label(
+                    egui::RichText::new(
+                        "加工内容を残したまま、選択中レイヤーのベースマスクを置き換えます。",
+                    )
+                    .size(11.0)
+                    .color(Color32::from_gray(180)),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        selected_kind =
+                            draw_mask_kind_picker(ui, current_kind, subject_model_available, true);
+                    });
+                ui.separator();
+                ui.checkbox(
+                    &mut keep_manual_override,
+                    "追加/削除マスクを保持する",
+                )
+                .lab_hover_tip(
+                    "ONではベースマスクだけを置き換えます。OFFでは追加マスクと削除マスクもクリアします。",
+                );
+            });
+
+        self.change_mask_dialog_open = open;
+        self.change_mask_keep_manual_override = keep_manual_override;
+        if let Some(kind) = selected_kind {
+            self.change_selected_layer_mask_and_auto_generate(kind, keep_manual_override, ctx);
         }
     }
 
@@ -8380,6 +8588,7 @@ impl eframe::App for LocalAdjustLabApp {
                 self.draw_tool_panel(ctx, full_rect);
             });
         self.draw_add_layer_dialog(ctx);
+        self.draw_change_mask_dialog(ctx);
         self.draw_effect_picker_dialog(ctx);
         let app_update_ms = update_start.elapsed().as_secs_f64() * 1000.0;
         self.perf_stats.app_update_ms_total += app_update_ms;
@@ -18014,6 +18223,39 @@ fn default_mask(kind: MaskKind, width: usize, height: usize) -> LocalMask {
     }
 }
 
+fn replace_layer_base_mask(
+    layer: &mut LocalAdjustmentLayer,
+    mask_kind: MaskKind,
+    width: usize,
+    height: usize,
+    keep_manual_override: bool,
+) {
+    layer.mask = default_mask(mask_kind, width, height);
+    if !keep_manual_override {
+        layer.manual_override = ManualMaskOverride::default();
+    }
+}
+
+fn paste_layer_effect(layer: &mut LocalAdjustmentLayer, effect: LocalEffect) {
+    let current_kind = EffectKind::from_effect(&layer.effect);
+    let pasted_kind = EffectKind::from_effect(&effect);
+    layer.effect = effect;
+    if current_kind != pasted_kind {
+        let mask_application = default_mask_application_for_effect(&layer.effect);
+        layer.mask_before_effect = mask_application.before_effect;
+        layer.mask_after_effect = mask_application.after_effect;
+    }
+}
+
+fn reset_layer_effect_params(layer: &mut LocalAdjustmentLayer) -> bool {
+    let kind = EffectKind::from_effect(&layer.effect);
+    if kind == EffectKind::None {
+        return false;
+    }
+    layer.effect = default_effect(kind);
+    true
+}
+
 fn make_shape(
     tool: MaskTool,
     start: [f32; 2],
@@ -19269,6 +19511,58 @@ fn panel_toggle_button(
     } else {
         ui.add(button)
     }
+}
+
+fn draw_mask_kind_picker(
+    ui: &mut egui::Ui,
+    current_kind: MaskKind,
+    subject_model_available: bool,
+    disable_current: bool,
+) -> Option<MaskKind> {
+    let mut selected = None;
+    for group in MASK_GROUPS {
+        ui.label(
+            egui::RichText::new(group.title)
+                .size(13.0)
+                .strong()
+                .color(Color32::WHITE),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            for &kind in group.kinds {
+                let is_current = kind == current_kind;
+                let subject_enabled = kind != MaskKind::Subject || subject_model_available;
+                let enabled = subject_enabled && !(disable_current && is_current);
+                let fill = if is_current {
+                    Color32::from_rgb(36, 112, 150)
+                } else if !enabled {
+                    Color32::from_rgba_unmultiplied(54, 54, 54, 150)
+                } else {
+                    Color32::from_rgba_unmultiplied(70, 70, 70, 190)
+                };
+                let tip = if disable_current && is_current {
+                    "現在のマスク種類です。".to_string()
+                } else if subject_enabled {
+                    kind.description().to_string()
+                } else {
+                    "被写体選択の新規生成には U²-Netp モデルが必要です。保存済みの被写体マスクは読み込んで利用できます。".to_string()
+                };
+                let response = ui
+                    .add_enabled(
+                        enabled,
+                        egui::Button::new(kind.label())
+                            .fill(fill)
+                            .min_size(egui::vec2(156.0, 30.0)),
+                    )
+                    .lab_hover_tip(tip);
+                if response.clicked() {
+                    selected = Some(kind);
+                }
+            }
+        });
+        ui.add_space(8.0);
+    }
+    selected
 }
 
 fn default_effect(kind: EffectKind) -> LocalEffect {
@@ -21659,6 +21953,125 @@ mod tests {
                 MaskKind::Segmentation,
             ]
         );
+    }
+
+    #[test]
+    fn replace_layer_base_mask_keeps_effect_and_manual_override_when_requested() {
+        let mut layer = LocalAdjustmentLayer::new(
+            "tone",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams {
+                brightness: 0.25,
+                ..ToneParams::default()
+            }),
+        );
+        layer.opacity = 0.42;
+        layer.mask_inverted = true;
+        layer.manual_override.subtract = Some(RasterVectorMask::empty(2, 2));
+
+        replace_layer_base_mask(&mut layer, MaskKind::Subject, 2, 2, true);
+
+        assert!(matches!(layer.mask, LocalMask::Subject(_)));
+        assert!(layer.manual_override.subtract.is_some());
+        assert_eq!(layer.opacity, 0.42);
+        assert!(layer.mask_inverted);
+        match layer.effect {
+            LocalEffect::Tone(params) => assert_eq!(params.brightness, 0.25),
+            _ => panic!("expected tone effect"),
+        }
+    }
+
+    #[test]
+    fn replace_layer_base_mask_can_clear_manual_override() {
+        let mut layer = LocalAdjustmentLayer::new(
+            "tone",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams::default()),
+        );
+        layer.manual_override.add = Some(RasterVectorMask::empty(2, 2));
+        layer.manual_override.subtract = Some(RasterVectorMask::empty(2, 2));
+
+        replace_layer_base_mask(&mut layer, MaskKind::LinearGradient, 2, 2, false);
+
+        assert!(matches!(layer.mask, LocalMask::LinearGradient(_)));
+        assert!(layer.manual_override.is_empty());
+    }
+
+    #[test]
+    fn paste_layer_effect_preserves_mask_application_for_same_effect_kind() {
+        let mut layer = LocalAdjustmentLayer::new(
+            "tone",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams::default()),
+        );
+        layer.mask_before_effect = true;
+        layer.mask_after_effect = false;
+
+        paste_layer_effect(
+            &mut layer,
+            LocalEffect::Tone(ToneParams {
+                brightness: 0.30,
+                ..ToneParams::default()
+            }),
+        );
+
+        assert!(layer.mask_before_effect);
+        assert!(!layer.mask_after_effect);
+        match layer.effect {
+            LocalEffect::Tone(params) => assert_eq!(params.brightness, 0.30),
+            _ => panic!("expected tone effect"),
+        }
+    }
+
+    #[test]
+    fn paste_layer_effect_uses_default_mask_application_for_new_effect_kind() {
+        let mut layer = LocalAdjustmentLayer::new(
+            "tone",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams::default()),
+        );
+        layer.mask_before_effect = false;
+        layer.mask_after_effect = true;
+
+        paste_layer_effect(
+            &mut layer,
+            LocalEffect::Wind(WindParams {
+                distance_px: 24.0,
+                strength: 1.0,
+                ..WindParams::default()
+            }),
+        );
+
+        assert!(layer.mask_before_effect);
+        assert!(!layer.mask_after_effect);
+        assert!(matches!(layer.effect, LocalEffect::Wind(_)));
+    }
+
+    #[test]
+    fn reset_layer_effect_params_keeps_effect_kind_and_mask_application() {
+        let mut layer = LocalAdjustmentLayer::new(
+            "tone",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams {
+                brightness: 0.50,
+                contrast: 0.25,
+                ..ToneParams::default()
+            }),
+        );
+        layer.mask_before_effect = true;
+        layer.mask_after_effect = false;
+
+        assert!(reset_layer_effect_params(&mut layer));
+
+        assert!(layer.mask_before_effect);
+        assert!(!layer.mask_after_effect);
+        match layer.effect {
+            LocalEffect::Tone(params) => {
+                assert_eq!(params.brightness, ToneParams::default().brightness);
+                assert_eq!(params.contrast, ToneParams::default().contrast);
+            }
+            _ => panic!("expected tone effect"),
+        }
     }
 
     #[test]
