@@ -23,8 +23,9 @@ use local_adjust_core::{
     MosaicTileMode, MotionBlurParams, PosterizeParams, RadialGradientMask, RangeMask, RasterMask,
     RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
     SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
-    ThreeWayColorGradingParams, ThresholdParams, ToneCurveParams, ToneParams, VignetteParams,
-    apply_layers, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
+    ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size, evaluate_layer_mask,
+    parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -939,6 +940,7 @@ enum EffectKind {
     Dehaze,
     Blur,
     MotionBlur,
+    TiltShift,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -977,6 +979,7 @@ impl EffectKind {
             LocalEffect::Dehaze(_) => Self::Dehaze,
             LocalEffect::Blur(_) => Self::Blur,
             LocalEffect::MotionBlur(_) => Self::MotionBlur,
+            LocalEffect::TiltShift(_) => Self::TiltShift,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1015,6 +1018,7 @@ impl EffectKind {
             Self::Dehaze => "かすみ除去",
             Self::Blur => "ぼかし",
             Self::MotionBlur => "移動ぼかし",
+            Self::TiltShift => "チルトシフト",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1055,6 +1059,9 @@ impl EffectKind {
             Self::Dehaze => "白っぽさを減らし、遠景や薄いコントラストを締めます。",
             Self::Blur => "選択範囲を均一にぼかします。背景ぼかしや軽い隠しに使います。",
             Self::MotionBlur => "指定した方向へ流れるようにぼかし、動きや速度感を加えます。",
+            Self::TiltShift => {
+                "焦点帯を残して周囲をぼかし、浅い被写界深度やジオラマ風の見た目を作ります。"
+            }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
@@ -1124,6 +1131,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
         kinds: &[
             EffectKind::Blur,
             EffectKind::MotionBlur,
+            EffectKind::TiltShift,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Sharpen,
@@ -6464,6 +6472,13 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 params.distance_px, params.angle_degrees
             )
         }
+        LocalEffect::TiltShift(params) => {
+            let mode = match params.mode {
+                TiltShiftMode::Linear => "線形",
+                TiltShiftMode::Radial => "円形",
+            };
+            format!("チルトシフト {mode} {:.0}px", params.max_radius_px)
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -7735,6 +7750,130 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から移動ぼかし結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::TiltShift(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "奥ぼかし") {
+                    *params = TiltShiftParams {
+                        mode: TiltShiftMode::Linear,
+                        center: [0.5, 0.58],
+                        angle_degrees: -90.0,
+                        focus_width: 0.10,
+                        falloff: 0.34,
+                        radius: [0.32, 0.32],
+                        max_radius_px: 24.0,
+                        strength: 1.0,
+                        far_only: true,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ミニチュア") {
+                    *params = TiltShiftParams {
+                        mode: TiltShiftMode::Linear,
+                        center: [0.5, 0.52],
+                        angle_degrees: -90.0,
+                        focus_width: 0.08,
+                        falloff: 0.22,
+                        radius: [0.32, 0.32],
+                        max_radius_px: 34.0,
+                        strength: 1.0,
+                        far_only: false,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "円形") {
+                    *params = TiltShiftParams {
+                        mode: TiltShiftMode::Radial,
+                        center: [0.5, 0.5],
+                        angle_degrees: -90.0,
+                        focus_width: 0.12,
+                        falloff: 0.34,
+                        radius: [0.32, 0.32],
+                        max_radius_px: 28.0,
+                        strength: 1.0,
+                        far_only: false,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "斜め") {
+                    *params = TiltShiftParams {
+                        mode: TiltShiftMode::Linear,
+                        center: [0.5, 0.5],
+                        angle_degrees: -35.0,
+                        focus_width: 0.10,
+                        falloff: 0.28,
+                        radius: [0.32, 0.32],
+                        max_radius_px: 26.0,
+                        strength: 0.9,
+                        far_only: false,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "焦点帯または焦点円を残し、外側だけをぼかします。背景だけに使う場合は線形の奥ぼかしから試してください。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal(|ui| {
+                let linear_selected = params.mode == TiltShiftMode::Linear;
+                if ui.selectable_label(linear_selected, "線形").clicked() && !linear_selected {
+                    params.mode = TiltShiftMode::Linear;
+                    changed = true;
+                }
+                let radial_selected = params.mode == TiltShiftMode::Radial;
+                if ui.selectable_label(radial_selected, "円形").clicked() && !radial_selected {
+                    params.mode = TiltShiftMode::Radial;
+                    changed = true;
+                }
+            });
+            let center_x =
+                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
+            changed |= center_x.changed();
+            center_x.lab_hover_tip("焦点帯または焦点円の中心位置です。");
+            let center_y =
+                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
+            changed |= center_y.changed();
+            center_y.lab_hover_tip("焦点帯または焦点円の中心位置です。");
+            if params.mode == TiltShiftMode::Linear {
+                let angle = ui.add(
+                    egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                        .text("奥行き方向")
+                        .suffix("°"),
+                );
+                changed |= angle.changed();
+                angle.lab_hover_tip("ぼかしが強くなる方向です。-90°は上側を奥として扱います。");
+                let far_only = ui.checkbox(&mut params.far_only, "奥だけぼかす");
+                changed |= far_only.changed();
+                far_only.lab_hover_tip("ONにすると、焦点帯より奥側だけをぼかします。OFFでは手前と奥の両側をぼかします。");
+            } else {
+                let rx =
+                    ui.add(egui::Slider::new(&mut params.radius[0], 0.02..=1.0).text("焦点 横"));
+                changed |= rx.changed();
+                rx.lab_hover_tip("円形モードで、シャープに残す範囲の横半径です。");
+                let ry =
+                    ui.add(egui::Slider::new(&mut params.radius[1], 0.02..=1.0).text("焦点 縦"));
+                changed |= ry.changed();
+                ry.lab_hover_tip("円形モードで、シャープに残す範囲の縦半径です。");
+            }
+            let focus_width =
+                ui.add(egui::Slider::new(&mut params.focus_width, 0.0..=0.5).text("焦点幅"));
+            changed |= focus_width.changed();
+            focus_width.lab_hover_tip("線形モードで、シャープに残す帯の幅です。");
+            let falloff =
+                ui.add(egui::Slider::new(&mut params.falloff, 0.02..=1.0).text("ぼかし境界"));
+            changed |= falloff.changed();
+            falloff.lab_hover_tip("焦点範囲の外側で、ぼかしがどれだけなだらかに強くなるかです。");
+            let max_radius =
+                ui.add(egui::Slider::new(&mut params.max_radius_px, 0.0..=80.0).text("最大半径"));
+            changed |= max_radius.changed();
+            max_radius.lab_hover_tip("最もぼける場所で使うぼかし半径です。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からチルトシフト結果へどれだけ近づけるかです。");
         }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -9978,6 +10117,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Dehaze => LocalEffect::Dehaze(DehazeParams::default()),
         EffectKind::Blur => LocalEffect::Blur(BlurParams::default()),
         EffectKind::MotionBlur => LocalEffect::MotionBlur(MotionBlurParams::default()),
+        EffectKind::TiltShift => LocalEffect::TiltShift(TiltShiftParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),

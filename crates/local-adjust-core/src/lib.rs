@@ -413,6 +413,7 @@ pub enum LocalEffect {
     Dehaze(DehazeParams),
     Blur(BlurParams),
     MotionBlur(MotionBlurParams),
+    TiltShift(TiltShiftParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -718,6 +719,43 @@ impl Default for MotionBlurParams {
             distance_px: 0.0,
             angle_degrees: 0.0,
             strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TiltShiftMode {
+    #[default]
+    Linear,
+    Radial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TiltShiftParams {
+    pub mode: TiltShiftMode,
+    pub center: [f32; 2],
+    pub angle_degrees: f32,
+    pub focus_width: f32,
+    pub falloff: f32,
+    pub radius: [f32; 2],
+    pub max_radius_px: f32,
+    pub strength: f32,
+    pub far_only: bool,
+}
+
+impl Default for TiltShiftParams {
+    fn default() -> Self {
+        Self {
+            mode: TiltShiftMode::Linear,
+            center: [0.5, 0.5],
+            angle_degrees: -90.0,
+            focus_width: 0.12,
+            falloff: 0.32,
+            radius: [0.32, 0.32],
+            max_radius_px: 20.0,
+            strength: 0.0,
+            far_only: false,
         }
     }
 }
@@ -1338,6 +1376,9 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         ),
         LocalEffect::MotionBlur(params) => {
             apply_motion_blur(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::TiltShift(params) => {
+            apply_tilt_shift(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -2317,6 +2358,73 @@ fn apply_motion_blur(src: &[u8], width: usize, height: usize, params: MotionBlur
         }
     }
     out
+}
+
+fn apply_tilt_shift(src: &[u8], width: usize, height: usize, params: TiltShiftParams) -> Vec<u8> {
+    let radius = params.max_radius_px.round().clamp(0.0, 160.0) as usize;
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || radius == 0 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+
+    let blurred = box_blur_rgba(src, width, height, radius);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let weight = tilt_shift_weight(x, y, width, height, params) * strength;
+            if weight <= f32::EPSILON {
+                continue;
+            }
+            let i = (y * width + x) * 4;
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], blurred[i + c], weight);
+            }
+        }
+    }
+    out
+}
+
+fn tilt_shift_weight(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    params: TiltShiftParams,
+) -> f32 {
+    let nx = normalized_coord(x, width);
+    let ny = normalized_coord(y, height);
+    let center_x = params.center[0].clamp(0.0, 1.0);
+    let center_y = params.center[1].clamp(0.0, 1.0);
+    let falloff = params.falloff.max(0.001);
+    let distance = match params.mode {
+        TiltShiftMode::Linear => {
+            let angle = params.angle_degrees.to_radians();
+            let dir_x = angle.cos();
+            let dir_y = angle.sin();
+            let signed_depth = (nx - center_x) * dir_x + (ny - center_y) * dir_y;
+            if params.far_only {
+                signed_depth - params.focus_width.max(0.0)
+            } else {
+                signed_depth.abs() - params.focus_width.max(0.0)
+            }
+        }
+        TiltShiftMode::Radial => {
+            let rx = params.radius[0].max(0.001);
+            let ry = params.radius[1].max(0.001);
+            let dx = (nx - center_x) / rx;
+            let dy = (ny - center_y) / ry;
+            (dx * dx + dy * dy).sqrt() - 1.0
+        }
+    };
+    smoothstep(0.0, falloff, distance.max(0.0))
+}
+
+fn normalized_coord(value: usize, size: usize) -> f32 {
+    if size <= 1 {
+        0.5
+    } else {
+        value as f32 / (size - 1) as f32
+    }
 }
 
 fn apply_soft_focus(
@@ -3886,6 +3994,38 @@ mod tests {
     }
 
     #[test]
+    fn tilt_shift_keeps_focus_band_and_blurs_outside() {
+        let mut pixels = vec![0_u8; 3 * 3 * 4];
+        for px in pixels.chunks_exact_mut(4) {
+            px[3] = 11;
+        }
+        let center = (3 + 1) * 4;
+        pixels[center..center + 4].copy_from_slice(&[255, 255, 255, 77]);
+        let src = RgbaImageBuf::new(3, 3, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "tilt",
+            LocalMask::Full,
+            LocalEffect::TiltShift(TiltShiftParams {
+                mode: TiltShiftMode::Linear,
+                center: [0.5, 0.5],
+                angle_degrees: 90.0,
+                focus_width: 0.05,
+                falloff: 0.10,
+                radius: [0.3, 0.3],
+                max_radius_px: 1.0,
+                strength: 1.0,
+                far_only: false,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let top_center = 1 * 4;
+        assert!(out.pixels[top_center] > 0);
+        assert_eq!(out.pixels[center], 255);
+        assert_eq!(out.pixels[center + 3], 77);
+        assert_eq!(out.pixels[top_center + 3], 11);
+    }
+
+    #[test]
     fn shadow_lift_brightens_dark_pixel() {
         let src = solid(1, 1, [24, 24, 24, 255]);
         let layer = LocalAdjustmentLayer::new(
@@ -3936,6 +4076,7 @@ mod tests {
             LocalEffect::Dehaze(DehazeParams::default()),
             LocalEffect::Blur(BlurParams::default()),
             LocalEffect::MotionBlur(MotionBlurParams::default()),
+            LocalEffect::TiltShift(TiltShiftParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),
