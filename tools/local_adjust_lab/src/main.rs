@@ -1253,7 +1253,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
         kinds: &[EffectKind::None],
     },
     EffectGroup {
-        title: "色調・カラー",
+        title: "色調補正",
         kinds: &[
             EffectKind::Tone,
             EffectKind::ToneCurve,
@@ -1266,42 +1266,63 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ColorMixer,
             EffectKind::HighlightsShadows,
             EffectKind::Dehaze,
+            EffectKind::Equalize,
+        ],
+    },
+    EffectGroup {
+        title: "色変換・ルック",
+        kinds: &[
             EffectKind::Look,
             EffectKind::CubeLut,
+            EffectKind::GradientMap,
             EffectKind::Posterize,
             EffectKind::Threshold,
             EffectKind::Invert,
             EffectKind::Duotone,
-            EffectKind::Equalize,
-            EffectKind::GradientMap,
         ],
     },
     EffectGroup {
-        title: "ぼかし・ディテール",
+        title: "ぼかし・フォーカス",
         kinds: &[
             EffectKind::Blur,
             EffectKind::MotionBlur,
-            EffectKind::Wind,
             EffectKind::TiltShift,
             EffectKind::LensBlur,
             EffectKind::RadialBlur,
+            EffectKind::SoftFocus,
+            EffectKind::EdgeSmooth,
+            EffectKind::Median,
+        ],
+    },
+    EffectGroup {
+        title: "シャープ・ディテール",
+        kinds: &[
+            EffectKind::Clarity,
+            EffectKind::Texture,
+            EffectKind::HighPass,
+            EffectKind::Sharpen,
+            EffectKind::SmartSharpen,
+        ],
+    },
+    EffectGroup {
+        title: "変形・歪み",
+        kinds: &[
             EffectKind::WaveDistortion,
             EffectKind::PinchSpherize,
             EffectKind::Twirl,
             EffectKind::PolarCoordinates,
             EffectKind::GlassDisplacement,
             EffectKind::LensCorrection,
+        ],
+    },
+    EffectGroup {
+        title: "表現・絵画調",
+        kinds: &[
+            EffectKind::Wind,
             EffectKind::LineExtract,
             EffectKind::ArtisticMedia,
             EffectKind::BrushStroke,
-            EffectKind::SoftFocus,
-            EffectKind::Clarity,
-            EffectKind::Texture,
-            EffectKind::HighPass,
-            EffectKind::Sharpen,
-            EffectKind::SmartSharpen,
-            EffectKind::EdgeSmooth,
-            EffectKind::Median,
+            EffectKind::Halftone,
         ],
     },
     EffectGroup {
@@ -1317,7 +1338,6 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Vignette,
             EffectKind::FilmGrain,
             EffectKind::ChromaticAberration,
-            EffectKind::Halftone,
         ],
     },
 ];
@@ -14264,6 +14284,89 @@ mod tests {
                 MaskKind::Segmentation,
             ]
         );
+    }
+
+    #[test]
+    fn effect_picker_groups_are_subdivided_and_cover_every_effect() {
+        let titles: Vec<&str> = EFFECT_GROUPS.iter().map(|group| group.title).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "基本",
+                "色調補正",
+                "色変換・ルック",
+                "ぼかし・フォーカス",
+                "シャープ・ディテール",
+                "変形・歪み",
+                "表現・絵画調",
+                "隠蔽・加工",
+                "光・雰囲気",
+            ]
+        );
+
+        let grouped: Vec<EffectKind> = EFFECT_GROUPS
+            .iter()
+            .flat_map(|group| group.kinds.iter().copied())
+            .collect();
+        let expected = vec![
+            EffectKind::None,
+            EffectKind::Tone,
+            EffectKind::ToneCurve,
+            EffectKind::RgbToneCurve,
+            EffectKind::ColorBalance,
+            EffectKind::ThreeWayColorGrading,
+            EffectKind::SelectiveColor,
+            EffectKind::ChannelMixer,
+            EffectKind::Clarity,
+            EffectKind::Texture,
+            EffectKind::HighPass,
+            EffectKind::HighlightsShadows,
+            EffectKind::Dehaze,
+            EffectKind::Blur,
+            EffectKind::MotionBlur,
+            EffectKind::Wind,
+            EffectKind::TiltShift,
+            EffectKind::LensBlur,
+            EffectKind::RadialBlur,
+            EffectKind::WaveDistortion,
+            EffectKind::PinchSpherize,
+            EffectKind::Twirl,
+            EffectKind::PolarCoordinates,
+            EffectKind::GlassDisplacement,
+            EffectKind::LensCorrection,
+            EffectKind::LineExtract,
+            EffectKind::ArtisticMedia,
+            EffectKind::BrushStroke,
+            EffectKind::SoftFocus,
+            EffectKind::Mosaic,
+            EffectKind::Sharpen,
+            EffectKind::SmartSharpen,
+            EffectKind::Hsl,
+            EffectKind::ColorMixer,
+            EffectKind::Look,
+            EffectKind::CubeLut,
+            EffectKind::Posterize,
+            EffectKind::Threshold,
+            EffectKind::Invert,
+            EffectKind::Duotone,
+            EffectKind::Equalize,
+            EffectKind::GradientMap,
+            EffectKind::DiffuseGlow,
+            EffectKind::Bloom,
+            EffectKind::Vignette,
+            EffectKind::FilmGrain,
+            EffectKind::ChromaticAberration,
+            EffectKind::Halftone,
+            EffectKind::StarGlow,
+            EffectKind::EdgeSmooth,
+            EffectKind::Median,
+        ];
+
+        assert_eq!(grouped.len(), expected.len());
+        for kind in expected {
+            let count = grouped.iter().filter(|&&item| item == kind).count();
+            assert_eq!(count, 1, "effect group count for {}", kind.label());
+        }
     }
 
     #[test]

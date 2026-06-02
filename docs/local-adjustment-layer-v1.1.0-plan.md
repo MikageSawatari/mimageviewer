@@ -902,6 +902,8 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
 - Selective Color は、対象色相スライダーに加えて画像上クリックのスポイトで対象色相を設定できるようにする
 - 加工内容はプルダウンではなく、左パネルの現在効果表示 + `効果選択` ボタンで扱う。
   `効果選択` はグループ別のダイアログを開き、効果ボタンのホバーで説明を表示する。
+  グループは効果数の増加に合わせ、色調補正 / 色変換・ルック / ぼかし・フォーカス /
+  シャープ・ディテール / 変形・歪み / 表現・絵画調 / 光・雰囲気などへ細分化する。
   フィルタ数が増えても選びやすくするため、詳細方針は [local-adjust-filter-candidates.md](local-adjust-filter-candidates.md)
   の UI 方針に合わせる
 - 各効果は選択直後になるべく無加工になる default とする。実用値は「プリセット」ボタンで投入し、
