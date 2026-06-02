@@ -55,12 +55,15 @@ const BRUSH_STROKE_MAX_STAMPS_PER_FRAME: usize = 96;
 const RESULT_RENDER_DRAG_RECHECK_MS: u64 = 90;
 const MASK_PREVIEW_DRAG_INTERVAL_MS: u64 = 16;
 const MASK_PREVIEW_TILE_SIZE: usize = 256;
+const MASK_PREVIEW_BASE_ALPHA: f32 = 155.0;
+const MASK_PREVIEW_EDIT_ALPHA: u8 = 225;
 const REGION_BOUNDARY_ANIM_INTERVAL_MS: u64 = 160;
 const U2NETP_INPUT_SIZE: usize = 320;
 const MAX_UNDO_SNAPSHOTS_NORMAL: usize = 24;
 const MAX_UNDO_SNAPSHOTS_LARGE: usize = 8;
 const LARGE_UNDO_PIXEL_COUNT: usize = 2_500_000;
 const REGION_SEGMENT_MAX_LABELS: usize = 2048;
+const FILE_HISTORY_LIMIT: usize = 20;
 const LAB_TEXT_FAMILY_NAME: &str = "miv-lab-toolbar-text";
 const LAB_TEXT_Y_OFFSET: f32 = 3.5;
 const LAB_TOOLTIP_GAP: f32 = 8.0;
@@ -362,6 +365,12 @@ struct StoredLayer {
     mask_expand_px: f32,
     mask_feather_px: f32,
     effect: LocalEffect,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct LabHistory {
+    #[serde(default)]
+    recent_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1122,6 +1131,30 @@ impl EffectKind {
     }
 }
 
+struct MaskGroup {
+    title: &'static str,
+    kinds: &'static [MaskKind],
+}
+
+const MASK_GROUPS: &[MaskGroup] = &[
+    MaskGroup {
+        title: "基本",
+        kinds: &[MaskKind::Full, MaskKind::Raster],
+    },
+    MaskGroup {
+        title: "グラデーション",
+        kinds: &[MaskKind::LinearGradient, MaskKind::RadialGradient],
+    },
+    MaskGroup {
+        title: "範囲選択",
+        kinds: &[MaskKind::LumaRange, MaskKind::ColorRange],
+    },
+    MaskGroup {
+        title: "自動・領域",
+        kinds: &[MaskKind::Subject, MaskKind::Segmentation],
+    },
+];
+
 struct EffectGroup {
     title: &'static str,
     kinds: &'static [EffectKind],
@@ -1249,6 +1282,7 @@ struct LocalAdjustLabApp {
     add_layer_mask_kind: MaskKind,
     effect_picker_dialog_open: bool,
     selective_color_pick_active: bool,
+    recent_files: Vec<PathBuf>,
     status: String,
     view_zoom: f32,
     view_pan: egui::Vec2,
@@ -1266,6 +1300,7 @@ impl LocalAdjustLabApp {
     fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
         configure_lab_fonts(&cc.egui_ctx);
         let now = Instant::now();
+        let recent_files = load_recent_files();
         let mut app = Self {
             image: None,
             source_texture: None,
@@ -1324,9 +1359,10 @@ impl LocalAdjustLabApp {
             crop_drag: None,
             crop_create_drag: None,
             add_layer_dialog_open: false,
-            add_layer_mask_kind: MaskKind::Raster,
+            add_layer_mask_kind: MaskKind::Full,
             effect_picker_dialog_open: false,
             selective_color_pick_active: false,
+            recent_files,
             status: "JPEG / PNG をドロップしてください。".to_string(),
             view_zoom: 1.0,
             view_pan: egui::Vec2::ZERO,
@@ -1348,6 +1384,7 @@ impl LocalAdjustLabApp {
     fn load_path(&mut self, ctx: &egui::Context, path: &Path) {
         match load_image(path) {
             Ok(loaded) => {
+                let history_save = self.remember_recent_file(path);
                 let color_image = color_image_from_rgba(&loaded.source);
                 self.source_texture = Some(ctx.load_texture(
                     "local_adjust_source",
@@ -1394,11 +1431,72 @@ impl LocalAdjustLabApp {
                     Ok(false) => self.status = load_status,
                     Err(e) => self.status = format!("{load_status} / 設定読込失敗: {e}"),
                 }
+                if let Err(e) = history_save {
+                    self.status = format!("{} / 履歴保存失敗: {e}", self.status);
+                }
                 self.mark_dirty();
             }
             Err(e) => {
                 self.status = format!("読み込み失敗: {e}");
             }
+        }
+    }
+
+    fn remember_recent_file(&mut self, path: &Path) -> Result<(), String> {
+        push_recent_file(&mut self.recent_files, path);
+        save_recent_files(&self.recent_files)
+    }
+
+    fn draw_menu_bar(&mut self, ctx: &egui::Context) {
+        let recent_files = self.recent_files.clone();
+        let current_path = self.image.as_ref().map(|image| image.path.clone());
+        let mut path_to_load = None;
+
+        egui::TopBottomPanel::top("local_adjust_lab_menubar").show(ctx, |ui| {
+            apply_lab_dark_ui(ui);
+            egui::MenuBar::new().ui(ui, |ui| {
+                ui.menu_button("読み込み", |ui| {
+                    if ui.button("画像を開く...").clicked() {
+                        let mut dialog = rfd::FileDialog::new()
+                            .add_filter("画像", &["jpg", "jpeg", "png"])
+                            .set_title("画像を選択");
+                        if let Some(parent) = current_path.as_ref().and_then(|path| path.parent()) {
+                            dialog = dialog.set_directory(parent);
+                        }
+                        path_to_load = dialog.pick_file();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if recent_files.is_empty() {
+                        ui.add_enabled(false, egui::Button::new("履歴はありません"));
+                    } else {
+                        for path in recent_files {
+                            let is_current = current_path
+                                .as_ref()
+                                .map(|current| recent_file_key(current) == recent_file_key(&path))
+                                .unwrap_or(false);
+                            let button =
+                                egui::Button::new(history_menu_label(&path)).fill(if is_current {
+                                    Color32::from_rgb(36, 112, 150)
+                                } else {
+                                    Color32::from_rgba_unmultiplied(70, 70, 70, 190)
+                                });
+                            if ui
+                                .add_sized(egui::vec2(460.0, 24.0), button)
+                                .lab_hover_tip(path.display().to_string())
+                                .clicked()
+                            {
+                                path_to_load = Some(path);
+                                ui.close();
+                            }
+                        }
+                    }
+                });
+            });
+        });
+
+        if let Some(path) = path_to_load {
+            self.load_path(ctx, &path);
         }
     }
 
@@ -1817,6 +1915,7 @@ impl LocalAdjustLabApp {
         self.override_edit_panel = None;
         self.add_layer_mask_kind = mask_kind;
         self.add_layer_dialog_open = false;
+        self.status = format!("補正レイヤーを追加しました: {}", mask_kind.label());
         self.mark_mask_changed();
     }
 
@@ -3594,10 +3693,17 @@ impl LocalAdjustLabApp {
             .selected_layer_ref()
             .map(|layer| MaskKind::from_mask(&layer.mask))
             .unwrap_or(MaskKind::Raster);
+        if mask_kind == MaskKind::Full && self.override_edit_panel == Some(OverrideEditTarget::Add)
+        {
+            self.reset_override_edit_state_for_selected_layer();
+        }
         let editing_base_manual = mask_kind == MaskKind::Raster;
+        let editing_full_mask = mask_kind == MaskKind::Full;
         ui.label(
             egui::RichText::new(if editing_base_manual {
                 "手動マスク:"
+            } else if editing_full_mask {
+                "削除マスク:"
             } else {
                 "追加/削除マスク:"
             })
@@ -3619,22 +3725,24 @@ impl LocalAdjustLabApp {
             .unwrap_or((false, false));
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            let add_label = if has_add {
-                "追加マスクあり"
-            } else {
-                "追加マスク"
-            };
-            if panel_toggle_button(
-                ui,
-                add_label,
-                self.override_edit_panel == Some(OverrideEditTarget::Add),
-                Some(btn_size),
-                true,
-            )
-            .lab_hover_tip("ベースマスクに手動で足す2値マスクを編集します。")
-            .clicked()
-            {
-                self.toggle_override_edit_panel(OverrideEditTarget::Add);
+            if !editing_full_mask {
+                let add_label = if has_add {
+                    "追加マスクあり"
+                } else {
+                    "追加マスク"
+                };
+                if panel_toggle_button(
+                    ui,
+                    add_label,
+                    self.override_edit_panel == Some(OverrideEditTarget::Add),
+                    Some(btn_size),
+                    true,
+                )
+                .lab_hover_tip("ベースマスクに手動で足す2値マスクを編集します。")
+                .clicked()
+                {
+                    self.toggle_override_edit_panel(OverrideEditTarget::Add);
+                }
             }
             let subtract_label = if has_subtract {
                 "削除マスクあり"
@@ -3701,12 +3809,15 @@ impl LocalAdjustLabApp {
         } else {
             ui.horizontal(|ui| {
                 ui.add_space(2.0);
+                let help = if editing_full_mask {
+                    "全体マスクでは削除マスクだけを開いて除外範囲を描きます。"
+                } else {
+                    "必要なときだけ追加マスク/削除マスクを開いて手描きします。"
+                };
                 ui.label(
-                    egui::RichText::new(
-                        "必要なときだけ追加マスク/削除マスクを開いて手描きします。",
-                    )
-                    .size(10.0)
-                    .color(Color32::from_gray(170)),
+                    egui::RichText::new(help)
+                        .size(10.0)
+                        .color(Color32::from_gray(170)),
                 );
             });
         }
@@ -4827,9 +4938,8 @@ impl LocalAdjustLabApp {
             return;
         }
         let mut open = self.add_layer_dialog_open;
-        let mut selected = self.add_layer_mask_kind;
-        let mut create_requested = false;
-        let mut cancel_requested = false;
+        let current_kind = self.add_layer_mask_kind;
+        let mut add_requested = None;
         let dialog_frame = egui::Frame::window(ctx.style().as_ref())
             .fill(Color32::from_rgba_unmultiplied(24, 24, 26, 245))
             .stroke(egui::Stroke::new(
@@ -4839,54 +4949,60 @@ impl LocalAdjustLabApp {
         egui::Window::new("補正レイヤーを追加")
             .order(egui::Order::Debug)
             .frame(dialog_frame)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
             .collapsible(false)
-            .resizable(false)
-            .default_width(360.0)
+            .resizable(true)
+            .default_width(500.0)
+            .default_height(390.0)
             .open(&mut open)
             .show(ctx, |ui| {
                 apply_lab_dark_ui(ui);
-                ui.label("マスク種類を選んで追加します。追加後は種類を変えず、内容を編集します。");
+                ui.label(
+                    egui::RichText::new(
+                        "使いたいマスク種類を選んでください。クリックするとレイヤーを追加します。",
+                    )
+                    .size(11.0)
+                    .color(Color32::from_gray(180)),
+                );
                 ui.separator();
-                for kind in [
-                    MaskKind::Raster,
-                    MaskKind::LinearGradient,
-                    MaskKind::RadialGradient,
-                    MaskKind::LumaRange,
-                    MaskKind::ColorRange,
-                    MaskKind::Full,
-                    MaskKind::Subject,
-                    MaskKind::Segmentation,
-                ] {
-                    ui.radio_value(&mut selected, kind, kind.label());
-                    ui.horizontal(|ui| {
-                        ui.add_space(24.0);
-                        let color = if selected == kind {
-                            Color32::from_gray(185)
-                        } else {
-                            Color32::from_gray(145)
-                        };
-                        ui.label(
-                            egui::RichText::new(kind.description())
-                                .size(11.0)
-                                .color(color),
-                        );
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for group in MASK_GROUPS {
+                            ui.label(
+                                egui::RichText::new(group.title)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                                for &kind in group.kinds {
+                                    let fill = if kind == current_kind {
+                                        Color32::from_rgb(36, 112, 150)
+                                    } else {
+                                        Color32::from_rgba_unmultiplied(70, 70, 70, 190)
+                                    };
+                                    let response = ui
+                                        .add_sized(
+                                            egui::vec2(156.0, 30.0),
+                                            egui::Button::new(kind.label()).fill(fill),
+                                        )
+                                        .lab_hover_tip(kind.description());
+                                    if response.clicked() {
+                                        add_requested = Some(kind);
+                                    }
+                                }
+                            });
+                            ui.add_space(8.0);
+                        }
                     });
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("追加").clicked() {
-                        create_requested = true;
-                    }
-                    if ui.button("キャンセル").clicked() {
-                        cancel_requested = true;
-                    }
-                });
             });
-        self.add_layer_mask_kind = selected;
-        self.add_layer_dialog_open = open && !cancel_requested;
-        if create_requested {
-            self.add_layer_with_mask_and_auto_generate(selected, ctx);
+
+        self.add_layer_dialog_open = open;
+        if let Some(kind) = add_requested {
+            self.add_layer_with_mask_and_auto_generate(kind, ctx);
         }
     }
 
@@ -6625,6 +6741,7 @@ impl eframe::App for LocalAdjustLabApp {
             self.switch_tool(MaskTool::Select);
         }
 
+        self.draw_menu_bar(ctx);
         self.poll_segmentation(ctx);
         self.poll_lut_load(ctx);
         self.poll_render(ctx);
@@ -11556,6 +11673,16 @@ fn build_mask_tile_image(
     tile_h: usize,
 ) -> ColorImage {
     let mut pixels = Vec::with_capacity(tile_w.saturating_mul(tile_h));
+    let hide_full_base = matches!(layer.mask, LocalMask::Full);
+    let show_full_base_while_editing = hide_full_base && edit_target.is_some();
+    let show_full_result = hide_full_base
+        && edit_target.is_none()
+        && layer
+            .manual_override
+            .subtract
+            .as_ref()
+            .map(raster_vector_mask_has_content)
+            .unwrap_or(false);
     for y in tile_y..tile_y + tile_h {
         let row = y * image_width;
         for x in tile_x..tile_x + tile_w {
@@ -11568,10 +11695,18 @@ fn build_mask_tile_image(
                 .map(|manual| raster_vector_alpha_at(manual, idx, x, y) >= 0.5)
                 .unwrap_or(false);
             if editing_mask {
-                pixels.push(colors.edit(225));
+                pixels.push(colors.edit(MASK_PREVIEW_EDIT_ALPHA));
+            } else if show_full_base_while_editing || show_full_result {
+                let alpha = (mask.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0)
+                    * MASK_PREVIEW_BASE_ALPHA)
+                    .round() as u8;
+                pixels.push(colors.base(alpha));
+            } else if hide_full_base {
+                pixels.push(Color32::TRANSPARENT);
             } else {
-                let alpha =
-                    (mask.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0) * 155.0).round() as u8;
+                let alpha = (mask.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0)
+                    * MASK_PREVIEW_BASE_ALPHA)
+                    .round() as u8;
                 pixels.push(colors.base(alpha));
             }
         }
@@ -11609,12 +11744,18 @@ fn raster_vector_alpha_at(mask: &RasterVectorMask, idx: usize, x: usize, y: usiz
     alpha
 }
 
+fn raster_vector_mask_has_content(mask: &RasterVectorMask) -> bool {
+    mask.alpha.iter().any(|&alpha| alpha >= 0.5)
+        || mask.shapes.iter().any(|shape| shape.op().is_add())
+}
+
 fn can_build_mask_tiles_from_layer(
     layer: &LocalAdjustmentLayer,
     image_width: usize,
     image_height: usize,
 ) -> bool {
     let mask_matches = match &layer.mask {
+        LocalMask::Full => true,
         LocalMask::RasterVector(mask) => {
             mask.width == image_width
                 && mask.height == image_height
@@ -11627,8 +11768,10 @@ fn can_build_mask_tiles_from_layer(
         }
         _ => false,
     };
+    let manual_override_supported =
+        matches!(layer.mask, LocalMask::Full) || layer.manual_override.is_empty();
     mask_matches
-        && layer.manual_override.is_empty()
+        && manual_override_supported
         && layer.mask_expand_px.abs() < 0.5
         && layer.mask_feather_px < 0.5
 }
@@ -11644,6 +11787,40 @@ fn build_mask_tile_image_from_layer(
     colors: MaskPreviewColors,
 ) -> ColorImage {
     match &layer.mask {
+        LocalMask::Full => {
+            let show_result = layer
+                .manual_override
+                .subtract
+                .as_ref()
+                .map(raster_vector_mask_has_content)
+                .unwrap_or(false);
+            let mut pixels = Vec::with_capacity(tile_w.saturating_mul(tile_h));
+            for y in tile_y..tile_y + tile_h {
+                let row = y * image_width;
+                for x in tile_x..tile_x + tile_w {
+                    let idx = row + x;
+                    if show_result {
+                        let subtract_alpha = layer
+                            .manual_override
+                            .subtract
+                            .as_ref()
+                            .map(|manual| raster_vector_alpha_at(manual, idx, x, y))
+                            .unwrap_or(0.0)
+                            .clamp(0.0, 1.0);
+                        let mut alpha = 1.0 - subtract_alpha;
+                        if layer.mask_inverted {
+                            alpha = 1.0 - alpha;
+                        }
+                        alpha = (alpha * layer.opacity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+                        let alpha_u8 = (alpha * MASK_PREVIEW_BASE_ALPHA).round() as u8;
+                        pixels.push(colors.base(alpha_u8));
+                    } else {
+                        pixels.push(Color32::TRANSPARENT);
+                    }
+                }
+            }
+            ColorImage::new([tile_w, tile_h], pixels)
+        }
         LocalMask::RasterVector(mask) => {
             let opacity = layer.opacity.clamp(0.0, 1.0);
             let mut pixels = Vec::with_capacity(tile_w.saturating_mul(tile_h));
@@ -11668,7 +11845,7 @@ fn build_mask_tile_image_from_layer(
                         alpha = 1.0 - alpha;
                     }
                     alpha = (alpha * opacity).clamp(0.0, 1.0);
-                    let alpha_u8 = (alpha * 155.0).round() as u8;
+                    let alpha_u8 = (alpha * MASK_PREVIEW_BASE_ALPHA).round() as u8;
                     pixels.push(colors.base(alpha_u8));
                 }
             }
@@ -12325,6 +12502,84 @@ fn avg_count(total: u64, count: u64) -> f64 {
     }
 }
 
+fn load_recent_files() -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(recent_files_path()) else {
+        return Vec::new();
+    };
+    let Ok(history) = serde_json::from_str::<LabHistory>(&text) else {
+        return Vec::new();
+    };
+    let mut recent_files = Vec::new();
+    for path in history.recent_files.iter().rev() {
+        push_recent_file(&mut recent_files, path);
+    }
+    recent_files
+}
+
+fn save_recent_files(recent_files: &[PathBuf]) -> Result<(), String> {
+    let path = recent_files_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let history = LabHistory {
+        recent_files: recent_files.to_vec(),
+    };
+    let json = serde_json::to_string_pretty(&history).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())
+}
+
+fn push_recent_file(recent_files: &mut Vec<PathBuf>, path: &Path) {
+    let path = normalize_recent_path(path);
+    let key = recent_file_key(&path);
+    recent_files.retain(|existing| recent_file_key(existing) != key);
+    recent_files.insert(0, path);
+    recent_files.truncate(FILE_HISTORY_LIMIT);
+}
+
+fn normalize_recent_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+fn recent_file_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
+fn history_menu_label(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("画像");
+    let parent_name = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if parent_name.is_empty() {
+        file_name.to_string()
+    } else {
+        format!("{file_name} ({parent_name})")
+    }
+}
+
+fn recent_files_path() -> PathBuf {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return PathBuf::from(appdata)
+            .join("mimageviewer")
+            .join("local_adjust_lab")
+            .join("recent_files.json");
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("target")
+        .join("local_adjust_lab_recent_files.json")
+}
+
 fn perf_log_path() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
@@ -12546,6 +12801,59 @@ mod tests {
     }
 
     #[test]
+    fn add_layer_dialog_mask_order_starts_with_full() {
+        let ordered: Vec<MaskKind> = MASK_GROUPS
+            .iter()
+            .flat_map(|group| group.kinds.iter().copied())
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                MaskKind::Full,
+                MaskKind::Raster,
+                MaskKind::LinearGradient,
+                MaskKind::RadialGradient,
+                MaskKind::LumaRange,
+                MaskKind::ColorRange,
+                MaskKind::Subject,
+                MaskKind::Segmentation,
+            ]
+        );
+    }
+
+    #[test]
+    fn recent_files_are_deduped_and_limited_to_twenty() {
+        let mut recent_files = Vec::new();
+        for idx in 0..25 {
+            push_recent_file(
+                &mut recent_files,
+                &PathBuf::from(format!(r"C:\images\sample_{idx}.png")),
+            );
+        }
+
+        assert_eq!(recent_files.len(), FILE_HISTORY_LIMIT);
+        assert_eq!(recent_files[0], PathBuf::from(r"C:\images\sample_24.png"));
+        assert_eq!(
+            recent_files[FILE_HISTORY_LIMIT - 1],
+            PathBuf::from(r"C:\images\sample_5.png")
+        );
+
+        push_recent_file(
+            &mut recent_files,
+            &PathBuf::from(r"C:\images\sample_10.png"),
+        );
+        assert_eq!(recent_files[0], PathBuf::from(r"C:\images\sample_10.png"));
+        assert_eq!(recent_files.len(), FILE_HISTORY_LIMIT);
+        assert_eq!(
+            recent_files
+                .iter()
+                .filter(|path| *path == &PathBuf::from(r"C:\images\sample_10.png"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn selective_color_eyedropper_hue_matches_primary_colors() {
         assert!((hue_degrees_from_rgb([255, 0, 0]) - 0.0).abs() < 0.1);
         assert!((hue_degrees_from_rgb([0, 255, 0]) - 120.0).abs() < 0.1);
@@ -12635,18 +12943,37 @@ mod tests {
     }
 
     #[test]
-    fn mask_preview_hidden_override_panels_show_final_mask_only() {
+    fn full_mask_preview_without_subtract_hides_base() {
+        let layer = LocalAdjustmentLayer::new(
+            "mask",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams::default()),
+        );
+
+        let image = build_mask_tile_image(
+            &[1.0, 1.0, 1.0],
+            &layer,
+            None,
+            MaskColorPreset::PinkCyan.colors(),
+            3,
+            0,
+            0,
+            3,
+            1,
+        );
+
+        assert_eq!(image.pixels[0], Color32::TRANSPARENT);
+        assert_eq!(image.pixels[1], Color32::TRANSPARENT);
+        assert_eq!(image.pixels[2], Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn full_mask_preview_shows_result_after_subtract_override() {
         let mut layer = LocalAdjustmentLayer::new(
             "mask",
             LocalMask::Full,
             LocalEffect::Tone(ToneParams::default()),
         );
-        layer.manual_override.add = Some(RasterVectorMask {
-            width: 3,
-            height: 1,
-            alpha: vec![1.0, 0.0, 0.0],
-            shapes: Vec::new(),
-        });
         layer.manual_override.subtract = Some(RasterVectorMask {
             width: 3,
             height: 1,
@@ -12670,10 +12997,7 @@ mod tests {
             image.pixels[0],
             Color32::from_rgba_unmultiplied(255, 48, 84, 155)
         );
-        assert_eq!(
-            image.pixels[1],
-            Color32::from_rgba_unmultiplied(255, 48, 84, 0)
-        );
+        assert_eq!(image.pixels[1], Color32::TRANSPARENT);
         assert_eq!(
             image.pixels[2],
             Color32::from_rgba_unmultiplied(255, 48, 84, 78)
@@ -12681,53 +13005,7 @@ mod tests {
     }
 
     #[test]
-    fn mask_preview_add_panel_shows_base_and_active_add_mask() {
-        let mut layer = LocalAdjustmentLayer::new(
-            "mask",
-            LocalMask::Full,
-            LocalEffect::Tone(ToneParams::default()),
-        );
-        layer.manual_override.add = Some(RasterVectorMask {
-            width: 3,
-            height: 1,
-            alpha: vec![1.0, 0.0, 0.0],
-            shapes: Vec::new(),
-        });
-        layer.manual_override.subtract = Some(RasterVectorMask {
-            width: 3,
-            height: 1,
-            alpha: vec![0.0, 1.0, 0.0],
-            shapes: Vec::new(),
-        });
-
-        let image = build_mask_tile_image(
-            &[0.2, 0.8, 0.5],
-            &layer,
-            Some(OverrideEditTarget::Add),
-            MaskColorPreset::PinkCyan.colors(),
-            3,
-            0,
-            0,
-            3,
-            1,
-        );
-
-        assert_eq!(
-            image.pixels[0],
-            Color32::from_rgba_unmultiplied(64, 190, 255, 225)
-        );
-        assert_eq!(
-            image.pixels[1],
-            Color32::from_rgba_unmultiplied(255, 48, 84, 124)
-        );
-        assert_eq!(
-            image.pixels[2],
-            Color32::from_rgba_unmultiplied(255, 48, 84, 78)
-        );
-    }
-
-    #[test]
-    fn mask_preview_subtract_panel_shows_base_plus_add_and_active_subtract_mask() {
+    fn full_mask_preview_subtract_panel_shows_base_and_active_subtract_mask() {
         let mut layer = LocalAdjustmentLayer::new(
             "mask",
             LocalMask::Full,
@@ -12770,7 +13048,7 @@ mod tests {
     fn mask_preview_color_preset_changes_base_and_edit_colors() {
         let mut layer = LocalAdjustmentLayer::new(
             "mask",
-            LocalMask::Full,
+            LocalMask::LumaRange(RangeMask::default()),
             LocalEffect::Tone(ToneParams::default()),
         );
         layer.manual_override.add = Some(RasterVectorMask {
