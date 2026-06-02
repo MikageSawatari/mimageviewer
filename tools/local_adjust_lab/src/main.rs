@@ -53,7 +53,7 @@ const PANEL_BOTTOM_MARGIN: f32 = 20.0;
 const PANEL_MIN_BODY_H: f32 = 160.0;
 const EFFECT_PICKER_BUTTON_MIN_W: f32 = 146.0;
 const EFFECT_PICKER_BUTTON_MAX_W: f32 = 172.0;
-const EFFECT_PICKER_BUTTON_H: f32 = 34.0;
+const EFFECT_PICKER_BUTTON_H: f32 = 30.0;
 const ZOOM_MIN: f32 = 0.05;
 const ZOOM_MAX: f32 = 12.0;
 const NUDGE_PIXELS: f32 = 1.0;
@@ -5792,7 +5792,7 @@ impl LocalAdjustLabApp {
                             );
                             let button_width = effect_picker_button_width(ui.available_width());
                             ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 5.0);
                                 for &kind in group.kinds {
                                     let selected = kind == current_kind;
                                     let fill = if selected {
@@ -5815,7 +5815,7 @@ impl LocalAdjustLabApp {
                                     }
                                 }
                             });
-                            ui.add_space(8.0);
+                            ui.add_space(7.0);
                         }
                     });
             });
@@ -19635,6 +19635,7 @@ mod tests {
 
     #[test]
     fn effect_picker_button_width_is_bounded_and_responsive() {
+        assert!(EFFECT_PICKER_BUTTON_H <= 30.0);
         for available_width in [320.0, 520.0, 720.0, 860.0, 1200.0] {
             let width = effect_picker_button_width(available_width);
             assert!(width >= EFFECT_PICKER_BUTTON_MIN_W);
