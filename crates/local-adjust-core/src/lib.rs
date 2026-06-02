@@ -426,6 +426,7 @@ pub enum LocalEffect {
     Dehaze(DehazeParams),
     Blur(BlurParams),
     MotionBlur(MotionBlurParams),
+    Wind(WindParams),
     TiltShift(TiltShiftParams),
     LensBlur(LensBlurParams),
     RadialBlur(RadialBlurParams),
@@ -479,6 +480,7 @@ impl LocalEffect {
             Self::Dehaze(_) => "かすみ除去",
             Self::Blur(_) => "ぼかし",
             Self::MotionBlur(_) => "モーションぼかし",
+            Self::Wind(_) => "風/スピード",
             Self::TiltShift(_) => "チルトぼかし",
             Self::LensBlur(_) => "レンズぼかし",
             Self::RadialBlur(_) => "放射ぼかし",
@@ -838,6 +840,52 @@ impl Default for MotionBlurParams {
             distance_px: 0.0,
             angle_degrees: 0.0,
             strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WindDirection {
+    #[default]
+    Right,
+    Left,
+    Down,
+    Up,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WindSource {
+    #[default]
+    Bright,
+    Dark,
+    Edge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindParams {
+    pub direction: WindDirection,
+    pub source: WindSource,
+    pub distance_px: f32,
+    pub threshold: f32,
+    pub softness: f32,
+    pub turbulence: f32,
+    pub strength: f32,
+    pub seed: u32,
+}
+
+impl Default for WindParams {
+    fn default() -> Self {
+        Self {
+            direction: WindDirection::Right,
+            source: WindSource::Bright,
+            distance_px: 0.0,
+            threshold: 0.45,
+            softness: 0.16,
+            turbulence: 0.0,
+            strength: 0.0,
+            seed: 1,
         }
     }
 }
@@ -1911,6 +1959,7 @@ where
         LocalEffect::MotionBlur(params) => {
             apply_motion_blur(&image.pixels, image.width, image.height, *params)
         }
+        LocalEffect::Wind(params) => apply_wind(&image.pixels, image.width, image.height, *params),
         LocalEffect::TiltShift(params) => {
             apply_tilt_shift(&image.pixels, image.width, image.height, *params)
         }
@@ -3008,6 +3057,101 @@ fn apply_motion_blur(src: &[u8], width: usize, height: usize, params: MotionBlur
         }
     }
     out
+}
+
+fn apply_wind(src: &[u8], width: usize, height: usize, params: WindParams) -> Vec<u8> {
+    let distance = params.distance_px.clamp(0.0, 240.0);
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || distance <= 0.5 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+
+    let threshold = params.threshold.clamp(0.0, 1.0);
+    let softness = params.softness.clamp(0.001, 1.0);
+    let turbulence = params.turbulence.clamp(0.0, 1.0);
+    let (dir_x, dir_y) = wind_direction_vector(params.direction);
+    let (perp_x, perp_y) = (-dir_y, dir_x);
+    let steps = (distance.ceil() as usize).clamp(1, 240);
+    let mut signal = vec![0.0_f32; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let alpha = src[i + 3] as f32 / 255.0;
+            let luma = luma01(
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            );
+            signal[y * width + x] = match params.source {
+                WindSource::Bright => luma * alpha,
+                WindSource::Dark => (1.0 - luma) * alpha,
+                WindSource::Edge => luma_edge_strength(src, width, height, x, y) * alpha,
+            };
+        }
+    }
+
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let mut best_weight = 0.0_f32;
+            let mut best_rgb = [0_u8; 3];
+            for step in 1..=steps {
+                let step_f = step as f32;
+                let gust = if turbulence <= f32::EPSILON {
+                    0.0
+                } else {
+                    let gust_scale = (step_f / steps as f32) * turbulence * 3.0;
+                    signed_noise(
+                        (x as u32).wrapping_add(step as u32),
+                        (y as u32).wrapping_add((step as u32).rotate_left(7)),
+                        params.seed,
+                    ) * gust_scale
+                };
+                let sx = x as f32 - dir_x * step_f + perp_x * gust;
+                let sy = y as f32 - dir_y * step_f + perp_y * gust;
+                let Some(si) = wind_sample_index(width, height, sx, sy) else {
+                    continue;
+                };
+                let gate = smoothstep(threshold, (threshold + softness).min(1.0), signal[si / 4]);
+                if gate <= f32::EPSILON {
+                    continue;
+                }
+                let decay = (1.0 - step_f / (steps as f32 + 1.0)).powf(1.15);
+                let weight = gate * decay;
+                if weight > best_weight {
+                    best_weight = weight;
+                    best_rgb = [src[si], src[si + 1], src[si + 2]];
+                }
+            }
+            if best_weight <= f32::EPSILON {
+                continue;
+            }
+            let i = (y * width + x) * 4;
+            let amount = best_weight * strength;
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], best_rgb[c], amount);
+            }
+        }
+    }
+    out
+}
+
+fn wind_direction_vector(direction: WindDirection) -> (f32, f32) {
+    match direction {
+        WindDirection::Right => (1.0, 0.0),
+        WindDirection::Left => (-1.0, 0.0),
+        WindDirection::Down => (0.0, 1.0),
+        WindDirection::Up => (0.0, -1.0),
+    }
+}
+
+fn wind_sample_index(width: usize, height: usize, x: f32, y: f32) -> Option<usize> {
+    let x = x.round() as isize;
+    let y = y.round() as isize;
+    if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
+        return None;
+    }
+    Some((y as usize * width + x as usize) * 4)
 }
 
 fn apply_tilt_shift(src: &[u8], width: usize, height: usize, params: TiltShiftParams) -> Vec<u8> {
@@ -5590,6 +5734,94 @@ mod tests {
     }
 
     #[test]
+    fn wind_right_extends_bright_pixel_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                0, 0, 0, 77, 255, 255, 255, 255, 0, 0, 0, 79, 0, 0, 0, 80, 0, 0, 0, 81,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "wind",
+            LocalMask::Full,
+            LocalEffect::Wind(WindParams {
+                direction: WindDirection::Right,
+                source: WindSource::Bright,
+                distance_px: 3.0,
+                threshold: 0.5,
+                softness: 0.01,
+                turbulence: 0.0,
+                strength: 1.0,
+                seed: 1,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let trail = 2 * 4;
+        assert!(out.pixels[trail] > 96);
+        assert_eq!(out.pixels[0], 0);
+        assert_eq!(out.pixels[trail + 3], 79);
+    }
+
+    #[test]
+    fn wind_left_extends_dark_pixel() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255,
+                255, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "wind",
+            LocalMask::Full,
+            LocalEffect::Wind(WindParams {
+                direction: WindDirection::Left,
+                source: WindSource::Dark,
+                distance_px: 2.0,
+                threshold: 0.5,
+                softness: 0.01,
+                turbulence: 0.0,
+                strength: 1.0,
+                seed: 1,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let trail = 1 * 4;
+        assert!(out.pixels[trail] < 200);
+        assert_eq!(out.pixels[4 * 4], 255);
+    }
+
+    #[test]
+    fn wind_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "wind",
+            LocalMask::Full,
+            LocalEffect::Wind(WindParams {
+                direction: WindDirection::Down,
+                source: WindSource::Edge,
+                distance_px: 12.0,
+                threshold: 0.0,
+                softness: 0.001,
+                turbulence: 1.0,
+                strength: 0.0,
+                seed: 7,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn tilt_shift_keeps_focus_band_and_blurs_outside() {
         let mut pixels = vec![0_u8; 3 * 3 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -6391,6 +6623,7 @@ mod tests {
             LocalEffect::Dehaze(DehazeParams::default()),
             LocalEffect::Blur(BlurParams::default()),
             LocalEffect::MotionBlur(MotionBlurParams::default()),
+            LocalEffect::Wind(WindParams::default()),
             LocalEffect::TiltShift(TiltShiftParams::default()),
             LocalEffect::LensBlur(LensBlurParams::default()),
             LocalEffect::RadialBlur(RadialBlurParams::default()),

@@ -29,8 +29,9 @@ use local_adjust_core::{
     RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams,
     SmartSharpenParams, SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams,
     ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams,
-    VignetteParams, WaveDistortionMode, WaveDistortionParams, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
+    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -970,6 +971,7 @@ enum EffectKind {
     Dehaze,
     Blur,
     MotionBlur,
+    Wind,
     TiltShift,
     LensBlur,
     RadialBlur,
@@ -1023,6 +1025,7 @@ impl EffectKind {
             LocalEffect::Dehaze(_) => Self::Dehaze,
             LocalEffect::Blur(_) => Self::Blur,
             LocalEffect::MotionBlur(_) => Self::MotionBlur,
+            LocalEffect::Wind(_) => Self::Wind,
             LocalEffect::TiltShift(_) => Self::TiltShift,
             LocalEffect::LensBlur(_) => Self::LensBlur,
             LocalEffect::RadialBlur(_) => Self::RadialBlur,
@@ -1076,6 +1079,7 @@ impl EffectKind {
             Self::Dehaze => "かすみ除去",
             Self::Blur => "ぼかし",
             Self::MotionBlur => "移動ぼかし",
+            Self::Wind => "風/スピード",
             Self::TiltShift => "チルトシフト",
             Self::LensBlur => "レンズぼかし",
             Self::RadialBlur => "放射/回転ぼかし",
@@ -1135,6 +1139,9 @@ impl EffectKind {
             Self::Dehaze => "白っぽさを減らし、遠景や薄いコントラストを締めます。",
             Self::Blur => "選択範囲を均一にぼかします。背景ぼかしや軽い隠しに使います。",
             Self::MotionBlur => "指定した方向へ流れるようにぼかし、動きや速度感を加えます。",
+            Self::Wind => {
+                "明部・暗部・輪郭を片方向へ引きずり、風やスピード感のある流線を作ります。"
+            }
             Self::TiltShift => {
                 "焦点帯を残して周囲をぼかし、浅い被写界深度やジオラマ風の見た目を作ります。"
             }
@@ -1263,6 +1270,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
         kinds: &[
             EffectKind::Blur,
             EffectKind::MotionBlur,
+            EffectKind::Wind,
             EffectKind::TiltShift,
             EffectKind::LensBlur,
             EffectKind::RadialBlur,
@@ -7153,6 +7161,15 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 params.distance_px, params.angle_degrees
             )
         }
+        LocalEffect::Wind(params) => {
+            let direction = match params.direction {
+                WindDirection::Right => "右へ",
+                WindDirection::Left => "左へ",
+                WindDirection::Down => "下へ",
+                WindDirection::Up => "上へ",
+            };
+            format!("風 {direction} {:.0}px", params.distance_px)
+        }
         LocalEffect::TiltShift(params) => {
             let mode = match params.mode {
                 TiltShiftMode::Linear => "線形",
@@ -8596,6 +8613,136 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から移動ぼかし結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::Wind(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "右へ") {
+                    *params = WindParams {
+                        direction: WindDirection::Right,
+                        source: WindSource::Bright,
+                        distance_px: 34.0,
+                        threshold: 0.42,
+                        softness: 0.16,
+                        turbulence: 0.08,
+                        strength: 0.85,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "左へ") {
+                    *params = WindParams {
+                        direction: WindDirection::Left,
+                        source: WindSource::Bright,
+                        distance_px: 34.0,
+                        threshold: 0.42,
+                        softness: 0.16,
+                        turbulence: 0.08,
+                        strength: 0.85,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強風") {
+                    *params = WindParams {
+                        direction: WindDirection::Right,
+                        source: WindSource::Edge,
+                        distance_px: 62.0,
+                        threshold: 0.18,
+                        softness: 0.14,
+                        turbulence: 0.22,
+                        strength: 0.95,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "暗線") {
+                    *params = WindParams {
+                        direction: WindDirection::Right,
+                        source: WindSource::Dark,
+                        distance_px: 42.0,
+                        threshold: 0.46,
+                        softness: 0.12,
+                        turbulence: 0.04,
+                        strength: 0.8,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "指定した起点を片方向へ引きずります。明部は光の尾、暗部は漫画的な暗線、輪郭は速度感の強い流線に向いています。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let right = params.direction == WindDirection::Right;
+                if ui.selectable_label(right, "右へ").clicked() && !right {
+                    params.direction = WindDirection::Right;
+                    changed = true;
+                }
+                let left = params.direction == WindDirection::Left;
+                if ui.selectable_label(left, "左へ").clicked() && !left {
+                    params.direction = WindDirection::Left;
+                    changed = true;
+                }
+                let down = params.direction == WindDirection::Down;
+                if ui.selectable_label(down, "下へ").clicked() && !down {
+                    params.direction = WindDirection::Down;
+                    changed = true;
+                }
+                let up = params.direction == WindDirection::Up;
+                if ui.selectable_label(up, "上へ").clicked() && !up {
+                    params.direction = WindDirection::Up;
+                    changed = true;
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                let bright = params.source == WindSource::Bright;
+                if ui.selectable_label(bright, "明部").clicked() && !bright {
+                    params.source = WindSource::Bright;
+                    changed = true;
+                }
+                let dark = params.source == WindSource::Dark;
+                if ui.selectable_label(dark, "暗部").clicked() && !dark {
+                    params.source = WindSource::Dark;
+                    changed = true;
+                }
+                let edge = params.source == WindSource::Edge;
+                if ui.selectable_label(edge, "輪郭").clicked() && !edge {
+                    params.source = WindSource::Edge;
+                    changed = true;
+                }
+            });
+            let distance = ui.add(
+                egui::Slider::new(&mut params.distance_px, 0.0..=160.0)
+                    .text("距離")
+                    .suffix("px"),
+            );
+            changed |= distance.changed();
+            distance.lab_hover_tip("流線を伸ばす長さです。");
+            let threshold =
+                ui.add(egui::Slider::new(&mut params.threshold, 0.0..=1.0).text("しきい値"));
+            changed |= threshold.changed();
+            threshold.lab_hover_tip("流線の起点として拾う明るさ・暗さ・輪郭の強さです。");
+            let softness =
+                ui.add(egui::Slider::new(&mut params.softness, 0.001..=0.5).text("柔らかさ"));
+            changed |= softness.changed();
+            softness.lab_hover_tip("しきい値付近の起点をどれだけなだらかに拾うかです。");
+            let turbulence =
+                ui.add(egui::Slider::new(&mut params.turbulence, 0.0..=1.0).text("乱れ"));
+            changed |= turbulence.changed();
+            turbulence.lab_hover_tip("流線の横揺れです。上げるほど風のムラが出ます。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から風/スピード結果へどれだけ近づけるかです。");
+            let mut seed = params.seed as i32;
+            let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
+            changed |= seed_response.changed();
+            seed_response.lab_hover_tip("乱れのパターンを変えます。");
+            params.seed = seed.max(0) as u32;
         }
         LocalEffect::TiltShift(params) => {
             if !params.range_initialized && !params.mode_selected {
@@ -12035,6 +12182,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Dehaze => LocalEffect::Dehaze(DehazeParams::default()),
         EffectKind::Blur => LocalEffect::Blur(BlurParams::default()),
         EffectKind::MotionBlur => LocalEffect::MotionBlur(MotionBlurParams::default()),
+        EffectKind::Wind => LocalEffect::Wind(WindParams::default()),
         EffectKind::TiltShift => LocalEffect::TiltShift(TiltShiftParams::default()),
         EffectKind::LensBlur => LocalEffect::LensBlur(LensBlurParams::default()),
         EffectKind::RadialBlur => LocalEffect::RadialBlur(RadialBlurParams::default()),
