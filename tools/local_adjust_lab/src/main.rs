@@ -1730,6 +1730,10 @@ impl LocalAdjustLabApp {
         self.show_mask = true;
     }
 
+    fn hide_mask_preview(&mut self) {
+        self.show_mask = false;
+    }
+
     fn mark_mask_changed(&mut self) {
         self.reveal_mask_preview();
         self.mark_dirty();
@@ -3809,7 +3813,7 @@ impl LocalAdjustLabApp {
                 egui::RichText::new(
                     "ホイール/Ctrl+ホイール:ズーム  Space+ドラッグ/中ボタン:パン\n\
                      Q:元画像  W:マスク表示\n\
-                     Ctrl:元画像を一時表示  Alt:マスク一時非表示  Shift:ルーペ\n\
+                     Ctrl:元画像を一時表示  Alt:マスク表示を一時反転  Shift:ルーペ\n\
                      境界筆[A]:境界で止めながら近い色を塗る  Ctrl中は境界表示+通常筆\n\
                      隙間補完[G]:細い未塗り部分を補完\n\
                      切り取り:黄色枠/ハンドルをドラッグ、保存時に最後段で切り出し\n\
@@ -4174,7 +4178,8 @@ impl LocalAdjustLabApp {
         let (ctrl_down, alt_down, shift_down) =
             ui.input(|i| (i.modifiers.ctrl, i.modifiers.alt, i.modifiers.shift));
         let source_preview_active = adjust_panel_active && (self.show_source || ctrl_down);
-        let mask_preview_active = adjust_panel_active && self.show_mask && !alt_down;
+        let mask_preview_active =
+            mask_preview_active(adjust_panel_active, self.show_mask, alt_down);
         let active_texture_id = if source_preview_active {
             source_texture.id()
         } else {
@@ -4874,6 +4879,7 @@ impl LocalAdjustLabApp {
             request_rgb_pick = response.start_rgb_pick;
             request_rgb_pick_cancel = response.cancel_rgb_pick;
             if response.changed {
+                self.hide_mask_preview();
                 self.mark_dirty();
             }
         }
@@ -16055,6 +16061,10 @@ fn screen_to_norm(rect: Rect, p: Pos2) -> [f32; 2] {
     ]
 }
 
+fn mask_preview_active(adjust_panel_active: bool, show_mask: bool, alt_down: bool) -> bool {
+    adjust_panel_active && (show_mask != alt_down)
+}
+
 #[derive(Clone, Copy)]
 struct GradientHandleVisuals {
     stroke: egui::Stroke,
@@ -16493,6 +16503,16 @@ mod tests {
         assert!(visuals.panel_fill.r() < 64);
         assert!(visuals.extreme_bg_color.r() < 32);
         assert!(visuals.widgets.inactive.bg_fill.r() < 96);
+    }
+
+    #[test]
+    fn alt_inverts_mask_preview_visibility() {
+        assert!(mask_preview_active(true, true, false));
+        assert!(!mask_preview_active(true, true, true));
+        assert!(!mask_preview_active(true, false, false));
+        assert!(mask_preview_active(true, false, true));
+        assert!(!mask_preview_active(false, true, false));
+        assert!(!mask_preview_active(false, false, true));
     }
 
     #[test]

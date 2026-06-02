@@ -35,7 +35,7 @@ the window.
   - Ctrl + mouse wheel: zoom around the pointer
   - Mouse wheel: zoom around the pointer
   - Ctrl while hovering the canvas: temporarily show the source image
-  - Alt while hovering the canvas: temporarily hide the mask preview
+  - Alt while hovering the canvas: temporarily invert the mask preview
   - Shift while hovering the canvas: show a loupe around the pointer
   - Zoom can go below fit-to-window, which is useful when editing final-stage
     crop handles near the image edge.
@@ -82,6 +82,9 @@ the window.
     editing Subtract Mask, base + add uses the base color and the subtract mask
     uses the edit color.
   - Creating or editing a mask automatically turns the mask preview on.
+  - Editing effect parameters automatically turns the mask preview off so the
+    result is easier to inspect. Alt temporarily inverts the current mask
+    preview state.
   - Duplicate a layer when reusing the same mask with a different effect.
 - Effects:
   - Tone
