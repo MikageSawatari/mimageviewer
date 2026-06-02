@@ -30,11 +30,11 @@ use local_adjust_core::{
     PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
     RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
     RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams,
-    SmartSharpenParams, SoftFocusParams, SolarizeParams, StarGlowParams, TextureParams,
-    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
-    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
-    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
-    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    SmartSharpenParams, SoftFocusParams, SolarizeParams, StarGlowParams, SubjectMask,
+    SubjectMaskRefinement, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams,
+    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -414,6 +414,10 @@ struct StoredSoftMask {
     width: usize,
     height: usize,
     alpha_u8_deflate_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_alpha_u8_deflate_b64: Option<String>,
+    #[serde(default)]
+    refinement: SubjectMaskRefinement,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1464,9 +1468,7 @@ struct LocalAdjustLabApp {
     edge_snap_radius: f32,
     region_color_tolerance: f32,
     region_min_area: usize,
-    subject_cutout_threshold: f32,
-    subject_cutout_expand_px: i32,
-    subject_cutout_feather_px: i32,
+    subject_cutout_edit_active: bool,
     line_width: f32,
     lasso_points: Vec<[f32; 2]>,
     shape_drag_start: Option<[f32; 2]>,
@@ -1549,9 +1551,7 @@ impl LocalAdjustLabApp {
             edge_snap_radius: 16.0,
             region_color_tolerance: 42.0,
             region_min_area: 64,
-            subject_cutout_threshold: 0.52,
-            subject_cutout_expand_px: 0,
-            subject_cutout_feather_px: 1,
+            subject_cutout_edit_active: false,
             line_width: 28.0,
             lasso_points: Vec::new(),
             shape_drag_start: None,
@@ -1617,6 +1617,7 @@ impl LocalAdjustLabApp {
                 self.segmentation_pending = None;
                 self.lut_load_pending = None;
                 self.image = Some(loaded);
+                self.subject_cutout_edit_active = false;
                 self.undo_stack.clear();
                 self.redo_stack.clear();
                 self.view_zoom = 1.0;
@@ -1795,6 +1796,7 @@ impl LocalAdjustLabApp {
             }
             self.layers = layers;
             self.selected_layer = self.selected_layer.min(self.layers.len().saturating_sub(1));
+            self.subject_cutout_edit_active = false;
             self.shape_drag = None;
             self.reset_override_edit_state_for_selected_layer();
             self.mark_dirty();
@@ -1811,6 +1813,7 @@ impl LocalAdjustLabApp {
             }
             self.layers = layers;
             self.selected_layer = self.selected_layer.min(self.layers.len().saturating_sub(1));
+            self.subject_cutout_edit_active = false;
             self.shape_drag = None;
             self.reset_override_edit_state_for_selected_layer();
             self.mark_dirty();
@@ -2418,7 +2421,7 @@ impl LocalAdjustLabApp {
                 let status = match generated {
                     GeneratedMask::Subject(mask) => {
                         if let Some(layer) = self.layers.get_mut(layer_idx) {
-                            layer.mask = LocalMask::Subject(mask);
+                            layer.mask = LocalMask::Subject(SubjectMask::from_raster(mask));
                         }
                         format!("被写体マスク生成完了: {elapsed_ms:.0}ms")
                     }
@@ -2679,7 +2682,7 @@ impl LocalAdjustLabApp {
                     && mask.height == h
                     && mask.alpha.iter().any(|&alpha| alpha > 0.02) =>
             {
-                Some(mask.clone())
+                Some(mask.current_raster_mask())
             }
             _ => None,
         })
@@ -4949,7 +4952,9 @@ impl LocalAdjustLabApp {
                 self.mark_mask_changed();
             }
         });
-        if let Some(stats) = self.selected_subject_mask_stats() {
+        if let Some((stats, mut refinement, refinement_enabled)) =
+            self.selected_subject_cutout_state()
+        {
             ui.separator();
             ui.label(
                 egui::RichText::new("切り抜き向け整形")
@@ -4957,47 +4962,100 @@ impl LocalAdjustLabApp {
                     .strong()
                     .color(Color32::from_gray(210)),
             );
+            let mut restore_source = false;
+            let mut apply_refinement = false;
+            let mut push_undo = false;
             ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "元マット") {
+                    restore_source = true;
+                    push_undo = true;
+                }
                 if preset_button(ui, "標準") {
-                    self.subject_cutout_threshold = 0.52;
-                    self.subject_cutout_expand_px = 0;
-                    self.subject_cutout_feather_px = 1;
+                    refinement = SubjectMaskRefinement {
+                        enabled: true,
+                        threshold: 0.52,
+                        expand_px: 0,
+                        feather_px: 1,
+                    };
+                    apply_refinement = true;
+                    push_undo = true;
                 }
                 if preset_button(ui, "硬め") {
-                    self.subject_cutout_threshold = 0.58;
-                    self.subject_cutout_expand_px = -1;
-                    self.subject_cutout_feather_px = 0;
+                    refinement = SubjectMaskRefinement {
+                        enabled: true,
+                        threshold: 0.58,
+                        expand_px: -1,
+                        feather_px: 0,
+                    };
+                    apply_refinement = true;
+                    push_undo = true;
                 }
                 if preset_button(ui, "柔らかめ") {
-                    self.subject_cutout_threshold = 0.45;
-                    self.subject_cutout_expand_px = 0;
-                    self.subject_cutout_feather_px = 2;
+                    refinement = SubjectMaskRefinement {
+                        enabled: true,
+                        threshold: 0.45,
+                        expand_px: 0,
+                        feather_px: 2,
+                    };
+                    apply_refinement = true;
+                    push_undo = true;
                 }
             });
-            let threshold = ui.add(
-                egui::Slider::new(&mut self.subject_cutout_threshold, 0.05..=0.95).text("しきい値"),
-            );
+            let threshold =
+                ui.add(egui::Slider::new(&mut refinement.threshold, 0.05..=0.95).text("しきい値"));
+            let threshold_started = threshold.drag_started();
+            let threshold_changed = threshold.changed();
+            let threshold_stopped = threshold.drag_stopped();
             threshold.lab_hover_tip(
                 "この値以上を被写体として残します。上げるほど背景側の半透明が減ります。",
             );
-            let expand = ui.add(
-                egui::Slider::new(&mut self.subject_cutout_expand_px, -4..=4).text("収縮/拡張"),
-            );
+            let expand =
+                ui.add(egui::Slider::new(&mut refinement.expand_px, -4..=4).text("収縮/拡張"));
+            let expand_started = expand.drag_started();
+            let expand_changed = expand.changed();
+            let expand_stopped = expand.drag_stopped();
             expand.lab_hover_tip(
                 "マイナスで少し内側へ縮め、プラスで外側へ広げます。背景のにじみがある時は -1 が効きます。",
             );
-            let feather = ui.add(
-                egui::Slider::new(&mut self.subject_cutout_feather_px, 0..=8).text("境界なめらか"),
-            );
+            let feather =
+                ui.add(egui::Slider::new(&mut refinement.feather_px, 0..=8).text("境界なめらか"));
+            let feather_started = feather.drag_started();
+            let feather_changed = feather.changed();
+            let feather_stopped = feather.drag_stopped();
             feather.lab_hover_tip(
                 "2値化後の境界だけをなじませます。0は完全な2値、1〜2は切り抜き向けの軽い境界です。",
             );
-            if ui.button("切り抜き向けに整形").clicked() {
-                self.apply_subject_cutout_refinement();
+            let slider_started = threshold_started || expand_started || feather_started;
+            let slider_changed = threshold_changed || expand_changed || feather_changed;
+            let slider_stopped = threshold_stopped || expand_stopped || feather_stopped;
+            if slider_started && !self.subject_cutout_edit_active {
+                self.subject_cutout_edit_active = true;
+                push_undo = true;
             }
+            if slider_changed {
+                refinement.enabled = true;
+                apply_refinement = true;
+                if !self.subject_cutout_edit_active {
+                    self.subject_cutout_edit_active = true;
+                    push_undo = true;
+                }
+            }
+            if restore_source {
+                self.restore_subject_source_mask(push_undo);
+            } else if apply_refinement {
+                self.apply_subject_cutout_refinement(refinement, push_undo);
+            }
+            if slider_stopped {
+                self.subject_cutout_edit_active = false;
+            }
+            let mode_label = if refinement_enabled {
+                "整形済み"
+            } else {
+                "元マット"
+            };
             ui.label(
                 egui::RichText::new(format!(
-                    "前景 {:.1}% / 半透明 {:.1}%",
+                    "{mode_label} / 前景 {:.1}% / 半透明 {:.1}%",
                     stats.foreground_percent, stats.soft_percent
                 ))
                 .size(10.0)
@@ -5517,7 +5575,7 @@ impl LocalAdjustLabApp {
                 LocalEffect::ColorOverlay(params) => Some(params.shape),
                 _ => None,
             })
-            .filter(|shape| *shape != ColorOverlayShape::Solid)
+            .filter(|shape| matches!(shape, ColorOverlayShape::Linear | ColorOverlayShape::Radial))
     }
 
     fn reset_selected_effect_gradient_geometry(&mut self) -> bool {
@@ -5547,15 +5605,21 @@ impl LocalAdjustLabApp {
         }
     }
 
-    fn selected_subject_mask_stats(&self) -> Option<SubjectMaskStats> {
+    fn selected_subject_cutout_state(
+        &self,
+    ) -> Option<(SubjectMaskStats, SubjectMaskRefinement, bool)> {
         let layer = self.selected_layer_ref()?;
         let LocalMask::Subject(mask) = &layer.mask else {
             return None;
         };
-        Some(subject_mask_stats(mask))
+        Some((
+            subject_mask_stats(mask),
+            mask.refinement,
+            mask.refinement.enabled,
+        ))
     }
 
-    fn apply_subject_cutout_refinement(&mut self) {
+    fn restore_subject_source_mask(&mut self, push_undo: bool) {
         let layer_idx = self.selected_layer;
         if !matches!(
             self.layers.get(layer_idx).map(|layer| &layer.mask),
@@ -5564,21 +5628,68 @@ impl LocalAdjustLabApp {
             self.status = "被写体選択レイヤーを選択してください。".to_string();
             return;
         }
-        let threshold = self.subject_cutout_threshold;
-        let expand_px = self.subject_cutout_expand_px;
-        let feather_px = self.subject_cutout_feather_px.max(0) as usize;
-        self.push_undo_snapshot();
+        if push_undo {
+            self.push_undo_snapshot();
+        }
         let Some(layer) = self.layers.get_mut(layer_idx) else {
             return;
         };
         let LocalMask::Subject(mask) = &mut layer.mask else {
             return;
         };
-        let alpha = subject_cutout_refined_alpha(mask, threshold, expand_px, feather_px);
-        mask.alpha = alpha;
+        let source = mask.source_alpha.as_ref().unwrap_or(&mask.alpha).clone();
+        mask.alpha = source;
+        mask.refinement.enabled = false;
         let stats = subject_mask_stats(mask);
         self.status = format!(
-            "被写体マスクを切り抜き向けに整形しました。前景 {:.1}% / 半透明 {:.1}%",
+            "被写体マスクを元マットに戻しました。前景 {:.1}% / 半透明 {:.1}%",
+            stats.foreground_percent, stats.soft_percent
+        );
+        self.mark_mask_changed();
+    }
+
+    fn apply_subject_cutout_refinement(
+        &mut self,
+        refinement: SubjectMaskRefinement,
+        push_undo: bool,
+    ) {
+        let layer_idx = self.selected_layer;
+        if !matches!(
+            self.layers.get(layer_idx).map(|layer| &layer.mask),
+            Some(LocalMask::Subject(_))
+        ) {
+            self.status = "被写体選択レイヤーを選択してください。".to_string();
+            return;
+        }
+        if push_undo {
+            self.push_undo_snapshot();
+        }
+        let Some(layer) = self.layers.get_mut(layer_idx) else {
+            return;
+        };
+        let LocalMask::Subject(mask) = &mut layer.mask else {
+            return;
+        };
+        if mask.source_alpha.is_none() {
+            mask.set_source_from_current();
+        }
+        let source = mask.source_raster_mask();
+        let alpha = subject_cutout_refined_alpha(
+            &source,
+            refinement.threshold,
+            refinement.expand_px,
+            refinement.feather_px.max(0) as usize,
+        );
+        mask.alpha = alpha;
+        mask.refinement = SubjectMaskRefinement {
+            enabled: true,
+            threshold: refinement.threshold,
+            expand_px: refinement.expand_px,
+            feather_px: refinement.feather_px.max(0),
+        };
+        let stats = subject_mask_stats(mask);
+        self.status = format!(
+            "被写体マスクを元マットから再整形しました。前景 {:.1}% / 半透明 {:.1}%",
             stats.foreground_percent, stats.soft_percent
         );
         self.mark_mask_changed();
@@ -7735,11 +7846,17 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 gradient_map_preset_label(params.preset)
             )
         }
-        LocalEffect::ColorFill(params) => format!(
-            "塗りつぶし {} {:.0}%",
-            color_overlay_shape_label(params.shape),
-            params.opacity * 100.0
-        ),
+        LocalEffect::ColorFill(params) => {
+            if params.shape == ColorOverlayShape::Unselected {
+                "塗りつぶし 選択してください".to_string()
+            } else {
+                format!(
+                    "塗りつぶし {} {:.0}%",
+                    color_overlay_shape_label(params.shape),
+                    params.opacity * 100.0
+                )
+            }
+        }
         LocalEffect::ColorOverlay(params) => format!(
             "塗り {} {:.0}%",
             color_overlay_blend_mode_label(params.blend_mode),
@@ -7854,6 +7971,7 @@ fn gradient_map_preset_label(preset: GradientMapPreset) -> &'static str {
 
 fn color_overlay_shape_label(shape: ColorOverlayShape) -> &'static str {
     match shape {
+        ColorOverlayShape::Unselected => "選択してください",
         ColorOverlayShape::Solid => "単色",
         ColorOverlayShape::Linear => "線形グラデーション",
         ColorOverlayShape::Radial => "円形グラデーション",
@@ -12019,6 +12137,7 @@ fn draw_effect_params(
                 color_overlay_shape_label(params.shape),
                 |ui| {
                     for shape in [
+                        ColorOverlayShape::Unselected,
                         ColorOverlayShape::Solid,
                         ColorOverlayShape::Linear,
                         ColorOverlayShape::Radial,
@@ -12031,7 +12150,12 @@ fn draw_effect_params(
                     }
                 },
             );
-            changed |= params.shape != before_shape;
+            if params.shape != before_shape {
+                if params.shape != ColorOverlayShape::Unselected && params.opacity <= f32::EPSILON {
+                    params.opacity = 1.0;
+                }
+                changed = true;
+            }
             ui.label(
                 egui::RichText::new(
                     "マスク範囲の元画像RGBを、指定した色またはグラデーション色へ置き換えます。被写体切り抜きの背景作成や確認用に向きます。",
@@ -12039,99 +12163,104 @@ fn draw_effect_params(
                 .size(10.0)
                 .color(Color32::from_gray(170)),
             );
-            let color_label = if params.shape == ColorOverlayShape::Solid {
-                "塗り色"
-            } else {
-                "開始色"
-            };
-            merge_rgb_color_response(
-                draw_rgb_color_control(
-                    ui,
-                    color_label,
-                    &mut params.start_rgb,
-                    RgbPickTarget::ColorFillStart,
-                    rgb_pick_active,
-                ),
-                &mut changed,
-                &mut start_rgb_pick,
-                &mut cancel_rgb_pick,
-            );
-            if params.shape != ColorOverlayShape::Solid {
-                let middle = ui.checkbox(&mut params.middle_enabled, "中間色を使う");
-                changed |= middle.changed();
-                middle.lab_hover_tip(
-                    "ONにすると、開始色・中間色・終了色の3色グラデーションになります。",
-                );
-                if params.middle_enabled {
-                    merge_rgb_color_response(
-                        draw_rgb_color_control(
-                            ui,
-                            "中間色",
-                            &mut params.middle_rgb,
-                            RgbPickTarget::ColorFillMiddle,
-                            rgb_pick_active,
-                        ),
-                        &mut changed,
-                        &mut start_rgb_pick,
-                        &mut cancel_rgb_pick,
-                    );
-                    let midpoint = ui
-                        .add(egui::Slider::new(&mut params.midpoint, 0.01..=0.99).text("中間位置"));
-                    changed |= midpoint.changed();
-                    midpoint.lab_hover_tip("グラデーション内で中間色が出る位置です。");
-                }
+            if params.shape != ColorOverlayShape::Unselected {
+                let color_label = if params.shape == ColorOverlayShape::Solid {
+                    "塗り色"
+                } else {
+                    "開始色"
+                };
                 merge_rgb_color_response(
                     draw_rgb_color_control(
                         ui,
-                        "終了色",
-                        &mut params.end_rgb,
-                        RgbPickTarget::ColorFillEnd,
+                        color_label,
+                        &mut params.start_rgb,
+                        RgbPickTarget::ColorFillStart,
                         rgb_pick_active,
                     ),
                     &mut changed,
                     &mut start_rgb_pick,
                     &mut cancel_rgb_pick,
                 );
-            }
-            let opacity =
-                ui.add(egui::Slider::new(&mut params.opacity, 0.0..=1.0).text("不透明度"));
-            changed |= opacity.changed();
-            opacity.lab_hover_tip("元画像から塗りつぶし色へどれだけ置き換えるかです。");
-            if params.shape == ColorOverlayShape::Linear {
-                let angle = ui.add(
-                    egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
-                        .text("角度")
-                        .suffix("°"),
-                );
-                if angle.changed() {
-                    params.linear_points_enabled = false;
-                    changed = true;
+                if params.shape != ColorOverlayShape::Solid {
+                    let middle = ui.checkbox(&mut params.middle_enabled, "中間色を使う");
+                    changed |= middle.changed();
+                    middle.lab_hover_tip(
+                        "ONにすると、開始色・中間色・終了色の3色グラデーションになります。",
+                    );
+                    if params.middle_enabled {
+                        merge_rgb_color_response(
+                            draw_rgb_color_control(
+                                ui,
+                                "中間色",
+                                &mut params.middle_rgb,
+                                RgbPickTarget::ColorFillMiddle,
+                                rgb_pick_active,
+                            ),
+                            &mut changed,
+                            &mut start_rgb_pick,
+                            &mut cancel_rgb_pick,
+                        );
+                        let midpoint = ui.add(
+                            egui::Slider::new(&mut params.midpoint, 0.01..=0.99).text("中間位置"),
+                        );
+                        changed |= midpoint.changed();
+                        midpoint.lab_hover_tip("グラデーション内で中間色が出る位置です。");
+                    }
+                    merge_rgb_color_response(
+                        draw_rgb_color_control(
+                            ui,
+                            "終了色",
+                            &mut params.end_rgb,
+                            RgbPickTarget::ColorFillEnd,
+                            rgb_pick_active,
+                        ),
+                        &mut changed,
+                        &mut start_rgb_pick,
+                        &mut cancel_rgb_pick,
+                    );
                 }
-                angle.lab_hover_tip(
-                    "線形グラデーションの方向です。0°で左から右へ色が変わります。画像上をドラッグすると開始点と終了点も設定できます。",
-                );
-            }
-            if params.shape == ColorOverlayShape::Radial {
-                let center_x =
-                    ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
-                changed |= center_x.changed();
-                center_x.lab_hover_tip("円形グラデーション中心の横位置です。");
-                let center_y =
-                    ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心Y"));
-                changed |= center_y.changed();
-                center_y.lab_hover_tip("円形グラデーション中心の縦位置です。");
-                let radius = ui.add(egui::Slider::new(&mut params.radius, 0.02..=2.0).text("半径"));
-                changed |= radius.changed();
-                radius.lab_hover_tip(
-                    "中心色から終了色へ変わる範囲です。画像上をドラッグすると中心と半径を設定できます。",
-                );
-            }
-            if params.shape != ColorOverlayShape::Solid {
-                let softness =
-                    ui.add(egui::Slider::new(&mut params.softness, 0.0..=1.0).text("なめらかさ"));
-                changed |= softness.changed();
-                softness
-                    .lab_hover_tip("グラデーションの変化を直線的にするか、なだらかにするかです。");
+                let opacity =
+                    ui.add(egui::Slider::new(&mut params.opacity, 0.0..=1.0).text("不透明度"));
+                changed |= opacity.changed();
+                opacity.lab_hover_tip("元画像から塗りつぶし色へどれだけ置き換えるかです。");
+                if params.shape == ColorOverlayShape::Linear {
+                    let angle = ui.add(
+                        egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                            .text("角度")
+                            .suffix("°"),
+                    );
+                    if angle.changed() {
+                        params.linear_points_enabled = false;
+                        changed = true;
+                    }
+                    angle.lab_hover_tip(
+                        "線形グラデーションの方向です。0°で左から右へ色が変わります。画像上をドラッグすると開始点と終了点も設定できます。",
+                    );
+                }
+                if params.shape == ColorOverlayShape::Radial {
+                    let center_x =
+                        ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
+                    changed |= center_x.changed();
+                    center_x.lab_hover_tip("円形グラデーション中心の横位置です。");
+                    let center_y =
+                        ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心Y"));
+                    changed |= center_y.changed();
+                    center_y.lab_hover_tip("円形グラデーション中心の縦位置です。");
+                    let radius =
+                        ui.add(egui::Slider::new(&mut params.radius, 0.02..=2.0).text("半径"));
+                    changed |= radius.changed();
+                    radius.lab_hover_tip(
+                        "中心色から終了色へ変わる範囲です。画像上をドラッグすると中心と半径を設定できます。",
+                    );
+                }
+                if params.shape != ColorOverlayShape::Solid {
+                    let softness = ui
+                        .add(egui::Slider::new(&mut params.softness, 0.0..=1.0).text("なめらかさ"));
+                    changed |= softness.changed();
+                    softness.lab_hover_tip(
+                        "グラデーションの変化を直線的にするか、なだらかにするかです。",
+                    );
+                }
             }
         }
         LocalEffect::ColorOverlay(params) => {
@@ -12897,7 +13026,7 @@ fn default_mask(kind: MaskKind, width: usize, height: usize) -> LocalMask {
         MaskKind::RadialGradient => LocalMask::RadialGradient(RadialGradientMask::default()),
         MaskKind::LumaRange => LocalMask::LumaRange(RangeMask::default()),
         MaskKind::ColorRange => LocalMask::ColorRange(ColorRangeMask::default()),
-        MaskKind::Subject => LocalMask::Subject(RasterMask::empty(width, height)),
+        MaskKind::Subject => LocalMask::Subject(SubjectMask::empty(width, height)),
         MaskKind::Segmentation => LocalMask::Segmentation(RegionMask::empty(width, height)),
     }
 }
@@ -13884,7 +14013,7 @@ struct SubjectMaskStats {
     soft_percent: f32,
 }
 
-fn subject_mask_stats(mask: &RasterMask) -> SubjectMaskStats {
+fn subject_mask_stats(mask: &SubjectMask) -> SubjectMaskStats {
     if mask.alpha.is_empty() {
         return SubjectMaskStats {
             foreground_percent: 0.0,
@@ -14690,29 +14819,56 @@ fn raster_vector_from_stored(stored: &StoredRasterVectorMask) -> Result<RasterVe
     })
 }
 
-fn stored_soft_mask_from_mask(mask: &RasterMask) -> Result<StoredSoftMask, String> {
-    let alpha_u8: Vec<u8> = mask
-        .alpha
+fn alpha_to_u8(alpha: &[f32]) -> Vec<u8> {
+    alpha
         .iter()
         .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
-        .collect();
+        .collect()
+}
+
+fn stored_soft_mask_from_mask(mask: &SubjectMask) -> Result<StoredSoftMask, String> {
+    let alpha_u8 = alpha_to_u8(&mask.alpha);
+    let source_alpha_u8_deflate_b64 = mask
+        .source_alpha
+        .as_ref()
+        .map(|alpha| deflate_b64(&alpha_to_u8(alpha)))
+        .transpose()?;
     Ok(StoredSoftMask {
         width: mask.width,
         height: mask.height,
         alpha_u8_deflate_b64: deflate_b64(&alpha_u8)?,
+        source_alpha_u8_deflate_b64,
+        refinement: mask.refinement,
     })
 }
 
-fn soft_mask_from_stored(stored: &StoredSoftMask) -> Result<RasterMask, String> {
+fn soft_mask_from_stored(stored: &StoredSoftMask) -> Result<SubjectMask, String> {
     let len = stored.width.saturating_mul(stored.height);
     let bytes = inflate_b64(&stored.alpha_u8_deflate_b64)?;
     if bytes.len() < len {
         return Err("soft mask payload is shorter than expected".to_string());
     }
-    Ok(RasterMask {
+    let alpha: Vec<f32> = bytes[..len].iter().map(|&v| v as f32 / 255.0).collect();
+    let source_alpha = if let Some(source) = &stored.source_alpha_u8_deflate_b64 {
+        let source_bytes = inflate_b64(source)?;
+        if source_bytes.len() < len {
+            return Err("soft source mask payload is shorter than expected".to_string());
+        }
+        Some(
+            source_bytes[..len]
+                .iter()
+                .map(|&v| v as f32 / 255.0)
+                .collect(),
+        )
+    } else {
+        Some(alpha.clone())
+    };
+    Ok(SubjectMask {
         width: stored.width,
         height: stored.height,
-        alpha: bytes[..len].iter().map(|&v| v as f32 / 255.0).collect(),
+        alpha,
+        source_alpha,
+        refinement: stored.refinement,
     })
 }
 
@@ -16108,6 +16264,7 @@ fn drag_color_gradient_geometry(
     started: bool,
 ) -> bool {
     match geometry.shape {
+        ColorOverlayShape::Unselected => false,
         ColorOverlayShape::Solid => false,
         ColorOverlayShape::Linear => {
             if started || !geometry.linear_points_enabled {
@@ -16133,6 +16290,7 @@ fn drag_color_gradient_geometry(
 
 fn reset_color_gradient_geometry(geometry: &mut ColorGradientGeometry) -> bool {
     match geometry.shape {
+        ColorOverlayShape::Unselected => false,
         ColorOverlayShape::Solid => false,
         ColorOverlayShape::Linear => {
             geometry.linear_points_enabled = false;
@@ -16158,6 +16316,7 @@ fn draw_color_gradient_geometry_handles(
     visuals: GradientHandleVisuals,
 ) -> (bool, bool) {
     match geometry.shape {
+        ColorOverlayShape::Unselected => (false, false),
         ColorOverlayShape::Solid => (false, false),
         ColorOverlayShape::Linear => {
             let (mut start, mut end) = color_gradient_linear_points(*geometry);
@@ -16467,11 +16626,11 @@ mod tests {
         };
         let refined = subject_cutout_refined_alpha(&mask, 0.5, 0, 0);
         assert_eq!(refined, vec![0.0, 0.0, 1.0, 1.0]);
-        let stats = subject_mask_stats(&RasterMask {
+        let stats = subject_mask_stats(&SubjectMask::from_raster(RasterMask {
             width: 4,
             height: 1,
             alpha: refined,
-        });
+        }));
         assert_eq!(stats.foreground_percent, 50.0);
         assert_eq!(stats.soft_percent, 0.0);
     }
@@ -16508,6 +16667,21 @@ mod tests {
         };
         let shrunk = subject_cutout_refined_alpha(&mask, 0.5, -1, 0);
         assert_eq!(shrunk, vec![0.0, 0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn subject_cutout_refinement_can_regenerate_from_cached_source() {
+        let source = RasterMask {
+            width: 4,
+            height: 1,
+            alpha: vec![0.20, 0.45, 0.55, 0.90],
+        };
+        let mut subject = SubjectMask::from_raster(source);
+        subject.alpha = subject_cutout_refined_alpha(&subject.source_raster_mask(), 0.60, 0, 0);
+        assert_eq!(subject.alpha, vec![0.0, 0.0, 0.0, 1.0]);
+
+        subject.alpha = subject_cutout_refined_alpha(&subject.source_raster_mask(), 0.40, 0, 0);
+        assert_eq!(subject.alpha, vec![0.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]
@@ -16624,6 +16798,34 @@ mod tests {
         assert_eq!(restored.height, 1);
         assert_eq!(restored.alpha, vec![0.0, 0.0, 1.0, 1.0]);
         assert_eq!(restored.shapes, mask.shapes);
+    }
+
+    #[test]
+    fn stored_subject_mask_roundtrips_source_and_refinement() {
+        let mask = SubjectMask {
+            width: 3,
+            height: 1,
+            alpha: vec![0.0, 1.0, 1.0],
+            source_alpha: Some(vec![0.20, 0.55, 0.90]),
+            refinement: SubjectMaskRefinement {
+                enabled: true,
+                threshold: 0.58,
+                expand_px: -1,
+                feather_px: 2,
+            },
+        };
+
+        let stored = stored_soft_mask_from_mask(&mask).unwrap();
+        let restored = soft_mask_from_stored(&stored).unwrap();
+
+        assert_eq!(restored.width, 3);
+        assert_eq!(restored.height, 1);
+        assert_eq!(restored.alpha, mask.alpha);
+        let source = restored.source_alpha.as_ref().unwrap();
+        for (actual, expected) in source.iter().zip(mask.source_alpha.as_ref().unwrap()) {
+            assert!((actual - expected).abs() <= 1.0 / 255.0);
+        }
+        assert_eq!(restored.refinement, mask.refinement);
     }
 
     #[test]

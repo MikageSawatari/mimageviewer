@@ -877,7 +877,9 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
 - マスク生成元: Full / Raster / Linear Gradient / Radial Gradient / Luma Range / Color Range / Subject / Segmentation
 - `local_adjust_lab` の被写体選択は、任意配置の `tools/local_adjust_lab/models/u2netp.onnx`
   を使って U²-Netp の被写体 / 背景マスクを worker thread で生成する初期実装まで接続済み。
-  生成結果は `Subject(RasterMask)` として保持し、背景選択はマスク反転で扱う
+  生成結果は `Subject(SubjectMask)` として保持し、背景選択はマスク反転で扱う。
+  `SubjectMask` は現在の alpha に加えて生成直後の soft matte も保持し、切り抜き向け整形の
+  しきい値 / 収縮拡張 / 境界なめらかスライダーは、その元 matte から現在 alpha を再生成する
 - `local_adjust_lab` の領域分割は、色差 / 境界 / 連結領域による候補生成を worker thread で行う。
   生成結果は `Segmentation(RegionMask)` として保持し、生成直後は未選択にする。未選択候補は
   アニメーションする境界線だけで表示し、クリック / ドラッグで個別に選択 / 解除できる。
@@ -912,6 +914,9 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
 - Look は未選択状態を `選択してください` として持ち、強度の default は 1.0 にする。
   これにより、効果選択直後は見た目を変えず、夕焼けなどのプリセットを選んだ時点で
   すぐ効果が出るようにする
+- ColorFill も未選択状態を `選択してください` として持ち、不透明度 default は 1.0 にする。
+  これにより、効果選択直後は見た目を変えず、単色 / 線形 / 円形の形状を選んだ時点で
+  すぐ塗りつぶし結果を確認できる
 - Tone Curve はまず RGB 共通の固定 5 点カーブ + プレビューで実装し、チャンネル別カーブは後続候補。
   Dehaze は Dark Channel Prior の考え方を軽量化し、白っぽさ低減と局所コントラスト寄りの仕上げ効果として扱う。
   Cross-Star Glow は明部抽出 + 方向性の減衰ブラーで、光線本数と回転角を指定できる

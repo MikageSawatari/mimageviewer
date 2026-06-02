@@ -56,7 +56,9 @@ the window.
     subject layer starts one generation pass automatically when the model is
     available. The generated soft matte can be refined for cutout work by
     thresholding it toward a binary mask, optionally shrinking/expanding it, and
-    smoothing only the boundary band.
+    smoothing only the boundary band. The original generated matte is kept with
+    the layer, so the cutout sliders regenerate from that matte instead of
+    destructively editing the current mask.
   - Region segmentation mask with color-coded candidates that can be toggled by
     clicking or dragging on the image. Creating a region layer starts one
     default full-image segmentation pass automatically; the tool panel can
@@ -118,6 +120,8 @@ the window.
 - RGB color parameters in Color Fill, Color Overlay, and Neon Glow share a
   control with a color button, HEX readout, RGB sliders, and an image-click
   eyedropper.
+- Color Fill starts with a shape placeholder and full opacity. Choosing Solid,
+  Linear Gradient, or Radial Gradient immediately makes the fill visible.
 - Linear and radial gradients in Color Fill and Color Overlay can be adjusted
   with the same canvas drag handles used by gradient-like mask/effect controls.
 - 3D LUT sample files are available under `tools/local_adjust_lab/sample_luts/`.

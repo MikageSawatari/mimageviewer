@@ -157,7 +157,7 @@ pub enum LocalMask {
     LumaRange(RangeMask),
     ColorRange(ColorRangeMask),
     /// Foreground/background matte from a salient-object or character matting model.
-    Subject(RasterMask),
+    Subject(SubjectMask),
     /// Region candidates that can be toggled independently.
     Segmentation(RegionMask),
 }
@@ -167,6 +167,48 @@ pub struct RasterMask {
     pub width: usize,
     pub height: usize,
     pub alpha: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SubjectMaskRefinement {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_subject_cutout_threshold")]
+    pub threshold: f32,
+    #[serde(default)]
+    pub expand_px: i32,
+    #[serde(default = "default_subject_cutout_feather_px")]
+    pub feather_px: i32,
+}
+
+impl Default for SubjectMaskRefinement {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: default_subject_cutout_threshold(),
+            expand_px: 0,
+            feather_px: default_subject_cutout_feather_px(),
+        }
+    }
+}
+
+fn default_subject_cutout_threshold() -> f32 {
+    0.52
+}
+
+fn default_subject_cutout_feather_px() -> i32 {
+    1
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubjectMask {
+    pub width: usize,
+    pub height: usize,
+    pub alpha: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_alpha: Option<Vec<f32>>,
+    #[serde(default)]
+    pub refinement: SubjectMaskRefinement,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -327,6 +369,61 @@ impl RasterMask {
             return Err(LocalAdjustError::InvalidMaskBuffer {
                 expected,
                 actual: self.alpha.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl SubjectMask {
+    pub fn empty(width: usize, height: usize) -> Self {
+        Self::from_raster(RasterMask::empty(width, height))
+    }
+
+    pub fn from_raster(mask: RasterMask) -> Self {
+        Self {
+            width: mask.width,
+            height: mask.height,
+            source_alpha: Some(mask.alpha.clone()),
+            alpha: mask.alpha,
+            refinement: SubjectMaskRefinement::default(),
+        }
+    }
+
+    pub fn current_raster_mask(&self) -> RasterMask {
+        RasterMask {
+            width: self.width,
+            height: self.height,
+            alpha: self.alpha.clone(),
+        }
+    }
+
+    pub fn source_raster_mask(&self) -> RasterMask {
+        RasterMask {
+            width: self.width,
+            height: self.height,
+            alpha: self.source_alpha.as_ref().unwrap_or(&self.alpha).clone(),
+        }
+    }
+
+    pub fn set_source_from_current(&mut self) {
+        self.source_alpha = Some(self.alpha.clone());
+    }
+
+    pub fn validate(&self, width: usize, height: usize) -> Result<()> {
+        let expected = width.saturating_mul(height);
+        if self.width != width || self.height != height || self.alpha.len() != expected {
+            return Err(LocalAdjustError::InvalidMaskBuffer {
+                expected,
+                actual: self.alpha.len(),
+            });
+        }
+        if let Some(source_alpha) = &self.source_alpha
+            && source_alpha.len() != expected
+        {
+            return Err(LocalAdjustError::InvalidMaskBuffer {
+                expected,
+                actual: source_alpha.len(),
             });
         }
         Ok(())
@@ -1868,7 +1965,7 @@ pub struct ColorFillParams {
     pub radius: f32,
     #[serde(default = "default_color_fill_softness")]
     pub softness: f32,
-    #[serde(default)]
+    #[serde(default = "default_color_fill_opacity")]
     pub opacity: f32,
 }
 
@@ -1888,13 +1985,13 @@ impl Default for ColorFillParams {
             center: default_color_fill_center(),
             radius: default_color_fill_radius(),
             softness: default_color_fill_softness(),
-            opacity: 0.0,
+            opacity: default_color_fill_opacity(),
         }
     }
 }
 
 fn default_color_fill_shape() -> ColorOverlayShape {
-    ColorOverlayShape::Solid
+    ColorOverlayShape::Unselected
 }
 
 fn default_color_fill_start_rgb() -> [u8; 3] {
@@ -1937,9 +2034,14 @@ fn default_color_fill_softness() -> f32 {
     0.45
 }
 
+fn default_color_fill_opacity() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ColorOverlayShape {
+    Unselected,
     Solid,
     #[default]
     Linear,
@@ -2649,7 +2751,11 @@ fn evaluate_raw_mask(image: RgbaImageRef<'_>, mask: &LocalMask) -> Result<Vec<f3
     let len = image.width * image.height;
     match mask {
         LocalMask::Full => Ok(vec![1.0; len]),
-        LocalMask::Raster(mask) | LocalMask::Subject(mask) => {
+        LocalMask::Raster(mask) => {
+            mask.validate(image.width, image.height)?;
+            Ok(mask.alpha.iter().map(|v| v.clamp(0.0, 1.0)).collect())
+        }
+        LocalMask::Subject(mask) => {
             mask.validate(image.width, image.height)?;
             Ok(mask.alpha.iter().map(|v| v.clamp(0.0, 1.0)).collect())
         }
@@ -6440,7 +6546,11 @@ fn apply_color_overlay(
     params: ColorOverlayParams,
 ) -> Vec<u8> {
     let opacity = params.opacity.clamp(0.0, 1.0);
-    if width == 0 || height == 0 || opacity <= f32::EPSILON {
+    if width == 0
+        || height == 0
+        || opacity <= f32::EPSILON
+        || params.shape == ColorOverlayShape::Unselected
+    {
         return src.to_vec();
     }
     let start = rgb_u8_to_f32(params.start_rgb);
@@ -6487,7 +6597,11 @@ fn apply_color_overlay(
 
 fn apply_color_fill(src: &[u8], width: usize, height: usize, params: ColorFillParams) -> Vec<u8> {
     let opacity = params.opacity.clamp(0.0, 1.0);
-    if width == 0 || height == 0 || opacity <= f32::EPSILON {
+    if width == 0
+        || height == 0
+        || opacity <= f32::EPSILON
+        || params.shape == ColorOverlayShape::Unselected
+    {
         return src.to_vec();
     }
     let mut out = src.to_vec();
@@ -6550,6 +6664,7 @@ fn color_shape_gradient_t(
     softness: f32,
 ) -> f32 {
     let raw = match shape {
+        ColorOverlayShape::Unselected => 0.0,
         ColorOverlayShape::Solid => 0.0,
         ColorOverlayShape::Linear => {
             if linear_points_enabled {
@@ -6587,7 +6702,10 @@ fn color_shape_gradient_t(
 
 fn color_fill_rgb(t: f32, params: ColorFillParams) -> [f32; 3] {
     let start = rgb_u8_to_f32(params.start_rgb);
-    if params.shape == ColorOverlayShape::Solid {
+    if matches!(
+        params.shape,
+        ColorOverlayShape::Unselected | ColorOverlayShape::Solid
+    ) {
         return start;
     }
     let end = rgb_u8_to_f32(params.end_rgb);
@@ -9102,6 +9220,31 @@ mod tests {
             let out = apply_layers(src.as_ref(), &[layer]).unwrap();
             assert_eq!(out.pixels, src.pixels);
         }
+    }
+
+    #[test]
+    fn color_fill_default_waits_for_shape_selection() {
+        let src = RgbaImageBuf::new(1, 1, vec![20, 40, 80, 255]).unwrap();
+        let params = ColorFillParams::default();
+        assert_eq!(params.shape, ColorOverlayShape::Unselected);
+        assert_eq!(params.opacity, 1.0);
+
+        let layer =
+            LocalAdjustmentLayer::new("fill", LocalMask::Full, LocalEffect::ColorFill(params));
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+
+        let layer = LocalAdjustmentLayer::new(
+            "fill",
+            LocalMask::Full,
+            LocalEffect::ColorFill(ColorFillParams {
+                shape: ColorOverlayShape::Solid,
+                start_rgb: [240, 220, 180],
+                ..params
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, vec![240, 220, 180, 255]);
     }
 
     #[test]
