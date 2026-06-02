@@ -546,6 +546,7 @@ pub enum LocalEffect {
     TiltShift(TiltShiftParams),
     LensBlur(LensBlurParams),
     BokehSprite(BokehSpriteParams),
+    LensDirt(LensDirtParams),
     RadialBlur(RadialBlurParams),
     WaveDistortion(WaveDistortionParams),
     HeatHaze(HeatHazeParams),
@@ -650,6 +651,7 @@ impl LocalEffect {
             Self::TiltShift(_) => "チルトぼかし",
             Self::LensBlur(_) => "レンズぼかし",
             Self::BokehSprite(_) => "玉ボケスプライト",
+            Self::LensDirt(_) => "レンズ汚れ/水滴",
             Self::RadialBlur(_) => "放射ぼかし",
             Self::WaveDistortion(_) => "波形ゆがみ",
             Self::HeatHaze(_) => "陽炎/熱揺らぎ",
@@ -1273,6 +1275,44 @@ impl Default for BokehSpriteParams {
             softness: 0.45,
             brightness: 1.0,
             color_strength: 0.35,
+            seed: 1,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LensDirtMode {
+    #[default]
+    Dust,
+    WaterDrops,
+    Smudges,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LensDirtParams {
+    pub mode: LensDirtMode,
+    pub density: f32,
+    pub size_px: f32,
+    pub opacity: f32,
+    pub softness: f32,
+    pub highlight_response: f32,
+    pub distortion_px: f32,
+    pub seed: u32,
+    pub strength: f32,
+}
+
+impl Default for LensDirtParams {
+    fn default() -> Self {
+        Self {
+            mode: LensDirtMode::Dust,
+            density: 0.45,
+            size_px: 14.0,
+            opacity: 0.45,
+            softness: 0.45,
+            highlight_response: 0.60,
+            distortion_px: 6.0,
             seed: 1,
             strength: 0.0,
         }
@@ -3934,6 +3974,9 @@ where
             LocalEffect::BokehSprite(params) => {
                 apply_bokeh_sprite(&image.pixels, image.width, image.height, *params)
             }
+            LocalEffect::LensDirt(params) => {
+                apply_lens_dirt(&image.pixels, image.width, image.height, *params)
+            }
             LocalEffect::RadialBlur(params) => {
                 apply_radial_blur(&image.pixels, image.width, image.height, *params)
             }
@@ -5791,6 +5834,335 @@ fn bokeh_sprite_shape_alpha(shape: BokehSpriteShape, nx: f32, ny: f32, edge: f32
         }
     }
     .clamp(0.0, 1.0)
+}
+
+fn apply_lens_dirt(src: &[u8], width: usize, height: usize, params: LensDirtParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let opacity = params.opacity.clamp(0.0, 1.0);
+    let density = params.density.clamp(0.0, 1.0);
+    if width == 0
+        || height == 0
+        || strength <= f32::EPSILON
+        || opacity <= f32::EPSILON
+        || density <= f32::EPSILON
+    {
+        return src.to_vec();
+    }
+
+    let size = params.size_px.clamp(2.0, 128.0);
+    let softness = params.softness.clamp(0.0, 1.0);
+    let highlight_response = params.highlight_response.clamp(0.0, 1.0);
+    let distortion = params.distortion_px.clamp(0.0, 32.0);
+    let len = width.saturating_mul(height);
+    let mut grime = vec![0.0_f32; len];
+    let mut shine = vec![0.0_f32; len];
+    let mut refract_x = vec![0.0_f32; len];
+    let mut refract_y = vec![0.0_f32; len];
+
+    match params.mode {
+        LensDirtMode::Dust => paint_lens_dust(
+            &mut grime,
+            &mut shine,
+            width,
+            height,
+            size,
+            density,
+            softness,
+            params.seed,
+        ),
+        LensDirtMode::WaterDrops => paint_lens_water_drops(
+            &mut grime,
+            &mut shine,
+            &mut refract_x,
+            &mut refract_y,
+            width,
+            height,
+            size,
+            density,
+            softness,
+            params.seed,
+        ),
+        LensDirtMode::Smudges => paint_lens_smudges(
+            &mut grime,
+            &mut shine,
+            width,
+            height,
+            size,
+            density,
+            softness,
+            params.seed,
+        ),
+    }
+
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let oi = idx * 4;
+            let alpha = src[oi + 3] as f32 / 255.0;
+            if alpha <= f32::EPSILON {
+                continue;
+            }
+            let base = [
+                src[oi] as f32 / 255.0,
+                src[oi + 1] as f32 / 255.0,
+                src[oi + 2] as f32 / 255.0,
+            ];
+            let luma = luma01(base[0], base[1], base[2]);
+            let visibility =
+                opacity * strength * lerp_f32(1.0, 0.22 + luma * 1.05, highlight_response);
+            let grime_amount = grime[idx].clamp(0.0, 1.0) * visibility;
+            let shine_amount =
+                shine[idx].clamp(0.0, 1.0) * visibility * (0.45 + highlight_response * luma * 1.35);
+            if grime_amount <= f32::EPSILON && shine_amount <= f32::EPSILON {
+                continue;
+            }
+
+            let mut sampled = base;
+            if distortion > f32::EPSILON {
+                let sx = x as f32 + refract_x[idx] * distortion * strength;
+                let sy = y as f32 + refract_y[idx] * distortion * strength;
+                let (rgb, sample_alpha) =
+                    sample_rgb_bilinear_alpha_aware(src, width, height, sx, sy);
+                if sample_alpha > f32::EPSILON {
+                    sampled = rgb;
+                }
+            }
+
+            let target = match params.mode {
+                LensDirtMode::Dust => lens_dust_rgb(sampled, grime_amount, shine_amount),
+                LensDirtMode::WaterDrops => {
+                    lens_water_drop_rgb(sampled, grime_amount, shine_amount)
+                }
+                LensDirtMode::Smudges => lens_smudge_rgb(sampled, grime_amount, shine_amount),
+            };
+            for c in 0..3 {
+                out[oi + c] = to_u8(target[c]);
+            }
+        }
+    }
+
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_lens_dust(
+    grime: &mut [f32],
+    shine: &mut [f32],
+    width: usize,
+    height: usize,
+    size: f32,
+    density: f32,
+    softness: f32,
+    seed: u32,
+) {
+    let spacing = (size * lerp_f32(3.2, 0.8, density))
+        .round()
+        .clamp(2.0, 128.0) as usize;
+    for cell_y in (0..height).step_by(spacing) {
+        for cell_x in (0..width).step_by(spacing) {
+            let gx = (cell_x / spacing) as u32;
+            let gy = (cell_y / spacing) as u32;
+            if lens_noise01(gx, gy, seed) > density {
+                continue;
+            }
+            let jitter_x = lens_noise01(gx, gy, seed ^ 0xD15A_11CE);
+            let jitter_y = lens_noise01(gx, gy, seed ^ 0xA53D_0011);
+            let cx = cell_x as f32 + jitter_x * spacing as f32;
+            let cy = cell_y as f32 + jitter_y * spacing as f32;
+            let radius = (size * lerp_f32(0.08, 0.34, lens_noise01(gx, gy, seed ^ 0x51E6_5EED)))
+                .clamp(0.6, 18.0);
+            let scratch = lens_noise01(gx, gy, seed ^ 0x5C8A_7C4D) > 0.86;
+            let angle = signed_noise(gx, gy, seed ^ 0xA119_1E55) * std::f32::consts::PI;
+            let rx = if scratch { radius * 5.2 } else { radius * 1.35 };
+            let ry = if scratch { radius * 0.45 } else { radius };
+            paint_lens_ellipse(
+                grime,
+                shine,
+                width,
+                height,
+                cx,
+                cy,
+                rx,
+                ry,
+                angle,
+                0.50 + density * 0.35,
+                if scratch { 0.12 } else { 0.04 },
+                0.10 + softness * 0.26,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_lens_water_drops(
+    grime: &mut [f32],
+    shine: &mut [f32],
+    refract_x: &mut [f32],
+    refract_y: &mut [f32],
+    width: usize,
+    height: usize,
+    size: f32,
+    density: f32,
+    softness: f32,
+    seed: u32,
+) {
+    let spacing = (size * lerp_f32(2.4, 0.72, density))
+        .round()
+        .clamp(3.0, 160.0) as usize;
+    for cell_y in (0..height).step_by(spacing) {
+        for cell_x in (0..width).step_by(spacing) {
+            let gx = (cell_x / spacing) as u32;
+            let gy = (cell_y / spacing) as u32;
+            if lens_noise01(gx, gy, seed ^ 0xA7E2_0615) > density {
+                continue;
+            }
+            let cx = cell_x as f32 + lens_noise01(gx, gy, seed ^ 0xC0DE_0011) * spacing as f32;
+            let cy = cell_y as f32 + lens_noise01(gx, gy, seed ^ 0xC0DE_0021) * spacing as f32;
+            let radius = (size * lerp_f32(0.28, 0.62, lens_noise01(gx, gy, seed ^ 0xC0DE_0031)))
+                .clamp(1.5, 96.0);
+            let min_x = (cx - radius - 2.0).floor().max(0.0) as usize;
+            let min_y = (cy - radius - 2.0).floor().max(0.0) as usize;
+            let max_x = (cx + radius + 2.0)
+                .ceil()
+                .min(width.saturating_sub(1) as f32) as usize;
+            let max_y = (cy + radius + 2.0)
+                .ceil()
+                .min(height.saturating_sub(1) as f32) as usize;
+            let edge = 0.05 + softness * 0.25;
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    let nx = (x as f32 + 0.5 - cx) / radius;
+                    let ny = (y as f32 + 0.5 - cy) / radius;
+                    let r = (nx * nx + ny * ny).sqrt();
+                    if r > 1.16 {
+                        continue;
+                    }
+                    let body = 1.0 - smoothstep(0.82, 1.05 + edge, r);
+                    let ring = smoothstep(0.48, 0.82, r) * (1.0 - smoothstep(0.95, 1.12, r));
+                    let highlight = smoothstep(0.68, 0.95, r) * (1.0 - smoothstep(0.98, 1.15, r));
+                    let idx = y * width + x;
+                    grime[idx] += (body * 0.22 + ring * 0.50).clamp(0.0, 1.0);
+                    shine[idx] += highlight * (0.65 + softness * 0.25);
+                    let normal_gain = (body * (1.0 - r).max(0.0) + ring * 0.45).clamp(0.0, 1.0);
+                    refract_x[idx] += nx * normal_gain;
+                    refract_y[idx] += ny * normal_gain;
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_lens_smudges(
+    grime: &mut [f32],
+    shine: &mut [f32],
+    width: usize,
+    height: usize,
+    size: f32,
+    density: f32,
+    softness: f32,
+    seed: u32,
+) {
+    let scale = size.clamp(8.0, 160.0);
+    let angle = signed_noise(7, 11, seed ^ 0x5EA1_5EED) * std::f32::consts::PI;
+    let cos_a = angle.cos();
+    let sin_a = angle.sin();
+    let threshold = lerp_f32(0.88, 0.28, density);
+    for y in 0..height {
+        for x in 0..width {
+            let u = (x as f32 * cos_a + y as f32 * sin_a) / scale;
+            let v = (-(x as f32) * sin_a + y as f32 * cos_a) / (scale * 0.36).max(1.0);
+            let coarse = glass_value_noise(u, v, seed);
+            let fine = glass_value_noise(u * 2.7 + 13.1, v * 1.9 - 5.7, seed ^ 0x91E7_5A1D);
+            let streak = ((v * std::f32::consts::TAU).sin() * 0.5 + 0.5) * 2.0 - 1.0;
+            let raw = 0.5 + (coarse * 0.52 + fine * 0.28 + streak * 0.20) * 0.5;
+            let alpha = smoothstep(threshold, 1.0, raw) * (0.62 + softness * 0.34);
+            if alpha <= 0.001 {
+                continue;
+            }
+            let idx = y * width + x;
+            grime[idx] += alpha;
+            shine[idx] += alpha * (0.16 + softness * 0.18);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_lens_ellipse(
+    grime: &mut [f32],
+    shine: &mut [f32],
+    width: usize,
+    height: usize,
+    center_x: f32,
+    center_y: f32,
+    radius_x: f32,
+    radius_y: f32,
+    angle: f32,
+    amount: f32,
+    shine_amount: f32,
+    edge: f32,
+) {
+    let pad = radius_x.max(radius_y) + 2.0;
+    let min_x = (center_x - pad).floor().max(0.0) as usize;
+    let min_y = (center_y - pad).floor().max(0.0) as usize;
+    let max_x = (center_x + pad).ceil().min(width.saturating_sub(1) as f32) as usize;
+    let max_y = (center_y + pad).ceil().min(height.saturating_sub(1) as f32) as usize;
+    let cos_a = angle.cos();
+    let sin_a = angle.sin();
+    let rx = radius_x.max(0.001);
+    let ry = radius_y.max(0.001);
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let dx = x as f32 + 0.5 - center_x;
+            let dy = y as f32 + 0.5 - center_y;
+            let u = (dx * cos_a + dy * sin_a) / rx;
+            let v = (-dx * sin_a + dy * cos_a) / ry;
+            let r = (u * u + v * v).sqrt();
+            if r > 1.12 {
+                continue;
+            }
+            let alpha = 1.0 - smoothstep(1.0 - edge, 1.0 + edge, r);
+            if alpha <= 0.001 {
+                continue;
+            }
+            let idx = y * width + x;
+            grime[idx] += alpha * amount;
+            shine[idx] += alpha * shine_amount;
+        }
+    }
+}
+
+fn lens_dust_rgb(rgb: [f32; 3], grime: f32, shine: f32) -> [f32; 3] {
+    let mut out = rgb;
+    for c in 0..3 {
+        out[c] = (out[c] * (1.0 - grime * 0.62)).clamp(0.0, 1.0);
+        out[c] = screen_channel(out[c], shine * 0.30);
+    }
+    out
+}
+
+fn lens_water_drop_rgb(rgb: [f32; 3], grime: f32, shine: f32) -> [f32; 3] {
+    let mut out = rgb;
+    for c in 0..3 {
+        out[c] = (out[c] * (1.0 - grime * 0.12)).clamp(0.0, 1.0);
+        out[c] = screen_channel(out[c], shine * 0.72);
+    }
+    out
+}
+
+fn lens_smudge_rgb(rgb: [f32; 3], grime: f32, shine: f32) -> [f32; 3] {
+    let luma = luma01(rgb[0], rgb[1], rgb[2]);
+    let mut out = rgb;
+    for c in 0..3 {
+        let hazed = screen_channel(out[c], grime * 0.58 + shine * 0.24);
+        out[c] = lerp_f32(hazed, luma + (hazed - luma) * 0.72, grime * 0.38);
+    }
+    out
+}
+
+fn lens_noise01(x: u32, y: u32, seed: u32) -> f32 {
+    (signed_noise(x, y, seed) * 0.5 + 0.5).clamp(0.0, 1.0)
 }
 
 fn apply_radial_blur(src: &[u8], width: usize, height: usize, params: RadialBlurParams) -> Vec<u8> {
@@ -14436,6 +14808,77 @@ mod tests {
     }
 
     #[test]
+    fn lens_dirt_water_drops_change_image_and_preserve_alpha() {
+        let src = solid(8, 8, [90, 100, 120, 173]);
+        let layer = LocalAdjustmentLayer::new(
+            "lens dirt",
+            LocalMask::Full,
+            LocalEffect::LensDirt(LensDirtParams {
+                mode: LensDirtMode::WaterDrops,
+                density: 1.0,
+                size_px: 7.0,
+                opacity: 1.0,
+                softness: 0.35,
+                highlight_response: 0.0,
+                distortion_px: 6.0,
+                seed: 3,
+                strength: 1.0,
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        assert_ne!(out.pixels, src.pixels);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 173));
+    }
+
+    #[test]
+    fn lens_dirt_keeps_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(1, 1, vec![12, 34, 56, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "lens dirt",
+            LocalMask::Full,
+            LocalEffect::LensDirt(LensDirtParams {
+                mode: LensDirtMode::Dust,
+                density: 1.0,
+                opacity: 1.0,
+                strength: 1.0,
+                ..LensDirtParams::default()
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn lens_dirt_modes_create_different_patterns() {
+        let src = solid(12, 8, [110, 120, 130, 255]);
+        let make = |mode| {
+            LocalAdjustmentLayer::new(
+                "lens dirt",
+                LocalMask::Full,
+                LocalEffect::LensDirt(LensDirtParams {
+                    mode,
+                    density: 0.75,
+                    size_px: 10.0,
+                    opacity: 0.9,
+                    highlight_response: 0.0,
+                    seed: 9,
+                    strength: 1.0,
+                    ..LensDirtParams::default()
+                }),
+            )
+        };
+
+        let dust = apply_layers(src.as_ref(), &[make(LensDirtMode::Dust)]).unwrap();
+        let smudges = apply_layers(src.as_ref(), &[make(LensDirtMode::Smudges)]).unwrap();
+
+        assert_ne!(dust.pixels, smudges.pixels);
+    }
+
+    #[test]
     fn radial_zoom_blur_spreads_from_center_and_preserves_alpha() {
         let mut pixels = vec![0_u8; 5 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -15682,6 +16125,7 @@ mod tests {
             LocalEffect::TiltShift(TiltShiftParams::default()),
             LocalEffect::LensBlur(LensBlurParams::default()),
             LocalEffect::BokehSprite(BokehSpriteParams::default()),
+            LocalEffect::LensDirt(LensDirtParams::default()),
             LocalEffect::RadialBlur(RadialBlurParams::default()),
             LocalEffect::WaveDistortion(WaveDistortionParams::default()),
             LocalEffect::HeatHaze(HeatHazeParams::default()),
@@ -15881,6 +16325,20 @@ mod tests {
                     brightness: 2.0,
                     color_strength: 1.0,
                     seed: 31,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "lens dirt dense water drops",
+                LocalEffect::LensDirt(LensDirtParams {
+                    mode: LensDirtMode::WaterDrops,
+                    density: 1.0,
+                    size_px: 128.0,
+                    opacity: 1.0,
+                    softness: 1.0,
+                    highlight_response: 1.0,
+                    distortion_px: 32.0,
+                    seed: 32,
                     strength: 1.0,
                 }),
             ),

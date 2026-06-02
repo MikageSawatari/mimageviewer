@@ -27,25 +27,26 @@ use local_adjust_core::{
     FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams, GlowingEdgesParams,
     GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams, HalftoneParams,
     HeatHazeParams, HighPassParams, HighlightsShadowsParams, HslParams, InvertParams,
-    LensBlurAperture, LensBlurParams, LensCorrectionParams, LensFlareParams, LightLeakParams,
-    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LithographParams,
-    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
-    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
-    NeonGlowParams, NewspaperPrintParams, NoiseDistribution, NoiseParams, OilPaintParams,
-    OldFilmParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement, PartColorParams,
-    ParticleOverlayMode, ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection,
-    PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
-    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialFlashParams,
-    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
-    RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode,
-    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
-    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
-    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
-    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams,
-    WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
-    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
+    LensBlurAperture, LensBlurParams, LensCorrectionParams, LensDirtMode, LensDirtParams,
+    LensFlareParams, LightLeakParams, LineExtractMode, LineExtractParams, LineKind,
+    LinearGradientMask, LithographParams, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
+    LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
+    MosaicTileMode, MotionBlurParams, NeonGlowParams, NewspaperPrintParams, NoiseDistribution,
+    NoiseParams, OilPaintParams, OldFilmParams, OrtonParams, OutlineStrokeParams,
+    OutlineStrokePlacement, PartColorParams, ParticleOverlayMode, ParticleOverlayParams,
+    PinchSpherizeParams, PixelSortDirection, PixelSortOrder, PixelSortParams, PixelStylizeMode,
+    PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
+    RadialBlurMode, RadialBlurParams, RadialFlashParams, RadialGradientMask, RangeMask, RasterMask,
+    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams,
+    ScanlineGlitchParams, ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp,
+    SharpenParams, SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode,
+    SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement,
+    TextureParams, TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams,
+    VhsParams, VignetteParams, WaterCausticsParams, WaveDistortionMode, WaveDistortionParams,
+    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
+    compute_mosaic_tile_size, default_mask_application_for_effect, evaluate_layer_mask,
+    parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1047,6 +1048,7 @@ enum EffectKind {
     TiltShift,
     LensBlur,
     BokehSprite,
+    LensDirt,
     RadialBlur,
     WaveDistortion,
     HeatHaze,
@@ -1220,6 +1222,7 @@ impl EffectKind {
             LocalEffect::TiltShift(_) => Self::TiltShift,
             LocalEffect::LensBlur(_) => Self::LensBlur,
             LocalEffect::BokehSprite(_) => Self::BokehSprite,
+            LocalEffect::LensDirt(_) => Self::LensDirt,
             LocalEffect::RadialBlur(_) => Self::RadialBlur,
             LocalEffect::WaveDistortion(_) => Self::WaveDistortion,
             LocalEffect::HeatHaze(_) => Self::HeatHaze,
@@ -1324,6 +1327,7 @@ impl EffectKind {
             Self::TiltShift => "チルトシフト",
             Self::LensBlur => "レンズぼかし",
             Self::BokehSprite => "玉ボケスプライト",
+            Self::LensDirt => "レンズ汚れ/水滴",
             Self::RadialBlur => "放射/回転ぼかし",
             Self::WaveDistortion => "波形ゆがみ",
             Self::HeatHaze => "陽炎/熱揺らぎ",
@@ -1412,6 +1416,7 @@ impl EffectKind {
             Self::Equalize => "ヒスト平坦化",
             Self::AnamorphicFlare => "アナモルフフレア",
             Self::BokehSprite => "玉ボケ粒子",
+            Self::LensDirt => "レンズ汚れ",
             Self::DiffractionStarburst => "回折スター",
             Self::WaterCaustics => "水中光網",
             Self::ParticleOverlay => "天候粒子",
@@ -1458,6 +1463,9 @@ impl EffectKind {
             }
             Self::LensBlur => "絞り形状でぼかし、明るい点を玉ボケのように膨らませます。",
             Self::BokehSprite => "明るい点を拾って、丸・星・ハート形の玉ボケ粒子として散らします。",
+            Self::LensDirt => {
+                "レンズ上のほこり、水滴、曇りのような汚れを手続き型オーバーレイで重ねます。"
+            }
             Self::RadialBlur => {
                 "中心から外へ伸びるズームぼかし、または中心周りの回転ぼかしを作ります。"
             }
@@ -1792,6 +1800,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ContactShadow,
             EffectKind::GodRays,
             EffectKind::LensFlare,
+            EffectKind::LensDirt,
             EffectKind::AnamorphicFlare,
             EffectKind::LightLeak,
             EffectKind::BacklightHaze,
@@ -9236,6 +9245,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::LensFlare(params) => {
             format!("レンズフレア {:.0}%", params.strength * 100.0)
         }
+        LocalEffect::LensDirt(params) => format!(
+            "レンズ汚れ {} {:.0}px",
+            lens_dirt_mode_label(params.mode),
+            params.size_px
+        ),
         LocalEffect::AnamorphicFlare(params) => format!(
             "アナモルフ {:.0}px {:.0}%",
             params.length_px,
@@ -9380,6 +9394,14 @@ fn bokeh_sprite_shape_label(shape: BokehSpriteShape) -> &'static str {
         BokehSpriteShape::Circle => "丸",
         BokehSpriteShape::Star => "星",
         BokehSpriteShape::Heart => "ハート",
+    }
+}
+
+fn lens_dirt_mode_label(mode: LensDirtMode) -> &'static str {
+    match mode {
+        LensDirtMode::Dust => "ダスト",
+        LensDirtMode::WaterDrops => "水滴",
+        LensDirtMode::Smudges => "曇り",
     }
 }
 
@@ -11909,6 +11931,119 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像に対して玉ボケ粒子をどれだけ重ねるかです。");
+        }
+        LocalEffect::LensDirt(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "ほこり") {
+                    *params = LensDirtParams {
+                        mode: LensDirtMode::Dust,
+                        density: 0.58,
+                        size_px: 10.0,
+                        opacity: 0.46,
+                        softness: 0.38,
+                        highlight_response: 0.72,
+                        distortion_px: 0.0,
+                        seed: 3,
+                        strength: 0.72,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "水滴") {
+                    *params = LensDirtParams {
+                        mode: LensDirtMode::WaterDrops,
+                        density: 0.48,
+                        size_px: 34.0,
+                        opacity: 0.72,
+                        softness: 0.48,
+                        highlight_response: 0.88,
+                        distortion_px: 10.0,
+                        seed: 5,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "曇り指紋") {
+                    *params = LensDirtParams {
+                        mode: LensDirtMode::Smudges,
+                        density: 0.58,
+                        size_px: 74.0,
+                        opacity: 0.62,
+                        softness: 0.78,
+                        highlight_response: 0.62,
+                        distortion_px: 2.0,
+                        seed: 7,
+                        strength: 0.72,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "薄く") {
+                    *params = LensDirtParams {
+                        mode: LensDirtMode::Dust,
+                        density: 0.28,
+                        size_px: 12.0,
+                        opacity: 0.26,
+                        softness: 0.52,
+                        highlight_response: 0.42,
+                        distortion_px: 0.0,
+                        seed: 11,
+                        strength: 0.45,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "レンズ表面のほこり、水滴、曇りを重ねます。光源や逆光のある絵で、レンズ越しの質感を足す用途に向いています。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal(|ui| {
+                for (mode, label) in [
+                    (LensDirtMode::Dust, "ダスト"),
+                    (LensDirtMode::WaterDrops, "水滴"),
+                    (LensDirtMode::Smudges, "曇り"),
+                ] {
+                    let selected = params.mode == mode;
+                    if ui.selectable_label(selected, label).clicked() && !selected {
+                        params.mode = mode;
+                        changed = true;
+                    }
+                }
+            });
+            let density = ui.add(egui::Slider::new(&mut params.density, 0.0..=1.0).text("密度"));
+            changed |= density.changed();
+            density.lab_hover_tip("汚れや水滴がどれだけ多く出るかです。");
+            let size = ui.add(egui::Slider::new(&mut params.size_px, 2.0..=128.0).text("サイズ"));
+            changed |= size.changed();
+            size.lab_hover_tip("ほこりの粒、水滴、曇り筋の大きさです。");
+            let opacity = ui.add(egui::Slider::new(&mut params.opacity, 0.0..=1.0).text("濃さ"));
+            changed |= opacity.changed();
+            opacity.lab_hover_tip("生成したレンズ汚れをどれだけ見せるかです。");
+            let softness =
+                ui.add(egui::Slider::new(&mut params.softness, 0.0..=1.0).text("柔らかさ"));
+            changed |= softness.changed();
+            softness.lab_hover_tip("汚れや水滴の輪郭をどれだけ柔らかくするかです。");
+            let highlight =
+                ui.add(egui::Slider::new(&mut params.highlight_response, 0.0..=1.0).text("光反応"));
+            changed |= highlight.changed();
+            highlight.lab_hover_tip(
+                "明るい場所で汚れを目立たせる量です。値を上げると逆光や光源付近で出やすくなります。",
+            );
+            let distortion = ui.add_enabled(
+                params.mode != LensDirtMode::Dust,
+                egui::Slider::new(&mut params.distortion_px, 0.0..=32.0).text("屈折"),
+            );
+            changed |= distortion.changed();
+            distortion
+                .lab_hover_tip("水滴や曇りで下の画像を少しずらす量です。ダストでは使いません。");
+            let seed = ui.add(egui::Slider::new(&mut params.seed, 0..=9999).text("seed"));
+            changed |= seed.changed();
+            seed.lab_hover_tip("汚れの配置やノイズを変える値です。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像に対してレンズ汚れをどれだけ重ねるかです。");
         }
         LocalEffect::RadialBlur(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -20058,6 +20193,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::TiltShift => LocalEffect::TiltShift(TiltShiftParams::default()),
         EffectKind::LensBlur => LocalEffect::LensBlur(LensBlurParams::default()),
         EffectKind::BokehSprite => LocalEffect::BokehSprite(BokehSpriteParams::default()),
+        EffectKind::LensDirt => LocalEffect::LensDirt(LensDirtParams::default()),
         EffectKind::RadialBlur => LocalEffect::RadialBlur(RadialBlurParams::default()),
         EffectKind::WaveDistortion => LocalEffect::WaveDistortion(WaveDistortionParams::default()),
         EffectKind::HeatHaze => LocalEffect::HeatHaze(HeatHazeParams::default()),
@@ -22635,6 +22771,7 @@ mod tests {
             EffectKind::ColorDodgeGlow,
             EffectKind::GodRays,
             EffectKind::LensFlare,
+            EffectKind::LensDirt,
             EffectKind::AnamorphicFlare,
             EffectKind::LightLeak,
             EffectKind::BacklightHaze,
