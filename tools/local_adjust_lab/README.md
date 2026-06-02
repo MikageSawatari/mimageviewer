@@ -88,6 +88,9 @@ the window.
   - Blur
   - Motion blur
   - Tilt shift
+    - Linear/radial focus ranges can be placed by dragging on the canvas and
+      then adjusted with center / focus / falloff handles, similar to gradient
+      mask handles.
   - Lens blur
   - Radial blur
   - Soft focus
@@ -119,7 +122,8 @@ the window.
 - Layer settings sidecar save/load. `foo.png` uses `foo.png.miv`; the sidecar is
   JSON with binary masks packed as 1-bit or 8-bit data, deflated, then base64
   encoded.
-- Async recomposition with generation discard
+- Async recomposition with generation discard, cancellation for superseded
+  renders, and progress status for long-running filters such as Median.
 - Manual-mask undo snapshots for layer operations, brush/lasso/object edits, and object deletion
 - Japanese system font registration so labels render correctly on Windows
 - Save result as `*_local_adjust.png`

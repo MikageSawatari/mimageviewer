@@ -4,6 +4,7 @@
 //! of local adjustment layers returns an RGBA image with the same dimensions.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub enum LocalAdjustError {
     InvalidImageBuffer { expected: usize, actual: usize },
     InvalidMaskBuffer { expected: usize, actual: usize },
+    Cancelled,
 }
 
 impl fmt::Display for LocalAdjustError {
@@ -28,6 +30,7 @@ impl fmt::Display for LocalAdjustError {
                     "invalid mask buffer length: expected {expected}, got {actual}"
                 )
             }
+            Self::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -35,6 +38,14 @@ impl fmt::Display for LocalAdjustError {
 impl std::error::Error for LocalAdjustError {}
 
 pub type Result<T> = std::result::Result<T, LocalAdjustError>;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LocalAdjustProgress {
+    pub layer_index: usize,
+    pub layer_count: usize,
+    pub effect_name: &'static str,
+    pub percent: f32,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RgbaImageBuf {
@@ -439,6 +450,50 @@ pub enum LocalEffect {
     Median(MedianParams),
 }
 
+impl LocalEffect {
+    fn progress_label(&self) -> &'static str {
+        match self {
+            Self::None => "効果なし",
+            Self::Tone(_) => "色調補正",
+            Self::ToneCurve(_) => "トーンカーブ",
+            Self::RgbToneCurve(_) => "RGBトーンカーブ",
+            Self::ColorBalance(_) => "カラーバランス",
+            Self::ThreeWayColorGrading(_) => "3ウェイカラー",
+            Self::SelectiveColor(_) => "セレクティブカラー",
+            Self::ChannelMixer(_) => "チャンネルミキサー",
+            Self::Clarity(_) => "明瞭度",
+            Self::HighlightsShadows(_) => "ハイライト/シャドウ",
+            Self::Dehaze(_) => "かすみ除去",
+            Self::Blur(_) => "ぼかし",
+            Self::MotionBlur(_) => "モーションぼかし",
+            Self::TiltShift(_) => "チルトぼかし",
+            Self::LensBlur(_) => "レンズぼかし",
+            Self::RadialBlur(_) => "放射ぼかし",
+            Self::SoftFocus(_) => "ソフトフォーカス",
+            Self::Mosaic(_) => "モザイク",
+            Self::Sharpen(_) => "シャープ",
+            Self::Hsl(_) => "色相/HSL",
+            Self::ColorMixer(_) => "カラーミキサー",
+            Self::Look(_) => "ルック",
+            Self::CubeLut(_) => "LUT",
+            Self::Posterize(_) => "ポスタライズ",
+            Self::Threshold(_) => "しきい値",
+            Self::Invert(_) => "ネガ",
+            Self::Duotone(_) => "デュオトーン",
+            Self::Equalize(_) => "ヒストグラム均等化",
+            Self::GradientMap(_) => "グラデーションマップ",
+            Self::Bloom(_) => "ブルーム",
+            Self::Vignette(_) => "ビネット",
+            Self::FilmGrain(_) => "フィルム粒子",
+            Self::ChromaticAberration(_) => "色収差",
+            Self::Halftone(_) => "ハーフトーン",
+            Self::StarGlow(_) => "クロス光",
+            Self::EdgeSmooth(_) => "エッジ保持ぼかし",
+            Self::Median(_) => "メディアンフィルタ",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ToneParams {
     pub brightness: f32,
@@ -737,6 +792,8 @@ pub enum TiltShiftMode {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TiltShiftParams {
     pub mode: TiltShiftMode,
+    #[serde(default = "default_tilt_shift_range_initialized")]
+    pub range_initialized: bool,
     pub center: [f32; 2],
     pub angle_degrees: f32,
     pub focus_width: f32,
@@ -747,10 +804,15 @@ pub struct TiltShiftParams {
     pub far_only: bool,
 }
 
+fn default_tilt_shift_range_initialized() -> bool {
+    true
+}
+
 impl Default for TiltShiftParams {
     fn default() -> Self {
         Self {
             mode: TiltShiftMode::Linear,
+            range_initialized: false,
             center: [0.5, 0.5],
             angle_degrees: -90.0,
             focus_width: 0.12,
@@ -1341,15 +1403,76 @@ pub fn apply_layers(
     src: RgbaImageRef<'_>,
     layers: &[LocalAdjustmentLayer],
 ) -> Result<RgbaImageBuf> {
+    apply_layers_with_progress(src, layers, None, |_| {})
+}
+
+pub fn apply_layers_with_progress<F>(
+    src: RgbaImageRef<'_>,
+    layers: &[LocalAdjustmentLayer],
+    cancel: Option<&AtomicBool>,
+    progress: F,
+) -> Result<RgbaImageBuf>
+where
+    F: FnMut(LocalAdjustProgress),
+{
+    apply_layers_impl(src, layers, cancel, progress)
+}
+
+fn apply_layers_impl<F>(
+    src: RgbaImageRef<'_>,
+    layers: &[LocalAdjustmentLayer],
+    cancel: Option<&AtomicBool>,
+    mut progress: F,
+) -> Result<RgbaImageBuf>
+where
+    F: FnMut(LocalAdjustProgress),
+{
     let src = src.validate()?;
     let mut out = RgbaImageBuf::new(src.width, src.height, src.pixels.to_vec())?;
+    let layer_count = layers
+        .iter()
+        .filter(|layer| layer.enabled && layer.opacity > 0.0)
+        .count();
     for layer in layers
         .iter()
         .filter(|layer| layer.enabled && layer.opacity > 0.0)
+        .enumerate()
     {
-        apply_layer(&mut out, layer)?;
+        let (layer_index, layer) = layer;
+        check_cancel(cancel)?;
+        progress(LocalAdjustProgress {
+            layer_index,
+            layer_count,
+            effect_name: layer.effect.progress_label(),
+            percent: 0.0,
+        });
+        apply_layer(
+            &mut out,
+            layer,
+            layer_index,
+            layer_count,
+            cancel,
+            &mut progress,
+        )?;
+        check_cancel(cancel)?;
+        progress(LocalAdjustProgress {
+            layer_index,
+            layer_count,
+            effect_name: layer.effect.progress_label(),
+            percent: 1.0,
+        });
     }
     Ok(out)
+}
+
+fn check_cancel(cancel: Option<&AtomicBool>) -> Result<()> {
+    if cancel
+        .map(|cancel| cancel.load(Ordering::Relaxed))
+        .unwrap_or(false)
+    {
+        return Err(LocalAdjustError::Cancelled);
+    }
+    Ok(())
 }
 
 pub fn evaluate_layer_mask(
@@ -1417,10 +1540,21 @@ fn apply_manual_override(
     Ok(())
 }
 
-fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result<()> {
+fn apply_layer<F>(
+    image: &mut RgbaImageBuf,
+    layer: &LocalAdjustmentLayer,
+    layer_index: usize,
+    layer_count: usize,
+    cancel: Option<&AtomicBool>,
+    progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(LocalAdjustProgress),
+{
     if matches!(&layer.effect, LocalEffect::None) {
         return Ok(());
     }
+    check_cancel(cancel)?;
     let mask = evaluate_layer_mask(image.as_ref(), layer)?;
     if let LocalEffect::Mosaic(params) = &layer.effect {
         image.pixels =
@@ -1516,10 +1650,23 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         LocalEffect::EdgeSmooth(params) => {
             apply_edge_smooth(&image.pixels, image.width, image.height, *params)
         }
-        LocalEffect::Median(params) => {
-            apply_median(&image.pixels, image.width, image.height, *params)
-        }
+        LocalEffect::Median(params) => apply_median(
+            &image.pixels,
+            image.width,
+            image.height,
+            *params,
+            cancel,
+            |percent| {
+                progress(LocalAdjustProgress {
+                    layer_index,
+                    layer_count,
+                    effect_name: layer.effect.progress_label(),
+                    percent,
+                });
+            },
+        )?,
     };
+    check_cancel(cancel)?;
     blend_rgb_with_mask(&mut image.pixels, &effected, &mask);
     Ok(())
 }
@@ -2453,7 +2600,12 @@ fn apply_motion_blur(src: &[u8], width: usize, height: usize, params: MotionBlur
 fn apply_tilt_shift(src: &[u8], width: usize, height: usize, params: TiltShiftParams) -> Vec<u8> {
     let radius = params.max_radius_px.round().clamp(0.0, 160.0) as usize;
     let strength = params.strength.clamp(0.0, 1.0);
-    if width == 0 || height == 0 || radius == 0 || strength <= f32::EPSILON {
+    if !params.range_initialized
+        || width == 0
+        || height == 0
+        || radius == 0
+        || strength <= f32::EPSILON
+    {
         return src.to_vec();
     }
 
@@ -3846,11 +3998,22 @@ fn apply_edge_smooth(src: &[u8], width: usize, height: usize, params: EdgeSmooth
     out
 }
 
-fn apply_median(src: &[u8], width: usize, height: usize, params: MedianParams) -> Vec<u8> {
+fn apply_median<F>(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: MedianParams,
+    cancel: Option<&AtomicBool>,
+    mut progress: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(f32),
+{
     let radius = params.radius_px.round().clamp(0.0, 8.0) as i32;
     let strength = params.strength.clamp(0.0, 1.0);
     if radius == 0 || strength <= f32::EPSILON || width == 0 || height == 0 {
-        return src.to_vec();
+        progress(1.0);
+        return Ok(src.to_vec());
     }
 
     let offsets = circle_offsets(radius);
@@ -3859,6 +4022,10 @@ fn apply_median(src: &[u8], width: usize, height: usize, params: MedianParams) -
     let mut green = Vec::with_capacity(offsets.len());
     let mut blue = Vec::with_capacity(offsets.len());
     for y in 0..height {
+        if y % 8 == 0 {
+            check_cancel(cancel)?;
+            progress((y as f32 / height as f32).clamp(0.0, 1.0));
+        }
         for x in 0..width {
             red.clear();
             green.clear();
@@ -3881,7 +4048,9 @@ fn apply_median(src: &[u8], width: usize, height: usize, params: MedianParams) -
             out[i + 2] = lerp_u8(src[i + 2], blue[mid], strength);
         }
     }
-    out
+    check_cancel(cancel)?;
+    progress(1.0);
+    Ok(out)
 }
 
 fn blend_rgb_with_mask(base: &mut [u8], effected: &[u8], mask: &[f32]) {
@@ -4103,6 +4272,46 @@ mod tests {
     }
 
     #[test]
+    fn apply_layers_with_progress_honors_cancel_flag() {
+        let src = solid(2, 2, [64, 96, 128, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "tone",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams {
+                brightness: 10.0,
+                ..ToneParams::default()
+            }),
+        );
+        let cancel = AtomicBool::new(true);
+        let err =
+            apply_layers_with_progress(src.as_ref(), &[layer], Some(&cancel), |_| {}).unwrap_err();
+        assert_eq!(err, LocalAdjustError::Cancelled);
+    }
+
+    #[test]
+    fn median_reports_incremental_progress() {
+        let src = solid(4, 16, [64, 96, 128, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "median",
+            LocalMask::Full,
+            LocalEffect::Median(MedianParams {
+                radius_px: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let mut progress = Vec::new();
+        apply_layers_with_progress(src.as_ref(), &[layer], None, |p| {
+            if p.effect_name == "メディアンフィルタ" {
+                progress.push(p.percent);
+            }
+        })
+        .unwrap();
+        assert!(progress.first().copied().unwrap_or(1.0) <= f32::EPSILON);
+        assert!(progress.iter().any(|&p| p >= 0.5));
+        assert!(progress.last().copied().unwrap_or(0.0) >= 1.0);
+    }
+
+    #[test]
     fn inverted_linear_gradient_flips_sides() {
         let src = solid(4, 1, [0, 0, 0, 255]);
         let mut layer = LocalAdjustmentLayer::new(
@@ -4314,6 +4523,7 @@ mod tests {
             LocalMask::Full,
             LocalEffect::TiltShift(TiltShiftParams {
                 mode: TiltShiftMode::Linear,
+                range_initialized: true,
                 center: [0.5, 0.5],
                 angle_degrees: 90.0,
                 focus_width: 0.05,

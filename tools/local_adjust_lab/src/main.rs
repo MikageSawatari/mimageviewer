@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
@@ -25,8 +26,8 @@ use local_adjust_core::{
     RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
     SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
     ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
-    ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size, evaluate_layer_mask,
-    parse_cube_lut,
+    ToneParams, VignetteParams, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -271,8 +272,22 @@ struct LoadedImage {
 
 struct RenderPending {
     generation: u64,
-    rx: mpsc::Receiver<Result<RgbaImageBuf, String>>,
+    rx: mpsc::Receiver<RenderWorkerMessage>,
+    cancel: Arc<AtomicBool>,
     started_at: Instant,
+}
+
+struct RenderProgress {
+    generation: u64,
+    layer_index: usize,
+    layer_count: usize,
+    effect_name: String,
+    percent: f32,
+}
+
+enum RenderWorkerMessage {
+    Progress(RenderProgress),
+    Done(Result<RgbaImageBuf, String>),
 }
 
 struct SegmentationPending {
@@ -1204,6 +1219,7 @@ struct LocalAdjustLabApp {
     prev_paint_pos: Option<Pos2>,
     last_paint_pos: Option<Pos2>,
     radial_gradient_drag_active: bool,
+    tilt_shift_drag_active: bool,
     boundary_edge_threshold: f32,
     boundary_ink_threshold: f32,
     boundary_gap_px: f32,
@@ -1281,6 +1297,7 @@ impl LocalAdjustLabApp {
             prev_paint_pos: None,
             last_paint_pos: None,
             radial_gradient_drag_active: false,
+            tilt_shift_drag_active: false,
             boundary_edge_threshold: 24.0,
             boundary_ink_threshold: 28.0,
             boundary_gap_px: 2.0,
@@ -1345,7 +1362,7 @@ impl LocalAdjustLabApp {
                 self.layers = Vec::new();
                 self.selected_layer = 0;
                 self.result = None;
-                self.pending = None;
+                self.cancel_pending_render();
                 self.segmentation_pending = None;
                 self.lut_load_pending = None;
                 self.image = Some(loaded);
@@ -1366,6 +1383,7 @@ impl LocalAdjustLabApp {
                 self.workflow_panel = LabWorkflowPanel::Adjust;
                 self.override_edit_panel = None;
                 self.radial_gradient_drag_active = false;
+                self.tilt_shift_drag_active = false;
                 self.edge_brush_seed = None;
                 self.selective_color_pick_active = false;
                 let load_status = format!("読み込み: {}", path.display());
@@ -1385,6 +1403,7 @@ impl LocalAdjustLabApp {
     }
 
     fn mark_dirty(&mut self) {
+        self.cancel_pending_render();
         self.generation = self.generation.wrapping_add(1);
         self.result_dirty = true;
         self.mask_dirty = true;
@@ -1407,6 +1426,7 @@ impl LocalAdjustLabApp {
     }
 
     fn mark_dirty_tiles(&mut self, new_tiles: BTreeSet<(usize, usize)>) {
+        self.cancel_pending_render();
         self.generation = self.generation.wrapping_add(1);
         self.result_dirty = true;
         if new_tiles.is_empty() {
@@ -1423,6 +1443,12 @@ impl LocalAdjustLabApp {
         tiles.extend(new_tiles);
         self.mask_dirty = true;
         self.last_edit = Instant::now();
+    }
+
+    fn cancel_pending_render(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     fn push_undo_snapshot(&mut self) {
@@ -1639,6 +1665,7 @@ impl LocalAdjustLabApp {
         if panel != LabWorkflowPanel::Adjust {
             self.shape_drag = None;
             self.radial_gradient_drag_active = false;
+            self.tilt_shift_drag_active = false;
         }
         if panel == LabWorkflowPanel::Crop {
             self.ensure_crop_rect();
@@ -1957,43 +1984,86 @@ impl LocalAdjustLabApp {
     }
 
     fn poll_render(&mut self, ctx: &egui::Context) {
-        let Some(pending) = &self.pending else {
-            return;
-        };
-        match pending.rx.try_recv() {
-            Ok(Ok(result)) => {
-                let generation = pending.generation;
-                let render_ms = pending.started_at.elapsed().as_secs_f64() * 1000.0;
-                self.pending = None;
-                self.perf_stats.render_jobs += 1;
-                self.perf_stats.render_ms_total += render_ms;
-                self.perf_stats.render_ms_max = self.perf_stats.render_ms_max.max(render_ms);
-                if generation == self.generation {
-                    let color_image = color_image_from_rgba(&result);
-                    if let Some(texture) = &mut self.result_texture {
-                        texture.set(color_image, TextureOptions::LINEAR);
-                    } else {
-                        self.result_texture = Some(ctx.load_texture(
-                            "local_adjust_result",
-                            color_image,
-                            TextureOptions::LINEAR,
-                        ));
+        let (messages, disconnected) = {
+            let Some(pending) = self.pending.as_ref() else {
+                return;
+            };
+            let mut messages = Vec::new();
+            let mut disconnected = false;
+            loop {
+                match pending.rx.try_recv() {
+                    Ok(message) => messages.push(message),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
                     }
-                    self.status = format!("再合成完了: generation {generation}");
-                    self.result = Some(result);
-                } else {
-                    self.status = "古い再合成結果を破棄しました。".to_string();
                 }
             }
-            Ok(Err(e)) => {
-                self.pending = None;
-                self.status = format!("再合成失敗: {e}");
+            (messages, disconnected)
+        };
+
+        for message in messages {
+            match message {
+                RenderWorkerMessage::Progress(progress) => {
+                    if progress.generation == self.generation {
+                        self.status = format!(
+                            "再合成中: {} {:.0}% ({}/{})",
+                            progress.effect_name,
+                            (progress.percent.clamp(0.0, 1.0) * 100.0).round(),
+                            progress.layer_index + 1,
+                            progress.layer_count.max(1)
+                        );
+                        ctx.request_repaint();
+                    }
+                }
+                RenderWorkerMessage::Done(result) => {
+                    let Some(pending) = self.pending.take() else {
+                        continue;
+                    };
+                    let generation = pending.generation;
+                    let render_ms = pending.started_at.elapsed().as_secs_f64() * 1000.0;
+                    self.perf_stats.render_jobs += 1;
+                    self.perf_stats.render_ms_total += render_ms;
+                    self.perf_stats.render_ms_max = self.perf_stats.render_ms_max.max(render_ms);
+                    match result {
+                        Ok(result) => {
+                            if generation == self.generation {
+                                let color_image = color_image_from_rgba(&result);
+                                if let Some(texture) = &mut self.result_texture {
+                                    texture.set(color_image, TextureOptions::LINEAR);
+                                } else {
+                                    self.result_texture = Some(ctx.load_texture(
+                                        "local_adjust_result",
+                                        color_image,
+                                        TextureOptions::LINEAR,
+                                    ));
+                                }
+                                self.status = format!("再合成完了: generation {generation}");
+                                self.result = Some(result);
+                            } else {
+                                self.status = "古い再合成結果を破棄しました。".to_string();
+                            }
+                        }
+                        Err(e) if e == "cancelled" => {
+                            self.status = "再合成をキャンセルしました。".to_string();
+                            if self.result_dirty {
+                                ctx.request_repaint();
+                            }
+                        }
+                        Err(e) => {
+                            self.status = format!("再合成失敗: {e}");
+                        }
+                    }
+                }
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.pending = None;
-                self.status = "再合成 worker が停止しました。".to_string();
-            }
+        }
+        if disconnected && self.pending.is_some() {
+            self.pending = None;
+            self.status = "再合成 worker が停止しました。".to_string();
+        }
+        if self.pending.is_some() {
+            ctx.request_repaint();
         }
     }
 
@@ -2319,18 +2389,50 @@ impl LocalAdjustLabApp {
         let layers = self.preview_layers();
         let generation = self.generation;
         let limited_preview = self.preview_to_selected_layer && layers.len() < self.layers.len();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
         let spawn_result = std::thread::Builder::new()
             .name("local-adjust-lab-render".to_string())
             .spawn(move || {
-                let result = apply_layers(source.as_ref(), &layers).map_err(|e| e.to_string());
-                let _ = tx.send(result);
+                let progress_tx = tx.clone();
+                let mut last_layer = usize::MAX;
+                let mut last_percent = -1.0_f32;
+                let result = apply_layers_with_progress(
+                    source.as_ref(),
+                    &layers,
+                    Some(worker_cancel.as_ref()),
+                    |progress| {
+                        if worker_cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let rounded_percent = (progress.percent.clamp(0.0, 1.0) * 100.0).round();
+                        let should_send = progress.layer_index != last_layer
+                            || rounded_percent - last_percent >= 5.0
+                            || rounded_percent >= 100.0;
+                        if should_send {
+                            last_layer = progress.layer_index;
+                            last_percent = rounded_percent;
+                            let _ =
+                                progress_tx.send(RenderWorkerMessage::Progress(RenderProgress {
+                                    generation,
+                                    layer_index: progress.layer_index,
+                                    layer_count: progress.layer_count,
+                                    effect_name: progress.effect_name.to_string(),
+                                    percent: progress.percent,
+                                }));
+                        }
+                    },
+                )
+                .map_err(|e| e.to_string());
+                let _ = tx.send(RenderWorkerMessage::Done(result));
             });
         match spawn_result {
             Ok(_) => {
                 self.pending = Some(RenderPending {
                     generation,
                     rx,
+                    cancel,
                     started_at: Instant::now(),
                 });
                 self.result_dirty = false;
@@ -3802,6 +3904,11 @@ impl LocalAdjustLabApp {
         } else {
             self.draw_gradient_handles(ui, rect)
         };
+        let tilt_shift_handle_used = if pan_mode || !adjust_panel_active || dialog_open {
+            false
+        } else {
+            self.draw_tilt_shift_handles(ui, rect)
+        };
         let crop_used = self.draw_crop_overlay(
             ui,
             rect,
@@ -3825,7 +3932,7 @@ impl LocalAdjustLabApp {
             let pointer = ui.input(|i| i.pointer.interact_pos());
             if let Some(pointer_screen) = pointer {
                 let pos = screen_to_image(rect, img_w, img_h, pointer_screen);
-                if !gradient_handle_used {
+                if !gradient_handle_used && !tilt_shift_handle_used {
                     if let Some(pos) = pos {
                         if self.selective_color_pick_active {
                             if response.clicked() || ui.input(|i| i.pointer.primary_pressed()) {
@@ -4991,6 +5098,37 @@ impl LocalAdjustLabApp {
             if override_editing_active {
                 return;
             }
+            let tilt_shift_range_initialized = self.selected_layer_ref().and_then(|layer| {
+                if let LocalEffect::TiltShift(params) = &layer.effect {
+                    Some(params.range_initialized)
+                } else {
+                    None
+                }
+            });
+            if let Some(initialized) = tilt_shift_range_initialized {
+                if secondary_pressed && initialized {
+                    self.push_undo_snapshot();
+                    if let Some(layer) = self.selected_layer_mut()
+                        && let LocalEffect::TiltShift(params) = &mut layer.effect
+                    {
+                        params.range_initialized = false;
+                    }
+                    self.tilt_shift_drag_active = false;
+                    self.status = "チルトぼかし範囲をクリアしました。".to_string();
+                    self.mark_dirty();
+                    return;
+                }
+                if primary_down && (!initialized || self.tilt_shift_drag_active) {
+                    let started = !self.tilt_shift_drag_active;
+                    if started {
+                        self.push_undo_snapshot();
+                        self.tilt_shift_drag_active = true;
+                    }
+                    self.drag_tilt_shift_range(pos, started);
+                    return;
+                }
+                return;
+            }
             match self.selected_layer_ref().map(|layer| &layer.mask) {
                 Some(LocalMask::LinearGradient(_)) => {
                     if primary_down {
@@ -5780,6 +5918,265 @@ impl LocalAdjustLabApp {
         used
     }
 
+    fn draw_tilt_shift_handles(&mut self, ui: &mut egui::Ui, rect: Rect) -> bool {
+        let Some(layer_idx) = self
+            .layers
+            .get(self.selected_layer)
+            .map(|_| self.selected_layer)
+        else {
+            return false;
+        };
+        let mut changed = false;
+        let used;
+        let painter = ui.painter().clone();
+        let stroke = egui::Stroke::new(2.0, Color32::from_rgb(100, 220, 255));
+        let soft_stroke =
+            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(100, 220, 255, 150));
+        let focus_stroke =
+            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 230, 120, 180));
+        let handle_fill = Color32::from_rgb(210, 245, 255);
+        let focus_fill = Color32::from_rgb(255, 238, 150);
+        let outer_fill = Color32::from_rgb(120, 220, 255);
+        let handle_stroke = egui::Stroke::new(2.0, Color32::from_rgb(10, 30, 36));
+
+        let LocalEffect::TiltShift(params) = &mut self.layers[layer_idx].effect else {
+            return false;
+        };
+        if !params.range_initialized {
+            return false;
+        }
+
+        match params.mode {
+            TiltShiftMode::Linear => {
+                let center = norm_to_screen(rect, params.center);
+                let angle = params.angle_degrees.to_radians();
+                let dir = [angle.cos(), angle.sin()];
+                let perp = [-dir[1], dir[0]];
+                let focus = params.focus_width.max(0.0);
+                let outer = focus + params.falloff.max(0.001);
+
+                let draw_boundary = |amount: f32, stroke: egui::Stroke| {
+                    let base = offset_norm(params.center, dir, amount);
+                    let a = norm_to_screen_unclamped(rect, offset_norm(base, perp, -1.6));
+                    let b = norm_to_screen_unclamped(rect, offset_norm(base, perp, 1.6));
+                    painter.line_segment([a, b], stroke);
+                };
+
+                if params.far_only {
+                    painter.line_segment(
+                        [
+                            center,
+                            norm_to_screen_unclamped(rect, offset_norm(params.center, dir, outer)),
+                        ],
+                        stroke,
+                    );
+                    draw_boundary(focus, focus_stroke);
+                    draw_boundary(outer, stroke);
+                } else {
+                    painter.line_segment(
+                        [
+                            norm_to_screen_unclamped(rect, offset_norm(params.center, dir, -outer)),
+                            norm_to_screen_unclamped(rect, offset_norm(params.center, dir, outer)),
+                        ],
+                        stroke,
+                    );
+                    draw_boundary(-focus, focus_stroke);
+                    draw_boundary(focus, focus_stroke);
+                    draw_boundary(-outer, soft_stroke);
+                    draw_boundary(outer, stroke);
+                }
+
+                let focus_handle =
+                    norm_to_screen_unclamped(rect, offset_norm(params.center, dir, focus));
+                let outer_handle =
+                    norm_to_screen_unclamped(rect, offset_norm(params.center, dir, outer));
+                let (center_changed, center_used) = drag_norm_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("tilt_center", layer_idx)),
+                    center,
+                    &mut params.center,
+                    "中心",
+                );
+                let focus_resp = ui
+                    .interact(
+                        Rect::from_center_size(focus_handle, egui::vec2(26.0, 26.0)),
+                        ui.id().with(("tilt_focus", layer_idx)),
+                        Sense::drag(),
+                    )
+                    .lab_hover_tip("焦点幅");
+                if focus_resp.dragged()
+                    && let Some(pos) = focus_resp.interact_pointer_pos()
+                {
+                    let n = screen_to_norm(rect, pos);
+                    let dx = n[0] - params.center[0];
+                    let dy = n[1] - params.center[1];
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    if distance > 0.001 {
+                        params.angle_degrees = dy.atan2(dx).to_degrees();
+                        params.focus_width = distance.min(0.8);
+                        params.falloff = params.falloff.max(0.001);
+                        changed = true;
+                    }
+                }
+                let outer_resp = ui
+                    .interact(
+                        Rect::from_center_size(outer_handle, egui::vec2(28.0, 28.0)),
+                        ui.id().with(("tilt_outer", layer_idx)),
+                        Sense::drag(),
+                    )
+                    .lab_hover_tip("ぼかし境界");
+                if outer_resp.dragged()
+                    && let Some(pos) = outer_resp.interact_pointer_pos()
+                {
+                    let n = screen_to_norm(rect, pos);
+                    let dx = n[0] - params.center[0];
+                    let dy = n[1] - params.center[1];
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    if distance > 0.001 {
+                        params.angle_degrees = dy.atan2(dx).to_degrees();
+                        params.falloff =
+                            (distance - params.focus_width.max(0.0)).max(0.001).min(1.2);
+                        changed = true;
+                    }
+                }
+                painter.circle_filled(center, 6.0, handle_fill);
+                painter.circle_stroke(center, 6.0, handle_stroke);
+                painter.circle_filled(focus_handle, 5.0, focus_fill);
+                painter.circle_stroke(focus_handle, 5.0, handle_stroke);
+                painter.circle_filled(outer_handle, 6.0, outer_fill);
+                painter.circle_stroke(outer_handle, 6.0, handle_stroke);
+                changed |= center_changed;
+                used = center_used
+                    || focus_resp.hovered()
+                    || focus_resp.dragged()
+                    || outer_resp.hovered()
+                    || outer_resp.dragged();
+            }
+            TiltShiftMode::Radial => {
+                let center = norm_to_screen(rect, params.center);
+                let inner_rx = params.radius[0].max(0.001) * rect.width();
+                let inner_ry = params.radius[1].max(0.001) * rect.height();
+                let outer_rx =
+                    params.radius[0].max(0.001) * (1.0 + params.falloff.max(0.001)) * rect.width();
+                let outer_ry =
+                    params.radius[1].max(0.001) * (1.0 + params.falloff.max(0.001)) * rect.height();
+                draw_ellipse_stroke(&painter, center, inner_rx, inner_ry, focus_stroke);
+                draw_ellipse_stroke(&painter, center, outer_rx, outer_ry, stroke);
+
+                let inner_x_handle = Pos2::new(center.x + inner_rx, center.y);
+                let inner_y_handle = Pos2::new(center.x, center.y + inner_ry);
+                let outer_x_handle = Pos2::new(center.x + outer_rx, center.y);
+                let outer_y_handle = Pos2::new(center.x, center.y + outer_ry);
+
+                let (center_changed, center_used) = drag_norm_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("tilt_radial_center", layer_idx)),
+                    center,
+                    &mut params.center,
+                    "中心",
+                );
+                let inner_x_resp = ui
+                    .interact(
+                        Rect::from_center_size(inner_x_handle, egui::vec2(26.0, 26.0)),
+                        ui.id().with(("tilt_inner_x", layer_idx)),
+                        Sense::drag(),
+                    )
+                    .lab_hover_tip("焦点 横");
+                if inner_x_resp.dragged()
+                    && let Some(pos) = inner_x_resp.interact_pointer_pos()
+                {
+                    let n = screen_to_norm(rect, pos);
+                    params.radius[0] = (n[0] - params.center[0]).abs().clamp(0.001, 1.2);
+                    changed = true;
+                }
+                let inner_y_resp = ui
+                    .interact(
+                        Rect::from_center_size(inner_y_handle, egui::vec2(26.0, 26.0)),
+                        ui.id().with(("tilt_inner_y", layer_idx)),
+                        Sense::drag(),
+                    )
+                    .lab_hover_tip("焦点 縦");
+                if inner_y_resp.dragged()
+                    && let Some(pos) = inner_y_resp.interact_pointer_pos()
+                {
+                    let n = screen_to_norm(rect, pos);
+                    params.radius[1] = (n[1] - params.center[1]).abs().clamp(0.001, 1.2);
+                    changed = true;
+                }
+                let outer_x_resp = ui
+                    .interact(
+                        Rect::from_center_size(outer_x_handle, egui::vec2(28.0, 28.0)),
+                        ui.id().with(("tilt_outer_x", layer_idx)),
+                        Sense::drag(),
+                    )
+                    .lab_hover_tip("ぼかし境界 横");
+                if outer_x_resp.dragged()
+                    && let Some(pos) = outer_x_resp.interact_pointer_pos()
+                {
+                    let n = screen_to_norm(rect, pos);
+                    let outer = (n[0] - params.center[0]).abs();
+                    params.falloff = (outer / params.radius[0].max(0.001) - 1.0)
+                        .max(0.001)
+                        .min(1.2);
+                    changed = true;
+                }
+                let outer_y_resp = ui
+                    .interact(
+                        Rect::from_center_size(outer_y_handle, egui::vec2(28.0, 28.0)),
+                        ui.id().with(("tilt_outer_y", layer_idx)),
+                        Sense::drag(),
+                    )
+                    .lab_hover_tip("ぼかし境界 縦");
+                if outer_y_resp.dragged()
+                    && let Some(pos) = outer_y_resp.interact_pointer_pos()
+                {
+                    let n = screen_to_norm(rect, pos);
+                    let outer = (n[1] - params.center[1]).abs();
+                    params.falloff = (outer / params.radius[1].max(0.001) - 1.0)
+                        .max(0.001)
+                        .min(1.2);
+                    changed = true;
+                }
+                painter.line_segment(
+                    [Pos2::new(center.x - outer_rx, center.y), outer_x_handle],
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(100, 220, 255, 110)),
+                );
+                painter.line_segment(
+                    [Pos2::new(center.x, center.y - outer_ry), outer_y_handle],
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(100, 220, 255, 110)),
+                );
+                painter.circle_filled(center, 6.0, handle_fill);
+                painter.circle_stroke(center, 6.0, handle_stroke);
+                painter.circle_filled(inner_x_handle, 5.0, focus_fill);
+                painter.circle_stroke(inner_x_handle, 5.0, handle_stroke);
+                painter.circle_filled(inner_y_handle, 5.0, focus_fill);
+                painter.circle_stroke(inner_y_handle, 5.0, handle_stroke);
+                painter.circle_filled(outer_x_handle, 6.0, outer_fill);
+                painter.circle_stroke(outer_x_handle, 6.0, handle_stroke);
+                painter.circle_filled(outer_y_handle, 6.0, outer_fill);
+                painter.circle_stroke(outer_y_handle, 6.0, handle_stroke);
+                changed |= center_changed;
+                used = center_used
+                    || inner_x_resp.hovered()
+                    || inner_x_resp.dragged()
+                    || inner_y_resp.hovered()
+                    || inner_y_resp.dragged()
+                    || outer_x_resp.hovered()
+                    || outer_x_resp.dragged()
+                    || outer_y_resp.hovered()
+                    || outer_y_resp.dragged();
+            }
+        }
+
+        if changed {
+            params.range_initialized = true;
+            self.mark_dirty();
+        }
+        used
+    }
+
     fn draw_crop_overlay(
         &mut self,
         ui: &mut egui::Ui,
@@ -6004,6 +6401,64 @@ impl LocalAdjustLabApp {
             _ => {}
         }
     }
+
+    fn drag_tilt_shift_range(&mut self, image_pos: Pos2, started: bool) {
+        let Some((w, h)) = self.image_dims() else {
+            return;
+        };
+        let n = [
+            (image_pos.x / w.max(1) as f32).clamp(0.0, 1.0),
+            (image_pos.y / h.max(1) as f32).clamp(0.0, 1.0),
+        ];
+        let Some(layer) = self.selected_layer_mut() else {
+            return;
+        };
+        let LocalEffect::TiltShift(params) = &mut layer.effect else {
+            return;
+        };
+        if started {
+            params.range_initialized = true;
+            params.center = n;
+            if params.strength <= f32::EPSILON {
+                params.strength = 1.0;
+            }
+            if params.max_radius_px <= f32::EPSILON {
+                params.max_radius_px = 20.0;
+            }
+            match params.mode {
+                TiltShiftMode::Linear => {
+                    params.focus_width = 0.0;
+                    params.falloff = 0.001;
+                }
+                TiltShiftMode::Radial => {
+                    params.radius = [0.001, 0.001];
+                    params.falloff = 0.40;
+                }
+            }
+        } else {
+            let dx = n[0] - params.center[0];
+            let dy = n[1] - params.center[1];
+            match params.mode {
+                TiltShiftMode::Linear => {
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    if distance > 0.001 {
+                        params.angle_degrees = dy.atan2(dx).to_degrees();
+                        params.focus_width = (distance * 0.35).clamp(0.0, 0.8);
+                        params.falloff = (distance * 0.65).clamp(0.001, 1.2);
+                    }
+                }
+                TiltShiftMode::Radial => {
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    if distance > 0.001 {
+                        let rx = dx.abs().max(distance * 0.35).clamp(0.001, 1.2);
+                        let ry = dy.abs().max(distance * 0.35).clamp(0.001, 1.2);
+                        params.radius = [rx, ry];
+                    }
+                }
+            }
+        }
+        self.mark_dirty();
+    }
 }
 
 impl eframe::App for LocalAdjustLabApp {
@@ -6038,6 +6493,7 @@ impl eframe::App for LocalAdjustLabApp {
         if !ctx.input(|i| i.pointer.primary_down()) {
             self.edge_brush_seed = None;
             self.radial_gradient_drag_active = false;
+            self.tilt_shift_drag_active = false;
         }
 
         if ctx.input(|i| i.key_pressed(Key::S) && i.modifiers.ctrl) {
@@ -7788,6 +8244,7 @@ fn draw_effect_params(
                 if preset_button(ui, "奥ぼかし") {
                     *params = TiltShiftParams {
                         mode: TiltShiftMode::Linear,
+                        range_initialized: true,
                         center: [0.5, 0.58],
                         angle_degrees: -90.0,
                         focus_width: 0.10,
@@ -7802,6 +8259,7 @@ fn draw_effect_params(
                 if preset_button(ui, "ミニチュア") {
                     *params = TiltShiftParams {
                         mode: TiltShiftMode::Linear,
+                        range_initialized: true,
                         center: [0.5, 0.52],
                         angle_degrees: -90.0,
                         focus_width: 0.08,
@@ -7816,6 +8274,7 @@ fn draw_effect_params(
                 if preset_button(ui, "円形") {
                     *params = TiltShiftParams {
                         mode: TiltShiftMode::Radial,
+                        range_initialized: true,
                         center: [0.5, 0.5],
                         angle_degrees: -90.0,
                         focus_width: 0.12,
@@ -7830,6 +8289,7 @@ fn draw_effect_params(
                 if preset_button(ui, "斜め") {
                     *params = TiltShiftParams {
                         mode: TiltShiftMode::Linear,
+                        range_initialized: true,
                         center: [0.5, 0.5],
                         angle_degrees: -35.0,
                         focus_width: 0.10,
@@ -7905,6 +8365,9 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からチルトシフト結果へどれだけ近づけるかです。");
+            if changed {
+                params.range_initialized = true;
+            }
         }
         LocalEffect::LensBlur(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -11904,6 +12367,20 @@ fn norm_to_screen(rect: Rect, n: [f32; 2]) -> Pos2 {
         rect.left() + n[0].clamp(0.0, 1.0) * rect.width(),
         rect.top() + n[1].clamp(0.0, 1.0) * rect.height(),
     )
+}
+
+fn norm_to_screen_unclamped(rect: Rect, n: [f32; 2]) -> Pos2 {
+    Pos2::new(
+        rect.left() + n[0] * rect.width(),
+        rect.top() + n[1] * rect.height(),
+    )
+}
+
+fn offset_norm(base: [f32; 2], direction: [f32; 2], amount: f32) -> [f32; 2] {
+    [
+        base[0] + direction[0] * amount,
+        base[1] + direction[1] * amount,
+    ]
 }
 
 fn screen_to_norm(rect: Rect, p: Pos2) -> [f32; 2] {
