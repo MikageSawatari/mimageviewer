@@ -601,6 +601,7 @@ pub enum LocalEffect {
     ChromaticAberration(ChromaticAberrationParams),
     ScanlineGlitch(ScanlineGlitchParams),
     Vhs(VhsParams),
+    PixelSort(PixelSortParams),
     Halftone(HalftoneParams),
     ScreenTone(ScreenToneParams),
     ColorHalftone(ColorHalftoneParams),
@@ -690,6 +691,7 @@ impl LocalEffect {
             Self::ChromaticAberration(_) => "色収差",
             Self::ScanlineGlitch(_) => "走査線グリッチ",
             Self::Vhs(_) => "VHS/アナログビデオ",
+            Self::PixelSort(_) => "ピクセルソート",
             Self::Halftone(_) => "ハーフトーン",
             Self::ScreenTone(_) => "スクリーントーン",
             Self::ColorHalftone(_) => "カラーハーフトーン",
@@ -2938,6 +2940,55 @@ impl Default for VhsParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PixelSortDirection {
+    Horizontal,
+    Vertical,
+}
+
+impl Default for PixelSortDirection {
+    fn default() -> Self {
+        Self::Horizontal
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PixelSortOrder {
+    DarkToLight,
+    LightToDark,
+}
+
+impl Default for PixelSortOrder {
+    fn default() -> Self {
+        Self::LightToDark
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PixelSortParams {
+    pub direction: PixelSortDirection,
+    pub order: PixelSortOrder,
+    pub low_threshold: f32,
+    pub high_threshold: f32,
+    pub max_segment_px: u32,
+    pub strength: f32,
+}
+
+impl Default for PixelSortParams {
+    fn default() -> Self {
+        Self {
+            direction: PixelSortDirection::Horizontal,
+            order: PixelSortOrder::LightToDark,
+            low_threshold: 0.35,
+            high_threshold: 0.95,
+            max_segment_px: 160,
+            strength: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HalftoneParams {
     pub cell_px: u32,
@@ -3618,6 +3669,9 @@ where
             }
             LocalEffect::Vhs(params) => {
                 apply_vhs(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::PixelSort(params) => {
+                apply_pixel_sort(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::Halftone(params) => {
                 apply_halftone(&image.pixels, image.width, image.height, *params)
@@ -10035,6 +10089,172 @@ fn vhs_ycbcr_to_rgb(y: f32, cb: f32, cr: f32) -> [f32; 3] {
     [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]
 }
 
+fn apply_pixel_sort(src: &[u8], width: usize, height: usize, params: PixelSortParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let low = params
+        .low_threshold
+        .clamp(0.0, 1.0)
+        .min(params.high_threshold.clamp(0.0, 1.0));
+    let high = params
+        .low_threshold
+        .clamp(0.0, 1.0)
+        .max(params.high_threshold.clamp(0.0, 1.0));
+    let max_segment = params.max_segment_px.clamp(2, 512) as usize;
+    let mut out = src.to_vec();
+    let mut indices = Vec::with_capacity(max_segment);
+    let mut samples = Vec::with_capacity(max_segment);
+
+    match params.direction {
+        PixelSortDirection::Horizontal => {
+            for y in 0..height {
+                let mut x = 0;
+                while x < width {
+                    indices.clear();
+                    while x < width {
+                        let i = (y * width + x) * 4;
+                        if pixel_sort_eligible(src, i, low, high) {
+                            break;
+                        }
+                        x += 1;
+                    }
+                    while x < width {
+                        let i = (y * width + x) * 4;
+                        if !pixel_sort_eligible(src, i, low, high) {
+                            break;
+                        }
+                        indices.push(i);
+                        if indices.len() == max_segment {
+                            apply_pixel_sort_segment(
+                                src,
+                                &mut out,
+                                &indices,
+                                params.order,
+                                strength,
+                                &mut samples,
+                            );
+                            indices.clear();
+                        }
+                        x += 1;
+                    }
+                    apply_pixel_sort_segment(
+                        src,
+                        &mut out,
+                        &indices,
+                        params.order,
+                        strength,
+                        &mut samples,
+                    );
+                }
+            }
+        }
+        PixelSortDirection::Vertical => {
+            for x in 0..width {
+                let mut y = 0;
+                while y < height {
+                    indices.clear();
+                    while y < height {
+                        let i = (y * width + x) * 4;
+                        if pixel_sort_eligible(src, i, low, high) {
+                            break;
+                        }
+                        y += 1;
+                    }
+                    while y < height {
+                        let i = (y * width + x) * 4;
+                        if !pixel_sort_eligible(src, i, low, high) {
+                            break;
+                        }
+                        indices.push(i);
+                        if indices.len() == max_segment {
+                            apply_pixel_sort_segment(
+                                src,
+                                &mut out,
+                                &indices,
+                                params.order,
+                                strength,
+                                &mut samples,
+                            );
+                            indices.clear();
+                        }
+                        y += 1;
+                    }
+                    apply_pixel_sort_segment(
+                        src,
+                        &mut out,
+                        &indices,
+                        params.order,
+                        strength,
+                        &mut samples,
+                    );
+                }
+            }
+        }
+    }
+
+    out
+}
+
+#[derive(Clone, Copy)]
+struct PixelSortSample {
+    rgb: [u8; 3],
+    luma: f32,
+}
+
+fn pixel_sort_eligible(src: &[u8], i: usize, low: f32, high: f32) -> bool {
+    if src[i + 3] == 0 {
+        return false;
+    }
+    let luma = luma01(
+        src[i] as f32 / 255.0,
+        src[i + 1] as f32 / 255.0,
+        src[i + 2] as f32 / 255.0,
+    );
+    luma >= low && luma <= high
+}
+
+fn apply_pixel_sort_segment(
+    src: &[u8],
+    out: &mut [u8],
+    indices: &[usize],
+    order: PixelSortOrder,
+    strength: f32,
+    samples: &mut Vec<PixelSortSample>,
+) {
+    if indices.len() < 2 {
+        return;
+    }
+    samples.clear();
+    samples.extend(indices.iter().map(|&i| {
+        let r = src[i] as f32 / 255.0;
+        let g = src[i + 1] as f32 / 255.0;
+        let b = src[i + 2] as f32 / 255.0;
+        PixelSortSample {
+            rgb: [src[i], src[i + 1], src[i + 2]],
+            luma: luma01(r, g, b),
+        }
+    }));
+    samples.sort_by(|a, b| match order {
+        PixelSortOrder::DarkToLight => a
+            .luma
+            .partial_cmp(&b.luma)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        PixelSortOrder::LightToDark => b
+            .luma
+            .partial_cmp(&a.luma)
+            .unwrap_or(std::cmp::Ordering::Equal),
+    });
+
+    for (&i, sample) in indices.iter().zip(samples.iter()) {
+        for c in 0..3 {
+            out[i + c] = lerp_u8(src[i + c], sample.rgb[c], strength);
+        }
+    }
+}
+
 fn apply_halftone(src: &[u8], width: usize, height: usize, params: HalftoneParams) -> Vec<u8> {
     let cell = params.cell_px.clamp(2, 96) as usize;
     let strength = params.strength.clamp(0.0, 1.0);
@@ -13095,6 +13315,7 @@ mod tests {
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
             LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
             LocalEffect::Vhs(VhsParams::default()),
+            LocalEffect::PixelSort(PixelSortParams::default()),
             LocalEffect::Halftone(HalftoneParams::default()),
             LocalEffect::ScreenTone(ScreenToneParams::default()),
             LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
@@ -13786,6 +14007,17 @@ mod tests {
                     noise: 1.0,
                     desaturation: 1.0,
                     seed: 20,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "pixel sort max vertical segment",
+                LocalEffect::PixelSort(PixelSortParams {
+                    direction: PixelSortDirection::Vertical,
+                    order: PixelSortOrder::LightToDark,
+                    low_threshold: 0.0,
+                    high_threshold: 1.0,
+                    max_segment_px: 512,
                     strength: 1.0,
                 }),
             ),
@@ -15761,6 +15993,115 @@ LUT_3D_SIZE 2
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(&out.pixels[0..4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn pixel_sort_sorts_horizontal_luma_range() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![10, 10, 10, 255, 200, 200, 200, 255, 100, 100, 100, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "pixel sort",
+            LocalMask::Full,
+            LocalEffect::PixelSort(PixelSortParams {
+                direction: PixelSortDirection::Horizontal,
+                order: PixelSortOrder::DarkToLight,
+                low_threshold: 0.0,
+                high_threshold: 1.0,
+                max_segment_px: 16,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(
+            &out.pixels[0..12],
+            &[10, 10, 10, 255, 100, 100, 100, 255, 200, 200, 200, 255]
+        );
+    }
+
+    #[test]
+    fn pixel_sort_sorts_vertical_light_to_dark() {
+        let src = RgbaImageBuf::new(
+            1,
+            3,
+            vec![10, 10, 10, 255, 200, 200, 200, 255, 100, 100, 100, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "pixel sort",
+            LocalMask::Full,
+            LocalEffect::PixelSort(PixelSortParams {
+                direction: PixelSortDirection::Vertical,
+                order: PixelSortOrder::LightToDark,
+                low_threshold: 0.0,
+                high_threshold: 1.0,
+                max_segment_px: 16,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(
+            &out.pixels[0..12],
+            &[200, 200, 200, 255, 100, 100, 100, 255, 10, 10, 10, 255]
+        );
+    }
+
+    #[test]
+    fn pixel_sort_threshold_keeps_dark_separator_in_place() {
+        let src = RgbaImageBuf::new(
+            4,
+            1,
+            vec![
+                20, 20, 20, 255, 180, 180, 180, 255, 100, 100, 100, 255, 220, 220, 220, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "pixel sort",
+            LocalMask::Full,
+            LocalEffect::PixelSort(PixelSortParams {
+                direction: PixelSortDirection::Horizontal,
+                order: PixelSortOrder::DarkToLight,
+                low_threshold: 0.30,
+                high_threshold: 0.95,
+                max_segment_px: 16,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(
+            &out.pixels[0..16],
+            &[
+                20, 20, 20, 255, 100, 100, 100, 255, 180, 180, 180, 255, 220, 220, 220, 255
+            ]
+        );
+    }
+
+    #[test]
+    fn pixel_sort_transparent_pixel_breaks_segment() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![0, 0, 0, 255, 255, 255, 255, 0, 128, 128, 128, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "pixel sort",
+            LocalMask::Full,
+            LocalEffect::PixelSort(PixelSortParams {
+                direction: PixelSortDirection::Horizontal,
+                order: PixelSortOrder::LightToDark,
+                low_threshold: 0.0,
+                high_threshold: 1.0,
+                max_segment_px: 16,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
     }
 
     #[test]

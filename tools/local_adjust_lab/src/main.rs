@@ -30,18 +30,19 @@ use local_adjust_core::{
     LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams,
     MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams,
     NoiseDistribution, NoiseParams, OilPaintParams, OrtonParams, OutlineStrokeParams,
-    OutlineStrokePlacement, PartColorParams, PinchSpherizeParams, PixelStylizeMode,
-    PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
-    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
-    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams,
-    ScanlineGlitchParams, ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp,
-    SharpenParams, SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode,
-    SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement,
-    TextureParams, TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams,
-    VhsParams, VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
-    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
+    OutlineStrokePlacement, PartColorParams, PinchSpherizeParams, PixelSortDirection,
+    PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
+    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
+    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
+    RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode, ScreenToneParams,
+    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
+    SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask,
+    SubjectMaskRefinement, TextureParams, TextureizerMode, TextureizerParams,
+    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
+    ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams, WaveDistortionMode,
+    WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1056,6 +1057,7 @@ enum EffectKind {
     ChromaticAberration,
     ScanlineGlitch,
     Vhs,
+    PixelSort,
     Halftone,
     ScreenTone,
     ColorHalftone,
@@ -1194,6 +1196,7 @@ impl EffectKind {
             LocalEffect::ChromaticAberration(_) => Self::ChromaticAberration,
             LocalEffect::ScanlineGlitch(_) => Self::ScanlineGlitch,
             LocalEffect::Vhs(_) => Self::Vhs,
+            LocalEffect::PixelSort(_) => Self::PixelSort,
             LocalEffect::Halftone(_) => Self::Halftone,
             LocalEffect::ScreenTone(_) => Self::ScreenTone,
             LocalEffect::ColorHalftone(_) => Self::ColorHalftone,
@@ -1283,6 +1286,7 @@ impl EffectKind {
             Self::ChromaticAberration => "色収差",
             Self::ScanlineGlitch => "走査線グリッチ",
             Self::Vhs => "VHS/アナログ",
+            Self::PixelSort => "ピクセルソート",
             Self::Halftone => "ハーフトーン",
             Self::ScreenTone => "スクリーントーン",
             Self::ColorHalftone => "カラーハーフトーン",
@@ -1460,6 +1464,9 @@ impl EffectKind {
             Self::Vhs => {
                 "色にじみ、横ゴースト、トラッキング帯、走査線を重ねて古いアナログビデオ風にします。"
             }
+            Self::PixelSort => {
+                "明るさ範囲で区切った行または列の画素を並べ替え、グリッチアート風の崩れを作ります。"
+            }
             Self::Halftone => "明るさをドットパターンに変換し、漫画や印刷風にします。",
             Self::ScreenTone => {
                 "網点、平行線、カケアミを重ね、濃度と元画像の明暗追従で漫画用のトーンを作ります。"
@@ -1611,6 +1618,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Textureizer,
             EffectKind::ScanlineGlitch,
             EffectKind::Vhs,
+            EffectKind::PixelSort,
         ],
     },
     EffectGroup {
@@ -8590,6 +8598,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
             format!("走査線グリッチ {:.0}%", params.strength * 100.0)
         }
         LocalEffect::Vhs(params) => format!("VHS {:.0}%", params.strength * 100.0),
+        LocalEffect::PixelSort(params) => format!("ピクセルソート {:.0}%", params.strength * 100.0),
         LocalEffect::Halftone(params) => format!("ハーフトーン {}px", params.cell_px),
         LocalEffect::ScreenTone(params) => format!(
             "スクリーントーン {} {:.0}px",
@@ -8651,6 +8660,20 @@ fn noise_distribution_label(distribution: NoiseDistribution) -> &'static str {
     match distribution {
         NoiseDistribution::Uniform => "均一",
         NoiseDistribution::Gaussian => "ガウス",
+    }
+}
+
+fn pixel_sort_direction_label(direction: PixelSortDirection) -> &'static str {
+    match direction {
+        PixelSortDirection::Horizontal => "横方向",
+        PixelSortDirection::Vertical => "縦方向",
+    }
+}
+
+fn pixel_sort_order_label(order: PixelSortOrder) -> &'static str {
+    match order {
+        PixelSortOrder::DarkToLight => "暗い→明るい",
+        PixelSortOrder::LightToDark => "明るい→暗い",
     }
 }
 
@@ -15509,6 +15532,111 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
                 .changed();
         }
+        LocalEffect::PixelSort(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "横流れ") {
+                    *params = PixelSortParams {
+                        direction: PixelSortDirection::Horizontal,
+                        order: PixelSortOrder::LightToDark,
+                        low_threshold: 0.25,
+                        high_threshold: 0.95,
+                        max_segment_px: 220,
+                        strength: 0.80,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "縦流れ") {
+                    *params = PixelSortParams {
+                        direction: PixelSortDirection::Vertical,
+                        order: PixelSortOrder::LightToDark,
+                        low_threshold: 0.30,
+                        high_threshold: 0.90,
+                        max_segment_px: 160,
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "明部だけ") {
+                    *params = PixelSortParams {
+                        direction: PixelSortDirection::Horizontal,
+                        order: PixelSortOrder::LightToDark,
+                        low_threshold: 0.62,
+                        high_threshold: 1.0,
+                        max_segment_px: 260,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "暗部だけ") {
+                    *params = PixelSortParams {
+                        direction: PixelSortDirection::Horizontal,
+                        order: PixelSortOrder::DarkToLight,
+                        low_threshold: 0.0,
+                        high_threshold: 0.42,
+                        max_segment_px: 180,
+                        strength: 0.80,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "指定した明るさ帯の連続画素だけを行または列方向に並べ替えます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+
+            let previous_direction = params.direction;
+            ComboBox::from_label("方向")
+                .selected_text(pixel_sort_direction_label(params.direction))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut params.direction,
+                        PixelSortDirection::Horizontal,
+                        "横方向",
+                    );
+                    ui.selectable_value(
+                        &mut params.direction,
+                        PixelSortDirection::Vertical,
+                        "縦方向",
+                    );
+                });
+            changed |= params.direction != previous_direction;
+
+            let previous_order = params.order;
+            ComboBox::from_label("並び順")
+                .selected_text(pixel_sort_order_label(params.order))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut params.order,
+                        PixelSortOrder::LightToDark,
+                        "明るい→暗い",
+                    );
+                    ui.selectable_value(
+                        &mut params.order,
+                        PixelSortOrder::DarkToLight,
+                        "暗い→明るい",
+                    );
+                });
+            changed |= params.order != previous_order;
+
+            changed |= ui
+                .add(egui::Slider::new(&mut params.low_threshold, 0.0..=1.0).text("明るさ下限"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.high_threshold, 0.0..=1.0).text("明るさ上限"))
+                .changed();
+            let mut max_segment = params.max_segment_px as i32;
+            changed |= ui
+                .add(egui::Slider::new(&mut max_segment, 2..=512).text("最大長(px)"))
+                .changed();
+            params.max_segment_px = max_segment.max(2) as u32;
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
+                .changed();
+        }
         LocalEffect::Halftone(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -17472,6 +17600,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         }
         EffectKind::ScanlineGlitch => LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
         EffectKind::Vhs => LocalEffect::Vhs(VhsParams::default()),
+        EffectKind::PixelSort => LocalEffect::PixelSort(PixelSortParams::default()),
         EffectKind::Halftone => LocalEffect::Halftone(HalftoneParams::default()),
         EffectKind::ScreenTone => LocalEffect::ScreenTone(ScreenToneParams::default()),
         EffectKind::ColorHalftone => LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
@@ -19821,6 +19950,7 @@ mod tests {
             EffectKind::Textureizer,
             EffectKind::ScanlineGlitch,
             EffectKind::Vhs,
+            EffectKind::PixelSort,
             EffectKind::ColorOverlay,
             EffectKind::StarGlow,
             EffectKind::EdgeSmooth,

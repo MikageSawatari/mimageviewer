@@ -130,6 +130,7 @@ the window.
   - Chromatic aberration
   - Scanline glitch / hologram
   - VHS / analog video
+  - Pixel sort
   - Halftone
   - Screen tone
   - Color halftone
