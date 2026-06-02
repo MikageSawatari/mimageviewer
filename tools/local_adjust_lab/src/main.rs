@@ -16,25 +16,25 @@ use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     AnamorphicFlareParams, ArtisticMediaMode, ArtisticMediaParams, AuroraParams,
-    BacklightHazeParams, BloomParams, BlurParams, BrushStrokeMode, BrushStrokeParams,
-    ChannelMixerParams, ChromaticAberrationParams, ClarityParams, CloudFogMode, CloudFogParams,
-    CmykPlateShiftParams, ColorBalanceParams, ColorBalanceRange, ColorDodgeGlowParams,
-    ColorFillParams, ColorGradeWheel, ColorHalftoneParams, ColorMixerParams, ColorOverlayBlendMode,
-    ColorOverlayParams, ColorOverlayShape, ColorRangeMask, ColorTraceParams, ContactShadowParams,
-    CubeLutParams, CutoutParams, DataMoshParams, DefringeParams, DehazeParams, DespeckleParams,
-    DiffractionStarburstParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
-    EmbossParams, EngravingParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
-    GlassDisplacementParams, GlowingEdgesParams, GodRaysParams, GradientMapParams,
-    GradientMapPreset, HalationParams, HalftoneParams, HeatHazeParams, HighPassParams,
-    HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
-    LensCorrectionParams, LensFlareParams, LightLeakParams, LineExtractMode, LineExtractParams,
-    LineKind, LinearGradientMask, LithographParams, LocalAdjustmentLayer, LocalEffect, LocalMask,
-    LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary,
-    MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams, NewspaperPrintParams,
-    NoiseDistribution, NoiseParams, OilPaintParams, OldFilmParams, OrtonParams,
-    OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, ParticleOverlayMode,
-    ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection, PixelSortOrder,
-    PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
+    BacklightHazeParams, BloomParams, BlurParams, BokehSpriteParams, BokehSpriteShape,
+    BrushStrokeMode, BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams,
+    ClarityParams, CloudFogMode, CloudFogParams, CmykPlateShiftParams, ColorBalanceParams,
+    ColorBalanceRange, ColorDodgeGlowParams, ColorFillParams, ColorGradeWheel, ColorHalftoneParams,
+    ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask,
+    ColorTraceParams, ContactShadowParams, CubeLutParams, CutoutParams, DataMoshParams,
+    DefringeParams, DehazeParams, DespeckleParams, DiffractionStarburstParams, DiffuseGlowParams,
+    DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams, EngravingParams, EqualizeParams,
+    FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams, GlowingEdgesParams,
+    GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams, HalftoneParams,
+    HeatHazeParams, HighPassParams, HighlightsShadowsParams, HslParams, InvertParams,
+    LensBlurAperture, LensBlurParams, LensCorrectionParams, LensFlareParams, LightLeakParams,
+    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LithographParams,
+    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
+    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
+    NeonGlowParams, NewspaperPrintParams, NoiseDistribution, NoiseParams, OilPaintParams,
+    OldFilmParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement, PartColorParams,
+    ParticleOverlayMode, ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection,
+    PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
     PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialFlashParams,
     RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
     RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode,
@@ -1046,6 +1046,7 @@ enum EffectKind {
     SpeedLines,
     TiltShift,
     LensBlur,
+    BokehSprite,
     RadialBlur,
     WaveDistortion,
     HeatHaze,
@@ -1218,6 +1219,7 @@ impl EffectKind {
             LocalEffect::SpeedLines(_) => Self::SpeedLines,
             LocalEffect::TiltShift(_) => Self::TiltShift,
             LocalEffect::LensBlur(_) => Self::LensBlur,
+            LocalEffect::BokehSprite(_) => Self::BokehSprite,
             LocalEffect::RadialBlur(_) => Self::RadialBlur,
             LocalEffect::WaveDistortion(_) => Self::WaveDistortion,
             LocalEffect::HeatHaze(_) => Self::HeatHaze,
@@ -1321,6 +1323,7 @@ impl EffectKind {
             Self::SpeedLines => "集中線/スピード線",
             Self::TiltShift => "チルトシフト",
             Self::LensBlur => "レンズぼかし",
+            Self::BokehSprite => "玉ボケスプライト",
             Self::RadialBlur => "放射/回転ぼかし",
             Self::WaveDistortion => "波形ゆがみ",
             Self::HeatHaze => "陽炎/熱揺らぎ",
@@ -1408,6 +1411,7 @@ impl EffectKind {
             Self::HighlightsShadows => "ハイライト/影",
             Self::Equalize => "ヒスト平坦化",
             Self::AnamorphicFlare => "アナモルフフレア",
+            Self::BokehSprite => "玉ボケ粒子",
             Self::DiffractionStarburst => "回折スター",
             Self::WaterCaustics => "水中光網",
             Self::ParticleOverlay => "天候粒子",
@@ -1453,6 +1457,7 @@ impl EffectKind {
                 "焦点帯を残して周囲をぼかし、浅い被写界深度やジオラマ風の見た目を作ります。"
             }
             Self::LensBlur => "絞り形状でぼかし、明るい点を玉ボケのように膨らませます。",
+            Self::BokehSprite => "明るい点を拾って、丸・星・ハート形の玉ボケ粒子として散らします。",
             Self::RadialBlur => {
                 "中心から外へ伸びるズームぼかし、または中心周りの回転ぼかしを作ります。"
             }
@@ -1707,6 +1712,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::MotionBlur,
             EffectKind::TiltShift,
             EffectKind::LensBlur,
+            EffectKind::BokehSprite,
             EffectKind::RadialBlur,
             EffectKind::SoftFocus,
             EffectKind::Orton,
@@ -9031,6 +9037,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
             };
             format!("レンズぼかし {aperture} {:.0}px", params.radius_px)
         }
+        LocalEffect::BokehSprite(params) => format!(
+            "玉ボケ {} {:.0}px",
+            bokeh_sprite_shape_label(params.shape),
+            params.size_px
+        ),
         LocalEffect::RadialBlur(params) => match params.mode {
             RadialBlurMode::Zoom => format!("ズームぼかし {:.0}px", params.zoom_px),
             RadialBlurMode::Spin => format!("回転ぼかし {:+.0}°", params.spin_degrees),
@@ -9361,6 +9372,14 @@ fn screen_tone_mode_label(mode: ScreenToneMode) -> &'static str {
         ScreenToneMode::Dots => "網点",
         ScreenToneMode::Lines => "線",
         ScreenToneMode::CrossHatch => "カケアミ",
+    }
+}
+
+fn bokeh_sprite_shape_label(shape: BokehSpriteShape) -> &'static str {
+    match shape {
+        BokehSpriteShape::Circle => "丸",
+        BokehSpriteShape::Star => "星",
+        BokehSpriteShape::Heart => "ハート",
     }
 }
 
@@ -11779,6 +11798,117 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からレンズぼかし結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::BokehSprite(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "丸い光") {
+                    *params = BokehSpriteParams {
+                        shape: BokehSpriteShape::Circle,
+                        threshold: 0.94,
+                        density: 0.35,
+                        size_px: 18.0,
+                        softness: 0.55,
+                        brightness: 1.0,
+                        color_strength: 0.45,
+                        seed: 1,
+                        strength: 0.65,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "星きらめき") {
+                    *params = BokehSpriteParams {
+                        shape: BokehSpriteShape::Star,
+                        threshold: 0.96,
+                        density: 0.45,
+                        size_px: 16.0,
+                        softness: 0.35,
+                        brightness: 1.4,
+                        color_strength: 0.35,
+                        seed: 7,
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ハート") {
+                    *params = BokehSpriteParams {
+                        shape: BokehSpriteShape::Heart,
+                        threshold: 0.95,
+                        density: 0.38,
+                        size_px: 20.0,
+                        softness: 0.45,
+                        brightness: 1.2,
+                        color_strength: 0.60,
+                        seed: 11,
+                        strength: 0.72,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "細かく") {
+                    *params = BokehSpriteParams {
+                        shape: BokehSpriteShape::Circle,
+                        threshold: 0.92,
+                        density: 0.75,
+                        size_px: 10.0,
+                        softness: 0.45,
+                        brightness: 0.85,
+                        color_strength: 0.35,
+                        seed: 19,
+                        strength: 0.55,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "明るい点から形状付きの玉ボケ粒子を作ります。レンズぼかしの上に重ねる装飾や、夜景・魔法光の仕上げに向いています。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal(|ui| {
+                for (shape, label) in [
+                    (BokehSpriteShape::Circle, "丸"),
+                    (BokehSpriteShape::Star, "星"),
+                    (BokehSpriteShape::Heart, "ハート"),
+                ] {
+                    let selected = params.shape == shape;
+                    if ui.selectable_label(selected, label).clicked() && !selected {
+                        params.shape = shape;
+                        changed = true;
+                    }
+                }
+            });
+            let threshold =
+                ui.add(egui::Slider::new(&mut params.threshold, 0.50..=0.995).text("明部しきい値"));
+            changed |= threshold.changed();
+            threshold.lab_hover_tip(
+                "粒子を発生させる明るさのしきい値です。低いほど多くの点から出ます。",
+            );
+            let density = ui.add(egui::Slider::new(&mut params.density, 0.0..=1.0).text("密度"));
+            changed |= density.changed();
+            density.lab_hover_tip("候補セルの間隔を変え、粒子が出る数を調整します。");
+            let size = ui.add(egui::Slider::new(&mut params.size_px, 2.0..=96.0).text("サイズ"));
+            changed |= size.changed();
+            size.lab_hover_tip("粒子ひとつあたりの大きさです。");
+            let softness =
+                ui.add(egui::Slider::new(&mut params.softness, 0.0..=1.0).text("柔らかさ"));
+            changed |= softness.changed();
+            softness.lab_hover_tip("粒子の輪郭をどれだけ柔らかくするかです。");
+            let brightness =
+                ui.add(egui::Slider::new(&mut params.brightness, 0.0..=2.0).text("明るさ"));
+            changed |= brightness.changed();
+            brightness.lab_hover_tip("生成した粒子の明るさです。");
+            let color_strength =
+                ui.add(egui::Slider::new(&mut params.color_strength, 0.0..=1.0).text("元色反映"));
+            changed |= color_strength.changed();
+            color_strength.lab_hover_tip("0では白い粒子、1では発生元の色を強く反映します。");
+            let seed = ui.add(egui::Slider::new(&mut params.seed, 0..=9999).text("seed"));
+            changed |= seed.changed();
+            seed.lab_hover_tip("粒子の揺らぎを変える値です。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像に対して玉ボケ粒子をどれだけ重ねるかです。");
         }
         LocalEffect::RadialBlur(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -19927,6 +20057,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::RadialFlash => LocalEffect::RadialFlash(RadialFlashParams::default()),
         EffectKind::TiltShift => LocalEffect::TiltShift(TiltShiftParams::default()),
         EffectKind::LensBlur => LocalEffect::LensBlur(LensBlurParams::default()),
+        EffectKind::BokehSprite => LocalEffect::BokehSprite(BokehSpriteParams::default()),
         EffectKind::RadialBlur => LocalEffect::RadialBlur(RadialBlurParams::default()),
         EffectKind::WaveDistortion => LocalEffect::WaveDistortion(WaveDistortionParams::default()),
         EffectKind::HeatHaze => LocalEffect::HeatHaze(HeatHazeParams::default()),
@@ -22459,6 +22590,7 @@ mod tests {
             EffectKind::RadialFlash,
             EffectKind::TiltShift,
             EffectKind::LensBlur,
+            EffectKind::BokehSprite,
             EffectKind::RadialBlur,
             EffectKind::WaveDistortion,
             EffectKind::HeatHaze,

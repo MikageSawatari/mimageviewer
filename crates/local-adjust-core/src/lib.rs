@@ -545,6 +545,7 @@ pub enum LocalEffect {
     Wind(WindParams),
     TiltShift(TiltShiftParams),
     LensBlur(LensBlurParams),
+    BokehSprite(BokehSpriteParams),
     RadialBlur(RadialBlurParams),
     WaveDistortion(WaveDistortionParams),
     HeatHaze(HeatHazeParams),
@@ -648,6 +649,7 @@ impl LocalEffect {
             Self::Wind(_) => "風/スピード",
             Self::TiltShift(_) => "チルトぼかし",
             Self::LensBlur(_) => "レンズぼかし",
+            Self::BokehSprite(_) => "玉ボケスプライト",
             Self::RadialBlur(_) => "放射ぼかし",
             Self::WaveDistortion(_) => "波形ゆがみ",
             Self::HeatHaze(_) => "陽炎/熱揺らぎ",
@@ -740,6 +742,7 @@ pub fn default_mask_application_for_effect(effect: &LocalEffect) -> MaskApplicat
         | LocalEffect::Bloom(_)
         | LocalEffect::Halation(_)
         | LocalEffect::ColorDodgeGlow(_)
+        | LocalEffect::BokehSprite(_)
         | LocalEffect::GodRays(_)
         | LocalEffect::AnamorphicFlare(_)
         | LocalEffect::StarGlow(_)
@@ -1233,6 +1236,44 @@ impl Default for LensBlurParams {
             rotation_degrees: 0.0,
             highlight_threshold: 0.96,
             highlight_boost: 0.0,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BokehSpriteShape {
+    #[default]
+    Circle,
+    Star,
+    Heart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BokehSpriteParams {
+    pub shape: BokehSpriteShape,
+    pub threshold: f32,
+    pub density: f32,
+    pub size_px: f32,
+    pub softness: f32,
+    pub brightness: f32,
+    pub color_strength: f32,
+    pub seed: u32,
+    pub strength: f32,
+}
+
+impl Default for BokehSpriteParams {
+    fn default() -> Self {
+        Self {
+            shape: BokehSpriteShape::Circle,
+            threshold: 0.96,
+            density: 0.35,
+            size_px: 18.0,
+            softness: 0.45,
+            brightness: 1.0,
+            color_strength: 0.35,
+            seed: 1,
             strength: 0.0,
         }
     }
@@ -3890,6 +3931,9 @@ where
             LocalEffect::LensBlur(params) => {
                 apply_lens_blur(&image.pixels, image.width, image.height, *params)
             }
+            LocalEffect::BokehSprite(params) => {
+                apply_bokeh_sprite(&image.pixels, image.width, image.height, *params)
+            }
             LocalEffect::RadialBlur(params) => {
                 apply_radial_blur(&image.pixels, image.width, image.height, *params)
             }
@@ -5570,6 +5614,183 @@ fn aperture_radius_at_angle(aperture: LensBlurAperture, angle: f32, rotation: f3
     let sector = std::f32::consts::PI * 2.0 / sides;
     let local = (angle - rotation + sector * 0.5).rem_euclid(sector) - sector * 0.5;
     (std::f32::consts::PI / sides).cos() / local.cos().max(0.001)
+}
+
+fn apply_bokeh_sprite(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: BokehSpriteParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let density = params.density.clamp(0.0, 1.0);
+    let size = params.size_px.clamp(2.0, 96.0);
+    let brightness = params.brightness.clamp(0.0, 2.0);
+    if width == 0
+        || height == 0
+        || strength <= f32::EPSILON
+        || density <= f32::EPSILON
+        || brightness <= f32::EPSILON
+    {
+        return src.to_vec();
+    }
+
+    let threshold = params.threshold.clamp(0.0, 0.9999);
+    let inv_range = 1.0 / (1.0 - threshold).max(0.001);
+    let softness = params.softness.clamp(0.0, 1.0);
+    let color_strength = params.color_strength.clamp(0.0, 1.0);
+    let spacing = (size * lerp_f32(2.6, 0.65, density))
+        .round()
+        .clamp(2.0, 128.0) as usize;
+    let mut sprites = vec![0.0_f32; width * height * 3];
+
+    for cell_y in (0..height).step_by(spacing) {
+        let y_end = (cell_y + spacing).min(height);
+        for cell_x in (0..width).step_by(spacing) {
+            let x_end = (cell_x + spacing).min(width);
+            let mut best: Option<(usize, usize, usize, f32)> = None;
+            for y in cell_y..y_end {
+                for x in cell_x..x_end {
+                    let i = (y * width + x) * 4;
+                    let alpha = src[i + 3] as f32 / 255.0;
+                    if alpha <= f32::EPSILON {
+                        continue;
+                    }
+                    let r = src[i] as f32 / 255.0;
+                    let g = src[i + 1] as f32 / 255.0;
+                    let b = src[i + 2] as f32 / 255.0;
+                    let max_channel = r.max(g).max(b);
+                    let signal = luma01(r, g, b).max(max_channel * 0.90) * alpha;
+                    if signal
+                        > best
+                            .map(|(_, _, _, best_signal)| best_signal)
+                            .unwrap_or(threshold)
+                    {
+                        best = Some((x, y, i, signal));
+                    }
+                }
+            }
+
+            let Some((x, y, i, signal)) = best else {
+                continue;
+            };
+            let gate = ((signal - threshold) * inv_range).clamp(0.0, 1.0);
+            if gate <= 0.001 {
+                continue;
+            }
+            let cell_ix = (cell_x / spacing) as u32;
+            let cell_iy = (cell_y / spacing) as u32;
+            let radius_noise = signed_noise(cell_ix, cell_iy, params.seed ^ 0xB04E_1105);
+            let jitter_x = signed_noise(cell_ix, cell_iy, params.seed ^ 0x51A7_C1E5) * size * 0.10;
+            let jitter_y = signed_noise(cell_ix, cell_iy, params.seed ^ 0xA11E_5EED) * size * 0.10;
+            let radius = (size * (0.50 + radius_noise * 0.12)).clamp(1.0, 96.0);
+            let source = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let color = [
+                lerp_f32(1.0, source[0], color_strength),
+                lerp_f32(1.0, source[1], color_strength),
+                lerp_f32(1.0, source[2], color_strength),
+            ];
+            draw_bokeh_sprite(
+                &mut sprites,
+                width,
+                height,
+                x as f32 + 0.5 + jitter_x,
+                y as f32 + 0.5 + jitter_y,
+                radius,
+                params.shape,
+                softness,
+                color,
+                gate * brightness,
+            );
+        }
+    }
+
+    let mut out = src.to_vec();
+    for i in 0..width * height {
+        let si = i * 3;
+        let oi = i * 4;
+        for c in 0..3 {
+            let base = src[oi + c] as f32 / 255.0;
+            let overlay = (sprites[si + c] * strength).clamp(0.0, 1.0);
+            out[oi + c] = to_u8(screen_channel(base, overlay));
+        }
+    }
+    out
+}
+
+fn draw_bokeh_sprite(
+    dst: &mut [f32],
+    width: usize,
+    height: usize,
+    center_x: f32,
+    center_y: f32,
+    radius: f32,
+    shape: BokehSpriteShape,
+    softness: f32,
+    color: [f32; 3],
+    weight: f32,
+) {
+    if radius <= f32::EPSILON || weight <= f32::EPSILON {
+        return;
+    }
+    let pad = radius + 1.0;
+    let min_x = (center_x - pad).floor().max(0.0) as usize;
+    let min_y = (center_y - pad).floor().max(0.0) as usize;
+    let max_x = (center_x + pad).ceil().min(width.saturating_sub(1) as f32) as usize;
+    let max_y = (center_y + pad).ceil().min(height.saturating_sub(1) as f32) as usize;
+    let edge = (0.035 + softness * 0.25).clamp(0.035, 0.32);
+    let gamma = lerp_f32(0.68, 1.35, softness);
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let nx = (x as f32 + 0.5 - center_x) / radius;
+            let ny = (y as f32 + 0.5 - center_y) / radius;
+            let shape_alpha = bokeh_sprite_shape_alpha(shape, nx, ny, edge);
+            if shape_alpha <= 0.001 {
+                continue;
+            }
+            let distance = (nx * nx + ny * ny).sqrt().clamp(0.0, 1.2);
+            let rim = smoothstep(0.58, 0.98, distance) * 0.28;
+            let falloff = (1.0 - distance * (0.18 + softness * 0.12)).clamp(0.60, 1.0);
+            let amount = shape_alpha.powf(gamma) * (1.0 + rim) * falloff * weight;
+            if amount <= 0.001 {
+                continue;
+            }
+            let i = (y * width + x) * 3;
+            for c in 0..3 {
+                dst[i + c] += color[c] * amount;
+            }
+        }
+    }
+}
+
+fn bokeh_sprite_shape_alpha(shape: BokehSpriteShape, nx: f32, ny: f32, edge: f32) -> f32 {
+    match shape {
+        BokehSpriteShape::Circle => {
+            let r = (nx * nx + ny * ny).sqrt();
+            1.0 - smoothstep(1.0 - edge, 1.0 + edge, r)
+        }
+        BokehSpriteShape::Star => {
+            let r = (nx * nx + ny * ny).sqrt();
+            let angle = ny.atan2(nx);
+            let point = (0.5 + 0.5 * (angle * 5.0).cos()).powf(1.35);
+            let boundary = 0.56 + point * 0.42;
+            1.0 - smoothstep(boundary - edge, boundary + edge, r)
+        }
+        BokehSpriteShape::Heart => {
+            let x = nx * 1.18;
+            let y = -ny * 1.18 + 0.18;
+            let f = (x * x + y * y - 1.0).powi(3) - x * x * y.powi(3);
+            let band = (0.10 + edge * 1.8).max(0.05);
+            let t = ((band - f) / (band * 2.0)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        }
+    }
+    .clamp(0.0, 1.0)
 }
 
 fn apply_radial_blur(src: &[u8], width: usize, height: usize, params: RadialBlurParams) -> Vec<u8> {
@@ -13590,6 +13811,14 @@ mod tests {
         assert!(diffraction_starburst.mask_before_effect);
         assert!(!diffraction_starburst.mask_after_effect);
 
+        let bokeh_sprite = LocalAdjustmentLayer::new(
+            "bokeh sprite",
+            LocalMask::Full,
+            LocalEffect::BokehSprite(BokehSpriteParams::default()),
+        );
+        assert!(bokeh_sprite.mask_before_effect);
+        assert!(!bokeh_sprite.mask_after_effect);
+
         let wave = LocalAdjustmentLayer::new(
             "wave",
             LocalMask::Full,
@@ -13632,6 +13861,45 @@ mod tests {
 
         assert!(out.pixels[2 * 4] > 0, "wind should leak to the right");
         assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn mask_before_without_mask_after_lets_bokeh_sprite_escape_mask() {
+        let mut pixels = vec![0_u8; 5 * 5 * 4];
+        for px in pixels.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        let center = (2 * 5 + 2) * 4;
+        pixels[center..center + 4].copy_from_slice(&[255, 255, 255, 255]);
+        let src = RgbaImageBuf::new(5, 5, pixels).unwrap();
+        let mask = LocalMask::Raster(RasterMask {
+            width: 5,
+            height: 5,
+            alpha: vec![
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+        });
+        let layer = LocalAdjustmentLayer::new(
+            "bokeh",
+            mask,
+            LocalEffect::BokehSprite(BokehSpriteParams {
+                threshold: 0.30,
+                density: 1.0,
+                size_px: 5.0,
+                strength: 1.0,
+                ..BokehSpriteParams::default()
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        let outside_mask = (2 * 5 + 1) * 4;
+        assert!(
+            out.pixels[outside_mask] > 0,
+            "bokeh sprite should leak outside the source mask"
+        );
+        assert_eq!(out.pixels[outside_mask + 3], 255);
     }
 
     #[test]
@@ -14115,6 +14383,56 @@ mod tests {
         assert!(out.pixels[neighbor] > 0);
         assert!(out.pixels[center] < 255);
         assert_eq!(out.pixels[neighbor + 3], 123);
+    }
+
+    #[test]
+    fn bokeh_sprite_draws_from_highlight_and_preserves_alpha() {
+        let mut pixels = vec![0_u8; 7 * 7 * 4];
+        for px in pixels.chunks_exact_mut(4) {
+            px[3] = 111;
+        }
+        let center = (3 * 7 + 3) * 4;
+        pixels[center..center + 4].copy_from_slice(&[255, 230, 180, 111]);
+        let src = RgbaImageBuf::new(7, 7, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "bokeh",
+            LocalMask::Full,
+            LocalEffect::BokehSprite(BokehSpriteParams {
+                shape: BokehSpriteShape::Circle,
+                threshold: 0.20,
+                density: 1.0,
+                size_px: 5.0,
+                softness: 0.40,
+                brightness: 1.0,
+                color_strength: 0.50,
+                seed: 3,
+                strength: 1.0,
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        let lifted_neighbor = (0..7 * 7).any(|idx| {
+            let i = idx * 4;
+            i != center && out.pixels[i] > src.pixels[i]
+        });
+        assert!(lifted_neighbor);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 111));
+    }
+
+    #[test]
+    fn bokeh_sprite_shapes_are_distinct() {
+        let circle_corner = bokeh_sprite_shape_alpha(BokehSpriteShape::Circle, 0.72, 0.72, 0.06);
+        let star_corner = bokeh_sprite_shape_alpha(BokehSpriteShape::Star, 0.72, 0.72, 0.06);
+        let star_point = bokeh_sprite_shape_alpha(BokehSpriteShape::Star, 1.0, 0.0, 0.06);
+        let heart_top = bokeh_sprite_shape_alpha(BokehSpriteShape::Heart, 0.0, -0.62, 0.06);
+        let heart_bottom = bokeh_sprite_shape_alpha(BokehSpriteShape::Heart, 0.0, 0.92, 0.06);
+
+        assert!(circle_corner < 0.5);
+        assert!(star_corner < circle_corner);
+        assert!(star_point > star_corner);
+        assert!(heart_top > 0.5);
+        assert!(heart_bottom > 0.0);
     }
 
     #[test]
@@ -15363,6 +15681,7 @@ mod tests {
             LocalEffect::Wind(WindParams::default()),
             LocalEffect::TiltShift(TiltShiftParams::default()),
             LocalEffect::LensBlur(LensBlurParams::default()),
+            LocalEffect::BokehSprite(BokehSpriteParams::default()),
             LocalEffect::RadialBlur(RadialBlurParams::default()),
             LocalEffect::WaveDistortion(WaveDistortionParams::default()),
             LocalEffect::HeatHaze(HeatHazeParams::default()),
@@ -15548,6 +15867,20 @@ mod tests {
                     rotation_degrees: 15.0,
                     highlight_threshold: 0.0,
                     highlight_boost: 3.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "bokeh sprite dense hearts",
+                LocalEffect::BokehSprite(BokehSpriteParams {
+                    shape: BokehSpriteShape::Heart,
+                    threshold: 0.0,
+                    density: 1.0,
+                    size_px: 96.0,
+                    softness: 1.0,
+                    brightness: 2.0,
+                    color_strength: 1.0,
+                    seed: 31,
                     strength: 1.0,
                 }),
             ),

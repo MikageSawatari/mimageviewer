@@ -66,13 +66,13 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、97種)
+### `LocalEffect` (部分補正レイヤー、98種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), PartColor(指定色だけ残す白黒化), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
-HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, RadialFlash, TiltShift, LensBlur, RadialBlur, WaveDistortion, HeatHaze, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
+HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, RadialFlash, TiltShift, LensBlur, BokehSprite, RadialBlur, WaveDistortion, HeatHaze, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
 GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, LightLeak, BacklightHaze, CloudFog, WaterCaustics, ParticleOverlay, Aurora, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Defringe, ScanlineGlitch, Vhs, DataMosh, PixelSort, OldFilm, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Lithograph, Engraving, NewspaperPrint, Textureizer, StarGlow, DiffractionStarburst, EdgeSmooth, Despeckle, Median
 
 ### マスク種別 (併用可能・差別化の武器)
@@ -241,7 +241,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 
 ### 9-H. 立体視 / 特殊光学
 - [ ] **レンズ汚れ / 水滴 / レンズダスト オーバーレイ** **中** — レンズ越し演出
-- [ ] **玉ボケスプライト (ハート/星形ボケ)** ★ **中** — 形状付きボケ粒子を明部に散らす。`レンズぼかし` の装飾版
+- [x] **玉ボケスプライト (ハート/星形ボケ / `BokehSprite`)** ★ **中** — 形状付きボケ粒子を明部に散らす。`レンズぼかし` の装飾版
 
 ### 特化系の中でのイラスト軸の推し
 1. **ハレーション** — `Halation` として実装済み。アニメ塗り仕上げの花形 (§C)
