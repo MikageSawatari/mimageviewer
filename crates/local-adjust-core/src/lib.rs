@@ -440,6 +440,7 @@ pub enum LocalEffect {
     ArtisticMedia(ArtisticMediaParams),
     BrushStroke(BrushStrokeParams),
     Cutout(CutoutParams),
+    Emboss(EmbossParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -497,6 +498,7 @@ impl LocalEffect {
             Self::ArtisticMedia(_) => "絵画調",
             Self::BrushStroke(_) => "筆致",
             Self::Cutout(_) => "切り絵",
+            Self::Emboss(_) => "エンボス",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -1288,6 +1290,27 @@ impl Default for CutoutParams {
             radius_px: 6.0,
             edge_strength: 0.25,
             color_amount: 0.85,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EmbossParams {
+    pub angle_degrees: f32,
+    pub depth: f32,
+    pub contrast: f32,
+    pub color_amount: f32,
+    pub strength: f32,
+}
+
+impl Default for EmbossParams {
+    fn default() -> Self {
+        Self {
+            angle_degrees: 135.0,
+            depth: 1.0,
+            contrast: 0.25,
+            color_amount: 0.0,
             strength: 0.0,
         }
     }
@@ -2097,6 +2120,9 @@ where
         }
         LocalEffect::Cutout(params) => {
             apply_cutout(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::Emboss(params) => {
+            apply_emboss(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -4408,6 +4434,77 @@ fn apply_cutout(src: &[u8], width: usize, height: usize, params: CutoutParams) -
         }
     }
     out
+}
+
+fn apply_emboss(src: &[u8], width: usize, height: usize, params: EmbossParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let depth = params.depth.clamp(0.0, 4.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON || depth <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let angle = params.angle_degrees.to_radians();
+    let dir = (angle.cos(), angle.sin());
+    let contrast = params.contrast.clamp(-1.0, 1.0);
+    let color_amount = params.color_amount.clamp(0.0, 1.0);
+
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let luma = luma01(base[0], base[1], base[2]);
+            let (gx, gy) = emboss_luma_gradient(src, width, height, x, y);
+            let slope = (gx * dir.0 + gy * dir.1) * depth;
+            let mut relief = (0.5 + slope * 0.58).clamp(0.0, 1.0);
+            relief = ((relief - 0.5) * (1.0 + contrast * 1.25) + 0.5).clamp(0.0, 1.0);
+            let gray = [relief, relief, relief];
+            let scale = relief / luma.max(0.05);
+            let tinted = [
+                (base[0] * scale).clamp(0.0, 1.0),
+                (base[1] * scale).clamp(0.0, 1.0),
+                (base[2] * scale).clamp(0.0, 1.0),
+            ];
+            let target = [
+                lerp_f32(gray[0], tinted[0], color_amount),
+                lerp_f32(gray[1], tinted[1], color_amount),
+                lerp_f32(gray[2], tinted[2], color_amount),
+            ];
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], to_u8(target[c]), strength);
+            }
+        }
+    }
+    out
+}
+
+fn emboss_luma_gradient(src: &[u8], width: usize, height: usize, x: usize, y: usize) -> (f32, f32) {
+    let x = x as isize;
+    let y = y as isize;
+    let sample = |xx: isize, yy: isize| emboss_luma_at(src, width, height, xx, yy);
+    let gx = -sample(x - 1, y - 1) + sample(x + 1, y - 1) - 2.0 * sample(x - 1, y)
+        + 2.0 * sample(x + 1, y)
+        - sample(x - 1, y + 1)
+        + sample(x + 1, y + 1);
+    let gy = -sample(x - 1, y - 1) - 2.0 * sample(x, y - 1) - sample(x + 1, y - 1)
+        + sample(x - 1, y + 1)
+        + 2.0 * sample(x, y + 1)
+        + sample(x + 1, y + 1);
+    (gx * 0.25, gy * 0.25)
+}
+
+fn emboss_luma_at(src: &[u8], width: usize, height: usize, x: isize, y: isize) -> f32 {
+    let x = x.clamp(0, width.saturating_sub(1) as isize) as usize;
+    let y = y.clamp(0, height.saturating_sub(1) as isize) as usize;
+    let i = (y * width + x) * 4;
+    luma01(
+        src[i] as f32 / 255.0,
+        src[i + 1] as f32 / 255.0,
+        src[i + 2] as f32 / 255.0,
+    )
 }
 
 fn farthest_corner_distance(width: usize, height: usize, cx: f32, cy: f32) -> f32 {
@@ -7103,6 +7200,77 @@ mod tests {
     }
 
     #[test]
+    fn emboss_lights_gradient_direction_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![0, 0, 0, 55, 128, 128, 128, 77, 255, 255, 255, 99],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "emboss",
+            LocalMask::Full,
+            LocalEffect::Emboss(EmbossParams {
+                angle_degrees: 0.0,
+                depth: 1.0,
+                contrast: 0.0,
+                color_amount: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[4] > src.pixels[4]);
+        assert_eq!(out.pixels[7], 77);
+    }
+
+    #[test]
+    fn emboss_angle_can_invert_relief() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![0, 0, 0, 55, 128, 128, 128, 77, 255, 255, 255, 99],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "emboss",
+            LocalMask::Full,
+            LocalEffect::Emboss(EmbossParams {
+                angle_degrees: 180.0,
+                depth: 1.0,
+                contrast: 0.0,
+                color_amount: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[4] < src.pixels[4]);
+        assert_eq!(out.pixels[7], 77);
+    }
+
+    #[test]
+    fn emboss_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "emboss",
+            LocalMask::Full,
+            LocalEffect::Emboss(EmbossParams {
+                angle_degrees: 45.0,
+                depth: 3.0,
+                contrast: 1.0,
+                color_amount: 1.0,
+                strength: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn median_removes_isolated_speckle_and_preserves_alpha() {
         let mut pixels = vec![0_u8; 3 * 3 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -7393,6 +7561,7 @@ mod tests {
             LocalEffect::ArtisticMedia(ArtisticMediaParams::default()),
             LocalEffect::BrushStroke(BrushStrokeParams::default()),
             LocalEffect::Cutout(CutoutParams::default()),
+            LocalEffect::Emboss(EmbossParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),

@@ -19,7 +19,7 @@ use local_adjust_core::{
     BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
     ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
     CubeLutParams, CutoutParams, DehazeParams, DiffuseGlowParams, DuotoneParams, DuotonePreset,
-    EdgeSmoothParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
+    EdgeSmoothParams, EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
     GlassDisplacementParams, GradientMapParams, GradientMapPreset, HalftoneParams, HighPassParams,
     HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
     LensCorrectionParams, LineExtractMode, LineExtractParams, LineKind, LinearGradientMask,
@@ -986,6 +986,7 @@ enum EffectKind {
     ArtisticMedia,
     BrushStroke,
     Cutout,
+    Emboss,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1043,6 +1044,7 @@ impl EffectKind {
             LocalEffect::ArtisticMedia(_) => Self::ArtisticMedia,
             LocalEffect::BrushStroke(_) => Self::BrushStroke,
             LocalEffect::Cutout(_) => Self::Cutout,
+            LocalEffect::Emboss(_) => Self::Emboss,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1100,6 +1102,7 @@ impl EffectKind {
             Self::ArtisticMedia => "水彩/鉛筆",
             Self::BrushStroke => "ドライブラシ/塗料",
             Self::Cutout => "切り絵",
+            Self::Emboss => "エンボス",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1187,6 +1190,7 @@ impl EffectKind {
             Self::Cutout => {
                 "色面をなじませて階調を減らし、切り絵やフラットなベクター調の見た目にします。"
             }
+            Self::Emboss => "明るさの傾きから陰影を作り、紙や金属の浮き彫りのような質感にします。",
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
@@ -1329,6 +1333,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ArtisticMedia,
             EffectKind::BrushStroke,
             EffectKind::Cutout,
+            EffectKind::Emboss,
             EffectKind::Halftone,
         ],
     },
@@ -7293,6 +7298,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
             format!("筆致 {mode}")
         }
         LocalEffect::Cutout(params) => format!("切り絵 {}段", params.levels),
+        LocalEffect::Emboss(params) => format!("エンボス {:.0}°", params.angle_degrees),
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -10102,6 +10108,78 @@ fn draw_effect_params(
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から切り絵結果へどれだけ近づけるかです。");
         }
+        LocalEffect::Emboss(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "浅い") {
+                    *params = EmbossParams {
+                        angle_degrees: 135.0,
+                        depth: 0.7,
+                        contrast: 0.12,
+                        color_amount: 0.0,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "くっきり") {
+                    *params = EmbossParams {
+                        angle_degrees: 135.0,
+                        depth: 1.35,
+                        contrast: 0.45,
+                        color_amount: 0.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "金属調") {
+                    *params = EmbossParams {
+                        angle_degrees: 120.0,
+                        depth: 1.65,
+                        contrast: 0.8,
+                        color_amount: 0.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "色付き") {
+                    *params = EmbossParams {
+                        angle_degrees: 135.0,
+                        depth: 1.0,
+                        contrast: 0.35,
+                        color_amount: 0.55,
+                        strength: 0.9,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "明るさの傾きから陰影を作り、紙や金属の浮き彫りのように見せます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let angle = ui.add(
+                egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                    .text("角度")
+                    .suffix("°"),
+            );
+            changed |= angle.changed();
+            angle.lab_hover_tip("光が当たる方向です。180度変えると凹凸の向きが反転します。");
+            let depth = ui.add(egui::Slider::new(&mut params.depth, 0.0..=4.0).text("深さ"));
+            changed |= depth.changed();
+            depth.lab_hover_tip("明暗差をどれだけ浮き彫りの陰影へ変換するかです。");
+            let contrast =
+                ui.add(egui::Slider::new(&mut params.contrast, -1.0..=1.0).text("コントラスト"));
+            changed |= contrast.changed();
+            contrast.lab_hover_tip("エンボス陰影の硬さです。高いほど金属的に締まります。");
+            let color = ui.add(egui::Slider::new(&mut params.color_amount, 0.0..=1.0).text("色量"));
+            changed |= color.changed();
+            color.lab_hover_tip("0ではモノクロ、上げると元画像の色を浮き彫りに残します。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からエンボス結果へどれだけ近づけるかです。");
+        }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -12558,6 +12636,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ArtisticMedia => LocalEffect::ArtisticMedia(ArtisticMediaParams::default()),
         EffectKind::BrushStroke => LocalEffect::BrushStroke(BrushStrokeParams::default()),
         EffectKind::Cutout => LocalEffect::Cutout(CutoutParams::default()),
+        EffectKind::Emboss => LocalEffect::Emboss(EmbossParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
@@ -14421,6 +14500,7 @@ mod tests {
             EffectKind::ArtisticMedia,
             EffectKind::BrushStroke,
             EffectKind::Cutout,
+            EffectKind::Emboss,
             EffectKind::SoftFocus,
             EffectKind::Mosaic,
             EffectKind::Sharpen,
