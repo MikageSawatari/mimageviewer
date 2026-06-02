@@ -577,6 +577,7 @@ pub enum LocalEffect {
     GradientMap(GradientMapParams),
     ColorFill(ColorFillParams),
     OutlineStroke(OutlineStrokeParams),
+    RimLight(RimLightParams),
     ColorTrace(ColorTraceParams),
     ColorOverlay(ColorOverlayParams),
     NeonGlow(NeonGlowParams),
@@ -656,6 +657,7 @@ impl LocalEffect {
             Self::GradientMap(_) => "グラデーションマップ",
             Self::ColorFill(_) => "塗りつぶし",
             Self::OutlineStroke(_) => "縁取り",
+            Self::RimLight(_) => "リムライト",
             Self::ColorTrace(_) => "色トレス",
             Self::ColorOverlay(_) => "塗り/グラデーション",
             Self::NeonGlow(_) => "ネオングロー",
@@ -693,7 +695,8 @@ pub fn default_mask_application_for_effect(effect: &LocalEffect) -> MaskApplicat
         | LocalEffect::Halation(_)
         | LocalEffect::GodRays(_)
         | LocalEffect::StarGlow(_)
-        | LocalEffect::OutlineStroke(_) => MaskApplication {
+        | LocalEffect::OutlineStroke(_)
+        | LocalEffect::RimLight(_) => MaskApplication {
             before_effect: true,
             after_effect: false,
         },
@@ -2171,6 +2174,29 @@ impl Default for OutlineStrokeParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RimLightParams {
+    pub light_angle_degrees: f32,
+    pub width_px: f32,
+    pub falloff: f32,
+    pub strength: f32,
+    pub color_rgb: [u8; 3],
+    pub wrap: f32,
+}
+
+impl Default for RimLightParams {
+    fn default() -> Self {
+        Self {
+            light_angle_degrees: 0.0,
+            width_px: 0.0,
+            falloff: 0.45,
+            strength: 0.0,
+            color_rgb: [220, 240, 255],
+            wrap: 0.15,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ColorTraceParams {
     pub strength: f32,
     pub line_threshold: f32,
@@ -3251,6 +3277,21 @@ where
                     });
                 },
             )?,
+            LocalEffect::RimLight(params) => apply_rim_light(
+                &image.pixels,
+                image.width,
+                image.height,
+                *params,
+                cancel,
+                |percent| {
+                    progress(LocalAdjustProgress {
+                        layer_index,
+                        layer_count,
+                        effect_name: layer.effect.progress_label(),
+                        percent,
+                    });
+                },
+            )?,
             LocalEffect::ColorTrace(params) => {
                 apply_color_trace(&image.pixels, image.width, image.height, *params)
             }
@@ -3338,7 +3379,10 @@ where
         }
     };
     check_cancel(cancel)?;
-    if matches!(&layer.effect, LocalEffect::OutlineStroke(_)) {
+    if matches!(
+        &layer.effect,
+        LocalEffect::OutlineStroke(_) | LocalEffect::RimLight(_)
+    ) {
         blend_rgb_with_effect_alpha_mask(&mut image.pixels, &effected, &output_mask);
     } else if layer.mask_before_effect && !layer.mask_after_effect {
         let input = masked_input
@@ -7543,6 +7587,98 @@ fn apply_outline_stroke(
     Ok(out)
 }
 
+fn apply_rim_light(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: RimLightParams,
+    cancel: Option<&AtomicBool>,
+    mut progress: impl FnMut(f32),
+) -> Result<Vec<u8>> {
+    let mut out = vec![0; src.len()];
+    let strength = params.strength.clamp(0.0, 2.0);
+    let radius = params.width_px.round().clamp(0.0, 96.0) as i32;
+    if width == 0 || height == 0 || radius == 0 || strength <= f32::EPSILON {
+        progress(1.0);
+        return Ok(out);
+    }
+
+    check_cancel(cancel)?;
+    let alpha: Vec<f32> = src.chunks_exact(4).map(|px| px[3] as f32 / 255.0).collect();
+    progress(0.02);
+
+    let dilated = morph_alpha_disk(&alpha, width, height, radius, true, cancel, |p| {
+        progress(0.02 + p * 0.34);
+    })?;
+    let inside_radius = (radius / 2).max(1);
+    let eroded = morph_alpha_disk(&alpha, width, height, inside_radius, false, cancel, |p| {
+        progress(0.36 + p * 0.24);
+    })?;
+    check_cancel(cancel)?;
+
+    let mut band = vec![0.0; alpha.len()];
+    for idx in 0..alpha.len() {
+        band[idx] = (dilated[idx] - eroded[idx]).clamp(0.0, 1.0);
+    }
+    let falloff = params.falloff.clamp(0.0, 1.0);
+    let softness = (radius as f32 * falloff * 0.75).round().clamp(0.0, 32.0) as usize;
+    if softness > 0 {
+        band = box_blur_alpha(&band, width, height, softness);
+    }
+    progress(0.68);
+
+    let direction_field = if radius <= 1 {
+        alpha
+    } else {
+        let normal_radius = (radius / 2).clamp(1, 16) as usize;
+        box_blur_alpha(&alpha, width, height, normal_radius)
+    };
+    let angle = params.light_angle_degrees.to_radians();
+    let light_x = angle.cos();
+    let light_y = angle.sin();
+    let wrap = params.wrap.clamp(0.0, 1.0);
+    let color = params.color_rgb;
+
+    for y in 0..height {
+        if y % 32 == 0 {
+            check_cancel(cancel)?;
+        }
+        let y0 = y.saturating_sub(1);
+        let y1 = (y + 1).min(height - 1);
+        for x in 0..width {
+            let idx = y * width + x;
+            let band_amount = band[idx].clamp(0.0, 1.0);
+            if band_amount <= f32::EPSILON {
+                continue;
+            }
+            let x0 = x.saturating_sub(1);
+            let x1 = (x + 1).min(width - 1);
+            let gx = direction_field[y * width + x1] - direction_field[y * width + x0];
+            let gy = direction_field[y1 * width + x] - direction_field[y0 * width + x];
+            let len = (gx * gx + gy * gy).sqrt();
+            if len <= f32::EPSILON {
+                continue;
+            }
+            let outward_x = -gx / len;
+            let outward_y = -gy / len;
+            let facing = (outward_x * light_x + outward_y * light_y).clamp(-1.0, 1.0);
+            let wrapped = ((facing + wrap) / (1.0 + wrap)).clamp(0.0, 1.0);
+            let direction_amount = smoothstep(0.0, 1.0, wrapped);
+            let amount = (band_amount * direction_amount * strength).clamp(0.0, 1.0);
+            if amount <= f32::EPSILON {
+                continue;
+            }
+            let o = idx * 4;
+            out[o] = color[0];
+            out[o + 1] = color[1];
+            out[o + 2] = color[2];
+            out[o + 3] = to_u8(amount);
+        }
+    }
+    progress(1.0);
+    Ok(out)
+}
+
 fn apply_color_trace(src: &[u8], width: usize, height: usize, params: ColorTraceParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 1.0);
     let radius = params.sample_radius_px.round().clamp(1.0, 64.0) as usize;
@@ -9829,6 +9965,14 @@ mod tests {
         assert!(outline.mask_before_effect);
         assert!(!outline.mask_after_effect);
 
+        let rim_light = LocalAdjustmentLayer::new(
+            "rim light",
+            LocalMask::Full,
+            LocalEffect::RimLight(RimLightParams::default()),
+        );
+        assert!(rim_light.mask_before_effect);
+        assert!(!rim_light.mask_after_effect);
+
         let wave = LocalAdjustmentLayer::new(
             "wave",
             LocalMask::Full,
@@ -9934,6 +10078,38 @@ mod tests {
         let center = (3 + 1) * 4;
         assert_eq!(&out.pixels[top_center..top_center + 3], &[0, 0, 0]);
         assert_eq!(&out.pixels[center..center + 3], &[200, 200, 200]);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    #[test]
+    fn rim_light_paints_only_light_facing_mask_edge() {
+        let src = solid(3, 3, [80, 80, 80, 255]);
+        let mask = LocalMask::Raster(RasterMask {
+            width: 3,
+            height: 3,
+            alpha: vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        });
+        let layer = LocalAdjustmentLayer::new(
+            "rim",
+            mask,
+            LocalEffect::RimLight(RimLightParams {
+                light_angle_degrees: 0.0,
+                width_px: 1.0,
+                falloff: 0.0,
+                strength: 1.0,
+                color_rgb: [255, 255, 255],
+                wrap: 0.0,
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        let left = (3 + 0) * 4;
+        let right = (3 + 2) * 4;
+        let center = (3 + 1) * 4;
+        assert_eq!(&out.pixels[left..left + 3], &[80, 80, 80]);
+        assert_eq!(&out.pixels[center..center + 3], &[80, 80, 80]);
+        assert!(out.pixels[right] > 80);
         assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 255));
     }
 
@@ -11479,6 +11655,7 @@ mod tests {
             LocalEffect::GradientMap(GradientMapParams::default()),
             LocalEffect::ColorFill(ColorFillParams::default()),
             LocalEffect::OutlineStroke(OutlineStrokeParams::default()),
+            LocalEffect::RimLight(RimLightParams::default()),
             LocalEffect::ColorTrace(ColorTraceParams::default()),
             LocalEffect::ColorOverlay(ColorOverlayParams::default()),
             LocalEffect::NeonGlow(NeonGlowParams::default()),
@@ -11936,6 +12113,17 @@ mod tests {
                     softness_px: 32.0,
                     opacity: 1.0,
                     color_rgb: [0, 0, 0],
+                }),
+            ),
+            masked(
+                "rim light max width",
+                LocalEffect::RimLight(RimLightParams {
+                    light_angle_degrees: -35.0,
+                    width_px: 96.0,
+                    falloff: 1.0,
+                    strength: 2.0,
+                    color_rgb: [220, 240, 255],
+                    wrap: 1.0,
                 }),
             ),
             full(

@@ -61,14 +61,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、71種)
+### `LocalEffect` (部分補正レイヤー、72種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorFill, OutlineStroke, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, GodRays, LensFlare, CloudFog, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Halftone, ScreenTone, ColorHalftone, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
+GradientMap, ColorFill, OutlineStroke, RimLight, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, GodRays, LensFlare, CloudFog, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Halftone, ScreenTone, ColorHalftone, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -203,7 +203,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 ### 9-C. アニメ / イラスト特化の光・陰影 ★最重要
 - [x] **ハレーション (`Halation`)** ★★★ **中** — 明部と肌/輪郭の境界を暖色白でにじませる。`Bloom` とは別の局所暖色ブリード。暖色、エッジ寄せ、スクリーン合成を調整できる。**§C で詳細設計**
 - [x] **トゥーン / セルシェード量子化 (`ToonShade`)** ★★ **中** — 明度を数段のフラット帯に量子化し、色相維持、影色/光色ティント、段差線を調整できる。`ポスタリゼーション` (RGB 各 ch 量子化) とは別。**§D で詳細設計**
-- [ ] **リムライト / 縁の光 追加** ★★ **中** — 被写体エッジの光源側だけ発光。既存 Subject マスク＋方向指定で実現。`縁取り` (均一枠) とは別物。**§E で詳細設計**
+- [x] **リムライト / 縁の光 追加 (`RimLight`)** ★★ **中** — 被写体エッジの光源側だけ発光。既存 Subject マスク＋方向指定で実現。`縁取り` (均一枠) とは別物。`前ON/後OFF` をデフォルトにし、幅、減衰、回り込み、光色を調整できる。**§E で詳細設計**
 - [ ] **接触影 / 簡易 AO (輪郭際の陰)** ★ **中** — エッジ内側を暗く締めて立体感を底上げ
 - [ ] **覆い焼きカラー発光 (color dodge glow)** ★ **易〜中** — 光源・エフェクトを発光合成。魔法/エモーション演出
 
@@ -236,7 +236,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 ### 特化系の中でのイラスト軸の推し
 1. **ハレーション** — `Halation` として実装済み。アニメ塗り仕上げの花形 (§C)
 2. **トゥーンシェード量子化** — `ToonShade` として実装済み。フォト/3D をアニメ塗り風に (§D)
-3. **リムライト追加** — 既存 Subject マスク資産が活きる (§E)
+3. **リムライト追加** — `RimLight` として実装済み。既存 Subject マスク資産が活きる (§E)
 4. **リソグラフ風** — 近年人気の質感、差別化になる (9-F)
 5. **陽炎 / 熱揺らぎ** — 背景イラストの空気感 (9-E)
 6. **グリッチ / VHS** — サイバー/レトロ演出の鉄板 (9-A/9-B)
@@ -415,22 +415,23 @@ pub struct ToonShadeParams {
 
 ### 中核
 **既存 Subject / Raster マスクのアルファ勾配**から輪郭法線を求め、`dot(法線, 光源方向)` が
-正（＝光源を向いている縁）の部分だけに、指定色のハイライトを width/falloff 付きで加算する。
-Subject マスクが無いレイヤーでは輝度エッジで代替。
+正（＝光源を向いている縁）の部分だけに、指定色のハイライトを width/falloff 付きで重ねる。
+Full など境界のないマスクでは効果は出ない。Subject / Raster / Segmentation など、境界を持つ
+マスクと組み合わせる前提にする。
 
 ### パラメータ案
 ```rust
 pub struct RimLightParams {
     pub light_angle_degrees: f32, // 光源方向 (縁のどちら側を光らせるか)
     pub width_px: f32,            // 縁光の太さ
-    pub strength: f32,
-    pub color: [u8; 3],           // 縁光の色
     pub falloff: f32,             // 内側への減衰
+    pub strength: f32,
+    pub color_rgb: [u8; 3],       // 縁光の色
     pub wrap: f32,                // 光の回り込み量 (0=正面側のみ, 大=側面まで)
 }
 ```
-- このエフェクトは**マスク（被写体）を入力として使う**点が他と違う。`apply_layer` で
-  `evaluate_layer_mask` の結果（被写体アルファ）を effect 側にも渡す配線が要る。
+- このエフェクトは `前ON/後OFF` をデフォルトにし、`mask_rgba_input` 後のアルファから
+  マスク境界を検出する。`縁取り` と同じく効果側の alpha を RGB オーバーレイ量として使う。
 - `wrap` を上げると半逆光気味に縁光が側面まで回り込む。キャラの立ち上げに有効。
 
 ---

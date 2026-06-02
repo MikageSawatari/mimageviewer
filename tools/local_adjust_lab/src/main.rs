@@ -31,13 +31,13 @@ use local_adjust_core::{
     OilPaintParams, OutlineStrokeParams, OutlineStrokePlacement, PinchSpherizeParams,
     PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
     PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, ScreenToneMode,
-    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
-    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
-    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
-    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VignetteParams, WaveDistortionMode,
-    WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams,
+    ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams,
+    SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams,
+    SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
+    TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
+    TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VignetteParams,
+    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
     apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
     evaluate_layer_mask, parse_cube_lut,
 };
@@ -1028,6 +1028,7 @@ enum EffectKind {
     GradientMap,
     ColorFill,
     OutlineStroke,
+    RimLight,
     ColorTrace,
     ColorOverlay,
     NeonGlow,
@@ -1065,6 +1066,7 @@ enum RgbPickTarget {
     CloudFogColor,
     SpotlightTint,
     OutlineStrokeColor,
+    RimLightColor,
     HalationTint,
     ToonShadeShadowTint,
     ToonShadeLightTint,
@@ -1084,6 +1086,7 @@ impl RgbPickTarget {
             Self::CloudFogColor => "雲/霧の色",
             Self::SpotlightTint => "スポットライトの光色",
             Self::OutlineStrokeColor => "縁取りの線色",
+            Self::RimLightColor => "リムライトの光色",
             Self::HalationTint => "ハレーションの暖色",
             Self::ToonShadeShadowTint => "トゥーン影色",
             Self::ToonShadeLightTint => "トゥーン光色",
@@ -1146,6 +1149,7 @@ impl EffectKind {
             LocalEffect::GradientMap(_) => Self::GradientMap,
             LocalEffect::ColorFill(_) => Self::ColorFill,
             LocalEffect::OutlineStroke(_) => Self::OutlineStroke,
+            LocalEffect::RimLight(_) => Self::RimLight,
             LocalEffect::ColorTrace(_) => Self::ColorTrace,
             LocalEffect::ColorOverlay(_) => Self::ColorOverlay,
             LocalEffect::NeonGlow(_) => Self::NeonGlow,
@@ -1225,6 +1229,7 @@ impl EffectKind {
             Self::GradientMap => "グラデーションマップ",
             Self::ColorFill => "塗りつぶし",
             Self::OutlineStroke => "縁取り",
+            Self::RimLight => "リムライト",
             Self::ColorTrace => "色トレス",
             Self::ColorOverlay => "塗り/グラデーション",
             Self::NeonGlow => "ネオングロー",
@@ -1353,6 +1358,9 @@ impl EffectKind {
             }
             Self::OutlineStroke => {
                 "マスク境界から外側・内側・中央の色枠を作り、被写体のステッカー風分離に使えます。"
+            }
+            Self::RimLight => {
+                "マスク境界のうち光方向に向いた側だけを照らし、被写体の縁に逆光や輪郭光を足します。"
             }
             Self::ColorTrace => "暗い線画を検出し、周辺の下地色を少し暗くした色へなじませます。",
             Self::ColorOverlay => {
@@ -1534,6 +1542,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
             EffectKind::Halation,
+            EffectKind::RimLight,
             EffectKind::GodRays,
             EffectKind::LensFlare,
             EffectKind::CloudFog,
@@ -8412,6 +8421,10 @@ fn effect_summary(effect: &LocalEffect) -> String {
             outline_stroke_placement_label(params.placement),
             params.width_px
         ),
+        LocalEffect::RimLight(params) => format!(
+            "リムライト {:.0}px {:.0}°",
+            params.width_px, params.light_angle_degrees
+        ),
         LocalEffect::ColorTrace(params) => format!("色トレス {:.0}%", params.strength * 100.0),
         LocalEffect::ColorOverlay(params) => format!(
             "塗り {} {:.0}%",
@@ -8752,6 +8765,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
             true
         }
         (LocalEffect::OutlineStroke(params), RgbPickTarget::OutlineStrokeColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::RimLight(params), RgbPickTarget::RimLightColor) => {
             params.color_rgb = rgb;
             true
         }
@@ -13417,6 +13434,97 @@ fn draw_effect_params(
             changed |= opacity.changed();
             opacity.lab_hover_tip("縁取り色を元画像へ重ねる強さです。");
         }
+        LocalEffect::RimLight(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "右リム") {
+                    *params = RimLightParams {
+                        light_angle_degrees: 0.0,
+                        width_px: 8.0,
+                        falloff: 0.42,
+                        strength: 0.85,
+                        color_rgb: [210, 238, 255],
+                        wrap: 0.12,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "右上光") {
+                    *params = RimLightParams {
+                        light_angle_degrees: -35.0,
+                        width_px: 10.0,
+                        falloff: 0.48,
+                        strength: 0.90,
+                        color_rgb: [255, 244, 210],
+                        wrap: 0.18,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "寒色輪郭") {
+                    *params = RimLightParams {
+                        light_angle_degrees: 160.0,
+                        width_px: 12.0,
+                        falloff: 0.55,
+                        strength: 0.78,
+                        color_rgb: [138, 205, 255],
+                        wrap: 0.24,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "柔らかめ") {
+                    *params = RimLightParams {
+                        light_angle_degrees: -120.0,
+                        width_px: 20.0,
+                        falloff: 0.78,
+                        strength: 0.58,
+                        color_rgb: [255, 238, 218],
+                        wrap: 0.38,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "マスク境界の光方向に向いた側だけを照らします。初期状態では前ON/後OFFなので、輪郭光がマスク外へ広がります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "光色",
+                    &mut params.color_rgb,
+                    RgbPickTarget::RimLightColor,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let angle = ui.add(
+                egui::Slider::new(&mut params.light_angle_degrees, -180.0..=180.0)
+                    .text("光方向")
+                    .suffix("°"),
+            );
+            changed |= angle.changed();
+            angle.lab_hover_tip("0°で右側、90°で下側、-90°で上側の縁が光ります。");
+            let width = ui.add(
+                egui::Slider::new(&mut params.width_px, 0.0..=64.0)
+                    .text("幅")
+                    .suffix("px"),
+            );
+            changed |= width.changed();
+            width.lab_hover_tip("境界から作るリムライトの太さです。0pxでは無効です。");
+            let falloff = ui.add(egui::Slider::new(&mut params.falloff, 0.0..=1.0).text("減衰"));
+            changed |= falloff.changed();
+            falloff.lab_hover_tip("リムライトの縁をどれだけなめらかに消すかです。");
+            let wrap = ui.add(egui::Slider::new(&mut params.wrap, 0.0..=1.0).text("回り込み"));
+            changed |= wrap.changed();
+            wrap.lab_hover_tip("光方向から外れた境界にも、どれだけ光を回り込ませるかです。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=2.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("輪郭光を元画像へ重ねる強さです。");
+        }
         LocalEffect::ColorOverlay(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -16327,6 +16435,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
         EffectKind::ColorFill => LocalEffect::ColorFill(ColorFillParams::default()),
         EffectKind::OutlineStroke => LocalEffect::OutlineStroke(OutlineStrokeParams::default()),
+        EffectKind::RimLight => LocalEffect::RimLight(RimLightParams::default()),
         EffectKind::ColorOverlay => LocalEffect::ColorOverlay(ColorOverlayParams::default()),
         EffectKind::NeonGlow => LocalEffect::NeonGlow(NeonGlowParams::default()),
         EffectKind::DiffuseGlow => LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
@@ -18654,6 +18763,7 @@ mod tests {
             EffectKind::Duotone,
             EffectKind::Equalize,
             EffectKind::GradientMap,
+            EffectKind::RimLight,
             EffectKind::NeonGlow,
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
@@ -18946,6 +19056,17 @@ mod tests {
             panic!("expected outline stroke effect");
         };
         assert_eq!(outline_params.color_rgb, [5, 6, 7]);
+
+        let mut rim_light = LocalEffect::RimLight(RimLightParams::default());
+        assert!(set_rgb_pick_target(
+            &mut rim_light,
+            RgbPickTarget::RimLightColor,
+            [180, 220, 255],
+        ));
+        let LocalEffect::RimLight(rim_light_params) = rim_light else {
+            panic!("expected rim light effect");
+        };
+        assert_eq!(rim_light_params.color_rgb, [180, 220, 255]);
 
         let mut halation = LocalEffect::Halation(HalationParams::default());
         assert!(set_rgb_pick_target(
