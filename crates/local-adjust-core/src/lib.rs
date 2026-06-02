@@ -565,6 +565,7 @@ pub enum LocalEffect {
     LensFlare(LensFlareParams),
     SpeedLines(SpeedLinesParams),
     CloudFog(CloudFogParams),
+    Spotlight(SpotlightParams),
     Vignette(VignetteParams),
     FilmGrain(FilmGrainParams),
     ChromaticAberration(ChromaticAberrationParams),
@@ -634,6 +635,7 @@ impl LocalEffect {
             Self::LensFlare(_) => "レンズフレア",
             Self::SpeedLines(_) => "集中線/スピード線",
             Self::CloudFog(_) => "雲/霧",
+            Self::Spotlight(_) => "スポットライト",
             Self::Vignette(_) => "ビネット",
             Self::FilmGrain(_) => "フィルム粒子",
             Self::ChromaticAberration(_) => "色収差",
@@ -2418,6 +2420,31 @@ impl Default for CloudFogParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SpotlightParams {
+    pub center: [f32; 2],
+    pub radius: f32,
+    pub feather: f32,
+    pub light_strength: f32,
+    pub shadow_strength: f32,
+    pub tint_rgb: [u8; 3],
+    pub tint_strength: f32,
+}
+
+impl Default for SpotlightParams {
+    fn default() -> Self {
+        Self {
+            center: [0.5, 0.45],
+            radius: 0.34,
+            feather: 0.36,
+            light_strength: 0.0,
+            shadow_strength: 0.0,
+            tint_rgb: [255, 236, 190],
+            tint_strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VignetteParams {
     /// Positive values darken the edge; negative values brighten it.
     pub strength: f32,
@@ -2854,6 +2881,9 @@ where
         }
         LocalEffect::CloudFog(params) => {
             apply_cloud_fog(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::Spotlight(params) => {
+            apply_spotlight(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::Vignette(params) => {
             apply_vignette(&image.pixels, image.width, image.height, *params)
@@ -7661,6 +7691,60 @@ fn cloud_fog_vertical_weight(y: usize, height: usize, fade: f32) -> f32 {
     lerp_f32(1.0, gradient.clamp(0.0, 1.0), amount)
 }
 
+fn apply_spotlight(src: &[u8], width: usize, height: usize, params: SpotlightParams) -> Vec<u8> {
+    let light_strength = params.light_strength.clamp(-1.0, 2.0);
+    let shadow_strength = params.shadow_strength.clamp(0.0, 1.0);
+    let tint_strength = params.tint_strength.clamp(0.0, 1.0);
+    if width == 0
+        || height == 0
+        || (light_strength.abs() <= f32::EPSILON
+            && shadow_strength <= f32::EPSILON
+            && tint_strength <= f32::EPSILON)
+    {
+        return src.to_vec();
+    }
+    let radius = params.radius.clamp(0.0, 1.0);
+    let feather = params.feather.clamp(0.001, 1.0);
+    let cx = params.center[0].clamp(0.0, 1.0) * width.saturating_sub(1) as f32;
+    let cy = params.center[1].clamp(0.0, 1.0) * height.saturating_sub(1) as f32;
+    let max_dist = farthest_corner_distance(width, height, cx, cy).max(1.0);
+    let tint = [
+        params.tint_rgb[0] as f32 / 255.0,
+        params.tint_rgb[1] as f32 / 255.0,
+        params.tint_rgb[2] as f32 / 255.0,
+    ];
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let d = dx.hypot(dy) / max_dist;
+            let spot = 1.0 - smoothstep(radius, (radius + feather).min(1.5), d);
+            let edge = 1.0 - spot;
+            for c in 0..3 {
+                let base = src[i + c] as f32 / 255.0;
+                let lit = if light_strength >= 0.0 {
+                    base + (1.0 - base) * light_strength * spot * 0.75
+                } else {
+                    base * (1.0 + light_strength * spot).clamp(0.0, 1.0)
+                };
+                let shaded = lit * (1.0 - shadow_strength * edge * 0.85);
+                let tinted = lerp_f32(
+                    shaded,
+                    screen_channel(shaded, tint[c] * tint_strength),
+                    tint_strength * spot,
+                );
+                out[i + c] = to_u8(tinted);
+            }
+        }
+    }
+    out
+}
+
 fn apply_vignette(src: &[u8], width: usize, height: usize, params: VignetteParams) -> Vec<u8> {
     let strength = params.strength.clamp(-1.0, 1.0);
     if strength.abs() <= f32::EPSILON || width == 0 || height == 0 {
@@ -9786,6 +9870,7 @@ mod tests {
             LocalEffect::LensFlare(LensFlareParams::default()),
             LocalEffect::SpeedLines(SpeedLinesParams::default()),
             LocalEffect::CloudFog(CloudFogParams::default()),
+            LocalEffect::Spotlight(SpotlightParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
             LocalEffect::FilmGrain(FilmGrainParams::default()),
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
@@ -10996,6 +11081,38 @@ LUT_3D_SIZE 2
         assert!(out.pixels[0] > out.pixels[4]);
         assert_eq!(out.pixels[8], src.pixels[8]);
         assert_eq!(out.pixels[11], 255);
+    }
+
+    #[test]
+    fn spotlight_brightens_center_darkens_edge_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                96, 96, 96, 91, 96, 96, 96, 92, 96, 96, 96, 93, 96, 96, 96, 94, 96, 96, 96, 95,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "spotlight",
+            LocalMask::Full,
+            LocalEffect::Spotlight(SpotlightParams {
+                center: [0.5, 0.0],
+                radius: 0.05,
+                feather: 0.35,
+                light_strength: 1.0,
+                shadow_strength: 0.65,
+                tint_rgb: [255, 230, 180],
+                tint_strength: 0.25,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let center = 2 * 4;
+        let edge = 0;
+        assert!(out.pixels[center] > src.pixels[center]);
+        assert!(out.pixels[edge] < src.pixels[edge]);
+        assert_eq!(out.pixels[center + 3], 93);
+        assert_eq!(out.pixels[edge + 3], 91);
     }
 
     #[test]

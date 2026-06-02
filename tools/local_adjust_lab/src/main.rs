@@ -31,11 +31,12 @@ use local_adjust_core::{
     PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
     RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
     RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, StarGlowParams, SubjectMask,
-    SubjectMaskRefinement, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams,
-    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
+    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, ThreeWayColorGradingParams,
+    ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams,
+    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
+    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1021,6 +1022,7 @@ enum EffectKind {
     GodRays,
     LensFlare,
     CloudFog,
+    Spotlight,
     Vignette,
     FilmGrain,
     ChromaticAberration,
@@ -1041,6 +1043,7 @@ enum RgbPickTarget {
     NeonGlowTint,
     SpeedLinesColor,
     CloudFogColor,
+    SpotlightTint,
 }
 
 impl RgbPickTarget {
@@ -1055,6 +1058,7 @@ impl RgbPickTarget {
             Self::NeonGlowTint => "ネオングローの着色",
             Self::SpeedLinesColor => "集中線/スピード線の線色",
             Self::CloudFogColor => "雲/霧の色",
+            Self::SpotlightTint => "スポットライトの光色",
         }
     }
 }
@@ -1119,6 +1123,7 @@ impl EffectKind {
             LocalEffect::GodRays(_) => Self::GodRays,
             LocalEffect::LensFlare(_) => Self::LensFlare,
             LocalEffect::CloudFog(_) => Self::CloudFog,
+            LocalEffect::Spotlight(_) => Self::Spotlight,
             LocalEffect::Vignette(_) => Self::Vignette,
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
             LocalEffect::ChromaticAberration(_) => Self::ChromaticAberration,
@@ -1188,6 +1193,7 @@ impl EffectKind {
             Self::GodRays => "光芒",
             Self::LensFlare => "レンズフレア",
             Self::CloudFog => "雲/霧",
+            Self::Spotlight => "スポットライト",
             Self::Vignette => "ビネット",
             Self::FilmGrain => "フィルム粒子",
             Self::ChromaticAberration => "色収差",
@@ -1309,6 +1315,7 @@ impl EffectKind {
             Self::GodRays => "明るい部分から光源方向に沿った放射状の光芒を作ります。",
             Self::LensFlare => "光源のにじみ、ハロー、レンズ内反射のゴーストを重ねます。",
             Self::CloudFog => "手続き型のノイズで霧や雲を重ね、大気感と遠近感を加えます。",
+            Self::Spotlight => "指定した中心を照らし、周辺を落として局所的な光を作ります。",
             Self::Vignette => "周辺を暗く、または明るくして視線を中央へ誘導します。",
             Self::FilmGrain => "粒状感を加え、フィルムや紙っぽい質感を作ります。",
             Self::ChromaticAberration => "RGBを少しずらし、レンズやデジタル風の色ズレを作ります。",
@@ -1448,6 +1455,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::GodRays,
             EffectKind::LensFlare,
             EffectKind::CloudFog,
+            EffectKind::Spotlight,
             EffectKind::StarGlow,
             EffectKind::Vignette,
             EffectKind::FilmGrain,
@@ -6749,6 +6757,35 @@ impl LocalAdjustLabApp {
                     guide_stroke,
                 );
             }
+            LocalEffect::Spotlight(params) => {
+                let center = norm_to_screen(rect, params.center);
+                let (center_changed, center_used) = drag_norm_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("spotlight_center", layer_idx)),
+                    center,
+                    &mut params.center,
+                    "スポットライト位置",
+                );
+                changed |= center_changed;
+                used |= center_used;
+
+                let center = norm_to_screen(rect, params.center);
+                let radius = params.radius.clamp(0.0, 1.0);
+                let feather = params.feather.clamp(0.001, 1.0);
+                let max_dim = rect.width().max(rect.height());
+                let radius_px = max_dim * radius * 0.5;
+                let outer_px = max_dim * (radius + feather).min(1.5) * 0.5;
+                let soft_stroke =
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 230, 130, 120));
+                let ring_stroke =
+                    egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 238, 160, 180));
+                let handle_stroke = egui::Stroke::new(2.0, Color32::from_rgb(45, 35, 10));
+                painter.circle_stroke(center, outer_px.max(2.0), soft_stroke);
+                painter.circle_stroke(center, radius_px.max(2.0), ring_stroke);
+                painter.circle_filled(center, 7.0, Color32::from_rgb(255, 224, 110));
+                painter.circle_stroke(center, 7.0, handle_stroke);
+            }
             _ => {}
         }
 
@@ -8025,6 +8062,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
             CloudFogMode::Fog => format!("霧 {:.0}%", params.opacity * 100.0),
             CloudFogMode::Clouds => format!("雲 {:.0}%", params.opacity * 100.0),
         },
+        LocalEffect::Spotlight(params) => format!(
+            "スポットライト +{:.0}% / 影 {:.0}%",
+            params.light_strength * 100.0,
+            params.shadow_strength * 100.0
+        ),
         LocalEffect::Vignette(params) => format!("ビネット {:.0}%", params.strength * 100.0),
         LocalEffect::FilmGrain(params) => format!("粒子 {:.0}%", params.amount * 100.0),
         LocalEffect::ChromaticAberration(params) => {
@@ -8259,6 +8301,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
         }
         (LocalEffect::CloudFog(params), RgbPickTarget::CloudFogColor) => {
             params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::Spotlight(params), RgbPickTarget::SpotlightTint) => {
+            params.tint_rgb = rgb;
             true
         }
         _ => false,
@@ -13323,6 +13369,112 @@ fn draw_effect_params(
             seed_response.lab_hover_tip("霧や雲のパターンを変えます。");
             params.seed = seed.max(0) as u32;
         }
+        LocalEffect::Spotlight(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "主役ライト") {
+                    *params = SpotlightParams {
+                        center: [0.50, 0.42],
+                        radius: 0.24,
+                        feather: 0.36,
+                        light_strength: 0.75,
+                        shadow_strength: 0.38,
+                        tint_rgb: [255, 238, 200],
+                        tint_strength: 0.22,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "舞台") {
+                    *params = SpotlightParams {
+                        center: [0.50, 0.24],
+                        radius: 0.18,
+                        feather: 0.30,
+                        light_strength: 1.05,
+                        shadow_strength: 0.62,
+                        tint_rgb: [255, 244, 220],
+                        tint_strength: 0.18,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "夕光") {
+                    *params = SpotlightParams {
+                        center: [0.28, 0.32],
+                        radius: 0.30,
+                        feather: 0.42,
+                        light_strength: 0.65,
+                        shadow_strength: 0.30,
+                        tint_rgb: [255, 190, 118],
+                        tint_strength: 0.42,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "暗転") {
+                    *params = SpotlightParams {
+                        center: [0.50, 0.50],
+                        radius: 0.26,
+                        feather: 0.28,
+                        light_strength: 0.20,
+                        shadow_strength: 0.78,
+                        tint_rgb: [230, 240, 255],
+                        tint_strength: 0.08,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "指定中心を照らし、周辺を落として視線誘導や舞台照明のような局所光を作ります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let mut show_handles = effect_position_handles_visible;
+            let handle_toggle = ui.checkbox(&mut show_handles, "画像ハンドルを表示");
+            if handle_toggle.changed() {
+                set_effect_position_handles_visible = Some(show_handles);
+            }
+            handle_toggle.lab_hover_tip(
+                "ONの間、画像上のスポットライトハンドルをドラッグして中心位置を調整できます。",
+            );
+            let center_x =
+                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
+            changed |= center_x.changed();
+            center_x.lab_hover_tip("ライト中心の横位置です。");
+            let center_y =
+                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心Y"));
+            changed |= center_y.changed();
+            center_y.lab_hover_tip("ライト中心の縦位置です。");
+            let radius = ui.add(egui::Slider::new(&mut params.radius, 0.0..=1.0).text("半径"));
+            changed |= radius.changed();
+            radius.lab_hover_tip("明るい中心部の大きさです。");
+            let feather =
+                ui.add(egui::Slider::new(&mut params.feather, 0.001..=1.0).text("ぼかし"));
+            changed |= feather.changed();
+            feather.lab_hover_tip("中心から外側へのなだらかさです。");
+            let light = ui
+                .add(egui::Slider::new(&mut params.light_strength, -1.0..=2.0).text("中心明るさ"));
+            changed |= light.changed();
+            light.lab_hover_tip("正の値で中心を明るく、負の値で中心を暗くします。");
+            let shadow =
+                ui.add(egui::Slider::new(&mut params.shadow_strength, 0.0..=1.0).text("周辺影"));
+            changed |= shadow.changed();
+            shadow.lab_hover_tip("スポット外側を暗く落とす強さです。");
+            let tint = ui.add(egui::Slider::new(&mut params.tint_strength, 0.0..=1.0).text("光色"));
+            changed |= tint.changed();
+            tint.lab_hover_tip("中心部へ指定色をどれだけ混ぜるかです。");
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "光色",
+                    &mut params.tint_rgb,
+                    RgbPickTarget::SpotlightTint,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+        }
         LocalEffect::Vignette(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -14952,6 +15104,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::GodRays => LocalEffect::GodRays(GodRaysParams::default()),
         EffectKind::LensFlare => LocalEffect::LensFlare(LensFlareParams::default()),
         EffectKind::CloudFog => LocalEffect::CloudFog(CloudFogParams::default()),
+        EffectKind::Spotlight => LocalEffect::Spotlight(SpotlightParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
         EffectKind::FilmGrain => LocalEffect::FilmGrain(FilmGrainParams::default()),
         EffectKind::ChromaticAberration => {
@@ -17188,6 +17341,7 @@ mod tests {
             EffectKind::GodRays,
             EffectKind::LensFlare,
             EffectKind::CloudFog,
+            EffectKind::Spotlight,
             EffectKind::Vignette,
             EffectKind::FilmGrain,
             EffectKind::ChromaticAberration,
@@ -17395,6 +17549,17 @@ mod tests {
             panic!("expected cloud fog effect");
         };
         assert_eq!(cloud_fog_params.color_rgb, [90, 120, 180]);
+
+        let mut spotlight = LocalEffect::Spotlight(SpotlightParams::default());
+        assert!(set_rgb_pick_target(
+            &mut spotlight,
+            RgbPickTarget::SpotlightTint,
+            [255, 210, 120],
+        ));
+        let LocalEffect::Spotlight(spotlight_params) = spotlight else {
+            panic!("expected spotlight effect");
+        };
+        assert_eq!(spotlight_params.tint_rgb, [255, 210, 120]);
 
         let mut tone = LocalEffect::Tone(ToneParams::default());
         assert!(!set_rgb_pick_target(

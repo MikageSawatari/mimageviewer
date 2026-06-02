@@ -115,6 +115,7 @@ the window.
   - God rays
   - Lens flare
   - Cloud/fog
+  - Spotlight
   - Vignette
   - Film grain
   - Chromatic aberration
@@ -126,16 +127,16 @@ the window.
   buttons for practical starting points, or Reset to return the current effect
   to its default values.
 - RGB color parameters in Color Fill, Color Overlay, Neon Glow, Speed Lines,
-  and Cloud/Fog share a
+  Cloud/Fog, and Spotlight share a
   control with a color button, HEX readout, RGB sliders, and an image-click
   eyedropper.
 - Color Fill starts with a shape placeholder and full opacity. Choosing Solid,
   Linear Gradient, or Radial Gradient immediately makes the fill visible.
 - Linear and radial gradients in Color Fill and Color Overlay can be adjusted
   with the same canvas drag handles used by gradient-like mask/effect controls.
-- God Rays can show a canvas handle for dragging the light source position
-  directly on the image; turn the handle off from the effect panel when it gets
-  in the way.
+- God Rays and Spotlight can show canvas handles for dragging the light source
+  position directly on the image; turn the handle off from the effect panel when
+  it gets in the way.
 - 3D LUT sample files are available under `tools/local_adjust_lab/sample_luts/`.
   They are small self-made `.cube` files for quick testing of the LUT loader and
   effect strength slider.
