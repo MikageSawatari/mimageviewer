@@ -140,6 +140,7 @@ the window.
   - Screen tone
   - Color halftone
   - CMYK plate shift
+  - Newspaper print / aged paper
   - Textureizer
   - Cross/star glow
   - Edge-preserving smooth

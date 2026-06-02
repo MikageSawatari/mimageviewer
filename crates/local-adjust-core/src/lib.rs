@@ -611,6 +611,7 @@ pub enum LocalEffect {
     ScreenTone(ScreenToneParams),
     ColorHalftone(ColorHalftoneParams),
     CmykPlateShift(CmykPlateShiftParams),
+    NewspaperPrint(NewspaperPrintParams),
     Textureizer(TextureizerParams),
     StarGlow(StarGlowParams),
     EdgeSmooth(EdgeSmoothParams),
@@ -706,6 +707,7 @@ impl LocalEffect {
             Self::ScreenTone(_) => "スクリーントーン",
             Self::ColorHalftone(_) => "カラーハーフトーン",
             Self::CmykPlateShift(_) => "CMYK版ズレ",
+            Self::NewspaperPrint(_) => "新聞印刷",
             Self::Textureizer(_) => "テクスチャライザ",
             Self::StarGlow(_) => "クロス光",
             Self::EdgeSmooth(_) => "エッジ保持ぼかし",
@@ -3250,6 +3252,35 @@ impl Default for CmykPlateShiftParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NewspaperPrintParams {
+    pub cell_px: f32,
+    pub dot_gain: f32,
+    pub ink_bleed: f32,
+    pub paper_age: f32,
+    pub paper_texture: f32,
+    pub contrast: f32,
+    pub fade: f32,
+    pub strength: f32,
+    pub seed: u32,
+}
+
+impl Default for NewspaperPrintParams {
+    fn default() -> Self {
+        Self {
+            cell_px: 9.0,
+            dot_gain: 0.05,
+            ink_bleed: 0.20,
+            paper_age: 0.45,
+            paper_texture: 0.35,
+            contrast: 0.20,
+            fade: 0.18,
+            strength: 0.0,
+            seed: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TextureizerMode {
@@ -3860,6 +3891,9 @@ where
             }
             LocalEffect::CmykPlateShift(params) => {
                 apply_cmyk_plate_shift(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::NewspaperPrint(params) => {
+                apply_newspaper_print(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::Textureizer(params) => {
                 apply_textureizer(&image.pixels, image.width, image.height, *params)
@@ -11394,6 +11428,101 @@ fn sample_cmyk_ink_alpha_aware(
     (cyan * alpha, magenta * alpha, yellow * alpha, black * alpha)
 }
 
+fn apply_newspaper_print(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: NewspaperPrintParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let cell = params.cell_px.clamp(3.0, 96.0);
+    let dot_gain = params.dot_gain.clamp(-0.35, 0.45);
+    let ink_bleed = params.ink_bleed.clamp(0.0, 1.0);
+    let paper_age = params.paper_age.clamp(0.0, 1.0);
+    let paper_texture = params.paper_texture.clamp(0.0, 1.0);
+    let contrast = 1.0 + params.contrast.clamp(-1.0, 1.0) * 1.35;
+    let fade = params.fade.clamp(0.0, 1.0);
+    let edge = 0.01 + ink_bleed * 0.34;
+    let angle = 15.0_f32.to_radians();
+    let cos = angle.cos();
+    let sin = angle.sin();
+    let cx = width as f32 * 0.5;
+    let cy = height as f32 * 0.5;
+    let texture_scale = (cell * 1.45).clamp(5.0, 120.0);
+    let mut out = src.to_vec();
+
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let luma = luma01(base[0], base[1], base[2]);
+            let print_luma = ((luma - 0.5) * contrast + 0.5).clamp(0.0, 1.0);
+            let tone = (1.0 - print_luma + dot_gain).clamp(0.0, 1.0);
+            let fx = x as f32 + 0.5 - cx;
+            let fy = y as f32 + 0.5 - cy;
+            let u = fx * cos + fy * sin;
+            let v = -fx * sin + fy * cos;
+            let ink_mask = screen_tone_ink_mask(ScreenToneMode::Dots, u, v, cell, tone, edge);
+            let print_noise = glass_value_noise(
+                x as f32 / (cell * 0.42).max(1.0) + 17.0,
+                y as f32 / (cell * 0.42).max(1.0) - 9.0,
+                params.seed ^ 0xBEE5_2DAD,
+            );
+            let ink_noise = (0.92 + print_noise * 0.16).clamp(0.70, 1.08);
+            let ink_alpha = (ink_mask * (1.0 - fade * 0.34) * ink_noise).clamp(0.0, 1.0);
+
+            let paper_noise = textureizer_value(
+                TextureizerMode::Paper,
+                x as f32,
+                y as f32,
+                texture_scale,
+                1.05,
+                params.seed,
+            );
+            let fiber = signed_noise(
+                x as u32,
+                (y as u32).wrapping_mul(3),
+                params.seed ^ 0x5A17_9E21,
+            );
+            let paper_variation = (paper_noise * 0.075 + fiber * 0.025) * paper_texture;
+            let paper = [
+                (0.995 - paper_age * 0.085 + paper_variation).clamp(0.0, 1.0),
+                (0.972 - paper_age * 0.125 + paper_variation * 0.82).clamp(0.0, 1.0),
+                (0.900 - paper_age * 0.225 + paper_variation * 0.56).clamp(0.0, 1.0),
+            ];
+            let ink_floor = 0.035 + fade * 0.155 + paper_age * 0.035;
+            let ink = [
+                (ink_floor * 1.06).clamp(0.0, 1.0),
+                (ink_floor * 0.98).clamp(0.0, 1.0),
+                (ink_floor * 0.82).clamp(0.0, 1.0),
+            ];
+            let target = [
+                lerp_f32(paper[0], ink[0], ink_alpha),
+                lerp_f32(paper[1], ink[1], ink_alpha),
+                lerp_f32(paper[2], ink[2], ink_alpha),
+            ];
+
+            for c in 0..3 {
+                out[i + c] = to_u8(lerp_f32(base[c], target[c], strength));
+            }
+        }
+    }
+
+    out
+}
+
 fn apply_textureizer(
     src: &[u8],
     width: usize,
@@ -14127,6 +14256,7 @@ mod tests {
             LocalEffect::ScreenTone(ScreenToneParams::default()),
             LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
             LocalEffect::CmykPlateShift(CmykPlateShiftParams::default()),
+            LocalEffect::NewspaperPrint(NewspaperPrintParams::default()),
             LocalEffect::Textureizer(TextureizerParams::default()),
             LocalEffect::StarGlow(StarGlowParams::default()),
             LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
@@ -14933,6 +15063,20 @@ mod tests {
                     black_generation: 1.0,
                     ink_gain: 0.35,
                     strength: 1.0,
+                }),
+            ),
+            full(
+                "newspaper print dense texture",
+                LocalEffect::NewspaperPrint(NewspaperPrintParams {
+                    cell_px: 3.0,
+                    dot_gain: 0.45,
+                    ink_bleed: 1.0,
+                    paper_age: 1.0,
+                    paper_texture: 1.0,
+                    contrast: 1.0,
+                    fade: 1.0,
+                    strength: 1.0,
+                    seed: 25,
                 }),
             ),
             full(
@@ -17517,6 +17661,71 @@ LUT_3D_SIZE 2
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(&out.pixels[0..4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn newspaper_print_turns_gray_into_ink_dots_and_preserves_alpha() {
+        let src = solid(8, 8, [150, 150, 150, 209]);
+        let layer = LocalAdjustmentLayer::new(
+            "newspaper",
+            LocalMask::Full,
+            LocalEffect::NewspaperPrint(NewspaperPrintParams {
+                cell_px: 4.0,
+                dot_gain: 0.05,
+                ink_bleed: 0.0,
+                paper_age: 0.35,
+                paper_texture: 0.0,
+                contrast: 0.35,
+                fade: 0.0,
+                strength: 1.0,
+                seed: 3,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_ne!(out.pixels, src.pixels);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 209));
+        assert!(out.pixels.chunks_exact(4).any(|px| px[0] < 80));
+        assert!(out.pixels.chunks_exact(4).any(|px| px[0] > 200));
+    }
+
+    #[test]
+    fn newspaper_print_ages_blank_paper_without_adding_white_ink() {
+        let src = solid(4, 4, [255, 255, 255, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "newspaper",
+            LocalMask::Full,
+            LocalEffect::NewspaperPrint(NewspaperPrintParams {
+                cell_px: 4.0,
+                dot_gain: 0.0,
+                ink_bleed: 0.0,
+                paper_age: 1.0,
+                paper_texture: 0.0,
+                contrast: 0.0,
+                fade: 0.0,
+                strength: 1.0,
+                seed: 4,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let px = &out.pixels[0..4];
+        assert!(px[0] > px[1]);
+        assert!(px[1] > px[2]);
+        assert_eq!(px[3], 255);
+    }
+
+    #[test]
+    fn newspaper_print_keeps_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(1, 1, vec![12, 34, 56, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "newspaper",
+            LocalMask::Full,
+            LocalEffect::NewspaperPrint(NewspaperPrintParams {
+                strength: 1.0,
+                ..NewspaperPrintParams::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
     }
 
     #[test]

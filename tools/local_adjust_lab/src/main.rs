@@ -29,21 +29,21 @@ use local_adjust_core::{
     LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams, LineKind,
     LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
     ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
-    MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams, OilPaintParams,
-    OldFilmParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement, PartColorParams,
-    ParticleOverlayMode, ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection,
-    PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
-    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
-    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
-    RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode, ScreenToneParams,
-    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
-    SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask,
-    SubjectMaskRefinement, TextureParams, TextureizerMode, TextureizerParams,
-    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
-    ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams, WaterCausticsParams,
-    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
-    evaluate_layer_mask, parse_cube_lut,
+    MotionBlurParams, NeonGlowParams, NewspaperPrintParams, NoiseDistribution, NoiseParams,
+    OilPaintParams, OldFilmParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement,
+    PartColorParams, ParticleOverlayMode, ParticleOverlayParams, PinchSpherizeParams,
+    PixelSortDirection, PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams,
+    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
+    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
+    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams,
+    ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams,
+    SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams,
+    SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
+    TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
+    TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams,
+    VignetteParams, WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection,
+    WindParams, WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1068,6 +1068,7 @@ enum EffectKind {
     ScreenTone,
     ColorHalftone,
     CmykPlateShift,
+    NewspaperPrint,
     Textureizer,
     StarGlow,
     EdgeSmooth,
@@ -1218,6 +1219,7 @@ impl EffectKind {
             LocalEffect::ScreenTone(_) => Self::ScreenTone,
             LocalEffect::ColorHalftone(_) => Self::ColorHalftone,
             LocalEffect::CmykPlateShift(_) => Self::CmykPlateShift,
+            LocalEffect::NewspaperPrint(_) => Self::NewspaperPrint,
             LocalEffect::Textureizer(_) => Self::Textureizer,
             LocalEffect::StarGlow(_) => Self::StarGlow,
             LocalEffect::EdgeSmooth(_) => Self::EdgeSmooth,
@@ -1313,6 +1315,7 @@ impl EffectKind {
             Self::ScreenTone => "スクリーントーン",
             Self::ColorHalftone => "カラーハーフトーン",
             Self::CmykPlateShift => "CMYK版ズレ",
+            Self::NewspaperPrint => "新聞印刷",
             Self::Textureizer => "テクスチャライザ",
             Self::StarGlow => "クロス光",
             Self::EdgeSmooth => "エッジ保持ぼかし",
@@ -1511,6 +1514,9 @@ impl EffectKind {
             Self::CmykPlateShift => {
                 "CMYKの色版を少しずらし、印刷物やリソグラフ風の色ズレを作ります。"
             }
+            Self::NewspaperPrint => {
+                "粗い網点、黄ばんだ紙色、紙目、インクのにじみを重ねて新聞紙や古印刷物風にします。"
+            }
             Self::Textureizer => {
                 "紙目、キャンバス、リネンの手続き型テクスチャをソフトライトで重ね、手描き感や紙質を足します。"
             }
@@ -1650,6 +1656,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ScreenTone,
             EffectKind::ColorHalftone,
             EffectKind::CmykPlateShift,
+            EffectKind::NewspaperPrint,
             EffectKind::Textureizer,
             EffectKind::ScanlineGlitch,
             EffectKind::Vhs,
@@ -8660,6 +8667,13 @@ fn effect_summary(effect: &LocalEffect) -> String {
         }
         LocalEffect::CmykPlateShift(params) => {
             format!("CMYK版ズレ {:.1}px", params.offset_px)
+        }
+        LocalEffect::NewspaperPrint(params) => {
+            format!(
+                "新聞印刷 {:.0}px 紙 {:.0}%",
+                params.cell_px,
+                params.paper_age * 100.0
+            )
         }
         LocalEffect::Textureizer(params) => format!(
             "テクスチャ {} {:.0}px",
@@ -16508,6 +16522,103 @@ fn draw_effect_params(
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から版ズレ再合成結果へどれだけ近づけるかです。");
         }
+        LocalEffect::NewspaperPrint(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "新聞紙") {
+                    *params = NewspaperPrintParams {
+                        cell_px: 9.0,
+                        dot_gain: 0.05,
+                        ink_bleed: 0.18,
+                        paper_age: 0.38,
+                        paper_texture: 0.34,
+                        contrast: 0.22,
+                        fade: 0.15,
+                        strength: 0.82,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "古新聞") {
+                    *params = NewspaperPrintParams {
+                        cell_px: 11.0,
+                        dot_gain: 0.03,
+                        ink_bleed: 0.36,
+                        paper_age: 0.82,
+                        paper_texture: 0.62,
+                        contrast: 0.08,
+                        fade: 0.48,
+                        strength: 0.88,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "粗い印刷") {
+                    *params = NewspaperPrintParams {
+                        cell_px: 16.0,
+                        dot_gain: 0.16,
+                        ink_bleed: 0.55,
+                        paper_age: 0.52,
+                        paper_texture: 0.45,
+                        contrast: 0.45,
+                        fade: 0.20,
+                        strength: 0.95,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡い紙面") {
+                    *params = NewspaperPrintParams {
+                        cell_px: 12.0,
+                        dot_gain: -0.07,
+                        ink_bleed: 0.20,
+                        paper_age: 0.60,
+                        paper_texture: 0.40,
+                        contrast: -0.10,
+                        fade: 0.36,
+                        strength: 0.65,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "元画像の明るさを粗い網点に置き換え、黄ばんだ紙色と紙目、少しにじんだインクで新聞・古印刷物風にします。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            changed |= ui
+                .add(egui::Slider::new(&mut params.cell_px, 3.0..=96.0).text("網点セル(px)"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.dot_gain, -0.35..=0.45).text("ドット増減"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.ink_bleed, 0.0..=1.0).text("インクにじみ"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.paper_age, 0.0..=1.0).text("紙の古さ"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.paper_texture, 0.0..=1.0).text("紙目"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.contrast, -1.0..=1.0).text("印刷コントラスト"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.fade, 0.0..=1.0).text("退色"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
+                .changed();
+            let mut seed = params.seed as i32;
+            changed |= ui
+                .add(egui::Slider::new(&mut seed, 0..=9999).text("seed"))
+                .changed();
+            params.seed = seed.max(0) as u32;
+        }
         LocalEffect::Textureizer(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -18206,6 +18317,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ScreenTone => LocalEffect::ScreenTone(ScreenToneParams::default()),
         EffectKind::ColorHalftone => LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
         EffectKind::CmykPlateShift => LocalEffect::CmykPlateShift(CmykPlateShiftParams::default()),
+        EffectKind::NewspaperPrint => LocalEffect::NewspaperPrint(NewspaperPrintParams::default()),
         EffectKind::Textureizer => LocalEffect::Textureizer(TextureizerParams::default()),
         EffectKind::StarGlow => LocalEffect::StarGlow(StarGlowParams::default()),
         EffectKind::EdgeSmooth => LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
@@ -20552,6 +20664,7 @@ mod tests {
             EffectKind::ScreenTone,
             EffectKind::ColorHalftone,
             EffectKind::CmykPlateShift,
+            EffectKind::NewspaperPrint,
             EffectKind::Textureizer,
             EffectKind::ScanlineGlitch,
             EffectKind::Vhs,
