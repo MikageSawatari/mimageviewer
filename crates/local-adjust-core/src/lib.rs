@@ -442,6 +442,7 @@ pub enum LocalEffect {
     Cutout(CutoutParams),
     Emboss(EmbossParams),
     PixelStylize(PixelStylizeParams),
+    Solarize(SolarizeParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -501,6 +502,7 @@ impl LocalEffect {
             Self::Cutout(_) => "切り絵",
             Self::Emboss(_) => "エンボス",
             Self::PixelStylize(_) => "粒状スタイル",
+            Self::Solarize(_) => "ソラリゼーション",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -1354,6 +1356,29 @@ impl Default for PixelStylizeParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SolarizeParams {
+    pub threshold: f32,
+    pub softness: f32,
+    pub inversion: f32,
+    pub contrast: f32,
+    pub color_amount: f32,
+    pub strength: f32,
+}
+
+impl Default for SolarizeParams {
+    fn default() -> Self {
+        Self {
+            threshold: 0.55,
+            softness: 0.08,
+            inversion: 1.0,
+            contrast: 0.0,
+            color_amount: 1.0,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SoftFocusParams {
     pub radius_px: f32,
     pub strength: f32,
@@ -2164,6 +2189,7 @@ where
         LocalEffect::PixelStylize(params) => {
             apply_pixel_stylize(&image.pixels, image.width, image.height, *params)
         }
+        LocalEffect::Solarize(params) => apply_solarize(&image.pixels, *params),
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
             image.width,
@@ -5452,6 +5478,60 @@ fn apply_invert(src: &[u8], params: InvertParams) -> Vec<u8> {
     out
 }
 
+fn apply_solarize(src: &[u8], params: SolarizeParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let inversion = params.inversion.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || inversion <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let threshold = params.threshold.clamp(0.0, 1.0);
+    let softness = params.softness.clamp(0.0, 0.5);
+    let contrast = params.contrast.clamp(-1.0, 1.0);
+    let color_amount = params.color_amount.clamp(0.0, 1.0);
+
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let base = [
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        ];
+        let luma = luma01(base[0], base[1], base[2]);
+        let luma_gate = solarize_gate(luma, threshold, softness);
+        let solar_luma = lerp_f32(luma, 1.0 - luma, luma_gate * inversion);
+        let mut color_target = [0.0; 3];
+        for c in 0..3 {
+            let channel_gate = solarize_gate(base[c], threshold, softness);
+            let gate = lerp_f32(luma_gate, channel_gate, color_amount * 0.7);
+            color_target[c] = lerp_f32(base[c], 1.0 - base[c], gate * inversion);
+        }
+        let mut target = [
+            lerp_f32(solar_luma, color_target[0], color_amount),
+            lerp_f32(solar_luma, color_target[1], color_amount),
+            lerp_f32(solar_luma, color_target[2], color_amount),
+        ];
+        for c in &mut target {
+            *c = ((*c - 0.5) * (1.0 + contrast * 1.25) + 0.5).clamp(0.0, 1.0);
+        }
+        px[0] = to_u8(lerp_f32(base[0], target[0], strength));
+        px[1] = to_u8(lerp_f32(base[1], target[1], strength));
+        px[2] = to_u8(lerp_f32(base[2], target[2], strength));
+    }
+    out
+}
+
+fn solarize_gate(value: f32, threshold: f32, softness: f32) -> f32 {
+    if softness <= f32::EPSILON {
+        if value >= threshold { 1.0 } else { 0.0 }
+    } else {
+        smoothstep(
+            (threshold - softness).clamp(0.0, 1.0),
+            (threshold + softness).clamp(0.0, 1.0),
+            value,
+        )
+    }
+}
+
 fn apply_duotone(src: &[u8], params: DuotoneParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 1.0);
     if params.preset == DuotonePreset::None || strength <= f32::EPSILON {
@@ -8016,6 +8096,7 @@ mod tests {
             LocalEffect::Cutout(CutoutParams::default()),
             LocalEffect::Emboss(EmbossParams::default()),
             LocalEffect::PixelStylize(PixelStylizeParams::default()),
+            LocalEffect::Solarize(SolarizeParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),
@@ -8529,6 +8610,47 @@ LUT_3D_SIZE 2
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out.pixels, vec![245, 135, 5, 128]);
+    }
+
+    #[test]
+    fn solarize_reverses_highlights_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(2, 1, vec![64, 64, 64, 77, 200, 200, 200, 88]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "solarize",
+            LocalMask::Full,
+            LocalEffect::Solarize(SolarizeParams {
+                threshold: 0.5,
+                softness: 0.0,
+                inversion: 1.0,
+                contrast: 0.0,
+                color_amount: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[64, 64, 64, 77]);
+        assert_eq!(&out.pixels[4..8], &[55, 55, 55, 88]);
+    }
+
+    #[test]
+    fn solarize_monochrome_mode_outputs_gray() {
+        let src = RgbaImageBuf::new(1, 1, vec![240, 120, 40, 99]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "solarize",
+            LocalMask::Full,
+            LocalEffect::Solarize(SolarizeParams {
+                threshold: 0.3,
+                softness: 0.0,
+                inversion: 1.0,
+                contrast: 0.0,
+                color_amount: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels[0], out.pixels[1]);
+        assert_eq!(out.pixels[1], out.pixels[2]);
+        assert_eq!(out.pixels[3], 99);
     }
 
     #[test]

@@ -29,10 +29,11 @@ use local_adjust_core::{
     PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
     RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
     RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams,
-    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    SoftFocusParams, SolarizeParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams,
+    ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams,
+    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
+    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -988,6 +989,7 @@ enum EffectKind {
     Cutout,
     Emboss,
     PixelStylize,
+    Solarize,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1047,6 +1049,7 @@ impl EffectKind {
             LocalEffect::Cutout(_) => Self::Cutout,
             LocalEffect::Emboss(_) => Self::Emboss,
             LocalEffect::PixelStylize(_) => Self::PixelStylize,
+            LocalEffect::Solarize(_) => Self::Solarize,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1106,6 +1109,7 @@ impl EffectKind {
             Self::Cutout => "切り絵",
             Self::Emboss => "エンボス",
             Self::PixelStylize => "粒状スタイル",
+            Self::Solarize => "ソラリゼーション",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1195,6 +1199,7 @@ impl EffectKind {
             }
             Self::Emboss => "明るさの傾きから陰影を作り、紙や金属の浮き彫りのような質感にします。",
             Self::PixelStylize => "結晶化、点描、Facet、メゾチントの粒状スタイライズを作ります。",
+            Self::Solarize => "明るい部分を反転させ、写真暗室風のトーン反転や特殊色を作ります。",
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
@@ -1339,6 +1344,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Cutout,
             EffectKind::Emboss,
             EffectKind::PixelStylize,
+            EffectKind::Solarize,
             EffectKind::Halftone,
         ],
     },
@@ -7313,6 +7319,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
             };
             format!("粒状スタイル {mode}")
         }
+        LocalEffect::Solarize(params) => {
+            format!("ソラリゼーション {:.0}%", params.threshold * 100.0)
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -10301,6 +10310,87 @@ fn draw_effect_params(
             seed_response.lab_hover_tip("セルや粒の配置パターンを変えます。");
             params.seed = seed.max(0) as u32;
         }
+        LocalEffect::Solarize(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "標準") {
+                    *params = SolarizeParams {
+                        threshold: 0.55,
+                        softness: 0.08,
+                        inversion: 1.0,
+                        contrast: 0.05,
+                        color_amount: 1.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "柔らかい") {
+                    *params = SolarizeParams {
+                        threshold: 0.52,
+                        softness: 0.22,
+                        inversion: 0.85,
+                        contrast: -0.05,
+                        color_amount: 0.85,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "白黒") {
+                    *params = SolarizeParams {
+                        threshold: 0.50,
+                        softness: 0.08,
+                        inversion: 1.0,
+                        contrast: 0.25,
+                        color_amount: 0.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ハイライト") {
+                    *params = SolarizeParams {
+                        threshold: 0.68,
+                        softness: 0.06,
+                        inversion: 1.0,
+                        contrast: 0.15,
+                        color_amount: 1.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "しきい値より明るいトーンを反転します。ネガより部分的で、境目の色ずれや暗室風の効果を作れます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let threshold =
+                ui.add(egui::Slider::new(&mut params.threshold, 0.0..=1.0).text("しきい値"));
+            changed |= threshold.changed();
+            threshold
+                .lab_hover_tip("反転を始める明るさです。上げるほどハイライトだけが反転します。");
+            let softness =
+                ui.add(egui::Slider::new(&mut params.softness, 0.0..=0.5).text("柔らかさ"));
+            changed |= softness.changed();
+            softness.lab_hover_tip("しきい値前後の反転をどれだけなだらかにするかです。");
+            let inversion =
+                ui.add(egui::Slider::new(&mut params.inversion, 0.0..=1.0).text("反転量"));
+            changed |= inversion.changed();
+            inversion.lab_hover_tip("明るいトーンを反対側へ折り返す量です。");
+            let color = ui.add(egui::Slider::new(&mut params.color_amount, 0.0..=1.0).text("色量"));
+            changed |= color.changed();
+            color.lab_hover_tip(
+                "0では白黒のトーン反転、上げるとRGBチャンネルごとの色ずれを残します。",
+            );
+            let contrast =
+                ui.add(egui::Slider::new(&mut params.contrast, -1.0..=1.0).text("コントラスト"));
+            changed |= contrast.changed();
+            contrast.lab_hover_tip("反転後の明暗差を締めたり、柔らかくしたりします。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からソラリゼーション結果へどれだけ近づけるかです。");
+        }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -12759,6 +12849,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Cutout => LocalEffect::Cutout(CutoutParams::default()),
         EffectKind::Emboss => LocalEffect::Emboss(EmbossParams::default()),
         EffectKind::PixelStylize => LocalEffect::PixelStylize(PixelStylizeParams::default()),
+        EffectKind::Solarize => LocalEffect::Solarize(SolarizeParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
@@ -14624,6 +14715,7 @@ mod tests {
             EffectKind::Cutout,
             EffectKind::Emboss,
             EffectKind::PixelStylize,
+            EffectKind::Solarize,
             EffectKind::SoftFocus,
             EffectKind::Mosaic,
             EffectKind::Sharpen,
