@@ -5195,20 +5195,51 @@ impl LocalAdjustLabApp {
                             };
                             let mask_line = MaskKind::from_mask(&layer.mask).label();
                             let effect_line = effect_summary(&layer.effect);
-                            ui.label(egui::RichText::new(mask_line).strong().color(text_color));
-                            ui.label(egui::RichText::new(effect_line).size(11.0).color(
-                                if layer.enabled {
-                                    Color32::from_gray(205)
-                                } else {
-                                    Color32::from_gray(125)
-                                },
-                            ));
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(mask_line).strong().color(text_color),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                row_clicked = true;
+                            }
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(effect_line).size(11.0).color(
+                                            if layer.enabled {
+                                                Color32::from_gray(205)
+                                            } else {
+                                                Color32::from_gray(125)
+                                            },
+                                        ),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                row_clicked = true;
+                            }
                             if !layer.enabled {
-                                ui.label(
-                                    egui::RichText::new("OFF")
-                                        .size(10.0)
-                                        .color(Color32::from_gray(150)),
-                                );
+                                if ui
+                                    .add(
+                                        egui::Label::new(
+                                            egui::RichText::new("OFF")
+                                                .size(10.0)
+                                                .color(Color32::from_gray(150)),
+                                        )
+                                        .sense(Sense::click()),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    row_clicked = true;
+                                }
                             }
                         });
                         let spacer_w = ui.available_width().max(0.0);
