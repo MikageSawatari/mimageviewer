@@ -30,19 +30,20 @@ use local_adjust_core::{
     LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams,
     MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams,
     NoiseDistribution, NoiseParams, OilPaintParams, OldFilmParams, OrtonParams,
-    OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, PinchSpherizeParams,
-    PixelSortDirection, PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams,
-    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
-    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
-    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams,
-    ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams,
-    SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams,
-    SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
-    TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
-    TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams,
-    VignetteParams, WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection,
-    WindParams, WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
+    OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, ParticleOverlayMode,
+    ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection, PixelSortOrder,
+    PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
+    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
+    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
+    RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode, ScreenToneParams,
+    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
+    SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask,
+    SubjectMaskRefinement, TextureParams, TextureizerMode, TextureizerParams,
+    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
+    ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams, WaterCausticsParams,
+    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1051,6 +1052,7 @@ enum EffectKind {
     AnamorphicFlare,
     CloudFog,
     WaterCaustics,
+    ParticleOverlay,
     Spotlight,
     Vignette,
     FilmGrain,
@@ -1082,6 +1084,7 @@ enum RgbPickTarget {
     NeonGlowTint,
     SpeedLinesColor,
     CloudFogColor,
+    ParticleOverlayColor,
     SpotlightTint,
     OutlineStrokeColor,
     RimLightColor,
@@ -1106,6 +1109,7 @@ impl RgbPickTarget {
             Self::NeonGlowTint => "ネオングローの着色",
             Self::SpeedLinesColor => "集中線/スピード線の線色",
             Self::CloudFogColor => "雲/霧の色",
+            Self::ParticleOverlayColor => "雨/雪/花びらの色",
             Self::SpotlightTint => "スポットライトの光色",
             Self::OutlineStrokeColor => "縁取りの線色",
             Self::RimLightColor => "リムライトの光色",
@@ -1192,6 +1196,7 @@ impl EffectKind {
             LocalEffect::AnamorphicFlare(_) => Self::AnamorphicFlare,
             LocalEffect::CloudFog(_) => Self::CloudFog,
             LocalEffect::WaterCaustics(_) => Self::WaterCaustics,
+            LocalEffect::ParticleOverlay(_) => Self::ParticleOverlay,
             LocalEffect::Spotlight(_) => Self::Spotlight,
             LocalEffect::Vignette(_) => Self::Vignette,
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
@@ -1284,6 +1289,7 @@ impl EffectKind {
             Self::AnamorphicFlare => "アナモルフィックフレア",
             Self::CloudFog => "雲/霧",
             Self::WaterCaustics => "水中コースティクス",
+            Self::ParticleOverlay => "雨/雪/花びら",
             Self::Spotlight => "スポットライト",
             Self::Vignette => "ビネット",
             Self::FilmGrain => "フィルム粒子",
@@ -1312,6 +1318,7 @@ impl EffectKind {
             Self::Equalize => "ヒスト平坦化",
             Self::AnamorphicFlare => "アナモルフフレア",
             Self::WaterCaustics => "水中光網",
+            Self::ParticleOverlay => "天候粒子",
             _ => self.label(),
         }
     }
@@ -1461,6 +1468,7 @@ impl EffectKind {
             Self::WaterCaustics => {
                 "水面越しの揺らぐ光網を重ね、水中やプール、反射光の演出を作ります。"
             }
+            Self::ParticleOverlay => "雨、雪、花びらの粒子を重ね、天候や舞い散る演出を作ります。",
             Self::Spotlight => "指定した中心を照らし、周辺を落として局所的な光を作ります。",
             Self::Vignette => "周辺を暗く、または明るくして視線を中央へ誘導します。",
             Self::FilmGrain => "粒状感を加え、フィルムや紙っぽい質感を作ります。",
@@ -1655,6 +1663,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::AnamorphicFlare,
             EffectKind::CloudFog,
             EffectKind::WaterCaustics,
+            EffectKind::ParticleOverlay,
             EffectKind::Spotlight,
             EffectKind::StarGlow,
             EffectKind::Vignette,
@@ -8597,6 +8606,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::WaterCaustics(params) => {
             format!("水中コースティクス {:.0}%", params.strength * 100.0)
         }
+        LocalEffect::ParticleOverlay(params) => format!(
+            "{} {:.0}%",
+            particle_overlay_mode_label(params.mode),
+            params.strength * 100.0
+        ),
         LocalEffect::Spotlight(params) => format!(
             "スポットライト +{:.0}% / 影 {:.0}%",
             params.light_strength * 100.0,
@@ -8701,6 +8715,14 @@ fn textureizer_mode_label(mode: TextureizerMode) -> &'static str {
         TextureizerMode::Paper => "紙目",
         TextureizerMode::Canvas => "キャンバス",
         TextureizerMode::Linen => "リネン",
+    }
+}
+
+fn particle_overlay_mode_label(mode: ParticleOverlayMode) -> &'static str {
+    match mode {
+        ParticleOverlayMode::Rain => "雨",
+        ParticleOverlayMode::Snow => "雪",
+        ParticleOverlayMode::Petals => "花びら",
     }
 }
 
@@ -8929,6 +8951,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
             true
         }
         (LocalEffect::CloudFog(params), RgbPickTarget::CloudFogColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::ParticleOverlay(params), RgbPickTarget::ParticleOverlayColor) => {
             params.color_rgb = rgb;
             true
         }
@@ -15207,6 +15233,133 @@ fn draw_effect_params(
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から水中コースティクス結果へどれだけ近づけるかです。");
         }
+        LocalEffect::ParticleOverlay(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "雨") {
+                    *params = ParticleOverlayParams {
+                        mode: ParticleOverlayMode::Rain,
+                        density: 0.58,
+                        size_px: 1.4,
+                        length_px: 38.0,
+                        angle_degrees: 105.0,
+                        opacity: 0.45,
+                        color_rgb: [210, 230, 255],
+                        seed: params.seed,
+                        strength: 0.78,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強い雨") {
+                    *params = ParticleOverlayParams {
+                        mode: ParticleOverlayMode::Rain,
+                        density: 0.86,
+                        size_px: 2.0,
+                        length_px: 62.0,
+                        angle_degrees: 108.0,
+                        opacity: 0.62,
+                        color_rgb: [220, 238, 255],
+                        seed: params.seed,
+                        strength: 0.90,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "雪") {
+                    *params = ParticleOverlayParams {
+                        mode: ParticleOverlayMode::Snow,
+                        density: 0.46,
+                        size_px: 4.2,
+                        length_px: 0.0,
+                        angle_degrees: 92.0,
+                        opacity: 0.74,
+                        color_rgb: [255, 255, 255],
+                        seed: params.seed,
+                        strength: 0.74,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "花びら") {
+                    *params = ParticleOverlayParams {
+                        mode: ParticleOverlayMode::Petals,
+                        density: 0.34,
+                        size_px: 5.5,
+                        length_px: 0.0,
+                        angle_degrees: 112.0,
+                        opacity: 0.76,
+                        color_rgb: [255, 166, 206],
+                        seed: params.seed,
+                        strength: 0.78,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "雨、雪、花びらを手続き型の粒子として重ねます。seedで配置を変えられます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                changed |= ui
+                    .selectable_value(&mut params.mode, ParticleOverlayMode::Rain, "雨")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut params.mode, ParticleOverlayMode::Snow, "雪")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut params.mode, ParticleOverlayMode::Petals, "花びら")
+                    .changed();
+            });
+            let density = ui.add(egui::Slider::new(&mut params.density, 0.0..=1.0).text("密度"));
+            changed |= density.changed();
+            density.lab_hover_tip("粒子の間隔です。高いほど画面内の粒子が増えます。");
+            let size = ui.add(
+                egui::Slider::new(&mut params.size_px, 0.5..=24.0)
+                    .text("サイズ")
+                    .suffix("px"),
+            );
+            changed |= size.changed();
+            size.lab_hover_tip("雨筋の太さ、雪や花びらの大きさです。");
+            let length = ui.add(
+                egui::Slider::new(&mut params.length_px, 0.0..=160.0)
+                    .text("長さ")
+                    .suffix("px"),
+            );
+            changed |= length.changed();
+            length.lab_hover_tip("雨筋の長さです。雪や花びらでは配置セルの向きだけに影響します。");
+            let angle = ui.add(
+                egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                    .text("角度")
+                    .suffix("°"),
+            );
+            changed |= angle.changed();
+            angle.lab_hover_tip("粒子が落ちる方向です。90°で真下方向になります。");
+            let opacity =
+                ui.add(egui::Slider::new(&mut params.opacity, 0.0..=1.0).text("不透明度"));
+            changed |= opacity.changed();
+            opacity.lab_hover_tip("粒子自体の濃さです。");
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "色",
+                    &mut params.color_rgb,
+                    RgbPickTarget::ParticleOverlayColor,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let mut seed = params.seed as i32;
+            let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
+            changed |= seed_response.changed();
+            seed_response.lab_hover_tip("粒子の配置を変えます。");
+            params.seed = seed.max(0) as u32;
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から粒子オーバーレイ結果へどれだけ近づけるかです。");
+        }
         LocalEffect::Spotlight(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -17795,6 +17948,9 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         }
         EffectKind::CloudFog => LocalEffect::CloudFog(CloudFogParams::default()),
         EffectKind::WaterCaustics => LocalEffect::WaterCaustics(WaterCausticsParams::default()),
+        EffectKind::ParticleOverlay => {
+            LocalEffect::ParticleOverlay(ParticleOverlayParams::default())
+        }
         EffectKind::Spotlight => LocalEffect::Spotlight(SpotlightParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
         EffectKind::FilmGrain => LocalEffect::FilmGrain(FilmGrainParams::default()),
@@ -20144,6 +20300,7 @@ mod tests {
             EffectKind::AnamorphicFlare,
             EffectKind::CloudFog,
             EffectKind::WaterCaustics,
+            EffectKind::ParticleOverlay,
             EffectKind::Spotlight,
             EffectKind::Vignette,
             EffectKind::FilmGrain,
@@ -20448,6 +20605,17 @@ mod tests {
             panic!("expected cloud fog effect");
         };
         assert_eq!(cloud_fog_params.color_rgb, [90, 120, 180]);
+
+        let mut particle_overlay = LocalEffect::ParticleOverlay(ParticleOverlayParams::default());
+        assert!(set_rgb_pick_target(
+            &mut particle_overlay,
+            RgbPickTarget::ParticleOverlayColor,
+            [210, 190, 255],
+        ));
+        let LocalEffect::ParticleOverlay(particle_overlay_params) = particle_overlay else {
+            panic!("expected particle overlay effect");
+        };
+        assert_eq!(particle_overlay_params.color_rgb, [210, 190, 255]);
 
         let mut spotlight = LocalEffect::Spotlight(SpotlightParams::default());
         assert!(set_rgb_pick_target(

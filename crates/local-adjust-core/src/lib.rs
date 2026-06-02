@@ -604,6 +604,7 @@ pub enum LocalEffect {
     PixelSort(PixelSortParams),
     OldFilm(OldFilmParams),
     WaterCaustics(WaterCausticsParams),
+    ParticleOverlay(ParticleOverlayParams),
     Halftone(HalftoneParams),
     ScreenTone(ScreenToneParams),
     ColorHalftone(ColorHalftoneParams),
@@ -696,6 +697,7 @@ impl LocalEffect {
             Self::PixelSort(_) => "ピクセルソート",
             Self::OldFilm(_) => "オールドフィルム",
             Self::WaterCaustics(_) => "水中コースティクス",
+            Self::ParticleOverlay(_) => "雨/雪/花びら",
             Self::Halftone(_) => "ハーフトーン",
             Self::ScreenTone(_) => "スクリーントーン",
             Self::ColorHalftone(_) => "カラーハーフトーン",
@@ -3047,6 +3049,49 @@ impl Default for WaterCausticsParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParticleOverlayMode {
+    Rain,
+    Snow,
+    Petals,
+}
+
+impl Default for ParticleOverlayMode {
+    fn default() -> Self {
+        Self::Rain
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ParticleOverlayParams {
+    pub mode: ParticleOverlayMode,
+    pub density: f32,
+    pub size_px: f32,
+    pub length_px: f32,
+    pub angle_degrees: f32,
+    pub opacity: f32,
+    pub color_rgb: [u8; 3],
+    pub seed: u32,
+    pub strength: f32,
+}
+
+impl Default for ParticleOverlayParams {
+    fn default() -> Self {
+        Self {
+            mode: ParticleOverlayMode::Rain,
+            density: 0.45,
+            size_px: 1.4,
+            length_px: 34.0,
+            angle_degrees: 105.0,
+            opacity: 0.45,
+            color_rgb: [210, 230, 255],
+            seed: 1,
+            strength: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HalftoneParams {
     pub cell_px: u32,
@@ -3736,6 +3781,9 @@ where
             }
             LocalEffect::WaterCaustics(params) => {
                 apply_water_caustics(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::ParticleOverlay(params) => {
+                apply_particle_overlay(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::Halftone(params) => {
                 apply_halftone(&image.pixels, image.width, image.height, *params)
@@ -10509,6 +10557,232 @@ fn water_caustics_pattern(u: f32, v: f32, phase: f32, seed: u32) -> f32 {
     (line * (0.72 + intersection * 0.28)).clamp(0.0, 1.0)
 }
 
+#[derive(Clone, Copy)]
+struct ParticleOverlaySample {
+    alpha: f32,
+    rgb: [f32; 3],
+}
+
+fn apply_particle_overlay(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: ParticleOverlayParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let opacity = params.opacity.clamp(0.0, 1.0);
+    let density = params.density.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON
+        || opacity <= f32::EPSILON
+        || density <= f32::EPSILON
+        || width == 0
+        || height == 0
+    {
+        return src.to_vec();
+    }
+
+    let size = params.size_px.clamp(0.5, 48.0);
+    let length = params.length_px.clamp(0.0, 240.0);
+    let angle = params.angle_degrees.to_radians();
+    let base_rgb = [
+        params.color_rgb[0] as f32 / 255.0,
+        params.color_rgb[1] as f32 / 255.0,
+        params.color_rgb[2] as f32 / 255.0,
+    ];
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+            let sample = particle_overlay_sample_at(
+                x as f32,
+                y as f32,
+                params.mode,
+                density,
+                size,
+                length,
+                angle,
+                base_rgb,
+                params.seed,
+            );
+            let alpha = (sample.alpha * opacity * strength).clamp(0.0, 1.0);
+            if alpha <= f32::EPSILON {
+                continue;
+            }
+            for c in 0..3 {
+                let base = src[i + c] as f32 / 255.0;
+                out[i + c] = to_u8(lerp_f32(base, sample.rgb[c], alpha));
+            }
+        }
+    }
+    out
+}
+
+fn particle_overlay_sample_at(
+    x: f32,
+    y: f32,
+    mode: ParticleOverlayMode,
+    density: f32,
+    size: f32,
+    length: f32,
+    angle: f32,
+    base_rgb: [f32; 3],
+    seed: u32,
+) -> ParticleOverlaySample {
+    let (sin, cos) = angle.sin_cos();
+    let u = x * cos + y * sin;
+    let v = -x * sin + y * cos;
+    let spacing = match mode {
+        ParticleOverlayMode::Rain => lerp_f32(52.0, 10.0, density),
+        ParticleOverlayMode::Snow => lerp_f32(68.0, 13.0, density),
+        ParticleOverlayMode::Petals => lerp_f32(78.0, 15.0, density),
+    }
+    .max(2.0);
+    let long_cell = match mode {
+        ParticleOverlayMode::Rain => (length.max(size * 3.0) * 1.18).max(spacing),
+        ParticleOverlayMode::Snow | ParticleOverlayMode::Petals => spacing,
+    };
+    let cell_u = (u / long_cell).floor() as i32;
+    let cell_v = (v / spacing).floor() as i32;
+    let mut alpha = 0.0;
+    let mut rgb = base_rgb;
+
+    for du in -1..=1 {
+        for dv in -1..=1 {
+            let cu = cell_u + du;
+            let cv = cell_v + dv;
+            let jitter_u = cell_noise01(cu, cv, seed);
+            let jitter_v = cell_noise01(cu, cv, seed ^ 0xB529_7A4D);
+            let particle_u = (cu as f32 + 0.12 + jitter_u * 0.76) * long_cell;
+            let particle_v = (cv as f32 + 0.12 + jitter_v * 0.76) * spacing;
+            let candidate = match mode {
+                ParticleOverlayMode::Rain => particle_rain_sample(
+                    u,
+                    v,
+                    particle_u,
+                    particle_v,
+                    size,
+                    length.max(size * 2.0),
+                    base_rgb,
+                    cu,
+                    cv,
+                    seed,
+                ),
+                ParticleOverlayMode::Snow => {
+                    particle_snow_sample(u, v, particle_u, particle_v, size, base_rgb, cu, cv, seed)
+                }
+                ParticleOverlayMode::Petals => particle_petal_sample(
+                    u, v, particle_u, particle_v, size, base_rgb, cu, cv, seed,
+                ),
+            };
+            if candidate.alpha > alpha {
+                alpha = candidate.alpha;
+                rgb = candidate.rgb;
+            }
+        }
+    }
+
+    ParticleOverlaySample { alpha, rgb }
+}
+
+fn particle_rain_sample(
+    u: f32,
+    v: f32,
+    particle_u: f32,
+    particle_v: f32,
+    size: f32,
+    length: f32,
+    base_rgb: [f32; 3],
+    cell_u: i32,
+    cell_v: i32,
+    seed: u32,
+) -> ParticleOverlaySample {
+    let along = (u - particle_u).abs();
+    let across = (v - particle_v).abs();
+    let half_len =
+        (length * (0.72 + cell_noise01(cell_u, cell_v, seed ^ 0x68BC_21EB) * 0.55)).max(size);
+    let line = 1.0 - smoothstep(size * 0.18, size, across);
+    let tail = 1.0 - smoothstep(half_len * 0.72, half_len, along);
+    let alpha = (line * tail).clamp(0.0, 1.0);
+    ParticleOverlaySample {
+        alpha,
+        rgb: brighten_particle_rgb(base_rgb, 0.85, 0.20),
+    }
+}
+
+fn particle_snow_sample(
+    u: f32,
+    v: f32,
+    particle_u: f32,
+    particle_v: f32,
+    size: f32,
+    base_rgb: [f32; 3],
+    cell_u: i32,
+    cell_v: i32,
+    seed: u32,
+) -> ParticleOverlaySample {
+    let radius = (size * (0.55 + cell_noise01(cell_u, cell_v, seed ^ 0xD1B5_4A32) * 0.75)).max(0.5);
+    let dist = ((u - particle_u).powi(2) + (v - particle_v).powi(2)).sqrt();
+    let alpha = 1.0 - smoothstep(radius * 0.45, radius, dist);
+    ParticleOverlaySample {
+        alpha: alpha.clamp(0.0, 1.0),
+        rgb: brighten_particle_rgb(base_rgb, 0.95, 0.10),
+    }
+}
+
+fn particle_petal_sample(
+    u: f32,
+    v: f32,
+    particle_u: f32,
+    particle_v: f32,
+    size: f32,
+    base_rgb: [f32; 3],
+    cell_u: i32,
+    cell_v: i32,
+    seed: u32,
+) -> ParticleOverlaySample {
+    let dx = u - particle_u;
+    let dy = v - particle_v;
+    let rotation = cell_noise01(cell_u, cell_v, seed ^ 0xA3C5_9AC3) * std::f32::consts::TAU;
+    let (sin, cos) = rotation.sin_cos();
+    let rx = dx * cos + dy * sin;
+    let ry = -dx * sin + dy * cos;
+    let major = (size * (1.7 + cell_noise01(cell_u, cell_v, seed ^ 0x91E1_D0F5) * 0.9)).max(1.0);
+    let minor = (size * 0.62).max(0.5);
+    let shape = ((rx / major).powi(2) + (ry / minor).powi(2)).sqrt();
+    let alpha = 1.0 - smoothstep(0.58, 1.0, shape);
+    let warmth = cell_noise01(cell_u, cell_v, seed ^ 0xC2B2_AE35);
+    let rgb = [
+        (base_rgb[0] * (0.95 + warmth * 0.12)).clamp(0.0, 1.0),
+        (base_rgb[1] * (0.88 + warmth * 0.12)).clamp(0.0, 1.0),
+        (base_rgb[2] * (0.92 + warmth * 0.10)).clamp(0.0, 1.0),
+    ];
+    ParticleOverlaySample {
+        alpha: alpha.clamp(0.0, 1.0),
+        rgb,
+    }
+}
+
+fn brighten_particle_rgb(rgb: [f32; 3], keep: f32, white: f32) -> [f32; 3] {
+    [
+        lerp_f32(rgb[0], 1.0, white) * keep,
+        lerp_f32(rgb[1], 1.0, white) * keep,
+        lerp_f32(rgb[2], 1.0, white) * keep,
+    ]
+}
+
+fn cell_noise01(x: i32, y: i32, seed: u32) -> f32 {
+    let h = hash_u32(
+        seed ^ (x as u32).wrapping_mul(0x9E37_79B1)
+            ^ (y as u32).wrapping_mul(0x85EB_CA77)
+            ^ (x as u32).rotate_left(11)
+            ^ (y as u32).rotate_right(9),
+    );
+    h as f32 / u32::MAX as f32
+}
+
 fn apply_halftone(src: &[u8], width: usize, height: usize, params: HalftoneParams) -> Vec<u8> {
     let cell = params.cell_px.clamp(2, 96) as usize;
     let strength = params.strength.clamp(0.0, 1.0);
@@ -13572,6 +13846,7 @@ mod tests {
             LocalEffect::PixelSort(PixelSortParams::default()),
             LocalEffect::OldFilm(OldFilmParams::default()),
             LocalEffect::WaterCaustics(WaterCausticsParams::default()),
+            LocalEffect::ParticleOverlay(ParticleOverlayParams::default()),
             LocalEffect::Halftone(HalftoneParams::default()),
             LocalEffect::ScreenTone(ScreenToneParams::default()),
             LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
@@ -14300,6 +14575,20 @@ mod tests {
                     depth: 1.0,
                     phase: 0.75,
                     seed: 22,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "particle overlay dense petals",
+                LocalEffect::ParticleOverlay(ParticleOverlayParams {
+                    mode: ParticleOverlayMode::Petals,
+                    density: 1.0,
+                    size_px: 48.0,
+                    length_px: 240.0,
+                    angle_degrees: 180.0,
+                    opacity: 1.0,
+                    color_rgb: [255, 180, 220],
+                    seed: 23,
                     strength: 1.0,
                 }),
             ),
@@ -16546,6 +16835,81 @@ LUT_3D_SIZE 2
                 depth: 1.0,
                 phase: 0.4,
                 seed: 9,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn particle_overlay_rain_adds_streaks_and_preserves_alpha() {
+        let src = solid(24, 24, [24, 30, 36, 211]);
+        let layer = LocalAdjustmentLayer::new(
+            "particle overlay",
+            LocalMask::Full,
+            LocalEffect::ParticleOverlay(ParticleOverlayParams {
+                mode: ParticleOverlayMode::Rain,
+                density: 1.0,
+                size_px: 3.0,
+                length_px: 80.0,
+                angle_degrees: 90.0,
+                opacity: 1.0,
+                color_rgb: [220, 238, 255],
+                seed: 5,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels.chunks_exact(4).any(|px| px[0] > 24));
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 211));
+    }
+
+    #[test]
+    fn particle_overlay_modes_create_different_patterns() {
+        let src = solid(24, 24, [80, 70, 90, 255]);
+        let base = ParticleOverlayParams {
+            mode: ParticleOverlayMode::Snow,
+            density: 0.85,
+            size_px: 5.0,
+            length_px: 0.0,
+            angle_degrees: 100.0,
+            opacity: 1.0,
+            color_rgb: [255, 245, 255],
+            seed: 3,
+            strength: 1.0,
+        };
+        let snow =
+            LocalAdjustmentLayer::new("snow", LocalMask::Full, LocalEffect::ParticleOverlay(base));
+        let petals = LocalAdjustmentLayer::new(
+            "petals",
+            LocalMask::Full,
+            LocalEffect::ParticleOverlay(ParticleOverlayParams {
+                mode: ParticleOverlayMode::Petals,
+                color_rgb: [255, 160, 205],
+                ..base
+            }),
+        );
+        let out_snow = apply_layers(src.as_ref(), &[snow]).unwrap();
+        let out_petals = apply_layers(src.as_ref(), &[petals]).unwrap();
+        assert_ne!(out_snow.pixels, out_petals.pixels);
+    }
+
+    #[test]
+    fn particle_overlay_skips_transparent_pixels() {
+        let src = RgbaImageBuf::new(1, 1, vec![255, 0, 0, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "particle overlay",
+            LocalMask::Full,
+            LocalEffect::ParticleOverlay(ParticleOverlayParams {
+                mode: ParticleOverlayMode::Snow,
+                density: 1.0,
+                size_px: 48.0,
+                length_px: 240.0,
+                angle_degrees: 0.0,
+                opacity: 1.0,
+                color_rgb: [255, 255, 255],
+                seed: 1,
                 strength: 1.0,
             }),
         );
