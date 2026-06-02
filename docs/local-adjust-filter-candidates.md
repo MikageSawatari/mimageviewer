@@ -48,14 +48,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、56種)
+### `LocalEffect` (部分補正レイヤー、57種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, DiffuseGlow, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
+GradientMap, ColorOverlay, DiffuseGlow, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -139,7 +139,7 @@ LightLeak / 減色8機種 / CRT 3種＋複合 / カラーグレード11種
 
 ## 6. 描画・光源系 ★イラスト重要 (仕上げの主役)
 
-- [ ] **グラデーション オーバーレイ / 塗り (ブレンド指定)** ★★★ **易** — 夕焼けのオレンジを乗算/スクリーンで被せる等、空気感・統一感の最頻出仕上げ (PS / CSP)
+- [x] **グラデーション オーバーレイ / 塗り (ブレンド指定)** ★★★ **易** — `ColorOverlay`。単色 / 線形 / 円形グラデーションを、通常・乗算・スクリーン・オーバーレイ・ソフトライト・カラーで合成できるようにした (PS / CSP)
 - [ ] **ネオングロー (`NeonGlow`)** ★★★ **中** — 明るい/鮮やかな部分の光を周囲へにじませる。色付きネオン対応。**§B で詳細設計**
 - [ ] **光芒 / God rays (放射状ボリューム光)** ★★★ **中** — 木漏れ日・差し込む光。アニメ調背景の花形
 - [ ] **レンズフレア** ★★ **中** — 光源演出の定番 (PS Render)
@@ -425,7 +425,7 @@ pub struct RimLightParams {
 
 1. **グラデーションマップ** — 色設計・仕上げの即戦力、LUT で軽い (§1)
 2. **色相別 HSL / カラーミキサー** — 局所色補正、現 `Hsl` の正統進化 (§1)
-3. **グラデーション オーバーレイ (ブレンド指定)** — 空気感付与の最頻出、実装容易 (§6)
+3. **グラデーション オーバーレイ (ブレンド指定)** — `ColorOverlay` として実装済み。空気感付与の最頻出 (§6)
 4. **ネオングロー** — 色付き発光、`Bloom` の弱点 (threshold≥0.90) を埋める (§B)
 5. **チルトシフト + ジオラマ プリセット** — 奥行き表現・ミニチュア、AI 不要 (§A)
 6. **モーションブラー ＋ 玉ボケ (レンズぼかし)** — 動き・被写界深度 (§2)

@@ -17,23 +17,24 @@ use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     ArtisticMediaMode, ArtisticMediaParams, BloomParams, BlurParams, BrushStrokeMode,
     BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
-    ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
-    CubeLutParams, CutoutParams, DehazeParams, DiffuseGlowParams, DuotoneParams, DuotonePreset,
-    EdgeSmoothParams, EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
-    GlassDisplacementParams, GlowingEdgesParams, GradientMapParams, GradientMapPreset,
-    HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams, InvertParams,
-    LensBlurAperture, LensBlurParams, LensCorrectionParams, LineExtractMode, LineExtractParams,
-    LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
-    LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
-    MosaicTileMode, MotionBlurParams, OilPaintParams, PinchSpherizeParams, PixelStylizeMode,
-    PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
-    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
-    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
-    SharpenParams, SmartSharpenParams, SoftFocusParams, SolarizeParams, StarGlowParams,
-    TextureParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
-    ToneCurveParams, ToneParams, TwirlParams, VignetteParams, WaveDistortionMode,
-    WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams,
+    ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask, CubeLutParams,
+    CutoutParams, DehazeParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
+    EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
+    GlowingEdgesParams, GradientMapParams, GradientMapPreset, HalftoneParams, HighPassParams,
+    HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
+    LensCorrectionParams, LineExtractMode, LineExtractParams, LineKind, LinearGradientMask,
+    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
+    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
+    OilPaintParams, PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams,
+    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
+    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
+    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams,
+    SmartSharpenParams, SoftFocusParams, SolarizeParams, StarGlowParams, TextureParams,
+    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
+    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
+    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
+    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1006,6 +1007,7 @@ enum EffectKind {
     Duotone,
     Equalize,
     GradientMap,
+    ColorOverlay,
     DiffuseGlow,
     Bloom,
     Vignette,
@@ -1068,6 +1070,7 @@ impl EffectKind {
             LocalEffect::Duotone(_) => Self::Duotone,
             LocalEffect::Equalize(_) => Self::Equalize,
             LocalEffect::GradientMap(_) => Self::GradientMap,
+            LocalEffect::ColorOverlay(_) => Self::ColorOverlay,
             LocalEffect::DiffuseGlow(_) => Self::DiffuseGlow,
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::Vignette(_) => Self::Vignette,
@@ -1130,6 +1133,7 @@ impl EffectKind {
             Self::Duotone => "ダブルトーン",
             Self::Equalize => "ヒストグラム平坦化",
             Self::GradientMap => "グラデーションマップ",
+            Self::ColorOverlay => "塗り/グラデーション",
             Self::DiffuseGlow => "拡散光彩",
             Self::Bloom => "ブルーム",
             Self::Vignette => "ビネット",
@@ -1233,6 +1237,9 @@ impl EffectKind {
             }
             Self::GradientMap => {
                 "明るさを指定したグラデーションの色へ置き換え、色設計や色トレス風に使います。"
+            }
+            Self::ColorOverlay => {
+                "単色やグラデーションの色面を、乗算・スクリーン・ソフトライトなどで重ねます。"
             }
             Self::DiffuseGlow => {
                 "明るい部分を白く柔らかく拡散し、粒状感のある夢幻的な光彩を作ります。"
@@ -1369,6 +1376,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
     EffectGroup {
         title: "光・雰囲気",
         kinds: &[
+            EffectKind::ColorOverlay,
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
             EffectKind::StarGlow,
@@ -7387,6 +7395,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 gradient_map_preset_label(params.preset)
             )
         }
+        LocalEffect::ColorOverlay(params) => format!(
+            "塗り {} {:.0}%",
+            color_overlay_blend_mode_label(params.blend_mode),
+            params.opacity * 100.0
+        ),
         LocalEffect::DiffuseGlow(params) => format!("拡散光彩 {:.0}px", params.radius_px),
         LocalEffect::Bloom(params) => format!("ブルーム {:.0}px", params.radius_px),
         LocalEffect::Vignette(params) => format!("ビネット {:.0}%", params.strength * 100.0),
@@ -7486,6 +7499,40 @@ fn gradient_map_preset_label(preset: GradientMapPreset) -> &'static str {
         GradientMapPreset::Fire => "炎",
         GradientMapPreset::Ice => "氷",
     }
+}
+
+fn color_overlay_shape_label(shape: ColorOverlayShape) -> &'static str {
+    match shape {
+        ColorOverlayShape::Solid => "単色",
+        ColorOverlayShape::Linear => "線形グラデーション",
+        ColorOverlayShape::Radial => "円形グラデーション",
+    }
+}
+
+fn color_overlay_blend_mode_label(mode: ColorOverlayBlendMode) -> &'static str {
+    match mode {
+        ColorOverlayBlendMode::Normal => "通常",
+        ColorOverlayBlendMode::Multiply => "乗算",
+        ColorOverlayBlendMode::Screen => "スクリーン",
+        ColorOverlayBlendMode::Overlay => "オーバーレイ",
+        ColorOverlayBlendMode::SoftLight => "ソフトライト",
+        ColorOverlayBlendMode::Color => "カラー",
+    }
+}
+
+fn draw_rgb_color_control(ui: &mut egui::Ui, label: &str, rgb: &mut [u8; 3]) -> bool {
+    let before = *rgb;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).color(Color32::from_gray(190)));
+        let response = ui.color_edit_button_srgb(rgb);
+        response.lab_hover_tip(format!("{label}を選びます。"));
+        ui.label(
+            egui::RichText::new(format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]))
+                .monospace()
+                .color(Color32::from_gray(170)),
+        );
+    });
+    *rgb != before
 }
 
 fn duotone_preset_label(preset: DuotonePreset) -> &'static str {
@@ -11450,6 +11497,155 @@ fn draw_effect_params(
             contrast_response
                 .lab_hover_tip("色を割り当てる前に、明るさの差を締めたり広げたりします。");
         }
+        LocalEffect::ColorOverlay(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "夕焼け") {
+                    *params = ColorOverlayParams {
+                        shape: ColorOverlayShape::Linear,
+                        blend_mode: ColorOverlayBlendMode::SoftLight,
+                        start_rgb: [255, 132, 48],
+                        end_rgb: [78, 124, 255],
+                        angle_degrees: -24.0,
+                        softness: 0.65,
+                        opacity: 0.58,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "暖色塗り") {
+                    *params = ColorOverlayParams {
+                        shape: ColorOverlayShape::Solid,
+                        blend_mode: ColorOverlayBlendMode::SoftLight,
+                        start_rgb: [255, 170, 92],
+                        opacity: 0.36,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "影色乗算") {
+                    *params = ColorOverlayParams {
+                        shape: ColorOverlayShape::Linear,
+                        blend_mode: ColorOverlayBlendMode::Multiply,
+                        start_rgb: [76, 84, 148],
+                        end_rgb: [255, 180, 98],
+                        angle_degrees: 34.0,
+                        softness: 0.45,
+                        opacity: 0.32,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "光の中心") {
+                    *params = ColorOverlayParams {
+                        shape: ColorOverlayShape::Radial,
+                        blend_mode: ColorOverlayBlendMode::Screen,
+                        start_rgb: [255, 236, 186],
+                        end_rgb: [255, 114, 44],
+                        center: [0.50, 0.36],
+                        radius: 0.72,
+                        softness: 0.82,
+                        opacity: 0.44,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+            });
+            let before_shape = params.shape;
+            lab_combo_box(
+                ui,
+                "color_overlay_shape",
+                color_overlay_shape_label(params.shape),
+                |ui| {
+                    for shape in [
+                        ColorOverlayShape::Solid,
+                        ColorOverlayShape::Linear,
+                        ColorOverlayShape::Radial,
+                    ] {
+                        ui.selectable_value(
+                            &mut params.shape,
+                            shape,
+                            color_overlay_shape_label(shape),
+                        );
+                    }
+                },
+            );
+            changed |= params.shape != before_shape;
+            let before_blend = params.blend_mode;
+            lab_combo_box(
+                ui,
+                "color_overlay_blend_mode",
+                color_overlay_blend_mode_label(params.blend_mode),
+                |ui| {
+                    for mode in [
+                        ColorOverlayBlendMode::Normal,
+                        ColorOverlayBlendMode::Multiply,
+                        ColorOverlayBlendMode::Screen,
+                        ColorOverlayBlendMode::Overlay,
+                        ColorOverlayBlendMode::SoftLight,
+                        ColorOverlayBlendMode::Color,
+                    ] {
+                        ui.selectable_value(
+                            &mut params.blend_mode,
+                            mode,
+                            color_overlay_blend_mode_label(mode),
+                        );
+                    }
+                },
+            );
+            changed |= params.blend_mode != before_blend;
+            ui.label(
+                egui::RichText::new(
+                    "画像の明るさではなく画面上の位置を基準に、単色またはグラデーションの色面を合成します。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let color_label = if params.shape == ColorOverlayShape::Solid {
+                "塗り色"
+            } else {
+                "開始色"
+            };
+            changed |= draw_rgb_color_control(ui, color_label, &mut params.start_rgb);
+            if params.shape != ColorOverlayShape::Solid {
+                changed |= draw_rgb_color_control(ui, "終了色", &mut params.end_rgb);
+            }
+            let opacity =
+                ui.add(egui::Slider::new(&mut params.opacity, 0.0..=1.0).text("不透明度"));
+            changed |= opacity.changed();
+            opacity.lab_hover_tip("色面を合成した結果へどれだけ近づけるかです。");
+            if params.shape == ColorOverlayShape::Linear {
+                let angle = ui.add(
+                    egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                        .text("角度")
+                        .suffix("°"),
+                );
+                changed |= angle.changed();
+                angle.lab_hover_tip("線形グラデーションの方向です。0°で左から右へ色が変わります。");
+            }
+            if params.shape == ColorOverlayShape::Radial {
+                let center_x =
+                    ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
+                changed |= center_x.changed();
+                center_x.lab_hover_tip("円形グラデーション中心の横位置です。");
+                let center_y =
+                    ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心Y"));
+                changed |= center_y.changed();
+                center_y.lab_hover_tip("円形グラデーション中心の縦位置です。");
+                let radius = ui.add(egui::Slider::new(&mut params.radius, 0.02..=2.0).text("半径"));
+                changed |= radius.changed();
+                radius.lab_hover_tip(
+                    "中心色から終了色へ変わる範囲です。1.0で画像の正規化座標ほぼ全体を覆います。",
+                );
+            }
+            if params.shape != ColorOverlayShape::Solid {
+                let softness =
+                    ui.add(egui::Slider::new(&mut params.softness, 0.0..=1.0).text("なめらかさ"));
+                changed |= softness.changed();
+                softness
+                    .lab_hover_tip("グラデーションの変化を直線的にするか、なだらかにするかです。");
+            }
+        }
         LocalEffect::DiffuseGlow(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -13081,6 +13277,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Duotone => LocalEffect::Duotone(DuotoneParams::default()),
         EffectKind::Equalize => LocalEffect::Equalize(EqualizeParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
+        EffectKind::ColorOverlay => LocalEffect::ColorOverlay(ColorOverlayParams::default()),
         EffectKind::DiffuseGlow => LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
@@ -14949,6 +15146,7 @@ mod tests {
             EffectKind::Duotone,
             EffectKind::Equalize,
             EffectKind::GradientMap,
+            EffectKind::ColorOverlay,
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
             EffectKind::Vignette,

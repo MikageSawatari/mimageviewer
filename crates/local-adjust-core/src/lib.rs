@@ -459,6 +459,7 @@ pub enum LocalEffect {
     Duotone(DuotoneParams),
     Equalize(EqualizeParams),
     GradientMap(GradientMapParams),
+    ColorOverlay(ColorOverlayParams),
     DiffuseGlow(DiffuseGlowParams),
     Bloom(BloomParams),
     Vignette(VignetteParams),
@@ -521,6 +522,7 @@ impl LocalEffect {
             Self::Duotone(_) => "デュオトーン",
             Self::Equalize(_) => "ヒストグラム均等化",
             Self::GradientMap(_) => "グラデーションマップ",
+            Self::ColorOverlay(_) => "塗り/グラデーション",
             Self::DiffuseGlow(_) => "拡散光彩",
             Self::Bloom(_) => "ブルーム",
             Self::Vignette(_) => "ビネット",
@@ -1834,6 +1836,89 @@ impl Default for GradientMapParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorOverlayShape {
+    Solid,
+    #[default]
+    Linear,
+    Radial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorOverlayBlendMode {
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    #[default]
+    SoftLight,
+    Color,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ColorOverlayParams {
+    #[serde(default)]
+    pub shape: ColorOverlayShape,
+    #[serde(default)]
+    pub blend_mode: ColorOverlayBlendMode,
+    #[serde(default = "default_color_overlay_start_rgb")]
+    pub start_rgb: [u8; 3],
+    #[serde(default = "default_color_overlay_end_rgb")]
+    pub end_rgb: [u8; 3],
+    #[serde(default = "default_color_overlay_angle_degrees")]
+    pub angle_degrees: f32,
+    #[serde(default = "default_color_overlay_center")]
+    pub center: [f32; 2],
+    #[serde(default = "default_color_overlay_radius")]
+    pub radius: f32,
+    #[serde(default = "default_color_overlay_softness")]
+    pub softness: f32,
+    #[serde(default)]
+    pub opacity: f32,
+}
+
+impl Default for ColorOverlayParams {
+    fn default() -> Self {
+        Self {
+            shape: ColorOverlayShape::Linear,
+            blend_mode: ColorOverlayBlendMode::SoftLight,
+            start_rgb: default_color_overlay_start_rgb(),
+            end_rgb: default_color_overlay_end_rgb(),
+            angle_degrees: default_color_overlay_angle_degrees(),
+            center: default_color_overlay_center(),
+            radius: default_color_overlay_radius(),
+            softness: default_color_overlay_softness(),
+            opacity: 0.0,
+        }
+    }
+}
+
+fn default_color_overlay_start_rgb() -> [u8; 3] {
+    [255, 150, 64]
+}
+
+fn default_color_overlay_end_rgb() -> [u8; 3] {
+    [80, 135, 255]
+}
+
+fn default_color_overlay_angle_degrees() -> f32 {
+    -25.0
+}
+
+fn default_color_overlay_center() -> [f32; 2] {
+    [0.5, 0.5]
+}
+
+fn default_color_overlay_radius() -> f32 {
+    0.85
+}
+
+fn default_color_overlay_softness() -> f32 {
+    0.55
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DiffuseGlowParams {
     pub threshold: f32,
@@ -2285,6 +2370,9 @@ where
         LocalEffect::Duotone(params) => apply_duotone(&image.pixels, *params),
         LocalEffect::Equalize(params) => apply_equalize(&image.pixels, *params),
         LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
+        LocalEffect::ColorOverlay(params) => {
+            apply_color_overlay(&image.pixels, image.width, image.height, *params)
+        }
         LocalEffect::DiffuseGlow(params) => {
             apply_diffuse_glow(&image.pixels, image.width, image.height, *params)
         }
@@ -6121,6 +6209,144 @@ fn sample_gradient_stops(t: f32, stops: &[(f32, [f32; 3])]) -> [f32; 3] {
     stops.last().map(|&(_, rgb)| rgb).unwrap_or(first_rgb)
 }
 
+fn apply_color_overlay(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: ColorOverlayParams,
+) -> Vec<u8> {
+    let opacity = params.opacity.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || opacity <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let start = rgb_u8_to_f32(params.start_rgb);
+    let end = rgb_u8_to_f32(params.end_rgb);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        let ny = normalized_pixel_coord(y, height);
+        for x in 0..width {
+            let nx = normalized_pixel_coord(x, width);
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let t = color_overlay_gradient_t(nx, ny, params);
+            let overlay = [
+                lerp_f32(start[0], end[0], t),
+                lerp_f32(start[1], end[1], t),
+                lerp_f32(start[2], end[2], t),
+            ];
+            let blended = color_overlay_blend_rgb(base, overlay, params.blend_mode);
+            out[i] = to_u8(lerp_f32(base[0], blended[0], opacity));
+            out[i + 1] = to_u8(lerp_f32(base[1], blended[1], opacity));
+            out[i + 2] = to_u8(lerp_f32(base[2], blended[2], opacity));
+        }
+    }
+    out
+}
+
+fn normalized_pixel_coord(index: usize, size: usize) -> f32 {
+    if size <= 1 {
+        0.5
+    } else {
+        index as f32 / (size - 1) as f32
+    }
+}
+
+fn rgb_u8_to_f32(rgb: [u8; 3]) -> [f32; 3] {
+    [
+        rgb[0] as f32 / 255.0,
+        rgb[1] as f32 / 255.0,
+        rgb[2] as f32 / 255.0,
+    ]
+}
+
+fn color_overlay_gradient_t(nx: f32, ny: f32, params: ColorOverlayParams) -> f32 {
+    let raw = match params.shape {
+        ColorOverlayShape::Solid => 0.0,
+        ColorOverlayShape::Linear => {
+            let angle = params.angle_degrees.to_radians();
+            let dx = angle.cos();
+            let dy = angle.sin();
+            let span = 0.5 * (dx.abs() + dy.abs()).max(f32::EPSILON);
+            let projected = (nx - 0.5) * dx + (ny - 0.5) * dy;
+            (projected / (span * 2.0) + 0.5).clamp(0.0, 1.0)
+        }
+        ColorOverlayShape::Radial => {
+            let cx = params.center[0].clamp(0.0, 1.0);
+            let cy = params.center[1].clamp(0.0, 1.0);
+            let radius = params.radius.clamp(0.02, 2.0);
+            let dx = nx - cx;
+            let dy = ny - cy;
+            (dx.hypot(dy) / radius).clamp(0.0, 1.0)
+        }
+    };
+    let smooth = smoothstep(0.0, 1.0, raw);
+    lerp_f32(raw, smooth, params.softness.clamp(0.0, 1.0))
+}
+
+fn color_overlay_blend_rgb(
+    base: [f32; 3],
+    overlay: [f32; 3],
+    mode: ColorOverlayBlendMode,
+) -> [f32; 3] {
+    match mode {
+        ColorOverlayBlendMode::Normal => overlay,
+        ColorOverlayBlendMode::Multiply => [
+            base[0] * overlay[0],
+            base[1] * overlay[1],
+            base[2] * overlay[2],
+        ],
+        ColorOverlayBlendMode::Screen => [
+            screen_channel(base[0], overlay[0]),
+            screen_channel(base[1], overlay[1]),
+            screen_channel(base[2], overlay[2]),
+        ],
+        ColorOverlayBlendMode::Overlay => [
+            overlay_blend_channel(base[0], overlay[0]),
+            overlay_blend_channel(base[1], overlay[1]),
+            overlay_blend_channel(base[2], overlay[2]),
+        ],
+        ColorOverlayBlendMode::SoftLight => [
+            soft_light_channel(base[0], overlay[0]),
+            soft_light_channel(base[1], overlay[1]),
+            soft_light_channel(base[2], overlay[2]),
+        ],
+        ColorOverlayBlendMode::Color => {
+            let (h, s, _) = rgb_to_hsl(overlay[0], overlay[1], overlay[2]);
+            let (_, _, l) = rgb_to_hsl(base[0], base[1], base[2]);
+            hsl_to_rgb(h, s, l)
+        }
+    }
+}
+
+fn screen_channel(base: f32, overlay: f32) -> f32 {
+    (1.0 - (1.0 - base) * (1.0 - overlay)).clamp(0.0, 1.0)
+}
+
+fn overlay_blend_channel(base: f32, overlay: f32) -> f32 {
+    if base < 0.5 {
+        2.0 * base * overlay
+    } else {
+        1.0 - 2.0 * (1.0 - base) * (1.0 - overlay)
+    }
+    .clamp(0.0, 1.0)
+}
+
+fn soft_light_channel(base: f32, overlay: f32) -> f32 {
+    if overlay < 0.5 {
+        base - (1.0 - 2.0 * overlay) * base * (1.0 - base)
+    } else {
+        base + (2.0 * overlay - 1.0) * (base.sqrt() - base)
+    }
+    .clamp(0.0, 1.0)
+}
+
 fn look_rgb(rgb: [f32; 3], preset: LookPreset) -> [f32; 3] {
     let [mut r, mut g, mut b] = rgb;
     let luma = luma01(r, g, b);
@@ -8444,6 +8670,7 @@ mod tests {
             LocalEffect::Duotone(DuotoneParams::default()),
             LocalEffect::Equalize(EqualizeParams::default()),
             LocalEffect::GradientMap(GradientMapParams::default()),
+            LocalEffect::ColorOverlay(ColorOverlayParams::default()),
             LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
@@ -8482,6 +8709,73 @@ mod tests {
         assert!(out.pixels[0] < out.pixels[8]);
         assert!(out.pixels[9] > out.pixels[1]);
         assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn color_overlay_multiply_darkens_without_changing_alpha() {
+        let src = RgbaImageBuf::new(1, 1, vec![200, 160, 120, 77]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "overlay",
+            LocalMask::Full,
+            LocalEffect::ColorOverlay(ColorOverlayParams {
+                shape: ColorOverlayShape::Solid,
+                blend_mode: ColorOverlayBlendMode::Multiply,
+                start_rgb: [128, 128, 255],
+                opacity: 1.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] < src.pixels[0]);
+        assert!(out.pixels[1] < src.pixels[1]);
+        assert_eq!(out.pixels[2], src.pixels[2]);
+        assert_eq!(out.pixels[3], src.pixels[3]);
+    }
+
+    #[test]
+    fn color_overlay_linear_gradient_varies_by_position() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![128, 128, 128, 255, 128, 128, 128, 255, 128, 128, 128, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "gradient overlay",
+            LocalMask::Full,
+            LocalEffect::ColorOverlay(ColorOverlayParams {
+                shape: ColorOverlayShape::Linear,
+                blend_mode: ColorOverlayBlendMode::Normal,
+                start_rgb: [255, 0, 0],
+                end_rgb: [0, 0, 255],
+                angle_degrees: 0.0,
+                opacity: 1.0,
+                softness: 0.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > out.pixels[8]);
+        assert!(out.pixels[10] > out.pixels[2]);
+        assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn color_overlay_keeps_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(1, 1, vec![11, 22, 33, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "overlay",
+            LocalMask::Full,
+            LocalEffect::ColorOverlay(ColorOverlayParams {
+                shape: ColorOverlayShape::Solid,
+                blend_mode: ColorOverlayBlendMode::Normal,
+                start_rgb: [255, 0, 0],
+                opacity: 1.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
     }
 
     #[test]
