@@ -18,25 +18,26 @@ use local_adjust_core::{
     ArtisticMediaMode, ArtisticMediaParams, BloomParams, BlurParams, BrushStrokeMode,
     BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams, CloudFogMode,
     CloudFogParams, ColorBalanceParams, ColorBalanceRange, ColorFillParams, ColorGradeWheel,
-    ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask,
-    CubeLutParams, CutoutParams, DehazeParams, DiffuseGlowParams, DuotoneParams, DuotonePreset,
-    EdgeSmoothParams, EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
-    GlassDisplacementParams, GlowingEdgesParams, GodRaysParams, GradientMapParams,
-    GradientMapPreset, HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams,
-    InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LensFlareParams,
-    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer,
-    LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams,
-    MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams, OilPaintParams,
-    PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
-    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
-    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
-    RgbaImageRef, ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams,
-    SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams,
-    SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
-    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
-    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
-    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
-    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    ColorHalftoneParams, ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams,
+    ColorOverlayShape, ColorRangeMask, CubeLutParams, CutoutParams, DehazeParams,
+    DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams,
+    EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
+    GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalftoneParams,
+    HighPassParams, HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture,
+    LensBlurParams, LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams,
+    LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
+    LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
+    MosaicTileMode, MotionBlurParams, NeonGlowParams, OilPaintParams, PinchSpherizeParams,
+    PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
+    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
+    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, ScreenToneMode,
+    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
+    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, ThreeWayColorGradingParams,
+    ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams,
+    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
+    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1028,6 +1029,7 @@ enum EffectKind {
     ChromaticAberration,
     Halftone,
     ScreenTone,
+    ColorHalftone,
     StarGlow,
     EdgeSmooth,
     Median,
@@ -1130,6 +1132,7 @@ impl EffectKind {
             LocalEffect::ChromaticAberration(_) => Self::ChromaticAberration,
             LocalEffect::Halftone(_) => Self::Halftone,
             LocalEffect::ScreenTone(_) => Self::ScreenTone,
+            LocalEffect::ColorHalftone(_) => Self::ColorHalftone,
             LocalEffect::StarGlow(_) => Self::StarGlow,
             LocalEffect::EdgeSmooth(_) => Self::EdgeSmooth,
             LocalEffect::Median(_) => Self::Median,
@@ -1201,6 +1204,7 @@ impl EffectKind {
             Self::ChromaticAberration => "色収差",
             Self::Halftone => "ハーフトーン",
             Self::ScreenTone => "スクリーントーン",
+            Self::ColorHalftone => "カラーハーフトーン",
             Self::StarGlow => "クロス光",
             Self::EdgeSmooth => "エッジ保持ぼかし",
             Self::Median => "メディアン",
@@ -1326,6 +1330,9 @@ impl EffectKind {
             Self::ScreenTone => {
                 "網点、平行線、カケアミを重ね、濃度と元画像の明暗追従で漫画用のトーンを作ります。"
             }
+            Self::ColorHalftone => {
+                "CMYK 4版の角度違いドットで、ポップアートやアメコミ風の印刷網点を作ります。"
+            }
             Self::StarGlow => "明るい部分から十字や多方向の光線を描写します。",
             Self::EdgeSmooth => "輪郭をなるべく残しながら面をなめらかにします。",
             Self::Median => "孤立した点ノイズや細かいゴミを、周囲の中央値で目立ちにくくします。",
@@ -1446,6 +1453,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::OilPaint,
             EffectKind::Halftone,
             EffectKind::ScreenTone,
+            EffectKind::ColorHalftone,
         ],
     },
     EffectGroup {
@@ -8085,6 +8093,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
             screen_tone_mode_label(params.mode),
             params.cell_px
         ),
+        LocalEffect::ColorHalftone(params) => {
+            format!("カラーハーフトーン {:.0}px", params.cell_px)
+        }
         LocalEffect::StarGlow(params) => {
             format!("クロス光 {}本 {:.0}px", params.ray_count, params.length_px)
         }
@@ -13698,6 +13709,72 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
                 .changed();
         }
+        LocalEffect::ColorHalftone(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "ポップ") {
+                    *params = ColorHalftoneParams {
+                        cell_px: 8.0,
+                        angle_offset_degrees: 0.0,
+                        dot_gain: 0.10,
+                        black_generation: 0.55,
+                        softness: 0.03,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "粗い印刷") {
+                    *params = ColorHalftoneParams {
+                        cell_px: 16.0,
+                        angle_offset_degrees: 0.0,
+                        dot_gain: 0.06,
+                        black_generation: 0.80,
+                        softness: 0.0,
+                        strength: 0.80,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡いCMYK") {
+                    *params = ColorHalftoneParams {
+                        cell_px: 11.0,
+                        angle_offset_degrees: 0.0,
+                        dot_gain: -0.08,
+                        black_generation: 0.45,
+                        softness: 0.10,
+                        strength: 0.60,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "CMYKの4版を角度違いのドットにします。ドット増減を上げるとインクが太り、印刷物らしい粗さが出ます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            changed |= ui
+                .add(egui::Slider::new(&mut params.cell_px, 3.0..=160.0).text("セル(px)"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.angle_offset_degrees, -180.0..=180.0)
+                        .text("角度オフセット"),
+                )
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.dot_gain, -0.5..=0.5).text("ドット増減"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.black_generation, 0.0..=1.0).text("黒版量"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.softness, 0.0..=1.0).text("柔らかさ"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
+                .changed();
+        }
         LocalEffect::StarGlow(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -15221,6 +15298,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         }
         EffectKind::Halftone => LocalEffect::Halftone(HalftoneParams::default()),
         EffectKind::ScreenTone => LocalEffect::ScreenTone(ScreenToneParams::default()),
+        EffectKind::ColorHalftone => LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
         EffectKind::StarGlow => LocalEffect::StarGlow(StarGlowParams::default()),
         EffectKind::EdgeSmooth => LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
         EffectKind::Median => LocalEffect::Median(MedianParams::default()),
@@ -17457,6 +17535,7 @@ mod tests {
             EffectKind::ChromaticAberration,
             EffectKind::Halftone,
             EffectKind::ScreenTone,
+            EffectKind::ColorHalftone,
             EffectKind::ColorOverlay,
             EffectKind::StarGlow,
             EffectKind::EdgeSmooth,

@@ -121,6 +121,7 @@ the window.
   - Chromatic aberration
   - Halftone
   - Screen tone
+  - Color halftone
   - Cross/star glow
   - Edge-preserving smooth
   - Median

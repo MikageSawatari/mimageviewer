@@ -48,14 +48,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、63種)
+### `LocalEffect` (部分補正レイヤー、64種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorFill, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, GodRays, LensFlare, CloudFog, Spotlight, Vignette, FilmGrain, ChromaticAberration, Halftone, ScreenTone, StarGlow, EdgeSmooth, Median
+GradientMap, ColorFill, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, GodRays, LensFlare, CloudFog, Spotlight, Vignette, FilmGrain, ChromaticAberration, Halftone, ScreenTone, ColorHalftone, StarGlow, EdgeSmooth, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -152,7 +152,7 @@ LightLeak / 減色8機種 / CRT 3種＋複合 / カラーグレード11種
 ## 7. ノイズ・テクスチャ系
 
 - [x] **網点 / スクリーントーン (線・濃度・グラデ)** ★★ **中** — `ScreenTone`。網点 / 線 / カケアミ、セル、角度、濃度、元画像の明暗への階調追従、柔らかさ、強度を調整できる漫画用トーン (CSP トーン)
-- [ ] **カラーハーフトーン (CMYK 4版ドット)** ★ **中** — ポップアート/アメコミ調。現 `Halftone` はグレーのみ (PS Pixelate)
+- [x] **カラーハーフトーン (CMYK 4版ドット)** ★ **中** — `ColorHalftone`。CMYK 4版の角度違いドット、セル、角度オフセット、ドット増減、黒版量、柔らかさ、強度を調整できるポップアート/アメコミ調フィルタ (PS Pixelate)
 - [ ] **テクスチャライザ (紙/キャンバス重ね)** ★ **易〜中** — 紙質・手描き感 (PS Texture)
 - [ ] **ノイズ付加 (Gaussian/Uniform, mono 指定)** **易** — 汎用ノイズ。FilmGrain と別系統 (PS / Krita)
 - [ ] **ゴミ・キズ取り / ディスペックル** ★ **中** — スキャン点ノイズの非 AI 高速除去 (スポット用) (PS / CSP / Krita)

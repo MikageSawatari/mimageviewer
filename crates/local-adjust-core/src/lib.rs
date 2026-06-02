@@ -571,6 +571,7 @@ pub enum LocalEffect {
     ChromaticAberration(ChromaticAberrationParams),
     Halftone(HalftoneParams),
     ScreenTone(ScreenToneParams),
+    ColorHalftone(ColorHalftoneParams),
     StarGlow(StarGlowParams),
     EdgeSmooth(EdgeSmoothParams),
     Median(MedianParams),
@@ -642,6 +643,7 @@ impl LocalEffect {
             Self::ChromaticAberration(_) => "色収差",
             Self::Halftone(_) => "ハーフトーン",
             Self::ScreenTone(_) => "スクリーントーン",
+            Self::ColorHalftone(_) => "カラーハーフトーン",
             Self::StarGlow(_) => "クロス光",
             Self::EdgeSmooth(_) => "エッジ保持ぼかし",
             Self::Median(_) => "メディアンフィルタ",
@@ -2547,6 +2549,29 @@ impl Default for ScreenToneParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ColorHalftoneParams {
+    pub cell_px: f32,
+    pub angle_offset_degrees: f32,
+    pub dot_gain: f32,
+    pub black_generation: f32,
+    pub softness: f32,
+    pub strength: f32,
+}
+
+impl Default for ColorHalftoneParams {
+    fn default() -> Self {
+        Self {
+            cell_px: 10.0,
+            angle_offset_degrees: 0.0,
+            dot_gain: 0.0,
+            black_generation: 0.70,
+            softness: 0.04,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StarGlowParams {
     pub ray_count: u32,
     pub rotation_degrees: f32,
@@ -2943,6 +2968,9 @@ where
         }
         LocalEffect::ScreenTone(params) => {
             apply_screen_tone(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::ColorHalftone(params) => {
+            apply_color_halftone(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::StarGlow(params) => {
             apply_star_glow(&image.pixels, image.width, image.height, *params)
@@ -8028,6 +8056,102 @@ fn centered_periodic_distance(coord: f32, cell: f32) -> f32 {
     (phase - 0.5).abs() * 2.0
 }
 
+fn apply_color_halftone(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: ColorHalftoneParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let cell = params.cell_px.clamp(3.0, 160.0);
+    let dot_gain = params.dot_gain.clamp(-0.5, 0.5);
+    let black_generation = params.black_generation.clamp(0.0, 1.0);
+    let edge = 0.01 + params.softness.clamp(0.0, 1.0) * 0.35;
+    let offset = params.angle_offset_degrees;
+    let plate_angles = [
+        offset + 15.0, // Cyan
+        offset + 75.0, // Magenta
+        offset + 0.0,  // Yellow
+        offset + 45.0, // Black
+    ];
+    let mut out = src.to_vec();
+    let cx = width as f32 * 0.5;
+    let cy = height as f32 * 0.5;
+
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let r = src[i] as f32 / 255.0;
+            let g = src[i + 1] as f32 / 255.0;
+            let b = src[i + 2] as f32 / 255.0;
+            let (cyan, magenta, yellow, black) =
+                rgb_to_cmyk_ink(r, g, b, black_generation, dot_gain);
+            let fx = x as f32 + 0.5 - cx;
+            let fy = y as f32 + 0.5 - cy;
+            let c_mask = color_halftone_plate_mask(fx, fy, cell, cyan, edge, plate_angles[0]);
+            let m_mask = color_halftone_plate_mask(fx, fy, cell, magenta, edge, plate_angles[1]);
+            let y_mask = color_halftone_plate_mask(fx, fy, cell, yellow, edge, plate_angles[2]);
+            let k_mask = color_halftone_plate_mask(fx, fy, cell, black, edge, plate_angles[3]);
+            let target = [
+                (1.0 - c_mask) * (1.0 - k_mask),
+                (1.0 - m_mask) * (1.0 - k_mask),
+                (1.0 - y_mask) * (1.0 - k_mask),
+            ];
+            for c in 0..3 {
+                let base = src[i + c] as f32 / 255.0;
+                out[i + c] = to_u8(lerp_f32(base, target[c], strength));
+            }
+        }
+    }
+
+    out
+}
+
+fn rgb_to_cmyk_ink(
+    r: f32,
+    g: f32,
+    b: f32,
+    black_generation: f32,
+    dot_gain: f32,
+) -> (f32, f32, f32, f32) {
+    let raw_cyan = 1.0 - r.clamp(0.0, 1.0);
+    let raw_magenta = 1.0 - g.clamp(0.0, 1.0);
+    let raw_yellow = 1.0 - b.clamp(0.0, 1.0);
+    let shared = raw_cyan.min(raw_magenta).min(raw_yellow);
+    let black = shared * black_generation;
+    (
+        (raw_cyan - black + dot_gain).clamp(0.0, 1.0),
+        (raw_magenta - black + dot_gain).clamp(0.0, 1.0),
+        (raw_yellow - black + dot_gain).clamp(0.0, 1.0),
+        (black + dot_gain).clamp(0.0, 1.0),
+    )
+}
+
+fn color_halftone_plate_mask(
+    fx: f32,
+    fy: f32,
+    cell: f32,
+    ink: f32,
+    edge: f32,
+    angle_degrees: f32,
+) -> f32 {
+    if ink <= 0.001 {
+        return 0.0;
+    }
+    let angle = angle_degrees.to_radians();
+    let u = fx * angle.cos() + fy * angle.sin();
+    let v = -fx * angle.sin() + fy * angle.cos();
+    let du = centered_periodic_distance(u, cell);
+    let dv = centered_periodic_distance(v, cell);
+    let dist = (du * du + dv * dv).sqrt();
+    let radius = ink.sqrt() * 0.98;
+    1.0 - smoothstep(radius, radius + edge, dist)
+}
+
 fn apply_star_glow(src: &[u8], width: usize, height: usize, params: StarGlowParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 3.0);
     let length = params.length_px.clamp(1.0, 240.0);
@@ -10009,6 +10133,7 @@ mod tests {
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
             LocalEffect::Halftone(HalftoneParams::default()),
             LocalEffect::ScreenTone(ScreenToneParams::default()),
+            LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
             LocalEffect::StarGlow(StarGlowParams::default()),
             LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
             LocalEffect::Median(MedianParams::default()),
@@ -11428,6 +11553,31 @@ LUT_3D_SIZE 2
         let row0 = out.pixels[0];
         let row2 = out.pixels[(2 * 8) * 4];
         assert_ne!(row0, row2);
+    }
+
+    #[test]
+    fn color_halftone_creates_colored_plates_and_preserves_alpha() {
+        let src = solid(8, 8, [80, 160, 220, 211]);
+        let layer = LocalAdjustmentLayer::new(
+            "color halftone",
+            LocalMask::Full,
+            LocalEffect::ColorHalftone(ColorHalftoneParams {
+                cell_px: 4.0,
+                angle_offset_degrees: 0.0,
+                dot_gain: 0.08,
+                black_generation: 0.55,
+                softness: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_ne!(out.pixels, src.pixels);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 211));
+        assert!(
+            out.pixels
+                .chunks_exact(4)
+                .any(|px| px[0] != px[1] || px[1] != px[2])
+        );
     }
 
     #[test]
