@@ -23,18 +23,19 @@ use local_adjust_core::{
     EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
     GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalftoneParams,
     HighPassParams, HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture,
-    LensBlurParams, LensCorrectionParams, LineExtractMode, LineExtractParams, LineKind,
-    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
-    ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
-    MotionBlurParams, NeonGlowParams, OilPaintParams, PinchSpherizeParams, PixelStylizeMode,
-    PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
-    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
-    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
-    SharpenParams, SmartSharpenParams, SoftFocusParams, SolarizeParams, StarGlowParams,
-    SubjectMask, SubjectMaskRefinement, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams,
-    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    LensBlurParams, LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams,
+    LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
+    LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
+    MosaicTileMode, MotionBlurParams, NeonGlowParams, OilPaintParams, PinchSpherizeParams,
+    PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
+    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
+    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
+    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
+    SolarizeParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
+    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
+    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
+    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
+    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1017,6 +1018,7 @@ enum EffectKind {
     DiffuseGlow,
     Bloom,
     GodRays,
+    LensFlare,
     Vignette,
     FilmGrain,
     ChromaticAberration,
@@ -1108,6 +1110,7 @@ impl EffectKind {
             LocalEffect::DiffuseGlow(_) => Self::DiffuseGlow,
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::GodRays(_) => Self::GodRays,
+            LocalEffect::LensFlare(_) => Self::LensFlare,
             LocalEffect::Vignette(_) => Self::Vignette,
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
             LocalEffect::ChromaticAberration(_) => Self::ChromaticAberration,
@@ -1174,6 +1177,7 @@ impl EffectKind {
             Self::DiffuseGlow => "拡散光彩",
             Self::Bloom => "ブルーム",
             Self::GodRays => "光芒",
+            Self::LensFlare => "レンズフレア",
             Self::Vignette => "ビネット",
             Self::FilmGrain => "フィルム粒子",
             Self::ChromaticAberration => "色収差",
@@ -1290,6 +1294,7 @@ impl EffectKind {
             }
             Self::Bloom => "明るい部分を周囲へにじませ、発光感を足します。",
             Self::GodRays => "明るい部分から光源方向に沿った放射状の光芒を作ります。",
+            Self::LensFlare => "光源のにじみ、ハロー、レンズ内反射のゴーストを重ねます。",
             Self::Vignette => "周辺を暗く、または明るくして視線を中央へ誘導します。",
             Self::FilmGrain => "粒状感を加え、フィルムや紙っぽい質感を作ります。",
             Self::ChromaticAberration => "RGBを少しずらし、レンズやデジタル風の色ズレを作ります。",
@@ -1426,6 +1431,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
             EffectKind::GodRays,
+            EffectKind::LensFlare,
             EffectKind::StarGlow,
             EffectKind::Vignette,
             EffectKind::FilmGrain,
@@ -7912,6 +7918,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::DiffuseGlow(params) => format!("拡散光彩 {:.0}px", params.radius_px),
         LocalEffect::Bloom(params) => format!("ブルーム {:.0}px", params.radius_px),
         LocalEffect::GodRays(params) => format!("光芒 {:.0}px", params.length_px),
+        LocalEffect::LensFlare(params) => {
+            format!("レンズフレア {:.0}%", params.strength * 100.0)
+        }
         LocalEffect::Vignette(params) => format!("ビネット {:.0}%", params.strength * 100.0),
         LocalEffect::FilmGrain(params) => format!("粒子 {:.0}%", params.amount * 100.0),
         LocalEffect::ChromaticAberration(params) => {
@@ -12833,6 +12842,86 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.warm_tint, 0.0..=1.0).text("暖色"))
                 .changed();
         }
+        LocalEffect::LensFlare(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "逆光") {
+                    *params = LensFlareParams {
+                        center: [0.78, 0.20],
+                        radius_px: 120.0,
+                        strength: 0.90,
+                        core_strength: 1.0,
+                        halo_strength: 0.85,
+                        ghost_strength: 0.75,
+                        streak_strength: 0.35,
+                        warm_tint: 0.45,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "シネマ") {
+                    *params = LensFlareParams {
+                        center: [0.12, 0.36],
+                        radius_px: 150.0,
+                        strength: 0.80,
+                        core_strength: 0.75,
+                        halo_strength: 0.45,
+                        ghost_strength: 0.65,
+                        streak_strength: 1.10,
+                        warm_tint: 0.08,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "柔らかい") {
+                    *params = LensFlareParams {
+                        center: [0.66, 0.18],
+                        radius_px: 170.0,
+                        strength: 0.55,
+                        core_strength: 0.55,
+                        halo_strength: 1.15,
+                        ghost_strength: 0.35,
+                        streak_strength: 0.10,
+                        warm_tint: 0.30,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "指定した光源から、にじみ、薄いリング、レンズ内反射のゴーストを作ります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let center_x =
+                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
+            changed |= center_x.changed();
+            center_x.lab_hover_tip("フレア光源の横位置です。");
+            let center_y =
+                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心Y"));
+            changed |= center_y.changed();
+            center_y.lab_hover_tip("フレア光源の縦位置です。");
+            changed |= ui
+                .add(egui::Slider::new(&mut params.radius_px, 4.0..=420.0).text("範囲"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=3.0).text("強さ"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.core_strength, 0.0..=2.0).text("コア"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.halo_strength, 0.0..=2.0).text("ハロー"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.ghost_strength, 0.0..=2.0).text("ゴースト"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.streak_strength, 0.0..=2.0).text("光条"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.warm_tint, 0.0..=1.0).text("暖色"))
+                .changed();
+        }
         LocalEffect::Vignette(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -14458,6 +14547,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::DiffuseGlow => LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::GodRays => LocalEffect::GodRays(GodRaysParams::default()),
+        EffectKind::LensFlare => LocalEffect::LensFlare(LensFlareParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
         EffectKind::FilmGrain => LocalEffect::FilmGrain(FilmGrainParams::default()),
         EffectKind::ChromaticAberration => {
@@ -16691,6 +16781,7 @@ mod tests {
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
             EffectKind::GodRays,
+            EffectKind::LensFlare,
             EffectKind::Vignette,
             EffectKind::FilmGrain,
             EffectKind::ChromaticAberration,

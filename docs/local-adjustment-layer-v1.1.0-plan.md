@@ -893,7 +893,7 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   に残す
 - 効果: Tone (自然な彩度・tint を含む) / Tone Curve / RGB Curve / Color Balance /
   3-way Color Grading / Selective Color / Channel Mixer / Color Mixer / Clarity / Highlights-Shadows /
-  Texture / HighPass / Blur / Motion Blur / Wind / Tilt Shift / Lens Blur / Radial Blur / WaveDistortion / PinchSpherize / Twirl / PolarCoordinates / GlassDisplacement / LensCorrection / LineExtract / ArtisticMedia / BrushStroke / Cutout / Emboss / PixelStylize / Solarize / GlowingEdges / OilPaint / Soft Focus / Mosaic / Sharpen(radius/threshold) / SmartSharpen(edge-aware) / HSL / Dehaze / Look / 3D LUT / Posterize / Threshold / Invert / Duotone / Equalize / Gradient Map / ColorFill / ColorOverlay / NeonGlow / DiffuseGlow / Bloom / GodRays /
+  Texture / HighPass / Blur / Motion Blur / Wind / Tilt Shift / Lens Blur / Radial Blur / WaveDistortion / PinchSpherize / Twirl / PolarCoordinates / GlassDisplacement / LensCorrection / LineExtract / ArtisticMedia / BrushStroke / Cutout / Emboss / PixelStylize / Solarize / GlowingEdges / OilPaint / Soft Focus / Mosaic / Sharpen(radius/threshold) / SmartSharpen(edge-aware) / HSL / Dehaze / Look / 3D LUT / Posterize / Threshold / Invert / Duotone / Equalize / Gradient Map / ColorFill / ColorOverlay / NeonGlow / DiffuseGlow / Bloom / GodRays / LensFlare /
   Vignette / Film Grain / Chromatic Aberration / Halftone / Cross-Star Glow /
   Edge-preserving Smooth / Median
 - 3D LUT は `.cube` の `LUT_3D_SIZE` / `DOMAIN_MIN` / `DOMAIN_MAX` / `LUT_3D_INPUT_RANGE` を読み取り、RGB 3D table

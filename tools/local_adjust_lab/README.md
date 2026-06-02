@@ -112,6 +112,7 @@ the window.
   - Look presets
   - Bloom
   - God rays
+  - Lens flare
   - Vignette
   - Film grain
   - Chromatic aberration

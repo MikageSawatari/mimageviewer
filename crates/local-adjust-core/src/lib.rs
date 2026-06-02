@@ -562,6 +562,7 @@ pub enum LocalEffect {
     DiffuseGlow(DiffuseGlowParams),
     Bloom(BloomParams),
     GodRays(GodRaysParams),
+    LensFlare(LensFlareParams),
     Vignette(VignetteParams),
     FilmGrain(FilmGrainParams),
     ChromaticAberration(ChromaticAberrationParams),
@@ -628,6 +629,7 @@ impl LocalEffect {
             Self::DiffuseGlow(_) => "拡散光彩",
             Self::Bloom(_) => "ブルーム",
             Self::GodRays(_) => "光芒",
+            Self::LensFlare(_) => "レンズフレア",
             Self::Vignette(_) => "ビネット",
             Self::FilmGrain(_) => "フィルム粒子",
             Self::ChromaticAberration(_) => "色収差",
@@ -2305,6 +2307,33 @@ impl Default for GodRaysParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LensFlareParams {
+    pub center: [f32; 2],
+    pub radius_px: f32,
+    pub strength: f32,
+    pub core_strength: f32,
+    pub halo_strength: f32,
+    pub ghost_strength: f32,
+    pub streak_strength: f32,
+    pub warm_tint: f32,
+}
+
+impl Default for LensFlareParams {
+    fn default() -> Self {
+        Self {
+            center: [0.72, 0.26],
+            radius_px: 96.0,
+            strength: 0.0,
+            core_strength: 1.0,
+            halo_strength: 0.7,
+            ghost_strength: 0.65,
+            streak_strength: 0.45,
+            warm_tint: 0.2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VignetteParams {
     /// Positive values darken the edge; negative values brighten it.
     pub strength: f32,
@@ -2732,6 +2761,9 @@ where
         }
         LocalEffect::GodRays(params) => {
             apply_god_rays(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::LensFlare(params) => {
+            apply_lens_flare(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::Vignette(params) => {
             apply_vignette(&image.pixels, image.width, image.height, *params)
@@ -7213,6 +7245,123 @@ fn apply_god_rays(src: &[u8], width: usize, height: usize, params: GodRaysParams
     out
 }
 
+fn apply_lens_flare(src: &[u8], width: usize, height: usize, params: LensFlareParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 3.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let radius = params.radius_px.clamp(4.0, 420.0);
+    let core_strength = params.core_strength.clamp(0.0, 2.0);
+    let halo_strength = params.halo_strength.clamp(0.0, 2.0);
+    let ghost_strength = params.ghost_strength.clamp(0.0, 2.0);
+    let streak_strength = params.streak_strength.clamp(0.0, 2.0);
+    let warm_tint = params.warm_tint.clamp(0.0, 1.0);
+    let warm = [1.0, 0.84, 0.54];
+    let cool = [0.50, 0.78, 1.0];
+    let light_rgb = [
+        lerp_f32(0.90, warm[0], warm_tint),
+        lerp_f32(0.94, warm[1], warm_tint),
+        lerp_f32(1.00, warm[2], warm_tint),
+    ];
+    let cx = params.center[0].clamp(0.0, 1.0) * width.saturating_sub(1) as f32;
+    let cy = params.center[1].clamp(0.0, 1.0) * height.saturating_sub(1) as f32;
+    let mx = width.saturating_sub(1) as f32 * 0.5;
+    let my = height.saturating_sub(1) as f32 * 0.5;
+    let axis_x = mx - cx;
+    let axis_y = my - cy;
+    let axis_len = axis_x.hypot(axis_y);
+    let (dir_x, dir_y) = if axis_len > 0.001 {
+        (axis_x / axis_len, axis_y / axis_len)
+    } else {
+        (1.0, 0.0)
+    };
+    let diag = (width.saturating_sub(1) as f32).hypot(height.saturating_sub(1) as f32);
+    let ghosts = [
+        (0.38_f32, 0.20_f32, [0.55_f32, 0.82_f32, 1.00_f32], 0.42_f32),
+        (0.66_f32, 0.11_f32, [1.00_f32, 0.54_f32, 0.86_f32], 0.30_f32),
+        (0.94_f32, 0.16_f32, [0.72_f32, 1.00_f32, 0.62_f32], 0.34_f32),
+        (1.18_f32, 0.24_f32, [1.00_f32, 0.76_f32, 0.42_f32], 0.24_f32),
+    ];
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+            let px = x as f32;
+            let py = y as f32;
+            let dx = px - cx;
+            let dy = py - cy;
+            let d = dx.hypot(dy);
+            let mut add = [0.0_f32; 3];
+
+            if core_strength > 0.0 {
+                let core_radius = (radius * 0.22).max(2.0);
+                let core = radial_falloff(d, core_radius).powf(2.4) * core_strength * 1.15;
+                let glow = radial_falloff(d, radius).powf(2.0) * core_strength * 0.36;
+                let amount = (core + glow) * strength;
+                for c in 0..3 {
+                    add[c] += light_rgb[c] * amount;
+                }
+            }
+
+            if halo_strength > 0.0 {
+                let halo_radius = radius * 0.58;
+                let ring_width = (radius * 0.16).max(2.0);
+                let ring = radial_ring(d, halo_radius, ring_width).powf(1.7);
+                let soft_halo = radial_falloff(d, radius * 1.12).powf(2.6) * 0.18;
+                let amount = (ring * 0.52 + soft_halo) * halo_strength * strength;
+                for c in 0..3 {
+                    let color = lerp_f32(cool[c], warm[c], warm_tint * 0.55);
+                    add[c] += color * amount;
+                }
+            }
+
+            if streak_strength > 0.0 {
+                let along = dx.abs() / (radius * 1.7).max(1.0);
+                let across = dy.abs() / (radius * 0.035).max(1.2);
+                let streak = (1.0 - along).clamp(0.0, 1.0).powf(1.35) * (-across * across).exp();
+                let amount = streak * streak_strength * strength * 0.42;
+                for c in 0..3 {
+                    add[c] += light_rgb[c] * amount;
+                }
+            }
+
+            if ghost_strength > 0.0 {
+                for &(offset, size_scale, ghost_rgb, amount_scale) in &ghosts {
+                    let gx = cx + dir_x * diag * offset;
+                    let gy = cy + dir_y * diag * offset;
+                    let gd = (px - gx).hypot(py - gy);
+                    let ghost_radius = (radius * size_scale).max(2.0);
+                    let disc = radial_falloff(gd, ghost_radius).powf(2.2);
+                    let ring =
+                        radial_ring(gd, ghost_radius * 0.72, ghost_radius * 0.22).powf(1.5) * 0.55;
+                    let amount = (disc * 0.40 + ring) * ghost_strength * strength * amount_scale;
+                    for c in 0..3 {
+                        let color = lerp_f32(ghost_rgb[c], warm[c], warm_tint * 0.35);
+                        add[c] += color * amount;
+                    }
+                }
+            }
+
+            for c in 0..3 {
+                let base = src[i + c] as f32 / 255.0;
+                out[i + c] = to_u8(screen_channel(base, add[c].clamp(0.0, 1.0)));
+            }
+        }
+    }
+    out
+}
+
+fn radial_falloff(distance: f32, radius: f32) -> f32 {
+    (1.0 - distance / radius.max(0.001)).clamp(0.0, 1.0)
+}
+
+fn radial_ring(distance: f32, radius: f32, width: f32) -> f32 {
+    (1.0 - (distance - radius).abs() / width.max(0.001)).clamp(0.0, 1.0)
+}
+
 fn apply_vignette(src: &[u8], width: usize, height: usize, params: VignetteParams) -> Vec<u8> {
     let strength = params.strength.clamp(-1.0, 1.0);
     if strength.abs() <= f32::EPSILON || width == 0 || height == 0 {
@@ -9335,6 +9484,7 @@ mod tests {
             LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
             LocalEffect::GodRays(GodRaysParams::default()),
+            LocalEffect::LensFlare(LensFlareParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
             LocalEffect::FilmGrain(FilmGrainParams::default()),
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
@@ -10389,6 +10539,41 @@ LUT_3D_SIZE 2
         );
         assert!(out.pixels[12] > src.pixels[12]);
         assert_eq!(out.pixels[15], 255);
+    }
+
+    #[test]
+    fn lens_flare_adds_light_and_ghosts_while_preserving_alpha() {
+        let src = RgbaImageBuf::new(
+            9,
+            1,
+            vec![
+                20, 20, 20, 91, 20, 20, 20, 92, 20, 20, 20, 93, 20, 20, 20, 94, 20, 20, 20, 95, 20,
+                20, 20, 96, 20, 20, 20, 97, 20, 20, 20, 98, 20, 20, 20, 99,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "lens flare",
+            LocalMask::Full,
+            LocalEffect::LensFlare(LensFlareParams {
+                center: [0.0, 0.0],
+                radius_px: 4.0,
+                strength: 1.5,
+                core_strength: 1.0,
+                halo_strength: 0.0,
+                ghost_strength: 1.6,
+                streak_strength: 0.0,
+                warm_tint: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert!(
+            out.pixels[20] > src.pixels[20],
+            "ghost artifacts should appear along the lens axis"
+        );
+        assert_eq!(out.pixels[3], 91);
+        assert_eq!(out.pixels[35], 99);
     }
 
     #[test]
