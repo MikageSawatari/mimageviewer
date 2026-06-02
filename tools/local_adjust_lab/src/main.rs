@@ -1002,6 +1002,23 @@ impl MaskKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolPanelSection {
+    Tool,
+    Mask,
+    Effect,
+}
+
+impl ToolPanelSection {
+    fn accent_color(self) -> Color32 {
+        match self {
+            Self::Tool => Color32::from_rgb(110, 145, 220),
+            Self::Mask => Color32::from_rgb(80, 190, 165),
+            Self::Effect => Color32::from_rgb(220, 160, 84),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffectKind {
     None,
     Tone,
@@ -4400,54 +4417,6 @@ impl LocalAdjustLabApp {
         });
     }
 
-    fn draw_effect_parameter_header(&mut self, ui: &mut egui::Ui) {
-        let has_layer = self.selected_layer_ref().is_some();
-        let can_paste = has_layer && self.effect_clipboard.is_some();
-        let can_reset = self
-            .selected_layer_ref()
-            .map(|layer| EffectKind::from_effect(&layer.effect) != EffectKind::None)
-            .unwrap_or(false);
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("加工パラメータ")
-                    .size(14.0)
-                    .strong()
-                    .color(Color32::WHITE),
-            );
-            ui.add_space(6.0);
-            if ui
-                .add_enabled(
-                    has_layer,
-                    egui::Button::new("コピー").min_size(egui::vec2(52.0, 24.0)),
-                )
-                .lab_hover_tip("現在の効果種類とパラメータをコピーします。")
-                .clicked()
-            {
-                self.copy_selected_effect();
-            }
-            if ui
-                .add_enabled(
-                    can_paste,
-                    egui::Button::new("ペースト").min_size(egui::vec2(62.0, 24.0)),
-                )
-                .lab_hover_tip("コピーした効果種類とパラメータを、選択中レイヤーへ貼り付けます。")
-                .clicked()
-            {
-                self.paste_effect_to_selected_layer();
-            }
-            if ui
-                .add_enabled(
-                    can_reset,
-                    egui::Button::new("リセット").min_size(egui::vec2(62.0, 24.0)),
-                )
-                .lab_hover_tip("現在の効果種類のパラメータだけを初期値へ戻します。")
-                .clicked()
-            {
-                self.reset_selected_effect_params();
-            }
-        });
-    }
-
     fn draw_save_controls(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
         let btn_w = btn_size.x;
         if ui
@@ -5538,147 +5507,182 @@ impl LocalAdjustLabApp {
             .map(|layer| MaskKind::from_mask(&layer.mask));
         let manual_edit_controls_visible =
             raster_vector_edit_controls_visible(selected_mask_kind, self.override_edit_panel);
-        if manual_edit_controls_visible {
-            self.draw_tool_controls(ui);
-        } else {
-            ui.label(
-                egui::RichText::new(
-                    "追加マスク/削除マスクを開くと、手描きツール設定を表示します。",
-                )
-                .size(11.0)
-                .color(Color32::from_gray(180)),
-            );
-        }
-        if selected_mask_kind != Some(MaskKind::Raster) && manual_edit_controls_visible {
-            let help = if self.override_edit_panel.is_some() {
-                "追加/削除マスクパネルが開いている間は、筆/図形ツールで追加マスクまたは削除マスクを編集します。ベースマスクを調整する場合はパネルを閉じます。"
+
+        draw_tool_panel_section(ui, ToolPanelSection::Tool, |ui| {
+            if manual_edit_controls_visible {
+                self.draw_tool_controls(ui);
             } else {
-                match selected_mask_kind {
-                    Some(MaskKind::LinearGradient) => {
-                        "選択ツールでは画像上のドラッグで生成/調整します。筆などに切り替えると追加/削除マスクを描けます。"
-                    }
-                    Some(MaskKind::RadialGradient) => {
-                        "選択ツールでは画像上のドラッグで生成/調整します。筆などに切り替えると追加/削除マスクを描けます。"
-                    }
-                    Some(MaskKind::ColorRange) => {
-                        "選択ツールでは画像上クリックでスポイト指定します。筆などに切り替えると追加/削除マスクを描けます。"
-                    }
-                    Some(MaskKind::LumaRange) => {
-                        "輝度範囲はスライダーで調整します。筆などで追加/削除マスクを描けます。"
-                    }
-                    Some(MaskKind::Full) => "全体マスクに対して削除マスクなどを描けます。",
-                    Some(MaskKind::Subject) => {
-                        "被写体/背景マットを保ったまま、筆などで追加/削除マスクを描けます。"
-                    }
-                    Some(MaskKind::Segmentation) => {
-                        "選択ツールでは領域候補をクリック/ドラッグでON/OFFします。筆などでは追加/削除マスクを描けます。"
-                    }
-                    None | Some(MaskKind::Raster) => "",
-                }
-            };
-            ui.label(
-                egui::RichText::new(help)
+                ui.label(
+                    egui::RichText::new("ツール設定")
+                        .size(14.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "追加マスク/削除マスクを開くと、手描きツール設定を表示します。",
+                    )
                     .size(11.0)
                     .color(Color32::from_gray(180)),
-            );
-        }
-
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("マスク設定")
-                    .size(14.0)
-                    .strong()
-                    .color(Color32::WHITE),
-            );
-            ui.add_space(8.0);
-            if ui
-                .add_sized(egui::vec2(112.0, 24.0), egui::Button::new("マスク種類変更"))
-                .lab_hover_tip("加工内容を残したまま、ベースマスクの種類を変更します。")
-                .clicked()
-            {
-                self.open_change_mask_dialog();
+                );
+            }
+            if selected_mask_kind != Some(MaskKind::Raster) && manual_edit_controls_visible {
+                let help = if self.override_edit_panel.is_some() {
+                    "追加/削除マスクパネルが開いている間は、筆/図形ツールで追加マスクまたは削除マスクを編集します。ベースマスクを調整する場合はパネルを閉じます。"
+                } else {
+                    match selected_mask_kind {
+                        Some(MaskKind::LinearGradient) => {
+                            "選択ツールでは画像上のドラッグで生成/調整します。筆などに切り替えると追加/削除マスクを描けます。"
+                        }
+                        Some(MaskKind::RadialGradient) => {
+                            "選択ツールでは画像上のドラッグで生成/調整します。筆などに切り替えると追加/削除マスクを描けます。"
+                        }
+                        Some(MaskKind::ColorRange) => {
+                            "選択ツールでは画像上クリックでスポイト指定します。筆などに切り替えると追加/削除マスクを描けます。"
+                        }
+                        Some(MaskKind::LumaRange) => {
+                            "輝度範囲はスライダーで調整します。筆などで追加/削除マスクを描けます。"
+                        }
+                        Some(MaskKind::Full) => "全体マスクに対して削除マスクなどを描けます。",
+                        Some(MaskKind::Subject) => {
+                            "被写体/背景マットを保ったまま、筆などで追加/削除マスクを描けます。"
+                        }
+                        Some(MaskKind::Segmentation) => {
+                            "選択ツールでは領域候補をクリック/ドラッグでON/OFFします。筆などでは追加/削除マスクを描けます。"
+                        }
+                        None | Some(MaskKind::Raster) => "",
+                    }
+                };
+                ui.label(
+                    egui::RichText::new(help)
+                        .size(11.0)
+                        .color(Color32::from_gray(180)),
+                );
             }
         });
-        let dims = self.image_dims().unwrap_or((1, 1));
-        let mut changed = false;
-        if let Some(layer) = self.selected_layer_mut() {
-            changed |= ui
-                .checkbox(&mut layer.mask_inverted, "マスク反転")
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(&mut layer.opacity, 0.0..=1.0).text("不透明度"))
-                .changed();
+
+        draw_tool_panel_section(ui, ToolPanelSection::Mask, |ui| {
             ui.horizontal(|ui| {
-                ui.label("マスク適用");
-                let before_response =
-                    draw_mask_application_button(ui, "前", layer.mask_before_effect);
-                let before_clicked = before_response.clicked();
-                before_response.lab_hover_tip("ONで、マスク範囲だけを効果の入力素材にします。");
-                if before_clicked {
-                    layer.mask_before_effect = !layer.mask_before_effect;
-                    changed = true;
-                }
-                let after_response =
-                    draw_mask_application_button(ui, "後", layer.mask_after_effect);
-                let after_clicked = after_response.clicked();
-                after_response.lab_hover_tip("ONで、効果後の結果をマスク範囲で切り取ります。");
-                if after_clicked {
-                    layer.mask_after_effect = !layer.mask_after_effect;
-                    changed = true;
+                ui.label(
+                    egui::RichText::new("マスク設定")
+                        .size(14.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                );
+                ui.add_space(8.0);
+                if ui
+                    .add_sized(egui::vec2(112.0, 24.0), egui::Button::new("マスク種類変更"))
+                    .lab_hover_tip("加工内容を残したまま、ベースマスクの種類を変更します。")
+                    .clicked()
+                {
+                    self.open_change_mask_dialog();
                 }
             });
-            changed |= ui
-                .add(egui::Slider::new(&mut layer.mask_expand_px, -32.0..=32.0).text("拡張/縮小"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(&mut layer.mask_feather_px, 0.0..=64.0).text("ぼかし境界"))
-                .changed();
-            ui.separator();
-            changed |= draw_mask_controls(ui, layer, dims);
-        }
-        if changed {
-            self.mark_mask_changed();
-        }
-        if selected_mask_kind == Some(MaskKind::Subject) {
-            ui.separator();
-            self.draw_subject_controls(ui);
-        }
-        if selected_mask_kind == Some(MaskKind::Segmentation) {
-            ui.separator();
-            self.draw_region_controls(ui);
-        }
+            let dims = self.image_dims().unwrap_or((1, 1));
+            let mut changed = false;
+            if let Some(layer) = self.selected_layer_mut() {
+                changed |= ui
+                    .checkbox(&mut layer.mask_inverted, "マスク反転")
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(&mut layer.opacity, 0.0..=1.0).text("不透明度"))
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label("マスク適用");
+                    let before_response =
+                        draw_mask_application_button(ui, "前", layer.mask_before_effect);
+                    let before_clicked = before_response.clicked();
+                    before_response.lab_hover_tip("ONで、マスク範囲だけを効果の入力素材にします。");
+                    if before_clicked {
+                        layer.mask_before_effect = !layer.mask_before_effect;
+                        changed = true;
+                    }
+                    let after_response =
+                        draw_mask_application_button(ui, "後", layer.mask_after_effect);
+                    let after_clicked = after_response.clicked();
+                    after_response.lab_hover_tip("ONで、効果後の結果をマスク範囲で切り取ります。");
+                    if after_clicked {
+                        layer.mask_after_effect = !layer.mask_after_effect;
+                        changed = true;
+                    }
+                });
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut layer.mask_expand_px, -32.0..=32.0)
+                            .text("拡張/縮小"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut layer.mask_feather_px, 0.0..=64.0)
+                            .text("ぼかし境界"),
+                    )
+                    .changed();
+                ui.separator();
+                changed |= draw_mask_controls(ui, layer, dims);
+            }
+            if changed {
+                self.mark_mask_changed();
+            }
+            if selected_mask_kind == Some(MaskKind::Subject) {
+                ui.separator();
+                self.draw_subject_controls(ui);
+            }
+            if selected_mask_kind == Some(MaskKind::Segmentation) {
+                ui.separator();
+                self.draw_region_controls(ui);
+            }
+        });
 
-        ui.separator();
-        self.draw_effect_parameter_header(ui);
-        let dims = self.image_dims().unwrap_or((1, 1));
         let mut request_cube_lut_load = false;
         let mut request_selective_color_pick = false;
         let mut request_selective_color_pick_cancel = false;
         let mut request_rgb_pick = None;
         let mut request_rgb_pick_cancel = false;
         let mut request_effect_position_handles_visible = None;
+        let mut request_copy_effect = false;
+        let mut request_paste_effect = false;
+        let mut request_reset_effect = false;
         let selective_color_pick_active = self.selective_color_pick_active;
         let rgb_pick_active = self.rgb_pick_active;
         let effect_position_handles_visible = self.effect_position_handles_visible;
-        if let Some(layer) = self.selected_layer_mut() {
-            let response = draw_effect_params(
-                ui,
-                layer,
-                dims,
-                selective_color_pick_active,
-                rgb_pick_active,
-                effect_position_handles_visible,
-            );
-            request_cube_lut_load = response.load_cube_lut;
-            request_selective_color_pick = response.start_selective_color_pick;
-            request_selective_color_pick_cancel = response.cancel_selective_color_pick;
-            request_rgb_pick = response.start_rgb_pick;
-            request_rgb_pick_cancel = response.cancel_rgb_pick;
-            request_effect_position_handles_visible = response.set_effect_position_handles_visible;
-            if response.changed {
-                self.hide_mask_preview();
-                self.mark_dirty();
+        let effect_clipboard_available = self.effect_clipboard.is_some();
+        draw_tool_panel_section(ui, ToolPanelSection::Effect, |ui| {
+            let dims = self.image_dims().unwrap_or((1, 1));
+            if let Some(layer) = self.selected_layer_mut() {
+                let response = draw_effect_params(
+                    ui,
+                    layer,
+                    dims,
+                    selective_color_pick_active,
+                    rgb_pick_active,
+                    effect_clipboard_available,
+                    effect_position_handles_visible,
+                );
+                request_cube_lut_load = response.load_cube_lut;
+                request_selective_color_pick = response.start_selective_color_pick;
+                request_selective_color_pick_cancel = response.cancel_selective_color_pick;
+                request_rgb_pick = response.start_rgb_pick;
+                request_rgb_pick_cancel = response.cancel_rgb_pick;
+                request_effect_position_handles_visible =
+                    response.set_effect_position_handles_visible;
+                request_copy_effect = response.copy_effect;
+                request_paste_effect = response.paste_effect;
+                request_reset_effect = response.reset_effect;
+                if response.changed {
+                    self.hide_mask_preview();
+                    self.mark_dirty();
+                }
             }
+        });
+        if request_copy_effect {
+            self.copy_selected_effect();
+        }
+        if request_paste_effect {
+            self.paste_effect_to_selected_layer();
+        }
+        if request_reset_effect {
+            self.reset_selected_effect_params();
         }
         if request_cube_lut_load {
             self.choose_cube_lut_for_selected_layer();
@@ -9825,6 +9829,9 @@ struct EffectParamResponse {
     start_rgb_pick: Option<RgbPickTarget>,
     cancel_rgb_pick: bool,
     set_effect_position_handles_visible: Option<bool>,
+    copy_effect: bool,
+    paste_effect: bool,
+    reset_effect: bool,
 }
 
 fn draw_effect_position_handle_toggle(ui: &mut egui::Ui, visible: bool) -> Option<bool> {
@@ -9863,6 +9870,7 @@ fn draw_effect_params(
     image_dims: (usize, usize),
     selective_color_pick_active: bool,
     rgb_pick_active: Option<RgbPickTarget>,
+    effect_clipboard_available: bool,
     effect_position_handles_visible: bool,
 ) -> EffectParamResponse {
     let mut changed = false;
@@ -9872,8 +9880,10 @@ fn draw_effect_params(
     let mut start_rgb_pick = None;
     let mut cancel_rgb_pick = false;
     let mut set_effect_position_handles_visible = None;
-    let effect_kind = EffectKind::from_effect(&layer.effect);
     let has_effect = !matches!(&layer.effect, LocalEffect::None);
+    let mut copy_effect = false;
+    let mut paste_effect = false;
+    let mut reset_effect = false;
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("加工パラメータ")
@@ -9881,26 +9891,28 @@ fn draw_effect_params(
                 .strong()
                 .color(Color32::WHITE),
         );
-        if has_effect {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("リセット").clicked() {
-                    layer.effect = default_effect(effect_kind);
-                    changed = true;
-                }
-            });
+        ui.add_space(6.0);
+        let copy_response = ui.button("コピー");
+        let copy_clicked = copy_response.clicked();
+        copy_response.lab_hover_tip("現在の効果種類と加工パラメータをコピーします。");
+        if copy_clicked {
+            copy_effect = true;
+        }
+        let paste_response =
+            ui.add_enabled(effect_clipboard_available, egui::Button::new("ペースト"));
+        let paste_clicked = paste_response.clicked();
+        paste_response
+            .lab_hover_tip("コピー済みの効果種類と加工パラメータをこのレイヤーへ貼り付けます。");
+        if paste_clicked {
+            paste_effect = true;
+        }
+        let reset_response = ui.add_enabled(has_effect, egui::Button::new("リセット"));
+        let reset_clicked = reset_response.clicked();
+        reset_response.lab_hover_tip("現在の効果を標準値に戻します。");
+        if reset_clicked {
+            reset_effect = true;
         }
     });
-    if changed {
-        return EffectParamResponse {
-            changed,
-            load_cube_lut,
-            start_selective_color_pick,
-            cancel_selective_color_pick,
-            start_rgb_pick,
-            cancel_rgb_pick,
-            set_effect_position_handles_visible,
-        };
-    }
     match &mut layer.effect {
         LocalEffect::None => {
             ui.label("加工内容を選ぶと、このレイヤーの効果が有効になります。");
@@ -18194,6 +18206,9 @@ fn draw_effect_params(
         start_rgb_pick,
         cancel_rgb_pick,
         set_effect_position_handles_visible,
+        copy_effect,
+        paste_effect,
+        reset_effect,
     }
 }
 
@@ -19511,6 +19526,25 @@ fn panel_toggle_button(
     } else {
         ui.add(button)
     }
+}
+
+fn draw_tool_panel_section<R>(
+    ui: &mut egui::Ui,
+    section: ToolPanelSection,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let response = egui::Frame::new()
+        .inner_margin(6.0)
+        .show(ui, |ui| add_contents(ui));
+    let rect = response.response.rect;
+    let line_rect = Rect::from_min_max(
+        egui::pos2(rect.left(), rect.top() + 4.0),
+        egui::pos2(rect.left() + 3.0, rect.bottom() - 4.0),
+    );
+    ui.painter()
+        .rect_filled(line_rect, 1.5, section.accent_color());
+    ui.add_space(2.0);
+    response.inner
 }
 
 fn draw_mask_kind_picker(
