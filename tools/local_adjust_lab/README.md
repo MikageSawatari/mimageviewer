@@ -131,6 +131,7 @@ the window.
   - Halftone
   - Screen tone
   - Color halftone
+  - CMYK plate shift
   - Textureizer
   - Cross/star glow
   - Edge-preserving smooth

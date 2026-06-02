@@ -17,12 +17,12 @@ use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     AnamorphicFlareParams, ArtisticMediaMode, ArtisticMediaParams, BloomParams, BlurParams,
     BrushStrokeMode, BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams,
-    ClarityParams, CloudFogMode, CloudFogParams, ColorBalanceParams, ColorBalanceRange,
-    ColorDodgeGlowParams, ColorFillParams, ColorGradeWheel, ColorHalftoneParams, ColorMixerParams,
-    ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask, ColorTraceParams,
-    ContactShadowParams, CubeLutParams, CutoutParams, DehazeParams, DespeckleParams,
-    DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams,
-    EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
+    ClarityParams, CloudFogMode, CloudFogParams, CmykPlateShiftParams, ColorBalanceParams,
+    ColorBalanceRange, ColorDodgeGlowParams, ColorFillParams, ColorGradeWheel, ColorHalftoneParams,
+    ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask,
+    ColorTraceParams, ContactShadowParams, CubeLutParams, CutoutParams, DehazeParams,
+    DespeckleParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
+    EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
     GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams,
     HalftoneParams, HeatHazeParams, HighPassParams, HighlightsShadowsParams, HslParams,
     InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LensFlareParams,
@@ -1054,6 +1054,7 @@ enum EffectKind {
     Halftone,
     ScreenTone,
     ColorHalftone,
+    CmykPlateShift,
     Textureizer,
     StarGlow,
     EdgeSmooth,
@@ -1189,6 +1190,7 @@ impl EffectKind {
             LocalEffect::Halftone(_) => Self::Halftone,
             LocalEffect::ScreenTone(_) => Self::ScreenTone,
             LocalEffect::ColorHalftone(_) => Self::ColorHalftone,
+            LocalEffect::CmykPlateShift(_) => Self::CmykPlateShift,
             LocalEffect::Textureizer(_) => Self::Textureizer,
             LocalEffect::StarGlow(_) => Self::StarGlow,
             LocalEffect::EdgeSmooth(_) => Self::EdgeSmooth,
@@ -1275,6 +1277,7 @@ impl EffectKind {
             Self::Halftone => "ハーフトーン",
             Self::ScreenTone => "スクリーントーン",
             Self::ColorHalftone => "カラーハーフトーン",
+            Self::CmykPlateShift => "CMYK版ズレ",
             Self::Textureizer => "テクスチャライザ",
             Self::StarGlow => "クロス光",
             Self::EdgeSmooth => "エッジ保持ぼかし",
@@ -1439,6 +1442,9 @@ impl EffectKind {
             Self::ColorHalftone => {
                 "CMYK 4版の角度違いドットで、ポップアートやアメコミ風の印刷網点を作ります。"
             }
+            Self::CmykPlateShift => {
+                "CMYKの色版を少しずらし、印刷物やリソグラフ風の色ズレを作ります。"
+            }
             Self::Textureizer => {
                 "紙目、キャンバス、リネンの手続き型テクスチャをソフトライトで重ね、手描き感や紙質を足します。"
             }
@@ -1576,6 +1582,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Halftone,
             EffectKind::ScreenTone,
             EffectKind::ColorHalftone,
+            EffectKind::CmykPlateShift,
             EffectKind::Textureizer,
         ],
     },
@@ -8555,6 +8562,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::ColorHalftone(params) => {
             format!("カラーハーフトーン {:.0}px", params.cell_px)
         }
+        LocalEffect::CmykPlateShift(params) => {
+            format!("CMYK版ズレ {:.1}px", params.offset_px)
+        }
         LocalEffect::Textureizer(params) => format!(
             "テクスチャ {} {:.0}px",
             textureizer_mode_label(params.mode),
@@ -15446,6 +15456,94 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
                 .changed();
         }
+        LocalEffect::CmykPlateShift(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "軽い版ズレ") {
+                    *params = CmykPlateShiftParams {
+                        offset_px: 1.6,
+                        angle_degrees: 0.0,
+                        black_offset_px: 0.3,
+                        black_generation: 0.70,
+                        ink_gain: 0.0,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "リソグラフ") {
+                    *params = CmykPlateShiftParams {
+                        offset_px: 4.2,
+                        angle_degrees: -18.0,
+                        black_offset_px: 1.0,
+                        black_generation: 0.45,
+                        ink_gain: 0.08,
+                        strength: 0.90,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "粗い印刷") {
+                    *params = CmykPlateShiftParams {
+                        offset_px: 7.0,
+                        angle_degrees: 12.0,
+                        black_offset_px: -1.8,
+                        black_generation: 0.82,
+                        ink_gain: 0.12,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡いズレ") {
+                    *params = CmykPlateShiftParams {
+                        offset_px: 2.4,
+                        angle_degrees: 35.0,
+                        black_offset_px: 0.0,
+                        black_generation: 0.55,
+                        ink_gain: -0.05,
+                        strength: 0.55,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "CMYKの各色版を少し違う位置から重ね直します。カラーハーフトーンや紙目と組み合わせると印刷物らしいズレが出ます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let offset = ui.add(
+                egui::Slider::new(&mut params.offset_px, 0.0..=32.0)
+                    .text("色版ずれ")
+                    .suffix("px"),
+            );
+            changed |= offset.changed();
+            offset.lab_hover_tip("シアン、マゼンタ、イエロー版をどれだけずらすかです。");
+            let angle = ui.add(
+                egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                    .text("ずれ方向")
+                    .suffix("°"),
+            );
+            changed |= angle.changed();
+            angle.lab_hover_tip("シアン版がずれる方向です。ほかの色版は別方向へ散らします。");
+            let black_offset = ui.add(
+                egui::Slider::new(&mut params.black_offset_px, -16.0..=16.0)
+                    .text("黒版ずれ")
+                    .suffix("px"),
+            );
+            changed |= black_offset.changed();
+            black_offset.lab_hover_tip("黒版だけの追加ずれです。小さめにすると輪郭が締まります。");
+            let black =
+                ui.add(egui::Slider::new(&mut params.black_generation, 0.0..=1.0).text("黒版量"));
+            changed |= black.changed();
+            black.lab_hover_tip("暗部を黒版へどれだけ分担させるかです。");
+            let gain =
+                ui.add(egui::Slider::new(&mut params.ink_gain, -0.35..=0.35).text("インク増減"));
+            changed |= gain.changed();
+            gain.lab_hover_tip("各版のインク量を増減します。正で濃く、負で淡くなります。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から版ズレ再合成結果へどれだけ近づけるかです。");
+        }
         LocalEffect::Textureizer(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -17133,6 +17231,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Halftone => LocalEffect::Halftone(HalftoneParams::default()),
         EffectKind::ScreenTone => LocalEffect::ScreenTone(ScreenToneParams::default()),
         EffectKind::ColorHalftone => LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
+        EffectKind::CmykPlateShift => LocalEffect::CmykPlateShift(CmykPlateShiftParams::default()),
         EffectKind::Textureizer => LocalEffect::Textureizer(TextureizerParams::default()),
         EffectKind::StarGlow => LocalEffect::StarGlow(StarGlowParams::default()),
         EffectKind::EdgeSmooth => LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
@@ -19464,6 +19563,7 @@ mod tests {
             EffectKind::Halftone,
             EffectKind::ScreenTone,
             EffectKind::ColorHalftone,
+            EffectKind::CmykPlateShift,
             EffectKind::Textureizer,
             EffectKind::ColorOverlay,
             EffectKind::StarGlow,

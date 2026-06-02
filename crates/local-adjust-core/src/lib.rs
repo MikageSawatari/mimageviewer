@@ -602,6 +602,7 @@ pub enum LocalEffect {
     Halftone(HalftoneParams),
     ScreenTone(ScreenToneParams),
     ColorHalftone(ColorHalftoneParams),
+    CmykPlateShift(CmykPlateShiftParams),
     Textureizer(TextureizerParams),
     StarGlow(StarGlowParams),
     EdgeSmooth(EdgeSmoothParams),
@@ -688,6 +689,7 @@ impl LocalEffect {
             Self::Halftone(_) => "ハーフトーン",
             Self::ScreenTone(_) => "スクリーントーン",
             Self::ColorHalftone(_) => "カラーハーフトーン",
+            Self::CmykPlateShift(_) => "CMYK版ズレ",
             Self::Textureizer(_) => "テクスチャライザ",
             Self::StarGlow(_) => "クロス光",
             Self::EdgeSmooth(_) => "エッジ保持ぼかし",
@@ -2951,6 +2953,29 @@ impl Default for ColorHalftoneParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CmykPlateShiftParams {
+    pub offset_px: f32,
+    pub angle_degrees: f32,
+    pub black_offset_px: f32,
+    pub black_generation: f32,
+    pub ink_gain: f32,
+    pub strength: f32,
+}
+
+impl Default for CmykPlateShiftParams {
+    fn default() -> Self {
+        Self {
+            offset_px: 0.0,
+            angle_degrees: 0.0,
+            black_offset_px: 0.0,
+            black_generation: 0.70,
+            ink_gain: 0.0,
+            strength: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TextureizerMode {
@@ -3534,6 +3559,9 @@ where
             }
             LocalEffect::ColorHalftone(params) => {
                 apply_color_halftone(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::CmykPlateShift(params) => {
+                apply_cmyk_plate_shift(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::Textureizer(params) => {
                 apply_textureizer(&image.pixels, image.width, image.height, *params)
@@ -9823,6 +9851,107 @@ fn color_halftone_plate_mask(
     1.0 - smoothstep(radius, radius + edge, dist)
 }
 
+fn apply_cmyk_plate_shift(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: CmykPlateShiftParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let offset = params.offset_px.clamp(0.0, 64.0);
+    let black_offset = params.black_offset_px.clamp(-64.0, 64.0);
+    let ink_gain = params.ink_gain.clamp(-0.35, 0.35);
+    if width == 0
+        || height == 0
+        || strength <= f32::EPSILON
+        || (offset <= f32::EPSILON
+            && black_offset.abs() <= f32::EPSILON
+            && ink_gain.abs() <= f32::EPSILON)
+    {
+        return src.to_vec();
+    }
+
+    let angle = params.angle_degrees.to_radians();
+    let dir = (angle.cos(), angle.sin());
+    let perp = (-dir.1, dir.0);
+    let black_generation = params.black_generation.clamp(0.0, 1.0);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+            let xf = x as f32;
+            let yf = y as f32;
+            let (cyan, _, _, _) = sample_cmyk_ink_alpha_aware(
+                src,
+                width,
+                height,
+                xf + dir.0 * offset,
+                yf + dir.1 * offset,
+                black_generation,
+                ink_gain,
+            );
+            let (_, magenta, _, _) = sample_cmyk_ink_alpha_aware(
+                src,
+                width,
+                height,
+                xf - dir.0 * offset,
+                yf - dir.1 * offset,
+                black_generation,
+                ink_gain,
+            );
+            let (_, _, yellow, _) = sample_cmyk_ink_alpha_aware(
+                src,
+                width,
+                height,
+                xf + perp.0 * offset,
+                yf + perp.1 * offset,
+                black_generation,
+                ink_gain,
+            );
+            let (_, _, _, black) = sample_cmyk_ink_alpha_aware(
+                src,
+                width,
+                height,
+                xf - perp.0 * black_offset,
+                yf - perp.1 * black_offset,
+                black_generation,
+                ink_gain,
+            );
+            let target = [
+                1.0 - (cyan + black).clamp(0.0, 1.0),
+                1.0 - (magenta + black).clamp(0.0, 1.0),
+                1.0 - (yellow + black).clamp(0.0, 1.0),
+            ];
+            for c in 0..3 {
+                let base = src[i + c] as f32 / 255.0;
+                out[i + c] = to_u8(lerp_f32(base, target[c], strength));
+            }
+        }
+    }
+    out
+}
+
+fn sample_cmyk_ink_alpha_aware(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: f32,
+    y: f32,
+    black_generation: f32,
+    ink_gain: f32,
+) -> (f32, f32, f32, f32) {
+    let (rgb, alpha) = sample_rgb_bilinear_alpha_aware(src, width, height, x, y);
+    if alpha <= f32::EPSILON {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let (cyan, magenta, yellow, black) =
+        rgb_to_cmyk_ink(rgb[0], rgb[1], rgb[2], black_generation, ink_gain);
+    (cyan * alpha, magenta * alpha, yellow * alpha, black * alpha)
+}
+
 fn apply_textureizer(
     src: &[u8],
     width: usize,
@@ -12547,6 +12676,7 @@ mod tests {
             LocalEffect::Halftone(HalftoneParams::default()),
             LocalEffect::ScreenTone(ScreenToneParams::default()),
             LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
+            LocalEffect::CmykPlateShift(CmykPlateShiftParams::default()),
             LocalEffect::Textureizer(TextureizerParams::default()),
             LocalEffect::StarGlow(StarGlowParams::default()),
             LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
@@ -13236,6 +13366,17 @@ mod tests {
                     dot_gain: 1.0,
                     black_generation: 1.0,
                     softness: 1.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "cmyk plate shift max offset",
+                LocalEffect::CmykPlateShift(CmykPlateShiftParams {
+                    offset_px: 64.0,
+                    angle_degrees: 180.0,
+                    black_offset_px: -64.0,
+                    black_generation: 1.0,
+                    ink_gain: 0.35,
                     strength: 1.0,
                 }),
             ),
@@ -15083,6 +15224,77 @@ LUT_3D_SIZE 2
                 .chunks_exact(4)
                 .any(|px| px[0] != px[1] || px[1] != px[2])
         );
+    }
+
+    #[test]
+    fn cmyk_plate_shift_offsets_cyan_plate_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![255, 255, 255, 201, 0, 255, 255, 202, 255, 255, 255, 203],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "cmyk shift",
+            LocalMask::Full,
+            LocalEffect::CmykPlateShift(CmykPlateShiftParams {
+                offset_px: 1.0,
+                angle_degrees: 0.0,
+                black_offset_px: 0.0,
+                black_generation: 0.70,
+                ink_gain: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] < 80);
+        assert!(out.pixels[1] > 220);
+        assert!(out.pixels[2] > 220);
+        assert_eq!(out.pixels[3], 201);
+        assert_eq!(out.pixels[11], 203);
+    }
+
+    #[test]
+    fn cmyk_plate_shift_zero_offset_keeps_color_when_ink_gain_is_zero() {
+        let src = RgbaImageBuf::new(2, 1, vec![80, 130, 210, 250, 24, 92, 140, 240]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "cmyk shift",
+            LocalMask::Full,
+            LocalEffect::CmykPlateShift(CmykPlateShiftParams {
+                offset_px: 0.0,
+                angle_degrees: 35.0,
+                black_offset_px: 0.0,
+                black_generation: 0.35,
+                ink_gain: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn cmyk_plate_shift_ignores_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![255, 255, 255, 255, 0, 255, 255, 0, 255, 255, 255, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "cmyk shift",
+            LocalMask::Full,
+            LocalEffect::CmykPlateShift(CmykPlateShiftParams {
+                offset_px: 1.0,
+                angle_degrees: 0.0,
+                black_offset_px: 0.0,
+                black_generation: 0.70,
+                ink_gain: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[255, 255, 255, 255]);
     }
 
     #[test]

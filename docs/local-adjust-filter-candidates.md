@@ -61,14 +61,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、78種)
+### `LocalEffect` (部分補正レイヤー、79種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), PartColor(指定色だけ残す白黒化), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, HeatHaze, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, CloudFog, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Halftone, ScreenTone, ColorHalftone, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
+GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, CloudFog, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -167,6 +167,7 @@ LightLeak / 減色8機種 / CRT 3種＋複合 / カラーグレード11種
 
 - [x] **網点 / スクリーントーン (線・濃度・グラデ)** ★★ **中** — `ScreenTone`。網点 / 線 / カケアミ、セル、角度、濃度、元画像の明暗への階調追従、柔らかさ、強度を調整できる漫画用トーン (CSP トーン)
 - [x] **カラーハーフトーン (CMYK 4版ドット)** ★ **中** — `ColorHalftone`。CMYK 4版の角度違いドット、セル、角度オフセット、ドット増減、黒版量、柔らかさ、強度を調整できるポップアート/アメコミ調フィルタ (PS Pixelate)
+- [x] **CMYK 版ズレ / 印刷ズレ (`CmykPlateShift`)** ★ **中** — CMYK各色版を別位置からサンプルして再合成する。色版ずれ、ずれ方向、黒版ずれ、黒版量、インク増減、強度を調整でき、透明RGBを拾わない alpha-aware サンプリングにした
 - [x] **テクスチャライザ (紙/キャンバス重ね)** ★ **易〜中** — `Textureizer`。紙目 / キャンバス / リネンの手続き型テクスチャを、スケール、凹凸、コントラスト、紙色、強度、seed で調整してソフトライト合成できる紙質・手描き感フィルタ (PS Texture)
 - [x] **ノイズ付加 (Gaussian/Uniform, mono 指定)** **易** — `Noise`。均一 / ガウス分布、単色 / カラーノイズ、量、seed を指定できる汎用ノイズ。FilmGrain と別系統 (PS / Krita)
 - [x] **ゴミ・キズ取り / ディスペックル** ★ **中** — `Despeckle`。周囲の中央値から大きく外れた孤立点だけを、半径、検出しきい値、強さで選択的に補修する非 AI 高速点ゴミ除去 (スポット用) (PS / CSP / Krita)
@@ -220,7 +221,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 
 ### 9-F. 印刷 / 版画 / 質感系 ★トレンド
 - [ ] **リソグラフ / シルクスクリーン風** ★★ **中** — 限定スポットカラー＋版ズレ＋粒状。近年イラストで人気の質感
-- [ ] **CMYK 版ズレ / 印刷ズレ** ★ **中** — 4 版を微妙にずらす印刷物風。`カラーハーフトーン` と相性
+- [x] **CMYK 版ズレ / 印刷ズレ (`CmykPlateShift`)** ★ **中** — 4 版を微妙にずらす印刷物風。`カラーハーフトーン` と相性。版ズレ0・インク増減0では元色へ戻る減法再合成にした
 - [ ] **銅版画 / エングレービング (線彫り調)** **中** — 等高線状の線で陰影。古典挿絵
 - [ ] **新聞印刷 / 古印刷物** **易〜中** — 粗ハーフトーン＋退色＋紙地
 
