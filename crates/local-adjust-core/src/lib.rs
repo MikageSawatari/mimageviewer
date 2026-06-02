@@ -432,6 +432,7 @@ pub enum LocalEffect {
     WaveDistortion(WaveDistortionParams),
     PinchSpherize(PinchSpherizeParams),
     Twirl(TwirlParams),
+    PolarCoordinates(PolarCoordinatesParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -480,6 +481,7 @@ impl LocalEffect {
             Self::WaveDistortion(_) => "波形ゆがみ",
             Self::PinchSpherize(_) => "つまむ/魚眼",
             Self::Twirl(_) => "渦巻き",
+            Self::PolarCoordinates(_) => "極座標",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -1013,6 +1015,37 @@ impl Default for TwirlParams {
             angle_degrees: 0.0,
             radius_px: 0.0,
             center: [0.5, 0.5],
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PolarCoordinatesMode {
+    #[default]
+    RectToPolar,
+    PolarToRect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PolarCoordinatesParams {
+    pub mode: PolarCoordinatesMode,
+    pub center: [f32; 2],
+    pub radius_px: f32,
+    pub angle_offset_degrees: f32,
+    pub invert_radius: bool,
+    pub strength: f32,
+}
+
+impl Default for PolarCoordinatesParams {
+    fn default() -> Self {
+        Self {
+            mode: PolarCoordinatesMode::RectToPolar,
+            center: [0.5, 0.5],
+            radius_px: 0.0,
+            angle_offset_degrees: 0.0,
+            invert_radius: false,
             strength: 0.0,
         }
     }
@@ -1777,6 +1810,9 @@ where
         }
         LocalEffect::Twirl(params) => {
             apply_twirl(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::PolarCoordinates(params) => {
+            apply_polar_coordinates(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -3200,6 +3236,74 @@ fn apply_twirl(src: &[u8], width: usize, height: usize, params: TwirlParams) -> 
             let sx = cx + dx * cos_t - dy * sin_t;
             let sy = cy + dx * sin_t + dy * cos_t;
             let sampled = sample_rgb_bilinear(src, width, height, sx, sy);
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], to_u8(sampled[c]), strength);
+            }
+        }
+    }
+    out
+}
+
+fn apply_polar_coordinates(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: PolarCoordinatesParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let cx = (width.saturating_sub(1)) as f32 * params.center[0].clamp(0.0, 1.0);
+    let cy = (height.saturating_sub(1)) as f32 * params.center[1].clamp(0.0, 1.0);
+    let max_radius = farthest_corner_distance(width, height, cx, cy).max(1.0);
+    let radius = if params.radius_px > 0.0 {
+        params.radius_px.min(max_radius).max(1.0)
+    } else {
+        max_radius
+    };
+    let max_x = width.saturating_sub(1) as f32;
+    let max_y = height.saturating_sub(1) as f32;
+    let denom_x = max_x.max(1.0);
+    let denom_y = max_y.max(1.0);
+    let angle_offset = params.angle_offset_degrees.to_radians();
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let (sample_pos, inside_effect) = match params.mode {
+                PolarCoordinatesMode::RectToPolar => {
+                    let dx = x as f32 - cx;
+                    let dy = y as f32 - cy;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist > radius {
+                        ((x as f32, y as f32), false)
+                    } else {
+                        let angle_t = (dy.atan2(dx) - angle_offset)
+                            .rem_euclid(std::f32::consts::TAU)
+                            / std::f32::consts::TAU;
+                        let mut radius_t = (dist / radius).clamp(0.0, 1.0);
+                        if params.invert_radius {
+                            radius_t = 1.0 - radius_t;
+                        }
+                        ((angle_t * max_x, radius_t * max_y), true)
+                    }
+                }
+                PolarCoordinatesMode::PolarToRect => {
+                    let angle_t = x as f32 / denom_x;
+                    let mut radius_t = y as f32 / denom_y;
+                    if params.invert_radius {
+                        radius_t = 1.0 - radius_t;
+                    }
+                    let angle = angle_t * std::f32::consts::TAU + angle_offset;
+                    let dist = radius * radius_t.clamp(0.0, 1.0);
+                    ((cx + angle.cos() * dist, cy + angle.sin() * dist), true)
+                }
+            };
+            if !inside_effect {
+                continue;
+            }
+            let sampled = sample_rgb_bilinear(src, width, height, sample_pos.0, sample_pos.1);
             for c in 0..3 {
                 out[i + c] = lerp_u8(src[i + c], to_u8(sampled[c]), strength);
             }
@@ -5244,6 +5348,88 @@ mod tests {
     }
 
     #[test]
+    fn polar_coordinates_rect_to_polar_wraps_angle_axis() {
+        let src = RgbaImageBuf::new(
+            3,
+            3,
+            vec![
+                10, 0, 0, 66, 20, 0, 0, 66, 30, 0, 0, 66, 40, 0, 0, 66, 50, 0, 0, 66, 60, 0, 0, 66,
+                70, 0, 0, 66, 80, 0, 0, 66, 90, 0, 0, 66,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "polar",
+            LocalMask::Full,
+            LocalEffect::PolarCoordinates(PolarCoordinatesParams {
+                mode: PolarCoordinatesMode::RectToPolar,
+                center: [0.5, 0.5],
+                radius_px: 1.0,
+                angle_offset_degrees: 0.0,
+                invert_radius: false,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let right_of_center = (3 + 2) * 4;
+        assert_eq!(out.pixels[right_of_center], 70);
+        assert_eq!(out.pixels[right_of_center + 3], 66);
+    }
+
+    #[test]
+    fn polar_coordinates_polar_to_rect_unwraps_radius_axis() {
+        let src = RgbaImageBuf::new(
+            3,
+            3,
+            vec![
+                10, 0, 0, 88, 20, 0, 0, 88, 30, 0, 0, 88, 40, 0, 0, 88, 50, 0, 0, 88, 60, 0, 0, 88,
+                70, 0, 0, 88, 80, 0, 0, 88, 90, 0, 0, 88,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "polar",
+            LocalMask::Full,
+            LocalEffect::PolarCoordinates(PolarCoordinatesParams {
+                mode: PolarCoordinatesMode::PolarToRect,
+                center: [0.5, 0.5],
+                radius_px: 1.0,
+                angle_offset_degrees: 0.0,
+                invert_radius: false,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let lower_left = (2 * 3) * 4;
+        assert_eq!(out.pixels[lower_left], 60);
+        assert_eq!(out.pixels[lower_left + 3], 88);
+    }
+
+    #[test]
+    fn polar_coordinates_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "polar",
+            LocalMask::Full,
+            LocalEffect::PolarCoordinates(PolarCoordinatesParams {
+                mode: PolarCoordinatesMode::RectToPolar,
+                center: [0.5, 0.5],
+                radius_px: 8.0,
+                angle_offset_degrees: 90.0,
+                invert_radius: true,
+                strength: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn median_removes_isolated_speckle_and_preserves_alpha() {
         let mut pixels = vec![0_u8; 3 * 3 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -5526,6 +5712,7 @@ mod tests {
             LocalEffect::WaveDistortion(WaveDistortionParams::default()),
             LocalEffect::PinchSpherize(PinchSpherizeParams::default()),
             LocalEffect::Twirl(TwirlParams::default()),
+            LocalEffect::PolarCoordinates(PolarCoordinatesParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),

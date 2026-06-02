@@ -22,13 +22,14 @@ use local_adjust_core::{
     HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams, LineKind,
     LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
     ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
-    MotionBlurParams, PinchSpherizeParams, PosterizeParams, RadialBlurMode, RadialBlurParams,
-    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
-    RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams,
-    WaveDistortionMode, WaveDistortionParams, apply_layers, apply_layers_with_progress,
-    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    MotionBlurParams, PinchSpherizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
+    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
+    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
+    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
+    StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
+    TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams, WaveDistortionMode,
+    WaveDistortionParams, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -974,6 +975,7 @@ enum EffectKind {
     WaveDistortion,
     PinchSpherize,
     Twirl,
+    PolarCoordinates,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1022,6 +1024,7 @@ impl EffectKind {
             LocalEffect::WaveDistortion(_) => Self::WaveDistortion,
             LocalEffect::PinchSpherize(_) => Self::PinchSpherize,
             LocalEffect::Twirl(_) => Self::Twirl,
+            LocalEffect::PolarCoordinates(_) => Self::PolarCoordinates,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1070,6 +1073,7 @@ impl EffectKind {
             Self::WaveDistortion => "波形ゆがみ",
             Self::PinchSpherize => "つまむ/魚眼",
             Self::Twirl => "渦巻き",
+            Self::PolarCoordinates => "極座標",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1133,6 +1137,9 @@ impl EffectKind {
             }
             Self::Twirl => {
                 "中心を基準に画像を渦巻き状に回転させ、渦や魔法陣のような演出を作ります。"
+            }
+            Self::PolarCoordinates => {
+                "矩形画像を円形構図へ巻き、または円形構図を横長の極座標画像へ展開します。"
             }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
@@ -1237,6 +1244,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::WaveDistortion,
             EffectKind::PinchSpherize,
             EffectKind::Twirl,
+            EffectKind::PolarCoordinates,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Texture,
@@ -7146,6 +7154,13 @@ fn effect_summary(effect: &LocalEffect) -> String {
             }
         }
         LocalEffect::Twirl(params) => format!("渦巻き {:+.0}°", params.angle_degrees),
+        LocalEffect::PolarCoordinates(params) => {
+            let mode = match params.mode {
+                PolarCoordinatesMode::RectToPolar => "矩形→円形",
+                PolarCoordinatesMode::PolarToRect => "円形→矩形",
+            };
+            format!("極座標 {mode}")
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -9136,6 +9151,98 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から渦巻き結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::PolarCoordinates(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "Tiny planet") {
+                    *params = PolarCoordinatesParams {
+                        mode: PolarCoordinatesMode::RectToPolar,
+                        center: [0.5, 0.5],
+                        radius_px: 0.0,
+                        angle_offset_degrees: -90.0,
+                        invert_radius: true,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "円形構図") {
+                    *params = PolarCoordinatesParams {
+                        mode: PolarCoordinatesMode::RectToPolar,
+                        center: [0.5, 0.5],
+                        radius_px: 0.0,
+                        angle_offset_degrees: 0.0,
+                        invert_radius: false,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "パノラマ展開") {
+                    *params = PolarCoordinatesParams {
+                        mode: PolarCoordinatesMode::PolarToRect,
+                        center: [0.5, 0.5],
+                        radius_px: 0.0,
+                        angle_offset_degrees: 0.0,
+                        invert_radius: false,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "内外反転") {
+                    params.invert_radius = !params.invert_radius;
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "横方向を角度、縦方向を半径として扱い、画像を円形に巻いたり横長へ展開したりします。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let rect_to_polar = params.mode == PolarCoordinatesMode::RectToPolar;
+                if ui.selectable_label(rect_to_polar, "矩形→円形").clicked() && !rect_to_polar
+                {
+                    params.mode = PolarCoordinatesMode::RectToPolar;
+                    changed = true;
+                }
+                let polar_to_rect = params.mode == PolarCoordinatesMode::PolarToRect;
+                if ui.selectable_label(polar_to_rect, "円形→矩形").clicked() && !polar_to_rect
+                {
+                    params.mode = PolarCoordinatesMode::PolarToRect;
+                    changed = true;
+                }
+            });
+            let invert = ui.checkbox(&mut params.invert_radius, "内外反転");
+            changed |= invert.changed();
+            invert.lab_hover_tip(
+                "半径方向の対応を反転します。Tiny planet では地面側を中心へ寄せる用途に使います。",
+            );
+            let radius =
+                ui.add(egui::Slider::new(&mut params.radius_px, 0.0..=1200.0).text("半径"));
+            changed |= radius.changed();
+            radius.lab_hover_tip(
+                "円形変換に使う半径です。0 のときは中心から画像の角までを使います。",
+            );
+            let angle = ui.add(
+                egui::Slider::new(&mut params.angle_offset_degrees, -180.0..=180.0)
+                    .text("角度オフセット")
+                    .suffix("°"),
+            );
+            changed |= angle.changed();
+            angle.lab_hover_tip("巻き始めの角度を回します。継ぎ目や上方向の位置合わせに使います。");
+            let center_x =
+                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
+            changed |= center_x.changed();
+            center_x.lab_hover_tip("円形変換の中心位置です。");
+            let center_y =
+                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
+            changed |= center_y.changed();
+            center_y.lab_hover_tip("円形変換の中心位置です。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から極座標変換結果へどれだけ近づけるかです。");
         }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -11509,6 +11616,9 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::WaveDistortion => LocalEffect::WaveDistortion(WaveDistortionParams::default()),
         EffectKind::PinchSpherize => LocalEffect::PinchSpherize(PinchSpherizeParams::default()),
         EffectKind::Twirl => LocalEffect::Twirl(TwirlParams::default()),
+        EffectKind::PolarCoordinates => {
+            LocalEffect::PolarCoordinates(PolarCoordinatesParams::default())
+        }
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
