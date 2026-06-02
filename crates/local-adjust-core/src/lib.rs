@@ -430,6 +430,7 @@ pub enum LocalEffect {
     LensBlur(LensBlurParams),
     RadialBlur(RadialBlurParams),
     WaveDistortion(WaveDistortionParams),
+    PinchSpherize(PinchSpherizeParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -476,6 +477,7 @@ impl LocalEffect {
             Self::LensBlur(_) => "レンズぼかし",
             Self::RadialBlur(_) => "放射ぼかし",
             Self::WaveDistortion(_) => "波形ゆがみ",
+            Self::PinchSpherize(_) => "つまむ/魚眼",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -969,6 +971,26 @@ impl Default for WaveDistortionParams {
             amplitude_px: 0.0,
             wavelength_px: 64.0,
             phase_degrees: 0.0,
+            center: [0.5, 0.5],
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PinchSpherizeParams {
+    /// Positive values create a fisheye/bulge; negative values pinch toward the center.
+    pub amount: f32,
+    pub radius_px: f32,
+    pub center: [f32; 2],
+    pub strength: f32,
+}
+
+impl Default for PinchSpherizeParams {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            radius_px: 0.0,
             center: [0.5, 0.5],
             strength: 0.0,
         }
@@ -1728,6 +1750,9 @@ where
         }
         LocalEffect::WaveDistortion(params) => {
             apply_wave_distortion(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::PinchSpherize(params) => {
+            apply_pinch_spherize(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -3071,6 +3096,53 @@ fn zigzag_wave(t: f32) -> f32 {
     } else {
         3.0 - t * 4.0
     }
+}
+
+fn apply_pinch_spherize(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: PinchSpherizeParams,
+) -> Vec<u8> {
+    let amount = params.amount.clamp(-1.0, 1.0);
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || amount.abs() <= f32::EPSILON || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let cx = (width.saturating_sub(1)) as f32 * params.center[0].clamp(0.0, 1.0);
+    let cy = (height.saturating_sub(1)) as f32 * params.center[1].clamp(0.0, 1.0);
+    let max_radius = farthest_corner_distance(width, height, cx, cy).max(1.0);
+    let radius = if params.radius_px > 0.0 {
+        params.radius_px.min(max_radius).max(1.0)
+    } else {
+        max_radius
+    };
+    let exponent = if amount >= 0.0 {
+        1.0 + amount * 2.0
+    } else {
+        1.0 / (1.0 + (-amount) * 2.0)
+    };
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= f32::EPSILON || dist >= radius {
+                continue;
+            }
+            let t = (dist / radius).clamp(0.0, 1.0);
+            let warped_dist = radius * t.powf(exponent);
+            let sx = cx + dx / dist * warped_dist;
+            let sy = cy + dy / dist * warped_dist;
+            let sampled = sample_rgb_bilinear(src, width, height, sx, sy);
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], to_u8(sampled[c]), strength);
+            }
+        }
+    }
+    out
 }
 
 fn farthest_corner_distance(width: usize, height: usize, cx: f32, cy: f32) -> f32 {
@@ -5008,6 +5080,58 @@ mod tests {
     }
 
     #[test]
+    fn spherize_distortion_samples_toward_center() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                10, 10, 10, 77, 40, 40, 40, 77, 80, 80, 80, 77, 120, 120, 120, 77, 160, 160, 160,
+                77,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "spherize",
+            LocalMask::Full,
+            LocalEffect::PinchSpherize(PinchSpherizeParams {
+                amount: 1.0,
+                radius_px: 4.0,
+                center: [0.0, 0.0],
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[8] < src.pixels[8]);
+        assert_eq!(out.pixels[11], 77);
+    }
+
+    #[test]
+    fn pinch_distortion_samples_away_from_center() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                10, 10, 10, 77, 40, 40, 40, 77, 80, 80, 80, 77, 120, 120, 120, 77, 160, 160, 160,
+                77,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "pinch",
+            LocalMask::Full,
+            LocalEffect::PinchSpherize(PinchSpherizeParams {
+                amount: -1.0,
+                radius_px: 4.0,
+                center: [0.0, 0.0],
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[4] > src.pixels[4]);
+        assert_eq!(out.pixels[7], 77);
+    }
+
+    #[test]
     fn median_removes_isolated_speckle_and_preserves_alpha() {
         let mut pixels = vec![0_u8; 3 * 3 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -5288,6 +5412,7 @@ mod tests {
             LocalEffect::LensBlur(LensBlurParams::default()),
             LocalEffect::RadialBlur(RadialBlurParams::default()),
             LocalEffect::WaveDistortion(WaveDistortionParams::default()),
+            LocalEffect::PinchSpherize(PinchSpherizeParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),

@@ -22,9 +22,9 @@ use local_adjust_core::{
     HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams, LineKind,
     LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
     ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
-    MotionBlurParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
-    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
-    RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    MotionBlurParams, PinchSpherizeParams, PosterizeParams, RadialBlurMode, RadialBlurParams,
+    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
+    RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
     SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
     TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, VignetteParams,
     WaveDistortionMode, WaveDistortionParams, apply_layers, apply_layers_with_progress,
@@ -972,6 +972,7 @@ enum EffectKind {
     LensBlur,
     RadialBlur,
     WaveDistortion,
+    PinchSpherize,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1018,6 +1019,7 @@ impl EffectKind {
             LocalEffect::LensBlur(_) => Self::LensBlur,
             LocalEffect::RadialBlur(_) => Self::RadialBlur,
             LocalEffect::WaveDistortion(_) => Self::WaveDistortion,
+            LocalEffect::PinchSpherize(_) => Self::PinchSpherize,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1064,6 +1066,7 @@ impl EffectKind {
             Self::LensBlur => "レンズぼかし",
             Self::RadialBlur => "放射/回転ぼかし",
             Self::WaveDistortion => "波形ゆがみ",
+            Self::PinchSpherize => "つまむ/魚眼",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1121,6 +1124,9 @@ impl EffectKind {
             }
             Self::WaveDistortion => {
                 "波やさざ波のように画像を揺らし、水面・反射・熱気の表現に使います。"
+            }
+            Self::PinchSpherize => {
+                "中心を基準にふくらませたり、つまんだりして、魚眼レンズや誇張表現を作ります。"
             }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
@@ -1223,6 +1229,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::LensBlur,
             EffectKind::RadialBlur,
             EffectKind::WaveDistortion,
+            EffectKind::PinchSpherize,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Texture,
@@ -7124,6 +7131,13 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::WaveDistortion(params) => {
             format!("波形ゆがみ {:.0}px", params.amplitude_px)
         }
+        LocalEffect::PinchSpherize(params) => {
+            if params.amount >= 0.0 {
+                format!("魚眼 {:.0}%", params.amount * 100.0)
+            } else {
+                format!("つまむ {:.0}%", -params.amount * 100.0)
+            }
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -8980,6 +8994,71 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からゆがみ結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::PinchSpherize(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "魚眼") {
+                    *params = PinchSpherizeParams {
+                        amount: 0.72,
+                        radius_px: 0.0,
+                        center: [0.5, 0.5],
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ふくらむ") {
+                    *params = PinchSpherizeParams {
+                        amount: 0.45,
+                        radius_px: 260.0,
+                        center: [0.5, 0.5],
+                        strength: 0.9,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "つまむ") {
+                    *params = PinchSpherizeParams {
+                        amount: -0.65,
+                        radius_px: 260.0,
+                        center: [0.5, 0.5],
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "小顔/圧縮") {
+                    *params = PinchSpherizeParams {
+                        amount: -0.35,
+                        radius_px: 180.0,
+                        center: [0.5, 0.45],
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "中心からの距離を変えて、魚眼レンズのようなふくらみや、内側へつまむ変形を作ります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let amount = ui.add(egui::Slider::new(&mut params.amount, -1.0..=1.0).text("変形量"));
+            changed |= amount.changed();
+            amount.lab_hover_tip("正で魚眼/ふくらみ、負で中心へつまむ変形になります。");
+            let radius = ui.add(egui::Slider::new(&mut params.radius_px, 0.0..=800.0).text("半径"));
+            changed |= radius.changed();
+            radius.lab_hover_tip("効果の範囲です。0 のときは中心から画像の角までを使います。");
+            let center_x =
+                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
+            changed |= center_x.changed();
+            center_x.lab_hover_tip("変形の中心位置です。");
+            let center_y =
+                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
+            changed |= center_y.changed();
+            center_y.lab_hover_tip("変形の中心位置です。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から変形結果へどれだけ近づけるかです。");
         }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -11351,6 +11430,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::LensBlur => LocalEffect::LensBlur(LensBlurParams::default()),
         EffectKind::RadialBlur => LocalEffect::RadialBlur(RadialBlurParams::default()),
         EffectKind::WaveDistortion => LocalEffect::WaveDistortion(WaveDistortionParams::default()),
+        EffectKind::PinchSpherize => LocalEffect::PinchSpherize(PinchSpherizeParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),

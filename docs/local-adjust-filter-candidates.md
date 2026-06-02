@@ -47,13 +47,13 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、40種)
+### `LocalEffect` (部分補正レイヤー、41種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
-HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, TiltShift, LensBlur, RadialBlur, WaveDistortion, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
+HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
 GradientMap, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
 
 ### マスク種別 (併用可能・差別化の武器)
@@ -111,7 +111,7 @@ OilPaint(Kuwahara) / Sketch(Sobel) / LightLeak / 減色8機種 / CRT 3種＋複�
 ## 4. 変形・歪み系
 
 - [x] **波形 / さざ波 / ジグザグ** ★ **易〜中** — 横波 / 縦波 / さざ波 / ジグザグのサンプリングゆがみ。水面・反射・揺らぎ。背景イラストで多用 (PS / CSP)
-- [ ] **つまむ / 球面化 (魚眼)** **中** — レンズ歪み・誇張 (PS Pinch/Spherize)
+- [x] **つまむ / 球面化 (魚眼)** **中** — 中心と半径を指定する Pinch / Spherize。魚眼、ふくらみ、つまみ変形に対応 (PS Pinch/Spherize)
 - [ ] **渦巻き (Twirl)** **易** — 渦・魔法陣演出 (PS)
 - [ ] **極座標 (rect↔polar)** **中** — tiny planet・円形構図 (PS)
 - [ ] **変位マップ / ガラス** **中** — テクスチャ沿い歪み (PS Displace/Glass)
