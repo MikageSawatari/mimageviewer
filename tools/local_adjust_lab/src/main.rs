@@ -25,15 +25,15 @@ use local_adjust_core::{
     LensBlurAperture, LensBlurParams, LensCorrectionParams, LineExtractMode, LineExtractParams,
     LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
     LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
-    MosaicTileMode, MotionBlurParams, PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams,
-    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
-    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
-    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams,
-    SmartSharpenParams, SoftFocusParams, SolarizeParams, StarGlowParams, TextureParams,
-    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
-    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
-    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
-    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    MosaicTileMode, MotionBlurParams, OilPaintParams, PinchSpherizeParams, PixelStylizeMode,
+    PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
+    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
+    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
+    SharpenParams, SmartSharpenParams, SoftFocusParams, SolarizeParams, StarGlowParams,
+    TextureParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
+    ToneCurveParams, ToneParams, TwirlParams, VignetteParams, WaveDistortionMode,
+    WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -991,6 +991,7 @@ enum EffectKind {
     PixelStylize,
     Solarize,
     GlowingEdges,
+    OilPaint,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1052,6 +1053,7 @@ impl EffectKind {
             LocalEffect::PixelStylize(_) => Self::PixelStylize,
             LocalEffect::Solarize(_) => Self::Solarize,
             LocalEffect::GlowingEdges(_) => Self::GlowingEdges,
+            LocalEffect::OilPaint(_) => Self::OilPaint,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1113,6 +1115,7 @@ impl EffectKind {
             Self::PixelStylize => "粒状スタイル",
             Self::Solarize => "ソラリゼーション",
             Self::GlowingEdges => "エッジ光彩",
+            Self::OilPaint => "油彩",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1205,6 +1208,9 @@ impl EffectKind {
             Self::Solarize => "明るい部分を反転させ、写真暗室風のトーン反転や特殊色を作ります。",
             Self::GlowingEdges => {
                 "輪郭を抽出してネオン色で光らせ、黒背景や元画像上の発光線を作ります。"
+            }
+            Self::OilPaint => {
+                "Kuwahara フィルタで色面を選択的になじませ、油彩のような塗り感を作ります。"
             }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
@@ -1352,6 +1358,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::PixelStylize,
             EffectKind::Solarize,
             EffectKind::GlowingEdges,
+            EffectKind::OilPaint,
             EffectKind::Halftone,
         ],
     },
@@ -7332,6 +7339,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::GlowingEdges(params) => {
             format!("エッジ光彩 {:.0}px", params.glow_radius_px)
         }
+        LocalEffect::OilPaint(params) => format!("油彩 {:.0}px", params.radius_px),
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -10532,6 +10540,72 @@ fn draw_effect_params(
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からエッジ光彩結果へどれだけ近づけるかです。");
         }
+        LocalEffect::OilPaint(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "標準") {
+                    *params = OilPaintParams {
+                        radius_px: 5.0,
+                        saturation: 0.08,
+                        contrast: 0.04,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "厚塗り") {
+                    *params = OilPaintParams {
+                        radius_px: 8.0,
+                        saturation: 0.18,
+                        contrast: 0.14,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "柔らかめ") {
+                    *params = OilPaintParams {
+                        radius_px: 6.0,
+                        saturation: -0.04,
+                        contrast: -0.08,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "細部残し") {
+                    *params = OilPaintParams {
+                        radius_px: 3.0,
+                        saturation: 0.04,
+                        contrast: 0.0,
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "4象限の輝度分散が小さい領域を選んで平均色に置き換える Kuwahara 系の油彩化です。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let radius = ui.add(
+                egui::Slider::new(&mut params.radius_px, 1.0..=12.0)
+                    .text("半径")
+                    .suffix("px"),
+            );
+            changed |= radius.changed();
+            radius.lab_hover_tip("色面をなじませる範囲です。大きいほど厚塗り風になります。");
+            let saturation =
+                ui.add(egui::Slider::new(&mut params.saturation, -1.0..=1.0).text("彩度"));
+            changed |= saturation.changed();
+            saturation.lab_hover_tip("油彩化した色面の鮮やかさです。");
+            let contrast =
+                ui.add(egui::Slider::new(&mut params.contrast, -1.0..=1.0).text("コントラスト"));
+            changed |= contrast.changed();
+            contrast.lab_hover_tip("油彩化した色面の明暗差を締めたり柔らかくしたりします。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から油彩結果へどれだけ近づけるかです。");
+        }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -12992,6 +13066,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::PixelStylize => LocalEffect::PixelStylize(PixelStylizeParams::default()),
         EffectKind::Solarize => LocalEffect::Solarize(SolarizeParams::default()),
         EffectKind::GlowingEdges => LocalEffect::GlowingEdges(GlowingEdgesParams::default()),
+        EffectKind::OilPaint => LocalEffect::OilPaint(OilPaintParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
@@ -14859,6 +14934,7 @@ mod tests {
             EffectKind::PixelStylize,
             EffectKind::Solarize,
             EffectKind::GlowingEdges,
+            EffectKind::OilPaint,
             EffectKind::SoftFocus,
             EffectKind::Mosaic,
             EffectKind::Sharpen,

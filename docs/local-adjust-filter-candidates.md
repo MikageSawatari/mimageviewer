@@ -48,13 +48,13 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、55種)
+### `LocalEffect` (部分補正レイヤー、56種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
-HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, Emboss, PixelStylize, Solarize, GlowingEdges, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
+HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
 GradientMap, DiffuseGlow, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
 
 ### マスク種別 (併用可能・差別化の武器)
@@ -62,7 +62,7 @@ Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / Col
 Subject(被写体分離) / Segmentation
 
 ### グローバル `PostFilter` 側にあって local には無いもの (= local へ移植候補)
-OilPaint(Kuwahara) / LightLeak / 減色8機種 / CRT 3種＋複合 / カラーグレード11種
+LightLeak / 減色8機種 / CRT 3種＋複合 / カラーグレード11種
 
 ---
 
@@ -133,7 +133,7 @@ OilPaint(Kuwahara) / LightLeak / 減色8機種 / CRT 3種＋複合 / カラー�
 - [x] **結晶化 / 点描 / Facet / メゾチント** **中** — `PixelStylize`。結晶化 / 点描 / Facet / メゾチントの4モードで、セルサイズ、輪郭、色量、ばらつき、seed を調整できる粒状スタイライズ (PS Pixelate)
 - [x] **ソラリゼーション** **易** — `Solarize`。しきい値より明るいトーンを反転し、柔らかさ、反転量、色量、コントラストを調整できる反転トーン芸術効果 (PS / Krita)
 - [x] **エッジの光彩 (Glowing Edges)** **中** — `GlowingEdges`。Sobel 輪郭をネオン色で描き、線幅、光彩半径、明るさ、色相、背景残しを調整できるネオン輪郭 (PS)
-- [ ] **OilPaint を local へ移植** **易** — 既にグローバルにある資産の部分適用化 (自前)
+- [x] **OilPaint を local へ移植** **易** — `OilPaint`。既存グローバルの Kuwahara オイルペイントを補正レイヤーへ移植し、半径、彩度、コントラスト、強さを調整できるようにした (自前)
 
 ---
 

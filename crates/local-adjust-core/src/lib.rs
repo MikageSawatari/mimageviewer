@@ -444,6 +444,7 @@ pub enum LocalEffect {
     PixelStylize(PixelStylizeParams),
     Solarize(SolarizeParams),
     GlowingEdges(GlowingEdgesParams),
+    OilPaint(OilPaintParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -505,6 +506,7 @@ impl LocalEffect {
             Self::PixelStylize(_) => "粒状スタイル",
             Self::Solarize(_) => "ソラリゼーション",
             Self::GlowingEdges(_) => "エッジ光彩",
+            Self::OilPaint(_) => "油彩",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -1412,6 +1414,25 @@ impl Default for GlowingEdgesParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OilPaintParams {
+    pub radius_px: f32,
+    pub saturation: f32,
+    pub contrast: f32,
+    pub strength: f32,
+}
+
+impl Default for OilPaintParams {
+    fn default() -> Self {
+        Self {
+            radius_px: 5.0,
+            saturation: 0.0,
+            contrast: 0.0,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SoftFocusParams {
     pub radius_px: f32,
     pub strength: f32,
@@ -2225,6 +2246,9 @@ where
         LocalEffect::Solarize(params) => apply_solarize(&image.pixels, *params),
         LocalEffect::GlowingEdges(params) => {
             apply_glowing_edges(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::OilPaint(params) => {
+            apply_oil_paint(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -4210,6 +4234,174 @@ fn glowing_edges_gate(edge: f32, threshold: f32, softness: f32) -> f32 {
     } else {
         smoothstep(threshold, (threshold + softness).min(1.0), edge)
     }
+}
+
+fn apply_oil_paint(src: &[u8], width: usize, height: usize, params: OilPaintParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let radius = params.radius_px.round().clamp(1.0, 12.0) as usize;
+    let saturation = params.saturation.clamp(-1.0, 1.0);
+    let contrast = params.contrast.clamp(-1.0, 1.0);
+    let integrals = build_oil_paint_integrals(src, width, height);
+
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let mut target = oil_paint_best_region_color(&integrals, width, height, x, y, radius)
+                .unwrap_or(base);
+            target = adjust_saturation(target, 1.0 + saturation);
+            for c in &mut target {
+                *c = ((*c - 0.5) * (1.0 + contrast * 1.25) + 0.5).clamp(0.0, 1.0);
+            }
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], to_u8(target[c]), strength);
+            }
+        }
+    }
+    out
+}
+
+struct OilPaintIntegrals {
+    stride: usize,
+    count: Vec<f32>,
+    r: Vec<f32>,
+    g: Vec<f32>,
+    b: Vec<f32>,
+    luma: Vec<f32>,
+    luma_sq: Vec<f32>,
+}
+
+fn build_oil_paint_integrals(src: &[u8], width: usize, height: usize) -> OilPaintIntegrals {
+    let stride = width + 1;
+    let len = stride * (height + 1);
+    let mut integrals = OilPaintIntegrals {
+        stride,
+        count: vec![0.0; len],
+        r: vec![0.0; len],
+        g: vec![0.0; len],
+        b: vec![0.0; len],
+        luma: vec![0.0; len],
+        luma_sq: vec![0.0; len],
+    };
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let alpha = src[i + 3];
+            let (count, r, g, b, luma, luma_sq) = if alpha == 0 {
+                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            } else {
+                let r = src[i] as f32 / 255.0;
+                let g = src[i + 1] as f32 / 255.0;
+                let b = src[i + 2] as f32 / 255.0;
+                let luma = luma01(r, g, b);
+                (1.0, r, g, b, luma, luma * luma)
+            };
+            let dst = (y + 1) * stride + x + 1;
+            let left = (y + 1) * stride + x;
+            let top = y * stride + x + 1;
+            let top_left = y * stride + x;
+            integrals.count[dst] =
+                count + integrals.count[left] + integrals.count[top] - integrals.count[top_left];
+            integrals.r[dst] = r + integrals.r[left] + integrals.r[top] - integrals.r[top_left];
+            integrals.g[dst] = g + integrals.g[left] + integrals.g[top] - integrals.g[top_left];
+            integrals.b[dst] = b + integrals.b[left] + integrals.b[top] - integrals.b[top_left];
+            integrals.luma[dst] =
+                luma + integrals.luma[left] + integrals.luma[top] - integrals.luma[top_left];
+            integrals.luma_sq[dst] = luma_sq + integrals.luma_sq[left] + integrals.luma_sq[top]
+                - integrals.luma_sq[top_left];
+        }
+    }
+    integrals
+}
+
+fn oil_paint_best_region_color(
+    integrals: &OilPaintIntegrals,
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    radius: usize,
+) -> Option<[f32; 3]> {
+    let r = radius as isize;
+    let x = x as isize;
+    let y = y as isize;
+    let regions = [
+        (x - r, x, y - r, y),
+        (x, x + r, y - r, y),
+        (x - r, x, y, y + r),
+        (x, x + r, y, y + r),
+    ];
+    let mut best_color = None;
+    let mut best_var = f32::MAX;
+    for &(x0, x1, y0, y1) in &regions {
+        let stats = oil_paint_region_stats(integrals, width, height, x0, x1, y0, y1);
+        let Some((mean_rgb, variance)) = stats else {
+            continue;
+        };
+        if variance < best_var {
+            best_var = variance;
+            best_color = Some(mean_rgb);
+        }
+    }
+    best_color
+}
+
+fn oil_paint_region_stats(
+    integrals: &OilPaintIntegrals,
+    width: usize,
+    height: usize,
+    x0: isize,
+    x1: isize,
+    y0: isize,
+    y1: isize,
+) -> Option<([f32; 3], f32)> {
+    let x0 = x0.clamp(0, width.saturating_sub(1) as isize) as usize;
+    let x1 = x1.clamp(0, width.saturating_sub(1) as isize) as usize;
+    let y0 = y0.clamp(0, height.saturating_sub(1) as isize) as usize;
+    let y1 = y1.clamp(0, height.saturating_sub(1) as isize) as usize;
+    if x1 < x0 || y1 < y0 {
+        return None;
+    }
+    let count = oil_paint_integral_sum(&integrals.count, integrals.stride, x0, x1, y0, y1);
+    if count <= f32::EPSILON {
+        return None;
+    }
+    let sum_luma = oil_paint_integral_sum(&integrals.luma, integrals.stride, x0, x1, y0, y1);
+    let sum_luma_sq = oil_paint_integral_sum(&integrals.luma_sq, integrals.stride, x0, x1, y0, y1);
+    let mean_luma = sum_luma / count;
+    let variance = (sum_luma_sq / count - mean_luma * mean_luma).max(0.0);
+    Some((
+        [
+            oil_paint_integral_sum(&integrals.r, integrals.stride, x0, x1, y0, y1) / count,
+            oil_paint_integral_sum(&integrals.g, integrals.stride, x0, x1, y0, y1) / count,
+            oil_paint_integral_sum(&integrals.b, integrals.stride, x0, x1, y0, y1) / count,
+        ],
+        variance,
+    ))
+}
+
+fn oil_paint_integral_sum(
+    integral: &[f32],
+    stride: usize,
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+) -> f32 {
+    let ax = x0;
+    let ay = y0;
+    let bx = x1 + 1;
+    let by = y1 + 1;
+    integral[by * stride + bx] - integral[ay * stride + bx] - integral[by * stride + ax]
+        + integral[ay * stride + ax]
 }
 
 fn apply_artistic_media(
@@ -8237,6 +8429,7 @@ mod tests {
             LocalEffect::PixelStylize(PixelStylizeParams::default()),
             LocalEffect::Solarize(SolarizeParams::default()),
             LocalEffect::GlowingEdges(GlowingEdgesParams::default()),
+            LocalEffect::OilPaint(OilPaintParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),
@@ -8869,6 +9062,69 @@ LUT_3D_SIZE 2
                 hue_degrees: 300.0,
                 color_amount: 1.0,
                 background_amount: 0.0,
+                strength: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn oil_paint_preserves_flat_color_and_alpha() {
+        let src = RgbaImageBuf::new(
+            2,
+            2,
+            vec![
+                90, 120, 150, 44, 90, 120, 150, 55, 90, 120, 150, 66, 90, 120, 150, 77,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "oil paint",
+            LocalMask::Full,
+            LocalEffect::OilPaint(OilPaintParams {
+                radius_px: 5.0,
+                saturation: 0.0,
+                contrast: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn oil_paint_ignores_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(2, 1, vec![255, 0, 0, 0, 20, 60, 200, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "oil paint",
+            LocalMask::Full,
+            LocalEffect::OilPaint(OilPaintParams {
+                radius_px: 1.0,
+                saturation: 0.0,
+                contrast: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[4..8], &[20, 60, 200, 255]);
+    }
+
+    #[test]
+    fn oil_paint_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "oil paint",
+            LocalMask::Full,
+            LocalEffect::OilPaint(OilPaintParams {
+                radius_px: 12.0,
+                saturation: 1.0,
+                contrast: 1.0,
                 strength: 0.0,
             }),
         );
