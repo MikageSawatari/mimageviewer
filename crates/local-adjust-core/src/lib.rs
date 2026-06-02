@@ -574,6 +574,7 @@ pub enum LocalEffect {
     Equalize(EqualizeParams),
     GradientMap(GradientMapParams),
     ColorFill(ColorFillParams),
+    OutlineStroke(OutlineStrokeParams),
     ColorOverlay(ColorOverlayParams),
     NeonGlow(NeonGlowParams),
     DiffuseGlow(DiffuseGlowParams),
@@ -649,6 +650,7 @@ impl LocalEffect {
             Self::Equalize(_) => "ヒストグラム均等化",
             Self::GradientMap(_) => "グラデーションマップ",
             Self::ColorFill(_) => "塗りつぶし",
+            Self::OutlineStroke(_) => "縁取り",
             Self::ColorOverlay(_) => "塗り/グラデーション",
             Self::NeonGlow(_) => "ネオングロー",
             Self::DiffuseGlow(_) => "拡散光彩",
@@ -682,7 +684,8 @@ pub fn default_mask_application_for_effect(effect: &LocalEffect) -> MaskApplicat
         | LocalEffect::DiffuseGlow(_)
         | LocalEffect::Bloom(_)
         | LocalEffect::GodRays(_)
-        | LocalEffect::StarGlow(_) => MaskApplication {
+        | LocalEffect::StarGlow(_)
+        | LocalEffect::OutlineStroke(_) => MaskApplication {
             before_effect: true,
             after_effect: false,
         },
@@ -2094,6 +2097,42 @@ fn default_color_fill_opacity() -> f32 {
     1.0
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutlineStrokePlacement {
+    Outside,
+    Inside,
+    Center,
+}
+
+impl Default for OutlineStrokePlacement {
+    fn default() -> Self {
+        Self::Outside
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OutlineStrokeParams {
+    #[serde(default)]
+    pub placement: OutlineStrokePlacement,
+    pub width_px: f32,
+    pub softness_px: f32,
+    pub opacity: f32,
+    pub color_rgb: [u8; 3],
+}
+
+impl Default for OutlineStrokeParams {
+    fn default() -> Self {
+        Self {
+            placement: OutlineStrokePlacement::Outside,
+            width_px: 0.0,
+            softness_px: 1.0,
+            opacity: 0.0,
+            color_rgb: [0, 0, 0],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ColorOverlayShape {
@@ -3109,6 +3148,9 @@ where
             LocalEffect::ColorFill(params) => {
                 apply_color_fill(&image.pixels, image.width, image.height, *params)
             }
+            LocalEffect::OutlineStroke(params) => {
+                apply_outline_stroke(&image.pixels, image.width, image.height, *params)
+            }
             LocalEffect::ColorOverlay(params) => {
                 apply_color_overlay(&image.pixels, image.width, image.height, *params)
             }
@@ -3190,7 +3232,9 @@ where
         }
     };
     check_cancel(cancel)?;
-    if layer.mask_before_effect && !layer.mask_after_effect {
+    if matches!(&layer.effect, LocalEffect::OutlineStroke(_)) {
+        blend_rgb_with_effect_alpha_mask(&mut image.pixels, &effected, &output_mask);
+    } else if layer.mask_before_effect && !layer.mask_after_effect {
         let input = masked_input
             .as_deref()
             .expect("masked input is present when mask_before_effect is true");
@@ -7114,6 +7158,52 @@ fn apply_color_fill(src: &[u8], width: usize, height: usize, params: ColorFillPa
     out
 }
 
+fn apply_outline_stroke(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: OutlineStrokeParams,
+) -> Vec<u8> {
+    let mut out = vec![0; src.len()];
+    let opacity = params.opacity.clamp(0.0, 1.0);
+    let radius = params.width_px.round().clamp(0.0, 96.0) as i32;
+    if width == 0 || height == 0 || radius == 0 || opacity <= f32::EPSILON {
+        return out;
+    }
+
+    let alpha: Vec<f32> = src.chunks_exact(4).map(|px| px[3] as f32 / 255.0).collect();
+    let dilated = morph_alpha(&alpha, width, height, radius);
+    let eroded = morph_alpha(&alpha, width, height, -radius);
+    let mut stroke: Vec<f32> = alpha
+        .iter()
+        .zip(dilated.iter())
+        .zip(eroded.iter())
+        .map(|((a, dilated), eroded)| match params.placement {
+            OutlineStrokePlacement::Outside => (dilated - a).clamp(0.0, 1.0),
+            OutlineStrokePlacement::Inside => (a - eroded).clamp(0.0, 1.0),
+            OutlineStrokePlacement::Center => (dilated - eroded).clamp(0.0, 1.0),
+        })
+        .collect();
+
+    let softness = params.softness_px.round().clamp(0.0, 32.0) as usize;
+    if softness > 0 {
+        stroke = box_blur_alpha(&stroke, width, height, softness);
+    }
+
+    for (idx, amount) in stroke.iter().enumerate() {
+        let amount = (amount * opacity).clamp(0.0, 1.0);
+        if amount <= f32::EPSILON {
+            continue;
+        }
+        let o = idx * 4;
+        out[o] = params.color_rgb[0];
+        out[o + 1] = params.color_rgb[1];
+        out[o + 2] = params.color_rgb[2];
+        out[o + 3] = to_u8(amount);
+    }
+    out
+}
+
 fn normalized_pixel_coord(index: usize, size: usize) -> f32 {
     if size <= 1 {
         0.5
@@ -8803,6 +8893,20 @@ fn blend_rgb_with_mask(base: &mut [u8], effected: &[u8], mask: &[f32]) {
     }
 }
 
+fn blend_rgb_with_effect_alpha_mask(base: &mut [u8], effected: &[u8], mask: &[f32]) {
+    for (i, mask_amount) in mask.iter().enumerate() {
+        let o = i * 4;
+        let amount = (effected[o + 3] as f32 / 255.0 * mask_amount.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        if amount <= f32::EPSILON {
+            continue;
+        }
+        for c in 0..3 {
+            base[o + c] = lerp_u8(base[o + c], effected[o + c], amount);
+        }
+        // Keep source alpha stable; outline stroke is a visual RGB overlay.
+    }
+}
+
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0))
         .round()
@@ -9166,6 +9270,14 @@ mod tests {
         assert!(wind.mask_before_effect);
         assert!(!wind.mask_after_effect);
 
+        let outline = LocalAdjustmentLayer::new(
+            "outline",
+            LocalMask::Full,
+            LocalEffect::OutlineStroke(OutlineStrokeParams::default()),
+        );
+        assert!(outline.mask_before_effect);
+        assert!(!outline.mask_after_effect);
+
         let wave = LocalAdjustmentLayer::new(
             "wave",
             LocalMask::Full,
@@ -9243,6 +9355,35 @@ mod tests {
 
         assert_eq!(out.pixels[2 * 4], 0, "post mask should clip escaped wind");
         assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn outline_stroke_paints_outside_mask_and_preserves_alpha() {
+        let src = solid(3, 3, [200, 200, 200, 255]);
+        let mask = LocalMask::Raster(RasterMask {
+            width: 3,
+            height: 3,
+            alpha: vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        });
+        let layer = LocalAdjustmentLayer::new(
+            "outline",
+            mask,
+            LocalEffect::OutlineStroke(OutlineStrokeParams {
+                placement: OutlineStrokePlacement::Outside,
+                width_px: 1.0,
+                softness_px: 0.0,
+                opacity: 1.0,
+                color_rgb: [0, 0, 0],
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        let top_center = 1 * 4;
+        let center = (3 + 1) * 4;
+        assert_eq!(&out.pixels[top_center..top_center + 3], &[0, 0, 0]);
+        assert_eq!(&out.pixels[center..center + 3], &[200, 200, 200]);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 255));
     }
 
     #[test]
@@ -10642,6 +10783,7 @@ mod tests {
             LocalEffect::Equalize(EqualizeParams::default()),
             LocalEffect::GradientMap(GradientMapParams::default()),
             LocalEffect::ColorFill(ColorFillParams::default()),
+            LocalEffect::OutlineStroke(OutlineStrokeParams::default()),
             LocalEffect::ColorOverlay(ColorOverlayParams::default()),
             LocalEffect::NeonGlow(NeonGlowParams::default()),
             LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),

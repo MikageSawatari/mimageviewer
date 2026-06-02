@@ -28,18 +28,18 @@ use local_adjust_core::{
     LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
     LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
     MosaicTileMode, MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams,
-    OilPaintParams, PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams,
-    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
-    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
-    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, ScreenToneMode, ScreenToneParams,
-    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
-    SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask,
-    SubjectMaskRefinement, TextureParams, TextureizerMode, TextureizerParams,
-    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
-    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
-    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
-    compute_mosaic_tile_size, default_mask_application_for_effect, evaluate_layer_mask,
-    parse_cube_lut,
+    OilPaintParams, OutlineStrokeParams, OutlineStrokePlacement, PinchSpherizeParams,
+    PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
+    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
+    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, ScreenToneMode,
+    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
+    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
+    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
+    ToneCurveParams, ToneParams, TwirlParams, VignetteParams, WaveDistortionMode,
+    WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1026,6 +1026,7 @@ enum EffectKind {
     Equalize,
     GradientMap,
     ColorFill,
+    OutlineStroke,
     ColorOverlay,
     NeonGlow,
     DiffuseGlow,
@@ -1060,6 +1061,7 @@ enum RgbPickTarget {
     SpeedLinesColor,
     CloudFogColor,
     SpotlightTint,
+    OutlineStrokeColor,
 }
 
 impl RgbPickTarget {
@@ -1075,6 +1077,7 @@ impl RgbPickTarget {
             Self::SpeedLinesColor => "集中線/スピード線の線色",
             Self::CloudFogColor => "雲/霧の色",
             Self::SpotlightTint => "スポットライトの光色",
+            Self::OutlineStrokeColor => "縁取りの線色",
         }
     }
 }
@@ -1132,6 +1135,7 @@ impl EffectKind {
             LocalEffect::Equalize(_) => Self::Equalize,
             LocalEffect::GradientMap(_) => Self::GradientMap,
             LocalEffect::ColorFill(_) => Self::ColorFill,
+            LocalEffect::OutlineStroke(_) => Self::OutlineStroke,
             LocalEffect::ColorOverlay(_) => Self::ColorOverlay,
             LocalEffect::NeonGlow(_) => Self::NeonGlow,
             LocalEffect::DiffuseGlow(_) => Self::DiffuseGlow,
@@ -1207,6 +1211,7 @@ impl EffectKind {
             Self::Equalize => "ヒストグラム平坦化",
             Self::GradientMap => "グラデーションマップ",
             Self::ColorFill => "塗りつぶし",
+            Self::OutlineStroke => "縁取り",
             Self::ColorOverlay => "塗り/グラデーション",
             Self::NeonGlow => "ネオングロー",
             Self::DiffuseGlow => "拡散光彩",
@@ -1328,6 +1333,9 @@ impl EffectKind {
             Self::ColorFill => {
                 "マスク範囲を単色、線形グラデーション、円形グラデーションで塗りつぶします。"
             }
+            Self::OutlineStroke => {
+                "マスク境界から外側・内側・中央の色枠を作り、被写体のステッカー風分離に使えます。"
+            }
             Self::ColorOverlay => {
                 "単色やグラデーションの色面を、乗算・スクリーン・ソフトライトなどで重ねます。"
             }
@@ -1400,7 +1408,11 @@ struct EffectGroup {
 const EFFECT_GROUPS: &[EffectGroup] = &[
     EffectGroup {
         title: "基本",
-        kinds: &[EffectKind::None, EffectKind::ColorFill],
+        kinds: &[
+            EffectKind::None,
+            EffectKind::ColorFill,
+            EffectKind::OutlineStroke,
+        ],
     },
     EffectGroup {
         title: "色調補正",
@@ -8369,6 +8381,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 )
             }
         }
+        LocalEffect::OutlineStroke(params) => format!(
+            "縁取り {} {:.0}px",
+            outline_stroke_placement_label(params.placement),
+            params.width_px
+        ),
         LocalEffect::ColorOverlay(params) => format!(
             "塗り {} {:.0}%",
             color_overlay_blend_mode_label(params.blend_mode),
@@ -8566,6 +8583,14 @@ fn color_overlay_shape_label(shape: ColorOverlayShape) -> &'static str {
     }
 }
 
+fn outline_stroke_placement_label(placement: OutlineStrokePlacement) -> &'static str {
+    match placement {
+        OutlineStrokePlacement::Outside => "外側",
+        OutlineStrokePlacement::Inside => "内側",
+        OutlineStrokePlacement::Center => "中央",
+    }
+}
+
 fn color_overlay_blend_mode_label(mode: ColorOverlayBlendMode) -> &'static str {
     match mode {
         ColorOverlayBlendMode::Normal => "通常",
@@ -8696,6 +8721,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
         }
         (LocalEffect::Spotlight(params), RgbPickTarget::SpotlightTint) => {
             params.tint_rgb = rgb;
+            true
+        }
+        (LocalEffect::OutlineStroke(params), RgbPickTarget::OutlineStrokeColor) => {
+            params.color_rgb = rgb;
             true
         }
         _ => false,
@@ -13052,6 +13081,100 @@ fn draw_effect_params(
                 }
             }
         }
+        LocalEffect::OutlineStroke(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "黒フチ") {
+                    *params = OutlineStrokeParams {
+                        placement: OutlineStrokePlacement::Outside,
+                        width_px: 4.0,
+                        softness_px: 1.0,
+                        opacity: 1.0,
+                        color_rgb: [0, 0, 0],
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "白ステッカー") {
+                    *params = OutlineStrokeParams {
+                        placement: OutlineStrokePlacement::Outside,
+                        width_px: 8.0,
+                        softness_px: 2.0,
+                        opacity: 0.95,
+                        color_rgb: [255, 255, 255],
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "内側色線") {
+                    *params = OutlineStrokeParams {
+                        placement: OutlineStrokePlacement::Inside,
+                        width_px: 3.0,
+                        softness_px: 1.0,
+                        opacity: 0.85,
+                        color_rgb: [80, 170, 255],
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "マスク境界をもとに色枠を描きます。初期状態では前ON/後OFFなので、外側の縁取りがマスクの外へ出ます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let before_placement = params.placement;
+            lab_combo_box(
+                ui,
+                "outline_stroke_placement",
+                outline_stroke_placement_label(params.placement),
+                |ui| {
+                    for placement in [
+                        OutlineStrokePlacement::Outside,
+                        OutlineStrokePlacement::Inside,
+                        OutlineStrokePlacement::Center,
+                    ] {
+                        ui.selectable_value(
+                            &mut params.placement,
+                            placement,
+                            outline_stroke_placement_label(placement),
+                        );
+                    }
+                },
+            );
+            changed |= params.placement != before_placement;
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "線色",
+                    &mut params.color_rgb,
+                    RgbPickTarget::OutlineStrokeColor,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let width = ui.add(
+                egui::Slider::new(&mut params.width_px, 0.0..=64.0)
+                    .text("幅")
+                    .suffix("px"),
+            );
+            changed |= width.changed();
+            width.lab_hover_tip("マスク境界から作る線の太さです。0pxでは無効です。");
+            let softness = ui.add(
+                egui::Slider::new(&mut params.softness_px, 0.0..=16.0)
+                    .text("ぼかし")
+                    .suffix("px"),
+            );
+            changed |= softness.changed();
+            softness.lab_hover_tip(
+                "線の縁を柔らかくします。ステッカー風は低め、発光前の下地は高めが向きます。",
+            );
+            let opacity =
+                ui.add(egui::Slider::new(&mut params.opacity, 0.0..=1.0).text("不透明度"));
+            changed |= opacity.changed();
+            opacity.lab_hover_tip("縁取り色を元画像へ重ねる強さです。");
+        }
         LocalEffect::ColorOverlay(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -15860,6 +15983,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Equalize => LocalEffect::Equalize(EqualizeParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
         EffectKind::ColorFill => LocalEffect::ColorFill(ColorFillParams::default()),
+        EffectKind::OutlineStroke => LocalEffect::OutlineStroke(OutlineStrokeParams::default()),
         EffectKind::ColorOverlay => LocalEffect::ColorOverlay(ColorOverlayParams::default()),
         EffectKind::NeonGlow => LocalEffect::NeonGlow(NeonGlowParams::default()),
         EffectKind::DiffuseGlow => LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
@@ -18135,6 +18259,7 @@ mod tests {
         let expected = vec![
             EffectKind::None,
             EffectKind::ColorFill,
+            EffectKind::OutlineStroke,
             EffectKind::Tone,
             EffectKind::ToneCurve,
             EffectKind::RgbToneCurve,
@@ -18463,6 +18588,17 @@ mod tests {
             panic!("expected spotlight effect");
         };
         assert_eq!(spotlight_params.tint_rgb, [255, 210, 120]);
+
+        let mut outline = LocalEffect::OutlineStroke(OutlineStrokeParams::default());
+        assert!(set_rgb_pick_target(
+            &mut outline,
+            RgbPickTarget::OutlineStrokeColor,
+            [5, 6, 7],
+        ));
+        let LocalEffect::OutlineStroke(outline_params) = outline else {
+            panic!("expected outline stroke effect");
+        };
+        assert_eq!(outline_params.color_rgb, [5, 6, 7]);
 
         let mut tone = LocalEffect::Tone(ToneParams::default());
         assert!(!set_rgb_pick_target(
