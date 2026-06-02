@@ -61,14 +61,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、69種)
+### `LocalEffect` (部分補正レイヤー、70種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorFill, OutlineStroke, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, GodRays, LensFlare, CloudFog, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Halftone, ScreenTone, ColorHalftone, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
+GradientMap, ColorFill, OutlineStroke, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, GodRays, LensFlare, CloudFog, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Halftone, ScreenTone, ColorHalftone, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -201,7 +201,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 - [ ] **オールドフィルム / 古写真** ★ **易** — 傷＋退色＋ビネット＋粒状の複合プリセット (既存要素の束ね)
 
 ### 9-C. アニメ / イラスト特化の光・陰影 ★最重要
-- [ ] **ハレーション (アニメの暖色白浮き)** ★★★ **中** — 明部と肌/輪郭の境界が暖色白でにじむ。`Bloom` とは別の局所暖色ブリード。**§C で詳細設計**
+- [x] **ハレーション (`Halation`)** ★★★ **中** — 明部と肌/輪郭の境界を暖色白でにじませる。`Bloom` とは別の局所暖色ブリード。暖色、エッジ寄せ、スクリーン合成を調整できる。**§C で詳細設計**
 - [ ] **トゥーン / セルシェード量子化** ★★ **中** — 輝度を数段のフラット帯に量子化 (境界線も可)。`ポスタリゼーション` (RGB 各 ch 量子化) とは別。**§D で詳細設計**
 - [ ] **リムライト / 縁の光 追加** ★★ **中** — 被写体エッジの光源側だけ発光。既存 Subject マスク＋方向指定で実現。`縁取り` (均一枠) とは別物。**§E で詳細設計**
 - [ ] **接触影 / 簡易 AO (輪郭際の陰)** ★ **中** — エッジ内側を暗く締めて立体感を底上げ
@@ -234,7 +234,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 - [ ] **玉ボケスプライト (ハート/星形ボケ)** ★ **中** — 形状付きボケ粒子を明部に散らす。`レンズぼかし` の装飾版
 
 ### 特化系の中でのイラスト軸の推し
-1. **ハレーション** — アニメ塗り仕上げの花形なのに現リストの穴だった (§C)
+1. **ハレーション** — `Halation` として実装済み。アニメ塗り仕上げの花形 (§C)
 2. **トゥーンシェード量子化** — フォト/3D をアニメ塗り風に (§D)
 3. **リムライト追加** — 既存 Subject マスク資産が活きる (§E)
 4. **リソグラフ風** — 近年人気の質感、差別化になる (9-F)

@@ -114,6 +114,7 @@ the window.
   - HSL / hue shift
   - Look presets
   - Bloom
+  - Halation
   - God rays
   - Lens flare
   - Cloud/fog
@@ -136,7 +137,7 @@ the window.
   buttons for practical starting points, or Reset to return the current effect
   to its default values.
 - RGB color parameters in Color Fill, Outline Stroke, Color Overlay, Neon Glow,
-  Speed Lines, Cloud/Fog, and Spotlight share a
+  Halation, Speed Lines, Cloud/Fog, and Spotlight share a
   control with a color button, HEX readout, RGB sliders, and an image-click
   eyedropper.
 - Color Fill starts with a shape placeholder and full opacity. Choosing Solid,
@@ -153,9 +154,9 @@ the window.
 - Each layer has `前` and `後` mask application toggles. `前` limits the effect
   input to the mask before calculation; `後` clips the calculated result by the
   mask. Existing-style local adjustments use `前` off / `後` on, while spreading
-  effects such as Wind, Outline Stroke, Neon Glow, Diffuse Glow, Bloom, God
-  Rays, Glowing Edges, and Cross/Star Glow default to `前` on / `後` off so the
-  effect can extend past the mask.
+  effects such as Wind, Outline Stroke, Neon Glow, Diffuse Glow, Bloom,
+  Halation, God Rays, Glowing Edges, and Cross/Star Glow default to `前` on /
+  `後` off so the effect can extend past the mask.
 - 3D LUT sample files are available under `tools/local_adjust_lab/sample_luts/`.
   They are small self-made `.cube` files for quick testing of the LUT loader and
   effect strength slider.

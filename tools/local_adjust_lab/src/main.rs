@@ -22,12 +22,12 @@ use local_adjust_core::{
     ColorOverlayShape, ColorRangeMask, ColorTraceParams, CubeLutParams, CutoutParams, DehazeParams,
     DespeckleParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
     EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
-    GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalftoneParams,
-    HighPassParams, HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture,
-    LensBlurParams, LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams,
-    LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
-    LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
-    MosaicTileMode, MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams,
+    GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams,
+    HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams, InvertParams,
+    LensBlurAperture, LensBlurParams, LensCorrectionParams, LensFlareParams, LineExtractMode,
+    LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
+    LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary,
+    MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams,
     OilPaintParams, OutlineStrokeParams, OutlineStrokePlacement, PinchSpherizeParams,
     PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
     PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
@@ -1032,6 +1032,7 @@ enum EffectKind {
     NeonGlow,
     DiffuseGlow,
     Bloom,
+    Halation,
     GodRays,
     LensFlare,
     CloudFog,
@@ -1063,6 +1064,7 @@ enum RgbPickTarget {
     CloudFogColor,
     SpotlightTint,
     OutlineStrokeColor,
+    HalationTint,
 }
 
 impl RgbPickTarget {
@@ -1079,6 +1081,7 @@ impl RgbPickTarget {
             Self::CloudFogColor => "雲/霧の色",
             Self::SpotlightTint => "スポットライトの光色",
             Self::OutlineStrokeColor => "縁取りの線色",
+            Self::HalationTint => "ハレーションの暖色",
         }
     }
 }
@@ -1142,6 +1145,7 @@ impl EffectKind {
             LocalEffect::NeonGlow(_) => Self::NeonGlow,
             LocalEffect::DiffuseGlow(_) => Self::DiffuseGlow,
             LocalEffect::Bloom(_) => Self::Bloom,
+            LocalEffect::Halation(_) => Self::Halation,
             LocalEffect::GodRays(_) => Self::GodRays,
             LocalEffect::LensFlare(_) => Self::LensFlare,
             LocalEffect::CloudFog(_) => Self::CloudFog,
@@ -1219,6 +1223,7 @@ impl EffectKind {
             Self::NeonGlow => "ネオングロー",
             Self::DiffuseGlow => "拡散光彩",
             Self::Bloom => "ブルーム",
+            Self::Halation => "ハレーション",
             Self::GodRays => "光芒",
             Self::LensFlare => "レンズフレア",
             Self::CloudFog => "雲/霧",
@@ -1350,6 +1355,9 @@ impl EffectKind {
                 "明るい部分を白く柔らかく拡散し、粒状感のある夢幻的な光彩を作ります。"
             }
             Self::Bloom => "明るい部分を周囲へにじませ、発光感を足します。",
+            Self::Halation => {
+                "明るい部分と中間調の境界を暖色の白でにじませ、アニメ風の光浮きを作ります。"
+            }
             Self::GodRays => "明るい部分から光源方向に沿った放射状の光芒を作ります。",
             Self::LensFlare => "光源のにじみ、ハロー、レンズ内反射のゴーストを重ねます。",
             Self::CloudFog => "手続き型のノイズで霧や雲を重ね、大気感と遠近感を加えます。",
@@ -1514,6 +1522,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::NeonGlow,
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
+            EffectKind::Halation,
             EffectKind::GodRays,
             EffectKind::LensFlare,
             EffectKind::CloudFog,
@@ -8405,6 +8414,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
         ),
         LocalEffect::DiffuseGlow(params) => format!("拡散光彩 {:.0}px", params.radius_px),
         LocalEffect::Bloom(params) => format!("ブルーム {:.0}px", params.radius_px),
+        LocalEffect::Halation(params) => format!("ハレーション {:.0}px", params.radius_px),
         LocalEffect::GodRays(params) => format!("光芒 {:.0}px", params.length_px),
         LocalEffect::LensFlare(params) => {
             format!("レンズフレア {:.0}%", params.strength * 100.0)
@@ -8731,6 +8741,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
         }
         (LocalEffect::OutlineStroke(params), RgbPickTarget::OutlineStrokeColor) => {
             params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::Halation(params), RgbPickTarget::HalationTint) => {
+            params.tint_rgb = rgb;
             true
         }
         _ => false,
@@ -13716,6 +13730,105 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.strength, 0.0..=2.0).text("強さ"))
                 .changed();
         }
+        LocalEffect::Halation(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "アニメ光") {
+                    *params = HalationParams {
+                        threshold: 0.58,
+                        radius_px: 34.0,
+                        strength: 0.65,
+                        warmth: 0.65,
+                        tint_rgb: [255, 232, 196],
+                        edge_bias: 0.45,
+                        screen_blend: true,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "逆光にじみ") {
+                    *params = HalationParams {
+                        threshold: 0.48,
+                        radius_px: 52.0,
+                        strength: 0.85,
+                        warmth: 0.75,
+                        tint_rgb: [255, 220, 176],
+                        edge_bias: 0.25,
+                        screen_blend: true,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "輪郭白浮き") {
+                    *params = HalationParams {
+                        threshold: 0.62,
+                        radius_px: 22.0,
+                        strength: 0.70,
+                        warmth: 0.45,
+                        tint_rgb: [255, 238, 210],
+                        edge_bias: 0.85,
+                        screen_blend: true,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡く") {
+                    *params = HalationParams {
+                        threshold: 0.70,
+                        radius_px: 18.0,
+                        strength: 0.35,
+                        warmth: 0.50,
+                        tint_rgb: [255, 236, 210],
+                        edge_bias: 0.35,
+                        screen_blend: true,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "明るい部分を暖色の白へ寄せて柔らかくにじませます。エッジ寄せを上げると明暗境界の白浮きが強くなります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let threshold =
+                ui.add(egui::Slider::new(&mut params.threshold, 0.05..=0.98).text("明部しきい値"));
+            changed |= threshold.changed();
+            threshold.lab_hover_tip(
+                "ハレーションの元になる明るさです。低いほど広い範囲からにじみます。",
+            );
+            let radius = ui.add(
+                egui::Slider::new(&mut params.radius_px, 0.0..=180.0)
+                    .text("にじみ半径")
+                    .suffix("px"),
+            );
+            changed |= radius.changed();
+            radius.lab_hover_tip("暖色の白浮きをどれだけ広げるかです。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=2.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像へハレーションを重ねる強さです。");
+            let warmth = ui.add(egui::Slider::new(&mut params.warmth, 0.0..=1.0).text("暖色寄せ"));
+            changed |= warmth.changed();
+            warmth.lab_hover_tip("光をどれだけ指定した暖色へ寄せるかです。");
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "暖色",
+                    &mut params.tint_rgb,
+                    RgbPickTarget::HalationTint,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let edge_bias =
+                ui.add(egui::Slider::new(&mut params.edge_bias, 0.0..=1.0).text("エッジ寄せ"));
+            changed |= edge_bias.changed();
+            edge_bias
+                .lab_hover_tip("0で明部全体、1に近づけるほど明暗境界を優先して白浮きを作ります。");
+            let screen_blend = ui.checkbox(&mut params.screen_blend, "スクリーン合成");
+            changed |= screen_blend.changed();
+            screen_blend.lab_hover_tip("ONにすると、加算より白飛びを抑えながら発光感を出します。");
+        }
         LocalEffect::GodRays(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -16074,6 +16187,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::NeonGlow => LocalEffect::NeonGlow(NeonGlowParams::default()),
         EffectKind::DiffuseGlow => LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
+        EffectKind::Halation => LocalEffect::Halation(HalationParams::default()),
         EffectKind::GodRays => LocalEffect::GodRays(GodRaysParams::default()),
         EffectKind::LensFlare => LocalEffect::LensFlare(LensFlareParams::default()),
         EffectKind::CloudFog => LocalEffect::CloudFog(CloudFogParams::default()),
@@ -18398,6 +18512,7 @@ mod tests {
             EffectKind::NeonGlow,
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
+            EffectKind::Halation,
             EffectKind::GodRays,
             EffectKind::LensFlare,
             EffectKind::CloudFog,
@@ -18686,6 +18801,17 @@ mod tests {
             panic!("expected outline stroke effect");
         };
         assert_eq!(outline_params.color_rgb, [5, 6, 7]);
+
+        let mut halation = LocalEffect::Halation(HalationParams::default());
+        assert!(set_rgb_pick_target(
+            &mut halation,
+            RgbPickTarget::HalationTint,
+            [255, 230, 190],
+        ));
+        let LocalEffect::Halation(halation_params) = halation else {
+            panic!("expected halation effect");
+        };
+        assert_eq!(halation_params.tint_rgb, [255, 230, 190]);
 
         let mut tone = LocalEffect::Tone(ToneParams::default());
         assert!(!set_rgb_pick_target(

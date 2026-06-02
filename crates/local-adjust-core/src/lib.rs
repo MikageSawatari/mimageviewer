@@ -580,6 +580,7 @@ pub enum LocalEffect {
     NeonGlow(NeonGlowParams),
     DiffuseGlow(DiffuseGlowParams),
     Bloom(BloomParams),
+    Halation(HalationParams),
     GodRays(GodRaysParams),
     LensFlare(LensFlareParams),
     SpeedLines(SpeedLinesParams),
@@ -657,6 +658,7 @@ impl LocalEffect {
             Self::NeonGlow(_) => "ネオングロー",
             Self::DiffuseGlow(_) => "拡散光彩",
             Self::Bloom(_) => "ブルーム",
+            Self::Halation(_) => "ハレーション",
             Self::GodRays(_) => "光芒",
             Self::LensFlare(_) => "レンズフレア",
             Self::SpeedLines(_) => "集中線/スピード線",
@@ -685,6 +687,7 @@ pub fn default_mask_application_for_effect(effect: &LocalEffect) -> MaskApplicat
         | LocalEffect::NeonGlow(_)
         | LocalEffect::DiffuseGlow(_)
         | LocalEffect::Bloom(_)
+        | LocalEffect::Halation(_)
         | LocalEffect::GodRays(_)
         | LocalEffect::StarGlow(_)
         | LocalEffect::OutlineStroke(_) => MaskApplication {
@@ -2400,6 +2403,31 @@ impl Default for BloomParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HalationParams {
+    pub threshold: f32,
+    pub radius_px: f32,
+    pub strength: f32,
+    pub warmth: f32,
+    pub tint_rgb: [u8; 3],
+    pub edge_bias: f32,
+    pub screen_blend: bool,
+}
+
+impl Default for HalationParams {
+    fn default() -> Self {
+        Self {
+            threshold: 0.62,
+            radius_px: 28.0,
+            strength: 0.0,
+            warmth: 0.55,
+            tint_rgb: [255, 232, 196],
+            edge_bias: 0.35,
+            screen_blend: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GodRaysParams {
     pub center: [f32; 2],
     pub threshold: f32,
@@ -3190,6 +3218,9 @@ where
             }
             LocalEffect::Bloom(params) => {
                 apply_bloom(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Halation(params) => {
+                apply_halation(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::GodRays(params) => {
                 apply_god_rays(&image.pixels, image.width, image.height, *params)
@@ -7755,6 +7786,100 @@ fn apply_bloom(src: &[u8], width: usize, height: usize, params: BloomParams) -> 
     out
 }
 
+fn apply_halation(src: &[u8], width: usize, height: usize, params: HalationParams) -> Vec<u8> {
+    let radius = params.radius_px.round().clamp(0.0, 180.0) as usize;
+    let strength = params.strength.clamp(0.0, 2.0);
+    if radius == 0 || strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let threshold = params.threshold.clamp(0.05, 0.995);
+    let warmth = params.warmth.clamp(0.0, 1.0);
+    let edge_bias = params.edge_bias.clamp(0.0, 1.0);
+    let tint = rgb_u8_to_f32(params.tint_rgb);
+    let len = width.saturating_mul(height);
+    let mut luma = vec![0.0; len];
+    for (idx, px) in src.chunks_exact(4).enumerate() {
+        luma[idx] = luma01(
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        );
+    }
+
+    let mut bright = vec![0_u8; src.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let i = idx * 4;
+            let alpha = src[i + 3] as f32 / 255.0;
+            if alpha <= f32::EPSILON {
+                continue;
+            }
+            let gate = smoothstep(threshold, (threshold + 0.30).min(1.0), luma[idx]);
+            if gate <= f32::EPSILON {
+                continue;
+            }
+            let edge = halation_edge_signal(&luma, width, height, x, y);
+            let edge_weight = lerp_f32(1.0, edge, edge_bias);
+            let weight = gate * edge_weight * alpha;
+            if weight <= f32::EPSILON {
+                continue;
+            }
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let white_mix = 0.24 + warmth * 0.38;
+            let warmed = [
+                base[0] + (1.0 - base[0]) * white_mix,
+                base[1] + (1.0 - base[1]) * white_mix,
+                base[2] + (1.0 - base[2]) * white_mix,
+            ];
+            for c in 0..3 {
+                let source = lerp_f32(warmed[c], tint[c], warmth * 0.75);
+                bright[i + c] = to_u8(source * weight);
+            }
+            bright[i + 3] = src[i + 3];
+        }
+    }
+
+    let glow = box_blur_rgba(&bright, width, height, radius);
+    let mut out = src.to_vec();
+    for i in (0..src.len()).step_by(4) {
+        if src[i + 3] == 0 {
+            continue;
+        }
+        for c in 0..3 {
+            let base = src[i + c] as f32 / 255.0;
+            let add = (glow[i + c] as f32 / 255.0 * strength).clamp(0.0, 1.0);
+            let target = if params.screen_blend {
+                screen_channel(base, add)
+            } else {
+                (base + add).clamp(0.0, 1.0)
+            };
+            out[i + c] = to_u8(target);
+        }
+    }
+    out
+}
+
+fn halation_edge_signal(luma: &[f32], width: usize, height: usize, x: usize, y: usize) -> f32 {
+    let idx = y * width + x;
+    let center = luma[idx];
+    let left = luma[y * width + x.saturating_sub(1)];
+    let right = luma[y * width + (x + 1).min(width - 1)];
+    let top = luma[y.saturating_sub(1) * width + x];
+    let bottom = luma[(y + 1).min(height - 1) * width + x];
+    let delta = (center - left)
+        .abs()
+        .max((center - right).abs())
+        .max((center - top).abs())
+        .max((center - bottom).abs());
+    smoothstep(0.02, 0.22, delta)
+}
+
 fn apply_god_rays(src: &[u8], width: usize, height: usize, params: GodRaysParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 3.0);
     let length = params.length_px.clamp(1.0, 360.0);
@@ -9370,6 +9495,14 @@ mod tests {
         assert!(wind.mask_before_effect);
         assert!(!wind.mask_after_effect);
 
+        let halation = LocalAdjustmentLayer::new(
+            "halation",
+            LocalMask::Full,
+            LocalEffect::Halation(HalationParams::default()),
+        );
+        assert!(halation.mask_before_effect);
+        assert!(!halation.mask_after_effect);
+
         let outline = LocalAdjustmentLayer::new(
             "outline",
             LocalMask::Full,
@@ -10922,6 +11055,7 @@ mod tests {
             LocalEffect::NeonGlow(NeonGlowParams::default()),
             LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
+            LocalEffect::Halation(HalationParams::default()),
             LocalEffect::GodRays(GodRaysParams::default()),
             LocalEffect::LensFlare(LensFlareParams::default()),
             LocalEffect::SpeedLines(SpeedLinesParams::default()),
@@ -11954,6 +12088,35 @@ LUT_3D_SIZE 2
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert!(out.pixels[0] > src.pixels[0]);
         assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn halation_spreads_warm_light_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 20, 20, 77, 255, 255, 255, 77, 20, 20, 20, 77],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "halation",
+            LocalMask::Full,
+            LocalEffect::Halation(HalationParams {
+                threshold: 0.50,
+                radius_px: 1.0,
+                strength: 1.5,
+                warmth: 1.0,
+                tint_rgb: [255, 220, 176],
+                edge_bias: 0.0,
+                screen_blend: true,
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert!(out.pixels[0] >= out.pixels[2]);
+        assert_eq!(out.pixels[3], 77);
     }
 
     #[test]
