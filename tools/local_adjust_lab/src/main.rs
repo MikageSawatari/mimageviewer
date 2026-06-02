@@ -1489,6 +1489,7 @@ struct LocalAdjustLabApp {
     radial_gradient_drag_active: bool,
     effect_gradient_drag_active: bool,
     tilt_shift_drag_active: bool,
+    effect_position_handles_visible: bool,
     boundary_edge_threshold: f32,
     boundary_ink_threshold: f32,
     boundary_gap_px: f32,
@@ -1572,6 +1573,7 @@ impl LocalAdjustLabApp {
             radial_gradient_drag_active: false,
             effect_gradient_drag_active: false,
             tilt_shift_drag_active: false,
+            effect_position_handles_visible: true,
             boundary_edge_threshold: 24.0,
             boundary_ink_threshold: 28.0,
             boundary_gap_px: 2.0,
@@ -4291,6 +4293,17 @@ impl LocalAdjustLabApp {
             } else {
                 self.draw_effect_gradient_handles(ui, rect)
             };
+        let effect_position_handle_used = if pan_mode
+            || !adjust_panel_active
+            || dialog_open
+            || !self.effect_position_handles_visible
+            || self.selective_color_pick_active
+            || self.rgb_pick_active.is_some()
+        {
+            false
+        } else {
+            self.draw_effect_position_handles(ui, rect)
+        };
         let gradient_handle_used =
             if pan_mode || !adjust_panel_active || dialog_open || effect_gradient_active {
                 false
@@ -4325,7 +4338,10 @@ impl LocalAdjustLabApp {
             let pointer = ui.input(|i| i.pointer.interact_pos());
             if let Some(pointer_screen) = pointer {
                 let pos = screen_to_image(rect, img_w, img_h, pointer_screen);
-                if !effect_gradient_handle_used && !gradient_handle_used && !tilt_shift_handle_used
+                if !effect_gradient_handle_used
+                    && !effect_position_handle_used
+                    && !gradient_handle_used
+                    && !tilt_shift_handle_used
                 {
                     if let Some(pos) = pos {
                         if self.selective_color_pick_active {
@@ -4890,8 +4906,10 @@ impl LocalAdjustLabApp {
         let mut request_selective_color_pick_cancel = false;
         let mut request_rgb_pick = None;
         let mut request_rgb_pick_cancel = false;
+        let mut request_effect_position_handles_visible = None;
         let selective_color_pick_active = self.selective_color_pick_active;
         let rgb_pick_active = self.rgb_pick_active;
+        let effect_position_handles_visible = self.effect_position_handles_visible;
         if let Some(layer) = self.selected_layer_mut() {
             let response = draw_effect_params(
                 ui,
@@ -4899,12 +4917,14 @@ impl LocalAdjustLabApp {
                 dims,
                 selective_color_pick_active,
                 rgb_pick_active,
+                effect_position_handles_visible,
             );
             request_cube_lut_load = response.load_cube_lut;
             request_selective_color_pick = response.start_selective_color_pick;
             request_selective_color_pick_cancel = response.cancel_selective_color_pick;
             request_rgb_pick = response.start_rgb_pick;
             request_rgb_pick_cancel = response.cancel_rgb_pick;
+            request_effect_position_handles_visible = response.set_effect_position_handles_visible;
             if response.changed {
                 self.hide_mask_preview();
                 self.mark_dirty();
@@ -4933,6 +4953,9 @@ impl LocalAdjustLabApp {
         if request_rgb_pick_cancel {
             self.rgb_pick_active = None;
             self.status = "RGBスポイトを解除しました。".to_string();
+        }
+        if let Some(visible) = request_effect_position_handles_visible {
+            self.effect_position_handles_visible = visible;
         }
     }
 
@@ -6679,6 +6702,63 @@ impl LocalAdjustLabApp {
         used
     }
 
+    fn draw_effect_position_handles(&mut self, ui: &mut egui::Ui, rect: Rect) -> bool {
+        let Some(layer_idx) = self
+            .layers
+            .get(self.selected_layer)
+            .map(|_| self.selected_layer)
+        else {
+            return false;
+        };
+
+        let mut changed = false;
+        let mut used = false;
+        let painter = ui.painter().clone();
+        match &mut self.layers[layer_idx].effect {
+            LocalEffect::GodRays(params) => {
+                let center = norm_to_screen(rect, params.center);
+                let (center_changed, center_used) = drag_norm_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("god_rays_center", layer_idx)),
+                    center,
+                    &mut params.center,
+                    "光源位置",
+                );
+                changed |= center_changed;
+                used |= center_used;
+
+                let center = norm_to_screen(rect, params.center);
+                let guide_stroke =
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 245, 170, 170));
+                let handle_stroke = egui::Stroke::new(2.0, Color32::from_rgb(45, 35, 10));
+                painter.circle_filled(center, 7.0, Color32::from_rgb(255, 238, 145));
+                painter.circle_stroke(center, 7.0, handle_stroke);
+                painter.line_segment(
+                    [
+                        Pos2::new(center.x - 14.0, center.y),
+                        Pos2::new(center.x + 14.0, center.y),
+                    ],
+                    guide_stroke,
+                );
+                painter.line_segment(
+                    [
+                        Pos2::new(center.x, center.y - 14.0),
+                        Pos2::new(center.x, center.y + 14.0),
+                    ],
+                    guide_stroke,
+                );
+            }
+            _ => {}
+        }
+
+        if changed {
+            self.hide_mask_preview();
+            self.mark_dirty();
+        }
+        used
+    }
+
     fn draw_tilt_shift_handles(&mut self, ui: &mut egui::Ui, rect: Rect) -> bool {
         let Some(layer_idx) = self
             .layers
@@ -8377,6 +8457,7 @@ struct EffectParamResponse {
     cancel_selective_color_pick: bool,
     start_rgb_pick: Option<RgbPickTarget>,
     cancel_rgb_pick: bool,
+    set_effect_position_handles_visible: Option<bool>,
 }
 
 fn draw_effect_params(
@@ -8385,6 +8466,7 @@ fn draw_effect_params(
     image_dims: (usize, usize),
     selective_color_pick_active: bool,
     rgb_pick_active: Option<RgbPickTarget>,
+    effect_position_handles_visible: bool,
 ) -> EffectParamResponse {
     let mut changed = false;
     let mut load_cube_lut = false;
@@ -8392,6 +8474,7 @@ fn draw_effect_params(
     let mut cancel_selective_color_pick = false;
     let mut start_rgb_pick = None;
     let mut cancel_rgb_pick = false;
+    let mut set_effect_position_handles_visible = None;
     let effect_kind = EffectKind::from_effect(&layer.effect);
     let has_effect = !matches!(&layer.effect, LocalEffect::None);
     ui.horizontal(|ui| {
@@ -8418,6 +8501,7 @@ fn draw_effect_params(
             cancel_selective_color_pick,
             start_rgb_pick,
             cancel_rgb_pick,
+            set_effect_position_handles_visible,
         };
     }
     match &mut layer.effect {
@@ -13004,6 +13088,14 @@ fn draw_effect_params(
                 .size(10.0)
                 .color(Color32::from_gray(170)),
             );
+            let mut show_handles = effect_position_handles_visible;
+            let handle_toggle = ui.checkbox(&mut show_handles, "画像ハンドルを表示");
+            if handle_toggle.changed() {
+                set_effect_position_handles_visible = Some(show_handles);
+            }
+            handle_toggle.lab_hover_tip(
+                "ONの間、画像上の光源ハンドルをドラッグして中心位置を調整できます。",
+            );
             let center_x =
                 ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
             changed |= center_x.changed();
@@ -13514,6 +13606,7 @@ fn draw_effect_params(
         cancel_selective_color_pick,
         start_rgb_pick,
         cancel_rgb_pick,
+        set_effect_position_handles_visible,
     }
 }
 

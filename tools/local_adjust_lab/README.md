@@ -133,6 +133,9 @@ the window.
   Linear Gradient, or Radial Gradient immediately makes the fill visible.
 - Linear and radial gradients in Color Fill and Color Overlay can be adjusted
   with the same canvas drag handles used by gradient-like mask/effect controls.
+- God Rays can show a canvas handle for dragging the light source position
+  directly on the image; turn the handle off from the effect panel when it gets
+  in the way.
 - 3D LUT sample files are available under `tools/local_adjust_lab/sample_luts/`.
   They are small self-made `.cube` files for quick testing of the LUT loader and
   effect strength slider.
