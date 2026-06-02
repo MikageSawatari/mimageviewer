@@ -1047,6 +1047,8 @@ impl MosaicParams {
 pub struct SharpenParams {
     pub amount: f32,
     pub radius_px: f32,
+    #[serde(default)]
+    pub threshold: f32,
 }
 
 impl Default for SharpenParams {
@@ -1054,6 +1056,7 @@ impl Default for SharpenParams {
         Self {
             amount: 0.0,
             radius_px: 1.0,
+            threshold: 0.0,
         }
     }
 }
@@ -1681,6 +1684,7 @@ where
             image.height,
             params.radius_px.round().max(0.0) as usize,
             params.amount.clamp(0.0, 2.0),
+            params.threshold.clamp(0.0, 255.0),
         ),
         LocalEffect::Hsl(params) => apply_hsl(&image.pixels, *params),
         LocalEffect::ColorMixer(params) => apply_color_mixer(&image.pixels, *params),
@@ -3041,17 +3045,43 @@ fn apply_mosaic_with_mask(
     out
 }
 
-fn apply_sharpen(src: &[u8], width: usize, height: usize, radius: usize, amount: f32) -> Vec<u8> {
+fn apply_sharpen(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    radius: usize,
+    amount: f32,
+    threshold: f32,
+) -> Vec<u8> {
     if radius == 0 || amount <= f32::EPSILON {
         return src.to_vec();
     }
     let blur = box_blur_rgba(src, width, height, radius);
     let mut out = src.to_vec();
     for i in (0..src.len()).step_by(4) {
+        let details = [
+            src[i] as f32 - blur[i] as f32,
+            src[i + 1] as f32 - blur[i + 1] as f32,
+            src[i + 2] as f32 - blur[i + 2] as f32,
+        ];
+        let detail_strength = details
+            .iter()
+            .fold(0.0_f32, |max, detail| max.max(detail.abs()));
+        let gate = if threshold <= f32::EPSILON {
+            1.0
+        } else if detail_strength <= threshold {
+            0.0
+        } else {
+            1.0 - threshold / detail_strength
+        };
+        if gate <= f32::EPSILON {
+            continue;
+        }
         for c in 0..3 {
             let base = src[i + c] as f32;
-            let low = blur[i + c] as f32;
-            out[i + c] = (base + (base - low) * amount).round().clamp(0.0, 255.0) as u8;
+            out[i + c] = (base + details[c] * amount * gate)
+                .round()
+                .clamp(0.0, 255.0) as u8;
         }
     }
     out
@@ -4854,6 +4884,56 @@ mod tests {
             }),
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[8] > src.pixels[8]);
+        assert_eq!(out.pixels[11], 255);
+    }
+
+    #[test]
+    fn sharpen_threshold_suppresses_low_contrast_detail() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                100, 100, 100, 255, 102, 102, 102, 255, 100, 100, 100, 255, 102, 102, 102, 255,
+                100, 100, 100, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "sharpen",
+            LocalMask::Full,
+            LocalEffect::Sharpen(SharpenParams {
+                amount: 2.0,
+                radius_px: 1.0,
+                threshold: 8.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn sharpen_threshold_keeps_strong_edges() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                40, 40, 40, 255, 40, 40, 40, 255, 220, 220, 220, 255, 220, 220, 220, 255, 220, 220,
+                220, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "sharpen",
+            LocalMask::Full,
+            LocalEffect::Sharpen(SharpenParams {
+                amount: 1.0,
+                radius_px: 1.0,
+                threshold: 20.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[4] < src.pixels[4]);
         assert!(out.pixels[8] > src.pixels[8]);
         assert_eq!(out.pixels[11], 255);
     }

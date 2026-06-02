@@ -53,7 +53,7 @@ RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライ�
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
-HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, TiltShift, LensBlur, RadialBlur, SoftFocus, Mosaic, Sharpen, Look(15プリセット),
+HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, TiltShift, LensBlur, RadialBlur, SoftFocus, Mosaic, Sharpen(radius/threshold), Look(15プリセット),
 GradientMap, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
 
 ### マスク種別 (併用可能・差別化の武器)
@@ -103,7 +103,7 @@ OilPaint(Kuwahara) / Sketch(Sobel) / LightLeak / 減色8機種 / CRT 3種＋複�
 
 - [x] **テクスチャ (中周波ディテール)** ★ **易** — Clarity と別系統。Lightroom は両方持つ
 - [x] **ハイパス** ★ **易** — シャープ/ディテール抽出の定番テクニック。中間グレー抽出表示と、Overlay 合成による細部強調を持つ (PS Other)
-- [ ] **アンシャープマスク フル制御 (radius/threshold)** **易** — 現 `Sharpen` を高機能化 (全ソフト)
+- [x] **アンシャープマスク フル制御 (radius/threshold)** **易** — 現 `Sharpen` を高機能化。しきい値で低コントラストのノイズを避けられる (全ソフト)
 - [ ] **スマートシャープ (deconvolution 寄り)** **中** — エッジ保持シャープ (PS)
 
 ---

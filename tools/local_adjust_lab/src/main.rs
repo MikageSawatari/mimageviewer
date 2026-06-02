@@ -7111,7 +7111,17 @@ fn effect_summary(effect: &LocalEffect) -> String {
             "モザイク {}",
             mosaic_tile_mode_label(params.effective_tile_mode())
         ),
-        LocalEffect::Sharpen(params) => format!("シャープ {:.0}%", params.amount * 100.0),
+        LocalEffect::Sharpen(params) => {
+            if params.threshold > 0.0 {
+                format!(
+                    "シャープ {:.0}% / しきい値 {:.0}",
+                    params.amount * 100.0,
+                    params.threshold
+                )
+            } else {
+                format!("シャープ {:.0}%", params.amount * 100.0)
+            }
+        }
         LocalEffect::Hsl(params) => format!("色相 {:+.0}°", params.hue_degrees),
         LocalEffect::ColorMixer(params) => {
             format!("カラーミキサー {}色", color_mixer_adjusted_count(params))
@@ -8985,6 +8995,7 @@ fn draw_effect_params(
                     *params = SharpenParams {
                         amount: 0.35,
                         radius_px: 1.0,
+                        threshold: 0.0,
                     };
                     changed = true;
                 }
@@ -8992,6 +9003,7 @@ fn draw_effect_params(
                     *params = SharpenParams {
                         amount: 0.7,
                         radius_px: 1.0,
+                        threshold: 4.0,
                     };
                     changed = true;
                 }
@@ -8999,16 +9011,34 @@ fn draw_effect_params(
                     *params = SharpenParams {
                         amount: 0.55,
                         radius_px: 2.0,
+                        threshold: 8.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ノイズ抑制") {
+                    *params = SharpenParams {
+                        amount: 0.95,
+                        radius_px: 1.5,
+                        threshold: 12.0,
                     };
                     changed = true;
                 }
             });
-            changed |= ui
-                .add(egui::Slider::new(&mut params.amount, 0.0..=2.0).text("量"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(&mut params.radius_px, 0.0..=8.0).text("半径"))
-                .changed();
+            let amount = ui.add(egui::Slider::new(&mut params.amount, 0.0..=2.0).text("量"));
+            changed |= amount.changed();
+            amount
+                .lab_hover_tip("輪郭へ足し戻す強さです。上げすぎると白黒の縁が出やすくなります。");
+            let radius = ui.add(egui::Slider::new(&mut params.radius_px, 0.0..=12.0).text("半径"));
+            changed |= radius.changed();
+            radius.lab_hover_tip(
+                "輪郭として扱う幅です。小さい値は細部、大きい値は太い輪郭に効きます。",
+            );
+            let threshold =
+                ui.add(egui::Slider::new(&mut params.threshold, 0.0..=64.0).text("しきい値"));
+            changed |= threshold.changed();
+            threshold.lab_hover_tip(
+                "小さな明暗差を無視する量です。値を上げるとノイズや微妙なざらつきに効きにくくなります。",
+            );
         }
         LocalEffect::Hsl(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
