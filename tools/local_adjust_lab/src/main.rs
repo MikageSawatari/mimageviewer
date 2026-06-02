@@ -6744,7 +6744,120 @@ impl LocalAdjustLabApp {
         let mut changed = false;
         let mut used = false;
         let painter = ui.painter().clone();
+        let image_dims = self.image_dims().unwrap_or((1, 1));
+        let source_px_scale = screen_px_per_source_px(rect, image_dims);
         match &mut self.layers[layer_idx].effect {
+            LocalEffect::RadialBlur(params) => {
+                let (center_changed, center_used, center) = draw_effect_center_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("radial_blur_center", layer_idx)),
+                    &mut params.center,
+                    "放射ぼかし中心",
+                    Color32::from_rgb(185, 235, 255),
+                );
+                changed |= center_changed;
+                used |= center_used;
+
+                let guide_stroke =
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 220, 255, 130));
+                painter.circle_stroke(center, 18.0, guide_stroke);
+            }
+            LocalEffect::WaveDistortion(params) if params.mode == WaveDistortionMode::Ripple => {
+                let (center_changed, center_used, center) = draw_effect_center_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("wave_distortion_center", layer_idx)),
+                    &mut params.center,
+                    "波形中心",
+                    Color32::from_rgb(170, 235, 255),
+                );
+                changed |= center_changed;
+                used |= center_used;
+
+                let stroke =
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 220, 255, 115));
+                for radius in [24.0, 48.0, 72.0] {
+                    painter.circle_stroke(center, radius, stroke);
+                }
+            }
+            LocalEffect::PinchSpherize(params) => {
+                let (center_changed, center_used, center) = draw_effect_center_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("pinch_spherize_center", layer_idx)),
+                    &mut params.center,
+                    "つまむ/魚眼中心",
+                    Color32::from_rgb(185, 235, 255),
+                );
+                changed |= center_changed;
+                used |= center_used;
+                draw_effect_source_radius(
+                    &painter,
+                    rect,
+                    center,
+                    params.radius_px,
+                    source_px_scale,
+                    Color32::from_rgba_unmultiplied(120, 220, 255, 150),
+                );
+            }
+            LocalEffect::Twirl(params) => {
+                let (center_changed, center_used, center) = draw_effect_center_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("twirl_center", layer_idx)),
+                    &mut params.center,
+                    "渦巻き中心",
+                    Color32::from_rgb(190, 225, 255),
+                );
+                changed |= center_changed;
+                used |= center_used;
+                draw_effect_source_radius(
+                    &painter,
+                    rect,
+                    center,
+                    params.radius_px,
+                    source_px_scale,
+                    Color32::from_rgba_unmultiplied(130, 205, 255, 150),
+                );
+            }
+            LocalEffect::PolarCoordinates(params) => {
+                let (center_changed, center_used, center) = draw_effect_center_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("polar_coordinates_center", layer_idx)),
+                    &mut params.center,
+                    "極座標中心",
+                    Color32::from_rgb(190, 225, 255),
+                );
+                changed |= center_changed;
+                used |= center_used;
+                draw_effect_source_radius(
+                    &painter,
+                    rect,
+                    center,
+                    params.radius_px,
+                    source_px_scale,
+                    Color32::from_rgba_unmultiplied(130, 205, 255, 150),
+                );
+            }
+            LocalEffect::LensCorrection(params) => {
+                let (center_changed, center_used, center) = draw_effect_center_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("lens_correction_center", layer_idx)),
+                    &mut params.center,
+                    "レンズ補正中心",
+                    Color32::from_rgb(190, 225, 255),
+                );
+                changed |= center_changed;
+                used |= center_used;
+
+                let stroke =
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(150, 215, 255, 125));
+                let radius = rect.width().min(rect.height()) * 0.18;
+                painter.circle_stroke(center, radius.max(2.0), stroke);
+            }
             LocalEffect::GodRays(params) => {
                 let center = norm_to_screen(rect, params.center);
                 let (center_changed, center_used) = drag_norm_handle(
@@ -6778,6 +6891,64 @@ impl LocalAdjustLabApp {
                     ],
                     guide_stroke,
                 );
+            }
+            LocalEffect::LensFlare(params) => {
+                let (center_changed, center_used, center) = draw_effect_center_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("lens_flare_center", layer_idx)),
+                    &mut params.center,
+                    "フレア光源位置",
+                    Color32::from_rgb(255, 232, 135),
+                );
+                changed |= center_changed;
+                used |= center_used;
+
+                draw_effect_source_radius(
+                    &painter,
+                    rect,
+                    center,
+                    params.radius_px,
+                    source_px_scale,
+                    Color32::from_rgba_unmultiplied(255, 226, 130, 145),
+                );
+                let guide_stroke =
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 245, 170, 135));
+                painter.line_segment(
+                    [
+                        Pos2::new(center.x - 28.0, center.y),
+                        Pos2::new(center.x + 28.0, center.y),
+                    ],
+                    guide_stroke,
+                );
+            }
+            LocalEffect::SpeedLines(params) => {
+                let (center_changed, center_used, center) = draw_effect_center_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("speed_lines_center", layer_idx)),
+                    &mut params.center,
+                    "集中線/スピード線中心",
+                    Color32::from_rgb(215, 250, 255),
+                );
+                changed |= center_changed;
+                used |= center_used;
+
+                let stroke =
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(160, 235, 255, 130));
+                match params.mode {
+                    SpeedLinesMode::Radial => {
+                        let max_radius = distance_to_farthest_rect_corner(center, rect).max(1.0);
+                        painter.circle_stroke(center, max_radius * params.inner_radius, stroke);
+                        painter.circle_stroke(center, max_radius * params.outer_radius, stroke);
+                    }
+                    SpeedLinesMode::Parallel => {
+                        let angle = params.angle_degrees.to_radians();
+                        let dir = egui::vec2(angle.cos(), angle.sin());
+                        let half = rect.width().hypot(rect.height()) * 0.5;
+                        painter.line_segment([center - dir * half, center + dir * half], stroke);
+                    }
+                }
             }
             LocalEffect::Spotlight(params) => {
                 let center = norm_to_screen(rect, params.center);
@@ -8118,6 +8289,25 @@ fn effect_summary(effect: &LocalEffect) -> String {
     }
 }
 
+fn effect_has_position_handles(effect: &LocalEffect) -> bool {
+    matches!(
+        effect,
+        LocalEffect::RadialBlur(_)
+            | LocalEffect::WaveDistortion(WaveDistortionParams {
+                mode: WaveDistortionMode::Ripple,
+                ..
+            })
+            | LocalEffect::PinchSpherize(_)
+            | LocalEffect::Twirl(_)
+            | LocalEffect::PolarCoordinates(_)
+            | LocalEffect::LensCorrection(_)
+            | LocalEffect::GodRays(_)
+            | LocalEffect::LensFlare(_)
+            | LocalEffect::SpeedLines(_)
+            | LocalEffect::Spotlight(_)
+    )
+}
+
 fn screen_tone_mode_label(mode: ScreenToneMode) -> &'static str {
     match mode {
         ScreenToneMode::Dots => "網点",
@@ -8600,6 +8790,15 @@ fn draw_effect_params(
             cancel_rgb_pick,
             set_effect_position_handles_visible,
         };
+    }
+    if effect_has_position_handles(&layer.effect) {
+        let mut show_handles = effect_position_handles_visible;
+        let handle_toggle = ui.checkbox(&mut show_handles, "画像ハンドルを表示");
+        if handle_toggle.changed() {
+            set_effect_position_handles_visible = Some(show_handles);
+        }
+        handle_toggle
+            .lab_hover_tip("ONの間、画像上の位置ハンドルをドラッグして中心位置を調整できます。");
     }
     match &mut layer.effect {
         LocalEffect::None => {
@@ -13185,14 +13384,6 @@ fn draw_effect_params(
                 .size(10.0)
                 .color(Color32::from_gray(170)),
             );
-            let mut show_handles = effect_position_handles_visible;
-            let handle_toggle = ui.checkbox(&mut show_handles, "画像ハンドルを表示");
-            if handle_toggle.changed() {
-                set_effect_position_handles_visible = Some(show_handles);
-            }
-            handle_toggle.lab_hover_tip(
-                "ONの間、画像上の光源ハンドルをドラッグして中心位置を調整できます。",
-            );
             let center_x =
                 ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
             changed |= center_x.changed();
@@ -13478,14 +13669,6 @@ fn draw_effect_params(
                 )
                 .size(10.0)
                 .color(Color32::from_gray(170)),
-            );
-            let mut show_handles = effect_position_handles_visible;
-            let handle_toggle = ui.checkbox(&mut show_handles, "画像ハンドルを表示");
-            if handle_toggle.changed() {
-                set_effect_position_handles_visible = Some(show_handles);
-            }
-            handle_toggle.lab_hover_tip(
-                "ONの間、画像上のスポットライトハンドルをドラッグして中心位置を調整できます。",
             );
             let center_x =
                 ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
@@ -17087,6 +17270,78 @@ fn screen_to_norm(rect: Rect, p: Pos2) -> [f32; 2] {
     ]
 }
 
+fn screen_px_per_source_px(rect: Rect, image_dims: (usize, usize)) -> f32 {
+    let sx = rect.width() / image_dims.0.max(1) as f32;
+    let sy = rect.height() / image_dims.1.max(1) as f32;
+    (sx + sy) * 0.5
+}
+
+fn distance_to_farthest_rect_corner(center: Pos2, rect: Rect) -> f32 {
+    [
+        rect.left_top(),
+        rect.right_top(),
+        rect.left_bottom(),
+        rect.right_bottom(),
+    ]
+    .into_iter()
+    .map(|corner| center.distance(corner))
+    .fold(0.0, f32::max)
+}
+
+fn draw_effect_center_handle(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    id: egui::Id,
+    center: &mut [f32; 2],
+    label: &str,
+    fill: Color32,
+) -> (bool, bool, Pos2) {
+    let center_screen = norm_to_screen(rect, *center);
+    let (changed, used) = drag_norm_handle(ui, rect, id, center_screen, center, label);
+    let center_screen = norm_to_screen(rect, *center);
+    let painter = ui.painter();
+    let guide = egui::Stroke::new(
+        1.0,
+        Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 145),
+    );
+    let stroke = egui::Stroke::new(2.0, Color32::from_rgb(10, 30, 36));
+    painter.circle_filled(center_screen, 7.0, fill);
+    painter.circle_stroke(center_screen, 7.0, stroke);
+    painter.line_segment(
+        [
+            Pos2::new(center_screen.x - 14.0, center_screen.y),
+            Pos2::new(center_screen.x + 14.0, center_screen.y),
+        ],
+        guide,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(center_screen.x, center_screen.y - 14.0),
+            Pos2::new(center_screen.x, center_screen.y + 14.0),
+        ],
+        guide,
+    );
+    (changed, used, center_screen)
+}
+
+fn draw_effect_source_radius(
+    painter: &egui::Painter,
+    rect: Rect,
+    center: Pos2,
+    radius_px: f32,
+    source_px_scale: f32,
+    color: Color32,
+) {
+    let radius = if radius_px > 0.0 {
+        radius_px * source_px_scale
+    } else {
+        distance_to_farthest_rect_corner(center, rect)
+    };
+    if radius > 1.5 {
+        painter.circle_stroke(center, radius, egui::Stroke::new(1.0, color));
+    }
+}
+
 fn mask_preview_active(adjust_panel_active: bool, show_mask: bool, alt_down: bool) -> bool {
     adjust_panel_active && (show_mask != alt_down)
 }
@@ -17659,6 +17914,56 @@ mod tests {
         for kind in expected {
             let count = grouped.iter().filter(|&&item| item == kind).count();
             assert_eq!(count, 1, "effect group count for {}", kind.label());
+        }
+    }
+
+    #[test]
+    fn image_space_center_effects_have_position_handles() {
+        let mut ripple = WaveDistortionParams::default();
+        ripple.mode = WaveDistortionMode::Ripple;
+
+        let handled = [
+            LocalEffect::RadialBlur(RadialBlurParams::default()),
+            LocalEffect::WaveDistortion(ripple),
+            LocalEffect::PinchSpherize(PinchSpherizeParams::default()),
+            LocalEffect::Twirl(TwirlParams::default()),
+            LocalEffect::PolarCoordinates(PolarCoordinatesParams::default()),
+            LocalEffect::LensCorrection(LensCorrectionParams::default()),
+            LocalEffect::GodRays(GodRaysParams::default()),
+            LocalEffect::LensFlare(LensFlareParams::default()),
+            LocalEffect::SpeedLines(SpeedLinesParams::default()),
+            LocalEffect::Spotlight(SpotlightParams::default()),
+        ];
+        for effect in handled {
+            assert!(
+                effect_has_position_handles(&effect),
+                "expected position handles for {}",
+                effect_summary(&effect)
+            );
+        }
+
+        let mut horizontal_wave = WaveDistortionParams::default();
+        horizontal_wave.mode = WaveDistortionMode::Horizontal;
+
+        let separate_or_non_position = [
+            LocalEffect::WaveDistortion(horizontal_wave),
+            LocalEffect::ColorFill(ColorFillParams {
+                shape: ColorOverlayShape::Radial,
+                ..Default::default()
+            }),
+            LocalEffect::ColorOverlay(ColorOverlayParams {
+                shape: ColorOverlayShape::Radial,
+                ..Default::default()
+            }),
+            LocalEffect::TiltShift(TiltShiftParams::default()),
+            LocalEffect::Tone(ToneParams::default()),
+        ];
+        for effect in separate_or_non_position {
+            assert!(
+                !effect_has_position_handles(&effect),
+                "unexpected position handles for {}",
+                effect_summary(&effect)
+            );
         }
     }
 

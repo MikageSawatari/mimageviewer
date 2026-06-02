@@ -137,9 +137,13 @@ the window.
   Linear Gradient, or Radial Gradient immediately makes the fill visible.
 - Linear and radial gradients in Color Fill and Color Overlay can be adjusted
   with the same canvas drag handles used by gradient-like mask/effect controls.
-- God Rays and Spotlight can show canvas handles for dragging the light source
-  position directly on the image; turn the handle off from the effect panel when
-  it gets in the way.
+- Effects with image-space center or light-source parameters can show canvas
+  handles for direct dragging on the image. God Rays, Lens Flare, Spotlight,
+  Speed Lines, Radial Blur, Ripple Wave Distortion, Pinch/Spherize, Twirl,
+  Polar Coordinates, and Lens Correction share the `画像ハンドルを表示` toggle;
+  turn it off from the effect panel when it gets in the way. Gradient-like
+  effects use the gradient handle system, and Tilt Shift keeps its dedicated
+  range handles.
 - 3D LUT sample files are available under `tools/local_adjust_lab/sample_luts/`.
   They are small self-made `.cube` files for quick testing of the LUT loader and
   effect strength slider.
