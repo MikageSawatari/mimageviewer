@@ -20,17 +20,17 @@ use local_adjust_core::{
     CubeLutParams, DehazeParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EqualizeParams,
     FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams, GradientMapParams,
     GradientMapPreset, HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams,
-    InvertParams, LensBlurAperture, LensBlurParams, LineKind, LinearGradientMask,
-    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
-    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
-    PinchSpherizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
-    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
-    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
-    SharpenParams, SmartSharpenParams, SoftFocusParams, StarGlowParams, TextureParams,
-    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
-    ToneParams, TwirlParams, VignetteParams, WaveDistortionMode, WaveDistortionParams,
-    apply_layers, apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask,
-    parse_cube_lut,
+    InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LineKind,
+    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
+    ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
+    MotionBlurParams, PinchSpherizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
+    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
+    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
+    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
+    StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
+    TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams, WaveDistortionMode,
+    WaveDistortionParams, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -978,6 +978,7 @@ enum EffectKind {
     Twirl,
     PolarCoordinates,
     GlassDisplacement,
+    LensCorrection,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1028,6 +1029,7 @@ impl EffectKind {
             LocalEffect::Twirl(_) => Self::Twirl,
             LocalEffect::PolarCoordinates(_) => Self::PolarCoordinates,
             LocalEffect::GlassDisplacement(_) => Self::GlassDisplacement,
+            LocalEffect::LensCorrection(_) => Self::LensCorrection,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1078,6 +1080,7 @@ impl EffectKind {
             Self::Twirl => "渦巻き",
             Self::PolarCoordinates => "極座標",
             Self::GlassDisplacement => "ガラス/変位",
+            Self::LensCorrection => "レンズ補正",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1147,6 +1150,9 @@ impl EffectKind {
             }
             Self::GlassDisplacement => {
                 "手続き型の変位マップで画像をずらし、すりガラスや波打つガラス越しの歪みを作ります。"
+            }
+            Self::LensCorrection => {
+                "樽型・糸巻き型のレンズ歪みを補正し、必要なら周辺減光も持ち上げます。"
             }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
@@ -1253,6 +1259,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Twirl,
             EffectKind::PolarCoordinates,
             EffectKind::GlassDisplacement,
+            EffectKind::LensCorrection,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Texture,
@@ -7177,6 +7184,18 @@ fn effect_summary(effect: &LocalEffect) -> String {
             };
             format!("ガラス変位 {mode} {:.0}px", params.displacement_px)
         }
+        LocalEffect::LensCorrection(params) => {
+            if params.distortion.abs() > f32::EPSILON {
+                let mode = if params.distortion >= 0.0 {
+                    "樽型補正"
+                } else {
+                    "糸巻き補正"
+                };
+                format!("レンズ補正 {mode} {:.0}%", params.distortion.abs() * 100.0)
+            } else {
+                format!("周辺減光補正 {:.0}%", params.vignette_correction * 100.0)
+            }
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -9372,6 +9391,84 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からガラス変位結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::LensCorrection(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "樽型補正") {
+                    *params = LensCorrectionParams {
+                        distortion: 0.35,
+                        zoom: 0.06,
+                        center: [0.5, 0.5],
+                        vignette_correction: 0.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "糸巻き補正") {
+                    *params = LensCorrectionParams {
+                        distortion: -0.35,
+                        zoom: 0.03,
+                        center: [0.5, 0.5],
+                        vignette_correction: 0.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "広角強め") {
+                    *params = LensCorrectionParams {
+                        distortion: 0.62,
+                        zoom: 0.14,
+                        center: [0.5, 0.5],
+                        vignette_correction: 0.12,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "周辺減光補正") {
+                    *params = LensCorrectionParams {
+                        distortion: 0.0,
+                        zoom: 0.0,
+                        center: [0.5, 0.5],
+                        vignette_correction: 0.48,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "中心から外側へ向かうレンズ歪みを補正します。ズームは補正後の端の伸びやにじみを切るために使います。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let distortion =
+                ui.add(egui::Slider::new(&mut params.distortion, -1.0..=1.0).text("歪み補正"));
+            changed |= distortion.changed();
+            distortion.lab_hover_tip("正で樽型歪みの補正、負で糸巻き歪みの補正です。");
+            let vignette = ui.add(
+                egui::Slider::new(&mut params.vignette_correction, -1.0..=1.0).text("周辺減光補正"),
+            );
+            changed |= vignette.changed();
+            vignette.lab_hover_tip(
+                "正で周辺を持ち上げ、負で周辺を落とします。写真補正では正側を使います。",
+            );
+            let zoom =
+                ui.add(egui::Slider::new(&mut params.zoom, 0.0..=0.5).text("ズーム/切り抜き"));
+            changed |= zoom.changed();
+            zoom.lab_hover_tip("歪み補正で端が伸びるとき、少し拡大して端を切ります。");
+            let center_x =
+                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
+            changed |= center_x.changed();
+            center_x.lab_hover_tip("レンズ補正の中心位置です。");
+            let center_y =
+                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
+            changed |= center_y.changed();
+            center_y.lab_hover_tip("レンズ補正の中心位置です。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からレンズ補正結果へどれだけ近づけるかです。");
         }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -11751,6 +11848,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::GlassDisplacement => {
             LocalEffect::GlassDisplacement(GlassDisplacementParams::default())
         }
+        EffectKind::LensCorrection => LocalEffect::LensCorrection(LensCorrectionParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),

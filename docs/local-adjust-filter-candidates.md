@@ -47,13 +47,13 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、44種)
+### `LocalEffect` (部分補正レイヤー、45種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
-HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
+HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
 GradientMap, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
 
 ### マスク種別 (併用可能・差別化の武器)
@@ -115,7 +115,7 @@ OilPaint(Kuwahara) / Sketch(Sobel) / LightLeak / 減色8機種 / CRT 3種＋複�
 - [x] **渦巻き (Twirl)** **易** — 中心・半径・回転量を指定する渦巻き変形。渦・魔法陣演出 (PS)
 - [x] **極座標 (rect↔polar)** **中** — 矩形→円形 / 円形→矩形、中心・半径・角度オフセット・内外反転を指定。tiny planet・円形構図 (PS)
 - [x] **変位マップ / ガラス** **中** — 手続き型の変位マップでサンプル位置をずらす GlassDisplacement。すりガラス / 波ガラス / 面ガラスに対応 (PS Displace/Glass)
-- [ ] **レンズ補正 (樽型/糸巻き/周辺減光除去)** **中** — 写真の幾何補正 (PS / Lightroom)
+- [x] **レンズ補正 (樽型/糸巻き/周辺減光除去)** **中** — `LensCorrection`。樽型/糸巻き補正、ズーム/切り抜き、中心調整、周辺減光補正に対応 (PS / Lightroom)
 - [ ] **ゆがみ / ワープ (Liquify)** **難** — 部分プッシュ/膨張で比率調整。効果大だが対話 UI が必要 (= フィルタ枠を超える大物) (PS / CSP)
 
 ---

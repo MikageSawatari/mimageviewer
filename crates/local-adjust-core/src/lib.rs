@@ -434,6 +434,7 @@ pub enum LocalEffect {
     Twirl(TwirlParams),
     PolarCoordinates(PolarCoordinatesParams),
     GlassDisplacement(GlassDisplacementParams),
+    LensCorrection(LensCorrectionParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -484,6 +485,7 @@ impl LocalEffect {
             Self::Twirl(_) => "渦巻き",
             Self::PolarCoordinates(_) => "極座標",
             Self::GlassDisplacement(_) => "ガラス変位",
+            Self::LensCorrection(_) => "レンズ補正",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -1082,6 +1084,28 @@ impl Default for GlassDisplacementParams {
             detail: 0.5,
             angle_degrees: 0.0,
             seed: 1,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LensCorrectionParams {
+    /// Positive values correct barrel distortion; negative values correct pincushion distortion.
+    pub distortion: f32,
+    pub zoom: f32,
+    pub center: [f32; 2],
+    pub vignette_correction: f32,
+    pub strength: f32,
+}
+
+impl Default for LensCorrectionParams {
+    fn default() -> Self {
+        Self {
+            distortion: 0.0,
+            zoom: 0.0,
+            center: [0.5, 0.5],
+            vignette_correction: 0.0,
             strength: 0.0,
         }
     }
@@ -1852,6 +1876,9 @@ where
         }
         LocalEffect::GlassDisplacement(params) => {
             apply_glass_displacement(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::LensCorrection(params) => {
+            apply_lens_correction(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -3461,6 +3488,62 @@ fn glass_value_noise(x: f32, y: f32, seed: u32) -> f32 {
     let top = lerp_f32(n00, n10, tx);
     let bottom = lerp_f32(n01, n11, tx);
     lerp_f32(top, bottom, ty)
+}
+
+fn apply_lens_correction(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: LensCorrectionParams,
+) -> Vec<u8> {
+    let distortion = params.distortion.clamp(-1.0, 1.0);
+    let zoom = params.zoom.clamp(0.0, 0.5);
+    let vignette = params.vignette_correction.clamp(-1.0, 1.0);
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0
+        || height == 0
+        || strength <= f32::EPSILON
+        || (distortion.abs() <= f32::EPSILON
+            && zoom <= f32::EPSILON
+            && vignette.abs() <= f32::EPSILON)
+    {
+        return src.to_vec();
+    }
+    let cx = (width.saturating_sub(1)) as f32 * params.center[0].clamp(0.0, 1.0);
+    let cy = (height.saturating_sub(1)) as f32 * params.center[1].clamp(0.0, 1.0);
+    let radius = farthest_corner_distance(width, height, cx, cy).max(1.0);
+    let zoom_scale = 1.0 / (1.0 + zoom);
+    let k1 = distortion * 0.72;
+    let k2 = distortion.abs() * distortion * 0.18;
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let dx = (x as f32 - cx) * zoom_scale;
+            let dy = (y as f32 - cy) * zoom_scale;
+            let r = ((dx * dx + dy * dy).sqrt() / radius).clamp(0.0, 1.0);
+            let r2 = r * r;
+            let radial_scale = (1.0 + k1 * r2 + k2 * r2 * r2).max(0.05);
+            let sx = cx + dx * radial_scale;
+            let sy = cy + dy * radial_scale;
+            let mut sampled = sample_rgb_bilinear(src, width, height, sx, sy);
+            if vignette.abs() > f32::EPSILON {
+                let edge = smoothstep(0.18, 1.0, r);
+                for c in &mut sampled {
+                    if vignette >= 0.0 {
+                        *c += (1.0 - *c) * vignette * edge * 0.75;
+                    } else {
+                        *c *= 1.0 + vignette * edge * 0.75;
+                    }
+                    *c = (*c).clamp(0.0, 1.0);
+                }
+            }
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], to_u8(sampled[c]), strength);
+            }
+        }
+    }
+    out
 }
 
 fn farthest_corner_distance(width: usize, height: usize, cx: f32, cy: f32) -> f32 {
@@ -5636,6 +5719,77 @@ mod tests {
     }
 
     #[test]
+    fn lens_correction_barrel_samples_outward_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                10, 10, 10, 77, 40, 40, 40, 77, 80, 80, 80, 77, 120, 120, 120, 77, 160, 160, 160,
+                77,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "lens",
+            LocalMask::Full,
+            LocalEffect::LensCorrection(LensCorrectionParams {
+                distortion: 1.0,
+                zoom: 0.0,
+                center: [0.0, 0.0],
+                vignette_correction: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let mid = 2 * 4;
+        assert!(out.pixels[mid] > src.pixels[mid]);
+        assert_eq!(out.pixels[mid + 3], 77);
+    }
+
+    #[test]
+    fn lens_correction_vignette_lifts_edges() {
+        let src =
+            RgbaImageBuf::new(3, 1, vec![80, 80, 80, 55, 80, 80, 80, 55, 80, 80, 80, 55]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "lens",
+            LocalMask::Full,
+            LocalEffect::LensCorrection(LensCorrectionParams {
+                distortion: 0.0,
+                zoom: 0.0,
+                center: [0.5, 0.5],
+                vignette_correction: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > out.pixels[4]);
+        assert_eq!(out.pixels[3], 55);
+    }
+
+    #[test]
+    fn lens_correction_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "lens",
+            LocalMask::Full,
+            LocalEffect::LensCorrection(LensCorrectionParams {
+                distortion: 0.75,
+                zoom: 0.12,
+                center: [0.5, 0.5],
+                vignette_correction: 0.5,
+                strength: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn median_removes_isolated_speckle_and_preserves_alpha() {
         let mut pixels = vec![0_u8; 3 * 3 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -5920,6 +6074,7 @@ mod tests {
             LocalEffect::Twirl(TwirlParams::default()),
             LocalEffect::PolarCoordinates(PolarCoordinatesParams::default()),
             LocalEffect::GlassDisplacement(GlassDisplacementParams::default()),
+            LocalEffect::LensCorrection(LensCorrectionParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),
