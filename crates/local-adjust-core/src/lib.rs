@@ -9556,6 +9556,7 @@ fn nearest_pixel_index(width: usize, height: usize, x: f32, y: f32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     fn solid(width: usize, height: usize, rgba: [u8; 4]) -> RgbaImageBuf {
         let mut pixels = Vec::with_capacity(width * height * 4);
@@ -9563,6 +9564,43 @@ mod tests {
             pixels.extend_from_slice(&rgba);
         }
         RgbaImageBuf::new(width, height, pixels).unwrap()
+    }
+
+    fn patterned(width: usize, height: usize) -> RgbaImageBuf {
+        let mut pixels = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let checker = if (x / 4 + y / 4) % 2 == 0 { 48 } else { 206 };
+                let r = ((x * 9 + y * 3 + checker) % 256) as u8;
+                let g = ((x * 5 + y * 11 + 64) % 256) as u8;
+                let b = ((x * 13 + y * 7 + 118) % 256) as u8;
+                let a = if x == 0 || y == 0 || x + 1 == width || y + 1 == height {
+                    0
+                } else {
+                    255
+                };
+                pixels.extend_from_slice(&[r, g, b, a]);
+            }
+        }
+        RgbaImageBuf::new(width, height, pixels).unwrap()
+    }
+
+    fn center_rect_mask(width: usize, height: usize) -> LocalMask {
+        let mut alpha = vec![0.0; width * height];
+        let x0 = width / 4;
+        let x1 = width - x0;
+        let y0 = height / 4;
+        let y1 = height - y0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                alpha[y * width + x] = 1.0;
+            }
+        }
+        LocalMask::Raster(RasterMask {
+            width,
+            height,
+            alpha,
+        })
     }
 
     #[test]
@@ -11469,6 +11507,694 @@ mod tests {
             let layer = LocalAdjustmentLayer::new("identity", LocalMask::Full, effect);
             let out = apply_layers(src.as_ref(), &[layer]).unwrap();
             assert_eq!(out.pixels, src.pixels);
+        }
+    }
+
+    #[test]
+    fn risky_max_parameter_effects_finish_quickly() {
+        struct RiskyEffectCase {
+            name: &'static str,
+            mask: LocalMask,
+            effect: LocalEffect,
+        }
+
+        let width = 48;
+        let height = 40;
+        let src = patterned(width, height);
+        let full = |name, effect| RiskyEffectCase {
+            name,
+            mask: LocalMask::Full,
+            effect,
+        };
+        let masked = |name, effect| RiskyEffectCase {
+            name,
+            mask: center_rect_mask(width, height),
+            effect,
+        };
+        let cases = vec![
+            full(
+                "clarity max radius",
+                LocalEffect::Clarity(ClarityParams {
+                    amount: 1.0,
+                    radius_px: 96.0,
+                }),
+            ),
+            full(
+                "texture max radius",
+                LocalEffect::Texture(TextureParams {
+                    amount: 1.0,
+                    radius_px: 96.0,
+                }),
+            ),
+            full(
+                "high pass max radius",
+                LocalEffect::HighPass(HighPassParams {
+                    amount: 2.0,
+                    radius_px: 96.0,
+                    contrast: 4.0,
+                    detail_only: false,
+                }),
+            ),
+            full(
+                "dehaze max radius",
+                LocalEffect::Dehaze(DehazeParams {
+                    amount: 1.0,
+                    radius_px: 48.0,
+                    min_transmission: 0.01,
+                    saturation: 100.0,
+                }),
+            ),
+            full(
+                "blur large radius",
+                LocalEffect::Blur(BlurParams { radius_px: 240.0 }),
+            ),
+            full(
+                "motion blur max distance",
+                LocalEffect::MotionBlur(MotionBlurParams {
+                    distance_px: 240.0,
+                    angle_degrees: 35.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "wind max distance",
+                LocalEffect::Wind(WindParams {
+                    direction: WindDirection::Right,
+                    source: WindSource::Edge,
+                    distance_px: 240.0,
+                    threshold: 0.0,
+                    softness: 0.001,
+                    turbulence: 1.0,
+                    strength: 1.0,
+                    seed: 7,
+                }),
+            ),
+            full(
+                "tilt shift max blur",
+                LocalEffect::TiltShift(TiltShiftParams {
+                    mode: TiltShiftMode::Radial,
+                    range_initialized: true,
+                    radius: [0.24, 0.32],
+                    max_radius_px: 160.0,
+                    strength: 1.0,
+                    ..Default::default()
+                }),
+            ),
+            full(
+                "lens blur max radius",
+                LocalEffect::LensBlur(LensBlurParams {
+                    radius_px: 96.0,
+                    aperture: LensBlurAperture::Octagon,
+                    rotation_degrees: 15.0,
+                    highlight_threshold: 0.0,
+                    highlight_boost: 3.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "radial zoom blur max samples",
+                LocalEffect::RadialBlur(RadialBlurParams {
+                    mode: RadialBlurMode::Zoom,
+                    center: [0.35, 0.42],
+                    zoom_px: 240.0,
+                    spin_degrees: 0.0,
+                    samples: 65,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "radial spin blur max samples",
+                LocalEffect::RadialBlur(RadialBlurParams {
+                    mode: RadialBlurMode::Spin,
+                    center: [0.52, 0.48],
+                    zoom_px: 0.0,
+                    spin_degrees: 180.0,
+                    samples: 65,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "ripple wave max amplitude",
+                LocalEffect::WaveDistortion(WaveDistortionParams {
+                    mode: WaveDistortionMode::Ripple,
+                    amplitude_px: 240.0,
+                    wavelength_px: 2.0,
+                    phase_degrees: 270.0,
+                    center: [0.5, 0.5],
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "zigzag wave max amplitude",
+                LocalEffect::WaveDistortion(WaveDistortionParams {
+                    mode: WaveDistortionMode::Zigzag,
+                    amplitude_px: 240.0,
+                    wavelength_px: 2.0,
+                    phase_degrees: 180.0,
+                    center: [0.5, 0.5],
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "spherize full radius",
+                LocalEffect::PinchSpherize(PinchSpherizeParams {
+                    amount: 1.0,
+                    radius_px: 0.0,
+                    center: [0.5, 0.5],
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "pinch full radius",
+                LocalEffect::PinchSpherize(PinchSpherizeParams {
+                    amount: -1.0,
+                    radius_px: 0.0,
+                    center: [0.5, 0.5],
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "twirl max angle",
+                LocalEffect::Twirl(TwirlParams {
+                    angle_degrees: 1080.0,
+                    radius_px: 0.0,
+                    center: [0.5, 0.5],
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "polar rect to polar full radius",
+                LocalEffect::PolarCoordinates(PolarCoordinatesParams {
+                    mode: PolarCoordinatesMode::RectToPolar,
+                    center: [0.5, 0.5],
+                    radius_px: 0.0,
+                    angle_offset_degrees: 360.0,
+                    invert_radius: true,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "polar to rect full radius",
+                LocalEffect::PolarCoordinates(PolarCoordinatesParams {
+                    mode: PolarCoordinatesMode::PolarToRect,
+                    center: [0.5, 0.5],
+                    radius_px: 0.0,
+                    angle_offset_degrees: -360.0,
+                    invert_radius: true,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "glass frosted max displacement",
+                LocalEffect::GlassDisplacement(GlassDisplacementParams {
+                    mode: GlassDisplacementMode::Frosted,
+                    displacement_px: 240.0,
+                    scale_px: 2.0,
+                    detail: 1.0,
+                    angle_degrees: 45.0,
+                    seed: 5,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "glass ripple max displacement",
+                LocalEffect::GlassDisplacement(GlassDisplacementParams {
+                    mode: GlassDisplacementMode::Ripple,
+                    displacement_px: 240.0,
+                    scale_px: 2.0,
+                    detail: 1.0,
+                    angle_degrees: 45.0,
+                    seed: 6,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "glass faceted max displacement",
+                LocalEffect::GlassDisplacement(GlassDisplacementParams {
+                    mode: GlassDisplacementMode::Faceted,
+                    displacement_px: 240.0,
+                    scale_px: 2.0,
+                    detail: 1.0,
+                    angle_degrees: 45.0,
+                    seed: 7,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "lens correction max warp",
+                LocalEffect::LensCorrection(LensCorrectionParams {
+                    distortion: 1.0,
+                    zoom: 1.0,
+                    center: [0.45, 0.55],
+                    vignette_correction: 1.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "line extract max thickness",
+                LocalEffect::LineExtract(LineExtractParams {
+                    mode: LineExtractMode::LightenOriginal,
+                    threshold: 0.0,
+                    softness: 0.001,
+                    thickness_px: 8.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "artistic watercolor max radius",
+                LocalEffect::ArtisticMedia(ArtisticMediaParams {
+                    mode: ArtisticMediaMode::Watercolor,
+                    radius_px: 48.0,
+                    edge_strength: 1.0,
+                    texture: 1.0,
+                    color_amount: 1.0,
+                    strength: 1.0,
+                    seed: 1,
+                }),
+            ),
+            full(
+                "artistic pencil max texture",
+                LocalEffect::ArtisticMedia(ArtisticMediaParams {
+                    mode: ArtisticMediaMode::PencilSketch,
+                    radius_px: 48.0,
+                    edge_strength: 1.0,
+                    texture: 1.0,
+                    color_amount: 1.0,
+                    strength: 1.0,
+                    seed: 2,
+                }),
+            ),
+            full(
+                "brush dry max length",
+                LocalEffect::BrushStroke(BrushStrokeParams {
+                    mode: BrushStrokeMode::DryBrush,
+                    length_px: 96.0,
+                    radius_px: 16.0,
+                    angle_degrees: -35.0,
+                    texture: 1.0,
+                    edge_strength: 1.0,
+                    color_amount: 1.0,
+                    strength: 1.0,
+                    seed: 3,
+                }),
+            ),
+            full(
+                "brush daubs max radius",
+                LocalEffect::BrushStroke(BrushStrokeParams {
+                    mode: BrushStrokeMode::PaintDaubs,
+                    length_px: 96.0,
+                    radius_px: 16.0,
+                    angle_degrees: 20.0,
+                    texture: 1.0,
+                    edge_strength: 1.0,
+                    color_amount: 1.0,
+                    strength: 1.0,
+                    seed: 4,
+                }),
+            ),
+            full(
+                "brush palette knife max radius",
+                LocalEffect::BrushStroke(BrushStrokeParams {
+                    mode: BrushStrokeMode::PaletteKnife,
+                    length_px: 96.0,
+                    radius_px: 16.0,
+                    angle_degrees: 10.0,
+                    texture: 1.0,
+                    edge_strength: 1.0,
+                    color_amount: 1.0,
+                    strength: 1.0,
+                    seed: 5,
+                }),
+            ),
+            full(
+                "cutout max radius",
+                LocalEffect::Cutout(CutoutParams {
+                    levels: 12,
+                    radius_px: 32.0,
+                    edge_strength: 1.0,
+                    color_amount: 1.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "pixel crystallize dense cells",
+                LocalEffect::PixelStylize(PixelStylizeParams {
+                    mode: PixelStylizeMode::Crystallize,
+                    cell_px: 1.0,
+                    edge_strength: 1.0,
+                    color_amount: 1.0,
+                    randomness: 1.0,
+                    strength: 1.0,
+                    seed: 8,
+                }),
+            ),
+            full(
+                "pixel pointillize dense cells",
+                LocalEffect::PixelStylize(PixelStylizeParams {
+                    mode: PixelStylizeMode::Pointillize,
+                    cell_px: 1.0,
+                    edge_strength: 1.0,
+                    color_amount: 1.0,
+                    randomness: 1.0,
+                    strength: 1.0,
+                    seed: 9,
+                }),
+            ),
+            full(
+                "pixel facet dense cells",
+                LocalEffect::PixelStylize(PixelStylizeParams {
+                    mode: PixelStylizeMode::Facet,
+                    cell_px: 1.0,
+                    edge_strength: 1.0,
+                    color_amount: 1.0,
+                    randomness: 1.0,
+                    strength: 1.0,
+                    seed: 10,
+                }),
+            ),
+            full(
+                "glowing edges max glow",
+                LocalEffect::GlowingEdges(GlowingEdgesParams {
+                    threshold: 0.0,
+                    softness: 1.0,
+                    edge_width_px: 12.0,
+                    glow_radius_px: 120.0,
+                    edge_brightness: 3.0,
+                    glow_strength: 3.0,
+                    hue_degrees: 280.0,
+                    color_amount: 1.0,
+                    background_amount: 1.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "oil paint max radius",
+                LocalEffect::OilPaint(OilPaintParams {
+                    radius_px: 12.0,
+                    saturation: 1.0,
+                    contrast: 1.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "soft focus large radius",
+                LocalEffect::SoftFocus(SoftFocusParams {
+                    radius_px: 240.0,
+                    strength: 1.0,
+                }),
+            ),
+            masked(
+                "mosaic dense mask-shape tiles",
+                LocalEffect::Mosaic(MosaicParams {
+                    tile_mode: MosaicTileMode::FixedPx(4),
+                    boundary: MosaicBoundary::MaskShape,
+                    block_px: 0,
+                }),
+            ),
+            full(
+                "sharpen max radius",
+                LocalEffect::Sharpen(SharpenParams {
+                    amount: 2.0,
+                    radius_px: 96.0,
+                    threshold: 0.0,
+                }),
+            ),
+            full(
+                "smart sharpen max radius",
+                LocalEffect::SmartSharpen(SmartSharpenParams {
+                    amount: 2.0,
+                    radius_px: 96.0,
+                    edge_threshold: 0.0,
+                    halo_suppression: 1.0,
+                }),
+            ),
+            masked(
+                "outline stroke max center width",
+                LocalEffect::OutlineStroke(OutlineStrokeParams {
+                    placement: OutlineStrokePlacement::Center,
+                    width_px: 96.0,
+                    softness_px: 32.0,
+                    opacity: 1.0,
+                    color_rgb: [0, 0, 0],
+                }),
+            ),
+            full(
+                "color trace max sample radius",
+                LocalEffect::ColorTrace(ColorTraceParams {
+                    strength: 1.0,
+                    line_threshold: 0.0,
+                    softness: 0.001,
+                    sample_radius_px: 64.0,
+                    darkness: 1.0,
+                    saturation: 2.0,
+                }),
+            ),
+            full(
+                "neon glow max radii",
+                LocalEffect::NeonGlow(NeonGlowParams {
+                    threshold: 0.05,
+                    by_saturation: true,
+                    inner_radius_px: 96.0,
+                    outer_radius_px: 180.0,
+                    strength: 2.0,
+                    inner_amount: 2.0,
+                    outer_amount: 2.0,
+                    glow_saturation: 2.0,
+                    tint_rgb: [0, 220, 255],
+                    tint_strength: 1.0,
+                    screen_blend: true,
+                    source_color_enabled: true,
+                    source_rgb: [0, 220, 255],
+                    source_tolerance: 1.0,
+                    source_feather: 1.0,
+                }),
+            ),
+            full(
+                "diffuse glow max radius",
+                LocalEffect::DiffuseGlow(DiffuseGlowParams {
+                    threshold: 0.0,
+                    radius_px: 120.0,
+                    strength: 2.0,
+                    white_mix: 1.0,
+                    grain: 1.0,
+                    seed: 11,
+                }),
+            ),
+            full(
+                "bloom max radius",
+                LocalEffect::Bloom(BloomParams {
+                    threshold: 0.90,
+                    radius_px: 120.0,
+                    strength: 2.0,
+                }),
+            ),
+            full(
+                "halation max radius",
+                LocalEffect::Halation(HalationParams {
+                    threshold: 0.05,
+                    radius_px: 180.0,
+                    strength: 2.0,
+                    warmth: 1.0,
+                    tint_rgb: [255, 232, 196],
+                    edge_bias: 1.0,
+                    screen_blend: true,
+                }),
+            ),
+            full(
+                "god rays max length",
+                LocalEffect::GodRays(GodRaysParams {
+                    center: [0.15, 0.12],
+                    threshold: 0.0,
+                    length_px: 360.0,
+                    decay: 1.0,
+                    strength: 3.0,
+                    warm_tint: 1.0,
+                }),
+            ),
+            full(
+                "lens flare max radius",
+                LocalEffect::LensFlare(LensFlareParams {
+                    center: [0.15, 0.18],
+                    radius_px: 420.0,
+                    strength: 3.0,
+                    core_strength: 2.0,
+                    halo_strength: 2.0,
+                    ghost_strength: 2.0,
+                    streak_strength: 2.0,
+                    warm_tint: 1.0,
+                }),
+            ),
+            full(
+                "speed lines max radial lines",
+                LocalEffect::SpeedLines(SpeedLinesParams {
+                    mode: SpeedLinesMode::Radial,
+                    center: [0.5, 0.5],
+                    angle_degrees: 0.0,
+                    line_count: 360,
+                    line_width_px: 32.0,
+                    length: 1.0,
+                    inner_radius: 0.0,
+                    outer_radius: 1.0,
+                    softness: 1.0,
+                    strength: 1.0,
+                    color_rgb: [255, 255, 255],
+                    seed: 12,
+                }),
+            ),
+            full(
+                "speed lines max parallel lines",
+                LocalEffect::SpeedLines(SpeedLinesParams {
+                    mode: SpeedLinesMode::Parallel,
+                    center: [0.5, 0.5],
+                    angle_degrees: -25.0,
+                    line_count: 360,
+                    line_width_px: 32.0,
+                    length: 1.0,
+                    inner_radius: 0.0,
+                    outer_radius: 1.0,
+                    softness: 1.0,
+                    strength: 1.0,
+                    color_rgb: [255, 255, 255],
+                    seed: 13,
+                }),
+            ),
+            full(
+                "cloud fog max density",
+                LocalEffect::CloudFog(CloudFogParams {
+                    mode: CloudFogMode::Clouds,
+                    scale_px: 2.0,
+                    detail: 1.0,
+                    density: 1.0,
+                    contrast: 1.0,
+                    height_fade: 1.0,
+                    opacity: 1.0,
+                    color_rgb: [235, 242, 255],
+                    seed: 14,
+                }),
+            ),
+            full(
+                "film grain max amount",
+                LocalEffect::FilmGrain(FilmGrainParams {
+                    amount: 1.0,
+                    size_px: 32,
+                    seed: 15,
+                }),
+            ),
+            full(
+                "gaussian noise max amount",
+                LocalEffect::Noise(NoiseParams {
+                    amount: 1.0,
+                    distribution: NoiseDistribution::Gaussian,
+                    monochrome: false,
+                    seed: 16,
+                }),
+            ),
+            full(
+                "chromatic aberration max offset",
+                LocalEffect::ChromaticAberration(ChromaticAberrationParams { offset_px: 24.0 }),
+            ),
+            full(
+                "halftone dense cells",
+                LocalEffect::Halftone(HalftoneParams {
+                    cell_px: 2,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "screen tone crosshatch dense cells",
+                LocalEffect::ScreenTone(ScreenToneParams {
+                    mode: ScreenToneMode::CrossHatch,
+                    cell_px: 2.0,
+                    angle_degrees: 45.0,
+                    density: 1.0,
+                    gradation: 1.0,
+                    softness: 1.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "color halftone dense cells",
+                LocalEffect::ColorHalftone(ColorHalftoneParams {
+                    cell_px: 3.0,
+                    angle_offset_degrees: 45.0,
+                    dot_gain: 1.0,
+                    black_generation: 1.0,
+                    softness: 1.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "textureizer dense canvas",
+                LocalEffect::Textureizer(TextureizerParams {
+                    mode: TextureizerMode::Canvas,
+                    scale_px: 2.0,
+                    depth: 1.0,
+                    contrast: 2.0,
+                    warmth: 1.0,
+                    strength: 1.0,
+                    seed: 17,
+                }),
+            ),
+            full(
+                "star glow max rays",
+                LocalEffect::StarGlow(StarGlowParams {
+                    ray_count: 12,
+                    rotation_degrees: 15.0,
+                    threshold: 0.0,
+                    length_px: 240.0,
+                    strength: 3.0,
+                }),
+            ),
+            full(
+                "edge smooth max radius",
+                LocalEffect::EdgeSmooth(EdgeSmoothParams {
+                    radius_px: 8.0,
+                    strength: 1.0,
+                    edge_threshold: 0.0,
+                }),
+            ),
+            full(
+                "median max radius",
+                LocalEffect::Median(MedianParams {
+                    radius_px: 8.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "despeckle max radius",
+                LocalEffect::Despeckle(DespeckleParams {
+                    radius_px: 4.0,
+                    threshold: 1.0,
+                    strength: 1.0,
+                }),
+            ),
+        ];
+
+        let per_case_budget = Duration::from_secs(2);
+        let mut slowest = ("", Duration::from_millis(0));
+        for case in cases {
+            let start = Instant::now();
+            let out = apply_layers(
+                src.as_ref(),
+                &[LocalAdjustmentLayer::new(case.name, case.mask, case.effect)],
+            )
+            .unwrap_or_else(|err| panic!("{} failed: {err}", case.name));
+            let elapsed = start.elapsed();
+            if elapsed > slowest.1 {
+                slowest = (case.name, elapsed);
+            }
+            assert_eq!(out.width, width, "{}", case.name);
+            assert_eq!(out.height, height, "{}", case.name);
+            assert_eq!(out.pixels.len(), src.pixels.len(), "{}", case.name);
+            assert!(
+                elapsed <= per_case_budget,
+                "{} took {:?}, over {:?}; slowest so far: {} {:?}",
+                case.name,
+                elapsed,
+                per_case_budget,
+                slowest.0,
+                slowest.1
+            );
         }
     }
 
