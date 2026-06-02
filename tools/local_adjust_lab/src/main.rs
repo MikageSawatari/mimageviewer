@@ -33,15 +33,15 @@ use local_adjust_core::{
     OutlineStrokePlacement, PartColorParams, PinchSpherizeParams, PixelStylizeMode,
     PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
     RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
-    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams, ScreenToneMode,
-    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
-    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
-    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
-    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VignetteParams, WaveDistortionMode,
-    WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
-    evaluate_layer_mask, parse_cube_lut,
+    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams,
+    ScanlineGlitchParams, ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp,
+    SharpenParams, SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode,
+    SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement,
+    TextureParams, TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams,
+    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
+    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1054,6 +1054,7 @@ enum EffectKind {
     FilmGrain,
     Noise,
     ChromaticAberration,
+    ScanlineGlitch,
     Halftone,
     ScreenTone,
     ColorHalftone,
@@ -1190,6 +1191,7 @@ impl EffectKind {
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
             LocalEffect::Noise(_) => Self::Noise,
             LocalEffect::ChromaticAberration(_) => Self::ChromaticAberration,
+            LocalEffect::ScanlineGlitch(_) => Self::ScanlineGlitch,
             LocalEffect::Halftone(_) => Self::Halftone,
             LocalEffect::ScreenTone(_) => Self::ScreenTone,
             LocalEffect::ColorHalftone(_) => Self::ColorHalftone,
@@ -1277,6 +1279,7 @@ impl EffectKind {
             Self::FilmGrain => "フィルム粒子",
             Self::Noise => "ノイズ付加",
             Self::ChromaticAberration => "色収差",
+            Self::ScanlineGlitch => "走査線グリッチ",
             Self::Halftone => "ハーフトーン",
             Self::ScreenTone => "スクリーントーン",
             Self::ColorHalftone => "カラーハーフトーン",
@@ -1448,6 +1451,9 @@ impl EffectKind {
                 "均一またはガウス分布のノイズを加え、単色/カラーのざらつきやデジタルノイズを作ります。"
             }
             Self::ChromaticAberration => "RGBを少しずらし、レンズやデジタル風の色ズレを作ります。",
+            Self::ScanlineGlitch => {
+                "横走査線、行ごとの揺れ、RGBずれ、ノイズを重ねてホログラムやデジタル破損の演出を作ります。"
+            }
             Self::Halftone => "明るさをドットパターンに変換し、漫画や印刷風にします。",
             Self::ScreenTone => {
                 "網点、平行線、カケアミを重ね、濃度と元画像の明暗追従で漫画用のトーンを作ります。"
@@ -1597,6 +1603,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ColorHalftone,
             EffectKind::CmykPlateShift,
             EffectKind::Textureizer,
+            EffectKind::ScanlineGlitch,
         ],
     },
     EffectGroup {
@@ -8572,6 +8579,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::ChromaticAberration(params) => {
             format!("色収差 {:.1}px", params.offset_px)
         }
+        LocalEffect::ScanlineGlitch(params) => {
+            format!("走査線グリッチ {:.0}%", params.strength * 100.0)
+        }
         LocalEffect::Halftone(params) => format!("ハーフトーン {}px", params.cell_px),
         LocalEffect::ScreenTone(params) => format!(
             "スクリーントーン {} {:.0}px",
@@ -15286,6 +15296,97 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.offset_px, 0.0..=24.0).text("ずれ(px)"))
                 .changed();
         }
+        LocalEffect::ScanlineGlitch(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "ホログラム") {
+                    *params = ScanlineGlitchParams {
+                        line_spacing_px: 4.0,
+                        line_strength: 0.42,
+                        jitter_px: 1.5,
+                        rgb_shift_px: 1.2,
+                        block_strength: 0.28,
+                        noise: 0.12,
+                        seed: params.seed,
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "走査線") {
+                    *params = ScanlineGlitchParams {
+                        line_spacing_px: 3.0,
+                        line_strength: 0.65,
+                        jitter_px: 0.0,
+                        rgb_shift_px: 0.4,
+                        block_strength: 0.0,
+                        noise: 0.04,
+                        seed: params.seed,
+                        strength: 0.70,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "破損") {
+                    *params = ScanlineGlitchParams {
+                        line_spacing_px: 5.0,
+                        line_strength: 0.55,
+                        jitter_px: 10.0,
+                        rgb_shift_px: 4.0,
+                        block_strength: 0.75,
+                        noise: 0.35,
+                        seed: params.seed,
+                        strength: 0.95,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡いSF") {
+                    *params = ScanlineGlitchParams {
+                        line_spacing_px: 6.0,
+                        line_strength: 0.25,
+                        jitter_px: 0.8,
+                        rgb_shift_px: 0.8,
+                        block_strength: 0.12,
+                        noise: 0.06,
+                        seed: params.seed,
+                        strength: 0.45,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new("横走査線、行ごとのずれ、RGBずれを重ねるデジタル演出です。")
+                    .size(10.0)
+                    .color(Color32::from_gray(170)),
+            );
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.line_spacing_px, 2.0..=64.0)
+                        .text("走査線間隔(px)"),
+                )
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.line_strength, 0.0..=1.0).text("走査線"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.jitter_px, 0.0..=48.0).text("行ずれ(px)"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.rgb_shift_px, 0.0..=24.0).text("RGBずれ(px)"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.block_strength, 0.0..=1.0).text("破損行"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.noise, 0.0..=1.0).text("ノイズ"))
+                .changed();
+            let mut seed = params.seed as i32;
+            changed |= ui
+                .add(egui::Slider::new(&mut seed, 0..=9999).text("seed"))
+                .changed();
+            params.seed = seed.max(0) as u32;
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
+                .changed();
+        }
         LocalEffect::Halftone(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -17247,6 +17348,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ChromaticAberration => {
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default())
         }
+        EffectKind::ScanlineGlitch => LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
         EffectKind::Halftone => LocalEffect::Halftone(HalftoneParams::default()),
         EffectKind::ScreenTone => LocalEffect::ScreenTone(ScreenToneParams::default()),
         EffectKind::ColorHalftone => LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
@@ -19594,6 +19696,7 @@ mod tests {
             EffectKind::ColorHalftone,
             EffectKind::CmykPlateShift,
             EffectKind::Textureizer,
+            EffectKind::ScanlineGlitch,
             EffectKind::ColorOverlay,
             EffectKind::StarGlow,
             EffectKind::EdgeSmooth,

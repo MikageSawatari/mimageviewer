@@ -599,6 +599,7 @@ pub enum LocalEffect {
     FilmGrain(FilmGrainParams),
     Noise(NoiseParams),
     ChromaticAberration(ChromaticAberrationParams),
+    ScanlineGlitch(ScanlineGlitchParams),
     Halftone(HalftoneParams),
     ScreenTone(ScreenToneParams),
     ColorHalftone(ColorHalftoneParams),
@@ -686,6 +687,7 @@ impl LocalEffect {
             Self::FilmGrain(_) => "フィルム粒子",
             Self::Noise(_) => "ノイズ",
             Self::ChromaticAberration(_) => "色収差",
+            Self::ScanlineGlitch(_) => "走査線グリッチ",
             Self::Halftone(_) => "ハーフトーン",
             Self::ScreenTone(_) => "スクリーントーン",
             Self::ColorHalftone(_) => "カラーハーフトーン",
@@ -2877,6 +2879,33 @@ impl Default for ChromaticAberrationParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ScanlineGlitchParams {
+    pub line_spacing_px: f32,
+    pub line_strength: f32,
+    pub jitter_px: f32,
+    pub rgb_shift_px: f32,
+    pub block_strength: f32,
+    pub noise: f32,
+    pub seed: u32,
+    pub strength: f32,
+}
+
+impl Default for ScanlineGlitchParams {
+    fn default() -> Self {
+        Self {
+            line_spacing_px: 4.0,
+            line_strength: 0.35,
+            jitter_px: 0.0,
+            rgb_shift_px: 0.0,
+            block_strength: 0.0,
+            noise: 0.0,
+            seed: 1,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HalftoneParams {
     pub cell_px: u32,
     pub strength: f32,
@@ -3551,6 +3580,9 @@ where
                 image.height,
                 params.offset_px.clamp(0.0, 24.0),
             ),
+            LocalEffect::ScanlineGlitch(params) => {
+                apply_scanline_glitch(&image.pixels, image.width, image.height, *params)
+            }
             LocalEffect::Halftone(params) => {
                 apply_halftone(&image.pixels, image.width, image.height, *params)
             }
@@ -9615,6 +9647,116 @@ fn apply_chromatic_aberration(src: &[u8], width: usize, height: usize, offset_px
     out
 }
 
+fn apply_scanline_glitch(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: ScanlineGlitchParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let spacing = params.line_spacing_px.clamp(2.0, 64.0);
+    let line_strength = params.line_strength.clamp(0.0, 1.0);
+    let jitter_px = params.jitter_px.clamp(0.0, 48.0);
+    let rgb_shift_px = params.rgb_shift_px.clamp(0.0, 24.0);
+    let block_strength = params.block_strength.clamp(0.0, 1.0);
+    let noise = params.noise.clamp(0.0, 1.0);
+    if line_strength <= f32::EPSILON
+        && jitter_px <= f32::EPSILON
+        && rgb_shift_px <= f32::EPSILON
+        && block_strength <= f32::EPSILON
+        && noise <= f32::EPSILON
+    {
+        return src.to_vec();
+    }
+
+    let mut out = src.to_vec();
+    for y in 0..height {
+        let row_seed = (y as u32).wrapping_mul(0x9E37_79B9) ^ params.seed;
+        let row_noise = signed_noise(y as u32, 0, row_seed);
+        let gate_noise = signed_noise(0, y as u32, params.seed ^ 0x51A7_9E21).abs();
+        let row_gate = smoothstep(1.0 - block_strength, 1.0, gate_noise);
+        let row_offset = (row_noise * jitter_px * (0.25 + row_gate * 0.75)).round();
+        let line_mask = scanline_glitch_line_mask(y, spacing);
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let xf = x as f32 + row_offset;
+            let yf = y as f32;
+            let mut target = [
+                sample_scanline_glitch_channel(
+                    src,
+                    width,
+                    height,
+                    xf + rgb_shift_px,
+                    yf,
+                    0,
+                    base[0],
+                ),
+                sample_scanline_glitch_channel(src, width, height, xf, yf, 1, base[1]),
+                sample_scanline_glitch_channel(
+                    src,
+                    width,
+                    height,
+                    xf - rgb_shift_px,
+                    yf,
+                    2,
+                    base[2],
+                ),
+            ];
+
+            let scan_dark = 1.0 - line_mask * line_strength * 0.58;
+            target[0] *= scan_dark;
+            target[1] = (target[1] * scan_dark + line_mask * line_strength * 0.035).clamp(0.0, 1.0);
+            target[2] = (target[2] * scan_dark + line_mask * line_strength * 0.070).clamp(0.0, 1.0);
+            for c in 0..3 {
+                let n = signed_noise(
+                    x as u32,
+                    y as u32,
+                    params.seed ^ (c as u32).wrapping_mul(0xA511_E9B3),
+                ) * noise
+                    * 0.20;
+                target[c] = (target[c] + n).clamp(0.0, 1.0);
+                out[i + c] = to_u8(lerp_f32(base[c], target[c], strength));
+            }
+        }
+    }
+    out
+}
+
+fn scanline_glitch_line_mask(y: usize, spacing: f32) -> f32 {
+    let phase = ((y as f32 + 0.5) / spacing).fract();
+    1.0 - smoothstep(0.32, 0.52, phase)
+}
+
+fn sample_scanline_glitch_channel(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: f32,
+    y: f32,
+    channel: usize,
+    fallback: f32,
+) -> f32 {
+    let (rgb, alpha) = sample_rgb_bilinear_alpha_aware(src, width, height, x, y);
+    if alpha > f32::EPSILON {
+        rgb[channel.min(2)]
+    } else {
+        fallback
+    }
+}
+
 fn apply_halftone(src: &[u8], width: usize, height: usize, params: HalftoneParams) -> Vec<u8> {
     let cell = params.cell_px.clamp(2, 96) as usize;
     let strength = params.strength.clamp(0.0, 1.0);
@@ -12673,6 +12815,7 @@ mod tests {
             LocalEffect::FilmGrain(FilmGrainParams::default()),
             LocalEffect::Noise(NoiseParams::default()),
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
+            LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
             LocalEffect::Halftone(HalftoneParams::default()),
             LocalEffect::ScreenTone(ScreenToneParams::default()),
             LocalEffect::ColorHalftone(ColorHalftoneParams::default()),
@@ -13338,6 +13481,19 @@ mod tests {
             full(
                 "chromatic aberration max offset",
                 LocalEffect::ChromaticAberration(ChromaticAberrationParams { offset_px: 24.0 }),
+            ),
+            full(
+                "scanline glitch max jitter",
+                LocalEffect::ScanlineGlitch(ScanlineGlitchParams {
+                    line_spacing_px: 2.0,
+                    line_strength: 1.0,
+                    jitter_px: 48.0,
+                    rgb_shift_px: 24.0,
+                    block_strength: 1.0,
+                    noise: 1.0,
+                    seed: 19,
+                    strength: 1.0,
+                }),
             ),
             full(
                 "halftone dense cells",
@@ -15141,6 +15297,74 @@ LUT_3D_SIZE 2
         assert_eq!(out.pixels[3], 201);
         assert_eq!(out.pixels[7], 202);
         assert_eq!(out.pixels[11], 203);
+    }
+
+    #[test]
+    fn scanline_glitch_darkens_scanline_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(1, 2, vec![200, 200, 200, 91, 200, 200, 200, 92]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "scanline",
+            LocalMask::Full,
+            LocalEffect::ScanlineGlitch(ScanlineGlitchParams {
+                line_spacing_px: 2.0,
+                line_strength: 1.0,
+                jitter_px: 0.0,
+                rgb_shift_px: 0.0,
+                block_strength: 0.0,
+                noise: 0.0,
+                seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] < src.pixels[0]);
+        assert_eq!(out.pixels[3], 91);
+        assert_eq!(out.pixels[7], 92);
+    }
+
+    #[test]
+    fn scanline_glitch_can_shift_red_channel() {
+        let src =
+            RgbaImageBuf::new(3, 1, vec![0, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "scanline",
+            LocalMask::Full,
+            LocalEffect::ScanlineGlitch(ScanlineGlitchParams {
+                line_spacing_px: 8.0,
+                line_strength: 0.0,
+                jitter_px: 0.0,
+                rgb_shift_px: 1.0,
+                block_strength: 0.0,
+                noise: 0.0,
+                seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > 180);
+        assert_eq!(out.pixels[1], 0);
+        assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn scanline_glitch_ignores_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(3, 1, vec![0, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "scanline",
+            LocalMask::Full,
+            LocalEffect::ScanlineGlitch(ScanlineGlitchParams {
+                line_spacing_px: 8.0,
+                line_strength: 0.0,
+                jitter_px: 0.0,
+                rgb_shift_px: 1.0,
+                block_strength: 0.0,
+                noise: 0.0,
+                seed: 1,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[0, 0, 0, 255]);
     }
 
     #[test]

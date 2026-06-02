@@ -128,6 +128,7 @@ the window.
   - Film grain
   - Noise
   - Chromatic aberration
+  - Scanline glitch / hologram
   - Halftone
   - Screen tone
   - Color halftone
