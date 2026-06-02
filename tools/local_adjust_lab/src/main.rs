@@ -20,19 +20,19 @@ use local_adjust_core::{
     ClarityParams, CloudFogMode, CloudFogParams, CmykPlateShiftParams, ColorBalanceParams,
     ColorBalanceRange, ColorDodgeGlowParams, ColorFillParams, ColorGradeWheel, ColorHalftoneParams,
     ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask,
-    ColorTraceParams, ContactShadowParams, CubeLutParams, CutoutParams, DehazeParams,
-    DespeckleParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
-    EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
-    GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams,
-    HalftoneParams, HeatHazeParams, HighPassParams, HighlightsShadowsParams, HslParams,
-    InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LensFlareParams,
-    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer,
-    LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams,
-    MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams,
-    NoiseDistribution, NoiseParams, OilPaintParams, OldFilmParams, OrtonParams,
-    OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, ParticleOverlayMode,
-    ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection, PixelSortOrder,
-    PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
+    ColorTraceParams, ContactShadowParams, CubeLutParams, CutoutParams, DefringeParams,
+    DehazeParams, DespeckleParams, DiffuseGlowParams, DuotoneParams, DuotonePreset,
+    EdgeSmoothParams, EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
+    GlassDisplacementParams, GlowingEdgesParams, GodRaysParams, GradientMapParams,
+    GradientMapPreset, HalationParams, HalftoneParams, HeatHazeParams, HighPassParams,
+    HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
+    LensCorrectionParams, LensFlareParams, LineExtractMode, LineExtractParams, LineKind,
+    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
+    ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
+    MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams, OilPaintParams,
+    OldFilmParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement, PartColorParams,
+    ParticleOverlayMode, ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection,
+    PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
     PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
     RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
     RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode, ScreenToneParams,
@@ -1059,6 +1059,7 @@ enum EffectKind {
     FilmGrain,
     Noise,
     ChromaticAberration,
+    Defringe,
     ScanlineGlitch,
     Vhs,
     PixelSort,
@@ -1208,6 +1209,7 @@ impl EffectKind {
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
             LocalEffect::Noise(_) => Self::Noise,
             LocalEffect::ChromaticAberration(_) => Self::ChromaticAberration,
+            LocalEffect::Defringe(_) => Self::Defringe,
             LocalEffect::ScanlineGlitch(_) => Self::ScanlineGlitch,
             LocalEffect::Vhs(_) => Self::Vhs,
             LocalEffect::PixelSort(_) => Self::PixelSort,
@@ -1302,6 +1304,7 @@ impl EffectKind {
             Self::FilmGrain => "フィルム粒子",
             Self::Noise => "ノイズ付加",
             Self::ChromaticAberration => "色収差",
+            Self::Defringe => "色フチ除去",
             Self::ScanlineGlitch => "走査線グリッチ",
             Self::Vhs => "VHS/アナログ",
             Self::PixelSort => "ピクセルソート",
@@ -1485,6 +1488,7 @@ impl EffectKind {
                 "均一またはガウス分布のノイズを加え、単色/カラーのざらつきやデジタルノイズを作ります。"
             }
             Self::ChromaticAberration => "RGBを少しずらし、レンズやデジタル風の色ズレを作ります。",
+            Self::Defringe => "強いエッジに出た紫や緑の色フチを検出し、局所的に彩度を落とします。",
             Self::ScanlineGlitch => {
                 "横走査線、行ごとの揺れ、RGBずれ、ノイズを重ねてホログラムやデジタル破損の演出を作ります。"
             }
@@ -1574,6 +1578,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::HighlightsShadows,
             EffectKind::Dehaze,
             EffectKind::Equalize,
+            EffectKind::Defringe,
         ],
     },
     EffectGroup {
@@ -8637,6 +8642,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::ChromaticAberration(params) => {
             format!("色収差 {:.1}px", params.offset_px)
         }
+        LocalEffect::Defringe(params) => format!("色フチ除去 {:.0}%", params.strength * 100.0),
         LocalEffect::ScanlineGlitch(params) => {
             format!("走査線グリッチ {:.0}%", params.strength * 100.0)
         }
@@ -15751,6 +15757,82 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.offset_px, 0.0..=24.0).text("ずれ(px)"))
                 .changed();
         }
+        LocalEffect::Defringe(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "軽く") {
+                    *params = DefringeParams {
+                        radius_px: 1.0,
+                        edge_threshold: 0.08,
+                        color_threshold: 0.18,
+                        neutralize: 0.55,
+                        strength: 0.55,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "紫/緑フチ") {
+                    *params = DefringeParams {
+                        radius_px: 1.0,
+                        edge_threshold: 0.05,
+                        color_threshold: 0.12,
+                        neutralize: 0.86,
+                        strength: 0.78,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強め") {
+                    *params = DefringeParams {
+                        radius_px: 2.0,
+                        edge_threshold: 0.04,
+                        color_threshold: 0.08,
+                        neutralize: 1.0,
+                        strength: 0.90,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "広め") {
+                    *params = DefringeParams {
+                        radius_px: 3.0,
+                        edge_threshold: 0.06,
+                        color_threshold: 0.14,
+                        neutralize: 0.75,
+                        strength: 0.72,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "周辺より彩度が高いエッジ上の色フチだけを検出し、局所的に彩度を落とします。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let radius = ui.add(
+                egui::Slider::new(&mut params.radius_px, 1.0..=8.0)
+                    .text("検出半径")
+                    .suffix("px"),
+            );
+            changed |= radius.changed();
+            radius.lab_hover_tip("周辺色と比較する距離です。太いフチには大きめが向きます。");
+            let edge = ui.add(
+                egui::Slider::new(&mut params.edge_threshold, 0.0..=1.0).text("エッジしきい値"),
+            );
+            changed |= edge.changed();
+            edge.lab_hover_tip("どれだけ明暗差がある場所を色フチ候補にするかです。");
+            let color = ui.add(
+                egui::Slider::new(&mut params.color_threshold, 0.0..=1.0).text("色フチしきい値"),
+            );
+            changed |= color.changed();
+            color.lab_hover_tip("周辺より彩度がどれだけ高い場合に補正するかです。");
+            let neutralize =
+                ui.add(egui::Slider::new(&mut params.neutralize, 0.0..=1.0).text("中和"));
+            changed |= neutralize.changed();
+            neutralize.lab_hover_tip("検出した色フチをどれだけ無彩色へ寄せるかです。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から色フチ除去結果へどれだけ近づけるかです。");
+        }
         LocalEffect::ScanlineGlitch(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -18115,6 +18197,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ChromaticAberration => {
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default())
         }
+        EffectKind::Defringe => LocalEffect::Defringe(DefringeParams::default()),
         EffectKind::ScanlineGlitch => LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
         EffectKind::Vhs => LocalEffect::Vhs(VhsParams::default()),
         EffectKind::PixelSort => LocalEffect::PixelSort(PixelSortParams::default()),
@@ -20444,6 +20527,7 @@ mod tests {
             EffectKind::Invert,
             EffectKind::Duotone,
             EffectKind::Equalize,
+            EffectKind::Defringe,
             EffectKind::GradientMap,
             EffectKind::RimLight,
             EffectKind::ContactShadow,

@@ -599,6 +599,7 @@ pub enum LocalEffect {
     FilmGrain(FilmGrainParams),
     Noise(NoiseParams),
     ChromaticAberration(ChromaticAberrationParams),
+    Defringe(DefringeParams),
     ScanlineGlitch(ScanlineGlitchParams),
     Vhs(VhsParams),
     PixelSort(PixelSortParams),
@@ -693,6 +694,7 @@ impl LocalEffect {
             Self::FilmGrain(_) => "フィルム粒子",
             Self::Noise(_) => "ノイズ",
             Self::ChromaticAberration(_) => "色収差",
+            Self::Defringe(_) => "色フチ除去",
             Self::ScanlineGlitch(_) => "走査線グリッチ",
             Self::Vhs(_) => "VHS/アナログビデオ",
             Self::PixelSort(_) => "ピクセルソート",
@@ -2891,6 +2893,27 @@ impl Default for ChromaticAberrationParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DefringeParams {
+    pub radius_px: f32,
+    pub edge_threshold: f32,
+    pub color_threshold: f32,
+    pub neutralize: f32,
+    pub strength: f32,
+}
+
+impl Default for DefringeParams {
+    fn default() -> Self {
+        Self {
+            radius_px: 1.0,
+            edge_threshold: 0.08,
+            color_threshold: 0.18,
+            neutralize: 0.75,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ScanlineGlitchParams {
     pub line_spacing_px: f32,
     pub line_strength: f32,
@@ -3802,6 +3825,9 @@ where
                 image.height,
                 params.offset_px.clamp(0.0, 24.0),
             ),
+            LocalEffect::Defringe(params) => {
+                apply_defringe(&image.pixels, image.width, image.height, *params)
+            }
             LocalEffect::ScanlineGlitch(params) => {
                 apply_scanline_glitch(&image.pixels, image.width, image.height, *params)
             }
@@ -9887,6 +9913,93 @@ fn apply_chromatic_aberration(src: &[u8], width: usize, height: usize, offset_px
     out
 }
 
+fn apply_defringe(src: &[u8], width: usize, height: usize, params: DefringeParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let neutralize = params.neutralize.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || neutralize <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let radius = params.radius_px.clamp(1.0, 8.0).round() as isize;
+    let edge_threshold = params.edge_threshold.clamp(0.0, 1.0);
+    let color_threshold = params.color_threshold.clamp(0.0, 1.0);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+            let rgb = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let (_, saturation, _) = rgb_to_hsl(rgb[0], rgb[1], rgb[2]);
+            let luma = luma01(rgb[0], rgb[1], rgb[2]);
+            if saturation <= color_threshold {
+                continue;
+            }
+            let Some((edge, max_neighbor_saturation)) =
+                defringe_neighbor_stats(src, width, height, x, y, radius, luma)
+            else {
+                continue;
+            };
+            let saturation_excess = (saturation - max_neighbor_saturation).max(0.0);
+            let edge_weight = smoothstep(edge_threshold, (edge_threshold + 0.22).min(1.0), edge);
+            let color_weight = smoothstep(
+                color_threshold,
+                (color_threshold + 0.28).min(1.0),
+                saturation_excess,
+            );
+            let amount = (edge_weight * color_weight * neutralize * strength).clamp(0.0, 1.0);
+            if amount <= f32::EPSILON {
+                continue;
+            }
+            for c in 0..3 {
+                out[i + c] = to_u8(lerp_f32(rgb[c], luma, amount));
+            }
+        }
+    }
+    out
+}
+
+fn defringe_neighbor_stats(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    radius: isize,
+    luma: f32,
+) -> Option<(f32, f32)> {
+    let mut max_edge: f32 = 0.0;
+    let mut max_saturation: f32 = 0.0;
+    let mut count = 0;
+    for (dx, dy) in [(radius, 0), (-radius, 0), (0, radius), (0, -radius)] {
+        let sx = x as isize + dx;
+        let sy = y as isize + dy;
+        if sx < 0 || sy < 0 || sx >= width as isize || sy >= height as isize {
+            continue;
+        }
+        let ni = (sy as usize * width + sx as usize) * 4;
+        if src[ni + 3] == 0 {
+            continue;
+        }
+        let rgb = [
+            src[ni] as f32 / 255.0,
+            src[ni + 1] as f32 / 255.0,
+            src[ni + 2] as f32 / 255.0,
+        ];
+        let (_, saturation, _) = rgb_to_hsl(rgb[0], rgb[1], rgb[2]);
+        let neighbor_luma = luma01(rgb[0], rgb[1], rgb[2]);
+        max_edge = max_edge.max((luma - neighbor_luma).abs());
+        max_saturation = max_saturation.max(saturation);
+        count += 1;
+    }
+    (count > 0).then_some((max_edge, max_saturation))
+}
+
 fn apply_scanline_glitch(
     src: &[u8],
     width: usize,
@@ -14002,6 +14115,7 @@ mod tests {
             LocalEffect::FilmGrain(FilmGrainParams::default()),
             LocalEffect::Noise(NoiseParams::default()),
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
+            LocalEffect::Defringe(DefringeParams::default()),
             LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
             LocalEffect::Vhs(VhsParams::default()),
             LocalEffect::PixelSort(PixelSortParams::default()),
@@ -14674,6 +14788,16 @@ mod tests {
             full(
                 "chromatic aberration max offset",
                 LocalEffect::ChromaticAberration(ChromaticAberrationParams { offset_px: 24.0 }),
+            ),
+            full(
+                "defringe max radius",
+                LocalEffect::Defringe(DefringeParams {
+                    radius_px: 8.0,
+                    edge_threshold: 0.0,
+                    color_threshold: 0.0,
+                    neutralize: 1.0,
+                    strength: 1.0,
+                }),
             ),
             full(
                 "scanline glitch max jitter",
@@ -16572,6 +16696,68 @@ LUT_3D_SIZE 2
         assert_eq!(out.pixels[3], 201);
         assert_eq!(out.pixels[7], 202);
         assert_eq!(out.pixels[11], 203);
+    }
+
+    #[test]
+    fn defringe_neutralizes_saturated_edge_fringe_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![240, 240, 240, 201, 255, 0, 255, 202, 20, 20, 20, 203],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "defringe",
+            LocalMask::Full,
+            LocalEffect::Defringe(DefringeParams {
+                radius_px: 1.0,
+                edge_threshold: 0.0,
+                color_threshold: 0.0,
+                neutralize: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[4] < src.pixels[4]);
+        assert!(out.pixels[5] > src.pixels[5]);
+        assert!(out.pixels[6] < src.pixels[6]);
+        assert_eq!(out.pixels[7], 202);
+    }
+
+    #[test]
+    fn defringe_keeps_saturated_edge_when_neighbor_is_same_color() {
+        let src = solid(3, 1, [230, 30, 20, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "defringe",
+            LocalMask::Full,
+            LocalEffect::Defringe(DefringeParams {
+                radius_px: 1.0,
+                edge_threshold: 0.0,
+                color_threshold: 0.0,
+                neutralize: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn defringe_skips_transparent_pixels() {
+        let src = RgbaImageBuf::new(1, 1, vec![255, 0, 255, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "defringe",
+            LocalMask::Full,
+            LocalEffect::Defringe(DefringeParams {
+                radius_px: 8.0,
+                edge_threshold: 0.0,
+                color_threshold: 0.0,
+                neutralize: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
     }
 
     #[test]

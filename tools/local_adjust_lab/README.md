@@ -131,6 +131,7 @@ the window.
   - Film grain
   - Noise
   - Chromatic aberration
+  - Defringe / chromatic fringe removal
   - Scanline glitch / hologram
   - VHS / analog video
   - Pixel sort
