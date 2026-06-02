@@ -578,6 +578,7 @@ pub enum LocalEffect {
     ColorFill(ColorFillParams),
     OutlineStroke(OutlineStrokeParams),
     RimLight(RimLightParams),
+    ContactShadow(ContactShadowParams),
     ColorTrace(ColorTraceParams),
     ColorOverlay(ColorOverlayParams),
     NeonGlow(NeonGlowParams),
@@ -658,6 +659,7 @@ impl LocalEffect {
             Self::ColorFill(_) => "塗りつぶし",
             Self::OutlineStroke(_) => "縁取り",
             Self::RimLight(_) => "リムライト",
+            Self::ContactShadow(_) => "接触影/AO",
             Self::ColorTrace(_) => "色トレス",
             Self::ColorOverlay(_) => "塗り/グラデーション",
             Self::NeonGlow(_) => "ネオングロー",
@@ -699,6 +701,10 @@ pub fn default_mask_application_for_effect(effect: &LocalEffect) -> MaskApplicat
         | LocalEffect::RimLight(_) => MaskApplication {
             before_effect: true,
             after_effect: false,
+        },
+        LocalEffect::ContactShadow(_) => MaskApplication {
+            before_effect: true,
+            after_effect: true,
         },
         _ => MaskApplication {
             before_effect: false,
@@ -2197,6 +2203,29 @@ impl Default for RimLightParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ContactShadowParams {
+    pub radius_px: f32,
+    pub softness_px: f32,
+    pub strength: f32,
+    pub color_rgb: [u8; 3],
+    pub direction_degrees: f32,
+    pub directionality: f32,
+}
+
+impl Default for ContactShadowParams {
+    fn default() -> Self {
+        Self {
+            radius_px: 0.0,
+            softness_px: 4.0,
+            strength: 0.0,
+            color_rgb: [18, 16, 20],
+            direction_degrees: 90.0,
+            directionality: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ColorTraceParams {
     pub strength: f32,
     pub line_threshold: f32,
@@ -3105,6 +3134,7 @@ where
         height: image.height,
         pixels: masked_input.as_deref().unwrap_or(&image.pixels),
     };
+    let original_pixels = image.pixels.as_slice();
 
     let effected = {
         let image = effect_image;
@@ -3292,6 +3322,22 @@ where
                     });
                 },
             )?,
+            LocalEffect::ContactShadow(params) => apply_contact_shadow(
+                original_pixels,
+                image.width,
+                image.height,
+                &base_mask,
+                *params,
+                cancel,
+                |percent| {
+                    progress(LocalAdjustProgress {
+                        layer_index,
+                        layer_count,
+                        effect_name: layer.effect.progress_label(),
+                        percent,
+                    });
+                },
+            )?,
             LocalEffect::ColorTrace(params) => {
                 apply_color_trace(&image.pixels, image.width, image.height, *params)
             }
@@ -3384,6 +3430,8 @@ where
         LocalEffect::OutlineStroke(_) | LocalEffect::RimLight(_)
     ) {
         blend_rgb_with_effect_alpha_mask(&mut image.pixels, &effected, &output_mask);
+    } else if matches!(&layer.effect, LocalEffect::ContactShadow(_)) {
+        blend_rgb_with_mask(&mut image.pixels, &effected, &output_mask);
     } else if layer.mask_before_effect && !layer.mask_after_effect {
         let input = masked_input
             .as_deref()
@@ -7679,6 +7727,103 @@ fn apply_rim_light(
     Ok(out)
 }
 
+fn apply_contact_shadow(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    mask: &[f32],
+    params: ContactShadowParams,
+    cancel: Option<&AtomicBool>,
+    mut progress: impl FnMut(f32),
+) -> Result<Vec<u8>> {
+    let mut out = src.to_vec();
+    let strength = params.strength.clamp(0.0, 1.0);
+    let radius = params.radius_px.round().clamp(0.0, 96.0) as i32;
+    if width == 0
+        || height == 0
+        || radius == 0
+        || strength <= f32::EPSILON
+        || mask.len() != width.saturating_mul(height)
+    {
+        progress(1.0);
+        return Ok(out);
+    }
+
+    check_cancel(cancel)?;
+    let alpha: Vec<f32> = src
+        .chunks_exact(4)
+        .zip(mask.iter())
+        .map(|(px, mask_amount)| (px[3] as f32 / 255.0) * mask_amount.clamp(0.0, 1.0))
+        .collect();
+    progress(0.02);
+
+    let eroded = morph_alpha_disk(&alpha, width, height, radius, false, cancel, |p| {
+        progress(0.02 + p * 0.50);
+    })?;
+    check_cancel(cancel)?;
+
+    let mut band = vec![0.0; alpha.len()];
+    for idx in 0..alpha.len() {
+        band[idx] = (alpha[idx] - eroded[idx]).clamp(0.0, 1.0);
+    }
+    let softness = params.softness_px.round().clamp(0.0, 32.0) as usize;
+    if softness > 0 {
+        band = box_blur_alpha(&band, width, height, softness);
+    }
+    progress(0.68);
+
+    let directionality = params.directionality.clamp(0.0, 1.0);
+    let direction_field = if directionality <= f32::EPSILON || radius <= 1 {
+        alpha
+    } else {
+        let normal_radius = (radius / 2).clamp(1, 16) as usize;
+        box_blur_alpha(&alpha, width, height, normal_radius)
+    };
+    let angle = params.direction_degrees.to_radians();
+    let shadow_x = angle.cos();
+    let shadow_y = angle.sin();
+    let color = params.color_rgb;
+
+    for y in 0..height {
+        if y % 32 == 0 {
+            check_cancel(cancel)?;
+        }
+        let y0 = y.saturating_sub(1);
+        let y1 = (y + 1).min(height - 1);
+        for x in 0..width {
+            let idx = y * width + x;
+            let mut amount = band[idx].clamp(0.0, 1.0) * strength;
+            if amount <= f32::EPSILON {
+                continue;
+            }
+            if directionality > f32::EPSILON {
+                let x0 = x.saturating_sub(1);
+                let x1 = (x + 1).min(width - 1);
+                let gx = direction_field[y * width + x1] - direction_field[y * width + x0];
+                let gy = direction_field[y1 * width + x] - direction_field[y0 * width + x];
+                let len = (gx * gx + gy * gy).sqrt();
+                if len <= f32::EPSILON {
+                    continue;
+                }
+                let outward_x = -gx / len;
+                let outward_y = -gy / len;
+                let facing = (outward_x * shadow_x + outward_y * shadow_y).clamp(0.0, 1.0);
+                let directional_amount = smoothstep(0.0, 1.0, facing);
+                amount *= lerp_f32(1.0, directional_amount, directionality);
+            }
+            if amount <= f32::EPSILON {
+                continue;
+            }
+            let o = idx * 4;
+            for c in 0..3 {
+                out[o + c] = lerp_u8(src[o + c], color[c], amount);
+            }
+        }
+    }
+    progress(1.0);
+    Ok(out)
+}
+
 fn apply_color_trace(src: &[u8], width: usize, height: usize, params: ColorTraceParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 1.0);
     let radius = params.sample_radius_px.round().clamp(1.0, 64.0) as usize;
@@ -9973,6 +10118,14 @@ mod tests {
         assert!(rim_light.mask_before_effect);
         assert!(!rim_light.mask_after_effect);
 
+        let contact_shadow = LocalAdjustmentLayer::new(
+            "contact shadow",
+            LocalMask::Full,
+            LocalEffect::ContactShadow(ContactShadowParams::default()),
+        );
+        assert!(contact_shadow.mask_before_effect);
+        assert!(contact_shadow.mask_after_effect);
+
         let wave = LocalAdjustmentLayer::new(
             "wave",
             LocalMask::Full,
@@ -10111,6 +10264,79 @@ mod tests {
         assert_eq!(&out.pixels[center..center + 3], &[80, 80, 80]);
         assert!(out.pixels[right] > 80);
         assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    #[test]
+    fn contact_shadow_darkens_inner_mask_edge_and_preserves_center() {
+        let src = solid(5, 5, [120, 120, 120, 255]);
+        let mut alpha = vec![0.0; 25];
+        for y in 1..4 {
+            for x in 1..4 {
+                alpha[y * 5 + x] = 1.0;
+            }
+        }
+        let mask = LocalMask::Raster(RasterMask {
+            width: 5,
+            height: 5,
+            alpha,
+        });
+        let layer = LocalAdjustmentLayer::new(
+            "contact",
+            mask,
+            LocalEffect::ContactShadow(ContactShadowParams {
+                radius_px: 1.0,
+                softness_px: 0.0,
+                strength: 1.0,
+                color_rgb: [0, 0, 0],
+                direction_degrees: 90.0,
+                directionality: 0.0,
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        let top_inner = (5 + 2) * 4;
+        let center = (2 * 5 + 2) * 4;
+        let outside = 2 * 4;
+        assert_eq!(&out.pixels[top_inner..top_inner + 3], &[0, 0, 0]);
+        assert_eq!(&out.pixels[center..center + 3], &[120, 120, 120]);
+        assert_eq!(&out.pixels[outside..outside + 3], &[120, 120, 120]);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    #[test]
+    fn contact_shadow_can_target_shadow_direction() {
+        let src = solid(5, 5, [120, 120, 120, 255]);
+        let mut alpha = vec![0.0; 25];
+        for y in 1..4 {
+            for x in 1..4 {
+                alpha[y * 5 + x] = 1.0;
+            }
+        }
+        let mask = LocalMask::Raster(RasterMask {
+            width: 5,
+            height: 5,
+            alpha,
+        });
+        let layer = LocalAdjustmentLayer::new(
+            "contact",
+            mask,
+            LocalEffect::ContactShadow(ContactShadowParams {
+                radius_px: 1.0,
+                softness_px: 0.0,
+                strength: 1.0,
+                color_rgb: [0, 0, 0],
+                direction_degrees: 90.0,
+                directionality: 1.0,
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        let top_inner = (5 + 2) * 4;
+        let bottom_inner = (3 * 5 + 2) * 4;
+        assert_eq!(&out.pixels[top_inner..top_inner + 3], &[120, 120, 120]);
+        assert_eq!(&out.pixels[bottom_inner..bottom_inner + 3], &[0, 0, 0]);
     }
 
     #[test]
@@ -11656,6 +11882,7 @@ mod tests {
             LocalEffect::ColorFill(ColorFillParams::default()),
             LocalEffect::OutlineStroke(OutlineStrokeParams::default()),
             LocalEffect::RimLight(RimLightParams::default()),
+            LocalEffect::ContactShadow(ContactShadowParams::default()),
             LocalEffect::ColorTrace(ColorTraceParams::default()),
             LocalEffect::ColorOverlay(ColorOverlayParams::default()),
             LocalEffect::NeonGlow(NeonGlowParams::default()),
@@ -12124,6 +12351,17 @@ mod tests {
                     strength: 2.0,
                     color_rgb: [220, 240, 255],
                     wrap: 1.0,
+                }),
+            ),
+            masked(
+                "contact shadow max radius",
+                LocalEffect::ContactShadow(ContactShadowParams {
+                    radius_px: 96.0,
+                    softness_px: 32.0,
+                    strength: 1.0,
+                    color_rgb: [0, 0, 0],
+                    direction_degrees: 90.0,
+                    directionality: 1.0,
                 }),
             ),
             full(

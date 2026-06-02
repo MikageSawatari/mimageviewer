@@ -61,14 +61,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、72種)
+### `LocalEffect` (部分補正レイヤー、73種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorFill, OutlineStroke, RimLight, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, GodRays, LensFlare, CloudFog, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Halftone, ScreenTone, ColorHalftone, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
+GradientMap, ColorFill, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, GodRays, LensFlare, CloudFog, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Halftone, ScreenTone, ColorHalftone, Textureizer, StarGlow, EdgeSmooth, Despeckle, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -204,7 +204,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 - [x] **ハレーション (`Halation`)** ★★★ **中** — 明部と肌/輪郭の境界を暖色白でにじませる。`Bloom` とは別の局所暖色ブリード。暖色、エッジ寄せ、スクリーン合成を調整できる。**§C で詳細設計**
 - [x] **トゥーン / セルシェード量子化 (`ToonShade`)** ★★ **中** — 明度を数段のフラット帯に量子化し、色相維持、影色/光色ティント、段差線を調整できる。`ポスタリゼーション` (RGB 各 ch 量子化) とは別。**§D で詳細設計**
 - [x] **リムライト / 縁の光 追加 (`RimLight`)** ★★ **中** — 被写体エッジの光源側だけ発光。既存 Subject マスク＋方向指定で実現。`縁取り` (均一枠) とは別物。`前ON/後OFF` をデフォルトにし、幅、減衰、回り込み、光色を調整できる。**§E で詳細設計**
-- [ ] **接触影 / 簡易 AO (輪郭際の陰)** ★ **中** — エッジ内側を暗く締めて立体感を底上げ
+- [x] **接触影 / 簡易 AO (`ContactShadow`)** ★ **中** — マスク境界の内側を暗く締めて立体感を底上げ。`前ON/後ON` をデフォルトにし、全周AOから下側だけの接触影まで、幅、ぼかし、方向性、影色を調整できる
 - [ ] **覆い焼きカラー発光 (color dodge glow)** ★ **易〜中** — 光源・エフェクトを発光合成。魔法/エモーション演出
 
 ### 9-D. 漫画の陰影表現

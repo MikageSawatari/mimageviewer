@@ -19,25 +19,26 @@ use local_adjust_core::{
     BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams, CloudFogMode,
     CloudFogParams, ColorBalanceParams, ColorBalanceRange, ColorFillParams, ColorGradeWheel,
     ColorHalftoneParams, ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams,
-    ColorOverlayShape, ColorRangeMask, ColorTraceParams, CubeLutParams, CutoutParams, DehazeParams,
-    DespeckleParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
-    EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
-    GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams,
-    HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams, InvertParams,
-    LensBlurAperture, LensBlurParams, LensCorrectionParams, LensFlareParams, LineExtractMode,
-    LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
-    LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary,
-    MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams,
-    OilPaintParams, OutlineStrokeParams, OutlineStrokePlacement, PinchSpherizeParams,
-    PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
-    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams,
-    ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams,
-    SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams,
-    SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
-    TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
-    TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VignetteParams,
-    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    ColorOverlayShape, ColorRangeMask, ColorTraceParams, ContactShadowParams, CubeLutParams,
+    CutoutParams, DehazeParams, DespeckleParams, DiffuseGlowParams, DuotoneParams, DuotonePreset,
+    EdgeSmoothParams, EmbossParams, EqualizeParams, FilmGrainParams, GlassDisplacementMode,
+    GlassDisplacementParams, GlowingEdgesParams, GodRaysParams, GradientMapParams,
+    GradientMapPreset, HalationParams, HalftoneParams, HighPassParams, HighlightsShadowsParams,
+    HslParams, InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams,
+    LensFlareParams, LineExtractMode, LineExtractParams, LineKind, LinearGradientMask,
+    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
+    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
+    NeonGlowParams, NoiseDistribution, NoiseParams, OilPaintParams, OutlineStrokeParams,
+    OutlineStrokePlacement, PinchSpherizeParams, PixelStylizeMode, PixelStylizeParams,
+    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
+    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
+    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams, ScreenToneMode,
+    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
+    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
+    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
+    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VignetteParams, WaveDistortionMode,
+    WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
     apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
     evaluate_layer_mask, parse_cube_lut,
 };
@@ -1029,6 +1030,7 @@ enum EffectKind {
     ColorFill,
     OutlineStroke,
     RimLight,
+    ContactShadow,
     ColorTrace,
     ColorOverlay,
     NeonGlow,
@@ -1067,6 +1069,7 @@ enum RgbPickTarget {
     SpotlightTint,
     OutlineStrokeColor,
     RimLightColor,
+    ContactShadowColor,
     HalationTint,
     ToonShadeShadowTint,
     ToonShadeLightTint,
@@ -1087,6 +1090,7 @@ impl RgbPickTarget {
             Self::SpotlightTint => "スポットライトの光色",
             Self::OutlineStrokeColor => "縁取りの線色",
             Self::RimLightColor => "リムライトの光色",
+            Self::ContactShadowColor => "接触影の影色",
             Self::HalationTint => "ハレーションの暖色",
             Self::ToonShadeShadowTint => "トゥーン影色",
             Self::ToonShadeLightTint => "トゥーン光色",
@@ -1150,6 +1154,7 @@ impl EffectKind {
             LocalEffect::ColorFill(_) => Self::ColorFill,
             LocalEffect::OutlineStroke(_) => Self::OutlineStroke,
             LocalEffect::RimLight(_) => Self::RimLight,
+            LocalEffect::ContactShadow(_) => Self::ContactShadow,
             LocalEffect::ColorTrace(_) => Self::ColorTrace,
             LocalEffect::ColorOverlay(_) => Self::ColorOverlay,
             LocalEffect::NeonGlow(_) => Self::NeonGlow,
@@ -1230,6 +1235,7 @@ impl EffectKind {
             Self::ColorFill => "塗りつぶし",
             Self::OutlineStroke => "縁取り",
             Self::RimLight => "リムライト",
+            Self::ContactShadow => "接触影/AO",
             Self::ColorTrace => "色トレス",
             Self::ColorOverlay => "塗り/グラデーション",
             Self::NeonGlow => "ネオングロー",
@@ -1361,6 +1367,9 @@ impl EffectKind {
             }
             Self::RimLight => {
                 "マスク境界のうち光方向に向いた側だけを照らし、被写体の縁に逆光や輪郭光を足します。"
+            }
+            Self::ContactShadow => {
+                "マスク境界の内側を暗く締め、被写体や選択範囲に簡易AOや接触影を足します。"
             }
             Self::ColorTrace => "暗い線画を検出し、周辺の下地色を少し暗くした色へなじませます。",
             Self::ColorOverlay => {
@@ -1543,6 +1552,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Bloom,
             EffectKind::Halation,
             EffectKind::RimLight,
+            EffectKind::ContactShadow,
             EffectKind::GodRays,
             EffectKind::LensFlare,
             EffectKind::CloudFog,
@@ -8425,6 +8435,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
             "リムライト {:.0}px {:.0}°",
             params.width_px, params.light_angle_degrees
         ),
+        LocalEffect::ContactShadow(params) => format!(
+            "接触影 {:.0}px {:.0}%",
+            params.radius_px,
+            params.strength * 100.0
+        ),
         LocalEffect::ColorTrace(params) => format!("色トレス {:.0}%", params.strength * 100.0),
         LocalEffect::ColorOverlay(params) => format!(
             "塗り {} {:.0}%",
@@ -8769,6 +8784,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
             true
         }
         (LocalEffect::RimLight(params), RgbPickTarget::RimLightColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::ContactShadow(params), RgbPickTarget::ContactShadowColor) => {
             params.color_rgb = rgb;
             true
         }
@@ -13525,6 +13544,102 @@ fn draw_effect_params(
             changed |= strength.changed();
             strength.lab_hover_tip("輪郭光を元画像へ重ねる強さです。");
         }
+        LocalEffect::ContactShadow(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "内側AO") {
+                    *params = ContactShadowParams {
+                        radius_px: 8.0,
+                        softness_px: 4.0,
+                        strength: 0.32,
+                        color_rgb: [18, 16, 20],
+                        direction_degrees: 90.0,
+                        directionality: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "下側影") {
+                    *params = ContactShadowParams {
+                        radius_px: 12.0,
+                        softness_px: 6.0,
+                        strength: 0.45,
+                        color_rgb: [30, 25, 44],
+                        direction_degrees: 90.0,
+                        directionality: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "薄い締め") {
+                    *params = ContactShadowParams {
+                        radius_px: 5.0,
+                        softness_px: 3.0,
+                        strength: 0.18,
+                        color_rgb: [22, 20, 24],
+                        direction_degrees: 90.0,
+                        directionality: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "硬い陰") {
+                    *params = ContactShadowParams {
+                        radius_px: 4.0,
+                        softness_px: 1.0,
+                        strength: 0.55,
+                        color_rgb: [12, 10, 14],
+                        direction_degrees: 90.0,
+                        directionality: 0.70,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "マスク境界の内側だけを暗くします。初期状態では前ON/後ONなので、簡易AOがマスク内に収まります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "影色",
+                    &mut params.color_rgb,
+                    RgbPickTarget::ContactShadowColor,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let radius = ui.add(
+                egui::Slider::new(&mut params.radius_px, 0.0..=64.0)
+                    .text("幅")
+                    .suffix("px"),
+            );
+            changed |= radius.changed();
+            radius.lab_hover_tip("境界の内側へ入る影の幅です。0pxでは無効です。");
+            let softness = ui.add(
+                egui::Slider::new(&mut params.softness_px, 0.0..=32.0)
+                    .text("ぼかし")
+                    .suffix("px"),
+            );
+            changed |= softness.changed();
+            softness.lab_hover_tip("影の縁をなめらかにします。硬いセル影では低めにします。");
+            let angle = ui.add(
+                egui::Slider::new(&mut params.direction_degrees, -180.0..=180.0)
+                    .text("影方向")
+                    .suffix("°"),
+            );
+            changed |= angle.changed();
+            angle.lab_hover_tip("0°で右側、90°で下側、-90°で上側の境界に影を寄せます。");
+            let directionality =
+                ui.add(egui::Slider::new(&mut params.directionality, 0.0..=1.0).text("方向性"));
+            changed |= directionality.changed();
+            directionality.lab_hover_tip("0で全周AO、1で指定方向の境界だけを強く暗くします。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("影色へ寄せる強さです。");
+        }
         LocalEffect::ColorOverlay(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -16436,6 +16551,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ColorFill => LocalEffect::ColorFill(ColorFillParams::default()),
         EffectKind::OutlineStroke => LocalEffect::OutlineStroke(OutlineStrokeParams::default()),
         EffectKind::RimLight => LocalEffect::RimLight(RimLightParams::default()),
+        EffectKind::ContactShadow => LocalEffect::ContactShadow(ContactShadowParams::default()),
         EffectKind::ColorOverlay => LocalEffect::ColorOverlay(ColorOverlayParams::default()),
         EffectKind::NeonGlow => LocalEffect::NeonGlow(NeonGlowParams::default()),
         EffectKind::DiffuseGlow => LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
@@ -18764,6 +18880,7 @@ mod tests {
             EffectKind::Equalize,
             EffectKind::GradientMap,
             EffectKind::RimLight,
+            EffectKind::ContactShadow,
             EffectKind::NeonGlow,
             EffectKind::DiffuseGlow,
             EffectKind::Bloom,
@@ -19067,6 +19184,17 @@ mod tests {
             panic!("expected rim light effect");
         };
         assert_eq!(rim_light_params.color_rgb, [180, 220, 255]);
+
+        let mut contact_shadow = LocalEffect::ContactShadow(ContactShadowParams::default());
+        assert!(set_rgb_pick_target(
+            &mut contact_shadow,
+            RgbPickTarget::ContactShadowColor,
+            [24, 18, 36],
+        ));
+        let LocalEffect::ContactShadow(contact_shadow_params) = contact_shadow else {
+            panic!("expected contact shadow effect");
+        };
+        assert_eq!(contact_shadow_params.color_rgb, [24, 18, 36]);
 
         let mut halation = LocalEffect::Halation(HalationParams::default());
         assert!(set_rgb_pick_target(
