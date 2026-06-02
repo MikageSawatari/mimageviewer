@@ -39,6 +39,10 @@ impl std::error::Error for LocalAdjustError {}
 
 pub type Result<T> = std::result::Result<T, LocalAdjustError>;
 
+fn default_mask_after_effect() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LocalAdjustProgress {
     pub layer_index: usize,
@@ -110,11 +114,16 @@ pub struct LocalAdjustmentLayer {
     pub mask_inverted: bool,
     pub mask_expand_px: f32,
     pub mask_feather_px: f32,
+    #[serde(default)]
+    pub mask_before_effect: bool,
+    #[serde(default = "default_mask_after_effect")]
+    pub mask_after_effect: bool,
     pub effect: LocalEffect,
 }
 
 impl LocalAdjustmentLayer {
     pub fn new(name: impl Into<String>, mask: LocalMask, effect: LocalEffect) -> Self {
+        let mask_application = default_mask_application_for_effect(&effect);
         Self {
             name: name.into(),
             enabled: true,
@@ -124,9 +133,17 @@ impl LocalAdjustmentLayer {
             mask_inverted: false,
             mask_expand_px: 0.0,
             mask_feather_px: 0.0,
+            mask_before_effect: mask_application.before_effect,
+            mask_after_effect: mask_application.after_effect,
             effect,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaskApplication {
+    pub before_effect: bool,
+    pub after_effect: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -650,6 +667,25 @@ impl LocalEffect {
             Self::EdgeSmooth(_) => "エッジ保持ぼかし",
             Self::Median(_) => "メディアンフィルタ",
         }
+    }
+}
+
+pub fn default_mask_application_for_effect(effect: &LocalEffect) -> MaskApplication {
+    match effect {
+        LocalEffect::Wind(_)
+        | LocalEffect::GlowingEdges(_)
+        | LocalEffect::NeonGlow(_)
+        | LocalEffect::DiffuseGlow(_)
+        | LocalEffect::Bloom(_)
+        | LocalEffect::GodRays(_)
+        | LocalEffect::StarGlow(_) => MaskApplication {
+            before_effect: true,
+            after_effect: false,
+        },
+        _ => MaskApplication {
+            before_effect: false,
+            after_effect: true,
+        },
     }
 }
 
@@ -2745,6 +2781,15 @@ pub fn evaluate_layer_mask(
     image: RgbaImageRef<'_>,
     layer: &LocalAdjustmentLayer,
 ) -> Result<Vec<f32>> {
+    let mut alpha = evaluate_layer_mask_without_opacity(image, layer)?;
+    apply_mask_opacity(&mut alpha, layer.opacity);
+    Ok(alpha)
+}
+
+fn evaluate_layer_mask_without_opacity(
+    image: RgbaImageRef<'_>,
+    layer: &LocalAdjustmentLayer,
+) -> Result<Vec<f32>> {
     let image = image.validate()?;
     let mut alpha = evaluate_raw_mask(image, &layer.mask)?;
     apply_manual_override(
@@ -2774,11 +2819,14 @@ pub fn evaluate_layer_mask(
             layer.mask_feather_px.round() as usize,
         );
     }
-    let opacity = layer.opacity.clamp(0.0, 1.0);
-    for a in &mut alpha {
+    Ok(alpha)
+}
+
+fn apply_mask_opacity(alpha: &mut [f32], opacity: f32) {
+    let opacity = opacity.clamp(0.0, 1.0);
+    for a in alpha {
         *a = (*a * opacity).clamp(0.0, 1.0);
     }
-    Ok(alpha)
 }
 
 fn apply_manual_override(
@@ -2821,226 +2869,302 @@ where
         return Ok(());
     }
     check_cancel(cancel)?;
-    let mask = evaluate_layer_mask(image.as_ref(), layer)?;
-    if let LocalEffect::Mosaic(params) = &layer.effect {
-        image.pixels =
-            apply_mosaic_with_mask(&image.pixels, image.width, image.height, &mask, *params);
+    let base_mask = evaluate_layer_mask_without_opacity(image.as_ref(), layer)?;
+    let opacity = layer.opacity.clamp(0.0, 1.0);
+    let output_mask = if layer.mask_after_effect {
+        let mut output_mask = base_mask.clone();
+        apply_mask_opacity(&mut output_mask, opacity);
+        output_mask
+    } else {
+        vec![opacity; base_mask.len()]
+    };
+    if let LocalEffect::Mosaic(params) = &layer.effect
+        && !layer.mask_before_effect
+        && layer.mask_after_effect
+    {
+        image.pixels = apply_mosaic_with_mask(
+            &image.pixels,
+            image.width,
+            image.height,
+            &output_mask,
+            *params,
+        );
         return Ok(());
     }
-    let effected = match &layer.effect {
-        LocalEffect::None => unreachable!("None is handled before mask evaluation"),
-        LocalEffect::Tone(params) => apply_tone_image(&image.pixels, *params),
-        LocalEffect::ToneCurve(params) => apply_tone_curve(&image.pixels, *params),
-        LocalEffect::RgbToneCurve(params) => apply_rgb_tone_curve(&image.pixels, *params),
-        LocalEffect::ColorBalance(params) => apply_color_balance(&image.pixels, *params),
-        LocalEffect::ThreeWayColorGrading(params) => {
-            apply_three_way_color_grading(&image.pixels, *params)
+
+    let masked_input = if layer.mask_before_effect {
+        Some(mask_rgba_input(&image.pixels, &base_mask))
+    } else {
+        None
+    };
+    let effect_image = RgbaImageRef {
+        width: image.width,
+        height: image.height,
+        pixels: masked_input.as_deref().unwrap_or(&image.pixels),
+    };
+
+    let effected = {
+        let image = effect_image;
+        match &layer.effect {
+            LocalEffect::None => unreachable!("None is handled before mask evaluation"),
+            LocalEffect::Tone(params) => apply_tone_image(&image.pixels, *params),
+            LocalEffect::ToneCurve(params) => apply_tone_curve(&image.pixels, *params),
+            LocalEffect::RgbToneCurve(params) => apply_rgb_tone_curve(&image.pixels, *params),
+            LocalEffect::ColorBalance(params) => apply_color_balance(&image.pixels, *params),
+            LocalEffect::ThreeWayColorGrading(params) => {
+                apply_three_way_color_grading(&image.pixels, *params)
+            }
+            LocalEffect::SelectiveColor(params) => apply_selective_color(&image.pixels, *params),
+            LocalEffect::ChannelMixer(params) => apply_channel_mixer(&image.pixels, *params),
+            LocalEffect::Clarity(params) => apply_clarity(
+                &image.pixels,
+                image.width,
+                image.height,
+                params.radius_px.round().max(0.0) as usize,
+                params.amount.clamp(-1.0, 1.0),
+            ),
+            LocalEffect::Texture(params) => apply_texture(
+                &image.pixels,
+                image.width,
+                image.height,
+                params.radius_px.round().max(0.0) as usize,
+                params.amount.clamp(-1.0, 1.0),
+            ),
+            LocalEffect::HighPass(params) => apply_high_pass(
+                &image.pixels,
+                image.width,
+                image.height,
+                params.radius_px.round().max(0.0) as usize,
+                params.amount.clamp(0.0, 2.0),
+                params.contrast.clamp(0.1, 4.0),
+                params.detail_only,
+            ),
+            LocalEffect::HighlightsShadows(params) => {
+                apply_highlights_shadows(&image.pixels, *params)
+            }
+            LocalEffect::Dehaze(params) => {
+                apply_dehaze(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Blur(params) => box_blur_rgba(
+                &image.pixels,
+                image.width,
+                image.height,
+                params.radius_px.round().max(0.0) as usize,
+            ),
+            LocalEffect::MotionBlur(params) => {
+                apply_motion_blur(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Wind(params) => {
+                apply_wind(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::TiltShift(params) => {
+                apply_tilt_shift(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::LensBlur(params) => {
+                apply_lens_blur(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::RadialBlur(params) => {
+                apply_radial_blur(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::WaveDistortion(params) => {
+                apply_wave_distortion(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::PinchSpherize(params) => {
+                apply_pinch_spherize(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Twirl(params) => {
+                apply_twirl(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::PolarCoordinates(params) => {
+                apply_polar_coordinates(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::GlassDisplacement(params) => {
+                apply_glass_displacement(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::LensCorrection(params) => {
+                apply_lens_correction(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::LineExtract(params) => {
+                apply_line_extract(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::ArtisticMedia(params) => {
+                apply_artistic_media(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::BrushStroke(params) => {
+                apply_brush_stroke(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Cutout(params) => {
+                apply_cutout(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Emboss(params) => {
+                apply_emboss(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::PixelStylize(params) => {
+                apply_pixel_stylize(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Solarize(params) => apply_solarize(&image.pixels, *params),
+            LocalEffect::GlowingEdges(params) => {
+                apply_glowing_edges(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::OilPaint(params) => {
+                apply_oil_paint(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::SoftFocus(params) => apply_soft_focus(
+                &image.pixels,
+                image.width,
+                image.height,
+                params.radius_px.round().max(0.0) as usize,
+                params.strength.clamp(0.0, 1.0),
+            ),
+            LocalEffect::Mosaic(params) => {
+                let full_mask = vec![1.0; image.width.saturating_mul(image.height)];
+                apply_mosaic_with_mask(
+                    &image.pixels,
+                    image.width,
+                    image.height,
+                    &full_mask,
+                    *params,
+                )
+            }
+            LocalEffect::Sharpen(params) => apply_sharpen(
+                &image.pixels,
+                image.width,
+                image.height,
+                params.radius_px.round().max(0.0) as usize,
+                params.amount.clamp(0.0, 2.0),
+                params.threshold.clamp(0.0, 255.0),
+            ),
+            LocalEffect::SmartSharpen(params) => apply_smart_sharpen(
+                &image.pixels,
+                image.width,
+                image.height,
+                params.radius_px.round().max(0.0) as usize,
+                params.amount.clamp(0.0, 2.0),
+                params.edge_threshold.clamp(0.0, 1.0),
+                params.halo_suppression.clamp(0.0, 1.0),
+            ),
+            LocalEffect::Hsl(params) => apply_hsl(&image.pixels, *params),
+            LocalEffect::ColorMixer(params) => apply_color_mixer(&image.pixels, *params),
+            LocalEffect::Look(params) => apply_look(&image.pixels, *params),
+            LocalEffect::CubeLut(params) => apply_cube_lut(&image.pixels, params),
+            LocalEffect::Posterize(params) => apply_posterize(&image.pixels, *params),
+            LocalEffect::Threshold(params) => apply_threshold(&image.pixels, *params),
+            LocalEffect::Invert(params) => apply_invert(&image.pixels, *params),
+            LocalEffect::Duotone(params) => apply_duotone(&image.pixels, *params),
+            LocalEffect::Equalize(params) => apply_equalize(&image.pixels, *params),
+            LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
+            LocalEffect::ColorFill(params) => {
+                apply_color_fill(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::ColorOverlay(params) => {
+                apply_color_overlay(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::NeonGlow(params) => {
+                apply_neon_glow(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::DiffuseGlow(params) => {
+                apply_diffuse_glow(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Bloom(params) => {
+                apply_bloom(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::GodRays(params) => {
+                apply_god_rays(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::LensFlare(params) => {
+                apply_lens_flare(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::SpeedLines(params) => {
+                apply_speed_lines(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::CloudFog(params) => {
+                apply_cloud_fog(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Spotlight(params) => {
+                apply_spotlight(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Vignette(params) => {
+                apply_vignette(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::FilmGrain(params) => {
+                apply_film_grain(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::ChromaticAberration(params) => apply_chromatic_aberration(
+                &image.pixels,
+                image.width,
+                image.height,
+                params.offset_px.clamp(0.0, 24.0),
+            ),
+            LocalEffect::Halftone(params) => {
+                apply_halftone(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::ScreenTone(params) => {
+                apply_screen_tone(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::ColorHalftone(params) => {
+                apply_color_halftone(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Textureizer(params) => {
+                apply_textureizer(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::StarGlow(params) => {
+                apply_star_glow(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::EdgeSmooth(params) => {
+                apply_edge_smooth(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Median(params) => apply_median(
+                &image.pixels,
+                image.width,
+                image.height,
+                *params,
+                cancel,
+                |percent| {
+                    progress(LocalAdjustProgress {
+                        layer_index,
+                        layer_count,
+                        effect_name: layer.effect.progress_label(),
+                        percent,
+                    });
+                },
+            )?,
         }
-        LocalEffect::SelectiveColor(params) => apply_selective_color(&image.pixels, *params),
-        LocalEffect::ChannelMixer(params) => apply_channel_mixer(&image.pixels, *params),
-        LocalEffect::Clarity(params) => apply_clarity(
-            &image.pixels,
-            image.width,
-            image.height,
-            params.radius_px.round().max(0.0) as usize,
-            params.amount.clamp(-1.0, 1.0),
-        ),
-        LocalEffect::Texture(params) => apply_texture(
-            &image.pixels,
-            image.width,
-            image.height,
-            params.radius_px.round().max(0.0) as usize,
-            params.amount.clamp(-1.0, 1.0),
-        ),
-        LocalEffect::HighPass(params) => apply_high_pass(
-            &image.pixels,
-            image.width,
-            image.height,
-            params.radius_px.round().max(0.0) as usize,
-            params.amount.clamp(0.0, 2.0),
-            params.contrast.clamp(0.1, 4.0),
-            params.detail_only,
-        ),
-        LocalEffect::HighlightsShadows(params) => apply_highlights_shadows(&image.pixels, *params),
-        LocalEffect::Dehaze(params) => {
-            apply_dehaze(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::Blur(params) => box_blur_rgba(
-            &image.pixels,
-            image.width,
-            image.height,
-            params.radius_px.round().max(0.0) as usize,
-        ),
-        LocalEffect::MotionBlur(params) => {
-            apply_motion_blur(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::Wind(params) => apply_wind(&image.pixels, image.width, image.height, *params),
-        LocalEffect::TiltShift(params) => {
-            apply_tilt_shift(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::LensBlur(params) => {
-            apply_lens_blur(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::RadialBlur(params) => {
-            apply_radial_blur(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::WaveDistortion(params) => {
-            apply_wave_distortion(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::PinchSpherize(params) => {
-            apply_pinch_spherize(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::Twirl(params) => {
-            apply_twirl(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::PolarCoordinates(params) => {
-            apply_polar_coordinates(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::GlassDisplacement(params) => {
-            apply_glass_displacement(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::LensCorrection(params) => {
-            apply_lens_correction(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::LineExtract(params) => {
-            apply_line_extract(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::ArtisticMedia(params) => {
-            apply_artistic_media(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::BrushStroke(params) => {
-            apply_brush_stroke(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::Cutout(params) => {
-            apply_cutout(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::Emboss(params) => {
-            apply_emboss(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::PixelStylize(params) => {
-            apply_pixel_stylize(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::Solarize(params) => apply_solarize(&image.pixels, *params),
-        LocalEffect::GlowingEdges(params) => {
-            apply_glowing_edges(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::OilPaint(params) => {
-            apply_oil_paint(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::SoftFocus(params) => apply_soft_focus(
-            &image.pixels,
-            image.width,
-            image.height,
-            params.radius_px.round().max(0.0) as usize,
-            params.strength.clamp(0.0, 1.0),
-        ),
-        LocalEffect::Mosaic(_) => unreachable!("Mosaic is handled before generic mask blending"),
-        LocalEffect::Sharpen(params) => apply_sharpen(
-            &image.pixels,
-            image.width,
-            image.height,
-            params.radius_px.round().max(0.0) as usize,
-            params.amount.clamp(0.0, 2.0),
-            params.threshold.clamp(0.0, 255.0),
-        ),
-        LocalEffect::SmartSharpen(params) => apply_smart_sharpen(
-            &image.pixels,
-            image.width,
-            image.height,
-            params.radius_px.round().max(0.0) as usize,
-            params.amount.clamp(0.0, 2.0),
-            params.edge_threshold.clamp(0.0, 1.0),
-            params.halo_suppression.clamp(0.0, 1.0),
-        ),
-        LocalEffect::Hsl(params) => apply_hsl(&image.pixels, *params),
-        LocalEffect::ColorMixer(params) => apply_color_mixer(&image.pixels, *params),
-        LocalEffect::Look(params) => apply_look(&image.pixels, *params),
-        LocalEffect::CubeLut(params) => apply_cube_lut(&image.pixels, params),
-        LocalEffect::Posterize(params) => apply_posterize(&image.pixels, *params),
-        LocalEffect::Threshold(params) => apply_threshold(&image.pixels, *params),
-        LocalEffect::Invert(params) => apply_invert(&image.pixels, *params),
-        LocalEffect::Duotone(params) => apply_duotone(&image.pixels, *params),
-        LocalEffect::Equalize(params) => apply_equalize(&image.pixels, *params),
-        LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
-        LocalEffect::ColorFill(params) => {
-            apply_color_fill(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::ColorOverlay(params) => {
-            apply_color_overlay(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::NeonGlow(params) => {
-            apply_neon_glow(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::DiffuseGlow(params) => {
-            apply_diffuse_glow(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::Bloom(params) => {
-            apply_bloom(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::GodRays(params) => {
-            apply_god_rays(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::LensFlare(params) => {
-            apply_lens_flare(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::SpeedLines(params) => {
-            apply_speed_lines(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::CloudFog(params) => {
-            apply_cloud_fog(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::Spotlight(params) => {
-            apply_spotlight(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::Vignette(params) => {
-            apply_vignette(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::FilmGrain(params) => {
-            apply_film_grain(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::ChromaticAberration(params) => apply_chromatic_aberration(
-            &image.pixels,
-            image.width,
-            image.height,
-            params.offset_px.clamp(0.0, 24.0),
-        ),
-        LocalEffect::Halftone(params) => {
-            apply_halftone(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::ScreenTone(params) => {
-            apply_screen_tone(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::ColorHalftone(params) => {
-            apply_color_halftone(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::Textureizer(params) => {
-            apply_textureizer(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::StarGlow(params) => {
-            apply_star_glow(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::EdgeSmooth(params) => {
-            apply_edge_smooth(&image.pixels, image.width, image.height, *params)
-        }
-        LocalEffect::Median(params) => apply_median(
-            &image.pixels,
-            image.width,
-            image.height,
-            *params,
-            cancel,
-            |percent| {
-                progress(LocalAdjustProgress {
-                    layer_index,
-                    layer_count,
-                    effect_name: layer.effect.progress_label(),
-                    percent,
-                });
-            },
-        )?,
     };
     check_cancel(cancel)?;
-    blend_rgb_with_mask(&mut image.pixels, &effected, &mask);
+    if layer.mask_before_effect && !layer.mask_after_effect {
+        let input = masked_input
+            .as_deref()
+            .expect("masked input is present when mask_before_effect is true");
+        add_rgb_effect_delta(&mut image.pixels, &effected, input, opacity);
+    } else {
+        blend_rgb_with_mask(&mut image.pixels, &effected, &output_mask);
+    }
     Ok(())
+}
+
+fn mask_rgba_input(src: &[u8], mask: &[f32]) -> Vec<u8> {
+    let mut out = src.to_vec();
+    for (idx, amount) in mask.iter().enumerate() {
+        let o = idx * 4;
+        let amount = amount.clamp(0.0, 1.0);
+        for c in 0..4 {
+            out[o + c] = (src[o + c] as f32 * amount).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+fn add_rgb_effect_delta(base: &mut [u8], effected: &[u8], input: &[u8], opacity: f32) {
+    let opacity = opacity.clamp(0.0, 1.0);
+    for i in (0..base.len()).step_by(4) {
+        for c in 0..3 {
+            let delta = effected[i + c] as f32 - input[i + c] as f32;
+            base[i + c] = (base[i + c] as f32 + delta * opacity)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+        // Keep source alpha stable; alpha expansion is intentionally out of scope.
+    }
 }
 
 fn evaluate_raw_mask(image: RgbaImageRef<'_>, mask: &LocalMask) -> Result<Vec<f32>> {
@@ -8871,6 +8995,95 @@ mod tests {
         let alpha = evaluate_layer_mask(src.as_ref(), &layer).unwrap();
 
         assert_eq!(alpha, vec![1.0, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn spreading_effects_default_to_mask_before_without_mask_after() {
+        let wind = LocalAdjustmentLayer::new(
+            "wind",
+            LocalMask::Full,
+            LocalEffect::Wind(WindParams::default()),
+        );
+        assert!(wind.mask_before_effect);
+        assert!(!wind.mask_after_effect);
+
+        let wave = LocalAdjustmentLayer::new(
+            "wave",
+            LocalMask::Full,
+            LocalEffect::WaveDistortion(WaveDistortionParams::default()),
+        );
+        assert!(!wave.mask_before_effect);
+        assert!(wave.mask_after_effect);
+    }
+
+    #[test]
+    fn mask_before_without_mask_after_lets_wind_escape_mask() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255,
+            ],
+        )
+        .unwrap();
+        let mask = LocalMask::Raster(RasterMask {
+            width: 5,
+            height: 1,
+            alpha: vec![0.0, 1.0, 0.0, 0.0, 0.0],
+        });
+        let effect = LocalEffect::Wind(WindParams {
+            direction: WindDirection::Right,
+            source: WindSource::Bright,
+            distance_px: 3.0,
+            threshold: 0.0,
+            softness: 0.01,
+            turbulence: 0.0,
+            strength: 1.0,
+            seed: 1,
+        });
+        let mut layer = LocalAdjustmentLayer::new("wind", mask, effect);
+        layer.mask_before_effect = true;
+        layer.mask_after_effect = false;
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        assert!(out.pixels[2 * 4] > 0, "wind should leak to the right");
+        assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn mask_after_clips_wind_that_would_escape_mask() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255,
+            ],
+        )
+        .unwrap();
+        let mask = LocalMask::Raster(RasterMask {
+            width: 5,
+            height: 1,
+            alpha: vec![0.0, 1.0, 0.0, 0.0, 0.0],
+        });
+        let effect = LocalEffect::Wind(WindParams {
+            direction: WindDirection::Right,
+            source: WindSource::Bright,
+            distance_px: 3.0,
+            threshold: 0.0,
+            softness: 0.01,
+            turbulence: 0.0,
+            strength: 1.0,
+            seed: 1,
+        });
+        let mut layer = LocalAdjustmentLayer::new("wind", mask, effect);
+        layer.mask_before_effect = true;
+        layer.mask_after_effect = true;
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        assert_eq!(out.pixels[2 * 4], 0, "post mask should clip escaped wind");
+        assert_eq!(out.pixels[3], 255);
     }
 
     #[test]

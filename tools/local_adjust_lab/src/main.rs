@@ -37,7 +37,8 @@ use local_adjust_core::{
     TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
     ToneCurveParams, ToneParams, TwirlParams, VignetteParams, WaveDistortionMode,
     WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -374,7 +375,15 @@ struct StoredLayer {
     mask_inverted: bool,
     mask_expand_px: f32,
     mask_feather_px: f32,
+    #[serde(default)]
+    mask_before_effect: bool,
+    #[serde(default = "default_mask_after_effect")]
+    mask_after_effect: bool,
     effect: LocalEffect,
+}
+
+fn default_mask_after_effect() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -4714,7 +4723,7 @@ impl LocalAdjustLabApp {
         }
 
         let mut clicked_layer = None;
-        let mut layer_enabled_changed = false;
+        let mut layer_control_changed = false;
         let image_ref = self.image.as_ref().map(|image| image.source.as_ref());
         for idx in 0..self.layers.len() {
             let selected = idx == self.selected_layer;
@@ -4736,13 +4745,45 @@ impl LocalAdjustLabApp {
                 .inner_margin(6.0)
                 .show(ui, |ui| {
                     ui.set_min_width(panel_w - 12.0);
+                    ui.set_min_height(56.0);
                     let layer = &mut self.layers[idx];
                     let mut row_clicked = false;
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        if ui.checkbox(&mut layer.enabled, "").changed() {
-                            layer_enabled_changed = true;
-                        }
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.set_min_width(42.0);
+                            if ui.checkbox(&mut layer.enabled, "").changed() {
+                                layer_control_changed = true;
+                            }
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                let before_response = draw_mask_application_button(
+                                    ui,
+                                    "前",
+                                    layer.mask_before_effect,
+                                );
+                                let before_clicked = before_response.clicked();
+                                before_response.lab_hover_tip(
+                                    "ONで、マスク範囲だけを効果の入力素材にします。",
+                                );
+                                if before_clicked {
+                                    layer.mask_before_effect = !layer.mask_before_effect;
+                                    layer_control_changed = true;
+                                }
+
+                                let after_response =
+                                    draw_mask_application_button(ui, "後", layer.mask_after_effect);
+                                let after_clicked = after_response.clicked();
+                                after_response.lab_hover_tip(
+                                    "ONで、効果後の結果をマスク範囲で切り取ります。",
+                                );
+                                if after_clicked {
+                                    layer.mask_after_effect = !layer.mask_after_effect;
+                                    layer_control_changed = true;
+                                }
+                            });
+                        });
                         if draw_layer_mask_thumbnail(ui, layer, image_ref, selected).clicked() {
                             row_clicked = true;
                         }
@@ -4774,7 +4815,7 @@ impl LocalAdjustLabApp {
                         let spacer_w = ui.available_width().max(0.0);
                         if spacer_w > 4.0 {
                             let (_, spacer_response) =
-                                ui.allocate_exact_size(egui::vec2(spacer_w, 48.0), Sense::click());
+                                ui.allocate_exact_size(egui::vec2(spacer_w, 56.0), Sense::click());
                             if spacer_response
                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                                 .clicked()
@@ -4789,7 +4830,7 @@ impl LocalAdjustLabApp {
                 clicked_layer = Some(idx);
             }
         }
-        if layer_enabled_changed {
+        if layer_control_changed {
             self.mark_dirty();
         }
         if let Some(idx) = clicked_layer {
@@ -4908,6 +4949,25 @@ impl LocalAdjustLabApp {
             changed |= ui
                 .add(egui::Slider::new(&mut layer.opacity, 0.0..=1.0).text("不透明度"))
                 .changed();
+            ui.horizontal(|ui| {
+                ui.label("マスク適用");
+                let before_response =
+                    draw_mask_application_button(ui, "前", layer.mask_before_effect);
+                let before_clicked = before_response.clicked();
+                before_response.lab_hover_tip("ONで、マスク範囲だけを効果の入力素材にします。");
+                if before_clicked {
+                    layer.mask_before_effect = !layer.mask_before_effect;
+                    changed = true;
+                }
+                let after_response =
+                    draw_mask_application_button(ui, "後", layer.mask_after_effect);
+                let after_clicked = after_response.clicked();
+                after_response.lab_hover_tip("ONで、効果後の結果をマスク範囲で切り取ります。");
+                if after_clicked {
+                    layer.mask_after_effect = !layer.mask_after_effect;
+                    changed = true;
+                }
+            });
             changed |= ui
                 .add(egui::Slider::new(&mut layer.mask_expand_px, -32.0..=32.0).text("拡張/縮小"))
                 .changed();
@@ -5592,7 +5652,11 @@ impl LocalAdjustLabApp {
         if let Some(kind) = selected_kind
             && let Some(layer) = self.selected_layer_mut()
         {
-            layer.effect = default_effect(kind);
+            let effect = default_effect(kind);
+            let mask_application = default_mask_application_for_effect(&effect);
+            layer.effect = effect;
+            layer.mask_before_effect = mask_application.before_effect;
+            layer.mask_after_effect = mask_application.after_effect;
             self.effect_picker_dialog_open = false;
             if kind != EffectKind::SelectiveColor {
                 self.selective_color_pick_active = false;
@@ -7911,6 +7975,29 @@ fn draw_mask_controls(
         }
     }
     changed
+}
+
+fn draw_mask_application_button(
+    ui: &mut egui::Ui,
+    label: &'static str,
+    active: bool,
+) -> egui::Response {
+    let fill = if active {
+        Color32::from_rgba_unmultiplied(92, 132, 190, 230)
+    } else {
+        Color32::from_rgba_unmultiplied(36, 38, 42, 170)
+    };
+    let text_color = if active {
+        Color32::WHITE
+    } else {
+        Color32::from_gray(165)
+    };
+    ui.add_sized(
+        egui::vec2(20.0, 18.0),
+        egui::Button::new(egui::RichText::new(label).size(10.0).color(text_color))
+            .fill(fill)
+            .corner_radius(3.0),
+    )
 }
 
 fn draw_layer_mask_thumbnail(
@@ -16228,6 +16315,8 @@ fn stored_layer_from_local(layer: &LocalAdjustmentLayer) -> Result<StoredLayer, 
         mask_inverted: layer.mask_inverted,
         mask_expand_px: layer.mask_expand_px,
         mask_feather_px: layer.mask_feather_px,
+        mask_before_effect: layer.mask_before_effect,
+        mask_after_effect: layer.mask_after_effect,
         effect: layer.effect.clone(),
     })
 }
@@ -16242,6 +16331,8 @@ fn local_layer_from_stored(stored: &StoredLayer) -> Result<LocalAdjustmentLayer,
         mask_inverted: stored.mask_inverted,
         mask_expand_px: stored.mask_expand_px,
         mask_feather_px: stored.mask_feather_px,
+        mask_before_effect: stored.mask_before_effect,
+        mask_after_effect: stored.mask_after_effect,
         effect: stored.effect.clone(),
     })
 }
@@ -18275,6 +18366,8 @@ mod tests {
         });
         layer.mask_inverted = true;
         layer.mask_feather_px = 3.0;
+        layer.mask_before_effect = true;
+        layer.mask_after_effect = false;
 
         let stored = stored_layer_from_local(&layer).unwrap();
         let restored = local_layer_from_stored(&stored).unwrap();
@@ -18285,6 +18378,8 @@ mod tests {
         assert!(matches!(restored.effect, LocalEffect::SoftFocus(_)));
         assert!(restored.mask_inverted);
         assert_eq!(restored.mask_feather_px, 3.0);
+        assert!(restored.mask_before_effect);
+        assert!(!restored.mask_after_effect);
     }
 
     #[test]

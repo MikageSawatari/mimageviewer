@@ -104,6 +104,8 @@ struct LocalAdjustmentLayer {
     mask_inverted: bool,
     mask_expand_px: f32,
     mask_feather_px: f32,
+    mask_before_effect: bool, // true=マスク範囲だけを効果の入力にする
+    mask_after_effect: bool,  // true=効果結果をマスクで切り取る
     effect: LocalEffect,
 }
 ```
@@ -161,6 +163,11 @@ struct ManualMaskOverride {
 合成時は base mask を評価した後、追加マスクで alpha=1.0、削除マスクで alpha=0.0 に上書きし、
 その後に反転、拡張 / 縮小、フェザー、不透明度を適用する。これにより、円形グラデーションや
 被写体マットの滑らかな alpha を維持しつつ、ピクセル単位の追加 / 削除を2値マスクで軽く保存できる。
+レイヤーは効果計算前 / 効果計算後のどちらでマスクを使うかを個別に切り替えられる。
+既存互換の基本形は `mask_before_effect=false` / `mask_after_effect=true`。風、ブルーム、
+ネオングロー、光芒、クロス光など、マスク内の素材から外側へ広がる効果は
+`mask_before_effect=true` / `mask_after_effect=false` をデフォルトにする。波形ゆがみなど
+対象内に収めたい変形は、必要に応じて両方 ON にできる。
 プレビューでは、追加マスク / 削除マスクの両パネルを閉じているときは最終マスクを選択中の
 ベース色で表示する。追加マスク編集中は削除マスクを無視した base mask をベース色、
 操作中の追加マスクを編集色で表示する。削除マスク編集中は base mask + 追加マスクをベース色、

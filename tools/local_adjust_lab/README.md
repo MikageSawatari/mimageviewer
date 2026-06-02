@@ -144,6 +144,12 @@ the window.
   turn it off from the effect panel when it gets in the way. Gradient-like
   effects use the gradient handle system, and Tilt Shift keeps its dedicated
   range handles.
+- Each layer has `前` and `後` mask application toggles. `前` limits the effect
+  input to the mask before calculation; `後` clips the calculated result by the
+  mask. Existing-style local adjustments use `前` off / `後` on, while spreading
+  effects such as Wind, Neon Glow, Diffuse Glow, Bloom, God Rays, Glowing Edges,
+  and Cross/Star Glow default to `前` on / `後` off so the effect can extend past
+  the mask.
 - 3D LUT sample files are available under `tools/local_adjust_lab/sample_luts/`.
   They are small self-made `.cube` files for quick testing of the LUT loader and
   effect strength slider.
