@@ -35,17 +35,17 @@ use local_adjust_core::{
     OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, ParticleOverlayMode,
     ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection, PixelSortOrder,
     PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
-    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
-    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
-    RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode, ScreenToneParams,
-    SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams, SoftFocusParams,
-    SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask,
-    SubjectMaskRefinement, TextureParams, TextureizerMode, TextureizerParams,
-    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
-    ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams, WaterCausticsParams,
-    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
-    evaluate_layer_mask, parse_cube_lut,
+    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialFlashParams,
+    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
+    RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode,
+    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
+    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
+    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
+    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams,
+    WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
+    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1100,6 +1100,7 @@ enum EffectKind {
     ParticleOverlay,
     Aurora,
     Spotlight,
+    RadialFlash,
     Vignette,
     FilmGrain,
     Noise,
@@ -1271,6 +1272,7 @@ impl EffectKind {
             LocalEffect::ParticleOverlay(_) => Self::ParticleOverlay,
             LocalEffect::Aurora(_) => Self::Aurora,
             LocalEffect::Spotlight(_) => Self::Spotlight,
+            LocalEffect::RadialFlash(_) => Self::RadialFlash,
             LocalEffect::Vignette(_) => Self::Vignette,
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
             LocalEffect::Noise(_) => Self::Noise,
@@ -1373,6 +1375,7 @@ impl EffectKind {
             Self::ParticleOverlay => "雨/雪/花びら",
             Self::Aurora => "オーロラ",
             Self::Spotlight => "スポットライト",
+            Self::RadialFlash => "集中線フラッシュ",
             Self::Vignette => "ビネット",
             Self::FilmGrain => "フィルム粒子",
             Self::Noise => "ノイズ付加",
@@ -1409,6 +1412,7 @@ impl EffectKind {
             Self::WaterCaustics => "水中光網",
             Self::ParticleOverlay => "天候粒子",
             Self::Aurora => "オーロラ",
+            Self::RadialFlash => "フラッシュ",
             _ => self.label(),
         }
     }
@@ -1567,6 +1571,9 @@ impl EffectKind {
             Self::ParticleOverlay => "雨、雪、花びらの粒子を重ね、天候や舞い散る演出を作ります。",
             Self::Aurora => "縦に揺れる発光カーテンを重ね、夜空や幻想的な背景の光を作ります。",
             Self::Spotlight => "指定した中心を照らし、周辺を落として局所的な光を作ります。",
+            Self::RadialFlash => {
+                "中心から放射する白黒のくさび形フラッシュで、漫画的な衝撃や視線誘導を作ります。"
+            }
             Self::Vignette => "周辺を暗く、または明るくして視線を中央へ誘導します。",
             Self::FilmGrain => "粒状感を加え、フィルムや紙っぽい質感を作ります。",
             Self::Noise => {
@@ -1735,6 +1742,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
         kinds: &[
             EffectKind::Wind,
             EffectKind::SpeedLines,
+            EffectKind::RadialFlash,
             EffectKind::LineExtract,
             EffectKind::ColorTrace,
             EffectKind::ArtisticMedia,
@@ -7825,6 +7833,24 @@ impl LocalAdjustLabApp {
                     }
                 }
             }
+            LocalEffect::RadialFlash(params) => {
+                let (center_changed, center_used, center) = draw_effect_center_handle(
+                    ui,
+                    rect,
+                    ui.id().with(("radial_flash_center", layer_idx)),
+                    &mut params.center,
+                    "集中線フラッシュ中心",
+                    Color32::from_rgb(255, 245, 170),
+                );
+                changed |= center_changed;
+                used |= center_used;
+
+                let max_radius = distance_to_farthest_rect_corner(center, rect).max(1.0);
+                let stroke =
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 245, 170, 135));
+                painter.circle_stroke(center, max_radius * params.inner_radius, stroke);
+                painter.circle_stroke(center, max_radius * params.outer_radius, stroke);
+            }
             LocalEffect::Spotlight(params) => {
                 let center = norm_to_screen(rect, params.center);
                 let (center_changed, center_used) = drag_norm_handle(
@@ -8987,6 +9013,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
             SpeedLinesMode::Radial => format!("集中線 {}本", params.line_count),
             SpeedLinesMode::Parallel => format!("スピード線 {}本", params.line_count),
         },
+        LocalEffect::RadialFlash(params) => {
+            format!("集中線フラッシュ {}本", params.ray_count)
+        }
         LocalEffect::TiltShift(params) => {
             let mode = match params.mode {
                 TiltShiftMode::Linear => "線形",
@@ -9322,6 +9351,7 @@ fn effect_has_position_handles(effect: &LocalEffect) -> bool {
             | LocalEffect::LightLeak(_)
             | LocalEffect::BacklightHaze(_)
             | LocalEffect::SpeedLines(_)
+            | LocalEffect::RadialFlash(_)
             | LocalEffect::Spotlight(_)
     )
 }
@@ -11359,6 +11389,130 @@ fn draw_effect_params(
             changed |= seed_response.changed();
             seed_response.lab_hover_tip("線のばらつきパターンを変えます。");
             params.seed = seed.max(0) as u32;
+        }
+        LocalEffect::RadialFlash(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "白黒衝撃") {
+                    *params = RadialFlashParams {
+                        center: [0.5, 0.5],
+                        ray_count: 36,
+                        rotation_degrees: -6.0,
+                        inner_radius: 0.06,
+                        outer_radius: 1.0,
+                        softness: 0.14,
+                        white_amount: 0.92,
+                        black_amount: 0.70,
+                        invert: false,
+                        strength: 0.90,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "反転") {
+                    *params = RadialFlashParams {
+                        center: [0.5, 0.5],
+                        ray_count: 34,
+                        rotation_degrees: 8.0,
+                        inner_radius: 0.03,
+                        outer_radius: 1.0,
+                        softness: 0.12,
+                        white_amount: 0.72,
+                        black_amount: 0.92,
+                        invert: true,
+                        strength: 0.88,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "細かい") {
+                    *params = RadialFlashParams {
+                        center: [0.5, 0.5],
+                        ray_count: 80,
+                        rotation_degrees: 0.0,
+                        inner_radius: 0.12,
+                        outer_radius: 1.0,
+                        softness: 0.24,
+                        white_amount: 0.86,
+                        black_amount: 0.56,
+                        invert: false,
+                        strength: 0.76,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "中心抜き") {
+                    *params = RadialFlashParams {
+                        center: [0.5, 0.5],
+                        ray_count: 44,
+                        rotation_degrees: -12.0,
+                        inner_radius: 0.28,
+                        outer_radius: 1.0,
+                        softness: 0.20,
+                        white_amount: 0.92,
+                        black_amount: 0.58,
+                        invert: false,
+                        strength: 0.82,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "中心から白黒のくさび形フラッシュを放射します。漫画的な衝撃や強い視線誘導向けです。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            changed |= draw_effect_center_controls(
+                ui,
+                &mut params.center,
+                "フラッシュの中心位置です。",
+                "フラッシュの中心位置です。",
+                effect_position_handles_visible,
+                &mut set_effect_position_handles_visible,
+            );
+            let mut ray_count = params.ray_count as i32;
+            let ray_count_response =
+                ui.add(egui::Slider::new(&mut ray_count, 4..=240).text("分割数"));
+            changed |= ray_count_response.changed();
+            ray_count_response.lab_hover_tip(
+                "白黒に分ける放射方向の数です。多いほど細かいフラッシュになります。",
+            );
+            params.ray_count = ray_count.clamp(4, 240) as u32;
+            let rotation = ui.add(
+                egui::Slider::new(&mut params.rotation_degrees, -180.0..=180.0)
+                    .text("回転")
+                    .suffix("°"),
+            );
+            changed |= rotation.changed();
+            rotation.lab_hover_tip("白黒フラッシュの角度を回します。");
+            let inner =
+                ui.add(egui::Slider::new(&mut params.inner_radius, 0.0..=0.98).text("中心抜き"));
+            changed |= inner.changed();
+            inner.lab_hover_tip("中心付近を効果なしで残す範囲です。");
+            let outer =
+                ui.add(egui::Slider::new(&mut params.outer_radius, 0.02..=1.0).text("外側範囲"));
+            changed |= outer.changed();
+            outer.lab_hover_tip("フラッシュを出す外側の範囲です。");
+            if params.outer_radius < params.inner_radius {
+                params.outer_radius = (params.inner_radius + 0.02).min(1.0);
+            }
+            let softness =
+                ui.add(egui::Slider::new(&mut params.softness, 0.0..=1.0).text("柔らかさ"));
+            changed |= softness.changed();
+            softness.lab_hover_tip("白黒の境界と内外のフェードを柔らかくします。");
+            let white =
+                ui.add(egui::Slider::new(&mut params.white_amount, 0.0..=1.0).text("白の強さ"));
+            changed |= white.changed();
+            white.lab_hover_tip("白いくさびで明るくする量です。");
+            let black =
+                ui.add(egui::Slider::new(&mut params.black_amount, 0.0..=1.0).text("黒の強さ"));
+            changed |= black.changed();
+            black.lab_hover_tip("黒いくさびで暗くする量です。");
+            let invert = ui.checkbox(&mut params.invert, "白黒を反転");
+            changed |= invert.changed();
+            invert.lab_hover_tip("白と黒の配置を入れ替えます。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からフラッシュ結果へどれだけ近づけるかです。");
         }
         LocalEffect::TiltShift(params) => {
             if !params.range_initialized && !params.mode_selected {
@@ -19770,6 +19924,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::MotionBlur => LocalEffect::MotionBlur(MotionBlurParams::default()),
         EffectKind::Wind => LocalEffect::Wind(WindParams::default()),
         EffectKind::SpeedLines => LocalEffect::SpeedLines(SpeedLinesParams::default()),
+        EffectKind::RadialFlash => LocalEffect::RadialFlash(RadialFlashParams::default()),
         EffectKind::TiltShift => LocalEffect::TiltShift(TiltShiftParams::default()),
         EffectKind::LensBlur => LocalEffect::LensBlur(LensBlurParams::default()),
         EffectKind::RadialBlur => LocalEffect::RadialBlur(RadialBlurParams::default()),
@@ -22301,6 +22456,7 @@ mod tests {
             EffectKind::MotionBlur,
             EffectKind::Wind,
             EffectKind::SpeedLines,
+            EffectKind::RadialFlash,
             EffectKind::TiltShift,
             EffectKind::LensBlur,
             EffectKind::RadialBlur,
@@ -22440,6 +22596,7 @@ mod tests {
             LocalEffect::LightLeak(LightLeakParams::default()),
             LocalEffect::BacklightHaze(BacklightHazeParams::default()),
             LocalEffect::SpeedLines(SpeedLinesParams::default()),
+            LocalEffect::RadialFlash(RadialFlashParams::default()),
             LocalEffect::Spotlight(SpotlightParams::default()),
         ];
         for effect in handled {

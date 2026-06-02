@@ -595,6 +595,7 @@ pub enum LocalEffect {
     LightLeak(LightLeakParams),
     BacklightHaze(BacklightHazeParams),
     SpeedLines(SpeedLinesParams),
+    RadialFlash(RadialFlashParams),
     CloudFog(CloudFogParams),
     Spotlight(SpotlightParams),
     Vignette(VignetteParams),
@@ -697,6 +698,7 @@ impl LocalEffect {
             Self::LightLeak(_) => "ライトリーク",
             Self::BacklightHaze(_) => "逆光ヘイズ",
             Self::SpeedLines(_) => "集中線/スピード線",
+            Self::RadialFlash(_) => "集中線フラッシュ",
             Self::CloudFog(_) => "雲/霧",
             Self::Spotlight(_) => "スポットライト",
             Self::Vignette(_) => "ビネット",
@@ -2829,6 +2831,37 @@ impl Default for SpeedLinesParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RadialFlashParams {
+    pub center: [f32; 2],
+    pub ray_count: u32,
+    pub rotation_degrees: f32,
+    pub inner_radius: f32,
+    pub outer_radius: f32,
+    pub softness: f32,
+    pub white_amount: f32,
+    pub black_amount: f32,
+    pub invert: bool,
+    pub strength: f32,
+}
+
+impl Default for RadialFlashParams {
+    fn default() -> Self {
+        Self {
+            center: [0.5, 0.5],
+            ray_count: 36,
+            rotation_degrees: 0.0,
+            inner_radius: 0.05,
+            outer_radius: 1.0,
+            softness: 0.18,
+            white_amount: 0.85,
+            black_amount: 0.65,
+            invert: false,
+            strength: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudFogMode {
@@ -4043,6 +4076,9 @@ where
             }
             LocalEffect::SpeedLines(params) => {
                 apply_speed_lines(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::RadialFlash(params) => {
+                apply_radial_flash(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::CloudFog(params) => {
                 apply_cloud_fog(&image.pixels, image.width, image.height, *params)
@@ -10049,6 +10085,84 @@ fn blend_speed_line_pixel(out: &mut [u8], src: &[u8], i: usize, color: [f32; 3],
     }
 }
 
+fn apply_radial_flash(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: RadialFlashParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let ray_count = params.ray_count.clamp(4, 240);
+    let cx = params.center[0].clamp(0.0, 1.0) * width.saturating_sub(1) as f32;
+    let cy = params.center[1].clamp(0.0, 1.0) * height.saturating_sub(1) as f32;
+    let max_dist = farthest_corner_distance(width, height, cx, cy).max(1.0);
+    let mut inner = params.inner_radius.clamp(0.0, 1.0);
+    let mut outer = params.outer_radius.clamp(0.0, 1.0);
+    if outer < inner {
+        std::mem::swap(&mut inner, &mut outer);
+    }
+    outer = outer.max(inner + 0.001).min(1.0);
+    let softness = params.softness.clamp(0.0, 1.0);
+    let angular_softness = (0.006 + softness * 0.18).min(0.45);
+    let radial_softness = (0.015 + softness * 0.18).min(0.35);
+    let white_amount = params.white_amount.clamp(0.0, 1.0);
+    let black_amount = params.black_amount.clamp(0.0, 1.0);
+    let rotation = params.rotation_degrees.to_radians();
+    let mut out = src.to_vec();
+
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let alpha = src[i + 3] as f32 / 255.0;
+            if alpha <= f32::EPSILON {
+                continue;
+            }
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let dx = px - cx;
+            let dy = py - cy;
+            let dist_norm = (dx.hypot(dy) / max_dist).clamp(0.0, 1.0);
+            let radial = smoothstep(inner, (inner + radial_softness).min(outer), dist_norm)
+                * (1.0 - smoothstep((outer - radial_softness).max(inner), outer, dist_norm));
+            if radial <= f32::EPSILON {
+                continue;
+            }
+
+            let angle = (dy.atan2(dx) - rotation) / std::f32::consts::TAU;
+            let phase = angle.rem_euclid(1.0) * ray_count as f32;
+            let sector = phase.floor() as u32;
+            let in_sector = phase - sector as f32;
+            let edge_distance = in_sector.min(1.0 - in_sector);
+            let sector_fill = smoothstep(0.0, angular_softness, edge_distance);
+            if sector_fill <= f32::EPSILON {
+                continue;
+            }
+
+            let mut white_sector = sector % 2 == 0;
+            if params.invert {
+                white_sector = !white_sector;
+            }
+            let amount = radial * sector_fill * strength * alpha;
+            if white_sector {
+                for c in 0..3 {
+                    let base = src[i + c] as f32 / 255.0;
+                    out[i + c] = to_u8(lerp_f32(base, 1.0, amount * white_amount));
+                }
+            } else {
+                for c in 0..3 {
+                    let base = src[i + c] as f32 / 255.0;
+                    out[i + c] = to_u8(lerp_f32(base, 0.0, amount * black_amount));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn apply_cloud_fog(src: &[u8], width: usize, height: usize, params: CloudFogParams) -> Vec<u8> {
     let opacity = params.opacity.clamp(0.0, 1.0);
     if opacity <= f32::EPSILON || width == 0 || height == 0 {
@@ -15299,6 +15413,7 @@ mod tests {
             LocalEffect::LightLeak(LightLeakParams::default()),
             LocalEffect::BacklightHaze(BacklightHazeParams::default()),
             LocalEffect::SpeedLines(SpeedLinesParams::default()),
+            LocalEffect::RadialFlash(RadialFlashParams::default()),
             LocalEffect::CloudFog(CloudFogParams::default()),
             LocalEffect::Spotlight(SpotlightParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
@@ -15977,6 +16092,21 @@ mod tests {
                     strength: 1.0,
                     color_rgb: [255, 255, 255],
                     seed: 13,
+                }),
+            ),
+            full(
+                "radial flash dense rays",
+                LocalEffect::RadialFlash(RadialFlashParams {
+                    center: [0.5, 0.5],
+                    ray_count: 240,
+                    rotation_degrees: 180.0,
+                    inner_radius: 0.0,
+                    outer_radius: 1.0,
+                    softness: 1.0,
+                    white_amount: 1.0,
+                    black_amount: 1.0,
+                    invert: true,
+                    strength: 1.0,
                 }),
             ),
             full(
@@ -17839,6 +17969,65 @@ LUT_3D_SIZE 2
         assert!(out.pixels[edge] < src.pixels[edge]);
         assert_eq!(out.pixels[center], src.pixels[center]);
         assert_eq!(out.pixels[edge + 3], 180);
+    }
+
+    #[test]
+    fn radial_flash_alternates_white_and_black_wedges() {
+        let mut pixels = vec![128_u8; 5 * 5 * 4];
+        for chunk in pixels.chunks_exact_mut(4) {
+            chunk[3] = 255;
+        }
+        let src = RgbaImageBuf::new(5, 5, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "radial flash",
+            LocalMask::Full,
+            LocalEffect::RadialFlash(RadialFlashParams {
+                center: [0.5, 0.5],
+                ray_count: 4,
+                rotation_degrees: -45.0,
+                inner_radius: 0.0,
+                outer_radius: 1.0,
+                softness: 0.4,
+                white_amount: 1.0,
+                black_amount: 1.0,
+                invert: false,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let right = (2 * 5 + 4) * 4;
+        let bottom = (4 * 5 + 2) * 4;
+        assert!(out.pixels[right] > src.pixels[right]);
+        assert!(out.pixels[bottom] < src.pixels[bottom]);
+        assert_eq!(out.pixels[right + 3], 255);
+    }
+
+    #[test]
+    fn radial_flash_invert_swaps_wedge_tone() {
+        let mut pixels = vec![128_u8; 5 * 5 * 4];
+        for chunk in pixels.chunks_exact_mut(4) {
+            chunk[3] = 255;
+        }
+        let src = RgbaImageBuf::new(5, 5, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "radial flash",
+            LocalMask::Full,
+            LocalEffect::RadialFlash(RadialFlashParams {
+                center: [0.5, 0.5],
+                ray_count: 4,
+                rotation_degrees: -45.0,
+                inner_radius: 0.0,
+                outer_radius: 1.0,
+                softness: 0.4,
+                white_amount: 1.0,
+                black_amount: 1.0,
+                invert: true,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let right = (2 * 5 + 4) * 4;
+        assert!(out.pixels[right] < src.pixels[right]);
     }
 
     #[test]
