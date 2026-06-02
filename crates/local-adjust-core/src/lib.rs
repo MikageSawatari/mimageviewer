@@ -438,6 +438,7 @@ pub enum LocalEffect {
     LensCorrection(LensCorrectionParams),
     LineExtract(LineExtractParams),
     ArtisticMedia(ArtisticMediaParams),
+    BrushStroke(BrushStrokeParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -493,6 +494,7 @@ impl LocalEffect {
             Self::LensCorrection(_) => "レンズ補正",
             Self::LineExtract(_) => "線画抽出",
             Self::ArtisticMedia(_) => "絵画調",
+            Self::BrushStroke(_) => "筆致",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -1223,6 +1225,44 @@ impl Default for ArtisticMediaParams {
             radius_px: 5.0,
             edge_strength: 0.35,
             texture: 0.25,
+            color_amount: 0.85,
+            strength: 0.0,
+            seed: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrushStrokeMode {
+    #[default]
+    DryBrush,
+    PaintDaubs,
+    PaletteKnife,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BrushStrokeParams {
+    pub mode: BrushStrokeMode,
+    pub length_px: f32,
+    pub radius_px: f32,
+    pub angle_degrees: f32,
+    pub texture: f32,
+    pub edge_strength: f32,
+    pub color_amount: f32,
+    pub strength: f32,
+    pub seed: u32,
+}
+
+impl Default for BrushStrokeParams {
+    fn default() -> Self {
+        Self {
+            mode: BrushStrokeMode::DryBrush,
+            length_px: 12.0,
+            radius_px: 1.0,
+            angle_degrees: 0.0,
+            texture: 0.5,
+            edge_strength: 0.35,
             color_amount: 0.85,
             strength: 0.0,
             seed: 1,
@@ -2028,6 +2068,9 @@ where
         }
         LocalEffect::ArtisticMedia(params) => {
             apply_artistic_media(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::BrushStroke(params) => {
+            apply_brush_stroke(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -4079,6 +4122,218 @@ fn pencil_hatch(x: usize, y: usize, seed: u32) -> f32 {
 fn quantize_unit(v: f32, levels: f32) -> f32 {
     let steps = (levels.max(2.0) - 1.0).max(1.0);
     (v.clamp(0.0, 1.0) * steps).round() / steps
+}
+
+fn apply_brush_stroke(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: BrushStrokeParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let length = params.length_px.clamp(0.0, 96.0);
+    let radius = params.radius_px.clamp(0.0, 16.0);
+    if length <= 0.5 && radius <= 0.5 {
+        return src.to_vec();
+    }
+    let angle = params.angle_degrees.to_radians();
+    let dir = (angle.cos(), angle.sin());
+    let perp = (-dir.1, dir.0);
+    let texture = params.texture.clamp(0.0, 1.0);
+    let edge_strength = params.edge_strength.clamp(0.0, 1.0);
+    let color_amount = params.color_amount.clamp(0.0, 1.0);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let stroke = brush_stroke_average(
+                src,
+                width,
+                height,
+                x,
+                y,
+                dir,
+                perp,
+                length,
+                radius,
+                params.seed,
+            );
+            let edge = luma_edge_strength(src, width, height, x, y);
+            let luma = luma01(base[0], base[1], base[2]);
+            let target = match params.mode {
+                BrushStrokeMode::DryBrush => brush_stroke_dry(
+                    base,
+                    stroke,
+                    x,
+                    y,
+                    params.seed,
+                    texture,
+                    edge,
+                    edge_strength,
+                    color_amount,
+                ),
+                BrushStrokeMode::PaintDaubs => brush_stroke_paint(
+                    base,
+                    stroke,
+                    x,
+                    y,
+                    params.seed,
+                    texture,
+                    edge,
+                    edge_strength,
+                    color_amount,
+                ),
+                BrushStrokeMode::PaletteKnife => brush_stroke_palette_knife(
+                    base,
+                    stroke,
+                    luma,
+                    x,
+                    y,
+                    params.seed,
+                    texture,
+                    edge,
+                    edge_strength,
+                    color_amount,
+                ),
+            };
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], to_u8(target[c]), strength);
+            }
+        }
+    }
+    out
+}
+
+fn brush_stroke_average(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    dir: (f32, f32),
+    perp: (f32, f32),
+    length: f32,
+    radius: f32,
+    seed: u32,
+) -> [f32; 3] {
+    let samples = ((length / 2.0).ceil() as usize + 1).clamp(3, 49);
+    let mut sum = [0.0_f32; 3];
+    let mut weight_sum = 0.0_f32;
+    for sample in 0..samples {
+        let t = if samples <= 1 {
+            0.0
+        } else {
+            sample as f32 / (samples - 1) as f32 - 0.5
+        };
+        let taper = 1.0 - (t.abs() * 2.0).powf(1.35) * 0.45;
+        let jitter = signed_noise(
+            (x as u32).wrapping_add(sample as u32),
+            (y as u32).wrapping_add((sample as u32).rotate_left(5)),
+            seed ^ 0x7A13_D91D,
+        ) * radius;
+        let sx = x as f32 + dir.0 * t * length + perp.0 * jitter;
+        let sy = y as f32 + dir.1 * t * length + perp.1 * jitter;
+        let rgb = sample_rgb_bilinear(src, width, height, sx, sy);
+        for c in 0..3 {
+            sum[c] += rgb[c] * taper;
+        }
+        weight_sum += taper;
+    }
+    if weight_sum <= f32::EPSILON {
+        return sample_rgb_bilinear(src, width, height, x as f32, y as f32);
+    }
+    [
+        sum[0] / weight_sum,
+        sum[1] / weight_sum,
+        sum[2] / weight_sum,
+    ]
+}
+
+fn brush_stroke_dry(
+    base: [f32; 3],
+    stroke: [f32; 3],
+    x: usize,
+    y: usize,
+    seed: u32,
+    texture: f32,
+    edge: f32,
+    edge_strength: f32,
+    color_amount: f32,
+) -> [f32; 3] {
+    let grain = signed_noise(x as u32, y as u32, seed ^ 0xD20B_1A55);
+    let skip = smoothstep(-0.45, 0.75, grain) * texture;
+    let mut color = [
+        lerp_f32(stroke[0], base[0], 0.35 + skip * 0.25),
+        lerp_f32(stroke[1], base[1], 0.35 + skip * 0.25),
+        lerp_f32(stroke[2], base[2], 0.35 + skip * 0.25),
+    ];
+    color = adjust_saturation(color, 0.78 + color_amount * 0.52);
+    let dry = (grain * texture * 0.10 - edge * edge_strength * 0.36).clamp(-0.2, 0.2);
+    for c in &mut color {
+        *c = quantize_unit((*c + dry).clamp(0.0, 1.0), 20.0);
+    }
+    color
+}
+
+fn brush_stroke_paint(
+    base: [f32; 3],
+    stroke: [f32; 3],
+    x: usize,
+    y: usize,
+    seed: u32,
+    texture: f32,
+    edge: f32,
+    edge_strength: f32,
+    color_amount: f32,
+) -> [f32; 3] {
+    let daub = signed_noise((x / 2) as u32, (y / 2) as u32, seed ^ 0xA1CE_B00C);
+    let mut color = [
+        lerp_f32(base[0], stroke[0], 0.72),
+        lerp_f32(base[1], stroke[1], 0.72),
+        lerp_f32(base[2], stroke[2], 0.72),
+    ];
+    color = adjust_saturation(color, 0.92 + color_amount * 0.55);
+    let impasto = (daub * texture * 0.08 + edge * edge_strength * 0.10).clamp(-0.16, 0.18);
+    for c in &mut color {
+        *c = quantize_unit((*c + impasto).clamp(0.0, 1.0), 16.0);
+    }
+    color
+}
+
+fn brush_stroke_palette_knife(
+    base: [f32; 3],
+    stroke: [f32; 3],
+    luma: f32,
+    x: usize,
+    y: usize,
+    seed: u32,
+    texture: f32,
+    edge: f32,
+    edge_strength: f32,
+    color_amount: f32,
+) -> [f32; 3] {
+    let scrape = signed_noise((x / 3) as u32, y as u32, seed ^ 0x51AB_1E7D);
+    let mut color = [
+        lerp_f32(base[0], stroke[0], 0.86),
+        lerp_f32(base[1], stroke[1], 0.86),
+        lerp_f32(base[2], stroke[2], 0.86),
+    ];
+    color = adjust_saturation(color, 0.75 + color_amount * 0.65);
+    let ridge = (scrape.signum() * scrape.abs().powf(0.65) * texture * 0.11)
+        + edge * edge_strength * (0.14 - luma * 0.18);
+    for c in &mut color {
+        let contrast = (*c - 0.5) * (1.0 + edge_strength * 0.35) + 0.5;
+        *c = quantize_unit((contrast + ridge).clamp(0.0, 1.0), 10.0);
+    }
+    color
 }
 
 fn farthest_corner_distance(width: usize, height: usize, cx: f32, cy: f32) -> f32 {
@@ -6625,6 +6880,80 @@ mod tests {
     }
 
     #[test]
+    fn brush_stroke_paint_daubs_smears_color_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(3, 1, vec![0, 0, 0, 55, 240, 40, 20, 77, 0, 0, 0, 99]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "paint",
+            LocalMask::Full,
+            LocalEffect::BrushStroke(BrushStrokeParams {
+                mode: BrushStrokeMode::PaintDaubs,
+                length_px: 2.0,
+                radius_px: 0.0,
+                angle_degrees: 0.0,
+                texture: 0.0,
+                edge_strength: 0.0,
+                color_amount: 1.0,
+                strength: 1.0,
+                seed: 1,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert!(out.pixels[4] < src.pixels[4]);
+        assert_eq!(out.pixels[7], 77);
+    }
+
+    #[test]
+    fn brush_stroke_palette_knife_quantizes_color() {
+        let src = RgbaImageBuf::new(1, 1, vec![123, 101, 79, 201]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "knife",
+            LocalMask::Full,
+            LocalEffect::BrushStroke(BrushStrokeParams {
+                mode: BrushStrokeMode::PaletteKnife,
+                length_px: 2.0,
+                radius_px: 0.0,
+                angle_degrees: 0.0,
+                texture: 0.0,
+                edge_strength: 0.0,
+                color_amount: 1.0,
+                strength: 1.0,
+                seed: 1,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_ne!(out.pixels[0], src.pixels[0]);
+        assert_eq!(out.pixels[3], 201);
+    }
+
+    #[test]
+    fn brush_stroke_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "brush",
+            LocalMask::Full,
+            LocalEffect::BrushStroke(BrushStrokeParams {
+                mode: BrushStrokeMode::DryBrush,
+                length_px: 24.0,
+                radius_px: 4.0,
+                angle_degrees: -35.0,
+                texture: 1.0,
+                edge_strength: 1.0,
+                color_amount: 1.0,
+                strength: 0.0,
+                seed: 7,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn median_removes_isolated_speckle_and_preserves_alpha() {
         let mut pixels = vec![0_u8; 3 * 3 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -6913,6 +7242,7 @@ mod tests {
             LocalEffect::LensCorrection(LensCorrectionParams::default()),
             LocalEffect::LineExtract(LineExtractParams::default()),
             LocalEffect::ArtisticMedia(ArtisticMediaParams::default()),
+            LocalEffect::BrushStroke(BrushStrokeParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),

@@ -47,13 +47,13 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、49種)
+### `LocalEffect` (部分補正レイヤー、50種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
-HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
+HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, Wind, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
 GradientMap, DiffuseGlow, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
 
 ### マスク種別 (併用可能・差別化の武器)
@@ -126,7 +126,7 @@ OilPaint(Kuwahara) / LightLeak / 減色8機種 / CRT 3種＋複合 / カラー�
 - [x] **拡散光彩 (Diffuse Glow)** ★ **易〜中** — `DiffuseGlow`。明部抽出を白く拡散し、粒状ノイズでムラを加える夢幻的グロー。Bloom とは別の柔らかさ (PS)
 - [x] **風 / スピード (Wind)** ★ **易** — `Wind`。明部 / 暗部 / 輪郭を指定方向へ引きずる流線。距離、しきい値、柔らかさ、乱れ、seed に対応 (PS)
 - [x] **水彩 / 色鉛筆 / 鉛筆画** **中** — `ArtisticMedia`。水彩 / 色鉛筆 / 鉛筆画モードで、色のなじませ、輪郭、紙目/筆致、色量を調整できる絵画調フィルタ (PS / CSP Artistic)
-- [ ] **ドライブラシ / 塗料 / パレットナイフ** **中** — 筆致テクスチャ (PS)
+- [x] **ドライブラシ / 塗料 / パレットナイフ** **中** — `BrushStroke`。方向付きストロークで色を引き、ドライブラシ / 塗料 / パレットナイフの筆致、幅、角度、輪郭、色量を調整できる (PS)
 - [ ] **切り絵 (Cutout)** **中** — フラット・ベクター調 (PS)
 - [ ] **エンボス / 浮き彫り** **易** — 質感・モノクロ装飾 (PS / Krita)
 - [ ] **結晶化 / 点描 / Facet / メゾチント** **中** — 粒状スタイライズ (PS Pixelate)

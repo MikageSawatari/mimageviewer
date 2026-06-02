@@ -15,23 +15,24 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
-    ArtisticMediaMode, ArtisticMediaParams, BloomParams, BlurParams, ChannelMixerParams,
-    ChromaticAberrationParams, ClarityParams, ColorBalanceParams, ColorBalanceRange,
-    ColorGradeWheel, ColorMixerParams, ColorRangeMask, CubeLutParams, DehazeParams,
-    DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EqualizeParams,
-    FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams, GradientMapParams,
-    GradientMapPreset, HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams,
-    InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LineExtractMode,
-    LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
-    LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary,
-    MosaicParams, MosaicTileMode, MotionBlurParams, PinchSpherizeParams, PolarCoordinatesMode,
-    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
-    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
-    RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams,
-    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    ArtisticMediaMode, ArtisticMediaParams, BloomParams, BlurParams, BrushStrokeMode,
+    BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
+    ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
+    CubeLutParams, DehazeParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
+    EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
+    GradientMapParams, GradientMapPreset, HalftoneParams, HighPassParams, HighlightsShadowsParams,
+    HslParams, InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams,
+    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer,
+    LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams,
+    MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, PinchSpherizeParams,
+    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
+    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
+    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams,
+    SmartSharpenParams, SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams,
+    ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams,
+    VignetteParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
+    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -983,6 +984,7 @@ enum EffectKind {
     LensCorrection,
     LineExtract,
     ArtisticMedia,
+    BrushStroke,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1038,6 +1040,7 @@ impl EffectKind {
             LocalEffect::LensCorrection(_) => Self::LensCorrection,
             LocalEffect::LineExtract(_) => Self::LineExtract,
             LocalEffect::ArtisticMedia(_) => Self::ArtisticMedia,
+            LocalEffect::BrushStroke(_) => Self::BrushStroke,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1093,6 +1096,7 @@ impl EffectKind {
             Self::LensCorrection => "レンズ補正",
             Self::LineExtract => "線画抽出",
             Self::ArtisticMedia => "水彩/鉛筆",
+            Self::BrushStroke => "ドライブラシ/塗料",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1174,6 +1178,9 @@ impl EffectKind {
                 "明るさのエッジを検出して線画を作り、白地・黒地・元画像への重ねに使えます。"
             }
             Self::ArtisticMedia => "水彩、色鉛筆、鉛筆画の質感で、写真や3D素材を絵画調に寄せます。",
+            Self::BrushStroke => {
+                "方向のある筆跡で、ドライブラシ、厚塗り、パレットナイフ風の質感を作ります。"
+            }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
@@ -1286,6 +1293,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::LensCorrection,
             EffectKind::LineExtract,
             EffectKind::ArtisticMedia,
+            EffectKind::BrushStroke,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Texture,
@@ -7249,6 +7257,14 @@ fn effect_summary(effect: &LocalEffect) -> String {
             };
             format!("絵画調 {mode}")
         }
+        LocalEffect::BrushStroke(params) => {
+            let mode = match params.mode {
+                BrushStrokeMode::DryBrush => "ドライブラシ",
+                BrushStrokeMode::PaintDaubs => "塗料",
+                BrushStrokeMode::PaletteKnife => "パレットナイフ",
+            };
+            format!("筆致 {mode}")
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -9861,6 +9877,129 @@ fn draw_effect_params(
             seed_response.lab_hover_tip("紙目や鉛筆線のパターンを変えます。");
             params.seed = seed.max(0) as u32;
         }
+        LocalEffect::BrushStroke(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "ドライブラシ") {
+                    *params = BrushStrokeParams {
+                        mode: BrushStrokeMode::DryBrush,
+                        length_px: 14.0,
+                        radius_px: 1.0,
+                        angle_degrees: -12.0,
+                        texture: 0.72,
+                        edge_strength: 0.45,
+                        color_amount: 0.85,
+                        strength: 1.0,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "塗料") {
+                    *params = BrushStrokeParams {
+                        mode: BrushStrokeMode::PaintDaubs,
+                        length_px: 18.0,
+                        radius_px: 3.0,
+                        angle_degrees: -24.0,
+                        texture: 0.34,
+                        edge_strength: 0.28,
+                        color_amount: 1.0,
+                        strength: 0.92,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ナイフ") {
+                    *params = BrushStrokeParams {
+                        mode: BrushStrokeMode::PaletteKnife,
+                        length_px: 34.0,
+                        radius_px: 2.0,
+                        angle_degrees: 0.0,
+                        texture: 0.48,
+                        edge_strength: 0.55,
+                        color_amount: 0.9,
+                        strength: 1.0,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "斜め筆致") {
+                    *params = BrushStrokeParams {
+                        mode: BrushStrokeMode::DryBrush,
+                        length_px: 24.0,
+                        radius_px: 2.0,
+                        angle_degrees: -38.0,
+                        texture: 0.58,
+                        edge_strength: 0.42,
+                        color_amount: 0.9,
+                        strength: 0.9,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "方向のあるサンプルで色を引き、筆跡・厚塗り・ナイフ跡のテクスチャを重ねます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let dry = params.mode == BrushStrokeMode::DryBrush;
+                if ui.selectable_label(dry, "ドライ").clicked() && !dry {
+                    params.mode = BrushStrokeMode::DryBrush;
+                    changed = true;
+                }
+                let paint = params.mode == BrushStrokeMode::PaintDaubs;
+                if ui.selectable_label(paint, "塗料").clicked() && !paint {
+                    params.mode = BrushStrokeMode::PaintDaubs;
+                    changed = true;
+                }
+                let knife = params.mode == BrushStrokeMode::PaletteKnife;
+                if ui.selectable_label(knife, "ナイフ").clicked() && !knife {
+                    params.mode = BrushStrokeMode::PaletteKnife;
+                    changed = true;
+                }
+            });
+            let length = ui.add(
+                egui::Slider::new(&mut params.length_px, 0.0..=72.0)
+                    .text("ストローク長")
+                    .suffix("px"),
+            );
+            changed |= length.changed();
+            length.lab_hover_tip("筆跡として色を引く長さです。");
+            let radius = ui.add(
+                egui::Slider::new(&mut params.radius_px, 0.0..=12.0)
+                    .text("幅")
+                    .suffix("px"),
+            );
+            changed |= radius.changed();
+            radius.lab_hover_tip("筆跡の横方向の揺れや幅です。");
+            let angle = ui.add(
+                egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                    .text("角度")
+                    .suffix("°"),
+            );
+            changed |= angle.changed();
+            angle.lab_hover_tip("筆跡の方向です。");
+            let texture = ui.add(egui::Slider::new(&mut params.texture, 0.0..=1.0).text("筆致"));
+            changed |= texture.changed();
+            texture.lab_hover_tip("ドライ感、塗料の凹凸、ナイフ跡の強さです。");
+            let edge = ui.add(egui::Slider::new(&mut params.edge_strength, 0.0..=1.0).text("輪郭"));
+            changed |= edge.changed();
+            edge.lab_hover_tip("輪郭やストロークの硬さをどれだけ出すかです。");
+            let color = ui.add(egui::Slider::new(&mut params.color_amount, 0.0..=1.0).text("色量"));
+            changed |= color.changed();
+            color.lab_hover_tip("元の色の鮮やかさをどれだけ残すかです。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から筆致結果へどれだけ近づけるかです。");
+            let mut seed = params.seed as i32;
+            let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
+            changed |= seed_response.changed();
+            seed_response.lab_hover_tip("筆致テクスチャのパターンを変えます。");
+            params.seed = seed.max(0) as u32;
+        }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -12315,6 +12454,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::LensCorrection => LocalEffect::LensCorrection(LensCorrectionParams::default()),
         EffectKind::LineExtract => LocalEffect::LineExtract(LineExtractParams::default()),
         EffectKind::ArtisticMedia => LocalEffect::ArtisticMedia(ArtisticMediaParams::default()),
+        EffectKind::BrushStroke => LocalEffect::BrushStroke(BrushStrokeParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
