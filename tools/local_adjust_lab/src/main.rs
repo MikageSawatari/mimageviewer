@@ -8851,6 +8851,36 @@ struct EffectParamResponse {
     set_effect_position_handles_visible: Option<bool>,
 }
 
+fn draw_effect_position_handle_toggle(ui: &mut egui::Ui, visible: bool) -> Option<bool> {
+    let mut show_handles = visible;
+    let response = ui.checkbox(&mut show_handles, "画像ハンドルを表示");
+    let changed = response.changed();
+    response.lab_hover_tip("ONの間、画像上の位置ハンドルをドラッグして中心位置を調整できます。");
+    changed.then_some(show_handles)
+}
+
+fn draw_effect_center_controls(
+    ui: &mut egui::Ui,
+    center: &mut [f32; 2],
+    x_tip: impl Into<egui::WidgetText>,
+    y_tip: impl Into<egui::WidgetText>,
+    effect_position_handles_visible: bool,
+    set_effect_position_handles_visible: &mut Option<bool>,
+) -> bool {
+    if let Some(visible) = draw_effect_position_handle_toggle(ui, effect_position_handles_visible) {
+        *set_effect_position_handles_visible = Some(visible);
+    }
+
+    let mut changed = false;
+    let center_x = ui.add(egui::Slider::new(&mut center[0], 0.0..=1.0).text("中心 X"));
+    changed |= center_x.changed();
+    center_x.lab_hover_tip(x_tip);
+    let center_y = ui.add(egui::Slider::new(&mut center[1], 0.0..=1.0).text("中心 Y"));
+    changed |= center_y.changed();
+    center_y.lab_hover_tip(y_tip);
+    changed
+}
+
 fn draw_effect_params(
     ui: &mut egui::Ui,
     layer: &mut LocalAdjustmentLayer,
@@ -8894,15 +8924,6 @@ fn draw_effect_params(
             cancel_rgb_pick,
             set_effect_position_handles_visible,
         };
-    }
-    if effect_has_position_handles(&layer.effect) {
-        let mut show_handles = effect_position_handles_visible;
-        let handle_toggle = ui.checkbox(&mut show_handles, "画像ハンドルを表示");
-        if handle_toggle.changed() {
-            set_effect_position_handles_visible = Some(show_handles);
-        }
-        handle_toggle
-            .lab_hover_tip("ONの間、画像上の位置ハンドルをドラッグして中心位置を調整できます。");
     }
     match &mut layer.effect {
         LocalEffect::None => {
@@ -10127,16 +10148,15 @@ fn draw_effect_params(
                     changed = true;
                 }
             });
-            if params.mode == SpeedLinesMode::Radial {
-                let center_x =
-                    ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
-                changed |= center_x.changed();
-                center_x.lab_hover_tip("集中点の横位置です。");
-                let center_y =
-                    ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心Y"));
-                changed |= center_y.changed();
-                center_y.lab_hover_tip("集中点の縦位置です。");
-            } else {
+            changed |= draw_effect_center_controls(
+                ui,
+                &mut params.center,
+                "放射では集中点、平行では線の基準位置です。",
+                "放射では集中点、平行では線の基準位置です。",
+                effect_position_handles_visible,
+                &mut set_effect_position_handles_visible,
+            );
+            if params.mode != SpeedLinesMode::Radial {
                 let angle = ui.add(
                     egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
                         .text("角度")
@@ -10527,16 +10547,14 @@ fn draw_effect_params(
                     changed = true;
                 }
             });
-            let center_x =
-                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
-            changed |= center_x.changed();
-            center_x.lab_hover_tip(
+            changed |= draw_effect_center_controls(
+                ui,
+                &mut params.center,
                 "ぼかしの中心位置です。ズームでは集中点、回転では回転中心になります。",
+                "ぼかしの中心位置です。",
+                effect_position_handles_visible,
+                &mut set_effect_position_handles_visible,
             );
-            let center_y =
-                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
-            changed |= center_y.changed();
-            center_y.lab_hover_tip("ぼかしの中心位置です。");
             match params.mode {
                 RadialBlurMode::Zoom => {
                     let zoom =
@@ -10661,14 +10679,14 @@ fn draw_effect_params(
                 "波の開始位置をずらします。アニメーション用ではなく、静止画の位置合わせ用です。",
             );
             if params.mode == WaveDistortionMode::Ripple {
-                let center_x =
-                    ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
-                changed |= center_x.changed();
-                center_x.lab_hover_tip("さざ波の中心位置です。");
-                let center_y =
-                    ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
-                changed |= center_y.changed();
-                center_y.lab_hover_tip("さざ波の中心位置です。");
+                changed |= draw_effect_center_controls(
+                    ui,
+                    &mut params.center,
+                    "さざ波の中心位置です。",
+                    "さざ波の中心位置です。",
+                    effect_position_handles_visible,
+                    &mut set_effect_position_handles_visible,
+                );
             }
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
@@ -10727,14 +10745,14 @@ fn draw_effect_params(
             let radius = ui.add(egui::Slider::new(&mut params.radius_px, 0.0..=800.0).text("半径"));
             changed |= radius.changed();
             radius.lab_hover_tip("効果の範囲です。0 のときは中心から画像の角までを使います。");
-            let center_x =
-                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
-            changed |= center_x.changed();
-            center_x.lab_hover_tip("変形の中心位置です。");
-            let center_y =
-                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
-            changed |= center_y.changed();
-            center_y.lab_hover_tip("変形の中心位置です。");
+            changed |= draw_effect_center_controls(
+                ui,
+                &mut params.center,
+                "変形の中心位置です。",
+                "変形の中心位置です。",
+                effect_position_handles_visible,
+                &mut set_effect_position_handles_visible,
+            );
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から変形結果へどれだけ近づけるかです。");
@@ -10796,14 +10814,14 @@ fn draw_effect_params(
             let radius = ui.add(egui::Slider::new(&mut params.radius_px, 0.0..=800.0).text("半径"));
             changed |= radius.changed();
             radius.lab_hover_tip("効果の範囲です。0 のときは中心から画像の角までを使います。");
-            let center_x =
-                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
-            changed |= center_x.changed();
-            center_x.lab_hover_tip("渦巻きの中心位置です。");
-            let center_y =
-                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
-            changed |= center_y.changed();
-            center_y.lab_hover_tip("渦巻きの中心位置です。");
+            changed |= draw_effect_center_controls(
+                ui,
+                &mut params.center,
+                "渦巻きの中心位置です。",
+                "渦巻きの中心位置です。",
+                effect_position_handles_visible,
+                &mut set_effect_position_handles_visible,
+            );
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から渦巻き結果へどれだけ近づけるかです。");
@@ -10888,14 +10906,14 @@ fn draw_effect_params(
             );
             changed |= angle.changed();
             angle.lab_hover_tip("巻き始めの角度を回します。継ぎ目や上方向の位置合わせに使います。");
-            let center_x =
-                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
-            changed |= center_x.changed();
-            center_x.lab_hover_tip("円形変換の中心位置です。");
-            let center_y =
-                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
-            changed |= center_y.changed();
-            center_y.lab_hover_tip("円形変換の中心位置です。");
+            changed |= draw_effect_center_controls(
+                ui,
+                &mut params.center,
+                "円形変換の中心位置です。",
+                "円形変換の中心位置です。",
+                effect_position_handles_visible,
+                &mut set_effect_position_handles_visible,
+            );
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から極座標変換結果へどれだけ近づけるかです。");
@@ -11079,14 +11097,14 @@ fn draw_effect_params(
                 ui.add(egui::Slider::new(&mut params.zoom, 0.0..=0.5).text("ズーム/切り抜き"));
             changed |= zoom.changed();
             zoom.lab_hover_tip("歪み補正で端が伸びるとき、少し拡大して端を切ります。");
-            let center_x =
-                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
-            changed |= center_x.changed();
-            center_x.lab_hover_tip("レンズ補正の中心位置です。");
-            let center_y =
-                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
-            changed |= center_y.changed();
-            center_y.lab_hover_tip("レンズ補正の中心位置です。");
+            changed |= draw_effect_center_controls(
+                ui,
+                &mut params.center,
+                "レンズ補正の中心位置です。",
+                "レンズ補正の中心位置です。",
+                effect_position_handles_visible,
+                &mut set_effect_position_handles_visible,
+            );
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からレンズ補正結果へどれだけ近づけるかです。");
@@ -13488,14 +13506,14 @@ fn draw_effect_params(
                 .size(10.0)
                 .color(Color32::from_gray(170)),
             );
-            let center_x =
-                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
-            changed |= center_x.changed();
-            center_x.lab_hover_tip("光が差し込む中心の横位置です。");
-            let center_y =
-                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心Y"));
-            changed |= center_y.changed();
-            center_y.lab_hover_tip("光が差し込む中心の縦位置です。");
+            changed |= draw_effect_center_controls(
+                ui,
+                &mut params.center,
+                "光が差し込む中心の横位置です。",
+                "光が差し込む中心の縦位置です。",
+                effect_position_handles_visible,
+                &mut set_effect_position_handles_visible,
+            );
             changed |= ui
                 .add(
                     egui::Slider::new(&mut params.threshold, 0.0..=0.98)
@@ -13566,14 +13584,14 @@ fn draw_effect_params(
                 .size(10.0)
                 .color(Color32::from_gray(170)),
             );
-            let center_x =
-                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
-            changed |= center_x.changed();
-            center_x.lab_hover_tip("フレア光源の横位置です。");
-            let center_y =
-                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心Y"));
-            changed |= center_y.changed();
-            center_y.lab_hover_tip("フレア光源の縦位置です。");
+            changed |= draw_effect_center_controls(
+                ui,
+                &mut params.center,
+                "フレア光源の横位置です。",
+                "フレア光源の縦位置です。",
+                effect_position_handles_visible,
+                &mut set_effect_position_handles_visible,
+            );
             changed |= ui
                 .add(egui::Slider::new(&mut params.radius_px, 4.0..=420.0).text("範囲"))
                 .changed();
@@ -13774,14 +13792,14 @@ fn draw_effect_params(
                 .size(10.0)
                 .color(Color32::from_gray(170)),
             );
-            let center_x =
-                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心X"));
-            changed |= center_x.changed();
-            center_x.lab_hover_tip("ライト中心の横位置です。");
-            let center_y =
-                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心Y"));
-            changed |= center_y.changed();
-            center_y.lab_hover_tip("ライト中心の縦位置です。");
+            changed |= draw_effect_center_controls(
+                ui,
+                &mut params.center,
+                "ライト中心の横位置です。",
+                "ライト中心の縦位置です。",
+                effect_position_handles_visible,
+                &mut set_effect_position_handles_visible,
+            );
             let radius = ui.add(egui::Slider::new(&mut params.radius, 0.0..=1.0).text("半径"));
             changed |= radius.changed();
             radius.lab_hover_tip("明るい中心部の大きさです。");
