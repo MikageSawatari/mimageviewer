@@ -429,6 +429,7 @@ pub enum LocalEffect {
     TiltShift(TiltShiftParams),
     LensBlur(LensBlurParams),
     RadialBlur(RadialBlurParams),
+    WaveDistortion(WaveDistortionParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
@@ -474,6 +475,7 @@ impl LocalEffect {
             Self::TiltShift(_) => "チルトぼかし",
             Self::LensBlur(_) => "レンズぼかし",
             Self::RadialBlur(_) => "放射ぼかし",
+            Self::WaveDistortion(_) => "波形ゆがみ",
             Self::SoftFocus(_) => "ソフトフォーカス",
             Self::Mosaic(_) => "モザイク",
             Self::Sharpen(_) => "シャープ",
@@ -935,6 +937,39 @@ impl Default for RadialBlurParams {
             zoom_px: 0.0,
             spin_degrees: 0.0,
             samples: 25,
+            strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WaveDistortionMode {
+    #[default]
+    Horizontal,
+    Vertical,
+    Ripple,
+    Zigzag,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WaveDistortionParams {
+    pub mode: WaveDistortionMode,
+    pub amplitude_px: f32,
+    pub wavelength_px: f32,
+    pub phase_degrees: f32,
+    pub center: [f32; 2],
+    pub strength: f32,
+}
+
+impl Default for WaveDistortionParams {
+    fn default() -> Self {
+        Self {
+            mode: WaveDistortionMode::Horizontal,
+            amplitude_px: 0.0,
+            wavelength_px: 64.0,
+            phase_degrees: 0.0,
+            center: [0.5, 0.5],
             strength: 0.0,
         }
     }
@@ -1690,6 +1725,9 @@ where
         }
         LocalEffect::RadialBlur(params) => {
             apply_radial_blur(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::WaveDistortion(params) => {
+            apply_wave_distortion(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::SoftFocus(params) => apply_soft_focus(
             &image.pixels,
@@ -2968,6 +3006,71 @@ fn apply_radial_blur(src: &[u8], width: usize, height: usize, params: RadialBlur
         }
     }
     out
+}
+
+fn apply_wave_distortion(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: WaveDistortionParams,
+) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let amplitude = params.amplitude_px.clamp(-240.0, 240.0);
+    if width == 0 || height == 0 || strength <= f32::EPSILON || amplitude.abs() <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let wavelength = params.wavelength_px.max(2.0);
+    let phase = params.phase_degrees.to_radians();
+    let cx = (width.saturating_sub(1)) as f32 * params.center[0].clamp(0.0, 1.0);
+    let cy = (height.saturating_sub(1)) as f32 * params.center[1].clamp(0.0, 1.0);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let xf = x as f32;
+            let yf = y as f32;
+            let (sx, sy) = match params.mode {
+                WaveDistortionMode::Horizontal => {
+                    let wave = (yf / wavelength * std::f32::consts::TAU + phase).sin();
+                    (xf + amplitude * wave, yf)
+                }
+                WaveDistortionMode::Vertical => {
+                    let wave = (xf / wavelength * std::f32::consts::TAU + phase).sin();
+                    (xf, yf + amplitude * wave)
+                }
+                WaveDistortionMode::Ripple => {
+                    let dx = xf - cx;
+                    let dy = yf - cy;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist <= f32::EPSILON {
+                        (xf, yf)
+                    } else {
+                        let wave = (dist / wavelength * std::f32::consts::TAU + phase).sin();
+                        let offset = amplitude * wave;
+                        (xf + dx / dist * offset, yf + dy / dist * offset)
+                    }
+                }
+                WaveDistortionMode::Zigzag => {
+                    let wave = zigzag_wave(yf / wavelength + phase / std::f32::consts::TAU);
+                    (xf + amplitude * wave, yf)
+                }
+            };
+            let sampled = sample_rgb_bilinear(src, width, height, sx, sy);
+            let i = (y * width + x) * 4;
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], to_u8(sampled[c]), strength);
+            }
+        }
+    }
+    out
+}
+
+fn zigzag_wave(t: f32) -> f32 {
+    let t = t.rem_euclid(1.0);
+    if t < 0.5 {
+        t * 4.0 - 1.0
+    } else {
+        3.0 - t * 4.0
+    }
 }
 
 fn farthest_corner_distance(width: usize, height: usize, cx: f32, cy: f32) -> f32 {
@@ -4853,6 +4956,58 @@ mod tests {
     }
 
     #[test]
+    fn wave_distortion_horizontal_offsets_pixels_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                10, 10, 10, 99, 40, 40, 40, 99, 80, 80, 80, 99, 120, 120, 120, 99, 160, 160, 160,
+                99,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "wave",
+            LocalMask::Full,
+            LocalEffect::WaveDistortion(WaveDistortionParams {
+                mode: WaveDistortionMode::Horizontal,
+                amplitude_px: 1.0,
+                wavelength_px: 64.0,
+                phase_degrees: 90.0,
+                center: [0.5, 0.5],
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels[0], src.pixels[4]);
+        assert_eq!(out.pixels[3], 99);
+    }
+
+    #[test]
+    fn wave_distortion_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "wave",
+            LocalMask::Full,
+            LocalEffect::WaveDistortion(WaveDistortionParams {
+                mode: WaveDistortionMode::Ripple,
+                amplitude_px: 8.0,
+                wavelength_px: 16.0,
+                phase_degrees: 45.0,
+                center: [0.5, 0.5],
+                strength: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn median_removes_isolated_speckle_and_preserves_alpha() {
         let mut pixels = vec![0_u8; 3 * 3 * 4];
         for px in pixels.chunks_exact_mut(4) {
@@ -5132,6 +5287,7 @@ mod tests {
             LocalEffect::TiltShift(TiltShiftParams::default()),
             LocalEffect::LensBlur(LensBlurParams::default()),
             LocalEffect::RadialBlur(RadialBlurParams::default()),
+            LocalEffect::WaveDistortion(WaveDistortionParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),

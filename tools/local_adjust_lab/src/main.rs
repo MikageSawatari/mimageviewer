@@ -26,8 +26,9 @@ use local_adjust_core::{
     RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
     RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
     SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, VignetteParams, apply_layers,
-    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, VignetteParams,
+    WaveDistortionMode, WaveDistortionParams, apply_layers, apply_layers_with_progress,
+    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -970,6 +971,7 @@ enum EffectKind {
     TiltShift,
     LensBlur,
     RadialBlur,
+    WaveDistortion,
     SoftFocus,
     Mosaic,
     Sharpen,
@@ -1015,6 +1017,7 @@ impl EffectKind {
             LocalEffect::TiltShift(_) => Self::TiltShift,
             LocalEffect::LensBlur(_) => Self::LensBlur,
             LocalEffect::RadialBlur(_) => Self::RadialBlur,
+            LocalEffect::WaveDistortion(_) => Self::WaveDistortion,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
@@ -1060,6 +1063,7 @@ impl EffectKind {
             Self::TiltShift => "チルトシフト",
             Self::LensBlur => "レンズぼかし",
             Self::RadialBlur => "放射/回転ぼかし",
+            Self::WaveDistortion => "波形ゆがみ",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
@@ -1114,6 +1118,9 @@ impl EffectKind {
             Self::LensBlur => "絞り形状でぼかし、明るい点を玉ボケのように膨らませます。",
             Self::RadialBlur => {
                 "中心から外へ伸びるズームぼかし、または中心周りの回転ぼかしを作ります。"
+            }
+            Self::WaveDistortion => {
+                "波やさざ波のように画像を揺らし、水面・反射・熱気の表現に使います。"
             }
             Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
@@ -1215,6 +1222,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::TiltShift,
             EffectKind::LensBlur,
             EffectKind::RadialBlur,
+            EffectKind::WaveDistortion,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Texture,
@@ -7113,6 +7121,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
             RadialBlurMode::Zoom => format!("ズームぼかし {:.0}px", params.zoom_px),
             RadialBlurMode::Spin => format!("回転ぼかし {:+.0}°", params.spin_degrees),
         },
+        LocalEffect::WaveDistortion(params) => {
+            format!("波形ゆがみ {:.0}px", params.amplitude_px)
+        }
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!(
             "モザイク {}",
@@ -8858,6 +8869,117 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から放射/回転ぼかし結果へどれだけ近づけるかです。");
+        }
+        LocalEffect::WaveDistortion(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "水面横波") {
+                    *params = WaveDistortionParams {
+                        mode: WaveDistortionMode::Horizontal,
+                        amplitude_px: 12.0,
+                        wavelength_px: 72.0,
+                        phase_degrees: 0.0,
+                        center: [0.5, 0.5],
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "縦ゆらぎ") {
+                    *params = WaveDistortionParams {
+                        mode: WaveDistortionMode::Vertical,
+                        amplitude_px: 10.0,
+                        wavelength_px: 64.0,
+                        phase_degrees: 0.0,
+                        center: [0.5, 0.5],
+                        strength: 0.9,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "さざ波") {
+                    *params = WaveDistortionParams {
+                        mode: WaveDistortionMode::Ripple,
+                        amplitude_px: 8.0,
+                        wavelength_px: 36.0,
+                        phase_degrees: 0.0,
+                        center: [0.5, 0.5],
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ジグザグ") {
+                    *params = WaveDistortionParams {
+                        mode: WaveDistortionMode::Zigzag,
+                        amplitude_px: 14.0,
+                        wavelength_px: 48.0,
+                        phase_degrees: 0.0,
+                        center: [0.5, 0.5],
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "画像を波の形にサンプルし直します。反射、水面、熱気、背景の揺らぎに使えます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let horizontal = params.mode == WaveDistortionMode::Horizontal;
+                if ui.selectable_label(horizontal, "横波").clicked() && !horizontal {
+                    params.mode = WaveDistortionMode::Horizontal;
+                    changed = true;
+                }
+                let vertical = params.mode == WaveDistortionMode::Vertical;
+                if ui.selectable_label(vertical, "縦波").clicked() && !vertical {
+                    params.mode = WaveDistortionMode::Vertical;
+                    changed = true;
+                }
+                let ripple = params.mode == WaveDistortionMode::Ripple;
+                if ui.selectable_label(ripple, "さざ波").clicked() && !ripple {
+                    params.mode = WaveDistortionMode::Ripple;
+                    changed = true;
+                }
+                let zigzag = params.mode == WaveDistortionMode::Zigzag;
+                if ui.selectable_label(zigzag, "ジグザグ").clicked() && !zigzag {
+                    params.mode = WaveDistortionMode::Zigzag;
+                    changed = true;
+                }
+            });
+            let amplitude =
+                ui.add(egui::Slider::new(&mut params.amplitude_px, -80.0..=80.0).text("振幅"));
+            changed |= amplitude.changed();
+            amplitude.lab_hover_tip(
+                "どれだけ大きく画素をずらすかです。符号を変えると揺れの向きが反転します。",
+            );
+            let wavelength =
+                ui.add(egui::Slider::new(&mut params.wavelength_px, 4.0..=240.0).text("波長"));
+            changed |= wavelength.changed();
+            wavelength
+                .lab_hover_tip("波の間隔です。小さい値ほど細かく、大きい値ほどゆったり揺れます。");
+            let phase = ui.add(
+                egui::Slider::new(&mut params.phase_degrees, -180.0..=180.0)
+                    .text("位相")
+                    .suffix("°"),
+            );
+            changed |= phase.changed();
+            phase.lab_hover_tip(
+                "波の開始位置をずらします。アニメーション用ではなく、静止画の位置合わせ用です。",
+            );
+            if params.mode == WaveDistortionMode::Ripple {
+                let center_x =
+                    ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
+                changed |= center_x.changed();
+                center_x.lab_hover_tip("さざ波の中心位置です。");
+                let center_y =
+                    ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
+                changed |= center_y.changed();
+                center_y.lab_hover_tip("さざ波の中心位置です。");
+            }
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からゆがみ結果へどれだけ近づけるかです。");
         }
         LocalEffect::SoftFocus(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -11228,6 +11350,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::TiltShift => LocalEffect::TiltShift(TiltShiftParams::default()),
         EffectKind::LensBlur => LocalEffect::LensBlur(LensBlurParams::default()),
         EffectKind::RadialBlur => LocalEffect::RadialBlur(RadialBlurParams::default()),
+        EffectKind::WaveDistortion => LocalEffect::WaveDistortion(WaveDistortionParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
