@@ -5122,6 +5122,38 @@ fn box_blur_alpha(src: &[f32], width: usize, height: usize, radius: usize) -> Ve
     out
 }
 
+fn alpha_at_with_outside(
+    field: &[f32],
+    width: usize,
+    height: usize,
+    x: isize,
+    y: isize,
+    outside_value: f32,
+) -> f32 {
+    if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
+        outside_value.clamp(0.0, 1.0)
+    } else {
+        field[y as usize * width + x as usize]
+    }
+}
+
+fn alpha_gradient_with_outside(
+    field: &[f32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    outside_value: f32,
+) -> (f32, f32) {
+    let x = x as isize;
+    let y = y as isize;
+    let gx = alpha_at_with_outside(field, width, height, x + 1, y, outside_value)
+        - alpha_at_with_outside(field, width, height, x - 1, y, outside_value);
+    let gy = alpha_at_with_outside(field, width, height, x, y + 1, outside_value)
+        - alpha_at_with_outside(field, width, height, x, y - 1, outside_value);
+    (gx, gy)
+}
+
 fn apply_tone_image(src: &[u8], params: ToneParams) -> Vec<u8> {
     let mut out = src.to_vec();
     for px in out.chunks_exact_mut(4) {
@@ -10348,13 +10380,23 @@ fn apply_rim_light(
     let alpha: Vec<f32> = src.chunks_exact(4).map(|px| px[3] as f32 / 255.0).collect();
     progress(0.02);
 
-    let dilated = morph_alpha_disk(&alpha, width, height, radius, true, cancel, |p| {
-        progress(0.02 + p * 0.34);
-    })?;
+    let dilated =
+        morph_alpha_disk_with_outside(&alpha, width, height, radius, true, 0.0, cancel, |p| {
+            progress(0.02 + p * 0.34);
+        })?;
     let inside_radius = (radius / 2).max(1);
-    let eroded = morph_alpha_disk(&alpha, width, height, inside_radius, false, cancel, |p| {
-        progress(0.36 + p * 0.24);
-    })?;
+    let eroded = morph_alpha_disk_with_outside(
+        &alpha,
+        width,
+        height,
+        inside_radius,
+        false,
+        0.0,
+        cancel,
+        |p| {
+            progress(0.36 + p * 0.24);
+        },
+    )?;
     check_cancel(cancel)?;
 
     let mut band = vec![0.0; alpha.len()];
@@ -10384,18 +10426,13 @@ fn apply_rim_light(
         if y % 32 == 0 {
             check_cancel(cancel)?;
         }
-        let y0 = y.saturating_sub(1);
-        let y1 = (y + 1).min(height - 1);
         for x in 0..width {
             let idx = y * width + x;
             let band_amount = band[idx].clamp(0.0, 1.0);
             if band_amount <= f32::EPSILON {
                 continue;
             }
-            let x0 = x.saturating_sub(1);
-            let x1 = (x + 1).min(width - 1);
-            let gx = direction_field[y * width + x1] - direction_field[y * width + x0];
-            let gy = direction_field[y1 * width + x] - direction_field[y0 * width + x];
+            let (gx, gy) = alpha_gradient_with_outside(&direction_field, width, height, x, y, 0.0);
             let len = (gx * gx + gy * gy).sqrt();
             if len <= f32::EPSILON {
                 continue;
@@ -10450,9 +10487,10 @@ fn apply_contact_shadow(
         .collect();
     progress(0.02);
 
-    let eroded = morph_alpha_disk(&alpha, width, height, radius, false, cancel, |p| {
-        progress(0.02 + p * 0.50);
-    })?;
+    let eroded =
+        morph_alpha_disk_with_outside(&alpha, width, height, radius, false, 0.0, cancel, |p| {
+            progress(0.02 + p * 0.50);
+        })?;
     check_cancel(cancel)?;
 
     let mut band = vec![0.0; alpha.len()];
@@ -10481,8 +10519,6 @@ fn apply_contact_shadow(
         if y % 32 == 0 {
             check_cancel(cancel)?;
         }
-        let y0 = y.saturating_sub(1);
-        let y1 = (y + 1).min(height - 1);
         for x in 0..width {
             let idx = y * width + x;
             let mut amount = band[idx].clamp(0.0, 1.0) * strength;
@@ -10490,10 +10526,8 @@ fn apply_contact_shadow(
                 continue;
             }
             if directionality > f32::EPSILON {
-                let x0 = x.saturating_sub(1);
-                let x1 = (x + 1).min(width - 1);
-                let gx = direction_field[y * width + x1] - direction_field[y * width + x0];
-                let gy = direction_field[y1 * width + x] - direction_field[y0 * width + x];
+                let (gx, gy) =
+                    alpha_gradient_with_outside(&direction_field, width, height, x, y, 0.0);
                 let len = (gx * gx + gy * gy).sqrt();
                 if len <= f32::EPSILON {
                     continue;
@@ -15631,6 +15665,33 @@ mod tests {
     }
 
     #[test]
+    fn rim_light_full_mask_uses_image_border_as_edge() {
+        let src = solid(5, 5, [80, 80, 80, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "rim",
+            LocalMask::Full,
+            LocalEffect::RimLight(RimLightParams {
+                light_angle_degrees: 0.0,
+                width_px: 1.0,
+                falloff: 0.0,
+                strength: 1.0,
+                color_rgb: [255, 255, 255],
+                wrap: 0.0,
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        let left = (2 * 5) * 4;
+        let right = (2 * 5 + 4) * 4;
+        let center = (2 * 5 + 2) * 4;
+        assert_eq!(&out.pixels[left..left + 3], &[80, 80, 80]);
+        assert_eq!(&out.pixels[center..center + 3], &[80, 80, 80]);
+        assert!(out.pixels[right] > 80);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    #[test]
     fn contact_shadow_darkens_inner_mask_edge_and_preserves_center() {
         let src = solid(5, 5, [120, 120, 120, 255]);
         let mut alpha = vec![0.0; 25];
@@ -15665,6 +15726,31 @@ mod tests {
         assert_eq!(&out.pixels[top_inner..top_inner + 3], &[0, 0, 0]);
         assert_eq!(&out.pixels[center..center + 3], &[120, 120, 120]);
         assert_eq!(&out.pixels[outside..outside + 3], &[120, 120, 120]);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    #[test]
+    fn contact_shadow_full_mask_uses_image_border_as_edge() {
+        let src = solid(5, 5, [120, 120, 120, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "contact",
+            LocalMask::Full,
+            LocalEffect::ContactShadow(ContactShadowParams {
+                radius_px: 1.0,
+                softness_px: 0.0,
+                strength: 1.0,
+                color_rgb: [0, 0, 0],
+                direction_degrees: 90.0,
+                directionality: 0.0,
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        let top_center = 2 * 4;
+        let center = (2 * 5 + 2) * 4;
+        assert_eq!(&out.pixels[top_center..top_center + 3], &[0, 0, 0]);
+        assert_eq!(&out.pixels[center..center + 3], &[120, 120, 120]);
         assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 255));
     }
 
