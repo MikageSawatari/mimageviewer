@@ -929,6 +929,9 @@ Undo / Redo を本体へ移植済み。フルスクリーン左パネルの補�
 - レイヤー行の `↑` / `↓` で順序を入れ替えられる。
 - マスク種別を `全体` / `手動` / `線形` / `円形` / `輝度` / `カラー` /
   `被写体` / `領域` に切り替えられる。
+- `被写体` マスクでは U²-Netp の生成 / 再生成、被写体選択 / 背景選択、輪郭補正を操作できる。
+- `領域` マスクでは画像全体 / 被写体内 / 背景のクラシック領域分割を非同期生成し、
+  生成後に画像上クリックで領域を追加 / 解除できる。
 - 画像上ドラッグで線形/円形グラデーション、効果中心ハンドル、手描き `RasterVector` マスクを編集できる。
   手描きマスクでは、筆、境界筆、隙間補完、囲み、多角形、直線、縦線、横線、矩形、楕円を作成できる。
   選択ツールでは図形マスクを選択し、図形本体やハンドルをドラッグして位置/サイズを調整できる。
@@ -946,8 +949,7 @@ Undo / Redo を本体へ移植済み。フルスクリーン左パネルの補�
 - `Ctrl+Alt+Shift+D` の pipeline debug 出力に `56_local_adjust_source_current`、
   `57_local_adjust_recomputed`、`58_local_adjust_current` が含まれる。
 - Ctrl+Z / Ctrl+Y でレイヤー追加/削除、パラメータ編集、キャンバス編集、LUT 読み込みが戻る。
-- 現時点の意図的な未実装: Subject / Segmentation の自動生成、サイドカーバックアップ、
-  `local-adjust-ui` 共通 crate 化。
+- 現時点の意図的な未実装: サイドカーバックアップ、`local-adjust-ui` 共通 crate 化。
 
 ## 12. 優先順位
 
@@ -995,6 +997,8 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
 - マスク生成元: Full / Raster / Linear Gradient / Radial Gradient / Luma Range / Color Range / Subject / Segmentation
 - `local_adjust_lab` の被写体選択は、任意配置の `tools/local_adjust_lab/models/u2netp.onnx`
   を使って U²-Netp の被写体 / 背景マスクを worker thread で生成する初期実装まで接続済み。
+  mIV 本体では `vendor/models/u2netp.onnx` を既存 AI モデル管理に追加し、
+  `%APPDATA%/mimageviewer/models/u2netp.onnx` へ展開して CPU 強制ロードで推論する。
   新規生成 / 再生成にはモデルが必要だが、生成済みマスクは `.miv` sidecar に保存されるため、
   モデル未配置環境でも読み込み、編集、適用は継続できる。生成結果は `Subject(SubjectMask)`
   として保持し、背景選択はマスク反転で扱う。
@@ -1002,6 +1006,7 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   `マスクを整形` チェックが ON のときだけ、しきい値 / 収縮拡張 / 境界なめらかスライダーで
   その元 matte から現在 alpha を再生成する。OFF に戻すと元 matte へ復帰する
 - `local_adjust_lab` の領域分割は、色差 / 境界 / 連結領域による候補生成を worker thread で行う。
+  mIV 本体にも同じクラシック分割を移植し、補正レイヤーパネルから非同期生成できる。
   生成結果は `Segmentation(RegionMask)` として保持し、生成直後は未選択にする。未選択候補は
   アニメーションする境界線だけで表示し、クリック / ドラッグで個別に選択 / 解除できる。
   被写体選択マスクがある場合は、被写体内または背景だけを領域分割できる。

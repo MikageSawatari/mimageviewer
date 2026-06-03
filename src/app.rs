@@ -289,6 +289,39 @@ pub(crate) struct LocalAdjustLutLoadPending {
     pub(crate) rx: mpsc::Receiver<Result<local_adjust_core::CubeLutParams, String>>,
 }
 
+pub(crate) struct LocalAdjustSegmentationPending {
+    pub(crate) fs_idx: usize,
+    pub(crate) layer_idx: usize,
+    pub(crate) generation: u64,
+    pub(crate) rx: mpsc::Receiver<Result<LocalAdjustGeneratedMask, String>>,
+}
+
+pub(crate) enum LocalAdjustGeneratedMask {
+    Subject(local_adjust_core::RasterMask),
+    Regions(local_adjust_core::RegionMask),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalAdjustRegionSegmentationScope {
+    Full,
+    Subject,
+    Background,
+}
+
+impl LocalAdjustRegionSegmentationScope {
+    pub(crate) fn requires_subject(self) -> bool {
+        matches!(self, Self::Subject | Self::Background)
+    }
+
+    pub(crate) fn pending_label(self) -> &'static str {
+        match self {
+            Self::Full => "画像全体を領域分割中...",
+            Self::Subject => "被写体内を領域分割中...",
+            Self::Background => "背景を領域分割中...",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalAdjustCanvasDragKind {
     LinearGradient,
@@ -3120,6 +3153,12 @@ pub struct App {
     pub(crate) local_adjust_pending: std::collections::HashMap<usize, LocalAdjustRenderPending>,
     /// 補正レイヤーの 3D LUT 読み込み worker。
     pub(crate) local_adjust_lut_pending: Option<LocalAdjustLutLoadPending>,
+    /// 補正レイヤーの被写体/領域マスク生成 worker。
+    pub(crate) local_adjust_segmentation_pending: Option<LocalAdjustSegmentationPending>,
+    /// 補正レイヤー領域分割の色差許容。
+    pub(crate) local_adjust_region_color_tolerance: f32,
+    /// 補正レイヤー領域分割の最小領域面積。
+    pub(crate) local_adjust_region_min_area: usize,
     /// 補正済み画像キャッシュ: item_idx → テクスチャ + ピクセルデータ
     pub(crate) adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
     /// 補正キャッシュ世代カウンタ (360 度パノラマビュー用、docs/panorama-360-view-plan.md §4.1.2)。
@@ -4341,6 +4380,9 @@ impl App {
             local_adjust_cache: std::collections::HashMap::new(),
             local_adjust_pending: std::collections::HashMap::new(),
             local_adjust_lut_pending: None,
+            local_adjust_segmentation_pending: None,
+            local_adjust_region_color_tolerance: 42.0,
+            local_adjust_region_min_area: 64,
             adjustment_cache: std::collections::HashMap::new(),
             adjustment_generation: std::collections::HashMap::new(),
             ai_upscale_generation: std::collections::HashMap::new(),
@@ -8377,6 +8419,7 @@ impl App {
         self.local_adjust_cache.clear();
         self.cancel_all_local_adjust_pending();
         self.local_adjust_lut_pending = None;
+        self.local_adjust_segmentation_pending = None;
         self.mask_pages.clear();
         self.erase_mask_generation.clear();
         self.conceal_pages.clear();
@@ -9456,6 +9499,8 @@ impl App {
         self.erase_result_cache.clear();
         self.local_adjust_cache.clear();
         self.cancel_all_local_adjust_pending();
+        self.local_adjust_lut_pending = None;
+        self.local_adjust_segmentation_pending = None;
         // 360 度パノラマビュー: cache 全体が変わったので世代を一斉 bump (§3.6.2.2)。
         self.bump_all_adjustment_generations();
         self.bump_all_ai_generations();
@@ -16772,6 +16817,7 @@ impl App {
         self.local_adjust_canvas_drag_before_layers = None;
         self.local_adjust_shape_drag_before_layers = None;
         self.local_adjust_mask_brush_before_layers = None;
+        self.local_adjust_segmentation_pending = None;
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
         self.conceal_cache.clear();
@@ -20862,6 +20908,7 @@ impl App {
         self.local_adjust_canvas_drag_before_layers = None;
         self.local_adjust_shape_drag_before_layers = None;
         self.local_adjust_mask_brush_before_layers = None;
+        self.local_adjust_segmentation_pending = None;
         self.analysis_mode = false;
         self.reset_erase_mode();
         self.compare_view_mode = crate::app::CompareViewMode::Off;
@@ -23256,6 +23303,7 @@ impl eframe::App for App {
         self.poll_erase_inpaint(ctx);
         self.poll_local_adjust_render(ctx);
         self.poll_local_adjust_lut_load(ctx);
+        self.poll_local_adjust_segmentation(ctx);
         self.poll_search();
         self.poll_favsearch();
         self.poll_metadata_load();
@@ -23309,6 +23357,7 @@ impl eframe::App for App {
             || self.favsearch_pending.is_some()
             || self.metadata_pending.is_some()
             || !self.local_adjust_pending.is_empty()
+            || self.local_adjust_segmentation_pending.is_some()
             || self
                 .tag_prewarm_pending
                 .as_ref()

@@ -12,12 +12,16 @@
 //!     - 「個別設定を解除」 — 現在のページの個別設定を削除 (標準値に戻す)
 //! - 保存スロット 10 個: クリック or Ctrl+数字で現在のページに適用
 
+use std::collections::VecDeque;
+use std::sync::Arc;
+
 use eframe::egui;
 
 use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
 use crate::app::{
-    AdjustSpreadTarget, App, LocalAdjustMaskEditTarget, LocalAdjustMaskShapeDrag,
-    LocalAdjustMaskTool, LocalAdjustShapeHandle,
+    AdjustSpreadTarget, App, LocalAdjustGeneratedMask, LocalAdjustMaskEditTarget,
+    LocalAdjustMaskShapeDrag, LocalAdjustMaskTool, LocalAdjustRegionSegmentationScope,
+    LocalAdjustShapeHandle,
 };
 use crate::local_adjust_catalog::{
     EFFECT_GROUPS, EffectKind, effect_picker_button_width, effect_picker_matches_query,
@@ -47,6 +51,8 @@ const LOCAL_ADJUST_PANEL_MARGIN_Y: f32 = 60.0;
 const LOCAL_ADJUST_PANEL_BOTTOM_MARGIN: f32 = 20.0;
 const LOCAL_ADJUST_PANEL_MIN_BODY_H: f32 = 120.0;
 const LOCAL_ADJUST_EDGE_BRUSH_INCLUDE_BOUNDARY_RADIUS: isize = 2;
+const LOCAL_ADJUST_U2NETP_INPUT_SIZE: usize = 320;
+const LOCAL_ADJUST_REGION_SEGMENT_MAX_LABELS: usize = 2048;
 
 #[derive(Debug, Clone, Copy)]
 enum QuickLocalAdjustEffect {
@@ -71,6 +77,8 @@ struct LocalEffectPanelRequests {
     start_rgb_pick: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
     cancel_rgb_pick: bool,
     set_effect_position_handles_visible: Option<bool>,
+    generate_subject_mask: Option<usize>,
+    generate_region_mask: Option<(usize, LocalAdjustRegionSegmentationScope)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,9 +129,83 @@ impl MaskKind {
             Self::RadialGradient => "中心から外側へ段階的に効果をかけます。",
             Self::LumaRange => "明るさの範囲でマスクを作ります。",
             Self::ColorRange => "指定色に近い範囲をマスクにします。",
-            Self::Subject => "被写体マスクを使います。自動生成は後続ステップで接続します。",
-            Self::Segmentation => "領域候補マスクを使います。自動生成は後続ステップで接続します。",
+            Self::Subject => "U²-Netp で被写体マスクを生成して使います。",
+            Self::Segmentation => "色と境界から領域候補を生成してクリック選択します。",
         }
+    }
+}
+
+#[cfg(test)]
+mod local_adjust_segmentation_tests {
+    use super::*;
+
+    #[test]
+    fn region_segmentation_splits_connected_color_regions() {
+        let width = 6;
+        let height = 4;
+        let mut pixels = Vec::with_capacity(width * height);
+        for _y in 0..height {
+            for x in 0..width {
+                let rgb = if x < 3 { [230, 40, 40] } else { [40, 80, 230] };
+                pixels.push(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+            }
+        }
+        let source = egui::ColorImage::new([width, height], pixels);
+        let mask = build_local_adjust_region_segmentation(
+            &source,
+            None,
+            LocalAdjustRegionSegmentationScope::Full,
+            8.0,
+            1,
+            255.0,
+            255.0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(mask.label_count(), 2);
+        assert_ne!(mask.labels[0], mask.labels[width - 1]);
+        assert!(mask.selected.iter().skip(1).all(|&selected| !selected));
+    }
+
+    #[test]
+    fn region_segmentation_background_scope_excludes_subject_pixels() {
+        let source = egui::ColorImage::new(
+            [4, 1],
+            vec![
+                egui::Color32::from_rgb(220, 40, 40),
+                egui::Color32::from_rgb(220, 40, 40),
+                egui::Color32::from_rgb(40, 80, 230),
+                egui::Color32::from_rgb(40, 80, 230),
+            ],
+        );
+        let subject = local_adjust_core::RasterMask {
+            width: 4,
+            height: 1,
+            alpha: vec![1.0, 1.0, 0.0, 0.0],
+        };
+        let mask = build_local_adjust_region_segmentation(
+            &source,
+            Some(&subject),
+            LocalAdjustRegionSegmentationScope::Background,
+            8.0,
+            1,
+            255.0,
+            255.0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(mask.labels[0], 0);
+        assert_eq!(mask.labels[1], 0);
+        assert_ne!(mask.labels[2], 0);
+        assert_eq!(mask.labels[2], mask.labels[3]);
+    }
+
+    #[test]
+    fn region_segmentation_fills_unlabeled_internal_gaps() {
+        let mut labels = vec![1, 0, 2];
+        let allowed = vec![true, true, true];
+        fill_local_adjust_unlabeled_region_pixels(&mut labels, 3, 1, &allowed);
+        assert_ne!(labels[1], 0);
     }
 }
 
@@ -422,6 +504,9 @@ fn draw_local_adjust_section(
     selective_color_pick_active: bool,
     rgb_pick_active: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
     effect_position_handles_visible: bool,
+    segmentation_pending: bool,
+    subject_model_available: bool,
+    subject_mask_available: bool,
     mask_edit_target: &mut LocalAdjustMaskEditTarget,
     mask_brush_radius: &mut f32,
     mask_paint_add: &mut bool,
@@ -433,6 +518,8 @@ fn draw_local_adjust_section(
     boundary_gap_px: &mut f32,
     edge_brush_tolerance: &mut f32,
     edge_brush_include_boundary: &mut bool,
+    region_color_tolerance: &mut f32,
+    region_min_area: &mut usize,
     effect_requests: &mut LocalEffectPanelRequests,
 ) {
     ui.add_space(4.0);
@@ -595,6 +682,9 @@ fn draw_local_adjust_section(
             selective_color_pick_active,
             rgb_pick_active,
             effect_position_handles_visible,
+            segmentation_pending,
+            subject_model_available,
+            subject_mask_available,
             mask_edit_target,
             mask_brush_radius,
             mask_paint_add,
@@ -606,6 +696,8 @@ fn draw_local_adjust_section(
             boundary_gap_px,
             edge_brush_tolerance,
             edge_brush_include_boundary,
+            region_color_tolerance,
+            region_min_area,
             effect_requests,
         );
     }
@@ -631,6 +723,9 @@ fn draw_selected_local_adjust_layer_editor(
     selective_color_pick_active: bool,
     rgb_pick_active: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
     effect_position_handles_visible: bool,
+    segmentation_pending: bool,
+    subject_model_available: bool,
+    subject_mask_available: bool,
     mask_edit_target: &mut LocalAdjustMaskEditTarget,
     mask_brush_radius: &mut f32,
     mask_paint_add: &mut bool,
@@ -642,6 +737,8 @@ fn draw_selected_local_adjust_layer_editor(
     boundary_gap_px: &mut f32,
     edge_brush_tolerance: &mut f32,
     edge_brush_include_boundary: &mut bool,
+    region_color_tolerance: &mut f32,
+    region_min_area: &mut usize,
     effect_requests: &mut LocalEffectPanelRequests,
 ) {
     let mut edited = layer.clone();
@@ -679,6 +776,13 @@ fn draw_selected_local_adjust_layer_editor(
         boundary_gap_px,
         edge_brush_tolerance,
         edge_brush_include_boundary,
+        segmentation_pending,
+        subject_model_available,
+        subject_mask_available,
+        region_color_tolerance,
+        region_min_area,
+        layer_idx,
+        effect_requests,
     );
     let response = draw_effect_params(
         ui,
@@ -791,6 +895,417 @@ fn sample_local_adjust_rgb(app: &App, fs_idx: usize, norm: [f32; 2]) -> Option<[
     let y = (norm[1].clamp(0.0, 1.0) * (h.saturating_sub(1)) as f32).round() as usize;
     let color = pixels.pixels[y.min(h - 1) * w + x.min(w - 1)];
     Some([color.r(), color.g(), color.b()])
+}
+
+fn local_adjust_subject_mask_has_content(mask: &local_adjust_core::SubjectMask) -> bool {
+    mask.alpha.iter().any(|&alpha| alpha > 0.02)
+        || mask
+            .source_alpha
+            .as_ref()
+            .is_some_and(|alpha| alpha.iter().any(|&value| value > 0.02))
+}
+
+fn local_adjust_subject_mask_candidate_from_layers(
+    layers: &[local_adjust_core::LocalAdjustmentLayer],
+    image_dims: (usize, usize),
+) -> Option<local_adjust_core::RasterMask> {
+    layers.iter().find_map(|layer| match &layer.mask {
+        local_adjust_core::LocalMask::Subject(mask)
+            if mask.width == image_dims.0
+                && mask.height == image_dims.1
+                && local_adjust_subject_mask_has_content(mask) =>
+        {
+            Some(mask.current_raster_mask())
+        }
+        _ => None,
+    })
+}
+
+fn build_local_adjust_u2netp_input(
+    source: &egui::ColorImage,
+) -> Result<ndarray::Array4<f32>, String> {
+    let [width, height] = source.size;
+    if width == 0 || height == 0 || source.pixels.len() != width.saturating_mul(height) {
+        return Err("invalid source image".to_string());
+    }
+    let mut rgb = Vec::with_capacity(width.saturating_mul(height).saturating_mul(3));
+    for color in &source.pixels {
+        rgb.extend_from_slice(&[color.r(), color.g(), color.b()]);
+    }
+    let Some(rgb_image) = image::RgbImage::from_raw(width as u32, height as u32, rgb) else {
+        return Err("invalid source RGB buffer".to_string());
+    };
+    let resized = image::imageops::resize(
+        &rgb_image,
+        LOCAL_ADJUST_U2NETP_INPUT_SIZE as u32,
+        LOCAL_ADJUST_U2NETP_INPUT_SIZE as u32,
+        image::imageops::FilterType::Triangle,
+    );
+    let mut input = ndarray::Array4::<f32>::zeros((
+        1,
+        3,
+        LOCAL_ADJUST_U2NETP_INPUT_SIZE,
+        LOCAL_ADJUST_U2NETP_INPUT_SIZE,
+    ));
+    let mean = [0.485_f32, 0.456, 0.406];
+    let std = [0.229_f32, 0.224, 0.225];
+    for y in 0..LOCAL_ADJUST_U2NETP_INPUT_SIZE {
+        for x in 0..LOCAL_ADJUST_U2NETP_INPUT_SIZE {
+            let p = resized.get_pixel(x as u32, y as u32).0;
+            for c in 0..3 {
+                let v = p[c] as f32 / 255.0;
+                input[[0, c, y, x]] = (v - mean[c]) / std[c];
+            }
+        }
+    }
+    Ok(input)
+}
+
+fn local_adjust_u2netp_output_size(shape: &[i64], raw_len: usize) -> (usize, usize) {
+    if shape.len() >= 2 {
+        let h = shape[shape.len() - 2].max(1) as usize;
+        let w = shape[shape.len() - 1].max(1) as usize;
+        if h.saturating_mul(w) <= raw_len {
+            return (w, h);
+        }
+    }
+    let side = (raw_len as f64).sqrt().round().max(1.0) as usize;
+    if side.saturating_mul(side) == raw_len {
+        (side, side)
+    } else {
+        (
+            LOCAL_ADJUST_U2NETP_INPUT_SIZE,
+            raw_len.max(1).div_ceil(LOCAL_ADJUST_U2NETP_INPUT_SIZE),
+        )
+    }
+}
+
+fn normalize_local_adjust_u2netp_output(raw: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let len = width.saturating_mul(height).min(raw.len());
+    if len == 0 {
+        return vec![0.0; width.saturating_mul(height)];
+    }
+    let offset = raw.len().saturating_sub(width.saturating_mul(height));
+    let values = &raw[offset..offset + len];
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    for &v in values {
+        if v.is_finite() {
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+        }
+    }
+    let range = max_v - min_v;
+    let mut out = vec![0.0; width.saturating_mul(height)];
+    for (idx, slot) in out.iter_mut().enumerate().take(len) {
+        let value = values[idx];
+        *slot = if range.is_finite() && range > 1.0e-6 {
+            ((value - min_v) / range).clamp(0.0, 1.0)
+        } else {
+            value.clamp(0.0, 1.0)
+        };
+    }
+    out
+}
+
+fn resize_local_adjust_mask_bilinear(
+    src: &[f32],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<f32> {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return Vec::new();
+    }
+    let mut dst = vec![0.0; dst_w.saturating_mul(dst_h)];
+    let scale_x = if dst_w > 1 {
+        (src_w.saturating_sub(1)) as f32 / (dst_w.saturating_sub(1)) as f32
+    } else {
+        0.0
+    };
+    let scale_y = if dst_h > 1 {
+        (src_h.saturating_sub(1)) as f32 / (dst_h.saturating_sub(1)) as f32
+    } else {
+        0.0
+    };
+    for y in 0..dst_h {
+        let sy = y as f32 * scale_y;
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(src_h - 1);
+        let fy = sy - y0 as f32;
+        for x in 0..dst_w {
+            let sx = x as f32 * scale_x;
+            let x0 = sx.floor() as usize;
+            let x1 = (x0 + 1).min(src_w - 1);
+            let fx = sx - x0 as f32;
+            let a00 = src[y0 * src_w + x0];
+            let a10 = src[y0 * src_w + x1];
+            let a01 = src[y1 * src_w + x0];
+            let a11 = src[y1 * src_w + x1];
+            let top = a00 + (a10 - a00) * fx;
+            let bottom = a01 + (a11 - a01) * fx;
+            dst[y * dst_w + x] = (top + (bottom - top) * fy).clamp(0.0, 1.0);
+        }
+    }
+    dst
+}
+
+fn run_local_adjust_u2netp_segmentation(
+    runtime: Arc<crate::ai::runtime::AiRuntime>,
+    model_path: std::path::PathBuf,
+    source: Arc<egui::ColorImage>,
+) -> Result<local_adjust_core::RasterMask, String> {
+    runtime
+        .load_model_cpu(crate::ai::ModelKind::SubjectU2Netp, &model_path)
+        .map_err(|err| format!("U²-Netp load: {err}"))?;
+    let input = build_local_adjust_u2netp_input(&source)?;
+    let input_tensor =
+        ort::value::Tensor::from_array(input).map_err(|err| format!("Tensor creation: {err}"))?;
+    let (shape, raw) = runtime
+        .with_session(crate::ai::ModelKind::SubjectU2Netp, |session| {
+            let outputs = session
+                .run(ort::inputs![input_tensor])
+                .map_err(|err| crate::ai::AiError::Ort(format!("U²-Netp run: {err}")))?;
+            let (shape, raw) = outputs[0]
+                .try_extract_tensor::<f32>()
+                .map_err(|err| crate::ai::AiError::Ort(format!("U²-Netp extract: {err}")))?;
+            Ok((shape.iter().copied().collect::<Vec<i64>>(), raw.to_vec()))
+        })
+        .map_err(|err| err.to_string())?;
+    let (small_w, small_h) = local_adjust_u2netp_output_size(&shape, raw.len());
+    let small_mask = normalize_local_adjust_u2netp_output(&raw, small_w, small_h);
+    let alpha = resize_local_adjust_mask_bilinear(
+        &small_mask,
+        small_w,
+        small_h,
+        source.size[0],
+        source.size[1],
+    );
+    Ok(local_adjust_core::RasterMask {
+        width: source.size[0],
+        height: source.size[1],
+        alpha,
+    })
+}
+
+fn local_adjust_region_boundary_mask(
+    source: &egui::ColorImage,
+    edge_threshold: f32,
+    ink_threshold: f32,
+    gap_px: usize,
+) -> Vec<u8> {
+    let [width, height] = source.size;
+    let mut out = vec![0_u8; width.saturating_mul(height)];
+    for y in 0..height {
+        for x in 0..width {
+            if local_adjust_boundary_pixel_at(source, x, y, edge_threshold, ink_threshold, gap_px) {
+                out[y * width + x] = 1;
+            }
+        }
+    }
+    out
+}
+
+fn local_adjust_region_source_rgb_at_index(source: &egui::ColorImage, idx: usize) -> [u8; 3] {
+    let color = source
+        .pixels
+        .get(idx)
+        .copied()
+        .unwrap_or(egui::Color32::BLACK);
+    [color.r(), color.g(), color.b()]
+}
+
+fn local_adjust_region_color_close(a: [u8; 3], b: [u8; 3], tolerance: f32) -> bool {
+    let max_delta = (a[0] as f32 - b[0] as f32)
+        .abs()
+        .max((a[1] as f32 - b[1] as f32).abs())
+        .max((a[2] as f32 - b[2] as f32).abs());
+    max_delta <= tolerance
+}
+
+fn local_adjust_region_neighbors(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> impl Iterator<Item = (usize, usize)> {
+    let mut out = [(usize::MAX, usize::MAX); 4];
+    let mut len = 0;
+    if x > 0 {
+        out[len] = (x - 1, y);
+        len += 1;
+    }
+    if x + 1 < width {
+        out[len] = (x + 1, y);
+        len += 1;
+    }
+    if y > 0 {
+        out[len] = (x, y - 1);
+        len += 1;
+    }
+    if y + 1 < height {
+        out[len] = (x, y + 1);
+        len += 1;
+    }
+    out.into_iter().take(len)
+}
+
+fn local_adjust_region_membership_allowed(
+    source: &egui::ColorImage,
+    subject: Option<&local_adjust_core::RasterMask>,
+    scope: LocalAdjustRegionSegmentationScope,
+    idx: usize,
+) -> bool {
+    if source
+        .pixels
+        .get(idx)
+        .map(|color| color.a() < 8)
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    match scope {
+        LocalAdjustRegionSegmentationScope::Full => true,
+        LocalAdjustRegionSegmentationScope::Subject => subject
+            .map(|mask| mask.alpha.get(idx).copied().unwrap_or(0.0) > 0.18)
+            .unwrap_or(false),
+        LocalAdjustRegionSegmentationScope::Background => subject
+            .map(|mask| mask.alpha.get(idx).copied().unwrap_or(0.0) <= 0.18)
+            .unwrap_or(false),
+    }
+}
+
+fn local_adjust_region_seed_allowed(
+    source: &egui::ColorImage,
+    subject: Option<&local_adjust_core::RasterMask>,
+    scope: LocalAdjustRegionSegmentationScope,
+    boundary: &[u8],
+    idx: usize,
+) -> bool {
+    boundary.get(idx).copied().unwrap_or(0) == 0
+        && local_adjust_region_membership_allowed(source, subject, scope, idx)
+}
+
+fn fill_local_adjust_unlabeled_region_pixels(
+    labels: &mut [u32],
+    width: usize,
+    height: usize,
+    allowed: &[bool],
+) {
+    let mut queue = VecDeque::new();
+    let len = width
+        .saturating_mul(height)
+        .min(labels.len())
+        .min(allowed.len());
+    for idx in 0..len {
+        if labels[idx] != 0 {
+            queue.push_back(idx);
+        }
+    }
+    while let Some(idx) = queue.pop_front() {
+        let label = labels[idx];
+        if label == 0 {
+            continue;
+        }
+        let x = idx % width;
+        let y = idx / width;
+        for (nx, ny) in local_adjust_region_neighbors(x, y, width, height) {
+            let nidx = ny * width + nx;
+            if nidx >= len || !allowed[nidx] || labels[nidx] != 0 {
+                continue;
+            }
+            labels[nidx] = label;
+            queue.push_back(nidx);
+        }
+    }
+}
+
+fn build_local_adjust_region_segmentation(
+    source: &egui::ColorImage,
+    subject: Option<&local_adjust_core::RasterMask>,
+    scope: LocalAdjustRegionSegmentationScope,
+    color_tolerance: f32,
+    min_area: usize,
+    edge_threshold: f32,
+    ink_threshold: f32,
+    gap_px: usize,
+) -> Result<local_adjust_core::RegionMask, String> {
+    let [width, height] = source.size;
+    let len = width.saturating_mul(height);
+    if len == 0 || source.pixels.len() != len {
+        return Err("invalid source image".to_string());
+    }
+    if let Some(mask) = subject
+        && (mask.width != width || mask.height != height || mask.alpha.len() != len)
+    {
+        return Err("subject mask size does not match image".to_string());
+    }
+    let boundary = local_adjust_region_boundary_mask(source, edge_threshold, ink_threshold, gap_px);
+    let mut visited = vec![false; len];
+    let mut labels = vec![0_u32; len];
+    let mut label = 0_u32;
+    let tolerance = color_tolerance.max(0.0);
+    let min_area = min_area.max(1);
+    let mut queue = VecDeque::new();
+    let mut component = Vec::new();
+
+    for start in 0..len {
+        if visited[start] {
+            continue;
+        }
+        if !local_adjust_region_seed_allowed(source, subject, scope, &boundary, start) {
+            visited[start] = true;
+            continue;
+        }
+        let seed = local_adjust_region_source_rgb_at_index(source, start);
+        visited[start] = true;
+        queue.clear();
+        component.clear();
+        queue.push_back(start);
+        while let Some(idx) = queue.pop_front() {
+            component.push(idx);
+            let x = idx % width;
+            let y = idx / width;
+            for (nx, ny) in local_adjust_region_neighbors(x, y, width, height) {
+                let nidx = ny * width + nx;
+                if visited[nidx] {
+                    continue;
+                }
+                if !local_adjust_region_seed_allowed(source, subject, scope, &boundary, nidx) {
+                    visited[nidx] = true;
+                    continue;
+                }
+                if local_adjust_region_color_close(
+                    seed,
+                    local_adjust_region_source_rgb_at_index(source, nidx),
+                    tolerance,
+                ) {
+                    visited[nidx] = true;
+                    queue.push_back(nidx);
+                }
+            }
+        }
+        if component.len() >= min_area && (label as usize) < LOCAL_ADJUST_REGION_SEGMENT_MAX_LABELS
+        {
+            label += 1;
+            for &idx in &component {
+                labels[idx] = label;
+            }
+        }
+    }
+
+    let membership_allowed: Vec<bool> = (0..len)
+        .map(|idx| local_adjust_region_membership_allowed(source, subject, scope, idx))
+        .collect();
+    fill_local_adjust_unlabeled_region_pixels(&mut labels, width, height, &membership_allowed);
+
+    Ok(local_adjust_core::RegionMask {
+        width,
+        height,
+        labels,
+        selected: vec![false; label as usize + 1],
+    })
 }
 
 fn local_adjust_norm_to_pixel(norm: [f32; 2], width: usize, height: usize) -> (f32, f32) {
@@ -2495,6 +3010,13 @@ fn draw_local_mask_editor(
     boundary_gap_px: &mut f32,
     edge_brush_tolerance: &mut f32,
     edge_brush_include_boundary: &mut bool,
+    segmentation_pending: bool,
+    subject_model_available: bool,
+    subject_mask_available: bool,
+    region_color_tolerance: &mut f32,
+    region_min_area: &mut usize,
+    layer_idx: usize,
+    effect_requests: &mut LocalEffectPanelRequests,
 ) -> bool {
     let mut changed = false;
     ui.separator();
@@ -2639,6 +3161,36 @@ fn draw_local_mask_editor(
         }
         local_adjust_core::LocalMask::Subject(mask) => {
             ui.label(format!("被写体マスク: {} x {}", mask.width, mask.height));
+            let generated_mask_available = local_adjust_subject_mask_has_content(mask);
+            let generate_label = if segmentation_pending {
+                "生成中..."
+            } else if generated_mask_available {
+                "元画像から再生成"
+            } else {
+                "被写体マスク生成"
+            };
+            let generate_response = ui.add_enabled(
+                !segmentation_pending && subject_model_available,
+                egui::Button::new(generate_label),
+            );
+            let generate_tip = if subject_model_available {
+                "元画像から U²-Netp で被写体マスクを生成します。"
+            } else {
+                "U²-Netp モデルが見つからないため生成できません。保存済みマスクの適用は可能です。"
+            };
+            if generate_response.on_hover_text(generate_tip).clicked() {
+                effect_requests.generate_subject_mask = Some(layer_idx);
+            }
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("被写体を選択").clicked() {
+                    layer.mask_inverted = false;
+                    changed = true;
+                }
+                if ui.small_button("背景を選択").clicked() {
+                    layer.mask_inverted = true;
+                    changed = true;
+                }
+            });
             changed |= ui
                 .checkbox(&mut mask.refinement.enabled, "輪郭補正")
                 .changed();
@@ -2654,8 +3206,85 @@ fn draw_local_mask_editor(
                 .changed();
             mask.refinement.expand_px = expand;
             mask.refinement.feather_px = feather;
+            let foreground = mask.alpha.iter().filter(|&&alpha| alpha >= 0.5).count();
+            let soft = mask
+                .alpha
+                .iter()
+                .filter(|&&alpha| alpha > 0.02 && alpha < 0.98)
+                .count();
+            let total = mask.alpha.len().max(1) as f32;
+            ui.label(
+                egui::RichText::new(format!(
+                    "前景 {:.1}% / 半透明 {:.1}%",
+                    foreground as f32 / total * 100.0,
+                    soft as f32 / total * 100.0
+                ))
+                .size(10.0)
+                .color(egui::Color32::from_gray(170)),
+            );
         }
         local_adjust_core::LocalMask::Segmentation(mask) => {
+            ui.label(
+                egui::RichText::new("領域分割")
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(170)),
+            );
+            let response =
+                ui.add(egui::Slider::new(region_color_tolerance, 4.0..=120.0).text("色差許容"));
+            response.on_hover_text("大きいほど近い色が同じ領域にまとまります。");
+            let mut min_area = (*region_min_area).clamp(1, 2048) as i32;
+            if ui
+                .add(egui::Slider::new(&mut min_area, 1..=2048).text("最小領域"))
+                .on_hover_text("この面積より小さい候補を捨てます。")
+                .changed()
+            {
+                *region_min_area = min_area.max(1) as usize;
+            }
+            if ui
+                .add_enabled(
+                    !segmentation_pending,
+                    egui::Button::new("画像全体を領域分割"),
+                )
+                .clicked()
+            {
+                effect_requests.generate_region_mask =
+                    Some((layer_idx, LocalAdjustRegionSegmentationScope::Full));
+            }
+            if ui
+                .add_enabled(
+                    !segmentation_pending && subject_mask_available,
+                    egui::Button::new("被写体内を領域分割"),
+                )
+                .clicked()
+            {
+                effect_requests.generate_region_mask =
+                    Some((layer_idx, LocalAdjustRegionSegmentationScope::Subject));
+            }
+            if ui
+                .add_enabled(
+                    !segmentation_pending && subject_mask_available,
+                    egui::Button::new("背景を領域分割"),
+                )
+                .clicked()
+            {
+                effect_requests.generate_region_mask =
+                    Some((layer_idx, LocalAdjustRegionSegmentationScope::Background));
+            }
+            if !subject_mask_available {
+                ui.label(
+                    egui::RichText::new("被写体マスクがあると、被写体内や背景だけを分割できます。")
+                        .size(10.0)
+                        .color(egui::Color32::from_gray(170)),
+                );
+            }
+            ui.horizontal_wrapped(|ui| {
+                if ui.selectable_label(*mask_paint_add, "追加").clicked() {
+                    *mask_paint_add = true;
+                }
+                if ui.selectable_label(!*mask_paint_add, "解除").clicked() {
+                    *mask_paint_add = false;
+                }
+            });
             ui.horizontal_wrapped(|ui| {
                 if ui.small_button("全選択").clicked() {
                     for selected in mask.selected.iter_mut().skip(1) {
@@ -2669,8 +3298,24 @@ fn draw_local_mask_editor(
                     }
                     changed = true;
                 }
+                if ui.small_button("選択反転").clicked() {
+                    for selected in mask.selected.iter_mut().skip(1) {
+                        *selected = !*selected;
+                    }
+                    changed = true;
+                }
             });
-            ui.label(format!("領域数: {}", mask.label_count()));
+            let selected_count = mask.selected.iter().skip(1).filter(|&&v| v).count();
+            ui.label(format!(
+                "領域: {} / 選択: {}",
+                mask.label_count(),
+                selected_count
+            ));
+            ui.label(
+                egui::RichText::new("画像上の領域をクリックして追加/解除します。")
+                    .size(10.0)
+                    .color(egui::Color32::from_gray(170)),
+            );
         }
     }
     changed |= draw_local_manual_mask_controls(
@@ -3818,6 +4463,50 @@ impl App {
         );
     }
 
+    fn toggle_local_adjust_region_at(
+        &mut self,
+        fs_idx: usize,
+        layer_idx: usize,
+        norm: [f32; 2],
+        selected: bool,
+    ) -> bool {
+        let image_dims = local_adjust_image_dims(self, fs_idx);
+        let (px, py) = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
+        let x = px.round().clamp(0.0, image_dims.0.saturating_sub(1) as f32) as usize;
+        let y = py.round().clamp(0.0, image_dims.1.saturating_sub(1) as f32) as usize;
+        let mut changed_label = None;
+        let changed =
+            self.mutate_local_adjust_layer_from_canvas(fs_idx, layer_idx, true, |layer| {
+                let local_adjust_core::LocalMask::Segmentation(mask) = &mut layer.mask else {
+                    return false;
+                };
+                if x >= mask.width || y >= mask.height {
+                    return false;
+                }
+                let label = mask.labels[y * mask.width + x] as usize;
+                if label == 0 {
+                    return false;
+                }
+                let Some(slot) = mask.selected.get_mut(label) else {
+                    return false;
+                };
+                if *slot == selected {
+                    return false;
+                }
+                *slot = selected;
+                changed_label = Some(label);
+                true
+            });
+        if let Some(label) = changed_label {
+            self.show_feedback_toast(if selected {
+                format!("領域 {label} を選択しました")
+            } else {
+                format!("領域 {label} を解除しました")
+            });
+        }
+        changed
+    }
+
     pub(crate) fn handle_local_adjust_canvas_input(
         &mut self,
         ctx: &egui::Context,
@@ -4240,6 +4929,15 @@ impl App {
                         }
                     }
                 }
+                Some(MaskKind::Segmentation) => {
+                    self.toggle_local_adjust_region_at(
+                        fs_idx,
+                        layer_idx,
+                        norm,
+                        self.local_adjust_mask_paint_add,
+                    );
+                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
                 Some(MaskKind::LinearGradient) => {
                     self.local_adjust_canvas_drag_before_layers =
                         self.local_adjust_page_layers.get(&fs_idx).cloned();
@@ -4282,6 +4980,7 @@ impl App {
                     .and_then(|layers| layers.get(layer_idx))
                     .map(|layer| MaskKind::from_mask(&layer.mask)),
                 Some(MaskKind::ColorRange | MaskKind::LinearGradient | MaskKind::RadialGradient)
+                    | Some(MaskKind::Segmentation)
             )
             || self.local_adjust_selective_color_pick_active
             || self.local_adjust_rgb_pick_active.is_some()
@@ -4698,6 +5397,12 @@ impl App {
         if let Some(layer_idx) = effect_requests.load_cube_lut {
             self.choose_local_adjust_cube_lut_for_layer(fs_idx, layer_idx);
         }
+        if let Some(layer_idx) = effect_requests.generate_subject_mask {
+            self.start_local_adjust_subject_segmentation(fs_idx, layer_idx);
+        }
+        if let Some((layer_idx, scope)) = effect_requests.generate_region_mask {
+            self.start_local_adjust_region_segmentation(fs_idx, layer_idx, scope);
+        }
     }
 
     fn choose_local_adjust_cube_lut_for_layer(&mut self, fs_idx: usize, layer_idx: usize) {
@@ -4825,6 +5530,241 @@ impl App {
         }
     }
 
+    fn local_adjust_subject_mask_candidate(
+        &self,
+        fs_idx: usize,
+    ) -> Option<local_adjust_core::RasterMask> {
+        let image_dims = local_adjust_image_dims(self, fs_idx);
+        let layers = self.local_adjust_page_layers.get(&fs_idx)?;
+        local_adjust_subject_mask_candidate_from_layers(layers, image_dims)
+    }
+
+    fn start_local_adjust_subject_segmentation(&mut self, fs_idx: usize, layer_idx: usize) {
+        if self.local_adjust_segmentation_pending.is_some() {
+            self.show_feedback_toast("マスク生成中です".to_string());
+            return;
+        }
+        if !self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .and_then(|layers| layers.get(layer_idx))
+            .is_some_and(|layer| matches!(layer.mask, local_adjust_core::LocalMask::Subject(_)))
+        {
+            self.show_feedback_toast("被写体マスクのレイヤーを選択してください".to_string());
+            return;
+        }
+        let Some(runtime) = self.ai_runtime.clone() else {
+            self.show_feedback_toast("AI ランタイムが初期化されていません".to_string());
+            return;
+        };
+        let Some(model_path) = self
+            .ai_model_manager
+            .model_path(crate::ai::ModelKind::SubjectU2Netp)
+        else {
+            self.show_feedback_toast("U²-Netp モデルが見つかりません".to_string());
+            return;
+        };
+        let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
+            self.show_feedback_toast("被写体マスク生成用の画像を取得できません".to_string());
+            return;
+        };
+        let generation = self
+            .local_adjust_generation
+            .get(&fs_idx)
+            .copied()
+            .unwrap_or(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("local-adjust-subject-segmentation".to_string())
+            .spawn(move || {
+                let result = run_local_adjust_u2netp_segmentation(runtime, model_path, source)
+                    .map(LocalAdjustGeneratedMask::Subject);
+                let _ = tx.send(result);
+            });
+        match spawn_result {
+            Ok(_) => {
+                self.local_adjust_segmentation_pending =
+                    Some(crate::app::LocalAdjustSegmentationPending {
+                        fs_idx,
+                        layer_idx,
+                        generation,
+                        rx,
+                    });
+                self.show_feedback_toast("被写体マスク生成中...".to_string());
+            }
+            Err(err) => {
+                self.show_feedback_toast(format!("被写体マスク worker 起動失敗: {err}"));
+            }
+        }
+    }
+
+    fn start_local_adjust_region_segmentation(
+        &mut self,
+        fs_idx: usize,
+        layer_idx: usize,
+        scope: LocalAdjustRegionSegmentationScope,
+    ) {
+        if self.local_adjust_segmentation_pending.is_some() {
+            self.show_feedback_toast("マスク生成中です".to_string());
+            return;
+        }
+        if !self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .and_then(|layers| layers.get(layer_idx))
+            .is_some_and(|layer| {
+                matches!(layer.mask, local_adjust_core::LocalMask::Segmentation(_))
+            })
+        {
+            self.show_feedback_toast("領域分割マスクのレイヤーを選択してください".to_string());
+            return;
+        }
+        let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
+            self.show_feedback_toast("領域分割用の画像を取得できません".to_string());
+            return;
+        };
+        let subject = if scope.requires_subject() {
+            self.local_adjust_subject_mask_candidate(fs_idx)
+        } else {
+            None
+        };
+        if scope.requires_subject() && subject.is_none() {
+            self.show_feedback_toast("利用できる被写体マスクがありません".to_string());
+            return;
+        }
+        let color_tolerance = self.local_adjust_region_color_tolerance;
+        let min_area = self.local_adjust_region_min_area.max(1);
+        let edge_threshold = self.local_adjust_boundary_edge_threshold.clamp(0.0, 255.0);
+        let ink_threshold = self.local_adjust_boundary_ink_threshold.clamp(0.0, 255.0);
+        let gap_px = self.local_adjust_boundary_gap_px.round().clamp(0.0, 8.0) as usize;
+        let generation = self
+            .local_adjust_generation
+            .get(&fs_idx)
+            .copied()
+            .unwrap_or(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("local-adjust-region-segmentation".to_string())
+            .spawn(move || {
+                let result = build_local_adjust_region_segmentation(
+                    source.as_ref(),
+                    subject.as_ref(),
+                    scope,
+                    color_tolerance,
+                    min_area,
+                    edge_threshold,
+                    ink_threshold,
+                    gap_px,
+                )
+                .map(LocalAdjustGeneratedMask::Regions);
+                let _ = tx.send(result);
+            });
+        match spawn_result {
+            Ok(_) => {
+                self.local_adjust_segmentation_pending =
+                    Some(crate::app::LocalAdjustSegmentationPending {
+                        fs_idx,
+                        layer_idx,
+                        generation,
+                        rx,
+                    });
+                self.show_feedback_toast(scope.pending_label().to_string());
+            }
+            Err(err) => {
+                self.show_feedback_toast(format!("領域分割 worker 起動失敗: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn poll_local_adjust_segmentation(&mut self, ctx: &egui::Context) {
+        let recv_result = {
+            let Some(pending) = self.local_adjust_segmentation_pending.as_ref() else {
+                return;
+            };
+            pending.rx.try_recv()
+        };
+        match recv_result {
+            Ok(Ok(generated)) => {
+                let Some(pending) = self.local_adjust_segmentation_pending.take() else {
+                    return;
+                };
+                let current_generation = self
+                    .local_adjust_generation
+                    .get(&pending.fs_idx)
+                    .copied()
+                    .unwrap_or(0);
+                if pending.generation != current_generation {
+                    self.show_feedback_toast(
+                        "マスク生成結果を破棄しました。レイヤーが変更されています".to_string(),
+                    );
+                    return;
+                }
+                let mut layers = self
+                    .local_adjust_page_layers
+                    .get(&pending.fs_idx)
+                    .cloned()
+                    .unwrap_or_default();
+                let before_layers = layers.clone();
+                let Some(layer) = layers.get_mut(pending.layer_idx) else {
+                    self.show_feedback_toast(
+                        "マスク生成結果を破棄しました。対象レイヤーがありません".to_string(),
+                    );
+                    return;
+                };
+                let status = match (&mut layer.mask, generated) {
+                    (
+                        local_adjust_core::LocalMask::Subject(slot),
+                        LocalAdjustGeneratedMask::Subject(mask),
+                    ) => {
+                        let foreground = mask.alpha.iter().filter(|&&alpha| alpha >= 0.5).count();
+                        let total = mask.alpha.len().max(1);
+                        *slot = local_adjust_core::SubjectMask::from_raster(mask);
+                        format!(
+                            "被写体マスク生成完了: 前景 {:.1}%",
+                            foreground as f32 / total as f32 * 100.0
+                        )
+                    }
+                    (
+                        local_adjust_core::LocalMask::Segmentation(slot),
+                        LocalAdjustGeneratedMask::Regions(mask),
+                    ) => {
+                        let label_count = mask.label_count();
+                        *slot = mask;
+                        format!("領域分割完了: {label_count} 領域")
+                    }
+                    _ => {
+                        self.show_feedback_toast(
+                            "マスク生成結果を破棄しました。対象レイヤーが変更されています"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                };
+                self.local_adjust_selected_layers
+                    .insert(pending.fs_idx, pending.layer_idx);
+                self.set_local_adjust_layers_for_idx_with_undo(
+                    pending.fs_idx,
+                    before_layers,
+                    layers,
+                    "補正レイヤーマスク生成".to_string(),
+                );
+                self.show_feedback_toast(status);
+                ctx.request_repaint();
+            }
+            Ok(Err(err)) => {
+                self.local_adjust_segmentation_pending = None;
+                self.show_feedback_toast(format!("マスク生成失敗: {err}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.local_adjust_segmentation_pending = None;
+                self.show_feedback_toast("マスク生成 worker が停止しました".to_string());
+            }
+        }
+    }
+
     /// 補正レイヤーの独立左パネルを描画する。
     pub(crate) fn draw_local_adjust_panel(&mut self, ctx: &egui::Context, full_rect: egui::Rect) {
         if !self.local_adjust_mode {
@@ -4862,6 +5802,13 @@ impl App {
         let selective_color_pick_active = self.local_adjust_selective_color_pick_active;
         let rgb_pick_active = self.local_adjust_rgb_pick_active;
         let effect_position_handles_visible = self.local_adjust_effect_position_handles_visible;
+        let segmentation_pending = self.local_adjust_segmentation_pending.is_some();
+        let subject_model_available = self
+            .ai_model_manager
+            .model_path(crate::ai::ModelKind::SubjectU2Netp)
+            .is_some();
+        let subject_mask_available =
+            local_adjust_subject_mask_candidate_from_layers(&layers, image_dims).is_some();
         let previous_mask_edit_target = self.local_adjust_mask_edit_target;
         let mut mask_edit_target = self.local_adjust_mask_edit_target;
         let mut mask_brush_radius = self.local_adjust_mask_brush_radius;
@@ -4875,6 +5822,8 @@ impl App {
         let mut boundary_gap_px = self.local_adjust_boundary_gap_px;
         let mut edge_brush_tolerance = self.local_adjust_edge_brush_tolerance;
         let mut edge_brush_include_boundary = self.local_adjust_edge_brush_include_boundary;
+        let mut region_color_tolerance = self.local_adjust_region_color_tolerance;
+        let mut region_min_area = self.local_adjust_region_min_area;
 
         let panel_pos = egui::pos2(
             full_rect.min.x + LOCAL_ADJUST_PANEL_MARGIN_X,
@@ -5027,6 +5976,9 @@ impl App {
                                             selective_color_pick_active,
                                             rgb_pick_active,
                                             effect_position_handles_visible,
+                                            segmentation_pending,
+                                            subject_model_available,
+                                            subject_mask_available,
                                             &mut mask_edit_target,
                                             &mut mask_brush_radius,
                                             &mut mask_paint_add,
@@ -5038,6 +5990,8 @@ impl App {
                                             &mut boundary_gap_px,
                                             &mut edge_brush_tolerance,
                                             &mut edge_brush_include_boundary,
+                                            &mut region_color_tolerance,
+                                            &mut region_min_area,
                                             &mut effect_requests,
                                         );
                                     });
@@ -5074,6 +6028,8 @@ impl App {
         self.local_adjust_boundary_gap_px = boundary_gap_px.clamp(0.0, 8.0);
         self.local_adjust_edge_brush_tolerance = edge_brush_tolerance.clamp(0.0, 255.0);
         self.local_adjust_edge_brush_include_boundary = edge_brush_include_boundary;
+        self.local_adjust_region_color_tolerance = region_color_tolerance.clamp(4.0, 120.0);
+        self.local_adjust_region_min_area = region_min_area.clamp(1, 2048);
         self.apply_local_adjust_panel_actions(
             fs_idx,
             add_quick_effect,

@@ -121,7 +121,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `local_adjust_catalog.rs` | 補正レイヤー効果ピッカー用の効果一覧・検索・デフォルト効果生成 |
 | `local_adjust_effect_ui.rs` | `local_adjust_lab` から移植した各 `LocalEffect` のパラメータ UI |
 | `spread_db.rs` | フォルダ別の見開きモード永続化 |
-| `ai/` | ONNX Runtime (DirectML or TensorRT) によるアップスケール / デノイズ / Inpainting / 画像種別分類。`AiBackend` で multi-EP 対応、TRT 用に `tensorrt_pack` (DLL pack 検出) と `tensorrt_builder` (子プロセスエンジンビルダー) を持つ。TRT 推論はメインから別プロセスへ shm + JSON IPC でルーティング (`trt_worker_pool` / `trt_worker_proto` / `trt_worker_runtime` / `trt_worker_shm`)。TensorRT 設定でも起動時には worker を自動起動せず、AI 処理が実際に必要になった最初のタイミングで遅延起動する。worker 死亡を検知したら自動 detach + DirectML フォールバック + UI バナー通知 |
+| `ai/` | ONNX Runtime (DirectML or TensorRT) によるアップスケール / デノイズ / Inpainting / 画像種別分類 / 補正レイヤー被写体選択。`AiBackend` で multi-EP 対応、TRT 用に `tensorrt_pack` (DLL pack 検出) と `tensorrt_builder` (子プロセスエンジンビルダー) を持つ。TRT 推論はメインから別プロセスへ shm + JSON IPC でルーティング (`trt_worker_pool` / `trt_worker_proto` / `trt_worker_runtime` / `trt_worker_shm`)。TensorRT 設定でも起動時には worker を自動起動せず、AI 処理が実際に必要になった最初のタイミングで遅延起動する。worker 死亡を検知したら自動 detach + DirectML フォールバック + UI バナー通知。U²-Netp 被写体選択は小型モデルとして in-process CPU 強制ロードで使う |
 | `png_metadata.rs` | PNG の tEXt/iTXt/zTXt に埋め込まれた AI メタデータ読み取り |
 | `exif_reader.rs` | EXIF 読み取り (rexif)。構造タグの抑止と Exif 2.3x 拡張タグの日本語名マップを持つ |
 | `xmp_reader.rs` | XMP 読み取り (quick-xml)。`xtw:*` 名前空間のツイート情報を抽出し「XMP ツイート情報」パネルに表示 |
@@ -130,7 +130,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 
 | モジュール | 役割 |
 | --- | --- |
-| `ui_adjustment_panel.rs` | 画像補正パネル (左端オーバーレイ)。プリセット切替・AI 設定・保存スロット。ヘッダーの補正レイヤーアイコンから `×` 付き独立左パネルも開く |
+| `ui_adjustment_panel.rs` | 画像補正パネル (左端オーバーレイ)。プリセット切替・AI 設定・保存スロット。ヘッダーの補正レイヤーアイコンから `×` 付き独立左パネルも開く。補正レイヤーパネルでは効果 UI、マスク編集、U²-Netp 被写体生成、クラシック領域分割生成を UI thread 外の worker 経由で扱う |
 | `ui_analysis_panel.rs` | 画像分析パネル (右端オーバーレイ)。色情報・ヒストグラム |
 | `ui_metadata_panel.rs` | メタデータパネル (AI メタデータ + EXIF + XMP ツイート情報) |
 | `ui_erase.rs` | 消しゴムモード (筆 / 囲み / 直線 / 縦線 / 横線 / 矩形 / 楕円 → MI-GAN で inpaint) |

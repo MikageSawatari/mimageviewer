@@ -392,6 +392,7 @@ impl AiRuntime {
         match kind {
             ModelKind::InpaintMiGan => false,
             ModelKind::ClassifierMobileNet => false,
+            ModelKind::SubjectU2Netp => false,
             ModelKind::UpscaleRealEsrGeneralV3 => false,
             ModelKind::UpscaleRealEsrganX4Plus
             | ModelKind::UpscaleRealEsrganAnime6B

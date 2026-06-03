@@ -57,6 +57,11 @@ static EMBEDDED_MODELS: &[EmbeddedModel] = &[
         filename: "migan.onnx",
         bytes: include_bytes!("../../vendor/models/migan.onnx"),
     },
+    EmbeddedModel {
+        kind: ModelKind::SubjectU2Netp,
+        filename: "u2netp.onnx",
+        bytes: include_bytes!("../../vendor/models/u2netp.onnx"),
+    },
 ];
 
 /// 展開済みモデルディレクトリのキャッシュ。

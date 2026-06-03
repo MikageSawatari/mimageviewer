@@ -126,6 +126,8 @@ pub enum ModelKind {
     DenoiseRealplksr,
     /// MI-GAN Inpainting
     InpaintMiGan,
+    /// U²-Netp foreground segmentation
+    SubjectU2Netp,
 }
 
 impl ModelKind {
@@ -140,6 +142,7 @@ impl ModelKind {
             ModelKind::DenoiseRealplksr => "denoise_realplksr",
             ModelKind::InpaintMiGan => "inpaint_migan",
             ModelKind::UpscaleRealCugan4x => "realcugan_4x",
+            ModelKind::SubjectU2Netp => "subject_u2netp",
         }
     }
 
@@ -154,6 +157,7 @@ impl ModelKind {
             ModelKind::UpscaleRealEsrGeneralV3 => "高速汎用",
             ModelKind::DenoiseRealplksr => "JPEG ノイズ除去 (等倍)",
             ModelKind::InpaintMiGan => "補完 (MI-GAN)",
+            ModelKind::SubjectU2Netp => "被写体選択 (U²-Netp)",
         }
     }
 
@@ -170,6 +174,7 @@ impl ModelKind {
             "inpaint_migan" | "inpaint_lama" => Some(ModelKind::InpaintMiGan),
             "realcugan_4x" => Some(ModelKind::UpscaleRealCugan4x),
             "denoise_realplksr" => Some(ModelKind::DenoiseRealplksr),
+            "subject_u2netp" => Some(ModelKind::SubjectU2Netp),
             _ => None,
         }
     }

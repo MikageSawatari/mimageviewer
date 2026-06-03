@@ -154,6 +154,7 @@ fn warmup_input_shape(kind: ModelKind) -> (usize, usize, usize, usize) {
         ModelKind::ClassifierMobileNet => (1, 3, 384, 384),
         ModelKind::DenoiseRealplksr => (1, 3, 256, 256),
         ModelKind::InpaintMiGan => (1, 4, 512, 512),
+        ModelKind::SubjectU2Netp => (1, 3, 320, 320),
         ModelKind::UpscaleRealEsrGeneralV3 => (1, 3, 512, 512),
         ModelKind::UpscaleRealEsrganX4Plus
         | ModelKind::UpscaleRealEsrganAnime6B
