@@ -97,7 +97,7 @@ fn sidecar_subtract_persists_through_import() {
     sidecar.flush();
 
     let loaded = SidecarFile::load(temp.path());
-    let stats = import_to_dbs(temp.path(), &loaded, None, Some(&mask_db), None);
+    let stats = import_to_dbs(temp.path(), &loaded, None, Some(&mask_db), None, None, None);
     assert_eq!(stats.imported_mask, 1);
 
     let key = reconstruct_image_key(temp.path(), "photo.jpg");

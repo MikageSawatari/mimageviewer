@@ -20,6 +20,7 @@ fn single_pixels(base_pixels: Arc<egui::ColorImage>) -> ExportPixels {
     ExportPixels::Single(ExportPagePixels {
         base_pixels,
         conceal_mask: None,
+        crop: None,
     })
 }
 
