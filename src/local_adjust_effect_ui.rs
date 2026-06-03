@@ -7,7 +7,7 @@ trait LabHoverTipExt {
 
 impl LabHoverTipExt for egui::Response {
     fn lab_hover_tip(self, text: impl Into<egui::WidgetText>) -> Self {
-        self.on_hover_text(text)
+        crate::ui_helpers::HoverTipExt::hover_tip_dark(self, text)
     }
 }
 
