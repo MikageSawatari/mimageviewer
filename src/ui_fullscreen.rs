@@ -846,6 +846,10 @@ impl App {
                     return self.resolve_local_adjust_source_texture(ctx, idx);
                 }
             }
+            if let Some(local_adjust_tex) = self.current_local_adjust_texture(idx) {
+                return Some(local_adjust_tex);
+            }
+            return self.resolve_local_adjust_source_texture(ctx, idx);
         }
 
         let erase_result_tex = self.ensure_erase_result_texture(ctx, idx);
