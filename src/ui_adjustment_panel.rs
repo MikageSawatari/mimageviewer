@@ -43,6 +43,7 @@ const LOCAL_ADJUST_PANEL_MARGIN_X: f32 = 16.0;
 const LOCAL_ADJUST_PANEL_MARGIN_Y: f32 = 60.0;
 const LOCAL_ADJUST_PANEL_BOTTOM_MARGIN: f32 = 20.0;
 const LOCAL_ADJUST_PANEL_MIN_BODY_H: f32 = 120.0;
+const LOCAL_ADJUST_EDGE_BRUSH_INCLUDE_BOUNDARY_RADIUS: isize = 2;
 
 #[derive(Debug, Clone, Copy)]
 enum QuickLocalAdjustEffect {
@@ -154,6 +155,8 @@ fn local_mask_edit_target_label(target: LocalAdjustMaskEditTarget) -> &'static s
 fn local_mask_tool_label(tool: LocalAdjustMaskTool) -> &'static str {
     match tool {
         LocalAdjustMaskTool::Brush => "筆",
+        LocalAdjustMaskTool::EdgeBrush => "境界筆",
+        LocalAdjustMaskTool::GapFillBrush => "隙間補完",
         LocalAdjustMaskTool::Lasso => "囲み",
         LocalAdjustMaskTool::Polygon => "多角形",
         LocalAdjustMaskTool::Line => "直線",
@@ -419,6 +422,12 @@ fn draw_local_adjust_section(
     mask_paint_add: &mut bool,
     mask_tool: &mut LocalAdjustMaskTool,
     mask_line_width: &mut f32,
+    mask_gap_fill_distance: &mut f32,
+    boundary_edge_threshold: &mut f32,
+    boundary_ink_threshold: &mut f32,
+    boundary_gap_px: &mut f32,
+    edge_brush_tolerance: &mut f32,
+    edge_brush_include_boundary: &mut bool,
     effect_requests: &mut LocalEffectPanelRequests,
 ) {
     ui.add_space(4.0);
@@ -572,6 +581,12 @@ fn draw_local_adjust_section(
             mask_paint_add,
             mask_tool,
             mask_line_width,
+            mask_gap_fill_distance,
+            boundary_edge_threshold,
+            boundary_ink_threshold,
+            boundary_gap_px,
+            edge_brush_tolerance,
+            edge_brush_include_boundary,
             effect_requests,
         );
     }
@@ -602,6 +617,12 @@ fn draw_selected_local_adjust_layer_editor(
     mask_paint_add: &mut bool,
     mask_tool: &mut LocalAdjustMaskTool,
     mask_line_width: &mut f32,
+    mask_gap_fill_distance: &mut f32,
+    boundary_edge_threshold: &mut f32,
+    boundary_ink_threshold: &mut f32,
+    boundary_gap_px: &mut f32,
+    edge_brush_tolerance: &mut f32,
+    edge_brush_include_boundary: &mut bool,
     effect_requests: &mut LocalEffectPanelRequests,
 ) {
     let mut edited = layer.clone();
@@ -633,6 +654,12 @@ fn draw_selected_local_adjust_layer_editor(
         mask_paint_add,
         mask_tool,
         mask_line_width,
+        mask_gap_fill_distance,
+        boundary_edge_threshold,
+        boundary_ink_threshold,
+        boundary_gap_px,
+        edge_brush_tolerance,
+        edge_brush_include_boundary,
     );
     let response = draw_effect_params(
         ui,
@@ -803,6 +830,543 @@ fn paint_local_adjust_alpha_line(
         }
     }
 
+    changed
+}
+
+fn local_adjust_luma_at(image: &egui::ColorImage, x: usize, y: usize) -> f32 {
+    let idx = y.saturating_mul(image.size[0]).saturating_add(x);
+    let color = image
+        .pixels
+        .get(idx)
+        .copied()
+        .unwrap_or(egui::Color32::BLACK);
+    color.r() as f32 * 0.299 + color.g() as f32 * 0.587 + color.b() as f32 * 0.114
+}
+
+fn local_adjust_luma_offset(
+    image: &egui::ColorImage,
+    x: usize,
+    y: usize,
+    dx: isize,
+    dy: isize,
+) -> Option<f32> {
+    let nx = x as isize + dx;
+    let ny = y as isize + dy;
+    if nx < 0 || ny < 0 || nx >= image.size[0] as isize || ny >= image.size[1] as isize {
+        return None;
+    }
+    Some(local_adjust_luma_at(image, nx as usize, ny as usize))
+}
+
+fn local_adjust_edge_strength_at(image: &egui::ColorImage, x: usize, y: usize) -> f32 {
+    let width = image.size[0];
+    let height = image.size[1];
+    let xm = x.saturating_sub(1);
+    let xp = (x + 1).min(width.saturating_sub(1));
+    let ym = y.saturating_sub(1);
+    let yp = (y + 1).min(height.saturating_sub(1));
+    let left = local_adjust_luma_at(image, xm, y);
+    let right = local_adjust_luma_at(image, xp, y);
+    let top = local_adjust_luma_at(image, x, ym);
+    let bottom = local_adjust_luma_at(image, x, yp);
+    ((right - left).powi(2) + (bottom - top).powi(2)).sqrt()
+}
+
+fn local_adjust_line_interior_strength_at(image: &egui::ColorImage, x: usize, y: usize) -> f32 {
+    if image.size[0] == 0 || image.size[1] == 0 {
+        return 0.0;
+    }
+    let center = local_adjust_luma_at(image, x, y);
+    let radius = 3_isize;
+    let mut best = 0.0_f32;
+    for (dx, dy) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
+        let Some(a) = local_adjust_luma_offset(image, x, y, dx * radius, dy * radius) else {
+            continue;
+        };
+        let Some(b) = local_adjust_luma_offset(image, x, y, -dx * radius, -dy * radius) else {
+            continue;
+        };
+        let dark_line = (a - center).min(b - center);
+        let bright_line = (center - a).min(center - b);
+        best = best.max(dark_line.max(bright_line).max(0.0));
+    }
+    best
+}
+
+fn local_adjust_raw_boundary_pixel_at(
+    image: &egui::ColorImage,
+    x: usize,
+    y: usize,
+    edge_threshold: f32,
+    ink_threshold: f32,
+) -> bool {
+    local_adjust_edge_strength_at(image, x, y) >= edge_threshold
+        || local_adjust_line_interior_strength_at(image, x, y) >= ink_threshold
+}
+
+fn local_adjust_nearest_boundary_distance(
+    image: &egui::ColorImage,
+    x: usize,
+    y: usize,
+    dx: isize,
+    dy: isize,
+    edge_threshold: f32,
+    ink_threshold: f32,
+    max_distance: usize,
+) -> Option<usize> {
+    for step in 1..=max_distance {
+        let nx = x as isize + dx * step as isize;
+        let ny = y as isize + dy * step as isize;
+        if nx < 0 || ny < 0 || nx >= image.size[0] as isize || ny >= image.size[1] as isize {
+            return None;
+        }
+        if local_adjust_raw_boundary_pixel_at(
+            image,
+            nx as usize,
+            ny as usize,
+            edge_threshold,
+            ink_threshold,
+        ) {
+            return Some(step);
+        }
+    }
+    None
+}
+
+fn local_adjust_boundary_gap_bridge_at(
+    image: &egui::ColorImage,
+    x: usize,
+    y: usize,
+    edge_threshold: f32,
+    ink_threshold: f32,
+    max_gap: usize,
+) -> bool {
+    for ((dx0, dy0), (dx1, dy1)) in [
+        ((-1, 0), (1, 0)),
+        ((0, -1), (0, 1)),
+        ((-1, -1), (1, 1)),
+        ((-1, 1), (1, -1)),
+    ] {
+        let a = local_adjust_nearest_boundary_distance(
+            image,
+            x,
+            y,
+            dx0,
+            dy0,
+            edge_threshold,
+            ink_threshold,
+            max_gap,
+        );
+        let b = local_adjust_nearest_boundary_distance(
+            image,
+            x,
+            y,
+            dx1,
+            dy1,
+            edge_threshold,
+            ink_threshold,
+            max_gap,
+        );
+        if let (Some(a), Some(b)) = (a, b)
+            && a + b <= max_gap + 1
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn local_adjust_boundary_pixel_at(
+    image: &egui::ColorImage,
+    x: usize,
+    y: usize,
+    edge_threshold: f32,
+    ink_threshold: f32,
+    gap_px: usize,
+) -> bool {
+    local_adjust_raw_boundary_pixel_at(image, x, y, edge_threshold, ink_threshold)
+        || (gap_px > 0
+            && local_adjust_boundary_gap_bridge_at(
+                image,
+                x,
+                y,
+                edge_threshold,
+                ink_threshold,
+                gap_px,
+            ))
+}
+
+fn local_adjust_edge_brush_pixel_allowed(
+    image: &egui::ColorImage,
+    x: usize,
+    y: usize,
+    seed: [u8; 3],
+    tolerance: i16,
+    edge_threshold: f32,
+    ink_threshold: f32,
+    gap_px: usize,
+) -> bool {
+    let idx = y.saturating_mul(image.size[0]).saturating_add(x);
+    let color = image
+        .pixels
+        .get(idx)
+        .copied()
+        .unwrap_or(egui::Color32::BLACK);
+    let rgb = [color.r(), color.g(), color.b()];
+    let max_delta = seed
+        .iter()
+        .zip(rgb)
+        .map(|(&a, b)| (a as i16 - b as i16).abs())
+        .max()
+        .unwrap_or(0);
+    max_delta <= tolerance
+        && !local_adjust_boundary_pixel_at(image, x, y, edge_threshold, ink_threshold, gap_px)
+}
+
+fn include_local_adjust_adjacent_boundary_pixels(
+    image: &egui::ColorImage,
+    targets: &mut Vec<usize>,
+    target_map: &mut [bool],
+    bounds: (usize, usize, usize, usize),
+    bw: usize,
+    center: [f32; 2],
+    radius_sq: f32,
+    thresholds: (f32, f32, usize),
+) {
+    if bw == 0 {
+        return;
+    }
+    let (min_x, max_x, min_y, max_y) = bounds;
+    let (edge_threshold, ink_threshold, gap_px) = thresholds;
+    let initial_len = targets.len();
+    let include_radius = LOCAL_ADJUST_EDGE_BRUSH_INCLUDE_BOUNDARY_RADIUS;
+    let include_radius_sq = include_radius * include_radius;
+    for i in 0..initial_len {
+        let src_idx = targets[i];
+        let x = src_idx % image.size[0];
+        let y = src_idx / image.size[0];
+        for dy in -include_radius..=include_radius {
+            for dx in -include_radius..=include_radius {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                if dx * dx + dy * dy > include_radius_sq {
+                    continue;
+                }
+                let nx = x as isize + dx;
+                let ny = y as isize + dy;
+                if nx < min_x as isize
+                    || ny < min_y as isize
+                    || nx > max_x as isize
+                    || ny > max_y as isize
+                {
+                    continue;
+                }
+                let nx = nx as usize;
+                let ny = ny as usize;
+                let local_idx = (ny - min_y) * bw + (nx - min_x);
+                if target_map.get(local_idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                let brush_dx = nx as f32 + 0.5 - center[0];
+                let brush_dy = ny as f32 + 0.5 - center[1];
+                if brush_dx * brush_dx + brush_dy * brush_dy > radius_sq {
+                    continue;
+                }
+                if local_adjust_boundary_pixel_at(
+                    image,
+                    nx,
+                    ny,
+                    edge_threshold,
+                    ink_threshold,
+                    gap_px,
+                ) {
+                    target_map[local_idx] = true;
+                    targets.push(ny * image.size[0] + nx);
+                }
+            }
+        }
+    }
+}
+
+fn paint_local_adjust_edge_brush_stamp(
+    alpha: &mut [f32],
+    image: &egui::ColorImage,
+    center: [f32; 2],
+    radius: f32,
+    paint: bool,
+    seed: [u8; 3],
+    tolerance: i16,
+    thresholds: (f32, f32, usize),
+    include_boundary: bool,
+) -> bool {
+    let (width, height) = (image.size[0], image.size[1]);
+    if width == 0 || height == 0 || alpha.len() < width.saturating_mul(height) {
+        return false;
+    }
+    let (edge_threshold, ink_threshold, gap_px) = thresholds;
+    let min_x = (center[0] - radius).floor().max(0.0) as usize;
+    let max_x = (center[0] + radius).ceil().min(width as f32 - 1.0) as usize;
+    let min_y = (center[1] - radius).floor().max(0.0) as usize;
+    let max_y = (center[1] + radius).ceil().min(height as f32 - 1.0) as usize;
+    let radius_sq = radius * radius;
+    let start_x = center[0].floor().clamp(min_x as f32, max_x as f32) as usize;
+    let start_y = center[1].floor().clamp(min_y as f32, max_y as f32) as usize;
+    if !local_adjust_edge_brush_pixel_allowed(
+        image,
+        start_x,
+        start_y,
+        seed,
+        tolerance,
+        edge_threshold,
+        ink_threshold,
+        gap_px,
+    ) {
+        return false;
+    }
+
+    let bw = max_x - min_x + 1;
+    let bh = max_y - min_y + 1;
+    let mut visited = vec![false; bw.saturating_mul(bh)];
+    let mut target_map = vec![false; bw.saturating_mul(bh)];
+    let mut queue = vec![(start_x, start_y)];
+    visited[(start_y - min_y) * bw + (start_x - min_x)] = true;
+    let mut targets = Vec::new();
+    while let Some((x, y)) = queue.pop() {
+        let dx = x as f32 + 0.5 - center[0];
+        let dy = y as f32 + 0.5 - center[1];
+        if dx * dx + dy * dy > radius_sq {
+            continue;
+        }
+        if !local_adjust_edge_brush_pixel_allowed(
+            image,
+            x,
+            y,
+            seed,
+            tolerance,
+            edge_threshold,
+            ink_threshold,
+            gap_px,
+        ) {
+            continue;
+        }
+        targets.push(y * width + x);
+        target_map[(y - min_y) * bw + (x - min_x)] = true;
+        for (nx, ny) in [
+            (x.saturating_sub(1), y),
+            ((x + 1).min(max_x), y),
+            (x, y.saturating_sub(1)),
+            (x, (y + 1).min(max_y)),
+        ] {
+            if nx < min_x || nx > max_x || ny < min_y || ny > max_y {
+                continue;
+            }
+            let local_idx = (ny - min_y) * bw + (nx - min_x);
+            if !visited[local_idx] {
+                visited[local_idx] = true;
+                queue.push((nx, ny));
+            }
+        }
+    }
+    if targets.is_empty() {
+        return false;
+    }
+    if include_boundary {
+        include_local_adjust_adjacent_boundary_pixels(
+            image,
+            &mut targets,
+            &mut target_map,
+            (min_x, max_x, min_y, max_y),
+            bw,
+            center,
+            radius_sq,
+            thresholds,
+        );
+    }
+
+    let value = if paint { 1.0 } else { 0.0 };
+    let mut changed = false;
+    for idx in targets {
+        if let Some(alpha) = alpha.get_mut(idx) {
+            let before = *alpha;
+            *alpha = value;
+            changed |= (*alpha - before).abs() > f32::EPSILON;
+        }
+    }
+    changed
+}
+
+fn paint_local_adjust_alpha_edge_brush_line(
+    alpha: &mut [f32],
+    image: &egui::ColorImage,
+    from_norm: [f32; 2],
+    to_norm: [f32; 2],
+    radius: f32,
+    paint: bool,
+    seed: Option<[u8; 3]>,
+    tolerance: f32,
+    thresholds: (f32, f32, usize),
+    include_boundary: bool,
+) -> bool {
+    let Some(seed) = seed else {
+        return false;
+    };
+    let (width, height) = (image.size[0], image.size[1]);
+    if width == 0 || height == 0 || alpha.len() < width.saturating_mul(height) {
+        return false;
+    }
+    let from = local_adjust_norm_to_pixel(from_norm, width, height);
+    let to = local_adjust_norm_to_pixel(to_norm, width, height);
+    let radius = radius.max(1.0);
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let dist = (dx * dx + dy * dy).sqrt();
+    let steps = (dist / (radius * 0.5)).ceil().max(1.0) as usize;
+    let tolerance = tolerance.clamp(0.0, 255.0).round() as i16;
+    let mut changed = false;
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let center = [from.0 + dx * t, from.1 + dy * t];
+        changed |= paint_local_adjust_edge_brush_stamp(
+            alpha,
+            image,
+            center,
+            radius,
+            paint,
+            seed,
+            tolerance,
+            thresholds,
+            include_boundary,
+        );
+    }
+    changed
+}
+
+fn local_adjust_nearest_mask_distance(
+    alpha: &[f32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    dx: isize,
+    dy: isize,
+    max_distance: usize,
+) -> Option<usize> {
+    for step in 1..=max_distance {
+        let nx = x as isize + dx * step as isize;
+        let ny = y as isize + dy * step as isize;
+        if nx < 0 || ny < 0 || nx >= width as isize || ny >= height as isize {
+            return None;
+        }
+        let idx = ny as usize * width + nx as usize;
+        if alpha.get(idx).copied().unwrap_or(0.0) > 0.5 {
+            return Some(step);
+        }
+    }
+    None
+}
+
+fn local_adjust_gap_between_masked_pixels(
+    alpha: &[f32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    max_gap: usize,
+) -> bool {
+    if width == 0 || height == 0 || max_gap == 0 {
+        return false;
+    }
+    let left = local_adjust_nearest_mask_distance(alpha, width, height, x, y, -1, 0, max_gap);
+    let right = local_adjust_nearest_mask_distance(alpha, width, height, x, y, 1, 0, max_gap);
+    if let (Some(l), Some(r)) = (left, right)
+        && l + r <= max_gap + 1
+    {
+        return true;
+    }
+    let up = local_adjust_nearest_mask_distance(alpha, width, height, x, y, 0, -1, max_gap);
+    let down = local_adjust_nearest_mask_distance(alpha, width, height, x, y, 0, 1, max_gap);
+    if let (Some(u), Some(d)) = (up, down)
+        && u + d <= max_gap + 1
+    {
+        return true;
+    }
+    false
+}
+
+fn paint_local_adjust_gap_fill_stamp(
+    alpha: &mut [f32],
+    src: &[f32],
+    width: usize,
+    height: usize,
+    center: [f32; 2],
+    radius: f32,
+    gap: usize,
+) -> bool {
+    if width == 0 || height == 0 || alpha.len() < width.saturating_mul(height) {
+        return false;
+    }
+    let min_x = (center[0] - radius).floor().max(0.0) as usize;
+    let max_x = (center[0] + radius).ceil().min(width as f32 - 1.0) as usize;
+    let min_y = (center[1] - radius).floor().max(0.0) as usize;
+    let max_y = (center[1] + radius).ceil().min(height as f32 - 1.0) as usize;
+    let radius_sq = radius * radius;
+    let mut changed = false;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let dx = x as f32 + 0.5 - center[0];
+            let dy = y as f32 + 0.5 - center[1];
+            if dx * dx + dy * dy > radius_sq {
+                continue;
+            }
+            let idx = y * width + x;
+            if src.get(idx).copied().unwrap_or(0.0) > 0.5 {
+                continue;
+            }
+            if local_adjust_gap_between_masked_pixels(src, width, height, x, y, gap) {
+                let before = alpha[idx];
+                alpha[idx] = 1.0;
+                changed |= (alpha[idx] - before).abs() > f32::EPSILON;
+            }
+        }
+    }
+    changed
+}
+
+fn paint_local_adjust_alpha_gap_fill_line(
+    alpha: &mut [f32],
+    width: usize,
+    height: usize,
+    from_norm: [f32; 2],
+    to_norm: [f32; 2],
+    radius: f32,
+    paint: bool,
+    gap: f32,
+) -> bool {
+    if !paint {
+        return paint_local_adjust_alpha_line(
+            alpha, width, height, from_norm, to_norm, radius, false,
+        );
+    }
+    if width == 0 || height == 0 || alpha.len() < width.saturating_mul(height) {
+        return false;
+    }
+    let from = local_adjust_norm_to_pixel(from_norm, width, height);
+    let to = local_adjust_norm_to_pixel(to_norm, width, height);
+    let radius = radius.max(1.0);
+    let gap = gap.round().clamp(1.0, 64.0) as usize;
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let dist = (dx * dx + dy * dy).sqrt();
+    let steps = (dist / (radius * 0.5)).ceil().max(1.0) as usize;
+    let src = alpha.to_vec();
+    let mut changed = false;
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let center = [from.0 + dx * t, from.1 + dy * t];
+        changed |=
+            paint_local_adjust_gap_fill_stamp(alpha, &src, width, height, center, radius, gap);
+    }
     changed
 }
 
@@ -1255,6 +1819,12 @@ fn draw_local_manual_mask_controls(
     mask_paint_add: &mut bool,
     mask_tool: &mut LocalAdjustMaskTool,
     mask_line_width: &mut f32,
+    mask_gap_fill_distance: &mut f32,
+    boundary_edge_threshold: &mut f32,
+    boundary_ink_threshold: &mut f32,
+    boundary_gap_px: &mut f32,
+    edge_brush_tolerance: &mut f32,
+    edge_brush_include_boundary: &mut bool,
 ) -> bool {
     let mut changed = false;
     let mask_kind = MaskKind::from_mask(&layer.mask);
@@ -1369,9 +1939,10 @@ fn draw_local_manual_mask_controls(
         for row in [
             &[
                 LocalAdjustMaskTool::Brush,
-                LocalAdjustMaskTool::Lasso,
-                LocalAdjustMaskTool::Polygon,
+                LocalAdjustMaskTool::EdgeBrush,
+                LocalAdjustMaskTool::GapFillBrush,
             ][..],
+            &[LocalAdjustMaskTool::Lasso, LocalAdjustMaskTool::Polygon][..],
             &[
                 LocalAdjustMaskTool::Line,
                 LocalAdjustMaskTool::VertLine,
@@ -1391,7 +1962,9 @@ fn draw_local_manual_mask_controls(
             });
         }
         match *mask_tool {
-            LocalAdjustMaskTool::Brush => {
+            LocalAdjustMaskTool::Brush
+            | LocalAdjustMaskTool::EdgeBrush
+            | LocalAdjustMaskTool::GapFillBrush => {
                 ui.add(
                     egui::Slider::new(mask_brush_radius, 1.0..=160.0)
                         .text("筆サイズ")
@@ -1405,6 +1978,35 @@ fn draw_local_manual_mask_controls(
                     egui::Slider::new(mask_line_width, 1.0..=160.0)
                         .text("線幅")
                         .custom_formatter(|v, _| format!("{:.0}px", v)),
+                );
+            }
+            _ => {}
+        }
+        match *mask_tool {
+            LocalAdjustMaskTool::EdgeBrush => {
+                ui.add(
+                    egui::Slider::new(boundary_edge_threshold, 0.0..=120.0).text("境界しきい値"),
+                );
+                ui.add(
+                    egui::Slider::new(boundary_ink_threshold, 0.0..=120.0).text("線内部しきい値"),
+                );
+                ui.add(egui::Slider::new(boundary_gap_px, 0.0..=4.0).text("境界ギャップ補完"));
+                ui.add(egui::Slider::new(edge_brush_tolerance, 0.0..=160.0).text("色差許容"));
+                ui.checkbox(edge_brush_include_boundary, "境界線を含む");
+                ui.label(
+                    egui::RichText::new("開始点から近い色だけを境界で止めて塗ります。")
+                        .size(10.0)
+                        .color(egui::Color32::from_gray(170)),
+                );
+            }
+            LocalAdjustMaskTool::GapFillBrush => {
+                ui.add(egui::Slider::new(mask_gap_fill_distance, 1.0..=48.0).text("隙間幅"));
+                ui.label(
+                    egui::RichText::new(
+                        "左右または上下のマスクに挟まれた細い未塗り部分を補完します。",
+                    )
+                    .size(10.0)
+                    .color(egui::Color32::from_gray(170)),
                 );
             }
             _ => {}
@@ -1473,6 +2075,12 @@ fn draw_local_mask_editor(
     mask_paint_add: &mut bool,
     mask_tool: &mut LocalAdjustMaskTool,
     mask_line_width: &mut f32,
+    mask_gap_fill_distance: &mut f32,
+    boundary_edge_threshold: &mut f32,
+    boundary_ink_threshold: &mut f32,
+    boundary_gap_px: &mut f32,
+    edge_brush_tolerance: &mut f32,
+    edge_brush_include_boundary: &mut bool,
 ) -> bool {
     let mut changed = false;
     ui.separator();
@@ -1659,6 +2267,12 @@ fn draw_local_mask_editor(
         mask_paint_add,
         mask_tool,
         mask_line_width,
+        mask_gap_fill_distance,
+        boundary_edge_threshold,
+        boundary_ink_threshold,
+        boundary_gap_px,
+        edge_brush_tolerance,
+        edge_brush_include_boundary,
     );
     changed
 }
@@ -2474,6 +3088,111 @@ impl App {
         })
     }
 
+    fn paint_local_adjust_mask_edge_brush(
+        &mut self,
+        fs_idx: usize,
+        layer_idx: usize,
+        target: LocalAdjustMaskEditTarget,
+        from_norm: [f32; 2],
+        to_norm: [f32; 2],
+        paint: bool,
+        edge_seed: Option<[u8; 3]>,
+        persist: bool,
+    ) -> bool {
+        let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
+            return false;
+        };
+        let radius = self.local_adjust_mask_brush_radius.max(1.0);
+        let image_dims = local_adjust_image_dims(self, fs_idx);
+        let thresholds = (
+            self.local_adjust_boundary_edge_threshold.clamp(0.0, 255.0),
+            self.local_adjust_boundary_ink_threshold.clamp(0.0, 255.0),
+            self.local_adjust_boundary_gap_px.clamp(0.0, 8.0).round() as usize,
+        );
+        let tolerance = self.local_adjust_edge_brush_tolerance;
+        let include_boundary = self.local_adjust_edge_brush_include_boundary;
+        self.mutate_local_adjust_layer_from_canvas(fs_idx, layer_idx, persist, |layer| {
+            let Some(mask) =
+                local_adjust_target_raster_vector_mask_mut(layer, target, image_dims, paint)
+            else {
+                return false;
+            };
+            if source.size != [mask.width, mask.height] {
+                return false;
+            }
+            paint_local_adjust_alpha_edge_brush_line(
+                &mut mask.alpha,
+                source.as_ref(),
+                from_norm,
+                to_norm,
+                radius,
+                paint,
+                edge_seed,
+                tolerance,
+                thresholds,
+                include_boundary,
+            )
+        })
+    }
+
+    fn paint_local_adjust_mask_gap_fill_brush(
+        &mut self,
+        fs_idx: usize,
+        layer_idx: usize,
+        target: LocalAdjustMaskEditTarget,
+        from_norm: [f32; 2],
+        to_norm: [f32; 2],
+        paint: bool,
+        persist: bool,
+    ) -> bool {
+        let radius = self.local_adjust_mask_brush_radius.max(1.0);
+        let gap = self.local_adjust_mask_gap_fill_distance;
+        let image_dims = local_adjust_image_dims(self, fs_idx);
+        self.mutate_local_adjust_layer_from_canvas(fs_idx, layer_idx, persist, |layer| {
+            let Some(mask) =
+                local_adjust_target_raster_vector_mask_mut(layer, target, image_dims, paint)
+            else {
+                return false;
+            };
+            paint_local_adjust_alpha_gap_fill_line(
+                &mut mask.alpha,
+                mask.width,
+                mask.height,
+                from_norm,
+                to_norm,
+                radius,
+                paint,
+                gap,
+            )
+        })
+    }
+
+    fn paint_local_adjust_mask_tool_segment(
+        &mut self,
+        fs_idx: usize,
+        layer_idx: usize,
+        target: LocalAdjustMaskEditTarget,
+        tool: LocalAdjustMaskTool,
+        from_norm: [f32; 2],
+        to_norm: [f32; 2],
+        paint: bool,
+        edge_seed: Option<[u8; 3]>,
+        persist: bool,
+    ) -> bool {
+        match tool {
+            LocalAdjustMaskTool::Brush => self.paint_local_adjust_mask_brush(
+                fs_idx, layer_idx, target, from_norm, to_norm, paint, persist,
+            ),
+            LocalAdjustMaskTool::EdgeBrush => self.paint_local_adjust_mask_edge_brush(
+                fs_idx, layer_idx, target, from_norm, to_norm, paint, edge_seed, persist,
+            ),
+            LocalAdjustMaskTool::GapFillBrush => self.paint_local_adjust_mask_gap_fill_brush(
+                fs_idx, layer_idx, target, from_norm, to_norm, paint, persist,
+            ),
+            _ => false,
+        }
+    }
+
     fn fill_local_adjust_mask_polygon(
         &mut self,
         fs_idx: usize,
@@ -2696,13 +3415,15 @@ impl App {
                     && let Some(norm) =
                         local_adjust_screen_to_norm(pos, image_rect, image_dims, zoom_pan, false)
                 {
-                    self.paint_local_adjust_mask_brush(
+                    self.paint_local_adjust_mask_tool_segment(
                         stroke.fs_idx,
                         stroke.layer_idx,
                         stroke.target,
+                        stroke.tool,
                         stroke.previous,
                         norm,
                         stroke.paint,
+                        stroke.edge_seed,
                         false,
                     );
                     stroke.previous = norm;
@@ -2869,24 +3590,34 @@ impl App {
 
             if let Some(target) = active_mask_edit_target {
                 match self.local_adjust_mask_tool {
-                    LocalAdjustMaskTool::Brush => {
+                    LocalAdjustMaskTool::Brush
+                    | LocalAdjustMaskTool::EdgeBrush
+                    | LocalAdjustMaskTool::GapFillBrush => {
                         self.local_adjust_mask_brush_before_layers =
                             self.local_adjust_page_layers.get(&fs_idx).cloned();
+                        let tool = self.local_adjust_mask_tool;
+                        let edge_seed = (tool == LocalAdjustMaskTool::EdgeBrush)
+                            .then(|| sample_local_adjust_rgb(self, fs_idx, norm))
+                            .flatten();
                         let stroke = crate::app::LocalAdjustMaskBrushStroke {
                             fs_idx,
                             layer_idx,
                             target,
+                            tool,
                             paint: self.local_adjust_mask_paint_add,
+                            edge_seed,
                             previous: norm,
                         };
                         self.local_adjust_mask_brush_stroke = Some(stroke);
-                        self.paint_local_adjust_mask_brush(
+                        self.paint_local_adjust_mask_tool_segment(
                             fs_idx,
                             layer_idx,
                             target,
+                            tool,
                             norm,
                             norm,
                             self.local_adjust_mask_paint_add,
+                            edge_seed,
                             false,
                         );
                     }
@@ -3059,16 +3790,25 @@ impl App {
         let active_mask_edit_target =
             effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target);
         if effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target).is_some()
-            && self.local_adjust_mask_tool == LocalAdjustMaskTool::Brush
+            && matches!(
+                self.local_adjust_mask_tool,
+                LocalAdjustMaskTool::Brush
+                    | LocalAdjustMaskTool::EdgeBrush
+                    | LocalAdjustMaskTool::GapFillBrush
+            )
             && let Some(pointer) = ui.ctx().input(|i| i.pointer.hover_pos())
             && local_adjust_screen_to_norm(pointer, image_rect, image_dims, zoom_pan, true)
                 .is_some()
             && let Some((scale, _)) = local_adjust_image_layout(image_rect, image_dims, zoom_pan)
         {
-            let color = if self.local_adjust_mask_paint_add {
-                egui::Color32::from_rgb(255, 226, 120)
-            } else {
-                egui::Color32::from_rgb(255, 120, 120)
+            let color = match (
+                self.local_adjust_mask_tool,
+                self.local_adjust_mask_paint_add,
+            ) {
+                (_, false) => egui::Color32::from_rgb(255, 120, 120),
+                (LocalAdjustMaskTool::EdgeBrush, true) => egui::Color32::from_rgb(120, 220, 255),
+                (LocalAdjustMaskTool::GapFillBrush, true) => egui::Color32::from_rgb(160, 255, 150),
+                _ => egui::Color32::from_rgb(255, 226, 120),
             };
             painter.circle_stroke(
                 pointer,
@@ -3560,6 +4300,12 @@ impl App {
         let previous_mask_tool = self.local_adjust_mask_tool;
         let mut mask_tool = self.local_adjust_mask_tool;
         let mut mask_line_width = self.local_adjust_mask_line_width;
+        let mut mask_gap_fill_distance = self.local_adjust_mask_gap_fill_distance;
+        let mut boundary_edge_threshold = self.local_adjust_boundary_edge_threshold;
+        let mut boundary_ink_threshold = self.local_adjust_boundary_ink_threshold;
+        let mut boundary_gap_px = self.local_adjust_boundary_gap_px;
+        let mut edge_brush_tolerance = self.local_adjust_edge_brush_tolerance;
+        let mut edge_brush_include_boundary = self.local_adjust_edge_brush_include_boundary;
 
         let panel_pos = egui::pos2(
             full_rect.min.x + LOCAL_ADJUST_PANEL_MARGIN_X,
@@ -3715,6 +4461,12 @@ impl App {
                                             &mut mask_paint_add,
                                             &mut mask_tool,
                                             &mut mask_line_width,
+                                            &mut mask_gap_fill_distance,
+                                            &mut boundary_edge_threshold,
+                                            &mut boundary_ink_threshold,
+                                            &mut boundary_gap_px,
+                                            &mut edge_brush_tolerance,
+                                            &mut edge_brush_include_boundary,
                                             &mut effect_requests,
                                         );
                                     });
@@ -3738,6 +4490,12 @@ impl App {
         }
         self.local_adjust_mask_tool = mask_tool;
         self.local_adjust_mask_line_width = mask_line_width.max(1.0);
+        self.local_adjust_mask_gap_fill_distance = mask_gap_fill_distance.clamp(1.0, 64.0);
+        self.local_adjust_boundary_edge_threshold = boundary_edge_threshold.clamp(0.0, 255.0);
+        self.local_adjust_boundary_ink_threshold = boundary_ink_threshold.clamp(0.0, 255.0);
+        self.local_adjust_boundary_gap_px = boundary_gap_px.clamp(0.0, 8.0);
+        self.local_adjust_edge_brush_tolerance = edge_brush_tolerance.clamp(0.0, 255.0);
+        self.local_adjust_edge_brush_include_boundary = edge_brush_include_boundary;
         self.apply_local_adjust_panel_actions(
             fs_idx,
             add_quick_effect,

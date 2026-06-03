@@ -315,6 +315,8 @@ pub(crate) enum LocalAdjustMaskEditTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalAdjustMaskTool {
     Brush,
+    EdgeBrush,
+    GapFillBrush,
     Lasso,
     Polygon,
     Line,
@@ -329,7 +331,9 @@ pub(crate) struct LocalAdjustMaskBrushStroke {
     pub(crate) fs_idx: usize,
     pub(crate) layer_idx: usize,
     pub(crate) target: LocalAdjustMaskEditTarget,
+    pub(crate) tool: LocalAdjustMaskTool,
     pub(crate) paint: bool,
+    pub(crate) edge_seed: Option<[u8; 3]>,
     pub(crate) previous: [f32; 2],
 }
 
@@ -3048,6 +3052,18 @@ pub struct App {
     pub(crate) local_adjust_mask_tool: LocalAdjustMaskTool,
     /// 補正レイヤー手描きマスクの直線系ツール幅 (画像 px)。
     pub(crate) local_adjust_mask_line_width: f32,
+    /// 補正レイヤー隙間補完ブラシで埋める未塗り隙間の最大幅 (画像 px)。
+    pub(crate) local_adjust_mask_gap_fill_distance: f32,
+    /// 補正レイヤー境界筆で止めるエッジのしきい値。
+    pub(crate) local_adjust_boundary_edge_threshold: f32,
+    /// 補正レイヤー境界筆で線内部として扱うしきい値。
+    pub(crate) local_adjust_boundary_ink_threshold: f32,
+    /// 補正レイヤー境界筆の境界検出ギャップ補完幅 (画像 px)。
+    pub(crate) local_adjust_boundary_gap_px: f32,
+    /// 補正レイヤー境界筆の開始色からの許容差。
+    pub(crate) local_adjust_edge_brush_tolerance: f32,
+    /// 補正レイヤー境界筆で塗り領域に接する境界線も含める。
+    pub(crate) local_adjust_edge_brush_include_boundary: bool,
     /// 補正レイヤー手描きマスクの囲み/多角形作成中ポイント (画像 px)。
     pub(crate) local_adjust_mask_lasso_points: Vec<[f32; 2]>,
     /// 補正レイヤー手描きマスクの図形ドラッグ開始点 (正規化座標)。
@@ -4276,6 +4292,12 @@ impl App {
             local_adjust_mask_paint_add: true,
             local_adjust_mask_tool: LocalAdjustMaskTool::Brush,
             local_adjust_mask_line_width: 24.0,
+            local_adjust_mask_gap_fill_distance: 10.0,
+            local_adjust_boundary_edge_threshold: 42.0,
+            local_adjust_boundary_ink_threshold: 32.0,
+            local_adjust_boundary_gap_px: 2.0,
+            local_adjust_edge_brush_tolerance: 48.0,
+            local_adjust_edge_brush_include_boundary: false,
             local_adjust_mask_lasso_points: Vec::new(),
             local_adjust_mask_shape_drag_start: None,
             local_adjust_mask_shape_drag_end: None,
