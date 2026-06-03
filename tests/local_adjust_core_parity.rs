@@ -32,7 +32,7 @@
 use local_adjust_core::{
     InvertParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
     MaskShape, RadialGradientMask, RasterMask, RasterVectorMask, RgbaImageBuf, RgbaImageRef,
-    ShapeOp, SubjectMaskRefinement, apply_layers, evaluate_layer_mask,
+    ShapeOp, SubjectMaskRefinement, apply_layers, evaluate_layer_mask, rasterize_shapes_into,
 };
 
 // ---------------------------------------------------------------------------
@@ -411,6 +411,50 @@ fn raster_vector_resize_scales_shapes_and_manual_overrides() {
         add.alpha.iter().copied().fold(0.0_f32, f32::max) > 0.2,
         "manual override alpha should survive bilinear resize"
     );
+}
+
+#[test]
+fn line_shape_has_square_end_caps() {
+    let width = 48;
+    let height = 24;
+    let mut alpha = vec![0.0; width * height];
+    rasterize_shapes_into(
+        &mut alpha,
+        width,
+        height,
+        &[MaskShape::Line {
+            op: ShapeOp::Add,
+            kind: LineKind::Horizontal,
+            p0: [12.0, 12.0],
+            p1: [36.0, 12.0],
+            thickness: 10.0,
+        }],
+    );
+
+    let column_coverage = |x: usize| (0..height).filter(|&y| alpha[y * width + x] >= 0.5).count();
+    let mid = column_coverage(24);
+
+    assert_eq!(
+        column_coverage(8),
+        0,
+        "pixels before p0 must stay empty; a rounded cap would fill this column"
+    );
+    assert_eq!(
+        column_coverage(39),
+        0,
+        "pixels after p1 must stay empty; a rounded cap would fill this column"
+    );
+    assert_eq!(
+        column_coverage(12),
+        mid,
+        "the first painted column should have the same rectangular thickness as the center"
+    );
+    assert_eq!(
+        column_coverage(35),
+        mid,
+        "the last painted column should have the same rectangular thickness as the center"
+    );
+    assert!(mid >= 9, "line thickness should be preserved at the center");
 }
 
 // ---------------------------------------------------------------------------

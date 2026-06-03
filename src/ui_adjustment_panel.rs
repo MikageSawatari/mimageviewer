@@ -63,7 +63,7 @@ const LOCAL_ADJUST_U2NETP_INPUT_SIZE: usize = 320;
 const LOCAL_ADJUST_REGION_SEGMENT_MAX_LABELS: usize = 2048;
 const LOCAL_ADJUST_MASK_PREVIEW_BASE_ALPHA: f32 = 155.0;
 const LOCAL_ADJUST_MASK_PREVIEW_EDIT_ALPHA: u8 = 225;
-const LOCAL_ADJUST_MASK_PREVIEW_MAX_TEXELS: f32 = 768.0;
+const LOCAL_ADJUST_MASK_PREVIEW_MAX_TEXELS: f32 = 2048.0;
 const LOCAL_ADJUST_REGION_BOUNDARY_ANIM_INTERVAL_MS: u64 = 160;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +292,43 @@ mod local_adjust_segmentation_tests {
     }
 
     #[test]
+    fn line_shape_preview_uses_square_end_caps() {
+        let layer = local_adjust_core::LocalAdjustmentLayer::new(
+            "line",
+            local_adjust_core::LocalMask::RasterVector(local_adjust_core::RasterVectorMask {
+                width: 48,
+                height: 24,
+                alpha: vec![0.0; 48 * 24],
+                shapes: vec![local_adjust_core::MaskShape::Line {
+                    op: local_adjust_core::ShapeOp::Add,
+                    kind: local_adjust_core::LineKind::Horizontal,
+                    p0: [12.0, 12.0],
+                    p1: [36.0, 12.0],
+                    thickness: 10.0,
+                }],
+            }),
+            local_adjust_core::LocalEffect::None,
+        );
+
+        assert_eq!(
+            local_adjust_mask_preview_alpha(&layer, None, 48, 24, 8, 12),
+            0.0
+        );
+        assert_eq!(
+            local_adjust_mask_preview_alpha(&layer, None, 48, 24, 12, 12),
+            1.0
+        );
+        assert_eq!(
+            local_adjust_mask_preview_alpha(&layer, None, 48, 24, 35, 12),
+            1.0
+        );
+        assert_eq!(
+            local_adjust_mask_preview_alpha(&layer, None, 48, 24, 39, 12),
+            0.0
+        );
+    }
+
+    #[test]
     fn full_mask_preview_hides_plain_full_base_but_shows_subtract_result() {
         let mut layer = local_adjust_core::LocalAdjustmentLayer::new(
             "full",
@@ -378,6 +415,53 @@ mod local_adjust_segmentation_tests {
             elapsed < std::time::Duration::from_millis(100),
             "Full + large subtract preview should be O(preview pixels + mask pixels), elapsed={elapsed:?}"
         );
+    }
+
+    #[test]
+    fn mask_preview_overlay_at_2048_completes_in_30ms() {
+        let width = 2048;
+        let height = 1152;
+        let mut labels = vec![0_u32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                labels[y * width + x] = ((x / 64 + (y / 64) * 32) % 1024 + 1) as u32;
+            }
+        }
+        let layer = local_adjust_core::LocalAdjustmentLayer::new(
+            "segmentation-preview",
+            local_adjust_core::LocalMask::Segmentation(local_adjust_core::RegionMask {
+                width,
+                height,
+                labels,
+                selected: vec![false; 1025],
+            }),
+            local_adjust_core::LocalEffect::None,
+        );
+
+        let started = std::time::Instant::now();
+        let image = build_local_adjust_mask_preview_image(
+            &layer,
+            None,
+            (width, height),
+            [2048, 1152],
+            0.25,
+            LocalAdjustMaskColorPreset::PinkCyan.colors(),
+            None,
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(image.size, [2048, 1152]);
+        if cfg!(debug_assertions) {
+            assert!(
+                elapsed < std::time::Duration::from_millis(750),
+                "debug 2048 preview overlay generation regressed badly, elapsed={elapsed:?}"
+            );
+        } else {
+            assert!(
+                elapsed < std::time::Duration::from_millis(30),
+                "2048 preview overlay generation should stay under 30ms, elapsed={elapsed:?}"
+            );
+        }
     }
 
     #[test]
@@ -3686,30 +3770,14 @@ fn local_adjust_inverse_rotate_point(p: [f32; 2], center: [f32; 2], rotation_rad
     [center[0] + dx * c - dy * s, center[1] + dx * s + dy * c]
 }
 
-fn local_adjust_dist2(a: [f32; 2], b: [f32; 2]) -> f32 {
-    let dx = a[0] - b[0];
-    let dy = a[1] - b[1];
-    dx * dx + dy * dy
-}
-
-fn local_adjust_distance_to_segment(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
-    let ab = [b[0] - a[0], b[1] - a[1]];
-    let ap = [p[0] - a[0], p[1] - a[1]];
-    let denom = ab[0] * ab[0] + ab[1] * ab[1];
-    let t = if denom <= f32::EPSILON {
-        0.0
-    } else {
-        ((ap[0] * ab[0] + ap[1] * ab[1]) / denom).clamp(0.0, 1.0)
-    };
-    let q = [a[0] + ab[0] * t, a[1] + ab[1] * t];
-    local_adjust_dist2(p, q).sqrt()
-}
-
 fn local_adjust_shape_contains(shape: local_adjust_core::MaskShape, p: [f32; 2]) -> bool {
     match shape {
         local_adjust_core::MaskShape::Line {
             p0, p1, thickness, ..
-        } => local_adjust_distance_to_segment(p, p0, p1) <= thickness * 0.5 + 3.0,
+        } => {
+            let corners = local_adjust_line_corners(p0, p1, thickness.max(1.0));
+            local_adjust_point_in_polygon(p, &corners)
+        }
         local_adjust_core::MaskShape::Rect {
             center,
             half_w,
@@ -3731,6 +3799,41 @@ fn local_adjust_shape_contains(shape: local_adjust_core::MaskShape, p: [f32; 2])
             ((local[0] - center[0]) / rx).powi(2) + ((local[1] - center[1]) / ry).powi(2) <= 1.0
         }
     }
+}
+
+fn local_adjust_line_corners(p0: [f32; 2], p1: [f32; 2], thickness: f32) -> [[f32; 2]; 4] {
+    let dx = p1[0] - p0[0];
+    let dy = p1[1] - p0[1];
+    let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+    let nx = -dy / len;
+    let ny = dx / len;
+    let half = thickness * 0.5;
+    [
+        [p0[0] + nx * half, p0[1] + ny * half],
+        [p1[0] + nx * half, p1[1] + ny * half],
+        [p1[0] - nx * half, p1[1] - ny * half],
+        [p0[0] - nx * half, p0[1] - ny * half],
+    ]
+}
+
+fn local_adjust_point_in_polygon(p: [f32; 2], points: &[[f32; 2]]) -> bool {
+    if points.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut prev = points.len() - 1;
+    for i in 0..points.len() {
+        let pi = points[i];
+        let pj = points[prev];
+        if (pi[1] > p[1]) != (pj[1] > p[1]) {
+            let x = (pj[0] - pi[0]) * (p[1] - pi[1]) / (pj[1] - pi[1]) + pi[0];
+            if p[0] < x {
+                inside = !inside;
+            }
+        }
+        prev = i;
+    }
+    inside
 }
 
 fn local_adjust_effect_center_mut(

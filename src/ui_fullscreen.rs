@@ -226,6 +226,17 @@ fn original_preview_shortcut_held(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.key_down(egui::Key::Num0))
 }
 
+fn local_adjust_prefix_preview_modifier_held(modifiers: egui::Modifiers) -> bool {
+    modifiers.ctrl && modifiers.shift
+}
+
+fn original_preview_should_yield_to_local_adjust_prefix(
+    local_adjust_mode: bool,
+    modifiers: egui::Modifiers,
+) -> bool {
+    local_adjust_mode && local_adjust_prefix_preview_modifier_held(modifiers)
+}
+
 /// メインビューポート経由のフルスクリーンキー処理 (`handle_fullscreen_root_key_input`)
 /// を起動するかどうかを判定する「プローブ」。押されたキーがこの集合に無いフレームは
 /// 実ハンドラ (`handle_fs_key_input` → 動画は `handle_video_input`) を一切呼ばない。
@@ -714,6 +725,14 @@ impl App {
             return false;
         }
         if !original_preview_shortcut_held(ctx) {
+            return false;
+        }
+        if ctx.input(|i| {
+            original_preview_should_yield_to_local_adjust_prefix(
+                self.local_adjust_mode,
+                i.modifiers,
+            )
+        }) {
             return false;
         }
         matches!(
@@ -10115,6 +10134,24 @@ mod tests {
         assert!(should_zoom_fullscreen_wheel(true, false));
         assert!(should_zoom_fullscreen_wheel(false, true));
         assert!(!should_zoom_fullscreen_wheel(false, false));
+    }
+
+    #[test]
+    fn original_preview_yields_only_for_local_adjust_ctrl_shift() {
+        let mut ctrl = egui::Modifiers::default();
+        ctrl.ctrl = true;
+        let mut ctrl_shift = ctrl;
+        ctrl_shift.shift = true;
+
+        assert!(!original_preview_should_yield_to_local_adjust_prefix(
+            true, ctrl
+        ));
+        assert!(original_preview_should_yield_to_local_adjust_prefix(
+            true, ctrl_shift
+        ));
+        assert!(!original_preview_should_yield_to_local_adjust_prefix(
+            false, ctrl_shift
+        ));
     }
 
     #[test]
