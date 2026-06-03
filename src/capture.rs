@@ -80,6 +80,7 @@ pub struct CapturePixelJob {
     pub source_already_adjusted: bool,
     pub params: crate::adjustment::AdjustParams,
     pub conceal: Option<CaptureConceal>,
+    pub crop: Option<crate::export_crop::CropRect>,
 }
 
 pub enum CapturePixelWork {
@@ -99,6 +100,7 @@ impl CapturePixelJob {
             source_already_adjusted: true,
             params: crate::adjustment::AdjustParams::default(),
             conceal: None,
+            crop: None,
         }
     }
 
@@ -113,6 +115,7 @@ impl CapturePixelJob {
             source_already_adjusted: false,
             params,
             conceal: None,
+            crop: None,
         }
     }
 
@@ -122,6 +125,11 @@ impl CapturePixelJob {
         preset: crate::conceal::ConcealPreset,
     ) -> Self {
         self.conceal = Some(CaptureConceal { mask, preset });
+        self
+    }
+
+    pub fn with_crop(mut self, crop: crate::export_crop::CropRect) -> Self {
+        self.crop = Some(crop);
         self
     }
 }
@@ -342,6 +350,9 @@ pub fn run_pixel_job(job: CapturePixelJob) -> Result<(String, u32, u32, Vec<u8>)
             conceal.mask.as_ref(),
             &conceal.preset,
         );
+    }
+    if let Some(crop) = job.crop {
+        image = crate::export_crop::crop_color_image(&image, crop)?;
     }
     let width = image.size[0] as u32;
     let height = image.size[1] as u32;
@@ -717,6 +728,32 @@ mod tests {
         assert_eq!((width, height), (2, 1));
         assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
         assert_eq!(&rgba[4..8], &[10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn run_pixel_job_applies_crop_after_conceal() {
+        let src = egui::ColorImage::new(
+            [3, 1],
+            vec![
+                egui::Color32::RED,
+                egui::Color32::GREEN,
+                egui::Color32::BLUE,
+            ],
+        );
+        let job = CapturePixelJob::already_adjusted("sample".to_string(), Arc::new(src)).with_crop(
+            crate::export_crop::CropRect {
+                min_x: 1.0,
+                min_y: 0.0,
+                max_x: 3.0,
+                max_y: 1.0,
+            },
+        );
+
+        let (_basename, width, height, rgba) = run_pixel_job(job).unwrap();
+
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(&rgba[0..4], &[0, 255, 0, 255]);
+        assert_eq!(&rgba[4..8], &[0, 0, 255, 255]);
     }
 
     #[test]

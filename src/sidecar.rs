@@ -72,6 +72,9 @@ pub struct SidecarEntry {
     /// フォルダ移動時の復元用バックアップとして扱う。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_adjust_layers: Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    /// 最後段 crop 設定。表示・コピー・書き出しの最終段でだけ適用する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_crop: Option<crate::export_crop::CropSettings>,
 }
 
 impl SidecarEntry {
@@ -80,6 +83,7 @@ impl SidecarEntry {
             && self.mask.is_none()
             && self.conceal.is_none()
             && self.local_adjust_layers.is_none()
+            && self.export_crop.is_none()
     }
 }
 
@@ -288,6 +292,26 @@ impl SidecarFile {
         }
     }
 
+    /// 最後段 crop 設定をセットする。
+    pub fn set_export_crop(&mut self, rel_key: &str, settings: crate::export_crop::CropSettings) {
+        let entry = self.items.entry(rel_key.to_string()).or_default();
+        entry.export_crop = Some(settings);
+        self.mark_dirty();
+    }
+
+    /// 最後段 crop 設定を取り除く。
+    pub fn remove_export_crop(&mut self, rel_key: &str) {
+        if let Some(entry) = self.items.get_mut(rel_key) {
+            if entry.export_crop.is_some() {
+                entry.export_crop = None;
+                if entry.is_empty() {
+                    self.items.remove(rel_key);
+                }
+                self.mark_dirty();
+            }
+        }
+    }
+
     /// 複数エントリの adjust を一括セット (「全画像に適用」用)。
     pub fn set_adjust_bulk<I>(&mut self, iter: I, params: &AdjustParams)
     where
@@ -451,10 +475,12 @@ pub struct ImportStats {
     pub imported_mask: usize,
     pub imported_conceal: usize,
     pub imported_local_adjust: usize,
+    pub imported_export_crop: usize,
     pub skipped_adjust: usize,
     pub skipped_mask: usize,
     pub skipped_conceal: usize,
     pub skipped_local_adjust: usize,
+    pub skipped_export_crop: usize,
 }
 
 /// サイドカーの各エントリを中央 DB へインポートする (純粋関数、テスト用に App から分離)。
@@ -470,6 +496,7 @@ pub fn import_to_dbs(
     mask_db: Option<&crate::mask_db::MaskDb>,
     conceal_db: Option<&crate::conceal_db::ConcealDb>,
     local_adjust_db: Option<&crate::local_adjust_db::LocalAdjustDb>,
+    export_crop_db: Option<&crate::export_crop::CropDb>,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
     for (rel_key, entry) in sidecar.items() {
@@ -544,6 +571,16 @@ pub fn import_to_dbs(
                 }
             }
         }
+
+        if let (Some(db), Some(crop)) = (export_crop_db, entry.export_crop) {
+            if db.get(&abs_key).is_none() {
+                if db.set(&abs_key, crop).is_ok() {
+                    stats.imported_export_crop += 1;
+                }
+            } else {
+                stats.skipped_export_crop += 1;
+            }
+        }
     }
     stats
 }
@@ -607,6 +644,18 @@ mod tests {
 
     fn sample_local_adjust_layer(name: &str) -> LocalAdjustmentLayer {
         LocalAdjustmentLayer::new(name, LocalMask::Full, LocalEffect::None)
+    }
+
+    fn sample_export_crop() -> crate::export_crop::CropSettings {
+        crate::export_crop::CropSettings {
+            rect: crate::export_crop::CropRect {
+                min_x: 10.0,
+                min_y: 12.0,
+                max_x: 90.0,
+                max_y: 70.0,
+            },
+            aspect_mode: crate::export_crop::CropAspectMode::Ratio4x3,
+        }
     }
 
     #[test]
@@ -685,7 +734,14 @@ mod tests {
             },
         );
         s.set_local_adjust_layers("img.jpg", vec![sample_local_adjust_layer("layer")]);
+        s.set_export_crop("img.jpg", sample_export_crop());
         assert_eq!(s.items().len(), 1);
+        s.remove_export_crop("img.jpg");
+        assert_eq!(
+            s.items().len(),
+            1,
+            "adjust + mask + conceal + local adjust still present"
+        );
         s.remove_local_adjust_layers("img.jpg");
         assert_eq!(s.items().len(), 1, "adjust + mask + conceal still present");
         s.remove_adjust("img.jpg");
@@ -730,6 +786,21 @@ mod tests {
         assert_eq!(entry.local_adjust_layers.as_ref().unwrap().len(), 1);
 
         s.remove_local_adjust_layers("img.jpg");
+        assert!(s.items().is_empty());
+    }
+
+    #[test]
+    fn set_export_crop_is_independent_of_other_fields() {
+        let mut s = SidecarFile::new(PathBuf::from("C:/tmp/nonexistent"));
+        s.set_export_crop("img.jpg", sample_export_crop());
+        let entry = s.items().get("img.jpg").unwrap();
+        assert!(entry.adjust.is_none());
+        assert!(entry.mask.is_none());
+        assert!(entry.conceal.is_none());
+        assert!(entry.local_adjust_layers.is_none());
+        assert_eq!(entry.export_crop, Some(sample_export_crop()));
+
+        s.remove_export_crop("img.jpg");
         assert!(s.items().is_empty());
     }
 
@@ -785,6 +856,7 @@ mod tests {
                     sample_local_adjust_layer("finish"),
                 ],
             );
+            s.set_export_crop("img.jpg", sample_export_crop());
             s.flush();
             assert!(!s.is_dirty());
         }
@@ -801,6 +873,10 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+        assert_eq!(
+            s2.items().get("img.jpg").unwrap().export_crop,
+            Some(sample_export_crop())
         );
         let mask = s2
             .items()
@@ -833,12 +909,44 @@ mod tests {
         let existing_key = reconstruct_image_key(folder, "existing.png");
         db.set_layers(&existing_key, &existing_layers).unwrap();
 
-        let stats = import_to_dbs(folder, &s, None, None, None, Some(&db));
+        let stats = import_to_dbs(folder, &s, None, None, None, Some(&db), None);
 
         assert_eq!(stats.imported_local_adjust, 1);
         assert_eq!(stats.skipped_local_adjust, 1);
         assert_eq!(db.get_layers(&fresh_key), Some(imported_layers));
         assert_eq!(db.get_layers(&existing_key), Some(existing_layers));
+    }
+
+    #[test]
+    fn import_to_dbs_imports_export_crop_without_overwriting_db() {
+        let sidecar_dir = tempfile::tempdir().unwrap();
+        let folder = sidecar_dir.path();
+        let mut s = SidecarFile::new(folder.to_path_buf());
+        let imported_crop = sample_export_crop();
+        let existing_crop = crate::export_crop::CropSettings {
+            rect: crate::export_crop::CropRect {
+                min_x: 1.0,
+                min_y: 2.0,
+                max_x: 30.0,
+                max_y: 40.0,
+            },
+            aspect_mode: crate::export_crop::CropAspectMode::Square,
+        };
+        s.set_export_crop("fresh.png", imported_crop);
+        s.set_export_crop("existing.png", sample_export_crop());
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = crate::export_crop::CropDb::open_at(&db_dir.path().join("crop.db")).unwrap();
+        let fresh_key = reconstruct_image_key(folder, "fresh.png");
+        let existing_key = reconstruct_image_key(folder, "existing.png");
+        db.set(&existing_key, existing_crop).unwrap();
+
+        let stats = import_to_dbs(folder, &s, None, None, None, None, Some(&db));
+
+        assert_eq!(stats.imported_export_crop, 1);
+        assert_eq!(stats.skipped_export_crop, 1);
+        assert_eq!(db.get(&fresh_key), Some(imported_crop));
+        assert_eq!(db.get(&existing_key), Some(existing_crop));
     }
 
     #[test]

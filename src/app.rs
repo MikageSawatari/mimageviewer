@@ -391,6 +391,17 @@ pub(crate) struct LocalAdjustMaskBrushStroke {
     pub(crate) previous: [f32; 2],
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExportCropDrag {
+    pub(crate) handle: crate::export_crop::CropHandle,
+    pub(crate) base: crate::export_crop::CropRect,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExportCropCreateDrag {
+    pub(crate) start: [f32; 2],
+}
+
 fn run_local_adjust_render(
     key: LocalAdjustResultKey,
     source: Arc<egui::ColorImage>,
@@ -3061,6 +3072,8 @@ pub struct App {
     pub(crate) adjustment_mode: bool,
     /// 補正レイヤーの独立左パネル表示フラグ。
     pub(crate) local_adjust_mode: bool,
+    /// エクスポート / 最後段 crop パネルの独立左パネル表示フラグ。
+    pub(crate) export_crop_mode: bool,
     /// 見開き表示中に補正パネルが操作する側 (画面上の左/右)。Single 表示中は
     /// 参照されない。`open_fullscreen` / spread_mode 切替で Left にリセット。
     pub(crate) adjust_spread_target: AdjustSpreadTarget,
@@ -3082,6 +3095,17 @@ pub struct App {
     /// 現フォルダで補正レイヤーを持つページの item_idx 集合 (サムネイルバッジ用)。
     /// サムネイルには補正レイヤー結果自体を反映しない。
     pub(crate) local_adjust_pages: std::collections::HashSet<usize>,
+    /// ページ個別の最後段 crop 設定: item_idx → CropSettings。
+    pub(crate) export_crop_page_settings:
+        std::collections::HashMap<usize, crate::export_crop::CropSettings>,
+    /// 現フォルダで最後段 crop を持つページの item_idx 集合。
+    pub(crate) export_crop_pages: std::collections::HashSet<usize>,
+    /// crop パネルで選択中のアスペクトモード。ページに保存済み設定があればそちらを優先する。
+    pub(crate) export_crop_aspect_mode: crate::export_crop::CropAspectMode,
+    /// crop 矩形のリサイズ/移動ドラッグ。
+    pub(crate) export_crop_drag: Option<ExportCropDrag>,
+    /// crop 新規作成ドラッグ。
+    pub(crate) export_crop_create_drag: Option<ExportCropCreateDrag>,
     /// 補正レイヤーパネルで選択中のレイヤー index。ページごとに保持する。
     pub(crate) local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
     /// 補正レイヤー効果追加ピッカーの検索語。
@@ -3190,6 +3214,8 @@ pub struct App {
     pub(crate) adjustment_db: Option<crate::adjustment_db::AdjustmentDb>,
     /// 補正レイヤー DB ハンドル
     pub(crate) local_adjust_db: Option<crate::local_adjust_db::LocalAdjustDb>,
+    /// 最後段 crop DB ハンドル
+    pub(crate) export_crop_db: Option<crate::export_crop::CropDb>,
     /// スロット保存ダイアログ: (slot_idx, 入力中の名前, 保存対象の補正値)。
     /// 補正値は開始時にキャプチャしておくことで、見開きの L/R 切替や
     /// ダイアログ中にスライダーを動かしても保存内容がブレない。
@@ -3978,6 +4004,10 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_local_adjust", 0, t);
 
         let t = std::time::Instant::now();
+        let export_crop_db = crate::export_crop::CropDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_export_crop", 0, t);
+
+        let t = std::time::Instant::now();
         let mask_db = crate::mask_db::MaskDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_mask", 0, t);
 
@@ -4342,11 +4372,17 @@ impl App {
             // 画像補正
             adjustment_mode: false,
             local_adjust_mode: false,
+            export_crop_mode: false,
             adjust_spread_target: AdjustSpreadTarget::Left,
             adjustment_page_params: std::collections::HashMap::new(),
             adjustment_favorite_params: std::collections::HashMap::new(),
             local_adjust_page_layers: std::collections::HashMap::new(),
             local_adjust_pages: std::collections::HashSet::new(),
+            export_crop_page_settings: std::collections::HashMap::new(),
+            export_crop_pages: std::collections::HashSet::new(),
+            export_crop_aspect_mode: crate::export_crop::CropAspectMode::Free,
+            export_crop_drag: None,
+            export_crop_create_drag: None,
             local_adjust_selected_layers: std::collections::HashMap::new(),
             local_adjust_effect_query: String::new(),
             local_adjust_effect_clipboard: None,
@@ -4392,6 +4428,7 @@ impl App {
             adjustment_dragging: false,
             adjustment_db,
             local_adjust_db,
+            export_crop_db,
             slot_save_dialog: None,
             ime_composing: false,
             ime_last_event_at: None,
@@ -8397,8 +8434,13 @@ impl App {
         self.adjustment_dragging = false;
         self.adjustment_mode = false;
         self.local_adjust_mode = false;
+        self.export_crop_mode = false;
+        self.export_crop_drag = None;
+        self.export_crop_create_drag = None;
         self.local_adjust_page_layers.clear();
         self.local_adjust_pages.clear();
+        self.export_crop_page_settings.clear();
+        self.export_crop_pages.clear();
         self.local_adjust_selected_layers.clear();
         self.local_adjust_effect_query.clear();
         self.local_adjust_effect_clipboard = None;
@@ -8516,6 +8558,37 @@ impl App {
                 &[(
                     "ms",
                     serde_json::Value::from(local_adjust_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
+            );
+        }
+
+        // 最後段 crop: ページ単位の crop 設定を DB から復元。
+        // サムネイル画像には反映せず、フルスクリーン表示 / コピー / エクスポートの
+        // 最終段だけで使う。
+        let crop_t0 = std::time::Instant::now();
+        if let Some(db) = &self.export_crop_db {
+            let prefix = crate::adjustment_db::normalize_path(&source_path);
+            let page_map = db.load_by_prefix(&prefix);
+            if !page_map.is_empty() {
+                for idx in 0..self.items.len() {
+                    if let Some(key) = self.page_path_key(idx) {
+                        if let Some(settings) = page_map.get(&key) {
+                            self.export_crop_page_settings.insert(idx, *settings);
+                            self.export_crop_pages.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_export_crop_db",
+                None,
+                sli_seq,
+                &[(
+                    "ms",
+                    serde_json::Value::from(crop_t0.elapsed().as_secs_f64() * 1000.0),
                 )],
             );
         }
@@ -9498,6 +9571,9 @@ impl App {
         self.conceal_mask_generation.clear();
         self.erase_result_cache.clear();
         self.local_adjust_cache.clear();
+        self.export_crop_mode = false;
+        self.export_crop_drag = None;
+        self.export_crop_create_drag = None;
         self.cancel_all_local_adjust_pending();
         self.local_adjust_lut_pending = None;
         self.local_adjust_segmentation_pending = None;
@@ -9612,6 +9688,15 @@ impl App {
             .collect();
         self.local_adjust_pages = self
             .local_adjust_pages
+            .iter()
+            .filter_map(|&i| shift(i))
+            .collect();
+        self.export_crop_page_settings = std::mem::take(&mut self.export_crop_page_settings)
+            .into_iter()
+            .filter_map(|(i, v)| shift(i).map(|ni| (ni, v)))
+            .collect();
+        self.export_crop_pages = self
+            .export_crop_pages
             .iter()
             .filter_map(|&i| shift(i))
             .collect();
@@ -16807,6 +16892,9 @@ impl App {
         self.reset_erase_mode();
         self.reset_conceal_mode();
         self.local_adjust_mode = false;
+        self.export_crop_mode = false;
+        self.export_crop_drag = None;
+        self.export_crop_create_drag = None;
         self.local_adjust_canvas_drag = None;
         self.local_adjust_mask_brush_stroke = None;
         self.local_adjust_mask_lasso_points.clear();
@@ -17996,6 +18084,77 @@ impl App {
         self.bump_local_adjust_generation(idx);
     }
 
+    /// 指定 idx の最後段 crop 設定を DB / サイドカー / in-memory state に反映する。
+    /// `None` または full rect は「crop なし」として削除する。
+    pub(crate) fn set_export_crop_for_idx(
+        &mut self,
+        idx: usize,
+        settings: Option<crate::export_crop::CropSettings>,
+        image_size: [usize; 2],
+    ) {
+        let key = match self.page_path_key(idx) {
+            Some(key) => key,
+            None => return,
+        };
+        let normalized = settings
+            .map(|settings| settings.sanitized(image_size[0], image_size[1]))
+            .filter(|settings| !settings.is_full(image_size[0], image_size[1]));
+
+        if let Some(settings) = normalized {
+            if let Some(db) = &self.export_crop_db {
+                if let Err(err) = db.set(&key, settings) {
+                    crate::logger::log(format!(
+                        "export_crop: failed to save crop idx={idx} error={err}"
+                    ));
+                }
+            }
+            self.with_sidecar_mut(idx, move |sc, rel| sc.set_export_crop(rel, settings));
+            self.export_crop_page_settings.insert(idx, settings);
+            self.export_crop_pages.insert(idx);
+        } else {
+            if let Some(db) = &self.export_crop_db {
+                if let Err(err) = db.remove(&key) {
+                    crate::logger::log(format!(
+                        "export_crop: failed to remove crop idx={idx} error={err}"
+                    ));
+                }
+            }
+            self.with_sidecar_mut(idx, |sc, rel| sc.remove_export_crop(rel));
+            self.export_crop_page_settings.remove(&idx);
+            self.export_crop_pages.remove(&idx);
+        }
+    }
+
+    pub(crate) fn set_export_crop_for_idx_memory_only(
+        &mut self,
+        idx: usize,
+        settings: Option<crate::export_crop::CropSettings>,
+        image_size: [usize; 2],
+    ) {
+        let normalized = settings
+            .map(|settings| settings.sanitized(image_size[0], image_size[1]))
+            .filter(|settings| !settings.is_full(image_size[0], image_size[1]));
+        if let Some(settings) = normalized {
+            self.export_crop_page_settings.insert(idx, settings);
+            self.export_crop_pages.insert(idx);
+        } else {
+            self.export_crop_page_settings.remove(&idx);
+            self.export_crop_pages.remove(&idx);
+        }
+    }
+
+    pub(crate) fn export_crop_for_idx(
+        &self,
+        idx: usize,
+        image_size: [usize; 2],
+    ) -> Option<crate::export_crop::CropSettings> {
+        self.export_crop_page_settings
+            .get(&idx)
+            .copied()
+            .map(|settings| settings.sanitized(image_size[0], image_size[1]))
+            .filter(|settings| !settings.is_full(image_size[0], image_size[1]))
+    }
+
     /// 現在の input / erase mask / local adjust 世代から、補正レイヤー cache key を作る。
     pub(crate) fn current_local_adjust_key(&self, idx: usize) -> LocalAdjustResultKey {
         LocalAdjustResultKey {
@@ -18731,18 +18890,21 @@ impl App {
                 self.mask_db.as_ref(),
                 self.conceal_db.as_ref(),
                 self.local_adjust_db.as_ref(),
+                self.export_crop_db.as_ref(),
             );
             if stats.imported_adjust > 0
                 || stats.imported_mask > 0
                 || stats.imported_conceal > 0
                 || stats.imported_local_adjust > 0
+                || stats.imported_export_crop > 0
             {
                 crate::logger::log(format!(
-                    "sidecar: imported {} adjust + {} mask + {} conceal + {} local-adjust entries from {}",
+                    "sidecar: imported {} adjust + {} mask + {} conceal + {} local-adjust + {} crop entries from {}",
                     stats.imported_adjust,
                     stats.imported_mask,
                     stats.imported_conceal,
                     stats.imported_local_adjust,
+                    stats.imported_export_crop,
                     sidecar_folder.display()
                 ));
             }
@@ -20912,6 +21074,9 @@ impl App {
         self.slideshow_playing = false;
         self.adjustment_mode = false;
         self.local_adjust_mode = false;
+        self.export_crop_mode = false;
+        self.export_crop_drag = None;
+        self.export_crop_create_drag = None;
         self.local_adjust_canvas_drag = None;
         self.local_adjust_mask_brush_stroke = None;
         self.local_adjust_mask_lasso_points.clear();

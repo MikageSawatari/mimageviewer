@@ -1910,6 +1910,36 @@ impl App {
                             ctx.request_repaint();
                         }
 
+                        if let Some((w, h)) = state.image_dims {
+                            let image_size = [w as usize, h as usize];
+                            let has_crop = self.export_crop_for_idx(fs_idx, image_size).is_some();
+                            if !is_spread_double
+                                && !state.original_preview_active
+                                && (self.export_crop_mode || has_crop)
+                            {
+                                let pointer_allowed = !self.any_dialog_open()
+                                    && !ctx.input(|i| {
+                                        i.pointer.hover_pos().is_some_and(|p| {
+                                            self.export_crop_panel_rect(full_rect).contains(p)
+                                        })
+                                    });
+                                let used = self.draw_export_crop_overlay(
+                                    ui,
+                                    image_rect,
+                                    fs_idx,
+                                    image_size,
+                                    pointer_allowed,
+                                );
+                                if self.export_crop_mode || used {
+                                    ctx.request_repaint();
+                                }
+                            } else if self.export_crop_mode {
+                                ctx.request_repaint();
+                            }
+                        } else if self.export_crop_mode {
+                            ctx.request_repaint();
+                        }
+
                         let overlay_t0 = std::time::Instant::now();
                         // ── ルーペ (Shift ホールド / M トグル) ──
                         // 見開き・分析・補正モードでは内部で早期 return する。
@@ -2035,6 +2065,13 @@ impl App {
                             && !panorama_mode_active_now
                         {
                             self.draw_local_adjust_panel(ctx, full_rect);
+                        } else if self.export_crop_mode
+                            && !compare_wipe_active
+                            && !panorama_mode_active_now
+                        {
+                            let image_size =
+                                state.image_dims.map(|(w, h)| [w as usize, h as usize]);
+                            self.draw_export_crop_panel(ctx, full_rect, fs_idx, image_size);
                         } else if adjustment_active {
                             // ── オーバーレイモード: 左パネル + 右パネル 同時表示 ──
                             // 描画と当たり判定で同じ rect を使う (adjustment_panel_rect 参照)。
@@ -3097,6 +3134,10 @@ impl App {
             return action;
         }
 
+        if self.export_crop_mode {
+            return self.handle_export_crop_keys(ctx, fs_idx);
+        }
+
         // 動画フルスクリーン中は専用キーマップ (Space=play/pause、Enter=play/pause、
         // Shift+Enter=外部プレイヤー、←→=シーク、↑↓=音量、M=mute、L=loop) を
         // 画像系のキー処理より先に走らせる。
@@ -4038,11 +4079,14 @@ impl App {
                             && self.local_adjust_panel_rect(full_rect).contains(p);
                         let in_conceal_panel =
                             self.conceal_mode && self.conceal_panel_rect(full_rect).contains(p);
+                        let in_export_crop_panel = self.export_crop_mode
+                            && self.export_crop_panel_rect(full_rect).contains(p);
                         in_right
                             || in_left
                             || in_erase_panel
                             || in_local_adjust_panel
                             || in_conceal_panel
+                            || in_export_crop_panel
                     })
                     .unwrap_or(false)
             });
@@ -8546,10 +8590,15 @@ impl App {
         job: crate::capture::CapturePixelJob,
     ) -> crate::capture::CapturePixelJob {
         let [w, h] = job.source.size;
-        let Some(mask) = self.conceal_composite_mask_for_export(idx, w, h) else {
-            return job;
+        let mut job = if let Some(mask) = self.conceal_composite_mask_for_export(idx, w, h) {
+            job.with_conceal(Arc::new(mask), self.current_conceal_preset_from_settings())
+        } else {
+            job
         };
-        job.with_conceal(Arc::new(mask), self.current_conceal_preset_from_settings())
+        if let Some(crop) = self.export_crop_for_idx(idx, [w, h]) {
+            job = job.with_crop(crop.rect);
+        }
+        job
     }
 
     fn capture_basename_for_idx(&self, idx: usize) -> Option<String> {
@@ -8757,9 +8806,13 @@ impl App {
         let conceal_mask = self
             .conceal_composite_mask_for_export(idx, base_pixels.size[0], base_pixels.size[1])
             .map(Arc::new);
+        let crop = self
+            .export_crop_for_idx(idx, [base_pixels.size[0], base_pixels.size[1]])
+            .map(|settings| settings.rect);
         Ok(crate::export_dialog::ExportPagePixels {
             base_pixels,
             conceal_mask,
+            crop,
         })
     }
 

@@ -6090,8 +6090,7 @@ impl App {
         // ── ヘッダー ──
         // タイトルを左寄せにし、右側に処理順の入口
         // (消しゴム / 補正レイヤー / 隠蔽加工 / エクスポート) を並べる。
-        // 補正レイヤーは消しゴム / 隠蔽加工と同じ独立左パネルとして開き、
-        // 他 3 つは既存の編集モード / 書き出しダイアログへ合流する。
+        // 補正レイヤーとエクスポートは、消しゴム / 隠蔽加工と同じ独立左パネルとして開く。
         let header_rect =
             egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), HEADER_H));
         const HEADER_BTN_SIZE: f32 = 28.0;
@@ -6188,7 +6187,7 @@ impl App {
             "adjust_panel_export_btn",
             can_overlay_edit,
             false,
-            "エクスポート (Ctrl+E)",
+            "エクスポート / 切り取り",
             crate::ui_fullscreen::draw_icons::draw_export_icon,
         );
         if can_overlay_edit && export_resp.clicked() {
@@ -6215,13 +6214,8 @@ impl App {
             return;
         }
         if activate_export {
-            // エクスポートは編集モード中 (adjustment / erase / conceal / analysis) は
-            // 弾かれる。補正パネルはホバーで出る自動オーバーレイなので、ここで閉じて
-            // ビューモードへ戻すことで「消しゴム / 隠蔽 / モザイクまで合成した最終結果」を
-            // 書き出せる状態にしてからダイアログを開く (Ctrl+E と同一経路)。
             self.adjustment_mode = false;
-            let ctx = child.ctx().clone();
-            self.open_export_dialog_for_current(&ctx, fs_root_idx);
+            self.export_crop_mode = true;
             return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
         }
 

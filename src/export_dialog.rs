@@ -105,6 +105,7 @@ pub struct ExportRequest {
 pub struct ExportPagePixels {
     pub base_pixels: Arc<egui::ColorImage>,
     pub conceal_mask: Option<Arc<Vec<bool>>>,
+    pub crop: Option<crate::export_crop::CropRect>,
 }
 
 #[derive(Clone)]
@@ -433,14 +434,21 @@ fn render_export_page_pixels<'a>(
     page: &'a ExportPagePixels,
     preset: Option<&ConcealPreset>,
 ) -> Result<Cow<'a, egui::ColorImage>, String> {
-    match (&page.conceal_mask, preset) {
-        (Some(mask), Some(preset)) => Ok(Cow::Owned(compose_conceal_for_export(
+    let rendered = match (&page.conceal_mask, preset) {
+        (Some(mask), Some(preset)) => Cow::Owned(compose_conceal_for_export(
             page.base_pixels.as_ref(),
             mask.as_ref(),
             preset,
-        )?)),
-        _ => Ok(Cow::Borrowed(page.base_pixels.as_ref())),
+        )?),
+        _ => Cow::Borrowed(page.base_pixels.as_ref()),
+    };
+    if let Some(crop) = page.crop {
+        return Ok(Cow::Owned(crate::export_crop::crop_color_image(
+            rendered.as_ref(),
+            crop,
+        )?));
     }
+    Ok(rendered)
 }
 
 fn compose_conceal_for_export(
@@ -498,6 +506,7 @@ mod tests {
             pixels: ExportPixels::Single(ExportPagePixels {
                 base_pixels: Arc::clone(&pixels),
                 conceal_mask: None,
+                crop: None,
             }),
             entries: vec![
                 ExportEntry {
@@ -548,6 +557,7 @@ mod tests {
             pixels: ExportPixels::Single(ExportPagePixels {
                 base_pixels: pixels,
                 conceal_mask: Some(mask),
+                crop: None,
             }),
             entries: vec![ExportEntry {
                 label: "black".to_string(),
@@ -582,6 +592,34 @@ mod tests {
     }
 
     #[test]
+    fn render_export_page_pixels_applies_crop_last() {
+        let pixels = Arc::new(egui::ColorImage::new(
+            [3, 1],
+            vec![
+                egui::Color32::from_rgb(255, 0, 0),
+                egui::Color32::from_rgb(0, 255, 0),
+                egui::Color32::from_rgb(0, 0, 255),
+            ],
+        ));
+        let page = ExportPagePixels {
+            base_pixels: pixels,
+            conceal_mask: None,
+            crop: Some(crate::export_crop::CropRect {
+                min_x: 1.0,
+                min_y: 0.0,
+                max_x: 3.0,
+                max_y: 1.0,
+            }),
+        };
+
+        let out = render_export_page_pixels(&page, None).unwrap();
+
+        assert_eq!(out.size, [2, 1]);
+        assert_eq!(out.pixels[0], egui::Color32::from_rgb(0, 255, 0));
+        assert_eq!(out.pixels[1], egui::Color32::from_rgb(0, 0, 255));
+    }
+
+    #[test]
     fn worker_exports_spread_pixels_with_per_page_conceal() {
         let temp = tempfile::tempdir().unwrap();
         let left = Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]));
@@ -599,10 +637,12 @@ mod tests {
                 left: ExportPagePixels {
                     base_pixels: left,
                     conceal_mask: Some(Arc::new(vec![true])),
+                    crop: None,
                 },
                 right: ExportPagePixels {
                     base_pixels: right,
                     conceal_mask: None,
+                    crop: None,
                 },
             },
             entries: vec![ExportEntry {

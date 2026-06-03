@@ -557,11 +557,13 @@ AI 自動検出よりも、ユーザーの意図した範囲を狭く安全に�
 ### 7.0 mIV 本体統合時の最小方針
 
 本体統合では、中央 DB を authoritative にする。フォルダ移動時の復元用バックアップとして、
-既存の `mimageviewer.dat` に `local_adjust_layers` を追加し、`adjustment.db` / `mask.db` /
-`conceal.db` と同じサイドカー同期に載せる。
+既存の `mimageviewer.dat` に `local_adjust_layers` と `export_crop` を追加し、
+`adjustment.db` / `mask.db` / `conceal.db` と同じサイドカー同期に載せる。
 
 - 保存先: `%APPDATA%/mimageviewer/local_adjust.db`
+- 最後段 crop 保存先: `%APPDATA%/mimageviewer/export_crop.db`
 - サイドカー: フォルダ単位 `mimageviewer.dat` の各エントリに `local_adjust_layers` を保存する。
+- crop サイドカー: 同じエントリに `export_crop` を保存する。
 - キー規則: `App::page_path_key` と同じ正規化済み page key
 - 対象: 通常画像 / ZIP 内画像 / PDF ページ
 - サムネイル: 補正レイヤー結果は反映しない。消しゴム / 隠蔽加工と同じく、必要ならバッジのみ表示する。
@@ -584,6 +586,8 @@ DB 案は、将来本体に統合するときの高速検索 / 一括管理 / �
 
 - `local_adjust_db.rs`
 - `%APPDATA%/mimageviewer/local_adjust.db`
+- `export_crop.rs`
+- `%APPDATA%/mimageviewer/export_crop.db`
 
 テーブル案:
 
@@ -616,7 +620,7 @@ ZIP / PDF ページのキーも既存のページキー生成に合わせる。
 輝度 / カラー範囲、被写体選択、領域分割などのパラメータを保存する。
 合成時は `mask_source_json` から必要なら raster alpha mask を再生成し、既存の mask pipeline に流す。
 
-サイドカーバックアップ `mimageviewer.dat` には `local_adjust_layers` 配列を保存する。
+サイドカーバックアップ `mimageviewer.dat` には `local_adjust_layers` 配列と `export_crop` を保存する。
 `local_adjust_lab` の `foo.png.miv` 形式は検証用で、本体の正式保存形式ではない。
 
 ## 8. キャッシュ案
@@ -906,11 +910,14 @@ v1.1.0 では、まず案 B の「最後段の非破壊 crop」を推奨する�
 
 2026-06-03 時点の mIV 本体統合では、`local_adjust_lab` の効果ピッカー、効果パラメータ UI、
 マスク種別 UI、グラデーション/カラー/手描き/効果位置ハンドルの主要キャンバス操作、
-Undo / Redo を本体へ移植済み。フルスクリーン左パネルの補正レイヤーアイコンから縦通しを確認する。
+Undo / Redo、最後段 crop preview / export crop を本体へ移植済み。フルスクリーン左パネルの
+補正レイヤー / エクスポートアイコンから縦通しを確認する。
 
 - 左パネルヘッダーのアイコンが、左から `消しゴム -> 補正レイヤー -> 隠蔽加工 -> エクスポート`
   の順に並ぶ。
 - 補正レイヤーアイコンで右上 `×` 付きの独立左パネルが開き、`×` または `Esc` で閉じられる。
+- エクスポートアイコンで右上 `×` 付きの独立左パネルが開き、crop の有効化、数値入力、
+  画像上ドラッグ、解除、Ctrl+E エクスポートへ進める。
 - 補正レイヤーパネルの効果検索で、効果名・短縮名・説明文をキーワード絞り込みしながら
   全 `LocalEffect` を追加できる。
 - 選択レイヤーの効果パラメータ UI から、コピー/ペースト/リセット、スポイト、位置ハンドル表示、
@@ -935,6 +942,9 @@ Undo / Redo を本体へ移植済み。フルスクリーン左パネルの補�
 - 右 Ctrl 元画像プレビューでは補正レイヤー結果も一時的に外れる。
 - Ctrl+E / キャプチャ保存は、補正レイヤーが有効な場合 `local_adjust_cache` 完了後だけ
   実行でき、下位画像を誤って保存しない。
+- 最後段 crop が有効なページでは、通常表示に crop 外暗転 overlay が出て、Ctrl+S コピー/保存と
+  Ctrl+E エクスポートの最終段で切り出される。crop 変更では `local_adjust_cache` /
+  `conceal_cache` は破棄されない。
 - `Ctrl+Alt+Shift+D` の pipeline debug 出力に `56_local_adjust_source_current`、
   `57_local_adjust_recomputed`、`58_local_adjust_current` が含まれる。
 - Ctrl+Z / Ctrl+Y でレイヤー追加/削除、パラメータ編集、キャンバス編集、LUT 読み込みが戻る。
