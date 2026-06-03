@@ -56,6 +56,8 @@ const LOCAL_ADJUST_PANEL_SECTION_MARGIN_LEFT: i8 = 10;
 const LOCAL_ADJUST_PANEL_SECTION_MARGIN_RIGHT: i8 = 6;
 const LOCAL_ADJUST_PANEL_SECTION_CONTENT_W_SHRINK: f32 =
     (LOCAL_ADJUST_PANEL_SECTION_MARGIN_LEFT + LOCAL_ADJUST_PANEL_SECTION_MARGIN_RIGHT) as f32;
+const LOCAL_ADJUST_MASK_PICKER_BUTTON_SIZE: egui::Vec2 = egui::vec2(156.0, 30.0);
+const LOCAL_ADJUST_EFFECT_PICKER_BUTTON_H: f32 = 30.0;
 const LOCAL_ADJUST_EDGE_BRUSH_INCLUDE_BOUNDARY_RADIUS: isize = 2;
 const LOCAL_ADJUST_U2NETP_INPUT_SIZE: usize = 320;
 const LOCAL_ADJUST_REGION_SEGMENT_MAX_LABELS: usize = 2048;
@@ -6394,13 +6396,14 @@ impl App {
                                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                                 for &kind in group.kinds {
                                     let response = ui
-                                        .add(
+                                        .add_sized(
+                                            LOCAL_ADJUST_MASK_PICKER_BUTTON_SIZE,
                                             egui::Button::new(
                                                 egui::RichText::new(kind.label())
                                                     .size(12.0)
                                                     .strong(),
                                             )
-                                            .min_size(egui::vec2(82.0, 28.0)),
+                                            .wrap(),
                                         )
                                         .on_hover_text(kind.description());
                                     if response.clicked() {
@@ -6489,15 +6492,18 @@ impl App {
                                 for &kind in group.kinds {
                                     let is_current = kind == current_kind;
                                     let response = ui
-                                        .add_enabled(
-                                            !is_current,
-                                            egui::Button::new(
-                                                egui::RichText::new(kind.label())
-                                                    .size(12.0)
-                                                    .strong(),
+                                        .add_enabled_ui(!is_current, |ui| {
+                                            ui.add_sized(
+                                                LOCAL_ADJUST_MASK_PICKER_BUTTON_SIZE,
+                                                egui::Button::new(
+                                                    egui::RichText::new(kind.label())
+                                                        .size(12.0)
+                                                        .strong(),
+                                                )
+                                                .wrap(),
                                             )
-                                            .min_size(egui::vec2(156.0, 30.0)),
-                                        )
+                                        })
+                                        .inner
                                         .on_hover_text(if is_current {
                                             "現在のマスク種類です。"
                                         } else {
@@ -6547,8 +6553,8 @@ impl App {
             .default_pos(ctx.content_rect().min + egui::vec2(80.0, 64.0))
             .collapsible(false)
             .resizable(true)
-            .default_width(560.0)
-            .default_height(520.0)
+            .default_size(egui::vec2(860.0, 560.0))
+            .min_size(egui::vec2(560.0, 360.0))
             .open(&mut open)
             .show(ctx, |ui| {
                 *ui.visuals_mut() = egui::Visuals::dark();
@@ -6598,10 +6604,14 @@ impl App {
                                 for kind in matched {
                                     let response = ui
                                         .add_sized(
-                                            egui::vec2(button_width, 28.0),
+                                            egui::vec2(
+                                                button_width,
+                                                LOCAL_ADJUST_EFFECT_PICKER_BUTTON_H,
+                                            ),
                                             egui::Button::new(
                                                 egui::RichText::new(kind.picker_label()).size(12.0),
-                                            ),
+                                            )
+                                            .wrap(),
                                         )
                                         .on_hover_text(kind.description());
                                     if response.clicked() {
@@ -7077,7 +7087,7 @@ impl App {
         // ── ヘッダー ──
         // タイトルを左寄せにし、右側に処理順の入口
         // (消しゴム / 補正レイヤー / 隠蔽加工 / エクスポート) を並べる。
-        // 補正レイヤーとエクスポートは、消しゴム / 隠蔽加工と同じ独立左パネルとして開く。
+        // 補正レイヤーは独立左パネル、エクスポートは Ctrl+E と同じダイアログで開く。
         let header_rect =
             egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), HEADER_H));
         const HEADER_BTN_SIZE: f32 = 28.0;
@@ -7202,7 +7212,9 @@ impl App {
         }
         if activate_export {
             self.adjustment_mode = false;
-            self.export_crop_mode = true;
+            self.export_crop_mode = false;
+            let ctx = child.ctx().clone();
+            self.open_export_dialog_for_current(&ctx, fs_idx);
             return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
         }
 
