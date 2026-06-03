@@ -211,6 +211,32 @@ mod local_adjust_segmentation_tests {
     }
 
     #[test]
+    fn rect_and_ellipse_shape_handles_are_hit_testable() {
+        let rect = local_adjust_core::MaskShape::Rect {
+            op: local_adjust_core::ShapeOp::Add,
+            center: [100.0, 100.0],
+            half_w: 30.0,
+            half_h: 20.0,
+            rotation_rad: 0.0,
+        };
+        assert_eq!(
+            hit_local_adjust_shape_handles(rect, [130.0, 120.0], 14.0),
+            Some(LocalAdjustShapeHandle::Corner(2))
+        );
+        let ellipse = local_adjust_core::MaskShape::Ellipse {
+            op: local_adjust_core::ShapeOp::Add,
+            center: [100.0, 100.0],
+            rx: 40.0,
+            ry: 22.0,
+            rotation_rad: 0.0,
+        };
+        assert_eq!(
+            hit_local_adjust_shape_handles(ellipse, [140.0, 100.0], 14.0),
+            Some(LocalAdjustShapeHandle::Radius)
+        );
+    }
+
+    #[test]
     fn full_mask_preview_hides_plain_full_base_but_shows_subtract_result() {
         let mut layer = local_adjust_core::LocalAdjustmentLayer::new(
             "full",
@@ -6454,6 +6480,16 @@ impl App {
             return Some((selected, handle));
         }
         for (idx, shape) in mask.shapes.iter().enumerate().rev() {
+            if self.local_adjust_selected_shape == Some(idx) {
+                continue;
+            }
+            if let Some(handle) =
+                hit_local_adjust_shape_handles(*shape, point, handle_hit_radius_px)
+            {
+                return Some((idx, handle));
+            }
+        }
+        for (idx, shape) in mask.shapes.iter().enumerate().rev() {
             if local_adjust_shape_contains(*shape, point) {
                 return Some((idx, LocalAdjustShapeHandle::Body));
             }
@@ -7154,6 +7190,24 @@ impl App {
                 }
                 _ => {}
             }
+        } else if active_mask_edit_target.is_some_and(|target| {
+            if self.local_adjust_mask_tool != LocalAdjustMaskTool::Select {
+                return false;
+            }
+            let point = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
+            let handle_hit_radius_px = local_adjust_image_layout(image_rect, image_dims, zoom_pan)
+                .map(|(scale, _)| (12.0 / scale.max(0.001)).clamp(12.0, 96.0))
+                .unwrap_or(12.0);
+            self.hit_test_local_adjust_mask_shapes(
+                fs_idx,
+                layer_idx,
+                target,
+                [point.0, point.1],
+                handle_hit_radius_px,
+            )
+            .is_some()
+        }) {
+            ctx.set_cursor_icon(egui::CursorIcon::Grab);
         } else if self
             .local_adjust_page_layers
             .get(&fs_idx)
