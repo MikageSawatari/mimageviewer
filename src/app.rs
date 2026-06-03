@@ -312,6 +312,18 @@ pub(crate) enum LocalAdjustMaskEditTarget {
     OverrideSubtract,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalAdjustMaskTool {
+    Brush,
+    Lasso,
+    Polygon,
+    Line,
+    VertLine,
+    HorizLine,
+    Rect,
+    Ellipse,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LocalAdjustMaskBrushStroke {
     pub(crate) fs_idx: usize,
@@ -3032,6 +3044,16 @@ pub struct App {
     pub(crate) local_adjust_mask_brush_radius: f32,
     /// 補正レイヤー手描きマスクを描画するか、消去するか。
     pub(crate) local_adjust_mask_paint_add: bool,
+    /// 補正レイヤー手描きマスクの選択ツール。
+    pub(crate) local_adjust_mask_tool: LocalAdjustMaskTool,
+    /// 補正レイヤー手描きマスクの直線系ツール幅 (画像 px)。
+    pub(crate) local_adjust_mask_line_width: f32,
+    /// 補正レイヤー手描きマスクの囲み/多角形作成中ポイント (画像 px)。
+    pub(crate) local_adjust_mask_lasso_points: Vec<[f32; 2]>,
+    /// 補正レイヤー手描きマスクの図形ドラッグ開始点 (正規化座標)。
+    pub(crate) local_adjust_mask_shape_drag_start: Option<[f32; 2]>,
+    /// 補正レイヤー手描きマスクの図形ドラッグ終点 (正規化座標)。
+    pub(crate) local_adjust_mask_shape_drag_end: Option<[f32; 2]>,
     /// 補正レイヤー手描きマスクのドラッグ中状態。
     pub(crate) local_adjust_mask_brush_stroke: Option<LocalAdjustMaskBrushStroke>,
     /// キャンバスドラッグ開始前の補正レイヤー配列。Undo をドラッグ単位にまとめる。
@@ -4252,6 +4274,11 @@ impl App {
             local_adjust_mask_edit_target: LocalAdjustMaskEditTarget::None,
             local_adjust_mask_brush_radius: 36.0,
             local_adjust_mask_paint_add: true,
+            local_adjust_mask_tool: LocalAdjustMaskTool::Brush,
+            local_adjust_mask_line_width: 24.0,
+            local_adjust_mask_lasso_points: Vec::new(),
+            local_adjust_mask_shape_drag_start: None,
+            local_adjust_mask_shape_drag_end: None,
             local_adjust_mask_brush_stroke: None,
             local_adjust_canvas_drag_before_layers: None,
             local_adjust_mask_brush_before_layers: None,
@@ -8285,6 +8312,9 @@ impl App {
         self.local_adjust_effect_position_handles_visible = true;
         self.local_adjust_canvas_drag = None;
         self.local_adjust_mask_brush_stroke = None;
+        self.local_adjust_mask_lasso_points.clear();
+        self.local_adjust_mask_shape_drag_start = None;
+        self.local_adjust_mask_shape_drag_end = None;
         self.local_adjust_canvas_drag_before_layers = None;
         self.local_adjust_mask_brush_before_layers = None;
         self.local_adjust_generation.clear();
@@ -16678,6 +16708,9 @@ impl App {
         self.local_adjust_mode = false;
         self.local_adjust_canvas_drag = None;
         self.local_adjust_mask_brush_stroke = None;
+        self.local_adjust_mask_lasso_points.clear();
+        self.local_adjust_mask_shape_drag_start = None;
+        self.local_adjust_mask_shape_drag_end = None;
         self.local_adjust_canvas_drag_before_layers = None;
         self.local_adjust_mask_brush_before_layers = None;
         self.erase_base_cache.clear();
@@ -20762,6 +20795,9 @@ impl App {
         self.local_adjust_mode = false;
         self.local_adjust_canvas_drag = None;
         self.local_adjust_mask_brush_stroke = None;
+        self.local_adjust_mask_lasso_points.clear();
+        self.local_adjust_mask_shape_drag_start = None;
+        self.local_adjust_mask_shape_drag_end = None;
         self.local_adjust_canvas_drag_before_layers = None;
         self.local_adjust_mask_brush_before_layers = None;
         self.analysis_mode = false;
