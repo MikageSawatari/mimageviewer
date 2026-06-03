@@ -23,6 +23,7 @@
 | UI スレッドから新しい同期 I/O / GPU アップロード / read_dir 走査を呼ぶ | [docs/ui-responsiveness.md](docs/ui-responsiveness.md) (§4 チェックリスト) |
 | ZIP / PDF 対応が必要な機能 | [docs/virtual-folders.md](docs/virtual-folders.md) |
 | 補正 / プリセット / AI アップスケール / 消しゴム | [docs/preset-and-adjustment.md](docs/preset-and-adjustment.md) |
+| 補正レイヤー / ローカル調整 / レイヤー合成 | [docs/local-adjustment-layer-v1.1.0-plan.md](docs/local-adjustment-layer-v1.1.0-plan.md) と [docs/local-adjust-filter-candidates.md](docs/local-adjust-filter-candidates.md) |
 | UI の見た目・配色を変える修正 | [docs/ui-snapshot-policy.md](docs/ui-snapshot-policy.md) (egui_kittest スナップショットの更新手順) |
 
 **設計を変えたら該当ドキュメントも同時に更新する** (下の「コード修正時のドキュメント同時更新」参照)。

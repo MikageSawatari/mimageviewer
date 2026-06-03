@@ -554,6 +554,21 @@ AI 自動検出よりも、ユーザーの意図した範囲を狭く安全に�
 
 ## 7. 永続化案
 
+### 7.0 mIV 本体統合時の最小方針
+
+本体統合の初期段階では、中央 DB を authoritative にする。サイドカーバックアップは
+`adjustment.db` / `mask.db` と同じく将来必要だが、補正レイヤーはマスクや効果 JSON が大きく、
+既存 `mimageviewer.dat` の同期 flush 課題も残っているため、最初の縦通しには含めない。
+
+- 初期保存先: `%APPDATA%/mimageviewer/local_adjust.db`
+- キー規則: `App::page_path_key` と同じ正規化済み page key
+- 対象: 通常画像 / ZIP 内画像 / PDF ページ
+- サムネイル: 補正レイヤー結果は反映しない。消しゴム / 隠蔽加工と同じく、必要ならバッジのみ表示する。
+- stale 中の表示: 古い補正レイヤー結果を残さず、補正レイヤー抜きの現在ベース画像を即時表示する。
+
+サイドカー対応、既存 `mimageviewer.dat` への `local_adjust_layers` 追加、または画像単位の
+`.miv` サイドカー正式採用は、最小統合が安定した後に判断する。
+
 補正レイヤーは容量が大きくなりやすく、ユーザーが時間をかけて調整するデータでもある。
 そのため、まずは画像ファイルと一緒に移動しやすいサイドカー保存を第一候補にする。
 
@@ -631,6 +646,11 @@ conceal source:
   local_adjust_cache > erase_result_cache > adjustment_cache > ai_upscale_cache > fs_cache
 ```
 
+`local_adjust_cache` は非同期 worker で生成する。補正レイヤーが存在するが cache が未生成、
+stale、または worker 実行中の場合、表示は `local adjust source` の現在ベース画像へ戻す。
+これによりパラメータ変更後に古い補正レイヤー結果が画面へ残る混乱を避け、入力操作と
+パネル描画を止めずに最新結果だけを遅延反映する。
+
 ### 8.1 無効化
 
 | 変更 | local_adjust_cache | conceal_cache |
@@ -681,6 +701,23 @@ conceal source:
   ソース解像度へリスケールする。
 
 ## 10. 実装フェーズ
+
+### mIV 本体統合タスクリスト
+
+本体統合は、実機試験前に戻しやすい小コミットへ分けて進める。
+
+1. 統合方針とプレビュー仕様を docs に明文化する。
+2. mIV 本体に `local-adjust-core` 依存と `local_adjust_db` の最小永続化を追加する。
+3. `App` 状態に補正レイヤー保持・読込・保存・バッジ用集合を追加する。
+4. `local_adjust_cache` と世代管理を追加し、stale 中は下位レイヤーを即時表示する。
+5. 補正レイヤー合成 worker を追加し、キャンセルと古い結果破棄を実装する。
+6. `resolve_fs_processed_texture` と隠蔽加工の入力解決に `local_adjust_cache` を組み込む。
+7. 最小 UI を追加する。初期範囲はレイヤー一覧、追加 / 削除 / ON-OFF、効果選択、主要パラメータ編集。
+8. マスク最小対応を追加する。最初は安全な Full / 既存マスク UI に接続しやすい範囲から始める。
+9. Undo / Redo とキャッシュ無効化ルールを補正レイヤー操作へ接続する。
+10. Ctrl+E 書き出しと pipeline debug に補正レイヤー段を追加する。
+11. perf 計測、ユニットテスト、必要な実機試験項目を追加する。
+12. 後続として sidecar backup と `local-adjust-ui` 共通化の要否を判断する。
 
 ### Phase 1: 全体補正の拡張
 
