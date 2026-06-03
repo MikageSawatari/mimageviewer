@@ -764,6 +764,22 @@ impl App {
         }
     }
 
+    /// 補正レイヤー直前の入力テクスチャを解決する。
+    /// 優先順: erase result → adjustment → AI → fs。
+    fn resolve_local_adjust_source_texture(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        if let Some(tex) = self.ensure_erase_result_texture(ctx, idx) {
+            return Some(tex);
+        }
+        if self.mask_pages.contains(&idx) {
+            return None;
+        }
+        self.resolve_fs_pre_overlay_texture(idx)
+    }
+
     /// フルスクリーン描画で使う最終表示テクスチャを解決する共通入口。
     ///
     /// 単ページ / 見開き / ルーペの全てがここを通ることで、加工レイヤを追加した
@@ -795,6 +811,23 @@ impl App {
             return preview_tex
                 .or_else(|| self.resolve_fs_pre_overlay_texture(idx))
                 .or_else(|| self.ensure_erase_base_texture(ctx, idx));
+        }
+
+        if self.local_adjust_mode {
+            let (ctrl_down, shift_down) = ctx.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
+            if ctrl_down
+                && shift_down
+                && let Some(layer_idx) = self.selected_local_adjust_layer_idx(idx)
+            {
+                self.maybe_start_local_adjust_layer_bypass_preview(idx, layer_idx);
+                if let Some(tex) = self.current_local_adjust_layer_bypass_texture(idx, layer_idx) {
+                    return Some(tex);
+                }
+                return self.resolve_local_adjust_source_texture(ctx, idx);
+            }
+            if ctrl_down || self.local_adjust_show_source {
+                return self.resolve_local_adjust_source_texture(ctx, idx);
+            }
         }
 
         let erase_result_tex = self.ensure_erase_result_texture(ctx, idx);
@@ -3128,6 +3161,23 @@ impl App {
         }
 
         if self.local_adjust_mode {
+            self.handle_meta_undo_keys(ctx);
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Q)) {
+                self.local_adjust_show_source = !self.local_adjust_show_source;
+                self.show_feedback_toast(if self.local_adjust_show_source {
+                    "補正レイヤー: 元画像表示 ON".to_string()
+                } else {
+                    "補正レイヤー: 元画像表示 OFF".to_string()
+                });
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W)) {
+                self.local_adjust_show_mask = !self.local_adjust_show_mask;
+                self.show_feedback_toast(if self.local_adjust_show_mask {
+                    "補正レイヤー: マスク表示 ON".to_string()
+                } else {
+                    "補正レイヤー: マスク表示 OFF".to_string()
+                });
+            }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                 self.local_adjust_mode = false;
                 self.local_adjust_add_layer_dialog_open = false;
@@ -4388,7 +4438,10 @@ impl App {
         }
         // 分析モード中は右クリックを色固定に使うため、終了トリガーにしない
         // コンテキストメニュー表示中は右クリック処理をスキップ
-        if !self.analysis_mode && self.fs_context_menu_idx.is_none() {
+        if !self.analysis_mode
+            && !self.is_overlay_edit_mode_active()
+            && self.fs_context_menu_idx.is_none()
+        {
             let secondary_down = ctx.input(|i| i.pointer.secondary_down());
             let secondary_released = ctx.input(|i| i.pointer.secondary_released());
             let secondary_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());

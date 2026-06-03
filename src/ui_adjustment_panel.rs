@@ -62,6 +62,24 @@ const LOCAL_ADJUST_EDGE_BRUSH_INCLUDE_BOUNDARY_RADIUS: isize = 2;
 const LOCAL_ADJUST_U2NETP_INPUT_SIZE: usize = 320;
 const LOCAL_ADJUST_REGION_SEGMENT_MAX_LABELS: usize = 2048;
 
+fn with_local_adjust_dark_window_style<R>(
+    ctx: &egui::Context,
+    add_contents: impl FnOnce() -> R,
+) -> R {
+    let previous_style = (*ctx.style()).clone();
+    let mut dark_style = previous_style.clone();
+    dark_style.visuals = egui::Visuals::dark();
+    dark_style.visuals.override_text_color = Some(egui::Color32::WHITE);
+    dark_style.visuals.window_fill = egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245);
+    dark_style.visuals.widgets.noninteractive.fg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::WHITE);
+    dark_style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    ctx.set_style(dark_style);
+    let result = add_contents();
+    ctx.set_style(previous_style);
+    result
+}
+
 #[derive(Default)]
 struct LocalEffectPanelRequests {
     load_cube_lut: Option<usize>,
@@ -153,6 +171,35 @@ impl MaskKind {
 #[cfg(test)]
 mod local_adjust_segmentation_tests {
     use super::*;
+
+    #[test]
+    fn local_adjust_mask_preview_alt_inverts_panel_toggle() {
+        assert!(local_adjust_mask_preview_active(true, true, false));
+        assert!(!local_adjust_mask_preview_active(true, true, true));
+        assert!(!local_adjust_mask_preview_active(true, false, false));
+        assert!(local_adjust_mask_preview_active(true, false, true));
+        assert!(!local_adjust_mask_preview_active(false, true, false));
+        assert!(!local_adjust_mask_preview_active(false, false, true));
+    }
+
+    #[test]
+    fn local_adjust_shape_handle_hit_radius_can_expand_for_zoomed_out_view() {
+        let shape = local_adjust_core::MaskShape::Ellipse {
+            op: local_adjust_core::ShapeOp::Add,
+            center: [100.0, 100.0],
+            rx: 50.0,
+            ry: 24.0,
+            rotation_rad: 0.0,
+        };
+        assert_eq!(
+            hit_local_adjust_shape_handles(shape, [170.0, 100.0], 12.0),
+            None
+        );
+        assert_eq!(
+            hit_local_adjust_shape_handles(shape, [170.0, 100.0], 24.0),
+            Some(LocalAdjustShapeHandle::Radius)
+        );
+    }
 
     #[test]
     fn region_segmentation_splits_connected_color_regions() {
@@ -403,11 +450,33 @@ fn draw_local_adjust_left_panel(
     mask_edit_target: &mut LocalAdjustMaskEditTarget,
     mask_paint_add: &mut bool,
     mask_tool: &mut LocalAdjustMaskTool,
+    show_source: &mut bool,
+    show_mask: &mut bool,
 ) {
     let section_panel_w = panel_w - LOCAL_ADJUST_PANEL_SECTION_CONTENT_W_SHRINK;
     let btn_w = ((section_panel_w - 20.0 - 4.0) / 2.0).max(96.0);
     let btn_size = egui::vec2(btn_w, 24.0);
     draw_local_adjust_panel_section(ui, LocalAdjustPanelSection::General, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if local_adjust_panel_toggle_button(
+                ui,
+                "元画像 [Q]",
+                *show_source,
+                Some(btn_size),
+                false,
+            )
+            .clicked()
+            {
+                *show_source = !*show_source;
+            }
+            if local_adjust_panel_toggle_button(ui, "マスク [W]", *show_mask, Some(btn_size), false)
+                .clicked()
+            {
+                *show_mask = !*show_mask;
+            }
+        });
+        ui.add_space(4.0);
         draw_local_adjust_layer_list(
             ui,
             section_panel_w,
@@ -2658,8 +2727,9 @@ fn local_adjust_shape_contains(shape: local_adjust_core::MaskShape, p: [f32; 2])
 fn hit_local_adjust_shape_handles(
     shape: local_adjust_core::MaskShape,
     p: [f32; 2],
+    hit_radius_px: f32,
 ) -> Option<LocalAdjustShapeHandle> {
-    let r2 = 12.0_f32.powi(2);
+    let r2 = hit_radius_px.max(12.0).powi(2);
     match shape {
         local_adjust_core::MaskShape::Line { p0, p1, .. } => {
             if local_adjust_dist2(p, p0) <= r2 {
@@ -3323,6 +3393,134 @@ fn draw_local_empty_thumbnail_mark(painter: &egui::Painter, rect: egui::Rect) {
         ],
         egui::Stroke::new(1.0, egui::Color32::from_gray(100)),
     );
+}
+
+fn local_adjust_mask_preview_active(
+    local_adjust_mode: bool,
+    show_mask: bool,
+    alt_down: bool,
+) -> bool {
+    local_adjust_mode && (show_mask != alt_down)
+}
+
+fn local_adjust_region_label_active(
+    mask: &local_adjust_core::RegionMask,
+    inverted: bool,
+    label: u32,
+) -> bool {
+    if label == 0 {
+        return false;
+    }
+    mask.selected.get(label as usize).copied().unwrap_or(false) ^ inverted
+}
+
+fn local_adjust_region_label_boundary(
+    mask: &local_adjust_core::RegionMask,
+    label: u32,
+    x: usize,
+    y: usize,
+) -> bool {
+    if x == 0 || y == 0 || x + 1 == mask.width || y + 1 == mask.height {
+        return true;
+    }
+    local_adjust_region_neighbors(x, y, mask.width, mask.height)
+        .any(|(nx, ny)| mask.labels[ny * mask.width + nx] != label)
+}
+
+fn local_adjust_region_active_boundary(
+    mask: &local_adjust_core::RegionMask,
+    inverted: bool,
+    label: u32,
+    x: usize,
+    y: usize,
+) -> bool {
+    if x == 0 || y == 0 || x + 1 == mask.width || y + 1 == mask.height {
+        return true;
+    }
+    local_adjust_region_neighbors(x, y, mask.width, mask.height).any(|(nx, ny)| {
+        let n_label = mask.labels[ny * mask.width + nx];
+        n_label != label || !local_adjust_region_label_active(mask, inverted, n_label)
+    })
+}
+
+fn local_adjust_region_boundary_color(label: u32, time_sec: f32) -> egui::Color32 {
+    let pulse = ((time_sec * 3.0 + label as f32 * 0.31).sin() * 0.5 + 0.5) * 45.0;
+    let r = (110.0 + ((label.wrapping_mul(53) % 120) as f32) + pulse).clamp(0.0, 255.0) as u8;
+    let g = (135.0 + ((label.wrapping_mul(97) % 100) as f32)).clamp(0.0, 255.0) as u8;
+    let b = (170.0 + ((label.wrapping_mul(31) % 80) as f32)).clamp(0.0, 255.0) as u8;
+    egui::Color32::from_rgba_unmultiplied(r, g, b, 190)
+}
+
+fn draw_local_adjust_mask_preview_overlay(
+    painter: &egui::Painter,
+    drawn_rect: egui::Rect,
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+    source: Option<&egui::ColorImage>,
+    image_dims: (usize, usize),
+    time_sec: f32,
+) {
+    let width = image_dims.0.max(1);
+    let height = image_dims.1.max(1);
+    let cols = (drawn_rect.width() / 12.0).round().clamp(32.0, 128.0) as usize;
+    let rows = ((cols as f32 * height as f32 / width as f32).round() as usize).clamp(24, 128);
+    let source = source.filter(|source| source.size == [width, height]);
+
+    for gy in 0..rows {
+        for gx in 0..cols {
+            let x = (((gx as f32 + 0.5) * width as f32 / cols as f32) as usize)
+                .min(width.saturating_sub(1));
+            let y = (((gy as f32 + 0.5) * height as f32 / rows as f32) as usize)
+                .min(height.saturating_sub(1));
+            let color = match &layer.mask {
+                local_adjust_core::LocalMask::Segmentation(mask)
+                    if mask.width == width && mask.height == height =>
+                {
+                    let idx = y * width + x;
+                    let label = mask.labels.get(idx).copied().unwrap_or(0);
+                    if label == 0 {
+                        egui::Color32::TRANSPARENT
+                    } else if local_adjust_region_label_active(mask, layer.mask_inverted, label) {
+                        if local_adjust_region_active_boundary(
+                            mask,
+                            layer.mask_inverted,
+                            label,
+                            x,
+                            y,
+                        ) {
+                            egui::Color32::from_rgba_unmultiplied(255, 230, 120, 230)
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(255, 80, 125, 170)
+                        }
+                    } else if local_adjust_region_label_boundary(mask, label, x, y) {
+                        local_adjust_region_boundary_color(label, time_sec)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    }
+                }
+                _ => {
+                    let alpha = local_adjust_mask_preview_alpha(layer, source, width, height, x, y);
+                    if alpha <= 0.02 {
+                        egui::Color32::TRANSPARENT
+                    } else {
+                        let a = (55.0 + alpha * 175.0).round().clamp(0.0, 255.0) as u8;
+                        egui::Color32::from_rgba_unmultiplied(255, 80, 125, a)
+                    }
+                }
+            };
+            if color == egui::Color32::TRANSPARENT {
+                continue;
+            }
+            let x0 = drawn_rect.left() + gx as f32 * drawn_rect.width() / cols as f32;
+            let y0 = drawn_rect.top() + gy as f32 * drawn_rect.height() / rows as f32;
+            let x1 = drawn_rect.left() + (gx + 1) as f32 * drawn_rect.width() / cols as f32;
+            let y1 = drawn_rect.top() + (gy + 1) as f32 * drawn_rect.height() / rows as f32;
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
+                0.0,
+                color,
+            );
+        }
+    }
 }
 
 fn local_adjust_mask_preview_alpha(
@@ -4521,7 +4719,7 @@ impl App {
         Some(fs_idx)
     }
 
-    fn selected_local_adjust_layer_idx(&self, fs_idx: usize) -> Option<usize> {
+    pub(crate) fn selected_local_adjust_layer_idx(&self, fs_idx: usize) -> Option<usize> {
         let layers = self.local_adjust_page_layers.get(&fs_idx)?;
         if layers.is_empty() {
             return None;
@@ -4883,6 +5081,7 @@ impl App {
         layer_idx: usize,
         target: LocalAdjustMaskEditTarget,
         point: [f32; 2],
+        handle_hit_radius_px: f32,
     ) -> Option<(usize, LocalAdjustShapeHandle)> {
         let layer = self
             .local_adjust_page_layers
@@ -4891,7 +5090,8 @@ impl App {
         let mask = local_adjust_target_raster_vector_mask_ref(layer, target)?;
         if let Some(selected) = self.local_adjust_selected_shape
             && let Some(shape) = mask.shapes.get(selected)
-            && let Some(handle) = hit_local_adjust_shape_handles(*shape, point)
+            && let Some(handle) =
+                hit_local_adjust_shape_handles(*shape, point, handle_hit_radius_px)
         {
             return Some((selected, handle));
         }
@@ -5332,11 +5532,16 @@ impl App {
                 match self.local_adjust_mask_tool {
                     LocalAdjustMaskTool::Select => {
                         let point = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
+                        let handle_hit_radius_px =
+                            local_adjust_image_layout(image_rect, image_dims, zoom_pan)
+                                .map(|(scale, _)| (12.0 / scale.max(0.001)).clamp(12.0, 96.0))
+                                .unwrap_or(12.0);
                         if let Some((shape_idx, handle)) = self.hit_test_local_adjust_mask_shapes(
                             fs_idx,
                             layer_idx,
                             target,
                             [point.0, point.1],
+                            handle_hit_radius_px,
                         ) {
                             self.local_adjust_shape_drag_before_layers =
                                 self.local_adjust_page_layers.get(&fs_idx).cloned();
@@ -5560,6 +5765,28 @@ impl App {
         let image_dims = local_adjust_image_dims(self, fs_idx);
         let painter = ui.painter();
         let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 226, 120));
+        let source_pixels = self.current_local_adjust_source_pixels(fs_idx);
+        let alt_down = ui.ctx().input(|i| i.modifiers.alt);
+        if local_adjust_mask_preview_active(
+            self.local_adjust_mode,
+            self.local_adjust_show_mask,
+            alt_down,
+        ) && let Some((_, drawn_rect)) =
+            local_adjust_image_layout(image_rect, image_dims, zoom_pan)
+        {
+            draw_local_adjust_mask_preview_overlay(
+                painter,
+                drawn_rect,
+                layer,
+                source_pixels.as_deref(),
+                image_dims,
+                ui.ctx().input(|i| i.time) as f32,
+            );
+            if matches!(layer.mask, local_adjust_core::LocalMask::Segmentation(_)) {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
         let shape_to_screen =
             local_adjust_image_layout(image_rect, image_dims, zoom_pan).map(|(_, drawn_rect)| {
                 let w = image_dims.0.max(1) as f32;
@@ -5796,6 +6023,7 @@ impl App {
         let mut changed = false;
         let mut selected_after: Option<usize> = None;
         let mut undo_summary: Option<String> = None;
+        let mut auto_generate_after_change: Option<(usize, MaskKind)> = None;
 
         let image_dims = local_adjust_image_dims(self, fs_idx);
         if let Some(mask_kind) = add_layer_mask {
@@ -5805,6 +6033,9 @@ impl App {
                 image_dims,
             ));
             selected_after = Some(layers.len().saturating_sub(1));
+            if matches!(mask_kind, MaskKind::Subject | MaskKind::Segmentation) {
+                auto_generate_after_change = Some((layers.len().saturating_sub(1), mask_kind));
+            }
             changed = true;
             undo_summary.get_or_insert_with(|| "補正レイヤー追加".to_string());
             self.show_feedback_toast(format!("補正レイヤーを追加しました: {}", mask_kind.label()));
@@ -5842,6 +6073,9 @@ impl App {
                 _ => LocalAdjustMaskEditTarget::None,
             };
             self.local_adjust_selected_shape = None;
+            if matches!(mask_kind, MaskKind::Subject | MaskKind::Segmentation) {
+                auto_generate_after_change = Some((layer_idx, mask_kind));
+            }
             self.show_feedback_toast(format!("マスク種類を変更: {}", mask_kind.label()));
         }
         if let Some((layer_idx, enabled)) = set_enabled {
@@ -5952,6 +6186,19 @@ impl App {
                 {
                     self.local_adjust_selected_layers.insert(fs_idx, selected);
                 }
+            }
+        }
+        if let Some((layer_idx, mask_kind)) = auto_generate_after_change {
+            match mask_kind {
+                MaskKind::Subject => {
+                    self.start_local_adjust_subject_segmentation(fs_idx, layer_idx)
+                }
+                MaskKind::Segmentation => self.start_local_adjust_region_segmentation(
+                    fs_idx,
+                    layer_idx,
+                    LocalAdjustRegionSegmentationScope::Full,
+                ),
+                _ => {}
             }
         }
         if let Some(visible) = effect_requests.set_effect_position_handles_visible {
@@ -6361,66 +6608,72 @@ impl App {
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        egui::Window::new("補正レイヤーを追加")
-            .order(egui::Order::Debug)
-            .frame(dialog_frame)
-            .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
-            .collapsible(false)
-            .resizable(true)
-            .default_width(500.0)
-            .default_height(390.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                *ui.visuals_mut() = egui::Visuals::dark();
-                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
-                ui.label(
+        with_local_adjust_dark_window_style(ctx, || {
+            egui::Window::new("補正レイヤーを追加")
+                .order(egui::Order::Debug)
+                .frame(dialog_frame)
+                .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
+                .collapsible(false)
+                .resizable(true)
+                .default_width(500.0)
+                .default_height(390.0)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    *ui.visuals_mut() = egui::Visuals::dark();
+                    ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                    ui.label(
                     egui::RichText::new(
                         "使いたいマスク種類を選んでください。クリックするとレイヤーを追加します。",
                     )
                     .size(11.0)
                     .color(egui::Color32::from_gray(180)),
                 );
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .max_height(320.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for group in MASK_GROUPS {
-                            ui.label(
-                                egui::RichText::new(group.title)
-                                    .size(13.0)
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
-                            );
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                                for &kind in group.kinds {
-                                    let response = ui
-                                        .add_sized(
-                                            LOCAL_ADJUST_MASK_PICKER_BUTTON_SIZE,
-                                            egui::Button::new(
-                                                egui::RichText::new(kind.label())
-                                                    .size(12.0)
-                                                    .strong(),
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for group in MASK_GROUPS {
+                                ui.label(
+                                    egui::RichText::new(group.title)
+                                        .size(13.0)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                                    for &kind in group.kinds {
+                                        let response = ui
+                                            .add_sized(
+                                                LOCAL_ADJUST_MASK_PICKER_BUTTON_SIZE,
+                                                egui::Button::new(
+                                                    egui::RichText::new(kind.label())
+                                                        .size(12.0)
+                                                        .strong(),
+                                                )
+                                                .wrap(),
                                             )
-                                            .wrap(),
-                                        )
-                                        .on_hover_text(kind.description());
-                                    if response.clicked() {
-                                        add_requested = Some(kind);
+                                            .on_hover_text(kind.description());
+                                        if response.clicked() {
+                                            add_requested = Some(kind);
+                                        }
                                     }
-                                }
-                            });
-                            ui.add_space(6.0);
-                        }
-                        let (w, h) = image_dims;
-                        ui.label(
-                            egui::RichText::new(format!("対象画像: {} x {}", w.max(1), h.max(1)))
+                                });
+                                ui.add_space(6.0);
+                            }
+                            let (w, h) = image_dims;
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "対象画像: {} x {}",
+                                    w.max(1),
+                                    h.max(1)
+                                ))
                                 .size(10.0)
                                 .color(egui::Color32::from_gray(160)),
-                        );
-                    });
-            });
+                            );
+                        });
+                });
+        });
         if let Some(kind) = add_requested {
             *add_layer_mask = Some(kind);
             open = false;
@@ -6455,69 +6708,71 @@ impl App {
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        egui::Window::new("マスク種類変更")
-            .order(egui::Order::Debug)
-            .frame(dialog_frame)
-            .default_pos(ctx.content_rect().min + egui::vec2(70.0, 54.0))
-            .collapsible(false)
-            .resizable(true)
-            .default_width(500.0)
-            .default_height(420.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                *ui.visuals_mut() = egui::Visuals::dark();
-                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
-                ui.checkbox(&mut keep_manual_override, "追加/削除マスクを維持");
-                ui.label(
-                    egui::RichText::new(
-                        "加工内容は残したまま、選択中レイヤーのベースマスクだけを変更します。",
-                    )
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(180)),
-                );
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .max_height(320.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for group in MASK_GROUPS {
-                            ui.label(
-                                egui::RichText::new(group.title)
-                                    .size(13.0)
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
-                            );
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                                for &kind in group.kinds {
-                                    let is_current = kind == current_kind;
-                                    let response = ui
-                                        .add_enabled_ui(!is_current, |ui| {
-                                            ui.add_sized(
-                                                LOCAL_ADJUST_MASK_PICKER_BUTTON_SIZE,
-                                                egui::Button::new(
-                                                    egui::RichText::new(kind.label())
-                                                        .size(12.0)
-                                                        .strong(),
+        with_local_adjust_dark_window_style(ctx, || {
+            egui::Window::new("マスク種類変更")
+                .order(egui::Order::Debug)
+                .frame(dialog_frame)
+                .default_pos(ctx.content_rect().min + egui::vec2(70.0, 54.0))
+                .collapsible(false)
+                .resizable(true)
+                .default_width(500.0)
+                .default_height(420.0)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    *ui.visuals_mut() = egui::Visuals::dark();
+                    ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                    ui.checkbox(&mut keep_manual_override, "追加/削除マスクを維持");
+                    ui.label(
+                        egui::RichText::new(
+                            "加工内容は残したまま、選択中レイヤーのベースマスクだけを変更します。",
+                        )
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(180)),
+                    );
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for group in MASK_GROUPS {
+                                ui.label(
+                                    egui::RichText::new(group.title)
+                                        .size(13.0)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                                    for &kind in group.kinds {
+                                        let is_current = kind == current_kind;
+                                        let response = ui
+                                            .add_enabled_ui(!is_current, |ui| {
+                                                ui.add_sized(
+                                                    LOCAL_ADJUST_MASK_PICKER_BUTTON_SIZE,
+                                                    egui::Button::new(
+                                                        egui::RichText::new(kind.label())
+                                                            .size(12.0)
+                                                            .strong(),
+                                                    )
+                                                    .wrap(),
                                                 )
-                                                .wrap(),
-                                            )
-                                        })
-                                        .inner
-                                        .on_hover_text(if is_current {
-                                            "現在のマスク種類です。"
-                                        } else {
-                                            kind.description()
-                                        });
-                                    if response.clicked() {
-                                        selected_kind = Some(kind);
+                                            })
+                                            .inner
+                                            .on_hover_text(if is_current {
+                                                "現在のマスク種類です。"
+                                            } else {
+                                                kind.description()
+                                            });
+                                        if response.clicked() {
+                                            selected_kind = Some(kind);
+                                        }
                                     }
-                                }
-                            });
-                            ui.add_space(6.0);
-                        }
-                    });
-            });
+                                });
+                                ui.add_space(6.0);
+                            }
+                        });
+                });
+        });
         if let Some(kind) = selected_kind {
             *change_layer_mask = Some((selected_layer, kind, keep_manual_override));
             open = false;
@@ -6547,89 +6802,92 @@ impl App {
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        egui::Window::new("加工内容を選択")
-            .order(egui::Order::Debug)
-            .frame(dialog_frame)
-            .default_pos(ctx.content_rect().min + egui::vec2(80.0, 64.0))
-            .collapsible(false)
-            .resizable(true)
-            .default_size(egui::vec2(860.0, 560.0))
-            .min_size(egui::vec2(560.0, 360.0))
-            .open(&mut open)
-            .show(ctx, |ui| {
-                *ui.visuals_mut() = egui::Visuals::dark();
-                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        egui::vec2((ui.available_width() - 32.0).max(120.0), 24.0),
-                        egui::TextEdit::singleline(effect_query)
-                            .hint_text("効果名で検索")
-                            .desired_width(f32::INFINITY),
-                    );
-                    if ui
-                        .add_enabled(!effect_query.is_empty(), egui::Button::new("×"))
-                        .on_hover_text("検索をクリア")
-                        .clicked()
-                    {
-                        effect_query.clear();
-                    }
-                });
-                ui.separator();
-                let query = effect_query.trim();
-                egui::ScrollArea::vertical()
-                    .max_height(440.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let button_width = effect_picker_button_width(ui.available_width());
-                        let mut any_effect = false;
-                        for group in EFFECT_GROUPS {
-                            let matched: Vec<EffectKind> = group
-                                .kinds
-                                .iter()
-                                .copied()
-                                .filter(|kind| effect_picker_matches_query(*kind, query))
-                                .collect();
-                            if matched.is_empty() {
-                                continue;
-                            }
-                            any_effect = true;
-                            ui.label(
-                                egui::RichText::new(group.title)
-                                    .size(13.0)
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
-                            );
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                                for kind in matched {
-                                    let response = ui
-                                        .add_sized(
-                                            egui::vec2(
-                                                button_width,
-                                                LOCAL_ADJUST_EFFECT_PICKER_BUTTON_H,
-                                            ),
-                                            egui::Button::new(
-                                                egui::RichText::new(kind.picker_label()).size(12.0),
-                                            )
-                                            .wrap(),
-                                        )
-                                        .on_hover_text(kind.description());
-                                    if response.clicked() {
-                                        picked_effect = Some(kind);
-                                    }
-                                }
-                            });
-                            ui.add_space(6.0);
-                        }
-                        if !any_effect {
-                            ui.label(
-                                egui::RichText::new("該当する効果がありません")
-                                    .size(11.0)
-                                    .color(egui::Color32::from_gray(160)),
-                            );
+        with_local_adjust_dark_window_style(ctx, || {
+            egui::Window::new("加工内容を選択")
+                .order(egui::Order::Debug)
+                .frame(dialog_frame)
+                .default_pos(ctx.content_rect().min + egui::vec2(80.0, 64.0))
+                .collapsible(false)
+                .resizable(true)
+                .default_size(egui::vec2(860.0, 560.0))
+                .min_size(egui::vec2(560.0, 360.0))
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    *ui.visuals_mut() = egui::Visuals::dark();
+                    ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            egui::vec2((ui.available_width() - 32.0).max(120.0), 24.0),
+                            egui::TextEdit::singleline(effect_query)
+                                .hint_text("効果名で検索")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if ui
+                            .add_enabled(!effect_query.is_empty(), egui::Button::new("×"))
+                            .on_hover_text("検索をクリア")
+                            .clicked()
+                        {
+                            effect_query.clear();
                         }
                     });
-            });
+                    ui.separator();
+                    let query = effect_query.trim();
+                    egui::ScrollArea::vertical()
+                        .max_height(440.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let button_width = effect_picker_button_width(ui.available_width());
+                            let mut any_effect = false;
+                            for group in EFFECT_GROUPS {
+                                let matched: Vec<EffectKind> = group
+                                    .kinds
+                                    .iter()
+                                    .copied()
+                                    .filter(|kind| effect_picker_matches_query(*kind, query))
+                                    .collect();
+                                if matched.is_empty() {
+                                    continue;
+                                }
+                                any_effect = true;
+                                ui.label(
+                                    egui::RichText::new(group.title)
+                                        .size(13.0)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                                    for kind in matched {
+                                        let response = ui
+                                            .add_sized(
+                                                egui::vec2(
+                                                    button_width,
+                                                    LOCAL_ADJUST_EFFECT_PICKER_BUTTON_H,
+                                                ),
+                                                egui::Button::new(
+                                                    egui::RichText::new(kind.picker_label())
+                                                        .size(12.0),
+                                                )
+                                                .wrap(),
+                                            )
+                                            .on_hover_text(kind.description());
+                                        if response.clicked() {
+                                            picked_effect = Some(kind);
+                                        }
+                                    }
+                                });
+                                ui.add_space(6.0);
+                            }
+                            if !any_effect {
+                                ui.label(
+                                    egui::RichText::new("該当する効果がありません")
+                                        .size(11.0)
+                                        .color(egui::Color32::from_gray(160)),
+                                );
+                            }
+                        });
+                });
+        });
         if let Some(kind) = picked_effect {
             *set_layer_effect = Some((selected_layer, kind));
             open = false;
@@ -6896,6 +7154,8 @@ impl App {
                                             &mut mask_edit_target,
                                             &mut mask_paint_add,
                                             &mut mask_tool,
+                                            &mut self.local_adjust_show_source,
+                                            &mut self.local_adjust_show_mask,
                                         );
                                     });
                             },
@@ -7198,6 +7458,8 @@ impl App {
         if activate_local_adjust {
             self.adjustment_mode = false;
             self.local_adjust_mode = true;
+            self.local_adjust_show_source = false;
+            self.local_adjust_show_mask = true;
             return;
         }
         if activate_erase {
