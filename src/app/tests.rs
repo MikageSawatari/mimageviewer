@@ -4833,11 +4833,10 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.erase_mode);
     }
 
-    /// 消しゴム preview / apply / 通常表示の再生成で作業解像度が割れると、
-    /// プレビューでは白く消えた端が通常表示で MI-GAN 再生成され、黒っぽい帯になる。
-    /// AI 高解像度レイヤがあるときは、入場時点のマスク解像度も高解像度側へ合わせる。
+    /// v1.1.0 編集パイプラインでは AI は最終段へ移るため、消しゴム編集の
+    /// 作業解像度は AI cache があっても source 解像度に固定される。
     #[test]
-    fn enter_erase_mode_uses_ai_size_for_mask_when_available() {
+    fn enter_erase_mode_keeps_source_size_even_when_ai_cache_exists() {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/a.jpg");
         app.fullscreen_idx = Some(idx);
@@ -4880,18 +4879,18 @@ mod favorite_adjustment_defaults_tests {
 
         assert_eq!(
             app.erase_mask_size,
-            [4, 4],
-            "erase edit mask should match the final inpaint input size"
+            [1, 1],
+            "erase edit mask should stay at source resolution"
         );
         assert_eq!(
             app.erase_mask.as_ref().map(Vec::len),
-            Some(16),
-            "new empty mask should be allocated at the high-resolution work size"
+            Some(1),
+            "new empty mask should be allocated at the source-resolution work size"
         );
         assert_eq!(
             app.erase_base_cache.get(&idx).map(|p| p.size),
             Some([1, 1]),
-            "raw erase_base_cache is still rebuilt from fs_cache; only the edit work size changes"
+            "raw erase_base_cache is rebuilt from fs_cache"
         );
     }
 

@@ -955,6 +955,64 @@ pub(crate) fn signature_from_scan(scan: &ScannedDir) -> u64 {
     hasher.finish()
 }
 
+/// Runtime-only hash for display pipeline cache keys.
+///
+/// `DefaultHasher` is intentionally not stable across Rust releases, so these
+/// values must never be persisted. They only separate in-process render cache
+/// entries while the app is running.
+fn runtime_hash_with(f: impl FnOnce(&mut std::collections::hash_map::DefaultHasher)) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    f(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_adjust_color_ai_params(params: &crate::adjustment::AdjustParams) -> u64 {
+    use std::hash::Hash;
+    runtime_hash_with(|h| {
+        params.brightness.to_bits().hash(h);
+        params.contrast.to_bits().hash(h);
+        params.gamma.to_bits().hash(h);
+        params.saturation.to_bits().hash(h);
+        params.temperature.to_bits().hash(h);
+        params.black_point.hash(h);
+        params.white_point.hash(h);
+        params.midtone.to_bits().hash(h);
+        params.auto_mode.map(|mode| format!("{mode:?}")).hash(h);
+        params.upscale_model.hash(h);
+        params.denoise_model.hash(h);
+    })
+}
+
+fn hash_adjust_final_params(
+    params: &crate::adjustment::AdjustParams,
+    post_filter_bypassed: bool,
+) -> u64 {
+    use std::hash::Hash;
+    runtime_hash_with(|h| {
+        hash_adjust_color_ai_params(params).hash(h);
+        post_filter_bypassed.hash(h);
+        if !post_filter_bypassed {
+            format!("{:?}", params.post_filter).hash(h);
+        }
+    })
+}
+
+fn hash_crop_settings(settings: Option<crate::export_crop::CropSettings>) -> u64 {
+    use std::hash::Hash;
+    runtime_hash_with(|h| {
+        if let Some(settings) = settings {
+            settings.rect.min_x.to_bits().hash(h);
+            settings.rect.min_y.to_bits().hash(h);
+            settings.rect.max_x.to_bits().hash(h);
+            settings.rect.max_y.to_bits().hash(h);
+            settings.aspect_mode.stable_key().hash(h);
+        } else {
+            0u8.hash(h);
+        }
+    })
+}
+
 /// 3 種の検索モード。相互排他制御 (`close_other_search_bars`) 用。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SearchMode {
@@ -1668,6 +1726,75 @@ pub(crate) struct EraseResultKey {
 pub(crate) struct EraseResultCacheEntry {
     pub pixels: Arc<egui::ColorImage>,
     pub texture: egui::TextureHandle,
+}
+
+/// source 解像度で edit 系を最後まで適用した結果を識別する key。
+///
+/// AdjustParams / AI / post_filter は含めない。ここが slider drag 時に
+/// erase / local-adjust / conceal を再計算しないための境界になる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct EditResultKey {
+    pub(crate) idx: usize,
+    pub(crate) source_gen: u64,
+    pub(crate) erase_mask_gen: u64,
+    pub(crate) local_gen: u64,
+    pub(crate) conceal_mask_gen: u64,
+    pub(crate) conceal_gen: u64,
+    pub(crate) crop_hash: u64,
+}
+
+pub(crate) struct EditResultEntry {
+    pub(crate) pixels: Arc<egui::ColorImage>,
+    pub(crate) texture: egui::TextureHandle,
+}
+
+/// edit_result に色調補正を掛けた後の AI 処理結果。
+///
+/// post_filter は AI の後段なので key には含めない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FinalAiKey {
+    pub(crate) edit_key: EditResultKey,
+    pub(crate) color_ai_hash: u64,
+    pub(crate) bg: u8,
+}
+
+pub(crate) struct FinalAiPending {
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) rx: mpsc::Receiver<FinalAiResult>,
+}
+
+impl Drop for FinalAiPending {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+pub(crate) enum FinalAiResult {
+    Ready {
+        key: FinalAiKey,
+        image: egui::ColorImage,
+    },
+    Cancelled {
+        key: FinalAiKey,
+    },
+    Failed {
+        key: FinalAiKey,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FinalCompositeKey {
+    pub(crate) edit_key: EditResultKey,
+    pub(crate) params_hash: u64,
+    pub(crate) bg: u8,
+}
+
+pub(crate) struct FinalCompositeEntry {
+    pub(crate) pixels: Arc<egui::ColorImage>,
+    pub(crate) texture: egui::TextureHandle,
+    /// false は AI 完了待ち中の暫定プレビュー。AI が届いたら同じ key を上書きする。
+    pub(crate) complete: bool,
 }
 
 /// 見開きから消しゴムに入ったときのコンテキスト。Apply / Cancel で
@@ -3315,6 +3442,17 @@ pub struct App {
     /// 補正レイヤー合成結果 cache。現在 key と一致する entry だけ表示に採用する。
     pub(crate) local_adjust_cache:
         std::collections::HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>,
+    /// source 解像度の edit 完了 cache。AdjustParams / AI / post_filter は含まない。
+    pub(crate) edit_result_cache: std::collections::HashMap<EditResultKey, EditResultEntry>,
+    /// edit_result へ色調補正を掛けた後に AI を適用した pixels cache。
+    pub(crate) final_ai_cache: std::collections::HashMap<FinalAiKey, Arc<egui::ColorImage>>,
+    /// final AI 処理中。表示中ページを優先し、古い key は cancel する。
+    pub(crate) final_ai_pending: std::collections::HashMap<FinalAiKey, FinalAiPending>,
+    /// final AI 失敗 key。モデル不在 / 推論失敗時の無限再試行を避ける。
+    pub(crate) final_ai_failed: std::collections::HashSet<FinalAiKey>,
+    /// 最終 composite cache。AdjustParams 全項目 + AI + post_filter 適用後。
+    pub(crate) final_composite_cache:
+        std::collections::HashMap<FinalCompositeKey, FinalCompositeEntry>,
     /// 補正レイヤー合成 worker。idx ごとに最新 1 本だけ動かす。
     pub(crate) local_adjust_pending: std::collections::HashMap<usize, LocalAdjustRenderPending>,
     /// 選択中レイヤーだけを一時除外した補正レイヤー結果 cache。
@@ -4575,6 +4713,11 @@ impl App {
             mask_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
             local_adjust_cache: std::collections::HashMap::new(),
+            edit_result_cache: std::collections::HashMap::new(),
+            final_ai_cache: std::collections::HashMap::new(),
+            final_ai_pending: std::collections::HashMap::new(),
+            final_ai_failed: std::collections::HashSet::new(),
+            final_composite_cache: std::collections::HashMap::new(),
             local_adjust_pending: std::collections::HashMap::new(),
             local_adjust_layer_bypass_cache: std::collections::HashMap::new(),
             local_adjust_layer_bypass_pending: None,
@@ -8637,6 +8780,8 @@ impl App {
         self.local_adjust_mask_brush_before_layers = None;
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
+        self.edit_result_cache.clear();
+        self.clear_all_final_pipeline_caches();
         self.cancel_all_local_adjust_pending();
         self.local_adjust_layer_bypass_cache.clear();
         self.local_adjust_prefix_preview_cache.clear();
@@ -8648,6 +8793,8 @@ impl App {
         self.conceal_mask_generation.clear();
         self.erase_result_cache.clear();
         self.input_generation.clear();
+        self.edit_result_cache.clear();
+        self.clear_all_final_pipeline_caches();
         self.cancel_all_erase_inpaint_pending();
         // 360 度パノラマビュー: フォルダ変更で cache 全体が変わったので世代を一斉 bump
         // (§3.6.2.2)。adjustment_generation / ai_upscale_generation の HashMap
@@ -9753,6 +9900,8 @@ impl App {
         self.local_adjust_cache.clear();
         self.local_adjust_layer_bypass_cache.clear();
         self.local_adjust_prefix_preview_cache.clear();
+        self.edit_result_cache.clear();
+        self.clear_all_final_pipeline_caches();
         self.export_crop_mode = false;
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
@@ -17096,6 +17245,8 @@ impl App {
         self.conceal_base_cache.clear();
         self.conceal_cache.clear();
         self.erase_result_cache.clear();
+        self.edit_result_cache.clear();
+        self.clear_all_final_pipeline_caches();
         for (cancel, _, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -17246,6 +17397,7 @@ impl App {
     ///
     /// inpaint 入力は通常の表示パイプラインと同じく post-filter 込み、編集中の
     /// base 表示だけは精密に塗れるよう `include_post_filter=false` で呼ぶ。
+    #[allow(dead_code)] // Legacy P2.4 removal path: edit source is raw in v1.1.0.
     pub(crate) fn apply_erase_adjustments_to_source(
         &self,
         idx: usize,
@@ -17277,7 +17429,7 @@ impl App {
                 cancel.store(true, Ordering::Relaxed);
             }
         }
-        self.bump_input_generation(idx);
+        self.clear_final_pipeline_caches_for_idx(idx);
     }
 
     /// AI バックエンド設定変更をホットリロードする (Phase 3、再起動不要)。
@@ -17527,32 +17679,9 @@ impl App {
                     ],
                 );
             }
-            // AI 完了時、fs_cache ベースで先に作られた仮 adjustment_cache を無効化する
-            // (そのまま残ると次回来訪時に低解像度の補正結果が使われてしまう)。
-            // 表示中かつ現在の bg と一致するもののみ、AI 結果に対して色調補正を即座に適用（チラつき防止）
             self.adjustment_cache.remove(&idx);
             self.invalidate_compare_prepared_for_idx(idx);
-            // 360 度パノラマビュー: adjustment_cache が消えた段階で bump (§3.6.2.2)。
-            // 直後の apply_sync_adjustment が走るときはそこでも bump されるが、
-            // 走らないルート (fullscreen_idx 不一致 / bg 不一致) でも cache 状態が
-            // 変わるので必ず先に bump しておく。
             self.bump_adjustment_generation(idx);
-            // 隠蔽合成キャッシュも該当 idx を破棄 (`docs/conceal-feature-plan.md §9` の
-            // 「AI モデル変更 / AI 完了 → conceal_cache 該当 idx クリア」hook)。
-            // AI 結果が conceal の入力レイヤになるので、stale を残すと低解像度ベースの
-            // 隠蔽が固定表示されてしまう。
-            self.clear_local_adjust_caches_for_idx(idx);
-            self.clear_conceal_caches(idx);
-            if self.fullscreen_idx == Some(idx) && self.effective_upscale_bg_mode() == bg {
-                self.rescale_active_conceal_edit_to_size(idx, [w, h], "ai_complete");
-            }
-            // 消しゴム編集中の表示テクスチャも invalidate して、`ensure_erase_base_texture`
-            // が次フレームで新しい ai_upscale_cache を取り直すようにする
-            // (= AI 完了が編集中に起こった場合、解像度が低い状態に張り付くのを防ぐ)。
-            self.erase_base_tex_cache.remove(&idx);
-            if self.fullscreen_idx == Some(idx) && self.effective_upscale_bg_mode() == bg {
-                self.apply_sync_adjustment(ctx, idx, &pixels);
-            }
             // 派生キャッシュ。fs.paint は fs_cache 側から load_seq を拾うためここでは 0。
             // source_dims はダウンスケール警告用で、派生エントリは元画像の fs_cache 側を
             // 参照すればよいのでここでは None を入れておく。
@@ -17579,6 +17708,7 @@ impl App {
     /// - 先読みが全完了している場合のみ開始
     /// - すでに処理済み or pending の場合はスキップ
     /// - アップスケール時: 2K 以上の画像はスキップ
+    #[allow(dead_code)] // Legacy AI cache is kept until P2.4 staged deletion.
     pub(crate) fn maybe_start_ai_upscale(&mut self, current_idx: usize) {
         let denoise_enabled = self.ai_denoise_model.is_some();
         let upscale_enabled = self.ai_upscale_enabled;
@@ -17868,6 +17998,7 @@ impl App {
     }
 
     /// AI アップスケールキャッシュの eviction（先読み範囲外を破棄）。
+    #[allow(dead_code)] // Legacy AI cache is kept until P2.4 staged deletion.
     fn evict_ai_upscale_cache(&mut self, current_idx: usize) {
         let keep_set = self.compute_keep_set(current_idx);
         // 全 bg バリアントとも、idx が範囲外なら破棄
@@ -17903,6 +18034,7 @@ impl App {
     }
 
     /// AI アップスケールの先読み（表示中画像の前後）。
+    #[allow(dead_code)] // Legacy AI cache is kept until P2.4 staged deletion.
     fn prefetch_ai_upscale(&mut self, current_idx: usize) {
         if !self.ai_upscale_enabled && self.ai_denoise_model.is_none() {
             return;
@@ -18337,6 +18469,7 @@ impl App {
             self.export_crop_page_settings.remove(&idx);
             self.export_crop_pages.remove(&idx);
         }
+        self.clear_edit_result_caches_for_idx(idx);
     }
 
     pub(crate) fn set_export_crop_for_idx_memory_only(
@@ -18355,6 +18488,7 @@ impl App {
             self.export_crop_page_settings.remove(&idx);
             self.export_crop_pages.remove(&idx);
         }
+        self.clear_edit_result_caches_for_idx(idx);
     }
 
     pub(crate) fn export_crop_for_idx(
@@ -18430,12 +18564,50 @@ impl App {
         self.cancel_local_adjust_prefix_preview_pending();
     }
 
+    fn cancel_final_ai_for_idx(&mut self, idx: usize) {
+        let keys: Vec<FinalAiKey> = self
+            .final_ai_pending
+            .keys()
+            .copied()
+            .filter(|key| key.edit_key.idx == idx)
+            .collect();
+        for key in keys {
+            if let Some(pending) = self.final_ai_pending.remove(&key) {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn clear_edit_result_caches_for_idx(&mut self, idx: usize) {
+        self.edit_result_cache.retain(|key, _| key.idx != idx);
+        self.clear_final_pipeline_caches_for_idx(idx);
+    }
+
+    fn clear_final_pipeline_caches_for_idx(&mut self, idx: usize) {
+        self.cancel_final_ai_for_idx(idx);
+        self.final_ai_cache.retain(|key, _| key.edit_key.idx != idx);
+        self.final_ai_failed.retain(|key| key.edit_key.idx != idx);
+        self.final_composite_cache
+            .retain(|key, _| key.edit_key.idx != idx);
+    }
+
+    fn clear_all_final_pipeline_caches(&mut self) {
+        for pending in self.final_ai_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.final_ai_pending.clear();
+        self.final_ai_cache.clear();
+        self.final_ai_failed.clear();
+        self.final_composite_cache.clear();
+    }
+
     /// 補正レイヤーが変わったことを idx 単位の世代で表す。
     pub(crate) fn bump_local_adjust_generation(&mut self, idx: usize) {
         let slot = self.local_adjust_generation.entry(idx).or_insert(0);
         *slot = slot.wrapping_add(1);
         self.clear_local_adjust_caches_for_idx(idx);
         self.clear_conceal_caches(idx);
+        self.clear_edit_result_caches_for_idx(idx);
     }
 
     /// 現在世代に一致する補正レイヤー結果テクスチャを返す。
@@ -18454,6 +18626,7 @@ impl App {
             .map(|entry| Arc::clone(&entry.pixels))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn current_local_adjust_layer_bypass_key(
         &self,
         idx: usize,
@@ -18465,6 +18638,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn current_local_adjust_layer_bypass_texture(
         &self,
         idx: usize,
@@ -18498,6 +18672,7 @@ impl App {
             .map(|entry| entry.texture.clone())
     }
 
+    #[allow(dead_code)]
     fn local_adjust_layers_with_selected_layer_bypassed(
         &self,
         idx: usize,
@@ -18560,21 +18735,7 @@ impl App {
         if self.mask_pages.contains(&idx) {
             return None;
         }
-        if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx) {
-            return Some(Arc::clone(pixels));
-        }
-
-        let bg = self.effective_upscale_bg_mode();
-        if self.ai_will_apply_to(idx) {
-            if let Some(FsCacheEntry::Static { pixels, .. }) = self.ai_upscale_cache.get(&(idx, bg))
-            {
-                return Some(Arc::clone(pixels));
-            }
-        }
-        if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) {
-            return Some(Arc::clone(pixels));
-        }
-        None
+        self.current_raw_source_pixels(idx)
     }
 
     pub(crate) fn maybe_start_local_adjust_render(&mut self, idx: usize) {
@@ -18616,6 +18777,7 @@ impl App {
             .insert(idx, LocalAdjustRenderPending { key, cancel, rx });
     }
 
+    #[allow(dead_code)]
     pub(crate) fn maybe_start_local_adjust_layer_bypass_preview(
         &mut self,
         idx: usize,
@@ -18884,6 +19046,7 @@ impl App {
     /// **その 1 ページだけ** 入力が変わった場合に呼ぶ。
     pub(crate) fn clear_conceal_caches(&mut self, idx: usize) {
         self.conceal_cache.remove(&idx);
+        self.clear_edit_result_caches_for_idx(idx);
     }
 
     fn active_conceal_edit_in_progress(&self) -> bool {
@@ -18990,6 +19153,7 @@ impl App {
         self.clear_local_adjust_caches_for_idx(idx);
         self.clear_erase_preview(idx);
         self.clear_conceal_caches(idx);
+        self.clear_edit_result_caches_for_idx(idx);
     }
 
     /// 全 idx の表示入力世代を進める。バルク補正やフォルダ切替などの広域 clear 用。
@@ -19005,6 +19169,8 @@ impl App {
         self.local_adjust_prefix_preview_cache.clear();
         self.erase_preview_cache.clear();
         self.conceal_cache.clear();
+        self.edit_result_cache.clear();
+        self.clear_all_final_pipeline_caches();
     }
 
     /// 消しゴムマスクが変わったことを idx 単位の世代で表す。
@@ -19016,6 +19182,7 @@ impl App {
         self.clear_local_adjust_caches_for_idx(idx);
         self.clear_erase_preview(idx);
         self.clear_conceal_caches(idx);
+        self.clear_edit_result_caches_for_idx(idx);
     }
 
     /// 隠蔽マスクが変わったことを idx 単位の世代で表す。
@@ -19023,6 +19190,7 @@ impl App {
         let slot = self.conceal_mask_generation.entry(idx).or_insert(0);
         *slot = slot.wrapping_add(1);
         self.clear_conceal_caches(idx);
+        self.clear_edit_result_caches_for_idx(idx);
     }
 
     /// 現在の input / erase mask 世代から、消しゴム確定結果 cache key を作る。
@@ -19058,27 +19226,23 @@ impl App {
             .map(|entry| std::sync::Arc::clone(&entry.pixels))
     }
 
+    /// Decode result at source resolution before any edit / adjustment / AI stage.
+    pub(crate) fn current_raw_source_pixels(&self, idx: usize) -> Option<Arc<egui::ColorImage>> {
+        match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => Some(Arc::clone(pixels)),
+            Some(FsCacheEntry::Animated {
+                frame_pixels,
+                current_frame,
+                ..
+            }) => frame_pixels.get(*current_frame).cloned(),
+            _ => None,
+        }
+    }
+
     /// 消しゴム編集中の表示用テクスチャを返す。
     ///
-    /// **表示 source の優先順位** (2026-05 ユーザー報告対応):
-    /// 1. `ai_upscale_cache[(idx, bg)]` (= AI アップスケール後の高解像度 pixels)
-    /// 2. `erase_base_cache[idx]` (= MI-GAN inpaint 入力用の pre-erase pixels)
-    ///
-    /// パイプライン上は **画像補正 → 消しゴム → 隠蔽** の順なので、消しゴム編集中も
-    /// 「画像補正 + AI アップスケール後」の高解像度状態を base として見せるのが正しい。
-    ///
-    /// 旧版 (Phase 4) は `erase_base_cache` を直接使っていたが、`auto_apply_saved_mask`
-    /// 経由で populate されると raw fs_cache が入る → 通常表示も raw 解像度に化ける問題が
-    /// あった。`erase_base_cache` 自体は MI-GAN inpaint の入力として保持し、表示 source は
-    /// AI upscale 結果を優先する形に分離した。
-    ///
-    /// 取得した source pixels に `effective_params(idx)` の色補正を
-    /// `apply_adjustments_fast` で適用してからテクスチャ化。post_filter は erase_mode 中
-    /// バイパス (`enter_erase_mode` で `post_filter_bypassed = true`) なのでここでも飛ばす。
-    ///
-    /// 出来上がったテクスチャは `erase_base_tex_cache` に idx 単位でキャッシュ。
-    /// 色補正変更時 (`clear_adjustment_caches`) と AI 完了時 (`apply_ai_upscale_result`
-    /// 経由) に invalidate される。
+    /// v1.1.0 の編集パイプラインでは消しゴムは常に source 解像度で動く。
+    /// ここで AdjustParams / AI / post_filter は適用せず、最終段 composite に任せる。
     pub(crate) fn ensure_erase_base_texture(
         &mut self,
         ctx: &egui::Context,
@@ -19087,21 +19251,15 @@ impl App {
         if let Some(tex) = self.erase_base_tex_cache.get(&idx) {
             return Some(tex.clone());
         }
-        // AI upscale 結果を優先取得 (= 高解像度)。なければ erase_base_cache (= raw 等)。
-        let bg = self.erase_upscale_bg_mode(idx);
-        let ai_pixels = self.ai_upscale_cache.get(&(idx, bg)).and_then(|e| match e {
-            FsCacheEntry::Static { pixels, .. } => Some(Arc::clone(pixels)),
-            _ => None,
-        });
-        let source_pixels = match ai_pixels {
-            Some(p) => p,
-            None => self.erase_base_cache.get(&idx)?.clone(),
-        };
+        let source_pixels = self
+            .erase_base_cache
+            .get(&idx)
+            .cloned()
+            .or_else(|| self.current_raw_source_pixels(idx))?;
         let source_pixels = self.black_flatten_erase_source_if_needed(idx, source_pixels);
-        let adjusted = self.apply_erase_adjustments_to_source(idx, source_pixels, false);
         let tex = ctx.load_texture(
             format!("erase_base_display_{idx}"),
-            (*adjusted).clone(),
+            (*source_pixels).clone(),
             egui::TextureOptions::LINEAR,
         );
         self.erase_base_tex_cache.insert(idx, tex.clone());
@@ -19110,9 +19268,8 @@ impl App {
 
     /// 隠蔽合成の入力になる現在の表示ソースを返す。
     ///
-    /// 表示パイプライン上は `erase_result > adjustment > ai_upscale > fs`。隠蔽モード
-    /// 入場時とプレビュー合成時で同じ優先順位を使い、AI アップスケール完了前後で
-    /// マスク解像度だけが取り残される状態を避ける。
+    /// v1.1.0 では AdjustParams / AI / post_filter は隠蔽より後段に移るため、
+    /// 入力は source 解像度の edit chain (`local_adjust > erase_result > raw`) に固定する。
     pub(crate) fn current_conceal_source_pixels(
         &self,
         idx: usize,
@@ -19120,27 +19277,17 @@ impl App {
         if let Some(pixels) = self.current_local_adjust_pixels(idx) {
             return Some((pixels, "local_adjust"));
         }
+        if self.has_active_local_adjust_layers(idx) {
+            return None;
+        }
         if let Some(pixels) = self.current_erase_result_pixels(idx) {
             return Some((pixels, "erase_result"));
         }
         if self.mask_pages.contains(&idx) {
             return None;
         }
-        if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx) {
-            return Some((Arc::clone(pixels), "adjustment"));
-        }
-
-        let bg = self.effective_upscale_bg_mode();
-        if self.ai_will_apply_to(idx) {
-            if let Some(FsCacheEntry::Static { pixels, .. }) = self.ai_upscale_cache.get(&(idx, bg))
-            {
-                return Some((Arc::clone(pixels), "ai_upscale"));
-            }
-        }
-        if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) {
-            return Some((Arc::clone(pixels), "fs"));
-        }
-        None
+        self.current_raw_source_pixels(idx)
+            .map(|pixels| (pixels, "fs"))
     }
 
     /// 隠蔽グローバルパラメータが変わったことを世代番号で表現する (lazy eviction)。
@@ -19150,6 +19297,8 @@ impl App {
     /// UI ヒッチを避けるための設計 (Codex P2、`docs/conceal-feature-plan.md §9.1`)。
     pub(crate) fn bump_conceal_generation(&mut self) {
         self.conceal_generation = self.conceal_generation.wrapping_add(1);
+        self.edit_result_cache.clear();
+        self.clear_all_final_pipeline_caches();
     }
 
     /// 表示パイプライン用: 該当 idx に隠蔽マスクが保存されていれば、現在の
@@ -19332,6 +19481,523 @@ impl App {
             },
         );
         Some(tex)
+    }
+
+    fn current_edit_result_key_for_size(
+        &self,
+        idx: usize,
+        source_size: [usize; 2],
+    ) -> EditResultKey {
+        let crop = self.export_crop_for_idx(idx, source_size);
+        EditResultKey {
+            idx,
+            source_gen: self.input_generation.get(&idx).copied().unwrap_or(0),
+            erase_mask_gen: self.erase_mask_generation.get(&idx).copied().unwrap_or(0),
+            local_gen: self.local_adjust_generation.get(&idx).copied().unwrap_or(0),
+            conceal_mask_gen: self.conceal_mask_generation.get(&idx).copied().unwrap_or(0),
+            conceal_gen: self.conceal_generation,
+            crop_hash: hash_crop_settings(crop),
+        }
+    }
+
+    pub(crate) fn ensure_edit_result_pixels(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<(EditResultKey, Arc<egui::ColorImage>)> {
+        let source_size = self.current_raw_source_pixels(idx)?.size;
+        let key = self.current_edit_result_key_for_size(idx, source_size);
+        if let Some(entry) = self.edit_result_cache.get(&key) {
+            return Some((key, Arc::clone(&entry.pixels)));
+        }
+
+        let mut pixels = if self.mask_pages.contains(&idx) {
+            let _ = self.ensure_erase_result_texture(ctx, idx)?;
+            self.current_erase_result_pixels(idx)?
+        } else {
+            self.current_raw_source_pixels(idx)?
+        };
+
+        if self.has_active_local_adjust_layers(idx) {
+            self.maybe_start_local_adjust_render(idx);
+            pixels = self.current_local_adjust_pixels(idx)?;
+        }
+
+        let should_apply_conceal = self.conceal_pages.contains(&idx)
+            || (self.conceal_mode
+                && self.conceal_preview_active
+                && self.fullscreen_idx == Some(idx));
+        if should_apply_conceal {
+            if self.ensure_conceal_texture(ctx, idx).is_some()
+                && let Some(entry) = self.conceal_cache.get(&idx)
+            {
+                pixels = Arc::clone(&entry.pixels);
+            }
+        }
+
+        if let Some(crop) = self.export_crop_for_idx(idx, source_size) {
+            let cropped = crate::export_crop::crop_color_image(&pixels, crop.rect).ok()?;
+            pixels = Arc::new(cropped);
+        }
+
+        let upload = clamp_for_gpu(&pixels);
+        let texture = ctx.load_texture(
+            format!(
+                "edit_result_{}_{}_{}_{}_{}_{}_{}",
+                key.idx,
+                key.source_gen,
+                key.erase_mask_gen,
+                key.local_gen,
+                key.conceal_mask_gen,
+                key.conceal_gen,
+                key.crop_hash
+            ),
+            upload.into_owned(),
+            egui::TextureOptions::LINEAR,
+        );
+        self.edit_result_cache.insert(
+            key,
+            EditResultEntry {
+                pixels: Arc::clone(&pixels),
+                texture,
+            },
+        );
+        Some((key, pixels))
+    }
+
+    pub(crate) fn current_edit_result_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
+        self.edit_result_cache
+            .iter()
+            .find(|(key, _)| key.idx == idx)
+            .map(|(_, entry)| entry.texture.clone())
+    }
+
+    fn final_ai_key_for_pixels(
+        &self,
+        edit_key: EditResultKey,
+        size: [usize; 2],
+        params: &crate::adjustment::AdjustParams,
+    ) -> Option<FinalAiKey> {
+        let [w, h] = size;
+        let w = w as u32;
+        let h = h as u32;
+        let upscale_enabled = params.upscale_model_kind().is_some()
+            && crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px);
+        let denoise_enabled = params.denoise_model_kind().is_some()
+            && crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px);
+        if !upscale_enabled && !denoise_enabled {
+            return None;
+        }
+        let bg = if upscale_enabled && self.fs_transparent_bg_mode == 1 {
+            1
+        } else {
+            0
+        };
+        Some(FinalAiKey {
+            edit_key,
+            color_ai_hash: hash_adjust_color_ai_params(params),
+            bg,
+        })
+    }
+
+    fn maybe_start_final_ai(
+        &mut self,
+        idx: usize,
+        key: FinalAiKey,
+        source_image: Arc<egui::ColorImage>,
+        params: crate::adjustment::AdjustParams,
+    ) {
+        if self.final_ai_cache.contains_key(&key)
+            || self.final_ai_pending.contains_key(&key)
+            || self.final_ai_failed.contains(&key)
+        {
+            return;
+        }
+
+        if self.fullscreen_idx == Some(idx) {
+            let to_cancel: Vec<FinalAiKey> = self
+                .final_ai_pending
+                .keys()
+                .copied()
+                .filter(|pending_key| pending_key.edit_key.idx != idx || *pending_key != key)
+                .collect();
+            for pending_key in to_cancel {
+                if let Some(pending) = self.final_ai_pending.get(&pending_key) {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        if self
+            .final_ai_pending
+            .values()
+            .any(|pending| !pending.cancel.load(Ordering::Relaxed))
+        {
+            return;
+        }
+
+        let [w, h] = source_image.size;
+        let w_u32 = w as u32;
+        let h_u32 = h as u32;
+        let upscale_request = params.upscale_model_kind();
+        let denoise_request = params.denoise_model_kind();
+        let upscale_in_range = upscale_request.is_some()
+            && crate::ai::upscale::should_process(w_u32, h_u32, self.settings.ai_upscale_skip_px);
+        let denoise_in_range = denoise_request.is_some()
+            && crate::ai::upscale::should_process(w_u32, h_u32, self.settings.ai_denoise_skip_px);
+        if !upscale_in_range && !denoise_in_range {
+            return;
+        }
+
+        self.ensure_ai_runtime();
+        let Some(runtime) = self.ai_runtime.clone() else {
+            return;
+        };
+        self.maybe_start_trt_worker_pool_for_ai_use(&runtime);
+        let manager = self.ai_model_manager.clone();
+
+        let denoise_model = if denoise_in_range {
+            let Some(kind) = denoise_request else {
+                return;
+            };
+            let Some(model_path) = manager.model_path(kind) else {
+                return;
+            };
+            if !runtime.is_loaded(kind)
+                && let Err(err) = runtime.load_model(kind, &model_path)
+            {
+                crate::logger::log(format!("[AI] Final denoise model load failed: {err}"));
+                return;
+            }
+            Some(kind)
+        } else {
+            None
+        };
+
+        let upscale_model = if upscale_in_range {
+            let Some(upscale_request) = upscale_request else {
+                return;
+            };
+            let kind = match upscale_request {
+                Some(kind) => kind,
+                None => {
+                    let category = self
+                        .ai_classify_cache
+                        .get(&idx)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            let dynimg = color_image_to_dynamic(&source_image);
+                            let cat = crate::ai::classify::classify_heuristic(&dynimg);
+                            self.ai_classify_cache.insert(idx, cat);
+                            cat
+                        });
+                    category.preferred_upscale_model()
+                }
+            };
+            match manager.model_path(kind) {
+                Some(model_path) => {
+                    if !runtime.is_loaded(kind)
+                        && let Err(err) = runtime.load_model(kind, &model_path)
+                    {
+                        crate::logger::log(format!("[AI] Final upscale model load failed: {err}"));
+                        None
+                    } else {
+                        Some(kind)
+                    }
+                }
+                None => {
+                    crate::logger::log(format!(
+                        "[AI] Final upscale model {:?} not available for idx={idx}",
+                        kind
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if denoise_model.is_none() && upscale_model.is_none() {
+            self.final_ai_failed.insert(key);
+            return;
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let bg_rgb: [u8; 3] = if key.bg == 1 {
+            [255, 255, 255]
+        } else {
+            [0, 0, 0]
+        };
+        let composite_first = upscale_model.is_some();
+        let spawn_result = std::thread::Builder::new()
+            .name("final-ai-composite".to_string())
+            .spawn(move || {
+                let mut dynimg = if composite_first {
+                    color_image_to_dynamic_composited(&source_image, bg_rgb)
+                } else {
+                    color_image_to_dynamic(&source_image)
+                };
+
+                if let Some(denoise_kind) = denoise_model {
+                    match crate::ai::denoise::denoise(
+                        &runtime,
+                        denoise_kind,
+                        &dynimg,
+                        &cancel_worker,
+                    ) {
+                        Ok(denoised) => {
+                            if upscale_model.is_some() {
+                                dynimg = color_image_to_dynamic(&denoised);
+                            } else {
+                                let _ = tx.send(FinalAiResult::Ready {
+                                    key,
+                                    image: denoised,
+                                });
+                                return;
+                            }
+                        }
+                        Err(err) => {
+                            if cancel_worker.load(Ordering::Relaxed) {
+                                let _ = tx.send(FinalAiResult::Cancelled { key });
+                                return;
+                            }
+                            if upscale_model.is_none() {
+                                let _ = tx.send(FinalAiResult::Failed {
+                                    key,
+                                    error: err.to_string(),
+                                });
+                                return;
+                            }
+                            crate::logger::log(format!(
+                                "[AI] Final denoise failed for idx={}: {err}",
+                                key.edit_key.idx
+                            ));
+                        }
+                    }
+                }
+
+                if let Some(upscale_kind) = upscale_model {
+                    match crate::ai::upscale::upscale(
+                        &runtime,
+                        upscale_kind,
+                        &dynimg,
+                        &cancel_worker,
+                    ) {
+                        Ok(image) => {
+                            let _ = tx.send(FinalAiResult::Ready { key, image });
+                        }
+                        Err(err) => {
+                            if cancel_worker.load(Ordering::Relaxed) {
+                                let _ = tx.send(FinalAiResult::Cancelled { key });
+                            } else {
+                                let _ = tx.send(FinalAiResult::Failed {
+                                    key,
+                                    error: err.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            });
+        if let Err(err) = spawn_result {
+            crate::logger::log(format!("final_ai: worker spawn failed: {err}"));
+            return;
+        }
+
+        self.final_ai_pending
+            .insert(key, FinalAiPending { cancel, rx });
+        crate::logger::log(format!(
+            "[AI] Final AI started idx={idx} bg={} denoise={:?} upscale={:?}",
+            key.bg, denoise_model, upscale_model
+        ));
+    }
+
+    fn apply_final_post_filter(
+        &self,
+        src: &egui::ColorImage,
+        params: &crate::adjustment::AdjustParams,
+    ) -> egui::ColorImage {
+        let apply_pf =
+            !self.post_filter_bypassed && params.post_filter != crate::adjustment::PostFilter::None;
+        if apply_pf {
+            crate::post_filter::apply(src, params.post_filter)
+        } else {
+            src.clone()
+        }
+    }
+
+    pub(crate) fn ensure_final_composite_texture(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
+        let params = self.effective_params(idx).clone();
+        let final_key = FinalCompositeKey {
+            edit_key,
+            params_hash: hash_adjust_final_params(&params, self.post_filter_bypassed),
+            bg: self
+                .final_ai_key_for_pixels(edit_key, edit_pixels.size, &params)
+                .map_or(0, |key| key.bg),
+        };
+        let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, &params);
+        let ai_ready = ai_key.and_then(|key| self.final_ai_cache.get(&key).cloned());
+        if let Some(entry) = self.final_composite_cache.get(&final_key) {
+            if entry.complete || ai_ready.is_none() {
+                return Some(entry.texture.clone());
+            }
+        }
+
+        let adjusted = if params.is_color_identity() {
+            Arc::clone(&edit_pixels)
+        } else {
+            Arc::new(crate::adjustment::apply_adjustments_fast(
+                &edit_pixels,
+                &params,
+            ))
+        };
+
+        let (base_pixels, complete) = match (ai_key, ai_ready) {
+            (Some(_), Some(pixels)) => (pixels, true),
+            (Some(key), None) if self.final_ai_failed.contains(&key) => {
+                (Arc::clone(&adjusted), true)
+            }
+            (Some(key), None) => {
+                self.maybe_start_final_ai(idx, key, Arc::clone(&adjusted), params.clone());
+                (Arc::clone(&adjusted), false)
+            }
+            (None, _) => (Arc::clone(&adjusted), true),
+        };
+
+        let post_filtered = Arc::new(self.apply_final_post_filter(&base_pixels, &params));
+        let upload = clamp_for_gpu(&post_filtered);
+        let tex_opts = if !self.post_filter_bypassed && params.post_filter.needs_nearest_sampler() {
+            egui::TextureOptions::NEAREST
+        } else {
+            egui::TextureOptions::LINEAR
+        };
+        let texture = ctx.load_texture(
+            format!(
+                "final_composite_{}_{}_{}_{}",
+                final_key.edit_key.idx,
+                final_key.edit_key.source_gen,
+                final_key.params_hash,
+                final_key.bg
+            ),
+            upload.into_owned(),
+            tex_opts,
+        );
+        self.final_composite_cache.insert(
+            final_key,
+            FinalCompositeEntry {
+                pixels: post_filtered,
+                texture: texture.clone(),
+                complete,
+            },
+        );
+        Some(texture)
+    }
+
+    pub(crate) fn ensure_final_composite_pixels(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<Arc<egui::ColorImage>> {
+        let texture = self.ensure_final_composite_texture(ctx, idx)?;
+        let _ = texture;
+        let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
+        let params = self.effective_params(idx).clone();
+        let final_key = FinalCompositeKey {
+            edit_key,
+            params_hash: hash_adjust_final_params(&params, self.post_filter_bypassed),
+            bg: self
+                .final_ai_key_for_pixels(edit_key, edit_pixels.size, &params)
+                .map_or(0, |key| key.bg),
+        };
+        self.final_composite_cache
+            .get(&final_key)
+            .filter(|entry| entry.complete)
+            .map(|entry| Arc::clone(&entry.pixels))
+    }
+
+    pub(crate) fn current_final_composite_texture(
+        &self,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        self.final_composite_cache
+            .iter()
+            .find(|(key, _)| key.edit_key.idx == idx)
+            .map(|(_, entry)| entry.texture.clone())
+    }
+
+    pub(crate) fn poll_final_ai(&mut self, ctx: &egui::Context) {
+        let mut completed = Vec::new();
+        let mut disconnected = Vec::new();
+        for (&key, pending) in &self.final_ai_pending {
+            match pending.rx.try_recv() {
+                Ok(result) => completed.push((key, result)),
+                Err(mpsc::TryRecvError::Disconnected) => disconnected.push(key),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        for key in disconnected {
+            self.final_ai_pending.remove(&key);
+        }
+
+        let mut repaint = false;
+        for (pending_key, result) in completed {
+            self.final_ai_pending.remove(&pending_key);
+            match result {
+                FinalAiResult::Ready { key, image } => {
+                    self.final_ai_cache.insert(key, Arc::new(image));
+                    self.final_composite_cache.retain(|cache_key, entry| {
+                        cache_key.edit_key != key.edit_key || entry.complete
+                    });
+                    repaint = true;
+                }
+                FinalAiResult::Cancelled { key } => {
+                    self.final_ai_failed.remove(&key);
+                }
+                FinalAiResult::Failed { key, error } => {
+                    self.final_ai_failed.insert(key);
+                    crate::logger::log(format!(
+                        "[AI] Final AI failed idx={} error={error}",
+                        key.edit_key.idx
+                    ));
+                    repaint = true;
+                }
+            }
+        }
+        if repaint {
+            ctx.request_repaint();
+        }
+        if !self.final_ai_pending.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn evict_final_pipeline_cache(&mut self, current_idx: usize) {
+        let keep_set = self.compute_keep_set(current_idx);
+        self.edit_result_cache
+            .retain(|key, _| keep_set.contains(&key.idx));
+        self.final_ai_cache
+            .retain(|key, _| keep_set.contains(&key.edit_key.idx));
+        self.final_ai_failed
+            .retain(|key| keep_set.contains(&key.edit_key.idx));
+        self.final_composite_cache
+            .retain(|key, _| keep_set.contains(&key.edit_key.idx));
+        let to_cancel: Vec<FinalAiKey> = self
+            .final_ai_pending
+            .keys()
+            .copied()
+            .filter(|key| !keep_set.contains(&key.edit_key.idx))
+            .collect();
+        for key in to_cancel {
+            if let Some(pending) = self.final_ai_pending.get(&key) {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     /// サイドカーからまだ DB に無いエントリを取り込み、両 DB を更新する。
@@ -20135,8 +20801,7 @@ impl App {
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
         self.thumb_adjust_tex.remove(&idx);
-        self.clear_local_adjust_caches_for_idx(idx);
-        self.clear_conceal_caches(idx);
+        self.clear_final_pipeline_caches_for_idx(idx);
         self.erase_base_tex_cache.remove(&idx);
     }
 
@@ -20144,6 +20809,7 @@ impl App {
     /// 表示中の画像のみ処理し、先読み分はページ切替時に処理する。
     /// 見開き Double 表示中はペアの両方の idx について実行を許可する。
     /// `spread_pair` は呼び出し側で計算済みのものを受け取って毎フレームの再計算を避ける。
+    #[allow(dead_code)] // Legacy adjustment cache is kept until P2.4 staged deletion.
     pub(crate) fn maybe_apply_adjustment(
         &mut self,
         ctx: &egui::Context,
@@ -20236,13 +20902,7 @@ impl App {
         self.thumb_adjust_tex.remove(&idx);
         // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
         self.bump_adjustment_generation(idx);
-        // 隠蔽合成: 上位レイヤ (adj) の入力が変わったので、`conceal_cache[idx]` も
-        // stale 扱いにする (`docs/conceal-feature-plan.md §9` 表)。
-        self.clear_local_adjust_caches_for_idx(idx);
-        self.clear_conceal_caches(idx);
-        // 消しゴム編集中の base テクスチャ (= 色補正適用済 raw) も同じく stale。
-        // 次回 `ensure_erase_base_texture` で再計算される。
-        self.erase_base_tex_cache.remove(&idx);
+        self.clear_final_pipeline_caches_for_idx(idx);
     }
 
     /// フルスクリーン補正キャッシュとサムネ補正テクスチャを同時に全クリアする。
@@ -20255,15 +20915,9 @@ impl App {
         self.compare_prepare_pending = None;
         self.compare_prepared_pair = None;
         self.compare_wipe_dragging = false;
-        self.local_adjust_cache.clear();
-        self.local_adjust_layer_bypass_cache.clear();
-        self.local_adjust_prefix_preview_cache.clear();
-        self.cancel_local_adjust_layer_bypass_pending();
-        self.cancel_local_adjust_prefix_preview_pending();
+        self.clear_all_final_pipeline_caches();
         // 360 度パノラマビュー: バルク clear に追随して全 entry を bump (§3.6.2.2)。
         self.bump_all_adjustment_generations();
-        // 隠蔽合成: バルク色補正変更で全ページ入力が変わるため世代 bump して全 stale 化。
-        self.bump_conceal_generation();
     }
 
     /// サムネイル補正を同期適用する (色調のみ、post_filter は対象外)。
@@ -20364,6 +21018,7 @@ impl App {
         // adjustment は idx 単位、AI は全体 — clear 粒度と整合させる。
         self.bump_adjustment_generation(idx);
         self.bump_all_ai_generations();
+        self.clear_final_pipeline_caches_for_idx(idx);
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -20375,12 +21030,13 @@ impl App {
     /// clear 粒度と整合させる (§3.6.2.2)。idx → source_key の解決に失敗するときは
     /// (= 構造アイテム等で対象外) 何もしない。
     pub(crate) fn bump_adjustment_generation(&mut self, idx: usize) {
-        self.bump_input_generation(idx);
         let Some(key) = self.metadata_cache_key(idx) else {
+            self.clear_final_pipeline_caches_for_idx(idx);
             return;
         };
         let slot = self.adjustment_generation.entry(key).or_insert(0);
         *slot = slot.saturating_add(1);
+        self.clear_final_pipeline_caches_for_idx(idx);
     }
 
     /// `ai_upscale_generation` の全 entry を +1 する (saturating)。
@@ -20388,20 +21044,20 @@ impl App {
     /// `ai_gen=0` cache_key と衝突するリスクを避ける (§3.6.2.2)。
     /// AI モデル / `bg_mode` 切替 / AI ON/OFF / cache 全体 clear の各経路で呼ぶ。
     pub(crate) fn bump_all_ai_generations(&mut self) {
-        self.bump_all_input_generations();
         for v in self.ai_upscale_generation.values_mut() {
             *v = v.saturating_add(1);
         }
+        self.clear_all_final_pipeline_caches();
     }
 
     /// `adjustment_generation` の全 entry を +1 する (saturating)。
     /// バルク補正 clear (`adjustment_cache.clear()` 経路) で `ai_upscale_generation`
     /// と同じく全体 bump する。`.clear()` ではない理由は同節 §3.6.2.2。
     pub(crate) fn bump_all_adjustment_generations(&mut self) {
-        self.bump_all_input_generations();
         for v in self.adjustment_generation.values_mut() {
             *v = v.saturating_add(1);
         }
+        self.clear_all_final_pipeline_caches();
     }
 
     /// 指定 source_key の `ai_upscale_generation` を +1 する (saturating)。
@@ -20409,12 +21065,13 @@ impl App {
     /// `source_kind` 部 (2=AI のみ / 3=AI+補正) で区別されるため、source_key 単位の
     /// generation で十分。
     pub(crate) fn bump_ai_generation(&mut self, idx: usize) {
-        self.bump_input_generation(idx);
         let Some(key) = self.metadata_cache_key(idx) else {
+            self.clear_final_pipeline_caches_for_idx(idx);
             return;
         };
         let slot = self.ai_upscale_generation.entry(key).or_insert(0);
         *slot = slot.saturating_add(1);
+        self.clear_final_pipeline_caches_for_idx(idx);
     }
 
     /// `clear_all_adjustment_and_ai_caches(idx)` の別名 (§3.6.2.2 で参照される
@@ -21542,6 +22199,7 @@ impl App {
     ///
     /// ここでは終端状態 (Static 以外の fs_cache entry) を「done」扱いにして先読みを通し、
     /// 未ロード (fs_cache 不在) のみ「一時的に未完了」(= current の load を待つ) とする。
+    #[allow(dead_code)] // Legacy AI prefetch scheduler is kept until P2.4 staged deletion.
     fn ai_prefetch_current_ready(&self, fs_idx: usize) -> bool {
         let cur_bg = self.effective_upscale_bg_mode();
         // 既に AI 結果が出来た / 恒久失敗した → done。
@@ -24018,6 +24676,7 @@ impl eframe::App for App {
         self.poll_prefetch(ctx);
         self.poll_video(ctx);
         self.poll_ai_upscale(ctx);
+        self.poll_final_ai(ctx);
         self.poll_erase_inpaint(ctx);
         self.poll_local_adjust_render(ctx);
         self.poll_local_adjust_layer_bypass_preview(ctx);
@@ -24080,6 +24739,7 @@ impl eframe::App for App {
             || self.local_adjust_layer_bypass_pending.is_some()
             || self.local_adjust_prefix_preview_pending.is_some()
             || self.local_adjust_segmentation_pending.is_some()
+            || !self.final_ai_pending.is_empty()
             || self
                 .tag_prewarm_pending
                 .as_ref()
@@ -24094,29 +24754,10 @@ impl eframe::App for App {
         if let Some(fs_idx) = self.fullscreen_idx {
             // プリセットに基づいてアップスケール設定を同期
             self.sync_upscale_from_preset(fs_idx);
-
-            // 表示中画像を最優先でアップスケール
-            self.maybe_start_ai_upscale(fs_idx);
-            // 表示中画像のアップスケールが完了 or 不要なら先読みもアップスケール。
-            // 判定は先読みスケジューラ専用の `ai_prefetch_current_ready` に委譲する。
-            // panorama settle 用の `ai_will_apply_to` は「寸法不明 / 終端状態」を保守的に
-            // true (= 適用されるかも) とするため、`!ai_will_apply_to` だと
-            // Animated/Failed の current で先読みが永久停止する。スケジューラ側は逆に
-            // 「終端状態 = done」とみなす必要があるので別 predicate にする (Codex P2 ×2)。
-            let current_done = self.ai_prefetch_current_ready(fs_idx);
-            if current_done && self.ai_upscale_pending.is_empty() {
-                self.prefetch_ai_upscale(fs_idx);
-            }
-            self.evict_ai_upscale_cache(fs_idx);
-
-            // 画像補正の適用（アップスケール後に適用）
-            // adjustment_cache がないがパラメータがある場合、フル解像度で補正を適用。
-            // 見開き Double 表示中は対のページについても補正適用を走らせる。
+            self.evict_final_pipeline_cache(fs_idx);
             let spread_pair = self.resolve_spread_pair(fs_idx);
-            self.maybe_apply_adjustment(ctx, fs_idx, spread_pair);
             if let crate::ui_fullscreen::SpreadPair::Double { left, right } = spread_pair {
                 let other = if left == fs_idx { right } else { left };
-                self.maybe_apply_adjustment(ctx, other, spread_pair);
                 self.maybe_start_local_adjust_render(other);
             }
             self.maybe_start_local_adjust_render(fs_idx);
@@ -24807,8 +25448,9 @@ impl eframe::App for App {
         // poll_ai_upscale() で取り込む。静止フルスクリーン中に egui が寝ると
         // upscale_end 済みの結果が次のユーザー入力まで job_ready にならず、
         // 先読みバーが数秒止まって見えるため、pending 中だけ低頻度に起こす。
-        let ai_upscale_poll_delay =
-            (!self.ai_upscale_pending.is_empty()).then_some(std::time::Duration::from_millis(33));
+        let ai_upscale_poll_delay = (!self.ai_upscale_pending.is_empty()
+            || !self.final_ai_pending.is_empty())
+        .then_some(std::time::Duration::from_millis(33));
         // `keep_fullscreen_viewport_alive` の cleanup フレーム保証 (Codex P2 — 統一安全網)。
         // close_fullscreen が App::update 内のどこで呼ばれても、次フレームで keep_alive の
         // "Visible(false) 送信" 経路が確実に走るよう repaint を要求する。アイドル時の

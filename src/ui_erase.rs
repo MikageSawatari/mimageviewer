@@ -2441,17 +2441,8 @@ impl App {
 
     // ── Inpaint 実行 ──────────────────────────────────────────────
 
-    /// 消しゴム確定結果の入力になる、pre-erase の表示ピクセルを取得する。
-    /// 通常は `adjustment_cache > ai_upscale_cache > fs_cache`。透過元画像だけは
-    /// 黒固定の作業ベースを守るため `adjustment_cache` を再利用せず、bg=0 の
-    /// AI / raw を黒不透明化してから補正を掛け直す。
     fn erase_working_size(&self, fs_idx: usize, raw_size: [usize; 2]) -> [usize; 2] {
-        let bg = self.erase_upscale_bg_mode(fs_idx);
-        if let Some(FsCacheEntry::Static { pixels, .. }) = self.ai_upscale_cache.get(&(fs_idx, bg))
-        {
-            return pixels.size;
-        }
-        if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx) {
+        if let Some(pixels) = self.current_raw_source_pixels(fs_idx) {
             return pixels.size;
         }
         raw_size
@@ -2469,72 +2460,17 @@ impl App {
     ) -> Option<(Arc<egui::ColorImage>, &'static str)> {
         let size_ok =
             |pixels: &Arc<egui::ColorImage>| expected_size.map_or(true, |size| pixels.size == size);
-        let force_black = self.fs_static_has_alpha(fs_idx);
-        let post_filter_active =
-            self.effective_params(fs_idx).post_filter != crate::adjustment::PostFilter::None;
-        let can_reuse_adjustment_cache =
-            !force_black && (!self.post_filter_bypassed || !post_filter_active);
-        let mut already_adjusted = false;
-        let mut source_name = "none";
-
-        let source = if can_reuse_adjustment_cache {
-            match self.adjustment_cache.get(&fs_idx) {
-                Some(FsCacheEntry::Static { pixels, .. }) if size_ok(pixels) => {
-                    already_adjusted = true;
-                    source_name = "adjustment";
-                    Some(Arc::clone(pixels))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        let source = match source {
-            Some(pixels) => Some(pixels),
-            None => {
-                let bg = self.erase_upscale_bg_mode(fs_idx);
-                let ai_matching = self
-                    .ai_upscale_cache
-                    .get(&(fs_idx, bg))
-                    .and_then(|e| match e {
-                        FsCacheEntry::Static { pixels, .. } if size_ok(pixels) => {
-                            Some(Arc::clone(pixels))
-                        }
-                        _ => None,
-                    });
-                if let Some(pixels) = ai_matching {
-                    source_name = "ai";
-                    Some(pixels)
-                } else if let Some(pixels) = self
-                    .erase_base_cache
+        let source = self
+            .current_raw_source_pixels(fs_idx)
+            .filter(size_ok)
+            .or_else(|| {
+                self.erase_base_cache
                     .get(&fs_idx)
                     .filter(|pixels| size_ok(pixels))
                     .map(Arc::clone)
-                {
-                    source_name = "erase_base";
-                    Some(pixels)
-                } else {
-                    match self.fs_cache.get(&fs_idx) {
-                        Some(FsCacheEntry::Static { pixels, .. }) if size_ok(pixels) => {
-                            source_name = "fs_cache";
-                            Some(Arc::clone(pixels))
-                        }
-                        _ => None,
-                    }
-                }
-            }
-        }?;
-
+            })?;
         let source = self.black_flatten_erase_source_if_needed(fs_idx, source);
-        if already_adjusted {
-            Some((source, source_name))
-        } else {
-            Some((
-                self.apply_erase_adjustments_to_source(fs_idx, source, true),
-                source_name,
-            ))
-        }
+        Some((source, "source"))
     }
 
     fn commit_pending_matches_current_erase_key(&self, fs_idx: usize) -> bool {

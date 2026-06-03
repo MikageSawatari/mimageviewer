@@ -626,8 +626,8 @@ impl App {
     }
 
     /// `idx` に対する「現在表示できる最良の既存テクスチャ」を Arc::clone で取り出す。
-    /// 優先順: 隠蔽加工 cache → 消しゴム確定結果 → 補正済み cache → AI 処理済み
-    /// → fs_cache (Static / Animated 現フレーム) → サムネ (`include_thumb=true` のときのみ)。
+    /// 優先順: final composite cache → edit cache → fs_cache (Static / Animated 現フレーム)
+    /// → サムネ (`include_thumb=true` のときのみ)。
     ///
     /// `prepare_fullscreen_state` の高解像度 tex 解決と `current_fs_tex_for_holdover`
     /// が同じチェーンを 2 回書いていた重複を集約する。ここでは既存 cache の lookup
@@ -638,6 +638,12 @@ impl App {
         idx: usize,
         include_thumb: bool,
     ) -> Option<egui::TextureHandle> {
+        if let Some(tex) = self.current_final_composite_texture(idx) {
+            return Some(tex);
+        }
+        if let Some(tex) = self.current_edit_result_texture(idx) {
+            return Some(tex);
+        }
         if let Some(entry) = self.conceal_cache.get(&idx) {
             if entry.generation == self.conceal_generation {
                 return Some(entry.texture.clone());
@@ -648,15 +654,6 @@ impl App {
         }
         if let Some(tex) = self.current_erase_result_texture(idx) {
             return Some(tex);
-        }
-        if let Some(FsCacheEntry::Static { tex, .. }) = self.adjustment_cache.get(&idx) {
-            return Some(tex.clone());
-        }
-        if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
-            let bg = self.effective_upscale_bg_mode();
-            if let Some(FsCacheEntry::Static { tex, .. }) = self.ai_upscale_cache.get(&(idx, bg)) {
-                return Some(tex.clone());
-            }
         }
         match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => return Some(tex.clone()),
@@ -739,20 +736,8 @@ impl App {
         }
     }
 
-    /// 消しゴム / 隠蔽より下位にある通常レイヤを解決する。
-    /// 優先順: adjustment_cache → ai_upscale_cache → fs_cache。
+    /// 編集プレビューの下地になる source 解像度レイヤを解決する。
     fn resolve_fs_pre_overlay_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
-        if let Some(FsCacheEntry::Static { tex, .. }) = self.adjustment_cache.get(&idx) {
-            return Some(tex.clone());
-        }
-
-        if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
-            let bg = self.effective_upscale_bg_mode();
-            if let Some(FsCacheEntry::Static { tex, .. }) = self.ai_upscale_cache.get(&(idx, bg)) {
-                return Some(tex.clone());
-            }
-        }
-
         match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
             Some(FsCacheEntry::Animated {
@@ -764,8 +749,8 @@ impl App {
         }
     }
 
-    /// 補正レイヤー直前の入力テクスチャを解決する。
-    /// 優先順: erase result → adjustment → AI → fs。
+    /// 補正レイヤー直前の source 解像度入力テクスチャを解決する。
+    /// 優先順: erase result → raw fs。
     fn resolve_local_adjust_source_texture(
         &mut self,
         ctx: &egui::Context,
@@ -783,9 +768,8 @@ impl App {
     /// フルスクリーン描画で使う最終表示テクスチャを解決する共通入口。
     ///
     /// 単ページ / 見開き / ルーペの全てがここを通ることで、加工レイヤを追加した
-    /// ときの横展開漏れを防ぐ。優先順は docs/display-pipeline.md §2.3 と同じ:
-    /// original preview → erase edit preview/base → conceal → erase result →
-    /// adjustment → AI → fs。
+    /// ときの横展開漏れを防ぐ。通常表示は edit result に AdjustParams / AI /
+    /// post_filter を最終段で適用した final composite を使う。
     fn resolve_fs_processed_texture(
         &mut self,
         ctx: &egui::Context,
@@ -855,17 +839,18 @@ impl App {
             return self.resolve_local_adjust_source_texture(ctx, idx);
         }
 
-        let erase_result_tex = self.ensure_erase_result_texture(ctx, idx);
-        if let Some(conceal_tex) = self.ensure_conceal_texture(ctx, idx) {
-            return Some(conceal_tex);
+        if self.conceal_mode && !self.conceal_preview_active {
+            if let Some(local_adjust_tex) = self.current_local_adjust_texture(idx) {
+                return Some(local_adjust_tex);
+            }
+            if let Some(erase_result_tex) = self.ensure_erase_result_texture(ctx, idx) {
+                return Some(erase_result_tex);
+            }
+            return self.resolve_fs_pre_overlay_texture(idx);
         }
-        if let Some(local_adjust_tex) = self.current_local_adjust_texture(idx) {
-            return Some(local_adjust_tex);
-        }
-        if let Some(tex) = erase_result_tex {
-            return Some(tex);
-        }
-        self.resolve_fs_pre_overlay_texture(idx)
+
+        self.ensure_final_composite_texture(ctx, idx)
+            .or_else(|| self.resolve_fs_pre_overlay_texture(idx))
     }
 
     /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込むためのヘルパ。
@@ -2170,9 +2155,7 @@ impl App {
                         let ai_upscale_info = if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
                             ai_info_model_name = self.ai_model_label(fs_idx, false);
                             // 処理後のサイズ
-                            if let Some(crate::fs_animation::FsCacheEntry::Static { tex, .. }) =
-                                self.ai_upscale_cache.get(&(fs_idx, self.effective_upscale_bg_mode()))
-                            {
+                            if let Some(tex) = self.current_final_composite_texture(fs_idx) {
                                 let s = tex.size_vec2();
                                 Some((ai_info_model_name.as_str(), s.x as u32, s.y as u32))
                             } else if self.ai_upscale_enabled {
@@ -2286,7 +2269,7 @@ impl App {
                                 self.cursor_hidden,
                             );
                             if copy_capture_pressed {
-                                self.copy_image_capture_to_clipboard(fs_idx);
+                                self.copy_image_capture_to_clipboard(ctx, fs_idx);
                             }
                             // 360 度パノラマビュー: トグル
                             if panorama_pressed {
@@ -5396,7 +5379,7 @@ impl App {
         let pinned_source_idx = slot.source_idx;
         let pinned_size = slot.source_size;
         let pinned_pixels = Arc::clone(&slot.pixels);
-        let current_work = match self.prepare_capture_pixel_work(fs_idx) {
+        let current_work = match self.prepare_capture_pixel_work(ctx, fs_idx) {
             Ok(work) => work,
             Err(err) => {
                 self.compare_view_mode = crate::app::CompareViewMode::Off;
@@ -7819,11 +7802,16 @@ impl App {
 
     /// フルスクリーン左下に AI 処理ステータスを表示する。
     fn draw_fs_ai_status(&mut self, ui: &mut egui::Ui, fs_idx: usize) {
-        let bg = self.effective_upscale_bg_mode();
-        let is_upscaling = self.ai_upscale_pending.contains_key(&(fs_idx, bg));
-        let is_upscaled = self.ai_upscale_cache.contains_key(&(fs_idx, bg));
+        let is_upscaling = self
+            .final_ai_pending
+            .keys()
+            .any(|key| key.edit_key.idx == fs_idx);
+        let is_upscaled = self
+            .final_ai_cache
+            .keys()
+            .any(|key| key.edit_key.idx == fs_idx);
         let is_loading = self.fs_pending.contains_key(&fs_idx);
-        let any_busy = is_loading || is_upscaling || !self.ai_upscale_pending.is_empty();
+        let any_busy = is_loading || is_upscaling || !self.final_ai_pending.is_empty();
 
         let mut lines: Vec<(String, egui::Color32)> = Vec::new();
 
@@ -7852,55 +7840,7 @@ impl App {
             ));
         }
 
-        // AI 機能が完全に無効なら先読みバーを出さない。
-        // 以前は AI off でも target があれば「0/N」バーが表示されて
-        // 進捗が進まないように見える UX 不具合があった。
-        let ai_feature_active = self.ai_upscale_enabled || self.ai_denoise_model.is_some();
-
-        let prefetch_progress: Option<(usize, usize)> = if is_upscaling || !ai_feature_active {
-            None
-        } else {
-            let targets = self.ai_prefetch_targets(fs_idx);
-            let total = targets.len();
-            if total == 0 {
-                None
-            } else {
-                // 「done」の判定: cache 済み / failed / サイズ閾値で skip 確定。
-                // 高解像度スキャン (2048px 超等) は maybe_start_ai_upscale で
-                // should_process に弾かれて AI が走らないが、従来は cache にも
-                // failed にも入らないため「0/N」バーが永久に残った。
-                // ここでサイズを見て「この画像は AI 対象外」と判別できるものは done
-                // 扱いにする。fs_cache に Static が無いものはまだ判定不能なので undone。
-                let upscale_px = self.settings.ai_upscale_skip_px;
-                let denoise_px = self.settings.ai_denoise_skip_px;
-                let upscale_enabled = self.ai_upscale_enabled;
-                let denoise_enabled = self.ai_denoise_model.is_some();
-                let done = targets
-                    .iter()
-                    .filter(|&&i| {
-                        if self.ai_upscale_cache.contains_key(&(i, bg))
-                            || self.ai_upscale_failed.contains(&(i, bg))
-                        {
-                            return true;
-                        }
-                        // fs_cache の dims でサイズ閾値判定
-                        if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&i) {
-                            let w = pixels.size[0] as u32;
-                            let h = pixels.size[1] as u32;
-                            let upscale_skip = !upscale_enabled
-                                || !crate::ai::upscale::should_process(w, h, upscale_px);
-                            let denoise_skip = !denoise_enabled
-                                || !crate::ai::upscale::should_process(w, h, denoise_px);
-                            if upscale_skip && denoise_skip {
-                                return true;
-                            }
-                        }
-                        false
-                    })
-                    .count();
-                (done < total).then_some((done, total))
-            }
-        };
+        let prefetch_progress: Option<(usize, usize)> = None;
 
         if lines.is_empty() && prefetch_progress.is_none() {
             self.ai_status_done_at = None;
@@ -7981,8 +7921,7 @@ impl App {
             });
 
         // フェードアウト中のみ毎フレーム再描画。処理中の進捗更新は
-        // poll_ai_upscale / poll_prefetch 側が完了時に repaint を要求するので
-        // ここでの busy-loop repaint は不要。
+        // poll_final_ai 側が完了時に repaint を要求するのでここでの busy-loop repaint は不要。
         if self.ai_status_done_at.is_some() {
             ctx.request_repaint();
         }
@@ -8373,7 +8312,7 @@ impl App {
             return;
         }
 
-        let work = match self.prepare_capture_pixel_work(fs_idx) {
+        let work = match self.prepare_capture_pixel_work(ctx, fs_idx) {
             Ok(work) => work,
             Err(err) => {
                 self.show_feedback_toast(err);
@@ -8384,7 +8323,7 @@ impl App {
     }
 
     pub(crate) fn start_compare_pin_single(&mut self, ctx: &egui::Context, idx: usize) {
-        let work = match self.prepare_capture_pixel_job(idx) {
+        let work = match self.prepare_capture_pixel_job(ctx, idx) {
             Ok(job) => crate::capture::CapturePixelWork::Single(job),
             Err(err) => {
                 self.show_feedback_toast(err);
@@ -8564,7 +8503,7 @@ impl App {
             return;
         }
 
-        let work = match self.prepare_capture_pixel_work(fs_idx) {
+        let work = match self.prepare_capture_pixel_work(ctx, fs_idx) {
             Ok(work) => work,
             Err(err) => {
                 self.show_feedback_toast(err);
@@ -8607,8 +8546,8 @@ impl App {
         }
     }
 
-    pub(crate) fn copy_image_capture_to_clipboard(&mut self, fs_idx: usize) {
-        let work = match self.prepare_capture_pixel_work(fs_idx) {
+    pub(crate) fn copy_image_capture_to_clipboard(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let work = match self.prepare_capture_pixel_work(ctx, fs_idx) {
             Ok(work) => work,
             Err(err) => {
                 self.show_feedback_toast(err);
@@ -8637,15 +8576,16 @@ impl App {
 
     fn prepare_capture_pixel_work(
         &mut self,
+        ctx: &egui::Context,
         idx: usize,
     ) -> Result<crate::capture::CapturePixelWork, String> {
         match self.resolve_visible_spread_pair(idx) {
             SpreadPair::Single => self
-                .prepare_capture_pixel_job(idx)
+                .prepare_capture_pixel_job(ctx, idx)
                 .map(crate::capture::CapturePixelWork::Single),
             SpreadPair::Double { left, right } => {
-                let left_job = self.prepare_capture_pixel_job(left)?;
-                let right_job = self.prepare_capture_pixel_job(right)?;
+                let left_job = self.prepare_capture_pixel_job(ctx, left)?;
+                let right_job = self.prepare_capture_pixel_job(ctx, right)?;
                 let basename = crate::capture::basename_from_text(&format!(
                     "{}_{}",
                     left_job.basename, right_job.basename
@@ -8660,78 +8600,22 @@ impl App {
     }
 
     fn prepare_capture_pixel_job(
-        &self,
+        &mut self,
+        ctx: &egui::Context,
         idx: usize,
     ) -> Result<crate::capture::CapturePixelJob, String> {
         let basename = self
             .capture_basename_for_idx(idx)
             .ok_or_else(|| "このアイテムはキャプチャ保存できません".to_string())?;
-
-        if let Some(pixels) = self.current_local_adjust_pixels(idx) {
-            return Ok(self.capture_job_with_conceal(
-                idx,
-                crate::capture::CapturePixelJob::already_adjusted(basename, pixels.clone()),
-            ));
-        }
-        if self.mask_pages.contains(&idx) && self.current_erase_result_pixels(idx).is_none() {
-            return Err("消しゴム補完の完了後に再実行してください".to_string());
-        }
-        if self.has_active_local_adjust_layers(idx) {
-            return Err("補正レイヤーの反映完了後に再実行してください".to_string());
-        }
-
-        if let Some(pixels) = self.current_erase_result_pixels(idx) {
-            return Ok(self.capture_job_with_conceal(
-                idx,
-                crate::capture::CapturePixelJob::already_adjusted(basename, pixels.clone()),
-            ));
-        }
-
-        if !self.post_filter_bypassed
-            && let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx)
-        {
-            return Ok(self.capture_job_with_conceal(
-                idx,
-                crate::capture::CapturePixelJob::already_adjusted(basename, pixels.clone()),
-            ));
-        }
-
-        let bg = self.effective_upscale_bg_mode();
-        let source = if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
-            self.ai_upscale_cache
-                .get(&(idx, bg))
-                .or_else(|| self.fs_cache.get(&idx))
-        } else {
-            self.fs_cache.get(&idx)
-        };
-        let Some(FsCacheEntry::Static { pixels, .. }) = source else {
-            if let Some(FsCacheEntry::Animated {
-                frame_pixels,
-                current_frame,
-                ..
-            }) = source
-            {
-                let Some(pixels) = frame_pixels.get(*current_frame) else {
-                    return Err("アニメーションフレームを取得できません".to_string());
-                };
-                return Ok(self.capture_job_with_conceal(
-                    idx,
-                    crate::capture::CapturePixelJob::already_adjusted(basename, pixels.clone()),
-                ));
-            }
-            return Err("画像の読み込み完了後に保存してください".to_string());
-        };
-
-        Ok(self.capture_job_with_conceal(
-            idx,
-            crate::capture::CapturePixelJob::needs_adjustment(
-                basename,
-                pixels.clone(),
-                self.effective_params(idx).clone(),
-            ),
+        let pixels = self
+            .ensure_final_composite_pixels(ctx, idx)
+            .ok_or_else(|| "最終合成の完了後に再実行してください".to_string())?;
+        Ok(crate::capture::CapturePixelJob::already_adjusted(
+            basename, pixels,
         ))
     }
 
+    #[allow(dead_code)] // Legacy export variant path; final composite is used in v1.1.0 P1.
     fn capture_job_with_conceal(
         &self,
         idx: usize,
@@ -8857,7 +8741,7 @@ impl App {
         self.ensure_export_local_adjust_ready(ctx, &[idx])?;
         let (source, source_label, original_format, source_dir, basename) =
             self.export_source_info_for_idx(idx)?;
-        let pixels = self.export_page_pixels_for_idx(idx)?;
+        let pixels = self.export_page_pixels_for_idx(ctx, idx)?;
         Ok(ExportDialogTarget {
             source,
             source_label,
@@ -8879,8 +8763,8 @@ impl App {
         let (_, left_label, _, left_dir, left_basename) =
             self.export_source_info_for_idx(left_idx)?;
         let (_, right_label, _, _, right_basename) = self.export_source_info_for_idx(right_idx)?;
-        let left = self.export_page_pixels_for_idx(left_idx)?;
-        let right = self.export_page_pixels_for_idx(right_idx)?;
+        let left = self.export_page_pixels_for_idx(ctx, left_idx)?;
+        let right = self.export_page_pixels_for_idx(ctx, right_idx)?;
         let basename =
             crate::capture::basename_from_text(&format!("{left_basename}_{right_basename}"));
         Ok(ExportDialogTarget {
@@ -8945,22 +8829,17 @@ impl App {
     }
 
     fn export_page_pixels_for_idx(
-        &self,
+        &mut self,
+        ctx: &egui::Context,
         idx: usize,
     ) -> Result<crate::export_dialog::ExportPagePixels, String> {
         let base_pixels = self
-            .resolve_export_base_pixels(idx)
-            .map_err(|_| "画像の読み込み完了後にエクスポートしてください".to_string())?;
-        let conceal_mask = self
-            .conceal_composite_mask_for_export(idx, base_pixels.size[0], base_pixels.size[1])
-            .map(Arc::new);
-        let crop = self
-            .export_crop_for_idx(idx, [base_pixels.size[0], base_pixels.size[1]])
-            .map(|settings| settings.rect);
+            .ensure_final_composite_pixels(ctx, idx)
+            .ok_or_else(|| "最終合成の完了後にエクスポートしてください".to_string())?;
         Ok(crate::export_dialog::ExportPagePixels {
             base_pixels,
-            conceal_mask,
-            crop,
+            conceal_mask: None,
+            crop: None,
         })
     }
 
@@ -9535,6 +9414,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)] // Legacy export variant path; final composite is used in v1.1.0 P1.
     fn resolve_export_base_pixels(&self, idx: usize) -> Result<Arc<egui::ColorImage>, String> {
         if let Some(pixels) = self.current_local_adjust_pixels(idx) {
             return Ok(pixels);
@@ -9576,6 +9456,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)] // Legacy export variant path; final composite is used in v1.1.0 P1.
     fn conceal_composite_mask_for_export(
         &self,
         idx: usize,
