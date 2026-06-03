@@ -111,6 +111,7 @@ fast_image_resize = { version = "5", features = ["image"] }
 png = "0.18"
 ttf-parser = "0.25"
 flate2 = "1"
+local-adjust-core = { path = "crates/local-adjust-core" }
 kamadak-exif = "0.6"
 rexif = "0.7"
 rayon = "1.10"

@@ -3698,6 +3698,7 @@ dependencies = [
  "flate2",
  "image",
  "kamadak-exif",
+ "local-adjust-core",
  "lopdf",
  "ndarray",
  "notify",
