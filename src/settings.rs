@@ -798,6 +798,9 @@ pub struct Settings {
     /// フォールバックする形式 (JPEG q=95 or PNG)。
     #[serde(default)]
     pub export_fallback_format: crate::conceal::ExportFallbackFormat,
+    /// `Ctrl+E` ダイアログの前回出力サイズ。
+    #[serde(default)]
+    pub export_default_scale: crate::export_dialog::ExportScale,
     /// `Ctrl+E` ダイアログでチェックされていたバリエーション
     /// `[現在の設定, プリセット 1, 2, 3, 4]` の前回チェック状態。
     #[serde(default = "default_export_batch_selection")]
@@ -1795,6 +1798,7 @@ impl Default for Settings {
             export_embed_metadata: true,
             export_last_directory: None,
             export_fallback_format: crate::conceal::ExportFallbackFormat::default(),
+            export_default_scale: crate::export_dialog::ExportScale::default(),
             export_batch_selection: default_export_batch_selection(),
         }
     }

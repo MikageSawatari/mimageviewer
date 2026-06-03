@@ -70,6 +70,45 @@ impl ExportFormat {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ExportScale {
+    #[default]
+    Full,
+    Half,
+    Quarter,
+}
+
+impl ExportScale {
+    pub const ALL: [Self; 3] = [Self::Full, Self::Half, Self::Quarter];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "そのまま",
+            Self::Half => "1/2 サイズ",
+            Self::Quarter => "1/4 サイズ",
+        }
+    }
+
+    pub fn factor(self) -> f32 {
+        match self {
+            Self::Full => 1.0,
+            Self::Half => 0.5,
+            Self::Quarter => 0.25,
+        }
+    }
+
+    pub fn scaled_size(self, size: [usize; 2]) -> [usize; 2] {
+        if self == Self::Full {
+            return [size[0].max(1), size[1].max(1)];
+        }
+        let factor = self.factor();
+        [
+            ((size[0].max(1) as f32 * factor).round() as usize).max(1),
+            ((size[1].max(1) as f32 * factor).round() as usize).max(1),
+        ]
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ExportSource {
     File {
@@ -97,6 +136,7 @@ pub struct ExportRequest {
     pub output_dir: PathBuf,
     pub basename: String,
     pub pixels: ExportPixels,
+    pub scale: ExportScale,
     pub entries: Vec<ExportEntry>,
     pub include_metadata: bool,
 }
@@ -106,6 +146,18 @@ pub struct ExportPagePixels {
     pub base_pixels: Arc<egui::ColorImage>,
     pub conceal_mask: Option<Arc<Vec<bool>>>,
     pub crop: Option<crate::export_crop::CropRect>,
+}
+
+impl ExportPagePixels {
+    pub fn render_size(&self) -> [usize; 2] {
+        let [w, h] = self.base_pixels.size;
+        if let Some(crop) = self.crop {
+            let (_, _, crop_w, crop_h) = crop.pixel_bounds(w, h);
+            [crop_w, crop_h]
+        } else {
+            [w.max(1), h.max(1)]
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -126,6 +178,17 @@ impl ExportPixels {
             }
         }
     }
+
+    pub fn render_size(&self) -> [usize; 2] {
+        match self {
+            Self::Single(page) => page.render_size(),
+            Self::Spread { left, right } => {
+                let [left_w, left_h] = left.render_size();
+                let [right_w, right_h] = right.render_size();
+                [left_w + right_w, left_h.max(right_h)]
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -134,6 +197,7 @@ pub struct ExportDialogState {
     pub source_label: String,
     pub original_format: SrcFormat,
     pub output_format: ExportFormat,
+    pub scale: ExportScale,
     pub basename: String,
     pub output_dir_text: String,
     pub source_dir: PathBuf,
@@ -375,6 +439,20 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
                 continue;
             }
         };
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(ExportEvent::Cancelled);
+            return;
+        }
+        let pixels = match scale_export_pixels(pixels, request.scale) {
+            Ok(pixels) => pixels,
+            Err(message) => {
+                let _ = tx.send(ExportEvent::Failed(ExportFailure {
+                    label: entry.label,
+                    message,
+                }));
+                continue;
+            }
+        };
         // 合成は CPU 重 (Mosaic/Blur で 4K だと数秒) なので、合成後 / encode 前にも
         // cancel を再チェックする。これでキャンセルが「encode 中の 1 ファイルだけは
         // 書き出されるが残りは抑止」ではなく、合成完了時点で確実に止まる
@@ -451,6 +529,39 @@ fn render_export_page_pixels<'a>(
     Ok(rendered)
 }
 
+fn scale_export_pixels<'a>(
+    pixels: Cow<'a, egui::ColorImage>,
+    scale: ExportScale,
+) -> Result<Cow<'a, egui::ColorImage>, String> {
+    if scale == ExportScale::Full {
+        return Ok(pixels);
+    }
+    let [w, h] = pixels.size;
+    let [new_w, new_h] = scale.scaled_size([w, h]);
+    if [new_w, new_h] == [w, h] {
+        return Ok(pixels);
+    }
+    let src_w = u32::try_from(w).map_err(|_| "エクスポート画像の幅が大きすぎます".to_string())?;
+    let src_h = u32::try_from(h).map_err(|_| "エクスポート画像の高さが大きすぎます".to_string())?;
+    let dst_w =
+        u32::try_from(new_w).map_err(|_| "エクスポート画像の幅が大きすぎます".to_string())?;
+    let dst_h =
+        u32::try_from(new_h).map_err(|_| "エクスポート画像の高さが大きすぎます".to_string())?;
+    let rgba = crate::capture::color_image_to_rgba(pixels.as_ref());
+    let src = image::RgbaImage::from_raw(src_w, src_h, rgba)
+        .ok_or_else(|| "エクスポート画像の RGBA バッファが不正です".to_string())?;
+    let resized = crate::fast_resize::resize_rgba8_exact(
+        &src,
+        dst_w,
+        dst_h,
+        crate::fast_resize::Quality::Lanczos3,
+    );
+    Ok(Cow::Owned(egui::ColorImage::from_rgba_unmultiplied(
+        [new_w, new_h],
+        resized.as_raw(),
+    )))
+}
+
 fn compose_conceal_for_export(
     base: &egui::ColorImage,
     mask: &[bool],
@@ -508,6 +619,7 @@ mod tests {
                 conceal_mask: None,
                 crop: None,
             }),
+            scale: ExportScale::Full,
             entries: vec![
                 ExportEntry {
                     label: "current".to_string(),
@@ -559,6 +671,7 @@ mod tests {
                 conceal_mask: Some(mask),
                 crop: None,
             }),
+            scale: ExportScale::Full,
             entries: vec![ExportEntry {
                 label: "black".to_string(),
                 suffix: 0,
@@ -645,6 +758,7 @@ mod tests {
                     crop: None,
                 },
             },
+            scale: ExportScale::Full,
             entries: vec![ExportEntry {
                 label: "black".to_string(),
                 suffix: 0,

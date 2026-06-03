@@ -8704,6 +8704,7 @@ impl App {
                 &target.original_format,
                 self.settings.export_fallback_format,
             ),
+            scale: self.settings.export_default_scale,
             basename: crate::capture::basename_from_text(&format!("{}_edited", target.basename)),
             output_dir_text: output_dir.display().to_string(),
             source_dir: target.source_dir,
@@ -8954,6 +8955,20 @@ impl App {
                 if !metadata_possible {
                     ui.small("形式変換、PDF、見開き合成ではメタデータ保持は無効です");
                 }
+
+                ui.add_space(6.0);
+                ui.label("出力サイズ");
+                let base_size = state.pixels.render_size();
+                ui.horizontal_wrapped(|ui| {
+                    for scale in crate::export_dialog::ExportScale::ALL {
+                        let [w, h] = scale.scaled_size(base_size);
+                        ui.radio_value(
+                            &mut state.scale,
+                            scale,
+                            format!("{} ({}×{})", scale.label(), w, h),
+                        );
+                    }
+                });
 
                 ui.separator();
                 ui.label("出力するバリエーション");
@@ -9303,6 +9318,7 @@ impl App {
         self.settings.export_embed_metadata = persisted_metadata;
         self.settings.export_last_directory = Some(output_dir.clone());
         self.settings.export_batch_selection = next_selection;
+        self.settings.export_default_scale = state.scale;
         if matches!(
             state.original_format,
             crate::save_with_metadata::SrcFormat::Other(_)
@@ -9323,6 +9339,7 @@ impl App {
             output_dir,
             basename: resolved_basename,
             pixels,
+            scale: state.scale,
             entries,
             include_metadata: effective_include_metadata,
         };
