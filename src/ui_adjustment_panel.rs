@@ -69,6 +69,84 @@ struct LocalEffectPanelRequests {
     set_effect_position_handles_visible: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaskKind {
+    Full,
+    Raster,
+    LinearGradient,
+    RadialGradient,
+    LumaRange,
+    ColorRange,
+    Subject,
+    Segmentation,
+}
+
+impl MaskKind {
+    fn from_mask(mask: &local_adjust_core::LocalMask) -> Self {
+        match mask {
+            local_adjust_core::LocalMask::Full => Self::Full,
+            local_adjust_core::LocalMask::Raster(_)
+            | local_adjust_core::LocalMask::RasterVector(_) => Self::Raster,
+            local_adjust_core::LocalMask::LinearGradient(_) => Self::LinearGradient,
+            local_adjust_core::LocalMask::RadialGradient(_) => Self::RadialGradient,
+            local_adjust_core::LocalMask::LumaRange(_) => Self::LumaRange,
+            local_adjust_core::LocalMask::ColorRange(_) => Self::ColorRange,
+            local_adjust_core::LocalMask::Subject(_) => Self::Subject,
+            local_adjust_core::LocalMask::Segmentation(_) => Self::Segmentation,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full => "全体",
+            Self::Raster => "手動",
+            Self::LinearGradient => "線形",
+            Self::RadialGradient => "円形",
+            Self::LumaRange => "輝度",
+            Self::ColorRange => "カラー",
+            Self::Subject => "被写体",
+            Self::Segmentation => "領域",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Full => "画像全体に同じ効果をかけます。",
+            Self::Raster => "ブラシ、囲み、図形で手動作成するマスクです。",
+            Self::LinearGradient => "線に沿って段階的に効果をかけます。",
+            Self::RadialGradient => "中心から外側へ段階的に効果をかけます。",
+            Self::LumaRange => "明るさの範囲でマスクを作ります。",
+            Self::ColorRange => "指定色に近い範囲をマスクにします。",
+            Self::Subject => "被写体マスクを使います。自動生成は後続ステップで接続します。",
+            Self::Segmentation => "領域候補マスクを使います。自動生成は後続ステップで接続します。",
+        }
+    }
+}
+
+struct MaskGroup {
+    title: &'static str,
+    kinds: &'static [MaskKind],
+}
+
+const MASK_GROUPS: &[MaskGroup] = &[
+    MaskGroup {
+        title: "基本",
+        kinds: &[MaskKind::Full, MaskKind::Raster],
+    },
+    MaskGroup {
+        title: "グラデーション",
+        kinds: &[MaskKind::LinearGradient, MaskKind::RadialGradient],
+    },
+    MaskGroup {
+        title: "範囲",
+        kinds: &[MaskKind::LumaRange, MaskKind::ColorRange],
+    },
+    MaskGroup {
+        title: "自動",
+        kinds: &[MaskKind::Subject, MaskKind::Segmentation],
+    },
+];
+
 impl QuickLocalAdjustEffect {
     const ALL: [Self; 8] = [
         Self::Vibrance,
@@ -376,6 +454,7 @@ fn draw_selected_local_adjust_layer_editor(
             .size(11.0)
             .color(egui::Color32::from_gray(180)),
     );
+    changed |= draw_local_mask_editor(ui, &mut edited, image_dims);
     let response = draw_effect_params(
         ui,
         &mut edited,
@@ -448,6 +527,283 @@ fn reset_layer_effect_params(layer: &mut local_adjust_core::LocalAdjustmentLayer
     }
     layer.effect = kind.default_effect();
     true
+}
+
+fn default_local_mask(kind: MaskKind, image_dims: (usize, usize)) -> local_adjust_core::LocalMask {
+    let (w, h) = (image_dims.0.max(1), image_dims.1.max(1));
+    match kind {
+        MaskKind::Full => local_adjust_core::LocalMask::Full,
+        MaskKind::Raster => local_adjust_core::LocalMask::RasterVector(
+            local_adjust_core::RasterVectorMask::empty(w, h),
+        ),
+        MaskKind::LinearGradient => {
+            local_adjust_core::LocalMask::LinearGradient(local_adjust_core::LinearGradientMask {
+                initialized: true,
+                start: [0.5, 0.0],
+                end: [0.5, 1.0],
+            })
+        }
+        MaskKind::RadialGradient => {
+            local_adjust_core::LocalMask::RadialGradient(local_adjust_core::RadialGradientMask {
+                initialized: true,
+                center: [0.5, 0.5],
+                inner_radius: 0.18,
+                inner_radius_y: 0.18,
+                outer_radius: 0.65,
+                outer_radius_y: 0.65,
+            })
+        }
+        MaskKind::LumaRange => {
+            local_adjust_core::LocalMask::LumaRange(local_adjust_core::RangeMask::default())
+        }
+        MaskKind::ColorRange => {
+            local_adjust_core::LocalMask::ColorRange(local_adjust_core::ColorRangeMask::default())
+        }
+        MaskKind::Subject => {
+            local_adjust_core::LocalMask::Subject(local_adjust_core::SubjectMask::empty(w, h))
+        }
+        MaskKind::Segmentation => {
+            local_adjust_core::LocalMask::Segmentation(local_adjust_core::RegionMask::empty(w, h))
+        }
+    }
+}
+
+fn local_adjust_slider(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    label: &'static str,
+) -> bool {
+    ui.add(egui::Slider::new(value, range).text(label))
+        .changed()
+}
+
+fn draw_mask_kind_picker(ui: &mut egui::Ui, current_kind: MaskKind) -> Option<MaskKind> {
+    let mut selected = None;
+    for group in MASK_GROUPS {
+        ui.label(
+            egui::RichText::new(group.title)
+                .size(11.0)
+                .color(egui::Color32::from_gray(170)),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            for &kind in group.kinds {
+                let active = kind == current_kind;
+                let response = ui
+                    .add(
+                        egui::Button::selectable(
+                            active,
+                            egui::RichText::new(kind.label()).size(11.0),
+                        )
+                        .min_size(egui::vec2(54.0, 22.0)),
+                    )
+                    .on_hover_text(kind.description());
+                if response.clicked() && !active {
+                    selected = Some(kind);
+                }
+            }
+        });
+        ui.add_space(2.0);
+    }
+    selected
+}
+
+fn draw_range_mask_sliders(ui: &mut egui::Ui, mask: &mut local_adjust_core::RangeMask) -> bool {
+    let mut changed = false;
+    changed |= local_adjust_slider(ui, &mut mask.min, 0.0..=1.0, "下限");
+    changed |= local_adjust_slider(ui, &mut mask.max, 0.0..=1.0, "上限");
+    changed |= local_adjust_slider(ui, &mut mask.feather, 0.0..=1.0, "範囲ぼかし");
+    if mask.max < mask.min {
+        std::mem::swap(&mut mask.min, &mut mask.max);
+        changed = true;
+    }
+    changed
+}
+
+fn draw_local_mask_editor(
+    ui: &mut egui::Ui,
+    layer: &mut local_adjust_core::LocalAdjustmentLayer,
+    image_dims: (usize, usize),
+) -> bool {
+    let mut changed = false;
+    ui.separator();
+    ui.label(
+        egui::RichText::new("マスク")
+            .size(SECTION_FONT)
+            .color(LABEL_COLOR),
+    );
+    let current_kind = MaskKind::from_mask(&layer.mask);
+    if let Some(kind) = draw_mask_kind_picker(ui, current_kind) {
+        layer.mask = default_local_mask(kind, image_dims);
+        layer.manual_override = local_adjust_core::ManualMaskOverride::default();
+        layer.mask_inverted = false;
+        changed = true;
+    }
+
+    changed |= ui.checkbox(&mut layer.mask_inverted, "反転").changed();
+    changed |= local_adjust_slider(ui, &mut layer.mask_expand_px, -128.0..=128.0, "拡張/収縮");
+    changed |= local_adjust_slider(ui, &mut layer.mask_feather_px, 0.0..=128.0, "境界ぼかし");
+    ui.horizontal_wrapped(|ui| {
+        changed |= ui
+            .checkbox(&mut layer.mask_before_effect, "効果前に適用")
+            .changed();
+        changed |= ui
+            .checkbox(&mut layer.mask_after_effect, "効果後に適用")
+            .changed();
+    });
+
+    match &mut layer.mask {
+        local_adjust_core::LocalMask::Full => {
+            ui.label(
+                egui::RichText::new("画像全体に効果を適用します。")
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(170)),
+            );
+        }
+        local_adjust_core::LocalMask::Raster(mask) => {
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("クリア").clicked() {
+                    mask.alpha.fill(0.0);
+                    changed = true;
+                }
+                if ui.small_button("塗りつぶし").clicked() {
+                    mask.alpha.fill(1.0);
+                    changed = true;
+                }
+            });
+            ui.label(format!("ビットマップ: {} x {}", mask.width, mask.height));
+        }
+        local_adjust_core::LocalMask::RasterVector(mask) => {
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("ビットマップ消去").clicked() {
+                    mask.alpha.fill(0.0);
+                    changed = true;
+                }
+                if ui.small_button("ビットマップ塗り").clicked() {
+                    mask.alpha.fill(1.0);
+                    changed = true;
+                }
+                if ui.small_button("図形消去").clicked() {
+                    mask.shapes.clear();
+                    changed = true;
+                }
+            });
+            ui.label(format!(
+                "手動マスク: {} x {} / 図形 {}",
+                mask.width,
+                mask.height,
+                mask.shapes.len()
+            ));
+        }
+        local_adjust_core::LocalMask::LinearGradient(mask) => {
+            if !mask.initialized && ui.small_button("上下グラデーションを作成").clicked()
+            {
+                *mask = local_adjust_core::LinearGradientMask {
+                    initialized: true,
+                    start: [0.5, 0.0],
+                    end: [0.5, 1.0],
+                };
+                changed = true;
+            }
+            changed |= ui.checkbox(&mut mask.initialized, "有効").changed();
+            changed |= local_adjust_slider(ui, &mut mask.start[0], 0.0..=1.0, "開始 X");
+            changed |= local_adjust_slider(ui, &mut mask.start[1], 0.0..=1.0, "開始 Y");
+            changed |= local_adjust_slider(ui, &mut mask.end[0], 0.0..=1.0, "終了 X");
+            changed |= local_adjust_slider(ui, &mut mask.end[1], 0.0..=1.0, "終了 Y");
+        }
+        local_adjust_core::LocalMask::RadialGradient(mask) => {
+            if !mask.initialized && ui.small_button("中央円形グラデーションを作成").clicked()
+            {
+                *mask = local_adjust_core::RadialGradientMask {
+                    initialized: true,
+                    center: [0.5, 0.5],
+                    inner_radius: 0.18,
+                    inner_radius_y: 0.18,
+                    outer_radius: 0.65,
+                    outer_radius_y: 0.65,
+                };
+                changed = true;
+            }
+            changed |= ui.checkbox(&mut mask.initialized, "有効").changed();
+            changed |= local_adjust_slider(ui, &mut mask.center[0], 0.0..=1.0, "中心 X");
+            changed |= local_adjust_slider(ui, &mut mask.center[1], 0.0..=1.0, "中心 Y");
+            changed |= local_adjust_slider(ui, &mut mask.inner_radius, 0.0..=1.5, "内側 横");
+            changed |= local_adjust_slider(ui, &mut mask.inner_radius_y, 0.0..=1.5, "内側 縦");
+            changed |= local_adjust_slider(ui, &mut mask.outer_radius, 0.0..=1.5, "外側 横");
+            changed |= local_adjust_slider(ui, &mut mask.outer_radius_y, 0.0..=1.5, "外側 縦");
+            mask.outer_radius = mask.outer_radius.max(mask.inner_radius + 0.001);
+            mask.outer_radius_y = mask.outer_radius_y.max(mask.inner_radius_y + 0.001);
+        }
+        local_adjust_core::LocalMask::LumaRange(mask) => {
+            ui.label(
+                egui::RichText::new("輝度範囲")
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(170)),
+            );
+            changed |= draw_range_mask_sliders(ui, mask);
+        }
+        local_adjust_core::LocalMask::ColorRange(mask) => {
+            if !mask.initialized && ui.small_button("白を対象色にする").clicked() {
+                mask.initialized = true;
+                mask.target_rgb = [255, 255, 255];
+                changed = true;
+            }
+            let mut r = mask.target_rgb[0] as i32;
+            let mut g = mask.target_rgb[1] as i32;
+            let mut b = mask.target_rgb[2] as i32;
+            let rgb_changed = ui
+                .add(egui::Slider::new(&mut r, 0..=255).text("R"))
+                .changed()
+                | ui.add(egui::Slider::new(&mut g, 0..=255).text("G"))
+                    .changed()
+                | ui.add(egui::Slider::new(&mut b, 0..=255).text("B"))
+                    .changed();
+            if rgb_changed {
+                mask.target_rgb = [r as u8, g as u8, b as u8];
+                mask.initialized = true;
+                changed = true;
+            }
+            changed |= local_adjust_slider(ui, &mut mask.tolerance, 0.0..=1.0, "許容幅");
+            changed |= local_adjust_slider(ui, &mut mask.feather, 0.0..=1.0, "範囲ぼかし");
+        }
+        local_adjust_core::LocalMask::Subject(mask) => {
+            ui.label(format!("被写体マスク: {} x {}", mask.width, mask.height));
+            changed |= ui
+                .checkbox(&mut mask.refinement.enabled, "輪郭補正")
+                .changed();
+            changed |=
+                local_adjust_slider(ui, &mut mask.refinement.threshold, 0.0..=1.0, "しきい値");
+            let mut expand = mask.refinement.expand_px;
+            let mut feather = mask.refinement.feather_px;
+            changed |= ui
+                .add(egui::Slider::new(&mut expand, -32..=32).text("拡張"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut feather, 0..=32).text("ぼかし"))
+                .changed();
+            mask.refinement.expand_px = expand;
+            mask.refinement.feather_px = feather;
+        }
+        local_adjust_core::LocalMask::Segmentation(mask) => {
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("全選択").clicked() {
+                    for selected in mask.selected.iter_mut().skip(1) {
+                        *selected = true;
+                    }
+                    changed = true;
+                }
+                if ui.small_button("全解除").clicked() {
+                    for selected in mask.selected.iter_mut().skip(1) {
+                        *selected = false;
+                    }
+                    changed = true;
+                }
+            });
+            ui.label(format!("領域数: {}", mask.label_count()));
+        }
+    }
+    changed
 }
 
 fn draw_header_icon_button(
