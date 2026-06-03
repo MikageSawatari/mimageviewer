@@ -210,6 +210,33 @@ mod local_adjust_segmentation_tests {
     }
 
     #[test]
+    fn full_mask_preview_hides_plain_full_base_but_shows_subtract_result() {
+        let mut layer = local_adjust_core::LocalAdjustmentLayer::new(
+            "full",
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::None,
+        );
+        assert_eq!(
+            local_adjust_mask_preview_alpha(&layer, None, 2, 1, 0, 0),
+            0.0
+        );
+        layer.manual_override.subtract = Some(local_adjust_core::RasterVectorMask {
+            width: 2,
+            height: 1,
+            alpha: vec![1.0, 0.0],
+            shapes: Vec::new(),
+        });
+        assert_eq!(
+            local_adjust_mask_preview_alpha(&layer, None, 2, 1, 0, 0),
+            0.0
+        );
+        assert_eq!(
+            local_adjust_mask_preview_alpha(&layer, None, 2, 1, 1, 0),
+            1.0
+        );
+    }
+
+    #[test]
     fn bitmap_mask_expand_and_shrink_use_3x3_neighbors() {
         let src = vec![
             0.0, 0.0, 0.0, //
@@ -4596,7 +4623,18 @@ fn local_adjust_mask_preview_alpha(
 ) -> f32 {
     let idx = y.saturating_mul(width).saturating_add(x);
     let mut alpha = match &layer.mask {
-        local_adjust_core::LocalMask::Full => 1.0,
+        local_adjust_core::LocalMask::Full => {
+            if layer
+                .manual_override
+                .subtract
+                .as_ref()
+                .is_some_and(local_adjust_raster_vector_mask_has_content)
+            {
+                1.0
+            } else {
+                0.0
+            }
+        }
         local_adjust_core::LocalMask::Raster(mask) => {
             if mask.width == width && mask.height == height {
                 mask.alpha.get(idx).copied().unwrap_or(0.0)
@@ -4658,6 +4696,11 @@ fn local_adjust_mask_preview_alpha(
         alpha = 1.0 - alpha;
     }
     (alpha * layer.opacity.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+}
+
+fn local_adjust_raster_vector_mask_has_content(mask: &local_adjust_core::RasterVectorMask) -> bool {
+    mask.alpha.iter().any(|&alpha| alpha >= 0.5)
+        || mask.shapes.iter().any(|shape| shape.op().is_add())
 }
 
 fn local_adjust_raster_vector_preview_alpha(
