@@ -30,9 +30,9 @@
 //! (= ラボとの値が乖離したら、本テストが落ちることで気付ける)。
 
 use local_adjust_core::{
-    LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, MaskShape,
-    RadialGradientMask, RasterMask, RasterVectorMask, RgbaImageRef, ShapeOp, SubjectMaskRefinement,
-    evaluate_layer_mask,
+    InvertParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
+    MaskShape, RadialGradientMask, RasterMask, RasterVectorMask, RgbaImageBuf, RgbaImageRef,
+    ShapeOp, SubjectMaskRefinement, apply_layers, evaluate_layer_mask,
 };
 
 // ---------------------------------------------------------------------------
@@ -223,6 +223,37 @@ fn initialized_linear_gradient_produces_varying_mask_alpha() {
     assert!(
         (alpha_tl - alpha_br).abs() > 0.1,
         "対角でアルファが変化しない (TL={alpha_tl} BR={alpha_br}) → グラデーション機能していない"
+    );
+}
+
+#[test]
+fn linear_gradient_invert_blend_has_stable_pixel_results() {
+    let src = RgbaImageBuf::new(
+        4,
+        1,
+        vec![
+            10, 20, 30, 201, 80, 90, 100, 202, 150, 160, 170, 203, 220, 230, 240, 204,
+        ],
+    )
+    .unwrap();
+    let layer = LocalAdjustmentLayer::new(
+        "linear-invert",
+        LocalMask::LinearGradient(LinearGradientMask {
+            initialized: true,
+            start: [0.0, 0.0],
+            end: [1.0, 0.0],
+        }),
+        LocalEffect::Invert(InvertParams { strength: 1.0 }),
+    );
+
+    let out = apply_layers(src.as_ref(), &[layer]).expect("parallelized blend path succeeds");
+
+    assert_eq!(
+        out.pixels,
+        vec![
+            39, 47, 54, 201, 116, 118, 121, 202, 122, 119, 117, 203, 58, 51, 43, 204,
+        ],
+        "linear mask evaluation, invert effect, and RGB blend must stay byte-stable"
     );
 }
 

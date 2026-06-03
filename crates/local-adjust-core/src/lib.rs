@@ -8,6 +8,7 @@ use std::fmt;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4444,9 +4445,9 @@ fn evaluate_layer_mask_without_opacity(
         &layer.manual_override,
     )?;
     if layer.mask_inverted {
-        for a in &mut alpha {
+        alpha.par_iter_mut().for_each(|a| {
             *a = 1.0 - *a;
-        }
+        });
     }
     if layer.mask_expand_px.abs() >= 0.5 {
         alpha = morph_alpha(
@@ -4469,9 +4470,9 @@ fn evaluate_layer_mask_without_opacity(
 
 fn apply_mask_opacity(alpha: &mut [f32], opacity: f32) {
     let opacity = opacity.clamp(0.0, 1.0);
-    for a in alpha {
+    alpha.par_iter_mut().for_each(|a| {
         *a = (*a * opacity).clamp(0.0, 1.0);
-    }
+    });
 }
 
 fn apply_manual_override(
@@ -4498,20 +4499,26 @@ fn apply_raster_vector_override(
 ) -> Result<()> {
     mask.validate(width, height)?;
     if mask.shapes.is_empty() {
-        for (a, &mask_alpha) in alpha.iter_mut().zip(&mask.alpha) {
-            if mask_alpha.clamp(0.0, 1.0) >= 0.5 {
-                *a = value;
-            }
-        }
+        alpha
+            .par_iter_mut()
+            .zip(mask.alpha.par_iter())
+            .for_each(|(a, &mask_alpha)| {
+                if mask_alpha.clamp(0.0, 1.0) >= 0.5 {
+                    *a = value;
+                }
+            });
         return Ok(());
     }
 
     let mask_alpha = eval_raster_vector_mask(mask, width, height)?;
-    for (a, mask_alpha) in alpha.iter_mut().zip(mask_alpha) {
-        if mask_alpha >= 0.5 {
-            *a = value;
-        }
-    }
+    alpha
+        .par_iter_mut()
+        .zip(mask_alpha.into_par_iter())
+        .for_each(|(a, mask_alpha)| {
+            if mask_alpha >= 0.5 {
+                *a = value;
+            }
+        });
     Ok(())
 }
 
@@ -4961,27 +4968,29 @@ where
 
 fn mask_rgba_input(src: &[u8], mask: &[f32]) -> Vec<u8> {
     let mut out = src.to_vec();
-    for (idx, amount) in mask.iter().enumerate() {
-        let o = idx * 4;
-        let amount = amount.clamp(0.0, 1.0);
-        for c in 0..4 {
-            out[o + c] = (src[o + c] as f32 * amount).round().clamp(0.0, 255.0) as u8;
-        }
-    }
+    out.par_chunks_exact_mut(4)
+        .zip(mask.par_iter())
+        .for_each(|(px, amount)| {
+            let amount = amount.clamp(0.0, 1.0);
+            for c in 0..4 {
+                px[c] = (px[c] as f32 * amount).round().clamp(0.0, 255.0) as u8;
+            }
+        });
     out
 }
 
 fn add_rgb_effect_delta(base: &mut [u8], effected: &[u8], input: &[u8], opacity: f32) {
     let opacity = opacity.clamp(0.0, 1.0);
-    for i in (0..base.len()).step_by(4) {
-        for c in 0..3 {
-            let delta = effected[i + c] as f32 - input[i + c] as f32;
-            base[i + c] = (base[i + c] as f32 + delta * opacity)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-        }
-        // Keep source alpha stable; alpha expansion is intentionally out of scope.
-    }
+    base.par_chunks_exact_mut(4)
+        .zip(effected.par_chunks_exact(4))
+        .zip(input.par_chunks_exact(4))
+        .for_each(|((base, effected), input)| {
+            for c in 0..3 {
+                let delta = effected[c] as f32 - input[c] as f32;
+                base[c] = (base[c] as f32 + delta * opacity).round().clamp(0.0, 255.0) as u8;
+            }
+            // Keep source alpha stable; alpha expansion is intentionally out of scope.
+        });
 }
 
 fn evaluate_raw_mask(image: RgbaImageRef<'_>, mask: &LocalMask) -> Result<Vec<f32>> {
@@ -4990,17 +4999,17 @@ fn evaluate_raw_mask(image: RgbaImageRef<'_>, mask: &LocalMask) -> Result<Vec<f3
         LocalMask::Full => Ok(vec![1.0; len]),
         LocalMask::Raster(mask) => {
             mask.validate(image.width, image.height)?;
-            Ok(mask.alpha.iter().map(|v| v.clamp(0.0, 1.0)).collect())
+            Ok(mask.alpha.par_iter().map(|v| v.clamp(0.0, 1.0)).collect())
         }
         LocalMask::Subject(mask) => {
             mask.validate(image.width, image.height)?;
-            Ok(mask.alpha.iter().map(|v| v.clamp(0.0, 1.0)).collect())
+            Ok(mask.alpha.par_iter().map(|v| v.clamp(0.0, 1.0)).collect())
         }
         LocalMask::Segmentation(mask) => {
             mask.validate(image.width, image.height)?;
             Ok(mask
                 .labels
-                .iter()
+                .par_iter()
                 .map(|&label| {
                     if mask.selected.get(label as usize).copied().unwrap_or(false) {
                         1.0
@@ -5217,13 +5226,13 @@ fn eval_linear_gradient(width: usize, height: usize, mask: LinearGradientMask) -
     let mut out = vec![0.0; width * height];
     let wf = width.max(1) as f32;
     let hf = height.max(1) as f32;
-    for y in 0..height {
-        for x in 0..width {
-            let nx = (x as f32 + 0.5) / wf;
-            let ny = (y as f32 + 0.5) / hf;
-            out[y * width + x] = (((nx - sx) * dx + (ny - sy) * dy) / denom).clamp(0.0, 1.0);
-        }
-    }
+    out.par_iter_mut().enumerate().for_each(|(i, alpha)| {
+        let x = i % width;
+        let y = i / width;
+        let nx = (x as f32 + 0.5) / wf;
+        let ny = (y as f32 + 0.5) / hf;
+        *alpha = (((nx - sx) * dx + (ny - sy) * dy) / denom).clamp(0.0, 1.0);
+    });
     out
 }
 
@@ -5238,24 +5247,24 @@ fn eval_radial_gradient(width: usize, height: usize, mask: RadialGradientMask) -
     let inner_y = mask.inner_radius_y.max(0.0);
     let outer_x = mask.outer_radius.max(inner_x + 0.0001);
     let outer_y = mask.outer_radius_y.max(inner_y + 0.0001);
-    for y in 0..height {
-        for x in 0..width {
-            let nx = (x as f32 + 0.5) / wf;
-            let ny = (y as f32 + 0.5) / hf;
-            let dx = nx - mask.center[0];
-            let dy = ny - mask.center[1];
-            let dist = (dx * dx + dy * dy).sqrt();
-            if dist <= f32::EPSILON {
-                out[y * width + x] = 1.0;
-                continue;
-            }
-            let ux = dx / dist;
-            let uy = dy / dist;
-            let inner = ellipse_radius_for_direction(inner_x, inner_y, ux, uy);
-            let outer = ellipse_radius_for_direction(outer_x, outer_y, ux, uy).max(inner + 0.0001);
-            out[y * width + x] = (1.0 - ((dist - inner) / (outer - inner))).clamp(0.0, 1.0);
+    out.par_iter_mut().enumerate().for_each(|(i, alpha)| {
+        let x = i % width;
+        let y = i / width;
+        let nx = (x as f32 + 0.5) / wf;
+        let ny = (y as f32 + 0.5) / hf;
+        let dx = nx - mask.center[0];
+        let dy = ny - mask.center[1];
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist <= f32::EPSILON {
+            *alpha = 1.0;
+            return;
         }
-    }
+        let ux = dx / dist;
+        let uy = dy / dist;
+        let inner = ellipse_radius_for_direction(inner_x, inner_y, ux, uy);
+        let outer = ellipse_radius_for_direction(outer_x, outer_y, ux, uy).max(inner + 0.0001);
+        *alpha = (1.0 - ((dist - inner) / (outer - inner))).clamp(0.0, 1.0);
+    });
     out
 }
 
@@ -5276,10 +5285,13 @@ fn ellipse_radius_for_direction(rx: f32, ry: f32, ux: f32, uy: f32) -> f32 {
 fn eval_luma_range(image: RgbaImageRef<'_>, mask: RangeMask) -> Vec<f32> {
     let mut out = vec![0.0; image.width * image.height];
     let (min, max) = ordered_pair(mask.min, mask.max);
-    for (i, px) in image.pixels.chunks_exact(4).enumerate() {
-        let luma = (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) / 255.0;
-        out[i] = range_alpha(luma, min, max, mask.feather);
-    }
+    out.par_iter_mut()
+        .zip(image.pixels.par_chunks_exact(4))
+        .for_each(|(alpha, px)| {
+            let luma =
+                (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) / 255.0;
+            *alpha = range_alpha(luma, min, max, mask.feather);
+        });
     out
 }
 
@@ -5293,17 +5305,19 @@ fn eval_color_range(image: RgbaImageRef<'_>, mask: ColorRangeMask) -> Vec<f32> {
     let tb = mask.target_rgb[2] as f32 / 255.0;
     let tol = mask.tolerance.max(0.0);
     let feather = mask.feather.max(0.0001);
-    for (i, px) in image.pixels.chunks_exact(4).enumerate() {
-        let dr = px[0] as f32 / 255.0 - tr;
-        let dg = px[1] as f32 / 255.0 - tg;
-        let db = px[2] as f32 / 255.0 - tb;
-        let dist = ((dr * dr + dg * dg + db * db) / 3.0).sqrt();
-        out[i] = if dist <= tol {
-            1.0
-        } else {
-            (1.0 - (dist - tol) / feather).clamp(0.0, 1.0)
-        };
-    }
+    out.par_iter_mut()
+        .zip(image.pixels.par_chunks_exact(4))
+        .for_each(|(alpha, px)| {
+            let dr = px[0] as f32 / 255.0 - tr;
+            let dg = px[1] as f32 / 255.0 - tg;
+            let db = px[2] as f32 / 255.0 - tb;
+            let dist = ((dr * dr + dg * dg + db * db) / 3.0).sqrt();
+            *alpha = if dist <= tol {
+                1.0
+            } else {
+                (1.0 - (dist - tol) / feather).clamp(0.0, 1.0)
+            };
+        });
     out
 }
 
@@ -5542,23 +5556,23 @@ fn alpha_gradient_with_outside(
 
 fn apply_tone_image(src: &[u8], params: ToneParams) -> Vec<u8> {
     let mut out = src.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    out.par_chunks_exact_mut(4).for_each(|px| {
         let adjusted = tone_rgb([px[0], px[1], px[2]], params);
         px[0] = adjusted[0];
         px[1] = adjusted[1];
         px[2] = adjusted[2];
-    }
+    });
     out
 }
 
 fn apply_tone_curve(src: &[u8], params: ToneCurveParams) -> Vec<u8> {
     let lut = tone_curve_lut(params);
     let mut out = src.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    out.par_chunks_exact_mut(4).for_each(|px| {
         px[0] = lut[px[0] as usize];
         px[1] = lut[px[1] as usize];
         px[2] = lut[px[2] as usize];
-    }
+    });
     out
 }
 
@@ -5567,11 +5581,11 @@ fn apply_rgb_tone_curve(src: &[u8], params: RgbToneCurveParams) -> Vec<u8> {
     let green_lut = rgb_tone_curve_lut(params.master, params.green);
     let blue_lut = rgb_tone_curve_lut(params.master, params.blue);
     let mut out = src.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    out.par_chunks_exact_mut(4).for_each(|px| {
         px[0] = red_lut[px[0] as usize];
         px[1] = green_lut[px[1] as usize];
         px[2] = blue_lut[px[2] as usize];
-    }
+    });
     out
 }
 
@@ -5612,7 +5626,7 @@ fn apply_color_balance(src: &[u8], params: ColorBalanceParams) -> Vec<u8> {
         return src.to_vec();
     }
     let mut out = src.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    out.par_chunks_exact_mut(4).for_each(|px| {
         let r = px[0] as f32 / 255.0;
         let g = px[1] as f32 / 255.0;
         let b = px[2] as f32 / 255.0;
@@ -5641,7 +5655,7 @@ fn apply_color_balance(src: &[u8], params: ColorBalanceParams) -> Vec<u8> {
         px[0] = to_u8(adjusted[0]);
         px[1] = to_u8(adjusted[1]);
         px[2] = to_u8(adjusted[2]);
-    }
+    });
     out
 }
 
@@ -5669,9 +5683,9 @@ fn apply_photo_filter(src: &[u8], params: PhotoFilterParams) -> Vec<u8> {
     }
     let filter = rgb_u8_to_f32(photo_filter_rgb(params));
     let mut out = src.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    out.par_chunks_exact_mut(4).for_each(|px| {
         if px[3] == 0 {
-            continue;
+            return;
         }
         let base = [
             px[0] as f32 / 255.0,
@@ -5694,7 +5708,7 @@ fn apply_photo_filter(src: &[u8], params: PhotoFilterParams) -> Vec<u8> {
         for c in 0..3 {
             px[c] = to_u8(lerp_f32(base[c], filtered[c], strength));
         }
-    }
+    });
     out
 }
 
@@ -5722,7 +5736,7 @@ fn apply_three_way_color_grading(src: &[u8], params: ThreeWayColorGradingParams)
     }
     let mut out = src.to_vec();
     let balance = (params.balance / 100.0).clamp(-1.0, 1.0) * 0.18;
-    for px in out.chunks_exact_mut(4) {
+    out.par_chunks_exact_mut(4).for_each(|px| {
         let r = px[0] as f32 / 255.0;
         let g = px[1] as f32 / 255.0;
         let b = px[2] as f32 / 255.0;
@@ -5739,7 +5753,7 @@ fn apply_three_way_color_grading(src: &[u8], params: ThreeWayColorGradingParams)
         px[0] = to_u8(r + delta[0]);
         px[1] = to_u8(g + delta[1]);
         px[2] = to_u8(b + delta[2]);
-    }
+    });
     out
 }
 
@@ -5775,7 +5789,7 @@ fn apply_selective_color(src: &[u8], params: SelectiveColorParams) -> Vec<u8> {
     let range = params.range_degrees.clamp(1.0, 180.0);
     let feather = params.feather_degrees.clamp(0.0, 180.0);
     let mut out = src.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    out.par_chunks_exact_mut(4).for_each(|px| {
         let (mut h, mut s, mut l) = rgb_to_hsl(
             px[0] as f32 / 255.0,
             px[1] as f32 / 255.0,
@@ -5785,7 +5799,7 @@ fn apply_selective_color(src: &[u8], params: SelectiveColorParams) -> Vec<u8> {
         let weight =
             selective_hue_weight(hue_degrees, target, range, feather) * smoothstep(0.03, 0.16, s);
         if weight <= f32::EPSILON {
-            continue;
+            return;
         }
         h = wrap01(h + hue_shift * weight);
         s = (s * (1.0 + sat_delta * weight)).clamp(0.0, 1.0);
@@ -5794,7 +5808,7 @@ fn apply_selective_color(src: &[u8], params: SelectiveColorParams) -> Vec<u8> {
         px[0] = to_u8(r);
         px[1] = to_u8(g);
         px[2] = to_u8(b);
-    }
+    });
     out
 }
 
@@ -5813,7 +5827,7 @@ fn apply_part_color(src: &[u8], params: PartColorParams) -> Vec<u8> {
     let range = params.range_degrees.clamp(1.0, 180.0);
     let feather = params.feather_degrees.clamp(0.0, 180.0);
     let mut out = src.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    out.par_chunks_exact_mut(4).for_each(|px| {
         let r = px[0] as f32 / 255.0;
         let g = px[1] as f32 / 255.0;
         let b = px[2] as f32 / 255.0;
@@ -5831,7 +5845,7 @@ fn apply_part_color(src: &[u8], params: PartColorParams) -> Vec<u8> {
         px[0] = to_u8(lerp_f32(selected[0], gray, gray_mix));
         px[1] = to_u8(lerp_f32(selected[1], gray, gray_mix));
         px[2] = to_u8(lerp_f32(selected[2], gray, gray_mix));
-    }
+    });
     out
 }
 
@@ -5861,7 +5875,7 @@ fn apply_channel_mixer(src: &[u8], params: ChannelMixerParams) -> Vec<u8> {
         return src.to_vec();
     }
     let mut out = src.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    out.par_chunks_exact_mut(4).for_each(|px| {
         let rgb = [
             px[0] as f32 / 255.0,
             px[1] as f32 / 255.0,
@@ -5877,7 +5891,7 @@ fn apply_channel_mixer(src: &[u8], params: ChannelMixerParams) -> Vec<u8> {
             px[1] = to_u8(mix_channels(rgb, params.green_output));
             px[2] = to_u8(mix_channels(rgb, params.blue_output));
         }
-    }
+    });
     out
 }
 
@@ -5904,9 +5918,9 @@ fn apply_monochrome_mixer(src: &[u8], params: MonochromeMixerParams) -> Vec<u8> 
     let tint_luma = luma01(tint[0], tint[1], tint[2]).max(0.001);
     let contrast = (1.0 + params.contrast.clamp(-100.0, 100.0) / 100.0).max(0.0);
     let mut out = src.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    out.par_chunks_exact_mut(4).for_each(|px| {
         if px[3] == 0 {
-            continue;
+            return;
         }
         let base = [
             px[0] as f32 / 255.0,
@@ -5948,7 +5962,7 @@ fn apply_monochrome_mixer(src: &[u8], params: MonochromeMixerParams) -> Vec<u8> 
         for c in 0..3 {
             px[c] = to_u8(lerp_f32(base[c], mono[c], strength));
         }
-    }
+    });
     out
 }
 
@@ -5965,13 +5979,16 @@ fn apply_clarity(src: &[u8], width: usize, height: usize, radius: usize, amount:
     }
     let blur = box_blur_rgba(src, width, height, radius);
     let mut out = src.to_vec();
-    for i in (0..src.len()).step_by(4) {
-        for c in 0..3 {
-            let base = src[i + c] as f32;
-            let low = blur[i + c] as f32;
-            out[i + c] = (base + (base - low) * amount).round().clamp(0.0, 255.0) as u8;
-        }
-    }
+    out.par_chunks_exact_mut(4)
+        .zip(src.par_chunks_exact(4))
+        .zip(blur.par_chunks_exact(4))
+        .for_each(|((out, src), blur)| {
+            for c in 0..3 {
+                let base = src[c] as f32;
+                let low = blur[c] as f32;
+                out[c] = (base + (base - low) * amount).round().clamp(0.0, 255.0) as u8;
+            }
+        });
     out
 }
 
@@ -5983,13 +6000,17 @@ fn apply_texture(src: &[u8], width: usize, height: usize, radius: usize, amount:
     let fine = box_blur_rgba(src, width, height, fine_radius);
     let coarse = box_blur_rgba(src, width, height, radius);
     let mut out = src.to_vec();
-    for i in (0..src.len()).step_by(4) {
-        for c in 0..3 {
-            let base = src[i + c] as f32;
-            let detail = fine[i + c] as f32 - coarse[i + c] as f32;
-            out[i + c] = (base + detail * amount).round().clamp(0.0, 255.0) as u8;
-        }
-    }
+    out.par_chunks_exact_mut(4)
+        .zip(src.par_chunks_exact(4))
+        .zip(fine.par_chunks_exact(4))
+        .zip(coarse.par_chunks_exact(4))
+        .for_each(|(((out, src), fine), coarse)| {
+            for c in 0..3 {
+                let base = src[c] as f32;
+                let detail = fine[c] as f32 - coarse[c] as f32;
+                out[c] = (base + detail * amount).round().clamp(0.0, 255.0) as u8;
+            }
+        });
     out
 }
 
@@ -6007,21 +6028,24 @@ fn apply_high_pass(
     }
     let blur = box_blur_rgba(src, width, height, radius);
     let mut out = src.to_vec();
-    for i in (0..src.len()).step_by(4) {
-        for c in 0..3 {
-            let base = src[i + c] as f32;
-            let low = blur[i + c] as f32;
-            let high_pass = (128.0 + (base - low) * contrast).round().clamp(0.0, 255.0) as u8;
-            if detail_only {
-                out[i + c] = high_pass;
-            } else {
-                let overlay = overlay_channel(src[i + c], high_pass);
-                out[i + c] = (base + (overlay as f32 - base) * amount)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
+    out.par_chunks_exact_mut(4)
+        .zip(src.par_chunks_exact(4))
+        .zip(blur.par_chunks_exact(4))
+        .for_each(|((out, src), blur)| {
+            for c in 0..3 {
+                let base = src[c] as f32;
+                let low = blur[c] as f32;
+                let high_pass = (128.0 + (base - low) * contrast).round().clamp(0.0, 255.0) as u8;
+                if detail_only {
+                    out[c] = high_pass;
+                } else {
+                    let overlay = overlay_channel(src[c], high_pass);
+                    out[c] = (base + (overlay as f32 - base) * amount)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
             }
-        }
-    }
+        });
     out
 }
 
@@ -10124,7 +10148,7 @@ fn apply_threshold(src: &[u8], params: ThresholdParams) -> Vec<u8> {
     }
     let threshold = params.threshold.clamp(0.0, 1.0);
     let mut out = src.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    out.par_chunks_exact_mut(4).for_each(|px| {
         let rgb = [
             px[0] as f32 / 255.0,
             px[1] as f32 / 255.0,
@@ -10141,7 +10165,7 @@ fn apply_threshold(src: &[u8], params: ThresholdParams) -> Vec<u8> {
         px[0] = to_u8(lerp_f32(rgb[0], target, strength));
         px[1] = to_u8(lerp_f32(rgb[1], target, strength));
         px[2] = to_u8(lerp_f32(rgb[2], target, strength));
-    }
+    });
     out
 }
 
@@ -10151,12 +10175,12 @@ fn apply_invert(src: &[u8], params: InvertParams) -> Vec<u8> {
         return src.to_vec();
     }
     let mut out = src.to_vec();
-    for px in out.chunks_exact_mut(4) {
+    out.par_chunks_exact_mut(4).for_each(|px| {
         for channel in &mut px[0..3] {
             let original = *channel as f32 / 255.0;
             *channel = to_u8(lerp_f32(original, 1.0 - original, strength));
         }
-    }
+    });
     out
 }
 
@@ -15465,28 +15489,32 @@ fn apply_despeckle(src: &[u8], width: usize, height: usize, params: DespecklePar
 }
 
 fn blend_rgb_with_mask(base: &mut [u8], effected: &[u8], mask: &[f32]) {
-    for (i, amount) in mask.iter().enumerate() {
-        let o = i * 4;
-        let amount = amount.clamp(0.0, 1.0);
-        for c in 0..3 {
-            base[o + c] = lerp_u8(base[o + c], effected[o + c], amount);
-        }
-        // Keep source alpha stable; local adjustments are visual RGB operations.
-    }
+    base.par_chunks_exact_mut(4)
+        .zip(effected.par_chunks_exact(4))
+        .zip(mask.par_iter())
+        .for_each(|((base, effected), amount)| {
+            let amount = amount.clamp(0.0, 1.0);
+            for c in 0..3 {
+                base[c] = lerp_u8(base[c], effected[c], amount);
+            }
+            // Keep source alpha stable; local adjustments are visual RGB operations.
+        });
 }
 
 fn blend_rgb_with_effect_alpha_mask(base: &mut [u8], effected: &[u8], mask: &[f32]) {
-    for (i, mask_amount) in mask.iter().enumerate() {
-        let o = i * 4;
-        let amount = (effected[o + 3] as f32 / 255.0 * mask_amount.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-        if amount <= f32::EPSILON {
-            continue;
-        }
-        for c in 0..3 {
-            base[o + c] = lerp_u8(base[o + c], effected[o + c], amount);
-        }
-        // Keep source alpha stable; outline stroke is a visual RGB overlay.
-    }
+    base.par_chunks_exact_mut(4)
+        .zip(effected.par_chunks_exact(4))
+        .zip(mask.par_iter())
+        .for_each(|((base, effected), mask_amount)| {
+            let amount = (effected[3] as f32 / 255.0 * mask_amount.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            if amount <= f32::EPSILON {
+                return;
+            }
+            for c in 0..3 {
+                base[c] = lerp_u8(base[c], effected[c], amount);
+            }
+            // Keep source alpha stable; outline stroke is a visual RGB overlay.
+        });
 }
 
 fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {

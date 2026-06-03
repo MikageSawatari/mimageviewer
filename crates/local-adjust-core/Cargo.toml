@@ -9,4 +9,5 @@ name = "local_adjust_core"
 path = "src/lib.rs"
 
 [dependencies]
+rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
