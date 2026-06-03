@@ -429,6 +429,48 @@ mod local_adjust_segmentation_tests {
     }
 
     #[test]
+    fn subject_mask_refinement_defaults_to_disabled() {
+        assert!(!local_adjust_core::SubjectMaskRefinement::default().enabled);
+    }
+
+    #[test]
+    fn subject_refinement_binarizes_soft_alpha() {
+        let mask = local_adjust_core::RasterMask {
+            width: 4,
+            height: 1,
+            alpha: vec![0.20, 0.49, 0.52, 0.90],
+        };
+        let refined = local_adjust_subject_refined_alpha(&mask, 0.5, 0, 0);
+        assert_eq!(refined, vec![0.0, 0.0, 1.0, 1.0]);
+        let stats = local_adjust_subject_mask_stats(&local_adjust_core::SubjectMask::from_raster(
+            local_adjust_core::RasterMask {
+                width: 4,
+                height: 1,
+                alpha: refined,
+            },
+        ));
+        assert_eq!(stats.foreground_percent, 50.0);
+        assert_eq!(stats.soft_percent, 0.0);
+    }
+
+    #[test]
+    fn subject_refinement_regenerates_from_cached_source() {
+        let source = local_adjust_core::RasterMask {
+            width: 4,
+            height: 1,
+            alpha: vec![0.20, 0.45, 0.55, 0.90],
+        };
+        let mut subject = local_adjust_core::SubjectMask::from_raster(source);
+        subject.alpha =
+            local_adjust_subject_refined_alpha(&subject.source_raster_mask(), 0.60, 0, 0);
+        assert_eq!(subject.alpha, vec![0.0, 0.0, 0.0, 1.0]);
+
+        subject.alpha =
+            local_adjust_subject_refined_alpha(&subject.source_raster_mask(), 0.40, 0, 0);
+        assert_eq!(subject.alpha, vec![0.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
     fn tilt_shift_linear_focus_drag_updates_focus_width_and_angle() {
         let mut params = local_adjust_core::TiltShiftParams {
             range_initialized: true,
@@ -1934,6 +1976,106 @@ fn local_adjust_subject_mask_has_content(mask: &local_adjust_core::SubjectMask) 
             .source_alpha
             .as_ref()
             .is_some_and(|alpha| alpha.iter().any(|&value| value > 0.02))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LocalAdjustSubjectMaskStats {
+    foreground_percent: f32,
+    soft_percent: f32,
+}
+
+fn local_adjust_subject_mask_stats(
+    mask: &local_adjust_core::SubjectMask,
+) -> LocalAdjustSubjectMaskStats {
+    if mask.alpha.is_empty() {
+        return LocalAdjustSubjectMaskStats {
+            foreground_percent: 0.0,
+            soft_percent: 0.0,
+        };
+    }
+    let mut foreground = 0usize;
+    let mut soft = 0usize;
+    for &alpha in &mask.alpha {
+        let alpha = alpha.clamp(0.0, 1.0);
+        if alpha >= 0.5 {
+            foreground += 1;
+        }
+        if alpha > 0.02 && alpha < 0.98 {
+            soft += 1;
+        }
+    }
+    let total = mask.alpha.len() as f32;
+    LocalAdjustSubjectMaskStats {
+        foreground_percent: foreground as f32 * 100.0 / total,
+        soft_percent: soft as f32 * 100.0 / total,
+    }
+}
+
+fn local_adjust_subject_refined_alpha(
+    mask: &local_adjust_core::RasterMask,
+    threshold: f32,
+    expand_px: i32,
+    feather_px: usize,
+) -> Vec<f32> {
+    let threshold = threshold.clamp(0.0, 1.0);
+    let mut alpha: Vec<f32> = mask
+        .alpha
+        .iter()
+        .map(|&value| {
+            if value.clamp(0.0, 1.0) >= threshold {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let steps = expand_px.unsigned_abs().min(16);
+    for _ in 0..steps {
+        alpha = local_adjust_morph_alpha_1px(&alpha, mask.width, mask.height, expand_px >= 0);
+    }
+    if feather_px > 0 {
+        alpha = local_adjust_box_blur_alpha(&alpha, mask.width, mask.height, feather_px.min(16));
+    }
+    alpha
+}
+
+fn local_adjust_box_blur_alpha(
+    src: &[f32],
+    width: usize,
+    height: usize,
+    radius: usize,
+) -> Vec<f32> {
+    if radius == 0 || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let mut tmp = vec![0.0; src.len()];
+    let mut out = vec![0.0; src.len()];
+    let mut prefix = vec![0.0; width.max(height) + 1];
+    for y in 0..height {
+        prefix[0] = 0.0;
+        for x in 0..width {
+            prefix[x + 1] = prefix[x] + src[y * width + x];
+        }
+        for x in 0..width {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius).min(width - 1);
+            let sum = prefix[x1 + 1] - prefix[x0];
+            tmp[y * width + x] = sum / (x1 - x0 + 1) as f32;
+        }
+    }
+    for x in 0..width {
+        prefix[0] = 0.0;
+        for y in 0..height {
+            prefix[y + 1] = prefix[y] + tmp[y * width + x];
+        }
+        for y in 0..height {
+            let y0 = y.saturating_sub(radius);
+            let y1 = (y + radius).min(height - 1);
+            let sum = prefix[y1 + 1] - prefix[y0];
+            out[y * width + x] = sum / (y1 - y0 + 1) as f32;
+        }
+    }
+    out
 }
 
 fn local_adjust_subject_mask_candidate_from_layers(
@@ -5260,33 +5402,104 @@ fn draw_local_mask_editor(
                     changed = true;
                 }
             });
-            changed |= ui
-                .checkbox(&mut mask.refinement.enabled, "輪郭補正")
-                .changed();
-            changed |=
-                local_adjust_slider(ui, &mut mask.refinement.threshold, 0.0..=1.0, "しきい値");
+            ui.separator();
+            ui.label(
+                egui::RichText::new("マスク補正")
+                    .size(11.0)
+                    .strong()
+                    .color(egui::Color32::from_gray(190)),
+            );
+            let mut refinement_enabled = mask.refinement.enabled;
+            let enable_response = ui.checkbox(&mut refinement_enabled, "マスクを補正");
+            if enable_response
+                .on_hover_text("ONにすると、生成直後の元マットから境界向けのマスクを再生成します。")
+                .changed()
+            {
+                if refinement_enabled {
+                    if mask.source_alpha.is_none() {
+                        mask.set_source_from_current();
+                    }
+                    let refinement = local_adjust_core::SubjectMaskRefinement {
+                        enabled: true,
+                        threshold: mask.refinement.threshold,
+                        expand_px: mask.refinement.expand_px,
+                        feather_px: mask.refinement.feather_px.max(0),
+                    };
+                    let source = mask.source_raster_mask();
+                    mask.alpha = local_adjust_subject_refined_alpha(
+                        &source,
+                        refinement.threshold,
+                        refinement.expand_px,
+                        refinement.feather_px as usize,
+                    );
+                    mask.refinement = refinement;
+                } else {
+                    let source = mask.source_alpha.as_ref().unwrap_or(&mask.alpha).clone();
+                    mask.alpha = source;
+                    mask.refinement.enabled = false;
+                }
+                changed = true;
+            }
+
+            let controls_enabled = mask.refinement.enabled;
+            let mut threshold = mask.refinement.threshold;
             let mut expand = mask.refinement.expand_px;
-            let mut feather = mask.refinement.feather_px;
-            changed |= ui
-                .add(egui::Slider::new(&mut expand, -32..=32).text("拡張"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(&mut feather, 0..=32).text("ぼかし"))
-                .changed();
-            mask.refinement.expand_px = expand;
-            mask.refinement.feather_px = feather;
-            let foreground = mask.alpha.iter().filter(|&&alpha| alpha >= 0.5).count();
-            let soft = mask
-                .alpha
-                .iter()
-                .filter(|&&alpha| alpha > 0.02 && alpha < 0.98)
-                .count();
-            let total = mask.alpha.len().max(1) as f32;
+            let mut feather = mask.refinement.feather_px.max(0);
+            let threshold_response = ui
+                .add_enabled(
+                    controls_enabled,
+                    egui::Slider::new(&mut threshold, 0.05..=0.95).text("しきい値"),
+                )
+                .on_hover_text(
+                    "この値以上を被写体として残します。上げるほど背景側の半透明が減ります。",
+                );
+            let expand_response = ui
+                .add_enabled(
+                    controls_enabled,
+                    egui::Slider::new(&mut expand, -4..=4).text("収縮/拡張"),
+                )
+                .on_hover_text("マイナスで少し内側へ縮め、プラスで外側へ広げます。");
+            let feather_response = ui
+                .add_enabled(
+                    controls_enabled,
+                    egui::Slider::new(&mut feather, 0..=8).text("境界なめらか"),
+                )
+                .on_hover_text("2値化後の境界だけをなじませます。0は完全な2値です。");
+            if controls_enabled
+                && (threshold_response.changed()
+                    || expand_response.changed()
+                    || feather_response.changed())
+            {
+                if mask.source_alpha.is_none() {
+                    mask.set_source_from_current();
+                }
+                let refinement = local_adjust_core::SubjectMaskRefinement {
+                    enabled: true,
+                    threshold,
+                    expand_px: expand,
+                    feather_px: feather.max(0),
+                };
+                let source = mask.source_raster_mask();
+                mask.alpha = local_adjust_subject_refined_alpha(
+                    &source,
+                    refinement.threshold,
+                    refinement.expand_px,
+                    refinement.feather_px as usize,
+                );
+                mask.refinement = refinement;
+                changed = true;
+            }
+
+            let stats = local_adjust_subject_mask_stats(mask);
+            let mode_label = if mask.refinement.enabled {
+                "補正済み"
+            } else {
+                "元マット"
+            };
             ui.label(
                 egui::RichText::new(format!(
-                    "前景 {:.1}% / 半透明 {:.1}%",
-                    foreground as f32 / total * 100.0,
-                    soft as f32 / total * 100.0
+                    "{mode_label} / 前景 {:.1}% / 半透明 {:.1}%",
+                    stats.foreground_percent, stats.soft_percent
                 ))
                 .size(10.0)
                 .color(egui::Color32::from_gray(170)),
