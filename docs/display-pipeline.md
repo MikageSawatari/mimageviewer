@@ -372,6 +372,8 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 `Ctrl+Shift` は「選択レイヤー直前までの prefix preview」に割り当てるため、
 元画像プレビューはこの組み合わせを捕まえず、`resolve_fs_processed_texture` の
 local_adjust 分岐に処理を譲る。`Ctrl` 単体は従来どおり元画像プレビューになる。
+この判定は fullscreen viewport 外側の main `ctx.input` では modifier が取れないため、
+右 Ctrl と同じく OS キー状態を参照する。
 
 ### 2.3.1 デバッグ出力
 

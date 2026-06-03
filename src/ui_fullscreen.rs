@@ -226,15 +226,16 @@ fn original_preview_shortcut_held(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.key_down(egui::Key::Num0))
 }
 
-fn local_adjust_prefix_preview_modifier_held(modifiers: egui::Modifiers) -> bool {
-    modifiers.ctrl && modifiers.shift
+#[cfg(windows)]
+fn shift_held_via_os() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SHIFT};
+
+    unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) < 0 }
 }
 
-fn original_preview_should_yield_to_local_adjust_prefix(
-    local_adjust_mode: bool,
-    modifiers: egui::Modifiers,
-) -> bool {
-    local_adjust_mode && local_adjust_prefix_preview_modifier_held(modifiers)
+#[cfg(not(windows))]
+fn shift_held_via_os() -> bool {
+    false
 }
 
 /// メインビューポート経由のフルスクリーンキー処理 (`handle_fullscreen_root_key_input`)
@@ -717,6 +718,12 @@ impl App {
     /// ので、フルスクリーン側の前フレーム focus 状態を反映する。`GetAsyncKeyState`
     /// 単体だと動画/アニメ駆動の repaint 中に他アプリの右Ctrl を拾うリスクがあるので、
     /// 必ずフォーカス gate と AND させる。
+    ///
+    /// Shift 検出も `ctx.input(|i| i.modifiers.shift)` ではなく OS API を使う。
+    /// `prepare_fullscreen_state` は `show_viewport_immediate` の外側で呼ばれるため、
+    /// ここでの ctx はメインビューポートのもの。フルスクリーンが OS フォーカスを
+    /// 持っている間、メイン ctx の modifier event は届かない
+    /// (= `i.modifiers.shift` が常に false)。右Ctrl 検出と同じ理由。
     fn original_preview_active(&self, ctx: &egui::Context, idx: usize) -> bool {
         if !self.fs_prev_focused {
             return false;
@@ -727,12 +734,7 @@ impl App {
         if !original_preview_shortcut_held(ctx) {
             return false;
         }
-        if ctx.input(|i| {
-            original_preview_should_yield_to_local_adjust_prefix(
-                self.local_adjust_mode,
-                i.modifiers,
-            )
-        }) {
+        if self.local_adjust_mode && shift_held_via_os() {
             return false;
         }
         matches!(
@@ -10134,24 +10136,6 @@ mod tests {
         assert!(should_zoom_fullscreen_wheel(true, false));
         assert!(should_zoom_fullscreen_wheel(false, true));
         assert!(!should_zoom_fullscreen_wheel(false, false));
-    }
-
-    #[test]
-    fn original_preview_yields_only_for_local_adjust_ctrl_shift() {
-        let mut ctrl = egui::Modifiers::default();
-        ctrl.ctrl = true;
-        let mut ctrl_shift = ctrl;
-        ctrl_shift.shift = true;
-
-        assert!(!original_preview_should_yield_to_local_adjust_prefix(
-            true, ctrl
-        ));
-        assert!(original_preview_should_yield_to_local_adjust_prefix(
-            true, ctrl_shift
-        ));
-        assert!(!original_preview_should_yield_to_local_adjust_prefix(
-            false, ctrl_shift
-        ));
     }
 
     #[test]
