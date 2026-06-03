@@ -66,11 +66,11 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、105種)
+### `LocalEffect` (部分補正レイヤー、106種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別), PhotoFilter(色付きフィルター),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), PartColor(指定色だけ残す白黒化), ChannelMixer(白黒/チャンネル混合),
-MonochromeMixer(6色帯白黒ミックス), Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定), RetroPalette(固定/適応パレット減色),
+MonochromeMixer(6色帯白黒ミックス), Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定), RetroPalette(固定/適応パレット減色), CrtDisplay(ブラウン管表示),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, FrequencySeparation, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, RadialFlash, TiltShift, LensBlur, BokehSprite, LensDirt, RadialBlur, WaveDistortion, HeatHaze, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
 GradientMap, ColorFill, Frame, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, LightLeak, BacklightHaze, CloudFog, WaterCaustics, ParticleOverlay, Aurora, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Anaglyph3d, Defringe, ScanlineGlitch, Vhs, DataMosh, PixelSort, OldFilm, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Lithograph, Engraving, NewspaperPrint, Textureizer, StarGlow, DiffractionStarburst, EdgeSmooth, Despeckle, Median
@@ -81,7 +81,8 @@ Subject(被写体分離) / Segmentation
 
 ### グローバル `PostFilter` 側にあって local には無いもの (= local へ移植候補)
 減色系は `RetroPalette` として移植済み (1bit / GameBoy / ファミコン / MSX2+ / PC-98 / ゲームギア / メガドライブ / SFC)。
-残りは CRT 3種＋複合 / カラーグレード11種。
+CRT 系は `CrtDisplay` として、同じ画像サイズのままスキャンライン / RGB アパーチャマスク / 曲面歪み / グローを重ねる local 版を追加済み。
+残りはカラーグレード11種だが、既存の `Look` / `PhotoFilter` / `MonochromeMixer` / `ThreeWayColorGrading` で多くを代替できる。
 
 ---
 
@@ -210,6 +211,7 @@ TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」�
 - [x] **アナグリフ3D / RGB分離シフト (`Anaglyph3d`)** ★ **易** — 左右にずらした画像を赤シアン/緑マゼンタ/琥珀青/RGB分離へ割り当て、立体視風や均一方向の色ズレ演出を作る
 
 ### 9-B. アナログ実機 / レトロ系
+- [x] **CRT表示 / ブラウン管表示 (`CrtDisplay`)** ★ **中** — スキャンライン、RGB アパーチャマスク、水平ビームにじみ、明部グロー、軽い曲面歪みを同じ画像サイズのまま重ねる。`RetroPalette` と組み合わせると実機表示風に寄せられ、`Vhs` のテープ劣化とは別系統
 - [x] **VHS / アナログビデオ風 (`Vhs`)** ★★ **中** — 輝度を残して色成分を横ににじませ、色ずれ、横ゴースト、トラッキング帯、走査線、ノイズ、退色を調整できる。CRT (既存グローバル) とは別系統
 - [x] **アナモルフィックフレア (横方向の青い光条 / `AnamorphicFlare`)** ★ **中** — シネマ調の水平ストリーク。明部抽出から横方向に色付きフレアを伸ばし、しきい値、長さ、太さ、強さ、色、着色量を調整できる
 - [x] **回折スターバースト (絞り点光源の光条 / `DiffractionStarburst`)** **中** — 点光源から絞り羽根数に応じた細い光条を伸ばす。奇数羽根では光条数が倍になり、点光源ハローと軽い色ズレも調整できる

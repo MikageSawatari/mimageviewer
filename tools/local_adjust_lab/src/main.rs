@@ -21,15 +21,15 @@ use local_adjust_core::{
     ChromaticAberrationParams, ClarityParams, CloudFogMode, CloudFogParams, CmykPlateShiftParams,
     ColorBalanceParams, ColorBalanceRange, ColorDodgeGlowParams, ColorFillParams, ColorGradeWheel,
     ColorHalftoneParams, ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams,
-    ColorOverlayShape, ColorRangeMask, ColorTraceParams, ContactShadowParams, CubeLutParams,
-    CutoutParams, DataMoshParams, DefringeParams, DehazeParams, DespeckleParams,
-    DiffractionStarburstParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
-    EmbossParams, EngravingParams, EqualizeParams, FilmGrainParams, FrameMode, FrameParams,
-    FrequencySeparationParams, GlassDisplacementMode, GlassDisplacementParams, GlowingEdgesParams,
-    GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams, HalftoneParams,
-    HeatHazeParams, HighPassParams, HighlightsShadowsParams, HslParams, InvertParams,
-    LensBlurAperture, LensBlurParams, LensCorrectionParams, LensDirtMode, LensDirtParams,
-    LensFlareParams, LightLeakParams, LineExtractMode, LineExtractParams, LineKind,
+    ColorOverlayShape, ColorRangeMask, ColorTraceParams, ContactShadowParams, CrtDisplayMode,
+    CrtDisplayParams, CubeLutParams, CutoutParams, DataMoshParams, DefringeParams, DehazeParams,
+    DespeckleParams, DiffractionStarburstParams, DiffuseGlowParams, DuotoneParams, DuotonePreset,
+    EdgeSmoothParams, EmbossParams, EngravingParams, EqualizeParams, FilmGrainParams, FrameMode,
+    FrameParams, FrequencySeparationParams, GlassDisplacementMode, GlassDisplacementParams,
+    GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams,
+    HalftoneParams, HeatHazeParams, HighPassParams, HighlightsShadowsParams, HslParams,
+    InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LensDirtMode,
+    LensDirtParams, LensFlareParams, LightLeakParams, LineExtractMode, LineExtractParams, LineKind,
     LinearGradientMask, LithographParams, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
     LookPreset, ManualMaskOverride, MaskShape, MedianParams, MonochromeMixerParams, MosaicBoundary,
     MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams, NewspaperPrintParams,
@@ -1083,6 +1083,7 @@ enum EffectKind {
     CubeLut,
     Posterize,
     RetroPalette,
+    CrtDisplay,
     Threshold,
     Invert,
     Duotone,
@@ -1271,6 +1272,7 @@ impl EffectKind {
             LocalEffect::CubeLut(_) => Self::CubeLut,
             LocalEffect::Posterize(_) => Self::Posterize,
             LocalEffect::RetroPalette(_) => Self::RetroPalette,
+            LocalEffect::CrtDisplay(_) => Self::CrtDisplay,
             LocalEffect::Threshold(_) => Self::Threshold,
             LocalEffect::Invert(_) => Self::Invert,
             LocalEffect::Duotone(_) => Self::Duotone,
@@ -1382,6 +1384,7 @@ impl EffectKind {
             Self::CubeLut => "3D LUT",
             Self::Posterize => "ポスタリゼーション",
             Self::RetroPalette => "レトロ減色",
+            Self::CrtDisplay => "CRT表示",
             Self::Threshold => "2値化",
             Self::Invert => "階調反転/ネガ",
             Self::Duotone => "ダブルトーン",
@@ -1449,6 +1452,7 @@ impl EffectKind {
             Self::LensDirt => "レンズ汚れ",
             Self::FrequencySeparation => "周波数分離",
             Self::RetroPalette => "レトロ減色",
+            Self::CrtDisplay => "CRT表示",
             Self::Frame => "フレーム",
             Self::DiffractionStarburst => "回折スター",
             Self::WaterCaustics => "水中光網",
@@ -1573,6 +1577,9 @@ impl EffectKind {
             Self::Posterize => "色の階調数を減らし、フラットでグラフィックな見た目にします。",
             Self::RetroPalette => {
                 "固定パレットや画像ごとの適応パレットへ減色し、レトロゲーム風の色味を作ります。"
+            }
+            Self::CrtDisplay => {
+                "スキャンライン、RGBアパーチャマスク、軽い曲面歪み、明部グローを重ねてブラウン管表示風にします。"
             }
             Self::Threshold => "明るさをしきい値で黒と白に分け、線画やモノクロ風にします。",
             Self::Invert => "RGBの明暗を反転し、ネガフィルムのような見た目にします。",
@@ -1833,6 +1840,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Engraving,
             EffectKind::NewspaperPrint,
             EffectKind::Textureizer,
+            EffectKind::CrtDisplay,
             EffectKind::ScanlineGlitch,
             EffectKind::Vhs,
             EffectKind::DataMosh,
@@ -9257,6 +9265,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
             retro_palette_mode_label(params.mode),
             params.strength * 100.0
         ),
+        LocalEffect::CrtDisplay(params) => format!(
+            "CRT {} {:.0}%",
+            crt_display_mode_label(params.mode),
+            params.strength * 100.0
+        ),
         LocalEffect::Threshold(params) => {
             let suffix = if params.invert { " 反転" } else { "" };
             format!("2値化 {:.0}%{suffix}", params.threshold * 100.0)
@@ -9591,6 +9604,14 @@ fn retro_palette_mode_label(mode: RetroPaletteMode) -> &'static str {
         RetroPaletteMode::GameGear => "ゲームギア",
         RetroPaletteMode::MegaDrive => "メガドライブ",
         RetroPaletteMode::Sfc => "SFC",
+    }
+}
+
+fn crt_display_mode_label(mode: CrtDisplayMode) -> &'static str {
+    match mode {
+        CrtDisplayMode::Simple => "控えめ",
+        CrtDisplayMode::Full => "フル",
+        CrtDisplayMode::Arcade => "アーケード",
     }
 }
 
@@ -15028,6 +15049,115 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からレトロ減色後の色へどれだけ近づけるかです。");
+        }
+        LocalEffect::CrtDisplay(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "控えめ") {
+                    *params = CrtDisplayParams::preset(CrtDisplayMode::Simple);
+                    changed = true;
+                }
+                if preset_button(ui, "フル") {
+                    *params = CrtDisplayParams::preset(CrtDisplayMode::Full);
+                    changed = true;
+                }
+                if preset_button(ui, "アーケード") {
+                    *params = CrtDisplayParams::preset(CrtDisplayMode::Arcade);
+                    changed = true;
+                }
+                if preset_button(ui, "黒線強め") {
+                    *params = CrtDisplayParams {
+                        scanline_spacing_px: 3.0,
+                        scanline_depth: 0.72,
+                        mask_strength: 0.20,
+                        curvature: 0.03,
+                        bloom: 0.12,
+                        horizontal_blur: 0.28,
+                        brightness: 1.55,
+                        strength: 0.92,
+                        ..CrtDisplayParams::preset(CrtDisplayMode::Arcade)
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "スキャンライン、RGBマスク、ビームにじみ、明部グローを同じ画像サイズのまま重ねます。レトロ減色と組み合わせると実機表示風に寄せられます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let before_mode = params.mode;
+            lab_combo_box(
+                ui,
+                "crt_display_mode",
+                crt_display_mode_label(params.mode),
+                |ui| {
+                    for mode in [
+                        CrtDisplayMode::Simple,
+                        CrtDisplayMode::Full,
+                        CrtDisplayMode::Arcade,
+                    ] {
+                        ui.selectable_value(&mut params.mode, mode, crt_display_mode_label(mode));
+                    }
+                },
+            );
+            if params.mode != before_mode {
+                let strength = params.strength;
+                *params = CrtDisplayParams {
+                    strength: strength.max(0.8),
+                    ..CrtDisplayParams::preset(params.mode)
+                };
+                changed = true;
+            }
+            let mut activates_effect = false;
+            let spacing = ui.add(
+                egui::Slider::new(&mut params.scanline_spacing_px, 2.0..=24.0)
+                    .text("走査線間隔")
+                    .suffix("px"),
+            );
+            changed |= spacing.changed();
+            activates_effect |= spacing.changed();
+            spacing.lab_hover_tip(
+                "暗い走査線の周期です。小さいほど細かく、値を大きくすると粗く見えます。",
+            );
+            let scanline =
+                ui.add(egui::Slider::new(&mut params.scanline_depth, 0.0..=1.0).text("走査線"));
+            changed |= scanline.changed();
+            activates_effect |= scanline.changed();
+            scanline.lab_hover_tip("走査線で暗く落とす強さです。");
+            let mask =
+                ui.add(egui::Slider::new(&mut params.mask_strength, 0.0..=1.0).text("RGBマスク"));
+            changed |= mask.changed();
+            activates_effect |= mask.changed();
+            mask.lab_hover_tip("赤・緑・青のアパーチャマスクを重ねる強さです。");
+            let blur = ui.add(
+                egui::Slider::new(&mut params.horizontal_blur, 0.0..=1.0).text("ビームにじみ"),
+            );
+            changed |= blur.changed();
+            activates_effect |= blur.changed();
+            blur.lab_hover_tip("水平方向へ少しにじませ、ブラウン管のビーム感を足します。");
+            let bloom = ui.add(egui::Slider::new(&mut params.bloom, 0.0..=1.0).text("グロー"));
+            changed |= bloom.changed();
+            activates_effect |= bloom.changed();
+            bloom.lab_hover_tip("明るい部分を拾って、蛍光体のにじみのように足します。");
+            let curvature =
+                ui.add(egui::Slider::new(&mut params.curvature, 0.0..=0.25).text("曲面歪み"));
+            changed |= curvature.changed();
+            activates_effect |= curvature.changed();
+            curvature
+                .lab_hover_tip("画面をわずかに樽型へ曲げます。大きい値では四隅が黒くなります。");
+            let brightness =
+                ui.add(egui::Slider::new(&mut params.brightness, 0.25..=2.5).text("明るさ補正"));
+            changed |= brightness.changed();
+            activates_effect |= brightness.changed();
+            brightness.lab_hover_tip("走査線やマスクで落ちた明るさを補います。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からCRT表示風の結果へどれだけ近づけるかです。");
+            if activates_effect && params.strength <= f32::EPSILON {
+                params.strength = 0.8;
+            }
         }
         LocalEffect::Threshold(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -21163,6 +21293,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::CubeLut => LocalEffect::CubeLut(CubeLutParams::default()),
         EffectKind::Posterize => LocalEffect::Posterize(PosterizeParams::default()),
         EffectKind::RetroPalette => LocalEffect::RetroPalette(RetroPaletteParams::default()),
+        EffectKind::CrtDisplay => LocalEffect::CrtDisplay(CrtDisplayParams::default()),
         EffectKind::Threshold => LocalEffect::Threshold(ThresholdParams::default()),
         EffectKind::Invert => LocalEffect::Invert(InvertParams::default()),
         EffectKind::Duotone => LocalEffect::Duotone(DuotoneParams::default()),
@@ -23736,6 +23867,7 @@ mod tests {
             EffectKind::Engraving,
             EffectKind::NewspaperPrint,
             EffectKind::Textureizer,
+            EffectKind::CrtDisplay,
             EffectKind::ScanlineGlitch,
             EffectKind::Vhs,
             EffectKind::DataMosh,

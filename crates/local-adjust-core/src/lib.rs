@@ -580,6 +580,7 @@ pub enum LocalEffect {
     CubeLut(CubeLutParams),
     Posterize(PosterizeParams),
     RetroPalette(RetroPaletteParams),
+    CrtDisplay(CrtDisplayParams),
     Threshold(ThresholdParams),
     Invert(InvertParams),
     Duotone(DuotoneParams),
@@ -691,6 +692,7 @@ impl LocalEffect {
             Self::CubeLut(_) => "LUT",
             Self::Posterize(_) => "ポスタライズ",
             Self::RetroPalette(_) => "レトロ減色",
+            Self::CrtDisplay(_) => "CRT表示",
             Self::Threshold(_) => "しきい値",
             Self::Invert(_) => "ネガ",
             Self::Duotone(_) => "デュオトーン",
@@ -2274,6 +2276,82 @@ impl Default for RetroPaletteParams {
             mode: RetroPaletteMode::GameBoy,
             dither: 0.14,
             strength: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrtDisplayMode {
+    Simple,
+    Full,
+    Arcade,
+}
+
+impl Default for CrtDisplayMode {
+    fn default() -> Self {
+        Self::Simple
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CrtDisplayParams {
+    pub mode: CrtDisplayMode,
+    pub scanline_spacing_px: f32,
+    pub scanline_depth: f32,
+    pub mask_strength: f32,
+    pub curvature: f32,
+    pub bloom: f32,
+    pub horizontal_blur: f32,
+    pub brightness: f32,
+    pub strength: f32,
+}
+
+impl CrtDisplayParams {
+    pub fn preset(mode: CrtDisplayMode) -> Self {
+        match mode {
+            CrtDisplayMode::Simple => Self {
+                mode,
+                scanline_spacing_px: 4.0,
+                scanline_depth: 0.32,
+                mask_strength: 0.12,
+                curvature: 0.0,
+                bloom: 0.08,
+                horizontal_blur: 0.30,
+                brightness: 1.22,
+                strength: 0.80,
+            },
+            CrtDisplayMode::Full => Self {
+                mode,
+                scanline_spacing_px: 4.0,
+                scanline_depth: 0.36,
+                mask_strength: 0.16,
+                curvature: 0.07,
+                bloom: 0.25,
+                horizontal_blur: 0.40,
+                brightness: 1.25,
+                strength: 0.88,
+            },
+            CrtDisplayMode::Arcade => Self {
+                mode,
+                scanline_spacing_px: 3.0,
+                scanline_depth: 0.55,
+                mask_strength: 0.26,
+                curvature: 0.0,
+                bloom: 0.18,
+                horizontal_blur: 0.45,
+                brightness: 1.55,
+                strength: 0.92,
+            },
+        }
+    }
+}
+
+impl Default for CrtDisplayParams {
+    fn default() -> Self {
+        Self {
+            strength: 0.0,
+            ..Self::preset(CrtDisplayMode::Simple)
         }
     }
 }
@@ -4350,6 +4428,9 @@ where
             LocalEffect::Posterize(params) => apply_posterize(&image.pixels, *params),
             LocalEffect::RetroPalette(params) => {
                 apply_retro_palette(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::CrtDisplay(params) => {
+                apply_crt_display(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::Threshold(params) => apply_threshold(&image.pixels, *params),
             LocalEffect::Invert(params) => apply_invert(&image.pixels, *params),
@@ -9241,6 +9322,165 @@ fn apply_retro_palette(
         }
     }
     out
+}
+
+fn apply_crt_display(src: &[u8], width: usize, height: usize, params: CrtDisplayParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let scanline_spacing = params.scanline_spacing_px.clamp(2.0, 24.0);
+    let scanline_depth = params.scanline_depth.clamp(0.0, 1.0);
+    let mask_strength = params.mask_strength.clamp(0.0, 1.0);
+    let curvature = params.curvature.clamp(0.0, 0.25);
+    let bloom = params.bloom.clamp(0.0, 1.0);
+    let horizontal_blur = params.horizontal_blur.clamp(0.0, 1.0);
+    let brightness = params.brightness.clamp(0.25, 2.5);
+    if scanline_depth <= f32::EPSILON
+        && mask_strength <= f32::EPSILON
+        && curvature <= f32::EPSILON
+        && bloom <= f32::EPSILON
+        && horizontal_blur <= f32::EPSILON
+        && (brightness - 1.0).abs() <= f32::EPSILON
+    {
+        return src.to_vec();
+    }
+
+    let bloom_map = (bloom > f32::EPSILON).then(|| build_crt_bloom_map(src, width, height));
+    let mut out = src.to_vec();
+    let width_f = width.max(1) as f32;
+    let height_f = height.max(1) as f32;
+    let sample_blur_offset = (0.35 + horizontal_blur * 1.15).clamp(0.35, 1.5);
+    let side_weight = horizontal_blur * 0.42;
+    let center_weight = 1.0 - side_weight * 2.0;
+
+    for y in 0..height {
+        let scan_mult = crt_scanline_multiplier(y as f32 + 0.5, scanline_spacing, scanline_depth);
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let Some((sx, sy)) = crt_source_position(x, y, width_f, height_f, curvature) else {
+                for c in 0..3 {
+                    out[i + c] = to_u8(lerp_f32(base[c], 0.0, strength));
+                }
+                continue;
+            };
+
+            let mut rgb = sample_rgb_bilinear_alpha_fallback(src, width, height, sx, sy, base);
+            if horizontal_blur > f32::EPSILON {
+                let left = sample_rgb_bilinear_alpha_fallback(
+                    src,
+                    width,
+                    height,
+                    sx - sample_blur_offset,
+                    sy,
+                    rgb,
+                );
+                let right = sample_rgb_bilinear_alpha_fallback(
+                    src,
+                    width,
+                    height,
+                    sx + sample_blur_offset,
+                    sy,
+                    rgb,
+                );
+                for c in 0..3 {
+                    rgb[c] = rgb[c] * center_weight + (left[c] + right[c]) * side_weight;
+                }
+            }
+
+            let mask = crt_aperture_mask(x as f32 + 0.5, mask_strength);
+            for c in 0..3 {
+                rgb[c] *= mask[c] * scan_mult * brightness;
+            }
+            if let Some(map) = &bloom_map {
+                let bx = sx.round().clamp(0.0, width.saturating_sub(1) as f32) as usize;
+                let by = sy.round().clamp(0.0, height.saturating_sub(1) as f32) as usize;
+                let glow = map[by * width + bx] * bloom;
+                for channel in &mut rgb {
+                    *channel += glow;
+                }
+            }
+
+            for c in 0..3 {
+                out[i + c] = to_u8(lerp_f32(base[c], rgb[c], strength));
+            }
+        }
+    }
+    out
+}
+
+fn build_crt_bloom_map(src: &[u8], width: usize, height: usize) -> Vec<f32> {
+    let mut bright = vec![0.0_f32; width.saturating_mul(height)];
+    for (idx, px) in src.chunks_exact(4).enumerate() {
+        let alpha = px[3] as f32 / 255.0;
+        if alpha <= f32::EPSILON {
+            continue;
+        }
+        let luma = luma01(
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        );
+        bright[idx] = smoothstep(0.55, 0.92, luma) * alpha;
+    }
+    let radius = ((width.min(height) as f32 / 180.0).round() as usize).clamp(1, 8);
+    box_blur_alpha(&bright, width, height, radius)
+}
+
+fn crt_source_position(
+    x: usize,
+    y: usize,
+    width: f32,
+    height: f32,
+    curvature: f32,
+) -> Option<(f32, f32)> {
+    if curvature <= f32::EPSILON {
+        return Some((x as f32, y as f32));
+    }
+    let nx = ((x as f32 + 0.5) / width) * 2.0 - 1.0;
+    let ny = ((y as f32 + 0.5) / height) * 2.0 - 1.0;
+    let r2 = nx * nx + ny * ny;
+    let k = 1.0 + r2 * curvature;
+    let dx = nx * k;
+    let dy = ny * k;
+    if dx.abs() > 1.0 || dy.abs() > 1.0 {
+        return None;
+    }
+    Some((
+        (dx * 0.5 + 0.5) * width - 0.5,
+        (dy * 0.5 + 0.5) * height - 0.5,
+    ))
+}
+
+fn crt_scanline_multiplier(y: f32, spacing: f32, depth: f32) -> f32 {
+    if depth <= f32::EPSILON {
+        return 1.0;
+    }
+    let phase = (y / spacing).fract();
+    let curve = (phase * std::f32::consts::PI).sin();
+    1.0 - depth * (1.0 - curve * curve)
+}
+
+fn crt_aperture_mask(x: f32, strength: f32) -> [f32; 3] {
+    if strength <= f32::EPSILON {
+        return [1.0, 1.0, 1.0];
+    }
+    let phase = x / 3.0;
+    let two_pi = std::f32::consts::TAU;
+    [
+        1.0 - strength + strength * 3.0 * (phase * two_pi).sin().max(0.0).powi(2),
+        1.0 - strength + strength * 3.0 * ((phase + 1.0 / 3.0) * two_pi).sin().max(0.0).powi(2),
+        1.0 - strength + strength * 3.0 * ((phase + 2.0 / 3.0) * two_pi).sin().max(0.0).powi(2),
+    ]
 }
 
 const RETRO_GAMEBOY_PALETTE: [[u8; 3]; 4] = [
@@ -17583,6 +17823,7 @@ mod tests {
             LocalEffect::CubeLut(CubeLutParams::default()),
             LocalEffect::Posterize(PosterizeParams::default()),
             LocalEffect::RetroPalette(RetroPaletteParams::default()),
+            LocalEffect::CrtDisplay(CrtDisplayParams::default()),
             LocalEffect::Threshold(ThresholdParams::default()),
             LocalEffect::Invert(InvertParams::default()),
             LocalEffect::Duotone(DuotoneParams::default()),
@@ -17726,6 +17967,20 @@ mod tests {
                 LocalEffect::RetroPalette(RetroPaletteParams {
                     mode: RetroPaletteMode::Sfc,
                     dither: 1.0,
+                    strength: 1.0,
+                }),
+            ),
+            full(
+                "crt display max phosphor",
+                LocalEffect::CrtDisplay(CrtDisplayParams {
+                    mode: CrtDisplayMode::Full,
+                    scanline_spacing_px: 2.0,
+                    scanline_depth: 1.0,
+                    mask_strength: 1.0,
+                    curvature: 0.25,
+                    bloom: 1.0,
+                    horizontal_blur: 1.0,
+                    brightness: 2.5,
                     strength: 1.0,
                 }),
             ),
@@ -19750,6 +20005,65 @@ LUT_3D_SIZE 2
     fn retro_palette_channel_is_bit_grid(channel: u8, bits: u8) -> bool {
         let levels = ((1_u32 << bits) - 1).max(1);
         (0..=levels).any(|level| ((level * 255 + levels / 2) / levels) as u8 == channel)
+    }
+
+    #[test]
+    fn crt_display_draws_scanlines_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            2,
+            4,
+            vec![
+                120, 120, 120, 201, 120, 120, 120, 202, 120, 120, 120, 203, 120, 120, 120, 204,
+                120, 120, 120, 205, 120, 120, 120, 206, 120, 120, 120, 207, 120, 120, 120, 208,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "crt",
+            LocalMask::Full,
+            LocalEffect::CrtDisplay(CrtDisplayParams {
+                scanline_spacing_px: 4.0,
+                scanline_depth: 1.0,
+                mask_strength: 0.0,
+                curvature: 0.0,
+                bloom: 0.0,
+                horizontal_blur: 0.0,
+                brightness: 1.0,
+                strength: 1.0,
+                ..CrtDisplayParams::preset(CrtDisplayMode::Simple)
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] < out.pixels[8]);
+        for (src_px, out_px) in src.pixels.chunks_exact(4).zip(out.pixels.chunks_exact(4)) {
+            assert_eq!(out_px[3], src_px[3]);
+        }
+    }
+
+    #[test]
+    fn crt_display_aperture_mask_separates_channels() {
+        let src = solid(3, 1, [120, 120, 120, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "crt",
+            LocalMask::Full,
+            LocalEffect::CrtDisplay(CrtDisplayParams {
+                scanline_depth: 0.0,
+                mask_strength: 0.85,
+                curvature: 0.0,
+                bloom: 0.0,
+                horizontal_blur: 0.0,
+                brightness: 1.0,
+                strength: 1.0,
+                ..CrtDisplayParams::preset(CrtDisplayMode::Simple)
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(
+            out.pixels
+                .chunks_exact(4)
+                .any(|px| px[0] != px[1] || px[1] != px[2])
+        );
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 255));
     }
 
     #[test]
