@@ -3112,9 +3112,9 @@ pub struct App {
     pub(crate) local_adjust_effect_query: String,
     /// 補正レイヤー効果パラメータのコピー/ペースト用クリップボード。
     pub(crate) local_adjust_effect_clipboard: Option<local_adjust_core::LocalEffect>,
-    /// 効果色スポイトの対象。キャンバス側の実接続は後続ステップで行う。
+    /// 効果色スポイトの対象。キャンバスクリックで対象色を拾う。
     pub(crate) local_adjust_rgb_pick_active: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
-    /// 選択色スポイトの状態。キャンバス側の実接続は後続ステップで行う。
+    /// 選択色スポイトの状態。キャンバスクリックで対象色を拾う。
     pub(crate) local_adjust_selective_color_pick_active: bool,
     /// 画像上の効果位置ハンドル表示フラグ。
     pub(crate) local_adjust_effect_position_handles_visible: bool,
