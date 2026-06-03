@@ -871,7 +871,8 @@ impl App {
                     }
                     return self.resolve_local_adjust_source_texture(ctx, idx);
                 } else {
-                    // L キーの「選択レイヤーまでプレビュー」は既存の prefix preview を維持する。
+                    // 補正レイヤーパネルの「選択レイヤーまでプレビュー」チェックボックスは、
+                    // 既存の prefix preview を維持する。
                     let layer_count = layer_idx.min(total_layers - 1) + 1;
                     if layer_count == 0 {
                         return self.resolve_local_adjust_source_texture(ctx, idx);
