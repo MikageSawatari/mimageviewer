@@ -344,11 +344,12 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 0. 右 Ctrl ホールド中の元画像プレビュー (fs_cache の raw decode)
 1. erase モードで編集中のマスクプレビュー   (ui_erase.rs)
 2. conceal_cache[idx]                      (隠蔽加工済み)
-3. erase_result_cache[idx,input,mask]      (消しゴム MI-GAN 確定結果)
-4. adjustment_cache[idx]                   (プリセット補正済み)
-5. ai_upscale_cache[idx,bg]                (AI アップスケール/デノイズ済み)
-6. fs_cache[idx]                           (生デコード結果、raw 専用)
-7. フォールバック: サムネイル (低解像度)
+3. local_adjust_cache[idx,input,mask,local] (補正レイヤー合成済み)
+4. erase_result_cache[idx,input,mask]      (消しゴム MI-GAN 確定結果)
+5. adjustment_cache[idx]                   (プリセット補正済み)
+6. ai_upscale_cache[idx,bg]                (AI アップスケール/デノイズ済み)
+7. fs_cache[idx]                           (生デコード結果、raw 専用)
+8. フォールバック: サムネイル (低解像度)
 ```
 
 **この優先順位は動かさないこと**。変更すると「補正を掛けた瞬間に一瞬生画像が見える」
@@ -363,6 +364,7 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 右 Ctrl ホールドの元画像プレビューは例外的な一時表示で、派生キャッシュは作り直さない。
 通常の画像 / ZIP 内画像 / PDF ページだけを対象にし、動画には適用しない。表示元は常に
 `fs_cache` の生デコード結果で、補正 / AI / 消しゴム / 隠蔽の派生キャッシュは参照しない。
+補正レイヤーの派生キャッシュも同様に参照しない。
 
 ### 2.3.1 デバッグ出力
 
@@ -431,13 +433,19 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
    preview / apply / ensure-result で作業解像度が割れると、同じマスクでも MI-GAN の
    補完結果が一致しないため。
    ↓
-6. 隠蔽加工 (モザイク / 白塗り / 黒塗り / ぼかし)
-   → conceal_cache[idx, generation] (= erase_result_cache または adjustment_cache をベースに合成)
+6. 補正レイヤー (local-adjust-core)
+   → local_adjust_cache[idx,input_gen,erase_mask_gen,local_gen]
+   消しゴム結果があればそれを、なければ補正済み / AI / raw を入力にして非同期 worker で合成する。
+   未生成または stale の間は古い補正レイヤー結果を表示せず、下位レイヤの画像を表示する。
+   サムネイルには反映しない。
+   ↓
+7. 隠蔽加工 (モザイク / 白塗り / 黒塗り / ぼかし)
+   → conceal_cache[idx, generation] (= local_adjust_cache / erase_result_cache / adjustment_cache をベースに合成)
    display 時は下位レイヤの代わりに conceal_cache を使う
 ```
 
 **ユーザー向けの言い換え**: AI 拡大 → 色補正 → 効果フィルタ → マスク補完 →
-モザイク加工 の順。**ポストフィルタはモザイクより前**で、CRT/減色などの
+補正レイヤー → モザイク加工 の順。**ポストフィルタはモザイクより前**で、CRT/減色などの
 画面効果は隠蔽加工レイヤの「下」に来る (= モザイクのほうが「最後の見た目」
 を支配する)。
 
@@ -453,6 +461,9 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 - **消しゴム/隠蔽加工/分析モード中の一時バイパス**: `App::post_filter_bypassed = true` の間は
   `apply_sync_adjustment` が post-filter 段をスキップし color-only の `adjustment_cache` を生成。
   モード解除時に false に戻し、描画用 cache だけをクリアして post-filter 適用状態で再生成させる。
+- **補正レイヤー**: `local-adjust-render` worker で `local-adjust-core` を適用し、
+  `local_adjust_cache` に載せる。生成中は古い補正レイヤー結果を使わず、
+  `erase_result_cache > adjustment_cache > ai_upscale_cache > fs_cache` の下位画像を表示する。
   消しゴムの preview / apply / ensure-result 入力はこの表示用 bypass に引きずられず、
   最終表示順どおり post-filter 適用後の画像を使う。
 - **AI アップスケール/デノイズ**: 別スレッドで推論。完了時に `ai_upscale_cache` に格納。

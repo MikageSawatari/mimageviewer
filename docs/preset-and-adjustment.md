@@ -290,17 +290,18 @@ bilinear 補間ソースサンプリング + 水平ブラー (h_blur) で、「�
 | `adjustment_cache` | `HashMap<idx, FsCacheEntry>` | 補正適用済みテクスチャ |
 | `ai_upscale_cache` | `HashMap<idx, FsCacheEntry>` | AI アップスケール/デノイズ適用済み |
 | `erase_result_cache` | `HashMap<EraseResultKey, EraseResultCacheEntry>` | 消しゴム MI-GAN 確定結果。`idx + input_generation + erase_mask_generation` で識別 |
+| `local_adjust_cache` | `HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>` | 補正レイヤー合成結果。`idx + input_generation + erase_mask_generation + local_adjust_generation` で識別 |
 | `conceal_cache` | `HashMap<idx, ConcealCacheEntry>` | 隠蔽加工合成済みテクスチャ |
 
 描画時 ([display-pipeline.md](display-pipeline.md) を参照) は:
 
 ```
-conceal_cache > erase_result_cache > adjustment_cache > ai_upscale_cache > fs_cache
+conceal_cache > local_adjust_cache > erase_result_cache > adjustment_cache > ai_upscale_cache > fs_cache
 ```
 
 の優先順位で最も処理済みのテクスチャを選ぶ。
 隠蔽加工のプレビュー合成は `current_conceal_source_pixels` で
-`erase_result > adjustment_cache > ai_upscale_cache > fs_cache` を毎回解決する。
+`local_adjust > erase_result > adjustment_cache > ai_upscale_cache > fs_cache` を毎回解決する。
 `conceal_base_cache` は隠蔽モード入場時ソースの退避で、編集中ページの現行ソースを
 一時的に取得できない場合のフォールバックとしてだけ使う。AI アップスケール完了などで
 編集中にソース解像度が変わった場合は、AI 完了 hook / 次回 compose 前 / モード終了保存前に
@@ -344,6 +345,17 @@ AI 処理には数秒〜数十秒かかるため、その間も `maybe_apply_adj
   表示優先順位 `adjustment > ai_upscale > fs` により AI 結果が覆い隠されてしまうので、
   上記の明示的な `remove` が必須。
 
+### 3.4 補正レイヤーの適用タイミング
+
+補正レイヤーは `local-adjust-core` を使う CPU 処理で、効果によっては重いため別スレッドで適用する。
+入力は `erase_result_cache > adjustment_cache > ai_upscale_cache > fs_cache` の順で解決し、
+結果を `local_adjust_cache` に格納する。消しゴムマスクが存在するが現在世代の
+`erase_result_cache` がまだ無い場合は、古い補正レイヤー結果を表示せず、消しゴム結果の生成を待つ。
+
+生成中または stale の間は、下位レイヤの画像をそのまま表示する。これにより補正レイヤーの古い結果が
+一瞬残ることを避け、非同期完了後に最新の `local_adjust_cache` へ差し替える。サムネイルには
+補正レイヤーを反映しない。
+
 ---
 
 ## 4. キャッシュ無効化ルール (早見表)
@@ -371,8 +383,8 @@ AI 処理には数秒〜数十秒かかるため、その間も `maybe_apply_adj
 (ポストフィルタは AI 設定を変えないので `ai_settings_eq` には含まれず、色系変更と同じ扱い)
 
 消しゴムマスク変更時は `erase_mask_generation[idx]` を進め、`erase_result_cache` と
-`conceal_cache[idx]` を stale 化する。`fs_cache` / `ai_upscale_cache` /
-`adjustment_cache` は下位入力として保持し、MI-GAN 結果だけを再生成する。
+`local_adjust_cache` / `conceal_cache[idx]` を stale 化する。`fs_cache` / `ai_upscale_cache` /
+`adjustment_cache` は下位入力として保持し、MI-GAN 結果と補正レイヤー結果だけを再生成する。
 
 ### 4.1 ヘルパー関数
 
@@ -432,7 +444,7 @@ fn clear_ai_caches_for_indices(&mut self, indices: &[usize])
                     mask_db (消しゴムマスク) ─▶ MI-GAN で inpaint
                                                            │
                                                            ▼
-                                               erase_result_cache ─▶ conceal_cache ─▶ 画面
+                                               erase_result_cache ─▶ local_adjust_cache ─▶ conceal_cache ─▶ 画面
 ```
 
 `fs_cache` は raw decode 専用で、消しゴム確定結果を書き戻さない。マスクが存在する画像は

@@ -257,6 +257,67 @@ pub(crate) struct ComparePinPending {
     pub(crate) rx: mpsc::Receiver<Result<ComparePinResult, String>>,
 }
 
+pub(crate) struct LocalAdjustRenderPending {
+    pub(crate) key: LocalAdjustResultKey,
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) rx: mpsc::Receiver<LocalAdjustRenderResult>,
+}
+
+impl Drop for LocalAdjustRenderPending {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+pub(crate) enum LocalAdjustRenderResult {
+    Ready {
+        key: LocalAdjustResultKey,
+        image: egui::ColorImage,
+    },
+    Cancelled,
+    Failed {
+        key: LocalAdjustResultKey,
+        error: String,
+    },
+}
+
+fn run_local_adjust_render(
+    key: LocalAdjustResultKey,
+    source: Arc<egui::ColorImage>,
+    layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    cancel: Arc<AtomicBool>,
+) -> LocalAdjustRenderResult {
+    if cancel.load(Ordering::Relaxed) {
+        return LocalAdjustRenderResult::Cancelled;
+    }
+    let [width, height] = source.size;
+    let rgba = crate::capture::color_image_to_rgba(&source);
+    let src = local_adjust_core::RgbaImageRef {
+        width,
+        height,
+        pixels: &rgba,
+    };
+    match local_adjust_core::apply_layers_with_progress(src, &layers, Some(&cancel), |_| {}) {
+        Ok(out) => {
+            if cancel.load(Ordering::Relaxed) {
+                return LocalAdjustRenderResult::Cancelled;
+            }
+            LocalAdjustRenderResult::Ready {
+                key,
+                image: egui::ColorImage::from_rgba_unmultiplied(
+                    [out.width, out.height],
+                    &out.pixels,
+                ),
+            }
+        }
+        Err(local_adjust_core::LocalAdjustError::Cancelled) => LocalAdjustRenderResult::Cancelled,
+        Err(err) => LocalAdjustRenderResult::Failed {
+            key,
+            error: err.to_string(),
+        },
+    }
+}
+
 pub(crate) struct ComparePinLoadPending {
     pub(crate) source_idx: usize,
     pub(crate) source_key: String,
@@ -2919,6 +2980,8 @@ pub struct App {
     /// 補正レイヤー合成結果 cache。現在 key と一致する entry だけ表示に採用する。
     pub(crate) local_adjust_cache:
         std::collections::HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>,
+    /// 補正レイヤー合成 worker。idx ごとに最新 1 本だけ動かす。
+    pub(crate) local_adjust_pending: std::collections::HashMap<usize, LocalAdjustRenderPending>,
     /// 補正済み画像キャッシュ: item_idx → テクスチャ + ピクセルデータ
     pub(crate) adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
     /// 補正キャッシュ世代カウンタ (360 度パノラマビュー用、docs/panorama-360-view-plan.md §4.1.2)。
@@ -4110,6 +4173,7 @@ impl App {
             mask_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
             local_adjust_cache: std::collections::HashMap::new(),
+            local_adjust_pending: std::collections::HashMap::new(),
             adjustment_cache: std::collections::HashMap::new(),
             adjustment_generation: std::collections::HashMap::new(),
             ai_upscale_generation: std::collections::HashMap::new(),
@@ -8127,6 +8191,7 @@ impl App {
         self.local_adjust_pages.clear();
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
+        self.cancel_all_local_adjust_pending();
         self.mask_pages.clear();
         self.erase_mask_generation.clear();
         self.conceal_pages.clear();
@@ -9205,6 +9270,7 @@ impl App {
         self.conceal_mask_generation.clear();
         self.erase_result_cache.clear();
         self.local_adjust_cache.clear();
+        self.cancel_all_local_adjust_pending();
         // 360 度パノラマビュー: cache 全体が変わったので世代を一斉 bump (§3.6.2.2)。
         self.bump_all_adjustment_generations();
         self.bump_all_ai_generations();
@@ -17646,7 +17712,21 @@ impl App {
 
     /// 指定 idx の補正レイヤー cache を全世代分破棄する。
     pub(crate) fn clear_local_adjust_caches_for_idx(&mut self, idx: usize) {
+        self.cancel_local_adjust_pending_for_idx(idx);
         self.local_adjust_cache.retain(|key, _| key.idx != idx);
+    }
+
+    fn cancel_local_adjust_pending_for_idx(&mut self, idx: usize) {
+        if let Some(pending) = self.local_adjust_pending.remove(&idx) {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn cancel_all_local_adjust_pending(&mut self) {
+        for pending in self.local_adjust_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.local_adjust_pending.clear();
     }
 
     /// 補正レイヤーが変わったことを idx 単位の世代で表す。
@@ -17664,6 +17744,144 @@ impl App {
         self.local_adjust_cache
             .get(&key)
             .map(|entry| entry.texture.clone())
+    }
+
+    /// 現在世代に一致する補正レイヤー結果ピクセルを返す。
+    pub(crate) fn current_local_adjust_pixels(&self, idx: usize) -> Option<Arc<egui::ColorImage>> {
+        let key = self.current_local_adjust_key(idx);
+        self.local_adjust_cache
+            .get(&key)
+            .map(|entry| Arc::clone(&entry.pixels))
+    }
+
+    fn local_adjust_layers_for_render(
+        &self,
+        idx: usize,
+    ) -> Option<Vec<local_adjust_core::LocalAdjustmentLayer>> {
+        let layers = self.local_adjust_page_layers.get(&idx)?;
+        layers
+            .iter()
+            .any(|layer| layer.enabled && layer.opacity > 0.0)
+            .then(|| layers.clone())
+    }
+
+    fn current_local_adjust_source_pixels(&self, idx: usize) -> Option<Arc<egui::ColorImage>> {
+        if let Some(pixels) = self.current_erase_result_pixels(idx) {
+            return Some(pixels);
+        }
+        if self.mask_pages.contains(&idx) {
+            return None;
+        }
+        if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx) {
+            return Some(Arc::clone(pixels));
+        }
+
+        let bg = self.effective_upscale_bg_mode();
+        if self.ai_will_apply_to(idx) {
+            if let Some(FsCacheEntry::Static { pixels, .. }) = self.ai_upscale_cache.get(&(idx, bg))
+            {
+                return Some(Arc::clone(pixels));
+            }
+        }
+        if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) {
+            return Some(Arc::clone(pixels));
+        }
+        None
+    }
+
+    pub(crate) fn maybe_start_local_adjust_render(&mut self, idx: usize) {
+        if self.current_local_adjust_texture(idx).is_some() {
+            return;
+        }
+        let Some(layers) = self.local_adjust_layers_for_render(idx) else {
+            return;
+        };
+        let key = self.current_local_adjust_key(idx);
+        if self
+            .local_adjust_pending
+            .get(&idx)
+            .is_some_and(|pending| pending.key == key)
+        {
+            return;
+        }
+        let Some(source) = self.current_local_adjust_source_pixels(idx) else {
+            return;
+        };
+
+        self.cancel_local_adjust_pending_for_idx(idx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("local-adjust-render".to_string())
+            .spawn(move || {
+                let result = run_local_adjust_render(key, source, layers, cancel_worker);
+                let _ = tx.send(result);
+            });
+        if let Err(err) = spawn_result {
+            crate::logger::log(format!("local_adjust: render worker spawn failed: {err}"));
+            return;
+        }
+
+        self.local_adjust_pending
+            .insert(idx, LocalAdjustRenderPending { key, cancel, rx });
+    }
+
+    pub(crate) fn poll_local_adjust_render(&mut self, ctx: &egui::Context) {
+        let mut completed = Vec::new();
+        let mut disconnected = Vec::new();
+        for (&idx, pending) in &self.local_adjust_pending {
+            match pending.rx.try_recv() {
+                Ok(result) => completed.push((idx, result)),
+                Err(mpsc::TryRecvError::Disconnected) => disconnected.push(idx),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        let mut repaint = false;
+        for idx in disconnected {
+            self.local_adjust_pending.remove(&idx);
+        }
+        for (idx, result) in completed {
+            self.local_adjust_pending.remove(&idx);
+            match result {
+                LocalAdjustRenderResult::Ready { key, image } => {
+                    if key != self.current_local_adjust_key(idx) {
+                        continue;
+                    }
+                    let pixels = Arc::new(image);
+                    let upload = clamp_for_gpu(&pixels);
+                    let texture = ctx.load_texture(
+                        format!(
+                            "local_adjust_{}_{}_{}_{}",
+                            key.idx, key.input_gen, key.erase_mask_gen, key.local_gen
+                        ),
+                        upload.into_owned(),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.local_adjust_cache
+                        .insert(key, LocalAdjustCacheEntry { pixels, texture });
+                    self.clear_conceal_caches(idx);
+                    repaint = true;
+                }
+                LocalAdjustRenderResult::Cancelled => {}
+                LocalAdjustRenderResult::Failed { key, error } => {
+                    if key == self.current_local_adjust_key(idx) {
+                        crate::logger::log(format!(
+                            "local_adjust: render failed idx={} error={error}",
+                            key.idx
+                        ));
+                    }
+                }
+            }
+        }
+
+        if repaint {
+            ctx.request_repaint();
+        }
+        if !self.local_adjust_pending.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
     }
 
     /// 指定 idx の `conceal_cache` エントリを破棄する。マスク確定 / 削除のように
@@ -17784,6 +18002,7 @@ impl App {
             *v = v.wrapping_add(1);
         }
         self.cancel_all_erase_inpaint_pending();
+        self.cancel_all_local_adjust_pending();
         self.erase_result_cache.clear();
         self.local_adjust_cache.clear();
         self.erase_preview_cache.clear();
@@ -17900,6 +18119,9 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<(std::sync::Arc<egui::ColorImage>, &'static str)> {
+        if let Some(pixels) = self.current_local_adjust_pixels(idx) {
+            return Some((pixels, "local_adjust"));
+        }
         if let Some(pixels) = self.current_erase_result_pixels(idx) {
             return Some((pixels, "erase_result"));
         }
@@ -22767,6 +22989,7 @@ impl eframe::App for App {
         self.poll_video(ctx);
         self.poll_ai_upscale(ctx);
         self.poll_erase_inpaint(ctx);
+        self.poll_local_adjust_render(ctx);
         self.poll_search();
         self.poll_favsearch();
         self.poll_metadata_load();
@@ -22819,6 +23042,7 @@ impl eframe::App for App {
         if self.search_pending.is_some()
             || self.favsearch_pending.is_some()
             || self.metadata_pending.is_some()
+            || !self.local_adjust_pending.is_empty()
             || self
                 .tag_prewarm_pending
                 .as_ref()
@@ -22856,7 +23080,9 @@ impl eframe::App for App {
             if let crate::ui_fullscreen::SpreadPair::Double { left, right } = spread_pair {
                 let other = if left == fs_idx { right } else { left };
                 self.maybe_apply_adjustment(ctx, other, spread_pair);
+                self.maybe_start_local_adjust_render(other);
             }
+            self.maybe_start_local_adjust_render(fs_idx);
             self.evict_adjustment_cache(fs_idx);
         }
         let t_fullscreen_work = frame_t0.elapsed();

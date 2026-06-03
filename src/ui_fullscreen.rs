@@ -801,6 +801,9 @@ impl App {
         if let Some(conceal_tex) = self.ensure_conceal_texture(ctx, idx) {
             return Some(conceal_tex);
         }
+        if let Some(local_adjust_tex) = self.current_local_adjust_texture(idx) {
+            return Some(local_adjust_tex);
+        }
         if let Some(tex) = erase_result_tex {
             return Some(tex);
         }
