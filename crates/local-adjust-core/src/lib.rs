@@ -160,6 +160,29 @@ impl ManualMaskOverride {
     pub fn is_empty(&self) -> bool {
         self.add.is_none() && self.subtract.is_none()
     }
+
+    pub fn resize_masks_to(&mut self, new_w: usize, new_h: usize) {
+        let new_w = new_w.max(1);
+        let new_h = new_h.max(1);
+        if let Some(mask) = &mut self.add {
+            mask.resize_to(new_w, new_h);
+        }
+        if let Some(mask) = &mut self.subtract {
+            mask.resize_to(new_w, new_h);
+        }
+    }
+
+    pub fn masks_match_dims(&self, width: usize, height: usize) -> bool {
+        let width = width.max(1);
+        let height = height.max(1);
+        self.add
+            .as_ref()
+            .is_none_or(|mask| mask.matches_dims(width, height))
+            && self
+                .subtract
+                .as_ref()
+                .is_none_or(|mask| mask.matches_dims(width, height))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -365,6 +388,121 @@ impl MaskShape {
     }
 }
 
+pub fn resize_mask_bilinear(
+    src: &[f32],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<f32> {
+    if dst_w == 0 || dst_h == 0 {
+        return Vec::new();
+    }
+    let mut dst = vec![0.0; dst_w.saturating_mul(dst_h)];
+    if src_w == 0 || src_h == 0 || src.is_empty() {
+        return dst;
+    }
+    let scale_x = if dst_w > 1 {
+        (src_w.saturating_sub(1)) as f32 / (dst_w.saturating_sub(1)) as f32
+    } else {
+        0.0
+    };
+    let scale_y = if dst_h > 1 {
+        (src_h.saturating_sub(1)) as f32 / (dst_h.saturating_sub(1)) as f32
+    } else {
+        0.0
+    };
+    for y in 0..dst_h {
+        let sy = y as f32 * scale_y;
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(src_h - 1);
+        let fy = sy - y0 as f32;
+        for x in 0..dst_w {
+            let sx = x as f32 * scale_x;
+            let x0 = sx.floor() as usize;
+            let x1 = (x0 + 1).min(src_w - 1);
+            let fx = sx - x0 as f32;
+            let a00 = mask_sample(src, src_w, x0, y0);
+            let a10 = mask_sample(src, src_w, x1, y0);
+            let a01 = mask_sample(src, src_w, x0, y1);
+            let a11 = mask_sample(src, src_w, x1, y1);
+            let top = a00 + (a10 - a00) * fx;
+            let bottom = a01 + (a11 - a01) * fx;
+            dst[y * dst_w + x] = (top + (bottom - top) * fy).clamp(0.0, 1.0);
+        }
+    }
+    dst
+}
+
+fn mask_sample(src: &[f32], width: usize, x: usize, y: usize) -> f32 {
+    src.get(y.saturating_mul(width).saturating_add(x))
+        .copied()
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0)
+}
+
+fn resize_labels_nearest(
+    src: &[u32],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<u32> {
+    if dst_w == 0 || dst_h == 0 {
+        return Vec::new();
+    }
+    let mut dst = vec![0; dst_w.saturating_mul(dst_h)];
+    if src_w == 0 || src_h == 0 || src.is_empty() {
+        return dst;
+    }
+    for y in 0..dst_h {
+        let sy = ((y as f32 + 0.5) * src_h as f32 / dst_h as f32)
+            .floor()
+            .clamp(0.0, src_h.saturating_sub(1) as f32) as usize;
+        for x in 0..dst_w {
+            let sx = ((x as f32 + 0.5) * src_w as f32 / dst_w as f32)
+                .floor()
+                .clamp(0.0, src_w.saturating_sub(1) as f32) as usize;
+            dst[y * dst_w + x] = src
+                .get(sy.saturating_mul(src_w).saturating_add(sx))
+                .copied()
+                .unwrap_or(0);
+        }
+    }
+    dst
+}
+
+fn scale_mask_shape(shape: &mut MaskShape, sx: f32, sy: f32) {
+    match shape {
+        MaskShape::Line {
+            p0, p1, thickness, ..
+        } => {
+            p0[0] *= sx;
+            p0[1] *= sy;
+            p1[0] *= sx;
+            p1[1] *= sy;
+            *thickness = (*thickness * ((sx.abs() + sy.abs()) * 0.5)).max(1.0);
+        }
+        MaskShape::Rect {
+            center,
+            half_w,
+            half_h,
+            ..
+        } => {
+            center[0] *= sx;
+            center[1] *= sy;
+            *half_w *= sx.abs();
+            *half_h *= sy.abs();
+        }
+        MaskShape::Ellipse { center, rx, ry, .. } => {
+            center[0] *= sx;
+            center[1] *= sy;
+            *rx *= sx.abs();
+            *ry *= sy.abs();
+        }
+    }
+}
+
 impl RasterMask {
     pub fn empty(width: usize, height: usize) -> Self {
         Self {
@@ -391,6 +529,25 @@ impl RasterMask {
             });
         }
         Ok(())
+    }
+
+    pub fn resize_to(&mut self, new_w: usize, new_h: usize) {
+        let new_w = new_w.max(1);
+        let new_h = new_h.max(1);
+        if self.matches_dims(new_w, new_h) {
+            return;
+        }
+        self.alpha = resize_mask_bilinear(&self.alpha, self.width, self.height, new_w, new_h);
+        self.width = new_w;
+        self.height = new_h;
+    }
+
+    pub fn matches_dims(&self, width: usize, height: usize) -> bool {
+        let width = width.max(1);
+        let height = height.max(1);
+        self.width == width
+            && self.height == height
+            && self.alpha.len() == width.saturating_mul(height)
     }
 }
 
@@ -446,6 +603,134 @@ impl SubjectMask {
             });
         }
         Ok(())
+    }
+
+    pub fn resize_to(&mut self, new_w: usize, new_h: usize) {
+        let new_w = new_w.max(1);
+        let new_h = new_h.max(1);
+        if self.matches_dims(new_w, new_h) {
+            return;
+        }
+        self.alpha = resize_mask_bilinear(&self.alpha, self.width, self.height, new_w, new_h);
+        if let Some(source_alpha) = &mut self.source_alpha {
+            *source_alpha =
+                resize_mask_bilinear(source_alpha, self.width, self.height, new_w, new_h);
+        }
+        self.width = new_w;
+        self.height = new_h;
+    }
+
+    pub fn matches_dims(&self, width: usize, height: usize) -> bool {
+        let width = width.max(1);
+        let height = height.max(1);
+        let expected = width.saturating_mul(height);
+        self.width == width
+            && self.height == height
+            && self.alpha.len() == expected
+            && self
+                .source_alpha
+                .as_ref()
+                .is_none_or(|alpha| alpha.len() == expected)
+    }
+}
+
+impl RegionMask {
+    pub fn resize_to(&mut self, new_w: usize, new_h: usize) {
+        let new_w = new_w.max(1);
+        let new_h = new_h.max(1);
+        if self.matches_dims(new_w, new_h) {
+            return;
+        }
+        self.labels = resize_labels_nearest(&self.labels, self.width, self.height, new_w, new_h);
+        self.width = new_w;
+        self.height = new_h;
+    }
+
+    pub fn matches_dims(&self, width: usize, height: usize) -> bool {
+        let width = width.max(1);
+        let height = height.max(1);
+        self.width == width
+            && self.height == height
+            && self.labels.len() == width.saturating_mul(height)
+    }
+}
+
+impl RasterVectorMask {
+    pub fn resize_to(&mut self, new_w: usize, new_h: usize) {
+        let new_w = new_w.max(1);
+        let new_h = new_h.max(1);
+        if self.matches_dims(new_w, new_h) {
+            return;
+        }
+        let dimensions_changed = self.width != new_w || self.height != new_h;
+        if dimensions_changed {
+            let sx = new_w as f32 / self.width.max(1) as f32;
+            let sy = new_h as f32 / self.height.max(1) as f32;
+            for shape in &mut self.shapes {
+                scale_mask_shape(shape, sx, sy);
+            }
+        }
+        self.alpha = resize_mask_bilinear(&self.alpha, self.width, self.height, new_w, new_h);
+        self.width = new_w;
+        self.height = new_h;
+    }
+
+    pub fn matches_dims(&self, width: usize, height: usize) -> bool {
+        let width = width.max(1);
+        let height = height.max(1);
+        self.width == width
+            && self.height == height
+            && self.alpha.len() == width.saturating_mul(height)
+    }
+}
+
+impl LocalMask {
+    pub fn resize_to(&mut self, new_w: usize, new_h: usize) {
+        let new_w = new_w.max(1);
+        let new_h = new_h.max(1);
+        match self {
+            Self::Raster(mask) => mask.resize_to(new_w, new_h),
+            Self::RasterVector(mask) => mask.resize_to(new_w, new_h),
+            Self::Subject(mask) => mask.resize_to(new_w, new_h),
+            Self::Segmentation(mask) => mask.resize_to(new_w, new_h),
+            Self::Full
+            | Self::LinearGradient(_)
+            | Self::RadialGradient(_)
+            | Self::LumaRange(_)
+            | Self::ColorRange(_) => {}
+        }
+    }
+
+    pub fn matches_dims(&self, width: usize, height: usize) -> bool {
+        let width = width.max(1);
+        let height = height.max(1);
+        match self {
+            Self::Raster(mask) => mask.matches_dims(width, height),
+            Self::RasterVector(mask) => mask.matches_dims(width, height),
+            Self::Subject(mask) => mask.matches_dims(width, height),
+            Self::Segmentation(mask) => mask.matches_dims(width, height),
+            Self::Full
+            | Self::LinearGradient(_)
+            | Self::RadialGradient(_)
+            | Self::LumaRange(_)
+            | Self::ColorRange(_) => true,
+        }
+    }
+}
+
+impl LocalAdjustmentLayer {
+    pub fn resize_masks_to(&mut self, new_w: usize, new_h: usize) {
+        let new_w = new_w.max(1);
+        let new_h = new_h.max(1);
+        self.mask.resize_to(new_w, new_h);
+        self.manual_override.resize_masks_to(new_w, new_h);
+    }
+
+    pub fn masks_match_dims(&self, width: usize, height: usize) -> bool {
+        let width = width.max(1);
+        let height = height.max(1);
+        self.mask.matches_dims(width, height)
+            && self.manual_override.masks_match_dims(width, height)
     }
 }
 

@@ -21,7 +21,7 @@ use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
 use crate::app::{
     AdjustSpreadTarget, App, LocalAdjustGeneratedMask, LocalAdjustMaskColorPreset,
     LocalAdjustMaskEditTarget, LocalAdjustMaskShapeDrag, LocalAdjustMaskTool,
-    LocalAdjustRegionSegmentationScope, LocalAdjustShapeHandle,
+    LocalAdjustRegionSegmentationScope,
 };
 use crate::local_adjust_catalog::{
     EFFECT_GROUPS, EffectKind, effect_picker_button_width, effect_picker_matches_query,
@@ -193,7 +193,32 @@ mod local_adjust_segmentation_tests {
     }
 
     #[test]
-    fn local_adjust_shape_handle_hit_radius_can_expand_for_zoomed_out_view() {
+    fn local_adjust_rect_handles_use_shared_vector_layout() {
+        let shape = local_adjust_core::MaskShape::Rect {
+            op: local_adjust_core::ShapeOp::Add,
+            center: [100.0, 100.0],
+            half_w: 30.0,
+            half_h: 20.0,
+            rotation_rad: 0.0,
+        };
+        let vector_shape = local_adjust_shape_to_vector_shape(shape);
+        let layout = crate::vector_edit::compute_handle_layout(&vector_shape, 1.0);
+        assert_eq!(
+            crate::vector_edit::hit_test(&layout, (130.0, 120.0), 1.0),
+            Some(crate::vector_edit::HoverTarget::Corner { idx: 2 })
+        );
+        assert_eq!(
+            crate::vector_edit::hit_test(&layout, (100.0, 80.0), 1.0),
+            Some(crate::vector_edit::HoverTarget::EdgeMidpoint { idx: 0 })
+        );
+        assert_eq!(
+            crate::vector_edit::hit_test(&layout, (100.0, 52.0), 1.0),
+            Some(crate::vector_edit::HoverTarget::RotateHandle)
+        );
+    }
+
+    #[test]
+    fn local_adjust_ellipse_handles_use_shared_vector_layout() {
         let shape = local_adjust_core::MaskShape::Ellipse {
             op: local_adjust_core::ShapeOp::Add,
             center: [100.0, 100.0],
@@ -201,40 +226,69 @@ mod local_adjust_segmentation_tests {
             ry: 24.0,
             rotation_rad: 0.0,
         };
+        let vector_shape = local_adjust_shape_to_vector_shape(shape);
+        let layout = crate::vector_edit::compute_handle_layout(&vector_shape, 1.0);
         assert_eq!(
-            hit_local_adjust_shape_handles(shape, [170.0, 100.0], 12.0),
-            None
+            crate::vector_edit::hit_test(&layout, (150.0, 100.0), 1.0),
+            Some(crate::vector_edit::HoverTarget::EdgeMidpoint { idx: 1 })
         );
         assert_eq!(
-            hit_local_adjust_shape_handles(shape, [170.0, 100.0], 24.0),
-            Some(LocalAdjustShapeHandle::Radius)
+            crate::vector_edit::hit_test(&layout, (100.0, 48.0), 1.0),
+            Some(crate::vector_edit::HoverTarget::RotateHandle)
         );
     }
 
     #[test]
-    fn rect_and_ellipse_shape_handles_are_hit_testable() {
-        let rect = local_adjust_core::MaskShape::Rect {
-            op: local_adjust_core::ShapeOp::Add,
-            center: [100.0, 100.0],
-            half_w: 30.0,
-            half_h: 20.0,
-            rotation_rad: 0.0,
-        };
-        assert_eq!(
-            hit_local_adjust_shape_handles(rect, [130.0, 120.0], 14.0),
-            Some(LocalAdjustShapeHandle::Corner(2))
+    fn selected_local_adjust_line_thickness_updates_shape() {
+        let mut layer = local_adjust_core::LocalAdjustmentLayer::new(
+            "line",
+            local_adjust_core::LocalMask::RasterVector(local_adjust_core::RasterVectorMask {
+                width: 200,
+                height: 100,
+                alpha: vec![0.0; 200 * 100],
+                shapes: vec![local_adjust_core::MaskShape::Line {
+                    op: local_adjust_core::ShapeOp::Add,
+                    kind: local_adjust_core::LineKind::Diagonal,
+                    p0: [10.0, 10.0],
+                    p1: [120.0, 10.0],
+                    thickness: 8.0,
+                }],
+            }),
+            local_adjust_core::LocalEffect::None,
         );
-        let ellipse = local_adjust_core::MaskShape::Ellipse {
+        assert_eq!(
+            selected_local_adjust_line_thickness(&layer, LocalAdjustMaskEditTarget::Base, Some(0),),
+            Some(8.0)
+        );
+        assert!(set_selected_local_adjust_line_thickness(
+            &mut layer,
+            LocalAdjustMaskEditTarget::Base,
+            Some(0),
+            18.0,
+            (200, 100),
+        ));
+        assert_eq!(
+            selected_local_adjust_line_thickness(&layer, LocalAdjustMaskEditTarget::Base, Some(0),),
+            Some(18.0)
+        );
+
+        let non_line = local_adjust_core::MaskShape::Ellipse {
             op: local_adjust_core::ShapeOp::Add,
             center: [100.0, 100.0],
             rx: 40.0,
             ry: 22.0,
             rotation_rad: 0.0,
         };
-        assert_eq!(
-            hit_local_adjust_shape_handles(ellipse, [140.0, 100.0], 14.0),
-            Some(LocalAdjustShapeHandle::Radius)
-        );
+        if let local_adjust_core::LocalMask::RasterVector(mask) = &mut layer.mask {
+            mask.shapes.push(non_line);
+        }
+        assert!(!set_selected_local_adjust_line_thickness(
+            &mut layer,
+            LocalAdjustMaskEditTarget::Base,
+            Some(1),
+            20.0,
+            (200, 100),
+        ));
     }
 
     #[test]
@@ -822,19 +876,20 @@ fn local_adjust_target_raster_vector_mask_mut(
 
     match target {
         LocalAdjustMaskEditTarget::Base => match &mut layer.mask {
-            local_adjust_core::LocalMask::RasterVector(mask) => Some(mask),
+            local_adjust_core::LocalMask::RasterVector(mask) => {
+                mask.resize_to(width, height);
+                Some(mask)
+            }
             _ => None,
         },
         LocalAdjustMaskEditTarget::OverrideAdd | LocalAdjustMaskEditTarget::OverrideSubtract => {
             let slot = local_mask_override_slot_mut(layer, target)?;
-            if slot
-                .as_ref()
-                .is_none_or(|mask| mask.width != width || mask.height != height)
-            {
-                if !create {
-                    return None;
-                }
+            if let Some(mask) = slot.as_mut() {
+                mask.resize_to(width, height);
+            } else if create {
                 *slot = Some(local_adjust_core::RasterVectorMask::empty(width, height));
+            } else {
+                return None;
             }
             slot.as_mut()
         }
@@ -1612,6 +1667,7 @@ fn draw_local_tool_settings(
     layer: &local_adjust_core::LocalAdjustmentLayer,
     mask_edit_target: LocalAdjustMaskEditTarget,
     mask_tool: LocalAdjustMaskTool,
+    selected_line_thickness: Option<f32>,
     mask_brush_radius: &mut f32,
     mask_line_width: &mut f32,
     mask_gap_fill_distance: &mut f32,
@@ -1642,8 +1698,24 @@ fn draw_local_tool_settings(
         }
         LocalAdjustMaskTool::Line
         | LocalAdjustMaskTool::VertLine
-        | LocalAdjustMaskTool::HorizLine => {
+        | LocalAdjustMaskTool::HorizLine
+        | LocalAdjustMaskTool::Select
+            if selected_line_thickness.is_some()
+                || matches!(
+                    mask_tool,
+                    LocalAdjustMaskTool::Line
+                        | LocalAdjustMaskTool::VertLine
+                        | LocalAdjustMaskTool::HorizLine
+                ) =>
+        {
             ui.add(egui::Slider::new(mask_line_width, 1.0..=160.0).text("線幅"));
+            if selected_line_thickness.is_some() {
+                ui.label(
+                    egui::RichText::new("選択中の直線にも反映します。")
+                        .size(10.0)
+                        .color(egui::Color32::from_gray(170)),
+                );
+            }
         }
         _ => {}
     }
@@ -1707,6 +1779,7 @@ fn draw_selected_local_adjust_layer_editor(
     layer_idx: usize,
     layer: &local_adjust_core::LocalAdjustmentLayer,
     image_dims: (usize, usize),
+    selected_shape: Option<usize>,
     update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
     effect_clipboard_available: bool,
     selective_color_pick_active: bool,
@@ -1736,14 +1809,21 @@ fn draw_selected_local_adjust_layer_editor(
     let selected_mask_kind = Some(MaskKind::from_mask(&edited.mask));
     let manual_edit_controls_visible =
         local_adjust_manual_edit_controls_visible(Some(&edited), *mask_edit_target);
+    let selected_line_thickness = effective_local_mask_edit_target(&edited, *mask_edit_target)
+        .and_then(|target| selected_local_adjust_line_thickness(&edited, target, selected_shape));
+    if let Some(thickness) = selected_line_thickness {
+        *mask_line_width = thickness.max(1.0);
+    }
 
     draw_local_adjust_panel_section(ui, LocalAdjustPanelSection::Tool, |ui| {
         if manual_edit_controls_visible {
+            let before_line_width = *mask_line_width;
             draw_local_tool_settings(
                 ui,
                 &edited,
                 *mask_edit_target,
                 *mask_tool,
+                selected_line_thickness,
                 mask_brush_radius,
                 mask_line_width,
                 mask_gap_fill_distance,
@@ -1753,6 +1833,19 @@ fn draw_selected_local_adjust_layer_editor(
                 edge_brush_tolerance,
                 edge_brush_include_boundary,
             );
+            if selected_line_thickness.is_some()
+                && (*mask_line_width - before_line_width).abs() > f32::EPSILON
+                && let Some(target) = effective_local_mask_edit_target(&edited, *mask_edit_target)
+                && set_selected_local_adjust_line_thickness(
+                    &mut edited,
+                    target,
+                    selected_shape,
+                    *mask_line_width,
+                    image_dims,
+                )
+            {
+                changed = true;
+            }
         } else {
             ui.label(
                 egui::RichText::new("ツール設定")
@@ -2320,40 +2413,7 @@ fn resize_local_adjust_mask_bilinear(
     dst_w: usize,
     dst_h: usize,
 ) -> Vec<f32> {
-    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
-        return Vec::new();
-    }
-    let mut dst = vec![0.0; dst_w.saturating_mul(dst_h)];
-    let scale_x = if dst_w > 1 {
-        (src_w.saturating_sub(1)) as f32 / (dst_w.saturating_sub(1)) as f32
-    } else {
-        0.0
-    };
-    let scale_y = if dst_h > 1 {
-        (src_h.saturating_sub(1)) as f32 / (dst_h.saturating_sub(1)) as f32
-    } else {
-        0.0
-    };
-    for y in 0..dst_h {
-        let sy = y as f32 * scale_y;
-        let y0 = sy.floor() as usize;
-        let y1 = (y0 + 1).min(src_h - 1);
-        let fy = sy - y0 as f32;
-        for x in 0..dst_w {
-            let sx = x as f32 * scale_x;
-            let x0 = sx.floor() as usize;
-            let x1 = (x0 + 1).min(src_w - 1);
-            let fx = sx - x0 as f32;
-            let a00 = src[y0 * src_w + x0];
-            let a10 = src[y0 * src_w + x1];
-            let a01 = src[y1 * src_w + x0];
-            let a11 = src[y1 * src_w + x1];
-            let top = a00 + (a10 - a00) * fx;
-            let bottom = a01 + (a11 - a01) * fx;
-            dst[y * dst_w + x] = (top + (bottom - top) * fy).clamp(0.0, 1.0);
-        }
-    }
-    dst
+    local_adjust_core::resize_mask_bilinear(src, src_w, src_h, dst_w, dst_h)
 }
 
 fn run_local_adjust_u2netp_segmentation(
@@ -3295,7 +3355,7 @@ fn make_local_adjust_shape(
         LocalAdjustMaskTool::VertLine => {
             let lx = start.0.min(end.0);
             let rx = start.0.max(end.0);
-            let thickness = (rx - lx).max(1.0);
+            let thickness = (rx - lx).max(line_width.max(1.0));
             let cx = (lx + rx) * 0.5;
             Some(local_adjust_core::MaskShape::Line {
                 op,
@@ -3308,7 +3368,7 @@ fn make_local_adjust_shape(
         LocalAdjustMaskTool::HorizLine => {
             let ty = start.1.min(end.1);
             let by = start.1.max(end.1);
-            let thickness = (by - ty).max(1.0);
+            let thickness = (by - ty).max(line_width.max(1.0));
             let cy = (ty + by) * 0.5;
             Some(local_adjust_core::MaskShape::Line {
                 op,
@@ -3344,6 +3404,187 @@ fn make_local_adjust_shape(
         }
         _ => None,
     }
+}
+
+fn local_adjust_shape_op_to_vector(op: local_adjust_core::ShapeOp) -> crate::mask_db::ShapeOp {
+    match op {
+        local_adjust_core::ShapeOp::Add => crate::mask_db::ShapeOp::Add,
+        local_adjust_core::ShapeOp::Subtract => crate::mask_db::ShapeOp::Subtract,
+    }
+}
+
+fn vector_shape_op_to_local_adjust(op: crate::mask_db::ShapeOp) -> local_adjust_core::ShapeOp {
+    match op {
+        crate::mask_db::ShapeOp::Add => local_adjust_core::ShapeOp::Add,
+        crate::mask_db::ShapeOp::Subtract => local_adjust_core::ShapeOp::Subtract,
+    }
+}
+
+fn local_adjust_line_kind_to_vector(kind: local_adjust_core::LineKind) -> crate::mask_db::LineKind {
+    match kind {
+        local_adjust_core::LineKind::Vertical => crate::mask_db::LineKind::Vertical,
+        local_adjust_core::LineKind::Horizontal => crate::mask_db::LineKind::Horizontal,
+        local_adjust_core::LineKind::Diagonal => crate::mask_db::LineKind::Diagonal,
+    }
+}
+
+fn vector_line_kind_to_local_adjust(kind: crate::mask_db::LineKind) -> local_adjust_core::LineKind {
+    match kind {
+        crate::mask_db::LineKind::Vertical => local_adjust_core::LineKind::Vertical,
+        crate::mask_db::LineKind::Horizontal => local_adjust_core::LineKind::Horizontal,
+        crate::mask_db::LineKind::Diagonal => local_adjust_core::LineKind::Diagonal,
+    }
+}
+
+fn local_adjust_shape_to_vector_shape(
+    shape: local_adjust_core::MaskShape,
+) -> crate::mask_db::Shape {
+    match shape {
+        local_adjust_core::MaskShape::Line {
+            op,
+            kind,
+            p0,
+            p1,
+            thickness,
+        } => crate::mask_db::Shape::Line {
+            op: local_adjust_shape_op_to_vector(op),
+            kind: local_adjust_line_kind_to_vector(kind),
+            p0: (p0[0], p0[1]),
+            p1: (p1[0], p1[1]),
+            thickness,
+        },
+        local_adjust_core::MaskShape::Rect {
+            op,
+            center,
+            half_w,
+            half_h,
+            rotation_rad,
+        } => crate::mask_db::Shape::Rect {
+            op: local_adjust_shape_op_to_vector(op),
+            center: (center[0], center[1]),
+            half_w,
+            half_h,
+            rotation_rad,
+        },
+        local_adjust_core::MaskShape::Ellipse {
+            op,
+            center,
+            rx,
+            ry,
+            rotation_rad,
+        } => crate::mask_db::Shape::Ellipse {
+            op: local_adjust_shape_op_to_vector(op),
+            center: (center[0], center[1]),
+            rx,
+            ry,
+            rotation_rad,
+        },
+    }
+}
+
+fn vector_shape_to_local_adjust_shape(
+    shape: crate::mask_db::Shape,
+) -> local_adjust_core::MaskShape {
+    match shape {
+        crate::mask_db::Shape::Line {
+            op,
+            kind,
+            p0,
+            p1,
+            thickness,
+        } => local_adjust_core::MaskShape::Line {
+            op: vector_shape_op_to_local_adjust(op),
+            kind: vector_line_kind_to_local_adjust(kind),
+            p0: [p0.0, p0.1],
+            p1: [p1.0, p1.1],
+            thickness,
+        },
+        crate::mask_db::Shape::Rect {
+            op,
+            center,
+            half_w,
+            half_h,
+            rotation_rad,
+        } => local_adjust_core::MaskShape::Rect {
+            op: vector_shape_op_to_local_adjust(op),
+            center: [center.0, center.1],
+            half_w,
+            half_h,
+            rotation_rad,
+        },
+        crate::mask_db::Shape::Ellipse {
+            op,
+            center,
+            rx,
+            ry,
+            rotation_rad,
+        } => local_adjust_core::MaskShape::Ellipse {
+            op: vector_shape_op_to_local_adjust(op),
+            center: [center.0, center.1],
+            rx,
+            ry,
+            rotation_rad,
+        },
+    }
+}
+
+fn local_adjust_point_in_vector_body(p: (f32, f32), poly: &[(f32, f32); 4]) -> bool {
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if (yi > p.1) != (yj > p.1) {
+            let x_intersect = (xj - xi) * (p.1 - yi) / (yj - yi + 1e-9) + xi;
+            if p.0 < x_intersect {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
+}
+
+fn selected_local_adjust_line_thickness(
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+    target: LocalAdjustMaskEditTarget,
+    selected_shape: Option<usize>,
+) -> Option<f32> {
+    let selected = selected_shape?;
+    let mask = local_adjust_target_raster_vector_mask_ref(layer, target)?;
+    match mask.shapes.get(selected)? {
+        local_adjust_core::MaskShape::Line { thickness, .. } => Some(*thickness),
+        _ => None,
+    }
+}
+
+fn set_selected_local_adjust_line_thickness(
+    layer: &mut local_adjust_core::LocalAdjustmentLayer,
+    target: LocalAdjustMaskEditTarget,
+    selected_shape: Option<usize>,
+    thickness: f32,
+    image_dims: (usize, usize),
+) -> bool {
+    let Some(selected) = selected_shape else {
+        return false;
+    };
+    let Some(mask) = local_adjust_target_raster_vector_mask_mut(layer, target, image_dims, false)
+    else {
+        return false;
+    };
+    let Some(local_adjust_core::MaskShape::Line {
+        thickness: line_thickness,
+        ..
+    }) = mask.shapes.get_mut(selected)
+    else {
+        return false;
+    };
+    let next = thickness.max(1.0);
+    if (*line_thickness - next).abs() <= f32::EPSILON {
+        return false;
+    }
+    *line_thickness = next;
+    true
 }
 
 fn draw_local_adjust_ellipse(
@@ -3438,15 +3679,6 @@ fn draw_local_adjust_shape_outline(
     }
 }
 
-fn local_adjust_axis_corners(center: [f32; 2], half_w: f32, half_h: f32) -> [[f32; 2]; 4] {
-    [
-        [center[0] - half_w, center[1] - half_h],
-        [center[0] + half_w, center[1] - half_h],
-        [center[0] + half_w, center[1] + half_h],
-        [center[0] - half_w, center[1] + half_h],
-    ]
-}
-
 fn local_adjust_inverse_rotate_point(p: [f32; 2], center: [f32; 2], rotation_rad: f32) -> [f32; 2] {
     let (s, c) = (-rotation_rad).sin_cos();
     let dx = p[0] - center[0];
@@ -3498,335 +3730,6 @@ fn local_adjust_shape_contains(shape: local_adjust_core::MaskShape, p: [f32; 2])
             let local = local_adjust_inverse_rotate_point(p, center, rotation_rad);
             ((local[0] - center[0]) / rx).powi(2) + ((local[1] - center[1]) / ry).powi(2) <= 1.0
         }
-    }
-}
-
-fn hit_local_adjust_shape_handles(
-    shape: local_adjust_core::MaskShape,
-    p: [f32; 2],
-    hit_radius_px: f32,
-) -> Option<LocalAdjustShapeHandle> {
-    let r2 = hit_radius_px.max(12.0).powi(2);
-    match shape {
-        local_adjust_core::MaskShape::Line { p0, p1, .. } => {
-            if local_adjust_dist2(p, p0) <= r2 {
-                Some(LocalAdjustShapeHandle::LineStart)
-            } else if local_adjust_dist2(p, p1) <= r2 {
-                Some(LocalAdjustShapeHandle::LineEnd)
-            } else {
-                None
-            }
-        }
-        local_adjust_core::MaskShape::Rect {
-            center,
-            half_w,
-            half_h,
-            rotation_rad,
-            ..
-        } => local_adjust_axis_corners(center, half_w, half_h)
-            .iter()
-            .enumerate()
-            .find(|&(_, &corner)| local_adjust_dist2(p, corner) <= r2 && rotation_rad.abs() < 0.001)
-            .map(|(i, _)| LocalAdjustShapeHandle::Corner(i as u8)),
-        local_adjust_core::MaskShape::Ellipse {
-            center,
-            rx,
-            ry,
-            rotation_rad,
-            ..
-        } => {
-            let handle = [center[0] + rx, center[1]];
-            if local_adjust_dist2(p, handle) <= r2 && rotation_rad.abs() < 0.001 {
-                Some(LocalAdjustShapeHandle::Radius)
-            } else {
-                local_adjust_axis_corners(center, rx, ry)
-                    .iter()
-                    .enumerate()
-                    .find(|&(_, &corner)| {
-                        local_adjust_dist2(p, corner) <= r2 && rotation_rad.abs() < 0.001
-                    })
-                    .map(|(i, _)| LocalAdjustShapeHandle::Corner(i as u8))
-            }
-        }
-    }
-}
-
-fn draw_local_adjust_shape_handles(
-    painter: &egui::Painter,
-    shape: local_adjust_core::MaskShape,
-    to_screen: &impl Fn([f32; 2]) -> egui::Pos2,
-) {
-    let fill = egui::Color32::from_rgb(255, 250, 210);
-    let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(35, 25, 10));
-    let draw = |p: [f32; 2]| {
-        let screen = to_screen(p);
-        painter.circle_filled(screen, 5.5, fill);
-        painter.circle_stroke(screen, 5.5, stroke);
-    };
-    match shape {
-        local_adjust_core::MaskShape::Line { p0, p1, .. } => {
-            draw(p0);
-            draw(p1);
-        }
-        local_adjust_core::MaskShape::Rect {
-            center,
-            half_w,
-            half_h,
-            rotation_rad,
-            ..
-        } => {
-            for p in local_adjust_rotated_corners(center, half_w, half_h, rotation_rad) {
-                draw(p);
-            }
-        }
-        local_adjust_core::MaskShape::Ellipse {
-            center,
-            rx,
-            ry,
-            rotation_rad,
-            ..
-        } => {
-            for p in local_adjust_rotated_corners(center, rx, ry, rotation_rad) {
-                draw(p);
-            }
-            draw([center[0] + rx, center[1]]);
-        }
-    }
-}
-
-fn translate_local_adjust_shape(
-    shape: local_adjust_core::MaskShape,
-    dx: f32,
-    dy: f32,
-) -> local_adjust_core::MaskShape {
-    match shape {
-        local_adjust_core::MaskShape::Line {
-            op,
-            kind,
-            p0,
-            p1,
-            thickness,
-        } => local_adjust_core::MaskShape::Line {
-            op,
-            kind,
-            p0: [p0[0] + dx, p0[1] + dy],
-            p1: [p1[0] + dx, p1[1] + dy],
-            thickness,
-        },
-        local_adjust_core::MaskShape::Rect {
-            op,
-            center,
-            half_w,
-            half_h,
-            rotation_rad,
-        } => local_adjust_core::MaskShape::Rect {
-            op,
-            center: [center[0] + dx, center[1] + dy],
-            half_w,
-            half_h,
-            rotation_rad,
-        },
-        local_adjust_core::MaskShape::Ellipse {
-            op,
-            center,
-            rx,
-            ry,
-            rotation_rad,
-        } => local_adjust_core::MaskShape::Ellipse {
-            op,
-            center: [center[0] + dx, center[1] + dy],
-            rx,
-            ry,
-            rotation_rad,
-        },
-    }
-}
-
-fn constrain_local_adjust_line_endpoint(
-    cur: [f32; 2],
-    anchor: [f32; 2],
-    modifiers: egui::Modifiers,
-) -> [f32; 2] {
-    if !modifiers.shift {
-        return cur;
-    }
-    let dx = cur[0] - anchor[0];
-    let dy = cur[1] - anchor[1];
-    if dx.abs() > dy.abs() {
-        [cur[0], anchor[1]]
-    } else {
-        [anchor[0], cur[1]]
-    }
-}
-
-fn resize_local_adjust_axis_rect(
-    op: local_adjust_core::ShapeOp,
-    center: [f32; 2],
-    half_w: f32,
-    half_h: f32,
-    rotation_rad: f32,
-    corner: u8,
-    cur: [f32; 2],
-    modifiers: egui::Modifiers,
-) -> Option<local_adjust_core::MaskShape> {
-    if rotation_rad.abs() > 0.001 {
-        return None;
-    }
-    let corners = local_adjust_axis_corners(center, half_w, half_h);
-    let anchor = corners[((corner as usize) + 2) % 4];
-    let cx = (anchor[0] + cur[0]) * 0.5;
-    let cy = (anchor[1] + cur[1]) * 0.5;
-    let mut next_half_w = (cur[0] - anchor[0]).abs() * 0.5;
-    let mut next_half_h = (cur[1] - anchor[1]).abs() * 0.5;
-    if modifiers.shift {
-        let m = next_half_w.max(next_half_h);
-        next_half_w = m;
-        next_half_h = m;
-    }
-    Some(local_adjust_core::MaskShape::Rect {
-        op,
-        center: [cx, cy],
-        half_w: next_half_w.max(1.0),
-        half_h: next_half_h.max(1.0),
-        rotation_rad,
-    })
-}
-
-fn resize_local_adjust_axis_ellipse(
-    op: local_adjust_core::ShapeOp,
-    center: [f32; 2],
-    rx: f32,
-    ry: f32,
-    rotation_rad: f32,
-    corner: u8,
-    cur: [f32; 2],
-    modifiers: egui::Modifiers,
-) -> Option<local_adjust_core::MaskShape> {
-    if rotation_rad.abs() > 0.001 {
-        return None;
-    }
-    let corners = local_adjust_axis_corners(center, rx, ry);
-    let anchor = corners[((corner as usize) + 2) % 4];
-    let cx = (anchor[0] + cur[0]) * 0.5;
-    let cy = (anchor[1] + cur[1]) * 0.5;
-    let mut next_rx = (cur[0] - anchor[0]).abs() * 0.5;
-    let mut next_ry = (cur[1] - anchor[1]).abs() * 0.5;
-    if modifiers.shift {
-        let m = next_rx.max(next_ry);
-        next_rx = m;
-        next_ry = m;
-    }
-    Some(local_adjust_core::MaskShape::Ellipse {
-        op,
-        center: [cx, cy],
-        rx: next_rx.max(1.0),
-        ry: next_ry.max(1.0),
-        rotation_rad,
-    })
-}
-
-fn apply_local_adjust_shape_drag(
-    drag: LocalAdjustMaskShapeDrag,
-    cur: [f32; 2],
-    modifiers: egui::Modifiers,
-) -> local_adjust_core::MaskShape {
-    let dx = cur[0] - drag.origin[0];
-    let dy = cur[1] - drag.origin[1];
-    match (drag.base, drag.handle) {
-        (shape, LocalAdjustShapeHandle::Body) => translate_local_adjust_shape(shape, dx, dy),
-        (
-            local_adjust_core::MaskShape::Line {
-                op,
-                kind,
-                p0: _,
-                p1,
-                thickness,
-            },
-            LocalAdjustShapeHandle::LineStart,
-        ) => local_adjust_core::MaskShape::Line {
-            op,
-            kind,
-            p0: constrain_local_adjust_line_endpoint(cur, p1, modifiers),
-            p1,
-            thickness,
-        },
-        (
-            local_adjust_core::MaskShape::Line {
-                op,
-                kind,
-                p0,
-                p1: _,
-                thickness,
-            },
-            LocalAdjustShapeHandle::LineEnd,
-        ) => local_adjust_core::MaskShape::Line {
-            op,
-            kind,
-            p0,
-            p1: constrain_local_adjust_line_endpoint(cur, p0, modifiers),
-            thickness,
-        },
-        (
-            local_adjust_core::MaskShape::Rect {
-                op,
-                center,
-                half_w,
-                half_h,
-                rotation_rad,
-            },
-            LocalAdjustShapeHandle::Corner(corner),
-        ) => resize_local_adjust_axis_rect(
-            op,
-            center,
-            half_w,
-            half_h,
-            rotation_rad,
-            corner,
-            cur,
-            modifiers,
-        )
-        .unwrap_or(drag.base),
-        (
-            local_adjust_core::MaskShape::Ellipse {
-                op,
-                center,
-                rx,
-                ry,
-                rotation_rad,
-            },
-            LocalAdjustShapeHandle::Corner(corner),
-        ) => resize_local_adjust_axis_ellipse(
-            op,
-            center,
-            rx,
-            ry,
-            rotation_rad,
-            corner,
-            cur,
-            modifiers,
-        )
-        .unwrap_or(drag.base),
-        (
-            local_adjust_core::MaskShape::Ellipse {
-                op,
-                center,
-                rx: _,
-                ry,
-                rotation_rad,
-            },
-            LocalAdjustShapeHandle::Radius,
-        ) => {
-            let next_rx = (cur[0] - center[0]).abs().max(1.0);
-            let next_ry = if modifiers.shift { next_rx } else { ry };
-            local_adjust_core::MaskShape::Ellipse {
-                op,
-                center,
-                rx: next_rx,
-                ry: next_ry,
-                rotation_rad,
-            }
-        }
-        _ => drag.base,
     }
 }
 
@@ -4976,12 +4879,12 @@ fn draw_local_adjust_mask_preview_overlay(
         *texture_slot = None;
     }
     if let Some(texture) = texture_slot.as_mut() {
-        texture.set(image, egui::TextureOptions::NEAREST);
+        texture.set(image, egui::TextureOptions::LINEAR);
     } else {
         *texture_slot = Some(painter.ctx().load_texture(
             "local_adjust_mask_preview",
             image,
-            egui::TextureOptions::NEAREST,
+            egui::TextureOptions::LINEAR,
         ));
     }
     let Some(texture) = texture_slot.as_ref() else {
@@ -6996,33 +6899,30 @@ impl App {
         layer_idx: usize,
         target: LocalAdjustMaskEditTarget,
         point: [f32; 2],
-        handle_hit_radius_px: f32,
-    ) -> Option<(usize, LocalAdjustShapeHandle)> {
+        scale: f32,
+    ) -> Option<(usize, crate::vector_edit::HoverTarget)> {
         let layer = self
             .local_adjust_page_layers
             .get(&fs_idx)
             .and_then(|layers| layers.get(layer_idx))?;
         let mask = local_adjust_target_raster_vector_mask_ref(layer, target)?;
+        let point = (point[0], point[1]);
         if let Some(selected) = self.local_adjust_selected_shape
             && let Some(shape) = mask.shapes.get(selected)
-            && let Some(handle) =
-                hit_local_adjust_shape_handles(*shape, point, handle_hit_radius_px)
         {
-            return Some((selected, handle));
-        }
-        for (idx, shape) in mask.shapes.iter().enumerate().rev() {
-            if self.local_adjust_selected_shape == Some(idx) {
-                continue;
-            }
-            if let Some(handle) =
-                hit_local_adjust_shape_handles(*shape, point, handle_hit_radius_px)
+            let vector_shape = local_adjust_shape_to_vector_shape(*shape);
+            let layout = crate::vector_edit::compute_handle_layout(&vector_shape, scale);
+            if let Some(handle) = crate::vector_edit::hit_test(&layout, point, scale)
+                && !matches!(handle, crate::vector_edit::HoverTarget::Body)
             {
-                return Some((idx, handle));
+                return Some((selected, handle));
             }
         }
         for (idx, shape) in mask.shapes.iter().enumerate().rev() {
-            if local_adjust_shape_contains(*shape, point) {
-                return Some((idx, LocalAdjustShapeHandle::Body));
+            let vector_shape = local_adjust_shape_to_vector_shape(*shape);
+            let layout = crate::vector_edit::compute_handle_layout(&vector_shape, scale);
+            if local_adjust_point_in_vector_body(point, &layout.body_corners) {
+                return Some((idx, crate::vector_edit::HoverTarget::Body));
             }
         }
         None
@@ -7044,7 +6944,9 @@ impl App {
             let Some(slot) = mask.shapes.get_mut(drag.shape_idx) else {
                 return false;
             };
-            *slot = apply_local_adjust_shape_drag(drag, point, modifiers);
+            let vector_shape =
+                crate::vector_edit::apply_drag(&drag.vector_drag, (point[0], point[1]), &modifiers);
+            *slot = vector_shape_to_local_adjust_shape(vector_shape);
             true
         })
     }
@@ -7187,6 +7089,7 @@ impl App {
             self.local_adjust_mask_brush_stroke = None;
             return;
         };
+        self.ensure_local_adjust_masks_match_source_dims(fs_idx);
         let Some(layer_idx) = self.selected_local_adjust_layer_idx(fs_idx) else {
             self.local_adjust_canvas_drag = None;
             self.local_adjust_mask_brush_stroke = None;
@@ -7545,46 +7448,62 @@ impl App {
             }
 
             if let Some(target) = active_mask_edit_target {
-                match self.local_adjust_mask_tool {
-                    LocalAdjustMaskTool::Select => {
-                        let point = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
-                        let handle_hit_radius_px =
-                            local_adjust_image_layout(image_rect, image_dims, zoom_pan)
-                                .map(|(scale, _)| (12.0 / scale.max(0.001)).clamp(12.0, 96.0))
-                                .unwrap_or(12.0);
-                        if let Some((shape_idx, handle)) = self.hit_test_local_adjust_mask_shapes(
+                let point = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
+                let shape_hit = local_adjust_image_layout(image_rect, image_dims, zoom_pan)
+                    .and_then(|(scale, _)| {
+                        self.hit_test_local_adjust_mask_shapes(
                             fs_idx,
                             layer_idx,
                             target,
                             [point.0, point.1],
-                            handle_hit_radius_px,
-                        ) {
-                            self.local_adjust_shape_drag_before_layers =
-                                self.local_adjust_page_layers.get(&fs_idx).cloned();
-                            self.local_adjust_selected_shape = Some(shape_idx);
-                            if let Some(layer) = self
-                                .local_adjust_page_layers
-                                .get(&fs_idx)
-                                .and_then(|layers| layers.get(layer_idx))
-                                && let Some(mask) =
-                                    local_adjust_target_raster_vector_mask_ref(layer, target)
-                                && let Some(shape) = mask.shapes.get(shape_idx).copied()
-                            {
-                                self.local_adjust_shape_drag = Some(LocalAdjustMaskShapeDrag {
-                                    fs_idx,
-                                    layer_idx,
-                                    target,
-                                    shape_idx,
+                            scale,
+                        )
+                    });
+                if let Some((shape_idx, handle)) = shape_hit {
+                    let should_begin_shape_drag = self.local_adjust_mask_tool
+                        == LocalAdjustMaskTool::Select
+                        || !matches!(handle, crate::vector_edit::HoverTarget::Body);
+                    if should_begin_shape_drag {
+                        self.local_adjust_shape_drag_before_layers =
+                            self.local_adjust_page_layers.get(&fs_idx).cloned();
+                        self.local_adjust_selected_shape = Some(shape_idx);
+                        if let Some(layer) = self
+                            .local_adjust_page_layers
+                            .get(&fs_idx)
+                            .and_then(|layers| layers.get(layer_idx))
+                            && let Some(mask) =
+                                local_adjust_target_raster_vector_mask_ref(layer, target)
+                            && let Some(shape) = mask.shapes.get(shape_idx).copied()
+                        {
+                            let vector_shape = local_adjust_shape_to_vector_shape(shape);
+                            self.local_adjust_shape_drag = Some(LocalAdjustMaskShapeDrag {
+                                fs_idx,
+                                layer_idx,
+                                target,
+                                shape_idx,
+                                vector_drag: crate::vector_edit::begin_drag(
                                     handle,
-                                    base: shape,
-                                    origin: [point.0, point.1],
-                                });
-                            }
-                        } else {
-                            self.local_adjust_selected_shape = None;
-                            self.local_adjust_shape_drag = None;
+                                    shape_idx,
+                                    vector_shape,
+                                    (point.0, point.1),
+                                ),
+                            });
+                            ctx.set_cursor_icon(crate::vector_edit::cursor_icon_for(
+                                handle,
+                                &vector_shape,
+                            ));
+                            ctx.request_repaint();
+                            return;
                         }
                     }
+                } else if self.local_adjust_mask_tool == LocalAdjustMaskTool::Select {
+                    self.local_adjust_selected_shape = None;
+                    self.local_adjust_shape_drag = None;
+                    ctx.request_repaint();
+                    return;
+                }
+                match self.local_adjust_mask_tool {
+                    LocalAdjustMaskTool::Select => {}
                     LocalAdjustMaskTool::Brush
                     | LocalAdjustMaskTool::EdgeBrush
                     | LocalAdjustMaskTool::GapFillBrush => {
@@ -7735,24 +7654,29 @@ impl App {
                 }
                 _ => {}
             }
-        } else if active_mask_edit_target.is_some_and(|target| {
+        } else if let Some((handle, vector_shape)) = active_mask_edit_target.and_then(|target| {
             if self.local_adjust_mask_tool != LocalAdjustMaskTool::Select {
-                return false;
+                return None;
             }
             let point = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
-            let handle_hit_radius_px = local_adjust_image_layout(image_rect, image_dims, zoom_pan)
-                .map(|(scale, _)| (12.0 / scale.max(0.001)).clamp(12.0, 96.0))
-                .unwrap_or(12.0);
-            self.hit_test_local_adjust_mask_shapes(
+            let (scale, _) = local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
+            let (shape_idx, handle) = self.hit_test_local_adjust_mask_shapes(
                 fs_idx,
                 layer_idx,
                 target,
                 [point.0, point.1],
-                handle_hit_radius_px,
-            )
-            .is_some()
+                scale,
+            )?;
+            let shape = self
+                .local_adjust_page_layers
+                .get(&fs_idx)
+                .and_then(|layers| layers.get(layer_idx))
+                .and_then(|layer| local_adjust_target_raster_vector_mask_ref(layer, target))
+                .and_then(|mask| mask.shapes.get(shape_idx))
+                .copied()?;
+            Some((handle, local_adjust_shape_to_vector_shape(shape)))
         }) {
-            ctx.set_cursor_icon(egui::CursorIcon::Grab);
+            ctx.set_cursor_icon(crate::vector_edit::cursor_icon_for(handle, &vector_shape));
         } else if self
             .local_adjust_page_layers
             .get(&fs_idx)
@@ -7837,6 +7761,7 @@ impl App {
         let Some(fs_idx) = self.current_local_adjust_edit_idx() else {
             return;
         };
+        self.ensure_local_adjust_masks_match_source_dims(fs_idx);
         let Some(layer_idx) = self.selected_local_adjust_layer_idx(fs_idx) else {
             return;
         };
@@ -7877,17 +7802,17 @@ impl App {
                     ));
             }
         }
-        let shape_to_screen =
-            local_adjust_image_layout(image_rect, image_dims, zoom_pan).map(|(_, drawn_rect)| {
-                let w = image_dims.0.max(1) as f32;
-                let h = image_dims.1.max(1) as f32;
-                move |p: [f32; 2]| -> egui::Pos2 {
-                    egui::pos2(
-                        drawn_rect.left() + p[0] / w * drawn_rect.width(),
-                        drawn_rect.top() + p[1] / h * drawn_rect.height(),
-                    )
-                }
-            });
+        let shape_layout = local_adjust_image_layout(image_rect, image_dims, zoom_pan);
+        let shape_to_screen = shape_layout.map(|(_, drawn_rect)| {
+            let w = image_dims.0.max(1) as f32;
+            let h = image_dims.1.max(1) as f32;
+            move |p: [f32; 2]| -> egui::Pos2 {
+                egui::pos2(
+                    drawn_rect.left() + p[0] / w * drawn_rect.width(),
+                    drawn_rect.top() + p[1] / h * drawn_rect.height(),
+                )
+            }
+        });
         let active_mask_edit_target =
             effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target);
         if effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target).is_some()
@@ -7920,16 +7845,62 @@ impl App {
         if let (Some(target), Some(to_screen)) = (active_mask_edit_target, shape_to_screen.as_ref())
         {
             if let Some(mask) = local_adjust_target_raster_vector_mask_ref(layer, target) {
+                let hovered_shape = if self.local_adjust_mask_tool == LocalAdjustMaskTool::Select
+                    || self.local_adjust_selected_shape.is_some()
+                {
+                    ui.ctx().input(|i| i.pointer.hover_pos()).and_then(|pos| {
+                        let (scale, drawn_rect) = shape_layout?;
+                        if !drawn_rect.contains(pos) {
+                            return None;
+                        }
+                        let point = (
+                            (pos.x - drawn_rect.left()) / scale,
+                            (pos.y - drawn_rect.top()) / scale,
+                        );
+                        let selected = self.local_adjust_selected_shape?;
+                        let shape = mask.shapes.get(selected).copied()?;
+                        let vector_shape = local_adjust_shape_to_vector_shape(shape);
+                        let layout =
+                            crate::vector_edit::compute_handle_layout(&vector_shape, scale);
+                        crate::vector_edit::hit_test(&layout, point, scale)
+                            .map(|target| (selected, target, vector_shape))
+                    })
+                } else {
+                    None
+                };
+                if let Some((_, target, vector_shape)) = hovered_shape {
+                    ui.ctx()
+                        .set_cursor_icon(crate::vector_edit::cursor_icon_for(
+                            target,
+                            &vector_shape,
+                        ));
+                }
                 for (idx, shape) in mask.shapes.iter().copied().enumerate() {
                     let selected = self.local_adjust_selected_shape == Some(idx);
-                    let color = if shape.op().is_add() {
-                        egui::Color32::from_rgb(255, 180, 64)
-                    } else {
-                        egui::Color32::from_rgb(80, 210, 255)
+                    let Some((scale, _)) = shape_layout else {
+                        continue;
                     };
-                    draw_local_adjust_shape_outline(painter, shape, to_screen, color, selected);
+                    let vector_shape = local_adjust_shape_to_vector_shape(shape);
+                    let layout = crate::vector_edit::compute_handle_layout(&vector_shape, scale);
+                    let to_vector_screen = |p: (f32, f32)| to_screen([p.0, p.1]);
                     if selected {
-                        draw_local_adjust_shape_handles(painter, shape, to_screen);
+                        let hovered = hovered_shape.and_then(|(hover_idx, target, _)| {
+                            (hover_idx == idx).then_some(target)
+                        });
+                        crate::vector_edit::draw_handles(
+                            painter,
+                            &layout,
+                            true,
+                            hovered,
+                            &to_vector_screen,
+                        );
+                    } else {
+                        crate::vector_edit::draw_shape_outline(
+                            painter,
+                            &layout,
+                            local_adjust_shape_op_to_vector(shape.op()),
+                            &to_vector_screen,
+                        );
                     }
                 }
             }
@@ -9038,6 +9009,7 @@ impl App {
                 }
                 SpreadPair::Single => (fs_root_idx, None),
             };
+        self.ensure_local_adjust_masks_match_source_dims(fs_idx);
         let layers = self
             .local_adjust_page_layers
             .get(&fs_idx)
@@ -9329,6 +9301,7 @@ impl App {
                                         selected_layer,
                                         layer,
                                         image_dims,
+                                        self.local_adjust_selected_shape,
                                         &mut update_layer,
                                         effect_clipboard_available,
                                         selective_color_pick_active,

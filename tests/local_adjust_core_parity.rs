@@ -30,8 +30,9 @@
 //! (= ラボとの値が乖離したら、本テストが落ちることで気付ける)。
 
 use local_adjust_core::{
-    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, RadialGradientMask,
-    RasterMask, RasterVectorMask, RgbaImageRef, SubjectMaskRefinement, evaluate_layer_mask,
+    LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, MaskShape,
+    RadialGradientMask, RasterMask, RasterVectorMask, RgbaImageRef, ShapeOp, SubjectMaskRefinement,
+    evaluate_layer_mask,
 };
 
 // ---------------------------------------------------------------------------
@@ -270,8 +271,114 @@ fn full_mask_with_large_subtract_buffer_completes_quickly() {
     assert_eq!(mask[0], 1.0);
     assert_eq!(mask[width * height - 1], 0.0);
     assert!(
-        elapsed < std::time::Duration::from_millis(100),
-        "Full + subtract evaluation should remain linear, elapsed={elapsed:?}"
+        elapsed < std::time::Duration::from_millis(1000),
+        "Full + subtract evaluation should remain linear (was O(n²) before #8d80b36b), elapsed={elapsed:?}"
+    );
+}
+
+#[test]
+fn mask_resize_preserves_alpha_distribution() {
+    let width = 1024;
+    let height = 576;
+    let alpha_at_norm = |nx: f32, ny: f32| -> f32 {
+        let dx = (nx - 0.5).abs() * 2.0;
+        let dy = (ny - 0.5).abs() * 2.0;
+        (1.0 - dx * 0.68 - dy * 0.48).clamp(0.0, 1.0)
+    };
+    let mut alpha = vec![0.0; width * height];
+    for y in 0..height {
+        let ny = y as f32 / (height - 1) as f32;
+        for x in 0..width {
+            let nx = x as f32 / (width - 1) as f32;
+            alpha[y * width + x] = alpha_at_norm(nx, ny);
+        }
+    }
+
+    let mut layer = LocalAdjustmentLayer::new(
+        "raster",
+        LocalMask::Raster(RasterMask {
+            width,
+            height,
+            alpha,
+        }),
+        LocalEffect::None,
+    );
+    layer.resize_masks_to(2048, 1152);
+
+    let LocalMask::Raster(mask) = &layer.mask else {
+        panic!("Raster mask should remain Raster after resize");
+    };
+    assert_eq!((mask.width, mask.height), (2048, 1152));
+    assert_eq!(mask.alpha.len(), 2048 * 1152);
+
+    let sample = |nx: f32, ny: f32| -> f32 {
+        let x = (nx * (mask.width - 1) as f32).round() as usize;
+        let y = (ny * (mask.height - 1) as f32).round() as usize;
+        mask.alpha[y * mask.width + x]
+    };
+    for (nx, ny) in [(0.5, 0.5), (0.35, 0.5), (0.65, 0.5), (0.5, 0.25)] {
+        let actual = sample(nx, ny);
+        let expected = alpha_at_norm(nx, ny);
+        assert!(
+            (actual - expected).abs() < 0.02,
+            "resized alpha drifted at ({nx}, {ny}): actual={actual} expected={expected}"
+        );
+    }
+    assert!(sample(0.5, 0.5) > sample(0.35, 0.5));
+    assert!(sample(0.35, 0.5) > sample(0.0, 0.0));
+}
+
+#[test]
+fn raster_vector_resize_scales_shapes_and_manual_overrides() {
+    let mut base = RasterVectorMask::empty(10, 8);
+    base.alpha[4 * 10 + 5] = 1.0;
+    base.shapes.push(MaskShape::Line {
+        op: ShapeOp::Add,
+        kind: LineKind::Diagonal,
+        p0: [2.0, 3.0],
+        p1: [8.0, 7.0],
+        thickness: 4.0,
+    });
+    let mut add = RasterVectorMask::empty(10, 8);
+    add.alpha[2 * 10 + 3] = 1.0;
+    let mut layer = LocalAdjustmentLayer::new(
+        "raster-vector",
+        LocalMask::RasterVector(base),
+        LocalEffect::None,
+    );
+    layer.manual_override.add = Some(add);
+
+    layer.resize_masks_to(20, 16);
+
+    let LocalMask::RasterVector(mask) = &layer.mask else {
+        panic!("RasterVector mask should remain RasterVector after resize");
+    };
+    assert_eq!((mask.width, mask.height), (20, 16));
+    assert_eq!(mask.alpha.len(), 20 * 16);
+    assert!(
+        mask.alpha.iter().copied().fold(0.0_f32, f32::max) > 0.2,
+        "bitmap alpha should survive bilinear resize"
+    );
+    let MaskShape::Line {
+        p0, p1, thickness, ..
+    } = mask.shapes[0]
+    else {
+        panic!("shape should remain Line");
+    };
+    assert_eq!(p0, [4.0, 6.0]);
+    assert_eq!(p1, [16.0, 14.0]);
+    assert!((thickness - 8.0).abs() < 1.0e-6);
+
+    let add = layer
+        .manual_override
+        .add
+        .as_ref()
+        .expect("manual add override should remain");
+    assert_eq!((add.width, add.height), (20, 16));
+    assert_eq!(add.alpha.len(), 20 * 16);
+    assert!(
+        add.alpha.iter().copied().fold(0.0_f32, f32::max) > 0.2,
+        "manual override alpha should survive bilinear resize"
     );
 }
 

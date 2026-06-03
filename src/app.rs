@@ -481,24 +481,13 @@ pub(crate) enum LocalAdjustMaskTool {
     Ellipse,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LocalAdjustShapeHandle {
-    Body,
-    LineStart,
-    LineEnd,
-    Corner(u8),
-    Radius,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LocalAdjustMaskShapeDrag {
     pub(crate) fs_idx: usize,
     pub(crate) layer_idx: usize,
     pub(crate) target: LocalAdjustMaskEditTarget,
     pub(crate) shape_idx: usize,
-    pub(crate) handle: LocalAdjustShapeHandle,
-    pub(crate) base: local_adjust_core::MaskShape,
-    pub(crate) origin: [f32; 2],
+    pub(crate) vector_drag: crate::vector_edit::DragState,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -18281,6 +18270,34 @@ impl App {
         self.bump_local_adjust_generation(idx);
     }
 
+    pub(crate) fn ensure_local_adjust_masks_match_source_dims(&mut self, idx: usize) -> bool {
+        let Some(source) = self.current_local_adjust_source_pixels(idx) else {
+            return false;
+        };
+        let [width, height] = source.size;
+        let width = width.max(1);
+        let height = height.max(1);
+        let needs_resize = self
+            .local_adjust_page_layers
+            .get(&idx)
+            .is_some_and(|layers| {
+                layers
+                    .iter()
+                    .any(|layer| !layer.masks_match_dims(width, height))
+            });
+        if !needs_resize {
+            return false;
+        }
+        let Some(mut layers) = self.local_adjust_page_layers.get(&idx).cloned() else {
+            return false;
+        };
+        for layer in &mut layers {
+            layer.resize_masks_to(width, height);
+        }
+        self.set_local_adjust_layers_for_idx_memory_only(idx, layers);
+        true
+    }
+
     /// 指定 idx の最後段 crop 設定を DB / サイドカー / in-memory state に反映する。
     /// `None` または full rect は「crop なし」として削除する。
     pub(crate) fn set_export_crop_for_idx(
@@ -18561,6 +18578,7 @@ impl App {
     }
 
     pub(crate) fn maybe_start_local_adjust_render(&mut self, idx: usize) {
+        self.ensure_local_adjust_masks_match_source_dims(idx);
         if self.current_local_adjust_texture(idx).is_some() {
             return;
         }
@@ -18603,6 +18621,7 @@ impl App {
         idx: usize,
         layer_idx: usize,
     ) {
+        self.ensure_local_adjust_masks_match_source_dims(idx);
         if self
             .current_local_adjust_layer_bypass_texture(idx, layer_idx)
             .is_some()
@@ -18652,6 +18671,7 @@ impl App {
         idx: usize,
         layer_count: usize,
     ) {
+        self.ensure_local_adjust_masks_match_source_dims(idx);
         if self
             .current_local_adjust_prefix_preview_texture(idx, layer_count)
             .is_some()

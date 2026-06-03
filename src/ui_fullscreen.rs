@@ -815,27 +815,30 @@ impl App {
 
         if self.local_adjust_mode {
             let (ctrl_down, shift_down) = ctx.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
-            if ctrl_down
-                && shift_down
-                && let Some(layer_idx) = self.selected_local_adjust_layer_idx(idx)
-            {
-                self.maybe_start_local_adjust_layer_bypass_preview(idx, layer_idx);
-                if let Some(tex) = self.current_local_adjust_layer_bypass_texture(idx, layer_idx) {
-                    return Some(tex);
-                }
+            let adjust_panel_active = self
+                .local_adjust_page_layers
+                .get(&idx)
+                .is_some_and(|layers| !layers.is_empty());
+            // Ctrl+Shift 押下中もモーメンタリで活性化 (= ラボ層 bypass preview)。
+            let modifier_bypass_active = adjust_panel_active && ctrl_down && shift_down;
+            if !modifier_bypass_active && (ctrl_down || self.local_adjust_show_source) {
                 return self.resolve_local_adjust_source_texture(ctx, idx);
             }
-            if ctrl_down || self.local_adjust_show_source {
-                return self.resolve_local_adjust_source_texture(ctx, idx);
-            }
-            if self.local_adjust_preview_to_selected_layer
+            if (self.local_adjust_preview_to_selected_layer || modifier_bypass_active)
                 && let (Some(layer_idx), Some(total_layers)) = (
                     self.selected_local_adjust_layer_idx(idx),
                     self.local_adjust_page_layers.get(&idx).map(Vec::len),
                 )
                 && total_layers > 0
             {
-                let layer_count = layer_idx.min(total_layers - 1) + 1;
+                let layer_count = if modifier_bypass_active {
+                    layer_idx.min(total_layers - 1)
+                } else {
+                    layer_idx.min(total_layers - 1) + 1
+                };
+                if layer_count == 0 {
+                    return self.resolve_local_adjust_source_texture(ctx, idx);
+                }
                 if layer_count < total_layers {
                     self.maybe_start_local_adjust_prefix_preview(idx, layer_count);
                     if let Some(tex) =
