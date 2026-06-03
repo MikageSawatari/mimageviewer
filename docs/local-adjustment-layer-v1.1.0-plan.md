@@ -926,6 +926,7 @@ Undo / Redo を本体へ移植済み。フルスクリーン左パネルの補�
   全 `LocalEffect` を追加できる。
 - 選択レイヤーの効果パラメータ UI から、コピー/ペースト/リセット、スポイト、位置ハンドル表示、
   3D LUT 読み込みを操作できる。
+- レイヤー行の `↑` / `↓` で順序を入れ替えられる。
 - マスク種別を `全体` / `手動` / `線形` / `円形` / `輝度` / `カラー` /
   `被写体` / `領域` に切り替えられる。
 - 画像上ドラッグで線形/円形グラデーション、効果中心ハンドル、手描き `RasterVector` マスクを編集できる。
@@ -944,8 +945,8 @@ Undo / Redo を本体へ移植済み。フルスクリーン左パネルの補�
 - `Ctrl+Alt+Shift+D` の pipeline debug 出力に `56_local_adjust_source_current`、
   `57_local_adjust_recomputed`、`58_local_adjust_current` が含まれる。
 - Ctrl+Z / Ctrl+Y でレイヤー追加/削除、パラメータ編集、キャンバス編集、LUT 読み込みが戻る。
-- 現時点の意図的な未実装: レイヤー並べ替え、図形の選択/ハンドル編集、
-  Subject / Segmentation の自動生成、サイドカーバックアップ、`local-adjust-ui` 共通 crate 化。
+- 現時点の意図的な未実装: 図形の選択/ハンドル編集、Subject / Segmentation の自動生成、
+  サイドカーバックアップ、`local-adjust-ui` 共通 crate 化。
 
 ## 12. 優先順位
 

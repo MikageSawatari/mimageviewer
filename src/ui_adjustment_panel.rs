@@ -411,6 +411,7 @@ fn draw_local_adjust_section(
     select_layer: &mut Option<usize>,
     set_enabled: &mut Option<(usize, bool)>,
     update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+    move_layer: &mut Option<(usize, usize)>,
     delete_layer: &mut Option<usize>,
     clear_layers: &mut bool,
     effect_clipboard_available: bool,
@@ -540,7 +541,7 @@ fn draw_local_adjust_section(
             let name = crate::ui_helpers::truncate_name(&layer.name, 12);
             let label = format!("{}: {}", layer_idx + 1, name);
             let label_resp = ui.add_sized(
-                egui::vec2((content_width - 68.0).max(80.0), 18.0),
+                egui::vec2((content_width - 106.0).max(56.0), 18.0),
                 egui::Button::selectable(
                     layer_idx == selected_layer,
                     egui::RichText::new(label)
@@ -556,6 +557,20 @@ fn draw_local_adjust_section(
                 layer.effect.display_label(),
                 layer.opacity * 100.0
             ));
+            if ui
+                .add_enabled(layer_idx > 0, egui::Button::new("↑"))
+                .on_hover_text("上へ移動")
+                .clicked()
+            {
+                *move_layer = Some((layer_idx, layer_idx - 1));
+            }
+            if ui
+                .add_enabled(layer_idx + 1 < layers.len(), egui::Button::new("↓"))
+                .on_hover_text("下へ移動")
+                .clicked()
+            {
+                *move_layer = Some((layer_idx, layer_idx + 1));
+            }
             if ui.small_button("削除").clicked() {
                 *delete_layer = Some(layer_idx);
             }
@@ -3984,6 +3999,7 @@ impl App {
         select_layer: Option<usize>,
         set_enabled: Option<(usize, bool)>,
         update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+        move_layer: Option<(usize, usize)>,
         delete_layer: Option<usize>,
         clear_layers: bool,
         effect_requests: LocalEffectPanelRequests,
@@ -4039,6 +4055,18 @@ impl App {
             selected_after = Some(layer_idx);
             changed = true;
             undo_summary.get_or_insert_with(|| "補正レイヤー編集".to_string());
+        }
+        if let Some((from, to)) = move_layer
+            && from < layers.len()
+            && to < layers.len()
+            && from != to
+        {
+            let layer = layers.remove(from);
+            layers.insert(to, layer);
+            selected_after = Some(to);
+            changed = true;
+            undo_summary.get_or_insert_with(|| "補正レイヤー並べ替え".to_string());
+            self.show_feedback_toast("補正レイヤーを並べ替えました".to_string());
         }
         if let Some(layer_idx) = effect_requests.copy_effect
             && let Some(layer) = layers.get(layer_idx)
@@ -4323,6 +4351,7 @@ impl App {
         let mut select_layer: Option<usize> = None;
         let mut set_enabled: Option<(usize, bool)> = None;
         let mut update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)> = None;
+        let mut move_layer: Option<(usize, usize)> = None;
         let mut delete_layer: Option<usize> = None;
         let mut clear_layers = false;
         let mut effect_requests = LocalEffectPanelRequests::default();
@@ -4450,6 +4479,7 @@ impl App {
                                             &mut select_layer,
                                             &mut set_enabled,
                                             &mut update_layer,
+                                            &mut move_layer,
                                             &mut delete_layer,
                                             &mut clear_layers,
                                             effect_clipboard_available,
@@ -4503,6 +4533,7 @@ impl App {
             select_layer,
             set_enabled,
             update_layer,
+            move_layer,
             delete_layer,
             clear_layers,
             effect_requests,
