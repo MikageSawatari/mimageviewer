@@ -5288,6 +5288,32 @@ mod pipeline_cache_refactor_tests {
         );
         assert!(app.final_composite_cache.contains_key(&final_b));
     }
+
+    #[test]
+    fn upscale_purge_preserves_source_resolution_edit_cache() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pipeline-upscale-toggle.jpg");
+        let (edit_key, final_key) =
+            insert_edit_and_final_cache(&mut app, &ctx, idx, "upscale_toggle");
+        app.mask_pages.insert(idx);
+        app.erase_mask_generation.insert(idx, 44);
+        app.input_generation.insert(idx, 55);
+
+        app.purge_upscale_for_idx(idx);
+
+        assert!(
+            app.edit_result_cache.contains_key(&edit_key),
+            "AI upscale ON/OFF must not drop source-resolution edit results or masks"
+        );
+        assert!(
+            !app.final_composite_cache.contains_key(&final_key),
+            "final composite must be rebuilt after AI upscale cache changes"
+        );
+        assert!(app.mask_pages.contains(&idx));
+        assert_eq!(app.erase_mask_generation.get(&idx), Some(&44));
+        assert_eq!(app.input_generation.get(&idx), Some(&55));
+    }
 }
 
 #[cfg(test)]
