@@ -737,8 +737,9 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - 保存先は前回保存先 (`Settings::export_last_directory`) が存在すればそれを既定表示し、なければ元の場所を使う。ダイアログの「元の場所」ボタンで、通常画像は画像ファイルの親フォルダ、ZIP 内画像は ZIP ファイルの親フォルダ、PDF ページは PDF ファイルの親フォルダ、見開き合成は左ページ側の元フォルダへ戻せる。
 - 出力名は既定で `<元名>_edited`。バッチ出力では `_0` (現在の設定) / `_1`〜`_4` (隠蔽プリセット) を付ける。同じ名前が存在する場合はセッション単位で `_0001` などを挟み、上書きしない。
 - 出力形式は JPEG 95 / PNG / WebP。元形式が書き出し非対応の場合は `Settings::export_fallback_format` に従う。形式変換、PDF、見開き合成ではメタデータ保持は無効。
+- 出力サイズは「そのまま」「1/2 サイズ」「1/4 サイズ」から選ぶ。crop / 見開き / 隠蔽プリセット合成後の画像を基準に Lanczos3 で縮小し、既定値は `Settings::export_default_scale` に保存する。
 - JPEG / PNG / WebP の同形式出力では、`Settings::export_embed_metadata` が有効なら元画像の EXIF / XMP / PNG text / WebP metadata を転記する。ZIP 内画像は worker がエントリバイトを読み、パスの無いメタデータ元として扱う。JPEG の Orientation は表示で回転済みの画素と一致するよう正規化する。
-- 永続化設定は `Settings::export_embed_metadata` (メタデータ保持)、`Settings::export_last_directory` (前回保存先)、`Settings::export_batch_selection` (現在 / プリセット 1〜4 のチェック状態)、`Settings::export_fallback_format` (非対応元形式の JPEG / PNG 選択)。
+- 永続化設定は `Settings::export_embed_metadata` (メタデータ保持)、`Settings::export_last_directory` (前回保存先)、`Settings::export_batch_selection` (現在 / プリセット 1〜4 のチェック状態)、`Settings::export_fallback_format` (非対応元形式の JPEG / PNG 選択)、`Settings::export_default_scale` (出力サイズ)。
 - 保存は `ctrl-e-export` worker で順次実行する。隠蔽プリセットの合成、画像エンコード、メタデータ転記、ファイル書き込みはいずれも worker 側で行い、UI は進捗モーダルを `try_recv` で更新する。キャンセルは次のエントリ開始前に反映され、処理中の 1 件は完了まで待つ。
 - 現在表示中の実フォルダへ保存した場合は、フルスクリーンを抜けて一覧へ戻ったタイミングでフォルダを再読み込みし、新しい出力ファイルのサムネイルを反映する。ZIP / PDF / 検索結果などの仮想フォルダでは自動再読み込みしない。
 
@@ -821,6 +822,7 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
   - 適応パレット機種は median cut で画像ごとに最適 N 色を抽出 (実機挙動と同じ)
   - rayon 並列化で 4K 画像でも 40〜80ms、CRT は brightness-matched で元画像とほぼ同輝度
   - 全フィルタで **alpha チャネル保持**。透過 PNG / WebP / GIF は透過のまま表示される
+  - v1.1.0 以降は消しゴム / 補正レイヤー / 隠蔽加工 / crop の後、最終表示段で適用
   - 消しゴム / 分析モード中は post-filter を一時バイパス (`post_filter_bypassed` フラグ)
 
 ### Phase 3（お気に入り・設定）✅ 完了

@@ -122,20 +122,18 @@ ZIP/PDF を開いている最中は `container(idx)` が ZIP/PDF 本体のパス
 グローバル) と一致するなら page_params エントリは作られず、カスケード解決に任せる挙動が
 自動で得られる (= DB エントリが無駄に増えない)。書き換えは `capture_adjust_full` で囲んで
 あるので Undo に乗る。AI 設定 (upscale_model / denoise_model) が変わるなら
-`clear_all_adjustment_and_ai_caches(dst)` で AI キャッシュも落として再アップスケールを誘発する。
+dst の final pipeline cache / pending を落として final AI を再実行させる。
 
 #### 見開き描画と補正適用の隠れた前提 (実装メモ)
 
 これまで `adjustment_active = self.adjustment_mode && !is_spread_double` でパネル全体が
 disabled だった頃は顕在化していなかった 2 点を併せて修正している:
 
-- `draw_fs_spread_page` のテクスチャ取得を `adjustment_cache → fs_cache → thumbnail → holdover`
-  の優先順に変更。これがないと見開きでスライダーを動かしても画面が変わらない (補正前
-  fs_cache がそのまま描かれる)。
-- `maybe_apply_adjustment` の早期 return ガードを「`fullscreen_idx` と一致 **または**
-  resolve_spread_pair で見開きペアの片方」に緩和。さらに呼び出し元 (フレーム末尾の補正適用
-  フェーズ) で右ページ idx についても追加で 1 回呼ぶ。これがないと見開きの右ページだけ
-  補正適用が走らない。
+- 見開き左右ページも `resolve_fs_processed_texture` を通して `final_composite_cache` を
+  取得する。これがないと片側だけ final pipeline が走らず、スライダー変更や final AI 完了が
+  見開きに反映されない。
+- final composite は各ページ idx ごとに `edit_result_cache` から lazy 生成するため、
+  見開きの右ページも描画時に同じ経路で補正・AI・post_filter が適用される。
 
 #### 「両ページ同時編集」を入れない理由
 
@@ -161,15 +159,17 @@ disabled だった頃は顕在化していなかった 2 点を併せて修正�
 
 ### 2.1 適用順序
 
-`adjustment.rs::apply_adjustments_fast` → `post_filter::apply`:
+色調そのものは `adjustment.rs::apply_adjustments_fast` で次の順に適用する:
 
 ```
-Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturation → Temperature → ポストフィルタ
+Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturation → Temperature
 ```
 
 - `temperature == 0` なら u8→u8 LUT で高速処理
 - `temperature != 0` なら f32 パイプライン (やや遅い)
-- ポストフィルタは `PostFilter::None` 以外のときだけ追加適用
+- v1.1.0 以降のフルスクリーン通常表示では、source 解像度の edit 結果
+  (`edit_result_cache`) に色調補正を掛け、その後に final AI、最後に
+  `post_filter::apply` を掛けて `final_composite_cache` に格納する。
 
 ### 2.2 ポストフィルタ (PostFilter enum)
 
@@ -253,14 +253,15 @@ bilinear 補間ソースサンプリング + 水平ブラー (h_blur) で、「�
 ### 2.3 ポストフィルタの一時バイパス
 
 消しゴム / 隠蔽加工 / 分析モード中は `App::post_filter_bypassed: bool` が `true` になり、
-`apply_sync_adjustment` が post-filter 段をスキップし color-only の `adjustment_cache` を生成する。
-モード解除時に false に戻し、描画用 cache だけをクリアして post-filter 適用状態で
-再生成させる。これは編集時の見やすさだけの切替なので、消しゴム確定結果の
+final composite の `params_hash` から `post_filter` を外す。モード解除時に false に戻し、
+該当 idx の final pipeline cache だけをクリアして post-filter 適用状態で再生成させる。
+これは編集時の見やすさだけの切替なので、source 解像度の edit cache や
 `input_generation` は進めない。
 
 - **消しゴム**: 減色プリセット (GameBoy 4 色など) が有効だと境界が潰れてマスクを精密に塗れないため
-  ただし MI-GAN の preview / apply / auto-apply / ensure-result 入力は最終表示順序に合わせ、
-  post-filter を含めた `色補正 → post-filter → 消しゴム` の画像を使う。
+  編集表示だけ post-filter を外す。MI-GAN の preview / apply / auto-apply /
+  ensure-result 入力も source 解像度の edit pipeline から取り、post-filter や final AI の
+  解像度変更には引きずられない。
 - **分析**: ヒストグラムは `fs_cache` の生ピクセルから計算されるため、表示だけを生に揃える
 
 `AdjustParams` には:
@@ -271,7 +272,7 @@ bilinear 補間ソースサンプリング + 水平ブラー (h_blur) で、「�
 
 右 Ctrl を押している間だけ、補正 / ポストフィルタ / AI アップスケール・デノイズ /
 消しゴム補完結果 / 隠蔽加工を表示選択から外し、元画像を一時表示する。これは「比較用の描画 override」
-であり、`adjustment_cache` や `ai_upscale_cache` の無効化、DB 書き換え、AI ジョブの停止は
+であり、`edit_result_cache` / final pipeline cache の無効化、DB 書き換え、AI ジョブの停止は
 行わない。表示元は常に raw 専用の `fs_cache` で、消しゴム補完済みページでも
 `erase_base_cache` は参照しない。
 
@@ -287,74 +288,72 @@ bilinear 補間ソースサンプリング + 水平ブラー (h_blur) で、「�
 | キャッシュ | 型 | 内容 |
 | --- | --- | --- |
 | `fs_cache` | `HashMap<idx, FsCacheEntry>` | 生デコード結果。Static / Animated / Failed |
-| `adjustment_cache` | `HashMap<idx, FsCacheEntry>` | 補正適用済みテクスチャ |
-| `ai_upscale_cache` | `HashMap<idx, FsCacheEntry>` | AI アップスケール/デノイズ適用済み |
 | `erase_result_cache` | `HashMap<EraseResultKey, EraseResultCacheEntry>` | 消しゴム MI-GAN 確定結果。`idx + input_generation + erase_mask_generation` で識別 |
 | `local_adjust_cache` | `HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>` | 補正レイヤー合成結果。`idx + input_generation + erase_mask_generation + local_adjust_generation` で識別 |
 | `conceal_cache` | `HashMap<idx, ConcealCacheEntry>` | 隠蔽加工合成済みテクスチャ |
+| `edit_result_cache` | `HashMap<EditResultKey, EditResultEntry>` | `raw -> erase -> local_adjust -> conceal -> crop` の source 解像度 edit 結果。AdjustParams / AI / post_filter は含めない |
+| `final_ai_cache` | `HashMap<FinalAiKey, Arc<ColorImage>>` | 色調補正後の edit 結果へ AI アップスケール / デノイズを適用した結果 |
+| `final_composite_cache` | `HashMap<FinalCompositeKey, FinalCompositeEntry>` | edit 結果に AdjustParams 全項目、final AI、post_filter を適用した通常表示用テクスチャ |
 
 描画時 ([display-pipeline.md](display-pipeline.md) を参照) は:
 
 ```
-conceal_cache > local_adjust_cache > erase_result_cache > adjustment_cache > ai_upscale_cache > fs_cache
+final_composite_cache > edit_result_cache > fs_cache
 ```
 
-の優先順位で最も処理済みのテクスチャを選ぶ。
+が通常表示の基本。erase / local_adjust / conceal の編集中だけ、各 UI が source 解像度の
+プレビュー (`erase_preview_cache`, `local_adjust_cache`, `conceal_cache` など) を
+一時的に表示する。
 隠蔽加工のプレビュー合成は `current_conceal_source_pixels` で
-`local_adjust > erase_result > adjustment_cache > ai_upscale_cache > fs_cache` を毎回解決する。
+`local_adjust > erase_result > fs_cache` を毎回解決する。
 `conceal_base_cache` は隠蔽モード入場時ソースの退避で、編集中ページの現行ソースを
 一時的に取得できない場合のフォールバックとしてだけ使う。AI アップスケール完了などで
-編集中にソース解像度が変わった場合は、AI 完了 hook / 次回 compose 前 / モード終了保存前に
-in-memory のビットマップと Shape をソース解像度へ一度だけスケールする。
-ドラッグ中など中間座標が残る場合だけ compose 時の一時リスケールにフォールバックする。
+final 表示解像度が変わっても、source 解像度の edit cache とマスク寸法は変えない。
 
-### 3.1 補正の適用タイミング
+### 3.1 edit pipeline の適用タイミング
 
-`App::maybe_apply_adjustment(idx)` が毎フレーム呼ばれ:
+`App::ensure_edit_result_pixels(ctx, idx)` が必要に応じて以下を lazy に解決し、
+`edit_result_cache` に載せる:
 
-1. `adjustment_cache[idx]` が存在する → 何もしない
-2. 有効パラメータが identity (無補正) → 何もしない (`fs_cache` をそのまま使わせる)
-3. それ以外 → `apply_sync_adjustment(idx)` で同期的に補正してキャッシュに格納
+1. `fs_cache` の raw pixels
+2. 消しゴムマスクがあれば `erase_result_cache`
+3. 補正レイヤーがあれば `local_adjust_cache`
+4. 隠蔽マスク / プレビューがあれば `conceal_cache`
+5. crop があれば `export_crop` の矩形で切り出し
 
-CPU 処理は LUT ベースなので 1 枚あたり数ミリ秒で済む。UI スレッドで OK。
+この段階では AdjustParams / final AI / post_filter を一切適用しない。色調スライダーの
+drag 中でも `edit_result_cache` は再利用されるため、マスクやブラシ stroke の重い再計算が走らない。
 
-### 3.2 AI の適用タイミング
+### 3.2 final pipeline の適用タイミング
 
-AI は**重い** (数秒〜数十秒) ので必ず別スレッド:
+`App::ensure_final_composite_texture(ctx, idx)` が `edit_result_cache` を入力にして:
 
-1. 有効パラメータに AI モデル指定があれば、`ai_upscale_pending[idx]` を作成 + 推論開始
-2. 完了すると `ai_upscale_cache[idx]` に結果が入る
-3. 以降のフレームはそのテクスチャが使われる (さらに補正が必要なら `adjustment_cache` が上書き)
+1. 色調補正 (`apply_adjustments_fast`)
+2. final AI アップスケール / デノイズ (`final_ai_pending` → `final_ai_cache`)
+3. post_filter (`post_filter::apply`)
+4. GPU upload (`final_composite_cache`)
 
-補正と AI の合成順序:
-- **先に AI アップスケール** → それを入力として**後から補正**
-- つまり `adjustment_cache` の中身は「AI 後に補正を掛けた」テクスチャ
+の順で最終表示を作る。AI 未完了中は色調補正済みの画像を暫定表示し、
+AI 完了時に未完了の final composite を捨てて再合成する。
 
-### 3.3 AI 処理中の暫定補正 (pre-AI adjustment)
+### 3.3 サムネイル補正
 
-AI 処理には数秒〜数十秒かかるため、その間も `maybe_apply_adjustment` は **`fs_cache` を入力に
-補正を同期適用して `adjustment_cache` を埋める**。これを省くと AI 完了までユーザーには
-「補正が掛かっていない生の `fs_cache`」が表示され、AI 完了の瞬間に補正分 (特にモノクロ系
-ポストフィルタなどコントラストが強いもの) が一気に乗って濃度が跳ねて見える。
-
-- AI 完了時 (`poll_ai_upscale`): **無条件に `adjustment_cache.remove(idx)` して仮版を破棄**
-  してから、表示中かつ bg 一致の場合のみ AI 結果に対して再度 `apply_sync_adjustment` を呼ぶ。
-  表示中でないページで AI が完了したときは `adjustment_cache` を空にしておけば、次回来訪時に
-  `maybe_apply_adjustment` が `ai_upscale_cache` から再生成する。
-- 仮版は `fs_cache` の解像度で作られるため AI 結果と比べて低解像度。仮版がそのまま残ると
-  表示優先順位 `adjustment > ai_upscale > fs` により AI 結果が覆い隠されてしまうので、
-  上記の明示的な `remove` が必須。
+サムネイルは `thumb_pixels` から色調補正のみを同期適用し、`thumb_adjust_tex` に保持する。
+edit 系 (erase / local_adjust / conceal / crop) は反映しない。post_filter と AI もサムネでは
+実行しない。スライダー drag 中は補正サムネ生成を止め、release 後に visible 優先で再生成する。
 
 ### 3.4 補正レイヤーの適用タイミング
 
 補正レイヤーは `local-adjust-core` を使う CPU 処理で、効果によっては重いため別スレッドで適用する。
-入力は `erase_result_cache > adjustment_cache > ai_upscale_cache > fs_cache` の順で解決し、
+入力は `erase_result_cache > fs_cache` の順で解決し、
 結果を `local_adjust_cache` に格納する。消しゴムマスクが存在するが現在世代の
 `erase_result_cache` がまだ無い場合は、古い補正レイヤー結果を表示せず、消しゴム結果の生成を待つ。
 
 生成中または stale の間は、下位レイヤの画像をそのまま表示する。これにより補正レイヤーの古い結果が
 一瞬残ることを避け、非同期完了後に最新の `local_adjust_cache` へ差し替える。サムネイルには
 補正レイヤーを反映しない。
+手描きブラシ stroke 中は in-memory レイヤーだけを即時更新し、重い worker 再合成は 150ms の
+idle まで遅延する。release 時は遅延をキャンセルして 1 回だけ generation を進める。
 
 初期 UI はフルスクリーン左パネルのヘッダーにある「補正レイヤー」アイコンから開く。
 ヘッダーの編集入口は左から `消しゴム -> 補正レイヤー -> 隠蔽加工 -> エクスポート` の順で、
@@ -384,70 +383,72 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 
 **これを間違えると高確率でバグる**。変更する前に必ず以下を確認:
 
-| 変更された内容 | `adjustment_cache` | `thumb_adjust_tex` | `ai_upscale_cache` | 実行中 AI ジョブ |
+| 変更された内容 | `edit_result_cache` | `final_ai_cache` / `final_composite_cache` | `thumb_adjust_tex` | pending |
 | --- | --- | --- | --- | --- |
-| 色系パラメータ変更* (ページ個別) | 該当 idx のみクリア | 該当 idx のみクリア | 残す | 残す |
-| **ポストフィルタ変更** (ページ個別) | **該当 idx のみクリア** (サンプラー切替のため再アップロードが必要) | 該当 idx のみクリア (実際は identity 差分なしで no-op、影響なし) | 残す | 残す |
-| 消しゴム/隠蔽加工/分析モードの入出 (`post_filter_bypassed` 切替) | 該当 idx の描画用 cache のみクリア (`input_generation` は進めない) | 触らない (サムネは post-filter 非対象) | 残す | 残す |
-| AI モデル変更 (ページ個別) | 全クリア | 該当 idx のみクリア | **全クリア** | **キャンセル** |
-| 保存スロット読込 → 現ページに適用 | 全クリア | 該当 idx のみクリア | AI モデルが異なれば全クリア | 同上 |
-| 「全画像に適用」 / 「全画像から削除」 | 全クリア | **全クリア** | AI 設定が変わる idx のみクリア + pending キャンセル | あり |
-| 「標準にする」 (global_preset 更新) | 全クリア | **全クリア** (override 有無を判定するより単純) | global の AI 設定が変わった場合、継承ページ (override なし) の idx をまとめてクリア + pending キャンセル | あり |
-| 「個別設定を解除」 (Ctrl+Backspace) | 該当 idx のみクリア | 該当 idx のみクリア | AI 設定が変わるなら該当 idx のみクリア + pending キャンセル | あり |
-| スライダードラッグ中 | 毎フレーム適用 (fs のみ) | **抑制** (描画時 `adjusted_tex = None`) | 残す | 残す |
-| スライダー release (true→false 遷移) | (変化なし) | **全クリア** → visible 優先で再生成 | — | — |
-| フォルダ切替 | 全クリア | **全クリア** + `thumb_pixels` も全クリア | 全クリア | キャンセル |
-| keep_range からの eviction | 該当 idx のみ evict | 該当 idx のみクリア + `thumb_pixels` も drop | 対象外 | — |
-| 回転変更 | **クリアしない** (描画時の GPU 行列で回転) | **クリアしない** (同左) | クリアしない | — |
-| 消しゴムマスク変更 | 残す | 触らない (`thumb_pixels` は元サムネソース、マスクで変わらない) | 残す | — |
-| 補正レイヤー変更 | 残す | 触らない (サムネ画像には反映しない) | 残す | — |
+| 色系パラメータ変更* (ページ個別) | 残す | 該当 idx の final cache をクリア | 該当 idx のみクリア | final AI は該当 idx をキャンセル |
+| **ポストフィルタ変更** (ページ個別) | 残す | 該当 idx の final cache をクリア | 触らない (サムネ非対象) | final AI は必要なら残せるが現実装は idx 単位 clear |
+| AI モデル変更 (ページ個別) | 残す | 該当 idx の final cache / pending / failed をクリア | 触らない (サムネ非対象) | final AI をキャンセル |
+| 消しゴム/隠蔽加工/分析モードの入出 (`post_filter_bypassed` 切替) | 残す | 該当 idx の final cache のみクリア (`input_generation` は進めない) | 触らない | final AI は該当 idx をキャンセル |
+| 保存スロット読込 → 現ページに適用 | 残す | 該当 idx の final cache をクリア | 該当 idx のみクリア | AI 設定が変われば final AI キャンセル |
+| 「全画像に適用」 / 「全画像から削除」 | 残す | final cache を対象範囲でクリア | **全クリア** | AI 設定が変わる idx の final AI をキャンセル |
+| 「標準にする」 (global_preset 更新) | 残す | final cache を継承ページ中心にクリア | **全クリア** | AI 設定が変わる idx の final AI をキャンセル |
+| 「個別設定を解除」 (Ctrl+Backspace) | 残す | 該当 idx の final cache をクリア | 該当 idx のみクリア | AI 設定が変われば final AI キャンセル |
+| スライダードラッグ中 | 残す | 毎フレーム final composite のみ再生成 | **抑制** (描画時 `adjusted_tex = None`) | edit 系 pending は触らない |
+| スライダー release (true→false 遷移) | 残す | (変化なし) | **全クリア** → visible 優先で再生成 | — |
+| フォルダ切替 | 全クリア | 全クリア | **全クリア** + `thumb_pixels` も全クリア | pending をキャンセル |
+| keep_range からの eviction | 該当 idx の edit/final を evict | 該当 idx の final を evict | 該当 idx のみクリア + `thumb_pixels` も drop | 対象外 |
+| 回転変更 | **クリアしない** (描画時の GPU 行列で回転) | **クリアしない** (同左) | **クリアしない** | — |
+| 消しゴムマスク変更 | 該当 idx をクリア | 該当 idx をクリア | 触らない (`thumb_pixels` は元サムネソース、マスクで変わらない) | erase/local/conceal/final pending をキャンセル |
+| 補正レイヤー変更 | 該当 idx をクリア | 該当 idx をクリア | 触らない (サムネ画像には反映しない) | local/final pending をキャンセル |
+| 隠蔽加工 / crop 変更 | 該当 idx をクリア | 該当 idx をクリア | 触らない | final pending をキャンセル |
 
 *「色系」= brightness/contrast/gamma/saturation/temperature/levels/auto_mode
 (ポストフィルタは AI 設定を変えないので `ai_settings_eq` には含まれず、色系変更と同じ扱い)
 
 消しゴムマスク変更時は `erase_mask_generation[idx]` を進め、`erase_result_cache` と
-`local_adjust_cache` / `conceal_cache[idx]` を stale 化する。`fs_cache` / `ai_upscale_cache` /
-`adjustment_cache` は下位入力として保持し、MI-GAN 結果と補正レイヤー結果だけを再生成する。
+`local_adjust_cache` / `conceal_cache[idx]` / `edit_result_cache` / final cache を stale 化する。
+`fs_cache` は下位入力として保持し、MI-GAN 結果と補正レイヤー結果だけを再生成する。
 
 補正レイヤー変更時は `local_adjust_generation[idx]` を進め、`local_adjust_cache` と
-下流の `conceal_cache[idx]` を stale 化する。`adjustment_cache` / `erase_result_cache` は
+下流の `conceal_cache[idx]` / `edit_result_cache` / final cache を stale 化する。
+`erase_result_cache` は
 下位入力として保持する。生成中または stale 中は下位入力を表示し、完了後に
 `local_adjust_cache` へ差し替える。
 
 ### 4.1 ヘルパー関数
 
-`App` には 3 系統の無効化ヘルパーがある:
+`App` には final pipeline 用の無効化ヘルパーがある:
 
 ```rust
-fn clear_adjustment_caches(&mut self, idx: usize)
-    // adjustment_cache[idx] のみクリア
+fn clear_edit_result_caches_for_idx(&mut self, idx: usize)
+    // source 解像度 edit result と、その下流 final pipeline をクリア
 
-fn clear_all_adjustment_and_ai_caches(&mut self, idx: usize)
-    // adjustment_cache[idx] + ai_upscale_cache 全クリア + ai_upscale_pending キャンセル
-    // (単一 idx 操作で AI モデル変更が起きたとき用)
+fn clear_final_pipeline_caches_for_idx(&mut self, idx: usize)
+    // final_ai_pending / final_ai_cache / final_ai_failed / final_composite_cache を idx 単位でクリア
 
-fn clear_ai_caches_for_indices(&mut self, indices: &[usize])
-    // 指定 idx 群の ai_upscale_cache / failed / pending をまとめてクリア
-    // (bulk / global 系の操作で「AI 設定が変わった idx だけ」落とすとき用)
+fn clear_all_final_pipeline_caches(&mut self)
+    // final AI pending をキャンセルし、final AI / final composite を全クリア
 ```
 
-単一 idx で AI モデル変更を伴う可能性がある操作は `clear_all_adjustment_and_ai_caches`、
-複数ページにまたがる操作は `clear_ai_caches_for_indices` を使う。
+AdjustParams / AI / post_filter だけが変わる操作は `clear_final_pipeline_caches_for_idx`、
+edit 系 (erase / local_adjust / conceal / crop) が変わる操作は `clear_edit_result_caches_for_idx`
+を使う。final cache は edit cache の下流なので、edit 側を落とすと final 側も必ず落ちる。
 
 `set_page_params` / `clear_page_params` / `apply_params_to_all_pages` /
 `clear_all_page_params` / `copy_params_to_global` の実装内でも、必要に応じて
-`adjustment_cache` をクリアしている (全クリア vs 部分クリア)。詳細はソース参照。
+final pipeline cache と `thumb_adjust_tex` をクリアしている (全クリア vs 部分クリア)。
+詳細はソース参照。
 
 特に `clear_page_params(idx)` は、削除後の effective params を見て
-**old.ai_settings_eq(new) が false なら** その `idx` の `ai_upscale_cache` /
-`ai_upscale_failed` / `ai_upscale_pending` をクリアする。これがないと
+**old.ai_settings_eq(new) が false なら** その `idx` の final AI cache /
+failed / pending をクリアする。これがないと
 「個別で AI OFF にしていたページから個別を解除しても、グローバルの AI が
 再実行されない」という不具合になる (実際、`ui_fullscreen.rs` から
 `Ctrl+Backspace` で解除した直後に上記不具合が発生していた)。
 
 同じ考え方を bulk / global / favorite 系にも横展開している:
 - `apply_params_to_all_pages(params)`: 書換前の各 idx の effective params と
-  `params` を `ai_settings_eq` で比較し、一致しない idx だけ AI キャッシュを落とす。
+  `params` を `ai_settings_eq` で比較し、一致しない idx だけ final AI cache を落とす。
 - `clear_all_page_params()`: 個別削除後の effective params は `effective_default_for_idx`
   (お気に入り標準 or global_preset) になるため、書換前の effective params とその標準を
   比較して差がある idx だけ落とす。
@@ -466,18 +467,20 @@ fn clear_ai_caches_for_indices(&mut self, indices: &[usize])
 `ui_erase.rs` と `mask_db.rs` で実装された消しゴム機能は、補正パイプラインと連携している:
 
 ```
-生画像 (fs_cache) ─▶ AI upscale (ai_upscale_cache) ─▶ 補正 (adjustment_cache)
-                                                           │
-                                                           ▼
-                    mask_db (消しゴムマスク) ─▶ MI-GAN で inpaint
-                                                           │
-                                                           ▼
-                                               erase_result_cache ─▶ local_adjust_cache ─▶ conceal_cache ─▶ 画面
+生画像 (fs_cache)
+    │
+    ├─ mask_db (消しゴムマスク) ─▶ MI-GAN で inpaint ─▶ erase_result_cache
+    │                                                       │
+    ▼                                                       ▼
+local_adjust_cache ─▶ conceal_cache ─▶ crop ─▶ edit_result_cache
+                                                   │
+                                                   ▼
+                         色調補正 ─▶ final AI ─▶ post_filter ─▶ final_composite_cache ─▶ 画面
 ```
 
 `fs_cache` は raw decode 専用で、消しゴム確定結果を書き戻さない。マスクが存在する画像は
-表示時に `ensure_erase_result_texture` が現在の pre-erase 入力
-(`adjustment_cache > ai_upscale_cache > fs_cache`) と保存マスクから inpaint を非同期起動し、
+表示時に `ensure_erase_result_texture` が source 解像度の raw 入力
+(`fs_cache`) と保存マスクから inpaint を非同期起動し、
 結果を `erase_result_cache` に載せる。入力またはマスクが変わると generation key が変わり、
 古い MI-GAN 結果は採用されない。
 
@@ -494,13 +497,11 @@ MI-GAN は RGB 専用で alpha を扱えない。透過 PNG / WebP 等は透明�
   `ensure_erase_base_texture`) と、`resolve_erase_input_pixels` 系の返り値 (preview / apply /
   auto-apply / ensure-result の全 MI-GAN 入力)。これで**表示も入力も出力も黒不透明で揃う
   (WYSIWYG)**。
-- AI 高解像度レイヤがあるページでは、消しゴム入場時の `erase_mask_size` も AI 側の
-  解像度に合わせる。raw サイズのマスクで preview し、通常表示復帰後に高解像度へ
-  リスケールして ensure-result すると、同じ見た目のマスクでも MI-GAN 入力が変わり、
-  preview と確定結果が一致しなくなるため。
-- AI アップスケール ON の透過画像では、B キーで白背景を選んでいても消しゴム用の
-  composite-first cache は bg=0 (黒) を参照する。白背景に焼き込まれた `(idx,1)` や
-  その派生 `adjustment_cache` を消しゴム入力へ流さないため。
+- AI アップスケール ON/OFF は final pipeline のみを変える。消しゴム入場時の
+  `erase_mask_size` は source 解像度の raw / erase 入力に固定され、アップスケール切替で
+  マスク寸法は変わらない。
+- AI アップスケール ON の透過画像でも、消しゴム用の入力は final AI の bg 付き cache を
+  参照しない。透過 source は黒で不透明化して MI-GAN に渡す。
 - `fs_cache` の透明原本は無変更。マスクを 1 つも作らずに消しゴムを抜ければ通常表示は `fs_cache`
   に戻るので、**元の透明画像がそのまま保持される** (= 加工しなければ破壊しない)。
 - 結果として MI-GAN と diffusion フォールバックの出力 alpha も一致する (P3-8 の非一貫も解消)。

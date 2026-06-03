@@ -20,7 +20,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 │  アプリ状態層 (src/app.rs の App 構造体)                       │
 │   - items / thumbnails / fullscreen_idx …                     │
 │   - 各種キュー (reload_queue, heavy_io_queue)                  │
-│   - 各種キャッシュ (fs_cache, adjustment_cache, ai_upscale_…)  │
+│   - 各種キャッシュ (fs_cache, edit_result_cache, final_composite_…) │
 │   - 通信チャネル (tx/rx, cancel_token, scroll_hint)            │
 └───────────────┬──────────────────────────────────────────────┘
                 │ LoadRequest を push / ワーカースレッド spawn
@@ -194,17 +194,17 @@ App::update() 内のハンドラ
     │  ├─ load_folder(path)         → フォルダ/ZIP/PDF 切替
     │  ├─ start_fs_load(idx)        → フルスクリーン画像ロード
     │  ├─ apply_rotation(idx)       → 回転の DB 更新
-    │  └─ preset 切替 / 補正変更    → adjustment_cache クリア
+    │  └─ preset 切替 / 補正変更    → final pipeline cache クリア
     │
     ▼
 各ワーカーに LoadRequest を投げる / テクスチャキャッシュを無効化
     │
     ▼
-次フレームの poll_* / maybe_apply_adjustment() 等で結果取り込み
+次フレームの poll_* / ensure_final_composite_*() 等で結果取り込み
     │
     ▼
 ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描画
-    (adjustment_cache > ai_upscale_cache > fs_cache の優先順位)
+    (final_composite_cache > edit_result_cache > fs_cache の優先順位)
 ```
 
 **「どのテクスチャを表示するか」の決定ロジックは `ui_fullscreen.rs` に集中している**。

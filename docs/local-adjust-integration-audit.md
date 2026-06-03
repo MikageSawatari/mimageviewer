@@ -744,3 +744,19 @@
 - 新たな差分が見つかったら同じ書式 (`X-N. 名前 🐛 / ⚠️ / ❌`) で追加する。
 - すべて ✓ になったら本ドキュメントを `docs/local-adjust-integration-complete.md` に
   リネーム (= リリース完了の歴史的記録として残す)。
+
+---
+
+## M. v1.1.0 パイプライン再構成 closure (Codex P1-P10)
+
+- **2026-06-03 Codex 対応**: `raw -> erase -> local_adjust -> conceal -> crop` を
+  source 解像度の edit pipeline とし、`AdjustParams -> final AI -> post_filter` を
+  final pipeline へ移動。cache は `edit_result_cache` と `final_composite_cache`
+  を通常表示の正系にした。
+- **完了 commit**: `[Pipeline P1]` から `[Pipeline P10]` までの 10 commit。
+- **自動検証**: `cargo test` green、`cargo fmt --package mimageviewer --check` clean。
+- **clippy**: `cargo clippy --package mimageviewer --all-targets -- -D warnings` は
+  `crates/local-adjust-core/src/lib.rs` の既存 lint 負債で失敗。release sign-off 前に
+  clippy debt closure が必要。
+- **実機確認待ち**: スライダー 10x 以上、4K ブラシ 60fps、既存 `.miv` / DB ファイル、
+  P9.4 のアップスケール切替 / post_filter / Ctrl+E 1/2 サイズシナリオ。
