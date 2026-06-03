@@ -64,6 +64,7 @@ const LOCAL_ADJUST_REGION_SEGMENT_MAX_LABELS: usize = 2048;
 const LOCAL_ADJUST_MASK_PREVIEW_BASE_ALPHA: f32 = 155.0;
 const LOCAL_ADJUST_MASK_PREVIEW_EDIT_ALPHA: u8 = 225;
 const LOCAL_ADJUST_MASK_PREVIEW_MAX_TEXELS: f32 = 768.0;
+const LOCAL_ADJUST_REGION_BOUNDARY_ANIM_INTERVAL_MS: u64 = 160;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalAdjustBitmapMaskOp {
@@ -418,6 +419,13 @@ mod local_adjust_segmentation_tests {
             local_adjust_core::LocalEffect::None,
         );
         assert!(!local_adjust_gradient_create_pending(&ready_radial));
+    }
+
+    #[test]
+    fn region_boundary_color_animates_over_time() {
+        let start = local_adjust_region_boundary_color(7, 0.0);
+        let later = local_adjust_region_boundary_color(7, 1.0);
+        assert_ne!(start, later);
     }
 
     #[test]
@@ -4617,11 +4625,34 @@ fn local_adjust_region_active_boundary(
 }
 
 fn local_adjust_region_boundary_color(label: u32, time_sec: f32) -> egui::Color32 {
-    let pulse = ((time_sec * 3.0 + label as f32 * 0.31).sin() * 0.5 + 0.5) * 45.0;
-    let r = (110.0 + ((label.wrapping_mul(53) % 120) as f32) + pulse).clamp(0.0, 255.0) as u8;
-    let g = (135.0 + ((label.wrapping_mul(97) % 100) as f32)).clamp(0.0, 255.0) as u8;
-    let b = (170.0 + ((label.wrapping_mul(31) % 80) as f32)).clamp(0.0, 255.0) as u8;
+    let hue = (time_sec * 130.0 + (label.wrapping_mul(47) % 360) as f32).rem_euclid(360.0);
+    let [r, g, b] = local_adjust_hsv_to_rgb(hue, 0.95, 1.0);
     egui::Color32::from_rgba_unmultiplied(r, g, b, 190)
+}
+
+fn local_adjust_hsv_to_rgb(hue: f32, sat: f32, val: f32) -> [u8; 3] {
+    let h = (hue / 60.0).rem_euclid(6.0);
+    let c = val * sat;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let m = val - c;
+    let (r, g, b) = if h < 1.0 {
+        (c, x, 0.0)
+    } else if h < 2.0 {
+        (x, c, 0.0)
+    } else if h < 3.0 {
+        (0.0, c, x)
+    } else if h < 4.0 {
+        (0.0, x, c)
+    } else if h < 5.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    [
+        ((r + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
 }
 
 fn draw_local_adjust_mask_preview_overlay(
@@ -4670,15 +4701,26 @@ fn draw_local_adjust_mask_preview_overlay(
     }
 
     let image = egui::ColorImage::new([tex_w, tex_h], pixels);
-    let texture = painter.ctx().load_texture(
-        "local_adjust_mask_preview",
-        image,
-        egui::TextureOptions::NEAREST,
-    );
-    let texture_id = texture.id();
-    *texture_slot = Some(texture);
+    if texture_slot
+        .as_ref()
+        .is_some_and(|texture| texture.size() != [tex_w, tex_h])
+    {
+        *texture_slot = None;
+    }
+    if let Some(texture) = texture_slot.as_mut() {
+        texture.set(image, egui::TextureOptions::NEAREST);
+    } else {
+        *texture_slot = Some(painter.ctx().load_texture(
+            "local_adjust_mask_preview",
+            image,
+            egui::TextureOptions::NEAREST,
+        ));
+    }
+    let Some(texture) = texture_slot.as_ref() else {
+        return;
+    };
     painter.image(
-        texture_id,
+        texture.id(),
         drawn_rect,
         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
@@ -7391,7 +7433,9 @@ impl App {
             );
             if matches!(layer.mask, local_adjust_core::LocalMask::Segmentation(_)) {
                 ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(100));
+                    .request_repaint_after(std::time::Duration::from_millis(
+                        LOCAL_ADJUST_REGION_BOUNDARY_ANIM_INTERVAL_MS,
+                    ));
             }
         }
         let shape_to_screen =
