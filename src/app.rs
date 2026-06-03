@@ -293,6 +293,7 @@ pub(crate) struct LocalAdjustLutLoadPending {
 pub(crate) enum LocalAdjustCanvasDragKind {
     LinearGradient,
     RadialGradient,
+    EffectCenter,
 }
 
 #[derive(Debug, Clone, Copy)]

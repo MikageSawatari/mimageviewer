@@ -591,6 +591,102 @@ fn draw_local_adjust_ellipse(
     }
 }
 
+fn local_adjust_effect_center_mut(
+    effect: &mut local_adjust_core::LocalEffect,
+) -> Option<(&mut [f32; 2], &'static str)> {
+    match effect {
+        local_adjust_core::LocalEffect::TiltShift(params) => {
+            Some((&mut params.center, "チルトシフト中心"))
+        }
+        local_adjust_core::LocalEffect::RadialBlur(params) => {
+            Some((&mut params.center, "放射ぼかし中心"))
+        }
+        local_adjust_core::LocalEffect::WaveDistortion(params)
+            if params.mode == local_adjust_core::WaveDistortionMode::Ripple =>
+        {
+            Some((&mut params.center, "波形中心"))
+        }
+        local_adjust_core::LocalEffect::PinchSpherize(params) => {
+            Some((&mut params.center, "つまむ/魚眼中心"))
+        }
+        local_adjust_core::LocalEffect::Twirl(params) => Some((&mut params.center, "渦巻き中心")),
+        local_adjust_core::LocalEffect::PolarCoordinates(params) => {
+            Some((&mut params.center, "極座標中心"))
+        }
+        local_adjust_core::LocalEffect::LensCorrection(params) => {
+            Some((&mut params.center, "レンズ補正中心"))
+        }
+        local_adjust_core::LocalEffect::GodRays(params) => Some((&mut params.center, "光源位置")),
+        local_adjust_core::LocalEffect::LensFlare(params) => {
+            Some((&mut params.center, "フレア光源位置"))
+        }
+        local_adjust_core::LocalEffect::LightLeak(params) => {
+            Some((&mut params.center, "ライトリーク位置"))
+        }
+        local_adjust_core::LocalEffect::BacklightHaze(params) => {
+            Some((&mut params.center, "逆光ヘイズ位置"))
+        }
+        local_adjust_core::LocalEffect::SpeedLines(params) => {
+            Some((&mut params.center, "集中線/スピード線中心"))
+        }
+        local_adjust_core::LocalEffect::RadialFlash(params) => {
+            Some((&mut params.center, "集中線フラッシュ中心"))
+        }
+        local_adjust_core::LocalEffect::Spotlight(params) => {
+            Some((&mut params.center, "スポットライト位置"))
+        }
+        _ => None,
+    }
+}
+
+fn local_adjust_effect_center(
+    effect: &local_adjust_core::LocalEffect,
+) -> Option<([f32; 2], &'static str)> {
+    match effect {
+        local_adjust_core::LocalEffect::TiltShift(params) => {
+            Some((params.center, "チルトシフト中心"))
+        }
+        local_adjust_core::LocalEffect::RadialBlur(params) => {
+            Some((params.center, "放射ぼかし中心"))
+        }
+        local_adjust_core::LocalEffect::WaveDistortion(params)
+            if params.mode == local_adjust_core::WaveDistortionMode::Ripple =>
+        {
+            Some((params.center, "波形中心"))
+        }
+        local_adjust_core::LocalEffect::PinchSpherize(params) => {
+            Some((params.center, "つまむ/魚眼中心"))
+        }
+        local_adjust_core::LocalEffect::Twirl(params) => Some((params.center, "渦巻き中心")),
+        local_adjust_core::LocalEffect::PolarCoordinates(params) => {
+            Some((params.center, "極座標中心"))
+        }
+        local_adjust_core::LocalEffect::LensCorrection(params) => {
+            Some((params.center, "レンズ補正中心"))
+        }
+        local_adjust_core::LocalEffect::GodRays(params) => Some((params.center, "光源位置")),
+        local_adjust_core::LocalEffect::LensFlare(params) => {
+            Some((params.center, "フレア光源位置"))
+        }
+        local_adjust_core::LocalEffect::LightLeak(params) => {
+            Some((params.center, "ライトリーク位置"))
+        }
+        local_adjust_core::LocalEffect::BacklightHaze(params) => {
+            Some((params.center, "逆光ヘイズ位置"))
+        }
+        local_adjust_core::LocalEffect::SpeedLines(params) => {
+            Some((params.center, "集中線/スピード線中心"))
+        }
+        local_adjust_core::LocalEffect::RadialFlash(params) => {
+            Some((params.center, "集中線フラッシュ中心"))
+        }
+        local_adjust_core::LocalEffect::Spotlight(params) => {
+            Some((params.center, "スポットライト位置"))
+        }
+        _ => None,
+    }
+}
+
 fn paste_layer_effect(
     layer: &mut local_adjust_core::LocalAdjustmentLayer,
     effect: local_adjust_core::LocalEffect,
@@ -1617,6 +1713,14 @@ impl App {
                     mask.outer_radius_y = dy;
                     true
                 }
+                (_, crate::app::LocalAdjustCanvasDragKind::EffectCenter) => {
+                    let Some((center, _)) = local_adjust_effect_center_mut(&mut layer.effect)
+                    else {
+                        return false;
+                    };
+                    *center = norm;
+                    true
+                }
                 _ => false,
             }
         })
@@ -1671,7 +1775,13 @@ impl App {
                         local_adjust_screen_to_norm(pos, image_rect, image_dims, zoom_pan, false)
                 {
                     self.apply_local_adjust_gradient_drag(drag, norm, false);
-                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                    let cursor = if drag.kind == crate::app::LocalAdjustCanvasDragKind::EffectCenter
+                    {
+                        egui::CursorIcon::Grabbing
+                    } else {
+                        egui::CursorIcon::Crosshair
+                    };
+                    ctx.set_cursor_icon(cursor);
                     ctx.request_repaint();
                 }
                 return;
@@ -1743,6 +1853,30 @@ impl App {
                 return;
             }
 
+            if self.local_adjust_effect_position_handles_visible {
+                let center_hit = self
+                    .local_adjust_page_layers
+                    .get(&fs_idx)
+                    .and_then(|layers| layers.get(layer_idx))
+                    .and_then(|layer| local_adjust_effect_center(&layer.effect))
+                    .and_then(|(center, _)| {
+                        local_adjust_norm_to_screen(center, image_rect, image_dims, zoom_pan)
+                    })
+                    .is_some_and(|center| center.distance(pos) <= 14.0);
+                if center_hit {
+                    let drag = crate::app::LocalAdjustCanvasDrag {
+                        fs_idx,
+                        layer_idx,
+                        kind: crate::app::LocalAdjustCanvasDragKind::EffectCenter,
+                        start: norm,
+                    };
+                    self.local_adjust_canvas_drag = Some(drag);
+                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                    return;
+                }
+            }
+
             let mask_kind = self
                 .local_adjust_page_layers
                 .get(&fs_idx)
@@ -1808,6 +1942,18 @@ impl App {
             || self.local_adjust_rgb_pick_active.is_some()
         {
             ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        } else if self.local_adjust_effect_position_handles_visible
+            && self
+                .local_adjust_page_layers
+                .get(&fs_idx)
+                .and_then(|layers| layers.get(layer_idx))
+                .and_then(|layer| local_adjust_effect_center(&layer.effect))
+                .and_then(|(center, _)| {
+                    local_adjust_norm_to_screen(center, image_rect, image_dims, zoom_pan)
+                })
+                .is_some_and(|center| center.distance(pos) <= 14.0)
+        {
+            ctx.set_cursor_icon(egui::CursorIcon::Grab);
         }
     }
 
@@ -1836,6 +1982,43 @@ impl App {
         let image_dims = local_adjust_image_dims(self, fs_idx);
         let painter = ui.painter();
         let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 226, 120));
+        if self.local_adjust_effect_position_handles_visible
+            && let Some((center_norm, label)) = local_adjust_effect_center(&layer.effect)
+            && let Some(center) =
+                local_adjust_norm_to_screen(center_norm, image_rect, image_dims, zoom_pan)
+        {
+            let handle_fill = egui::Color32::from_rgb(185, 235, 255);
+            let handle_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(20, 45, 58));
+            painter.circle_filled(center, 7.0, handle_fill);
+            painter.circle_stroke(center, 7.0, handle_stroke);
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 13.0, center.y),
+                    egui::pos2(center.x + 13.0, center.y),
+                ],
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(185, 235, 255, 180),
+                ),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x, center.y - 13.0),
+                    egui::pos2(center.x, center.y + 13.0),
+                ],
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(185, 235, 255, 180),
+                ),
+            );
+            painter.text(
+                center + egui::vec2(10.0, -12.0),
+                egui::Align2::LEFT_BOTTOM,
+                label,
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgba_unmultiplied(230, 245, 255, 220),
+            );
+        }
         match &layer.mask {
             local_adjust_core::LocalMask::LinearGradient(mask) if mask.initialized => {
                 let Some(start) =
