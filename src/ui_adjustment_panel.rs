@@ -255,6 +255,52 @@ mod local_adjust_segmentation_tests {
     }
 
     #[test]
+    fn tilt_shift_range_drag_initializes_linear_range() {
+        let mut params = local_adjust_core::TiltShiftParams {
+            mode: local_adjust_core::TiltShiftMode::Linear,
+            mode_selected: true,
+            range_initialized: false,
+            strength: 0.0,
+            max_radius_px: 0.0,
+            ..Default::default()
+        };
+        assert!(apply_local_adjust_tilt_shift_range_drag(
+            &mut params,
+            [0.25, 0.25],
+            [0.25, 0.65],
+        ));
+        assert_eq!(params.center, [0.25, 0.25]);
+        assert!(params.range_initialized);
+        assert!(!params.mode_selected);
+        assert!((params.angle_degrees - 90.0).abs() < 1e-4);
+        assert!((params.focus_width - 0.14).abs() < 1e-5);
+        assert!((params.falloff - 0.26).abs() < 1e-5);
+        assert_eq!(params.strength, 1.0);
+        assert_eq!(params.max_radius_px, 20.0);
+    }
+
+    #[test]
+    fn tilt_shift_range_drag_initializes_radial_range() {
+        let mut params = local_adjust_core::TiltShiftParams {
+            mode: local_adjust_core::TiltShiftMode::Radial,
+            mode_selected: true,
+            range_initialized: false,
+            ..Default::default()
+        };
+        assert!(apply_local_adjust_tilt_shift_range_drag(
+            &mut params,
+            [0.4, 0.5],
+            [0.7, 0.8],
+        ));
+        assert_eq!(params.center, [0.4, 0.5]);
+        assert!(params.range_initialized);
+        assert!(!params.mode_selected);
+        assert!((params.radius[0] - 0.3).abs() < 1e-5);
+        assert!((params.radius[1] - 0.3).abs() < 1e-5);
+        assert!((params.falloff - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
     fn region_segmentation_splits_connected_color_regions() {
         let width = 6;
         let height = 4;
@@ -3820,6 +3866,58 @@ fn local_adjust_tilt_shift_handle_hit(
         .find_map(|(kind, handle)| (handle.distance(pos) <= 15.0).then_some(kind))
 }
 
+fn local_adjust_tilt_shift_range_create_pending(effect: &local_adjust_core::LocalEffect) -> bool {
+    matches!(
+        effect,
+        local_adjust_core::LocalEffect::TiltShift(params)
+            if params.mode_selected && !params.range_initialized
+    )
+}
+
+fn apply_local_adjust_tilt_shift_range_drag(
+    params: &mut local_adjust_core::TiltShiftParams,
+    start: [f32; 2],
+    norm: [f32; 2],
+) -> bool {
+    params.mode_selected = false;
+    params.range_initialized = true;
+    params.center = start;
+    if params.strength <= f32::EPSILON {
+        params.strength = 1.0;
+    }
+    if params.max_radius_px <= f32::EPSILON {
+        params.max_radius_px = 20.0;
+    }
+
+    let dx = norm[0] - start[0];
+    let dy = norm[1] - start[1];
+    match params.mode {
+        local_adjust_core::TiltShiftMode::Linear => {
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance > 0.001 {
+                params.angle_degrees = dy.atan2(dx).to_degrees();
+                params.focus_width = (distance * 0.35).clamp(0.0, 0.8);
+                params.falloff = (distance * 0.65).clamp(0.001, 1.2);
+            } else {
+                params.focus_width = 0.0;
+                params.falloff = 0.001;
+            }
+        }
+        local_adjust_core::TiltShiftMode::Radial => {
+            let distance = (dx * dx + dy * dy).sqrt();
+            params.falloff = 0.40;
+            if distance > 0.001 {
+                let rx = dx.abs().max(distance * 0.35).clamp(0.001, 1.2);
+                let ry = dy.abs().max(distance * 0.35).clamp(0.001, 1.2);
+                params.radius = [rx, ry];
+            } else {
+                params.radius = [0.001, 0.001];
+            }
+        }
+    }
+    true
+}
+
 fn apply_local_adjust_tilt_shift_handle_drag(
     params: &mut local_adjust_core::TiltShiftParams,
     kind: crate::app::LocalAdjustCanvasDragKind,
@@ -5545,6 +5643,13 @@ impl App {
                     *center = norm;
                     true
                 }
+                (_, crate::app::LocalAdjustCanvasDragKind::TiltShiftRange) => {
+                    let local_adjust_core::LocalEffect::TiltShift(params) = &mut layer.effect
+                    else {
+                        return false;
+                    };
+                    apply_local_adjust_tilt_shift_range_drag(params, drag.start, norm)
+                }
                 (
                     _,
                     crate::app::LocalAdjustCanvasDragKind::TiltShiftFocus
@@ -6129,6 +6234,7 @@ impl App {
                     let cursor = if matches!(
                         drag.kind,
                         crate::app::LocalAdjustCanvasDragKind::EffectCenter
+                            | crate::app::LocalAdjustCanvasDragKind::TiltShiftRange
                             | crate::app::LocalAdjustCanvasDragKind::TiltShiftFocus
                             | crate::app::LocalAdjustCanvasDragKind::TiltShiftOuter
                             | crate::app::LocalAdjustCanvasDragKind::TiltShiftInnerX
@@ -6266,6 +6372,27 @@ impl App {
             }
 
             if self.local_adjust_effect_position_handles_visible {
+                let tilt_shift_range_pending = self
+                    .local_adjust_page_layers
+                    .get(&fs_idx)
+                    .and_then(|layers| layers.get(layer_idx))
+                    .is_some_and(|layer| {
+                        local_adjust_tilt_shift_range_create_pending(&layer.effect)
+                    });
+                if tilt_shift_range_pending {
+                    self.local_adjust_canvas_drag_before_layers =
+                        self.local_adjust_page_layers.get(&fs_idx).cloned();
+                    let drag = crate::app::LocalAdjustCanvasDrag {
+                        fs_idx,
+                        layer_idx,
+                        kind: crate::app::LocalAdjustCanvasDragKind::TiltShiftRange,
+                        start: norm,
+                    };
+                    self.local_adjust_canvas_drag = Some(drag);
+                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                    return;
+                }
                 let tilt_shift_handle = self
                     .local_adjust_page_layers
                     .get(&fs_idx)
@@ -6509,6 +6636,14 @@ impl App {
             )
             || self.local_adjust_selective_color_pick_active
             || self.local_adjust_rgb_pick_active.is_some()
+        {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        } else if self.local_adjust_effect_position_handles_visible
+            && self
+                .local_adjust_page_layers
+                .get(&fs_idx)
+                .and_then(|layers| layers.get(layer_idx))
+                .is_some_and(|layer| local_adjust_tilt_shift_range_create_pending(&layer.effect))
         {
             ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         } else if self.local_adjust_effect_position_handles_visible

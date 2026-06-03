@@ -339,6 +339,7 @@ pub(crate) enum LocalAdjustCanvasDragKind {
     LinearGradient,
     RadialGradient,
     EffectCenter,
+    TiltShiftRange,
     TiltShiftFocus,
     TiltShiftOuter,
     TiltShiftInnerX,
