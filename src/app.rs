@@ -1446,16 +1446,6 @@ pub(crate) enum AdjustSpreadTarget {
     Right,
 }
 
-/// 左側の画像補正パネルで現在表示しているツール。
-///
-/// `Adjustment` は従来の全体画像補正、`LocalAdjust` は補正レイヤーの最小 UI。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) enum AdjustmentPanelTool {
-    #[default]
-    Adjustment,
-    LocalAdjust,
-}
-
 /// 仮想フォルダ (PDF/ZIP) 進入時の親 catalog への write-back ターゲット。
 /// `start_loading_items` で仮想フォルダ用 catalog を開くタイミングで構築し、
 /// `poll_thumbnails` の finalize シグナル経路で発火する。
@@ -2959,8 +2949,8 @@ pub struct App {
     // ── 画像補正 ──────────────────────────────────────────────────
     /// 補正パネル表示フラグ (左パネルホバーで表示)
     pub(crate) adjustment_mode: bool,
-    /// 左側の補正パネル内で表示するツール。
-    pub(crate) adjustment_panel_tool: AdjustmentPanelTool,
+    /// 補正レイヤーの独立左パネル表示フラグ。
+    pub(crate) local_adjust_mode: bool,
     /// 見開き表示中に補正パネルが操作する側 (画面上の左/右)。Single 表示中は
     /// 参照されない。`open_fullscreen` / spread_mode 切替で Left にリセット。
     pub(crate) adjust_spread_target: AdjustSpreadTarget,
@@ -4176,7 +4166,7 @@ impl App {
 
             // 画像補正
             adjustment_mode: false,
-            adjustment_panel_tool: AdjustmentPanelTool::Adjustment,
+            local_adjust_mode: false,
             adjust_spread_target: AdjustSpreadTarget::Left,
             adjustment_page_params: std::collections::HashMap::new(),
             adjustment_favorite_params: std::collections::HashMap::new(),
@@ -8200,6 +8190,7 @@ impl App {
         self.adjustment_page_params.clear();
         self.adjustment_dragging = false;
         self.adjustment_mode = false;
+        self.local_adjust_mode = false;
         self.local_adjust_page_layers.clear();
         self.local_adjust_pages.clear();
         self.local_adjust_generation.clear();
@@ -16589,6 +16580,7 @@ impl App {
         }
         self.reset_erase_mode();
         self.reset_conceal_mode();
+        self.local_adjust_mode = false;
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
         self.conceal_cache.clear();
@@ -20621,7 +20613,7 @@ impl App {
     ///
     /// ON 時の副作用 (360 モードは機能制限モードなので、衝突する状態を抑止する):
     /// - スライドショー停止 (= 360 を見る間は次画像へ自動遷移しない)
-    /// - adjustment_mode / analysis_mode / erase_mode を OFF
+    /// - adjustment_mode / local_adjust_mode / analysis_mode / erase_mode を OFF
     /// - compare_view_mode を Off
     /// - show_metadata_panel は false に
     pub(crate) fn toggle_panorama_mode(&mut self, fs_idx: usize) {
@@ -20650,6 +20642,7 @@ impl App {
         // しておく。これらは 360 OFF 後にユーザーが再度有効化できる。
         self.slideshow_playing = false;
         self.adjustment_mode = false;
+        self.local_adjust_mode = false;
         self.analysis_mode = false;
         self.reset_erase_mode();
         self.compare_view_mode = crate::app::CompareViewMode::Off;

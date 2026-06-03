@@ -2019,6 +2019,11 @@ impl App {
                                     }
                                 }
                             }
+                        } else if self.local_adjust_mode
+                            && !compare_wipe_active
+                            && !panorama_mode_active_now
+                        {
+                            self.draw_local_adjust_panel(ctx, full_rect);
                         } else if adjustment_active {
                             // ── オーバーレイモード: 左パネル + 右パネル 同時表示 ──
                             // 描画と当たり判定で同じ rect を使う (adjustment_panel_rect 参照)。
@@ -2158,7 +2163,7 @@ impl App {
                                 is_spread_double,
                                 ai_upscale_info,
                                 &mut self.adjustment_mode,
-                                &mut self.adjustment_panel_tool,
+                                &mut self.local_adjust_mode,
                                 has_page_override,
                                 state.pdf_content_type,
                                 is_video_mode,
@@ -3074,6 +3079,13 @@ impl App {
             return self.handle_conceal_keys(ctx, fs_idx);
         }
 
+        if self.local_adjust_mode {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                self.local_adjust_mode = false;
+            }
+            return action;
+        }
+
         // 動画フルスクリーン中は専用キーマップ (Space=play/pause、Enter=play/pause、
         // Shift+Enter=外部プレイヤー、←→=シーク、↑↓=音量、M=mute、L=loop) を
         // 画像系のキー処理より先に走らせる。
@@ -3627,6 +3639,7 @@ impl App {
                 self.enter_analysis_mode_bypass();
                 // 補正パネルと排他
                 self.adjustment_mode = false;
+                self.local_adjust_mode = false;
             }
         }
         if self.analysis_mode && !is_spread_double {
@@ -4010,9 +4023,15 @@ impl App {
                             && p.y >= 60.0;
                         let in_erase_panel =
                             self.erase_mode && self.erase_panel_rect(full_rect).contains(p);
+                        let in_local_adjust_panel = self.local_adjust_mode
+                            && self.local_adjust_panel_rect(full_rect).contains(p);
                         let in_conceal_panel =
                             self.conceal_mode && self.conceal_panel_rect(full_rect).contains(p);
-                        in_right || in_left || in_erase_panel || in_conceal_panel
+                        in_right
+                            || in_left
+                            || in_erase_panel
+                            || in_local_adjust_panel
+                            || in_conceal_panel
                     })
                     .unwrap_or(false)
             });
@@ -4027,8 +4046,8 @@ impl App {
                 self.adjustment_mode = false;
             }
         } else if self.is_overlay_edit_mode_active() {
-            // 消しゴム / 隠蔽加工モード中は補正パネルを強制 OFF (ペイント中に色補正
-            // バーが画面端ホバーで開かないように)。
+            // 消しゴム / 補正レイヤー / 隠蔽加工モード中は補正パネルを強制 OFF
+            // (編集中に色補正バーが画面端ホバーで開かないように)。
             self.adjustment_mode = false;
         } else {
             let edge_hover = passive_hover_enabled
@@ -6940,7 +6959,7 @@ impl App {
         ai_upscale_info: Option<(&str, u32, u32)>,
         // 画像補正パネル表示トグル
         adjustment_mode: &mut bool,
-        adjustment_panel_tool: &mut crate::app::AdjustmentPanelTool,
+        local_adjust_mode: &mut bool,
         // 現在ページに個別補正が適用されているか (ボタン点灯用)
         has_page_override: bool,
         // PDF ページのコンテンツ種別 (非 PDF なら None)
@@ -7475,7 +7494,7 @@ impl App {
                 let opening = !*adjustment_mode;
                 *adjustment_mode = opening;
                 if opening {
-                    *adjustment_panel_tool = crate::app::AdjustmentPanelTool::Adjustment;
+                    *local_adjust_mode = false;
                 }
             }
             if resp.hovered() {

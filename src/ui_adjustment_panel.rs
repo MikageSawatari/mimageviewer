@@ -15,7 +15,7 @@
 use eframe::egui;
 
 use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
-use crate::app::{AdjustSpreadTarget, AdjustmentPanelTool, App};
+use crate::app::{AdjustSpreadTarget, App};
 use crate::ui_fullscreen::SpreadPair;
 
 const HEADER_H: f32 = 36.0;
@@ -33,6 +33,12 @@ const BODY_PAD_LEFT: f32 = 10.0;
 const BODY_PAD_RIGHT: f32 = 10.0;
 /// ScrollArea の縦バーが重なる分として、本文 widget 幅から差し引く余白。
 const BODY_SCROLLBAR_RESERVE: f32 = 14.0;
+/// 補正レイヤー独立パネルの幅。消しゴム / 隠蔽加工パネルと揃える。
+const LOCAL_ADJUST_PANEL_W: f32 = 200.0;
+const LOCAL_ADJUST_PANEL_MARGIN_X: f32 = 16.0;
+const LOCAL_ADJUST_PANEL_MARGIN_Y: f32 = 60.0;
+const LOCAL_ADJUST_PANEL_BOTTOM_MARGIN: f32 = 20.0;
+const LOCAL_ADJUST_PANEL_MIN_BODY_H: f32 = 120.0;
 
 #[derive(Debug, Clone, Copy)]
 enum QuickLocalAdjustEffect {
@@ -149,15 +155,7 @@ fn draw_local_adjust_section(
     delete_layer: &mut Option<usize>,
     clear_layers: &mut bool,
 ) {
-    ui.add_space(8.0);
-    ui.separator();
     ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new("補正レイヤー")
-            .size(11.0)
-            .color(LABEL_COLOR),
-    );
-    ui.add_space(2.0);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for effect in QuickLocalAdjustEffect::ALL {
@@ -246,6 +244,11 @@ fn draw_header_icon_button(
     } else {
         resp.on_hover_text("画像を開いているときのみ使用できます")
     }
+}
+
+fn local_adjust_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f32 {
+    (full_rect.max.y - panel_pos.y - LOCAL_ADJUST_PANEL_BOTTOM_MARGIN)
+        .max(LOCAL_ADJUST_PANEL_MIN_BODY_H + 40.0)
 }
 
 /// スライダーとリセットボタンを描画するヘルパー。
@@ -843,6 +846,241 @@ fn draw_sliders(
 }
 
 impl App {
+    /// 補正レイヤー独立パネルの矩形を返す。
+    pub(crate) fn local_adjust_panel_rect(&self, full_rect: egui::Rect) -> egui::Rect {
+        let panel_pos = egui::pos2(
+            full_rect.min.x + LOCAL_ADJUST_PANEL_MARGIN_X,
+            full_rect.min.y + LOCAL_ADJUST_PANEL_MARGIN_Y,
+        );
+        let h = local_adjust_panel_outer_height(full_rect, panel_pos);
+        egui::Rect::from_min_size(panel_pos, egui::vec2(LOCAL_ADJUST_PANEL_W, h))
+    }
+
+    fn apply_local_adjust_panel_actions(
+        &mut self,
+        fs_idx: usize,
+        add_effect: Option<QuickLocalAdjustEffect>,
+        set_enabled: Option<(usize, bool)>,
+        delete_layer: Option<usize>,
+        clear_layers: bool,
+    ) {
+        if let Some(effect) = add_effect {
+            let mut layers = self
+                .local_adjust_page_layers
+                .get(&fs_idx)
+                .cloned()
+                .unwrap_or_default();
+            layers.push(effect.layer());
+            self.set_local_adjust_layers_for_idx(fs_idx, layers);
+            self.show_feedback_toast(format!("補正レイヤーを追加: {}", effect.label()));
+        }
+        if let Some((layer_idx, enabled)) = set_enabled {
+            if let Some(mut layers) = self.local_adjust_page_layers.get(&fs_idx).cloned()
+                && let Some(layer) = layers.get_mut(layer_idx)
+            {
+                layer.enabled = enabled;
+                self.set_local_adjust_layers_for_idx(fs_idx, layers);
+                self.show_feedback_toast(if enabled {
+                    "補正レイヤーを有効化".to_string()
+                } else {
+                    "補正レイヤーを無効化".to_string()
+                });
+            }
+        }
+        if let Some(layer_idx) = delete_layer
+            && let Some(mut layers) = self.local_adjust_page_layers.get(&fs_idx).cloned()
+            && layer_idx < layers.len()
+        {
+            layers.remove(layer_idx);
+            self.set_local_adjust_layers_for_idx(fs_idx, layers);
+            self.show_feedback_toast("補正レイヤーを削除".to_string());
+        }
+        if clear_layers {
+            self.set_local_adjust_layers_for_idx(fs_idx, Vec::new());
+            self.show_feedback_toast("補正レイヤーをすべて削除".to_string());
+        }
+    }
+
+    /// 補正レイヤーの独立左パネルを描画する。
+    pub(crate) fn draw_local_adjust_panel(&mut self, ctx: &egui::Context, full_rect: egui::Rect) {
+        if !self.local_adjust_mode {
+            return;
+        }
+        let Some(fs_root_idx) = self.fullscreen_idx else {
+            return;
+        };
+
+        let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) =
+            match self.resolve_spread_pair(fs_root_idx) {
+                SpreadPair::Double { left, right } => {
+                    let target = match self.adjust_spread_target {
+                        AdjustSpreadTarget::Left => left,
+                        AdjustSpreadTarget::Right => right,
+                    };
+                    (target, Some((left, right)))
+                }
+                SpreadPair::Single => (fs_root_idx, None),
+            };
+        let layers = self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .cloned()
+            .unwrap_or_default();
+
+        let panel_pos = egui::pos2(
+            full_rect.min.x + LOCAL_ADJUST_PANEL_MARGIN_X,
+            full_rect.min.y + LOCAL_ADJUST_PANEL_MARGIN_Y,
+        );
+        let panel_h = local_adjust_panel_outer_height(full_rect, panel_pos);
+        let sink_rect = egui::Rect::from_min_size(
+            panel_pos,
+            egui::vec2(LOCAL_ADJUST_PANEL_W + 4.0, panel_h + 8.0),
+        );
+
+        let mut close_clicked = false;
+        let mut add_effect: Option<QuickLocalAdjustEffect> = None;
+        let mut set_enabled: Option<(usize, bool)> = None;
+        let mut delete_layer: Option<usize> = None;
+        let mut clear_layers = false;
+
+        egui::Area::new(egui::Id::new("local_adjust_panel"))
+            .fixed_pos(panel_pos)
+            .order(egui::Order::Foreground)
+            .interactable(true)
+            .show(ctx, |ui| {
+                ui.interact(
+                    sink_rect,
+                    egui::Id::new("local_adjust_panel_click_sink"),
+                    egui::Sense::click_and_drag(),
+                );
+                egui::Frame::popup(ui.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                    ))
+                    .corner_radius(6.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(LOCAL_ADJUST_PANEL_W);
+                        ui.set_max_width(LOCAL_ADJUST_PANEL_W);
+                        *ui.visuals_mut() = egui::Visuals::dark();
+                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("補正レイヤー")
+                                    .size(15.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let (close_rect, close_resp) = ui.allocate_exact_size(
+                                        egui::vec2(26.0, 22.0),
+                                        egui::Sense::click(),
+                                    );
+                                    let close_bg = if close_resp.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(220, 80, 80, 200)
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
+                                    };
+                                    ui.painter().rect_filled(close_rect, 4.0, close_bg);
+                                    crate::ui_fullscreen::draw_icons::draw_close_icon(
+                                        ui.painter(),
+                                        close_rect.center(),
+                                        8.0,
+                                    );
+                                    if close_resp.clicked() {
+                                        close_clicked = true;
+                                    }
+                                    close_resp.on_hover_text("閉じる");
+                                },
+                            );
+                        });
+                        ui.separator();
+
+                        let body_height = (full_rect.max.y
+                            - ui.cursor().top()
+                            - LOCAL_ADJUST_PANEL_BOTTOM_MARGIN)
+                            .max(LOCAL_ADJUST_PANEL_MIN_BODY_H);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(LOCAL_ADJUST_PANEL_W, body_height),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                ui.set_min_width(LOCAL_ADJUST_PANEL_W);
+                                ui.set_max_width(LOCAL_ADJUST_PANEL_W);
+                                ui.set_min_height(body_height);
+                                egui::ScrollArea::vertical()
+                                    .max_height(body_height)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(LOCAL_ADJUST_PANEL_W);
+                                        ui.set_max_width(LOCAL_ADJUST_PANEL_W);
+
+                                        if let Some((left, right)) = spread_lr {
+                                            ui.horizontal(|ui| {
+                                                let is_left = self.adjust_spread_target
+                                                    == AdjustSpreadTarget::Left;
+                                                if ui
+                                                    .selectable_label(is_left, "左ページ")
+                                                    .clicked()
+                                                {
+                                                    self.adjust_spread_target =
+                                                        AdjustSpreadTarget::Left;
+                                                }
+                                                if ui
+                                                    .selectable_label(!is_left, "右ページ")
+                                                    .clicked()
+                                                {
+                                                    self.adjust_spread_target =
+                                                        AdjustSpreadTarget::Right;
+                                                }
+                                            });
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "対象: {}",
+                                                    if fs_idx == left {
+                                                        "左ページ"
+                                                    } else if fs_idx == right {
+                                                        "右ページ"
+                                                    } else {
+                                                        "現在ページ"
+                                                    }
+                                                ))
+                                                .size(11.0)
+                                                .color(egui::Color32::from_gray(170)),
+                                            );
+                                            ui.add_space(4.0);
+                                        }
+
+                                        draw_local_adjust_section(
+                                            ui,
+                                            LOCAL_ADJUST_PANEL_W,
+                                            &layers,
+                                            &mut add_effect,
+                                            &mut set_enabled,
+                                            &mut delete_layer,
+                                            &mut clear_layers,
+                                        );
+                                    });
+                            },
+                        );
+                    });
+            });
+
+        if close_clicked {
+            self.local_adjust_mode = false;
+        }
+        self.apply_local_adjust_panel_actions(
+            fs_idx,
+            add_effect,
+            set_enabled,
+            delete_layer,
+            clear_layers,
+        );
+    }
+
     /// 左パネルの画像補正パネルを描画する。
     pub(crate) fn draw_adjustment_panel(
         &mut self,
@@ -889,22 +1127,18 @@ impl App {
         // ── ヘッダー ──
         // タイトルを左寄せにし、右側に処理順の入口
         // (消しゴム / 補正レイヤー / 隠蔽加工 / エクスポート) を並べる。
-        // 補正レイヤーだけはこの左パネル内の専用ビューへ切り替え、他 3 つは既存の
-        // 編集モード / 書き出しダイアログへ合流する。
+        // 補正レイヤーは消しゴム / 隠蔽加工と同じ独立左パネルとして開き、
+        // 他 3 つは既存の編集モード / 書き出しダイアログへ合流する。
         let header_rect =
             egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), HEADER_H));
         const HEADER_BTN_SIZE: f32 = 28.0;
         const HEADER_BTN_GAP: f32 = 4.0;
         const HEADER_RIGHT_PAD: f32 = 8.0;
-        let title = match self.adjustment_panel_tool {
-            AdjustmentPanelTool::Adjustment => "画像補正",
-            AdjustmentPanelTool::LocalAdjust => "補正レイヤー",
-        };
         // タイトル左寄せ (本文と同じ左余白、CENTER_Y 縦中央)
         child.painter().text(
             egui::pos2(header_rect.min.x + BODY_PAD_LEFT, header_rect.center().y),
             egui::Align2::LEFT_CENTER,
-            title,
+            "画像補正",
             egui::FontId::proportional(16.0),
             egui::Color32::WHITE,
         );
@@ -959,19 +1193,13 @@ impl App {
             activate_erase = true;
         }
 
-        let local_adjust_active = self.adjustment_panel_tool == AdjustmentPanelTool::LocalAdjust;
-        let local_adjust_tooltip = if local_adjust_active {
-            "補正レイヤー (クリックで画像補正へ戻る)"
-        } else {
-            "補正レイヤー"
-        };
         let local_adjust_resp = draw_header_icon_button(
             &mut child,
             local_adjust_rect,
             "adjust_panel_local_adjust_btn",
             can_overlay_edit,
-            local_adjust_active,
-            local_adjust_tooltip,
+            false,
+            "補正レイヤー",
             crate::ui_fullscreen::draw_icons::draw_local_adjust_icon,
         );
         if can_overlay_edit && local_adjust_resp.clicked() {
@@ -1009,11 +1237,9 @@ impl App {
         // と整合させるためにも必要)。`enter_*_mode` 自身が必要なキャッシュ初期化と
         // post_filter バイパスを行うので、ここでは flag を倒すだけで十分。
         if activate_local_adjust {
-            self.adjustment_panel_tool = if local_adjust_active {
-                AdjustmentPanelTool::Adjustment
-            } else {
-                AdjustmentPanelTool::LocalAdjust
-            };
+            self.adjustment_mode = false;
+            self.local_adjust_mode = true;
+            return;
         }
         if activate_erase {
             self.adjustment_mode = false;
@@ -1065,10 +1291,6 @@ impl App {
         let mut clear_page_clicked = false;
         let mut save_to_slot: Option<usize> = None;
         let mut load_from_slot: Option<usize> = None;
-        let mut add_local_adjust_effect: Option<QuickLocalAdjustEffect> = None;
-        let mut set_local_adjust_enabled: Option<(usize, bool)> = None;
-        let mut delete_local_adjust_layer: Option<usize> = None;
-        let mut clear_local_adjust_layers = false;
 
         // 編集対象ページを含むお気に入り (なければ None)。
         let fav_info = self
@@ -1115,11 +1337,6 @@ impl App {
         // 現在の有効パラメータを取得して編集用コピーを作る
         let mut edit_params = self.effective_params(fs_idx).clone();
         let original = edit_params.clone();
-        let local_adjust_layers = self
-            .local_adjust_page_layers
-            .get(&fs_idx)
-            .cloned()
-            .unwrap_or_default();
 
         // しきい値以上ならスキップされる → その場合は「無効」を UI に反映する
         let ai_denoise_disabled_threshold = match image_dims {
@@ -1190,19 +1407,6 @@ impl App {
                                 }
                             });
                             ui.add_space(2.0);
-                        }
-
-                        if self.adjustment_panel_tool == AdjustmentPanelTool::LocalAdjust {
-                            draw_local_adjust_section(
-                                ui,
-                                content_width,
-                                &local_adjust_layers,
-                                &mut add_local_adjust_effect,
-                                &mut set_local_adjust_enabled,
-                                &mut delete_local_adjust_layer,
-                                &mut clear_local_adjust_layers,
-                            );
-                            return (false, false);
                         }
 
                         // ── スコープ表示 ──
@@ -1485,43 +1689,6 @@ impl App {
             });
             self.show_feedback_toast("個別設定を解除".to_string());
         }
-        if let Some(effect) = add_local_adjust_effect {
-            let mut layers = self
-                .local_adjust_page_layers
-                .get(&fs_idx)
-                .cloned()
-                .unwrap_or_default();
-            layers.push(effect.layer());
-            self.set_local_adjust_layers_for_idx(fs_idx, layers);
-            self.show_feedback_toast(format!("補正レイヤーを追加: {}", effect.label()));
-        }
-        if let Some((layer_idx, enabled)) = set_local_adjust_enabled {
-            if let Some(mut layers) = self.local_adjust_page_layers.get(&fs_idx).cloned() {
-                if let Some(layer) = layers.get_mut(layer_idx) {
-                    layer.enabled = enabled;
-                    self.set_local_adjust_layers_for_idx(fs_idx, layers);
-                    self.show_feedback_toast(if enabled {
-                        "補正レイヤーを有効化".to_string()
-                    } else {
-                        "補正レイヤーを無効化".to_string()
-                    });
-                }
-            }
-        }
-        if let Some(layer_idx) = delete_local_adjust_layer {
-            if let Some(mut layers) = self.local_adjust_page_layers.get(&fs_idx).cloned() {
-                if layer_idx < layers.len() {
-                    layers.remove(layer_idx);
-                    self.set_local_adjust_layers_for_idx(fs_idx, layers);
-                    self.show_feedback_toast("補正レイヤーを削除".to_string());
-                }
-            }
-        }
-        if clear_local_adjust_layers {
-            self.set_local_adjust_layers_for_idx(fs_idx, Vec::new());
-            self.show_feedback_toast("補正レイヤーをすべて削除".to_string());
-        }
-
         // ── 保存スロット: ダイアログで名称を入力 ──
         if let Some(slot_idx) = save_to_slot {
             // 既存スロットがあればその名前を初期値に、なければ空で開く
