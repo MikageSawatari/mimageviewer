@@ -2356,6 +2356,7 @@ impl App {
                                 let rot = self.get_rotation(idx);
                                 let has_page_override =
                                     self.adjustment_page_params.contains_key(&idx);
+                                let has_local_adjust = self.local_adjust_pages.contains(&idx);
                                 let has_mask = self.mask_pages.contains(&idx);
                                 let has_conceal = self.conceal_pages.contains(&idx);
                                 let rating = self.get_rating(idx);
@@ -2402,6 +2403,7 @@ impl App {
                                     self.selected == Some(idx),
                                     self.checked.contains(&idx),
                                     has_page_override,
+                                    has_local_adjust,
                                     has_mask,
                                     has_conceal,
                                     rating,

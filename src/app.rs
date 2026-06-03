@@ -17700,6 +17700,34 @@ impl App {
 
     // ── local_adjust_cache / conceal_cache の世代管理 + invalidate ヘルパー ──
 
+    /// 指定 idx の補正レイヤー配列を DB と in-memory state に反映する。
+    /// 空配列は「補正レイヤーなし」として DB からも削除する。
+    pub(crate) fn set_local_adjust_layers_for_idx(
+        &mut self,
+        idx: usize,
+        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    ) {
+        let key = match self.page_path_key(idx) {
+            Some(key) => key,
+            None => return,
+        };
+        if let Some(db) = &self.local_adjust_db {
+            if let Err(err) = db.set_layers(&key, &layers) {
+                crate::logger::log(format!(
+                    "local_adjust: failed to save layers idx={idx} error={err}"
+                ));
+            }
+        }
+        if layers.is_empty() {
+            self.local_adjust_page_layers.remove(&idx);
+            self.local_adjust_pages.remove(&idx);
+        } else {
+            self.local_adjust_page_layers.insert(idx, layers);
+            self.local_adjust_pages.insert(idx);
+        }
+        self.bump_local_adjust_generation(idx);
+    }
+
     /// 現在の input / erase mask / local adjust 世代から、補正レイヤー cache key を作る。
     pub(crate) fn current_local_adjust_key(&self, idx: usize) -> LocalAdjustResultKey {
         LocalAdjustResultKey {
@@ -17730,7 +17758,6 @@ impl App {
     }
 
     /// 補正レイヤーが変わったことを idx 単位の世代で表す。
-    #[allow(dead_code)]
     pub(crate) fn bump_local_adjust_generation(&mut self, idx: usize) {
         let slot = self.local_adjust_generation.entry(idx).or_insert(0);
         *slot = slot.wrapping_add(1);
@@ -25319,6 +25346,7 @@ pub(crate) fn draw_cell(
     is_selected: bool,
     is_checked: bool,
     has_page_override: bool, // true なら左上に補正済みバッジ「補」を表示
+    has_local_adjust: bool,  // true なら左上に補正レイヤーバッジ「局」を表示
     has_mask: bool,          // true なら左上に消しゴムマスクバッジ「消」を表示
     has_conceal: bool,       // true なら左上に隠蔽加工マスクバッジ「隠」を表示 (Phase 4)
     rating: u8,              // 0 = 非表示, 1-5 = ★バッジ
@@ -25736,8 +25764,9 @@ pub(crate) fn draw_cell(
         );
     }
 
-    // 左上バッジ列: 補 (ページ個別補正) → 消 (消しゴムマスク) → 📌(金、pin)
-    // → タグバッジ。横並びで、収まらなければ末尾省略。
+    // 左上バッジ列: 補 (ページ個別補正) → 局 (補正レイヤー) →
+    // 消 (消しゴムマスク) → 📌(金、pin) → タグバッジ。
+    // 横並びで、収まらなければ末尾省略。
     {
         let font = egui::FontId::proportional(11.0);
         let pad_x = 4.0;
@@ -25760,6 +25789,13 @@ pub(crate) fn draw_cell(
             draw_single_char_badge(
                 "補",
                 egui::Color32::from_rgb(50, 120, 220),
+                egui::Color32::WHITE,
+            );
+        }
+        if has_local_adjust {
+            draw_single_char_badge(
+                "局",
+                egui::Color32::from_rgb(60, 150, 130),
                 egui::Color32::WHITE,
             );
         }

@@ -637,6 +637,10 @@ pub enum LocalEffect {
 }
 
 impl LocalEffect {
+    pub fn display_label(&self) -> &'static str {
+        self.progress_label()
+    }
+
     fn progress_label(&self) -> &'static str {
         match self {
             Self::None => "効果なし",

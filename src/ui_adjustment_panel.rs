@@ -34,6 +34,192 @@ const BODY_PAD_RIGHT: f32 = 10.0;
 /// ScrollArea の縦バーが重なる分として、本文 widget 幅から差し引く余白。
 const BODY_SCROLLBAR_RESERVE: f32 = 14.0;
 
+#[derive(Debug, Clone, Copy)]
+enum QuickLocalAdjustEffect {
+    Vibrance,
+    WarmPhotoFilter,
+    MonochromeMixer,
+    SoftBlur,
+    Sharpen,
+    Vignette,
+    CrtDisplay,
+    Anaglyph3d,
+}
+
+impl QuickLocalAdjustEffect {
+    const ALL: [Self; 8] = [
+        Self::Vibrance,
+        Self::WarmPhotoFilter,
+        Self::MonochromeMixer,
+        Self::SoftBlur,
+        Self::Sharpen,
+        Self::Vignette,
+        Self::CrtDisplay,
+        Self::Anaglyph3d,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Vibrance => "自然な彩度",
+            Self::WarmPhotoFilter => "暖色フィルター",
+            Self::MonochromeMixer => "白黒ミキサー",
+            Self::SoftBlur => "ソフトぼかし",
+            Self::Sharpen => "シャープ",
+            Self::Vignette => "ビネット",
+            Self::CrtDisplay => "CRT表示",
+            Self::Anaglyph3d => "アナグリフ3D",
+        }
+    }
+
+    fn effect(self) -> local_adjust_core::LocalEffect {
+        match self {
+            Self::Vibrance => local_adjust_core::LocalEffect::Tone(local_adjust_core::ToneParams {
+                vibrance: 55.0,
+                saturation: 8.0,
+                ..Default::default()
+            }),
+            Self::WarmPhotoFilter => {
+                local_adjust_core::LocalEffect::PhotoFilter(local_adjust_core::PhotoFilterParams {
+                    preset: local_adjust_core::PhotoFilterPreset::Warm85,
+                    density: 0.45,
+                    preserve_luminosity: true,
+                    strength: 1.0,
+                    ..Default::default()
+                })
+            }
+            Self::MonochromeMixer => local_adjust_core::LocalEffect::MonochromeMixer(
+                local_adjust_core::MonochromeMixerParams {
+                    red: 10.0,
+                    yellow: 18.0,
+                    green: 12.0,
+                    cyan: 0.0,
+                    blue: -8.0,
+                    magenta: 0.0,
+                    contrast: 14.0,
+                    strength: 1.0,
+                    ..Default::default()
+                },
+            ),
+            Self::SoftBlur => local_adjust_core::LocalEffect::Blur(local_adjust_core::BlurParams {
+                radius_px: 4.0,
+            }),
+            Self::Sharpen => {
+                local_adjust_core::LocalEffect::Sharpen(local_adjust_core::SharpenParams {
+                    amount: 1.0,
+                    radius_px: 1.0,
+                    threshold: 0.02,
+                })
+            }
+            Self::Vignette => {
+                local_adjust_core::LocalEffect::Vignette(local_adjust_core::VignetteParams {
+                    strength: 0.55,
+                    radius: 0.58,
+                    feather: 0.38,
+                })
+            }
+            Self::CrtDisplay => local_adjust_core::LocalEffect::CrtDisplay(
+                local_adjust_core::CrtDisplayParams::preset(
+                    local_adjust_core::CrtDisplayMode::Simple,
+                ),
+            ),
+            Self::Anaglyph3d => {
+                local_adjust_core::LocalEffect::Anaglyph3d(local_adjust_core::AnaglyphParams {
+                    strength: 0.85,
+                    ..Default::default()
+                })
+            }
+        }
+    }
+
+    fn layer(self) -> local_adjust_core::LocalAdjustmentLayer {
+        local_adjust_core::LocalAdjustmentLayer::new(
+            self.label(),
+            local_adjust_core::LocalMask::Full,
+            self.effect(),
+        )
+    }
+}
+
+fn draw_local_adjust_section(
+    ui: &mut egui::Ui,
+    content_width: f32,
+    layers: &[local_adjust_core::LocalAdjustmentLayer],
+    add_effect: &mut Option<QuickLocalAdjustEffect>,
+    set_enabled: &mut Option<(usize, bool)>,
+    delete_layer: &mut Option<usize>,
+    clear_layers: &mut bool,
+) {
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("補正レイヤー")
+            .size(11.0)
+            .color(LABEL_COLOR),
+    );
+    ui.add_space(2.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for effect in QuickLocalAdjustEffect::ALL {
+            if ui
+                .small_button(effect.label())
+                .on_hover_text("画像全体に適用する補正レイヤーを追加")
+                .clicked()
+            {
+                *add_effect = Some(effect);
+            }
+        }
+    });
+    ui.add_space(4.0);
+
+    if layers.is_empty() {
+        ui.label(
+            egui::RichText::new("このページには補正レイヤーがありません")
+                .size(11.0)
+                .color(egui::Color32::from_gray(170)),
+        );
+        return;
+    }
+
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let mut enabled = layer.enabled;
+            if ui.checkbox(&mut enabled, "").changed() {
+                *set_enabled = Some((layer_idx, enabled));
+            }
+            let name = crate::ui_helpers::truncate_name(&layer.name, 12);
+            let label = format!("{}: {}", layer_idx + 1, name);
+            let label_resp = ui.add_sized(
+                egui::vec2((content_width - 68.0).max(80.0), 18.0),
+                egui::Label::new(
+                    egui::RichText::new(label)
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(220)),
+                ),
+            );
+            label_resp.on_hover_text(format!(
+                "{} / opacity {:.0}%",
+                layer.effect.display_label(),
+                layer.opacity * 100.0
+            ));
+            if ui.small_button("削除").clicked() {
+                *delete_layer = Some(layer_idx);
+            }
+        });
+    }
+
+    if ui
+        .add(
+            egui::Button::new("補正レイヤーをすべて削除").min_size(egui::vec2(content_width, 22.0)),
+        )
+        .on_hover_text("このページの補正レイヤーをすべて削除")
+        .clicked()
+    {
+        *clear_layers = true;
+    }
+}
+
 /// スライダーとリセットボタンを描画するヘルパー。
 /// リセットボタン（↩）をクリックするとデフォルト値に戻す。
 macro_rules! slider_with_reset {
@@ -874,6 +1060,10 @@ impl App {
         let mut clear_page_clicked = false;
         let mut save_to_slot: Option<usize> = None;
         let mut load_from_slot: Option<usize> = None;
+        let mut add_local_adjust_effect: Option<QuickLocalAdjustEffect> = None;
+        let mut set_local_adjust_enabled: Option<(usize, bool)> = None;
+        let mut delete_local_adjust_layer: Option<usize> = None;
+        let mut clear_local_adjust_layers = false;
 
         // 編集対象ページを含むお気に入り (なければ None)。
         let fav_info = self
@@ -920,6 +1110,11 @@ impl App {
         // 現在の有効パラメータを取得して編集用コピーを作る
         let mut edit_params = self.effective_params(fs_idx).clone();
         let original = edit_params.clone();
+        let local_adjust_layers = self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .cloned()
+            .unwrap_or_default();
 
         // しきい値以上ならスキップされる → その場合は「無効」を UI に反映する
         let ai_denoise_disabled_threshold = match image_dims {
@@ -1076,6 +1271,16 @@ impl App {
                             &mut edit_params,
                             ai_denoise_disabled_threshold,
                             ai_upscale_disabled_threshold,
+                        );
+
+                        draw_local_adjust_section(
+                            ui,
+                            content_width,
+                            &local_adjust_layers,
+                            &mut add_local_adjust_effect,
+                            &mut set_local_adjust_enabled,
+                            &mut delete_local_adjust_layer,
+                            &mut clear_local_adjust_layers,
                         );
 
                         // ── 保存スロット (5x2 grid) ──
@@ -1271,6 +1476,42 @@ impl App {
                 app.clear_page_params(fs_idx)
             });
             self.show_feedback_toast("個別設定を解除".to_string());
+        }
+        if let Some(effect) = add_local_adjust_effect {
+            let mut layers = self
+                .local_adjust_page_layers
+                .get(&fs_idx)
+                .cloned()
+                .unwrap_or_default();
+            layers.push(effect.layer());
+            self.set_local_adjust_layers_for_idx(fs_idx, layers);
+            self.show_feedback_toast(format!("補正レイヤーを追加: {}", effect.label()));
+        }
+        if let Some((layer_idx, enabled)) = set_local_adjust_enabled {
+            if let Some(mut layers) = self.local_adjust_page_layers.get(&fs_idx).cloned() {
+                if let Some(layer) = layers.get_mut(layer_idx) {
+                    layer.enabled = enabled;
+                    self.set_local_adjust_layers_for_idx(fs_idx, layers);
+                    self.show_feedback_toast(if enabled {
+                        "補正レイヤーを有効化".to_string()
+                    } else {
+                        "補正レイヤーを無効化".to_string()
+                    });
+                }
+            }
+        }
+        if let Some(layer_idx) = delete_local_adjust_layer {
+            if let Some(mut layers) = self.local_adjust_page_layers.get(&fs_idx).cloned() {
+                if layer_idx < layers.len() {
+                    layers.remove(layer_idx);
+                    self.set_local_adjust_layers_for_idx(fs_idx, layers);
+                    self.show_feedback_toast("補正レイヤーを削除".to_string());
+                }
+            }
+        }
+        if clear_local_adjust_layers {
+            self.set_local_adjust_layers_for_idx(fs_idx, Vec::new());
+            self.show_feedback_toast("補正レイヤーをすべて削除".to_string());
         }
 
         // ── 保存スロット: ダイアログで名称を入力 ──
