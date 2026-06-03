@@ -13,7 +13,7 @@ use eframe::egui;
 use image::ImageEncoder;
 use serde_json::json;
 
-use crate::app::{App, EraseResultKey};
+use crate::app::{App, EraseResultKey, LocalAdjustResultKey};
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::GridItem;
 
@@ -44,8 +44,10 @@ struct PipelineDebugPageWork {
     path_key: Option<String>,
     input_generation: u64,
     erase_mask_generation: u64,
+    local_adjust_generation: u64,
     conceal_mask_generation: u64,
     current_erase_key: EraseResultKey,
+    current_local_adjust_key: LocalAdjustResultKey,
     post_filter: String,
     notes: Vec<String>,
     stages: Vec<PipelineDebugStageWork>,
@@ -70,6 +72,12 @@ enum PipelineDebugStageWork {
         source: Arc<egui::ColorImage>,
         params: crate::adjustment::AdjustParams,
         force_black_flatten: bool,
+    },
+    LocalAdjustCompose {
+        name: String,
+        note: String,
+        source: Arc<egui::ColorImage>,
+        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
     },
     ConcealCompose {
         name: String,
@@ -253,8 +261,10 @@ impl App {
             path_key: self.page_path_key(idx),
             input_generation: self.input_generation.get(&idx).copied().unwrap_or(0),
             erase_mask_generation: self.erase_mask_generation.get(&idx).copied().unwrap_or(0),
+            local_adjust_generation: self.local_adjust_generation.get(&idx).copied().unwrap_or(0),
             conceal_mask_generation: self.conceal_mask_generation.get(&idx).copied().unwrap_or(0),
             current_erase_key: self.current_erase_result_key(idx),
+            current_local_adjust_key: self.current_local_adjust_key(idx),
             post_filter: format!("{:?}", self.effective_params(idx).post_filter),
             notes: Vec::new(),
             stages: Vec::new(),
@@ -264,6 +274,7 @@ impl App {
         self.add_ai_stages(idx, &mut page);
         self.add_adjustment_stages(idx, &mut page);
         self.add_erase_stages(idx, &mut page);
+        self.add_local_adjust_stages(idx, &mut page);
         self.add_conceal_stages(idx, &mut page);
         page
     }
@@ -465,6 +476,97 @@ impl App {
                     key.input_gen,
                     key.mask_gen,
                     key == page.current_erase_key
+                ),
+                pixels,
+            );
+        }
+    }
+
+    fn add_local_adjust_stages(&self, idx: usize, page: &mut PipelineDebugPageWork) {
+        let layers = self
+            .local_adjust_page_layers
+            .get(&idx)
+            .cloned()
+            .unwrap_or_default();
+        if layers.is_empty() {
+            page.push_missing("55_local_adjust_layers", "no local adjustment layers");
+        } else {
+            let active_count = layers
+                .iter()
+                .filter(|layer| layer.enabled && layer.opacity > 0.0)
+                .count();
+            page.push_missing(
+                "55_local_adjust_layers",
+                &format!("{} layers loaded, {} active", layers.len(), active_count),
+            );
+        }
+
+        let local_source = self.current_local_adjust_source_pixels(idx);
+        if let Some(source) = local_source.as_ref() {
+            page.push_image(
+                "56_local_adjust_source_current",
+                "current source for local adjustment render",
+                Arc::clone(source),
+            );
+        } else if self.has_active_local_adjust_layers(idx) {
+            page.push_missing(
+                "56_local_adjust_source_current",
+                "active local adjustment layers exist but source is not ready",
+            );
+        } else {
+            page.push_missing(
+                "56_local_adjust_source_current",
+                "no active local adjustment layers",
+            );
+        }
+
+        if let Some(source) = local_source
+            && self.has_active_local_adjust_layers(idx)
+        {
+            page.stages
+                .push(PipelineDebugStageWork::LocalAdjustCompose {
+                    name: "57_local_adjust_recomputed".to_string(),
+                    note: "worker recomposition from current local adjustment source".to_string(),
+                    source,
+                    layers: layers.clone(),
+                });
+        } else {
+            page.push_missing(
+                "57_local_adjust_recomputed",
+                "no active local adjustment source to recompute",
+            );
+        }
+
+        let mut entries = self
+            .local_adjust_cache
+            .iter()
+            .filter(|(key, _)| key.idx == idx)
+            .map(|(key, entry)| (*key, Arc::clone(&entry.pixels)))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(key, _)| (key.input_gen, key.erase_mask_gen, key.local_gen));
+        if entries.is_empty() {
+            page.push_missing(
+                "58_local_adjust_cache",
+                "local_adjust_cache has no entry for idx",
+            );
+        }
+        for (key, pixels) in entries {
+            let name = if key == page.current_local_adjust_key {
+                "58_local_adjust_current".to_string()
+            } else {
+                format!(
+                    "58_local_adjust_stale_input{}_mask{}_local{}",
+                    key.input_gen, key.erase_mask_gen, key.local_gen
+                )
+            };
+            page.push_image(
+                &name,
+                &format!(
+                    "local_adjust_cache key input_gen={} erase_mask_gen={} local_gen={} current={}",
+                    key.input_gen,
+                    key.erase_mask_gen,
+                    key.local_gen,
+                    key == page.current_local_adjust_key
                 ),
                 pixels,
             );
@@ -760,6 +862,44 @@ fn run_pipeline_debug_export(
                         missing: false,
                     }
                 }
+                PipelineDebugStageWork::LocalAdjustCompose {
+                    name,
+                    note,
+                    source,
+                    layers,
+                } => {
+                    let rgba = crate::capture::color_image_to_rgba(&source);
+                    let src = local_adjust_core::RgbaImageRef {
+                        width: source.size[0],
+                        height: source.size[1],
+                        pixels: &rgba,
+                    };
+                    match local_adjust_core::apply_layers(src, &layers) {
+                        Ok(output) => {
+                            let image = egui::ColorImage::from_rgba_unmultiplied(
+                                [output.width, output.height],
+                                &output.pixels,
+                            );
+                            let file = format!("{name}.png");
+                            save_color_image_png(&image, &page_dir.join(&file))?;
+                            written_count += 1;
+                            SavedStage {
+                                name,
+                                file: Some(format!("{}/{}", page.dir_name, file)),
+                                size: Some(image.size),
+                                note,
+                                missing: false,
+                            }
+                        }
+                        Err(err) => SavedStage {
+                            name,
+                            file: None,
+                            size: Some(source.size),
+                            note: format!("{note}; local adjustment recompute failed: {err}"),
+                            missing: true,
+                        },
+                    }
+                }
                 PipelineDebugStageWork::ConcealCompose {
                     name,
                     note,
@@ -822,18 +962,25 @@ fn run_pipeline_debug_export(
         manifest_pages.push(json!({
             "idx": page.idx,
             "item": page.item,
-            "path_key": page.path_key,
-            "input_generation": page.input_generation,
-            "erase_mask_generation": page.erase_mask_generation,
-            "conceal_mask_generation": page.conceal_mask_generation,
-            "current_erase_key": {
-                "idx": page.current_erase_key.idx,
-                "input_gen": page.current_erase_key.input_gen,
-                "mask_gen": page.current_erase_key.mask_gen,
-            },
-            "post_filter": page.post_filter,
-            "notes": page.notes,
-            "stages": manifest_stages,
+                "path_key": page.path_key,
+                "input_generation": page.input_generation,
+                "erase_mask_generation": page.erase_mask_generation,
+                "local_adjust_generation": page.local_adjust_generation,
+                "conceal_mask_generation": page.conceal_mask_generation,
+                "current_erase_key": {
+                    "idx": page.current_erase_key.idx,
+                    "input_gen": page.current_erase_key.input_gen,
+                    "mask_gen": page.current_erase_key.mask_gen,
+                },
+                "current_local_adjust_key": {
+                    "idx": page.current_local_adjust_key.idx,
+                    "input_gen": page.current_local_adjust_key.input_gen,
+                    "erase_mask_gen": page.current_local_adjust_key.erase_mask_gen,
+                    "local_gen": page.current_local_adjust_key.local_gen,
+                },
+                "post_filter": page.post_filter,
+                "notes": page.notes,
+                "stages": manifest_stages,
         }));
     }
 

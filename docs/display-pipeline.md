@@ -359,7 +359,8 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 単ページ、見開き、ルーペなどが `adjustment_cache → fs_cache` のような独自チェーンを
 再実装すると、新しい派生レイヤ (消しゴム / 隠蔽加工 / AI など) の横展開漏れが起きる。
 保存・比較・クリップボードのようなピクセル出力経路も、`prepare_capture_pixel_job` で
-同じ順序の base pixels を選び、隠蔽加工は capture worker 側で合成する。
+同じ順序の base pixels を選び、隠蔽加工は capture worker 側で合成する。補正レイヤーが
+有効だが `local_adjust_cache` がまだ無い場合、古い結果や下位画像は保存せず、完了後の再実行を促す。
 
 右 Ctrl ホールドの元画像プレビューは例外的な一時表示で、派生キャッシュは作り直さない。
 通常の画像 / ZIP 内画像 / PDF ページだけを対象にし、動画には適用しない。表示元は常に
@@ -371,7 +372,8 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 フルスクリーン表示中に `Ctrl+Alt+Shift+D` を押すと、現在表示中ページ (見開き時は左右
 ページ) のパイプライン段階を `%APPDATA%\mimageviewer\debug-pipeline\...` へ出力する。
 PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行い、`manifest.json`
-に `input_generation` / `erase_mask_generation` / `conceal_mask_generation`、各 stage の
+に `input_generation` / `erase_mask_generation` / `local_adjust_generation` /
+`conceal_mask_generation`、各 stage の
 有無、欠落理由、出力ファイル名を記録する。消しゴム・隠蔽加工モード中でも、通常
 ショートカットより先にこのキーだけを処理する。
 
@@ -464,6 +466,8 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 - **補正レイヤー**: `local-adjust-render` worker で `local-adjust-core` を適用し、
   `local_adjust_cache` に載せる。生成中は古い補正レイヤー結果を使わず、
   `erase_result_cache > adjustment_cache > ai_upscale_cache > fs_cache` の下位画像を表示する。
+  Ctrl+E / キャプチャ保存では、補正レイヤーが有効なページは `local_adjust_cache` 完了後だけ
+  出力対象にする。
   消しゴムの preview / apply / ensure-result 入力はこの表示用 bypass に引きずられず、
   最終表示順どおり post-filter 適用後の画像を使う。
 - **AI アップスケール/デノイズ**: 別スレッドで推論。完了時に `ai_upscale_cache` に格納。

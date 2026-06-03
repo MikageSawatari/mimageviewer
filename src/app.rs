@@ -17792,7 +17792,20 @@ impl App {
             .then(|| layers.clone())
     }
 
-    fn current_local_adjust_source_pixels(&self, idx: usize) -> Option<Arc<egui::ColorImage>> {
+    pub(crate) fn has_active_local_adjust_layers(&self, idx: usize) -> bool {
+        self.local_adjust_page_layers
+            .get(&idx)
+            .is_some_and(|layers| {
+                layers
+                    .iter()
+                    .any(|layer| layer.enabled && layer.opacity > 0.0)
+            })
+    }
+
+    pub(crate) fn current_local_adjust_source_pixels(
+        &self,
+        idx: usize,
+    ) -> Option<Arc<egui::ColorImage>> {
         if let Some(pixels) = self.current_erase_result_pixels(idx) {
             return Some(pixels);
         }

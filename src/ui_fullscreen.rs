@@ -8439,14 +8439,24 @@ impl App {
             .capture_basename_for_idx(idx)
             .ok_or_else(|| "このアイテムはキャプチャ保存できません".to_string())?;
 
-        if let Some(pixels) = self.current_erase_result_pixels(idx) {
+        if let Some(pixels) = self.current_local_adjust_pixels(idx) {
             return Ok(self.capture_job_with_conceal(
                 idx,
                 crate::capture::CapturePixelJob::already_adjusted(basename, pixels.clone()),
             ));
         }
-        if self.mask_pages.contains(&idx) {
+        if self.mask_pages.contains(&idx) && self.current_erase_result_pixels(idx).is_none() {
             return Err("消しゴム補完の完了後に再実行してください".to_string());
+        }
+        if self.has_active_local_adjust_layers(idx) {
+            return Err("補正レイヤーの反映完了後に再実行してください".to_string());
+        }
+
+        if let Some(pixels) = self.current_erase_result_pixels(idx) {
+            return Ok(self.capture_job_with_conceal(
+                idx,
+                crate::capture::CapturePixelJob::already_adjusted(basename, pixels.clone()),
+            ));
         }
 
         if !self.post_filter_bypassed
@@ -8611,6 +8621,7 @@ impl App {
         idx: usize,
     ) -> Result<ExportDialogTarget, String> {
         self.ensure_export_erase_ready(ctx, &[idx])?;
+        self.ensure_export_local_adjust_ready(ctx, &[idx])?;
         let (source, source_label, original_format, source_dir, basename) =
             self.export_source_info_for_idx(idx)?;
         let pixels = self.export_page_pixels_for_idx(idx)?;
@@ -8631,6 +8642,7 @@ impl App {
         right_idx: usize,
     ) -> Result<ExportDialogTarget, String> {
         self.ensure_export_erase_ready(ctx, &[left_idx, right_idx])?;
+        self.ensure_export_local_adjust_ready(ctx, &[left_idx, right_idx])?;
         let (_, left_label, _, left_dir, left_basename) =
             self.export_source_info_for_idx(left_idx)?;
         let (_, right_label, _, _, right_basename) = self.export_source_info_for_idx(right_idx)?;
@@ -8671,6 +8683,26 @@ impl App {
                 if self.current_erase_result_pixels(idx).is_none() {
                     return Err(
                         "消しゴム補完の準備中です。少し待ってから Ctrl+E を再実行してください"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_export_local_adjust_ready(
+        &mut self,
+        ctx: &egui::Context,
+        indices: &[usize],
+    ) -> Result<(), String> {
+        for &idx in indices {
+            if self.has_active_local_adjust_layers(idx) {
+                self.maybe_start_local_adjust_render(idx);
+                if self.current_local_adjust_pixels(idx).is_none() {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                    return Err(
+                        "補正レイヤーの反映中です。少し待ってから Ctrl+E を再実行してください"
                             .to_string(),
                     );
                 }
@@ -9267,6 +9299,16 @@ impl App {
     }
 
     fn resolve_export_base_pixels(&self, idx: usize) -> Result<Arc<egui::ColorImage>, String> {
+        if let Some(pixels) = self.current_local_adjust_pixels(idx) {
+            return Ok(pixels);
+        }
+        if self.mask_pages.contains(&idx) && self.current_erase_result_pixels(idx).is_none() {
+            return Err("消しゴム補完の完了後にエクスポートしてください".to_string());
+        }
+        if self.has_active_local_adjust_layers(idx) {
+            return Err("補正レイヤーの反映完了後にエクスポートしてください".to_string());
+        }
+
         if let Some(pixels) = self.current_erase_result_pixels(idx) {
             return Ok(pixels);
         }
