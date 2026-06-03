@@ -5358,6 +5358,57 @@ mod pipeline_display_edit_split_tests {
         );
     }
 
+    fn insert_current_erase_result(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+        color: egui::Color32,
+    ) -> Arc<egui::ColorImage> {
+        let image = egui::ColorImage::new([1, 1], vec![color]);
+        let pixels = Arc::new(image.clone());
+        let tex = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
+        app.erase_result_cache.insert(
+            app.current_erase_result_key(idx),
+            EraseResultCacheEntry {
+                pixels: Arc::clone(&pixels),
+                texture: tex,
+            },
+        );
+        pixels
+    }
+
+    fn active_tone_layer() -> local_adjust_core::LocalAdjustmentLayer {
+        local_adjust_core::LocalAdjustmentLayer::new(
+            "tone",
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::Tone(local_adjust_core::ToneParams {
+                brightness: 12.0,
+                ..Default::default()
+            }),
+        )
+    }
+
+    fn insert_current_local_adjust_result(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+        color: egui::Color32,
+    ) -> Arc<egui::ColorImage> {
+        let image = egui::ColorImage::new([1, 1], vec![color]);
+        let pixels = Arc::new(image.clone());
+        let tex = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
+        app.local_adjust_cache.insert(
+            app.current_local_adjust_key(idx),
+            LocalAdjustCacheEntry {
+                pixels: Arc::clone(&pixels),
+                texture: tex,
+            },
+        );
+        pixels
+    }
+
     #[test]
     fn edit_sources_ignore_final_display_cache() {
         let ctx = egui::Context::default();
@@ -5388,6 +5439,81 @@ mod pipeline_display_edit_split_tests {
             .expect("raw fs source should be available for conceal");
         assert_eq!(kind, "fs");
         assert_eq!(conceal_source.pixels[0], raw.pixels[0]);
+    }
+
+    #[test]
+    fn local_adjust_source_prefers_source_resolution_erase_over_ai_cache() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/local-source.jpg");
+        insert_fs_static(
+            &mut app,
+            &ctx,
+            idx,
+            "raw_for_local",
+            egui::Color32::from_rgb(1, 2, 3),
+        );
+        let ai = egui::ColorImage::new([4, 4], vec![egui::Color32::from_rgb(240, 240, 240); 16]);
+        let ai_tex = ctx.load_texture("stale_ai_local", ai.clone(), egui::TextureOptions::LINEAR);
+        let ai_bg = app.erase_upscale_bg_mode(idx);
+        app.ai_upscale_cache.insert(
+            (idx, ai_bg),
+            FsCacheEntry::Static {
+                tex: ai_tex,
+                pixels: Arc::new(ai),
+                source_dims: None,
+                load_seq: 0,
+            },
+        );
+        let erase = insert_current_erase_result(
+            &mut app,
+            &ctx,
+            idx,
+            "erase_for_local",
+            egui::Color32::from_rgb(40, 50, 60),
+        );
+
+        let local_source = app
+            .current_local_adjust_source_pixels(idx)
+            .expect("erase result should be the local-adjust source");
+
+        assert_eq!(local_source.size, [1, 1]);
+        assert_eq!(local_source.pixels[0], erase.pixels[0]);
+    }
+
+    #[test]
+    fn conceal_source_waits_for_local_adjust_result_before_composing() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/conceal-source.jpg");
+        insert_fs_static(
+            &mut app,
+            &ctx,
+            idx,
+            "raw_for_conceal",
+            egui::Color32::from_rgb(1, 2, 3),
+        );
+        app.local_adjust_page_layers
+            .insert(idx, vec![active_tone_layer()]);
+
+        assert!(
+            app.current_conceal_source_pixels(idx).is_none(),
+            "conceal must not compose over raw while an active local-adjust layer is pending"
+        );
+
+        let local = insert_current_local_adjust_result(
+            &mut app,
+            &ctx,
+            idx,
+            "local_for_conceal",
+            egui::Color32::from_rgb(90, 100, 110),
+        );
+        let (conceal_source, kind) = app
+            .current_conceal_source_pixels(idx)
+            .expect("completed local-adjust result should feed conceal");
+
+        assert_eq!(kind, "local_adjust");
+        assert_eq!(conceal_source.pixels[0], local.pixels[0]);
     }
 }
 
