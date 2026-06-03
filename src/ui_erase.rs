@@ -3026,6 +3026,7 @@ impl App {
                 },
             );
             self.invalidate_compare_prepared_for_idx(idx);
+            self.clear_local_adjust_caches_for_idx(idx);
             self.clear_conceal_caches(idx);
             crate::logger::log(format!(
                 "erase: inpaint complete ({} ms, prefix={})",

@@ -643,6 +643,9 @@ impl App {
                 return Some(entry.texture.clone());
             }
         }
+        if let Some(tex) = self.current_local_adjust_texture(idx) {
+            return Some(tex);
+        }
         if let Some(tex) = self.current_erase_result_texture(idx) {
             return Some(tex);
         }

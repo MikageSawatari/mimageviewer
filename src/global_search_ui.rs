@@ -1137,6 +1137,10 @@ impl App {
         // 旧フォルダの個別設定は意味を失うため clear する。
         // (削除経路では呼び出し元が idx shift で保持する)
         self.adjustment_page_params.clear();
+        self.local_adjust_page_layers.clear();
+        self.local_adjust_pages.clear();
+        self.local_adjust_generation.clear();
+        self.local_adjust_cache.clear();
         self.mask_pages.clear();
         // path-keyed キャッシュも Ctrl+G では items が総入れ替わりするのでリセット。
         self.metadata_cache.clear();

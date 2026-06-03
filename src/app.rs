@@ -1299,6 +1299,27 @@ pub(crate) struct ConcealSnapshot {
     pub shapes: Vec<crate::mask_db::Shape>,
 }
 
+/// 補正レイヤー合成結果を識別する cache key。
+///
+/// 補正レイヤーは消しゴム後・隠蔽加工前に入るため、下位入力世代
+/// (`input_generation` / `erase_mask_generation`) と補正レイヤー自身の世代を
+/// まとめて key にする。どれかが変わると lookup miss になり、stale 中は
+/// 補正レイヤー抜きの現在ベース画像を表示する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LocalAdjustResultKey {
+    pub(crate) idx: usize,
+    pub(crate) input_gen: u64,
+    pub(crate) erase_mask_gen: u64,
+    pub(crate) local_gen: u64,
+}
+
+/// 補正レイヤー合成結果の cache entry。
+pub(crate) struct LocalAdjustCacheEntry {
+    #[allow(dead_code)]
+    pub pixels: Arc<egui::ColorImage>,
+    pub texture: egui::TextureHandle,
+}
+
 /// 隠蔽合成結果のキャッシュエントリ (Phase 4)。
 ///
 /// `pixels` は合成済み RGBA、`texture` は GPU アップロード済みハンドル。
@@ -2888,11 +2909,16 @@ pub struct App {
     /// 現フォルダで補正レイヤーを持つページの item_idx 集合 (サムネイルバッジ用)。
     /// サムネイルには補正レイヤー結果自体を反映しない。
     pub(crate) local_adjust_pages: std::collections::HashSet<usize>,
+    /// 補正レイヤー自身の世代番号。レイヤー追加 / 削除 / パラメータ変更で idx 単位に +1 する。
+    pub(crate) local_adjust_generation: std::collections::HashMap<usize, u64>,
     /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
     /// フォルダロード時に mask_db から一括取得し、save/delete/apply でメンテナンスする。
     pub(crate) mask_pages: std::collections::HashSet<usize>,
     /// 消しゴムマスクの世代番号。mask / shape の保存・削除で idx 単位に +1 する。
     pub(crate) erase_mask_generation: std::collections::HashMap<usize, u64>,
+    /// 補正レイヤー合成結果 cache。現在 key と一致する entry だけ表示に採用する。
+    pub(crate) local_adjust_cache:
+        std::collections::HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>,
     /// 補正済み画像キャッシュ: item_idx → テクスチャ + ピクセルデータ
     pub(crate) adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
     /// 補正キャッシュ世代カウンタ (360 度パノラマビュー用、docs/panorama-360-view-plan.md §4.1.2)。
@@ -4080,8 +4106,10 @@ impl App {
             adjustment_favorite_params: std::collections::HashMap::new(),
             local_adjust_page_layers: std::collections::HashMap::new(),
             local_adjust_pages: std::collections::HashSet::new(),
+            local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
+            local_adjust_cache: std::collections::HashMap::new(),
             adjustment_cache: std::collections::HashMap::new(),
             adjustment_generation: std::collections::HashMap::new(),
             ai_upscale_generation: std::collections::HashMap::new(),
@@ -8097,6 +8125,8 @@ impl App {
         self.adjustment_mode = false;
         self.local_adjust_page_layers.clear();
         self.local_adjust_pages.clear();
+        self.local_adjust_generation.clear();
+        self.local_adjust_cache.clear();
         self.mask_pages.clear();
         self.erase_mask_generation.clear();
         self.conceal_pages.clear();
@@ -9171,8 +9201,10 @@ impl App {
         self.ai_classify_cache.clear();
         self.input_generation.clear();
         self.erase_mask_generation.clear();
+        self.local_adjust_generation.clear();
         self.conceal_mask_generation.clear();
         self.erase_result_cache.clear();
+        self.local_adjust_cache.clear();
         // 360 度パノラマビュー: cache 全体が変わったので世代を一斉 bump (§3.6.2.2)。
         self.bump_all_adjustment_generations();
         self.bump_all_ai_generations();
@@ -9277,6 +9309,15 @@ impl App {
         self.adjustment_page_params = std::mem::take(&mut self.adjustment_page_params)
             .into_iter()
             .filter_map(|(i, v)| shift(i).map(|ni| (ni, v)))
+            .collect();
+        self.local_adjust_page_layers = std::mem::take(&mut self.local_adjust_page_layers)
+            .into_iter()
+            .filter_map(|(i, v)| shift(i).map(|ni| (ni, v)))
+            .collect();
+        self.local_adjust_pages = self
+            .local_adjust_pages
+            .iter()
+            .filter_map(|&i| shift(i))
             .collect();
         self.mask_pages = self.mask_pages.iter().filter_map(|&i| shift(i)).collect();
         self.conceal_pages = self
@@ -16918,6 +16959,7 @@ impl App {
             // 「AI モデル変更 / AI 完了 → conceal_cache 該当 idx クリア」hook)。
             // AI 結果が conceal の入力レイヤになるので、stale を残すと低解像度ベースの
             // 隠蔽が固定表示されてしまう。
+            self.clear_local_adjust_caches_for_idx(idx);
             self.clear_conceal_caches(idx);
             if self.fullscreen_idx == Some(idx) && self.effective_upscale_bg_mode() == bg {
                 self.rescale_active_conceal_edit_to_size(idx, [w, h], "ai_complete");
@@ -17590,7 +17632,39 @@ impl App {
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_conceal(rel));
     }
 
-    // ── conceal_cache の世代管理 + invalidate ヘルパー (Phase 4) ─────────────
+    // ── local_adjust_cache / conceal_cache の世代管理 + invalidate ヘルパー ──
+
+    /// 現在の input / erase mask / local adjust 世代から、補正レイヤー cache key を作る。
+    pub(crate) fn current_local_adjust_key(&self, idx: usize) -> LocalAdjustResultKey {
+        LocalAdjustResultKey {
+            idx,
+            input_gen: self.input_generation.get(&idx).copied().unwrap_or(0),
+            erase_mask_gen: self.erase_mask_generation.get(&idx).copied().unwrap_or(0),
+            local_gen: self.local_adjust_generation.get(&idx).copied().unwrap_or(0),
+        }
+    }
+
+    /// 指定 idx の補正レイヤー cache を全世代分破棄する。
+    pub(crate) fn clear_local_adjust_caches_for_idx(&mut self, idx: usize) {
+        self.local_adjust_cache.retain(|key, _| key.idx != idx);
+    }
+
+    /// 補正レイヤーが変わったことを idx 単位の世代で表す。
+    #[allow(dead_code)]
+    pub(crate) fn bump_local_adjust_generation(&mut self, idx: usize) {
+        let slot = self.local_adjust_generation.entry(idx).or_insert(0);
+        *slot = slot.wrapping_add(1);
+        self.clear_local_adjust_caches_for_idx(idx);
+        self.clear_conceal_caches(idx);
+    }
+
+    /// 現在世代に一致する補正レイヤー結果テクスチャを返す。
+    pub(crate) fn current_local_adjust_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
+        let key = self.current_local_adjust_key(idx);
+        self.local_adjust_cache
+            .get(&key)
+            .map(|entry| entry.texture.clone())
+    }
 
     /// 指定 idx の `conceal_cache` エントリを破棄する。マスク確定 / 削除のように
     /// **その 1 ページだけ** 入力が変わった場合に呼ぶ。
@@ -17699,6 +17773,7 @@ impl App {
         *slot = slot.wrapping_add(1);
         self.cancel_erase_commit_pending_for_idx(idx);
         self.clear_erase_result_caches_for_idx(idx);
+        self.clear_local_adjust_caches_for_idx(idx);
         self.clear_erase_preview(idx);
         self.clear_conceal_caches(idx);
     }
@@ -17710,6 +17785,7 @@ impl App {
         }
         self.cancel_all_erase_inpaint_pending();
         self.erase_result_cache.clear();
+        self.local_adjust_cache.clear();
         self.erase_preview_cache.clear();
         self.conceal_cache.clear();
     }
@@ -17720,6 +17796,7 @@ impl App {
         *slot = slot.wrapping_add(1);
         self.cancel_erase_commit_pending_for_idx(idx);
         self.clear_erase_result_caches_for_idx(idx);
+        self.clear_local_adjust_caches_for_idx(idx);
         self.clear_erase_preview(idx);
         self.clear_conceal_caches(idx);
     }
@@ -18829,6 +18906,7 @@ impl App {
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
         self.thumb_adjust_tex.remove(&idx);
+        self.clear_local_adjust_caches_for_idx(idx);
         self.clear_conceal_caches(idx);
         self.erase_base_tex_cache.remove(&idx);
     }
@@ -18931,6 +19009,7 @@ impl App {
         self.bump_adjustment_generation(idx);
         // 隠蔽合成: 上位レイヤ (adj) の入力が変わったので、`conceal_cache[idx]` も
         // stale 扱いにする (`docs/conceal-feature-plan.md §9` 表)。
+        self.clear_local_adjust_caches_for_idx(idx);
         self.clear_conceal_caches(idx);
         // 消しゴム編集中の base テクスチャ (= 色補正適用済 raw) も同じく stale。
         // 次回 `ensure_erase_base_texture` で再計算される。
@@ -18947,6 +19026,7 @@ impl App {
         self.compare_prepare_pending = None;
         self.compare_prepared_pair = None;
         self.compare_wipe_dragging = false;
+        self.local_adjust_cache.clear();
         // 360 度パノラマビュー: バルク clear に追随して全 entry を bump (§3.6.2.2)。
         self.bump_all_adjustment_generations();
         // 隠蔽合成: バルク色補正変更で全ページ入力が変わるため世代 bump して全 stale 化。
