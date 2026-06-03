@@ -31,7 +31,7 @@
 
 use local_adjust_core::{
     LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, RadialGradientMask,
-    RasterMask, RgbaImageRef, SubjectMaskRefinement, evaluate_layer_mask,
+    RasterMask, RasterVectorMask, RgbaImageRef, SubjectMaskRefinement, evaluate_layer_mask,
 };
 
 // ---------------------------------------------------------------------------
@@ -244,6 +244,35 @@ fn full_mask_evaluates_to_all_ones() {
     for (i, v) in mask.iter().enumerate() {
         assert_eq!(*v, 1.0, "Full マスク pixel[{i}] が 1.0 でない: {v}");
     }
+}
+
+/// M-1 follow-up: Full + large subtract override must stay linear-time.
+/// The UI preview bug was caused by repeatedly scanning the subtract buffer per preview pixel.
+#[test]
+fn full_mask_with_large_subtract_buffer_completes_quickly() {
+    let width = 3840;
+    let height = 2160;
+    let pixels = vec![128_u8; width * height * 4];
+    let mut subtract = RasterVectorMask::empty(width, height);
+    subtract.alpha[width * height - 1] = 1.0;
+    let mut layer = LocalAdjustmentLayer::new("full", LocalMask::Full, LocalEffect::None);
+    layer.manual_override.subtract = Some(subtract);
+    let img_ref = RgbaImageRef {
+        width,
+        height,
+        pixels: &pixels,
+    };
+
+    let started = std::time::Instant::now();
+    let mask = evaluate_layer_mask(img_ref, &layer).expect("Full + subtract evaluates");
+    let elapsed = started.elapsed();
+
+    assert_eq!(mask[0], 1.0);
+    assert_eq!(mask[width * height - 1], 0.0);
+    assert!(
+        elapsed < std::time::Duration::from_millis(100),
+        "Full + subtract evaluation should remain linear, elapsed={elapsed:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -4196,19 +4196,35 @@ fn apply_manual_override(
     manual_override: &ManualMaskOverride,
 ) -> Result<()> {
     if let Some(add) = &manual_override.add {
-        let add_alpha = eval_raster_vector_mask(add, width, height)?;
-        for (a, add) in alpha.iter_mut().zip(add_alpha) {
-            if add >= 0.5 {
-                *a = 1.0;
-            }
-        }
+        apply_raster_vector_override(alpha, width, height, add, 1.0)?;
     }
     if let Some(subtract) = &manual_override.subtract {
-        let subtract_alpha = eval_raster_vector_mask(subtract, width, height)?;
-        for (a, subtract) in alpha.iter_mut().zip(subtract_alpha) {
-            if subtract >= 0.5 {
-                *a = 0.0;
+        apply_raster_vector_override(alpha, width, height, subtract, 0.0)?;
+    }
+    Ok(())
+}
+
+fn apply_raster_vector_override(
+    alpha: &mut [f32],
+    width: usize,
+    height: usize,
+    mask: &RasterVectorMask,
+    value: f32,
+) -> Result<()> {
+    mask.validate(width, height)?;
+    if mask.shapes.is_empty() {
+        for (a, &mask_alpha) in alpha.iter_mut().zip(&mask.alpha) {
+            if mask_alpha.clamp(0.0, 1.0) >= 0.5 {
+                *a = value;
             }
+        }
+        return Ok(());
+    }
+
+    let mask_alpha = eval_raster_vector_mask(mask, width, height)?;
+    for (a, mask_alpha) in alpha.iter_mut().zip(mask_alpha) {
+        if mask_alpha >= 0.5 {
+            *a = value;
         }
     }
     Ok(())

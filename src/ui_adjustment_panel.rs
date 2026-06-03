@@ -295,6 +295,38 @@ mod local_adjust_segmentation_tests {
     }
 
     #[test]
+    fn full_mask_with_large_subtract_preview_completes_quickly() {
+        let width = 3840;
+        let height = 2160;
+        let mut subtract = local_adjust_core::RasterVectorMask::empty(width, height);
+        subtract.alpha[width * height - 1] = 1.0;
+        let mut layer = local_adjust_core::LocalAdjustmentLayer::new(
+            "full",
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::None,
+        );
+        layer.manual_override.subtract = Some(subtract);
+
+        let started = std::time::Instant::now();
+        let image = build_local_adjust_mask_preview_image(
+            &layer,
+            None,
+            (width, height),
+            [64, 64],
+            0.0,
+            LocalAdjustMaskColorPreset::PinkCyan.colors(),
+            None,
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(image.size, [64, 64]);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "Full + large subtract preview should be O(preview pixels + mask pixels), elapsed={elapsed:?}"
+        );
+    }
+
+    #[test]
     fn bitmap_mask_expand_and_shrink_use_3x3_neighbors() {
         let src = vec![
             0.0, 0.0, 0.0, //
@@ -4739,6 +4771,7 @@ fn draw_local_layer_mask_thumbnail(
     let width = image_dims.0.max(1);
     let height = image_dims.1.max(1);
     let source = source.filter(|source| source.size == [width, height]);
+    let full_subtract_has_content = local_adjust_full_subtract_mask_has_content(layer);
     let mut alphas = [0.0_f32; GRID * GRID];
     let mut min_x = GRID;
     let mut min_y = GRID;
@@ -4751,8 +4784,16 @@ fn draw_local_layer_mask_thumbnail(
                 .min(width.saturating_sub(1));
             let y = (((gy as f32 + 0.5) * height as f32 / GRID as f32) as usize)
                 .min(height.saturating_sub(1));
-            let alpha =
-                local_adjust_mask_preview_alpha(layer, source, width, height, x, y).clamp(0.0, 1.0);
+            let alpha = local_adjust_mask_preview_alpha_cached(
+                layer,
+                source,
+                width,
+                height,
+                x,
+                y,
+                full_subtract_has_content,
+            )
+            .clamp(0.0, 1.0);
             alphas[gy * GRID + gx] = alpha;
             if alpha > 0.02 {
                 min_x = min_x.min(gx);
@@ -4919,30 +4960,15 @@ fn draw_local_adjust_mask_preview_overlay(
     let tex_h = (rect_h * scale)
         .round()
         .clamp(1.0, LOCAL_ADJUST_MASK_PREVIEW_MAX_TEXELS) as usize;
-    let source = source.filter(|source| source.size == [width, height]);
-    let mut pixels = Vec::with_capacity(tex_w.saturating_mul(tex_h));
-
-    for gy in 0..tex_h {
-        for gx in 0..tex_w {
-            let x = (((gx as f32 + 0.5) * width as f32 / tex_w as f32) as usize)
-                .min(width.saturating_sub(1));
-            let y = (((gy as f32 + 0.5) * height as f32 / tex_h as f32) as usize)
-                .min(height.saturating_sub(1));
-            pixels.push(local_adjust_mask_preview_color(
-                layer,
-                source,
-                width,
-                height,
-                x,
-                y,
-                time_sec,
-                colors,
-                edit_target,
-            ));
-        }
-    }
-
-    let image = egui::ColorImage::new([tex_w, tex_h], pixels);
+    let image = build_local_adjust_mask_preview_image(
+        layer,
+        source,
+        (width, height),
+        [tex_w, tex_h],
+        time_sec,
+        colors,
+        edit_target,
+    );
     if texture_slot
         .as_ref()
         .is_some_and(|texture| texture.size() != [tex_w, tex_h])
@@ -4969,6 +4995,47 @@ fn draw_local_adjust_mask_preview_overlay(
     );
 }
 
+fn build_local_adjust_mask_preview_image(
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+    source: Option<&egui::ColorImage>,
+    image_dims: (usize, usize),
+    preview_size: [usize; 2],
+    time_sec: f32,
+    colors: crate::app::LocalAdjustMaskPreviewColors,
+    edit_target: Option<LocalAdjustMaskEditTarget>,
+) -> egui::ColorImage {
+    let width = image_dims.0.max(1);
+    let height = image_dims.1.max(1);
+    let [tex_w, tex_h] = [preview_size[0].max(1), preview_size[1].max(1)];
+    let source = source.filter(|source| source.size == [width, height]);
+    let full_subtract_has_content = local_adjust_full_subtract_mask_has_content(layer);
+    let mut pixels = Vec::with_capacity(tex_w.saturating_mul(tex_h));
+
+    for gy in 0..tex_h {
+        for gx in 0..tex_w {
+            let x = (((gx as f32 + 0.5) * width as f32 / tex_w as f32) as usize)
+                .min(width.saturating_sub(1));
+            let y = (((gy as f32 + 0.5) * height as f32 / tex_h as f32) as usize)
+                .min(height.saturating_sub(1));
+            pixels.push(local_adjust_mask_preview_color_cached(
+                layer,
+                source,
+                width,
+                height,
+                x,
+                y,
+                time_sec,
+                colors,
+                edit_target,
+                full_subtract_has_content,
+            ));
+        }
+    }
+
+    egui::ColorImage::new([tex_w, tex_h], pixels)
+}
+
+#[cfg(test)]
 fn local_adjust_mask_preview_color(
     layer: &local_adjust_core::LocalAdjustmentLayer,
     source: Option<&egui::ColorImage>,
@@ -4979,6 +5046,32 @@ fn local_adjust_mask_preview_color(
     time_sec: f32,
     colors: crate::app::LocalAdjustMaskPreviewColors,
     edit_target: Option<LocalAdjustMaskEditTarget>,
+) -> egui::Color32 {
+    local_adjust_mask_preview_color_cached(
+        layer,
+        source,
+        width,
+        height,
+        x,
+        y,
+        time_sec,
+        colors,
+        edit_target,
+        local_adjust_full_subtract_mask_has_content(layer),
+    )
+}
+
+fn local_adjust_mask_preview_color_cached(
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+    source: Option<&egui::ColorImage>,
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    time_sec: f32,
+    colors: crate::app::LocalAdjustMaskPreviewColors,
+    edit_target: Option<LocalAdjustMaskEditTarget>,
+    full_subtract_has_content: bool,
 ) -> egui::Color32 {
     let idx = y.saturating_mul(width).saturating_add(x);
     if let Some(mask) = match edit_target {
@@ -5013,7 +5106,15 @@ fn local_adjust_mask_preview_color(
             }
         }
         _ => {
-            let alpha = local_adjust_mask_preview_alpha(layer, source, width, height, x, y);
+            let alpha = local_adjust_mask_preview_alpha_cached(
+                layer,
+                source,
+                width,
+                height,
+                x,
+                y,
+                full_subtract_has_content,
+            );
             if alpha <= 0.02 {
                 egui::Color32::TRANSPARENT
             } else {
@@ -5026,6 +5127,7 @@ fn local_adjust_mask_preview_color(
     }
 }
 
+#[cfg(test)]
 fn local_adjust_mask_preview_alpha(
     layer: &local_adjust_core::LocalAdjustmentLayer,
     source: Option<&egui::ColorImage>,
@@ -5034,15 +5136,30 @@ fn local_adjust_mask_preview_alpha(
     x: usize,
     y: usize,
 ) -> f32 {
+    local_adjust_mask_preview_alpha_cached(
+        layer,
+        source,
+        width,
+        height,
+        x,
+        y,
+        local_adjust_full_subtract_mask_has_content(layer),
+    )
+}
+
+fn local_adjust_mask_preview_alpha_cached(
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+    source: Option<&egui::ColorImage>,
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    full_subtract_has_content: bool,
+) -> f32 {
     let idx = y.saturating_mul(width).saturating_add(x);
     let mut alpha = match &layer.mask {
         local_adjust_core::LocalMask::Full => {
-            if layer
-                .manual_override
-                .subtract
-                .as_ref()
-                .is_some_and(local_adjust_raster_vector_mask_has_content)
-            {
+            if full_subtract_has_content {
                 1.0
             } else {
                 0.0
@@ -5109,6 +5226,16 @@ fn local_adjust_mask_preview_alpha(
         alpha = 1.0 - alpha;
     }
     (alpha * layer.opacity.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+}
+
+fn local_adjust_full_subtract_mask_has_content(
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+) -> bool {
+    layer
+        .manual_override
+        .subtract
+        .as_ref()
+        .is_some_and(local_adjust_raster_vector_mask_has_content)
 }
 
 fn local_adjust_raster_vector_mask_has_content(mask: &local_adjust_core::RasterVectorMask) -> bool {
