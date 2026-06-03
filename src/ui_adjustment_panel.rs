@@ -19,9 +19,9 @@ use eframe::egui;
 
 use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
 use crate::app::{
-    AdjustSpreadTarget, App, LocalAdjustGeneratedMask, LocalAdjustMaskEditTarget,
-    LocalAdjustMaskShapeDrag, LocalAdjustMaskTool, LocalAdjustRegionSegmentationScope,
-    LocalAdjustShapeHandle,
+    AdjustSpreadTarget, App, LocalAdjustGeneratedMask, LocalAdjustMaskColorPreset,
+    LocalAdjustMaskEditTarget, LocalAdjustMaskShapeDrag, LocalAdjustMaskTool,
+    LocalAdjustRegionSegmentationScope, LocalAdjustShapeHandle,
 };
 use crate::local_adjust_catalog::{
     EFFECT_GROUPS, EffectKind, effect_picker_button_width, effect_picker_matches_query,
@@ -61,6 +61,14 @@ const LOCAL_ADJUST_EFFECT_PICKER_BUTTON_H: f32 = 30.0;
 const LOCAL_ADJUST_EDGE_BRUSH_INCLUDE_BOUNDARY_RADIUS: isize = 2;
 const LOCAL_ADJUST_U2NETP_INPUT_SIZE: usize = 320;
 const LOCAL_ADJUST_REGION_SEGMENT_MAX_LABELS: usize = 2048;
+const LOCAL_ADJUST_MASK_PREVIEW_BASE_ALPHA: f32 = 155.0;
+const LOCAL_ADJUST_MASK_PREVIEW_MAX_TEXELS: f32 = 768.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalAdjustBitmapMaskOp {
+    Expand,
+    Shrink,
+}
 
 fn with_local_adjust_dark_window_style<R>(
     ctx: &egui::Context,
@@ -198,6 +206,91 @@ mod local_adjust_segmentation_tests {
         assert_eq!(
             hit_local_adjust_shape_handles(shape, [170.0, 100.0], 24.0),
             Some(LocalAdjustShapeHandle::Radius)
+        );
+    }
+
+    #[test]
+    fn bitmap_mask_expand_and_shrink_use_3x3_neighbors() {
+        let src = vec![
+            0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0,
+        ];
+        assert_eq!(local_adjust_morph_alpha_1px(&src, 3, 3, true), vec![1.0; 9]);
+        assert_eq!(
+            local_adjust_morph_alpha_1px(&src, 3, 3, false),
+            vec![0.0; 9]
+        );
+    }
+
+    #[test]
+    fn linear_gradient_handle_hit_detects_endpoints() {
+        let layer = local_adjust_core::LocalAdjustmentLayer::new(
+            "linear",
+            local_adjust_core::LocalMask::LinearGradient(local_adjust_core::LinearGradientMask {
+                initialized: true,
+                start: [0.2, 0.3],
+                end: [0.8, 0.7],
+            }),
+            local_adjust_core::LocalEffect::None,
+        );
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        assert_eq!(
+            local_adjust_gradient_handle_hit(
+                &layer,
+                egui::pos2(80.0, 70.0),
+                rect,
+                (100, 100),
+                None
+            ),
+            Some(crate::app::LocalAdjustCanvasDragKind::LinearGradientEnd)
+        );
+        assert_eq!(
+            local_adjust_gradient_handle_hit(
+                &layer,
+                egui::pos2(20.0, 30.0),
+                rect,
+                (100, 100),
+                None
+            ),
+            Some(crate::app::LocalAdjustCanvasDragKind::LinearGradientStart)
+        );
+    }
+
+    #[test]
+    fn radial_gradient_handle_hit_detects_outer_and_center_handles() {
+        let layer = local_adjust_core::LocalAdjustmentLayer::new(
+            "radial",
+            local_adjust_core::LocalMask::RadialGradient(local_adjust_core::RadialGradientMask {
+                initialized: true,
+                center: [0.5, 0.5],
+                inner_radius: 0.1,
+                inner_radius_y: 0.2,
+                outer_radius: 0.3,
+                outer_radius_y: 0.4,
+            }),
+            local_adjust_core::LocalEffect::None,
+        );
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0));
+        assert_eq!(
+            local_adjust_gradient_handle_hit(
+                &layer,
+                egui::pos2(160.0, 50.0),
+                rect,
+                (200, 100),
+                None
+            ),
+            Some(crate::app::LocalAdjustCanvasDragKind::RadialGradientOuterX)
+        );
+        assert_eq!(
+            local_adjust_gradient_handle_hit(
+                &layer,
+                egui::pos2(100.0, 50.0),
+                rect,
+                (200, 100),
+                None
+            ),
+            Some(crate::app::LocalAdjustCanvasDragKind::RadialGradientCenter)
         );
     }
 
@@ -429,6 +522,39 @@ fn local_adjust_raster_vector_has_content(mask: &local_adjust_core::RasterVector
     mask.alpha.iter().any(|a| *a > 0.0) || !mask.shapes.is_empty()
 }
 
+fn local_adjust_morph_alpha_1px(
+    src: &[f32],
+    width: usize,
+    height: usize,
+    dilate: bool,
+) -> Vec<f32> {
+    if width == 0 || height == 0 || src.len() < width.saturating_mul(height) {
+        return src.to_vec();
+    }
+    let mut out = vec![0.0; src.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let mut value = if dilate { 0.0_f32 } else { 1.0_f32 };
+            let y0 = y.saturating_sub(1);
+            let y1 = (y + 1).min(height - 1);
+            let x0 = x.saturating_sub(1);
+            let x1 = (x + 1).min(width - 1);
+            for yy in y0..=y1 {
+                for xx in x0..=x1 {
+                    let sample = src[yy * width + xx].clamp(0.0, 1.0);
+                    if dilate {
+                        value = value.max(sample);
+                    } else {
+                        value = value.min(sample);
+                    }
+                }
+            }
+            out[y * width + x] = value;
+        }
+    }
+    out
+}
+
 fn local_adjust_target_raster_vector_mask_mut(
     layer: &mut local_adjust_core::LocalAdjustmentLayer,
     target: LocalAdjustMaskEditTarget,
@@ -549,32 +675,19 @@ fn draw_local_adjust_left_panel(
     mask_edit_target: &mut LocalAdjustMaskEditTarget,
     mask_paint_add: &mut bool,
     mask_tool: &mut LocalAdjustMaskTool,
+    bitmap_mask_op: &mut Option<LocalAdjustBitmapMaskOp>,
     show_source: &mut bool,
     show_mask: &mut bool,
+    mask_color_preset: &mut LocalAdjustMaskColorPreset,
+    preview_to_selected_layer: &mut bool,
 ) {
     let section_panel_w = panel_w - LOCAL_ADJUST_PANEL_SECTION_CONTENT_W_SHRINK;
     let btn_w = ((section_panel_w - 20.0 - 4.0) / 2.0).max(96.0);
     let btn_size = egui::vec2(btn_w, 24.0);
     draw_local_adjust_panel_section(ui, LocalAdjustPanelSection::General, |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            if local_adjust_panel_toggle_button(
-                ui,
-                "元画像 [Q]",
-                *show_source,
-                Some(btn_size),
-                false,
-            )
-            .clicked()
-            {
-                *show_source = !*show_source;
-            }
-            if local_adjust_panel_toggle_button(ui, "マスク [W]", *show_mask, Some(btn_size), false)
-                .clicked()
-            {
-                *show_mask = !*show_mask;
-            }
-        });
+        draw_local_adjust_display_controls(ui, btn_size, show_source, show_mask, mask_color_preset);
+    });
+    draw_local_adjust_panel_section(ui, LocalAdjustPanelSection::General, |ui| {
         ui.add_space(4.0);
         draw_local_adjust_layer_list(
             ui,
@@ -590,6 +703,7 @@ fn draw_local_adjust_left_panel(
             move_layer,
             duplicate_layer,
             delete_layer,
+            preview_to_selected_layer,
         );
     });
 
@@ -616,7 +730,61 @@ fn draw_local_adjust_left_panel(
             mask_edit_target,
             mask_paint_add,
             mask_tool,
+            bitmap_mask_op,
         );
+    });
+}
+
+fn draw_local_adjust_display_controls(
+    ui: &mut egui::Ui,
+    btn_size: egui::Vec2,
+    show_source: &mut bool,
+    show_mask: &mut bool,
+    mask_color_preset: &mut LocalAdjustMaskColorPreset,
+) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("表示:").color(egui::Color32::from_gray(200)));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for preset in LocalAdjustMaskColorPreset::ALL.into_iter().rev() {
+                let selected = *mask_color_preset == preset;
+                let colors = preset.colors();
+                let button = egui::Button::new(
+                    egui::RichText::new(preset.label())
+                        .strong()
+                        .size(10.0)
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(colors.base(if selected { 145 } else { 80 }))
+                .stroke(if selected {
+                    egui::Stroke::new(1.5, colors.edit(255))
+                } else {
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 35),
+                    )
+                });
+                if ui
+                    .add_sized(egui::vec2(24.0, 18.0), button)
+                    .on_hover_text(format!("マスクカラー: {}", preset.description()))
+                    .clicked()
+                {
+                    *mask_color_preset = preset;
+                }
+            }
+        });
+    });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if local_adjust_panel_toggle_button(ui, "元画像 [Q]", *show_source, Some(btn_size), false)
+            .clicked()
+        {
+            *show_source = !*show_source;
+        }
+        if local_adjust_panel_toggle_button(ui, "マスク [W]", *show_mask, Some(btn_size), false)
+            .clicked()
+        {
+            *show_mask = !*show_mask;
+        }
     });
 }
 
@@ -634,6 +802,7 @@ fn draw_local_adjust_layer_list(
     move_layer: &mut Option<(usize, usize)>,
     duplicate_layer: &mut Option<usize>,
     delete_layer: &mut Option<usize>,
+    preview_to_selected_layer: &mut bool,
 ) {
     let btn_w = ((panel_w - 20.0 - 4.0) / 2.0).max(96.0);
     let action_row_w = btn_w * 2.0 + 4.0;
@@ -651,6 +820,18 @@ fn draw_local_adjust_layer_list(
         .clicked()
     {
         *add_layer_dialog_open = true;
+    }
+    ui.checkbox(preview_to_selected_layer, "選択レイヤーまでプレビュー");
+    if *preview_to_selected_layer && !layers.is_empty() {
+        ui.label(
+            egui::RichText::new(format!(
+                "表示中: 1〜{} / {}",
+                selected_layer.min(layers.len() - 1) + 1,
+                layers.len()
+            ))
+            .size(10.0)
+            .color(egui::Color32::from_gray(170)),
+        );
     }
     if layers.is_empty() {
         ui.label(
@@ -884,6 +1065,7 @@ fn draw_local_adjust_manual_tool_selector(
     mask_edit_target: &mut LocalAdjustMaskEditTarget,
     mask_paint_add: &mut bool,
     mask_tool: &mut LocalAdjustMaskTool,
+    bitmap_mask_op: &mut Option<LocalAdjustBitmapMaskOp>,
 ) {
     let Some(layer) = layer else {
         return;
@@ -902,7 +1084,13 @@ fn draw_local_adjust_manual_tool_selector(
     match mask_kind {
         MaskKind::Raster => {
             *mask_edit_target = LocalAdjustMaskEditTarget::Base;
-            draw_local_manual_mask_tool_panel(ui, btn_size, mask_paint_add, mask_tool);
+            draw_local_manual_mask_tool_panel(
+                ui,
+                btn_size,
+                mask_paint_add,
+                mask_tool,
+                bitmap_mask_op,
+            );
             return;
         }
         MaskKind::Full => {
@@ -1008,7 +1196,13 @@ fn draw_local_adjust_manual_tool_selector(
                         .size(10.0)
                         .color(egui::Color32::from_gray(170)),
                 );
-                draw_local_manual_mask_tool_panel(ui, btn_size, mask_paint_add, mask_tool);
+                draw_local_manual_mask_tool_panel(
+                    ui,
+                    btn_size,
+                    mask_paint_add,
+                    mask_tool,
+                    bitmap_mask_op,
+                );
                 ui.separator();
                 let has_target = match active_target {
                     LocalAdjustMaskEditTarget::OverrideAdd => layer.manual_override.add.is_some(),
@@ -1064,6 +1258,7 @@ fn draw_local_manual_mask_tool_panel(
     btn_size: egui::Vec2,
     mask_paint_add: &mut bool,
     mask_tool: &mut LocalAdjustMaskTool,
+    bitmap_mask_op: &mut Option<LocalAdjustBitmapMaskOp>,
 ) {
     ui.label(egui::RichText::new("描画 / 消去:").color(egui::Color32::from_gray(200)));
     ui.horizontal(|ui| {
@@ -1109,6 +1304,21 @@ fn draw_local_manual_mask_tool_panel(
             }
         });
     }
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if ui
+            .add_sized(btn_size, egui::Button::new("1px拡張"))
+            .clicked()
+        {
+            *bitmap_mask_op = Some(LocalAdjustBitmapMaskOp::Expand);
+        }
+        if ui
+            .add_sized(btn_size, egui::Button::new("1px縮小"))
+            .clicked()
+        {
+            *bitmap_mask_op = Some(LocalAdjustBitmapMaskOp::Shrink);
+        }
+    });
     ui.label(egui::RichText::new("オブジェクト:").color(egui::Color32::from_gray(200)));
     for row in [
         [
@@ -1449,14 +1659,13 @@ fn draw_selected_local_adjust_layer_editor(
 }
 
 fn local_adjust_image_dims(app: &App, fs_idx: usize) -> (usize, usize) {
+    if let Some(pixels) = app.current_local_adjust_source_pixels(fs_idx) {
+        return (pixels.size[0].max(1), pixels.size[1].max(1));
+    }
     match app.fs_cache.get(&fs_idx) {
-        Some(crate::fs_animation::FsCacheEntry::Static {
-            pixels,
-            source_dims,
-            ..
-        }) => source_dims
-            .map(|[w, h]| (w, h))
-            .unwrap_or((pixels.size[0], pixels.size[1])),
+        Some(crate::fs_animation::FsCacheEntry::Static { pixels, .. }) => {
+            (pixels.size[0].max(1), pixels.size[1].max(1))
+        }
         _ => (1, 1),
     }
 }
@@ -4296,18 +4505,28 @@ fn draw_local_adjust_mask_preview_overlay(
     source: Option<&egui::ColorImage>,
     image_dims: (usize, usize),
     time_sec: f32,
+    colors: crate::app::LocalAdjustMaskPreviewColors,
+    texture_slot: &mut Option<egui::TextureHandle>,
 ) {
     let width = image_dims.0.max(1);
     let height = image_dims.1.max(1);
-    let cols = (drawn_rect.width() / 12.0).round().clamp(32.0, 128.0) as usize;
-    let rows = ((cols as f32 * height as f32 / width as f32).round() as usize).clamp(24, 128);
+    let rect_w = drawn_rect.width().max(1.0);
+    let rect_h = drawn_rect.height().max(1.0);
+    let scale = (LOCAL_ADJUST_MASK_PREVIEW_MAX_TEXELS / rect_w.max(rect_h)).min(1.0);
+    let tex_w = (rect_w * scale)
+        .round()
+        .clamp(1.0, LOCAL_ADJUST_MASK_PREVIEW_MAX_TEXELS) as usize;
+    let tex_h = (rect_h * scale)
+        .round()
+        .clamp(1.0, LOCAL_ADJUST_MASK_PREVIEW_MAX_TEXELS) as usize;
     let source = source.filter(|source| source.size == [width, height]);
+    let mut pixels = Vec::with_capacity(tex_w.saturating_mul(tex_h));
 
-    for gy in 0..rows {
-        for gx in 0..cols {
-            let x = (((gx as f32 + 0.5) * width as f32 / cols as f32) as usize)
+    for gy in 0..tex_h {
+        for gx in 0..tex_w {
+            let x = (((gx as f32 + 0.5) * width as f32 / tex_w as f32) as usize)
                 .min(width.saturating_sub(1));
-            let y = (((gy as f32 + 0.5) * height as f32 / rows as f32) as usize)
+            let y = (((gy as f32 + 0.5) * height as f32 / tex_h as f32) as usize)
                 .min(height.saturating_sub(1));
             let color = match &layer.mask {
                 local_adjust_core::LocalMask::Segmentation(mask)
@@ -4325,9 +4544,9 @@ fn draw_local_adjust_mask_preview_overlay(
                             x,
                             y,
                         ) {
-                            egui::Color32::from_rgba_unmultiplied(255, 230, 120, 230)
+                            colors.boundary(235)
                         } else {
-                            egui::Color32::from_rgba_unmultiplied(255, 80, 125, 170)
+                            colors.base(188)
                         }
                     } else if local_adjust_region_label_boundary(mask, label, x, y) {
                         local_adjust_region_boundary_color(label, time_sec)
@@ -4340,25 +4559,31 @@ fn draw_local_adjust_mask_preview_overlay(
                     if alpha <= 0.02 {
                         egui::Color32::TRANSPARENT
                     } else {
-                        let a = (55.0 + alpha * 175.0).round().clamp(0.0, 255.0) as u8;
-                        egui::Color32::from_rgba_unmultiplied(255, 80, 125, a)
+                        let a = (alpha * LOCAL_ADJUST_MASK_PREVIEW_BASE_ALPHA)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                        colors.base(a)
                     }
                 }
             };
-            if color == egui::Color32::TRANSPARENT {
-                continue;
-            }
-            let x0 = drawn_rect.left() + gx as f32 * drawn_rect.width() / cols as f32;
-            let y0 = drawn_rect.top() + gy as f32 * drawn_rect.height() / rows as f32;
-            let x1 = drawn_rect.left() + (gx + 1) as f32 * drawn_rect.width() / cols as f32;
-            let y1 = drawn_rect.top() + (gy + 1) as f32 * drawn_rect.height() / rows as f32;
-            painter.rect_filled(
-                egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
-                0.0,
-                color,
-            );
+            pixels.push(color);
         }
     }
+
+    let image = egui::ColorImage::new([tex_w, tex_h], pixels);
+    let texture = painter.ctx().load_texture(
+        "local_adjust_mask_preview",
+        image,
+        egui::TextureOptions::NEAREST,
+    );
+    let texture_id = texture.id();
+    *texture_slot = Some(texture);
+    painter.image(
+        texture_id,
+        drawn_rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
 }
 
 fn local_adjust_mask_preview_alpha(
@@ -4526,6 +4751,65 @@ fn local_adjust_ellipse_radius_for_direction(rx: f32, ry: f32, ux: f32, uy: f32)
     }
 }
 
+fn local_adjust_gradient_handle_hit(
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+    pos: egui::Pos2,
+    image_rect: egui::Rect,
+    image_dims: (usize, usize),
+    zoom_pan: Option<(f32, egui::Vec2)>,
+) -> Option<crate::app::LocalAdjustCanvasDragKind> {
+    const HIT_RADIUS: f32 = 14.0;
+    match &layer.mask {
+        local_adjust_core::LocalMask::LinearGradient(mask) if mask.initialized => {
+            let start = local_adjust_norm_to_screen(mask.start, image_rect, image_dims, zoom_pan)?;
+            let end = local_adjust_norm_to_screen(mask.end, image_rect, image_dims, zoom_pan)?;
+            if end.distance(pos) <= HIT_RADIUS {
+                Some(crate::app::LocalAdjustCanvasDragKind::LinearGradientEnd)
+            } else if start.distance(pos) <= HIT_RADIUS {
+                Some(crate::app::LocalAdjustCanvasDragKind::LinearGradientStart)
+            } else {
+                None
+            }
+        }
+        local_adjust_core::LocalMask::RadialGradient(mask) if mask.initialized => {
+            let (_, drawn_rect) = local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
+            let center =
+                local_adjust_norm_to_screen(mask.center, image_rect, image_dims, zoom_pan)?;
+            let inner_rx = mask.inner_radius.max(0.0) * drawn_rect.width();
+            let inner_ry = mask.inner_radius_y.max(0.0) * drawn_rect.height();
+            let outer_rx = mask.outer_radius.max(mask.inner_radius).max(0.0) * drawn_rect.width();
+            let outer_ry =
+                mask.outer_radius_y.max(mask.inner_radius_y).max(0.0) * drawn_rect.height();
+            let handles = [
+                (
+                    egui::pos2(center.x + outer_rx, center.y),
+                    crate::app::LocalAdjustCanvasDragKind::RadialGradientOuterX,
+                ),
+                (
+                    egui::pos2(center.x, center.y + outer_ry),
+                    crate::app::LocalAdjustCanvasDragKind::RadialGradientOuterY,
+                ),
+                (
+                    egui::pos2(center.x + inner_rx, center.y),
+                    crate::app::LocalAdjustCanvasDragKind::RadialGradientInnerX,
+                ),
+                (
+                    egui::pos2(center.x, center.y + inner_ry),
+                    crate::app::LocalAdjustCanvasDragKind::RadialGradientInnerY,
+                ),
+                (
+                    center,
+                    crate::app::LocalAdjustCanvasDragKind::RadialGradientCenter,
+                ),
+            ];
+            handles.into_iter().find_map(|(handle_pos, kind)| {
+                (handle_pos.distance(pos) <= HIT_RADIUS).then_some(kind)
+            })
+        }
+        _ => None,
+    }
+}
+
 fn local_adjust_luma_range_preview_alpha(
     source: Option<&egui::ColorImage>,
     mask: local_adjust_core::RangeMask,
@@ -4646,60 +4930,49 @@ fn draw_local_mask_editor(
                     mask.alpha.fill(0.0);
                     changed = true;
                 }
-                if ui.small_button("ビットマップ塗り").clicked() {
-                    mask.alpha.fill(1.0);
-                    changed = true;
-                }
-                if ui.small_button("図形消去").clicked() {
+                if ui.small_button("オブジェクト消去").clicked() {
                     mask.shapes.clear();
                     changed = true;
                 }
             });
             ui.label(format!(
-                "手動マスク: {} x {} / 図形 {}",
+                "手動マスク: {} x {} / オブジェクト {}",
                 mask.width,
                 mask.height,
                 mask.shapes.len()
             ));
         }
         local_adjust_core::LocalMask::LinearGradient(mask) => {
-            if !mask.initialized && ui.small_button("上下グラデーションを作成").clicked()
-            {
-                *mask = local_adjust_core::LinearGradientMask {
-                    initialized: true,
-                    start: [0.5, 0.0],
-                    end: [0.5, 1.0],
-                };
-                changed = true;
+            if !mask.initialized {
+                ui.label("画像上でドラッグして範囲を生成します。");
+            } else {
+                if ui.small_button("グラデーションをクリア").clicked() {
+                    *mask = local_adjust_core::LinearGradientMask::default();
+                    changed = true;
+                }
+                changed |= local_adjust_slider(ui, &mut mask.start[0], 0.0..=1.0, "開始 X");
+                changed |= local_adjust_slider(ui, &mut mask.start[1], 0.0..=1.0, "開始 Y");
+                changed |= local_adjust_slider(ui, &mut mask.end[0], 0.0..=1.0, "終了 X");
+                changed |= local_adjust_slider(ui, &mut mask.end[1], 0.0..=1.0, "終了 Y");
             }
-            changed |= ui.checkbox(&mut mask.initialized, "有効").changed();
-            changed |= local_adjust_slider(ui, &mut mask.start[0], 0.0..=1.0, "開始 X");
-            changed |= local_adjust_slider(ui, &mut mask.start[1], 0.0..=1.0, "開始 Y");
-            changed |= local_adjust_slider(ui, &mut mask.end[0], 0.0..=1.0, "終了 X");
-            changed |= local_adjust_slider(ui, &mut mask.end[1], 0.0..=1.0, "終了 Y");
         }
         local_adjust_core::LocalMask::RadialGradient(mask) => {
-            if !mask.initialized && ui.small_button("中央円形グラデーションを作成").clicked()
-            {
-                *mask = local_adjust_core::RadialGradientMask {
-                    initialized: true,
-                    center: [0.5, 0.5],
-                    inner_radius: 0.18,
-                    inner_radius_y: 0.18,
-                    outer_radius: 0.65,
-                    outer_radius_y: 0.65,
-                };
-                changed = true;
+            if !mask.initialized {
+                ui.label("画像上でドラッグして範囲を生成します。");
+            } else {
+                if ui.small_button("グラデーションをクリア").clicked() {
+                    *mask = local_adjust_core::RadialGradientMask::default();
+                    changed = true;
+                }
+                changed |= local_adjust_slider(ui, &mut mask.center[0], 0.0..=1.0, "中心 X");
+                changed |= local_adjust_slider(ui, &mut mask.center[1], 0.0..=1.0, "中心 Y");
+                changed |= local_adjust_slider(ui, &mut mask.inner_radius, 0.0..=1.5, "内側 横");
+                changed |= local_adjust_slider(ui, &mut mask.inner_radius_y, 0.0..=1.5, "内側 縦");
+                changed |= local_adjust_slider(ui, &mut mask.outer_radius, 0.0..=1.5, "外側 横");
+                changed |= local_adjust_slider(ui, &mut mask.outer_radius_y, 0.0..=1.5, "外側 縦");
+                mask.outer_radius = mask.outer_radius.max(mask.inner_radius + 0.001);
+                mask.outer_radius_y = mask.outer_radius_y.max(mask.inner_radius_y + 0.001);
             }
-            changed |= ui.checkbox(&mut mask.initialized, "有効").changed();
-            changed |= local_adjust_slider(ui, &mut mask.center[0], 0.0..=1.0, "中心 X");
-            changed |= local_adjust_slider(ui, &mut mask.center[1], 0.0..=1.0, "中心 Y");
-            changed |= local_adjust_slider(ui, &mut mask.inner_radius, 0.0..=1.5, "内側 横");
-            changed |= local_adjust_slider(ui, &mut mask.inner_radius_y, 0.0..=1.5, "内側 縦");
-            changed |= local_adjust_slider(ui, &mut mask.outer_radius, 0.0..=1.5, "外側 横");
-            changed |= local_adjust_slider(ui, &mut mask.outer_radius_y, 0.0..=1.5, "外側 縦");
-            mask.outer_radius = mask.outer_radius.max(mask.inner_radius + 0.001);
-            mask.outer_radius_y = mask.outer_radius_y.max(mask.inner_radius_y + 0.001);
         }
         local_adjust_core::LocalMask::LumaRange(mask) => {
             ui.label(
@@ -5523,6 +5796,19 @@ fn draw_sliders(
 }
 
 impl App {
+    pub(crate) fn set_local_adjust_mask_tool_from_shortcut(&mut self, tool: LocalAdjustMaskTool) {
+        if self.local_adjust_mask_tool != tool {
+            self.local_adjust_mask_lasso_points.clear();
+            self.local_adjust_mask_shape_drag_start = None;
+            self.local_adjust_mask_shape_drag_end = None;
+            self.local_adjust_mask_brush_stroke = None;
+            self.local_adjust_shape_drag = None;
+            self.local_adjust_shape_drag_before_layers = None;
+        }
+        self.local_adjust_mask_tool = tool;
+        self.show_feedback_toast(format!("マスクツール: {}", local_mask_tool_label(tool)));
+    }
+
     /// 補正レイヤー独立パネルの矩形を返す。
     pub(crate) fn local_adjust_panel_rect(&self, full_rect: egui::Rect) -> egui::Rect {
         let panel_pos = egui::pos2(
@@ -5604,6 +5890,55 @@ impl App {
         true
     }
 
+    fn apply_local_adjust_bitmap_mask_op(
+        &mut self,
+        fs_idx: usize,
+        layer_idx: usize,
+        edit_target: LocalAdjustMaskEditTarget,
+        op: LocalAdjustBitmapMaskOp,
+    ) {
+        let image_dims = local_adjust_image_dims(self, fs_idx);
+        let changed =
+            self.mutate_local_adjust_layer_from_canvas(fs_idx, layer_idx, true, |layer| {
+                let Some(active_target) = effective_local_mask_edit_target(layer, edit_target)
+                else {
+                    return false;
+                };
+                let Some(mask) = local_adjust_target_raster_vector_mask_mut(
+                    layer,
+                    active_target,
+                    image_dims,
+                    true,
+                ) else {
+                    return false;
+                };
+                let expected_len = mask.width.saturating_mul(mask.height);
+                if expected_len == 0 || mask.alpha.len() < expected_len {
+                    return false;
+                }
+                let next = local_adjust_morph_alpha_1px(
+                    &mask.alpha,
+                    mask.width,
+                    mask.height,
+                    op == LocalAdjustBitmapMaskOp::Expand,
+                );
+                if next == mask.alpha {
+                    return false;
+                }
+                mask.alpha = next;
+                true
+            });
+        if changed {
+            self.show_feedback_toast(
+                match op {
+                    LocalAdjustBitmapMaskOp::Expand => "手動マスクを1px拡張しました。",
+                    LocalAdjustBitmapMaskOp::Shrink => "手動マスクを1px縮小しました。",
+                }
+                .to_string(),
+            );
+        }
+    }
+
     fn apply_local_adjust_gradient_drag(
         &mut self,
         drag: crate::app::LocalAdjustCanvasDrag,
@@ -5622,17 +5957,76 @@ impl App {
                     true
                 }
                 (
+                    local_adjust_core::LocalMask::LinearGradient(mask),
+                    crate::app::LocalAdjustCanvasDragKind::LinearGradientStart,
+                ) => {
+                    mask.start = norm;
+                    true
+                }
+                (
+                    local_adjust_core::LocalMask::LinearGradient(mask),
+                    crate::app::LocalAdjustCanvasDragKind::LinearGradientEnd,
+                ) => {
+                    mask.end = norm;
+                    true
+                }
+                (
                     local_adjust_core::LocalMask::RadialGradient(mask),
                     crate::app::LocalAdjustCanvasDragKind::RadialGradient,
                 ) => {
                     mask.initialized = true;
                     mask.center = drag.start;
-                    let dx = (norm[0] - drag.start[0]).abs().max(0.001);
-                    let dy = (norm[1] - drag.start[1]).abs().max(0.001);
-                    mask.inner_radius = 0.0;
-                    mask.inner_radius_y = 0.0;
-                    mask.outer_radius = dx;
-                    mask.outer_radius_y = dy;
+                    let dx = norm[0] - drag.start[0];
+                    let dy = norm[1] - drag.start[1];
+                    let radius = (dx * dx + dy * dy).sqrt().max(0.001);
+                    let inner = (radius * 0.45).min(radius - 0.001).max(0.0);
+                    mask.inner_radius = inner;
+                    mask.inner_radius_y = inner;
+                    mask.outer_radius = radius;
+                    mask.outer_radius_y = radius;
+                    true
+                }
+                (
+                    local_adjust_core::LocalMask::RadialGradient(mask),
+                    crate::app::LocalAdjustCanvasDragKind::RadialGradientCenter,
+                ) => {
+                    mask.center = norm;
+                    true
+                }
+                (
+                    local_adjust_core::LocalMask::RadialGradient(mask),
+                    crate::app::LocalAdjustCanvasDragKind::RadialGradientInnerX,
+                ) => {
+                    mask.inner_radius = (norm[0] - mask.center[0])
+                        .abs()
+                        .min((mask.outer_radius - 0.001).max(0.0));
+                    true
+                }
+                (
+                    local_adjust_core::LocalMask::RadialGradient(mask),
+                    crate::app::LocalAdjustCanvasDragKind::RadialGradientInnerY,
+                ) => {
+                    mask.inner_radius_y = (norm[1] - mask.center[1])
+                        .abs()
+                        .min((mask.outer_radius_y - 0.001).max(0.0));
+                    true
+                }
+                (
+                    local_adjust_core::LocalMask::RadialGradient(mask),
+                    crate::app::LocalAdjustCanvasDragKind::RadialGradientOuterX,
+                ) => {
+                    mask.outer_radius = (norm[0] - mask.center[0])
+                        .abs()
+                        .max(mask.inner_radius + 0.001);
+                    true
+                }
+                (
+                    local_adjust_core::LocalMask::RadialGradient(mask),
+                    crate::app::LocalAdjustCanvasDragKind::RadialGradientOuterY,
+                ) => {
+                    mask.outer_radius_y = (norm[1] - mask.center[1])
+                        .abs()
+                        .max(mask.inner_radius_y + 0.001);
                     true
                 }
                 (_, crate::app::LocalAdjustCanvasDragKind::EffectCenter) => {
@@ -6109,6 +6503,15 @@ impl App {
         if !self.local_adjust_mode {
             return;
         }
+        if self.local_adjust_add_layer_dialog_open
+            || self.local_adjust_change_mask_dialog_open
+            || self.local_adjust_effect_picker_dialog_open
+        {
+            self.local_adjust_canvas_drag = None;
+            self.local_adjust_mask_brush_stroke = None;
+            self.local_adjust_shape_drag = None;
+            return;
+        }
         let Some(fs_idx) = self.current_local_adjust_edit_idx() else {
             self.local_adjust_mask_brush_stroke = None;
             return;
@@ -6233,7 +6636,14 @@ impl App {
                     self.apply_local_adjust_gradient_drag(drag, norm, false);
                     let cursor = if matches!(
                         drag.kind,
-                        crate::app::LocalAdjustCanvasDragKind::EffectCenter
+                        crate::app::LocalAdjustCanvasDragKind::LinearGradientStart
+                            | crate::app::LocalAdjustCanvasDragKind::LinearGradientEnd
+                            | crate::app::LocalAdjustCanvasDragKind::RadialGradientCenter
+                            | crate::app::LocalAdjustCanvasDragKind::RadialGradientInnerX
+                            | crate::app::LocalAdjustCanvasDragKind::RadialGradientInnerY
+                            | crate::app::LocalAdjustCanvasDragKind::RadialGradientOuterX
+                            | crate::app::LocalAdjustCanvasDragKind::RadialGradientOuterY
+                            | crate::app::LocalAdjustCanvasDragKind::EffectCenter
                             | crate::app::LocalAdjustCanvasDragKind::TiltShiftRange
                             | crate::app::LocalAdjustCanvasDragKind::TiltShiftFocus
                             | crate::app::LocalAdjustCanvasDragKind::TiltShiftOuter
@@ -6368,6 +6778,28 @@ impl App {
                     }
                 }
                 self.local_adjust_rgb_pick_active = None;
+                return;
+            }
+
+            if let Some(kind) = self
+                .local_adjust_page_layers
+                .get(&fs_idx)
+                .and_then(|layers| layers.get(layer_idx))
+                .and_then(|layer| {
+                    local_adjust_gradient_handle_hit(layer, pos, image_rect, image_dims, zoom_pan)
+                })
+            {
+                self.local_adjust_canvas_drag_before_layers =
+                    self.local_adjust_page_layers.get(&fs_idx).cloned();
+                let drag = crate::app::LocalAdjustCanvasDrag {
+                    fs_idx,
+                    layer_idx,
+                    kind,
+                    start: norm,
+                };
+                self.local_adjust_canvas_drag = Some(drag);
+                self.apply_local_adjust_gradient_drag(drag, norm, false);
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                 return;
             }
 
@@ -6623,6 +7055,16 @@ impl App {
             .get(&fs_idx)
             .and_then(|layers| layers.get(layer_idx))
             .and_then(|layer| {
+                local_adjust_gradient_handle_hit(layer, pos, image_rect, image_dims, zoom_pan)
+            })
+            .is_some()
+        {
+            ctx.set_cursor_icon(egui::CursorIcon::Grab);
+        } else if self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .and_then(|layers| layers.get(layer_idx))
+            .and_then(|layer| {
                 effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target)
             })
             .is_some()
@@ -6679,6 +7121,12 @@ impl App {
         if !self.local_adjust_mode {
             return;
         }
+        if self.local_adjust_add_layer_dialog_open
+            || self.local_adjust_change_mask_dialog_open
+            || self.local_adjust_effect_picker_dialog_open
+        {
+            return;
+        }
         let Some(fs_idx) = self.current_local_adjust_edit_idx() else {
             return;
         };
@@ -6711,6 +7159,8 @@ impl App {
                 source_pixels.as_deref(),
                 image_dims,
                 ui.ctx().input(|i| i.time) as f32,
+                self.local_adjust_mask_color_preset.colors(),
+                &mut self.local_adjust_mask_preview_texture,
             );
             if matches!(layer.mask, local_adjust_core::LocalMask::Segmentation(_)) {
                 ui.ctx()
@@ -6859,7 +7309,9 @@ impl App {
                 };
                 painter.line_segment([start, end], stroke);
                 painter.circle_filled(start, 5.0, egui::Color32::from_rgb(255, 238, 145));
+                painter.circle_stroke(start, 5.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
                 painter.circle_filled(end, 5.0, egui::Color32::from_rgb(80, 210, 255));
+                painter.circle_stroke(end, 5.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
             }
             local_adjust_core::LocalMask::RadialGradient(mask) if mask.initialized => {
                 let Some(center) =
@@ -6867,6 +7319,21 @@ impl App {
                 else {
                     return;
                 };
+                let Some((_, drawn_rect)) =
+                    local_adjust_image_layout(image_rect, image_dims, zoom_pan)
+                else {
+                    return;
+                };
+                let inner_rx = mask.inner_radius.max(0.0) * drawn_rect.width();
+                let inner_ry = mask.inner_radius_y.max(0.0) * drawn_rect.height();
+                let outer_rx =
+                    mask.outer_radius.max(mask.inner_radius).max(0.0) * drawn_rect.width();
+                let outer_ry =
+                    mask.outer_radius_y.max(mask.inner_radius_y).max(0.0) * drawn_rect.height();
+                let inner_x_handle = egui::pos2(center.x + inner_rx, center.y);
+                let inner_y_handle = egui::pos2(center.x, center.y + inner_ry);
+                let outer_x_handle = egui::pos2(center.x + outer_rx, center.y);
+                let outer_y_handle = egui::pos2(center.x, center.y + outer_ry);
                 draw_local_adjust_ellipse(
                     painter,
                     image_rect,
@@ -6889,7 +7356,46 @@ impl App {
                         egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 220, 255)),
                     );
                 }
+                painter.line_segment(
+                    [egui::pos2(center.x - outer_rx, center.y), outer_x_handle],
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 220, 80, 100),
+                    ),
+                );
+                painter.line_segment(
+                    [egui::pos2(center.x, center.y - outer_ry), outer_y_handle],
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 220, 80, 100),
+                    ),
+                );
                 painter.circle_filled(center, 5.0, egui::Color32::from_rgb(255, 238, 145));
+                painter.circle_stroke(center, 5.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
+                painter.circle_filled(inner_x_handle, 4.5, egui::Color32::from_rgb(255, 230, 140));
+                painter.circle_stroke(
+                    inner_x_handle,
+                    4.5,
+                    egui::Stroke::new(1.5, egui::Color32::BLACK),
+                );
+                painter.circle_filled(inner_y_handle, 4.5, egui::Color32::from_rgb(255, 230, 140));
+                painter.circle_stroke(
+                    inner_y_handle,
+                    4.5,
+                    egui::Stroke::new(1.5, egui::Color32::BLACK),
+                );
+                painter.circle_filled(outer_x_handle, 5.0, egui::Color32::from_rgb(255, 190, 110));
+                painter.circle_stroke(
+                    outer_x_handle,
+                    5.0,
+                    egui::Stroke::new(1.5, egui::Color32::BLACK),
+                );
+                painter.circle_filled(outer_y_handle, 5.0, egui::Color32::from_rgb(255, 190, 110));
+                painter.circle_stroke(
+                    outer_y_handle,
+                    5.0,
+                    egui::Stroke::new(1.5, egui::Color32::BLACK),
+                );
             }
             _ => {}
         }
@@ -7842,7 +8348,11 @@ impl App {
         let effect_position_handles_visible = self.local_adjust_effect_position_handles_visible;
         let segmentation_pending = self.local_adjust_segmentation_pending.is_some();
         let active_local_adjust_layers = self.has_active_local_adjust_layers(fs_idx);
-        let local_adjust_render_pending = self.local_adjust_pending.contains_key(&fs_idx);
+        let current_local_adjust_key = self.current_local_adjust_key(fs_idx);
+        let local_adjust_render_pending = self
+            .local_adjust_pending
+            .get(&fs_idx)
+            .is_some_and(|pending| pending.key == current_local_adjust_key);
         let local_adjust_render_ready = self.current_local_adjust_texture(fs_idx).is_some();
         let local_adjust_status = if segmentation_pending {
             "マスク生成中...".to_string()
@@ -7906,6 +8416,7 @@ impl App {
         let mut delete_layer: Option<usize> = None;
         let clear_layers = false;
         let mut effect_requests = LocalEffectPanelRequests::default();
+        let mut bitmap_mask_op = None;
 
         egui::Area::new(egui::Id::new("local_adjust_panel"))
             .fixed_pos(panel_pos)
@@ -8058,8 +8569,11 @@ impl App {
                                             &mut mask_edit_target,
                                             &mut mask_paint_add,
                                             &mut mask_tool,
+                                            &mut bitmap_mask_op,
                                             &mut self.local_adjust_show_source,
                                             &mut self.local_adjust_show_mask,
+                                            &mut self.local_adjust_mask_color_preset,
+                                            &mut self.local_adjust_preview_to_selected_layer,
                                         );
                                     });
                             },
@@ -8189,6 +8703,14 @@ impl App {
         self.local_adjust_edge_brush_include_boundary = edge_brush_include_boundary;
         self.local_adjust_region_color_tolerance = region_color_tolerance.clamp(4.0, 120.0);
         self.local_adjust_region_min_area = region_min_area.clamp(1, 2048);
+        if let Some(op) = bitmap_mask_op {
+            self.apply_local_adjust_bitmap_mask_op(
+                fs_idx,
+                selected_layer,
+                self.local_adjust_mask_edit_target,
+                op,
+            );
+        }
         self.apply_local_adjust_panel_actions(
             fs_idx,
             add_layer_mask,

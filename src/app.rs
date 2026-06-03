@@ -281,6 +281,18 @@ impl Drop for LocalAdjustLayerBypassPending {
     }
 }
 
+pub(crate) struct LocalAdjustPrefixPreviewPending {
+    pub(crate) key: LocalAdjustPrefixPreviewKey,
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) rx: mpsc::Receiver<LocalAdjustRenderResult>,
+}
+
+impl Drop for LocalAdjustPrefixPreviewPending {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 pub(crate) enum LocalAdjustRenderResult {
     Ready {
         key: LocalAdjustResultKey,
@@ -337,7 +349,14 @@ impl LocalAdjustRegionSegmentationScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalAdjustCanvasDragKind {
     LinearGradient,
+    LinearGradientStart,
+    LinearGradientEnd,
     RadialGradient,
+    RadialGradientCenter,
+    RadialGradientInnerX,
+    RadialGradientInnerY,
+    RadialGradientOuterX,
+    RadialGradientOuterY,
     EffectCenter,
     TiltShiftRange,
     TiltShiftFocus,
@@ -362,6 +381,89 @@ pub(crate) enum LocalAdjustMaskEditTarget {
     Base,
     OverrideAdd,
     OverrideSubtract,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalAdjustMaskColorPreset {
+    PinkCyan,
+    CyanOrange,
+    YellowViolet,
+}
+
+impl LocalAdjustMaskColorPreset {
+    pub(crate) const ALL: [Self; 3] = [Self::PinkCyan, Self::CyanOrange, Self::YellowViolet];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PinkCyan => "1",
+            Self::CyanOrange => "2",
+            Self::YellowViolet => "3",
+        }
+    }
+
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::PinkCyan => "ピンク / 水色",
+            Self::CyanOrange => "シアン / オレンジ",
+            Self::YellowViolet => "黄 / 紫",
+        }
+    }
+
+    pub(crate) fn colors(self) -> LocalAdjustMaskPreviewColors {
+        match self {
+            Self::PinkCyan => LocalAdjustMaskPreviewColors {
+                base_rgb: [255, 48, 84],
+                edit_rgb: [64, 190, 255],
+                boundary_rgb: [255, 245, 120],
+            },
+            Self::CyanOrange => LocalAdjustMaskPreviewColors {
+                base_rgb: [0, 205, 255],
+                edit_rgb: [255, 150, 40],
+                boundary_rgb: [255, 235, 80],
+            },
+            Self::YellowViolet => LocalAdjustMaskPreviewColors {
+                base_rgb: [255, 225, 40],
+                edit_rgb: [185, 115, 255],
+                boundary_rgb: [80, 230, 255],
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalAdjustMaskPreviewColors {
+    pub(crate) base_rgb: [u8; 3],
+    pub(crate) edit_rgb: [u8; 3],
+    pub(crate) boundary_rgb: [u8; 3],
+}
+
+impl LocalAdjustMaskPreviewColors {
+    pub(crate) fn base(self, alpha: u8) -> egui::Color32 {
+        egui::Color32::from_rgba_unmultiplied(
+            self.base_rgb[0],
+            self.base_rgb[1],
+            self.base_rgb[2],
+            alpha,
+        )
+    }
+
+    pub(crate) fn edit(self, alpha: u8) -> egui::Color32 {
+        egui::Color32::from_rgba_unmultiplied(
+            self.edit_rgb[0],
+            self.edit_rgb[1],
+            self.edit_rgb[2],
+            alpha,
+        )
+    }
+
+    pub(crate) fn boundary(self, alpha: u8) -> egui::Color32 {
+        egui::Color32::from_rgba_unmultiplied(
+            self.boundary_rgb[0],
+            self.boundary_rgb[1],
+            self.boundary_rgb[2],
+            alpha,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1519,6 +1621,13 @@ pub(crate) struct LocalAdjustResultKey {
 pub(crate) struct LocalAdjustLayerBypassPreviewKey {
     pub(crate) result_key: LocalAdjustResultKey,
     pub(crate) layer_idx: usize,
+}
+
+/// 先頭から指定レイヤー数までを一時合成する補正レイヤープレビューの cache key。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LocalAdjustPrefixPreviewKey {
+    pub(crate) result_key: LocalAdjustResultKey,
+    pub(crate) layer_count: usize,
 }
 
 /// 補正レイヤー合成結果の cache entry。
@@ -3148,6 +3257,12 @@ pub struct App {
     pub(crate) local_adjust_show_source: bool,
     /// 補正レイヤー編集時に選択中レイヤーのマスクを表示する。
     pub(crate) local_adjust_show_mask: bool,
+    /// 補正レイヤー編集時のマスクプレビュー色。
+    pub(crate) local_adjust_mask_color_preset: LocalAdjustMaskColorPreset,
+    /// 選択中レイヤーまでを合成した表示確認モード。
+    pub(crate) local_adjust_preview_to_selected_layer: bool,
+    /// 補正レイヤーのマスクプレビュー overlay 用テクスチャ。
+    pub(crate) local_adjust_mask_preview_texture: Option<egui::TextureHandle>,
     /// 補正レイヤー効果パラメータのコピー/ペースト用クリップボード。
     pub(crate) local_adjust_effect_clipboard: Option<local_adjust_core::LocalEffect>,
     /// 効果色スポイトの対象。キャンバスクリックで対象色を拾う。
@@ -3218,6 +3333,11 @@ pub struct App {
         std::collections::HashMap<LocalAdjustLayerBypassPreviewKey, LocalAdjustCacheEntry>,
     /// 選択中レイヤーだけを一時除外した補正レイヤー preview worker。
     pub(crate) local_adjust_layer_bypass_pending: Option<LocalAdjustLayerBypassPending>,
+    /// 選択中レイヤーまでを一時表示する補正レイヤー preview cache。
+    pub(crate) local_adjust_prefix_preview_cache:
+        std::collections::HashMap<LocalAdjustPrefixPreviewKey, LocalAdjustCacheEntry>,
+    /// 選択中レイヤーまでを一時表示する補正レイヤー preview worker。
+    pub(crate) local_adjust_prefix_preview_pending: Option<LocalAdjustPrefixPreviewPending>,
     /// 補正レイヤーの 3D LUT 読み込み worker。
     pub(crate) local_adjust_lut_pending: Option<LocalAdjustLutLoadPending>,
     /// 補正レイヤーの被写体/領域マスク生成 worker。
@@ -4434,6 +4554,9 @@ impl App {
             local_adjust_effect_query: String::new(),
             local_adjust_show_source: false,
             local_adjust_show_mask: true,
+            local_adjust_mask_color_preset: LocalAdjustMaskColorPreset::PinkCyan,
+            local_adjust_preview_to_selected_layer: false,
+            local_adjust_mask_preview_texture: None,
             local_adjust_effect_clipboard: None,
             local_adjust_rgb_pick_active: None,
             local_adjust_selective_color_pick_active: false,
@@ -4466,6 +4589,8 @@ impl App {
             local_adjust_pending: std::collections::HashMap::new(),
             local_adjust_layer_bypass_cache: std::collections::HashMap::new(),
             local_adjust_layer_bypass_pending: None,
+            local_adjust_prefix_preview_cache: std::collections::HashMap::new(),
+            local_adjust_prefix_preview_pending: None,
             local_adjust_lut_pending: None,
             local_adjust_segmentation_pending: None,
             local_adjust_region_color_tolerance: 42.0,
@@ -8506,6 +8631,7 @@ impl App {
         self.local_adjust_effect_query.clear();
         self.local_adjust_show_source = false;
         self.local_adjust_show_mask = true;
+        self.local_adjust_preview_to_selected_layer = false;
         self.local_adjust_effect_clipboard = None;
         self.local_adjust_rgb_pick_active = None;
         self.local_adjust_selective_color_pick_active = false;
@@ -8524,7 +8650,7 @@ impl App {
         self.local_adjust_cache.clear();
         self.cancel_all_local_adjust_pending();
         self.local_adjust_layer_bypass_cache.clear();
-        self.cancel_local_adjust_layer_bypass_pending();
+        self.local_adjust_prefix_preview_cache.clear();
         self.local_adjust_lut_pending = None;
         self.local_adjust_segmentation_pending = None;
         self.mask_pages.clear();
@@ -9637,11 +9763,11 @@ impl App {
         self.erase_result_cache.clear();
         self.local_adjust_cache.clear();
         self.local_adjust_layer_bypass_cache.clear();
+        self.local_adjust_prefix_preview_cache.clear();
         self.export_crop_mode = false;
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
         self.cancel_all_local_adjust_pending();
-        self.cancel_local_adjust_layer_bypass_pending();
         self.local_adjust_lut_pending = None;
         self.local_adjust_segmentation_pending = None;
         // 360 度パノラマビュー: cache 全体が変わったので世代を一斉 bump (§3.6.2.2)。
@@ -18249,6 +18375,15 @@ impl App {
         }
         self.local_adjust_layer_bypass_cache
             .retain(|key, _| key.result_key.idx != idx);
+        if self
+            .local_adjust_prefix_preview_pending
+            .as_ref()
+            .is_some_and(|pending| pending.key.result_key.idx == idx)
+        {
+            self.cancel_local_adjust_prefix_preview_pending();
+        }
+        self.local_adjust_prefix_preview_cache
+            .retain(|key, _| key.result_key.idx != idx);
     }
 
     fn cancel_local_adjust_pending_for_idx(&mut self, idx: usize) {
@@ -18263,12 +18398,19 @@ impl App {
         }
     }
 
+    fn cancel_local_adjust_prefix_preview_pending(&mut self) {
+        if let Some(pending) = self.local_adjust_prefix_preview_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
     fn cancel_all_local_adjust_pending(&mut self) {
         for pending in self.local_adjust_pending.values() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         self.local_adjust_pending.clear();
         self.cancel_local_adjust_layer_bypass_pending();
+        self.cancel_local_adjust_prefix_preview_pending();
     }
 
     /// 補正レイヤーが変わったことを idx 単位の世代で表す。
@@ -18317,6 +18459,28 @@ impl App {
             .map(|entry| entry.texture.clone())
     }
 
+    pub(crate) fn current_local_adjust_prefix_preview_key(
+        &self,
+        idx: usize,
+        layer_count: usize,
+    ) -> LocalAdjustPrefixPreviewKey {
+        LocalAdjustPrefixPreviewKey {
+            result_key: self.current_local_adjust_key(idx),
+            layer_count,
+        }
+    }
+
+    pub(crate) fn current_local_adjust_prefix_preview_texture(
+        &self,
+        idx: usize,
+        layer_count: usize,
+    ) -> Option<egui::TextureHandle> {
+        let key = self.current_local_adjust_prefix_preview_key(idx, layer_count);
+        self.local_adjust_prefix_preview_cache
+            .get(&key)
+            .map(|entry| entry.texture.clone())
+    }
+
     fn local_adjust_layers_with_selected_layer_bypassed(
         &self,
         idx: usize,
@@ -18329,6 +18493,23 @@ impl App {
             .iter()
             .any(|layer| layer.enabled && layer.opacity > 0.0)
             .then_some(layers)
+    }
+
+    fn local_adjust_layers_until(
+        &self,
+        idx: usize,
+        layer_count: usize,
+    ) -> Option<Vec<local_adjust_core::LocalAdjustmentLayer>> {
+        let layers = self.local_adjust_page_layers.get(&idx)?;
+        let count = layer_count.min(layers.len());
+        if count == 0 || count >= layers.len() {
+            return None;
+        }
+        let preview_layers = layers[..count].to_vec();
+        preview_layers
+            .iter()
+            .any(|layer| layer.enabled && layer.opacity > 0.0)
+            .then_some(preview_layers)
     }
 
     fn local_adjust_layers_for_render(
@@ -18466,6 +18647,54 @@ impl App {
             Some(LocalAdjustLayerBypassPending { key, cancel, rx });
     }
 
+    pub(crate) fn maybe_start_local_adjust_prefix_preview(
+        &mut self,
+        idx: usize,
+        layer_count: usize,
+    ) {
+        if self
+            .current_local_adjust_prefix_preview_texture(idx, layer_count)
+            .is_some()
+        {
+            return;
+        }
+        let key = self.current_local_adjust_prefix_preview_key(idx, layer_count);
+        if self
+            .local_adjust_prefix_preview_pending
+            .as_ref()
+            .is_some_and(|pending| pending.key == key)
+        {
+            return;
+        }
+        let Some(layers) = self.local_adjust_layers_until(idx, layer_count) else {
+            return;
+        };
+        let Some(source) = self.current_local_adjust_source_pixels(idx) else {
+            return;
+        };
+
+        self.cancel_local_adjust_prefix_preview_pending();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
+        let render_key = key.result_key;
+        let (tx, rx) = mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("local-adjust-prefix-preview".to_string())
+            .spawn(move || {
+                let result = run_local_adjust_render(render_key, source, layers, cancel_worker);
+                let _ = tx.send(result);
+            });
+        if let Err(err) = spawn_result {
+            crate::logger::log(format!(
+                "local_adjust: prefix preview worker spawn failed: {err}"
+            ));
+            return;
+        }
+
+        self.local_adjust_prefix_preview_pending =
+            Some(LocalAdjustPrefixPreviewPending { key, cancel, rx });
+    }
+
     pub(crate) fn poll_local_adjust_render(&mut self, ctx: &egui::Context) {
         let mut completed = Vec::new();
         let mut disconnected = Vec::new();
@@ -18573,6 +18802,60 @@ impl App {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.local_adjust_layer_bypass_pending = None;
+            }
+        }
+    }
+
+    pub(crate) fn poll_local_adjust_prefix_preview(&mut self, ctx: &egui::Context) {
+        let recv_result = {
+            let Some(pending) = self.local_adjust_prefix_preview_pending.as_ref() else {
+                return;
+            };
+            pending.rx.try_recv()
+        };
+        match recv_result {
+            Ok(LocalAdjustRenderResult::Ready { key, image }) => {
+                let Some(pending) = self.local_adjust_prefix_preview_pending.take() else {
+                    return;
+                };
+                if key != pending.key.result_key || key != self.current_local_adjust_key(key.idx) {
+                    return;
+                }
+                let pixels = Arc::new(image);
+                let upload = clamp_for_gpu(&pixels);
+                let texture = ctx.load_texture(
+                    format!(
+                        "local_adjust_prefix_preview_{}_{}_{}_{}_{}",
+                        key.idx,
+                        key.input_gen,
+                        key.erase_mask_gen,
+                        key.local_gen,
+                        pending.key.layer_count
+                    ),
+                    upload.into_owned(),
+                    egui::TextureOptions::LINEAR,
+                );
+                self.local_adjust_prefix_preview_cache
+                    .insert(pending.key, LocalAdjustCacheEntry { pixels, texture });
+                ctx.request_repaint();
+            }
+            Ok(LocalAdjustRenderResult::Cancelled) => {
+                self.local_adjust_prefix_preview_pending = None;
+            }
+            Ok(LocalAdjustRenderResult::Failed { key, error }) => {
+                self.local_adjust_prefix_preview_pending = None;
+                if key == self.current_local_adjust_key(key.idx) {
+                    crate::logger::log(format!(
+                        "local_adjust: prefix preview failed idx={} error={error}",
+                        key.idx
+                    ));
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.local_adjust_prefix_preview_pending = None;
             }
         }
     }
@@ -18699,6 +18982,7 @@ impl App {
         self.erase_result_cache.clear();
         self.local_adjust_cache.clear();
         self.local_adjust_layer_bypass_cache.clear();
+        self.local_adjust_prefix_preview_cache.clear();
         self.erase_preview_cache.clear();
         self.conceal_cache.clear();
     }
@@ -19953,7 +20237,9 @@ impl App {
         self.compare_wipe_dragging = false;
         self.local_adjust_cache.clear();
         self.local_adjust_layer_bypass_cache.clear();
+        self.local_adjust_prefix_preview_cache.clear();
         self.cancel_local_adjust_layer_bypass_pending();
+        self.cancel_local_adjust_prefix_preview_pending();
         // 360 度パノラマビュー: バルク clear に追随して全 entry を bump (§3.6.2.2)。
         self.bump_all_adjustment_generations();
         // 隠蔽合成: バルク色補正変更で全ページ入力が変わるため世代 bump して全 stale 化。
@@ -23715,6 +24001,7 @@ impl eframe::App for App {
         self.poll_erase_inpaint(ctx);
         self.poll_local_adjust_render(ctx);
         self.poll_local_adjust_layer_bypass_preview(ctx);
+        self.poll_local_adjust_prefix_preview(ctx);
         self.poll_local_adjust_lut_load(ctx);
         self.poll_local_adjust_segmentation(ctx);
         self.poll_search();
@@ -23771,6 +24058,7 @@ impl eframe::App for App {
             || self.metadata_pending.is_some()
             || !self.local_adjust_pending.is_empty()
             || self.local_adjust_layer_bypass_pending.is_some()
+            || self.local_adjust_prefix_preview_pending.is_some()
             || self.local_adjust_segmentation_pending.is_some()
             || self
                 .tag_prewarm_pending

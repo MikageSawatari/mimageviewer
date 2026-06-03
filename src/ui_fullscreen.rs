@@ -828,6 +828,24 @@ impl App {
             if ctrl_down || self.local_adjust_show_source {
                 return self.resolve_local_adjust_source_texture(ctx, idx);
             }
+            if self.local_adjust_preview_to_selected_layer
+                && let (Some(layer_idx), Some(total_layers)) = (
+                    self.selected_local_adjust_layer_idx(idx),
+                    self.local_adjust_page_layers.get(&idx).map(Vec::len),
+                )
+                && total_layers > 0
+            {
+                let layer_count = layer_idx.min(total_layers - 1) + 1;
+                if layer_count < total_layers {
+                    self.maybe_start_local_adjust_prefix_preview(idx, layer_count);
+                    if let Some(tex) =
+                        self.current_local_adjust_prefix_preview_texture(idx, layer_count)
+                    {
+                        return Some(tex);
+                    }
+                    return self.resolve_local_adjust_source_texture(ctx, idx);
+                }
+            }
         }
 
         let erase_result_tex = self.ensure_erase_result_texture(ctx, idx);
@@ -3177,6 +3195,69 @@ impl App {
                 } else {
                     "補正レイヤー: マスク表示 OFF".to_string()
                 });
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::D)) {
+                self.local_adjust_mask_paint_add = true;
+                self.show_feedback_toast("手動マスク: 描画".to_string());
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F)) {
+                self.local_adjust_mask_paint_add = false;
+                self.show_feedback_toast("手動マスク: 消去".to_string());
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B)) {
+                self.set_local_adjust_mask_tool_from_shortcut(
+                    crate::app::LocalAdjustMaskTool::Brush,
+                );
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::A)) {
+                self.set_local_adjust_mask_tool_from_shortcut(
+                    crate::app::LocalAdjustMaskTool::EdgeBrush,
+                );
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::G)) {
+                self.set_local_adjust_mask_tool_from_shortcut(
+                    crate::app::LocalAdjustMaskTool::GapFillBrush,
+                );
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L)) {
+                self.set_local_adjust_mask_tool_from_shortcut(
+                    crate::app::LocalAdjustMaskTool::Lasso,
+                );
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P)) {
+                self.set_local_adjust_mask_tool_from_shortcut(
+                    crate::app::LocalAdjustMaskTool::Polygon,
+                );
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S)) {
+                self.set_local_adjust_mask_tool_from_shortcut(
+                    crate::app::LocalAdjustMaskTool::Select,
+                );
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::I)) {
+                self.set_local_adjust_mask_tool_from_shortcut(
+                    crate::app::LocalAdjustMaskTool::Line,
+                );
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V)) {
+                self.set_local_adjust_mask_tool_from_shortcut(
+                    crate::app::LocalAdjustMaskTool::VertLine,
+                );
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H)) {
+                self.set_local_adjust_mask_tool_from_shortcut(
+                    crate::app::LocalAdjustMaskTool::HorizLine,
+                );
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R)) {
+                self.set_local_adjust_mask_tool_from_shortcut(
+                    crate::app::LocalAdjustMaskTool::Rect,
+                );
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::O)) {
+                self.set_local_adjust_mask_tool_from_shortcut(
+                    crate::app::LocalAdjustMaskTool::Ellipse,
+                );
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                 self.local_adjust_mode = false;
