@@ -314,6 +314,7 @@ pub(crate) enum LocalAdjustMaskEditTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalAdjustMaskTool {
+    Select,
     Brush,
     EdgeBrush,
     GapFillBrush,
@@ -324,6 +325,26 @@ pub(crate) enum LocalAdjustMaskTool {
     HorizLine,
     Rect,
     Ellipse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalAdjustShapeHandle {
+    Body,
+    LineStart,
+    LineEnd,
+    Corner(u8),
+    Radius,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalAdjustMaskShapeDrag {
+    pub(crate) fs_idx: usize,
+    pub(crate) layer_idx: usize,
+    pub(crate) target: LocalAdjustMaskEditTarget,
+    pub(crate) shape_idx: usize,
+    pub(crate) handle: LocalAdjustShapeHandle,
+    pub(crate) base: local_adjust_core::MaskShape,
+    pub(crate) origin: [f32; 2],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3070,8 +3091,15 @@ pub struct App {
     pub(crate) local_adjust_mask_shape_drag_start: Option<[f32; 2]>,
     /// 補正レイヤー手描きマスクの図形ドラッグ終点 (正規化座標)。
     pub(crate) local_adjust_mask_shape_drag_end: Option<[f32; 2]>,
+    /// 補正レイヤー手描きマスクの選択中図形。
+    pub(crate) local_adjust_selected_shape: Option<usize>,
+    /// 補正レイヤー手描きマスクの選択図形ドラッグ状態。
+    pub(crate) local_adjust_shape_drag: Option<LocalAdjustMaskShapeDrag>,
     /// 補正レイヤー手描きマスクのドラッグ中状態。
     pub(crate) local_adjust_mask_brush_stroke: Option<LocalAdjustMaskBrushStroke>,
+    /// 図形ドラッグ開始前の補正レイヤー配列。Undo をドラッグ単位にまとめる。
+    pub(crate) local_adjust_shape_drag_before_layers:
+        Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
     /// キャンバスドラッグ開始前の補正レイヤー配列。Undo をドラッグ単位にまとめる。
     pub(crate) local_adjust_canvas_drag_before_layers:
         Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
@@ -4301,7 +4329,10 @@ impl App {
             local_adjust_mask_lasso_points: Vec::new(),
             local_adjust_mask_shape_drag_start: None,
             local_adjust_mask_shape_drag_end: None,
+            local_adjust_selected_shape: None,
+            local_adjust_shape_drag: None,
             local_adjust_mask_brush_stroke: None,
+            local_adjust_shape_drag_before_layers: None,
             local_adjust_canvas_drag_before_layers: None,
             local_adjust_mask_brush_before_layers: None,
             local_adjust_generation: std::collections::HashMap::new(),
@@ -8337,7 +8368,10 @@ impl App {
         self.local_adjust_mask_lasso_points.clear();
         self.local_adjust_mask_shape_drag_start = None;
         self.local_adjust_mask_shape_drag_end = None;
+        self.local_adjust_selected_shape = None;
+        self.local_adjust_shape_drag = None;
         self.local_adjust_canvas_drag_before_layers = None;
+        self.local_adjust_shape_drag_before_layers = None;
         self.local_adjust_mask_brush_before_layers = None;
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
@@ -16733,7 +16767,10 @@ impl App {
         self.local_adjust_mask_lasso_points.clear();
         self.local_adjust_mask_shape_drag_start = None;
         self.local_adjust_mask_shape_drag_end = None;
+        self.local_adjust_selected_shape = None;
+        self.local_adjust_shape_drag = None;
         self.local_adjust_canvas_drag_before_layers = None;
+        self.local_adjust_shape_drag_before_layers = None;
         self.local_adjust_mask_brush_before_layers = None;
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
@@ -20820,7 +20857,10 @@ impl App {
         self.local_adjust_mask_lasso_points.clear();
         self.local_adjust_mask_shape_drag_start = None;
         self.local_adjust_mask_shape_drag_end = None;
+        self.local_adjust_selected_shape = None;
+        self.local_adjust_shape_drag = None;
         self.local_adjust_canvas_drag_before_layers = None;
+        self.local_adjust_shape_drag_before_layers = None;
         self.local_adjust_mask_brush_before_layers = None;
         self.analysis_mode = false;
         self.reset_erase_mode();
