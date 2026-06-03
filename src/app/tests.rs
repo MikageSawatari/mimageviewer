@@ -5290,6 +5290,107 @@ mod pipeline_cache_refactor_tests {
     }
 }
 
+#[cfg(test)]
+mod pipeline_display_edit_split_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn push_image(app: &mut App, path: &str) -> usize {
+        app.items.push(GridItem::Image(PathBuf::from(path)));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.items.len() - 1
+    }
+
+    fn insert_fs_static(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+        color: egui::Color32,
+    ) -> Arc<egui::ColorImage> {
+        let image = egui::ColorImage::new([1, 1], vec![color]);
+        let pixels = Arc::new(image.clone());
+        let tex = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex,
+                pixels: Arc::clone(&pixels),
+                source_dims: Some([1, 1]),
+                load_seq: 0,
+            },
+        );
+        pixels
+    }
+
+    fn insert_stale_final_display_cache(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+        color: egui::Color32,
+    ) {
+        let edit_key = EditResultKey {
+            idx,
+            source_gen: 0,
+            erase_mask_gen: 0,
+            local_gen: 0,
+            conceal_mask_gen: 0,
+            conceal_gen: app.conceal_generation,
+            crop_hash: 0,
+        };
+        let final_key = FinalCompositeKey {
+            edit_key,
+            params_hash: 0x55,
+            bg: 0,
+        };
+        let image = egui::ColorImage::new([1, 1], vec![color]);
+        let texture = ctx.load_texture(label, image.clone(), egui::TextureOptions::LINEAR);
+        app.final_composite_cache.insert(
+            final_key,
+            FinalCompositeEntry {
+                pixels: Arc::new(image),
+                texture,
+                complete: true,
+            },
+        );
+    }
+
+    #[test]
+    fn edit_sources_ignore_final_display_cache() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/display-edit-split.jpg");
+        let raw = insert_fs_static(
+            &mut app,
+            &ctx,
+            idx,
+            "raw_source",
+            egui::Color32::from_rgb(1, 2, 3),
+        );
+        insert_stale_final_display_cache(
+            &mut app,
+            &ctx,
+            idx,
+            "final_display",
+            egui::Color32::from_rgb(200, 210, 220),
+        );
+
+        let local_source = app
+            .current_local_adjust_source_pixels(idx)
+            .expect("raw fs source should be available for local adjust");
+        assert_eq!(local_source.pixels[0], raw.pixels[0]);
+
+        let (conceal_source, kind) = app
+            .current_conceal_source_pixels(idx)
+            .expect("raw fs source should be available for conceal");
+        assert_eq!(kind, "fs");
+        assert_eq!(conceal_source.pixels[0], raw.pixels[0]);
+    }
+}
+
 #[cfg(all(test, windows))]
 mod native_video_rating_key_tests {
     use super::phase_c_support::setup_app;
