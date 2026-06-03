@@ -34,20 +34,20 @@ use local_adjust_core::{
     MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
     NeonGlowParams, NewspaperPrintParams, NoiseDistribution, NoiseParams, OilPaintParams,
     OldFilmParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement, PartColorParams,
-    ParticleOverlayMode, ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection,
-    PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
-    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialFlashParams,
-    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RetroPaletteMode,
-    RetroPaletteParams, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams,
-    ScanlineGlitchParams, ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp,
-    SharpenParams, SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode,
-    SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement,
-    TextureParams, TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams,
-    VhsParams, VignetteParams, WaterCausticsParams, WaveDistortionMode, WaveDistortionParams,
-    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
-    compute_mosaic_tile_size, default_mask_application_for_effect, evaluate_layer_mask,
-    parse_cube_lut,
+    ParticleOverlayMode, ParticleOverlayParams, PhotoFilterParams, PhotoFilterPreset,
+    PinchSpherizeParams, PixelSortDirection, PixelSortOrder, PixelSortParams, PixelStylizeMode,
+    PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
+    RadialBlurMode, RadialBlurParams, RadialFlashParams, RadialGradientMask, RangeMask, RasterMask,
+    RasterVectorMask, RegionMask, RetroPaletteMode, RetroPaletteParams, RgbToneCurveParams,
+    RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode,
+    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
+    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
+    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
+    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams,
+    WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
+    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1033,6 +1033,7 @@ enum EffectKind {
     ToneCurve,
     RgbToneCurve,
     ColorBalance,
+    PhotoFilter,
     ThreeWayColorGrading,
     SelectiveColor,
     PartColor,
@@ -1140,6 +1141,7 @@ enum RgbPickTarget {
     ColorFillEnd,
     FrameColor,
     FrameLineColor,
+    PhotoFilterColor,
     ColorOverlayStart,
     ColorOverlayEnd,
     NeonGlowSource,
@@ -1176,6 +1178,7 @@ impl RgbPickTarget {
             Self::ColorFillEnd => "塗りつぶしの終了色",
             Self::FrameColor => "フレームの色",
             Self::FrameLineColor => "フレームの内側ライン色",
+            Self::PhotoFilterColor => "フォトフィルターのカスタム色",
             Self::ColorOverlayStart => "塗り/グラデーションの開始色",
             Self::ColorOverlayEnd => "塗り/グラデーションの終了色",
             Self::NeonGlowSource => "ネオングローの発光源色",
@@ -1214,6 +1217,7 @@ impl EffectKind {
             LocalEffect::ToneCurve(_) => Self::ToneCurve,
             LocalEffect::RgbToneCurve(_) => Self::RgbToneCurve,
             LocalEffect::ColorBalance(_) => Self::ColorBalance,
+            LocalEffect::PhotoFilter(_) => Self::PhotoFilter,
             LocalEffect::ThreeWayColorGrading(_) => Self::ThreeWayColorGrading,
             LocalEffect::SelectiveColor(_) => Self::SelectiveColor,
             LocalEffect::PartColor(_) => Self::PartColor,
@@ -1322,6 +1326,7 @@ impl EffectKind {
             Self::ToneCurve => "トーンカーブ",
             Self::RgbToneCurve => "RGBカーブ",
             Self::ColorBalance => "カラーバランス",
+            Self::PhotoFilter => "フォトフィルター",
             Self::ThreeWayColorGrading => "3-wayグレーディング",
             Self::SelectiveColor => "セレクティブカラー",
             Self::PartColor => "パートカラー",
@@ -1430,6 +1435,7 @@ impl EffectKind {
             Self::Equalize => "ヒスト平坦化",
             Self::AnamorphicFlare => "アナモルフフレア",
             Self::BokehSprite => "玉ボケ粒子",
+            Self::PhotoFilter => "フォトフィルタ",
             Self::LensDirt => "レンズ汚れ",
             Self::FrequencySeparation => "周波数分離",
             Self::RetroPalette => "レトロ減色",
@@ -1450,6 +1456,9 @@ impl EffectKind {
             Self::ToneCurve => "暗部から明部までの明るさをカーブで細かく調整します。",
             Self::RgbToneCurve => "赤、緑、青のチャンネル別カーブで色味と明暗を細かく調整します。",
             Self::ColorBalance => "シャドウ、中間、ハイライトごとに色の偏りを調整します。",
+            Self::PhotoFilter => {
+                "暖色・寒色・セピアなどの色付きフィルターをかぶせ、濃度と輝度保持で色かぶりや雰囲気を調整します。"
+            }
             Self::ThreeWayColorGrading => {
                 "シャドウ、中間、ハイライトに別々の色味と明るさを足して空気感を作ります。"
             }
@@ -1716,6 +1725,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ToneCurve,
             EffectKind::RgbToneCurve,
             EffectKind::ColorBalance,
+            EffectKind::PhotoFilter,
             EffectKind::ThreeWayColorGrading,
             EffectKind::SelectiveColor,
             EffectKind::PartColor,
@@ -9026,6 +9036,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 "チャンネルミキサー".to_string()
             }
         }
+        LocalEffect::PhotoFilter(params) => format!(
+            "フォトフィルター {} {:.0}%",
+            photo_filter_preset_label(params.preset),
+            params.strength * 100.0
+        ),
         LocalEffect::Clarity(_) => "明瞭度".to_string(),
         LocalEffect::Texture(params) => format!("テクスチャ {:+.0}%", params.amount * 100.0),
         LocalEffect::HighPass(params) => {
@@ -9599,6 +9614,21 @@ fn frame_mode_label(mode: FrameMode) -> &'static str {
     }
 }
 
+fn photo_filter_preset_label(preset: PhotoFilterPreset) -> &'static str {
+    match preset {
+        PhotoFilterPreset::Custom => "カスタム",
+        PhotoFilterPreset::Warm85 => "Warm 85",
+        PhotoFilterPreset::Warm81 => "Warm 81",
+        PhotoFilterPreset::Cool80 => "Cool 80",
+        PhotoFilterPreset::Cool82 => "Cool 82",
+        PhotoFilterPreset::Sepia => "セピア",
+        PhotoFilterPreset::Sunset => "夕景",
+        PhotoFilterPreset::Underwater => "水中",
+        PhotoFilterPreset::Magenta => "マゼンタ",
+        PhotoFilterPreset::Green => "グリーン",
+    }
+}
+
 fn outline_stroke_placement_label(placement: OutlineStrokePlacement) -> &'static str {
     match placement {
         OutlineStrokePlacement::Outside => "外側",
@@ -9716,6 +9746,11 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
         }
         (LocalEffect::Frame(params), RgbPickTarget::FrameLineColor) => {
             params.line_rgb = rgb;
+            true
+        }
+        (LocalEffect::PhotoFilter(params), RgbPickTarget::PhotoFilterColor) => {
+            params.color_rgb = rgb;
+            params.preset = PhotoFilterPreset::Custom;
             true
         }
         (LocalEffect::ColorOverlay(params), RgbPickTarget::ColorOverlayStart) => {
@@ -10427,6 +10462,129 @@ fn draw_effect_params(
             preserve.lab_hover_tip(
                 "色だけを寄せたいときに使います。オフにすると色変更による明るさ変化も残します。",
             );
+        }
+        LocalEffect::PhotoFilter(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "Warm 85") {
+                    *params = PhotoFilterParams {
+                        preset: PhotoFilterPreset::Warm85,
+                        density: 0.35,
+                        strength: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "Cool 80") {
+                    *params = PhotoFilterParams {
+                        preset: PhotoFilterPreset::Cool80,
+                        density: 0.32,
+                        strength: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "セピア") {
+                    *params = PhotoFilterParams {
+                        preset: PhotoFilterPreset::Sepia,
+                        density: 0.42,
+                        strength: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "夕景") {
+                    *params = PhotoFilterParams {
+                        preset: PhotoFilterPreset::Sunset,
+                        density: 0.45,
+                        strength: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "水中") {
+                    *params = PhotoFilterParams {
+                        preset: PhotoFilterPreset::Underwater,
+                        density: 0.38,
+                        strength: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "カスタム") {
+                    *params = PhotoFilterParams {
+                        preset: PhotoFilterPreset::Custom,
+                        density: 0.35,
+                        strength: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+            });
+            let before_preset = params.preset;
+            lab_combo_box(
+                ui,
+                "photo_filter_preset",
+                photo_filter_preset_label(params.preset),
+                |ui| {
+                    for preset in [
+                        PhotoFilterPreset::Custom,
+                        PhotoFilterPreset::Warm85,
+                        PhotoFilterPreset::Warm81,
+                        PhotoFilterPreset::Cool80,
+                        PhotoFilterPreset::Cool82,
+                        PhotoFilterPreset::Sepia,
+                        PhotoFilterPreset::Sunset,
+                        PhotoFilterPreset::Underwater,
+                        PhotoFilterPreset::Magenta,
+                        PhotoFilterPreset::Green,
+                    ] {
+                        ui.selectable_value(
+                            &mut params.preset,
+                            preset,
+                            photo_filter_preset_label(preset),
+                        );
+                    }
+                },
+            );
+            if params.preset != before_preset {
+                if params.strength <= f32::EPSILON {
+                    params.strength = 1.0;
+                }
+                changed = true;
+            }
+            ui.label(
+                egui::RichText::new(
+                    "色付きフィルターをかぶせる感覚で、暖色・寒色・セピアなどの色かぶりや雰囲気を足します。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            if params.preset == PhotoFilterPreset::Custom {
+                merge_rgb_color_response(
+                    draw_rgb_color_control(
+                        ui,
+                        "フィルター色",
+                        &mut params.color_rgb,
+                        RgbPickTarget::PhotoFilterColor,
+                        rgb_pick_active,
+                    ),
+                    &mut changed,
+                    &mut start_rgb_pick,
+                    &mut cancel_rgb_pick,
+                );
+            }
+            let density = ui.add(egui::Slider::new(&mut params.density, 0.0..=1.0).text("濃度"));
+            changed |= density.changed();
+            density.lab_hover_tip("フィルター色をどれだけ強くかぶせるかです。");
+            let preserve = ui.checkbox(&mut params.preserve_luminosity, "明るさを保つ");
+            changed |= preserve.changed();
+            preserve.lab_hover_tip(
+                "ONにすると、色味だけを変えて元の明るさに近づけます。OFFではフィルター色の明暗も反映します。",
+            );
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からフォトフィルター後の色へどれだけ近づけるかです。");
         }
         LocalEffect::ThreeWayColorGrading(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -20640,6 +20798,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ToneCurve => LocalEffect::ToneCurve(ToneCurveParams::default()),
         EffectKind::RgbToneCurve => LocalEffect::RgbToneCurve(RgbToneCurveParams::default()),
         EffectKind::ColorBalance => LocalEffect::ColorBalance(ColorBalanceParams::default()),
+        EffectKind::PhotoFilter => LocalEffect::PhotoFilter(PhotoFilterParams::default()),
         EffectKind::ThreeWayColorGrading => {
             LocalEffect::ThreeWayColorGrading(ThreeWayColorGradingParams::default())
         }
@@ -23184,6 +23343,7 @@ mod tests {
             EffectKind::ToneCurve,
             EffectKind::RgbToneCurve,
             EffectKind::ColorBalance,
+            EffectKind::PhotoFilter,
             EffectKind::ThreeWayColorGrading,
             EffectKind::SelectiveColor,
             EffectKind::PartColor,
@@ -23524,6 +23684,21 @@ mod tests {
         };
         assert_eq!(frame_params.color_rgb, [18, 28, 38]);
         assert_eq!(frame_params.line_rgb, [220, 230, 240]);
+
+        let mut photo_filter = LocalEffect::PhotoFilter(PhotoFilterParams {
+            preset: PhotoFilterPreset::Warm85,
+            ..Default::default()
+        });
+        assert!(set_rgb_pick_target(
+            &mut photo_filter,
+            RgbPickTarget::PhotoFilterColor,
+            [180, 120, 40],
+        ));
+        let LocalEffect::PhotoFilter(photo_filter_params) = photo_filter else {
+            panic!("expected photo filter effect");
+        };
+        assert_eq!(photo_filter_params.color_rgb, [180, 120, 40]);
+        assert_eq!(photo_filter_params.preset, PhotoFilterPreset::Custom);
 
         let mut overlay = LocalEffect::ColorOverlay(ColorOverlayParams::default());
         assert!(set_rgb_pick_target(

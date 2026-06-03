@@ -66,9 +66,9 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、102種)
+### `LocalEffect` (部分補正レイヤー、103種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
-RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
+RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別), PhotoFilter(色付きフィルター),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), PartColor(指定色だけ残す白黒化), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定), RetroPalette(固定/適応パレット減色),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
@@ -93,6 +93,7 @@ Subject(被写体分離) / Segmentation
 - [x] **色相別 HSL / カラーミキサー (6〜8色帯)** ★★★ **易〜中** — 「肌だけ」「空だけ」など色域ごとに H/S/L 調整。現 `Hsl` は全体一律なので別物 (Lightroom / PS / Krita)
 - [x] **チャンネル別トーンカーブ (R/G/B 独立・多点)** ★★ **易** — 現 `ToneCurve` は5点合成のみ。RGB 独立化＋多点でクロスプロセス等が自在に (PS / CSP / Krita)
 - [x] **カラーバランス (シャドウ/中間/ハイライト別の色偏移)** ★★ **易** — Look より自由なグレーディング (PS / CSP)
+- [x] **フォトフィルター (`PhotoFilter`)** ★ **易** — Warm/Cool/Sepia などの色付きフィルターを濃度と輝度保持でかぶせ、直感的に色かぶりや雰囲気を足せる
 - [x] **3-way カラーグレーディング (カラーホイール)** ★ **中** — 上位版。Lightroom Color Grading / DaVinci 風
 - [x] **セレクティブカラー / ポイントカラー** ★ **易〜中** — 特定色を選んでその色だけ調整 (Lightroom / PS)
 - [x] **チャンネルミキサー / 本格白黒変換 (色別の明度寄与)** ★ **易** — モノクロ化を色ごとに制御 (PS / Krita)

@@ -532,6 +532,7 @@ pub enum LocalEffect {
     ToneCurve(ToneCurveParams),
     RgbToneCurve(RgbToneCurveParams),
     ColorBalance(ColorBalanceParams),
+    PhotoFilter(PhotoFilterParams),
     ThreeWayColorGrading(ThreeWayColorGradingParams),
     SelectiveColor(SelectiveColorParams),
     PartColor(PartColorParams),
@@ -640,6 +641,7 @@ impl LocalEffect {
             Self::ToneCurve(_) => "トーンカーブ",
             Self::RgbToneCurve(_) => "RGBトーンカーブ",
             Self::ColorBalance(_) => "カラーバランス",
+            Self::PhotoFilter(_) => "フォトフィルター",
             Self::ThreeWayColorGrading(_) => "3ウェイカラー",
             Self::SelectiveColor(_) => "セレクティブカラー",
             Self::PartColor(_) => "パートカラー",
@@ -876,6 +878,60 @@ impl Default for ColorBalanceParams {
             preserve_luma: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PhotoFilterPreset {
+    #[default]
+    Custom,
+    Warm85,
+    Warm81,
+    Cool80,
+    Cool82,
+    Sepia,
+    Sunset,
+    Underwater,
+    Magenta,
+    Green,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PhotoFilterParams {
+    #[serde(default)]
+    pub preset: PhotoFilterPreset,
+    #[serde(default = "default_photo_filter_color_rgb")]
+    pub color_rgb: [u8; 3],
+    #[serde(default = "default_photo_filter_density")]
+    pub density: f32,
+    #[serde(default = "default_photo_filter_preserve_luminosity")]
+    pub preserve_luminosity: bool,
+    #[serde(default)]
+    pub strength: f32,
+}
+
+impl Default for PhotoFilterParams {
+    fn default() -> Self {
+        Self {
+            preset: PhotoFilterPreset::Custom,
+            color_rgb: default_photo_filter_color_rgb(),
+            density: default_photo_filter_density(),
+            preserve_luminosity: default_photo_filter_preserve_luminosity(),
+            strength: 0.0,
+        }
+    }
+}
+
+fn default_photo_filter_color_rgb() -> [u8; 3] {
+    [255, 176, 80]
+}
+
+fn default_photo_filter_density() -> f32 {
+    0.35
+}
+
+fn default_photo_filter_preserve_luminosity() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -4063,6 +4119,7 @@ where
             LocalEffect::ToneCurve(params) => apply_tone_curve(&image.pixels, *params),
             LocalEffect::RgbToneCurve(params) => apply_rgb_tone_curve(&image.pixels, *params),
             LocalEffect::ColorBalance(params) => apply_color_balance(&image.pixels, *params),
+            LocalEffect::PhotoFilter(params) => apply_photo_filter(&image.pixels, *params),
             LocalEffect::ThreeWayColorGrading(params) => {
                 apply_three_way_color_grading(&image.pixels, *params)
             }
@@ -5063,6 +5120,58 @@ fn color_balance_delta(range: ColorBalanceRange, weight: f32) -> [f32; 3] {
 
 fn add_rgb_delta(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn apply_photo_filter(src: &[u8], params: PhotoFilterParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let density = params.density.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || density <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let filter = rgb_u8_to_f32(photo_filter_rgb(params));
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        if px[3] == 0 {
+            continue;
+        }
+        let base = [
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        ];
+        let mut filtered = [
+            lerp_f32(base[0], filter[0], density),
+            lerp_f32(base[1], filter[1], density),
+            lerp_f32(base[2], filter[2], density),
+        ];
+        if params.preserve_luminosity {
+            let base_luma = luma01(base[0], base[1], base[2]);
+            let filtered_luma = luma01(filtered[0], filtered[1], filtered[2]);
+            let delta = base_luma - filtered_luma;
+            for channel in &mut filtered {
+                *channel = (*channel + delta).clamp(0.0, 1.0);
+            }
+        }
+        for c in 0..3 {
+            px[c] = to_u8(lerp_f32(base[c], filtered[c], strength));
+        }
+    }
+    out
+}
+
+fn photo_filter_rgb(params: PhotoFilterParams) -> [u8; 3] {
+    match params.preset {
+        PhotoFilterPreset::Custom => params.color_rgb,
+        PhotoFilterPreset::Warm85 => [255, 174, 74],
+        PhotoFilterPreset::Warm81 => [255, 202, 124],
+        PhotoFilterPreset::Cool80 => [92, 165, 255],
+        PhotoFilterPreset::Cool82 => [150, 205, 255],
+        PhotoFilterPreset::Sepia => [196, 132, 68],
+        PhotoFilterPreset::Sunset => [255, 112, 58],
+        PhotoFilterPreset::Underwater => [45, 180, 205],
+        PhotoFilterPreset::Magenta => [230, 88, 200],
+        PhotoFilterPreset::Green => [98, 205, 105],
+    }
 }
 
 fn apply_three_way_color_grading(src: &[u8], params: ThreeWayColorGradingParams) -> Vec<u8> {
@@ -17024,6 +17133,7 @@ mod tests {
             LocalEffect::ToneCurve(ToneCurveParams::default()),
             LocalEffect::RgbToneCurve(RgbToneCurveParams::default()),
             LocalEffect::ColorBalance(ColorBalanceParams::default()),
+            LocalEffect::PhotoFilter(PhotoFilterParams::default()),
             LocalEffect::ThreeWayColorGrading(ThreeWayColorGradingParams::default()),
             LocalEffect::SelectiveColor(SelectiveColorParams::default()),
             LocalEffect::PartColor(PartColorParams::default()),
@@ -18613,6 +18723,33 @@ mod tests {
         assert!(out.pixels[0] - src.pixels[0] > out.pixels[8] - src.pixels[8]);
         assert_eq!(out.pixels[3], 255);
         assert_eq!(out.pixels[11], 255);
+    }
+
+    #[test]
+    fn photo_filter_warms_color_and_preserves_luminosity() {
+        let src = RgbaImageBuf::new(2, 1, vec![128, 128, 128, 99, 12, 34, 56, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "photo filter",
+            LocalMask::Full,
+            LocalEffect::PhotoFilter(PhotoFilterParams {
+                preset: PhotoFilterPreset::Warm85,
+                density: 0.70,
+                preserve_luminosity: true,
+                strength: 1.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > out.pixels[2]);
+        let original_luma = luma01(128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0);
+        let filtered_luma = luma01(
+            out.pixels[0] as f32 / 255.0,
+            out.pixels[1] as f32 / 255.0,
+            out.pixels[2] as f32 / 255.0,
+        );
+        assert!((filtered_luma - original_luma).abs() < 0.04);
+        assert_eq!(out.pixels[3], 99);
+        assert_eq!(&out.pixels[4..8], &[12, 34, 56, 0]);
     }
 
     #[test]
