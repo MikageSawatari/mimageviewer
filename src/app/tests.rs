@@ -5906,6 +5906,128 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    fn make_fake_final_ai_pending() -> (FinalAiPending, Arc<std::sync::atomic::AtomicBool>) {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let pending = FinalAiPending {
+            cancel: Arc::clone(&cancel),
+            rx,
+        };
+        (pending, cancel)
+    }
+
+    /// P5-1: `has_uncancelled_final_ai_pending` は cancel フラグが立っていない
+    /// pending を 1 件でも検出する。これは prefetch_final_ai が「現在ページの AI が
+    /// 完了するまで先読みを起動しない」ゲートに使う。
+    ///
+    /// 退行を防ぐシナリオ: 旧設計 `current_done && ai_upscale_pending.is_empty()` 相当
+    /// の条件を新パイプライン版でも機能させる。これが壊れると、隣接ページの spawn が
+    /// 現在ページの spawn と競合して ai_runtime の lock を取り合い、UI が固まる。
+    #[test]
+    fn has_uncancelled_final_ai_pending_detects_live_workers() {
+        let mut app = setup_app();
+        assert!(
+            !app.has_uncancelled_final_ai_pending(),
+            "no pending => false"
+        );
+
+        // 1 件 live で挿入 → true
+        let key = FinalAiKey {
+            edit_key: EditResultKey {
+                idx: 0,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+                crop_hash: 0,
+            },
+            color_ai_hash: 0,
+            bg: 0,
+        };
+        let (pending, cancel) = make_fake_final_ai_pending();
+        app.final_ai_pending.insert(key, pending);
+        assert!(
+            app.has_uncancelled_final_ai_pending(),
+            "live pending => true"
+        );
+
+        // cancel フラグを立てる → false (= 既に終了予定の worker は無視)
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !app.has_uncancelled_final_ai_pending(),
+            "cancelled pending => false (so prefetch can resume)"
+        );
+    }
+
+    /// P5-1: `prefetch_final_ai` は live な pending があるときは何もしない。
+    /// AI runtime 不要 (= test 環境で spawn しなくても短絡する) の path を確認する。
+    #[test]
+    fn prefetch_final_ai_short_circuits_when_pending_active() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/prefetch-skip.jpg");
+        // live な pending を仕込む → prefetch_final_ai は即 return
+        let key = FinalAiKey {
+            edit_key: EditResultKey {
+                idx,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+                crop_hash: 0,
+            },
+            color_ai_hash: 0,
+            bg: 0,
+        };
+        let pending_before = app.final_ai_pending.len();
+        let (pending, _cancel) = make_fake_final_ai_pending();
+        app.final_ai_pending.insert(key, pending);
+        app.prefetch_final_ai(&ctx, idx);
+        assert_eq!(
+            app.final_ai_pending.len(),
+            pending_before + 1,
+            "prefetch must not spawn while live pending exists"
+        );
+    }
+
+    /// P5-1: cancel 済 pending しかなければ、prefetch は次の起動に進める
+    /// (= has_uncancelled_final_ai_pending が false を返すパス)。
+    /// AI runtime 不要なので「spawn しないが skip もしない」位置で止まることを確認。
+    #[test]
+    fn prefetch_final_ai_proceeds_when_all_pending_are_cancelled() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/prefetch-proceed.jpg");
+        let key = FinalAiKey {
+            edit_key: EditResultKey {
+                idx,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+                crop_hash: 0,
+            },
+            color_ai_hash: 0,
+            bg: 0,
+        };
+        let (pending, cancel) = make_fake_final_ai_pending();
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        app.final_ai_pending.insert(key, pending);
+
+        // fs_cache に source 無いので ensure_edit_result_pixels は None を返し、
+        // 各ターゲットが skip される。結果として final_ai_pending は変わらない。
+        let pending_before = app.final_ai_pending.len();
+        app.prefetch_final_ai(&ctx, idx);
+        assert_eq!(
+            app.final_ai_pending.len(),
+            pending_before,
+            "no fs_cache => ensure_edit_result_pixels None => prefetch skips, no spawn"
+        );
+    }
+
     /// 補助テスト: `has_active_local_adjust_layers` は「描画に影響するレイヤーが
     /// 1 つ以上あるか」を返す。これは `_with_selected_layer_bypassed` / `_until` /
     /// `_for_render` と同じ "enabled && opacity > 0" 判定を共有しているので、

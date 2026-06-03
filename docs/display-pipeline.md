@@ -475,6 +475,14 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
   ブラシ stroke 中は 150ms の idle まで重い再合成を遅延し、release 時に確定世代を進める。
 - **AI アップスケール/デノイズ**: final pipeline の別スレッドで推論。完了時に
   `final_ai_cache` に格納し、未完了の `final_composite_cache` を捨てて再合成する。
+- **AI 先読み (新パイプライン)**: `App::prefetch_final_ai` がフルスクリーン更新ループ
+  終盤で呼ばれ、現在ページの `final_ai_pending` (cancel フラグ除く) が空のときだけ
+  隣接ページの `final_ai` 推論を 1 件 spawn する。`ai_prefetch_targets` で前後の
+  対象 idx を `ai_upscale_prefetch_forward / back` 件まで取得する。
+  ⚠️ **退行注意**: Pipeline P1 リファクタ (be05cfef) で旧 `prefetch_ai_upscale` が
+  dead code 化され、新版が未実装のまま 1 リリース過ごした。`App::update` の
+  「フルスクリーン work セクション」(= `// AI 先読み (新パイプライン)` コメント) を
+  消すと再発するため、リファクタ時は呼び出し元の存在を要確認。
 - **元画像プレビュー**: 右 Ctrl を押している間だけ描画時のテクスチャ選択を
   raw 専用の `fs_cache` に切り替える。DB・補正設定・AI queue は変更しない。
 - **何かを変えたら正しいキャッシュをクリア**:

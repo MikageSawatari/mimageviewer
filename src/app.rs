@@ -18058,6 +18058,61 @@ impl App {
         }
     }
 
+    /// 進行中の (= cancel フラグが立っていない) final_ai pending が 1 件でも
+    /// あるかを返す。先読みの起動可否判定 (= 現在ページの AI が完了するまで
+    /// 待つ) に使う。
+    pub(crate) fn has_uncancelled_final_ai_pending(&self) -> bool {
+        self.final_ai_pending
+            .values()
+            .any(|p| !p.cancel.load(Ordering::Relaxed))
+    }
+
+    /// 新パイプライン (v1.1.0+) の AI 先読み。表示中画像の前後について
+    /// `final_ai_cache` を埋め、ページ送り時に AI 結果が即 hit する状態にする。
+    ///
+    /// ## 設計判断
+    /// - 旧 `prefetch_ai_upscale` は Pipeline P1 リファクタ後 dead code 化していた
+    ///   (= 呼び出し元が同時に削除され、新パイプライン版が未実装)。
+    /// - 同時起動は 1 ジョブのみ (= 旧設計の `current_done &&
+    ///   ai_upscale_pending.is_empty()` 条件を踏襲)。これで一括 spawn による
+    ///   ai_runtime の競合 / VRAM 不足を防ぐ。
+    /// - 各 idx ごとに `ensure_edit_result_pixels` を呼ぶため、隣接ページの source
+    ///   pixels が `fs_cache` に乗っていなければそのターゲットは skip される
+    ///   (= fs_prefetch の完了を毎フレ retry で待つ、コスト軽い)。
+    /// - `maybe_start_final_ai` 内の "active pending check" は cancel 済を除外
+    ///   しないため、ここで `has_uncancelled_final_ai_pending` を別途 gate する。
+    pub(crate) fn prefetch_final_ai(&mut self, ctx: &egui::Context, current_idx: usize) {
+        // 現在ページの AI が走っている間 (= cancel されていない pending あり) は
+        // 先読みしない。旧設計 `current_done && empty` 条件と同等。
+        if self.has_uncancelled_final_ai_pending() {
+            return;
+        }
+        let targets = self.ai_prefetch_targets(current_idx);
+        for idx in targets {
+            // 直前で has_uncancelled_final_ai_pending が false でも、ループ内で
+            // maybe_start_final_ai が pending を 1 件増やすので、次以降の idx は
+            // 自然に gate される (= 旧設計と同じ「同時 1 ジョブ」ポリシー)。
+            if self.has_uncancelled_final_ai_pending() {
+                return;
+            }
+            let Some((edit_key, edit_pixels)) = self.ensure_edit_result_pixels(ctx, idx) else {
+                continue;
+            };
+            let params = self.effective_params(idx).clone();
+            let Some(key) = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, &params)
+            else {
+                continue;
+            };
+            if self.final_ai_cache.contains_key(&key)
+                || self.final_ai_pending.contains_key(&key)
+                || self.final_ai_failed.contains(&key)
+            {
+                continue;
+            }
+            self.maybe_start_final_ai(idx, key, edit_pixels, params);
+        }
+    }
+
     // ── 画像補正 ──────────────────────────────────────────────────
 
     /// ページの正規化キーを返す（DB 保存用）。
@@ -24841,6 +24896,12 @@ impl eframe::App for App {
             }
             self.maybe_start_local_adjust_render(fs_idx);
             self.evict_adjustment_cache(fs_idx);
+            // AI 先読み (新パイプライン v1.1.0)。現在ページの final_ai が完了 / 不要
+            // のときだけ隣接ページを起動するため、毎フレーム呼んでも spawn の競合を
+            // 起こさない (= 内部で has_uncancelled_final_ai_pending を gate に使う)。
+            // Pipeline P1 リファクタで dead code 化していた旧 `prefetch_ai_upscale` の
+            // 後継 (= ページ送り時 AI を待たされる退行を直す)。
+            self.prefetch_final_ai(ctx, fs_idx);
         }
         let t_fullscreen_work = frame_t0.elapsed();
 
