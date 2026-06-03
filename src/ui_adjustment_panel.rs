@@ -62,6 +62,7 @@ const LOCAL_ADJUST_EDGE_BRUSH_INCLUDE_BOUNDARY_RADIUS: isize = 2;
 const LOCAL_ADJUST_U2NETP_INPUT_SIZE: usize = 320;
 const LOCAL_ADJUST_REGION_SEGMENT_MAX_LABELS: usize = 2048;
 const LOCAL_ADJUST_MASK_PREVIEW_BASE_ALPHA: f32 = 155.0;
+const LOCAL_ADJUST_MASK_PREVIEW_EDIT_ALPHA: u8 = 225;
 const LOCAL_ADJUST_MASK_PREVIEW_MAX_TEXELS: f32 = 768.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +234,36 @@ mod local_adjust_segmentation_tests {
         assert_eq!(
             local_adjust_mask_preview_alpha(&layer, None, 2, 1, 1, 0),
             1.0
+        );
+    }
+
+    #[test]
+    fn subtract_override_edit_preview_uses_edit_color() {
+        let colors = LocalAdjustMaskColorPreset::PinkCyan.colors();
+        let mut layer = local_adjust_core::LocalAdjustmentLayer::new(
+            "full",
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::None,
+        );
+        layer.manual_override.subtract = Some(local_adjust_core::RasterVectorMask {
+            width: 1,
+            height: 1,
+            alpha: vec![1.0],
+            shapes: Vec::new(),
+        });
+        assert_eq!(
+            local_adjust_mask_preview_color(
+                &layer,
+                None,
+                1,
+                1,
+                0,
+                0,
+                0.0,
+                colors,
+                Some(LocalAdjustMaskEditTarget::OverrideSubtract),
+            ),
+            colors.edit(LOCAL_ADJUST_MASK_PREVIEW_EDIT_ALPHA)
         );
     }
 
@@ -4533,6 +4564,7 @@ fn draw_local_adjust_mask_preview_overlay(
     image_dims: (usize, usize),
     time_sec: f32,
     colors: crate::app::LocalAdjustMaskPreviewColors,
+    edit_target: Option<LocalAdjustMaskEditTarget>,
     texture_slot: &mut Option<egui::TextureHandle>,
 ) {
     let width = image_dims.0.max(1);
@@ -4555,45 +4587,17 @@ fn draw_local_adjust_mask_preview_overlay(
                 .min(width.saturating_sub(1));
             let y = (((gy as f32 + 0.5) * height as f32 / tex_h as f32) as usize)
                 .min(height.saturating_sub(1));
-            let color = match &layer.mask {
-                local_adjust_core::LocalMask::Segmentation(mask)
-                    if mask.width == width && mask.height == height =>
-                {
-                    let idx = y * width + x;
-                    let label = mask.labels.get(idx).copied().unwrap_or(0);
-                    if label == 0 {
-                        egui::Color32::TRANSPARENT
-                    } else if local_adjust_region_label_active(mask, layer.mask_inverted, label) {
-                        if local_adjust_region_active_boundary(
-                            mask,
-                            layer.mask_inverted,
-                            label,
-                            x,
-                            y,
-                        ) {
-                            colors.boundary(235)
-                        } else {
-                            colors.base(188)
-                        }
-                    } else if local_adjust_region_label_boundary(mask, label, x, y) {
-                        local_adjust_region_boundary_color(label, time_sec)
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    }
-                }
-                _ => {
-                    let alpha = local_adjust_mask_preview_alpha(layer, source, width, height, x, y);
-                    if alpha <= 0.02 {
-                        egui::Color32::TRANSPARENT
-                    } else {
-                        let a = (alpha * LOCAL_ADJUST_MASK_PREVIEW_BASE_ALPHA)
-                            .round()
-                            .clamp(0.0, 255.0) as u8;
-                        colors.base(a)
-                    }
-                }
-            };
-            pixels.push(color);
+            pixels.push(local_adjust_mask_preview_color(
+                layer,
+                source,
+                width,
+                height,
+                x,
+                y,
+                time_sec,
+                colors,
+                edit_target,
+            ));
         }
     }
 
@@ -4611,6 +4615,63 @@ fn draw_local_adjust_mask_preview_overlay(
         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
     );
+}
+
+fn local_adjust_mask_preview_color(
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+    source: Option<&egui::ColorImage>,
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    time_sec: f32,
+    colors: crate::app::LocalAdjustMaskPreviewColors,
+    edit_target: Option<LocalAdjustMaskEditTarget>,
+) -> egui::Color32 {
+    let idx = y.saturating_mul(width).saturating_add(x);
+    if let Some(mask) = match edit_target {
+        Some(LocalAdjustMaskEditTarget::OverrideAdd) => layer.manual_override.add.as_ref(),
+        Some(LocalAdjustMaskEditTarget::OverrideSubtract) => {
+            layer.manual_override.subtract.as_ref()
+        }
+        _ => None,
+    } && local_adjust_raster_vector_preview_alpha(mask, width, height, idx, x, y).unwrap_or(0.0)
+        >= 0.5
+    {
+        return colors.edit(LOCAL_ADJUST_MASK_PREVIEW_EDIT_ALPHA);
+    }
+
+    match &layer.mask {
+        local_adjust_core::LocalMask::Segmentation(mask)
+            if mask.width == width && mask.height == height =>
+        {
+            let label = mask.labels.get(idx).copied().unwrap_or(0);
+            if label == 0 {
+                egui::Color32::TRANSPARENT
+            } else if local_adjust_region_label_active(mask, layer.mask_inverted, label) {
+                if local_adjust_region_active_boundary(mask, layer.mask_inverted, label, x, y) {
+                    colors.boundary(235)
+                } else {
+                    colors.base(188)
+                }
+            } else if local_adjust_region_label_boundary(mask, label, x, y) {
+                local_adjust_region_boundary_color(label, time_sec)
+            } else {
+                egui::Color32::TRANSPARENT
+            }
+        }
+        _ => {
+            let alpha = local_adjust_mask_preview_alpha(layer, source, width, height, x, y);
+            if alpha <= 0.02 {
+                egui::Color32::TRANSPARENT
+            } else {
+                let a = (alpha * LOCAL_ADJUST_MASK_PREVIEW_BASE_ALPHA)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                colors.base(a)
+            }
+        }
+    }
 }
 
 fn local_adjust_mask_preview_alpha(
@@ -7203,6 +7264,7 @@ impl App {
                 image_dims,
                 ui.ctx().input(|i| i.time) as f32,
                 self.local_adjust_mask_color_preset.colors(),
+                effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target),
                 &mut self.local_adjust_mask_preview_texture,
             );
             if matches!(layer.mask, local_adjust_core::LocalMask::Segmentation(_)) {
