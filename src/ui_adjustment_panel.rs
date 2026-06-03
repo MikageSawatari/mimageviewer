@@ -202,6 +202,59 @@ mod local_adjust_segmentation_tests {
     }
 
     #[test]
+    fn tilt_shift_linear_focus_drag_updates_focus_width_and_angle() {
+        let mut params = local_adjust_core::TiltShiftParams {
+            range_initialized: true,
+            center: [0.5, 0.5],
+            ..Default::default()
+        };
+        assert!(apply_local_adjust_tilt_shift_handle_drag(
+            &mut params,
+            crate::app::LocalAdjustCanvasDragKind::TiltShiftFocus,
+            [0.5, 0.7],
+        ));
+        assert!((params.focus_width - 0.2).abs() < 1e-5);
+        assert!((params.angle_degrees - 90.0).abs() < 1e-4);
+        assert!(params.range_initialized);
+    }
+
+    #[test]
+    fn tilt_shift_radial_outer_drag_updates_falloff() {
+        let mut params = local_adjust_core::TiltShiftParams {
+            mode: local_adjust_core::TiltShiftMode::Radial,
+            range_initialized: true,
+            center: [0.5, 0.5],
+            radius: [0.2, 0.25],
+            falloff: 0.1,
+            ..Default::default()
+        };
+        assert!(apply_local_adjust_tilt_shift_handle_drag(
+            &mut params,
+            crate::app::LocalAdjustCanvasDragKind::TiltShiftOuterX,
+            [0.8, 0.5],
+        ));
+        assert!((params.falloff - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn tilt_shift_handle_hit_detects_linear_outer_handle() {
+        let params = local_adjust_core::TiltShiftParams {
+            range_initialized: true,
+            center: [0.5, 0.5],
+            angle_degrees: 0.0,
+            focus_width: 0.1,
+            falloff: 0.2,
+            ..Default::default()
+        };
+        let effect = local_adjust_core::LocalEffect::TiltShift(params);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        assert_eq!(
+            local_adjust_tilt_shift_handle_hit(&effect, egui::pos2(80.0, 50.0), rect),
+            Some(crate::app::LocalAdjustCanvasDragKind::TiltShiftOuter)
+        );
+    }
+
+    #[test]
     fn region_segmentation_splits_connected_color_regions() {
         let width = 6;
         let height = 4;
@@ -1411,6 +1464,67 @@ fn local_adjust_norm_to_screen(
         rect.left() + norm[0] * rect.width(),
         rect.top() + norm[1] * rect.height(),
     ))
+}
+
+fn local_adjust_drawn_norm_to_screen(rect: egui::Rect, norm: [f32; 2]) -> egui::Pos2 {
+    egui::pos2(
+        rect.left() + norm[0].clamp(0.0, 1.0) * rect.width(),
+        rect.top() + norm[1].clamp(0.0, 1.0) * rect.height(),
+    )
+}
+
+fn local_adjust_drawn_norm_to_screen_unclamped(rect: egui::Rect, norm: [f32; 2]) -> egui::Pos2 {
+    egui::pos2(
+        rect.left() + norm[0] * rect.width(),
+        rect.top() + norm[1] * rect.height(),
+    )
+}
+
+fn local_adjust_offset_norm(base: [f32; 2], direction: [f32; 2], amount: f32) -> [f32; 2] {
+    [
+        base[0] + direction[0] * amount,
+        base[1] + direction[1] * amount,
+    ]
+}
+
+fn local_adjust_screen_px_per_source_px(rect: egui::Rect, image_dims: (usize, usize)) -> f32 {
+    let sx = rect.width() / image_dims.0.max(1) as f32;
+    let sy = rect.height() / image_dims.1.max(1) as f32;
+    (sx + sy) * 0.5
+}
+
+fn local_adjust_distance_to_farthest_rect_corner(center: egui::Pos2, rect: egui::Rect) -> f32 {
+    [
+        rect.left_top(),
+        rect.right_top(),
+        rect.left_bottom(),
+        rect.right_bottom(),
+    ]
+    .into_iter()
+    .map(|corner| center.distance(corner))
+    .fold(0.0, f32::max)
+}
+
+fn draw_local_adjust_ellipse_stroke(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius_x: f32,
+    radius_y: f32,
+    stroke: egui::Stroke,
+) {
+    if radius_x <= 0.5 || radius_y <= 0.5 {
+        return;
+    }
+    let steps = 96;
+    let mut points = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let angle = std::f32::consts::TAU * i as f32 / steps as f32;
+        points.push(egui::pos2(
+            center.x + radius_x * angle.cos(),
+            center.y + radius_y * angle.sin(),
+        ));
+    }
+    painter.add(egui::Shape::line(points, stroke));
 }
 
 fn sample_local_adjust_rgb(app: &App, fs_idx: usize, norm: [f32; 2]) -> Option<[u8; 3]> {
@@ -3149,6 +3263,632 @@ fn local_adjust_effect_center(
     }
 }
 
+fn draw_local_adjust_effect_center_marker(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    label: &str,
+    fill: egui::Color32,
+) {
+    let guide = egui::Stroke::new(
+        1.0,
+        egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 145),
+    );
+    let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(10, 30, 36));
+    painter.circle_filled(center, 7.0, fill);
+    painter.circle_stroke(center, 7.0, stroke);
+    painter.line_segment(
+        [
+            egui::pos2(center.x - 14.0, center.y),
+            egui::pos2(center.x + 14.0, center.y),
+        ],
+        guide,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(center.x, center.y - 14.0),
+            egui::pos2(center.x, center.y + 14.0),
+        ],
+        guide,
+    );
+    painter.text(
+        center + egui::vec2(10.0, -12.0),
+        egui::Align2::LEFT_BOTTOM,
+        label,
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_rgba_unmultiplied(230, 245, 255, 220),
+    );
+}
+
+fn draw_local_adjust_effect_source_radius(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    center: egui::Pos2,
+    radius_px: f32,
+    source_px_scale: f32,
+    color: egui::Color32,
+) {
+    let radius = if radius_px > 0.0 {
+        radius_px * source_px_scale
+    } else {
+        local_adjust_distance_to_farthest_rect_corner(center, rect)
+    };
+    if radius > 1.5 {
+        painter.circle_stroke(center, radius, egui::Stroke::new(1.0, color));
+    }
+}
+
+fn draw_local_adjust_tilt_shift_overlay(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    params: local_adjust_core::TiltShiftParams,
+) {
+    if !params.range_initialized {
+        draw_local_adjust_effect_center_marker(
+            painter,
+            local_adjust_drawn_norm_to_screen(rect, params.center),
+            "チルトシフト中心",
+            egui::Color32::from_rgb(185, 235, 255),
+        );
+        return;
+    }
+
+    let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 220, 255));
+    let soft_stroke = egui::Stroke::new(
+        1.0,
+        egui::Color32::from_rgba_unmultiplied(100, 220, 255, 150),
+    );
+    let focus_stroke = egui::Stroke::new(
+        1.0,
+        egui::Color32::from_rgba_unmultiplied(255, 230, 120, 180),
+    );
+    let handle_fill = egui::Color32::from_rgb(210, 245, 255);
+    let focus_fill = egui::Color32::from_rgb(255, 238, 150);
+    let outer_fill = egui::Color32::from_rgb(120, 220, 255);
+    let handle_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(10, 30, 36));
+
+    match params.mode {
+        local_adjust_core::TiltShiftMode::Linear => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            let angle = params.angle_degrees.to_radians();
+            let dir = [angle.cos(), angle.sin()];
+            let perp = [-dir[1], dir[0]];
+            let focus = params.focus_width.max(0.0);
+            let outer = focus + params.falloff.max(0.001);
+            let draw_boundary = |amount: f32, stroke: egui::Stroke| {
+                let base = local_adjust_offset_norm(params.center, dir, amount);
+                let a = local_adjust_drawn_norm_to_screen_unclamped(
+                    rect,
+                    local_adjust_offset_norm(base, perp, -1.6),
+                );
+                let b = local_adjust_drawn_norm_to_screen_unclamped(
+                    rect,
+                    local_adjust_offset_norm(base, perp, 1.6),
+                );
+                painter.line_segment([a, b], stroke);
+            };
+
+            if params.far_only {
+                painter.line_segment(
+                    [
+                        center,
+                        local_adjust_drawn_norm_to_screen_unclamped(
+                            rect,
+                            local_adjust_offset_norm(params.center, dir, outer),
+                        ),
+                    ],
+                    stroke,
+                );
+                draw_boundary(focus, focus_stroke);
+                draw_boundary(outer, stroke);
+            } else {
+                painter.line_segment(
+                    [
+                        local_adjust_drawn_norm_to_screen_unclamped(
+                            rect,
+                            local_adjust_offset_norm(params.center, dir, -outer),
+                        ),
+                        local_adjust_drawn_norm_to_screen_unclamped(
+                            rect,
+                            local_adjust_offset_norm(params.center, dir, outer),
+                        ),
+                    ],
+                    stroke,
+                );
+                draw_boundary(-focus, focus_stroke);
+                draw_boundary(focus, focus_stroke);
+                draw_boundary(-outer, soft_stroke);
+                draw_boundary(outer, stroke);
+            }
+
+            let focus_handle = local_adjust_drawn_norm_to_screen_unclamped(
+                rect,
+                local_adjust_offset_norm(params.center, dir, focus),
+            );
+            let outer_handle = local_adjust_drawn_norm_to_screen_unclamped(
+                rect,
+                local_adjust_offset_norm(params.center, dir, outer),
+            );
+            painter.circle_filled(center, 6.0, handle_fill);
+            painter.circle_stroke(center, 6.0, handle_stroke);
+            painter.circle_filled(focus_handle, 5.0, focus_fill);
+            painter.circle_stroke(focus_handle, 5.0, handle_stroke);
+            painter.circle_filled(outer_handle, 6.0, outer_fill);
+            painter.circle_stroke(outer_handle, 6.0, handle_stroke);
+        }
+        local_adjust_core::TiltShiftMode::Radial => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            let inner_rx = params.radius[0].max(0.001) * rect.width();
+            let inner_ry = params.radius[1].max(0.001) * rect.height();
+            let outer_rx =
+                params.radius[0].max(0.001) * (1.0 + params.falloff.max(0.001)) * rect.width();
+            let outer_ry =
+                params.radius[1].max(0.001) * (1.0 + params.falloff.max(0.001)) * rect.height();
+            draw_local_adjust_ellipse_stroke(painter, center, inner_rx, inner_ry, focus_stroke);
+            draw_local_adjust_ellipse_stroke(painter, center, outer_rx, outer_ry, stroke);
+            let inner_x_handle = egui::pos2(center.x + inner_rx, center.y);
+            let inner_y_handle = egui::pos2(center.x, center.y + inner_ry);
+            let outer_x_handle = egui::pos2(center.x + outer_rx, center.y);
+            let outer_y_handle = egui::pos2(center.x, center.y + outer_ry);
+            painter.line_segment(
+                [egui::pos2(center.x - outer_rx, center.y), outer_x_handle],
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(100, 220, 255, 110),
+                ),
+            );
+            painter.line_segment(
+                [egui::pos2(center.x, center.y - outer_ry), outer_y_handle],
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(100, 220, 255, 110),
+                ),
+            );
+            for (handle, fill, radius) in [
+                (center, handle_fill, 6.0),
+                (inner_x_handle, focus_fill, 5.0),
+                (inner_y_handle, focus_fill, 5.0),
+                (outer_x_handle, outer_fill, 6.0),
+                (outer_y_handle, outer_fill, 6.0),
+            ] {
+                painter.circle_filled(handle, radius, fill);
+                painter.circle_stroke(handle, radius, handle_stroke);
+            }
+        }
+    }
+}
+
+fn draw_local_adjust_effect_position_overlay(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    image_dims: (usize, usize),
+    effect: &local_adjust_core::LocalEffect,
+) {
+    let source_px_scale = local_adjust_screen_px_per_source_px(rect, image_dims);
+    match effect {
+        local_adjust_core::LocalEffect::TiltShift(params) => {
+            draw_local_adjust_tilt_shift_overlay(painter, rect, *params);
+        }
+        local_adjust_core::LocalEffect::RadialBlur(params) => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            draw_local_adjust_effect_center_marker(
+                painter,
+                center,
+                "放射ぼかし中心",
+                egui::Color32::from_rgb(185, 235, 255),
+            );
+            painter.circle_stroke(
+                center,
+                18.0,
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(120, 220, 255, 130),
+                ),
+            );
+        }
+        local_adjust_core::LocalEffect::WaveDistortion(params)
+            if params.mode == local_adjust_core::WaveDistortionMode::Ripple =>
+        {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            draw_local_adjust_effect_center_marker(
+                painter,
+                center,
+                "波形中心",
+                egui::Color32::from_rgb(170, 235, 255),
+            );
+            let stroke = egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(120, 220, 255, 115),
+            );
+            for radius in [24.0, 48.0, 72.0] {
+                painter.circle_stroke(center, radius, stroke);
+            }
+        }
+        local_adjust_core::LocalEffect::PinchSpherize(params) => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            draw_local_adjust_effect_center_marker(
+                painter,
+                center,
+                "つまむ/魚眼中心",
+                egui::Color32::from_rgb(185, 235, 255),
+            );
+            draw_local_adjust_effect_source_radius(
+                painter,
+                rect,
+                center,
+                params.radius_px,
+                source_px_scale,
+                egui::Color32::from_rgba_unmultiplied(120, 220, 255, 150),
+            );
+        }
+        local_adjust_core::LocalEffect::Twirl(params) => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            draw_local_adjust_effect_center_marker(
+                painter,
+                center,
+                "渦巻き中心",
+                egui::Color32::from_rgb(190, 225, 255),
+            );
+            draw_local_adjust_effect_source_radius(
+                painter,
+                rect,
+                center,
+                params.radius_px,
+                source_px_scale,
+                egui::Color32::from_rgba_unmultiplied(130, 205, 255, 150),
+            );
+        }
+        local_adjust_core::LocalEffect::PolarCoordinates(params) => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            draw_local_adjust_effect_center_marker(
+                painter,
+                center,
+                "極座標中心",
+                egui::Color32::from_rgb(190, 225, 255),
+            );
+            draw_local_adjust_effect_source_radius(
+                painter,
+                rect,
+                center,
+                params.radius_px,
+                source_px_scale,
+                egui::Color32::from_rgba_unmultiplied(130, 205, 255, 150),
+            );
+        }
+        local_adjust_core::LocalEffect::LensCorrection(params) => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            draw_local_adjust_effect_center_marker(
+                painter,
+                center,
+                "レンズ補正中心",
+                egui::Color32::from_rgb(190, 225, 255),
+            );
+            painter.circle_stroke(
+                center,
+                (rect.width().min(rect.height()) * 0.18).max(2.0),
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(150, 215, 255, 125),
+                ),
+            );
+        }
+        local_adjust_core::LocalEffect::GodRays(params) => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            draw_local_adjust_effect_center_marker(
+                painter,
+                center,
+                "光源位置",
+                egui::Color32::from_rgb(255, 238, 145),
+            );
+        }
+        local_adjust_core::LocalEffect::LensFlare(params) => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            draw_local_adjust_effect_center_marker(
+                painter,
+                center,
+                "フレア光源位置",
+                egui::Color32::from_rgb(255, 232, 135),
+            );
+            draw_local_adjust_effect_source_radius(
+                painter,
+                rect,
+                center,
+                params.radius_px,
+                source_px_scale,
+                egui::Color32::from_rgba_unmultiplied(255, 226, 130, 145),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 28.0, center.y),
+                    egui::pos2(center.x + 28.0, center.y),
+                ],
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 245, 170, 135),
+                ),
+            );
+        }
+        local_adjust_core::LocalEffect::LightLeak(params) => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            draw_local_adjust_effect_center_marker(
+                painter,
+                center,
+                "ライトリーク位置",
+                egui::Color32::from_rgb(255, 188, 120),
+            );
+            let diag = rect.width().hypot(rect.height()).max(1.0);
+            let radius_px = diag * params.radius.clamp(0.05, 1.6);
+            painter.circle_stroke(
+                center,
+                radius_px.max(2.0),
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 178, 110, 145),
+                ),
+            );
+            painter.circle_stroke(
+                center,
+                (radius_px * 1.85).max(2.0),
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 224, 160, 85),
+                ),
+            );
+        }
+        local_adjust_core::LocalEffect::BacklightHaze(params) => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            draw_local_adjust_effect_center_marker(
+                painter,
+                center,
+                "逆光ヘイズ位置",
+                egui::Color32::from_rgb(255, 226, 165),
+            );
+            let diag = rect.width().hypot(rect.height()).max(1.0);
+            let radius_px = diag * params.radius.clamp(0.05, 1.6);
+            painter.circle_stroke(
+                center,
+                radius_px.max(2.0),
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 230, 175, 145),
+                ),
+            );
+            painter.circle_stroke(
+                center,
+                (radius_px * 1.55).max(2.0),
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 245, 210, 90),
+                ),
+            );
+        }
+        local_adjust_core::LocalEffect::SpeedLines(params) => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            draw_local_adjust_effect_center_marker(
+                painter,
+                center,
+                "集中線/スピード線中心",
+                egui::Color32::from_rgb(215, 250, 255),
+            );
+            let stroke = egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(160, 235, 255, 130),
+            );
+            match params.mode {
+                local_adjust_core::SpeedLinesMode::Radial => {
+                    let max_radius =
+                        local_adjust_distance_to_farthest_rect_corner(center, rect).max(1.0);
+                    painter.circle_stroke(center, max_radius * params.inner_radius, stroke);
+                    painter.circle_stroke(center, max_radius * params.outer_radius, stroke);
+                }
+                local_adjust_core::SpeedLinesMode::Parallel => {
+                    let angle = params.angle_degrees.to_radians();
+                    let dir = egui::vec2(angle.cos(), angle.sin());
+                    let half = rect.width().hypot(rect.height()) * 0.5;
+                    painter.line_segment([center - dir * half, center + dir * half], stroke);
+                }
+            }
+        }
+        local_adjust_core::LocalEffect::RadialFlash(params) => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            draw_local_adjust_effect_center_marker(
+                painter,
+                center,
+                "集中線フラッシュ中心",
+                egui::Color32::from_rgb(255, 245, 170),
+            );
+            let max_radius = local_adjust_distance_to_farthest_rect_corner(center, rect).max(1.0);
+            let stroke = egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 245, 170, 135),
+            );
+            painter.circle_stroke(center, max_radius * params.inner_radius, stroke);
+            painter.circle_stroke(center, max_radius * params.outer_radius, stroke);
+        }
+        local_adjust_core::LocalEffect::Spotlight(params) => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            let radius = params.radius.clamp(0.0, 1.0);
+            let feather = params.feather.clamp(0.001, 1.0);
+            let max_dim = rect.width().max(rect.height());
+            let radius_px = max_dim * radius * 0.5;
+            let outer_px = max_dim * (radius + feather).min(1.5) * 0.5;
+            painter.circle_stroke(
+                center,
+                outer_px.max(2.0),
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 230, 130, 120),
+                ),
+            );
+            painter.circle_stroke(
+                center,
+                radius_px.max(2.0),
+                egui::Stroke::new(
+                    1.5,
+                    egui::Color32::from_rgba_unmultiplied(255, 238, 160, 180),
+                ),
+            );
+            draw_local_adjust_effect_center_marker(
+                painter,
+                center,
+                "スポットライト位置",
+                egui::Color32::from_rgb(255, 224, 110),
+            );
+        }
+        _ => {
+            if let Some((center_norm, label)) = local_adjust_effect_center(effect) {
+                draw_local_adjust_effect_center_marker(
+                    painter,
+                    local_adjust_drawn_norm_to_screen(rect, center_norm),
+                    label,
+                    egui::Color32::from_rgb(185, 235, 255),
+                );
+            }
+        }
+    }
+}
+
+fn local_adjust_tilt_shift_handle_positions(
+    rect: egui::Rect,
+    params: local_adjust_core::TiltShiftParams,
+) -> Vec<(crate::app::LocalAdjustCanvasDragKind, egui::Pos2)> {
+    if !params.range_initialized {
+        return Vec::new();
+    }
+    match params.mode {
+        local_adjust_core::TiltShiftMode::Linear => {
+            let angle = params.angle_degrees.to_radians();
+            let dir = [angle.cos(), angle.sin()];
+            let focus = params.focus_width.max(0.0);
+            let outer = focus + params.falloff.max(0.001);
+            vec![
+                (
+                    crate::app::LocalAdjustCanvasDragKind::TiltShiftFocus,
+                    local_adjust_drawn_norm_to_screen_unclamped(
+                        rect,
+                        local_adjust_offset_norm(params.center, dir, focus),
+                    ),
+                ),
+                (
+                    crate::app::LocalAdjustCanvasDragKind::TiltShiftOuter,
+                    local_adjust_drawn_norm_to_screen_unclamped(
+                        rect,
+                        local_adjust_offset_norm(params.center, dir, outer),
+                    ),
+                ),
+            ]
+        }
+        local_adjust_core::TiltShiftMode::Radial => {
+            let center = local_adjust_drawn_norm_to_screen(rect, params.center);
+            let inner_rx = params.radius[0].max(0.001) * rect.width();
+            let inner_ry = params.radius[1].max(0.001) * rect.height();
+            let outer_rx =
+                params.radius[0].max(0.001) * (1.0 + params.falloff.max(0.001)) * rect.width();
+            let outer_ry =
+                params.radius[1].max(0.001) * (1.0 + params.falloff.max(0.001)) * rect.height();
+            vec![
+                (
+                    crate::app::LocalAdjustCanvasDragKind::TiltShiftInnerX,
+                    egui::pos2(center.x + inner_rx, center.y),
+                ),
+                (
+                    crate::app::LocalAdjustCanvasDragKind::TiltShiftInnerY,
+                    egui::pos2(center.x, center.y + inner_ry),
+                ),
+                (
+                    crate::app::LocalAdjustCanvasDragKind::TiltShiftOuterX,
+                    egui::pos2(center.x + outer_rx, center.y),
+                ),
+                (
+                    crate::app::LocalAdjustCanvasDragKind::TiltShiftOuterY,
+                    egui::pos2(center.x, center.y + outer_ry),
+                ),
+            ]
+        }
+    }
+}
+
+fn local_adjust_tilt_shift_handle_hit(
+    effect: &local_adjust_core::LocalEffect,
+    pos: egui::Pos2,
+    drawn_rect: egui::Rect,
+) -> Option<crate::app::LocalAdjustCanvasDragKind> {
+    let local_adjust_core::LocalEffect::TiltShift(params) = effect else {
+        return None;
+    };
+    local_adjust_tilt_shift_handle_positions(drawn_rect, *params)
+        .into_iter()
+        .find_map(|(kind, handle)| (handle.distance(pos) <= 15.0).then_some(kind))
+}
+
+fn apply_local_adjust_tilt_shift_handle_drag(
+    params: &mut local_adjust_core::TiltShiftParams,
+    kind: crate::app::LocalAdjustCanvasDragKind,
+    norm: [f32; 2],
+) -> bool {
+    match (params.mode, kind) {
+        (
+            local_adjust_core::TiltShiftMode::Linear,
+            crate::app::LocalAdjustCanvasDragKind::TiltShiftFocus,
+        ) => {
+            let dx = norm[0] - params.center[0];
+            let dy = norm[1] - params.center[1];
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance <= 0.001 {
+                return false;
+            }
+            params.angle_degrees = dy.atan2(dx).to_degrees();
+            params.focus_width = distance.min(0.8);
+            params.falloff = params.falloff.max(0.001);
+        }
+        (
+            local_adjust_core::TiltShiftMode::Linear,
+            crate::app::LocalAdjustCanvasDragKind::TiltShiftOuter,
+        ) => {
+            let dx = norm[0] - params.center[0];
+            let dy = norm[1] - params.center[1];
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance <= 0.001 {
+                return false;
+            }
+            params.angle_degrees = dy.atan2(dx).to_degrees();
+            params.falloff = (distance - params.focus_width.max(0.0)).max(0.001).min(1.2);
+        }
+        (
+            local_adjust_core::TiltShiftMode::Radial,
+            crate::app::LocalAdjustCanvasDragKind::TiltShiftInnerX,
+        ) => {
+            params.radius[0] = (norm[0] - params.center[0]).abs().clamp(0.001, 1.2);
+        }
+        (
+            local_adjust_core::TiltShiftMode::Radial,
+            crate::app::LocalAdjustCanvasDragKind::TiltShiftInnerY,
+        ) => {
+            params.radius[1] = (norm[1] - params.center[1]).abs().clamp(0.001, 1.2);
+        }
+        (
+            local_adjust_core::TiltShiftMode::Radial,
+            crate::app::LocalAdjustCanvasDragKind::TiltShiftOuterX,
+        ) => {
+            let outer = (norm[0] - params.center[0]).abs();
+            params.falloff = (outer / params.radius[0].max(0.001) - 1.0)
+                .max(0.001)
+                .min(1.2);
+        }
+        (
+            local_adjust_core::TiltShiftMode::Radial,
+            crate::app::LocalAdjustCanvasDragKind::TiltShiftOuterY,
+        ) => {
+            let outer = (norm[1] - params.center[1]).abs();
+            params.falloff = (outer / params.radius[1].max(0.001) - 1.0)
+                .max(0.001)
+                .min(1.2);
+        }
+        _ => return false,
+    }
+    params.range_initialized = true;
+    true
+}
+
 fn paste_layer_effect(
     layer: &mut local_adjust_core::LocalAdjustmentLayer,
     effect: local_adjust_core::LocalEffect,
@@ -4805,6 +5545,21 @@ impl App {
                     *center = norm;
                     true
                 }
+                (
+                    _,
+                    crate::app::LocalAdjustCanvasDragKind::TiltShiftFocus
+                    | crate::app::LocalAdjustCanvasDragKind::TiltShiftOuter
+                    | crate::app::LocalAdjustCanvasDragKind::TiltShiftInnerX
+                    | crate::app::LocalAdjustCanvasDragKind::TiltShiftInnerY
+                    | crate::app::LocalAdjustCanvasDragKind::TiltShiftOuterX
+                    | crate::app::LocalAdjustCanvasDragKind::TiltShiftOuterY,
+                ) => {
+                    let local_adjust_core::LocalEffect::TiltShift(params) = &mut layer.effect
+                    else {
+                        return false;
+                    };
+                    apply_local_adjust_tilt_shift_handle_drag(params, drag.kind, norm)
+                }
                 _ => false,
             }
         })
@@ -5371,8 +6126,16 @@ impl App {
                         local_adjust_screen_to_norm(pos, image_rect, image_dims, zoom_pan, false)
                 {
                     self.apply_local_adjust_gradient_drag(drag, norm, false);
-                    let cursor = if drag.kind == crate::app::LocalAdjustCanvasDragKind::EffectCenter
-                    {
+                    let cursor = if matches!(
+                        drag.kind,
+                        crate::app::LocalAdjustCanvasDragKind::EffectCenter
+                            | crate::app::LocalAdjustCanvasDragKind::TiltShiftFocus
+                            | crate::app::LocalAdjustCanvasDragKind::TiltShiftOuter
+                            | crate::app::LocalAdjustCanvasDragKind::TiltShiftInnerX
+                            | crate::app::LocalAdjustCanvasDragKind::TiltShiftInnerY
+                            | crate::app::LocalAdjustCanvasDragKind::TiltShiftOuterX
+                            | crate::app::LocalAdjustCanvasDragKind::TiltShiftOuterY
+                    ) {
                         egui::CursorIcon::Grabbing
                     } else {
                         egui::CursorIcon::Crosshair
@@ -5503,6 +6266,29 @@ impl App {
             }
 
             if self.local_adjust_effect_position_handles_visible {
+                let tilt_shift_handle = self
+                    .local_adjust_page_layers
+                    .get(&fs_idx)
+                    .and_then(|layers| layers.get(layer_idx))
+                    .and_then(|layer| {
+                        let (_, drawn_rect) =
+                            local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
+                        local_adjust_tilt_shift_handle_hit(&layer.effect, pos, drawn_rect)
+                    });
+                if let Some(kind) = tilt_shift_handle {
+                    self.local_adjust_canvas_drag_before_layers =
+                        self.local_adjust_page_layers.get(&fs_idx).cloned();
+                    let drag = crate::app::LocalAdjustCanvasDrag {
+                        fs_idx,
+                        layer_idx,
+                        kind,
+                        start: norm,
+                    };
+                    self.local_adjust_canvas_drag = Some(drag);
+                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    return;
+                }
                 let center_hit = self
                     .local_adjust_page_layers
                     .get(&fs_idx)
@@ -5730,11 +6516,20 @@ impl App {
                 .local_adjust_page_layers
                 .get(&fs_idx)
                 .and_then(|layers| layers.get(layer_idx))
-                .and_then(|layer| local_adjust_effect_center(&layer.effect))
-                .and_then(|(center, _)| {
-                    local_adjust_norm_to_screen(center, image_rect, image_dims, zoom_pan)
+                .is_some_and(|layer| {
+                    let tilt_shift_hit =
+                        local_adjust_image_layout(image_rect, image_dims, zoom_pan)
+                            .and_then(|(_, drawn_rect)| {
+                                local_adjust_tilt_shift_handle_hit(&layer.effect, pos, drawn_rect)
+                            })
+                            .is_some();
+                    let center_hit = local_adjust_effect_center(&layer.effect)
+                        .and_then(|(center, _)| {
+                            local_adjust_norm_to_screen(center, image_rect, image_dims, zoom_pan)
+                        })
+                        .is_some_and(|center| center.distance(pos) <= 14.0);
+                    tilt_shift_hit || center_hit
                 })
-                .is_some_and(|center| center.distance(pos) <= 14.0)
         {
             ctx.set_cursor_icon(egui::CursorIcon::Grab);
         }
@@ -5905,40 +6700,14 @@ impl App {
             }
         }
         if self.local_adjust_effect_position_handles_visible
-            && let Some((center_norm, label)) = local_adjust_effect_center(&layer.effect)
-            && let Some(center) =
-                local_adjust_norm_to_screen(center_norm, image_rect, image_dims, zoom_pan)
+            && let Some((_, drawn_rect)) =
+                local_adjust_image_layout(image_rect, image_dims, zoom_pan)
         {
-            let handle_fill = egui::Color32::from_rgb(185, 235, 255);
-            let handle_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(20, 45, 58));
-            painter.circle_filled(center, 7.0, handle_fill);
-            painter.circle_stroke(center, 7.0, handle_stroke);
-            painter.line_segment(
-                [
-                    egui::pos2(center.x - 13.0, center.y),
-                    egui::pos2(center.x + 13.0, center.y),
-                ],
-                egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(185, 235, 255, 180),
-                ),
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(center.x, center.y - 13.0),
-                    egui::pos2(center.x, center.y + 13.0),
-                ],
-                egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(185, 235, 255, 180),
-                ),
-            );
-            painter.text(
-                center + egui::vec2(10.0, -12.0),
-                egui::Align2::LEFT_BOTTOM,
-                label,
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_rgba_unmultiplied(230, 245, 255, 220),
+            draw_local_adjust_effect_position_overlay(
+                painter,
+                drawn_rect,
+                image_dims,
+                &layer.effect,
             );
         }
         match &layer.mask {
