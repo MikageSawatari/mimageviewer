@@ -379,6 +379,48 @@ mod local_adjust_segmentation_tests {
     }
 
     #[test]
+    fn gradient_create_pending_only_for_uninitialized_masks() {
+        let pending_linear = local_adjust_core::LocalAdjustmentLayer::new(
+            "linear",
+            local_adjust_core::LocalMask::LinearGradient(Default::default()),
+            local_adjust_core::LocalEffect::None,
+        );
+        assert!(local_adjust_gradient_create_pending(&pending_linear));
+
+        let ready_linear = local_adjust_core::LocalAdjustmentLayer::new(
+            "linear",
+            local_adjust_core::LocalMask::LinearGradient(local_adjust_core::LinearGradientMask {
+                initialized: true,
+                start: [0.2, 0.2],
+                end: [0.8, 0.8],
+            }),
+            local_adjust_core::LocalEffect::None,
+        );
+        assert!(!local_adjust_gradient_create_pending(&ready_linear));
+
+        let pending_radial = local_adjust_core::LocalAdjustmentLayer::new(
+            "radial",
+            local_adjust_core::LocalMask::RadialGradient(Default::default()),
+            local_adjust_core::LocalEffect::None,
+        );
+        assert!(local_adjust_gradient_create_pending(&pending_radial));
+
+        let ready_radial = local_adjust_core::LocalAdjustmentLayer::new(
+            "radial",
+            local_adjust_core::LocalMask::RadialGradient(local_adjust_core::RadialGradientMask {
+                initialized: true,
+                center: [0.5, 0.5],
+                inner_radius: 0.1,
+                inner_radius_y: 0.1,
+                outer_radius: 0.3,
+                outer_radius_y: 0.3,
+            }),
+            local_adjust_core::LocalEffect::None,
+        );
+        assert!(!local_adjust_gradient_create_pending(&ready_radial));
+    }
+
+    #[test]
     fn tilt_shift_linear_focus_drag_updates_focus_width_and_angle() {
         let mut params = local_adjust_core::TiltShiftParams {
             range_initialized: true,
@@ -4940,6 +4982,14 @@ fn local_adjust_gradient_handle_hit(
     }
 }
 
+fn local_adjust_gradient_create_pending(layer: &local_adjust_core::LocalAdjustmentLayer) -> bool {
+    match &layer.mask {
+        local_adjust_core::LocalMask::LinearGradient(mask) => !mask.initialized,
+        local_adjust_core::LocalMask::RadialGradient(mask) => !mask.initialized,
+        _ => false,
+    }
+}
+
 fn local_adjust_luma_range_preview_alpha(
     source: Option<&egui::ColorImage>,
     mask: local_adjust_core::RangeMask,
@@ -7163,30 +7213,44 @@ impl App {
                     ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
                 }
                 Some(MaskKind::LinearGradient) => {
-                    self.local_adjust_canvas_drag_before_layers =
-                        self.local_adjust_page_layers.get(&fs_idx).cloned();
-                    let drag = crate::app::LocalAdjustCanvasDrag {
-                        fs_idx,
-                        layer_idx,
-                        kind: crate::app::LocalAdjustCanvasDragKind::LinearGradient,
-                        start: norm,
-                    };
-                    self.local_adjust_canvas_drag = Some(drag);
-                    self.apply_local_adjust_gradient_drag(drag, norm, false);
-                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                    let create_pending = self
+                        .local_adjust_page_layers
+                        .get(&fs_idx)
+                        .and_then(|layers| layers.get(layer_idx))
+                        .is_some_and(local_adjust_gradient_create_pending);
+                    if create_pending {
+                        self.local_adjust_canvas_drag_before_layers =
+                            self.local_adjust_page_layers.get(&fs_idx).cloned();
+                        let drag = crate::app::LocalAdjustCanvasDrag {
+                            fs_idx,
+                            layer_idx,
+                            kind: crate::app::LocalAdjustCanvasDragKind::LinearGradient,
+                            start: norm,
+                        };
+                        self.local_adjust_canvas_drag = Some(drag);
+                        self.apply_local_adjust_gradient_drag(drag, norm, false);
+                        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                    }
                 }
                 Some(MaskKind::RadialGradient) => {
-                    self.local_adjust_canvas_drag_before_layers =
-                        self.local_adjust_page_layers.get(&fs_idx).cloned();
-                    let drag = crate::app::LocalAdjustCanvasDrag {
-                        fs_idx,
-                        layer_idx,
-                        kind: crate::app::LocalAdjustCanvasDragKind::RadialGradient,
-                        start: norm,
-                    };
-                    self.local_adjust_canvas_drag = Some(drag);
-                    self.apply_local_adjust_gradient_drag(drag, norm, false);
-                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                    let create_pending = self
+                        .local_adjust_page_layers
+                        .get(&fs_idx)
+                        .and_then(|layers| layers.get(layer_idx))
+                        .is_some_and(local_adjust_gradient_create_pending);
+                    if create_pending {
+                        self.local_adjust_canvas_drag_before_layers =
+                            self.local_adjust_page_layers.get(&fs_idx).cloned();
+                        let drag = crate::app::LocalAdjustCanvasDrag {
+                            fs_idx,
+                            layer_idx,
+                            kind: crate::app::LocalAdjustCanvasDragKind::RadialGradient,
+                            start: norm,
+                        };
+                        self.local_adjust_canvas_drag = Some(drag);
+                        self.apply_local_adjust_gradient_drag(drag, norm, false);
+                        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                    }
                 }
                 _ => {}
             }
@@ -7231,9 +7295,13 @@ impl App {
                     .get(&fs_idx)
                     .and_then(|layers| layers.get(layer_idx))
                     .map(|layer| MaskKind::from_mask(&layer.mask)),
-                Some(MaskKind::ColorRange | MaskKind::LinearGradient | MaskKind::RadialGradient)
-                    | Some(MaskKind::Segmentation)
+                Some(MaskKind::ColorRange) | Some(MaskKind::Segmentation)
             )
+            || self
+                .local_adjust_page_layers
+                .get(&fs_idx)
+                .and_then(|layers| layers.get(layer_idx))
+                .is_some_and(local_adjust_gradient_create_pending)
             || self.local_adjust_selective_color_pick_active
             || self.local_adjust_rgb_pick_active.is_some()
         {
