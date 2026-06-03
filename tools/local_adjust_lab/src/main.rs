@@ -11582,74 +11582,36 @@ fn draw_tone_detail_effect_params(
     }
 }
 
-fn draw_effect_params(
+macro_rules! focus_motion_effect_patterns {
+    () => {
+        LocalEffect::Blur(_)
+            | LocalEffect::MotionBlur(_)
+            | LocalEffect::Wind(_)
+            | LocalEffect::SpeedLines(_)
+            | LocalEffect::RadialFlash(_)
+            | LocalEffect::TiltShift(_)
+            | LocalEffect::LensBlur(_)
+            | LocalEffect::BokehSprite(_)
+            | LocalEffect::LensDirt(_)
+    };
+}
+
+fn is_focus_motion_effect(effect: &LocalEffect) -> bool {
+    matches!(effect, focus_motion_effect_patterns!())
+}
+
+fn draw_focus_motion_effect_params(
     ui: &mut egui::Ui,
-    layer: &mut LocalAdjustmentLayer,
-    image_dims: (usize, usize),
-    selective_color_pick_active: bool,
+    effect: &mut LocalEffect,
     rgb_pick_active: Option<RgbPickTarget>,
-    effect_clipboard_available: bool,
     effect_position_handles_visible: bool,
 ) -> EffectParamResponse {
     let mut changed = false;
-    let mut load_cube_lut = false;
-    let mut start_selective_color_pick = false;
-    let mut cancel_selective_color_pick = false;
     let mut start_rgb_pick = None;
     let mut cancel_rgb_pick = false;
     let mut set_effect_position_handles_visible = None;
-    let has_effect = !matches!(&layer.effect, LocalEffect::None);
-    let mut copy_effect = false;
-    let mut paste_effect = false;
-    let mut reset_effect = false;
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("加工パラメータ")
-                .size(14.0)
-                .strong()
-                .color(Color32::WHITE),
-        );
-        ui.add_space(6.0);
-        let copy_response = ui.button("コピー");
-        let copy_clicked = copy_response.clicked();
-        copy_response.lab_hover_tip("現在の効果種類と加工パラメータをコピーします。");
-        if copy_clicked {
-            copy_effect = true;
-        }
-        let paste_response =
-            ui.add_enabled(effect_clipboard_available, egui::Button::new("ペースト"));
-        let paste_clicked = paste_response.clicked();
-        paste_response
-            .lab_hover_tip("コピー済みの効果種類と加工パラメータをこのレイヤーへ貼り付けます。");
-        if paste_clicked {
-            paste_effect = true;
-        }
-        let reset_response = ui.add_enabled(has_effect, egui::Button::new("リセット"));
-        let reset_clicked = reset_response.clicked();
-        reset_response.lab_hover_tip("現在の効果を標準値に戻します。");
-        if reset_clicked {
-            reset_effect = true;
-        }
-    });
-    match &mut layer.effect {
-        LocalEffect::None => {
-            ui.label("加工内容を選ぶと、このレイヤーの効果が有効になります。");
-        }
-        tone_detail_effect_patterns!() => {
-            let tone_detail_response = draw_tone_detail_effect_params(
-                ui,
-                &mut layer.effect,
-                selective_color_pick_active,
-                rgb_pick_active,
-            );
-            changed |= tone_detail_response.changed;
-            start_selective_color_pick |= tone_detail_response.start_selective_color_pick;
-            cancel_selective_color_pick |= tone_detail_response.cancel_selective_color_pick;
-            cancel_rgb_pick |= tone_detail_response.cancel_rgb_pick;
-            if tone_detail_response.start_rgb_pick.is_some() {
-                start_rgb_pick = tone_detail_response.start_rgb_pick;
-            }
-        }
+
+    match effect {
         LocalEffect::Blur(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -12629,6 +12591,111 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像に対してレンズ汚れをどれだけ重ねるかです。");
+        }
+        _ => {
+            debug_assert!(
+                !is_focus_motion_effect(effect),
+                "focus/motion effect dispatch is out of sync"
+            );
+        }
+    }
+
+    EffectParamResponse {
+        changed,
+        start_rgb_pick,
+        cancel_rgb_pick,
+        set_effect_position_handles_visible,
+        ..Default::default()
+    }
+}
+
+fn draw_effect_params(
+    ui: &mut egui::Ui,
+    layer: &mut LocalAdjustmentLayer,
+    image_dims: (usize, usize),
+    selective_color_pick_active: bool,
+    rgb_pick_active: Option<RgbPickTarget>,
+    effect_clipboard_available: bool,
+    effect_position_handles_visible: bool,
+) -> EffectParamResponse {
+    let mut changed = false;
+    let mut load_cube_lut = false;
+    let mut start_selective_color_pick = false;
+    let mut cancel_selective_color_pick = false;
+    let mut start_rgb_pick = None;
+    let mut cancel_rgb_pick = false;
+    let mut set_effect_position_handles_visible = None;
+    let has_effect = !matches!(&layer.effect, LocalEffect::None);
+    let mut copy_effect = false;
+    let mut paste_effect = false;
+    let mut reset_effect = false;
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("加工パラメータ")
+                .size(14.0)
+                .strong()
+                .color(Color32::WHITE),
+        );
+        ui.add_space(6.0);
+        let copy_response = ui.button("コピー");
+        let copy_clicked = copy_response.clicked();
+        copy_response.lab_hover_tip("現在の効果種類と加工パラメータをコピーします。");
+        if copy_clicked {
+            copy_effect = true;
+        }
+        let paste_response =
+            ui.add_enabled(effect_clipboard_available, egui::Button::new("ペースト"));
+        let paste_clicked = paste_response.clicked();
+        paste_response
+            .lab_hover_tip("コピー済みの効果種類と加工パラメータをこのレイヤーへ貼り付けます。");
+        if paste_clicked {
+            paste_effect = true;
+        }
+        let reset_response = ui.add_enabled(has_effect, egui::Button::new("リセット"));
+        let reset_clicked = reset_response.clicked();
+        reset_response.lab_hover_tip("現在の効果を標準値に戻します。");
+        if reset_clicked {
+            reset_effect = true;
+        }
+    });
+    match &mut layer.effect {
+        LocalEffect::None => {
+            ui.label("加工内容を選ぶと、このレイヤーの効果が有効になります。");
+        }
+        tone_detail_effect_patterns!() => {
+            let tone_detail_response = draw_tone_detail_effect_params(
+                ui,
+                &mut layer.effect,
+                selective_color_pick_active,
+                rgb_pick_active,
+            );
+            changed |= tone_detail_response.changed;
+            start_selective_color_pick |= tone_detail_response.start_selective_color_pick;
+            cancel_selective_color_pick |= tone_detail_response.cancel_selective_color_pick;
+            cancel_rgb_pick |= tone_detail_response.cancel_rgb_pick;
+            if tone_detail_response.start_rgb_pick.is_some() {
+                start_rgb_pick = tone_detail_response.start_rgb_pick;
+            }
+        }
+        focus_motion_effect_patterns!() => {
+            let focus_motion_response = draw_focus_motion_effect_params(
+                ui,
+                &mut layer.effect,
+                rgb_pick_active,
+                effect_position_handles_visible,
+            );
+            changed |= focus_motion_response.changed;
+            cancel_rgb_pick |= focus_motion_response.cancel_rgb_pick;
+            if focus_motion_response.start_rgb_pick.is_some() {
+                start_rgb_pick = focus_motion_response.start_rgb_pick;
+            }
+            if focus_motion_response
+                .set_effect_position_handles_visible
+                .is_some()
+            {
+                set_effect_position_handles_visible =
+                    focus_motion_response.set_effect_position_handles_visible;
+            }
         }
         LocalEffect::RadialBlur(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
