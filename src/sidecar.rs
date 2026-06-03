@@ -68,11 +68,18 @@ pub struct SidecarEntry {
     /// 用途が異なるだけ。両者を 1 ファイルに同居させても容量影響は小さい。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conceal: Option<SidecarMask>,
+    /// 補正レイヤー配列。中央 `local_adjust.db` が authoritative で、サイドカーは
+    /// フォルダ移動時の復元用バックアップとして扱う。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_adjust_layers: Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
 }
 
 impl SidecarEntry {
     fn is_empty(&self) -> bool {
-        self.adjust.is_none() && self.mask.is_none() && self.conceal.is_none()
+        self.adjust.is_none()
+            && self.mask.is_none()
+            && self.conceal.is_none()
+            && self.local_adjust_layers.is_none()
     }
 }
 
@@ -253,6 +260,34 @@ impl SidecarFile {
         }
     }
 
+    /// 補正レイヤー配列をセットする。空配列は削除と同じ扱いにする。
+    pub fn set_local_adjust_layers(
+        &mut self,
+        rel_key: &str,
+        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    ) {
+        if layers.is_empty() {
+            self.remove_local_adjust_layers(rel_key);
+            return;
+        }
+        let entry = self.items.entry(rel_key.to_string()).or_default();
+        entry.local_adjust_layers = Some(layers);
+        self.mark_dirty();
+    }
+
+    /// 補正レイヤー配列を取り除く。
+    pub fn remove_local_adjust_layers(&mut self, rel_key: &str) {
+        if let Some(entry) = self.items.get_mut(rel_key) {
+            if entry.local_adjust_layers.is_some() {
+                entry.local_adjust_layers = None;
+                if entry.is_empty() {
+                    self.items.remove(rel_key);
+                }
+                self.mark_dirty();
+            }
+        }
+    }
+
     /// 複数エントリの adjust を一括セット (「全画像に適用」用)。
     pub fn set_adjust_bulk<I>(&mut self, iter: I, params: &AdjustParams)
     where
@@ -415,9 +450,11 @@ pub struct ImportStats {
     pub imported_adjust: usize,
     pub imported_mask: usize,
     pub imported_conceal: usize,
+    pub imported_local_adjust: usize,
     pub skipped_adjust: usize,
     pub skipped_mask: usize,
     pub skipped_conceal: usize,
+    pub skipped_local_adjust: usize,
 }
 
 /// サイドカーの各エントリを中央 DB へインポートする (純粋関数、テスト用に App から分離)。
@@ -432,6 +469,7 @@ pub fn import_to_dbs(
     adjust_db: Option<&crate::adjustment_db::AdjustmentDb>,
     mask_db: Option<&crate::mask_db::MaskDb>,
     conceal_db: Option<&crate::conceal_db::ConcealDb>,
+    local_adjust_db: Option<&crate::local_adjust_db::LocalAdjustDb>,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
     for (rel_key, entry) in sidecar.items() {
@@ -494,6 +532,18 @@ pub fn import_to_dbs(
                 }
             }
         }
+
+        if let (Some(db), Some(layers)) = (local_adjust_db, &entry.local_adjust_layers) {
+            if !layers.is_empty() {
+                if db.get_layers(&abs_key).is_none() {
+                    if db.set_layers(&abs_key, layers).is_ok() {
+                        stats.imported_local_adjust += 1;
+                    }
+                } else {
+                    stats.skipped_local_adjust += 1;
+                }
+            }
+        }
     }
     stats
 }
@@ -545,6 +595,7 @@ fn current_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use local_adjust_core::{LocalAdjustmentLayer, LocalEffect, LocalMask};
     use std::path::PathBuf;
 
     fn sample_params() -> AdjustParams {
@@ -552,6 +603,10 @@ mod tests {
         p.brightness = 10.0;
         p.contrast = -5.0;
         p
+    }
+
+    fn sample_local_adjust_layer(name: &str) -> LocalAdjustmentLayer {
+        LocalAdjustmentLayer::new(name, LocalMask::Full, LocalEffect::None)
     }
 
     #[test]
@@ -608,8 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_empty_after_removing_all_three_kinds() {
-        // Phase 4: adjust / mask / conceal の 3 種類すべてに対する is_empty 連動
+    fn entry_empty_after_removing_all_kinds() {
         let mut s = SidecarFile::new(PathBuf::from("C:/tmp/nonexistent"));
         s.set_adjust("img.jpg", sample_params());
         s.set_mask(
@@ -630,13 +684,19 @@ mod tests {
                 vectors: Vec::new(),
             },
         );
+        s.set_local_adjust_layers("img.jpg", vec![sample_local_adjust_layer("layer")]);
         assert_eq!(s.items().len(), 1);
+        s.remove_local_adjust_layers("img.jpg");
+        assert_eq!(s.items().len(), 1, "adjust + mask + conceal still present");
         s.remove_adjust("img.jpg");
         assert_eq!(s.items().len(), 1, "mask + conceal still present");
         s.remove_mask("img.jpg");
         assert_eq!(s.items().len(), 1, "conceal still present");
         s.remove_conceal("img.jpg");
-        assert!(s.items().is_empty(), "entry dropped when all three gone");
+        assert!(
+            s.items().is_empty(),
+            "entry dropped when all fields are gone"
+        );
     }
 
     #[test]
@@ -657,6 +717,20 @@ mod tests {
         assert!(entry.mask.is_none());
         assert!(entry.conceal.is_some());
         assert_eq!(entry.conceal.as_ref().unwrap().w, 8);
+    }
+
+    #[test]
+    fn set_local_adjust_layers_is_independent_of_other_fields() {
+        let mut s = SidecarFile::new(PathBuf::from("C:/tmp/nonexistent"));
+        s.set_local_adjust_layers("img.jpg", vec![sample_local_adjust_layer("look")]);
+        let entry = s.items().get("img.jpg").unwrap();
+        assert!(entry.adjust.is_none());
+        assert!(entry.mask.is_none());
+        assert!(entry.conceal.is_none());
+        assert_eq!(entry.local_adjust_layers.as_ref().unwrap().len(), 1);
+
+        s.remove_local_adjust_layers("img.jpg");
+        assert!(s.items().is_empty());
     }
 
     #[test]
@@ -704,6 +778,13 @@ mod tests {
                 "book.zip::001.jpg",
                 SidecarMask::from_raw(&[1, 2, 3, 4], &[], 8, 8),
             );
+            s.set_local_adjust_layers(
+                "img.jpg",
+                vec![
+                    sample_local_adjust_layer("base"),
+                    sample_local_adjust_layer("finish"),
+                ],
+            );
             s.flush();
             assert!(!s.is_dirty());
         }
@@ -711,6 +792,16 @@ mod tests {
         assert_eq!(s2.items().len(), 2);
         let adj = s2.items().get("img.jpg").unwrap().adjust.as_ref().unwrap();
         assert_eq!(adj.brightness, 10.0);
+        assert_eq!(
+            s2.items()
+                .get("img.jpg")
+                .unwrap()
+                .local_adjust_layers
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
         let mask = s2
             .items()
             .get("book.zip::001.jpg")
@@ -720,6 +811,34 @@ mod tests {
             .unwrap();
         assert_eq!(mask.w, 8);
         assert_eq!(mask.decode().unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn import_to_dbs_imports_local_adjust_without_overwriting_db() {
+        let sidecar_dir = tempfile::tempdir().unwrap();
+        let folder = sidecar_dir.path();
+        let mut s = SidecarFile::new(folder.to_path_buf());
+        let imported_layers = vec![sample_local_adjust_layer("from sidecar")];
+        let existing_layers = vec![sample_local_adjust_layer("already in db")];
+        s.set_local_adjust_layers("fresh.png", imported_layers.clone());
+        s.set_local_adjust_layers(
+            "existing.png",
+            vec![sample_local_adjust_layer("stale sidecar")],
+        );
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = crate::local_adjust_db::LocalAdjustDb::open_at(&db_dir.path().join("local.db"))
+            .unwrap();
+        let fresh_key = reconstruct_image_key(folder, "fresh.png");
+        let existing_key = reconstruct_image_key(folder, "existing.png");
+        db.set_layers(&existing_key, &existing_layers).unwrap();
+
+        let stats = import_to_dbs(folder, &s, None, None, None, Some(&db));
+
+        assert_eq!(stats.imported_local_adjust, 1);
+        assert_eq!(stats.skipped_local_adjust, 1);
+        assert_eq!(db.get_layers(&fresh_key), Some(imported_layers));
+        assert_eq!(db.get_layers(&existing_key), Some(existing_layers));
     }
 
     #[test]

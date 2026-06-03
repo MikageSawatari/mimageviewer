@@ -556,11 +556,12 @@ AI 自動検出よりも、ユーザーの意図した範囲を狭く安全に�
 
 ### 7.0 mIV 本体統合時の最小方針
 
-本体統合の初期段階では、中央 DB を authoritative にする。サイドカーバックアップは
-`adjustment.db` / `mask.db` と同じく将来必要だが、補正レイヤーはマスクや効果 JSON が大きく、
-既存 `mimageviewer.dat` の同期 flush 課題も残っているため、最初の縦通しには含めない。
+本体統合では、中央 DB を authoritative にする。フォルダ移動時の復元用バックアップとして、
+既存の `mimageviewer.dat` に `local_adjust_layers` を追加し、`adjustment.db` / `mask.db` /
+`conceal.db` と同じサイドカー同期に載せる。
 
-- 初期保存先: `%APPDATA%/mimageviewer/local_adjust.db`
+- 保存先: `%APPDATA%/mimageviewer/local_adjust.db`
+- サイドカー: フォルダ単位 `mimageviewer.dat` の各エントリに `local_adjust_layers` を保存する。
 - キー規則: `App::page_path_key` と同じ正規化済み page key
 - 対象: 通常画像 / ZIP 内画像 / PDF ページ
 - サムネイル: 補正レイヤー結果は反映しない。消しゴム / 隠蔽加工と同じく、必要ならバッジのみ表示する。
@@ -573,20 +574,9 @@ AI 自動検出よりも、ユーザーの意図した範囲を狭く安全に�
 詳細パラメータ編集、マスク編集、レイヤー並べ替え、Undo / Redo は後続タスクで扱う。
 プレビューは自動反映し、手動プレビュー用アイコンは置かない。
 
-サイドカー対応、既存 `mimageviewer.dat` への `local_adjust_layers` 追加、または画像単位の
-`.miv` サイドカー正式採用は、最小統合が安定した後に判断する。
-
-補正レイヤーは容量が大きくなりやすく、ユーザーが時間をかけて調整するデータでもある。
-そのため、まずは画像ファイルと一緒に移動しやすいサイドカー保存を第一候補にする。
-
-サイドカー案:
-
-- 通常画像 `foo.png` に対して `foo.png.miv` を同じフォルダに作る。
-- ファイル名全体に `.miv` を付けることで、`foo.png` / `foo.jpg` が同じフォルダにあっても衝突しない。
-- JSON 形式にし、数値パラメータや効果は読みやすく保存する。
-- 手動マスク、追加マスク、削除マスクは 2値として 1bit/pixel に packed し、deflate + base64 で保存する。
-- 被写体マットのようなソフトマスクは 8bit alpha に量子化し、deflate + base64 で保存する。
-- 領域分割ラベルは u32 little-endian 配列を deflate + base64 で保存し、選択状態は別配列で持つ。
+画像単位 `.miv` サイドカー案は `local_adjust_lab` の検証用に残し、本体では既存の
+フォルダ単位 `mimageviewer.dat` を使う。中央 DB に既に補正レイヤーがある場合、サイドカーからの
+インポートでは上書きしない。
 
 DB 案は、将来本体に統合するときの高速検索 / 一括管理 / 仮想フォルダ対応用として残す。
 
@@ -626,9 +616,8 @@ ZIP / PDF ページのキーも既存のページキー生成に合わせる。
 輝度 / カラー範囲、被写体選択、領域分割などのパラメータを保存する。
 合成時は `mask_source_json` から必要なら raster alpha mask を再生成し、既存の mask pipeline に流す。
 
-サイドカーバックアップ `mimageviewer.dat` には、将来的に `local_adjust_layers` 相当の
-配列を追加するか、画像単位の `.miv` サイドカーを正式採用するかを本体統合時に判断する。
-`local_adjust_lab` では先に `foo.png.miv` 形式を実装して、容量と復元性を検証する。
+サイドカーバックアップ `mimageviewer.dat` には `local_adjust_layers` 配列を保存する。
+`local_adjust_lab` の `foo.png.miv` 形式は検証用で、本体の正式保存形式ではない。
 
 ## 8. キャッシュ案
 
@@ -724,7 +713,7 @@ stale、または worker 実行中の場合、表示は `local adjust source` �
 9. Undo / Redo とキャッシュ無効化ルールを補正レイヤー操作へ接続する。
 10. Ctrl+E 書き出しと pipeline debug に補正レイヤー段を追加する。
 11. perf 計測、ユニットテスト、必要な実機試験項目を追加する。
-12. 後続として sidecar backup と `local-adjust-ui` 共通化の要否を判断する。
+12. 後続として `local-adjust-ui` 共通化の要否を判断する。
 
 ### Phase 1: 全体補正の拡張
 
@@ -949,7 +938,7 @@ Undo / Redo を本体へ移植済み。フルスクリーン左パネルの補�
 - `Ctrl+Alt+Shift+D` の pipeline debug 出力に `56_local_adjust_source_current`、
   `57_local_adjust_recomputed`、`58_local_adjust_current` が含まれる。
 - Ctrl+Z / Ctrl+Y でレイヤー追加/削除、パラメータ編集、キャンバス編集、LUT 読み込みが戻る。
-- 現時点の意図的な未実装: サイドカーバックアップ、`local-adjust-ui` 共通 crate 化。
+- 現時点の意図的な未実装: `local-adjust-ui` 共通 crate 化。
 
 ## 12. 優先順位
 

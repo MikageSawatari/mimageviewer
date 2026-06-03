@@ -17960,6 +17960,14 @@ impl App {
                 ));
             }
         }
+        if layers.is_empty() {
+            self.with_sidecar_mut(idx, |sc, rel| sc.remove_local_adjust_layers(rel));
+        } else {
+            let sidecar_layers = layers.clone();
+            self.with_sidecar_mut(idx, move |sc, rel| {
+                sc.set_local_adjust_layers(rel, sidecar_layers)
+            });
+        }
         self.set_local_adjust_layers_for_idx_memory_only(idx, layers);
     }
 
@@ -18722,13 +18730,19 @@ impl App {
                 self.adjustment_db.as_ref(),
                 self.mask_db.as_ref(),
                 self.conceal_db.as_ref(),
+                self.local_adjust_db.as_ref(),
             );
-            if stats.imported_adjust > 0 || stats.imported_mask > 0 || stats.imported_conceal > 0 {
+            if stats.imported_adjust > 0
+                || stats.imported_mask > 0
+                || stats.imported_conceal > 0
+                || stats.imported_local_adjust > 0
+            {
                 crate::logger::log(format!(
-                    "sidecar: imported {} adjust + {} mask + {} conceal entries from {}",
+                    "sidecar: imported {} adjust + {} mask + {} conceal + {} local-adjust entries from {}",
                     stats.imported_adjust,
                     stats.imported_mask,
                     stats.imported_conceal,
+                    stats.imported_local_adjust,
                     sidecar_folder.display()
                 ));
             }

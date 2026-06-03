@@ -2,7 +2,8 @@
 //!
 //! `%APPDATA%/mimageviewer/local_adjust.db` に、ページ単位の
 //! `Vec<local_adjust_core::LocalAdjustmentLayer>` を JSON として保存する。
-//! 初期統合では中央 DB を authoritative にし、サイドカーバックアップは後続で扱う。
+//! 中央 DB を authoritative にし、フォルダ移動時の復元用バックアップとして
+//! `mimageviewer.dat` にも同じレイヤー配列をミラーする。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
