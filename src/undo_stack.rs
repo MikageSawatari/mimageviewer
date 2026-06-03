@@ -68,6 +68,17 @@ pub struct AdjustmentChange {
     pub after: Option<AdjustParams>,
 }
 
+/// 補正レイヤー 1 ページ分の変更記録。
+///
+/// 空配列は「補正レイヤーなし」を表す。DB/sidecar への反映は
+/// `App::set_local_adjust_layers_for_idx` が担当する。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalAdjustmentChange {
+    pub idx: usize,
+    pub before: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    pub after: Vec<local_adjust_core::LocalAdjustmentLayer>,
+}
+
 /// レーティング 1 件の変更記録。`path_key` は `adjustment_db::normalize_path` 正規化済み。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RatingChange {
@@ -106,6 +117,10 @@ pub enum UndoEntry {
         changes: Vec<AdjustmentChange>,
         summary: String,
     },
+    LocalAdjustment {
+        changes: Vec<LocalAdjustmentChange>,
+        summary: String,
+    },
 }
 
 impl UndoEntry {
@@ -113,7 +128,8 @@ impl UndoEntry {
         match self {
             UndoEntry::Rating { summary, .. }
             | UndoEntry::Tag { summary, .. }
-            | UndoEntry::Adjustment { summary, .. } => summary,
+            | UndoEntry::Adjustment { summary, .. }
+            | UndoEntry::LocalAdjustment { summary, .. } => summary,
         }
     }
 
@@ -123,6 +139,7 @@ impl UndoEntry {
             UndoEntry::Rating { changes, .. } => !changes.is_empty(),
             UndoEntry::Tag { changes, .. } => !changes.is_empty(),
             UndoEntry::Adjustment { changes, .. } => !changes.is_empty(),
+            UndoEntry::LocalAdjustment { changes, .. } => !changes.is_empty(),
         }
     }
 }

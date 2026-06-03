@@ -3034,6 +3034,12 @@ pub struct App {
     pub(crate) local_adjust_mask_paint_add: bool,
     /// 補正レイヤー手描きマスクのドラッグ中状態。
     pub(crate) local_adjust_mask_brush_stroke: Option<LocalAdjustMaskBrushStroke>,
+    /// キャンバスドラッグ開始前の補正レイヤー配列。Undo をドラッグ単位にまとめる。
+    pub(crate) local_adjust_canvas_drag_before_layers:
+        Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    /// 手描きブラシ開始前の補正レイヤー配列。Undo をストローク単位にまとめる。
+    pub(crate) local_adjust_mask_brush_before_layers:
+        Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
     /// 補正レイヤー自身の世代番号。レイヤー追加 / 削除 / パラメータ変更で idx 単位に +1 する。
     pub(crate) local_adjust_generation: std::collections::HashMap<usize, u64>,
     /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
@@ -4247,6 +4253,8 @@ impl App {
             local_adjust_mask_brush_radius: 36.0,
             local_adjust_mask_paint_add: true,
             local_adjust_mask_brush_stroke: None,
+            local_adjust_canvas_drag_before_layers: None,
+            local_adjust_mask_brush_before_layers: None,
             local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
@@ -8276,6 +8284,9 @@ impl App {
         self.local_adjust_selective_color_pick_active = false;
         self.local_adjust_effect_position_handles_visible = true;
         self.local_adjust_canvas_drag = None;
+        self.local_adjust_mask_brush_stroke = None;
+        self.local_adjust_canvas_drag_before_layers = None;
+        self.local_adjust_mask_brush_before_layers = None;
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
         self.cancel_all_local_adjust_pending();
@@ -16665,6 +16676,10 @@ impl App {
         self.reset_erase_mode();
         self.reset_conceal_mode();
         self.local_adjust_mode = false;
+        self.local_adjust_canvas_drag = None;
+        self.local_adjust_mask_brush_stroke = None;
+        self.local_adjust_canvas_drag_before_layers = None;
+        self.local_adjust_mask_brush_before_layers = None;
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
         self.conceal_cache.clear();
@@ -20745,6 +20760,10 @@ impl App {
         self.slideshow_playing = false;
         self.adjustment_mode = false;
         self.local_adjust_mode = false;
+        self.local_adjust_canvas_drag = None;
+        self.local_adjust_mask_brush_stroke = None;
+        self.local_adjust_canvas_drag_before_layers = None;
+        self.local_adjust_mask_brush_before_layers = None;
         self.analysis_mode = false;
         self.reset_erase_mode();
         self.compare_view_mode = crate::app::CompareViewMode::Off;

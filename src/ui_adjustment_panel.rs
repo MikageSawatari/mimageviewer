@@ -2007,6 +2007,7 @@ impl App {
             .get(&fs_idx)
             .cloned()
             .unwrap_or_default();
+        let before_layers = layers.clone();
         let Some(layer) = layers.get_mut(layer_idx) else {
             return false;
         };
@@ -2015,7 +2016,12 @@ impl App {
         }
         self.local_adjust_selected_layers.insert(fs_idx, layer_idx);
         if persist {
-            self.set_local_adjust_layers_for_idx(fs_idx, layers);
+            self.set_local_adjust_layers_for_idx_with_undo(
+                fs_idx,
+                before_layers,
+                layers,
+                "補正レイヤーキャンバス操作".to_string(),
+            );
         } else {
             self.set_local_adjust_layers_for_idx_memory_only(fs_idx, layers);
         }
@@ -2145,7 +2151,16 @@ impl App {
         }
         self.local_adjust_selected_layers
             .insert(stroke.fs_idx, stroke.layer_idx);
-        self.set_local_adjust_layers_for_idx(stroke.fs_idx, layers);
+        let before = self
+            .local_adjust_mask_brush_before_layers
+            .take()
+            .unwrap_or_else(|| layers.clone());
+        self.set_local_adjust_layers_for_idx_with_undo(
+            stroke.fs_idx,
+            before,
+            layers,
+            "補正レイヤー手描きマスク".to_string(),
+        );
     }
 
     fn persist_local_adjust_canvas_drag(&mut self) {
@@ -2155,7 +2170,16 @@ impl App {
         let Some(layers) = self.local_adjust_page_layers.get(&drag.fs_idx).cloned() else {
             return;
         };
-        self.set_local_adjust_layers_for_idx(drag.fs_idx, layers);
+        let before = self
+            .local_adjust_canvas_drag_before_layers
+            .take()
+            .unwrap_or_else(|| layers.clone());
+        self.set_local_adjust_layers_for_idx_with_undo(
+            drag.fs_idx,
+            before,
+            layers,
+            "補正レイヤーキャンバス操作".to_string(),
+        );
     }
 
     pub(crate) fn handle_local_adjust_canvas_input(
@@ -2314,6 +2338,8 @@ impl App {
                     })
                     .is_some_and(|center| center.distance(pos) <= 14.0);
                 if center_hit {
+                    self.local_adjust_canvas_drag_before_layers =
+                        self.local_adjust_page_layers.get(&fs_idx).cloned();
                     let drag = crate::app::LocalAdjustCanvasDrag {
                         fs_idx,
                         layer_idx,
@@ -2335,6 +2361,8 @@ impl App {
                     effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target)
                 });
             if let Some(target) = active_mask_edit_target {
+                self.local_adjust_mask_brush_before_layers =
+                    self.local_adjust_page_layers.get(&fs_idx).cloned();
                 let stroke = crate::app::LocalAdjustMaskBrushStroke {
                     fs_idx,
                     layer_idx,
@@ -2389,6 +2417,8 @@ impl App {
                     }
                 }
                 Some(MaskKind::LinearGradient) => {
+                    self.local_adjust_canvas_drag_before_layers =
+                        self.local_adjust_page_layers.get(&fs_idx).cloned();
                     let drag = crate::app::LocalAdjustCanvasDrag {
                         fs_idx,
                         layer_idx,
@@ -2400,6 +2430,8 @@ impl App {
                     ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
                 }
                 Some(MaskKind::RadialGradient) => {
+                    self.local_adjust_canvas_drag_before_layers =
+                        self.local_adjust_page_layers.get(&fs_idx).cloned();
                     let drag = crate::app::LocalAdjustCanvasDrag {
                         fs_idx,
                         layer_idx,
@@ -2600,25 +2632,30 @@ impl App {
             .get(&fs_idx)
             .cloned()
             .unwrap_or_default();
+        let before_layers = layers.clone();
         let mut changed = false;
         let mut selected_after: Option<usize> = None;
+        let mut undo_summary: Option<String> = None;
 
         if let Some(effect) = add_quick_effect {
             layers.push(effect.layer());
             selected_after = Some(layers.len().saturating_sub(1));
             changed = true;
+            undo_summary.get_or_insert_with(|| "補正レイヤー追加".to_string());
             self.show_feedback_toast(format!("補正レイヤーを追加: {}", effect.label()));
         }
         if let Some(kind) = add_effect {
             layers.push(kind.layer());
             selected_after = Some(layers.len().saturating_sub(1));
             changed = true;
+            undo_summary.get_or_insert_with(|| "補正レイヤー追加".to_string());
             self.show_feedback_toast(format!("補正レイヤーを追加: {}", kind.label()));
         }
         if let Some((layer_idx, enabled)) = set_enabled {
             if let Some(layer) = layers.get_mut(layer_idx) {
                 layer.enabled = enabled;
                 changed = true;
+                undo_summary.get_or_insert_with(|| "補正レイヤー切替".to_string());
                 self.show_feedback_toast(if enabled {
                     "補正レイヤーを有効化".to_string()
                 } else {
@@ -2632,6 +2669,7 @@ impl App {
             layers[layer_idx] = layer;
             selected_after = Some(layer_idx);
             changed = true;
+            undo_summary.get_or_insert_with(|| "補正レイヤー編集".to_string());
         }
         if let Some(layer_idx) = effect_requests.copy_effect
             && let Some(layer) = layers.get(layer_idx)
@@ -2647,6 +2685,7 @@ impl App {
                     paste_layer_effect(layer, effect);
                     selected_after = Some(layer_idx);
                     changed = true;
+                    undo_summary.get_or_insert_with(|| "補正レイヤー効果ペースト".to_string());
                     self.local_adjust_selective_color_pick_active = false;
                     self.local_adjust_rgb_pick_active = None;
                     self.show_feedback_toast(format!("加工パラメータをペースト: {}", kind.label()));
@@ -2662,6 +2701,7 @@ impl App {
             if reset_layer_effect_params(layer) {
                 selected_after = Some(layer_idx);
                 changed = true;
+                undo_summary.get_or_insert_with(|| "補正レイヤー効果リセット".to_string());
                 self.local_adjust_selective_color_pick_active = false;
                 self.local_adjust_rgb_pick_active = None;
                 self.show_feedback_toast(format!("加工パラメータをリセット: {}", kind.label()));
@@ -2673,15 +2713,22 @@ impl App {
             layers.remove(layer_idx);
             selected_after = Some(layer_idx.min(layers.len().saturating_sub(1)));
             changed = true;
+            undo_summary.get_or_insert_with(|| "補正レイヤー削除".to_string());
             self.show_feedback_toast("補正レイヤーを削除".to_string());
         }
         if clear_layers {
             layers.clear();
             changed = true;
+            undo_summary.get_or_insert_with(|| "補正レイヤー全削除".to_string());
             self.show_feedback_toast("補正レイヤーをすべて削除".to_string());
         }
         if changed {
-            self.set_local_adjust_layers_for_idx(fs_idx, layers);
+            self.set_local_adjust_layers_for_idx_with_undo(
+                fs_idx,
+                before_layers,
+                layers,
+                undo_summary.unwrap_or_else(|| "補正レイヤー編集".to_string()),
+            );
             if let Some(selected) = selected_after {
                 if self
                     .local_adjust_page_layers
@@ -2801,6 +2848,7 @@ impl App {
                     .get(&pending.fs_idx)
                     .cloned()
                     .unwrap_or_default();
+                let before_layers = layers.clone();
                 if !layers.get(pending.layer_idx).is_some_and(|layer| {
                     matches!(layer.effect, local_adjust_core::LocalEffect::CubeLut(_))
                 }) {
@@ -2814,7 +2862,12 @@ impl App {
                 layers[pending.layer_idx].effect = local_adjust_core::LocalEffect::CubeLut(params);
                 self.local_adjust_selected_layers
                     .insert(pending.fs_idx, pending.layer_idx);
-                self.set_local_adjust_layers_for_idx(pending.fs_idx, layers);
+                self.set_local_adjust_layers_for_idx_with_undo(
+                    pending.fs_idx,
+                    before_layers,
+                    layers,
+                    "補正レイヤーLUT読み込み".to_string(),
+                );
                 self.show_feedback_toast(format!(
                     "LUT読み込み完了: {name} ({size}^3) / {}",
                     pending.path.display()

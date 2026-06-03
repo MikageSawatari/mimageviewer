@@ -20,7 +20,9 @@ use crate::adjustment::AdjustParams;
 use crate::app::App;
 use crate::tag_ops::find_favorite_id;
 use crate::tag_write_worker::{TagJobKind, TagWriteJob};
-use crate::undo_stack::{AdjustUndoScope, AdjustmentChange, RatingChange, TagChange, UndoEntry};
+use crate::undo_stack::{
+    AdjustUndoScope, AdjustmentChange, LocalAdjustmentChange, RatingChange, TagChange, UndoEntry,
+};
 
 impl App {
     // ── 積み込み (操作直後に呼ぶ) ────────────────────────────────────
@@ -73,6 +75,25 @@ impl App {
             return;
         }
         self.meta_undo.push(UndoEntry::Adjustment {
+            changes: filtered,
+            summary,
+        });
+    }
+
+    /// 1 回の補正レイヤー操作を Undo スタックに積む。
+    pub(crate) fn push_local_adjustment_undo_entry(
+        &mut self,
+        changes: Vec<LocalAdjustmentChange>,
+        summary: String,
+    ) {
+        let filtered: Vec<LocalAdjustmentChange> = changes
+            .into_iter()
+            .filter(|c| c.before != c.after)
+            .collect();
+        if filtered.is_empty() {
+            return;
+        }
+        self.meta_undo.push(UndoEntry::LocalAdjustment {
             changes: filtered,
             summary,
         });
@@ -148,6 +169,11 @@ impl App {
                     self.apply_adjustment_change_to_app(&changes[i], true);
                 }
             }
+            UndoEntry::LocalAdjustment { changes, .. } => {
+                for c in changes {
+                    self.apply_local_adjustment_change_to_app(c, true);
+                }
+            }
         }
         self.show_feedback_toast(format!("元に戻す: {summary}"));
         self.meta_undo.push_redo(entry);
@@ -177,6 +203,11 @@ impl App {
                 order.sort_by_key(|&i| std::cmp::Reverse(adjust_scope_priority(&changes[i].scope)));
                 for i in order {
                     self.apply_adjustment_change_to_app(&changes[i], false);
+                }
+            }
+            UndoEntry::LocalAdjustment { changes, .. } => {
+                for c in changes {
+                    self.apply_local_adjustment_change_to_app(c, false);
                 }
             }
         }
@@ -307,6 +338,16 @@ impl App {
         }
     }
 
+    /// 補正レイヤー Undo/Redo の 1 件適用。
+    fn apply_local_adjustment_change_to_app(
+        &mut self,
+        c: &LocalAdjustmentChange,
+        use_before: bool,
+    ) {
+        let target = if use_before { &c.before } else { &c.after };
+        self.set_local_adjust_layers_for_idx(c.idx, target.clone());
+    }
+
     /// 単一スコープの単一変更を Undo スタックに積む共通ヘルパー。`before == after`
     /// は捨てられるので、呼び出し側で抑止判定を書かなくて済む。
     pub(crate) fn capture_adjustment_undo(
@@ -324,6 +365,35 @@ impl App {
             }],
             summary,
         );
+    }
+
+    pub(crate) fn capture_local_adjustment_undo(
+        &mut self,
+        idx: usize,
+        before: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        after: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        summary: String,
+    ) {
+        self.push_local_adjustment_undo_entry(
+            vec![LocalAdjustmentChange { idx, before, after }],
+            summary,
+        );
+    }
+
+    pub(crate) fn set_local_adjust_layers_for_idx_with_undo(
+        &mut self,
+        idx: usize,
+        before: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        summary: String,
+    ) {
+        self.set_local_adjust_layers_for_idx(idx, layers);
+        let after = self
+            .local_adjust_page_layers
+            .get(&idx)
+            .cloned()
+            .unwrap_or_default();
+        self.capture_local_adjustment_undo(idx, before, after, summary);
     }
 
     /// 補正書き込み操作の **直前 → 直後** で 3 層 (Page / Favorite / Global) すべての

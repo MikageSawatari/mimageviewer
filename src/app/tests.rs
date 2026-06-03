@@ -2823,6 +2823,50 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// 補正レイヤーの Undo/Redo: レイヤー配列全体を before/after として戻す。
+    #[test]
+    fn local_adjustment_layers_undo_redo_round_trip() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        let layer = local_adjust_core::LocalAdjustmentLayer::new(
+            "tone",
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::Tone(local_adjust_core::ToneParams {
+                brightness: 25.0,
+                ..Default::default()
+            }),
+        );
+
+        let before = app
+            .local_adjust_page_layers
+            .get(&idx)
+            .cloned()
+            .unwrap_or_default();
+        app.set_local_adjust_layers_for_idx_with_undo(
+            idx,
+            before,
+            vec![layer],
+            "test local adjust".to_string(),
+        );
+        assert_eq!(app.local_adjust_page_layers.get(&idx).unwrap().len(), 1);
+        assert!(app.local_adjust_pages.contains(&idx));
+
+        app.apply_meta_undo();
+        assert!(
+            !app.local_adjust_page_layers.contains_key(&idx),
+            "Undo 後は補正レイヤーなしに戻る"
+        );
+        assert!(!app.local_adjust_pages.contains(&idx));
+
+        app.apply_meta_redo();
+        assert_eq!(
+            app.local_adjust_page_layers.get(&idx).unwrap().len(),
+            1,
+            "Redo で補正レイヤーが再適用される"
+        );
+        assert!(app.local_adjust_pages.contains(&idx));
+    }
+
     /// Codex P1 回帰: お気に入り標準の更新で冗長な個別ページが pruning される。
     /// Undo するとお気に入り標準は元に戻り、かつ削除された個別ページも復元される。
     #[test]
