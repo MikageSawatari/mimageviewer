@@ -584,6 +584,7 @@ pub enum LocalEffect {
     Equalize(EqualizeParams),
     GradientMap(GradientMapParams),
     ColorFill(ColorFillParams),
+    Frame(FrameParams),
     OutlineStroke(OutlineStrokeParams),
     RimLight(RimLightParams),
     ContactShadow(ContactShadowParams),
@@ -691,6 +692,7 @@ impl LocalEffect {
             Self::Equalize(_) => "ヒストグラム均等化",
             Self::GradientMap(_) => "グラデーションマップ",
             Self::ColorFill(_) => "塗りつぶし",
+            Self::Frame(_) => "フレーム",
             Self::OutlineStroke(_) => "縁取り",
             Self::RimLight(_) => "リムライト",
             Self::ContactShadow(_) => "接触影/AO",
@@ -2400,6 +2402,87 @@ fn default_color_fill_softness() -> f32 {
 
 fn default_color_fill_opacity() -> f32 {
     1.0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameMode {
+    #[default]
+    Border,
+    Letterbox,
+    RoundedMatte,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FrameParams {
+    #[serde(default)]
+    pub mode: FrameMode,
+    #[serde(default = "default_frame_color_rgb")]
+    pub color_rgb: [u8; 3],
+    #[serde(default = "default_frame_line_rgb")]
+    pub line_rgb: [u8; 3],
+    #[serde(default = "default_frame_opacity")]
+    pub opacity: f32,
+    #[serde(default)]
+    pub width_px: f32,
+    #[serde(default)]
+    pub use_individual_widths: bool,
+    #[serde(default)]
+    pub top_px: f32,
+    #[serde(default)]
+    pub right_px: f32,
+    #[serde(default)]
+    pub bottom_px: f32,
+    #[serde(default)]
+    pub left_px: f32,
+    #[serde(default)]
+    pub softness_px: f32,
+    #[serde(default)]
+    pub line_width_px: f32,
+    #[serde(default)]
+    pub line_opacity: f32,
+    #[serde(default = "default_frame_aspect_ratio")]
+    pub aspect_ratio: f32,
+    #[serde(default)]
+    pub corner_radius_px: f32,
+}
+
+impl Default for FrameParams {
+    fn default() -> Self {
+        Self {
+            mode: FrameMode::Border,
+            color_rgb: default_frame_color_rgb(),
+            line_rgb: default_frame_line_rgb(),
+            opacity: default_frame_opacity(),
+            width_px: 0.0,
+            use_individual_widths: false,
+            top_px: 0.0,
+            right_px: 0.0,
+            bottom_px: 0.0,
+            left_px: 0.0,
+            softness_px: 0.0,
+            line_width_px: 0.0,
+            line_opacity: 0.0,
+            aspect_ratio: default_frame_aspect_ratio(),
+            corner_radius_px: 0.0,
+        }
+    }
+}
+
+fn default_frame_color_rgb() -> [u8; 3] {
+    [0, 0, 0]
+}
+
+fn default_frame_line_rgb() -> [u8; 3] {
+    [255, 255, 255]
+}
+
+fn default_frame_opacity() -> f32 {
+    1.0
+}
+
+fn default_frame_aspect_ratio() -> f32 {
+    2.35
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4146,6 +4229,9 @@ where
             LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
             LocalEffect::ColorFill(params) => {
                 apply_color_fill(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Frame(params) => {
+                apply_frame(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::OutlineStroke(params) => apply_outline_stroke(
                 &image.pixels,
@@ -9599,6 +9685,237 @@ fn apply_color_fill(src: &[u8], width: usize, height: usize, params: ColorFillPa
         }
     }
     out
+}
+
+fn apply_frame(src: &[u8], width: usize, height: usize, params: FrameParams) -> Vec<u8> {
+    let opacity = params.opacity.clamp(0.0, 1.0);
+    if width == 0 || height == 0 || opacity <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let mut out = src.to_vec();
+    let color = params.color_rgb;
+    let line_color = params.line_rgb;
+    let line_opacity = params.line_opacity.clamp(0.0, 1.0);
+    for y in 0..height {
+        let py = y as f32 + 0.5;
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+            let px = x as f32 + 0.5;
+            let (matte_amount, line_amount) = match params.mode {
+                FrameMode::Border => frame_border_amounts(px, py, width, height, params),
+                FrameMode::Letterbox => frame_letterbox_amounts(px, py, width, height, params),
+                FrameMode::RoundedMatte => {
+                    frame_rounded_matte_amounts(px, py, width, height, params)
+                }
+            };
+            let matte_amount = matte_amount * opacity;
+            if matte_amount > f32::EPSILON {
+                for c in 0..3 {
+                    out[i + c] = lerp_u8(out[i + c], color[c], matte_amount);
+                }
+            }
+            let line_amount = line_amount * line_opacity * opacity;
+            if line_amount > f32::EPSILON {
+                for c in 0..3 {
+                    out[i + c] = lerp_u8(out[i + c], line_color[c], line_amount);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn frame_border_amounts(
+    px: f32,
+    py: f32,
+    width: usize,
+    height: usize,
+    params: FrameParams,
+) -> (f32, f32) {
+    let (top, right, bottom, left) = frame_effective_widths(params);
+    let width = width as f32;
+    let height = height as f32;
+    let softness = params.softness_px.max(0.0);
+    let line_width = params.line_width_px.max(0.0);
+    let left_distance = px;
+    let right_distance = width - px;
+    let top_distance = py;
+    let bottom_distance = height - py;
+    let matte = [
+        frame_edge_amount(left_distance, left, softness),
+        frame_edge_amount(right_distance, right, softness),
+        frame_edge_amount(top_distance, top, softness),
+        frame_edge_amount(bottom_distance, bottom, softness),
+    ]
+    .into_iter()
+    .fold(0.0_f32, f32::max);
+    let line = [
+        frame_inner_line_amount(left_distance, left, line_width, softness),
+        frame_inner_line_amount(right_distance, right, line_width, softness),
+        frame_inner_line_amount(top_distance, top, line_width, softness),
+        frame_inner_line_amount(bottom_distance, bottom, line_width, softness),
+    ]
+    .into_iter()
+    .fold(0.0_f32, f32::max);
+    (matte, line)
+}
+
+fn frame_letterbox_amounts(
+    px: f32,
+    py: f32,
+    width: usize,
+    height: usize,
+    params: FrameParams,
+) -> (f32, f32) {
+    let w = width as f32;
+    let h = height as f32;
+    let aspect = params.aspect_ratio.clamp(0.1, 10.0);
+    let current_aspect = if h > 0.0 { w / h } else { aspect };
+    let softness = params.softness_px.max(0.0);
+    let line_width = params.line_width_px.max(0.0);
+    if current_aspect < aspect {
+        let content_h = (w / aspect).min(h).max(0.0);
+        let bar = ((h - content_h) * 0.5).max(0.0);
+        let top_distance = py;
+        let bottom_distance = h - py;
+        let matte = frame_edge_amount(top_distance, bar, softness).max(frame_edge_amount(
+            bottom_distance,
+            bar,
+            softness,
+        ));
+        let line = frame_inner_line_amount(top_distance, bar, line_width, softness).max(
+            frame_inner_line_amount(bottom_distance, bar, line_width, softness),
+        );
+        (matte, line)
+    } else {
+        let content_w = (h * aspect).min(w).max(0.0);
+        let bar = ((w - content_w) * 0.5).max(0.0);
+        let left_distance = px;
+        let right_distance = w - px;
+        let matte = frame_edge_amount(left_distance, bar, softness).max(frame_edge_amount(
+            right_distance,
+            bar,
+            softness,
+        ));
+        let line = frame_inner_line_amount(left_distance, bar, line_width, softness).max(
+            frame_inner_line_amount(right_distance, bar, line_width, softness),
+        );
+        (matte, line)
+    }
+}
+
+fn frame_rounded_matte_amounts(
+    px: f32,
+    py: f32,
+    width: usize,
+    height: usize,
+    params: FrameParams,
+) -> (f32, f32) {
+    let inset = params.width_px.max(0.0);
+    let radius = params.corner_radius_px.max(0.0);
+    let softness = params.softness_px.max(0.0);
+    let line_width = params.line_width_px.max(0.0);
+    let signed_distance = rounded_rect_signed_distance(px, py, width, height, inset, radius);
+    let matte = if softness <= f32::EPSILON {
+        if signed_distance >= 0.0 { 1.0 } else { 0.0 }
+    } else {
+        smoothstep(-softness, 0.0, signed_distance)
+    };
+    let line = if signed_distance <= 0.0 {
+        frame_inner_line_amount(-signed_distance, 0.0, line_width, softness)
+    } else {
+        0.0
+    };
+    (matte, line)
+}
+
+fn frame_effective_widths(params: FrameParams) -> (f32, f32, f32, f32) {
+    if params.use_individual_widths {
+        (
+            params.top_px.max(0.0),
+            params.right_px.max(0.0),
+            params.bottom_px.max(0.0),
+            params.left_px.max(0.0),
+        )
+    } else {
+        let width = params.width_px.max(0.0);
+        (width, width, width, width)
+    }
+}
+
+fn frame_edge_amount(distance: f32, width: f32, softness: f32) -> f32 {
+    if width <= f32::EPSILON {
+        return 0.0;
+    }
+    if softness <= f32::EPSILON {
+        return if distance < width { 1.0 } else { 0.0 };
+    }
+    let hard_width = (width - softness).max(0.0);
+    if distance <= hard_width {
+        1.0
+    } else if distance >= width {
+        0.0
+    } else {
+        smoothstep(0.0, 1.0, (width - distance) / softness)
+    }
+}
+
+fn frame_inner_line_amount(distance: f32, edge_width: f32, line_width: f32, softness: f32) -> f32 {
+    if line_width <= f32::EPSILON {
+        return 0.0;
+    }
+    frame_band_amount(
+        distance,
+        edge_width.max(0.0),
+        edge_width.max(0.0) + line_width,
+        softness,
+    )
+}
+
+fn frame_band_amount(distance: f32, start: f32, end: f32, softness: f32) -> f32 {
+    if end <= start {
+        return 0.0;
+    }
+    if softness <= f32::EPSILON {
+        return if distance >= start && distance < end {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    let enter = smoothstep(start - softness, start, distance);
+    let leave = 1.0 - smoothstep(end, end + softness, distance);
+    enter.min(leave).clamp(0.0, 1.0)
+}
+
+fn rounded_rect_signed_distance(
+    px: f32,
+    py: f32,
+    width: usize,
+    height: usize,
+    inset: f32,
+    radius: f32,
+) -> f32 {
+    let w = width as f32;
+    let h = height as f32;
+    let inner_w = (w - inset * 2.0).max(0.0);
+    let inner_h = (h - inset * 2.0).max(0.0);
+    if inner_w <= f32::EPSILON || inner_h <= f32::EPSILON {
+        return 1.0;
+    }
+    let half_w = inner_w * 0.5;
+    let half_h = inner_h * 0.5;
+    let radius = radius.clamp(0.0, half_w.min(half_h));
+    let cx = w * 0.5;
+    let cy = h * 0.5;
+    let qx = (px - cx).abs() - (half_w - radius);
+    let qy = (py - cy).abs() - (half_h - radius);
+    let ox = qx.max(0.0);
+    let oy = qy.max(0.0);
+    (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0) - radius
 }
 
 fn apply_outline_stroke(
@@ -16759,6 +17076,7 @@ mod tests {
             LocalEffect::Equalize(EqualizeParams::default()),
             LocalEffect::GradientMap(GradientMapParams::default()),
             LocalEffect::ColorFill(ColorFillParams::default()),
+            LocalEffect::Frame(FrameParams::default()),
             LocalEffect::OutlineStroke(OutlineStrokeParams::default()),
             LocalEffect::RimLight(RimLightParams::default()),
             LocalEffect::ContactShadow(ContactShadowParams::default()),
@@ -16865,6 +17183,20 @@ mod tests {
                     detail_amount: 2.0,
                     detail_contrast: 2.0,
                     strength: 1.0,
+                }),
+            ),
+            full(
+                "frame rounded matte max",
+                LocalEffect::Frame(FrameParams {
+                    mode: FrameMode::RoundedMatte,
+                    color_rgb: [0, 0, 0],
+                    opacity: 1.0,
+                    width_px: 96.0,
+                    softness_px: 48.0,
+                    line_width_px: 8.0,
+                    line_opacity: 1.0,
+                    corner_radius_px: 160.0,
+                    ..Default::default()
                 }),
             ),
             full(
@@ -17991,6 +18323,70 @@ mod tests {
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn frame_border_draws_inside_edges_and_preserves_center() {
+        let src = RgbaImageBuf::new(4, 3, vec![100, 120, 140, 255].repeat(12)).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "frame",
+            LocalMask::Full,
+            LocalEffect::Frame(FrameParams {
+                mode: FrameMode::Border,
+                color_rgb: [0, 0, 0],
+                opacity: 1.0,
+                width_px: 1.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[0, 0, 0, 255]);
+        let center = (1 * 4 + 1) * 4;
+        assert_eq!(&out.pixels[center..center + 4], &[100, 120, 140, 255]);
+        let right_edge = (1 * 4 + 3) * 4;
+        assert_eq!(&out.pixels[right_edge..right_edge + 4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn frame_letterbox_adds_bars_without_recoloring_middle() {
+        let src = RgbaImageBuf::new(4, 4, vec![180, 170, 160, 255].repeat(16)).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "letterbox",
+            LocalMask::Full,
+            LocalEffect::Frame(FrameParams {
+                mode: FrameMode::Letterbox,
+                color_rgb: [0, 0, 0],
+                opacity: 1.0,
+                aspect_ratio: 2.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[0, 0, 0, 255]);
+        let middle = (1 * 4 + 1) * 4;
+        assert_eq!(&out.pixels[middle..middle + 4], &[180, 170, 160, 255]);
+        let bottom = (3 * 4 + 2) * 4;
+        assert_eq!(&out.pixels[bottom..bottom + 4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn frame_rounded_matte_colors_corners_and_keeps_center() {
+        let src = RgbaImageBuf::new(5, 5, vec![220, 210, 200, 255].repeat(25)).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "rounded matte",
+            LocalMask::Full,
+            LocalEffect::Frame(FrameParams {
+                mode: FrameMode::RoundedMatte,
+                color_rgb: [12, 14, 16],
+                opacity: 1.0,
+                corner_radius_px: 2.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[12, 14, 16, 255]);
+        let center = (2 * 5 + 2) * 4;
+        assert_eq!(&out.pixels[center..center + 4], &[220, 210, 200, 255]);
     }
 
     #[test]

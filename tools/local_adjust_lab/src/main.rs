@@ -24,29 +24,30 @@ use local_adjust_core::{
     ColorTraceParams, ContactShadowParams, CubeLutParams, CutoutParams, DataMoshParams,
     DefringeParams, DehazeParams, DespeckleParams, DiffractionStarburstParams, DiffuseGlowParams,
     DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams, EngravingParams, EqualizeParams,
-    FilmGrainParams, FrequencySeparationParams, GlassDisplacementMode, GlassDisplacementParams,
-    GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams,
-    HalftoneParams, HeatHazeParams, HighPassParams, HighlightsShadowsParams, HslParams,
-    InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LensDirtMode,
-    LensDirtParams, LensFlareParams, LightLeakParams, LineExtractMode, LineExtractParams, LineKind,
-    LinearGradientMask, LithographParams, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
-    LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams,
-    MosaicTileMode, MotionBlurParams, NeonGlowParams, NewspaperPrintParams, NoiseDistribution,
-    NoiseParams, OilPaintParams, OldFilmParams, OrtonParams, OutlineStrokeParams,
-    OutlineStrokePlacement, PartColorParams, ParticleOverlayMode, ParticleOverlayParams,
-    PinchSpherizeParams, PixelSortDirection, PixelSortOrder, PixelSortParams, PixelStylizeMode,
-    PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
-    RadialBlurMode, RadialBlurParams, RadialFlashParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RetroPaletteMode, RetroPaletteParams, RgbToneCurveParams,
-    RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode,
-    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
-    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
-    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
-    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams,
-    WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
-    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
+    FilmGrainParams, FrameMode, FrameParams, FrequencySeparationParams, GlassDisplacementMode,
+    GlassDisplacementParams, GlowingEdgesParams, GodRaysParams, GradientMapParams,
+    GradientMapPreset, HalationParams, HalftoneParams, HeatHazeParams, HighPassParams,
+    HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
+    LensCorrectionParams, LensDirtMode, LensDirtParams, LensFlareParams, LightLeakParams,
+    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LithographParams,
+    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
+    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
+    NeonGlowParams, NewspaperPrintParams, NoiseDistribution, NoiseParams, OilPaintParams,
+    OldFilmParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement, PartColorParams,
+    ParticleOverlayMode, ParticleOverlayParams, PinchSpherizeParams, PixelSortDirection,
+    PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode,
+    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialFlashParams,
+    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RetroPaletteMode,
+    RetroPaletteParams, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams,
+    ScanlineGlitchParams, ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp,
+    SharpenParams, SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode,
+    SpeedLinesParams, SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement,
+    TextureParams, TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams,
+    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams,
+    VhsParams, VignetteParams, WaterCausticsParams, WaveDistortionMode, WaveDistortionParams,
+    WindDirection, WindParams, WindSource, apply_layers, apply_layers_with_progress,
+    compute_mosaic_tile_size, default_mask_application_for_effect, evaluate_layer_mask,
+    parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1085,6 +1086,7 @@ enum EffectKind {
     Equalize,
     GradientMap,
     ColorFill,
+    Frame,
     OutlineStroke,
     RimLight,
     ContactShadow,
@@ -1136,6 +1138,8 @@ enum RgbPickTarget {
     ColorFillStart,
     ColorFillMiddle,
     ColorFillEnd,
+    FrameColor,
+    FrameLineColor,
     ColorOverlayStart,
     ColorOverlayEnd,
     NeonGlowSource,
@@ -1170,6 +1174,8 @@ impl RgbPickTarget {
             Self::ColorFillStart => "塗りつぶしの開始色",
             Self::ColorFillMiddle => "塗りつぶしの中間色",
             Self::ColorFillEnd => "塗りつぶしの終了色",
+            Self::FrameColor => "フレームの色",
+            Self::FrameLineColor => "フレームの内側ライン色",
             Self::ColorOverlayStart => "塗り/グラデーションの開始色",
             Self::ColorOverlayEnd => "塗り/グラデーションの終了色",
             Self::NeonGlowSource => "ネオングローの発光源色",
@@ -1261,6 +1267,7 @@ impl EffectKind {
             LocalEffect::Equalize(_) => Self::Equalize,
             LocalEffect::GradientMap(_) => Self::GradientMap,
             LocalEffect::ColorFill(_) => Self::ColorFill,
+            LocalEffect::Frame(_) => Self::Frame,
             LocalEffect::OutlineStroke(_) => Self::OutlineStroke,
             LocalEffect::RimLight(_) => Self::RimLight,
             LocalEffect::ContactShadow(_) => Self::ContactShadow,
@@ -1368,6 +1375,7 @@ impl EffectKind {
             Self::Equalize => "ヒストグラム平坦化",
             Self::GradientMap => "グラデーションマップ",
             Self::ColorFill => "塗りつぶし",
+            Self::Frame => "フレーム/黒帯",
             Self::OutlineStroke => "縁取り",
             Self::RimLight => "リムライト",
             Self::ContactShadow => "接触影/AO",
@@ -1425,6 +1433,7 @@ impl EffectKind {
             Self::LensDirt => "レンズ汚れ",
             Self::FrequencySeparation => "周波数分離",
             Self::RetroPalette => "レトロ減色",
+            Self::Frame => "フレーム",
             Self::DiffractionStarburst => "回折スター",
             Self::WaterCaustics => "水中光網",
             Self::ParticleOverlay => "天候粒子",
@@ -1553,6 +1562,9 @@ impl EffectKind {
             }
             Self::ColorFill => {
                 "マスク範囲を単色、線形グラデーション、円形グラデーションで塗りつぶします。"
+            }
+            Self::Frame => {
+                "画像内側にフレーム、シネマ黒帯、角丸マットを描き、保存前の仕上げ枠を作ります。"
             }
             Self::OutlineStroke => {
                 "マスク境界から外側・内側・中央の色枠を作り、被写体のステッカー風分離に使えます。"
@@ -1693,6 +1705,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
         kinds: &[
             EffectKind::None,
             EffectKind::ColorFill,
+            EffectKind::Frame,
             EffectKind::OutlineStroke,
         ],
     },
@@ -9233,6 +9246,11 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 )
             }
         }
+        LocalEffect::Frame(params) => match params.mode {
+            FrameMode::Border => format!("フレーム {:.0}px", params.width_px),
+            FrameMode::Letterbox => format!("レターボックス {:.2}:1", params.aspect_ratio),
+            FrameMode::RoundedMatte => format!("角丸マット {:.0}px", params.corner_radius_px),
+        },
         LocalEffect::OutlineStroke(params) => format!(
             "縁取り {} {:.0}px",
             outline_stroke_placement_label(params.placement),
@@ -9573,6 +9591,14 @@ fn color_overlay_shape_label(shape: ColorOverlayShape) -> &'static str {
     }
 }
 
+fn frame_mode_label(mode: FrameMode) -> &'static str {
+    match mode {
+        FrameMode::Border => "フレーム",
+        FrameMode::Letterbox => "レターボックス",
+        FrameMode::RoundedMatte => "角丸マット",
+    }
+}
+
 fn outline_stroke_placement_label(placement: OutlineStrokePlacement) -> &'static str {
     match placement {
         OutlineStrokePlacement::Outside => "外側",
@@ -9682,6 +9708,14 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
         }
         (LocalEffect::ColorFill(params), RgbPickTarget::ColorFillEnd) => {
             params.end_rgb = rgb;
+            true
+        }
+        (LocalEffect::Frame(params), RgbPickTarget::FrameColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::Frame(params), RgbPickTarget::FrameLineColor) => {
+            params.line_rgb = rgb;
             true
         }
         (LocalEffect::ColorOverlay(params), RgbPickTarget::ColorOverlayStart) => {
@@ -15179,6 +15213,211 @@ fn draw_effect_params(
                 }
             }
         }
+        LocalEffect::Frame(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "黒枠") {
+                    *params = FrameParams {
+                        mode: FrameMode::Border,
+                        color_rgb: [0, 0, 0],
+                        opacity: 1.0,
+                        width_px: 36.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "白枠") {
+                    *params = FrameParams {
+                        mode: FrameMode::Border,
+                        color_rgb: [255, 255, 255],
+                        line_rgb: [210, 210, 210],
+                        opacity: 1.0,
+                        width_px: 48.0,
+                        line_width_px: 1.0,
+                        line_opacity: 0.8,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "映画黒帯") {
+                    *params = FrameParams {
+                        mode: FrameMode::Letterbox,
+                        color_rgb: [0, 0, 0],
+                        opacity: 1.0,
+                        aspect_ratio: 2.35,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "角丸白") {
+                    *params = FrameParams {
+                        mode: FrameMode::RoundedMatte,
+                        color_rgb: [255, 255, 255],
+                        opacity: 1.0,
+                        width_px: 0.0,
+                        corner_radius_px: 36.0,
+                        softness_px: 2.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+            });
+            let before_mode = params.mode;
+            lab_combo_box(ui, "frame_mode", frame_mode_label(params.mode), |ui| {
+                for mode in [
+                    FrameMode::Border,
+                    FrameMode::Letterbox,
+                    FrameMode::RoundedMatte,
+                ] {
+                    ui.selectable_value(&mut params.mode, mode, frame_mode_label(mode));
+                }
+            });
+            if params.mode != before_mode {
+                match params.mode {
+                    FrameMode::Border if params.width_px <= f32::EPSILON => {
+                        params.width_px = 36.0;
+                    }
+                    FrameMode::Letterbox => {
+                        params.aspect_ratio = params.aspect_ratio.max(2.35);
+                    }
+                    FrameMode::RoundedMatte if params.corner_radius_px <= f32::EPSILON => {
+                        params.corner_radius_px = 36.0;
+                    }
+                    _ => {}
+                }
+                changed = true;
+            }
+            ui.label(
+                egui::RichText::new(
+                    "画像サイズは変えず、画像の内側に枠や黒帯を描きます。外側キャンバスを広げる余白追加とは別の仕上げ効果です。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            merge_rgb_color_response(
+                draw_rgb_color_control(
+                    ui,
+                    "フレーム色",
+                    &mut params.color_rgb,
+                    RgbPickTarget::FrameColor,
+                    rgb_pick_active,
+                ),
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let opacity =
+                ui.add(egui::Slider::new(&mut params.opacity, 0.0..=1.0).text("不透明度"));
+            changed |= opacity.changed();
+            opacity.lab_hover_tip("元画像からフレーム色へ置き換える強さです。");
+            match params.mode {
+                FrameMode::Border => {
+                    let individual =
+                        ui.checkbox(&mut params.use_individual_widths, "辺ごとに幅を指定");
+                    changed |= individual.changed();
+                    individual.lab_hover_tip("ONにすると上下左右のフレーム幅を個別に指定します。");
+                    if params.use_individual_widths {
+                        let top =
+                            ui.add(egui::Slider::new(&mut params.top_px, 0.0..=300.0).text("上"));
+                        let right =
+                            ui.add(egui::Slider::new(&mut params.right_px, 0.0..=300.0).text("右"));
+                        let bottom = ui
+                            .add(egui::Slider::new(&mut params.bottom_px, 0.0..=300.0).text("下"));
+                        let left =
+                            ui.add(egui::Slider::new(&mut params.left_px, 0.0..=300.0).text("左"));
+                        changed |=
+                            top.changed() || right.changed() || bottom.changed() || left.changed();
+                    } else {
+                        let width =
+                            ui.add(egui::Slider::new(&mut params.width_px, 0.0..=300.0).text("幅"));
+                        changed |= width.changed();
+                        width.lab_hover_tip("四辺に描くフレームの内側幅です。");
+                    }
+                    let softness = ui.add(
+                        egui::Slider::new(&mut params.softness_px, 0.0..=80.0).text("ぼかし境界"),
+                    );
+                    changed |= softness.changed();
+                    softness.lab_hover_tip("フレーム内側の境界をどれだけ柔らかくするかです。");
+                }
+                FrameMode::Letterbox => {
+                    ui.horizontal_wrapped(|ui| {
+                        if preset_button(ui, "1.85") {
+                            params.aspect_ratio = 1.85;
+                            changed = true;
+                        }
+                        if preset_button(ui, "2.35") {
+                            params.aspect_ratio = 2.35;
+                            changed = true;
+                        }
+                        if preset_button(ui, "2.39") {
+                            params.aspect_ratio = 2.39;
+                            changed = true;
+                        }
+                    });
+                    let aspect = ui.add(
+                        egui::Slider::new(&mut params.aspect_ratio, 1.0..=3.0).text("アスペクト"),
+                    );
+                    changed |= aspect.changed();
+                    aspect.lab_hover_tip(
+                        "残したい中央領域の横:縦比です。現在の画像より横長なら上下、縦長なら左右に帯を描きます。",
+                    );
+                    let softness = ui.add(
+                        egui::Slider::new(&mut params.softness_px, 0.0..=80.0).text("ぼかし境界"),
+                    );
+                    changed |= softness.changed();
+                    softness.lab_hover_tip("黒帯の境界をどれだけ柔らかくするかです。");
+                }
+                FrameMode::RoundedMatte => {
+                    let inset = ui
+                        .add(egui::Slider::new(&mut params.width_px, 0.0..=200.0).text("内側余白"));
+                    changed |= inset.changed();
+                    inset.lab_hover_tip("角丸で残す中央領域を内側へ縮める幅です。");
+                    let radius = ui.add(
+                        egui::Slider::new(&mut params.corner_radius_px, 0.0..=300.0).text("角丸"),
+                    );
+                    changed |= radius.changed();
+                    radius.lab_hover_tip("中央領域の角丸半径です。");
+                    let softness = ui.add(
+                        egui::Slider::new(&mut params.softness_px, 0.0..=80.0).text("ぼかし境界"),
+                    );
+                    changed |= softness.changed();
+                    softness.lab_hover_tip("角丸マット境界をどれだけ柔らかくするかです。");
+                }
+            }
+            let before_line_width = params.line_width_px;
+            let line_width =
+                ui.add(egui::Slider::new(&mut params.line_width_px, 0.0..=32.0).text("内側ライン"));
+            if line_width.changed() {
+                if before_line_width <= f32::EPSILON
+                    && params.line_width_px > f32::EPSILON
+                    && params.line_opacity <= f32::EPSILON
+                {
+                    params.line_opacity = 1.0;
+                }
+                changed = true;
+            }
+            line_width
+                .lab_hover_tip("フレームや黒帯の内側境界に細いラインを重ねます。0で無効です。");
+            if params.line_width_px > f32::EPSILON {
+                merge_rgb_color_response(
+                    draw_rgb_color_control(
+                        ui,
+                        "ライン色",
+                        &mut params.line_rgb,
+                        RgbPickTarget::FrameLineColor,
+                        rgb_pick_active,
+                    ),
+                    &mut changed,
+                    &mut start_rgb_pick,
+                    &mut cancel_rgb_pick,
+                );
+                let line_opacity = ui.add(
+                    egui::Slider::new(&mut params.line_opacity, 0.0..=1.0).text("ライン不透明度"),
+                );
+                changed |= line_opacity.changed();
+                line_opacity.lab_hover_tip("内側ラインの濃さです。");
+            }
+        }
         LocalEffect::OutlineStroke(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -20466,6 +20705,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Equalize => LocalEffect::Equalize(EqualizeParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
         EffectKind::ColorFill => LocalEffect::ColorFill(ColorFillParams::default()),
+        EffectKind::Frame => LocalEffect::Frame(FrameParams::default()),
         EffectKind::OutlineStroke => LocalEffect::OutlineStroke(OutlineStrokeParams::default()),
         EffectKind::RimLight => LocalEffect::RimLight(RimLightParams::default()),
         EffectKind::ContactShadow => LocalEffect::ContactShadow(ContactShadowParams::default()),
@@ -22938,6 +23178,7 @@ mod tests {
         let expected = vec![
             EffectKind::None,
             EffectKind::ColorFill,
+            EffectKind::Frame,
             EffectKind::OutlineStroke,
             EffectKind::Tone,
             EffectKind::ToneCurve,
@@ -23266,6 +23507,23 @@ mod tests {
         assert_eq!(fill_params.start_rgb, [10, 20, 30]);
         assert_eq!(fill_params.middle_rgb, [40, 50, 60]);
         assert_eq!(fill_params.end_rgb, [70, 80, 90]);
+
+        let mut frame = LocalEffect::Frame(FrameParams::default());
+        assert!(set_rgb_pick_target(
+            &mut frame,
+            RgbPickTarget::FrameColor,
+            [18, 28, 38],
+        ));
+        assert!(set_rgb_pick_target(
+            &mut frame,
+            RgbPickTarget::FrameLineColor,
+            [220, 230, 240],
+        ));
+        let LocalEffect::Frame(frame_params) = frame else {
+            panic!("expected frame effect");
+        };
+        assert_eq!(frame_params.color_rgb, [18, 28, 38]);
+        assert_eq!(frame_params.line_rgb, [220, 230, 240]);
 
         let mut overlay = LocalEffect::ColorOverlay(ColorOverlayParams::default());
         assert!(set_rgb_pick_target(
