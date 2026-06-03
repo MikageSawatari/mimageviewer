@@ -5506,6 +5506,546 @@ mod pipeline_cache_refactor_tests {
             "release commit already invalidated render caches; deferred timer must not bump again"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // P4-1〜P4-5: bypass preview (Ctrl+Shift) vs prefix preview (panel toggle)
+    //
+    // 回帰防止の背景 (A-3 v1/v2/v3 で実害発生):
+    //   - Ctrl+Shift は「選択レイヤーだけバイパス」(layer_idx=N → N 以外を全部適用)
+    //   - 「選択レイヤーまでプレビュー」(panel checkbox) は「先頭から N+1 枚を適用」
+    //   - 2 つは意味が違うので **cache キーも別レーン** に分けないと衝突する
+    //   - lab `layers_with_selected_layer_bypassed` (tools/local_adjust_lab/src/main.rs:23348)
+    //     と mIV `local_adjust_layers_with_selected_layer_bypassed` (src/app.rs) の変換式は
+    //     完全に同じでなければならない (= bypass の semantics をぶれさせない)
+    // -----------------------------------------------------------------------
+
+    fn full_layer(name: &str) -> local_adjust_core::LocalAdjustmentLayer {
+        local_adjust_core::LocalAdjustmentLayer::new(
+            name,
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::None,
+        )
+    }
+
+    /// ラボ tools/local_adjust_lab/src/main.rs:23348-23357 のリファレンス実装。
+    /// mIV 側 (`App::local_adjust_layers_with_selected_layer_bypassed`) は Option で
+    /// 「他に有効レイヤーが無ければ None」を返す最適化を持つが、**変換式そのもの**は
+    /// この関数と一致する必要がある (= 選択レイヤーの enabled=false にする、他は触らない)。
+    fn lab_layers_with_selected_layer_bypassed(
+        layers: &[local_adjust_core::LocalAdjustmentLayer],
+        selected_layer: usize,
+    ) -> Vec<local_adjust_core::LocalAdjustmentLayer> {
+        let mut preview_layers = layers.to_vec();
+        if let Some(layer) = preview_layers.get_mut(selected_layer) {
+            layer.enabled = false;
+        }
+        preview_layers
+    }
+
+    /// P4-1: bypass と prefix の cache key は同じ idx でも別レーンに乗る。
+    /// 同じ result_key で layer_idx と layer_count が偶然同じ整数になっても、
+    /// HashMap で別エントリとして区別される (= 型が違う)。
+    #[test]
+    fn bypass_and_prefix_preview_caches_are_separate_lanes() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/lane-sep.jpg");
+
+        let result_key = app.current_local_adjust_key(idx);
+        let bypass_key = LocalAdjustLayerBypassPreviewKey {
+            result_key,
+            layer_idx: 1,
+        };
+        let prefix_key = LocalAdjustPrefixPreviewKey {
+            result_key,
+            layer_count: 1,
+        };
+
+        let bypass_image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(11, 22, 33)]);
+        let prefix_image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(44, 55, 66)]);
+        let bypass_tex = ctx.load_texture(
+            "lane_sep_bypass",
+            bypass_image.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let prefix_tex = ctx.load_texture(
+            "lane_sep_prefix",
+            prefix_image.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.local_adjust_layer_bypass_cache.insert(
+            bypass_key,
+            LocalAdjustCacheEntry {
+                pixels: Arc::new(bypass_image),
+                texture: bypass_tex,
+            },
+        );
+        app.local_adjust_prefix_preview_cache.insert(
+            prefix_key,
+            LocalAdjustCacheEntry {
+                pixels: Arc::new(prefix_image),
+                texture: prefix_tex,
+            },
+        );
+
+        // 両方とも独立に lookup できる
+        assert!(
+            app.current_local_adjust_layer_bypass_texture(idx, 1)
+                .is_some(),
+            "bypass cache lane must remain queryable"
+        );
+        assert!(
+            app.current_local_adjust_prefix_preview_texture(idx, 1)
+                .is_some(),
+            "prefix cache lane must remain queryable"
+        );
+        // 別 layer_idx / layer_count では miss する
+        assert!(
+            app.current_local_adjust_layer_bypass_texture(idx, 0)
+                .is_none()
+        );
+        assert!(
+            app.current_local_adjust_prefix_preview_texture(idx, 2)
+                .is_none()
+        );
+    }
+
+    /// P4-2: ラボ vs mIV — bypass 変換式の意味的一致テスト。
+    /// 違う意味で実装すると Ctrl+Shift が「直前までの prefix」とすり替わる (A-3 v3 で実害)。
+    #[test]
+    fn local_adjust_layer_bypass_matches_lab_transformation() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/bypass-lab-parity.jpg");
+        let layers = vec![full_layer("A"), full_layer("B"), full_layer("C")];
+        app.local_adjust_page_layers.insert(idx, layers.clone());
+
+        // 各 layer_idx について、mIV と lab で同じ (name, enabled) 並びになる
+        for layer_idx in 0..layers.len() {
+            let miv = app
+                .local_adjust_layers_with_selected_layer_bypassed(idx, layer_idx)
+                .expect("two other layers still enabled");
+            let lab = lab_layers_with_selected_layer_bypassed(&layers, layer_idx);
+
+            assert_eq!(
+                miv.iter()
+                    .map(|l| (l.name.clone(), l.enabled))
+                    .collect::<Vec<_>>(),
+                lab.iter()
+                    .map(|l| (l.name.clone(), l.enabled))
+                    .collect::<Vec<_>>(),
+                "bypass transformation must match lab for selected={layer_idx}"
+            );
+            assert!(
+                !miv[layer_idx].enabled,
+                "selected layer must be disabled in preview at idx={layer_idx}"
+            );
+            let others = miv
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != layer_idx)
+                .filter(|(_, l)| l.enabled)
+                .count();
+            assert_eq!(
+                others, 2,
+                "the other 2 layers must remain enabled at idx={layer_idx}"
+            );
+        }
+    }
+
+    /// P4-3: prefix preview の semantics。
+    /// 「選択レイヤーまでプレビュー」(panel checkbox) は先頭から N 枚を渡す。
+    /// - layer_count == 0 → None (描画不要)
+    /// - layer_count >= len → None (= 通常レンダリングと同じ、prefix preview 不要)
+    /// - layer_count == len-1 → Some(vec[0..len-1])
+    #[test]
+    fn local_adjust_prefix_preview_boundaries() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/prefix-boundaries.jpg");
+        let layers = vec![full_layer("A"), full_layer("B"), full_layer("C")];
+        app.local_adjust_page_layers.insert(idx, layers);
+
+        // layer_count = 0 → None
+        assert!(
+            app.local_adjust_layers_until(idx, 0).is_none(),
+            "prefix preview with zero layers must yield None"
+        );
+        // layer_count = len → None (フル合成は別経路)
+        assert!(
+            app.local_adjust_layers_until(idx, 3).is_none(),
+            "prefix == total layers must short-circuit (final composite handles it)"
+        );
+        // layer_count = len + 1 (clamp) → None
+        assert!(
+            app.local_adjust_layers_until(idx, 99).is_none(),
+            "prefix > total layers must also short-circuit"
+        );
+        // layer_count = 1 → A だけ
+        let one = app
+            .local_adjust_layers_until(idx, 1)
+            .expect("prefix=1 returns first layer");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].name, "A");
+        // layer_count = 2 → A + B
+        let two = app
+            .local_adjust_layers_until(idx, 2)
+            .expect("prefix=2 returns first two");
+        assert_eq!(
+            two.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            vec!["A", "B"]
+        );
+    }
+
+    /// P4-4: bypass で残るレイヤーが全て disabled になるなら preview 不要 (None)。
+    /// これは worker 起動の最適化 = Ctrl+Shift 押下時に渡せるレイヤーが無いなら
+    /// そのまま source 表示にフォールバックさせる。
+    #[test]
+    fn local_adjust_layer_bypass_returns_none_when_no_other_enabled_layers_remain() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/bypass-empty.jpg");
+
+        // ケース 1: 唯一のレイヤーを bypass → 残り 0
+        app.local_adjust_page_layers
+            .insert(idx, vec![full_layer("only")]);
+        assert!(
+            app.local_adjust_layers_with_selected_layer_bypassed(idx, 0)
+                .is_none(),
+            "bypassing the only layer must yield None (nothing to render)"
+        );
+
+        // ケース 2: A(disabled) + B(enabled) で B を bypass → 残りは A(disabled) のみ → None
+        let mut a = full_layer("A");
+        a.enabled = false;
+        app.local_adjust_page_layers
+            .insert(idx, vec![a, full_layer("B")]);
+        assert!(
+            app.local_adjust_layers_with_selected_layer_bypassed(idx, 1)
+                .is_none(),
+            "bypassing the only enabled layer must yield None"
+        );
+
+        // ケース 3: opacity=0 のレイヤーも「有効」とみなさない
+        let mut zero_op = full_layer("zero");
+        zero_op.opacity = 0.0;
+        app.local_adjust_page_layers
+            .insert(idx, vec![zero_op, full_layer("real")]);
+        assert!(
+            app.local_adjust_layers_with_selected_layer_bypassed(idx, 1)
+                .is_none(),
+            "bypassing the only opaque layer must yield None (opacity=0 doesn't count)"
+        );
+
+        // ケース 4: 範囲外 idx → None
+        app.local_adjust_page_layers
+            .insert(idx, vec![full_layer("a"), full_layer("b")]);
+        assert!(
+            app.local_adjust_layers_with_selected_layer_bypassed(idx, 99)
+                .is_none(),
+            "out-of-bounds layer_idx must yield None"
+        );
+    }
+
+    /// P4-5: final_composite_cache と bypass preview cache は独立に存在できる。
+    /// Ctrl+Shift トグルで毎回 final composite を捨てる事故 (= スライダー応答悪化) を防ぐ。
+    #[test]
+    fn bypass_preview_cache_coexists_with_final_composite_cache() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/bypass-coexist.jpg");
+        let (edit_key, final_key) =
+            insert_edit_and_final_cache(&mut app, &ctx, idx, "bypass_coexist");
+
+        // bypass preview cache に何か入れる (= worker 完了 simulate)
+        let result_key = app.current_local_adjust_key(idx);
+        let bypass_key = LocalAdjustLayerBypassPreviewKey {
+            result_key,
+            layer_idx: 0,
+        };
+        let bypass_image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(99, 0, 0)]);
+        let bypass_tex = ctx.load_texture(
+            "coexist_bypass",
+            bypass_image.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.local_adjust_layer_bypass_cache.insert(
+            bypass_key,
+            LocalAdjustCacheEntry {
+                pixels: Arc::new(bypass_image),
+                texture: bypass_tex,
+            },
+        );
+
+        // 両方とも生き残っていること
+        assert!(
+            app.edit_result_cache.contains_key(&edit_key),
+            "edit_result_cache must survive bypass preview population"
+        );
+        assert!(
+            app.final_composite_cache.contains_key(&final_key),
+            "final_composite_cache must survive bypass preview population"
+        );
+        assert!(
+            app.current_local_adjust_layer_bypass_texture(idx, 0)
+                .is_some(),
+            "bypass preview cache must remain populated"
+        );
+
+        // 別ページの clear が他ページの bypass cache を巻き込まないこと
+        let other_idx = push_image(&mut app, "C:/pics/bypass-coexist-other.jpg");
+        app.clear_local_adjust_caches_for_idx(other_idx);
+        assert!(
+            app.current_local_adjust_layer_bypass_texture(idx, 0)
+                .is_some(),
+            "clearing other-page caches must not affect this page's bypass cache"
+        );
+    }
+
+    /// fake pending を仕込むためのヘルパー。worker は起動せず、cancel フラグ + チャネルだけ。
+    fn make_fake_bypass_pending(
+        result_key: LocalAdjustResultKey,
+        layer_idx: usize,
+    ) -> (
+        LocalAdjustLayerBypassPending,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::sync::mpsc::Sender<LocalAdjustRenderResult>,
+    ) {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pending = LocalAdjustLayerBypassPending {
+            key: LocalAdjustLayerBypassPreviewKey {
+                result_key,
+                layer_idx,
+            },
+            cancel: Arc::clone(&cancel),
+            rx,
+        };
+        (pending, cancel, tx)
+    }
+
+    fn make_fake_prefix_pending(
+        result_key: LocalAdjustResultKey,
+        layer_count: usize,
+    ) -> (
+        LocalAdjustPrefixPreviewPending,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::sync::mpsc::Sender<LocalAdjustRenderResult>,
+    ) {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pending = LocalAdjustPrefixPreviewPending {
+            key: LocalAdjustPrefixPreviewKey {
+                result_key,
+                layer_count,
+            },
+            cancel: Arc::clone(&cancel),
+            rx,
+        };
+        (pending, cancel, tx)
+    }
+
+    /// P4-8a: `clear_local_adjust_caches_for_idx` は対象 idx の bypass/prefix
+    /// pending worker をキャンセルする。
+    /// 回帰防止: ナビゲート / レイヤー編集で stale な worker が走り続け、
+    /// 古い結果が新ページの cache に書き込まれる事故。
+    #[test]
+    fn clear_local_adjust_caches_cancels_bypass_and_prefix_pending() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/cancel-bypass.jpg");
+        app.local_adjust_page_layers
+            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+        let result_key = app.current_local_adjust_key(idx);
+
+        let (bypass_pending, bypass_cancel, _bypass_tx) = make_fake_bypass_pending(result_key, 1);
+        let (prefix_pending, prefix_cancel, _prefix_tx) = make_fake_prefix_pending(result_key, 1);
+        app.local_adjust_layer_bypass_pending = Some(bypass_pending);
+        app.local_adjust_prefix_preview_pending = Some(prefix_pending);
+
+        app.clear_local_adjust_caches_for_idx(idx);
+
+        assert!(
+            bypass_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "bypass pending cancel flag must be set when cache for the same idx is cleared"
+        );
+        assert!(
+            prefix_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "prefix pending cancel flag must be set when cache for the same idx is cleared"
+        );
+        assert!(
+            app.local_adjust_layer_bypass_pending.is_none(),
+            "bypass pending must be taken out after cancellation"
+        );
+        assert!(
+            app.local_adjust_prefix_preview_pending.is_none(),
+            "prefix pending must be taken out after cancellation"
+        );
+    }
+
+    /// P4-8b: 別 idx の cache clear では現在の pending はキャンセルされない。
+    /// (= ページごとに独立した管理になっている)
+    #[test]
+    fn clear_local_adjust_caches_for_other_idx_keeps_bypass_pending() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/cancel-keep-this.jpg");
+        let other_idx = push_image(&mut app, "C:/pics/cancel-keep-other.jpg");
+        app.local_adjust_page_layers
+            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+        let result_key = app.current_local_adjust_key(idx);
+
+        let (bypass_pending, bypass_cancel, _bypass_tx) = make_fake_bypass_pending(result_key, 1);
+        app.local_adjust_layer_bypass_pending = Some(bypass_pending);
+
+        // 別 idx を clear → 現在の pending は無傷
+        app.clear_local_adjust_caches_for_idx(other_idx);
+
+        assert!(
+            !bypass_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "clearing other-idx caches must not cancel this idx's bypass pending"
+        );
+        assert!(
+            app.local_adjust_layer_bypass_pending.is_some(),
+            "bypass pending must remain after other-idx clear"
+        );
+    }
+
+    /// 補助テスト: `has_active_local_adjust_layers` は「描画に影響するレイヤーが
+    /// 1 つ以上あるか」を返す。これは `_with_selected_layer_bypassed` / `_until` /
+    /// `_for_render` と同じ "enabled && opacity > 0" 判定を共有しているので、
+    /// 仕様変更時に 4 関数全てが揃って動くことを暗黙の不変条件として固定する。
+    #[test]
+    fn has_active_local_adjust_layers_matches_render_gating_semantics() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/active-gate.jpg");
+
+        // ページにレイヤーが無い
+        assert!(
+            !app.has_active_local_adjust_layers(idx),
+            "no layers => not active"
+        );
+
+        // disabled レイヤーのみ
+        let mut disabled = full_layer("d");
+        disabled.enabled = false;
+        app.local_adjust_page_layers
+            .insert(idx, vec![disabled.clone()]);
+        assert!(
+            !app.has_active_local_adjust_layers(idx),
+            "all-disabled => not active"
+        );
+
+        // opacity=0 のみ
+        let mut zero = full_layer("z");
+        zero.opacity = 0.0;
+        app.local_adjust_page_layers.insert(idx, vec![zero.clone()]);
+        assert!(
+            !app.has_active_local_adjust_layers(idx),
+            "opacity=0 only => not active"
+        );
+
+        // 1 つでも enabled && opacity>0 があれば active
+        app.local_adjust_page_layers
+            .insert(idx, vec![disabled, zero, full_layer("real")]);
+        assert!(
+            app.has_active_local_adjust_layers(idx),
+            "any enabled & opaque layer => active"
+        );
+    }
+
+    /// P4-8d: tx 側が drop された (= worker thread が cancel/panic で消えた) ら、
+    /// poll の Disconnected ブランチで pending が掃除される。
+    #[test]
+    fn poll_bypass_preview_clears_pending_when_worker_disconnects() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/poll-disconnect.jpg");
+        let result_key = app.current_local_adjust_key(idx);
+
+        let (pending, _cancel, tx) = make_fake_bypass_pending(result_key, 0);
+        app.local_adjust_layer_bypass_pending = Some(pending);
+
+        // tx を drop → Disconnected が返る
+        drop(tx);
+        app.poll_local_adjust_layer_bypass_preview(&ctx);
+
+        assert!(
+            app.local_adjust_layer_bypass_pending.is_none(),
+            "Disconnected worker must clear pending"
+        );
+    }
+
+    /// P4-8e: 明示的な Cancelled シグナルでも pending が掃除される。
+    #[test]
+    fn poll_bypass_preview_clears_pending_on_cancelled_signal() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/poll-cancel-sig.jpg");
+        let result_key = app.current_local_adjust_key(idx);
+
+        let (pending, _cancel, tx) = make_fake_bypass_pending(result_key, 0);
+        app.local_adjust_layer_bypass_pending = Some(pending);
+
+        tx.send(LocalAdjustRenderResult::Cancelled)
+            .expect("send cancelled");
+        app.poll_local_adjust_layer_bypass_preview(&ctx);
+
+        assert!(
+            app.local_adjust_layer_bypass_pending.is_none(),
+            "Cancelled signal must clear pending"
+        );
+        // cache には何も書かれない
+        assert!(
+            app.local_adjust_layer_bypass_cache.is_empty(),
+            "Cancelled must not populate cache"
+        );
+    }
+
+    /// P4-8c: poll は cancel ガード後に届いた stale 結果を cache に書き込まない。
+    /// pending を仕込んでから別ページに移動 (= current_local_adjust_key が変わる)
+    /// → 古いキーで Ready が届いても無視されることを確認する。
+    #[test]
+    fn poll_bypass_preview_discards_stale_ready_result() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/poll-stale.jpg");
+        app.local_adjust_page_layers
+            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+        let old_result_key = app.current_local_adjust_key(idx);
+
+        let (bypass_pending, _bypass_cancel, bypass_tx) =
+            make_fake_bypass_pending(old_result_key, 1);
+        let bypass_cache_key = bypass_pending.key;
+        app.local_adjust_layer_bypass_pending = Some(bypass_pending);
+
+        // 入力世代を bump して current_local_adjust_key を変える
+        app.bump_local_adjust_generation(idx);
+        let new_result_key = app.current_local_adjust_key(idx);
+        assert_ne!(
+            old_result_key, new_result_key,
+            "bump_local_adjust_generation must change the result key"
+        );
+
+        // bump 後の pending は cancel で taken されているはずなので、stale tx は
+        // 既に切れたチャネルへの送信になる。明示的に Pending を再構築して
+        // 「古いキーの Ready 結果が届いた状態」をシミュレートする
+        let (bypass_pending2, _cancel2, bypass_tx2) = make_fake_bypass_pending(new_result_key, 1);
+        app.local_adjust_layer_bypass_pending = Some(bypass_pending2);
+
+        // 古い result_key の Ready を送る (新 pending は new_result_key を期待)
+        // → poll 内の `if key != pending.key.result_key` ガードで弾かれ、cache に入らない
+        bypass_tx2
+            .send(LocalAdjustRenderResult::Ready {
+                key: old_result_key,
+                image: egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(1, 2, 3)]),
+            })
+            .expect("send into live channel");
+        app.poll_local_adjust_layer_bypass_preview(&ctx);
+
+        assert!(
+            !app.local_adjust_layer_bypass_cache
+                .contains_key(&bypass_cache_key),
+            "stale Ready (mismatched result_key) must not populate the cache"
+        );
+        // 古い chan は使われていなかったので不要; ガード値消費だけ
+        drop(bypass_tx);
+    }
 }
 
 #[cfg(test)]

@@ -457,6 +457,96 @@ fn line_shape_has_square_end_caps() {
     assert!(mid >= 9, "line thickness should be preserved at the center");
 }
 
+/// A-1 regression hardening: vertical lines must also have square caps.
+/// 既存 `line_shape_has_square_end_caps` は水平線のみカバーしているので、
+/// `line_corners` の数式が方向によらず一貫していることを別軸で確認する。
+#[test]
+fn line_shape_vertical_has_square_end_caps() {
+    let width = 24;
+    let height = 48;
+    let mut alpha = vec![0.0; width * height];
+    rasterize_shapes_into(
+        &mut alpha,
+        width,
+        height,
+        &[MaskShape::Line {
+            op: ShapeOp::Add,
+            kind: LineKind::Vertical,
+            p0: [12.0, 12.0],
+            p1: [12.0, 36.0],
+            thickness: 10.0,
+        }],
+    );
+
+    let row_coverage = |y: usize| (0..width).filter(|&x| alpha[y * width + x] >= 0.5).count();
+    let mid = row_coverage(24);
+
+    assert_eq!(
+        row_coverage(8),
+        0,
+        "pixels above p0 must stay empty for a vertical line"
+    );
+    assert_eq!(
+        row_coverage(39),
+        0,
+        "pixels below p1 must stay empty for a vertical line"
+    );
+    assert_eq!(
+        row_coverage(12),
+        mid,
+        "first painted row should have the same rectangular thickness as the center"
+    );
+    assert_eq!(
+        row_coverage(35),
+        mid,
+        "last painted row should have the same rectangular thickness as the center"
+    );
+    assert!(mid >= 9, "vertical line thickness preserved at the center");
+}
+
+/// A-1 regression hardening: diagonal lines also use square caps (= 端の伸びがゼロ)。
+/// ラインを 45° で配置し、端点を含む正方領域だけが塗られ、その先 (= 半円が伸びる領域)
+/// が空のままであることを確認する。
+#[test]
+fn line_shape_diagonal_has_square_end_caps() {
+    let size = 64;
+    let mut alpha = vec![0.0; size * size];
+    let p0 = [20.0_f32, 20.0];
+    let p1 = [44.0_f32, 44.0];
+    let thickness = 4.0_f32;
+    rasterize_shapes_into(
+        &mut alpha,
+        size,
+        size,
+        &[MaskShape::Line {
+            op: ShapeOp::Add,
+            kind: LineKind::Diagonal,
+            p0,
+            p1,
+            thickness,
+        }],
+    );
+
+    // p0 から進行方向と逆向きに thickness 程度進んだ位置 = 半円の cap があれば塗られる位置
+    // square cap なら塗られないはず
+    let beyond_start = [(p0[0] - 3.0) as usize, (p0[1] - 3.0) as usize];
+    let beyond_end = [(p1[0] + 3.0) as usize, (p1[1] + 3.0) as usize];
+
+    let sample = |x: usize, y: usize| alpha[y * size + x];
+    assert_eq!(
+        sample(beyond_start[0], beyond_start[1]),
+        0.0,
+        "diagonal: cap-beyond-p0 must be empty (square cap, not rounded)"
+    );
+    assert_eq!(
+        sample(beyond_end[0], beyond_end[1]),
+        0.0,
+        "diagonal: cap-beyond-p1 must be empty (square cap, not rounded)"
+    );
+    // 線分の中央付近 ([32,32]) は塗られている
+    assert!(sample(32, 32) >= 0.5, "diagonal: midpoint must be painted");
+}
+
 // ---------------------------------------------------------------------------
 // Animated overlay color formula (M-5)
 // ---------------------------------------------------------------------------

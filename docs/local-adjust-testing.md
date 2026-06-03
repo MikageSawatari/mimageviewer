@@ -33,6 +33,13 @@
 | M-5 領域カラーアニメーション | L1+L3 | L3 `lab_animated_overlay_color_is_time_dependent` ✅ + L2 で mIV 側の boundary color が同じ式か検証 | core_parity.rs |
 | M-6 隠蔽加工バイパス | App統合 | **難度高** — 別途 conceal_compose 周辺の unit test として書く必要あり | (TBD) |
 | M-7 被写体マスク UI gating | L3 (値) + L2 (UI gating) | L3 `subject_refinement_default_is_disabled_with_lab_baseline` ✅ + `subject_refinement_three_preset_values_match_lab` ✅ + L2 で UI 描画が disabled になることを別途 | core_parity.rs + Codex 追加 |
+| A-1 直線端の round cap | L2+L3 | L2 `line_shape_preview_uses_square_end_caps` ✅ + L3 `line_shape_has_square_end_caps` ✅ + L3 `line_shape_vertical_has_square_end_caps` / `line_shape_diagonal_has_square_end_caps` ✅ (方向別ガード) | ef750308 / P4-6 |
+| A-2 アニメーション点滅が点 | L2 | L2 `mask_preview_overlay_at_2048_completes_in_30ms` ✅ (性能) + `mask_preview_max_texels_constant_stays_at_or_above_2048` ✅ (= 定数値ガード、768 への退行を検知) + `region_boundary_color_completes_meaningful_hue_rotation_in_one_second` ✅ (= アニメーション周波数ガード) | ef750308 / P4-7 |
+| A-3 Ctrl+Shift modifier 検出失敗 | (テスト困難) | OS API (`GetAsyncKeyState`) 経路は unit test 不可。代わりに L3 `bypass_and_prefix_preview_caches_are_separate_lanes` ✅ で **cache キーが衝突しないこと** を符号化 | adbc3dab / P4-1 |
+| A-3 v3 prefix と bypass の取り違え | L2+L3 | `local_adjust_layer_bypass_disables_only_selected_layer` ✅ + `local_adjust_layer_bypass_matches_lab_transformation` ✅ (= ラボ変換式との semantics 一致) + `local_adjust_prefix_preview_boundaries` ✅ (= 直前まで preview の境界条件) | adbc3dab / P4-2, P4-3 |
+| bypass preview cache 共存 | L3 | `bypass_preview_cache_coexists_with_final_composite_cache` ✅ (= final composite を巻き込まずに toggle 可能であることのガード) | P4-5 |
+| bypass / prefix worker cancel | L3 | `clear_local_adjust_caches_cancels_bypass_and_prefix_pending` ✅ + `clear_local_adjust_caches_for_other_idx_keeps_bypass_pending` ✅ + `poll_bypass_preview_discards_stale_ready_result` ✅ (= stale write 防止) | P4-8 |
+| bypass で残るレイヤーが無いケース | L3 | `local_adjust_layer_bypass_returns_none_when_no_other_enabled_layers_remain` ✅ (= worker 起動最適化、無効レイヤー / opacity=0 / 範囲外 idx 全部 None) | P4-4 |
 
 ## Codex への指示テンプレート (修正コミット時)
 
@@ -125,6 +132,45 @@ public ではないので、現状 ui_snapshot.rs からは触れない。
    呼んで egui_kittest スナップショットを撮る
 
 このパス整備は時間予算 (v1.1.0 まで) では実施せず、v1.2.0 で着手予定。
+
+## Phase 2 拡充 (2026-06、A-3 トリロジー後)
+
+A-1〜A-3 と Pipeline P1-P10 を経て、以下の新規テストが追加されている (P4-1〜P4-8):
+
+- **`src/app/tests.rs::pipeline_cache_refactor_tests`** (7 → 15 件):
+  - `bypass_and_prefix_preview_caches_are_separate_lanes` — Ctrl+Shift bypass と
+    panel checkbox prefix の cache キーが別レーンに乗ることを符号化。
+  - `local_adjust_layer_bypass_matches_lab_transformation` — lab
+    `layers_with_selected_layer_bypassed` (tools/local_adjust_lab/src/main.rs:23348)
+    の変換式と mIV `App::local_adjust_layers_with_selected_layer_bypassed`
+    の出力が並びレベルで一致することを毎 layer_idx で検証。
+  - `local_adjust_prefix_preview_boundaries` — 「選択レイヤーまでプレビュー」が
+    layer_count=0 / =len / >len で None を返す境界条件、=1/=2 で先頭から N 枚返す
+    semantics を固定。
+  - `local_adjust_layer_bypass_returns_none_when_no_other_enabled_layers_remain` —
+    残りレイヤーが空 / disabled / opacity=0 / 範囲外 idx の全 None ケース。
+  - `bypass_preview_cache_coexists_with_final_composite_cache` — Ctrl+Shift トグル時に
+    final composite を捨てないことを assertion (= スライダー応答悪化を防ぐ)。
+  - `clear_local_adjust_caches_cancels_bypass_and_prefix_pending` — 対象 idx の
+    cache clear で bypass/prefix の両 pending の cancel が立つ。
+  - `clear_local_adjust_caches_for_other_idx_keeps_bypass_pending` — 別 idx の
+    clear ではこの idx の pending は無傷。
+  - `poll_bypass_preview_discards_stale_ready_result` — pending が live でも、
+    `result_key` が現状と違う Ready が届いたら cache に書かない。
+
+- **`tests/local_adjust_core_parity.rs`** (15 → 17 件):
+  - `line_shape_vertical_has_square_end_caps` — A-1 退行ガード (vertical)
+  - `line_shape_diagonal_has_square_end_caps` — A-1 退行ガード (diagonal)
+
+- **`src/ui_adjustment_panel.rs::local_adjust_segmentation_tests`** (新規 2 件):
+  - `mask_preview_max_texels_constant_stays_at_or_above_2048` — A-2 退行ガード
+    (定数 `LOCAL_ADJUST_MASK_PREVIEW_MAX_TEXELS` が 768 等に戻されたら fail)。
+  - `region_boundary_color_completes_meaningful_hue_rotation_in_one_second` —
+    A-2 関連ガード (= 1 秒で hue が十分回転することを RGB 差分で観測)。
+
+A-3 の OS API 経路 (`GetAsyncKeyState`) は unit test できないため、**cache キー分離 +
+変換式 parity** で間接的にカバーしている。Codex/Claude Code でこの周辺を修正する際は、
+本表の右列のテストが残っているか確認すること (= 削除提案が来たら回帰防止根拠を必ず聞く)。
 
 ## CI 統合
 

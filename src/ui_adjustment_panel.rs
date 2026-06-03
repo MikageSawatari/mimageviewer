@@ -842,6 +842,124 @@ mod local_adjust_segmentation_tests {
         fill_local_adjust_unlabeled_region_pixels(&mut labels, 3, 1, &allowed);
         assert_ne!(labels[1], 0);
     }
+
+    /// A-2 regression hardening: MAX_TEXELS は 2048 を下回ってはならない。
+    ///
+    /// 経緯: ef750308 で 768 → 2048 に上げた。理由は領域境界アニメーションが
+    /// 動的色で点滅する際、小さな texture (768 上限) では境界線が「点」として
+    /// 見えてしまい、アニメーション効果が崩壊するため。値が小さく戻されると
+    /// 同じ事象が再発するので、定数の下限を **コンパイル時に固定** しておく
+    /// (= 値を 2048 未満に戻したコミットはビルドが通らない)。
+    /// (パフォーマンス上限は `mask_preview_overlay_at_2048_completes_in_30ms` 側で別途確認)
+    #[test]
+    fn mask_preview_max_texels_constant_stays_at_or_above_2048() {
+        const {
+            assert!(
+                super::LOCAL_ADJUST_MASK_PREVIEW_MAX_TEXELS >= 2048.0,
+                "MAX_TEXELS < 2048 だと領域境界アニメーションが点になる (A-2 退行)"
+            )
+        };
+    }
+
+    /// A-1 関連: shape hit-test (`local_adjust_shape_contains`) も polygon 経由で
+    /// **square cap** を保つ。distance-based に戻されると click-to-select の判定が
+    /// 丸い半円範囲に広がり、ユーザーが「線の端より外側」をクリックしても誤選択する。
+    #[test]
+    fn shape_contains_line_uses_polygon_square_caps() {
+        let line = local_adjust_core::MaskShape::Line {
+            op: local_adjust_core::ShapeOp::Add,
+            kind: local_adjust_core::LineKind::Horizontal,
+            p0: [10.0, 10.0],
+            p1: [50.0, 10.0],
+            thickness: 8.0,
+        };
+        // 線分の真ん中: 含まれる
+        assert!(super::local_adjust_shape_contains(line, [30.0, 10.0]));
+        // 端点 p0 ぴったり: 含まれる
+        assert!(super::local_adjust_shape_contains(line, [10.0, 10.0]));
+        // p0 のすぐ手前 (X = 6.0, 端点から 4px 手前) → rounded cap なら含まれていた
+        // square cap なら含まれない (= square cap の polygon の外側)
+        assert!(
+            !super::local_adjust_shape_contains(line, [6.0, 10.0]),
+            "click 4px before p0 must miss with square cap (rounded would hit)"
+        );
+        // p1 のすぐ先 (X = 54.0)
+        assert!(
+            !super::local_adjust_shape_contains(line, [54.0, 10.0]),
+            "click 4px past p1 must miss with square cap"
+        );
+        // 横方向に thickness/2 + 1 = 5 はずれた位置 (Y = 15) → 範囲外
+        assert!(!super::local_adjust_shape_contains(line, [30.0, 15.5]));
+    }
+
+    /// Rect の hit-test は rotation を反転して local 座標で half_w / half_h 判定する。
+    #[test]
+    fn shape_contains_rect_respects_rotation() {
+        let rect = local_adjust_core::MaskShape::Rect {
+            op: local_adjust_core::ShapeOp::Add,
+            center: [100.0, 100.0],
+            half_w: 20.0,
+            half_h: 10.0,
+            rotation_rad: std::f32::consts::FRAC_PI_2, // 90°
+        };
+        // 90° 回転後: half_w が y 方向に伸びる
+        // 中心: 含まれる
+        assert!(super::local_adjust_shape_contains(rect, [100.0, 100.0]));
+        // 元の half_w 方向 (= 回転後は短辺方向 ±10): 中心 ±10 で含まれる
+        assert!(super::local_adjust_shape_contains(rect, [110.0, 100.0]));
+        assert!(!super::local_adjust_shape_contains(rect, [115.0, 100.0]));
+        // 元の half_h 方向 (= 回転後は長辺方向 ±20)
+        assert!(super::local_adjust_shape_contains(rect, [100.0, 115.0]));
+        assert!(!super::local_adjust_shape_contains(rect, [100.0, 125.0]));
+    }
+
+    /// Ellipse の hit-test は rotation を反転して楕円方程式で内外判定する。
+    #[test]
+    fn shape_contains_ellipse_uses_quadratic_form() {
+        let ell = local_adjust_core::MaskShape::Ellipse {
+            op: local_adjust_core::ShapeOp::Add,
+            center: [200.0, 200.0],
+            rx: 30.0,
+            ry: 15.0,
+            rotation_rad: 0.0,
+        };
+        assert!(super::local_adjust_shape_contains(ell, [200.0, 200.0])); // 中心
+        assert!(super::local_adjust_shape_contains(ell, [229.0, 200.0])); // ほぼ rx
+        assert!(!super::local_adjust_shape_contains(ell, [232.0, 200.0])); // rx 超過
+        assert!(super::local_adjust_shape_contains(ell, [200.0, 214.0])); // ほぼ ry
+        assert!(!super::local_adjust_shape_contains(ell, [200.0, 217.0])); // ry 超過
+        // 軸外: ((dx/rx)^2 + (dy/ry)^2) で判定。中心から (20, 10) は 0.44+0.44 < 1 → 内
+        assert!(super::local_adjust_shape_contains(ell, [220.0, 210.0]));
+        // (30, 10) は (1.0 + 0.44) > 1 → 外
+        assert!(!super::local_adjust_shape_contains(ell, [230.0, 210.0]));
+    }
+
+    /// A-2 関連: アニメーション色は時間経過で十分に変化する。
+    /// 既存 `region_boundary_color_animates_over_time` は t=0 と t=1 の 2 点比較
+    /// だが、間隔の刻みが粗すぎて「ほぼ静止」していても通ってしまう。
+    /// ここでは 0.1 秒刻みで色相変化量を測り、1 秒で 360° hue サイクルの
+    /// 1/4 (= 90°) 以上回ることを assertion する。
+    #[test]
+    fn region_boundary_color_completes_meaningful_hue_rotation_in_one_second() {
+        // hue 計算式 (src/ui_adjustment_panel.rs::local_adjust_region_boundary_color):
+        //   hue = (time_sec * 130.0 + (label * 47 % 360)) mod 360
+        // 1 秒で 130 度進む → 90 度以上のしきい値は安全マージン
+        let label = 0_u32; // label のオフセット影響を切り捨て
+        let mut max_diff: f32 = 0.0;
+        for i in 1..=10 {
+            let t = i as f32 * 0.1;
+            let c0 = super::local_adjust_region_boundary_color(label, 0.0);
+            let ct = super::local_adjust_region_boundary_color(label, t);
+            let diff = ((c0.r() as i32 - ct.r() as i32).abs()
+                + (c0.g() as i32 - ct.g() as i32).abs()
+                + (c0.b() as i32 - ct.b() as i32).abs()) as f32;
+            max_diff = max_diff.max(diff);
+        }
+        assert!(
+            max_diff >= 100.0,
+            "色相が 1 秒で 100/765 以上動かない → アニメーション周波数が遅すぎる (A-2 退行)"
+        );
+    }
 }
 
 fn effective_local_mask_edit_target(
