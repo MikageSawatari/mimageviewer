@@ -5164,6 +5164,132 @@ mod favorite_adjustment_defaults_tests {
     }
 }
 
+/// v1.1.0 pipeline refactor: edit-result cache and final-composite cache must
+/// be invalidated on different axes.
+#[cfg(test)]
+mod pipeline_cache_refactor_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn push_image(app: &mut App, path: &str) -> usize {
+        app.items.push(GridItem::Image(PathBuf::from(path)));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.items.len() - 1
+    }
+
+    fn dummy_edit_key(app: &App, idx: usize) -> EditResultKey {
+        EditResultKey {
+            idx,
+            source_gen: app.input_generation.get(&idx).copied().unwrap_or(0),
+            erase_mask_gen: app.erase_mask_generation.get(&idx).copied().unwrap_or(0),
+            local_gen: app.local_adjust_generation.get(&idx).copied().unwrap_or(0),
+            conceal_mask_gen: app.conceal_mask_generation.get(&idx).copied().unwrap_or(0),
+            conceal_gen: app.conceal_generation,
+            crop_hash: 0,
+        }
+    }
+
+    fn insert_edit_and_final_cache(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+    ) -> (EditResultKey, FinalCompositeKey) {
+        let image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(7, 8, 9)]);
+        let pixels = Arc::new(image.clone());
+        let edit_key = dummy_edit_key(app, idx);
+        let edit_tex = ctx.load_texture(
+            format!("{label}_edit"),
+            image.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.edit_result_cache.insert(
+            edit_key,
+            EditResultEntry {
+                pixels: Arc::clone(&pixels),
+                texture: edit_tex,
+            },
+        );
+
+        let final_key = FinalCompositeKey {
+            edit_key,
+            params_hash: 0x11,
+            bg: 0,
+        };
+        let final_tex = ctx.load_texture(
+            format!("{label}_final"),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        app.final_composite_cache.insert(
+            final_key,
+            FinalCompositeEntry {
+                pixels,
+                texture: final_tex,
+                complete: true,
+            },
+        );
+        app.final_ai_cache.insert(
+            FinalAiKey {
+                edit_key,
+                color_ai_hash: 0x22,
+                bg: 0,
+            },
+            Arc::new(egui::ColorImage::new(
+                [1, 1],
+                vec![egui::Color32::from_rgb(10, 11, 12)],
+            )),
+        );
+        (edit_key, final_key)
+    }
+
+    #[test]
+    fn adjustment_generation_keeps_edit_cache_and_clears_final_cache() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pipeline-adjust.jpg");
+        let (edit_key, final_key) =
+            insert_edit_and_final_cache(&mut app, &ctx, idx, "adjust_change");
+
+        app.bump_adjustment_generation(idx);
+
+        assert!(
+            app.edit_result_cache.contains_key(&edit_key),
+            "AdjustParams changes must not invalidate source-resolution edit results"
+        );
+        assert!(
+            !app.final_composite_cache.contains_key(&final_key),
+            "final composite depends on AdjustParams and must be rebuilt"
+        );
+        assert!(
+            app.final_ai_cache.is_empty(),
+            "AI-in-final cache for the page must be cleared with final composite"
+        );
+    }
+
+    #[test]
+    fn edit_generation_clears_only_the_changed_page_edit_and_final_caches() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx_a = push_image(&mut app, "C:/pics/pipeline-edit-a.jpg");
+        let idx_b = push_image(&mut app, "C:/pics/pipeline-edit-b.jpg");
+        let (edit_a, final_a) = insert_edit_and_final_cache(&mut app, &ctx, idx_a, "edit_a");
+        let (edit_b, final_b) = insert_edit_and_final_cache(&mut app, &ctx, idx_b, "edit_b");
+
+        app.bump_erase_mask_generation(idx_a);
+
+        assert!(!app.edit_result_cache.contains_key(&edit_a));
+        assert!(!app.final_composite_cache.contains_key(&final_a));
+        assert!(
+            app.edit_result_cache.contains_key(&edit_b),
+            "unrelated pages should stay hot during page-local edit invalidation"
+        );
+        assert!(app.final_composite_cache.contains_key(&final_b));
+    }
+}
+
 #[cfg(all(test, windows))]
 mod native_video_rating_key_tests {
     use super::phase_c_support::setup_app;
