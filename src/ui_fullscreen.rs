@@ -227,6 +227,18 @@ fn original_preview_shortcut_held(ctx: &egui::Context) -> bool {
 }
 
 #[cfg(windows)]
+fn ctrl_held_via_os() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL};
+
+    unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) < 0 }
+}
+
+#[cfg(not(windows))]
+fn ctrl_held_via_os() -> bool {
+    false
+}
+
+#[cfg(windows)]
 fn shift_held_via_os() -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SHIFT};
 
@@ -791,6 +803,10 @@ impl App {
     /// 単ページ / 見開き / ルーペの全てがここを通ることで、加工レイヤを追加した
     /// ときの横展開漏れを防ぐ。通常表示は edit result に AdjustParams / AI /
     /// post_filter を最終段で適用した final composite を使う。
+    ///
+    /// 注意: 本関数は `prepare_fullscreen_state` 経由でメインビューポート ctx が
+    /// 渡される経路がある。Modifier 状態は `ctx.input(|i| i.modifiers)` ではなく
+    /// 必ず `*_held_via_os()` 系で取ること。
     fn resolve_fs_processed_texture(
         &mut self,
         ctx: &egui::Context,
@@ -819,7 +835,14 @@ impl App {
         }
 
         if self.local_adjust_mode {
-            let (ctrl_down, shift_down) = ctx.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
+            // `prepare_fullscreen_state` 経由では ctx がメインビューポートのものになり、
+            // フルスクリーンが OS フォーカスを持つ間は modifier event が届かない。
+            // `original_preview_active` と同じく OS キー状態で見る。
+            let (ctrl_down, shift_down) = if self.fs_prev_focused {
+                (ctrl_held_via_os(), shift_held_via_os())
+            } else {
+                (false, false)
+            };
             let adjust_panel_active = self
                 .local_adjust_page_layers
                 .get(&idx)
