@@ -5000,6 +5000,52 @@ where
     Ok(out)
 }
 
+fn morph_alpha_disk_with_outside<F>(
+    src: &[f32],
+    width: usize,
+    height: usize,
+    radius: i32,
+    dilate: bool,
+    outside_value: f32,
+    cancel: Option<&AtomicBool>,
+    progress: F,
+) -> Result<Vec<f32>>
+where
+    F: FnMut(f32),
+{
+    let r = radius.max(0) as usize;
+    if r == 0 || width == 0 || height == 0 {
+        return morph_alpha_disk(src, width, height, radius, dilate, cancel, progress);
+    }
+
+    let padded_width = width + r * 2;
+    let padded_height = height + r * 2;
+    let mut padded = vec![outside_value.clamp(0.0, 1.0); padded_width * padded_height];
+    for y in 0..height {
+        let src_start = y * width;
+        let dst_start = (y + r) * padded_width + r;
+        padded[dst_start..dst_start + width].copy_from_slice(&src[src_start..src_start + width]);
+    }
+
+    let padded_out = morph_alpha_disk(
+        &padded,
+        padded_width,
+        padded_height,
+        radius,
+        dilate,
+        cancel,
+        progress,
+    )?;
+    let mut out = vec![0.0; src.len()];
+    for y in 0..height {
+        let src_start = (y + r) * padded_width + r;
+        let dst_start = y * width;
+        out[dst_start..dst_start + width]
+            .copy_from_slice(&padded_out[src_start..src_start + width]);
+    }
+    Ok(out)
+}
+
 fn sliding_row_extreme(src: &[f32], radius: usize, dilate: bool, out: &mut [f32]) {
     debug_assert_eq!(src.len(), out.len());
     if src.is_empty() {
@@ -10209,12 +10255,13 @@ fn apply_outline_stroke(
         (0.02, 0.72, 0.02, 0.72)
     };
     let dilated = if needs_dilate {
-        Some(morph_alpha_disk(
+        Some(morph_alpha_disk_with_outside(
             &alpha,
             width,
             height,
             radius,
             true,
+            0.0,
             cancel,
             |p| progress(dilate_start + p * dilate_span),
         )?)
@@ -10222,12 +10269,13 @@ fn apply_outline_stroke(
         None
     };
     let eroded = if needs_erode {
-        Some(morph_alpha_disk(
+        Some(morph_alpha_disk_with_outside(
             &alpha,
             width,
             height,
             radius,
             false,
+            0.0,
             cancel,
             |p| progress(erode_start + p * erode_span),
         )?)
@@ -15519,6 +15567,32 @@ mod tests {
 
         let top_center = 1 * 4;
         let center = (3 + 1) * 4;
+        assert_eq!(&out.pixels[top_center..top_center + 3], &[0, 0, 0]);
+        assert_eq!(&out.pixels[center..center + 3], &[200, 200, 200]);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    #[test]
+    fn outline_stroke_inside_full_mask_paints_image_border() {
+        let src = solid(5, 5, [200, 200, 200, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "outline",
+            LocalMask::Full,
+            LocalEffect::OutlineStroke(OutlineStrokeParams {
+                placement: OutlineStrokePlacement::Inside,
+                width_px: 1.0,
+                softness_px: 0.0,
+                opacity: 1.0,
+                color_rgb: [0, 0, 0],
+            }),
+        );
+
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        let top_left = 0;
+        let top_center = 2 * 4;
+        let center = (2 * 5 + 2) * 4;
+        assert_eq!(&out.pixels[top_left..top_left + 3], &[0, 0, 0]);
         assert_eq!(&out.pixels[top_center..top_center + 3], &[0, 0, 0]);
         assert_eq!(&out.pixels[center..center + 3], &[200, 200, 200]);
         assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 255));
