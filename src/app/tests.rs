@@ -5275,6 +5275,52 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
+    fn local_adjust_layer_bypass_disables_only_selected_layer() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/layer-bypass.jpg");
+        app.local_adjust_page_layers.insert(
+            idx,
+            vec![
+                local_adjust_core::LocalAdjustmentLayer::new(
+                    "A",
+                    local_adjust_core::LocalMask::Full,
+                    local_adjust_core::LocalEffect::None,
+                ),
+                local_adjust_core::LocalAdjustmentLayer::new(
+                    "B",
+                    local_adjust_core::LocalMask::Full,
+                    local_adjust_core::LocalEffect::None,
+                ),
+                local_adjust_core::LocalAdjustmentLayer::new(
+                    "C",
+                    local_adjust_core::LocalMask::Full,
+                    local_adjust_core::LocalEffect::None,
+                ),
+            ],
+        );
+
+        let preview_layers = app
+            .local_adjust_layers_with_selected_layer_bypassed(idx, 1)
+            .expect("A and C remain active after bypassing B");
+
+        assert_eq!(
+            preview_layers
+                .iter()
+                .map(|layer| (layer.name.as_str(), layer.enabled))
+                .collect::<Vec<_>>(),
+            vec![("A", true), ("B", false), ("C", true)]
+        );
+        assert!(
+            app.local_adjust_page_layers
+                .get(&idx)
+                .unwrap()
+                .iter()
+                .all(|layer| layer.enabled),
+            "bypass preview must not mutate stored layer state"
+        );
+    }
+
+    #[test]
     fn adjustment_generation_keeps_edit_cache_and_clears_final_cache() {
         let ctx = egui::Context::default();
         let mut app = setup_app();

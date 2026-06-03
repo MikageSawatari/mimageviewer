@@ -18703,7 +18703,6 @@ impl App {
             .map(|entry| Arc::clone(&entry.pixels))
     }
 
-    #[allow(dead_code)]
     pub(crate) fn current_local_adjust_layer_bypass_key(
         &self,
         idx: usize,
@@ -18715,7 +18714,6 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn current_local_adjust_layer_bypass_texture(
         &self,
         idx: usize,
@@ -18749,7 +18747,6 @@ impl App {
             .map(|entry| entry.texture.clone())
     }
 
-    #[allow(dead_code)]
     fn local_adjust_layers_with_selected_layer_bypassed(
         &self,
         idx: usize,
@@ -18854,7 +18851,6 @@ impl App {
             .insert(idx, LocalAdjustRenderPending { key, cancel, rx });
     }
 
-    #[allow(dead_code)]
     pub(crate) fn maybe_start_local_adjust_layer_bypass_preview(
         &mut self,
         idx: usize,

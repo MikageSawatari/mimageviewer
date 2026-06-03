@@ -369,10 +369,10 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 通常の画像 / ZIP 内画像 / PDF ページだけを対象にし、動画には適用しない。表示元は常に
 `fs_cache` の生デコード結果で、補正 / AI / 消しゴム / 隠蔽の派生キャッシュは参照しない。
 補正レイヤーの派生キャッシュも同様に参照しない。ただし補正レイヤーモード中の
-`Ctrl+Shift` は「選択レイヤー直前までの prefix preview」に割り当てるため、
+`Ctrl+Shift` は「選択レイヤーをバイパスし他レイヤーを全て適用したプレビュー」に割り当てるため、
 元画像プレビューはこの組み合わせを捕まえず、`resolve_fs_processed_texture` の
 local_adjust 分岐に処理を譲る。`Ctrl` 単体は従来どおり元画像プレビューになる。
-元画像プレビューの譲渡判定と prefix preview の modifier gate は、fullscreen viewport
+元画像プレビューの譲渡判定と layer bypass preview の modifier gate は、fullscreen viewport
 外側の main `ctx.input` では modifier が取れないため、右 Ctrl と同じく OS キー状態を
 参照する。
 

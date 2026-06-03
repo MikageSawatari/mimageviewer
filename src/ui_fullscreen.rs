@@ -859,22 +859,32 @@ impl App {
                 )
                 && total_layers > 0
             {
-                let layer_count = if modifier_bypass_active {
-                    layer_idx.min(total_layers - 1)
-                } else {
-                    layer_idx.min(total_layers - 1) + 1
-                };
-                if layer_count == 0 {
-                    return self.resolve_local_adjust_source_texture(ctx, idx);
-                }
-                if layer_count < total_layers {
-                    self.maybe_start_local_adjust_prefix_preview(idx, layer_count);
+                if modifier_bypass_active {
+                    // Ctrl+Shift: 選択レイヤーだけをバイパスし、他レイヤーは適用する。
+                    // レイヤー効果を素早く on/off 比較するためのラボ仕様。
+                    let bypass_layer_idx = layer_idx.min(total_layers - 1);
+                    self.maybe_start_local_adjust_layer_bypass_preview(idx, bypass_layer_idx);
                     if let Some(tex) =
-                        self.current_local_adjust_prefix_preview_texture(idx, layer_count)
+                        self.current_local_adjust_layer_bypass_texture(idx, bypass_layer_idx)
                     {
                         return Some(tex);
                     }
                     return self.resolve_local_adjust_source_texture(ctx, idx);
+                } else {
+                    // L キーの「選択レイヤーまでプレビュー」は既存の prefix preview を維持する。
+                    let layer_count = layer_idx.min(total_layers - 1) + 1;
+                    if layer_count == 0 {
+                        return self.resolve_local_adjust_source_texture(ctx, idx);
+                    }
+                    if layer_count < total_layers {
+                        self.maybe_start_local_adjust_prefix_preview(idx, layer_count);
+                        if let Some(tex) =
+                            self.current_local_adjust_prefix_preview_texture(idx, layer_count)
+                        {
+                            return Some(tex);
+                        }
+                        return self.resolve_local_adjust_source_texture(ctx, idx);
+                    }
                 }
             }
             if let Some(local_adjust_tex) = self.current_local_adjust_texture(idx) {
