@@ -19,6 +19,7 @@ use crate::app::{AdjustSpreadTarget, App};
 use crate::local_adjust_catalog::{
     EFFECT_GROUPS, EffectKind, effect_picker_button_width, effect_picker_matches_query,
 };
+use crate::local_adjust_effect_ui::draw_effect_params;
 use crate::ui_fullscreen::SpreadPair;
 
 const HEADER_H: f32 = 36.0;
@@ -53,6 +54,19 @@ enum QuickLocalAdjustEffect {
     Vignette,
     CrtDisplay,
     Anaglyph3d,
+}
+
+#[derive(Default)]
+struct LocalEffectPanelRequests {
+    load_cube_lut: Option<usize>,
+    copy_effect: Option<usize>,
+    paste_effect: Option<usize>,
+    reset_effect: Option<usize>,
+    start_selective_color_pick: bool,
+    cancel_selective_color_pick: bool,
+    start_rgb_pick: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
+    cancel_rgb_pick: bool,
+    set_effect_position_handles_visible: Option<bool>,
 }
 
 impl QuickLocalAdjustEffect {
@@ -154,6 +168,7 @@ fn draw_local_adjust_section(
     content_width: f32,
     layers: &[local_adjust_core::LocalAdjustmentLayer],
     selected_layer: usize,
+    image_dims: (usize, usize),
     effect_query: &mut String,
     add_quick_effect: &mut Option<QuickLocalAdjustEffect>,
     add_effect: &mut Option<EffectKind>,
@@ -162,6 +177,11 @@ fn draw_local_adjust_section(
     update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
     delete_layer: &mut Option<usize>,
     clear_layers: &mut bool,
+    effect_clipboard_available: bool,
+    selective_color_pick_active: bool,
+    rgb_pick_active: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
+    effect_position_handles_visible: bool,
+    effect_requests: &mut LocalEffectPanelRequests,
 ) {
     ui.add_space(4.0);
     ui.label(
@@ -301,10 +321,15 @@ fn draw_local_adjust_section(
         ui.add_space(4.0);
         draw_selected_local_adjust_layer_editor(
             ui,
-            content_width,
             selected_layer,
             layer,
+            image_dims,
             update_layer,
+            effect_clipboard_available,
+            selective_color_pick_active,
+            rgb_pick_active,
+            effect_position_handles_visible,
+            effect_requests,
         );
     }
 
@@ -321,10 +346,15 @@ fn draw_local_adjust_section(
 
 fn draw_selected_local_adjust_layer_editor(
     ui: &mut egui::Ui,
-    content_width: f32,
     layer_idx: usize,
     layer: &local_adjust_core::LocalAdjustmentLayer,
+    image_dims: (usize, usize),
     update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+    effect_clipboard_available: bool,
+    selective_color_pick_active: bool,
+    rgb_pick_active: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
+    effect_position_handles_visible: bool,
+    effect_requests: &mut LocalEffectPanelRequests,
 ) {
     let mut edited = layer.clone();
     let mut changed = false;
@@ -346,100 +376,78 @@ fn draw_selected_local_adjust_layer_editor(
             .size(11.0)
             .color(egui::Color32::from_gray(180)),
     );
-    changed |= draw_local_effect_minimal_params(ui, content_width, &mut edited.effect);
+    let response = draw_effect_params(
+        ui,
+        &mut edited,
+        image_dims,
+        selective_color_pick_active,
+        rgb_pick_active,
+        effect_clipboard_available,
+        effect_position_handles_visible,
+    );
+    changed |= response.changed;
+    if response.load_cube_lut {
+        effect_requests.load_cube_lut = Some(layer_idx);
+    }
+    if response.copy_effect {
+        effect_requests.copy_effect = Some(layer_idx);
+    }
+    if response.paste_effect {
+        effect_requests.paste_effect = Some(layer_idx);
+    }
+    if response.reset_effect {
+        effect_requests.reset_effect = Some(layer_idx);
+    }
+    effect_requests.start_selective_color_pick |= response.start_selective_color_pick;
+    effect_requests.cancel_selective_color_pick |= response.cancel_selective_color_pick;
+    if response.start_rgb_pick.is_some() {
+        effect_requests.start_rgb_pick = response.start_rgb_pick;
+    }
+    effect_requests.cancel_rgb_pick |= response.cancel_rgb_pick;
+    if response.set_effect_position_handles_visible.is_some() {
+        effect_requests.set_effect_position_handles_visible =
+            response.set_effect_position_handles_visible;
+    }
     if changed {
         *update_layer = Some((layer_idx, edited));
     }
 }
 
-fn local_param_slider(
-    ui: &mut egui::Ui,
-    value: &mut f32,
-    range: std::ops::RangeInclusive<f32>,
-    label: &'static str,
-) -> bool {
-    ui.add(egui::Slider::new(value, range).text(label))
-        .changed()
+fn local_adjust_image_dims(app: &App, fs_idx: usize) -> (usize, usize) {
+    match app.fs_cache.get(&fs_idx) {
+        Some(crate::fs_animation::FsCacheEntry::Static {
+            pixels,
+            source_dims,
+            ..
+        }) => source_dims
+            .map(|[w, h]| (w, h))
+            .unwrap_or((pixels.size[0], pixels.size[1])),
+        _ => (1, 1),
+    }
 }
 
-fn draw_local_effect_minimal_params(
-    ui: &mut egui::Ui,
-    _content_width: f32,
-    effect: &mut local_adjust_core::LocalEffect,
-) -> bool {
-    use local_adjust_core::LocalEffect;
-    let mut changed = false;
-    match effect {
-        LocalEffect::Tone(params) => {
-            changed |= local_param_slider(ui, &mut params.brightness, -100.0..=100.0, "明るさ");
-            changed |= local_param_slider(ui, &mut params.contrast, -100.0..=100.0, "コントラスト");
-            changed |= local_param_slider(ui, &mut params.gamma, 0.2..=5.0, "ガンマ");
-            changed |= local_param_slider(ui, &mut params.saturation, -100.0..=100.0, "彩度");
-            changed |= local_param_slider(ui, &mut params.vibrance, -100.0..=100.0, "自然な彩度");
-            changed |= local_param_slider(ui, &mut params.temperature, -100.0..=100.0, "色温度");
-            changed |= local_param_slider(ui, &mut params.tint, -100.0..=100.0, "色かぶり補正");
-        }
-        LocalEffect::PhotoFilter(params) => {
-            changed |= local_param_slider(ui, &mut params.density, 0.0..=1.0, "濃度");
-            changed |= local_param_slider(ui, &mut params.strength, 0.0..=1.0, "強さ");
-            changed |= ui
-                .checkbox(&mut params.preserve_luminosity, "輝度を保持")
-                .changed();
-        }
-        LocalEffect::MonochromeMixer(params) => {
-            changed |= local_param_slider(ui, &mut params.red, -100.0..=100.0, "赤");
-            changed |= local_param_slider(ui, &mut params.yellow, -100.0..=100.0, "黄");
-            changed |= local_param_slider(ui, &mut params.green, -100.0..=100.0, "緑");
-            changed |= local_param_slider(ui, &mut params.cyan, -100.0..=100.0, "シアン");
-            changed |= local_param_slider(ui, &mut params.blue, -100.0..=100.0, "青");
-            changed |= local_param_slider(ui, &mut params.magenta, -100.0..=100.0, "マゼンタ");
-            changed |= local_param_slider(ui, &mut params.contrast, -100.0..=100.0, "コントラスト");
-            changed |= local_param_slider(ui, &mut params.tint_strength, 0.0..=1.0, "色調");
-            changed |= local_param_slider(ui, &mut params.strength, 0.0..=1.0, "強さ");
-        }
-        LocalEffect::Blur(params) => {
-            changed |= local_param_slider(ui, &mut params.radius_px, 0.0..=80.0, "半径");
-        }
-        LocalEffect::Sharpen(params) => {
-            changed |= local_param_slider(ui, &mut params.amount, 0.0..=3.0, "量");
-            changed |= local_param_slider(ui, &mut params.radius_px, 0.2..=8.0, "半径");
-            changed |= local_param_slider(ui, &mut params.threshold, 0.0..=0.25, "しきい値");
-        }
-        LocalEffect::Vignette(params) => {
-            changed |= local_param_slider(ui, &mut params.strength, -1.0..=1.0, "強さ");
-            changed |= local_param_slider(ui, &mut params.radius, 0.05..=1.5, "半径");
-            changed |= local_param_slider(ui, &mut params.feather, 0.0..=1.0, "ぼかし");
-        }
-        LocalEffect::CrtDisplay(params) => {
-            changed |= local_param_slider(
-                ui,
-                &mut params.scanline_spacing_px,
-                1.0..=12.0,
-                "走査線間隔",
-            );
-            changed |= local_param_slider(ui, &mut params.scanline_depth, 0.0..=1.0, "走査線");
-            changed |= local_param_slider(ui, &mut params.mask_strength, 0.0..=1.0, "RGBマスク");
-            changed |= local_param_slider(ui, &mut params.curvature, 0.0..=0.3, "曲面");
-            changed |= local_param_slider(ui, &mut params.bloom, 0.0..=1.0, "グロー");
-            changed |= local_param_slider(ui, &mut params.horizontal_blur, 0.0..=2.0, "横ぼかし");
-            changed |= local_param_slider(ui, &mut params.brightness, 0.2..=2.5, "明るさ");
-            changed |= local_param_slider(ui, &mut params.strength, 0.0..=1.0, "強さ");
-        }
-        LocalEffect::Anaglyph3d(params) => {
-            changed |= local_param_slider(ui, &mut params.disparity_px, 0.0..=48.0, "ズレ");
-            changed |= local_param_slider(ui, &mut params.angle_degrees, -180.0..=180.0, "角度");
-            changed |= local_param_slider(ui, &mut params.luma_mix, 0.0..=1.0, "輝度ミックス");
-            changed |= local_param_slider(ui, &mut params.strength, 0.0..=1.0, "強さ");
-        }
-        _ => {
-            ui.label(
-                egui::RichText::new("この効果の詳細パラメータ UI は後続ステップで移植します。")
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(160)),
-            );
-        }
+fn paste_layer_effect(
+    layer: &mut local_adjust_core::LocalAdjustmentLayer,
+    effect: local_adjust_core::LocalEffect,
+) {
+    let current_kind = EffectKind::from_effect(&layer.effect);
+    let pasted_kind = EffectKind::from_effect(&effect);
+    layer.effect = effect;
+    if current_kind != pasted_kind {
+        let mask_application =
+            local_adjust_core::default_mask_application_for_effect(&layer.effect);
+        layer.mask_before_effect = mask_application.before_effect;
+        layer.mask_after_effect = mask_application.after_effect;
     }
-    changed
+}
+
+fn reset_layer_effect_params(layer: &mut local_adjust_core::LocalAdjustmentLayer) -> bool {
+    let kind = EffectKind::from_effect(&layer.effect);
+    if kind == EffectKind::None {
+        return false;
+    }
+    layer.effect = kind.default_effect();
+    true
 }
 
 fn draw_header_icon_button(
@@ -1090,6 +1098,7 @@ impl App {
         update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
         delete_layer: Option<usize>,
         clear_layers: bool,
+        effect_requests: LocalEffectPanelRequests,
     ) {
         if let Some(layer_idx) = select_layer {
             if let Some(layers) = self.local_adjust_page_layers.get(&fs_idx)
@@ -1137,6 +1146,40 @@ impl App {
             selected_after = Some(layer_idx);
             changed = true;
         }
+        if let Some(layer_idx) = effect_requests.copy_effect
+            && let Some(layer) = layers.get(layer_idx)
+        {
+            let kind = EffectKind::from_effect(&layer.effect);
+            self.local_adjust_effect_clipboard = Some(layer.effect.clone());
+            self.show_feedback_toast(format!("加工パラメータをコピー: {}", kind.label()));
+        }
+        if let Some(layer_idx) = effect_requests.paste_effect {
+            if let Some(effect) = self.local_adjust_effect_clipboard.clone() {
+                if let Some(layer) = layers.get_mut(layer_idx) {
+                    let kind = EffectKind::from_effect(&effect);
+                    paste_layer_effect(layer, effect);
+                    selected_after = Some(layer_idx);
+                    changed = true;
+                    self.local_adjust_selective_color_pick_active = false;
+                    self.local_adjust_rgb_pick_active = None;
+                    self.show_feedback_toast(format!("加工パラメータをペースト: {}", kind.label()));
+                }
+            } else {
+                self.show_feedback_toast("コピー済みの加工パラメータがありません".to_string());
+            }
+        }
+        if let Some(layer_idx) = effect_requests.reset_effect
+            && let Some(layer) = layers.get_mut(layer_idx)
+        {
+            let kind = EffectKind::from_effect(&layer.effect);
+            if reset_layer_effect_params(layer) {
+                selected_after = Some(layer_idx);
+                changed = true;
+                self.local_adjust_selective_color_pick_active = false;
+                self.local_adjust_rgb_pick_active = None;
+                self.show_feedback_toast(format!("加工パラメータをリセット: {}", kind.label()));
+            }
+        }
         if let Some(layer_idx) = delete_layer
             && layer_idx < layers.len()
         {
@@ -1160,6 +1203,147 @@ impl App {
                 {
                     self.local_adjust_selected_layers.insert(fs_idx, selected);
                 }
+            }
+        }
+        if let Some(visible) = effect_requests.set_effect_position_handles_visible {
+            self.local_adjust_effect_position_handles_visible = visible;
+        }
+        if effect_requests.cancel_selective_color_pick {
+            self.local_adjust_selective_color_pick_active = false;
+        }
+        if effect_requests.start_selective_color_pick {
+            self.local_adjust_selective_color_pick_active = true;
+            self.local_adjust_rgb_pick_active = None;
+            self.show_feedback_toast("画像上の色をクリックして対象色を選択します".to_string());
+        }
+        if effect_requests.cancel_rgb_pick {
+            self.local_adjust_rgb_pick_active = None;
+        }
+        if let Some(target) = effect_requests.start_rgb_pick {
+            self.local_adjust_rgb_pick_active = Some(target);
+            self.local_adjust_selective_color_pick_active = false;
+            self.show_feedback_toast(format!("スポイト対象: {}", target.label()));
+        }
+        if let Some(layer_idx) = effect_requests.load_cube_lut {
+            self.choose_local_adjust_cube_lut_for_layer(fs_idx, layer_idx);
+        }
+    }
+
+    fn choose_local_adjust_cube_lut_for_layer(&mut self, fs_idx: usize, layer_idx: usize) {
+        if self.local_adjust_lut_pending.is_some() {
+            self.show_feedback_toast("LUT読み込み中です".to_string());
+            return;
+        }
+        if !self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .and_then(|layers| layers.get(layer_idx))
+            .is_some_and(|layer| matches!(layer.effect, local_adjust_core::LocalEffect::CubeLut(_)))
+        {
+            self.show_feedback_toast("3D LUT レイヤーを選択してください".to_string());
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("3D LUT (.cube)", &["cube"])
+            .set_title("3D LUTを選択")
+            .pick_file()
+        else {
+            return;
+        };
+        let fallback_name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("3D LUT")
+            .to_string();
+        let worker_path = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("local-adjust-lut-load".to_string())
+            .spawn(move || {
+                let result = std::fs::read_to_string(&worker_path)
+                    .map_err(|err| format!("LUTファイルを読めません: {err}"))
+                    .and_then(|text| local_adjust_core::parse_cube_lut(&text, &fallback_name));
+                let _ = tx.send(result);
+            });
+        match spawn_result {
+            Ok(_) => {
+                self.local_adjust_lut_pending = Some(crate::app::LocalAdjustLutLoadPending {
+                    fs_idx,
+                    layer_idx,
+                    generation: self
+                        .local_adjust_generation
+                        .get(&fs_idx)
+                        .copied()
+                        .unwrap_or(0),
+                    path: path.clone(),
+                    rx,
+                });
+                self.show_feedback_toast(format!("LUT読み込み中: {}", path.display()));
+            }
+            Err(err) => {
+                self.show_feedback_toast(format!("LUT読み込み worker 起動失敗: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn poll_local_adjust_lut_load(&mut self, ctx: &egui::Context) {
+        let recv_result = {
+            let Some(pending) = self.local_adjust_lut_pending.as_ref() else {
+                return;
+            };
+            pending.rx.try_recv()
+        };
+        match recv_result {
+            Ok(Ok(params)) => {
+                let Some(pending) = self.local_adjust_lut_pending.take() else {
+                    return;
+                };
+                let current_generation = self
+                    .local_adjust_generation
+                    .get(&pending.fs_idx)
+                    .copied()
+                    .unwrap_or(0);
+                if pending.generation != current_generation {
+                    self.show_feedback_toast(
+                        "LUT読み込み結果を破棄しました。レイヤーが変更されています".to_string(),
+                    );
+                    return;
+                }
+                let mut layers = self
+                    .local_adjust_page_layers
+                    .get(&pending.fs_idx)
+                    .cloned()
+                    .unwrap_or_default();
+                if !layers.get(pending.layer_idx).is_some_and(|layer| {
+                    matches!(layer.effect, local_adjust_core::LocalEffect::CubeLut(_))
+                }) {
+                    self.show_feedback_toast(
+                        "LUT読み込み結果を破棄しました。対象レイヤーが変更されています".to_string(),
+                    );
+                    return;
+                }
+                let name = params.name.clone();
+                let size = params.size;
+                layers[pending.layer_idx].effect = local_adjust_core::LocalEffect::CubeLut(params);
+                self.local_adjust_selected_layers
+                    .insert(pending.fs_idx, pending.layer_idx);
+                self.set_local_adjust_layers_for_idx(pending.fs_idx, layers);
+                self.show_feedback_toast(format!(
+                    "LUT読み込み完了: {name} ({size}^3) / {}",
+                    pending.path.display()
+                ));
+                ctx.request_repaint();
+            }
+            Ok(Err(err)) => {
+                self.local_adjust_lut_pending = None;
+                self.show_feedback_toast(format!("LUT読み込み失敗: {err}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.local_adjust_lut_pending = None;
+                self.show_feedback_toast("LUT読み込み worker が停止しました".to_string());
             }
         }
     }
@@ -1195,7 +1379,12 @@ impl App {
             .copied()
             .unwrap_or(0)
             .min(layers.len().saturating_sub(1));
+        let image_dims = local_adjust_image_dims(self, fs_idx);
         let mut effect_query = self.local_adjust_effect_query.clone();
+        let effect_clipboard_available = self.local_adjust_effect_clipboard.is_some();
+        let selective_color_pick_active = self.local_adjust_selective_color_pick_active;
+        let rgb_pick_active = self.local_adjust_rgb_pick_active;
+        let effect_position_handles_visible = self.local_adjust_effect_position_handles_visible;
 
         let panel_pos = egui::pos2(
             full_rect.min.x + LOCAL_ADJUST_PANEL_MARGIN_X,
@@ -1215,6 +1404,7 @@ impl App {
         let mut update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)> = None;
         let mut delete_layer: Option<usize> = None;
         let mut clear_layers = false;
+        let mut effect_requests = LocalEffectPanelRequests::default();
 
         egui::Area::new(egui::Id::new("local_adjust_panel"))
             .fixed_pos(panel_pos)
@@ -1332,6 +1522,7 @@ impl App {
                                             LOCAL_ADJUST_PANEL_W,
                                             &layers,
                                             selected_layer,
+                                            image_dims,
                                             &mut effect_query,
                                             &mut add_quick_effect,
                                             &mut add_effect,
@@ -1340,6 +1531,11 @@ impl App {
                                             &mut update_layer,
                                             &mut delete_layer,
                                             &mut clear_layers,
+                                            effect_clipboard_available,
+                                            selective_color_pick_active,
+                                            rgb_pick_active,
+                                            effect_position_handles_visible,
+                                            &mut effect_requests,
                                         );
                                     });
                             },
@@ -1360,6 +1556,7 @@ impl App {
             update_layer,
             delete_layer,
             clear_layers,
+            effect_requests,
         );
     }
 

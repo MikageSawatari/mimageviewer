@@ -281,6 +281,14 @@ pub(crate) enum LocalAdjustRenderResult {
     },
 }
 
+pub(crate) struct LocalAdjustLutLoadPending {
+    pub(crate) fs_idx: usize,
+    pub(crate) layer_idx: usize,
+    pub(crate) generation: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) rx: mpsc::Receiver<Result<local_adjust_core::CubeLutParams, String>>,
+}
+
 fn run_local_adjust_render(
     key: LocalAdjustResultKey,
     source: Arc<egui::ColorImage>,
@@ -2976,6 +2984,14 @@ pub struct App {
     pub(crate) local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
     /// 補正レイヤー効果追加ピッカーの検索語。
     pub(crate) local_adjust_effect_query: String,
+    /// 補正レイヤー効果パラメータのコピー/ペースト用クリップボード。
+    pub(crate) local_adjust_effect_clipboard: Option<local_adjust_core::LocalEffect>,
+    /// 効果色スポイトの対象。キャンバス側の実接続は後続ステップで行う。
+    pub(crate) local_adjust_rgb_pick_active: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
+    /// 選択色スポイトの状態。キャンバス側の実接続は後続ステップで行う。
+    pub(crate) local_adjust_selective_color_pick_active: bool,
+    /// 画像上の効果位置ハンドル表示フラグ。
+    pub(crate) local_adjust_effect_position_handles_visible: bool,
     /// 補正レイヤー自身の世代番号。レイヤー追加 / 削除 / パラメータ変更で idx 単位に +1 する。
     pub(crate) local_adjust_generation: std::collections::HashMap<usize, u64>,
     /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
@@ -2988,6 +3004,8 @@ pub struct App {
         std::collections::HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>,
     /// 補正レイヤー合成 worker。idx ごとに最新 1 本だけ動かす。
     pub(crate) local_adjust_pending: std::collections::HashMap<usize, LocalAdjustRenderPending>,
+    /// 補正レイヤーの 3D LUT 読み込み worker。
+    pub(crate) local_adjust_lut_pending: Option<LocalAdjustLutLoadPending>,
     /// 補正済み画像キャッシュ: item_idx → テクスチャ + ピクセルデータ
     pub(crate) adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
     /// 補正キャッシュ世代カウンタ (360 度パノラマビュー用、docs/panorama-360-view-plan.md §4.1.2)。
@@ -4178,11 +4196,16 @@ impl App {
             local_adjust_pages: std::collections::HashSet::new(),
             local_adjust_selected_layers: std::collections::HashMap::new(),
             local_adjust_effect_query: String::new(),
+            local_adjust_effect_clipboard: None,
+            local_adjust_rgb_pick_active: None,
+            local_adjust_selective_color_pick_active: false,
+            local_adjust_effect_position_handles_visible: true,
             local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
             local_adjust_cache: std::collections::HashMap::new(),
             local_adjust_pending: std::collections::HashMap::new(),
+            local_adjust_lut_pending: None,
             adjustment_cache: std::collections::HashMap::new(),
             adjustment_generation: std::collections::HashMap::new(),
             ai_upscale_generation: std::collections::HashMap::new(),
@@ -8201,9 +8224,14 @@ impl App {
         self.local_adjust_pages.clear();
         self.local_adjust_selected_layers.clear();
         self.local_adjust_effect_query.clear();
+        self.local_adjust_effect_clipboard = None;
+        self.local_adjust_rgb_pick_active = None;
+        self.local_adjust_selective_color_pick_active = false;
+        self.local_adjust_effect_position_handles_visible = true;
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
         self.cancel_all_local_adjust_pending();
+        self.local_adjust_lut_pending = None;
         self.mask_pages.clear();
         self.erase_mask_generation.clear();
         self.conceal_pages.clear();
@@ -23052,6 +23080,7 @@ impl eframe::App for App {
         self.poll_ai_upscale(ctx);
         self.poll_erase_inpaint(ctx);
         self.poll_local_adjust_render(ctx);
+        self.poll_local_adjust_lut_load(ctx);
         self.poll_search();
         self.poll_favsearch();
         self.poll_metadata_load();

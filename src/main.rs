@@ -51,6 +51,7 @@ pub mod ingest_worker;
 pub mod io_semaphore;
 pub mod local_adjust_catalog;
 pub mod local_adjust_db;
+pub mod local_adjust_effect_ui;
 pub mod logger;
 mod manual_mask_tools;
 pub mod mask_db;
