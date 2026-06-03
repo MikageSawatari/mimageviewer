@@ -5168,6 +5168,8 @@ mod favorite_adjustment_defaults_tests {
 /// be invalidated on different axes.
 #[cfg(test)]
 mod pipeline_cache_refactor_tests {
+    use crate::adjustment::PostFilter;
+
     use super::phase_c_support::setup_app;
     use super::*;
     use std::path::PathBuf;
@@ -5293,6 +5295,56 @@ mod pipeline_cache_refactor_tests {
         assert!(
             app.final_ai_cache.is_empty(),
             "AI-in-final cache for the page must be cleared with final composite"
+        );
+    }
+
+    #[test]
+    fn final_composite_applies_post_filter_without_polluting_edit_cache() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pipeline-post-filter.jpg");
+        let raw_color = egui::Color32::from_rgb(60, 120, 180);
+        let raw_pixels = Arc::new(egui::ColorImage::new([1, 1], vec![raw_color]));
+        let raw_texture = ctx.load_texture(
+            "post_filter_raw",
+            (*raw_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: raw_texture,
+                pixels: Arc::clone(&raw_pixels),
+                source_dims: Some([1, 1]),
+                load_seq: 0,
+            },
+        );
+        app.settings.global_preset.post_filter = PostFilter::Sepia;
+
+        let (edit_key, edit_pixels) = app
+            .ensure_edit_result_pixels(&ctx, idx)
+            .expect("edit result should be available from raw source");
+        let final_pixels = app
+            .ensure_final_composite_pixels(&ctx, idx)
+            .expect("final composite should be complete without AI");
+        let expected = crate::post_filter::apply(&raw_pixels, crate::adjustment::PostFilter::Sepia);
+
+        assert_eq!(
+            edit_pixels.pixels[0], raw_color,
+            "edit cache must stay in source-resolution, pre-post-filter space"
+        );
+        assert_eq!(final_pixels.pixels[0], expected.pixels[0]);
+        assert_ne!(
+            final_pixels.pixels[0], edit_pixels.pixels[0],
+            "post_filter should be visible only at the final composite stage"
+        );
+        assert_eq!(
+            app.edit_result_cache
+                .get(&edit_key)
+                .expect("edit cache entry should remain")
+                .pixels
+                .pixels[0],
+            raw_color
         );
     }
 

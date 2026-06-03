@@ -733,6 +733,97 @@ mod tests {
     }
 
     #[test]
+    fn export_scale_dimensions_use_rendered_crop_spread_size() {
+        let left = ExportPagePixels {
+            base_pixels: Arc::new(egui::ColorImage::new(
+                [5, 4],
+                vec![egui::Color32::BLACK; 20],
+            )),
+            conceal_mask: None,
+            crop: Some(crate::export_crop::CropRect {
+                min_x: 1.0,
+                min_y: 1.0,
+                max_x: 5.0,
+                max_y: 4.0,
+            }),
+        };
+        let right = ExportPagePixels {
+            base_pixels: Arc::new(egui::ColorImage::new(
+                [3, 5],
+                vec![egui::Color32::WHITE; 15],
+            )),
+            conceal_mask: None,
+            crop: None,
+        };
+        let pixels = ExportPixels::Spread { left, right };
+
+        assert_eq!(pixels.render_size(), [7, 5]);
+        assert_eq!(ExportScale::Half.scaled_size(pixels.render_size()), [4, 3]);
+        assert_eq!(
+            ExportScale::Quarter.scaled_size(pixels.render_size()),
+            [2, 1]
+        );
+    }
+
+    #[test]
+    fn worker_exports_half_scale_after_spread_render() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = Arc::new(egui::ColorImage::new(
+            [4, 2],
+            vec![egui::Color32::from_rgb(200, 0, 0); 8],
+        ));
+        let right = Arc::new(egui::ColorImage::new(
+            [2, 2],
+            vec![egui::Color32::from_rgb(0, 0, 200); 4],
+        ));
+        let pending = spawn_export_worker(ExportRequest {
+            source: ExportSource::RenderedSpread,
+            original_format: SrcFormat::Other("spread".to_string()),
+            output_format: ExportFormat::Png,
+            output_dir: temp.path().to_path_buf(),
+            basename: "half_spread".to_string(),
+            pixels: ExportPixels::Spread {
+                left: ExportPagePixels {
+                    base_pixels: left,
+                    conceal_mask: None,
+                    crop: None,
+                },
+                right: ExportPagePixels {
+                    base_pixels: right,
+                    conceal_mask: None,
+                    crop: None,
+                },
+            },
+            scale: ExportScale::Half,
+            entries: vec![ExportEntry {
+                label: "current".to_string(),
+                suffix: 0,
+                conceal_preset: None,
+            }],
+            include_metadata: false,
+        })
+        .unwrap();
+
+        loop {
+            match pending
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+            {
+                ExportEvent::Failed(err) => panic!("unexpected export failure: {err:?}"),
+                ExportEvent::AllDone => break,
+                ExportEvent::Started { .. } | ExportEvent::Completed(_) => {}
+                ExportEvent::Cancelled => panic!("unexpected cancel"),
+            }
+        }
+
+        let out = image::open(temp.path().join("half_spread_0.png"))
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(out.dimensions(), (3, 1));
+    }
+
+    #[test]
     fn worker_exports_spread_pixels_with_per_page_conceal() {
         let temp = tempfile::tempdir().unwrap();
         let left = Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]));
