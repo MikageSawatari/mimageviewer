@@ -932,7 +932,7 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   削除した。失敗内容と再導入条件は [ai-region-segmentation-retrospective.md](ai-region-segmentation-retrospective.md)
   に残す
 - 効果: Tone (自然な彩度・tint を含む) / Tone Curve / RGB Curve / Color Balance / Photo Filter /
-  3-way Color Grading / Selective Color / Part Color / Channel Mixer / Color Mixer / Clarity / Highlights-Shadows /
+  3-way Color Grading / Selective Color / Part Color / Channel Mixer / Monochrome Mixer / Color Mixer / Clarity / Highlights-Shadows /
   Texture / HighPass / FrequencySeparation / Blur / Motion Blur / Wind / SpeedLines / Tilt Shift / Lens Blur / Radial Blur / WaveDistortion / HeatHaze / PinchSpherize / Twirl / PolarCoordinates / GlassDisplacement / LensCorrection / LineExtract / ColorTrace / ArtisticMedia / BrushStroke / Cutout / ToonShade / Emboss / PixelStylize / Solarize / GlowingEdges / OilPaint / Soft Focus / Orton / Mosaic / Sharpen(radius/threshold) / SmartSharpen(edge-aware) / HSL / Dehaze / Look / 3D LUT / Posterize / RetroPalette / Threshold / Invert / Duotone / Equalize / Gradient Map / ColorFill / Frame / OutlineStroke / RimLight / ContactShadow / ColorOverlay / NeonGlow / DiffuseGlow / Bloom / Halation / ColorDodgeGlow / GodRays / LensFlare / Anamorphic Flare / LightLeak / BacklightHaze / CloudFog / WaterCaustics / ParticleOverlay / Aurora / Spotlight /
   Vignette / Film Grain / Chromatic Aberration / Defringe / Scanline Glitch / VHS / DataMosh / Pixel Sort / Old Film / Halftone / ScreenTone / ColorHalftone / CmykPlateShift / Lithograph / Engraving / NewspaperPrint / Textureizer / Cross-Star Glow /
   Edge-preserving Smooth / Median

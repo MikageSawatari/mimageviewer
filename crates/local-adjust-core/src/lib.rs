@@ -537,6 +537,7 @@ pub enum LocalEffect {
     SelectiveColor(SelectiveColorParams),
     PartColor(PartColorParams),
     ChannelMixer(ChannelMixerParams),
+    MonochromeMixer(MonochromeMixerParams),
     Clarity(ClarityParams),
     Texture(TextureParams),
     HighPass(HighPassParams),
@@ -646,6 +647,7 @@ impl LocalEffect {
             Self::SelectiveColor(_) => "セレクティブカラー",
             Self::PartColor(_) => "パートカラー",
             Self::ChannelMixer(_) => "チャンネルミキサー",
+            Self::MonochromeMixer(_) => "モノクロミキサー",
             Self::Clarity(_) => "明瞭度",
             Self::Texture(_) => "テクスチャ",
             Self::HighPass(_) => "ハイパス",
@@ -1055,6 +1057,37 @@ impl ChannelMixerParams {
             && self.red_output == [100.0, 0.0, 0.0]
             && self.green_output == [0.0, 100.0, 0.0]
             && self.blue_output == [0.0, 0.0, 100.0]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MonochromeMixerParams {
+    pub red: f32,
+    pub yellow: f32,
+    pub green: f32,
+    pub cyan: f32,
+    pub blue: f32,
+    pub magenta: f32,
+    pub contrast: f32,
+    pub tint_rgb: [u8; 3],
+    pub tint_strength: f32,
+    pub strength: f32,
+}
+
+impl Default for MonochromeMixerParams {
+    fn default() -> Self {
+        Self {
+            red: 0.0,
+            yellow: 0.0,
+            green: 0.0,
+            cyan: 0.0,
+            blue: 0.0,
+            magenta: 0.0,
+            contrast: 0.0,
+            tint_rgb: [196, 132, 68],
+            tint_strength: 0.0,
+            strength: 0.0,
+        }
     }
 }
 
@@ -4126,6 +4159,7 @@ where
             LocalEffect::SelectiveColor(params) => apply_selective_color(&image.pixels, *params),
             LocalEffect::PartColor(params) => apply_part_color(&image.pixels, *params),
             LocalEffect::ChannelMixer(params) => apply_channel_mixer(&image.pixels, *params),
+            LocalEffect::MonochromeMixer(params) => apply_monochrome_mixer(&image.pixels, *params),
             LocalEffect::Clarity(params) => apply_clarity(
                 &image.pixels,
                 image.width,
@@ -5344,6 +5378,80 @@ fn apply_channel_mixer(src: &[u8], params: ChannelMixerParams) -> Vec<u8> {
 
 fn mix_channels(rgb: [f32; 3], coeffs: [f32; 3]) -> f32 {
     (rgb[0] * coeffs[0] + rgb[1] * coeffs[1] + rgb[2] * coeffs[2]) / 100.0
+}
+
+fn apply_monochrome_mixer(src: &[u8], params: MonochromeMixerParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let tint_strength = params.tint_strength.clamp(0.0, 1.0);
+    let band_values = [
+        params.red,
+        params.yellow,
+        params.green,
+        params.cyan,
+        params.blue,
+        params.magenta,
+    ];
+    let band_centers = [0.0, 60.0, 120.0, 180.0, 240.0, 300.0];
+    let tint = rgb_u8_to_f32(params.tint_rgb);
+    let tint_luma = luma01(tint[0], tint[1], tint[2]).max(0.001);
+    let contrast = (1.0 + params.contrast.clamp(-100.0, 100.0) / 100.0).max(0.0);
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        if px[3] == 0 {
+            continue;
+        }
+        let base = [
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        ];
+        let (h, s, _) = rgb_to_hsl(base[0], base[1], base[2]);
+        let hue = h * 360.0;
+        let mut weighted_delta = 0.0;
+        let mut weight_sum = 0.0;
+        for (center, value) in band_centers
+            .iter()
+            .copied()
+            .zip(band_values.iter().copied())
+        {
+            let weight = monochrome_mixer_hue_weight(hue, center);
+            weighted_delta += weight * value.clamp(-100.0, 100.0);
+            weight_sum += weight;
+        }
+        let sat_weight = smoothstep(0.02, 0.32, s);
+        let band_delta = if weight_sum > f32::EPSILON {
+            weighted_delta / weight_sum / 100.0 * 0.45 * sat_weight
+        } else {
+            0.0
+        };
+        let mut gray = (luma01(base[0], base[1], base[2]) + band_delta).clamp(0.0, 1.0);
+        gray = ((gray - 0.5) * contrast + 0.5).clamp(0.0, 1.0);
+        let mut mono = [gray, gray, gray];
+        if tint_strength > f32::EPSILON {
+            let toned = [
+                (gray * tint[0] / tint_luma).clamp(0.0, 1.0),
+                (gray * tint[1] / tint_luma).clamp(0.0, 1.0),
+                (gray * tint[2] / tint_luma).clamp(0.0, 1.0),
+            ];
+            for c in 0..3 {
+                mono[c] = lerp_f32(mono[c], toned[c], tint_strength);
+            }
+        }
+        for c in 0..3 {
+            px[c] = to_u8(lerp_f32(base[c], mono[c], strength));
+        }
+    }
+    out
+}
+
+fn monochrome_mixer_hue_weight(hue_degrees: f32, center_degrees: f32) -> f32 {
+    let delta = (hue_degrees - center_degrees).rem_euclid(360.0);
+    let distance = delta.min(360.0 - delta);
+    let t = (1.0 - distance / 90.0).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 fn apply_clarity(src: &[u8], width: usize, height: usize, radius: usize, amount: f32) -> Vec<u8> {
@@ -17138,6 +17246,7 @@ mod tests {
             LocalEffect::SelectiveColor(SelectiveColorParams::default()),
             LocalEffect::PartColor(PartColorParams::default()),
             LocalEffect::ChannelMixer(ChannelMixerParams::default()),
+            LocalEffect::MonochromeMixer(MonochromeMixerParams::default()),
             LocalEffect::Clarity(ClarityParams::default()),
             LocalEffect::Texture(TextureParams::default()),
             LocalEffect::HighPass(HighPassParams::default()),
@@ -18893,6 +19002,57 @@ mod tests {
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(&out.pixels, &[200, 40, 10, 255]);
+    }
+
+    #[test]
+    fn monochrome_mixer_red_filter_brightens_red_and_darkens_blue() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![220, 20, 20, 255, 20, 220, 20, 255, 20, 20, 220, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "bw mix",
+            LocalMask::Full,
+            LocalEffect::MonochromeMixer(MonochromeMixerParams {
+                red: 70.0,
+                yellow: 20.0,
+                blue: -70.0,
+                cyan: -20.0,
+                strength: 1.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        for px in out.pixels.chunks_exact(4) {
+            assert_eq!(px[0], px[1]);
+            assert_eq!(px[1], px[2]);
+        }
+        assert!(out.pixels[0] > out.pixels[8]);
+        assert!(out.pixels[4] > out.pixels[8]);
+    }
+
+    #[test]
+    fn monochrome_mixer_tints_and_preserves_transparent_rgb() {
+        let src = RgbaImageBuf::new(2, 1, vec![120, 140, 170, 255, 10, 30, 50, 0]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "sepia bw",
+            LocalMask::Full,
+            LocalEffect::MonochromeMixer(MonochromeMixerParams {
+                tint_rgb: [196, 132, 68],
+                tint_strength: 0.70,
+                strength: 1.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        assert!(out.pixels[0] > out.pixels[1]);
+        assert!(out.pixels[1] > out.pixels[2]);
+        assert_eq!(out.pixels[3], 255);
+        assert_eq!(&out.pixels[4..8], &[10, 30, 50, 0]);
     }
 
     #[test]

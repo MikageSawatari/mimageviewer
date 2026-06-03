@@ -31,22 +31,22 @@ use local_adjust_core::{
     LensCorrectionParams, LensDirtMode, LensDirtParams, LensFlareParams, LightLeakParams,
     LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LithographParams,
     LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
-    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
-    NeonGlowParams, NewspaperPrintParams, NoiseDistribution, NoiseParams, OilPaintParams,
-    OldFilmParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement, PartColorParams,
-    ParticleOverlayMode, ParticleOverlayParams, PhotoFilterParams, PhotoFilterPreset,
-    PinchSpherizeParams, PixelSortDirection, PixelSortOrder, PixelSortParams, PixelStylizeMode,
-    PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
-    RadialBlurMode, RadialBlurParams, RadialFlashParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RetroPaletteMode, RetroPaletteParams, RgbToneCurveParams,
-    RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode,
-    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
-    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
-    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
-    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams,
-    WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
-    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    MaskShape, MedianParams, MonochromeMixerParams, MosaicBoundary, MosaicParams, MosaicTileMode,
+    MotionBlurParams, NeonGlowParams, NewspaperPrintParams, NoiseDistribution, NoiseParams,
+    OilPaintParams, OldFilmParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement,
+    PartColorParams, ParticleOverlayMode, ParticleOverlayParams, PhotoFilterParams,
+    PhotoFilterPreset, PinchSpherizeParams, PixelSortDirection, PixelSortOrder, PixelSortParams,
+    PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
+    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialFlashParams, RadialGradientMask,
+    RangeMask, RasterMask, RasterVectorMask, RegionMask, RetroPaletteMode, RetroPaletteParams,
+    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams,
+    ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams,
+    SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams,
+    SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
+    TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
+    TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams,
+    VignetteParams, WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection,
+    WindParams, WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
     default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
@@ -1038,6 +1038,7 @@ enum EffectKind {
     SelectiveColor,
     PartColor,
     ChannelMixer,
+    MonochromeMixer,
     Clarity,
     Texture,
     HighPass,
@@ -1142,6 +1143,7 @@ enum RgbPickTarget {
     FrameColor,
     FrameLineColor,
     PhotoFilterColor,
+    MonochromeMixerTint,
     ColorOverlayStart,
     ColorOverlayEnd,
     NeonGlowSource,
@@ -1179,6 +1181,7 @@ impl RgbPickTarget {
             Self::FrameColor => "フレームの色",
             Self::FrameLineColor => "フレームの内側ライン色",
             Self::PhotoFilterColor => "フォトフィルターのカスタム色",
+            Self::MonochromeMixerTint => "モノクロミキサーの色調",
             Self::ColorOverlayStart => "塗り/グラデーションの開始色",
             Self::ColorOverlayEnd => "塗り/グラデーションの終了色",
             Self::NeonGlowSource => "ネオングローの発光源色",
@@ -1222,6 +1225,7 @@ impl EffectKind {
             LocalEffect::SelectiveColor(_) => Self::SelectiveColor,
             LocalEffect::PartColor(_) => Self::PartColor,
             LocalEffect::ChannelMixer(_) => Self::ChannelMixer,
+            LocalEffect::MonochromeMixer(_) => Self::MonochromeMixer,
             LocalEffect::Clarity(_) => Self::Clarity,
             LocalEffect::Texture(_) => Self::Texture,
             LocalEffect::HighPass(_) => Self::HighPass,
@@ -1331,6 +1335,7 @@ impl EffectKind {
             Self::SelectiveColor => "セレクティブカラー",
             Self::PartColor => "パートカラー",
             Self::ChannelMixer => "チャンネルミキサー",
+            Self::MonochromeMixer => "モノクロミキサー",
             Self::Clarity => "明瞭度",
             Self::Texture => "テクスチャ",
             Self::HighPass => "ハイパス",
@@ -1436,6 +1441,7 @@ impl EffectKind {
             Self::AnamorphicFlare => "アナモルフフレア",
             Self::BokehSprite => "玉ボケ粒子",
             Self::PhotoFilter => "フォトフィルタ",
+            Self::MonochromeMixer => "白黒ミキサー",
             Self::LensDirt => "レンズ汚れ",
             Self::FrequencySeparation => "周波数分離",
             Self::RetroPalette => "レトロ減色",
@@ -1467,6 +1473,9 @@ impl EffectKind {
                 "指定した色だけを残し、それ以外をグレー寄りにして主役の色を強調します。"
             }
             Self::ChannelMixer => "RGBチャンネルの寄与率を変え、色変換や本格的な白黒化を行います。",
+            Self::MonochromeMixer => {
+                "赤・黄・緑・シアン・青・マゼンタごとに白黒変換の明るさを調整し、セピアなどの色調も足せます。"
+            }
             Self::Clarity => "局所コントラストを上げ、輪郭や質感をくっきり見せます。",
             Self::Texture => {
                 "中くらいの細かさの質感だけを強めたり弱めたりします。肌や塗り面のざらつき調整に使います。"
@@ -1730,6 +1739,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::SelectiveColor,
             EffectKind::PartColor,
             EffectKind::ChannelMixer,
+            EffectKind::MonochromeMixer,
             EffectKind::Hsl,
             EffectKind::ColorMixer,
             EffectKind::HighlightsShadows,
@@ -9036,6 +9046,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 "チャンネルミキサー".to_string()
             }
         }
+        LocalEffect::MonochromeMixer(params) => {
+            format!("白黒ミキサー {:.0}%", params.strength * 100.0)
+        }
         LocalEffect::PhotoFilter(params) => format!(
             "フォトフィルター {} {:.0}%",
             photo_filter_preset_label(params.preset),
@@ -9751,6 +9764,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
         (LocalEffect::PhotoFilter(params), RgbPickTarget::PhotoFilterColor) => {
             params.color_rgb = rgb;
             params.preset = PhotoFilterPreset::Custom;
+            true
+        }
+        (LocalEffect::MonochromeMixer(params), RgbPickTarget::MonochromeMixerTint) => {
+            params.tint_rgb = rgb;
             true
         }
         (LocalEffect::ColorOverlay(params), RgbPickTarget::ColorOverlayStart) => {
@@ -11087,6 +11104,141 @@ fn draw_effect_params(
                     changed |= draw_channel_coeff_sliders(ui, &mut params.blue_output);
                 });
             }
+        }
+        LocalEffect::MonochromeMixer(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "標準白黒") {
+                    *params = MonochromeMixerParams {
+                        strength: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "赤フィルター") {
+                    *params = MonochromeMixerParams {
+                        red: 65.0,
+                        yellow: 28.0,
+                        cyan: -18.0,
+                        blue: -70.0,
+                        contrast: 10.0,
+                        strength: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "緑フィルター") {
+                    *params = MonochromeMixerParams {
+                        red: -12.0,
+                        green: 58.0,
+                        cyan: 18.0,
+                        magenta: -28.0,
+                        contrast: 8.0,
+                        strength: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "青空濃く") {
+                    *params = MonochromeMixerParams {
+                        red: 24.0,
+                        yellow: 22.0,
+                        cyan: -25.0,
+                        blue: -58.0,
+                        contrast: 16.0,
+                        strength: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "セピア") {
+                    *params = MonochromeMixerParams {
+                        red: 12.0,
+                        yellow: 8.0,
+                        blue: -16.0,
+                        tint_rgb: [196, 132, 68],
+                        tint_strength: 0.42,
+                        contrast: 6.0,
+                        strength: 1.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "色ごとの明度を調整して白黒化します。赤フィルターは肌や赤を明るく、青空を暗くするような使い方に向いています。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let mut activates_effect = false;
+            let red = ui.add(egui::Slider::new(&mut params.red, -100.0..=100.0).text("赤の明るさ"));
+            changed |= red.changed();
+            activates_effect |= red.changed();
+            red.lab_hover_tip("赤系の色を白黒変換したときの明るさです。");
+            let yellow =
+                ui.add(egui::Slider::new(&mut params.yellow, -100.0..=100.0).text("黄の明るさ"));
+            changed |= yellow.changed();
+            activates_effect |= yellow.changed();
+            yellow.lab_hover_tip("黄系の色を白黒変換したときの明るさです。");
+            let green =
+                ui.add(egui::Slider::new(&mut params.green, -100.0..=100.0).text("緑の明るさ"));
+            changed |= green.changed();
+            activates_effect |= green.changed();
+            green.lab_hover_tip("緑系の色を白黒変換したときの明るさです。");
+            let cyan =
+                ui.add(egui::Slider::new(&mut params.cyan, -100.0..=100.0).text("シアンの明るさ"));
+            changed |= cyan.changed();
+            activates_effect |= cyan.changed();
+            cyan.lab_hover_tip("シアン系の色を白黒変換したときの明るさです。");
+            let blue =
+                ui.add(egui::Slider::new(&mut params.blue, -100.0..=100.0).text("青の明るさ"));
+            changed |= blue.changed();
+            activates_effect |= blue.changed();
+            blue.lab_hover_tip("青系の色を白黒変換したときの明るさです。");
+            let magenta = ui.add(
+                egui::Slider::new(&mut params.magenta, -100.0..=100.0).text("マゼンタの明るさ"),
+            );
+            changed |= magenta.changed();
+            activates_effect |= magenta.changed();
+            magenta.lab_hover_tip("マゼンタ系の色を白黒変換したときの明るさです。");
+            let contrast = ui
+                .add(egui::Slider::new(&mut params.contrast, -100.0..=100.0).text("コントラスト"));
+            changed |= contrast.changed();
+            activates_effect |= contrast.changed();
+            contrast.lab_hover_tip("白黒化した明暗のコントラストを調整します。");
+            let tint =
+                ui.add(egui::Slider::new(&mut params.tint_strength, 0.0..=1.0).text("色調を足す"));
+            changed |= tint.changed();
+            activates_effect |= tint.changed();
+            tint.lab_hover_tip("白黒画像へセピアなどの色味を加える量です。");
+            let tint_response = draw_rgb_color_control(
+                ui,
+                "色調",
+                &mut params.tint_rgb,
+                RgbPickTarget::MonochromeMixerTint,
+                rgb_pick_active,
+            );
+            if tint_response.changed {
+                activates_effect = true;
+                if params.tint_strength <= f32::EPSILON {
+                    params.tint_strength = 0.35;
+                }
+            }
+            merge_rgb_color_response(
+                tint_response,
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            if activates_effect && params.strength <= f32::EPSILON {
+                params.strength = 1.0;
+                changed = true;
+            }
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からモノクロミキサー結果へ切り替える強さです。");
         }
         LocalEffect::Clarity(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -20805,6 +20957,9 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::SelectiveColor => LocalEffect::SelectiveColor(SelectiveColorParams::default()),
         EffectKind::PartColor => LocalEffect::PartColor(PartColorParams::default()),
         EffectKind::ChannelMixer => LocalEffect::ChannelMixer(ChannelMixerParams::default()),
+        EffectKind::MonochromeMixer => {
+            LocalEffect::MonochromeMixer(MonochromeMixerParams::default())
+        }
         EffectKind::Clarity => LocalEffect::Clarity(ClarityParams::default()),
         EffectKind::Texture => LocalEffect::Texture(TextureParams::default()),
         EffectKind::HighPass => LocalEffect::HighPass(HighPassParams::default()),
@@ -23348,6 +23503,7 @@ mod tests {
             EffectKind::SelectiveColor,
             EffectKind::PartColor,
             EffectKind::ChannelMixer,
+            EffectKind::MonochromeMixer,
             EffectKind::Clarity,
             EffectKind::Texture,
             EffectKind::HighPass,
@@ -23463,11 +23619,13 @@ mod tests {
             EffectKind::AnamorphicFlare.picker_label(),
             "アナモルフフレア"
         );
+        assert_eq!(EffectKind::MonochromeMixer.picker_label(), "白黒ミキサー");
         for kind in [
             EffectKind::ThreeWayColorGrading,
             EffectKind::HighlightsShadows,
             EffectKind::Equalize,
             EffectKind::AnamorphicFlare,
+            EffectKind::MonochromeMixer,
         ] {
             assert!(kind.picker_label().chars().count() <= 10);
         }
@@ -23699,6 +23857,17 @@ mod tests {
         };
         assert_eq!(photo_filter_params.color_rgb, [180, 120, 40]);
         assert_eq!(photo_filter_params.preset, PhotoFilterPreset::Custom);
+
+        let mut monochrome_mixer = LocalEffect::MonochromeMixer(MonochromeMixerParams::default());
+        assert!(set_rgb_pick_target(
+            &mut monochrome_mixer,
+            RgbPickTarget::MonochromeMixerTint,
+            [190, 145, 90],
+        ));
+        let LocalEffect::MonochromeMixer(monochrome_mixer_params) = monochrome_mixer else {
+            panic!("expected monochrome mixer effect");
+        };
+        assert_eq!(monochrome_mixer_params.tint_rgb, [190, 145, 90]);
 
         let mut overlay = LocalEffect::ColorOverlay(ColorOverlayParams::default());
         assert!(set_rgb_pick_target(
