@@ -3108,6 +3108,14 @@ pub struct App {
     pub(crate) export_crop_create_drag: Option<ExportCropCreateDrag>,
     /// 補正レイヤーパネルで選択中のレイヤー index。ページごとに保持する。
     pub(crate) local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
+    /// 補正レイヤー追加時のマスク種類選択ダイアログ。
+    pub(crate) local_adjust_add_layer_dialog_open: bool,
+    /// 選択中補正レイヤーのマスク種類変更ダイアログ。
+    pub(crate) local_adjust_change_mask_dialog_open: bool,
+    /// マスク種類変更時に追加/削除マスクを維持するか。
+    pub(crate) local_adjust_change_mask_keep_manual_override: bool,
+    /// 選択中補正レイヤーの効果選択ダイアログ。
+    pub(crate) local_adjust_effect_picker_dialog_open: bool,
     /// 補正レイヤー効果追加ピッカーの検索語。
     pub(crate) local_adjust_effect_query: String,
     /// 補正レイヤー効果パラメータのコピー/ペースト用クリップボード。
@@ -4384,6 +4392,10 @@ impl App {
             export_crop_drag: None,
             export_crop_create_drag: None,
             local_adjust_selected_layers: std::collections::HashMap::new(),
+            local_adjust_add_layer_dialog_open: false,
+            local_adjust_change_mask_dialog_open: false,
+            local_adjust_change_mask_keep_manual_override: true,
+            local_adjust_effect_picker_dialog_open: false,
             local_adjust_effect_query: String::new(),
             local_adjust_effect_clipboard: None,
             local_adjust_rgb_pick_active: None,
@@ -5376,6 +5388,9 @@ impl App {
             || self.slot_save_dialog.is_some()
             || self.export_dialog.is_some()
             || self.export_pending.is_some()
+            || self.local_adjust_add_layer_dialog_open
+            || self.local_adjust_change_mask_dialog_open
+            || self.local_adjust_effect_picker_dialog_open
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
     }
@@ -5400,6 +5415,9 @@ impl App {
             || self.slot_save_dialog.is_some()
             || self.export_dialog.is_some()
             || self.export_pending.is_some()
+            || self.local_adjust_add_layer_dialog_open
+            || self.local_adjust_change_mask_dialog_open
+            || self.local_adjust_effect_picker_dialog_open
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
     }
@@ -8442,6 +8460,10 @@ impl App {
         self.export_crop_page_settings.clear();
         self.export_crop_pages.clear();
         self.local_adjust_selected_layers.clear();
+        self.local_adjust_add_layer_dialog_open = false;
+        self.local_adjust_change_mask_dialog_open = false;
+        self.local_adjust_change_mask_keep_manual_override = true;
+        self.local_adjust_effect_picker_dialog_open = false;
         self.local_adjust_effect_query.clear();
         self.local_adjust_effect_clipboard = None;
         self.local_adjust_rgb_pick_active = None;
@@ -16892,6 +16914,10 @@ impl App {
         self.reset_erase_mode();
         self.reset_conceal_mode();
         self.local_adjust_mode = false;
+        self.local_adjust_add_layer_dialog_open = false;
+        self.local_adjust_change_mask_dialog_open = false;
+        self.local_adjust_change_mask_keep_manual_override = true;
+        self.local_adjust_effect_picker_dialog_open = false;
         self.export_crop_mode = false;
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
@@ -21074,6 +21100,10 @@ impl App {
         self.slideshow_playing = false;
         self.adjustment_mode = false;
         self.local_adjust_mode = false;
+        self.local_adjust_add_layer_dialog_open = false;
+        self.local_adjust_change_mask_dialog_open = false;
+        self.local_adjust_change_mask_keep_manual_override = true;
+        self.local_adjust_effect_picker_dialog_open = false;
         self.export_crop_mode = false;
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;

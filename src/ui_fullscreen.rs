@@ -3130,6 +3130,9 @@ impl App {
         if self.local_adjust_mode {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                 self.local_adjust_mode = false;
+                self.local_adjust_add_layer_dialog_open = false;
+                self.local_adjust_change_mask_dialog_open = false;
+                self.local_adjust_effect_picker_dialog_open = false;
             }
             return action;
         }
@@ -3692,6 +3695,9 @@ impl App {
                 // 補正パネルと排他
                 self.adjustment_mode = false;
                 self.local_adjust_mode = false;
+                self.local_adjust_add_layer_dialog_open = false;
+                self.local_adjust_change_mask_dialog_open = false;
+                self.local_adjust_effect_picker_dialog_open = false;
             }
         }
         if self.analysis_mode && !is_spread_double {
@@ -4076,7 +4082,8 @@ impl App {
                         let in_erase_panel =
                             self.erase_mode && self.erase_panel_rect(full_rect).contains(p);
                         let in_local_adjust_panel = self.local_adjust_mode
-                            && self.local_adjust_panel_rect(full_rect).contains(p);
+                            && (self.local_adjust_panel_rect(full_rect).contains(p)
+                                || self.local_adjust_tool_panel_rect(full_rect).contains(p));
                         let in_conceal_panel =
                             self.conceal_mode && self.conceal_panel_rect(full_rect).contains(p);
                         let in_export_crop_panel = self.export_crop_mode

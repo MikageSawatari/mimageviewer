@@ -198,10 +198,6 @@ impl EffectKind {
             _ => self.label(),
         }
     }
-
-    pub(crate) fn layer(self) -> LocalAdjustmentLayer {
-        LocalAdjustmentLayer::new(self.label(), LocalMask::Full, self.default_effect())
-    }
 }
 
 pub(crate) struct EffectGroup {
