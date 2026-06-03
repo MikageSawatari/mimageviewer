@@ -5054,10 +5054,15 @@ impl LocalAdjustLabApp {
             } else {
                 self.draw_effect_gradient_handles(ui, rect)
             };
+        let selected_effect_has_position_handles = self
+            .layers
+            .get(self.selected_layer)
+            .is_some_and(|layer| effect_has_position_handles(&layer.effect));
         let effect_position_handle_used = if pan_mode
             || !adjust_panel_active
             || dialog_open
             || !self.effect_position_handles_visible
+            || !selected_effect_has_position_handles
             || self.selective_color_pick_active
             || self.rgb_pick_active.is_some()
         {
@@ -10153,6 +10158,31 @@ fn draw_effect_center_controls(
     changed
 }
 
+macro_rules! tone_detail_effect_patterns {
+    () => {
+        LocalEffect::Tone(_)
+            | LocalEffect::ToneCurve(_)
+            | LocalEffect::RgbToneCurve(_)
+            | LocalEffect::ColorBalance(_)
+            | LocalEffect::PhotoFilter(_)
+            | LocalEffect::ThreeWayColorGrading(_)
+            | LocalEffect::SelectiveColor(_)
+            | LocalEffect::PartColor(_)
+            | LocalEffect::ChannelMixer(_)
+            | LocalEffect::MonochromeMixer(_)
+            | LocalEffect::Clarity(_)
+            | LocalEffect::Texture(_)
+            | LocalEffect::HighPass(_)
+            | LocalEffect::FrequencySeparation(_)
+            | LocalEffect::HighlightsShadows(_)
+            | LocalEffect::Dehaze(_)
+    };
+}
+
+fn is_tone_detail_effect(effect: &LocalEffect) -> bool {
+    matches!(effect, tone_detail_effect_patterns!())
+}
+
 fn draw_tone_detail_effect_params(
     ui: &mut egui::Ui,
     effect: &mut LocalEffect,
@@ -11534,7 +11564,12 @@ fn draw_tone_detail_effect_params(
                 .add(egui::Slider::new(&mut params.saturation, -50.0..=50.0).text("彩度補正"))
                 .changed();
         }
-        _ => unreachable!("tone/detail effect dispatch is exhaustive"),
+        _ => {
+            debug_assert!(
+                !is_tone_detail_effect(effect),
+                "tone/detail effect dispatch is out of sync"
+            );
+        }
     }
 
     EffectParamResponse {
@@ -11600,22 +11635,7 @@ fn draw_effect_params(
         LocalEffect::None => {
             ui.label("加工内容を選ぶと、このレイヤーの効果が有効になります。");
         }
-        LocalEffect::Tone(_)
-        | LocalEffect::ToneCurve(_)
-        | LocalEffect::RgbToneCurve(_)
-        | LocalEffect::ColorBalance(_)
-        | LocalEffect::PhotoFilter(_)
-        | LocalEffect::ThreeWayColorGrading(_)
-        | LocalEffect::SelectiveColor(_)
-        | LocalEffect::PartColor(_)
-        | LocalEffect::ChannelMixer(_)
-        | LocalEffect::MonochromeMixer(_)
-        | LocalEffect::Clarity(_)
-        | LocalEffect::Texture(_)
-        | LocalEffect::HighPass(_)
-        | LocalEffect::FrequencySeparation(_)
-        | LocalEffect::HighlightsShadows(_)
-        | LocalEffect::Dehaze(_) => {
+        tone_detail_effect_patterns!() => {
             let tone_detail_response = draw_tone_detail_effect_params(
                 ui,
                 &mut layer.effect,
