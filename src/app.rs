@@ -2972,6 +2972,10 @@ pub struct App {
     /// 現フォルダで補正レイヤーを持つページの item_idx 集合 (サムネイルバッジ用)。
     /// サムネイルには補正レイヤー結果自体を反映しない。
     pub(crate) local_adjust_pages: std::collections::HashSet<usize>,
+    /// 補正レイヤーパネルで選択中のレイヤー index。ページごとに保持する。
+    pub(crate) local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
+    /// 補正レイヤー効果追加ピッカーの検索語。
+    pub(crate) local_adjust_effect_query: String,
     /// 補正レイヤー自身の世代番号。レイヤー追加 / 削除 / パラメータ変更で idx 単位に +1 する。
     pub(crate) local_adjust_generation: std::collections::HashMap<usize, u64>,
     /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
@@ -4172,6 +4176,8 @@ impl App {
             adjustment_favorite_params: std::collections::HashMap::new(),
             local_adjust_page_layers: std::collections::HashMap::new(),
             local_adjust_pages: std::collections::HashSet::new(),
+            local_adjust_selected_layers: std::collections::HashMap::new(),
+            local_adjust_effect_query: String::new(),
             local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
@@ -8193,6 +8199,8 @@ impl App {
         self.local_adjust_mode = false;
         self.local_adjust_page_layers.clear();
         self.local_adjust_pages.clear();
+        self.local_adjust_selected_layers.clear();
+        self.local_adjust_effect_query.clear();
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
         self.cancel_all_local_adjust_pending();
@@ -17726,7 +17734,15 @@ impl App {
         if layers.is_empty() {
             self.local_adjust_page_layers.remove(&idx);
             self.local_adjust_pages.remove(&idx);
+            self.local_adjust_selected_layers.remove(&idx);
         } else {
+            let selected = self
+                .local_adjust_selected_layers
+                .get(&idx)
+                .copied()
+                .unwrap_or(0)
+                .min(layers.len().saturating_sub(1));
+            self.local_adjust_selected_layers.insert(idx, selected);
             self.local_adjust_page_layers.insert(idx, layers);
             self.local_adjust_pages.insert(idx);
         }

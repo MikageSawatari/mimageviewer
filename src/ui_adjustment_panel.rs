@@ -16,6 +16,9 @@ use eframe::egui;
 
 use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
 use crate::app::{AdjustSpreadTarget, App};
+use crate::local_adjust_catalog::{
+    EFFECT_GROUPS, EffectKind, effect_picker_button_width, effect_picker_matches_query,
+};
 use crate::ui_fullscreen::SpreadPair;
 
 const HEADER_H: f32 = 36.0;
@@ -150,12 +153,22 @@ fn draw_local_adjust_section(
     ui: &mut egui::Ui,
     content_width: f32,
     layers: &[local_adjust_core::LocalAdjustmentLayer],
-    add_effect: &mut Option<QuickLocalAdjustEffect>,
+    selected_layer: usize,
+    effect_query: &mut String,
+    add_quick_effect: &mut Option<QuickLocalAdjustEffect>,
+    add_effect: &mut Option<EffectKind>,
+    select_layer: &mut Option<usize>,
     set_enabled: &mut Option<(usize, bool)>,
+    update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
     delete_layer: &mut Option<usize>,
     clear_layers: &mut bool,
 ) {
     ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("よく使う")
+            .size(SECTION_FONT)
+            .color(LABEL_COLOR),
+    );
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for effect in QuickLocalAdjustEffect::ALL {
@@ -164,11 +177,82 @@ fn draw_local_adjust_section(
                 .on_hover_text("画像全体に適用する補正レイヤーを追加")
                 .clicked()
             {
-                *add_effect = Some(effect);
+                *add_quick_effect = Some(effect);
             }
         }
     });
+    ui.add_space(8.0);
+
+    ui.label(
+        egui::RichText::new("効果を追加")
+            .size(SECTION_FONT)
+            .color(LABEL_COLOR),
+    );
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2((content_width - 34.0).max(80.0), 22.0),
+            egui::TextEdit::singleline(effect_query)
+                .hint_text("効果名で検索")
+                .desired_width(f32::INFINITY),
+        );
+        if ui
+            .add_enabled(!effect_query.is_empty(), egui::Button::new("×"))
+            .on_hover_text("検索をクリア")
+            .clicked()
+        {
+            effect_query.clear();
+        }
+    });
+    let button_width = effect_picker_button_width(content_width);
+    let query = effect_query.trim();
+    let mut any_effect = false;
+    for group in EFFECT_GROUPS {
+        let matched: Vec<EffectKind> = group
+            .kinds
+            .iter()
+            .copied()
+            .filter(|kind| effect_picker_matches_query(*kind, query))
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        any_effect = true;
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(group.title)
+                .size(11.0)
+                .color(egui::Color32::from_gray(170)),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            for kind in matched {
+                let resp = ui.add_sized(
+                    egui::vec2(button_width, 22.0),
+                    egui::Button::new(egui::RichText::new(kind.picker_label()).size(11.0)),
+                );
+                let resp = resp.on_hover_text(kind.description());
+                if resp.clicked() {
+                    *add_effect = Some(kind);
+                }
+            }
+        });
+    }
+    if !any_effect {
+        ui.label(
+            egui::RichText::new("該当する効果がありません")
+                .size(11.0)
+                .color(egui::Color32::from_gray(160)),
+        );
+    }
+
+    ui.add_space(8.0);
+    ui.separator();
     ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("レイヤー")
+            .size(SECTION_FONT)
+            .color(LABEL_COLOR),
+    );
 
     if layers.is_empty() {
         ui.label(
@@ -190,12 +274,16 @@ fn draw_local_adjust_section(
             let label = format!("{}: {}", layer_idx + 1, name);
             let label_resp = ui.add_sized(
                 egui::vec2((content_width - 68.0).max(80.0), 18.0),
-                egui::Label::new(
+                egui::Button::selectable(
+                    layer_idx == selected_layer,
                     egui::RichText::new(label)
                         .size(11.0)
                         .color(egui::Color32::from_gray(220)),
                 ),
             );
+            if label_resp.clicked() {
+                *select_layer = Some(layer_idx);
+            }
             label_resp.on_hover_text(format!(
                 "{} / opacity {:.0}%",
                 layer.effect.display_label(),
@@ -207,6 +295,19 @@ fn draw_local_adjust_section(
         });
     }
 
+    if let Some(layer) = layers.get(selected_layer) {
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+        draw_selected_local_adjust_layer_editor(
+            ui,
+            content_width,
+            selected_layer,
+            layer,
+            update_layer,
+        );
+    }
+
     if ui
         .add(
             egui::Button::new("補正レイヤーをすべて削除").min_size(egui::vec2(content_width, 22.0)),
@@ -216,6 +317,129 @@ fn draw_local_adjust_section(
     {
         *clear_layers = true;
     }
+}
+
+fn draw_selected_local_adjust_layer_editor(
+    ui: &mut egui::Ui,
+    content_width: f32,
+    layer_idx: usize,
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+    update_layer: &mut Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
+) {
+    let mut edited = layer.clone();
+    let mut changed = false;
+    ui.label(
+        egui::RichText::new(format!("選択中: {}", edited.name))
+            .size(SECTION_FONT)
+            .color(LABEL_COLOR),
+    );
+    changed |= ui
+        .add(
+            egui::Slider::new(&mut edited.opacity, 0.0..=1.0)
+                .text("不透明度")
+                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+        )
+        .changed();
+    let effect_kind = EffectKind::from_effect(&edited.effect);
+    ui.label(
+        egui::RichText::new(effect_kind.label())
+            .size(11.0)
+            .color(egui::Color32::from_gray(180)),
+    );
+    changed |= draw_local_effect_minimal_params(ui, content_width, &mut edited.effect);
+    if changed {
+        *update_layer = Some((layer_idx, edited));
+    }
+}
+
+fn local_param_slider(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    label: &'static str,
+) -> bool {
+    ui.add(egui::Slider::new(value, range).text(label))
+        .changed()
+}
+
+fn draw_local_effect_minimal_params(
+    ui: &mut egui::Ui,
+    _content_width: f32,
+    effect: &mut local_adjust_core::LocalEffect,
+) -> bool {
+    use local_adjust_core::LocalEffect;
+    let mut changed = false;
+    match effect {
+        LocalEffect::Tone(params) => {
+            changed |= local_param_slider(ui, &mut params.brightness, -100.0..=100.0, "明るさ");
+            changed |= local_param_slider(ui, &mut params.contrast, -100.0..=100.0, "コントラスト");
+            changed |= local_param_slider(ui, &mut params.gamma, 0.2..=5.0, "ガンマ");
+            changed |= local_param_slider(ui, &mut params.saturation, -100.0..=100.0, "彩度");
+            changed |= local_param_slider(ui, &mut params.vibrance, -100.0..=100.0, "自然な彩度");
+            changed |= local_param_slider(ui, &mut params.temperature, -100.0..=100.0, "色温度");
+            changed |= local_param_slider(ui, &mut params.tint, -100.0..=100.0, "色かぶり補正");
+        }
+        LocalEffect::PhotoFilter(params) => {
+            changed |= local_param_slider(ui, &mut params.density, 0.0..=1.0, "濃度");
+            changed |= local_param_slider(ui, &mut params.strength, 0.0..=1.0, "強さ");
+            changed |= ui
+                .checkbox(&mut params.preserve_luminosity, "輝度を保持")
+                .changed();
+        }
+        LocalEffect::MonochromeMixer(params) => {
+            changed |= local_param_slider(ui, &mut params.red, -100.0..=100.0, "赤");
+            changed |= local_param_slider(ui, &mut params.yellow, -100.0..=100.0, "黄");
+            changed |= local_param_slider(ui, &mut params.green, -100.0..=100.0, "緑");
+            changed |= local_param_slider(ui, &mut params.cyan, -100.0..=100.0, "シアン");
+            changed |= local_param_slider(ui, &mut params.blue, -100.0..=100.0, "青");
+            changed |= local_param_slider(ui, &mut params.magenta, -100.0..=100.0, "マゼンタ");
+            changed |= local_param_slider(ui, &mut params.contrast, -100.0..=100.0, "コントラスト");
+            changed |= local_param_slider(ui, &mut params.tint_strength, 0.0..=1.0, "色調");
+            changed |= local_param_slider(ui, &mut params.strength, 0.0..=1.0, "強さ");
+        }
+        LocalEffect::Blur(params) => {
+            changed |= local_param_slider(ui, &mut params.radius_px, 0.0..=80.0, "半径");
+        }
+        LocalEffect::Sharpen(params) => {
+            changed |= local_param_slider(ui, &mut params.amount, 0.0..=3.0, "量");
+            changed |= local_param_slider(ui, &mut params.radius_px, 0.2..=8.0, "半径");
+            changed |= local_param_slider(ui, &mut params.threshold, 0.0..=0.25, "しきい値");
+        }
+        LocalEffect::Vignette(params) => {
+            changed |= local_param_slider(ui, &mut params.strength, -1.0..=1.0, "強さ");
+            changed |= local_param_slider(ui, &mut params.radius, 0.05..=1.5, "半径");
+            changed |= local_param_slider(ui, &mut params.feather, 0.0..=1.0, "ぼかし");
+        }
+        LocalEffect::CrtDisplay(params) => {
+            changed |= local_param_slider(
+                ui,
+                &mut params.scanline_spacing_px,
+                1.0..=12.0,
+                "走査線間隔",
+            );
+            changed |= local_param_slider(ui, &mut params.scanline_depth, 0.0..=1.0, "走査線");
+            changed |= local_param_slider(ui, &mut params.mask_strength, 0.0..=1.0, "RGBマスク");
+            changed |= local_param_slider(ui, &mut params.curvature, 0.0..=0.3, "曲面");
+            changed |= local_param_slider(ui, &mut params.bloom, 0.0..=1.0, "グロー");
+            changed |= local_param_slider(ui, &mut params.horizontal_blur, 0.0..=2.0, "横ぼかし");
+            changed |= local_param_slider(ui, &mut params.brightness, 0.2..=2.5, "明るさ");
+            changed |= local_param_slider(ui, &mut params.strength, 0.0..=1.0, "強さ");
+        }
+        LocalEffect::Anaglyph3d(params) => {
+            changed |= local_param_slider(ui, &mut params.disparity_px, 0.0..=48.0, "ズレ");
+            changed |= local_param_slider(ui, &mut params.angle_degrees, -180.0..=180.0, "角度");
+            changed |= local_param_slider(ui, &mut params.luma_mix, 0.0..=1.0, "輝度ミックス");
+            changed |= local_param_slider(ui, &mut params.strength, 0.0..=1.0, "強さ");
+        }
+        _ => {
+            ui.label(
+                egui::RichText::new("この効果の詳細パラメータ UI は後続ステップで移植します。")
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(160)),
+            );
+        }
+    }
+    changed
 }
 
 fn draw_header_icon_button(
@@ -859,27 +1083,46 @@ impl App {
     fn apply_local_adjust_panel_actions(
         &mut self,
         fs_idx: usize,
-        add_effect: Option<QuickLocalAdjustEffect>,
+        add_quick_effect: Option<QuickLocalAdjustEffect>,
+        add_effect: Option<EffectKind>,
+        select_layer: Option<usize>,
         set_enabled: Option<(usize, bool)>,
+        update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)>,
         delete_layer: Option<usize>,
         clear_layers: bool,
     ) {
-        if let Some(effect) = add_effect {
-            let mut layers = self
-                .local_adjust_page_layers
-                .get(&fs_idx)
-                .cloned()
-                .unwrap_or_default();
+        if let Some(layer_idx) = select_layer {
+            if let Some(layers) = self.local_adjust_page_layers.get(&fs_idx)
+                && layer_idx < layers.len()
+            {
+                self.local_adjust_selected_layers.insert(fs_idx, layer_idx);
+            }
+        }
+
+        let mut layers = self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .cloned()
+            .unwrap_or_default();
+        let mut changed = false;
+        let mut selected_after: Option<usize> = None;
+
+        if let Some(effect) = add_quick_effect {
             layers.push(effect.layer());
-            self.set_local_adjust_layers_for_idx(fs_idx, layers);
+            selected_after = Some(layers.len().saturating_sub(1));
+            changed = true;
             self.show_feedback_toast(format!("補正レイヤーを追加: {}", effect.label()));
         }
+        if let Some(kind) = add_effect {
+            layers.push(kind.layer());
+            selected_after = Some(layers.len().saturating_sub(1));
+            changed = true;
+            self.show_feedback_toast(format!("補正レイヤーを追加: {}", kind.label()));
+        }
         if let Some((layer_idx, enabled)) = set_enabled {
-            if let Some(mut layers) = self.local_adjust_page_layers.get(&fs_idx).cloned()
-                && let Some(layer) = layers.get_mut(layer_idx)
-            {
+            if let Some(layer) = layers.get_mut(layer_idx) {
                 layer.enabled = enabled;
-                self.set_local_adjust_layers_for_idx(fs_idx, layers);
+                changed = true;
                 self.show_feedback_toast(if enabled {
                     "補正レイヤーを有効化".to_string()
                 } else {
@@ -887,17 +1130,37 @@ impl App {
                 });
             }
         }
+        if let Some((layer_idx, layer)) = update_layer
+            && layer_idx < layers.len()
+        {
+            layers[layer_idx] = layer;
+            selected_after = Some(layer_idx);
+            changed = true;
+        }
         if let Some(layer_idx) = delete_layer
-            && let Some(mut layers) = self.local_adjust_page_layers.get(&fs_idx).cloned()
             && layer_idx < layers.len()
         {
             layers.remove(layer_idx);
-            self.set_local_adjust_layers_for_idx(fs_idx, layers);
+            selected_after = Some(layer_idx.min(layers.len().saturating_sub(1)));
+            changed = true;
             self.show_feedback_toast("補正レイヤーを削除".to_string());
         }
         if clear_layers {
-            self.set_local_adjust_layers_for_idx(fs_idx, Vec::new());
+            layers.clear();
+            changed = true;
             self.show_feedback_toast("補正レイヤーをすべて削除".to_string());
+        }
+        if changed {
+            self.set_local_adjust_layers_for_idx(fs_idx, layers);
+            if let Some(selected) = selected_after {
+                if self
+                    .local_adjust_page_layers
+                    .get(&fs_idx)
+                    .is_some_and(|layers| selected < layers.len())
+                {
+                    self.local_adjust_selected_layers.insert(fs_idx, selected);
+                }
+            }
         }
     }
 
@@ -926,6 +1189,13 @@ impl App {
             .get(&fs_idx)
             .cloned()
             .unwrap_or_default();
+        let selected_layer = self
+            .local_adjust_selected_layers
+            .get(&fs_idx)
+            .copied()
+            .unwrap_or(0)
+            .min(layers.len().saturating_sub(1));
+        let mut effect_query = self.local_adjust_effect_query.clone();
 
         let panel_pos = egui::pos2(
             full_rect.min.x + LOCAL_ADJUST_PANEL_MARGIN_X,
@@ -938,8 +1208,11 @@ impl App {
         );
 
         let mut close_clicked = false;
-        let mut add_effect: Option<QuickLocalAdjustEffect> = None;
+        let mut add_quick_effect: Option<QuickLocalAdjustEffect> = None;
+        let mut add_effect: Option<EffectKind> = None;
+        let mut select_layer: Option<usize> = None;
         let mut set_enabled: Option<(usize, bool)> = None;
+        let mut update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)> = None;
         let mut delete_layer: Option<usize> = None;
         let mut clear_layers = false;
 
@@ -1058,8 +1331,13 @@ impl App {
                                             ui,
                                             LOCAL_ADJUST_PANEL_W,
                                             &layers,
+                                            selected_layer,
+                                            &mut effect_query,
+                                            &mut add_quick_effect,
                                             &mut add_effect,
+                                            &mut select_layer,
                                             &mut set_enabled,
+                                            &mut update_layer,
                                             &mut delete_layer,
                                             &mut clear_layers,
                                         );
@@ -1072,10 +1350,14 @@ impl App {
         if close_clicked {
             self.local_adjust_mode = false;
         }
+        self.local_adjust_effect_query = effect_query;
         self.apply_local_adjust_panel_actions(
             fs_idx,
+            add_quick_effect,
             add_effect,
+            select_layer,
             set_enabled,
+            update_layer,
             delete_layer,
             clear_layers,
         );
