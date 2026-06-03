@@ -434,6 +434,41 @@ mod local_adjust_segmentation_tests {
     }
 
     #[test]
+    fn subject_refinement_preset_values_match_lab() {
+        let cases = [
+            (
+                LocalAdjustSubjectRefinementPreset::Standard,
+                "標準",
+                0.52,
+                0,
+                1,
+            ),
+            (
+                LocalAdjustSubjectRefinementPreset::Firm,
+                "硬め",
+                0.58,
+                -1,
+                0,
+            ),
+            (
+                LocalAdjustSubjectRefinementPreset::Soft,
+                "柔らかめ",
+                0.45,
+                0,
+                2,
+            ),
+        ];
+        for (preset, label, threshold, expand_px, feather_px) in cases {
+            let refinement = preset.refinement();
+            assert_eq!(preset.label(), label);
+            assert!(refinement.enabled);
+            assert_eq!(refinement.threshold, threshold);
+            assert_eq!(refinement.expand_px, expand_px);
+            assert_eq!(refinement.feather_px, feather_px);
+        }
+    }
+
+    #[test]
     fn subject_refinement_binarizes_soft_alpha() {
         let mask = local_adjust_core::RasterMask {
             width: 4,
@@ -1984,6 +2019,48 @@ struct LocalAdjustSubjectMaskStats {
     soft_percent: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalAdjustSubjectRefinementPreset {
+    Standard,
+    Firm,
+    Soft,
+}
+
+impl LocalAdjustSubjectRefinementPreset {
+    const ALL: [Self; 3] = [Self::Standard, Self::Firm, Self::Soft];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "標準",
+            Self::Firm => "硬め",
+            Self::Soft => "柔らかめ",
+        }
+    }
+
+    fn refinement(self) -> local_adjust_core::SubjectMaskRefinement {
+        match self {
+            Self::Standard => local_adjust_core::SubjectMaskRefinement {
+                enabled: true,
+                threshold: 0.52,
+                expand_px: 0,
+                feather_px: 1,
+            },
+            Self::Firm => local_adjust_core::SubjectMaskRefinement {
+                enabled: true,
+                threshold: 0.58,
+                expand_px: -1,
+                feather_px: 0,
+            },
+            Self::Soft => local_adjust_core::SubjectMaskRefinement {
+                enabled: true,
+                threshold: 0.45,
+                expand_px: 0,
+                feather_px: 2,
+            },
+        }
+    }
+}
+
 fn local_adjust_subject_mask_stats(
     mask: &local_adjust_core::SubjectMask,
 ) -> LocalAdjustSubjectMaskStats {
@@ -2037,6 +2114,29 @@ fn local_adjust_subject_refined_alpha(
         alpha = local_adjust_box_blur_alpha(&alpha, mask.width, mask.height, feather_px.min(16));
     }
     alpha
+}
+
+fn apply_local_adjust_subject_refinement(
+    mask: &mut local_adjust_core::SubjectMask,
+    refinement: local_adjust_core::SubjectMaskRefinement,
+) {
+    if mask.source_alpha.is_none() {
+        mask.set_source_from_current();
+    }
+    let refinement = local_adjust_core::SubjectMaskRefinement {
+        enabled: true,
+        threshold: refinement.threshold,
+        expand_px: refinement.expand_px,
+        feather_px: refinement.feather_px.max(0),
+    };
+    let source = mask.source_raster_mask();
+    mask.alpha = local_adjust_subject_refined_alpha(
+        &source,
+        refinement.threshold,
+        refinement.expand_px,
+        refinement.feather_px as usize,
+    );
+    mask.refinement = refinement;
 }
 
 fn local_adjust_box_blur_alpha(
@@ -5410,29 +5510,21 @@ fn draw_local_mask_editor(
                     .color(egui::Color32::from_gray(190)),
             );
             let mut refinement_enabled = mask.refinement.enabled;
-            let enable_response = ui.checkbox(&mut refinement_enabled, "マスクを補正");
+            let enable_response = ui.checkbox(&mut refinement_enabled, "マスクを整形");
             if enable_response
                 .on_hover_text("ONにすると、生成直後の元マットから境界向けのマスクを再生成します。")
                 .changed()
             {
                 if refinement_enabled {
-                    if mask.source_alpha.is_none() {
-                        mask.set_source_from_current();
-                    }
-                    let refinement = local_adjust_core::SubjectMaskRefinement {
-                        enabled: true,
-                        threshold: mask.refinement.threshold,
-                        expand_px: mask.refinement.expand_px,
-                        feather_px: mask.refinement.feather_px.max(0),
-                    };
-                    let source = mask.source_raster_mask();
-                    mask.alpha = local_adjust_subject_refined_alpha(
-                        &source,
-                        refinement.threshold,
-                        refinement.expand_px,
-                        refinement.feather_px as usize,
+                    apply_local_adjust_subject_refinement(
+                        mask,
+                        local_adjust_core::SubjectMaskRefinement {
+                            enabled: true,
+                            threshold: mask.refinement.threshold,
+                            expand_px: mask.refinement.expand_px,
+                            feather_px: mask.refinement.feather_px.max(0),
+                        },
                     );
-                    mask.refinement = refinement;
                 } else {
                     let source = mask.source_alpha.as_ref().unwrap_or(&mask.alpha).clone();
                     mask.alpha = source;
@@ -5442,6 +5534,21 @@ fn draw_local_mask_editor(
             }
 
             let controls_enabled = mask.refinement.enabled;
+            let mut preset_refinement = None;
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for preset in LocalAdjustSubjectRefinementPreset::ALL {
+                        if ui.add(egui::Button::new(preset.label()).small()).clicked() {
+                            preset_refinement = Some(preset.refinement());
+                        }
+                    }
+                });
+            });
+            if let Some(refinement) = preset_refinement {
+                apply_local_adjust_subject_refinement(mask, refinement);
+                changed = true;
+            }
+
             let mut threshold = mask.refinement.threshold;
             let mut expand = mask.refinement.expand_px;
             let mut feather = mask.refinement.feather_px.max(0);
@@ -5470,29 +5577,21 @@ fn draw_local_mask_editor(
                     || expand_response.changed()
                     || feather_response.changed())
             {
-                if mask.source_alpha.is_none() {
-                    mask.set_source_from_current();
-                }
-                let refinement = local_adjust_core::SubjectMaskRefinement {
-                    enabled: true,
-                    threshold,
-                    expand_px: expand,
-                    feather_px: feather.max(0),
-                };
-                let source = mask.source_raster_mask();
-                mask.alpha = local_adjust_subject_refined_alpha(
-                    &source,
-                    refinement.threshold,
-                    refinement.expand_px,
-                    refinement.feather_px as usize,
+                apply_local_adjust_subject_refinement(
+                    mask,
+                    local_adjust_core::SubjectMaskRefinement {
+                        enabled: true,
+                        threshold,
+                        expand_px: expand,
+                        feather_px: feather.max(0),
+                    },
                 );
-                mask.refinement = refinement;
                 changed = true;
             }
 
             let stats = local_adjust_subject_mask_stats(mask);
             let mode_label = if mask.refinement.enabled {
-                "補正済み"
+                "整形済み"
             } else {
                 "元マット"
             };
