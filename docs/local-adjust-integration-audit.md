@@ -29,6 +29,180 @@
 > 注: 各項目内の「mIV 現状」は監査作成時点の記録として残している。項目冒頭に
 > 「2026-06-03 Codex 対応」がある場合は、その対応内容が最新状態。
 
+## 2026-06-03 第 2 ラウンド差分 (実機テストで発覚)
+
+第 1 ラウンド (P0/P1) の修正後、ユーザーが実機操作で新たに 7 件の差分を発見。
+これらは「コード構造を見て突き合わせる」だけでは見えにくい類のもので、
+**lab 単体と mIV を並べて同じ操作をする** ことで初めて表面化する。優先度は
+全部 **P0** (実機で目に見えるバグ)。
+
+| ID | 内容 | 種類 |
+|---|---|---|
+| **M-1** | 「全体」マスク選択時、レイヤープレビュー/マスクプレビューが自動非表示にならない | UX 欠落 |
+| **M-2** | 削除マスク / 追加マスクが**ベースマスクと同色**で描かれて見分けが付かない | ❌ ラボの edit_rgb 色未使用 |
+| **M-3** | Rect / Ellipse オブジェクトのハンドルがドラッグできない (lab 側にもあるバグ) | 🐛 ラボバグ → mIV で fix が必要 |
+| **M-4** | 線形/円形グラデーションを再ドラッグすると新規作成扱いになり、既存設定が消える | 🐛 lab の修正が未反映 |
+| **M-5** | 領域分割の領域カラーアニメーションが無い | ❌ animated_overlay_color 未移植 |
+| **M-6** | 補正レイヤー編集中も**隠蔽加工が適用された画像**が見えてしまう (素のソースが見えるべき) | 🐛 compose chain 順序 |
+| **M-7** | 被写体マスクの「マスクを整形」が「輪郭補正」になっていて、デフォルト ON / プリセット欠落 / disable されない | ⚠️ UX 違い + 致命的バグ |
+
+### M-1. 全体マスク時のプレビュー自動非表示 ❌
+
+- **症状**: マスク種類を「全体 (Full)」にすると、`show_mask` トグルや
+  レイヤーリストの mask thumbnail が表示する意味がなくなる (= 全 1.0 を塗るだけ)。
+  ラボでは Full 選択中はマスクプレビューを描画しない / レイヤーサムネを
+  「全体」表示に切り替える等のフォールバックがあった (要 lab コード再確認)。
+- **修正指示**:
+  1. `tools/local_adjust_lab/src/main.rs` の `mask_kind == MaskKind::Full` 周辺
+     (`lab:4724-4744, 5686, 8824-8826` 等) を読み、Full 時の表示動作を抜き出す。
+  2. mIV の `draw_local_adjust_mask_preview_overlay` (`panel:4505-`) と
+     `draw_local_layer_mask_thumbnail` (`panel:4350-`) に Full 専用分岐を追加。
+     - 全体マスクは「画像全体に効果を適用」というラベル表示のみ
+       (色プレビューは描かない、または極めて薄く描画)。
+  3. レイヤーリストの mask kind ラベル (`panel:4543` 周辺 `MaskKind::from_mask(...).label()`)
+     はそのままで OK。
+
+### M-2. 削除マスク / 追加マスクの色分け ❌ **致命的**
+
+- **症状**: ユーザー指摘「削除マスクが見えないのでうまく操作できません。マスクと
+  異なる色で削除マスク・追加マスクを表示する機能が抜け落ちているようです」。
+- **ラボの設計**: `LocalAdjustMaskPreviewColors` には `base_rgb` (ベースマスク用) と
+  `edit_rgb` (編集中の add/subtract マスク用) の **2 色** が定義されている
+  (`app:415-444`)。 ラボのマスク overlay 描画は editing override の場合に
+  `colors.edit(MASK_PREVIEW_EDIT_ALPHA)` で違う色を塗る (`lab:22286`)。
+- **mIV 現状**: `panel:4589-` の `local_adjust_mask_preview_alpha` は base/override
+  の alpha を **合算した単一の f32** を返している。色は `colors.base(a)` 一択
+  (`panel:4565`)。**override の色情報が失われている**。
+- **修正指示**:
+  1. `local_adjust_mask_preview_alpha` を **`(base_alpha, override_add_alpha,
+     override_subtract_alpha): (f32, f32, f32)` を返す関数** に変えるか、
+     enum で kind を返す:
+     ```rust
+     enum MaskPreviewPixel {
+         Base(f32),         // ベースマスクのみ
+         OverrideAdd(f32),  // 追加マスクで明るくなった部分
+         OverrideSubtract(f32), // 削除マスクで暗くなった部分
+         Mixed { base: f32, override_add: f32, override_subtract: f32 },
+     }
+     ```
+  2. 描画側 (`panel:4561-4566`) で kind に応じて
+     `colors.base()` / `colors.edit()` を使い分ける。
+     ラボの ALPHA 定数 (`MASK_PREVIEW_EDIT_ALPHA`) も移植。
+  3. **基準**: ユーザーが削除マスクを描いたとき、その範囲が**明確に違う色**
+     (ピンクではなく水色など、preset 依存) で表示されること。lab 単体で同じ操作を
+     してその色を目視確認 → mIV でも同じ色になるか確認。
+
+### M-3. Rect / Ellipse シェイプのハンドルドラッグ 🐛 **lab バグ → mIV で fix**
+
+- **症状**: 矩形 / 楕円オブジェクトを置いたあと、ハンドル (corner / radius) を
+  ドラッグしても動かない。**lab にも同じバグあり** とユーザーが報告。
+- **lab 既存実装**: `lab:848-` `ShapeHandle::{Body, LineStart, LineEnd, Corner, Radius}`
+  + `lab:20211-20283` の drag_apply。コードは揃っているが**ハンドル位置の
+  hit-test または描画が壊れている**。
+- **修正指示**:
+  1. **線形/円形グラデーションのハンドル経路を参考に** Rect/Ellipse の
+     hit-test を直す。線形/円形は今動いている (mIV F-1 で復元済み)。
+  2. mIV `panel:2937-3110` の `draw_local_adjust_shape_handles` と
+     `panel:3111-3311` の `apply_local_adjust_shape_drag` を確認:
+     - ハンドル位置の screen 座標と pointer position の **同じ座標空間** での
+       距離計算になっているか
+     - 14px 程度のヒット半径か (gradient と同程度)
+     - drag 中の座標変換が screen → norm → 図形パラメータ更新まで正しいか
+  3. lab 側は直さなくて OK (= mIV だけ直す。lab は捨て置く)。
+
+### M-4. グラデーション再ドラッグで既存設定が消えるバグ 🐛 **lab の fix が未反映**
+
+- **症状**: ユーザー指摘「ラボツールでは一度おいたら、明示的に消さない限り作り直され
+  ません。ドラッグしようとして場所がズレたときに前の設定が消えてしまうのは困るので
+  ラボツールでは修正したのですが、反映されていません」。
+- **lab 既存修正**: 一度 `mask.initialized = true` になったグラデーションは、空き領域を
+  ドラッグしても**新規作成されない**。既存ハンドルだけが移動対象。完全リセットは
+  「グラデーションをクリア」ボタンを明示的に押した場合のみ。
+- **mIV 現状**: `panel:6593-6612` の canvas input でグラデーション初期化済みでも
+  空き領域クリック → 新規作成パスに入る。要該当箇所の `mask.initialized` チェック追加。
+- **修正指示**:
+  1. mIV の canvas input でグラデーション作成のトリガーになっているコード
+     (`panel:6593-6612` 周辺) を確認。
+  2. `if let LocalMask::LinearGradient(mask) | LocalMask::RadialGradient(mask) = ...`
+     のドラッグ開始判定に `if !mask.initialized` ガードを追加。既に初期化済みなら
+     新規作成ではなく**ハンドルヒット判定 only** に絞る (= ヒットしなければ何もしない、
+     新規作成パスには絶対入らない)。
+  3. lab 側の該当修正コード位置を grep で特定して同じロジックを移植する
+     (`lab:6781-` の `handle_canvas_input` 内のグラデーション処理)。
+
+### M-5. 領域分割のカラーアニメーション ❌
+
+- **症状**: ユーザー指摘「領域分割の領域部分のカラーアニメーション機能が実装されていません」。
+- **ラボ**: `lab:283` `animated_overlay_color(ctx, alpha)` で時間ベースの色変化を計算。
+  これを `lab:5027 / 7360 / 7386 / 7391 / 7397 / 7433` で適用。領域マスクの境界が
+  動的に色変化することで「どこが選択候補か」が一目でわかる UX。
+- **mIV 現状**: `panel:4333` `local_adjust_region_boundary_color(label, time_sec)` で
+  partial 移植済み。**しかしユーザー報告ではアニメーションが見えていない**。
+  - 仮説 1: `time_sec` が固定値で渡っていてアニメーションが進まない。
+  - 仮説 2: 境界色は計算されるが境界判定 (`local_adjust_region_label_boundary`) が
+    効いていない / 描画頻度が低くて止まって見える。
+  - 仮説 3: 領域選択中の `request_repaint_after(100ms)` (`panel:7166`) が選択時のみで
+    領域候補表示時には呼ばれていない。
+- **修正指示**:
+  1. lab の `animated_overlay_color` 実装をそのまま移植
+     (`time_sec.sin()` などの式を確認)。
+  2. mIV の `local_adjust_region_boundary_color` をその式に置き換え。
+  3. 領域マスク表示中は常に `ctx.request_repaint_after(Duration::from_millis(50))`
+     を要求するように `draw_local_adjust_canvas_overlay` 側を修正。
+
+### M-6. 補正レイヤー編集中も隠蔽加工が見えてしまう 🐛 **compose chain 順序**
+
+- **症状**: ユーザー指摘「消しゴムツールでは、補正レイヤー・隠蔽加工が見えないように
+  なっていると思いますが、同様に補正レイヤー編集中は隠蔽加工の処理はみえないように
+  してください。今は隠蔽加工がされた状態の表示になっていると思います。」
+- **意図**: 補正レイヤー編集中は **「補正レイヤーが作用する素材 = 隠蔽加工する前」** を
+  画面に出すべき。隠蔽加工は補正レイヤーの出力に対して後段で適用するパイプライン
+  なので、編集中の表示も同じ前後関係に揃える。
+- **mIV 現状**: `ui_fullscreen.rs:1953` の compose 経路で local_adjust_mode 時の
+  入力テクスチャ取得は `resolve_local_adjust_source_texture` を経由するが、これが
+  conceal-applied texture を返している可能性が高い。素材 (= conceal 前) を返す
+  べき。
+- **修正指示**:
+  1. `App::resolve_local_adjust_source_texture` (位置は `src/app.rs` 内) を読み、
+     入力 chain の中で conceal-applied texture をスキップするように修正。
+  2. 参考: 消しゴムモード (`erase_mode`) は既に同じ理由で conceal をスキップして
+     いるはず (`src/ui_conceal.rs:72` 周辺の OR-of-modes 判定)。同じパターンで
+     `local_adjust_mode` も追加。
+  3. **動作確認**: 隠蔽加工が既に効いている画像を開く → 補正レイヤーモードに入る →
+     画面が**隠蔽前の元画像**に切り替わる → 補正レイヤーを追加してプレビュー → モード
+     退出で隠蔽加工が復活する。
+
+### M-7. 被写体マスクの「マスクを整形」UI 🐛 **致命的バグ + UX 欠落**
+
+- **症状**: ユーザー指摘「被写体マスクの輪郭補正が動いていません。デフォルトでは
+  補正無しで、スライダーは disabled になるはずですが、操作もできてしまいます。
+  ラボツールでは名称もマスクを補正ですし、プリセットの選択も消えています」。
+- **ラボ実装** (`lab:5923-5985`):
+  - ラベル: **「マスクを整形」** (mIV は「輪郭補正」)
+  - チェックボックスは UI 内で `refinement_controls_enabled` を切替、OFF 時は
+    sliders/preset を `add_enabled_ui(false, ...)` で disabled 化
+  - チェック ON 時に 3 プリセット (標準/硬め/柔らかめ) ボタンが操作可能
+  - デフォルト: `SubjectMaskRefinement::default().enabled = false` (mIV 側の core も
+    同じデフォルト @ `crates/local-adjust-core/src/lib.rs:208`)
+- **mIV 現状** (`panel:5042+`):
+  - ラベル: **「輪郭補正」** ← 名称違い
+  - チェックボックスはあるが、その後のスライダーは `add_enabled_ui` で囲んでいない
+    → **常に操作可能** (バグ)
+  - **プリセットボタン (標準/硬め/柔らかめ) が完全に欠落**
+- **修正指示**:
+  1. ラベルを **「マスクを整形」** に変更 (`panel:5042` の checkbox 第 2 引数)。
+  2. checkbox の後に続く threshold/expand/feather スライダーを
+     `ui.add_enabled_ui(mask.refinement.enabled, |ui| { ... })` で囲む。
+  3. ラボ `lab:5953-5982` の 3 プリセットボタン (標準/硬め/柔らかめ) を移植。
+     各プリセットの値もラボから byte 一致で持ってくる:
+     - 標準: threshold=0.52, expand=0, feather=1
+     - 硬め: threshold=0.58, expand=-1, feather=0
+     - 柔らかめ: threshold=0.45, expand=0, feather=2
+  4. プリセットボタンも `add_enabled_ui` の中に置く (= マスクを整形が ON のときだけ操作可能)。
+  5. `preset_button` ヘルパーが mIV 側に無ければ移植 (`lab:10001`)。
+
+---
+
 ## 進め方
 
 1. 機能カテゴリ A〜L の各項目について、**ラボ実装の位置** と **mIV 現状の位置 / 状態** を
