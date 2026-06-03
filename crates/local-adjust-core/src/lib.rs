@@ -610,6 +610,7 @@ pub enum LocalEffect {
     FilmGrain(FilmGrainParams),
     Noise(NoiseParams),
     ChromaticAberration(ChromaticAberrationParams),
+    Anaglyph3d(AnaglyphParams),
     Defringe(DefringeParams),
     ScanlineGlitch(ScanlineGlitchParams),
     Vhs(VhsParams),
@@ -720,6 +721,7 @@ impl LocalEffect {
             Self::FilmGrain(_) => "フィルム粒子",
             Self::Noise(_) => "ノイズ",
             Self::ChromaticAberration(_) => "色収差",
+            Self::Anaglyph3d(_) => "アナグリフ3D",
             Self::Defringe(_) => "色フチ除去",
             Self::ScanlineGlitch(_) => "走査線グリッチ",
             Self::Vhs(_) => "VHS/アナログビデオ",
@@ -3317,6 +3319,42 @@ impl Default for ChromaticAberrationParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnaglyphMode {
+    RedCyan,
+    GreenMagenta,
+    AmberBlue,
+    RgbSplit,
+}
+
+impl Default for AnaglyphMode {
+    fn default() -> Self {
+        Self::RedCyan
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AnaglyphParams {
+    pub mode: AnaglyphMode,
+    pub disparity_px: f32,
+    pub angle_degrees: f32,
+    pub luma_mix: f32,
+    pub strength: f32,
+}
+
+impl Default for AnaglyphParams {
+    fn default() -> Self {
+        Self {
+            mode: AnaglyphMode::RedCyan,
+            disparity_px: 6.0,
+            angle_degrees: 0.0,
+            luma_mix: 0.45,
+            strength: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DefringeParams {
     pub radius_px: f32,
@@ -4433,6 +4471,9 @@ where
                 image.height,
                 params.offset_px.clamp(0.0, 24.0),
             ),
+            LocalEffect::Anaglyph3d(params) => {
+                apply_anaglyph_3d(&image.pixels, image.width, image.height, *params)
+            }
             LocalEffect::Defringe(params) => {
                 apply_defringe(&image.pixels, image.width, image.height, *params)
             }
@@ -12081,6 +12122,99 @@ fn apply_chromatic_aberration(src: &[u8], width: usize, height: usize, offset_px
     out
 }
 
+fn apply_anaglyph_3d(src: &[u8], width: usize, height: usize, params: AnaglyphParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    let disparity = params.disparity_px.clamp(0.0, 96.0);
+    if strength <= f32::EPSILON || disparity <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let half_disparity = disparity * 0.5;
+    let angle = params.angle_degrees.to_radians();
+    let (sin, cos) = angle.sin_cos();
+    let dx = cos * half_disparity;
+    let dy = sin * half_disparity;
+    let luma_mix = params.luma_mix.clamp(0.0, 1.0);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if src[i + 3] == 0 {
+                continue;
+            }
+            let base = [
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            ];
+            let left = anaglyph_prepare_sample(
+                sample_rgb_bilinear_alpha_fallback(
+                    src,
+                    width,
+                    height,
+                    x as f32 - dx,
+                    y as f32 - dy,
+                    base,
+                ),
+                luma_mix,
+            );
+            let right = anaglyph_prepare_sample(
+                sample_rgb_bilinear_alpha_fallback(
+                    src,
+                    width,
+                    height,
+                    x as f32 + dx,
+                    y as f32 + dy,
+                    base,
+                ),
+                luma_mix,
+            );
+            let shifted = match params.mode {
+                AnaglyphMode::RedCyan => [left[0], right[1], right[2]],
+                AnaglyphMode::GreenMagenta => [right[0], left[1], right[2]],
+                AnaglyphMode::AmberBlue => [left[0], left[1] * 0.86 + right[1] * 0.14, right[2]],
+                AnaglyphMode::RgbSplit => [left[0], base[1], right[2]],
+            };
+            for c in 0..3 {
+                out[i + c] = to_u8(lerp_f32(base[c], shifted[c], strength));
+            }
+        }
+    }
+    out
+}
+
+fn anaglyph_prepare_sample(rgb: [f32; 3], luma_mix: f32) -> [f32; 3] {
+    if luma_mix <= f32::EPSILON {
+        return rgb;
+    }
+    let luma = luma01(rgb[0], rgb[1], rgb[2]);
+    [
+        lerp_f32(rgb[0], luma, luma_mix),
+        lerp_f32(rgb[1], luma, luma_mix),
+        lerp_f32(rgb[2], luma, luma_mix),
+    ]
+}
+
+fn sample_rgb_bilinear_alpha_fallback(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: f32,
+    y: f32,
+    fallback: [f32; 3],
+) -> [f32; 3] {
+    let (rgb, alpha) = sample_rgb_bilinear_alpha_aware(src, width, height, x, y);
+    if alpha <= f32::EPSILON {
+        fallback
+    } else {
+        [
+            lerp_f32(fallback[0], rgb[0], alpha.clamp(0.0, 1.0)),
+            lerp_f32(fallback[1], rgb[1], alpha.clamp(0.0, 1.0)),
+            lerp_f32(fallback[2], rgb[2], alpha.clamp(0.0, 1.0)),
+        ]
+    }
+}
+
 fn apply_defringe(src: &[u8], width: usize, height: usize, params: DefringeParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 1.0);
     let neutralize = params.neutralize.clamp(0.0, 1.0);
@@ -17319,6 +17453,7 @@ mod tests {
             LocalEffect::FilmGrain(FilmGrainParams::default()),
             LocalEffect::Noise(NoiseParams::default()),
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
+            LocalEffect::Anaglyph3d(AnaglyphParams::default()),
             LocalEffect::Defringe(DefringeParams::default()),
             LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
             LocalEffect::Vhs(VhsParams::default()),
@@ -18110,6 +18245,16 @@ mod tests {
             full(
                 "chromatic aberration max offset",
                 LocalEffect::ChromaticAberration(ChromaticAberrationParams { offset_px: 24.0 }),
+            ),
+            full(
+                "anaglyph max disparity",
+                LocalEffect::Anaglyph3d(AnaglyphParams {
+                    mode: AnaglyphMode::RedCyan,
+                    disparity_px: 96.0,
+                    angle_degrees: 180.0,
+                    luma_mix: 1.0,
+                    strength: 1.0,
+                }),
             ),
             full(
                 "defringe max radius",
@@ -20591,6 +20736,55 @@ LUT_3D_SIZE 2
         assert_eq!(out.pixels[3], 201);
         assert_eq!(out.pixels[7], 202);
         assert_eq!(out.pixels[11], 203);
+    }
+
+    #[test]
+    fn anaglyph_3d_splits_left_and_right_channels() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                0, 10, 200, 255, 50, 20, 150, 255, 100, 30, 100, 255, 150, 40, 50, 255, 200, 50, 0,
+                255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "anaglyph",
+            LocalMask::Full,
+            LocalEffect::Anaglyph3d(AnaglyphParams {
+                mode: AnaglyphMode::RedCyan,
+                disparity_px: 2.0,
+                angle_degrees: 0.0,
+                luma_mix: 0.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let center = &out.pixels[8..12];
+        assert_eq!(center, &[50, 40, 50, 255]);
+    }
+
+    #[test]
+    fn anaglyph_3d_preserves_transparent_hidden_rgb() {
+        let src = RgbaImageBuf::new(3, 1, vec![20, 40, 80, 255, 240, 10, 10, 0, 80, 40, 20, 255])
+            .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "anaglyph",
+            LocalMask::Full,
+            LocalEffect::Anaglyph3d(AnaglyphParams {
+                mode: AnaglyphMode::RgbSplit,
+                disparity_px: 2.0,
+                luma_mix: 0.0,
+                strength: 1.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[4..8], &[240, 10, 10, 0]);
+        assert!(out.pixels[0] < 80);
+        assert_eq!(out.pixels[3], 255);
+        assert_eq!(out.pixels[11], 255);
     }
 
     #[test]

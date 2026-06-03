@@ -66,14 +66,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、104種)
+### `LocalEffect` (部分補正レイヤー、105種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別), PhotoFilter(色付きフィルター),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), PartColor(指定色だけ残す白黒化), ChannelMixer(白黒/チャンネル混合),
 MonochromeMixer(6色帯白黒ミックス), Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定), RetroPalette(固定/適応パレット減色),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, FrequencySeparation, Dehaze, Blur(box), MotionBlur, Wind, SpeedLines, RadialFlash, TiltShift, LensBlur, BokehSprite, LensDirt, RadialBlur, WaveDistortion, HeatHaze, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, ArtisticMedia, BrushStroke, Cutout, ToonShade, Emboss, PixelStylize, Solarize, GlowingEdges, OilPaint, SoftFocus, Orton, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, ColorFill, Frame, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, LightLeak, BacklightHaze, CloudFog, WaterCaustics, ParticleOverlay, Aurora, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Defringe, ScanlineGlitch, Vhs, DataMosh, PixelSort, OldFilm, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Lithograph, Engraving, NewspaperPrint, Textureizer, StarGlow, DiffractionStarburst, EdgeSmooth, Despeckle, Median
+GradientMap, ColorFill, Frame, OutlineStroke, RimLight, ContactShadow, ColorTrace, ColorOverlay, NeonGlow, DiffuseGlow, Bloom, Halation, ColorDodgeGlow, GodRays, LensFlare, AnamorphicFlare, LightLeak, BacklightHaze, CloudFog, WaterCaustics, ParticleOverlay, Aurora, Spotlight, Vignette, FilmGrain, Noise, ChromaticAberration, Anaglyph3d, Defringe, ScanlineGlitch, Vhs, DataMosh, PixelSort, OldFilm, Halftone, ScreenTone, ColorHalftone, CmykPlateShift, Lithograph, Engraving, NewspaperPrint, Textureizer, StarGlow, DiffractionStarburst, EdgeSmooth, Despeckle, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -201,12 +201,13 @@ mIV は既に Subject(被写体分離) / Segmentation / LumaRange / ColorRange �
 
 TiltShift / NeonGlow のように「特定の見た目を狙い撃ちする」単機能エフェクト。
 §1〜8 の汎用カテゴリから漏れる、用途特化系をまとめる。
-(幾何/対称・アナグリフ3D は今回スコープ外として除外)
+(幾何/対称は今回スコープ外として除外)
 
 ### 9-A. デジタル / グリッチ系
-- [x] **グリッチ / RGBずれ・データモッシュ (`DataMosh`)** ★★ **中** — ブロックずれ、フリーズ、スメア、RGB分離、ノイズを組み合わせるデジタル破損演出。現 `ChromaticAberration` (均一色ずれ) とは別物。サイバーパンク/vaporwave
+- [x] **グリッチ / RGBずれ・データモッシュ (`DataMosh`)** ★★ **中** — ブロックずれ、フリーズ、スメア、RGB分離、ノイズを組み合わせるデジタル破損演出。`ChromaticAberration` / `Anaglyph3d` の単純な色ズレとは別物。サイバーパンク/vaporwave
 - [x] **ピクセルソート (`PixelSort`)** ★ **中** — 行/列の画素を指定した明るさ帯の連続区間ごとに輝度順でソートする独特のグリッチアート。方向、並び順、明るさ下限/上限、最大区間長、強度を調整できる
 - [x] **走査線グリッチ / ホログラム (`ScanlineGlitch`)** ★ **易〜中** — 横走査線、行ずれ、RGBずれ、破損行、ノイズ、seed、強度を調整できる UI/SF 演出
+- [x] **アナグリフ3D / RGB分離シフト (`Anaglyph3d`)** ★ **易** — 左右にずらした画像を赤シアン/緑マゼンタ/琥珀青/RGB分離へ割り当て、立体視風や均一方向の色ズレ演出を作る
 
 ### 9-B. アナログ実機 / レトロ系
 - [x] **VHS / アナログビデオ風 (`Vhs`)** ★★ **中** — 輝度を残して色成分を横ににじませ、色ずれ、横ゴースト、トラッキング帯、走査線、ノイズ、退色を調整できる。CRT (既存グローバル) とは別系統

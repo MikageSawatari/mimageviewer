@@ -15,38 +15,39 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
-    AnamorphicFlareParams, ArtisticMediaMode, ArtisticMediaParams, AuroraParams,
-    BacklightHazeParams, BloomParams, BlurParams, BokehSpriteParams, BokehSpriteShape,
-    BrushStrokeMode, BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams,
-    ClarityParams, CloudFogMode, CloudFogParams, CmykPlateShiftParams, ColorBalanceParams,
-    ColorBalanceRange, ColorDodgeGlowParams, ColorFillParams, ColorGradeWheel, ColorHalftoneParams,
-    ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams, ColorOverlayShape, ColorRangeMask,
-    ColorTraceParams, ContactShadowParams, CubeLutParams, CutoutParams, DataMoshParams,
-    DefringeParams, DehazeParams, DespeckleParams, DiffractionStarburstParams, DiffuseGlowParams,
-    DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams, EngravingParams, EqualizeParams,
-    FilmGrainParams, FrameMode, FrameParams, FrequencySeparationParams, GlassDisplacementMode,
-    GlassDisplacementParams, GlowingEdgesParams, GodRaysParams, GradientMapParams,
-    GradientMapPreset, HalationParams, HalftoneParams, HeatHazeParams, HighPassParams,
-    HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams,
-    LensCorrectionParams, LensDirtMode, LensDirtParams, LensFlareParams, LightLeakParams,
-    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LithographParams,
-    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
-    MaskShape, MedianParams, MonochromeMixerParams, MosaicBoundary, MosaicParams, MosaicTileMode,
-    MotionBlurParams, NeonGlowParams, NewspaperPrintParams, NoiseDistribution, NoiseParams,
-    OilPaintParams, OldFilmParams, OrtonParams, OutlineStrokeParams, OutlineStrokePlacement,
-    PartColorParams, ParticleOverlayMode, ParticleOverlayParams, PhotoFilterParams,
-    PhotoFilterPreset, PinchSpherizeParams, PixelSortDirection, PixelSortOrder, PixelSortParams,
-    PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
-    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialFlashParams, RadialGradientMask,
-    RangeMask, RasterMask, RasterVectorMask, RegionMask, RetroPaletteMode, RetroPaletteParams,
-    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams,
-    ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams,
-    SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams,
-    SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
-    TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
-    TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams,
-    VignetteParams, WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection,
-    WindParams, WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
+    AnaglyphMode, AnaglyphParams, AnamorphicFlareParams, ArtisticMediaMode, ArtisticMediaParams,
+    AuroraParams, BacklightHazeParams, BloomParams, BlurParams, BokehSpriteParams,
+    BokehSpriteShape, BrushStrokeMode, BrushStrokeParams, ChannelMixerParams,
+    ChromaticAberrationParams, ClarityParams, CloudFogMode, CloudFogParams, CmykPlateShiftParams,
+    ColorBalanceParams, ColorBalanceRange, ColorDodgeGlowParams, ColorFillParams, ColorGradeWheel,
+    ColorHalftoneParams, ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams,
+    ColorOverlayShape, ColorRangeMask, ColorTraceParams, ContactShadowParams, CubeLutParams,
+    CutoutParams, DataMoshParams, DefringeParams, DehazeParams, DespeckleParams,
+    DiffractionStarburstParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
+    EmbossParams, EngravingParams, EqualizeParams, FilmGrainParams, FrameMode, FrameParams,
+    FrequencySeparationParams, GlassDisplacementMode, GlassDisplacementParams, GlowingEdgesParams,
+    GodRaysParams, GradientMapParams, GradientMapPreset, HalationParams, HalftoneParams,
+    HeatHazeParams, HighPassParams, HighlightsShadowsParams, HslParams, InvertParams,
+    LensBlurAperture, LensBlurParams, LensCorrectionParams, LensDirtMode, LensDirtParams,
+    LensFlareParams, LightLeakParams, LineExtractMode, LineExtractParams, LineKind,
+    LinearGradientMask, LithographParams, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
+    LookPreset, ManualMaskOverride, MaskShape, MedianParams, MonochromeMixerParams, MosaicBoundary,
+    MosaicParams, MosaicTileMode, MotionBlurParams, NeonGlowParams, NewspaperPrintParams,
+    NoiseDistribution, NoiseParams, OilPaintParams, OldFilmParams, OrtonParams,
+    OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, ParticleOverlayMode,
+    ParticleOverlayParams, PhotoFilterParams, PhotoFilterPreset, PinchSpherizeParams,
+    PixelSortDirection, PixelSortOrder, PixelSortParams, PixelStylizeMode, PixelStylizeParams,
+    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
+    RadialBlurParams, RadialFlashParams, RadialGradientMask, RangeMask, RasterMask,
+    RasterVectorMask, RegionMask, RetroPaletteMode, RetroPaletteParams, RgbToneCurveParams,
+    RgbaImageBuf, RgbaImageRef, RimLightParams, ScanlineGlitchParams, ScreenToneMode,
+    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
+    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
+    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
+    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
+    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VhsParams, VignetteParams,
+    WaterCausticsParams, WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams,
+    WindSource, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
     default_mask_application_for_effect, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
@@ -1114,6 +1115,7 @@ enum EffectKind {
     FilmGrain,
     Noise,
     ChromaticAberration,
+    Anaglyph3d,
     Defringe,
     ScanlineGlitch,
     Vhs,
@@ -1301,6 +1303,7 @@ impl EffectKind {
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
             LocalEffect::Noise(_) => Self::Noise,
             LocalEffect::ChromaticAberration(_) => Self::ChromaticAberration,
+            LocalEffect::Anaglyph3d(_) => Self::Anaglyph3d,
             LocalEffect::Defringe(_) => Self::Defringe,
             LocalEffect::ScanlineGlitch(_) => Self::ScanlineGlitch,
             LocalEffect::Vhs(_) => Self::Vhs,
@@ -1411,6 +1414,7 @@ impl EffectKind {
             Self::FilmGrain => "フィルム粒子",
             Self::Noise => "ノイズ付加",
             Self::ChromaticAberration => "色収差",
+            Self::Anaglyph3d => "アナグリフ3D",
             Self::Defringe => "色フチ除去",
             Self::ScanlineGlitch => "走査線グリッチ",
             Self::Vhs => "VHS/アナログ",
@@ -1451,6 +1455,7 @@ impl EffectKind {
             Self::ParticleOverlay => "天候粒子",
             Self::Aurora => "オーロラ",
             Self::RadialFlash => "フラッシュ",
+            Self::Anaglyph3d => "アナグリフ",
             _ => self.label(),
         }
     }
@@ -1637,6 +1642,9 @@ impl EffectKind {
                 "均一またはガウス分布のノイズを加え、単色/カラーのざらつきやデジタルノイズを作ります。"
             }
             Self::ChromaticAberration => "RGBを少しずらし、レンズやデジタル風の色ズレを作ります。",
+            Self::Anaglyph3d => {
+                "左右にずらした画像を赤シアンなどのチャンネルへ分け、立体視風や強い色ズレ表現を作ります。"
+            }
             Self::Defringe => "強いエッジに出た紫や緑の色フチを検出し、局所的に彩度を落とします。",
             Self::ScanlineGlitch => {
                 "横走査線、行ごとの揺れ、RGBずれ、ノイズを重ねてホログラムやデジタル破損の演出を作ります。"
@@ -1864,6 +1872,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::FilmGrain,
             EffectKind::Noise,
             EffectKind::ChromaticAberration,
+            EffectKind::Anaglyph3d,
         ],
     },
 ];
@@ -9364,6 +9373,13 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::ChromaticAberration(params) => {
             format!("色収差 {:.1}px", params.offset_px)
         }
+        LocalEffect::Anaglyph3d(params) => {
+            format!(
+                "アナグリフ {} {:.0}px",
+                anaglyph_mode_label(params.mode),
+                params.disparity_px
+            )
+        }
         LocalEffect::Defringe(params) => format!("色フチ除去 {:.0}%", params.strength * 100.0),
         LocalEffect::ScanlineGlitch(params) => {
             format!("走査線グリッチ {:.0}%", params.strength * 100.0)
@@ -9481,6 +9497,15 @@ fn noise_distribution_label(distribution: NoiseDistribution) -> &'static str {
     match distribution {
         NoiseDistribution::Uniform => "均一",
         NoiseDistribution::Gaussian => "ガウス",
+    }
+}
+
+fn anaglyph_mode_label(mode: AnaglyphMode) -> &'static str {
+    match mode {
+        AnaglyphMode::RedCyan => "赤シアン",
+        AnaglyphMode::GreenMagenta => "緑マゼンタ",
+        AnaglyphMode::AmberBlue => "琥珀青",
+        AnaglyphMode::RgbSplit => "RGB分離",
     }
 }
 
@@ -17864,6 +17889,131 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.offset_px, 0.0..=24.0).text("ずれ(px)"))
                 .changed();
         }
+        LocalEffect::Anaglyph3d(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "赤シアン") {
+                    *params = AnaglyphParams {
+                        mode: AnaglyphMode::RedCyan,
+                        disparity_px: 8.0,
+                        angle_degrees: 0.0,
+                        luma_mix: 0.55,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "立体弱め") {
+                    *params = AnaglyphParams {
+                        mode: AnaglyphMode::RedCyan,
+                        disparity_px: 4.0,
+                        angle_degrees: 0.0,
+                        luma_mix: 0.70,
+                        strength: 0.65,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "琥珀青") {
+                    *params = AnaglyphParams {
+                        mode: AnaglyphMode::AmberBlue,
+                        disparity_px: 7.0,
+                        angle_degrees: 0.0,
+                        luma_mix: 0.50,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "RGB分離") {
+                    *params = AnaglyphParams {
+                        mode: AnaglyphMode::RgbSplit,
+                        disparity_px: 10.0,
+                        angle_degrees: 0.0,
+                        luma_mix: 0.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "斜めズレ") {
+                    *params = AnaglyphParams {
+                        mode: AnaglyphMode::RgbSplit,
+                        disparity_px: 8.0,
+                        angle_degrees: -25.0,
+                        luma_mix: 0.0,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "左右にずらした画像を色チャンネルへ割り当てます。赤シアンは立体視風、RGB分離はグリッチ寄りの色ズレに向きます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let mut activates_effect = false;
+            let previous_mode = params.mode;
+            ComboBox::from_label("方式")
+                .selected_text(anaglyph_mode_label(params.mode))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut params.mode,
+                        AnaglyphMode::RedCyan,
+                        anaglyph_mode_label(AnaglyphMode::RedCyan),
+                    );
+                    ui.selectable_value(
+                        &mut params.mode,
+                        AnaglyphMode::GreenMagenta,
+                        anaglyph_mode_label(AnaglyphMode::GreenMagenta),
+                    );
+                    ui.selectable_value(
+                        &mut params.mode,
+                        AnaglyphMode::AmberBlue,
+                        anaglyph_mode_label(AnaglyphMode::AmberBlue),
+                    );
+                    ui.selectable_value(
+                        &mut params.mode,
+                        AnaglyphMode::RgbSplit,
+                        anaglyph_mode_label(AnaglyphMode::RgbSplit),
+                    );
+                });
+            if params.mode != previous_mode {
+                changed = true;
+                activates_effect = true;
+            }
+            let disparity = ui.add(
+                egui::Slider::new(&mut params.disparity_px, 0.0..=96.0)
+                    .text("視差")
+                    .suffix("px"),
+            );
+            changed |= disparity.changed();
+            activates_effect |= disparity.changed();
+            disparity
+                .lab_hover_tip("左右画像の総ずれ量です。大きいほど色分離と立体感が強くなります。");
+            let angle = ui.add(
+                egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                    .text("方向")
+                    .suffix("°"),
+            );
+            changed |= angle.changed();
+            activates_effect |= angle.changed();
+            angle.lab_hover_tip(
+                "視差をかける方向です。通常の3D風は0°、演出色ズレは斜めも使えます。",
+            );
+            let luma_mix =
+                ui.add(egui::Slider::new(&mut params.luma_mix, 0.0..=1.0).text("明度化"));
+            changed |= luma_mix.changed();
+            activates_effect |= luma_mix.changed();
+            luma_mix.lab_hover_tip(
+                "左右画像を明度へ寄せてから色チャンネルへ割り当てます。色の暴れを抑えます。",
+            );
+            if activates_effect && params.strength <= f32::EPSILON {
+                params.strength = 1.0;
+                changed = true;
+            }
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像からアナグリフ結果へ切り替える強さです。");
+        }
         LocalEffect::Defringe(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -21049,6 +21199,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ChromaticAberration => {
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default())
         }
+        EffectKind::Anaglyph3d => LocalEffect::Anaglyph3d(AnaglyphParams::default()),
         EffectKind::Defringe => LocalEffect::Defringe(DefringeParams::default()),
         EffectKind::ScanlineGlitch => LocalEffect::ScanlineGlitch(ScanlineGlitchParams::default()),
         EffectKind::Vhs => LocalEffect::Vhs(VhsParams::default()),
@@ -23576,6 +23727,7 @@ mod tests {
             EffectKind::FilmGrain,
             EffectKind::Noise,
             EffectKind::ChromaticAberration,
+            EffectKind::Anaglyph3d,
             EffectKind::Halftone,
             EffectKind::ScreenTone,
             EffectKind::ColorHalftone,
