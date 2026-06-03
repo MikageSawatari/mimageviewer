@@ -1899,6 +1899,17 @@ impl App {
                             ctx.request_repaint();
                         }
 
+                        if self.local_adjust_mode
+                            && !is_spread_double
+                            && !state.original_preview_active
+                        {
+                            let zp = self.fs_zoom_pan();
+                            self.handle_local_adjust_canvas_input(ctx, full_rect, image_rect, zp);
+                            self.draw_local_adjust_canvas_overlay(ui, image_rect, zp);
+                        } else if self.local_adjust_mode {
+                            ctx.request_repaint();
+                        }
+
                         let overlay_t0 = std::time::Instant::now();
                         // ── ルーペ (Shift ホールド / M トグル) ──
                         // 見開き・分析・補正モードでは内部で早期 return する。

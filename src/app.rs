@@ -289,6 +289,20 @@ pub(crate) struct LocalAdjustLutLoadPending {
     pub(crate) rx: mpsc::Receiver<Result<local_adjust_core::CubeLutParams, String>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalAdjustCanvasDragKind {
+    LinearGradient,
+    RadialGradient,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalAdjustCanvasDrag {
+    pub(crate) fs_idx: usize,
+    pub(crate) layer_idx: usize,
+    pub(crate) kind: LocalAdjustCanvasDragKind,
+    pub(crate) start: [f32; 2],
+}
+
 fn run_local_adjust_render(
     key: LocalAdjustResultKey,
     source: Arc<egui::ColorImage>,
@@ -2992,6 +3006,8 @@ pub struct App {
     pub(crate) local_adjust_selective_color_pick_active: bool,
     /// 画像上の効果位置ハンドル表示フラグ。
     pub(crate) local_adjust_effect_position_handles_visible: bool,
+    /// 補正レイヤーの画像上ドラッグ操作状態。
+    pub(crate) local_adjust_canvas_drag: Option<LocalAdjustCanvasDrag>,
     /// 補正レイヤー自身の世代番号。レイヤー追加 / 削除 / パラメータ変更で idx 単位に +1 する。
     pub(crate) local_adjust_generation: std::collections::HashMap<usize, u64>,
     /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
@@ -4200,6 +4216,7 @@ impl App {
             local_adjust_rgb_pick_active: None,
             local_adjust_selective_color_pick_active: false,
             local_adjust_effect_position_handles_visible: true,
+            local_adjust_canvas_drag: None,
             local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
@@ -8228,6 +8245,7 @@ impl App {
         self.local_adjust_rgb_pick_active = None;
         self.local_adjust_selective_color_pick_active = false;
         self.local_adjust_effect_position_handles_visible = true;
+        self.local_adjust_canvas_drag = None;
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
         self.cancel_all_local_adjust_pending();
@@ -17759,6 +17777,16 @@ impl App {
                 ));
             }
         }
+        self.set_local_adjust_layers_for_idx_memory_only(idx, layers);
+    }
+
+    /// 指定 idx の補正レイヤー配列を in-memory state だけに反映する。
+    /// 画像上ドラッグなど高頻度更新では DB I/O を避け、release 時やパネル操作で保存する。
+    pub(crate) fn set_local_adjust_layers_for_idx_memory_only(
+        &mut self,
+        idx: usize,
+        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    ) {
         if layers.is_empty() {
             self.local_adjust_page_layers.remove(&idx);
             self.local_adjust_pages.remove(&idx);

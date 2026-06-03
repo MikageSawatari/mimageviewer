@@ -249,7 +249,7 @@ fn outline_stroke_placement_label(placement: OutlineStrokePlacement) -> &'static
     }
 }
 
-fn hue_degrees_from_rgb(rgb: [u8; 3]) -> f32 {
+pub(crate) fn hue_degrees_from_rgb(rgb: [u8; 3]) -> f32 {
     let r = rgb[0] as f32 / 255.0;
     let g = rgb[1] as f32 / 255.0;
     let b = rgb[2] as f32 / 255.0;
@@ -392,6 +392,150 @@ fn merge_rgb_color_response(
     }
     if response.start_pick.is_some() {
         *start_rgb_pick = response.start_pick;
+    }
+}
+
+pub(crate) fn set_rgb_pick_target(
+    effect: &mut LocalEffect,
+    target: RgbPickTarget,
+    rgb: [u8; 3],
+) -> bool {
+    match (effect, target) {
+        (LocalEffect::ColorFill(params), RgbPickTarget::ColorFillStart) => {
+            params.start_rgb = rgb;
+            true
+        }
+        (LocalEffect::ColorFill(params), RgbPickTarget::ColorFillMiddle) => {
+            params.middle_rgb = rgb;
+            true
+        }
+        (LocalEffect::ColorFill(params), RgbPickTarget::ColorFillEnd) => {
+            params.end_rgb = rgb;
+            true
+        }
+        (LocalEffect::Frame(params), RgbPickTarget::FrameColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::Frame(params), RgbPickTarget::FrameLineColor) => {
+            params.line_rgb = rgb;
+            true
+        }
+        (LocalEffect::PhotoFilter(params), RgbPickTarget::PhotoFilterColor) => {
+            params.color_rgb = rgb;
+            params.preset = PhotoFilterPreset::Custom;
+            true
+        }
+        (LocalEffect::MonochromeMixer(params), RgbPickTarget::MonochromeMixerTint) => {
+            params.tint_rgb = rgb;
+            true
+        }
+        (LocalEffect::ColorOverlay(params), RgbPickTarget::ColorOverlayStart) => {
+            params.start_rgb = rgb;
+            true
+        }
+        (LocalEffect::ColorOverlay(params), RgbPickTarget::ColorOverlayEnd) => {
+            params.end_rgb = rgb;
+            true
+        }
+        (LocalEffect::NeonGlow(params), RgbPickTarget::NeonGlowSource) => {
+            params.source_rgb = rgb;
+            params.source_color_enabled = true;
+            true
+        }
+        (LocalEffect::NeonGlow(params), RgbPickTarget::NeonGlowTint) => {
+            params.tint_rgb = rgb;
+            true
+        }
+        (LocalEffect::SpeedLines(params), RgbPickTarget::SpeedLinesColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::CloudFog(params), RgbPickTarget::CloudFogColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::ParticleOverlay(params), RgbPickTarget::ParticleOverlayColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::Aurora(params), RgbPickTarget::AuroraColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::Aurora(params), RgbPickTarget::AuroraSecondaryColor) => {
+            params.secondary_rgb = rgb;
+            true
+        }
+        (LocalEffect::Spotlight(params), RgbPickTarget::SpotlightTint) => {
+            params.tint_rgb = rgb;
+            true
+        }
+        (LocalEffect::OutlineStroke(params), RgbPickTarget::OutlineStrokeColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::RimLight(params), RgbPickTarget::RimLightColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::ContactShadow(params), RgbPickTarget::ContactShadowColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::ColorDodgeGlow(params), RgbPickTarget::ColorDodgeGlowColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::AnamorphicFlare(params), RgbPickTarget::AnamorphicFlareColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::LightLeak(params), RgbPickTarget::LightLeakColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::BacklightHaze(params), RgbPickTarget::BacklightHazeColor) => {
+            params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::Lithograph(params), RgbPickTarget::LithographInkA) => {
+            params.ink_a_rgb = rgb;
+            true
+        }
+        (LocalEffect::Lithograph(params), RgbPickTarget::LithographInkB) => {
+            params.ink_b_rgb = rgb;
+            true
+        }
+        (LocalEffect::Lithograph(params), RgbPickTarget::LithographPaper) => {
+            params.paper_rgb = rgb;
+            true
+        }
+        (LocalEffect::Engraving(params), RgbPickTarget::EngravingInk) => {
+            params.ink_rgb = rgb;
+            true
+        }
+        (LocalEffect::Engraving(params), RgbPickTarget::EngravingPaper) => {
+            params.paper_rgb = rgb;
+            true
+        }
+        (LocalEffect::PartColor(params), RgbPickTarget::PartColorTarget) => {
+            params.target_rgb = rgb;
+            true
+        }
+        (LocalEffect::Halation(params), RgbPickTarget::HalationTint) => {
+            params.tint_rgb = rgb;
+            true
+        }
+        (LocalEffect::ToonShade(params), RgbPickTarget::ToonShadeShadowTint) => {
+            params.shadow_tint_rgb = rgb;
+            true
+        }
+        (LocalEffect::ToonShade(params), RgbPickTarget::ToonShadeLightTint) => {
+            params.light_tint_rgb = rgb;
+            true
+        }
+        _ => false,
     }
 }
 
