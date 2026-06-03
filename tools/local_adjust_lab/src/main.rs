@@ -1953,6 +1953,7 @@ struct LocalAdjustLabApp {
     change_mask_kind: MaskKind,
     change_mask_keep_manual_override: bool,
     effect_picker_dialog_open: bool,
+    effect_picker_query: String,
     effect_clipboard: Option<LocalEffect>,
     selective_color_pick_active: bool,
     rgb_pick_active: Option<RgbPickTarget>,
@@ -2043,6 +2044,7 @@ impl LocalAdjustLabApp {
             change_mask_kind: MaskKind::Full,
             change_mask_keep_manual_override: true,
             effect_picker_dialog_open: false,
+            effect_picker_query: String::new(),
             effect_clipboard: None,
             selective_color_pick_active: false,
             rgb_pick_active: None,
@@ -4545,6 +4547,7 @@ impl LocalAdjustLabApp {
                 .clicked()
             {
                 self.effect_picker_dialog_open = true;
+                self.effect_picker_query.clear();
             }
         });
     }
@@ -6469,12 +6472,42 @@ impl LocalAdjustLabApp {
                     .color(Color32::from_gray(180)),
                 );
                 ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("検索").color(Color32::from_gray(210)));
+                    let search_response = ui.add(
+                        egui::TextEdit::singleline(&mut self.effect_picker_query)
+                            .desired_width((ui.available_width() - 58.0).max(180.0))
+                            .hint_text("効果名・説明"),
+                    );
+                    search_response.lab_hover_tip("入力したキーワードを含む効果だけを表示します。");
+                    if ui
+                        .add_enabled(
+                            !self.effect_picker_query.is_empty(),
+                            egui::Button::new("クリア"),
+                        )
+                        .clicked()
+                    {
+                        self.effect_picker_query.clear();
+                    }
+                });
+                let query = self.effect_picker_query.trim().to_string();
                 let picker_body_height = ui.available_height().clamp(240.0, 680.0);
                 egui::ScrollArea::vertical()
                     .max_height(picker_body_height)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        let mut shown_count = 0usize;
                         for group in EFFECT_GROUPS {
+                            let matching_kinds: Vec<EffectKind> = group
+                                .kinds
+                                .iter()
+                                .copied()
+                                .filter(|kind| effect_picker_matches_query(*kind, &query))
+                                .collect();
+                            if matching_kinds.is_empty() {
+                                continue;
+                            }
+                            shown_count += matching_kinds.len();
                             ui.label(
                                 egui::RichText::new(group.title)
                                     .size(13.0)
@@ -6484,7 +6517,7 @@ impl LocalAdjustLabApp {
                             let button_width = effect_picker_button_width(ui.available_width());
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 5.0);
-                                for &kind in group.kinds {
+                                for kind in matching_kinds {
                                     let selected = kind == current_kind;
                                     let fill = if selected {
                                         Color32::from_rgb(36, 112, 150)
@@ -6507,6 +6540,13 @@ impl LocalAdjustLabApp {
                                 }
                             });
                             ui.add_space(7.0);
+                        }
+                        if shown_count == 0 {
+                            ui.label(
+                                egui::RichText::new("該当する効果がありません。")
+                                    .size(12.0)
+                                    .color(Color32::from_gray(170)),
+                            );
                         }
                     });
             });
@@ -23326,6 +23366,22 @@ fn effect_picker_button_width(available_width: f32) -> f32 {
         .clamp(EFFECT_PICKER_BUTTON_MIN_W, EFFECT_PICKER_BUTTON_MAX_W)
 }
 
+fn effect_picker_matches_query(kind: EffectKind, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+
+    let fields = [
+        kind.label().to_lowercase(),
+        kind.picker_label().to_lowercase(),
+        kind.description().to_lowercase(),
+    ];
+    query
+        .split_whitespace()
+        .all(|token| fields.iter().any(|field| field.contains(token)))
+}
+
 #[derive(Clone, Copy)]
 struct GradientHandleVisuals {
     stroke: egui::Stroke,
@@ -24120,6 +24176,20 @@ mod tests {
             assert!(width <= EFFECT_PICKER_BUTTON_MAX_W);
         }
         assert!(effect_picker_button_width(860.0) > effect_picker_button_width(320.0));
+    }
+
+    #[test]
+    fn effect_picker_query_matches_labels_and_descriptions() {
+        assert!(effect_picker_matches_query(EffectKind::Bloom, ""));
+        assert!(effect_picker_matches_query(EffectKind::Bloom, "ブルーム"));
+        assert!(effect_picker_matches_query(EffectKind::Anaglyph3d, "3d"));
+        assert!(effect_picker_matches_query(EffectKind::LensBlur, "玉ボケ"));
+        assert!(effect_picker_matches_query(EffectKind::LensDirt, "水滴"));
+        assert!(effect_picker_matches_query(
+            EffectKind::LensDirt,
+            "レンズ 水滴"
+        ));
+        assert!(!effect_picker_matches_query(EffectKind::Tone, "水滴"));
     }
 
     #[test]
