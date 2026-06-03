@@ -117,6 +117,9 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮 + ベクタオブジェクト JSON) |
 | `conceal_db.rs` | 隠蔽加工マスクの SQLite 永続化。`mask_db.rs` と同じビットマップ + ベクタ構造を使い、マスクスロットも管理 |
 | `local-adjust-core` | 補正レイヤー合成 core。mIV 本体では消しゴム後・隠蔽加工前の非同期レイヤーとして使う |
+| `local_adjust_db.rs` | 補正レイヤー配列をページ単位 JSON として `local_adjust.db` へ保存する |
+| `local_adjust_catalog.rs` | 補正レイヤー効果ピッカー用の効果一覧・検索・デフォルト効果生成 |
+| `local_adjust_effect_ui.rs` | `local_adjust_lab` から移植した各 `LocalEffect` のパラメータ UI |
 | `spread_db.rs` | フォルダ別の見開きモード永続化 |
 | `ai/` | ONNX Runtime (DirectML or TensorRT) によるアップスケール / デノイズ / Inpainting / 画像種別分類。`AiBackend` で multi-EP 対応、TRT 用に `tensorrt_pack` (DLL pack 検出) と `tensorrt_builder` (子プロセスエンジンビルダー) を持つ。TRT 推論はメインから別プロセスへ shm + JSON IPC でルーティング (`trt_worker_pool` / `trt_worker_proto` / `trt_worker_runtime` / `trt_worker_shm`)。TensorRT 設定でも起動時には worker を自動起動せず、AI 処理が実際に必要になった最初のタイミングで遅延起動する。worker 死亡を検知したら自動 detach + DirectML フォールバック + UI バナー通知 |
 | `png_metadata.rs` | PNG の tEXt/iTXt/zTXt に埋め込まれた AI メタデータ読み取り |
@@ -222,7 +225,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `search_index.db` | Ctrl+S 用。お気に入り配下のフォルダ/ZIP/PDF/動画名索引 | `search_index_db.rs` |
 | `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み | `fts_index.rs` → `ingest_worker.rs` / `tag_write_worker.rs` |
 | `fts_meta.db` | ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たず Tantivy STORED に集約 | `fts_meta.rs` |
-| `adjustment.db` | フォルダ別プリセット 4 種 + ページ別プリセット割当 | `adjustment_db.rs` |
+| `adjustment.db` | ページ個別補正 (`page_params`) とお気に入り標準補正 (`favorite_params`) | `adjustment_db.rs` |
 | `mask.db` | 消しゴムマスク (deflate 圧縮 1bit/pixel + ベクタオブジェクト JSON) | `mask_db.rs` |
 | `conceal.db` | 隠蔽加工マスク (deflate 圧縮 1bit/pixel + ベクタオブジェクト JSON) とマスクスロット | `conceal_db.rs` |
 | `local_adjust.db` | 補正レイヤーのページ単位 JSON。初期統合では中央 DB を authoritative とし、サイドカーバックアップは後続で扱う | `local_adjust_db.rs` |

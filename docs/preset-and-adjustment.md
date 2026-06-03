@@ -359,8 +359,19 @@ AI 処理には数秒〜数十秒かかるため、その間も `maybe_apply_adj
 初期 UI はフルスクリーン左パネルのヘッダーにある「補正レイヤー」アイコンから開く。
 ヘッダーの編集入口は左から `消しゴム -> 補正レイヤー -> 隠蔽加工 -> エクスポート` の順で、
 補正レイヤーは消しゴム / 隠蔽加工と同じ右上 `×` 付きの独立左パネルとして表示する。
-初期パネルでは代表効果の追加、ON/OFF、削除、全削除だけを扱う。プレビューは自動反映のため
-手動プレビュー用アイコンは置かない。
+パネルには効果ピッカー検索、全 `LocalEffect` のパラメータ UI、効果コピー/ペースト/リセット、
+マスク種別切替、グラデーション/カラー範囲/手描きマスク編集を置く。プレビューは自動反映のため
+手動プレビュー用アイコンは置かない。3D LUT の `.cube` 読み込みは UI スレッドで読まず、
+`local-adjust-lut-load` worker で読み込んで完了時にレイヤーへ反映する。
+
+画像上のキャンバス操作は以下を扱う:
+
+- `LinearGradient` / `RadialGradient`: 画像上ドラッグで開始/終了点または中心/半径を更新する。
+- `ColorRange`: 画像クリックで対象 RGB を拾う。
+- `SelectiveColor` と各種 RGB パラメータ: 効果 UI のスポイトボタンから画像クリックで色を拾う。
+- 位置を持つ効果 (`TiltShift` / `RadialBlur` / `LensFlare` / `Spotlight` など): 位置ハンドル表示中に画像上のハンドルをドラッグする。
+- 手描きマスク: `RasterVector` はベースマスクを直接編集し、その他のマスクでは追加/削除マスクを明示的に開いたときだけブラシ入力が有効になる。ドラッグ中は in-memory 更新、release 時に DB 保存する。
+
 サムネイル側は画像を変えず、補正レイヤー設定があるページに `局` バッジだけを表示する。
 
 Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページでは `local_adjust_cache` が揃ってから
@@ -388,6 +399,7 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 | keep_range からの eviction | 該当 idx のみ evict | 該当 idx のみクリア + `thumb_pixels` も drop | 対象外 | — |
 | 回転変更 | **クリアしない** (描画時の GPU 行列で回転) | **クリアしない** (同左) | クリアしない | — |
 | 消しゴムマスク変更 | 残す | 触らない (`thumb_pixels` は元サムネソース、マスクで変わらない) | 残す | — |
+| 補正レイヤー変更 | 残す | 触らない (サムネ画像には反映しない) | 残す | — |
 
 *「色系」= brightness/contrast/gamma/saturation/temperature/levels/auto_mode
 (ポストフィルタは AI 設定を変えないので `ai_settings_eq` には含まれず、色系変更と同じ扱い)
@@ -395,6 +407,11 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 消しゴムマスク変更時は `erase_mask_generation[idx]` を進め、`erase_result_cache` と
 `local_adjust_cache` / `conceal_cache[idx]` を stale 化する。`fs_cache` / `ai_upscale_cache` /
 `adjustment_cache` は下位入力として保持し、MI-GAN 結果と補正レイヤー結果だけを再生成する。
+
+補正レイヤー変更時は `local_adjust_generation[idx]` を進め、`local_adjust_cache` と
+下流の `conceal_cache[idx]` を stale 化する。`adjustment_cache` / `erase_result_cache` は
+下位入力として保持する。生成中または stale 中は下位入力を表示し、完了後に
+`local_adjust_cache` へ差し替える。
 
 ### 4.1 ヘルパー関数
 
@@ -645,11 +662,12 @@ MI-GAN / diffusion に渡す最終マスクと、オーバーレイ描画に使�
 
 ---
 
-## 8.X 画像補正の Undo / Redo (v0.8.1)
+## 8.X 画像補正 / 補正レイヤーの Undo / Redo (v0.8.1+)
 
-`Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`) でフルスクリーン中の画像補正操作を取り消せる。
+`Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`) でフルスクリーン中の画像補正操作と補正レイヤー操作を取り消せる。
 履歴は [`crate::undo_stack::UndoStack`](../src/undo_stack.rs) に積まれ、
-レーティング・タグの Undo と同じスタックを共有する (型は `UndoEntry::Adjustment`)。
+レーティング・タグの Undo と同じスタックを共有する。通常補正は `UndoEntry::Adjustment`、
+補正レイヤーは `UndoEntry::LocalAdjustment` として記録する。
 
 ### 取り消し対象
 
@@ -660,6 +678,8 @@ MI-GAN / diffusion に渡す最終マスクと、オーバーレイ描画に使�
 - ホットキー: U / Shift+U / Alt+U (アップスケール循環)、N (デノイズトグル)、
   T / Shift+T / Alt+T (ポストフィルタ循環)、Q / Ctrl+Backspace (個別解除)
 - 保存スロット適用: Ctrl+1〜9 / Ctrl+0、左パネルのスロットボタン
+- 補正レイヤー: レイヤー追加/削除/全削除、ON/OFF、効果パラメータ編集、
+  効果コピー/ペースト/リセット、LUT 読み込み、カラー/グラデーション/位置ハンドル/手描きマスクのキャンバス操作
 
 ### スコープ表現 ([`AdjustUndoScope`](../src/undo_stack.rs))
 
@@ -675,6 +695,12 @@ struct AdjustmentChange {
     before: Option<AdjustParams>,  // None = エントリ無し (Page / Favorite のみ)
     after: Option<AdjustParams>,
 }
+
+struct LocalAdjustmentChange {
+    idx: usize,
+    before: Vec<LocalAdjustmentLayer>, // empty = 補正レイヤーなし
+    after: Vec<LocalAdjustmentLayer>,
+}
 ```
 
 `Global` スコープは常に `Some` (`settings.global_preset` は Optional ではない)。
@@ -687,6 +713,11 @@ struct AdjustmentChange {
 `clear_page_params` / `set_favorite_default` / `clear_favorite_default` /
 `copy_params_to_global`。これらは DB 更新・サイドカー更新・キャッシュ無効化を
 すべて内部で行うので、Undo 用に副作用を再実装する必要はない。
+
+補正レイヤーは `apply_local_adjustment_change_to_app` で `before` / `after` の
+`Vec<LocalAdjustmentLayer>` を `set_local_adjust_layers_for_idx` へ戻す。これにより
+`local_adjust.db` 更新、`local_adjust_pages` バッジ集合、`local_adjust_generation` bump、
+`local_adjust_cache` / 下流 `conceal_cache` の無効化が通常操作と同じ経路で走る。
 
 ### スライダードラッグの取り扱い (drag-release granularity)
 
@@ -725,6 +756,10 @@ struct AdjustmentChange {
 
 `clear_meta_undo` は `adjustment_drag_session` も `None` にリセットするので、
 ドラッグ中に境界を跨いでも進行中セッションが残骸として残らない。
+補正レイヤーのキャンバスドラッグ / 手描きブラシは開始前レイヤー配列を
+`local_adjust_canvas_drag_before_layers` / `local_adjust_mask_brush_before_layers` に保持し、
+release 時に 1 Undo として確定する。モード終了・フォルダ切替・360 モード開始では
+これらの一時状態も破棄する。
 
 ### 副作用に乗る点
 
