@@ -501,6 +501,14 @@ pub(crate) struct LocalAdjustMaskBrushStroke {
     pub(crate) previous: [f32; 2],
 }
 
+pub(crate) const LOCAL_ADJUST_BRUSH_EFFECT_DEFER_MS: u64 = 150;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalAdjustBrushDeferredRender {
+    pub(crate) idx: usize,
+    pub(crate) last_input_at: std::time::Instant,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ExportCropDrag {
     pub(crate) handle: crate::export_crop::CropHandle,
@@ -3432,6 +3440,8 @@ pub struct App {
     /// 手描きブラシ開始前の補正レイヤー配列。Undo をストローク単位にまとめる。
     pub(crate) local_adjust_mask_brush_before_layers:
         Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    /// 手描きブラシ中の重い補正レイヤー再計算を少し遅らせるための保留状態。
+    pub(crate) local_adjust_brush_deferred_render: Option<LocalAdjustBrushDeferredRender>,
     /// 補正レイヤー自身の世代番号。レイヤー追加 / 削除 / パラメータ変更で idx 単位に +1 する。
     pub(crate) local_adjust_generation: std::collections::HashMap<usize, u64>,
     /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
@@ -4709,6 +4719,7 @@ impl App {
             local_adjust_shape_drag_before_layers: None,
             local_adjust_canvas_drag_before_layers: None,
             local_adjust_mask_brush_before_layers: None,
+            local_adjust_brush_deferred_render: None,
             local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
@@ -8778,6 +8789,7 @@ impl App {
         self.local_adjust_canvas_drag_before_layers = None;
         self.local_adjust_shape_drag_before_layers = None;
         self.local_adjust_mask_brush_before_layers = None;
+        self.local_adjust_brush_deferred_render = None;
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
         self.edit_result_cache.clear();
@@ -9895,6 +9907,7 @@ impl App {
         self.input_generation.clear();
         self.erase_mask_generation.clear();
         self.local_adjust_generation.clear();
+        self.local_adjust_brush_deferred_render = None;
         self.conceal_mask_generation.clear();
         self.erase_result_cache.clear();
         self.local_adjust_cache.clear();
@@ -17240,6 +17253,7 @@ impl App {
         self.local_adjust_canvas_drag_before_layers = None;
         self.local_adjust_shape_drag_before_layers = None;
         self.local_adjust_mask_brush_before_layers = None;
+        self.local_adjust_brush_deferred_render = None;
         self.local_adjust_segmentation_pending = None;
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
@@ -18384,6 +18398,24 @@ impl App {
         idx: usize,
         layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
     ) {
+        self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
+        self.bump_local_adjust_generation(idx);
+    }
+
+    pub(crate) fn set_local_adjust_layers_for_idx_memory_only_defer_render(
+        &mut self,
+        idx: usize,
+        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    ) {
+        self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
+        self.defer_local_adjust_brush_render(idx);
+    }
+
+    fn set_local_adjust_layers_for_idx_memory_only_inner(
+        &mut self,
+        idx: usize,
+        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+    ) {
         if layers.is_empty() {
             self.local_adjust_page_layers.remove(&idx);
             self.local_adjust_pages.remove(&idx);
@@ -18399,7 +18431,6 @@ impl App {
             self.local_adjust_page_layers.insert(idx, layers);
             self.local_adjust_pages.insert(idx);
         }
-        self.bump_local_adjust_generation(idx);
     }
 
     pub(crate) fn ensure_local_adjust_masks_match_source_dims(&mut self, idx: usize) -> bool {
@@ -18603,11 +18634,57 @@ impl App {
 
     /// 補正レイヤーが変わったことを idx 単位の世代で表す。
     pub(crate) fn bump_local_adjust_generation(&mut self, idx: usize) {
+        self.cancel_deferred_local_adjust_brush_render(idx);
         let slot = self.local_adjust_generation.entry(idx).or_insert(0);
         *slot = slot.wrapping_add(1);
         self.clear_local_adjust_caches_for_idx(idx);
         self.clear_conceal_caches(idx);
         self.clear_edit_result_caches_for_idx(idx);
+    }
+
+    pub(crate) fn defer_local_adjust_brush_render(&mut self, idx: usize) {
+        if self
+            .local_adjust_brush_deferred_render
+            .is_some_and(|pending| pending.idx != idx)
+        {
+            self.flush_deferred_local_adjust_brush_render();
+        }
+        self.local_adjust_brush_deferred_render = Some(LocalAdjustBrushDeferredRender {
+            idx,
+            last_input_at: std::time::Instant::now(),
+        });
+    }
+
+    pub(crate) fn cancel_deferred_local_adjust_brush_render(&mut self, idx: usize) {
+        if self
+            .local_adjust_brush_deferred_render
+            .is_some_and(|pending| pending.idx == idx)
+        {
+            self.local_adjust_brush_deferred_render = None;
+        }
+    }
+
+    pub(crate) fn flush_deferred_local_adjust_brush_render(&mut self) -> bool {
+        let Some(pending) = self.local_adjust_brush_deferred_render.take() else {
+            return false;
+        };
+        self.bump_local_adjust_generation(pending.idx);
+        true
+    }
+
+    pub(crate) fn poll_deferred_local_adjust_brush_render_at(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let pending = self.local_adjust_brush_deferred_render?;
+        let defer_for = std::time::Duration::from_millis(LOCAL_ADJUST_BRUSH_EFFECT_DEFER_MS);
+        let elapsed = now.saturating_duration_since(pending.last_input_at);
+        if elapsed >= defer_for {
+            self.flush_deferred_local_adjust_brush_render();
+            None
+        } else {
+            Some(defer_for - elapsed)
+        }
     }
 
     /// 現在世代に一致する補正レイヤー結果テクスチャを返す。
@@ -24213,6 +24290,12 @@ impl eframe::App for App {
             crate::record_ui_heartbeat_detail(heartbeat.clone());
             crate::logger::log(heartbeat);
             self.last_ui_heartbeat_log = now;
+        }
+        let had_deferred_local_adjust_brush = self.local_adjust_brush_deferred_render.is_some();
+        if let Some(delay) = self.poll_deferred_local_adjust_brush_render_at(now) {
+            ctx.request_repaint_after(delay);
+        } else if had_deferred_local_adjust_brush {
+            ctx.request_repaint();
         }
 
         // メインウィンドウの HWND を最初のフレームで取得 (Win32 ShowWindow 用)。

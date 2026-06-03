@@ -6428,6 +6428,27 @@ impl App {
         persist: bool,
         mutate: impl FnOnce(&mut local_adjust_core::LocalAdjustmentLayer) -> bool,
     ) -> bool {
+        self.mutate_local_adjust_layer_from_canvas_impl(fs_idx, layer_idx, persist, false, mutate)
+    }
+
+    fn mutate_local_adjust_layer_from_canvas_defer_render(
+        &mut self,
+        fs_idx: usize,
+        layer_idx: usize,
+        persist: bool,
+        mutate: impl FnOnce(&mut local_adjust_core::LocalAdjustmentLayer) -> bool,
+    ) -> bool {
+        self.mutate_local_adjust_layer_from_canvas_impl(fs_idx, layer_idx, persist, true, mutate)
+    }
+
+    fn mutate_local_adjust_layer_from_canvas_impl(
+        &mut self,
+        fs_idx: usize,
+        layer_idx: usize,
+        persist: bool,
+        defer_render: bool,
+        mutate: impl FnOnce(&mut local_adjust_core::LocalAdjustmentLayer) -> bool,
+    ) -> bool {
         let mut layers = self
             .local_adjust_page_layers
             .get(&fs_idx)
@@ -6448,6 +6469,8 @@ impl App {
                 layers,
                 "補正レイヤーキャンバス操作".to_string(),
             );
+        } else if defer_render {
+            self.set_local_adjust_layers_for_idx_memory_only_defer_render(fs_idx, layers);
         } else {
             self.set_local_adjust_layers_for_idx_memory_only(fs_idx, layers);
         }
@@ -6640,59 +6663,65 @@ impl App {
     ) -> bool {
         let radius = self.local_adjust_mask_brush_radius.max(1.0);
         let image_dims = local_adjust_image_dims(self, fs_idx);
-        self.mutate_local_adjust_layer_from_canvas(fs_idx, layer_idx, persist, |layer| match target
-        {
-            LocalAdjustMaskEditTarget::Base => match &mut layer.mask {
-                local_adjust_core::LocalMask::Raster(mask) => paint_local_adjust_alpha_line(
-                    &mut mask.alpha,
-                    mask.width,
-                    mask.height,
-                    from_norm,
-                    to_norm,
-                    radius,
-                    paint,
-                ),
-                local_adjust_core::LocalMask::RasterVector(mask) => paint_local_adjust_alpha_line(
-                    &mut mask.alpha,
-                    mask.width,
-                    mask.height,
-                    from_norm,
-                    to_norm,
-                    radius,
-                    paint,
-                ),
-                _ => false,
-            },
-            LocalAdjustMaskEditTarget::OverrideAdd
-            | LocalAdjustMaskEditTarget::OverrideSubtract => {
-                let Some(slot) = local_mask_override_slot_mut(layer, target) else {
-                    return false;
-                };
-                let (width, height) = (image_dims.0.max(1), image_dims.1.max(1));
-                if slot
-                    .as_ref()
-                    .is_none_or(|mask| mask.width != width || mask.height != height)
-                {
-                    if !paint {
-                        return false;
+        self.mutate_local_adjust_layer_from_canvas_defer_render(
+            fs_idx,
+            layer_idx,
+            persist,
+            |layer| match target {
+                LocalAdjustMaskEditTarget::Base => match &mut layer.mask {
+                    local_adjust_core::LocalMask::Raster(mask) => paint_local_adjust_alpha_line(
+                        &mut mask.alpha,
+                        mask.width,
+                        mask.height,
+                        from_norm,
+                        to_norm,
+                        radius,
+                        paint,
+                    ),
+                    local_adjust_core::LocalMask::RasterVector(mask) => {
+                        paint_local_adjust_alpha_line(
+                            &mut mask.alpha,
+                            mask.width,
+                            mask.height,
+                            from_norm,
+                            to_norm,
+                            radius,
+                            paint,
+                        )
                     }
-                    *slot = Some(local_adjust_core::RasterVectorMask::empty(width, height));
+                    _ => false,
+                },
+                LocalAdjustMaskEditTarget::OverrideAdd
+                | LocalAdjustMaskEditTarget::OverrideSubtract => {
+                    let Some(slot) = local_mask_override_slot_mut(layer, target) else {
+                        return false;
+                    };
+                    let (width, height) = (image_dims.0.max(1), image_dims.1.max(1));
+                    if slot
+                        .as_ref()
+                        .is_none_or(|mask| mask.width != width || mask.height != height)
+                    {
+                        if !paint {
+                            return false;
+                        }
+                        *slot = Some(local_adjust_core::RasterVectorMask::empty(width, height));
+                    }
+                    let Some(mask) = slot.as_mut() else {
+                        return false;
+                    };
+                    paint_local_adjust_alpha_line(
+                        &mut mask.alpha,
+                        mask.width,
+                        mask.height,
+                        from_norm,
+                        to_norm,
+                        radius,
+                        paint,
+                    )
                 }
-                let Some(mask) = slot.as_mut() else {
-                    return false;
-                };
-                paint_local_adjust_alpha_line(
-                    &mut mask.alpha,
-                    mask.width,
-                    mask.height,
-                    from_norm,
-                    to_norm,
-                    radius,
-                    paint,
-                )
-            }
-            LocalAdjustMaskEditTarget::None => false,
-        })
+                LocalAdjustMaskEditTarget::None => false,
+            },
+        )
     }
 
     fn paint_local_adjust_mask_edge_brush(
@@ -6718,28 +6747,33 @@ impl App {
         );
         let tolerance = self.local_adjust_edge_brush_tolerance;
         let include_boundary = self.local_adjust_edge_brush_include_boundary;
-        self.mutate_local_adjust_layer_from_canvas(fs_idx, layer_idx, persist, |layer| {
-            let Some(mask) =
-                local_adjust_target_raster_vector_mask_mut(layer, target, image_dims, paint)
-            else {
-                return false;
-            };
-            if source.size != [mask.width, mask.height] {
-                return false;
-            }
-            paint_local_adjust_alpha_edge_brush_line(
-                &mut mask.alpha,
-                source.as_ref(),
-                from_norm,
-                to_norm,
-                radius,
-                paint,
-                edge_seed,
-                tolerance,
-                thresholds,
-                include_boundary,
-            )
-        })
+        self.mutate_local_adjust_layer_from_canvas_defer_render(
+            fs_idx,
+            layer_idx,
+            persist,
+            |layer| {
+                let Some(mask) =
+                    local_adjust_target_raster_vector_mask_mut(layer, target, image_dims, paint)
+                else {
+                    return false;
+                };
+                if source.size != [mask.width, mask.height] {
+                    return false;
+                }
+                paint_local_adjust_alpha_edge_brush_line(
+                    &mut mask.alpha,
+                    source.as_ref(),
+                    from_norm,
+                    to_norm,
+                    radius,
+                    paint,
+                    edge_seed,
+                    tolerance,
+                    thresholds,
+                    include_boundary,
+                )
+            },
+        )
     }
 
     fn paint_local_adjust_mask_gap_fill_brush(
@@ -6755,23 +6789,28 @@ impl App {
         let radius = self.local_adjust_mask_brush_radius.max(1.0);
         let gap = self.local_adjust_mask_gap_fill_distance;
         let image_dims = local_adjust_image_dims(self, fs_idx);
-        self.mutate_local_adjust_layer_from_canvas(fs_idx, layer_idx, persist, |layer| {
-            let Some(mask) =
-                local_adjust_target_raster_vector_mask_mut(layer, target, image_dims, paint)
-            else {
-                return false;
-            };
-            paint_local_adjust_alpha_gap_fill_line(
-                &mut mask.alpha,
-                mask.width,
-                mask.height,
-                from_norm,
-                to_norm,
-                radius,
-                paint,
-                gap,
-            )
-        })
+        self.mutate_local_adjust_layer_from_canvas_defer_render(
+            fs_idx,
+            layer_idx,
+            persist,
+            |layer| {
+                let Some(mask) =
+                    local_adjust_target_raster_vector_mask_mut(layer, target, image_dims, paint)
+                else {
+                    return false;
+                };
+                paint_local_adjust_alpha_gap_fill_line(
+                    &mut mask.alpha,
+                    mask.width,
+                    mask.height,
+                    from_norm,
+                    to_norm,
+                    radius,
+                    paint,
+                    gap,
+                )
+            },
+        )
     }
 
     fn paint_local_adjust_mask_tool_segment(
@@ -6984,6 +7023,7 @@ impl App {
             return;
         };
         let Some(mut layers) = self.local_adjust_page_layers.get(&stroke.fs_idx).cloned() else {
+            self.cancel_deferred_local_adjust_brush_render(stroke.fs_idx);
             return;
         };
         if let Some(layer) = layers.get_mut(stroke.layer_idx) {

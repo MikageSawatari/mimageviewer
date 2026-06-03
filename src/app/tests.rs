@@ -5245,6 +5245,33 @@ mod pipeline_cache_refactor_tests {
         (edit_key, final_key)
     }
 
+    fn insert_local_adjust_cache(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+    ) -> LocalAdjustResultKey {
+        let key = app.current_local_adjust_key(idx);
+        let image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(20, 30, 40)]);
+        let texture = ctx.load_texture(label, image.clone(), egui::TextureOptions::LINEAR);
+        app.local_adjust_cache.insert(
+            key,
+            LocalAdjustCacheEntry {
+                pixels: Arc::new(image),
+                texture,
+            },
+        );
+        key
+    }
+
+    fn brush_layer() -> local_adjust_core::LocalAdjustmentLayer {
+        local_adjust_core::LocalAdjustmentLayer::new(
+            "brush",
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::None,
+        )
+    }
+
     #[test]
     fn adjustment_generation_keeps_edit_cache_and_clears_final_cache() {
         let ctx = egui::Context::default();
@@ -5313,6 +5340,73 @@ mod pipeline_cache_refactor_tests {
         assert!(app.mask_pages.contains(&idx));
         assert_eq!(app.erase_mask_generation.get(&idx), Some(&44));
         assert_eq!(app.input_generation.get(&idx), Some(&55));
+    }
+
+    #[test]
+    fn deferred_brush_render_keeps_generation_until_idle_deadline() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pipeline-brush-defer.jpg");
+        let local_key = insert_local_adjust_cache(&mut app, &ctx, idx, "brush_defer_local");
+        let (edit_key, final_key) =
+            insert_edit_and_final_cache(&mut app, &ctx, idx, "brush_defer_final");
+
+        app.set_local_adjust_layers_for_idx_memory_only_defer_render(idx, vec![brush_layer()]);
+        let pending = app
+            .local_adjust_brush_deferred_render
+            .expect("brush render should be deferred");
+        let early = pending.last_input_at
+            + std::time::Duration::from_millis(LOCAL_ADJUST_BRUSH_EFFECT_DEFER_MS - 1);
+
+        let delay = app
+            .poll_deferred_local_adjust_brush_render_at(early)
+            .expect("deadline should not flush early");
+        assert!(delay <= std::time::Duration::from_millis(1));
+        assert_eq!(
+            app.local_adjust_generation.get(&idx).copied().unwrap_or(0),
+            0
+        );
+        assert!(app.local_adjust_cache.contains_key(&local_key));
+        assert!(app.edit_result_cache.contains_key(&edit_key));
+        assert!(app.final_composite_cache.contains_key(&final_key));
+
+        let due = pending.last_input_at
+            + std::time::Duration::from_millis(LOCAL_ADJUST_BRUSH_EFFECT_DEFER_MS);
+        assert!(
+            app.poll_deferred_local_adjust_brush_render_at(due)
+                .is_none()
+        );
+        assert_eq!(app.local_adjust_generation.get(&idx), Some(&1));
+        assert!(app.local_adjust_brush_deferred_render.is_none());
+        assert!(!app.local_adjust_cache.contains_key(&local_key));
+        assert!(!app.edit_result_cache.contains_key(&edit_key));
+        assert!(!app.final_composite_cache.contains_key(&final_key));
+    }
+
+    #[test]
+    fn brush_release_bump_cancels_deferred_render_without_double_generation() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pipeline-brush-release.jpg");
+
+        app.set_local_adjust_layers_for_idx_memory_only_defer_render(idx, vec![brush_layer()]);
+        let pending = app
+            .local_adjust_brush_deferred_render
+            .expect("brush render should be deferred");
+        app.set_local_adjust_layers_for_idx_memory_only(idx, vec![brush_layer()]);
+
+        assert_eq!(app.local_adjust_generation.get(&idx), Some(&1));
+        assert!(app.local_adjust_brush_deferred_render.is_none());
+        let due = pending.last_input_at
+            + std::time::Duration::from_millis(LOCAL_ADJUST_BRUSH_EFFECT_DEFER_MS * 2);
+        assert!(
+            app.poll_deferred_local_adjust_brush_render_at(due)
+                .is_none()
+        );
+        assert_eq!(
+            app.local_adjust_generation.get(&idx),
+            Some(&1),
+            "release commit already invalidated render caches; deferred timer must not bump again"
+        );
     }
 }
 
