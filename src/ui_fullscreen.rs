@@ -2158,6 +2158,7 @@ impl App {
                                 is_spread_double,
                                 ai_upscale_info,
                                 &mut self.adjustment_mode,
+                                &mut self.adjustment_panel_tool,
                                 has_page_override,
                                 state.pdf_content_type,
                                 is_video_mode,
@@ -6939,6 +6940,7 @@ impl App {
         ai_upscale_info: Option<(&str, u32, u32)>,
         // 画像補正パネル表示トグル
         adjustment_mode: &mut bool,
+        adjustment_panel_tool: &mut crate::app::AdjustmentPanelTool,
         // 現在ページに個別補正が適用されているか (ボタン点灯用)
         has_page_override: bool,
         // PDF ページのコンテンツ種別 (非 PDF なら None)
@@ -7470,7 +7472,11 @@ impl App {
             };
             let resp = resp.hover_tip_dark(tooltip);
             if resp.clicked() {
-                *adjustment_mode = !*adjustment_mode;
+                let opening = !*adjustment_mode;
+                *adjustment_mode = opening;
+                if opening {
+                    *adjustment_panel_tool = crate::app::AdjustmentPanelTool::Adjustment;
+                }
             }
             if resp.hovered() {
                 *nav_delta = 0;

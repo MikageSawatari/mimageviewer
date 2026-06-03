@@ -15,7 +15,7 @@
 use eframe::egui;
 
 use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
-use crate::app::{AdjustSpreadTarget, App};
+use crate::app::{AdjustSpreadTarget, AdjustmentPanelTool, App};
 use crate::ui_fullscreen::SpreadPair;
 
 const HEADER_H: f32 = 36.0;
@@ -217,6 +217,34 @@ fn draw_local_adjust_section(
         .clicked()
     {
         *clear_layers = true;
+    }
+}
+
+fn draw_header_icon_button(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: &'static str,
+    enabled: bool,
+    active: bool,
+    tooltip: &str,
+    icon_fn: impl FnOnce(&egui::Painter, egui::Pos2, f32),
+) -> egui::Response {
+    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    let bg = if !enabled {
+        egui::Color32::from_rgba_unmultiplied(50, 50, 50, 120)
+    } else if active {
+        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 220)
+    } else if resp.hovered() {
+        egui::Color32::from_rgba_unmultiplied(100, 100, 100, 220)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
+    };
+    ui.painter().rect_filled(rect, 4.0, bg);
+    icon_fn(ui.painter(), rect.center(), rect.width() * 0.28);
+    if enabled {
+        resp.on_hover_text(tooltip)
+    } else {
+        resp.on_hover_text("画像を開いているときのみ使用できます")
     }
 }
 
@@ -859,29 +887,24 @@ impl App {
         child.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
 
         // ── ヘッダー ──
-        // タイトル「画像補正」を左寄せにし、右側に消しゴム / 隠蔽加工 / エクスポートの
-        // 起動アイコンを並べる。E / Ctrl+M / Ctrl+E キーと同じ動作をマウスからも辿れる
-        // ようにするためのエントリーポイント。
-        //
-        // Phase 4 v2 (2026-05): 文字バッジ「消」「隠」を **画像アイコン** に置換。
-        // 消しゴム = `draw_eraser_icon` (斜めの 2 段ブロック)、隠蔽加工 =
-        // `draw_mosaic_icon` (3x3 タイル、モザイクの視覚的メタファ)。
-        //
-        // 2026-05: エクスポート (Ctrl+E) のアイコンを追加。Ctrl+E はキー操作しか入口が
-        // 無く UI から気付けなかったため、消しゴム / 隠蔽の入口でもあるこのパネルに
-        // 同居させる。トレイへ下向き矢印の `draw_export_icon`。エクスポートは編集モード
-        // 中は実行できないので、クリック時は adjustment_mode を倒してから
-        // `open_export_dialog_for_current` を呼ぶ (= ビューモードへ戻して合成結果を書く)。
+        // タイトルを左寄せにし、右側に処理順の入口
+        // (消しゴム / 補正レイヤー / 隠蔽加工 / エクスポート) を並べる。
+        // 補正レイヤーだけはこの左パネル内の専用ビューへ切り替え、他 3 つは既存の
+        // 編集モード / 書き出しダイアログへ合流する。
         let header_rect =
             egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), HEADER_H));
         const HEADER_BTN_SIZE: f32 = 28.0;
         const HEADER_BTN_GAP: f32 = 4.0;
         const HEADER_RIGHT_PAD: f32 = 8.0;
+        let title = match self.adjustment_panel_tool {
+            AdjustmentPanelTool::Adjustment => "画像補正",
+            AdjustmentPanelTool::LocalAdjust => "補正レイヤー",
+        };
         // タイトル左寄せ (本文と同じ左余白、CENTER_Y 縦中央)
         child.painter().text(
             egui::pos2(header_rect.min.x + BODY_PAD_LEFT, header_rect.center().y),
             egui::Align2::LEFT_CENTER,
-            "画像補正",
+            title,
             egui::FontId::proportional(16.0),
             egui::Color32::WHITE,
         );
@@ -896,120 +919,102 @@ impl App {
                         | crate::grid_item::GridItem::PdfPage { .. }
                 )
             );
-        // 右側 3 ボタン (隠蔽 = 右端 / 消しゴム = その左 / エクスポート = さらに左)
+        // 右側 4 ボタン。左から 消しゴム / 補正レイヤー / 隠蔽加工 / エクスポート。
         let btn_y = header_rect.center().y - HEADER_BTN_SIZE / 2.0;
-        let conceal_btn_x = header_rect.max.x - HEADER_RIGHT_PAD - HEADER_BTN_SIZE;
-        let erase_btn_x = conceal_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
-        let export_btn_x = erase_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
-        let export_rect = egui::Rect::from_min_size(
-            egui::pos2(export_btn_x, btn_y),
-            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
-        );
+        let export_btn_x = header_rect.max.x - HEADER_RIGHT_PAD - HEADER_BTN_SIZE;
+        let conceal_btn_x = export_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+        let local_adjust_btn_x = conceal_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+        let erase_btn_x = local_adjust_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
         let erase_rect = egui::Rect::from_min_size(
             egui::pos2(erase_btn_x, btn_y),
+            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
+        );
+        let local_adjust_rect = egui::Rect::from_min_size(
+            egui::pos2(local_adjust_btn_x, btn_y),
             egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
         );
         let conceal_rect = egui::Rect::from_min_size(
             egui::pos2(conceal_btn_x, btn_y),
             egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
         );
+        let export_rect = egui::Rect::from_min_size(
+            egui::pos2(export_btn_x, btn_y),
+            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
+        );
         let mut activate_erase = false;
+        let mut activate_local_adjust = false;
         let mut activate_conceal = false;
         let mut activate_export = false;
-        // 消しゴムボタン: 鉛筆型アイコン。背景はホバーバーと同じ灰系で、ホバー時に明るく。
-        // disabled (= 非画像) は半透明で識別。
-        {
-            let resp = child.interact(
-                erase_rect,
-                egui::Id::new("adjust_panel_erase_btn"),
-                egui::Sense::click(),
-            );
-            let bg = if !can_overlay_edit {
-                egui::Color32::from_rgba_unmultiplied(50, 50, 50, 120)
-            } else if resp.hovered() {
-                egui::Color32::from_rgba_unmultiplied(100, 100, 100, 220)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
-            };
-            child.painter().rect_filled(erase_rect, 4.0, bg);
-            // アイコン描画 (中心、半径 = ボタンサイズの 28%、ホバーバーと同係数)
-            let r = HEADER_BTN_SIZE * 0.28;
-            crate::ui_fullscreen::draw_icons::draw_eraser_icon(
-                child.painter(),
-                erase_rect.center(),
-                r,
-            );
-            if can_overlay_edit && resp.clicked() {
-                activate_erase = true;
-            }
-            if can_overlay_edit {
-                resp.on_hover_text("消しゴム (E)");
-            }
+
+        let erase_resp = draw_header_icon_button(
+            &mut child,
+            erase_rect,
+            "adjust_panel_erase_btn",
+            can_overlay_edit,
+            false,
+            "消しゴム (E)",
+            crate::ui_fullscreen::draw_icons::draw_eraser_icon,
+        );
+        if can_overlay_edit && erase_resp.clicked() {
+            activate_erase = true;
         }
-        // 隠蔽加工ボタン: 2x2 タイル (モザイクメタファ)
-        {
-            let resp = child.interact(
-                conceal_rect,
-                egui::Id::new("adjust_panel_conceal_btn"),
-                egui::Sense::click(),
-            );
-            let bg = if !can_overlay_edit {
-                egui::Color32::from_rgba_unmultiplied(50, 50, 50, 120)
-            } else if resp.hovered() {
-                egui::Color32::from_rgba_unmultiplied(100, 100, 100, 220)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
-            };
-            child.painter().rect_filled(conceal_rect, 4.0, bg);
-            let r = HEADER_BTN_SIZE * 0.28;
-            // 3x3 モザイク専用アイコン (動画タイルモードの 2x2 とは別シンボル)
-            crate::ui_fullscreen::draw_icons::draw_mosaic_icon(
-                child.painter(),
-                conceal_rect.center(),
-                r,
-            );
-            if can_overlay_edit && resp.clicked() {
-                activate_conceal = true;
-            }
-            if can_overlay_edit {
-                resp.on_hover_text("隠蔽加工 (Ctrl+M)");
-            }
+
+        let local_adjust_active = self.adjustment_panel_tool == AdjustmentPanelTool::LocalAdjust;
+        let local_adjust_tooltip = if local_adjust_active {
+            "補正レイヤー (クリックで画像補正へ戻る)"
+        } else {
+            "補正レイヤー"
+        };
+        let local_adjust_resp = draw_header_icon_button(
+            &mut child,
+            local_adjust_rect,
+            "adjust_panel_local_adjust_btn",
+            can_overlay_edit,
+            local_adjust_active,
+            local_adjust_tooltip,
+            crate::ui_fullscreen::draw_icons::draw_local_adjust_icon,
+        );
+        if can_overlay_edit && local_adjust_resp.clicked() {
+            activate_local_adjust = true;
         }
-        // エクスポートボタン: 下向き矢印 + トレイ (= ファイル保存)。消しゴム補完や
-        // 隠蔽加工 (モザイク等)・色補正まで焼き込んだ画像をファイルへ書き出す入口で、
-        // Ctrl+E と同じ `open_export_dialog_for_current` を呼ぶ (dispatch 側で処理)。
-        {
-            let resp = child.interact(
-                export_rect,
-                egui::Id::new("adjust_panel_export_btn"),
-                egui::Sense::click(),
-            );
-            let bg = if !can_overlay_edit {
-                egui::Color32::from_rgba_unmultiplied(50, 50, 50, 120)
-            } else if resp.hovered() {
-                egui::Color32::from_rgba_unmultiplied(100, 100, 100, 220)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
-            };
-            child.painter().rect_filled(export_rect, 4.0, bg);
-            let r = HEADER_BTN_SIZE * 0.28;
-            crate::ui_fullscreen::draw_icons::draw_export_icon(
-                child.painter(),
-                export_rect.center(),
-                r,
-            );
-            if can_overlay_edit && resp.clicked() {
-                activate_export = true;
-            }
-            if can_overlay_edit {
-                resp.on_hover_text("エクスポート (Ctrl+E)");
-            }
+
+        let conceal_resp = draw_header_icon_button(
+            &mut child,
+            conceal_rect,
+            "adjust_panel_conceal_btn",
+            can_overlay_edit,
+            false,
+            "隠蔽加工 (Ctrl+M)",
+            crate::ui_fullscreen::draw_icons::draw_mosaic_icon,
+        );
+        if can_overlay_edit && conceal_resp.clicked() {
+            activate_conceal = true;
+        }
+
+        let export_resp = draw_header_icon_button(
+            &mut child,
+            export_rect,
+            "adjust_panel_export_btn",
+            can_overlay_edit,
+            false,
+            "エクスポート (Ctrl+E)",
+            crate::ui_fullscreen::draw_icons::draw_export_icon,
+        );
+        if can_overlay_edit && export_resp.clicked() {
+            activate_export = true;
         }
         // クリック処理は描画後にディスパッチ (借用衝突回避)。
         // 補正パネルは「ホバーで自動閉じる」モードなので、消しゴム / 隠蔽に入る前に
         // adjustment_mode を倒しておく (enter_*_mode 内のガード `!self.adjustment_mode`
         // と整合させるためにも必要)。`enter_*_mode` 自身が必要なキャッシュ初期化と
         // post_filter バイパスを行うので、ここでは flag を倒すだけで十分。
+        if activate_local_adjust {
+            self.adjustment_panel_tool = if local_adjust_active {
+                AdjustmentPanelTool::Adjustment
+            } else {
+                AdjustmentPanelTool::LocalAdjust
+            };
+        }
         if activate_erase {
             self.adjustment_mode = false;
             self.enter_erase_mode(fs_root_idx);
@@ -1187,6 +1192,19 @@ impl App {
                             ui.add_space(2.0);
                         }
 
+                        if self.adjustment_panel_tool == AdjustmentPanelTool::LocalAdjust {
+                            draw_local_adjust_section(
+                                ui,
+                                content_width,
+                                &local_adjust_layers,
+                                &mut add_local_adjust_effect,
+                                &mut set_local_adjust_enabled,
+                                &mut delete_local_adjust_layer,
+                                &mut clear_local_adjust_layers,
+                            );
+                            return (false, false);
+                        }
+
                         // ── スコープ表示 ──
                         ui.add_space(2.0);
                         ui.label(
@@ -1271,16 +1289,6 @@ impl App {
                             &mut edit_params,
                             ai_denoise_disabled_threshold,
                             ai_upscale_disabled_threshold,
-                        );
-
-                        draw_local_adjust_section(
-                            ui,
-                            content_width,
-                            &local_adjust_layers,
-                            &mut add_local_adjust_effect,
-                            &mut set_local_adjust_enabled,
-                            &mut delete_local_adjust_layer,
-                            &mut clear_local_adjust_layers,
                         );
 
                         // ── 保存スロット (5x2 grid) ──

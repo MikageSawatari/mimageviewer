@@ -275,6 +275,49 @@ pub(crate) fn draw_export_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     );
 }
 
+/// 補正レイヤーアイコン。重なった薄いシートで「非破壊レイヤー」を表す。
+pub(crate) fn draw_local_adjust_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let white = egui::Color32::WHITE;
+    let stroke = egui::Stroke::new(1.45, white);
+    let layer = |dy: f32| {
+        [
+            egui::pos2(c.x, c.y + dy - r * 0.58),
+            egui::pos2(c.x + r * 0.95, c.y + dy - r * 0.12),
+            egui::pos2(c.x, c.y + dy + r * 0.46),
+            egui::pos2(c.x - r * 0.95, c.y + dy - r * 0.12),
+        ]
+    };
+
+    for (dy, alpha) in [(r * 0.52, 95), (r * 0.18, 120), (-r * 0.18, 155)] {
+        let points = layer(dy);
+        painter.add(egui::Shape::convex_polygon(
+            points.to_vec(),
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
+            egui::Stroke::NONE,
+        ));
+        painter.add(egui::Shape::closed_line(points.to_vec(), stroke));
+    }
+
+    let accent = egui::Stroke::new(
+        1.15,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 190),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(c.x - r * 0.36, c.y - r * 0.18),
+            egui::pos2(c.x + r * 0.36, c.y - r * 0.18),
+        ],
+        accent,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(c.x, c.y - r * 0.54),
+            egui::pos2(c.x, c.y + r * 0.18),
+        ],
+        accent,
+    );
+}
+
 /// ウィンドウ / 全画面 切り替えアイコン (タイトルバー付きウィンドウ枠)。
 /// native 動画 HUD の `draw_overlay_window_toggle_icon` と見た目を揃える。
 pub(super) fn draw_window_toggle_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {

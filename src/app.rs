@@ -1446,6 +1446,16 @@ pub(crate) enum AdjustSpreadTarget {
     Right,
 }
 
+/// 左側の画像補正パネルで現在表示しているツール。
+///
+/// `Adjustment` は従来の全体画像補正、`LocalAdjust` は補正レイヤーの最小 UI。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum AdjustmentPanelTool {
+    #[default]
+    Adjustment,
+    LocalAdjust,
+}
+
 /// 仮想フォルダ (PDF/ZIP) 進入時の親 catalog への write-back ターゲット。
 /// `start_loading_items` で仮想フォルダ用 catalog を開くタイミングで構築し、
 /// `poll_thumbnails` の finalize シグナル経路で発火する。
@@ -2949,6 +2959,8 @@ pub struct App {
     // ── 画像補正 ──────────────────────────────────────────────────
     /// 補正パネル表示フラグ (左パネルホバーで表示)
     pub(crate) adjustment_mode: bool,
+    /// 左側の補正パネル内で表示するツール。
+    pub(crate) adjustment_panel_tool: AdjustmentPanelTool,
     /// 見開き表示中に補正パネルが操作する側 (画面上の左/右)。Single 表示中は
     /// 参照されない。`open_fullscreen` / spread_mode 切替で Left にリセット。
     pub(crate) adjust_spread_target: AdjustSpreadTarget,
@@ -4164,6 +4176,7 @@ impl App {
 
             // 画像補正
             adjustment_mode: false,
+            adjustment_panel_tool: AdjustmentPanelTool::Adjustment,
             adjust_spread_target: AdjustSpreadTarget::Left,
             adjustment_page_params: std::collections::HashMap::new(),
             adjustment_favorite_params: std::collections::HashMap::new(),
