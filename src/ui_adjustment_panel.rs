@@ -15,7 +15,7 @@
 use eframe::egui;
 
 use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
-use crate::app::{AdjustSpreadTarget, App};
+use crate::app::{AdjustSpreadTarget, App, LocalAdjustMaskEditTarget};
 use crate::local_adjust_catalog::{
     EFFECT_GROUPS, EffectKind, effect_picker_button_width, effect_picker_matches_query,
 };
@@ -120,6 +120,89 @@ impl MaskKind {
             Self::Subject => "被写体マスクを使います。自動生成は後続ステップで接続します。",
             Self::Segmentation => "領域候補マスクを使います。自動生成は後続ステップで接続します。",
         }
+    }
+}
+
+fn effective_local_mask_edit_target(
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+    selected: LocalAdjustMaskEditTarget,
+) -> Option<LocalAdjustMaskEditTarget> {
+    match &layer.mask {
+        local_adjust_core::LocalMask::Raster(_) | local_adjust_core::LocalMask::RasterVector(_) => {
+            Some(LocalAdjustMaskEditTarget::Base)
+        }
+        local_adjust_core::LocalMask::Full => (selected
+            == LocalAdjustMaskEditTarget::OverrideSubtract)
+            .then_some(LocalAdjustMaskEditTarget::OverrideSubtract),
+        _ => matches!(
+            selected,
+            LocalAdjustMaskEditTarget::OverrideAdd | LocalAdjustMaskEditTarget::OverrideSubtract
+        )
+        .then_some(selected),
+    }
+}
+
+fn local_mask_edit_target_label(target: LocalAdjustMaskEditTarget) -> &'static str {
+    match target {
+        LocalAdjustMaskEditTarget::None => "閉じる",
+        LocalAdjustMaskEditTarget::Base => "手動マスク",
+        LocalAdjustMaskEditTarget::OverrideAdd => "追加マスク",
+        LocalAdjustMaskEditTarget::OverrideSubtract => "削除マスク",
+    }
+}
+
+fn local_mask_override_slot_mut(
+    layer: &mut local_adjust_core::LocalAdjustmentLayer,
+    target: LocalAdjustMaskEditTarget,
+) -> Option<&mut Option<local_adjust_core::RasterVectorMask>> {
+    match target {
+        LocalAdjustMaskEditTarget::OverrideAdd => Some(&mut layer.manual_override.add),
+        LocalAdjustMaskEditTarget::OverrideSubtract => Some(&mut layer.manual_override.subtract),
+        _ => None,
+    }
+}
+
+fn local_mask_override_slot_ref(
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+    target: LocalAdjustMaskEditTarget,
+) -> Option<&Option<local_adjust_core::RasterVectorMask>> {
+    match target {
+        LocalAdjustMaskEditTarget::OverrideAdd => Some(&layer.manual_override.add),
+        LocalAdjustMaskEditTarget::OverrideSubtract => Some(&layer.manual_override.subtract),
+        _ => None,
+    }
+}
+
+fn local_adjust_raster_vector_has_content(mask: &local_adjust_core::RasterVectorMask) -> bool {
+    mask.alpha.iter().any(|a| *a > 0.0) || !mask.shapes.is_empty()
+}
+
+fn local_mask_override_has_content(
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+    target: LocalAdjustMaskEditTarget,
+) -> bool {
+    local_mask_override_slot_ref(layer, target).is_some_and(|slot| {
+        slot.as_ref()
+            .is_some_and(local_adjust_raster_vector_has_content)
+    })
+}
+
+fn compact_local_adjust_manual_override(layer: &mut local_adjust_core::LocalAdjustmentLayer) {
+    if layer
+        .manual_override
+        .add
+        .as_ref()
+        .is_some_and(|mask| !local_adjust_raster_vector_has_content(mask))
+    {
+        layer.manual_override.add = None;
+    }
+    if layer
+        .manual_override
+        .subtract
+        .as_ref()
+        .is_some_and(|mask| !local_adjust_raster_vector_has_content(mask))
+    {
+        layer.manual_override.subtract = None;
     }
 }
 
@@ -259,6 +342,9 @@ fn draw_local_adjust_section(
     selective_color_pick_active: bool,
     rgb_pick_active: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
     effect_position_handles_visible: bool,
+    mask_edit_target: &mut LocalAdjustMaskEditTarget,
+    mask_brush_radius: &mut f32,
+    mask_paint_add: &mut bool,
     effect_requests: &mut LocalEffectPanelRequests,
 ) {
     ui.add_space(4.0);
@@ -407,6 +493,9 @@ fn draw_local_adjust_section(
             selective_color_pick_active,
             rgb_pick_active,
             effect_position_handles_visible,
+            mask_edit_target,
+            mask_brush_radius,
+            mask_paint_add,
             effect_requests,
         );
     }
@@ -432,6 +521,9 @@ fn draw_selected_local_adjust_layer_editor(
     selective_color_pick_active: bool,
     rgb_pick_active: Option<crate::local_adjust_effect_ui::RgbPickTarget>,
     effect_position_handles_visible: bool,
+    mask_edit_target: &mut LocalAdjustMaskEditTarget,
+    mask_brush_radius: &mut f32,
+    mask_paint_add: &mut bool,
     effect_requests: &mut LocalEffectPanelRequests,
 ) {
     let mut edited = layer.clone();
@@ -454,7 +546,14 @@ fn draw_selected_local_adjust_layer_editor(
             .size(11.0)
             .color(egui::Color32::from_gray(180)),
     );
-    changed |= draw_local_mask_editor(ui, &mut edited, image_dims);
+    changed |= draw_local_mask_editor(
+        ui,
+        &mut edited,
+        image_dims,
+        mask_edit_target,
+        mask_brush_radius,
+        mask_paint_add,
+    );
     let response = draw_effect_params(
         ui,
         &mut edited,
@@ -566,6 +665,65 @@ fn sample_local_adjust_rgb(app: &App, fs_idx: usize, norm: [f32; 2]) -> Option<[
     let y = (norm[1].clamp(0.0, 1.0) * (h.saturating_sub(1)) as f32).round() as usize;
     let color = pixels.pixels[y.min(h - 1) * w + x.min(w - 1)];
     Some([color.r(), color.g(), color.b()])
+}
+
+fn local_adjust_norm_to_pixel(norm: [f32; 2], width: usize, height: usize) -> (f32, f32) {
+    (
+        norm[0].clamp(0.0, 1.0) * width.saturating_sub(1) as f32,
+        norm[1].clamp(0.0, 1.0) * height.saturating_sub(1) as f32,
+    )
+}
+
+fn paint_local_adjust_alpha_line(
+    alpha: &mut [f32],
+    width: usize,
+    height: usize,
+    from_norm: [f32; 2],
+    to_norm: [f32; 2],
+    radius: f32,
+    paint: bool,
+) -> bool {
+    if width == 0 || height == 0 || alpha.len() < width.saturating_mul(height) {
+        return false;
+    }
+    let from = local_adjust_norm_to_pixel(from_norm, width, height);
+    let to = local_adjust_norm_to_pixel(to_norm, width, height);
+    let radius = radius.max(1.0);
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let dist = (dx * dx + dy * dy).sqrt();
+    let steps = (dist / (radius * 0.5)).ceil().max(1.0) as usize;
+    let value = if paint { 1.0 } else { 0.0 };
+    let mut changed = false;
+
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let cx = from.0 + dx * t;
+        let cy = from.1 + dy * t;
+        let x0 = ((cx - radius).floor().max(0.0).min(width as f32)) as usize;
+        let y0 = ((cy - radius).floor().max(0.0).min(height as f32)) as usize;
+        let x1 = ((cx + radius).ceil().max(0.0).min(width as f32)) as usize;
+        let y1 = ((cy + radius).ceil().max(0.0).min(height as f32)) as usize;
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        let radius_sq = radius * radius;
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let ddx = px as f32 + 0.5 - cx;
+                let ddy = py as f32 + 0.5 - cy;
+                if ddx * ddx + ddy * ddy <= radius_sq {
+                    let idx = py * width + px;
+                    if (alpha[idx] - value).abs() > f32::EPSILON {
+                        alpha[idx] = value;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    changed
 }
 
 fn draw_local_adjust_ellipse(
@@ -803,10 +961,185 @@ fn draw_range_mask_sliders(ui: &mut egui::Ui, mask: &mut local_adjust_core::Rang
     changed
 }
 
+fn draw_local_manual_mask_controls(
+    ui: &mut egui::Ui,
+    layer: &mut local_adjust_core::LocalAdjustmentLayer,
+    mask_edit_target: &mut LocalAdjustMaskEditTarget,
+    mask_brush_radius: &mut f32,
+    mask_paint_add: &mut bool,
+) -> bool {
+    let mut changed = false;
+    let mask_kind = MaskKind::from_mask(&layer.mask);
+    ui.separator();
+    ui.label(
+        egui::RichText::new("手描き")
+            .size(11.0)
+            .color(egui::Color32::from_gray(190)),
+    );
+
+    match mask_kind {
+        MaskKind::Raster => {
+            *mask_edit_target = LocalAdjustMaskEditTarget::Base;
+            ui.label(
+                egui::RichText::new("画像上をドラッグして手動マスクを描きます。")
+                    .size(10.0)
+                    .color(egui::Color32::from_gray(170)),
+            );
+        }
+        MaskKind::Full => {
+            if matches!(
+                *mask_edit_target,
+                LocalAdjustMaskEditTarget::Base | LocalAdjustMaskEditTarget::OverrideAdd
+            ) {
+                *mask_edit_target = LocalAdjustMaskEditTarget::None;
+            }
+            ui.horizontal_wrapped(|ui| {
+                let label = if layer.manual_override.subtract.is_some() {
+                    "削除マスクあり"
+                } else {
+                    "削除マスク"
+                };
+                if ui
+                    .selectable_label(
+                        *mask_edit_target == LocalAdjustMaskEditTarget::OverrideSubtract,
+                        label,
+                    )
+                    .on_hover_text("全体マスクから除外する範囲を手描きします")
+                    .clicked()
+                {
+                    *mask_edit_target = LocalAdjustMaskEditTarget::OverrideSubtract;
+                }
+                if ui
+                    .selectable_label(
+                        *mask_edit_target == LocalAdjustMaskEditTarget::None,
+                        "閉じる",
+                    )
+                    .clicked()
+                {
+                    *mask_edit_target = LocalAdjustMaskEditTarget::None;
+                }
+            });
+        }
+        _ => {
+            if *mask_edit_target == LocalAdjustMaskEditTarget::Base {
+                *mask_edit_target = LocalAdjustMaskEditTarget::None;
+            }
+            ui.horizontal_wrapped(|ui| {
+                for target in [
+                    LocalAdjustMaskEditTarget::OverrideAdd,
+                    LocalAdjustMaskEditTarget::OverrideSubtract,
+                ] {
+                    let has_content = local_mask_override_has_content(layer, target);
+                    let label = if has_content {
+                        format!("{}あり", local_mask_edit_target_label(target))
+                    } else {
+                        local_mask_edit_target_label(target).to_string()
+                    };
+                    if ui
+                        .selectable_label(*mask_edit_target == target, label)
+                        .on_hover_text("ベースマスクに手動の追加/削除を重ねます")
+                        .clicked()
+                    {
+                        *mask_edit_target = target;
+                    }
+                }
+                if ui
+                    .selectable_label(
+                        *mask_edit_target == LocalAdjustMaskEditTarget::None,
+                        "閉じる",
+                    )
+                    .clicked()
+                {
+                    *mask_edit_target = LocalAdjustMaskEditTarget::None;
+                }
+            });
+        }
+    }
+
+    if let Some(active_target) = effective_local_mask_edit_target(layer, *mask_edit_target) {
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .selectable_label(*mask_paint_add, "描画")
+                .on_hover_text("ドラッグした範囲をマスクに追加します")
+                .clicked()
+            {
+                *mask_paint_add = true;
+            }
+            if ui
+                .selectable_label(!*mask_paint_add, "消去")
+                .on_hover_text("ドラッグした範囲を現在の手描きマスクから消します")
+                .clicked()
+            {
+                *mask_paint_add = false;
+            }
+        });
+        ui.add(
+            egui::Slider::new(mask_brush_radius, 1.0..=160.0)
+                .text("筆サイズ")
+                .custom_formatter(|v, _| format!("{:.0}px", v)),
+        );
+        let clear_label = match active_target {
+            LocalAdjustMaskEditTarget::Base => "ビットマップを消去",
+            LocalAdjustMaskEditTarget::OverrideAdd => "追加マスクを消去",
+            LocalAdjustMaskEditTarget::OverrideSubtract => "削除マスクを消去",
+            LocalAdjustMaskEditTarget::None => "消去",
+        };
+        if ui.small_button(clear_label).clicked() {
+            match active_target {
+                LocalAdjustMaskEditTarget::Base => match &mut layer.mask {
+                    local_adjust_core::LocalMask::Raster(mask) => {
+                        mask.alpha.fill(0.0);
+                        changed = true;
+                    }
+                    local_adjust_core::LocalMask::RasterVector(mask) => {
+                        mask.alpha.fill(0.0);
+                        changed = true;
+                    }
+                    _ => {}
+                },
+                LocalAdjustMaskEditTarget::OverrideAdd
+                | LocalAdjustMaskEditTarget::OverrideSubtract => {
+                    if let Some(slot) = local_mask_override_slot_mut(layer, active_target)
+                        && slot.is_some()
+                    {
+                        *slot = None;
+                        changed = true;
+                    }
+                }
+                LocalAdjustMaskEditTarget::None => {}
+            }
+        }
+        ui.label(
+            egui::RichText::new(format!(
+                "{}を編集中。画像上をドラッグして描画します。",
+                local_mask_edit_target_label(active_target)
+            ))
+            .size(10.0)
+            .color(egui::Color32::from_gray(170)),
+        );
+    } else {
+        let help = if mask_kind == MaskKind::Full {
+            "削除マスクを開くと、全体効果から除外する範囲を描けます。"
+        } else {
+            "追加マスクまたは削除マスクを開くと、ベースマスクに手描きを重ねられます。"
+        };
+        ui.label(
+            egui::RichText::new(help)
+                .size(10.0)
+                .color(egui::Color32::from_gray(170)),
+        );
+    }
+
+    changed
+}
+
 fn draw_local_mask_editor(
     ui: &mut egui::Ui,
     layer: &mut local_adjust_core::LocalAdjustmentLayer,
     image_dims: (usize, usize),
+    mask_edit_target: &mut LocalAdjustMaskEditTarget,
+    mask_brush_radius: &mut f32,
+    mask_paint_add: &mut bool,
 ) -> bool {
     let mut changed = false;
     ui.separator();
@@ -985,6 +1318,13 @@ fn draw_local_mask_editor(
             ui.label(format!("領域数: {}", mask.label_count()));
         }
     }
+    changed |= draw_local_manual_mask_controls(
+        ui,
+        layer,
+        mask_edit_target,
+        mask_brush_radius,
+        mask_paint_add,
+    );
     changed
 }
 
@@ -1726,6 +2066,88 @@ impl App {
         })
     }
 
+    fn paint_local_adjust_mask_brush(
+        &mut self,
+        fs_idx: usize,
+        layer_idx: usize,
+        target: LocalAdjustMaskEditTarget,
+        from_norm: [f32; 2],
+        to_norm: [f32; 2],
+        paint: bool,
+        persist: bool,
+    ) -> bool {
+        let radius = self.local_adjust_mask_brush_radius.max(1.0);
+        let image_dims = local_adjust_image_dims(self, fs_idx);
+        self.mutate_local_adjust_layer_from_canvas(fs_idx, layer_idx, persist, |layer| match target
+        {
+            LocalAdjustMaskEditTarget::Base => match &mut layer.mask {
+                local_adjust_core::LocalMask::Raster(mask) => paint_local_adjust_alpha_line(
+                    &mut mask.alpha,
+                    mask.width,
+                    mask.height,
+                    from_norm,
+                    to_norm,
+                    radius,
+                    paint,
+                ),
+                local_adjust_core::LocalMask::RasterVector(mask) => paint_local_adjust_alpha_line(
+                    &mut mask.alpha,
+                    mask.width,
+                    mask.height,
+                    from_norm,
+                    to_norm,
+                    radius,
+                    paint,
+                ),
+                _ => false,
+            },
+            LocalAdjustMaskEditTarget::OverrideAdd
+            | LocalAdjustMaskEditTarget::OverrideSubtract => {
+                let Some(slot) = local_mask_override_slot_mut(layer, target) else {
+                    return false;
+                };
+                let (width, height) = (image_dims.0.max(1), image_dims.1.max(1));
+                if slot
+                    .as_ref()
+                    .is_none_or(|mask| mask.width != width || mask.height != height)
+                {
+                    if !paint {
+                        return false;
+                    }
+                    *slot = Some(local_adjust_core::RasterVectorMask::empty(width, height));
+                }
+                let Some(mask) = slot.as_mut() else {
+                    return false;
+                };
+                paint_local_adjust_alpha_line(
+                    &mut mask.alpha,
+                    mask.width,
+                    mask.height,
+                    from_norm,
+                    to_norm,
+                    radius,
+                    paint,
+                )
+            }
+            LocalAdjustMaskEditTarget::None => false,
+        })
+    }
+
+    fn persist_local_adjust_mask_brush_stroke(&mut self) {
+        let Some(stroke) = self.local_adjust_mask_brush_stroke.take() else {
+            return;
+        };
+        let Some(mut layers) = self.local_adjust_page_layers.get(&stroke.fs_idx).cloned() else {
+            return;
+        };
+        if let Some(layer) = layers.get_mut(stroke.layer_idx) {
+            compact_local_adjust_manual_override(layer);
+        }
+        self.local_adjust_selected_layers
+            .insert(stroke.fs_idx, stroke.layer_idx);
+        self.set_local_adjust_layers_for_idx(stroke.fs_idx, layers);
+    }
+
     fn persist_local_adjust_canvas_drag(&mut self) {
         let Some(drag) = self.local_adjust_canvas_drag.take() else {
             return;
@@ -1747,10 +2169,12 @@ impl App {
             return;
         }
         let Some(fs_idx) = self.current_local_adjust_edit_idx() else {
+            self.local_adjust_mask_brush_stroke = None;
             return;
         };
         let Some(layer_idx) = self.selected_local_adjust_layer_idx(fs_idx) else {
             self.local_adjust_canvas_drag = None;
+            self.local_adjust_mask_brush_stroke = None;
             return;
         };
         let image_dims = local_adjust_image_dims(self, fs_idx);
@@ -1764,8 +2188,34 @@ impl App {
         });
 
         if primary_released {
+            self.persist_local_adjust_mask_brush_stroke();
             self.persist_local_adjust_canvas_drag();
             return;
+        }
+
+        if let Some(mut stroke) = self.local_adjust_mask_brush_stroke {
+            if primary_down {
+                if let Some(pos) = pointer_pos
+                    && let Some(norm) =
+                        local_adjust_screen_to_norm(pos, image_rect, image_dims, zoom_pan, false)
+                {
+                    self.paint_local_adjust_mask_brush(
+                        stroke.fs_idx,
+                        stroke.layer_idx,
+                        stroke.target,
+                        stroke.previous,
+                        norm,
+                        stroke.paint,
+                        false,
+                    );
+                    stroke.previous = norm;
+                    self.local_adjust_mask_brush_stroke = Some(stroke);
+                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                    ctx.request_repaint();
+                }
+                return;
+            }
+            self.local_adjust_mask_brush_stroke = None;
         }
 
         if let Some(drag) = self.local_adjust_canvas_drag {
@@ -1877,6 +2327,36 @@ impl App {
                 }
             }
 
+            let active_mask_edit_target = self
+                .local_adjust_page_layers
+                .get(&fs_idx)
+                .and_then(|layers| layers.get(layer_idx))
+                .and_then(|layer| {
+                    effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target)
+                });
+            if let Some(target) = active_mask_edit_target {
+                let stroke = crate::app::LocalAdjustMaskBrushStroke {
+                    fs_idx,
+                    layer_idx,
+                    target,
+                    paint: self.local_adjust_mask_paint_add,
+                    previous: norm,
+                };
+                self.local_adjust_mask_brush_stroke = Some(stroke);
+                self.paint_local_adjust_mask_brush(
+                    fs_idx,
+                    layer_idx,
+                    target,
+                    norm,
+                    norm,
+                    self.local_adjust_mask_paint_add,
+                    false,
+                );
+                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                ctx.request_repaint();
+                return;
+            }
+
             let mask_kind = self
                 .local_adjust_page_layers
                 .get(&fs_idx)
@@ -1932,13 +2412,22 @@ impl App {
                 }
                 _ => {}
             }
-        } else if matches!(
-            self.local_adjust_page_layers
-                .get(&fs_idx)
-                .and_then(|layers| layers.get(layer_idx))
-                .map(|layer| MaskKind::from_mask(&layer.mask)),
-            Some(MaskKind::ColorRange | MaskKind::LinearGradient | MaskKind::RadialGradient)
-        ) || self.local_adjust_selective_color_pick_active
+        } else if self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .and_then(|layers| layers.get(layer_idx))
+            .and_then(|layer| {
+                effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target)
+            })
+            .is_some()
+            || matches!(
+                self.local_adjust_page_layers
+                    .get(&fs_idx)
+                    .and_then(|layers| layers.get(layer_idx))
+                    .map(|layer| MaskKind::from_mask(&layer.mask)),
+                Some(MaskKind::ColorRange | MaskKind::LinearGradient | MaskKind::RadialGradient)
+            )
+            || self.local_adjust_selective_color_pick_active
             || self.local_adjust_rgb_pick_active.is_some()
         {
             ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -1982,6 +2471,23 @@ impl App {
         let image_dims = local_adjust_image_dims(self, fs_idx);
         let painter = ui.painter();
         let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 226, 120));
+        if effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target).is_some()
+            && let Some(pointer) = ui.ctx().input(|i| i.pointer.hover_pos())
+            && local_adjust_screen_to_norm(pointer, image_rect, image_dims, zoom_pan, true)
+                .is_some()
+            && let Some((scale, _)) = local_adjust_image_layout(image_rect, image_dims, zoom_pan)
+        {
+            let color = if self.local_adjust_mask_paint_add {
+                egui::Color32::from_rgb(255, 226, 120)
+            } else {
+                egui::Color32::from_rgb(255, 120, 120)
+            };
+            painter.circle_stroke(
+                pointer,
+                (self.local_adjust_mask_brush_radius * scale).max(1.0),
+                egui::Stroke::new(1.5, color),
+            );
+        }
         if self.local_adjust_effect_position_handles_visible
             && let Some((center_norm, label)) = local_adjust_effect_center(&layer.effect)
             && let Some(center) =
@@ -2366,6 +2872,9 @@ impl App {
         let selective_color_pick_active = self.local_adjust_selective_color_pick_active;
         let rgb_pick_active = self.local_adjust_rgb_pick_active;
         let effect_position_handles_visible = self.local_adjust_effect_position_handles_visible;
+        let mut mask_edit_target = self.local_adjust_mask_edit_target;
+        let mut mask_brush_radius = self.local_adjust_mask_brush_radius;
+        let mut mask_paint_add = self.local_adjust_mask_paint_add;
 
         let panel_pos = egui::pos2(
             full_rect.min.x + LOCAL_ADJUST_PANEL_MARGIN_X,
@@ -2516,6 +3025,9 @@ impl App {
                                             selective_color_pick_active,
                                             rgb_pick_active,
                                             effect_position_handles_visible,
+                                            &mut mask_edit_target,
+                                            &mut mask_brush_radius,
+                                            &mut mask_paint_add,
                                             &mut effect_requests,
                                         );
                                     });
@@ -2528,6 +3040,9 @@ impl App {
             self.local_adjust_mode = false;
         }
         self.local_adjust_effect_query = effect_query;
+        self.local_adjust_mask_edit_target = mask_edit_target;
+        self.local_adjust_mask_brush_radius = mask_brush_radius.max(1.0);
+        self.local_adjust_mask_paint_add = mask_paint_add;
         self.apply_local_adjust_panel_actions(
             fs_idx,
             add_quick_effect,

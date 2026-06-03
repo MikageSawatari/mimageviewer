@@ -304,6 +304,23 @@ pub(crate) struct LocalAdjustCanvasDrag {
     pub(crate) start: [f32; 2],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalAdjustMaskEditTarget {
+    None,
+    Base,
+    OverrideAdd,
+    OverrideSubtract,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalAdjustMaskBrushStroke {
+    pub(crate) fs_idx: usize,
+    pub(crate) layer_idx: usize,
+    pub(crate) target: LocalAdjustMaskEditTarget,
+    pub(crate) paint: bool,
+    pub(crate) previous: [f32; 2],
+}
+
 fn run_local_adjust_render(
     key: LocalAdjustResultKey,
     source: Arc<egui::ColorImage>,
@@ -3009,6 +3026,14 @@ pub struct App {
     pub(crate) local_adjust_effect_position_handles_visible: bool,
     /// 補正レイヤーの画像上ドラッグ操作状態。
     pub(crate) local_adjust_canvas_drag: Option<LocalAdjustCanvasDrag>,
+    /// 補正レイヤーの手描きマスク編集対象。
+    pub(crate) local_adjust_mask_edit_target: LocalAdjustMaskEditTarget,
+    /// 補正レイヤー手描きマスクのブラシ半径 (画像 px)。
+    pub(crate) local_adjust_mask_brush_radius: f32,
+    /// 補正レイヤー手描きマスクを描画するか、消去するか。
+    pub(crate) local_adjust_mask_paint_add: bool,
+    /// 補正レイヤー手描きマスクのドラッグ中状態。
+    pub(crate) local_adjust_mask_brush_stroke: Option<LocalAdjustMaskBrushStroke>,
     /// 補正レイヤー自身の世代番号。レイヤー追加 / 削除 / パラメータ変更で idx 単位に +1 する。
     pub(crate) local_adjust_generation: std::collections::HashMap<usize, u64>,
     /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
@@ -4218,6 +4243,10 @@ impl App {
             local_adjust_selective_color_pick_active: false,
             local_adjust_effect_position_handles_visible: true,
             local_adjust_canvas_drag: None,
+            local_adjust_mask_edit_target: LocalAdjustMaskEditTarget::None,
+            local_adjust_mask_brush_radius: 36.0,
+            local_adjust_mask_paint_add: true,
+            local_adjust_mask_brush_stroke: None,
             local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
