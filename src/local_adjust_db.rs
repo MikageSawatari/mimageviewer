@@ -4,7 +4,7 @@
 //! `Vec<local_adjust_core::LocalAdjustmentLayer>` を JSON として保存する。
 //! 初期統合では中央 DB を authoritative にし、サイドカーバックアップは後続で扱う。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use local_adjust_core::LocalAdjustmentLayer;
@@ -105,6 +105,39 @@ impl LocalAdjustDb {
         }
         set
     }
+
+    /// 指定プレフィックスで始まるページの補正レイヤー配列を一括取得する。
+    pub fn load_layers_by_prefix(
+        &self,
+        prefix: &str,
+    ) -> HashMap<String, Vec<LocalAdjustmentLayer>> {
+        let mut map = HashMap::new();
+        let Ok(mut stmt) = self.conn.prepare_cached(
+            "SELECT page_path, layers_json FROM local_adjust_pages
+             WHERE page_path LIKE ?1 ESCAPE '\\'",
+        ) else {
+            return map;
+        };
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+            .replace('[', "\\[");
+        let pattern = format!("{escaped}%");
+        let Ok(rows) = stmt.query_map([&pattern], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            return map;
+        };
+        for (key, json) in rows.flatten() {
+            if let Ok(layers) = serde_json::from_str::<Vec<LocalAdjustmentLayer>>(&json) {
+                if !layers.is_empty() {
+                    map.insert(key, layers);
+                }
+            }
+        }
+        map
+    }
 }
 
 #[cfg(test)]
@@ -156,5 +189,19 @@ mod tests {
 
         assert!(keys.contains("c:/imgs/100%/a.png"));
         assert!(!keys.contains("c:/imgs/100x/b.png"));
+    }
+
+    #[test]
+    fn load_layers_by_prefix_returns_non_empty_layers() {
+        let (_temp, db) = open_temp_db();
+        let layers = vec![sample_layer("a")];
+        db.set_layers("c:/imgs/a.png", &layers).unwrap();
+        db.set_layers("c:/other/b.png", &[sample_layer("b")])
+            .unwrap();
+
+        let map = db.load_layers_by_prefix("c:/imgs/");
+
+        assert_eq!(map.get("c:/imgs/a.png"), Some(&layers));
+        assert!(!map.contains_key("c:/other/b.png"));
     }
 }

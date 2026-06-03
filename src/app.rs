@@ -2880,6 +2880,14 @@ pub struct App {
     /// 解決は [`App::effective_params`] 参照。
     pub(crate) adjustment_favorite_params:
         std::collections::HashMap<uuid::Uuid, crate::adjustment::AdjustParams>,
+    /// ページ個別の補正レイヤー: item_idx → LocalAdjustmentLayer 配列。
+    /// フォルダロード時に `local_adjust_db` から復元し、表示合成は後段の
+    /// `local_adjust_cache` / worker が担当する。
+    pub(crate) local_adjust_page_layers:
+        std::collections::HashMap<usize, Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    /// 現フォルダで補正レイヤーを持つページの item_idx 集合 (サムネイルバッジ用)。
+    /// サムネイルには補正レイヤー結果自体を反映しない。
+    pub(crate) local_adjust_pages: std::collections::HashSet<usize>,
     /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
     /// フォルダロード時に mask_db から一括取得し、save/delete/apply でメンテナンスする。
     pub(crate) mask_pages: std::collections::HashSet<usize>,
@@ -2914,6 +2922,8 @@ pub struct App {
     pub(crate) adjustment_dragging: bool,
     /// 補正 DB ハンドル
     pub(crate) adjustment_db: Option<crate::adjustment_db::AdjustmentDb>,
+    /// 補正レイヤー DB ハンドル
+    pub(crate) local_adjust_db: Option<crate::local_adjust_db::LocalAdjustDb>,
     /// スロット保存ダイアログ: (slot_idx, 入力中の名前, 保存対象の補正値)。
     /// 補正値は開始時にキャプチャしておくことで、見開きの L/R 切替や
     /// ダイアログ中にスライダーを動かしても保存内容がブレない。
@@ -3698,6 +3708,10 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_adjustment", 0, t);
 
         let t = std::time::Instant::now();
+        let local_adjust_db = crate::local_adjust_db::LocalAdjustDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_local_adjust", 0, t);
+
+        let t = std::time::Instant::now();
         let mask_db = crate::mask_db::MaskDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_mask", 0, t);
 
@@ -4064,6 +4078,8 @@ impl App {
             adjust_spread_target: AdjustSpreadTarget::Left,
             adjustment_page_params: std::collections::HashMap::new(),
             adjustment_favorite_params: std::collections::HashMap::new(),
+            local_adjust_page_layers: std::collections::HashMap::new(),
+            local_adjust_pages: std::collections::HashSet::new(),
             mask_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
             adjustment_cache: std::collections::HashMap::new(),
@@ -4074,6 +4090,7 @@ impl App {
             thumb_adjust_was_dragging: false,
             adjustment_dragging: false,
             adjustment_db,
+            local_adjust_db,
             slot_save_dialog: None,
             ime_composing: false,
             ime_last_event_at: None,
@@ -8078,6 +8095,8 @@ impl App {
         self.adjustment_page_params.clear();
         self.adjustment_dragging = false;
         self.adjustment_mode = false;
+        self.local_adjust_page_layers.clear();
+        self.local_adjust_pages.clear();
         self.mask_pages.clear();
         self.erase_mask_generation.clear();
         self.conceal_pages.clear();
@@ -8144,6 +8163,36 @@ impl App {
                 &[(
                     "ms",
                     serde_json::Value::from(adj_t0.elapsed().as_secs_f64() * 1000.0),
+                )],
+            );
+        }
+
+        // 補正レイヤー: ページ単位のレイヤー配列を DB から復元。
+        // サムネイルには結果を反映しないが、バッジ判定用に idx 集合も保持する。
+        let local_adjust_t0 = std::time::Instant::now();
+        if let Some(db) = &self.local_adjust_db {
+            let prefix = crate::adjustment_db::normalize_path(&source_path);
+            let page_map = db.load_layers_by_prefix(&prefix);
+            if !page_map.is_empty() {
+                for idx in 0..self.items.len() {
+                    if let Some(key) = self.page_path_key(idx) {
+                        if let Some(layers) = page_map.get(&key) {
+                            self.local_adjust_page_layers.insert(idx, layers.clone());
+                            self.local_adjust_pages.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "sli_local_adjust_db",
+                None,
+                sli_seq,
+                &[(
+                    "ms",
+                    serde_json::Value::from(local_adjust_t0.elapsed().as_secs_f64() * 1000.0),
                 )],
             );
         }
