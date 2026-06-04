@@ -326,24 +326,35 @@ impl App {
                     == crate::snapshot::snapshot_key_from_path(&snap.origin)
             })
             .unwrap_or(false);
-        // ユーザー報告 fix: Ctrl+G/Ctrl+S 検索 view から ★固定した場合、origin が合成 path
-        // `__search_results__` になっている。snapshot は検索 mode を consume したので、
-        // 解除しても自然な表示にならない (= items だけ復元しても active=false で UI 不整合)。
-        // → pre_snapshot_search_origin が記録されていればそれを load_folder で開く。
-        let origin_is_synthetic =
-            at_origin && snap.origin == crate::app::search_results_synthetic_path();
-        if origin_is_synthetic {
-            if let Some(restore_to) = snap.pre_snapshot_search_origin.clone() {
-                // snapshot は既に take() で None になっているので load_folder の guard は通る。
-                // load_folder 経路で items/thumbnails/visible_indices/items_generation/cache が
-                // 全部入れ替わる (= invalidate も自動)。
-                self.load_folder(restore_to);
-                self.show_feedback_toast("★固定を解除しました".into());
-                return;
-            }
-            // pre_snapshot_search_origin が無い場合は fallback で saved_items 復元
-            // (= 合成 path 表示のまま残るが、エッジケースとして許容)。
+        // ユーザー報告 fix (2 段階目): Ctrl+G/Ctrl+S 検索 view から ★固定した場合、
+        // snapshot は検索 mode を consume したので解除しても自然な表示にならない (= items
+        // だけ復元しても active=false で UI 不整合 / 「🌐 アイテム検索: ...」表示が残る)。
+        // pre_snapshot_search_origin が Some (= snapshot ON 時に検索 active だった) なら、
+        // origin の form (= 合成 path か drilled 実 path か) に関係なく、検索開始前の
+        // 現実 folder に load_folder で戻る。
+        //
+        // 旧版 (c508ca25) は origin == __search_results__ (= Ctrl+G flat view のみ) を
+        // 判定していたが、Ctrl+G drilled view では origin が drill container の実 path に
+        // なるため判定が漏れて、saved_items 復元で「🌐 アイテム検索: ... (10000 件)」表示が
+        // 残るバグになっていた (= ユーザー報告)。
+        let _ = at_origin; // synthetic check 削除に伴い未使用、後段の at_origin 分岐で再 bind
+        if let Some(restore_to) = snap.pre_snapshot_search_origin.clone() {
+            // snapshot は既に take() で None になっているので load_folder の guard は通る。
+            // load_folder 経路で items/thumbnails/visible_indices/items_generation/cache が
+            // 全部入れ替わる (= invalidate も自動)。
+            self.load_folder(restore_to);
+            self.show_feedback_toast("★固定を解除しました".into());
+            return;
         }
+        // ここから先は「通常 folder からの ★固定」のみ (= pre_snapshot_search_origin None)
+        let at_origin = self
+            .current_folder
+            .as_ref()
+            .map(|p| {
+                crate::snapshot::snapshot_key_from_path(p)
+                    == crate::snapshot::snapshot_key_from_path(&snap.origin)
+            })
+            .unwrap_or(false);
         if at_origin {
             // origin のまま解除 → 元の items 復元 (= snapshot 元のフォルダに戻る)。
             // snapshot 中に subset (= self.thumbnails) で thumbnail worker が
