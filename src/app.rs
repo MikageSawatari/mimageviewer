@@ -6107,15 +6107,19 @@ impl App {
     /// をスキップできる。`path` が ZIP/PDF ファイルのときは仮想フォルダとして
     /// 別ルートに入るため `pre_scan` は無視される (None 相当で委譲)。
     pub fn load_folder_with_scan(&mut self, path: PathBuf, pre_scan: Option<ScannedDir>) {
-        // ★固定 (Snapshot Lock) 中は範囲外フォルダへの移動を block する (= §4.4)。
-        // 検索 mode 起動など意図的に snapshot を解除して移動するケースは、caller が
-        // 事前に `deactivate_snapshot()` を呼ぶ責任を持つ。pending nav は 1 件分の
-        // toast に集約 (= 同フレームで複数 caller が来てもユーザーには 1 件しか見えない)。
-        // ただし `snapshot_internal_nav = true` 中は snapshot navigation 経路なので
-        // bypass する (= snapshot 内 Folder entry に入る正常 flow、§4.6)。
-        if self.is_snapshot_active() && !self.snapshot_internal_nav {
+        // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
+        // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能
+        // (§4.4 「captured folder の中の child folder」)。判定は `snapshot_owner_entry`
+        // で path 完全一致または prefix 一致を見る。
+        // snapshot_internal_nav は snapshot_load_and_open 経由の forced bypass (= 既知
+        // safe path のみ)、ここの owner_entry チェックは UI 経由 click を扱う。
+        if self.is_snapshot_active()
+            && !self.snapshot_internal_nav
+            && self.snapshot_owner_entry(&path).is_none()
+        {
             self.show_feedback_toast(
-                "スナップショット中は他のフォルダに移動できません (★固定を解除してください)".into(),
+                "スナップショット中は範囲外のフォルダに移動できません (★固定を解除してください)"
+                    .into(),
             );
             return;
         }
