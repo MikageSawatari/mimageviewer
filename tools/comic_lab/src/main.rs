@@ -403,15 +403,16 @@ struct ComicLab {
     /// Decode cache keyed by stamp source key (so the same emoji/file decodes
     /// once and is reused across objects). `None` = decode failed (don't retry).
     stamp_source_cache: HashMap<String, Option<Arc<RgbaOverlay>>>,
-    /// Stamp source key -> GPU texture, uploaded once. While a stamp is being
-    /// dragged/resized/rotated it's drawn as a GPU-transformed quad from this
-    /// texture (scale/rotate are ~free on the GPU) and EXCLUDED from the CPU bake,
-    /// so a large/rotated stamp no longer re-rasterizes on every drag frame.
+    /// Stamp source key -> GPU texture, uploaded once. Non-outlined stamps are
+    /// drawn as GPU-transformed quads from this texture (scale/rotate/flip/opacity
+    /// are ~free on the GPU) and EXCLUDED from the CPU bake entirely, so stamps
+    /// never re-rasterize on the CPU — the bake stays cheap regardless of stamp
+    /// count/size/rotation. (Outlined stamps stay in the CPU bake for the halo.)
     stamp_textures: HashMap<String, TextureHandle>,
-    /// Stamp id excluded from the last completed bake (= drawn as a GPU quad
-    /// during its drag). Used to force a final, complete re-bake when the drag
-    /// ends so the stamp lands back in the WYSIWYG overlay with correct z/outline.
-    baked_excluded: Option<u64>,
+    /// Stamp ids excluded from the last completed bake (= the GPU-quad stamps),
+    /// sorted. When this set changes (stamp added/removed/outline toggled/z moved)
+    /// the CPU bake must re-run.
+    baked_excluded_set: Vec<u64>,
     /// Recently used stamps (MRU, persisted) for quick re-insert.
     recent_stamps: Vec<StampSource>,
     /// Whether the stamp picker dialog is open.
@@ -573,7 +574,7 @@ impl ComicLab {
             stamp_images: StampImages::new(),
             stamp_source_cache: HashMap::new(),
             stamp_textures: HashMap::new(),
-            baked_excluded: None,
+            baked_excluded_set: Vec::new(),
             recent_stamps: load_recent_stamps(),
             show_stamp_dialog: false,
             stamp_dialog_filter: String::new(),
@@ -1471,7 +1472,7 @@ impl ComicLab {
         }
     }
 
-    fn rebake(&mut self, ctx: &egui::Context, exclude: Option<u64>) {
+    fn rebake(&mut self, ctx: &egui::Context, exclude: &[u64]) {
         if self.image.is_none() {
             return;
         }
@@ -1484,27 +1485,55 @@ impl ComicLab {
             let img = self.image.as_ref().unwrap();
             (img.width, img.height)
         };
-        // Hide the live-dragged stamp from the bake (it's drawn as a GPU quad
-        // instead). Save & restore its `enabled` so the user's state isn't lost.
-        let hidden = exclude
-            .and_then(|id| self.objects.iter().position(|o| o.id == id))
-            .map(|idx| (idx, self.objects[idx].enabled));
-        if let Some((idx, _)) = hidden {
-            self.objects[idx].enabled = false;
+        // Hide the GPU-quad stamps from the bake (they're drawn as GPU quads).
+        // They're all enabled by construction, so restore them to enabled after.
+        let mut restore: Vec<usize> = Vec::new();
+        for &id in exclude {
+            if let Some(idx) = self.objects.iter().position(|o| o.id == id) {
+                if self.objects[idx].enabled {
+                    self.objects[idx].enabled = false;
+                    restore.push(idx);
+                }
+            }
         }
         let t_c = std::time::Instant::now();
         let overlay =
             bake_overlay_with_stamps(&self.objects, iw, ih, &self.fonts, &self.stamp_images);
         self.last_composite_ms = t_c.elapsed().as_secs_f64() * 1000.0;
-        if let Some((idx, was)) = hidden {
-            self.objects[idx].enabled = was;
+        for idx in restore {
+            self.objects[idx].enabled = true;
         }
         let t_u = std::time::Instant::now();
         let color = ColorImage::from_rgba_unmultiplied([overlay.w, overlay.h], &overlay.pixels);
         self.baked_texture = Some(ctx.load_texture("comic_baked", color, TextureOptions::LINEAR));
         self.last_upload_ms = t_u.elapsed().as_secs_f64() * 1000.0;
         self.baked_dirty = false;
-        self.baked_excluded = exclude;
+        self.baked_excluded_set = exclude.to_vec();
+    }
+
+    /// Ids of stamps drawn as GPU quads (= excluded from the CPU bake): enabled,
+    /// no sticker outline (an outline needs the CPU halo), and decodable. Sorted
+    /// by (z, id) so the quads layer correctly among themselves. Ensures each
+    /// texture is uploaded as a side effect.
+    fn gpu_stamp_ids(&mut self, ctx: &egui::Context) -> Vec<u64> {
+        let mut cands: Vec<(i32, u64, StampSource)> = self
+            .objects
+            .iter()
+            .filter_map(|o| match &o.kind {
+                AnnotationKind::Stamp(s) if o.enabled && s.outline.is_none() => {
+                    Some((o.z, o.id, s.source.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        cands.sort_by_key(|&(z, id, _)| (z, id));
+        let mut ids = Vec::with_capacity(cands.len());
+        for (_, id, source) in cands {
+            if self.ensure_stamp_texture(ctx, &source).is_some() {
+                ids.push(id);
+            }
+        }
+        ids
     }
 
     /// Upload a stamp source as a GPU texture (once, cached by source key) for the
@@ -1530,9 +1559,10 @@ impl ComicLab {
         Some(tex)
     }
 
-    /// Draw the live drag preview of stamp `id` as a GPU-transformed textured quad
-    /// (scale/rotate/flip/opacity), matching where the bake will place it on
-    /// release. Avoids CPU-rasterizing a large/rotated stamp every drag frame.
+    /// Draw stamp `id` as a GPU-transformed textured quad (scale/rotate/flip/
+    /// opacity), centered on its pivot. Used for ALL non-outlined stamps (they're
+    /// excluded from the CPU bake), so a stamp never re-rasterizes on the CPU and
+    /// its position is identical whether idle or being dragged.
     fn draw_stamp_preview(&mut self, ctx: &egui::Context, painter: &egui::Painter, id: u64) {
         let Some(obj) = self.objects.iter().find(|o| o.id == id) else {
             return;
@@ -4622,61 +4652,34 @@ impl ComicLab {
             // don't allocate + upload a full-resolution texture every frame.
             let now = ctx.input(|i| i.time);
             let dragging = self.drag != DragKind::None;
-            // While a stamp is being moved / resized / rotated, draw it as a GPU
-            // textured quad and keep it OUT of the CPU bake — scale & rotate are
-            // ~free on the GPU, so a large/rotated stamp no longer re-rasterizes
-            // (scale-to-fit + rotate_blit) on every drag frame. Only transform
-            // drags qualify (not Pan / tail handles).
-            let preview_stamp: Option<u64> = if matches!(
-                self.drag,
-                DragKind::Move | DragKind::Corner(_) | DragKind::Rotate
-            ) {
-                // Candidate: the selected, ENABLED stamp (a disabled/hidden stamp
-                // must not pop into view as a quad).
-                let cand = self.selected.and_then(|id| {
-                    self.objects
-                        .iter()
-                        .find(|o| o.id == id && o.enabled)
-                        .and_then(|o| match &o.kind {
-                            AnnotationKind::Stamp(s) => Some((id, s.source.clone())),
-                            _ => None,
-                        })
-                });
-                // Only exclude it from the bake when we actually have a GPU texture
-                // to draw — otherwise keep it in the bake so a missing-image stamp
-                // still shows its placeholder during the drag (no vanishing).
-                match cand {
-                    Some((id, source)) if self.ensure_stamp_texture(ctx, &source).is_some() => {
-                        Some(id)
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            // The exclusion changing (drag start hides the stamp from the bake;
-            // drag end must bring it back with correct z/outline) requires a bake.
-            let exclusion_changed = preview_stamp != self.baked_excluded;
-            if exclusion_changed {
+            // All non-outlined stamps are drawn as GPU textured quads and kept OUT
+            // of the CPU bake entirely (scale/rotate/flip/opacity are ~free on the
+            // GPU). The bake then never rasterizes a stamp, so it's cheap no matter
+            // how many large/rotated stamps exist, and a stamp's on-screen position
+            // never changes between "dragging" and "idle" (no CPU↔GPU handoff, so
+            // no drag-end shift). Outlined stamps stay in the bake (CPU halo).
+            let gpu_ids = self.gpu_stamp_ids(ctx);
+            // The excluded SET changing (stamp added/removed, outline toggled, z
+            // reordered) means the bake content changed → must re-bake.
+            let set_changed = gpu_ids != self.baked_excluded_set;
+            if set_changed {
                 self.baked_dirty = true;
             }
-            // KEY: while a stamp is being dragged, the baked layer EXCLUDES it and
-            // every other object is static, so the bake output doesn't change frame
-            // to frame — only the GPU quad moves. So bake exactly ONCE at grab
-            // (exclusion_changed) and skip the throttled re-bakes that were
-            // re-rasterizing all the *other* stamps + re-uploading the full-res
-            // texture every tick (the periodic stutter). Non-stamp drags
-            // (bubbles/windows are IN the bake and moving) still re-bake throttled.
-            let stamp_drag_static = preview_stamp.is_some() && !exclusion_changed;
+            // While dragging one of the GPU stamps, the CPU bake (which excludes all
+            // of them) is static — only the dragged quad moves — so skip re-baking
+            // (this was the periodic stutter: re-rasterizing/re-uploading every
+            // tick). Dragging a non-stamp (it IS in the bake and moving) re-bakes.
+            let dragging_gpu_stamp = dragging && self.selected.is_some_and(|id| gpu_ids.contains(&id));
+            let suppress = dragging_gpu_stamp && !set_changed;
             // During a drag, adapt the re-bake interval to the last bake's cost so
             // a heavy scene doesn't saturate the UI thread with back-to-back bakes.
             let min_interval = (self.last_bake_dur * 1.5).clamp(0.03, 0.25);
             if self.baked_dirty
-                && !stamp_drag_static
+                && !suppress
                 && (!dragging || now - self.last_bake_time >= min_interval)
             {
                 let t0 = std::time::Instant::now();
-                self.rebake(ctx, preview_stamp);
+                self.rebake(ctx, &gpu_ids);
                 self.last_bake_dur = t0.elapsed().as_secs_f64();
                 self.last_bake_time = now;
             }
@@ -4690,8 +4693,8 @@ impl ComicLab {
                     Color32::WHITE,
                 );
             }
-            // Live GPU preview of the dragged stamp, on top of the bake.
-            if let Some(id) = preview_stamp {
+            // GPU stamps on top of the bake, in z order among themselves.
+            for &id in &gpu_ids {
                 self.draw_stamp_preview(ctx, &painter, id);
             }
 
