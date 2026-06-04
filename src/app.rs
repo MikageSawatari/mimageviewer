@@ -13145,10 +13145,10 @@ impl App {
         // PageUp/PageDown 単体は一覧のページ移動なので、Ctrl 付きだけをここで扱う。
         if ctrl_page_down {
             self.bump_input_seq("grid_sibling_nav", Some("forward"));
-            // ★固定 中はグリッドでも snapshot 内 container entry を巡回 (= Ctrl+↑↓ と同型、
-            // Codex P2-1 対応で追加)。snapshot scope の外への sibling 移動は意味なし。
+            // ★固定 中: P2-2 fix で Ctrl+↑↓ と Ctrl+PageUp/Down の意味分岐を統一。
+            // Ctrl+PageUp/Down は image-like のみ巡回 (= page 版)、Ctrl+↑↓ は全 entry。
             if self.is_snapshot_active() {
-                let _ = self.snapshot_navigate_grid(true);
+                let _ = self.snapshot_navigate_grid_page(true);
             } else if in_global_search || in_favsearch {
                 // 検索ビューは仮想階層なので、実ファイルシステムの兄弟移動は行わない。
             } else if in_local_search {
@@ -13160,7 +13160,7 @@ impl App {
         if ctrl_page_up {
             self.bump_input_seq("grid_sibling_nav", Some("backward"));
             if self.is_snapshot_active() {
-                let _ = self.snapshot_navigate_grid(false);
+                let _ = self.snapshot_navigate_grid_page(false);
             } else if in_global_search || in_favsearch {
                 // 同上。
             } else if in_local_search {

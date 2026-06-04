@@ -782,7 +782,9 @@ impl App {
     /// snapshot 内の **次/前 container entry** index を返す
     /// (= Folder / ZipFile / PdfFile / ConvertibleArchive のみ対象、image-like は skip)。
     ///
-    /// グリッド中の Ctrl+↑↓ で snapshot 内 folder 間を巡回するために使う。
+    /// P2-2 fix 後は内部利用なし (= 全 entry を扱う arrow / playable resolver に統一)。
+    /// 将来 container only nav が必要になった場合のために保持。
+    #[allow(dead_code)]
     pub(crate) fn snapshot_next_container_entry(
         &self,
         current_idx: Option<usize>,
@@ -817,23 +819,36 @@ impl App {
 
     /// グリッド中の snapshot navigation (= Ctrl+↑↓ from grid)。
     ///
-    /// 現在 folder が snapshot 内 container entry の中に居る場合、その entry の owner_idx
-    /// を出発点に、次/前の container entry を resolve して `load_folder` で開く。
-    /// fullscreen は開かない (= グリッド表示を維持)。
+    /// Codex P2-2 修正: resolver semantics 統一。
+    /// - Ctrl+↑↓ → 全 entry (snapshot_next_arrow_entry)
+    /// - 次 entry が container なら load_folder で grid 表示
+    /// - 次 entry が image-like なら直接 open_fullscreen (= 自然な「次へ」)
     ///
+    /// fullscreen 中の snapshot_navigate と semantics 完全一致。
     /// 戻り値: `true` = navigation した、`false` = 末尾 / inactive。末尾は toast。
     pub(crate) fn snapshot_navigate_grid(&mut self, forward: bool) -> bool {
+        self.snapshot_navigate_grid_inner(forward, /*page_only=*/ false)
+    }
+
+    /// グリッド中の snapshot Ctrl+PageUp/Down 用 (= playable のみ巡回)。
+    pub(crate) fn snapshot_navigate_grid_page(&mut self, forward: bool) -> bool {
+        self.snapshot_navigate_grid_inner(forward, /*page_only=*/ true)
+    }
+
+    fn snapshot_navigate_grid_inner(&mut self, forward: bool, page_only: bool) -> bool {
         if !self.is_snapshot_active() {
             return false;
         }
-        // 現在 folder → snapshot 内 container entry の idx を解決
-        // (= snapshot_origin に居る場合は None、child folder の中なら owner_entry が hit)
         let current_owner = self
             .current_folder
             .clone()
             .and_then(|p| self.snapshot_owner_entry(&p));
-        let Some(next_idx) = self.snapshot_next_container_entry(current_owner, forward) else {
-            // snapshot 内に次/前 container が無い (= 末尾、または snapshot 全部 image)
+        let next_idx = if page_only {
+            self.snapshot_next_playable_entry(current_owner, forward)
+        } else {
+            self.snapshot_next_arrow_entry(current_owner, forward)
+        };
+        let Some(next_idx) = next_idx else {
             self.show_feedback_toast(
                 if forward {
                     "★固定リスト末尾です"
@@ -844,49 +859,67 @@ impl App {
             );
             return false;
         };
-        // 次 container entry の path を取得して snapshot_load_and_open
-        let Some(entry) = self.snapshot.as_ref().and_then(|s| s.items.get(next_idx)) else {
+        // kind で動作分岐: container は grid 表示 (load_folder)、playable は fullscreen
+        let entry_kind = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.items.get(next_idx))
+            .map(|e| e.kind);
+        let Some(entry_kind) = entry_kind else {
             return false;
         };
-        use crate::snapshot::SnapshotTarget;
-        let target_path = match &entry.target {
-            SnapshotTarget::Fs(p) => p.clone(),
-            // ZipImage/PdfPage は is_container() = false なので next_container_entry が返さない
-            // が、防御的に early return
-            _ => return false,
-        };
-        // grid mode = was_fs false + resume_slideshow false で呼ぶ
-        // (= snapshot_load_and_open の内部 if was_fs || resume_slideshow ブランチは
-        // 通らず、items 入れ替えだけ。fullscreen は開かない。)
-        self.snapshot_internal_nav = true;
-        self.load_folder(target_path);
-        self.snapshot_internal_nav = false;
-        // ★一時解除中の自動発動は `maybe_restore_rating_filter_if_out_of_scope`
-        // (= load_folder 末尾) が現在 folder の★を見て自動再評価するので、ここで
-        // 明示的に呼ぶ必要はない。
-        if self.rating_filter_suppressed_at.is_some() {
-            self.rebuild_visible_indices();
+        if entry_kind.is_playable_leaf() {
+            // image-like → fullscreen で開く (= grid からでも snapshot 内 image を直接 view)
+            self.snapshot_open_entry(next_idx, /*resume_slideshow=*/ false)
+        } else {
+            // container → grid 表示で load_folder (fullscreen は開かない、既存挙動)
+            let Some(entry) = self.snapshot.as_ref().and_then(|s| s.items.get(next_idx)) else {
+                return false;
+            };
+            use crate::snapshot::SnapshotTarget;
+            let target_path = match &entry.target {
+                SnapshotTarget::Fs(p) => p.clone(),
+                SnapshotTarget::ConvertibleArchive { path, .. } => {
+                    if let Some(cached) = self.try_archive_cache_lookup(path) {
+                        cached
+                    } else {
+                        self.show_feedback_toast(
+                            "変換対応アーカイブは★固定範囲内で開けません".into(),
+                        );
+                        return false;
+                    }
+                }
+                _ => return false,
+            };
+            self.snapshot_internal_nav = true;
+            self.load_folder(target_path);
+            self.snapshot_internal_nav = false;
+            if self.rating_filter_suppressed_at.is_some() {
+                self.rebuild_visible_indices();
+            }
+            true
         }
-        true
     }
 
     /// snapshot navigation のスライドショー版 (= ctx 不要、末尾で slideshow 停止)。
     ///
-    /// `try_start_slideshow_next_folder` から呼ばれる。slideshow_playing を維持しつつ
-    /// 次の **container entry** (= Folder/Zip/Pdf) を open する (= snapshot 内の次 folder
-    /// 巡回がメイン use case)。container 内で先頭画像から slideshow 再開する。
-    /// 末尾なら slideshow 停止して true 返す (= caller がループフォールバックしない)。
+    /// Codex P2-2 修正: resolver semantics 統一。snapshot_next_arrow_entry (= 全 entry)
+    /// で次 entry を探し、kind に応じて:
+    /// - container → snapshot_open_entry が snapshot_load_and_open で最初の playable item
+    ///   を fullscreen で開く + slideshow_playing=true 再開
+    /// - playable leaf → snapshot_open_entry が直接 open_fullscreen + slideshow_playing
+    ///
+    /// 旧版は container 限定 (snapshot_next_container_entry) だったため、snapshot 内が
+    /// image のみだと末尾扱いで停止していた。新挙動では image-only snapshot でも
+    /// 次 image に進める。
     ///
     /// 戻り値:
-    /// - true = 次 container open or 末尾停止のいずれかで処理完了 (= caller の loop fallback 抑止)
+    /// - true = 次 entry open or 末尾停止のいずれかで処理完了 (= caller の loop fallback 抑止)
     /// - false = snapshot inactive (= caller が通常 fallback)
     pub(crate) fn snapshot_advance_for_slideshow(&mut self, forward: bool) -> bool {
         if !self.is_snapshot_active() {
             return false;
         }
-        // 現在 folder の owner_entry idx を取得。snapshot_current_fullscreen_path は
-        // image path を返すので、その image が属する owner container を解決する。
-        // current_folder ベースで owner を引いた方が確実なので両方試みて優先順位を付ける。
         let current_owner = self
             .snapshot_current_fullscreen_path()
             .and_then(|p| self.snapshot_owner_entry(&p))
@@ -895,18 +928,13 @@ impl App {
                     .clone()
                     .and_then(|p| self.snapshot_owner_entry(&p))
             });
-        // 次の container entry (= ★3 folder の次など) を探す
-        let next = self.snapshot_next_container_entry(current_owner, forward);
+        // P2-2 fix: 全 entry を対象に巡回 (= Ctrl+↑↓ と同じ semantics)
+        let next = self.snapshot_next_arrow_entry(current_owner, forward);
         if let Some(idx) = next {
-            // 次 container を open + 中で先頭画像から slideshow 再開
-            // snapshot_open_entry は Folder kind の entry で snapshot_load_and_open を呼び、
-            // resume_slideshow=true なら最初の playable item で fullscreen + slideshow_playing
             let _ = self.snapshot_open_entry(idx, /*resume_slideshow=*/ true);
             true
         } else {
-            // 末尾: 次 container 無し → slideshow 停止 + nav lock 解除
-            // capture_fs_nav_holdover で取得した lock を release しないと次の Ctrl+↑↓ が
-            // fs_nav_is_locked() で block される (= ユーザー報告「Ctrl+上下で移動できなくなる」)。
+            // 末尾: 次 entry 無し → slideshow 停止 + nav lock 解除
             self.release_fs_nav_lock();
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
@@ -918,8 +946,6 @@ impl App {
                 }
                 .into(),
             );
-            // true 返す: caller (= try_start_slideshow_next_folder) は false だと loop fallback
-            // するので、末尾検知は true 扱いで「処理完了」と通知する。
             true
         }
     }
