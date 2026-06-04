@@ -7895,7 +7895,10 @@ impl App {
             ));
         }
 
-        let prefetch_progress: Option<(usize, usize)> = None;
+        // Pipeline P1 refactor で旧 ai_upscale_pending を参照する経路が無効化されて
+        // 進捗バーが常時非表示になっていた。新パイプライン版 `final_ai_prefetch_progress`
+        // が done/total を計算して、先読み中だけバーを出す。
+        let prefetch_progress: Option<(usize, usize)> = self.final_ai_prefetch_progress(fs_idx);
 
         if lines.is_empty() && prefetch_progress.is_none() {
             self.ai_status_done_at = None;

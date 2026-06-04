@@ -5992,6 +5992,64 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// P5-3: `final_ai_prefetch_progress` は target が無いとき None を返す。
+    /// (= フォルダ内に画像が 1 枚しか無い場合や、先読み設定が 0/0 の場合)
+    #[test]
+    fn final_ai_prefetch_progress_is_none_when_no_targets() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/only-one.jpg");
+        // 1 枚だけなので前後 target は空
+        assert!(
+            app.final_ai_prefetch_progress(idx).is_none(),
+            "single-image folder => no prefetch progress bar"
+        );
+    }
+
+    /// P5-3: `is_idx_final_ai_done_or_skipped` は source pixels が無い idx を
+    /// pending 扱い (= false) にする。fs_prefetch が走るのを待っている状態。
+    #[test]
+    fn is_idx_final_ai_done_or_skipped_false_without_source_pixels() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/no-source.jpg");
+        // fs_cache に Static 無し → false
+        assert!(
+            !app.is_idx_final_ai_done_or_skipped(idx),
+            "no source pixels => pending (not done)"
+        );
+    }
+
+    /// P5-3: `final_ai_prefetch_progress` は現在ページの AI 処理中は None を返す
+    /// (= 「AI 処理中」ラベルが既に出ているので進捗バー二重表示を避ける)。
+    #[test]
+    fn final_ai_prefetch_progress_hidden_while_current_busy() {
+        let mut app = setup_app();
+        let idx_cur = push_image(&mut app, "C:/pics/busy-cur.jpg");
+        push_image(&mut app, "C:/pics/busy-next-1.jpg");
+        push_image(&mut app, "C:/pics/busy-next-2.jpg");
+
+        // 現在ページの final_ai_pending を仕込む
+        let key = FinalAiKey {
+            edit_key: EditResultKey {
+                idx: idx_cur,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+                crop_hash: 0,
+            },
+            color_ai_hash: 0,
+            bg: 0,
+        };
+        let (pending, _cancel) = make_fake_final_ai_pending();
+        app.final_ai_pending.insert(key, pending);
+
+        assert!(
+            app.final_ai_prefetch_progress(idx_cur).is_none(),
+            "current page busy => hide prefetch progress (avoid double-label)"
+        );
+    }
+
     /// P5-1: cancel 済 pending しかなければ、prefetch は次の起動に進める
     /// (= has_uncancelled_final_ai_pending が false を返すパス)。
     /// AI runtime 不要なので「spawn しないが skip もしない」位置で止まることを確認。

@@ -18067,6 +18067,54 @@ impl App {
             .any(|p| !p.cancel.load(Ordering::Relaxed))
     }
 
+    /// 指定 idx の AI 処理が「完了」または「skip 確定」(= AI 不要 / failed) の
+    /// いずれかかを判定する。先読み進捗バー (`draw_fs_ai_status`) の done/total
+    /// 計算に使う pub(crate) helper。
+    ///
+    /// 戻り値:
+    /// - `true`: 結果が cache にある / 失敗確定 / AI モデル未設定 / skip_px 超過
+    /// - `false`: まだ処理待ち、もしくは source pixels すら準備できていない
+    ///
+    /// `final_ai_key_for_pixels` と同じ判定式を共有するため、skip_px や bg mode の
+    /// 整合性は自動で保たれる。
+    pub(crate) fn is_idx_final_ai_done_or_skipped(&self, idx: usize) -> bool {
+        // source pixels が無ければ判定不能 → pending 扱い (= done 数に入れない)
+        let Some(pixels) = self.current_raw_source_pixels(idx) else {
+            return false;
+        };
+        let params = self.effective_params(idx);
+        let edit_key = self.current_edit_result_key_for_size(idx, pixels.size);
+        let Some(key) = self.final_ai_key_for_pixels(edit_key, pixels.size, params) else {
+            // AI 不要 (= モデル未設定 or skip_px 超) → done
+            return true;
+        };
+        self.final_ai_cache.contains_key(&key) || self.final_ai_failed.contains(&key)
+    }
+
+    /// 先読み進捗バー用の (done, total) を返す。総 target が 0 ならバー非表示
+    /// (= None)。現在ページの AI 処理が走っている間 (= `current_busy`) は先読み
+    /// バーを隠して「AI 処理中」ラベルだけ見せる。
+    pub(crate) fn final_ai_prefetch_progress(&self, fs_idx: usize) -> Option<(usize, usize)> {
+        let targets = self.ai_prefetch_targets(fs_idx);
+        let total = targets.len();
+        if total == 0 {
+            return None;
+        }
+        let done = targets
+            .iter()
+            .filter(|&&i| self.is_idx_final_ai_done_or_skipped(i))
+            .count();
+        let current_busy = self
+            .final_ai_pending
+            .keys()
+            .any(|key| key.edit_key.idx == fs_idx);
+        if done < total && !current_busy {
+            Some((done, total))
+        } else {
+            None
+        }
+    }
+
     /// 新パイプライン (v1.1.0+) の AI 先読み。表示中画像の前後について
     /// `final_ai_cache` を埋め、ページ送り時に AI 結果が即 hit する状態にする。
     ///
