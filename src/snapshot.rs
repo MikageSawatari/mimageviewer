@@ -19,6 +19,7 @@
 //!
 //! App との結合 (state 切替・UI・nav resolver) は app.rs / ui_main.rs 側。
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -61,13 +62,20 @@ pub struct SnapshotEntry {
 
 /// snapshot entry が指す元 path 構造 (= 再 open / reconstruct で使う)。
 ///
-/// `display` 文字列からの round-trip では復元できない構造 (ZipImage / PdfPage) を
-/// 保持するため、専用 enum で持つ。
+/// `display` 文字列からの round-trip では復元できない構造 (ZipImage / PdfPage /
+/// ConvertibleArchive) を保持するため、専用 enum で持つ。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotTarget {
-    /// 通常 filesystem path (= Folder / Image / Video / ZipFile / PdfFile /
-    /// ConvertibleArchive)。GridItem への復元は kind と組み合わせて行う。
+    /// 通常 filesystem path (= Folder / Image / Video / ZipFile / PdfFile)。
+    /// GridItem への復元は kind と組み合わせて行う。
     Fs(PathBuf),
+    /// 7z / LZH 等の変換対応アーカイブ (Codex P3 修正: format を保持)。
+    /// 旧版は SnapshotTarget::Fs にまとめて reconstruct で Folder に退化していたが、
+    /// snapshot 範囲内で再 open する際に変換 dialog を出せず壊れる原因になっていた。
+    ConvertibleArchive {
+        path: PathBuf,
+        format: crate::archive_converter::ArchiveFormat,
+    },
     /// ZIP 内 image entry
     ZipImage {
         zip_path: PathBuf,
@@ -146,20 +154,24 @@ impl FilterState {
 
 // ─── path 正規化純関数 ────────────────────────────────────
 
-/// `\\?\` extended prefix を取り除く。
+/// `\\?\` extended prefix を取り除く (Codex P3 修正: UNC を本物の UNC 表現に復元)。
 ///
-/// Windows のロングパス対応で `\\?\C:\foo` 形式が来た場合に `C:\foo` に戻す。
-/// UNC `\\?\UNC\server\share` は `\\server\share` に戻す。
-fn strip_extended_prefix(s: &str) -> &str {
+/// - `\\?\C:\foo` → `C:\foo`
+/// - `\\?\UNC\server\share\file` → `\\server\share\file` (= 通常 UNC 表現)
+/// - 通常 path はそのまま (= Borrowed)
+///
+/// UNC 復元のため `Cow<str>` を返す (= owned 版が必要なケース)。旧版は
+/// `\\?\UNC\` を剥がすだけで先頭 `\\` を失っていたため、通常 UNC `\\server\share`
+/// と extended UNC `\\?\UNC\server\share` が別 key に正規化されるバグがあった。
+fn strip_extended_prefix(s: &str) -> Cow<'_, str> {
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        // `\\?\UNC\server\share` → `\\server\share` だが、戻り値 `rest` は
-        // 先頭 `\\` を失っているので caller 側で接頭辞を再構築する必要がある。
-        // ここではシンプルに extended prefix 部分のみ取り除き、文字列の意味は
-        // 「`server\share\...`」として normalize_fs に渡す (= 後段で
-        // forward slash 統一されるので問題なし)。
-        return rest;
+        // 通常 UNC `\\server\share\...` 形式に復元 (= 先頭 `\\` を再構築)
+        return Cow::Owned(format!(r"\\{rest}"));
     }
-    s.strip_prefix(r"\\?\").unwrap_or(s)
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return Cow::Borrowed(rest);
+    }
+    Cow::Borrowed(s)
 }
 
 /// 通常 filesystem path を normalize して `SnapshotKey::Fs` の中身となる文字列にする。
@@ -177,6 +189,36 @@ pub fn normalize_fs(path: &Path) -> String {
         s.pop();
     }
     s
+}
+
+// ─── UNC normalization 検証 (Codex P3 fix) ───────────────────────────
+
+#[cfg(test)]
+mod unc_tests {
+    use super::*;
+
+    #[test]
+    fn normal_unc_and_extended_unc_collapse_to_same_key() {
+        // P3 fix: `\\server\share\file` と `\\?\UNC\server\share\file` が同じ key に
+        // 正規化されるべき。旧版は別 key になっていた。
+        let normal = normalize_fs(Path::new(r"\\server\share\file.png"));
+        let extended = normalize_fs(Path::new(r"\\?\UNC\server\share\file.png"));
+        assert_eq!(
+            normal, extended,
+            "normal UNC and extended UNC must collapse: normal={normal}, extended={extended}"
+        );
+        // 期待値: `//server/share/file.png`
+        assert_eq!(normal, "//server/share/file.png");
+    }
+
+    #[test]
+    fn normal_drive_and_extended_drive_collapse() {
+        // `C:\foo` と `\\?\C:\foo` が同じ key
+        let normal = normalize_fs(Path::new(r"C:\foo"));
+        let extended = normalize_fs(Path::new(r"\\?\C:\foo"));
+        assert_eq!(normal, extended);
+        assert_eq!(normal, "c:/foo");
+    }
 }
 
 /// path をアーカイブの container 部分と inner 部分に分割する。
@@ -308,7 +350,10 @@ pub fn snapshot_target_from_grid_item(item: &GridItem) -> Option<SnapshotTarget>
         | GridItem::Video(p)
         | GridItem::ZipFile(p)
         | GridItem::PdfFile(p) => Some(SnapshotTarget::Fs(p.clone())),
-        GridItem::ConvertibleArchive { path, .. } => Some(SnapshotTarget::Fs(path.clone())),
+        GridItem::ConvertibleArchive { path, format } => Some(SnapshotTarget::ConvertibleArchive {
+            path: path.clone(),
+            format: *format,
+        }),
         GridItem::ZipImage {
             zip_path,
             entry_name,
@@ -338,11 +383,14 @@ pub fn reconstruct_grid_item(entry: &SnapshotEntry) -> Option<GridItem> {
         (SnapshotTarget::Fs(p), SnapshotEntryKind::Video) => Some(GridItem::Video(p.clone())),
         (SnapshotTarget::Fs(p), SnapshotEntryKind::ZipFile) => Some(GridItem::ZipFile(p.clone())),
         (SnapshotTarget::Fs(p), SnapshotEntryKind::PdfFile) => Some(GridItem::PdfFile(p.clone())),
-        // ConvertibleArchive は format 情報を失うので restore できない。Fs 扱いで近似:
-        // 実用上は snapshot 内に ConvertibleArchive を含めるケースは稀なので MVP として許容。
-        (SnapshotTarget::Fs(p), SnapshotEntryKind::ConvertibleArchive) => {
-            Some(GridItem::Folder(p.clone()))
-        }
+        // ConvertibleArchive: SnapshotTarget で format を保持しているので完全復元 (Codex P3 fix)
+        (
+            SnapshotTarget::ConvertibleArchive { path, format },
+            SnapshotEntryKind::ConvertibleArchive,
+        ) => Some(GridItem::ConvertibleArchive {
+            path: path.clone(),
+            format: *format,
+        }),
         (
             SnapshotTarget::ZipImage {
                 zip_path,
@@ -495,11 +543,11 @@ mod tests {
     #[test]
     fn normalize_fs_strips_extended_prefix() {
         assert_eq!(normalize_fs(Path::new(r"\\?\C:\foo")), "c:/foo");
-        // `\\?\UNC\server\share\file` → 後段で forward slash 化されて
-        // `server/share/file` 相当になる (= 元の `\\server\share` 表記とは別形式だが、
-        // snapshot 内で同じ正規化を通すので owner lookup で一致する)
+        // `\\?\UNC\server\share\file` → 通常 UNC `\\server\share\file` と同じ key
+        // (= `//server/share/file`) に正規化される (Codex P3 fix)。
+        // 旧版は `server/share/file` (= 先頭 `\\` 失う) で通常 UNC と別 key だった。
         let unc_extended = normalize_fs(Path::new(r"\\?\UNC\server\share\file"));
-        assert_eq!(unc_extended, "server/share/file");
+        assert_eq!(unc_extended, "//server/share/file");
     }
 
     #[test]

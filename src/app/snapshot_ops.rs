@@ -660,15 +660,33 @@ impl App {
                 self.snapshot_load_and_open(pdf_path, resume_slideshow);
                 true
             }
-            SnapshotEntryKind::Folder
-            | SnapshotEntryKind::ZipFile
-            | SnapshotEntryKind::PdfFile
-            | SnapshotEntryKind::ConvertibleArchive => {
+            SnapshotEntryKind::Folder | SnapshotEntryKind::ZipFile | SnapshotEntryKind::PdfFile => {
                 let SnapshotTarget::Fs(container_path) = entry_target else {
                     return false;
                 };
                 self.snapshot_load_and_open(container_path, resume_slideshow);
                 true
+            }
+            SnapshotEntryKind::ConvertibleArchive => {
+                // ConvertibleArchive (= 7z/LZH 等) は format を保持して別経路 (= 変換 cache
+                // 確認 + 必要なら変換 dialog) で開く。snapshot 中の自動 open は cache hit 時
+                // のみサポート (= dialog が出る case は snapshot scope を逸脱するため skip)。
+                let SnapshotTarget::ConvertibleArchive { path, format } = entry_target else {
+                    return false;
+                };
+                let _ = format; // 変換 dialog は snapshot scope 外、cache hit 時のみ自動 open
+                if let Some(cached) = self.try_archive_cache_lookup(&path) {
+                    self.snapshot_load_and_open(cached, resume_slideshow);
+                    true
+                } else {
+                    // cache 無し: snapshot 中は変換 dialog を出さず skip (= 次 entry に進む
+                    // 想定だが、ユーザーの代表 use case ではないので MVP として false)
+                    self.show_feedback_toast(
+                        "変換対応アーカイブは★固定範囲内で開けません (解除してから開いてください)"
+                            .into(),
+                    );
+                    false
+                }
             }
         }
     }
