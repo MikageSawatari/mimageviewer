@@ -84,6 +84,7 @@ pub mod settings_db;
 pub mod settings_restore;
 pub mod sidecar;
 pub mod single_instance;
+pub mod snapshot;
 pub mod spread_db;
 pub mod stats;
 pub mod susie_loader;

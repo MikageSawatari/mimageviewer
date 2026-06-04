@@ -4108,6 +4108,25 @@ pub struct App {
     /// を 1 回だけ呼ぶ (= coalesce)。
     #[cfg(windows)]
     pub(crate) hud_raise_rx: std::sync::mpsc::Receiver<()>,
+
+    /// ★固定 (Snapshot Lock) 機能の現在状態。`Some` なら active、`None` なら inactive。
+    /// 設計: [docs/star-lock-snapshot-design.md](../docs/star-lock-snapshot-design.md)
+    ///
+    /// active 中は:
+    /// - top-level grid 表示が `SnapshotState::items` を render する (= visible_indices 凍結)
+    /// - filter は普通に効く (= ★ filter 等の UI は操作可能、captured folder の中身には作用する)
+    /// - 検索 (Ctrl+F/S/G) は mutual exclusion で同時 active 不可
+    /// - フォルダパス suffix に `(スナップショット中 N件)` が出る
+    /// - BS / Alt+↑ / Alt+←→ / フォルダツリー / お気に入りクリックは disable
+    /// - fullscreen Ctrl+↑↓ は snapshot 内 entry を巡回
+    ///
+    /// 永続化しない (= app 再起動で消える)。
+    pub(crate) snapshot: Option<crate::snapshot::SnapshotState>,
+
+    /// 次に発行する `SnapshotState::generation_id` の seed。
+    /// snapshot ON 毎に increment して、pending folder nav が古い generation の結果を
+    /// 適用しないようにするため (= snapshot toggle OFF 中に旧 nav 結果が来ても無視する)。
+    pub(crate) snapshot_next_generation_id: u64,
 }
 
 impl Default for App {
@@ -4950,6 +4969,10 @@ impl App {
                 let (_, rx) = std::sync::mpsc::channel::<()>();
                 rx
             },
+            // ★固定 (Snapshot Lock) は起動時 inactive。
+            // settings.db には書かない (= app 再起動で消える、設計どおり)。
+            snapshot: None,
+            snapshot_next_generation_id: 1,
         };
 
         #[cfg(windows)]
