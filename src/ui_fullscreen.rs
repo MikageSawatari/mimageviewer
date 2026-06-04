@@ -250,6 +250,92 @@ fn shift_held_via_os() -> bool {
     false
 }
 
+/// `local_adjust_mode` 中にどのテクスチャ経路を採用するかを表す純粋な決定型。
+///
+/// `resolve_fs_processed_texture` の補正レイヤー分岐で副作用 (OS API キー読み・
+/// HashMap アクセス・worker spawn) を呼ぶ前の **判定だけ** を切り出すために用意した。
+/// これにより A-3 saga で 3 回手戻りした「Ctrl+Shift vs `preview_to_selected_layer`
+/// vs Ctrl のみ」の優先順位が unit test できる。
+///
+/// 経路 → 副作用 (caller がやる):
+/// - `ShowSource`: `resolve_local_adjust_source_texture(ctx, idx)`
+/// - `BypassLayer{layer_idx}`: `maybe_start_local_adjust_layer_bypass_preview` +
+///   `current_local_adjust_layer_bypass_texture` → fallback to source
+/// - `PrefixPreview{layer_count}`: `maybe_start_local_adjust_prefix_preview` +
+///   `current_local_adjust_prefix_preview_texture` → fallback to source
+/// - `FullComposite`: `current_local_adjust_texture` → fallback to source
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalAdjustPreviewAction {
+    ShowSource,
+    BypassLayer { layer_idx: usize },
+    PrefixPreview { layer_count: usize },
+    FullComposite,
+}
+
+/// 補正レイヤー描画経路の純粋な決定ロジック。
+///
+/// 副作用ゼロ。OS API (`ctrl_held_via_os` / `shift_held_via_os`) や App 状態の
+/// 取り出しは caller の責任で、ここでは bool / Option / usize しか見ない。
+///
+/// 入力:
+/// - `fs_prev_focused`: フルスクリーンが OS フォーカスを持っているか。false の場合
+///   ctrl/shift の OS 読みは不安定なので 0 扱いにする (= ここで一括処理)
+/// - `ctrl_held` / `shift_held`: OS から読んだ修飾キー状態
+/// - `show_source_toggle`: パネルの「元画像を表示」トグル (= App::local_adjust_show_source)
+/// - `preview_to_selected_layer_toggle`: パネルの「選択レイヤーまでプレビュー」
+/// - `has_any_layer`: 当該ページに 1 つ以上レイヤーがあるか
+/// - `selected_layer_idx`: 選択中レイヤーの idx (= App::selected_local_adjust_layer_idx)
+/// - `total_layers`: ページのレイヤー数
+pub(crate) fn decide_local_adjust_preview_action(
+    fs_prev_focused: bool,
+    ctrl_held: bool,
+    shift_held: bool,
+    show_source_toggle: bool,
+    preview_to_selected_layer_toggle: bool,
+    has_any_layer: bool,
+    selected_layer_idx: Option<usize>,
+    total_layers: usize,
+) -> LocalAdjustPreviewAction {
+    // フルスクリーン非フォーカス時は OS キー読みを採用しない (= 別アプリの
+    // Ctrl 押下を誤検知しないため)。`original_preview_active` と同じガード。
+    let (ctrl, shift) = if fs_prev_focused {
+        (ctrl_held, shift_held)
+    } else {
+        (false, false)
+    };
+    let adjust_panel_active = has_any_layer;
+    // Ctrl+Shift bypass はパネルにレイヤーがある時だけ意味を持つ (= バイパスする
+    // 対象が無いと無意味)。adjust_panel_active=false なら bypass は不発で、
+    // 下の ShowSource ゲートに落ちる。
+    let modifier_bypass_active = adjust_panel_active && ctrl && shift;
+
+    if !modifier_bypass_active && (ctrl || show_source_toggle) {
+        return LocalAdjustPreviewAction::ShowSource;
+    }
+
+    let preview_requested = preview_to_selected_layer_toggle || modifier_bypass_active;
+    if preview_requested && total_layers > 0 {
+        if let Some(layer_idx) = selected_layer_idx {
+            if modifier_bypass_active {
+                let bypass_layer_idx = layer_idx.min(total_layers - 1);
+                return LocalAdjustPreviewAction::BypassLayer {
+                    layer_idx: bypass_layer_idx,
+                };
+            } else {
+                // 「選択レイヤーまでプレビュー」: 先頭から N+1 枚を適用
+                let layer_count = layer_idx.min(total_layers - 1) + 1;
+                if layer_count < total_layers {
+                    return LocalAdjustPreviewAction::PrefixPreview { layer_count };
+                }
+                // layer_count == total_layers → 通常の FullComposite と同じ結果なので
+                // 専用の prefix preview worker を起動する意味がない (= fall through)
+            }
+        }
+    }
+
+    LocalAdjustPreviewAction::FullComposite
+}
+
 /// メインビューポート経由のフルスクリーンキー処理 (`handle_fullscreen_root_key_input`)
 /// を起動するかどうかを判定する「プローブ」。押されたキーがこの集合に無いフレームは
 /// 実ハンドラ (`handle_fs_key_input` → 動画は `handle_video_input`) を一切呼ばない。
@@ -835,63 +921,58 @@ impl App {
         }
 
         if self.local_adjust_mode {
+            // 判定は副作用ゼロの `decide_local_adjust_preview_action` に集約 (= unit
+            // test できる)。caller である本関数は OS API 読み・cache lookup・worker
+            // spawn・source texture フォールバックの責務だけを持つ。
+            //
             // `prepare_fullscreen_state` 経由では ctx がメインビューポートのものになり、
-            // フルスクリーンが OS フォーカスを持つ間は modifier event が届かない。
-            // `original_preview_active` と同じく OS キー状態で見る。
-            let (ctrl_down, shift_down) = if self.fs_prev_focused {
-                (ctrl_held_via_os(), shift_held_via_os())
-            } else {
-                (false, false)
-            };
-            let adjust_panel_active = self
+            // フルスクリーンが OS フォーカスを持つ間は modifier event が届かないため、
+            // `original_preview_active` と同じく OS キー状態を見る (fs_prev_focused
+            // ガードは decide 関数内に集約済み)。
+            let total_layers = self
                 .local_adjust_page_layers
                 .get(&idx)
-                .is_some_and(|layers| !layers.is_empty());
-            // Ctrl+Shift 押下中もモーメンタリで活性化 (= ラボ層 bypass preview)。
-            let modifier_bypass_active = adjust_panel_active && ctrl_down && shift_down;
-            if !modifier_bypass_active && (ctrl_down || self.local_adjust_show_source) {
-                return self.resolve_local_adjust_source_texture(ctx, idx);
-            }
-            if (self.local_adjust_preview_to_selected_layer || modifier_bypass_active)
-                && let (Some(layer_idx), Some(total_layers)) = (
-                    self.selected_local_adjust_layer_idx(idx),
-                    self.local_adjust_page_layers.get(&idx).map(Vec::len),
-                )
-                && total_layers > 0
-            {
-                if modifier_bypass_active {
-                    // Ctrl+Shift: 選択レイヤーだけをバイパスし、他レイヤーは適用する。
-                    // レイヤー効果を素早く on/off 比較するためのラボ仕様。
-                    let bypass_layer_idx = layer_idx.min(total_layers - 1);
-                    self.maybe_start_local_adjust_layer_bypass_preview(idx, bypass_layer_idx);
+                .map(Vec::len)
+                .unwrap_or(0);
+            let action = decide_local_adjust_preview_action(
+                self.fs_prev_focused,
+                ctrl_held_via_os(),
+                shift_held_via_os(),
+                self.local_adjust_show_source,
+                self.local_adjust_preview_to_selected_layer,
+                total_layers > 0,
+                self.selected_local_adjust_layer_idx(idx),
+                total_layers,
+            );
+            match action {
+                LocalAdjustPreviewAction::ShowSource => {
+                    return self.resolve_local_adjust_source_texture(ctx, idx);
+                }
+                LocalAdjustPreviewAction::BypassLayer { layer_idx } => {
+                    self.maybe_start_local_adjust_layer_bypass_preview(idx, layer_idx);
                     if let Some(tex) =
-                        self.current_local_adjust_layer_bypass_texture(idx, bypass_layer_idx)
+                        self.current_local_adjust_layer_bypass_texture(idx, layer_idx)
                     {
                         return Some(tex);
                     }
                     return self.resolve_local_adjust_source_texture(ctx, idx);
-                } else {
-                    // 補正レイヤーパネルの「選択レイヤーまでプレビュー」チェックボックスは、
-                    // 既存の prefix preview を維持する。
-                    let layer_count = layer_idx.min(total_layers - 1) + 1;
-                    if layer_count == 0 {
-                        return self.resolve_local_adjust_source_texture(ctx, idx);
+                }
+                LocalAdjustPreviewAction::PrefixPreview { layer_count } => {
+                    self.maybe_start_local_adjust_prefix_preview(idx, layer_count);
+                    if let Some(tex) =
+                        self.current_local_adjust_prefix_preview_texture(idx, layer_count)
+                    {
+                        return Some(tex);
                     }
-                    if layer_count < total_layers {
-                        self.maybe_start_local_adjust_prefix_preview(idx, layer_count);
-                        if let Some(tex) =
-                            self.current_local_adjust_prefix_preview_texture(idx, layer_count)
-                        {
-                            return Some(tex);
-                        }
-                        return self.resolve_local_adjust_source_texture(ctx, idx);
+                    return self.resolve_local_adjust_source_texture(ctx, idx);
+                }
+                LocalAdjustPreviewAction::FullComposite => {
+                    if let Some(local_adjust_tex) = self.current_local_adjust_texture(idx) {
+                        return Some(local_adjust_tex);
                     }
+                    return self.resolve_local_adjust_source_texture(ctx, idx);
                 }
             }
-            if let Some(local_adjust_tex) = self.current_local_adjust_texture(idx) {
-                return Some(local_adjust_tex);
-            }
-            return self.resolve_local_adjust_source_texture(ctx, idx);
         }
 
         if self.conceal_mode && !self.conceal_preview_active {
@@ -10173,6 +10254,155 @@ mod tests {
         assert!(should_zoom_fullscreen_wheel(true, false));
         assert!(should_zoom_fullscreen_wheel(false, true));
         assert!(!should_zoom_fullscreen_wheel(false, false));
+    }
+
+    // ── decide_local_adjust_preview_action unit tests ─────────────────────
+    //
+    // A-3 saga (3 iterations of fixes) で発生した「修飾キー判定 + 経路選択」の
+    // 退行を符号化する。OS API (`ctrl_held_via_os`) と App 状態は caller が
+    // 取り出して渡す形にしてあるので、ここでは pure logic だけテストできる。
+
+    fn act(
+        focus: bool,
+        ctrl: bool,
+        shift: bool,
+        show_source: bool,
+        preview_to_selected: bool,
+        has_any: bool,
+        selected: Option<usize>,
+        total: usize,
+    ) -> LocalAdjustPreviewAction {
+        decide_local_adjust_preview_action(
+            focus,
+            ctrl,
+            shift,
+            show_source,
+            preview_to_selected,
+            has_any,
+            selected,
+            total,
+        )
+    }
+
+    /// 修飾キー無し・パネル状態無し → FullComposite (= 通常表示)
+    #[test]
+    fn decide_action_default_is_full_composite() {
+        assert_eq!(
+            act(true, false, false, false, false, true, Some(0), 3),
+            LocalAdjustPreviewAction::FullComposite
+        );
+    }
+
+    /// Ctrl のみ押下 → 元画像表示 (= 一時的に補正前を見るパス)
+    #[test]
+    fn decide_action_ctrl_only_shows_source() {
+        assert_eq!(
+            act(true, true, false, false, false, true, Some(0), 3),
+            LocalAdjustPreviewAction::ShowSource
+        );
+    }
+
+    /// 「元画像を表示」トグル ON → ShowSource (= panel checkbox)
+    #[test]
+    fn decide_action_show_source_toggle_shows_source() {
+        assert_eq!(
+            act(true, false, false, true, false, true, Some(0), 3),
+            LocalAdjustPreviewAction::ShowSource
+        );
+    }
+
+    /// Ctrl+Shift + パネルにレイヤーあり + 選択あり → BypassLayer (= ラボ仕様)
+    #[test]
+    fn decide_action_ctrl_shift_with_layers_uses_bypass() {
+        assert_eq!(
+            act(true, true, true, false, false, true, Some(1), 3),
+            LocalAdjustPreviewAction::BypassLayer { layer_idx: 1 }
+        );
+    }
+
+    /// Ctrl+Shift だがパネルにレイヤー無し → ShowSource (= bypass 対象が無いので
+    /// Ctrl-only 経路に落ちる)
+    #[test]
+    fn decide_action_ctrl_shift_without_layers_falls_to_source() {
+        assert_eq!(
+            act(true, true, true, false, false, false, None, 0),
+            LocalAdjustPreviewAction::ShowSource
+        );
+    }
+
+    /// 「選択レイヤーまでプレビュー」ON + 選択は最終レイヤーより手前 → PrefixPreview
+    #[test]
+    fn decide_action_preview_toggle_with_intermediate_selection_uses_prefix() {
+        assert_eq!(
+            act(true, false, false, false, true, true, Some(1), 3),
+            LocalAdjustPreviewAction::PrefixPreview { layer_count: 2 }
+        );
+    }
+
+    /// 「選択レイヤーまでプレビュー」ON + 選択は最後のレイヤー → FullComposite
+    /// (= prefix=total と FullComposite は同じ結果なので worker 起動を避ける)
+    #[test]
+    fn decide_action_preview_toggle_at_last_layer_falls_to_full() {
+        assert_eq!(
+            act(true, false, false, false, true, true, Some(2), 3),
+            LocalAdjustPreviewAction::FullComposite
+        );
+    }
+
+    /// `selected_layer_idx = None` のときは preview 経路に進まない → FullComposite
+    #[test]
+    fn decide_action_no_selection_falls_to_full_composite() {
+        assert_eq!(
+            act(true, false, false, false, true, true, None, 3),
+            LocalAdjustPreviewAction::FullComposite
+        );
+    }
+
+    /// フルスクリーン非フォーカス: 別アプリの Ctrl 押下を誤検知しないために
+    /// ctrl_held / shift_held を 0 扱いし、Ctrl が来ても FullComposite のまま
+    #[test]
+    fn decide_action_ignores_modifiers_when_not_focused() {
+        assert_eq!(
+            act(false, true, true, false, false, true, Some(1), 3),
+            LocalAdjustPreviewAction::FullComposite,
+            "non-focused fullscreen must not pick up other app's Ctrl+Shift"
+        );
+    }
+
+    /// 非フォーカスでも `show_source_toggle` (= app state) は効く
+    /// (= OS API 経由でないので別アプリの状態を読まない)
+    #[test]
+    fn decide_action_show_source_toggle_works_when_not_focused() {
+        assert_eq!(
+            act(false, false, false, true, false, true, Some(0), 3),
+            LocalAdjustPreviewAction::ShowSource
+        );
+    }
+
+    /// Ctrl+Shift で選択 idx が total を超えていたら clamp される
+    /// (= 古い selected idx が leftover していても panic しない)
+    #[test]
+    fn decide_action_bypass_clamps_overflow_layer_idx() {
+        assert_eq!(
+            act(true, true, true, false, false, true, Some(99), 3),
+            LocalAdjustPreviewAction::BypassLayer { layer_idx: 2 }
+        );
+    }
+
+    /// total_layers = 0 で preview/bypass 経路は不発になり FullComposite
+    /// (= ページに何も無い、ただ Ctrl+Shift 押されただけ)
+    #[test]
+    fn decide_action_zero_layers_never_picks_preview() {
+        // Ctrl+Shift だが has_any=false → modifier_bypass_active=false → ShowSource (Ctrl 経路)
+        assert_eq!(
+            act(true, true, true, false, false, false, None, 0),
+            LocalAdjustPreviewAction::ShowSource
+        );
+        // preview_to_selected ON で total=0 → FullComposite (preview 経路に入らない)
+        assert_eq!(
+            act(true, false, false, false, true, false, None, 0),
+            LocalAdjustPreviewAction::FullComposite
+        );
     }
 
     #[test]
