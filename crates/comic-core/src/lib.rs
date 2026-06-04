@@ -36,7 +36,7 @@ pub use raster::{
 };
 pub use tessellate::{
     BubbleGeometry, auto_base_t, bubble_geometry, fit_bubble_shape, nearest_base_t,
-    resolve_tail_base, shape_renders_tail, tessellate_bubble, tessellate_tail,
+    resolve_tail_base, shape_is_mergeable, shape_renders_tail, tessellate_bubble, tessellate_tail,
 };
 
 #[cfg(test)]

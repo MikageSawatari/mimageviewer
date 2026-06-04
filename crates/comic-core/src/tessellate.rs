@@ -601,6 +601,20 @@ fn shape_half_extents(shape: &BubbleShape) -> (f32, f32) {
     }
 }
 
+/// Whether a shape participates in a merge chain. The merge trick (fill → stroke
+/// → opaque-fill-erase) needs a solid fillable polygon body, so the line-field
+/// effects (集中線 / 流線), 意識 (feathered, no clean fill) and なし (nothing to
+/// fill) are excluded — they always bake standalone instead of being fused.
+pub fn shape_is_mergeable(shape: &BubbleShape) -> bool {
+    !matches!(
+        shape,
+        BubbleShape::MotionLines { .. }
+            | BubbleShape::SpeedLines { .. }
+            | BubbleShape::TextOnly { .. }
+            | BubbleShape::Concentration { .. }
+    )
+}
+
 /// Whether a shape actually renders a tail (つの / 思考の丸). Line-field effects
 /// (集中線 / 流線), 意識 (fuzzy, edgeless) and なし (text-only) draw no outline to
 /// attach a tail to, so the rasterizer skips it for them. Bounds / hit-test use
@@ -1293,6 +1307,43 @@ mod tests {
             10.0,
         );
         assert!(matches!(f, BubbleShape::Arrow { dir_rad, .. } if (dir_rad - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn fuzzy_and_textonly_shapes_are_not_mergeable() {
+        // The merge union trick needs a fillable polygon body.
+        assert!(!shape_is_mergeable(&BubbleShape::Concentration {
+            rx: 10.0,
+            ry: 10.0,
+            shape_seed: 0
+        }));
+        assert!(!shape_is_mergeable(&BubbleShape::TextOnly {
+            half_w: 10.0,
+            half_h: 10.0
+        }));
+        assert!(!shape_is_mergeable(&BubbleShape::MotionLines {
+            rx: 10.0,
+            ry: 10.0,
+            count: 8,
+            shape_seed: 0
+        }));
+        // Polygon-bodied shapes (incl. the new 線 / 二重線) merge fine.
+        assert!(shape_is_mergeable(&BubbleShape::Ellipse {
+            rx: 10.0,
+            ry: 10.0
+        }));
+        assert!(shape_is_mergeable(&BubbleShape::Strokes {
+            half_w: 10.0,
+            half_h: 10.0,
+            corner_px: 4.0,
+            shape_seed: 0
+        }));
+        assert!(shape_is_mergeable(&BubbleShape::DoubleStroke {
+            half_w: 10.0,
+            half_h: 10.0,
+            corner_px: 4.0,
+            gap_px: 6.0
+        }));
     }
 
     #[test]

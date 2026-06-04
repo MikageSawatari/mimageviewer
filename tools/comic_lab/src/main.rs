@@ -2894,7 +2894,13 @@ impl ComicLab {
         let (tail_enabled, deco_enabled) = if is_bubble {
             self.draw_bubble_toggles(ui, sel, &mut dirty);
             match self.objects.iter().find(|o| o.id == sel).map(|o| &o.kind) {
-                Some(AnnotationKind::Bubble(b)) => (b.tail.is_some(), !b.decorations.is_empty()),
+                // A tail only counts when the shape actually renders one — a stale
+                // tail on a tailless shape (e.g. a hand-edited sidecar) must not
+                // enable the Tail tab.
+                Some(AnnotationKind::Bubble(b)) => (
+                    b.tail.is_some() && shape_renders_tail(&b.shape),
+                    !b.decorations.is_empty(),
+                ),
                 _ => (false, false),
             }
         } else {
@@ -4652,8 +4658,9 @@ impl ComicLab {
                     }
                     // Tail handles: cyan base (on the outline) + orange tip.
                     // The whole object bakes rotated, so rotate the handle
-                    // positions to match the visible (rotated) tail.
-                    if let Some(tail) = &b.tail {
+                    // positions to match the visible (rotated) tail. Skip for
+                    // tailless shapes (the tail isn't drawn, so no handles).
+                    if let Some(tail) = b.tail.as_ref().filter(|_| shape_renders_tail(&b.shape)) {
                         let eff = effective_bubble_shape(b, &self.fonts);
                         let rot = obj.rotation_rad;
                         let base =
@@ -4756,7 +4763,10 @@ impl ComicLab {
                 if let Some(sel) = self.selected {
                     if let Some(obj) = self.objects.iter().find(|o| o.id == sel) {
                         if let AnnotationKind::Bubble(b) = &obj.kind {
-                            if let Some(tail) = &b.tail {
+                            // Tailless shapes draw no tail → no tail handles to grab.
+                            if let Some(tail) =
+                                b.tail.as_ref().filter(|_| shape_renders_tail(&b.shape))
+                            {
                                 let rot = obj.rotation_rad;
                                 let tip = rotate_about(tail.tip, obj.pivot, rot);
                                 let tip_screen = self.view.img_to_screen(tip);

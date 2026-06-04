@@ -135,7 +135,13 @@ pub fn bake_overlay_with_stamps(
     // `merge_with_below` fuses with the bubble directly beneath it. A chain
     // renders as one union outline (rotated members composite at their rotated
     // position via bake_into); everything else bakes individually.
-    let is_bubble = |i: usize| matches!(objects[i].kind, AnnotationKind::Bubble(_));
+    // Only shapes with a solid fillable polygon body can take part in a merge
+    // chain (the fill→stroke→erase union trick). Fuzzy / line-field / text-only
+    // shapes always bake standalone, so they neither start nor join a chain.
+    let mergeable = |i: usize| match &objects[i].kind {
+        AnnotationKind::Bubble(b) => crate::tessellate::shape_is_mergeable(&b.shape),
+        _ => false,
+    };
     let mut gi = 0;
     while gi < order.len() {
         let mut group = vec![order[gi]];
@@ -145,7 +151,7 @@ pub fn bake_overlay_with_stamps(
                 AnnotationKind::Bubble(b) => b.merge_with_below,
                 _ => false,
             };
-            if is_bubble(order[gi]) && nxt_merges_down {
+            if mergeable(order[gi]) && nxt_merges_down && mergeable(nxt) {
                 group.push(nxt);
                 gi += 1;
             } else {
@@ -2114,6 +2120,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn concentration_with_merge_flag_bakes_standalone() {
+        // Regression (Codex P2): a Concentration must not join a merge chain (its
+        // feather can't fill/erase). Even with merge_with_below set above a normal
+        // bubble, its half-alpha fill must stay ~half (not forced opaque by the
+        // merge erase pass).
+        let fonts = FontSet::new();
+        let mut lower = BubbleObject::default();
+        lower.shape = BubbleShape::Ellipse { rx: 40.0, ry: 30.0 };
+        lower.fill = Some(Rgba::WHITE);
+        lower.auto_size = false;
+        lower.text = TextBlock::default();
+        let lower = {
+            let mut o = AnnotationObject::new_bubble(1, (70.0, 90.0), lower);
+            o.z = 0;
+            o
+        };
+        let mut upper = BubbleObject::default();
+        upper.shape = BubbleShape::Concentration {
+            rx: 50.0,
+            ry: 40.0,
+            shape_seed: 0,
+        };
+        upper.fill = Some(Rgba::new(255, 255, 255, 128));
+        upper.outline.width_px = 0.0;
+        upper.fill_opacity = 1.0;
+        upper.auto_size = false;
+        upper.merge_with_below = true; // would force-opaque if it merged
+        upper.text = TextBlock::default();
+        let upper = {
+            let mut o = AnnotationObject::new_bubble(2, (150.0, 90.0), upper);
+            o.z = 1;
+            o
+        };
+        let ov = bake_overlay(&[lower, upper], 240, 180, &fonts);
+        // Concentration center (150,90) should remain ~half-alpha (baked standalone).
+        let a = ov.pixels[(90 * 240 + 150) * 4 + 3];
+        assert!(
+            (110..=140).contains(&a),
+            "merged-flag concentration center should stay ~128, got {a}"
+        );
     }
 
     #[test]
