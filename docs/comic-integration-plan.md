@@ -1,7 +1,7 @@
 # テキスト注釈(comic)機能 — 本体 mIV 統合計画
 
-Status: 計画ドラフト v2（Codex 計画レビュー反映済み・実装着手前）
-更新: 2026-06-05
+Status: 計画ドラフト v2.1（Codex 計画レビュー反映済み・Inc 0 はマージ保留中）
+更新: 2026-06-05（安全プレップ: `scale_scene` 先行実装 §5.4 / master 現況点検 §5.5）
 対象ブランチ: `lab`（master 未マージ。master 統合は別途指示で実施）
 
 ラボ（`tools/comic_lab` + `crates/comic-core`）で完成させた吹き出し/テキスト/スタンプ/
@@ -132,9 +132,40 @@ raw → erase → local_adjust → conceal → crop → color → AI(upscale) �
 - `bake_overlay_with_stamps(scaled_objects, out_w, out_h, ...)` で **出力解像度直書き**（低解像度
   ベイク→拡大ではない＝くっきり）。
 - **再ベイク条件**: 出力寸法が変わるたび（crop / AI on-off / post-filter / 表示ズームの export 時）。
-- 実装: 上記相似変換は comic-core の純加法ヘルパー `scale_scene(&[obj], s) -> Vec<obj>`（単体テスト
-  付き、§2 許容範囲）か mIV 側で行う。**Inc 1 で確定**。
+- 実装: 上記相似変換は **comic-core の純加法ヘルパー `comic_core::scale_scene(&[obj], s) -> Vec<obj>`
+  として実装済み**（`crates/comic-core/src/transform.rs`、2026-06-05 の安全プレップで先行実装、§2 許容範囲）。
+  全絶対長を ×s、`density` のみ ÷s（飾り個数を一定に保つ）、`rotation_rad`/比率/カウントは不変。
+  `s==1.0` は厳密恒等、`s<=0`/非有限は no-op。単体テスト 7 本（恒等・no-op・倍率全項目・単体テキスト・`BubbleShape` enum 全 15 変種・往復・
+  実ベイク面積）。**crop translate（`-crop_origin*S`）は別段で合成**（scale_scene は原点中心スケール専用）。
 - 表示（非 export）は表示解像度でベイクしてよい（速度と鮮明さの両立）。Inc 1 で速度を見て決める。
+
+### 5.5 master 現況の反映（2026-06-05 read-only 点検）
+
+統合着手前に master（`C:\home\mimageviewer`）の表示パイプラインを点検した結果のメモ。
+**master は並行作業中（snapshot/crop 系が未コミット）なので、最終確定は Inc 1/7 で当時の
+master に対して再確認する**（このスナップショットに固定しない）。
+
+- **パイプライン順序は計画 §5.1 と一致**: master の `docs/display-pipeline.md` §3.0 の確定順序は
+  `raw → 消しゴム → 補正レイヤー → 隠蔽 → crop → 色補正 → AI → post-filter`。comic を最終段に足す
+  D1 はこの順序の自然な延長で、矛盾なし（D1 の前提が裏付けられた）。
+- **表示テクスチャ入口は `resolve_fs_processed_texture()`**（§5.2 の参照は有効）。優先順位
+  `元画像プレビュー > 編集中プレビュー > final_composite_cache > edit_result_cache > fs_cache > サムネ`
+  は「動かすな」と明記。comic オーバーレイ合成はこの **最終段（final_composite 相当）の後ろ or 内側**に
+  差す形になる（Inc 1 で `resolve_fs_processed_texture` のどの分岐に挿すか確定）。
+- **crop がリファクタ進行中（重要）**: 直近コミット `79992d13`「Crop を独立モード化し、最後段の
+  暗転 overlay + save 時切り出しに」/ `83afa557`（+ 未コミット WIP）で、crop は
+  「**表示時は全体画像＋crop 外を暗転する overlay**、**実切り出しは save 時**」へ変わった。
+  - 表示ベイク: comic は **非 crop（全体）座標**でベイクし最前面に重ねる。`S = display_long/source_long`、
+    crop translate なし。
+  - export（Ctrl+E）ベイク: §5.4 の `S = out_long/cropped_source_long` ＋ `translate(-crop_origin)` で
+    **切り出し後の出力解像度**に直書き（既に §5.4 が想定済み）。
+  - **未確定（Inc 1 表示 / Inc 7 export で確定）**: crop の「暗転 overlay」と comic テキストの重なり順。
+    crop 外に置いたテキストを暗転対象にするか（=これから切られる領域として暗くする）、常に最前面
+    （D1 純守）にするか。master の crop overlay 実装が固まってから決める。
+- **キャッシュ無効化に comic 段を足す**: master §3.1 のルール「crop 変更 → edit+final cache クリア」
+  「補正/AI/post_filter 変更 → final cache クリア」に倣い、**comic 編集 → `final_composite_cache`（comic は
+  post-filter より後段）をクリア＋ `comic_generation`（`conceal_mask_generation` 相当）を進める**配線を
+  Inc 1/2 で用意する。サムネは非反映（D3）なので thumb cache は触らない。
 
 ---
 
@@ -341,7 +372,9 @@ raw → erase → local_adjust → conceal → crop → color → AI(upscale) �
 
 ## 11. 未確定の実装詳細（該当 Inc で確定）
 
-- **§5.4 のスケールヘルパー位置**: comic-core 加法ヘルパー `scale_scene` か mIV 側か（Inc 1）。
+- ~~**§5.4 のスケールヘルパー位置**~~: **確定** — comic-core 加法ヘルパー
+  `comic_core::scale_scene`（`transform.rs`）として実装済み（2026-06-05 安全プレップ）。crop translate の
+  合成だけ Inc 1 で mIV 側に書く。
 - **表示ベイク解像度**: 表示は表示解像度か（速度）、常に出力解像度か（鮮明）。実測で（Inc 1）。
 - **スタンプ GPU quad の mIV 統合**: まず 1 枚 CPU ベイク（`StampImages`）で動かし、後段でラボの GPU quad
   最適化を移植。テクスチャ eviction を mIV 流儀へ（Inc 4c / Inc 8）。

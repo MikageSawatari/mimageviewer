@@ -19,6 +19,7 @@ pub mod layout;
 pub mod model;
 pub mod raster;
 pub mod tessellate;
+pub mod transform;
 
 pub use font::{FontSet, GlyphBitmap, LoadedFont, rotate_cw};
 pub use layout::{GlyphForm, GlyphPlacement, TextLayout, layout_text, layout_text_wrapped};
@@ -38,6 +39,7 @@ pub use tessellate::{
     BubbleGeometry, auto_base_t, bubble_geometry, fit_bubble_shape, nearest_base_t,
     resolve_tail_base, shape_is_mergeable, shape_renders_tail, tessellate_bubble, tessellate_tail,
 };
+pub use transform::scale_scene;
 
 #[cfg(test)]
 mod integration_tests {
