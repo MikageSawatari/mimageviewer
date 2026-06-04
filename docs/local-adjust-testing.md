@@ -281,17 +281,47 @@ UPDATE_SNAPSHOTS=1 cargo test --bin mimageviewer-core local_adjust_panel_snapsho
 # 生成された PNG を必ず目視確認してからコミット
 ```
 
-### bump_* マトリクス (Phase 4 で fixation した範囲)
+### bump_* マトリクス (Phase 4 + Phase 6 で fixation 完了した全範囲)
 
 | bump_X | 主に触る cache | 触らない cache |
 |---|---|---|
-| `bump_adjustment_generation(idx)` | `final_composite_cache(idx)` | `final_ai_cache`, `final_ai_failed`, `edit_result_cache` |
+| `bump_input_generation(idx)` | erase_result(idx), local_adjust*(idx), conceal(idx), edit_result(idx), final pipeline(idx) **= 全部** | (なし、最強の clear) |
+| `bump_erase_mask_generation(idx)` | bump_input と同じ振る舞い (= 同一実装) | (なし) |
+| `bump_local_adjust_generation(idx)` | local_adjust*(idx), conceal(idx), edit_result(idx), final pipeline(idx) | **erase_result** (= 上流の MI-GAN 結果を保護) |
+| `bump_conceal_mask_generation(idx)` | conceal(idx), edit_result(idx), final pipeline(idx) | erase_result, local_adjust* |
+| `bump_adjustment_generation(idx)` | `final_composite_cache(idx)` | `final_ai_cache`, `final_ai_failed`, `edit_result_cache` (P5-6 fix) |
 | `bump_ai_generation(idx)` | `final_ai_cache(idx)`, `final_ai_failed(idx)`, `final_composite_cache(idx)` | `edit_result_cache`, `local_adjust_cache`, `conceal_cache` |
 | `bump_conceal_generation()` (global) | `edit_result_cache(全)`, final pipeline(全) | `local_adjust_cache`, `erase_result_cache` |
 
 idx-scoped vs global の区別、edit chain vs final pipeline の境界、AI 関連 cache
 の 3 つ組 (cache / failed / composite) の同期削除がポイント。これら 3 軸が
 壊れると P5-6 のような「先読みが完了したのに次ページ表示で再計算」事故が再発する。
+
+## Phase 6 拡充 (2026-06、bump_* マトリクス完全化 + AI None 経路)
+
+Phase 4 で adjustment / ai / conceal を、Phase 6 で残り 3 種 (input / erase_mask /
+local_adjust) を fixation してマトリクスを完成。さらに `final_ai_key_for_pixels` の
+None 経路 (= AI モデル未設定ユーザー) も符号化。
+
+- **`src/app/tests.rs::pipeline_cache_refactor_tests`** (29 → 34 件):
+  - `bump_input_generation_clears_entire_edit_chain_for_idx` — input 世代 bump は
+    最上流なので idx の全 cache (erase_result 含む) + final pipeline を clear。
+  - `bump_erase_mask_generation_clears_entire_edit_chain_for_idx` — erase_mask は
+    bump_input と同じ実装。別 fn として個別 fixation することで「片方だけ
+    削除パターンが増える」退行を検知。
+  - `bump_local_adjust_generation_keeps_erase_result_but_clears_downstream` —
+    補正レイヤー bump は **erase_result を保護** (= MI-GAN 推論を再起動しない最適化)。
+    その他 (local_adjust / conceal / edit_result / final pipeline) は clear。
+  - `final_ai_key_is_none_when_no_ai_models_configured` — `upscale_model` /
+    `denoise_model` が両方 None なら `final_ai_key_for_pixels` は None を返す
+    (= AI 推論ジョブ不要)。
+  - `is_idx_final_ai_done_or_skipped_true_when_no_ai_models` — その None 戻りを受けて
+    `is_idx_final_ai_done_or_skipped` が true (= done 扱い) を返す経路を符号化。
+    AI 機能未使用ユーザーで先読み進捗バーが永久に終わらない退行を防ぐ。
+
+これで bump_* マトリクスは 7 種すべて fixation 済み。各 bump_* を再実装するときは
+**上のマトリクス表と P7-1/P9-1 のテストが全 green を保つこと**を確認すれば
+P5-6 級の退行は予防できる。
 
 これらの guard は src/app.rs 18957- (bypass) / 19007- (prefix) にある 4 つの
 `is_some() return` + `let Some(..) else return` パターン、および

@@ -5453,6 +5453,231 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// P9-2: AI モデルが両方未設定なら `final_ai_key_for_pixels` は None を返す。
+    /// このとき key が無いので AI 推論は不要、`is_idx_final_ai_done_or_skipped` は
+    /// **true (= done 扱い)** を返して進捗バーから外れる。
+    ///
+    /// セマンティクス: 「AI 機能を使わないユーザー」(= upscale_model / denoise_model
+    /// 共に None) で先読み進捗バーが終わらない退行を防ぐ。AI 不要なら最初から
+    /// 「done」として総数にカウントしない設計。
+    #[test]
+    fn final_ai_key_is_none_when_no_ai_models_configured() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/no-ai-models.jpg");
+
+        // デフォルト AdjustParams は upscale_model = None / denoise_model = None
+        let params = app.effective_params(idx);
+        assert!(
+            params.upscale_model_kind().is_none(),
+            "fixture pre-condition: upscale model is None"
+        );
+        assert!(
+            params.denoise_model_kind().is_none(),
+            "fixture pre-condition: denoise model is None"
+        );
+
+        let edit_key = dummy_edit_key(&app, idx);
+        let result = app.final_ai_key_for_pixels(edit_key, [1920, 1080], &params);
+        assert!(
+            result.is_none(),
+            "両モデル None なら final_ai_key も None (= AI 推論ジョブ不要)"
+        );
+    }
+
+    /// P9-2b: AI モデル未設定で `is_idx_final_ai_done_or_skipped` が **true** を返す。
+    /// 先読み進捗バーの total 計算で「AI 不要 = done 扱い」とすることで、AI を
+    /// 使わないユーザー (= 多数派) で進捗バーが終わらない退行を防ぐ。
+    ///
+    /// 退行防止: もし `final_ai_key_for_pixels` の None 戻りで `is_done_or_skipped`
+    /// が false を返すように変わると、AI 不要なページが永久に pending 扱いになり、
+    /// 進捗バーが消えなくなる (= 「AI 設定無いのにバーが出続ける」ユーザー報告)。
+    #[test]
+    fn is_idx_final_ai_done_or_skipped_true_when_no_ai_models() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/no-ai-models-done.jpg");
+
+        // raw_source_pixels が Some を返すように fs_cache に Static を仕込む
+        let img = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(100, 110, 120)]);
+        let pixels = Arc::new(img.clone());
+        let tex = ctx.load_texture("no-ai-source", img, Default::default());
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex,
+                pixels: Arc::clone(&pixels),
+                source_dims: Some([1, 1]),
+                load_seq: 0,
+            },
+        );
+
+        // 事前条件: source pixels が解決できる
+        assert!(
+            app.current_raw_source_pixels(idx).is_some(),
+            "fixture: raw_source_pixels が引ける状態"
+        );
+
+        // AI モデル未設定 → AI 不要 → done 扱い (= true)
+        assert!(
+            app.is_idx_final_ai_done_or_skipped(idx),
+            "AI モデル未設定の idx は done 扱い (= 進捗バー total から自然に外れる)"
+        );
+    }
+
+    /// P9-1 helper: idx 分の **全 edit chain cache** (erase_result / local_adjust /
+    /// conceal / edit_result / final_composite / final_ai) に 1 件ずつ entry を仕込み、
+    /// bump_* 後に「何が残って何が消えたか」を観測しやすくする fixture。
+    fn populate_all_idx_caches(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+    ) -> (
+        EraseResultKey,
+        LocalAdjustResultKey,
+        EditResultKey,
+        FinalCompositeKey,
+    ) {
+        // erase_result_cache
+        let erase_key = app.current_erase_result_key(idx);
+        let erase_img = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(50, 60, 70)]);
+        let erase_tex = ctx.load_texture(
+            format!("{label}_erase"),
+            erase_img.clone(),
+            Default::default(),
+        );
+        app.erase_result_cache.insert(
+            erase_key,
+            EraseResultCacheEntry {
+                pixels: Arc::new(erase_img),
+                texture: erase_tex,
+            },
+        );
+
+        // local_adjust_cache
+        let local_key = insert_local_adjust_cache(app, ctx, idx, label);
+
+        // conceal_cache
+        let conceal_img = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(70, 80, 90)]);
+        let conceal_tex = ctx.load_texture(
+            format!("{label}_conceal"),
+            conceal_img.clone(),
+            Default::default(),
+        );
+        let conceal_generation = app.conceal_generation;
+        app.conceal_cache.insert(
+            idx,
+            ConcealCacheEntry {
+                pixels: Arc::new(conceal_img),
+                texture: conceal_tex,
+                generation: conceal_generation,
+            },
+        );
+
+        // edit_result_cache + final_composite_cache + final_ai_cache
+        let (edit_key, final_key) = insert_edit_and_final_cache(app, ctx, idx, label);
+
+        (erase_key, local_key, edit_key, final_key)
+    }
+
+    /// P9-1a: `bump_input_generation(idx)` は **edit chain 全部** (erase_result /
+    /// local_adjust / conceal / edit_result) + **final pipeline 全部** (final_ai /
+    /// final_composite) を idx 単位で全部 clear する。
+    ///
+    /// セマンティクス: 表示入力世代の bump は「decode 結果から下流全部やり直し」
+    /// なので、計算済みの中間結果は全てを捨てる。`bump_adjustment_generation` の
+    /// 「final_composite だけ」とは対照的に、これは最強の clear。
+    ///
+    /// 退行防止: もし erase_result まで巻き込まずに local_adjust 以下だけ clear する
+    /// ような最適化が誤って入ると、source 解像度の編集が古い decode 結果に縛られて
+    /// 表示が更新されない事故になる。
+    #[test]
+    fn bump_input_generation_clears_entire_edit_chain_for_idx() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/bump-input.jpg");
+        let (erase_key, local_key, edit_key, final_key) =
+            populate_all_idx_caches(&mut app, &ctx, idx, "bump_input");
+
+        app.bump_input_generation(idx);
+
+        // 全部 idx 単位で clear される
+        assert!(
+            !app.erase_result_cache.contains_key(&erase_key),
+            "bump_input は erase_result も clear する (= 最上流の bump)"
+        );
+        assert!(!app.local_adjust_cache.contains_key(&local_key));
+        assert!(!app.conceal_cache.contains_key(&idx));
+        assert!(!app.edit_result_cache.contains_key(&edit_key));
+        assert!(!app.final_composite_cache.contains_key(&final_key));
+        assert!(
+            app.final_ai_cache.is_empty(),
+            "bump_input は final_ai も idx 単位で clear する (= clear_edit_result_caches_for_idx 経由)"
+        );
+    }
+
+    /// P9-1b: `bump_erase_mask_generation(idx)` は `bump_input_generation` と
+    /// **構造的に同じ** clear 振る舞い (= 同じ helpers 呼ぶ実装)。別 fn なので
+    /// 個別 fixation して「片方だけ削除パターンが追加される」退行を検知する。
+    #[test]
+    fn bump_erase_mask_generation_clears_entire_edit_chain_for_idx() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/bump-erase-mask.jpg");
+        let (erase_key, local_key, edit_key, final_key) =
+            populate_all_idx_caches(&mut app, &ctx, idx, "bump_erase_mask");
+
+        app.bump_erase_mask_generation(idx);
+
+        assert!(!app.erase_result_cache.contains_key(&erase_key));
+        assert!(!app.local_adjust_cache.contains_key(&local_key));
+        assert!(!app.conceal_cache.contains_key(&idx));
+        assert!(!app.edit_result_cache.contains_key(&edit_key));
+        assert!(!app.final_composite_cache.contains_key(&final_key));
+        assert!(app.final_ai_cache.is_empty());
+    }
+
+    /// P9-1c: `bump_local_adjust_generation(idx)` は **erase_result を keep** する点で
+    /// `bump_input` / `bump_erase_mask` と異なる。補正レイヤーは消しゴム結果より下流
+    /// なので、layer 変更で消しゴム inpaint 結果まで再計算する必要は無い、という
+    /// パイプライン階層を符号化する。
+    ///
+    /// 退行防止: 「効率化のため」と称して erase_result を巻き込む変更が入ると、
+    /// 重い MI-GAN 推論が補正レイヤー編集のたびに走るようになる。
+    #[test]
+    fn bump_local_adjust_generation_keeps_erase_result_but_clears_downstream() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/bump-local-adjust.jpg");
+        let (erase_key, local_key, edit_key, final_key) =
+            populate_all_idx_caches(&mut app, &ctx, idx, "bump_local_adjust");
+
+        app.bump_local_adjust_generation(idx);
+
+        assert!(
+            app.erase_result_cache.contains_key(&erase_key),
+            "erase_result は上流なので bump_local_adjust では保護される \
+             (= MI-GAN 推論を再起動しないための重要な最適化)"
+        );
+        assert!(
+            !app.local_adjust_cache.contains_key(&local_key),
+            "対象 cache (local_adjust) は idx 単位で clear"
+        );
+        assert!(
+            !app.conceal_cache.contains_key(&idx),
+            "下流の conceal は clear (= local_adjust の出力に依存するので無効化)"
+        );
+        assert!(
+            !app.edit_result_cache.contains_key(&edit_key),
+            "下流の edit_result も clear"
+        );
+        assert!(
+            !app.final_composite_cache.contains_key(&final_key),
+            "final pipeline も idx 単位で clear (= clear_edit_result_caches_for_idx 経由)"
+        );
+        assert!(app.final_ai_cache.is_empty());
+    }
+
     /// P7-2: `bump_ai_generation(idx)` は失敗 cache (`final_ai_failed`) も idx 単位で
     /// 削除し、別 idx の失敗エントリは無傷に保つ。
     ///
