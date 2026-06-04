@@ -1511,28 +1511,37 @@ impl ComicLab {
         self.baked_excluded_set = exclude.to_vec();
     }
 
-    /// Ids of stamps drawn as GPU quads (= excluded from the CPU bake): enabled,
-    /// no sticker outline (an outline needs the CPU halo), and decodable. Sorted
-    /// by (z, id) so the quads layer correctly among themselves. Ensures each
-    /// texture is uploaded as a side effect.
+    /// Ids of stamps drawn as GPU quads (= excluded from the CPU bake), in
+    /// ascending z (draw bottom-to-top). To stay z-correct, only the maximal
+    /// TOP-z run of enabled, non-outlined, decodable stamps qualifies: those sit
+    /// above everything left in the CPU bake, so drawing them on top preserves z.
+    /// A stamp placed BELOW a non-stamp object (or an outlined / undecodable stamp)
+    /// ends the run and stays in the CPU bake at its true z. Ensures textures.
     fn gpu_stamp_ids(&mut self, ctx: &egui::Context) -> Vec<u64> {
-        let mut cands: Vec<(i32, u64, StampSource)> = self
-            .objects
-            .iter()
-            .filter_map(|o| match &o.kind {
-                AnnotationKind::Stamp(s) if o.enabled && s.outline.is_none() => {
-                    Some((o.z, o.id, s.source.clone()))
-                }
-                _ => None,
-            })
+        let mut order: Vec<usize> = (0..self.objects.len())
+            .filter(|&i| self.objects[i].enabled)
             .collect();
-        cands.sort_by_key(|&(z, id, _)| (z, id));
-        let mut ids = Vec::with_capacity(cands.len());
-        for (_, id, source) in cands {
+        order.sort_by_key(|&i| self.objects[i].z);
+        let mut ids = Vec::new();
+        for &i in order.iter().rev() {
+            let (id, source) = {
+                let o = &self.objects[i];
+                match &o.kind {
+                    AnnotationKind::Stamp(s) if s.outline.is_none() => (o.id, s.source.clone()),
+                    // Any non-(GPU stamp) object ends the top run — stamps below it
+                    // must stay in the CPU bake to keep correct z.
+                    _ => break,
+                }
+            };
             if self.ensure_stamp_texture(ctx, &source).is_some() {
                 ids.push(id);
+            } else {
+                // Decode failed → this stamp (placeholder) and everything below it
+                // stay in the CPU bake.
+                break;
             }
         }
+        ids.reverse(); // ascending z
         ids
     }
 
@@ -4693,7 +4702,8 @@ impl ComicLab {
                     Color32::WHITE,
                 );
             }
-            // GPU stamps on top of the bake, in z order among themselves.
+            // GPU stamps (the top-z run) drawn on top of the bake, ascending z.
+            // Lower stamps (below a bubble/text) stayed in the bake at true z.
             for &id in &gpu_ids {
                 self.draw_stamp_preview(ctx, &painter, id);
             }
