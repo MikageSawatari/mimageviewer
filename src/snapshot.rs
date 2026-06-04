@@ -498,6 +498,16 @@ pub struct SnapshotState {
     /// 同上、サムネイル状態 (= GPU texture 含む、ロード済みフォルダ代表サムネ保持)。
     /// 子フォルダから BS で戻った際にサムネが Pending に戻らないために必要。
     pub list_view_thumbnails: Vec<crate::grid_item::ThumbnailState>,
+
+    /// 検索 view (Ctrl+G/Ctrl+S) から ★固定した場合の「戻り先フォルダ」。
+    ///
+    /// activate_snapshot で `global_search.saved_folder` or `favsearch.saved_folder` を
+    /// 採用して保存。deactivate_snapshot で origin が合成 path (= `__search_results__`)
+    /// だった場合、この folder に load_folder で戻る。ユーザー報告「Ctrl+G → ★固定 →
+    /// 解除でフォルダがアイテム検索の合成 path 表示のまま残る」事故を回避するため。
+    ///
+    /// 通常 folder からの ★固定では None。
+    pub pre_snapshot_search_origin: Option<PathBuf>,
 }
 
 // ═══════════════════════════════════════════════════════════

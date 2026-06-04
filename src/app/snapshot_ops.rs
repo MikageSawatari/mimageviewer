@@ -209,6 +209,16 @@ impl App {
             .current_folder
             .clone()
             .unwrap_or_else(std::path::PathBuf::new);
+        // 検索 view (Ctrl+G / Ctrl+S) から ★固定した場合の戻り先 folder を採用
+        // (= deactivate 時に合成 path `__search_results__` から本物 folder に戻るため)。
+        // close_searches_for_snapshot が走る前に capture する必要あり。
+        let pre_snapshot_search_origin = if self.global_search.active {
+            self.global_search.saved_folder.clone()
+        } else if self.favsearch.active {
+            self.favsearch.saved_folder.clone()
+        } else {
+            None
+        };
         let mut membership: std::collections::HashMap<SnapshotKey, usize> =
             std::collections::HashMap::with_capacity(captured_entries.len());
         for (idx, entry) in captured_entries.iter().enumerate() {
@@ -273,6 +283,7 @@ impl App {
             saved_selected,
             list_view_items,
             list_view_thumbnails,
+            pre_snapshot_search_origin,
         });
         // ★items_generation bump + invalidate_idx_state_and_queues (= Codex P1-1):
         // items を差し替えたので、旧 ThumbMsg / pending / keep_set / idx-keyed cache が
@@ -315,6 +326,24 @@ impl App {
                     == crate::snapshot::snapshot_key_from_path(&snap.origin)
             })
             .unwrap_or(false);
+        // ユーザー報告 fix: Ctrl+G/Ctrl+S 検索 view から ★固定した場合、origin が合成 path
+        // `__search_results__` になっている。snapshot は検索 mode を consume したので、
+        // 解除しても自然な表示にならない (= items だけ復元しても active=false で UI 不整合)。
+        // → pre_snapshot_search_origin が記録されていればそれを load_folder で開く。
+        let origin_is_synthetic =
+            at_origin && snap.origin == crate::app::search_results_synthetic_path();
+        if origin_is_synthetic {
+            if let Some(restore_to) = snap.pre_snapshot_search_origin.clone() {
+                // snapshot は既に take() で None になっているので load_folder の guard は通る。
+                // load_folder 経路で items/thumbnails/visible_indices/items_generation/cache が
+                // 全部入れ替わる (= invalidate も自動)。
+                self.load_folder(restore_to);
+                self.show_feedback_toast("★固定を解除しました".into());
+                return;
+            }
+            // pre_snapshot_search_origin が無い場合は fallback で saved_items 復元
+            // (= 合成 path 表示のまま残るが、エッジケースとして許容)。
+        }
         if at_origin {
             // origin のまま解除 → 元の items 復元 (= snapshot 元のフォルダに戻る)。
             // snapshot 中に subset (= self.thumbnails) で thumbnail worker が
