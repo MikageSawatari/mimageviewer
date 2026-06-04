@@ -1650,8 +1650,14 @@ awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
 
 **やむを得ず 1 つの作業ツリーを共有する場合の規律** (worktree を分けないとき):
 
-- **`git add -A` / `git add .` 禁止**。必ず**自分が触ったパスだけを明示 add** する
-  (`git add crates/comic-core tools/comic_lab ...`)。これで相手のファイルを巻き込まない。
+- **コミットは必ず pathspec commit `git commit -- <自分のパス>` を使う**。bare `git commit`
+  は**共有 index 全体**をコミットするため、`git add` した直後でも、相手が並行で stage した
+  ファイルを巻き込む (2026-06 実害: 相手の `src/*` が自分のコミットに混入)。`git commit --
+  <paths>` は指定パスだけを working tree からコミットし、index の他の内容を無視するので
+  race-proof。**`-F msgfile` / `-m` 等のオプションは `--` の前に置く** (後ろに置くと pathspec
+  扱いされてエラー)。例: `git commit -F /tmp/msg.txt -- crates/comic-core tools/comic_lab`。
+- **`git add -A` / `git add .` 禁止**。明示 add でも上記のとおり bare commit だと相手の stage
+  を拾うので、最終的な防御は pathspec commit。
 - **HEAD が自分のコミットでないときに `git reset` / `rebase` / 履歴書き換えをしない**。
   実行前に必ず `git log --oneline -5` で「最新が本当に自分の commit か」を確認する。相手の
   commit を巻き戻すと相手の作業が HEAD から消える。
