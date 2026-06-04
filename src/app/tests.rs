@@ -6187,6 +6187,109 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    // ========================================================================
+    // P6-3: M-6 退行ガード (補正レイヤー編集中は隠蔽加工を見せない設計の符号化)
+    // ========================================================================
+    //
+    // ユーザー報告 (docs/local-adjust-integration-audit.md §M-6):
+    //   「消しゴムツールでは、補正レイヤー・隠蔽加工が見えないようになっていると
+    //    思いますが、同様に補正レイヤー編集中は隠蔽加工の処理はみえないように
+    //    してください。」
+    //
+    // 設計: 補正レイヤーは **隠蔽加工の上流** にある (= AdjustParams / AI / conceal
+    // は全部 local_adjust の出力に対して後段適用)。だから補正レイヤー編集中の表示
+    // は conceal-applied の結果を**そもそも経由してはいけない**。
+    //
+    // 構造的な根拠は 2 つあり、片方ずつ別テストで pin する:
+    //   (a) `LocalAdjustResultKey` が conceal の generation を含まない
+    //       → 単一 page の conceal 変更で local_adjust cache が捨てられない
+    //       → 「補正レイヤー編集中は conceal を含まない layer 出力を見せる」設計の根拠
+    //   (b) `current_local_adjust_source_pixels` が conceal_cache を参照しない
+    //       → 補正レイヤー編集中の「入力源」(= layer がまだ無いとき表示する素材)
+    //          には conceal-applied pixels が混じらない
+
+    /// P6-3a: `LocalAdjustResultKey` は **conceal の generation を含まない**。
+    /// 補正レイヤー演算は conceal よりも上流なので、conceal が変わっても
+    /// local_adjust cache は無効化されない。逆に conceal_gen を入れる退行が
+    /// 入ると、conceal を変更するたびに補正レイヤー cache が捨てられて
+    /// 性能劣化 + M-6 (= 編集中に conceal が見えてしまう) を招く。
+    ///
+    /// 形態: フィールドの exhaustive destructure で **コンパイル時に**
+    /// 追加フィールドを検知する。conceal_gen を生やしたら exhaustive match
+    /// が壊れて即 fail する。
+    #[test]
+    fn local_adjust_result_key_excludes_conceal_generation_m6() {
+        let key = LocalAdjustResultKey {
+            idx: 7,
+            input_gen: 1,
+            erase_mask_gen: 2,
+            local_gen: 3,
+        };
+        // exhaustive destructure — 新フィールド追加でコンパイルエラーになる
+        let LocalAdjustResultKey {
+            idx,
+            input_gen,
+            erase_mask_gen,
+            local_gen,
+        } = key;
+        assert_eq!(idx, 7);
+        assert_eq!(input_gen, 1);
+        assert_eq!(erase_mask_gen, 2);
+        assert_eq!(local_gen, 3);
+        // conceal_*_gen が追加されたら上の destructure が non-exhaustive で
+        // コンパイル落ち。その時は本テストを更新する前に M-6 が破綻していないか
+        // (= 補正レイヤー編集中に隠蔽加工が見える退行が無いか) 必ず再検証する。
+    }
+
+    /// P6-3b: `current_local_adjust_source_pixels` は **conceal_cache を参照しない**。
+    /// 補正レイヤー編集中の入力源 (= まだレイヤーが無いときの素材) には
+    /// 隠蔽加工結果が混じってはいけない。
+    ///
+    /// セットアップ: conceal_cache と conceal_pages に明確に識別可能な pixels を
+    /// 仕込み、raw_source / erase_result は無いままにする。compose chain が
+    /// もし誤って conceal を入力源として返すなら、その Arc を返してしまう。
+    /// 期待: None (= raw も erase も無いので何も返らない)、絶対に
+    /// conceal_pixels を返してはいけない。
+    #[test]
+    fn current_local_adjust_source_pixels_ignores_conceal_cache_m6() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/m6-no-conceal-source.jpg");
+
+        // conceal cache に「明らかに識別可能な」 pixels を仕込む
+        let ctx = egui::Context::default();
+        let conceal_color = egui::Color32::from_rgb(123, 45, 67);
+        let conceal_img = egui::ColorImage::new([1, 1], vec![conceal_color]);
+        let conceal_pixels = Arc::new(conceal_img.clone());
+        let conceal_tex = ctx.load_texture("conceal-m6-source", conceal_img, Default::default());
+        let conceal_generation = app.conceal_generation;
+        app.conceal_cache.insert(
+            idx,
+            ConcealCacheEntry {
+                pixels: Arc::clone(&conceal_pixels),
+                texture: conceal_tex,
+                generation: conceal_generation,
+            },
+        );
+        app.conceal_pages.insert(idx);
+
+        // 補正レイヤー編集中の入力源解決
+        let result = app.current_local_adjust_source_pixels(idx);
+
+        // raw_source / erase_result が無いので結果は None になる想定だが、
+        // 万一 Some が返ったとしても、その Arc が conceal_pixels と同一であっては
+        // ならない (= conceal を bypass している証拠)。
+        if let Some(returned) = result {
+            assert!(
+                !Arc::ptr_eq(&returned, &conceal_pixels),
+                "M-6 regression: local_adjust source MUST NOT return conceal-applied pixels. \
+                 If this fires, the compose chain for `current_local_adjust_source_pixels` \
+                 has started routing through conceal_cache, which means the editor will \
+                 show conceal-applied output while editing layers (= the exact behavior \
+                 docs/local-adjust-integration-audit.md §M-6 forbids)."
+            );
+        }
+    }
+
     /// P6-2d: source pixels が None (mask page 中) なら、`maybe_start` は noop。
     #[test]
     fn maybe_start_prefix_preview_returns_early_when_source_unavailable() {

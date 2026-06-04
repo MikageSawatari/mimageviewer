@@ -179,7 +179,7 @@ P5-1〜P5-6 で AI 先読みパイプライン (edit → AI/補正の順序入�
 描画ループ内で毎フレーム呼ばれる経路なので、guard が外れると worker spawn 爆発や
 無駄な cancel/respawn churn が起きる。
 
-- **`src/app/tests.rs::pipeline_cache_refactor_tests`** (15 → 23 件):
+- **`src/app/tests.rs::pipeline_cache_refactor_tests`** (15 → 25 件):
   - `maybe_start_layer_bypass_returns_early_when_cache_already_present` —
     cache hit guard が外れたら毎フレーム spawn する退行を検知。
   - `maybe_start_layer_bypass_keeps_same_key_pending_alive` —
@@ -197,10 +197,34 @@ P5-1〜P5-6 で AI 先読みパイプライン (edit → AI/補正の順序入�
     `local_adjust_layers_until` の `count == 0 || count >= layers.len()` 境界
     (= 「先頭から 0 枚」「先頭から全枚」は元の合成と同じなので spawn 不要) を符号化。
   - `maybe_start_prefix_preview_returns_early_when_source_unavailable` — 同上。
+  - `local_adjust_result_key_excludes_conceal_generation_m6` — **M-6 構造ガード**。
+    `LocalAdjustResultKey` を exhaustive destructure してフィールド集合
+    (idx / input_gen / erase_mask_gen / local_gen) を符号化。conceal_*_gen を
+    追加する退行が入ると **コンパイル時** に検知される (= 補正レイヤー演算は
+    conceal の上流であるという設計を構造で固定)。
+  - `current_local_adjust_source_pixels_ignores_conceal_cache_m6` —
+    **M-6 動作ガード**。conceal_cache に明確に識別可能な pixels を仕込んだ
+    状態で `current_local_adjust_source_pixels` を呼び、戻り値が conceal の
+    Arc と同一でないことを assert。compose chain が誤って conceal-applied
+    pixels を補正レイヤーの入力源に回す退行を検知する。
 
 これらの guard は src/app.rs 18957- (bypass) / 19007- (prefix) にある 4 つの
-`is_some() return` + `let Some(..) else return` パターン。**`fn maybe_start_*` を
-リファクタしたら必ず**この 8 本が green を保つことを確認すること。
+`is_some() return` + `let Some(..) else return` パターン、および
+src/app.rs:18905- (`current_local_adjust_source_pixels`) の compose chain。
+**`fn maybe_start_*` / `LocalAdjustResultKey` / `current_local_adjust_source_pixels`
+をリファクタしたら必ず**この 10 本が green を保つことを確認すること。
+
+### M-6 のテーブル更新
+
+| バグ ID | レイヤー | テスト関数 | コミット |
+|---|---|---|---|
+| M-6 隠蔽加工バイパス | L3 (App統合) | `local_adjust_result_key_excludes_conceal_generation_m6` (構造) + `current_local_adjust_source_pixels_ignores_conceal_cache_m6` (動作) ✅ | (Phase 3) |
+
+(冒頭の M-6 行が「難度高 / TBD」になっていたのを **Phase 3 で着手済み** と本表で
+上書きしている。M-6 の完全カバー = compose chain 全分岐 (BypassLayer /
+PrefixPreview / FullComposite / ShowSource × `ensure_final_composite_texture`
+非経由) まで踏み込むのは L4 (egui_kittest による E2E) 待ちで、現状は
+構造 + 動作の 2 軸ガードで実用上の退行は検知できる。)
 
 ## CI 統合
 
