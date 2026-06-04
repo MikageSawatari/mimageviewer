@@ -597,6 +597,21 @@ fn sideways_size(font: &LoadedFont, run: &[char], size: f32, cell: f32) -> f32 {
     }
 }
 
+/// Across-column (horizontal) extent a cluster needs. Single/Grapheme/Sideways
+/// occupy one `cell`; a 縦中横 (`Tcy`) run is laid at FULL body size and can be
+/// wider than a cell — the column then widens so the run doesn't collide with its
+/// neighbours (instead of shrinking the digits to fit).
+fn cluster_width(cluster: &Cluster, font: &LoadedFont, size: f32, cell: f32) -> f32 {
+    match cluster {
+        Cluster::Single(_) | Cluster::Grapheme(_) | Cluster::Sideways(_) => cell,
+        Cluster::Tcy(run) => run
+            .iter()
+            .map(|&c| font.h_advance(c, size))
+            .sum::<f32>()
+            .max(1.0),
+    }
+}
+
 /// Along-column height of one cluster, given the cell size and per-glyph step.
 fn cluster_height(
     cluster: &Cluster,
@@ -671,9 +686,6 @@ fn layout_vertical(block: &TextBlock, font: &LoadedFont, wrap_height: Option<f32
         let m = font.h_advance('\u{3042}', size); // あ as CJK width proxy
         if m > 1.0 { m } else { size }
     };
-    // Clamp to a small positive (mirrors line_advance): a large negative
-    // line_gap could otherwise collapse column advance and thus the bounds.
-    let col_advance = (cell + block.line_gap).max(1.0);
     // Vertical step between stacked glyphs within a column.
     // Clamp to a small positive value: size_px can be tiny and letter_gap can be
     // negative, which would otherwise give zero/negative cells (inverted layout).
@@ -713,14 +725,38 @@ fn layout_vertical(block: &TextBlock, font: &LoadedFont, wrap_height: Option<f32
     }
 
     let max_h = columns.iter().map(|c| c.height).fold(0.0f32, f32::max);
-    let n_cols = columns.len().max(1);
-    let total_w = col_advance * columns.len() as f32;
+    let n = columns.len();
+
+    // Per-column width = max(cell, widest 縦中横 run in the column). Each column's
+    // slot is its width + line_gap. Columns pack RIGHT-TO-LEFT, so a wide 縦中横
+    // column pushes its neighbours apart instead of overlapping them.
+    let widths: Vec<f32> = columns
+        .iter()
+        .map(|c| {
+            c.clusters
+                .iter()
+                .map(|cl| cluster_width(cl, font, size, cell))
+                .fold(cell, f32::max)
+        })
+        .collect();
+    let slots: Vec<f32> = widths
+        .iter()
+        .map(|&w| (w + block.line_gap).max(1.0))
+        .collect();
+    // `col_left[idx]` = left edge of column idx's content (= total width of the
+    // columns to its LEFT, which have higher idx because col 0 is rightmost).
+    let mut col_left = vec![0.0f32; n];
+    let mut left_acc = 0.0f32;
+    for idx in (0..n).rev() {
+        col_left[idx] = left_acc;
+        left_acc += slots[idx];
+    }
+    let total_w = left_acc;
 
     let mut placed = Vec::new();
     for (col_idx, col) in columns.iter().enumerate() {
-        // RIGHT-TO-LEFT: the first column sits at the rightmost x.
-        let col_left = (n_cols - 1 - col_idx) as f32 * col_advance;
-        let col_center_x = col_left + cell * 0.5;
+        // Center the column's content within its own (possibly widened) width.
+        let col_center_x = col_left[col_idx] + widths[col_idx] * 0.5;
         // Align along the column (Start = top).
         let start_y = match block.align {
             TextAlign::Start => 0.0,
@@ -755,37 +791,27 @@ fn layout_vertical(block: &TextBlock, font: &LoadedFont, wrap_height: Option<f32
                     );
                 }
                 Cluster::Tcy(run) => {
-                    // Lay the run horizontally, centered in the cell. Start at
-                    // half the body size; if the run is wider than 90% of the
-                    // cell, scale it down so it never overflows into neighboring
-                    // columns (fit-to-column, avoids overlap).
-                    let mut tcy_size = size * 0.5;
-                    let width_at = |sz: f32| -> f32 {
-                        run.iter().map(|&c| font.h_advance(c, sz)).sum::<f32>()
-                    };
-                    let limit = cell * 0.9;
-                    let w0 = width_at(tcy_size);
-                    if w0 > limit && w0 > 0.0 {
-                        tcy_size *= limit / w0;
-                    }
+                    // 縦中横: lay the run horizontally at FULL body size (no shrink),
+                    // centered in the column. The column was widened to fit the run
+                    // (see `cluster_width`), so it doesn't overlap its neighbours.
                     let mut widths = Vec::with_capacity(run.len());
                     let mut total = 0.0f32;
                     for &c in run {
-                        let w = font.h_advance(c, tcy_size);
+                        let w = font.h_advance(c, size);
                         widths.push(w);
                         total += w;
                     }
-                    // Horizontally centered in the cell; vertically centered in
-                    // the cell (baseline placed so glyph body sits mid-cell).
+                    // Horizontally centered on the column axis; vertically centered
+                    // in the cell (baseline placed so the glyph body sits mid-cell).
                     let mut pen_x = col_center_x - total * 0.5;
-                    let y = cell_top + glyph_step * 0.5 + tcy_size * 0.5;
+                    let y = cell_top + glyph_step * 0.5 + size * 0.34;
                     for (i, &c) in run.iter().enumerate() {
                         placed.push(GlyphPlacement::new(
                             c,
                             font.glyph_id(c),
                             pen_x,
                             y,
-                            tcy_size,
+                            size,
                             GlyphForm::Upright,
                         ));
                         pen_x += widths[i];

@@ -33,11 +33,22 @@ pub struct ShapedGlyph {
     pub y_advance: f32,
 }
 
-/// A single loaded font face: the raw bytes (so a borrowing `rustybuzz::Face`
-/// can be built on demand) plus cached design metrics.
+// Owns the font bytes + a borrowing `rustybuzz::Face` parsed ONCE (self-cell makes
+// the self-reference safe). Rebuilding the Face per call was a severe perf bug
+// (~46µs each on a .ttc) — caching it makes metric/shape/raster calls ~free.
+self_cell::self_cell!(
+    struct FaceCell {
+        owner: Vec<u8>,
+        #[covariant]
+        dependent: RbFace,
+    }
+);
+type RbFace<'a> = Face<'a>;
+
+/// A single loaded font face: the bytes + the parsed face (cached) + design metrics.
 pub struct LoadedFont {
     pub key: String,
-    data: Vec<u8>,
+    cell: FaceCell,
     upem: f32,
     ascent_fu: f32,
     descent_fu: f32, // negative
@@ -47,15 +58,17 @@ pub struct LoadedFont {
 impl LoadedFont {
     /// Load a face from raw TTF/OTF/TTC bytes. For TTC, the first face is used.
     pub fn from_bytes(key: impl Into<String>, bytes: Vec<u8>) -> Result<Self, String> {
-        let face = Face::from_slice(&bytes, 0).ok_or_else(|| "failed to parse font".to_string())?;
+        let cell = FaceCell::try_new(bytes, |b| {
+            Face::from_slice(b, 0).ok_or_else(|| "failed to parse font".to_string())
+        })?;
+        let face = cell.borrow_dependent();
         let upem = (face.units_per_em() as f32).max(1.0);
         let ascent_fu = face.ascender() as f32;
         let descent_fu = face.descender() as f32;
         let line_gap_fu = face.line_gap() as f32;
-        drop(face);
         Ok(LoadedFont {
             key: key.into(),
-            data: bytes,
+            cell,
             upem,
             ascent_fu,
             descent_fu,
@@ -63,10 +76,9 @@ impl LoadedFont {
         })
     }
 
-    /// Build a borrowing shaping/outline face from the owned bytes. `from_slice`
-    /// only parses the table directory, so this is cheap to call per run.
-    fn face(&self) -> Option<Face<'_>> {
-        Face::from_slice(&self.data, 0)
+    /// The parsed font face (cached; cheap to call).
+    fn face(&self) -> &RbFace<'_> {
+        self.cell.borrow_dependent()
     }
 
     pub fn units_per_em(&self) -> f32 {
@@ -76,8 +88,8 @@ impl LoadedFont {
     /// Horizontal advance (in px) for a char at the given pixel size.
     pub fn h_advance(&self, ch: char, size_px: f32) -> f32 {
         let s = size_px / self.upem;
-        if let Some(face) = self.face()
-            && let Some(gid) = face.glyph_index(ch)
+        let face = self.face();
+        if let Some(gid) = face.glyph_index(ch)
             && let Some(adv) = face.glyph_hor_advance(gid)
         {
             return adv as f32 * s;
@@ -102,17 +114,12 @@ impl LoadedFont {
 
     /// Glyph id for `ch` (0 / .notdef when the font lacks it).
     pub fn glyph_id(&self, ch: char) -> u16 {
-        self.face()
-            .and_then(|f| f.glyph_index(ch))
-            .map(|g| g.0)
-            .unwrap_or(0)
+        self.face().glyph_index(ch).map(|g| g.0).unwrap_or(0)
     }
 
     /// True if the font has a real (non-.notdef) glyph for `ch`.
     pub fn covers(&self, ch: char) -> bool {
-        self.face()
-            .and_then(|f| f.glyph_index(ch))
-            .is_some_and(|g| g.0 != 0)
+        self.face().glyph_index(ch).is_some_and(|g| g.0 != 0)
     }
 
     /// Ink height (px) of a char's outline bounding box. 0 for no outline.
@@ -131,7 +138,7 @@ impl LoadedFont {
 
     /// Like `glyph_px_bounds` but by glyph id (for shaped/substituted glyphs).
     pub fn glyph_px_bounds_gid(&self, gid: u16, size_px: f32) -> Option<(f32, f32, f32, f32)> {
-        let face = self.face()?;
+        let face = self.face();
         let mut nb = NoopOutline;
         let r = face.outline_glyph(GlyphId(gid), &mut nb)?;
         let s = size_px / self.upem;
@@ -148,9 +155,7 @@ impl LoadedFont {
     /// font's `vert` feature automatically (HarfBuzz default), giving the correct
     /// vertical glyph forms and metrics.
     pub fn shape_run(&self, text: &str, size_px: f32, vertical: bool) -> Vec<ShapedGlyph> {
-        let Some(face) = self.face() else {
-            return Vec::new();
-        };
+        let face = self.face();
         let mut buf = UnicodeBuffer::new();
         buf.push_str(text);
         buf.set_direction(if vertical {
@@ -158,7 +163,7 @@ impl LoadedFont {
         } else {
             Direction::LeftToRight
         });
-        let gb = rustybuzz::shape(&face, &[], buf);
+        let gb = rustybuzz::shape(face, &[], buf);
         let s = size_px / self.upem;
         let infos = gb.glyph_infos();
         let pos = gb.glyph_positions();
@@ -176,25 +181,6 @@ impl LoadedFont {
             .collect()
     }
 
-    /// Vertical shaping of a single char → its (substituted) vertical glyph +
-    /// metrics. Falls back to the cmap glyph at full-em advance if shaping yields
-    /// nothing.
-    pub fn vertical_glyph(&self, ch: char, size_px: f32) -> ShapedGlyph {
-        let mut buf = [0u8; 4];
-        let s = ch.encode_utf8(&mut buf);
-        self.shape_run(s, size_px, true)
-            .into_iter()
-            .next()
-            .unwrap_or(ShapedGlyph {
-                gid: self.glyph_id(ch),
-                cluster: 0,
-                x_offset: 0.0,
-                y_offset: 0.0,
-                x_advance: 0.0,
-                y_advance: -size_px,
-            })
-    }
-
     /// Rasterize a glyph id into a coverage bitmap via `ab_glyph_rasterizer`
     /// (the same coverage engine `ab_glyph` uses). `outline_dilate_px` expands
     /// the mask (袋文字 halo) by an 8-neighbour max dilation.
@@ -204,7 +190,7 @@ impl LoadedFont {
         size_px: f32,
         outline_dilate_px: f32,
     ) -> Option<GlyphBitmap> {
-        let face = self.face()?;
+        let face = self.face();
         let mut col = OutlineCollector::default();
         let r = face.outline_glyph(GlyphId(gid), &mut col)?;
         let s = size_px / self.upem;

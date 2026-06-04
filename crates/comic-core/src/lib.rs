@@ -162,8 +162,8 @@ mod integration_tests {
             "縦中横 members advance horizontally"
         );
         assert!(
-            marks.iter().all(|g| g.size < block.size_px),
-            "縦中横 glyphs should be reduced"
+            marks.iter().all(|g| (g.size - block.size_px).abs() < 0.01),
+            "縦中横 glyphs keep full body size (no shrink)"
         );
     }
 
@@ -420,15 +420,15 @@ mod integration_tests {
     }
 
     #[test]
-    fn tcy_fits_within_cell_width() {
+    fn tcy_full_size_widens_column_no_overlap() {
         let Some(font) = load_test_font() else {
             eprintln!("skip: no Windows JP font available");
             return;
         };
-        // A long bracketed run `[ABCDEFG]` must be scaled so the whole 縦中横
-        // cluster fits inside ~90% of one column cell (no overflow into the
-        // neighbouring column).
-        let block = markup_block("[ABCDEFG]");
+        // 縦中横 is now laid at FULL body size (no shrink); a wide run widens its
+        // column so it doesn't collide with the neighbouring column. Layout:
+        // col0 = Tcy([A..G]) (rightmost, wide), col1 = X / Y singles (to its left).
+        let block = markup_block("[ABCDEFG]\nXY");
         let layout = layout_text(&block, &font);
         let marked: Vec<&GlyphPlacement> = layout
             .glyphs
@@ -436,26 +436,37 @@ mod integration_tests {
             .filter(|g| ('A'..='G').contains(&g.ch))
             .collect();
         assert_eq!(marked.len(), 7, "all 7 chars placed");
-        // All share one baseline (縦中横 is horizontal).
+        // Full body size (NOT shrunk) and a shared baseline.
+        assert!(
+            marked.iter().all(|g| (g.size - block.size_px).abs() < 0.01),
+            "縦中横 keeps full body size"
+        );
         let y0 = marked[0].y;
         assert!(
             marked.iter().all(|g| (g.y - y0).abs() < 1.0),
             "縦中横 members share one baseline"
         );
-        // Measured run width from leftmost pen-left to rightmost glyph advance.
-        let tcy_size = marked[0].size;
-        let left = marked.iter().map(|g| g.x).fold(f32::INFINITY, f32::min);
-        let mut right = f32::NEG_INFINITY;
-        for g in &marked {
-            right = right.max(g.x + font.h_advance(g.ch, tcy_size));
-        }
-        let run_w = right - left;
-        // The cell width is the あ advance at the block size.
+        // The run is full-size wide (> one cell): the column must have widened.
+        let run_left = marked.iter().map(|g| g.x).fold(f32::INFINITY, f32::min);
+        let run_right = marked
+            .iter()
+            .map(|g| g.x + font.h_advance(g.ch, g.size))
+            .fold(f32::NEG_INFINITY, f32::max);
         let cell = font.h_advance('\u{3042}', block.size_px);
         assert!(
-            run_w <= cell * 0.9 + 1.0,
-            "tcy run width {run_w} must fit within cell*0.9 = {}",
-            cell * 0.9
+            run_right - run_left > cell,
+            "full-size run is wider than a cell"
+        );
+        // No overlap: the X/Y column (to the left) must end before the tcy run starts.
+        let xy_right = layout
+            .glyphs
+            .iter()
+            .filter(|g| g.ch == 'X' || g.ch == 'Y')
+            .map(|g| g.x + font.h_advance(g.ch, g.size))
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            xy_right <= run_left + 1.0,
+            "neighbouring column (right edge {xy_right}) must not overlap the 縦中横 run (left {run_left})"
         );
     }
 

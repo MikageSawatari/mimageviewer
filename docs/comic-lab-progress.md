@@ -29,6 +29,29 @@ Status: 作業中スナップショット (コンパクト耐性用)
   comic_lab = `resvg`、`image` に webp/gif/bmp。
 - **本体未統合**: どちらも lab のみ。本体 `src/` は触っていない。
 
+## 2026-06-04 実機フィードバック対応 (perf / 縦中横 / 検証サンプル)
+
+実機確認後の 3 点を対応:
+
+- **⚠ 重大 perf 修正 (face caching)**: `LoadedFont` が **呼び出しごとに**
+  `rustybuzz::Face::from_slice`(.ttc 解析)を再実行していた (h_advance ≈46µs/回、bake
+  6.4ms/回・release)。`self_cell` で **バイト列 + 解析済み Face を 1 度だけ保持**するよう変更
+  (h_advance 0.04µs/回 ≈ 1000×、shape/rasterize ≈20-28×、bake ≈2×)。これが「操作が重い」の
+  主因。テストスイートも 1s → 0.05s に短縮 (テストも再解析に支配されていた)。
+- **縦中横を「縮小せず全角サイズ + 列幅可変」に変更**: 従来は `size*0.5` に縮小してセルに収め
+  ていたのを、**本文と同じサイズのまま横並び**にし、列幅 = `max(cell, 縦中横ラン幅)` として
+  列を右→左へ可変幅パッキング。桁数が多いと**その列の左右間隔が広がり**隣の列と重ならない
+  (`cluster_width` + per-column `col_left`/`widths`)。回帰テスト
+  `tcy_full_size_widens_column_no_overlap` を追加、`mixed_punct_tcy_cluster` を全角サイズ assert に更新。
+- **テキストのドラッグ移動**: hit-test の bounds は実測で正しく(glyph ink ⊂ bounds)、移動
+  ロジックも全 kind で pivot を動かす。**動かなく見えたのは上の perf 起因のラグ**(drag 中は
+  0.09s throttle で再 bake、bake が重すぎて追従しなかった)。face caching で解消見込み。
+- **検証サンプル**: `docs/comic-lab-sample-scene.comic.json`(読み込めるシーン) +
+  `docs/comic-lab-sample-text.md`(コピペ用) + `scripts/gen_comic_sample.py`(生成元)。
+  IVS は実測で Yu Gothic/Meiryo/MS Gothic 共通対応の `辻 葛 芦` を採用。
+  `sample_scene_loads` テストでシーンが SidecarDoc 経路でロードでき IVS/結合文字が保持される
+  ことを保証。
+
 ## 構成
 - `crates/comic-core` — pure (egui 非依存)。model(+Stamp) / layout(横/縦書き+縦中横+横倒し) /
   font(`rustybuzz` shape + `ab_glyph_rasterizer` coverage, `rotate_cw`) /

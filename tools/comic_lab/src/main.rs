@@ -4253,7 +4253,9 @@ impl ComicLab {
             // don't allocate + upload a full-resolution texture every frame.
             let now = ctx.input(|i| i.time);
             let dragging = self.drag != DragKind::None;
-            if self.baked_dirty && (!dragging || now - self.last_bake_time >= 0.09) {
+            // Re-bake at ~30fps during a drag (CPU bake is cheap now that the font
+            // face is cached; this throttle only bounds full-res texture uploads).
+            if self.baked_dirty && (!dragging || now - self.last_bake_time >= 0.03) {
                 self.rebake(ctx);
                 self.last_bake_time = now;
             }

@@ -21,3 +21,7 @@ serde = { version = "1", features = ["derive"] }
 #   the previous ab_glyph path. 袋文字 dilation / rotate_cw operate on the coverage.
 rustybuzz = "0.20.1"
 ab_glyph_rasterizer = "0.1.10"
+# Owns the font bytes + a borrowing rustybuzz::Face parsed ONCE (self-referential).
+# Rebuilding Face::from_slice per metric/shape/raster call was a severe perf bug
+# (~46us each on a .ttc); caching the parsed face makes those calls ~free.
+self_cell = "1"
