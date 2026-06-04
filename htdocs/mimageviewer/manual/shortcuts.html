@@ -65,9 +65,9 @@
           <tr><td><kbd>Page Up</kbd></td><td>1ページ上にスクロール</td></tr>
           <tr><td><kbd>Page Down</kbd></td><td>1ページ下にスクロール</td></tr>
           <tr><td><kbd>BS</kbd></td><td>親フォルダへ移動。検索中 (<kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>) は検索結果の階層を 1 段戻る (最上位では何もしない。検索を閉じるには <kbd>Esc</kbd> や検索バーの <span aria-hidden="true">×</span> ボタン)</td></tr>
-          <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd></td><td>ツリー順で前のフォルダへ</td></tr>
-          <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>ツリー順で次のフォルダへ</td></tr>
-          <tr><td><kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd></td><td>前 / 次の兄弟フォルダへ（現在地と同じ親の直下だけを対象にし、子や祖先の階層へは入らない）。グリッド・フルスクリーンで有効、検索中は無効</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd></td><td>ツリー順で前のフォルダへ（★固定中は固定したリストの前へ）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>ツリー順で次のフォルダへ（★固定中は固定したリストの次へ）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd></td><td>前 / 次の兄弟フォルダへ（現在地と同じ親の直下だけを対象にし、子や祖先の階層へは入らない）。グリッド・フルスクリーンで有効、検索中は無効。★固定中は固定したリストの前 / 次の画像・動画へ（フォルダ・ZIP・PDF は飛ばす）</td></tr>
         </tbody>
       </table>
     </div>
@@ -77,6 +77,18 @@
         5 ボタンマウスの<strong>戻る／進むボタン</strong>は <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>Ctrl</kbd>+<kbd>↓</kbd> と同じ動作です (履歴ではなく、ツリー順の前／次フォルダへ移動)。グリッド表示・フルスクリーン表示・動画再生中のいずれでも使えます。
       </div>
     </div>
+
+    <h3>★固定 (絞り込み結果の凍結)</h3>
+    <p>
+      ★ レーティングフィルター・<kbd>Ctrl</kbd>+<kbd>F</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>G</kbd> で絞り込んだ結果を、ツールバーの <strong>[★固定]</strong> ボタンで一時的にスナップショットとして凍結できます。スライドショーや <kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd> で、その範囲内だけを巡回したいときに便利です。
+    </p>
+    <ul>
+      <li><strong>固定する</strong>: ★ フィルターツールバー右端の [★固定] をクリック。検索結果が active ならその結果も固定対象。Ctrl+G の結果取得中・集約表示中は使用不可。</li>
+      <li><strong>解除する</strong>: もう一度 [★固定] をクリック。または <kbd>Ctrl</kbd>+<kbd>F</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>G</kbd> で新たに検索を始めると自動解除。</li>
+      <li><strong>巡回</strong>: フルスクリーンで <kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd> で固定リスト内の前/次へ。リスト内のフォルダに入ると中の最初の画像が表示され、その先頭・末尾でさらに <kbd>Ctrl</kbd>+<kbd>↑</kbd>/<kbd>↓</kbd> を押すと固定リスト内の次のフォルダ・画像へ。</li>
+      <li><strong>スライドショー</strong>: フォルダ末尾に到達するとリスト内の次の画像/フォルダへ自動遷移。</li>
+      <li><strong>制限</strong>: 固定中は範囲外のフォルダへ移動できません (<kbd>BS</kbd>・<kbd>Alt</kbd>+<kbd>↑</kbd>・フォルダツリー・お気に入りなど)。アプリ再起動で固定は消えます (永続化しません)。</li>
+    </ul>
 
     <h3>選択・チェック</h3>
     <div class="table-wrap">

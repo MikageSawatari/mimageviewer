@@ -25,6 +25,7 @@ impl App {
     }
 
     /// snapshot の起点フォルダ path。inactive なら None。
+    #[allow(dead_code)] // 将来の debug log / restore 用、SL-C3 では未使用
     pub(crate) fn snapshot_origin(&self) -> Option<&Path> {
         self.snapshot.as_ref().map(|s| s.origin.as_path())
     }
@@ -310,6 +311,283 @@ impl App {
         had_active
     }
 
+    // ─── snapshot navigation (§4.6 混合 nav resolver) ──────────────────────────────────────
+
+    /// 現在 fullscreen で開いている path を返す。
+    /// snapshot 中で folder enter 後の場合、items は folder contents なので
+    /// items[fullscreen_idx] の path を取り出す。
+    pub(crate) fn snapshot_current_fullscreen_path(&self) -> Option<std::path::PathBuf> {
+        let idx = self.fullscreen_idx?;
+        let item = self.items.get(idx)?;
+        // GridItem の path は display_path() ではなく真の path を取り出す必要がある
+        use crate::grid_item::GridItem;
+        match item {
+            GridItem::Folder(p)
+            | GridItem::Image(p)
+            | GridItem::Video(p)
+            | GridItem::ZipFile(p)
+            | GridItem::PdfFile(p) => Some(p.clone()),
+            GridItem::ConvertibleArchive { path, .. } => Some(path.clone()),
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => {
+                // `<zip>/<entry>` 形式で構築 (= snapshot_key_from_path の split_archive_path
+                // と整合)
+                let mut p = zip_path.clone();
+                p.push(entry_name);
+                Some(p)
+            }
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => {
+                // `<pdf>/p:<num>` 形式
+                let mut p = pdf_path.clone();
+                p.push(format!("p:{page_num}"));
+                Some(p)
+            }
+            _ => None,
+        }
+    }
+
+    /// snapshot 内の **次/前 entry** index を計算する (= 混合 nav の Arrow 用)。
+    ///
+    /// `current_idx` が None なら snapshot 先頭 / 末尾を返す (= snapshot に最初に入る場合)。
+    /// forward=true なら次へ、false なら前へ。末尾 (= wrap せず stop) なら None。
+    pub(crate) fn snapshot_next_arrow_entry(
+        &self,
+        current_idx: Option<usize>,
+        forward: bool,
+    ) -> Option<usize> {
+        let snap = self.snapshot.as_ref()?;
+        let n = snap.items.len();
+        if n == 0 {
+            return None;
+        }
+        match current_idx {
+            None => Some(if forward { 0 } else { n - 1 }),
+            Some(i) => {
+                if forward {
+                    if i + 1 < n { Some(i + 1) } else { None }
+                } else {
+                    if i > 0 { Some(i - 1) } else { None }
+                }
+            }
+        }
+    }
+
+    /// snapshot 内の **次/前 playable image-like entry** index (= Ctrl+PageUp/Down +
+    /// slideshow 末尾用)。Folder/Zip/Pdf entry は skip。
+    pub(crate) fn snapshot_next_playable_entry(
+        &self,
+        current_idx: Option<usize>,
+        forward: bool,
+    ) -> Option<usize> {
+        let snap = self.snapshot.as_ref()?;
+        let n = snap.items.len();
+        if n == 0 {
+            return None;
+        }
+        let start: isize = match current_idx {
+            None => {
+                if forward {
+                    -1
+                } else {
+                    n as isize
+                }
+            }
+            Some(i) => i as isize,
+        };
+        let step: isize = if forward { 1 } else { -1 };
+        let mut cur = start + step;
+        while cur >= 0 && cur < n as isize {
+            let idx = cur as usize;
+            if snap.items[idx].kind.is_playable_leaf() {
+                return Some(idx);
+            }
+            cur += step;
+        }
+        None
+    }
+
+    /// snapshot 内 entry を open する (= load_folder + open_fullscreen のエントリポイント)。
+    ///
+    /// 動作:
+    /// - playable leaf (Image/Video/ZipImage/PdfPage):
+    ///   - 現在 items に同 path があれば `open_fullscreen(items_idx)` で直接
+    ///   - 無ければ owner folder を `load_folder` してから fullscreen 開く
+    /// - container (Folder/ZipFile/PdfFile):
+    ///   - `load_folder(container_path)` で中身を items に展開
+    ///   - 完了後に **最初の playable item を fullscreen で開く** (= 設計 §4.6)
+    ///   - スライドショー継続の場合は `resume_slideshow` で起動
+    pub(crate) fn snapshot_open_entry(&mut self, entry_idx: usize, resume_slideshow: bool) -> bool {
+        use crate::grid_item::GridItem;
+        use crate::snapshot::SnapshotEntryKind;
+        let Some(snap) = self.snapshot.as_ref() else {
+            return false;
+        };
+        let Some(entry) = snap.items.get(entry_idx) else {
+            return false;
+        };
+        let entry_kind = entry.kind;
+        let target_path = std::path::PathBuf::from(&entry.display);
+        match entry_kind {
+            SnapshotEntryKind::Image
+            | SnapshotEntryKind::Video
+            | SnapshotEntryKind::ZipImage
+            | SnapshotEntryKind::PdfPage => {
+                // 現在 items の中に同 path があれば直接 open
+                if let Some(idx) = self.items.iter().position(|it| match it {
+                    GridItem::Image(p) | GridItem::Video(p) => *p == target_path,
+                    GridItem::ZipImage {
+                        zip_path,
+                        entry_name,
+                    } => {
+                        let mut p = zip_path.clone();
+                        p.push(entry_name);
+                        p == target_path
+                    }
+                    GridItem::PdfPage {
+                        pdf_path, page_num, ..
+                    } => {
+                        let mut p = pdf_path.clone();
+                        p.push(format!("p:{page_num}"));
+                        p == target_path
+                    }
+                    _ => false,
+                }) {
+                    self.open_fullscreen(idx);
+                    if resume_slideshow {
+                        self.slideshow_playing = true;
+                    }
+                    return true;
+                }
+                // 該当 path が現在 items に無い → owner folder を load してから open
+                let owner_folder = match entry_kind {
+                    SnapshotEntryKind::Image | SnapshotEntryKind::Video => {
+                        target_path.parent().map(|p| p.to_path_buf())
+                    }
+                    SnapshotEntryKind::ZipImage | SnapshotEntryKind::PdfPage => {
+                        // archive 内 inner なので container を解決
+                        crate::snapshot::split_archive_path(&target_path).map(|(c, _)| c)
+                    }
+                    _ => None,
+                };
+                if let Some(folder) = owner_folder {
+                    self.snapshot_load_and_open(folder, resume_slideshow);
+                    return true;
+                }
+                false
+            }
+            SnapshotEntryKind::Folder
+            | SnapshotEntryKind::ZipFile
+            | SnapshotEntryKind::PdfFile
+            | SnapshotEntryKind::ConvertibleArchive => {
+                // container を load し、その後最初の playable item を fullscreen で開く
+                self.snapshot_load_and_open(target_path, resume_slideshow);
+                true
+            }
+        }
+    }
+
+    /// snapshot internal nav flag を立てて load_folder + 最初の playable item を fullscreen で開く。
+    ///
+    /// `load_folder_with_scan` の snapshot guard を bypass するため、`snapshot_internal_nav`
+    /// を true にしてから呼ぶ。flag は呼び出し後に false に戻す (= scope guard pattern)。
+    fn snapshot_load_and_open(&mut self, folder_path: std::path::PathBuf, resume_slideshow: bool) {
+        let was_fs = self.fullscreen_idx.is_some();
+        // 現在 fullscreen を閉じる (= items が入れ替わるので)
+        if was_fs {
+            self.close_fullscreen();
+        }
+        // guard bypass
+        self.snapshot_internal_nav = true;
+        self.load_folder(folder_path);
+        self.snapshot_internal_nav = false;
+        // load_folder 完了後に最初の playable item (= Image/Video) を fullscreen で開く。
+        // ※ ZIP/PDF は async enumerate なので、items は ZipSeparator のみで埋まっている可能性が
+        //   ある。その場合は次フレーム以降の enumerate 完了で deferred reopen される (= §4.6
+        //   末尾説明)。MVP では sync 経路のみ対応、ZIP/PDF への snapshot navigation は実機
+        //   確認で評価する。
+        if was_fs || resume_slideshow {
+            // 最初の image-like item を探して open
+            if let Some(first_idx) = self.items.iter().position(|it| {
+                matches!(
+                    it,
+                    crate::grid_item::GridItem::Image(_)
+                        | crate::grid_item::GridItem::Video(_)
+                        | crate::grid_item::GridItem::ZipImage { .. }
+                        | crate::grid_item::GridItem::PdfPage { .. }
+                )
+            }) {
+                self.open_fullscreen(first_idx);
+                if resume_slideshow {
+                    self.slideshow_playing = true;
+                }
+            }
+        }
+    }
+
+    /// snapshot navigation のエントリポイント (Ctrl+↑↓ / Ctrl+PageUp/Down)。
+    ///
+    /// fullscreen から呼ばれる。`forward=true` で次へ、`page_only=true` で image-like のみ巡回。
+    ///
+    /// 戻り値: `true` = navigation した、`false` = snapshot inactive / 末尾。
+    /// 末尾の場合は boundary hint をセットする。
+    pub(crate) fn snapshot_navigate(
+        &mut self,
+        ctx: &egui::Context,
+        forward: bool,
+        page_only: bool,
+        resume_slideshow: bool,
+    ) -> bool {
+        if !self.is_snapshot_active() {
+            return false;
+        }
+        // 現在 fullscreen path → owner_entry idx を解決
+        let current_owner = self
+            .snapshot_current_fullscreen_path()
+            .and_then(|p| self.snapshot_owner_entry(&p));
+        let next = if page_only {
+            self.snapshot_next_playable_entry(current_owner, forward)
+        } else {
+            self.snapshot_next_arrow_entry(current_owner, forward)
+        };
+        if let Some(idx) = next {
+            self.snapshot_open_entry(idx, resume_slideshow)
+        } else {
+            // 末尾: boundary hint を表示
+            self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder {
+                forward,
+                at: std::time::Instant::now(),
+            });
+            ctx.request_repaint();
+            false
+        }
+    }
+
+    /// snapshot navigation のスライドショー版 (= ctx 不要、末尾で slideshow 停止)。
+    ///
+    /// `try_start_slideshow_next_folder` から呼ばれる。slideshow_playing を維持しつつ
+    /// 次の playable image entry へ。末尾なら slideshow 停止。
+    pub(crate) fn snapshot_advance_for_slideshow(&mut self, forward: bool) -> bool {
+        if !self.is_snapshot_active() {
+            return false;
+        }
+        let current_owner = self
+            .snapshot_current_fullscreen_path()
+            .and_then(|p| self.snapshot_owner_entry(&p));
+        let next = self.snapshot_next_playable_entry(current_owner, forward);
+        if let Some(idx) = next {
+            self.snapshot_open_entry(idx, /*resume_slideshow=*/ true)
+        } else {
+            // 末尾: slideshow 停止
+            self.slideshow_playing = false;
+            self.slideshow_anchor_idx = None;
+            false
+        }
+    }
+
     /// snapshot 範囲内のどの entry が `path` を own するか。
     ///
     /// - 完全一致 (= image/video/zipimage/pdfpage entry を直接 fullscreen で開いた場合) → O(1)
@@ -559,5 +837,73 @@ mod tests {
         app.settings.rating_filter = [false; 6];
         let suffix2 = app.snapshot_path_suffix().unwrap();
         assert!(suffix2.contains("filter 変更後"));
+    }
+
+    // ─── nav resolver tests (§4.6 P1-3 解決) ──────────
+
+    #[test]
+    fn next_arrow_entry_forward_steps_through_all_kinds() {
+        // [Image, Folder, Video] の混合 entry を Ctrl+↑↓ で全部巡回
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\a.png")),
+            GridItem::Folder(PathBuf::from(r"E:\folder")),
+            GridItem::Video(PathBuf::from(r"E:\b.mp4")),
+        ]);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        // current=None で先頭、forward → 0 → 1 → 2 → None
+        assert_eq!(app.snapshot_next_arrow_entry(None, true), Some(0));
+        assert_eq!(app.snapshot_next_arrow_entry(Some(0), true), Some(1));
+        assert_eq!(app.snapshot_next_arrow_entry(Some(1), true), Some(2));
+        assert_eq!(app.snapshot_next_arrow_entry(Some(2), true), None);
+    }
+
+    #[test]
+    fn next_arrow_entry_backward_steps_through_all_kinds() {
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\a.png")),
+            GridItem::Folder(PathBuf::from(r"E:\folder")),
+            GridItem::Video(PathBuf::from(r"E:\b.mp4")),
+        ]);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        // current=None で末尾、backward → 2 → 1 → 0 → None
+        assert_eq!(app.snapshot_next_arrow_entry(None, false), Some(2));
+        assert_eq!(app.snapshot_next_arrow_entry(Some(2), false), Some(1));
+        assert_eq!(app.snapshot_next_arrow_entry(Some(1), false), Some(0));
+        assert_eq!(app.snapshot_next_arrow_entry(Some(0), false), None);
+    }
+
+    #[test]
+    fn next_playable_entry_skips_folder_entries() {
+        // Ctrl+PageUp/Down は image-like のみ巡回 (Folder/Zip/Pdf skip)
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\a.png")),
+            GridItem::Folder(PathBuf::from(r"E:\folder")), // skip 対象
+            GridItem::ZipFile(PathBuf::from(r"E:\b.zip")), // skip 対象
+            GridItem::Video(PathBuf::from(r"E:\c.mp4")),
+        ]);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert_eq!(app.snapshot_next_playable_entry(None, true), Some(0));
+        // 0 (Image) → next playable は 3 (Video)、1 (Folder) と 2 (ZipFile) は skip
+        assert_eq!(app.snapshot_next_playable_entry(Some(0), true), Some(3));
+        assert_eq!(app.snapshot_next_playable_entry(Some(3), true), None);
+    }
+
+    #[test]
+    fn next_playable_entry_all_folders_returns_none() {
+        // 全部 Folder の snapshot だと playable が無い
+        let mut app = test_app_with_items(vec![
+            GridItem::Folder(PathBuf::from(r"E:\a")),
+            GridItem::Folder(PathBuf::from(r"E:\b")),
+        ]);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert_eq!(app.snapshot_next_playable_entry(None, true), None);
+        assert_eq!(app.snapshot_next_playable_entry(Some(0), true), None);
+    }
+
+    #[test]
+    fn next_arrow_entry_inactive_returns_none() {
+        let app = App::default();
+        assert_eq!(app.snapshot_next_arrow_entry(None, true), None);
+        assert_eq!(app.snapshot_next_playable_entry(None, true), None);
     }
 }

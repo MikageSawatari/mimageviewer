@@ -4128,6 +4128,12 @@ pub struct App {
     /// snapshot ON 毎に increment して、pending folder nav が古い generation の結果を
     /// 適用しないようにするため (= snapshot toggle OFF 中に旧 nav 結果が来ても無視する)。
     pub(crate) snapshot_next_generation_id: u64,
+
+    /// snapshot navigation 中だけ true (= load_folder の snapshot guard を bypass)。
+    /// snapshot navigation は範囲外への移動ではなく snapshot 内 entry の閲覧なので、
+    /// guard をすり抜けて load_folder を呼ぶ必要がある。caller は呼び出し前後で必ず
+    /// 立てて消す (= scope guard pattern)。詳細は §4.6 owner_entry / Folder enter。
+    pub(crate) snapshot_internal_nav: bool,
 }
 
 impl Default for App {
@@ -4974,6 +4980,7 @@ impl App {
             // settings.db には書かない (= app 再起動で消える、設計どおり)。
             snapshot: None,
             snapshot_next_generation_id: 1,
+            snapshot_internal_nav: false,
         };
 
         #[cfg(windows)]
@@ -6104,7 +6111,9 @@ impl App {
         // 検索 mode 起動など意図的に snapshot を解除して移動するケースは、caller が
         // 事前に `deactivate_snapshot()` を呼ぶ責任を持つ。pending nav は 1 件分の
         // toast に集約 (= 同フレームで複数 caller が来てもユーザーには 1 件しか見えない)。
-        if self.is_snapshot_active() {
+        // ただし `snapshot_internal_nav = true` 中は snapshot navigation 経路なので
+        // bypass する (= snapshot 内 Folder entry に入る正常 flow、§4.6)。
+        if self.is_snapshot_active() && !self.snapshot_internal_nav {
             self.show_feedback_toast(
                 "スナップショット中は他のフォルダに移動できません (★固定を解除してください)".into(),
             );

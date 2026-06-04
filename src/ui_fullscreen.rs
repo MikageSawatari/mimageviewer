@@ -4806,6 +4806,11 @@ impl App {
             // 既に nav 進行中: 二重発火しない (が、ループフォールバックもしない)。
             return true;
         }
+        // ★固定 中は snapshot 内の次 playable image-like entry に遷移して slideshow 継続 (= §4.6)。
+        if self.is_snapshot_active() {
+            self.capture_fs_nav_holdover(fs_idx);
+            return self.snapshot_advance_for_slideshow(/*forward=*/ true);
+        }
         if self.global_search.active || self.favsearch.active || self.show_search_bar {
             return false;
         }
@@ -4970,6 +4975,16 @@ impl App {
             self.native_video_deferred_nav_delta = None;
         }
 
+        // ★固定 中は snapshot 内 entry を巡回する (= §4.6)。
+        // Folder/Image/Video 混合 entry 全部対象。
+        if self.is_snapshot_active() {
+            self.capture_fs_nav_holdover(fs_idx);
+            let _ = self.snapshot_navigate(
+                ctx, forward, /*page_only=*/ false, /*resume_slideshow=*/ false,
+            );
+            return;
+        }
+
         if self.global_search.active {
             if self.global_search.drill.is_some() {
                 self.global_search_ctrl_nav_fullscreen(ctx, forward);
@@ -5028,6 +5043,17 @@ impl App {
         #[cfg(windows)]
         {
             self.native_video_deferred_nav_delta = None;
+        }
+
+        // ★固定 中は snapshot 内の playable image-like entry のみを巡回 (= §4.6)。
+        // Ctrl+PageUp/Down は Folder entry を skip して直接 image/video へ。
+        if self.is_snapshot_active() {
+            self.capture_fs_nav_holdover(fs_idx);
+            let _ = self.snapshot_navigate(
+                ctx, forward, /*page_only=*/ true, /*resume_slideshow=*/ false,
+            );
+            let _ = native_toast;
+            return;
         }
 
         if self.global_search.active || self.favsearch.active {
