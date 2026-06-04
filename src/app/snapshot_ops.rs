@@ -699,6 +699,98 @@ impl App {
         }
     }
 
+    /// snapshot 内の **次/前 container entry** index を返す
+    /// (= Folder / ZipFile / PdfFile / ConvertibleArchive のみ対象、image-like は skip)。
+    ///
+    /// グリッド中の Ctrl+↑↓ で snapshot 内 folder 間を巡回するために使う。
+    pub(crate) fn snapshot_next_container_entry(
+        &self,
+        current_idx: Option<usize>,
+        forward: bool,
+    ) -> Option<usize> {
+        let snap = self.snapshot.as_ref()?;
+        let n = snap.items.len();
+        if n == 0 {
+            return None;
+        }
+        let start: isize = match current_idx {
+            None => {
+                if forward {
+                    -1
+                } else {
+                    n as isize
+                }
+            }
+            Some(i) => i as isize,
+        };
+        let step: isize = if forward { 1 } else { -1 };
+        let mut cur = start + step;
+        while cur >= 0 && cur < n as isize {
+            let idx = cur as usize;
+            if snap.items[idx].kind.is_container() {
+                return Some(idx);
+            }
+            cur += step;
+        }
+        None
+    }
+
+    /// グリッド中の snapshot navigation (= Ctrl+↑↓ from grid)。
+    ///
+    /// 現在 folder が snapshot 内 container entry の中に居る場合、その entry の owner_idx
+    /// を出発点に、次/前の container entry を resolve して `load_folder` で開く。
+    /// fullscreen は開かない (= グリッド表示を維持)。
+    ///
+    /// 戻り値: `true` = navigation した、`false` = 末尾 / inactive。末尾は toast。
+    pub(crate) fn snapshot_navigate_grid(&mut self, forward: bool) -> bool {
+        if !self.is_snapshot_active() {
+            return false;
+        }
+        // 現在 folder → snapshot 内 container entry の idx を解決
+        // (= snapshot_origin に居る場合は None、child folder の中なら owner_entry が hit)
+        let current_owner = self
+            .current_folder
+            .clone()
+            .and_then(|p| self.snapshot_owner_entry(&p));
+        let Some(next_idx) = self.snapshot_next_container_entry(current_owner, forward) else {
+            // snapshot 内に次/前 container が無い (= 末尾、または snapshot 全部 image)
+            self.show_feedback_toast(
+                if forward {
+                    "★固定リスト末尾です"
+                } else {
+                    "★固定リスト先頭です"
+                }
+                .into(),
+            );
+            return false;
+        };
+        // 次 container entry の path を取得して snapshot_load_and_open
+        let Some(entry) = self.snapshot.as_ref().and_then(|s| s.items.get(next_idx)) else {
+            return false;
+        };
+        use crate::snapshot::SnapshotTarget;
+        let target_path = match &entry.target {
+            SnapshotTarget::Fs(p) => p.clone(),
+            // ZipImage/PdfPage は is_container() = false なので next_container_entry が返さない
+            // が、防御的に early return
+            _ => return false,
+        };
+        // grid mode = was_fs false + resume_slideshow false で呼ぶ
+        // (= snapshot_load_and_open の内部 if was_fs || resume_slideshow ブランチは
+        // 通らず、items 入れ替えだけ。fullscreen は開かない。)
+        let was_fs_before = self.fullscreen_idx.is_some();
+        let _ = was_fs_before;
+        self.snapshot_internal_nav = true;
+        self.load_folder(target_path.clone());
+        self.snapshot_internal_nav = false;
+        // folder enter の filter 自動 suppress (= snapshot_load_and_open と同じ)
+        self.maybe_suppress_rating_filter_for_opened_container_path(&target_path);
+        if self.rating_filter_suppressed_at.is_some() {
+            self.rebuild_visible_indices();
+        }
+        true
+    }
+
     /// snapshot navigation のスライドショー版 (= ctx 不要、末尾で slideshow 停止)。
     ///
     /// `try_start_slideshow_next_folder` から呼ばれる。slideshow_playing を維持しつつ

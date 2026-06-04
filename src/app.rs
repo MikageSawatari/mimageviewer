@@ -13100,7 +13100,12 @@ impl App {
             // perf: グリッドの Ctrl+↓ を input イベントとして記録 (fullscreen 側と対称)。
             // これで入力 → DFS → load_folder → 初フレームまでを seq で相関できる。
             self.bump_input_seq("grid_ctrl_nav", Some("forward"));
-            if in_global_search_drilled {
+            // ★固定 中はグリッドでも snapshot 内 container entry を巡回 (= §4.6)。
+            // snapshot 内 folder の中に居る場合は次の container へ、snapshot root に
+            // 居る場合は最初の container を開く。image-like entry は skip。
+            if self.is_snapshot_active() {
+                let _ = self.snapshot_navigate_grid(true);
+            } else if in_global_search_drilled {
                 self.global_search_ctrl_nav(true);
             } else if in_global_search {
                 // Aggregated 中は何もしない (fs ツリー遡行はユーザ期待に反する)
@@ -13118,7 +13123,10 @@ impl App {
         // Ctrl+↑: 深さ優先で前のフォルダへ（画像なしはスキップ）
         if ctrl_up {
             self.bump_input_seq("grid_ctrl_nav", Some("backward"));
-            if in_global_search_drilled {
+            // ★固定 中は snapshot 内 container entry を逆順に巡回
+            if self.is_snapshot_active() {
+                let _ = self.snapshot_navigate_grid(false);
+            } else if in_global_search_drilled {
                 self.global_search_ctrl_nav(false);
             } else if in_global_search {
                 // Aggregated 中は何もしない
