@@ -4618,11 +4618,26 @@ impl ComicLab {
                 self.drag,
                 DragKind::Move | DragKind::Corner(_) | DragKind::Rotate
             ) {
-                self.selected.filter(|&id| {
+                // Candidate: the selected, ENABLED stamp (a disabled/hidden stamp
+                // must not pop into view as a quad).
+                let cand = self.selected.and_then(|id| {
                     self.objects
                         .iter()
-                        .any(|o| o.id == id && matches!(o.kind, AnnotationKind::Stamp(_)))
-                })
+                        .find(|o| o.id == id && o.enabled)
+                        .and_then(|o| match &o.kind {
+                            AnnotationKind::Stamp(s) => Some((id, s.source.clone())),
+                            _ => None,
+                        })
+                });
+                // Only exclude it from the bake when we actually have a GPU texture
+                // to draw — otherwise keep it in the bake so a missing-image stamp
+                // still shows its placeholder during the drag (no vanishing).
+                match cand {
+                    Some((id, source)) if self.ensure_stamp_texture(ctx, &source).is_some() => {
+                        Some(id)
+                    }
+                    _ => None,
+                }
             } else {
                 None
             };
