@@ -392,6 +392,10 @@ viewport 維持コストを戻さない。
 `native_video_in_window_active` が反転する。`App::update` は render 前後の embedded 判定を
 OR してグリッド描画を抑止し、viewport → embedded では main 側へ画像を描いてから古い
 fullscreen viewport を hidden にする。これにより背面の一覧が一瞬露出するのを避ける。
+embedded → viewport では専用 viewport が OS 側で前面に出るまで main 側が通常グリッドへ
+戻らないよう、短い `still_fullscreen_viewport_enter_suppress_until` 期間だけ黒地 +
+holdover 画像を描く。これは既存テクスチャ参照の描画だけで、hidden viewport の常時維持や
+同期ロードは増やさない。
 
 **関連ルール**: `keep_fullscreen_viewport_alive` 実行後に `close_fullscreen` する経路で、
 同フレーム内に fullscreen を再 open しない場合は明示的に `ctx.request_repaint()` を呼ぶ。

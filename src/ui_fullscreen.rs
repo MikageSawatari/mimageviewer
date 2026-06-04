@@ -1580,6 +1580,63 @@ impl App {
         }
     }
 
+    /// in-window 静止画から専用 fullscreen viewport へ切り替える直後、
+    /// OS が新 viewport を前面表示するまで main 側の通常グリッド描画を抑止する。
+    #[cfg(windows)]
+    pub(crate) fn still_fullscreen_viewport_enter_suppressed(&mut self) -> bool {
+        let Some(until) = self.still_fullscreen_viewport_enter_suppress_until else {
+            return false;
+        };
+
+        if self.fullscreen_idx.is_none() || self.native_video_in_window_active {
+            self.still_fullscreen_viewport_enter_suppress_until = None;
+            if !self.fs_nav_is_locked() {
+                self.fs_holdover_tex = None;
+            }
+            return false;
+        }
+
+        if std::time::Instant::now() <= until {
+            return true;
+        }
+
+        self.still_fullscreen_viewport_enter_suppress_until = None;
+        if !self.fs_nav_is_locked() {
+            self.fs_holdover_tex = None;
+        }
+        false
+    }
+
+    /// `still_fullscreen_viewport_enter_suppressed` 中に main viewport へ描く黒地。
+    /// 可能なら直前画像を中央 contain で残し、専用 viewport が前面に出るまで
+    /// 背面のグリッドが見えないようにする。
+    #[cfg(windows)]
+    pub(crate) fn render_still_fullscreen_viewport_enter_holdover(&mut self, ctx: &egui::Context) {
+        let holdover = self.fs_holdover_tex.clone();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+            .show(ctx, |ui| {
+                if let Some(handle) = holdover.as_ref() {
+                    let avail = ui.available_size();
+                    let tex_size = handle.size_vec2();
+                    if tex_size.x > 0.0 && tex_size.y > 0.0 && avail.x > 0.0 && avail.y > 0.0 {
+                        let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
+                        let w = tex_size.x * scale;
+                        let h = tex_size.y * scale;
+                        let img_rect =
+                            egui::Rect::from_center_size(ui.max_rect().center(), egui::vec2(w, h));
+                        ui.painter().image(
+                            handle.id(),
+                            img_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+            });
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+
     pub(crate) fn render_fullscreen_viewport(&mut self, ctx: &egui::Context) {
         let Some(fs_idx) = self.fullscreen_idx else {
             // in-window 静止画モードで PDF/ZIP enumerate defer 中:

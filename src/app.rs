@@ -3126,6 +3126,10 @@ pub struct App {
     // ── フルスクリーンビューポート ─────────────────────────────
     /// フルスクリーンビューポートが現在表示中か（Visible+Focus 送信済み）
     pub(crate) fs_viewport_shown: bool,
+    /// in-window 静止画から専用 fullscreen viewport へ切り替える間、
+    /// root 側が通常グリッドを描いて背面に露出するのを抑止する期限。
+    #[cfg(windows)]
+    pub(crate) still_fullscreen_viewport_enter_suppress_until: Option<std::time::Instant>,
     /// 閉じた後に次回表示用の ViewportId を更新するか。
     ///
     /// Win+Shift+Arrow など OS 側のモニター移動で eframe/winit の viewport state が
@@ -4647,6 +4651,8 @@ impl App {
             slideshow_next_at: std::time::Instant::now(),
             slideshow_anchor_idx: None,
             fs_viewport_shown: false,
+            #[cfg(windows)]
+            still_fullscreen_viewport_enter_suppress_until: None,
             fs_viewport_recreate_after_hide: false,
             fs_viewport_generation: 0,
             fs_opened_at: None,
@@ -17349,6 +17355,10 @@ impl App {
         self.last_loop_pos.clear();
         self.video_continuous_last_eof = None;
         self.fs_viewport_recreate_after_hide = true;
+        #[cfg(windows)]
+        {
+            self.still_fullscreen_viewport_enter_suppress_until = None;
+        }
         // 次回フルスクリーン入場時に古い活動時刻 / hidden 状態を引き継がないようクリア。
         self.cursor_last_activity = None;
         self.cursor_hidden = false;
@@ -25242,6 +25252,8 @@ impl eframe::App for App {
         let embedded_fs_active =
             embedded_fs_active_before_render || self.fullscreen_embedded_still_active();
         #[cfg(windows)]
+        let still_viewport_enter_suppressed = self.still_fullscreen_viewport_enter_suppressed();
+        #[cfg(windows)]
         self.ensure_native_video_front();
         #[cfg(windows)]
         self.sync_native_video_iconic_thumbnail();
@@ -25310,6 +25322,11 @@ impl eframe::App for App {
             }
             self.sync_native_video_main_cloak(false);
             self.process_native_video_main_chrome_restore(ctx);
+
+            if still_viewport_enter_suppressed {
+                self.render_still_fullscreen_viewport_enter_holdover(ctx);
+                return;
+            }
 
             // ── in-window 静止画フルスクリーン ──
             // render_fullscreen_viewport が main ctx に CentralPanel を描いたので、

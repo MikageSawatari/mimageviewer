@@ -1568,14 +1568,24 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn toggle_still_window_mode(&mut self) {
         let in_window = !self.settings.video_in_window_mode;
+        let now = std::time::Instant::now();
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         self.settings.video_in_window_mode = in_window;
         self.native_video_in_window_active = in_window;
+        if in_window {
+            self.still_fullscreen_viewport_enter_suppress_until = None;
+        } else {
+            if let Some(fs_idx) = self.fullscreen_idx {
+                self.fs_holdover_tex = self.current_fs_tex_for_holdover(fs_idx);
+            }
+            self.still_fullscreen_viewport_enter_suppress_until =
+                Some(now + std::time::Duration::from_millis(260));
+        }
         self.settings.save();
         // embedded → viewport では新 viewport がフォーカスを取るまで数フレーム
         // main にフォーカスが残る。focus 起因の自動クローズ (update() の
         // フォーカスガード) を抑止するため grace を張り直す (open_fullscreen と同じ)。
-        self.fs_opened_at = Some(std::time::Instant::now());
+        self.fs_opened_at = Some(now);
         self.fs_focus_grace_elapsed = false;
         crate::logger::log(format!(
             "[fs] still-image window mode toggled -> in_window={in_window}"
