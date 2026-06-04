@@ -230,7 +230,9 @@ fn bake_object_unrotated(
 ) {
     match &obj.kind {
         AnnotationKind::Bubble(bubble) => {
-            draw_bubble_parts(overlay, obj.pivot, bubble, fonts, true, true, true, false);
+            draw_bubble_parts(
+                overlay, obj.pivot, bubble, fonts, true, true, true, false, 1.0,
+            );
         }
         AnnotationKind::Text(text) => {
             bake_text(overlay, text, obj.pivot, fonts, false);
@@ -245,10 +247,33 @@ fn bake_object_unrotated(
     }
 }
 
+/// Multiply applied to a member's outline width on the merge stroke pass. The
+/// stroke is centered on the outline, and the merge's interior-erase fill (pass 3)
+/// wipes the half that lies inside the body — leaving only the outer half. Drawing
+/// it at 2× makes that surviving outer half equal the configured width, so a
+/// merged balloon's outline isn't ~half as thick as an unmerged bubble's.
+const MERGE_STROKE_SCALE: f32 = 2.0;
+
+/// Max outward jitter (px) a 線 (sketch) outline pass can add to a vertex beyond
+/// the stroke itself (see `draw_sketch_outline`'s `amp` clamp). `object_local_aabb`
+/// adds this to the temp-buffer slack for `Strokes` so a rotated/merged sketch
+/// outline isn't clipped before rotate_blit. Keep the two in sync.
+const SKETCH_MAX_JITTER: f32 = 6.0;
+
+/// A copy of `s` with its width multiplied by `scale`.
+fn scaled_stroke(s: &StrokeStyle, scale: f32) -> StrokeStyle {
+    StrokeStyle {
+        color: s.color,
+        width_px: s.width_px * scale,
+    }
+}
+
 /// Draw selected parts of a bubble (unrotated, in `overlay` coords). The merge
 /// passes use this to draw fill-only / stroke-only / deco+text-only so the union
 /// "fill → stroke → fill" trick can erase interior strokes. `opaque_fill` forces
-/// the fill alpha to 255 (used by the merge fill passes).
+/// the fill alpha to 255 (used by the merge fill passes). `stroke_scale` widens
+/// the outline on the stroke pass (the merge passes use `MERGE_STROKE_SCALE` to
+/// offset the interior-erase thinning; the single-object path uses 1.0).
 #[allow(clippy::too_many_arguments)]
 fn draw_bubble_parts(
     overlay: &mut RgbaOverlay,
@@ -259,6 +284,7 @@ fn draw_bubble_parts(
     do_stroke: bool,
     do_decotext: bool,
     opaque_fill: bool,
+    stroke_scale: f32,
 ) {
     // Unified body+tail contour: the tail spike is part of the same closed
     // outline as the body, so the fill and the stroke are seamless.
@@ -310,12 +336,13 @@ fn draw_bubble_parts(
         match shape {
             // 線: rough multi-pass hand-drawn outline (instead of one clean line).
             BubbleShape::Strokes { shape_seed, .. } => {
-                draw_sketch_outline(overlay, pivot, &geo, &bubble.outline, shape_seed);
+                let stroke = scaled_stroke(&bubble.outline, stroke_scale);
+                draw_sketch_outline(overlay, pivot, &geo, &stroke, shape_seed);
             }
             // 二重線: the clean OUTER line (incl. spliced tail) here; the inner ring
             // is drawn on the decotext pass so a merge group's interior-erase fill
             // (pass 3) can't wipe it.
-            _ => bubble_stroke(overlay, bubble, &geo),
+            _ => bubble_stroke(overlay, bubble, &geo, stroke_scale),
         }
     }
     if do_decotext {
@@ -440,7 +467,7 @@ fn draw_sketch_outline(
     if n < 3 {
         return;
     }
-    let amp = (stroke.width_px * 1.0).clamp(1.5, 6.0);
+    let amp = stroke.width_px.clamp(1.5, SKETCH_MAX_JITTER);
     const PASSES: u32 = 2;
     for pass in 0..PASSES {
         let salt = shape_seed.wrapping_add(pass.wrapping_mul(131));
@@ -602,17 +629,20 @@ fn bubble_fill(
     }
 }
 
-/// Stroke a bubble's body+tail outline and any thought circles.
+/// Stroke a bubble's body+tail outline and any thought circles. `scale` widens
+/// the outline (merge passes use `MERGE_STROKE_SCALE`; single objects use 1.0).
 fn bubble_stroke(
     overlay: &mut RgbaOverlay,
     bubble: &BubbleObject,
     geo: &crate::tessellate::BubbleGeometry,
+    scale: f32,
 ) {
     if bubble.outline.width_px > 0.0 {
-        stroke_polygon(overlay, &geo.outline, &bubble.outline);
+        let stroke = scaled_stroke(&bubble.outline, scale);
+        stroke_polygon(overlay, &geo.outline, &stroke);
         for &(cx, cy, r) in &geo.thought {
             let poly = circle_poly(cx, cy, r, 24);
-            stroke_polygon(overlay, &poly, &bubble.outline);
+            stroke_polygon(overlay, &poly, &stroke);
         }
     }
 }
@@ -678,7 +708,19 @@ fn bake_merge_group(
         |overlay: &mut RgbaOverlay, i: usize, do_fill: bool, do_stroke: bool, do_decotext: bool| {
             bake_into(overlay, &objects[i], fonts, |ov, o| {
                 if let AnnotationKind::Bubble(b) = &o.kind {
-                    draw_bubble_parts(ov, o.pivot, b, fonts, do_fill, do_stroke, do_decotext, true);
+                    // 2× stroke offsets the pass-3 interior-erase thinning so a merged
+                    // outline keeps its configured width (only matters on the stroke pass).
+                    draw_bubble_parts(
+                        ov,
+                        o.pivot,
+                        b,
+                        fonts,
+                        do_fill,
+                        do_stroke,
+                        do_decotext,
+                        true,
+                        MERGE_STROKE_SCALE,
+                    );
                 }
             });
         };
@@ -784,7 +826,21 @@ fn object_local_aabb(obj: &AnnotationObject, fonts: &FontSet) -> Option<(f32, f3
                     acc(obj.pivot.0 + lw * 0.5 + tm, obj.pivot.1 + lh * 0.5 + tm);
                 }
             }
-            let m = bubble.outline.width_px.max(0.0) * 0.5 + 1.0;
+            // Pad by the stroke's OUTER reach so a rotated bubble's outline isn't
+            // clipped by the temp buffer before rotate_blit. A merged member draws
+            // its stroke at MERGE_STROKE_SCALE (the inner half is erased, leaving the
+            // outer half), so the outline can reach `width/2 * scale` outward. Pad for
+            // that worst case unconditionally (over-padding an unmerged bubble only
+            // enlarges the temp buffer slightly — rotate_blit copies opaque pixels
+            // only, so there's no visual effect). 線 (sketch) also jitters vertices
+            // outward by up to SKETCH_MAX_JITTER beyond the stroke.
+            let sketch_extra = if matches!(shape, BubbleShape::Strokes { .. }) {
+                SKETCH_MAX_JITTER
+            } else {
+                0.0
+            };
+            let m =
+                bubble.outline.width_px.max(0.0) * 0.5 * MERGE_STROKE_SCALE + 1.0 + sketch_extra;
             minx -= m;
             miny -= m;
             maxx += m;
@@ -2584,6 +2640,66 @@ mod tests {
     }
 
     #[test]
+    fn merge_keeps_outline_width() {
+        // A merged member's OUTER outline must keep ~its configured width. The
+        // interior-erase pass (pass 3) wipes the inner half of a centered stroke,
+        // so the stroke pass draws at MERGE_STROKE_SCALE (2×) to compensate.
+        // Regression: merging used to halve the visible outline thickness.
+        let fonts = FontSet::new();
+        let mk = |x: f32, id: u64, z: i32, merge: bool| {
+            let mut b = BubbleObject::default();
+            b.shape = BubbleShape::RoundRect {
+                half_w: 50.0,
+                half_h: 34.0,
+                corner_px: 14.0,
+            };
+            b.fill = Some(Rgba::WHITE);
+            b.outline = StrokeStyle {
+                color: Rgba::BLACK,
+                width_px: 6.0,
+            };
+            b.text = TextBlock::default();
+            b.auto_size = false;
+            b.merge_with_below = merge;
+            let mut o = AnnotationObject::new_bubble(id, (x, 80.0), b);
+            o.z = z;
+            o
+        };
+        // Count dark outline pixels only in the RIGHT bubble's region (x >= 220).
+        let count_dark_right = |ov: &RgbaOverlay| {
+            let mut n = 0usize;
+            for y in 0..ov.h {
+                for x in 220..ov.w {
+                    let p = &ov.pixels[(y * ov.w + x) * 4..][..4];
+                    if p[3] > 200 && p[0] < 70 && p[1] < 70 && p[2] < 70 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        // Right bubble alone (single-object path, 1× stroke).
+        let single = count_dark_right(&bake_overlay(&[mk(320.0, 1, 0, false)], 440, 160, &fonts));
+        // Right bubble (z=1, merges down) grouped with a far-left bubble (z=0).
+        // The outlines don't overlap, so the right bubble's outline is the only
+        // dark ink in its region — its width should match the single case, NOT halve.
+        let merged = count_dark_right(&bake_overlay(
+            &[mk(100.0, 2, 0, false), mk(320.0, 1, 1, true)],
+            440,
+            160,
+            &fonts,
+        ));
+        assert!(
+            merged as f32 >= single as f32 * 0.7,
+            "merged outline must not be ~halved (merged {merged} vs single {single})"
+        );
+        assert!(
+            merged as f32 <= single as f32 * 1.6,
+            "merged outline must stay near its configured width (merged {merged} vs single {single})"
+        );
+    }
+
+    #[test]
     fn merge_works_for_rotated_members() {
         // Merge must also erase interior strokes when the members are rotated
         // (the chain composites each part through the rotation path).
@@ -2622,6 +2738,67 @@ mod tests {
             merged < unmerged,
             "rotated merge should erase interior strokes (merged {merged} >= unmerged {unmerged})"
         );
+    }
+
+    #[test]
+    fn merge_thick_outline_rotated_not_clipped() {
+        // A rotated, merged member with a THICK outline must not lose its (2×) outer
+        // stroke to the rotated-bake temp buffer — object_local_aabb pads for
+        // MERGE_STROKE_SCALE (+ SKETCH_MAX_JITTER for 線). At rotation 0 the bubble
+        // draws directly (no buffer); a rotated bake with too-small a buffer would
+        // clip the outer outline and drop a large fraction of the dark pixels.
+        let fonts = FontSet::new();
+        let mk = |shape: BubbleShape, x: f32, id: u64, z: i32, merge: bool, rot: f32| {
+            let mut b = BubbleObject::default();
+            b.shape = shape;
+            b.fill = Some(Rgba::WHITE);
+            b.outline = StrokeStyle {
+                color: Rgba::BLACK,
+                width_px: 16.0,
+            };
+            b.text = TextBlock::default();
+            b.auto_size = false;
+            b.merge_with_below = merge;
+            let mut o = AnnotationObject::new_bubble(id, (x, 110.0), b);
+            o.z = z;
+            o.rotation_rad = rot;
+            o
+        };
+        let count_dark = |ov: &RgbaOverlay| {
+            ov.pixels
+                .chunks_exact(4)
+                .filter(|p| p[3] > 200 && p[0] < 70 && p[1] < 70 && p[2] < 70)
+                .count()
+        };
+        // Both a solid ellipse and a 線 (sketch, +jitter) outline go through the 2×
+        // merge stroke. Far-apart members (no overlap) so each full outline survives;
+        // the top one (z=1) merges down → both bake through the merge path.
+        for shape in [
+            BubbleShape::Ellipse { rx: 40.0, ry: 26.0 },
+            BubbleShape::Strokes {
+                half_w: 40.0,
+                half_h: 26.0,
+                corner_px: 12.0,
+                shape_seed: 3,
+            },
+        ] {
+            let bake = |rot: f32| {
+                let a = mk(shape, 80.0, 1, 0, false, rot);
+                let bb = mk(shape, 230.0, 2, 1, true, rot);
+                bake_overlay(&[a, bb], 320, 220, &fonts)
+            };
+            let flat = count_dark(&bake(0.0));
+            let rotated = count_dark(&bake(0.5));
+            assert!(
+                flat > 0 && rotated > 0,
+                "should bake outline pixels for {shape:?}"
+            );
+            assert!(
+                rotated as f32 >= flat as f32 * 0.8,
+                "rotated merged thick outline lost pixels (temp-buffer clip?) for \
+                 {shape:?}: rotated {rotated} vs flat {flat}"
+            );
+        }
     }
 
     #[test]

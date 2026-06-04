@@ -47,6 +47,13 @@ const UNDO_CAP: usize = 100;
 /// comic-core's `draw_stamp` cap so a corrupt size can't OOM the upload.
 const STAMP_MAX_PX: usize = 8192;
 
+/// Font-picker card size (shared by the grid layout and the card renderer so the
+/// column count, row height and per-card geometry stay in sync). The height
+/// reserves a clear name band below the preview strip so the font name is never
+/// clipped or drawn over the light sample.
+const FONT_CARD_W: f32 = 220.0;
+const FONT_CARD_H: f32 = 70.0;
+
 /// Cache key for an outlined stamp's pre-composited sticker texture. Keyed on the
 /// halo's *effective* params — color + integer dilation radius `rad` (the rounded,
 /// capped width that actually shapes the halo) + display size + flips — NOT the
@@ -2031,10 +2038,8 @@ impl ComicLab {
                     .cloned()
                     .collect();
 
-                const CARD_W: f32 = 220.0;
-                const CARD_H: f32 = 64.0;
                 let avail_w = ui.available_width();
-                let cols = ((avail_w / (CARD_W + 8.0)).floor() as usize).max(1);
+                let cols = ((avail_w / (FONT_CARD_W + 8.0)).floor() as usize).max(1);
                 let rows = visible.len().div_ceil(cols);
 
                 // Cap new sample renders per frame so opening / scrolling the
@@ -2046,7 +2051,7 @@ impl ComicLab {
 
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show_rows(ui, CARD_H + 8.0, rows, |ui, row_range| {
+                    .show_rows(ui, FONT_CARD_H + 8.0, rows, |ui, row_range| {
                         for row in row_range {
                             ui.horizontal(|ui| {
                                 for col in 0..cols {
@@ -2119,9 +2124,8 @@ impl ComicLab {
         selected: bool,
         allow_build: bool,
     ) -> bool {
-        const CARD_W: f32 = 220.0;
-        const CARD_H: f32 = 64.0;
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(CARD_W, CARD_H), Sense::click());
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(FONT_CARD_W, FONT_CARD_H), Sense::click());
         let hovered = resp.hovered();
         let painter = ui.painter_at(rect);
         let bg = if selected {
@@ -2145,10 +2149,16 @@ impl ComicLab {
             ),
             egui::StrokeKind::Inside,
         );
+        // Layout: light preview strip on top, a dedicated name band below it so the
+        // (white-on-dark) font name never overlaps the light sample or clips at the
+        // card's bottom edge.
+        let pad = 6.0;
+        let name_band = 22.0;
+        let sample_h = (FONT_CARD_H - pad * 2.0 - name_band).max(8.0);
         // Sample image (lazy). Drawn on a light strip so black text reads.
         let sample_area = Rect::from_min_size(
-            rect.min + egui::vec2(6.0, 6.0),
-            egui::vec2(CARD_W - 12.0, CARD_H - 24.0),
+            rect.min + egui::vec2(pad, pad),
+            egui::vec2(FONT_CARD_W - pad * 2.0, sample_h),
         );
         painter.rect_filled(sample_area, 2.0, Color32::from_gray(235));
         let tex = if allow_build {
@@ -2170,8 +2180,10 @@ impl ComicLab {
                 Color32::WHITE,
             );
         }
+        // Font name centered in the name band (below the preview strip), so it is
+        // fully visible and clear of the light sample.
         painter.text(
-            egui::pos2(rect.min.x + 6.0, rect.max.y - 14.0),
+            egui::pos2(rect.min.x + 8.0, rect.max.y - pad - name_band * 0.5),
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::proportional(12.0),
@@ -3369,12 +3381,25 @@ impl ComicLab {
         };
 
         ui.add_space(2.0);
-        // 結合 (structural; not part of any preset → re-bake only).
-        if ui
-            .checkbox(&mut b.merge_with_below, "下の吹き出しと結合")
-            .changed()
-        {
+        // 結合 (structural; not part of any preset → re-bake only). Only shapes with
+        // a solid fillable body can union (the fill→stroke→erase trick); fuzzy /
+        // line-field / text-only shapes (意識 / 集中線 / 流線 / なし) can't, so disable
+        // the toggle for them and clear any stale flag (e.g. set on a previous shape).
+        let merge_supported = comic_core::shape_is_mergeable(&b.shape);
+        if !merge_supported && b.merge_with_below {
+            b.merge_with_below = false;
             *dirty = true;
+        }
+        let merge_resp = ui.add_enabled(
+            merge_supported,
+            egui::Checkbox::new(&mut b.merge_with_below, "下の吹き出しと結合"),
+        );
+        if merge_supported && merge_resp.changed() {
+            *dirty = true;
+        }
+        if !merge_supported {
+            // Disabled widgets ignore `on_hover_text`; must use the disabled variant.
+            merge_resp.on_disabled_hover_text("この形状は結合に対応していません");
         }
 
         // しっぽ有無 (stashed so toggling off→on doesn't move it). Tailless shapes
@@ -3402,7 +3427,8 @@ impl ComicLab {
             *dirty = true;
         }
         if !tail_supported {
-            tail_resp.on_hover_text("この形状はしっぽに対応していません");
+            // Disabled widgets ignore `on_hover_text`; must use the disabled variant.
+            tail_resp.on_disabled_hover_text("この形状はしっぽに対応していません");
         }
 
         // 飾り有無 (decorations non-empty = on, stashed). Seeding a single
@@ -5534,11 +5560,15 @@ fn marker_pairs_eq(a: &[MarkupRule], b: &[MarkupRule]) -> bool {
 }
 
 fn default_bubble_tail(pivot: (f32, f32)) -> Tail {
+    // Point the default tail down-LEFT at 45° rather than straight down — a
+    // diagonal tail reads as "speaking toward someone" and looks more natural than
+    // a vertical spike. Length ~150px (106 = 150/√2 on each axis).
+    const TAIL_DIAG: f32 = 106.0;
     Tail {
         // Shorter + slimmer default so a fresh bubble's tail looks proportionate
         // (comic-core also caps the base width to the bubble's perpendicular
         // extent, so this width is an upper request).
-        tip: (pivot.0, pivot.1 + 150.0),
+        tip: (pivot.0 - TAIL_DIAG, pivot.1 + TAIL_DIAG),
         base_t: 0.25,
         base_auto: true,
         width_px: 32.0,
