@@ -45,6 +45,21 @@ Claude Code セッションを並行で動かす」節)。
 - テスト comic-core **83** / comic_lab 4 green。FramePlanner 形状は **Phase1-3 完了**。
 - 実機確認用 release バイナリ: `target/release/comic_lab.exe` (`cargo run --release -p comic_lab`)。
 
+## 2026-06-04 末: 実機フィードバック対応 (UI / 性能、branch lab、コミット済み)
+
+- **追加ダイアログのレスポンシブ化** (c405acd2): 吹き出し追加ダイアログを viewport 幅
+  クランプ + set_max_width + 縦 ScrollArea で固定幅サムネが折り返すように。
+- **ピッカーサムネ修正**: 集中線/流線=線群描画、意識=ぼかし楕円、矢印=既定しっぽ廃止。
+- **集中線/流線の文字可読性**: セリフに白い袋文字(フチ)を既定 ON (text_outline)。
+- **絵文字**: `scripts/setup-twemoji.sh` で vendor/twemoji/svg に 125 個取得 (gitignore)。
+- **スタンプ負荷の根治** (a49fa1bb, 1c0b3bb0): ドラッグ/拡縮/回転中はスタンプを CPU bake
+  から除外し **GPU テクスチャ quad** で描画 (拡縮・回転は GPU でほぼ無償)。source は
+  `stamp_textures` に一度だけアップロード。ドラッグ終了で完全 bake に戻り z/輪郭が正確。
+  ドラッグ中 bake はアダプティブスロットル併用。decode 失敗/無効スタンプは bake に残す
+  (消えない)。Codex 3 周対応で P1/P2 なし。
+- 累積コミット: 5bfdd0d3→929af8c6→34ccded7 (P1-2) → 233bebf8→16b22a2c→23d491da→07515f7c
+  (P3) → c405acd2→a49fa1bb→1c0b3bb0 (実機 FB)。lab は **master 未マージ**。
+
 (以下は worktree 移行前=master 上の履歴。同じ内容が lab ブランチにも入っている)
 
 ## 2026-06-04 後半: 縦書き OpenType 化 (案B) + スタンプ機能 (未コミット)
