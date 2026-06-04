@@ -311,6 +311,12 @@ struct ComicLab {
     /// interval adapts to this so a heavy scene (large/rotated stamps on a big
     /// image) doesn't saturate the UI thread with back-to-back full-res bakes.
     last_bake_dur: f64,
+    /// Breakdown (ms) of the last bake: CPU composite vs GPU texture upload, for
+    /// the on-canvas perf HUD (find what's slow).
+    last_composite_ms: f64,
+    last_upload_ms: f64,
+    /// Show the perf HUD (bake timings) on the canvas. Toggle with F1.
+    show_perf_hud: bool,
 
     fonts: FontSet,
     /// (key, display label) for the font picker. The key IS the display name for
@@ -520,6 +526,9 @@ impl ComicLab {
             baked_dirty: true,
             last_bake_time: 0.0,
             last_bake_dur: 0.0,
+            last_composite_ms: 0.0,
+            last_upload_ms: 0.0,
+            show_perf_hud: std::env::var_os("COMIC_LAB_PERF").is_some(),
             fonts,
             available_fonts,
             font_paths,
@@ -1483,13 +1492,17 @@ impl ComicLab {
         if let Some((idx, _)) = hidden {
             self.objects[idx].enabled = false;
         }
+        let t_c = std::time::Instant::now();
         let overlay =
             bake_overlay_with_stamps(&self.objects, iw, ih, &self.fonts, &self.stamp_images);
+        self.last_composite_ms = t_c.elapsed().as_secs_f64() * 1000.0;
         if let Some((idx, was)) = hidden {
             self.objects[idx].enabled = was;
         }
+        let t_u = std::time::Instant::now();
         let color = ColorImage::from_rgba_unmultiplied([overlay.w, overlay.h], &overlay.pixels);
         self.baked_texture = Some(ctx.load_texture("comic_baked", color, TextureOptions::LINEAR));
+        self.last_upload_ms = t_u.elapsed().as_secs_f64() * 1000.0;
         self.baked_dirty = false;
         self.baked_excluded = exclude;
     }
@@ -2760,22 +2773,25 @@ impl ComicLab {
                 1.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        // Responsive: clamp the dialog width to the viewport so the fixed-width
-        // thumbnail grid wraps onto multiple rows instead of running off the right
-        // edge (the preset list has grown well past one row).
+        // Resizable window with a concrete default size (like the adjustment lab):
+        // a resizable window has a definite width, so the fixed-width thumbnail
+        // grid wraps to it (a non-resizable auto-sized window ignores width caps
+        // for horizontal_wrapped and runs off as one row).
         let avail = ctx.content_rect();
-        let dialog_w = (avail.width() - 24.0).clamp(120.0, 520.0);
+        let default_w = (avail.width() - 80.0).clamp(320.0, 560.0);
+        let default_h = (avail.height() - 120.0).clamp(220.0, 560.0);
         egui::Window::new("吹き出しを追加")
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
             .pivot(egui::Align2::CENTER_CENTER)
             .default_pos(avail.center())
             .collapsible(false)
-            .resizable(false)
-            .max_width(dialog_w)
+            .resizable(true)
+            .default_width(default_w)
+            .default_height(default_h)
+            .min_width(220.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.set_max_width(dialog_w);
                 ui.label(
                     egui::RichText::new("形を選んでください。クリックで追加します。")
                         .size(11.0)
@@ -2783,7 +2799,6 @@ impl ComicLab {
                 );
                 ui.separator();
                 egui::ScrollArea::vertical()
-                    .max_height((avail.height() - 160.0).clamp(160.0, 460.0))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
@@ -2818,25 +2833,24 @@ impl ComicLab {
                 1.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        // Responsive: clamp the dialog width to the viewport so it never runs off
-        // the right edge, and center it. `set_max_width` makes the thumbnail grid
-        // wrap to that width.
+        // Resizable window with a concrete default size so the fixed-width preview
+        // grid wraps to the window width (a non-resizable auto-sized window ignores
+        // width caps for horizontal_wrapped and runs off as one row).
         let avail = ctx.content_rect();
-        // Width tracks the viewport so it never runs off-screen; floor at one
-        // thumbnail column (~170) rather than a fixed 280 that could exceed a
-        // narrow viewport.
-        let dialog_w = (avail.width() - 24.0).clamp(170.0, 560.0);
+        let default_w = (avail.width() - 80.0).clamp(340.0, 620.0);
+        let default_h = (avail.height() - 120.0).clamp(220.0, 560.0);
         egui::Window::new("メッセージウィンドウを追加")
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
             .pivot(egui::Align2::CENTER_CENTER)
             .default_pos(avail.center())
             .collapsible(false)
-            .resizable(false)
-            .max_width(dialog_w)
+            .resizable(true)
+            .default_width(default_w)
+            .default_height(default_h)
+            .min_width(180.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.set_max_width(dialog_w);
                 ui.label(
                     egui::RichText::new("デザインを選んでください。クリックで追加します。")
                         .size(11.0)
@@ -2844,7 +2858,6 @@ impl ComicLab {
                 );
                 ui.separator();
                 egui::ScrollArea::vertical()
-                    .max_height((avail.height() - 160.0).clamp(160.0, 420.0))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
@@ -4643,15 +4656,25 @@ impl ComicLab {
             };
             // The exclusion changing (drag start hides the stamp from the bake;
             // drag end must bring it back with correct z/outline) requires a bake.
-            if preview_stamp != self.baked_excluded {
+            let exclusion_changed = preview_stamp != self.baked_excluded;
+            if exclusion_changed {
                 self.baked_dirty = true;
             }
+            // KEY: while a stamp is being dragged, the baked layer EXCLUDES it and
+            // every other object is static, so the bake output doesn't change frame
+            // to frame — only the GPU quad moves. So bake exactly ONCE at grab
+            // (exclusion_changed) and skip the throttled re-bakes that were
+            // re-rasterizing all the *other* stamps + re-uploading the full-res
+            // texture every tick (the periodic stutter). Non-stamp drags
+            // (bubbles/windows are IN the bake and moving) still re-bake throttled.
+            let stamp_drag_static = preview_stamp.is_some() && !exclusion_changed;
             // During a drag, adapt the re-bake interval to the last bake's cost so
             // a heavy scene doesn't saturate the UI thread with back-to-back bakes.
-            // Cheap scenes still re-bake at ~30fps; expensive ones back off to keep
-            // the handles/cursor responsive between bakes.
             let min_interval = (self.last_bake_dur * 1.5).clamp(0.03, 0.25);
-            if self.baked_dirty && (!dragging || now - self.last_bake_time >= min_interval) {
+            if self.baked_dirty
+                && !stamp_drag_static
+                && (!dragging || now - self.last_bake_time >= min_interval)
+            {
                 let t0 = std::time::Instant::now();
                 self.rebake(ctx, preview_stamp);
                 self.last_bake_dur = t0.elapsed().as_secs_f64();
@@ -4688,6 +4711,46 @@ impl ComicLab {
                     "ドロップして画像を開く",
                     egui::FontId::proportional(28.0),
                     Color32::WHITE,
+                );
+            }
+
+            // Perf HUD (toggle with F1): last bake timings + object counts, to find
+            // what's slow during interaction.
+            if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+                self.show_perf_hud = !self.show_perf_hud;
+            }
+            if self.show_perf_hud {
+                let stamps = self
+                    .objects
+                    .iter()
+                    .filter(|o| matches!(o.kind, AnnotationKind::Stamp(_)))
+                    .count();
+                let hud = format!(
+                    "bake {:.1}ms (composite {:.1} + upload {:.1}) | img {}x{} | obj {} stamp {} | drag {}",
+                    self.last_bake_dur * 1000.0,
+                    self.last_composite_ms,
+                    self.last_upload_ms,
+                    img_w,
+                    img_h,
+                    self.objects.len(),
+                    stamps,
+                    if dragging { "yes" } else { "no" },
+                );
+                let pos = canvas_rect.left_top() + egui::vec2(8.0, 8.0);
+                // Shadowed text for legibility over any background.
+                painter.text(
+                    pos + egui::vec2(1.0, 1.0),
+                    egui::Align2::LEFT_TOP,
+                    &hud,
+                    egui::FontId::monospace(12.0),
+                    Color32::from_black_alpha(200),
+                );
+                painter.text(
+                    pos,
+                    egui::Align2::LEFT_TOP,
+                    &hud,
+                    egui::FontId::monospace(12.0),
+                    Color32::from_rgb(120, 230, 140),
                 );
             }
         });
