@@ -397,6 +397,15 @@ struct ComicLab {
     /// Decode cache keyed by stamp source key (so the same emoji/file decodes
     /// once and is reused across objects). `None` = decode failed (don't retry).
     stamp_source_cache: HashMap<String, Option<Arc<RgbaOverlay>>>,
+    /// Stamp source key -> GPU texture, uploaded once. While a stamp is being
+    /// dragged/resized/rotated it's drawn as a GPU-transformed quad from this
+    /// texture (scale/rotate are ~free on the GPU) and EXCLUDED from the CPU bake,
+    /// so a large/rotated stamp no longer re-rasterizes on every drag frame.
+    stamp_textures: HashMap<String, TextureHandle>,
+    /// Stamp id excluded from the last completed bake (= drawn as a GPU quad
+    /// during its drag). Used to force a final, complete re-bake when the drag
+    /// ends so the stamp lands back in the WYSIWYG overlay with correct z/outline.
+    baked_excluded: Option<u64>,
     /// Recently used stamps (MRU, persisted) for quick re-insert.
     recent_stamps: Vec<StampSource>,
     /// Whether the stamp picker dialog is open.
@@ -554,6 +563,8 @@ impl ComicLab {
             ime_composing: false,
             stamp_images: StampImages::new(),
             stamp_source_cache: HashMap::new(),
+            stamp_textures: HashMap::new(),
+            baked_excluded: None,
             recent_stamps: load_recent_stamps(),
             show_stamp_dialog: false,
             stamp_dialog_filter: String::new(),
@@ -1451,7 +1462,7 @@ impl ComicLab {
         }
     }
 
-    fn rebake(&mut self, ctx: &egui::Context) {
+    fn rebake(&mut self, ctx: &egui::Context, exclude: Option<u64>) {
         if self.image.is_none() {
             return;
         }
@@ -1460,17 +1471,108 @@ impl ComicLab {
         // touched in the picker this session). Done before borrowing `image`.
         self.ensure_object_fonts_loaded();
         self.ensure_stamp_images();
-        let img = self.image.as_ref().unwrap();
-        let overlay = bake_overlay_with_stamps(
-            &self.objects,
-            img.width,
-            img.height,
-            &self.fonts,
-            &self.stamp_images,
-        );
+        let (iw, ih) = {
+            let img = self.image.as_ref().unwrap();
+            (img.width, img.height)
+        };
+        // Hide the live-dragged stamp from the bake (it's drawn as a GPU quad
+        // instead). Save & restore its `enabled` so the user's state isn't lost.
+        let hidden = exclude
+            .and_then(|id| self.objects.iter().position(|o| o.id == id))
+            .map(|idx| (idx, self.objects[idx].enabled));
+        if let Some((idx, _)) = hidden {
+            self.objects[idx].enabled = false;
+        }
+        let overlay =
+            bake_overlay_with_stamps(&self.objects, iw, ih, &self.fonts, &self.stamp_images);
+        if let Some((idx, was)) = hidden {
+            self.objects[idx].enabled = was;
+        }
         let color = ColorImage::from_rgba_unmultiplied([overlay.w, overlay.h], &overlay.pixels);
         self.baked_texture = Some(ctx.load_texture("comic_baked", color, TextureOptions::LINEAR));
         self.baked_dirty = false;
+        self.baked_excluded = exclude;
+    }
+
+    /// Upload a stamp source as a GPU texture (once, cached by source key) for the
+    /// live drag preview. Reuses the decode cache. `None` if the source can't be
+    /// decoded (the bake's placeholder shows when the drag ends).
+    fn ensure_stamp_texture(
+        &mut self,
+        ctx: &egui::Context,
+        source: &StampSource,
+    ) -> Option<TextureHandle> {
+        let key = stamp_source_key(source);
+        if let Some(t) = self.stamp_textures.get(&key) {
+            return Some(t.clone());
+        }
+        let img = self
+            .stamp_source_cache
+            .entry(key.clone())
+            .or_insert_with(|| load_stamp_image(source).map(Arc::new))
+            .clone()?;
+        let color = ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.pixels);
+        let tex = ctx.load_texture(format!("stamp_{key}"), color, TextureOptions::LINEAR);
+        self.stamp_textures.insert(key, tex.clone());
+        Some(tex)
+    }
+
+    /// Draw the live drag preview of stamp `id` as a GPU-transformed textured quad
+    /// (scale/rotate/flip/opacity), matching where the bake will place it on
+    /// release. Avoids CPU-rasterizing a large/rotated stamp every drag frame.
+    fn draw_stamp_preview(&mut self, ctx: &egui::Context, painter: &egui::Painter, id: u64) {
+        let Some(obj) = self.objects.iter().find(|o| o.id == id) else {
+            return;
+        };
+        let AnnotationKind::Stamp(stamp) = &obj.kind else {
+            return;
+        };
+        let pivot = obj.pivot;
+        let rot = obj.rotation_rad;
+        let (hw, hh) = (stamp.half_w, stamp.half_h);
+        let (fh, fv) = (stamp.flip_h, stamp.flip_v);
+        let opacity = stamp.opacity.clamp(0.0, 1.0);
+        let source = stamp.source.clone();
+        let Some(tex) = self.ensure_stamp_texture(ctx, &source) else {
+            return;
+        };
+        let corner = |lx: f32, ly: f32| {
+            self.view
+                .img_to_screen(rotate_about((pivot.0 + lx, pivot.1 + ly), pivot, rot))
+        };
+        let (tl, tr, br, bl) = (
+            corner(-hw, -hh),
+            corner(hw, -hh),
+            corner(hw, hh),
+            corner(-hw, hh),
+        );
+        // Texture UVs (0..1), with flips.
+        let (u0, u1) = if fh { (1.0, 0.0) } else { (0.0, 1.0) };
+        let (v0, v1) = if fv { (1.0, 0.0) } else { (0.0, 1.0) };
+        let tint = Color32::from_white_alpha((opacity * 255.0).round().clamp(0.0, 255.0) as u8);
+        let mut mesh = egui::Mesh::with_texture(tex.id());
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: tl,
+            uv: egui::pos2(u0, v0),
+            color: tint,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: tr,
+            uv: egui::pos2(u1, v0),
+            color: tint,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: br,
+            uv: egui::pos2(u1, v1),
+            color: tint,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: bl,
+            uv: egui::pos2(u0, v1),
+            color: tint,
+        });
+        mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        painter.add(egui::Shape::mesh(mesh));
     }
 
     /// Resolve every Stamp object's source into a decoded RGBA image for baking.
@@ -4507,15 +4609,36 @@ impl ComicLab {
             // don't allocate + upload a full-resolution texture every frame.
             let now = ctx.input(|i| i.time);
             let dragging = self.drag != DragKind::None;
+            // While a stamp is being moved / resized / rotated, draw it as a GPU
+            // textured quad and keep it OUT of the CPU bake — scale & rotate are
+            // ~free on the GPU, so a large/rotated stamp no longer re-rasterizes
+            // (scale-to-fit + rotate_blit) on every drag frame. Only transform
+            // drags qualify (not Pan / tail handles).
+            let preview_stamp: Option<u64> = if matches!(
+                self.drag,
+                DragKind::Move | DragKind::Corner(_) | DragKind::Rotate
+            ) {
+                self.selected.filter(|&id| {
+                    self.objects
+                        .iter()
+                        .any(|o| o.id == id && matches!(o.kind, AnnotationKind::Stamp(_)))
+                })
+            } else {
+                None
+            };
+            // The exclusion changing (drag start hides the stamp from the bake;
+            // drag end must bring it back with correct z/outline) requires a bake.
+            if preview_stamp != self.baked_excluded {
+                self.baked_dirty = true;
+            }
             // During a drag, adapt the re-bake interval to the last bake's cost so
-            // a heavy scene (large/rotated stamps on a big image, where a single
-            // full-res bake can take 100ms+) doesn't saturate the UI thread with
-            // back-to-back bakes. Cheap scenes still re-bake at ~30fps; expensive
-            // ones back off to keep the handles/cursor responsive between bakes.
+            // a heavy scene doesn't saturate the UI thread with back-to-back bakes.
+            // Cheap scenes still re-bake at ~30fps; expensive ones back off to keep
+            // the handles/cursor responsive between bakes.
             let min_interval = (self.last_bake_dur * 1.5).clamp(0.03, 0.25);
             if self.baked_dirty && (!dragging || now - self.last_bake_time >= min_interval) {
                 let t0 = std::time::Instant::now();
-                self.rebake(ctx);
+                self.rebake(ctx, preview_stamp);
                 self.last_bake_dur = t0.elapsed().as_secs_f64();
                 self.last_bake_time = now;
             }
@@ -4528,6 +4651,10 @@ impl ComicLab {
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     Color32::WHITE,
                 );
+            }
+            // Live GPU preview of the dragged stamp, on top of the bake.
+            if let Some(id) = preview_stamp {
+                self.draw_stamp_preview(ctx, &painter, id);
             }
 
             // Selection decorations (handles) on top of the baked overlay.
