@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "objects": [
+    {
+      "id": 1,
+      "enabled": true,
+      "z": 1,
+      "pivot": [
+        120.0,
+        80.0
+      ],
+      "rotation_rad": 0.0,
+      "kind": {
+        "Text": {
+          "text": "「あれ……？」\nうん。",
+          "font_key": "",
+          "size_px": 44.0,
+          "color": {
+            "r": 255,
+            "g": 255,
+            "b": 255,
+            "a": 255
+          },
+          "orientation": "Vertical",
+          "align": "Start",
+          "markup_enabled": false,
+          "outline": {
+            "color": {
+              "r": 0,
+              "g": 0,
+              "b": 0,
+              "a": 255
+            },
+            "width_px": 3.0
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "enabled": true,
+      "z": 2,
+      "pivot": [
+        300.0,
+        80.0
+      ],
+      "rotation_rad": 0.0,
+      "kind": {
+        "Text": {
+          "text": "12月25日\n午後3時\nえっ!?",
+          "font_key": "",
+          "size_px": 44.0,
+          "color": {
+            "r": 255,
+            "g": 255,
+            "b": 255,
+            "a": 255
+          },
+          "orientation": "Vertical",
+          "align": "Start",
+          "markup_enabled": false,
+          "outline": {
+            "color": {
+              "r": 0,
+              "g": 0,
+              "b": 0,
+              "a": 255
+            },
+            "width_px": 3.0
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "enabled": true,
+      "z": 3,
+      "pivot": [
+        520.0,
+        80.0
+      ],
+      "rotation_rad": 0.0,
+      "kind": {
+        "Text": {
+          "text": "辻葛芦\n辻󠄀葛󠄀芦󠄀",
+          "font_key": "",
+          "size_px": 44.0,
+          "color": {
+            "r": 255,
+            "g": 255,
+            "b": 255,
+            "a": 255
+          },
+          "orientation": "Vertical",
+          "align": "Start",
+          "markup_enabled": false,
+          "outline": {
+            "color": {
+              "r": 0,
+              "g": 0,
+              "b": 0,
+              "a": 255
+            },
+            "width_px": 3.0
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "enabled": true,
+      "z": 4,
+      "pivot": [
+        700.0,
+        80.0
+      ],
+      "rotation_rad": 0.0,
+      "kind": {
+        "Text": {
+          "text": "{LOVE}な[AI]",
+          "font_key": "",
+          "size_px": 44.0,
+          "color": {
+            "r": 255,
+            "g": 255,
+            "b": 255,
+            "a": 255
+          },
+          "orientation": "Vertical",
+          "align": "Start",
+          "markup_enabled": true,
+          "outline": {
+            "color": {
+              "r": 0,
+              "g": 0,
+              "b": 0,
+              "a": 255
+            },
+            "width_px": 3.0
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "enabled": true,
+      "z": 5,
+      "pivot": [
+        820.0,
+        80.0
+      ],
+      "rotation_rad": 0.0,
+      "kind": {
+        "Text": {
+          "text": "がぎ\nがぎ",
+          "font_key": "",
+          "size_px": 44.0,
+          "color": {
+            "r": 255,
+            "g": 255,
+            "b": 255,
+            "a": 255
+          },
+          "orientation": "Vertical",
+          "align": "Start",
+          "markup_enabled": false,
+          "outline": {
+            "color": {
+              "r": 0,
+              "g": 0,
+              "b": 0,
+              "a": 255
+            },
+            "width_px": 3.0
+          }
+        }
+      }
+    }
+  ]
+}

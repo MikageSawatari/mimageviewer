@@ -6335,3 +6335,39 @@ fn recent_files_path() -> PathBuf {
         .join("target")
         .join("comic_lab_recent_files.json")
 }
+
+#[cfg(test)]
+mod sample_tests {
+    use super::*;
+
+    /// The shipped verification scene (docs/comic-lab-sample-scene.comic.json)
+    /// must keep loading through the lab's real `SidecarDoc` path, with the IVS /
+    /// combining-mark codepoints intact (regenerate via scripts/gen_comic_sample.py).
+    #[test]
+    fn sample_scene_loads() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/comic-lab-sample-scene.comic.json"
+        );
+        let text = std::fs::read_to_string(path).expect("sample scene present");
+        let doc: SidecarDoc = serde_json::from_str(&text).expect("sample scene parses");
+        assert_eq!(doc.schema_version, 1);
+        assert_eq!(doc.objects.len(), 5, "5 demo blocks");
+        // Every block is vertical standalone text.
+        for o in &doc.objects {
+            match &o.kind {
+                AnnotationKind::Text(t) => {
+                    assert_eq!(t.orientation, Orientation::Vertical)
+                }
+                other => panic!("unexpected kind: {other:?}"),
+            }
+        }
+        let all: String = doc
+            .objects
+            .iter()
+            .filter_map(|o| o.text_block().map(|t| t.text.clone()))
+            .collect();
+        assert!(all.contains('\u{E0100}'), "IVS selector present");
+        assert!(all.contains('\u{3099}'), "combining dakuten present");
+    }
+}
