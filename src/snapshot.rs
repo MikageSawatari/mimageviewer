@@ -307,21 +307,46 @@ impl Default for FilterState {
     }
 }
 
-/// `App` から取り出される snapshot 全体の view。
+/// `App` が snapshot active 中に保持する state。`App.snapshot: Option<SnapshotState>` で
+/// active/inactive を表現する (= `is_some()` で判定)。
 ///
-/// App field を 4 つに分けて管理するより、active かどうかで Option として
-/// 1 つにまとめた方が借用関係が綺麗 (= App 側はこの struct を持つ Option<SnapshotState>)。
-/// ただし MVP の最初の commit では App field を直接持つ形で実装し、後で必要なら
-/// この struct にまとめ直す (= refactor 余地として残す)。
-#[allow(dead_code)] // C2 commit でも未参照、C3 commit の nav resolver で使う想定
-#[derive(Clone, Debug)]
+/// snapshot ON 時に既存の `App.items` / `App.thumbnails` / `App.visible_indices` /
+/// `App.scroll_offset_y` を `saved_*` field に退避し、snapshot subset で置き換える。
+/// snapshot OFF 時に `saved_*` から復元 (= 元のフォルダ表示に戻る)。
+///
+/// 設計: docs/star-lock-snapshot-design.md §4.2 / §4.6 / §5
+///
+/// `Debug` 派生していないのは `GridItem` / `ThumbnailState` が `Debug` 未実装のため
+/// (= GUI 系の型は Debug 出力されることを想定していない)。snapshot state を
+/// log に出したい場合は `origin` / `items.len()` 等の具体的 field を個別に出す。
+#[derive(Clone)]
 pub struct SnapshotState {
+    // ── snapshot 本体 ──
+    /// snapshot に含まれる entry list (= top-level grid 表示順を保つ)
     pub items: Vec<SnapshotEntry>,
+    /// O(1) membership / owner_entry lookup 用。`items` の index を指す。
     pub membership: HashMap<SnapshotKey, usize>,
+    /// snapshot 起点となった base path (= 表示・解除時の reference)
     pub origin: PathBuf,
+    /// ★レベル filter の capture 時 snapshot (= 後で current と比較して
+    /// 「filter 変更後」suffix 判定に使う)
     pub filter_at_capture: FilterState,
+    /// 絞り込み元のラベル (tooltip / debug 用)
     pub source_label: SnapshotSourceLabel,
+    /// pending folder nav の世代識別 (= snapshot OFF 後に旧 nav 結果が来ても無視)
     pub generation_id: u64,
+
+    // ── 退避 state (= snapshot OFF 時に復元) ──
+    /// snapshot ON 時点の `App.items` (= 通常フォルダの GridItem 一覧)
+    pub saved_items: Vec<crate::grid_item::GridItem>,
+    /// snapshot ON 時点の `App.thumbnails` (= GPU texture 状態含む)
+    pub saved_thumbnails: Vec<crate::grid_item::ThumbnailState>,
+    /// snapshot ON 時点の `App.visible_indices` (= filter 適用後の indices)
+    pub saved_visible_indices: Vec<usize>,
+    /// snapshot ON 時点の `App.scroll_offset_y`
+    pub saved_scroll_offset_y: f32,
+    /// snapshot ON 時点の `App.selected` (= 選択中セル idx、復元用)
+    pub saved_selected: Option<usize>,
 }
 
 // ═══════════════════════════════════════════════════════════

@@ -9,6 +9,7 @@ use std::sync::{
 #[cfg(windows)]
 mod native_video;
 pub(crate) mod normalize;
+mod snapshot_ops;
 
 const MAX_FOLDER_NAV_STACK: usize = 100;
 const MAX_RECENT_FOLDERS: usize = 20;
@@ -6099,6 +6100,16 @@ impl App {
     /// をスキップできる。`path` が ZIP/PDF ファイルのときは仮想フォルダとして
     /// 別ルートに入るため `pre_scan` は無視される (None 相当で委譲)。
     pub fn load_folder_with_scan(&mut self, path: PathBuf, pre_scan: Option<ScannedDir>) {
+        // ★固定 (Snapshot Lock) 中は範囲外フォルダへの移動を block する (= §4.4)。
+        // 検索 mode 起動など意図的に snapshot を解除して移動するケースは、caller が
+        // 事前に `deactivate_snapshot()` を呼ぶ責任を持つ。pending nav は 1 件分の
+        // toast に集約 (= 同フレームで複数 caller が来てもユーザーには 1 件しか見えない)。
+        if self.is_snapshot_active() {
+            self.show_feedback_toast(
+                "スナップショット中は他のフォルダに移動できません (★固定を解除してください)".into(),
+            );
+            return;
+        }
         // perf: UI スレッドをブロックする load_folder 全体の wall time を計測する。
         // Ctrl+↑↓ 連打時の引っかかりの主要因がここに集まる想定。
         let lf_t0 = std::time::Instant::now();
@@ -7129,6 +7140,10 @@ impl App {
     /// お気に入り検索バーを開く (メニューや Ctrl+S から呼ばれる)。
     /// 他の検索バー (Ctrl+F / Ctrl+G) が開いていれば閉じて相互排他を保つ。
     pub(crate) fn open_favsearch(&mut self) {
+        // ★固定 中は scope mutual exclusion で snapshot を先に解除する (= §4.5)。
+        if self.is_snapshot_active() {
+            self.deactivate_snapshot();
+        }
         self.cancel_pending_folder_nav();
         self.close_other_search_bars(SearchMode::Favsearch);
         self.favsearch.active = true;
@@ -7144,6 +7159,10 @@ impl App {
     /// Ctrl+F のローカルメタデータ検索バーを開く。
     /// 他の検索バーが開いていれば閉じる (相互排他)。
     pub(crate) fn open_local_metadata_search(&mut self) {
+        // ★固定 中は scope mutual exclusion で snapshot を先に解除する (= §4.5)。
+        if self.is_snapshot_active() {
+            self.deactivate_snapshot();
+        }
         self.cancel_pending_folder_nav();
         self.close_other_search_bars(SearchMode::LocalMeta);
         self.show_search_bar = true;

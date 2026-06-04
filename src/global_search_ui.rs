@@ -1354,6 +1354,10 @@ impl App {
         if self.global_search.active {
             return;
         }
+        // ★固定 中は scope mutual exclusion で snapshot を先に解除する (= §4.5)。
+        if self.is_snapshot_active() {
+            self.deactivate_snapshot();
+        }
         self.cancel_pending_folder_nav();
         // 他の検索バー (Ctrl+F / Ctrl+S) が開いていれば閉じる (相互排他)
         self.close_other_search_bars(crate::app::SearchMode::Global);

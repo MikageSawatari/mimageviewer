@@ -1201,6 +1201,44 @@ impl App {
                             toolbar_rating_changed = true;
                         }
                     }
+
+                    // ★固定 (Snapshot Lock) ボタン (= 設計: docs/star-lock-snapshot-design.md §4.1)。
+                    // ★ボタン群の右に区切りなしで配置。snapshot 中は active 強調、
+                    // inactive で検索 pending 等のときは disabled。
+                    let snap_active = self.is_snapshot_active();
+                    let snap_count = self.snapshot_count();
+                    let disabled_reason = self.snapshot_button_disabled_reason();
+                    let enabled = snap_active || disabled_reason.is_none();
+                    let label_text = if let Some(n) = snap_count {
+                        format!("★固定 ({n})")
+                    } else {
+                        "★固定".to_string()
+                    };
+                    let rich = if snap_active {
+                        // active 時は背景強調色 (= 青系)
+                        egui::RichText::new(label_text)
+                            .color(egui::Color32::from_rgb(255, 255, 255))
+                            .background_color(egui::Color32::from_rgb(58, 110, 165))
+                            .strong()
+                    } else {
+                        egui::RichText::new(label_text)
+                    };
+                    let tooltip = if snap_active {
+                        let n = snap_count.unwrap_or(0);
+                        format!("★固定を解除 ({n}件)")
+                    } else if let Some(r) = disabled_reason {
+                        r.to_string()
+                    } else {
+                        "現在の絞り込み結果をスナップショットに固定\n(★/Ctrl+F/S/G の結果範囲内のみで巡回)".to_string()
+                    };
+                    let resp = ui
+                        .add_enabled(enabled, egui::Button::new(rich).small())
+                        .hover_tip(tooltip);
+                    if resp.clicked() {
+                        let label = self.infer_snapshot_source_label();
+                        self.toggle_snapshot(label);
+                    }
+
                     first_section = false;
                 }
                 if show_favs {
@@ -1606,16 +1644,24 @@ impl App {
                         }
 
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            let resp = ui.add(
+                            // snapshot 中はフォルダパス入力を disabled にする (= §4.4)。
+                            // suffix も同行右側に label 表示。
+                            let snap_suffix = self.snapshot_path_suffix();
+                            let is_snap_active = snap_suffix.is_some();
+                            let resp = ui.add_enabled(
+                                !is_snap_active,
                                 egui::TextEdit::singleline(&mut self.address)
                                     .desired_width(f32::INFINITY),
                             );
                             self.address_has_focus = resp.has_focus();
-                            if resp.lost_focus() && enter_pressed {
+                            if !is_snap_active && resp.lost_focus() && enter_pressed {
                                 let p = PathBuf::from(&self.address);
                                 if let Some(resolved) = resolve_folder_bar_nav_path(&p) {
                                     result = Some(AddressBarNav::Direct(resolved));
                                 }
+                            }
+                            if let Some(suffix) = snap_suffix {
+                                ui.colored_label(egui::Color32::from_rgb(58, 110, 165), suffix);
                             }
                         });
                     });
