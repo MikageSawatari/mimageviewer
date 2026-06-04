@@ -592,7 +592,7 @@ impl App {
         let entry_target = entry.target.clone();
         match entry_kind {
             SnapshotEntryKind::Image | SnapshotEntryKind::Video => {
-                let SnapshotTarget::Fs(target_path) = entry_target else {
+                let SnapshotTarget::Fs(target_path) = entry_target.clone() else {
                     return false;
                 };
                 // 現在 items の中に同 path があれば直接 open
@@ -606,9 +606,11 @@ impl App {
                     }
                     return true;
                 }
-                // 該当 path が現在 items に無い → owner folder を load してから open
+                // 該当 path が現在 items に無い → owner folder を load してから対象 leaf を open
+                // (Codex 3rd P2 fix: 旧版は target を渡していなかったので first playable に
+                // 着地していた)
                 if let Some(folder) = target_path.parent().map(|p| p.to_path_buf()) {
-                    self.snapshot_load_and_open(folder, resume_slideshow);
+                    self.snapshot_load_and_open(folder, resume_slideshow, Some(entry_target));
                     return true;
                 }
                 false
@@ -617,7 +619,7 @@ impl App {
                 let SnapshotTarget::ZipImage {
                     zip_path,
                     entry_name,
-                } = entry_target
+                } = entry_target.clone()
                 else {
                     return false;
                 };
@@ -635,12 +637,12 @@ impl App {
                     }
                     return true;
                 }
-                // 該当 zip が現在開かれていない → zip を load してから open
-                self.snapshot_load_and_open(zip_path, resume_slideshow);
+                // 該当 zip が現在開かれていない → zip を load してから対象 entry を open
+                self.snapshot_load_and_open(zip_path, resume_slideshow, Some(entry_target));
                 true
             }
             SnapshotEntryKind::PdfPage => {
-                let SnapshotTarget::PdfPage { pdf_path, page_num } = entry_target else {
+                let SnapshotTarget::PdfPage { pdf_path, page_num } = entry_target.clone() else {
                     return false;
                 };
                 if let Some(idx) = self.items.iter().position(|it| match it {
@@ -657,14 +659,15 @@ impl App {
                     }
                     return true;
                 }
-                self.snapshot_load_and_open(pdf_path, resume_slideshow);
+                self.snapshot_load_and_open(pdf_path, resume_slideshow, Some(entry_target));
                 true
             }
             SnapshotEntryKind::Folder | SnapshotEntryKind::ZipFile | SnapshotEntryKind::PdfFile => {
                 let SnapshotTarget::Fs(container_path) = entry_target else {
                     return false;
                 };
-                self.snapshot_load_and_open(container_path, resume_slideshow);
+                // container 経路は target None (= first playable に着地)
+                self.snapshot_load_and_open(container_path, resume_slideshow, None);
                 true
             }
             SnapshotEntryKind::ConvertibleArchive => {
@@ -676,7 +679,7 @@ impl App {
                 };
                 let _ = format; // 変換 dialog は snapshot scope 外、cache hit 時のみ自動 open
                 if let Some(cached) = self.try_archive_cache_lookup(&path) {
-                    self.snapshot_load_and_open(cached, resume_slideshow);
+                    self.snapshot_load_and_open(cached, resume_slideshow, None);
                     true
                 } else {
                     // cache 無し: snapshot 中は変換 dialog を出さず skip (= 次 entry に進む
@@ -691,11 +694,21 @@ impl App {
         }
     }
 
-    /// snapshot internal nav flag を立てて load_folder + 最初の playable item を fullscreen で開く。
+    /// snapshot internal nav flag を立てて load_folder + 対象 leaf or 最初の playable item を
+    /// fullscreen で開く。
+    ///
+    /// `target` が `Some` なら、load 完了後に items 内で対象を探して open (Codex 3rd P2 fix:
+    /// 対象画像でなくフォルダ先頭に着地するバグの修正)。マッチしなければ first playable に
+    /// fallback。`target` が `None` (= container 経路) なら first playable を開く。
     ///
     /// `load_folder_with_scan` の snapshot guard を bypass するため、`snapshot_internal_nav`
     /// を true にしてから呼ぶ。flag は呼び出し後に false に戻す (= scope guard pattern)。
-    fn snapshot_load_and_open(&mut self, folder_path: std::path::PathBuf, resume_slideshow: bool) {
+    fn snapshot_load_and_open(
+        &mut self,
+        folder_path: std::path::PathBuf,
+        resume_slideshow: bool,
+        target: Option<crate::snapshot::SnapshotTarget>,
+    ) {
         let was_fs = self.fullscreen_idx.is_some();
         // 現在 fullscreen を閉じる (= items が入れ替わるので)
         if was_fs {
@@ -713,23 +726,56 @@ impl App {
         if self.rating_filter_suppressed_at.is_some() {
             self.rebuild_visible_indices();
         }
-        // load_folder 完了後に最初の playable item (= Image/Video) を fullscreen で開く。
+        // load_folder 完了後の open 対象を解決:
+        // - target Some → items 内で対象 leaf を探す (Codex P2 fix)
+        // - target None or マッチしない → 最初の playable item に fallback
         // ※ ZIP/PDF は async enumerate なので、items は ZipSeparator のみで埋まっている可能性が
-        //   ある。その場合は次フレーム以降の enumerate 完了で deferred reopen される (= §4.6
-        //   末尾説明)。MVP では sync 経路のみ対応、ZIP/PDF への snapshot navigation は実機
-        //   確認で評価する。
+        //   ある。その場合は次フレーム以降の enumerate 完了で deferred reopen される (MVP として
+        //   sync 経路のみ対応、ZIP/PDF への snapshot navigation は実機確認で評価)。
         if was_fs || resume_slideshow {
-            // 最初の image-like item を探して open
-            if let Some(first_idx) = self.items.iter().position(|it| {
-                matches!(
-                    it,
-                    crate::grid_item::GridItem::Image(_)
-                        | crate::grid_item::GridItem::Video(_)
-                        | crate::grid_item::GridItem::ZipImage { .. }
-                        | crate::grid_item::GridItem::PdfPage { .. }
-                )
-            }) {
-                self.open_fullscreen(first_idx);
+            use crate::grid_item::GridItem;
+            use crate::snapshot::SnapshotTarget;
+            let target_idx: Option<usize> = match target.as_ref() {
+                Some(SnapshotTarget::Fs(p)) => self.items.iter().position(|it| match it {
+                    GridItem::Image(ip) | GridItem::Video(ip) => ip == p,
+                    _ => false,
+                }),
+                Some(SnapshotTarget::ZipImage {
+                    zip_path,
+                    entry_name,
+                }) => self.items.iter().position(|it| match it {
+                    GridItem::ZipImage {
+                        zip_path: zp,
+                        entry_name: en,
+                    } => zp == zip_path && en == entry_name,
+                    _ => false,
+                }),
+                Some(SnapshotTarget::PdfPage { pdf_path, page_num }) => {
+                    self.items.iter().position(|it| match it {
+                        GridItem::PdfPage {
+                            pdf_path: pp,
+                            page_num: pn,
+                            ..
+                        } => pp == pdf_path && pn == page_num,
+                        _ => false,
+                    })
+                }
+                Some(SnapshotTarget::ConvertibleArchive { .. }) | None => None,
+            };
+            // target にマッチしなければ first playable に fallback
+            let open_idx = target_idx.or_else(|| {
+                self.items.iter().position(|it| {
+                    matches!(
+                        it,
+                        GridItem::Image(_)
+                            | GridItem::Video(_)
+                            | GridItem::ZipImage { .. }
+                            | GridItem::PdfPage { .. }
+                    )
+                })
+            });
+            if let Some(idx) = open_idx {
+                self.open_fullscreen(idx);
                 if resume_slideshow {
                     self.slideshow_playing = true;
                 }

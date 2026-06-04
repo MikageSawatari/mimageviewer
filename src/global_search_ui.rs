@@ -1677,7 +1677,10 @@ impl App {
         // (§4.3.2)。aggregate_auto が下りていれば no-op。
         self.global_search.maybe_auto_switch_aggregate();
         ensure_container_mtime_populated(&mut self.global_search);
-        let rating_filter = self.settings.rating_filter;
+        // Codex 3rd P1 fix: ★一時解除中 (= effective filter [true;6]) を Ctrl+G drill view
+        // にも反映。旧版は settings.rating_filter を直接使っていたため、suppress 発動して
+        // も drill 内で未評価 hits が build_drilled_items 側で落とされていた。
+        let rating_filter = self.effective_rating_filter();
         let sort_order = self.settings.sort_order;
         let (items, image_metas) = match self.global_search.view() {
             GlobalSearchView::Flat => {

@@ -3073,11 +3073,14 @@ pub struct App {
     /// ([`maybe_restore_rating_filter_if_out_of_scope`])。
     /// 破棄: ユーザーが手動で filter を変更した時 (意図的操作を尊重して復元せず捨てる)。
     ///
-    /// `settings.rating_filter` は suppression 中は in-memory 上 `[true; 6]` (全 ON) に
-    /// 書き換えるが **`settings.save()` を呼ばない**。永続化は元のフィルタ値のまま残る
-    /// ので、アプリ再起動時はユーザーの saved filter に戻る。
+    /// **Codex P1-2 fix 後 (2026-06+)**: `settings.rating_filter` は **書き換えない**。
+    /// 表示用の実効フィルタは [`Self::effective_rating_filter`] が suppression の有無を
+    /// 見て切替える (= suppress 中なら `[true; 6]`、それ以外なら settings 値)。
+    /// 旧版は settings を直接 `[true; 6]` に書き換える hidden mode で、`rating_filter_active()`
+    /// が嘘をつき自己破壊ループの原因になっていた。
     ///
-    /// (anchor_path, 保存した旧フィルタ)
+    /// (anchor_path, 旧フィルタ saved 値) — 旧 saved 値は P1-2 fix 後は未使用だが、
+    /// 型は互換性のため残置。新規 fix 時に削除候補。
     pub(crate) rating_filter_suppressed_at: Option<(PathBuf, [bool; 6])>,
 
     /// 再帰レーティングフィルタ: 現フォルダ直下のコンテナごとの子孫★件数バッファ。

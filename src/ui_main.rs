@@ -1590,7 +1590,8 @@ impl App {
                         if self.settings.show_address_bar_history_menu {
                             // 検索 (Ctrl+G / Ctrl+S) 中は履歴メニューを無効化する
                             // (検索は透明な一時オーバーレイで履歴の概念が適用されない)。
-                            ui.add_enabled_ui(!search_active, |ui| {
+                            // Codex 3rd P3 fix: snapshot 中も同様に無効化。
+                            ui.add_enabled_ui(!search_active && !snapshot_active, |ui| {
                                 ui.menu_button("履歴▼", |ui| {
                                     let menu_width =
                                         (ctx.content_rect().width() * 0.72).clamp(560.0, 1100.0);
