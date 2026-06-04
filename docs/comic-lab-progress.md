@@ -1,11 +1,43 @@
 # comic_lab 進捗・ハンドオフメモ
 
 Status: 作業中スナップショット (コンパクト耐性用)
-更新: 2026-06-04 セッション (縦書き OpenType 化 + スタンプ機能)
+更新: 2026-06-04 セッション (FramePlanner 形状追加 / worktree 運用へ移行)
 
 吹き出し・テキスト注釈ツールの **lab 試作** (`tools/comic_lab` + `crates/comic-core`)。
 設計の正本: [speech-bubble-text-tool-plan.md](speech-bubble-text-tool-plan.md) (Claude 案) /
 [speech-bubble-tool-design.md](speech-bubble-tool-design.md) (Codex 案)。
+
+## ⚠ 作業環境 (次セッション必読・worktree 運用)
+
+ラボ作業は **専用 worktree `C:\home\mimageviewer-lab` (branch `lab`)** で行う。本体アプリ
+セッションは `C:\home\mimageviewer` (branch `master`) を使い、index/HEAD が分離するので
+コミットの取り合いが起きない (1ツリー共有時に多発した事故の回避策。CLAUDE.md「複数の
+Claude Code セッションを並行で動かす」節)。
+
+- Claude Code の cwd は毎コマンド main repo にリセットされるので、ラボ操作は**明示パス**で:
+  - git: `git -C C:\home\mimageviewer-lab <cmd>`
+  - cargo: `cargo <cmd> -p comic_lab|comic-core --manifest-path C:\home\mimageviewer-lab\Cargo.toml`
+    (本体パッケージをビルドしないので **vendor 不要・build.rs 走らない**。bare `cargo build` は禁止)
+  - fmt: `(cd C:\home\mimageviewer-lab && cargo fmt)` — `--manifest-path` だけだと main 側を見るので cd 必須
+  - 編集: `C:\home\mimageviewer-lab\...` の絶対パス
+- `lab` ブランチは **master 未マージ**。実機確認OK後に一度だけ `lab`→`master` を merge する
+  (ユーザー判断待ち)。退避ブランチは不要 (worktree 隔離で十分)。
+
+## 2026-06-04 末: FramePlanner 形状追加 (branch lab、コミット済み)
+
+[FramePlanner](https://github.com/jonigata/FramePlanner2) (MIT) 参考に吹き出し形状を拡充。
+詳細は [comic-lab-frameplanner-shapes.md](comic-lab-frameplanner-shapes.md)。
+
+- **Phase1 ベクター形状** (5bfdd0d3): `BubbleShape` に Polygon/Diamond/Heart/Arrow/Soft。
+  既存 tessellate→塗り/枠/しっぽ/本文/自動サイズ/ハンドルに乗る。lab `BubblePreset` に
+  やわらか/多角形/ダイヤ/ハート/矢印 追加。
+- **Phase2 線群エフェクト** (929af8c6): `MotionLines`(集中線)/`SpeedLines`(流線)。塗りでなく
+  多数の線 + 中央クリア楕円(`LINE_FIELD_CLEAR_RATIO=0.55`)。`draw_line_field` (raster)。
+- **Codex P1/P2 対応** (34ccded7): 流線を外接/クリア楕円の交点計算に書換 (斜めでも AABB 内)、
+  自動サイズを内接率ベースに、count/sides 上限クランプ。
+- テスト comic-core 72 / comic_lab 4 green。**Phase3** (意識/線/二重線/◯?/なし) は将来。
+
+(以下は worktree 移行前=master 上の履歴。同じ内容が lab ブランチにも入っている)
 
 ## 2026-06-04 後半: 縦書き OpenType 化 (案B) + スタンプ機能 (未コミット)
 
