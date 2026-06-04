@@ -441,6 +441,15 @@ pub struct SnapshotState {
     pub saved_scroll_offset_y: f32,
     /// snapshot ON 時点の `App.selected` (= 選択中セル idx、復元用)
     pub saved_selected: Option<usize>,
+
+    // ── snapshot list view 用の固定 state (= BS で復帰したときに使う) ──
+    /// snapshot list view を構成する GridItem 一覧 (= snapshot subset の clone)。
+    /// `reconstruct_grid_item` での再構築だと ZipImage/PdfPage の細部 (= content_type 等)
+    /// が失われるため、初回 activate 時の clone を保持する。
+    pub list_view_items: Vec<crate::grid_item::GridItem>,
+    /// 同上、サムネイル状態 (= GPU texture 含む、ロード済みフォルダ代表サムネ保持)。
+    /// 子フォルダから BS で戻った際にサムネが Pending に戻らないために必要。
+    pub list_view_thumbnails: Vec<crate::grid_item::ThumbnailState>,
 }
 
 // ═══════════════════════════════════════════════════════════

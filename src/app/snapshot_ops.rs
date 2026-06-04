@@ -235,6 +235,10 @@ impl App {
                 .and_then(snapshot_key_from_grid_item)
                 .and_then(|key| membership.get(&key).copied())
         });
+        // list_view_items / list_view_thumbnails 用に clone を確保
+        // (= BS で snapshot list 復帰した時に Pending リセットせず再利用するため)。
+        let list_view_items = captured_items_grid.clone();
+        let list_view_thumbnails = captured_thumbnails.clone();
         let saved_items = std::mem::replace(&mut self.items, captured_items_grid);
         let saved_thumbnails = std::mem::replace(&mut self.thumbnails, captured_thumbnails);
         let saved_visible_indices =
@@ -267,6 +271,8 @@ impl App {
             saved_visible_indices,
             saved_scroll_offset_y,
             saved_selected,
+            list_view_items,
+            list_view_thumbnails,
         });
 
         let msg = if search_was_active {
@@ -333,19 +339,19 @@ impl App {
     /// - filter suppress を解除 (= snapshot list 自体は filter を suppress しない設計)
     /// - current_folder = snapshot_origin、address bar 表示も更新
     pub(crate) fn snapshot_return_to_list_view(&mut self) -> bool {
-        use crate::grid_item::ThumbnailState;
-        // 必要な snapshot field を最初に clone して借用を切る (= 後段の mut self call と衝突しない)
-        let (snap_origin, reconstructed) = {
+        // 必要な snapshot field を最初に clone して借用を切る (= 後段の mut self call と衝突しない)。
+        // list_view_items / list_view_thumbnails は activate_snapshot 時に保存した clone を
+        // 使う (= reconstruct だと folder 代表サムネが Pending に戻って「フォルダアイコン」
+        // 表示になるユーザー報告対応)。
+        let (snap_origin, list_items, list_thumbs) = {
             let Some(snap) = self.snapshot.as_ref() else {
                 return false;
             };
-            let origin = snap.origin.clone();
-            let reconstructed: Vec<crate::grid_item::GridItem> = snap
-                .items
-                .iter()
-                .filter_map(crate::snapshot::reconstruct_grid_item)
-                .collect();
-            (origin, reconstructed)
+            (
+                snap.origin.clone(),
+                snap.list_view_items.clone(),
+                snap.list_view_thumbnails.clone(),
+            )
         };
         // 既に snapshot root に居れば何もしない (= 通常 BS の対象)
         let at_origin = self
@@ -359,16 +365,16 @@ impl App {
         if at_origin {
             return false;
         }
-        let n = reconstructed.len();
+        let n = list_items.len();
         // filter suppress 解除 (= snapshot list view は filter 通常適用)
         let _ = self.restore_rating_filter_suppression();
         // fullscreen 中なら閉じる
         if self.fullscreen_idx.is_some() {
             self.close_fullscreen();
         }
-        // items 入れ替え
-        self.items = reconstructed;
-        self.thumbnails = vec![ThumbnailState::Pending; n];
+        // items 入れ替え (= 保存したサムネ付き state を復帰)
+        self.items = list_items;
+        self.thumbnails = list_thumbs;
         self.visible_indices = (0..n).collect();
         self.current_folder = Some(snap_origin.clone());
         self.address = snap_origin.display().to_string();
@@ -702,7 +708,11 @@ impl App {
         if let Some(idx) = next {
             self.snapshot_open_entry(idx, resume_slideshow)
         } else {
-            // 末尾: boundary hint を表示
+            // 末尾: boundary hint + nav lock 解除
+            // snapshot 経路は apply_folder_nav_result を通らないので、capture_fs_nav_holdover
+            // で取得した lock が残ったまま (= 次の Ctrl+↑↓ が fs_nav_is_locked() で block される)。
+            // 末尾検知時に明示的に release が必要。
+            self.release_fs_nav_lock();
             self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder {
                 forward,
                 at: std::time::Instant::now(),
@@ -837,7 +847,10 @@ impl App {
             let _ = self.snapshot_open_entry(idx, /*resume_slideshow=*/ true);
             true
         } else {
-            // 末尾: 次 container 無し → slideshow 停止
+            // 末尾: 次 container 無し → slideshow 停止 + nav lock 解除
+            // capture_fs_nav_holdover で取得した lock を release しないと次の Ctrl+↑↓ が
+            // fs_nav_is_locked() で block される (= ユーザー報告「Ctrl+上下で移動できなくなる」)。
+            self.release_fs_nav_lock();
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
             self.show_feedback_toast(

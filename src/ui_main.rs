@@ -1645,9 +1645,14 @@ impl App {
 
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             // snapshot 中はフォルダパス入力を disabled にする (= §4.4)。
-                            // suffix も同行右側に label 表示。
+                            // suffix は TextEdit の **左** に colored_label として置く
+                            // (= 旧版で右に置くと TextEdit が desired_width(INFINITY) で残り幅を
+                            // 全消費するため履歴プルダウン等に重なる事故が起きていた、ユーザー報告)。
                             let snap_suffix = self.snapshot_path_suffix();
                             let is_snap_active = snap_suffix.is_some();
+                            if let Some(suffix) = snap_suffix {
+                                ui.colored_label(egui::Color32::from_rgb(58, 110, 165), suffix);
+                            }
                             let resp = ui.add_enabled(
                                 !is_snap_active,
                                 egui::TextEdit::singleline(&mut self.address)
@@ -1659,9 +1664,6 @@ impl App {
                                 if let Some(resolved) = resolve_folder_bar_nav_path(&p) {
                                     result = Some(AddressBarNav::Direct(resolved));
                                 }
-                            }
-                            if let Some(suffix) = snap_suffix {
-                                ui.colored_label(egui::Color32::from_rgb(58, 110, 165), suffix);
                             }
                         });
                     });
