@@ -1622,6 +1622,44 @@ awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
   PR（プルリクエスト）の作成は、明示的に指示された場合のみ行う。
 - **デフォルトブランチ**: GitHub 上は `main`、ローカルは `master`。リリース時は両方に push する。
 
+### 複数の Claude Code セッションを並行で動かす (lab と本体の同時編集) ⚠️
+
+ラボ (`crates/comic-core` / `tools/comic_lab`) と本体 (`src/` ほか) は編集ファイルが
+重ならないので**並行作業自体は可能**だが、**2 つのセッションが同じ作業ツリー
+(= 同じ `.git` の index と HEAD) を共有すると git 操作が衝突する**。2026-06 に実害:
+一方の `git add -A` がもう一方のステージ変更を巻き込んで誤ったコミットに混入し、さらに
+一方の `git reset` が他方の commit を HEAD から落とした (2 回発生)。ファイル編集自体は
+衝突していなくても、index・HEAD の取り合いで起きる。
+
+**推奨 = セッションごとに `git worktree` を分ける**。index・HEAD が独立し、取り合いが
+原理的に起きなくなる:
+
+- ラボ用 worktree は **vendor/ 不要**。`cargo {check,test} -p comic_lab -p comic-core`
+  は本体パッケージ (`mimageviewer`) をビルドしないので **root の build.rs が走らず**、
+  pdfium/ffmpeg/ort/susie の DLL チェックに引っかからない。junction も張らないので下記
+  「worktree + Windows junction の地雷」のリスクも無い:
+  ```bash
+  git worktree add ../mimageviewer-lab -b lab    # vendor セットアップ不要
+  cd ../mimageviewer-lab
+  cargo test -p comic-core && cargo check -p comic_lab
+  ```
+  ⚠ ラボ worktree では **bare `cargo build` を打たない** (全 member をビルドして本体
+  build.rs が走り vendor チェックで失敗する)。必ず `-p comic_lab` / `-p comic-core` を付ける。
+- 各 worktree は**自分のブランチ**にコミットし、作業完了時に**一方ずつ** master へ merge する。
+- 撤収は必ず `scripts/safe-worktree-remove.ps1` 経由 (下記「worktree + Windows junction」)。
+
+**やむを得ず 1 つの作業ツリーを共有する場合の規律** (worktree を分けないとき):
+
+- **`git add -A` / `git add .` 禁止**。必ず**自分が触ったパスだけを明示 add** する
+  (`git add crates/comic-core tools/comic_lab ...`)。これで相手のファイルを巻き込まない。
+- **HEAD が自分のコミットでないときに `git reset` / `rebase` / 履歴書き換えをしない**。
+  実行前に必ず `git log --oneline -5` で「最新が本当に自分の commit か」を確認する。相手の
+  commit を巻き戻すと相手の作業が HEAD から消える。
+- **コミット直後に `git log --oneline -1` で自分の commit が HEAD にあるか確認**する。消えて
+  いたら相手の操作に巻き込まれている → `git reflog` か退避ブランチから復旧する。
+- **大きめの作業は退避ブランチを作っておく**: `git branch -f <name> HEAD`。相手の reset で
+  master が巻き戻っても `git reset --hard <name>` で復旧できる (2026-06 はこれで救済した)。
+
 ### worktree + Windows junction の地雷 ⚠️
 
 並行作業のため `git worktree add` で別 worktree を切るときに、`vendor/` を main worktree から
