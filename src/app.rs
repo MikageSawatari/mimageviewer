@@ -15217,23 +15217,39 @@ impl App {
     /// 改めて発動する経路が無かった (= Enter / double-click 経由でのみ発動)。
     ///
     /// 関数名は互換性のため維持 (= 呼び出し元: load_folder_with_scan 末尾)。
+    ///
+    /// ⚠ filter active 判定の注意: suppress 中は `settings.rating_filter` が
+    /// `[true; 6]` (= 全 ON) に書き換えられているため `rating_filter_active()` は
+    /// false を返す。suppress の有無で active 判定先を切り替える必要がある
+    /// (= suppress 中は saved を見る、無ければ現 filter を見る)。これを混同すると
+    /// 自己破壊ループ (= suppress 即時 restore → 再発動 → 即時 restore...) になる。
     pub(crate) fn maybe_restore_rating_filter_if_out_of_scope(&mut self) {
-        // フィルタ inactive (= 全 ★ レベル ON) なら suppress も不要。残っていれば restore。
-        if !self.rating_filter_active() {
-            self.restore_rating_filter_suppression();
-            return;
-        }
         let Some(current) = self.effective_folder() else {
             // 現在フォルダが取れない状態 (起動直後など) は触らない
             return;
         };
-        // 既に suppress 中: anchor の subtree 内なら維持、外なら一旦 restore
-        if let Some((anchor, _)) = self.rating_filter_suppressed_at.as_ref() {
-            if path_in_subtree_ci(&current, anchor) {
+        // 既に suppress 中の処理 (= saved を見て active 判定)
+        if let Some((anchor, saved)) = self.rating_filter_suppressed_at.as_ref() {
+            // saved が all true なら元々 filter なし → suppress 不要、restore
+            let saved_active = saved.iter().any(|&b| !b);
+            if !saved_active {
+                self.restore_rating_filter_suppression();
                 return;
             }
-            // subtree 外に出た → restore してから新 anchor で再評価する
+            // saved active: anchor の subtree 内なら維持
+            let anchor_owned = anchor.clone(); // immutable borrow を切る
+            if path_in_subtree_ci(&current, &anchor_owned) {
+                return;
+            }
+            // subtree 外 → restore してから再評価 (= 下の maybe_suppress を呼ぶ)
             self.restore_rating_filter_suppression();
+            // 注意: restore 後の rating_filter は saved 値 (= active) に戻っている。
+            // 次の maybe_suppress 内の `rating_filter_active()` チェックも通る。
+        } else {
+            // suppress なし: 現 filter が inactive なら suppress 発動も不要
+            if !self.rating_filter_active() {
+                return;
+            }
         }
         // 現在 folder の★を見て suppress を発動可否判定 (= 既存 helper を再利用)。
         // 発動条件: folder 自身に★が付いている + その★が現在 filter で通る
