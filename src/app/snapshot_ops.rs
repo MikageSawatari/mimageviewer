@@ -1396,4 +1396,107 @@ mod tests {
         assert_eq!(app.snapshot_next_arrow_entry(None, true), None);
         assert_eq!(app.snapshot_next_playable_entry(None, true), None);
     }
+
+    // ─── Codex 5th review P3: 回帰テスト追加 ────────────
+
+    /// Ctrl+G 検索 view から ★固定すると `pre_snapshot_search_origin` が
+    /// `global_search.saved_folder` から capture されることを保証する回帰テスト
+    /// (Codex 4th review で deactivate 時に検索表示が残るバグの根本対策)。
+    #[test]
+    fn activate_with_global_search_captures_pre_snapshot_origin() {
+        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\a.png"))]);
+        // Ctrl+G が active + saved_folder を持っている状態を模擬
+        app.global_search.active = true;
+        app.global_search.saved_folder = Some(PathBuf::from(r"E:\original_folder"));
+        app.activate_snapshot(SnapshotSourceLabel::GlobalSearch {
+            query: "klee".into(),
+        });
+        let snap = app.snapshot.as_ref().expect("snapshot active");
+        assert_eq!(
+            snap.pre_snapshot_search_origin,
+            Some(PathBuf::from(r"E:\original_folder")),
+            "Ctrl+G の saved_folder が pre_snapshot_search_origin に capture される"
+        );
+        // 検索 mode は consume 済み (= scope mutual exclusion)
+        assert!(!app.global_search.active);
+    }
+
+    /// Ctrl+S 検索 view から ★固定すると `pre_snapshot_search_origin` が
+    /// `favsearch.saved_folder` から capture されることを保証する。
+    #[test]
+    fn activate_with_favsearch_captures_pre_snapshot_origin() {
+        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\a.png"))]);
+        app.favsearch.active = true;
+        app.favsearch.saved_folder = Some(PathBuf::from(r"E:\fav_origin"));
+        app.activate_snapshot(SnapshotSourceLabel::FavSearch {
+            query: "sun".into(),
+        });
+        let snap = app.snapshot.as_ref().expect("snapshot active");
+        assert_eq!(
+            snap.pre_snapshot_search_origin,
+            Some(PathBuf::from(r"E:\fav_origin")),
+            "Ctrl+S の saved_folder が pre_snapshot_search_origin に capture される"
+        );
+        assert!(!app.favsearch.active);
+    }
+
+    /// 通常 folder (= 検索 view ではない) から ★固定した場合、
+    /// `pre_snapshot_search_origin` は None になる (= deactivate で saved_items
+    /// 復元 path に入る、検索戻り先 load_folder は走らない)。
+    #[test]
+    fn activate_from_normal_folder_has_no_pre_snapshot_search_origin() {
+        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\a.png"))]);
+        // 検索系すべて inactive
+        assert!(!app.global_search.active);
+        assert!(!app.favsearch.active);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        let snap = app.snapshot.as_ref().expect("snapshot active");
+        assert!(
+            snap.pre_snapshot_search_origin.is_none(),
+            "通常 folder からの ★固定では pre_snapshot_search_origin は None"
+        );
+    }
+
+    /// snapshot_open_entry が現在 items 内に同 path の image leaf を直接 fullscreen で
+    /// 開けることを保証する (= 同 folder 内 leaf navigation の最短経路)。
+    /// Codex 4th P2 fix の前提となる「items hit時は load_folder せず直接 open」を verify。
+    #[test]
+    fn snapshot_open_entry_image_leaf_in_current_items_opens_directly() {
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\test\a.png")),
+            GridItem::Image(PathBuf::from(r"E:\test\b.png")),
+        ]);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        // entry idx 1 (= b.png) を open する → items[1] が既にあるので open_fullscreen 直接呼び
+        let result = app.snapshot_open_entry(1, /*resume_slideshow=*/ false);
+        assert!(result, "items 内 leaf の直接 open は true 返す");
+        // fullscreen_idx は items の idx 経由で設定される
+        assert_eq!(app.fullscreen_idx, Some(1));
+    }
+
+    /// `pre_snapshot_search_origin` の **active flag としての使用** = synthetic 判定では
+    /// なく Some/None で deactivate path を分岐 (= 021c54fe の修正対象)。
+    /// drilled view (= origin が drill container の実 path) でも検索 view 由来なら
+    /// 戻り先 load_folder path に入ることを保証する設計上の不変条件テスト。
+    #[test]
+    fn pre_snapshot_search_origin_works_for_drilled_view_not_synthetic() {
+        // drilled view を模擬: current_folder = drill container 実 path、
+        // global_search.active=true + saved_folder=Some
+        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\a.png"))]);
+        app.current_folder = Some(PathBuf::from(r"E:\drilled\container")); // 実 path
+        app.global_search.active = true;
+        app.global_search.saved_folder = Some(PathBuf::from(r"E:\before_search"));
+        app.activate_snapshot(SnapshotSourceLabel::GlobalSearch {
+            query: "test".into(),
+        });
+        let snap = app.snapshot.as_ref().expect("snapshot active");
+        // origin は drill container 実 path (= 合成 path ではない)
+        assert_eq!(snap.origin, PathBuf::from(r"E:\drilled\container"));
+        // しかし pre_snapshot_search_origin は Some なので、deactivate 時に
+        // synthetic 判定でなく Some/None 判定で 戻り先 load_folder path に入る
+        assert_eq!(
+            snap.pre_snapshot_search_origin,
+            Some(PathBuf::from(r"E:\before_search"))
+        );
+    }
 }
