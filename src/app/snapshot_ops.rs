@@ -225,12 +225,28 @@ impl App {
 
         let n = captured_entries.len();
         let snapshot_visible_indices: Vec<usize> = (0..n).collect();
+        // 元の selected idx (= items 内のグローバル位置) を snapshot 内の対応 idx に
+        // 変換 (= ユーザー要望: ボタンを押したときのカーソル位置を保持)。
+        // 元 items[old_idx] の SnapshotKey → membership で snapshot 内 idx を引く。
+        // snapshot 対象外 item (ZipSeparator 等) や、そもそも未選択なら None。
+        let new_selected = self.selected.and_then(|old_idx| {
+            self.items
+                .get(old_idx)
+                .and_then(snapshot_key_from_grid_item)
+                .and_then(|key| membership.get(&key).copied())
+        });
         let saved_items = std::mem::replace(&mut self.items, captured_items_grid);
         let saved_thumbnails = std::mem::replace(&mut self.thumbnails, captured_thumbnails);
         let saved_visible_indices =
             std::mem::replace(&mut self.visible_indices, snapshot_visible_indices);
         let saved_scroll_offset_y = std::mem::replace(&mut self.scroll_offset_y, 0.0);
-        let saved_selected = std::mem::replace(&mut self.selected, None);
+        let saved_selected = std::mem::replace(&mut self.selected, new_selected);
+        // 新 selected がある場合は次フレームで画面内にスクロール (= 表示されたカーソルが
+        // 画面外にあるとユーザー視認できないため)。new_selected が None なら scroll_offset_y
+        // = 0.0 のままで先頭表示。
+        if new_selected.is_some() {
+            self.scroll_to_selected = true;
+        }
         // ★情報 / 回転 / タグ / EXIF 等の idx-based cache を全 clear する。
         // items を入れ替えたので idx の意味が変わる (= 旧 idx → stars の対応が壊れ、
         // 「★バッジが全部消える」「★一時解除中が発動しない」原因になる)。
@@ -948,9 +964,14 @@ mod tests {
 
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
         assert!(app.is_snapshot_active());
-        // snapshot 中は scroll / selected がリセットされる
+        // snapshot 中は scroll はリセット、selected は snapshot 内対応 idx に変換される
+        // (= 両 items とも snapshot 対象なので元 idx=1 → 新 idx=1)
         assert_eq!(app.scroll_offset_y, 0.0);
-        assert_eq!(app.selected, None);
+        assert_eq!(app.selected, Some(1));
+        assert!(
+            app.scroll_to_selected,
+            "保持した selected が画面外に居る可能性があるので scroll_to_selected を立てる"
+        );
 
         app.deactivate_snapshot();
         assert!(!app.is_snapshot_active());
@@ -958,6 +979,40 @@ mod tests {
         assert_eq!(app.items.len(), 2);
         assert_eq!(app.scroll_offset_y, 123.0);
         assert_eq!(app.selected, Some(1));
+    }
+
+    #[test]
+    fn snapshot_preserves_selected_with_remapped_index() {
+        // 元 items: [Sep, Folder, Image] (idx 0/1/2)、selected=2 (= Image)
+        // Sep は snapshot 対象外なので snapshot subset は [Folder, Image] (idx 0/1)
+        // 元 selected=2 (Image) → snapshot 内 idx=1 (Image) に remap される
+        let mut app = test_app_with_items(vec![
+            GridItem::ZipSeparator {
+                dir_display: "title".into(),
+            },
+            GridItem::Folder(PathBuf::from(r"E:\folder")),
+            GridItem::Image(PathBuf::from(r"E:\img.png")),
+        ]);
+        app.selected = Some(2);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        // snapshot subset 内で Image は idx=1
+        assert_eq!(app.selected, Some(1));
+    }
+
+    #[test]
+    fn snapshot_clears_selected_when_selected_not_in_snapshot() {
+        // 元 selected が ZipSeparator (snapshot 対象外) → 新 selected は None
+        let mut app = test_app_with_items(vec![
+            GridItem::Folder(PathBuf::from(r"E:\folder")),
+            GridItem::ZipSeparator {
+                dir_display: "title".into(),
+            },
+        ]);
+        app.selected = Some(1); // ZipSeparator
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert_eq!(app.selected, None);
+        // scroll_to_selected は new_selected が None なので立たない
+        assert!(!app.scroll_to_selected);
     }
 
     #[test]
