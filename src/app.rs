@@ -19791,11 +19791,21 @@ impl App {
         }
 
         if self.fullscreen_idx == Some(idx) {
+            // display 経路: 編集が進んだ同じ idx の古い key (= stale request) のみ
+            // cancel する。**別 idx の prefetch pending は触らない** — 先読みの
+            // 投資を無駄にせず、ユーザーが Ctrl+→ で隣接ページに移動した瞬間に
+            // final_ai_cache hit が成立する。
+            //
+            // ⚠ 退行注意: 過去の実装は別 idx 含めて全 pending を cancel していた
+            // (= display 中ページが最優先という意図)。しかしこれで「prefetch 完了寸前
+            // に殺される → 翌フレで prefetch_final_ai が同じ key で再 spawn → 再度
+            // display に呼ばれて再 cancel」の cycle に入り、隣接ページの AI 結果が
+            // 永久に final_ai_cache に格納されない実害があった (2026-06)。
             let to_cancel: Vec<FinalAiKey> = self
                 .final_ai_pending
                 .keys()
                 .copied()
-                .filter(|pending_key| pending_key.edit_key.idx != idx || *pending_key != key)
+                .filter(|pending_key| pending_key.edit_key.idx == idx && *pending_key != key)
                 .collect();
             for pending_key in to_cancel {
                 if let Some(pending) = self.final_ai_pending.get(&pending_key) {
@@ -19803,11 +19813,13 @@ impl App {
                 }
             }
         }
-        if self
-            .final_ai_pending
-            .values()
-            .any(|pending| !pending.cancel.load(Ordering::Relaxed))
-        {
+        // 同時に走る AI worker 数の gate は「**この idx の別 key**」だけ。別 idx
+        // (= prefetch) の pending が走っていても自分は spawn する (= display 優先)。
+        // ai_runtime は内部で worker 並列を捌けるので、display + prefetch 1 件ずつ
+        // 並走しても VRAM 競合は問題にならない (旧 ai_upscale_cache 経路でも同様)。
+        if self.final_ai_pending.iter().any(|(pending_key, pending)| {
+            pending_key.edit_key.idx == idx && !pending.cancel.load(Ordering::Relaxed)
+        }) {
             return;
         }
 
