@@ -307,9 +307,36 @@ impl App {
             })
             .unwrap_or(false);
         if at_origin {
-            // origin のまま解除 → 元の items 復元 (= snapshot 元のフォルダに戻る)
+            // origin のまま解除 → 元の items 復元 (= snapshot 元のフォルダに戻る)。
+            // snapshot 中に subset (= self.thumbnails) で thumbnail worker が
+            // Pending → Loaded に進めたものを、path key 経由で saved 側に merge する。
+            // これをしないと「snapshot 解除後に新生成サムネが消える」(ユーザー報告)。
+            // GPU TextureHandle は内部 Arc なので clone は cheap。
+            use crate::grid_item::ThumbnailState;
+            let mut merged_thumbnails = snap.saved_thumbnails;
+            for (subset_idx, subset_thumb) in self.thumbnails.iter().enumerate() {
+                if !matches!(subset_thumb, ThumbnailState::Loaded { .. }) {
+                    continue; // Pending/Failed/Evicted は merge 対象外
+                }
+                let Some(subset_item) = self.items.get(subset_idx) else {
+                    continue;
+                };
+                let Some(subset_key) = crate::snapshot::snapshot_key_from_grid_item(subset_item)
+                else {
+                    continue;
+                };
+                // saved 内で同じ path key の item を探す (O(saved) linear、実用上問題なし)
+                if let Some(saved_idx) = snap.saved_items.iter().position(|it| {
+                    crate::snapshot::snapshot_key_from_grid_item(it).as_ref() == Some(&subset_key)
+                }) {
+                    if let Some(slot) = merged_thumbnails.get_mut(saved_idx) {
+                        // 既に Loaded のスロットも上書き OK (= 新しい方が確実に新しい render)
+                        *slot = subset_thumb.clone();
+                    }
+                }
+            }
             self.items = snap.saved_items;
-            self.thumbnails = snap.saved_thumbnails;
+            self.thumbnails = merged_thumbnails;
             self.visible_indices = snap.saved_visible_indices;
             self.scroll_offset_y = snap.saved_scroll_offset_y;
             self.selected = snap.saved_selected;
