@@ -34,6 +34,7 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | 入力 | 動作 |
 |---|---|
 | <kbd>Esc</kbd> | フルスクリーン解除 |
+| <kbd>Enter</kbd> | (画像) フルスクリーン解除 (Esc と同等、右手側ホームポジションからの解除キー)。グリッドで Enter / ダブルクリックで開く動作とトグル成立 / (動画) 再生・一時停止トグル |
 | <kbd>I</kbd> / <kbd>Tab</kbd> | メタデータパネル固定表示トグル (右パネル) |
 | <kbd>Space</kbd> | (画像) 選択 (チェック) トグル — スライドショー再生中なら停止 / (動画) 再生・一時停止トグル |
 | <kbd>Backspace</kbd> | 親フォルダへ → グリッドビュー |
@@ -74,7 +75,6 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>U</kbd> / <kbd>Shift</kbd>+<kbd>U</kbd> / <kbd>Alt</kbd>+<kbd>U</kbd> | AI モデル 次 / 前 / リセット |
 | <kbd>T</kbd> / <kbd>Shift</kbd>+<kbd>T</kbd> / <kbd>Alt</kbd>+<kbd>T</kbd> | ポストフィルタ 次 / 前 / 標準 (リセット) |
 | <kbd>Ctrl</kbd>+<kbd>S</kbd> | 現在画像 / アニメーション現在フレーム / ZIP 内画像 / PDF ページをキャプチャ保存フォルダへ保存 |
-| <kbd>Enter</kbd> | (動画ボタンが映る場合のみ) 外部プレイヤー |
 
 ## 消しゴムモード
 

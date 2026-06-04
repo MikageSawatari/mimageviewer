@@ -250,6 +250,27 @@ fn shift_held_via_os() -> bool {
     false
 }
 
+/// 静止画フルスクリーンで Enter キーをフルスクリーン解除トリガーとして消費すべきか
+/// 判定する純関数 (副作用ゼロ)。
+///
+/// 設計意図: 「グリッドで Enter で開く → フルスクリーンで Enter で抜ける」のトグル
+/// 動作を成立させる。Esc も同じ位置に居るので、Enter は Esc の **追加** 選択肢。
+///
+/// 除外条件 (= false を返す):
+/// - 動画モード: Enter は `handle_video_input` で「再生/一時停止」として既に消費中
+/// - IME 変換中: Enter は IME 確定キーなので奪わない
+/// - フルスクリーン context menu 表示中: メニュー側の Enter 選択操作を優先
+///
+/// サブモード (補正レイヤー/消しゴム/隠蔽/export crop) は caller 側で早期 return
+/// 済みなのでここでは判定しない (= caller の責任)。
+pub(crate) fn should_close_fullscreen_on_enter(
+    is_video_item: bool,
+    ime_active: bool,
+    context_menu_open: bool,
+) -> bool {
+    !is_video_item && !ime_active && !context_menu_open
+}
+
 /// `local_adjust_mode` 中にどのテクスチャ経路を採用するかを表す純粋な決定型。
 ///
 /// `resolve_fs_processed_texture` の補正レイヤー分岐で副作用 (OS API キー読み・
@@ -3446,6 +3467,20 @@ impl App {
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
         // 奪われないようにする
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        // 静止画フルスクリーンでは Enter も Esc と同等に「フルスクリーン解除」トリガー。
+        // グリッドで Enter (Double click 相当) → 開く、フルスクリーンで Enter → 戻る、
+        // のトグル動作を成立させる。判定は副作用ゼロの
+        // `should_close_fullscreen_on_enter` に集約 (= unit test 可能)。
+        let is_video_item = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+        let enter_consume_ok = should_close_fullscreen_on_enter(
+            is_video_item,
+            self.ime_input_active(),
+            self.fs_context_menu_idx.is_some(),
+        );
+        let enter_close = !esc
+            && enter_consume_ok
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        let esc = esc || enter_close;
         let shift_held = ctx.input(|i| i.modifiers.shift);
         // 左右キーは上下と分離して処理（RTL 反転のため）
         // Shift+矢印（スプレッドナビ）にも対応するため、修飾キーを問わず消費
@@ -10441,6 +10476,42 @@ mod tests {
             LocalAdjustPreviewAction::BypassLayer { layer_idx: 1 },
             "Ctrl+Shift bypass は show_source トグル ON より優先 (= modifier の方が一時操作で勝つ)"
         );
+    }
+
+    // ── should_close_fullscreen_on_enter unit tests ──────────────────────
+    //
+    // Enter キーを Esc と同等に「フルスクリーン解除」トリガーとして使うかを判定する
+    // 純関数の境界条件を符号化する。
+
+    /// 通常の静止画フルスクリーン中: Enter で解除する (= Esc 相当)。
+    #[test]
+    fn enter_closes_fs_for_still_image_in_normal_state() {
+        assert!(should_close_fullscreen_on_enter(false, false, false));
+    }
+
+    /// 動画モードでは Enter は「再生/停止」なので消費しない。
+    #[test]
+    fn enter_does_not_close_fs_for_video() {
+        assert!(!should_close_fullscreen_on_enter(true, false, false));
+    }
+
+    /// IME 変換中の Enter は IME 確定キーなので奪わない (= 日本語入力中の事故防止)。
+    #[test]
+    fn enter_does_not_close_fs_during_ime_composition() {
+        assert!(!should_close_fullscreen_on_enter(false, true, false));
+    }
+
+    /// フルスクリーン context menu 表示中の Enter はメニュー選択操作なので奪わない。
+    #[test]
+    fn enter_does_not_close_fs_when_context_menu_open() {
+        assert!(!should_close_fullscreen_on_enter(false, false, true));
+    }
+
+    /// 同時に複数の除外条件が成立しても (= 動画 + IME + menu)、いずれかが立てば
+    /// 解除しない。
+    #[test]
+    fn enter_close_combined_exclusions() {
+        assert!(!should_close_fullscreen_on_enter(true, true, true));
     }
 
     /// P7-3c: `preview_to_selected_layer_toggle` は **フルスクリーン非フォーカス時でも効く**。
