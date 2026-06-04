@@ -274,6 +274,15 @@ impl App {
             list_view_items,
             list_view_thumbnails,
         });
+        // ★items_generation bump + invalidate_idx_state_and_queues (= Codex P1-1):
+        // items を差し替えたので、旧 ThumbMsg / pending / keep_set / idx-keyed cache が
+        // 新 idx に着地して「サムネが化ける/消える」事故を防ぐ。`invalidate_idx_state_and_queues`
+        // は thumbnails 自体は触らないので、上で入れ替えた captured_thumbnails は維持される。
+        self.items_generation = self.items_generation.wrapping_add(1);
+        self.invalidate_idx_state_and_queues();
+        // tags_cache は invalidate 対象外なので手動 clear (= 既存 clear は冗長になるが
+        // 残しておく方が安全、二重 clear は no-op)
+        self.tags_cache.clear();
 
         let msg = if search_was_active {
             format!("検索結果をスナップショットに固定しました ({n} 件)")
@@ -340,9 +349,12 @@ impl App {
             self.visible_indices = snap.saved_visible_indices;
             self.scroll_offset_y = snap.saved_scroll_offset_y;
             self.selected = snap.saved_selected;
-            // idx-based cache を invalidate (= items 入れ替え対応)
-            self.rating_cache.clear();
-            self.rotation_cache.clear();
+            // items_generation bump + invalidate (= Codex P1-1)
+            // items を saved に戻したので、snapshot 中に走った ThumbMsg / pending が
+            // 新 idx 配置に着地して壊さないよう invalidate。merged_thumbnails は
+            // invalidate 後も保持される (= thumbnails 自体は invalidate 対象外)。
+            self.items_generation = self.items_generation.wrapping_add(1);
+            self.invalidate_idx_state_and_queues();
             self.tags_cache.clear();
         } else {
             // child folder の中で解除 → 現在の items はそのまま、snapshot state だけ捨てる
@@ -407,9 +419,9 @@ impl App {
         self.address = snap_origin.display().to_string();
         self.scroll_offset_y = 0.0;
         self.selected = None;
-        // idx-based cache を invalidate (= items 入れ替え対応)
-        self.rating_cache.clear();
-        self.rotation_cache.clear();
+        // items_generation bump + invalidate (= Codex P1-1)
+        self.items_generation = self.items_generation.wrapping_add(1);
+        self.invalidate_idx_state_and_queues();
         self.tags_cache.clear();
         self.show_feedback_toast("★固定リストに戻りました".into());
         true
