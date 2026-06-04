@@ -568,6 +568,11 @@ pub fn draw_archive_badge(painter: &egui::Painter, cell_rect: egui::Rect, label:
 ///
 /// 用途: レーティング ★ バッジなど **左下に並ぶ別オーバーレイ** を、コンテナバッジに
 /// 重ねず縦に積むときの y オフセット計算。1 バッジぶん分の高さを取りたいときに使う。
+///
+/// ⚠ **`cell_rect` 引数には `draw_*_badge` と同じ `inner` (= 外周 padding を引いた
+/// 内側 rect) を渡すこと**。outer rect を渡すと `cell.height` がわずかに大きく見えて
+/// `font_size` が `draw_*_badge` 側と乖離し、レーティング配置に 1-2 px の食い込みが
+/// 発生する (実機フィードバックで判明)。
 pub fn container_badge_height(cell_rect: egui::Rect) -> f32 {
     let font_size = (cell_rect.height() * 0.10).clamp(9.0, 16.0);
     let pad_v = font_size * 0.2;

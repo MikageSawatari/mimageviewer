@@ -27777,13 +27777,20 @@ pub(crate) fn draw_cell(
         // コンテナ系で左下バッジが描かれていれば 1 段上に積む。画像系 (Image /
         // ZipImage / PdfPage) や Folder の Pending 状態 (= ファイル名がセンター)
         // などは 0 (= 従来位置)。
+        //
+        // ★ も folder/zip/pdf/archive と同じ **inner** 基準で配置する:
+        //   - x: `inner.min.x + 3.0` で folder badge と左端が揃う (rect ベースだと 4px 左にはみ出る)
+        //   - y: `inner.max.y - bg_h - 3.0 - lift` で同じ anchor から計算
+        // lift には gap 4px を追加して、folder badge との間に視覚的に余裕を出す
+        // (実機フィードバック: container_badge_height の galley 近似 + anchor 差で
+        // 単純な `+ 2.0` だと 1-2 px 重なるため、`+ 4.0` で安全側に倒す)。
         let star_y_lift = if cell_has_lower_left_container_badge(item, thumb) {
-            crate::ui_helpers::container_badge_height(rect) + 2.0
+            crate::ui_helpers::container_badge_height(inner) + 4.0
         } else {
             0.0
         };
         let bg_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.min.x + 3.0, rect.max.y - bg_h - 3.0 - star_y_lift),
+            egui::pos2(inner.min.x + 3.0, inner.max.y - bg_h - 3.0 - star_y_lift),
             egui::vec2(bg_w, bg_h),
         );
         painter.rect_filled(
