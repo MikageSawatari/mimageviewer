@@ -14674,7 +14674,10 @@ impl App {
     /// 動画 / セパレータ / ConvertibleArchive などは常に通す。
     pub(crate) fn rebuild_visible_indices(&mut self) {
         let search_filter = self.search_filter.clone();
-        let rating_filter = self.settings.rating_filter;
+        // Codex P1-2 fix: effective_rating_filter() で ★一時解除中は [true;6] が返るので
+        // 表示は全 ON 相当になる。旧版は settings.rating_filter を書き換えて同じ効果を
+        // 出していたが、ユーザー設定が壊れる hidden mode だった。
+        let rating_filter = self.effective_rating_filter();
         // すべてのバケットが true ならレーティングフィルタは無効 (常に通す)
         let rating_filter_active = !rating_filter.iter().all(|&b| b);
 
@@ -15130,8 +15133,29 @@ impl App {
 
     /// レーティングフィルタが有効か (バケットが 1 つでも OFF なら true)。
     /// フィルタが全 ON の状態は「フィルタ未使用」として worker を動かさない。
+    ///
+    /// ⚠ Codex P1-2 fix 後: この関数は **ユーザー設定** (`settings.rating_filter`) を
+    /// 直接見る。★一時解除中は内部で effective_rating_filter() が [true;6] を返すが、
+    /// settings 自体は書き換えていないので嘘をつかない。
     pub(crate) fn rating_filter_active(&self) -> bool {
         !self.settings.rating_filter.iter().all(|&b| b)
+    }
+
+    /// 表示に使う実効フィルタ (= effective rating filter)。
+    ///
+    /// - ★一時解除中: `[true; 6]` (= 全 ON、画面表示は filter なし状態)
+    /// - それ以外: `settings.rating_filter` (= ユーザー設定そのまま)
+    ///
+    /// Codex P1-2 fix: 旧版は ★一時解除発動時に `settings.rating_filter` を直接
+    /// `[true; 6]` に書き換える hidden mode だったため、`rating_filter_active()`
+    /// が嘘をつき、自己破壊ループ等のバグを誘発していた。本関数の導入で
+    /// 「ユーザー設定」と「実効フィルタ」を完全分離。
+    pub(crate) fn effective_rating_filter(&self) -> [bool; 6] {
+        if self.rating_filter_suppressed_at.is_some() {
+            [true; 6]
+        } else {
+            self.settings.rating_filter
+        }
     }
 
     /// `maybe_suppress_rating_filter_for_opened_container` の path 版。
@@ -15164,9 +15188,12 @@ impl App {
         if s > 5 || !self.settings.rating_filter[s] {
             return;
         }
-        let saved = self.settings.rating_filter;
+        // Codex P1-2 fix: settings.rating_filter は書き換えない。
+        // effective_rating_filter() が rating_filter_suppressed_at の有無で
+        // [true;6] / settings 値を返し分ける。
+        let saved = self.settings.rating_filter; // 互換性のため field に残す (= 未使用)
         self.rating_filter_suppressed_at = Some((anchor.to_path_buf(), saved));
-        self.settings.rating_filter = [true; 6];
+        self.show_feedback_toast("★フィルタ一時解除中 (親へ戻ると復元)".to_string());
     }
 
     /// 「自身に★が付いたコンテナ (Folder / ZIP / PDF) を開く」操作時に呼ぶ。
@@ -15207,10 +15234,10 @@ impl App {
             // 見なしてフィルタは保持する。
             return;
         }
-        let saved = self.settings.rating_filter;
+        // Codex P1-2 fix: settings.rating_filter は書き換えない (= ユーザー設定を保持)。
+        // 表示は effective_rating_filter() が suppress 状態を見て [true;6] / settings を切替。
+        let saved = self.settings.rating_filter; // 互換性のため field に残す (= 未使用)
         self.rating_filter_suppressed_at = Some((anchor, saved));
-        self.settings.rating_filter = [true; 6];
-        // settings.save() は呼ばない (in-memory のみ、永続化は saved のまま維持)。
         self.show_feedback_toast("★フィルタ一時解除中 (親へ戻ると復元)".to_string());
     }
 
@@ -15221,43 +15248,29 @@ impl App {
     /// 3. fall through (= suppress なし) で現在 folder の★を見て suppress 発動可否を判定
     ///
     /// これにより Ctrl+↑↓ / Ctrl+PageUp/Down で別の★付き folder に移動した際にも
-    /// 自動的に ★一時解除 が発動する。旧版は subtree 外 restore のみで、移動先で
-    /// 改めて発動する経路が無かった (= Enter / double-click 経由でのみ発動)。
+    /// 自動的に ★一時解除 が発動する。
     ///
     /// 関数名は互換性のため維持 (= 呼び出し元: load_folder_with_scan 末尾)。
     ///
-    /// ⚠ filter active 判定の注意: suppress 中は `settings.rating_filter` が
-    /// `[true; 6]` (= 全 ON) に書き換えられているため `rating_filter_active()` は
-    /// false を返す。suppress の有無で active 判定先を切り替える必要がある
-    /// (= suppress 中は saved を見る、無ければ現 filter を見る)。これを混同すると
-    /// 自己破壊ループ (= suppress 即時 restore → 再発動 → 即時 restore...) になる。
+    /// Codex P1-2 fix 後: settings.rating_filter は書き換えないので、active 判定は
+    /// 直接 rating_filter_active() を見れば良い (= 旧版の自己破壊ループ回避が不要に)。
     pub(crate) fn maybe_restore_rating_filter_if_out_of_scope(&mut self) {
         let Some(current) = self.effective_folder() else {
             // 現在フォルダが取れない状態 (起動直後など) は触らない
             return;
         };
-        // 既に suppress 中の処理 (= saved を見て active 判定)
-        if let Some((anchor, saved)) = self.rating_filter_suppressed_at.as_ref() {
-            // saved が all true なら元々 filter なし → suppress 不要、restore
-            let saved_active = saved.iter().any(|&b| !b);
-            if !saved_active {
-                self.restore_rating_filter_suppression();
-                return;
-            }
-            // saved active: anchor の subtree 内なら維持
+        // 既に suppress 中: anchor の subtree 内なら維持、外なら一旦 restore
+        if let Some((anchor, _)) = self.rating_filter_suppressed_at.as_ref() {
             let anchor_owned = anchor.clone(); // immutable borrow を切る
             if path_in_subtree_ci(&current, &anchor_owned) {
                 return;
             }
-            // subtree 外 → restore してから再評価 (= 下の maybe_suppress を呼ぶ)
+            // subtree 外 → restore してから再評価
             self.restore_rating_filter_suppression();
-            // 注意: restore 後の rating_filter は saved 値 (= active) に戻っている。
-            // 次の maybe_suppress 内の `rating_filter_active()` チェックも通る。
-        } else {
-            // suppress なし: 現 filter が inactive なら suppress 発動も不要
-            if !self.rating_filter_active() {
-                return;
-            }
+        }
+        // suppress なし状態で再評価: rating_filter_active なら現在 folder の★で発動可否判定
+        if !self.rating_filter_active() {
+            return;
         }
         // 現在 folder の★を見て suppress を発動可否判定 (= 既存 helper を再利用)。
         // 発動条件: folder 自身に★が付いている + その★が現在 filter で通る
@@ -15271,10 +15284,10 @@ impl App {
     /// `maybe_restore_rating_filter_if_out_of_scope` (scope 外自動復元) と
     /// toolbar の「★一時解除中」バッジクリック (即時復元) の両方から使う。
     pub(crate) fn restore_rating_filter_suppression(&mut self) -> bool {
-        if let Some((_, saved)) = self.rating_filter_suppressed_at.take() {
-            self.settings.rating_filter = saved;
-            // save() は呼ばない: suppression 中の書き換えも in-memory のみだったため、
-            // 復元は単に元の saved 値に戻すだけで永続化する必要がない。
+        if self.rating_filter_suppressed_at.take().is_some() {
+            // Codex P1-2 fix: settings.rating_filter は書き換えていないので復元不要。
+            // suppressed_at = None になった時点で effective_rating_filter() が
+            // settings 値を返すようになる。
             true
         } else {
             false
@@ -15388,7 +15401,9 @@ impl App {
             _ => return None,
         };
         let key = crate::adjustment_db::normalize_path(path);
-        let rf = &self.settings.rating_filter;
+        // Codex P1-2 fix: effective filter で ★一時解除中の表示に整合させる
+        let rf_owned = self.effective_rating_filter();
+        let rf = &rf_owned;
         // 合成 drilled view (検索結果一覧そのもの) のときだけ search_drilled_folder_counts
         // を参照する。Ctrl+G 経由で実フォルダ/ZIP/PDF を開いた実体ビューでは
         // items_are_global_search_view=false になっており、items は実体側の中身なので

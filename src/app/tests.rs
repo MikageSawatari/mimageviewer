@@ -2124,9 +2124,19 @@ mod phase_c_drill_nav_tests {
             Some(folder),
             "★5 コンテナを開いたら suppression anchor が設定される"
         );
+        // Codex P1-2 fix 後: settings.rating_filter はユーザー設定そのまま (= 書き換え無し)、
+        // effective_rating_filter() が suppression 状態を見て [true;6] を返す。
         assert_eq!(
-            app.settings.rating_filter, [true; 6],
-            "suppression 起動中は filter が全 ON"
+            app.effective_rating_filter(),
+            [true; 6],
+            "suppression 起動中は effective filter が全 ON"
+        );
+        // settings 自体は元の filter (= ★5 ON) を保持
+        let mut expected_settings = [false; 6];
+        expected_settings[5] = true;
+        assert_eq!(
+            app.settings.rating_filter, expected_settings,
+            "suppression 中も settings.rating_filter は元の値を保持 (= P1-2 fix)"
         );
     }
 
