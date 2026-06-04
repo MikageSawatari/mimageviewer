@@ -761,7 +761,10 @@ impl App {
         // ※ ZIP/PDF は async enumerate なので、items は ZipSeparator のみで埋まっている可能性が
         //   ある。その場合は次フレーム以降の enumerate 完了で deferred reopen される (MVP として
         //   sync 経路のみ対応、ZIP/PDF への snapshot navigation は実機確認で評価)。
-        if was_fs || resume_slideshow {
+        // Codex 4th P2 fix: `target.is_some()` も open 条件に含める。grid 経路の
+        // snapshot leaf navigation (= was_fs=false, resume_slideshow=false) でも、
+        // target で指定された画像/動画/ZipImage/PdfPage を fullscreen で開くように。
+        if was_fs || resume_slideshow || target.is_some() {
             use crate::grid_item::GridItem;
             use crate::snapshot::SnapshotTarget;
             let target_idx: Option<usize> = match target.as_ref() {
