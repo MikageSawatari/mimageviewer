@@ -1663,14 +1663,16 @@ impl App {
         let embedded = false;
         let main_ctx = ctx;
         #[cfg(windows)]
-        if embedded && self.fs_viewport_shown {
-            // 万一 viewport モードから embedded へ切り替わったら、残った
-            // フルスクリーン viewport を隠してから embedded 描画へ移る。
-            self.hide_native_video_black_backdrop_if_shown(ctx);
-        }
-        let fs_builder = self.build_fullscreen_viewport_builder();
+        let hide_viewport_after_embedded_paint = embedded && self.fs_viewport_shown;
+        let mut fs_builder = self.build_fullscreen_viewport_builder();
         let fs_id = self.fullscreen_viewport_id();
         let need_show = !self.fs_viewport_shown;
+        if need_show && !embedded {
+            // 新規 viewport は hidden で作り、DWM transition 抑止属性を当ててから
+            // Visible(true) にする。初期 white client と最大化アニメーションの露出を
+            // 動画 backdrop と同じ手順で避ける。
+            fs_builder = fs_builder.with_visible(false);
+        }
         let fs_viewport_t0 = std::time::Instant::now();
         let mut fs_setup_ms = 0.0_f64;
         let mut fs_input_ms = 0.0_f64;
@@ -1701,6 +1703,8 @@ impl App {
                 if need_show && !embedded {
                     // embedded のときは専用 viewport を作らないので Visible/Focus は
                     // 送らない (main ウィンドウは既に表示・フォーカス済み)。
+                    #[cfg(windows)]
+                    crate::dwm_transitions::disable_transitions_for_thread_windows();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
@@ -2582,6 +2586,12 @@ impl App {
             if embedded {
                 // in-window 静止画: メインウィンドウの egui ctx に直接描画する。
                 render_fs_body(main_ctx, true);
+                #[cfg(windows)]
+                if hide_viewport_after_embedded_paint {
+                    // 先に main 側へ画像を描いてから古い専用 viewport を隠す。
+                    // これで背面の一覧が DWM に露出する隙間を作らない。
+                    self.hide_native_video_black_backdrop_if_shown(main_ctx);
+                }
             } else {
                 // 従来: 専用フルスクリーン viewport を出してそこに描画する。
                 main_ctx.show_viewport_immediate(fs_id, fs_builder, |vp_ctx, _class| {
@@ -9172,7 +9182,8 @@ impl App {
                 ui.add_space(6.0);
                 ui.label("出力サイズ");
                 let base_size = state.pixels.render_size();
-                ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
                     for scale in crate::export_dialog::ExportScale::ALL {
                         let [w, h] = scale.scaled_size(base_size);
                         ui.radio_value(

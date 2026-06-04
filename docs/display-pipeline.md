@@ -160,7 +160,9 @@ ui_fullscreen.rs::render_fullscreen_viewport
 **`keep_fullscreen_viewport_alive`** はフルスクリーン非アクティブ時 (`fullscreen_idx == None`)
 に呼ばれ、`fs_viewport_shown == true` の 1 フレームだけ `Visible(false)` cmd を送って hidden 化
 する責務を持つ。それ以外のアイドルでは何もしない (2026-05-10、hidden viewport 維持コスト削減)。
-代償として `close_fullscreen` 後の再入場で 1x1 → フルサイズの DWM 遷移フラッシュが毎回出る。
+再入場時は `render_fullscreen_viewport` が新規 viewport を hidden で作成し、DWM transition
+抑止属性を適用してから `Visible(true)` にする。アイドル時の hidden viewport 維持コストを
+戻さずに、初期 white client / サイズ遷移フラッシュを抑える。
 詳細は [docs/ui-responsiveness.md §9](ui-responsiveness.md) を参照。
 
 フルスクリーンの先読み対象は、`items` 全体ではなく `visible_indices` 由来の display list から

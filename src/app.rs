@@ -359,6 +359,10 @@ pub(crate) enum LocalAdjustCanvasDragKind {
     RadialGradientOuterX,
     RadialGradientOuterY,
     EffectCenter,
+    EffectLinearGradientStart,
+    EffectLinearGradientEnd,
+    EffectRadialGradientCenter,
+    EffectRadialGradientRadius,
     TiltShiftRange,
     TiltShiftFocus,
     TiltShiftOuter,
@@ -25225,7 +25229,7 @@ impl eframe::App for App {
         // (描画後だと handle_fs_navigation の close で fullscreen_idx が None になり
         //  判定が崩れるため、呼び出し直前にキャプチャする)。
         #[cfg(windows)]
-        let embedded_fs_active = self.fullscreen_embedded_still_active();
+        let embedded_fs_active_before_render = self.fullscreen_embedded_still_active();
         // PDF/ZIP enumerate defer 中は fullscreen_idx = None でも in-window 用 holdover
         // を main ctx に描いているので、続くグリッド描画は同じく抑止する必要がある
         // (両方の CentralPanel が走ると二重描画 + 白フラッシュ)。
@@ -25234,6 +25238,9 @@ impl eframe::App for App {
             self.native_video_in_window_active && self.fs_nav_after_pdf_enumerate.is_some();
         self.render_fullscreen_viewport(ctx);
         let t_render_fullscreen_viewport = frame_t0.elapsed();
+        #[cfg(windows)]
+        let embedded_fs_active =
+            embedded_fs_active_before_render || self.fullscreen_embedded_still_active();
         #[cfg(windows)]
         self.ensure_native_video_front();
         #[cfg(windows)]

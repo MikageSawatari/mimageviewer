@@ -1568,6 +1568,7 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn toggle_still_window_mode(&mut self) {
         let in_window = !self.settings.video_in_window_mode;
+        crate::dwm_transitions::disable_transitions_for_thread_windows();
         self.settings.video_in_window_mode = in_window;
         self.native_video_in_window_active = in_window;
         self.settings.save();

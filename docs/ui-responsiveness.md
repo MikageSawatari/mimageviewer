@@ -382,10 +382,16 @@ perf log では `fullscreen_viewport_ms` が 30-70ms/frame を占めており、
 非アクティブ時には呼ばないこと。終了直後 1 フレームだけ `Visible(false)` cmd 送信用に
 show_viewport_immediate を呼ぶ用法は OK。
 
-代償: `close_fullscreen` 後の再入場時に 1x1 → フルサイズの DWM 遷移フラッシュが毎回出る
-(`fs_viewport_recreate_after_hide` で generation が進み新しい ViewportId になるため)。
-実機で許容できないと判定された場合は、フルスクリーン終了後 N 秒は keep_alive を維持する
-grace 期間を別途追加する。
+再入場時のちらつき対策は、アイドル時 keep_alive ではなく表示直前の hidden 生成で行う。
+`render_fullscreen_viewport` は新規 viewport を `with_visible(false)` で作成し、作成後に
+`DWMWA_TRANSITIONS_FORCEDISABLED` を適用してから `Visible(true)` を送る。これにより
+1x1 → フルサイズの DWM 遷移や初期 white client の露出を抑えつつ、非アクティブ時の
+viewport 維持コストを戻さない。
+
+静止画の F11 ウィンドウ内表示切替では、`render_fullscreen_viewport` の実行中に
+`native_video_in_window_active` が反転する。`App::update` は render 前後の embedded 判定を
+OR してグリッド描画を抑止し、viewport → embedded では main 側へ画像を描いてから古い
+fullscreen viewport を hidden にする。これにより背面の一覧が一瞬露出するのを避ける。
 
 **関連ルール**: `keep_fullscreen_viewport_alive` 実行後に `close_fullscreen` する経路で、
 同フレーム内に fullscreen を再 open しない場合は明示的に `ctx.request_repaint()` を呼ぶ。

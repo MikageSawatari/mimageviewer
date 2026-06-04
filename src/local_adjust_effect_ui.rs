@@ -20,7 +20,26 @@ fn lab_combo_box<R>(
     ComboBox::from_id_salt(id_salt)
         .selected_text(selected_text)
         .height(420.0)
-        .show_ui(ui, add_contents)
+        .show_ui(ui, |ui| {
+            apply_local_adjust_dark_ui(ui);
+            add_contents(ui)
+        })
+}
+
+fn local_adjust_dark_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.override_text_color = Some(egui::Color32::WHITE);
+    visuals.window_fill = egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    visuals
+}
+
+fn apply_local_adjust_dark_ui(ui: &mut egui::Ui) {
+    ui.ctx().set_theme(egui::ThemePreference::Dark);
+    let mut style = (*ui.ctx().style()).clone();
+    style.visuals = local_adjust_dark_visuals();
+    ui.ctx().set_style(style);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8772,9 +8791,12 @@ pub(crate) fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.amount, 0.0..=1.0).text("量"))
                 .changed();
             let previous_distribution = params.distribution;
-            ComboBox::from_label("分布")
-                .selected_text(noise_distribution_label(params.distribution))
-                .show_ui(ui, |ui| {
+            ui.label("分布");
+            lab_combo_box(
+                ui,
+                "noise_distribution",
+                noise_distribution_label(params.distribution),
+                |ui| {
                     ui.selectable_value(
                         &mut params.distribution,
                         NoiseDistribution::Uniform,
@@ -8785,7 +8807,8 @@ pub(crate) fn draw_effect_params(
                         NoiseDistribution::Gaussian,
                         "ガウス",
                     );
-                });
+                },
+            );
             changed |= params.distribution != previous_distribution;
             changed |= ui.checkbox(&mut params.monochrome, "単色ノイズ").changed();
             let mut seed = params.seed as i32;
@@ -8873,9 +8896,12 @@ pub(crate) fn draw_effect_params(
             );
             let mut activates_effect = false;
             let previous_mode = params.mode;
-            ComboBox::from_label("方式")
-                .selected_text(anaglyph_mode_label(params.mode))
-                .show_ui(ui, |ui| {
+            ui.label("方式");
+            lab_combo_box(
+                ui,
+                "anaglyph_mode",
+                anaglyph_mode_label(params.mode),
+                |ui| {
                     ui.selectable_value(
                         &mut params.mode,
                         AnaglyphMode::RedCyan,
@@ -8896,7 +8922,8 @@ pub(crate) fn draw_effect_params(
                         AnaglyphMode::RgbSplit,
                         anaglyph_mode_label(AnaglyphMode::RgbSplit),
                     );
-                });
+                },
+            );
             if params.mode != previous_mode {
                 changed = true;
                 activates_effect = true;
@@ -9410,9 +9437,12 @@ pub(crate) fn draw_effect_params(
             );
 
             let previous_direction = params.direction;
-            ComboBox::from_label("方向")
-                .selected_text(pixel_sort_direction_label(params.direction))
-                .show_ui(ui, |ui| {
+            ui.label("方向");
+            lab_combo_box(
+                ui,
+                "pixel_sort_direction",
+                pixel_sort_direction_label(params.direction),
+                |ui| {
                     ui.selectable_value(
                         &mut params.direction,
                         PixelSortDirection::Horizontal,
@@ -9423,13 +9453,17 @@ pub(crate) fn draw_effect_params(
                         PixelSortDirection::Vertical,
                         "縦方向",
                     );
-                });
+                },
+            );
             changed |= params.direction != previous_direction;
 
             let previous_order = params.order;
-            ComboBox::from_label("並び順")
-                .selected_text(pixel_sort_order_label(params.order))
-                .show_ui(ui, |ui| {
+            ui.label("並び順");
+            lab_combo_box(
+                ui,
+                "pixel_sort_order",
+                pixel_sort_order_label(params.order),
+                |ui| {
                     ui.selectable_value(
                         &mut params.order,
                         PixelSortOrder::LightToDark,
@@ -9440,7 +9474,8 @@ pub(crate) fn draw_effect_params(
                         PixelSortOrder::DarkToLight,
                         "暗い→明るい",
                     );
-                });
+                },
+            );
             changed |= params.order != previous_order;
 
             changed |= ui

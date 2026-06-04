@@ -77,6 +77,7 @@ fn with_local_adjust_dark_window_style<R>(
     add_contents: impl FnOnce() -> R,
 ) -> R {
     let previous_style = (*ctx.style()).clone();
+    let previous_theme = ctx.options(|opt| opt.theme_preference);
     let mut dark_style = previous_style.clone();
     dark_style.visuals = egui::Visuals::dark();
     dark_style.visuals.override_text_color = Some(egui::Color32::WHITE);
@@ -84,8 +85,10 @@ fn with_local_adjust_dark_window_style<R>(
     dark_style.visuals.widgets.noninteractive.fg_stroke =
         egui::Stroke::new(1.0, egui::Color32::WHITE);
     dark_style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    ctx.set_theme(egui::ThemePreference::Dark);
     ctx.set_style(dark_style);
     let result = add_contents();
+    ctx.set_theme(previous_theme);
     ctx.set_style(previous_style);
     result
 }
@@ -546,6 +549,81 @@ mod local_adjust_segmentation_tests {
                 None
             ),
             Some(crate::app::LocalAdjustCanvasDragKind::RadialGradientCenter)
+        );
+    }
+
+    #[test]
+    fn effect_linear_gradient_handle_hit_uses_angle_points() {
+        let effect =
+            local_adjust_core::LocalEffect::ColorOverlay(local_adjust_core::ColorOverlayParams {
+                shape: local_adjust_core::ColorOverlayShape::Linear,
+                angle_degrees: 0.0,
+                linear_points_enabled: false,
+                ..Default::default()
+            });
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        assert_eq!(
+            local_adjust_effect_gradient_handle_hit(&effect, egui::pos2(100.0, 50.0), rect),
+            Some(crate::app::LocalAdjustCanvasDragKind::EffectLinearGradientEnd)
+        );
+        assert_eq!(
+            local_adjust_effect_gradient_handle_hit(&effect, egui::pos2(0.0, 50.0), rect),
+            Some(crate::app::LocalAdjustCanvasDragKind::EffectLinearGradientStart)
+        );
+    }
+
+    #[test]
+    fn effect_linear_gradient_drag_enables_custom_points() {
+        let mut effect =
+            local_adjust_core::LocalEffect::ColorFill(local_adjust_core::ColorFillParams {
+                shape: local_adjust_core::ColorOverlayShape::Linear,
+                ..Default::default()
+            });
+        assert!(apply_local_adjust_effect_gradient_handle_drag(
+            &mut effect,
+            crate::app::LocalAdjustCanvasDragKind::EffectLinearGradientEnd,
+            [0.75, 0.25],
+        ));
+        let local_adjust_core::LocalEffect::ColorFill(params) = effect else {
+            panic!("expected color fill effect");
+        };
+        assert!(params.linear_points_enabled);
+        assert_eq!(params.linear_end, [0.75, 0.25]);
+    }
+
+    #[test]
+    fn effect_radial_gradient_radius_drag_updates_radius() {
+        let mut effect =
+            local_adjust_core::LocalEffect::ColorOverlay(local_adjust_core::ColorOverlayParams {
+                shape: local_adjust_core::ColorOverlayShape::Radial,
+                center: [0.5, 0.5],
+                radius: 0.2,
+                ..Default::default()
+            });
+        assert!(apply_local_adjust_effect_gradient_handle_drag(
+            &mut effect,
+            crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientRadius,
+            [0.8, 0.5],
+        ));
+        let local_adjust_core::LocalEffect::ColorOverlay(params) = effect else {
+            panic!("expected color overlay effect");
+        };
+        assert!((params.radius - 0.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn effect_radial_gradient_handle_hit_allows_large_radius() {
+        let effect =
+            local_adjust_core::LocalEffect::ColorOverlay(local_adjust_core::ColorOverlayParams {
+                shape: local_adjust_core::ColorOverlayShape::Radial,
+                center: [0.5, 0.5],
+                radius: 0.9,
+                ..Default::default()
+            });
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        assert_eq!(
+            local_adjust_effect_gradient_handle_hit(&effect, egui::pos2(140.0, 50.0), rect),
+            Some(crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientRadius)
         );
     }
 
@@ -2492,6 +2570,19 @@ fn local_adjust_screen_to_norm(
     ])
 }
 
+fn local_adjust_screen_to_norm_unclamped(
+    screen: egui::Pos2,
+    image_rect: egui::Rect,
+    image_dims: (usize, usize),
+    zoom_pan: Option<(f32, egui::Vec2)>,
+) -> Option<[f32; 2]> {
+    let (_, rect) = local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
+    Some([
+        (screen.x - rect.left()) / rect.width(),
+        (screen.y - rect.top()) / rect.height(),
+    ])
+}
+
 fn local_adjust_norm_to_screen(
     norm: [f32; 2],
     image_rect: egui::Rect,
@@ -4296,6 +4387,262 @@ fn local_adjust_effect_center(
     }
 }
 
+#[derive(Clone, Copy)]
+struct LocalAdjustColorGradientGeometry {
+    shape: local_adjust_core::ColorOverlayShape,
+    angle_degrees: f32,
+    linear_points_enabled: bool,
+    linear_start: [f32; 2],
+    linear_end: [f32; 2],
+    center: [f32; 2],
+    radius: f32,
+}
+
+fn local_adjust_linear_points_from_angle(angle_degrees: f32) -> ([f32; 2], [f32; 2]) {
+    let angle = angle_degrees.to_radians();
+    let dx = angle.cos();
+    let dy = angle.sin();
+    let tx = if dx.abs() <= f32::EPSILON {
+        f32::INFINITY
+    } else {
+        0.5 / dx.abs()
+    };
+    let ty = if dy.abs() <= f32::EPSILON {
+        f32::INFINITY
+    } else {
+        0.5 / dy.abs()
+    };
+    let t = tx.min(ty).max(0.001);
+    (
+        [
+            (0.5 - dx * t).clamp(0.0, 1.0),
+            (0.5 - dy * t).clamp(0.0, 1.0),
+        ],
+        [
+            (0.5 + dx * t).clamp(0.0, 1.0),
+            (0.5 + dy * t).clamp(0.0, 1.0),
+        ],
+    )
+}
+
+fn local_adjust_angle_from_linear_points(start: [f32; 2], end: [f32; 2]) -> Option<f32> {
+    let dx = end[0] - start[0];
+    let dy = end[1] - start[1];
+    if dx * dx + dy * dy <= 0.000001 {
+        None
+    } else {
+        Some(dy.atan2(dx).to_degrees())
+    }
+}
+
+fn local_adjust_color_fill_gradient_geometry(
+    params: &local_adjust_core::ColorFillParams,
+) -> LocalAdjustColorGradientGeometry {
+    LocalAdjustColorGradientGeometry {
+        shape: params.shape,
+        angle_degrees: params.angle_degrees,
+        linear_points_enabled: params.linear_points_enabled,
+        linear_start: params.linear_start,
+        linear_end: params.linear_end,
+        center: params.center,
+        radius: params.radius,
+    }
+}
+
+fn local_adjust_apply_color_fill_gradient_geometry(
+    params: &mut local_adjust_core::ColorFillParams,
+    geometry: LocalAdjustColorGradientGeometry,
+) {
+    params.angle_degrees = geometry.angle_degrees;
+    params.linear_points_enabled = geometry.linear_points_enabled;
+    params.linear_start = geometry.linear_start;
+    params.linear_end = geometry.linear_end;
+    params.center = geometry.center;
+    params.radius = geometry.radius;
+}
+
+fn local_adjust_color_overlay_gradient_geometry(
+    params: &local_adjust_core::ColorOverlayParams,
+) -> LocalAdjustColorGradientGeometry {
+    LocalAdjustColorGradientGeometry {
+        shape: params.shape,
+        angle_degrees: params.angle_degrees,
+        linear_points_enabled: params.linear_points_enabled,
+        linear_start: params.linear_start,
+        linear_end: params.linear_end,
+        center: params.center,
+        radius: params.radius,
+    }
+}
+
+fn local_adjust_apply_color_overlay_gradient_geometry(
+    params: &mut local_adjust_core::ColorOverlayParams,
+    geometry: LocalAdjustColorGradientGeometry,
+) {
+    params.angle_degrees = geometry.angle_degrees;
+    params.linear_points_enabled = geometry.linear_points_enabled;
+    params.linear_start = geometry.linear_start;
+    params.linear_end = geometry.linear_end;
+    params.center = geometry.center;
+    params.radius = geometry.radius;
+}
+
+fn local_adjust_effect_gradient_geometry(
+    effect: &local_adjust_core::LocalEffect,
+) -> Option<LocalAdjustColorGradientGeometry> {
+    match effect {
+        local_adjust_core::LocalEffect::ColorFill(params) => {
+            Some(local_adjust_color_fill_gradient_geometry(params))
+        }
+        local_adjust_core::LocalEffect::ColorOverlay(params) => {
+            Some(local_adjust_color_overlay_gradient_geometry(params))
+        }
+        _ => None,
+    }
+}
+
+fn local_adjust_apply_effect_gradient_geometry(
+    effect: &mut local_adjust_core::LocalEffect,
+    geometry: LocalAdjustColorGradientGeometry,
+) -> bool {
+    match effect {
+        local_adjust_core::LocalEffect::ColorFill(params) => {
+            if params.shape != geometry.shape {
+                return false;
+            }
+            local_adjust_apply_color_fill_gradient_geometry(params, geometry);
+            true
+        }
+        local_adjust_core::LocalEffect::ColorOverlay(params) => {
+            if params.shape != geometry.shape {
+                return false;
+            }
+            local_adjust_apply_color_overlay_gradient_geometry(params, geometry);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn local_adjust_color_gradient_linear_points(
+    geometry: LocalAdjustColorGradientGeometry,
+) -> ([f32; 2], [f32; 2]) {
+    if geometry.linear_points_enabled {
+        (geometry.linear_start, geometry.linear_end)
+    } else {
+        local_adjust_linear_points_from_angle(geometry.angle_degrees)
+    }
+}
+
+fn local_adjust_set_color_gradient_linear_points(
+    geometry: &mut LocalAdjustColorGradientGeometry,
+    start: [f32; 2],
+    end: [f32; 2],
+) {
+    geometry.linear_points_enabled = true;
+    geometry.linear_start = [start[0].clamp(0.0, 1.0), start[1].clamp(0.0, 1.0)];
+    geometry.linear_end = [end[0].clamp(0.0, 1.0), end[1].clamp(0.0, 1.0)];
+    if let Some(angle) =
+        local_adjust_angle_from_linear_points(geometry.linear_start, geometry.linear_end)
+    {
+        geometry.angle_degrees = angle;
+    }
+}
+
+fn local_adjust_effect_gradient_handle_positions(
+    effect: &local_adjust_core::LocalEffect,
+    rect: egui::Rect,
+) -> Vec<(crate::app::LocalAdjustCanvasDragKind, egui::Pos2)> {
+    let Some(geometry) = local_adjust_effect_gradient_geometry(effect) else {
+        return Vec::new();
+    };
+    match geometry.shape {
+        local_adjust_core::ColorOverlayShape::Linear => {
+            let (start, end) = local_adjust_color_gradient_linear_points(geometry);
+            vec![
+                (
+                    crate::app::LocalAdjustCanvasDragKind::EffectLinearGradientEnd,
+                    local_adjust_drawn_norm_to_screen(rect, end),
+                ),
+                (
+                    crate::app::LocalAdjustCanvasDragKind::EffectLinearGradientStart,
+                    local_adjust_drawn_norm_to_screen(rect, start),
+                ),
+            ]
+        }
+        local_adjust_core::ColorOverlayShape::Radial => {
+            let center = local_adjust_drawn_norm_to_screen(rect, geometry.center);
+            let radius = geometry.radius.clamp(0.02, 2.0);
+            let radius_handle = egui::pos2(center.x + radius * rect.width(), center.y);
+            vec![
+                (
+                    crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientRadius,
+                    radius_handle,
+                ),
+                (
+                    crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientCenter,
+                    center,
+                ),
+            ]
+        }
+        local_adjust_core::ColorOverlayShape::Unselected
+        | local_adjust_core::ColorOverlayShape::Solid => Vec::new(),
+    }
+}
+
+fn local_adjust_effect_gradient_handle_hit(
+    effect: &local_adjust_core::LocalEffect,
+    pos: egui::Pos2,
+    drawn_rect: egui::Rect,
+) -> Option<crate::app::LocalAdjustCanvasDragKind> {
+    const HIT_RADIUS: f32 = 15.0;
+    local_adjust_effect_gradient_handle_positions(effect, drawn_rect)
+        .into_iter()
+        .find_map(|(kind, handle)| (handle.distance(pos) <= HIT_RADIUS).then_some(kind))
+}
+
+fn apply_local_adjust_effect_gradient_handle_drag(
+    effect: &mut local_adjust_core::LocalEffect,
+    kind: crate::app::LocalAdjustCanvasDragKind,
+    norm: [f32; 2],
+) -> bool {
+    let Some(mut geometry) = local_adjust_effect_gradient_geometry(effect) else {
+        return false;
+    };
+    match (geometry.shape, kind) {
+        (
+            local_adjust_core::ColorOverlayShape::Linear,
+            crate::app::LocalAdjustCanvasDragKind::EffectLinearGradientStart,
+        ) => {
+            let (_, end) = local_adjust_color_gradient_linear_points(geometry);
+            local_adjust_set_color_gradient_linear_points(&mut geometry, norm, end);
+        }
+        (
+            local_adjust_core::ColorOverlayShape::Linear,
+            crate::app::LocalAdjustCanvasDragKind::EffectLinearGradientEnd,
+        ) => {
+            let (start, _) = local_adjust_color_gradient_linear_points(geometry);
+            local_adjust_set_color_gradient_linear_points(&mut geometry, start, norm);
+        }
+        (
+            local_adjust_core::ColorOverlayShape::Radial,
+            crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientCenter,
+        ) => {
+            geometry.center = [norm[0].clamp(0.0, 1.0), norm[1].clamp(0.0, 1.0)];
+        }
+        (
+            local_adjust_core::ColorOverlayShape::Radial,
+            crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientRadius,
+        ) => {
+            let dx = norm[0] - geometry.center[0];
+            let dy = norm[1] - geometry.center[1];
+            geometry.radius = (dx * dx + dy * dy).sqrt().clamp(0.02, 2.0);
+        }
+        _ => return false,
+    }
+    local_adjust_apply_effect_gradient_geometry(effect, geometry)
+}
+
 fn draw_local_adjust_effect_center_marker(
     painter: &egui::Painter,
     center: egui::Pos2,
@@ -4347,6 +4694,52 @@ fn draw_local_adjust_effect_source_radius(
     };
     if radius > 1.5 {
         painter.circle_stroke(center, radius, egui::Stroke::new(1.0, color));
+    }
+}
+
+fn draw_local_adjust_effect_gradient_overlay(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    effect: &local_adjust_core::LocalEffect,
+) {
+    let Some(geometry) = local_adjust_effect_gradient_geometry(effect) else {
+        return;
+    };
+    let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(120, 220, 255));
+    let soft_stroke = egui::Stroke::new(
+        1.0,
+        egui::Color32::from_rgba_unmultiplied(120, 220, 255, 110),
+    );
+    let start_fill = egui::Color32::from_rgb(215, 250, 255);
+    let end_fill = egui::Color32::from_rgb(120, 220, 255);
+    let handle_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(10, 30, 36));
+
+    match geometry.shape {
+        local_adjust_core::ColorOverlayShape::Linear => {
+            let (start, end) = local_adjust_color_gradient_linear_points(geometry);
+            let start_screen = local_adjust_drawn_norm_to_screen(rect, start);
+            let end_screen = local_adjust_drawn_norm_to_screen(rect, end);
+            painter.line_segment([start_screen, end_screen], stroke);
+            painter.circle_filled(start_screen, 6.0, start_fill);
+            painter.circle_stroke(start_screen, 6.0, handle_stroke);
+            painter.circle_filled(end_screen, 6.0, end_fill);
+            painter.circle_stroke(end_screen, 6.0, handle_stroke);
+        }
+        local_adjust_core::ColorOverlayShape::Radial => {
+            let center = local_adjust_drawn_norm_to_screen(rect, geometry.center);
+            let radius = geometry.radius.clamp(0.02, 2.0);
+            let radius_x = radius * rect.width();
+            let radius_y = radius * rect.height();
+            let radius_handle = egui::pos2(center.x + radius_x, center.y);
+            draw_local_adjust_ellipse_stroke(painter, center, radius_x, radius_y, stroke);
+            painter.line_segment([center, radius_handle], soft_stroke);
+            painter.circle_filled(center, 6.0, start_fill);
+            painter.circle_stroke(center, 6.0, handle_stroke);
+            painter.circle_filled(radius_handle, 6.0, end_fill);
+            painter.circle_stroke(radius_handle, 6.0, handle_stroke);
+        }
+        local_adjust_core::ColorOverlayShape::Unselected
+        | local_adjust_core::ColorOverlayShape::Solid => {}
     }
 }
 
@@ -4498,6 +4891,10 @@ fn draw_local_adjust_effect_position_overlay(
 ) {
     let source_px_scale = local_adjust_screen_px_per_source_px(rect, image_dims);
     match effect {
+        local_adjust_core::LocalEffect::ColorFill(_)
+        | local_adjust_core::LocalEffect::ColorOverlay(_) => {
+            draw_local_adjust_effect_gradient_overlay(painter, rect, effect);
+        }
         local_adjust_core::LocalEffect::TiltShift(params) => {
             draw_local_adjust_tilt_shift_overlay(painter, rect, *params);
         }
@@ -7083,6 +7480,17 @@ impl App {
                         .max(mask.inner_radius_y + 0.001);
                     true
                 }
+                (
+                    _,
+                    crate::app::LocalAdjustCanvasDragKind::EffectLinearGradientStart
+                    | crate::app::LocalAdjustCanvasDragKind::EffectLinearGradientEnd
+                    | crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientCenter
+                    | crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientRadius,
+                ) => apply_local_adjust_effect_gradient_handle_drag(
+                    &mut layer.effect,
+                    drag.kind,
+                    norm,
+                ),
                 (_, crate::app::LocalAdjustCanvasDragKind::EffectCenter) => {
                     let Some((center, _)) = local_adjust_effect_center_mut(&mut layer.effect)
                     else {
@@ -7711,8 +8119,13 @@ impl App {
         if let Some(drag) = self.local_adjust_canvas_drag {
             if primary_down {
                 if let Some(pos) = pointer_pos
-                    && let Some(norm) =
+                    && let Some(norm) = if drag.kind
+                        == crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientRadius
+                    {
+                        local_adjust_screen_to_norm_unclamped(pos, image_rect, image_dims, zoom_pan)
+                    } else {
                         local_adjust_screen_to_norm(pos, image_rect, image_dims, zoom_pan, false)
+                    }
                 {
                     self.apply_local_adjust_gradient_drag(drag, norm, false);
                     let cursor = if matches!(
@@ -7725,6 +8138,10 @@ impl App {
                             | crate::app::LocalAdjustCanvasDragKind::RadialGradientOuterX
                             | crate::app::LocalAdjustCanvasDragKind::RadialGradientOuterY
                             | crate::app::LocalAdjustCanvasDragKind::EffectCenter
+                            | crate::app::LocalAdjustCanvasDragKind::EffectLinearGradientStart
+                            | crate::app::LocalAdjustCanvasDragKind::EffectLinearGradientEnd
+                            | crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientCenter
+                            | crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientRadius
                             | crate::app::LocalAdjustCanvasDragKind::TiltShiftRange
                             | crate::app::LocalAdjustCanvasDragKind::TiltShiftFocus
                             | crate::app::LocalAdjustCanvasDragKind::TiltShiftOuter
@@ -7755,6 +8172,46 @@ impl App {
         }
         let Some(norm) = local_adjust_screen_to_norm(pos, image_rect, image_dims, zoom_pan, true)
         else {
+            if self.local_adjust_effect_position_handles_visible
+                && let Some(kind) = self
+                    .local_adjust_page_layers
+                    .get(&fs_idx)
+                    .and_then(|layers| layers.get(layer_idx))
+                    .and_then(|layer| {
+                        let (_, drawn_rect) =
+                            local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
+                        local_adjust_effect_gradient_handle_hit(&layer.effect, pos, drawn_rect)
+                    })
+            {
+                if primary_pressed
+                    && !self.local_adjust_selective_color_pick_active
+                    && self.local_adjust_rgb_pick_active.is_none()
+                {
+                    let drag_norm = if kind
+                        == crate::app::LocalAdjustCanvasDragKind::EffectRadialGradientRadius
+                    {
+                        local_adjust_screen_to_norm_unclamped(pos, image_rect, image_dims, zoom_pan)
+                    } else {
+                        local_adjust_screen_to_norm(pos, image_rect, image_dims, zoom_pan, false)
+                    };
+                    if let Some(norm) = drag_norm {
+                        self.local_adjust_canvas_drag_before_layers =
+                            self.local_adjust_page_layers.get(&fs_idx).cloned();
+                        let drag = crate::app::LocalAdjustCanvasDrag {
+                            fs_idx,
+                            layer_idx,
+                            kind,
+                            start: norm,
+                        };
+                        self.local_adjust_canvas_drag = Some(drag);
+                        self.apply_local_adjust_gradient_drag(drag, norm, false);
+                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                        ctx.request_repaint();
+                    }
+                } else {
+                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                }
+            }
             return;
         };
 
@@ -7916,6 +8373,29 @@ impl App {
                         local_adjust_tilt_shift_handle_hit(&layer.effect, pos, drawn_rect)
                     });
                 if let Some(kind) = tilt_shift_handle {
+                    self.local_adjust_canvas_drag_before_layers =
+                        self.local_adjust_page_layers.get(&fs_idx).cloned();
+                    let drag = crate::app::LocalAdjustCanvasDrag {
+                        fs_idx,
+                        layer_idx,
+                        kind,
+                        start: norm,
+                    };
+                    self.local_adjust_canvas_drag = Some(drag);
+                    self.apply_local_adjust_gradient_drag(drag, norm, false);
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    return;
+                }
+                let effect_gradient_handle = self
+                    .local_adjust_page_layers
+                    .get(&fs_idx)
+                    .and_then(|layers| layers.get(layer_idx))
+                    .and_then(|layer| {
+                        let (_, drawn_rect) =
+                            local_adjust_image_layout(image_rect, image_dims, zoom_pan)?;
+                        local_adjust_effect_gradient_handle_hit(&layer.effect, pos, drawn_rect)
+                    });
+                if let Some(kind) = effect_gradient_handle {
                     self.local_adjust_canvas_drag_before_layers =
                         self.local_adjust_page_layers.get(&fs_idx).cloned();
                     let drag = crate::app::LocalAdjustCanvasDrag {
@@ -8238,12 +8718,22 @@ impl App {
                                 local_adjust_tilt_shift_handle_hit(&layer.effect, pos, drawn_rect)
                             })
                             .is_some();
+                    let effect_gradient_hit =
+                        local_adjust_image_layout(image_rect, image_dims, zoom_pan)
+                            .and_then(|(_, drawn_rect)| {
+                                local_adjust_effect_gradient_handle_hit(
+                                    &layer.effect,
+                                    pos,
+                                    drawn_rect,
+                                )
+                            })
+                            .is_some();
                     let center_hit = local_adjust_effect_center(&layer.effect)
                         .and_then(|(center, _)| {
                             local_adjust_norm_to_screen(center, image_rect, image_dims, zoom_pan)
                         })
                         .is_some_and(|center| center.distance(pos) <= 14.0);
-                    tilt_shift_hit || center_hit
+                    tilt_shift_hit || effect_gradient_hit || center_hit
                 })
         {
             ctx.set_cursor_icon(egui::CursorIcon::Grab);
