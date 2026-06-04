@@ -172,6 +172,36 @@ A-3 の OS API 経路 (`GetAsyncKeyState`) は unit test できないため、**
 変換式 parity** で間接的にカバーしている。Codex/Claude Code でこの周辺を修正する際は、
 本表の右列のテストが残っているか確認すること (= 削除提案が来たら回帰防止根拠を必ず聞く)。
 
+## Phase 3 拡充 (2026-06、P5 AI 先読み修復後)
+
+P5-1〜P5-6 で AI 先読みパイプライン (edit → AI/補正の順序入れ替え) の退行を修復した
+後、ついでに **`maybe_start_*_preview` 系の early-return guard** を符号化した。これらは
+描画ループ内で毎フレーム呼ばれる経路なので、guard が外れると worker spawn 爆発や
+無駄な cancel/respawn churn が起きる。
+
+- **`src/app/tests.rs::pipeline_cache_refactor_tests`** (15 → 23 件):
+  - `maybe_start_layer_bypass_returns_early_when_cache_already_present` —
+    cache hit guard が外れたら毎フレーム spawn する退行を検知。
+  - `maybe_start_layer_bypass_keeps_same_key_pending_alive` —
+    同 key 重複要求で既存 pending を cancel/respawn する churn を防ぐ。
+  - `maybe_start_layer_bypass_returns_early_when_no_remaining_enabled_layers` —
+    `local_adjust_layers_with_selected_layer_bypassed` が None を返す全ケース
+    (disabled / opacity=0 / 範囲外 idx / 残り 0 枚) で spawn しない最適化。
+  - `maybe_start_layer_bypass_returns_early_when_source_unavailable` —
+    mask page 編集中に bypass preview を要求しても worker spawn しない
+    (= 編集確定前の不完全な source で render → flicker を防ぐ)。
+  - `maybe_start_prefix_preview_returns_early_when_cache_already_present` —
+    bypass 側と同型 (= 別 cache を触るので個別 fixation)。
+  - `maybe_start_prefix_preview_keeps_same_key_pending_alive` — 同上。
+  - `maybe_start_prefix_preview_returns_early_at_layer_count_boundaries` —
+    `local_adjust_layers_until` の `count == 0 || count >= layers.len()` 境界
+    (= 「先頭から 0 枚」「先頭から全枚」は元の合成と同じなので spawn 不要) を符号化。
+  - `maybe_start_prefix_preview_returns_early_when_source_unavailable` — 同上。
+
+これらの guard は src/app.rs 18957- (bypass) / 19007- (prefix) にある 4 つの
+`is_some() return` + `let Some(..) else return` パターン。**`fn maybe_start_*` を
+リファクタしたら必ず**この 8 本が green を保つことを確認すること。
+
 ## CI 統合
 
 `.github/workflows/` の test job に何も追加せず動く (= `cargo test` 全体に含まれる)。

@@ -5932,6 +5932,287 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    // ========================================================================
+    // P6-1: maybe_start_local_adjust_layer_bypass_preview の guard 経路テスト
+    // ========================================================================
+    //
+    // `maybe_start_local_adjust_layer_bypass_preview` には 4 つの early-return
+    // guard がある (src/app.rs:18957-):
+    //   1. cache hit          → 既に bypass cache に同 key が乗っている
+    //   2. same-key pending   → 同 key の pending が既に live
+    //   3. layers None        → bypass しても残り有効レイヤーが無い (= 無駄な spawn)
+    //   4. source None        → mask page 中などで source pixels が取れない
+    //
+    // どの guard も「pending を新規 spawn しない / 既存 pending を cancel しない」
+    // ことが期待動作。pending フィールドの不変性を assertion で固定する。
+    // spawn を踏まないので worker thread の起動コストや race も発生しない。
+
+    /// P6-1a: 同 key の bypass cache が既に乗っている場合、`maybe_start` は
+    /// 何もしない (= pending を作らない)。
+    /// 回帰防止: cache hit guard が外れて毎フレーム worker spawn する退行
+    /// (= UI 描画ループ内で繰り返し呼ばれる経路なので、guard が無いと spawn 爆発)。
+    #[test]
+    fn maybe_start_layer_bypass_returns_early_when_cache_already_present() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/bypass-guard-cache.jpg");
+        app.local_adjust_page_layers
+            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+
+        // cache に同 key を仕込む
+        let ctx = egui::Context::default();
+        let key = app.current_local_adjust_layer_bypass_key(idx, 1);
+        let img = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+        let tex = ctx.load_texture("bypass-guard-cache", img.clone(), Default::default());
+        app.local_adjust_layer_bypass_cache.insert(
+            key,
+            LocalAdjustCacheEntry {
+                pixels: Arc::new(img),
+                texture: tex,
+            },
+        );
+
+        assert!(
+            app.local_adjust_layer_bypass_pending.is_none(),
+            "pre-condition: pending must be empty"
+        );
+
+        app.maybe_start_local_adjust_layer_bypass_preview(idx, 1);
+
+        assert!(
+            app.local_adjust_layer_bypass_pending.is_none(),
+            "cache hit must short-circuit; no pending should be created"
+        );
+    }
+
+    /// P6-1b: 同 key の pending が既に live なら、`maybe_start` は新規 spawn
+    /// しないし既存 pending を cancel もしない (= 無駄な churn を防ぐ)。
+    /// 回帰防止: 同フレーム内で同じ呼び出しが 2 回走った時に、最初の pending を
+    /// cancel して 2 つ目を作るような無駄が起きないこと。
+    #[test]
+    fn maybe_start_layer_bypass_keeps_same_key_pending_alive() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/bypass-guard-same-key.jpg");
+        app.local_adjust_page_layers
+            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+
+        let result_key = app.current_local_adjust_key(idx);
+        let layer_idx = 1usize;
+        let (pending, cancel, _tx) = make_fake_bypass_pending(result_key, layer_idx);
+        app.local_adjust_layer_bypass_pending = Some(pending);
+
+        app.maybe_start_local_adjust_layer_bypass_preview(idx, layer_idx);
+
+        assert!(
+            app.local_adjust_layer_bypass_pending.is_some(),
+            "same-key pending must survive (= no spawn churn)"
+        );
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "same-key pending must not be cancelled"
+        );
+    }
+
+    /// P6-1c: bypass しても残り有効レイヤーが無い (= 単一レイヤーを bypass する等)
+    /// 場合、`maybe_start` は noop。
+    /// 回帰防止: 描画結果が原画と同じになる無駄な spawn を防ぐ最適化。
+    /// `local_adjust_layers_with_selected_layer_bypassed` が None を返す全ケース
+    /// (disabled / opacity=0 / 範囲外) はこの経路を通る。
+    #[test]
+    fn maybe_start_layer_bypass_returns_early_when_no_remaining_enabled_layers() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/bypass-guard-no-layers.jpg");
+        // 単一 layer のみ → bypass すると残り 0 → None
+        app.local_adjust_page_layers
+            .insert(idx, vec![full_layer("only")]);
+
+        // 別 key の pending を立てておく → guard で抜けたかの判定材料
+        let mut other_key = app.current_local_adjust_key(idx);
+        other_key.idx = idx + 100; // 違う idx で別 key 化
+        let (pending, cancel, _tx) = make_fake_bypass_pending(other_key, 0);
+        app.local_adjust_layer_bypass_pending = Some(pending);
+
+        app.maybe_start_local_adjust_layer_bypass_preview(idx, 0);
+
+        assert!(
+            app.local_adjust_layer_bypass_pending.is_some(),
+            "existing pending must survive when layers=None \
+             (= guard short-circuits before cancel_local_adjust_layer_bypass_pending)"
+        );
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "existing pending cancel must not fire when layers=None"
+        );
+    }
+
+    /// P6-1d: source pixels が None (例: mask page 編集中) なら、`maybe_start`
+    /// は noop。
+    /// 回帰防止: mask 編集中に bypass preview を要求しても worker spawn しない
+    /// (= 編集確定前の不完全な source で render すると flicker する事故を防ぐ)。
+    #[test]
+    fn maybe_start_layer_bypass_returns_early_when_source_unavailable() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/bypass-guard-no-source.jpg");
+        app.local_adjust_page_layers
+            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+        // mask_pages に入れる → current_local_adjust_source_pixels が None
+        app.mask_pages.insert(idx);
+
+        // 別 key の pending を立てておく → guard で抜けたかの判定材料
+        let mut other_key = app.current_local_adjust_key(idx);
+        other_key.idx = idx + 100;
+        let (pending, cancel, _tx) = make_fake_bypass_pending(other_key, 1);
+        app.local_adjust_layer_bypass_pending = Some(pending);
+
+        app.maybe_start_local_adjust_layer_bypass_preview(idx, 1);
+
+        assert!(
+            app.local_adjust_layer_bypass_pending.is_some(),
+            "existing pending must survive when source=None"
+        );
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "existing pending cancel must not fire when source=None"
+        );
+    }
+
+    // ========================================================================
+    // P6-2: maybe_start_local_adjust_prefix_preview の guard 経路テスト (対称)
+    // ========================================================================
+    //
+    // `maybe_start_local_adjust_prefix_preview` (src/app.rs:19007-) は bypass
+    // 側と同じ 4 つの early-return guard を持つ。layers の境界条件だけ違う:
+    //   - `local_adjust_layers_until` は count == 0 || count >= layers.len() で
+    //     None を返す (= "全部" or "0 枚" は元の合成と同じなので preview 不要)。
+    // それ以外 (cache hit / same-key pending / source None) は bypass と同型。
+    // 同じ guard を呼んでも違うフィールドを触るので、片方だけ壊れる退行を
+    // 個別に検知できるよう独立テストとして書く。
+
+    /// P6-2a: 同 key の prefix cache が既に乗っている → `maybe_start` は noop。
+    #[test]
+    fn maybe_start_prefix_preview_returns_early_when_cache_already_present() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/prefix-guard-cache.jpg");
+        app.local_adjust_page_layers
+            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+
+        let ctx = egui::Context::default();
+        let key = app.current_local_adjust_prefix_preview_key(idx, 1);
+        let img = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+        let tex = ctx.load_texture("prefix-guard-cache", img.clone(), Default::default());
+        app.local_adjust_prefix_preview_cache.insert(
+            key,
+            LocalAdjustCacheEntry {
+                pixels: Arc::new(img),
+                texture: tex,
+            },
+        );
+
+        assert!(
+            app.local_adjust_prefix_preview_pending.is_none(),
+            "pre-condition: pending must be empty"
+        );
+
+        app.maybe_start_local_adjust_prefix_preview(idx, 1);
+
+        assert!(
+            app.local_adjust_prefix_preview_pending.is_none(),
+            "cache hit must short-circuit; no pending should be created"
+        );
+    }
+
+    /// P6-2b: 同 key の prefix pending が live なら、`maybe_start` は新規 spawn
+    /// しないし cancel もしない (= churn 防止)。
+    #[test]
+    fn maybe_start_prefix_preview_keeps_same_key_pending_alive() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/prefix-guard-same-key.jpg");
+        app.local_adjust_page_layers
+            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+
+        let result_key = app.current_local_adjust_key(idx);
+        let layer_count = 1usize;
+        let (pending, cancel, _tx) = make_fake_prefix_pending(result_key, layer_count);
+        app.local_adjust_prefix_preview_pending = Some(pending);
+
+        app.maybe_start_local_adjust_prefix_preview(idx, layer_count);
+
+        assert!(
+            app.local_adjust_prefix_preview_pending.is_some(),
+            "same-key pending must survive"
+        );
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "same-key pending must not be cancelled"
+        );
+    }
+
+    /// P6-2c: `local_adjust_layers_until` が None を返す境界条件
+    /// (= layer_count==0 / layer_count>=layers.len()) では `maybe_start` は noop。
+    /// 回帰防止: 「先頭から 0 枚」「先頭から全枚」は元の合成と同じなので spawn 不要。
+    /// この最適化が外れると Ctrl 押下時に毎フレーム無駄な worker spawn が走る。
+    #[test]
+    fn maybe_start_prefix_preview_returns_early_at_layer_count_boundaries() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/prefix-guard-boundaries.jpg");
+        app.local_adjust_page_layers
+            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+
+        let mut other_key = app.current_local_adjust_key(idx);
+        other_key.idx = idx + 100;
+
+        // (i) layer_count = 0 → None
+        let (pending0, cancel0, _tx0) = make_fake_prefix_pending(other_key, 0);
+        app.local_adjust_prefix_preview_pending = Some(pending0);
+        app.maybe_start_local_adjust_prefix_preview(idx, 0);
+        assert!(
+            app.local_adjust_prefix_preview_pending.is_some(),
+            "layer_count=0 → pending must survive"
+        );
+        assert!(
+            !cancel0.load(std::sync::atomic::Ordering::Relaxed),
+            "layer_count=0 → existing pending must not be cancelled"
+        );
+
+        // (ii) layer_count >= layers.len() → None
+        let (pending2, cancel2, _tx2) = make_fake_prefix_pending(other_key, 2);
+        app.local_adjust_prefix_preview_pending = Some(pending2);
+        app.maybe_start_local_adjust_prefix_preview(idx, 2);
+        assert!(
+            app.local_adjust_prefix_preview_pending.is_some(),
+            "layer_count >= len → pending must survive"
+        );
+        assert!(
+            !cancel2.load(std::sync::atomic::Ordering::Relaxed),
+            "layer_count >= len → existing pending must not be cancelled"
+        );
+    }
+
+    /// P6-2d: source pixels が None (mask page 中) なら、`maybe_start` は noop。
+    #[test]
+    fn maybe_start_prefix_preview_returns_early_when_source_unavailable() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/prefix-guard-no-source.jpg");
+        app.local_adjust_page_layers
+            .insert(idx, vec![full_layer("A"), full_layer("B")]);
+        app.mask_pages.insert(idx);
+
+        let mut other_key = app.current_local_adjust_key(idx);
+        other_key.idx = idx + 100;
+        let (pending, cancel, _tx) = make_fake_prefix_pending(other_key, 1);
+        app.local_adjust_prefix_preview_pending = Some(pending);
+
+        app.maybe_start_local_adjust_prefix_preview(idx, 1);
+
+        assert!(
+            app.local_adjust_prefix_preview_pending.is_some(),
+            "existing pending must survive when source=None"
+        );
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "existing pending cancel must not fire when source=None"
+        );
+    }
+
     fn make_fake_final_ai_pending() -> (FinalAiPending, Arc<std::sync::atomic::AtomicBool>) {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (_tx, rx) = std::sync::mpsc::channel();
