@@ -5379,6 +5379,174 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// P7-1a: `bump_adjustment_generation(idx)` は **別 idx** の
+    /// `final_ai_cache` / `final_composite_cache` を一切 touch しない。
+    ///
+    /// 回帰防止: P5-6 で発見した「open_fullscreen が defensive に隣接ページの
+    /// `bump_adjustment_generation` を呼ぶ → 隣接の prefetch 結果が消える」退行の
+    /// **idx-scoping そのもの**を符号化する。`retain` の filter 条件が誤って
+    /// `cache_key.edit_key.idx != idx` から `cache_key.edit_key.idx == idx` に
+    /// 反転したら、本テストが落ちる。
+    #[test]
+    fn adjustment_generation_only_affects_the_target_idx() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx_a = push_image(&mut app, "C:/pics/adjust-idx-a.jpg");
+        let idx_b = push_image(&mut app, "C:/pics/adjust-idx-b.jpg");
+        let (_edit_a, final_a) = insert_edit_and_final_cache(&mut app, &ctx, idx_a, "adj_a");
+        let (_edit_b, final_b) = insert_edit_and_final_cache(&mut app, &ctx, idx_b, "adj_b");
+
+        assert_eq!(app.final_composite_cache.len(), 2);
+        assert_eq!(app.final_ai_cache.len(), 2);
+
+        // idx_a だけ bump → idx_b の final_composite / final_ai は無傷
+        app.bump_adjustment_generation(idx_a);
+
+        assert!(
+            !app.final_composite_cache.contains_key(&final_a),
+            "idx_a の final_composite は無効化される"
+        );
+        assert!(
+            app.final_composite_cache.contains_key(&final_b),
+            "idx_b の final_composite は P7-1a で守られる (= 隣接ページの prefetch 死守)"
+        );
+        // AI cache は両 idx とも生存
+        assert_eq!(
+            app.final_ai_cache.len(),
+            2,
+            "bump_adjustment_generation は final_ai_cache を一切 touch しない (P5-6)"
+        );
+    }
+
+    /// P7-1b: `bump_ai_generation(idx)` は AI cache だけ idx 単位で clear し、
+    /// **`edit_result_cache` は touch しない** (= 上流の編集結果は AI モデル切替で再構築不要)。
+    ///
+    /// 回帰防止: AI モデル切替や failure 後 retry で `bump_ai_generation` が呼ばれた
+    /// とき、edit_result まで一緒に捨てる退行が起きると source 解像度の編集 (消しゴム /
+    /// 補正レイヤー / 隠蔽) の再合成も走り、UI が大きく止まる。
+    #[test]
+    fn ai_generation_clears_final_pipeline_but_keeps_edit_cache() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/ai-gen-keep-edit.jpg");
+        let (edit_key, final_key) = insert_edit_and_final_cache(&mut app, &ctx, idx, "ai_gen");
+
+        assert!(app.edit_result_cache.contains_key(&edit_key));
+        assert!(app.final_composite_cache.contains_key(&final_key));
+        assert!(!app.final_ai_cache.is_empty());
+
+        app.bump_ai_generation(idx);
+
+        // 上流の edit_result は維持
+        assert!(
+            app.edit_result_cache.contains_key(&edit_key),
+            "AI 世代 bump は edit_result_cache を保持する (= 編集結果は AI に依存しない)"
+        );
+        // 下流の final pipeline は idx 単位で clear
+        assert!(
+            !app.final_composite_cache.contains_key(&final_key),
+            "AI 世代 bump で final_composite が idx 単位で clear される"
+        );
+        assert!(
+            app.final_ai_cache.is_empty(),
+            "AI 世代 bump で final_ai_cache が idx 単位で clear される"
+        );
+    }
+
+    /// P7-2: `bump_ai_generation(idx)` は失敗 cache (`final_ai_failed`) も idx 単位で
+    /// 削除し、別 idx の失敗エントリは無傷に保つ。
+    ///
+    /// セマンティクス: AI モデル切替や retry 経路で `bump_ai_generation` が走ったとき、
+    /// 「同じ key で AI が失敗した」履歴も対象 idx 分はリセットして次回再試行を許可する。
+    /// 一方、別 idx の失敗履歴は別文脈なので削除してはいけない。
+    ///
+    /// 回帰防止: `clear_final_pipeline_caches_for_idx` の retain filter が
+    /// `key.edit_key.idx != idx` から退化すると、別ページの失敗履歴を巻き込んで
+    /// 削除し、AI 推論が同じ理由で繰り返し失敗するページでも再 spawn してしまう。
+    #[test]
+    fn ai_generation_also_clears_failed_for_target_idx() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx_a = push_image(&mut app, "C:/pics/ai-fail-a.jpg");
+        let idx_b = push_image(&mut app, "C:/pics/ai-fail-b.jpg");
+        let (_edit_a, final_a) = insert_edit_and_final_cache(&mut app, &ctx, idx_a, "fail_a");
+        let (_edit_b, final_b) = insert_edit_and_final_cache(&mut app, &ctx, idx_b, "fail_b");
+
+        // 両 idx に AI 失敗履歴を仕込む (= 直近の AI 推論で失敗した状態)
+        let failed_a = FinalAiKey {
+            edit_key: final_a.edit_key,
+            color_ai_hash: 0xDEAD,
+            bg: 0,
+        };
+        let failed_b = FinalAiKey {
+            edit_key: final_b.edit_key,
+            color_ai_hash: 0xDEAD,
+            bg: 0,
+        };
+        app.final_ai_failed.insert(failed_a);
+        app.final_ai_failed.insert(failed_b);
+        assert_eq!(app.final_ai_failed.len(), 2);
+
+        // idx_a の AI 世代だけ bump
+        app.bump_ai_generation(idx_a);
+
+        assert!(
+            !app.final_ai_failed.contains(&failed_a),
+            "対象 idx の失敗履歴はリセットされる (= 次回再試行を許可)"
+        );
+        assert!(
+            app.final_ai_failed.contains(&failed_b),
+            "別 idx の失敗履歴は無傷 (= 別ページの retry を巻き込まない)"
+        );
+    }
+
+    /// P7-1c: `bump_conceal_generation()` (global) は **全 idx** の
+    /// `edit_result_cache` + final pipeline を一括 clear する。
+    ///
+    /// 回帰防止: conceal 不透明度 / ぼかし半径などのグローバルパラメータが変わったとき、
+    /// 該当ページだけ touch する設計だと「他ページで先に hydrate された edit_result」が
+    /// 古い conceal で固まる事故が起きる。conceal_gen は `EditResultKey` のフィールドなので、
+    /// global bump + 全 clear で「次の lookup から新 conceal_gen で再構築」を強制する。
+    #[test]
+    fn conceal_generation_clears_all_idx_edit_and_final_caches() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx_a = push_image(&mut app, "C:/pics/conceal-gen-a.jpg");
+        let idx_b = push_image(&mut app, "C:/pics/conceal-gen-b.jpg");
+        let (edit_a, final_a) = insert_edit_and_final_cache(&mut app, &ctx, idx_a, "conceal_a");
+        let (edit_b, final_b) = insert_edit_and_final_cache(&mut app, &ctx, idx_b, "conceal_b");
+
+        assert_eq!(app.edit_result_cache.len(), 2);
+        assert_eq!(app.final_composite_cache.len(), 2);
+        assert_eq!(app.final_ai_cache.len(), 2);
+        let conceal_gen_before = app.conceal_generation;
+
+        app.bump_conceal_generation();
+
+        // global なので idx_a / idx_b の両方が消える
+        assert_eq!(
+            app.conceal_generation,
+            conceal_gen_before.wrapping_add(1),
+            "conceal_generation は +1 される (= 全 edit_result key が次回 lookup で stale 化)"
+        );
+        assert!(
+            !app.edit_result_cache.contains_key(&edit_a),
+            "idx_a の edit_result は global clear で消える"
+        );
+        assert!(
+            !app.edit_result_cache.contains_key(&edit_b),
+            "idx_b の edit_result も global clear で消える (P7-1c の核)"
+        );
+        assert!(app.edit_result_cache.is_empty());
+        assert!(
+            !app.final_composite_cache.contains_key(&final_a)
+                && !app.final_composite_cache.contains_key(&final_b),
+            "global bump は final pipeline も全 clear する"
+        );
+        assert!(app.final_composite_cache.is_empty());
+        assert!(app.final_ai_cache.is_empty());
+    }
+
     /// P5-6: `bump_adjustment_generation` は `final_ai_cache` を巻き込まず、
     /// `final_composite_cache` だけ idx 単位で無効化する。
     ///

@@ -10405,6 +10405,62 @@ mod tests {
         );
     }
 
+    /// P7-3a: `show_source_toggle` と `preview_to_selected_layer_toggle` が**両方 ON**
+    /// なら、ShowSource が PrefixPreview より優先される。
+    ///
+    /// 根拠: `decide_local_adjust_preview_action` のコードを読むと、最初の if で
+    /// `show_source_toggle` を見て早期 return するため、後段の preview_requested 判定
+    /// に到達しない構造になっている。これは UX として「元画像表示はパネルで
+    /// 明示的に有効化したもの」だから「選択レイヤーまでプレビュー」よりも強い
+    /// ユーザー意図、という設計。
+    ///
+    /// 退行: もし将来この優先順位が反転すると、ユーザーが「元画像表示」を ON に
+    /// したまま選択レイヤーを切り替えると、急に PrefixPreview に切り替わって
+    /// 「元画像が見えない」と困惑する。
+    #[test]
+    fn decide_action_show_source_toggle_beats_preview_to_selected_layer() {
+        assert_eq!(
+            act(true, false, false, true, true, true, Some(1), 3),
+            LocalAdjustPreviewAction::ShowSource,
+            "show_source トグル ON は preview_to_selected_layer ON より優先"
+        );
+    }
+
+    /// P7-3b: Ctrl+Shift modifier bypass は `show_source_toggle` の状態より優先される。
+    ///
+    /// 根拠: 最初の if 条件 `!modifier_bypass_active && (ctrl || show_source_toggle)`
+    /// で `modifier_bypass_active=true` なら全体が false で抜けない → BypassLayer 経路へ。
+    ///
+    /// UX 意図: パネル UX で「元画像表示」を ON にしたまま「特定レイヤーだけ一時的に
+    /// 抜いた絵を見たい」ときに Ctrl+Shift を押すと bypass が効く (= toggle を一度
+    /// off にしなくて済む)。
+    #[test]
+    fn decide_action_ctrl_shift_bypass_beats_show_source_toggle() {
+        assert_eq!(
+            act(true, true, true, true, false, true, Some(1), 3),
+            LocalAdjustPreviewAction::BypassLayer { layer_idx: 1 },
+            "Ctrl+Shift bypass は show_source トグル ON より優先 (= modifier の方が一時操作で勝つ)"
+        );
+    }
+
+    /// P7-3c: `preview_to_selected_layer_toggle` は **フルスクリーン非フォーカス時でも効く**。
+    ///
+    /// 根拠: focus は OS API (`*_held_via_os`) で読む修飾キーの誤検知を防ぐためだけの
+    /// ガードで、App state である toggle 系には適用されない。`fs_prev_focused=false`
+    /// でも `preview_to_selected_layer_toggle=true` なら PrefixPreview に進む。
+    ///
+    /// 回帰防止: `decide_local_adjust_preview_action` 内で focus による early return を
+    /// 全体に適用するような誤った refactor が入ると、別アプリにフォーカスが移った
+    /// 瞬間に panel toggle が無視されてしまう。
+    #[test]
+    fn decide_action_preview_to_selected_layer_works_when_not_focused() {
+        assert_eq!(
+            act(false, false, false, false, true, true, Some(1), 3),
+            LocalAdjustPreviewAction::PrefixPreview { layer_count: 2 },
+            "panel toggle 系は OS focus に依存せず効く (= 修飾キーの focus guard とは別)"
+        );
+    }
+
     #[test]
     fn location_display_regular_image_joins_folder_and_filename() {
         let out = compute_location_display(

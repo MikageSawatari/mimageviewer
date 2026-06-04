@@ -215,6 +215,52 @@ P5-1〜P5-6 で AI 先読みパイプライン (edit → AI/補正の順序入�
   forward=back=0 の空、forward >> n の overflow を網羅。順序が崩れると
   「ページ送り直後に毎回 cold miss する」退行を検知する。
 
+## Phase 4 拡充 (2026-06、bump_* マトリクス + decide_action 拡張)
+
+P5-6 で発見した「`bump_adjustment_generation` が `final_ai_cache` を巻き込み
+削除する退行」を受け、bump_* ファミリの cache 操作セマンティクスをマトリクスで
+固定する。同時に `decide_local_adjust_preview_action` の toggle vs modifier 優先
+順位の隠れた契約も符号化する。
+
+- **`src/app/tests.rs::pipeline_cache_refactor_tests`** (25 → 29 件):
+  - `adjustment_generation_only_affects_the_target_idx` — **P5-6 idx-scoping**
+    の境界条件。`bump_adjustment_generation(idx_a)` 後に `idx_b` の
+    `final_composite_cache` / `final_ai_cache` の両方が無傷であることを assert。
+    retain filter が反転したら検知。
+  - `ai_generation_clears_final_pipeline_but_keeps_edit_cache` — `bump_ai_generation`
+    は AI 関連 cache (final_ai + final_composite) を idx 単位で clear するが、
+    上流の `edit_result_cache` は保持する。AI モデル切替で消しゴム/補正/隠蔽の
+    再合成までは走らせない設計を符号化。
+  - `ai_generation_also_clears_failed_for_target_idx` — `bump_ai_generation` は
+    `final_ai_failed` も idx 単位で削除し、別 idx の失敗履歴は無傷に保つ。
+    モデル切替後の retry 許可と「別ページの retry を巻き込まない」両立を fixation。
+  - `conceal_generation_clears_all_idx_edit_and_final_caches` — global bump の
+    境界。conceal の global パラメータ変更で **全 idx** の `edit_result_cache` +
+    final pipeline が一括 clear されること、`conceal_generation` 自体が +1 する
+    ことを符号化。
+
+- **`src/ui_fullscreen.rs::tests::decide_action_*`** (12 → 15 件):
+  - `decide_action_show_source_toggle_beats_preview_to_selected_layer` — 両 toggle
+    ON で ShowSource が優先される設計 (= 「元画像表示」は明示的なユーザー意図で
+    勝つ)。
+  - `decide_action_ctrl_shift_bypass_beats_show_source_toggle` — modifier bypass
+    は `show_source_toggle` より優先 (= toggle を一度 off にせずに bypass できる)。
+  - `decide_action_preview_to_selected_layer_works_when_not_focused` — toggle 系は
+    OS focus に依存しない (= focus guard は OS 修飾キー読みだけに適用される
+    設計の符号化)。
+
+### bump_* マトリクス (Phase 4 で fixation した範囲)
+
+| bump_X | 主に触る cache | 触らない cache |
+|---|---|---|
+| `bump_adjustment_generation(idx)` | `final_composite_cache(idx)` | `final_ai_cache`, `final_ai_failed`, `edit_result_cache` |
+| `bump_ai_generation(idx)` | `final_ai_cache(idx)`, `final_ai_failed(idx)`, `final_composite_cache(idx)` | `edit_result_cache`, `local_adjust_cache`, `conceal_cache` |
+| `bump_conceal_generation()` (global) | `edit_result_cache(全)`, final pipeline(全) | `local_adjust_cache`, `erase_result_cache` |
+
+idx-scoped vs global の区別、edit chain vs final pipeline の境界、AI 関連 cache
+の 3 つ組 (cache / failed / composite) の同期削除がポイント。これら 3 軸が
+壊れると P5-6 のような「先読みが完了したのに次ページ表示で再計算」事故が再発する。
+
 これらの guard は src/app.rs 18957- (bypass) / 19007- (prefix) にある 4 つの
 `is_some() return` + `let Some(..) else return` パターン、および
 src/app.rs:18905- (`current_local_adjust_source_pixels`) の compose chain。
