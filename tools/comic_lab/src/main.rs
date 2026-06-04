@@ -2812,23 +2812,29 @@ impl ComicLab {
                 1.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        // Resizable window with a concrete default size (like the adjustment lab):
-        // a resizable window has a definite width, so the fixed-width thumbnail
-        // grid wraps to it (a non-resizable auto-sized window ignores width caps
-        // for horizontal_wrapped and runs off as one row).
+        // Resizable window. The grid is laid out MANUALLY (column count from the
+        // actual width) instead of `horizontal_wrapped`, which reports its
+        // unwrapped one-row width as the window's min width and forces the window
+        // full-width (the "幅が目一杯" + weird-resize symptom).
         let avail = ctx.content_rect();
-        let default_w = (avail.width() - 80.0).clamp(320.0, 560.0);
+        let max_w = (avail.width() - 24.0).max(PRESET_CELL_W + 48.0);
+        let default_w = max_w.min(540.0);
         let default_h = (avail.height() - 120.0).clamp(220.0, 560.0);
         egui::Window::new("吹き出しを追加")
+            // Fresh id so egui doesn't restore the full-width size remembered from
+            // the earlier horizontal_wrapped layout (a .max_width clamp can't shrink
+            // an already-remembered window size — Codex).
+            .id(egui::Id::new("add_bubble_dialog_grid"))
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(avail.center())
+            // No pivot: a CENTER_CENTER pivot makes resizing feel odd (size changes
+            // keep the center fixed). Center via default_pos instead (Codex).
+            .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
             .collapsible(false)
             .resizable(true)
-            .default_width(default_w)
-            .default_height(default_h)
-            .min_width(220.0)
+            .default_size([default_w, default_h])
+            .min_width(PRESET_CELL_W + 30.0)
+            .max_width(max_w)
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label(
@@ -2840,14 +2846,18 @@ impl ComicLab {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
-                            for &preset in BubblePreset::ALL {
-                                if draw_preset_thumbnail(ui, preset) {
-                                    chosen = Some(preset);
+                        let cols = grid_cols(ui.available_width(), PRESET_CELL_W);
+                        ui.spacing_mut().item_spacing =
+                            egui::vec2(PRESET_CELL_SPACING, PRESET_CELL_SPACING);
+                        for chunk in BubblePreset::ALL.chunks(cols) {
+                            ui.horizontal_top(|ui| {
+                                for &preset in chunk {
+                                    if draw_preset_thumbnail(ui, preset) {
+                                        chosen = Some(preset);
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        }
                     });
             });
 
@@ -2872,22 +2882,22 @@ impl ComicLab {
                 1.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        // Resizable window with a concrete default size so the fixed-width preview
-        // grid wraps to the window width (a non-resizable auto-sized window ignores
-        // width caps for horizontal_wrapped and runs off as one row).
+        // Resizable window; grid laid out manually (column count from the actual
+        // width) so it reflows on resize instead of forcing a one-row min width.
         let avail = ctx.content_rect();
-        let default_w = (avail.width() - 80.0).clamp(340.0, 620.0);
+        let max_w = (avail.width() - 24.0).max(WINDOW_PRESET_CELL_W + 48.0);
+        let default_w = max_w.min(640.0);
         let default_h = (avail.height() - 120.0).clamp(220.0, 560.0);
         egui::Window::new("メッセージウィンドウを追加")
+            .id(egui::Id::new("add_window_dialog_grid"))
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(avail.center())
+            .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
             .collapsible(false)
             .resizable(true)
-            .default_width(default_w)
-            .default_height(default_h)
-            .min_width(180.0)
+            .default_size([default_w, default_h])
+            .min_width(WINDOW_PRESET_CELL_W + 30.0)
+            .max_width(max_w)
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label(
@@ -2899,14 +2909,19 @@ impl ComicLab {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
-                            for (i, p) in self.window_presets.iter().enumerate() {
-                                if draw_window_preset_thumbnail(ui, p) {
-                                    chosen = Some(i);
+                        let cols = grid_cols(ui.available_width(), WINDOW_PRESET_CELL_W);
+                        ui.spacing_mut().item_spacing =
+                            egui::vec2(PRESET_CELL_SPACING, PRESET_CELL_SPACING);
+                        let n = self.window_presets.len();
+                        for row_start in (0..n).step_by(cols) {
+                            ui.horizontal_top(|ui| {
+                                for i in row_start..(row_start + cols).min(n) {
+                                    if draw_window_preset_thumbnail(ui, &self.window_presets[i]) {
+                                        chosen = Some(i);
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        }
                     });
             });
 
@@ -5385,8 +5400,22 @@ fn default_bubble_tail(pivot: (f32, f32)) -> Tail {
 
 /// One clickable preset thumbnail (a small rendered bubble + the preset name
 /// below). Returns true when clicked. Used by the add dialog.
+/// Cell width of a bubble-preset thumbnail (and the add-dialog grid column).
+const PRESET_CELL_W: f32 = 96.0;
+/// Cell width of a window-preset thumbnail.
+const WINDOW_PRESET_CELL_W: f32 = 150.0;
+/// Spacing between thumbnail cells in the add dialogs.
+const PRESET_CELL_SPACING: f32 = 10.0;
+
+/// Number of columns that fit `cell_w`-wide thumbnails (+ spacing) into `avail`
+/// width. At least 1. Used to lay out the add-dialog grids manually so they
+/// reflow on resize without `horizontal_wrapped` forcing a one-row min width.
+fn grid_cols(avail: f32, cell_w: f32) -> usize {
+    (((avail + PRESET_CELL_SPACING) / (cell_w + PRESET_CELL_SPACING)).floor() as usize).max(1)
+}
+
 fn draw_preset_thumbnail(ui: &mut egui::Ui, preset: BubblePreset) -> bool {
-    const CELL_W: f32 = 96.0;
+    const CELL_W: f32 = PRESET_CELL_W;
     const PREVIEW_H: f32 = 64.0;
     let resp = ui
         .vertical(|ui| {
@@ -5431,7 +5460,7 @@ fn draw_preset_thumbnail(ui: &mut egui::Ui, preset: BubblePreset) -> bool {
 /// One clickable window-style preset thumbnail (a small rendered window panel +
 /// the preset name below). Returns true when clicked.
 fn draw_window_preset_thumbnail(ui: &mut egui::Ui, preset: &WindowStylePreset) -> bool {
-    const CELL_W: f32 = 150.0;
+    const CELL_W: f32 = WINDOW_PRESET_CELL_W;
     const PREVIEW_H: f32 = 60.0;
     let resp = ui
         .vertical(|ui| {
