@@ -3625,6 +3625,39 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.conceal_mode);
     }
 
+    /// 見開きから切り取りモードに入ったあと `reset_export_crop_mode` で元の見開き状態に戻ること。
+    #[test]
+    fn reset_export_crop_mode_restores_saved_spread_state() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(1);
+        app.spread_mode = SpreadMode::Single;
+        app.export_crop_spread_ctx = Some(crate::app::EraseSpreadCtx {
+            saved_mode: SpreadMode::Ltr,
+            pair: (0, 1),
+        });
+        app.fs_zoom = 2.0;
+        app.fs_pan = egui::Vec2::new(50.0, 30.0);
+        app.export_crop_mode = true;
+        app.export_crop_drag = None;
+
+        app.reset_export_crop_mode();
+
+        assert_eq!(app.spread_mode, SpreadMode::Ltr);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.export_crop_spread_ctx.is_none());
+        assert_eq!(app.fs_zoom, 1.0);
+        assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+        assert!(!app.export_crop_mode);
+    }
+
     /// 見開き表示中の Ctrl+E は左右ページを 1 つの export snapshot として開く。
     #[test]
     fn open_export_dialog_uses_spread_pixels_when_spread_is_visible() {
@@ -5350,7 +5383,6 @@ mod pipeline_cache_refactor_tests {
             local_gen: app.local_adjust_generation.get(&idx).copied().unwrap_or(0),
             conceal_mask_gen: app.conceal_mask_generation.get(&idx).copied().unwrap_or(0),
             conceal_gen: app.conceal_generation,
-            crop_hash: 0,
         }
     }
 
@@ -6904,7 +6936,6 @@ mod pipeline_cache_refactor_tests {
                 local_gen: 0,
                 conceal_mask_gen: 0,
                 conceal_gen: 0,
-                crop_hash: 0,
             },
             color_ai_hash: 0,
             bg: 0,
@@ -6940,7 +6971,6 @@ mod pipeline_cache_refactor_tests {
                 local_gen: 0,
                 conceal_mask_gen: 0,
                 conceal_gen: 0,
-                crop_hash: 0,
             },
             color_ai_hash: 0,
             bg: 0,
@@ -7016,7 +7046,6 @@ mod pipeline_cache_refactor_tests {
                 local_gen: 0,
                 conceal_mask_gen: 0,
                 conceal_gen: 0,
-                crop_hash: 0,
             },
             color_ai_hash: 0xAAAA,
             bg: 0,
@@ -7033,7 +7062,6 @@ mod pipeline_cache_refactor_tests {
                 local_gen: 0,
                 conceal_mask_gen: 0,
                 conceal_gen: 0,
-                crop_hash: 0,
             },
             color_ai_hash: 0xBBBB,
             bg: 0,
@@ -7109,7 +7137,6 @@ mod pipeline_cache_refactor_tests {
                 local_gen: 0,
                 conceal_mask_gen: 0,
                 conceal_gen: 0,
-                crop_hash: 0,
             },
             color_ai_hash: 0,
             bg: 0,
@@ -7139,7 +7166,6 @@ mod pipeline_cache_refactor_tests {
                 local_gen: 0,
                 conceal_mask_gen: 0,
                 conceal_gen: 0,
-                crop_hash: 0,
             },
             color_ai_hash: 0,
             bg: 0,
@@ -7350,7 +7376,6 @@ mod pipeline_display_edit_split_tests {
             local_gen: 0,
             conceal_mask_gen: 0,
             conceal_gen: app.conceal_generation,
-            crop_hash: 0,
         };
         let final_key = FinalCompositeKey {
             edit_key,

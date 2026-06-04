@@ -291,7 +291,7 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
 | `erase_result_cache` | `HashMap<EraseResultKey, EraseResultCacheEntry>` | 消しゴム MI-GAN 確定結果。`idx + input_generation + erase_mask_generation` で識別 |
 | `local_adjust_cache` | `HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>` | 補正レイヤー合成結果。`idx + input_generation + erase_mask_generation + local_adjust_generation` で識別 |
 | `conceal_cache` | `HashMap<idx, ConcealCacheEntry>` | 隠蔽加工合成済みテクスチャ |
-| `edit_result_cache` | `HashMap<EditResultKey, EditResultEntry>` | `raw -> erase -> local_adjust -> conceal -> crop` の source 解像度 edit 結果。AdjustParams / AI / post_filter は含めない |
+| `edit_result_cache` | `HashMap<EditResultKey, EditResultEntry>` | `raw -> erase -> local_adjust -> conceal` の source 解像度 edit 結果。AdjustParams / AI / post_filter / crop は含めない |
 | `final_ai_cache` | `HashMap<FinalAiKey, Arc<ColorImage>>` | 色調補正後の edit 結果へ AI アップスケール / デノイズを適用した結果 |
 | `final_composite_cache` | `HashMap<FinalCompositeKey, FinalCompositeEntry>` | edit 結果に AdjustParams 全項目、final AI、post_filter を適用した通常表示用テクスチャ |
 
@@ -319,10 +319,16 @@ final 表示解像度が変わっても、source 解像度の edit cache とマ�
 2. 消しゴムマスクがあれば `erase_result_cache`
 3. 補正レイヤーがあれば `local_adjust_cache`
 4. 隠蔽マスク / プレビューがあれば `conceal_cache`
-5. crop があれば `export_crop` の矩形で切り出し
 
 この段階では AdjustParams / final AI / post_filter を一切適用しない。色調スライダーの
 drag 中でも `edit_result_cache` は再利用されるため、マスクやブラシ stroke の重い再計算が走らない。
+
+**crop は表示パイプラインに含めない** (通常表示は crop 外を暗くする overlay のみで、
+画像そのものは切り取らない)。実際の切り出しは Ctrl+S コピー / Ctrl+E 書き出しの最終段で
+`App::export_crop_rect_for_pixels` を使い、final composite (AI アップスケール後で source と
+サイズが違いうる) のピクセル座標へ crop 矩形をスケールして適用する。したがって crop の
+変更は `edit_result_cache` / final cache を無効化しない (無効化すると crop ドラッグのたびに
+AI を無駄に再実行してしまう)。
 
 ### 3.2 final pipeline の適用タイミング
 
@@ -339,7 +345,7 @@ AI 完了時に未完了の final composite を捨てて再合成する。
 ### 3.3 サムネイル補正
 
 サムネイルは `thumb_pixels` から色調補正のみを同期適用し、`thumb_adjust_tex` に保持する。
-edit 系 (erase / local_adjust / conceal / crop) は反映しない。post_filter と AI もサムネでは
+edit 系 (erase / local_adjust / conceal) や crop は反映しない。post_filter と AI もサムネでは
 実行しない。スライダー drag 中は補正サムネ生成を止め、release 後に visible 優先で再生成する。
 
 ### 3.4 補正レイヤーの適用タイミング
@@ -400,7 +406,8 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 | 回転変更 | **クリアしない** (描画時の GPU 行列で回転) | **クリアしない** (同左) | **クリアしない** | — |
 | 消しゴムマスク変更 | 該当 idx をクリア | 該当 idx をクリア | 触らない (`thumb_pixels` は元サムネソース、マスクで変わらない) | erase/local/conceal/final pending をキャンセル |
 | 補正レイヤー変更 | 該当 idx をクリア | 該当 idx をクリア | 触らない (サムネ画像には反映しない) | local/final pending をキャンセル |
-| 隠蔽加工 / crop 変更 | 該当 idx をクリア | 該当 idx をクリア | 触らない | final pending をキャンセル |
+| 隠蔽加工変更 | 該当 idx をクリア | 該当 idx をクリア | 触らない | final pending をキャンセル |
+| crop 変更 | **クリアしない** (表示は overlay のみ) | **クリアしない** | 触らない | **触らない** (AI を無駄にキャンセルしない) |
 
 *「色系」= brightness/contrast/gamma/saturation/temperature/levels/auto_mode
 (ポストフィルタは AI 設定を変えないので `ai_settings_eq` には含まれず、色系変更と同じ扱い)
@@ -431,8 +438,9 @@ fn clear_all_final_pipeline_caches(&mut self)
 ```
 
 AdjustParams / AI / post_filter だけが変わる操作は `clear_final_pipeline_caches_for_idx`、
-edit 系 (erase / local_adjust / conceal / crop) が変わる操作は `clear_edit_result_caches_for_idx`
+edit 系 (erase / local_adjust / conceal) が変わる操作は `clear_edit_result_caches_for_idx`
 を使う。final cache は edit cache の下流なので、edit 側を落とすと final 側も必ず落ちる。
+crop は表示パイプライン外 (save 時のみ適用) なので、crop 変更ではこれらを呼ばない。
 
 `set_page_params` / `clear_page_params` / `apply_params_to_all_pages` /
 `clear_all_page_params` / `copy_params_to_global` の実装内でも、必要に応じて
@@ -472,11 +480,17 @@ failed / pending をクリアする。これがないと
     ├─ mask_db (消しゴムマスク) ─▶ MI-GAN で inpaint ─▶ erase_result_cache
     │                                                       │
     ▼                                                       ▼
-local_adjust_cache ─▶ conceal_cache ─▶ crop ─▶ edit_result_cache
-                                                   │
-                                                   ▼
+local_adjust_cache ─▶ conceal_cache ─▶ edit_result_cache
+                                           │
+                                           ▼
                          色調補正 ─▶ final AI ─▶ post_filter ─▶ final_composite_cache ─▶ 画面
+                                                                       │
+                                                                       ▼
+                                     (Ctrl+S / Ctrl+E のみ) crop で切り出し ─▶ 保存
 ```
+
+crop は通常表示には反映されず (crop 外を暗くする overlay のみ)、保存 / 書き出し時に
+final composite を crop 矩形で切り出す最終段としてだけ働く。
 
 `fs_cache` は raw decode 専用で、消しゴム確定結果を書き戻さない。マスクが存在する画像は
 表示時に `ensure_erase_result_texture` が source 解像度の raw 入力

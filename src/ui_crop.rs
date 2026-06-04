@@ -72,6 +72,43 @@ impl App {
         egui::Rect::from_min_size(pos, egui::vec2(PANEL_W, h))
     }
 
+    /// 切り取りモードに入る。見開き double 表示中は消しゴム / 隠蔽加工と同じく
+    /// Single ページへ pivot し、退場時に spread 状態を復元する。crop は表示 overlay
+    /// のみで重い合成が無いため、post_filter バイパスや base cache 準備は行わない。
+    pub(crate) fn enter_export_crop_mode(&mut self, fs_idx: usize) {
+        let spread_pair = match self.resolve_spread_pair(fs_idx) {
+            crate::ui_fullscreen::SpreadPair::Double { left, right } => Some((left, right)),
+            crate::ui_fullscreen::SpreadPair::Single => None,
+        };
+        if let Some(pair) = spread_pair {
+            self.export_crop_spread_ctx = Some(crate::app::EraseSpreadCtx {
+                saved_mode: self.spread_mode,
+                pair,
+            });
+            self.spread_mode = crate::settings::SpreadMode::Single;
+            self.fullscreen_idx = Some(pair.0);
+            self.fs_zoom = 1.0;
+            self.fs_pan = egui::Vec2::ZERO;
+        }
+        self.export_crop_mode = true;
+        self.export_crop_drag = None;
+        self.export_crop_create_drag = None;
+    }
+
+    /// 切り取りモードを終了する。crop 矩形はドラッグ確定ごとに DB / サイドカーへ
+    /// 保存済みなので、ここでは flag / ドラッグ状態のクリアと spread 復元だけ行う。
+    pub(crate) fn reset_export_crop_mode(&mut self) {
+        self.export_crop_mode = false;
+        self.export_crop_drag = None;
+        self.export_crop_create_drag = None;
+        if let Some(ctx) = self.export_crop_spread_ctx.take() {
+            self.spread_mode = ctx.saved_mode;
+            self.fullscreen_idx = Some(ctx.pair.0);
+            self.fs_zoom = 1.0;
+            self.fs_pan = egui::Vec2::ZERO;
+        }
+    }
+
     pub(crate) fn handle_export_crop_keys(
         &mut self,
         ctx: &egui::Context,
@@ -85,13 +122,11 @@ impl App {
             jump_to: None,
         };
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            self.export_crop_mode = false;
-            self.export_crop_drag = None;
-            self.export_crop_create_drag = None;
+            self.reset_export_crop_mode();
             return action;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E)) {
-            self.export_crop_mode = false;
+            self.reset_export_crop_mode();
             self.open_export_dialog_for_current(ctx, fs_idx);
         }
         action
@@ -111,7 +146,6 @@ impl App {
         let panel_pos = panel_rect.min;
         let panel_h = panel_rect.height();
         let mut close = false;
-        let mut open_export = false;
 
         egui::Area::new(egui::Id::new("export_crop_panel"))
             .order(egui::Order::Foreground)
@@ -126,35 +160,51 @@ impl App {
                     egui::Sense::click(),
                 );
                 egui::Frame::popup(ui.style())
-                    .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 24, 238))
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                    ))
+                    .corner_radius(6.0)
                     .show(ui, |ui| {
                         ui.set_min_width(PANEL_W);
                         ui.set_max_width(PANEL_W);
                         ui.set_max_height(panel_h);
+                        // ⚠ テーマに依存せず常に DARK visuals を使う (隠蔽加工パネルと同じ。
+                        // これが無いとライトテーマで widget 背景色が崩れる)。
+                        *ui.visuals_mut() = egui::Visuals::dark();
                         ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
 
                         ui.horizontal(|ui| {
-                            ui.heading("エクスポート");
+                            ui.heading("切り取り");
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("×").clicked() {
+                                    // 閉じる × ボタン (隠蔽加工パネルと同じ自前描画)。
+                                    let (close_rect, close_resp) = ui.allocate_exact_size(
+                                        egui::vec2(26.0, 22.0),
+                                        egui::Sense::click(),
+                                    );
+                                    let close_bg = if close_resp.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(220, 80, 80, 200)
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
+                                    };
+                                    ui.painter().rect_filled(close_rect, 4.0, close_bg);
+                                    crate::ui_fullscreen::draw_icons::draw_close_icon(
+                                        ui.painter(),
+                                        close_rect.center(),
+                                        8.0,
+                                    );
+                                    if close_resp.clicked() {
                                         close = true;
                                     }
+                                    close_resp.on_hover_text("閉じる (Esc)");
                                 },
                             );
                         });
                         ui.separator();
 
-                        if ui.button("エクスポート...").clicked() {
-                            open_export = true;
-                        }
-                        if ui.button("出力フォルダを開く").clicked() {
-                            self.open_capture_output_dir();
-                        }
-
-                        ui.separator();
-                        ui.label("切り取り");
                         let Some(image_size) = image_size else {
                             ui.add_enabled(false, egui::Button::new("画像読み込み待ち"));
                             return;
@@ -165,13 +215,7 @@ impl App {
             });
 
         if close {
-            self.export_crop_mode = false;
-            self.export_crop_drag = None;
-            self.export_crop_create_drag = None;
-        }
-        if open_export {
-            self.export_crop_mode = false;
-            self.open_export_dialog_for_current(ctx, fs_idx);
+            self.reset_export_crop_mode();
         }
     }
 
@@ -196,15 +240,19 @@ impl App {
             || current.is_some_and(|settings| settings.aspect_mode != aspect_mode)
         {
             self.export_crop_aspect_mode = aspect_mode;
-            if let Some(mut settings) = current {
+            if let Some(ratio) = aspect_mode.aspect_ratio() {
+                // 固定比率を選んだら、その比率で「画像中央寄せ・最大面積」の crop を
+                // 即座に設定する (current が無くても作成。次のドラッグを待たない)。
+                let rect = CropRect::full(image_size[0], image_size[1])
+                    .fit_to_aspect_around_center(ratio, image_size[0], image_size[1]);
+                self.set_export_crop_for_idx(
+                    fs_idx,
+                    Some(CropSettings { rect, aspect_mode }),
+                    image_size,
+                );
+            } else if let Some(mut settings) = current {
+                // 自由 / 現在比率: 既存 crop の比率モードだけ更新し rect は維持する。
                 settings.aspect_mode = aspect_mode;
-                if let Some(ratio) = self.export_crop_aspect_ratio(settings, image_size) {
-                    settings.rect = settings.rect.fit_to_aspect_around_center(
-                        ratio,
-                        image_size[0],
-                        image_size[1],
-                    );
-                }
                 self.set_export_crop_for_idx(fs_idx, Some(settings), image_size);
             }
         }
@@ -221,7 +269,13 @@ impl App {
                 .add_enabled(!active, egui::Button::new("有効化"))
                 .clicked()
             {
-                let rect = centered_default_crop(image_size);
+                // 固定比率が選ばれていればその比率で中央寄せ・最大面積、
+                // 自由 / 現在比率なら 80% 中央のデフォルト矩形を作る。
+                let rect = match aspect_mode.aspect_ratio() {
+                    Some(ratio) => CropRect::full(image_size[0], image_size[1])
+                        .fit_to_aspect_around_center(ratio, image_size[0], image_size[1]),
+                    None => centered_default_crop(image_size),
+                };
                 self.set_export_crop_for_idx(
                     fs_idx,
                     Some(CropSettings { rect, aspect_mode }),

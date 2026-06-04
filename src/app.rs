@@ -1011,21 +1011,6 @@ fn hash_adjust_final_params(
     })
 }
 
-fn hash_crop_settings(settings: Option<crate::export_crop::CropSettings>) -> u64 {
-    use std::hash::Hash;
-    runtime_hash_with(|h| {
-        if let Some(settings) = settings {
-            settings.rect.min_x.to_bits().hash(h);
-            settings.rect.min_y.to_bits().hash(h);
-            settings.rect.max_x.to_bits().hash(h);
-            settings.rect.max_y.to_bits().hash(h);
-            settings.aspect_mode.stable_key().hash(h);
-        } else {
-            0u8.hash(h);
-        }
-    })
-}
-
 /// 3 種の検索モード。相互排他制御 (`close_other_search_bars`) 用。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SearchMode {
@@ -1753,7 +1738,6 @@ pub(crate) struct EditResultKey {
     pub(crate) local_gen: u64,
     pub(crate) conceal_mask_gen: u64,
     pub(crate) conceal_gen: u64,
-    pub(crate) crop_hash: u64,
 }
 
 pub(crate) struct EditResultEntry {
@@ -3391,6 +3375,9 @@ pub struct App {
     pub(crate) export_crop_drag: Option<ExportCropDrag>,
     /// crop 新規作成ドラッグ。
     pub(crate) export_crop_create_drag: Option<ExportCropCreateDrag>,
+    /// 見開きから切り取りモードに入ったときの spread 状態スナップショット
+    /// (消しゴム / 隠蔽加工と同じく Single へ pivot し、退場時に復元する)。
+    pub(crate) export_crop_spread_ctx: Option<EraseSpreadCtx>,
     /// 補正レイヤーパネルで選択中のレイヤー index。ページごとに保持する。
     pub(crate) local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
     /// 補正レイヤー追加時のマスク種類選択ダイアログ。
@@ -4737,6 +4724,7 @@ impl App {
             export_crop_aspect_mode: crate::export_crop::CropAspectMode::Free,
             export_crop_drag: None,
             export_crop_create_drag: None,
+            export_crop_spread_ctx: None,
             local_adjust_selected_layers: std::collections::HashMap::new(),
             local_adjust_add_layer_dialog_open: false,
             local_adjust_change_mask_dialog_open: false,
@@ -8845,6 +8833,7 @@ impl App {
         self.export_crop_mode = false;
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
+        self.export_crop_spread_ctx = None;
         self.local_adjust_page_layers.clear();
         self.local_adjust_pages.clear();
         self.export_crop_page_settings.clear();
@@ -10001,6 +9990,7 @@ impl App {
         self.export_crop_mode = false;
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
+        self.export_crop_spread_ctx = None;
         self.cancel_all_local_adjust_pending();
         self.local_adjust_lut_pending = None;
         self.local_adjust_segmentation_pending = None;
@@ -17400,14 +17390,17 @@ impl App {
         }
         self.reset_erase_mode();
         self.reset_conceal_mode();
+        // close は fullscreen_idx=None を維持する。spread_ctx を残すと
+        // reset_export_crop_mode が fullscreen_idx を旧ページへ復元してしまい、
+        // フォルダロード経路 (start_loading_items→close_fullscreen) で stale な
+        // fullscreen idx を引き継ぐため、復元せず破棄する (Codex P1)。
+        self.export_crop_spread_ctx = None;
+        self.reset_export_crop_mode();
         self.local_adjust_mode = false;
         self.local_adjust_add_layer_dialog_open = false;
         self.local_adjust_change_mask_dialog_open = false;
         self.local_adjust_change_mask_keep_manual_override = true;
         self.local_adjust_effect_picker_dialog_open = false;
-        self.export_crop_mode = false;
-        self.export_crop_drag = None;
-        self.export_crop_create_drag = None;
         self.local_adjust_canvas_drag = None;
         self.local_adjust_mask_brush_stroke = None;
         self.local_adjust_mask_lasso_points.clear();
@@ -18248,7 +18241,7 @@ impl App {
             return false;
         };
         let params = self.effective_params(idx);
-        let edit_key = self.current_edit_result_key_for_size(idx, pixels.size);
+        let edit_key = self.current_edit_result_key(idx);
         let Some(key) = self.final_ai_key_for_pixels(edit_key, pixels.size, params) else {
             // AI 不要 (= モデル未設定 or skip_px 超) → done
             return true;
@@ -18768,7 +18761,10 @@ impl App {
             self.export_crop_page_settings.remove(&idx);
             self.export_crop_pages.remove(&idx);
         }
-        self.clear_edit_result_caches_for_idx(idx);
+        // crop は表示パイプライン (edit_result / final composite) に含まれない (暗転
+        // overlay のみ。実切り出しは save 時)。よって edit_result / final AI キャッシュは
+        // 無効化しない。無効化すると crop ドラッグのたびに AI アップスケールを無駄に
+        // 再実行 / キャンセルしてしまう (Codex P2)。
     }
 
     pub(crate) fn set_export_crop_for_idx_memory_only(
@@ -18787,7 +18783,7 @@ impl App {
             self.export_crop_page_settings.remove(&idx);
             self.export_crop_pages.remove(&idx);
         }
-        self.clear_edit_result_caches_for_idx(idx);
+        // (上記 set_export_crop_for_idx と同じ理由でキャッシュ無効化しない。Codex P2)
     }
 
     pub(crate) fn export_crop_for_idx(
@@ -18800,6 +18796,33 @@ impl App {
             .copied()
             .map(|settings| settings.sanitized(image_size[0], image_size[1]))
             .filter(|settings| !settings.is_full(image_size[0], image_size[1]))
+    }
+
+    /// 保存対象画像 (final composite。AI アップスケールで source とサイズが違うことが
+    /// ある) のピクセル座標へスケールした crop 矩形を返す。crop は source 座標で保存
+    /// されているので、`target_size / source_size` の比で等比拡縮する。表示は切り取らず
+    /// capture / export の最終段でだけ使う。
+    pub(crate) fn export_crop_rect_for_pixels(
+        &self,
+        idx: usize,
+        target_size: [usize; 2],
+    ) -> Option<crate::export_crop::CropRect> {
+        let source_size = self.current_raw_source_pixels(idx)?.size;
+        let crop = self.export_crop_for_idx(idx, source_size)?;
+        if source_size == target_size {
+            return Some(crop.rect);
+        }
+        let sx = target_size[0] as f32 / source_size[0].max(1) as f32;
+        let sy = target_size[1] as f32 / source_size[1].max(1) as f32;
+        Some(
+            crate::export_crop::CropRect {
+                min_x: crop.rect.min_x * sx,
+                min_y: crop.rect.min_y * sy,
+                max_x: crop.rect.max_x * sx,
+                max_y: crop.rect.max_y * sy,
+            }
+            .sanitized(target_size[0], target_size[1]),
+        )
     }
 
     /// 現在の input / erase mask / local adjust 世代から、補正レイヤー cache key を作る。
@@ -19824,12 +19847,7 @@ impl App {
         Some(tex)
     }
 
-    fn current_edit_result_key_for_size(
-        &self,
-        idx: usize,
-        source_size: [usize; 2],
-    ) -> EditResultKey {
-        let crop = self.export_crop_for_idx(idx, source_size);
+    fn current_edit_result_key(&self, idx: usize) -> EditResultKey {
         EditResultKey {
             idx,
             source_gen: self.input_generation.get(&idx).copied().unwrap_or(0),
@@ -19837,7 +19855,6 @@ impl App {
             local_gen: self.local_adjust_generation.get(&idx).copied().unwrap_or(0),
             conceal_mask_gen: self.conceal_mask_generation.get(&idx).copied().unwrap_or(0),
             conceal_gen: self.conceal_generation,
-            crop_hash: hash_crop_settings(crop),
         }
     }
 
@@ -19846,8 +19863,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<(EditResultKey, Arc<egui::ColorImage>)> {
-        let source_size = self.current_raw_source_pixels(idx)?.size;
-        let key = self.current_edit_result_key_for_size(idx, source_size);
+        let key = self.current_edit_result_key(idx);
         if let Some(entry) = self.edit_result_cache.get(&key) {
             return Some((key, Arc::clone(&entry.pixels)));
         }
@@ -19876,22 +19892,18 @@ impl App {
             }
         }
 
-        if let Some(crop) = self.export_crop_for_idx(idx, source_size) {
-            let cropped = crate::export_crop::crop_color_image(&pixels, crop.rect).ok()?;
-            pixels = Arc::new(cropped);
-        }
-
+        // crop は表示パイプラインでは適用しない (暗転 overlay のみ)。実際の切り出しは
+        // capture / export の最終段で `export_crop_rect_for_pixels` を使って行う。
         let upload = clamp_for_gpu(&pixels);
         let texture = ctx.load_texture(
             format!(
-                "edit_result_{}_{}_{}_{}_{}_{}_{}",
+                "edit_result_{}_{}_{}_{}_{}_{}",
                 key.idx,
                 key.source_gen,
                 key.erase_mask_gen,
                 key.local_gen,
                 key.conceal_mask_gen,
-                key.conceal_gen,
-                key.crop_hash
+                key.conceal_gen
             ),
             upload.into_owned(),
             egui::TextureOptions::LINEAR,
@@ -22648,6 +22660,7 @@ impl App {
         self.export_crop_mode = false;
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
+        self.export_crop_spread_ctx = None;
         self.local_adjust_canvas_drag = None;
         self.local_adjust_mask_brush_stroke = None;
         self.local_adjust_mask_lasso_points.clear();

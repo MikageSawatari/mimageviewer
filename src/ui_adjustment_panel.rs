@@ -10478,10 +10478,11 @@ impl App {
                         | crate::grid_item::GridItem::PdfPage { .. }
                 )
             );
-        // 右側 4 ボタン。左から 消しゴム / 補正レイヤー / 隠蔽加工 / エクスポート。
+        // 右側 5 ボタン。左から 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り / エクスポート。
         let btn_y = header_rect.center().y - HEADER_BTN_SIZE / 2.0;
         let export_btn_x = header_rect.max.x - HEADER_RIGHT_PAD - HEADER_BTN_SIZE;
-        let conceal_btn_x = export_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+        let crop_btn_x = export_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+        let conceal_btn_x = crop_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
         let local_adjust_btn_x = conceal_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
         let erase_btn_x = local_adjust_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
         let erase_rect = egui::Rect::from_min_size(
@@ -10496,6 +10497,10 @@ impl App {
             egui::pos2(conceal_btn_x, btn_y),
             egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
         );
+        let crop_rect = egui::Rect::from_min_size(
+            egui::pos2(crop_btn_x, btn_y),
+            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
+        );
         let export_rect = egui::Rect::from_min_size(
             egui::pos2(export_btn_x, btn_y),
             egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
@@ -10503,6 +10508,7 @@ impl App {
         let mut activate_erase = false;
         let mut activate_local_adjust = false;
         let mut activate_conceal = false;
+        let mut activate_crop = false;
         let mut activate_export = false;
 
         let erase_resp = draw_header_icon_button(
@@ -10544,13 +10550,26 @@ impl App {
             activate_conceal = true;
         }
 
+        let crop_resp = draw_header_icon_button(
+            &mut child,
+            crop_rect,
+            "adjust_panel_crop_btn",
+            can_overlay_edit,
+            false,
+            "切り取り",
+            crate::ui_fullscreen::draw_icons::draw_crop_icon,
+        );
+        if can_overlay_edit && crop_resp.clicked() {
+            activate_crop = true;
+        }
+
         let export_resp = draw_header_icon_button(
             &mut child,
             export_rect,
             "adjust_panel_export_btn",
             can_overlay_edit,
             false,
-            "エクスポート / 切り取り",
+            "エクスポート",
             crate::ui_fullscreen::draw_icons::draw_export_icon,
         );
         if can_overlay_edit && export_resp.clicked() {
@@ -10578,9 +10597,13 @@ impl App {
             self.enter_conceal_mode(fs_root_idx);
             return;
         }
+        if activate_crop {
+            self.adjustment_mode = false;
+            self.enter_export_crop_mode(fs_root_idx);
+            return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
+        }
         if activate_export {
             self.adjustment_mode = false;
-            self.export_crop_mode = false;
             let ctx = child.ctx().clone();
             self.open_export_dialog_for_current(&ctx, fs_idx);
             return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ

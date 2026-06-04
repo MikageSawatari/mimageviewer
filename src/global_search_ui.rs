@@ -1142,6 +1142,11 @@ impl App {
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
         self.mask_pages.clear();
+        // crop も idx ベース。`export_crop_for_idx` は DB 再ルックアップせず idx-map を
+        // 直読みするため、Ctrl+G の総入れ替えで残すと無関係な検索結果に旧 crop の暗転
+        // overlay が漏れる (Codex P1)。明示 clear する。
+        self.export_crop_page_settings.clear();
+        self.export_crop_pages.clear();
         // path-keyed キャッシュも Ctrl+G では items が総入れ替わりするのでリセット。
         self.metadata_cache.clear();
         self.exif_cache.clear();

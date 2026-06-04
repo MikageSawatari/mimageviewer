@@ -76,35 +76,52 @@ pub enum ExportScale {
     Full,
     Half,
     Quarter,
+    /// 長辺を指定 px 以下に縮小する (アップスケールはしない)。
+    LongEdge(u32),
 }
 
 impl ExportScale {
-    pub const ALL: [Self; 3] = [Self::Full, Self::Half, Self::Quarter];
+    /// 固定倍率の選択肢 (ダイアログのラジオで列挙する)。長辺 px 指定は別 UI で扱う。
+    pub const FIXED: [Self; 3] = [Self::Full, Self::Half, Self::Quarter];
+    /// 長辺 px 指定モードの既定値・範囲。
+    pub const DEFAULT_LONG_EDGE: u32 = 2048;
+    pub const LONG_EDGE_MIN: u32 = 256;
+    pub const LONG_EDGE_MAX: u32 = 16384;
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Self::Full => "そのまま",
-            Self::Half => "1/2 サイズ",
-            Self::Quarter => "1/4 サイズ",
+            Self::Full => "そのまま".to_string(),
+            Self::Half => "1/2 サイズ".to_string(),
+            Self::Quarter => "1/4 サイズ".to_string(),
+            Self::LongEdge(px) => format!("長辺 {px}px 以下"),
         }
     }
 
-    pub fn factor(self) -> f32 {
-        match self {
-            Self::Full => 1.0,
-            Self::Half => 0.5,
-            Self::Quarter => 0.25,
-        }
-    }
-
+    /// crop / 合成済みサイズを入力に、出力ピクセルサイズを返す。
+    /// `LongEdge(n)` は長辺が n を超えるときだけ縮小し、アップスケールはしない。
     pub fn scaled_size(self, size: [usize; 2]) -> [usize; 2] {
-        if self == Self::Full {
-            return [size[0].max(1), size[1].max(1)];
+        let w = size[0].max(1);
+        let h = size[1].max(1);
+        match self {
+            Self::Full => [w, h],
+            Self::Half => Self::scaled_by_factor(w, h, 0.5),
+            Self::Quarter => Self::scaled_by_factor(w, h, 0.25),
+            Self::LongEdge(px) => {
+                let target = px.max(1) as usize;
+                let long = w.max(h);
+                if long <= target {
+                    [w, h]
+                } else {
+                    Self::scaled_by_factor(w, h, target as f32 / long as f32)
+                }
+            }
         }
-        let factor = self.factor();
+    }
+
+    fn scaled_by_factor(w: usize, h: usize, factor: f32) -> [usize; 2] {
         [
-            ((size[0].max(1) as f32 * factor).round() as usize).max(1),
-            ((size[1].max(1) as f32 * factor).round() as usize).max(1),
+            ((w as f32 * factor).round() as usize).max(1),
+            ((h as f32 * factor).round() as usize).max(1),
         ]
     }
 }
@@ -762,6 +779,29 @@ mod tests {
         assert_eq!(
             ExportScale::Quarter.scaled_size(pixels.render_size()),
             [2, 1]
+        );
+    }
+
+    #[test]
+    fn export_scale_long_edge_downscales_only_when_larger() {
+        // 長辺が target を超えるときは長辺=target に合わせて等比縮小。
+        assert_eq!(
+            ExportScale::LongEdge(1000).scaled_size([4000, 2000]),
+            [1000, 500]
+        );
+        assert_eq!(
+            ExportScale::LongEdge(1000).scaled_size([2000, 4000]),
+            [500, 1000]
+        );
+        // 長辺が target 以下なら原寸のまま (アップスケールしない)。
+        assert_eq!(
+            ExportScale::LongEdge(4096).scaled_size([1920, 1080]),
+            [1920, 1080]
+        );
+        // 長辺がちょうど target なら原寸。
+        assert_eq!(
+            ExportScale::LongEdge(2048).scaled_size([2048, 1024]),
+            [2048, 1024]
         );
     }
 

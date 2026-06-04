@@ -25,7 +25,11 @@ pub enum CropAspectMode {
     Square,
     Ratio4x3,
     Ratio3x4,
+    /// 4:5。SNS フィードの縦長投稿でよく使われる。
+    Ratio4x5,
     Ratio16x9,
+    /// 1.91:1。SNS の横長フィード / リンクカードでよく使われる。
+    Ratio191x100,
     Ratio9x16,
 }
 
@@ -50,13 +54,17 @@ pub enum CropHandle {
 }
 
 impl CropAspectMode {
-    pub const ALL: [Self; 7] = [
+    /// ドロップダウン表示順。自由 / 現在比率 のあと、固定比率は横長 → 縦長の順に並べる
+    /// (1.91:1 → 16:9 → 4:3 → 1:1 → 4:5 → 3:4 → 9:16)。
+    pub const ALL: [Self; 9] = [
         Self::Free,
         Self::Keep,
-        Self::Square,
-        Self::Ratio4x3,
-        Self::Ratio3x4,
+        Self::Ratio191x100,
         Self::Ratio16x9,
+        Self::Ratio4x3,
+        Self::Square,
+        Self::Ratio4x5,
+        Self::Ratio3x4,
         Self::Ratio9x16,
     ];
 
@@ -67,7 +75,9 @@ impl CropAspectMode {
             Self::Square => "1:1",
             Self::Ratio4x3 => "4:3",
             Self::Ratio3x4 => "3:4",
+            Self::Ratio4x5 => "4:5 (SNS縦長)",
             Self::Ratio16x9 => "16:9",
+            Self::Ratio191x100 => "1.91:1 (SNS横長)",
             Self::Ratio9x16 => "9:16",
         }
     }
@@ -79,7 +89,9 @@ impl CropAspectMode {
             Self::Square => "square",
             Self::Ratio4x3 => "4x3",
             Self::Ratio3x4 => "3x4",
+            Self::Ratio4x5 => "4x5",
             Self::Ratio16x9 => "16x9",
+            Self::Ratio191x100 => "191x100",
             Self::Ratio9x16 => "9x16",
         }
     }
@@ -90,7 +102,9 @@ impl CropAspectMode {
             "square" => Self::Square,
             "4x3" => Self::Ratio4x3,
             "3x4" => Self::Ratio3x4,
+            "4x5" => Self::Ratio4x5,
             "16x9" => Self::Ratio16x9,
+            "191x100" => Self::Ratio191x100,
             "9x16" => Self::Ratio9x16,
             _ => Self::Free,
         }
@@ -102,7 +116,9 @@ impl CropAspectMode {
             Self::Square => Some(1.0),
             Self::Ratio4x3 => Some(4.0 / 3.0),
             Self::Ratio3x4 => Some(3.0 / 4.0),
+            Self::Ratio4x5 => Some(4.0 / 5.0),
             Self::Ratio16x9 => Some(16.0 / 9.0),
+            Self::Ratio191x100 => Some(1.91),
             Self::Ratio9x16 => Some(9.0 / 16.0),
         }
     }
@@ -533,6 +549,26 @@ impl CropDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aspect_mode_stable_key_round_trips_all_variants() {
+        for mode in CropAspectMode::ALL {
+            assert_eq!(
+                CropAspectMode::from_stable_key(mode.stable_key()),
+                mode,
+                "stable_key round-trip failed for {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sns_aspect_ratios_have_expected_values() {
+        assert_eq!(CropAspectMode::Ratio4x5.aspect_ratio(), Some(0.8));
+        assert_eq!(CropAspectMode::Ratio191x100.aspect_ratio(), Some(1.91));
+        // 縦長 (4:5) は < 1、横長 (1.91:1) は > 1。
+        assert!(CropAspectMode::Ratio4x5.aspect_ratio().unwrap() < 1.0);
+        assert!(CropAspectMode::Ratio191x100.aspect_ratio().unwrap() > 1.0);
+    }
 
     #[test]
     fn crop_rect_sanitizes_to_image_bounds() {

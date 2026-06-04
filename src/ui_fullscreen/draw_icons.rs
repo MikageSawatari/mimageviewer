@@ -275,6 +275,34 @@ pub(crate) fn draw_export_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     );
 }
 
+/// 切り取り (crop) アイコン。重なった 2 本の L 字マークで写真のトリミング枠を表す。
+pub(crate) fn draw_crop_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let white = egui::Color32::WHITE;
+    let stroke = egui::Stroke::new(1.8, white);
+    let a = r * 0.45; // 内側フレームの半幅
+    let ext = r * 0.95; // アームの外側端
+    // 左アーム (縦) — 上に飛び出す
+    painter.line_segment(
+        [egui::pos2(c.x - a, c.y - ext), egui::pos2(c.x - a, c.y + a)],
+        stroke,
+    );
+    // 上アーム (横) — 左に飛び出す
+    painter.line_segment(
+        [egui::pos2(c.x - ext, c.y - a), egui::pos2(c.x + a, c.y - a)],
+        stroke,
+    );
+    // 右アーム (縦) — 下に飛び出す
+    painter.line_segment(
+        [egui::pos2(c.x + a, c.y - a), egui::pos2(c.x + a, c.y + ext)],
+        stroke,
+    );
+    // 下アーム (横) — 右に飛び出す
+    painter.line_segment(
+        [egui::pos2(c.x - a, c.y + a), egui::pos2(c.x + ext, c.y + a)],
+        stroke,
+    );
+}
+
 /// 補正レイヤーアイコン。重なった薄いシートで「非破壊レイヤー」を表す。
 pub(crate) fn draw_local_adjust_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let white = egui::Color32::WHITE;

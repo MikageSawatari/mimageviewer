@@ -2182,6 +2182,28 @@ impl App {
                                 && !state.original_preview_active
                                 && (self.export_crop_mode || has_crop)
                             {
+                                // crop overlay は full_rect ではなく、実際に表示されている
+                                // 画像のフィット矩形 (レターボックス + zoom/pan 反映) に
+                                // 写像する (消しゴム / 隠蔽の image_layout と同じ作法)。
+                                // 既知の制限: 回転 / 自由回転は未対応 (消しゴム / 隠蔽の
+                                // overlay と同じく source 座標で写像する)。保存は source 方位の
+                                // composite に crop を適用するので正しいが、回転表示中は
+                                // overlay の向きが表示とズレる (アプリ全体の overlay 共通制限)。
+                                let crop_image_rect = {
+                                    let display_size = egui::vec2(w as f32, h as f32);
+                                    let fit_scale = (full_rect.width() / display_size.x)
+                                        .min(full_rect.height() / display_size.y);
+                                    let (total_scale, center) = match self.fs_zoom_pan() {
+                                        Some((zoom, pan)) => {
+                                            (fit_scale * zoom, full_rect.center() + pan)
+                                        }
+                                        None => (fit_scale, full_rect.center()),
+                                    };
+                                    egui::Rect::from_center_size(
+                                        center,
+                                        display_size * total_scale,
+                                    )
+                                };
                                 let pointer_allowed = !self.any_dialog_open()
                                     && !ctx.input(|i| {
                                         i.pointer.hover_pos().is_some_and(|p| {
@@ -2190,7 +2212,7 @@ impl App {
                                     });
                                 let used = self.draw_export_crop_overlay(
                                     ui,
-                                    image_rect,
+                                    crop_image_rect,
                                     fs_idx,
                                     image_size,
                                     pointer_allowed,
@@ -8890,9 +8912,13 @@ impl App {
         let pixels = self
             .ensure_final_composite_pixels(ctx, idx)
             .ok_or_else(|| "最終合成の完了後に再実行してください".to_string())?;
-        Ok(crate::capture::CapturePixelJob::already_adjusted(
-            basename, pixels,
-        ))
+        let size = pixels.size;
+        let mut job = crate::capture::CapturePixelJob::already_adjusted(basename, pixels);
+        // crop は表示パイプラインでは適用しないので、最終段でここで切り出す。
+        if let Some(rect) = self.export_crop_rect_for_pixels(idx, size) {
+            job = job.with_crop(rect);
+        }
+        Ok(job)
     }
 
     #[allow(dead_code)] // Legacy export variant path; final composite is used in v1.1.0 P1.
@@ -9117,10 +9143,13 @@ impl App {
         let base_pixels = self
             .ensure_final_composite_pixels(ctx, idx)
             .ok_or_else(|| "最終合成の完了後にエクスポートしてください".to_string())?;
+        // crop は表示には反映しないので、export の最終段で base_pixels (= final
+        // composite。AI アップスケールで source とサイズが違いうる) に対して切り出す。
+        let crop = self.export_crop_rect_for_pixels(idx, base_pixels.size);
         Ok(crate::export_dialog::ExportPagePixels {
             base_pixels,
             conceal_mask: None,
-            crop: None,
+            crop,
         })
     }
 
@@ -9241,7 +9270,7 @@ impl App {
                 let base_size = state.pixels.render_size();
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
-                    for scale in crate::export_dialog::ExportScale::ALL {
+                    for scale in crate::export_dialog::ExportScale::FIXED {
                         let [w, h] = scale.scaled_size(base_size);
                         ui.radio_value(
                             &mut state.scale,
@@ -9249,6 +9278,34 @@ impl App {
                             format!("{} ({}×{})", scale.label(), w, h),
                         );
                     }
+                    // 長辺 px 指定 (AI アップスケールの巨大サイズを一定上限へ収める用途)。
+                    let mut long_edge_px = match state.scale {
+                        crate::export_dialog::ExportScale::LongEdge(px) => px,
+                        _ => crate::export_dialog::ExportScale::DEFAULT_LONG_EDGE,
+                    };
+                    let is_long_edge =
+                        matches!(state.scale, crate::export_dialog::ExportScale::LongEdge(_));
+                    let [lw, lh] = crate::export_dialog::ExportScale::LongEdge(long_edge_px)
+                        .scaled_size(base_size);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .radio(is_long_edge, format!("長辺指定 ({lw}×{lh})"))
+                            .clicked()
+                        {
+                            state.scale = crate::export_dialog::ExportScale::LongEdge(long_edge_px);
+                        }
+                        let resp = ui.add(
+                            egui::DragValue::new(&mut long_edge_px)
+                                .range(
+                                    crate::export_dialog::ExportScale::LONG_EDGE_MIN
+                                        ..=crate::export_dialog::ExportScale::LONG_EDGE_MAX,
+                                )
+                                .suffix("px"),
+                        );
+                        if resp.changed() {
+                            state.scale = crate::export_dialog::ExportScale::LongEdge(long_edge_px);
+                        }
+                    });
                 });
 
                 ui.separator();
