@@ -974,6 +974,14 @@ fn rotate_blit(
 /// horizontal/vertical flips, a sticker outline (silhouette-alpha dilation laid
 /// behind), and `opacity`. Object rotation is handled by `bake_into` (this draws
 /// unrotated). `img` is straight-alpha RGBA in any source resolution.
+///
+/// Delegates the image+halo composite to [`composite_stamp_sticker`] (the same fn
+/// the lab's GPU quad path uses) and blits the result as **one unit** with
+/// `opacity`. So an outlined stamp fades identically whether it renders here (CPU
+/// bake, e.g. below a bubble) or as a GPU quad (top-z run). Source-over is
+/// associative, so at opacity 1 this is pixel-identical to compositing halo then
+/// fill straight onto the overlay; at opacity < 1 both paths now fade the
+/// composited sticker as a whole (see `sticker_matches_cpu_bake`).
 fn draw_stamp(
     overlay: &mut RgbaOverlay,
     pivot: (f32, f32),
@@ -992,21 +1000,70 @@ fn draw_stamp(
     const STAMP_MAX_PX: usize = 8192;
     let tw = ((stamp.half_w * 2.0).round().max(1.0) as usize).min(STAMP_MAX_PX);
     let th = ((stamp.half_h * 2.0).round().max(1.0) as usize).min(STAMP_MAX_PX);
-    // Center the (possibly capped) bitmap on the pivot. Using the rasterized size
-    // keeps a capped/degenerate stamp centered instead of drawn off-pivot.
-    let left = pivot.0 - tw as f32 * 0.5;
-    let top = pivot.1 - th as f32 * 0.5;
-    let (ow, oh) = (overlay.w as i32, overlay.h as i32);
 
-    // Resolve the source into a target-sized straight-alpha RGBA buffer, applying
-    // flips. Sampling the source center of each target texel keeps scaling smooth.
+    let (sticker, rad) =
+        composite_stamp_sticker(img, stamp.flip_h, stamp.flip_v, tw, th, stamp.outline);
+    // The sticker's image occupies the centered (capped) tw×th rect; its halo adds
+    // `rad` px of padding on every side, so its top-left lands at this float origin.
+    let left = pivot.0 - tw as f32 * 0.5 - rad as f32;
+    let top = pivot.1 - th as f32 * 0.5 - rad as f32;
+    blit_overlay_with_opacity(overlay, &sticker, left, top, opacity);
+}
+
+/// Blit a standalone straight-alpha `src` overlay onto `dst` at float origin
+/// (`ox`,`oy`) with a uniform `opacity` (source-over). Truncating `ox + sx` per
+/// pixel reproduces the legacy per-texel placement exactly. Used to lay a
+/// pre-composited stamp sticker onto the bake so the CPU path and the GPU quad
+/// path fade an outlined stamp identically (as one unit).
+fn blit_overlay_with_opacity(
+    dst: &mut RgbaOverlay,
+    src: &RgbaOverlay,
+    ox: f32,
+    oy: f32,
+    opacity: f32,
+) {
+    let dh = dst.h as i32;
+    for sy in 0..src.h {
+        let dy = (oy + sy as f32) as i32;
+        if dy < 0 || dy >= dh {
+            continue;
+        }
+        for sx in 0..src.w {
+            let i = (sy * src.w + sx) * 4;
+            let a = src.pixels[i + 3];
+            if a == 0 {
+                continue;
+            }
+            let dx = (ox + sx as f32) as i32;
+            // blend_px clamps x to the destination bounds.
+            dst.blend_px(
+                dx,
+                dy,
+                Rgba::new(src.pixels[i], src.pixels[i + 1], src.pixels[i + 2], a),
+                opacity,
+            );
+        }
+    }
+}
+
+/// Resolve a source stamp image into a `tw`×`th` straight-alpha RGBA buffer,
+/// applying horizontal/vertical flips with bilinear sampling (source-center of
+/// each target texel). Shared by the CPU stamp bake ([`draw_stamp`]) and the GPU
+/// sticker pre-composite ([`composite_stamp_sticker`]) so both sample identically.
+fn resolve_stamp_buf(
+    img: &RgbaOverlay,
+    flip_h: bool,
+    flip_v: bool,
+    tw: usize,
+    th: usize,
+) -> Vec<u8> {
     let mut buf = vec![0u8; tw * th * 4];
     for ty in 0..th {
         for tx in 0..tw {
             let u = (tx as f32 + 0.5) / tw as f32;
             let v = (ty as f32 + 0.5) / th as f32;
-            let su = if stamp.flip_h { 1.0 - u } else { u };
-            let sv = if stamp.flip_v { 1.0 - v } else { v };
+            let su = if flip_h { 1.0 - u } else { u };
+            let sv = if flip_v { 1.0 - v } else { v };
             let sx = su * img.w as f32 - 0.5;
             let sy = sv * img.h as f32 - 0.5;
             let (r, g, b, a) = sample_bilinear(img, sx, sy);
@@ -1017,83 +1074,112 @@ fn draw_stamp(
             buf[i + 3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
         }
     }
+    buf
+}
 
-    // Sticker outline: dilate the silhouette alpha (8-neighbour, circular) and
-    // lay the halo color behind the image (same idea as 袋文字).
-    if let Some(stroke) = stamp.outline.filter(|s| s.width_px > 0.0) {
-        // Cap the radius so a pathological width can't make dilation (O(px·r²))
-        // explode.
-        let rad = (stroke.width_px.round().max(0.0) as i32).min(256);
-        if rad > 0 {
-            let r2 = (rad * rad) as f32;
-            let alpha_at = |tx: i32, ty: i32| -> f32 {
-                if tx < 0 || ty < 0 || tx as usize >= tw || ty as usize >= th {
-                    0.0
-                } else {
-                    buf[(ty as usize * tw + tx as usize) * 4 + 3] as f32 / 255.0
+/// Max circular silhouette-dilation coverage of the `tw`×`th` alpha in `buf`
+/// (straight-alpha RGBA) at local pixel (`tx`,`ty`) within radius `rad`
+/// (`r2 = rad²`). Shared by the CPU bake and the GPU sticker pre-composite so the
+/// halo edge is identical. Returns early at full coverage.
+#[inline]
+fn sticker_halo_coverage(
+    buf: &[u8],
+    tw: usize,
+    th: usize,
+    tx: i32,
+    ty: i32,
+    rad: i32,
+    r2: f32,
+) -> f32 {
+    let alpha_at = |x: i32, y: i32| -> f32 {
+        if x < 0 || y < 0 || x as usize >= tw || y as usize >= th {
+            0.0
+        } else {
+            buf[(y as usize * tw + x as usize) * 4 + 3] as f32 / 255.0
+        }
+    };
+    let mut m = 0.0f32;
+    for dy in -rad..=rad {
+        for dx in -rad..=rad {
+            if (dx * dx + dy * dy) as f32 > r2 {
+                continue;
+            }
+            let a = alpha_at(tx + dx, ty + dy);
+            if a > m {
+                m = a;
+                if m >= 1.0 {
+                    return 1.0;
                 }
-            };
-            // Iterate a `rad`-padded region so the halo can extend BEYOND the
-            // image edge (a sticker border around a fully-opaque image, not just
-            // into an emoji's transparent margins). Skip rows/cols outside the
-            // overlay so off-canvas pixels aren't scanned.
-            for ty in -rad..(th as i32 + rad) {
-                let iy = (top + ty as f32) as i32;
-                if iy < 0 || iy >= oh {
-                    continue;
-                }
-                for tx in -rad..(tw as i32 + rad) {
-                    let ix = (left + tx as f32) as i32;
-                    if ix < 0 || ix >= ow {
-                        continue;
-                    }
-                    let mut m = 0.0f32;
-                    'k: for dy in -rad..=rad {
-                        for dx in -rad..=rad {
-                            if (dx * dx + dy * dy) as f32 > r2 {
-                                continue;
-                            }
-                            let a = alpha_at(tx + dx, ty + dy);
-                            if a > m {
-                                m = a;
-                                if m >= 1.0 {
-                                    break 'k;
-                                }
-                            }
-                        }
-                    }
+            }
+        }
+    }
+    m
+}
+
+/// Pre-composite a stamp's image + sticker-outline halo into a standalone
+/// straight-alpha RGBA overlay at **opacity 1**, so a caller (e.g. the lab's GPU
+/// quad path) can upload it once and reuse it across duplicates instead of
+/// re-rasterizing the halo on every bake. The image is rendered at `tw`×`th`
+/// (flips baked in) and centered with `rad`-px transparent padding on every side,
+/// so the returned overlay is `(tw + 2·rad)`×`(th + 2·rad)` and the halo can
+/// extend beyond the image edge exactly as [`draw_stamp`] draws it. Returns the
+/// overlay and `rad` (px the sticker extends past the image half-extents); apply
+/// opacity, rotation and on-canvas placement at draw time. `outline = None` (or
+/// width ≤ 0) yields the bare image with `rad = 0`.
+///
+/// Keeps the halo math in sync with [`draw_stamp`] — both use [`resolve_stamp_buf`]
+/// + [`sticker_halo_coverage`]; `sticker_matches_cpu_bake` guards against drift.
+pub fn composite_stamp_sticker(
+    img: &RgbaOverlay,
+    flip_h: bool,
+    flip_v: bool,
+    tw: usize,
+    th: usize,
+    outline: Option<StrokeStyle>,
+) -> (RgbaOverlay, usize) {
+    if img.w == 0 || img.h == 0 || tw == 0 || th == 0 {
+        return (RgbaOverlay::new(tw.max(1), th.max(1)), 0);
+    }
+    let buf = resolve_stamp_buf(img, flip_h, flip_v, tw, th);
+    let rad = outline
+        .filter(|s| s.width_px > 0.0)
+        .map(|s| (s.width_px.round().max(0.0) as i32).min(256))
+        .unwrap_or(0)
+        .max(0) as usize;
+    let mut out = RgbaOverlay::new(tw + 2 * rad, th + 2 * rad);
+    // Halo first (behind). Local image coords (tx,ty) land at (tx+rad, ty+rad) in
+    // the padded frame.
+    if rad > 0 {
+        if let Some(stroke) = outline {
+            let r = rad as i32;
+            let r2 = (r * r) as f32;
+            for ty in -r..(th as i32 + r) {
+                for tx in -r..(tw as i32 + r) {
+                    let m = sticker_halo_coverage(&buf, tw, th, tx, ty, r, r2);
                     if m > 0.0 {
-                        overlay.blend_px(ix, iy, stroke.color, m * opacity);
+                        out.blend_px(tx + r, ty + r, stroke.color, m);
                     }
                 }
             }
         }
     }
-
-    // Fill: the stamp pixels over the halo. Skip rows/cols outside the overlay.
+    // Fill: the stamp pixels over the halo at offset (rad, rad).
     for ty in 0..th {
-        let iy = (top + ty as f32) as i32;
-        if iy < 0 || iy >= oh {
-            continue;
-        }
         for tx in 0..tw {
             let i = (ty * tw + tx) * 4;
             let a = buf[i + 3];
             if a == 0 {
                 continue;
             }
-            let ix = (left + tx as f32) as i32;
-            if ix < 0 || ix >= ow {
-                continue;
-            }
-            overlay.blend_px(
-                ix,
-                iy,
+            out.blend_px(
+                (tx + rad) as i32,
+                (ty + rad) as i32,
                 Rgba::new(buf[i], buf[i + 1], buf[i + 2], a),
-                opacity,
+                1.0,
             );
         }
     }
+    (out, rad)
 }
 
 /// Placeholder for a stamp whose image is unavailable (e.g. a moved/missing user
@@ -2338,6 +2424,95 @@ mod tests {
         assert!(
             outlined > plain,
             "sticker outline should add opaque pixels: {outlined} vs {plain}"
+        );
+    }
+
+    #[test]
+    fn sticker_matches_cpu_bake() {
+        // The GPU sticker pre-composite (composite_stamp_sticker) must produce the
+        // SAME pixels as the CPU bake (draw_stamp) for an outlined stamp at opacity
+        // 1 / no rotation, so duplicates rendered as GPU quads look identical to the
+        // bake. Guards the shared-helper refactor (resolve_stamp_buf +
+        // sticker_halo_coverage) against drift.
+        let fonts = FontSet::new();
+        let img = solid_stamp_img(32, Rgba::new(220, 30, 40, 255));
+        let outline = StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 5.0,
+        };
+        let pivot = (50.0f32, 50.0f32);
+        let half = 16.0f32;
+        // CPU bake on a transparent 100×100 canvas (large enough: no clamping).
+        let obj = AnnotationObject::new_stamp(
+            7,
+            pivot,
+            StampObject {
+                source: crate::model::StampSource::Emoji("x".into()),
+                half_w: half,
+                half_h: half,
+                outline: Some(outline),
+                ..StampObject::default()
+            },
+        );
+        let mut stamps = StampImages::new();
+        stamps.insert(7, std::sync::Arc::new(img.clone()));
+        let ov = bake_overlay_with_stamps(&[obj], 100, 100, &fonts, &stamps);
+
+        // Standalone sticker (= what the GPU quad uploads).
+        let tw = (half * 2.0) as usize; // 32
+        let th = tw;
+        let (st, rad) = composite_stamp_sticker(&img, false, false, tw, th, Some(outline));
+        assert_eq!(rad, 5, "rad should follow the 5px outline");
+        assert_eq!((st.w, st.h), (tw + 2 * rad, th + 2 * rad));
+
+        // Sticker pixel (sx,sy) maps to canvas (left - rad + sx, top - rad + sy).
+        let left = (pivot.0 - tw as f32 * 0.5) as i32; // 34
+        let top = (pivot.1 - th as f32 * 0.5) as i32; // 34
+        let mut compared = 0u32;
+        for sy in 0..st.h {
+            for sx in 0..st.w {
+                let cx = left - rad as i32 + sx as i32;
+                let cy = top - rad as i32 + sy as i32;
+                if cx < 0 || cy < 0 || cx >= 100 || cy >= 100 {
+                    continue;
+                }
+                let si = (sy * st.w + sx) * 4;
+                let ci = (cy as usize * 100 + cx as usize) * 4;
+                for k in 0..4 {
+                    let a = st.pixels[si + k] as i32;
+                    let b = ov.pixels[ci + k] as i32;
+                    assert!(
+                        (a - b).abs() <= 1,
+                        "sticker vs CPU bake mismatch at sticker({sx},{sy}) ch{k}: {a} vs {b}"
+                    );
+                }
+                compared += 1;
+            }
+        }
+        assert!(compared > 1000, "should compare the overlapping footprint");
+
+        // Opacity < 1 must fade the composited sticker AS ONE UNIT (the GPU quad
+        // tints the whole texture; the CPU path now blits with the same opacity).
+        // A fully-opaque interior pixel should land at ~opacity·255 over the
+        // transparent canvas.
+        let faded = AnnotationObject::new_stamp(
+            7,
+            pivot,
+            StampObject {
+                source: crate::model::StampSource::Emoji("x".into()),
+                half_w: half,
+                half_h: half,
+                opacity: 0.5,
+                outline: Some(outline),
+                ..StampObject::default()
+            },
+        );
+        let ov2 = bake_overlay_with_stamps(&[faded], 100, 100, &fonts, &stamps);
+        let center = (50usize * 100 + 50) * 4;
+        let a = ov2.pixels[center + 3] as i32;
+        assert!(
+            (a - 128).abs() <= 4,
+            "opacity 0.5 interior alpha should be ~128, got {a}"
         );
     }
 

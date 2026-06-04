@@ -31,8 +31,8 @@ pub use model::{
     markup_rules_brackets, markup_rules_white,
 };
 pub use raster::{
-    RgbaOverlay, StampImages, bake_overlay, bake_overlay_with_stamps, effective_bubble_shape,
-    effective_window_half_extents, message_window_overflows,
+    RgbaOverlay, StampImages, bake_overlay, bake_overlay_with_stamps, composite_stamp_sticker,
+    effective_bubble_shape, effective_window_half_extents, message_window_overflows,
 };
 pub use tessellate::{
     BubbleGeometry, auto_base_t, bubble_geometry, fit_bubble_shape, nearest_base_t,

@@ -12,7 +12,7 @@
 //! Persistence: Save/Load write/read the object list as JSON to a
 //! `<image>.comic.json` sidecar (analogous to local_adjust_lab's `.miv`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -43,6 +43,39 @@ const ZOOM_MAX: f32 = 16.0;
 const HANDLE_R: f32 = 7.0;
 const FILE_HISTORY_LIMIT: usize = 16;
 const UNDO_CAP: usize = 100;
+/// Max rasterized stamp edge (px) when pre-compositing a sticker texture — mirrors
+/// comic-core's `draw_stamp` cap so a corrupt size can't OOM the upload.
+const STAMP_MAX_PX: usize = 8192;
+
+/// Cache key for an outlined stamp's pre-composited sticker texture. Keyed on the
+/// halo's *effective* params — color + integer dilation radius `rad` (the rounded,
+/// capped width that actually shapes the halo) + display size + flips — NOT the
+/// raw `width_px`. Two widths that round to the same `rad` yield an identical halo
+/// and correctly share one texture; widths straddling a `.5` boundary get distinct
+/// keys (and distinct padding). Identical duplicates collapse to one key.
+fn sticker_key(
+    source: &StampSource,
+    color: Rgba,
+    rad: i32,
+    tw: usize,
+    th: usize,
+    flip_h: bool,
+    flip_v: bool,
+) -> String {
+    format!(
+        "{}|{:02x}{:02x}{:02x}{:02x}r{}|{}x{}|{}{}",
+        stamp_source_key(source),
+        color.r,
+        color.g,
+        color.b,
+        color.a,
+        rad,
+        tw,
+        th,
+        flip_h as u8,
+        flip_v as u8,
+    )
+}
 
 fn main() -> eframe::Result<()> {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
@@ -403,12 +436,21 @@ struct ComicLab {
     /// Decode cache keyed by stamp source key (so the same emoji/file decodes
     /// once and is reused across objects). `None` = decode failed (don't retry).
     stamp_source_cache: HashMap<String, Option<Arc<RgbaOverlay>>>,
-    /// Stamp source key -> GPU texture, uploaded once. Non-outlined stamps are
-    /// drawn as GPU-transformed quads from this texture (scale/rotate/flip/opacity
-    /// are ~free on the GPU) and EXCLUDED from the CPU bake entirely, so stamps
-    /// never re-rasterize on the CPU — the bake stays cheap regardless of stamp
-    /// count/size/rotation. (Outlined stamps stay in the CPU bake for the halo.)
+    /// Stamp source key -> GPU texture (raw image, no halo), uploaded once.
+    /// Non-outlined stamps are drawn as GPU-transformed quads from this texture
+    /// (scale/rotate/flip/opacity are ~free on the GPU) and EXCLUDED from the CPU
+    /// bake entirely, so stamps never re-rasterize on the CPU — the bake stays
+    /// cheap regardless of stamp count/size/rotation.
     stamp_textures: HashMap<String, TextureHandle>,
+    /// Outlined ("sticker") stamps: a pre-composited image+halo texture, baked
+    /// ONCE via `comic_core::composite_stamp_sticker` and reused as a GPU quad —
+    /// so N duplicates of one outlined stamp cost one halo dilation, not N every
+    /// bake. Keyed by source+outline(color/width)+display size+flips, so identical
+    /// duplicates share one texture; resizing one re-bakes only that stamp. FIFO-
+    /// capped (`sticker_order`) to bound GPU memory across a session of resizes.
+    sticker_textures: HashMap<String, TextureHandle>,
+    /// Insertion order of `sticker_textures` keys for FIFO eviction.
+    sticker_order: VecDeque<String>,
     /// Stamp ids excluded from the last completed bake (= the GPU-quad stamps),
     /// sorted. When this set changes (stamp added/removed/outline toggled/z moved)
     /// the CPU bake must re-run.
@@ -574,6 +616,8 @@ impl ComicLab {
             stamp_images: StampImages::new(),
             stamp_source_cache: HashMap::new(),
             stamp_textures: HashMap::new(),
+            sticker_textures: HashMap::new(),
+            sticker_order: VecDeque::new(),
             baked_excluded_set: Vec::new(),
             recent_stamps: load_recent_stamps(),
             show_stamp_dialog: false,
@@ -1513,10 +1557,13 @@ impl ComicLab {
 
     /// Ids of stamps drawn as GPU quads (= excluded from the CPU bake), in
     /// ascending z (draw bottom-to-top). To stay z-correct, only the maximal
-    /// TOP-z run of enabled, non-outlined, decodable stamps qualifies: those sit
-    /// above everything left in the CPU bake, so drawing them on top preserves z.
-    /// A stamp placed BELOW a non-stamp object (or an outlined / undecodable stamp)
-    /// ends the run and stays in the CPU bake at its true z. Ensures textures.
+    /// TOP-z run of enabled, decodable stamps qualifies: those sit above
+    /// everything left in the CPU bake, so drawing them on top preserves z.
+    /// Both plain and outlined ("sticker") stamps qualify — the outlined ones use a
+    /// pre-composited image+halo texture (`ensure_sticker_texture`) so the heavy
+    /// halo dilation runs once per unique sticker, not every bake. A stamp placed
+    /// BELOW a non-stamp object (or an undecodable stamp) ends the run and stays in
+    /// the CPU bake at its true z. Ensures textures.
     fn gpu_stamp_ids(&mut self, ctx: &egui::Context) -> Vec<u64> {
         let mut order: Vec<usize> = (0..self.objects.len())
             .filter(|&i| self.objects[i].enabled)
@@ -1524,16 +1571,21 @@ impl ComicLab {
         order.sort_by_key(|&i| self.objects[i].z);
         let mut ids = Vec::new();
         for &i in order.iter().rev() {
-            let (id, source) = {
+            let (id, stamp) = {
                 let o = &self.objects[i];
                 match &o.kind {
-                    AnnotationKind::Stamp(s) if s.outline.is_none() => (o.id, s.source.clone()),
-                    // Any non-(GPU stamp) object ends the top run — stamps below it
-                    // must stay in the CPU bake to keep correct z.
+                    AnnotationKind::Stamp(s) => (o.id, s.clone()),
+                    // Any non-stamp object ends the top run — stamps below it must
+                    // stay in the CPU bake to keep correct z.
                     _ => break,
                 }
             };
-            if self.ensure_stamp_texture(ctx, &source).is_some() {
+            let ok = if stamp.outline.is_some_and(|o| o.width_px > 0.0) {
+                self.ensure_sticker_texture(ctx, &stamp).is_some()
+            } else {
+                self.ensure_stamp_texture(ctx, &stamp.source).is_some()
+            };
+            if ok {
                 ids.push(id);
             } else {
                 // Decode failed → this stamp (placeholder) and everything below it
@@ -1568,25 +1620,121 @@ impl ComicLab {
         Some(tex)
     }
 
+    /// Build (or fetch) the pre-composited image+halo GPU texture for an outlined
+    /// ("sticker") stamp, so it draws as one quad like a plain stamp instead of
+    /// re-rasterizing the halo in the CPU bake. Cached by source+outline+display
+    /// size+flips: identical duplicates share one texture (the heavy dilation runs
+    /// ONCE), so N copies of an outlined stamp no longer make the bake O(N).
+    ///
+    /// Returns `(texture, half_w, half_h)` — the on-canvas half-extents of the quad
+    /// to draw, derived from the *capped* raster size so they match the CPU bake
+    /// even for a corrupt/huge sidecar (the bake centers the capped tw×th bitmap).
+    /// `None` if the source can't be decoded or the stamp has no positive-width
+    /// outline.
+    fn ensure_sticker_texture(
+        &mut self,
+        ctx: &egui::Context,
+        stamp: &StampObject,
+    ) -> Option<(TextureHandle, f32, f32)> {
+        let outline = stamp.outline.filter(|o| o.width_px > 0.0)?;
+        let tw = ((stamp.half_w * 2.0).round().max(1.0) as usize).min(STAMP_MAX_PX);
+        let th = ((stamp.half_h * 2.0).round().max(1.0) as usize).min(STAMP_MAX_PX);
+        // Effective dilation radius — must match comic-core's `composite_stamp_sticker`.
+        let rad = (outline.width_px.round().max(0.0) as i32).min(256).max(0);
+        // Quad half-extents from the capped bitmap (+ halo padding), so the quad
+        // maps the texture 1:1 and matches the CPU bake's centered footprint.
+        let hw = tw as f32 * 0.5 + rad as f32;
+        let hh = th as f32 * 0.5 + rad as f32;
+        let key = sticker_key(
+            &stamp.source,
+            outline.color,
+            rad,
+            tw,
+            th,
+            stamp.flip_h,
+            stamp.flip_v,
+        );
+        if let Some(t) = self.sticker_textures.get(&key) {
+            return Some((t.clone(), hw, hh));
+        }
+        // Reuse the shared decode cache (same key as the plain image path).
+        let img = self
+            .stamp_source_cache
+            .entry(stamp_source_key(&stamp.source))
+            .or_insert_with(|| load_stamp_image(&stamp.source).map(Arc::new))
+            .clone()?;
+        let (sticker, _) = comic_core::composite_stamp_sticker(
+            &img,
+            stamp.flip_h,
+            stamp.flip_v,
+            tw,
+            th,
+            Some(outline),
+        );
+        let color = ColorImage::from_rgba_unmultiplied([sticker.w, sticker.h], &sticker.pixels);
+        let tex = ctx.load_texture(format!("sticker_{key}"), color, TextureOptions::LINEAR);
+        // FIFO-evict the oldest entry to bound GPU memory — a long session of
+        // resizing outlined stamps would otherwise keep a texture per distinct size.
+        // Capped well above any single frame's working set (the top-z run can't
+        // exceed the object count) so eviction never drops an in-use texture.
+        const STICKER_CACHE_CAP: usize = 256;
+        while self.sticker_textures.len() >= STICKER_CACHE_CAP {
+            match self.sticker_order.pop_front() {
+                Some(old) => {
+                    self.sticker_textures.remove(&old);
+                }
+                None => break,
+            }
+        }
+        self.sticker_textures.insert(key.clone(), tex.clone());
+        self.sticker_order.push_back(key);
+        Some((tex, hw, hh))
+    }
+
     /// Draw stamp `id` as a GPU-transformed textured quad (scale/rotate/flip/
-    /// opacity), centered on its pivot. Used for ALL non-outlined stamps (they're
-    /// excluded from the CPU bake), so a stamp never re-rasterizes on the CPU and
-    /// its position is identical whether idle or being dragged.
+    /// opacity), centered on its pivot. Used for ALL GPU stamps (excluded from the
+    /// CPU bake), so a stamp never re-rasterizes on the CPU and its position is
+    /// identical whether idle or being dragged. Outlined stamps draw their
+    /// pre-composited image+halo "sticker" texture (flips baked in, quad grown by
+    /// the halo `rad`); plain stamps draw the raw image texture with UV-swap flips.
     fn draw_stamp_preview(&mut self, ctx: &egui::Context, painter: &egui::Painter, id: u64) {
-        let Some(obj) = self.objects.iter().find(|o| o.id == id) else {
-            return;
+        let (pivot, rot, opacity, stamp) = {
+            let Some(obj) = self.objects.iter().find(|o| o.id == id) else {
+                return;
+            };
+            let AnnotationKind::Stamp(s) = &obj.kind else {
+                return;
+            };
+            (
+                obj.pivot,
+                obj.rotation_rad,
+                s.opacity.clamp(0.0, 1.0),
+                s.clone(),
+            )
         };
-        let AnnotationKind::Stamp(stamp) = &obj.kind else {
-            return;
-        };
-        let pivot = obj.pivot;
-        let rot = obj.rotation_rad;
-        let (hw, hh) = (stamp.half_w, stamp.half_h);
-        let (fh, fv) = (stamp.flip_h, stamp.flip_v);
-        let opacity = stamp.opacity.clamp(0.0, 1.0);
-        let source = stamp.source.clone();
-        let Some(tex) = self.ensure_stamp_texture(ctx, &source) else {
-            return;
+        let (tex, hw, hh, (u0, u1), (v0, v1)) = if stamp.outline.is_some_and(|o| o.width_px > 0.0) {
+            // Sticker texture already contains the halo + baked flips → straight UVs.
+            // `ensure_sticker_texture` returns the quad half-extents (from the capped
+            // raster + halo padding) so the quad maps the texture 1:1.
+            let Some((tex, hw, hh)) = self.ensure_sticker_texture(ctx, &stamp) else {
+                return;
+            };
+            (tex, hw, hh, (0.0f32, 1.0f32), (0.0f32, 1.0f32))
+        } else {
+            let Some(tex) = self.ensure_stamp_texture(ctx, &stamp.source) else {
+                return;
+            };
+            let u = if stamp.flip_h {
+                (1.0f32, 0.0f32)
+            } else {
+                (0.0f32, 1.0f32)
+            };
+            let v = if stamp.flip_v {
+                (1.0f32, 0.0f32)
+            } else {
+                (0.0f32, 1.0f32)
+            };
+            (tex, stamp.half_w, stamp.half_h, u, v)
         };
         let corner = |lx: f32, ly: f32| {
             self.view
@@ -1598,9 +1746,6 @@ impl ComicLab {
             corner(hw, hh),
             corner(-hw, hh),
         );
-        // Texture UVs (0..1), with flips.
-        let (u0, u1) = if fh { (1.0, 0.0) } else { (0.0, 1.0) };
-        let (v0, v1) = if fv { (1.0, 0.0) } else { (0.0, 1.0) };
         let tint = Color32::from_white_alpha((opacity * 255.0).round().clamp(0.0, 255.0) as u8);
         let mut mesh = egui::Mesh::with_texture(tex.id());
         mesh.vertices.push(egui::epaint::Vertex {
@@ -4676,12 +4821,15 @@ impl ComicLab {
             // don't allocate + upload a full-resolution texture every frame.
             let now = ctx.input(|i| i.time);
             let dragging = self.drag != DragKind::None;
-            // All non-outlined stamps are drawn as GPU textured quads and kept OUT
-            // of the CPU bake entirely (scale/rotate/flip/opacity are ~free on the
-            // GPU). The bake then never rasterizes a stamp, so it's cheap no matter
-            // how many large/rotated stamps exist, and a stamp's on-screen position
-            // never changes between "dragging" and "idle" (no CPU↔GPU handoff, so
-            // no drag-end shift). Outlined stamps stay in the bake (CPU halo).
+            // The top-z run of stamps is drawn as GPU textured quads and kept OUT of
+            // the CPU bake entirely (scale/rotate/flip/opacity are ~free on the GPU).
+            // Outlined stamps qualify too: their image+halo is pre-composited once
+            // into a "sticker" texture (cached per source+outline+size) and reused, so
+            // N duplicates cost one halo dilation instead of N every bake. The bake
+            // then never rasterizes a stamp, so it's cheap no matter how many large/
+            // rotated/outlined stamps exist, and a stamp's on-screen position never
+            // changes between "dragging" and "idle" (no CPU↔GPU handoff, no drag-end
+            // shift).
             let gpu_ids = self.gpu_stamp_ids(ctx);
             // The excluded SET changing (stamp added/removed, outline toggled, z
             // reordered) means the bake content changed → must re-bake.
