@@ -260,6 +260,9 @@ fn shift_held_via_os() -> bool {
 /// - 動画モード: Enter は `handle_video_input` で「再生/一時停止」として既に消費中
 /// - IME 変換中: Enter は IME 確定キーなので奪わない
 /// - フルスクリーン context menu 表示中: メニュー側の Enter 選択操作を優先
+/// - グリッド Enter で open した直後の押下: `suppress_until_release` が立っている間は
+///   抑止 (= 同フレーム内に残った Enter event を拾って即 close する事故を防ぐ)。
+///   詳細は `fs_suppress_enter_close_until_release` フィールドの doc 参照。
 ///
 /// サブモード (補正レイヤー/消しゴム/隠蔽/export crop) は caller 側で早期 return
 /// 済みなのでここでは判定しない (= caller の責任)。
@@ -267,8 +270,9 @@ pub(crate) fn should_close_fullscreen_on_enter(
     is_video_item: bool,
     ime_active: bool,
     context_menu_open: bool,
+    suppress_until_release: bool,
 ) -> bool {
-    !is_video_item && !ime_active && !context_menu_open
+    !is_video_item && !ime_active && !context_menu_open && !suppress_until_release
 }
 
 /// `local_adjust_mode` 中にどのテクスチャ経路を採用するかを表す純粋な決定型。
@@ -3471,11 +3475,20 @@ impl App {
         // グリッドで Enter (Double click 相当) → 開く、フルスクリーンで Enter → 戻る、
         // のトグル動作を成立させる。判定は副作用ゼロの
         // `should_close_fullscreen_on_enter` に集約 (= unit test 可能)。
+        //
+        // suppress ガード解除: Enter が現在押下されていなければ
+        // `fs_suppress_enter_close_until_release` を false にリセット (= 次の新規押下から
+        // close が有効化される)。「Enter で open → 同フレームで close」を防ぐ仕組み。
+        let enter_currently_down = ctx.input(|i| i.key_down(egui::Key::Enter));
+        if !enter_currently_down {
+            self.fs_suppress_enter_close_until_release = false;
+        }
         let is_video_item = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         let enter_consume_ok = should_close_fullscreen_on_enter(
             is_video_item,
             self.ime_input_active(),
             self.fs_context_menu_idx.is_some(),
+            self.fs_suppress_enter_close_until_release,
         );
         let enter_close = !esc
             && enter_consume_ok
@@ -10486,32 +10499,40 @@ mod tests {
     /// 通常の静止画フルスクリーン中: Enter で解除する (= Esc 相当)。
     #[test]
     fn enter_closes_fs_for_still_image_in_normal_state() {
-        assert!(should_close_fullscreen_on_enter(false, false, false));
+        assert!(should_close_fullscreen_on_enter(false, false, false, false));
     }
 
     /// 動画モードでは Enter は「再生/停止」なので消費しない。
     #[test]
     fn enter_does_not_close_fs_for_video() {
-        assert!(!should_close_fullscreen_on_enter(true, false, false));
+        assert!(!should_close_fullscreen_on_enter(true, false, false, false));
     }
 
     /// IME 変換中の Enter は IME 確定キーなので奪わない (= 日本語入力中の事故防止)。
     #[test]
     fn enter_does_not_close_fs_during_ime_composition() {
-        assert!(!should_close_fullscreen_on_enter(false, true, false));
+        assert!(!should_close_fullscreen_on_enter(false, true, false, false));
     }
 
     /// フルスクリーン context menu 表示中の Enter はメニュー選択操作なので奪わない。
     #[test]
     fn enter_does_not_close_fs_when_context_menu_open() {
-        assert!(!should_close_fullscreen_on_enter(false, false, true));
+        assert!(!should_close_fullscreen_on_enter(false, false, true, false));
     }
 
     /// 同時に複数の除外条件が成立しても (= 動画 + IME + menu)、いずれかが立てば
     /// 解除しない。
     #[test]
     fn enter_close_combined_exclusions() {
-        assert!(!should_close_fullscreen_on_enter(true, true, true));
+        assert!(!should_close_fullscreen_on_enter(true, true, true, true));
+    }
+
+    /// グリッドの Enter で open した直後のフレームでは `suppress_until_release` が
+    /// true で、Enter event がまだ input queue に残っていても close しない
+    /// (= 「一瞬開いてすぐ閉じる」ユーザー報告に対する退行ガード)。
+    #[test]
+    fn enter_does_not_close_fs_while_suppressed_after_grid_open() {
+        assert!(!should_close_fullscreen_on_enter(false, false, false, true));
     }
 
     /// P7-3c: `preview_to_selected_layer_toggle` は **フルスクリーン非フォーカス時でも効く**。

@@ -2126,6 +2126,11 @@ impl App {
                         self.fs_focus_regained_at = Some(std::time::Instant::now());
                     }
                     self.fs_open_intent_from_grid = true;
+                    // P10-1 follow-up: grid_action_open は Enter (および双クリック) からも
+                    // 呼ばれる。Enter 経路では `handle_fullscreen_root_key_input` が同フレームで
+                    // Enter を `consume_key` で拾って即 close する事故を防ぐためのガード。
+                    // ダブルクリック経路では Enter event がそもそも無いので no-op。
+                    self.fs_suppress_enter_close_until_release = true;
                     self.open_fullscreen(idx);
                 }
                 Some(GridItem::ConvertibleArchive { path, format }) => {

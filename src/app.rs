@@ -2996,6 +2996,20 @@ pub struct App {
     /// `open_fullscreen` 経由で動画を実際に open するときに
     /// `mem::take` で取り出して reset される (= 1 度だけ有効)。
     pub(crate) fs_open_intent_from_grid: bool,
+    /// グリッドの <kbd>Enter</kbd> 押下で `open_fullscreen` した直後、同フレーム内に残っている
+    /// Enter event を `handle_fullscreen_root_key_input` 経路が拾って即 close する事故を防ぐ
+    /// ためのガード。
+    ///
+    /// シナリオ: グリッドの Enter ハンドラは `i.key_pressed(Enter)` (= consume せず) で
+    /// 検知 → `open_fullscreen` 呼び出し。同じフレーム内で `handle_fullscreen_root_key_input`
+    /// が走ると、まだ input queue に残った Enter event を `consume_key` で拾って
+    /// `enter_close` → 即フルスクリーン解除になる (= ユーザー報告「一瞬開いてすぐ閉じる」)。
+    ///
+    /// このフラグは Enter 経路の `open_fullscreen` 呼び出し側で `true` にセットし、
+    /// `handle_fs_key_input` 冒頭で「Enter が現在押下中でなければ false にリセット」する。
+    /// 結果として、押しっぱなしの Enter event はガードされ、リリース後に新規押下された
+    /// Enter から close が有効になる。
+    pub(crate) fs_suppress_enter_close_until_release: bool,
     /// 次に開く動画だけ autoplay 設定を上書きする one-shot state。
     /// 連続再生の自動遷移ではユーザー設定に関わらず再生開始するために使う。
     pub(crate) fs_video_open_autoplay_override: Option<bool>,
@@ -4571,6 +4585,7 @@ impl App {
             native_video_deferred_nav_delta: None,
             video_tile_cache,
             fs_open_intent_from_grid: false,
+            fs_suppress_enter_close_until_release: false,
             fs_video_open_autoplay_override: None,
             fs_video_open_ignore_resume_once: false,
             video_thumb_overrides_dirty: false,
@@ -12929,6 +12944,11 @@ impl App {
                             // Phase 7.J: Enter からの open はグリッド意図扱い。
                             self.bump_input_seq_for_item("grid_enter", idx);
                             self.fs_open_intent_from_grid = true;
+                            // P10-1 follow-up: Enter で open した直後、同フレームの
+                            // input queue に残った Enter event を `handle_fullscreen_root_key_input`
+                            // が拾って即 close する事故を防ぐ。詳細は
+                            // `fs_suppress_enter_close_until_release` の doc 参照。
+                            self.fs_suppress_enter_close_until_release = true;
                             self.open_fullscreen(idx);
                         }
                         Some(GridItem::ConvertibleArchive { path, format }) => {
