@@ -274,17 +274,174 @@ fn draw_bubble_parts(
         return;
     }
 
+    // なし (text-only): no fill / stroke / tail — only the centered text.
+    if matches!(shape, BubbleShape::TextOnly { .. }) {
+        if do_decotext {
+            bake_text(overlay, &bubble.text, pivot, fonts, true);
+        }
+        return;
+    }
+
+    // 意識 (concentration): a fuzzy feathered ellipse. The whole look (feathered
+    // fill + soft rim ring) is drawn once on the fill pass, so a merge group's
+    // separate stroke pass won't double the ring.
+    if let BubbleShape::Concentration { rx, ry, shape_seed } = shape {
+        if do_fill {
+            draw_concentration(overlay, pivot, bubble, rx, ry, shape_seed, opaque_fill);
+        }
+        if do_decotext {
+            let geo = bubble_geometry(&shape, pivot, bubble.tail.as_ref());
+            bubble_decorations(overlay, bubble, pivot, &shape, &geo, fonts);
+            bake_text(overlay, &bubble.text, pivot, fonts, true);
+        }
+        return;
+    }
+
     let geo = bubble_geometry(&shape, pivot, bubble.tail.as_ref());
     if do_fill {
         bubble_fill(overlay, bubble, &geo, opaque_fill);
     }
     if do_stroke {
-        bubble_stroke(overlay, bubble, &geo);
+        match shape {
+            // 線: rough multi-pass hand-drawn outline (instead of one clean line).
+            BubbleShape::Strokes { shape_seed, .. } => {
+                draw_sketch_outline(overlay, pivot, &geo, &bubble.outline, shape_seed);
+            }
+            // 二重線: the clean outer line (incl. spliced tail) + a body-only inner
+            // ring `gap` inside.
+            BubbleShape::DoubleStroke {
+                half_w,
+                half_h,
+                corner_px,
+                gap_px,
+            } => {
+                bubble_stroke(overlay, bubble, &geo);
+                if bubble.outline.width_px > 0.0 {
+                    let g = gap_px.max(1.0);
+                    let inner = BubbleShape::RoundRect {
+                        half_w: (half_w - g).max(1.0),
+                        half_h: (half_h - g).max(1.0),
+                        corner_px: (corner_px - g).max(0.0),
+                    };
+                    stroke_polygon(overlay, &tessellate_bubble(&inner, pivot), &bubble.outline);
+                }
+            }
+            _ => bubble_stroke(overlay, bubble, &geo),
+        }
     }
     if do_decotext {
         bubble_decorations(overlay, bubble, pivot, &shape, &geo, fonts);
         // Embedded text, centered in the bubble body.
         bake_text(overlay, &bubble.text, pivot, fonts, true);
+    }
+}
+
+/// Draw a 意識 (concentration) fuzzy ellipse: a feathered fill (opaque inside
+/// `CONCENTRATION_SOLID_RATIO`, fading to transparent by a wobbling rim) plus a
+/// soft outline ring just inside the rim. The rim wobbles with `shape_seed` so
+/// the blob reads as hand-drawn / もやもや. Rendered per-pixel over the ellipse
+/// AABB. `opaque_fill` forces the fill to full opacity (merge passes).
+fn draw_concentration(
+    overlay: &mut RgbaOverlay,
+    pivot: (f32, f32),
+    bubble: &BubbleObject,
+    rx: f32,
+    ry: f32,
+    shape_seed: u32,
+    opaque_fill: bool,
+) {
+    let (cx, cy) = pivot;
+    let rx = rx.max(1.0);
+    let ry = ry.max(1.0);
+    let inner = crate::tessellate::CONCENTRATION_SOLID_RATIO; // ~0.78
+    let ph1 = lf_hash(shape_seed, 1) * std::f32::consts::TAU;
+    let ph2 = lf_hash(shape_seed, 2) * std::f32::consts::TAU;
+    let fill = bubble.fill;
+    let fill_a_base = if opaque_fill {
+        1.0
+    } else {
+        bubble.fill_opacity.clamp(0.0, 1.0)
+    };
+    let ring = bubble.outline;
+    let ring_on = ring.width_px > 0.0 && ring.color.a > 0;
+    let x0 = (cx - rx).floor() as i32;
+    let x1 = (cx + rx).ceil() as i32;
+    let y0 = (cy - ry).floor() as i32;
+    let y1 = (cy + ry).ceil() as i32;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let nx = (x as f32 + 0.5 - cx) / rx;
+            let ny = (y as f32 + 0.5 - cy) / ry;
+            let d = (nx * nx + ny * ny).sqrt();
+            if d > 1.0 {
+                continue;
+            }
+            let ang = ny.atan2(nx);
+            // Rim wobble: the fade endpoint, kept strictly inside the ellipse.
+            let wob = 0.05 * (3.0 * ang + ph1).sin() + 0.03 * (7.0 * ang + ph2).sin();
+            let rim = (1.0 + wob).clamp(0.6, 0.99);
+            // Feathered fill: opaque to `inner`, fading to 0 at `rim`.
+            if let Some(fc) = fill {
+                let cov = if d <= inner {
+                    1.0
+                } else {
+                    ((rim - d) / (rim - inner).max(1e-3)).clamp(0.0, 1.0)
+                };
+                if cov > 0.0 {
+                    overlay.blend_px(x, y, fc, fill_a_base * cov * (fc.a as f32 / 255.0));
+                }
+            }
+            // Soft ring just inside the rim (a fuzzy "edge").
+            if ring_on {
+                let ring_c = rim * 0.93;
+                let half_band = 0.10;
+                let band = (1.0 - (d - ring_c).abs() / half_band).clamp(0.0, 1.0);
+                if band > 0.0 {
+                    overlay.blend_px(x, y, ring.color, band * (ring.color.a as f32 / 255.0));
+                }
+            }
+        }
+    }
+}
+
+/// Draw a 線 (sketchy) outline: stroke the contour a few times, each pass
+/// perturbing every vertex along its outward radial by a smooth seed-driven wave
+/// (different phase per pass). Smooth = no self-crossing; the overlapping passes
+/// read as one rough, hand-drawn line.
+fn draw_sketch_outline(
+    overlay: &mut RgbaOverlay,
+    pivot: (f32, f32),
+    geo: &crate::tessellate::BubbleGeometry,
+    stroke: &StrokeStyle,
+    shape_seed: u32,
+) {
+    if stroke.width_px <= 0.0 || stroke.color.a == 0 {
+        return;
+    }
+    let n = geo.outline.len();
+    if n < 3 {
+        return;
+    }
+    let amp = (stroke.width_px * 1.0).clamp(1.5, 6.0);
+    const PASSES: u32 = 2;
+    for pass in 0..PASSES {
+        let salt = shape_seed.wrapping_add(pass.wrapping_mul(131));
+        let ph1 = lf_hash(salt, 1) * std::f32::consts::TAU;
+        let ph2 = lf_hash(salt, 2) * std::f32::consts::TAU;
+        let jittered: Vec<(f32, f32)> = geo
+            .outline
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y))| {
+                let t = i as f32 / n as f32 * std::f32::consts::TAU;
+                let dx = x - pivot.0;
+                let dy = y - pivot.1;
+                let len = (dx * dx + dy * dy).sqrt().max(1e-3);
+                let off = amp * (0.6 * (5.0 * t + ph1).sin() + 0.4 * (11.0 * t + ph2).sin());
+                (x + dx / len * off, y + dy / len * off)
+            })
+            .collect();
+        stroke_polygon(overlay, &jittered, stroke);
     }
 }
 
@@ -466,6 +623,10 @@ fn bubble_decorations(
         BubbleShape::Soft { half_w, half_h, .. } => half_w.min(half_h),
         BubbleShape::MotionLines { rx, ry, .. } => rx.min(ry),
         BubbleShape::SpeedLines { half_w, half_h, .. } => half_w.min(half_h),
+        BubbleShape::TextOnly { half_w, half_h } => half_w.min(half_h),
+        BubbleShape::Concentration { rx, ry, .. } => rx.min(ry),
+        BubbleShape::Strokes { half_w, half_h, .. } => half_w.min(half_h),
+        BubbleShape::DoubleStroke { half_w, half_h, .. } => half_w.min(half_h),
     };
     // Tail base point for `Tail` decoration placement. Spike tails use the
     // spliced base midpoint; thought tails have no spliced base (geo.tail is
@@ -562,6 +723,10 @@ fn object_local_aabb(obj: &AnnotationObject, fonts: &FontSet) -> Option<(f32, f3
                     BubbleShape::Soft { half_w, half_h, .. } => half_w.min(half_h),
                     BubbleShape::MotionLines { rx, ry, .. } => rx.min(ry),
                     BubbleShape::SpeedLines { half_w, half_h, .. } => half_w.min(half_h),
+                    BubbleShape::TextOnly { half_w, half_h } => half_w.min(half_h),
+                    BubbleShape::Concentration { rx, ry, .. } => rx.min(ry),
+                    BubbleShape::Strokes { half_w, half_h, .. } => half_w.min(half_h),
+                    BubbleShape::DoubleStroke { half_w, half_h, .. } => half_w.min(half_h),
                 };
                 let tail_base = match (&geo.tail, &bubble.tail) {
                     (Some(t), _) => Some(((t[0].0 + t[1].0) * 0.5, (t[0].1 + t[1].1) * 0.5)),
@@ -1829,6 +1994,145 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn text_only_with_empty_text_draws_nothing() {
+        // なし must not draw any box: with empty text and a fill/outline set, the
+        // overlay stays fully transparent (proves fill + stroke are skipped).
+        let fonts = FontSet::new();
+        let mut b = BubbleObject::default();
+        b.shape = BubbleShape::TextOnly {
+            half_w: 60.0,
+            half_h: 40.0,
+        };
+        b.fill = Some(Rgba::WHITE);
+        b.outline = StrokeStyle {
+            color: Rgba::BLACK,
+            width_px: 4.0,
+        };
+        b.auto_size = false;
+        b.text = TextBlock::default(); // empty
+        let obj = AnnotationObject::new_bubble(1, (100.0, 100.0), b);
+        let ov = bake_overlay(&[obj], 200, 200, &fonts);
+        assert!(
+            ov.pixels.iter().all(|&p| p == 0),
+            "text-only with no text must draw nothing (no box)"
+        );
+    }
+
+    #[test]
+    fn concentration_fills_center_and_fades_outside() {
+        let fonts = FontSet::new();
+        let (cx, cy) = (110.0f32, 110.0f32);
+        let (rx, ry) = (80.0f32, 60.0f32);
+        let mut b = BubbleObject::default();
+        b.shape = BubbleShape::Concentration {
+            rx,
+            ry,
+            shape_seed: 2,
+        };
+        b.fill = Some(Rgba::WHITE);
+        b.outline = StrokeStyle {
+            color: Rgba::BLACK,
+            width_px: 3.0,
+        };
+        b.auto_size = false;
+        b.text = TextBlock::default();
+        let obj = AnnotationObject::new_bubble(1, (cx, cy), b);
+        let ov = bake_overlay(&[obj], 220, 220, &fonts);
+        let alpha = |x: usize, y: usize| ov.pixels[(y * ov.w + x) * 4 + 3];
+        // Center is opaque (solid fill region).
+        assert!(
+            alpha(cx as usize, cy as usize) > 200,
+            "concentration center should be opaque"
+        );
+        // A point well outside the ellipse is transparent.
+        assert_eq!(alpha(5, 5), 0, "outside the ellipse must be clear");
+        // The fill feathers: a pixel just inside the rim is less opaque than the
+        // center (soft edge, not a hard cut).
+        let near_rim = alpha((cx + rx * 0.97) as usize, cy as usize);
+        let center = alpha(cx as usize, cy as usize);
+        assert!(
+            near_rim < center,
+            "rim ({near_rim}) should be softer than center ({center})"
+        );
+    }
+
+    #[test]
+    fn double_stroke_draws_more_than_single() {
+        let fonts = FontSet::new();
+        let count_opaque = |shape: BubbleShape| {
+            let mut b = BubbleObject::default();
+            b.shape = shape;
+            b.fill = None; // isolate stroke pixels
+            b.outline = StrokeStyle {
+                color: Rgba::BLACK,
+                width_px: 3.0,
+            };
+            b.auto_size = false;
+            b.text = TextBlock::default();
+            let obj = AnnotationObject::new_bubble(1, (130.0, 100.0), b);
+            let ov = bake_overlay(&[obj], 260, 200, &fonts);
+            ov.pixels.chunks_exact(4).filter(|p| p[3] > 0).count()
+        };
+        let single = count_opaque(BubbleShape::RoundRect {
+            half_w: 90.0,
+            half_h: 60.0,
+            corner_px: 20.0,
+        });
+        let double = count_opaque(BubbleShape::DoubleStroke {
+            half_w: 90.0,
+            half_h: 60.0,
+            corner_px: 20.0,
+            gap_px: 10.0,
+        });
+        assert!(single > 0, "single rounded rect should stroke");
+        assert!(
+            double > single,
+            "double-stroke ({double}) should draw more than single ({single})"
+        );
+    }
+
+    #[test]
+    fn sketch_strokes_bake_pixels_within_box() {
+        let fonts = FontSet::new();
+        let (cx, cy) = (130.0f32, 110.0f32);
+        let (hw, hh) = (90.0f32, 60.0f32);
+        let mut b = BubbleObject::default();
+        b.shape = BubbleShape::Strokes {
+            half_w: hw,
+            half_h: hh,
+            corner_px: 24.0,
+            shape_seed: 4,
+        };
+        b.fill = None;
+        b.outline = StrokeStyle {
+            color: Rgba::BLACK,
+            width_px: 3.0,
+        };
+        b.auto_size = false;
+        b.text = TextBlock::default();
+        let obj = AnnotationObject::new_bubble(1, (cx, cy), b);
+        let ov = bake_overlay(&[obj], 260, 220, &fonts);
+        let mut any = false;
+        let m = 10.0; // sketch jitter + line half-width slack
+        for y in 0..ov.h {
+            for x in 0..ov.w {
+                if ov.pixels[(y * ov.w + x) * 4 + 3] == 0 {
+                    continue;
+                }
+                any = true;
+                assert!(
+                    (x as f32) >= cx - hw - m
+                        && (x as f32) <= cx + hw + m
+                        && (y as f32) >= cy - hh - m
+                        && (y as f32) <= cy + hh + m,
+                    "sketch stroke escaped the box at ({x},{y})"
+                );
+            }
+        }
+        assert!(any, "sketch outline should draw pixels");
     }
 
     /// A solid `n×n` straight-alpha RGBA stamp image in `color`.

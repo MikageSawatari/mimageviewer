@@ -308,6 +308,44 @@ pub enum BubbleShape {
         #[serde(default)]
         shape_seed: u32,
     },
+    /// なし (text-only container): no fill / no stroke / no tail — just the
+    /// centered text. `half_w`/`half_h` define the movable & selectable region and
+    /// the auto-size box. Lets the user place free text that can later be switched
+    /// to any other shape (it rides the bubble pipeline, unlike a Text object).
+    TextOnly {
+        half_w: f32,
+        half_h: f32,
+    },
+    /// 意識 (concentration / awareness): a soft, fuzzy-edged ellipse drawn with a
+    /// feathered fill rim + a soft outline ring (no hard edge), evoking an inner
+    /// monologue / dazed feeling. `shape_seed` jitters the rim wobble.
+    Concentration {
+        rx: f32,
+        ry: f32,
+        #[serde(default)]
+        shape_seed: u32,
+    },
+    /// 線 (sketchy strokes): a rounded rect whose outline is drawn with several
+    /// hand-drawn, jittered passes (rough / pencil look). Fill works normally
+    /// inside. `shape_seed` drives the deterministic per-pass jitter.
+    Strokes {
+        half_w: f32,
+        half_h: f32,
+        #[serde(default = "soft_corner")]
+        corner_px: f32,
+        #[serde(default)]
+        shape_seed: u32,
+    },
+    /// 二重線 (double stroke): a rounded rect with two concentric outlines `gap_px`
+    /// apart (the inner ring is body-only; a tail keeps a single line).
+    DoubleStroke {
+        half_w: f32,
+        half_h: f32,
+        #[serde(default = "soft_corner")]
+        corner_px: f32,
+        #[serde(default = "double_gap")]
+        gap_px: f32,
+    },
 }
 
 fn lines_count() -> u32 {
@@ -319,6 +357,9 @@ fn arrow_up() -> f32 {
 }
 fn soft_corner() -> f32 {
     28.0
+}
+fn double_gap() -> f32 {
+    8.0
 }
 
 impl Default for BubbleShape {

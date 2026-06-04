@@ -1,6 +1,6 @@
 # comic_lab 吹き出し形状の拡充（FramePlanner 参考）
 
-Status: Phase1 + Phase2 実装済み（2026-06）。Phase3 は将来。
+Status: Phase1 + Phase2 + Phase3 実装済み（2026-06）。
 対象: `crates/comic-core`（形状・ラスタ） + `tools/comic_lab`（UI）。
 
 ## 背景・分析
@@ -24,7 +24,11 @@ FramePlanner 内部名 → 表示 → 本ツール対応:
 | shout | シャウト | 既存 Burst プリセット「叫び」で代替 |
 | **motion-lines** | 集中線 | Phase2: `MotionLines`（線群） |
 | **speed-lines** | 流線 | Phase2: `SpeedLines`（線群） |
-| concentration / strokes / double-strokes / *-mind / none | 意識/線/二重線/◯？/なし | Phase3（将来） |
+| **concentration** | 意識 | Phase3: `Concentration`（ぼかし縁の楕円） |
+| **strokes** | 線 | Phase3: `Strokes`（手描き風の多重ストローク） |
+| **double-strokes** | 二重線 | Phase3: `DoubleStroke`（二重 stroke） |
+| ***-mind** | ◯？（思考） | Phase3: 既存形状 + `TailKind::Thought`（プリセット「思考(楕円)」） |
+| **none** | なし | Phase3: `TextOnly`（テキストのみ・枠なし） |
 
 ## Phase1: ベクター形状（既存パイプラインに乗る）
 
@@ -61,11 +65,33 @@ lab: `BubblePreset` に やわらか/多角形/ダイヤ/ハート/矢印 を追
   - 線の色/太さは `bubble.outline`。しっぽは無し（`tail_kind` で None）。
 - 回帰テスト: `line_field_shapes_bake_pixels_with_clear_center`（線が描かれ、中心ピクセルは透明）。
 
-## Phase3（将来）
+## Phase3: ぼかし縁 / 手描き / テキストのみ（実装済み）
 
-- 意識（ぼかし縁の楕円）、線（手描き風の多重ストローク）、二重線（二重 stroke）、
-  ◯？（既存形状 + 思考しっぽ）、なし（テキストのみ）。
+既存のベクター / 線群パイプラインに、塗り多角形でも線群でもない描画モードを 4 つ追加。
+
+- **意識** `Concentration {rx,ry,shape_seed}`: ぼかし縁の楕円。`draw_bubble_parts` が
+  検出して `draw_concentration` を呼ぶ（per-pixel）。内側 `CONCENTRATION_SOLID_RATIO`
+  (=0.78) までは不透明、そこから縁に向かって羽化（feather）。縁の半径は seed 由来の
+  低周波 sine 2 波で揺らして「もやもや」感を出す。縁付近にソフトな ring（枠色）を重ねる。
+  しっぽ無し。自動サイズは文字外接を内側 0.78 楕円に収める（外接 = 文字外接 × √2 / 0.78）。
+- **線** `Strokes {half_w,half_h,corner_px,shape_seed}`: 角丸長方形の輪郭を、各頂点を
+  外向き法線に沿って seed 由来の滑らかな波でずらした多重 stroke（2 pass、位相違い）で
+  描く＝手描き風。塗り・本文・自動サイズ・しっぽ・hit-test は通常パイプラインのまま。
+  滑らかな摂動なので自己交差しない。
+- **二重線** `DoubleStroke {half_w,half_h,corner_px,gap_px}`: 角丸長方形の外側ラインに加え、
+  `gap_px` 内側にもう 1 本（body のみ、しっぽは 1 本）。自動サイズは文字が内側ラインに
+  収まるよう外接を gap 分広げる。
+- **なし** `TextOnly {half_w,half_h}`: 枠も塗りもしっぽも描かず、中央寄せ本文のみ。
+  `half_w/half_h` は移動・選択領域 + 自動サイズ用。bubble パイプラインに乗るので後から
+  任意の形状へ切替できる（Text オブジェクトと違い吹き出しとして扱える）。
+
+◯？（思考系）は新形状ではなく既存形状 + `TailKind::Thought`。プリセット「思考(楕円)」
+（`MindEllipse` = Ellipse + Thought）を追加（もくもく `Cloud` との対比でクリーンな楕円）。
+
+回帰テスト: tessellate `phase3_shapes_have_sane_outlines` / `fit_preserves_phase3_variants`、
+raster `text_only_with_empty_text_draws_nothing` / `concentration_fills_center_and_fades_outside`
+/ `double_stroke_draws_more_than_single` / `sketch_strokes_bake_pixels_within_box`。
 
 ## 検証
-`cargo test -p comic-core`（71）/ `cargo test -p comic_lab --bin comic_lab`（4）green。
+`cargo test -p comic-core`（78）/ `cargo test -p comic_lab --bin comic_lab`（4）green。
 lab worktree（branch `lab`）で実装。

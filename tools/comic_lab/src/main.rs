@@ -25,6 +25,7 @@ use comic_core::{
     TextBlock, VAnchor, WindowPosition, bake_overlay, bake_overlay_with_stamps, bubble_geometry,
     effective_bubble_shape, effective_window_half_extents, layout_text, markup_rules_angle,
     markup_rules_brackets, markup_rules_white, nearest_base_t, resolve_tail_base,
+    tessellate_bubble,
 };
 use eframe::egui::{self, Color32, ColorImage, Pos2, Rect, Sense, TextureHandle, TextureOptions};
 use serde::{Deserialize, Serialize};
@@ -4066,6 +4067,84 @@ impl ComicLab {
                     }
                 });
             }
+            BubbleShape::TextOnly { half_w, half_h } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                        .changed();
+                }
+                ui.label(
+                    egui::RichText::new("枠なし・テキストのみ (塗り/枠は描画されません)")
+                        .small()
+                        .weak(),
+                );
+            }
+            BubbleShape::Concentration { rx, ry, shape_seed } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                        .changed();
+                }
+                ui.horizontal(|ui| {
+                    ui.label(format!("seed {shape_seed}"));
+                    if ui.button("再生成").clicked() {
+                        *shape_seed = shape_seed.wrapping_add(1);
+                        edited = true;
+                    }
+                });
+            }
+            BubbleShape::Strokes {
+                half_w,
+                half_h,
+                corner_px,
+                shape_seed,
+            } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                        .changed();
+                }
+                edited |= ui
+                    .add(egui::Slider::new(corner_px, 0.0..=200.0).text("角丸"))
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label(format!("seed {shape_seed}"));
+                    if ui.button("再生成").clicked() {
+                        *shape_seed = shape_seed.wrapping_add(1);
+                        edited = true;
+                    }
+                });
+            }
+            BubbleShape::DoubleStroke {
+                half_w,
+                half_h,
+                corner_px,
+                gap_px,
+            } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                        .changed();
+                }
+                edited |= ui
+                    .add(egui::Slider::new(corner_px, 0.0..=200.0).text("角丸"))
+                    .changed();
+                edited |= ui
+                    .add(egui::Slider::new(gap_px, 2.0..=40.0).text("線の間隔"))
+                    .changed();
+            }
         }
         if auto {
             ui.label(
@@ -4462,6 +4541,10 @@ impl ComicLab {
             BubbleShape::Soft { half_w, half_h, .. } => (half_w, half_h),
             BubbleShape::MotionLines { rx, ry, .. } => (rx, ry),
             BubbleShape::SpeedLines { half_w, half_h, .. } => (half_w, half_h),
+            BubbleShape::TextOnly { half_w, half_h } => (half_w, half_h),
+            BubbleShape::Concentration { rx, ry, .. } => (rx, ry),
+            BubbleShape::Strokes { half_w, half_h, .. } => (half_w, half_h),
+            BubbleShape::DoubleStroke { half_w, half_h, .. } => (half_w, half_h),
         };
         let (sin, cos) = obj.rotation_rad.sin_cos();
         let p = obj.pivot;
@@ -4995,14 +5078,18 @@ fn set_bubble_half_extents(b: &mut BubbleObject, hw: f32, hh: f32) {
         }
         BubbleShape::Polygon { rx, ry, .. }
         | BubbleShape::Heart { rx, ry }
-        | BubbleShape::MotionLines { rx, ry, .. } => {
+        | BubbleShape::MotionLines { rx, ry, .. }
+        | BubbleShape::Concentration { rx, ry, .. } => {
             *rx = hw;
             *ry = hh;
         }
         BubbleShape::SpeedLines { half_w, half_h, .. }
         | BubbleShape::Diamond { half_w, half_h }
         | BubbleShape::Arrow { half_w, half_h, .. }
-        | BubbleShape::Soft { half_w, half_h, .. } => {
+        | BubbleShape::Soft { half_w, half_h, .. }
+        | BubbleShape::TextOnly { half_w, half_h }
+        | BubbleShape::Strokes { half_w, half_h, .. }
+        | BubbleShape::DoubleStroke { half_w, half_h, .. } => {
             *half_w = hw;
             *half_h = hh;
         }
@@ -5233,6 +5320,24 @@ fn paint_bubble_preview(painter: &egui::Painter, area: Rect, preset: BubblePrese
     // Build the geometry in a neutral local space, then map to `area`.
     let pivot = (0.0f32, 0.0f32);
     let shape = preset.shape();
+
+    // なし: no box — show a couple of text-placeholder lines so the thumbnail
+    // reads as "text only".
+    if matches!(shape, BubbleShape::TextOnly { .. }) {
+        let line_col = Color32::from_gray(210);
+        for i in 0..2 {
+            let y = area.top() + area.height() * (0.40 + i as f32 * 0.24);
+            painter.line_segment(
+                [
+                    egui::pos2(area.left() + 10.0, y),
+                    egui::pos2(area.right() - 10.0 - i as f32 * 14.0, y),
+                ],
+                egui::Stroke::new(3.0, line_col),
+            );
+        }
+        return;
+    }
+
     // A small tail pointing down-left, only for presets that have one.
     let tail = preset.tail_kind().map(|kind| Tail {
         tip: (-70.0, 200.0),
@@ -5299,6 +5404,28 @@ fn paint_bubble_preview(painter: &egui::Painter, area: Rect, preset: BubblePrese
         painter.add(egui::Shape::mesh(mesh));
         painter.add(egui::Shape::closed_line(outline, stroke));
     }
+    // 二重線: a second, inner concentric ring (matches the bake).
+    if let BubbleShape::DoubleStroke {
+        half_w,
+        half_h,
+        corner_px,
+        gap_px,
+    } = shape
+    {
+        let g = gap_px.max(1.0);
+        let inner_shape = BubbleShape::RoundRect {
+            half_w: (half_w - g).max(1.0),
+            half_h: (half_h - g).max(1.0),
+            corner_px: (corner_px - g).max(0.0),
+        };
+        let inner: Vec<Pos2> = tessellate_bubble(&inner_shape, pivot)
+            .iter()
+            .map(|&p| map(p))
+            .collect();
+        if inner.len() >= 3 {
+            painter.add(egui::Shape::closed_line(inner, stroke));
+        }
+    }
     // Thought-tail circles (filled + stroked).
     for &(tcx, tcy, r) in &geo.thought {
         let c = map((tcx, tcy));
@@ -5343,6 +5470,11 @@ enum BubblePreset {
     Arrow,
     MotionLines,
     SpeedLines,
+    Concentration,
+    MindEllipse,
+    Strokes,
+    DoubleStroke,
+    TextOnly,
 }
 
 impl BubblePreset {
@@ -5354,14 +5486,19 @@ impl BubblePreset {
         BubblePreset::Soft,
         BubblePreset::Narration,
         BubblePreset::Thought,
+        BubblePreset::MindEllipse,
         BubblePreset::Shout,
         BubblePreset::Whisper,
+        BubblePreset::Concentration,
         BubblePreset::Polygon,
         BubblePreset::Diamond,
         BubblePreset::Heart,
         BubblePreset::Arrow,
         BubblePreset::MotionLines,
         BubblePreset::SpeedLines,
+        BubblePreset::Strokes,
+        BubblePreset::DoubleStroke,
+        BubblePreset::TextOnly,
     ];
 
     fn label(self) -> &'static str {
@@ -5379,6 +5516,11 @@ impl BubblePreset {
             BubblePreset::Arrow => "矢印",
             BubblePreset::MotionLines => "集中線",
             BubblePreset::SpeedLines => "流線",
+            BubblePreset::Concentration => "意識",
+            BubblePreset::MindEllipse => "思考(楕円)",
+            BubblePreset::Strokes => "線",
+            BubblePreset::DoubleStroke => "二重線",
+            BubblePreset::TextOnly => "なし",
         }
     }
 
@@ -5398,6 +5540,11 @@ impl BubblePreset {
             BubblePreset::Arrow => "arrow",
             BubblePreset::MotionLines => "motion-lines",
             BubblePreset::SpeedLines => "speed-lines",
+            BubblePreset::Concentration => "concentration",
+            BubblePreset::MindEllipse => "mind-ellipse",
+            BubblePreset::Strokes => "strokes",
+            BubblePreset::DoubleStroke => "double-strokes",
+            BubblePreset::TextOnly => "none",
         }
     }
 
@@ -5470,14 +5617,45 @@ impl BubblePreset {
                 count: 48,
                 shape_seed: 0,
             },
+            BubblePreset::Concentration => BubbleShape::Concentration {
+                rx: 180.0,
+                ry: 120.0,
+                shape_seed: 0,
+            },
+            BubblePreset::MindEllipse => BubbleShape::Ellipse {
+                rx: 165.0,
+                ry: 110.0,
+            },
+            BubblePreset::Strokes => BubbleShape::Strokes {
+                half_w: 165.0,
+                half_h: 105.0,
+                corner_px: 36.0,
+                shape_seed: 0,
+            },
+            BubblePreset::DoubleStroke => BubbleShape::DoubleStroke {
+                half_w: 165.0,
+                half_h: 105.0,
+                corner_px: 26.0,
+                gap_px: 8.0,
+            },
+            BubblePreset::TextOnly => BubbleShape::TextOnly {
+                half_w: 150.0,
+                half_h: 95.0,
+            },
         }
     }
 
     fn tail_kind(self) -> Option<TailKind> {
         match self {
-            // No tail for narration or the line-field effects (集中線 / 流線).
-            BubblePreset::Narration | BubblePreset::MotionLines | BubblePreset::SpeedLines => None,
-            BubblePreset::Thought => Some(TailKind::Thought),
+            // No tail for narration, the line-field effects (集中線 / 流線),
+            // 意識 (fuzzy, edgeless), or なし (text-only).
+            BubblePreset::Narration
+            | BubblePreset::MotionLines
+            | BubblePreset::SpeedLines
+            | BubblePreset::Concentration
+            | BubblePreset::TextOnly => None,
+            // Thought-style tails (もくもく cloud + clean 楕円 thought).
+            BubblePreset::Thought | BubblePreset::MindEllipse => Some(TailKind::Thought),
             _ => Some(TailKind::Spike),
         }
     }

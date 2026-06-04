@@ -66,12 +66,37 @@ pub fn tessellate_bubble(shape: &BubbleShape, pivot: (f32, f32)) -> Vec<(f32, f3
         // central ellipse (`LINE_FIELD_CLEAR_RATIO` of the outer extent).
         BubbleShape::MotionLines { rx, ry, .. } => ellipse_pts(cx, cy, rx, ry),
         BubbleShape::SpeedLines { half_w, half_h, .. } => ellipse_pts(cx, cy, half_w, half_h),
+        // なし: a plain rect bounds box (for AABB / hit-test / auto-size). The
+        // rasterizer draws no fill/stroke for this shape — only the centered text.
+        BubbleShape::TextOnly { half_w, half_h } => round_rect(cx, cy, half_w, half_h, 0.0),
+        // 意識: the outline is a plain ellipse (drives AABB / hit-test); the fuzzy
+        // feathered rim is rendered by the rasterizer within this extent.
+        BubbleShape::Concentration { rx, ry, .. } => ellipse_pts(cx, cy, rx, ry),
+        // 線 / 二重線: rounded-rect outline (the sketchy / doubled stroke styling
+        // is applied by the rasterizer; fill/AABB/hit-test/tail use this contour).
+        BubbleShape::Strokes {
+            half_w,
+            half_h,
+            corner_px,
+            ..
+        } => round_rect(cx, cy, half_w, half_h, corner_px),
+        BubbleShape::DoubleStroke {
+            half_w,
+            half_h,
+            corner_px,
+            ..
+        } => round_rect(cx, cy, half_w, half_h, corner_px),
     }
 }
 
 /// The clear central ellipse of a line-field shape (集中線/流線), as a fraction
 /// of its outer extent. Text fits inside this; lines stop at its edge.
 pub const LINE_FIELD_CLEAR_RATIO: f32 = 0.55;
+
+/// The solid-fill fraction of a 意識 (concentration) ellipse: the fill is opaque
+/// inside this radius and feathers to transparent by the rim. Auto-size fits the
+/// text rectangle inside this inner ellipse.
+pub const CONCENTRATION_SOLID_RATIO: f32 = 0.78;
 
 /// Axis-aligned ellipse outline (ELLIPSE_SEGMENTS points).
 fn ellipse_pts(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<(f32, f32)> {
@@ -309,6 +334,42 @@ pub fn fit_bubble_shape(
             count,
             shape_seed,
         },
+        // なし: the box exactly wraps the text (+ padding); no shape to inflate.
+        BubbleShape::TextOnly { .. } => BubbleShape::TextOnly {
+            half_w: hw,
+            half_h: hh,
+        },
+        // 意識: text fits the SOLID inner ellipse, so the outer ellipse is enlarged
+        // by √2 / solid-ratio (the rim feathers out beyond the text).
+        BubbleShape::Concentration { shape_seed, .. } => BubbleShape::Concentration {
+            rx: hw * SQRT2 / CONCENTRATION_SOLID_RATIO,
+            ry: hh * SQRT2 / CONCENTRATION_SOLID_RATIO,
+            shape_seed,
+        },
+        // 線: like a rounded rect (the sketch jitter is small); keep corner + seed.
+        BubbleShape::Strokes {
+            corner_px,
+            shape_seed,
+            ..
+        } => BubbleShape::Strokes {
+            half_w: hw,
+            half_h: hh,
+            corner_px: corner_px.min(hw.min(hh)),
+            shape_seed,
+        },
+        // 二重線: the inner ring sits `gap` inside, so the text must fit inside the
+        // INNER rect — enlarge the outer half-extents by `gap` on each side.
+        BubbleShape::DoubleStroke {
+            corner_px, gap_px, ..
+        } => {
+            let g = gap_px.max(0.0);
+            BubbleShape::DoubleStroke {
+                half_w: hw + g,
+                half_h: hh + g,
+                corner_px: corner_px.min((hw + g).min(hh + g)),
+                gap_px,
+            }
+        }
     }
 }
 
@@ -533,6 +594,10 @@ fn shape_half_extents(shape: &BubbleShape) -> (f32, f32) {
         BubbleShape::Soft { half_w, half_h, .. } => (half_w, half_h),
         BubbleShape::MotionLines { rx, ry, .. } => (rx, ry),
         BubbleShape::SpeedLines { half_w, half_h, .. } => (half_w, half_h),
+        BubbleShape::TextOnly { half_w, half_h } => (half_w, half_h),
+        BubbleShape::Concentration { rx, ry, .. } => (rx, ry),
+        BubbleShape::Strokes { half_w, half_h, .. } => (half_w, half_h),
+        BubbleShape::DoubleStroke { half_w, half_h, .. } => (half_w, half_h),
     }
 }
 
@@ -1213,6 +1278,133 @@ mod tests {
             10.0,
         );
         assert!(matches!(f, BubbleShape::Arrow { dir_rad, .. } if (dir_rad - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn phase3_shapes_have_sane_outlines() {
+        // なし: a plain 4-corner rect within the half-extent box.
+        let t = tessellate_bubble(
+            &BubbleShape::TextOnly {
+                half_w: 40.0,
+                half_h: 30.0,
+            },
+            (0.0, 0.0),
+        );
+        assert_eq!(t.len(), 4);
+        assert!(t.iter().all(|&(x, y)| x.abs() <= 40.1 && y.abs() <= 30.1));
+
+        // 意識: an ellipse outline within rx/ry.
+        let c = tessellate_bubble(
+            &BubbleShape::Concentration {
+                rx: 60.0,
+                ry: 40.0,
+                shape_seed: 3,
+            },
+            (0.0, 0.0),
+        );
+        assert_eq!(c.len(), ELLIPSE_SEGMENTS);
+        assert!(c.iter().all(|&(x, y)| x.abs() <= 60.1 && y.abs() <= 40.1));
+
+        // 線 / 二重線: rounded-rect contours within the box.
+        for s in [
+            BubbleShape::Strokes {
+                half_w: 70.0,
+                half_h: 45.0,
+                corner_px: 20.0,
+                shape_seed: 1,
+            },
+            BubbleShape::DoubleStroke {
+                half_w: 70.0,
+                half_h: 45.0,
+                corner_px: 20.0,
+                gap_px: 8.0,
+            },
+        ] {
+            let p = tessellate_bubble(&s, (0.0, 0.0));
+            assert!(p.len() > 8 && p.iter().all(|&(x, y)| x.abs() <= 70.1 && y.abs() <= 45.1));
+        }
+    }
+
+    #[test]
+    fn fit_preserves_phase3_variants() {
+        let (tw, th, pad) = (120.0, 90.0, 10.0);
+        // なし: half extents are exactly text/2 + padding.
+        let f = fit_bubble_shape(
+            &BubbleShape::TextOnly {
+                half_w: 1.0,
+                half_h: 1.0,
+            },
+            tw,
+            th,
+            pad,
+        );
+        let BubbleShape::TextOnly { half_w, half_h } = f else {
+            panic!("text-only stays text-only");
+        };
+        assert!((half_w - (tw * 0.5 + pad)).abs() < 1e-3);
+        assert!((half_h - (th * 0.5 + pad)).abs() < 1e-3);
+
+        // 意識: text rect fits inside the SOLID inner ellipse.
+        let f = fit_bubble_shape(
+            &BubbleShape::Concentration {
+                rx: 1.0,
+                ry: 1.0,
+                shape_seed: 5,
+            },
+            tw,
+            th,
+            pad,
+        );
+        let BubbleShape::Concentration { rx, ry, shape_seed } = f else {
+            panic!("concentration stays concentration");
+        };
+        assert_eq!(shape_seed, 5);
+        let (hw, hh) = (tw * 0.5 + pad, th * 0.5 + pad);
+        let inner = CONCENTRATION_SOLID_RATIO;
+        let cover = (hw / (rx * inner)).powi(2) + (hh / (ry * inner)).powi(2);
+        assert!(
+            cover <= 1.0 + 1e-3,
+            "text rect inside solid ellipse: {cover}"
+        );
+
+        // 二重線: the OUTER half extents are enlarged by the gap so the text fits
+        // inside the inner ring (outer = text/2 + pad + gap).
+        let f = fit_bubble_shape(
+            &BubbleShape::DoubleStroke {
+                half_w: 1.0,
+                half_h: 1.0,
+                corner_px: 12.0,
+                gap_px: 8.0,
+            },
+            tw,
+            th,
+            pad,
+        );
+        let BubbleShape::DoubleStroke {
+            half_w,
+            half_h,
+            gap_px,
+            ..
+        } = f
+        else {
+            panic!("double-stroke stays double-stroke");
+        };
+        assert_eq!(gap_px, 8.0);
+        assert!((half_w - (hw + 8.0)).abs() < 1e-3 && (half_h - (hh + 8.0)).abs() < 1e-3);
+
+        // 線: rounded-rect-like fit, corner + seed preserved.
+        let f = fit_bubble_shape(
+            &BubbleShape::Strokes {
+                half_w: 1.0,
+                half_h: 1.0,
+                corner_px: 30.0,
+                shape_seed: 9,
+            },
+            tw,
+            th,
+            pad,
+        );
+        assert!(matches!(f, BubbleShape::Strokes { shape_seed: 9, .. }));
     }
 
     #[test]
