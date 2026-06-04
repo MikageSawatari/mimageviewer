@@ -208,6 +208,13 @@ P5-1〜P5-6 で AI 先読みパイプライン (edit → AI/補正の順序入�
     Arc と同一でないことを assert。compose chain が誤って conceal-applied
     pixels を補正レイヤーの入力源に回す退行を検知する。
 
+- **`src/app/tests.rs::interleaved_prefetch_targets_boundary_cases`** (top-level
+  test mod に追加):
+  AI 先読みターゲット選定の純関数 (= P5 series で活用) の境界を符号化。
+  通常 case (中央, forward=2 back=1) のインタリーブ順序、先頭/末尾の片側 None、
+  forward=back=0 の空、forward >> n の overflow を網羅。順序が崩れると
+  「ページ送り直後に毎回 cold miss する」退行を検知する。
+
 これらの guard は src/app.rs 18957- (bypass) / 19007- (prefix) にある 4 つの
 `is_some() return` + `let Some(..) else return` パターン、および
 src/app.rs:18905- (`current_local_adjust_source_pixels`) の compose chain。

@@ -148,6 +148,65 @@ fn fullscreen_prefetch_candidates_respect_visible_indices() {
     );
 }
 
+/// P6-6: `interleaved_prefetch_targets` 純関数の境界条件を符号化する。
+///
+/// この関数は `App::ai_prefetch_targets` の中核で、UI スレッドから 1 フレーム
+/// 数回呼ばれる経路にいる。順序 (forward, back, forward, back, ...) を変えると
+/// 「ユーザーが次に見るページから優先して AI を温める」スケジュールが崩れる
+/// (= ページ送り直後に毎回 cold miss する退行)。
+///
+/// それぞれ独立した境界 (= 先頭で back が無い / 末尾で forward が無い /
+/// 全 0 で空 / 大きい d で末尾にぶつかったらスキップ) を 1 個ずつチェックする。
+#[test]
+fn interleaved_prefetch_targets_boundary_cases() {
+    // 通常 case: 中央 (pos=3), forward=2, back=1
+    // 期待順: forward d=1 → back d=1 → forward d=2  (back d=2 は無し: pf_back=1)
+    let indices: Vec<usize> = (0..7).collect(); // [0,1,2,3,4,5,6]
+    assert_eq!(
+        interleaved_prefetch_targets(&indices, 3, 7, 2, 1),
+        vec![4, 2, 5],
+        "通常 case: forward → back → forward 順 (d=1 forward, d=1 back, d=2 forward)"
+    );
+
+    // 先頭: pos=0, forward=3, back=2
+    // pos.checked_sub(d) → None で back は何も生やさない
+    assert_eq!(
+        interleaved_prefetch_targets(&indices, 0, 7, 3, 2),
+        vec![1, 2, 3],
+        "先頭: back は全部 None なので forward のみ"
+    );
+
+    // 末尾: pos=6, forward=2, back=3
+    // pos+d >= n で forward はカット、back は 3 件取れる
+    assert_eq!(
+        interleaved_prefetch_targets(&indices, 6, 7, 2, 3),
+        vec![5, 4, 3],
+        "末尾: forward は 範囲外なので back のみ"
+    );
+
+    // 全 0: forward=0, back=0
+    assert!(
+        interleaved_prefetch_targets(&indices, 3, 7, 0, 0).is_empty(),
+        "forward=back=0 → 空"
+    );
+
+    // 非対称: forward >> back の典型ケース (settings 既定: forward=2, back=1)
+    // pos=2, n=5 → forward d=1→3, back d=1→1, forward d=2→4 (back d=2 は無し)
+    let small: Vec<usize> = vec![10, 20, 30, 40, 50];
+    assert_eq!(
+        interleaved_prefetch_targets(&small, 2, 5, 2, 1),
+        vec![40, 20, 50],
+        "デフォルト forward=2 back=1 のインタリーブ順序 (= settings 既定値の代表ケース)"
+    );
+
+    // forward が n を越える: 末尾を超えたらスキップ
+    assert_eq!(
+        interleaved_prefetch_targets(&small, 2, 5, 10, 0),
+        vec![40, 50],
+        "forward が n を越えても、範囲内のものだけが選ばれる (overflow scenarios)"
+    );
+}
+
 #[test]
 fn next_video_search_uses_visible_indices_and_skips_non_video_items() {
     use crate::grid_item::GridItem;
