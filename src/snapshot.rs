@@ -43,13 +43,38 @@ pub enum SnapshotKey {
 /// snapshot に含まれる 1 件分の entry。
 ///
 /// `kind` で対応する操作 (folder enter / image fullscreen / page render) を切り替え、
-/// `key` で identity 比較する。`display_path` は UI 表示用 (lazy 評価しない、構築時に決定)。
+/// `key` で identity 比較する。`target` は実際の open 経路で使う元 path 構造体
+/// (= ZipImage は `<zip>+<entry_name>` 構造を保持、PdfPage は `<pdf>+<page_num>` 構造を保持)。
+/// `display` は UI 表示用 (lazy 評価しない、構築時に決定)。
+///
+/// ⚠ 旧版では `display` を path round-trip に使っていたが、ZipImage の `<zip>:<entry>` /
+/// PdfPage の `<pdf>:Page N` 形式が `snapshot_key_from_path` で解釈不能だったため、
+/// `target` を分離して構造を保持する (Codex P1-1 fix)。
 #[derive(Clone, Debug)]
 pub struct SnapshotEntry {
     pub key: SnapshotKey,
     pub kind: SnapshotEntryKind,
+    pub target: SnapshotTarget,
     /// UI 表示・log 用の文字列形式 path。`display_path()` を都度呼ぶより安価。
     pub display: String,
+}
+
+/// snapshot entry が指す元 path 構造 (= 再 open / reconstruct で使う)。
+///
+/// `display` 文字列からの round-trip では復元できない構造 (ZipImage / PdfPage) を
+/// 保持するため、専用 enum で持つ。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotTarget {
+    /// 通常 filesystem path (= Folder / Image / Video / ZipFile / PdfFile /
+    /// ConvertibleArchive)。GridItem への復元は kind と組み合わせて行う。
+    Fs(PathBuf),
+    /// ZIP 内 image entry
+    ZipImage {
+        zip_path: PathBuf,
+        entry_name: String,
+    },
+    /// PDF page (0-indexed)
+    PdfPage { pdf_path: PathBuf, page_num: u32 },
 }
 
 /// snapshot entry の種別。
@@ -264,11 +289,80 @@ pub fn snapshot_entry_kind(item: &GridItem) -> Option<SnapshotEntryKind> {
 pub fn snapshot_entry_from_grid_item(item: &GridItem) -> Option<SnapshotEntry> {
     let key = snapshot_key_from_grid_item(item)?;
     let kind = snapshot_entry_kind(item)?;
+    let target = snapshot_target_from_grid_item(item)?;
     Some(SnapshotEntry {
         key,
         kind,
+        target,
         display: item.display_path(),
     })
+}
+
+/// `GridItem` から `SnapshotTarget` を構築する。
+///
+/// `Fs` variant は通常 PathBuf、Archive 系 (ZipImage/PdfPage) は構造化して保持。
+pub fn snapshot_target_from_grid_item(item: &GridItem) -> Option<SnapshotTarget> {
+    match item {
+        GridItem::Folder(p)
+        | GridItem::Image(p)
+        | GridItem::Video(p)
+        | GridItem::ZipFile(p)
+        | GridItem::PdfFile(p) => Some(SnapshotTarget::Fs(p.clone())),
+        GridItem::ConvertibleArchive { path, .. } => Some(SnapshotTarget::Fs(path.clone())),
+        GridItem::ZipImage {
+            zip_path,
+            entry_name,
+        } => Some(SnapshotTarget::ZipImage {
+            zip_path: zip_path.clone(),
+            entry_name: entry_name.clone(),
+        }),
+        GridItem::PdfPage {
+            pdf_path, page_num, ..
+        } => Some(SnapshotTarget::PdfPage {
+            pdf_path: pdf_path.clone(),
+            page_num: *page_num,
+        }),
+        GridItem::ZipSeparator { .. } | GridItem::SearchContainer { .. } => None,
+    }
+}
+
+/// `SnapshotEntry` から `GridItem` を復元する (= snapshot list view への帰還で使う)。
+///
+/// `target` 構造を保持しているので ZipImage/PdfPage も正しく復元できる。
+/// `PdfPage::content_type` は復元できない (= 元 GridItem 構築時に None で再構築、
+/// fullscreen で再描画されると更新される)。
+pub fn reconstruct_grid_item(entry: &SnapshotEntry) -> Option<GridItem> {
+    match (&entry.target, entry.kind) {
+        (SnapshotTarget::Fs(p), SnapshotEntryKind::Folder) => Some(GridItem::Folder(p.clone())),
+        (SnapshotTarget::Fs(p), SnapshotEntryKind::Image) => Some(GridItem::Image(p.clone())),
+        (SnapshotTarget::Fs(p), SnapshotEntryKind::Video) => Some(GridItem::Video(p.clone())),
+        (SnapshotTarget::Fs(p), SnapshotEntryKind::ZipFile) => Some(GridItem::ZipFile(p.clone())),
+        (SnapshotTarget::Fs(p), SnapshotEntryKind::PdfFile) => Some(GridItem::PdfFile(p.clone())),
+        // ConvertibleArchive は format 情報を失うので restore できない。Fs 扱いで近似:
+        // 実用上は snapshot 内に ConvertibleArchive を含めるケースは稀なので MVP として許容。
+        (SnapshotTarget::Fs(p), SnapshotEntryKind::ConvertibleArchive) => {
+            Some(GridItem::Folder(p.clone()))
+        }
+        (
+            SnapshotTarget::ZipImage {
+                zip_path,
+                entry_name,
+            },
+            SnapshotEntryKind::ZipImage,
+        ) => Some(GridItem::ZipImage {
+            zip_path: zip_path.clone(),
+            entry_name: entry_name.clone(),
+        }),
+        (SnapshotTarget::PdfPage { pdf_path, page_num }, SnapshotEntryKind::PdfPage) => {
+            Some(GridItem::PdfPage {
+                pdf_path: pdf_path.clone(),
+                page_num: *page_num,
+                content_type: None,
+            })
+        }
+        // target と kind が不整合のケースは構築不能 (= 設計バグ、debug log のみ)
+        _ => None,
+    }
 }
 
 /// 子 path が親 fs path 配下にあるか判定する (= sibling false positive 防止)。

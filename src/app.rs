@@ -13041,6 +13041,13 @@ impl App {
         // BS: 親フォルダへ (検索中はスタックを戻る)
         // Ctrl+BS は個別補正の解除に使うので除外する
         if (backspace && !ctrl_held) || alt_up {
+            // Fix-B (ユーザー指摘): ★固定 中の BS は snapshot list view (= snapshot.items を
+            // render する状態) に戻る。snapshot 内 child folder に居る場合のみ動作し、既に
+            // snapshot root 表示中なら通常の親フォルダ移動を試みる (= load_folder guard で
+            // 範囲外なら toast block される)。
+            if self.is_snapshot_active() && self.snapshot_return_to_list_view() {
+                return None;
+            }
             // Ctrl+G 絞り込みビュー中なら 1 段上げる (current_path != container_root) か、
             // Aggregated に戻る。自由な fs 遡行は許さない (docs §10.3)。
             if self.global_search.active {

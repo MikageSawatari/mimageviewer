@@ -257,16 +257,98 @@ impl App {
     /// snapshot を deactivate する (= 退避していた items 等を復元)。
     ///
     /// 検索 state は **consume 済み** で復元しない (= §4.5 mutual exclusion の対称性)。
+    ///
+    /// Fix-D (Codex P1-3): user が snapshot 内 child folder の中に居る状態で解除した
+    /// 場合、saved_items を強制復元すると address/grid 不整合になる。current_folder が
+    /// origin と一致する場合のみ復元、不一致の場合は current_folder の通常 reload を
+    /// 行う (= snapshot state を捨てるだけ)。
     pub(crate) fn deactivate_snapshot(&mut self) {
         let Some(snap) = self.snapshot.take() else {
             return;
         };
-        self.items = snap.saved_items;
-        self.thumbnails = snap.saved_thumbnails;
-        self.visible_indices = snap.saved_visible_indices;
-        self.scroll_offset_y = snap.saved_scroll_offset_y;
-        self.selected = snap.saved_selected;
+        // filter suppress も解除 (= snapshot 内 folder enter で発動していた可能性がある)
+        let _ = self.restore_rating_filter_suppression();
+        // current_folder が snapshot origin と一致するか
+        let at_origin = self
+            .current_folder
+            .as_ref()
+            .map(|p| {
+                crate::snapshot::snapshot_key_from_path(p)
+                    == crate::snapshot::snapshot_key_from_path(&snap.origin)
+            })
+            .unwrap_or(false);
+        if at_origin {
+            // origin のまま解除 → 元の items 復元 (= snapshot 元のフォルダに戻る)
+            self.items = snap.saved_items;
+            self.thumbnails = snap.saved_thumbnails;
+            self.visible_indices = snap.saved_visible_indices;
+            self.scroll_offset_y = snap.saved_scroll_offset_y;
+            self.selected = snap.saved_selected;
+        } else {
+            // child folder の中で解除 → 現在の items はそのまま、snapshot state だけ捨てる
+            // visible_indices は filter / current_folder に対して再構築
+            self.rebuild_visible_indices();
+        }
         self.show_feedback_toast("★固定を解除しました".into());
+    }
+
+    /// Fix-B (ユーザー指摘): snapshot 内 child folder に居る状態で BS が押されたら、
+    /// snapshot list view (= snapshot.items を render する状態) に戻る。
+    ///
+    /// 戻り値: `true` = snapshot list view に戻った、`false` = inactive or 既に snapshot
+    /// list view 表示中 (= 通常 BS を続行すべき)。
+    ///
+    /// 実装:
+    /// - snapshot.items から `reconstruct_grid_item` で GridItem を再構築 (= Codex P1-1
+    ///   fix で導入した SnapshotTarget 経由なので ZipImage/PdfPage も復元できる)
+    /// - thumbnails は Pending 状態でリセット (= 既存 thumbnail cache が path-keyed なので
+    ///   即座に hit して再描画される)
+    /// - filter suppress を解除 (= snapshot list 自体は filter を suppress しない設計)
+    /// - current_folder = snapshot_origin、address bar 表示も更新
+    pub(crate) fn snapshot_return_to_list_view(&mut self) -> bool {
+        use crate::grid_item::ThumbnailState;
+        // 必要な snapshot field を最初に clone して借用を切る (= 後段の mut self call と衝突しない)
+        let (snap_origin, reconstructed) = {
+            let Some(snap) = self.snapshot.as_ref() else {
+                return false;
+            };
+            let origin = snap.origin.clone();
+            let reconstructed: Vec<crate::grid_item::GridItem> = snap
+                .items
+                .iter()
+                .filter_map(crate::snapshot::reconstruct_grid_item)
+                .collect();
+            (origin, reconstructed)
+        };
+        // 既に snapshot root に居れば何もしない (= 通常 BS の対象)
+        let at_origin = self
+            .current_folder
+            .as_ref()
+            .map(|p| {
+                crate::snapshot::snapshot_key_from_path(p)
+                    == crate::snapshot::snapshot_key_from_path(&snap_origin)
+            })
+            .unwrap_or(false);
+        if at_origin {
+            return false;
+        }
+        let n = reconstructed.len();
+        // filter suppress 解除 (= snapshot list view は filter 通常適用)
+        let _ = self.restore_rating_filter_suppression();
+        // fullscreen 中なら閉じる
+        if self.fullscreen_idx.is_some() {
+            self.close_fullscreen();
+        }
+        // items 入れ替え
+        self.items = reconstructed;
+        self.thumbnails = vec![ThumbnailState::Pending; n];
+        self.visible_indices = (0..n).collect();
+        self.current_folder = Some(snap_origin.clone());
+        self.address = snap_origin.display().to_string();
+        self.scroll_offset_y = 0.0;
+        self.selected = None;
+        self.show_feedback_toast("★固定リストに戻りました".into());
+        true
     }
 
     /// 検索系 (Ctrl+F / Ctrl+S / Ctrl+G) を全部 close する (= snapshot ON 時に呼ぶ)。
@@ -422,7 +504,7 @@ impl App {
     ///   - スライドショー継続の場合は `resume_slideshow` で起動
     pub(crate) fn snapshot_open_entry(&mut self, entry_idx: usize, resume_slideshow: bool) -> bool {
         use crate::grid_item::GridItem;
-        use crate::snapshot::SnapshotEntryKind;
+        use crate::snapshot::{SnapshotEntryKind, SnapshotTarget};
         let Some(snap) = self.snapshot.as_ref() else {
             return false;
         };
@@ -430,30 +512,16 @@ impl App {
             return false;
         };
         let entry_kind = entry.kind;
-        let target_path = std::path::PathBuf::from(&entry.display);
+        // 構造化 target を使う (Codex P1-1 fix): display 文字列の round-trip 破綻を回避
+        let entry_target = entry.target.clone();
         match entry_kind {
-            SnapshotEntryKind::Image
-            | SnapshotEntryKind::Video
-            | SnapshotEntryKind::ZipImage
-            | SnapshotEntryKind::PdfPage => {
+            SnapshotEntryKind::Image | SnapshotEntryKind::Video => {
+                let SnapshotTarget::Fs(target_path) = entry_target else {
+                    return false;
+                };
                 // 現在 items の中に同 path があれば直接 open
                 if let Some(idx) = self.items.iter().position(|it| match it {
                     GridItem::Image(p) | GridItem::Video(p) => *p == target_path,
-                    GridItem::ZipImage {
-                        zip_path,
-                        entry_name,
-                    } => {
-                        let mut p = zip_path.clone();
-                        p.push(entry_name);
-                        p == target_path
-                    }
-                    GridItem::PdfPage {
-                        pdf_path, page_num, ..
-                    } => {
-                        let mut p = pdf_path.clone();
-                        p.push(format!("p:{page_num}"));
-                        p == target_path
-                    }
                     _ => false,
                 }) {
                     self.open_fullscreen(idx);
@@ -463,28 +531,67 @@ impl App {
                     return true;
                 }
                 // 該当 path が現在 items に無い → owner folder を load してから open
-                let owner_folder = match entry_kind {
-                    SnapshotEntryKind::Image | SnapshotEntryKind::Video => {
-                        target_path.parent().map(|p| p.to_path_buf())
-                    }
-                    SnapshotEntryKind::ZipImage | SnapshotEntryKind::PdfPage => {
-                        // archive 内 inner なので container を解決
-                        crate::snapshot::split_archive_path(&target_path).map(|(c, _)| c)
-                    }
-                    _ => None,
-                };
-                if let Some(folder) = owner_folder {
+                if let Some(folder) = target_path.parent().map(|p| p.to_path_buf()) {
                     self.snapshot_load_and_open(folder, resume_slideshow);
                     return true;
                 }
                 false
             }
+            SnapshotEntryKind::ZipImage => {
+                let SnapshotTarget::ZipImage {
+                    zip_path,
+                    entry_name,
+                } = entry_target
+                else {
+                    return false;
+                };
+                // 現在 items の中に同 zip/entry があれば直接 open
+                if let Some(idx) = self.items.iter().position(|it| match it {
+                    GridItem::ZipImage {
+                        zip_path: zp,
+                        entry_name: en,
+                    } => *zp == zip_path && *en == entry_name,
+                    _ => false,
+                }) {
+                    self.open_fullscreen(idx);
+                    if resume_slideshow {
+                        self.slideshow_playing = true;
+                    }
+                    return true;
+                }
+                // 該当 zip が現在開かれていない → zip を load してから open
+                self.snapshot_load_and_open(zip_path, resume_slideshow);
+                true
+            }
+            SnapshotEntryKind::PdfPage => {
+                let SnapshotTarget::PdfPage { pdf_path, page_num } = entry_target else {
+                    return false;
+                };
+                if let Some(idx) = self.items.iter().position(|it| match it {
+                    GridItem::PdfPage {
+                        pdf_path: pp,
+                        page_num: pn,
+                        ..
+                    } => *pp == pdf_path && *pn == page_num,
+                    _ => false,
+                }) {
+                    self.open_fullscreen(idx);
+                    if resume_slideshow {
+                        self.slideshow_playing = true;
+                    }
+                    return true;
+                }
+                self.snapshot_load_and_open(pdf_path, resume_slideshow);
+                true
+            }
             SnapshotEntryKind::Folder
             | SnapshotEntryKind::ZipFile
             | SnapshotEntryKind::PdfFile
             | SnapshotEntryKind::ConvertibleArchive => {
-                // container を load し、その後最初の playable item を fullscreen で開く
-                self.snapshot_load_and_open(target_path, resume_slideshow);
+                let SnapshotTarget::Fs(container_path) = entry_target else {
+                    return false;
+                };
+                self.snapshot_load_and_open(container_path, resume_slideshow);
                 true
             }
         }
@@ -502,8 +609,19 @@ impl App {
         }
         // guard bypass
         self.snapshot_internal_nav = true;
-        self.load_folder(folder_path);
+        self.load_folder(folder_path.clone());
         self.snapshot_internal_nav = false;
+        // Fix-A (ユーザー指摘): snapshot 内 folder に入る = ★3 folder の中の無印画像を
+        // 見たいケースが代表 use case。既存の「★一時解除中」機構を流用して、folder
+        // 自身の★レベルで filter を一時 suppress する。これで filter 適用前は隠れていた
+        // 中の image が見えるようになる。snapshot を解除する / 範囲外フォルダに出ると
+        // suppress も自動解除される (= 既存の restore 経路)。
+        // suppress 後に rebuild_visible_indices を呼んで filter 解除を反映する
+        // (= load_folder 内の rebuild は suppress 前の filter で実行されているため)。
+        self.maybe_suppress_rating_filter_for_opened_container_path(&folder_path);
+        if self.rating_filter_suppressed_at.is_some() {
+            self.rebuild_visible_indices();
+        }
         // load_folder 完了後に最初の playable item (= Image/Video) を fullscreen で開く。
         // ※ ZIP/PDF は async enumerate なので、items は ZipSeparator のみで埋まっている可能性が
         //   ある。その場合は次フレーム以降の enumerate 完了で deferred reopen される (= §4.6
