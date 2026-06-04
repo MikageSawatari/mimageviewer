@@ -105,6 +105,36 @@
 4. **filter UI を disabled** にする:
    - ★ filter ボタン群 (なし / ★1〜★5): disabled
    - Ctrl+F / Ctrl+S / Ctrl+G 入力欄: 既存検索が active ならその結果が固定対象、新規検索は disabled (= 後述の 4.5 参照)
+5. **filter state を論理的に suspend** する (= 4.2.1 参照、重要)
+
+### 4.2.1 filter の役割 — capture 時のみ、navigation 中は suspend
+
+★固定 中の `rating_filter` / `text_query` / `Ctrl+S` 結果リストは、**「どの top-level item を snapshot に入れるか」を決定するためにだけ使う**。snapshot ON 後、各 snapshot folder に入った場合、その **フォルダ内部の表示には filter を適用しない** (= 全 items を見せる)。
+
+#### 理由 — 原 use case の解決
+
+ユーザーの代表的な use case は「**フォルダ自体が ★5、中身は無印画像**」 (= 数千フォルダから気に入った数フォルダを ★5 マークしておく) で、その中の画像を slideshow したい:
+
+```
+★5 folder A (folder itself is ★5)
+  ├ image_001.jpg (no rating)
+  ├ image_002.jpg (no rating)
+  └ ...
+```
+
+snapshot 中 folder A に入ったとき、★5 filter が中まで効くと「★5 image が 0 件 → 結果なし」となり、**snapshot の意味がない**。よって filter は capture 時にのみ効かせ、navigation 中は suspend する。
+
+#### 実装上の含意
+
+- `snapshot_active` 中は `passes_rating_filter` / `passes_text_query` を **bypass** する (= 結果として常に `true` を返すラッパー、または filter state を temp に退避)
+- snapshot OFF で filter state 復活 (= 解除後、元の絞り込み状態に戻る)
+- 「snapshot 中の各フォルダ内でも filter したい」要望が後で来たら v1.2.0 で option 化 (= §8 後続作業を参照)
+
+#### memory フットプリント
+
+- snapshot は **現在の visible_indices にある items の path だけ** を保持 (= 入れ子の中身は保持しない)
+- 例: 100 フォルダ中 ★5 が 12 件なら snapshot は 12 path のみ
+- 100 フォルダ全部 ★5 でも 100 path、最悪 case でも数千 path = 数百 KB 程度
 
 #### OFF 動作 (= 再クリック / グリッド中の Esc)
 
@@ -175,6 +205,8 @@ snapshot active 中、フルスクリーンで開いた path が `snapshot_items
 | `Esc` | フルスクリーン解除のみ (= snapshot は維持、グリッドに戻る) |
 | `Enter` | 既存 P10-1 どおり、フルスクリーン解除 |
 
+**重要**: snapshot folder に入った後、その **フォルダ内部の image-like 一覧は filter なしで全表示** される (= §4.2.1 参照)。「フォルダ自体が ★5 + 中身は無印画像」が代表 use case なので、中身まで filter が効くと意味がなくなるため。
+
 snapshot 範囲外の path をフルスクリーンで開いた場合 (= 例: snapshot 中にお気に入りクリックは disabled なので発生しないはずだが、エッジケース対策):
 - 通常 mode の DFS を使う (= snapshot は影響しない)
 - ただし設計上、snapshot 中はナビゲーション全般を disable しているのでこのケースは起きない想定
@@ -223,6 +255,8 @@ snapshot 範囲外の path をフルスクリーンで開いた場合 (= 例: sn
 - `snapshot_auto_off_on_ctrl_s_open` — Ctrl+S で snapshot 自動解除
 - `snapshot_button_disabled_during_global_search_streaming` — ストリーミング中は disabled
 - `snapshot_path_contains_check` — フルスクリーン open 時の「path が snapshot 内か」判定
+- **`snapshot_suspends_rating_filter_for_inner_folder_contents`** — snapshot 中 folder に入ると、その中身は filter が bypass される (= §4.2.1 の挙動検証)
+- **`snapshot_off_restores_filter_state`** — 解除後に元の rating_filter / text_query が復活する
 
 ### 6.2 integration test (= 既存パターン応用)
 
@@ -233,6 +267,7 @@ snapshot 範囲外の path をフルスクリーンで開いた場合 (= 例: sn
 ### 6.3 実機確認項目 (= manual)
 
 - ★5 filter → `[★固定]` → スライドショー → 末尾で次の ★5 フォルダへ進むこと
+- **★5 folder (中身は無印画像) を snapshot 化 → folder を開く → 中身画像が全表示される** (= filter suspend 確認、§4.2.1)
 - Ctrl+G "風景" → 結果取得完了 → `[★固定]` → スライドショーで結果範囲内のみ巡回
 - snapshot 中の BS / フォルダツリークリックで toast が出ること
 - snapshot 中の Ctrl+S → 自動解除して検索開始
@@ -260,6 +295,7 @@ snapshot 範囲外の path をフルスクリーンで開いた場合 (= 例: sn
 
 ### UX の細部
 
+- **filter suspend の妥当性** (= §4.2.1): snapshot folder 内部で filter を bypass する設計は妥当か? ユーザーが「snapshot 中も filter かけたい」と思う case は v1.2.0 まで先送りで OK か?
 - snapshot 中の `←→` (画像ページめくり) で同フォルダ末尾に達したとき、自動で snapshot 内の次フォルダ先頭へ進む? それともフォルダ末尾でとまる? (= 既存「フォルダ末尾の境界 hint」との関係)
 - snapshot 解除後、フォルダ表示は維持 (= 仕様) だが、ユーザーが「snapshot 中に開いたフォルダ」が解除元と違う場合、解除後どこに居るのが自然?
   - 案 A: 解除直前のフォルダのまま
@@ -322,3 +358,4 @@ snapshot 範囲外の path をフルスクリーンで開いた場合 (= 例: sn
 | 日付 | 内容 |
 |---|---|
 | 2026-06-04 | 初版 (= 議論経緯 + 案 D 設計確定) |
+| 2026-06-04 | §4.2.1 追加 (= filter は capture 時のみ、navigation 中は suspend) + §4.6 / §6 / §7 に該当反映。ユーザー質問「★3 filter 中の入れ子★2 は除外される?」への回答として明示 |
