@@ -30,6 +30,7 @@
         <a href="fullscreen.html">フルスクリーン表示</a>
         <a href="video.html">動画再生</a>
         <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
         <a href="analysis.html">画像分析モード</a>
         <a href="erase.html">消しゴムモード</a>
         <a href="conceal.html">隠蔽加工</a>
@@ -249,7 +250,7 @@
           <tr><td>サブフォルダ探索階層</td><td>代表画像を探すときにサブフォルダを何階層まで探索するか（0〜10）</td><td>3 階層</td></tr>
           <tr><td>空フォルダスキップ上限</td><td><kbd>Ctrl</kbd>+<kbd>↑↓</kbd> で画像のない空フォルダ・画像を含まない ZIP を連続スキップする上限数（最大 30）</td><td>5</td></tr>
           <tr><td>フォルダに補正・マスク設定のバックアップを保存する</td>
-              <td>フォルダ直下に <code>mimageviewer.dat</code>（隠し＋システム属性）を作成し、画像補正・消しゴムマスクの設定をバックアップします。
+              <td>フォルダ直下に <code>mimageviewer.dat</code>（隠し＋システム属性）を作成し、画像補正・補正レイヤー・消しゴムマスクの設定をバックアップします。
               フォルダを丸ごと別ドライブへ移動しても設定が保持されます。中央の設定 DB が主で、バックアップはフォールバック用です。
               OFF 中は既存のバックアップファイルも読み込まれません（ファイル自体は削除されません）。</td>
               <td>ON</td></tr>
@@ -257,7 +258,7 @@
       </table>
     </div>
 
-    <p class="note">補正・消しゴムマスクの設定は基本的に <code>%APPDATA%\mimageviewer\</code> 配下の DB で一括管理されます。
+    <p class="note">補正・補正レイヤー・消しゴムマスクの設定は基本的に <code>%APPDATA%\mimageviewer\</code> 配下の DB で一括管理されます。
     ただしファイル・フォルダのパスがキーになっているため、ユーザーがエクスプローラなどでフォルダを移動すると設定が参照できなくなります。
     時間のかかる補正・マスク設定については、フォルダ移動に耐えるよう上記「バックアップを保存する」で各フォルダに自動的にバックアップを作成できます（デフォルト ON）。</p>
 
@@ -729,6 +730,7 @@
           <tr><td>設定ファイル</td><td><code>%APPDATA%\mimageviewer\settings.db</code></td><td>—</td></tr>
           <tr><td>回転情報 DB</td><td><code>%APPDATA%\mimageviewer\rotation.db</code></td><td>ページ単位（A）</td></tr>
           <tr><td>画像補正 DB</td><td><code>%APPDATA%\mimageviewer\adjustment.db</code></td><td>ページ単位（A）＋標準設定・保存スロットも格納</td></tr>
+          <tr><td>補正レイヤー DB</td><td><code>%APPDATA%\mimageviewer\local_adjust.db</code></td><td>ページ単位（A）</td></tr>
           <tr><td>消去マスク DB</td><td><code>%APPDATA%\mimageviewer\mask.db</code></td><td>ページ単位（A）</td></tr>
           <tr><td>★レーティング DB</td><td><code>%APPDATA%\mimageviewer\rating.db</code></td><td>ページ単位（A）</td></tr>
           <tr><td>見開き設定 DB</td><td><code>%APPDATA%\mimageviewer\spread.db</code></td><td>フォルダ単位（A）</td></tr>
@@ -747,7 +749,7 @@
           <tr><td>Susie ワーカー EXE</td><td><code>%APPDATA%\mimageviewer\mimageviewer-susie32.exe</code>（32bit バイナリ、本体に埋め込み済み。初回起動時に自動展開）</td><td>—</td></tr>
           <tr><td>補正・マスクのバックアップ<br>（環境設定で ON の場合のみ）</td>
               <td>各フォルダ直下に <code>mimageviewer.dat</code>（Hidden + System 属性の JSON）</td>
-              <td>フォルダ単位のバックアップ</td></tr>
+              <td>画像補正・補正レイヤー・マスク設定のフォルダ単位バックアップ</td></tr>
         </tbody>
       </table>
     </div>

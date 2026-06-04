@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>補正レイヤー — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>補正レイヤー</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html" class="active">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="export.html">エクスポート</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="search.html">検索機能</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">補正レイヤー</h1>
+    <p class="page-desc">マスク付きの非破壊レイヤーを画像ごとに重ね、背景だけぼかす、人物だけ明るくする、周辺だけ暗くする、といった局所的な仕上げを行います。</p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>元の画像ファイルは変更しません。</strong>
+        補正レイヤーは画像ごとの編集情報として保存され、表示時や書き出し時に合成されます。
+        加工済みファイルが必要な場合は <a href="export.html">エクスポート</a>で別ファイルとして保存します。
+      </div>
+    </div>
+
+    <h2>画像補正との違い</h2>
+    <p><a href="adjustment.html">画像補正</a>は、明るさ・色・AI アップスケール・ポストフィルタなどを最終表示にまとめてかける全体向けの機能です。
+    補正レイヤーはその前段で、消しゴム補完の後、隠蔽加工の前に、マスクで指定した範囲へ効果を重ねます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>機能</th><th>向いている用途</th><th>サムネイル</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>画像補正</td><td>ページ全体の明るさ、彩度、色温度、AI 拡大、ポストフィルタ</td><td>個別補正があるページに「補」バッジ。色補正サムネイルにも反映</td></tr>
+          <tr><td>補正レイヤー</td><td>背景だけ、人物だけ、空だけ、周辺だけなど、範囲を決めた仕上げ</td><td>結果はサムネイルに反映しません。設定があるページに「レ」バッジ</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>処理の詳しい順序は <a href="adjustment.html#pipeline-order">画像補正の「処理の適用順序」</a>も参照してください。</p>
+
+    <h2>開き方</h2>
+    <ol>
+      <li>画像をフルスクリーンで開きます</li>
+      <li>画面左端・上端・右端にマウスを寄せ、画像補正パネルを表示します</li>
+      <li>ヘッダー右側の処理順アイコン列から、消しゴムと隠蔽加工の間にある補正レイヤーアイコンをクリックします</li>
+      <li>右上の <strong>×</strong>、または <kbd>Esc</kbd> で補正レイヤーパネルを閉じます</li>
+    </ol>
+    <p>補正レイヤーパネルを開いている間は、通常のフルスクリーン操作よりもマスク編集用の操作が優先されます。</p>
+
+    <h2>基本的な流れ</h2>
+    <ol class="step-list">
+      <li><strong>補正レイヤーを追加</strong>します。追加時に、最初のマスク種類を選びます</li>
+      <li><strong>マスクを作成</strong>します。手動、グラデーション、範囲、被写体、領域などから選べます</li>
+      <li><strong>効果を選択</strong>します。効果ピッカーで検索し、必要なパラメータを調整します</li>
+      <li><strong>境界を整える</strong>ため、マスク反転、フェザー、拡張 / 縮小、不透明度を調整します</li>
+      <li>必要に応じてレイヤーを複製し、別の効果を重ねます。1 レイヤーにつき効果は 1 つです</li>
+      <li>保存用の画像が必要な場合は、パネルを閉じて <kbd>Ctrl</kbd>+<kbd>E</kbd> で書き出します</li>
+    </ol>
+
+    <div class="box tip">
+      <span class="box-icon">💡</span>
+      <div class="box-body">
+        効果の種類や各パラメータの詳しい意味は、効果ピッカーと各コントロールのツールチップで確認できます。
+        マニュアルでは効果一覧を羅列せず、マスク作成とレイヤー操作の考え方を中心に説明します。
+      </div>
+    </div>
+
+    <h2>レイヤーの考え方</h2>
+    <p>補正レイヤーは、<strong>マスク</strong>と<strong>効果</strong>を 1 セットにしたものです。
+    レイヤー一覧の上から順に合成され、上にあるレイヤーほど後から重なります。</p>
+    <ul>
+      <li><strong>表示 ON/OFF:</strong> レイヤーの効果を一時的に無効化して比較できます</li>
+      <li><strong>不透明度:</strong> レイヤー全体の強さを下げます。効果のパラメータを変えずに馴染ませたいときに使います</li>
+      <li><strong>複製:</strong> 同じマスクを使って別の効果を重ねたいときに便利です</li>
+      <li><strong>上下移動:</strong> ぼかし、明るさ、光効果などの重なり順を変えます</li>
+      <li><strong>削除:</strong> 選択中のレイヤーを削除します。元画像は変更されません</li>
+    </ul>
+    <p><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd> で、レイヤー追加、削除、移動、マスク編集、パラメータ変更を取り消し / やり直しできます。</p>
+
+    <h2>マスクの基本</h2>
+    <p>マスクは「どこに効果をかけるか」を表します。白い部分ほど効果が強く、黒い部分には効果がかかりません。
+    グラデーションや被写体マスクのような柔らかいマスクでは、中間の濃さに応じて効果がなだらかに混ざります。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>項目</th><th>使い方</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>マスク反転</td><td>選んだ範囲の外側に効果をかけます。人物を選んで背景だけぼかす、背景を選んで人物だけ明るくする、といった使い方に向いています</td></tr>
+          <tr><td>フェザー</td><td>マスクの境界をぼかします。補正の段差や輪郭の不自然さを減らせます</td></tr>
+          <tr><td>拡張 / 縮小</td><td>マスクを外側へ広げる、または内側へ縮めます。背景ぼかしで輪郭のにじみを避けたいときは少し縮小すると調整しやすくなります</td></tr>
+          <tr><td>マスク表示</td><td><kbd>W</kbd> で選択中レイヤーのマスク表示を切り替えます。色はパネルのマスクカラーから変更できます</td></tr>
+          <tr><td>元画像表示</td><td><kbd>Q</kbd> で補正レイヤー直前の画像を確認できます。効果のかかり方を比較したいときに使います</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>マスク種類</h2>
+    <p>レイヤー追加時、または「マスク種類変更」から、ベースになるマスクを選びます。
+    効果は残したままマスク種類だけ差し替えられるため、先に効果を決めてから範囲を試すこともできます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>種類</th><th>特徴</th><th>向いている用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>全体</td><td>画像全体を白いマスクとして扱います</td><td>補正レイヤーの効果を全体へ重ねたいとき。除外したい部分は削除マスクで抜けます</td></tr>
+          <tr><td>手動</td><td>筆、囲み、多角形、直線、矩形、楕円などで自由に作るマスクです</td><td>狭い範囲を意図通りに選ぶ、AI や範囲選択の結果を最終調整する</td></tr>
+          <tr><td>線形グラデーション</td><td>ドラッグした方向に沿って効果がなだらかに変化します</td><td>上だけ暗くする、下だけ明るくする、背景へゆるく効果をかける</td></tr>
+          <tr><td>円形グラデーション</td><td>中心から外側へ効果がなだらかに変化します</td><td>主役の周辺だけ落とす、中央だけ明るくする、スポット的にぼかす</td></tr>
+          <tr><td>輝度</td><td>画像全体から明るさの範囲に合う部分を選びます</td><td>ハイライトだけ、暗部だけ、白い紙面だけなどを調整する</td></tr>
+          <tr><td>カラー</td><td>スポイトで指定した色に近い部分を画像全体から選びます</td><td>特定の服色、空、髪色、背景色だけを調整する</td></tr>
+          <tr><td>被写体</td><td>被写体 / 背景のマスクを生成します。モデルが必要な場合はツール内の案内に従います</td><td>人物やキャラクターを大きく選び、反転して背景を加工する</td></tr>
+          <tr><td>領域</td><td>色と境界から候補領域を作り、クリックして必要な領域を選びます</td><td>髪、服、小物など、色や境界で分かれた部分をまとめて選ぶ</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>追加マスク / 削除マスク</h2>
+    <p>グラデーション、輝度、カラー、被写体、領域などのマスクは、まずベースマスクとして残ります。
+    その上から手で足したい部分は<strong>追加マスク</strong>、抜きたい部分は<strong>削除マスク</strong>で調整します。</p>
+    <ul>
+      <li><strong>追加マスク:</strong> ベースマスクで拾えなかった部分を、手描きで効果範囲に足します</li>
+      <li><strong>削除マスク:</strong> ベースマスクが拾いすぎた部分を、手描きで効果範囲から外します</li>
+      <li><strong>全体マスク:</strong> 画像全体に効果がかかるため、除外したい部分だけ削除マスクで描くと扱いやすくなります</li>
+    </ul>
+    <p>追加 / 削除マスクは、ベースマスクそのものを壊しません。閉じている間は手描き編集のパネルを表示せず、ベースマスクと効果の設定に集中できます。</p>
+
+    <h2>手動マスクツール</h2>
+    <p>手動マスク、追加マスク、削除マスクでは、次のツールを使えます。
+    描画 / 消去は <kbd>D</kbd> / <kbd>F</kbd> で切り替えます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>ツール</th><th>キー</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>筆</td><td><kbd>B</kbd></td><td>円形ブラシで自由に塗ります。ホイールやパネルのスライダーで太さを変えられます</td></tr>
+          <tr><td>境界筆</td><td><kbd>A</kbd></td><td>ストローク開始点に近い色を優先して塗ります。輪郭をまたぎにくい筆として使います</td></tr>
+          <tr><td>隙間補完</td><td><kbd>G</kbd></td><td>線や塗りの小さな隙間を埋める用途のブラシです</td></tr>
+          <tr><td>囲み</td><td><kbd>L</kbd></td><td>ドラッグで囲んだ範囲を塗ります。大まかな範囲を素早く作るときに使います</td></tr>
+          <tr><td>多角形</td><td><kbd>P</kbd></td><td>クリックで頂点を置いて範囲を作ります。直線的な境界を正確に選びたいときに使います</td></tr>
+          <tr><td>選択</td><td><kbd>S</kbd></td><td>直線、矩形、楕円などのオブジェクトを選択し、移動・変形・削除します</td></tr>
+          <tr><td>直線</td><td><kbd>I</kbd></td><td>太い直線を作ります。綴じ跡や一直線の光、帯状の調整に使えます</td></tr>
+          <tr><td>縦線 / 横線</td><td><kbd>V</kbd> / <kbd>H</kbd></td><td>画像の端から端まで届く縦方向 / 横方向の帯を作ります</td></tr>
+          <tr><td>矩形 / 楕円</td><td><kbd>R</kbd> / <kbd>O</kbd></td><td>後からハンドルで編集できる図形マスクを作ります</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>手動マスクのビットマップ部分には、1px 拡張、1px 縮小、スムーズなどの整形操作も使えます。
+    レイヤー全体のフェザーや拡張 / 縮小とは別に、マスクそのものを整えるための操作です。</p>
+
+    <h2>画像上での操作</h2>
+    <ul>
+      <li>線形 / 円形グラデーションは、画像上のハンドルをドラッグして向き、中心、半径を調整します</li>
+      <li>カラー範囲は、画像クリックで基準色を拾えます</li>
+      <li>効果側に色スポイトや位置ハンドルがある場合は、効果パネルのボタンから画像上で指定できます</li>
+      <li>選択ツールでは、図形マスクの枠やハンドルをドラッグして後編集できます</li>
+      <li><kbd>Ctrl</kbd>+ホイールはズーム、通常ホイールは筆や線の太さ変更に使います</li>
+    </ul>
+
+    <h2>プレビュー</h2>
+    <p>補正レイヤーは CPU worker で非同期に合成されます。変更直後は一時的に補正レイヤー抜きの下位画像が表示され、計算が終わると最新結果へ差し替わります。
+    古い補正レイヤー結果を残したまま見せないための挙動です。</p>
+    <ul>
+      <li><kbd>Q</kbd>: 補正レイヤー直前の元画像表示 ON / OFF</li>
+      <li><kbd>W</kbd>: 選択中レイヤーのマスク表示 ON / OFF</li>
+      <li>選択レイヤーまでプレビュー: 下のレイヤーから選択中レイヤーまでだけを表示し、重なり順を確認します</li>
+      <li><kbd>Ctrl</kbd> 押下中: 一時的に元画像寄りの比較表示を行います</li>
+      <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd> 押下中: 選択中レイヤーだけを外した比較表示を行います</li>
+    </ul>
+
+    <h2>保存と書き出し</h2>
+    <p>補正レイヤーは自動保存され、同じ画像を開くと復元されます。
+    中央の保存先は <code>%APPDATA%\mimageviewer\local_adjust.db</code> です。
+    環境設定で「フォルダに補正・マスク設定のバックアップを保存する」が ON の場合は、フォルダ直下の <code>mimageviewer.dat</code> にも復元用の情報が保存されます。</p>
+    <p><kbd>Ctrl</kbd>+<kbd>E</kbd> のエクスポート、またはキャプチャ保存では補正レイヤー結果が反映されます。
+    補正レイヤーの再合成中は、最新結果が揃ってから書き出してください。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>
