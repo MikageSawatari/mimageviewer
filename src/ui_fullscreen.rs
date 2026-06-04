@@ -2178,9 +2178,18 @@ impl App {
                         if let Some((w, h)) = state.image_dims {
                             let image_size = [w as usize, h as usize];
                             let has_crop = self.export_crop_for_idx(fs_idx, image_size).is_some();
+                            // crop はパイプライン最後段。crop の枠 / 暗転は「切り取りツール」
+                            // または「素の通常表示」でのみ出す。各ツールは自分の手前までの
+                            // 状態を表示する作りなので、crop より手前のツール (消しゴム /
+                            // 補正レイヤー / 隠蔽加工) や 補正 / 分析モード中は出さない。
+                            let in_earlier_tool = self.erase_mode
+                                || self.local_adjust_mode
+                                || self.conceal_mode
+                                || self.adjustment_mode
+                                || self.analysis_mode;
                             if !is_spread_double
                                 && !state.original_preview_active
-                                && (self.export_crop_mode || has_crop)
+                                && (self.export_crop_mode || (has_crop && !in_earlier_tool))
                             {
                                 // crop overlay は full_rect ではなく、実際に表示されている
                                 // 画像のフィット矩形 (レターボックス + zoom/pan 反映) に
