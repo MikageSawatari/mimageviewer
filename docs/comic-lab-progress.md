@@ -60,6 +60,26 @@ Claude Code セッションを並行で動かす」節)。
 - 累積コミット: 5bfdd0d3→929af8c6→34ccded7 (P1-2) → 233bebf8→16b22a2c→23d491da→07515f7c
   (P3) → c405acd2→a49fa1bb→1c0b3bb0 (実機 FB)。lab は **master 未マージ**。
 
+## 2026-06-04 末: スタンプ性能 + ダイアログ (実機 FB 第3弾、コミット済み)
+
+実機計測 (perf HUD: F1 / COMIC_LAB_PERF) で composite(CPU) が upload(GPU) の約 10 倍 =
+スタンプの CPU ラスタライズが支配的と判明。これを根治。
+
+- **スタンプ性能** (a5ee93ed→754cd325→50cbffc9): 枠なしスタンプを **常時 GPU テクスチャ
+  quad** で描画し CPU bake から除外 (`gpu_stamp_ids` = 最上位 z から連続する枠なし・
+  デコード可スタンプ = top-z run、z 整合を維持)。bake はスタンプを一切ラスタライズ
+  しないので枚数/サイズ/回転によらず軽い。掴み時カクつき・ドラッグ終了時の位置ズレも
+  解消 (CPU↔GPU 持ち替えが無い)。枠付きスタンプのみ CPU bake (halo 維持)。
+  perf HUD (bake 合計/composite/upload + 数) を追加。
+- **追加ダイアログ** (786bfd83): 折り返さない/全幅/リサイズ変、を Codex 相談で解決。
+  horizontal_wrapped の未折り返し min 幅フィードバックが原因 → **手動グリッド**
+  (available_width から列数算出、ui.horizontal_top 行) に変更。`.max_width` は記憶済み
+  サイズを縮められないため Window `.id` を新規化して破棄。`.pivot(CENTER_CENTER)` の
+  リサイズ挙動を避け default_pos 中央寄せに。共有定数 PRESET_CELL_W/WINDOW_PRESET_CELL_W/
+  grid_cols() を追加。
+- 実機確認 OK (速度改善・ズレ解消・ダイアログ折り返し/リサイズ正常)。
+- Codex を計 9 ラウンド (同一セッション resume) 活用、最終 P1/P2 なし。
+
 (以下は worktree 移行前=master 上の履歴。同じ内容が lab ブランチにも入っている)
 
 ## 2026-06-04 後半: 縦書き OpenType 化 (案B) + スタンプ機能 (未コミット)
