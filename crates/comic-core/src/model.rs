@@ -251,6 +251,47 @@ pub enum BubbleShape {
         #[serde(default)]
         shape_seed: u32,
     },
+    /// Regular polygon (多角形) inscribed in the rx/ry ellipse. `sides` >= 3.
+    Polygon {
+        rx: f32,
+        ry: f32,
+        sides: u32,
+    },
+    /// Diamond / rhombus (ダイヤ) through the four axis points.
+    Diamond {
+        half_w: f32,
+        half_h: f32,
+    },
+    /// Heart (ハート) parametric curve fitted to rx/ry.
+    Heart {
+        rx: f32,
+        ry: f32,
+    },
+    /// Arrow (矢印): a shaft + head pointing toward `dir_rad` (0 = +x / right,
+    /// -PI/2 = up), sized by half_w (length axis) / half_h (cross axis).
+    Arrow {
+        half_w: f32,
+        half_h: f32,
+        #[serde(default = "arrow_up")]
+        dir_rad: f32,
+    },
+    /// Soft / やわらか balloon: a rounded rect with gently wavy edges.
+    /// `corner_px` rounds the corners; `shape_seed` jitters the wave phase.
+    Soft {
+        half_w: f32,
+        half_h: f32,
+        #[serde(default = "soft_corner")]
+        corner_px: f32,
+        #[serde(default)]
+        shape_seed: u32,
+    },
+}
+
+fn arrow_up() -> f32 {
+    -std::f32::consts::FRAC_PI_2
+}
+fn soft_corner() -> f32 {
+    28.0
 }
 
 impl Default for BubbleShape {

@@ -3927,6 +3927,86 @@ impl ComicLab {
                     }
                 });
             }
+            BubbleShape::Polygon { rx, ry, sides } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                        .changed();
+                }
+                edited |= ui
+                    .add(egui::Slider::new(sides, 3..=12).text("辺の数"))
+                    .changed();
+            }
+            BubbleShape::Diamond { half_w, half_h } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                        .changed();
+                }
+            }
+            BubbleShape::Heart { rx, ry } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                        .changed();
+                }
+            }
+            BubbleShape::Arrow {
+                half_w,
+                half_h,
+                dir_rad,
+            } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 20.0..=800.0).text("長さ半分"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 20.0..=800.0).text("幅半分"))
+                        .changed();
+                }
+                let mut deg = dir_rad.to_degrees();
+                if ui
+                    .add(egui::Slider::new(&mut deg, -180.0..=180.0).text("向き(度)"))
+                    .changed()
+                {
+                    *dir_rad = deg.to_radians();
+                    edited = true;
+                }
+            }
+            BubbleShape::Soft {
+                half_w,
+                half_h,
+                corner_px,
+                shape_seed,
+            } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                        .changed();
+                }
+                edited |= ui
+                    .add(egui::Slider::new(corner_px, 0.0..=200.0).text("角丸"))
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label(format!("seed {shape_seed}"));
+                    if ui.button("再生成").clicked() {
+                        *shape_seed = shape_seed.wrapping_add(1);
+                        edited = true;
+                    }
+                });
+            }
         }
         if auto {
             ui.label(
@@ -4316,6 +4396,11 @@ impl ComicLab {
             BubbleShape::RoundRect { half_w, half_h, .. } => (half_w, half_h),
             BubbleShape::Burst { rx, ry, .. } => (rx, ry),
             BubbleShape::Cloud { rx, ry, .. } => (rx, ry),
+            BubbleShape::Polygon { rx, ry, .. } => (rx, ry),
+            BubbleShape::Diamond { half_w, half_h } => (half_w, half_h),
+            BubbleShape::Heart { rx, ry } => (rx, ry),
+            BubbleShape::Arrow { half_w, half_h, .. } => (half_w, half_h),
+            BubbleShape::Soft { half_w, half_h, .. } => (half_w, half_h),
         };
         let (sin, cos) = obj.rotation_rad.sin_cos();
         let p = obj.pivot;
@@ -4847,6 +4932,16 @@ fn set_bubble_half_extents(b: &mut BubbleObject, hw: f32, hh: f32) {
             *rx = hw;
             *ry = hh;
         }
+        BubbleShape::Polygon { rx, ry, .. } | BubbleShape::Heart { rx, ry } => {
+            *rx = hw;
+            *ry = hh;
+        }
+        BubbleShape::Diamond { half_w, half_h }
+        | BubbleShape::Arrow { half_w, half_h, .. }
+        | BubbleShape::Soft { half_w, half_h, .. } => {
+            *half_w = hw;
+            *half_h = hh;
+        }
     }
 }
 
@@ -5177,6 +5272,11 @@ enum BubblePreset {
     Thought,
     Shout,
     Whisper,
+    Soft,
+    Polygon,
+    Diamond,
+    Heart,
+    Arrow,
 }
 
 impl BubblePreset {
@@ -5185,10 +5285,15 @@ impl BubblePreset {
     const ALL: &'static [BubblePreset] = &[
         BubblePreset::Normal,
         BubblePreset::RoundRect,
+        BubblePreset::Soft,
         BubblePreset::Narration,
         BubblePreset::Thought,
         BubblePreset::Shout,
         BubblePreset::Whisper,
+        BubblePreset::Polygon,
+        BubblePreset::Diamond,
+        BubblePreset::Heart,
+        BubblePreset::Arrow,
     ];
 
     fn label(self) -> &'static str {
@@ -5199,6 +5304,11 @@ impl BubblePreset {
             BubblePreset::Thought => "思考",
             BubblePreset::Shout => "叫び",
             BubblePreset::Whisper => "ささやき",
+            BubblePreset::Soft => "やわらか",
+            BubblePreset::Polygon => "多角形",
+            BubblePreset::Diamond => "ダイヤ",
+            BubblePreset::Heart => "ハート",
+            BubblePreset::Arrow => "矢印",
         }
     }
 
@@ -5211,6 +5321,11 @@ impl BubblePreset {
             BubblePreset::Thought => "thought",
             BubblePreset::Shout => "shout",
             BubblePreset::Whisper => "whisper",
+            BubblePreset::Soft => "soft",
+            BubblePreset::Polygon => "polygon",
+            BubblePreset::Diamond => "diamond",
+            BubblePreset::Heart => "heart",
+            BubblePreset::Arrow => "arrow",
         }
     }
 
@@ -5245,6 +5360,30 @@ impl BubblePreset {
                 spikes: 20,
                 jag: 0.55,
                 shape_seed: 1,
+            },
+            BubblePreset::Soft => BubbleShape::Soft {
+                half_w: 165.0,
+                half_h: 105.0,
+                corner_px: 38.0,
+                shape_seed: 0,
+            },
+            BubblePreset::Polygon => BubbleShape::Polygon {
+                rx: 155.0,
+                ry: 125.0,
+                sides: 6,
+            },
+            BubblePreset::Diamond => BubbleShape::Diamond {
+                half_w: 160.0,
+                half_h: 130.0,
+            },
+            BubblePreset::Heart => BubbleShape::Heart {
+                rx: 150.0,
+                ry: 140.0,
+            },
+            BubblePreset::Arrow => BubbleShape::Arrow {
+                half_w: 150.0,
+                half_h: 110.0,
+                dir_rad: -std::f32::consts::FRAC_PI_2,
             },
         }
     }

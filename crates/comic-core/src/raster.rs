@@ -329,6 +329,11 @@ fn bubble_decorations(
         BubbleShape::RoundRect { half_w, half_h, .. } => half_w.min(half_h),
         BubbleShape::Burst { rx, ry, .. } => rx.min(ry),
         BubbleShape::Cloud { rx, ry, .. } => rx.min(ry),
+        BubbleShape::Polygon { rx, ry, .. } => rx.min(ry),
+        BubbleShape::Diamond { half_w, half_h } => half_w.min(half_h),
+        BubbleShape::Heart { rx, ry } => rx.min(ry),
+        BubbleShape::Arrow { half_w, half_h, .. } => half_w.min(half_h),
+        BubbleShape::Soft { half_w, half_h, .. } => half_w.min(half_h),
     };
     // Tail base point for `Tail` decoration placement. Spike tails use the
     // spliced base midpoint; thought tails have no spliced base (geo.tail is
@@ -418,6 +423,11 @@ fn object_local_aabb(obj: &AnnotationObject, fonts: &FontSet) -> Option<(f32, f3
                     BubbleShape::RoundRect { half_w, half_h, .. } => half_w.min(half_h),
                     BubbleShape::Burst { rx, ry, .. } => rx.min(ry),
                     BubbleShape::Cloud { rx, ry, .. } => rx.min(ry),
+                    BubbleShape::Polygon { rx, ry, .. } => rx.min(ry),
+                    BubbleShape::Diamond { half_w, half_h } => half_w.min(half_h),
+                    BubbleShape::Heart { rx, ry } => rx.min(ry),
+                    BubbleShape::Arrow { half_w, half_h, .. } => half_w.min(half_h),
+                    BubbleShape::Soft { half_w, half_h, .. } => half_w.min(half_h),
                 };
                 let tail_base = match (&geo.tail, &bubble.tail) {
                     (Some(t), _) => Some(((t[0].0 + t[1].0) * 0.5, (t[0].1 + t[1].1) * 0.5)),

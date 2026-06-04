@@ -41,7 +41,106 @@ pub fn tessellate_bubble(shape: &BubbleShape, pivot: (f32, f32)) -> Vec<(f32, f3
             amp,
             shape_seed,
         } => cloud(cx, cy, rx, ry, lobes, amp, shape_seed),
+        BubbleShape::Polygon { rx, ry, sides } => polygon(cx, cy, rx, ry, sides),
+        BubbleShape::Diamond { half_w, half_h } => vec![
+            (cx, cy - half_h),
+            (cx + half_w, cy),
+            (cx, cy + half_h),
+            (cx - half_w, cy),
+        ],
+        BubbleShape::Heart { rx, ry } => heart(cx, cy, rx, ry),
+        BubbleShape::Arrow {
+            half_w,
+            half_h,
+            dir_rad,
+        } => arrow(cx, cy, half_w, half_h, dir_rad),
+        BubbleShape::Soft {
+            half_w,
+            half_h,
+            corner_px,
+            shape_seed,
+        } => soft(cx, cy, half_w, half_h, corner_px, shape_seed),
     }
+}
+
+/// Regular `sides`-gon inscribed in the rx/ry ellipse, oriented point-up.
+fn polygon(cx: f32, cy: f32, rx: f32, ry: f32, sides: u32) -> Vec<(f32, f32)> {
+    let n = sides.max(3);
+    let mut pts = Vec::with_capacity(n as usize);
+    let start = -std::f32::consts::FRAC_PI_2; // a vertex at the top
+    for i in 0..n {
+        let a = start + (i as f32) / (n as f32) * std::f32::consts::TAU;
+        pts.push((cx + rx * a.cos(), cy + ry * a.sin()));
+    }
+    pts
+}
+
+/// Heart outline (ハート) fitted to the rx/ry box, point-down. Classic
+/// 16sin³t curve, normalized to ±1 then scaled; y flipped for screen space.
+fn heart(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<(f32, f32)> {
+    const SEG: usize = 96;
+    let mut pts = Vec::with_capacity(SEG);
+    for i in 0..SEG {
+        let t = (i as f32) / (SEG as f32) * std::f32::consts::TAU;
+        let x = 16.0 * t.sin().powi(3);
+        let y = 13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos() - (4.0 * t).cos();
+        // Normalize: x in ±16, y in ~[-17, 12]. Center y and flip for screen.
+        pts.push((cx + rx * (x / 16.0), cy - ry * (y / 15.0)));
+    }
+    pts
+}
+
+/// Arrow outline (矢印): built pointing toward +x in local space, then rotated
+/// by `dir_rad` about the pivot. `half_w` is the half-length along the arrow,
+/// `half_h` the half cross-width. Head spans the front ~45%, shaft is ~45% tall.
+fn arrow(cx: f32, cy: f32, half_w: f32, half_h: f32, dir_rad: f32) -> Vec<(f32, f32)> {
+    let hw = half_w.max(2.0);
+    let hh = half_h.max(2.0);
+    let head_x = hw * 0.1; // head base x (front 45% is the triangle)
+    let shaft_hh = hh * 0.45; // shaft half-thickness
+    // 7-point arrow in local space (+x = tip).
+    let local = [
+        (hw, 0.0),           // tip
+        (head_x, hh),        // head top corner
+        (head_x, shaft_hh),  // head/shaft top junction
+        (-hw, shaft_hh),     // shaft top-back
+        (-hw, -shaft_hh),    // shaft bottom-back
+        (head_x, -shaft_hh), // head/shaft bottom junction
+        (head_x, -hh),       // head bottom corner
+    ];
+    let (sin, cos) = dir_rad.sin_cos();
+    local
+        .iter()
+        .map(|&(x, y)| (cx + x * cos - y * sin, cy + x * sin + y * cos))
+        .collect()
+}
+
+/// Soft / やわらか outline: a rounded rect whose perimeter gently undulates
+/// (low-amplitude wave) so it reads as a soft, hand-drawn balloon.
+fn soft(
+    cx: f32,
+    cy: f32,
+    half_w: f32,
+    half_h: f32,
+    corner: f32,
+    shape_seed: u32,
+) -> Vec<(f32, f32)> {
+    let base = round_rect_dense(cx, cy, half_w, half_h, corner);
+    let amp = (half_w.min(half_h)) * 0.06;
+    let waves = 6.0;
+    let phase = hash01(shape_seed, 1) * std::f32::consts::TAU;
+    let n = base.len();
+    base.iter()
+        .enumerate()
+        .map(|(i, &(x, y))| {
+            let t = (i as f32) / (n as f32) * std::f32::consts::TAU;
+            let dx = x - cx;
+            let dy = y - cy;
+            let len = (dx * dx + dy * dy).sqrt().max(1e-3);
+            let bulge = amp * (waves * t + phase).sin();
+            (x + dx / len * bulge, y + dy / len * bulge)
+        })
+        .collect()
 }
 
 /// Resize a bubble shape so its interior contains a text box of `text_w × text_h`
@@ -118,6 +217,41 @@ pub fn fit_bubble_shape(
                 shape_seed,
             }
         }
+        // Polygon inscribed in the ellipse: its inradius is smaller than the
+        // ellipse, so size generously (2x) to keep the text rect inside.
+        BubbleShape::Polygon { sides, .. } => BubbleShape::Polygon {
+            rx: hw * 2.0,
+            ry: hh * 2.0,
+            sides,
+        },
+        // Rhombus: the inscribed axis-aligned rect (a,b) fits when a/hw+b/hh<=1,
+        // so doubling the half-extents leaves the text rect well inside.
+        BubbleShape::Diamond { .. } => BubbleShape::Diamond {
+            half_w: hw * 2.0,
+            half_h: hh * 2.0,
+        },
+        // Heart: text sits in the broad upper-center; size generously.
+        BubbleShape::Heart { .. } => BubbleShape::Heart {
+            rx: hw * 1.7,
+            ry: hh * 1.9,
+        },
+        // Arrow: text in the shaft/head body; size generously, keep direction.
+        BubbleShape::Arrow { dir_rad, .. } => BubbleShape::Arrow {
+            half_w: hw * 1.6,
+            half_h: hh * 1.6,
+            dir_rad,
+        },
+        // Soft: like a rounded rect (the wave is small); keep corner + seed.
+        BubbleShape::Soft {
+            corner_px,
+            shape_seed,
+            ..
+        } => BubbleShape::Soft {
+            half_w: hw,
+            half_h: hh,
+            corner_px: corner_px.min(hw.min(hh)),
+            shape_seed,
+        },
     }
 }
 
@@ -245,6 +379,42 @@ fn round_rect(cx: f32, cy: f32, half_w: f32, half_h: f32, corner: f32) -> Vec<(f
     pts
 }
 
+/// Rounded rect with the straight edges subdivided too (dense perimeter), so a
+/// per-vertex perturbation (e.g. the `soft` wave) is visible along the edges,
+/// not only at the corners. Clockwise from the top edge.
+fn round_rect_dense(cx: f32, cy: f32, half_w: f32, half_h: f32, corner: f32) -> Vec<(f32, f32)> {
+    let corner = corner.max(0.0).min(half_w.min(half_h));
+    let (left, right) = (cx - half_w, cx + half_w);
+    let (top, bottom) = (cy - half_h, cy + half_h);
+    const EDGE_SEG: usize = 12;
+    let half_pi = 0.5 * std::f32::consts::PI;
+    let mut pts = Vec::new();
+    let mut edge = |a: (f32, f32), b: (f32, f32), pts: &mut Vec<(f32, f32)>| {
+        // Exclusive of the end point (next corner arc starts there).
+        for i in 0..EDGE_SEG {
+            let f = i as f32 / EDGE_SEG as f32;
+            pts.push((a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f));
+        }
+    };
+    let arc = |ccx: f32, ccy: f32, start: f32, pts: &mut Vec<(f32, f32)>| {
+        for i in 0..=CORNER_SEGMENTS {
+            let t = start + (i as f32 / CORNER_SEGMENTS as f32) * half_pi;
+            pts.push((ccx + corner * t.cos(), ccy + corner * t.sin()));
+        }
+    };
+    // top edge -> TR arc -> right edge -> BR arc -> bottom edge -> BL arc ->
+    // left edge -> TL arc.
+    edge((left + corner, top), (right - corner, top), &mut pts);
+    arc(right - corner, top + corner, -half_pi, &mut pts);
+    edge((right, top + corner), (right, bottom - corner), &mut pts);
+    arc(right - corner, bottom - corner, 0.0, &mut pts);
+    edge((right - corner, bottom), (left + corner, bottom), &mut pts);
+    arc(left + corner, bottom - corner, half_pi, &mut pts);
+    edge((left, bottom - corner), (left, top + corner), &mut pts);
+    arc(left + corner, top + corner, std::f32::consts::PI, &mut pts);
+    pts
+}
+
 /// Build a straight tail triangle. `base_center` is a point on the bubble
 /// outline (the rasterizer/lab computes it from `base_t`); `tip` is the tail
 /// tip. The base is `width_px` wide, perpendicular to the base->tip direction.
@@ -299,6 +469,11 @@ fn shape_half_extents(shape: &BubbleShape) -> (f32, f32) {
         BubbleShape::RoundRect { half_w, half_h, .. } => (half_w, half_h),
         BubbleShape::Burst { rx, ry, .. } => (rx, ry),
         BubbleShape::Cloud { rx, ry, .. } => (rx, ry),
+        BubbleShape::Polygon { rx, ry, .. } => (rx, ry),
+        BubbleShape::Diamond { half_w, half_h } => (half_w, half_h),
+        BubbleShape::Heart { rx, ry } => (rx, ry),
+        BubbleShape::Arrow { half_w, half_h, .. } => (half_w, half_h),
+        BubbleShape::Soft { half_w, half_h, .. } => (half_w, half_h),
     }
 }
 
@@ -890,6 +1065,95 @@ mod tests {
             (0.0, 0.0),
         );
         assert!(c.len() >= 16);
+    }
+
+    #[test]
+    fn new_vector_shapes_have_sane_outlines() {
+        // Polygon: exactly `sides` vertices, all within the rx/ry box.
+        let p = tessellate_bubble(
+            &BubbleShape::Polygon {
+                rx: 50.0,
+                ry: 40.0,
+                sides: 6,
+            },
+            (0.0, 0.0),
+        );
+        assert_eq!(p.len(), 6);
+        assert!(p.iter().all(|&(x, y)| x.abs() <= 50.1 && y.abs() <= 40.1));
+
+        // Diamond: 4 axis points.
+        let d = tessellate_bubble(
+            &BubbleShape::Diamond {
+                half_w: 30.0,
+                half_h: 20.0,
+            },
+            (0.0, 0.0),
+        );
+        assert_eq!(
+            d,
+            vec![(0.0, -20.0), (30.0, 0.0), (0.0, 20.0), (-30.0, 0.0)]
+        );
+
+        // Heart / Soft: non-empty closed curves within their box (+ soft wave).
+        let h = tessellate_bubble(&BubbleShape::Heart { rx: 60.0, ry: 60.0 }, (0.0, 0.0));
+        assert!(h.len() > 30 && h.iter().all(|&(x, y)| x.abs() <= 70.0 && y.abs() <= 70.0));
+        let s = tessellate_bubble(
+            &BubbleShape::Soft {
+                half_w: 80.0,
+                half_h: 50.0,
+                corner_px: 24.0,
+                shape_seed: 3,
+            },
+            (0.0, 0.0),
+        );
+        assert!(s.len() > 30);
+
+        // Arrow pointing up: the tip is the topmost point (most negative y).
+        let a = tessellate_bubble(
+            &BubbleShape::Arrow {
+                half_w: 40.0,
+                half_h: 30.0,
+                dir_rad: -std::f32::consts::FRAC_PI_2,
+            },
+            (0.0, 0.0),
+        );
+        let tip =
+            a.iter().copied().fold(
+                (0.0f32, f32::INFINITY),
+                |acc, p| if p.1 < acc.1 { p } else { acc },
+            );
+        assert!(
+            tip.1 < -30.0 && tip.0.abs() < 2.0,
+            "arrow tip points up: {tip:?}"
+        );
+    }
+
+    #[test]
+    fn fit_preserves_new_variants() {
+        let f = fit_bubble_shape(
+            &BubbleShape::Polygon {
+                rx: 1.0,
+                ry: 1.0,
+                sides: 7,
+            },
+            100.0,
+            80.0,
+            10.0,
+        );
+        assert!(matches!(f, BubbleShape::Polygon { sides: 7, .. }));
+        let f = fit_bubble_shape(&BubbleShape::Heart { rx: 1.0, ry: 1.0 }, 100.0, 80.0, 10.0);
+        assert!(matches!(f, BubbleShape::Heart { .. }));
+        let f = fit_bubble_shape(
+            &BubbleShape::Arrow {
+                half_w: 1.0,
+                half_h: 1.0,
+                dir_rad: 0.5,
+            },
+            100.0,
+            80.0,
+            10.0,
+        );
+        assert!(matches!(f, BubbleShape::Arrow { dir_rad, .. } if (dir_rad - 0.5).abs() < 1e-6));
     }
 
     #[test]
