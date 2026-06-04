@@ -326,35 +326,33 @@ impl App {
                     == crate::snapshot::snapshot_key_from_path(&snap.origin)
             })
             .unwrap_or(false);
-        // ユーザー報告 fix (2 段階目): Ctrl+G/Ctrl+S 検索 view から ★固定した場合、
+        // ユーザー報告 fix (3 段階目): Ctrl+G/Ctrl+S 検索 view から ★固定した場合、
         // snapshot は検索 mode を consume したので解除しても自然な表示にならない (= items
         // だけ復元しても active=false で UI 不整合 / 「🌐 アイテム検索: ...」表示が残る)。
-        // pre_snapshot_search_origin が Some (= snapshot ON 時に検索 active だった) なら、
-        // origin の form (= 合成 path か drilled 実 path か) に関係なく、検索開始前の
-        // 現実 folder に load_folder で戻る。
+        // 検索 view 由来 snapshot + **まだ origin に居る** (= 検索 view の合成 path や
+        // drilled container 内で解除) なら、検索開始前の現実 folder に load_folder で戻る。
         //
-        // 旧版 (c508ca25) は origin == __search_results__ (= Ctrl+G flat view のみ) を
-        // 判定していたが、Ctrl+G drilled view では origin が drill container の実 path に
-        // なるため判定が漏れて、saved_items 復元で「🌐 アイテム検索: ... (10000 件)」表示が
-        // 残るバグになっていた (= ユーザー報告)。
-        let _ = at_origin; // synthetic check 削除に伴い未使用、後段の at_origin 分岐で再 bind
-        if let Some(restore_to) = snap.pre_snapshot_search_origin.clone() {
-            // snapshot は既に take() で None になっているので load_folder の guard は通る。
-            // load_folder 経路で items/thumbnails/visible_indices/items_generation/cache が
-            // 全部入れ替わる (= invalidate も自動)。
-            self.load_folder(restore_to);
-            self.show_feedback_toast("★固定を解除しました".into());
-            return;
+        // 段階履歴:
+        // - c508ca25: origin == __search_results__ (= Ctrl+G flat view のみ) で synthetic
+        //   判定 → drilled view (実 path) が漏れて 🌐 表示残るバグ
+        // - 021c54fe: pre_snapshot_search_origin.is_some() のみで判定 → drilled view も
+        //   救うが、captured child folder の中で解除しても検索前に飛ぶバグ (Codex P2)
+        // - 本コミット: pre_snapshot_search_origin Some **かつ** at_origin の場合に限定。
+        //   child folder の中で解除した場合は既存「解除直前のフォルダ維持」path に落ちる。
+        if at_origin {
+            if let Some(restore_to) = snap.pre_snapshot_search_origin.clone() {
+                // 検索 close と同じく履歴抑止: suppress_nav_record_for_search_restore を
+                // 立てる (Codex P2-2 fix)。これで back/recent 履歴に drilled origin が
+                // 積まれない (= close_global_search / close_favsearch と同じ抑止)。
+                self.suppress_nav_record_for_search_restore = true;
+                // snapshot は既に take() で None なので load_folder の guard は通る。
+                // load_folder 経路で items/thumbnails/visible_indices/items_generation/cache が
+                // 全部入れ替わる (= invalidate も自動)。
+                self.load_folder(restore_to);
+                self.show_feedback_toast("★固定を解除しました".into());
+                return;
+            }
         }
-        // ここから先は「通常 folder からの ★固定」のみ (= pre_snapshot_search_origin None)
-        let at_origin = self
-            .current_folder
-            .as_ref()
-            .map(|p| {
-                crate::snapshot::snapshot_key_from_path(p)
-                    == crate::snapshot::snapshot_key_from_path(&snap.origin)
-            })
-            .unwrap_or(false);
         if at_origin {
             // origin のまま解除 → 元の items 復元 (= snapshot 元のフォルダに戻る)。
             // snapshot 中に subset (= self.thumbnails) で thumbnail worker が
@@ -1454,6 +1452,73 @@ mod tests {
         assert!(
             snap.pre_snapshot_search_origin.is_none(),
             "通常 folder からの ★固定では pre_snapshot_search_origin は None"
+        );
+    }
+
+    /// Codex 6th P3 回帰テスト: 検索 view 由来 snapshot を **child folder 内で** 解除した
+    /// 場合は、検索前 folder に飛ばず「解除直前のフォルダ維持」(= 既存仕様) を守る。
+    ///
+    /// シナリオ:
+    /// - Ctrl+G で ★固定 (= pre_snapshot_search_origin Some)
+    /// - snapshot 内 child folder X に入る (= current_folder が origin と不一致)
+    /// - 解除 → child folder X のままで居る (= restore_to に飛ばない)
+    #[test]
+    fn deactivate_in_child_folder_keeps_current_when_pre_origin_some() {
+        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\a.png"))]);
+        app.global_search.active = true;
+        app.global_search.saved_folder = Some(PathBuf::from(r"E:\before_search"));
+        app.activate_snapshot(SnapshotSourceLabel::GlobalSearch {
+            query: "test".into(),
+        });
+        // snapshot 中、child folder の中に navigate した状態を模擬 (= current_folder 変更)
+        let child_folder = PathBuf::from(r"E:\drilled\container\subfolder");
+        app.current_folder = Some(child_folder.clone());
+        // 解除: at_origin = false なので pre_snapshot_search_origin Some でも load_folder
+        // しない (= 既存「解除直前のフォルダ維持」path に落ちる)
+        app.deactivate_snapshot();
+        // current_folder は child folder のまま (= restore_to に飛んでいない)
+        assert_eq!(
+            app.current_folder,
+            Some(child_folder),
+            "child folder 内での解除では current_folder を維持 (= P2-1 fix)"
+        );
+        // suppress_nav_record_for_search_restore は立っていない (= load_folder してない)
+        assert!(!app.suppress_nav_record_for_search_restore);
+    }
+
+    /// Codex 6th P3 回帰テスト: 検索 view 由来 snapshot を **origin で** 解除すると
+    /// load_folder(restore_to) が呼ばれる (= current_folder が restore_to に向かう)。
+    /// 同経路で suppress_nav_record_for_search_restore も立てられるが、load_folder 内で
+    /// `mem::take` 消費されるので、観測可能な指標 (= snapshot None + current_folder 変化) で
+    /// verify する。
+    #[test]
+    fn deactivate_at_origin_with_pre_search_origin_takes_restore_path() {
+        let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\a.png"))]);
+        app.current_folder = Some(PathBuf::from(r"E:\drilled\container"));
+        app.global_search.active = true;
+        app.global_search.saved_folder = Some(PathBuf::from(r"E:\before_search"));
+        app.activate_snapshot(SnapshotSourceLabel::GlobalSearch {
+            query: "test".into(),
+        });
+        // current_folder は origin のまま (= drilled view で固定したケース)
+        assert_eq!(
+            app.current_folder,
+            Some(PathBuf::from(r"E:\drilled\container"))
+        );
+        let before_cf = app.current_folder.clone();
+        // 解除: at_origin = true + pre_search_origin Some → load_folder(restore_to)
+        app.deactivate_snapshot();
+        // 重要な不変条件: snapshot は解除された
+        assert!(app.snapshot.is_none());
+        // current_folder は load_folder で restore_to に変わる試行が走る
+        // (= test fixture では実 path 無くても load_folder 冒頭で current_folder が
+        //  restore_to に向かって更新される、または save 経路を通る)
+        // → 少なくとも before_cf と異なる、または restore_to に到達する
+        let after_cf = app.current_folder.clone();
+        assert!(
+            after_cf != before_cf || after_cf == Some(PathBuf::from(r"E:\before_search")),
+            "deactivate で current_folder が変化する (= restore path に入った証拠) \
+             before={before_cf:?}, after={after_cf:?}"
         );
     }
 

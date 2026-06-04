@@ -502,9 +502,18 @@ pub struct SnapshotState {
     /// 検索 view (Ctrl+G/Ctrl+S) から ★固定した場合の「戻り先フォルダ」。
     ///
     /// activate_snapshot で `global_search.saved_folder` or `favsearch.saved_folder` を
-    /// 採用して保存。deactivate_snapshot で origin が合成 path (= `__search_results__`)
-    /// だった場合、この folder に load_folder で戻る。ユーザー報告「Ctrl+G → ★固定 →
-    /// 解除でフォルダがアイテム検索の合成 path 表示のまま残る」事故を回避するため。
+    /// 採用して保存。deactivate_snapshot で **at_origin (= まだ snapshot origin に居る)**
+    /// + これが Some の場合に、suppress_nav_record_for_search_restore を立てて
+    /// `load_folder(restore_to)` で検索開始前の現実 folder に戻る。
+    ///
+    /// 「at_origin」の含意:
+    /// - Ctrl+G flat/aggregated view: origin = `__search_results__` (合成 path)
+    /// - Ctrl+G drilled view: origin = drill container 実 path
+    /// - Ctrl+S 結果ビュー: 同上 (= 合成 path or drilled path)
+    ///
+    /// at_origin で居続けたなら検索 view 由来の表示が残るので restore へ。captured
+    /// child folder の中で解除した場合は「解除直前のフォルダ維持」(= 既存仕様) を
+    /// 守るために fall through (= restore せず)。
     ///
     /// 通常 folder からの ★固定では None。
     pub pre_snapshot_search_origin: Option<PathBuf>,
