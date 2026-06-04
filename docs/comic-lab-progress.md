@@ -1,7 +1,7 @@
 # comic_lab 進捗・ハンドオフメモ
 
 Status: 作業中スナップショット (コンパクト耐性用)
-更新: 2026-06-04 セッション (FramePlanner 形状追加 / worktree 運用へ移行)
+更新: 2026-06-04 セッション (FramePlanner 形状 Phase1-3 完了 / worktree 運用 / Codex 2 周対応)
 
 吹き出し・テキスト注釈ツールの **lab 試作** (`tools/comic_lab` + `crates/comic-core`)。
 設計の正本: [speech-bubble-text-tool-plan.md](speech-bubble-text-tool-plan.md) (Claude 案) /
@@ -35,7 +35,15 @@ Claude Code セッションを並行で動かす」節)。
   多数の線 + 中央クリア楕円(`LINE_FIELD_CLEAR_RATIO=0.55`)。`draw_line_field` (raster)。
 - **Codex P1/P2 対応** (34ccded7): 流線を外接/クリア楕円の交点計算に書換 (斜めでも AABB 内)、
   自動サイズを内接率ベースに、count/sides 上限クランプ。
-- テスト comic-core 72 / comic_lab 4 green。**Phase3** (意識/線/二重線/◯?/なし) は将来。
+- **Phase3** (233bebf8): 意識(`Concentration` ぼかし縁楕円, per-pixel feather+soft ring)/
+  線(`Strokes` 手描き風多重 stroke)/二重線(`DoubleStroke` 同心 2 本)/思考(楕円)
+  (`MindEllipse` = Ellipse+Thought)/なし(`TextOnly` テキストのみ)。◯?=既存形状+Thought。
+- **Phase3 Codex 2 周対応** (16b22a2c, 23d491da): 意識の alpha 二重適用修正・走査クランプ・
+  merge では do_decotext で 1 回描画 / 二重線の内側 ring を merge erase 後に描画 /
+  しっぽ非対応形状 (`shape_renders_tail`) の AABB・hit-test・UI gate / merge チェーンから
+  非多角形形状を除外 (`shape_is_mergeable`)。Codex 最終確認 P1/P2 なし。
+- テスト comic-core **83** / comic_lab 4 green。FramePlanner 形状は **Phase1-3 完了**。
+- 実機確認用 release バイナリ: `target/release/comic_lab.exe` (`cargo run --release -p comic_lab`)。
 
 (以下は worktree 移行前=master 上の履歴。同じ内容が lab ブランチにも入っている)
 
