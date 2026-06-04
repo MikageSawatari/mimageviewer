@@ -15206,20 +15206,39 @@ impl App {
         self.show_feedback_toast("★フィルタ一時解除中 (親へ戻ると復元)".to_string());
     }
 
-    /// `load_folder` の最後に呼ぶ: suppression anchor の subtree から外に出ていれば
-    /// 保存したフィルタを復元する。subtree の内側にいれば no-op。
+    /// `load_folder` の最後に呼ぶ: suppression の自動再評価。
+    ///
+    /// 1. 既に suppress 中 + anchor の subtree 内 → 維持 (= 子孫探索中は継続)
+    /// 2. 既に suppress 中 + anchor の subtree 外 → 一旦 restore
+    /// 3. fall through (= suppress なし) で現在 folder の★を見て suppress 発動可否を判定
+    ///
+    /// これにより Ctrl+↑↓ / Ctrl+PageUp/Down で別の★付き folder に移動した際にも
+    /// 自動的に ★一時解除 が発動する。旧版は subtree 外 restore のみで、移動先で
+    /// 改めて発動する経路が無かった (= Enter / double-click 経由でのみ発動)。
+    ///
+    /// 関数名は互換性のため維持 (= 呼び出し元: load_folder_with_scan 末尾)。
     pub(crate) fn maybe_restore_rating_filter_if_out_of_scope(&mut self) {
-        let Some((anchor, _)) = self.rating_filter_suppressed_at.as_ref() else {
+        // フィルタ inactive (= 全 ★ レベル ON) なら suppress も不要。残っていれば restore。
+        if !self.rating_filter_active() {
+            self.restore_rating_filter_suppression();
             return;
-        };
+        }
         let Some(current) = self.effective_folder() else {
             // 現在フォルダが取れない状態 (起動直後など) は触らない
             return;
         };
-        if path_in_subtree_ci(&current, anchor) {
-            return;
+        // 既に suppress 中: anchor の subtree 内なら維持、外なら一旦 restore
+        if let Some((anchor, _)) = self.rating_filter_suppressed_at.as_ref() {
+            if path_in_subtree_ci(&current, anchor) {
+                return;
+            }
+            // subtree 外に出た → restore してから新 anchor で再評価する
+            self.restore_rating_filter_suppression();
         }
-        self.restore_rating_filter_suppression();
+        // 現在 folder の★を見て suppress を発動可否判定 (= 既存 helper を再利用)。
+        // 発動条件: folder 自身に★が付いている + その★が現在 filter で通る
+        // (= ★なし folder では発動しない、フィルタ外 folder でも発動しない)。
+        self.maybe_suppress_rating_filter_for_opened_container_path(&current);
     }
 
     /// suppression anchor を取り出し、保存されていたフィルタを復元する。

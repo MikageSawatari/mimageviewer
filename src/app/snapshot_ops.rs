@@ -640,16 +640,13 @@ impl App {
         }
         // guard bypass
         self.snapshot_internal_nav = true;
-        self.load_folder(folder_path.clone());
+        self.load_folder(folder_path);
         self.snapshot_internal_nav = false;
-        // Fix-A (ユーザー指摘): snapshot 内 folder に入る = ★3 folder の中の無印画像を
-        // 見たいケースが代表 use case。既存の「★一時解除中」機構を流用して、folder
-        // 自身の★レベルで filter を一時 suppress する。これで filter 適用前は隠れていた
-        // 中の image が見えるようになる。snapshot を解除する / 範囲外フォルダに出ると
-        // suppress も自動解除される (= 既存の restore 経路)。
-        // suppress 後に rebuild_visible_indices を呼んで filter 解除を反映する
-        // (= load_folder 内の rebuild は suppress 前の filter で実行されているため)。
-        self.maybe_suppress_rating_filter_for_opened_container_path(&folder_path);
+        // ★一時解除中の自動発動は `maybe_restore_rating_filter_if_out_of_scope`
+        // (= load_folder 末尾で呼ばれる) が現在 folder の★を見て自動再評価するので、
+        // ここで明示的に呼ぶ必要はない (= 旧版で必要だった理由が消えた)。
+        // ただし suppress 発動後に rebuild_visible_indices が走らないケースがある
+        // (= 一部の load_folder 経路) ので、念のため rebuild を呼ぶ。
         if self.rating_filter_suppressed_at.is_some() {
             self.rebuild_visible_indices();
         }
@@ -794,13 +791,12 @@ impl App {
         // grid mode = was_fs false + resume_slideshow false で呼ぶ
         // (= snapshot_load_and_open の内部 if was_fs || resume_slideshow ブランチは
         // 通らず、items 入れ替えだけ。fullscreen は開かない。)
-        let was_fs_before = self.fullscreen_idx.is_some();
-        let _ = was_fs_before;
         self.snapshot_internal_nav = true;
-        self.load_folder(target_path.clone());
+        self.load_folder(target_path);
         self.snapshot_internal_nav = false;
-        // folder enter の filter 自動 suppress (= snapshot_load_and_open と同じ)
-        self.maybe_suppress_rating_filter_for_opened_container_path(&target_path);
+        // ★一時解除中の自動発動は `maybe_restore_rating_filter_if_out_of_scope`
+        // (= load_folder 末尾) が現在 folder の★を見て自動再評価するので、ここで
+        // 明示的に呼ぶ必要はない。
         if self.rating_filter_suppressed_at.is_some() {
             self.rebuild_visible_indices();
         }
