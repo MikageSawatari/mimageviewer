@@ -1,8 +1,8 @@
 # ★固定 (Snapshot Lock) 機能 設計ドキュメント
 
-ステータス: **設計確定、Codex レビュー待ち** (2026-06-04)
-対象リリース: **v1.1.0**
-規模見積もり: **~500-600 行、1-2 commit**
+ステータス: **設計確定、Codex 2nd review 反映済み、実装着手可能** (2026-06-04)
+対象リリース: **v1.1.0** (= 規模により v1.2.0 送り判断あり、Step 1-3 完了時点で再評価)
+規模見積もり: **~1,500-1,700 行、2-3 commit** (= Codex P2-7 + 残指摘修正後)
 
 ---
 
@@ -60,8 +60,8 @@
 ### 基本コンセプト
 
 - **永続化しない一時的な snapshot** (= アプリ再起動で消える)
-- ボタンクリックで「現在の絞り込み結果」を凍結 → スナップショット中
-- スナップショット中は filter UI が disabled (= 結果が変わらないことを保証)
+- ボタンクリックで「現在の絞り込み結果 (= visible_indices)」を path list に凍結 → top-level grid 表示が snapshot_items の render に切替
+- **filter UI は操作可能** (= filter は普通に効く。snapshot は top-level grid 表示の凍結のみが役割、§4.2.1)
 - グリッド / フルスクリーン両方で「snapshot 範囲内のみ navigation」(= 検索結果ビューと同じセマンティクス)
 - もう一度ボタンクリック (またはグリッドで Esc) で解除
 
@@ -128,12 +128,40 @@
 
 #### snapshot 中の filter 変更検出 (= ステータスバー表示)
 
-snapshot ON 時の filter 状態 (`snapshot_filter_at_capture: FilterState`) を記録し、現在 filter と差があるかを判定:
+snapshot ON 時の filter 状態 `snapshot_filter_at_capture: FilterState` を記録し、現在 filter と差があるかを判定:
+
+```rust
+#[derive(Clone, PartialEq, Eq)]
+pub struct FilterState {
+    /// ★ filter (= snapshot 中も操作可能、これが主な変化観察対象)
+    rating_filter: [bool; 6],  // index 0=未評価, 1=★1, ..., 5=★5
+}
+```
+
+**含めない**もの (= mutual exclusion で consume されるため、snapshot 中は常に「無効」状態):
+- `text_query` (Ctrl+F) — snapshot ON 時に clear、snapshot 中に新規 query すると snapshot 解除されるので比較不要
+- `favsearch_query` (Ctrl+S) — 同上
+- `global_search_query` (Ctrl+G) — 同上
+
+代わりに **snapshot がどんな source から作られたか** は `SnapshotSourceLabel` で別途記録:
+
+```rust
+#[derive(Clone)]
+pub enum SnapshotSourceLabel {
+    RatingFilter { active_levels: Vec<u8> },  // 例: [5] = ★5 filter から
+    TextSearch { query: String },              // Ctrl+F の query
+    FavSearch { query: String },               // Ctrl+S の query
+    GlobalSearch { query: String },            // Ctrl+G の query
+    Mixed,                                     // 複数 source の組み合わせ
+}
+```
+
+これは tooltip / debug log で「この snapshot は何から来たか」を示すために使う (= ユーザーが「★5 で固定したやつ」と思い出せる)。
 
 | 状態 | フォルダパス suffix 表示 |
 |---|---|
-| filter 不変 | `(スナップショット中 N件)` |
-| filter 変更後 | `(スナップショット中 N件 / filter 変更後)` |
+| filter 不変 (= `rating_filter` 一致) | `(スナップショット中 N件)` |
+| filter 変更後 (= `rating_filter` 差あり) | `(スナップショット中 N件 / filter 変更後)` |
 
 これにより「snapshot 中だが filter は別状態」をユーザーが認識できる (= §4.3 参照)。
 
@@ -146,10 +174,10 @@ snapshot ON 時の filter 状態 (`snapshot_filter_at_capture: FilterState`) を
 
 #### OFF 動作 (= 再クリック / グリッド中の Esc)
 
-1. `snapshot_items` クリア
-2. `snapshot_origin` クリア
-3. filter UI 復活 (= disabled 解除)
-4. フォルダ表示は **snapshot 解除直前のフォルダのまま** (= ユーザーが snapshot 中に navigate していたフォルダ)
+1. `snapshot_items` / `snapshot_membership` / `snapshot_origin` / `snapshot_filter_at_capture` クリア
+2. `snapshot_active = false` で grid 表示を `visible_indices` ベースに戻す (= 現在の filter state が反映される)
+3. フォルダ表示は **snapshot 解除直前のフォルダのまま** (= ユーザーが snapshot 中に navigate していたフォルダ)
+4. **検索 mode の state は consume 済み** (= snapshot ON 時に clear したものは復元しない、§4.5 mutual exclusion の対称性)。Ctrl+F/S/G の query を残したい場合はユーザーが再入力
 
 #### 永続化
 
@@ -202,11 +230,27 @@ captured folder (= snapshot に含まれる Folder/Zip/Pdf) に入った後、�
 
 #### 検索 active 中 → `[★固定]` 押下 (= 検索 → snapshot へ昇格)
 
-1. 現在の `visible_indices` (= 検索結果) から path 一覧を抽出
-2. **検索 mode を解除** (= 検索バーを閉じる、`favsearch.active = false` / Ctrl+F query クリア / Ctrl+G results クリア)
-3. snapshot mode に切替 (= `snapshot_active = true`, `snapshot_items` に検索結果 paths を保存)
-4. grid 表示は snapshot_items を render (= 見た目は検索結果と同じ)
+**順序が重要** (= state 上書きで取りこぼし防止):
+
+1. **capture first**: 現在の `visible_indices` (= 検索結果) から SnapshotEntry list + SnapshotKey membership map を構築。この時点で local 変数に持つ
+2. **close search**: 検索 mode を解除 (= `favsearch.active = false` / `search_pending = false` / Ctrl+F query クリア / Ctrl+G results クリア / search bar UI を hide)
+3. **activate snapshot**: `snapshot_active = true`, `snapshot_items` / `snapshot_membership` / `snapshot_origin` / `snapshot_filter_at_capture` をセット
+4. **render switch**: grid 表示は次フレームから snapshot_items を render (= 見た目は検索結果と同じ)
 5. toast 「検索結果をスナップショットに固定しました (N 件)」
+
+検索 state は **consume** する (= snapshot OFF 時に restore しない、§4.5 mutual exclusion の対称性。検索を続けたい場合はユーザーが再入力)。これは Ctrl+S → Ctrl+G の検索乗り換え時と同じ pattern。
+
+#### dirty/pending 検索の snapshot 禁止 (= P2-new)
+
+Ctrl+F / Ctrl+S / Ctrl+G いずれも、**pending 状態 (= query 入力中で未確定) では `[★固定]` ボタンを disabled** にする。stale 結果を snapshot しないため:
+
+| 検索種 | pending 判定 | disabled tooltip |
+|---|---|---|
+| Ctrl+G | `global_search.is_searching()` | 「Ctrl+G の結果取得中は使用不可」 |
+| Ctrl+F | `search_pending` または `query != last_executed` | 「検索結果の確定後にお試しください」 |
+| Ctrl+S | `favsearch_pending` または `query != last_executed` | 「検索結果の確定後にお試しください」 |
+
+ユーザーが query を確定する (= Enter を押す or debounce 完了) と pending が解除され、`[★固定]` が enable される。代替案 (= ボタン押下時に強制実行) も検討したが、UX が「ボタン押したのに何も起きない数秒」になるため disable で統一。
 
 これにより「検索結果のスライドショー」需要に応える:
 - `Ctrl+F "夏"` で現在フォルダ内 30 件絞り込み → `[★固定]` → 30 件 snapshot → スライドショーで 30 件巡回
@@ -241,30 +285,100 @@ MVP で disable する理由: `SearchContainer` は単一 path に正規化で�
 
 ### 4.6 フルスクリーン navigation の snapshot mode
 
-#### owner-entry lookup (= P1-1 解決)
+#### `SnapshotKey` 厳密定義 (= P1-1 解決の前提)
+
+`SnapshotKey` は path を normalize した hash 可能な値で、Windows の path 比較の落とし穴を全部解消する:
+
+```rust
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub enum SnapshotKey {
+    /// 通常の filesystem path (= Folder, Image, Video)
+    Fs(String),
+    /// アーカイブ inner path (= ZipImage / PdfPage)
+    Archive { container: String, inner: String },
+}
+
+fn snapshot_key_from_path(path: &Path) -> SnapshotKey {
+    // 1. ZipFile / PdfFile 内かを判定
+    if let Some((container, inner)) = split_archive_path(path) {
+        return SnapshotKey::Archive {
+            container: normalize_fs(container),
+            inner: normalize_inner(inner),
+        };
+    }
+    SnapshotKey::Fs(normalize_fs(path))
+}
+
+fn normalize_fs(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let s = strip_extended_prefix(&s);  // `\\?\C:\...` → `C:\...`
+    let s = s.replace('/', "\\");        // unix-style → windows-style
+    let s = strip_trailing_separator(&s); // `C:\foo\` → `C:\foo`
+    s.to_lowercase()                      // Windows case-insensitive
+}
+```
+
+| 正規化観点 | 処理 |
+|---|---|
+| **Windows 大文字小文字** | `to_lowercase()` で吸収 (= `e:\Foo` と `E:\foo` は同一) |
+| **separator** | `/` を `\` に正規化 |
+| **trailing separator** | `\\foo\\` → `\\foo` |
+| **`\\?\` extended prefix** | drive path に正規化 (= `\\?\C:\foo` → `C:\foo`) |
+| **UNC path** | `\\server\share\foo` はそのまま (= `\\?\UNC\server\share\foo` も `\\server\share\foo` に正規化) |
+| **ZipFile / PdfFile inner path** | container と inner を分離 (`Archive { container, inner }`)。container は fs と同じ normalize、inner は内部 separator のみ統一 |
+| **inner path の例** | `e:\foo.zip\sub\image.png` → `Archive { container: "e:\\foo.zip", inner: "sub\\image.png" }` |
+
+`split_archive_path()` は既存の zip_loader / pdf_loader の path 判定ロジックを流用 (= 拡張子 `.zip` / `.pdf` の境界を path 中から検出)。
+
+#### `snapshot_owner_entry` (= P1-1 解決)
 
 snapshot は **Folder/Zip/Pdf の path** を持つが、fullscreen で開かれるのは **その中の image path** (= snapshot に直接含まれない)。よって「現在の path が snapshot 内のどの entry に属するか」を判定する必要がある:
 
 ```rust
-// 擬似コード
-fn snapshot_owner_entry(snapshot: &[SnapshotEntry], current_path: &Path) -> Option<usize> {
-    // 1. 完全一致 (= image/video entry の場合)
-    if let Some(idx) = snapshot_membership.get(&snapshot_key(current_path)) {
-        return Some(*idx);
+fn snapshot_owner_entry(app: &App, current_path: &Path) -> Option<usize> {
+    let key = snapshot_key_from_path(current_path);
+    // 1. 完全一致 (= image/video/zipimage/pdfpage entry の場合)
+    if let Some(&idx) = app.snapshot_membership.get(&key) {
+        return Some(idx);
     }
     // 2. prefix 一致 (= Folder/Zip/Pdf entry の場合)
-    for (idx, entry) in snapshot.iter().enumerate() {
-        if matches!(entry.kind, Folder | ZipFile | PdfFile)
-            && current_path.starts_with(&entry.path) {
-            return Some(idx);
+    //    SnapshotKey::Archive にも対応: container 一致なら owner
+    for (idx, entry) in app.snapshot_items.iter().enumerate() {
+        match &entry.key {
+            SnapshotKey::Fs(fs_path) if matches!(entry.kind, Folder | ZipFile | PdfFile) => {
+                // current が fs_path 配下か (= separator 境界で判定、sibling false positive 防止)
+                if is_inside_fs(&key, fs_path) { return Some(idx); }
+            }
+            SnapshotKey::Archive { container, inner: entry_inner } if matches!(entry.kind, ZipFile) => {
+                // ZipFile entry に対する inner image lookup (= rare、通常 ZipFile は inner なしで snapshot)
+                if let SnapshotKey::Archive { container: cur_c, inner: cur_i } = &key {
+                    if cur_c == container && cur_i.starts_with(entry_inner) { return Some(idx); }
+                }
+            }
+            _ => {}
         }
     }
     None
 }
+
+fn is_inside_fs(child: &SnapshotKey, parent_fs: &str) -> bool {
+    match child {
+        SnapshotKey::Fs(c) => c.starts_with(parent_fs) && c[parent_fs.len()..].starts_with('\\'),
+        SnapshotKey::Archive { container, .. } => {
+            container.starts_with(parent_fs) && container[parent_fs.len()..].starts_with('\\')
+        }
+    }
+}
 ```
 
-- ZIP/PDF entry には `entry.path + "/"` を prefix にする (= ZipImage の path 形式は `archive.zip/inner/image.png`)
-- HashMap の併設で完全一致は O(1)、prefix 一致は entry 数の linear scan (= 最悪 1000 entry でも μs オーダー)
+| 観点 | 処理 |
+|---|---|
+| 完全一致 | HashMap O(1) (= image/video entry を直接 fullscreen で開いた場合) |
+| prefix 一致 | entry 数の linear scan (= 最悪 1000 entry でも μs オーダー) |
+| **sibling false positive 防止** | `is_inside_fs()` で separator 境界を確認 (= `C:\foo` は `C:\foobar\baz` を own しない) |
+| **case-only 差** | `SnapshotKey` 構築時に小文字化済みなので吸収 |
+| **trailing separator** | normalize 済みなので吸収 |
+| **ZipFile inner path** | `Archive { container, inner }` 構造で比較 (= raw `starts_with` の落とし穴回避) |
 
 #### 混合 entry navigation の挙動 (= P1-3 解決)
 
@@ -279,6 +393,16 @@ snapshot は image / video / Folder / ZipFile / PdfFile が混在する可能性
 | **スライドショー末尾の自動次フォルダ** | 同上 (= 「次の playable snapshot entry」を解決して連続再生) |
 | **`Esc`** | フルスクリーン解除のみ (= snapshot は維持、グリッドに戻る) |
 | **`Enter`** | 既存 P10-1 どおり、フルスクリーン解除 |
+
+#### terminal rules (= 境界の挙動、P2-mixed nav 残)
+
+| 観点 | rule |
+|---|---|
+| **folder 内 ordering** | **既存の grid sort + current filter を尊重** (= snapshot 中も filter は普通に効く §4.2.1)。`load_folder` 経路で得られる順序そのまま |
+| **「最初の image-like」が無い folder** | scan 時に skip して次 playable entry を探す (= folder 配下に image が 0 件 / video 0 件のケース)。skip しても snapshot scope 内に playable が残っているか確認 |
+| **scan 上限** | 探索は **snapshot_items 全体まで** linear scan (= 最悪 1000 entry でも μs オーダー)。1 件も playable が無ければ「snapshot 全体に再生対象なし」状態 |
+| **snapshot 末尾到達** | **wrap せず stop**、フルスクリーン境界 hint (= 既存「次/前のフォルダがありません」と同形 toast) を表示。slideshow も末尾停止 (= §4.6 既存 slideshow 末尾動作と整合) |
+| **snapshot 解除中の pending nav** | snapshot toggle OFF で pending folder load が cancel される (= snapshot_generation_id で識別、§5 Step 11 参照) |
 
 #### snapshot 範囲外 path の fullscreen open
 
@@ -302,8 +426,8 @@ snapshot は image / video / Folder / ZipFile / PdfFile が混在する可能性
 
 | Step | 内容 | 規模 |
 |---|---|---|
-| **1** | `App` に `snapshot_active: bool`, `snapshot_items: Vec<SnapshotEntry>`, `snapshot_membership: HashMap<SnapshotKey, usize>`, `snapshot_origin: PathBuf`, `snapshot_filter_at_capture: FilterState` フィールド追加 + Default init | ~40 行 |
-| **2** | `SnapshotEntry` / `SnapshotEntryKind` / `SnapshotKey` 型定義 (= GridItem を path + kind に正規化、Hash/Eq impl) | ~60 行 |
+| **1** | `App` に `snapshot_active: bool`, `snapshot_items: Vec<SnapshotEntry>`, `snapshot_membership: HashMap<SnapshotKey, usize>`, `snapshot_origin: PathBuf`, `snapshot_filter_at_capture: FilterState`, `snapshot_source_label: SnapshotSourceLabel`, `snapshot_generation_id: u64` フィールド追加 + Default init | ~50 行 |
+| **2** | `SnapshotEntry` / `SnapshotEntryKind` / `SnapshotKey` 型定義 (= GridItem を path + kind に正規化、Hash/Eq impl) + `snapshot_key_from_path()` + `normalize_fs()` + `split_archive_path()` + `is_inside_fs()` 純関数群 (= §4.6 SnapshotKey 厳密定義の実装) | ~120 行 |
 | **3** | `[★固定]` ボタン UI を ★ filter ツールバーの右に追加 (= `src/ui_main.rs` の `draw_rating_filter_button` 付近) | ~80 行 |
 | **4** | ON/OFF コマンド (= ボタン handler、`visible_indices` → SnapshotEntry list 抽出 + membership map 構築 + filter capture + state 切替) | ~90 行 |
 | **5** | grid 描画の切替 (= snapshot_active なら `snapshot_items` を render する、visible_indices ではなく) | ~80 行 |
@@ -312,20 +436,24 @@ snapshot は image / video / Folder / ZipFile / PdfFile が混在する可能性
 | **8** | Ctrl+S/F/G の自動解除動作 (= 検索開始前に snapshot OFF + toast) | ~40 行 |
 | **9** | Ctrl+G ストリーミング中 + aggregated view の `[★固定]` disabled 判定 (= `global_search.is_searching()` + aggregated 検出) | ~40 行 |
 | **10** | `snapshot_owner_entry()` 純関数 + HashMap O(1) lookup + prefix match for Folder/Zip/Pdf | ~80 行 |
-| **11** | **新 `FolderNavMode::Snapshot { current_idx, ordered_entries, resume_slideshow }` variant 追加** (= P2-2、Favsearch 流用しない)。fullscreen Ctrl+↑↓ / Ctrl+PageUp/Down / 末尾→次 entry の resolver | ~200 行 |
+| **11** | **新 `FolderNavMode::Snapshot { generation_id, current_idx, action_kind, media_policy }` variant 追加** (= P2-2、Favsearch 流用しない)。fullscreen Ctrl+↑↓ / Ctrl+PageUp/Down / 末尾→次 entry の resolver。`generation_id` で snapshot OFF 後の pending nav 識別、`action_kind` (= Arrow / Page / OwnerEnd / Slideshow) で resolver 切替、`media_policy` (= AllowVideo / StillOnly) で slideshow 時の動画 skip | ~230 行 |
 | **12** | スライドショー末尾の snapshot mode 接続 (= 次の playable snapshot entry を resolve) | ~60 行 |
 | **13** | グリッド中の Esc で解除 (= 既存検索 Esc と同じパターン、優先度: 検索 dismiss → snapshot dismiss) | ~40 行 |
-| **14** | unit test: snapshot 生成 / 解除 / membership lookup / owner_entry / 混合 nav resolver / Ctrl+G streaming gate / Ctrl+F/S/G 自動解除 / filter 変化検出 / scroll 不変 / rating add/remove で snapshot 不変 (= P2-6 規制テスト含む) | ~250 行 |
+| **14** | unit test: snapshot 生成 / 解除 / membership lookup / owner_entry / 混合 nav resolver / Ctrl+G streaming gate / Ctrl+F/S/G 自動解除 / filter 変化検出 / scroll 不変 / rating add/remove で snapshot 不変 + **path normalization (case fold / trailing sep / extended prefix / UNC / Zip inner) / sibling false positive 防止 / dirty Ctrl+F/S gate / no-playable folder skip / snapshot OFF 時の pending nav cancel (= generation_id 識別) / slideshow mid-folder transition** (= P2-6 規制テスト全部含む) | ~340 行 |
 | **15** | integration test: snapshot lock/unlock roundtrip / fullscreen 混合 nav / slideshow NextFolder / aggregated SearchContainer disable | ~100 行 |
 | **16** | docs: `docs/keymap-spec.md` + `docs/spec.md` + マニュアル `shortcuts.html` `grid.html` `search.html` `slideshow.html` `rating.html` + `show_toolbar_rating` で隠れるケース注記 | ~80 行 |
 
-**合計: ~1,390 行、1-2 commit**
+**合計: ~1,560 行、2-3 commit** (= SnapshotKey 仕様 + dirty gate + state 拡張 + 追加テスト分)
 
 #### v1.1.0 リリース判断
 
-- 規模が ~1,400 行に膨らんだ (= Codex P2-7 指摘) ため、週末リリースに含めるか v1.2.0 送りか判断必要
-- scope を **「★ filter 結果のみ snapshot 化、Ctrl+F/S/G 除外」** に絞れば §4.5 大半が消え、~900 行に収まる可能性。ただし v1.2.0 で再設計が必要になる懸念あり
+- 規模が ~1,560 行に膨らんだため、週末リリースに含めるか v1.2.0 送りか判断必要
+- scope を **「★ filter 結果のみ snapshot 化、Ctrl+F/S/G 除外」** に絞れば §4.5 大半が消え、~1,000 行に収まる可能性。ただし v1.2.0 で再設計が必要になる懸念あり
 - 推奨: 規模見積もりは Codex の値を採用 (= 過小評価リスクを取らない)。週末リリース可否は実装ペースを Step 1-3 完了時点で再評価する
+- 1 commit ではなく **2-3 commit に分割** 推奨:
+  - Commit 1: Step 1-2 (型定義 + 正規化純関数) + 単体テスト (~250 行)
+  - Commit 2: Step 3-10 (UI + ON/OFF + 視覚指標 + 範囲外 disable + mutual exclusion + owner_entry) + 単体テスト (~700 行)
+  - Commit 3: Step 11-16 (FolderNavMode::Snapshot + 末尾→次 entry + Esc + integration test + docs) (~610 行)
 
 ---
 
@@ -390,6 +518,20 @@ snapshot は image / video / Folder / ZipFile / PdfFile が混在する可能性
 | **P2-7** 規模見積もり過小 | Step 表を全面更新、~680 行 → **~1,390 行** に修正 |
 | **P3** memory + child folder navigability + docs 不足 | §4.2.1 (memory 数 MB 言及 + HashMap), §4.4 (child folder 入れる), Step 16 (docs/spec.md + 各マニュアル) で反映 |
 
+### Codex 2nd review (= 2026-06-04 同日) の追加指摘と対応
+
+| Codex 2nd 指摘 | 対応 |
+|---|---|
+| **P1-1 still weak** SnapshotKey 厳密定義不足 | §4.6 に SnapshotKey 厳密定義節を追加: case-fold / separator 正規化 / `\\?\` extended prefix / UNC / Archive { container, inner } 構造 + `is_inside_fs()` で sibling false positive 防止 |
+| **P2-1 残** §4.5 lifecycle 文言矛盾 | §4.5 で「capture → close → activate」3 段の順序を明示。検索 state は **consume** (= restore しない) を明文化。OFF 動作で「state は consume 済み、復元しない」追記 |
+| **P2-new** dirty/pending Ctrl+F/S で stale 結果 snapshot | §4.5 に dirty/pending 検索の disable gate 追加: `search_pending` / `favsearch_pending` / `query != last_executed` でも disabled |
+| **P2-FilterState** 未定義 + §4.5 と矛盾 | §4.2.1 で `FilterState { rating_filter: [bool; 6] }` のみに絞る (= text_query 等は consume されるので除外) + `SnapshotSourceLabel` 別途定義 |
+| **P1-3 残** terminal rules 不足 | §4.6 に「terminal rules」節追加: folder 内 ordering (= 既存 sort + filter)、no-playable folder skip、末尾は wrap せず stop + boundary hint、snapshot OFF 時の pending nav cancel |
+| **Step 11 state 不完全** | Step 11 を `FolderNavMode::Snapshot { generation_id, current_idx, action_kind, media_policy }` に拡張 |
+| **P2-6 残** 追加 regression | Step 14 unit test 数を拡張 (path normalization / sibling false positive / dirty gate / no-playable skip / pending nav cancel / slideshow mid-folder transition) |
+| **P2-7 weak** header line 5 stale | header を `~1,500-1,700 行、2-3 commit` に修正、Step 表合計と整合 |
+| **P3-3** 旧 filter UI disabled 記述残存 | line 64 / 151 / 447 / 463 を新仕様に修正 (filter UI 操作可 / state は consume / 関連コード位置の `要調査` 削除) |
+
 ## 7. 旧版 Codex レビュー時の論点 (= 2026-06-04 初回 review に対する論点リスト、参考)
 
 ### 設計の妥当性 (= 採用案 D が筋か)
@@ -444,7 +586,7 @@ snapshot は image / video / Folder / ZipFile / PdfFile が混在する可能性
 ### v1.2.0 候補
 
 - **「保存済み一覧」機能** (= 案 C のリベンジ、永続化 + 名前付け、ただし v1.1.0 ★固定が使いやすければ不要かも)
-- **「★固定」中の filter 部分変更** (= 現状は全 disabled だが、★ レベルの調整くらいは許可してリアルタイム再 snapshot する案)
+- **「★固定」中の filter 部分変更で再 snapshot** (= 現状は filter を変えても top-level 凍結だが、明示的に「再 snapshot」ボタンを出して現在 filter で取り直しできるようにする案)
 - **Ctrl+G ストリーミング中も逐次 snapshot** (= 現状は disabled、ただし complexity 増)
 
 ---
@@ -460,7 +602,9 @@ snapshot は image / video / Folder / ZipFile / PdfFile が混在する可能性
 | `navigate_folder_with_skip` | `src/folder_tree.rs` |
 | Ctrl+S 検索バー | `src/ui_main.rs:1882` 周辺 (`raw_enter_pressed`) |
 | Ctrl+F 検索バー | `src/ui_main.rs:1702` 周辺 |
-| `global_search` ストリーミング状態 | `src/global_search.rs` (要調査) |
+| `global_search` ストリーミング状態 | `src/global_search.rs` の `is_searching()` (= P2-4) |
+| Ctrl+F pending state | `src/app.rs` の `search_pending` 関連 (= dirty check 用) |
+| Ctrl+S pending state | `src/app.rs` の `favsearch_pending` 関連 (= dirty check 用) |
 | フォルダパス表示 (フォルダバー) | `src/ui_main.rs` (= 要 grep `folder_bar` or `フォルダパス`) |
 | グリッド Esc 既存挙動 | `src/app.rs` (= 検索解除等) |
 | draw_cell (= snapshot 中の Folder バッジ表示と並列) | `src/app.rs:27236` |
@@ -474,3 +618,4 @@ snapshot は image / video / Folder / ZipFile / PdfFile が混在する可能性
 | 2026-06-04 | 初版 (= 議論経緯 + 案 D 設計確定) |
 | 2026-06-04 | §4.2.1 追加 (= filter は capture 時のみ、navigation 中は suspend) + §4.6 / §6 / §7 に該当反映。ユーザー質問「★3 filter 中の入れ子★2 は除外される?」への回答として明示 |
 | 2026-06-04 | Codex P1-P3 review 反映: §4.2.1 を **filter suspend 廃止 → top-level grid 凍結のみ** に全面書き換え (P1-2 解決)。§4.6 に owner-entry lookup (P1-1) + 混合 nav rule (P1-3) 追加。§4.5 を **scope mutual exclusion** (= 検索↔snapshot 対称切替) に書き換え (P2-1 解決)。Step 11 で **新 `FolderNavMode::Snapshot` variant** に変更 (P2-2)。`is_searching()` (P2-4) / aggregated disable (P2-5) / 追加 regression テスト (P2-6) / 規模見積もり ~1,390 行に修正 (P2-7)。§6.5 に Codex 対応状況一覧表追加 |
+| 2026-06-04 | Codex 2nd review (= 残 P1/P2/P3 一括反映): §4.6 SnapshotKey 厳密定義節追加 (= case-fold / separator / extended prefix / UNC / Archive 構造、P1-1 完全解決)。§4.5 lifecycle 3 段順序明示 + dirty/pending Ctrl+F/S の disable gate 追加 (P2-1 残 / P2-new 解決)。§4.2.1 `FilterState` を `rating_filter` のみに絞る + `SnapshotSourceLabel` 別途定義 (P2-FilterState 解決)。§4.6 terminal rules 節追加 (= ordering / no-playable skip / 末尾 stop + boundary hint、P1-3 残 解決)。Step 11 を `{ generation_id, current_idx, action_kind, media_policy }` に拡張 (P2-Step11)。Step 14 unit test 追加 6 件 (P2-6 残)。規模 ~1,560 行、commit 分割推奨 (P2-7)。header / 旧 filter UI disabled 記述削除 (P3-3) |
