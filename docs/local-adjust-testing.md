@@ -249,6 +249,38 @@ P5-6 で発見した「`bump_adjustment_generation` が `final_ai_cache` を巻�
     OS focus に依存しない (= focus guard は OS 修飾キー読みだけに適用される
     設計の符号化)。
 
+## Phase 5 拡充 (2026-06、補正レイヤーパネル UI snapshot 着手)
+
+これまで「v1.2.0 で着手予定」として deferred されていた **補正レイヤーパネルの
+E2E UI snapshot** を着手。当初の計画では `pub mod local_adjust_test_api` を新設して
+`tests/local_adjust_ui_snapshot.rs` を作る予定だったが、調査の結果 `src/lib.rs` の
+`app` module が stub だけで `App::draw_local_adjust_*` (`pub(crate)`) には届かない
+ことが判明。方針を **bin test (`src/ui_adjustment_panel.rs::local_adjust_segmentation_tests`
+内で直接 `egui_kittest::Harness` を使う)** に変更。
+
+詳細は [docs/ui-snapshot-policy.md](ui-snapshot-policy.md) 末尾の
+「lib vs bin の使い分け」節を参照。
+
+追加した snapshot (5 件、`tests/snapshots/local_adjust_panel_*.png`):
+
+| ファイル名 | シナリオ | 退行検知の対象 |
+|---|---|---|
+| `local_adjust_panel_empty_layer_list.png` | layers=[] | 空状態ガイドテキスト / 「+ 補正レイヤー」ボタン |
+| `local_adjust_panel_one_full_layer.png` | layer 1 件選択 | 選択ハイライト色 / 操作ボタン (↑↓/複製/削除) のレイアウト |
+| `local_adjust_panel_two_layers_second_selected.png` | 2 件 / 2 番目選択 | 選択中のみ操作ボタン表示、未選択行のスタイル |
+| `local_adjust_panel_preview_to_selected_layer_active.png` | 3 件 + toggle ON | 「表示中: 1〜2 / 3」ラベル文言 |
+| `local_adjust_panel_layer_disabled.png` | layer.enabled = false | チェックボックス OFF / 「OFF」表示 / 薄い表現 |
+
+共通 helper `snapshot_panel_with_layers` を mod 内に置いてあるので、シナリオを
+増やすときは `snapshot_layer(name, mask, effect, enabled)` で layer 配列を
+組み立てて 1 行で snapshot 追加できる。
+
+更新手順:
+```bash
+UPDATE_SNAPSHOTS=1 cargo test --bin mimageviewer-core local_adjust_panel_snapshot
+# 生成された PNG を必ず目視確認してからコミット
+```
+
 ### bump_* マトリクス (Phase 4 で fixation した範囲)
 
 | bump_X | 主に触る cache | 触らない cache |

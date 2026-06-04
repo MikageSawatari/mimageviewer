@@ -111,3 +111,48 @@ CJK フォントを自前で vendored するか `Noto Sans CJK` をインスト�
   試す。
 - **画像コンテンツ**を描画する UI (グリッドセル等) は、画像パスが通らないため
   スナップショット対象外。モックテクスチャを渡すテストは将来的に検討。
+
+## lib (`tests/`) vs bin (`src/` 内 `#[cfg(test)]`) の使い分け
+
+`tests/ui_snapshot.rs` は **lib crate** から見えるもの (`mimageviewer::*` の pub API)
+だけテストできる。`src/lib.rs` には bin 専属の `app` module を **stub だけ** 置いて
+あり、`App::draw_local_adjust_*` のような `pub(crate)` panel render 関数には届かない。
+
+このため、bin (= App や `pub(crate) fn`) に閉じた UI のスナップショットを撮りたい
+ときは、**bin test (`src/<module>.rs` 内 `#[cfg(test)] mod`) の中で直接
+`egui_kittest::Harness` を使う**:
+
+```rust
+// src/ui_adjustment_panel.rs::local_adjust_segmentation_tests 内
+#[test]
+fn local_adjust_panel_snapshot_empty_layer_list() {
+    use egui_kittest::Harness;
+    let mut fonts_ready = false;
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(280.0, 200.0))
+        .build(move |ctx| {
+            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+            if !fonts_ready {
+                crate::ui_fonts::configure_fonts(ctx);
+                fonts_ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::draw_local_adjust_layer_list(ui, /* args... */);
+            });
+        });
+    harness.run();
+    harness.snapshot("local_adjust_panel_empty_layer_list");
+}
+```
+
+スナップショットは **同じ `tests/snapshots/<name>.png`** に保存される (lib テストと
+bin テストでディレクトリ共有)。**`UPDATE_SNAPSHOTS=1`** も同じ:
+
+```bash
+UPDATE_SNAPSHOTS=1 cargo test --bin mimageviewer-core local_adjust_panel_snapshot
+```
+
+実例: `src/ui_adjustment_panel.rs::local_adjust_segmentation_tests::local_adjust_panel_snapshot_*`
+(5 件、補正レイヤーパネル + レイヤーリスト UI)。

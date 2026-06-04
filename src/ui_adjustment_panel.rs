@@ -960,6 +960,252 @@ mod local_adjust_segmentation_tests {
             "色相が 1 秒で 100/765 以上動かない → アニメーション周波数が遅すぎる (A-2 退行)"
         );
     }
+
+    // ========================================================================
+    // P8 / Phase 5: 補正レイヤーパネル UI スナップショット (egui_kittest)
+    // ========================================================================
+    //
+    // 背景: `tests/ui_snapshot.rs` は lib crate (= `mimageviewer::*` の pub API のみ
+    // アクセス可) として動くので、`pub(crate) fn draw_local_adjust_*` には届かない。
+    // 代わりにこの bin test mod 内で egui_kittest の Harness を直接叩く。
+    //
+    // 目的: 補正レイヤーパネルの描画ロジック (= 大半が `pub(crate) fn draw_*`) に
+    // 意図しない見た目変更 (配色 / レイアウト / ボタンサイズ) が入ったとき、
+    // PNG 差分として検知する。
+    //
+    // 実行:
+    //   cargo test --bin mimageviewer-core local_adjust_panel_snapshot
+    // 更新:
+    //   UPDATE_SNAPSHOTS=1 cargo test --bin mimageviewer-core local_adjust_panel_snapshot
+    //
+    // スナップショット保存先: `tests/snapshots/<name>.png` (cargo の test snapshot
+    // 規約に従う; bin test と integration test で同じディレクトリを共有する)。
+    //
+    // ⚠ skeleton 段階 (Phase 5、smoke 1 件): 最小限の構成で「panel render が panic
+    // しないこと」を確かめる。シナリオ拡充 (layer 追加 / mask preview / bypass mode)
+    // は Phase 5+ で `local_adjust_panel_snapshot_*` を増やす。
+
+    /// P8-3: 補正レイヤーパネルの「空 (= layer が 1 つも無い)」状態を snapshot 化する
+    /// smoke テスト。`draw_local_adjust_layer_list` が空 layers に対して
+    /// 「+ 補正レイヤー」ボタン + ガイドテキスト + 「選択レイヤーまでプレビュー」
+    /// チェックボックス だけを描くことを符号化。
+    ///
+    /// 退行検知:
+    /// - 空状態のガイドテキスト文言・配色変更
+    /// - 「+ 補正レイヤー」ボタンのレイアウト
+    /// - 「選択レイヤーまでプレビュー」チェックボックスのラベル文字列
+    #[test]
+    fn local_adjust_panel_snapshot_empty_layer_list() {
+        use egui_kittest::Harness;
+
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(280.0, 200.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let layers: Vec<local_adjust_core::LocalAdjustmentLayer> = vec![];
+                    let mut add_layer_dialog_open = false;
+                    let mut select_layer: Option<usize> = None;
+                    let mut set_enabled: Option<(usize, bool)> = None;
+                    let mut update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)> =
+                        None;
+                    let mut move_layer: Option<(usize, usize)> = None;
+                    let mut duplicate_layer: Option<usize> = None;
+                    let mut delete_layer: Option<usize> = None;
+                    let mut preview_to_selected_layer = false;
+                    super::draw_local_adjust_layer_list(
+                        ui,
+                        260.0,
+                        &layers,
+                        0,
+                        (1920, 1080),
+                        None,
+                        &mut add_layer_dialog_open,
+                        &mut select_layer,
+                        &mut set_enabled,
+                        &mut update_layer,
+                        &mut move_layer,
+                        &mut duplicate_layer,
+                        &mut delete_layer,
+                        &mut preview_to_selected_layer,
+                    );
+                });
+            });
+
+        harness.run();
+        harness.snapshot("local_adjust_panel_empty_layer_list");
+    }
+
+    /// Snapshot シナリオ用の helper: 名前 / マスク / effect だけを受けて
+    /// `LocalAdjustmentLayer` を作る (= 各 snapshot test の fixture を 1 行で書ける)。
+    fn snapshot_layer(
+        name: &str,
+        mask: local_adjust_core::LocalMask,
+        effect: local_adjust_core::LocalEffect,
+        enabled: bool,
+    ) -> local_adjust_core::LocalAdjustmentLayer {
+        let mut layer = local_adjust_core::LocalAdjustmentLayer::new(name, mask, effect);
+        layer.enabled = enabled;
+        layer
+    }
+
+    /// Snapshot シナリオ共通ハーネス。`build_panel` closure 内で
+    /// `draw_local_adjust_layer_list` を呼んで snapshot を撮る。
+    /// closure に渡る引数は `(ui, panel_w)`、それ以外の `&mut` は内部 default。
+    fn snapshot_panel_with_layers(
+        name: &str,
+        size: egui::Vec2,
+        layers: Vec<local_adjust_core::LocalAdjustmentLayer>,
+        selected_layer: usize,
+        preview_to_selected_layer: bool,
+    ) {
+        use egui_kittest::Harness;
+
+        let mut fonts_ready = false;
+        let layers = std::sync::Arc::new(layers);
+        let layers_for_render = std::sync::Arc::clone(&layers);
+        let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+            if !fonts_ready {
+                crate::ui_fonts::configure_fonts(ctx);
+                fonts_ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut add_layer_dialog_open = false;
+                let mut select_layer: Option<usize> = None;
+                let mut set_enabled: Option<(usize, bool)> = None;
+                let mut update_layer: Option<(usize, local_adjust_core::LocalAdjustmentLayer)> =
+                    None;
+                let mut move_layer: Option<(usize, usize)> = None;
+                let mut duplicate_layer: Option<usize> = None;
+                let mut delete_layer: Option<usize> = None;
+                let mut preview_flag = preview_to_selected_layer;
+                super::draw_local_adjust_layer_list(
+                    ui,
+                    260.0,
+                    &layers_for_render,
+                    selected_layer,
+                    (1920, 1080),
+                    None,
+                    &mut add_layer_dialog_open,
+                    &mut select_layer,
+                    &mut set_enabled,
+                    &mut update_layer,
+                    &mut move_layer,
+                    &mut duplicate_layer,
+                    &mut delete_layer,
+                    &mut preview_flag,
+                );
+            });
+        });
+
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    /// P8-4a: 単一 Full マスク layer 1 つ (有効状態)。
+    /// 退行検知: layer 行のチェックボックス / 「前」「後」ボタンの hit 領域 / カラム
+    /// レイアウトが崩れたら PNG 差分で気付く。
+    #[test]
+    fn local_adjust_panel_snapshot_one_full_layer() {
+        snapshot_panel_with_layers(
+            "local_adjust_panel_one_full_layer",
+            egui::vec2(280.0, 260.0),
+            vec![snapshot_layer(
+                "Layer 1",
+                local_adjust_core::LocalMask::Full,
+                local_adjust_core::LocalEffect::None,
+                true,
+            )],
+            0,
+            false,
+        );
+    }
+
+    /// P8-4b: 2 layers、2 番目を選択した状態。選択ハイライトの色 / 強調表示が
+    /// 切り替わっていることを符号化。
+    #[test]
+    fn local_adjust_panel_snapshot_two_layers_second_selected() {
+        snapshot_panel_with_layers(
+            "local_adjust_panel_two_layers_second_selected",
+            egui::vec2(280.0, 320.0),
+            vec![
+                snapshot_layer(
+                    "Layer 1",
+                    local_adjust_core::LocalMask::Full,
+                    local_adjust_core::LocalEffect::None,
+                    true,
+                ),
+                snapshot_layer(
+                    "Layer 2",
+                    local_adjust_core::LocalMask::Full,
+                    local_adjust_core::LocalEffect::None,
+                    true,
+                ),
+            ],
+            1,
+            false,
+        );
+    }
+
+    /// P8-4c: `preview_to_selected_layer` トグル ON 状態。「表示中: 1〜N / 総数」
+    /// のラベルが見えることを符号化 (= L キーで preview に入ったときの UI 退行検知)。
+    #[test]
+    fn local_adjust_panel_snapshot_preview_to_selected_layer_active() {
+        snapshot_panel_with_layers(
+            "local_adjust_panel_preview_to_selected_layer_active",
+            egui::vec2(280.0, 320.0),
+            vec![
+                snapshot_layer(
+                    "Layer 1",
+                    local_adjust_core::LocalMask::Full,
+                    local_adjust_core::LocalEffect::None,
+                    true,
+                ),
+                snapshot_layer(
+                    "Layer 2",
+                    local_adjust_core::LocalMask::Full,
+                    local_adjust_core::LocalEffect::None,
+                    true,
+                ),
+                snapshot_layer(
+                    "Layer 3",
+                    local_adjust_core::LocalMask::Full,
+                    local_adjust_core::LocalEffect::None,
+                    true,
+                ),
+            ],
+            1,
+            true,
+        );
+    }
+
+    /// P8-4d: 無効化された layer。チェックボックスが unchecked、行の見た目が
+    /// 通常 / 選択中とは違う薄い表現になることを符号化。
+    #[test]
+    fn local_adjust_panel_snapshot_layer_disabled() {
+        snapshot_panel_with_layers(
+            "local_adjust_panel_layer_disabled",
+            egui::vec2(280.0, 260.0),
+            vec![snapshot_layer(
+                "Layer 1",
+                local_adjust_core::LocalMask::Full,
+                local_adjust_core::LocalEffect::None,
+                false,
+            )],
+            0,
+            false,
+        );
+    }
 }
 
 fn effective_local_mask_edit_target(
