@@ -561,6 +561,19 @@ pub fn draw_archive_badge(painter: &egui::Painter, cell_rect: egui::Rect, label:
     );
 }
 
+/// 左下に描くコンテナバッジ (folder/zip/pdf/archive) の標準的な高さ。
+/// 各 `draw_*_badge` 関数と同じ `font_size = (cell.height * 0.10).clamp(9.0, 16.0)` +
+/// `pad_v = font_size * 0.2` の計算に追従し、`galley.size().y` を `font_size * 1.4` で
+/// 安全側に近似する (= painter を持たない呼び出し元から呼べるよう text metric を見ない)。
+///
+/// 用途: レーティング ★ バッジなど **左下に並ぶ別オーバーレイ** を、コンテナバッジに
+/// 重ねず縦に積むときの y オフセット計算。1 バッジぶん分の高さを取りたいときに使う。
+pub fn container_badge_height(cell_rect: egui::Rect) -> f32 {
+    let font_size = (cell_rect.height() * 0.10).clamp(9.0, 16.0);
+    let pad_v = font_size * 0.2;
+    font_size * 1.4 + pad_v * 2.0
+}
+
 /// フォルダサムネイルに表示するバッジ（左下、緑系、フォルダ名表示）。
 pub fn draw_folder_badge(painter: &egui::Painter, cell_rect: egui::Rect, folder_name: &str) {
     let font_size = (cell_rect.height() * 0.10).clamp(9.0, 16.0);

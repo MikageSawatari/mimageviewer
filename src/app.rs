@@ -27233,6 +27233,29 @@ fn draw_thumb(
 const BADGE_TEXT_TOP_PAD: f32 = 5.0;
 const BADGE_TEXT_BOTTOM_PAD: f32 = 1.0;
 
+/// `draw_cell` で **左下にコンテナバッジ** (フォルダ名 / "ZIP" / "PDF" / "7z" / "LZH")
+/// が描かれるかを判定する純関数。
+///
+/// 用途: レーティング ★ バッジを左下に出すとき、コンテナバッジと重ねず縦に積む必要が
+/// あるかを判定する (= ユーザー報告「フォルダ名と ★ が重なる」対策)。
+///
+/// 描画ロジックとの対応 (draw_cell 内):
+/// - `Folder`: `ThumbnailState::Loaded` のときだけ `draw_folder_badge` を呼ぶ。
+///   Pending / Evicted / Failed のときはセンターに 📁 アイコン + `draw_cell_filename`
+///   なので左下バッジは描かれない。
+/// - `ZipFile` / `PdfFile`: thumb の状態に関わらず常に badge_fn が呼ばれる
+///   (Loaded はサムネ + ラベル、Pending はアイコンプレースホルダ + ラベル)。
+/// - `ConvertibleArchive`: 常に `draw_archive_badge` が呼ばれる。
+/// - その他 (Image / Video / ZipImage / PdfPage / ZipSeparator): 左下にコンテナ
+///   バッジは描かない (= false)。
+pub(crate) fn cell_has_lower_left_container_badge(item: &GridItem, thumb: &ThumbnailState) -> bool {
+    match item {
+        GridItem::Folder(_) => matches!(thumb, ThumbnailState::Loaded { .. }),
+        GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::ConvertibleArchive { .. } => true,
+        _ => false,
+    }
+}
+
 pub(crate) fn draw_cell(
     ui: &egui::Ui,
     rect: egui::Rect,
@@ -27728,6 +27751,10 @@ pub(crate) fn draw_cell(
     // 画像系 (Image / ZipImage / PdfPage): 金色の ★
     // コンテナ系 (Folder / ZipFile / PdfFile): 銀青色の ★ + 先頭に 📁 アイコンを付与して
     //   「コンテナ自体への評価」であることを一目で区別できるようにする。
+    //
+    // コンテナ系で **左下バッジ** (folder 名 / "ZIP" / "PDF" / "7z" / "LZH") が既に
+    // 描かれている場合、★ をその上に積んで重なりを回避する (= ユーザー報告対応)。
+    // 判定は副作用ゼロの `cell_has_lower_left_container_badge` に集約。
     if rating >= 1 && rating <= 5 {
         let is_container = item.is_container_ratable();
         let star_color = if is_container {
@@ -27747,8 +27774,16 @@ pub(crate) fn draw_cell(
         let pad_x = 5.0;
         let bg_w = galley.size().x + pad_x * 2.0;
         let bg_h = galley.size().y + BADGE_TEXT_TOP_PAD + BADGE_TEXT_BOTTOM_PAD;
+        // コンテナ系で左下バッジが描かれていれば 1 段上に積む。画像系 (Image /
+        // ZipImage / PdfPage) や Folder の Pending 状態 (= ファイル名がセンター)
+        // などは 0 (= 従来位置)。
+        let star_y_lift = if cell_has_lower_left_container_badge(item, thumb) {
+            crate::ui_helpers::container_badge_height(rect) + 2.0
+        } else {
+            0.0
+        };
         let bg_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.min.x + 3.0, rect.max.y - bg_h - 3.0),
+            egui::pos2(rect.min.x + 3.0, rect.max.y - bg_h - 3.0 - star_y_lift),
             egui::vec2(bg_w, bg_h),
         );
         painter.rect_filled(

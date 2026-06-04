@@ -113,6 +113,98 @@ fn scan_directory_keeps_sources_when_upscaled_stem_is_ambiguous() {
     );
 }
 
+// ── cell_has_lower_left_container_badge ───────────────────────────────────
+//
+// レーティング ★ バッジを左下に出す際、コンテナバッジ (folder 名 / "ZIP" / "PDF" /
+// "7z" / "LZH") と重ねないために使う純関数。ユーザー報告「フォルダ名と ★ が重なる」
+// 退行ガード。
+
+#[test]
+fn lower_left_container_badge_yes_for_folder_when_loaded() {
+    use crate::grid_item::GridItem;
+    let dummy_tex = {
+        let ctx = egui::Context::default();
+        ctx.load_texture(
+            "dummy",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            Default::default(),
+        )
+    };
+    let folder = GridItem::Folder(PathBuf::from("c:/x"));
+    let loaded = ThumbnailState::Loaded {
+        tex: dummy_tex,
+        from_cache: false,
+        rendered_at_px: 128,
+        source_dims: None,
+    };
+    assert!(cell_has_lower_left_container_badge(&folder, &loaded));
+}
+
+#[test]
+fn lower_left_container_badge_no_for_folder_when_pending() {
+    use crate::grid_item::GridItem;
+    let folder = GridItem::Folder(PathBuf::from("c:/x"));
+    assert!(!cell_has_lower_left_container_badge(
+        &folder,
+        &ThumbnailState::Pending
+    ));
+    assert!(!cell_has_lower_left_container_badge(
+        &folder,
+        &ThumbnailState::Evicted
+    ));
+    assert!(!cell_has_lower_left_container_badge(
+        &folder,
+        &ThumbnailState::Failed
+    ));
+}
+
+#[test]
+fn lower_left_container_badge_always_yes_for_archive_types() {
+    use crate::grid_item::GridItem;
+    let zip = GridItem::ZipFile(PathBuf::from("c:/x.zip"));
+    let pdf = GridItem::PdfFile(PathBuf::from("c:/x.pdf"));
+    let arch = GridItem::ConvertibleArchive {
+        path: PathBuf::from("c:/x.7z"),
+        format: crate::archive_converter::ArchiveFormat::SevenZ,
+    };
+    // どの thumb 状態でも常に true (= 描画パスは Loaded/Pending/Evicted/Failed すべて
+    // 最後に badge_fn を呼ぶ)
+    for thumb in [
+        ThumbnailState::Pending,
+        ThumbnailState::Evicted,
+        ThumbnailState::Failed,
+    ] {
+        assert!(cell_has_lower_left_container_badge(&zip, &thumb));
+        assert!(cell_has_lower_left_container_badge(&pdf, &thumb));
+        assert!(cell_has_lower_left_container_badge(&arch, &thumb));
+    }
+}
+
+#[test]
+fn lower_left_container_badge_no_for_image_like_items() {
+    use crate::grid_item::GridItem;
+    let image = GridItem::Image(PathBuf::from("c:/x.jpg"));
+    let zip_image = GridItem::ZipImage {
+        zip_path: PathBuf::from("c:/x.zip"),
+        entry_name: "p1.jpg".to_string(),
+    };
+    let pdf_page = GridItem::PdfPage {
+        pdf_path: PathBuf::from("c:/x.pdf"),
+        page_num: 0,
+        content_type: None,
+    };
+    let video = GridItem::Video(PathBuf::from("c:/x.mp4"));
+    let sep = GridItem::ZipSeparator {
+        dir_display: "ch01".to_string(),
+    };
+    for item in [&image, &zip_image, &pdf_page, &video, &sep] {
+        assert!(!cell_has_lower_left_container_badge(
+            item,
+            &ThumbnailState::Pending
+        ));
+    }
+}
+
 #[test]
 fn fullscreen_prefetch_candidates_respect_visible_indices() {
     use crate::grid_item::GridItem;
