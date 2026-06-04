@@ -5246,6 +5246,10 @@ impl NativeEguiOverlay {
         let overlay_height_points = self.height as f32 / ppp;
         let position_secs = self.video_position_secs;
         let duration_secs = self.video_duration_secs;
+        // P10-2: now-playing バナー (現在再生中のチャプター/ブックマーク) は左パネル
+        // 表示中だけ出す。`jump_panel_visible()` は pointer hover で決まるため、
+        // closure 内で再計算するのではなく、ここで bool として取って move する。
+        let jump_panel_visible_for_banner = self.jump_panel_visible();
         let is_playing = self.video_is_playing;
         let volume = self.video_volume;
         let muted = self.video_muted;
@@ -5575,6 +5579,83 @@ impl NativeEguiOverlay {
             // `draw_native_normalize_progress` まで届かない (= スキャン中に HUD が
             // フェードアウトすると進捗 UI も消える)。bottom HUD だけを条件分岐し、
             // progress UI 描画は必ず実行する。
+            // 「現在再生中のチャプター/ブックマーク」バナー (= P10-2)。
+            // ジャンプパネル (= 左パネル) が表示されている間だけ、シークバー直上に
+            // 直近マーカーのタイトルを 1 行で出す。
+            //
+            // 「直近」= 現在再生位置の手前にある最後のマーカー (Chapter / Bookmark)。
+            // Pin は除外 (= フレームピンであって「再生中の区間」を表さないため)。
+            // 種別優先順位は無し: pts_secs が最大のものを採用 (= 直近の方を表示)。
+            // 詳細は `find_now_playing_marker` の doc を参照。
+            if bottom_hud_visible
+                && jump_panel_visible_for_banner
+                && let Some(now_marker) =
+                    crate::video::native_presenter::overlay_draw::find_now_playing_marker(
+                        &jump_entries,
+                        position_secs,
+                    )
+            {
+                let (kind_label, kind_color) = match now_marker.kind {
+                    NativeOverlayTimelineMarkerKind::Bookmark => {
+                        ("BM", egui::Color32::from_rgb(255, 220, 82))
+                    }
+                    NativeOverlayTimelineMarkerKind::Chapter => {
+                        ("CH", egui::Color32::from_rgb(115, 210, 255))
+                    }
+                    NativeOverlayTimelineMarkerKind::Pin => {
+                        // find_now_playing_marker が Pin を弾くのでここには来ない。
+                        // 防御的に PIN 色を使う。
+                        ("PIN", egui::Color32::from_rgb(140, 245, 170))
+                    }
+                };
+                let title_text = now_marker
+                    .title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| match now_marker.kind {
+                        NativeOverlayTimelineMarkerKind::Bookmark => "(無題)".to_string(),
+                        NativeOverlayTimelineMarkerKind::Chapter => "(無題)".to_string(),
+                        _ => "(無題)".to_string(),
+                    });
+                let banner_height = 26.0;
+                let banner_gap = 6.0;
+                let banner_y =
+                    (overlay_height_points - HUD_BOTTOM_HEIGHT - banner_height - banner_gap)
+                        .max(0.0);
+                // 左パネル幅の右端から 12pt 右、シークバー直上に配置。
+                // ユーザー案の図 (左パネル + 動画 + シークバー上にバナー) に合わせる。
+                let banner_x = native_jump_panel_width() + 12.0;
+                egui::Area::new(egui::Id::new("native_video_now_playing_banner"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(banner_x, banner_y))
+                    .interactable(false)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style())
+                            .fill(egui::Color32::from_rgba_premultiplied(0, 0, 0, 200))
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(4.0)
+                            .inner_margin(egui::Margin::symmetric(8, 4))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui.label(
+                                        egui::RichText::new(kind_label)
+                                            .size(11.0)
+                                            .strong()
+                                            .color(kind_color),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(title_text)
+                                            .size(13.0)
+                                            .color(egui::Color32::from_rgb(230, 230, 230)),
+                                    );
+                                });
+                            });
+                    });
+            }
+
             if bottom_hud_visible {
                 egui::Area::new(egui::Id::new("native_video_seek_hud"))
                     .order(egui::Order::Foreground)

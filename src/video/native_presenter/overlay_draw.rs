@@ -3148,6 +3148,37 @@ pub(super) fn timeline_markers_match(
             .all(|(a, b)| a.kind == b.kind && (a.pts_secs - b.pts_secs).abs() <= f64::EPSILON)
 }
 
+/// 現在再生位置の **直前にある最後のチャプター/ブックマーク** を返す。
+///
+/// 「現在再生中」の判定基準: `entry.pts_secs <= position_secs` を満たすマーカー群から
+/// `pts_secs` が最大のものを選ぶ (= ユーザーが「ここから先まで進んだ」最後のマーカー)。
+/// Pin は含めない (= ユーザーが付けたフレームピンであり「再生中の区間」を表さないため)。
+///
+/// 種別優先順位: 「(s) 直近の方を表示」を採用。Chapter / Bookmark の区別なく **pts_secs
+/// が最大** のものを返す (= 種別関係なく時間的に直前のマーカー)。
+///
+/// すべてのマーカーが現在位置より後 / 一覧が空 / 該当 kind が無い場合は None。
+pub(super) fn find_now_playing_marker(
+    entries: &[NativeOverlayJumpEntry],
+    position_secs: f64,
+) -> Option<&NativeOverlayJumpEntry> {
+    entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.kind,
+                NativeOverlayTimelineMarkerKind::Chapter
+                    | NativeOverlayTimelineMarkerKind::Bookmark
+            )
+        })
+        .filter(|entry| entry.pts_secs <= position_secs)
+        .max_by(|a, b| {
+            a.pts_secs
+                .partial_cmp(&b.pts_secs)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
 pub(super) fn jump_entries_match(
     a: &[NativeOverlayJumpEntry],
     b: &[NativeOverlayJumpEntry],
@@ -3922,6 +3953,107 @@ pub(super) fn layout_truncated_to_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Snapshot シナリオで使う `NativeOverlayJumpEntry` を最小フィールドだけで組み立てる。
+    /// thumbnail は None (= 表示しないテスト)、bookmark_id も None (= 任意)。
+    fn entry(
+        pts: f64,
+        kind: NativeOverlayTimelineMarkerKind,
+        title: &str,
+    ) -> NativeOverlayJumpEntry {
+        NativeOverlayJumpEntry {
+            pts_secs: pts,
+            kind,
+            title: Some(title.to_string()),
+            bookmark_id: None,
+            thumbnail: None,
+        }
+    }
+
+    /// 通常 case: チャプター/ブックマーク混在で、現在位置 30 秒の直前にあるのは
+    /// 25 秒の Chapter (= pts 最大)。
+    #[test]
+    fn find_now_playing_returns_latest_marker_before_position() {
+        let entries = vec![
+            entry(0.0, NativeOverlayTimelineMarkerKind::Chapter, "OP"),
+            entry(15.0, NativeOverlayTimelineMarkerKind::Bookmark, "サビ"),
+            entry(25.0, NativeOverlayTimelineMarkerKind::Chapter, "Aメロ"),
+            entry(60.0, NativeOverlayTimelineMarkerKind::Chapter, "Bメロ"),
+        ];
+        let now = find_now_playing_marker(&entries, 30.0).unwrap();
+        assert_eq!(now.pts_secs, 25.0);
+        assert_eq!(now.title.as_deref(), Some("Aメロ"));
+    }
+
+    /// 「(s) 直近の方を表示」: 種別を問わず pts_secs が最大のものが勝つ。
+    /// Bookmark (20.0) と Chapter (15.0) では Bookmark が選ばれる。
+    #[test]
+    fn find_now_playing_picks_closest_regardless_of_kind() {
+        let entries = vec![
+            entry(15.0, NativeOverlayTimelineMarkerKind::Chapter, "前章"),
+            entry(
+                20.0,
+                NativeOverlayTimelineMarkerKind::Bookmark,
+                "ハイライト",
+            ),
+        ];
+        let now = find_now_playing_marker(&entries, 25.0).unwrap();
+        assert_eq!(now.pts_secs, 20.0);
+        assert_eq!(now.title.as_deref(), Some("ハイライト"));
+    }
+
+    /// Pin は除外される (= 「再生中の区間」を表さないため)。
+    /// Pin (30.0) の方が新しくても、Chapter (10.0) が選ばれる。
+    #[test]
+    fn find_now_playing_excludes_pins() {
+        let entries = vec![
+            entry(10.0, NativeOverlayTimelineMarkerKind::Chapter, "OP"),
+            entry(30.0, NativeOverlayTimelineMarkerKind::Pin, "Pinned frame"),
+        ];
+        let now = find_now_playing_marker(&entries, 60.0).unwrap();
+        assert_eq!(now.pts_secs, 10.0);
+        assert_eq!(now.title.as_deref(), Some("OP"));
+    }
+
+    /// 全マーカーが現在位置より後 → None (= 表示しない)。
+    #[test]
+    fn find_now_playing_returns_none_when_all_markers_in_future() {
+        let entries = vec![
+            entry(60.0, NativeOverlayTimelineMarkerKind::Chapter, "Bメロ"),
+            entry(90.0, NativeOverlayTimelineMarkerKind::Chapter, "サビ"),
+        ];
+        assert!(find_now_playing_marker(&entries, 30.0).is_none());
+    }
+
+    /// 該当 kind 無し (= Pin のみ) → None。
+    #[test]
+    fn find_now_playing_returns_none_when_only_pins_exist() {
+        let entries = vec![
+            entry(5.0, NativeOverlayTimelineMarkerKind::Pin, "Pin 1"),
+            entry(15.0, NativeOverlayTimelineMarkerKind::Pin, "Pin 2"),
+        ];
+        assert!(find_now_playing_marker(&entries, 60.0).is_none());
+    }
+
+    /// 空 entries → None。
+    #[test]
+    fn find_now_playing_returns_none_for_empty_entries() {
+        let entries: Vec<NativeOverlayJumpEntry> = vec![];
+        assert!(find_now_playing_marker(&entries, 30.0).is_none());
+    }
+
+    /// 境界条件: pts_secs == position_secs はちょうど「直前」とみなして含める。
+    /// (= 「今、ここを通過したばかり」を反映)
+    #[test]
+    fn find_now_playing_includes_marker_at_exact_position() {
+        let entries = vec![entry(
+            30.0,
+            NativeOverlayTimelineMarkerKind::Chapter,
+            "ちょうど 30 秒",
+        )];
+        let now = find_now_playing_marker(&entries, 30.0).unwrap();
+        assert_eq!(now.pts_secs, 30.0);
+    }
 
     /// `layout_truncated_to_width` テスト用の painter を作る。egui Context を一度
     /// run して fonts を初期化し、background layer の painter を返す。実フォントは
