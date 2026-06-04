@@ -794,22 +794,51 @@ impl App {
     /// snapshot navigation のスライドショー版 (= ctx 不要、末尾で slideshow 停止)。
     ///
     /// `try_start_slideshow_next_folder` から呼ばれる。slideshow_playing を維持しつつ
-    /// 次の playable image entry へ。末尾なら slideshow 停止。
+    /// 次の **container entry** (= Folder/Zip/Pdf) を open する (= snapshot 内の次 folder
+    /// 巡回がメイン use case)。container 内で先頭画像から slideshow 再開する。
+    /// 末尾なら slideshow 停止して true 返す (= caller がループフォールバックしない)。
+    ///
+    /// 戻り値:
+    /// - true = 次 container open or 末尾停止のいずれかで処理完了 (= caller の loop fallback 抑止)
+    /// - false = snapshot inactive (= caller が通常 fallback)
     pub(crate) fn snapshot_advance_for_slideshow(&mut self, forward: bool) -> bool {
         if !self.is_snapshot_active() {
             return false;
         }
+        // 現在 folder の owner_entry idx を取得。snapshot_current_fullscreen_path は
+        // image path を返すので、その image が属する owner container を解決する。
+        // current_folder ベースで owner を引いた方が確実なので両方試みて優先順位を付ける。
         let current_owner = self
             .snapshot_current_fullscreen_path()
-            .and_then(|p| self.snapshot_owner_entry(&p));
-        let next = self.snapshot_next_playable_entry(current_owner, forward);
+            .and_then(|p| self.snapshot_owner_entry(&p))
+            .or_else(|| {
+                self.current_folder
+                    .clone()
+                    .and_then(|p| self.snapshot_owner_entry(&p))
+            });
+        // 次の container entry (= ★3 folder の次など) を探す
+        let next = self.snapshot_next_container_entry(current_owner, forward);
         if let Some(idx) = next {
-            self.snapshot_open_entry(idx, /*resume_slideshow=*/ true)
+            // 次 container を open + 中で先頭画像から slideshow 再開
+            // snapshot_open_entry は Folder kind の entry で snapshot_load_and_open を呼び、
+            // resume_slideshow=true なら最初の playable item で fullscreen + slideshow_playing
+            let _ = self.snapshot_open_entry(idx, /*resume_slideshow=*/ true);
+            true
         } else {
-            // 末尾: slideshow 停止
+            // 末尾: 次 container 無し → slideshow 停止
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
-            false
+            self.show_feedback_toast(
+                if forward {
+                    "★固定リスト末尾です (スライドショー停止)"
+                } else {
+                    "★固定リスト先頭です (スライドショー停止)"
+                }
+                .into(),
+            );
+            // true 返す: caller (= try_start_slideshow_next_folder) は false だと loop fallback
+            // するので、末尾検知は true 扱いで「処理完了」と通知する。
+            true
         }
     }
 
