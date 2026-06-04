@@ -163,7 +163,7 @@ impl App {
     ///    items / thumbnails / visible_indices / scroll_offset / selected を退避して
     ///    snapshot subset で置き換え
     pub(crate) fn activate_snapshot(&mut self, source_label: SnapshotSourceLabel) {
-        // Step 1: capture
+        // Step 1: capture (= visible_indices から SnapshotEntry を構築)。
         let captured_entries: Vec<SnapshotEntry> = self
             .visible_indices
             .iter()
@@ -231,6 +231,13 @@ impl App {
             std::mem::replace(&mut self.visible_indices, snapshot_visible_indices);
         let saved_scroll_offset_y = std::mem::replace(&mut self.scroll_offset_y, 0.0);
         let saved_selected = std::mem::replace(&mut self.selected, None);
+        // ★情報 / 回転 / タグ / EXIF 等の idx-based cache を全 clear する。
+        // items を入れ替えたので idx の意味が変わる (= 旧 idx → stars の対応が壊れ、
+        // 「★バッジが全部消える」「★一時解除中が発動しない」原因になる)。
+        // 既存の load_folder 経路 (= self.start_loading_items) と同様に invalidate する。
+        self.rating_cache.clear();
+        self.rotation_cache.clear();
+        self.tags_cache.clear();
 
         self.snapshot = Some(SnapshotState {
             items: captured_entries,
@@ -284,6 +291,10 @@ impl App {
             self.visible_indices = snap.saved_visible_indices;
             self.scroll_offset_y = snap.saved_scroll_offset_y;
             self.selected = snap.saved_selected;
+            // idx-based cache を invalidate (= items 入れ替え対応)
+            self.rating_cache.clear();
+            self.rotation_cache.clear();
+            self.tags_cache.clear();
         } else {
             // child folder の中で解除 → 現在の items はそのまま、snapshot state だけ捨てる
             // visible_indices は filter / current_folder に対して再構築
@@ -347,6 +358,10 @@ impl App {
         self.address = snap_origin.display().to_string();
         self.scroll_offset_y = 0.0;
         self.selected = None;
+        // idx-based cache を invalidate (= items 入れ替え対応)
+        self.rating_cache.clear();
+        self.rotation_cache.clear();
+        self.tags_cache.clear();
         self.show_feedback_toast("★固定リストに戻りました".into());
         true
     }
