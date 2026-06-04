@@ -5320,13 +5320,37 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// P5-6: `bump_adjustment_generation` は `final_ai_cache` を巻き込まず、
+    /// `final_composite_cache` だけ idx 単位で無効化する。
+    ///
+    /// ## 退行の根本原因 (2026-06 実害)
+    ///
+    /// 旧実装は `clear_final_pipeline_caches_for_idx(idx)` を呼んでいて、それが
+    /// `final_ai_cache.retain(|key| key.edit_key.idx != idx)` を実行 → idx の AI 結果を
+    /// 全削除していた。`open_fullscreen(idx)` がページ送りのたびに
+    /// `bump_adjustment_generation(idx)` を defensive に呼ぶ設計なので、prefetch で
+    /// 完了済みの AI 結果が次ページ表示の瞬間に消える事故が発生
+    /// (= 「先読みバーは出ているのに次画像で一瞬待たされる」)。
+    ///
+    /// 期待される挙動:
+    /// - `edit_result_cache`: 維持 (= source 解像度の編集結果は色補正と独立)
+    /// - `final_composite_cache`: idx 単位で削除 (= 色補正適用後の最終 composite は再構築)
+    /// - **`final_ai_cache`: 維持** (= key に AdjustParams を含むので新 params で自動 miss、
+    ///   旧 params の AI 結果は同じ params に戻したときの再利用に備えて保持)
+    /// - `final_ai_failed`: 維持 (= 同じ理由、key で自動区別)
     #[test]
-    fn adjustment_generation_keeps_edit_cache_and_clears_final_cache() {
+    fn adjustment_generation_keeps_edit_and_ai_cache_clears_only_final_composite() {
         let ctx = egui::Context::default();
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/pipeline-adjust.jpg");
         let (edit_key, final_key) =
             insert_edit_and_final_cache(&mut app, &ctx, idx, "adjust_change");
+
+        // insert_edit_and_final_cache が AI cache に 1 件入れている前提
+        assert!(
+            !app.final_ai_cache.is_empty(),
+            "fixture should pre-populate final_ai_cache"
+        );
 
         app.bump_adjustment_generation(idx);
 
@@ -5338,9 +5362,11 @@ mod pipeline_cache_refactor_tests {
             !app.final_composite_cache.contains_key(&final_key),
             "final composite depends on AdjustParams and must be rebuilt"
         );
+        // ⚠ 退行防止: AI cache は触らない。新 AdjustParams の key で自動 miss する。
         assert!(
-            app.final_ai_cache.is_empty(),
-            "AI-in-final cache for the page must be cleared with final composite"
+            !app.final_ai_cache.is_empty(),
+            "AI cache MUST survive bump_adjustment_generation (= preserves prefetched AI \
+             results from being killed every page advance via open_fullscreen)"
         );
     }
 

@@ -21218,13 +21218,34 @@ impl App {
     /// clear 粒度と整合させる (§3.6.2.2)。idx → source_key の解決に失敗するときは
     /// (= 構造アイテム等で対象外) 何もしない。
     pub(crate) fn bump_adjustment_generation(&mut self, idx: usize) {
+        // AdjustParams 変更時: **final_composite_cache だけ** 当該 idx で削除し、
+        // **final_ai_cache / final_ai_failed は触らない**。
+        //
+        // 理由:
+        // - `final_ai_cache` の key (`FinalAiKey`) は `color_ai_hash` (= AdjustParams を
+        //   含む) を持つので、AdjustParams が変われば新しい key で自動的に miss する。
+        //   その時点で新 worker が spawn されるので、明示削除は不要。
+        // - 旧 params 用の AI 結果は `evict_final_pipeline_cache` の keep_set 外 evict
+        //   経路で自然に掃除されるので、ここで強制 retain する必要なし。
+        // - 一方 `final_composite_cache` は AdjustParams を key 値に含んでも、idx ベースで
+        //   早期に捨てた方が後段 lookup ロジックが単純で済むので idx で retain。
+        //
+        // ⚠ Pipeline P1 リファクタの取りこぼし (2026-06 実害): 旧 `adjustment_cache` 用に
+        // 書かれていた `clear_final_pipeline_caches_for_idx(idx)` をそのまま呼ぶ実装に
+        // なっていた。これだと `open_fullscreen` が defensive に
+        // `bump_adjustment_generation(idx)` を呼ぶたび、隣接ページの prefetch_final_ai
+        // で完了した `final_ai_cache` エントリまで巻き込んで削除され、次ページ表示時に
+        // 毎回 AI を待たされる退行があった (= 「先読み進捗バーは出ているのに次画像で
+        // 一瞬アップスケール前が見えて、AI 処理から再表示」のユーザー報告)。
         let Some(key) = self.metadata_cache_key(idx) else {
-            self.clear_final_pipeline_caches_for_idx(idx);
+            self.final_composite_cache
+                .retain(|cache_key, _| cache_key.edit_key.idx != idx);
             return;
         };
         let slot = self.adjustment_generation.entry(key).or_insert(0);
         *slot = slot.saturating_add(1);
-        self.clear_final_pipeline_caches_for_idx(idx);
+        self.final_composite_cache
+            .retain(|cache_key, _| cache_key.edit_key.idx != idx);
     }
 
     /// `ai_upscale_generation` の全 entry を +1 する (saturating)。
