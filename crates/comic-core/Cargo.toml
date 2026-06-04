@@ -1,0 +1,23 @@
+[package]
+name = "comic-core"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[lib]
+name = "comic_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# Vertical text via OpenType features (docs/vertical-text-opentype-plan.md, 案B):
+# - rustybuzz: pure-Rust HarfBuzz port = the single font parser + shaper. Vertical
+#   runs are shaped with Direction::TopToBottom, so the font's `vert` feature (or
+#   the UAX#50 fallback) is applied automatically — correct vertical glyph forms
+#   (。、…ー brackets) + vertical metrics, no per-character workarounds. Its
+#   re-exported `ttf_parser` also provides glyph outlines.
+# - ab_glyph_rasterizer: the coverage engine `ab_glyph` uses internally. We feed
+#   it the ttf_parser outlines, so there is ONE font parser and AA quality matches
+#   the previous ab_glyph path. 袋文字 dilation / rotate_cw operate on the coverage.
+rustybuzz = "0.20.1"
+ab_glyph_rasterizer = "0.1.10"

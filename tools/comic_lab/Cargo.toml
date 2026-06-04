@@ -1,0 +1,23 @@
+[package]
+name = "comic_lab"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[dependencies]
+eframe = { version = "0.33", features = ["wgpu"] }
+egui = "0.33"
+image = { version = "0.25", features = ["jpeg", "png", "webp", "gif", "bmp"] }
+comic-core = { path = "../../crates/comic-core" }
+ab_glyph = "0.2"
+rfd = "0.15"
+base64 = "0.22"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Crisp SVG emoji stamps (docs/stamp-feature-design.md): render bundled emoji
+# SVGs to RGBA at the target size. Pure-Rust (usvg + tiny-skia).
+resvg = "0.45"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
