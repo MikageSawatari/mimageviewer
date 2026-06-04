@@ -257,6 +257,23 @@ fn draw_bubble_parts(
     // Unified body+tail contour: the tail spike is part of the same closed
     // outline as the body, so the fill and the stroke are seamless.
     let shape = effective_bubble_shape(bubble, fonts);
+
+    // Line-field effects (集中線 / 流線) render as many strokes radiating /
+    // streaking around a clear central ellipse — not as a filled polygon. Draw
+    // the lines once (on the stroke pass), then the centered text on top.
+    if matches!(
+        shape,
+        BubbleShape::MotionLines { .. } | BubbleShape::SpeedLines { .. }
+    ) {
+        if do_stroke {
+            draw_line_field(overlay, pivot, bubble, &shape);
+        }
+        if do_decotext {
+            bake_text(overlay, &bubble.text, pivot, fonts, true);
+        }
+        return;
+    }
+
     let geo = bubble_geometry(&shape, pivot, bubble.tail.as_ref());
     if do_fill {
         bubble_fill(overlay, bubble, &geo, opaque_fill);
@@ -268,6 +285,106 @@ fn draw_bubble_parts(
         bubble_decorations(overlay, bubble, pivot, &shape, &geo, fonts);
         // Embedded text, centered in the bubble body.
         bake_text(overlay, &bubble.text, pivot, fonts, true);
+    }
+}
+
+/// Tiny deterministic hash → f32 in [0,1) for line-field jitter (no `rand`).
+fn lf_hash(seed: u32, i: u32) -> f32 {
+    let mut x = seed
+        .wrapping_mul(0x9E37_79B9)
+        .wrapping_add(i.wrapping_mul(0x85EB_CA6B))
+        .wrapping_add(0x2754_5A57);
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352D);
+    x ^= x >> 15;
+    (x as f32) / (u32::MAX as f32)
+}
+
+/// Draw a 集中線/流線 line field. Uses the bubble's outline color + width as the
+/// line color + base thickness (defaulting to a visible width if unset).
+fn draw_line_field(
+    overlay: &mut RgbaOverlay,
+    pivot: (f32, f32),
+    bubble: &BubbleObject,
+    shape: &BubbleShape,
+) {
+    let color = bubble.outline.color;
+    let width = bubble.outline.width_px.max(1.5);
+    let clear = crate::tessellate::LINE_FIELD_CLEAR_RATIO;
+    match *shape {
+        BubbleShape::MotionLines {
+            rx,
+            ry,
+            count,
+            shape_seed,
+        } => {
+            let count = count.max(8);
+            let step = std::f32::consts::TAU / count as f32;
+            for i in 0..count {
+                // Even angular spacing + small jitter so it isn't mechanical.
+                let a = i as f32 * step + (lf_hash(shape_seed, i) - 0.5) * step * 0.7;
+                let (c, s) = (a.cos(), a.sin());
+                let inner = (pivot.0 + rx * clear * c, pivot.1 + ry * clear * s);
+                let outer = (pivot.0 + rx * c, pivot.1 + ry * s);
+                // Tapered streak: full width at the outer rim, a point at the
+                // clear-center edge.
+                let dx = outer.0 - inner.0;
+                let dy = outer.1 - inner.1;
+                let len = (dx * dx + dy * dy).sqrt().max(1e-3);
+                let (px, py) = (-dy / len, dx / len);
+                let hw = width * (0.5 + lf_hash(shape_seed, i + 9013) * 0.6);
+                let tri = [
+                    (outer.0 + px * hw, outer.1 + py * hw),
+                    (outer.0 - px * hw, outer.1 - py * hw),
+                    inner,
+                ];
+                fill_polygon(overlay, &tri, color);
+            }
+        }
+        BubbleShape::SpeedLines {
+            half_w,
+            half_h,
+            dir_rad,
+            count,
+            shape_seed,
+        } => {
+            let count = count.max(8);
+            let (dx, dy) = (dir_rad.cos(), dir_rad.sin()); // along-line dir
+            let (px, py) = (-dy, dx); // perpendicular (offset axis)
+            // Box half-extents projected onto each axis.
+            let along = (half_w * dx).abs() + (half_h * dy).abs();
+            let perp = (half_w * px).abs() + (half_h * py).abs();
+            let stroke = StrokeStyle {
+                color,
+                width_px: width,
+            };
+            for i in 0..count {
+                let f = if count == 1 {
+                    0.0
+                } else {
+                    i as f32 / (count - 1) as f32 * 2.0 - 1.0
+                };
+                let off = f * perp; // perpendicular offset of this line
+                let cx = pivot.0 + px * off;
+                let cy = pivot.1 + py * off;
+                // Where the line crosses the clear central ellipse (in the perp
+                // fraction): skip that middle segment so text stays clear.
+                let fr = (off.abs() / (perp * clear)).min(1.0);
+                let gap = if off.abs() < perp * clear {
+                    along * clear * (1.0 - fr * fr).max(0.0).sqrt()
+                } else {
+                    0.0
+                };
+                let jit = (lf_hash(shape_seed, i) - 0.5) * along * 0.06;
+                let a0 = (cx - dx * along, cy - dy * along);
+                let a1 = (cx - dx * (gap + jit.abs()), cy - dy * (gap + jit.abs()));
+                let b0 = (cx + dx * (gap + jit.abs()), cy + dy * (gap + jit.abs()));
+                let b1 = (cx + dx * along, cy + dy * along);
+                stroke_segment(overlay, a0, a1, &stroke);
+                stroke_segment(overlay, b0, b1, &stroke);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -334,6 +451,8 @@ fn bubble_decorations(
         BubbleShape::Heart { rx, ry } => rx.min(ry),
         BubbleShape::Arrow { half_w, half_h, .. } => half_w.min(half_h),
         BubbleShape::Soft { half_w, half_h, .. } => half_w.min(half_h),
+        BubbleShape::MotionLines { rx, ry, .. } => rx.min(ry),
+        BubbleShape::SpeedLines { half_w, half_h, .. } => half_w.min(half_h),
     };
     // Tail base point for `Tail` decoration placement. Spike tails use the
     // spliced base midpoint; thought tails have no spliced base (geo.tail is
@@ -428,6 +547,8 @@ fn object_local_aabb(obj: &AnnotationObject, fonts: &FontSet) -> Option<(f32, f3
                     BubbleShape::Heart { rx, ry } => rx.min(ry),
                     BubbleShape::Arrow { half_w, half_h, .. } => half_w.min(half_h),
                     BubbleShape::Soft { half_w, half_h, .. } => half_w.min(half_h),
+                    BubbleShape::MotionLines { rx, ry, .. } => rx.min(ry),
+                    BubbleShape::SpeedLines { half_w, half_h, .. } => half_w.min(half_h),
                 };
                 let tail_base = match (&geo.tail, &bubble.tail) {
                     (Some(t), _) => Some(((t[0].0 + t[1].0) * 0.5, (t[0].1 + t[1].1) * 0.5)),
@@ -1611,6 +1732,50 @@ mod tests {
         let ov = bake_overlay(&[obj], 64, 48, &fonts);
         let any_opaque = ov.pixels.chunks_exact(4).any(|p| p[3] > 0);
         assert!(any_opaque, "bubble fill should write some opaque pixels");
+    }
+
+    #[test]
+    fn line_field_shapes_bake_pixels_with_clear_center() {
+        let fonts = FontSet::new();
+        for shape in [
+            BubbleShape::MotionLines {
+                rx: 90.0,
+                ry: 70.0,
+                count: 48,
+                shape_seed: 1,
+            },
+            BubbleShape::SpeedLines {
+                half_w: 90.0,
+                half_h: 70.0,
+                dir_rad: 0.0,
+                count: 40,
+                shape_seed: 1,
+            },
+        ] {
+            let mut b = BubbleObject::default();
+            b.shape = shape;
+            b.fill = None;
+            b.outline = StrokeStyle {
+                color: Rgba::BLACK,
+                width_px: 3.0,
+            };
+            b.text = TextBlock::default();
+            let obj = AnnotationObject::new_bubble(1, (110.0, 110.0), b);
+            let ov = bake_overlay(&[obj], 220, 220, &fonts);
+            // Lines are drawn (opaque pixels exist).
+            assert!(
+                ov.pixels.chunks_exact(4).any(|p| p[3] > 0),
+                "line field should draw lines: {shape:?}"
+            );
+            // The clear central ellipse (≈55%) stays empty: the exact pivot pixel
+            // has no line through it.
+            let i = (110 * 220 + 110) * 4;
+            assert_eq!(
+                ov.pixels[i + 3],
+                0,
+                "line-field center must be clear: {shape:?}"
+            );
+        }
     }
 
     /// A solid `n×n` straight-alpha RGBA stamp image in `color`.

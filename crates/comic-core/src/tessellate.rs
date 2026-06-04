@@ -60,7 +60,27 @@ pub fn tessellate_bubble(shape: &BubbleShape, pivot: (f32, f32)) -> Vec<(f32, f3
             corner_px,
             shape_seed,
         } => soft(cx, cy, half_w, half_h, corner_px, shape_seed),
+        // Line-field effects: the outline is the OUTER ellipse (drives AABB,
+        // hit-test, tail). The radial/parallel lines themselves are drawn by the
+        // rasterizer (no fill/stroke of this ellipse). Text sits in the clear
+        // central ellipse (`LINE_FIELD_CLEAR_RATIO` of the outer extent).
+        BubbleShape::MotionLines { rx, ry, .. } => ellipse_pts(cx, cy, rx, ry),
+        BubbleShape::SpeedLines { half_w, half_h, .. } => ellipse_pts(cx, cy, half_w, half_h),
     }
+}
+
+/// The clear central ellipse of a line-field shape (集中線/流線), as a fraction
+/// of its outer extent. Text fits inside this; lines stop at its edge.
+pub const LINE_FIELD_CLEAR_RATIO: f32 = 0.55;
+
+/// Axis-aligned ellipse outline (ELLIPSE_SEGMENTS points).
+fn ellipse_pts(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<(f32, f32)> {
+    let mut pts = Vec::with_capacity(ELLIPSE_SEGMENTS);
+    for i in 0..ELLIPSE_SEGMENTS {
+        let t = (i as f32) / (ELLIPSE_SEGMENTS as f32) * std::f32::consts::TAU;
+        pts.push((cx + rx * t.cos(), cy + ry * t.sin()));
+    }
+    pts
 }
 
 /// Regular `sides`-gon inscribed in the rx/ry ellipse, oriented point-up.
@@ -250,6 +270,28 @@ pub fn fit_bubble_shape(
             half_w: hw,
             half_h: hh,
             corner_px: corner_px.min(hw.min(hh)),
+            shape_seed,
+        },
+        // Line fields: text must fit the CLEAR center (a fraction of the outer
+        // extent), so the outer ellipse is enlarged by 1/CLEAR_RATIO.
+        BubbleShape::MotionLines {
+            count, shape_seed, ..
+        } => BubbleShape::MotionLines {
+            rx: hw * SQRT2 / LINE_FIELD_CLEAR_RATIO,
+            ry: hh * SQRT2 / LINE_FIELD_CLEAR_RATIO,
+            count,
+            shape_seed,
+        },
+        BubbleShape::SpeedLines {
+            dir_rad,
+            count,
+            shape_seed,
+            ..
+        } => BubbleShape::SpeedLines {
+            half_w: hw * SQRT2 / LINE_FIELD_CLEAR_RATIO,
+            half_h: hh * SQRT2 / LINE_FIELD_CLEAR_RATIO,
+            dir_rad,
+            count,
             shape_seed,
         },
     }
@@ -474,6 +516,8 @@ fn shape_half_extents(shape: &BubbleShape) -> (f32, f32) {
         BubbleShape::Heart { rx, ry } => (rx, ry),
         BubbleShape::Arrow { half_w, half_h, .. } => (half_w, half_h),
         BubbleShape::Soft { half_w, half_h, .. } => (half_w, half_h),
+        BubbleShape::MotionLines { rx, ry, .. } => (rx, ry),
+        BubbleShape::SpeedLines { half_w, half_h, .. } => (half_w, half_h),
     }
 }
 

@@ -4007,6 +4007,65 @@ impl ComicLab {
                     }
                 });
             }
+            BubbleShape::MotionLines {
+                rx,
+                ry,
+                count,
+                shape_seed,
+            } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(rx, 40.0..=1000.0).text("外半径rx"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(ry, 40.0..=1000.0).text("外半径ry"))
+                        .changed();
+                }
+                edited |= ui
+                    .add(egui::Slider::new(count, 8..=200).text("線の本数"))
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label(format!("seed {shape_seed}"));
+                    if ui.button("再生成").clicked() {
+                        *shape_seed = shape_seed.wrapping_add(1);
+                        edited = true;
+                    }
+                });
+            }
+            BubbleShape::SpeedLines {
+                half_w,
+                half_h,
+                dir_rad,
+                count,
+                shape_seed,
+            } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 40.0..=1000.0).text("半幅"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 40.0..=1000.0).text("半高"))
+                        .changed();
+                }
+                edited |= ui
+                    .add(egui::Slider::new(count, 8..=200).text("線の本数"))
+                    .changed();
+                let mut deg = dir_rad.to_degrees();
+                if ui
+                    .add(egui::Slider::new(&mut deg, -180.0..=180.0).text("向き(度)"))
+                    .changed()
+                {
+                    *dir_rad = deg.to_radians();
+                    edited = true;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(format!("seed {shape_seed}"));
+                    if ui.button("再生成").clicked() {
+                        *shape_seed = shape_seed.wrapping_add(1);
+                        edited = true;
+                    }
+                });
+            }
         }
         if auto {
             ui.label(
@@ -4401,6 +4460,8 @@ impl ComicLab {
             BubbleShape::Heart { rx, ry } => (rx, ry),
             BubbleShape::Arrow { half_w, half_h, .. } => (half_w, half_h),
             BubbleShape::Soft { half_w, half_h, .. } => (half_w, half_h),
+            BubbleShape::MotionLines { rx, ry, .. } => (rx, ry),
+            BubbleShape::SpeedLines { half_w, half_h, .. } => (half_w, half_h),
         };
         let (sin, cos) = obj.rotation_rad.sin_cos();
         let p = obj.pivot;
@@ -4932,11 +4993,14 @@ fn set_bubble_half_extents(b: &mut BubbleObject, hw: f32, hh: f32) {
             *rx = hw;
             *ry = hh;
         }
-        BubbleShape::Polygon { rx, ry, .. } | BubbleShape::Heart { rx, ry } => {
+        BubbleShape::Polygon { rx, ry, .. }
+        | BubbleShape::Heart { rx, ry }
+        | BubbleShape::MotionLines { rx, ry, .. } => {
             *rx = hw;
             *ry = hh;
         }
-        BubbleShape::Diamond { half_w, half_h }
+        BubbleShape::SpeedLines { half_w, half_h, .. }
+        | BubbleShape::Diamond { half_w, half_h }
         | BubbleShape::Arrow { half_w, half_h, .. }
         | BubbleShape::Soft { half_w, half_h, .. } => {
             *half_w = hw;
@@ -5277,6 +5341,8 @@ enum BubblePreset {
     Diamond,
     Heart,
     Arrow,
+    MotionLines,
+    SpeedLines,
 }
 
 impl BubblePreset {
@@ -5294,6 +5360,8 @@ impl BubblePreset {
         BubblePreset::Diamond,
         BubblePreset::Heart,
         BubblePreset::Arrow,
+        BubblePreset::MotionLines,
+        BubblePreset::SpeedLines,
     ];
 
     fn label(self) -> &'static str {
@@ -5309,6 +5377,8 @@ impl BubblePreset {
             BubblePreset::Diamond => "ダイヤ",
             BubblePreset::Heart => "ハート",
             BubblePreset::Arrow => "矢印",
+            BubblePreset::MotionLines => "集中線",
+            BubblePreset::SpeedLines => "流線",
         }
     }
 
@@ -5326,6 +5396,8 @@ impl BubblePreset {
             BubblePreset::Diamond => "diamond",
             BubblePreset::Heart => "heart",
             BubblePreset::Arrow => "arrow",
+            BubblePreset::MotionLines => "motion-lines",
+            BubblePreset::SpeedLines => "speed-lines",
         }
     }
 
@@ -5385,12 +5457,26 @@ impl BubblePreset {
                 half_h: 110.0,
                 dir_rad: -std::f32::consts::FRAC_PI_2,
             },
+            BubblePreset::MotionLines => BubbleShape::MotionLines {
+                rx: 240.0,
+                ry: 180.0,
+                count: 72,
+                shape_seed: 0,
+            },
+            BubblePreset::SpeedLines => BubbleShape::SpeedLines {
+                half_w: 260.0,
+                half_h: 170.0,
+                dir_rad: 0.0,
+                count: 48,
+                shape_seed: 0,
+            },
         }
     }
 
     fn tail_kind(self) -> Option<TailKind> {
         match self {
-            BubblePreset::Narration => None, // ナレーション has no tail.
+            // No tail for narration or the line-field effects (集中線 / 流線).
+            BubblePreset::Narration | BubblePreset::MotionLines | BubblePreset::SpeedLines => None,
             BubblePreset::Thought => Some(TailKind::Thought),
             _ => Some(TailKind::Spike),
         }

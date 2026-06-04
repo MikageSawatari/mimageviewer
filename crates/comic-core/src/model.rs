@@ -285,6 +285,33 @@ pub enum BubbleShape {
         #[serde(default)]
         shape_seed: u32,
     },
+    /// 集中線 (concentration / motion lines): `count` tapered lines radiating from
+    /// a clear central ellipse outward to the rx/ry extent. Renders as a line
+    /// field (no fill/stroke); text sits in the clear center.
+    MotionLines {
+        rx: f32,
+        ry: f32,
+        #[serde(default = "lines_count")]
+        count: u32,
+        #[serde(default)]
+        shape_seed: u32,
+    },
+    /// 流線 (speed lines): `count` parallel tapered lines in `dir_rad`, across the
+    /// half_w/half_h extent, skipping a clear central ellipse for text.
+    SpeedLines {
+        half_w: f32,
+        half_h: f32,
+        #[serde(default)]
+        dir_rad: f32,
+        #[serde(default = "lines_count")]
+        count: u32,
+        #[serde(default)]
+        shape_seed: u32,
+    },
+}
+
+fn lines_count() -> u32 {
+    64
 }
 
 fn arrow_up() -> f32 {
