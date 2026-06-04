@@ -318,7 +318,7 @@ fn draw_line_field(
             count,
             shape_seed,
         } => {
-            let count = count.max(8);
+            let count = count.clamp(8, 1000);
             let step = std::f32::consts::TAU / count as f32;
             for i in 0..count {
                 // Even angular spacing + small jitter so it isn't mechanical.
@@ -348,15 +348,29 @@ fn draw_line_field(
             count,
             shape_seed,
         } => {
-            let count = count.max(8);
+            let count = count.clamp(8, 1000);
             let (dx, dy) = (dir_rad.cos(), dir_rad.sin()); // along-line dir
             let (px, py) = (-dy, dx); // perpendicular (offset axis)
-            // Box half-extents projected onto each axis.
-            let along = (half_w * dx).abs() + (half_h * dy).abs();
-            let perp = (half_w * px).abs() + (half_h * py).abs();
+            let (rx, ry) = (half_w.max(1.0), half_h.max(1.0));
+            // Support half-extent along the perpendicular: the max offset where a
+            // line still meets the outer ellipse. Lines are spread within ±this.
+            let perp_max = ((rx * px).powi(2) + (ry * py).powi(2)).sqrt();
             let stroke = StrokeStyle {
                 color,
                 width_px: width,
+            };
+            // Intersect the line {pivot + p*off + t*d} with an axis ellipse of
+            // half-extents (ex,ey); returns the two t roots (lo, hi) or None.
+            let cross = |off: f32, ex: f32, ey: f32| -> Option<(f32, f32)> {
+                let a = (dx / ex).powi(2) + (dy / ey).powi(2);
+                let cterm = (px * off / ex).powi(2) + (py * off / ey).powi(2) - 1.0;
+                let b = 2.0 * (dx * px * off / (ex * ex) + dy * py * off / (ey * ey));
+                let disc = b * b - 4.0 * a * cterm;
+                if disc <= 0.0 || a <= 0.0 {
+                    return None;
+                }
+                let sq = disc.sqrt();
+                Some(((-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)))
             };
             for i in 0..count {
                 let f = if count == 1 {
@@ -364,24 +378,23 @@ fn draw_line_field(
                 } else {
                     i as f32 / (count - 1) as f32 * 2.0 - 1.0
                 };
-                let off = f * perp; // perpendicular offset of this line
+                // Inset slightly so the extreme lines don't sit exactly on the rim.
+                let off = f * perp_max * 0.985;
                 let cx = pivot.0 + px * off;
                 let cy = pivot.1 + py * off;
-                // Where the line crosses the clear central ellipse (in the perp
-                // fraction): skip that middle segment so text stays clear.
-                let fr = (off.abs() / (perp * clear)).min(1.0);
-                let gap = if off.abs() < perp * clear {
-                    along * clear * (1.0 - fr * fr).max(0.0).sqrt()
-                } else {
-                    0.0
+                let Some((t_lo, t_hi)) = cross(off, rx, ry) else {
+                    continue; // line misses the outer ellipse
                 };
-                let jit = (lf_hash(shape_seed, i) - 0.5) * along * 0.06;
-                let a0 = (cx - dx * along, cy - dy * along);
-                let a1 = (cx - dx * (gap + jit.abs()), cy - dy * (gap + jit.abs()));
-                let b0 = (cx + dx * (gap + jit.abs()), cy + dy * (gap + jit.abs()));
-                let b1 = (cx + dx * along, cy + dy * along);
-                stroke_segment(overlay, a0, a1, &stroke);
-                stroke_segment(overlay, b0, b1, &stroke);
+                let at = |t: f32| (cx + dx * t, cy + dy * t);
+                match cross(off, rx * clear, ry * clear) {
+                    // Crosses the clear center: draw the two outer segments only.
+                    Some((c_lo, c_hi)) => {
+                        stroke_segment(overlay, at(t_lo), at(c_lo), &stroke);
+                        stroke_segment(overlay, at(c_hi), at(t_hi), &stroke);
+                    }
+                    // Outside the clear center: one full chord.
+                    None => stroke_segment(overlay, at(t_lo), at(t_hi), &stroke),
+                }
             }
         }
         _ => {}
@@ -1775,6 +1788,46 @@ mod tests {
                 0,
                 "line-field center must be clear: {shape:?}"
             );
+        }
+    }
+
+    #[test]
+    fn speed_lines_stay_within_outer_ellipse_diagonal() {
+        // Regression (Codex P1): a diagonal 流線 must not escape the outer ellipse
+        // (= the AABB / hit-test / rotated-bake bound). Every opaque pixel must lie
+        // within the outer ellipse + a small margin for line width.
+        let fonts = FontSet::new();
+        let (cx, cy) = (130.0f32, 130.0f32);
+        let (hw, hh) = (100.0f32, 70.0f32);
+        let mut b = BubbleObject::default();
+        b.shape = BubbleShape::SpeedLines {
+            half_w: hw,
+            half_h: hh,
+            dir_rad: std::f32::consts::FRAC_PI_4, // 45° diagonal
+            count: 60,
+            shape_seed: 7,
+        };
+        b.fill = None;
+        b.outline = StrokeStyle {
+            color: Rgba::BLACK,
+            width_px: 3.0,
+        };
+        b.text = TextBlock::default();
+        let obj = AnnotationObject::new_bubble(1, (cx, cy), b);
+        let ov = bake_overlay(&[obj], 260, 260, &fonts);
+        let m = 6.0; // line half-width + AA slack
+        for y in 0..ov.h {
+            for x in 0..ov.w {
+                if ov.pixels[(y * ov.w + x) * 4 + 3] == 0 {
+                    continue;
+                }
+                let nx = (x as f32 - cx) / (hw + m);
+                let ny = (y as f32 - cy) / (hh + m);
+                assert!(
+                    nx * nx + ny * ny <= 1.05,
+                    "speed line escaped outer ellipse at ({x},{y})"
+                );
+            }
         }
     }
 

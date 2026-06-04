@@ -85,7 +85,7 @@ fn ellipse_pts(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<(f32, f32)> {
 
 /// Regular `sides`-gon inscribed in the rx/ry ellipse, oriented point-up.
 fn polygon(cx: f32, cy: f32, rx: f32, ry: f32, sides: u32) -> Vec<(f32, f32)> {
-    let n = sides.max(3);
+    let n = sides.clamp(3, 256);
     let mut pts = Vec::with_capacity(n as usize);
     let start = -std::f32::consts::FRAC_PI_2; // a vertex at the top
     for i in 0..n {
@@ -104,8 +104,9 @@ fn heart(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<(f32, f32)> {
         let t = (i as f32) / (SEG as f32) * std::f32::consts::TAU;
         let x = 16.0 * t.sin().powi(3);
         let y = 13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos() - (4.0 * t).cos();
-        // Normalize: x in ±16, y in ~[-17, 12]. Center y and flip for screen.
-        pts.push((cx + rx * (x / 16.0), cy - ry * (y / 15.0)));
+        // Normalize: x in ±16, y in ~[-17, 12]. /17 keeps the bottom tip within ry
+        // (so shape_half_extents / handles match the outline). Flip y for screen.
+        pts.push((cx + rx * (x / 16.0), cy - ry * (y / 17.0)));
     }
     pts
 }
@@ -237,30 +238,44 @@ pub fn fit_bubble_shape(
                 shape_seed,
             }
         }
-        // Polygon inscribed in the ellipse: its inradius is smaller than the
-        // ellipse, so size generously (2x) to keep the text rect inside.
-        BubbleShape::Polygon { sides, .. } => BubbleShape::Polygon {
-            rx: hw * 2.0,
-            ry: hh * 2.0,
-            sides,
-        },
+        // Polygon: the inradius (flat-side distance) is `rx*cos(pi/sides)`, which
+        // shrinks for low side counts (a triangle is much narrower than its
+        // circumradius). Size against the inradius so the text rect fits even for
+        // few sides; `√2` covers the rect corners.
+        BubbleShape::Polygon { sides, .. } => {
+            let inr = (std::f32::consts::PI / sides.clamp(3, 256) as f32)
+                .cos()
+                .max(0.4);
+            BubbleShape::Polygon {
+                rx: hw * SQRT2 / inr,
+                ry: hh * SQRT2 / inr,
+                sides,
+            }
+        }
         // Rhombus: the inscribed axis-aligned rect (a,b) fits when a/hw+b/hh<=1,
         // so doubling the half-extents leaves the text rect well inside.
         BubbleShape::Diamond { .. } => BubbleShape::Diamond {
             half_w: hw * 2.0,
             half_h: hh * 2.0,
         },
-        // Heart: text sits in the broad upper-center; size generously.
+        // Heart: centered text must clear the top notch and the side dips; size
+        // generously (esp. vertically, since the notch eats the upper-center).
         BubbleShape::Heart { .. } => BubbleShape::Heart {
-            rx: hw * 1.7,
-            ry: hh * 1.9,
+            rx: hw * 1.9,
+            ry: hh * 2.3,
         },
-        // Arrow: text in the shaft/head body; size generously, keep direction.
-        BubbleShape::Arrow { dir_rad, .. } => BubbleShape::Arrow {
-            half_w: hw * 1.6,
-            half_h: hh * 1.6,
-            dir_rad,
-        },
+        // Arrow: the text must fit the shaft (cross half-thickness = 0.45*half_h),
+        // and the arrow can point any direction, so size both axes from the larger
+        // text half-extent: 0.45*2.6*d = 1.17*d >= d covers the cross; 2.0*d covers
+        // the length.
+        BubbleShape::Arrow { dir_rad, .. } => {
+            let d = hw.max(hh);
+            BubbleShape::Arrow {
+                half_w: d * 2.0,
+                half_h: d * 2.6,
+                dir_rad,
+            }
+        }
         // Soft: like a rounded rect (the wave is small); keep corner + seed.
         BubbleShape::Soft {
             corner_px,
