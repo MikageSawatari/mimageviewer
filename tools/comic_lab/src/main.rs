@@ -307,6 +307,10 @@ struct ComicLab {
     baked_dirty: bool,
     /// egui time (s) of the last bake, for drag throttling.
     last_bake_time: f64,
+    /// Wall-clock duration (s) of the last bake. During a drag the re-bake
+    /// interval adapts to this so a heavy scene (large/rotated stamps on a big
+    /// image) doesn't saturate the UI thread with back-to-back full-res bakes.
+    last_bake_dur: f64,
 
     fonts: FontSet,
     /// (key, display label) for the font picker. The key IS the display name for
@@ -506,6 +510,7 @@ impl ComicLab {
             baked_texture: None,
             baked_dirty: true,
             last_bake_time: 0.0,
+            last_bake_dur: 0.0,
             fonts,
             available_fonts,
             font_paths,
@@ -2653,29 +2658,41 @@ impl ComicLab {
                 1.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
+        // Responsive: clamp the dialog width to the viewport so the fixed-width
+        // thumbnail grid wraps onto multiple rows instead of running off the right
+        // edge (the preset list has grown well past one row).
+        let avail = ctx.content_rect();
+        let dialog_w = (avail.width() - 24.0).clamp(120.0, 520.0);
         egui::Window::new("吹き出しを追加")
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
-            .default_pos(ctx.content_rect().center() - egui::vec2(220.0, 170.0))
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(avail.center())
             .collapsible(false)
             .resizable(false)
-            .default_width(440.0)
+            .max_width(dialog_w)
             .open(&mut open)
             .show(ctx, |ui| {
+                ui.set_max_width(dialog_w);
                 ui.label(
                     egui::RichText::new("形を選んでください。クリックで追加します。")
                         .size(11.0)
                         .color(Color32::from_gray(180)),
                 );
                 ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
-                    for &preset in BubblePreset::ALL {
-                        if draw_preset_thumbnail(ui, preset) {
-                            chosen = Some(preset);
-                        }
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .max_height((avail.height() - 160.0).clamp(160.0, 460.0))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+                            for &preset in BubblePreset::ALL {
+                                if draw_preset_thumbnail(ui, preset) {
+                                    chosen = Some(preset);
+                                }
+                            }
+                        });
+                    });
             });
 
         self.show_add_dialog = open;
@@ -4490,10 +4507,16 @@ impl ComicLab {
             // don't allocate + upload a full-resolution texture every frame.
             let now = ctx.input(|i| i.time);
             let dragging = self.drag != DragKind::None;
-            // Re-bake at ~30fps during a drag (CPU bake is cheap now that the font
-            // face is cached; this throttle only bounds full-res texture uploads).
-            if self.baked_dirty && (!dragging || now - self.last_bake_time >= 0.03) {
+            // During a drag, adapt the re-bake interval to the last bake's cost so
+            // a heavy scene (large/rotated stamps on a big image, where a single
+            // full-res bake can take 100ms+) doesn't saturate the UI thread with
+            // back-to-back bakes. Cheap scenes still re-bake at ~30fps; expensive
+            // ones back off to keep the handles/cursor responsive between bakes.
+            let min_interval = (self.last_bake_dur * 1.5).clamp(0.03, 0.25);
+            if self.baked_dirty && (!dragging || now - self.last_bake_time >= min_interval) {
+                let t0 = std::time::Instant::now();
                 self.rebake(ctx);
+                self.last_bake_dur = t0.elapsed().as_secs_f64();
                 self.last_bake_time = now;
             }
             if let Some(tex) = &self.baked_texture {
@@ -5361,6 +5384,84 @@ fn paint_bubble_preview(painter: &egui::Painter, area: Rect, preset: BubblePrese
         return;
     }
 
+    // 集中線 / 流線: line fields aren't a filled polygon — draw the lines around a
+    // clear center (light, so they show on the dark thumbnail). Matches the bake.
+    const CLEAR: f32 = 0.55; // comic_core::LINE_FIELD_CLEAR_RATIO
+    let line_col = Color32::from_gray(210);
+    if matches!(shape, BubbleShape::MotionLines { .. }) {
+        let (cx, cy) = (area.center().x, area.center().y);
+        let (rx, ry) = (area.width() * 0.46, area.height() * 0.46);
+        let n = 22;
+        for i in 0..n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            let (c, s) = (a.cos(), a.sin());
+            painter.line_segment(
+                [
+                    egui::pos2(cx + rx * CLEAR * c, cy + ry * CLEAR * s),
+                    egui::pos2(cx + rx * c, cy + ry * s),
+                ],
+                egui::Stroke::new(1.4, line_col),
+            );
+        }
+        return;
+    }
+    if matches!(shape, BubbleShape::SpeedLines { .. }) {
+        // Horizontal parallel streaks (preset dir is 0) skipping a clear center.
+        let (cx, cy) = (area.center().x, area.center().y);
+        let (rx, ry) = (area.width() * 0.47, area.height() * 0.44);
+        let n = 9;
+        for i in 0..n {
+            let f = i as f32 / (n as f32 - 1.0) * 2.0 - 1.0; // -1..1
+            let yoff = f * ry;
+            let outer_k = 1.0 - (yoff / ry).powi(2);
+            if outer_k <= 0.0 {
+                continue;
+            }
+            let half = rx * outer_k.sqrt();
+            let y = cy + yoff;
+            // Clear-ellipse half-width at this y (0 outside the clear band).
+            let clear_k = (CLEAR * CLEAR) - (yoff / ry).powi(2);
+            let gap = if clear_k > 0.0 {
+                rx * clear_k.sqrt()
+            } else {
+                0.0
+            };
+            if gap > 0.0 {
+                painter.line_segment(
+                    [egui::pos2(cx - half, y), egui::pos2(cx - gap, y)],
+                    egui::Stroke::new(1.4, line_col),
+                );
+                painter.line_segment(
+                    [egui::pos2(cx + gap, y), egui::pos2(cx + half, y)],
+                    egui::Stroke::new(1.4, line_col),
+                );
+            } else {
+                painter.line_segment(
+                    [egui::pos2(cx - half, y), egui::pos2(cx + half, y)],
+                    egui::Stroke::new(1.4, line_col),
+                );
+            }
+        }
+        return;
+    }
+    // 意識: a soft, fuzzy ellipse — translucent fill + a faint thin rim (hint at
+    // the feathered edge instead of the hard outline the generic path would draw).
+    if let BubbleShape::Concentration { .. } = shape {
+        let c = area.center();
+        let r = egui::vec2(area.width() * 0.44, area.height() * 0.44);
+        painter.add(egui::Shape::ellipse_filled(
+            c,
+            r,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+        ));
+        painter.add(egui::Shape::ellipse_stroke(
+            c,
+            r,
+            egui::Stroke::new(1.2, Color32::from_gray(180)),
+        ));
+        return;
+    }
+
     // A small tail pointing down-left, only for presets that have one.
     let tail = preset.tail_kind().map(|kind| Tail {
         tip: (-70.0, 200.0),
@@ -5671,15 +5772,30 @@ impl BubblePreset {
     fn tail_kind(self) -> Option<TailKind> {
         match self {
             // No tail for narration, the line-field effects (集中線 / 流線),
-            // 意識 (fuzzy, edgeless), or なし (text-only).
+            // 意識 (fuzzy, edgeless), なし (text-only), or 矢印 (already a pointer —
+            // a spike tail on top is redundant and looks broken once auto-sized).
             BubblePreset::Narration
             | BubblePreset::MotionLines
             | BubblePreset::SpeedLines
             | BubblePreset::Concentration
-            | BubblePreset::TextOnly => None,
+            | BubblePreset::TextOnly
+            | BubblePreset::Arrow => None,
             // Thought-style tails (もくもく cloud + clean 楕円 thought).
             BubblePreset::Thought | BubblePreset::MindEllipse => Some(TailKind::Thought),
             _ => Some(TailKind::Spike),
+        }
+    }
+
+    /// Default 袋文字 (text outline) for this preset. Line-field effects have no
+    /// fill behind the text, so a white halo keeps the black text readable against
+    /// the lines + the underlying image.
+    fn text_outline(self) -> Option<StrokeStyle> {
+        match self {
+            BubblePreset::MotionLines | BubblePreset::SpeedLines => Some(StrokeStyle {
+                color: Rgba::WHITE,
+                width_px: 6.0,
+            }),
+            _ => None,
         }
     }
 
@@ -5727,6 +5843,7 @@ impl BubblePreset {
                 align: self.text_align(),
                 orientation: Orientation::Vertical,
                 markup_enabled: true,
+                outline: self.text_outline(),
                 ..TextBlock::default()
             },
             auto_size: true,
