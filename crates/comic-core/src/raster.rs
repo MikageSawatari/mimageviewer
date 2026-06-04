@@ -282,14 +282,13 @@ fn draw_bubble_parts(
         return;
     }
 
-    // 意識 (concentration): a fuzzy feathered ellipse. The whole look (feathered
-    // fill + soft rim ring) is drawn once on the fill pass, so a merge group's
-    // separate stroke pass won't double the ring.
+    // 意識 (concentration): a fuzzy feathered ellipse. Rendered once, on the
+    // decotext pass — a merge group runs do_fill TWICE (fill + opaque-erase), so
+    // gating on do_fill would double-composite the feather and darken it; the
+    // decotext pass runs exactly once in both the single and merge paths.
     if let BubbleShape::Concentration { rx, ry, shape_seed } = shape {
-        if do_fill {
-            draw_concentration(overlay, pivot, bubble, rx, ry, shape_seed, opaque_fill);
-        }
         if do_decotext {
+            draw_concentration(overlay, pivot, bubble, rx, ry, shape_seed, opaque_fill);
             let geo = bubble_geometry(&shape, pivot, bubble.tail.as_ref());
             bubble_decorations(overlay, bubble, pivot, &shape, &geo, fonts);
             bake_text(overlay, &bubble.text, pivot, fonts, true);
@@ -307,29 +306,31 @@ fn draw_bubble_parts(
             BubbleShape::Strokes { shape_seed, .. } => {
                 draw_sketch_outline(overlay, pivot, &geo, &bubble.outline, shape_seed);
             }
-            // 二重線: the clean outer line (incl. spliced tail) + a body-only inner
-            // ring `gap` inside.
-            BubbleShape::DoubleStroke {
-                half_w,
-                half_h,
-                corner_px,
-                gap_px,
-            } => {
-                bubble_stroke(overlay, bubble, &geo);
-                if bubble.outline.width_px > 0.0 {
-                    let g = gap_px.max(1.0);
-                    let inner = BubbleShape::RoundRect {
-                        half_w: (half_w - g).max(1.0),
-                        half_h: (half_h - g).max(1.0),
-                        corner_px: (corner_px - g).max(0.0),
-                    };
-                    stroke_polygon(overlay, &tessellate_bubble(&inner, pivot), &bubble.outline);
-                }
-            }
+            // 二重線: the clean OUTER line (incl. spliced tail) here; the inner ring
+            // is drawn on the decotext pass so a merge group's interior-erase fill
+            // (pass 3) can't wipe it.
             _ => bubble_stroke(overlay, bubble, &geo),
         }
     }
     if do_decotext {
+        // 二重線: inner concentric ring, after any merge erase-fill pass.
+        if let BubbleShape::DoubleStroke {
+            half_w,
+            half_h,
+            corner_px,
+            gap_px,
+        } = shape
+        {
+            if bubble.outline.width_px > 0.0 {
+                let g = gap_px.max(1.0);
+                let inner = BubbleShape::RoundRect {
+                    half_w: (half_w - g).max(1.0),
+                    half_h: (half_h - g).max(1.0),
+                    corner_px: (corner_px - g).max(0.0),
+                };
+                stroke_polygon(overlay, &tessellate_bubble(&inner, pivot), &bubble.outline);
+            }
+        }
         bubble_decorations(overlay, bubble, pivot, &shape, &geo, fonts);
         // Embedded text, centered in the bubble body.
         bake_text(overlay, &bubble.text, pivot, fonts, true);
@@ -364,10 +365,12 @@ fn draw_concentration(
     };
     let ring = bubble.outline;
     let ring_on = ring.width_px > 0.0 && ring.color.a > 0;
-    let x0 = (cx - rx).floor() as i32;
-    let x1 = (cx + rx).ceil() as i32;
-    let y0 = (cy - ry).floor() as i32;
-    let y1 = (cy + ry).ceil() as i32;
+    // Clamp the scan box to the overlay so a huge / off-canvas ellipse (corrupt
+    // sidecar or extreme auto-size) doesn't iterate millions of off-screen pixels.
+    let x0 = ((cx - rx).floor() as i32).max(0);
+    let x1 = ((cx + rx).ceil() as i32).min(overlay.w as i32 - 1);
+    let y0 = ((cy - ry).floor() as i32).max(0);
+    let y1 = ((cy + ry).ceil() as i32).min(overlay.h as i32 - 1);
     for y in y0..=y1 {
         for x in x0..=x1 {
             let nx = (x as f32 + 0.5 - cx) / rx;
@@ -380,7 +383,10 @@ fn draw_concentration(
             // Rim wobble: the fade endpoint, kept strictly inside the ellipse.
             let wob = 0.05 * (3.0 * ang + ph1).sin() + 0.03 * (7.0 * ang + ph2).sin();
             let rim = (1.0 + wob).clamp(0.6, 0.99);
-            // Feathered fill: opaque to `inner`, fading to 0 at `rim`.
+            // Feathered fill: opaque to `inner`, fading to 0 at `rim`. `blend_px`
+            // multiplies in the color's own alpha, so pass only the coverage here
+            // (do NOT pre-multiply by fc.a — that would double-apply the alpha).
+            // For a merge erase pass, force the color opaque so it actually erases.
             if let Some(fc) = fill {
                 let cov = if d <= inner {
                     1.0
@@ -388,16 +394,22 @@ fn draw_concentration(
                     ((rim - d) / (rim - inner).max(1e-3)).clamp(0.0, 1.0)
                 };
                 if cov > 0.0 {
-                    overlay.blend_px(x, y, fc, fill_a_base * cov * (fc.a as f32 / 255.0));
+                    let col = if opaque_fill {
+                        Rgba { a: 255, ..fc }
+                    } else {
+                        fc
+                    };
+                    overlay.blend_px(x, y, col, fill_a_base * cov);
                 }
             }
-            // Soft ring just inside the rim (a fuzzy "edge").
+            // Soft ring just inside the rim (a fuzzy "edge"). `blend_px` applies
+            // ring.color.a, so pass only the band coverage.
             if ring_on {
                 let ring_c = rim * 0.93;
                 let half_band = 0.10;
                 let band = (1.0 - (d - ring_c).abs() / half_band).clamp(0.0, 1.0);
                 if band > 0.0 {
-                    overlay.blend_px(x, y, ring.color, band * (ring.color.a as f32 / 255.0));
+                    overlay.blend_px(x, y, ring.color, band);
                 }
             }
         }
@@ -698,7 +710,13 @@ fn object_local_aabb(obj: &AnnotationObject, fonts: &FontSet) -> Option<(f32, f3
     match &obj.kind {
         AnnotationKind::Bubble(bubble) => {
             let shape = effective_bubble_shape(bubble, fonts);
-            let geo = bubble_geometry(&shape, obj.pivot, bubble.tail.as_ref());
+            // Tailless shapes (line fields / 意識 / なし) draw no tail, so don't let
+            // a stale tail splice into the contour or inflate the AABB.
+            let tail = bubble
+                .tail
+                .as_ref()
+                .filter(|_| crate::tessellate::shape_renders_tail(&shape));
+            let geo = bubble_geometry(&shape, obj.pivot, tail);
             for &(x, y) in &geo.outline {
                 acc(x, y);
             }
@@ -706,7 +724,7 @@ fn object_local_aabb(obj: &AnnotationObject, fonts: &FontSet) -> Option<(f32, f3
                 acc(cx - r, cy - r);
                 acc(cx + r, cy + r);
             }
-            if let Some(t) = &bubble.tail {
+            if let Some(t) = tail {
                 acc(t.tip.0, t.tip.1);
             }
             // Decoration extents.
@@ -2056,6 +2074,73 @@ mod tests {
         assert!(
             near_rim < center,
             "rim ({near_rim}) should be softer than center ({center})"
+        );
+    }
+
+    #[test]
+    fn tailless_shape_does_not_render_a_set_tail() {
+        // A Concentration with a far-away tail must NOT draw the tail (the shape is
+        // edgeless); pixels near the tail tip stay clear.
+        let fonts = FontSet::new();
+        let mut b = BubbleObject::default();
+        b.shape = BubbleShape::Concentration {
+            rx: 50.0,
+            ry: 40.0,
+            shape_seed: 1,
+        };
+        b.fill = Some(Rgba::WHITE);
+        b.outline = StrokeStyle {
+            color: Rgba::BLACK,
+            width_px: 3.0,
+        };
+        b.auto_size = false;
+        b.text = TextBlock::default();
+        b.tail = Some(crate::model::Tail {
+            tip: (100.0, 230.0), // far below the ellipse
+            base_t: 0.25,
+            base_auto: true,
+            width_px: 40.0,
+            kind: crate::model::TailKind::Spike,
+        });
+        let obj = AnnotationObject::new_bubble(1, (100.0, 100.0), b);
+        let ov = bake_overlay(&[obj], 200, 260, &fonts);
+        // The whole lower region toward the tail tip must be clear (no tail spike).
+        for y in 160..260 {
+            for x in 0..200 {
+                assert_eq!(
+                    ov.pixels[(y * 200 + x) * 4 + 3],
+                    0,
+                    "tailless shape drew a tail at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concentration_translucent_fill_respects_alpha() {
+        // Regression (Codex P2): the fill alpha must not be double-applied. A
+        // half-alpha fill should yield a center alpha near 128, not ~64.
+        let fonts = FontSet::new();
+        let mut b = BubbleObject::default();
+        b.shape = BubbleShape::Concentration {
+            rx: 60.0,
+            ry: 50.0,
+            shape_seed: 0,
+        };
+        b.fill = Some(Rgba::new(255, 255, 255, 128));
+        b.outline = StrokeStyle {
+            color: Rgba::BLACK,
+            width_px: 0.0, // no ring, isolate the fill
+        };
+        b.fill_opacity = 1.0;
+        b.auto_size = false;
+        b.text = TextBlock::default();
+        let obj = AnnotationObject::new_bubble(1, (90.0, 80.0), b);
+        let ov = bake_overlay(&[obj], 180, 160, &fonts);
+        let center = ov.pixels[(80 * 180 + 90) * 4 + 3];
+        assert!(
+            (110..=140).contains(&center),
+            "half-alpha fill center should be ~128, got {center}"
         );
     }
 

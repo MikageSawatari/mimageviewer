@@ -601,6 +601,21 @@ fn shape_half_extents(shape: &BubbleShape) -> (f32, f32) {
     }
 }
 
+/// Whether a shape actually renders a tail (つの / 思考の丸). Line-field effects
+/// (集中線 / 流線), 意識 (fuzzy, edgeless) and なし (text-only) draw no outline to
+/// attach a tail to, so the rasterizer skips it for them. Bounds / hit-test use
+/// this so a tail set on such a shape doesn't create invisible selectable
+/// geometry or inflate the AABB.
+pub fn shape_renders_tail(shape: &BubbleShape) -> bool {
+    !matches!(
+        shape,
+        BubbleShape::MotionLines { .. }
+            | BubbleShape::SpeedLines { .. }
+            | BubbleShape::TextOnly { .. }
+            | BubbleShape::Concentration { .. }
+    )
+}
+
 /// Cap the requested tail base width to the bubble's half-extent perpendicular
 /// to the tail direction. A bottom tail on a tall/narrow bubble (perp = small
 /// width) gets a slim base; a side tail (perp = tall height) or a wide bubble
@@ -1278,6 +1293,49 @@ mod tests {
             10.0,
         );
         assert!(matches!(f, BubbleShape::Arrow { dir_rad, .. } if (dir_rad - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn tailless_shapes_report_no_tail() {
+        // Line fields / 意識 / なし render no tail; everything else does.
+        assert!(!shape_renders_tail(&BubbleShape::TextOnly {
+            half_w: 10.0,
+            half_h: 10.0
+        }));
+        assert!(!shape_renders_tail(&BubbleShape::Concentration {
+            rx: 10.0,
+            ry: 10.0,
+            shape_seed: 0
+        }));
+        assert!(!shape_renders_tail(&BubbleShape::MotionLines {
+            rx: 10.0,
+            ry: 10.0,
+            count: 8,
+            shape_seed: 0
+        }));
+        assert!(!shape_renders_tail(&BubbleShape::SpeedLines {
+            half_w: 10.0,
+            half_h: 10.0,
+            dir_rad: 0.0,
+            count: 8,
+            shape_seed: 0
+        }));
+        assert!(shape_renders_tail(&BubbleShape::Ellipse {
+            rx: 10.0,
+            ry: 10.0
+        }));
+        assert!(shape_renders_tail(&BubbleShape::Strokes {
+            half_w: 10.0,
+            half_h: 10.0,
+            corner_px: 4.0,
+            shape_seed: 0
+        }));
+        assert!(shape_renders_tail(&BubbleShape::DoubleStroke {
+            half_w: 10.0,
+            half_h: 10.0,
+            corner_px: 4.0,
+            gap_px: 6.0
+        }));
     }
 
     #[test]

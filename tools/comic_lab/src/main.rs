@@ -25,7 +25,7 @@ use comic_core::{
     TextBlock, VAnchor, WindowPosition, bake_overlay, bake_overlay_with_stamps, bubble_geometry,
     effective_bubble_shape, effective_window_half_extents, layout_text, markup_rules_angle,
     markup_rules_brackets, markup_rules_white, nearest_base_t, resolve_tail_base,
-    tessellate_bubble,
+    shape_renders_tail, tessellate_bubble,
 };
 use eframe::egui::{self, Color32, ColorImage, Pos2, Rect, Sense, TextureHandle, TextureOptions};
 use serde::{Deserialize, Serialize};
@@ -1303,7 +1303,10 @@ impl ComicLab {
                 // tail tip) so clicking the tail / spikes selects the bubble.
                 // Expanded by the stroke half-width + a little slack.
                 let eff = effective_bubble_shape(b, &self.fonts);
-                let geo = bubble_geometry(&eff, obj.pivot, b.tail.as_ref());
+                // Tailless shapes (line fields / 意識 / なし) render no tail, so a
+                // stale tail must not splice into the hit region or inflate bounds.
+                let tail = b.tail.as_ref().filter(|_| shape_renders_tail(&eff));
+                let geo = bubble_geometry(&eff, obj.pivot, tail);
                 let mut min = (f32::INFINITY, f32::INFINITY);
                 let mut max = (f32::NEG_INFINITY, f32::NEG_INFINITY);
                 let pivot = obj.pivot;
@@ -1327,7 +1330,7 @@ impl ComicLab {
                     acc(rcx - r, rcy - r);
                     acc(rcx + r, rcy + r);
                 }
-                if let Some(t) = &b.tail {
+                if let Some(t) = tail {
                     let (px, py) = rotate_about(t.tip, pivot, rot);
                     acc(px, py);
                 }
@@ -3037,9 +3040,16 @@ impl ComicLab {
             *dirty = true;
         }
 
-        // しっぽ有無 (stashed so toggling off→on doesn't move it).
+        // しっぽ有無 (stashed so toggling off→on doesn't move it). Tailless shapes
+        // (集中線 / 流線 / 意識 / なし) draw no tail, so disable the toggle for them
+        // (prevents creating invisible selectable tail geometry).
+        let tail_supported = shape_renders_tail(&b.shape);
         let mut has_tail = b.tail.is_some();
-        if ui.checkbox(&mut has_tail, "しっぽを表示").changed() {
+        let tail_resp = ui.add_enabled(
+            tail_supported,
+            egui::Checkbox::new(&mut has_tail, "しっぽを表示"),
+        );
+        if tail_supported && tail_resp.changed() {
             if has_tail {
                 b.tail = Some(
                     self.tail_stash
@@ -3053,6 +3063,9 @@ impl ComicLab {
             // breaks the link (glow off).
             b.shape_preset_link = None;
             *dirty = true;
+        }
+        if !tail_supported {
+            tail_resp.on_hover_text("この形状はしっぽに対応していません");
         }
 
         // 飾り有無 (decorations non-empty = on, stashed). Seeding a single
