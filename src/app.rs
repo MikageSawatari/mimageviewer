@@ -13078,8 +13078,10 @@ impl App {
             }
         }
 
-        let history_shortcut_allowed =
-            !self.global_search.active && !self.favsearch.active && !self.show_search_bar;
+        let history_shortcut_allowed = !self.global_search.active
+            && !self.favsearch.active
+            && !self.show_search_bar
+            && !self.is_snapshot_active(); // Codex P2-1: ★固定 中は履歴ナビ block
         if alt_left && history_shortcut_allowed {
             return Some(crate::ui_main::AddressBarNav::HistoryBack);
         }
@@ -13143,7 +13145,11 @@ impl App {
         // PageUp/PageDown 単体は一覧のページ移動なので、Ctrl 付きだけをここで扱う。
         if ctrl_page_down {
             self.bump_input_seq("grid_sibling_nav", Some("forward"));
-            if in_global_search || in_favsearch {
+            // ★固定 中はグリッドでも snapshot 内 container entry を巡回 (= Ctrl+↑↓ と同型、
+            // Codex P2-1 対応で追加)。snapshot scope の外への sibling 移動は意味なし。
+            if self.is_snapshot_active() {
+                let _ = self.snapshot_navigate_grid(true);
+            } else if in_global_search || in_favsearch {
                 // 検索ビューは仮想階層なので、実ファイルシステムの兄弟移動は行わない。
             } else if in_local_search {
                 self.cancel_pending_folder_nav();
@@ -13153,7 +13159,9 @@ impl App {
         }
         if ctrl_page_up {
             self.bump_input_seq("grid_sibling_nav", Some("backward"));
-            if in_global_search || in_favsearch {
+            if self.is_snapshot_active() {
+                let _ = self.snapshot_navigate_grid(false);
+            } else if in_global_search || in_favsearch {
                 // 同上。
             } else if in_local_search {
                 self.cancel_pending_folder_nav();

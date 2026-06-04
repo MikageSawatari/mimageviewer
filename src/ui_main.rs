@@ -1352,6 +1352,8 @@ impl App {
             .and_then(|p| p.parent().map(|parent| parent.to_path_buf()));
         let back_target = self.folder_history_back_target().cloned();
         let forward_target = self.folder_history_forward_target().cloned();
+        // Codex P2-1: ★固定 中は履歴/親/ツリーボタンを disabled (= 余計な処理を起動しない)
+        let snapshot_active = self.is_snapshot_active();
         let recent_folders: Vec<PathBuf> = self.recent_folder_entries().to_vec();
         let favorite_target = self.current_favorite_target();
         let current_is_favorite = favorite_target.as_ref().is_some_and(|p| {
@@ -1400,7 +1402,10 @@ impl App {
                     if show_history_nav {
                         // 検索 (Ctrl+G / Ctrl+S) 中は ←/→ を無効化する。検索は透明な
                         // 一時オーバーレイで、フォルダ履歴の概念が適用されないため。
-                        let back_hover = if search_active {
+                        // ★固定 中も同様に無効化 (Codex P2-1)。
+                        let back_hover = if snapshot_active {
+                            "★固定中は履歴ナビを使用できません".to_string()
+                        } else if search_active {
                             "検索中はフォルダ履歴を使用できません".to_string()
                         } else {
                             back_target
@@ -1410,7 +1415,7 @@ impl App {
                         };
                         if ui
                             .add_enabled(
-                                back_target.is_some() && !search_active,
+                                back_target.is_some() && !search_active && !snapshot_active,
                                 egui::Button::new("←"),
                             )
                             .hover_tip(back_hover)
@@ -1418,7 +1423,9 @@ impl App {
                         {
                             result = Some(AddressBarNav::HistoryBack);
                         }
-                        let forward_hover = if search_active {
+                        let forward_hover = if snapshot_active {
+                            "★固定中は履歴ナビを使用できません".to_string()
+                        } else if search_active {
                             "検索中はフォルダ履歴を使用できません".to_string()
                         } else {
                             forward_target
@@ -1428,7 +1435,7 @@ impl App {
                         };
                         if ui
                             .add_enabled(
-                                forward_target.is_some() && !search_active,
+                                forward_target.is_some() && !search_active && !snapshot_active,
                                 egui::Button::new("→"),
                             )
                             .hover_tip(forward_hover)
@@ -1459,12 +1466,20 @@ impl App {
                                 search_drill_up = true;
                             }
                         } else {
-                            let parent_hover = parent_target
-                                .as_ref()
-                                .map(|p| format!("親フォルダへ [BS]\n{}", p.to_string_lossy()))
-                                .unwrap_or_else(|| "親フォルダへ [BS]".to_string());
+                            // Codex P2-1: ★固定 中は親への移動 (= scope 外) を disabled
+                            let parent_hover = if snapshot_active {
+                                "★固定中は親フォルダへ移動できません".to_string()
+                            } else {
+                                parent_target
+                                    .as_ref()
+                                    .map(|p| format!("親フォルダへ [BS]\n{}", p.to_string_lossy()))
+                                    .unwrap_or_else(|| "親フォルダへ [BS]".to_string())
+                            };
                             if ui
-                                .add_enabled(parent_target.is_some(), egui::Button::new("⬆"))
+                                .add_enabled(
+                                    parent_target.is_some() && !snapshot_active,
+                                    egui::Button::new("⬆"),
+                                )
                                 .hover_tip(parent_hover)
                                 .clicked()
                                 && let (Some(cur), Some(parent)) =
@@ -1482,17 +1497,26 @@ impl App {
                     if show_tree_nav {
                         // 検索中は ▲▼ を「前後のヒットフォルダへ移動」に転用する
                         // (キーボード Ctrl+↑↓ と一致)。最上位では disabled。
-                        let tree_enabled = if search_active {
+                        // ★固定 中は scope 外への DFS 移動を起動しない方が良い
+                        // (= snapshot 内 nav は別経路、Codex P2-1)。
+                        let tree_enabled = if snapshot_active {
+                            // snapshot 中も ▲▼ は使える: snapshot 内 container 巡回 (= キー Ctrl+↑↓ と一致)
+                            true
+                        } else if search_active {
                             search_drilled_in
                         } else {
                             has_current
                         };
-                        let prev_hover = if search_active {
+                        let prev_hover = if snapshot_active {
+                            "★固定リストの前へ [Ctrl+↑]"
+                        } else if search_active {
                             "前のヒットフォルダへ [Ctrl+↑]"
                         } else {
                             "ツリー順で前のフォルダへ [Ctrl+↑]"
                         };
-                        let next_hover = if search_active {
+                        let next_hover = if snapshot_active {
+                            "★固定リストの次へ [Ctrl+↓]"
+                        } else if search_active {
                             "次のヒットフォルダへ [Ctrl+↓]"
                         } else {
                             "ツリー順で次のフォルダへ [Ctrl+↓]"
@@ -1697,7 +1721,10 @@ impl App {
                     // 検索中は ▲▼ を検索仮想階層の前後ヒット移動に振り分ける
                     // (キーボード Ctrl+↑↓ と同じ分岐)。最上位では ▲▼ が disabled な
                     // ので通常ここには来ないが、防御的に各ナビ関数も空なら no-op。
-                    if self.global_search.active && self.global_search.drill.is_some() {
+                    // ★固定 中は snapshot 内 container 巡回 (Codex P2-1)。
+                    if self.is_snapshot_active() {
+                        let _ = self.snapshot_navigate_grid(forward);
+                    } else if self.global_search.active && self.global_search.drill.is_some() {
                         self.global_search_ctrl_nav(forward);
                     } else if self.favsearch.active && !self.favsearch.nav_stack.is_empty() {
                         self.favsearch_ctrl_nav(forward);
