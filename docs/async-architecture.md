@@ -16,7 +16,8 @@
 | PDF ページ列挙 | `std::thread` | 1 (PDF 開く都度) | PDF ワーカーに列挙要求を送る |
 | PDF メタ catch-up / 隣接 prefetch | `std::thread` (常駐、`pdf-meta-catchup`) | 1 | `pdf_meta` テーブルへの背景書き込みを統括 (v1.0.0)。WebP cache hit で render_page を skip した PDF (= アップグレードユーザーの既存サムネ) の `pdf_meta` 補完 (`MetaOnly`、low lane) と、`load_pdf_as_folder` 直後の ±1 隣接 PDF の page 0 render + WebP 温め (`NeighborPrefetch`、high lane) を、`CatchupQueue` 経由でシリアル処理する。重複は pending HashSet で dedup、low → high の優先昇格あり |
 | Susie ワーカー | **別プロセス** (`mimageviewer-susie32.exe`、32bit ビルド) + ディスパッチャースレッド | 3 (設定で 1 に落とせる) | 32bit の Susie 画像プラグイン (`.spi`) をロードし IsSupported/GetPicture を呼び出す。プラグインクラッシュの隔離も兼ねる |
-| AI 推論 | `std::thread` + mpsc | 1 (全モデル共通) | ort (DirectML) の upscale/denoise/inpaint |
+| AI 推論 (final pipeline) | `std::thread` (`final-ai-worker`, 常駐) + 優先度キュー (`AiJobQueue`) + 共有 mpsc | 1 | final AI (upscale/denoise) を `AiJob` キューから逐次処理。`AiRuntime` の sessions Mutex が全推論を直列化するため worker は 1 本で十分。**モデルロード (`load_model`) / 推論を worker スレッド上で実行し、UI スレッドは sessions ロックに触らない** (= per-job spawn だった旧設計の「UI THREAD HANG: 推論ロック飢餓」を解消、§3.2.1)。優先度は Display(表示中ページ, LIFO) → Prefetch(先読み, FIFO) |
+| AI 消しゴム (MI-GAN inpaint) | `std::thread` (使い捨て) + mpsc | preview/commit ごと | erase ツールの補完推論 (`erase_inpaint_pending`、final pipeline とは別経路、§3.3) |
 | Ctrl+E エクスポート | `std::thread` (`ctrl-e-export`) + mpsc | ダイアログ確定ごとに 1 本 | UI スレッドで snapshot した base pixels / composite mask / preset を使い、隠蔽合成と JPEG/PNG/WebP 保存を順番に実行する。元画像メタデータ転記と `create_new` 書き込みも worker 側で実行し、キャンセルは各エントリ開始前に `Arc<AtomicBool>` を確認する |
 | 音声出力 warm-up | `std::thread` (`cpal-warmup`) | 起動時 1 本 | WASAPI の初回 audio session 確立をバックグラウンドで済ませる。小さな無音 cpal stream を短時間だけ開いて閉じ、初回動画 open の UI スレッド停止を避ける |
 | 動画サムネイル | `std::thread` | 1 | Windows Shell API を逐次呼び出し |
@@ -92,6 +93,7 @@
 | `heavy_io_queue` | `Arc<Mutex<Vec<LoadRequest>>>` | Folder/ZipFile 要求 (本物の同期 I/O のみ)。reload_queue と同じ prefetch suppression gate を共有 |
 | `pdf_pool.queue` | `Arc<(Mutex<JobQueue>, Condvar)>` | PDF ワーカーへのレンダ/列挙要求。`critical` / `high_normal` / `normal` VecDeque + `normal_in_flight` + `workers_busy` + `in_flight_started_at: Vec<Option<Instant>>` (POOL_SIZE 固定、worker_id index) を同一 Mutex で保護。dispatcher は `critical → high_normal → normal` の順で pop し、HighNormal + Normal で `normal_in_flight` 枠 (= `worker_count - 1`) を共有する。**`CRITICAL_RESERVATION_ACTIVE` (v1.0.0 から常時 ON、最低 1 ワーカーを Critical 用に予約)** によってグリッドからの `Enter` (= Critical な `enumerate_pages_async`) がサムネ先読みの in-flight 待ちで詰まらないようにする。HighNormal は `req.priority=true` の可視セル用 (= 画面に見えているサムネ render を画面外先読みより先に処理)。**Context epoch (`CURRENT_CONTEXT_EPOCH`)** で UI ナビゲーション (フォルダ移動 / Ctrl+G 結果差替え) ごとに HighNormal/Normal ジョブを世代管理し、bump で stale を一括 prune + dispatcher pop 時にも stale 判定。Critical と epoch=0 (background) はプルーン対象外。**`CancelWaitPolicy::HarvestOnCancel`** (thumbnail PDF render の cache-savable 経路のみ) では cancel が立っても in-flight IPC の reply を待ち、PDFium が既に処理した render 結果を harvest して cache 保存に進ませる (= 再エントリ時の再 render 地獄を防ぐ)。**`promote_to_high_normal`** で App 側がスクロール後の現可視 PDF を Normal lane から HighNormal lane に昇格 (= prefetch として enqueue された後で可視になったジョブを救う) |
 | `CatchupQueue` (`thumb_loader.rs`) | `Arc<(Mutex<CatchupQueueState>, Condvar)>` | `pdf_meta` 背景書き込みキュー (v1.0.0)。`high: VecDeque<NeighborPrefetch>` (cap 16) + `low: VecDeque<MetaOnly>` (cap 256) + `pending: HashSet<PathBuf>` を同一 Mutex で保護。worker は high → low の順で pop。同 path が low にいる時に高優先が後から来ると **`high` 空き確認後に `low` から remove → `high` に push** で昇格する (lane が満杯のときだけ drop、lane 間は独立)。詳細は [docs/pdf-page-count-cache-plan.md の「最終形」セクション](pdf-page-count-cache-plan.md) |
+| `AiJobQueue` (`app.rs`) | `Arc<(Mutex<AiJobQueueState>, Condvar)>` | final AI (upscale/denoise) ジョブ。`display: VecDeque` (表示中ページ, push_front=LIFO) + `prefetch: VecDeque` (先読み, push_back=FIFO) + `shutdown` を同一 Mutex で保護。`final-ai-worker` が `display → prefetch` の順で pop。enqueue 重複は呼び出し側 `final_ai_pending.contains_key` で dedup。cancel は `final_ai_pending[key].cancel` (Drop でも立つ) を worker が pop 時に確認し、立っていれば推論せず `Cancelled` を返す (= 高速ページ送りで keep_set 外になったジョブは GPU 推論が始まる前に止まる) |
 | `texture_backlog` | ローカル Vec (App) | GPU アップロード未完の ColorImage。MAX_TEXTURES_PER_FRAME=8 超過分 |
 
 ワーカーが要求を取り出すときは **優先度 (priority フラグ) → 距離 → forward/backward** でソート。
@@ -224,6 +226,50 @@ pending 中は追加ホイール入力を捨て、queue も delta 累積もし�
 要求を取り下げるときは個別にこのフラグを立てる。
 ワーカーは大きな処理の合間 (タイル推論の各タイル、フレームデコード直後、など) でフラグを確認する。
 
+### 3.2.1 final AI パイプライン (upscale/denoise) の単一ワーカー + 優先度キュー
+
+現行の final AI 経路 (`maybe_start_final_ai` / `final_ai_pending` / `final_ai_cache`) は、
+**ジョブごとに `std::thread::spawn` していた旧設計を `AiJobQueue` (単一ワーカー + 優先度
+キュー) に置き換えてある**。背景は「フルスクリーンを高速にめくりながら 4x アップスケールを
+連発すると UI が 15 秒級にフリーズ (`UI THREAD HANG`)」という実害 (2026-06 のクラッシュ
+ログ)。原因は 2 つで、本キュー化で両方を断つ:
+
+1. **UI スレッドが推論ロックを待っていた**: `AiRuntime` は `sessions: Mutex<HashMap<…,
+   Session>>` を `session.run()` 実行中ずっと握る (= 全推論が単一 Mutex で直列化される)。
+   旧 `maybe_start_final_ai` は **UI スレッド上で** `is_loaded` / `load_model` を呼んで
+   いたため、推論 backlog がロックを握りっぱなしのとき UI スレッドが飢餓状態になっていた。
+   → **モデルロード (`load_model`) と推論はすべて `final-ai-worker` 上で実行**し、UI
+   スレッドはモデル「種別」決定 (`model_path` 存在チェックのみ、sessions 非接触) と
+   enqueue だけを行う。`run_final_ai_job` / `ensure_model_loaded` が worker 側の実体。
+2. **ジョブ滞留に上限が無かった**: 通過したページの display ジョブは止めず (キャッシュを
+   埋める意図)、`maybe_start_final_ai` のゲートは「同じ idx の二重起動」しか防がないため、
+   高速ページ送りで spawn 済みスレッドが無制限に積み上がっていた。→ 単一ワーカー +
+   キューにすることで「実行は常に 1 件、残りはキューで待つ」になり、cancel 済みジョブは
+   pop 時に推論せず `Cancelled` を返す。`evict_final_pipeline_cache` が keep_set 外の
+   pending に cancel フラグを立てれば、GPU 推論が始まる前に捨てられる。
+
+優先度とキャンセル規約:
+
+- **優先度**: `fullscreen_idx == idx` の display ジョブは `display` lane に **push_front
+  (LIFO)** で積む (= 最後に表示したページを最優先)。先読みは `prefetch` lane に
+  **push_back (FIFO)**。worker は `display → prefetch` の順で pop。
+- **キャンセル**: `final_ai_pending[key].cancel: Arc<AtomicBool>` を共有。
+  `cancel_final_ai_for_idx` / `evict_final_pipeline_cache` / `clear_*` が立てる。
+  `FinalAiPending` の Drop も cancel を立てる。worker は pop 直後とタイル境界
+  (`upscale` / `denoise` 内) で確認する。
+- **結果回収**: 全ジョブ共有の単一 mpsc (`final_ai_rx`)。`poll_final_ai` が毎フレーム
+  drain し、**pending に残っている key の結果だけ** を適用する (取り消し済み key の結果は
+  捨てる = 旧 per-thread 設計で rx drop により失われていたのと同じ挙動。stale な
+  `final_ai_cache` 挿入を防ぐ)。
+- **同時起動ポリシー**: 先読みは `prefetch_final_ai` が `has_uncancelled_final_ai_pending`
+  で gate するため、未キャンセル pending がある間は新しい先読みを enqueue しない
+  (= キューに先読みが溜まりすぎない)。display ジョブはこの gate の対象外で即 enqueue。
+
+> 注: ここで残る課題は「常駐キャッシュ (`final_ai_cache` / `final_composite_cache`) の
+> 退去が **枚数** (keep_set ≈ 前後 18 idx) ベースで、4x フル解像度 (1 枚 82-156MB) を
+> バイト/メガピクセル予算で縛っていない」点と「ページ送り中に AI 起動をデバウンスして
+> いない」点。VRAM 常駐の根本ガードと高速スクラブ時の起動抑制は別タスク。
+
 ### 3.3 フルスクリーン読み込みの優先度制御
 
 `start_fs_load` はプールを持たない使い捨て `std::thread::spawn` なので、素朴に先読みを
@@ -237,7 +283,8 @@ pending 中は追加ホイール入力を捨て、queue も delta 累積もし�
    そこで初めて先読みが起動する。
 
 AI アップスケール (`maybe_start_ai_upscale`) も同様: 同時実行は 1 枚のみで、現在画像が
-来たら古い先読みをキャンセル。
+来たら古い先読みをキャンセル。**ただしこれは旧 `ai_upscale_*` 経路 (`#[allow(dead_code)]`)
+の記述。現行の final AI 経路は §3.2.1 の `AiJobQueue` (単一ワーカー + 優先度キュー) を使う。**
 
 消しゴム MI-GAN (`ui_erase.rs`) は `erase_inpaint_pending[(idx, kind)]` で管理する。
 `kind` は `Preview` / `Commit` の 2 種で、preview 押下が同じ idx の commit ジョブを

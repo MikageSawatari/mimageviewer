@@ -7168,10 +7168,8 @@ mod pipeline_cache_refactor_tests {
 
     fn make_fake_final_ai_pending() -> (FinalAiPending, Arc<std::sync::atomic::AtomicBool>) {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (_tx, rx) = std::sync::mpsc::channel();
         let pending = FinalAiPending {
             cancel: Arc::clone(&cancel),
-            rx,
         };
         (pending, cancel)
     }
@@ -7247,6 +7245,82 @@ mod pipeline_cache_refactor_tests {
             app.final_ai_pending.len(),
             pending_before + 1,
             "prefetch must not spawn while live pending exists"
+        );
+    }
+
+    /// AI キュー化リファクタ: `poll_final_ai` は単一共有チャネルから Ready/Failed を
+    /// drain し、pending を除去して cache / failed を更新する。pending に無い key の
+    /// 結果は捨てる (= cancel_final_ai_for_idx / clear / evict で取り消された後に届く
+    /// stale 結果。旧 per-thread 設計で rx drop により失われていたのと同じ挙動)。
+    #[test]
+    fn poll_final_ai_drains_shared_channel_and_skips_unknown_keys() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.final_ai_rx = Some(rx);
+
+        let mk_key = |idx: usize| FinalAiKey {
+            edit_key: EditResultKey {
+                idx,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+            },
+            color_ai_hash: 0,
+            bg: 0,
+        };
+
+        // (1) Ready: pending あり → final_ai_cache に入り pending 除去
+        let ready_key = mk_key(0);
+        let (pending, _c) = make_fake_final_ai_pending();
+        app.final_ai_pending.insert(ready_key, pending);
+        tx.send(FinalAiResult::Ready {
+            key: ready_key,
+            image: egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+        })
+        .unwrap();
+
+        // (2) Failed: pending あり → final_ai_failed に入り pending 除去
+        let failed_key = mk_key(1);
+        let (pending, _c) = make_fake_final_ai_pending();
+        app.final_ai_pending.insert(failed_key, pending);
+        tx.send(FinalAiResult::Failed {
+            key: failed_key,
+            error: "boom".to_string(),
+        })
+        .unwrap();
+
+        // (3) Unknown: pending に無い key の Ready → 捨てる (cache に入らない)
+        let unknown_key = mk_key(2);
+        tx.send(FinalAiResult::Ready {
+            key: unknown_key,
+            image: egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+        })
+        .unwrap();
+
+        app.poll_final_ai(&ctx);
+
+        assert!(
+            app.final_ai_cache.contains_key(&ready_key),
+            "Ready with live pending must populate final_ai_cache"
+        );
+        assert!(
+            !app.final_ai_pending.contains_key(&ready_key),
+            "Ready must remove its pending"
+        );
+        assert!(
+            app.final_ai_failed.contains(&failed_key),
+            "Failed with live pending must mark final_ai_failed"
+        );
+        assert!(
+            !app.final_ai_pending.contains_key(&failed_key),
+            "Failed must remove its pending"
+        );
+        assert!(
+            !app.final_ai_cache.contains_key(&unknown_key),
+            "result for a key not in pending must be dropped (stale)"
         );
     }
 

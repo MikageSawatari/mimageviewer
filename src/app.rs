@@ -1823,7 +1823,6 @@ pub(crate) struct FinalAiKey {
 
 pub(crate) struct FinalAiPending {
     pub(crate) cancel: Arc<AtomicBool>,
-    pub(crate) rx: mpsc::Receiver<FinalAiResult>,
 }
 
 impl Drop for FinalAiPending {
@@ -1844,6 +1843,134 @@ pub(crate) enum FinalAiResult {
         key: FinalAiKey,
         error: String,
     },
+}
+
+/// AI ジョブの優先度。表示中ページ (Display) を先読み (Prefetch) より先に処理する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AiJobPriority {
+    Display,
+    Prefetch,
+}
+
+/// 単一 AI ワーカーが処理する 1 ジョブ。`run_final_ai_job` が消費する。
+///
+/// モデルロード / 推論 (= `AiRuntime` の sessions Mutex を握る処理) は **worker
+/// スレッド上で** 行うため、UI スレッドは sessions ロックに触らない。これが
+/// 「UI THREAD HANG (推論ロック飢餓)」の止血になる (旧 per-job spawn 設計では
+/// UI スレッドが `is_loaded` / `load_model` を呼んでロックを待っていた)。
+pub(crate) struct AiJob {
+    pub(crate) key: FinalAiKey,
+    pub(crate) priority: AiJobPriority,
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) runtime: Arc<crate::ai::runtime::AiRuntime>,
+    pub(crate) manager: Arc<crate::ai::model_manager::ModelManager>,
+    pub(crate) source: Arc<egui::ColorImage>,
+    pub(crate) denoise_kind: Option<crate::ai::ModelKind>,
+    pub(crate) upscale_kind: Option<crate::ai::ModelKind>,
+}
+
+struct AiJobQueueState {
+    /// 表示中ページのジョブ (LIFO = 最後に表示したページを最優先)。
+    display: std::collections::VecDeque<AiJob>,
+    /// 先読みジョブ (FIFO)。
+    prefetch: std::collections::VecDeque<AiJob>,
+    shutdown: bool,
+}
+
+impl AiJobQueueState {
+    fn pop_next(&mut self) -> Option<AiJob> {
+        self.display
+            .pop_front()
+            .or_else(|| self.prefetch.pop_front())
+    }
+}
+
+/// 単一ワーカー + 優先度キュー。per-job thread spawn を置き換える。
+///
+/// `pdf_loader::PdfWorkerPool` と同じ Mutex+Condvar パターン
+/// (CLAUDE.md / docs/async-architecture.md §5.5)。`AiRuntime` の sessions Mutex が
+/// 全推論を直列化している以上、ワーカーは 1 本で十分 (N>1 にしても Mutex で詰まる)。
+pub(crate) struct AiJobQueue {
+    inner: Arc<(std::sync::Mutex<AiJobQueueState>, std::sync::Condvar)>,
+}
+
+impl AiJobQueue {
+    /// ワーカースレッドを 1 本起動し、結果送出用の Receiver を返す。
+    fn new() -> (Self, mpsc::Receiver<FinalAiResult>) {
+        let inner = Arc::new((
+            std::sync::Mutex::new(AiJobQueueState {
+                display: std::collections::VecDeque::new(),
+                prefetch: std::collections::VecDeque::new(),
+                shutdown: false,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let (tx, rx) = mpsc::channel();
+        let worker_inner = Arc::clone(&inner);
+        if let Err(err) = std::thread::Builder::new()
+            .name("final-ai-worker".to_string())
+            .spawn(move || run_ai_worker(worker_inner, tx))
+        {
+            crate::logger::log(format!("final_ai: worker spawn failed: {err}"));
+        }
+        (Self { inner }, rx)
+    }
+
+    fn enqueue(&self, job: AiJob) {
+        let (mtx, cv) = &*self.inner;
+        let mut q = mtx.lock().unwrap();
+        match job.priority {
+            AiJobPriority::Display => q.display.push_front(job),
+            AiJobPriority::Prefetch => q.prefetch.push_back(job),
+        }
+        cv.notify_one();
+    }
+}
+
+impl Drop for AiJobQueue {
+    fn drop(&mut self) {
+        let (mtx, cv) = &*self.inner;
+        if let Ok(mut q) = mtx.lock() {
+            q.shutdown = true;
+        }
+        cv.notify_all();
+        // join しない: in-flight の推論完了を待つとアプリ終了が数秒遅れるため、
+        // shutdown フラグだけ立てて detach する (プロセス終了でスレッドは回収される)。
+    }
+}
+
+/// 単一 AI ワーカーのディスパッチループ。Condvar で起床し、Display → Prefetch の
+/// 順でジョブを pop して 1 件ずつ実行する。cancel 済みジョブは実行せず Cancelled を返す。
+fn run_ai_worker(
+    queue: Arc<(std::sync::Mutex<AiJobQueueState>, std::sync::Condvar)>,
+    tx: mpsc::Sender<FinalAiResult>,
+) {
+    loop {
+        let job = {
+            let (mtx, cv) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            loop {
+                if q.shutdown {
+                    return;
+                }
+                if let Some(job) = q.pop_next() {
+                    break job;
+                }
+                q = cv.wait(q).unwrap();
+            }
+        };
+        // pop 前に cancel された (= 高速ページ送りで keep_set から外れた等) ジョブは
+        // 推論せずに Cancelled を返す。これにより無駄な GPU 推論が始まる前に止まる。
+        if job.cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(FinalAiResult::Cancelled { key: job.key });
+            continue;
+        }
+        let result = run_final_ai_job(&job);
+        if tx.send(result).is_err() {
+            // UI 側 (Receiver) が drop された = アプリ終了。
+            return;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3539,6 +3666,10 @@ pub struct App {
     pub(crate) final_ai_pending: std::collections::HashMap<FinalAiKey, FinalAiPending>,
     /// final AI 失敗 key。モデル不在 / 推論失敗時の無限再試行を避ける。
     pub(crate) final_ai_failed: std::collections::HashSet<FinalAiKey>,
+    /// 単一 AI ワーカー + 優先度キュー (per-job thread spawn を置換)。初回 AI 処理で遅延起動。
+    pub(crate) ai_job_queue: Option<AiJobQueue>,
+    /// AI ワーカーからの結果受信口 (全ジョブ共有の単一チャネル)。
+    pub(crate) final_ai_rx: Option<mpsc::Receiver<FinalAiResult>>,
     /// 最終 composite cache。AdjustParams 全項目 + AI + post_filter 適用後。
     pub(crate) final_composite_cache:
         std::collections::HashMap<FinalCompositeKey, FinalCompositeEntry>,
@@ -4926,6 +5057,8 @@ impl App {
             final_ai_cache: std::collections::HashMap::new(),
             final_ai_pending: std::collections::HashMap::new(),
             final_ai_failed: std::collections::HashSet::new(),
+            ai_job_queue: None,
+            final_ai_rx: None,
             final_composite_cache: std::collections::HashMap::new(),
             local_adjust_pending: std::collections::HashMap::new(),
             local_adjust_layer_bypass_cache: std::collections::HashMap::new(),
@@ -18028,6 +18161,16 @@ impl App {
         }
     }
 
+    /// 単一 AI ワーカー + 優先度キューを遅延起動する (初回 final AI ジョブ時)。
+    /// ワーカースレッドは 1 本だけ生成し、結果は `final_ai_rx` で受ける。
+    fn ensure_ai_job_queue(&mut self) {
+        if self.ai_job_queue.is_none() {
+            let (queue, rx) = AiJobQueue::new();
+            self.ai_job_queue = Some(queue);
+            self.final_ai_rx = Some(rx);
+        }
+    }
+
     fn maybe_start_trt_worker_pool_for_ai_use(
         &self,
         runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
@@ -20373,13 +20516,8 @@ impl App {
             let Some(kind) = denoise_request else {
                 return;
             };
-            let Some(model_path) = manager.model_path(kind) else {
-                return;
-            };
-            if !runtime.is_loaded(kind)
-                && let Err(err) = runtime.load_model(kind, &model_path)
-            {
-                crate::logger::log(format!("[AI] Final denoise model load failed: {err}"));
+            // モデルパス存在のみ確認。実ロード (sessions Mutex) は worker に委ねる。
+            if manager.model_path(kind).is_none() {
                 return;
             }
             Some(kind)
@@ -20407,24 +20545,15 @@ impl App {
                     category.preferred_upscale_model()
                 }
             };
-            match manager.model_path(kind) {
-                Some(model_path) => {
-                    if !runtime.is_loaded(kind)
-                        && let Err(err) = runtime.load_model(kind, &model_path)
-                    {
-                        crate::logger::log(format!("[AI] Final upscale model load failed: {err}"));
-                        None
-                    } else {
-                        Some(kind)
-                    }
-                }
-                None => {
-                    crate::logger::log(format!(
-                        "[AI] Final upscale model {:?} not available for idx={idx}",
-                        kind
-                    ));
-                    None
-                }
+            // モデルパス存在のみ確認。実ロード (sessions Mutex) は worker に委ねる。
+            if manager.model_path(kind).is_none() {
+                crate::logger::log(format!(
+                    "[AI] Final upscale model {:?} not available for idx={idx}",
+                    kind
+                ));
+                None
+            } else {
+                Some(kind)
             }
         } else {
             None
@@ -20436,94 +20565,37 @@ impl App {
         }
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_worker = Arc::clone(&cancel);
-        let (tx, rx) = mpsc::channel();
-        let bg_rgb: [u8; 3] = if key.bg == 1 {
-            [255, 255, 255]
+        let priority = if self.fullscreen_idx == Some(idx) {
+            AiJobPriority::Display
         } else {
-            [0, 0, 0]
+            AiJobPriority::Prefetch
         };
-        let composite_first = upscale_model.is_some();
-        let spawn_result = std::thread::Builder::new()
-            .name("final-ai-composite".to_string())
-            .spawn(move || {
-                let mut dynimg = if composite_first {
-                    color_image_to_dynamic_composited(&source_image, bg_rgb)
-                } else {
-                    color_image_to_dynamic(&source_image)
-                };
 
-                if let Some(denoise_kind) = denoise_model {
-                    match crate::ai::denoise::denoise(
-                        &runtime,
-                        denoise_kind,
-                        &dynimg,
-                        &cancel_worker,
-                    ) {
-                        Ok(denoised) => {
-                            if upscale_model.is_some() {
-                                dynimg = color_image_to_dynamic(&denoised);
-                            } else {
-                                let _ = tx.send(FinalAiResult::Ready {
-                                    key,
-                                    image: denoised,
-                                });
-                                return;
-                            }
-                        }
-                        Err(err) => {
-                            if cancel_worker.load(Ordering::Relaxed) {
-                                let _ = tx.send(FinalAiResult::Cancelled { key });
-                                return;
-                            }
-                            if upscale_model.is_none() {
-                                let _ = tx.send(FinalAiResult::Failed {
-                                    key,
-                                    error: err.to_string(),
-                                });
-                                return;
-                            }
-                            crate::logger::log(format!(
-                                "[AI] Final denoise failed for idx={}: {err}",
-                                key.edit_key.idx
-                            ));
-                        }
-                    }
-                }
-
-                if let Some(upscale_kind) = upscale_model {
-                    match crate::ai::upscale::upscale(
-                        &runtime,
-                        upscale_kind,
-                        &dynimg,
-                        &cancel_worker,
-                    ) {
-                        Ok(image) => {
-                            let _ = tx.send(FinalAiResult::Ready { key, image });
-                        }
-                        Err(err) => {
-                            if cancel_worker.load(Ordering::Relaxed) {
-                                let _ = tx.send(FinalAiResult::Cancelled { key });
-                            } else {
-                                let _ = tx.send(FinalAiResult::Failed {
-                                    key,
-                                    error: err.to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
+        // per-job thread spawn ではなく、単一 AI ワーカー + 優先度キューに enqueue する。
+        // モデルロード / 推論 (= sessions Mutex を握る処理) は worker スレッド上で走るので、
+        // UI スレッドは sessions ロックに一切触らない (旧設計の UI 固着の止血)。
+        self.ensure_ai_job_queue();
+        self.final_ai_pending.insert(
+            key,
+            FinalAiPending {
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        if let Some(queue) = self.ai_job_queue.as_ref() {
+            queue.enqueue(AiJob {
+                key,
+                priority,
+                cancel,
+                runtime,
+                manager,
+                source: source_image,
+                denoise_kind: denoise_model,
+                upscale_kind: upscale_model,
             });
-        if let Err(err) = spawn_result {
-            crate::logger::log(format!("final_ai: worker spawn failed: {err}"));
-            return;
         }
-
-        self.final_ai_pending
-            .insert(key, FinalAiPending { cancel, rx });
         crate::logger::log(format!(
-            "[AI] Final AI started idx={idx} bg={} denoise={:?} upscale={:?}",
-            key.bg, denoise_model, upscale_model
+            "[AI] Final AI queued idx={idx} bg={} denoise={:?} upscale={:?} priority={:?}",
+            key.bg, denoise_model, upscale_model, priority
         ));
     }
 
@@ -20996,22 +21068,43 @@ impl App {
     }
 
     pub(crate) fn poll_final_ai(&mut self, ctx: &egui::Context) {
+        // 全 AI ジョブ共有の単一チャネルを drain する。
         let mut completed = Vec::new();
-        let mut disconnected = Vec::new();
-        for (&key, pending) in &self.final_ai_pending {
-            match pending.rx.try_recv() {
-                Ok(result) => completed.push((key, result)),
-                Err(mpsc::TryRecvError::Disconnected) => disconnected.push(key),
-                Err(mpsc::TryRecvError::Empty) => {}
+        let mut disconnected = false;
+        if let Some(rx) = self.final_ai_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(result) => completed.push(result),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
             }
         }
-        for key in disconnected {
-            self.final_ai_pending.remove(&key);
+        if disconnected {
+            // ワーカースレッドが死んだ (通常は起きない)。キューをリセットして
+            // 次回 enqueue 時に作り直し、stuck pending を一掃する。
+            crate::logger::log("[AI] final-ai worker disconnected; resetting queue".to_string());
+            self.final_ai_pending.clear();
+            self.ai_job_queue = None;
+            self.final_ai_rx = None;
         }
 
         let mut repaint = false;
-        for (pending_key, result) in completed {
-            self.final_ai_pending.remove(&pending_key);
+        for result in completed {
+            let key = match &result {
+                FinalAiResult::Ready { key, .. }
+                | FinalAiResult::Cancelled { key }
+                | FinalAiResult::Failed { key, .. } => *key,
+            };
+            // pending から既に除去済み (cancel_final_ai_for_idx / clear / evict 経由で
+            // 取り消された) の結果は捨てる。旧 per-thread 設計で rx drop により結果が
+            // 失われていたのと同じ挙動にし、stale な final_ai_cache 挿入を防ぐ。
+            if self.final_ai_pending.remove(&key).is_none() {
+                continue;
+            }
             match result {
                 FinalAiResult::Ready { key, image } => {
                     self.final_ai_cache.insert(key, Arc::new(image));
@@ -28887,6 +28980,127 @@ fn draw_upscaled_video_badge(painter: &egui::Painter, cell_rect: egui::Rect) {
         galley,
         egui::Color32::WHITE,
     );
+}
+
+/// AI worker スレッド上で 1 ジョブ (denoise / upscale) を実行する。
+///
+/// **モデルのロード (= `AiRuntime` の sessions Mutex を握る重い処理) はここで初めて
+/// 行う**。UI スレッドは種別決定 (`model_path` 存在チェック) までしかやらないので、
+/// 推論 backlog がロックを握っていても UI が固まらない。
+fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
+    let key = job.key;
+    let runtime = &job.runtime;
+    let manager = &job.manager;
+    let cancel = &job.cancel;
+
+    // モデルロードは worker 上で。ロードに失敗したモデルは「使えない」扱いに落とす
+    // (UI スレッドで load していた旧設計と最終状態は同じ: 両方不可なら Failed)。
+    let denoise_model = match job.denoise_kind {
+        Some(kind) => match ensure_model_loaded(runtime, manager, kind) {
+            Ok(()) => Some(kind),
+            Err(err) => {
+                crate::logger::log(format!("[AI] Final denoise model load failed: {err}"));
+                None
+            }
+        },
+        None => None,
+    };
+    let upscale_model = match job.upscale_kind {
+        Some(kind) => match ensure_model_loaded(runtime, manager, kind) {
+            Ok(()) => Some(kind),
+            Err(err) => {
+                crate::logger::log(format!("[AI] Final upscale model load failed: {err}"));
+                None
+            }
+        },
+        None => None,
+    };
+    if denoise_model.is_none() && upscale_model.is_none() {
+        return FinalAiResult::Failed {
+            key,
+            error: "no usable AI model (load failed)".to_string(),
+        };
+    }
+
+    let bg_rgb: [u8; 3] = if key.bg == 1 {
+        [255, 255, 255]
+    } else {
+        [0, 0, 0]
+    };
+    let composite_first = upscale_model.is_some();
+    let mut dynimg = if composite_first {
+        color_image_to_dynamic_composited(&job.source, bg_rgb)
+    } else {
+        color_image_to_dynamic(&job.source)
+    };
+
+    if let Some(denoise_kind) = denoise_model {
+        match crate::ai::denoise::denoise(runtime, denoise_kind, &dynimg, cancel) {
+            Ok(denoised) => {
+                if upscale_model.is_some() {
+                    dynimg = color_image_to_dynamic(&denoised);
+                } else {
+                    return FinalAiResult::Ready {
+                        key,
+                        image: denoised,
+                    };
+                }
+            }
+            Err(err) => {
+                if cancel.load(Ordering::Relaxed) {
+                    return FinalAiResult::Cancelled { key };
+                }
+                if upscale_model.is_none() {
+                    return FinalAiResult::Failed {
+                        key,
+                        error: err.to_string(),
+                    };
+                }
+                crate::logger::log(format!(
+                    "[AI] Final denoise failed for idx={}: {err}",
+                    key.edit_key.idx
+                ));
+            }
+        }
+    }
+
+    if let Some(upscale_kind) = upscale_model {
+        match crate::ai::upscale::upscale(runtime, upscale_kind, &dynimg, cancel) {
+            Ok(image) => FinalAiResult::Ready { key, image },
+            Err(err) => {
+                if cancel.load(Ordering::Relaxed) {
+                    FinalAiResult::Cancelled { key }
+                } else {
+                    FinalAiResult::Failed {
+                        key,
+                        error: err.to_string(),
+                    }
+                }
+            }
+        }
+    } else {
+        // denoise だけ成功し upscale_model=None の分岐は上で return 済みなので論理的に
+        // 到達しない。安全網として Failed (= 非 AI 表示へフォールバック) を返す。
+        FinalAiResult::Failed {
+            key,
+            error: "no upscale model after denoise".to_string(),
+        }
+    }
+}
+
+/// 指定モデルがロード済みでなければロードする (worker スレッド専用)。
+fn ensure_model_loaded(
+    runtime: &crate::ai::runtime::AiRuntime,
+    manager: &crate::ai::model_manager::ModelManager,
+    kind: crate::ai::ModelKind,
+) -> Result<(), String> {
+    if runtime.is_loaded(kind) {
+        return Ok(());
+    }
+    let path = manager
+        .model_path(kind)
+        .ok_or_else(|| format!("model path not found for {kind:?}"))?;
+    runtime.load_model(kind, &path).map_err(|e| e.to_string())
 }
 
 /// egui::ColorImage → image::DynamicImage 変換ヘルパー。
