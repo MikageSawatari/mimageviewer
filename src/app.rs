@@ -3846,8 +3846,17 @@ pub struct App {
     pub(crate) comic_db: Option<crate::comic_db::ComicDb>,
     /// comic.db から読み込んだ注釈ドキュメントのメモリキャッシュ。**キーは
     /// `page_path_key`** (画像の identity = フォルダ移動・idx 入れ替えに非依存) なので、
-    /// idx remap での無効化は不要。空 Vec = 「読み込み済みだが注釈なし」。
+    /// idx remap での無効化は不要。空 Vec = 「読み込み済みだが注釈なし」。編集モード中は
+    /// この `comic_docs[key]` を直接 in-place 編集し (表示と共有)、退場時に comic.db へ保存する。
     pub(crate) comic_docs: std::collections::HashMap<String, Vec<comic_core::AnnotationObject>>,
+
+    // ── テキスト注釈 編集モード (Inc 3) ─────────────────────────
+    /// 「テキスト」編集モード (消しゴム/隠蔽と同系列、D2)。Ctrl+T で入退場。
+    pub(crate) text_mode: bool,
+    /// 選択中の注釈オブジェクトの index (`comic_docs[key]` 内)。Inc 3b で選択/移動に使う。
+    pub(crate) text_selected: Option<usize>,
+    /// 見開きから text モードに入ったときの spread 復元コンテキスト (conceal と同じ流儀)。
+    pub(crate) text_spread_ctx: Option<EraseSpreadCtx>,
 
     // ── フルスクリーン Ctrl+↑↓ ナビロック ─────────────────────────
     /// ナビ中の「次のページがまだ表示できない」ガード。`Some(gen)` の間は
@@ -4935,6 +4944,9 @@ impl App {
                 .unwrap_or(false),
             comic_db,
             comic_docs: std::collections::HashMap::new(),
+            text_mode: false,
+            text_selected: None,
+            text_spread_ctx: None,
             erase_preview_active: false,
             conceal_preview_active: false,
             erase_base_tex_cache: std::collections::HashMap::new(),
@@ -20525,7 +20537,7 @@ impl App {
     /// 注釈ドキュメントを comic.db からメモリキャッシュ (`comic_docs`、page_path_key 別)
     /// へ遅延ロードする。1 キーにつき DB は 1 度だけ引き、以降はメモリ参照。no-row /
     /// 壊れ JSON は空 Vec として記録する (= 「読み込み済みだが注釈なし」)。
-    fn ensure_comic_doc_loaded(&mut self, key: &str) {
+    pub(crate) fn ensure_comic_doc_loaded(&mut self, key: &str) {
         if self.comic_docs.contains_key(key) {
             return;
         }
@@ -20540,7 +20552,7 @@ impl App {
     /// 注釈ドキュメントを comic.db に保存し、メモリキャッシュ (`comic_docs`) も更新する。
     /// 空なら削除 (no-row = 空注釈)。Inc 2b でここに「設定のバックアップ」ON 時の
     /// `mimageviewer.dat` ミラーを足す。
-    fn save_comic_objects(
+    pub(crate) fn save_comic_objects(
         &mut self,
         idx: usize,
         key: &str,

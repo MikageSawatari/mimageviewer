@@ -69,7 +69,11 @@ impl App {
     /// 将来別の overlay edit mode (例: 切り抜き / ワイヤフレーム) を追加するときも
     /// この 1 箇所を拡張するだけで済む。
     pub(crate) fn is_overlay_edit_mode_active(&self) -> bool {
-        self.erase_mode || self.local_adjust_mode || self.conceal_mode || self.export_crop_mode
+        self.erase_mode
+            || self.local_adjust_mode
+            || self.conceal_mode
+            || self.export_crop_mode
+            || self.text_mode
     }
 
     // ── モード入退場 ────────────────────────────────────────────────

@@ -109,6 +109,7 @@ pub mod ui_helpers;
 mod ui_main;
 mod ui_metadata_panel;
 pub mod ui_susie_diagnostic;
+pub mod ui_text;
 pub mod ui_text_links;
 #[cfg(windows)]
 #[cfg(windows)]

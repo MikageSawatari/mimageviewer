@@ -1414,6 +1414,7 @@ struct FsFrameState {
 }
 
 /// フルスクリーンのキー入力結果。
+#[derive(Default)]
 pub(crate) struct FsKeyAction {
     pub(crate) close: bool,
     pub(crate) nav_delta: i32,
@@ -2171,6 +2172,18 @@ impl App {
                             self.draw_conceal_overlay(ui, ctx, image_rect, zp);
                             ctx.request_repaint();
                         } else if self.conceal_mode {
+                            ctx.request_repaint();
+                        }
+
+                        // ── テキスト注釈モード: パネル描画 (Inc 3a) ──
+                        // Inc 3b 以降でキャンバスのオブジェクト選択 / 移動オーバーレイを足す。
+                        if self.text_mode
+                            && !is_spread_double
+                            && !state.original_preview_active
+                        {
+                            self.draw_text_overlay(ctx, full_rect);
+                            ctx.request_repaint();
+                        } else if self.text_mode {
                             ctx.request_repaint();
                         }
 
@@ -3433,6 +3446,10 @@ impl App {
 
         // 隠蔽加工モード中: 専用ショートカット (S/B/L/I/V/H/R/O、D/F、Ctrl+Z、Delete、
         // 矢印移動、Esc / Ctrl+M) に切り替える。通常のフルスクリーンショートカットは無効化。
+        if self.text_mode {
+            return self.handle_text_keys(ctx, fs_idx);
+        }
+
         if self.conceal_mode {
             return self.handle_conceal_keys(ctx, fs_idx);
         }
@@ -4199,6 +4216,19 @@ impl App {
             && !is_video_fs
         {
             self.enter_conceal_mode(fs_idx);
+        }
+
+        // Ctrl+T: テキスト注釈モード入場 (分析・補正・消しゴム・隠蔽・動画中は無効)。
+        // テキストモード中の Ctrl+T / Esc は本関数冒頭の早期 return で処理済み。
+        let key_ctrl_t = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::T));
+        if key_ctrl_t
+            && !self.analysis_mode
+            && !self.adjustment_mode
+            && !self.erase_mode
+            && !self.conceal_mode
+            && !is_video_fs
+        {
+            self.enter_text_mode(fs_idx);
         }
 
         if key_ctrl_s_capture {
