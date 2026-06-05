@@ -1856,11 +1856,26 @@ cache eviction または `GpuVideoDevice` drop までその FFmpeg device contex
 D3D11 device-lost recovery を実装する場合は、device を差し替える前に
 `hwframes_pool` を clear する必要がある。
 
+2026-06-05 追記: SD インターレース H.264 (`field_order=TT/BB/TB/BT`,
+`coded <= 720x576`) で、FFmpeg が返す共有 `AVHWFramesContext.initial_pool_size=17`
+のまま固定 pool を初期化すると、80 frame 前後で `Static surface pool size exceeded`
+→ `AVERROR_INVALIDDATA` になる実機ケースがある。FFmpeg-owned D3D11VA device と SW decode
+は同じファイルで成功するため、ファイル破損やインターレース一般の非対応ではなく、
+mIV が shared device 用に明示設定する static hwframes pool の容量不足として扱う。
+利用者環境で未報告の再生失敗を避けるため、shared D3D11VA 経路では codec / 解像度 /
+field order を限定せず、`avcodec_get_hw_frames_parameters()` が返した
+`initial_pool_size` を `max(initial_pool_size * 2, 32)` へ引き上げてから
+`av_hwframe_ctx_init()` する。これにより今回の実機ケースは `17→34` になる。
+4K 10bit P010 の理論下限では `17→34` が約 403 MiB → 約 807 MiB で、
+増加分は再生可否の確実性を優先できる範囲と判断する。FFmpeg-owned D3D11VA device と
+SW decode の経路はこの pool 調整の対象外。
+
 | kind | 発火元 | 説明 | 主な extras |
 |---|---|---|---|
 | `acquire` | FFmpeg `get_format` callback | D3D11VA hwframes context の cache hit/miss | `result=hit/miss/...`, `coded_w`, `coded_h`, `format`, `sw_format`, `initial_pool_size`, `bind_flags`, `misc_flags`, `estimated_pool_mib`, `pool_entries_before/after`, `pool_total_mib_before/after`, `cache_ref_count` |
 | `evict` | cache capacity / device drop / tray hide | LRU eviction または明示 clear | `reason=capacity/stale_ref/gpu_video_device_drop/tray_hide`, key fields, `pool_entries_before`, `pool_total_mib_before` |
 | `attach_fallback` | FFmpeg `get_format` callback | cache 経路で ctx を渡せず FFmpeg 自動生成へ戻した | `error` |
+| `pool_size_adjusted` | FFmpeg `get_format` callback | shared hwframes pool を `max(initial*2,32)` へ拡張 | `before`, `after` |
 
 `cache_ref_count` は event emit 時点の cached `AVBufferRef` refcount。通常は
 cache 自身の 1 本 + decoder に渡した 1 本で `2` になる。`2` より大きい値が継続する場合は、

@@ -35,6 +35,7 @@ use super::d3d11_device::{GpuVideoDevice, GpuVideoError};
 
 const HW_FRAMES_POOL_MAX_ENTRIES: usize = 6;
 const HW_FRAMES_POOL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+const SHARED_D3D11VA_MIN_POOL_SIZE: i32 = 32;
 
 /// D3D11VA lock/unlock callback の呼出回数 (= API レベル直列化が機能している証拠の
 /// 取得用、2026-05-15 追加)。perf log に詳細イベントを出すと頻度が高すぎるので、
@@ -342,6 +343,30 @@ impl HwFramesKey {
     }
 }
 
+fn adjusted_pool_size_for_shared_hw_frames(initial_pool_size: i32) -> i32 {
+    initial_pool_size
+        .saturating_mul(2)
+        .max(SHARED_D3D11VA_MIN_POOL_SIZE)
+}
+
+unsafe fn expand_pool_for_shared_hw_frames(frames_ref: *mut AVBufferRef) -> Option<(i32, i32)> {
+    if frames_ref.is_null() {
+        return None;
+    }
+    let frames_ctx = unsafe { (*frames_ref).data as *mut AVHWFramesContext };
+    if frames_ctx.is_null() {
+        return None;
+    }
+    let frames_ctx_ref = unsafe { &mut *frames_ctx };
+    let before = frames_ctx_ref.initial_pool_size;
+    let target_size = adjusted_pool_size_for_shared_hw_frames(before);
+    if target_size == before {
+        return None;
+    }
+    frames_ctx_ref.initial_pool_size = target_size;
+    Some((before, frames_ctx_ref.initial_pool_size))
+}
+
 struct HwFramesPoolEntry {
     key: HwFramesKey,
     frames_ref: *mut AVBufferRef,
@@ -395,6 +420,25 @@ impl HwFramesPool {
                 );
             }
             return Err(format!("avcodec_get_hw_frames_parameters failed: {ret}"));
+        }
+
+        let pool_size_adjustment = unsafe { expand_pool_for_shared_hw_frames(params_ref) };
+        if let Some((before, after)) = pool_size_adjustment {
+            crate::logger::log(format!(
+                "HW: expanded shared D3D11VA frames pool: {before}->{after}"
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "hwframes_pool",
+                    "pool_size_adjusted",
+                    None,
+                    0,
+                    &[
+                        ("before", serde_json::Value::from(before as i64)),
+                        ("after", serde_json::Value::from(after as i64)),
+                    ],
+                );
+            }
         }
 
         let key = match unsafe { HwFramesKey::from_frames_ref(params_ref) } {
@@ -605,5 +649,21 @@ unsafe fn addref_com(ptr: *mut c_void) {
         let vtable = *(ptr as *mut *mut *const c_void);
         let add_ref: AddRefFn = std::mem::transmute(*vtable.add(1));
         let _ = add_ref(ptr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adjusts_shared_pool_size_to_double_with_floor() {
+        assert_eq!(adjusted_pool_size_for_shared_hw_frames(17), 34);
+        assert_eq!(adjusted_pool_size_for_shared_hw_frames(8), 32);
+        assert_eq!(adjusted_pool_size_for_shared_hw_frames(16), 32);
+        assert_eq!(adjusted_pool_size_for_shared_hw_frames(32), 64);
+        assert_eq!(adjusted_pool_size_for_shared_hw_frames(0), 32);
+        assert_eq!(adjusted_pool_size_for_shared_hw_frames(-1), 32);
+        assert_eq!(adjusted_pool_size_for_shared_hw_frames(i32::MAX), i32::MAX);
     }
 }
