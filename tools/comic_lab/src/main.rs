@@ -120,6 +120,46 @@ const FONT_CATALOG: &[(&str, &str)] = &[
     ),
 ];
 
+/// Optional lab-only bundled font directory. Drop OFL-compatible TTF/OTF/TTC
+/// files here to make them available in the font picker and SFX presets without
+/// installing them into Windows.
+fn bundled_font_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("fonts")
+}
+
+fn enumerate_bundled_fonts() -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(bundled_font_dir()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext_ok = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                let e = e.to_ascii_lowercase();
+                e == "ttf" || e == "ttc" || e == "otf"
+            })
+            .unwrap_or(false);
+        if !ext_ok {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let label = stem.replace(['_', '-'], " ");
+        out.push((label, path));
+    }
+    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out
+}
+
 /// Enumerate installed Windows fonts from the registry. Reads both the
 /// machine-wide (`HKLM`) and per-user (`HKCU`) `…\Fonts` keys; each value name
 /// looks like `Yu Gothic Medium (TrueType)` and the data is a bare filename
@@ -201,6 +241,19 @@ fn clean_font_name(raw: &str) -> String {
     // Keep the first alias if multiple are joined with " & ".
     let first = without_tag.split(" & ").next().unwrap_or(without_tag);
     first.trim().to_string()
+}
+
+fn font_lookup_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '-' | '_' | '.'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn font_name_matches_candidate(font_name: &str, candidate: &str) -> bool {
+    let font_name = font_lookup_key(font_name);
+    let candidate = font_lookup_key(candidate);
+    !candidate.is_empty() && font_name.contains(&candidate)
 }
 
 /// Install the JP font bytes into egui so live text shows Japanese. Kept
@@ -408,6 +461,8 @@ struct ComicLab {
     show_add_dialog: bool,
     /// Whether the "ウィンドウ追加" preset-picker modal is open.
     show_add_window_dialog: bool,
+    /// Whether the "オノマトペ追加" preset-picker modal is open.
+    show_onomatopoeia_dialog: bool,
 
     /// Whether the font-sample picker modal is open + which object it targets.
     show_font_dialog: bool,
@@ -421,6 +476,10 @@ struct ComicLab {
     /// Cache of rendered font-sample textures, keyed by (font key, sample text).
     /// Cleared when the sample text changes.
     font_sample_cache: HashMap<(String, String), TextureHandle>,
+    /// Cache of rendered onomatopoeia preset thumbnails, keyed by
+    /// (preset label + resolved font key). These thumbnails are baked through
+    /// comic-core so the picker preview uses the actual OFL font face.
+    onomatopoeia_thumb_cache: HashMap<String, TextureHandle>,
     /// Script classification per font key (filled in by a background thread so
     /// the UI never blocks parsing hundreds of fonts). Unknown = not yet done.
     font_script: HashMap<String, FontScript>,
@@ -486,7 +545,17 @@ impl ComicLab {
         let mut font_paths: HashMap<String, PathBuf> = HashMap::new();
         let mut available_fonts: Vec<(String, String)> = Vec::new();
 
-        // FONT_CATALOG first so its (often nicer) JP labels seed default_font_key.
+        // Lab-bundled fonts first: this lets OFL fonts in
+        // tools/comic_lab/assets/fonts override same-named system entries for
+        // onomatopoeia presets while keeping the normal default-font preference
+        // below anchored to FONT_CATALOG.
+        for (name, path) in enumerate_bundled_fonts() {
+            if !font_paths.contains_key(&name) {
+                font_paths.insert(name.clone(), path);
+                available_fonts.push((name.clone(), name));
+            }
+        }
+        // FONT_CATALOG next so its (often nicer) JP labels seed default_font_key.
         for (label, path) in FONT_CATALOG {
             let p = PathBuf::from(path);
             if !p.exists() {
@@ -610,12 +679,14 @@ impl ComicLab {
             drag_pivot_anchor: (0.0, 0.0),
             show_add_dialog: false,
             show_add_window_dialog: false,
+            show_onomatopoeia_dialog: false,
             show_font_dialog: false,
             font_dialog_target: None,
             font_dialog_filter: String::new(),
             font_dialog_category: FontCategory::Japanese,
             font_dialog_sample: String::new(),
             font_sample_cache: HashMap::new(),
+            onomatopoeia_thumb_cache: HashMap::new(),
             font_script: HashMap::new(),
             font_script_rx,
             prop_tab: PropTab::Serifu,
@@ -825,7 +896,6 @@ impl ComicLab {
     }
 
     fn add_text(&mut self) {
-        let pivot = self.default_new_pivot();
         let tb = TextBlock {
             text: "テキスト".to_string(),
             font_key: self.default_font_key.clone(),
@@ -839,6 +909,9 @@ impl ComicLab {
             }),
             ..TextBlock::default()
         };
+        let center = self.default_new_pivot();
+        let (w, h) = self.text_layout_size(&tb);
+        let pivot = (center.0 - w * 0.5, center.1 - h * 0.5);
         let id = self.next_id;
         self.next_id += 1;
         let mut obj = AnnotationObject::new_text(id, pivot, tb);
@@ -847,6 +920,35 @@ impl ComicLab {
         self.normalize_z();
         self.selected = Some(id);
         self.baked_dirty = true;
+    }
+
+    fn add_onomatopoeia_preset(&mut self, preset: OnomatopoeiaPreset) {
+        let font_key = self.resolve_onomatopoeia_font(preset.font_candidate());
+        self.ensure_font_loaded(&font_key);
+        let tb = preset.build_text(&font_key);
+        let center = self.default_new_pivot();
+        let (w, h) = self.text_layout_size(&tb);
+        let pivot = (center.0 - w * 0.5, center.1 - h * 0.5);
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut obj = AnnotationObject::new_text(id, pivot, tb);
+        obj.rotation_rad = preset.rotation_rad();
+        obj.z = self.objects.len() as i32;
+        self.objects.push(obj);
+        self.normalize_z();
+        self.selected = Some(id);
+        self.baked_dirty = true;
+        self.status = format!("オノマトペ「{}」を追加しました ({font_key})", preset.text());
+    }
+
+    fn resolve_onomatopoeia_font(&self, candidate: &str) -> String {
+        if let Some((key, _)) = self.available_fonts.iter().find(|(key, label)| {
+            font_name_matches_candidate(key, candidate)
+                || font_name_matches_candidate(label, candidate)
+        }) {
+            return key.clone();
+        }
+        self.default_font_key.clone()
     }
 
     /// Insert a new bubble built from `preset` at the default pivot.
@@ -1371,6 +1473,28 @@ impl ComicLab {
         self.objects.iter_mut().find(|o| o.id == sel)
     }
 
+    fn text_layout_size(&self, t: &TextBlock) -> (f32, f32) {
+        self.fonts
+            .get(&t.font_key)
+            .map(|font| {
+                let layout = layout_text(t, font);
+                (layout.bounds.0.max(8.0), layout.bounds.1.max(8.0))
+            })
+            .unwrap_or((100.0, 40.0))
+    }
+
+    fn text_rotation_center(&self, obj: &AnnotationObject, t: &TextBlock) -> (f32, f32) {
+        let (w, h) = self.text_layout_size(t);
+        (obj.pivot.0 + w * 0.5, obj.pivot.1 + h * 0.5)
+    }
+
+    fn rotation_center(&self, obj: &AnnotationObject) -> (f32, f32) {
+        match &obj.kind {
+            AnnotationKind::Text(t) => self.text_rotation_center(obj, t),
+            _ => obj.pivot,
+        }
+    }
+
     /// Approximate image-space bounds of an object (for hit-testing / select).
     fn object_bounds(&self, obj: &AnnotationObject) -> Rect {
         match &obj.kind {
@@ -1425,18 +1549,27 @@ impl ComicLab {
                 )
             }
             AnnotationKind::Text(t) => {
-                if let Some(font) = self.fonts.get(&t.font_key) {
-                    let layout = layout_text(t, font);
-                    Rect::from_min_size(
-                        Pos2::new(obj.pivot.0, obj.pivot.1),
-                        egui::vec2(layout.bounds.0.max(8.0), layout.bounds.1.max(8.0)),
-                    )
-                } else {
-                    Rect::from_min_size(
-                        Pos2::new(obj.pivot.0, obj.pivot.1),
-                        egui::vec2(100.0, 40.0),
-                    )
+                let (w, h) = self.text_layout_size(t);
+                let center = (obj.pivot.0 + w * 0.5, obj.pivot.1 + h * 0.5);
+                let mut min = (f32::INFINITY, f32::INFINITY);
+                let mut max = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                for &(lx, ly) in &[
+                    (-w * 0.5, -h * 0.5),
+                    (w * 0.5, -h * 0.5),
+                    (w * 0.5, h * 0.5),
+                    (-w * 0.5, h * 0.5),
+                ] {
+                    let p = rotate_about((center.0 + lx, center.1 + ly), center, obj.rotation_rad);
+                    min.0 = min.0.min(p.0);
+                    min.1 = min.1.min(p.1);
+                    max.0 = max.0.max(p.0);
+                    max.1 = max.1.max(p.1);
                 }
+                let m = t.outline.map(|s| s.width_px).unwrap_or(0.0).max(0.0) + 2.0;
+                Rect::from_min_max(
+                    Pos2::new(min.0 - m, min.1 - m),
+                    Pos2::new(max.0 + m, max.1 + m),
+                )
             }
             AnnotationKind::MessageWindow(w) => {
                 // Rotated panel rect (pivot = center), expanded by the stroke
@@ -1848,6 +1981,8 @@ impl ComicLab {
                     // Choosing a font is an individual edit → break the link.
                     tb.preset_link = None;
                 }
+                self.font_sample_cache.clear();
+                self.onomatopoeia_thumb_cache.clear();
                 self.baked_dirty = true;
                 self.status = format!("フォント追加: {label}");
             }
@@ -1922,6 +2057,34 @@ impl ComicLab {
         ))
     }
 
+    /// Render an onomatopoeia preset thumbnail through comic-core using the
+    /// resolved font face. Rotation is intentionally omitted in the picker so
+    /// the glyph shape stays easy to compare; inserted objects still receive
+    /// the preset's rotation.
+    fn render_onomatopoeia_preview(
+        &self,
+        preset: OnomatopoeiaPreset,
+        font_key: &str,
+    ) -> Option<ColorImage> {
+        let font = self.fonts.get(font_key)?;
+        if font.key != font_key {
+            return None;
+        }
+        let mut block = preset.build_text(font_key);
+        block.size_px = block.size_px.clamp(50.0, 92.0);
+        let layout = layout_text(&block, font);
+        let outline_pad = block.outline.map(|s| s.width_px).unwrap_or(0.0);
+        let pad = (outline_pad + 12.0).ceil();
+        let w = ((layout.bounds.0 + pad * 2.0).ceil() as usize).clamp(1, 1600);
+        let h = ((layout.bounds.1 + pad * 2.0).ceil() as usize).clamp(1, 1200);
+        let obj = AnnotationObject::new_text(0, (pad, pad), block);
+        let overlay = bake_overlay(&[obj], w, h, &self.fonts);
+        Some(ColorImage::from_rgba_unmultiplied(
+            [overlay.w, overlay.h],
+            &overlay.pixels,
+        ))
+    }
+
     /// Return the cached sample texture for `name` without building it.
     fn font_sample_cached(&self, name: &str) -> Option<TextureHandle> {
         self.font_sample_cache
@@ -1941,6 +2104,30 @@ impl ComicLab {
         let img = self.render_font_sample(name, &sample, 30.0)?;
         let tex = ctx.load_texture(format!("font_sample_{name}"), img, TextureOptions::LINEAR);
         self.font_sample_cache.insert(key, tex.clone());
+        Some(tex)
+    }
+
+    /// Lazily build + cache the actual-font thumbnail for an onomatopoeia
+    /// preset. This mirrors insertion font resolution, including fallback.
+    fn onomatopoeia_thumb_texture(
+        &mut self,
+        ctx: &egui::Context,
+        preset: OnomatopoeiaPreset,
+    ) -> Option<TextureHandle> {
+        let font_key = self.resolve_onomatopoeia_font(preset.font_candidate());
+        let key = format!("{}|{}|{}", preset.label(), preset.text(), font_key);
+        if let Some(tex) = self.onomatopoeia_thumb_cache.get(&key) {
+            return Some(tex.clone());
+        }
+        self.ensure_font_loaded(&font_key);
+        let img = self.render_onomatopoeia_preview(preset, &font_key)?;
+        let tex_name = format!(
+            "onomato_preview_{}_{}",
+            font_lookup_key(preset.label()),
+            font_lookup_key(&font_key)
+        );
+        let tex = ctx.load_texture(tex_name, img, TextureOptions::LINEAR);
+        self.onomatopoeia_thumb_cache.insert(key, tex.clone());
         Some(tex)
     }
 
@@ -2682,6 +2869,7 @@ impl eframe::App for ComicLab {
         self.draw_canvas(ctx);
         self.draw_add_dialog(ctx);
         self.draw_add_window_dialog(ctx);
+        self.draw_onomatopoeia_dialog(ctx);
         self.draw_font_dialog(ctx);
         self.draw_stamp_dialog(ctx);
 
@@ -2704,8 +2892,8 @@ impl ComicLab {
                 ui.heading("吹き出し / テキスト");
                 ui.separator();
 
-                // One full-width add button per row (吹き出し → ウィンドウ → テキスト).
-                // 吹き出し / ウィンドウ open a visual pattern picker; テキスト is direct.
+                // One full-width add button per row. Generated onomatopoeia is a
+                // text object; image onomatopoeia stays under stamps.
                 let add_w = LEFT_W - 20.0;
                 if ui
                     .add_sized(egui::vec2(add_w, 26.0), egui::Button::new("吹き出し追加"))
@@ -2726,6 +2914,13 @@ impl ComicLab {
                     .clicked()
                 {
                     self.add_text();
+                }
+                ui.add_space(2.0);
+                if ui
+                    .add_sized(egui::vec2(add_w, 26.0), egui::Button::new("オノマトペ追加"))
+                    .clicked()
+                {
+                    self.show_onomatopoeia_dialog = true;
                 }
                 ui.add_space(2.0);
                 if ui
@@ -3086,6 +3281,145 @@ impl ComicLab {
         if let Some(idx) = chosen {
             self.add_message_window_with_preset(idx);
             self.show_add_window_dialog = false;
+        }
+    }
+
+    /// One fixed-size onomatopoeia preset card. The preview is a baked
+    /// comic-core image, so it reflects the actual bundled/system font instead
+    /// of egui's UI font.
+    fn draw_onomatopoeia_thumbnail(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        preset: OnomatopoeiaPreset,
+    ) -> bool {
+        const CELL_W: f32 = ONOMATO_PRESET_CELL_W;
+        const PREVIEW_H: f32 = 104.0;
+        const LABEL_H: f32 = 30.0;
+        const PAD: f32 = 7.0;
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(CELL_W, PREVIEW_H + LABEL_H), Sense::click());
+        let hovered = resp.hovered();
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(
+            rect,
+            4.0,
+            if hovered {
+                Color32::from_rgb(66, 66, 70)
+            } else {
+                Color32::from_rgb(42, 42, 46)
+            },
+        );
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(
+                1.0,
+                if hovered {
+                    Color32::from_rgb(150, 195, 255)
+                } else {
+                    Color32::from_gray(70)
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let preview_area = Rect::from_min_max(
+            rect.min + egui::vec2(PAD, PAD),
+            egui::pos2(rect.max.x - PAD, rect.min.y + PREVIEW_H - 5.0),
+        );
+        painter.rect_filled(preview_area, 3.0, Color32::from_rgb(34, 34, 38));
+        if let Some(tex) = self.onomatopoeia_thumb_texture(ctx, preset) {
+            let sz = tex.size_vec2();
+            if sz.x > 0.0 && sz.y > 0.0 {
+                let scale = (preview_area.width() / sz.x)
+                    .min(preview_area.height() / sz.y)
+                    .min(1.45);
+                let draw = egui::vec2(sz.x * scale, sz.y * scale);
+                let origin = preview_area.center() - draw * 0.5;
+                painter.image(
+                    tex.id(),
+                    Rect::from_min_size(origin, draw),
+                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+        } else {
+            paint_onomatopoeia_preview(&painter, preview_area.shrink(6.0), preset);
+        }
+        let label_area = Rect::from_min_max(
+            egui::pos2(rect.min.x + 6.0, rect.max.y - LABEL_H),
+            egui::pos2(rect.max.x - 6.0, rect.max.y - 3.0),
+        );
+        painter.text(
+            label_area.center(),
+            egui::Align2::CENTER_CENTER,
+            preset.label(),
+            egui::FontId::proportional(11.0),
+            Color32::WHITE,
+        );
+        resp.clicked()
+    }
+
+    /// Font-generated SFX add dialog. The chosen preset inserts a normal
+    /// standalone Text object with bold comic styling; image SFX remain stamps.
+    fn draw_onomatopoeia_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_onomatopoeia_dialog {
+            return;
+        }
+        let mut open = self.show_onomatopoeia_dialog;
+        let mut chosen: Option<OnomatopoeiaPreset> = None;
+        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+            .fill(Color32::from_rgba_unmultiplied(24, 24, 26, 248))
+            .stroke(egui::Stroke::new(
+                1.0,
+                Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+            ));
+        let avail = ctx.content_rect();
+        let max_w = (avail.width() - 24.0).max(ONOMATO_PRESET_CELL_W + 48.0);
+        let default_w = max_w.min(860.0);
+        let default_h = (avail.height() - 120.0).clamp(300.0, 660.0);
+        egui::Window::new("オノマトペを追加")
+            .id(egui::Id::new("onomatopoeia_dialog_grid"))
+            .order(egui::Order::Foreground)
+            .frame(dialog_frame)
+            .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([default_w, default_h])
+            .min_width(ONOMATO_PRESET_CELL_W + 30.0)
+            .max_width(max_w)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "フォントごとのサンプルを選んでください。クリックで追加します。",
+                    )
+                    .size(11.0)
+                    .color(Color32::from_gray(180)),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let cols = grid_cols(ui.available_width(), ONOMATO_PRESET_CELL_W);
+                        ui.spacing_mut().item_spacing =
+                            egui::vec2(PRESET_CELL_SPACING, PRESET_CELL_SPACING);
+                        for chunk in OnomatopoeiaPreset::ALL.chunks(cols) {
+                            ui.horizontal_top(|ui| {
+                                for &preset in chunk {
+                                    if self.draw_onomatopoeia_thumbnail(ui, ctx, preset) {
+                                        chosen = Some(preset);
+                                    }
+                                }
+                            });
+                        }
+                    });
+            });
+
+        self.show_onomatopoeia_dialog = open;
+        if let Some(preset) = chosen {
+            self.add_onomatopoeia_preset(preset);
+            self.show_onomatopoeia_dialog = false;
         }
     }
 
@@ -5038,13 +5372,31 @@ impl ComicLab {
         Some((corners, rot_handle))
     }
 
+    /// Corner points (TL,TR,BR,BL) + rotation handle for standalone text.
+    /// Text stores its pivot as the layout top-left, but its edit handles rotate
+    /// around the text rectangle center to match the baked result.
+    fn text_handle_points(&self, obj: &AnnotationObject) -> Option<([(f32, f32); 4], (f32, f32))> {
+        let AnnotationKind::Text(t) = &obj.kind else {
+            return None;
+        };
+        let (w, h) = self.text_layout_size(t);
+        let (hw, hh) = (w * 0.5, h * 0.5);
+        let p = (obj.pivot.0 + hw, obj.pivot.1 + hh);
+        let (sin, cos) = obj.rotation_rad.sin_cos();
+        let rot = |lx: f32, ly: f32| (p.0 + lx * cos - ly * sin, p.1 + lx * sin + ly * cos);
+        let corners = [rot(-hw, -hh), rot(hw, -hh), rot(hw, hh), rot(-hw, hh)];
+        let offset_img = 28.0 / self.view.zoom.max(1e-3);
+        let rot_handle = rot(0.0, -(hh + offset_img));
+        Some((corners, rot_handle))
+    }
+
     /// Corner + rotation handles for whichever kind supports them.
     fn handle_points(&self, obj: &AnnotationObject) -> Option<([(f32, f32); 4], (f32, f32))> {
         match &obj.kind {
             AnnotationKind::Bubble(_) => self.bubble_handle_points(obj),
             AnnotationKind::MessageWindow(_) => self.window_handle_points(obj),
             AnnotationKind::Stamp(_) => self.stamp_handle_points(obj),
-            AnnotationKind::Text(_) => None,
+            AnnotationKind::Text(_) => self.text_handle_points(obj),
         }
     }
 
@@ -5106,16 +5458,34 @@ impl ComicLab {
                 }
             }
             AnnotationKind::Text(_) => {
-                // Standalone text: a plain AABB selection box (no resize yet).
-                let bounds = self.object_bounds(obj);
-                let min = self.view.img_to_screen((bounds.min.x, bounds.min.y));
-                let max = self.view.img_to_screen((bounds.max.x, bounds.max.y));
-                painter.rect_stroke(
-                    Rect::from_min_max(min, max),
-                    0.0,
-                    egui::Stroke::new(1.5, blue),
-                    egui::StrokeKind::Outside,
-                );
+                // Standalone text / generated onomatopoeia: same rotated quad,
+                // resize corners and rotation knob as stamps.
+                if let Some((corners, roth)) = self.text_handle_points(obj) {
+                    let cs: Vec<Pos2> = corners
+                        .iter()
+                        .map(|c| self.view.img_to_screen(*c))
+                        .collect();
+                    for i in 0..4 {
+                        painter
+                            .line_segment([cs[i], cs[(i + 1) % 4]], egui::Stroke::new(1.5, blue));
+                    }
+                    let top_mid = egui::pos2((cs[0].x + cs[1].x) * 0.5, (cs[0].y + cs[1].y) * 0.5);
+                    let roth_s = self.view.img_to_screen(roth);
+                    painter.line_segment([top_mid, roth_s], egui::Stroke::new(1.5, blue));
+                    painter.circle_filled(roth_s, HANDLE_R, Color32::from_rgb(120, 220, 120));
+                    painter.circle_stroke(roth_s, HANDLE_R, egui::Stroke::new(1.5, Color32::BLACK));
+                    for c in &cs {
+                        let r =
+                            Rect::from_center_size(*c, egui::vec2(HANDLE_R * 1.8, HANDLE_R * 1.8));
+                        painter.rect_filled(r, 1.0, Color32::from_rgb(230, 230, 235));
+                        painter.rect_stroke(
+                            r,
+                            1.0,
+                            egui::Stroke::new(1.5, Color32::BLACK),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                }
             }
             AnnotationKind::MessageWindow(_) => {
                 // Same rotated quad + rotate knob + corner squares as a bubble
@@ -5347,8 +5717,23 @@ impl ComicLab {
                     }
                     DragKind::Corner(_) => {
                         // Resize symmetric about the pivot, measured along the
-                        // bubble's local (rotated) axes. Turns auto-size off.
+                        // object's local (rotated) axes. Text scales uniformly
+                        // around its layout center; bubbles/windows turn auto
+                        // sizing/position presets off as needed.
                         let img_pt = self.view.screen_to_img(ptr);
+                        let text_resize = self
+                            .selected
+                            .and_then(|sel| self.objects.iter().find(|o| o.id == sel))
+                            .and_then(|obj| {
+                                if let AnnotationKind::Text(t) = &obj.kind {
+                                    let (w, h) = self.text_layout_size(t);
+                                    let center = (obj.pivot.0 + w * 0.5, obj.pivot.1 + h * 0.5);
+                                    Some((w, h, center))
+                                } else {
+                                    None
+                                }
+                            });
+                        let mut resized_text: Option<(u64, (f32, f32), TextBlock)> = None;
                         if let Some(obj) = self.selected_obj_mut() {
                             let pivot = obj.pivot;
                             let (sin, cos) = obj.rotation_rad.sin_cos();
@@ -5390,16 +5775,43 @@ impl ComicLab {
                                     s.half_w = new_w;
                                     s.half_h = (new_w / aspect.max(1e-3)).max(8.0);
                                 }
-                                AnnotationKind::Text(_) => {}
+                                AnnotationKind::Text(t) => {
+                                    if let Some((w, h, center)) = text_resize {
+                                        let local =
+                                            inv_rotate_about(img_pt, center, obj.rotation_rad);
+                                        let lx = local.0 - center.0;
+                                        let ly = local.1 - center.1;
+                                        let sx = lx.abs() / (w * 0.5).max(1.0);
+                                        let sy = ly.abs() / (h * 0.5).max(1.0);
+                                        let scale = sx.max(sy).clamp(0.12, 12.0);
+                                        let new_size = (t.size_px * scale).clamp(6.0, 240.0);
+                                        if (new_size - t.size_px).abs() > 0.01 {
+                                            t.size_px = new_size;
+                                            t.preset_link = None;
+                                        }
+                                        resized_text = Some((obj.id, center, t.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((id, center, text)) = resized_text {
+                            let (w, h) = self.text_layout_size(&text);
+                            if let Some(obj) = self.objects.iter_mut().find(|o| o.id == id) {
+                                obj.pivot = (center.0 - w * 0.5, center.1 - h * 0.5);
                             }
                         }
                         self.baked_dirty = true;
                     }
                     DragKind::Rotate => {
                         let img_pt = self.view.screen_to_img(ptr);
+                        let center = self
+                            .selected
+                            .and_then(|sel| self.objects.iter().find(|o| o.id == sel))
+                            .map(|obj| self.rotation_center(obj));
                         if let Some(obj) = self.selected_obj_mut() {
-                            let relx = img_pt.0 - obj.pivot.0;
-                            let rely = img_pt.1 - obj.pivot.1;
+                            let center = center.unwrap_or(obj.pivot);
+                            let relx = img_pt.0 - center.0;
+                            let rely = img_pt.1 - center.1;
                             // Handle points "up" (local -Y) at rotation 0.
                             obj.rotation_rad = rely.atan2(relx) + std::f32::consts::FRAC_PI_2;
                         }
@@ -5582,6 +5994,8 @@ fn default_bubble_tail(pivot: (f32, f32)) -> Tail {
 const PRESET_CELL_W: f32 = 96.0;
 /// Cell width of a window-preset thumbnail.
 const WINDOW_PRESET_CELL_W: f32 = 150.0;
+/// Cell width of a font-generated onomatopoeia thumbnail.
+const ONOMATO_PRESET_CELL_W: f32 = 184.0;
 /// Spacing between thumbnail cells in the add dialogs.
 const PRESET_CELL_SPACING: f32 = 10.0;
 
@@ -5678,6 +6092,43 @@ fn draw_window_preset_thumbnail(ui: &mut egui::Ui, preset: &WindowStylePreset) -
         })
         .inner;
     resp.clicked()
+}
+
+fn paint_onomatopoeia_preview(painter: &egui::Painter, area: Rect, preset: OnomatopoeiaPreset) {
+    let fill = rgba_to_color32(preset.color());
+    let outline = preset
+        .outline()
+        .map(|s| rgba_to_color32(s.color))
+        .unwrap_or(Color32::from_black_alpha(0));
+    let center = area.center();
+    let font_size = if preset.text().chars().count() >= 4 {
+        24.0
+    } else {
+        28.0
+    };
+    let font_id = egui::FontId::proportional(font_size);
+    let text = preset.text();
+    if preset.outline().is_some() {
+        for (dx, dy) in [
+            (-2.0, 0.0),
+            (2.0, 0.0),
+            (0.0, -2.0),
+            (0.0, 2.0),
+            (-1.5, -1.5),
+            (1.5, -1.5),
+            (-1.5, 1.5),
+            (1.5, 1.5),
+        ] {
+            painter.text(
+                center + egui::vec2(dx, dy),
+                egui::Align2::CENTER_CENTER,
+                text,
+                font_id.clone(),
+                outline,
+            );
+        }
+    }
+    painter.text(center, egui::Align2::CENTER_CENTER, text, font_id, fill);
 }
 
 /// Paint a quick preview of a window-style preset inside `area`: the panel fill
@@ -6294,6 +6745,328 @@ impl BubblePreset {
 // edit clears it. System presets use `sys:*` ids and aren't editable/removable;
 // user presets use `user:<name>` ids and persist to presets.json.
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct OnomatopoeiaPreset {
+    label: &'static str,
+    text: &'static str,
+    font_candidate: &'static str,
+    size_px: f32,
+    color: Rgba,
+    orientation: Orientation,
+    letter_gap: f32,
+    outline: Option<StrokeStyle>,
+    rotation_deg: f32,
+}
+
+const ONOMATOPOEIA_PRESETS: &[OnomatopoeiaPreset] = &[
+    OnomatopoeiaPreset {
+        label: "Otomanopee One",
+        text: "ドンッ",
+        font_candidate: "Otomanopee One",
+        size_px: 92.0,
+        color: Rgba::BLACK,
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 8.0,
+        }),
+        rotation_deg: -8.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Dela Gothic One",
+        text: "ガーン",
+        font_candidate: "Dela Gothic One",
+        size_px: 92.0,
+        color: Rgba::new(44, 78, 190, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 7.0,
+        }),
+        rotation_deg: 5.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Reggae One",
+        text: "ゴゴゴ",
+        font_candidate: "Reggae One",
+        size_px: 78.0,
+        color: Rgba::new(42, 28, 72, 255),
+        orientation: Orientation::Vertical,
+        letter_gap: 2.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::new(218, 196, 255, 255),
+            width_px: 5.0,
+        }),
+        rotation_deg: 0.0,
+    },
+    OnomatopoeiaPreset {
+        label: "RocknRoll One",
+        text: "ザザッ",
+        font_candidate: "RocknRoll One",
+        size_px: 82.0,
+        color: Rgba::WHITE,
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::BLACK,
+            width_px: 7.0,
+        }),
+        rotation_deg: -10.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Rampart One",
+        text: "バァン",
+        font_candidate: "Rampart One",
+        size_px: 88.0,
+        color: Rgba::new(255, 216, 64, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::BLACK,
+            width_px: 4.0,
+        }),
+        rotation_deg: 6.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Stick",
+        text: "シュッ",
+        font_candidate: "Stick",
+        size_px: 84.0,
+        color: Rgba::WHITE,
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::BLACK,
+            width_px: 6.0,
+        }),
+        rotation_deg: -14.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Train One",
+        text: "ビューン",
+        font_candidate: "Train One",
+        size_px: 78.0,
+        color: Rgba::new(90, 230, 255, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::new(12, 40, 70, 255),
+            width_px: 5.0,
+        }),
+        rotation_deg: -12.0,
+    },
+    OnomatopoeiaPreset {
+        label: "DotGothic16",
+        text: "ピコ",
+        font_candidate: "DotGothic16",
+        size_px: 64.0,
+        color: Rgba::new(125, 255, 110, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::new(20, 55, 25, 255),
+            width_px: 4.0,
+        }),
+        rotation_deg: 0.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Hachi Maru Pop",
+        text: "わーい",
+        font_candidate: "Hachi Maru Pop",
+        size_px: 74.0,
+        color: Rgba::new(255, 140, 45, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 6.0,
+        }),
+        rotation_deg: -4.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Darumadrop One",
+        text: "ぽよん",
+        font_candidate: "Darumadrop One",
+        size_px: 78.0,
+        color: Rgba::new(245, 70, 145, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 6.0,
+        }),
+        rotation_deg: 6.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Yusei Magic",
+        text: "キラキラ",
+        font_candidate: "Yusei Magic",
+        size_px: 68.0,
+        color: Rgba::new(255, 230, 72, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::new(92, 62, 0, 255),
+            width_px: 5.0,
+        }),
+        rotation_deg: 4.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Klee One SemiBold",
+        text: "しーん",
+        font_candidate: "Klee One SemiBold",
+        size_px: 58.0,
+        color: Rgba::new(122, 126, 132, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 7.0,
+        outline: None,
+        rotation_deg: 0.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Kaisei Decol Bold",
+        text: "ふわっ",
+        font_candidate: "Kaisei Decol Bold",
+        size_px: 64.0,
+        color: Rgba::new(245, 220, 255, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::new(74, 40, 120, 255),
+            width_px: 4.0,
+        }),
+        rotation_deg: -3.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Zen Kurenaido",
+        text: "ひそ",
+        font_candidate: "Zen Kurenaido",
+        size_px: 50.0,
+        color: Rgba::new(150, 150, 155, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 3.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 3.0,
+        }),
+        rotation_deg: 0.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Kaisei Tokumin ExtraBold",
+        text: "ズシン",
+        font_candidate: "Kaisei Tokumin ExtraBold",
+        size_px: 86.0,
+        color: Rgba::BLACK,
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 6.0,
+        }),
+        rotation_deg: 3.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Zen Maru Gothic Black",
+        text: "ぷにっ",
+        font_candidate: "Zen Maru Gothic Black",
+        size_px: 76.0,
+        color: Rgba::new(130, 235, 190, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::new(18, 76, 62, 255),
+            width_px: 5.0,
+        }),
+        rotation_deg: -4.0,
+    },
+    OnomatopoeiaPreset {
+        label: "M PLUS 1",
+        text: "バシッ",
+        font_candidate: "M PLUS 1",
+        size_px: 82.0,
+        color: Rgba::BLACK,
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 7.0,
+        }),
+        rotation_deg: -8.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Shippori Mincho Bold",
+        text: "ぞくっ",
+        font_candidate: "Shippori Mincho Bold",
+        size_px: 70.0,
+        color: Rgba::new(38, 48, 86, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 4.0,
+        }),
+        rotation_deg: -2.0,
+    },
+];
+
+impl OnomatopoeiaPreset {
+    const ALL: &'static [OnomatopoeiaPreset] = ONOMATOPOEIA_PRESETS;
+
+    fn label(self) -> &'static str {
+        self.label
+    }
+
+    fn text(self) -> &'static str {
+        self.text
+    }
+
+    fn font_candidate(self) -> &'static str {
+        self.font_candidate
+    }
+
+    fn color(self) -> Rgba {
+        self.color
+    }
+
+    fn outline(self) -> Option<StrokeStyle> {
+        self.outline
+    }
+
+    fn size_px(self) -> f32 {
+        self.size_px
+    }
+
+    fn rotation_rad(self) -> f32 {
+        self.rotation_deg.to_radians()
+    }
+
+    fn orientation(self) -> Orientation {
+        self.orientation
+    }
+
+    fn letter_gap(self) -> f32 {
+        self.letter_gap
+    }
+
+    fn build_text(self, font_key: &str) -> TextBlock {
+        TextBlock {
+            text: self.text().to_string(),
+            font_key: font_key.to_string(),
+            size_px: self.size_px(),
+            color: self.color(),
+            orientation: self.orientation(),
+            align: TextAlign::Center,
+            line_gap: 0.0,
+            letter_gap: self.letter_gap(),
+            outline: self.outline(),
+            auto_tcy: false,
+            markup_enabled: false,
+            ..TextBlock::default()
+        }
+    }
+}
 
 /// A reusable text-style preset (everything that styles a TextBlock except its
 /// content / markup rules).
@@ -7339,5 +8112,45 @@ mod sample_tests {
             .collect();
         assert!(all.contains('\u{E0100}'), "IVS selector present");
         assert!(all.contains('\u{3099}'), "combining dakuten present");
+    }
+
+    #[test]
+    fn onomatopoeia_preset_builds_text_object_style() {
+        let preset = OnomatopoeiaPreset::ALL
+            .iter()
+            .copied()
+            .find(|p| p.font_candidate() == "Otomanopee One")
+            .expect("Otomanopee preset");
+        let tb = preset.build_text("OtomanopeeOne Regular");
+        assert_eq!(tb.text, "ドンッ");
+        assert_eq!(tb.font_key, "OtomanopeeOne Regular");
+        assert_eq!(tb.orientation, Orientation::Horizontal);
+        assert_eq!(tb.align, TextAlign::Center);
+        assert!(!tb.markup_enabled);
+        assert_eq!(tb.outline.expect("impact outline").width_px, 8.0);
+        assert!(preset.rotation_rad().abs() > 0.01);
+    }
+
+    #[test]
+    fn onomatopoeia_presets_cover_bundled_font_samples() {
+        assert!(OnomatopoeiaPreset::ALL.len() >= 18);
+        for preset in OnomatopoeiaPreset::ALL {
+            assert!(!preset.label().is_empty());
+            assert!(!preset.text().is_empty());
+            assert!(!preset.font_candidate().is_empty());
+        }
+    }
+
+    #[test]
+    fn font_candidate_matching_ignores_separators() {
+        assert!(font_name_matches_candidate(
+            "DelaGothicOne-Regular",
+            "Dela Gothic One"
+        ));
+        assert!(font_name_matches_candidate(
+            "OtomanopeeOne Regular",
+            "Otomanopee One"
+        ));
+        assert!(!font_name_matches_candidate("Yu Gothic", "Dela Gothic One"));
     }
 }
