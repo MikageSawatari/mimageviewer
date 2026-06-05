@@ -35,7 +35,10 @@ const SECTION_FONT: f32 = 12.0;
 const LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 230, 230);
 
 /// 左パネルの幅
-pub const LEFT_PANEL_WIDTH: f32 = 260.0;
+// ヘッダーのツール入口アイコンは 6 個 (消しゴム/補正/隠蔽/切り取り/テキスト/エクスポート)。
+// 各 28px + gap 4px + 右余白 8px のクラスタと「画像補正」タイトルが衝突しないよう、
+// アイコン 1 個分 (約 32px) 広げて 292px にしている (テキスト注釈アイコン追加時に拡幅)。
+pub const LEFT_PANEL_WIDTH: f32 = 292.0;
 /// 左パネルの下端をウィンドウ下端から少し浮かせる余白。
 pub const LEFT_PANEL_BOTTOM_MARGIN: f32 = 20.0;
 /// 補正本文の左余白。画面端に文字が張り付かないようにする。
@@ -10561,10 +10564,12 @@ impl App {
                         | crate::grid_item::GridItem::PdfPage { .. }
                 )
             );
-        // 右側 5 ボタン。左から 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り / エクスポート。
+        // 右側 6 ボタン。左から 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り / テキスト / エクスポート。
+        // テキストは comic 注釈モード (最前面・パイプライン最終段) なので crop と export の間に置く。
         let btn_y = header_rect.center().y - HEADER_BTN_SIZE / 2.0;
         let export_btn_x = header_rect.max.x - HEADER_RIGHT_PAD - HEADER_BTN_SIZE;
-        let crop_btn_x = export_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+        let text_btn_x = export_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+        let crop_btn_x = text_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
         let conceal_btn_x = crop_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
         let local_adjust_btn_x = conceal_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
         let erase_btn_x = local_adjust_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
@@ -10584,6 +10589,10 @@ impl App {
             egui::pos2(crop_btn_x, btn_y),
             egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
         );
+        let text_rect = egui::Rect::from_min_size(
+            egui::pos2(text_btn_x, btn_y),
+            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
+        );
         let export_rect = egui::Rect::from_min_size(
             egui::pos2(export_btn_x, btn_y),
             egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
@@ -10592,6 +10601,7 @@ impl App {
         let mut activate_local_adjust = false;
         let mut activate_conceal = false;
         let mut activate_crop = false;
+        let mut activate_text = false;
         let mut activate_export = false;
 
         let erase_resp = draw_header_icon_button(
@@ -10646,6 +10656,19 @@ impl App {
             activate_crop = true;
         }
 
+        let text_resp = draw_header_icon_button(
+            &mut child,
+            text_rect,
+            "adjust_panel_text_btn",
+            can_overlay_edit,
+            false,
+            "テキスト注釈 (Ctrl+T)",
+            crate::ui_fullscreen::draw_icons::draw_text_icon,
+        );
+        if can_overlay_edit && text_resp.clicked() {
+            activate_text = true;
+        }
+
         let export_resp = draw_header_icon_button(
             &mut child,
             export_rect,
@@ -10683,6 +10706,11 @@ impl App {
         if activate_crop {
             self.adjustment_mode = false;
             self.enter_export_crop_mode(fs_root_idx);
+            return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
+        }
+        if activate_text {
+            self.adjustment_mode = false;
+            self.enter_text_mode(fs_root_idx);
             return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
         }
         if activate_export {

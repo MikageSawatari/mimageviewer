@@ -303,6 +303,45 @@ pub(crate) fn draw_crop_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     );
 }
 
+/// テキスト注釈 (comic) アイコン。吹き出し + 本文線 + しっぽで注釈ツールを表す。
+pub(crate) fn draw_text_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let white = egui::Color32::WHITE;
+    let stroke = egui::Stroke::new(1.6, white);
+    let bw = r * 0.92; // 吹き出し本体の半幅
+    let bh = r * 0.62; // 吹き出し本体の半高
+    let body = egui::Rect::from_min_max(
+        egui::pos2(c.x - bw, c.y - bh - r * 0.14),
+        egui::pos2(c.x + bw, c.y + bh - r * 0.14),
+    );
+    painter.rect_stroke(body, r * 0.30, stroke, egui::StrokeKind::Middle);
+    // しっぽ (左下)
+    painter.add(egui::Shape::line(
+        vec![
+            egui::pos2(c.x - bw * 0.42, body.max.y - 0.6),
+            egui::pos2(c.x - bw * 0.58, c.y + bh + r * 0.34),
+            egui::pos2(c.x - bw * 0.04, body.max.y - 0.6),
+        ],
+        stroke,
+    ));
+    // 本文線 2 本
+    let line_y0 = body.center().y - r * 0.20;
+    let line_y1 = body.center().y + r * 0.16;
+    painter.line_segment(
+        [
+            egui::pos2(c.x - bw * 0.55, line_y0),
+            egui::pos2(c.x + bw * 0.55, line_y0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(c.x - bw * 0.55, line_y1),
+            egui::pos2(c.x + bw * 0.28, line_y1),
+        ],
+        stroke,
+    );
+}
+
 /// 補正レイヤーアイコン。重なった薄いシートで「非破壊レイヤー」を表す。
 pub(crate) fn draw_local_adjust_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let white = egui::Color32::WHITE;
