@@ -904,12 +904,23 @@ impl App {
     // ── オーバーレイ描画 ──────────────────────────────────────────────
 
     /// テキストモードのパネル領域 (クリック吸収判定用)。
+    /// 左右パネルの本体 (スクロール領域) の高さ。`draw_text_panel` と入力抑制矩形
+    /// (`text_panel_rect` / `text_detail_panel_rect`) で同じ値を共有する。
+    fn text_panel_body_height(image_rect: egui::Rect) -> f32 {
+        (image_rect.height() - PANEL_MARGIN_Y - 48.0).clamp(200.0, 720.0)
+    }
+
     pub(crate) fn text_panel_rect(&self, image_rect: egui::Rect) -> egui::Rect {
         let pos = egui::pos2(
             image_rect.min.x + PANEL_MARGIN_X,
             image_rect.min.y + PANEL_MARGIN_Y,
         );
-        let h = (image_rect.height() - PANEL_MARGIN_Y - 24.0).clamp(220.0, 760.0);
+        // 本体高 + chrome (ヘッダ + 追加行 + セパレータ 2 本 + popup 余白) を確保し、
+        // 実際に見えているパネルより矩形が短くならないようにする (Codex P2: 下端の帯で
+        // キャンバスクリックが貫通し選択解除/ドラッグが起きるのを防ぐ)。画面下端で打ち切る。
+        let h = (Self::text_panel_body_height(image_rect) + 108.0)
+            .min(image_rect.height() - PANEL_MARGIN_Y - 4.0)
+            .max(120.0);
         egui::Rect::from_min_size(pos, egui::vec2(PANEL_W + 16.0, h))
     }
 
@@ -919,7 +930,10 @@ impl App {
         let w = PANEL_W + 16.0;
         let x = (image_rect.max.x - w - PANEL_MARGIN_X).max(image_rect.min.x + PANEL_MARGIN_X);
         let pos = egui::pos2(x, image_rect.min.y + PANEL_MARGIN_Y);
-        let h = (image_rect.height() - PANEL_MARGIN_Y - 24.0).clamp(220.0, 760.0);
+        // 右は「詳細設定」見出し + セパレータ + popup 余白のみ (追加行が無い分 chrome 小)。
+        let h = (Self::text_panel_body_height(image_rect) + 72.0)
+            .min(image_rect.height() - PANEL_MARGIN_Y - 4.0)
+            .max(120.0);
         egui::Rect::from_min_size(pos, egui::vec2(w, h))
     }
 
@@ -1035,7 +1049,7 @@ impl App {
         );
         let sink_rect = self.text_panel_rect(image_rect);
         let detail_rect = self.text_detail_panel_rect(image_rect);
-        let body_height = (image_rect.height() - PANEL_MARGIN_Y - 48.0).clamp(200.0, 720.0);
+        let body_height = Self::text_panel_body_height(image_rect);
 
         // 借用衝突を避けるため作業セットを一旦取り出し、ローカルだけを編集する。
         let mut objects = self.comic_docs.remove(&key).unwrap_or_default();
