@@ -51,16 +51,23 @@ TensorRT とは別の導線にする。
 | 種別 | 内容 | 必須度 | サイズ目安 | 備考 |
 | --- | --- | --- | --- | --- |
 | オノマトペ向け OFL フォント | Google Fonts 等の OFL 日本語フォント | 高 | lab 現状 18 書体で約 61 MiB | ライセンス文面も同梱 |
-| 被写体分離モデル | U²-Net 系 foreground matte ONNX | 高 | 要再計測 | まず通常版 U²-Net を優先候補。重すぎる場合のみ軽量版再検討 |
+| 被写体分離モデル | BiRefNet fp16 ONNX (foreground matte) | 高 | ~490 MB | onnx-community/BiRefNet-ONNX (重み ZhengPeng7/BiRefNet 由来、MIT)。RTX 4090/DirectML で warm 104ms (1024²) を実測 |
 | フォントプリセット | フォントごとのサンプル語、色、袋文字、初期角度 | 高 | 小 | アプリ側コード/JSON でもよい |
 | 画像オノマトペ素材 | PNG/WebP スタンプ素材 | 低 | 未定 | ライセンス整理が必要。初期 pack には含めなくてよい |
 
-U²-Net について:
+被写体分離モデルについて (2026-06 確定):
 
-- 現行 docs では `U²-Netp` を小型モデルとして扱っている。
-- 今後は比較的新しい PC をターゲットにし、検証分岐を減らすため、通常版 U²-Net を優先する。
-- 通常版のサイズ、ライセンス、DirectML / CPU 実行時間は、実装直前に再確認する。
+- 当初は U²-Net 系を候補としていたが、検証の結果 **BiRefNet fp16** を採用した。
+  イラスト (髪の細毛まで) / 実写 (salient 被写体) いずれも U²-Netp と別次元の品質。
+- 入手元: onnx-community/BiRefNet-ONNX (`onnx/model_fp16.onnx`, 490 MB)。
+  重みは ZhengPeng7/BiRefNet 由来、**MIT** ライセンス。
+- I/O: 入力 `input_image` [1,3,1024,1024] **fp32** (fp16 は内部のみ)、ImageNet 正規化。
+  出力 `output_image` [1,1,1024,1024] は **sigmoid 適用前のロジット** (後処理で sigmoid)。
+- 実行は **DirectML (GPU)**。RTX 4090 で warm 104ms / cold 297ms、初回ロード ~4.9s。
+  CPU では 1024² が実用にならないため、`load_model` (DirectML EP) を使う。
+- v1.1.0 開発中に本体埋め込みの U²-Netp は廃止。被写体マスク生成は追加パック導入時のみ有効。
 - モデル差し替えは pack manifest のバージョン更新で扱う。保存済み被写体マスクはモデル無しでも使える。
+- 検証 probe: `cargo run --release --bin probe_birefnet -- <model.onnx> <image>`。
 
 ## 4. ダウンロード導線
 
@@ -120,8 +127,8 @@ U²-Net について:
         *.ttf
         *-OFL.txt
       models/
-        u2net.onnx
-        u2net-LICENSE.txt
+        birefnet_fp16.onnx
+        birefnet_fp16-LICENSE.txt
 ```
 
 `manifest.json` は現在有効な pack へのポインタを持つ。
@@ -147,10 +154,10 @@ pack 更新時は新しいディレクトリへ展開してから、検証完了
       "sha256": "..."
     },
     {
-      "path": "models/u2net.onnx",
+      "path": "models/birefnet_fp16.onnx",
       "kind": "subject_matte_model",
-      "model_id": "u2net",
-      "license": "...",
+      "model_id": "birefnet_fp16",
+      "license": "MIT",
       "sha256": "..."
     }
   ]
