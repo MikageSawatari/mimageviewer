@@ -235,7 +235,10 @@ impl App {
     fn on_editing_addon_installed(&mut self) {
         self.comic_fonts = None;
         self.comic_fonts_loaded = false;
-        crate::logger::log("[editing pack] install 完了、フォントキャッシュを無効化".to_string());
+        self.refresh_subject_matte_path();
+        crate::logger::log(
+            "[editing pack] install 完了、フォント / 被写体マットキャッシュを無効化".to_string(),
+        );
     }
 
     /// インストールダイアログ本体。`update()` から毎フレーム呼ぶ。

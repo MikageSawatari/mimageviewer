@@ -784,11 +784,14 @@ impl App {
     pub(crate) fn uninstall_editing_addon_now(&mut self) {
         // 1. active pointer を先に外す (= 機能側は即「未導入」扱いになる)。
         let _ = std::fs::remove_file(crate::editing_addon::active_pointer_path());
-        // 2. フォントキャッシュ無効化 (次回ベイク時に追加パックフォントを外して読み直す)。
+        // 2. フォント / 被写体マットキャッシュ無効化。
+        //    active pointer を外した後なので refresh は None になり、被写体マスク生成が即 disabled になる。
         self.comic_fonts = None;
         self.comic_fonts_loaded = false;
+        self.refresh_subject_matte_path();
         crate::logger::log(
-            "[editing pack] 削除を開始 (active.json 解除 + フォントキャッシュ無効化)".to_string(),
+            "[editing pack] 削除を開始 (active.json 解除 + フォント/被写体マットキャッシュ無効化)"
+                .to_string(),
         );
         // 3. pack ディレクトリ / DL 残骸の削除は背景 thread に逃がす
         //    (BiRefNet ~490MB を含むため remove_dir_all は数秒かかり得る)。

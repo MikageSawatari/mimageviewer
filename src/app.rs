@@ -3879,6 +3879,11 @@ pub struct App {
     /// だけ 1 度ロードを試みる。本格的なフォント管理は Inc 4b。
     pub(crate) comic_fonts: Option<Arc<comic_core::FontSet>>,
     pub(crate) comic_fonts_loaded: bool,
+    /// 被写体マット (BiRefNet) モデルの絶対パス。編集用追加パックから供給される。
+    /// 未導入なら `None` (= 被写体マスク生成は disabled)。毎フレームの I/O を避けるため
+    /// ここにキャッシュし、起動時 / pack 導入完了 / pack 削除時にだけ
+    /// `refresh_subject_matte_path()` で更新する。
+    pub(crate) subject_matte_path: Option<std::path::PathBuf>,
     /// スタンプ画像のデコードキャッシュ (`stamp_source_key` → 512px straight-alpha
     /// `RgbaOverlay`)。絵文字 SVG / ユーザー画像を 1 度だけデコードし、各ベイクで
     /// id→Arc の `StampImages` を組み立てる際に再利用する (Inc 4c)。`None` =
@@ -5019,6 +5024,7 @@ impl App {
             comic_generation: 0,
             comic_fonts: None,
             comic_fonts_loaded: false,
+            subject_matte_path: crate::editing_addon::subject_matte_model_path(),
             comic_stamp_cache: std::collections::HashMap::new(),
             comic_demo_enabled: std::env::var("MIV_COMIC_DEMO")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -20701,6 +20707,21 @@ impl App {
             }
         }
         self.comic_fonts.clone()
+    }
+
+    /// 被写体マット (BiRefNet) モデルパスのキャッシュを再評価する。
+    /// 編集用追加パックの導入完了 / 削除時に呼ぶ (起動時は構造体初期化で設定済み)。
+    /// `editing_addon::subject_matte_model_path()` は active.json + manifest の読み込みを
+    /// 伴うため、毎フレームではなく状態変化時にだけ呼ぶこと。
+    pub(crate) fn refresh_subject_matte_path(&mut self) {
+        self.subject_matte_path = crate::editing_addon::subject_matte_model_path();
+        crate::logger::log(format!(
+            "[editing pack] 被写体マットモデル: {}",
+            self.subject_matte_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(未導入)".to_string())
+        ));
     }
 
     /// canonical(非回転・非アップスケール)ソース画素の寸法 `(W, H)` を返す。注釈座標

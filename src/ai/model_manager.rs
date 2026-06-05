@@ -57,11 +57,9 @@ static EMBEDDED_MODELS: &[EmbeddedModel] = &[
         filename: "migan.onnx",
         bytes: include_bytes!("../../vendor/models/migan.onnx"),
     },
-    EmbeddedModel {
-        kind: ModelKind::SubjectU2Netp,
-        filename: "u2netp.onnx",
-        bytes: include_bytes!("../../vendor/models/u2netp.onnx"),
-    },
+    // 被写体マット (ModelKind::SubjectMatte = BiRefNet) は本体に埋め込まず、
+    // 編集用追加パック (editing_addon) からダウンロードして供給する。
+    // u2netp.onnx の埋め込みは v1.1.0 開発中に廃止 (spec §9: pack 導入時のみ有効化)。
 ];
 
 /// 展開済みモデルディレクトリのキャッシュ。

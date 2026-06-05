@@ -126,8 +126,8 @@ pub enum ModelKind {
     DenoiseRealplksr,
     /// MI-GAN Inpainting
     InpaintMiGan,
-    /// U²-Netp foreground segmentation
-    SubjectU2Netp,
+    /// 被写体マット (BiRefNet, 編集用追加パックから供給。fp32 I/O, 1024², 出力は sigmoid 適用前ロジット)
+    SubjectMatte,
 }
 
 impl ModelKind {
@@ -142,7 +142,7 @@ impl ModelKind {
             ModelKind::DenoiseRealplksr => "denoise_realplksr",
             ModelKind::InpaintMiGan => "inpaint_migan",
             ModelKind::UpscaleRealCugan4x => "realcugan_4x",
-            ModelKind::SubjectU2Netp => "subject_u2netp",
+            ModelKind::SubjectMatte => "subject_matte",
         }
     }
 
@@ -157,7 +157,7 @@ impl ModelKind {
             ModelKind::UpscaleRealEsrGeneralV3 => "高速汎用",
             ModelKind::DenoiseRealplksr => "JPEG ノイズ除去 (等倍)",
             ModelKind::InpaintMiGan => "補完 (MI-GAN)",
-            ModelKind::SubjectU2Netp => "被写体選択 (U²-Netp)",
+            ModelKind::SubjectMatte => "被写体マット (BiRefNet)",
         }
     }
 
@@ -174,7 +174,8 @@ impl ModelKind {
             "inpaint_migan" | "inpaint_lama" => Some(ModelKind::InpaintMiGan),
             "realcugan_4x" => Some(ModelKind::UpscaleRealCugan4x),
             "denoise_realplksr" => Some(ModelKind::DenoiseRealplksr),
-            "subject_u2netp" => Some(ModelKind::SubjectU2Netp),
+            // "subject_u2netp" は旧名 (v1.1.0 開発中の埋め込み U²-Netp)。BiRefNet 移行後の互換用。
+            "subject_matte" | "subject_u2netp" => Some(ModelKind::SubjectMatte),
             _ => None,
         }
     }

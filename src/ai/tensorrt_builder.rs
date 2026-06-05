@@ -154,7 +154,9 @@ fn warmup_input_shape(kind: ModelKind) -> (usize, usize, usize, usize) {
         ModelKind::ClassifierMobileNet => (1, 3, 384, 384),
         ModelKind::DenoiseRealplksr => (1, 3, 256, 256),
         ModelKind::InpaintMiGan => (1, 4, 512, 512),
-        ModelKind::SubjectU2Netp => (1, 3, 320, 320),
+        // SubjectMatte (BiRefNet) は should_route_to_worker=false なので TRT engine は作らないが、
+        // match の網羅性のため shape を残す (= BiRefNet 入力 1024²)。
+        ModelKind::SubjectMatte => (1, 3, 1024, 1024),
         ModelKind::UpscaleRealEsrGeneralV3 => (1, 3, 512, 512),
         ModelKind::UpscaleRealEsrganX4Plus
         | ModelKind::UpscaleRealEsrganAnime6B

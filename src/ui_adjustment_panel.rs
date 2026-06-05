@@ -59,7 +59,8 @@ const LOCAL_ADJUST_PANEL_SECTION_CONTENT_W_SHRINK: f32 =
 const LOCAL_ADJUST_MASK_PICKER_BUTTON_SIZE: egui::Vec2 = egui::vec2(156.0, 30.0);
 const LOCAL_ADJUST_EFFECT_PICKER_BUTTON_H: f32 = 30.0;
 const LOCAL_ADJUST_EDGE_BRUSH_INCLUDE_BOUNDARY_RADIUS: isize = 2;
-const LOCAL_ADJUST_U2NETP_INPUT_SIZE: usize = 320;
+/// 被写体マット (BiRefNet) の正方形入力サイズ。BiRefNet は 1024² 学習。
+const LOCAL_ADJUST_SUBJECT_INPUT_SIZE: usize = 1024;
 const LOCAL_ADJUST_REGION_SEGMENT_MAX_LABELS: usize = 2048;
 const LOCAL_ADJUST_MASK_PREVIEW_BASE_ALPHA: f32 = 155.0;
 const LOCAL_ADJUST_MASK_PREVIEW_EDIT_ALPHA: u8 = 225;
@@ -106,6 +107,8 @@ struct LocalEffectPanelRequests {
     set_effect_position_handles_visible: Option<bool>,
     generate_subject_mask: Option<usize>,
     generate_region_mask: Option<(usize, LocalAdjustRegionSegmentationScope)>,
+    /// 被写体マットモデル (編集用追加パック) が未導入のとき、ダウンロード導線を開く要求 (spec §9)。
+    request_editing_addon_download: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +178,7 @@ impl MaskKind {
             Self::RadialGradient => "中心から外側へ段階的に効果をかけます。",
             Self::LumaRange => "明るさの範囲でマスクを作ります。",
             Self::ColorRange => "指定色に近い範囲をマスクにします。",
-            Self::Subject => "U²-Netp で被写体マスクを生成して使います。",
+            Self::Subject => "AI で被写体マスクを生成して使います。",
             Self::Segmentation => "色と境界から領域候補を生成してクリック選択します。",
         }
     }
@@ -2858,7 +2861,7 @@ fn local_adjust_subject_mask_candidate_from_layers(
     })
 }
 
-fn build_local_adjust_u2netp_input(
+fn build_local_adjust_subject_input(
     source: &egui::ColorImage,
 ) -> Result<ndarray::Array4<f32>, String> {
     let [width, height] = source.size;
@@ -2874,20 +2877,20 @@ fn build_local_adjust_u2netp_input(
     };
     let resized = image::imageops::resize(
         &rgb_image,
-        LOCAL_ADJUST_U2NETP_INPUT_SIZE as u32,
-        LOCAL_ADJUST_U2NETP_INPUT_SIZE as u32,
+        LOCAL_ADJUST_SUBJECT_INPUT_SIZE as u32,
+        LOCAL_ADJUST_SUBJECT_INPUT_SIZE as u32,
         image::imageops::FilterType::Triangle,
     );
     let mut input = ndarray::Array4::<f32>::zeros((
         1,
         3,
-        LOCAL_ADJUST_U2NETP_INPUT_SIZE,
-        LOCAL_ADJUST_U2NETP_INPUT_SIZE,
+        LOCAL_ADJUST_SUBJECT_INPUT_SIZE,
+        LOCAL_ADJUST_SUBJECT_INPUT_SIZE,
     ));
     let mean = [0.485_f32, 0.456, 0.406];
     let std = [0.229_f32, 0.224, 0.225];
-    for y in 0..LOCAL_ADJUST_U2NETP_INPUT_SIZE {
-        for x in 0..LOCAL_ADJUST_U2NETP_INPUT_SIZE {
+    for y in 0..LOCAL_ADJUST_SUBJECT_INPUT_SIZE {
+        for x in 0..LOCAL_ADJUST_SUBJECT_INPUT_SIZE {
             let p = resized.get_pixel(x as u32, y as u32).0;
             for c in 0..3 {
                 let v = p[c] as f32 / 255.0;
@@ -2898,7 +2901,7 @@ fn build_local_adjust_u2netp_input(
     Ok(input)
 }
 
-fn local_adjust_u2netp_output_size(shape: &[i64], raw_len: usize) -> (usize, usize) {
+fn local_adjust_subject_output_size(shape: &[i64], raw_len: usize) -> (usize, usize) {
     if shape.len() >= 2 {
         let h = shape[shape.len() - 2].max(1) as usize;
         let w = shape[shape.len() - 1].max(1) as usize;
@@ -2911,35 +2914,27 @@ fn local_adjust_u2netp_output_size(shape: &[i64], raw_len: usize) -> (usize, usi
         (side, side)
     } else {
         (
-            LOCAL_ADJUST_U2NETP_INPUT_SIZE,
-            raw_len.max(1).div_ceil(LOCAL_ADJUST_U2NETP_INPUT_SIZE),
+            LOCAL_ADJUST_SUBJECT_INPUT_SIZE,
+            raw_len.max(1).div_ceil(LOCAL_ADJUST_SUBJECT_INPUT_SIZE),
         )
     }
 }
 
-fn normalize_local_adjust_u2netp_output(raw: &[f32], width: usize, height: usize) -> Vec<f32> {
-    let len = width.saturating_mul(height).min(raw.len());
-    if len == 0 {
-        return vec![0.0; width.saturating_mul(height)];
-    }
-    let offset = raw.len().saturating_sub(width.saturating_mul(height));
-    let values = &raw[offset..offset + len];
-    let mut min_v = f32::INFINITY;
-    let mut max_v = f32::NEG_INFINITY;
-    for &v in values {
-        if v.is_finite() {
-            min_v = min_v.min(v);
-            max_v = max_v.max(v);
-        }
-    }
-    let range = max_v - min_v;
-    let mut out = vec![0.0; width.saturating_mul(height)];
+/// BiRefNet の出力 (sigmoid 適用前のロジット、実測レンジ ±300) を 0-1 のマット alpha に変換する。
+/// 旧 U²-Netp は出力が概ね 0-1 だったため min/max 正規化だったが、BiRefNet はロジット出力なので
+/// sigmoid を直接適用する (min/max 正規化だと巨大レンジが線形圧縮されて灰色のぼやけたマットになる)。
+/// 出力テンソルが `[.., 1, H, W]` の場合の最後の H*W を採用する。
+fn sigmoid_local_adjust_subject_output(raw: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let total = width.saturating_mul(height);
+    let len = total.min(raw.len());
+    let offset = raw.len().saturating_sub(total);
+    let mut out = vec![0.0_f32; total];
     for (idx, slot) in out.iter_mut().enumerate().take(len) {
-        let value = values[idx];
-        *slot = if range.is_finite() && range > 1.0e-6 {
-            ((value - min_v) / range).clamp(0.0, 1.0)
+        let v = raw[offset + idx];
+        *slot = if v.is_finite() {
+            (1.0 / (1.0 + (-v).exp())).clamp(0.0, 1.0)
         } else {
-            value.clamp(0.0, 1.0)
+            0.0
         };
     }
     out
@@ -2955,30 +2950,33 @@ fn resize_local_adjust_mask_bilinear(
     local_adjust_core::resize_mask_bilinear(src, src_w, src_h, dst_w, dst_h)
 }
 
-fn run_local_adjust_u2netp_segmentation(
+fn run_local_adjust_subject_segmentation(
     runtime: Arc<crate::ai::runtime::AiRuntime>,
     model_path: std::path::PathBuf,
     source: Arc<egui::ColorImage>,
 ) -> Result<local_adjust_core::RasterMask, String> {
+    // BiRefNet は 1024² の重いモデルなので DirectML (GPU) でロードする。
+    // (CPU では 1024² 推論が数十秒かかり実用にならない。DirectML EP 登録失敗時のみ
+    //  register_directml_ep が CPU にフォールバックする。)
     runtime
-        .load_model_cpu(crate::ai::ModelKind::SubjectU2Netp, &model_path)
-        .map_err(|err| format!("U²-Netp load: {err}"))?;
-    let input = build_local_adjust_u2netp_input(&source)?;
+        .load_model(crate::ai::ModelKind::SubjectMatte, &model_path)
+        .map_err(|err| format!("BiRefNet load: {err}"))?;
+    let input = build_local_adjust_subject_input(&source)?;
     let input_tensor =
         ort::value::Tensor::from_array(input).map_err(|err| format!("Tensor creation: {err}"))?;
     let (shape, raw) = runtime
-        .with_session(crate::ai::ModelKind::SubjectU2Netp, |session| {
+        .with_session(crate::ai::ModelKind::SubjectMatte, |session| {
             let outputs = session
                 .run(ort::inputs![input_tensor])
-                .map_err(|err| crate::ai::AiError::Ort(format!("U²-Netp run: {err}")))?;
+                .map_err(|err| crate::ai::AiError::Ort(format!("BiRefNet run: {err}")))?;
             let (shape, raw) = outputs[0]
                 .try_extract_tensor::<f32>()
-                .map_err(|err| crate::ai::AiError::Ort(format!("U²-Netp extract: {err}")))?;
+                .map_err(|err| crate::ai::AiError::Ort(format!("BiRefNet extract: {err}")))?;
             Ok((shape.iter().copied().collect::<Vec<i64>>(), raw.to_vec()))
         })
         .map_err(|err| err.to_string())?;
-    let (small_w, small_h) = local_adjust_u2netp_output_size(&shape, raw.len());
-    let small_mask = normalize_local_adjust_u2netp_output(&raw, small_w, small_h);
+    let (small_w, small_h) = local_adjust_subject_output_size(&shape, raw.len());
+    let small_mask = sigmoid_local_adjust_subject_output(&raw, small_w, small_h);
     let alpha = resize_local_adjust_mask_bilinear(
         &small_mask,
         small_w,
@@ -6379,12 +6377,31 @@ fn draw_local_mask_editor(
                 egui::Button::new(generate_label),
             );
             let generate_tip = if subject_model_available {
-                "元画像から U²-Netp で被写体マスクを生成します。"
+                "元画像から AI で被写体マスクを生成します。"
             } else {
-                "U²-Netp モデルが見つからないため生成できません。保存済みマスクの適用は可能です。"
+                "被写体マスク生成には編集用追加ファイルが必要です。保存済みマスクの表示・編集は可能です。"
             };
             if generate_response.on_hover_text(generate_tip).clicked() {
                 effect_requests.generate_subject_mask = Some(layer_idx);
+            }
+            // モデル未導入時はダウンロード導線を出す (spec §9)。
+            if !subject_model_available {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("編集用追加ファイルが必要です")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(255, 180, 90)),
+                    );
+                    if ui
+                        .small_button("ダウンロード")
+                        .on_hover_text(
+                            "被写体分離モデルを含む編集用追加ファイルをダウンロードします。",
+                        )
+                        .clicked()
+                    {
+                        effect_requests.request_editing_addon_download = true;
+                    }
+                });
             }
             ui.horizontal_wrapped(|ui| {
                 if ui.small_button("被写体を選択").clicked() {
@@ -9317,6 +9334,11 @@ impl App {
         if let Some((layer_idx, scope)) = effect_requests.generate_region_mask {
             self.start_local_adjust_region_segmentation(fs_idx, layer_idx, scope);
         }
+        if effect_requests.request_editing_addon_download {
+            // 被写体マスク UI からの明示クリックなので、このセッションで辞退済みでも開く。
+            self.editing_addon_declined_session = false;
+            self.maybe_prompt_editing_addon();
+        }
     }
 
     fn choose_local_adjust_cube_lut_for_layer(&mut self, fs_idx: usize, layer_idx: usize) {
@@ -9471,11 +9493,12 @@ impl App {
             self.show_feedback_toast("AI ランタイムが初期化されていません".to_string());
             return;
         };
-        let Some(model_path) = self
-            .ai_model_manager
-            .model_path(crate::ai::ModelKind::SubjectU2Netp)
-        else {
-            self.show_feedback_toast("U²-Netp モデルが見つかりません".to_string());
+        // 被写体マットモデル (BiRefNet) は編集用追加パックから供給される。
+        // App 構造体に毎フレーム I/O を避けてキャッシュしてあるパスを使う。
+        let Some(model_path) = self.subject_matte_path.clone() else {
+            self.show_feedback_toast(
+                "被写体マットモデルが見つかりません (編集用追加ファイル未導入)".to_string(),
+            );
             return;
         };
         let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
@@ -9491,7 +9514,7 @@ impl App {
         let spawn_result = std::thread::Builder::new()
             .name("local-adjust-subject-segmentation".to_string())
             .spawn(move || {
-                let result = run_local_adjust_u2netp_segmentation(runtime, model_path, source)
+                let result = run_local_adjust_subject_segmentation(runtime, model_path, source)
                     .map(LocalAdjustGeneratedMask::Subject);
                 let _ = tx.send(result);
             });
@@ -10054,10 +10077,9 @@ impl App {
         } else {
             ("待機", egui::Color32::from_gray(165))
         };
-        let subject_model_available = self
-            .ai_model_manager
-            .model_path(crate::ai::ModelKind::SubjectU2Netp)
-            .is_some();
+        // 被写体マットモデル (編集用追加パック) の有無。毎フレーム I/O を避けるため
+        // App キャッシュ (subject_matte_path) を読むだけ (install/uninstall で更新される)。
+        let subject_model_available = self.subject_matte_path.is_some();
         let subject_mask_available =
             local_adjust_subject_mask_candidate_from_layers(&layers, image_dims).is_some();
         let previous_mask_edit_target = self.local_adjust_mask_edit_target;
