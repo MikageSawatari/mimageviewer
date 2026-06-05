@@ -17,6 +17,11 @@
 //! - パネル (`draw_text_panel`): オブジェクト追加 / 一覧 (選択・複製・削除・前後) /
 //!   選択中オブジェクトの種別別インライン編集 (テキスト内容・サイズ・色・向き・袋文字・
 //!   吹き出し形状・塗り・ウィンドウ枠 等)。IME 安全なテキスト入力。
+//! - Undo/Redo (`do_comic_undo` / `do_comic_redo` / `commit_comic_undo_on_settle`、Inc 6):
+//!   テキストモード中だけ効く Ctrl+Z / Ctrl+Y (Ctrl+Shift+Z) のエディタ専用
+//!   スナップショットスタック (D7)。`meta_undo` (レーティング/タグ) とは別スタックで、
+//!   `handle_text_keys` が先に key を consume するので干渉しない。編集が settle したら
+//!   ベースラインとの差を 1 エントリに coalesce する (ラボ移植)。
 //!
 //! 変形ハンドル (四隅スケール / 回転ノブ / しっぽ) と Undo/Redo は Inc 6、スタンプ
 //! ピッカー (絵文字アセット) は Inc 4c、プリセット / 追加ダイアログは Inc 5。
@@ -36,6 +41,9 @@ const PANEL_MARGIN_X: f32 = 16.0;
 const PANEL_MARGIN_Y: f32 = 60.0;
 /// ハンドル (回転ノブ / 四隅 / しっぽ) の当たり判定半径 (画面 px)。ラボと同値。
 const HANDLE_R: f32 = 7.0;
+/// エディタ専用 Undo/Redo (Inc 6) の最大スタック深さ。ラボ (`UNDO_CAP`) と同値。
+/// 超過時は最古エントリから捨てる。
+const COMIC_UNDO_CAP: usize = 100;
 
 /// 右詳細パネルのカテゴリタブ。補正レイヤーの section-accent と同じく、各カテゴリに
 /// アクセント色を割り当て、タブボタン + コンテンツ左端の色帯で「カラーの縦線での分類」を
@@ -692,6 +700,58 @@ fn kind_label(o: &AnnotationObject) -> &'static str {
     }
 }
 
+// ── Undo / Redo の純ロジック (Inc 6、テスト容易にするため App 非依存) ──────
+//
+// ラボ `commit_pending` / `do_undo` / `do_redo` の coalesce スタック操作を、
+// `comic_docs[key]` の作業 Vec (`objects`) と 3 本のスタック / ベースラインだけを
+// 受け取る自由関数に切り出したもの。App 側メソッドはこれを呼ぶだけの薄いファサード。
+
+/// coalesce commit: `objects` がベースラインと異なれば旧ベースラインを undo へ積み、
+/// redo をクリアし、ベースラインを `objects` へ更新する。`UNDO_CAP` 超過分は最古を捨てる。
+fn comic_commit_pending(
+    undo: &mut Vec<Vec<AnnotationObject>>,
+    redo: &mut Vec<Vec<AnnotationObject>>,
+    baseline: &mut Vec<AnnotationObject>,
+    objects: &[AnnotationObject],
+) {
+    if objects != baseline.as_slice() {
+        undo.push(std::mem::replace(baseline, objects.to_vec()));
+        if undo.len() > COMIC_UNDO_CAP {
+            undo.remove(0);
+        }
+        redo.clear();
+    }
+}
+
+/// undo 1 段: まず未コミット編集を commit してから 1 つ戻す。戻せたら復元後の状態を
+/// `Some` で返す (呼び出し側が `comic_docs` へ書き戻す)。スタック空なら `None`。
+fn comic_undo_step(
+    undo: &mut Vec<Vec<AnnotationObject>>,
+    redo: &mut Vec<Vec<AnnotationObject>>,
+    baseline: &mut Vec<AnnotationObject>,
+    objects: &[AnnotationObject],
+) -> Option<Vec<AnnotationObject>> {
+    comic_commit_pending(undo, redo, baseline, objects);
+    let prev = undo.pop()?;
+    redo.push(objects.to_vec());
+    *baseline = prev.clone();
+    Some(prev)
+}
+
+/// redo 1 段: 1 つ進める (commit はしない、ラボ `do_redo` と同じ)。進めたら復元後の
+/// 状態を `Some` で返す。スタック空なら `None`。
+fn comic_redo_step(
+    undo: &mut Vec<Vec<AnnotationObject>>,
+    redo: &mut Vec<Vec<AnnotationObject>>,
+    baseline: &mut Vec<AnnotationObject>,
+    objects: &[AnnotationObject],
+) -> Option<Vec<AnnotationObject>> {
+    let next = redo.pop()?;
+    undo.push(objects.to_vec());
+    *baseline = next.clone();
+    Some(next)
+}
+
 fn to_c32(c: Rgba) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
 }
@@ -742,6 +802,8 @@ impl App {
         self.stamp_dialog_replace_target = None;
         self.clear_meta_undo();
         self.ensure_comic_doc_loaded(&key);
+        // エディタ専用 undo を入場ページの現状態へリセット (D7、`meta_undo` とは別スタック)。
+        self.reset_comic_history(&key);
 
         // テキスト編集はシステムフォントでも動くが、初回入場時に追加パック (オノマトペ
         // 向けフォント + 被写体分離モデル) の取得を案内する (spec §4.1)。未導入かつ
@@ -782,6 +844,11 @@ impl App {
         if was_text_mode {
             self.clear_meta_undo();
         }
+        // エディタ専用 undo スタックも退場時にクリア (次回入場で再ベースライン化される)。
+        self.comic_undo_stack.clear();
+        self.comic_redo_stack.clear();
+        self.comic_undo_baseline.clear();
+        self.comic_undo_key = None;
 
         if let Some(ctx) = self.text_spread_ctx.take() {
             self.spread_mode = ctx.saved_mode;
@@ -790,6 +857,122 @@ impl App {
             self.fs_pan = egui::Vec2::ZERO;
         }
         crate::logger::log("text: reset mode".to_string());
+    }
+
+    // ── Undo / Redo (Inc 6、エディタ専用スナップショットスタック、D7) ──────
+    //
+    // ラボ (`tools/comic_lab`) の coalesce 方式を移植: 編集が settle するたびに
+    // ベースラインとの差分を 1 エントリにまとめて push する。`meta_undo`
+    // (レーティング/タグ) とは完全に別スタックで、テキストモード中のみ動く。
+    // 対象は現在ページの注釈 `comic_docs[key]` 全体。
+
+    /// 注釈 undo/redo を現在ページ `key` の状態へリセットする (モード入場・ページ確定時)。
+    /// ラボ `reset_history` 相当。
+    fn reset_comic_history(&mut self, key: &str) {
+        self.comic_undo_stack.clear();
+        self.comic_redo_stack.clear();
+        self.comic_undo_baseline = self.comic_docs.get(key).cloned().unwrap_or_default();
+        self.comic_undo_key = Some(key.to_string());
+    }
+
+    /// coalesce した 1 エントリを commit する (busy 判定は呼び出し側)。ラボ
+    /// `commit_pending` 相当。`comic_docs[key]` の作業 Vec を渡して純ロジックへ委譲。
+    fn commit_comic_pending(&mut self, key: &str) {
+        if let Some(objects) = self.comic_docs.get(key) {
+            comic_commit_pending(
+                &mut self.comic_undo_stack,
+                &mut self.comic_redo_stack,
+                &mut self.comic_undo_baseline,
+                objects,
+            );
+        }
+    }
+
+    /// フレーム末で呼ぶ coalesce commit。drag 中 (ポインタ押下) や IME / テキストフィールド
+    /// フォーカス中 (キーボード入力要求) は commit せず、操作が落ち着いてから 1 エントリに
+    /// まとめる。ラボ `update` 末尾の `if !busy { commit_pending() }` 相当。
+    pub(crate) fn commit_comic_undo_on_settle(&mut self, ctx: &egui::Context) {
+        if !self.text_mode {
+            return;
+        }
+        let Some(key) = self.fullscreen_idx.and_then(|i| self.page_path_key(i)) else {
+            return;
+        };
+        // テキストモード中はページ固定だが、防御的にキー不一致を検出したら再ベースライン化して
+        // cross-page の undo エントリができないようにする。
+        if self.comic_undo_key.as_deref() != Some(key.as_str()) {
+            self.reset_comic_history(&key);
+            return;
+        }
+        let busy = ctx.input(|i| i.pointer.any_down()) || ctx.wants_keyboard_input();
+        if busy {
+            return;
+        }
+        self.commit_comic_pending(&key);
+    }
+
+    /// Ctrl+Z。未コミットの編集をまず commit してから 1 つ戻す。ラボ `do_undo` 相当。
+    fn do_comic_undo(&mut self) {
+        let Some(key) = self.fullscreen_idx.and_then(|i| self.page_path_key(i)) else {
+            return;
+        };
+        if self.comic_undo_key.as_deref() != Some(key.as_str()) {
+            // 別ページ — 戻す履歴がない。現ページで再ベースライン化だけして抜ける。
+            self.reset_comic_history(&key);
+            return;
+        }
+        let cur = self.comic_docs.get(&key).cloned().unwrap_or_default();
+        if let Some(prev) = comic_undo_step(
+            &mut self.comic_undo_stack,
+            &mut self.comic_redo_stack,
+            &mut self.comic_undo_baseline,
+            &cur,
+        ) {
+            self.comic_docs.insert(key.clone(), prev);
+            self.after_comic_history_change(&key);
+        }
+    }
+
+    /// Ctrl+Y / Ctrl+Shift+Z。ラボ `do_redo` 相当 (commit_pending は呼ばない)。
+    fn do_comic_redo(&mut self) {
+        let Some(key) = self.fullscreen_idx.and_then(|i| self.page_path_key(i)) else {
+            return;
+        };
+        if self.comic_undo_key.as_deref() != Some(key.as_str()) {
+            self.reset_comic_history(&key);
+            return;
+        }
+        let cur = self.comic_docs.get(&key).cloned().unwrap_or_default();
+        if let Some(next) = comic_redo_step(
+            &mut self.comic_undo_stack,
+            &mut self.comic_redo_stack,
+            &mut self.comic_undo_baseline,
+            &cur,
+        ) {
+            self.comic_docs.insert(key.clone(), next);
+            self.after_comic_history_change(&key);
+        }
+    }
+
+    /// undo/redo 後の後始末: 消えた選択を解除し、進行中ドラッグを破棄、再ベイクと
+    /// 永続化 (デバウンス保存) を予約する。ラボ `after_history_change` 相当
+    /// (mIV は tail_stash/deco_stash を持たないので保持処理は不要)。
+    fn after_comic_history_change(&mut self, key: &str) {
+        if let Some(sel) = self.text_selected {
+            let exists = self
+                .comic_docs
+                .get(key)
+                .is_some_and(|objs| objs.iter().any(|o| o.id == sel));
+            if !exists {
+                self.text_selected = None;
+            }
+        }
+        // 復元の途中で握っていたドラッグ状態は無効化する (古い id / 座標基準が残る事故防止)。
+        self.text_drag = None;
+        // 再ベイク (comic_generation を進める) + 復元結果を comic.db + サイドカーへ
+        // デバウンス保存に乗せる (退場時 reset_text_mode でも最終保存される)。
+        self.mark_comic_dirty();
+        self.text_dirty_at = Some(std::time::Instant::now());
     }
 
     // ── キー入力 ────────────────────────────────────────────────────
@@ -810,8 +993,37 @@ impl App {
             return action;
         }
 
-        // Delete / Backspace: 選択オブジェクトを削除 (テキストフィールド非フォーカス時のみ)。
         let editing_text = ctx.memory(|m| m.focused().is_some());
+
+        // Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z: エディタ専用 Undo/Redo (D7)。
+        // テキストフィールドにフォーカスがある間は egui の TextEdit に Ctrl+Z を委ねて
+        // (= 消費しない) フィールド内テキストの undo を壊さない。フィールド外の編集
+        // (追加 / 削除 / 移動 / 変形 / パネル操作) のみここで undo する。
+        // **メタ undo との非干渉**: テキストモード中は `handle_fs_key_input` がこの関数で
+        // return するため、ここで消費しなかった (= editing_text 時の) key も含めて
+        // `handle_meta_undo_keys` (レーティング/タグ undo) には決して到達しない。
+        // consume 順は `handle_meta_undo_keys` と同じ: Ctrl+Shift+Z (redo) → Ctrl+Y (redo)
+        // → Ctrl+Z (undo)。`Modifiers::CTRL` 指定の consume は Shift 併用 Z も拾うため
+        // redo を先に握り、Ctrl+Shift+Z が undo 側へ流れないようにする。
+        if !editing_text {
+            let (undo, redo) = ctx.input_mut(|i| {
+                let redo = i
+                    .consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z)
+                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::Y);
+                let undo = i.consume_key(egui::Modifiers::CTRL, egui::Key::Z);
+                (undo, redo)
+            });
+            if undo {
+                self.do_comic_undo();
+                return action;
+            }
+            if redo {
+                self.do_comic_redo();
+                return action;
+            }
+        }
+
+        // Delete / Backspace: 選択オブジェクトを削除 (テキストフィールド非フォーカス時のみ)。
         if !editing_text {
             let del = ctx.input_mut(|i| {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
@@ -1065,6 +1277,11 @@ impl App {
         self.draw_text_add_stamp_dialog(ctx);
         self.draw_text_add_onomatopoeia_dialog(ctx);
         self.draw_text_font_dialog(ctx);
+        // フレーム末: 編集が settle (drag 終了 + フィールド非フォーカス) したら
+        // coalesce した undo エントリを 1 つ commit する (Inc 6、ラボの frame-end
+        // `commit_pending` 相当)。パネル / キャンバス / ダイアログの全編集が反映済みの
+        // この時点で呼ぶ。
+        self.commit_comic_undo_on_settle(ctx);
     }
 
     /// 選択中オブジェクトの変形ハンドルを画面に描く。回転を反映した境界四角形 +
@@ -5433,5 +5650,106 @@ mod tests {
             pick_handle(&obj, br_screen, &view, None),
             Some(TextDragKind::Corner(2))
         );
+    }
+
+    // ── Undo / Redo の純ロジック (Inc 6) ──────────────────────────────
+
+    /// 1 オブジェクトの状態を作るヘルパー (id だけで区別できれば十分)。
+    fn state(ids: &[u64]) -> Vec<AnnotationObject> {
+        ids.iter()
+            .map(|&id| stamp_obj(id, (0.0, 0.0), 10.0, 10.0))
+            .collect()
+    }
+
+    #[test]
+    fn commit_coalesces_only_on_change() {
+        let mut undo = Vec::new();
+        let mut redo = Vec::new();
+        let mut base = state(&[1]);
+        // 変化なし → push されない。
+        comic_commit_pending(&mut undo, &mut redo, &mut base, &state(&[1]));
+        assert!(undo.is_empty());
+        // 変化あり → 旧ベースラインを 1 つだけ push、ベースライン更新。
+        comic_commit_pending(&mut undo, &mut redo, &mut base, &state(&[1, 2]));
+        assert_eq!(undo.len(), 1);
+        assert_eq!(undo[0], state(&[1]));
+        assert_eq!(base, state(&[1, 2]));
+    }
+
+    #[test]
+    fn undo_then_redo_round_trips() {
+        let mut undo = Vec::new();
+        let mut redo = Vec::new();
+        let mut base = state(&[1]);
+        // [1] → [1,2] を commit。
+        comic_commit_pending(&mut undo, &mut redo, &mut base, &state(&[1, 2]));
+        // undo: 作業状態 [1,2] を渡すと [1] が返り、redo に [1,2] が積まれる。
+        let after_undo = comic_undo_step(&mut undo, &mut redo, &mut base, &state(&[1, 2]));
+        assert_eq!(after_undo, Some(state(&[1])));
+        assert_eq!(base, state(&[1]));
+        assert_eq!(redo.len(), 1);
+        // redo: [1] を渡すと [1,2] が返り、元に戻る。
+        let after_redo = comic_redo_step(&mut undo, &mut redo, &mut base, &state(&[1]));
+        assert_eq!(after_redo, Some(state(&[1, 2])));
+        assert_eq!(base, state(&[1, 2]));
+        assert!(redo.is_empty());
+    }
+
+    #[test]
+    fn undo_commits_pending_edit_first() {
+        // ラボ do_undo と同じ: 未コミットの編集があるとき undo はまずそれを commit してから戻す。
+        let mut undo = Vec::new();
+        let mut redo = Vec::new();
+        let mut base = state(&[1]); // ベースライン = [1]、作業状態 = [1,2] (未コミット)
+        let after_undo = comic_undo_step(&mut undo, &mut redo, &mut base, &state(&[1, 2]));
+        // 未コミット [1,2] が commit されてから戻るので、戻り先は [1]。
+        assert_eq!(after_undo, Some(state(&[1])));
+        // redo には未コミットだった [1,2] が積まれている。
+        assert_eq!(redo, vec![state(&[1, 2])]);
+    }
+
+    #[test]
+    fn new_edit_clears_redo() {
+        let mut undo = Vec::new();
+        let mut redo = Vec::new();
+        let mut base = state(&[1]);
+        comic_commit_pending(&mut undo, &mut redo, &mut base, &state(&[1, 2]));
+        comic_undo_step(&mut undo, &mut redo, &mut base, &state(&[1, 2]));
+        assert_eq!(redo.len(), 1);
+        // undo 後に別の編集を commit すると redo は捨てられる (分岐した履歴)。
+        comic_commit_pending(&mut undo, &mut redo, &mut base, &state(&[1, 3]));
+        assert!(redo.is_empty());
+        assert_eq!(base, state(&[1, 3]));
+    }
+
+    #[test]
+    fn empty_stacks_are_noops() {
+        let mut undo: Vec<Vec<AnnotationObject>> = Vec::new();
+        let mut redo: Vec<Vec<AnnotationObject>> = Vec::new();
+        let mut base = state(&[1]);
+        // 何も積まれていなければ undo/redo は None で状態を変えない。
+        assert_eq!(
+            comic_undo_step(&mut undo, &mut redo, &mut base, &state(&[1])),
+            None
+        );
+        assert_eq!(
+            comic_redo_step(&mut undo, &mut redo, &mut base, &state(&[1])),
+            None
+        );
+        assert_eq!(base, state(&[1]));
+    }
+
+    #[test]
+    fn undo_stack_respects_cap() {
+        let mut undo = Vec::new();
+        let mut redo = Vec::new();
+        let mut base = state(&[0]);
+        // CAP + 5 回 commit して、最古が捨てられ深さが CAP で頭打ちになることを確認。
+        for i in 1..=(COMIC_UNDO_CAP as u64 + 5) {
+            comic_commit_pending(&mut undo, &mut redo, &mut base, &state(&[i]));
+        }
+        assert_eq!(undo.len(), COMIC_UNDO_CAP);
+        // 先頭 (最古) は remove(0) されているので state(&[0]) ではない。
+        assert_ne!(undo[0], state(&[0]));
     }
 }

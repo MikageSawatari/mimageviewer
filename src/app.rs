@@ -4117,6 +4117,24 @@ pub struct App {
     /// 見開きから text モードに入ったときの spread 復元コンテキスト (conceal と同じ流儀)。
     pub(crate) text_spread_ctx: Option<EraseSpreadCtx>,
 
+    // ── テキスト注釈 Undo/Redo (Inc 6) ────────────────────────────
+    /// エディタ専用スナップショット undo スタック (D7)。現在編集中ページの注釈
+    /// `comic_docs[key]` 全体の過去状態を保持する。**メタ操作 undo (`meta_undo`、
+    /// レーティング / タグ) とは独立スタック** — テキストモード中のみ Ctrl+Z/Y で
+    /// 操作し、`handle_text_keys` が先に key を consume するのでメタ undo
+    /// (`handle_meta_undo_keys`) には渡らない。編集が settle したら
+    /// `comic_undo_baseline` と比較して 1 エントリだけ push する (coalesce)。
+    pub(crate) comic_undo_stack: Vec<Vec<comic_core::AnnotationObject>>,
+    /// 注釈 redo スタック (上記の対)。新しい編集を commit すると clear される。
+    pub(crate) comic_redo_stack: Vec<Vec<comic_core::AnnotationObject>>,
+    /// 最後に commit した注釈状態 (coalesce のベースライン)。編集が落ち着いたとき
+    /// `comic_docs[key]` と比較し、差があれば push してから更新する。
+    pub(crate) comic_undo_baseline: Vec<comic_core::AnnotationObject>,
+    /// 上記スタック / ベースラインが対応する `page_path_key`。テキストモード中は
+    /// ページ固定だが、防御的にキー不一致を検出したら再ベースライン化して
+    /// cross-page の undo エントリができないようにする。
+    pub(crate) comic_undo_key: Option<String>,
+
     // ── フルスクリーン Ctrl+↑↓ ナビロック ─────────────────────────
     /// ナビ中の「次のページがまだ表示できない」ガード。`Some(gen)` の間は
     /// 新たな Ctrl+↑↓ 入力を無視し、`fs_holdover_tex` を画面に出し続ける。
@@ -5244,6 +5262,10 @@ impl App {
             recent_stamps_loaded: false,
             stamp_thumb_cache: std::collections::HashMap::new(),
             text_spread_ctx: None,
+            comic_undo_stack: Vec::new(),
+            comic_redo_stack: Vec::new(),
+            comic_undo_baseline: Vec::new(),
+            comic_undo_key: None,
             erase_preview_active: false,
             conceal_preview_active: false,
             erase_base_tex_cache: std::collections::HashMap::new(),
