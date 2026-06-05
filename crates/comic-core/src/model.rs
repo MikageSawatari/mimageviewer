@@ -251,6 +251,115 @@ pub enum BubbleShape {
         #[serde(default)]
         shape_seed: u32,
     },
+    /// Regular polygon (多角形) inscribed in the rx/ry ellipse. `sides` >= 3.
+    Polygon {
+        rx: f32,
+        ry: f32,
+        sides: u32,
+    },
+    /// Diamond / rhombus (ダイヤ) through the four axis points.
+    Diamond {
+        half_w: f32,
+        half_h: f32,
+    },
+    /// Heart (ハート) parametric curve fitted to rx/ry.
+    Heart {
+        rx: f32,
+        ry: f32,
+    },
+    /// Arrow (矢印): a shaft + head pointing toward `dir_rad` (0 = +x / right,
+    /// -PI/2 = up), sized by half_w (length axis) / half_h (cross axis).
+    Arrow {
+        half_w: f32,
+        half_h: f32,
+        #[serde(default = "arrow_up")]
+        dir_rad: f32,
+    },
+    /// Soft / やわらか balloon: a rounded rect with gently wavy edges.
+    /// `corner_px` rounds the corners; `shape_seed` jitters the wave phase.
+    Soft {
+        half_w: f32,
+        half_h: f32,
+        #[serde(default = "soft_corner")]
+        corner_px: f32,
+        #[serde(default)]
+        shape_seed: u32,
+    },
+    /// 集中線 (concentration / motion lines): `count` tapered lines radiating from
+    /// a clear central ellipse outward to the rx/ry extent. Renders as a line
+    /// field (no fill/stroke); text sits in the clear center.
+    MotionLines {
+        rx: f32,
+        ry: f32,
+        #[serde(default = "lines_count")]
+        count: u32,
+        #[serde(default)]
+        shape_seed: u32,
+    },
+    /// 流線 (speed lines): `count` parallel tapered lines in `dir_rad`, across the
+    /// half_w/half_h extent, skipping a clear central ellipse for text.
+    SpeedLines {
+        half_w: f32,
+        half_h: f32,
+        #[serde(default)]
+        dir_rad: f32,
+        #[serde(default = "lines_count")]
+        count: u32,
+        #[serde(default)]
+        shape_seed: u32,
+    },
+    /// なし (text-only container): no fill / no stroke / no tail — just the
+    /// centered text. `half_w`/`half_h` define the movable & selectable region and
+    /// the auto-size box. Lets the user place free text that can later be switched
+    /// to any other shape (it rides the bubble pipeline, unlike a Text object).
+    TextOnly {
+        half_w: f32,
+        half_h: f32,
+    },
+    /// 意識 (concentration / awareness): a soft, fuzzy-edged ellipse drawn with a
+    /// feathered fill rim + a soft outline ring (no hard edge), evoking an inner
+    /// monologue / dazed feeling. `shape_seed` jitters the rim wobble.
+    Concentration {
+        rx: f32,
+        ry: f32,
+        #[serde(default)]
+        shape_seed: u32,
+    },
+    /// 線 (sketchy strokes): a rounded rect whose outline is drawn with several
+    /// hand-drawn, jittered passes (rough / pencil look). Fill works normally
+    /// inside. `shape_seed` drives the deterministic per-pass jitter.
+    Strokes {
+        half_w: f32,
+        half_h: f32,
+        #[serde(default = "soft_corner")]
+        corner_px: f32,
+        #[serde(default)]
+        shape_seed: u32,
+    },
+    /// 二重線 (double stroke): a rounded rect with two concentric outlines `gap_px`
+    /// apart (the inner ring is body-only; a tail keeps a single line).
+    DoubleStroke {
+        half_w: f32,
+        half_h: f32,
+        #[serde(default = "soft_corner")]
+        corner_px: f32,
+        #[serde(default = "double_gap")]
+        gap_px: f32,
+    },
+}
+
+fn lines_count() -> u32 {
+    64
+}
+
+fn arrow_up() -> f32 {
+    -std::f32::consts::FRAC_PI_2
+}
+fn soft_corner() -> f32 {
+    28.0
+}
+fn double_gap() -> f32 {
+    8.0
 }
 
 impl Default for BubbleShape {

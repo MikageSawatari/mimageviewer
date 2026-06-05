@@ -1,11 +1,86 @@
 # comic_lab 進捗・ハンドオフメモ
 
 Status: 作業中スナップショット (コンパクト耐性用)
-更新: 2026-06-04 セッション (縦書き OpenType 化 + スタンプ機能)
+更新: 2026-06-04 セッション (FramePlanner 形状 Phase1-3 完了 / worktree 運用 / Codex 2 周対応)
 
 吹き出し・テキスト注釈ツールの **lab 試作** (`tools/comic_lab` + `crates/comic-core`)。
 設計の正本: [speech-bubble-text-tool-plan.md](speech-bubble-text-tool-plan.md) (Claude 案) /
 [speech-bubble-tool-design.md](speech-bubble-tool-design.md) (Codex 案)。
+
+## ⚠ 作業環境 (次セッション必読・worktree 運用)
+
+ラボ作業は **専用 worktree `C:\home\mimageviewer-lab` (branch `lab`)** で行う。本体アプリ
+セッションは `C:\home\mimageviewer` (branch `master`) を使い、index/HEAD が分離するので
+コミットの取り合いが起きない (1ツリー共有時に多発した事故の回避策。CLAUDE.md「複数の
+Claude Code セッションを並行で動かす」節)。
+
+- Claude Code の cwd は毎コマンド main repo にリセットされるので、ラボ操作は**明示パス**で:
+  - git: `git -C C:\home\mimageviewer-lab <cmd>`
+  - cargo: `cargo <cmd> -p comic_lab|comic-core --manifest-path C:\home\mimageviewer-lab\Cargo.toml`
+    (本体パッケージをビルドしないので **vendor 不要・build.rs 走らない**。bare `cargo build` は禁止)
+  - fmt: `(cd C:\home\mimageviewer-lab && cargo fmt)` — `--manifest-path` だけだと main 側を見るので cd 必須
+  - 編集: `C:\home\mimageviewer-lab\...` の絶対パス
+- `lab` ブランチは **master 未マージ**。実機確認OK後に一度だけ `lab`→`master` を merge する
+  (ユーザー判断待ち)。退避ブランチは不要 (worktree 隔離で十分)。
+
+## 2026-06-04 末: FramePlanner 形状追加 (branch lab、コミット済み)
+
+[FramePlanner](https://github.com/jonigata/FramePlanner2) (MIT) 参考に吹き出し形状を拡充。
+詳細は [comic-lab-frameplanner-shapes.md](comic-lab-frameplanner-shapes.md)。
+
+- **Phase1 ベクター形状** (5bfdd0d3): `BubbleShape` に Polygon/Diamond/Heart/Arrow/Soft。
+  既存 tessellate→塗り/枠/しっぽ/本文/自動サイズ/ハンドルに乗る。lab `BubblePreset` に
+  やわらか/多角形/ダイヤ/ハート/矢印 追加。
+- **Phase2 線群エフェクト** (929af8c6): `MotionLines`(集中線)/`SpeedLines`(流線)。塗りでなく
+  多数の線 + 中央クリア楕円(`LINE_FIELD_CLEAR_RATIO=0.55`)。`draw_line_field` (raster)。
+- **Codex P1/P2 対応** (34ccded7): 流線を外接/クリア楕円の交点計算に書換 (斜めでも AABB 内)、
+  自動サイズを内接率ベースに、count/sides 上限クランプ。
+- **Phase3** (233bebf8): 意識(`Concentration` ぼかし縁楕円, per-pixel feather+soft ring)/
+  線(`Strokes` 手描き風多重 stroke)/二重線(`DoubleStroke` 同心 2 本)/思考(楕円)
+  (`MindEllipse` = Ellipse+Thought)/なし(`TextOnly` テキストのみ)。◯?=既存形状+Thought。
+- **Phase3 Codex 2 周対応** (16b22a2c, 23d491da): 意識の alpha 二重適用修正・走査クランプ・
+  merge では do_decotext で 1 回描画 / 二重線の内側 ring を merge erase 後に描画 /
+  しっぽ非対応形状 (`shape_renders_tail`) の AABB・hit-test・UI gate / merge チェーンから
+  非多角形形状を除外 (`shape_is_mergeable`)。Codex 最終確認 P1/P2 なし。
+- テスト comic-core **83** / comic_lab 4 green。FramePlanner 形状は **Phase1-3 完了**。
+- 実機確認用 release バイナリ: `target/release/comic_lab.exe` (`cargo run --release -p comic_lab`)。
+
+## 2026-06-04 末: 実機フィードバック対応 (UI / 性能、branch lab、コミット済み)
+
+- **追加ダイアログのレスポンシブ化** (c405acd2): 吹き出し追加ダイアログを viewport 幅
+  クランプ + set_max_width + 縦 ScrollArea で固定幅サムネが折り返すように。
+- **ピッカーサムネ修正**: 集中線/流線=線群描画、意識=ぼかし楕円、矢印=既定しっぽ廃止。
+- **集中線/流線の文字可読性**: セリフに白い袋文字(フチ)を既定 ON (text_outline)。
+- **絵文字**: `scripts/setup-twemoji.sh` で vendor/twemoji/svg に 125 個取得 (gitignore)。
+- **スタンプ負荷の根治** (a49fa1bb, 1c0b3bb0): ドラッグ/拡縮/回転中はスタンプを CPU bake
+  から除外し **GPU テクスチャ quad** で描画 (拡縮・回転は GPU でほぼ無償)。source は
+  `stamp_textures` に一度だけアップロード。ドラッグ終了で完全 bake に戻り z/輪郭が正確。
+  ドラッグ中 bake はアダプティブスロットル併用。decode 失敗/無効スタンプは bake に残す
+  (消えない)。Codex 3 周対応で P1/P2 なし。
+- 累積コミット: 5bfdd0d3→929af8c6→34ccded7 (P1-2) → 233bebf8→16b22a2c→23d491da→07515f7c
+  (P3) → c405acd2→a49fa1bb→1c0b3bb0 (実機 FB)。lab は **master 未マージ**。
+
+## 2026-06-04 末: スタンプ性能 + ダイアログ (実機 FB 第3弾、コミット済み)
+
+実機計測 (perf HUD: F1 / COMIC_LAB_PERF) で composite(CPU) が upload(GPU) の約 10 倍 =
+スタンプの CPU ラスタライズが支配的と判明。これを根治。
+
+- **スタンプ性能** (a5ee93ed→754cd325→50cbffc9): 枠なしスタンプを **常時 GPU テクスチャ
+  quad** で描画し CPU bake から除外 (`gpu_stamp_ids` = 最上位 z から連続する枠なし・
+  デコード可スタンプ = top-z run、z 整合を維持)。bake はスタンプを一切ラスタライズ
+  しないので枚数/サイズ/回転によらず軽い。掴み時カクつき・ドラッグ終了時の位置ズレも
+  解消 (CPU↔GPU 持ち替えが無い)。枠付きスタンプのみ CPU bake (halo 維持)。
+  perf HUD (bake 合計/composite/upload + 数) を追加。
+- **追加ダイアログ** (786bfd83): 折り返さない/全幅/リサイズ変、を Codex 相談で解決。
+  horizontal_wrapped の未折り返し min 幅フィードバックが原因 → **手動グリッド**
+  (available_width から列数算出、ui.horizontal_top 行) に変更。`.max_width` は記憶済み
+  サイズを縮められないため Window `.id` を新規化して破棄。`.pivot(CENTER_CENTER)` の
+  リサイズ挙動を避け default_pos 中央寄せに。共有定数 PRESET_CELL_W/WINDOW_PRESET_CELL_W/
+  grid_cols() を追加。
+- 実機確認 OK (速度改善・ズレ解消・ダイアログ折り返し/リサイズ正常)。
+- Codex を計 9 ラウンド (同一セッション resume) 活用、最終 P1/P2 なし。
+
+(以下は worktree 移行前=master 上の履歴。同じ内容が lab ブランチにも入っている)
 
 ## 2026-06-04 後半: 縦書き OpenType 化 (案B) + スタンプ機能 (未コミット)
 

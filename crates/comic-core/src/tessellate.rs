@@ -41,7 +41,152 @@ pub fn tessellate_bubble(shape: &BubbleShape, pivot: (f32, f32)) -> Vec<(f32, f3
             amp,
             shape_seed,
         } => cloud(cx, cy, rx, ry, lobes, amp, shape_seed),
+        BubbleShape::Polygon { rx, ry, sides } => polygon(cx, cy, rx, ry, sides),
+        BubbleShape::Diamond { half_w, half_h } => vec![
+            (cx, cy - half_h),
+            (cx + half_w, cy),
+            (cx, cy + half_h),
+            (cx - half_w, cy),
+        ],
+        BubbleShape::Heart { rx, ry } => heart(cx, cy, rx, ry),
+        BubbleShape::Arrow {
+            half_w,
+            half_h,
+            dir_rad,
+        } => arrow(cx, cy, half_w, half_h, dir_rad),
+        BubbleShape::Soft {
+            half_w,
+            half_h,
+            corner_px,
+            shape_seed,
+        } => soft(cx, cy, half_w, half_h, corner_px, shape_seed),
+        // Line-field effects: the outline is the OUTER ellipse (drives AABB,
+        // hit-test, tail). The radial/parallel lines themselves are drawn by the
+        // rasterizer (no fill/stroke of this ellipse). Text sits in the clear
+        // central ellipse (`LINE_FIELD_CLEAR_RATIO` of the outer extent).
+        BubbleShape::MotionLines { rx, ry, .. } => ellipse_pts(cx, cy, rx, ry),
+        BubbleShape::SpeedLines { half_w, half_h, .. } => ellipse_pts(cx, cy, half_w, half_h),
+        // なし: a plain rect bounds box (for AABB / hit-test / auto-size). The
+        // rasterizer draws no fill/stroke for this shape — only the centered text.
+        BubbleShape::TextOnly { half_w, half_h } => round_rect(cx, cy, half_w, half_h, 0.0),
+        // 意識: the outline is a plain ellipse (drives AABB / hit-test); the fuzzy
+        // feathered rim is rendered by the rasterizer within this extent.
+        BubbleShape::Concentration { rx, ry, .. } => ellipse_pts(cx, cy, rx, ry),
+        // 線 / 二重線: rounded-rect outline (the sketchy / doubled stroke styling
+        // is applied by the rasterizer; fill/AABB/hit-test/tail use this contour).
+        BubbleShape::Strokes {
+            half_w,
+            half_h,
+            corner_px,
+            ..
+        } => round_rect(cx, cy, half_w, half_h, corner_px),
+        BubbleShape::DoubleStroke {
+            half_w,
+            half_h,
+            corner_px,
+            ..
+        } => round_rect(cx, cy, half_w, half_h, corner_px),
     }
+}
+
+/// The clear central ellipse of a line-field shape (集中線/流線), as a fraction
+/// of its outer extent. Text fits inside this; lines stop at its edge.
+pub const LINE_FIELD_CLEAR_RATIO: f32 = 0.55;
+
+/// The solid-fill fraction of a 意識 (concentration) ellipse: the fill is opaque
+/// inside this radius and feathers to transparent by the rim. Auto-size fits the
+/// text rectangle inside this inner ellipse.
+pub const CONCENTRATION_SOLID_RATIO: f32 = 0.78;
+
+/// Axis-aligned ellipse outline (ELLIPSE_SEGMENTS points).
+fn ellipse_pts(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<(f32, f32)> {
+    let mut pts = Vec::with_capacity(ELLIPSE_SEGMENTS);
+    for i in 0..ELLIPSE_SEGMENTS {
+        let t = (i as f32) / (ELLIPSE_SEGMENTS as f32) * std::f32::consts::TAU;
+        pts.push((cx + rx * t.cos(), cy + ry * t.sin()));
+    }
+    pts
+}
+
+/// Regular `sides`-gon inscribed in the rx/ry ellipse, oriented point-up.
+fn polygon(cx: f32, cy: f32, rx: f32, ry: f32, sides: u32) -> Vec<(f32, f32)> {
+    let n = sides.clamp(3, 256);
+    let mut pts = Vec::with_capacity(n as usize);
+    let start = -std::f32::consts::FRAC_PI_2; // a vertex at the top
+    for i in 0..n {
+        let a = start + (i as f32) / (n as f32) * std::f32::consts::TAU;
+        pts.push((cx + rx * a.cos(), cy + ry * a.sin()));
+    }
+    pts
+}
+
+/// Heart outline (ハート) fitted to the rx/ry box, point-down. Classic
+/// 16sin³t curve, normalized to ±1 then scaled; y flipped for screen space.
+fn heart(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<(f32, f32)> {
+    const SEG: usize = 96;
+    let mut pts = Vec::with_capacity(SEG);
+    for i in 0..SEG {
+        let t = (i as f32) / (SEG as f32) * std::f32::consts::TAU;
+        let x = 16.0 * t.sin().powi(3);
+        let y = 13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos() - (4.0 * t).cos();
+        // Normalize: x in ±16, y in ~[-17, 12]. /17 keeps the bottom tip within ry
+        // (so shape_half_extents / handles match the outline). Flip y for screen.
+        pts.push((cx + rx * (x / 16.0), cy - ry * (y / 17.0)));
+    }
+    pts
+}
+
+/// Arrow outline (矢印): built pointing toward +x in local space, then rotated
+/// by `dir_rad` about the pivot. `half_w` is the half-length along the arrow,
+/// `half_h` the half cross-width. Head spans the front ~45%, shaft is ~45% tall.
+fn arrow(cx: f32, cy: f32, half_w: f32, half_h: f32, dir_rad: f32) -> Vec<(f32, f32)> {
+    let hw = half_w.max(2.0);
+    let hh = half_h.max(2.0);
+    let head_x = hw * 0.1; // head base x (front 45% is the triangle)
+    let shaft_hh = hh * 0.45; // shaft half-thickness
+    // 7-point arrow in local space (+x = tip).
+    let local = [
+        (hw, 0.0),           // tip
+        (head_x, hh),        // head top corner
+        (head_x, shaft_hh),  // head/shaft top junction
+        (-hw, shaft_hh),     // shaft top-back
+        (-hw, -shaft_hh),    // shaft bottom-back
+        (head_x, -shaft_hh), // head/shaft bottom junction
+        (head_x, -hh),       // head bottom corner
+    ];
+    let (sin, cos) = dir_rad.sin_cos();
+    local
+        .iter()
+        .map(|&(x, y)| (cx + x * cos - y * sin, cy + x * sin + y * cos))
+        .collect()
+}
+
+/// Soft / やわらか outline: a rounded rect whose perimeter gently undulates
+/// (low-amplitude wave) so it reads as a soft, hand-drawn balloon.
+fn soft(
+    cx: f32,
+    cy: f32,
+    half_w: f32,
+    half_h: f32,
+    corner: f32,
+    shape_seed: u32,
+) -> Vec<(f32, f32)> {
+    let base = round_rect_dense(cx, cy, half_w, half_h, corner);
+    let amp = (half_w.min(half_h)) * 0.06;
+    let waves = 6.0;
+    let phase = hash01(shape_seed, 1) * std::f32::consts::TAU;
+    let n = base.len();
+    base.iter()
+        .enumerate()
+        .map(|(i, &(x, y))| {
+            let t = (i as f32) / (n as f32) * std::f32::consts::TAU;
+            let dx = x - cx;
+            let dy = y - cy;
+            let len = (dx * dx + dy * dy).sqrt().max(1e-3);
+            let bulge = amp * (waves * t + phase).sin();
+            (x + dx / len * bulge, y + dy / len * bulge)
+        })
+        .collect()
 }
 
 /// Resize a bubble shape so its interior contains a text box of `text_w × text_h`
@@ -116,6 +261,113 @@ pub fn fit_bubble_shape(
                 lobes,
                 amp,
                 shape_seed,
+            }
+        }
+        // Polygon: the inradius (flat-side distance) is `rx*cos(pi/sides)`, which
+        // shrinks for low side counts (a triangle is much narrower than its
+        // circumradius). Size against the inradius so the text rect fits even for
+        // few sides; `√2` covers the rect corners.
+        BubbleShape::Polygon { sides, .. } => {
+            let inr = (std::f32::consts::PI / sides.clamp(3, 256) as f32)
+                .cos()
+                .max(0.4);
+            BubbleShape::Polygon {
+                rx: hw * SQRT2 / inr,
+                ry: hh * SQRT2 / inr,
+                sides,
+            }
+        }
+        // Rhombus: the inscribed axis-aligned rect (a,b) fits when a/hw+b/hh<=1,
+        // so doubling the half-extents leaves the text rect well inside.
+        BubbleShape::Diamond { .. } => BubbleShape::Diamond {
+            half_w: hw * 2.0,
+            half_h: hh * 2.0,
+        },
+        // Heart: centered text must clear the top notch and the side dips; size
+        // generously (esp. vertically, since the notch eats the upper-center).
+        BubbleShape::Heart { .. } => BubbleShape::Heart {
+            rx: hw * 1.9,
+            ry: hh * 2.3,
+        },
+        // Arrow: the text must fit the shaft (cross half-thickness = 0.45*half_h),
+        // and the arrow can point any direction, so size both axes from the larger
+        // text half-extent: 0.45*2.6*d = 1.17*d >= d covers the cross; 2.0*d covers
+        // the length.
+        BubbleShape::Arrow { dir_rad, .. } => {
+            let d = hw.max(hh);
+            BubbleShape::Arrow {
+                half_w: d * 2.0,
+                half_h: d * 2.6,
+                dir_rad,
+            }
+        }
+        // Soft: like a rounded rect (the wave is small); keep corner + seed.
+        BubbleShape::Soft {
+            corner_px,
+            shape_seed,
+            ..
+        } => BubbleShape::Soft {
+            half_w: hw,
+            half_h: hh,
+            corner_px: corner_px.min(hw.min(hh)),
+            shape_seed,
+        },
+        // Line fields: text must fit the CLEAR center (a fraction of the outer
+        // extent), so the outer ellipse is enlarged by 1/CLEAR_RATIO.
+        BubbleShape::MotionLines {
+            count, shape_seed, ..
+        } => BubbleShape::MotionLines {
+            rx: hw * SQRT2 / LINE_FIELD_CLEAR_RATIO,
+            ry: hh * SQRT2 / LINE_FIELD_CLEAR_RATIO,
+            count,
+            shape_seed,
+        },
+        BubbleShape::SpeedLines {
+            dir_rad,
+            count,
+            shape_seed,
+            ..
+        } => BubbleShape::SpeedLines {
+            half_w: hw * SQRT2 / LINE_FIELD_CLEAR_RATIO,
+            half_h: hh * SQRT2 / LINE_FIELD_CLEAR_RATIO,
+            dir_rad,
+            count,
+            shape_seed,
+        },
+        // なし: the box exactly wraps the text (+ padding); no shape to inflate.
+        BubbleShape::TextOnly { .. } => BubbleShape::TextOnly {
+            half_w: hw,
+            half_h: hh,
+        },
+        // 意識: text fits the SOLID inner ellipse, so the outer ellipse is enlarged
+        // by √2 / solid-ratio (the rim feathers out beyond the text).
+        BubbleShape::Concentration { shape_seed, .. } => BubbleShape::Concentration {
+            rx: hw * SQRT2 / CONCENTRATION_SOLID_RATIO,
+            ry: hh * SQRT2 / CONCENTRATION_SOLID_RATIO,
+            shape_seed,
+        },
+        // 線: like a rounded rect (the sketch jitter is small); keep corner + seed.
+        BubbleShape::Strokes {
+            corner_px,
+            shape_seed,
+            ..
+        } => BubbleShape::Strokes {
+            half_w: hw,
+            half_h: hh,
+            corner_px: corner_px.min(hw.min(hh)),
+            shape_seed,
+        },
+        // 二重線: the inner ring sits `gap` inside, so the text must fit inside the
+        // INNER rect — enlarge the outer half-extents by `gap` on each side.
+        BubbleShape::DoubleStroke {
+            corner_px, gap_px, ..
+        } => {
+            let g = gap_px.max(0.0);
+            BubbleShape::DoubleStroke {
+                half_w: hw + g,
+                half_h: hh + g,
+                corner_px: corner_px.min((hw + g).min(hh + g)),
+                gap_px,
             }
         }
     }
@@ -245,6 +497,42 @@ fn round_rect(cx: f32, cy: f32, half_w: f32, half_h: f32, corner: f32) -> Vec<(f
     pts
 }
 
+/// Rounded rect with the straight edges subdivided too (dense perimeter), so a
+/// per-vertex perturbation (e.g. the `soft` wave) is visible along the edges,
+/// not only at the corners. Clockwise from the top edge.
+fn round_rect_dense(cx: f32, cy: f32, half_w: f32, half_h: f32, corner: f32) -> Vec<(f32, f32)> {
+    let corner = corner.max(0.0).min(half_w.min(half_h));
+    let (left, right) = (cx - half_w, cx + half_w);
+    let (top, bottom) = (cy - half_h, cy + half_h);
+    const EDGE_SEG: usize = 12;
+    let half_pi = 0.5 * std::f32::consts::PI;
+    let mut pts = Vec::new();
+    let mut edge = |a: (f32, f32), b: (f32, f32), pts: &mut Vec<(f32, f32)>| {
+        // Exclusive of the end point (next corner arc starts there).
+        for i in 0..EDGE_SEG {
+            let f = i as f32 / EDGE_SEG as f32;
+            pts.push((a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f));
+        }
+    };
+    let arc = |ccx: f32, ccy: f32, start: f32, pts: &mut Vec<(f32, f32)>| {
+        for i in 0..=CORNER_SEGMENTS {
+            let t = start + (i as f32 / CORNER_SEGMENTS as f32) * half_pi;
+            pts.push((ccx + corner * t.cos(), ccy + corner * t.sin()));
+        }
+    };
+    // top edge -> TR arc -> right edge -> BR arc -> bottom edge -> BL arc ->
+    // left edge -> TL arc.
+    edge((left + corner, top), (right - corner, top), &mut pts);
+    arc(right - corner, top + corner, -half_pi, &mut pts);
+    edge((right, top + corner), (right, bottom - corner), &mut pts);
+    arc(right - corner, bottom - corner, 0.0, &mut pts);
+    edge((right - corner, bottom), (left + corner, bottom), &mut pts);
+    arc(left + corner, bottom - corner, half_pi, &mut pts);
+    edge((left, bottom - corner), (left, top + corner), &mut pts);
+    arc(left + corner, top + corner, std::f32::consts::PI, &mut pts);
+    pts
+}
+
 /// Build a straight tail triangle. `base_center` is a point on the bubble
 /// outline (the rasterizer/lab computes it from `base_t`); `tip` is the tail
 /// tip. The base is `width_px` wide, perpendicular to the base->tip direction.
@@ -299,7 +587,47 @@ fn shape_half_extents(shape: &BubbleShape) -> (f32, f32) {
         BubbleShape::RoundRect { half_w, half_h, .. } => (half_w, half_h),
         BubbleShape::Burst { rx, ry, .. } => (rx, ry),
         BubbleShape::Cloud { rx, ry, .. } => (rx, ry),
+        BubbleShape::Polygon { rx, ry, .. } => (rx, ry),
+        BubbleShape::Diamond { half_w, half_h } => (half_w, half_h),
+        BubbleShape::Heart { rx, ry } => (rx, ry),
+        BubbleShape::Arrow { half_w, half_h, .. } => (half_w, half_h),
+        BubbleShape::Soft { half_w, half_h, .. } => (half_w, half_h),
+        BubbleShape::MotionLines { rx, ry, .. } => (rx, ry),
+        BubbleShape::SpeedLines { half_w, half_h, .. } => (half_w, half_h),
+        BubbleShape::TextOnly { half_w, half_h } => (half_w, half_h),
+        BubbleShape::Concentration { rx, ry, .. } => (rx, ry),
+        BubbleShape::Strokes { half_w, half_h, .. } => (half_w, half_h),
+        BubbleShape::DoubleStroke { half_w, half_h, .. } => (half_w, half_h),
     }
+}
+
+/// Whether a shape participates in a merge chain. The merge trick (fill → stroke
+/// → opaque-fill-erase) needs a solid fillable polygon body, so the line-field
+/// effects (集中線 / 流線), 意識 (feathered, no clean fill) and なし (nothing to
+/// fill) are excluded — they always bake standalone instead of being fused.
+pub fn shape_is_mergeable(shape: &BubbleShape) -> bool {
+    !matches!(
+        shape,
+        BubbleShape::MotionLines { .. }
+            | BubbleShape::SpeedLines { .. }
+            | BubbleShape::TextOnly { .. }
+            | BubbleShape::Concentration { .. }
+    )
+}
+
+/// Whether a shape actually renders a tail (つの / 思考の丸). Line-field effects
+/// (集中線 / 流線), 意識 (fuzzy, edgeless) and なし (text-only) draw no outline to
+/// attach a tail to, so the rasterizer skips it for them. Bounds / hit-test use
+/// this so a tail set on such a shape doesn't create invisible selectable
+/// geometry or inflate the AABB.
+pub fn shape_renders_tail(shape: &BubbleShape) -> bool {
+    !matches!(
+        shape,
+        BubbleShape::MotionLines { .. }
+            | BubbleShape::SpeedLines { .. }
+            | BubbleShape::TextOnly { .. }
+            | BubbleShape::Concentration { .. }
+    )
 }
 
 /// Cap the requested tail base width to the bubble's half-extent perpendicular
@@ -890,6 +1218,302 @@ mod tests {
             (0.0, 0.0),
         );
         assert!(c.len() >= 16);
+    }
+
+    #[test]
+    fn new_vector_shapes_have_sane_outlines() {
+        // Polygon: exactly `sides` vertices, all within the rx/ry box.
+        let p = tessellate_bubble(
+            &BubbleShape::Polygon {
+                rx: 50.0,
+                ry: 40.0,
+                sides: 6,
+            },
+            (0.0, 0.0),
+        );
+        assert_eq!(p.len(), 6);
+        assert!(p.iter().all(|&(x, y)| x.abs() <= 50.1 && y.abs() <= 40.1));
+
+        // Diamond: 4 axis points.
+        let d = tessellate_bubble(
+            &BubbleShape::Diamond {
+                half_w: 30.0,
+                half_h: 20.0,
+            },
+            (0.0, 0.0),
+        );
+        assert_eq!(
+            d,
+            vec![(0.0, -20.0), (30.0, 0.0), (0.0, 20.0), (-30.0, 0.0)]
+        );
+
+        // Heart / Soft: non-empty closed curves within their box (+ soft wave).
+        let h = tessellate_bubble(&BubbleShape::Heart { rx: 60.0, ry: 60.0 }, (0.0, 0.0));
+        assert!(h.len() > 30 && h.iter().all(|&(x, y)| x.abs() <= 70.0 && y.abs() <= 70.0));
+        let s = tessellate_bubble(
+            &BubbleShape::Soft {
+                half_w: 80.0,
+                half_h: 50.0,
+                corner_px: 24.0,
+                shape_seed: 3,
+            },
+            (0.0, 0.0),
+        );
+        assert!(s.len() > 30);
+
+        // Arrow pointing up: the tip is the topmost point (most negative y).
+        let a = tessellate_bubble(
+            &BubbleShape::Arrow {
+                half_w: 40.0,
+                half_h: 30.0,
+                dir_rad: -std::f32::consts::FRAC_PI_2,
+            },
+            (0.0, 0.0),
+        );
+        let tip =
+            a.iter().copied().fold(
+                (0.0f32, f32::INFINITY),
+                |acc, p| if p.1 < acc.1 { p } else { acc },
+            );
+        assert!(
+            tip.1 < -30.0 && tip.0.abs() < 2.0,
+            "arrow tip points up: {tip:?}"
+        );
+    }
+
+    #[test]
+    fn fit_preserves_new_variants() {
+        let f = fit_bubble_shape(
+            &BubbleShape::Polygon {
+                rx: 1.0,
+                ry: 1.0,
+                sides: 7,
+            },
+            100.0,
+            80.0,
+            10.0,
+        );
+        assert!(matches!(f, BubbleShape::Polygon { sides: 7, .. }));
+        let f = fit_bubble_shape(&BubbleShape::Heart { rx: 1.0, ry: 1.0 }, 100.0, 80.0, 10.0);
+        assert!(matches!(f, BubbleShape::Heart { .. }));
+        let f = fit_bubble_shape(
+            &BubbleShape::Arrow {
+                half_w: 1.0,
+                half_h: 1.0,
+                dir_rad: 0.5,
+            },
+            100.0,
+            80.0,
+            10.0,
+        );
+        assert!(matches!(f, BubbleShape::Arrow { dir_rad, .. } if (dir_rad - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn fuzzy_and_textonly_shapes_are_not_mergeable() {
+        // The merge union trick needs a fillable polygon body.
+        assert!(!shape_is_mergeable(&BubbleShape::Concentration {
+            rx: 10.0,
+            ry: 10.0,
+            shape_seed: 0
+        }));
+        assert!(!shape_is_mergeable(&BubbleShape::TextOnly {
+            half_w: 10.0,
+            half_h: 10.0
+        }));
+        assert!(!shape_is_mergeable(&BubbleShape::MotionLines {
+            rx: 10.0,
+            ry: 10.0,
+            count: 8,
+            shape_seed: 0
+        }));
+        // Polygon-bodied shapes (incl. the new 線 / 二重線) merge fine.
+        assert!(shape_is_mergeable(&BubbleShape::Ellipse {
+            rx: 10.0,
+            ry: 10.0
+        }));
+        assert!(shape_is_mergeable(&BubbleShape::Strokes {
+            half_w: 10.0,
+            half_h: 10.0,
+            corner_px: 4.0,
+            shape_seed: 0
+        }));
+        assert!(shape_is_mergeable(&BubbleShape::DoubleStroke {
+            half_w: 10.0,
+            half_h: 10.0,
+            corner_px: 4.0,
+            gap_px: 6.0
+        }));
+    }
+
+    #[test]
+    fn tailless_shapes_report_no_tail() {
+        // Line fields / 意識 / なし render no tail; everything else does.
+        assert!(!shape_renders_tail(&BubbleShape::TextOnly {
+            half_w: 10.0,
+            half_h: 10.0
+        }));
+        assert!(!shape_renders_tail(&BubbleShape::Concentration {
+            rx: 10.0,
+            ry: 10.0,
+            shape_seed: 0
+        }));
+        assert!(!shape_renders_tail(&BubbleShape::MotionLines {
+            rx: 10.0,
+            ry: 10.0,
+            count: 8,
+            shape_seed: 0
+        }));
+        assert!(!shape_renders_tail(&BubbleShape::SpeedLines {
+            half_w: 10.0,
+            half_h: 10.0,
+            dir_rad: 0.0,
+            count: 8,
+            shape_seed: 0
+        }));
+        assert!(shape_renders_tail(&BubbleShape::Ellipse {
+            rx: 10.0,
+            ry: 10.0
+        }));
+        assert!(shape_renders_tail(&BubbleShape::Strokes {
+            half_w: 10.0,
+            half_h: 10.0,
+            corner_px: 4.0,
+            shape_seed: 0
+        }));
+        assert!(shape_renders_tail(&BubbleShape::DoubleStroke {
+            half_w: 10.0,
+            half_h: 10.0,
+            corner_px: 4.0,
+            gap_px: 6.0
+        }));
+    }
+
+    #[test]
+    fn phase3_shapes_have_sane_outlines() {
+        // なし: a plain 4-corner rect within the half-extent box.
+        let t = tessellate_bubble(
+            &BubbleShape::TextOnly {
+                half_w: 40.0,
+                half_h: 30.0,
+            },
+            (0.0, 0.0),
+        );
+        assert_eq!(t.len(), 4);
+        assert!(t.iter().all(|&(x, y)| x.abs() <= 40.1 && y.abs() <= 30.1));
+
+        // 意識: an ellipse outline within rx/ry.
+        let c = tessellate_bubble(
+            &BubbleShape::Concentration {
+                rx: 60.0,
+                ry: 40.0,
+                shape_seed: 3,
+            },
+            (0.0, 0.0),
+        );
+        assert_eq!(c.len(), ELLIPSE_SEGMENTS);
+        assert!(c.iter().all(|&(x, y)| x.abs() <= 60.1 && y.abs() <= 40.1));
+
+        // 線 / 二重線: rounded-rect contours within the box.
+        for s in [
+            BubbleShape::Strokes {
+                half_w: 70.0,
+                half_h: 45.0,
+                corner_px: 20.0,
+                shape_seed: 1,
+            },
+            BubbleShape::DoubleStroke {
+                half_w: 70.0,
+                half_h: 45.0,
+                corner_px: 20.0,
+                gap_px: 8.0,
+            },
+        ] {
+            let p = tessellate_bubble(&s, (0.0, 0.0));
+            assert!(p.len() > 8 && p.iter().all(|&(x, y)| x.abs() <= 70.1 && y.abs() <= 45.1));
+        }
+    }
+
+    #[test]
+    fn fit_preserves_phase3_variants() {
+        let (tw, th, pad) = (120.0, 90.0, 10.0);
+        // なし: half extents are exactly text/2 + padding.
+        let f = fit_bubble_shape(
+            &BubbleShape::TextOnly {
+                half_w: 1.0,
+                half_h: 1.0,
+            },
+            tw,
+            th,
+            pad,
+        );
+        let BubbleShape::TextOnly { half_w, half_h } = f else {
+            panic!("text-only stays text-only");
+        };
+        assert!((half_w - (tw * 0.5 + pad)).abs() < 1e-3);
+        assert!((half_h - (th * 0.5 + pad)).abs() < 1e-3);
+
+        // 意識: text rect fits inside the SOLID inner ellipse.
+        let f = fit_bubble_shape(
+            &BubbleShape::Concentration {
+                rx: 1.0,
+                ry: 1.0,
+                shape_seed: 5,
+            },
+            tw,
+            th,
+            pad,
+        );
+        let BubbleShape::Concentration { rx, ry, shape_seed } = f else {
+            panic!("concentration stays concentration");
+        };
+        assert_eq!(shape_seed, 5);
+        let (hw, hh) = (tw * 0.5 + pad, th * 0.5 + pad);
+        let inner = CONCENTRATION_SOLID_RATIO;
+        let cover = (hw / (rx * inner)).powi(2) + (hh / (ry * inner)).powi(2);
+        assert!(
+            cover <= 1.0 + 1e-3,
+            "text rect inside solid ellipse: {cover}"
+        );
+
+        // 二重線: the OUTER half extents are enlarged by the gap so the text fits
+        // inside the inner ring (outer = text/2 + pad + gap).
+        let f = fit_bubble_shape(
+            &BubbleShape::DoubleStroke {
+                half_w: 1.0,
+                half_h: 1.0,
+                corner_px: 12.0,
+                gap_px: 8.0,
+            },
+            tw,
+            th,
+            pad,
+        );
+        let BubbleShape::DoubleStroke {
+            half_w,
+            half_h,
+            gap_px,
+            ..
+        } = f
+        else {
+            panic!("double-stroke stays double-stroke");
+        };
+        assert_eq!(gap_px, 8.0);
+        assert!((half_w - (hw + 8.0)).abs() < 1e-3 && (half_h - (hh + 8.0)).abs() < 1e-3);
+
+        // 線: rounded-rect-like fit, corner + seed preserved.
+        let f = fit_bubble_shape(
+            &BubbleShape::Strokes {
+                half_w: 1.0,
+                half_h: 1.0,
+                corner_px: 30.0,
+                shape_seed: 9,
+            },
+            tw,
+            th,
+            pad,
+        );
+        assert!(matches!(f, BubbleShape::Strokes { shape_seed: 9, .. }));
     }
 
     #[test]

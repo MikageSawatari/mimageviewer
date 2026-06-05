@@ -19,6 +19,7 @@ pub mod layout;
 pub mod model;
 pub mod raster;
 pub mod tessellate;
+pub mod transform;
 
 pub use font::{FontSet, GlyphBitmap, LoadedFont, rotate_cw};
 pub use layout::{GlyphForm, GlyphPlacement, TextLayout, layout_text, layout_text_wrapped};
@@ -31,13 +32,14 @@ pub use model::{
     markup_rules_brackets, markup_rules_white,
 };
 pub use raster::{
-    RgbaOverlay, StampImages, bake_overlay, bake_overlay_with_stamps, effective_bubble_shape,
-    effective_window_half_extents, message_window_overflows,
+    RgbaOverlay, StampImages, bake_overlay, bake_overlay_with_stamps, composite_stamp_sticker,
+    effective_bubble_shape, effective_window_half_extents, message_window_overflows,
 };
 pub use tessellate::{
     BubbleGeometry, auto_base_t, bubble_geometry, fit_bubble_shape, nearest_base_t,
-    resolve_tail_base, tessellate_bubble, tessellate_tail,
+    resolve_tail_base, shape_is_mergeable, shape_renders_tail, tessellate_bubble, tessellate_tail,
 };
+pub use transform::scale_scene;
 
 #[cfg(test)]
 mod integration_tests {

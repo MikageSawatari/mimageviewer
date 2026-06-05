@@ -12,7 +12,7 @@
 //! Persistence: Save/Load write/read the object list as JSON to a
 //! `<image>.comic.json` sidecar (analogous to local_adjust_lab's `.miv`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -25,6 +25,7 @@ use comic_core::{
     TextBlock, VAnchor, WindowPosition, bake_overlay, bake_overlay_with_stamps, bubble_geometry,
     effective_bubble_shape, effective_window_half_extents, layout_text, markup_rules_angle,
     markup_rules_brackets, markup_rules_white, nearest_base_t, resolve_tail_base,
+    shape_renders_tail, tessellate_bubble,
 };
 use eframe::egui::{self, Color32, ColorImage, Pos2, Rect, Sense, TextureHandle, TextureOptions};
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,46 @@ const ZOOM_MAX: f32 = 16.0;
 const HANDLE_R: f32 = 7.0;
 const FILE_HISTORY_LIMIT: usize = 16;
 const UNDO_CAP: usize = 100;
+/// Max rasterized stamp edge (px) when pre-compositing a sticker texture — mirrors
+/// comic-core's `draw_stamp` cap so a corrupt size can't OOM the upload.
+const STAMP_MAX_PX: usize = 8192;
+
+/// Font-picker card size (shared by the grid layout and the card renderer so the
+/// column count, row height and per-card geometry stay in sync). The height
+/// reserves a clear name band below the preview strip so the font name is never
+/// clipped or drawn over the light sample.
+const FONT_CARD_W: f32 = 220.0;
+const FONT_CARD_H: f32 = 70.0;
+
+/// Cache key for an outlined stamp's pre-composited sticker texture. Keyed on the
+/// halo's *effective* params — color + integer dilation radius `rad` (the rounded,
+/// capped width that actually shapes the halo) + display size + flips — NOT the
+/// raw `width_px`. Two widths that round to the same `rad` yield an identical halo
+/// and correctly share one texture; widths straddling a `.5` boundary get distinct
+/// keys (and distinct padding). Identical duplicates collapse to one key.
+fn sticker_key(
+    source: &StampSource,
+    color: Rgba,
+    rad: i32,
+    tw: usize,
+    th: usize,
+    flip_h: bool,
+    flip_v: bool,
+) -> String {
+    format!(
+        "{}|{:02x}{:02x}{:02x}{:02x}r{}|{}x{}|{}{}",
+        stamp_source_key(source),
+        color.r,
+        color.g,
+        color.b,
+        color.a,
+        rad,
+        tw,
+        th,
+        flip_h as u8,
+        flip_v as u8,
+    )
+}
 
 fn main() -> eframe::Result<()> {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
@@ -306,6 +347,16 @@ struct ComicLab {
     baked_dirty: bool,
     /// egui time (s) of the last bake, for drag throttling.
     last_bake_time: f64,
+    /// Wall-clock duration (s) of the last bake. During a drag the re-bake
+    /// interval adapts to this so a heavy scene (large/rotated stamps on a big
+    /// image) doesn't saturate the UI thread with back-to-back full-res bakes.
+    last_bake_dur: f64,
+    /// Breakdown (ms) of the last bake: CPU composite vs GPU texture upload, for
+    /// the on-canvas perf HUD (find what's slow).
+    last_composite_ms: f64,
+    last_upload_ms: f64,
+    /// Show the perf HUD (bake timings) on the canvas. Toggle with F1.
+    show_perf_hud: bool,
 
     fonts: FontSet,
     /// (key, display label) for the font picker. The key IS the display name for
@@ -392,6 +443,25 @@ struct ComicLab {
     /// Decode cache keyed by stamp source key (so the same emoji/file decodes
     /// once and is reused across objects). `None` = decode failed (don't retry).
     stamp_source_cache: HashMap<String, Option<Arc<RgbaOverlay>>>,
+    /// Stamp source key -> GPU texture (raw image, no halo), uploaded once.
+    /// Non-outlined stamps are drawn as GPU-transformed quads from this texture
+    /// (scale/rotate/flip/opacity are ~free on the GPU) and EXCLUDED from the CPU
+    /// bake entirely, so stamps never re-rasterize on the CPU — the bake stays
+    /// cheap regardless of stamp count/size/rotation.
+    stamp_textures: HashMap<String, TextureHandle>,
+    /// Outlined ("sticker") stamps: a pre-composited image+halo texture, baked
+    /// ONCE via `comic_core::composite_stamp_sticker` and reused as a GPU quad —
+    /// so N duplicates of one outlined stamp cost one halo dilation, not N every
+    /// bake. Keyed by source+outline(color/width)+display size+flips, so identical
+    /// duplicates share one texture; resizing one re-bakes only that stamp. FIFO-
+    /// capped (`sticker_order`) to bound GPU memory across a session of resizes.
+    sticker_textures: HashMap<String, TextureHandle>,
+    /// Insertion order of `sticker_textures` keys for FIFO eviction.
+    sticker_order: VecDeque<String>,
+    /// Stamp ids excluded from the last completed bake (= the GPU-quad stamps),
+    /// sorted. When this set changes (stamp added/removed/outline toggled/z moved)
+    /// the CPU bake must re-run.
+    baked_excluded_set: Vec<u64>,
     /// Recently used stamps (MRU, persisted) for quick re-insert.
     recent_stamps: Vec<StampSource>,
     /// Whether the stamp picker dialog is open.
@@ -505,6 +575,10 @@ impl ComicLab {
             baked_texture: None,
             baked_dirty: true,
             last_bake_time: 0.0,
+            last_bake_dur: 0.0,
+            last_composite_ms: 0.0,
+            last_upload_ms: 0.0,
+            show_perf_hud: std::env::var_os("COMIC_LAB_PERF").is_some(),
             fonts,
             available_fonts,
             font_paths,
@@ -548,6 +622,10 @@ impl ComicLab {
             ime_composing: false,
             stamp_images: StampImages::new(),
             stamp_source_cache: HashMap::new(),
+            stamp_textures: HashMap::new(),
+            sticker_textures: HashMap::new(),
+            sticker_order: VecDeque::new(),
+            baked_excluded_set: Vec::new(),
             recent_stamps: load_recent_stamps(),
             show_stamp_dialog: false,
             stamp_dialog_filter: String::new(),
@@ -1302,7 +1380,10 @@ impl ComicLab {
                 // tail tip) so clicking the tail / spikes selects the bubble.
                 // Expanded by the stroke half-width + a little slack.
                 let eff = effective_bubble_shape(b, &self.fonts);
-                let geo = bubble_geometry(&eff, obj.pivot, b.tail.as_ref());
+                // Tailless shapes (line fields / 意識 / なし) render no tail, so a
+                // stale tail must not splice into the hit region or inflate bounds.
+                let tail = b.tail.as_ref().filter(|_| shape_renders_tail(&eff));
+                let geo = bubble_geometry(&eff, obj.pivot, tail);
                 let mut min = (f32::INFINITY, f32::INFINITY);
                 let mut max = (f32::NEG_INFINITY, f32::NEG_INFINITY);
                 let pivot = obj.pivot;
@@ -1326,7 +1407,7 @@ impl ComicLab {
                     acc(rcx - r, rcy - r);
                     acc(rcx + r, rcy + r);
                 }
-                if let Some(t) = &b.tail {
+                if let Some(t) = tail {
                     let (px, py) = rotate_about(t.tip, pivot, rot);
                     acc(px, py);
                 }
@@ -1442,7 +1523,7 @@ impl ComicLab {
         }
     }
 
-    fn rebake(&mut self, ctx: &egui::Context) {
+    fn rebake(&mut self, ctx: &egui::Context, exclude: &[u64]) {
         if self.image.is_none() {
             return;
         }
@@ -1451,17 +1532,251 @@ impl ComicLab {
         // touched in the picker this session). Done before borrowing `image`.
         self.ensure_object_fonts_loaded();
         self.ensure_stamp_images();
-        let img = self.image.as_ref().unwrap();
-        let overlay = bake_overlay_with_stamps(
-            &self.objects,
-            img.width,
-            img.height,
-            &self.fonts,
-            &self.stamp_images,
-        );
+        let (iw, ih) = {
+            let img = self.image.as_ref().unwrap();
+            (img.width, img.height)
+        };
+        // Hide the GPU-quad stamps from the bake (they're drawn as GPU quads).
+        // They're all enabled by construction, so restore them to enabled after.
+        let mut restore: Vec<usize> = Vec::new();
+        for &id in exclude {
+            if let Some(idx) = self.objects.iter().position(|o| o.id == id) {
+                if self.objects[idx].enabled {
+                    self.objects[idx].enabled = false;
+                    restore.push(idx);
+                }
+            }
+        }
+        let t_c = std::time::Instant::now();
+        let overlay =
+            bake_overlay_with_stamps(&self.objects, iw, ih, &self.fonts, &self.stamp_images);
+        self.last_composite_ms = t_c.elapsed().as_secs_f64() * 1000.0;
+        for idx in restore {
+            self.objects[idx].enabled = true;
+        }
+        let t_u = std::time::Instant::now();
         let color = ColorImage::from_rgba_unmultiplied([overlay.w, overlay.h], &overlay.pixels);
         self.baked_texture = Some(ctx.load_texture("comic_baked", color, TextureOptions::LINEAR));
+        self.last_upload_ms = t_u.elapsed().as_secs_f64() * 1000.0;
         self.baked_dirty = false;
+        self.baked_excluded_set = exclude.to_vec();
+    }
+
+    /// Ids of stamps drawn as GPU quads (= excluded from the CPU bake), in
+    /// ascending z (draw bottom-to-top). To stay z-correct, only the maximal
+    /// TOP-z run of enabled, decodable stamps qualifies: those sit above
+    /// everything left in the CPU bake, so drawing them on top preserves z.
+    /// Both plain and outlined ("sticker") stamps qualify — the outlined ones use a
+    /// pre-composited image+halo texture (`ensure_sticker_texture`) so the heavy
+    /// halo dilation runs once per unique sticker, not every bake. A stamp placed
+    /// BELOW a non-stamp object (or an undecodable stamp) ends the run and stays in
+    /// the CPU bake at its true z. Ensures textures.
+    fn gpu_stamp_ids(&mut self, ctx: &egui::Context) -> Vec<u64> {
+        let mut order: Vec<usize> = (0..self.objects.len())
+            .filter(|&i| self.objects[i].enabled)
+            .collect();
+        order.sort_by_key(|&i| self.objects[i].z);
+        let mut ids = Vec::new();
+        for &i in order.iter().rev() {
+            let (id, stamp) = {
+                let o = &self.objects[i];
+                match &o.kind {
+                    AnnotationKind::Stamp(s) => (o.id, s.clone()),
+                    // Any non-stamp object ends the top run — stamps below it must
+                    // stay in the CPU bake to keep correct z.
+                    _ => break,
+                }
+            };
+            let ok = if stamp.outline.is_some_and(|o| o.width_px > 0.0) {
+                self.ensure_sticker_texture(ctx, &stamp).is_some()
+            } else {
+                self.ensure_stamp_texture(ctx, &stamp.source).is_some()
+            };
+            if ok {
+                ids.push(id);
+            } else {
+                // Decode failed → this stamp (placeholder) and everything below it
+                // stay in the CPU bake.
+                break;
+            }
+        }
+        ids.reverse(); // ascending z
+        ids
+    }
+
+    /// Upload a stamp source as a GPU texture (once, cached by source key) for the
+    /// live drag preview. Reuses the decode cache. `None` if the source can't be
+    /// decoded (the bake's placeholder shows when the drag ends).
+    fn ensure_stamp_texture(
+        &mut self,
+        ctx: &egui::Context,
+        source: &StampSource,
+    ) -> Option<TextureHandle> {
+        let key = stamp_source_key(source);
+        if let Some(t) = self.stamp_textures.get(&key) {
+            return Some(t.clone());
+        }
+        let img = self
+            .stamp_source_cache
+            .entry(key.clone())
+            .or_insert_with(|| load_stamp_image(source).map(Arc::new))
+            .clone()?;
+        let color = ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.pixels);
+        let tex = ctx.load_texture(format!("stamp_{key}"), color, TextureOptions::LINEAR);
+        self.stamp_textures.insert(key, tex.clone());
+        Some(tex)
+    }
+
+    /// Build (or fetch) the pre-composited image+halo GPU texture for an outlined
+    /// ("sticker") stamp, so it draws as one quad like a plain stamp instead of
+    /// re-rasterizing the halo in the CPU bake. Cached by source+outline+display
+    /// size+flips: identical duplicates share one texture (the heavy dilation runs
+    /// ONCE), so N copies of an outlined stamp no longer make the bake O(N).
+    ///
+    /// Returns `(texture, half_w, half_h)` — the on-canvas half-extents of the quad
+    /// to draw, derived from the *capped* raster size so they match the CPU bake
+    /// even for a corrupt/huge sidecar (the bake centers the capped tw×th bitmap).
+    /// `None` if the source can't be decoded or the stamp has no positive-width
+    /// outline.
+    fn ensure_sticker_texture(
+        &mut self,
+        ctx: &egui::Context,
+        stamp: &StampObject,
+    ) -> Option<(TextureHandle, f32, f32)> {
+        let outline = stamp.outline.filter(|o| o.width_px > 0.0)?;
+        let tw = ((stamp.half_w * 2.0).round().max(1.0) as usize).min(STAMP_MAX_PX);
+        let th = ((stamp.half_h * 2.0).round().max(1.0) as usize).min(STAMP_MAX_PX);
+        // Effective dilation radius — must match comic-core's `composite_stamp_sticker`.
+        let rad = (outline.width_px.round().max(0.0) as i32).min(256).max(0);
+        // Quad half-extents from the capped bitmap (+ halo padding), so the quad
+        // maps the texture 1:1 and matches the CPU bake's centered footprint.
+        let hw = tw as f32 * 0.5 + rad as f32;
+        let hh = th as f32 * 0.5 + rad as f32;
+        let key = sticker_key(
+            &stamp.source,
+            outline.color,
+            rad,
+            tw,
+            th,
+            stamp.flip_h,
+            stamp.flip_v,
+        );
+        if let Some(t) = self.sticker_textures.get(&key) {
+            return Some((t.clone(), hw, hh));
+        }
+        // Reuse the shared decode cache (same key as the plain image path).
+        let img = self
+            .stamp_source_cache
+            .entry(stamp_source_key(&stamp.source))
+            .or_insert_with(|| load_stamp_image(&stamp.source).map(Arc::new))
+            .clone()?;
+        let (sticker, _) = comic_core::composite_stamp_sticker(
+            &img,
+            stamp.flip_h,
+            stamp.flip_v,
+            tw,
+            th,
+            Some(outline),
+        );
+        let color = ColorImage::from_rgba_unmultiplied([sticker.w, sticker.h], &sticker.pixels);
+        let tex = ctx.load_texture(format!("sticker_{key}"), color, TextureOptions::LINEAR);
+        // FIFO-evict the oldest entry to bound GPU memory — a long session of
+        // resizing outlined stamps would otherwise keep a texture per distinct size.
+        // Capped well above any single frame's working set (the top-z run can't
+        // exceed the object count) so eviction never drops an in-use texture.
+        const STICKER_CACHE_CAP: usize = 256;
+        while self.sticker_textures.len() >= STICKER_CACHE_CAP {
+            match self.sticker_order.pop_front() {
+                Some(old) => {
+                    self.sticker_textures.remove(&old);
+                }
+                None => break,
+            }
+        }
+        self.sticker_textures.insert(key.clone(), tex.clone());
+        self.sticker_order.push_back(key);
+        Some((tex, hw, hh))
+    }
+
+    /// Draw stamp `id` as a GPU-transformed textured quad (scale/rotate/flip/
+    /// opacity), centered on its pivot. Used for ALL GPU stamps (excluded from the
+    /// CPU bake), so a stamp never re-rasterizes on the CPU and its position is
+    /// identical whether idle or being dragged. Outlined stamps draw their
+    /// pre-composited image+halo "sticker" texture (flips baked in, quad grown by
+    /// the halo `rad`); plain stamps draw the raw image texture with UV-swap flips.
+    fn draw_stamp_preview(&mut self, ctx: &egui::Context, painter: &egui::Painter, id: u64) {
+        let (pivot, rot, opacity, stamp) = {
+            let Some(obj) = self.objects.iter().find(|o| o.id == id) else {
+                return;
+            };
+            let AnnotationKind::Stamp(s) = &obj.kind else {
+                return;
+            };
+            (
+                obj.pivot,
+                obj.rotation_rad,
+                s.opacity.clamp(0.0, 1.0),
+                s.clone(),
+            )
+        };
+        let (tex, hw, hh, (u0, u1), (v0, v1)) = if stamp.outline.is_some_and(|o| o.width_px > 0.0) {
+            // Sticker texture already contains the halo + baked flips → straight UVs.
+            // `ensure_sticker_texture` returns the quad half-extents (from the capped
+            // raster + halo padding) so the quad maps the texture 1:1.
+            let Some((tex, hw, hh)) = self.ensure_sticker_texture(ctx, &stamp) else {
+                return;
+            };
+            (tex, hw, hh, (0.0f32, 1.0f32), (0.0f32, 1.0f32))
+        } else {
+            let Some(tex) = self.ensure_stamp_texture(ctx, &stamp.source) else {
+                return;
+            };
+            let u = if stamp.flip_h {
+                (1.0f32, 0.0f32)
+            } else {
+                (0.0f32, 1.0f32)
+            };
+            let v = if stamp.flip_v {
+                (1.0f32, 0.0f32)
+            } else {
+                (0.0f32, 1.0f32)
+            };
+            (tex, stamp.half_w, stamp.half_h, u, v)
+        };
+        let corner = |lx: f32, ly: f32| {
+            self.view
+                .img_to_screen(rotate_about((pivot.0 + lx, pivot.1 + ly), pivot, rot))
+        };
+        let (tl, tr, br, bl) = (
+            corner(-hw, -hh),
+            corner(hw, -hh),
+            corner(hw, hh),
+            corner(-hw, hh),
+        );
+        let tint = Color32::from_white_alpha((opacity * 255.0).round().clamp(0.0, 255.0) as u8);
+        let mut mesh = egui::Mesh::with_texture(tex.id());
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: tl,
+            uv: egui::pos2(u0, v0),
+            color: tint,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: tr,
+            uv: egui::pos2(u1, v0),
+            color: tint,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: br,
+            uv: egui::pos2(u1, v1),
+            color: tint,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: bl,
+            uv: egui::pos2(u0, v1),
+            color: tint,
+        });
+        mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        painter.add(egui::Shape::mesh(mesh));
     }
 
     /// Resolve every Stamp object's source into a decoded RGBA image for baking.
@@ -1723,10 +2038,8 @@ impl ComicLab {
                     .cloned()
                     .collect();
 
-                const CARD_W: f32 = 220.0;
-                const CARD_H: f32 = 64.0;
                 let avail_w = ui.available_width();
-                let cols = ((avail_w / (CARD_W + 8.0)).floor() as usize).max(1);
+                let cols = ((avail_w / (FONT_CARD_W + 8.0)).floor() as usize).max(1);
                 let rows = visible.len().div_ceil(cols);
 
                 // Cap new sample renders per frame so opening / scrolling the
@@ -1738,7 +2051,7 @@ impl ComicLab {
 
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show_rows(ui, CARD_H + 8.0, rows, |ui, row_range| {
+                    .show_rows(ui, FONT_CARD_H + 8.0, rows, |ui, row_range| {
                         for row in row_range {
                             ui.horizontal(|ui| {
                                 for col in 0..cols {
@@ -1811,9 +2124,8 @@ impl ComicLab {
         selected: bool,
         allow_build: bool,
     ) -> bool {
-        const CARD_W: f32 = 220.0;
-        const CARD_H: f32 = 64.0;
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(CARD_W, CARD_H), Sense::click());
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(FONT_CARD_W, FONT_CARD_H), Sense::click());
         let hovered = resp.hovered();
         let painter = ui.painter_at(rect);
         let bg = if selected {
@@ -1837,10 +2149,16 @@ impl ComicLab {
             ),
             egui::StrokeKind::Inside,
         );
+        // Layout: light preview strip on top, a dedicated name band below it so the
+        // (white-on-dark) font name never overlaps the light sample or clips at the
+        // card's bottom edge.
+        let pad = 6.0;
+        let name_band = 22.0;
+        let sample_h = (FONT_CARD_H - pad * 2.0 - name_band).max(8.0);
         // Sample image (lazy). Drawn on a light strip so black text reads.
         let sample_area = Rect::from_min_size(
-            rect.min + egui::vec2(6.0, 6.0),
-            egui::vec2(CARD_W - 12.0, CARD_H - 24.0),
+            rect.min + egui::vec2(pad, pad),
+            egui::vec2(FONT_CARD_W - pad * 2.0, sample_h),
         );
         painter.rect_filled(sample_area, 2.0, Color32::from_gray(235));
         let tex = if allow_build {
@@ -1862,8 +2180,10 @@ impl ComicLab {
                 Color32::WHITE,
             );
         }
+        // Font name centered in the name band (below the preview strip), so it is
+        // fully visible and clear of the light sample.
         painter.text(
-            egui::pos2(rect.min.x + 6.0, rect.max.y - 14.0),
+            egui::pos2(rect.min.x + 8.0, rect.max.y - pad - name_band * 0.5),
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::proportional(12.0),
@@ -2649,13 +2969,29 @@ impl ComicLab {
                 1.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
+        // Resizable window. The grid is laid out MANUALLY (column count from the
+        // actual width) instead of `horizontal_wrapped`, which reports its
+        // unwrapped one-row width as the window's min width and forces the window
+        // full-width (the "幅が目一杯" + weird-resize symptom).
+        let avail = ctx.content_rect();
+        let max_w = (avail.width() - 24.0).max(PRESET_CELL_W + 48.0);
+        let default_w = max_w.min(540.0);
+        let default_h = (avail.height() - 120.0).clamp(220.0, 560.0);
         egui::Window::new("吹き出しを追加")
+            // Fresh id so egui doesn't restore the full-width size remembered from
+            // the earlier horizontal_wrapped layout (a .max_width clamp can't shrink
+            // an already-remembered window size — Codex).
+            .id(egui::Id::new("add_bubble_dialog_grid"))
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
-            .default_pos(ctx.content_rect().center() - egui::vec2(220.0, 170.0))
+            // No pivot: a CENTER_CENTER pivot makes resizing feel odd (size changes
+            // keep the center fixed). Center via default_pos instead (Codex).
+            .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
             .collapsible(false)
-            .resizable(false)
-            .default_width(440.0)
+            .resizable(true)
+            .default_size([default_w, default_h])
+            .min_width(PRESET_CELL_W + 30.0)
+            .max_width(max_w)
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label(
@@ -2664,14 +3000,22 @@ impl ComicLab {
                         .color(Color32::from_gray(180)),
                 );
                 ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
-                    for &preset in BubblePreset::ALL {
-                        if draw_preset_thumbnail(ui, preset) {
-                            chosen = Some(preset);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let cols = grid_cols(ui.available_width(), PRESET_CELL_W);
+                        ui.spacing_mut().item_spacing =
+                            egui::vec2(PRESET_CELL_SPACING, PRESET_CELL_SPACING);
+                        for chunk in BubblePreset::ALL.chunks(cols) {
+                            ui.horizontal_top(|ui| {
+                                for &preset in chunk {
+                                    if draw_preset_thumbnail(ui, preset) {
+                                        chosen = Some(preset);
+                                    }
+                                }
+                            });
                         }
-                    }
-                });
+                    });
             });
 
         self.show_add_dialog = open;
@@ -2695,25 +3039,24 @@ impl ComicLab {
                 1.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        // Responsive: clamp the dialog width to the viewport so it never runs off
-        // the right edge, and center it. `set_max_width` makes the thumbnail grid
-        // wrap to that width.
+        // Resizable window; grid laid out manually (column count from the actual
+        // width) so it reflows on resize instead of forcing a one-row min width.
         let avail = ctx.content_rect();
-        // Width tracks the viewport so it never runs off-screen; floor at one
-        // thumbnail column (~170) rather than a fixed 280 that could exceed a
-        // narrow viewport.
-        let dialog_w = (avail.width() - 24.0).clamp(170.0, 560.0);
+        let max_w = (avail.width() - 24.0).max(WINDOW_PRESET_CELL_W + 48.0);
+        let default_w = max_w.min(640.0);
+        let default_h = (avail.height() - 120.0).clamp(220.0, 560.0);
         egui::Window::new("メッセージウィンドウを追加")
+            .id(egui::Id::new("add_window_dialog_grid"))
             .order(egui::Order::Foreground)
             .frame(dialog_frame)
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(avail.center())
+            .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
             .collapsible(false)
-            .resizable(false)
-            .max_width(dialog_w)
+            .resizable(true)
+            .default_size([default_w, default_h])
+            .min_width(WINDOW_PRESET_CELL_W + 30.0)
+            .max_width(max_w)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.set_max_width(dialog_w);
                 ui.label(
                     egui::RichText::new("デザインを選んでください。クリックで追加します。")
                         .size(11.0)
@@ -2721,17 +3064,21 @@ impl ComicLab {
                 );
                 ui.separator();
                 egui::ScrollArea::vertical()
-                    .max_height((avail.height() - 160.0).clamp(160.0, 420.0))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
-                            for (i, p) in self.window_presets.iter().enumerate() {
-                                if draw_window_preset_thumbnail(ui, p) {
-                                    chosen = Some(i);
+                        let cols = grid_cols(ui.available_width(), WINDOW_PRESET_CELL_W);
+                        ui.spacing_mut().item_spacing =
+                            egui::vec2(PRESET_CELL_SPACING, PRESET_CELL_SPACING);
+                        let n = self.window_presets.len();
+                        for row_start in (0..n).step_by(cols) {
+                            ui.horizontal_top(|ui| {
+                                for i in row_start..(row_start + cols).min(n) {
+                                    if draw_window_preset_thumbnail(ui, &self.window_presets[i]) {
+                                        chosen = Some(i);
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        }
                     });
             });
 
@@ -2890,7 +3237,13 @@ impl ComicLab {
         let (tail_enabled, deco_enabled) = if is_bubble {
             self.draw_bubble_toggles(ui, sel, &mut dirty);
             match self.objects.iter().find(|o| o.id == sel).map(|o| &o.kind) {
-                Some(AnnotationKind::Bubble(b)) => (b.tail.is_some(), !b.decorations.is_empty()),
+                // A tail only counts when the shape actually renders one — a stale
+                // tail on a tailless shape (e.g. a hand-edited sidecar) must not
+                // enable the Tail tab.
+                Some(AnnotationKind::Bubble(b)) => (
+                    b.tail.is_some() && shape_renders_tail(&b.shape),
+                    !b.decorations.is_empty(),
+                ),
                 _ => (false, false),
             }
         } else {
@@ -3028,17 +3381,37 @@ impl ComicLab {
         };
 
         ui.add_space(2.0);
-        // 結合 (structural; not part of any preset → re-bake only).
-        if ui
-            .checkbox(&mut b.merge_with_below, "下の吹き出しと結合")
-            .changed()
-        {
+        // 結合 (structural; not part of any preset → re-bake only). Only shapes with
+        // a solid fillable body can union (the fill→stroke→erase trick); fuzzy /
+        // line-field / text-only shapes (意識 / 集中線 / 流線 / なし) can't, so disable
+        // the toggle for them and clear any stale flag (e.g. set on a previous shape).
+        let merge_supported = comic_core::shape_is_mergeable(&b.shape);
+        if !merge_supported && b.merge_with_below {
+            b.merge_with_below = false;
             *dirty = true;
         }
+        let merge_resp = ui.add_enabled(
+            merge_supported,
+            egui::Checkbox::new(&mut b.merge_with_below, "下の吹き出しと結合"),
+        );
+        if merge_supported && merge_resp.changed() {
+            *dirty = true;
+        }
+        if !merge_supported {
+            // Disabled widgets ignore `on_hover_text`; must use the disabled variant.
+            merge_resp.on_disabled_hover_text("この形状は結合に対応していません");
+        }
 
-        // しっぽ有無 (stashed so toggling off→on doesn't move it).
+        // しっぽ有無 (stashed so toggling off→on doesn't move it). Tailless shapes
+        // (集中線 / 流線 / 意識 / なし) draw no tail, so disable the toggle for them
+        // (prevents creating invisible selectable tail geometry).
+        let tail_supported = shape_renders_tail(&b.shape);
         let mut has_tail = b.tail.is_some();
-        if ui.checkbox(&mut has_tail, "しっぽを表示").changed() {
+        let tail_resp = ui.add_enabled(
+            tail_supported,
+            egui::Checkbox::new(&mut has_tail, "しっぽを表示"),
+        );
+        if tail_supported && tail_resp.changed() {
             if has_tail {
                 b.tail = Some(
                     self.tail_stash
@@ -3052,6 +3425,10 @@ impl ComicLab {
             // breaks the link (glow off).
             b.shape_preset_link = None;
             *dirty = true;
+        }
+        if !tail_supported {
+            // Disabled widgets ignore `on_hover_text`; must use the disabled variant.
+            tail_resp.on_disabled_hover_text("この形状はしっぽに対応していません");
         }
 
         // 飾り有無 (decorations non-empty = on, stashed). Seeding a single
@@ -3927,6 +4304,223 @@ impl ComicLab {
                     }
                 });
             }
+            BubbleShape::Polygon { rx, ry, sides } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                        .changed();
+                }
+                edited |= ui
+                    .add(egui::Slider::new(sides, 3..=12).text("辺の数"))
+                    .changed();
+            }
+            BubbleShape::Diamond { half_w, half_h } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                        .changed();
+                }
+            }
+            BubbleShape::Heart { rx, ry } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                        .changed();
+                }
+            }
+            BubbleShape::Arrow {
+                half_w,
+                half_h,
+                dir_rad,
+            } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 20.0..=800.0).text("長さ半分"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 20.0..=800.0).text("幅半分"))
+                        .changed();
+                }
+                let mut deg = dir_rad.to_degrees();
+                if ui
+                    .add(egui::Slider::new(&mut deg, -180.0..=180.0).text("向き(度)"))
+                    .changed()
+                {
+                    *dir_rad = deg.to_radians();
+                    edited = true;
+                }
+            }
+            BubbleShape::Soft {
+                half_w,
+                half_h,
+                corner_px,
+                shape_seed,
+            } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                        .changed();
+                }
+                edited |= ui
+                    .add(egui::Slider::new(corner_px, 0.0..=200.0).text("角丸"))
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label(format!("seed {shape_seed}"));
+                    if ui.button("再生成").clicked() {
+                        *shape_seed = shape_seed.wrapping_add(1);
+                        edited = true;
+                    }
+                });
+            }
+            BubbleShape::MotionLines {
+                rx,
+                ry,
+                count,
+                shape_seed,
+            } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(rx, 40.0..=1000.0).text("外半径rx"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(ry, 40.0..=1000.0).text("外半径ry"))
+                        .changed();
+                }
+                edited |= ui
+                    .add(egui::Slider::new(count, 8..=200).text("線の本数"))
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label(format!("seed {shape_seed}"));
+                    if ui.button("再生成").clicked() {
+                        *shape_seed = shape_seed.wrapping_add(1);
+                        edited = true;
+                    }
+                });
+            }
+            BubbleShape::SpeedLines {
+                half_w,
+                half_h,
+                dir_rad,
+                count,
+                shape_seed,
+            } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 40.0..=1000.0).text("半幅"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 40.0..=1000.0).text("半高"))
+                        .changed();
+                }
+                edited |= ui
+                    .add(egui::Slider::new(count, 8..=200).text("線の本数"))
+                    .changed();
+                let mut deg = dir_rad.to_degrees();
+                if ui
+                    .add(egui::Slider::new(&mut deg, -180.0..=180.0).text("向き(度)"))
+                    .changed()
+                {
+                    *dir_rad = deg.to_radians();
+                    edited = true;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(format!("seed {shape_seed}"));
+                    if ui.button("再生成").clicked() {
+                        *shape_seed = shape_seed.wrapping_add(1);
+                        edited = true;
+                    }
+                });
+            }
+            BubbleShape::TextOnly { half_w, half_h } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                        .changed();
+                }
+                ui.label(
+                    egui::RichText::new("枠なし・テキストのみ (塗り/枠は描画されません)")
+                        .small()
+                        .weak(),
+                );
+            }
+            BubbleShape::Concentration { rx, ry, shape_seed } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                        .changed();
+                }
+                ui.horizontal(|ui| {
+                    ui.label(format!("seed {shape_seed}"));
+                    if ui.button("再生成").clicked() {
+                        *shape_seed = shape_seed.wrapping_add(1);
+                        edited = true;
+                    }
+                });
+            }
+            BubbleShape::Strokes {
+                half_w,
+                half_h,
+                corner_px,
+                shape_seed,
+            } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                        .changed();
+                }
+                edited |= ui
+                    .add(egui::Slider::new(corner_px, 0.0..=200.0).text("角丸"))
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label(format!("seed {shape_seed}"));
+                    if ui.button("再生成").clicked() {
+                        *shape_seed = shape_seed.wrapping_add(1);
+                        edited = true;
+                    }
+                });
+            }
+            BubbleShape::DoubleStroke {
+                half_w,
+                half_h,
+                corner_px,
+                gap_px,
+            } => {
+                if !auto {
+                    edited |= ui
+                        .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                        .changed();
+                    edited |= ui
+                        .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                        .changed();
+                }
+                edited |= ui
+                    .add(egui::Slider::new(corner_px, 0.0..=200.0).text("角丸"))
+                    .changed();
+                edited |= ui
+                    .add(egui::Slider::new(gap_px, 2.0..=40.0).text("線の間隔"))
+                    .changed();
+            }
         }
         if auto {
             ui.label(
@@ -4253,10 +4847,38 @@ impl ComicLab {
             // don't allocate + upload a full-resolution texture every frame.
             let now = ctx.input(|i| i.time);
             let dragging = self.drag != DragKind::None;
-            // Re-bake at ~30fps during a drag (CPU bake is cheap now that the font
-            // face is cached; this throttle only bounds full-res texture uploads).
-            if self.baked_dirty && (!dragging || now - self.last_bake_time >= 0.03) {
-                self.rebake(ctx);
+            // The top-z run of stamps is drawn as GPU textured quads and kept OUT of
+            // the CPU bake entirely (scale/rotate/flip/opacity are ~free on the GPU).
+            // Outlined stamps qualify too: their image+halo is pre-composited once
+            // into a "sticker" texture (cached per source+outline+size) and reused, so
+            // N duplicates cost one halo dilation instead of N every bake. The bake
+            // then never rasterizes a stamp, so it's cheap no matter how many large/
+            // rotated/outlined stamps exist, and a stamp's on-screen position never
+            // changes between "dragging" and "idle" (no CPU↔GPU handoff, no drag-end
+            // shift).
+            let gpu_ids = self.gpu_stamp_ids(ctx);
+            // The excluded SET changing (stamp added/removed, outline toggled, z
+            // reordered) means the bake content changed → must re-bake.
+            let set_changed = gpu_ids != self.baked_excluded_set;
+            if set_changed {
+                self.baked_dirty = true;
+            }
+            // While dragging one of the GPU stamps, the CPU bake (which excludes all
+            // of them) is static — only the dragged quad moves — so skip re-baking
+            // (this was the periodic stutter: re-rasterizing/re-uploading every
+            // tick). Dragging a non-stamp (it IS in the bake and moving) re-bakes.
+            let dragging_gpu_stamp = dragging && self.selected.is_some_and(|id| gpu_ids.contains(&id));
+            let suppress = dragging_gpu_stamp && !set_changed;
+            // During a drag, adapt the re-bake interval to the last bake's cost so
+            // a heavy scene doesn't saturate the UI thread with back-to-back bakes.
+            let min_interval = (self.last_bake_dur * 1.5).clamp(0.03, 0.25);
+            if self.baked_dirty
+                && !suppress
+                && (!dragging || now - self.last_bake_time >= min_interval)
+            {
+                let t0 = std::time::Instant::now();
+                self.rebake(ctx, &gpu_ids);
+                self.last_bake_dur = t0.elapsed().as_secs_f64();
                 self.last_bake_time = now;
             }
             if let Some(tex) = &self.baked_texture {
@@ -4268,6 +4890,11 @@ impl ComicLab {
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     Color32::WHITE,
                 );
+            }
+            // GPU stamps (the top-z run) drawn on top of the bake, ascending z.
+            // Lower stamps (below a bubble/text) stayed in the bake at true z.
+            for &id in &gpu_ids {
+                self.draw_stamp_preview(ctx, &painter, id);
             }
 
             // Selection decorations (handles) on top of the baked overlay.
@@ -4286,6 +4913,46 @@ impl ComicLab {
                     "ドロップして画像を開く",
                     egui::FontId::proportional(28.0),
                     Color32::WHITE,
+                );
+            }
+
+            // Perf HUD (toggle with F1): last bake timings + object counts, to find
+            // what's slow during interaction.
+            if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+                self.show_perf_hud = !self.show_perf_hud;
+            }
+            if self.show_perf_hud {
+                let stamps = self
+                    .objects
+                    .iter()
+                    .filter(|o| matches!(o.kind, AnnotationKind::Stamp(_)))
+                    .count();
+                let hud = format!(
+                    "bake {:.1}ms (composite {:.1} + upload {:.1}) | img {}x{} | obj {} stamp {} | drag {}",
+                    self.last_bake_dur * 1000.0,
+                    self.last_composite_ms,
+                    self.last_upload_ms,
+                    img_w,
+                    img_h,
+                    self.objects.len(),
+                    stamps,
+                    if dragging { "yes" } else { "no" },
+                );
+                let pos = canvas_rect.left_top() + egui::vec2(8.0, 8.0);
+                // Shadowed text for legibility over any background.
+                painter.text(
+                    pos + egui::vec2(1.0, 1.0),
+                    egui::Align2::LEFT_TOP,
+                    &hud,
+                    egui::FontId::monospace(12.0),
+                    Color32::from_black_alpha(200),
+                );
+                painter.text(
+                    pos,
+                    egui::Align2::LEFT_TOP,
+                    &hud,
+                    egui::FontId::monospace(12.0),
+                    Color32::from_rgb(120, 230, 140),
                 );
             }
         });
@@ -4316,6 +4983,17 @@ impl ComicLab {
             BubbleShape::RoundRect { half_w, half_h, .. } => (half_w, half_h),
             BubbleShape::Burst { rx, ry, .. } => (rx, ry),
             BubbleShape::Cloud { rx, ry, .. } => (rx, ry),
+            BubbleShape::Polygon { rx, ry, .. } => (rx, ry),
+            BubbleShape::Diamond { half_w, half_h } => (half_w, half_h),
+            BubbleShape::Heart { rx, ry } => (rx, ry),
+            BubbleShape::Arrow { half_w, half_h, .. } => (half_w, half_h),
+            BubbleShape::Soft { half_w, half_h, .. } => (half_w, half_h),
+            BubbleShape::MotionLines { rx, ry, .. } => (rx, ry),
+            BubbleShape::SpeedLines { half_w, half_h, .. } => (half_w, half_h),
+            BubbleShape::TextOnly { half_w, half_h } => (half_w, half_h),
+            BubbleShape::Concentration { rx, ry, .. } => (rx, ry),
+            BubbleShape::Strokes { half_w, half_h, .. } => (half_w, half_h),
+            BubbleShape::DoubleStroke { half_w, half_h, .. } => (half_w, half_h),
         };
         let (sin, cos) = obj.rotation_rad.sin_cos();
         let p = obj.pivot;
@@ -4410,8 +5088,9 @@ impl ComicLab {
                     }
                     // Tail handles: cyan base (on the outline) + orange tip.
                     // The whole object bakes rotated, so rotate the handle
-                    // positions to match the visible (rotated) tail.
-                    if let Some(tail) = &b.tail {
+                    // positions to match the visible (rotated) tail. Skip for
+                    // tailless shapes (the tail isn't drawn, so no handles).
+                    if let Some(tail) = b.tail.as_ref().filter(|_| shape_renders_tail(&b.shape)) {
                         let eff = effective_bubble_shape(b, &self.fonts);
                         let rot = obj.rotation_rad;
                         let base =
@@ -4514,7 +5193,10 @@ impl ComicLab {
                 if let Some(sel) = self.selected {
                     if let Some(obj) = self.objects.iter().find(|o| o.id == sel) {
                         if let AnnotationKind::Bubble(b) = &obj.kind {
-                            if let Some(tail) = &b.tail {
+                            // Tailless shapes draw no tail → no tail handles to grab.
+                            if let Some(tail) =
+                                b.tail.as_ref().filter(|_| shape_renders_tail(&b.shape))
+                            {
                                 let rot = obj.rotation_rad;
                                 let tip = rotate_about(tail.tip, obj.pivot, rot);
                                 let tip_screen = self.view.img_to_screen(tip);
@@ -4847,6 +5529,23 @@ fn set_bubble_half_extents(b: &mut BubbleObject, hw: f32, hh: f32) {
             *rx = hw;
             *ry = hh;
         }
+        BubbleShape::Polygon { rx, ry, .. }
+        | BubbleShape::Heart { rx, ry }
+        | BubbleShape::MotionLines { rx, ry, .. }
+        | BubbleShape::Concentration { rx, ry, .. } => {
+            *rx = hw;
+            *ry = hh;
+        }
+        BubbleShape::SpeedLines { half_w, half_h, .. }
+        | BubbleShape::Diamond { half_w, half_h }
+        | BubbleShape::Arrow { half_w, half_h, .. }
+        | BubbleShape::Soft { half_w, half_h, .. }
+        | BubbleShape::TextOnly { half_w, half_h }
+        | BubbleShape::Strokes { half_w, half_h, .. }
+        | BubbleShape::DoubleStroke { half_w, half_h, .. } => {
+            *half_w = hw;
+            *half_h = hh;
+        }
     }
 }
 
@@ -4861,11 +5560,15 @@ fn marker_pairs_eq(a: &[MarkupRule], b: &[MarkupRule]) -> bool {
 }
 
 fn default_bubble_tail(pivot: (f32, f32)) -> Tail {
+    // Point the default tail down-LEFT at 45° rather than straight down — a
+    // diagonal tail reads as "speaking toward someone" and looks more natural than
+    // a vertical spike. Length ~150px (106 = 150/√2 on each axis).
+    const TAIL_DIAG: f32 = 106.0;
     Tail {
         // Shorter + slimmer default so a fresh bubble's tail looks proportionate
         // (comic-core also caps the base width to the bubble's perpendicular
         // extent, so this width is an upper request).
-        tip: (pivot.0, pivot.1 + 150.0),
+        tip: (pivot.0 - TAIL_DIAG, pivot.1 + TAIL_DIAG),
         base_t: 0.25,
         base_auto: true,
         width_px: 32.0,
@@ -4875,8 +5578,22 @@ fn default_bubble_tail(pivot: (f32, f32)) -> Tail {
 
 /// One clickable preset thumbnail (a small rendered bubble + the preset name
 /// below). Returns true when clicked. Used by the add dialog.
+/// Cell width of a bubble-preset thumbnail (and the add-dialog grid column).
+const PRESET_CELL_W: f32 = 96.0;
+/// Cell width of a window-preset thumbnail.
+const WINDOW_PRESET_CELL_W: f32 = 150.0;
+/// Spacing between thumbnail cells in the add dialogs.
+const PRESET_CELL_SPACING: f32 = 10.0;
+
+/// Number of columns that fit `cell_w`-wide thumbnails (+ spacing) into `avail`
+/// width. At least 1. Used to lay out the add-dialog grids manually so they
+/// reflow on resize without `horizontal_wrapped` forcing a one-row min width.
+fn grid_cols(avail: f32, cell_w: f32) -> usize {
+    (((avail + PRESET_CELL_SPACING) / (cell_w + PRESET_CELL_SPACING)).floor() as usize).max(1)
+}
+
 fn draw_preset_thumbnail(ui: &mut egui::Ui, preset: BubblePreset) -> bool {
-    const CELL_W: f32 = 96.0;
+    const CELL_W: f32 = PRESET_CELL_W;
     const PREVIEW_H: f32 = 64.0;
     let resp = ui
         .vertical(|ui| {
@@ -4921,7 +5638,7 @@ fn draw_preset_thumbnail(ui: &mut egui::Ui, preset: BubblePreset) -> bool {
 /// One clickable window-style preset thumbnail (a small rendered window panel +
 /// the preset name below). Returns true when clicked.
 fn draw_window_preset_thumbnail(ui: &mut egui::Ui, preset: &WindowStylePreset) -> bool {
-    const CELL_W: f32 = 150.0;
+    const CELL_W: f32 = WINDOW_PRESET_CELL_W;
     const PREVIEW_H: f32 = 60.0;
     let resp = ui
         .vertical(|ui| {
@@ -5074,6 +5791,102 @@ fn paint_bubble_preview(painter: &egui::Painter, area: Rect, preset: BubblePrese
     // Build the geometry in a neutral local space, then map to `area`.
     let pivot = (0.0f32, 0.0f32);
     let shape = preset.shape();
+
+    // なし: no box — show a couple of text-placeholder lines so the thumbnail
+    // reads as "text only".
+    if matches!(shape, BubbleShape::TextOnly { .. }) {
+        let line_col = Color32::from_gray(210);
+        for i in 0..2 {
+            let y = area.top() + area.height() * (0.40 + i as f32 * 0.24);
+            painter.line_segment(
+                [
+                    egui::pos2(area.left() + 10.0, y),
+                    egui::pos2(area.right() - 10.0 - i as f32 * 14.0, y),
+                ],
+                egui::Stroke::new(3.0, line_col),
+            );
+        }
+        return;
+    }
+
+    // 集中線 / 流線: line fields aren't a filled polygon — draw the lines around a
+    // clear center (light, so they show on the dark thumbnail). Matches the bake.
+    const CLEAR: f32 = 0.55; // comic_core::LINE_FIELD_CLEAR_RATIO
+    let line_col = Color32::from_gray(210);
+    if matches!(shape, BubbleShape::MotionLines { .. }) {
+        let (cx, cy) = (area.center().x, area.center().y);
+        let (rx, ry) = (area.width() * 0.46, area.height() * 0.46);
+        let n = 22;
+        for i in 0..n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            let (c, s) = (a.cos(), a.sin());
+            painter.line_segment(
+                [
+                    egui::pos2(cx + rx * CLEAR * c, cy + ry * CLEAR * s),
+                    egui::pos2(cx + rx * c, cy + ry * s),
+                ],
+                egui::Stroke::new(1.4, line_col),
+            );
+        }
+        return;
+    }
+    if matches!(shape, BubbleShape::SpeedLines { .. }) {
+        // Horizontal parallel streaks (preset dir is 0) skipping a clear center.
+        let (cx, cy) = (area.center().x, area.center().y);
+        let (rx, ry) = (area.width() * 0.47, area.height() * 0.44);
+        let n = 9;
+        for i in 0..n {
+            let f = i as f32 / (n as f32 - 1.0) * 2.0 - 1.0; // -1..1
+            let yoff = f * ry;
+            let outer_k = 1.0 - (yoff / ry).powi(2);
+            if outer_k <= 0.0 {
+                continue;
+            }
+            let half = rx * outer_k.sqrt();
+            let y = cy + yoff;
+            // Clear-ellipse half-width at this y (0 outside the clear band).
+            let clear_k = (CLEAR * CLEAR) - (yoff / ry).powi(2);
+            let gap = if clear_k > 0.0 {
+                rx * clear_k.sqrt()
+            } else {
+                0.0
+            };
+            if gap > 0.0 {
+                painter.line_segment(
+                    [egui::pos2(cx - half, y), egui::pos2(cx - gap, y)],
+                    egui::Stroke::new(1.4, line_col),
+                );
+                painter.line_segment(
+                    [egui::pos2(cx + gap, y), egui::pos2(cx + half, y)],
+                    egui::Stroke::new(1.4, line_col),
+                );
+            } else {
+                painter.line_segment(
+                    [egui::pos2(cx - half, y), egui::pos2(cx + half, y)],
+                    egui::Stroke::new(1.4, line_col),
+                );
+            }
+        }
+        return;
+    }
+    // 意識: a soft, fuzzy ellipse — translucent fill + a faint thin rim (hint at
+    // the feathered edge instead of the hard outline the generic path would draw).
+    if let BubbleShape::Concentration { .. } = shape {
+        let c = area.center();
+        let r = egui::vec2(area.width() * 0.44, area.height() * 0.44);
+        painter.add(egui::Shape::ellipse_filled(
+            c,
+            r,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+        ));
+        painter.add(egui::Shape::ellipse_stroke(
+            c,
+            r,
+            egui::Stroke::new(1.2, Color32::from_gray(180)),
+        ));
+        return;
+    }
+
     // A small tail pointing down-left, only for presets that have one.
     let tail = preset.tail_kind().map(|kind| Tail {
         tip: (-70.0, 200.0),
@@ -5140,6 +5953,28 @@ fn paint_bubble_preview(painter: &egui::Painter, area: Rect, preset: BubblePrese
         painter.add(egui::Shape::mesh(mesh));
         painter.add(egui::Shape::closed_line(outline, stroke));
     }
+    // 二重線: a second, inner concentric ring (matches the bake).
+    if let BubbleShape::DoubleStroke {
+        half_w,
+        half_h,
+        corner_px,
+        gap_px,
+    } = shape
+    {
+        let g = gap_px.max(1.0);
+        let inner_shape = BubbleShape::RoundRect {
+            half_w: (half_w - g).max(1.0),
+            half_h: (half_h - g).max(1.0),
+            corner_px: (corner_px - g).max(0.0),
+        };
+        let inner: Vec<Pos2> = tessellate_bubble(&inner_shape, pivot)
+            .iter()
+            .map(|&p| map(p))
+            .collect();
+        if inner.len() >= 3 {
+            painter.add(egui::Shape::closed_line(inner, stroke));
+        }
+    }
     // Thought-tail circles (filled + stroked).
     for &(tcx, tcy, r) in &geo.thought {
         let c = map((tcx, tcy));
@@ -5177,6 +6012,18 @@ enum BubblePreset {
     Thought,
     Shout,
     Whisper,
+    Soft,
+    Polygon,
+    Diamond,
+    Heart,
+    Arrow,
+    MotionLines,
+    SpeedLines,
+    Concentration,
+    MindEllipse,
+    Strokes,
+    DoubleStroke,
+    TextOnly,
 }
 
 impl BubblePreset {
@@ -5185,10 +6032,22 @@ impl BubblePreset {
     const ALL: &'static [BubblePreset] = &[
         BubblePreset::Normal,
         BubblePreset::RoundRect,
+        BubblePreset::Soft,
         BubblePreset::Narration,
         BubblePreset::Thought,
+        BubblePreset::MindEllipse,
         BubblePreset::Shout,
         BubblePreset::Whisper,
+        BubblePreset::Concentration,
+        BubblePreset::Polygon,
+        BubblePreset::Diamond,
+        BubblePreset::Heart,
+        BubblePreset::Arrow,
+        BubblePreset::MotionLines,
+        BubblePreset::SpeedLines,
+        BubblePreset::Strokes,
+        BubblePreset::DoubleStroke,
+        BubblePreset::TextOnly,
     ];
 
     fn label(self) -> &'static str {
@@ -5199,6 +6058,18 @@ impl BubblePreset {
             BubblePreset::Thought => "思考",
             BubblePreset::Shout => "叫び",
             BubblePreset::Whisper => "ささやき",
+            BubblePreset::Soft => "やわらか",
+            BubblePreset::Polygon => "多角形",
+            BubblePreset::Diamond => "ダイヤ",
+            BubblePreset::Heart => "ハート",
+            BubblePreset::Arrow => "矢印",
+            BubblePreset::MotionLines => "集中線",
+            BubblePreset::SpeedLines => "流線",
+            BubblePreset::Concentration => "意識",
+            BubblePreset::MindEllipse => "思考(楕円)",
+            BubblePreset::Strokes => "線",
+            BubblePreset::DoubleStroke => "二重線",
+            BubblePreset::TextOnly => "なし",
         }
     }
 
@@ -5211,6 +6082,18 @@ impl BubblePreset {
             BubblePreset::Thought => "thought",
             BubblePreset::Shout => "shout",
             BubblePreset::Whisper => "whisper",
+            BubblePreset::Soft => "soft",
+            BubblePreset::Polygon => "polygon",
+            BubblePreset::Diamond => "diamond",
+            BubblePreset::Heart => "heart",
+            BubblePreset::Arrow => "arrow",
+            BubblePreset::MotionLines => "motion-lines",
+            BubblePreset::SpeedLines => "speed-lines",
+            BubblePreset::Concentration => "concentration",
+            BubblePreset::MindEllipse => "mind-ellipse",
+            BubblePreset::Strokes => "strokes",
+            BubblePreset::DoubleStroke => "double-strokes",
+            BubblePreset::TextOnly => "none",
         }
     }
 
@@ -5246,14 +6129,98 @@ impl BubblePreset {
                 jag: 0.55,
                 shape_seed: 1,
             },
+            BubblePreset::Soft => BubbleShape::Soft {
+                half_w: 165.0,
+                half_h: 105.0,
+                corner_px: 38.0,
+                shape_seed: 0,
+            },
+            BubblePreset::Polygon => BubbleShape::Polygon {
+                rx: 155.0,
+                ry: 125.0,
+                sides: 6,
+            },
+            BubblePreset::Diamond => BubbleShape::Diamond {
+                half_w: 160.0,
+                half_h: 130.0,
+            },
+            BubblePreset::Heart => BubbleShape::Heart {
+                rx: 150.0,
+                ry: 140.0,
+            },
+            BubblePreset::Arrow => BubbleShape::Arrow {
+                half_w: 150.0,
+                half_h: 110.0,
+                dir_rad: -std::f32::consts::FRAC_PI_2,
+            },
+            BubblePreset::MotionLines => BubbleShape::MotionLines {
+                rx: 240.0,
+                ry: 180.0,
+                count: 72,
+                shape_seed: 0,
+            },
+            BubblePreset::SpeedLines => BubbleShape::SpeedLines {
+                half_w: 260.0,
+                half_h: 170.0,
+                dir_rad: 0.0,
+                count: 48,
+                shape_seed: 0,
+            },
+            BubblePreset::Concentration => BubbleShape::Concentration {
+                rx: 180.0,
+                ry: 120.0,
+                shape_seed: 0,
+            },
+            BubblePreset::MindEllipse => BubbleShape::Ellipse {
+                rx: 165.0,
+                ry: 110.0,
+            },
+            BubblePreset::Strokes => BubbleShape::Strokes {
+                half_w: 165.0,
+                half_h: 105.0,
+                corner_px: 36.0,
+                shape_seed: 0,
+            },
+            BubblePreset::DoubleStroke => BubbleShape::DoubleStroke {
+                half_w: 165.0,
+                half_h: 105.0,
+                corner_px: 26.0,
+                gap_px: 8.0,
+            },
+            BubblePreset::TextOnly => BubbleShape::TextOnly {
+                half_w: 150.0,
+                half_h: 95.0,
+            },
         }
     }
 
     fn tail_kind(self) -> Option<TailKind> {
         match self {
-            BubblePreset::Narration => None, // ナレーション has no tail.
-            BubblePreset::Thought => Some(TailKind::Thought),
+            // No tail for narration, the line-field effects (集中線 / 流線),
+            // 意識 (fuzzy, edgeless), なし (text-only), or 矢印 (already a pointer —
+            // a spike tail on top is redundant and looks broken once auto-sized).
+            BubblePreset::Narration
+            | BubblePreset::MotionLines
+            | BubblePreset::SpeedLines
+            | BubblePreset::Concentration
+            | BubblePreset::TextOnly
+            | BubblePreset::Arrow => None,
+            // Thought-style tails (もくもく cloud + clean 楕円 thought).
+            BubblePreset::Thought | BubblePreset::MindEllipse => Some(TailKind::Thought),
             _ => Some(TailKind::Spike),
+        }
+    }
+
+    /// Default 袋文字 (text outline) for this preset. Line-field effects have no
+    /// fill behind the text, so a white halo keeps the black text readable against
+    /// the lines + the underlying image.
+    fn text_outline(self) -> Option<StrokeStyle> {
+        match self {
+            BubblePreset::MotionLines | BubblePreset::SpeedLines => Some(StrokeStyle {
+                color: Rgba::WHITE,
+                width_px: 6.0,
+            }),
+            _ => None,
         }
     }
 
@@ -5301,6 +6268,7 @@ impl BubblePreset {
                 align: self.text_align(),
                 orientation: Orientation::Vertical,
                 markup_enabled: true,
+                outline: self.text_outline(),
                 ..TextBlock::default()
             },
             auto_size: true,
