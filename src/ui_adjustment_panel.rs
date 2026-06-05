@@ -251,6 +251,27 @@ mod local_adjust_segmentation_tests {
     }
 
     #[test]
+    fn change_mask_kind_resets_inversion() {
+        // 被写体マスクで「背景を選択」= mask_inverted=true の状態から手動マスクへ種類変更
+        // したとき、反転が引き継がれて全面マスクになる退行を防ぐ (mask_inverted がリセットされる)。
+        let mut layer = local_adjust_core::LocalAdjustmentLayer::new(
+            "subject",
+            local_adjust_core::LocalMask::Subject(local_adjust_core::SubjectMask::empty(4, 4)),
+            local_adjust_core::LocalEffect::None,
+        );
+        layer.mask_inverted = true;
+        replace_local_adjust_layer_base_mask(&mut layer, MaskKind::Raster, (4, 4), false);
+        assert!(
+            !layer.mask_inverted,
+            "マスク種類変更で反転フラグがリセットされること"
+        );
+        assert!(matches!(
+            layer.mask,
+            local_adjust_core::LocalMask::RasterVector(_)
+        ));
+    }
+
+    #[test]
     fn selected_local_adjust_line_thickness_updates_shape() {
         let mut layer = local_adjust_core::LocalAdjustmentLayer::new(
             "line",
@@ -5457,6 +5478,10 @@ fn replace_local_adjust_layer_base_mask(
     keep_manual_override: bool,
 ) {
     layer.mask = default_local_mask(mask_kind, image_dims);
+    // 新しいベースマスクは非反転で始める。被写体マスクで「背景を選択」(mask_inverted=true)
+    // していた状態から手動マスク等へ種類変更すると、空マスク (alpha=0) が反転されて
+    // 全面 alpha=1 になり、ビットマップ消去でも戻せなくなる退行があったため明示リセットする。
+    layer.mask_inverted = false;
     if !keep_manual_override {
         layer.manual_override = local_adjust_core::ManualMaskOverride::default();
     }
