@@ -19,7 +19,7 @@
 //! `cargo check` で型エラーが出たらそこを最初に疑うこと。
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
@@ -6470,6 +6470,265 @@ impl AuxVideoDecoder {
 
     pub(crate) fn d3d11va_config(&self) -> &str {
         &self.d3d11va_config
+    }
+}
+
+const D3D11VA_DECODE_PROBE_MAX_CONSECUTIVE_SEND_PACKET_ERRORS: u32 = 5;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum D3d11vaDecodeProbeMode {
+    Shared,
+    Owned,
+    Software,
+}
+
+impl D3d11vaDecodeProbeMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Owned => "owned",
+            Self::Software => "sw",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct D3d11vaDecodeProbeReport {
+    pub mode: D3d11vaDecodeProbeMode,
+    pub path: PathBuf,
+    pub codec_name: String,
+    pub decoder_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub field_order: String,
+    pub stream_interlaced: bool,
+    pub d3d11va_supported: bool,
+    pub d3d11va_config: String,
+    pub hw_decode_active: bool,
+    pub packets: u64,
+    pub frames: u64,
+    pub hw_frames: u64,
+    pub sw_frames: u64,
+    pub readback_failures: u64,
+    pub packet_read_errors: u64,
+    pub send_packet_errors: u64,
+    pub first_send_packet_error: Option<String>,
+    pub first_send_packet_error_at_packet: Option<u64>,
+    pub first_send_packet_error_at_frame: Option<u64>,
+    pub first_send_packet_error_elapsed_ms: Option<f64>,
+    pub elapsed_ms: f64,
+    pub exit_reason: String,
+}
+
+impl D3d11vaDecodeProbeReport {
+    pub fn ok(&self) -> bool {
+        self.send_packet_errors == 0 && self.readback_failures == 0
+    }
+}
+
+pub fn run_d3d11va_decode_probe(
+    path: &Path,
+    mode: D3d11vaDecodeProbeMode,
+    max_frames: Option<u64>,
+    max_packets: Option<u64>,
+) -> Result<D3d11vaDecodeProbeReport, String> {
+    use ffmpeg::media::Type as MediaType;
+    use ffmpeg_the_third as ffmpeg;
+
+    ffmpeg::init().map_err(|e| format!("ffmpeg::init failed: {e}"))?;
+    let started = std::time::Instant::now();
+    let mut input =
+        ffmpeg::format::input(path).map_err(|e| format!("format::input failed: {e}"))?;
+    let video_stream = input
+        .streams()
+        .best(MediaType::Video)
+        .ok_or_else(|| "no video stream".to_string())?;
+    let video_stream_idx = video_stream.index();
+    let video_params = video_stream.parameters();
+    let video_params_owned = clone_codec_parameters(&video_params)?;
+    let codec_id = video_params_owned.id();
+    let field_order = video_params_owned.field_order();
+
+    #[cfg(windows)]
+    let shared_gpu_video_device = if mode == D3d11vaDecodeProbeMode::Shared {
+        Some(
+            crate::video::gpu_renderer::GpuVideoDevice::new()
+                .map_err(|e| format!("GpuVideoDevice::new failed: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    let opened = match mode {
+        D3d11vaDecodeProbeMode::Shared => {
+            #[cfg(windows)]
+            {
+                open_video_decoder_with_candidates(
+                    &video_params_owned,
+                    codec_id,
+                    true,
+                    shared_gpu_video_device.as_ref(),
+                )
+            }
+            #[cfg(not(windows))]
+            {
+                return Err("shared D3D11VA probe is Windows-only".to_string());
+            }
+        }
+        D3d11vaDecodeProbeMode::Owned => {
+            #[cfg(windows)]
+            {
+                open_video_decoder_with_candidates(&video_params_owned, codec_id, true, None)
+            }
+            #[cfg(not(windows))]
+            {
+                open_video_decoder_with_candidates(&video_params_owned, codec_id, true)
+            }
+        }
+        D3d11vaDecodeProbeMode::Software => {
+            #[cfg(windows)]
+            {
+                open_video_decoder_with_candidates(&video_params_owned, codec_id, false, None)
+            }
+            #[cfg(not(windows))]
+            {
+                open_video_decoder_with_candidates(&video_params_owned, codec_id, false)
+            }
+        }
+    }?;
+
+    let hw_decode_active = opened.hw_device.is_some();
+    let mut report = D3d11vaDecodeProbeReport {
+        mode,
+        path: path.to_path_buf(),
+        codec_name: codec_id.name().to_string(),
+        decoder_name: opened.decoder_name.clone(),
+        width: video_params_owned.width(),
+        height: video_params_owned.height(),
+        field_order: format!("{field_order:?}"),
+        stream_interlaced: field_order_is_interlaced(field_order),
+        d3d11va_supported: opened.hw_probe.d3d11va_supported,
+        d3d11va_config: opened.hw_probe.d3d11va_config.clone(),
+        hw_decode_active,
+        packets: 0,
+        frames: 0,
+        hw_frames: 0,
+        sw_frames: 0,
+        readback_failures: 0,
+        packet_read_errors: 0,
+        send_packet_errors: 0,
+        first_send_packet_error: None,
+        first_send_packet_error_at_packet: None,
+        first_send_packet_error_at_frame: None,
+        first_send_packet_error_elapsed_ms: None,
+        elapsed_ms: 0.0,
+        exit_reason: "completed".to_string(),
+    };
+    let mut opened = opened;
+    let mut consecutive_send_packet_errors = 0_u32;
+
+    for item in input.packets() {
+        let (stream, packet) = match item {
+            Ok(sp) => sp,
+            Err(e) => {
+                report.packet_read_errors = report.packet_read_errors.saturating_add(1);
+                if report.packet_read_errors <= 5 {
+                    crate::logger::log(format!("d3d11va probe packet read error: {e}"));
+                }
+                continue;
+            }
+        };
+        if stream.index() != video_stream_idx {
+            continue;
+        }
+        if max_packets.is_some_and(|limit| report.packets >= limit) {
+            report.exit_reason = format!("max_packets:{limit}", limit = max_packets.unwrap());
+            break;
+        }
+        report.packets = report.packets.saturating_add(1);
+        if let Err(e) = opened.decoder.send_packet(&packet) {
+            report.send_packet_errors = report.send_packet_errors.saturating_add(1);
+            consecutive_send_packet_errors = consecutive_send_packet_errors.saturating_add(1);
+            if report.first_send_packet_error.is_none() {
+                report.first_send_packet_error = Some(e.to_string());
+                report.first_send_packet_error_at_packet = Some(report.packets);
+                report.first_send_packet_error_at_frame = Some(report.frames);
+                report.first_send_packet_error_elapsed_ms =
+                    Some(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            crate::logger::log(format!(
+                "d3d11va probe send_packet error: {e} \
+                 mode={} packets={} frames={} consecutive={consecutive_send_packet_errors}",
+                mode.label(),
+                report.packets,
+                report.frames
+            ));
+            if consecutive_send_packet_errors
+                >= D3D11VA_DECODE_PROBE_MAX_CONSECUTIVE_SEND_PACKET_ERRORS
+            {
+                report.exit_reason =
+                    format!("send_packet_exhausted:{consecutive_send_packet_errors}");
+                break;
+            }
+        } else {
+            consecutive_send_packet_errors = 0;
+        }
+
+        drain_d3d11va_probe_frames(&mut opened.decoder, &mut report, max_frames);
+        if max_frames.is_some_and(|limit| report.frames >= limit) {
+            report.exit_reason = format!("max_frames:{limit}", limit = max_frames.unwrap());
+            break;
+        }
+    }
+
+    if report.exit_reason == "completed" {
+        unsafe {
+            use ffmpeg_the_third::ffi::avcodec_send_packet;
+            let _ = avcodec_send_packet(opened.decoder.as_mut_ptr(), std::ptr::null());
+        }
+        drain_d3d11va_probe_frames(&mut opened.decoder, &mut report, max_frames);
+        if max_frames.is_some_and(|limit| report.frames >= limit) {
+            report.exit_reason = format!("max_frames:{limit}", limit = max_frames.unwrap());
+        }
+    }
+
+    report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    Ok(report)
+}
+
+fn drain_d3d11va_probe_frames(
+    decoder: &mut ffmpeg_the_third::decoder::Video,
+    report: &mut D3d11vaDecodeProbeReport,
+    max_frames: Option<u64>,
+) {
+    use ffmpeg::format::Pixel;
+    use ffmpeg::util::frame::video::Video;
+    use ffmpeg_the_third as ffmpeg;
+
+    let mut frame = Video::empty();
+    while decoder.receive_frame(&mut frame).is_ok() {
+        report.frames = report.frames.saturating_add(1);
+        if matches!(frame.format(), Pixel::D3D11) {
+            report.hw_frames = report.hw_frames.saturating_add(1);
+        } else {
+            report.sw_frames = report.sw_frames.saturating_add(1);
+        }
+        let mut sw_holder = None;
+        if let Err(e) =
+            crate::video::swscale_helpers::prepare_frame_for_swscale(&frame, &mut sw_holder)
+        {
+            report.readback_failures = report.readback_failures.saturating_add(1);
+            if report.readback_failures <= 5 {
+                crate::logger::log(format!(
+                    "d3d11va probe readback failed: {e} frames={}",
+                    report.frames
+                ));
+            }
+        }
+        if max_frames.is_some_and(|limit| report.frames >= limit) {
+            break;
+        }
+        frame = Video::empty();
     }
 }
 
