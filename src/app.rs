@@ -3650,6 +3650,13 @@ pub struct App {
     /// Some の間ダイアログが表示され、worker thread が動作している。
     /// 閉じる (Drop) と worker は cancel される。
     pub(crate) trt_install_state: Option<crate::ui_dialogs::trt_install::TrtInstallState>,
+    /// 編集用追加パック (オノマトペ向けフォント + 被写体分離モデル) のオンライン
+    /// 取得ダイアログ状態。Some の間ダイアログ表示 + worker 動作 (Drop で cancel)。
+    pub(crate) editing_addon_install_state:
+        Option<crate::ui_dialogs::editing_addon::EditingAddonInstallState>,
+    /// 編集用追加パックの確認ダイアログを「今はしない」で閉じたか (このセッション中)。
+    /// true の間は編集系入口での再 prompt を抑制する (spec §4.1 `declined_this_session`)。
+    pub(crate) editing_addon_declined_session: bool,
     /// フルスクリーン中央のヒントオーバーレイ。
     /// 最後/最初の項目でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で
     /// 画像・動画のあるフォルダが skip_limit 以内に見つからなかったときに表示する。
@@ -4942,6 +4949,8 @@ impl App {
             trt_auto_restart_attempts: 0,
             trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             trt_install_state: None,
+            editing_addon_install_state: None,
+            editing_addon_declined_session: false,
             fs_boundary_hint: None,
 
             // 消しゴムモード
@@ -26091,6 +26100,8 @@ impl eframe::App for App {
         self.show_trt_worker_notice_dialog(ctx);
         // TRT pack オンラインインストールダイアログ (環境設定から起動)。
         self.show_trt_install_dialog(ctx);
+        // 編集用追加パック (フォント + 被写体分離モデル) のオンライン取得ダイアログ。
+        self.show_editing_addon_dialog(ctx);
         self.show_stats_dialog_window(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);

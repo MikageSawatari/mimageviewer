@@ -13,6 +13,7 @@ pub(crate) mod archive_convert;
 mod cache_creator;
 mod cache_manager;
 pub(crate) mod context_menu;
+pub(crate) mod editing_addon;
 mod fav_add;
 pub(crate) mod favorites_editor;
 mod open_folder;
