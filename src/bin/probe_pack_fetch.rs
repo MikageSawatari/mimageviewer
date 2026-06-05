@@ -10,9 +10,12 @@
 //!   # ターミナル A: 成果物ディレクトリを配信
 //!   (cd dist/editing-pack-publish && python -m http.server 8099)
 //!   # ターミナル B:
-//!   MIV_EDITING_PACK_BASE_URL=http://127.0.0.1:8099 cargo run --bin probe_editing_install
+//!   MIV_EDITING_PACK_BASE_URL=http://127.0.0.1:8099 cargo run --bin probe_pack_fetch
 //!
 //! release ビルドでは override が無視される (security) ので必ず debug で実行する。
+//!
+//! NOTE: bin 名に "install"/"setup"/"update" を含めると Windows の UAC インストーラ検出
+//! ヒューリスティクスで実行に管理者権限を要求される (os error 740)。名前は中立にすること。
 
 use std::time::Duration;
 
