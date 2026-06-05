@@ -35,6 +35,10 @@ pub struct TextStylePreset {
     pub outline: Option<StrokeStyle>,
     pub auto_tcy: bool,
     pub markup_enabled: bool,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
 }
 
 impl TextStylePreset {
@@ -50,6 +54,8 @@ impl TextStylePreset {
         tb.outline = self.outline;
         tb.auto_tcy = self.auto_tcy;
         tb.markup_enabled = self.markup_enabled;
+        tb.bold = self.bold;
+        tb.italic = self.italic;
         tb.preset_link = Some(self.id.clone());
     }
 
@@ -68,6 +74,8 @@ impl TextStylePreset {
             outline: tb.outline,
             auto_tcy: tb.auto_tcy,
             markup_enabled: tb.markup_enabled,
+            bold: tb.bold,
+            italic: tb.italic,
         }
     }
 }
@@ -156,13 +164,12 @@ pub struct WindowStylePreset {
 
 impl WindowStylePreset {
     /// スタイルを `w` に適用する。本文・名前の TEXT 内容とフォントは対象から保つ。
+    ///
+    /// レイアウト (size_mode / half_w / half_h / margin_px / position) は対象に**残す**。
+    /// 「見た目を着せ替える」操作で利用者がリサイズ/移動した枠が既定サイズへ縮む事故を
+    /// 防ぐ (Codex P3)。プリセット側のレイアウト値は `from_window` で取り込むが適用しない。
     pub fn apply_to(&self, w: &mut MessageWindowObject) {
-        w.size_mode = self.size_mode;
-        w.half_w = self.half_w;
-        w.half_h = self.half_h;
-        w.margin_px = self.margin_px;
         w.corner_px = self.corner_px;
-        w.position = self.position;
         w.fill_mode = self.fill_mode;
         w.fill = self.fill;
         w.fill_opacity = self.fill_opacity;
@@ -335,6 +342,8 @@ mod tests {
             }),
             auto_tcy: false,
             markup_enabled: true,
+            bold: true,
+            italic: false,
         };
         let mut tb = TextBlock {
             text: "本文は保持".to_string(),
@@ -345,6 +354,7 @@ mod tests {
         assert_eq!(tb.font_key, "MyFont");
         assert_eq!(tb.size_px, 72.0);
         assert_eq!(tb.align, TextAlign::End);
+        assert!(tb.bold, "bold もプリセットから復元される");
         assert_eq!(tb.preset_link.as_deref(), Some("user:t1"));
     }
 
@@ -383,6 +393,8 @@ mod tests {
                 outline: None,
                 auto_tcy: false,
                 markup_enabled: false,
+                bold: false,
+                italic: false,
             },
             TextStylePreset {
                 id: "user:t1".to_string(),
@@ -397,6 +409,8 @@ mod tests {
                 outline: None,
                 auto_tcy: false,
                 markup_enabled: false,
+                bold: false,
+                italic: false,
             },
         ];
         let doc = UserPresetDoc {

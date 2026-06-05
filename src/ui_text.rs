@@ -2235,7 +2235,11 @@ impl App {
         self.comic_window_presets = window;
     }
 
-    /// 既存と衝突しない `user:<prefix><n>` プリセット id を作る。
+    /// 再利用されないユニークな `user:<prefix><nanos>` プリセット id を作る。
+    ///
+    /// 単調増加 (エポックナノ秒) ベースにすることで、プリセットを削除しても同じ id が
+    /// 再発行されない。インデックス再利用方式だと、削除した id が別ページ (comic.db に
+    /// 保存済み) の旧リンクと衝突し、無関係なプリセットに点灯/再適用される (Codex P2)。
     fn next_user_preset_id(&self, prefix: &str) -> String {
         let used: std::collections::HashSet<String> = self
             .comic_text_presets
@@ -2244,13 +2248,16 @@ impl App {
             .chain(self.comic_shape_presets.iter().map(|p| p.id.clone()))
             .chain(self.comic_window_presets.iter().map(|p| p.id.clone()))
             .collect();
-        let mut n = 1;
+        let mut base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         loop {
-            let id = format!("user:{prefix}{n}");
+            let id = format!("user:{prefix}{base}");
             if !used.contains(&id) {
                 return id;
             }
-            n += 1;
+            base += 1;
         }
     }
 
@@ -3535,6 +3542,8 @@ fn system_text_presets(font: &str) -> Vec<TextStylePreset> {
         outline,
         auto_tcy: true,
         markup_enabled: true,
+        bold: false,
+        italic: false,
     };
     vec![
         base(
@@ -4268,7 +4277,12 @@ fn edit_object_ui(
             ui.add_space(4.0);
             draw_section_bar(ui, TextPropTab::Serifu.color(), |ui| {
                 text_preset_bar(ui, t, presets, changed);
+                let snap = t.clone();
                 text_block_ui(ui, t, changed, true, open_font_picker);
+                // 個別スタイル編集でプリセットリンクを解除 (本文内容の編集では外さない)。
+                if t.preset_link.is_some() && text_style_diverged(&snap, t) {
+                    t.preset_link = None;
+                }
             });
         }
         AnnotationKind::Bubble(b) => {
@@ -4289,10 +4303,21 @@ fn edit_object_ui(
                 TextPropTab::Serifu => {
                     text_block_ui(ui, &mut b.text, changed, true, open_font_picker)
                 }
-                TextPropTab::Tail => bubble_tail_ui(ui, b, changed),
+                TextPropTab::Tail => {
+                    let snap = b.clone();
+                    bubble_tail_ui(ui, b, changed);
+                    // しっぽ種別の付与/除去はプリセット (tail_kind) と乖離する。
+                    if b.shape_preset_link.is_some() && shape_style_diverged(&snap, b) {
+                        b.shape_preset_link = None;
+                    }
+                }
                 TextPropTab::Body => {
                     shape_preset_bar(ui, b, pivot, presets, changed);
+                    let snap = b.clone();
                     bubble_body_ui(ui, b, changed);
+                    if b.shape_preset_link.is_some() && shape_style_diverged(&snap, b) {
+                        b.shape_preset_link = None;
+                    }
                 }
             });
         }
@@ -4318,7 +4343,11 @@ fn edit_object_ui(
                 }
                 _ => {
                     window_preset_bar(ui, w, presets, changed);
+                    let snap = w.clone();
                     window_body_ui(ui, w, changed);
+                    if w.style_preset_link.is_some() && window_style_diverged(&snap, w) {
+                        w.style_preset_link = None;
+                    }
                 }
             });
         }
@@ -4327,6 +4356,56 @@ fn edit_object_ui(
             stamp_ui(ui, s, changed, open_stamp_replace);
         }
     }
+}
+
+/// セリフプリセットが捉えるスタイル各フィールドのいずれかが変わったか (本文内容と
+/// preset_link は無視)。個別編集でリンクを解除する判定に使う。
+fn text_style_diverged(a: &TextBlock, b: &TextBlock) -> bool {
+    a.font_key != b.font_key
+        || a.size_px != b.size_px
+        || a.color != b.color
+        || a.orientation != b.orientation
+        || a.align != b.align
+        || a.line_gap != b.line_gap
+        || a.letter_gap != b.letter_gap
+        || a.outline != b.outline
+        || a.auto_tcy != b.auto_tcy
+        || a.markup_enabled != b.markup_enabled
+        || a.bold != b.bold
+        || a.italic != b.italic
+}
+
+/// 本体プリセット (ShapeStylePreset) が捉えるフィールドのいずれかが変わったか。しっぽの
+/// 位置は対象外 (preset は tail_kind のみ)。
+fn shape_style_diverged(a: &BubbleObject, b: &BubbleObject) -> bool {
+    a.shape != b.shape
+        || a.tail.map(|t| t.kind) != b.tail.map(|t| t.kind)
+        || a.fill != b.fill
+        || a.fill_opacity != b.fill_opacity
+        || a.outline != b.outline
+        || a.padding_px != b.padding_px
+}
+
+/// ウィンドウプリセットが適用する視覚フィールドのいずれかが変わったか。レイアウト
+/// (size/position) は preset が適用しないので対象外。本文 TEXT も対象外 (別タブで編集)。
+fn window_style_diverged(a: &MessageWindowObject, b: &MessageWindowObject) -> bool {
+    a.corner_px != b.corner_px
+        || a.fill_mode != b.fill_mode
+        || a.fill != b.fill
+        || a.fill_opacity != b.fill_opacity
+        || a.gradient_to != b.gradient_to
+        || a.scrim_dense_side != b.scrim_dense_side
+        || a.frame != b.frame
+        || a.outline != b.outline
+        || a.frame_gap_px != b.frame_gap_px
+        || a.shadow != b.shadow
+        || a.padding != b.padding
+        || a.v_anchor != b.v_anchor
+        || a.wrap != b.wrap
+        || a.indicator != b.indicator
+        || a.indicator_auto != b.indicator_auto
+        || a.name_plate != b.name_plate
+        || a.portrait != b.portrait
 }
 
 /// プリセットバー周りの状態。詳細パネルの外 (draw_text_panel) で結果を処理する。
