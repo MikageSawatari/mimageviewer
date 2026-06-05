@@ -3838,8 +3838,16 @@ pub struct App {
     pub(crate) comic_fonts: Option<Arc<comic_core::FontSet>>,
     pub(crate) comic_fonts_loaded: bool,
     /// Inc 1 のデモフィクスチャを出すか (環境変数 `MIV_COMIC_DEMO=1` で有効)。
-    /// 通常閲覧を壊さないため既定 OFF。Inc 2 で comic.db 読み込みに置換する暫定ゲート。
+    /// 通常閲覧を壊さないため既定 OFF。Inc 2 では「注釈が無い画像にデモをシードして
+    /// comic.db へ保存する」開発用シードのトリガも兼ねる (round-trip 検証用)。
     pub(crate) comic_demo_enabled: bool,
+    /// 注釈の正本 = 中央 SQLite `comic.db` (D4/§6.1)。起動時に open。失敗時は None
+    /// (= 永続化なしで表示のみ動作、クラッシュさせない)。
+    pub(crate) comic_db: Option<crate::comic_db::ComicDb>,
+    /// comic.db から読み込んだ注釈ドキュメントのメモリキャッシュ。**キーは
+    /// `page_path_key`** (画像の identity = フォルダ移動・idx 入れ替えに非依存) なので、
+    /// idx remap での無効化は不要。空 Vec = 「読み込み済みだが注釈なし」。
+    pub(crate) comic_docs: std::collections::HashMap<String, Vec<comic_core::AnnotationObject>>,
 
     // ── フルスクリーン Ctrl+↑↓ ナビロック ─────────────────────────
     /// ナビ中の「次のページがまだ表示できない」ガード。`Some(gen)` の間は
@@ -4400,6 +4408,10 @@ impl App {
         let conceal_db = crate::conceal_db::ConcealDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_conceal", 0, t);
 
+        let t = std::time::Instant::now();
+        let comic_db = crate::comic_db::ComicDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_comic", 0, t);
+
         let video_upscale_data_dir = crate::data_dir::get();
         let video_upscale_queue_lock =
             crate::video::upscale::queue::QueueLock::acquire(&video_upscale_data_dir).ok();
@@ -4921,6 +4933,8 @@ impl App {
             comic_demo_enabled: std::env::var("MIV_COMIC_DEMO")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            comic_db,
+            comic_docs: std::collections::HashMap::new(),
             erase_preview_active: false,
             conceal_preview_active: false,
             erase_base_tex_cache: std::collections::HashMap::new(),
@@ -20508,27 +20522,44 @@ impl App {
 
     // ── テキスト注釈 (comic) オーバーレイ (Inc 1、最前面 D1) ─────────────
 
-    /// この画像 (idx) に適用する注釈オブジェクト列。Inc 1 は環境変数ゲートのデモ
-    /// フィクスチャを返すだけ。Inc 2 で `comic.db` (page_path_key) 読み込みに置換する。
-    fn comic_objects_for_idx(
-        &self,
-        _idx: usize,
-        w: usize,
-        h: usize,
-    ) -> Vec<comic_core::AnnotationObject> {
-        if self.comic_demo_enabled {
-            crate::comic_overlay::demo_objects(w, h)
-        } else {
-            Vec::new()
+    /// 注釈ドキュメントを comic.db からメモリキャッシュ (`comic_docs`、page_path_key 別)
+    /// へ遅延ロードする。1 キーにつき DB は 1 度だけ引き、以降はメモリ参照。no-row /
+    /// 壊れ JSON は空 Vec として記録する (= 「読み込み済みだが注釈なし」)。
+    fn ensure_comic_doc_loaded(&mut self, key: &str) {
+        if self.comic_docs.contains_key(key) {
+            return;
+        }
+        let objs = self
+            .comic_db
+            .as_ref()
+            .and_then(|db| db.get(key))
+            .unwrap_or_default();
+        self.comic_docs.insert(key.to_string(), objs);
+    }
+
+    /// 注釈ドキュメントを comic.db に保存し、メモリキャッシュ (`comic_docs`) も更新する。
+    /// 空なら削除 (no-row = 空注釈)。Inc 2b でここに「設定のバックアップ」ON 時の
+    /// `mimageviewer.dat` ミラーを足す。
+    fn save_comic_objects(&mut self, key: &str, objects: &[comic_core::AnnotationObject]) {
+        self.comic_docs.insert(key.to_string(), objects.to_vec());
+        if let Some(db) = &self.comic_db {
+            if let Err(e) = db.set(key, objects) {
+                crate::logger::log(format!("[comic] comic.db set failed key={key}: {e}"));
+            }
         }
     }
 
-    /// この画像 (idx) に表示すべき注釈があるかの安価な早期ゲート。下地 (final composite)
-    /// に触れる前に呼ぶことで、注釈無し画像の通常閲覧をゼロオーバーヘッドに保つ
-    /// (Codex P3)。Inc 1 はデモゲートのみ。Inc 2 で comic.db / メモリ上の注釈セットの
-    /// 有無を見るように差し替える。
-    fn comic_has_objects(&self, _idx: usize) -> bool {
-        self.comic_demo_enabled
+    /// この画像 (idx) に表示すべき注釈があるかの早期ゲート。下地 (final composite) に
+    /// 触れる前に呼ぶことで、注釈無し画像の通常閲覧をほぼゼロオーバーヘッドに保つ
+    /// (Codex P3。comic.db lookup は page_path_key ごとに 1 度だけ、以降はメモリ)。
+    /// デモ有効時はシードのため常に true。
+    fn comic_has_objects(&mut self, idx: usize) -> bool {
+        let Some(key) = self.page_path_key(idx) else {
+            return false; // Folder / Video 等 (page_path_key 無し) は対象外
+        };
+        self.ensure_comic_doc_loaded(&key);
+        let has_persisted = self.comic_docs.get(&key).is_some_and(|v| !v.is_empty());
+        has_persisted || self.comic_demo_enabled
     }
 
     /// 注釈描画用フォントセットを遅延ロードして返す (1 度だけ試行)。フォントが見つから
@@ -20606,7 +20637,18 @@ impl App {
                 return Some(entry.texture.clone());
             }
         }
-        let objects = self.comic_objects_for_idx(idx, w, h);
+        // 注釈を comic.db から解決 (page_path_key)。デモ有効で永続注釈が無ければ、
+        // デモをシードして comic.db に保存する (Inc 2 の round-trip 検証用。デモを
+        // 切って再起動すると comic.db からロードされて表示が再現される)。
+        let Some(key) = self.page_path_key(idx) else {
+            return None;
+        };
+        self.ensure_comic_doc_loaded(&key);
+        let mut objects = self.comic_docs.get(&key).cloned().unwrap_or_default();
+        if objects.is_empty() && self.comic_demo_enabled {
+            objects = crate::comic_overlay::demo_objects(w, h);
+            self.save_comic_objects(&key, &objects);
+        }
         if objects.is_empty() {
             return None;
         }
