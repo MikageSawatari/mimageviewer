@@ -3044,8 +3044,10 @@ fn run_video_decode(
     // 触らず、packet を `pending_resend_packet` に保持して次 iteration で再送する。
     const MAX_CONSECUTIVE_SEND_PACKET_ERRORS: u32 = 5;
     let mut consecutive_send_packet_errors: u32 = 0;
+    let mut recoverable_invalid_data_packets: u64 = 0;
     let mut hw_format_sw_fallback_attempted = false;
     let mut hw_format_sw_fallback_active = false;
+    let mut hw_invalid_data_sw_fallback_attempted = false;
     // pending packet には保存時の seek serial を attach する (Codex P1 2026-05-15)。
     // 消費前に `clock.current_seek_serial()` および local `current_seek_serial` と
     // 一致するか確認し、seek が進行中 (= live serial が先行) なら packet を破棄して
@@ -3198,6 +3200,7 @@ fn run_video_decode(
                     // packet があれば破棄 (Codex P1 2026-05-15)。
                     pending_resend_packet = None;
                     consecutive_send_packet_errors = 0;
+                    recoverable_invalid_data_packets = 0;
                     // bwdif keeps a tiny temporal window. Drop it on seek so the
                     // first post-seek frame cannot be compared with pre-seek data.
                     deinterlacer = None;
@@ -3423,6 +3426,101 @@ fn run_video_decode(
                         }
                     }
                 }
+                let recoverable_invalid_data =
+                    is_recoverable_send_packet_invalid_data(&e, first_frame_delivered);
+                if recoverable_invalid_data
+                    && hw_device.is_some()
+                    && !hw_invalid_data_sw_fallback_attempted
+                {
+                    hw_invalid_data_sw_fallback_attempted = true;
+                    crate::logger::log(format!(
+                        "[video-decode] HW send_packet returned InvalidData after first frame; reopening SW decoder: codec={}",
+                        codec_id.name()
+                    ));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "video_decode",
+                            "hw_invalid_data_sw_retry",
+                            None,
+                            current_seek_serial,
+                            &[("codec", serde_json::Value::from(codec_id.name()))],
+                        );
+                    }
+                    let reopened_result = {
+                        #[cfg(windows)]
+                        {
+                            open_video_decoder_with_candidates(
+                                &video_params,
+                                codec_id,
+                                false,
+                                gpu_video_device.as_ref(),
+                            )
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            open_video_decoder_with_candidates(&video_params, codec_id, false)
+                        }
+                    };
+                    match reopened_result {
+                        Ok(reopened) => {
+                            let decoder_name = reopened.decoder_name.clone();
+                            let new_hw_probe = reopened.hw_probe.clone();
+                            video_decoder = reopened.decoder;
+                            hw_format_probe = reopened.hw_format_probe;
+                            hw_device = reopened.hw_device;
+                            hw_format_sw_fallback_active = true;
+                            consecutive_send_packet_errors = 0;
+                            recoverable_invalid_data_packets = 0;
+                            watchdog_start = std::time::Instant::now();
+                            pending_resend_packet = Some((current_seek_serial, packet));
+                            scaler = None;
+                            scaler_key = None;
+                            deinterlacer = None;
+                            crate::logger::log(format!(
+                                "[video-decode] SW decoder reopened after runtime InvalidData: codec={} decoder={decoder_name} d3d11va_supported={} d3d11va_config={}",
+                                codec_id.name(),
+                                new_hw_probe.d3d11va_supported,
+                                new_hw_probe.d3d11va_config
+                            ));
+                            continue;
+                        }
+                        Err(open_err) => {
+                            crate::logger::log(format!(
+                                "[video-decode] SW decoder reopen failed after runtime InvalidData: codec={} err={open_err}",
+                                codec_id.name()
+                            ));
+                        }
+                    }
+                }
+                if recoverable_invalid_data {
+                    recoverable_invalid_data_packets =
+                        recoverable_invalid_data_packets.saturating_add(1);
+                    if recoverable_invalid_data_packets <= 5
+                        || recoverable_invalid_data_packets % 100 == 0
+                    {
+                        crate::logger::log(format!(
+                            "[video-decode] skipped InvalidData packet after first frame: count={recoverable_invalid_data_packets} pkt_rx_len={} video_tx_len={}",
+                            video_pkt_rx.len(),
+                            video_tx.len()
+                        ));
+                    }
+                    if crate::perf::is_enabled()
+                        && (recoverable_invalid_data_packets <= 5
+                            || recoverable_invalid_data_packets % 100 == 0)
+                    {
+                        crate::perf::event(
+                            "video_decode",
+                            "invalid_data_packet_skipped",
+                            None,
+                            current_seek_serial,
+                            &[(
+                                "count",
+                                serde_json::Value::from(recoverable_invalid_data_packets as i64),
+                            )],
+                        );
+                    }
+                    continue;
+                }
                 // 致命系: ENOSYS / EINVAL / External 等。連続失敗で thread を exit。
                 consecutive_send_packet_errors += 1;
                 crate::logger::log(format!(
@@ -3459,6 +3557,7 @@ fn run_video_decode(
         } else {
             // packet 投入成功 → 致命系 counter リセット (EAGAIN は前段で別管理)。
             consecutive_send_packet_errors = 0;
+            recoverable_invalid_data_packets = 0;
         }
         // EAGAIN 経路または送信成功時は receive_frame ループに進む。
         // 1 枚でも取れたら error カウンタは更にリセット (= 後段の receive ループ内で行う)。
@@ -3513,6 +3612,7 @@ fn run_video_decode(
             // リセットして transient な send_packet エラー (driver の一時的な
             // resource pressure 等) を許容する (Codex 助言 2026-05-15)。
             consecutive_send_packet_errors = 0;
+            recoverable_invalid_data_packets = 0;
             let decode_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
             let pts = match video_frame_timestamp(&frame) {
                 Some(pts) => pts,
@@ -6009,6 +6109,13 @@ fn should_retry_sw_after_hw_format_refusal(
         && probe.map_or(false, HwFormatProbeState::d3d11_refused)
 }
 
+fn is_recoverable_send_packet_invalid_data(
+    err: &ffmpeg_the_third::Error,
+    first_frame_delivered: bool,
+) -> bool {
+    first_frame_delivered && matches!(err, ffmpeg_the_third::Error::InvalidData)
+}
+
 #[derive(Clone, Debug)]
 struct D3d11vaHwFramesSnapshot {
     ref_ptr: usize,
@@ -7145,9 +7252,9 @@ mod decoder_candidate_tests {
         FrameStepDecodeSpec, FrameStepDecodeState, FrameStepSelection, HwFormatProbeState,
         VideoControlMsg, VideoDecodeInput, VideoPacketMsg, bwdif_filter_key,
         bwdif_force_all_frames, candidate_allows_sw_decode, field_order_is_interlaced,
-        normalize_audio_input_layout, normalize_sar, preferred_video_decoders,
-        recv_audio_decode_input, recv_video_decode_input_with_timeout, selected_video_rate,
-        should_bypass_pacing_for_startup_first_frame,
+        is_recoverable_send_packet_invalid_data, normalize_audio_input_layout, normalize_sar,
+        preferred_video_decoders, recv_audio_decode_input, recv_video_decode_input_with_timeout,
+        selected_video_rate, should_bypass_pacing_for_startup_first_frame,
         should_bypass_pause_park_for_post_seek_first_frame,
         should_retry_sw_after_hw_format_refusal, should_try_deinterlace,
     };
@@ -7435,6 +7542,28 @@ mod decoder_candidate_tests {
             false,
             false,
             Some(&probe)
+        ));
+    }
+
+    #[test]
+    fn invalid_data_send_packet_is_recoverable_only_after_first_frame() {
+        assert!(!is_recoverable_send_packet_invalid_data(
+            &ffmpeg_the_third::Error::InvalidData,
+            false
+        ));
+        assert!(is_recoverable_send_packet_invalid_data(
+            &ffmpeg_the_third::Error::InvalidData,
+            true
+        ));
+        assert!(!is_recoverable_send_packet_invalid_data(
+            &ffmpeg_the_third::Error::External,
+            true
+        ));
+        assert!(!is_recoverable_send_packet_invalid_data(
+            &ffmpeg_the_third::Error::Other {
+                errno: super::EAGAIN_ERRNO
+            },
+            true
         ));
     }
 

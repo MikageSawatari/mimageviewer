@@ -678,6 +678,11 @@ fast-swap throttle が永遠に refuse 状態のままになり「動画が一�
   flush 前の decoder に注ぎ込んで「seek 後に古いフレームが混ざる」再発要因になる。
   Flush ハンドラも `pending_resend_packet = None` で同様の防御 (双方向のガード)。
   致命系カウンタには加算しない。
+- **InvalidData after first frame**: 初回フレーム表示後の `AVERROR_INVALIDDATA` は、
+  壊れた GOP / 一部非互換 packet で発生し得るため、HW resource pressure とは分けて扱う。
+  HW decode 中に最初の `InvalidData` を見たら SW decoder で 1 回だけ開き直し、同 packet
+  を再送する。SW 側でも `InvalidData` が続く場合は packet をスキップして再生継続を試みる。
+  最初のフレーム前の `InvalidData` は起動失敗として従来通り致命系に分類する。
 - **致命系** (ENOSYS / EINVAL / External / その他): `MAX_CONSECUTIVE_SEND_PACKET_ERRORS=5`
   で連続失敗を打ち切り、`send_packet_exhausted` perf event を出して thread を exit。
   `receive_frame` で 1 枚でも取れたらカウンタリセット (transient な driver pressure を許容)。
