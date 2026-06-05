@@ -3911,6 +3911,21 @@ pub struct App {
     pub(crate) text_add_bubble_dialog: bool,
     /// 「ウィンドウを追加」スタイルピッカーダイアログの表示中フラグ。
     pub(crate) text_add_window_dialog: bool,
+    /// 「スタンプを追加/変更」絵文字ピッカーダイアログの表示中フラグ (Inc 4c)。
+    pub(crate) text_add_stamp_dialog: bool,
+    /// スタンプピッカーが「既存スタンプの差し替え」で開かれたときの対象オブジェクト id。
+    /// `None` のときは新規追加。
+    pub(crate) stamp_dialog_replace_target: Option<u64>,
+    /// スタンプピッカーの検索文字列 (名前 / コード)。
+    pub(crate) stamp_dialog_filter: String,
+    /// スタンプピッカーのカテゴリタブ選択。
+    pub(crate) stamp_dialog_category: crate::comic_stamp::EmojiCategory,
+    /// 最近使ったスタンプ (MRU、`comic_recent_stamps.json` に永続化)。初回ダイアログ表示時に
+    /// 遅延ロードする (`recent_stamps_loaded`)。
+    pub(crate) recent_stamps: Vec<comic_core::StampSource>,
+    pub(crate) recent_stamps_loaded: bool,
+    /// スタンプピッカーのサムネイルテクスチャキャッシュ (`stamp_source_key` → テクスチャ)。
+    pub(crate) stamp_thumb_cache: std::collections::HashMap<String, egui::TextureHandle>,
     /// 見開きから text モードに入ったときの spread 復元コンテキスト (conceal と同じ流儀)。
     pub(crate) text_spread_ctx: Option<EraseSpreadCtx>,
 
@@ -5008,6 +5023,13 @@ impl App {
             text_dirty_at: None,
             text_add_bubble_dialog: false,
             text_add_window_dialog: false,
+            text_add_stamp_dialog: false,
+            stamp_dialog_replace_target: None,
+            stamp_dialog_filter: String::new(),
+            stamp_dialog_category: crate::comic_stamp::EmojiCategory::Smileys,
+            recent_stamps: Vec::new(),
+            recent_stamps_loaded: false,
+            stamp_thumb_cache: std::collections::HashMap::new(),
             text_spread_ctx: None,
             erase_preview_active: false,
             conceal_preview_active: false,

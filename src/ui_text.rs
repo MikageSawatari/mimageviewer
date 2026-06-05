@@ -1039,6 +1039,7 @@ impl App {
         // 追加ダイアログ (パネルが comic_docs を書き戻した後に描く)。
         self.draw_text_add_bubble_dialog(ctx);
         self.draw_text_add_window_dialog(ctx);
+        self.draw_text_add_stamp_dialog(ctx);
     }
 
     /// 選択中オブジェクトの変形ハンドルを画面に描く。回転を反映した境界四角形 +
@@ -1148,6 +1149,8 @@ impl App {
         let mut close = false;
         let mut open_bubble_dialog = false;
         let mut open_window_dialog = false;
+        let mut open_stamp_dialog = false;
+        let mut open_stamp_replace = false;
 
         // ── 左パネル: ヘッダ + 追加 + オブジェクト一覧 (補正レイヤー風) ──
         egui::Area::new(egui::Id::new("text_panel"))
@@ -1220,6 +1223,9 @@ impl App {
                             if ui.button("ウィンドウ").clicked() {
                                 open_window_dialog = true;
                             }
+                            if ui.button("スタンプ").clicked() {
+                                open_stamp_dialog = true;
+                            }
                         });
                         ui.separator();
 
@@ -1281,7 +1287,13 @@ impl App {
                                         if let Some(o) = selected
                                             .and_then(|id| objects.iter_mut().find(|o| o.id == id))
                                         {
-                                            edit_object_ui(ui, o, &mut prop_tab, &mut changed);
+                                            edit_object_ui(
+                                                ui,
+                                                o,
+                                                &mut prop_tab,
+                                                &mut changed,
+                                                &mut open_stamp_replace,
+                                            );
                                         } else {
                                             ui.label(
                                                 egui::RichText::new(
@@ -1303,6 +1315,16 @@ impl App {
         }
         if open_window_dialog {
             self.text_add_window_dialog = true;
+        }
+        if open_stamp_dialog {
+            // 新規追加 (差し替え対象なし)。
+            self.stamp_dialog_replace_target = None;
+            self.text_add_stamp_dialog = true;
+        }
+        if open_stamp_replace {
+            // 詳細パネルの「別のスタンプに変更」: 選択中スタンプを差し替え対象にする。
+            self.stamp_dialog_replace_target = selected;
+            self.text_add_stamp_dialog = true;
         }
 
         // 書き戻し。編集中は毎フレーム DB へ書かず (Codex P2)、メモリ更新 + 再ベイクに留め、
@@ -1517,6 +1539,303 @@ impl App {
             self.mark_comic_dirty();
             self.text_add_window_dialog = false;
         }
+    }
+
+    /// スタンプピッカーのサムネイルテクスチャを (なければ) 用意する。デコードは
+    /// `comic_stamp_cache` (ベイクと共有) 経由で 1 度だけ行い、44px に縮小して
+    /// `stamp_thumb_cache` にアップロードする。
+    fn ensure_stamp_thumb(&mut self, ctx: &egui::Context, source: &comic_core::StampSource) {
+        let key = crate::comic_stamp::stamp_source_key(source);
+        if self.stamp_thumb_cache.contains_key(&key) {
+            return;
+        }
+        let full = self
+            .comic_stamp_cache
+            .entry(key.clone())
+            .or_insert_with(|| {
+                crate::comic_stamp::load_stamp_image(source).map(std::sync::Arc::new)
+            })
+            .clone();
+        let Some(full) = full else {
+            return;
+        };
+        let thumb = crate::comic_stamp::downscale_overlay(&full, 44);
+        let color = egui::ColorImage::from_rgba_unmultiplied([thumb.w, thumb.h], &thumb.pixels);
+        let tex = ctx.load_texture(
+            format!("stamp_thumb_{key}"),
+            color,
+            egui::TextureOptions::LINEAR,
+        );
+        self.stamp_thumb_cache.insert(key, tex);
+    }
+
+    /// 絵文字スタンプピッカー (カテゴリタブ + 検索 + 最近使った行 + 絵文字グリッド +
+    /// 「画像ファイルから追加」)。クリックで新規追加 or (差し替えモードなら) ソース差し替え。
+    /// ラボ `draw_stamp_dialog` の本体移植。
+    fn draw_text_add_stamp_dialog(&mut self, ctx: &egui::Context) {
+        if !self.text_add_stamp_dialog {
+            return;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            self.text_add_stamp_dialog = false;
+            return;
+        };
+        let Some(key) = self.page_path_key(fs_idx) else {
+            self.text_add_stamp_dialog = false;
+            return;
+        };
+        let (sw, sh) = self.source_dims_for_idx(fs_idx).unwrap_or((1000.0, 1000.0));
+
+        // 最近使ったスタンプを初回だけロード。
+        if !self.recent_stamps_loaded {
+            self.recent_stamps = crate::comic_stamp::load_recent_stamps();
+            self.recent_stamps_loaded = true;
+        }
+
+        let assets = crate::comic_stamp::emoji_assets_available();
+        let filter = self.stamp_dialog_filter.to_lowercase();
+        let cat = self.stamp_dialog_category;
+        // 表示対象: 検索中はカテゴリを無視。
+        let visible: Vec<(&'static str, &'static str)> = crate::comic_stamp::EMOJI_CATALOG
+            .iter()
+            .filter(|e| !e.name.is_empty())
+            .filter(|e| {
+                if filter.is_empty() {
+                    e.category == cat
+                } else {
+                    e.name.to_lowercase().contains(&filter) || e.key.contains(&filter)
+                }
+            })
+            .map(|e| (e.key, e.name))
+            .collect();
+
+        // サムネイルは &mut self が要るので read-only クロージャの前に用意しておく。
+        if assets {
+            for (k, _) in &visible {
+                self.ensure_stamp_thumb(ctx, &comic_core::StampSource::Emoji((*k).to_string()));
+            }
+        }
+        let recents = self.recent_stamps.clone();
+        for s in &recents {
+            self.ensure_stamp_thumb(ctx, s);
+        }
+        let thumbs = self.stamp_thumb_cache.clone();
+        let replacing = self.stamp_dialog_replace_target.is_some();
+
+        let mut open = true;
+        let mut chosen: Option<comic_core::StampSource> = None;
+        let mut pick_file = false;
+        let mut filter_local = self.stamp_dialog_filter.clone();
+        let mut cat_local = cat;
+
+        let title = if replacing {
+            "スタンプを変更"
+        } else {
+            "スタンプを追加"
+        };
+        let avail = ctx.content_rect();
+        let default_w = (avail.width() - 24.0).clamp(360.0, 600.0);
+        let default_h = (avail.height() - 120.0).clamp(280.0, 560.0);
+        let frame = egui::Frame::window(ctx.style().as_ref())
+            .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+            ));
+        egui::Window::new(title)
+            .id(egui::Id::new("text_add_stamp_dialog"))
+            .order(egui::Order::Foreground)
+            .frame(frame)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([default_w, default_h])
+            .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                *ui.visuals_mut() = egui::Visuals::dark();
+                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                ui.horizontal(|ui| {
+                    if ui.button("画像ファイルから追加…").clicked() {
+                        pick_file = true;
+                    }
+                    ui.separator();
+                    ui.label("検索");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut filter_local)
+                            .hint_text("名前 / コード")
+                            .desired_width(160.0),
+                    );
+                });
+
+                // 最近使った行。
+                if !recents.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("最近使った").weak());
+                    ui.horizontal_wrapped(|ui| {
+                        for s in &recents {
+                            let k = crate::comic_stamp::stamp_source_key(s);
+                            let label = crate::comic_stamp::stamp_label(s);
+                            let resp = if let Some(tex) = thumbs.get(&k) {
+                                ui.add(
+                                    egui::Button::image(egui::load::SizedTexture::new(
+                                        tex.id(),
+                                        egui::vec2(34.0, 34.0),
+                                    ))
+                                    .corner_radius(4.0),
+                                )
+                            } else {
+                                ui.button(&label)
+                            };
+                            if resp.on_hover_text(&label).clicked() {
+                                chosen = Some(s.clone());
+                            }
+                        }
+                    });
+                    ui.separator();
+                }
+
+                // カテゴリタブ (検索中は隠す)。
+                if filter_local.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        for &c in crate::comic_stamp::EmojiCategory::all() {
+                            ui.selectable_value(&mut cat_local, c, c.label());
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+
+                if !assets {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 180, 90),
+                        "絵文字アセット未配置: scripts/setup-twemoji.sh で取得 (画像ファイルからは追加できます)",
+                    );
+                }
+
+                // 絵文字グリッド。
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for (k, name) in &visible {
+                                let src_key = format!("e:{k}");
+                                let resp = if let Some(tex) = thumbs.get(&src_key) {
+                                    ui.add(
+                                        egui::Button::image(egui::load::SizedTexture::new(
+                                            tex.id(),
+                                            egui::vec2(40.0, 40.0),
+                                        ))
+                                        .corner_radius(4.0),
+                                    )
+                                } else {
+                                    // アセット無し (or デコード失敗): コンパクトなテキストチップ。
+                                    ui.add_sized(
+                                        [44.0, 44.0],
+                                        egui::Button::new(egui::RichText::new(*k).size(9.0).weak()),
+                                    )
+                                };
+                                if resp.on_hover_text(*name).clicked() {
+                                    chosen =
+                                        Some(comic_core::StampSource::Emoji((*k).to_string()));
+                                }
+                            }
+                        });
+                    });
+            });
+
+        // 編集した検索文字列 / カテゴリを書き戻す。
+        self.stamp_dialog_filter = filter_local;
+        self.stamp_dialog_category = cat_local;
+        self.text_add_stamp_dialog = open;
+
+        if pick_file {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("画像", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
+                .pick_file()
+            {
+                chosen = Some(comic_core::StampSource::File(path));
+            }
+        }
+
+        if let Some(src) = chosen {
+            self.apply_stamp_choice(fs_idx, &key, (sw, sh), src);
+            self.text_add_stamp_dialog = false;
+        } else if !open {
+            // × で閉じた: 差し替え対象もクリア。
+            self.stamp_dialog_replace_target = None;
+        }
+    }
+
+    /// ピッカーで選んだスタンプソースを適用する。差し替え対象があれば既存スタンプの
+    /// ソースを差し替え (ジオメトリ保持・アスペクト再フィット)、無ければ画像中心へ新規追加。
+    /// MRU 更新 + comic.db 保存まで行う。
+    fn apply_stamp_choice(
+        &mut self,
+        fs_idx: usize,
+        key: &str,
+        src_dims: (f32, f32),
+        source: comic_core::StampSource,
+    ) {
+        // ソースをデコードしてアスペクト (w/h) を得る (キャッシュ経由)。
+        let skey = crate::comic_stamp::stamp_source_key(&source);
+        let aspect = {
+            let entry = self.comic_stamp_cache.entry(skey).or_insert_with(|| {
+                crate::comic_stamp::load_stamp_image(&source).map(std::sync::Arc::new)
+            });
+            match entry {
+                Some(o) if o.w > 0 && o.h > 0 => o.w as f32 / o.h as f32,
+                _ => 1.0,
+            }
+        }
+        .max(1e-3);
+
+        let mut objs = self.comic_docs.remove(key).unwrap_or_default();
+        match self.stamp_dialog_replace_target.take() {
+            Some(id) => {
+                // 既存スタンプのソース差し替え (長辺サイズ保持、短辺をアスペクト再フィット)。
+                if let Some(obj) = objs.iter_mut().find(|o| o.id == id) {
+                    if let AnnotationKind::Stamp(s) = &mut obj.kind {
+                        let long = s.half_w.max(s.half_h);
+                        if aspect >= 1.0 {
+                            s.half_w = long;
+                            s.half_h = (long / aspect).max(8.0);
+                        } else {
+                            s.half_h = long;
+                            s.half_w = (long * aspect).max(8.0);
+                        }
+                        s.source = source.clone();
+                    }
+                }
+                self.text_selected = Some(id);
+            }
+            None => {
+                // 画像中心へ新規追加 (長辺 ~ ソース短辺の比率)。
+                let (sw, sh) = src_dims;
+                let long = (sw.min(sh) * 0.12).clamp(48.0, 800.0); // half-extent
+                let (half_w, half_h) = if aspect >= 1.0 {
+                    (long, (long / aspect).max(8.0))
+                } else {
+                    ((long * aspect).max(8.0), long)
+                };
+                let id = next_id(&objs);
+                let z = objs.len() as i32;
+                let stamp = StampObject {
+                    source: source.clone(),
+                    half_w,
+                    half_h,
+                    ..StampObject::default()
+                };
+                let mut o = AnnotationObject::new_stamp(id, (sw * 0.5, sh * 0.5), stamp);
+                o.z = z;
+                objs.push(o);
+                self.text_selected = Some(id);
+            }
+        }
+        // MRU 更新 + 永続化。
+        crate::comic_stamp::push_recent_stamp(&mut self.recent_stamps, &source);
+        crate::comic_stamp::save_recent_stamps(&self.recent_stamps);
+        self.save_comic_objects(fs_idx, key, &objs);
+        self.text_dirty_at = None;
+        self.mark_comic_dirty();
     }
 }
 
@@ -2509,6 +2828,7 @@ fn edit_object_ui(
     o: &mut AnnotationObject,
     tab: &mut TextPropTab,
     changed: &mut bool,
+    open_stamp_replace: &mut bool,
 ) {
     ui.strong(kind_label(o));
     // 回転 (全種共通、タブの外)。
@@ -2573,7 +2893,7 @@ fn edit_object_ui(
         }
         AnnotationKind::Stamp(s) => {
             // スタンプは画像プロパティのみ (タブなし)。
-            stamp_ui(ui, s, changed);
+            stamp_ui(ui, s, changed, open_stamp_replace);
         }
     }
 }
@@ -2874,13 +3194,48 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
     });
 }
 
-/// スタンプの編集 (ピッカーは Inc 4c。ここでは不透明度 / 反転のみ)。
-fn stamp_ui(ui: &mut egui::Ui, s: &mut StampObject, changed: &mut bool) {
-    ui.label(
-        egui::RichText::new("スタンプ画像の選択は今後のバージョンで対応します")
-            .small()
-            .color(egui::Color32::from_gray(160)),
-    );
+/// スタンプの編集 (画像 = 大きさ / 不透明度 / 反転 / ステッカー風縁取り + ソース差し替え)。
+/// `open_stamp_replace` は「別のスタンプに変更」が押されたときに立て、呼び出し側が
+/// 絵文字ピッカーを差し替えモードで開く (ラボ `draw_stamp_properties` 相当)。
+fn stamp_ui(
+    ui: &mut egui::Ui,
+    s: &mut StampObject,
+    changed: &mut bool,
+    open_stamp_replace: &mut bool,
+) {
+    ui.label(format!(
+        "画像: {}",
+        crate::comic_stamp::stamp_label(&s.source)
+    ));
+    if ui.button("別のスタンプに変更…").clicked() {
+        *open_stamp_replace = true;
+    }
+    ui.separator();
+
+    // 大きさ (長辺 px、アスペクト保持)。
+    let aspect = if s.half_h > 1e-3 {
+        s.half_w / s.half_h
+    } else {
+        1.0
+    };
+    let mut long = s.half_w.max(s.half_h) * 2.0;
+    ui.horizontal(|ui| {
+        ui.label("大きさ");
+        if ui
+            .add(egui::Slider::new(&mut long, 16.0..=1600.0).suffix("px"))
+            .changed()
+        {
+            let half_long = (long * 0.5).max(8.0);
+            if aspect >= 1.0 {
+                s.half_w = half_long;
+                s.half_h = (half_long / aspect).max(8.0);
+            } else {
+                s.half_h = half_long;
+                s.half_w = (half_long * aspect).max(8.0);
+            }
+            *changed = true;
+        }
+    });
     if ui
         .add(egui::Slider::new(&mut s.opacity, 0.0..=1.0).text("不透明"))
         .changed()
@@ -2899,6 +3254,38 @@ fn stamp_ui(ui: &mut egui::Ui, s: &mut StampObject, changed: &mut bool) {
             *changed = true;
         }
     });
+    // ステッカー風縁取り (シルエットを膨張させて背面に敷く)。
+    let mut has_outline = s.outline.is_some();
+    if ui
+        .checkbox(&mut has_outline, "縁取り (ステッカー風)")
+        .changed()
+    {
+        s.outline = if has_outline {
+            Some(StrokeStyle {
+                color: Rgba::WHITE,
+                width_px: 6.0,
+            })
+        } else {
+            None
+        };
+        *changed = true;
+    }
+    if let Some(o) = &mut s.outline {
+        ui.horizontal(|ui| {
+            ui.label("縁色");
+            let mut col = to_c32(o.color);
+            if ui.color_edit_button_srgba(&mut col).changed() {
+                o.color = from_c32(col);
+                *changed = true;
+            }
+            if ui
+                .add(egui::Slider::new(&mut o.width_px, 0.0..=40.0).text("太さ"))
+                .changed()
+            {
+                *changed = true;
+            }
+        });
+    }
 }
 
 fn frame_label(f: FrameStyle) -> &'static str {
