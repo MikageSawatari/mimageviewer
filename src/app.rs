@@ -4072,6 +4072,11 @@ pub struct App {
     pub(crate) text_add_window_dialog: bool,
     /// 「スタンプを追加/変更」絵文字ピッカーダイアログの表示中フラグ (Inc 4c)。
     pub(crate) text_add_stamp_dialog: bool,
+    /// 「オノマトペを追加」プリセットピッカーダイアログの表示中フラグ (Inc 4c)。
+    pub(crate) text_add_onomatopoeia_dialog: bool,
+    /// オノマトペプリセットのサムネイルテクスチャキャッシュ
+    /// (`<label>|<text>|<font_key>` → 実フォントで焼いたプレビュー)。
+    pub(crate) onomatopoeia_thumb_cache: std::collections::HashMap<String, egui::TextureHandle>,
     /// スタンプピッカーが「既存スタンプの差し替え」で開かれたときの対象オブジェクト id。
     /// `None` のときは新規追加。
     pub(crate) stamp_dialog_replace_target: Option<u64>,
@@ -5194,6 +5199,8 @@ impl App {
             text_add_bubble_dialog: false,
             text_add_window_dialog: false,
             text_add_stamp_dialog: false,
+            text_add_onomatopoeia_dialog: false,
+            onomatopoeia_thumb_cache: std::collections::HashMap::new(),
             stamp_dialog_replace_target: None,
             stamp_dialog_filter: String::new(),
             stamp_dialog_category: crate::comic_stamp::EmojiCategory::Smileys,

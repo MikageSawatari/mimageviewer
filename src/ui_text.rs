@@ -732,6 +732,7 @@ impl App {
         self.text_dirty_at = None;
         self.text_add_bubble_dialog = false;
         self.text_add_window_dialog = false;
+        self.text_add_onomatopoeia_dialog = false;
         // スタンプピッカーの差し替え対象は page-local id なので、モードをまたいで残すと
         // 別ページの同 id スタンプを誤って差し替える (Codex P2)。入場時に必ずクリアする。
         self.text_add_stamp_dialog = false;
@@ -769,6 +770,7 @@ impl App {
         self.text_dirty_at = None;
         self.text_add_bubble_dialog = false;
         self.text_add_window_dialog = false;
+        self.text_add_onomatopoeia_dialog = false;
         // スタンプピッカーの差し替え対象を退場時にもクリア (Codex P2、enter 側と対)。
         self.text_add_stamp_dialog = false;
         self.stamp_dialog_replace_target = None;
@@ -1056,6 +1058,7 @@ impl App {
         self.draw_text_add_bubble_dialog(ctx);
         self.draw_text_add_window_dialog(ctx);
         self.draw_text_add_stamp_dialog(ctx);
+        self.draw_text_add_onomatopoeia_dialog(ctx);
     }
 
     /// 選択中オブジェクトの変形ハンドルを画面に描く。回転を反映した境界四角形 +
@@ -1167,6 +1170,7 @@ impl App {
         let mut open_window_dialog = false;
         let mut open_stamp_dialog = false;
         let mut open_stamp_replace = false;
+        let mut open_onomatopoeia_dialog = false;
 
         // ── 左パネル: ヘッダ + 追加 + オブジェクト一覧 (補正レイヤー風) ──
         egui::Area::new(egui::Id::new("text_panel"))
@@ -1226,9 +1230,9 @@ impl App {
                         });
                         ui.separator();
 
-                        // ── 追加 ──
-                        ui.horizontal(|ui| {
-                            ui.label("追加:");
+                        // ── 追加 ── (ボタンが多いので折り返しレイアウトにする)
+                        ui.label("追加:");
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("テキスト").clicked() {
                                 let id = next_id(&objects);
                                 let z = objects.len() as i32;
@@ -1259,6 +1263,9 @@ impl App {
                             }
                             if ui.button("スタンプ").clicked() {
                                 open_stamp_dialog = true;
+                            }
+                            if ui.button("オノマトペ").clicked() {
+                                open_onomatopoeia_dialog = true;
                             }
                         });
                         ui.separator();
@@ -1366,6 +1373,9 @@ impl App {
             // 詳細パネルの「別のスタンプに変更」: 選択中スタンプを差し替え対象にする。
             self.stamp_dialog_replace_target = selected;
             self.text_add_stamp_dialog = true;
+        }
+        if open_onomatopoeia_dialog {
+            self.text_add_onomatopoeia_dialog = true;
         }
 
         // 書き戻し。編集中は毎フレーム DB へ書かず (Codex P2)、メモリ更新 + 再ベイクに留め、
@@ -1580,6 +1590,221 @@ impl App {
             self.mark_comic_dirty();
             self.text_add_window_dialog = false;
         }
+    }
+
+    /// オノマトペプリセットの `font_candidate` を実フォントキーへ解決する。列挙済みの
+    /// `comic_available_fonts` から区切り無視の部分一致で探し、見つからなければ既定
+    /// フォント ("ui") を返す (= 追加パック未導入時はシステム既定で焼かれる)。
+    /// 呼び出し前に `ensure_comic_font_registry()` を済ませておくこと。
+    fn resolve_onomatopoeia_font(&self, candidate: &str) -> String {
+        self.comic_available_fonts
+            .iter()
+            .find(|a| crate::font_assets::font_name_matches_candidate(&a.key, candidate))
+            .map(|a| a.key.clone())
+            .unwrap_or_else(|| crate::comic_overlay::COMIC_FONT_KEY.to_string())
+    }
+
+    /// オノマトペプリセットを実フォントで comic-core ベイクし、ピッカー用プレビュー画像を
+    /// 返す。回転は意図的に省く (字形を比べやすく)。既定フォントすら無ければ `None`。
+    fn render_onomatopoeia_preview(
+        &mut self,
+        preset: OnomatopoeiaPreset,
+        font_key: &str,
+    ) -> Option<egui::ColorImage> {
+        let mut block = preset.build_text(font_key);
+        block.size_px = block.size_px.clamp(50.0, 92.0);
+        // フォントをロード (参照フォントを含む FontSet を得る)。
+        let probe = AnnotationObject::new_text(0, (0.0, 0.0), block.clone());
+        let fonts = self.ensure_comic_fonts_for(std::slice::from_ref(&probe))?;
+        let font = fonts.get(font_key)?;
+        let layout = comic_core::layout_text(&block, font);
+        let outline_pad = block.outline.map(|s| s.width_px).unwrap_or(0.0);
+        let pad = (outline_pad + 12.0).ceil();
+        let w = ((layout.bounds.0 + pad * 2.0).ceil() as usize).clamp(1, 1600);
+        let h = ((layout.bounds.1 + pad * 2.0).ceil() as usize).clamp(1, 1200);
+        let obj = AnnotationObject::new_text(0, (pad, pad), block);
+        let overlay = comic_core::bake_overlay(&[obj], w, h, &fonts);
+        Some(egui::ColorImage::from_rgba_unmultiplied(
+            [overlay.w, overlay.h],
+            &overlay.pixels,
+        ))
+    }
+
+    /// オノマトペプリセットのサムネイルテクスチャを遅延構築 + キャッシュして返す。
+    /// キーは `<label>|<text>|<解決フォント>`。呼び出し前に registry を ensure すること。
+    fn onomatopoeia_thumb_texture(
+        &mut self,
+        ctx: &egui::Context,
+        preset: OnomatopoeiaPreset,
+    ) -> Option<egui::TextureHandle> {
+        let font_key = self.resolve_onomatopoeia_font(preset.font_candidate);
+        let cache_key = format!("{}|{}|{}", preset.label, preset.text, font_key);
+        if let Some(tex) = self.onomatopoeia_thumb_cache.get(&cache_key) {
+            return Some(tex.clone());
+        }
+        let img = self.render_onomatopoeia_preview(preset, &font_key)?;
+        let tex_name = format!(
+            "onomato_preview_{}",
+            crate::font_assets::font_lookup_key(&cache_key)
+        );
+        let tex = ctx.load_texture(tex_name, img, egui::TextureOptions::LINEAR);
+        self.onomatopoeia_thumb_cache.insert(cache_key, tex.clone());
+        Some(tex)
+    }
+
+    /// 「オノマトペを追加」プリセットピッカー。実フォントで焼いたサムネイルのグリッドから
+    /// クリックで標準テキストオブジェクトを追加する (ラボ準拠)。追加パック未導入時は
+    /// 注意書き + 入手ボタンを出すが、既定フォントで追加することもできる。
+    fn draw_text_add_onomatopoeia_dialog(&mut self, ctx: &egui::Context) {
+        if !self.text_add_onomatopoeia_dialog {
+            return;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            self.text_add_onomatopoeia_dialog = false;
+            return;
+        };
+        let Some(key) = self.page_path_key(fs_idx) else {
+            self.text_add_onomatopoeia_dialog = false;
+            return;
+        };
+        let (sw, sh) = self.source_dims_for_idx(fs_idx).unwrap_or((1000.0, 1000.0));
+        let pack_installed = crate::editing_addon::is_installed();
+
+        // サムネイルは &mut self が要るので read-only クロージャの前に用意する
+        // (スタンプピッカーと同じ流儀)。全プリセットのフォントを 1 回の FontSet 再構築で
+        // まとめてロードしてから (= プリセットごとの再構築を避ける)、各サムネを焼く。
+        self.ensure_comic_font_registry();
+        let probe: Vec<AnnotationObject> = ONOMATOPOEIA_PRESETS
+            .iter()
+            .map(|p| {
+                let fk = self.resolve_onomatopoeia_font(p.font_candidate);
+                AnnotationObject::new_text(0, (0.0, 0.0), p.build_text(&fk))
+            })
+            .collect();
+        let _ = self.ensure_comic_fonts_for(&probe);
+        let mut cards: Vec<(OnomatopoeiaPreset, Option<egui::TextureHandle>)> =
+            Vec::with_capacity(ONOMATOPOEIA_PRESETS.len());
+        for &preset in ONOMATOPOEIA_PRESETS {
+            let tex = self.onomatopoeia_thumb_texture(ctx, preset);
+            cards.push((preset, tex));
+        }
+
+        let mut open = true;
+        let mut chosen: Option<OnomatopoeiaPreset> = None;
+        let mut request_pack = false;
+        let avail = ctx.content_rect();
+        let default_w = (avail.width() - 24.0).clamp(360.0, 860.0);
+        let default_h = (avail.height() - 120.0).clamp(300.0, 660.0);
+        let frame = egui::Frame::window(ctx.style().as_ref())
+            .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+            ));
+        egui::Window::new("オノマトペを追加")
+            .id(egui::Id::new("text_add_onomatopoeia_dialog"))
+            .order(egui::Order::Foreground)
+            .frame(frame)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([default_w, default_h])
+            .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                *ui.visuals_mut() = egui::Visuals::dark();
+                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                if !pack_installed {
+                    ui.label(
+                        egui::RichText::new(
+                            "オノマトペ用の装飾フォントは編集用追加パックに含まれます。",
+                        )
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(220, 180, 90)),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "未導入のため、追加するとシステム既定フォントで作成されます。",
+                        )
+                        .size(11.0)
+                        .color(egui::Color32::from_gray(170)),
+                    );
+                    if ui.button("編集用追加パックを入手…").clicked() {
+                        request_pack = true;
+                    }
+                    ui.separator();
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "フォントごとのサンプルを選んでください。クリックで追加します。",
+                    )
+                    .size(11.0)
+                    .color(egui::Color32::from_gray(180)),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let cols = ((ui.available_width() / (ONOMATO_CELL_W + 10.0)).floor()
+                            as usize)
+                            .max(1);
+                        ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+                        for chunk in cards.chunks(cols) {
+                            ui.horizontal_top(|ui| {
+                                for (preset, tex) in chunk {
+                                    if draw_onomatopoeia_card(ui, *preset, tex.as_ref()) {
+                                        chosen = Some(*preset);
+                                    }
+                                }
+                            });
+                        }
+                    });
+            });
+
+        self.text_add_onomatopoeia_dialog = open;
+        if request_pack {
+            // 明示クリックなのでこのセッションで辞退済みでも開く。
+            self.editing_addon_declined_session = false;
+            self.maybe_prompt_editing_addon();
+        }
+        if let Some(preset) = chosen {
+            self.add_onomatopoeia_object(fs_idx, &key, preset, sw, sh);
+            self.text_add_onomatopoeia_dialog = false;
+        }
+    }
+
+    /// オノマトペプリセットを標準テキストオブジェクトとして画像中央へ追加し、永続化する。
+    /// サイズはソース寸法に比例スケールし、回転はプリセット値を適用する。
+    fn add_onomatopoeia_object(
+        &mut self,
+        fs_idx: usize,
+        key: &str,
+        preset: OnomatopoeiaPreset,
+        sw: f32,
+        sh: f32,
+    ) {
+        self.ensure_comic_font_registry();
+        let font_key = self.resolve_onomatopoeia_font(preset.font_candidate);
+        let mut tb = preset.build_text(&font_key);
+        // プリセットは ~760px 基準のラボ寸法。ソース解像度に比例させる (相対比は保つ)。
+        let scale = (sh / 760.0).clamp(0.4, 12.0);
+        tb.size_px = (preset.size_px * scale).clamp(20.0, sh * 0.45);
+        // レイアウト寸法を測って画像中央へ寄せる (単独テキストの pivot は左上)。
+        let probe = AnnotationObject::new_text(0, (0.0, 0.0), tb.clone());
+        let fonts = self.ensure_comic_fonts_for(std::slice::from_ref(&probe));
+        let (lw, lh) = text_layout_size(&tb, fonts.as_deref());
+        let pivot = (sw * 0.5 - lw * 0.5, sh * 0.5 - lh * 0.5);
+
+        let mut objs = self.comic_docs.remove(key).unwrap_or_default();
+        let id = next_id(&objs);
+        let z = objs.len() as i32;
+        let mut o = AnnotationObject::new_text(id, pivot, tb);
+        o.rotation_rad = preset.rotation_deg.to_radians();
+        o.z = z;
+        objs.push(o);
+        self.text_selected = Some(id);
+        self.save_comic_objects(fs_idx, key, &objs);
+        self.text_dirty_at = None;
+        self.mark_comic_dirty();
     }
 
     /// スタンプピッカーのサムネイルテクスチャを (なければ) 用意する。デコードは
@@ -2670,6 +2895,417 @@ fn draw_bubble_preset_thumbnail(ui: &mut egui::Ui, preset: BubblePreset) -> bool
     .inner
 }
 
+// ── オノマトペプリセット (Inc 4c、ラボ ONOMATOPOEIA_PRESETS 準拠) ───────────
+//
+// 各プリセットは装飾フォント (追加パック同梱の OFL フォント) を `font_candidate` で
+// 指定し、`resolve_onomatopoeia_font` が実フォント名へ解決する。サイズはラボの ~760px
+// 基準値で、追加時にソース解像度へ比例スケールする。
+
+/// オノマトペ追加ピッカーの 1 セル幅 (実フォントサンプルを大きめに見せる)。
+const ONOMATO_CELL_W: f32 = 184.0;
+
+#[derive(Clone, Copy)]
+struct OnomatopoeiaPreset {
+    label: &'static str,
+    text: &'static str,
+    font_candidate: &'static str,
+    size_px: f32,
+    color: Rgba,
+    orientation: Orientation,
+    letter_gap: f32,
+    outline: Option<StrokeStyle>,
+    rotation_deg: f32,
+}
+
+const ONOMATOPOEIA_PRESETS: &[OnomatopoeiaPreset] = &[
+    OnomatopoeiaPreset {
+        label: "Otomanopee One",
+        text: "ドンッ",
+        font_candidate: "Otomanopee One",
+        size_px: 92.0,
+        color: Rgba::BLACK,
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 8.0,
+        }),
+        rotation_deg: -8.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Dela Gothic One",
+        text: "ガーン",
+        font_candidate: "Dela Gothic One",
+        size_px: 92.0,
+        color: Rgba::new(44, 78, 190, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 7.0,
+        }),
+        rotation_deg: 5.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Reggae One",
+        text: "ゴゴゴ",
+        font_candidate: "Reggae One",
+        size_px: 78.0,
+        color: Rgba::new(42, 28, 72, 255),
+        orientation: Orientation::Vertical,
+        letter_gap: 2.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::new(218, 196, 255, 255),
+            width_px: 5.0,
+        }),
+        rotation_deg: 0.0,
+    },
+    OnomatopoeiaPreset {
+        label: "RocknRoll One",
+        text: "ザザッ",
+        font_candidate: "RocknRoll One",
+        size_px: 82.0,
+        color: Rgba::WHITE,
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::BLACK,
+            width_px: 7.0,
+        }),
+        rotation_deg: -10.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Rampart One",
+        text: "バァン",
+        font_candidate: "Rampart One",
+        size_px: 88.0,
+        color: Rgba::new(255, 216, 64, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::BLACK,
+            width_px: 4.0,
+        }),
+        rotation_deg: 6.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Stick",
+        text: "シュッ",
+        font_candidate: "Stick",
+        size_px: 84.0,
+        color: Rgba::WHITE,
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::BLACK,
+            width_px: 6.0,
+        }),
+        rotation_deg: -14.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Train One",
+        text: "ビューン",
+        font_candidate: "Train One",
+        size_px: 78.0,
+        color: Rgba::new(90, 230, 255, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::new(12, 40, 70, 255),
+            width_px: 5.0,
+        }),
+        rotation_deg: -12.0,
+    },
+    OnomatopoeiaPreset {
+        label: "DotGothic16",
+        text: "ピコ",
+        font_candidate: "DotGothic16",
+        size_px: 64.0,
+        color: Rgba::new(125, 255, 110, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::new(20, 55, 25, 255),
+            width_px: 4.0,
+        }),
+        rotation_deg: 0.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Hachi Maru Pop",
+        text: "わーい",
+        font_candidate: "Hachi Maru Pop",
+        size_px: 74.0,
+        color: Rgba::new(255, 140, 45, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 6.0,
+        }),
+        rotation_deg: -4.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Darumadrop One",
+        text: "ぽよん",
+        font_candidate: "Darumadrop One",
+        size_px: 78.0,
+        color: Rgba::new(245, 70, 145, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 6.0,
+        }),
+        rotation_deg: 6.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Yusei Magic",
+        text: "キラキラ",
+        font_candidate: "Yusei Magic",
+        size_px: 68.0,
+        color: Rgba::new(255, 230, 72, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::new(92, 62, 0, 255),
+            width_px: 5.0,
+        }),
+        rotation_deg: 4.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Klee One SemiBold",
+        text: "しーん",
+        font_candidate: "Klee One SemiBold",
+        size_px: 58.0,
+        color: Rgba::new(122, 126, 132, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 7.0,
+        outline: None,
+        rotation_deg: 0.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Kaisei Decol Bold",
+        text: "ふわっ",
+        font_candidate: "Kaisei Decol Bold",
+        size_px: 64.0,
+        color: Rgba::new(245, 220, 255, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::new(74, 40, 120, 255),
+            width_px: 4.0,
+        }),
+        rotation_deg: -3.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Zen Kurenaido",
+        text: "ひそ",
+        font_candidate: "Zen Kurenaido",
+        size_px: 50.0,
+        color: Rgba::new(150, 150, 155, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 3.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 3.0,
+        }),
+        rotation_deg: 0.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Kaisei Tokumin ExtraBold",
+        text: "ズシン",
+        font_candidate: "Kaisei Tokumin ExtraBold",
+        size_px: 86.0,
+        color: Rgba::BLACK,
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 6.0,
+        }),
+        rotation_deg: 3.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Zen Maru Gothic Black",
+        text: "ぷにっ",
+        font_candidate: "Zen Maru Gothic Black",
+        size_px: 76.0,
+        color: Rgba::new(130, 235, 190, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::new(18, 76, 62, 255),
+            width_px: 5.0,
+        }),
+        rotation_deg: -4.0,
+    },
+    OnomatopoeiaPreset {
+        label: "M PLUS 1",
+        text: "バシッ",
+        font_candidate: "M PLUS 1",
+        size_px: 82.0,
+        color: Rgba::BLACK,
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 7.0,
+        }),
+        rotation_deg: -8.0,
+    },
+    OnomatopoeiaPreset {
+        label: "Shippori Mincho Bold",
+        text: "ぞくっ",
+        font_candidate: "Shippori Mincho Bold",
+        size_px: 70.0,
+        color: Rgba::new(38, 48, 86, 255),
+        orientation: Orientation::Horizontal,
+        letter_gap: 0.0,
+        outline: Some(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 4.0,
+        }),
+        rotation_deg: -2.0,
+    },
+];
+
+impl OnomatopoeiaPreset {
+    /// プリセットから標準テキストブロックを作る (font_key は解決済みを渡す)。
+    fn build_text(self, font_key: &str) -> TextBlock {
+        TextBlock {
+            text: self.text.to_string(),
+            font_key: font_key.to_string(),
+            size_px: self.size_px,
+            color: self.color,
+            orientation: self.orientation,
+            align: TextAlign::Center,
+            line_gap: 0.0,
+            letter_gap: self.letter_gap,
+            outline: self.outline,
+            auto_tcy: false,
+            ..TextBlock::default()
+        }
+    }
+}
+
+/// オノマトペサムネイルが焼けないとき (フォント未ロード等) の簡易プレビュー。egui の
+/// proportional UI フォントで袋文字風に描く (実フォントの形は出ないがレイアウトは伝わる)。
+fn paint_onomatopoeia_preview(
+    painter: &egui::Painter,
+    area: egui::Rect,
+    preset: OnomatopoeiaPreset,
+) {
+    let fill = to_c32(preset.color);
+    let outline = preset
+        .outline
+        .map(|s| to_c32(s.color))
+        .unwrap_or(egui::Color32::from_black_alpha(0));
+    let center = area.center();
+    let font_size = if preset.text.chars().count() >= 4 {
+        24.0
+    } else {
+        28.0
+    };
+    let font_id = egui::FontId::proportional(font_size);
+    let text = preset.text;
+    if preset.outline.is_some() {
+        for (dx, dy) in [
+            (-2.0, 0.0),
+            (2.0, 0.0),
+            (0.0, -2.0),
+            (0.0, 2.0),
+            (-1.5, -1.5),
+            (1.5, -1.5),
+            (-1.5, 1.5),
+            (1.5, 1.5),
+        ] {
+            painter.text(
+                center + egui::vec2(dx, dy),
+                egui::Align2::CENTER_CENTER,
+                text,
+                font_id.clone(),
+                outline,
+            );
+        }
+    }
+    painter.text(center, egui::Align2::CENTER_CENTER, text, font_id, fill);
+}
+
+/// オノマトペプリセットの 1 カード。上に実フォントで焼いたプレビュー (無ければ簡易
+/// プレビュー)、下にフォント名ラベル。クリックで true。`tex` は呼び出し側で事前構築。
+fn draw_onomatopoeia_card(
+    ui: &mut egui::Ui,
+    preset: OnomatopoeiaPreset,
+    tex: Option<&egui::TextureHandle>,
+) -> bool {
+    const PREVIEW_H: f32 = 104.0;
+    const LABEL_H: f32 = 30.0;
+    const PAD: f32 = 7.0;
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ONOMATO_CELL_W, PREVIEW_H + LABEL_H),
+        egui::Sense::click(),
+    );
+    let hovered = resp.hovered();
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(
+        rect,
+        4.0,
+        if hovered {
+            egui::Color32::from_rgb(66, 66, 70)
+        } else {
+            egui::Color32::from_rgb(42, 42, 46)
+        },
+    );
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(
+            1.0,
+            if hovered {
+                egui::Color32::from_rgb(150, 195, 255)
+            } else {
+                egui::Color32::from_gray(70)
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let preview_area = egui::Rect::from_min_max(
+        rect.min + egui::vec2(PAD, PAD),
+        egui::pos2(rect.max.x - PAD, rect.min.y + PREVIEW_H - 5.0),
+    );
+    painter.rect_filled(preview_area, 3.0, egui::Color32::from_rgb(34, 34, 38));
+    if let Some(tex) = tex {
+        let sz = tex.size_vec2();
+        if sz.x > 0.0 && sz.y > 0.0 {
+            let scale = (preview_area.width() / sz.x)
+                .min(preview_area.height() / sz.y)
+                .min(1.45);
+            let draw = egui::vec2(sz.x * scale, sz.y * scale);
+            let origin = preview_area.center() - draw * 0.5;
+            painter.image(
+                tex.id(),
+                egui::Rect::from_min_size(origin, draw),
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+    } else {
+        paint_onomatopoeia_preview(&painter, preview_area.shrink(6.0), preset);
+    }
+    let label_area = egui::Rect::from_min_max(
+        egui::pos2(rect.min.x + 6.0, rect.max.y - LABEL_H),
+        egui::pos2(rect.max.x - 6.0, rect.max.y - 3.0),
+    );
+    painter.text(
+        label_area.center(),
+        egui::Align2::CENTER_CENTER,
+        preset.label,
+        egui::FontId::proportional(11.0),
+        egui::Color32::WHITE,
+    );
+    resp.clicked()
+}
+
 // ── パネル UI ヘルパー (self を借りない純 UI 関数) ──────────────────────
 
 /// オブジェクト一覧の行部分 (選択ハイライト + 表示トグル)。補正レイヤーパネルと同じ見た目。
@@ -3549,6 +4185,46 @@ fn shape_half(shape: &BubbleShape) -> (f32, f32) {
 mod tests {
     use super::*;
     use crate::rotation_db::Rotation;
+
+    #[test]
+    fn onomatopoeia_preset_builds_text_block_style() {
+        let preset = ONOMATOPOEIA_PRESETS
+            .iter()
+            .find(|p| p.font_candidate == "Otomanopee One")
+            .copied()
+            .expect("Otomanopee preset exists");
+        let tb = preset.build_text("OtomanopeeOne Regular");
+        assert_eq!(tb.text, "ドンッ");
+        assert_eq!(tb.font_key, "OtomanopeeOne Regular");
+        assert_eq!(tb.align, TextAlign::Center);
+        assert!(tb.outline.is_some());
+        assert!(!tb.auto_tcy, "オノマトペは自動縦中横を無効にする");
+        assert!(tb.size_px > 0.0);
+    }
+
+    #[test]
+    fn onomatopoeia_presets_have_candidates() {
+        assert!(!ONOMATOPOEIA_PRESETS.is_empty());
+        for p in ONOMATOPOEIA_PRESETS {
+            assert!(
+                !p.font_candidate.is_empty(),
+                "{} に候補フォント無し",
+                p.label
+            );
+            assert!(!p.text.is_empty(), "{} にテキスト無し", p.label);
+            // 候補は実フォント名 (ファイル名由来ラベル) に区切り無視で一致するはず。
+            // 代表ケースをスポット検証する。
+        }
+        // 既知の対応関係 (pack ファイル名 → 候補)。
+        assert!(crate::font_assets::font_name_matches_candidate(
+            "MPLUS1 wght",
+            "M PLUS 1"
+        ));
+        assert!(crate::font_assets::font_name_matches_candidate(
+            "KleeOne SemiBold",
+            "Klee One SemiBold"
+        ));
+    }
 
     #[test]
     fn uv_inverse_round_trips() {
