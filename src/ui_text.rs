@@ -26,7 +26,7 @@ use crate::ui_fullscreen::{FsKeyAction, SpreadPair};
 use comic_core::{
     AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, FillMode, FontSet, FrameStyle,
     MessageWindowObject, Orientation, Rgba, SizeMode, StampObject, StrokeStyle, Tail, TailKind,
-    TextAlign, TextBlock, WindowPosition,
+    TextAlign, TextBlock, VAnchor, WindowPosition,
 };
 
 /// パネル幅 (編集コントロールが入るので conceal より少し広い)。
@@ -1389,6 +1389,10 @@ impl App {
                 frame: p.frame,
                 fill_mode: p.fill_mode,
                 fill: p.fill,
+                fill_opacity: p.fill_opacity,
+                gradient_to: p.gradient_to,
+                scrim_dense_side: p.scrim_dense_side,
+                corner_px: p.corner_px,
                 outline: StrokeStyle {
                     color: p.outline,
                     width_px: p.outline_w,
@@ -1398,6 +1402,7 @@ impl App {
             w.text.text = "本文".to_string();
             w.text.font_key = font_key.clone();
             w.text.size_px = (sh * 0.03).clamp(20.0, 64.0);
+            w.text.color = p.text_color;
             let mut o = AnnotationObject::new_message_window(id, (sw * 0.5, sh * 0.8), w);
             o.z = z;
             objs.push(o);
@@ -1412,48 +1417,153 @@ impl App {
 
 // ── 追加ダイアログ用ヘルパー ────────────────────────────────────────────
 
-/// ウィンドウ追加ダイアログのスタイルプリセット。
+/// ウィンドウ追加ダイアログのスタイルプリセット。ラボ `system_window_presets` の
+/// 見た目 (塗り・枠・角丸・本文色) を移植したもの。名前プレート / 立ち絵 / 指標などの
+/// 詳細 (Inc 4d) はここでは持たず、追加後に詳細設定で付ける。
 struct WinPreset {
     label: &'static str,
     frame: FrameStyle,
     fill_mode: FillMode,
     fill: Option<Rgba>,
+    fill_opacity: f32,
+    gradient_to: Option<Rgba>,
+    scrim_dense_side: VAnchor,
     outline: Rgba,
     outline_w: f32,
+    corner_px: f32,
+    text_color: Rgba,
 }
 
 const WIN_PRESETS: &[WinPreset] = &[
     WinPreset {
-        label: "標準枠",
-        frame: FrameStyle::SolidRounded,
-        fill_mode: FillMode::Solid,
-        fill: Some(Rgba::new(18, 22, 48, 235)),
-        outline: Rgba::WHITE,
-        outline_w: 3.0,
-    },
-    WinPreset {
-        label: "二重枠",
+        label: "DQ風 紺枠",
         frame: FrameStyle::DoubleLine,
         fill_mode: FillMode::Solid,
-        fill: Some(Rgba::new(20, 20, 28, 235)),
+        fill: Some(Rgba::new(12, 18, 52, 255)),
+        fill_opacity: 1.0,
+        gradient_to: None,
+        scrim_dense_side: VAnchor::Center,
         outline: Rgba::WHITE,
         outline_w: 3.0,
+        corner_px: 6.0,
+        text_color: Rgba::WHITE,
     },
     WinPreset {
-        label: "枠なし半透明",
-        frame: FrameStyle::None,
-        fill_mode: FillMode::Translucent,
-        fill: Some(Rgba::new(0, 0, 0, 160)),
+        label: "FF風 青グラデ",
+        frame: FrameStyle::SolidRounded,
+        fill_mode: FillMode::LinearGradient,
+        fill: Some(Rgba::new(30, 60, 160, 255)),
+        fill_opacity: 1.0,
+        gradient_to: Some(Rgba::new(8, 16, 60, 255)),
+        scrim_dense_side: VAnchor::Center,
         outline: Rgba::WHITE,
-        outline_w: 0.0,
+        outline_w: 3.0,
+        corner_px: 10.0,
+        text_color: Rgba::WHITE,
     },
     WinPreset {
-        label: "下スクリム (枠なし)",
+        label: "ツクール窓",
+        frame: FrameStyle::SolidRounded,
+        fill_mode: FillMode::Solid,
+        fill: Some(Rgba::new(20, 24, 40, 235)),
+        fill_opacity: 1.0,
+        gradient_to: None,
+        scrim_dense_side: VAnchor::Center,
+        outline: Rgba::new(120, 150, 220, 255),
+        outline_w: 3.0,
+        corner_px: 10.0,
+        text_color: Rgba::WHITE,
+    },
+    WinPreset {
+        label: "ツクール暗幕",
         frame: FrameStyle::None,
         fill_mode: FillMode::GradientScrim,
-        fill: Some(Rgba::new(0, 0, 0, 200)),
+        fill: Some(Rgba::new(0, 0, 0, 255)),
+        fill_opacity: 1.0,
+        gradient_to: None,
+        scrim_dense_side: VAnchor::Bottom,
         outline: Rgba::WHITE,
         outline_w: 0.0,
+        corner_px: 0.0,
+        text_color: Rgba::WHITE,
+    },
+    WinPreset {
+        label: "枠なし下部",
+        frame: FrameStyle::None,
+        fill_mode: FillMode::Translucent,
+        fill: Some(Rgba::new(0, 0, 0, 140)),
+        fill_opacity: 1.0,
+        gradient_to: None,
+        scrim_dense_side: VAnchor::Center,
+        outline: Rgba::WHITE,
+        outline_w: 0.0,
+        corner_px: 0.0,
+        text_color: Rgba::WHITE,
+    },
+    WinPreset {
+        label: "枠あり下部",
+        frame: FrameStyle::SolidRounded,
+        fill_mode: FillMode::Translucent,
+        fill: Some(Rgba::new(20, 20, 28, 200)),
+        fill_opacity: 1.0,
+        gradient_to: None,
+        scrim_dense_side: VAnchor::Center,
+        outline: Rgba::new(220, 220, 230, 255),
+        outline_w: 2.0,
+        corner_px: 18.0,
+        text_color: Rgba::WHITE,
+    },
+    WinPreset {
+        label: "ノベルADV",
+        frame: FrameStyle::SolidRounded,
+        fill_mode: FillMode::Translucent,
+        fill: Some(Rgba::new(10, 12, 24, 190)),
+        fill_opacity: 1.0,
+        gradient_to: None,
+        scrim_dense_side: VAnchor::Center,
+        outline: Rgba::new(180, 190, 210, 255),
+        outline_w: 2.0,
+        corner_px: 14.0,
+        text_color: Rgba::WHITE,
+    },
+    WinPreset {
+        label: "ノベルNVL",
+        frame: FrameStyle::None,
+        fill_mode: FillMode::Translucent,
+        fill: Some(Rgba::new(0, 0, 0, 150)),
+        fill_opacity: 1.0,
+        gradient_to: None,
+        scrim_dense_side: VAnchor::Center,
+        outline: Rgba::WHITE,
+        outline_w: 0.0,
+        corner_px: 0.0,
+        text_color: Rgba::WHITE,
+    },
+    WinPreset {
+        label: "ノベル白枠",
+        frame: FrameStyle::SolidRounded,
+        fill_mode: FillMode::Translucent,
+        fill: Some(Rgba::new(250, 250, 250, 220)),
+        fill_opacity: 1.0,
+        gradient_to: None,
+        scrim_dense_side: VAnchor::Center,
+        outline: Rgba::new(90, 90, 100, 255),
+        outline_w: 2.0,
+        corner_px: 16.0,
+        text_color: Rgba::BLACK,
+    },
+    WinPreset {
+        label: "コミックキャプション",
+        frame: FrameStyle::SolidRounded,
+        fill_mode: FillMode::Solid,
+        fill: Some(Rgba::new(250, 245, 225, 255)),
+        fill_opacity: 1.0,
+        gradient_to: None,
+        scrim_dense_side: VAnchor::Center,
+        outline: Rgba::new(40, 40, 40, 255),
+        outline_w: 2.0,
+        corner_px: 0.0,
+        text_color: Rgba::BLACK,
     },
 ];
 
@@ -1461,37 +1571,79 @@ const WIN_PRESETS: &[WinPreset] = &[
 const WIN_CELL_W: f32 = 116.0;
 
 /// ウィンドウプリセットを `area` 内にプレビュー描画 (塗り + 枠 + 本文見立ての線)。
-/// ラボ `paint_window_preview` の簡易版 (WinPreset は gradient_to 等を持たないので
-/// scrim は上下の濃淡帯で近似する)。
+/// ラボ `paint_window_preview` の移植。グラデ / スクリム (濃淡側) / 角丸 / 本文色を反映。
 fn paint_winpreset_preview(painter: &egui::Painter, area: egui::Rect, p: &WinPreset) {
     let to_c = |c: Rgba, a: u8| egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, a);
-    let corner = 4.0;
+    let corner = (p.corner_px * 0.2).clamp(0.0, 10.0);
     if let Some(fill) = p.fill {
+        let a = (fill.a as f32 * p.fill_opacity).round().clamp(0.0, 255.0) as u8;
         match p.fill_mode {
             FillMode::None => {}
-            FillMode::GradientScrim => {
-                // 下が濃い縦グラデーションを 2 帯で近似 (上=薄 / 下=濃)。
+            FillMode::GradientScrim => match p.scrim_dense_side {
+                VAnchor::Center => {
+                    let third = area.height() / 3.0;
+                    let m1 = area.top() + third;
+                    let m2 = area.bottom() - third;
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(area.min, egui::pos2(area.right(), m1)),
+                        0.0,
+                        to_c(fill, a / 5),
+                    );
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(area.left(), m1),
+                            egui::pos2(area.right(), m2),
+                        ),
+                        0.0,
+                        to_c(fill, a),
+                    );
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(egui::pos2(area.left(), m2), area.max),
+                        0.0,
+                        to_c(fill, a / 5),
+                    );
+                }
+                other => {
+                    let (top_a, bot_a) = match other {
+                        VAnchor::Top => (a, a / 5),
+                        _ => (a / 5, a),
+                    };
+                    let mid = area.center().y;
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(area.min, egui::pos2(area.right(), mid)),
+                        0.0,
+                        to_c(fill, top_a),
+                    );
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(egui::pos2(area.left(), mid), area.max),
+                        0.0,
+                        to_c(fill, bot_a),
+                    );
+                }
+            },
+            FillMode::LinearGradient => {
+                let to = p.gradient_to.unwrap_or(fill);
                 let mid = area.center().y;
                 painter.rect_filled(
                     egui::Rect::from_min_max(area.min, egui::pos2(area.right(), mid)),
-                    0.0,
-                    to_c(fill, fill.a / 5),
+                    corner,
+                    to_c(fill, a),
                 );
                 painter.rect_filled(
                     egui::Rect::from_min_max(egui::pos2(area.left(), mid), area.max),
-                    0.0,
-                    to_c(fill, fill.a),
+                    corner,
+                    to_c(to, a),
                 );
             }
             _ => {
-                // Solid / Translucent: fill.a をそのまま使う。
-                painter.rect_filled(area, corner, to_c(fill, fill.a));
+                // Solid / Translucent。
+                painter.rect_filled(area, corner, to_c(fill, a));
             }
         }
     }
     if !matches!(p.frame, FrameStyle::None) {
         let stroke = egui::Stroke::new(
-            (p.outline_w * 0.5).clamp(1.0, 3.0),
+            (p.outline_w * 0.4).clamp(1.0, 3.0),
             to_c(p.outline, p.outline.a),
         );
         painter.rect_stroke(area, corner, stroke, egui::StrokeKind::Inside);
@@ -1504,8 +1656,8 @@ fn paint_winpreset_preview(painter: &egui::Painter, area: egui::Rect, p: &WinPre
             );
         }
     }
-    // 本文見立ての線 2 本 (白)。
-    let line_col = egui::Color32::from_gray(210);
+    // 本文見立ての線 2 本 (プリセットの本文色)。
+    let line_col = to_c(p.text_color, 210);
     for i in 0..2 {
         let y = area.top() + area.height() * (0.45 + i as f32 * 0.22);
         painter.line_segment(
