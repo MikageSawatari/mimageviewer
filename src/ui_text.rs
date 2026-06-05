@@ -1008,7 +1008,11 @@ impl App {
     /// 左右パネルの本体 (スクロール領域) の高さ。`draw_text_panel` と入力抑制矩形
     /// (`text_panel_rect` / `text_detail_panel_rect`) で同じ値を共有する。
     fn text_panel_body_height(image_rect: egui::Rect) -> f32 {
-        (image_rect.height() - PANEL_MARGIN_Y - 48.0).clamp(200.0, 720.0)
+        // body (一覧スクロール + 操作行) は利用可能高から chrome (ヘッダ / 追加行 /
+        // セパレータ / popup 余白 ≈ 124px) を引いた分。画面が高いほど一覧も縦に伸ばし、
+        // スクロールバーを出す前に余白を活用する (実機 FB)。rect は body + chrome なので
+        // 画面内に収まる。上限は超大型ディスプレイ向けの安全弁。
+        (image_rect.height() - PANEL_MARGIN_Y * 2.0 - 124.0).clamp(220.0, 1600.0)
     }
 
     pub(crate) fn text_panel_rect(&self, image_rect: egui::Rect) -> egui::Rect {
@@ -1195,10 +1199,28 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    // × は U+00D7 (multiplication sign、Yu Gothic に存在)。
-                                    if ui.button("×").on_hover_text("閉じる (Esc)").clicked() {
+                                    // 閉じる × ボタン。消しゴム / 隠蔽 / 補正レイヤーと同じ
+                                    // draw_close_icon 様式に統一 (テキストボタンだと見た目が
+                                    // 浮くため、実機 FB で指摘あり)。
+                                    let (close_rect, close_resp) = ui.allocate_exact_size(
+                                        egui::vec2(26.0, 22.0),
+                                        egui::Sense::click(),
+                                    );
+                                    let close_bg = if close_resp.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(220, 80, 80, 200)
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
+                                    };
+                                    ui.painter().rect_filled(close_rect, 4.0, close_bg);
+                                    crate::ui_fullscreen::draw_icons::draw_close_icon(
+                                        ui.painter(),
+                                        close_rect.center(),
+                                        8.0,
+                                    );
+                                    if close_resp.clicked() {
                                         close = true;
                                     }
+                                    close_resp.on_hover_text("閉じる (Esc / Ctrl+T)");
                                 },
                             );
                         });
@@ -1241,16 +1263,21 @@ impl App {
                         });
                         ui.separator();
 
+                        // 一覧 (ScrollArea) と操作行 (固定) を分離。操作行ぶんの高さを
+                        // 先に確保し、残りを一覧スクロールに割り当てる。これで一覧を
+                        // 多数追加してスクロールしても ↑↓複製削除 が常に見える。
+                        let actions_h = 34.0_f32;
+                        let list_h = (body_height - actions_h).max(80.0);
                         ui.allocate_ui_with_layout(
-                            egui::vec2(PANEL_W, body_height),
+                            egui::vec2(PANEL_W, list_h),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| {
                                 egui::ScrollArea::vertical()
                                     .id_salt("text_panel_scroll")
-                                    .max_height(body_height)
+                                    .max_height(list_h)
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
-                                        object_list_ui(
+                                        object_list_rows_ui(
                                             ui,
                                             &mut objects,
                                             &mut selected,
@@ -1259,6 +1286,8 @@ impl App {
                                     });
                             },
                         );
+                        ui.separator();
+                        object_list_actions_ui(ui, &mut objects, &mut selected, &mut changed);
                     });
             });
 
@@ -2643,11 +2672,10 @@ fn draw_bubble_preset_thumbnail(ui: &mut egui::Ui, preset: BubblePreset) -> bool
 
 // ── パネル UI ヘルパー (self を借りない純 UI 関数) ──────────────────────
 
-/// オブジェクト一覧 (選択 / 前後 / 複製 / 表示トグル / 削除)。
-/// オブジェクト一覧。補正レイヤーパネル (`draw_local_adjust_layer_list`) と同じ見た目で、
-/// 選択ハイライト付きの行 + 末尾に共通操作行 (↑ ↓ 複製 削除) を 1 つだけ置く。
-/// 操作は「選択中オブジェクト」に対して行う (行ごとのボタンは持たない)。
-fn object_list_ui(
+/// オブジェクト一覧の行部分 (選択ハイライト + 表示トグル)。補正レイヤーパネルと同じ見た目。
+/// 共通操作行 (↑ ↓ 複製 削除) は `object_list_actions_ui` に分離し、ScrollArea の外へ
+/// 固定表示する (一覧だけがスクロールし、操作ボタンは常に見える)。
+fn object_list_rows_ui(
     ui: &mut egui::Ui,
     objects: &mut Vec<AnnotationObject>,
     selected: &mut Option<u64>,
@@ -2742,7 +2770,18 @@ fn object_list_ui(
     if let Some(id) = clicked {
         *selected = Some(id);
     }
+}
 
+/// 一覧の共通操作行 (↑ ↓ 複製 削除)。`object_list_rows_ui` の ScrollArea とは別に
+/// パネル下部へ固定表示する (スクロールしても操作ボタンが常に見えるように)。
+/// 操作は「選択中オブジェクト」に対して行う。
+fn object_list_actions_ui(
+    ui: &mut egui::Ui,
+    objects: &mut Vec<AnnotationObject>,
+    selected: &mut Option<u64>,
+    changed: &mut bool,
+) {
+    let row_w = PANEL_W - 12.0;
     // ── 共通操作行 (選択中オブジェクトに作用) ──
     let sel_idx = selected.and_then(|id| objects.iter().position(|o| o.id == id));
     ui.add_space(4.0);
