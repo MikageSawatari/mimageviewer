@@ -20805,6 +20805,47 @@ impl App {
         self.comic_cache.get(&idx).map(|e| e.texture.clone())
     }
 
+    /// Ctrl+E 書き出し用に、最終 composite の上に注釈を焼き込んだ **ピクセル** を返す
+    /// (テクスチャではなく `Arc<ColorImage>`)。注釈が無ければ `None` (= 素の composite を
+    /// 使う)。表示と同じ S=base長辺/source長辺 で base 解像度に焼くので、呼び出し側
+    /// (export) はこの上に crop + ダウンサンプルを掛ける (Inc 7)。
+    ///
+    /// 注: 現状はダウンサンプル**前**(base 解像度)で焼くため、強い縮小時はテキストが
+    /// 下地と一緒に縮小される。D10 の「ダウンサンプル後に最終解像度直焼き」は将来の
+    /// 鮮明化リファイン (等倍/軽縮小では差は出ない)。フルスクリーン Ctrl+E 経路は
+    /// conceal_mask=None なので、ここで焼いた注釈が conceal preset に潰されることはない。
+    pub(crate) fn comic_composited_pixels_for_export(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<Arc<egui::ColorImage>> {
+        if !self.comic_has_objects(idx) {
+            return None;
+        }
+        let base = self.ensure_final_composite_pixels(ctx, idx)?;
+        let [w, h] = base.size;
+        let key = self.page_path_key(idx)?;
+        self.ensure_comic_doc_loaded(&key);
+        let objects = self.comic_docs.get(&key).cloned().unwrap_or_default();
+        if objects.is_empty() {
+            return None; // デモ有効でも永続注釈が無ければ export には焼かない
+        }
+        let (src_w, src_h) = self
+            .source_dims_for_idx(idx)
+            .unwrap_or((w as f32, h as f32));
+        let fonts = self.ensure_comic_fonts()?;
+        let s_bake = (w.max(h) as f32) / src_w.max(src_h).max(1.0);
+        let scaled = if (s_bake - 1.0).abs() > 1e-4 {
+            comic_core::scale_scene(&objects, s_bake)
+        } else {
+            objects
+        };
+        let overlay = comic_core::bake_overlay(&scaled, w, h, &fonts);
+        Some(Arc::new(crate::comic_overlay::composite_overlay_over(
+            &base, &overlay,
+        )))
+    }
+
     pub(crate) fn poll_final_ai(&mut self, ctx: &egui::Context) {
         let mut completed = Vec::new();
         let mut disconnected = Vec::new();

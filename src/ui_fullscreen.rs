@@ -9191,9 +9191,15 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Result<crate::export_dialog::ExportPagePixels, String> {
-        let base_pixels = self
-            .ensure_final_composite_pixels(ctx, idx)
-            .ok_or_else(|| "最終合成の完了後にエクスポートしてください".to_string())?;
+        // 注釈 (comic) があれば最終 composite に焼き込んでから export する (最前面 D1)。
+        // 注釈が無ければ素の final composite。フルスクリーン Ctrl+E は conceal_mask=None
+        // なので、ここで焼いた注釈が worker の conceal preset 合成に潰されない (Inc 7)。
+        let base_pixels = match self.comic_composited_pixels_for_export(ctx, idx) {
+            Some(p) => p,
+            None => self
+                .ensure_final_composite_pixels(ctx, idx)
+                .ok_or_else(|| "最終合成の完了後にエクスポートしてください".to_string())?,
+        };
         // crop は表示には反映しないので、export の最終段で base_pixels (= final
         // composite。AI アップスケールで source とサイズが違いうる) に対して切り出す。
         let crop = self.export_crop_rect_for_pixels(idx, base_pixels.size);
