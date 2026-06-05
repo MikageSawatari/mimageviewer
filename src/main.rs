@@ -16,6 +16,7 @@ pub mod catalog;
 pub mod changelog_markdown;
 pub mod comic_db;
 pub mod comic_overlay;
+pub mod comic_stamp;
 pub mod compare_wgpu;
 pub mod conceal;
 pub mod conceal_compose;

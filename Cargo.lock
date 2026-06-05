@@ -3819,6 +3819,7 @@ dependencies = [
  "pollster",
  "quick-xml 0.39.2",
  "rayon",
+ "resvg",
  "rexif",
  "rfd",
  "rusqlite",
