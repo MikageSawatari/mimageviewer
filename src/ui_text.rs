@@ -818,6 +818,7 @@ impl App {
             return;
         };
         let panel_rect = self.text_panel_rect(image_rect);
+        let detail_rect = self.text_detail_panel_rect(image_rect);
         let fonts = self.ensure_comic_fonts();
 
         let (pressed, down, released, pos) = ctx.input(|i| {
@@ -831,7 +832,7 @@ impl App {
 
         if pressed {
             if let Some(pos) = pos {
-                if panel_rect.contains(pos) {
+                if panel_rect.contains(pos) || detail_rect.contains(pos) {
                     return; // パネル上のクリックはキャンバス操作にしない
                 }
                 let img = view.screen_to_image(pos);
@@ -910,6 +911,16 @@ impl App {
         );
         let h = (image_rect.height() - PANEL_MARGIN_Y - 24.0).clamp(220.0, 760.0);
         egui::Rect::from_min_size(pos, egui::vec2(PANEL_W + 16.0, h))
+    }
+
+    /// 詳細設定 (選択オブジェクトの編集 UI) を載せる右パネルの矩形。補正レイヤーの
+    /// ツールパネルと同様、画面右端に寄せる。`text_panel_rect` (左=一覧) と対になる。
+    pub(crate) fn text_detail_panel_rect(&self, image_rect: egui::Rect) -> egui::Rect {
+        let w = PANEL_W + 16.0;
+        let x = (image_rect.max.x - w - PANEL_MARGIN_X).max(image_rect.min.x + PANEL_MARGIN_X);
+        let pos = egui::pos2(x, image_rect.min.y + PANEL_MARGIN_Y);
+        let h = (image_rect.height() - PANEL_MARGIN_Y - 24.0).clamp(220.0, 760.0);
+        egui::Rect::from_min_size(pos, egui::vec2(w, h))
     }
 
     /// テキストモードのオーバーレイ描画 (選択枠 + パネル)。
@@ -1023,6 +1034,7 @@ impl App {
             image_rect.min.y + PANEL_MARGIN_Y,
         );
         let sink_rect = self.text_panel_rect(image_rect);
+        let detail_rect = self.text_detail_panel_rect(image_rect);
         let body_height = (image_rect.height() - PANEL_MARGIN_Y - 48.0).clamp(200.0, 720.0);
 
         // 借用衝突を避けるため作業セットを一旦取り出し、ローカルだけを編集する。
@@ -1033,6 +1045,7 @@ impl App {
         let mut open_bubble_dialog = false;
         let mut open_window_dialog = false;
 
+        // ── 左パネル: ヘッダ + 追加 + オブジェクト一覧 (補正レイヤー風) ──
         egui::Area::new(egui::Id::new("text_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
@@ -1121,16 +1134,54 @@ impl App {
                                             &mut selected,
                                             &mut changed,
                                         );
-                                        ui.separator();
-                                        if let Some(id) = selected {
-                                            if let Some(o) = objects.iter_mut().find(|o| o.id == id)
-                                            {
-                                                edit_object_ui(ui, o, &mut changed);
-                                            }
+                                    });
+                            },
+                        );
+                    });
+            });
+
+        // ── 右パネル: 詳細設定 (選択オブジェクトの編集) ──
+        egui::Area::new(egui::Id::new("text_detail_panel"))
+            .fixed_pos(detail_rect.min)
+            .order(egui::Order::Foreground)
+            .interactable(true)
+            .show(ctx, |ui| {
+                ui.interact(
+                    detail_rect,
+                    egui::Id::new("text_detail_panel_click_sink"),
+                    egui::Sense::click_and_drag(),
+                );
+                egui::Frame::popup(ui.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 235))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                    ))
+                    .corner_radius(6.0)
+                    .show(ui, |ui| {
+                        *ui.visuals_mut() = egui::Visuals::dark();
+                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                        ui.set_min_width(PANEL_W);
+                        ui.set_max_width(PANEL_W);
+                        ui.strong("詳細設定");
+                        ui.separator();
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(PANEL_W, body_height),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("text_detail_scroll")
+                                    .max_height(body_height)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        if let Some(o) = selected
+                                            .and_then(|id| objects.iter_mut().find(|o| o.id == id))
+                                        {
+                                            edit_object_ui(ui, o, &mut changed);
                                         } else {
                                             ui.label(
                                                 egui::RichText::new(
-                                                    "オブジェクトをクリックで選択 / ドラッグで移動",
+                                                    "左の一覧で選択 / キャンバスをクリックで選択\nドラッグで移動・ハンドルで変形",
                                                 )
                                                 .small()
                                                 .color(egui::Color32::from_gray(170)),
@@ -2000,51 +2051,153 @@ fn draw_bubble_preset_thumbnail(ui: &mut egui::Ui, preset: BubblePreset) -> bool
 // ── パネル UI ヘルパー (self を借りない純 UI 関数) ──────────────────────
 
 /// オブジェクト一覧 (選択 / 前後 / 複製 / 表示トグル / 削除)。
+/// オブジェクト一覧。補正レイヤーパネル (`draw_local_adjust_layer_list`) と同じ見た目で、
+/// 選択ハイライト付きの行 + 末尾に共通操作行 (↑ ↓ 複製 削除) を 1 つだけ置く。
+/// 操作は「選択中オブジェクト」に対して行う (行ごとのボタンは持たない)。
 fn object_list_ui(
     ui: &mut egui::Ui,
     objects: &mut Vec<AnnotationObject>,
     selected: &mut Option<u64>,
     changed: &mut bool,
 ) {
-    ui.label(egui::RichText::new(format!("オブジェクト ({})", objects.len())).small());
-    let n = objects.len();
+    ui.label(
+        egui::RichText::new(format!("オブジェクト ({})", objects.len()))
+            .strong()
+            .color(egui::Color32::WHITE),
+    );
+    if objects.is_empty() {
+        ui.label(
+            egui::RichText::new("「追加」からテキスト・吹き出し・ウィンドウを作成してください。")
+                .small()
+                .color(egui::Color32::from_gray(175)),
+        );
+        return;
+    }
+
+    let row_w = PANEL_W - 12.0;
+    let mut clicked: Option<u64> = None;
+    let mut toggle_enabled: Option<(usize, bool)> = None;
+    // 配列の末尾ほど前面 (z 大)。前面のものを上に見せると直感的なので逆順で描く。
+    for i in (0..objects.len()).rev() {
+        let o = &objects[i];
+        let id = o.id;
+        let is_sel = *selected == Some(id);
+        let label = format!("{}: {}", i + 1, kind_label(o));
+        let text_color = if o.enabled {
+            egui::Color32::WHITE
+        } else {
+            egui::Color32::from_gray(140)
+        };
+        let frame = egui::Frame::new()
+            .fill(if is_sel {
+                egui::Color32::from_rgba_unmultiplied(58, 96, 150, 170)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(52, 52, 54, 120)
+            })
+            .stroke(egui::Stroke::new(
+                1.0,
+                if is_sel {
+                    egui::Color32::from_rgba_unmultiplied(150, 195, 255, 130)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24)
+                },
+            ))
+            .corner_radius(4.0)
+            .inner_margin(6.0)
+            .show(ui, |ui| {
+                ui.set_min_width(row_w);
+                let mut row_clicked = false;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let mut enabled = o.enabled;
+                    if ui
+                        .checkbox(&mut enabled, "")
+                        .on_hover_text("表示")
+                        .changed()
+                    {
+                        toggle_enabled = Some((i, enabled));
+                    }
+                    if ui
+                        .add(
+                            egui::Label::new(egui::RichText::new(label).color(text_color))
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        row_clicked = true;
+                    }
+                    let spacer_w = ui.available_width().max(0.0);
+                    if spacer_w > 4.0 {
+                        let (_, r) = ui
+                            .allocate_exact_size(egui::vec2(spacer_w, 18.0), egui::Sense::click());
+                        if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            row_clicked = true;
+                        }
+                    }
+                });
+                row_clicked
+            });
+        if frame.inner {
+            clicked = Some(id);
+        }
+    }
+    if let Some((i, en)) = toggle_enabled {
+        objects[i].enabled = en;
+        *changed = true;
+    }
+    if let Some(id) = clicked {
+        *selected = Some(id);
+    }
+
+    // ── 共通操作行 (選択中オブジェクトに作用) ──
+    let sel_idx = selected.and_then(|id| objects.iter().position(|o| o.id == id));
+    ui.add_space(4.0);
     let mut move_up: Option<usize> = None;
     let mut move_down: Option<usize> = None;
     let mut duplicate: Option<usize> = None;
     let mut delete: Option<usize> = None;
-
-    for i in 0..n {
-        let id = objects[i].id;
-        let label = format!("{}: {}", i + 1, kind_label(&objects[i]));
-        ui.horizontal(|ui| {
-            let mut enabled = objects[i].enabled;
-            if ui
-                .checkbox(&mut enabled, "")
-                .on_hover_text("表示")
-                .changed()
-            {
-                objects[i].enabled = enabled;
-                *changed = true;
-            }
-            if ui.selectable_label(*selected == Some(id), label).clicked() {
-                *selected = Some(id);
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("×").on_hover_text("削除").clicked() {
-                    delete = Some(i);
-                }
-                if ui.small_button("複製").on_hover_text("複製").clicked() {
-                    duplicate = Some(i);
-                }
-                if ui.small_button("↓").on_hover_text("背面へ").clicked() {
-                    move_down = Some(i);
-                }
-                if ui.small_button("↑").on_hover_text("前面へ").clicked() {
-                    move_up = Some(i);
-                }
-            });
-        });
-    }
+    ui.horizontal(|ui| {
+        let gap = 4.0;
+        ui.spacing_mut().item_spacing.x = gap;
+        let unit_w = ((row_w - gap * 3.0) / 6.0).max(24.0);
+        let small_btn = egui::vec2(unit_w, 22.0);
+        let wide_btn = egui::vec2(unit_w * 2.0, 22.0);
+        let can_front = sel_idx.is_some_and(|i| i + 1 < objects.len());
+        let can_back = sel_idx.is_some_and(|i| i > 0);
+        let has_sel = sel_idx.is_some();
+        if ui
+            .add_enabled(can_front, egui::Button::new("↑").min_size(small_btn))
+            .on_hover_text("前面へ")
+            .clicked()
+        {
+            move_up = sel_idx;
+        }
+        if ui
+            .add_enabled(can_back, egui::Button::new("↓").min_size(small_btn))
+            .on_hover_text("背面へ")
+            .clicked()
+        {
+            move_down = sel_idx;
+        }
+        if ui
+            .add_enabled(has_sel, egui::Button::new("複製").min_size(wide_btn))
+            .clicked()
+        {
+            duplicate = sel_idx;
+        }
+        if ui
+            .add_enabled(
+                has_sel,
+                egui::Button::new("削除")
+                    .min_size(wide_btn)
+                    .fill(egui::Color32::from_rgb(120, 50, 50)),
+            )
+            .clicked()
+        {
+            delete = sel_idx;
+        }
+    });
 
     if let Some(i) = move_up {
         if i + 1 < objects.len() {
