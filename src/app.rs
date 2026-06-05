@@ -17620,6 +17620,13 @@ impl App {
         }
         self.reset_erase_mode();
         self.reset_conceal_mode();
+        // テキストモードもフルスクリーン解除時に保存して閉じる (Codex P1: 閉じ経路で
+        // text_mode がリークすると次回フルスクリーンで通常ショートカットが効かなくなり、
+        // 編集も保存されない)。reset_conceal_mode と同じくこの時点では fullscreen_idx が
+        // まだ有効なので save_comic_objects が正しいページに効く。export_crop と同じ理由で
+        // spread_ctx は復元せず破棄する (close は fullscreen_idx=None を維持するため)。
+        self.text_spread_ctx = None;
+        self.reset_text_mode();
         // close は fullscreen_idx=None を維持する。spread_ctx を残すと
         // reset_export_crop_mode が fullscreen_idx を旧ページへ復元してしまい、
         // フォルダロード経路 (start_loading_items→close_fullscreen) で stale な
