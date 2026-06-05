@@ -1,7 +1,7 @@
 # comic_lab 進捗・ハンドオフメモ
 
 Status: 作業中スナップショット (コンパクト耐性用)
-更新: 2026-06-04 セッション (FramePlanner 形状 Phase1-3 完了 / worktree 運用 / Codex 2 周対応)
+更新: 2026-06-05 セッション (フォント生成オノマトペ試作 / FramePlanner 形状 Phase1-3 完了 / worktree 運用)
 
 吹き出し・テキスト注釈ツールの **lab 試作** (`tools/comic_lab` + `crates/comic-core`)。
 設計の正本: [speech-bubble-text-tool-plan.md](speech-bubble-text-tool-plan.md) (Claude 案) /
@@ -22,6 +22,25 @@ Claude Code セッションを並行で動かす」節)。
   - 編集: `C:\home\mimageviewer-lab\...` の絶対パス
 - `lab` ブランチは **master 未マージ**。実機確認OK後に一度だけ `lab`→`master` を merge する
   (ユーザー判断待ち)。退避ブランチは不要 (worktree 隔離で十分)。
+
+## 2026-06-05: フォント生成オノマトペ試作 (branch lab)
+
+- 左パネルに **オノマトペ追加** を追加。画像素材系のオノマトペは従来どおり **スタンプ追加** 側に残し、
+  OFLフォント + スタイルプリセットで生成するものだけをオノマトペ追加から入れる整理にした。
+- オノマトペは新モデルを増やさず `AnnotationKind::Text` として生成する。保存/Undo/右パネル編集/高解像度
+  bake は既存テキスト機能に乗る。プリセットは文言・サイズ・色・袋文字・初期角度・候補フォント名を持つ。
+- `tools/comic_lab/assets/fonts` に置いた TTF/OTF/TTC を起動時に自動登録する lab 用フォント置き場を追加し、
+  Google Fonts の OFL 日本語フォントを 18 ファイル (約 61MiB) 同梱。各フォントの OFL 文面も同ディレクトリに置く。
+- プリセットは「フォントごとに1つの言葉」を割り当てる方式に変更。`Otomanopee One` / `Dela Gothic One` /
+  `Reggae One` / `RocknRoll One` / `Rampart One` / `Stick` / `Train One` / `DotGothic16` /
+  `Hachi Maru Pop` / `Darumadrop One` / `Yusei Magic` / `Klee One` / `Kaisei Decol` /
+  `Zen Kurenaido` / `Kaisei Tokumin` / `Zen Maru Gothic` / `M PLUS 1` / `Shippori Mincho`
+  をサンプルとして選べる。見つからない環境では既定日本語フォントへフォールバックする。
+- オノマトペ追加ダイアログのプレビューは egui の通常テキストではなく、選択時と同じ `comic-core`
+  bake 経路で実フォントを画像化して表示するようにした。字形比較しやすいようカードも大型化。
+- 単体テキスト / フォント生成オノマトペにも、スタンプ同様の矩形ハンドルを追加。四隅ドラッグで
+  `TextBlock.size_px` を均一スケールし、上部の回転ハンドルで回転できる。単体テキストの回転中心は
+  文字矩形の中央に変更し、新規テキスト/オノマトペは追加位置の中心に文字矩形が来るよう初期配置する。
 
 ## 2026-06-04 末: FramePlanner 形状追加 (branch lab、コミット済み)
 

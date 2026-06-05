@@ -171,8 +171,9 @@ pub fn bake_overlay_with_stamps(
 /// Bake one object, honoring `obj.rotation_rad`, with `draw` selecting WHAT to
 /// render (full object, or just a part for the merge passes). For a non-trivial
 /// rotation the part is drawn unrotated into a tight temp buffer and
-/// rotate-blitted into `overlay` around the pivot (bilinear, premultiplied) —
-/// shape, tail, decorations and text all rotate together (no per-glyph rotation).
+/// rotate-blitted into `overlay` around the object's edit pivot (bilinear,
+/// premultiplied). Standalone text stores its pivot as the layout top-left, but
+/// rotates around the layout center so SFX/text handles behave like stamps.
 fn bake_into(
     overlay: &mut RgbaOverlay,
     obj: &AnnotationObject,
@@ -186,6 +187,7 @@ fn bake_into(
     let Some((minx, miny, maxx, maxy)) = object_local_aabb(obj, fonts) else {
         return;
     };
+    let rotation_pivot = object_rotation_pivot(obj, fonts);
     let pad = 2.0;
     let (minx, miny) = (minx - pad, miny - pad);
     let (maxx, maxy) = (maxx + pad, maxy + pad);
@@ -207,7 +209,13 @@ fn bake_into(
         }
     }
     draw(&mut tmp, &shifted);
-    rotate_blit(overlay, &tmp, (minx, miny), obj.pivot, obj.rotation_rad);
+    rotate_blit(
+        overlay,
+        &tmp,
+        (minx, miny),
+        rotation_pivot,
+        obj.rotation_rad,
+    );
 }
 
 /// Bake a single object fully (all parts), honoring rotation.
@@ -911,6 +919,21 @@ fn object_local_aabb(obj: &AnnotationObject, fonts: &FontSet) -> Option<(f32, f3
         return None;
     }
     Some((minx, miny, maxx, maxy))
+}
+
+/// The image-space pivot used for object rotation. Most objects store their
+/// pivot at their visual center. Standalone text keeps `obj.pivot` as the
+/// layout top-left for placement, so derive a center pivot from its layout.
+fn object_rotation_pivot(obj: &AnnotationObject, fonts: &FontSet) -> (f32, f32) {
+    if let AnnotationKind::Text(text) = &obj.kind {
+        if !text.text.is_empty() {
+            if let Some(font) = fonts.get(&text.font_key) {
+                let (lw, lh) = layout_text(text, font).bounds;
+                return (obj.pivot.0 + lw * 0.5, obj.pivot.1 + lh * 0.5);
+            }
+        }
+    }
+    obj.pivot
 }
 
 /// Bilinear-sample `src` (straight-alpha RGBA) at fractional pixel (x, y),
@@ -2056,6 +2079,24 @@ mod tests {
     use super::*;
     use crate::model::{BubbleObject, BubbleShape};
 
+    const FONT_CANDIDATES: &[&str] = &[
+        r"C:\Windows\Fonts\YuGothM.ttc",
+        r"C:\Windows\Fonts\meiryo.ttc",
+        r"C:\Windows\Fonts\msgothic.ttc",
+        r"C:\Windows\Fonts\YuGothR.ttc",
+    ];
+
+    fn load_test_font() -> Option<LoadedFont> {
+        for path in FONT_CANDIDATES {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(font) = LoadedFont::from_bytes("test", bytes) {
+                    return Some(font);
+                }
+            }
+        }
+        None
+    }
+
     #[test]
     fn empty_objects_make_transparent_overlay() {
         let fonts = FontSet::new();
@@ -2076,6 +2117,28 @@ mod tests {
         let ov = bake_overlay(&[obj], 64, 48, &fonts);
         let any_opaque = ov.pixels.chunks_exact(4).any(|p| p[3] > 0);
         assert!(any_opaque, "bubble fill should write some opaque pixels");
+    }
+
+    #[test]
+    fn standalone_text_rotation_pivot_is_layout_center() {
+        let Some(font) = load_test_font() else {
+            eprintln!("skip: no Windows Japanese test font");
+            return;
+        };
+        let mut fonts = FontSet::new();
+        fonts.insert(font);
+        let text = TextBlock {
+            text: "テキスト".to_string(),
+            font_key: "test".to_string(),
+            size_px: 42.0,
+            ..TextBlock::default()
+        };
+        let font = fonts.get("test").expect("registered font");
+        let (w, h) = layout_text(&text, font).bounds;
+        let obj = AnnotationObject::new_text(1, (30.0, 40.0), text);
+        let pivot = object_rotation_pivot(&obj, &fonts);
+        assert!((pivot.0 - (30.0 + w * 0.5)).abs() < 0.01);
+        assert!((pivot.1 - (40.0 + h * 0.5)).abs() < 0.01);
     }
 
     #[test]
