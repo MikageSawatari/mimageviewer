@@ -617,7 +617,10 @@ pub fn import_to_dbs(
 
         if let (Some(db), Some(objects)) = (comic_db, &entry.comic) {
             if !objects.is_empty() {
-                if db.get(&abs_key).is_none() {
+                // get_raw で「行の有無」を判定する。get() は壊れ JSON も None を返すため、
+                // それで判定すると壊れた/将来非互換の中央行をサイドカーで上書きしてしまう
+                // (Codex P2)。seed ガードと同じく get_raw に揃え、既存行は一切上書きしない。
+                if db.get_raw(&abs_key).is_none() {
                     if db.set(&abs_key, objects).is_ok() {
                         stats.imported_comic += 1;
                     }

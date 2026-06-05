@@ -20898,6 +20898,12 @@ impl App {
                     sidecar_folder.display()
                 ));
             }
+            // import で comic.db に追加した行が、それ以前に空としてキャッシュされた
+            // comic_docs に隠れて再起動まで見えない、という stale read を防ぐ (Codex P3)。
+            // 次の表示で comic.db から再ロードされる (page_path_key 別キャッシュなので安価)。
+            if stats.imported_comic > 0 {
+                self.comic_docs.clear();
+            }
         }
         if let (Some(db), Some(fs_mt)) = (&self.adjustment_db, fs_mtime) {
             let _ = db.sidecar_sync_upsert(&folder_key, fs_mt);
