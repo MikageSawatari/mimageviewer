@@ -3874,6 +3874,10 @@ pub struct App {
     /// デバウンス用)。`Some(t)` の間は未保存で、編集が `DEBOUNCE` 止まったら comic.db +
     /// サイドカーへ 1 度だけ保存する (退場時 `reset_text_mode` でも最終保存)。
     pub(crate) text_dirty_at: Option<std::time::Instant>,
+    /// 「吹き出しを追加」形状ピッカーダイアログの表示中フラグ。
+    pub(crate) text_add_bubble_dialog: bool,
+    /// 「ウィンドウを追加」スタイルピッカーダイアログの表示中フラグ。
+    pub(crate) text_add_window_dialog: bool,
     /// 見開きから text モードに入ったときの spread 復元コンテキスト (conceal と同じ流儀)。
     pub(crate) text_spread_ctx: Option<EraseSpreadCtx>,
 
@@ -4967,6 +4971,8 @@ impl App {
             text_selected: None,
             text_drag: None,
             text_dirty_at: None,
+            text_add_bubble_dialog: false,
+            text_add_window_dialog: false,
             text_spread_ctx: None,
             erase_preview_active: false,
             conceal_preview_active: false,

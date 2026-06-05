@@ -314,6 +314,8 @@ impl App {
         self.text_selected = None;
         self.text_drag = None;
         self.text_dirty_at = None;
+        self.text_add_bubble_dialog = false;
+        self.text_add_window_dialog = false;
         self.clear_meta_undo();
         self.ensure_comic_doc_loaded(&key);
 
@@ -340,6 +342,8 @@ impl App {
         self.text_selected = None;
         self.text_drag = None;
         self.text_dirty_at = None;
+        self.text_add_bubble_dialog = false;
+        self.text_add_window_dialog = false;
         if was_text_mode {
             self.clear_meta_undo();
         }
@@ -567,6 +571,9 @@ impl App {
     ) {
         self.draw_text_selection(ui, image_rect, zoom_pan);
         self.draw_text_panel(ctx, image_rect);
+        // 追加ダイアログ (パネルが comic_docs を書き戻した後に描く)。
+        self.draw_text_add_bubble_dialog(ctx);
+        self.draw_text_add_window_dialog(ctx);
     }
 
     /// 選択中オブジェクトの境界枠を画面に描く (回転を反映した四角形)。
@@ -648,6 +655,8 @@ impl App {
         let mut selected = self.text_selected;
         let mut changed = false;
         let mut close = false;
+        let mut open_bubble_dialog = false;
+        let mut open_window_dialog = false;
 
         egui::Area::new(egui::Id::new("text_panel"))
             .fixed_pos(panel_pos)
@@ -667,6 +676,11 @@ impl App {
                     ))
                     .corner_radius(6.0)
                     .show(ui, |ui| {
+                        // フルスクリーンビューポートの visuals は明るい場合があり、暗い
+                        // パネル背景に暗い文字が乗って読めなくなる。隠蔽 (conceal) パネルと
+                        // 同様に暗テーマ + 白文字を明示する。
+                        *ui.visuals_mut() = egui::Visuals::dark();
+                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
                         ui.set_min_width(PANEL_W);
                         ui.set_max_width(PANEL_W);
                         ui.horizontal(|ui| {
@@ -708,40 +722,11 @@ impl App {
                                 changed = true;
                             }
                             if ui.button("吹き出し").clicked() {
-                                let id = next_id(&objects);
-                                let z = objects.len() as i32;
-                                let mut b = BubbleObject::default();
-                                b.text.text = "セリフ".to_string();
-                                b.text.font_key = font_key.clone();
-                                b.text.size_px = (sh * 0.035).clamp(22.0, 80.0);
-                                let mut o =
-                                    AnnotationObject::new_bubble(id, (sw * 0.5, sh * 0.5), b);
-                                o.z = z;
-                                objects.push(o);
-                                selected = Some(id);
-                                changed = true;
+                                // 形状を選ぶダイアログを開く (ラボの「吹き出しを追加」相当)。
+                                open_bubble_dialog = true;
                             }
                             if ui.button("ウィンドウ").clicked() {
-                                let id = next_id(&objects);
-                                let z = objects.len() as i32;
-                                let mut w = MessageWindowObject {
-                                    position: WindowPosition::Free,
-                                    half_w: (sw * 0.4).max(120.0),
-                                    half_h: (sh * 0.12).max(60.0),
-                                    ..MessageWindowObject::default()
-                                };
-                                w.text.text = "本文".to_string();
-                                w.text.font_key = font_key.clone();
-                                w.text.size_px = (sh * 0.03).clamp(20.0, 64.0);
-                                let mut o = AnnotationObject::new_message_window(
-                                    id,
-                                    (sw * 0.5, sh * 0.8),
-                                    w,
-                                );
-                                o.z = z;
-                                objects.push(o);
-                                selected = Some(id);
-                                changed = true;
+                                open_window_dialog = true;
                             }
                         });
                         ui.separator();
@@ -782,6 +767,14 @@ impl App {
                     });
             });
 
+        // 追加ボタンはダイアログを開く (実際の追加はダイアログ側)。
+        if open_bubble_dialog {
+            self.text_add_bubble_dialog = true;
+        }
+        if open_window_dialog {
+            self.text_add_window_dialog = true;
+        }
+
         // 書き戻し。編集中は毎フレーム DB へ書かず (Codex P2)、メモリ更新 + 再ベイクに留め、
         // 編集が止まってから (デバウンス) / 退場時に 1 度だけ comic.db + サイドカーへ保存する。
         self.text_selected = selected;
@@ -806,6 +799,286 @@ impl App {
             self.reset_text_mode();
         }
     }
+
+    /// 「吹き出しを追加」形状ピッカー。形状プレビューのグリッドからクリックで追加する
+    /// (ラボの「吹き出しを追加」ダイアログ相当)。
+    fn draw_text_add_bubble_dialog(&mut self, ctx: &egui::Context) {
+        if !self.text_add_bubble_dialog {
+            return;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            self.text_add_bubble_dialog = false;
+            return;
+        };
+        let Some(key) = self.page_path_key(fs_idx) else {
+            self.text_add_bubble_dialog = false;
+            return;
+        };
+        let (sw, sh) = self.source_dims_for_idx(fs_idx).unwrap_or((1000.0, 1000.0));
+        let font_key = crate::comic_overlay::COMIC_FONT_KEY.to_string();
+
+        let mut open = true;
+        let mut chosen: Option<ShapeKind> = None;
+        let avail = ctx.content_rect();
+        let default_w = (avail.width() - 24.0).clamp(360.0, 560.0);
+        let default_h = (avail.height() - 120.0).clamp(240.0, 560.0);
+        let frame = egui::Frame::window(ctx.style().as_ref())
+            .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+            ));
+        egui::Window::new("吹き出しを追加")
+            .id(egui::Id::new("text_add_bubble_dialog"))
+            .order(egui::Order::Foreground)
+            .frame(frame)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([default_w, default_h])
+            .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                *ui.visuals_mut() = egui::Visuals::dark();
+                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                ui.label(
+                    egui::RichText::new("形を選んでください。クリックで追加します。")
+                        .size(12.0)
+                        .color(egui::Color32::from_gray(190)),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let cell = 92.0;
+                        let cols = ((ui.available_width() / (cell + 8.0)).floor() as usize).max(1);
+                        for chunk in ShapeKind::ALL.chunks(cols) {
+                            ui.horizontal_top(|ui| {
+                                for &k in chunk {
+                                    if shape_preview_cell(ui, k, cell) {
+                                        chosen = Some(k);
+                                    }
+                                }
+                            });
+                        }
+                    });
+            });
+
+        self.text_add_bubble_dialog = open;
+        if let Some(k) = chosen {
+            let mut objs = self.comic_docs.remove(&key).unwrap_or_default();
+            let id = next_id(&objs);
+            let z = objs.len() as i32;
+            let hw = (sw * 0.14).clamp(60.0, 480.0);
+            let hh = (sh * 0.09).clamp(40.0, 360.0);
+            let mut b = BubbleObject {
+                shape: k.to_shape(hw, hh),
+                ..BubbleObject::default()
+            };
+            b.text.text = "セリフ".to_string();
+            b.text.font_key = font_key.clone();
+            b.text.size_px = (sh * 0.035).clamp(22.0, 80.0);
+            // auto_size を切って、選んだ形状サイズをそのまま使う (空文字でも潰れない)。
+            b.auto_size = false;
+            let mut o = AnnotationObject::new_bubble(id, (sw * 0.5, sh * 0.5), b);
+            o.z = z;
+            objs.push(o);
+            self.text_selected = Some(id);
+            self.save_comic_objects(fs_idx, &key, &objs);
+            self.text_dirty_at = None;
+            self.mark_comic_dirty();
+            self.text_add_bubble_dialog = false;
+        }
+    }
+
+    /// 「ウィンドウを追加」スタイルピッカー。定義済みスタイルのボタンからクリックで追加する。
+    fn draw_text_add_window_dialog(&mut self, ctx: &egui::Context) {
+        if !self.text_add_window_dialog {
+            return;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            self.text_add_window_dialog = false;
+            return;
+        };
+        let Some(key) = self.page_path_key(fs_idx) else {
+            self.text_add_window_dialog = false;
+            return;
+        };
+        let (sw, sh) = self.source_dims_for_idx(fs_idx).unwrap_or((1000.0, 1000.0));
+        let font_key = crate::comic_overlay::COMIC_FONT_KEY.to_string();
+
+        let mut open = true;
+        let mut chosen: Option<usize> = None;
+        let avail = ctx.content_rect();
+        let default_w = 360.0_f32;
+        let default_h = 300.0_f32;
+        let frame = egui::Frame::window(ctx.style().as_ref())
+            .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+            ));
+        egui::Window::new("ウィンドウを追加")
+            .id(egui::Id::new("text_add_window_dialog"))
+            .order(egui::Order::Foreground)
+            .frame(frame)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([default_w, default_h])
+            .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                *ui.visuals_mut() = egui::Visuals::dark();
+                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                ui.label(
+                    egui::RichText::new("デザインを選んでください。クリックで追加します。")
+                        .size(12.0)
+                        .color(egui::Color32::from_gray(190)),
+                );
+                ui.separator();
+                for (i, p) in WIN_PRESETS.iter().enumerate() {
+                    if ui
+                        .add_sized([ui.available_width(), 34.0], egui::Button::new(p.label))
+                        .clicked()
+                    {
+                        chosen = Some(i);
+                    }
+                    ui.add_space(4.0);
+                }
+            });
+
+        self.text_add_window_dialog = open;
+        if let Some(i) = chosen {
+            let p = &WIN_PRESETS[i];
+            let mut objs = self.comic_docs.remove(&key).unwrap_or_default();
+            let id = next_id(&objs);
+            let z = objs.len() as i32;
+            let mut w = MessageWindowObject {
+                position: WindowPosition::Free,
+                half_w: (sw * 0.4).max(120.0),
+                half_h: (sh * 0.12).max(60.0),
+                frame: p.frame,
+                fill_mode: p.fill_mode,
+                fill: p.fill,
+                outline: StrokeStyle {
+                    color: p.outline,
+                    width_px: p.outline_w,
+                },
+                ..MessageWindowObject::default()
+            };
+            w.text.text = "本文".to_string();
+            w.text.font_key = font_key.clone();
+            w.text.size_px = (sh * 0.03).clamp(20.0, 64.0);
+            let mut o = AnnotationObject::new_message_window(id, (sw * 0.5, sh * 0.8), w);
+            o.z = z;
+            objs.push(o);
+            self.text_selected = Some(id);
+            self.save_comic_objects(fs_idx, &key, &objs);
+            self.text_dirty_at = None;
+            self.mark_comic_dirty();
+            self.text_add_window_dialog = false;
+        }
+    }
+}
+
+// ── 追加ダイアログ用ヘルパー ────────────────────────────────────────────
+
+/// ウィンドウ追加ダイアログのスタイルプリセット。
+struct WinPreset {
+    label: &'static str,
+    frame: FrameStyle,
+    fill_mode: FillMode,
+    fill: Option<Rgba>,
+    outline: Rgba,
+    outline_w: f32,
+}
+
+const WIN_PRESETS: &[WinPreset] = &[
+    WinPreset {
+        label: "標準枠",
+        frame: FrameStyle::SolidRounded,
+        fill_mode: FillMode::Solid,
+        fill: Some(Rgba::new(18, 22, 48, 235)),
+        outline: Rgba::WHITE,
+        outline_w: 3.0,
+    },
+    WinPreset {
+        label: "二重枠",
+        frame: FrameStyle::DoubleLine,
+        fill_mode: FillMode::Solid,
+        fill: Some(Rgba::new(20, 20, 28, 235)),
+        outline: Rgba::WHITE,
+        outline_w: 3.0,
+    },
+    WinPreset {
+        label: "枠なし半透明",
+        frame: FrameStyle::None,
+        fill_mode: FillMode::Translucent,
+        fill: Some(Rgba::new(0, 0, 0, 160)),
+        outline: Rgba::WHITE,
+        outline_w: 0.0,
+    },
+    WinPreset {
+        label: "下スクリム (枠なし)",
+        frame: FrameStyle::None,
+        fill_mode: FillMode::GradientScrim,
+        fill: Some(Rgba::new(0, 0, 0, 200)),
+        outline: Rgba::WHITE,
+        outline_w: 0.0,
+    },
+];
+
+/// 形状ピッカーの 1 セル: 上部に形状アウトラインのプレビュー、下部にラベル。クリックで true。
+fn shape_preview_cell(ui: &mut egui::Ui, kind: ShapeKind, cell: f32) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(cell, cell + 18.0), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    let bg = if resp.hovered() {
+        egui::Color32::from_gray(64)
+    } else {
+        egui::Color32::from_gray(42)
+    };
+    painter.rect_filled(rect, 4.0, bg);
+    let pad = 9.0;
+    let area = egui::Rect::from_min_size(
+        rect.min + egui::vec2(pad, pad),
+        egui::vec2(cell - 2.0 * pad, cell - 2.0 * pad),
+    );
+    let shape = kind.to_shape(40.0, 28.0);
+    let pts = comic_core::tessellate_bubble(&shape, (0.0, 0.0));
+    if pts.len() >= 2 {
+        let (mut minx, mut miny, mut maxx, mut maxy) = (
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        );
+        for &(x, y) in &pts {
+            minx = minx.min(x);
+            miny = miny.min(y);
+            maxx = maxx.max(x);
+            maxy = maxy.max(y);
+        }
+        let bw = (maxx - minx).max(1.0);
+        let bh = (maxy - miny).max(1.0);
+        let s = (area.width() / bw).min(area.height() / bh);
+        let mid = ((minx + maxx) * 0.5, (miny + maxy) * 0.5);
+        let c = area.center();
+        let map = |p: (f32, f32)| egui::pos2(c.x + (p.0 - mid.0) * s, c.y + (p.1 - mid.1) * s);
+        let n = pts.len();
+        for i in 0..n {
+            painter.line_segment(
+                [map(pts[i]), map(pts[(i + 1) % n])],
+                egui::Stroke::new(1.6, egui::Color32::WHITE),
+            );
+        }
+    }
+    painter.text(
+        egui::pos2(rect.center().x, rect.max.y - 9.0),
+        egui::Align2::CENTER_CENTER,
+        kind.label(),
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_gray(220),
+    );
+    resp.clicked()
 }
 
 // ── パネル UI ヘルパー (self を借りない純 UI 関数) ──────────────────────
