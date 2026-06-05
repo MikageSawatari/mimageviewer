@@ -9,11 +9,15 @@ Status: 計画 v2.11（**Inc 3 完了** + **Inc 7 書き出し完了** + **Inc 6
 ピッカー / 詳細編集 / 実画像ベイク**。
 Inc 0/1/2/3/7 完了、Inc 4c スタンプ完了、**Inc 4c オノマトペ + フォント基盤/選択
 完了**、**Inc 5 プリセット完了 (セリフ/本体/ウィンドウ)**、**Inc 6 完了 (変形ハンドル +
-エディタ専用 Undo/Redo)**。
-残: Inc 4d (ウィンドウ詳細編集) / Inc 4e (飾り §7.6)。**§7 は部分署名** — コア統合済みだが
-4d/4e 未実装で「ラボ完全パリティ」未達 (§7.0 最終署名 参照)）
-更新: 2026-06-06（**Inc 6 Undo/Redo 完了** `52b5f9f6` + Codex P2/P3 修正 `93a24c6c`。
-coalesce 方式をラボから移植、メタ undo と非干渉、単体テスト 6 件、§7 最終署名を §7.0 に追記。
+エディタ専用 Undo/Redo)**、**Inc 4d ウィンドウ詳細編集 + Inc 4e 飾り 完了**。
+残: 最終パリティ照合で判明した **earlier-Inc (4a/4b) の取りこぼし** — §7.1 `line_gap`/
+`letter_gap`・`markup_enabled` トグル・記号挿入ボタン、§7.2 `merge_with_below` トグル、
+§7.3 しっぽ off→on stash、§7.7 非対応形状でのタブ無効化。これらを v1.1.0 で閉じるか
+ユーザー確認中 (§7.0 最終署名 参照)）
+更新: 2026-06-06（**Inc 4d/4e 完了** `1ebe7ddb` + Codex P2×2/P3 修正 `b4a15d46`。
+window_body_ui 全面拡張 + window_parts_ui + bubble_deco_ui + resolve_window_placement、
+TextPropTab に Parts/Deco 追加、単体テスト 4 件。§7 最終パリティ照合で earlier-Inc
+ギャップが判明し §7.0 を是正。**Inc 6 Undo/Redo 完了** `52b5f9f6`/`93a24c6c`。
 以下は過去分: lab を `ff0efc98` で再マージ = テキスト回転ピボット + フォント/オノマトペ
 プリセット + text handles を取り込み。Inc 6 ハンドル移植 `c6d4d7cb`、Codex P2 対応 +
 吹き出し/ウィンドウ追加ダイアログを BubblePreset/paint_*_preview でラボ準拠プレビューに
@@ -248,101 +252,112 @@ master に対して再確認する**（このスナップショットに固定�
 `comic-core` の `model.rs` の項目を基準に網羅。各項目が mIV でラボと同じ見え/挙動になったらチェック。
 **[deferred]** は意図的に v1 対象外（実装しないことを明示）。
 
-### 7.0 最終署名（Inc 6 完了時点・2026-06-06）— **部分署名**
+### 7.0 最終署名（Inc 4d/4e 完了時点・2026-06-06）— **大半完了、ただし earlier-Inc の残あり**
 
-Inc 6（変形ハンドル + Undo/Redo）の完了をもって §7 の状況を確定する。**コア機能は統合
-完了だが、「ラボ完全パリティ」は未達**（下記 GAP の Inc 4d/4e が残る）。各項目の実機目視は
-ワークフロー §9 step 4（ユーザー確認）で実施する前提で、ここでは **コード統合の有無**を署名する。
+Inc 6（変形ハンドル + Undo/Redo）に続いて **Inc 4d（ウィンドウ詳細編集）+ Inc 4e（飾り）を
+実装完了**した。**ただし最終パリティ照合で、Inc 4a/4b 期に取りこぼしていた earlier-Inc の
+ギャップが判明した**（前回 §7.0 の「残は 4d/4e のみ」は誤り。本サインオフで是正する）。
+各項目の実機目視はワークフロー §9 step 4（ユーザー確認）で実施する前提で、ここでは
+**コード統合の有無**を署名する。
 
-- ✅ **統合完了（コード）**: §7.1 TextBlock / §7.2 BubbleObject / §7.3 Tail / §7.4 StampObject /
-  §7.7 共有 UI（一覧・選択・**変形ハンドル**・**Undo/Redo**・プリセット・追加/見本/ピッカー
-  ダイアログ・IME）/ §7.8 統合・永続化（comic.db / サイドカー / ZIP・PDF / フォルダ移動 /
-  最前面オーバーレイ / Ctrl+E / サムネ非反映 / 回転整合）。
-- ⚠️ **§7.5 MessageWindow = 基本のみ**: 枠 / 塗りモード（None/Solid/Translucent/GradientScrim/
-  LinearGradient）/ 塗り色 / 線色・線幅、および**追加プリセット 10 種**は統合済み。ただし
-  **name_plate / portrait / indicator / per-side Insets / shadow / position / size / vanchor /
-  禁則ワードラップ の個別編集 UI は未実装**（プリセット適用でのみ反映される）。= **Inc 4d 残**。
-- ❌ **§7.6 DecorationLayer（飾り）= 未実装**: mIV テキストモードは「飾り未対応」
-  （`TextPropTab` に飾りタブ無し、装飾の追加/編集 UI 無し）。= **Inc 4e 残**。
-- ◻️ **[deferred] 項目**: 各節に明記のとおり v1 対象外（9-slice 画像枠 / 実立ち絵 / Beveled /
-  per-corner 角丸 / choice・NVL 複数エントリ 等）。
-- 📌 **GAP の扱い**: 「ラボ完全パリティ」の署名は **Inc 4d（ウィンドウ詳細）+ Inc 4e（飾り）の
-  完了をもって成立**する。両者を v1 範囲に含めるかはユーザー判断。Inc 6 自体（ハンドル +
-  Undo/Redo）の受け入れは満たしている。
+- ✅ **統合完了（コード）**:
+  §7.3 Tail（しっぽ種別/幅/ハンドル）/ §7.4 StampObject / §7.5 MessageWindow（位置・サイズ・
+  角丸・背景[単色/半透明/スクリム/2色グラデ]・枠[単線/二重線]・影・縦位置・折り返し[禁則]・
+  per-side 余白・名前プレート・立ち絵枠プレースホルダ・続き指標、`resolve_window_placement`、
+  Inc 4d `1ebe7ddb`/`b4a15d46`）/ §7.6 DecorationLayer（きらきら/花/泡 ×
+  配置/密度/大きさ/色/縁取り/種別固有/seed、Inc 4e `1ebe7ddb`）/ §7.8 統合・永続化 /
+  §7.7 のうち 一覧・選択・変形ハンドル・Undo/Redo・プリセット・追加/見本/ピッカー
+  ダイアログ・IME。
+- ❌ **残ギャップ（earlier-Inc、full parity の前に要対応）**:
+  - **§7.1 TextBlock**: `line_gap` / `letter_gap` スライダー未実装。`markup_enabled` トグル +
+    記法（`[]{}` / `〈〉《》` / `〚〛〘〙`）の **記号挿入ボタン** 未実装（markup 描画自体は
+    動くが、作成時 ON 固定で UI から ON/OFF・挿入ができない）。
+  - **§7.2 BubbleObject**: `merge_with_below`（下の吹き出しと結合）の UI トグル未実装
+    （`comic_core::shape_is_mergeable` ゲート + 無効ホバー含む）。
+  - **§7.3 Tail**: off→on で stash 復元（現状は既定しっぽを再生成。位置を覚えない）。
+  - **§7.7 共有 UI**: 構造トグルのタブ無効化（非対応形状で しっぽ/飾り タブを無効化 +
+    無効ホバー）。現状 mIV は全タブ常時有効。
+- ◻️ **[deferred] 項目（v1 対象外、各節に明記）**: 9-slice 画像枠 / 実立ち絵画像 /
+  Beveled 枠 / per-corner 角丸 / choice・NVL 複数エントリ（§7.5）。立ち絵は v1 では
+  **色付きプレースホルダ矩形**。
+- 📌 **mIV 側で意図的にラボと変えた点**: 名前テキスト編集ではウィンドウ link を切らない
+  （mIV のプリセット規約 = テキスト内容では link を切らない、と一貫。Codex P3 受容）。
+- ⏭️ **判断待ち**: 上記「残ギャップ」を v1.1.0 で閉じるか（= 真の full parity）はユーザー確認中。
 
-> 凡例: ✅ = ラボと同じ見え/挙動になった（コード統合）。⏳ = 実機目視待ち。
-> ❌ = 未実装。**[deferred]** = v1 対象外。
+> 凡例: ✅ = ラボと同じ見え/挙動になった（コード統合）。❌ = 未実装。
+> **[deferred]** = v1 対象外。実機目視（ユーザー）は §9 step 4。
 
 ### 7.1 TextBlock（全 kind 共有）
-- [ ] text / font_key / size_px / color
-- [ ] orientation 横書き / 縦書き（OpenType `vert`、`。、「」…ー` 縦字形）
-- [ ] align（start/center/end）/ line_gap / letter_gap
-- [ ] outline 袋文字（色・太さ）
-- [ ] bold / italic
-- [ ] auto_tcy 自動縦中横（数字 2-3 桁 / `!?`）
-- [ ] markup_enabled ＋ 記法 3 セット（`[]{}` / `〈〉《》` / `〚〛〘〙`、縦中横/横倒し）
-- [ ] preset_link（適用で点灯・個別編集で解除）
+- [x] text / font_key / size_px / color
+- [x] orientation 横書き / 縦書き（OpenType `vert`、`。、「」…ー` 縦字形）
+- [~] align（start/center/end）= 実装済。**`line_gap` / `letter_gap` スライダーは未実装**（§7.0 残ギャップ）
+- [x] outline 袋文字（色・太さ）
+- [x] bold / italic
+- [x] auto_tcy 自動縦中横（数字 2-3 桁 / `!?`）
+- [ ] **markup_enabled トグル ＋ 記法 3 セット（`[]{}` / `〈〉《》` / `〚〛〘〙`）の記号挿入ボタン = 未実装**（描画は動く。§7.0 残ギャップ）
+- [x] preset_link（適用で点灯・個別編集で解除）
 
 ### 7.2 BubbleObject
-- [ ] shape 全 16: Ellipse / RoundRect / Burst / Cloud / Polygon / Diamond / Heart / Arrow / Soft /
+- [x] shape 全 16: Ellipse / RoundRect / Burst / Cloud / Polygon / Diamond / Heart / Arrow / Soft /
       MotionLines(集中線) / SpeedLines(流線) / Concentration(意識) / Strokes(線) / DoubleStroke(二重線) /
       MindEllipse(思考楕円=Ellipse+Thought) / TextOnly(なし)
-- [ ] 形状別パラメータ（rx/ry, half, corner, spikes/jag/seed, lobes/amp, sides, dir_rad, count, gap …）
-- [ ] fill（色）/ fill_opacity / outline（色・太さ）/ padding_px
-- [ ] auto_size（文字に合わせる、ON/OFF 切替時の fit 凍結）
-- [ ] merge_with_below（union、線幅維持＝2×、非対応形状は無効化＋無効ホバー）
-- [ ] shape_preset_link
+- [x] 形状別パラメータ（rx/ry, half, corner, spikes/jag/seed, lobes/amp, sides, dir_rad, count, gap …）
+- [x] fill（色）/ fill_opacity / outline（色・太さ）/ padding_px
+- [x] auto_size（文字に合わせる、ON/OFF 切替時の fit 凍結）
+- [ ] **merge_with_below（union、線幅維持＝2×、非対応形状は無効化＋無効ホバー）= 未実装**（§7.0 残ギャップ）
+- [x] shape_preset_link
 
 ### 7.3 Tail（しっぽ）
-- [ ] kind: Spike（輪郭一体 splice）/ Thought（円トレイル）
-- [ ] tip / width_px / base_t / base_auto（自動付け根＝対象方向）
-- [ ] 既定 左下45°、表示トグル（off→on で stash 復元、非対応形状で無効化＋無効ホバー）
+- [x] kind: Spike（輪郭一体 splice）/ Thought（円トレイル）
+- [x] tip / width_px / base_t / base_auto（自動付け根＝対象方向）
+- [~] 既定 左下45°、表示トグル = 実装済。**off→on の stash 復元は未実装（既定を再生成）**（§7.0 残ギャップ）
 
 ### 7.4 StampObject
-- [ ] source: Emoji（同梱）/ File（ユーザー画像、§6.4 で埋め込み）
-- [ ] half_w/half_h（アスペクト保持の一様スケール）/ opacity / flip_h / flip_v
-- [ ] outline（ステッカーフチ）
-- [ ] style_preset_link
-- [ ] ピッカー（カテゴリ / 検索 / 最近）/ ユーザー画像追加 / source 差し替え
-- [ ] デコードキャッシュ / 欠落プレースホルダ / GPU テクスチャ quad（多数複製でも軽い）
-- [ ] 絵文字アセット同梱＋CC-BY 帰属表記（ソフトウェア情報 / readme）
+- [x] source: Emoji（同梱）/ File（ユーザー画像、§6.4 で埋め込み）
+- [x] half_w/half_h（アスペクト保持の一様スケール）/ opacity / flip_h / flip_v
+- [x] outline（ステッカーフチ）
+- [x] style_preset_link
+- [x] ピッカー（カテゴリ / 検索 / 最近）/ ユーザー画像追加 / source 差し替え
+- [x] デコードキャッシュ / 欠落プレースホルダ / GPU テクスチャ quad（多数複製でも軽い）
+- [x] 絵文字アセット同梱＋CC-BY 帰属表記（ソフトウェア情報 / readme）
 
-### 7.5 MessageWindowObject
-- [ ] frame: None / SolidRounded / DoubleLine（+ frame_gap_px, outline）
-- [ ] fill: None / Solid / Translucent / GradientScrim（+ gradient_to 線形グラデ / scrim_dense_side）
-- [ ] position: Top / Bottom / Center / Free
-- [ ] size: FullWidth / Inset / AutoFitText
-- [ ] vanchor / Insets（per-side padding）/ shadow（ドロップシャドウ）
-- [ ] name_plate: mode / 名前テキスト / 色 / fill / outline / corner / padding / offset、名前ヘッダ（上部常時）
-- [ ] portrait: side / width / fill / outline / margin（本文との非重なり）
-- [ ] indicator: kind ＋ indicator_auto（溢れた時だけ表示）
-- [ ] 日本語禁則ワードラップ / AutoFitText / オーバーフロー警告（赤枠）
+### 7.5 MessageWindowObject — ✅ 個別編集 UI 完了（Inc 4d `1ebe7ddb`/`b4a15d46`）
+- [x] frame: None / SolidRounded / DoubleLine（+ frame_gap_px, outline）
+- [x] fill: None / Solid / Translucent / GradientScrim（+ gradient_to 線形グラデ / scrim_dense_side）
+- [x] position: Top / Middle / Bottom / Center / Free（`resolve_window_placement` で pivot 解決）
+- [x] size: FullWidth / Inset / AutoFitText
+- [x] vanchor / Insets（per-side padding）/ shadow（ドロップシャドウ）
+- [x] name_plate: mode / 名前テキスト / 色 / fill / outline / corner / padding / offset（mIV は「部品」タブに集約。ラボの上部常時ヘッダとは配置のみ差）
+- [x] portrait: side / width / fill / outline / margin（本文との非重なり、色付きプレースホルダ）
+- [x] indicator: kind ＋ indicator_auto（溢れた時だけ表示）
+- [x] 日本語禁則ワードラップ / AutoFitText / オーバーフロー警告（赤枠、comic-core 描画）
 - [ ] [deferred] 9-slice 画像枠 / 実立ち絵画像 / Beveled 枠 / per-corner 角丸 / choice・NVL 複数エントリ
 
-### 7.6 DecorationLayer（飾り）— ❌ 未実装（Inc 4e 残）
-- ❌ kind: Sparkle(星) / Flower(花) / Bubble(泡)
-- ❌ placement: Outline / Outside / Inside / Tail
-- ❌ density / size_ratio / color / seed
-- ❌ outline_width / outline_color / center_color（花中央）/ points（星）/ petals（花）/ gradient（泡）
+### 7.6 DecorationLayer（飾り）— ✅ 完了（Inc 4e `1ebe7ddb`、`bubble_deco_ui`）
+- [x] kind: Sparkle(星) / Flower(花) / Bubble(泡)
+- [x] placement: Outline / Outside / Inside / Tail
+- [x] density / size_ratio / color / seed（追加時 seed=max+1 で位置衝突回避、再生成ボタン）
+- [x] outline_width / outline_color / center_color（花中央）/ points（星）/ petals（花）/ gradient（泡）
 
 ### 7.7 共有 UI 挙動
-- [ ] オブジェクト一覧（上へ/下へ/複製/削除）、z normalize、enable/disable トグル
+- [x] オブジェクト一覧（上へ/下へ/複製/削除）、z normalize、enable/disable トグル
 - [x] 選択 / 移動 / 四隅スケール / 回転ノブ / しっぽハンドル（当たり判定＝comic-core ジオメトリ一致）— Inc 6 `c6d4d7cb`
 - [x] Undo / Redo（エディタ専用、coalesce）— Inc 6 `52b5f9f6`/`93a24c6c`
-- [ ] プリセット: セリフ / 本体 / ウィンドウ（system + user、適用 / 更新 / 削除 / 改名 / リンク点灯）
-- [ ] 追加ダイアログ（吹き出し / ウィンドウ）= レスポンシブ手動グリッド
-- [ ] フォント見本ダイアログ（見本＝編集中セリフ先頭行、名前見切れ無し、ファイル追加）
-- [ ] スタンプピッカー
-- [ ] 構造トグル（結合 / しっぽ / 飾り、非対応で無効化＋無効ホバー）、自動サイズトグル
-- [ ] IME 安全なテキスト編集（Enter/Escape 横取りしない）、記号挿入ボタン
+- [x] プリセット: セリフ / 本体 / ウィンドウ（system + user、適用 / 更新 / 削除 / 改名 / リンク点灯）— Inc 5
+- [x] 追加ダイアログ（吹き出し / ウィンドウ）= レスポンシブ手動グリッド
+- [x] フォント見本ダイアログ（見本＝編集中セリフ先頭行、名前見切れ無し、ファイル追加）— Inc 4c
+- [x] スタンプピッカー — Inc 4c
+- [~] 構造トグル: しっぽ表示 / 飾り（「飾り」タブの追加で on/off）/ 自動サイズトグル は実装済。
+      **結合（merge_with_below）UI と 非対応形状でのタブ無効化＋無効ホバー は未実装**（§7.0 残ギャップ）
+- [~] IME 安全なテキスト編集（Enter/Escape 横取りしない）は実装済。**記号挿入ボタンは未実装**（§7.0 残ギャップ）
 
 ### 7.8 統合・永続化挙動
-- [ ] comic.db 保存 / 読込（スキーマ版数）
-- [ ] mimageviewer.dat ミラー（バックアップ ON 時のみ）、OFF→ON バックフィル（§6.3）
-- [ ] ZIP / PDF 内画像での編集・保存（page_path_key）
-- [ ] フォルダ移動で保持（バックアップ ON）、ユーザー画像スタンプも保持（§6.4）
-- [ ] 非破壊オーバーレイ表示（最前面 D1）/ Ctrl+E 焼き込み出力（表示と一致）
-- [ ] サムネ非反映（D3）/ 非破壊回転 DB との整合（D8）
+- [x] comic.db 保存 / 読込（スキーマ版数）— Inc 2
+- [x] mimageviewer.dat ミラー（バックアップ ON 時のみ）。OFF→ON バックフィルは siblings 同様 **見送り**（§6.3）
+- [x] ZIP / PDF 内画像での編集・保存（page_path_key）— Inc 2
+- [x] フォルダ移動で保持（バックアップ ON）、ユーザー画像スタンプも保持（§6.4）
+- [x] 非破壊オーバーレイ表示（最前面 D1）/ Ctrl+E 焼き込み出力（表示と一致）— Inc 1/7
+- [x] サムネ非反映（D3）/ 非破壊回転 DB との整合（D8）
 
 ---
 
@@ -429,6 +444,15 @@ Inc 6（変形ハンドル + Undo/Redo）の完了をもって §7 の状況を�
   - 受け入れ（各）: **当該種別の描画とインライン編集コントロール**がラボ一致。§7 の該当項目を消し込む。
     （プリセット/追加ダイアログ/フォント見本/変形ハンドルは Inc 5/6 に依存するので、ここでは
     描画＋編集コントロールに限定して判定）。
+  - ✅ **4d ウィンドウ詳細 完了（2026-06-06、`1ebe7ddb` + Codex `b4a15d46`）**: `window_body_ui`
+    (枠タブ = 位置/サイズ/角丸/背景[単色/半透明/スクリム/2色グラデ]/枠[単線/二重線]/影/縦位置/
+    折り返し[禁則]/per-side 余白) + `window_parts_ui` (部品タブ = 名前プレート/立ち絵枠/続き指標) +
+    `resolve_window_placement`。`TextPropTab::Parts` 追加。Codex P2×2/P3×1 対応。
+  - ✅ **4e 飾り 完了（2026-06-06、`1ebe7ddb`）**: `bubble_deco_ui`（飾りタブ = きらきら/花/泡 ×
+    配置/密度/大きさ/色/縁取り/種別固有/seed 再生成）。`TextPropTab::Deco` 追加。
+  - ⚠️ **4a/4b の取りこぼし（最終パリティ照合で判明、§7.0 残ギャップ）**: §7.1 `line_gap`/`letter_gap`
+    スライダー・`markup_enabled` トグル・記号挿入ボタン、§7.2 `merge_with_below` トグル、§7.3 しっぽ
+    off→on stash 復元、§7.7 非対応形状でのタブ無効化。v1.1.0 で閉じるかユーザー確認中。
 - **Inc 5: プリセット ＋ 追加/見本/ピッカー ダイアログ**
   - ✅ **追加ダイアログのプレビュー部分はラボ準拠に刷新済（2026-06-05、`4a64ad15`）**:
     吹き出し追加は `BubblePreset`(18 種) + `paint_bubble_preview`(塗り三角形ファン + 統合
