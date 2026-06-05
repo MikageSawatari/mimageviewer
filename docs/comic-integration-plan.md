@@ -1,16 +1,20 @@
 # テキスト注釈(comic)機能 — 本体 mIV 統合計画
 
-Status: 計画 v2.10（**Inc 3 完了** + **Inc 7 書き出し完了** + **Inc 6 変形ハンドル(回転/四隅
-リサイズ/しっぽ)完了** + 追加ダイアログのプレビューをラボ準拠に刷新 + **パネルを左(一覧)/
+Status: 計画 v2.11（**Inc 3 完了** + **Inc 7 書き出し完了** + **Inc 6 完了 = 変形ハンドル
+(回転/四隅リサイズ/しっぽ) + エディタ専用 Undo/Redo** + 追加ダイアログのプレビューをラボ準拠に刷新 + **パネルを左(一覧)/
 右(詳細設定)に分割し一覧を補正レイヤー風 UI に刷新** + **ウィンドウ追加プリセットを 10 種
 (ラボ system_window_presets パリティ)に拡張** + **右詳細パネルをカテゴリタブ化
 (セリフ青/本体緑/しっぽ橙 + 左色帯、ラボ PropTab 相当の「カラーの縦線での分類」)** +
 **Inc 4c スタンプ(絵文字)完了 = Twemoji SVG を exe 同梱 (build.rs codegen + resvg)、
 ピッカー / 詳細編集 / 実画像ベイク**。
 Inc 0/1/2/3/7 完了、Inc 4c スタンプ完了、**Inc 4c オノマトペ + フォント基盤/選択
-完了**、**Inc 5 プリセット完了 (セリフ/本体/ウィンドウ)**、Inc 6 の変形ハンドル部分完了。
-残: Inc 6 Undo / Inc 4d/4e ウィンドウ・飾り詳細）
-更新: 2026-06-05（lab を `ff0efc98` で再マージ = テキスト回転ピボット + フォント/オノマトペ
+完了**、**Inc 5 プリセット完了 (セリフ/本体/ウィンドウ)**、**Inc 6 完了 (変形ハンドル +
+エディタ専用 Undo/Redo)**。
+残: Inc 4d (ウィンドウ詳細編集) / Inc 4e (飾り §7.6)。**§7 は部分署名** — コア統合済みだが
+4d/4e 未実装で「ラボ完全パリティ」未達 (§7.0 最終署名 参照)）
+更新: 2026-06-06（**Inc 6 Undo/Redo 完了** `52b5f9f6` + Codex P2/P3 修正 `93a24c6c`。
+coalesce 方式をラボから移植、メタ undo と非干渉、単体テスト 6 件、§7 最終署名を §7.0 に追記。
+以下は過去分: lab を `ff0efc98` で再マージ = テキスト回転ピボット + フォント/オノマトペ
 プリセット + text handles を取り込み。Inc 6 ハンドル移植 `c6d4d7cb`、Codex P2 対応 +
 吹き出し/ウィンドウ追加ダイアログを BubblePreset/paint_*_preview でラボ準拠プレビューに
 刷新 `4a64ad15`。パネル左右分割 + 一覧を補正レイヤー風 (共通操作行 1 つ) に刷新 `95f5b1cd`、
@@ -20,8 +24,8 @@ Inc 0/1/2/3/7 完了、Inc 4c スタンプ完了、**Inc 4c オノマトペ + �
 CC-BY 帰属 + bootstrap 配線。Inc 4c オノマトペ + フォント基盤: フォントレジストリ
 (`src/font_assets.rs` = pack/user/system 列挙 + 遅延ロード) `9fed07e3` → オノマトペ
 プリセット 18 種 + 実フォントピッカー `4ae8fcef` → テキスト詳細パネルのフォント選択
-ピッカー (見本グリッド + ユーザーフォント追加) `00de7a18` [本コミット]。
-次は Inc 5 プリセット・フォント → Inc 6 Undo）
+ピッカー (見本グリッド + ユーザーフォント追加) `00de7a18`。
+次は Inc 4d (ウィンドウ詳細編集) / Inc 4e (飾り) — v1 範囲に含めるかユーザー判断）
 対象ブランチ: `master`（lab を初回 `6ac779b2`、追加分を `ff0efc98` でマージ。comic-core は本体の依存）
 
 ラボ（`tools/comic_lab` + `crates/comic-core`）で完成させた吹き出し/テキスト/スタンプ/
@@ -244,6 +248,31 @@ master に対して再確認する**（このスナップショットに固定�
 `comic-core` の `model.rs` の項目を基準に網羅。各項目が mIV でラボと同じ見え/挙動になったらチェック。
 **[deferred]** は意図的に v1 対象外（実装しないことを明示）。
 
+### 7.0 最終署名（Inc 6 完了時点・2026-06-06）— **部分署名**
+
+Inc 6（変形ハンドル + Undo/Redo）の完了をもって §7 の状況を確定する。**コア機能は統合
+完了だが、「ラボ完全パリティ」は未達**（下記 GAP の Inc 4d/4e が残る）。各項目の実機目視は
+ワークフロー §9 step 4（ユーザー確認）で実施する前提で、ここでは **コード統合の有無**を署名する。
+
+- ✅ **統合完了（コード）**: §7.1 TextBlock / §7.2 BubbleObject / §7.3 Tail / §7.4 StampObject /
+  §7.7 共有 UI（一覧・選択・**変形ハンドル**・**Undo/Redo**・プリセット・追加/見本/ピッカー
+  ダイアログ・IME）/ §7.8 統合・永続化（comic.db / サイドカー / ZIP・PDF / フォルダ移動 /
+  最前面オーバーレイ / Ctrl+E / サムネ非反映 / 回転整合）。
+- ⚠️ **§7.5 MessageWindow = 基本のみ**: 枠 / 塗りモード（None/Solid/Translucent/GradientScrim/
+  LinearGradient）/ 塗り色 / 線色・線幅、および**追加プリセット 10 種**は統合済み。ただし
+  **name_plate / portrait / indicator / per-side Insets / shadow / position / size / vanchor /
+  禁則ワードラップ の個別編集 UI は未実装**（プリセット適用でのみ反映される）。= **Inc 4d 残**。
+- ❌ **§7.6 DecorationLayer（飾り）= 未実装**: mIV テキストモードは「飾り未対応」
+  （`TextPropTab` に飾りタブ無し、装飾の追加/編集 UI 無し）。= **Inc 4e 残**。
+- ◻️ **[deferred] 項目**: 各節に明記のとおり v1 対象外（9-slice 画像枠 / 実立ち絵 / Beveled /
+  per-corner 角丸 / choice・NVL 複数エントリ 等）。
+- 📌 **GAP の扱い**: 「ラボ完全パリティ」の署名は **Inc 4d（ウィンドウ詳細）+ Inc 4e（飾り）の
+  完了をもって成立**する。両者を v1 範囲に含めるかはユーザー判断。Inc 6 自体（ハンドル +
+  Undo/Redo）の受け入れは満たしている。
+
+> 凡例: ✅ = ラボと同じ見え/挙動になった（コード統合）。⏳ = 実機目視待ち。
+> ❌ = 未実装。**[deferred]** = v1 対象外。
+
 ### 7.1 TextBlock（全 kind 共有）
 - [ ] text / font_key / size_px / color
 - [ ] orientation 横書き / 縦書き（OpenType `vert`、`。、「」…ー` 縦字形）
@@ -290,16 +319,16 @@ master に対して再確認する**（このスナップショットに固定�
 - [ ] 日本語禁則ワードラップ / AutoFitText / オーバーフロー警告（赤枠）
 - [ ] [deferred] 9-slice 画像枠 / 実立ち絵画像 / Beveled 枠 / per-corner 角丸 / choice・NVL 複数エントリ
 
-### 7.6 DecorationLayer（飾り）
-- [ ] kind: Sparkle(星) / Flower(花) / Bubble(泡)
-- [ ] placement: Outline / Outside / Inside / Tail
-- [ ] density / size_ratio / color / seed
-- [ ] outline_width / outline_color / center_color（花中央）/ points（星）/ petals（花）/ gradient（泡）
+### 7.6 DecorationLayer（飾り）— ❌ 未実装（Inc 4e 残）
+- ❌ kind: Sparkle(星) / Flower(花) / Bubble(泡)
+- ❌ placement: Outline / Outside / Inside / Tail
+- ❌ density / size_ratio / color / seed
+- ❌ outline_width / outline_color / center_color（花中央）/ points（星）/ petals（花）/ gradient（泡）
 
 ### 7.7 共有 UI 挙動
 - [ ] オブジェクト一覧（上へ/下へ/複製/削除）、z normalize、enable/disable トグル
-- [ ] 選択 / 移動 / 四隅スケール / 回転ノブ / しっぽハンドル（当たり判定＝comic-core ジオメトリ一致）
-- [ ] Undo / Redo（エディタ専用、coalesce）
+- [x] 選択 / 移動 / 四隅スケール / 回転ノブ / しっぽハンドル（当たり判定＝comic-core ジオメトリ一致）— Inc 6 `c6d4d7cb`
+- [x] Undo / Redo（エディタ専用、coalesce）— Inc 6 `52b5f9f6`/`93a24c6c`
 - [ ] プリセット: セリフ / 本体 / ウィンドウ（system + user、適用 / 更新 / 削除 / 改名 / リンク点灯）
 - [ ] 追加ダイアログ（吹き出し / ウィンドウ）= レスポンシブ手動グリッド
 - [ ] フォント見本ダイアログ（見本＝編集中セリフ先頭行、名前見切れ無し、ファイル追加）
@@ -422,8 +451,29 @@ master に対して再確認する**（このスナップショットに固定�
     スケール、スタンプはアスペクト維持。回転中心は単独テキスト=レイアウト中心 / 他=pivot
     (comic-core `object_rotation_pivot` と整合)。**Codex P2 対応**: press 直後の hold ではなく
     画面 4px 超のドラッグまで変形を適用しない arm 閾値 (`TextDrag.start/armed`)。単体テスト 4 件。
-  - ⏳ **残: エディタ専用 Undo/Redo (Ctrl+Z/Y)**、§7 全消し込みの最終署名。
-  - 受け入れ: Ctrl+Z/Y がモード内で動き `meta_undo` と干渉しない。§7 完了。
+  - ✅ **エディタ専用 Undo/Redo 完了（2026-06-06、`52b5f9f6` + Codex 修正 `93a24c6c`）**:
+    ラボ `do_undo`/`do_redo`/`commit_pending`/`reset_history` の coalesce 方式を移植。
+    純ロジック (`comic_commit_pending`/`comic_undo_step`/`comic_redo_step`) を App 非依存の
+    自由関数に切り出し、App メソッド (`reset_comic_history`/`commit_comic_pending`/
+    `commit_comic_undo_on_settle`/`do_comic_undo`/`do_comic_redo`/`after_comic_history_change`)
+    は薄いファサード。対象は現ページの `comic_docs[page_path_key]` 全体。App 新規フィールド
+    `comic_undo_stack`/`comic_redo_stack`/`comic_undo_baseline`/`comic_undo_key` (in-memory のみ、
+    永続スキーマ変更なし)。`handle_text_keys` で Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z を consume
+    (consume 順は `handle_meta_undo_keys` と同一)。commit-on-settle は `draw_text_overlay` 末尾で
+    drag/IME 中を避けて 1 エントリに coalesce。`enter_text_mode` で reset、`reset_text_mode` で
+    クリア。**メタ undo (レーティング/タグ) とは別スタックで非干渉**: テキストモード中は
+    `handle_fs_key_input` が `handle_text_keys` で return し、かつ `handle_keyboard` は
+    fullscreen 中に `shortcuts_blocked_by_text_input` で早期 return するため
+    `handle_meta_undo_keys` は到達不能。単体テスト 6 件追加 (coalesce/round-trip/redo-clear/
+    cap/empty-noop/commit-pending-first)。**Codex P2/P3 対応**: ① probe に `Key::Y` 追加
+    (Ctrl+Y が root-key 経路で届かない非対称を解消) ② undo 抑制判定を `focused().is_some()` →
+    `wants_keyboard_input()` (ボタン/スライダーフォーカスで undo が効かなくなるのを修正、ラボ準拠)。
+  - 受け入れ: ✅ Ctrl+Z/Y がモード内で動き `meta_undo` と干渉しない (構造的に到達不能を確認)。
+    ビルド緑 + テスト 2054 passed。実機目視 (undo/redo の体感) はユーザー確認待ち。
+  - ⚠️ **§7 パリティ最終署名 = 部分署名 (下記 §7 冒頭の「最終署名」参照)**: Inc 6 (ハンドル +
+    Undo/Redo) は完了したが、**Inc 4d (ウィンドウ詳細編集) と Inc 4e (飾り §7.6) が未実装**の
+    ため「ラボ完全パリティ」は未達。コア (TextBlock/Bubble/Tail/Stamp/プリセット/ダイアログ/
+    ハンドル/Undo) は統合済み。4d/4e の扱いはユーザー判断 (v1 範囲に含めるか) を仰ぐ。
 - **Inc 7: 書き出し統合（Ctrl+E）** — ✅ **基本実装完了（2026-06-05）**
   - ✅ `comic_composited_pixels_for_export(ctx, idx)` を `export_page_pixels_for_idx` に挿し、注釈があれば最終
     composite に焼き込んだピクセルを base_pixels にする（最前面 D1）。crop + ダウンサンプル + spread 合成 + 回転は
