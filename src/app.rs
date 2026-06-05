@@ -4077,6 +4077,18 @@ pub struct App {
     /// オノマトペプリセットのサムネイルテクスチャキャッシュ
     /// (`<label>|<text>|<font_key>` → 実フォントで焼いたプレビュー)。
     pub(crate) onomatopoeia_thumb_cache: std::collections::HashMap<String, egui::TextureHandle>,
+    /// フォント選択ダイアログ (テキスト詳細パネルの「フォント」から開く、Inc 4c) の状態。
+    pub(crate) text_font_dialog: bool,
+    /// フォント選択の対象オブジェクト id (選択中テキストの font_key を書き換える)。
+    pub(crate) text_font_dialog_target: Option<u64>,
+    /// フォント選択ダイアログの絞り込み文字列。
+    pub(crate) text_font_dialog_filter: String,
+    /// フォント選択ダイアログのカテゴリ絞り込み (None = すべて)。
+    pub(crate) text_font_dialog_category: Option<crate::font_assets::FontCategory>,
+    /// フォント選択ダイアログの見本テキスト。
+    pub(crate) text_font_dialog_sample: String,
+    /// フォント見本テクスチャのキャッシュ (`(font_key, 見本テキスト)` → 焼いた 1 行サンプル)。
+    pub(crate) font_sample_cache: std::collections::HashMap<(String, String), egui::TextureHandle>,
     /// スタンプピッカーが「既存スタンプの差し替え」で開かれたときの対象オブジェクト id。
     /// `None` のときは新規追加。
     pub(crate) stamp_dialog_replace_target: Option<u64>,
@@ -5201,6 +5213,12 @@ impl App {
             text_add_stamp_dialog: false,
             text_add_onomatopoeia_dialog: false,
             onomatopoeia_thumb_cache: std::collections::HashMap::new(),
+            text_font_dialog: false,
+            text_font_dialog_target: None,
+            text_font_dialog_filter: String::new(),
+            text_font_dialog_category: None,
+            text_font_dialog_sample: String::new(),
+            font_sample_cache: std::collections::HashMap::new(),
             stamp_dialog_replace_target: None,
             stamp_dialog_filter: String::new(),
             stamp_dialog_category: crate::comic_stamp::EmojiCategory::Smileys,

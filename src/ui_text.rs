@@ -733,6 +733,8 @@ impl App {
         self.text_add_bubble_dialog = false;
         self.text_add_window_dialog = false;
         self.text_add_onomatopoeia_dialog = false;
+        self.text_font_dialog = false;
+        self.text_font_dialog_target = None;
         // スタンプピッカーの差し替え対象は page-local id なので、モードをまたいで残すと
         // 別ページの同 id スタンプを誤って差し替える (Codex P2)。入場時に必ずクリアする。
         self.text_add_stamp_dialog = false;
@@ -771,6 +773,8 @@ impl App {
         self.text_add_bubble_dialog = false;
         self.text_add_window_dialog = false;
         self.text_add_onomatopoeia_dialog = false;
+        self.text_font_dialog = false;
+        self.text_font_dialog_target = None;
         // スタンプピッカーの差し替え対象を退場時にもクリア (Codex P2、enter 側と対)。
         self.text_add_stamp_dialog = false;
         self.stamp_dialog_replace_target = None;
@@ -1059,6 +1063,7 @@ impl App {
         self.draw_text_add_window_dialog(ctx);
         self.draw_text_add_stamp_dialog(ctx);
         self.draw_text_add_onomatopoeia_dialog(ctx);
+        self.draw_text_font_dialog(ctx);
     }
 
     /// 選択中オブジェクトの変形ハンドルを画面に描く。回転を反映した境界四角形 +
@@ -1171,6 +1176,7 @@ impl App {
         let mut open_stamp_dialog = false;
         let mut open_stamp_replace = false;
         let mut open_onomatopoeia_dialog = false;
+        let mut open_font_picker = false;
 
         // ── 左パネル: ヘッダ + 追加 + オブジェクト一覧 (補正レイヤー風) ──
         egui::Area::new(egui::Id::new("text_panel"))
@@ -1341,6 +1347,7 @@ impl App {
                                                 &mut prop_tab,
                                                 &mut changed,
                                                 &mut open_stamp_replace,
+                                                &mut open_font_picker,
                                             );
                                         } else {
                                             ui.label(
@@ -1376,6 +1383,16 @@ impl App {
         }
         if open_onomatopoeia_dialog {
             self.text_add_onomatopoeia_dialog = true;
+        }
+        if open_font_picker {
+            // 選択中テキストのフォントを見本から選ぶダイアログを開く。
+            self.text_font_dialog_target = selected;
+            self.text_font_dialog_filter.clear();
+            if self.text_font_dialog_sample.is_empty() {
+                self.text_font_dialog_sample = "あア永 Ag".to_string();
+            }
+            self.font_sample_cache.clear();
+            self.text_font_dialog = true;
         }
 
         // 書き戻し。編集中は毎フレーム DB へ書かず (Codex P2)、メモリ更新 + 再ベイクに留め、
@@ -1805,6 +1822,351 @@ impl App {
         self.save_comic_objects(fs_idx, key, &objs);
         self.text_dirty_at = None;
         self.mark_comic_dirty();
+    }
+
+    /// フォント `font_key` で見本テキストを 1 行ベイクして RGBA 画像にする。フォントが
+    /// 解決できない (= 未ロード / parse 失敗) ときは `None` (= カードに見本を出さない)。
+    fn render_font_sample(
+        &mut self,
+        font_key: &str,
+        sample: &str,
+        px: f32,
+    ) -> Option<egui::ColorImage> {
+        // 1 カードが巨大テクスチャを確保しないよう見本長を制限する (フィールドは編集可)。
+        let sample: String = sample.chars().take(40).collect();
+        let block = TextBlock {
+            text: sample,
+            font_key: font_key.to_string(),
+            size_px: px,
+            color: Rgba::BLACK,
+            orientation: Orientation::Horizontal,
+            ..TextBlock::default()
+        };
+        let probe = AnnotationObject::new_text(0, (0.0, 0.0), block.clone());
+        let fonts = self.ensure_comic_fonts_for(std::slice::from_ref(&probe))?;
+        let font = fonts.get(font_key)?;
+        // `FontSet::get` は未知キーを既定フォントへ fallback するので、解決面が実際に
+        // `font_key` でなければ見本を出さない (別フォントを誤った名前で見せない)。
+        if font.key != font_key {
+            return None;
+        }
+        let layout = comic_core::layout_text(&block, font);
+        let pad = 6.0f32;
+        let w = ((layout.bounds.0 + pad * 2.0).ceil() as usize).clamp(1, 2000);
+        let h = ((layout.bounds.1 + pad * 2.0).ceil() as usize).clamp(1, 400);
+        let obj = AnnotationObject::new_text(0, (pad, pad), block);
+        let overlay = comic_core::bake_overlay(&[obj], w, h, &fonts);
+        Some(egui::ColorImage::from_rgba_unmultiplied(
+            [overlay.w, overlay.h],
+            &overlay.pixels,
+        ))
+    }
+
+    /// フォント見本テクスチャを遅延構築 + キャッシュして返す。キーは `(font_key, 見本)`。
+    fn font_sample_texture(
+        &mut self,
+        ctx: &egui::Context,
+        font_key: &str,
+    ) -> Option<egui::TextureHandle> {
+        let sample = self.text_font_dialog_sample.clone();
+        let cache_key = (font_key.to_string(), sample.clone());
+        if let Some(tex) = self.font_sample_cache.get(&cache_key) {
+            return Some(tex.clone());
+        }
+        let img = self.render_font_sample(font_key, &sample, 30.0)?;
+        let tex_name = format!(
+            "font_sample_{}_{}",
+            crate::font_assets::font_lookup_key(font_key),
+            crate::font_assets::font_lookup_key(&sample)
+        );
+        let tex = ctx.load_texture(tex_name, img, egui::TextureOptions::LINEAR);
+        self.font_sample_cache.insert(cache_key, tex.clone());
+        Some(tex)
+    }
+
+    /// フォント選択ダイアログの 1 カード (上に見本ストリップ、下にフォント名)。クリックで
+    /// true。`allow_build` のときだけ見本テクスチャを焼く (1 フレーム予算)。
+    fn draw_font_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        key: &str,
+        selected: bool,
+        allow_build: bool,
+    ) -> bool {
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(FONT_CARD_W, FONT_CARD_H), egui::Sense::click());
+        let hovered = resp.hovered();
+        let painter = ui.painter_at(rect);
+        let bg = if selected {
+            egui::Color32::from_rgb(50, 70, 100)
+        } else if hovered {
+            egui::Color32::from_rgb(58, 58, 64)
+        } else {
+            egui::Color32::from_rgb(40, 40, 44)
+        };
+        painter.rect_filled(rect, 4.0, bg);
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(
+                if selected { 2.0 } else { 1.0 },
+                if selected || hovered {
+                    egui::Color32::from_rgb(150, 195, 255)
+                } else {
+                    egui::Color32::from_gray(70)
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let pad = 6.0;
+        let name_band = 22.0;
+        let sample_h = (FONT_CARD_H - pad * 2.0 - name_band).max(8.0);
+        let sample_area = egui::Rect::from_min_size(
+            rect.min + egui::vec2(pad, pad),
+            egui::vec2(FONT_CARD_W - pad * 2.0, sample_h),
+        );
+        // 黒文字の見本が読めるよう明るいストリップを敷く。
+        painter.rect_filled(sample_area, 2.0, egui::Color32::from_gray(235));
+        let tex = if allow_build {
+            self.font_sample_texture(ctx, key)
+        } else {
+            self.font_sample_cache
+                .get(&(key.to_string(), self.text_font_dialog_sample.clone()))
+                .cloned()
+        };
+        if let Some(tex) = tex {
+            let sz = tex.size_vec2();
+            if sz.x > 0.0 && sz.y > 0.0 {
+                let scale = (sample_area.width() / sz.x)
+                    .min(sample_area.height() / sz.y)
+                    .min(1.0);
+                let draw = egui::vec2(sz.x * scale, sz.y * scale);
+                let origin = sample_area.center() - draw * 0.5;
+                painter.image(
+                    tex.id(),
+                    egui::Rect::from_min_size(origin, draw),
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+        painter.text(
+            egui::pos2(rect.min.x + 8.0, rect.max.y - pad - name_band * 0.5),
+            egui::Align2::LEFT_CENTER,
+            key,
+            egui::FontId::proportional(12.0),
+            egui::Color32::WHITE,
+        );
+        resp.clicked()
+    }
+
+    /// フォント選択ダイアログ。見本テキスト + 絞り込み + カテゴリ (すべて/追加パック/
+    /// ユーザー/システム) でフィルタした一覧を、可視行だけ実フォントで焼いて見せる
+    /// (`show_rows` 仮想化 + 1 フレーム予算でカクつきを防ぐ)。選んだフォントを対象
+    /// テキストの font_key に設定して再ベイクする。
+    fn draw_text_font_dialog(&mut self, ctx: &egui::Context) {
+        if !self.text_font_dialog {
+            return;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            self.text_font_dialog = false;
+            return;
+        };
+        let Some(target) = self.text_font_dialog_target else {
+            self.text_font_dialog = false;
+            return;
+        };
+        let Some(page_key) = self.page_path_key(fs_idx) else {
+            self.text_font_dialog = false;
+            return;
+        };
+        self.ensure_comic_font_registry();
+
+        // 一覧スナップショット (フィルタ適用) と現在のフォントを closure 前に用意する。
+        let filter_lc = self.text_font_dialog_filter.to_lowercase();
+        let cat = self.text_font_dialog_category;
+        let visible: Vec<String> = self
+            .comic_available_fonts
+            .iter()
+            .filter(|a| {
+                (filter_lc.is_empty() || a.key.to_lowercase().contains(&filter_lc))
+                    && (cat.is_none() || cat == Some(a.category))
+            })
+            .map(|a| a.key.clone())
+            .collect();
+        let current_key = self
+            .comic_docs
+            .get(&page_key)
+            .and_then(|objs| objs.iter().find(|o| o.id == target))
+            .and_then(|o| o.text_block().map(|tb| tb.font_key.clone()))
+            .unwrap_or_default();
+        let pack_count = self
+            .comic_available_fonts
+            .iter()
+            .filter(|a| a.category == crate::font_assets::FontCategory::Pack)
+            .count();
+
+        let mut open = true;
+        let mut chosen: Option<String> = None;
+        let mut pick_file = false;
+        let avail = ctx.content_rect();
+        let default_w = (avail.width() - 24.0).clamp(360.0, 760.0);
+        let default_h = (avail.height() - 120.0).clamp(320.0, 600.0);
+        let frame = egui::Frame::window(ctx.style().as_ref())
+            .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+            ));
+        egui::Window::new("フォントを選択")
+            .id(egui::Id::new("text_font_dialog"))
+            .order(egui::Order::Foreground)
+            .frame(frame)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([default_w, default_h])
+            .default_pos(avail.center() - egui::vec2(default_w, default_h) * 0.5)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                *ui.visuals_mut() = egui::Visuals::dark();
+                ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+                ui.horizontal(|ui| {
+                    ui.label("見本");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.text_font_dialog_sample)
+                                .desired_width(180.0),
+                        )
+                        .changed()
+                    {
+                        self.font_sample_cache.clear();
+                    }
+                    ui.label("絞り込み");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.text_font_dialog_filter)
+                            .desired_width(140.0)
+                            .hint_text("フォント名"),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("ファイルから追加…").clicked() {
+                            pick_file = true;
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("種別");
+                    ui.selectable_value(&mut self.text_font_dialog_category, None, "すべて");
+                    ui.selectable_value(
+                        &mut self.text_font_dialog_category,
+                        Some(crate::font_assets::FontCategory::Pack),
+                        format!("追加パック ({pack_count})"),
+                    );
+                    ui.selectable_value(
+                        &mut self.text_font_dialog_category,
+                        Some(crate::font_assets::FontCategory::User),
+                        "ユーザー追加",
+                    );
+                    ui.selectable_value(
+                        &mut self.text_font_dialog_category,
+                        Some(crate::font_assets::FontCategory::System),
+                        "システム",
+                    );
+                });
+                ui.separator();
+
+                let avail_w = ui.available_width();
+                let cols = ((avail_w / (FONT_CARD_W + 8.0)).floor() as usize).max(1);
+                let rows = visible.len().div_ceil(cols);
+                // 1 フレームに新規ラスタライズするカード数を制限 (開封 / スクロールで
+                // フォント parse + texture upload が UI を止めないよう、残りは次フレーム以降)。
+                let mut build_budget = 4i32;
+                let mut need_repaint = false;
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, FONT_CARD_H + 8.0, rows, |ui, row_range| {
+                        for row in row_range {
+                            ui.horizontal(|ui| {
+                                for col in 0..cols {
+                                    let idx = row * cols + col;
+                                    let Some(key) = visible.get(idx) else {
+                                        break;
+                                    };
+                                    let selected = key == &current_key;
+                                    let cached = self.font_sample_cache.contains_key(&(
+                                        key.clone(),
+                                        self.text_font_dialog_sample.clone(),
+                                    ));
+                                    let allow = cached || build_budget > 0;
+                                    if !cached && allow {
+                                        build_budget -= 1;
+                                    }
+                                    if !cached && !allow {
+                                        need_repaint = true;
+                                    }
+                                    if self.draw_font_card(ui, ctx, key, selected, allow) {
+                                        chosen = Some(key.clone());
+                                    }
+                                }
+                            });
+                        }
+                        if need_repaint {
+                            ui.ctx().request_repaint();
+                        }
+                    });
+            });
+
+        self.text_font_dialog = open;
+        if pick_file {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("フォント", &["ttf", "otf", "ttc"])
+                .pick_file()
+            {
+                if let Some(label) = self.add_user_font_file(&path) {
+                    chosen = Some(label);
+                }
+            }
+        }
+        if let Some(font_key) = chosen {
+            let mut objs = self.comic_docs.remove(&page_key).unwrap_or_default();
+            if let Some(tb) = objs
+                .iter_mut()
+                .find(|o| o.id == target)
+                .and_then(|o| o.text_block_mut())
+            {
+                tb.font_key = font_key.clone();
+                tb.preset_link = None; // 個別編集なのでプリセットリンクを解除
+            }
+            let _ = self.ensure_comic_fonts_for(&objs);
+            self.save_comic_objects(fs_idx, &page_key, &objs);
+            self.text_dirty_at = None;
+            self.mark_comic_dirty();
+            self.text_font_dialog = false;
+        }
+    }
+
+    /// 選んだフォントファイルをユーザーフォントディレクトリへコピーし、レジストリを
+    /// 再列挙して、その表示ラベル (= font_key) を返す。失敗時は `None`。
+    fn add_user_font_file(&mut self, path: &std::path::Path) -> Option<String> {
+        let dir = crate::font_assets::user_fonts_dir();
+        if std::fs::create_dir_all(&dir).is_err() {
+            return None;
+        }
+        let file_name = path.file_name()?;
+        let dest = dir.join(file_name);
+        // 既に同名があればコピーを省く (上書きでロックを避ける)。
+        if !dest.exists() && std::fs::copy(path, &dest).is_err() {
+            return None;
+        }
+        // 再列挙してこのフォントを一覧に載せる。
+        self.comic_font_registry_loaded = false;
+        self.ensure_comic_font_registry();
+        self.font_sample_cache.clear();
+        // コピー先パスから表示ラベルを導出 (font_assets と同じ規則: stem の _/- を空白に)。
+        let stem = dest.file_stem().and_then(|s| s.to_str())?;
+        let label = stem.replace(['_', '-'], " ").trim().to_string();
+        if label.is_empty() { None } else { Some(label) }
     }
 
     /// スタンプピッカーのサムネイルテクスチャを (なければ) 用意する。デコードは
@@ -2904,6 +3266,10 @@ fn draw_bubble_preset_thumbnail(ui: &mut egui::Ui, preset: BubblePreset) -> bool
 /// オノマトペ追加ピッカーの 1 セル幅 (実フォントサンプルを大きめに見せる)。
 const ONOMATO_CELL_W: f32 = 184.0;
 
+/// フォント選択ダイアログの 1 カード寸法 (見本ストリップ + フォント名)。
+const FONT_CARD_W: f32 = 220.0;
+const FONT_CARD_H: f32 = 70.0;
+
 #[derive(Clone, Copy)]
 struct OnomatopoeiaPreset {
     label: &'static str,
@@ -3521,6 +3887,7 @@ fn edit_object_ui(
     tab: &mut TextPropTab,
     changed: &mut bool,
     open_stamp_replace: &mut bool,
+    open_font_picker: &mut bool,
 ) {
     ui.strong(kind_label(o));
     // 回転 (全種共通、タブの外)。
@@ -3539,7 +3906,7 @@ fn edit_object_ui(
             *tab = TextPropTab::Serifu;
             ui.add_space(4.0);
             draw_section_bar(ui, TextPropTab::Serifu.color(), |ui| {
-                text_block_ui(ui, t, changed, true);
+                text_block_ui(ui, t, changed, true, open_font_picker);
             });
         }
         AnnotationKind::Bubble(b) => {
@@ -3557,7 +3924,9 @@ fn edit_object_ui(
             ui.add_space(4.0);
             let cur = *tab;
             draw_section_bar(ui, cur.color(), |ui| match cur {
-                TextPropTab::Serifu => text_block_ui(ui, &mut b.text, changed, true),
+                TextPropTab::Serifu => {
+                    text_block_ui(ui, &mut b.text, changed, true, open_font_picker)
+                }
                 TextPropTab::Tail => bubble_tail_ui(ui, b, changed),
                 TextPropTab::Body => bubble_body_ui(ui, b, changed),
             });
@@ -3579,7 +3948,9 @@ fn edit_object_ui(
             ui.add_space(4.0);
             let cur = *tab;
             draw_section_bar(ui, cur.color(), |ui| match cur {
-                TextPropTab::Serifu => text_block_ui(ui, &mut w.text, changed, true),
+                TextPropTab::Serifu => {
+                    text_block_ui(ui, &mut w.text, changed, true, open_font_picker)
+                }
                 _ => window_body_ui(ui, w, changed),
             });
         }
@@ -3592,7 +3963,13 @@ fn edit_object_ui(
 
 /// TextBlock の編集 (テキスト内容・サイズ・色・向き・整列・袋文字・太字/斜体)。
 /// `with_text` が false のときは本文編集欄を出さない (名前プレート等の流用余地)。
-fn text_block_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool, with_text: bool) {
+fn text_block_ui(
+    ui: &mut egui::Ui,
+    t: &mut TextBlock,
+    changed: &mut bool,
+    with_text: bool,
+    open_font_picker: &mut bool,
+) {
     if with_text {
         let resp = ui.add(
             egui::TextEdit::multiline(&mut t.text)
@@ -3604,6 +3981,22 @@ fn text_block_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool, with_
             *changed = true;
         }
     }
+    // フォント選択 (現在のフォント名 + 選択ボタン)。ピッカーは別ダイアログで開く。
+    ui.horizontal(|ui| {
+        ui.label("フォント");
+        let cur = if t.font_key.is_empty() || t.font_key == crate::comic_overlay::COMIC_FONT_KEY {
+            "既定 (システム)".to_string()
+        } else {
+            t.font_key.clone()
+        };
+        if ui
+            .button(egui::RichText::new(cur).size(12.0))
+            .on_hover_text("フォントを見本から選択")
+            .clicked()
+        {
+            *open_font_picker = true;
+        }
+    });
     if ui
         .add(egui::Slider::new(&mut t.size_px, 8.0..=400.0).text("サイズ"))
         .changed()
