@@ -109,6 +109,12 @@ struct LocalEffectPanelRequests {
     generate_region_mask: Option<(usize, LocalAdjustRegionSegmentationScope)>,
     /// 被写体マットモデル (編集用追加パック) が未導入のとき、ダウンロード導線を開く要求 (spec §9)。
     request_editing_addon_download: bool,
+    /// このフレームでマスク (種類・形状・パラメータ等) を操作した → マスク表示を ON にする。
+    /// ラボの reveal_mask_preview 相当。brush / 生成は App 側で別途検出する。
+    mask_touched: bool,
+    /// このフレームで効果パラメータを操作した → マスク表示を OFF にする。
+    /// ラボの「効果 response.changed → hide_mask_preview」相当。
+    effect_touched: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2484,6 +2490,13 @@ fn draw_selected_local_adjust_layer_editor(
         );
     });
 
+    // 効果セクションより前に立った `changed` は、マスク種類 / 反転 / 不透明度 / 適用前後 /
+    // 拡張縮小 / ぼかし / マスクエディタ (被写体・領域・筆設定) 由来 = マスク操作。
+    // ラボの reveal_mask_preview 相当として「マスクを触った」フラグを立てる。
+    if changed {
+        effect_requests.mask_touched = true;
+    }
+
     draw_local_adjust_panel_section(ui, LocalAdjustPanelSection::Effect, |ui| {
         let response = draw_effect_params(
             ui,
@@ -2494,7 +2507,11 @@ fn draw_selected_local_adjust_layer_editor(
             effect_clipboard_available,
             effect_position_handles_visible,
         );
-        changed |= response.changed;
+        if response.changed {
+            changed = true;
+            // ラボの「効果 response.changed → hide_mask_preview」相当。
+            effect_requests.effect_touched = true;
+        }
         if response.load_cube_lut {
             effect_requests.load_cube_lut = Some(layer_idx);
         }
@@ -7803,6 +7820,8 @@ impl App {
                 true
             });
         if changed {
+            // 図形マスク確定 = マスク操作 → マスク表示 ON (ラボ mark_mask_changed 相当)。
+            self.local_adjust_show_mask = true;
             let layers = self
                 .local_adjust_page_layers
                 .get(&fs_idx)
@@ -7914,6 +7933,8 @@ impl App {
         let Some(stroke) = self.local_adjust_mask_brush_stroke.take() else {
             return;
         };
+        // 手描きマスク確定 = マスク操作 → マスク表示 ON (ラボ mark_mask_changed 相当)。
+        self.local_adjust_show_mask = true;
         let Some(mut layers) = self.local_adjust_page_layers.get(&stroke.fs_idx).cloned() else {
             self.cancel_deferred_local_adjust_brush_render(stroke.fs_idx);
             return;
@@ -10405,6 +10426,21 @@ impl App {
         self.local_adjust_edge_brush_include_boundary = edge_brush_include_boundary;
         self.local_adjust_region_color_tolerance = region_color_tolerance.clamp(4.0, 120.0);
         self.local_adjust_region_min_area = region_min_area.clamp(1, 2048);
+        // マスク操作で表示 ON / 効果操作で表示 OFF (ラボ tools/local_adjust_lab の
+        // reveal_mask_preview / hide_mask_preview 挙動の移植)。マスク操作 = パネルの
+        // マスク設定変更 (mask_touched) / 筆ストローク (bitmap_mask_op) / 被写体・領域生成。
+        // 効果操作 = 効果パラメータ変更 (effect_touched)。同フレームに両方立つことは
+        // 実質ないが、その場合はマスク操作を優先 (= 後に評価して ON を勝たせる)。
+        let mask_touched = effect_requests.mask_touched
+            || bitmap_mask_op.is_some()
+            || effect_requests.generate_subject_mask.is_some()
+            || effect_requests.generate_region_mask.is_some();
+        if effect_requests.effect_touched {
+            self.local_adjust_show_mask = false;
+        }
+        if mask_touched {
+            self.local_adjust_show_mask = true;
+        }
         if let Some(op) = bitmap_mask_op {
             self.apply_local_adjust_bitmap_mask_op(
                 fs_idx,
