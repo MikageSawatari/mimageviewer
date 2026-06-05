@@ -1,7 +1,7 @@
 # テキスト注釈(comic)機能 — 本体 mIV 統合計画
 
-Status: 計画 v2.3（**Inc 1 表示部 完了** = 最前面オーバーレイ実機検証 PASS・同期ベイク方針確定）
-更新: 2026-06-05（Inc 1 表示部 完了・検証 PASS。次は Inc 2 = 永続化 comic.db）
+Status: 計画 v2.4（**Inc 2 完了** = comic.db 正本 + mimageviewer.dat ミラー。Inc 1 表示部も検証 PASS 済み）
+更新: 2026-06-05（Inc 2 永続化 完了。次は Inc 3 = 編集モード骨格 + IME）
 対象ブランチ: `master`（lab を `6ac779b2` でマージ。comic-core は本体の依存）
 
 ラボ（`tools/comic_lab` + `crates/comic-core`）で完成させた吹き出し/テキスト/スタンプ/
@@ -195,12 +195,16 @@ master に対して再確認する**（このスナップショットに固定�
 - ZIP/PDF はフォルダ単位サイドカー（ZIP の隣の `mimageviewer.dat`）に `page_path_key` 系で入るので、
   ZIP/PDF 内画像のテキストも移動で保持される。
 
-### 6.3 バックアップ OFF→ON の整合（P1 対応）
+### 6.3 バックアップ OFF→ON の整合（P1 → 見送り決定 2026-06-05）
 - OFF 中は `comic.db` だけ更新され、フォルダ `mimageviewer.dat` は **古いまま**になりうる。後で ON に
   したフォルダを「全ページ再保存する前に」移動すると、**古いサイドカーが import される**事故が起きる。
-- **対策（実装）**: 「設定のバックアップ」を OFF→ON にした時点で、**現在フォルダの comic 項目を
-  `comic.db` から `mimageviewer.dat` へバックフィル**してから運用する。これを受け入れテストで担保。
-  既存編集（mask/conceal/local_adjust）が同じ穴を持つなら、その挙動に合わせる/併せて是正する。
+- **決定（Inc 2b 実装時）**: comic 独自のバックフィルは**実装しない**。コード調査で
+  **既存サブシステム（mask/conceal/local_adjust/export_crop）も OFF→ON バックフィルを持たず同じ穴**
+  であることを確認した（`sidecar_backup_enabled` 直書きも `backfill` ロジックも存在しない）。本計画の
+  既定方針「既存が同じ穴を持つなら挙動に合わせる」に従い siblings に揃える。comic だけ独自バックフィルを
+  足すと挙動が非対称になり保守性を損なうため。**統一バックフィル（全サブシステム共通の OFF→ON 再保存）は
+  将来の横断課題**として別途扱う（mIV 全体の改善）。それまではユーザーが OFF→ON 後に同フォルダを移動する
+  前に各ページを一度開く/再保存すれば dat が最新化される。
 
 ### 6.4 ユーザー画像スタンプの持ち運び（D9 / P1 対応）
 - `StampSource::File(PathBuf)` は JSON 化できるが、フォルダ移動・別マシンで**画像が見つからなくなる**
@@ -323,12 +327,24 @@ master に対して再確認する**（このスナップショットに固定�
     揃え、worker 化は **Inc 4+ の実コンテンツ（多オブジェクト）で実測してから必要に応じて**入れる（§10 / §11 更新）。
     `bake+composite+upload` の計測ログを `ensure_comic_composite_texture` に計装済み。
   - 残（Inc 2 以降）: 実データ読み込み（デモ撤去）、編集モード、座標逆写像（編集時、§5.3）。
-- **Inc 2: 永続化**
-  - `comic.db` 読み書き（スキーマ版数）＋ `mimageviewer.dat` ミラー（バックアップ ON 時、OFF→ON
-    バックフィル §6.3）。`page_path_key` で通常/ZIP/PDF。
-  - 受け入れ: 保存→再起動→復元。ZIP/PDF 内画像でも。バックアップ OFF 時は dat を触らない。
-    フォルダ移動で保持。Image/ZipImage/ネスト ZIP/PdfPage/移動 import の受け入れテスト。補正レイヤー
-    dual-write の実機確認（§6.5）。
+- **Inc 2: 永続化** — ✅ **完了（2026-06-05）**
+  - ✅ **2a comic.db**（正本）: `src/comic_db.rs`（`comic_entries(page_path PK, doc_version, doc_json)` +
+    `PRAGMA user_version`、get/set/delete/raw、壊れ JSON→空+ログ、単体 7 本）。App 配線: 起動時 open /
+    `comic_docs`（page_path_key 別メモリキャッシュ、idx remap 非依存）/ ensure_comic_doc_loaded（1 度だけ
+    DB 引く）/ save_comic_objects。デモは「注釈無し画像へ seed して comic.db 保存」= round-trip 検証用に。
+  - ✅ **2b サイドカーミラー**: `SidecarEntry.comic`（`Vec<AnnotationObject>`）+ set/remove_comic、
+    `import_to_dbs` に comic_db 分岐（中央に無い時だけ import）、save_comic_objects から `with_sidecar_mut`
+    でミラー（「設定のバックアップ」ON 時のみ）。`page_path_key` で Image/ZipImage/PdfPage 共通。
+    import round-trip テスト追加。
+  - ✅ Codex P2 対応: 壊れ/将来非互換の既存行をデモ seed で上書きしない（get_raw で行存在確認）。
+  - 受け入れ: 単体/統合テスト緑（comic_db 7・sidecar import round-trip）。round-trip（デモ seed→再起動→
+    comic.db ロードで再現）。バックアップ ON 時のみ dat 書き込み。**実機での保存→再起動→復元と ZIP/PDF・
+    フォルダ移動の最終目視はユーザー確認待ち**。
+  - **OFF→ON バックフィル（§6.3）は見送り**: 既存 conceal/mask/local_adjust も未実装で同じ穴を持つため、
+    siblings に揃える（§6.3 更新）。統一バックフィルは将来の横断課題。
+  - **Codex P3 フォローアップ（未対応・低リスク）**: ①comic.db の transient DB エラーも空キャッシュに潰れて
+    再試行されない（no-row/壊れ JSON は意図的キャッシュ、DB エラーだけ区別する案）②`comic_docs` が
+    セッション中無制限増加（小さい文字列。LRU/空エントリ prune 案）。Inc 8 仕上げで検討。
 - **Inc 3: 編集モード骨格 ＋ IME**
   - 「テキスト」モード enter/exit、キャンバス入力捕捉、回転下の逆写像（D8）、選択・移動、IME 安全な
     Enter/Escape ゲート。
