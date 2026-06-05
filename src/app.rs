@@ -3872,6 +3872,12 @@ pub struct App {
     /// だけ 1 度ロードを試みる。本格的なフォント管理は Inc 4b。
     pub(crate) comic_fonts: Option<Arc<comic_core::FontSet>>,
     pub(crate) comic_fonts_loaded: bool,
+    /// スタンプ画像のデコードキャッシュ (`stamp_source_key` → 512px straight-alpha
+    /// `RgbaOverlay`)。絵文字 SVG / ユーザー画像を 1 度だけデコードし、各ベイクで
+    /// id→Arc の `StampImages` を組み立てる際に再利用する (Inc 4c)。`None` =
+    /// デコード失敗 (ベイカがプレースホルダを描く)。ソースキーは安定なので無効化不要。
+    pub(crate) comic_stamp_cache:
+        std::collections::HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>,
     /// Inc 1 のデモフィクスチャを出すか (環境変数 `MIV_COMIC_DEMO=1` で有効)。
     /// 通常閲覧を壊さないため既定 OFF。Inc 2 では「注釈が無い画像にデモをシードして
     /// comic.db へ保存する」開発用シードのトリガも兼ねる (round-trip 検証用)。
@@ -4989,6 +4995,7 @@ impl App {
             comic_generation: 0,
             comic_fonts: None,
             comic_fonts_loaded: false,
+            comic_stamp_cache: std::collections::HashMap::new(),
             comic_demo_enabled: std::env::var("MIV_COMIC_DEMO")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
@@ -20701,6 +20708,35 @@ impl App {
     /// 回転は paint-time の `draw_rotated_image_ex` が下地と一緒に掛けるので、ここでは
     /// canonical (非回転) のまま焼く (D8)。Inc 1 は同期ベイク (conceal と同流儀)。重い
     /// 場合の worker 化 + 1 フレ 1 枚律速は Inc 1-c (§10)。
+    /// 与えられたオブジェクト集合からスタンプの `StampImages` (id → `Arc<RgbaOverlay>`) を
+    /// 組み立てる (Inc 4c)。各ソースは `comic_stamp_cache` 経由で 1 度だけデコードし、
+    /// 同じ絵文字/ファイルを使う複数オブジェクトは Arc を共有する。デコード失敗した
+    /// スタンプは map に入れない (= ベイカが `draw_stamp_placeholder` を描く)。
+    ///
+    /// id は `scale_scene` でも保たれ、ソースはスケール非依存 (デコードは 512px ネイティブ、
+    /// ベイカが canvas サイズへバイリニア縮小する) なので、元/スケール後どちらの集合から
+    /// 組み立てても同じ map になる。
+    fn build_stamp_images(
+        &mut self,
+        objects: &[comic_core::AnnotationObject],
+    ) -> comic_core::StampImages {
+        use comic_core::AnnotationKind;
+        let mut images = comic_core::StampImages::new();
+        for o in objects {
+            let AnnotationKind::Stamp(stamp) = &o.kind else {
+                continue;
+            };
+            let key = crate::comic_stamp::stamp_source_key(&stamp.source);
+            let entry = self.comic_stamp_cache.entry(key).or_insert_with(|| {
+                crate::comic_stamp::load_stamp_image(&stamp.source).map(Arc::new)
+            });
+            if let Some(img) = entry {
+                images.insert(o.id, Arc::clone(img));
+            }
+        }
+        images
+    }
+
     pub(crate) fn ensure_comic_composite_texture(
         &mut self,
         ctx: &egui::Context,
@@ -20794,7 +20830,9 @@ impl App {
         } else {
             objects.clone()
         };
-        let overlay = comic_core::bake_overlay(&scaled_objects, w, h, &fonts);
+        let stamp_images = self.build_stamp_images(&scaled_objects);
+        let overlay =
+            comic_core::bake_overlay_with_stamps(&scaled_objects, w, h, &fonts, &stamp_images);
         let composed = Arc::new(crate::comic_overlay::composite_overlay_over(
             &base, &overlay,
         ));
@@ -20868,7 +20906,8 @@ impl App {
         } else {
             objects
         };
-        let overlay = comic_core::bake_overlay(&scaled, w, h, &fonts);
+        let stamp_images = self.build_stamp_images(&scaled);
+        let overlay = comic_core::bake_overlay_with_stamps(&scaled, w, h, &fonts, &stamp_images);
         Some(Arc::new(crate::comic_overlay::composite_overlay_over(
             &base, &overlay,
         )))
