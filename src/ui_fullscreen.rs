@@ -773,6 +773,10 @@ impl App {
         idx: usize,
         include_thumb: bool,
     ) -> Option<egui::TextureHandle> {
+        // comic 注釈は最前面 (D1)。holdover / display-tex 解決でも最優先で拾う。
+        if let Some(tex) = self.current_comic_composite_texture(idx) {
+            return Some(tex);
+        }
         if let Some(tex) = self.current_final_composite_texture(idx) {
             return Some(tex);
         }
@@ -1010,6 +1014,12 @@ impl App {
             return self.resolve_fs_pre_overlay_texture(idx);
         }
 
+        // comic (テキスト注釈) は最前面 = パイプライン最終段 (D1)。注釈が無ければ
+        // None なので素の final composite にフォールバック (非注釈画像はゼロ
+        // オーバーヘッド・退行なし)。
+        if let Some(comic) = self.ensure_comic_composite_texture(ctx, idx) {
+            return Some(comic);
+        }
         self.ensure_final_composite_texture(ctx, idx)
             .or_else(|| self.resolve_fs_pre_overlay_texture(idx))
     }

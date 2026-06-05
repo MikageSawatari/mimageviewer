@@ -1704,6 +1704,28 @@ pub(crate) struct ConcealCacheEntry {
     pub generation: u64,
 }
 
+/// テキスト注釈 (comic) を最終 composite の上に焼き込んだ結果のキャッシュ
+/// (Inc 1、`docs/comic-integration-plan.md` D1 最前面 / §5.2 合成経路)。
+///
+/// `ensure_final_composite_pixels` (canonical ソース解像度・post-filter 後) を下地に、
+/// 注釈を S=1 で焼いて src-over 合成したもの。回転は paint-time が下地と一緒に掛ける
+/// (D8) ので、ここには非回転の canonical テクスチャが入る。
+pub(crate) struct ComicCacheEntry {
+    /// 合成済み RGBA (canonical 解像度)。Inc 7 の Ctrl+E 焼き込み出力で再利用するため
+    /// 保持する (表示と出力で経路を共有、§5.2)。現状の描画パスでは texture のみ使用。
+    #[allow(dead_code)]
+    pub pixels: Arc<egui::ColorImage>,
+    pub texture: egui::TextureHandle,
+    /// 下地 final composite pixels の Arc ポインタ identity。下地が作り直されると変わる
+    /// ので再ベイクのトリガになる (crop/色/AI/post-filter 変更を 1 つで捕捉)。ABA 回避の
+    /// ため、`comic_cache` は下地 (`final_composite_cache`) の clear 時に必ず連動破棄する。
+    pub base_ptr: usize,
+    /// `comic_generation` のスナップショット (注釈編集で進む。Inc 2 以降)。
+    pub comic_gen: u64,
+    /// 焼いた解像度 (下地寸法)。防御用。
+    pub dims: [usize; 2],
+}
+
 /// 消しゴムプレビュー (= preview ボタン押下時の MI-GAN 結果) を保持する一時キャッシュ。
 ///
 /// `fs_cache` を書き換えない隔離設計 (Codex P1 R4 #1)。プレビュー中だけ表示
@@ -3802,6 +3824,22 @@ pub struct App {
     /// `conceal_cache` の各 entry はこの値と照合され、不一致なら miss 扱い。
     pub(crate) conceal_generation: u64,
 
+    // ── テキスト注釈 (comic) オーバーレイ (Inc 1) ─────────────────
+    /// 注釈を最終 composite の上に焼き込んだ結果のキャッシュ (idx-keyed)。表示パイプ
+    /// ラインの最終段 = 最前面 (D1)。`final_composite_cache` の clear に連動して破棄する
+    /// (`clear_final_pipeline_caches_for_idx` / `clear_all_final_pipeline_caches`)。
+    pub(crate) comic_cache: std::collections::HashMap<usize, ComicCacheEntry>,
+    /// 注釈編集の世代番号 (Inc 2 以降で編集確定ごとに +1)。`comic_cache` の各 entry は
+    /// この値と照合され、不一致なら miss 扱い (conceal_generation と同じ lazy eviction)。
+    pub(crate) comic_generation: u64,
+    /// 注釈描画用フォントセット (遅延ロード、Arc 共有)。`comic_fonts_loaded` が false の間
+    /// だけ 1 度ロードを試みる。本格的なフォント管理は Inc 4b。
+    pub(crate) comic_fonts: Option<Arc<comic_core::FontSet>>,
+    pub(crate) comic_fonts_loaded: bool,
+    /// Inc 1 のデモフィクスチャを出すか (環境変数 `MIV_COMIC_DEMO=1` で有効)。
+    /// 通常閲覧を壊さないため既定 OFF。Inc 2 で comic.db 読み込みに置換する暫定ゲート。
+    pub(crate) comic_demo_enabled: bool,
+
     // ── フルスクリーン Ctrl+↑↓ ナビロック ─────────────────────────
     /// ナビ中の「次のページがまだ表示できない」ガード。`Some(gen)` の間は
     /// 新たな Ctrl+↑↓ 入力を無視し、`fs_holdover_tex` を画面に出し続ける。
@@ -4875,6 +4913,13 @@ impl App {
             conceal_mask_generation: std::collections::HashMap::new(),
             conceal_cache: std::collections::HashMap::new(),
             conceal_generation: 0,
+            comic_cache: std::collections::HashMap::new(),
+            comic_generation: 0,
+            comic_fonts: None,
+            comic_fonts_loaded: false,
+            comic_demo_enabled: std::env::var("MIV_COMIC_DEMO")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
             erase_preview_active: false,
             conceal_preview_active: false,
             erase_base_tex_cache: std::collections::HashMap::new(),
@@ -10021,6 +10066,7 @@ impl App {
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
         self.conceal_cache.clear();
+        self.comic_cache.clear();
         self.fs_early_dims.clear();
         self.fs_cache.clear();
         self.fs_upload_backlog.clear();
@@ -16021,6 +16067,7 @@ impl App {
             self.clear_erase_result_caches_for_idx(*idx);
             self.conceal_base_cache.remove(idx);
             self.conceal_cache.remove(idx);
+            self.comic_cache.remove(idx);
             self.save_mask_raw_with_sidecar(
                 *idx,
                 &compressed,
@@ -17572,6 +17619,7 @@ impl App {
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
         self.conceal_cache.clear();
+        self.comic_cache.clear();
         self.erase_result_cache.clear();
         self.edit_result_cache.clear();
         self.clear_all_final_pipeline_caches();
@@ -19067,6 +19115,8 @@ impl App {
         self.final_ai_failed.retain(|key| key.edit_key.idx != idx);
         self.final_composite_cache
             .retain(|key, _| key.edit_key.idx != idx);
+        // comic は final composite を下地にするので連動破棄 (base_ptr の ABA 回避)。
+        self.comic_cache.remove(&idx);
     }
 
     fn clear_all_final_pipeline_caches(&mut self) {
@@ -19077,6 +19127,7 @@ impl App {
         self.final_ai_cache.clear();
         self.final_ai_failed.clear();
         self.final_composite_cache.clear();
+        self.comic_cache.clear();
     }
 
     /// 補正レイヤーが変わったことを idx 単位の世代で表す。
@@ -19566,6 +19617,7 @@ impl App {
     /// **その 1 ページだけ** 入力が変わった場合に呼ぶ。
     pub(crate) fn clear_conceal_caches(&mut self, idx: usize) {
         self.conceal_cache.remove(&idx);
+        self.comic_cache.remove(&idx);
         self.clear_edit_result_caches_for_idx(idx);
     }
 
@@ -19689,6 +19741,7 @@ impl App {
         self.local_adjust_prefix_preview_cache.clear();
         self.erase_preview_cache.clear();
         self.conceal_cache.clear();
+        self.comic_cache.clear();
         self.edit_result_cache.clear();
         self.clear_all_final_pipeline_caches();
     }
@@ -20450,6 +20503,100 @@ impl App {
             .iter()
             .find(|(key, _)| key.edit_key.idx == idx)
             .map(|(_, entry)| entry.texture.clone())
+    }
+
+    // ── テキスト注釈 (comic) オーバーレイ (Inc 1、最前面 D1) ─────────────
+
+    /// この画像 (idx) に適用する注釈オブジェクト列。Inc 1 は環境変数ゲートのデモ
+    /// フィクスチャを返すだけ。Inc 2 で `comic.db` (page_path_key) 読み込みに置換する。
+    fn comic_objects_for_idx(
+        &self,
+        _idx: usize,
+        w: usize,
+        h: usize,
+    ) -> Vec<comic_core::AnnotationObject> {
+        if self.comic_demo_enabled {
+            crate::comic_overlay::demo_objects(w, h)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 注釈描画用フォントセットを遅延ロードして返す (1 度だけ試行)。フォントが見つから
+    /// なければ `None` (= テキストを焼けないので comic 合成自体をスキップ)。本格的な
+    /// フォント列挙・選択は Inc 4b。
+    fn ensure_comic_fonts(&mut self) -> Option<Arc<comic_core::FontSet>> {
+        if !self.comic_fonts_loaded {
+            self.comic_fonts_loaded = true;
+            self.comic_fonts = crate::comic_overlay::load_comic_fonts().map(Arc::new);
+            if self.comic_fonts.is_none() {
+                crate::logger::log(
+                    "[comic] 注釈描画用の日本語フォントが見つかりませんでした".to_string(),
+                );
+            }
+        }
+        self.comic_fonts.clone()
+    }
+
+    /// 最終 composite (canonical ソース解像度・post-filter 後) の上に注釈を S=1 で焼いて
+    /// src-over 合成したテクスチャを返す (最前面 D1、§5.2 経路)。注釈が無い画像では
+    /// `None` を返し、呼び出し側は素の final composite にフォールバックする (= 非注釈
+    /// 画像はゼロオーバーヘッド・退行なし)。
+    ///
+    /// 回転は paint-time の `draw_rotated_image_ex` が下地と一緒に掛けるので、ここでは
+    /// canonical (非回転) のまま焼く (D8)。Inc 1 は同期ベイク (conceal と同流儀)。重い
+    /// 場合の worker 化 + 1 フレ 1 枚律速は Inc 1-c (§10)。
+    pub(crate) fn ensure_comic_composite_texture(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        // 下地は AI 完了済み (complete) の最終 composite。AI 待ちの間は None が返るので
+        // comic はまだ出ない (= comic は AI より後段、正しい)。
+        let base = self.ensure_final_composite_pixels(ctx, idx)?;
+        let [w, h] = base.size;
+        let objects = self.comic_objects_for_idx(idx, w, h);
+        if objects.is_empty() {
+            return None;
+        }
+        let base_ptr = Arc::as_ptr(&base) as usize;
+        let comic_gen = self.comic_generation;
+        if let Some(entry) = self.comic_cache.get(&idx) {
+            if entry.base_ptr == base_ptr && entry.comic_gen == comic_gen && entry.dims == [w, h] {
+                return Some(entry.texture.clone());
+            }
+        }
+        let fonts = self.ensure_comic_fonts()?;
+        let overlay = comic_core::bake_overlay(&objects, w, h, &fonts);
+        let composed = Arc::new(crate::comic_overlay::composite_overlay_over(
+            &base, &overlay,
+        ));
+        let upload = clamp_for_gpu(&composed);
+        let texture = ctx.load_texture(
+            format!("comic_{idx}_{base_ptr}_{comic_gen}"),
+            upload.into_owned(),
+            egui::TextureOptions::LINEAR,
+        );
+        self.comic_cache.insert(
+            idx,
+            ComicCacheEntry {
+                pixels: composed,
+                texture: texture.clone(),
+                base_ptr,
+                comic_gen,
+                dims: [w, h],
+            },
+        );
+        Some(texture)
+    }
+
+    /// `comic_cache` の現エントリのテクスチャを副作用なしで返す (holdover / display-tex
+    /// 解決用)。世代照合はしない (= `current_final_composite_texture` と同じ best-effort)。
+    pub(crate) fn current_comic_composite_texture(
+        &self,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        self.comic_cache.get(&idx).map(|e| e.texture.clone())
     }
 
     pub(crate) fn poll_final_ai(&mut self, ctx: &egui::Context) {
