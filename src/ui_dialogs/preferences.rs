@@ -223,6 +223,18 @@ pub(crate) struct PreferencesState {
     pub auto_thread_count: usize,
     pub vram_mib: Option<u64>,
 
+    // ── 動画ページ用の一時状態 ─────────────────────────────────
+    /// `audio_normalize.db` を開けているか。開けていない場合は削除ボタンを出さない。
+    pub audio_normalize_db_available: bool,
+    /// 環境設定を開いた時点 / 削除後の音量ノーマライズ測定値件数。
+    pub audio_normalize_entry_count: usize,
+    /// 音量ノーマライズ測定値削除の確認ダイアログ表示中フラグ。
+    pub audio_normalize_clear_confirm_open: bool,
+    /// 確認ダイアログで削除が確定されたことを App 側へ伝える one-shot フラグ。
+    pub audio_normalize_clear_requested: bool,
+    /// 直近の音量ノーマライズ測定値削除結果。
+    pub audio_normalize_clear_result: Option<String>,
+
     // ── AI バックエンド ページ用のキャッシュ ────────────────────
     /// プライマリ GPU のベンダー (NVIDIA でなければ TRT は disabled に)
     pub gpu_vendor: Option<crate::gpu_info::GpuVendor>,
@@ -306,6 +318,8 @@ impl PreferencesState {
     pub(crate) fn from_settings(
         s: &Settings,
         ai_runtime: Option<&crate::ai::runtime::AiRuntime>,
+        audio_normalize_db_available: bool,
+        audio_normalize_entry_count: usize,
     ) -> Self {
         let manual_threads = match &s.parallelism {
             Parallelism::Manual(n) => *n,
@@ -379,6 +393,11 @@ impl PreferencesState {
             exif_scroll_to_added: None,
             auto_thread_count,
             vram_mib: crate::gpu_info::query_vram_summary_mib(),
+            audio_normalize_db_available,
+            audio_normalize_entry_count,
+            audio_normalize_clear_confirm_open: false,
+            audio_normalize_clear_requested: false,
+            audio_normalize_clear_result: None,
             gpu_vendor,
             trt_worker_active,
             current_runtime_fallback_reason,
@@ -452,8 +471,15 @@ impl App {
         // 初回: 一時コピーを作成
         if self.pref_state.is_none() {
             #[cfg_attr(not(windows), allow(unused_mut))]
-            let mut new_state =
-                PreferencesState::from_settings(&self.settings, self.ai_runtime.as_deref());
+            let mut new_state = PreferencesState::from_settings(
+                &self.settings,
+                self.ai_runtime.as_deref(),
+                self.audio_normalize_db.is_some(),
+                self.audio_normalize_db
+                    .as_ref()
+                    .map(|db| db.count())
+                    .unwrap_or(0),
+            );
             // 既にスキャン済みの VST3 プラグイン候補を引き継ぐ (= 再スキャン不要で表示)
             #[cfg(windows)]
             {
@@ -723,6 +749,44 @@ impl App {
         } else if cancel || !open {
             self.pref_state = None;
             self.show_preferences = false;
+        }
+
+        let mut clear_audio_normalize_requested = false;
+        if let Some(ps) = self.pref_state.as_mut() {
+            if ps.audio_normalize_clear_requested {
+                ps.audio_normalize_clear_requested = false;
+                clear_audio_normalize_requested = true;
+            }
+        }
+        if clear_audio_normalize_requested {
+            let result = match self.audio_normalize_db.as_ref() {
+                Some(db) => match db.clear_all() {
+                    Ok(deleted) => {
+                        let remaining = db.count();
+                        crate::logger::log(format!(
+                            "[audio_normalize] cleared {deleted} cached measurements"
+                        ));
+                        Ok((deleted, remaining))
+                    }
+                    Err(e) => Err(format!("{e}")),
+                },
+                None => Err("音量ノーマライズ測定値 DB を開けませんでした".to_string()),
+            };
+
+            if let Some(ps) = self.pref_state.as_mut() {
+                match result {
+                    Ok((deleted, remaining)) => {
+                        ps.audio_normalize_entry_count = remaining;
+                        ps.audio_normalize_clear_result = Some(format!(
+                            "音量ノーマライズ測定値を {deleted} 件削除しました。"
+                        ));
+                    }
+                    Err(err) => {
+                        ps.audio_normalize_clear_result =
+                            Some(format!("音量ノーマライズ測定値の削除に失敗しました: {err}"));
+                    }
+                }
+            }
         }
 
         // 「TensorRT パックをダウンロード」ボタンが押されていたら、環境設定ダイアログを

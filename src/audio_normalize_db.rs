@@ -200,4 +200,24 @@ mod tests {
         // 異なる target なら別エントリ扱い (DB 主キーに含まれるため)
         assert!(db.lookup(&path, -16000).is_none());
     }
+
+    #[test]
+    fn clear_all_removes_cached_measurements() {
+        let (db, dir) = temp_db();
+        let first = dir.path().join("first.mp4");
+        let second = dir.path().join("second.mp4");
+        std::fs::write(&first, b"first").expect("write first");
+        std::fs::write(&second, b"second").expect("write second");
+
+        db.upsert(&first, &sample_result(-14000))
+            .expect("upsert first");
+        db.upsert(&second, &sample_result(-14000))
+            .expect("upsert second");
+        assert_eq!(db.count(), 2);
+
+        assert_eq!(db.clear_all().expect("clear_all"), 2);
+        assert_eq!(db.count(), 0);
+        assert!(db.lookup(&first, -14000).is_none());
+        assert!(db.lookup(&second, -14000).is_none());
+    }
 }

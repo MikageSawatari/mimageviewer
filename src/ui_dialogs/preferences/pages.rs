@@ -1156,120 +1156,198 @@ pub(super) fn page_update_check(ui: &mut egui::Ui, state: &mut PreferencesState)
 }
 
 pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
-    let s = &mut state.settings;
+    {
+        let s = &mut state.settings;
 
-    ui.label(egui::RichText::new("ハードウェアデコード").strong());
-    ui.add_space(4.0);
-    ui.label(
-        "GPU の動画デコード機能 (Direct3D 11) を使って HEVC / 4K 動画の CPU 負荷を下げます。\n\
+        ui.label(egui::RichText::new("ハードウェアデコード").strong());
+        ui.add_space(4.0);
+        ui.label(
+            "GPU の動画デコード機能 (Direct3D 11) を使って HEVC / 4K 動画の CPU 負荷を下げます。\n\
          D3D11VA 非対応のコーデックは CPU デコードで再生し、対応コーデックの初期化失敗はエラーとして表示します。",
-    );
-    ui.add_space(6.0);
-    ui.checkbox(&mut s.video_hw_decode, "ハードウェアデコードを有効にする")
-        .on_hover_text(
-            "ON (既定): 対応コーデックは GPU でデコード。D3D11VA 非対応コーデックは CPU でデコード。\n\
+        );
+        ui.add_space(6.0);
+        ui.checkbox(&mut s.video_hw_decode, "ハードウェアデコードを有効にする")
+            .on_hover_text(
+                "ON (既定): 対応コーデックは GPU でデコード。D3D11VA 非対応コーデックは CPU でデコード。\n\
          OFF: 常に CPU でデコード。\n\
          切り替え後は次に開く動画から反映されます。",
+            );
+
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("デインターレース").strong());
+        ui.add_space(4.0);
+        ui.label(
+            "インターレース動画の横縞ノイズを、FFmpeg の bwdif フィルタで表示前に補正します。",
         );
-
-    ui.add_space(12.0);
-    ui.label(egui::RichText::new("デインターレース").strong());
-    ui.add_space(4.0);
-    ui.label("インターレース動画の横縞ノイズを、FFmpeg の bwdif フィルタで表示前に補正します。");
-    ui.add_space(6.0);
-    egui::ComboBox::from_label("デインターレース")
-        .selected_text(s.video_deinterlace.label())
-        .show_ui(ui, |ui| {
-            for &mode in crate::settings::VideoDeinterlaceMode::all() {
-                ui.selectable_value(&mut s.video_deinterlace, mode, mode.label());
-            }
-        });
-    ui.label(
-        egui::RichText::new("自動: インターレースとしてデコードされたフレームだけ補正。切り替え後は次に開く動画から反映されます。")
-            .small(),
-    );
-
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(8.0);
-
-    ui.label(egui::RichText::new("再生").strong());
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label("ループ再生:");
-        let mut current = s.video_loop_mode;
-        egui::ComboBox::from_id_salt("video_loop_mode")
-            .selected_text(current.label())
+        ui.add_space(6.0);
+        egui::ComboBox::from_label("デインターレース")
+            .selected_text(s.video_deinterlace.label())
             .show_ui(ui, |ui| {
-                for mode in crate::settings::VideoLoopMode::all() {
-                    ui.selectable_value(&mut current, *mode, mode.label());
+                for &mode in crate::settings::VideoDeinterlaceMode::all() {
+                    ui.selectable_value(&mut s.video_deinterlace, mode, mode.label());
                 }
             });
-        if current != s.video_loop_mode {
-            s.video_loop_mode = current;
-            // 旧 bool 設定も新モードと矛盾しないよう同期 (古いコード誤読対策)。
-            s.video_loop = !matches!(current, crate::settings::VideoLoopMode::Off);
-        }
-    });
-    ui.checkbox(&mut s.video_start_muted, "起動直後はミュートで開始");
-
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        let mut vol_pos = crate::settings::video_volume_linear_to_fader_pos(s.video_volume);
-        let response = ui.add(
-            egui::Slider::new(&mut vol_pos, 0.0..=1.0)
-                .text("既定音量")
-                .show_value(false)
-                .clamping(egui::SliderClamping::Always),
+        ui.label(
+            egui::RichText::new("自動: インターレースとしてデコードされたフレームだけ補正。切り替え後は次に開く動画から反映されます。")
+                .small(),
         );
-        if response.changed() {
-            s.video_volume = crate::settings::video_volume_fader_pos_to_linear(vol_pos);
-        }
-        ui.label(crate::settings::format_video_volume_db(s.video_volume));
-    });
 
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(8.0);
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
 
-    ui.label(egui::RichText::new("レジューム再生").strong());
-    ui.add_space(4.0);
-    ui.checkbox(
-        &mut s.video_grid_open_starts_from_beginning,
-        "一覧から開いたときは最初から再生する",
-    )
-    .on_hover_text(
-        "ON: サムネイル一覧からダブルクリック / Enter で開いた動画は、保存済み再生位置があっても先頭から再生します。\n\
+        ui.label(egui::RichText::new("再生").strong());
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("ループ再生:");
+            let mut current = s.video_loop_mode;
+            egui::ComboBox::from_id_salt("video_loop_mode")
+                .selected_text(current.label())
+                .show_ui(ui, |ui| {
+                    for mode in crate::settings::VideoLoopMode::all() {
+                        ui.selectable_value(&mut current, *mode, mode.label());
+                    }
+                });
+            if current != s.video_loop_mode {
+                s.video_loop_mode = current;
+                // 旧 bool 設定も新モードと矛盾しないよう同期 (古いコード誤読対策)。
+                s.video_loop = !matches!(current, crate::settings::VideoLoopMode::Off);
+            }
+        });
+        ui.checkbox(&mut s.video_start_muted, "起動直後はミュートで開始");
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let mut vol_pos = crate::settings::video_volume_linear_to_fader_pos(s.video_volume);
+            let response = ui.add(
+                egui::Slider::new(&mut vol_pos, 0.0..=1.0)
+                    .text("既定音量")
+                    .show_value(false)
+                    .clamping(egui::SliderClamping::Always),
+            );
+            if response.changed() {
+                s.video_volume = crate::settings::video_volume_fader_pos_to_linear(vol_pos);
+            }
+            ui.label(crate::settings::format_video_volume_db(s.video_volume));
+        });
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        ui.label(egui::RichText::new("レジューム再生").strong());
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut s.video_grid_open_starts_from_beginning,
+            "一覧から開いたときは最初から再生する",
+        )
+        .on_hover_text(
+            "ON: サムネイル一覧からダブルクリック / Enter で開いた動画は、保存済み再生位置があっても先頭から再生します。\n\
          ホイール / ↑↓ などフルスクリーン中の動画移動では、従来どおり保存済み位置から再開します。",
-    );
-    ui.add_space(6.0);
-    let count = s.video_resume_positions.len();
-    ui.label(format!(
-        "現在 {count} 件の動画について再生位置を記憶しています。\n\
+        );
+        ui.add_space(6.0);
+        let count = s.video_resume_positions.len();
+        ui.label(format!(
+            "現在 {count} 件の動画について再生位置を記憶しています。\n\
          3 秒以上再生・かつ末尾 5 秒以内に到達していない場合のみ保存されます。"
-    ));
-    if count > 0 && ui.button("すべての再生位置をクリア").clicked() {
-        s.video_resume_positions.clear();
+        ));
+        if count > 0 && ui.button("すべての再生位置をクリア").clicked() {
+            s.video_resume_positions.clear();
+        }
     }
 
+    draw_audio_normalize_cache_controls(ui, state);
+
     ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
 
-    ui.label(egui::RichText::new("グリッドサムネイル").strong());
-    ui.add_space(4.0);
-    ui.checkbox(
-        &mut s.video_thumb_use_sidecar_image,
-        "同名ファイル名の画像があれば動画サムネに優先採用",
-    )
-    .on_hover_text(
-        "例: movie.mp4 の隣に movie.jpg があれば、それをサムネに使う。\n\
+    {
+        let s = &mut state.settings;
+        ui.label(egui::RichText::new("グリッドサムネイル").strong());
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut s.video_thumb_use_sidecar_image,
+            "同名ファイル名の画像があれば動画サムネに優先採用",
+        )
+        .on_hover_text(
+            "例: movie.mp4 の隣に movie.jpg があれば、それをサムネに使う。\n\
          OFF にすると Windows 標準のサムネのみ採用 (= 既定動作)。\n\
          ピン留めしたフレーム (今後実装予定) は本設定に関わらず常に最優先。",
-    );
+        );
+    }
 
     // VST3 プラグイン処理は専用ページ "VST3 プラグイン" に分離した (= ユーザー要望
     // 「環境設定の中に新しい項目」)。動画タブには出さない。
+}
+
+fn draw_audio_normalize_cache_controls(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("音量ノーマライズ測定値").strong());
+    ui.add_space(4.0);
+
+    if state.audio_normalize_db_available {
+        ui.label(format!(
+            "現在 {} 件の動画について音量ノーマライズ測定値を保存しています。",
+            state.audio_normalize_entry_count
+        ));
+        ui.label(
+            egui::RichText::new("削除しても、現在再生中に適用済みの音量はその場では変更しません。")
+                .small()
+                .weak(),
+        );
+        ui.add_space(4.0);
+        if ui
+            .add_enabled(
+                state.audio_normalize_entry_count > 0,
+                egui::Button::new("すべての音量ノーマライズ測定値をクリア"),
+            )
+            .clicked()
+        {
+            state.audio_normalize_clear_result = None;
+            state.audio_normalize_clear_confirm_open = true;
+        }
+    } else {
+        ui.label(
+            egui::RichText::new("音量ノーマライズ測定値 DB を開けませんでした。")
+                .small()
+                .weak(),
+        );
+    }
+
+    if let Some(msg) = state.audio_normalize_clear_result.as_deref() {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(msg).small());
+    }
+
+    if state.audio_normalize_clear_confirm_open {
+        let mut open = true;
+        let entry_count = state.audio_normalize_entry_count;
+        egui::Window::new("音量ノーマライズ測定値のクリア")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "保存済みの音量ノーマライズ測定値 ({entry_count} 件) をすべて削除しますか？"
+                ));
+                ui.label("次回以降、必要な動画は再スキャンされます。");
+                ui.label("この操作は元に戻せません。");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("クリア").clicked() {
+                        state.audio_normalize_clear_requested = true;
+                        state.audio_normalize_clear_confirm_open = false;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        state.audio_normalize_clear_confirm_open = false;
+                    }
+                });
+            });
+        if !open {
+            state.audio_normalize_clear_confirm_open = false;
+        }
+    }
 }
 
 /// VST3 プラグイン専用ページ (= 環境設定 ツリーの "VST3 プラグイン" カテゴリ)。
