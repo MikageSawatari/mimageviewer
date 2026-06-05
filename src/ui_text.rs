@@ -21,18 +21,20 @@
 //! 変形ハンドル (四隅スケール / 回転ノブ / しっぽ) と Undo/Redo は Inc 6、スタンプ
 //! ピッカー (絵文字アセット) は Inc 4c、プリセット / 追加ダイアログは Inc 5。
 
-use crate::app::{App, TextDrag};
+use crate::app::{App, TextDrag, TextDragKind};
 use crate::ui_fullscreen::{FsKeyAction, SpreadPair};
 use comic_core::{
     AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, FillMode, FontSet, FrameStyle,
-    MessageWindowObject, Orientation, Rgba, StampObject, StrokeStyle, TailKind, TextAlign,
-    TextBlock, WindowPosition,
+    MessageWindowObject, Orientation, Rgba, SizeMode, StampObject, StrokeStyle, TailKind,
+    TextAlign, TextBlock, WindowPosition,
 };
 
 /// パネル幅 (編集コントロールが入るので conceal より少し広い)。
 const PANEL_W: f32 = 268.0;
 const PANEL_MARGIN_X: f32 = 16.0;
 const PANEL_MARGIN_Y: f32 = 60.0;
+/// ハンドル (回転ノブ / 四隅 / しっぽ) の当たり判定半径 (画面 px)。ラボと同値。
+const HANDLE_R: f32 = 7.0;
 
 /// 選択枠の色 (環境依存グリフを使わない純描画)。
 fn sel_color() -> egui::Color32 {
@@ -54,6 +56,9 @@ pub(crate) struct TextImgView {
     free_rot: f32,
     sw: f32,
     sh: f32,
+    /// 画像 px → 画面 px の一様スケール (= fit * zoom)。回転ノブを画面上 28px 上に
+    /// 置くための画像空間オフセット (`28 / scale`) 計算に使う。
+    scale: f32,
 }
 
 /// `draw_rotated_image_ex` の UV 割り当てに対応する forward 写像
@@ -252,6 +257,328 @@ fn translate_object(o: &mut AnnotationObject, dx: f32, dy: f32) {
             t.tip.1 += dy;
         }
     }
+}
+
+// ── 変形ハンドル (回転 / サイズ / しっぽ) ─ ラボ `*_handle_points` 等を移植 ─────
+
+/// テキストのレイアウト寸法 (canonical px)。フォント未ロード時は控えめな既定。
+/// ラボ `ComicLab::text_layout_size` と同式。
+fn text_layout_size(t: &TextBlock, fonts: Option<&FontSet>) -> (f32, f32) {
+    fonts
+        .and_then(|f| f.get(&t.font_key))
+        .map(|font| {
+            let layout = comic_core::layout_text(t, font);
+            (layout.bounds.0.max(8.0), layout.bounds.1.max(8.0))
+        })
+        .unwrap_or((100.0, 40.0))
+}
+
+/// オブジェクトの回転中心 (canonical px)。単独テキストは pivot をレイアウト左上に
+/// 持つので中心を導出する。それ以外は pivot が視覚中心。ラボ `rotation_center` と同式。
+fn rotation_center(o: &AnnotationObject, fonts: Option<&FontSet>) -> (f32, f32) {
+    match &o.kind {
+        AnnotationKind::Text(t) => {
+            let (w, h) = text_layout_size(t, fonts);
+            (o.pivot.0 + w * 0.5, o.pivot.1 + h * 0.5)
+        }
+        _ => o.pivot,
+    }
+}
+
+/// オブジェクトの半径 (hw, hh) と回転中心 pivot を返す (ハンドル計算用)。
+/// ラボ `*_handle_points` の前半と同じ寸法取り。
+fn handle_half_extents(
+    o: &AnnotationObject,
+    fonts: Option<&FontSet>,
+) -> Option<((f32, f32), (f32, f32))> {
+    match &o.kind {
+        AnnotationKind::Bubble(b) => {
+            let fonts = fonts?;
+            let (hw, hh) = match comic_core::effective_bubble_shape(b, fonts) {
+                BubbleShape::Ellipse { rx, ry } => (rx, ry),
+                BubbleShape::RoundRect { half_w, half_h, .. } => (half_w, half_h),
+                BubbleShape::Burst { rx, ry, .. } => (rx, ry),
+                BubbleShape::Cloud { rx, ry, .. } => (rx, ry),
+                BubbleShape::Polygon { rx, ry, .. } => (rx, ry),
+                BubbleShape::Diamond { half_w, half_h } => (half_w, half_h),
+                BubbleShape::Heart { rx, ry } => (rx, ry),
+                BubbleShape::Arrow { half_w, half_h, .. } => (half_w, half_h),
+                BubbleShape::Soft { half_w, half_h, .. } => (half_w, half_h),
+                BubbleShape::MotionLines { rx, ry, .. } => (rx, ry),
+                BubbleShape::SpeedLines { half_w, half_h, .. } => (half_w, half_h),
+                BubbleShape::TextOnly { half_w, half_h } => (half_w, half_h),
+                BubbleShape::Concentration { rx, ry, .. } => (rx, ry),
+                BubbleShape::Strokes { half_w, half_h, .. } => (half_w, half_h),
+                BubbleShape::DoubleStroke { half_w, half_h, .. } => (half_w, half_h),
+            };
+            Some(((hw, hh), o.pivot))
+        }
+        AnnotationKind::MessageWindow(w) => {
+            let fonts = fonts?;
+            let (hw, hh) = comic_core::effective_window_half_extents(w, fonts);
+            Some(((hw, hh), o.pivot))
+        }
+        AnnotationKind::Stamp(s) => Some(((s.half_w, s.half_h), o.pivot)),
+        AnnotationKind::Text(t) => {
+            let (w, h) = text_layout_size(t, fonts);
+            let (hw, hh) = (w * 0.5, h * 0.5);
+            Some(((hw, hh), (o.pivot.0 + hw, o.pivot.1 + hh)))
+        }
+    }
+}
+
+/// 四隅 (TL,TR,BR,BL) と回転ノブの画像空間座標。`obj.rotation_rad` を反映する。
+/// 回転ノブは上端からズーム非依存で `28px` 上 (`offset_img = 28 / scale`)。
+/// ラボ `*_handle_points` と同式。
+fn handle_points(
+    o: &AnnotationObject,
+    fonts: Option<&FontSet>,
+    scale: f32,
+) -> Option<([(f32, f32); 4], (f32, f32))> {
+    let ((hw, hh), p) = handle_half_extents(o, fonts)?;
+    let (sin, cos) = o.rotation_rad.sin_cos();
+    let rot = |lx: f32, ly: f32| (p.0 + lx * cos - ly * sin, p.1 + lx * sin + ly * cos);
+    let corners = [rot(-hw, -hh), rot(hw, -hh), rot(hw, hh), rot(-hw, hh)];
+    let offset_img = 28.0 / scale.max(1e-3);
+    let rot_handle = rot(0.0, -(hh + offset_img));
+    Some((corners, rot_handle))
+}
+
+/// 吹き出しのしっぽハンドル (base, tip) の画像空間座標。回転を反映する。
+/// しっぽを描かない形状 / しっぽ無しなら None。
+fn tail_handle_points(
+    o: &AnnotationObject,
+    fonts: Option<&FontSet>,
+) -> Option<((f32, f32), (f32, f32))> {
+    let AnnotationKind::Bubble(b) = &o.kind else {
+        return None;
+    };
+    let fonts = fonts?;
+    let tail = b
+        .tail
+        .as_ref()
+        .filter(|_| comic_core::shape_renders_tail(&b.shape))?;
+    let eff = comic_core::effective_bubble_shape(b, fonts);
+    let rot = o.rotation_rad;
+    let base = rotate_about(
+        comic_core::resolve_tail_base(&eff, o.pivot, tail),
+        o.pivot,
+        rot,
+    );
+    let tip = rotate_about(tail.tip, o.pivot, rot);
+    Some((base, tip))
+}
+
+/// 吹き出し形状の半径を設定する (corner-resize 用)。ラボ `set_bubble_half_extents`。
+fn set_bubble_half_extents(b: &mut BubbleObject, hw: f32, hh: f32) {
+    match &mut b.shape {
+        BubbleShape::Ellipse { rx, ry }
+        | BubbleShape::Burst { rx, ry, .. }
+        | BubbleShape::Cloud { rx, ry, .. }
+        | BubbleShape::Polygon { rx, ry, .. }
+        | BubbleShape::Heart { rx, ry }
+        | BubbleShape::MotionLines { rx, ry, .. }
+        | BubbleShape::Concentration { rx, ry, .. } => {
+            *rx = hw;
+            *ry = hh;
+        }
+        BubbleShape::RoundRect { half_w, half_h, .. }
+        | BubbleShape::SpeedLines { half_w, half_h, .. }
+        | BubbleShape::Diamond { half_w, half_h }
+        | BubbleShape::Arrow { half_w, half_h, .. }
+        | BubbleShape::Soft { half_w, half_h, .. }
+        | BubbleShape::TextOnly { half_w, half_h }
+        | BubbleShape::Strokes { half_w, half_h, .. }
+        | BubbleShape::DoubleStroke { half_w, half_h, .. } => {
+            *half_w = hw;
+            *half_h = hh;
+        }
+    }
+}
+
+/// drag-start: 選択中オブジェクトのどのハンドルを掴んだかを判定する。
+/// 優先順: しっぽ先端 → しっぽ根元 → 回転ノブ → 四隅。いずれも当たらなければ None
+/// (呼び出し側で本体 hit-test → Move にフォールバックする)。ラボ `handle_canvas_input`
+/// の drag_started 分岐と同じ優先順。
+fn pick_handle(
+    o: &AnnotationObject,
+    ptr: egui::Pos2,
+    view: &TextImgView,
+    fonts: Option<&FontSet>,
+) -> Option<TextDragKind> {
+    let r = HANDLE_R + 4.0;
+    if let Some((base, tip)) = tail_handle_points(o, fonts) {
+        let tip_s = view.image_to_screen(tip.0, tip.1);
+        if (tip_s - ptr).length() <= r {
+            return Some(TextDragKind::TailTip);
+        }
+        let base_s = view.image_to_screen(base.0, base.1);
+        if (base_s - ptr).length() <= r {
+            return Some(TextDragKind::TailBase);
+        }
+    }
+    if let Some((corners, roth)) = handle_points(o, fonts, view.scale) {
+        let roth_s = view.image_to_screen(roth.0, roth.1);
+        if (roth_s - ptr).length() <= r {
+            return Some(TextDragKind::Rotate);
+        }
+        for (i, c) in corners.iter().enumerate() {
+            let cs = view.image_to_screen(c.0, c.1);
+            if (cs - ptr).length() <= r {
+                return Some(TextDragKind::Corner(i));
+            }
+        }
+    }
+    None
+}
+
+/// drag-continue: ハンドル種別に応じて対象オブジェクトを変形する。`img` は現フレームの
+/// ポインタ画像座標 (canonical px)。何か変化したら true。ラボ `handle_canvas_input` の
+/// dragged 分岐と同じ数式。
+fn apply_text_drag(
+    objs: &mut [AnnotationObject],
+    drag: &TextDrag,
+    img: (f32, f32),
+    fonts: Option<&FontSet>,
+) -> bool {
+    // 借用衝突を避けるため、可変借用の前に不変参照から必要値を読む。
+    let rot_center = objs
+        .iter()
+        .find(|o| o.id == drag.id)
+        .map(|o| rotation_center(o, fonts));
+    let text_resize = objs.iter().find(|o| o.id == drag.id).and_then(|o| {
+        if let AnnotationKind::Text(t) = &o.kind {
+            let (w, h) = text_layout_size(t, fonts);
+            Some((w, h, (o.pivot.0 + w * 0.5, o.pivot.1 + h * 0.5)))
+        } else {
+            None
+        }
+    });
+
+    let mut changed = false;
+    // resize 後にテキストの pivot を中心固定で再計算するための予約 (借用解除後に行う)。
+    let mut text_recenter: Option<(u64, (f32, f32))> = None;
+
+    if let Some(o) = objs.iter_mut().find(|o| o.id == drag.id) {
+        let id = o.id;
+        let obj_rot = o.rotation_rad;
+        match drag.kind {
+            TextDragKind::Move => {
+                let dx = img.0 - drag.last_img.0;
+                let dy = img.1 - drag.last_img.1;
+                if dx != 0.0 || dy != 0.0 {
+                    translate_object(o, dx, dy);
+                    changed = true;
+                }
+            }
+            TextDragKind::Rotate => {
+                let c = rot_center.unwrap_or(o.pivot);
+                let relx = img.0 - c.0;
+                let rely = img.1 - c.1;
+                // ハンドルは rotation 0 で局所 -Y (上) を指す。
+                o.rotation_rad = rely.atan2(relx) + std::f32::consts::FRAC_PI_2;
+                changed = true;
+            }
+            TextDragKind::Corner(_) => {
+                let pivot = o.pivot;
+                let (sin, cos) = o.rotation_rad.sin_cos();
+                let relx = img.0 - pivot.0;
+                let rely = img.1 - pivot.1;
+                // 局所軸へ逆回転 (pivot 対称リサイズ)。
+                let lx = relx * cos + rely * sin;
+                let ly = -relx * sin + rely * cos;
+                match &mut o.kind {
+                    AnnotationKind::Bubble(b) => {
+                        set_bubble_half_extents(b, lx.abs().max(10.0), ly.abs().max(10.0));
+                        b.auto_size = false;
+                        b.shape_preset_link = None;
+                        changed = true;
+                    }
+                    AnnotationKind::MessageWindow(w) => {
+                        w.half_w = lx.abs().max(20.0);
+                        w.half_h = ly.abs().max(12.0);
+                        w.size_mode = SizeMode::Inset;
+                        w.position = WindowPosition::Free;
+                        w.style_preset_link = None;
+                        changed = true;
+                    }
+                    AnnotationKind::Stamp(s) => {
+                        // アスペクト比を保った一様スケール。
+                        let aspect = if s.half_h > 1e-3 {
+                            s.half_w / s.half_h
+                        } else {
+                            1.0
+                        };
+                        let cand_w = lx.abs().max(8.0);
+                        let cand_h = ly.abs().max(8.0);
+                        let new_w = cand_w.max(cand_h * aspect);
+                        s.half_w = new_w;
+                        s.half_h = (new_w / aspect.max(1e-3)).max(8.0);
+                        changed = true;
+                    }
+                    AnnotationKind::Text(t) => {
+                        if let Some((w, h, center)) = text_resize {
+                            // レイアウト中心まわりで逆回転 → 局所スケール係数 → size_px。
+                            let local = rotate_about(img, center, -obj_rot);
+                            let lx = local.0 - center.0;
+                            let ly = local.1 - center.1;
+                            let sx = lx.abs() / (w * 0.5).max(1.0);
+                            let sy = ly.abs() / (h * 0.5).max(1.0);
+                            let scale = sx.max(sy).clamp(0.12, 12.0);
+                            let new_size = (t.size_px * scale).clamp(6.0, 240.0);
+                            if (new_size - t.size_px).abs() > 0.01 {
+                                t.size_px = new_size;
+                                t.preset_link = None;
+                                changed = true;
+                            }
+                            // resize 後は新レイアウト寸法で pivot を中心固定再計算する。
+                            text_recenter = Some((id, center));
+                        }
+                    }
+                }
+            }
+            TextDragKind::TailTip => {
+                let local = rotate_about(img, o.pivot, -o.rotation_rad);
+                if let AnnotationKind::Bubble(b) = &mut o.kind {
+                    if let Some(tail) = &mut b.tail {
+                        tail.tip = local;
+                        changed = true;
+                    }
+                }
+            }
+            TextDragKind::TailBase => {
+                let pivot = o.pivot;
+                let local = rotate_about(img, pivot, -o.rotation_rad);
+                if let (AnnotationKind::Bubble(b), Some(fonts)) = (&mut o.kind, fonts) {
+                    if b.tail.is_some() {
+                        let eff = comic_core::effective_bubble_shape(b, fonts);
+                        let t = comic_core::nearest_base_t(&eff, pivot, local);
+                        if let Some(tail) = &mut b.tail {
+                            tail.base_auto = false;
+                            tail.base_t = t;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // テキスト resize の pivot 再計算 (借用解除後)。
+    if let Some((id, center)) = text_recenter {
+        if let Some(o2) = objs.iter_mut().find(|o| o.id == id) {
+            let size = if let AnnotationKind::Text(t) = &o2.kind {
+                Some(text_layout_size(t, fonts))
+            } else {
+                None
+            };
+            if let Some((nw, nh)) = size {
+                o2.pivot = (center.0 - nw * 0.5, center.1 - nh * 0.5);
+            }
+        }
+    }
+
+    changed
 }
 
 /// 新規オブジェクトに割り当てる id (既存最大 + 1)。
@@ -467,6 +794,7 @@ impl App {
             free_rot,
             sw,
             sh,
+            scale: total_scale,
         })
     }
 
@@ -507,32 +835,47 @@ impl App {
                     return; // パネル上のクリックはキャンバス操作にしない
                 }
                 let img = view.screen_to_image(pos);
-                let hit = self
-                    .comic_docs
-                    .get(&key)
-                    .and_then(|objs| hit_test(objs, img, fonts.as_deref()));
-                self.text_selected = hit;
-                self.text_drag = hit.map(|id| TextDrag {
-                    id,
-                    last_img: img,
-                    moved: false,
+                // 優先: 選択中オブジェクトのハンドル (しっぽ/回転/四隅) → 本体 hit-test。
+                let handle = self.text_selected.and_then(|sel| {
+                    self.comic_docs
+                        .get(&key)
+                        .and_then(|objs| objs.iter().find(|o| o.id == sel))
+                        .and_then(|o| pick_handle(o, pos, &view, fonts.as_deref()))
                 });
+                let (drag_id, kind) = match handle {
+                    Some(k) => (self.text_selected, Some(k)),
+                    None => {
+                        let hit = self
+                            .comic_docs
+                            .get(&key)
+                            .and_then(|objs| hit_test(objs, img, fonts.as_deref()));
+                        self.text_selected = hit;
+                        (hit, hit.map(|_| TextDragKind::Move))
+                    }
+                };
+                self.text_drag = match (drag_id, kind) {
+                    (Some(id), Some(kind)) => Some(TextDrag {
+                        id,
+                        kind,
+                        last_img: img,
+                        moved: false,
+                    }),
+                    _ => None,
+                };
             }
         } else if down {
             if let (Some(pos), Some(mut drag)) = (pos, self.text_drag) {
                 let img = view.screen_to_image(pos);
-                let dx = img.0 - drag.last_img.0;
-                let dy = img.1 - drag.last_img.1;
-                if dx != 0.0 || dy != 0.0 {
-                    if let Some(objs) = self.comic_docs.get_mut(&key) {
-                        if let Some(o) = objs.iter_mut().find(|o| o.id == drag.id) {
-                            translate_object(o, dx, dy);
-                            drag.moved = true;
-                        }
-                    }
-                    drag.last_img = img;
+                let changed = self
+                    .comic_docs
+                    .get_mut(&key)
+                    .map(|objs| apply_text_drag(objs, &drag, img, fonts.as_deref()))
+                    .unwrap_or(false);
+                if changed {
+                    drag.moved = true;
                     self.mark_comic_dirty();
                 }
+                drag.last_img = img;
                 self.text_drag = Some(drag);
             }
         }
@@ -576,7 +919,9 @@ impl App {
         self.draw_text_add_window_dialog(ctx);
     }
 
-    /// 選択中オブジェクトの境界枠を画面に描く (回転を反映した四角形)。
+    /// 選択中オブジェクトの変形ハンドルを画面に描く。回転を反映した境界四角形 +
+    /// 回転ノブ (緑) + 四隅リサイズハンドル (白角) + 吹き出しのしっぽハンドル
+    /// (cyan=根元 / 橙=先端)。ラボ `draw_selection_handles` と同じ見た目。
     fn draw_text_selection(
         &mut self,
         ui: &mut egui::Ui,
@@ -596,35 +941,57 @@ impl App {
             return;
         };
         let fonts = self.ensure_comic_fonts();
-        let bounds = self
+        let Some(o) = self
             .comic_docs
             .get(&key)
             .and_then(|objs| objs.iter().find(|o| o.id == id))
-            .map(|o| object_bounds(o, fonts.as_deref()));
-        let Some(b) = bounds else {
+            .cloned()
+        else {
             return;
         };
-        let corners = [
-            b.left_top(),
-            b.right_top(),
-            b.right_bottom(),
-            b.left_bottom(),
-        ];
-        let pts: Vec<egui::Pos2> = corners
-            .iter()
-            .map(|c| view.image_to_screen(c.x, c.y))
-            .collect();
+        let Some((corners, roth)) = handle_points(&o, fonts.as_deref(), view.scale) else {
+            return;
+        };
         let painter = ui.painter().with_clip_rect(image_rect);
-        let stroke = egui::Stroke::new(2.0, sel_color());
+        let blue = sel_color();
+        let cs: Vec<egui::Pos2> = corners
+            .iter()
+            .map(|c| view.image_to_screen(c.0, c.1))
+            .collect();
+        // 回転を反映した境界四角形。
+        let stroke = egui::Stroke::new(1.5, blue);
         for i in 0..4 {
-            painter.line_segment([pts[i], pts[(i + 1) % 4]], stroke);
+            painter.line_segment([cs[i], cs[(i + 1) % 4]], stroke);
         }
-        for p in &pts {
-            painter.rect_filled(
-                egui::Rect::from_center_size(*p, egui::vec2(8.0, 8.0)),
+        // 回転ノブ: 上端中点から茎 + 緑の丸。
+        let top_mid = egui::pos2((cs[0].x + cs[1].x) * 0.5, (cs[0].y + cs[1].y) * 0.5);
+        let roth_s = view.image_to_screen(roth.0, roth.1);
+        painter.line_segment([top_mid, roth_s], stroke);
+        painter.circle_filled(roth_s, HANDLE_R, egui::Color32::from_rgb(120, 220, 120));
+        painter.circle_stroke(
+            roth_s,
+            HANDLE_R,
+            egui::Stroke::new(1.5, egui::Color32::BLACK),
+        );
+        // 四隅リサイズハンドル (白い小四角)。
+        for c in &cs {
+            let r = egui::Rect::from_center_size(*c, egui::vec2(HANDLE_R * 1.8, HANDLE_R * 1.8));
+            painter.rect_filled(r, 1.0, egui::Color32::from_rgb(230, 230, 235));
+            painter.rect_stroke(
+                r,
                 1.0,
-                sel_color(),
+                egui::Stroke::new(1.5, egui::Color32::BLACK),
+                egui::StrokeKind::Outside,
             );
+        }
+        // 吹き出しのしっぽハンドル (cyan=根元 / 橙=先端)。
+        if let Some((base, tip)) = tail_handle_points(&o, fonts.as_deref()) {
+            let bp = view.image_to_screen(base.0, base.1);
+            painter.circle_filled(bp, HANDLE_R, egui::Color32::from_rgb(80, 200, 220));
+            painter.circle_stroke(bp, HANDLE_R, egui::Stroke::new(1.5, egui::Color32::BLACK));
+            let tp = view.image_to_screen(tip.0, tip.1);
+            painter.circle_filled(tp, HANDLE_R, egui::Color32::from_rgb(255, 160, 60));
+            painter.circle_stroke(tp, HANDLE_R, egui::Stroke::new(1.5, egui::Color32::BLACK));
         }
     }
 
@@ -1765,6 +2132,7 @@ mod tests {
             free_rot: free,
             sw,
             sh,
+            scale: fit,
         }
     }
 
@@ -1844,5 +2212,82 @@ mod tests {
         } else {
             panic!("not a bubble");
         }
+    }
+
+    fn stamp_obj(id: u64, pivot: (f32, f32), half_w: f32, half_h: f32) -> AnnotationObject {
+        AnnotationObject::new_stamp(
+            id,
+            pivot,
+            StampObject {
+                half_w,
+                half_h,
+                ..StampObject::default()
+            },
+        )
+    }
+
+    #[test]
+    fn rotate_drag_sets_rotation_about_center() {
+        // フォント非依存のスタンプで回転ノブの数式を検証。
+        let mut objs = vec![stamp_obj(1, (100.0, 100.0), 50.0, 30.0)];
+        let drag = TextDrag {
+            id: 1,
+            kind: TextDragKind::Rotate,
+            last_img: (0.0, 0.0),
+            moved: false,
+        };
+        // 中心の真右 → atan2(0,+) + π/2 = π/2。
+        assert!(apply_text_drag(&mut objs, &drag, (200.0, 100.0), None));
+        assert!((objs[0].rotation_rad - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+        // 中心の真上 (画面 y は下向き) → atan2(-1,0) + π/2 = 0。
+        apply_text_drag(&mut objs, &drag, (100.0, 50.0), None);
+        assert!(objs[0].rotation_rad.abs() < 1e-4);
+    }
+
+    #[test]
+    fn corner_drag_resizes_stamp_aspect_preserving() {
+        // アスペクト 2:1 のスタンプ。corner を (180,100) へ → lx=80, ly=0。
+        let mut objs = vec![stamp_obj(1, (100.0, 100.0), 40.0, 20.0)];
+        let drag = TextDrag {
+            id: 1,
+            kind: TextDragKind::Corner(2),
+            last_img: (0.0, 0.0),
+            moved: false,
+        };
+        assert!(apply_text_drag(&mut objs, &drag, (180.0, 100.0), None));
+        if let AnnotationKind::Stamp(s) = &objs[0].kind {
+            assert!((s.half_w - 80.0).abs() < 1e-3, "half_w={}", s.half_w);
+            // アスペクト 2:1 を保持。
+            assert!((s.half_h - 40.0).abs() < 1e-3, "half_h={}", s.half_h);
+        } else {
+            panic!("not a stamp");
+        }
+    }
+
+    #[test]
+    fn pick_handle_finds_rotation_knob_then_misses() {
+        let view = make_view(Rotation::None, 0.0); // scale = 2.0
+        let obj = stamp_obj(1, (200.0, 150.0), 50.0, 30.0);
+        let (_, roth) = handle_points(&obj, None, view.scale).expect("stamp has handles");
+        let knob_screen = view.image_to_screen(roth.0, roth.1);
+        assert_eq!(
+            pick_handle(&obj, knob_screen, &view, None),
+            Some(TextDragKind::Rotate)
+        );
+        // 遠い点はどのハンドルにも当たらない。
+        assert_eq!(pick_handle(&obj, egui::pos2(0.0, 0.0), &view, None), None);
+    }
+
+    #[test]
+    fn pick_handle_finds_corner() {
+        let view = make_view(Rotation::None, 0.0);
+        let obj = stamp_obj(1, (200.0, 150.0), 50.0, 30.0);
+        let (corners, _) = handle_points(&obj, None, view.scale).expect("stamp has handles");
+        // BR コーナー (index 2)。
+        let br_screen = view.image_to_screen(corners[2].0, corners[2].1);
+        assert_eq!(
+            pick_handle(&obj, br_screen, &view, None),
+            Some(TextDragKind::Corner(2))
+        );
     }
 }

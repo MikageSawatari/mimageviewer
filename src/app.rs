@@ -1727,12 +1727,30 @@ pub(crate) struct ComicCacheEntry {
     pub dims: [usize; 2],
 }
 
-/// テキスト注釈のキャンバス上ドラッグ移動の進行状態 (Inc 3c)。
+/// テキスト注釈のキャンバス上ドラッグの種別 (Inc 6 変形ハンドル)。
+/// どのハンドルを掴んでドラッグしているかを表す。
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum TextDragKind {
+    /// オブジェクト本体をドラッグして平行移動。
+    Move,
+    /// 回転ノブをドラッグして `rotation_rad` を変更。
+    Rotate,
+    /// 四隅ハンドル (0..3: TL,TR,BR,BL) をドラッグしてサイズ変更。
+    Corner(usize),
+    /// 吹き出しのしっぽ先端 (tip) をドラッグ。
+    TailTip,
+    /// 吹き出しのしっぽ根元 (base) をドラッグ。
+    TailBase,
+}
+
+/// テキスト注釈のキャンバス上ドラッグの進行状態 (Inc 3c / Inc 6)。
 #[derive(Clone, Copy)]
 pub(crate) struct TextDrag {
     /// ドラッグ中のオブジェクト id。
     pub id: u64,
-    /// 直近のポインタ画像座標 (canonical ソース px)。毎フレームの差分で pivot を動かす。
+    /// 掴んでいるハンドルの種別。
+    pub kind: TextDragKind,
+    /// 直近のポインタ画像座標 (canonical ソース px)。Move の差分計算に使う。
     pub last_img: (f32, f32),
     /// 実際に動かしたか (press だけで動かさなかった場合に undo / dirty を出さない)。
     pub moved: bool,
