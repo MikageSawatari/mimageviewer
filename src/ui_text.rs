@@ -1888,6 +1888,9 @@ impl App {
             w.text.font_key = font_key.clone();
             w.text.size_px = (sh * 0.03).clamp(20.0, 64.0);
             w.text.color = p.text_color;
+            // 名前プレートの本文も同じ既定フォントにしておく (ラボと同様。名前フォントを
+            // 個別に変える UI は無いので、作成時に有効なフォントを焼き付ける)。
+            w.name_plate.name.font_key = font_key.clone();
             let mut o = AnnotationObject::new_message_window(id, (sw * 0.5, sh * 0.8), w);
             o.z = z;
             objs.push(o);
@@ -2438,7 +2441,13 @@ impl App {
                 tb.font_key = font_key.clone();
                 tb.preset_link = None; // 個別編集なのでプリセットリンクを解除
             }
-            let _ = self.ensure_comic_fonts_for(&objs);
+            let fonts = self.ensure_comic_fonts_for(&objs);
+            // AutoFitText の位置プリセット窓は本文フォントの寸法で高さが決まるので、
+            // フォント変更後は pivot を再アンカーする (Codex P2: フォントダイアログ経路は
+            // draw_text_panel の changed 解決を通らないため、ここで明示的に解決する)。
+            if let Some((sw, sh)) = self.source_dims_for_idx(fs_idx) {
+                resolve_window_placement(&mut objs, target, sw, sh, fonts.as_deref());
+            }
             self.save_comic_objects(fs_idx, &page_key, &objs);
             self.text_dirty_at = None;
             self.mark_comic_dirty();
@@ -4607,7 +4616,7 @@ fn edit_object_ui(
                 TextPropTab::Parts => {
                     // 名前プレート / 立ち絵枠 / 続き指標。個別編集でウィンドウリンク解除。
                     let snap = w.clone();
-                    window_parts_ui(ui, w, changed, open_font_picker);
+                    window_parts_ui(ui, w, changed);
                     if w.style_preset_link.is_some() && window_style_diverged(&snap, w) {
                         w.style_preset_link = None;
                     }
@@ -4680,7 +4689,15 @@ fn window_style_diverged(a: &MessageWindowObject, b: &MessageWindowObject) -> bo
         || name_plate_style_diverged(&a.name_plate, &b.name_plate)
 }
 
-/// 名前プレートの装飾差 (名前の TEXT 内容とフォントは apply で保持されるので無視)。
+/// 名前プレートの**装飾**差 (名前の TEXT 内容とフォントは比較から除外)。
+///
+/// 話者名そのもの (name.text) はインスタンス固有の内容であってプリセットが定義する
+/// スタイルではないので、名前を打ち替えてもウィンドウリンクは切らない。これは mIV の
+/// プリセット規約 (本文内容では link を切らない = `text_style_diverged` も `text` を無視) と
+/// 一貫した挙動で、ラボ `draw_window_name_header` が名前編集でも link を切るのとは意図的に
+/// 異なる (Codex P3。mIV 側の規約の方が一貫しているのでこちらを採用)。プレートの
+/// スタイル (mode / 色 / 塗り / 枠 / 角丸 / 余白 / オフセット / サイズ) を変えれば
+/// ちゃんと link は切れる。name.font_key は名前専用フォント UI を持たないので無視。
 fn name_plate_style_diverged(a: &comic_core::NamePlate, b: &comic_core::NamePlate) -> bool {
     let mut an = a.clone();
     let mut bn = b.clone();
@@ -5399,12 +5416,7 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
 
 /// メッセージウィンドウ「部品」タブ。名前プレート (モード・名前・色 + 装飾) / 立ち絵枠
 /// プレースホルダ / 続き指標。ラボ `draw_window_name_header` + `tab_window_parts` をまとめた。
-fn window_parts_ui(
-    ui: &mut egui::Ui,
-    w: &mut MessageWindowObject,
-    changed: &mut bool,
-    open_font_picker: &mut bool,
-) {
+fn window_parts_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut bool) {
     // ── 名前プレート ──
     ui.label(egui::RichText::new("名前プレート").strong());
     ui.horizontal(|ui| {
@@ -5442,9 +5454,6 @@ fn window_parts_ui(
                     .hint_text("話者名"),
             )
             .changed();
-        if ui.button("名前のフォント…").clicked() {
-            *open_font_picker = true;
-        }
         *changed |= ui
             .add(egui::Slider::new(&mut w.name_plate.name.size_px, 8.0..=120.0).text("文字サイズ"))
             .changed();
