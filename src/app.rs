@@ -4021,6 +4021,14 @@ pub struct App {
     pub(crate) comic_available_fonts: Vec<crate::font_assets::FontAsset>,
     pub(crate) comic_font_paths: std::collections::HashMap<String, std::path::PathBuf>,
     pub(crate) comic_font_registry_loaded: bool,
+    /// 注釈スタイルプリセット (Inc 5)。組み込み (sys:*) + ユーザー (user:*) を結合した
+    /// 一覧。`comic_presets_loaded` が false の間だけ 1 度組み立てる (system + presets.json)。
+    pub(crate) comic_text_presets: Vec<crate::comic_presets::TextStylePreset>,
+    pub(crate) comic_shape_presets: Vec<crate::comic_presets::ShapeStylePreset>,
+    pub(crate) comic_window_presets: Vec<crate::comic_presets::WindowStylePreset>,
+    pub(crate) comic_presets_loaded: bool,
+    /// プリセット「現在を保存」用の名前入力欄 (詳細パネルに表示)。
+    pub(crate) comic_preset_name_input: String,
     /// 被写体マット (BiRefNet) モデルの絶対パス。編集用追加パックから供給される。
     /// 未導入なら `None` (= 被写体マスク生成は disabled)。毎フレームの I/O を避けるため
     /// ここにキャッシュし、起動時 / pack 導入完了 / pack 削除時にだけ
@@ -5198,6 +5206,11 @@ impl App {
             comic_available_fonts: Vec::new(),
             comic_font_paths: std::collections::HashMap::new(),
             comic_font_registry_loaded: false,
+            comic_text_presets: Vec::new(),
+            comic_shape_presets: Vec::new(),
+            comic_window_presets: Vec::new(),
+            comic_presets_loaded: false,
+            comic_preset_name_input: String::new(),
             subject_matte_path: crate::editing_addon::subject_matte_model_path(),
             editing_pack_about: None,
             editing_pack_about_loaded: false,
