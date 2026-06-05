@@ -3870,6 +3870,10 @@ pub struct App {
     /// キャンバス上のドラッグ移動の進行状態 (Inc 3c)。`last_img` は直近のポインタ画像
     /// 座標で、毎フレームの差分でオブジェクトを動かす。
     pub(crate) text_drag: Option<TextDrag>,
+    /// パネル編集の未保存タイムスタンプ (Codex P2: 毎フレーム DB 書き込みを避ける
+    /// デバウンス用)。`Some(t)` の間は未保存で、編集が `DEBOUNCE` 止まったら comic.db +
+    /// サイドカーへ 1 度だけ保存する (退場時 `reset_text_mode` でも最終保存)。
+    pub(crate) text_dirty_at: Option<std::time::Instant>,
     /// 見開きから text モードに入ったときの spread 復元コンテキスト (conceal と同じ流儀)。
     pub(crate) text_spread_ctx: Option<EraseSpreadCtx>,
 
@@ -4962,6 +4966,7 @@ impl App {
             text_mode: false,
             text_selected: None,
             text_drag: None,
+            text_dirty_at: None,
             text_spread_ctx: None,
             erase_preview_active: false,
             conceal_preview_active: false,
@@ -20632,8 +20637,16 @@ impl App {
     /// アニメーション等で取れなければ `None`。
     pub(crate) fn source_dims_for_idx(&self, idx: usize) -> Option<(f32, f32)> {
         match self.fs_cache.get(&idx) {
-            Some(crate::fs_animation::FsCacheEntry::Static { pixels, .. }) => {
-                Some((pixels.size[0].max(1) as f32, pixels.size[1].max(1) as f32))
+            Some(crate::fs_animation::FsCacheEntry::Static {
+                pixels,
+                source_dims,
+                ..
+            }) => {
+                // `source_dims` は GPU 上限 (8192) clamp **前** のデコード寸法。注釈は
+                // canonical ソース px で持つ (D8) ので、>8K 画像でも clamp 後の
+                // `pixels.size` ではなく真のソース寸法を使う (Codex P1)。
+                let [w, h] = source_dims.unwrap_or(pixels.size);
+                Some((w.max(1) as f32, h.max(1) as f32))
             }
             _ => None,
         }

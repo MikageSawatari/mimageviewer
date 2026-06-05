@@ -313,6 +313,7 @@ impl App {
         self.text_mode = true;
         self.text_selected = None;
         self.text_drag = None;
+        self.text_dirty_at = None;
         self.clear_meta_undo();
         self.ensure_comic_doc_loaded(&key);
 
@@ -338,6 +339,7 @@ impl App {
         self.text_mode = false;
         self.text_selected = None;
         self.text_drag = None;
+        self.text_dirty_at = None;
         if was_text_mode {
             self.clear_meta_undo();
         }
@@ -423,6 +425,7 @@ impl App {
         let snapshot = objs.clone();
         self.text_selected = None;
         self.save_comic_objects(fs_idx, &key, &snapshot);
+        self.text_dirty_at = None;
         self.mark_comic_dirty();
     }
 
@@ -536,6 +539,7 @@ impl App {
                     // 移動確定で comic.db + サイドカーへ保存 (退場時保存に加えて即時永続化)。
                     let objs = self.comic_docs.get(&key).cloned().unwrap_or_default();
                     self.save_comic_objects(fs_idx, &key, &objs);
+                    self.text_dirty_at = None;
                 }
             }
         }
@@ -778,11 +782,23 @@ impl App {
                     });
             });
 
-        // 書き戻し。
+        // 書き戻し。編集中は毎フレーム DB へ書かず (Codex P2)、メモリ更新 + 再ベイクに留め、
+        // 編集が止まってから (デバウンス) / 退場時に 1 度だけ comic.db + サイドカーへ保存する。
         self.text_selected = selected;
-        if changed {
-            self.save_comic_objects(fs_idx, &key, &objects);
+        const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(700);
+        let save_now = if changed {
             self.mark_comic_dirty();
+            self.text_dirty_at = Some(std::time::Instant::now());
+            false
+        } else {
+            self.text_dirty_at
+                .map(|t| t.elapsed() >= DEBOUNCE)
+                .unwrap_or(false)
+        };
+        if save_now {
+            // save_comic_objects が comic_docs へも書き戻す。
+            self.save_comic_objects(fs_idx, &key, &objects);
+            self.text_dirty_at = None;
         } else {
             self.comic_docs.insert(key, objects);
         }
