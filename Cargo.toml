@@ -94,6 +94,10 @@ windows = { version = "0.61", features = [
     "Win32_UI_HiDpi",
 ] }
 windows-numerics = "0.2"
+# 注釈 (comic) のフォントピッカー / オノマトペで Windows インストール済みフォントを
+# レジストリ (HKLM/HKCU の …\Fonts) から列挙する (src/font_assets.rs)。ラボ
+# (tools/comic_lab) と同じ winreg を使う。
+winreg = "0.52"
 
 [dependencies]
 eframe = { version = "0.33", features = ["wgpu"] }

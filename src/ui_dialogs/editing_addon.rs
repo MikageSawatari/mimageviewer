@@ -235,6 +235,8 @@ impl App {
     fn on_editing_addon_installed(&mut self) {
         self.comic_fonts = None;
         self.comic_fonts_loaded = false;
+        self.comic_loaded_font_keys.clear();
+        self.comic_font_registry_loaded = false; // 新 pack のフォントを再列挙させる
         self.refresh_subject_matte_path();
         crate::logger::log(
             "[editing pack] install 完了、フォント / 被写体マットキャッシュを無効化".to_string(),

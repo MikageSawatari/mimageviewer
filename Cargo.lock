@@ -3843,6 +3843,7 @@ dependencies = [
  "windows 0.61.3",
  "windows-dpapi",
  "windows-numerics",
+ "winreg",
  "winresource",
  "zip",
 ]

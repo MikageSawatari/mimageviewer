@@ -4007,9 +4007,20 @@ pub struct App {
     /// この値と照合され、不一致なら miss 扱い (conceal_generation と同じ lazy eviction)。
     pub(crate) comic_generation: u64,
     /// 注釈描画用フォントセット (遅延ロード、Arc 共有)。`comic_fonts_loaded` が false の間
-    /// だけ 1 度ロードを試みる。本格的なフォント管理は Inc 4b。
+    /// だけ既定フォント (COMIC_FONT_KEY="ui") をロードする。追加で参照されたフォント
+    /// (pack オノマトペ / ユーザー選択フォント) は `ensure_comic_fonts_for` が
+    /// 必要に応じて差し込み再構築する (Inc 4c)。
     pub(crate) comic_fonts: Option<Arc<comic_core::FontSet>>,
     pub(crate) comic_fonts_loaded: bool,
+    /// 現在 `comic_fonts` (FontSet) に parse 済みのフォントキー集合。既定 "ui" 以外で
+    /// 何が読み込み済みかを追跡し、`ensure_comic_fonts_for` が「未ロードの参照フォントが
+    /// あるか」を O(1) で判定して不要な再構築を避ける (Inc 4c)。
+    pub(crate) comic_loaded_font_keys: std::collections::HashSet<String>,
+    /// 注釈フォントの列挙結果 (ピッカー一覧、表示名→パス)。`comic_font_registry_loaded`
+    /// が false の間だけ 1 度列挙する。pack 導入 / 削除で invalidate される (Inc 4c)。
+    pub(crate) comic_available_fonts: Vec<crate::font_assets::FontAsset>,
+    pub(crate) comic_font_paths: std::collections::HashMap<String, std::path::PathBuf>,
+    pub(crate) comic_font_registry_loaded: bool,
     /// 被写体マット (BiRefNet) モデルの絶対パス。編集用追加パックから供給される。
     /// 未導入なら `None` (= 被写体マスク生成は disabled)。毎フレームの I/O を避けるため
     /// ここにキャッシュし、起動時 / pack 導入完了 / pack 削除時にだけ
@@ -5162,6 +5173,10 @@ impl App {
             comic_generation: 0,
             comic_fonts: None,
             comic_fonts_loaded: false,
+            comic_loaded_font_keys: std::collections::HashSet::new(),
+            comic_available_fonts: Vec::new(),
+            comic_font_paths: std::collections::HashMap::new(),
+            comic_font_registry_loaded: false,
             subject_matte_path: crate::editing_addon::subject_matte_model_path(),
             editing_pack_about: None,
             editing_pack_about_loaded: false,
@@ -20772,19 +20787,104 @@ impl App {
         has_persisted || self.comic_demo_enabled
     }
 
-    /// 注釈描画用フォントセットを遅延ロードして返す (1 度だけ試行)。フォントが見つから
-    /// なければ `None` (= テキストを焼けないので comic 合成自体をスキップ)。本格的な
-    /// フォント列挙・選択は Inc 4b。
-    pub(crate) fn ensure_comic_fonts(&mut self) -> Option<Arc<comic_core::FontSet>> {
-        if !self.comic_fonts_loaded {
-            self.comic_fonts_loaded = true;
-            self.comic_fonts = crate::comic_overlay::load_comic_fonts().map(Arc::new);
-            if self.comic_fonts.is_none() {
-                crate::logger::log(
-                    "[comic] 注釈描画用の日本語フォントが見つかりませんでした".to_string(),
-                );
+    /// 注釈フォントの列挙結果 (ピッカー一覧 + 表示名→パス) を 1 度だけ作る。pack 同梱 /
+    /// ユーザー追加 / システムフォントを走査する同期 I/O だが、**注釈オブジェクトがある
+    /// 画像 / テキストモードでのみ** 呼ばれる (通常閲覧はゼロオーバーヘッド)。pack 導入 /
+    /// 削除時に `comic_font_registry_loaded=false` で invalidate される (Inc 4c)。
+    pub(crate) fn ensure_comic_font_registry(&mut self) {
+        if self.comic_font_registry_loaded {
+            return;
+        }
+        self.comic_font_registry_loaded = true;
+        let (assets, paths) = crate::font_assets::enumerate_comic_fonts();
+        crate::logger::log(format!("[comic] フォント列挙: {} 種", assets.len()));
+        self.comic_available_fonts = assets;
+        self.comic_font_paths = paths;
+    }
+
+    /// 既定フォント (COMIC_FONT_KEY="ui") + `extra_keys` + これまでロード済みのキーを
+    /// parse した新しい `FontSet` を構築して `comic_fonts` に差し替える。既定フォントを
+    /// 必ず最初に入れることで `FontSet::default_key` が "ui" になり、未知キーは既定へ
+    /// fallback する (= 既存注釈の互換)。フォント追加は新規参照時のみなので毎フレームでは
+    /// 走らない (Inc 4c)。
+    fn rebuild_comic_fontset(&mut self, extra_keys: &[String]) {
+        self.comic_fonts_loaded = true;
+        // 既定 JP フォント ("ui") を先頭に。見つからなければテキストを焼けない。
+        let Some(mut set) = crate::comic_overlay::load_comic_fonts() else {
+            self.comic_fonts = None;
+            self.comic_loaded_font_keys.clear();
+            crate::logger::log(
+                "[comic] 注釈描画用の日本語フォントが見つかりませんでした".to_string(),
+            );
+            return;
+        };
+        // これまでロード済みのキー ∪ 新規要求キー を parse して差し込む。
+        let mut keys: Vec<String> = self.comic_loaded_font_keys.iter().cloned().collect();
+        for k in extra_keys {
+            if !keys.iter().any(|e| e == k) {
+                keys.push(k.clone());
             }
         }
+        let mut loaded: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for key in keys {
+            let Some(path) = self.comic_font_paths.get(&key).cloned() else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if let Ok(font) = comic_core::LoadedFont::from_bytes(key.clone(), bytes) {
+                set.insert(font);
+                loaded.insert(key);
+            }
+        }
+        self.comic_loaded_font_keys = loaded;
+        self.comic_fonts = Some(Arc::new(set));
+    }
+
+    /// 注釈描画用フォントセットを遅延ロードして返す (既定フォントのみ保証)。フォントが
+    /// 見つからなければ `None` (= テキストを焼けないので comic 合成自体をスキップ)。
+    /// 特定フォントを確実に含めたいベイク経路では [`ensure_comic_fonts_for`] を使う。
+    pub(crate) fn ensure_comic_fonts(&mut self) -> Option<Arc<comic_core::FontSet>> {
+        self.ensure_comic_font_registry();
+        if !self.comic_fonts_loaded {
+            self.rebuild_comic_fontset(&[]);
+        }
+        self.comic_fonts.clone()
+    }
+
+    /// `objects` が参照する全フォントを parse 済みにしてから `FontSet` を返す。未ロードの
+    /// 参照フォント (pack オノマトペ / ユーザー選択フォント) があれば 1 度だけ再構築する。
+    /// 既に全て揃っていればキャッシュ済み Arc をそのまま返す (ベイクの度には走らない)。
+    pub(crate) fn ensure_comic_fonts_for(
+        &mut self,
+        objects: &[comic_core::AnnotationObject],
+    ) -> Option<Arc<comic_core::FontSet>> {
+        self.ensure_comic_font_registry();
+        // 参照されていて、まだ未ロードで、パスが分かっているキーだけを集める。
+        let mut needed: Vec<String> = Vec::new();
+        for o in objects {
+            let Some(tb) = o.text_block() else {
+                continue;
+            };
+            let k = &tb.font_key;
+            if k.is_empty() || k == crate::comic_overlay::COMIC_FONT_KEY {
+                continue; // 既定は base ロードで賄う
+            }
+            if self.comic_loaded_font_keys.contains(k) {
+                continue; // parse 済み
+            }
+            if !self.comic_font_paths.contains_key(k) {
+                continue; // パス不明 → fallback 描画 (再構築しても無駄)
+            }
+            if !needed.iter().any(|e| e == k) {
+                needed.push(k.clone());
+            }
+        }
+        if self.comic_fonts.is_some() && needed.is_empty() {
+            return self.comic_fonts.clone();
+        }
+        self.rebuild_comic_fontset(&needed);
         self.comic_fonts.clone()
     }
 
@@ -20973,7 +21073,9 @@ impl App {
         if objects.is_empty() {
             return None;
         }
-        let fonts = self.ensure_comic_fonts()?;
+        // 参照フォント (pack オノマトペ / ユーザー選択) を含めてロード (Inc 4c)。font_key は
+        // スケール非依存なので canonical オブジェクトで判定してよい。
+        let fonts = self.ensure_comic_fonts_for(&objects)?;
         // 同期ベイク (隠蔽 conceal と同流儀)。画像ごと 1 回・キャッシュ済みで毎フレーム
         // ではないが、実コンテンツでの worker 化要否を判断できるよう計測する。閾値 (80ms)
         // 超過は conceal と同じく perf ログに出す (§10、Inc 4+ で実測して判断)。
@@ -21053,7 +21155,8 @@ impl App {
         let (src_w, src_h) = self
             .source_dims_for_idx(idx)
             .unwrap_or((w as f32, h as f32));
-        let fonts = self.ensure_comic_fonts()?;
+        // 参照フォントを含めてロード (Inc 4c)。objects は下で move されるので前に呼ぶ。
+        let fonts = self.ensure_comic_fonts_for(&objects)?;
         let s_bake = (w.max(h) as f32) / src_w.max(src_h).max(1.0);
         let scaled = if (s_bake - 1.0).abs() > 1e-4 {
             comic_core::scale_scene(&objects, s_bake)
