@@ -1824,14 +1824,22 @@ impl App {
         self.mark_comic_dirty();
     }
 
-    /// フォント `font_key` で見本テキストを 1 行ベイクして RGBA 画像にする。フォントが
-    /// 解決できない (= 未ロード / parse 失敗) ときは `None` (= カードに見本を出さない)。
+    /// フォント `font_key` で見本テキストを 1 行ベイクして RGBA 画像にする。
+    ///
+    /// ピッカー専用に、共有 FontSet (`comic_fonts`) を**触らず**フォントを単発で
+    /// read+parse して焼く。共有 FontSet を rebuild すると、一覧スクロールで新フォントを
+    /// 見るたびに既ロード分まで再 read/再 parse され O(n^2) になる (Codex P2)。単発 parse
+    /// なら 1 フォント = 1 read + 1 parse で、呼び出し側の 1 フレーム予算で律速できる。
+    /// パス不明 / read / parse 失敗時は `None` (= カードに見本を出さない)。
     fn render_font_sample(
-        &mut self,
+        &self,
         font_key: &str,
         sample: &str,
         px: f32,
     ) -> Option<egui::ColorImage> {
+        let path = self.comic_font_paths.get(font_key)?;
+        let bytes = std::fs::read(path).ok()?;
+        let font = comic_core::LoadedFont::from_bytes(font_key.to_string(), bytes).ok()?;
         // 1 カードが巨大テクスチャを確保しないよう見本長を制限する (フィールドは編集可)。
         let sample: String = sample.chars().take(40).collect();
         let block = TextBlock {
@@ -1842,20 +1850,14 @@ impl App {
             orientation: Orientation::Horizontal,
             ..TextBlock::default()
         };
-        let probe = AnnotationObject::new_text(0, (0.0, 0.0), block.clone());
-        let fonts = self.ensure_comic_fonts_for(std::slice::from_ref(&probe))?;
-        let font = fonts.get(font_key)?;
-        // `FontSet::get` は未知キーを既定フォントへ fallback するので、解決面が実際に
-        // `font_key` でなければ見本を出さない (別フォントを誤った名前で見せない)。
-        if font.key != font_key {
-            return None;
-        }
-        let layout = comic_core::layout_text(&block, font);
+        let layout = comic_core::layout_text(&block, &font);
         let pad = 6.0f32;
         let w = ((layout.bounds.0 + pad * 2.0).ceil() as usize).clamp(1, 2000);
         let h = ((layout.bounds.1 + pad * 2.0).ceil() as usize).clamp(1, 400);
+        let mut set = comic_core::FontSet::new();
+        set.insert(font);
         let obj = AnnotationObject::new_text(0, (pad, pad), block);
-        let overlay = comic_core::bake_overlay(&[obj], w, h, &fonts);
+        let overlay = comic_core::bake_overlay(&[obj], w, h, &set);
         Some(egui::ColorImage::from_rgba_unmultiplied(
             [overlay.w, overlay.h],
             &overlay.pixels,
@@ -1863,6 +1865,7 @@ impl App {
     }
 
     /// フォント見本テクスチャを遅延構築 + キャッシュして返す。キーは `(font_key, 見本)`。
+    /// 描画失敗は `font_sample_failed` に記録して毎フレームの再試行を防ぐ (Codex P3)。
     fn font_sample_texture(
         &mut self,
         ctx: &egui::Context,
@@ -1873,7 +1876,13 @@ impl App {
         if let Some(tex) = self.font_sample_cache.get(&cache_key) {
             return Some(tex.clone());
         }
-        let img = self.render_font_sample(font_key, &sample, 30.0)?;
+        if self.font_sample_failed.contains(font_key) {
+            return None;
+        }
+        let Some(img) = self.render_font_sample(font_key, &sample, 30.0) else {
+            self.font_sample_failed.insert(font_key.to_string());
+            return None;
+        };
         let tex_name = format!(
             "font_sample_{}_{}",
             crate::font_assets::font_lookup_key(font_key),
@@ -2094,15 +2103,16 @@ impl App {
                                         break;
                                     };
                                     let selected = key == &current_key;
-                                    let cached = self.font_sample_cache.contains_key(&(
+                                    // 構築済み (テクスチャ有) か失敗済みなら予算を消費しない。
+                                    let settled = self.font_sample_cache.contains_key(&(
                                         key.clone(),
                                         self.text_font_dialog_sample.clone(),
-                                    ));
-                                    let allow = cached || build_budget > 0;
-                                    if !cached && allow {
+                                    )) || self.font_sample_failed.contains(key);
+                                    let allow = settled || build_budget > 0;
+                                    if !settled && allow {
                                         build_budget -= 1;
                                     }
-                                    if !cached && !allow {
+                                    if !settled && !allow {
                                         need_repaint = true;
                                     }
                                     if self.draw_font_card(ui, ctx, key, selected, allow) {
@@ -2163,6 +2173,7 @@ impl App {
         self.comic_font_registry_loaded = false;
         self.ensure_comic_font_registry();
         self.font_sample_cache.clear();
+        self.font_sample_failed.clear();
         // コピー先パスから表示ラベルを導出 (font_assets と同じ規則: stem の _/- を空白に)。
         let stem = dest.file_stem().and_then(|s| s.to_str())?;
         let label = stem.replace(['_', '-'], " ").trim().to_string();

@@ -237,6 +237,13 @@ impl App {
         self.comic_fonts_loaded = false;
         self.comic_loaded_font_keys.clear();
         self.comic_font_registry_loaded = false; // 新 pack のフォントを再列挙させる
+        // フォントソースが変わったので見本 / オノマトペプレビュー + 焼き済み注釈
+        // (comic_cache) も無効化する。bump しないと表示中ページが旧フォントのまま
+        // 残る (Codex P2)。
+        self.font_sample_cache.clear();
+        self.font_sample_failed.clear();
+        self.onomatopoeia_thumb_cache.clear();
+        self.mark_comic_dirty();
         self.refresh_subject_matte_path();
         crate::logger::log(
             "[editing pack] install 完了、フォント / 被写体マットキャッシュを無効化".to_string(),

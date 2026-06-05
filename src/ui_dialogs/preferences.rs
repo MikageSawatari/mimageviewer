@@ -794,6 +794,12 @@ impl App {
         self.comic_fonts_loaded = false;
         self.comic_loaded_font_keys.clear();
         self.comic_font_registry_loaded = false; // pack フォントを一覧から外す
+        // フォントソースが変わったので見本 / オノマトペプレビュー + 焼き済み注釈
+        // (comic_cache) も無効化する (Codex P2)。
+        self.font_sample_cache.clear();
+        self.font_sample_failed.clear();
+        self.onomatopoeia_thumb_cache.clear();
+        self.mark_comic_dirty();
         self.refresh_subject_matte_path();
         crate::logger::log(
             "[editing pack] 削除を開始 (active.json 解除 + フォント/被写体マットキャッシュ無効化)"

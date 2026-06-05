@@ -4089,6 +4089,10 @@ pub struct App {
     pub(crate) text_font_dialog_sample: String,
     /// フォント見本テクスチャのキャッシュ (`(font_key, 見本テキスト)` → 焼いた 1 行サンプル)。
     pub(crate) font_sample_cache: std::collections::HashMap<(String, String), egui::TextureHandle>,
+    /// 見本の描画に失敗したフォントキー (パス不明 / 読み込み / parse 失敗)。失敗は
+    /// 見本テキストに依らずフォント固有なので、ここに記録して毎フレームの再試行 +
+    /// フレーム予算の浪費を防ぐ (Codex P3)。registry / pack 変更時にクリアする。
+    pub(crate) font_sample_failed: std::collections::HashSet<String>,
     /// スタンプピッカーが「既存スタンプの差し替え」で開かれたときの対象オブジェクト id。
     /// `None` のときは新規追加。
     pub(crate) stamp_dialog_replace_target: Option<u64>,
@@ -5219,6 +5223,7 @@ impl App {
             text_font_dialog_category: None,
             text_font_dialog_sample: String::new(),
             font_sample_cache: std::collections::HashMap::new(),
+            font_sample_failed: std::collections::HashSet::new(),
             stamp_dialog_replace_target: None,
             stamp_dialog_filter: String::new(),
             stamp_dialog_category: crate::comic_stamp::EmojiCategory::Smileys,
@@ -20887,23 +20892,29 @@ impl App {
     ) -> Option<Arc<comic_core::FontSet>> {
         self.ensure_comic_font_registry();
         // 参照されていて、まだ未ロードで、パスが分かっているキーだけを集める。
+        // オブジェクト内の **全 TextBlock** を見る (本文 + メッセージウィンドウの名前
+        // プレート)。本文だけだと名前プレートの独自フォントが既定へ落ちる (Codex P2)。
         let mut needed: Vec<String> = Vec::new();
-        for o in objects {
-            let Some(tb) = o.text_block() else {
-                continue;
-            };
-            let k = &tb.font_key;
+        let consider = |k: &str, needed: &mut Vec<String>| {
             if k.is_empty() || k == crate::comic_overlay::COMIC_FONT_KEY {
-                continue; // 既定は base ロードで賄う
+                return; // 既定は base ロードで賄う
             }
             if self.comic_loaded_font_keys.contains(k) {
-                continue; // parse 済み
+                return; // parse 済み
             }
             if !self.comic_font_paths.contains_key(k) {
-                continue; // パス不明 → fallback 描画 (再構築しても無駄)
+                return; // パス不明 → fallback 描画 (再構築しても無駄)
             }
             if !needed.iter().any(|e| e == k) {
-                needed.push(k.clone());
+                needed.push(k.to_string());
+            }
+        };
+        for o in objects {
+            if let Some(tb) = o.text_block() {
+                consider(&tb.font_key, &mut needed);
+            }
+            if let comic_core::AnnotationKind::MessageWindow(w) = &o.kind {
+                consider(&w.name_plate.name.font_key, &mut needed);
             }
         }
         if self.comic_fonts.is_some() && needed.is_empty() {
