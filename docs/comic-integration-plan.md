@@ -1,8 +1,8 @@
 # テキスト注釈(comic)機能 — 本体 mIV 統合計画
 
-Status: 計画ドラフト v2.1（Codex 計画レビュー反映済み・Inc 0 はマージ保留中）
-更新: 2026-06-05（安全プレップ: `scale_scene` 先行実装 §5.4 / master 現況点検 §5.5）
-対象ブランチ: `lab`（master 未マージ。master 統合は別途指示で実施）
+Status: 計画 v2.2（**Inc 0 完了** = lab→master マージ済み・comic-core 依存配線済み）
+更新: 2026-06-05（Inc 0 完了。次は Inc 1 = 最前面オーバーレイ表示）
+対象ブランチ: `master`（lab を `6ac779b2` でマージ。comic-core は本体の依存）
 
 ラボ（`tools/comic_lab` + `crates/comic-core`）で完成させた吹き出し/テキスト/スタンプ/
 メッセージウィンドウ注釈機能を、本体 mImageViewer（`C:\home\mimageviewer`、master）へ
@@ -76,6 +76,7 @@ Status: 計画ドラフト v2.1（Codex 計画レビュー反映済み・Inc 0 �
 | D8 | 座標系（回転） | 注釈は **canonical（非回転）ソース画素座標**で保持（EXIF/PDF レンダ/clamp 後・`rotation_db` 適用前。＝消しゴム/隠蔽マスクと同じ空間）。表示/書き出しは既存の最終画素と同じ回転ポリシーを適用。回転表示中の編集はポインタを逆回転して canonical へ写像。 |
 | D9 | スタンプ画像の持ち運び | 絵文字スタンプ=同梱アセットへのキー参照（軽量）。**ユーザー画像スタンプ=ダウンスケール RGBA を注釈データに埋め込み**（フォルダ移動・別マシンでも保持）。元ファイル欠落時は欠落プレースホルダ。サイズ上限あり（§6）。 |
 | D10 | テキストとダウンサンプルの前後（ユーザー承認 2026-06-05） | テキスト/吹き出しは AI を通さず**ベクタからラスタライズ**するため、**最終出力解像度（エクスポート時はダウンサンプル後）で焼いて最後に合成**する。順序は `… → ポストフィルタ →（ダウンサンプル）→ テキスト → 書き出し`。先に高解像度で焼いて縮小すると甘くなるのを避ける（D1=最前面・くっきりの徹底）。実装は `scale_scene` の `S` を**最終出力長辺基準**にするだけ（`S = 最終出力長辺 / crop後ソース長辺`）。エクスポートが等倍でも同コードが最良結果。表示時も同原理（表示解像度で焼く）。Inc 7 で確定。 |
+| D11 | 絵文字アセットの同梱方式（方向付け 2026-06-05、最終確定 Inc 4c） | Twemoji（jdecked fork、**CC-BY 4.0**）の curated カタログ（`tools/comic_lab/src/stamp.rs` の `EMOJI_CATALOG`、数百個。キー=コードポイント hex）を採用。**推奨=事前ラスタライズ PNG を `include_bytes!` で本体に内包→初回スタンプ利用時に `%APPDATA%/mimageviewer/emoji/` へ展開し、既存 `image` クレートでデコード**（PDFium/ORT/models と同パターン。本体 mIV に resvg を増やさない）。代替=SVG 同梱＋resvg をランタイム依存に追加。ラスタライズ解像度（`EMOJI_RENDER_PX=512` 基準）／サイズ予算と最終決定は **Inc 4c**（ピッカー実装時）。アセットは optional（欠落時はユーザー画像のみに degrade）。**CC-BY 帰属を「ソフトウェア情報（環境設定→ヘルプ）」＋`installer/readme.txt` に必須**。Inc 0/1 は非ブロッキング（スタンプは Inc 4c で初めて必要）。 |
 
 ---
 
@@ -298,11 +299,15 @@ master に対して再確認する**（このスナップショットに固定�
 コミット**。受け入れを満たさなければ次へ進まない。**「ラボ完全パリティ」の最終署名は Inc 6 完了後**
 （プリセット/ダイアログ/ハンドルが揃って初めて成立する）。
 
-- **Inc 0: lab→master マージ ＋ 依存配線 ＋ アセット方針**（master の修正一段落＋ユーザー「マージ」後）
-  - `lab`→`master` マージで `crates/comic-core` + `tools/comic_lab` を master に持ち込む。ワークスペース
-    /Cargo メタを整え、mIV に `comic-core` 依存追加。`comic-core` のテストを master 上で実行。
-  - 絵文字 Twemoji（CC-BY）の vendor 化・同梱・帰属方針を決める（`scripts/setup-twemoji.sh` の取得物）。
-  - 受け入れ: master でビルド緑・既存テスト緑・comic-core テスト緑。mIV から comic-core 参照可。
+- **Inc 0: lab→master マージ ＋ 依存配線 ＋ アセット方針** — ✅ **完了（2026-06-05）**
+  - ✅ `lab`→`master` マージ（`6ac779b2`、`--no-ff`、conflict 無し）で `crates/comic-core` +
+    `tools/comic_lab` + 統合 docs を master へ。lab は本体 `src/`/`build.rs`/`vendor/` 不変（read-only 精査 +
+    `merge-tree` dry-run で確認済み）。
+  - ✅ mIV に `comic-core = { path = "crates/comic-core" }` 依存配線（`cc9e3c11`。Cargo.lock は 1 行追加）。
+  - ✅ 絵文字 Twemoji（CC-BY 4.0）の同梱方針を **D11 で方向付け**（事前ラスタライズ PNG を内包＋APPDATA 展開、
+    resvg をランタイムに足さない）。実 vendoring は Inc 4c。
+  - ✅ 受け入れ: `cargo build -p mimageviewer --bin mimageviewer-core` 緑 / 既存テスト 1980 passed 0 failed /
+    comic-core テスト 93 passed 0 failed / `cargo fmt --check` clean。mIV から comic-core 参照可。
 - **Inc 1: 最前面オーバーレイ表示（読み取り専用）＋ 座標/回転/worker 基盤**
   - 固定 or ファイルの `Vec<AnnotationObject>` を §5.4 の変換でベイクし最終画像の上に合成表示（D1）。
     canonical 座標＋回転ポリシー（D8）を確定・実装。**ベイク＋アップロードを worker 化＋1 フレ 1 枚律速**。
@@ -385,7 +390,11 @@ master に対して再確認する**（このスナップショットに固定�
   最適化を移植。テクスチャ eviction を mIV 流儀へ（Inc 4c / Inc 8）。
 - **フォント列挙**: mIV のフォント列挙（`winreg`）再利用か comic-core 側か（Inc 4b）。
 - **ユーザー画像スタンプ埋め込みの上限・圧縮**（§6.4、Inc 4c）。
-- **絵文字アセットの vendor 化方式**（Inc 0）。
+- ~~**絵文字アセットの vendor 化方式**~~: **方向付け済（D11）** — curated Twemoji（CC-BY 4.0）を
+  事前ラスタライズ PNG として `include_bytes!` 内包＋初回利用時に `%APPDATA%/mimageviewer/emoji/` 展開、
+  本体は既存 `image` クレートでデコード（resvg をランタイム依存に足さない）。ラスタライズ解像度／
+  サイズ予算と帰属文面の最終確定は Inc 4c（ピッカー実装時。スタンプは Inc 4c で初めて必要なので
+  Inc 0/1 は非ブロッキング）。
 
 ---
 
