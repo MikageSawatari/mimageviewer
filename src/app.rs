@@ -3891,6 +3891,9 @@ pub struct App {
     /// 選択中の注釈オブジェクトの **id** (`comic_docs[key]` 内の `AnnotationObject::id`)。
     /// index ではなく id で持つので、削除 / z 並べ替えで選択がずれない (Inc 3b)。
     pub(crate) text_selected: Option<u64>,
+    /// 右詳細パネルのカテゴリタブ選択 (セリフ/本体/しっぽ/枠)。アプリ単位で 1 つ保持し、
+    /// 補正レイヤーの section-accent と同じカラー分類を右パネルに与える (Inc 4b)。
+    pub(crate) text_prop_tab: crate::ui_text::TextPropTab,
     /// キャンバス上のドラッグ移動の進行状態 (Inc 3c)。`last_img` は直近のポインタ画像
     /// 座標で、毎フレームの差分でオブジェクトを動かす。
     pub(crate) text_drag: Option<TextDrag>,
@@ -4993,6 +4996,7 @@ impl App {
             comic_docs: std::collections::HashMap::new(),
             text_mode: false,
             text_selected: None,
+            text_prop_tab: crate::ui_text::TextPropTab::Serifu,
             text_drag: None,
             text_dirty_at: None,
             text_add_bubble_dialog: false,

@@ -36,6 +36,95 @@ const PANEL_MARGIN_Y: f32 = 60.0;
 /// ハンドル (回転ノブ / 四隅 / しっぽ) の当たり判定半径 (画面 px)。ラボと同値。
 const HANDLE_R: f32 = 7.0;
 
+/// 右詳細パネルのカテゴリタブ。補正レイヤーの section-accent と同じく、各カテゴリに
+/// アクセント色を割り当て、タブボタン + コンテンツ左端の色帯で「カラーの縦線での分類」を
+/// 与える (ラボの `PropTab` 相当。mIV は飾り未対応なので セリフ/本体/しっぽ の 3 種)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextPropTab {
+    /// セリフ (本文テキスト): 青。
+    Serifu,
+    /// 本体 (吹き出し形状・塗り / ウィンドウ枠): 緑。
+    Body,
+    /// しっぽ (吹き出しのしっぽ): 橙。
+    Tail,
+}
+
+impl TextPropTab {
+    /// カテゴリのアクセント色 (タブボタンと左色帯で共有)。
+    fn color(self) -> egui::Color32 {
+        match self {
+            TextPropTab::Serifu => egui::Color32::from_rgb(90, 170, 255), // 青
+            TextPropTab::Body => egui::Color32::from_rgb(95, 208, 140),   // 緑
+            TextPropTab::Tail => egui::Color32::from_rgb(255, 160, 60),   // 橙
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            TextPropTab::Serifu => "セリフ",
+            TextPropTab::Body => "本体",
+            TextPropTab::Tail => "しっぽ",
+        }
+    }
+}
+
+/// コンテンツを左端に細いアクセント色の縦帯付きフレームで囲む (補正レイヤーの
+/// `draw_panel_section` / ラボの `draw_section_bar` と同流儀)。詳細タブを
+/// カテゴリ色で分類するために使う。
+fn draw_section_bar<R>(
+    ui: &mut egui::Ui,
+    color: egui::Color32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let response = egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: 10,
+            right: 2,
+            top: 4,
+            bottom: 4,
+        })
+        .show(ui, |ui| add_contents(ui));
+    let rect = response.response.rect;
+    let line_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.top() + 4.0),
+        egui::pos2(rect.left() + 3.0, rect.bottom() - 4.0),
+    );
+    ui.painter().rect_filled(line_rect, 1.5, color);
+    ui.add_space(2.0);
+    response.inner
+}
+
+/// 常時カテゴリ色を帯びる詳細タブボタン。選択 = フル彩度 + 黒文字 + 白枠、
+/// 非選択 = 減光、無効 = さらに減光 + 非操作。クリックで true (無効時は常に false)。
+fn prop_tab_button(
+    ui: &mut egui::Ui,
+    tab: TextPropTab,
+    selected: bool,
+    enabled: bool,
+    label: &str,
+) -> bool {
+    let base = tab.color();
+    let fill = if !enabled {
+        base.gamma_multiply(0.12)
+    } else if selected {
+        base
+    } else {
+        base.gamma_multiply(0.40)
+    };
+    let text_col = if !enabled {
+        egui::Color32::from_gray(110)
+    } else if selected {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::from_gray(235)
+    };
+    let mut btn = egui::Button::new(egui::RichText::new(label).color(text_col)).fill(fill);
+    if selected && enabled {
+        btn = btn.stroke(egui::Stroke::new(1.5, egui::Color32::WHITE));
+    }
+    ui.add_enabled(enabled, btn).clicked()
+}
+
 /// 選択枠の色 (環境依存グリフを使わない純描画)。
 fn sel_color() -> egui::Color32 {
     egui::Color32::from_rgb(80, 180, 255)
@@ -1054,6 +1143,7 @@ impl App {
         // 借用衝突を避けるため作業セットを一旦取り出し、ローカルだけを編集する。
         let mut objects = self.comic_docs.remove(&key).unwrap_or_default();
         let mut selected = self.text_selected;
+        let mut prop_tab = self.text_prop_tab;
         let mut changed = false;
         let mut close = false;
         let mut open_bubble_dialog = false;
@@ -1191,7 +1281,7 @@ impl App {
                                         if let Some(o) = selected
                                             .and_then(|id| objects.iter_mut().find(|o| o.id == id))
                                         {
-                                            edit_object_ui(ui, o, &mut changed);
+                                            edit_object_ui(ui, o, &mut prop_tab, &mut changed);
                                         } else {
                                             ui.label(
                                                 egui::RichText::new(
@@ -1218,6 +1308,7 @@ impl App {
         // 書き戻し。編集中は毎フレーム DB へ書かず (Codex P2)、メモリ更新 + 再ベイクに留め、
         // 編集が止まってから (デバウンス) / 退場時に 1 度だけ comic.db + サイドカーへ保存する。
         self.text_selected = selected;
+        self.text_prop_tab = prop_tab;
         const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(700);
         let save_now = if changed {
             self.mark_comic_dirty();
@@ -2410,9 +2501,17 @@ fn object_list_ui(
 }
 
 /// 選択中オブジェクトの種別別インライン編集。
-fn edit_object_ui(ui: &mut egui::Ui, o: &mut AnnotationObject, changed: &mut bool) {
+/// 右詳細パネルの本体。選択オブジェクトを「カラーの縦線での分類」(カテゴリタブ +
+/// 色帯) で編集する。`tab` はアプリ単位の選択状態で、オブジェクト種別に応じて
+/// 有効タブへ正規化する。
+fn edit_object_ui(
+    ui: &mut egui::Ui,
+    o: &mut AnnotationObject,
+    tab: &mut TextPropTab,
+    changed: &mut bool,
+) {
     ui.strong(kind_label(o));
-    // 回転 (全種共通)。
+    // 回転 (全種共通、タブの外)。
     let mut deg = o.rotation_rad.to_degrees();
     if ui
         .add(egui::Slider::new(&mut deg, -180.0..=180.0).text("回転°"))
@@ -2424,15 +2523,56 @@ fn edit_object_ui(ui: &mut egui::Ui, o: &mut AnnotationObject, changed: &mut boo
 
     match &mut o.kind {
         AnnotationKind::Text(t) => {
-            text_block_ui(ui, t, changed, true);
+            // テキストは セリフ カテゴリのみ。タブ行は出さず色帯だけ付ける。
+            *tab = TextPropTab::Serifu;
+            ui.add_space(4.0);
+            draw_section_bar(ui, TextPropTab::Serifu.color(), |ui| {
+                text_block_ui(ui, t, changed, true);
+            });
         }
         AnnotationKind::Bubble(b) => {
-            bubble_ui(ui, b, changed);
+            // セリフ / 本体 / しっぽ。しっぽタブには表示 on/off も入れるので常時有効
+            // (しっぽが無い吹き出しでも中の checkbox から付与できる)。
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for t in [TextPropTab::Serifu, TextPropTab::Body, TextPropTab::Tail] {
+                    if prop_tab_button(ui, t, *tab == t, true, t.label()) {
+                        *tab = t;
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            let cur = *tab;
+            draw_section_bar(ui, cur.color(), |ui| match cur {
+                TextPropTab::Serifu => text_block_ui(ui, &mut b.text, changed, true),
+                TextPropTab::Tail => bubble_tail_ui(ui, b, changed),
+                TextPropTab::Body => bubble_body_ui(ui, b, changed),
+            });
         }
         AnnotationKind::MessageWindow(w) => {
-            window_ui(ui, w, changed);
+            // セリフ / 枠 (= Body)。しっぽは無いので Body へ正規化する。
+            if *tab == TextPropTab::Tail {
+                *tab = TextPropTab::Body;
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for (t, lbl) in [(TextPropTab::Serifu, "セリフ"), (TextPropTab::Body, "枠")] {
+                    if prop_tab_button(ui, t, *tab == t, true, lbl) {
+                        *tab = t;
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            let cur = *tab;
+            draw_section_bar(ui, cur.color(), |ui| match cur {
+                TextPropTab::Serifu => text_block_ui(ui, &mut w.text, changed, true),
+                _ => window_body_ui(ui, w, changed),
+            });
         }
         AnnotationKind::Stamp(s) => {
+            // スタンプは画像プロパティのみ (タブなし)。
             stamp_ui(ui, s, changed);
         }
     }
@@ -2552,8 +2692,9 @@ fn text_block_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool, with_
     }
 }
 
-/// 吹き出しの編集 (形状・塗り・輪郭・自動サイズ・しっぽ・本文)。
-fn bubble_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
+/// 吹き出し「本体」タブ (形状・塗り・輪郭・自動サイズ・余白)。本文は セリフ タブ、
+/// しっぽは しっぽ タブへ分離している。
+fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
     // 形状コンボ。
     let cur = ShapeKind::from_shape(&b.shape);
     let (hw, hh) = shape_half(&b.shape);
@@ -2623,9 +2764,12 @@ fn bubble_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
     {
         *changed = true;
     }
-    // しっぽ。
+}
+
+/// 吹き出し「しっぽ」タブ (表示 on/off + 種別 + 幅)。
+fn bubble_tail_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
     let mut has_tail = b.tail.is_some();
-    if ui.checkbox(&mut has_tail, "しっぽ").changed() {
+    if ui.checkbox(&mut has_tail, "しっぽを表示").changed() {
         b.tail = if has_tail {
             Some(comic_core::Tail::default())
         } else {
@@ -2650,21 +2794,24 @@ fn bubble_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
                 t.kind = k;
                 *changed = true;
             }
-            if ui
-                .add(egui::Slider::new(&mut t.width_px, 4.0..=120.0).text("幅"))
-                .changed()
-            {
-                *changed = true;
-            }
         });
+        if ui
+            .add(egui::Slider::new(&mut t.width_px, 4.0..=120.0).text("幅"))
+            .changed()
+        {
+            *changed = true;
+        }
+    } else {
+        ui.label(
+            egui::RichText::new("「しっぽを表示」で会話/思考のしっぽを付けられます")
+                .small()
+                .color(egui::Color32::from_gray(160)),
+        );
     }
-    ui.separator();
-    ui.label("本文");
-    text_block_ui(ui, &mut b.text, changed, true);
 }
 
-/// メッセージウィンドウの編集 (枠・塗り・配置・本文)。
-fn window_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut bool) {
+/// メッセージウィンドウ「枠」タブ (枠・塗り・輪郭)。本文は セリフ タブへ分離。
+fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut bool) {
     // 枠。
     let mut frame = w.frame;
     egui::ComboBox::from_label("枠")
@@ -2725,9 +2872,6 @@ fn window_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut bool)
             *changed = true;
         }
     });
-    ui.separator();
-    ui.label("本文");
-    text_block_ui(ui, &mut w.text, changed, true);
 }
 
 /// スタンプの編集 (ピッカーは Inc 4c。ここでは不透明度 / 反転のみ)。
