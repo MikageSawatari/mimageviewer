@@ -1750,8 +1750,14 @@ pub(crate) struct TextDrag {
     pub id: u64,
     /// 掴んでいるハンドルの種別。
     pub kind: TextDragKind,
+    /// press 時のポインタ画面座標。ドラッグ判定 (閾値超え) の起点。
+    pub start: egui::Pos2,
     /// 直近のポインタ画像座標 (canonical ソース px)。Move の差分計算に使う。
     pub last_img: (f32, f32),
+    /// 閾値を超えて実ドラッグに移行したか。これが立つまで変形を適用しない
+    /// (= 単なるクリックでハンドルが微小に動く / 不要保存が出るのを防ぐ。
+    /// ラボの `resp.dragged()` 相当のガード)。
+    pub armed: bool,
     /// 実際に動かしたか (press だけで動かさなかった場合に undo / dirty を出さない)。
     pub moved: bool,
 }

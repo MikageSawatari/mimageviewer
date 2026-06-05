@@ -25,7 +25,7 @@ use crate::app::{App, TextDrag, TextDragKind};
 use crate::ui_fullscreen::{FsKeyAction, SpreadPair};
 use comic_core::{
     AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, FillMode, FontSet, FrameStyle,
-    MessageWindowObject, Orientation, Rgba, SizeMode, StampObject, StrokeStyle, TailKind,
+    MessageWindowObject, Orientation, Rgba, SizeMode, StampObject, StrokeStyle, Tail, TailKind,
     TextAlign, TextBlock, WindowPosition,
 };
 
@@ -857,7 +857,9 @@ impl App {
                     (Some(id), Some(kind)) => Some(TextDrag {
                         id,
                         kind,
+                        start: pos,
                         last_img: img,
+                        armed: false,
                         moved: false,
                     }),
                     _ => None,
@@ -865,17 +867,23 @@ impl App {
             }
         } else if down {
             if let (Some(pos), Some(mut drag)) = (pos, self.text_drag) {
-                let img = view.screen_to_image(pos);
-                let changed = self
-                    .comic_docs
-                    .get_mut(&key)
-                    .map(|objs| apply_text_drag(objs, &drag, img, fonts.as_deref()))
-                    .unwrap_or(false);
-                if changed {
-                    drag.moved = true;
-                    self.mark_comic_dirty();
+                // 閾値を超えるまで変形を適用しない (単なるクリックでハンドルが微小に
+                // 動く / 不要保存が出るのを防ぐ。ラボの resp.dragged() 相当)。
+                const DRAG_ARM_PX: f32 = 4.0;
+                if drag.armed || (pos - drag.start).length() >= DRAG_ARM_PX {
+                    drag.armed = true;
+                    let img = view.screen_to_image(pos);
+                    let changed = self
+                        .comic_docs
+                        .get_mut(&key)
+                        .map(|objs| apply_text_drag(objs, &drag, img, fonts.as_deref()))
+                        .unwrap_or(false);
+                    if changed {
+                        drag.moved = true;
+                        self.mark_comic_dirty();
+                    }
+                    drag.last_img = img;
                 }
-                drag.last_img = img;
                 self.text_drag = Some(drag);
             }
         }
@@ -1185,9 +1193,9 @@ impl App {
         let font_key = crate::comic_overlay::COMIC_FONT_KEY.to_string();
 
         let mut open = true;
-        let mut chosen: Option<ShapeKind> = None;
+        let mut chosen: Option<BubblePreset> = None;
         let avail = ctx.content_rect();
-        let default_w = (avail.width() - 24.0).clamp(360.0, 560.0);
+        let default_w = (avail.width() - 24.0).clamp(360.0, 600.0);
         let default_h = (avail.height() - 120.0).clamp(240.0, 560.0);
         let frame = egui::Frame::window(ctx.style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
@@ -1216,13 +1224,15 @@ impl App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let cell = 92.0;
-                        let cols = ((ui.available_width() / (cell + 8.0)).floor() as usize).max(1);
-                        for chunk in ShapeKind::ALL.chunks(cols) {
+                        let cols = ((ui.available_width() / (PRESET_CELL_W + 8.0)).floor()
+                            as usize)
+                            .max(1);
+                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                        for chunk in BubblePreset::ALL.chunks(cols) {
                             ui.horizontal_top(|ui| {
-                                for &k in chunk {
-                                    if shape_preview_cell(ui, k, cell) {
-                                        chosen = Some(k);
+                                for &preset in chunk {
+                                    if draw_bubble_preset_thumbnail(ui, preset) {
+                                        chosen = Some(preset);
                                     }
                                 }
                             });
@@ -1231,22 +1241,17 @@ impl App {
             });
 
         self.text_add_bubble_dialog = open;
-        if let Some(k) = chosen {
+        if let Some(preset) = chosen {
             let mut objs = self.comic_docs.remove(&key).unwrap_or_default();
             let id = next_id(&objs);
             let z = objs.len() as i32;
-            let hw = (sw * 0.14).clamp(60.0, 480.0);
-            let hh = (sh * 0.09).clamp(40.0, 360.0);
-            let mut b = BubbleObject {
-                shape: k.to_shape(hw, hh),
-                ..BubbleObject::default()
-            };
-            b.text.text = "セリフ".to_string();
-            b.text.font_key = font_key.clone();
-            b.text.size_px = (sh * 0.035).clamp(22.0, 80.0);
-            // auto_size を切って、選んだ形状サイズをそのまま使う (空文字でも潰れない)。
-            b.auto_size = false;
-            let mut o = AnnotationObject::new_bubble(id, (sw * 0.5, sh * 0.5), b);
+            // 画像中心に、ソース寸法に合わせたサイズで配置 (build_bubble は auto_size=true
+            // なのでセリフ文字数に合わせて自動でフィットする)。
+            let pivot = (sw * 0.5, sh * 0.5);
+            let mut b = preset.build_bubble(pivot, &font_key);
+            // ソース解像度に合わせて文字サイズだけ調整 (既定 40px はラボ基準)。
+            b.text.size_px = (sh * 0.035).clamp(24.0, 96.0);
+            let mut o = AnnotationObject::new_bubble(id, pivot, b);
             o.z = z;
             objs.push(o);
             self.text_selected = Some(id);
@@ -1276,8 +1281,8 @@ impl App {
         let mut open = true;
         let mut chosen: Option<usize> = None;
         let avail = ctx.content_rect();
-        let default_w = 360.0_f32;
-        let default_h = 300.0_f32;
+        let default_w = (avail.width() - 24.0).clamp(320.0, 540.0);
+        let default_h = (avail.height() - 120.0).clamp(220.0, 460.0);
         let frame = egui::Frame::window(ctx.style().as_ref())
             .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 248))
             .stroke(egui::Stroke::new(
@@ -1302,15 +1307,22 @@ impl App {
                         .color(egui::Color32::from_gray(190)),
                 );
                 ui.separator();
-                for (i, p) in WIN_PRESETS.iter().enumerate() {
-                    if ui
-                        .add_sized([ui.available_width(), 34.0], egui::Button::new(p.label))
-                        .clicked()
-                    {
-                        chosen = Some(i);
-                    }
-                    ui.add_space(4.0);
-                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let cols =
+                            ((ui.available_width() / (WIN_CELL_W + 8.0)).floor() as usize).max(1);
+                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                        for chunk in (0..WIN_PRESETS.len()).collect::<Vec<_>>().chunks(cols) {
+                            ui.horizontal_top(|ui| {
+                                for &i in chunk {
+                                    if draw_winpreset_thumbnail(ui, &WIN_PRESETS[i]) {
+                                        chosen = Some(i);
+                                    }
+                                }
+                            });
+                        }
+                    });
             });
 
         self.text_add_window_dialog = open;
@@ -1394,58 +1406,595 @@ const WIN_PRESETS: &[WinPreset] = &[
     },
 ];
 
-/// 形状ピッカーの 1 セル: 上部に形状アウトラインのプレビュー、下部にラベル。クリックで true。
-fn shape_preview_cell(ui: &mut egui::Ui, kind: ShapeKind, cell: f32) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(cell, cell + 18.0), egui::Sense::click());
-    let painter = ui.painter_at(rect);
-    let bg = if resp.hovered() {
-        egui::Color32::from_gray(64)
-    } else {
-        egui::Color32::from_gray(42)
-    };
-    painter.rect_filled(rect, 4.0, bg);
-    let pad = 9.0;
-    let area = egui::Rect::from_min_size(
-        rect.min + egui::vec2(pad, pad),
-        egui::vec2(cell - 2.0 * pad, cell - 2.0 * pad),
-    );
-    let shape = kind.to_shape(40.0, 28.0);
-    let pts = comic_core::tessellate_bubble(&shape, (0.0, 0.0));
-    if pts.len() >= 2 {
-        let (mut minx, mut miny, mut maxx, mut maxy) = (
-            f32::INFINITY,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-        );
-        for &(x, y) in &pts {
-            minx = minx.min(x);
-            miny = miny.min(y);
-            maxx = maxx.max(x);
-            maxy = maxy.max(y);
+/// ウィンドウプリセット 1 セルの幅。
+const WIN_CELL_W: f32 = 116.0;
+
+/// ウィンドウプリセットを `area` 内にプレビュー描画 (塗り + 枠 + 本文見立ての線)。
+/// ラボ `paint_window_preview` の簡易版 (WinPreset は gradient_to 等を持たないので
+/// scrim は上下の濃淡帯で近似する)。
+fn paint_winpreset_preview(painter: &egui::Painter, area: egui::Rect, p: &WinPreset) {
+    let to_c = |c: Rgba, a: u8| egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, a);
+    let corner = 4.0;
+    if let Some(fill) = p.fill {
+        match p.fill_mode {
+            FillMode::None => {}
+            FillMode::GradientScrim => {
+                // 下が濃い縦グラデーションを 2 帯で近似 (上=薄 / 下=濃)。
+                let mid = area.center().y;
+                painter.rect_filled(
+                    egui::Rect::from_min_max(area.min, egui::pos2(area.right(), mid)),
+                    0.0,
+                    to_c(fill, fill.a / 5),
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(area.left(), mid), area.max),
+                    0.0,
+                    to_c(fill, fill.a),
+                );
+            }
+            _ => {
+                // Solid / Translucent: fill.a をそのまま使う。
+                painter.rect_filled(area, corner, to_c(fill, fill.a));
+            }
         }
-        let bw = (maxx - minx).max(1.0);
-        let bh = (maxy - miny).max(1.0);
-        let s = (area.width() / bw).min(area.height() / bh);
-        let mid = ((minx + maxx) * 0.5, (miny + maxy) * 0.5);
-        let c = area.center();
-        let map = |p: (f32, f32)| egui::pos2(c.x + (p.0 - mid.0) * s, c.y + (p.1 - mid.1) * s);
-        let n = pts.len();
-        for i in 0..n {
-            painter.line_segment(
-                [map(pts[i]), map(pts[(i + 1) % n])],
-                egui::Stroke::new(1.6, egui::Color32::WHITE),
+    }
+    if !matches!(p.frame, FrameStyle::None) {
+        let stroke = egui::Stroke::new(
+            (p.outline_w * 0.5).clamp(1.0, 3.0),
+            to_c(p.outline, p.outline.a),
+        );
+        painter.rect_stroke(area, corner, stroke, egui::StrokeKind::Inside);
+        if matches!(p.frame, FrameStyle::DoubleLine) {
+            painter.rect_stroke(
+                area.shrink(3.0),
+                (corner - 1.0).max(0.0),
+                stroke,
+                egui::StrokeKind::Inside,
             );
         }
     }
-    painter.text(
-        egui::pos2(rect.center().x, rect.max.y - 9.0),
-        egui::Align2::CENTER_CENTER,
-        kind.label(),
-        egui::FontId::proportional(11.0),
-        egui::Color32::from_gray(220),
-    );
-    resp.clicked()
+    // 本文見立ての線 2 本 (白)。
+    let line_col = egui::Color32::from_gray(210);
+    for i in 0..2 {
+        let y = area.top() + area.height() * (0.45 + i as f32 * 0.22);
+        painter.line_segment(
+            [
+                egui::pos2(area.left() + 8.0, y),
+                egui::pos2(area.right() - 8.0 - i as f32 * 16.0, y),
+            ],
+            egui::Stroke::new(3.0, line_col),
+        );
+    }
+}
+
+/// ウィンドウプリセットのサムネイル 1 枚 (プレビュー + ラベル)。クリックで true。
+fn draw_winpreset_thumbnail(ui: &mut egui::Ui, p: &WinPreset) -> bool {
+    const PREVIEW_H: f32 = 60.0;
+    ui.vertical(|ui| {
+        ui.set_width(WIN_CELL_W);
+        let (rect, r) =
+            ui.allocate_exact_size(egui::vec2(WIN_CELL_W, PREVIEW_H), egui::Sense::click());
+        let hovered = r.hovered();
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(
+            rect,
+            4.0,
+            if hovered {
+                egui::Color32::from_rgb(70, 70, 74)
+            } else {
+                egui::Color32::from_rgb(46, 46, 50)
+            },
+        );
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(
+                1.0,
+                if hovered {
+                    egui::Color32::from_rgb(150, 195, 255)
+                } else {
+                    egui::Color32::from_gray(70)
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        paint_winpreset_preview(&painter, rect.shrink(7.0), p);
+        ui.add(egui::Label::new(
+            egui::RichText::new(p.label)
+                .size(11.0)
+                .color(egui::Color32::WHITE),
+        ));
+        r.clicked()
+    })
+    .inner
+}
+
+/// 吹き出しプリセット 1 セルの幅 (追加ダイアログのグリッド列)。ラボ `PRESET_CELL_W`。
+const PRESET_CELL_W: f32 = 96.0;
+
+/// 既定のしっぽ (下左 45°)。ラボ `default_bubble_tail` と同式。
+fn default_bubble_tail(pivot: (f32, f32)) -> Tail {
+    const TAIL_DIAG: f32 = 106.0;
+    Tail {
+        tip: (pivot.0 - TAIL_DIAG, pivot.1 + TAIL_DIAG),
+        base_t: 0.25,
+        base_auto: true,
+        width_px: 32.0,
+        kind: TailKind::Spike,
+    }
+}
+
+/// 吹き出しプリセット = 形状 + しっぽ + 塗り + 縁取り + 文字スタイルの束。ラボ
+/// `BubblePreset` を移植 (preset 永続化用の sys_slug は省略)。これにより追加ダイアログの
+/// プレビューが「実際に焼かれる吹き出し」と一致する。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BubblePreset {
+    Normal,
+    RoundRect,
+    Narration,
+    Thought,
+    Shout,
+    Whisper,
+    Soft,
+    Polygon,
+    Diamond,
+    Heart,
+    Arrow,
+    MotionLines,
+    SpeedLines,
+    Concentration,
+    MindEllipse,
+    Strokes,
+    DoubleStroke,
+    TextOnly,
+}
+
+impl BubblePreset {
+    const ALL: &'static [BubblePreset] = &[
+        BubblePreset::Normal,
+        BubblePreset::RoundRect,
+        BubblePreset::Soft,
+        BubblePreset::Narration,
+        BubblePreset::Thought,
+        BubblePreset::MindEllipse,
+        BubblePreset::Shout,
+        BubblePreset::Whisper,
+        BubblePreset::Concentration,
+        BubblePreset::Polygon,
+        BubblePreset::Diamond,
+        BubblePreset::Heart,
+        BubblePreset::Arrow,
+        BubblePreset::MotionLines,
+        BubblePreset::SpeedLines,
+        BubblePreset::Strokes,
+        BubblePreset::DoubleStroke,
+        BubblePreset::TextOnly,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            BubblePreset::Normal => "通常",
+            BubblePreset::RoundRect => "角丸",
+            BubblePreset::Narration => "ナレーション",
+            BubblePreset::Thought => "思考",
+            BubblePreset::Shout => "叫び",
+            BubblePreset::Whisper => "ささやき",
+            BubblePreset::Soft => "やわらか",
+            BubblePreset::Polygon => "多角形",
+            BubblePreset::Diamond => "ダイヤ",
+            BubblePreset::Heart => "ハート",
+            BubblePreset::Arrow => "矢印",
+            BubblePreset::MotionLines => "集中線",
+            BubblePreset::SpeedLines => "流線",
+            BubblePreset::Concentration => "意識",
+            BubblePreset::MindEllipse => "思考(楕円)",
+            BubblePreset::Strokes => "線",
+            BubblePreset::DoubleStroke => "二重線",
+            BubblePreset::TextOnly => "なし",
+        }
+    }
+
+    fn shape(self) -> BubbleShape {
+        match self {
+            BubblePreset::Normal | BubblePreset::Whisper => BubbleShape::Ellipse {
+                rx: 160.0,
+                ry: 100.0,
+            },
+            BubblePreset::RoundRect => BubbleShape::RoundRect {
+                half_w: 160.0,
+                half_h: 100.0,
+                corner_px: 28.0,
+            },
+            BubblePreset::Narration => BubbleShape::RoundRect {
+                half_w: 170.0,
+                half_h: 90.0,
+                corner_px: 0.0,
+            },
+            BubblePreset::Thought => BubbleShape::Cloud {
+                rx: 170.0,
+                ry: 115.0,
+                lobes: 11,
+                amp: 0.14,
+                shape_seed: 0,
+            },
+            BubblePreset::Shout => BubbleShape::Burst {
+                rx: 170.0,
+                ry: 120.0,
+                spikes: 20,
+                jag: 0.55,
+                shape_seed: 1,
+            },
+            BubblePreset::Soft => BubbleShape::Soft {
+                half_w: 165.0,
+                half_h: 105.0,
+                corner_px: 38.0,
+                shape_seed: 0,
+            },
+            BubblePreset::Polygon => BubbleShape::Polygon {
+                rx: 155.0,
+                ry: 125.0,
+                sides: 6,
+            },
+            BubblePreset::Diamond => BubbleShape::Diamond {
+                half_w: 160.0,
+                half_h: 130.0,
+            },
+            BubblePreset::Heart => BubbleShape::Heart {
+                rx: 150.0,
+                ry: 140.0,
+            },
+            BubblePreset::Arrow => BubbleShape::Arrow {
+                half_w: 150.0,
+                half_h: 110.0,
+                dir_rad: -std::f32::consts::FRAC_PI_2,
+            },
+            BubblePreset::MotionLines => BubbleShape::MotionLines {
+                rx: 240.0,
+                ry: 180.0,
+                count: 72,
+                shape_seed: 0,
+            },
+            BubblePreset::SpeedLines => BubbleShape::SpeedLines {
+                half_w: 260.0,
+                half_h: 170.0,
+                dir_rad: 0.0,
+                count: 48,
+                shape_seed: 0,
+            },
+            BubblePreset::Concentration => BubbleShape::Concentration {
+                rx: 180.0,
+                ry: 120.0,
+                shape_seed: 0,
+            },
+            BubblePreset::MindEllipse => BubbleShape::Ellipse {
+                rx: 165.0,
+                ry: 110.0,
+            },
+            BubblePreset::Strokes => BubbleShape::Strokes {
+                half_w: 165.0,
+                half_h: 105.0,
+                corner_px: 36.0,
+                shape_seed: 0,
+            },
+            BubblePreset::DoubleStroke => BubbleShape::DoubleStroke {
+                half_w: 165.0,
+                half_h: 105.0,
+                corner_px: 26.0,
+                gap_px: 8.0,
+            },
+            BubblePreset::TextOnly => BubbleShape::TextOnly {
+                half_w: 150.0,
+                half_h: 95.0,
+            },
+        }
+    }
+
+    fn tail_kind(self) -> Option<TailKind> {
+        match self {
+            BubblePreset::Narration
+            | BubblePreset::MotionLines
+            | BubblePreset::SpeedLines
+            | BubblePreset::Concentration
+            | BubblePreset::TextOnly
+            | BubblePreset::Arrow => None,
+            BubblePreset::Thought | BubblePreset::MindEllipse => Some(TailKind::Thought),
+            _ => Some(TailKind::Spike),
+        }
+    }
+
+    fn text_outline(self) -> Option<StrokeStyle> {
+        match self {
+            BubblePreset::MotionLines | BubblePreset::SpeedLines => Some(StrokeStyle {
+                color: Rgba::WHITE,
+                width_px: 6.0,
+            }),
+            _ => None,
+        }
+    }
+
+    fn outline_width(self) -> f32 {
+        match self {
+            BubblePreset::Shout => 5.0,
+            BubblePreset::Whisper => 1.5,
+            _ => 3.0,
+        }
+    }
+
+    fn text_align(self) -> TextAlign {
+        match self {
+            BubblePreset::Narration => TextAlign::Start,
+            _ => TextAlign::Center,
+        }
+    }
+
+    fn text_color(self) -> Rgba {
+        match self {
+            BubblePreset::Whisper => Rgba::new(120, 120, 120, 255),
+            _ => Rgba::BLACK,
+        }
+    }
+
+    /// 新規吹き出しを構築 (縦書き + markup ON、ラボの追加既定に一致)。
+    fn build_bubble(self, pivot: (f32, f32), font_key: &str) -> BubbleObject {
+        let mut b = BubbleObject {
+            shape: self.shape(),
+            fill: Some(Rgba::WHITE),
+            fill_opacity: 1.0,
+            outline: StrokeStyle {
+                color: Rgba::BLACK,
+                width_px: self.outline_width(),
+            },
+            tail: None,
+            padding_px: 16.0,
+            decorations: Vec::new(),
+            text: TextBlock {
+                text: "セリフ".to_string(),
+                font_key: font_key.to_string(),
+                size_px: 40.0,
+                color: self.text_color(),
+                align: self.text_align(),
+                orientation: Orientation::Vertical,
+                markup_enabled: true,
+                outline: self.text_outline(),
+                ..TextBlock::default()
+            },
+            auto_size: true,
+            merge_with_below: false,
+            shape_preset_link: None,
+        };
+        if let Some(kind) = self.tail_kind() {
+            let mut tail = default_bubble_tail(pivot);
+            tail.kind = kind;
+            b.tail = Some(tail);
+        }
+        b
+    }
+}
+
+/// 吹き出しプリセットを `area` 内に縮小フィットで描く (塗り + 統合アウトライン +
+/// しっぽ)。comic-core ジオメトリを使うので焼き上がりと一致。ラボ `paint_bubble_preview`。
+fn paint_bubble_preview(painter: &egui::Painter, area: egui::Rect, preset: BubblePreset) {
+    use egui::{Color32, Pos2};
+    let pivot = (0.0f32, 0.0f32);
+    let shape = preset.shape();
+
+    // なし: 箱なし — テキスト見立ての線 2 本。
+    if matches!(shape, BubbleShape::TextOnly { .. }) {
+        let line_col = Color32::from_gray(210);
+        for i in 0..2 {
+            let y = area.top() + area.height() * (0.40 + i as f32 * 0.24);
+            painter.line_segment(
+                [
+                    egui::pos2(area.left() + 10.0, y),
+                    egui::pos2(area.right() - 10.0 - i as f32 * 14.0, y),
+                ],
+                egui::Stroke::new(3.0, line_col),
+            );
+        }
+        return;
+    }
+
+    const CLEAR: f32 = 0.55; // comic_core::LINE_FIELD_CLEAR_RATIO 相当
+    let line_col = Color32::from_gray(210);
+    if matches!(shape, BubbleShape::MotionLines { .. }) {
+        let (cx, cy) = (area.center().x, area.center().y);
+        let (rx, ry) = (area.width() * 0.46, area.height() * 0.46);
+        let n = 22;
+        for i in 0..n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            let (c, s) = (a.cos(), a.sin());
+            painter.line_segment(
+                [
+                    egui::pos2(cx + rx * CLEAR * c, cy + ry * CLEAR * s),
+                    egui::pos2(cx + rx * c, cy + ry * s),
+                ],
+                egui::Stroke::new(1.4, line_col),
+            );
+        }
+        return;
+    }
+    if matches!(shape, BubbleShape::SpeedLines { .. }) {
+        let (cx, cy) = (area.center().x, area.center().y);
+        let (rx, ry) = (area.width() * 0.47, area.height() * 0.44);
+        let n = 9;
+        for i in 0..n {
+            let f = i as f32 / (n as f32 - 1.0) * 2.0 - 1.0;
+            let yoff = f * ry;
+            let outer_k = 1.0 - (yoff / ry).powi(2);
+            if outer_k <= 0.0 {
+                continue;
+            }
+            let half = rx * outer_k.sqrt();
+            let y = cy + yoff;
+            let clear_k = (CLEAR * CLEAR) - (yoff / ry).powi(2);
+            let gap = if clear_k > 0.0 {
+                rx * clear_k.sqrt()
+            } else {
+                0.0
+            };
+            if gap > 0.0 {
+                painter.line_segment(
+                    [egui::pos2(cx - half, y), egui::pos2(cx - gap, y)],
+                    egui::Stroke::new(1.4, line_col),
+                );
+                painter.line_segment(
+                    [egui::pos2(cx + gap, y), egui::pos2(cx + half, y)],
+                    egui::Stroke::new(1.4, line_col),
+                );
+            } else {
+                painter.line_segment(
+                    [egui::pos2(cx - half, y), egui::pos2(cx + half, y)],
+                    egui::Stroke::new(1.4, line_col),
+                );
+            }
+        }
+        return;
+    }
+    if let BubbleShape::Concentration { .. } = shape {
+        let c = area.center();
+        let r = egui::vec2(area.width() * 0.44, area.height() * 0.44);
+        painter.add(egui::Shape::ellipse_filled(
+            c,
+            r,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+        ));
+        painter.add(egui::Shape::ellipse_stroke(
+            c,
+            r,
+            egui::Stroke::new(1.2, Color32::from_gray(180)),
+        ));
+        return;
+    }
+
+    let tail = preset.tail_kind().map(|kind| Tail {
+        tip: (-70.0, 200.0),
+        base_t: 0.30,
+        base_auto: true,
+        width_px: 60.0,
+        kind,
+    });
+    let geo = comic_core::bubble_geometry(&shape, pivot, tail.as_ref());
+
+    let mut min = (f32::INFINITY, f32::INFINITY);
+    let mut max = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut grow = |x: f32, y: f32| {
+        min.0 = min.0.min(x);
+        min.1 = min.1.min(y);
+        max.0 = max.0.max(x);
+        max.1 = max.1.max(y);
+    };
+    for &(x, y) in &geo.outline {
+        grow(x, y);
+    }
+    for &(cx, cy, r) in &geo.thought {
+        grow(cx - r, cy - r);
+        grow(cx + r, cy + r);
+    }
+    if !min.0.is_finite() {
+        return;
+    }
+    let w = (max.0 - min.0).max(1.0);
+    let h = (max.1 - min.1).max(1.0);
+    let scale = (area.width() / w).min(area.height() / h);
+    let cx = (min.0 + max.0) * 0.5;
+    let cy = (min.1 + max.1) * 0.5;
+    let map = |p: (f32, f32)| -> Pos2 {
+        Pos2::new(
+            area.center().x + (p.0 - cx) * scale,
+            area.center().y + (p.1 - cy) * scale,
+        )
+    };
+
+    let fill = Color32::WHITE;
+    let stroke = egui::Stroke::new((preset.outline_width() * scale).max(1.0), Color32::BLACK);
+
+    // 統合アウトラインを pivot からの三角形ファンで塗る (concave でも star-shaped)。
+    let center = map(pivot);
+    let outline: Vec<Pos2> = geo.outline.iter().map(|&p| map(p)).collect();
+    if outline.len() >= 3 {
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(center, fill);
+        for &p in &outline {
+            mesh.colored_vertex(p, fill);
+        }
+        let n = outline.len() as u32;
+        for i in 0..n {
+            let a = 1 + i;
+            let b = 1 + (i + 1) % n;
+            mesh.add_triangle(0, a, b);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+        painter.add(egui::Shape::closed_line(outline, stroke));
+    }
+    // 二重線: 内側の同心リング。
+    if let BubbleShape::DoubleStroke {
+        half_w,
+        half_h,
+        corner_px,
+        gap_px,
+    } = shape
+    {
+        let g = gap_px.max(1.0);
+        let inner_shape = BubbleShape::RoundRect {
+            half_w: (half_w - g).max(1.0),
+            half_h: (half_h - g).max(1.0),
+            corner_px: (corner_px - g).max(0.0),
+        };
+        let inner: Vec<Pos2> = comic_core::tessellate_bubble(&inner_shape, pivot)
+            .iter()
+            .map(|&p| map(p))
+            .collect();
+        if inner.len() >= 3 {
+            painter.add(egui::Shape::closed_line(inner, stroke));
+        }
+    }
+    // 思考のしっぽ円 (塗り + 縁取り)。
+    for &(tcx, tcy, r) in &geo.thought {
+        let c = map((tcx, tcy));
+        painter.circle(c, r * scale, fill, stroke);
+    }
+}
+
+/// 吹き出しプリセットのサムネイル 1 枚 (描画プレビュー + ラベル)。クリックで true。
+fn draw_bubble_preset_thumbnail(ui: &mut egui::Ui, preset: BubblePreset) -> bool {
+    const PREVIEW_H: f32 = 64.0;
+    ui.vertical(|ui| {
+        ui.set_width(PRESET_CELL_W);
+        let (rect, r) =
+            ui.allocate_exact_size(egui::vec2(PRESET_CELL_W, PREVIEW_H), egui::Sense::click());
+        let hovered = r.hovered();
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(
+            rect,
+            4.0,
+            if hovered {
+                egui::Color32::from_rgb(60, 60, 64)
+            } else {
+                egui::Color32::from_rgb(40, 40, 44)
+            },
+        );
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(
+                1.0,
+                if hovered {
+                    egui::Color32::from_rgb(150, 195, 255)
+                } else {
+                    egui::Color32::from_gray(70)
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        paint_bubble_preview(&painter, rect.shrink(8.0), preset);
+        ui.add(egui::Label::new(
+            egui::RichText::new(preset.label())
+                .size(11.0)
+                .color(egui::Color32::WHITE),
+        ));
+        r.clicked()
+    })
+    .inner
 }
 
 // ── パネル UI ヘルパー (self を借りない純 UI 関数) ──────────────────────
@@ -2233,7 +2782,9 @@ mod tests {
         let drag = TextDrag {
             id: 1,
             kind: TextDragKind::Rotate,
+            start: egui::pos2(0.0, 0.0),
             last_img: (0.0, 0.0),
+            armed: true,
             moved: false,
         };
         // 中心の真右 → atan2(0,+) + π/2 = π/2。
@@ -2251,7 +2802,9 @@ mod tests {
         let drag = TextDrag {
             id: 1,
             kind: TextDragKind::Corner(2),
+            start: egui::pos2(0.0, 0.0),
             last_img: (0.0, 0.0),
+            armed: true,
             moved: false,
         };
         assert!(apply_text_drag(&mut objs, &drag, (180.0, 100.0), None));
