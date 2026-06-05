@@ -1,7 +1,7 @@
 # テキスト注釈(comic)機能 — 本体 mIV 統合計画
 
-Status: 計画 v2.2（**Inc 0 完了** = lab→master マージ済み・comic-core 依存配線済み）
-更新: 2026-06-05（Inc 0 完了。次は Inc 1 = 最前面オーバーレイ表示）
+Status: 計画 v2.3（**Inc 1 表示部 完了** = 最前面オーバーレイ実機検証 PASS・同期ベイク方針確定）
+更新: 2026-06-05（Inc 1 表示部 完了・検証 PASS。次は Inc 2 = 永続化 comic.db）
 対象ブランチ: `master`（lab を `6ac779b2` でマージ。comic-core は本体の依存）
 
 ラボ（`tools/comic_lab` + `crates/comic-core`）で完成させた吹き出し/テキスト/スタンプ/
@@ -308,11 +308,21 @@ master に対して再確認する**（このスナップショットに固定�
     resvg をランタイムに足さない）。実 vendoring は Inc 4c。
   - ✅ 受け入れ: `cargo build -p mimageviewer --bin mimageviewer-core` 緑 / 既存テスト 1980 passed 0 failed /
     comic-core テスト 93 passed 0 failed / `cargo fmt --check` clean。mIV から comic-core 参照可。
-- **Inc 1: 最前面オーバーレイ表示（読み取り専用）＋ 座標/回転/worker 基盤**
-  - 固定 or ファイルの `Vec<AnnotationObject>` を §5.4 の変換でベイクし最終画像の上に合成表示（D1）。
-    canonical 座標＋回転ポリシー（D8）を確定・実装。**ベイク＋アップロードを worker 化＋1 フレ 1 枚律速**。
-  - 受け入れ: crop/AI/色補正/回転を変えてもテキストが正しい位置・解像度・回転で最前面に乗る（くっきり）。
-    `analyze_perf.py hitches` で編集外のヒッチ無し。
+- **Inc 1: 最前面オーバーレイ表示（読み取り専用）＋ 座標/回転基盤** — ✅ **表示部 完了（2026-06-05、実機検証 PASS）**
+  - ✅ デモフィクスチャ（`comic_overlay::demo_objects`、`MIV_COMIC_DEMO=1` でゲート）を §5.4 の
+    **S=1（source 解像度直焼き＝くっきり）** でベイクし最終 composite の上に src-over 合成して最前面表示（D1）。
+    回転は paint-time の `draw_rotated_image_ex` が下地と一緒に掛けるので comic 側は非回転 canonical のまま（D8）。
+  - ✅ 配線: `comic_overlay.rs`（純合成 + フォントローダ + フィクスチャ）/ `ComicCacheEntry`（base Arc 保持で
+    ABA 回避）/ `ensure_comic_composite_texture`（早期ゲート → 下地 → ベイク → 合成 → upload）/
+    `resolve_fs_processed_texture`・`resolve_fs_display_tex` への注入 / final pipeline + 5 ライフサイクル点での
+    キャッシュ連動破棄。Codex レビュー P1 なし、P2（ABA/eviction）・P3（早期ゲート）対応済み。
+  - ✅ 受け入れ: 実機で crop/AI/色補正/回転を変えてもテキストが正しい位置・解像度・回転で最前面・くっきり
+    （ユーザー目視 PASS）。`cargo test` 緑（comic_overlay 単体 4 本含む）。
+  - **worker 化は保留（方針変更）**: comic のベイクは「画像ごと 1 回・キャッシュ済み」で毎フレームではなく、
+    既存の隠蔽（conceal）も同期合成で出荷済み。よって **同期ベイク + 80ms 超過 perf ログ**（conceal と同流儀）で
+    揃え、worker 化は **Inc 4+ の実コンテンツ（多オブジェクト）で実測してから必要に応じて**入れる（§10 / §11 更新）。
+    `bake+composite+upload` の計測ログを `ensure_comic_composite_texture` に計装済み。
+  - 残（Inc 2 以降）: 実データ読み込み（デモ撤去）、編集モード、座標逆写像（編集時、§5.3）。
 - **Inc 2: 永続化**
   - `comic.db` 読み書き（スキーマ版数）＋ `mimageviewer.dat` ミラー（バックアップ ON 時、OFF→ON
     バックフィル §6.3）。`page_path_key` で通常/ZIP/PDF。
@@ -366,8 +376,11 @@ master に対して再確認する**（このスナップショットに固定�
 ## 10. mIV 制約の遵守チェックリスト
 
 - **UI スレッド同期 I/O 禁止**（`docs/ui-responsiveness.md` §4）: 注釈ベイク（フル解像度 RGBA）＋
-  `ctx.load_texture` は重い。**Inc 1 から worker 化＋1 フレ 1 枚律速**。編集中の連続ベイクはアダプティブ
-  スロットル（ラボ `last_bake_dur` を移植）。
+  `ctx.load_texture` は重い。**現状は同期ベイク + 80ms 超過 perf ログ**（既存の隠蔽 conceal が同期合成で
+  出荷済み＝同流儀。comic ベイクは画像ごと 1 回・キャッシュ済みで毎フレームではない）。
+  **worker 化は Inc 4+ の実コンテンツ（多オブジェクト）で実測してから必要に応じて**入れる（毎フレーム連続
+  ベイクが発生する編集中プレビュー〔Inc 3/6〕で hitch が出たら、ラボ `last_bake_dur` のアダプティブ
+  スロットル＋worker 化を移植）。判断材料として `ensure_comic_composite_texture` に計測ログを計装済み。
 - **read_dir は `entry.file_type()`**。
 - **IME**: Enter/Escape は `dialog_enter_pressed`/`dialog_escape_pressed` 経由。新ビューポート入口で
   `update_ime_state`。
@@ -385,7 +398,9 @@ master に対して再確認する**（このスナップショットに固定�
 - ~~**§5.4 のスケールヘルパー位置**~~: **確定** — comic-core 加法ヘルパー
   `comic_core::scale_scene`（`transform.rs`）として実装済み（2026-06-05 安全プレップ）。crop translate の
   合成だけ Inc 1 で mIV 側に書く。
-- **表示ベイク解像度**: 表示は表示解像度か（速度）、常に出力解像度か（鮮明）。実測で（Inc 1）。
+- ~~**表示ベイク解像度**~~: **確定（Inc 1）** — 下地 `ensure_final_composite_pixels` が canonical ソース
+  解像度なので **S=1 で source 解像度に直焼き（くっきり優先）**。同期ベイク + 80ms 超過 perf ログで計装。
+  GPU が表示サイズへ縮小。実機で問題なし（多オブジェクト時の worker 化は Inc 4+ で実測判断、§10）。
 - **スタンプ GPU quad の mIV 統合**: まず 1 枚 CPU ベイク（`StampImages`）で動かし、後段でラボの GPU quad
   最適化を移植。テクスチャ eviction を mIV 流儀へ（Inc 4c / Inc 8）。
 - **フォント列挙**: mIV のフォント列挙（`winreg`）再利用か comic-core 側か（Inc 4b）。
