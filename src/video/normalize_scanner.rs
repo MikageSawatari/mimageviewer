@@ -45,6 +45,10 @@ use crate::video::normalize_types::NormalizeResult;
 
 /// EBU R128 が integrated LUFS を信頼できる動画長 (秒)。
 const MIN_RELIABLE_DURATION_SECS: f64 = 30.0;
+/// 長尺動画で仮 gain を返す既定スキャン量。10 分ぶん測れたら再生を始め、最終 scan は継続する。
+pub const PROVISIONAL_SCAN_AFTER_SECS: f64 = 10.0 * 60.0;
+/// 仮結果として採用する最低 loudness。先頭側が無音に近い動画で +24dB 仮 gain を返さない。
+const PROVISIONAL_MIN_VALID_LUFS: f32 = -70.0;
 /// scanner 内で固定する出力 sample rate。filter graph の aformat で揃える。
 ///
 /// ⚠️ 再生側 (`decoder.rs::audio_setup`) は cpal の出力デバイス sample rate を使うため
@@ -105,6 +109,41 @@ pub fn scan_audio_loudness(
     target_lufs_milli: i32,
     cancel: Arc<AtomicBool>,
     progress: Arc<NormalizeScanProgress>,
+) -> Result<NormalizeResult, NormalizeScanError> {
+    let mut noop = |_result: NormalizeResult| {};
+    scan_audio_loudness_impl(path, target_lufs_milli, cancel, progress, None, &mut noop)
+}
+
+/// `provisional_after_secs` ぶん処理できた時点で、算出可能なら仮 `NormalizeResult` を
+/// `on_provisional` に一度だけ返し、そのまま最後まで scan を継続する。
+///
+/// 仮結果は「現在までに観測した loudness / true peak」だけに基づくため DB 保存しない。
+/// App 側は再生開始用のセッション内 gain として扱い、最終 `Ok` の結果だけを永続化する。
+pub fn scan_audio_loudness_with_provisional(
+    path: &Path,
+    target_lufs_milli: i32,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<NormalizeScanProgress>,
+    provisional_after_secs: f64,
+    on_provisional: &mut dyn FnMut(NormalizeResult),
+) -> Result<NormalizeResult, NormalizeScanError> {
+    scan_audio_loudness_impl(
+        path,
+        target_lufs_milli,
+        cancel,
+        progress,
+        Some(provisional_after_secs),
+        on_provisional,
+    )
+}
+
+fn scan_audio_loudness_impl(
+    path: &Path,
+    target_lufs_milli: i32,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<NormalizeScanProgress>,
+    provisional_after_secs: Option<f64>,
+    on_provisional: &mut dyn FnMut(NormalizeResult),
 ) -> Result<NormalizeResult, NormalizeScanError> {
     let target_lufs = target_lufs_milli as f32 / 1000.0;
 
@@ -181,6 +220,11 @@ pub fn scan_audio_loudness(
     let mut last_true_peak_linear: f32 = 0.0;
     let mut max_momentary_lufs: f32 = f32::NEG_INFINITY;
     let mut emitted_frames: u64 = 0;
+    let mut last_processed_secs = 0.0_f64;
+    let mut provisional_emitted = false;
+    let provisional_after_secs = provisional_after_secs.filter(|secs| {
+        secs.is_finite() && *secs > 0.0 && (duration_secs <= 0.0 || duration_secs > *secs + 1.0)
+    });
 
     // packet を 1 つずつ処理しながら cancel チェック
     let packet_iter = input.packets();
@@ -203,6 +247,7 @@ pub fn scan_audio_loudness(
             let pts_secs =
                 pts as f64 * stream_tb.numerator() as f64 / stream_tb.denominator() as f64;
             if pts_secs.is_finite() && pts_secs >= 0.0 {
+                last_processed_secs = pts_secs;
                 progress
                     .pts_processed_ms
                     .store((pts_secs * 1000.0) as u64, Ordering::Release);
@@ -225,6 +270,17 @@ pub fn scan_audio_loudness(
                 &mut max_momentary_lufs,
                 &mut emitted_frames,
             )?;
+            maybe_emit_provisional(
+                provisional_after_secs,
+                &mut provisional_emitted,
+                last_processed_secs,
+                target_lufs_milli,
+                target_lufs,
+                last_integrated_lufs,
+                last_true_peak_linear,
+                max_momentary_lufs,
+                on_provisional,
+            );
         }
     }
 
@@ -248,6 +304,17 @@ pub fn scan_audio_loudness(
             &mut max_momentary_lufs,
             &mut emitted_frames,
         )?;
+        maybe_emit_provisional(
+            provisional_after_secs,
+            &mut provisional_emitted,
+            last_processed_secs,
+            target_lufs_milli,
+            target_lufs,
+            last_integrated_lufs,
+            last_true_peak_linear,
+            max_momentary_lufs,
+            on_provisional,
+        );
     }
 
     // filter graph EOF: source に NULL を流して下流に EOF 伝播 → 最終 metadata frame を pull
@@ -266,10 +333,68 @@ pub fn scan_audio_loudness(
         &mut emitted_frames,
     )?;
 
-    // ── 結果計算 ──
+    compute_normalize_result(
+        target_lufs_milli,
+        target_lufs,
+        last_integrated_lufs,
+        last_true_peak_linear,
+        max_momentary_lufs,
+        duration_secs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_emit_provisional(
+    provisional_after_secs: Option<f64>,
+    provisional_emitted: &mut bool,
+    processed_secs: f64,
+    target_lufs_milli: i32,
+    target_lufs: f32,
+    last_integrated_lufs: f32,
+    last_true_peak_linear: f32,
+    max_momentary_lufs: f32,
+    on_provisional: &mut dyn FnMut(NormalizeResult),
+) {
+    let Some(threshold_secs) = provisional_after_secs else {
+        return;
+    };
+    if *provisional_emitted || processed_secs < threshold_secs {
+        return;
+    }
+    let measured_secs = processed_secs.max(threshold_secs);
+    match compute_normalize_result(
+        target_lufs_milli,
+        target_lufs,
+        last_integrated_lufs,
+        last_true_peak_linear,
+        max_momentary_lufs,
+        measured_secs,
+    ) {
+        Ok(result) => {
+            if result.integrated_lufs <= PROVISIONAL_MIN_VALID_LUFS
+                && max_momentary_lufs <= PROVISIONAL_MIN_VALID_LUFS
+            {
+                return;
+            }
+            *provisional_emitted = true;
+            on_provisional(result);
+        }
+        Err(NormalizeScanError::SilentInput) | Err(NormalizeScanError::InvalidLoudness) => {}
+        Err(_) => {}
+    }
+}
+
+fn compute_normalize_result(
+    target_lufs_milli: i32,
+    target_lufs: f32,
+    last_integrated_lufs: f32,
+    last_true_peak_linear: f32,
+    max_momentary_lufs: f32,
+    measured_duration_secs: f64,
+) -> Result<NormalizeResult, NormalizeScanError> {
     // 短尺動画 (< 30s) や integrated が無効なら momentary 最大値を使う。
     let integrated_lufs = if !last_integrated_lufs.is_finite()
-        || (duration_secs > 0.0 && duration_secs < MIN_RELIABLE_DURATION_SECS)
+        || (measured_duration_secs > 0.0 && measured_duration_secs < MIN_RELIABLE_DURATION_SECS)
     {
         if max_momentary_lufs.is_finite() {
             max_momentary_lufs
@@ -423,5 +548,72 @@ mod tests {
             progress,
         );
         assert!(result.is_err(), "expected Err, got {:?}", result.ok());
+    }
+
+    #[test]
+    fn compute_result_limits_gain_by_true_peak() {
+        let result =
+            compute_normalize_result(-14000, -14.0, -24.0, 1.0, f32::NEG_INFINITY, 600.0).unwrap();
+
+        assert!((result.gain_db - -1.0).abs() < 1.0e-6);
+        assert!((result.true_peak_db - 0.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn compute_result_uses_momentary_for_short_or_invalid_integrated() {
+        let result =
+            compute_normalize_result(-14000, -14.0, f32::NEG_INFINITY, 0.1, -18.0, 12.0).unwrap();
+
+        assert!((result.integrated_lufs - -18.0).abs() < 1.0e-6);
+        assert!((result.gain_db - 4.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn provisional_emit_waits_for_valid_loudness() {
+        let mut emitted = Vec::new();
+        let mut invalid_emitted_flag = false;
+        maybe_emit_provisional(
+            Some(600.0),
+            &mut invalid_emitted_flag,
+            600.0,
+            -14000,
+            -14.0,
+            f32::NEG_INFINITY,
+            0.0,
+            f32::NEG_INFINITY,
+            &mut |result| emitted.push(result),
+        );
+        assert!(!invalid_emitted_flag);
+        assert!(emitted.is_empty());
+
+        let mut silent_finite_flag = false;
+        maybe_emit_provisional(
+            Some(600.0),
+            &mut silent_finite_flag,
+            600.0,
+            -14000,
+            -14.0,
+            -120.0,
+            0.0,
+            -120.0,
+            &mut |result| emitted.push(result),
+        );
+        assert!(!silent_finite_flag);
+        assert!(emitted.is_empty());
+
+        let mut emitted_flag = false;
+        maybe_emit_provisional(
+            Some(600.0),
+            &mut emitted_flag,
+            600.0,
+            -14000,
+            -14.0,
+            -20.0,
+            0.1,
+            -19.0,
+            &mut |result| emitted.push(result),
+        );
+        assert!(emitted_flag);
+        assert_eq!(emitted.len(), 1);
     }
 }

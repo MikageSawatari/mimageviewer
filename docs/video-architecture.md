@@ -1720,8 +1720,9 @@ buffer は触らない。Codex の A' 案 (`processed` も `raw_pending` も保�
 
 採用理由:
 - `set_normalize_gain` は atomic store だけ。buffer に触らないので audible PTS は連続。
-- 既存 `processed` (~100ms 分) は旧 gain のまま鳴り続けるが、`raw_pending` 経由で
-  新 gain は次の chunk から自然に反映される。100ms 程度の音量ズレは知覚しにくい。
+- audio-pump が目標 gain の変化を検出し、VST3 前段で dB 空間の 4 秒 ramp を行う。
+  既存 `processed` (~100ms 分) は旧 gain のまま鳴り続けるが、`raw_pending` 経由で
+  次に処理する chunk から滑らかに新 gain へ追従する。
 - A/V offset は飛ばない。連続再生で永続ズレを起こさない。
 
 却下した代替案:
@@ -1870,9 +1871,9 @@ cache 自身の 1 本 + decoder に渡した 1 本で `2` になる。`2` より
 | Norm toggle | ✗ | ✗ | ✗ (= 2026-05-11 削除、上の「既知の症状 (修正済)」節参照) |
 
 Norm では `set_normalize_gain` の atomic store のみ行い、`processed` / `raw_pending` /
-`audio_tx_queued` のいずれも触らない。新 gain は `raw_pending` を経由した次の chunk
-から自然に適用される (= 既存 `processed` の最大 ~100ms は旧 gain で鳴り続けるが、
-A/V offset は連続性を保つ)。
+`audio_tx_queued` のいずれも触らない。audio-pump は目標 gain 変更を dB 空間で 4 秒 ramp
+するため、仮 gain → 確定 gain や手動 ON/OFF の段差を滑らかにする (= 既存 `processed`
+の最大 ~100ms は旧 gain で鳴り続けるが、A/V offset は連続性を保つ)。
 ただし open / source-swap 時点で `audio_normalize.db` の測定値が見つかる場合は、
 `build_video_player_for_open` で `VideoPlayer::open` に初期 Norm gain を渡し、音声ワーカー
 起動前の `AvClock` に設定する。これにより再生開始直後の最初の processed chunk から
@@ -1891,10 +1892,14 @@ open / source swap、fullscreen 終了、または全体 OFF で解除する。
 未測定かつ open/source-swap 時点で autoplay する動画は、`VideoPlayer::open` へ渡す
 autoplay を一時的に false にしてから fs_cache に挿入し、`init_normalize_state_for_opened_video`
 後に `start_normalize_scan_for_deferred_play_intent` で scan を開始する。この経路では
-`NormalizeScanState.was_playing=true` を明示しておくため、測定完了後は本来の autoplay /
-resume 意図に戻るが、測定前の未補正音は再生されない。キャッシュ hit の動画を grid から
-再開する場合や、停止中の未測定動画をクリック / Enter で再生する場合も同じ deferred-play
-scan 経路を使う。
+`NormalizeScanState.was_playing=true` を明示しておく。長尺動画では scanner が
+`PROVISIONAL_SCAN_AFTER_SECS` (= 10 分) に到達した時点で `Provisional` を返し、App は
+仮 gain を DB 保存せず現在 player へ適用して再生 intent と `audio_preroll_suspended` を
+復帰する。scanner はそのまま継続し、最終 `Done` のみ `audio_normalize.db` に保存して
+`OnApplied` へ遷移する。確定 gain への差分は audio-pump の 4 秒 ramp で追従する。
+10 分未満の動画や、10 分時点で loudness がまだ有効でない動画は従来通り確定結果まで待つ。
+キャッシュ hit の動画を grid から再開する場合や、停止中の未測定動画をクリック / Enter で
+再生する場合も同じ deferred-play scan 経路を使う。
 pause 中でも audio-pump は最大 ~100ms の `processed` を旧 gain で先読みできるため、
 測定前再生待ちの間は `AvClock::audio_preroll_suspended` を立てて audio-pump の
 raw→processed 先読みを一時停止し、旧 gain の `processed` を作らない。cpal callback 側も

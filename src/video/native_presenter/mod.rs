@@ -6736,8 +6736,11 @@ impl NativeEguiOverlay {
                         use crate::video::normalize_types::NormalizeUiState;
                         let norm_ui_state = self.normalize_state.ui_state;
                         let is_scanning = matches!(norm_ui_state, NormalizeUiState::Scanning);
-                        let norm_active =
-                            matches!(norm_ui_state, NormalizeUiState::OnApplied { .. });
+                        let norm_active = matches!(
+                            norm_ui_state,
+                            NormalizeUiState::OnApplied { .. }
+                                | NormalizeUiState::ProvisionalApplied { .. }
+                        );
                         let norm_unmeasured =
                             matches!(norm_ui_state, NormalizeUiState::OnUnmeasured);
                         let norm_resp = ui.interact(
@@ -6751,6 +6754,9 @@ impl NativeEguiOverlay {
                             }
                             NormalizeUiState::OnApplied { gain_db } => format!(
                                 "音量ノーマライズ ON ({gain_db:+.1}dB / -14 LUFS)。クリックで OFF"
+                            ),
+                            NormalizeUiState::ProvisionalApplied { gain_db } => format!(
+                                "音量ノーマライズ ON (仮 {gain_db:+.1}dB / 確定測定中)。クリックで OFF"
                             ),
                             NormalizeUiState::OnUnmeasured => {
                                 "音量ノーマライズが有効です。クリックして測定 / 右クリックで OFF"

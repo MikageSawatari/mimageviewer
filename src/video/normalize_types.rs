@@ -13,7 +13,7 @@
 //!   理由: -14 LUFS 近辺の動画は `gain_db = 0.0` = `gain = 1.0` で測定済みになるため、
 //!   gain 値だけでは「未測定」と「測定済みで補正不要」が区別できない。
 
-/// ノーマライズボタンの 4 状態。
+/// ノーマライズボタンの 5 状態。
 ///
 /// 動画 1 本ごと (= fs_idx ごと) に App 側 `normalize_ui_states: HashMap<usize, _>`
 /// で持つ。`Off` 以外はグローバル設定 ON が前提。
@@ -25,6 +25,12 @@ pub enum NormalizeUiState {
     /// クリックで OFF 化。
     OnApplied {
         /// 適用中のゲイン (dB)。表示用 (0 dB ぴったりもありうる)。
+        gain_db: f32,
+    },
+    /// 長尺動画の先頭側だけで仮 gain を適用済み。最終 scan はバックグラウンド継続中。
+    /// DB には保存せず、確定値が届いたら `OnApplied` に遷移する。
+    ProvisionalApplied {
+        /// 適用中の仮ゲイン (dB)。表示用。
         gain_db: f32,
     },
     /// グローバル ON + DB ミス。gain は 1.0 (素通し) のまま、ボタンはオレンジ点滅。

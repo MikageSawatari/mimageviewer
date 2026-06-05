@@ -30,6 +30,11 @@ pub struct NormalizeScanState {
     /// スキャン開始時点の Settings.target_lufs_milli (= clamp 済み)。Settings の変更で
     /// 別キー保存になるのを防ぐため、開始時の値を固定保持する。
     pub target_lufs_milli: i32,
+    /// 長尺動画で仮 gain を現在の player に適用済みか。true なら UI はモーダル scan
+    /// blocker を閉じ、worker は確定値を出すまでバックグラウンド継続する。
+    pub provisional_applied: bool,
+    /// 適用した仮結果。最終 scan が失敗した場合でも、現在セッションの UI 表示に使う。
+    pub provisional_result: Option<NormalizeResult>,
     /// worker thread。drop されると detached になるが、worker は cancel atomic を
     /// 見て早期 return するので問題ない。
     pub _join: JoinHandle<()>,
@@ -38,6 +43,8 @@ pub struct NormalizeScanState {
 /// worker → App の完了通知。
 #[derive(Debug)]
 pub enum NormalizeMessage {
+    /// 長尺動画の先頭側で算出した仮結果。DB には保存しない。
+    Provisional(NormalizeResult),
     /// スキャン成功。`NormalizeResult` を DB に保存し gain を適用する。
     Done(NormalizeResult),
     /// FFmpeg / 計算エラー (詳細メッセージ付き)。DB 保存しない、UI 状態は OnUnmeasured に戻す。

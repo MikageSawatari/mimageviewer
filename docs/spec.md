@@ -567,7 +567,7 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 | `video_hw_decode` | bool | true | Windows D3D11VA ハードウェアデコードを試みる。D3D11VA 非対応 codec は CPU デコード、D3D11VA 対応 codec の HW 経路失敗は再生エラー |
 | `video_deinterlace` | VideoDeinterlaceMode | Auto | 動画再生時のデインターレース（Off / Auto / On）。Auto は frame interlaced flag と stream field_order を参照し、Auto/On は FFmpeg bwdif を表示前に適用 |
 | `video_grid_open_starts_from_beginning` | bool | false | ON のとき、サムネイル一覧から動画を開いた場合だけ保存済み再生位置を使わず先頭から再生する。フルスクリーン中の動画移動では保存済み位置を使う |
-| `audio_normalize_enabled` | bool | false | 動画音量ノーマライズのグローバル ON/OFF。ON のとき、open / Norm ボタン押下で per-file 測定値 (`audio_normalize.db`) を引いて -14 LUFS 相当に gain 適用。測定済み動画は再生開始前から初期 gain を入れる。未測定動画は再生前に自動スキャンし、完了後に再生へ戻る。キャンセル / 失敗後は同 fs_idx の自動再試行を抑止する。全体 OFF は実行中のスキャンもキャンセルする |
+| `audio_normalize_enabled` | bool | false | 動画音量ノーマライズのグローバル ON/OFF。ON のとき、open / Norm ボタン押下で per-file 測定値 (`audio_normalize.db`) を引いて -14 LUFS 相当に gain 適用。測定済み動画は再生開始前から初期 gain を入れる。未測定動画は再生前に自動スキャンし、長尺では約 10 分ぶん測れた時点で仮 gain により再生を開始、確定値が出たら DB 保存して数秒かけて gain を追従する。キャンセル / 失敗後は同 fs_idx の自動再試行を抑止する。全体 OFF は実行中のスキャンもキャンセルする |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |
 | `minimize_to_tray_on_close` | bool | false | ON のとき [×] で終了せずタスクトレイに常駐する。格納時は動画 / フルスクリーンセッションを通常の終了経路で閉じ、再生位置を保存して動画デコーダ・音声出力・native presenter・アイドル状態の GPU 動画プールなどのリソースを解放する。VST3 プラグインチェーンは停止しない |

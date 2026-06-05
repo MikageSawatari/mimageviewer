@@ -2384,8 +2384,13 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
-        // [Scanning] 中はクリック無効
-        if self.normalize_state.is_some() {
+        // [Scanning] のモーダル段階だけクリック無効。仮 gain 適用後のバックグラウンド
+        // scan 中は、クリック OFF で scan cancel + 全体 OFF にできる。
+        if self
+            .normalize_state
+            .as_ref()
+            .is_some_and(|state| !state.provisional_applied)
+        {
             return;
         }
         use crate::video::normalize_types::NormalizeUiState;
@@ -2405,8 +2410,9 @@ impl App {
         };
 
         match current_state {
-            NormalizeUiState::OnApplied { .. } => {
-                // [OnApplied] → [Off]: グローバル OFF + 全 player に gain=1.0 即時適用
+            NormalizeUiState::OnApplied { .. } | NormalizeUiState::ProvisionalApplied { .. } => {
+                // [OnApplied/ProvisionalApplied] → [Off]:
+                // グローバル OFF + 全 player に gain=1.0 適用。仮 scan 中なら cancel も行う。
                 self.disable_normalize_globally();
             }
             NormalizeUiState::OnUnmeasured => {
@@ -2704,11 +2710,19 @@ impl App {
         let join = std::thread::Builder::new()
             .name("normalize-scan".to_string())
             .spawn(move || {
-                let result = crate::video::normalize_scanner::scan_audio_loudness(
+                let tx_provisional = tx.clone();
+                let mut send_provisional =
+                    move |result: crate::video::normalize_types::NormalizeResult| {
+                        let _ = tx_provisional
+                            .send(crate::app::normalize::NormalizeMessage::Provisional(result));
+                    };
+                let result = crate::video::normalize_scanner::scan_audio_loudness_with_provisional(
                     &path_clone,
                     target_milli,
                     cancel_clone,
                     progress_clone,
+                    crate::video::normalize_scanner::PROVISIONAL_SCAN_AFTER_SECS,
+                    &mut send_provisional,
                 );
                 let _ = tx.send(crate::app::normalize::NormalizeMessage::from(result));
             });
@@ -2737,6 +2751,8 @@ impl App {
             was_playing,
             file_path: path,
             target_lufs_milli: target_milli,
+            provisional_applied: false,
+            provisional_result: None,
             _join: join,
         });
         self.normalize_ui_states
@@ -2756,6 +2772,48 @@ impl App {
             },
             None => return,
         };
+        if let Some(Ok(crate::app::normalize::NormalizeMessage::Provisional(result))) = msg {
+            let Some((fs_idx, file_path, was_playing)) = self
+                .normalize_state
+                .as_ref()
+                .map(|state| (state.fs_idx, state.file_path.clone(), state.was_playing))
+            else {
+                return;
+            };
+            let still_valid = match self.fs_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Video { player, .. }) => player.path() == file_path.as_path(),
+                _ => false,
+            };
+            if still_valid {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    let linear = 10.0_f64.powf(result.gain_db as f64 / 20.0);
+                    apply_normalize_gain_with_perf(
+                        player,
+                        fs_idx,
+                        linear,
+                        result.gain_db,
+                        "scan_provisional",
+                    );
+                    if was_playing {
+                        player.set_playing(true);
+                        player.set_audio_preroll_suspended(false);
+                    }
+                }
+                self.normalize_ui_states.insert(
+                    fs_idx,
+                    NormalizeUiState::ProvisionalApplied {
+                        gain_db: result.gain_db,
+                    },
+                );
+                if let Some(state) = self.normalize_state.as_mut() {
+                    if state.fs_idx == fs_idx && state.file_path == file_path {
+                        state.provisional_applied = true;
+                        state.provisional_result = Some(result);
+                    }
+                }
+            }
+            return;
+        }
         // 2. 完了確定: state を所有してから後処理
         let Some(state) = self.normalize_state.take() else {
             return;
@@ -2808,17 +2866,29 @@ impl App {
                 self.normalize_auto_scan_suppressed.insert(state.fs_idx);
                 // DB に書かない、グローバル ON は維持、UI 状態を OnUnmeasured に戻す
                 if still_valid {
-                    if let Some(FsCacheEntry::Video { player, .. }) =
-                        self.fs_cache.get(&state.fs_idx)
-                    {
-                        if state.was_playing {
-                            player.set_playing(true);
-                            player.set_audio_preroll_suspended(false);
+                    if let Some(provisional) = state.provisional_result {
+                        self.normalize_ui_states.insert(
+                            state.fs_idx,
+                            NormalizeUiState::ProvisionalApplied {
+                                gain_db: provisional.gain_db,
+                            },
+                        );
+                    } else {
+                        if let Some(FsCacheEntry::Video { player, .. }) =
+                            self.fs_cache.get(&state.fs_idx)
+                        {
+                            if state.was_playing {
+                                player.set_playing(true);
+                                player.set_audio_preroll_suspended(false);
+                            }
                         }
+                        self.normalize_ui_states
+                            .insert(state.fs_idx, NormalizeUiState::OnUnmeasured);
                     }
-                    self.normalize_ui_states
-                        .insert(state.fs_idx, NormalizeUiState::OnUnmeasured);
                 }
+            }
+            Some(Ok(crate::app::normalize::NormalizeMessage::Provisional(_))) => {
+                // Provisional は上で state を残したまま処理済み。ここには通常到達しない。
             }
             None => {
                 // unreachable - try_recv が Empty なら return 済み、Disconnected なら Some(Err(()))

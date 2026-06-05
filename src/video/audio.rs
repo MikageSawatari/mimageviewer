@@ -335,6 +335,8 @@ const SAFETY_LIMITER_CEILING_DBFS: f32 = 0.0;
 /// 点かず、VST / 音量 boost / normalize boost で実際に gain staging が破綻して
 /// 可聴な抑え込みが起きたときだけ点く。
 const SAFETY_LIMITER_INDICATOR_GR_DB: f32 = 1.0;
+/// normalize gain の変更を dB 空間でならす時間。仮 gain → 確定 gain の段差を隠す。
+const NORMALIZE_GAIN_RAMP_SECS: f64 = 4.0;
 
 /// VST3 チェーン後段と 0dB 超の手動音量 boost の保険用 lookahead limiter。
 ///
@@ -440,6 +442,124 @@ impl SafetyLimiter {
         }
         min_target_gain <= self.indicator_gain_threshold
     }
+}
+
+/// audio-pump 内だけで持つ normalize gain smoother。
+///
+/// `AvClock` は目標 gain だけを atomic publish し、pump が block を処理する時点で
+/// 目標変更を検出して dB 空間で ramp する。`audio_preroll_suspended` 中は
+/// `snap_to_target` しておくことで、測定前待機解除後の最初の音は仮 gain で始まる。
+struct NormalizeGainRamp {
+    channels: usize,
+    ramp_frames: usize,
+    current_db: f32,
+    target_db: f32,
+    step_db_per_frame: f32,
+    remaining_frames: usize,
+}
+
+impl NormalizeGainRamp {
+    fn new(sample_rate: u32, channels: usize) -> Self {
+        let ramp_frames = ((sample_rate as f64 * NORMALIZE_GAIN_RAMP_SECS).round() as usize).max(1);
+        Self {
+            channels: channels.max(1),
+            ramp_frames,
+            current_db: 0.0,
+            target_db: 0.0,
+            step_db_per_frame: 0.0,
+            remaining_frames: 0,
+        }
+    }
+
+    fn snap_to_target(&mut self, target_linear: f32) {
+        let db = normalize_linear_to_db(target_linear);
+        self.current_db = db;
+        self.target_db = db;
+        self.step_db_per_frame = 0.0;
+        self.remaining_frames = 0;
+    }
+
+    /// `samples` に現在の ramp gain を掛け、block 内の最大 normalize gain を返す。
+    fn apply_to_samples(&mut self, samples: &mut [f32], target_linear: f32) -> f32 {
+        let requested_db = normalize_linear_to_db(target_linear);
+        if (requested_db - self.target_db).abs() > 0.001 {
+            self.target_db = requested_db;
+            self.remaining_frames = self.ramp_frames;
+            self.step_db_per_frame =
+                (self.target_db - self.current_db) / self.remaining_frames as f32;
+        }
+
+        if samples.is_empty() {
+            return normalize_db_to_linear(self.current_db);
+        }
+
+        let frames = samples.len() / self.channels;
+        let mut max_gain = 0.0_f32;
+        if self.remaining_frames == 0 {
+            self.current_db = self.target_db;
+            let gain = normalize_db_to_linear(self.current_db);
+            max_gain = gain;
+            if (gain - 1.0).abs() > f32::EPSILON {
+                for s in samples {
+                    *s *= gain;
+                }
+            }
+            return max_gain;
+        }
+
+        for frame in 0..frames {
+            if self.remaining_frames > 0 {
+                self.current_db += self.step_db_per_frame;
+                self.remaining_frames -= 1;
+                if self.remaining_frames == 0 {
+                    self.current_db = self.target_db;
+                    self.step_db_per_frame = 0.0;
+                }
+            }
+            let gain = normalize_db_to_linear(self.current_db);
+            max_gain = max_gain.max(gain);
+            if (gain - 1.0).abs() > f32::EPSILON {
+                let base = frame * self.channels;
+                for ch in 0..self.channels {
+                    if let Some(s) = samples.get_mut(base + ch) {
+                        *s *= gain;
+                    }
+                }
+            }
+        }
+
+        // 万一 samples.len() が channels の倍数でない場合の defensive tail。
+        let tail_start = frames * self.channels;
+        if tail_start < samples.len() {
+            let gain = normalize_db_to_linear(self.current_db);
+            max_gain = max_gain.max(gain);
+            for s in &mut samples[tail_start..] {
+                *s *= gain;
+            }
+        }
+        max_gain
+    }
+
+    #[cfg(test)]
+    fn remaining_frames(&self) -> usize {
+        self.remaining_frames
+    }
+}
+
+fn normalize_linear_to_db(gain: f32) -> f32 {
+    let clamped = if gain.is_finite() && gain > 0.0 {
+        gain
+    } else {
+        1.0
+    };
+    20.0 * clamped.log10()
+}
+
+fn normalize_db_to_linear(db: f32) -> f32 {
+    if !db.is_finite() {
+        return 1.0;
+    }
+    10.0_f32.powf(db / 20.0)
 }
 
 /// 既定音声出力デバイスのサンプルレートを取得する (実際にはストリームは開かない)。
@@ -709,6 +829,8 @@ fn run_pump(
     let _ = (samples_per_sec * TARGET_PROCESSED_SECS) as usize; // future use: explicit cap_samples cache
     let mut safety_limiter = SafetyLimiter::new(sample_rate, 2);
     let mut time_stretcher = TimeStretcher::new(sample_rate);
+    let mut normalize_gain_ramp = NormalizeGainRamp::new(sample_rate, 2);
+    normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
 
     let mut activated = false;
     let mut last_seen_seek_serial: u64 = 0;
@@ -1006,6 +1128,7 @@ fn run_pump(
         }
 
         if clock.audio_preroll_suspended() {
+            normalize_gain_ramp.snap_to_target(clock.normalize_gain() as f32);
             if let Ok(buf) = buffer.lock() {
                 publish_buffer_secs(&buf, &clock);
             }
@@ -1044,12 +1167,10 @@ fn run_pump(
                 time_stretcher.process(&raw.samples, raw.duration_secs, playback_speed);
             // 音量ノーマライズの線形ゲイン (Phase 2-A): VST3 入力前に掛ける。
             // VST3 (Pro-L2 等) が「-14 LUFS に揃った入力」を見られるよう前段に置く。
-            let normalize_gain = clock.normalize_gain() as f32;
-            if (normalize_gain - 1.0).abs() > f32::EPSILON {
-                for s in stretched.samples.iter_mut() {
-                    *s *= normalize_gain;
-                }
-            }
+            // 目標変更は dB 空間で ramp する。測定前待機からの解除時は上の
+            // `snap_to_target` により、最初の可聴 chunk から仮 gain で始まる。
+            let max_normalize_gain_in_block = normalize_gain_ramp
+                .apply_to_samples(&mut stretched.samples, clock.normalize_gain() as f32);
             #[cfg(windows)]
             let (mut output_samples, mut current_pdc_latency_secs, vst_chain_active): (
                 Vec<f32>,
@@ -1152,7 +1273,7 @@ fn run_pump(
             // Phase 2-B: normalize gain が +側 (>1.0) のときも safety_limiter を通す。
             // VST3 無効 + 音量0dB以下 + normalize +20dB のケースで clip を防ぐ。
             // 下げ方向 (<1.0) は clip 不可なので limiter 不要 (5ms latency 節約)。
-            let normalize_boost_active = normalize_gain > 1.0 + f32::EPSILON;
+            let normalize_boost_active = max_normalize_gain_in_block > 1.0 + f32::EPSILON;
             let limiter_active =
                 vst_chain_active || pre_limiter_gain > 1.0 || normalize_boost_active;
             if limiter_active {
@@ -1905,6 +2026,41 @@ mod tests {
             audio_tx_accounting_epoch: 0,
             seek_target_secs: Some(seek_serial as f64),
         }
+    }
+
+    #[test]
+    fn normalize_gain_ramp_interpolates_in_db_space() {
+        let mut ramp = NormalizeGainRamp::new(10, 2);
+        let target = 10.0_f32.powf(6.0 / 20.0);
+        let mut first_quarter = vec![1.0_f32; 20]; // 10 stereo frames; full ramp = 40 frames.
+
+        let max_gain = ramp.apply_to_samples(&mut first_quarter, target);
+
+        assert!(first_quarter[0] > 1.0);
+        assert!(first_quarter[18] < target);
+        assert!(max_gain < target);
+        assert_eq!(ramp.remaining_frames(), 30);
+
+        let mut rest = vec![1.0_f32; 80];
+        let max_gain = ramp.apply_to_samples(&mut rest, target);
+
+        assert_eq!(ramp.remaining_frames(), 0);
+        assert!((rest[78] - target).abs() < 1.0e-5);
+        assert!((max_gain - target).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn normalize_gain_ramp_can_snap_for_preroll() {
+        let mut ramp = NormalizeGainRamp::new(48_000, 2);
+        ramp.apply_to_samples(&mut [1.0_f32; 16], 2.0);
+        ramp.snap_to_target(0.5);
+
+        let mut samples = vec![1.0_f32; 8];
+        let max_gain = ramp.apply_to_samples(&mut samples, 0.5);
+
+        assert_eq!(ramp.remaining_frames(), 0);
+        assert!((max_gain - 0.5).abs() < 1.0e-6);
+        assert!(samples.iter().all(|s| (*s - 0.5).abs() < 1.0e-6));
     }
 
     #[test]

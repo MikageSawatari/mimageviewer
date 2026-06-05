@@ -79,13 +79,16 @@ HDD 向け判断:
 「10 分ほどスキャンしたら仮 gain で再生開始し、スキャン継続後に確定 gain へ ramp する」
 方向は、HDD では並列化より安全に体感待ちを下げやすい。
 
-実装する場合は以下をセットにする:
+今回の実装では以下をセットにした:
 
 - scanner から `Provisional` と `Done` の 2 段階メッセージを返す。
 - 仮結果は DB に保存しない。確定結果だけ `audio_normalize.db` に保存する。
-- `AvClock::normalize_gain` は現在 atomic 即時切替なので、audio pump 側で 3〜5 秒の dB ramp を
-  持つ。
+- `AvClock::normalize_gain` は目標値の atomic とし、audio pump 側で 4 秒の dB ramp を持つ。
+- 仮 gain 適用後は `ProvisionalApplied` UI 状態にし、モーダル progress を閉じて再生を開始する。
+
+残る検討:
+
 - 継続スキャンは低優先度にし、再生バッファ不足 / seek / source switch / fullscreen close で
-  一時停止またはキャンセルする。
+  一時停止またはキャンセルする adaptive throttle。
 - idle 時や再生していない動画の事前測定では jobs 2〜4 も候補。ただし再生中は jobs 1 から始め、
   audio/video queue が薄い場合はスキャンを止める adaptive throttle を優先する。
