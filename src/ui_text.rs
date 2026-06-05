@@ -732,6 +732,10 @@ impl App {
         self.text_dirty_at = None;
         self.text_add_bubble_dialog = false;
         self.text_add_window_dialog = false;
+        // スタンプピッカーの差し替え対象は page-local id なので、モードをまたいで残すと
+        // 別ページの同 id スタンプを誤って差し替える (Codex P2)。入場時に必ずクリアする。
+        self.text_add_stamp_dialog = false;
+        self.stamp_dialog_replace_target = None;
         self.clear_meta_undo();
         self.ensure_comic_doc_loaded(&key);
 
@@ -760,6 +764,9 @@ impl App {
         self.text_dirty_at = None;
         self.text_add_bubble_dialog = false;
         self.text_add_window_dialog = false;
+        // スタンプピッカーの差し替え対象を退場時にもクリア (Codex P2、enter 側と対)。
+        self.text_add_stamp_dialog = false;
+        self.stamp_dialog_replace_target = None;
         if was_text_mode {
             self.clear_meta_undo();
         }
@@ -1610,6 +1617,11 @@ impl App {
             .collect();
 
         // サムネイルは &mut self が要るので read-only クロージャの前に用意しておく。
+        // 初回デコードは UI スレッド同期 (Codex P2)。ただし (1) これはユーザーが明示的に
+        // 開くモーダルで、スクロール等のホットパスではない、(2) 絵文字はカテゴリ単位で
+        // 件数が bounded + resvg 512px と軽量 + デコード結果はキャッシュで 1 度きり、
+        // (3) ユーザー画像は FILE_STAMP_MAX_PX で抑制済み、なので許容する。将来、開封時の
+        // 引っかかりが問題になれば worker 化する (docs/ui-responsiveness.md §2 のテンプレ)。
         if assets {
             for (k, _) in &visible {
                 self.ensure_stamp_thumb(ctx, &comic_core::StampSource::Emoji((*k).to_string()));

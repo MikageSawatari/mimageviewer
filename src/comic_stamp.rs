@@ -24,6 +24,12 @@ include!(concat!(env!("OUT_DIR"), "/emoji_svgs.rs"));
 /// バイリニア縮小するので、ここでは鮮明さ / メモリの上限を決めるだけ。
 pub const EMOJI_RENDER_PX: u32 = 512;
 
+/// ユーザー画像スタンプをキャッシュに保持するネイティブ解像度の長辺上限 (px)。
+/// 巨大写真 (8000px 級) を素のままキャッシュすると 1 枚で数百 MB になり、複数枚で
+/// セッションメモリを圧迫する (Codex P3)。長辺がこれを超える場合は面積平均縮小して
+/// から保持する (canvas へはバイリニア拡縮するので実用上の画質劣化は軽微)。
+pub const FILE_STAMP_MAX_PX: usize = 2048;
+
 /// ピッカーのカテゴリ。`all()` の順 = タブ順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmojiCategory {
@@ -253,7 +259,13 @@ pub fn load_stamp_image(source: &StampSource) -> Option<RgbaOverlay> {
     match source {
         StampSource::File(path) => {
             let bytes = std::fs::read(path).ok()?;
-            decode_raster(&bytes)
+            let img = decode_raster(&bytes)?;
+            // 巨大画像はネイティブ長辺を上限で抑えてキャッシュメモリを bound する。
+            if img.w.max(img.h) > FILE_STAMP_MAX_PX {
+                Some(downscale_overlay(&img, FILE_STAMP_MAX_PX))
+            } else {
+                Some(img)
+            }
         }
         StampSource::Emoji(key) => {
             let bytes = emoji_svg_bytes(key)?;
