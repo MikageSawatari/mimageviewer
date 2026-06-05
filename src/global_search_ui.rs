@@ -1133,20 +1133,18 @@ impl App {
             }
         }
         self.selected = restored_selected;
-        // 補正・マスクも idx ベース。Ctrl+G は items が総入れ替わりするので
-        // 旧フォルダの個別設定は意味を失うため clear する。
-        // (削除経路では呼び出し元が idx shift で保持する)
-        self.adjustment_page_params.clear();
-        self.local_adjust_page_layers.clear();
-        self.local_adjust_pages.clear();
+        // 補正・マスク・crop・隠蔽・選択レイヤーはすべて idx ベース。Ctrl+G は items が
+        // 総入れ替わりするので旧フォルダの個別設定は意味を失う。`clear_page_edit_state()` で
+        // idx-keyed ページ編集状態を一括 clear する (Codex P2: 旧実装は
+        // local_adjust_selected_layers と conceal_pages を取りこぼし、検索結果に旧ページの
+        // 選択レイヤー / 隠蔽バッジが漏れていた)。`export_crop_for_idx` は DB 再ルックアップ
+        // せず idx-map を直読みするため、残すと無関係な検索結果に旧 crop の暗転 overlay が
+        // 漏れる (Codex P1)。clear_page_edit_state がそれも含めて落とす。
+        // (削除経路では呼び出し元が idx shift で保持する。)
+        self.clear_page_edit_state();
+        // generation / cache はページ編集状態ではないが、idx 入れ替えで stale になるので併せて落とす。
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
-        self.mask_pages.clear();
-        // crop も idx ベース。`export_crop_for_idx` は DB 再ルックアップせず idx-map を
-        // 直読みするため、Ctrl+G の総入れ替えで残すと無関係な検索結果に旧 crop の暗転
-        // overlay が漏れる (Codex P1)。明示 clear する。
-        self.export_crop_page_settings.clear();
-        self.export_crop_pages.clear();
         // path-keyed キャッシュも Ctrl+G では items が総入れ替わりするのでリセット。
         self.metadata_cache.clear();
         self.exif_cache.clear();

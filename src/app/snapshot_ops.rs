@@ -294,6 +294,35 @@ impl App {
         // tags_cache は invalidate 対象外なので手動 clear (= 既存 clear は冗長になるが
         // 残しておく方が安全、二重 clear は no-op)
         self.tags_cache.clear();
+        // ★items を subset へ差し替えたので、idx-keyed なページ編集状態 (補正 / ローカル
+        // 調整 / crop / マスク / 隠蔽) を新 idx に合わせ直す (Codex P1)。これをやらないと、
+        // 差し替え前 idx に紐付いた補正・マスクが subset の別 idx に乗って表示 / エクスポート /
+        // 保存される。`invalidate_idx_state_and_queues` は idx-keyed cache を落とすがユーザー
+        // 設定マップ (adjustment_page_params 等) は残すため、ここで明示的に処理する必要がある。
+        //
+        // cross-folder 検索 view 由来 snapshot (= Ctrl+S/Ctrl+G) は **clear のみ**:
+        // - subset が cross-folder で単一 prefix hydrate できない (origin = 検索前の実
+        //   current_folder なので、prefix 配下の subset item だけ部分的に hydrate されてしまう)。
+        // - 検索 view は元々ページ編集 overlay を出さない設計 (replace_search_view_items が
+        //   clear する) なので、その snapshot も overlay 無しで揃える。
+        // 判定は `pre_snapshot_search_origin.is_some()` (= Ctrl+S/Ctrl+G でのみ Some)。
+        // **`search_was_active` では判定しない**: あれは Ctrl+F (= 単一フォルダの構造フィルタ)
+        // でも true になるが、Ctrl+F の subset は origin 配下に収まるので通常どおり rehydrate
+        // すべき。`search_was_active` で gate すると Ctrl+F snapshot が誤って clear され、
+        // しかも list 復帰 (pre_snapshot_search_origin で判定) との非対称を生む (Codex follow-up)。
+        // 通常フォルダ / Ctrl+F filter 由来は origin の DB から subset idx で hydrate し直す。
+        // deactivate / list 復帰でも同じ判定で対称に処理する。
+        if let Some((origin, is_search_view)) = self
+            .snapshot
+            .as_ref()
+            .map(|s| (s.origin.clone(), s.pre_snapshot_search_origin.is_some()))
+        {
+            if is_search_view {
+                self.clear_page_edit_state();
+            } else {
+                self.rehydrate_page_edit_state_for_current_items(&origin);
+            }
+        }
 
         let msg = if search_was_active {
             format!("検索結果をスナップショットに固定しました ({n} 件)")
@@ -394,6 +423,13 @@ impl App {
             self.items_generation = self.items_generation.wrapping_add(1);
             self.invalidate_idx_state_and_queues();
             self.tags_cache.clear();
+            // items を saved (元フォルダ) に戻したので、ページ編集状態も元 idx で hydrate
+            // し直す (= activate の subset hydrate と対称、Codex P1)。snapshot 中に編集した分は
+            // set_page_params 等が DB に同期保存済みなので、DB から読み直せば反映される。
+            // (child folder 経路は load_folder 由来で既に hydrate 済みなので不要。検索 view 由来
+            //  解除は上の at_origin + pre_search_origin 分岐で load_folder に入るのでこちらは通らない。)
+            let origin = snap.origin.clone();
+            self.rehydrate_page_edit_state_for_current_items(&origin);
         } else {
             // child folder の中で解除 → 現在の items はそのまま、snapshot state だけ捨てる
             // visible_indices は filter / current_folder に対して再構築
@@ -420,7 +456,7 @@ impl App {
         // list_view_items / list_view_thumbnails は activate_snapshot 時に保存した clone を
         // 使う (= reconstruct だと folder 代表サムネが Pending に戻って「フォルダアイコン」
         // 表示になるユーザー報告対応)。
-        let (snap_origin, list_items, list_thumbs) = {
+        let (snap_origin, list_items, list_thumbs, is_search_snapshot) = {
             let Some(snap) = self.snapshot.as_ref() else {
                 return false;
             };
@@ -428,6 +464,9 @@ impl App {
                 snap.origin.clone(),
                 snap.list_view_items.clone(),
                 snap.list_view_thumbnails.clone(),
+                // 検索 view 由来 snapshot は origin が cross-folder prefix なので rehydrate せず
+                // clear のみ (= activate と同じ判定。pre_snapshot_search_origin Some が search 由来)。
+                snap.pre_snapshot_search_origin.is_some(),
             )
         };
         // 既に snapshot root に居れば何もしない (= 通常 BS の対象)
@@ -461,6 +500,15 @@ impl App {
         self.items_generation = self.items_generation.wrapping_add(1);
         self.invalidate_idx_state_and_queues();
         self.tags_cache.clear();
+        // snapshot list (= subset) に戻したので、ページ編集状態も subset idx で合わせ直す
+        // (= activate と同じ、Codex P1)。通常フォルダ由来は origin の DB から hydrate
+        // (child folder で編集した分は DB に同期保存済みなので subset 該当ページに反映される)。
+        // 検索 view 由来は cross-folder prefix なので clear のみ (= activate と対称)。
+        if is_search_snapshot {
+            self.clear_page_edit_state();
+        } else {
+            self.rehydrate_page_edit_state_for_current_items(&snap_origin);
+        }
         self.show_feedback_toast("★固定リストに戻りました".into());
         true
     }
@@ -764,47 +812,32 @@ impl App {
         if self.rating_filter_suppressed_at.is_some() {
             self.rebuild_visible_indices();
         }
-        // load_folder 完了後の open 対象を解決:
-        // - target Some → items 内で対象 leaf を探す (Codex P2 fix)
+        // open 意図 (= was_fs / resume_slideshow / 明示 target) が無ければ何もしない。
+        // Codex 4th P2 fix: `target.is_some()` も open 条件に含める (grid 経路の snapshot
+        // leaf navigation でも target で指定された leaf を開く)。
+        if !(was_fs || resume_slideshow || target.is_some()) {
+            return;
+        }
+        // ZIP/PDF は非同期列挙なので、この時点では items が ZipSeparator のみ等で揃って
+        // いない。その場合は target を deferred reopen に載せ、`poll_zip_enumerate` /
+        // `poll_pdf_enumerate` 完了時に解決して開く (Codex P2 fix: 旧版は同期 lookup のみで
+        // first playable / 先頭に着地し、ロックリストから未展開 ZIP/PDF 内ページへの
+        // ジャンプ・スライドショー復帰が対象ページに到達しなかった)。
+        if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
+            self.fs_nav_after_pdf_enumerate = Some(crate::app::DeferredFsReopen {
+                resume_slideshow,
+                target,
+            });
+            return;
+        }
+        // 同期に items が揃った場合 (= 通常フォルダ / cache hit PDF placeholder 等) は即 open:
+        // - target Some → items 内で対象 leaf を探す
         // - target None or マッチしない → 最初の playable item に fallback
-        // ※ ZIP/PDF は async enumerate なので、items は ZipSeparator のみで埋まっている可能性が
-        //   ある。その場合は次フレーム以降の enumerate 完了で deferred reopen される (MVP として
-        //   sync 経路のみ対応、ZIP/PDF への snapshot navigation は実機確認で評価)。
-        // Codex 4th P2 fix: `target.is_some()` も open 条件に含める。grid 経路の
-        // snapshot leaf navigation (= was_fs=false, resume_slideshow=false) でも、
-        // target で指定された画像/動画/ZipImage/PdfPage を fullscreen で開くように。
-        if was_fs || resume_slideshow || target.is_some() {
-            use crate::grid_item::GridItem;
-            use crate::snapshot::SnapshotTarget;
-            let target_idx: Option<usize> = match target.as_ref() {
-                Some(SnapshotTarget::Fs(p)) => self.items.iter().position(|it| match it {
-                    GridItem::Image(ip) | GridItem::Video(ip) => ip == p,
-                    _ => false,
-                }),
-                Some(SnapshotTarget::ZipImage {
-                    zip_path,
-                    entry_name,
-                }) => self.items.iter().position(|it| match it {
-                    GridItem::ZipImage {
-                        zip_path: zp,
-                        entry_name: en,
-                    } => zp == zip_path && en == entry_name,
-                    _ => false,
-                }),
-                Some(SnapshotTarget::PdfPage { pdf_path, page_num }) => {
-                    self.items.iter().position(|it| match it {
-                        GridItem::PdfPage {
-                            pdf_path: pp,
-                            page_num: pn,
-                            ..
-                        } => pp == pdf_path && pn == page_num,
-                        _ => false,
-                    })
-                }
-                Some(SnapshotTarget::ConvertibleArchive { .. }) | None => None,
-            };
-            // target にマッチしなければ first playable に fallback
-            let open_idx = target_idx.or_else(|| {
+        use crate::grid_item::GridItem;
+        let open_idx = target
+            .as_ref()
+            .and_then(|t| self.resolve_snapshot_target_idx(t))
+            .or_else(|| {
                 self.items.iter().position(|it| {
                     matches!(
                         it,
@@ -815,13 +848,80 @@ impl App {
                     )
                 })
             });
-            if let Some(idx) = open_idx {
-                self.open_fullscreen(idx);
-                if resume_slideshow {
-                    self.slideshow_playing = true;
-                }
+        if let Some(idx) = open_idx {
+            self.open_fullscreen(idx);
+            if resume_slideshow {
+                self.slideshow_playing = true;
             }
         }
+    }
+
+    /// `SnapshotTarget` を現在の `items` から解決して idx を返す (Codex P2 fix の共有 helper)。
+    ///
+    /// `snapshot_load_and_open` の同期 open 経路と、`poll_zip_enumerate` /
+    /// `poll_pdf_enumerate` の deferred reopen 経路の両方から使い、target マッチロジックの
+    /// 重複を避ける。`ConvertibleArchive` は leaf ではないので常に `None`。
+    pub(crate) fn resolve_snapshot_target_idx(
+        &self,
+        target: &crate::snapshot::SnapshotTarget,
+    ) -> Option<usize> {
+        use crate::grid_item::GridItem;
+        use crate::snapshot::SnapshotTarget;
+        match target {
+            SnapshotTarget::Fs(p) => self.items.iter().position(|it| match it {
+                GridItem::Image(ip) | GridItem::Video(ip) => ip == p,
+                _ => false,
+            }),
+            SnapshotTarget::ZipImage {
+                zip_path,
+                entry_name,
+            } => self.items.iter().position(|it| match it {
+                GridItem::ZipImage {
+                    zip_path: zp,
+                    entry_name: en,
+                } => zp == zip_path && en == entry_name,
+                _ => false,
+            }),
+            SnapshotTarget::PdfPage { pdf_path, page_num } => {
+                self.items.iter().position(|it| match it {
+                    GridItem::PdfPage {
+                        pdf_path: pp,
+                        page_num: pn,
+                        ..
+                    } => pp == pdf_path && pn == page_num,
+                    _ => false,
+                })
+            }
+            SnapshotTarget::ConvertibleArchive { .. } => None,
+        }
+    }
+
+    /// `snapshot_open_entry` を呼び、その nav 試行が items reload も deferred reopen も
+    /// 起こさなかった場合 (= 直接 open / open 失敗のどちらでも、待つべき非同期変化が無い)
+    /// は `capture_fs_nav_holdover` で取得した nav lock を release する。
+    ///
+    /// fullscreen からの Ctrl+↑↓ / Ctrl+PageUp/Down (`snapshot_navigate`) も スライドショー
+    /// 自動送り (`snapshot_advance_for_slideshow`) も、open 前に `capture_fs_nav_holdover` で
+    /// lock を立てる。直接 open は `open_fullscreen` が items_generation を進めないため、
+    /// 解除しないと `poll_fs_nav_lock` の gen-check に到達せず lock が残り、次のナビが
+    /// `fs_nav_is_locked()` で永久 block される (= 末尾経路と同じ理由が成功経路でも起きる)。
+    ///
+    /// 除外される経路: reload (snapshot_load_and_open の sync open) は items_generation が進む
+    /// ので `poll_fs_nav_lock` が gen-check + 新 tex 用意で解除。deferred ZIP/PDF は
+    /// `fs_nav_after_pdf_enumerate` が立つので `poll_fs_nav_lock` が enumerate 完了まで lock を
+    /// 保持。どちらも gen 変化 / deferred 有無で自動的に除外される。
+    /// (grid nav 経路は holdover を取らないので release は idempotent な no-op。)
+    fn snapshot_open_entry_release_lock_if_direct(
+        &mut self,
+        entry_idx: usize,
+        resume_slideshow: bool,
+    ) -> bool {
+        let gen_before = self.items_generation;
+        let opened = self.snapshot_open_entry(entry_idx, resume_slideshow);
+        if self.items_generation == gen_before && self.fs_nav_after_pdf_enumerate.is_none() {
+            self.release_fs_nav_lock();
+        }
+        opened
     }
 
     /// snapshot navigation のエントリポイント (Ctrl+↑↓ / Ctrl+PageUp/Down)。
@@ -850,7 +950,9 @@ impl App {
             self.snapshot_next_arrow_entry(current_owner, forward)
         };
         if let Some(idx) = next {
-            self.snapshot_open_entry(idx, resume_slideshow)
+            // 直接 open 後の nav lock 解除を含めて wrapper に委譲 (= スライドショー経路と共有、
+            // 経路漏れ防止)。
+            self.snapshot_open_entry_release_lock_if_direct(idx, resume_slideshow)
         } else {
             // 末尾: boundary hint + nav lock 解除
             // snapshot 経路は apply_folder_nav_result を通らないので、capture_fs_nav_holdover
@@ -1018,7 +1120,10 @@ impl App {
         // P2-2 fix: 全 entry を対象に巡回 (= Ctrl+↑↓ と同じ semantics)
         let next = self.snapshot_next_arrow_entry(current_owner, forward);
         if let Some(idx) = next {
-            let _ = self.snapshot_open_entry(idx, /*resume_slideshow=*/ true);
+            // スライドショー自動送りも fullscreen から holdover を取って呼ばれるので、直接 open
+            // 後は nav lock を解除する (= 手動 Ctrl+↑↓ と共有の wrapper、Codex follow-up)。
+            let _ = self
+                .snapshot_open_entry_release_lock_if_direct(idx, /*resume_slideshow=*/ true);
             true
         } else {
             // 末尾: 次 entry 無し → slideshow 停止 + nav lock 解除
@@ -1562,6 +1667,134 @@ mod tests {
         assert_eq!(
             snap.pre_snapshot_search_origin,
             Some(PathBuf::from(r"E:\before_search"))
+        );
+    }
+
+    /// Codex P2 (deferred target 解決): `resolve_snapshot_target_idx` が各 leaf 種別の
+    /// target を現在 items から正しく idx 解決する。これが snapshot_load_and_open の同期
+    /// open 経路と poll_zip/pdf_enumerate の deferred reopen 経路の両方の核。
+    #[test]
+    fn resolve_snapshot_target_idx_matches_each_leaf_kind() {
+        use crate::snapshot::SnapshotTarget;
+        let app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\test\a.png")),
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"E:\test\doc.pdf"),
+                page_num: 3,
+                content_type: None,
+            },
+            GridItem::ZipImage {
+                zip_path: PathBuf::from(r"E:\test\arc.zip"),
+                entry_name: "sub/img.png".into(),
+            },
+        ]);
+
+        // Fs (画像) target → idx 0
+        assert_eq!(
+            app.resolve_snapshot_target_idx(&SnapshotTarget::Fs(PathBuf::from(r"E:\test\a.png"))),
+            Some(0)
+        );
+        // PdfPage target → idx 1 (path + page_num 一致)
+        assert_eq!(
+            app.resolve_snapshot_target_idx(&SnapshotTarget::PdfPage {
+                pdf_path: PathBuf::from(r"E:\test\doc.pdf"),
+                page_num: 3,
+            }),
+            Some(1)
+        );
+        // ZipImage target → idx 2 (zip_path + entry_name 一致)
+        assert_eq!(
+            app.resolve_snapshot_target_idx(&SnapshotTarget::ZipImage {
+                zip_path: PathBuf::from(r"E:\test\arc.zip"),
+                entry_name: "sub/img.png".into(),
+            }),
+            Some(2)
+        );
+        // 別ページ番号は不一致 → None
+        assert_eq!(
+            app.resolve_snapshot_target_idx(&SnapshotTarget::PdfPage {
+                pdf_path: PathBuf::from(r"E:\test\doc.pdf"),
+                page_num: 99,
+            }),
+            None
+        );
+        // items に無い path → None
+        assert_eq!(
+            app.resolve_snapshot_target_idx(&SnapshotTarget::Fs(PathBuf::from(r"E:\test\zzz.png"))),
+            None
+        );
+        // ConvertibleArchive は leaf でない → 常に None
+        assert_eq!(
+            app.resolve_snapshot_target_idx(&SnapshotTarget::ConvertibleArchive {
+                path: PathBuf::from(r"E:\test\arc.7z"),
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            }),
+            None
+        );
+    }
+
+    /// Codex follow-up: snapshot list 内 leaf 間の Ctrl+↑↓ (= 直接 open、reload 無し) の後、
+    /// nav lock が解除されること。直接 open は items_generation を進めないので、解除しないと
+    /// `poll_fs_nav_lock` の gen-check に到達せず lock が残り、次の Ctrl+↑↓ が永久 block される
+    /// (= 末尾経路と同じ理由だが成功経路で漏れていた)。
+    #[test]
+    fn snapshot_direct_open_nav_releases_fs_nav_lock() {
+        let ctx = egui::Context::default();
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\test\a.png")),
+            GridItem::Image(PathBuf::from(r"E:\test\b.png")),
+        ]);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        // a を fullscreen で開く (= 現 items 内なので直接 open)。
+        assert!(app.snapshot_open_entry(0, /*resume_slideshow=*/ false));
+        assert_eq!(app.fullscreen_idx, Some(0));
+        // Ctrl+↑↓ 入口の capture_fs_nav_holdover が lock を立てた状態を再現。
+        app.capture_fs_nav_holdover(0);
+        assert!(app.fs_nav_is_locked(), "ナビ直前は lock が立つ");
+        let gen_before = app.items_generation;
+
+        // 次の leaf (b) へ snapshot_navigate (= 直接 open、reload 無し)。
+        let moved = app.snapshot_navigate(&ctx, /*forward=*/ true, false, false);
+
+        assert!(moved, "次の leaf へ移動する");
+        assert_eq!(app.fullscreen_idx, Some(1), "b に移動");
+        assert_eq!(
+            app.items_generation, gen_before,
+            "直接 open は items_generation を進めない (= reload していない)"
+        );
+        assert!(
+            !app.fs_nav_is_locked(),
+            "直接 open 後は nav lock が解除され、次の Ctrl+↑↓ が block されない"
+        );
+    }
+
+    /// Codex follow-up (スライドショー経路): snapshot スライドショーの直接 leaf 送りでも
+    /// nav lock が解除されること。`snapshot_advance_for_slideshow` も fullscreen から holdover
+    /// を取って呼ばれるので、手動 Ctrl+↑↓ と同じ wrapper で release する。
+    #[test]
+    fn snapshot_slideshow_direct_advance_releases_fs_nav_lock() {
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\test\a.png")),
+            GridItem::Image(PathBuf::from(r"E:\test\b.png")),
+        ]);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert!(app.snapshot_open_entry(0, /*resume_slideshow=*/ true));
+        assert_eq!(app.fullscreen_idx, Some(0));
+        app.capture_fs_nav_holdover(0);
+        assert!(app.fs_nav_is_locked());
+        let gen_before = app.items_generation;
+
+        let advanced = app.snapshot_advance_for_slideshow(/*forward=*/ true);
+
+        assert!(advanced, "次の leaf へ自動送りする");
+        assert_eq!(app.fullscreen_idx, Some(1), "b に送られる");
+        assert_eq!(
+            app.items_generation, gen_before,
+            "直接 open は items_generation を進めない"
+        );
+        assert!(
+            !app.fs_nav_is_locked(),
+            "スライドショー直接送り後も nav lock が解除される"
         );
     }
 }

@@ -49,6 +49,18 @@ ZIP/PDF を開いている最中は `container(idx)` が ZIP/PDF 本体のパス
 
 `adjustment_page_params: HashMap<usize, AdjustParams>` はフォルダ/ZIP/PDF ロード時に
 `AdjustmentDb::load_page_params(prefix)` で一括読込される。
+★固定 (snapshot) の activate / deactivate / list 復帰のように `load_folder` を通さずに
+`items` を差し替える経路では、`App::rehydrate_page_edit_state_for_current_items(prefix)`
+が同じ clear + DB ロードを行って idx-keyed 状態 (この `adjustment_page_params` に加え
+`local_adjust_page_layers` / `local_adjust_pages` / `local_adjust_selected_layers` /
+`export_crop_page_settings` / `export_crop_pages` / `mask_pages` / `conceal_pages`) を新しい
+idx へ hydrate し直す。これをやらないと差し替え前 idx の補正・マスクが別ページに乗る
+(Codex P1 2026-06-05)。**`load_folder` 側の hydration を変えたら同関数も揃えること**。
+ただし **cross-folder 検索 (Ctrl+S/Ctrl+G) 由来 snapshot は `App::clear_page_edit_state()`
+で clear のみ** (= subset が cross-folder で単一 prefix hydrate できず、検索 view は元々
+ページ編集 overlay を出さない)。Ctrl+F (単一フォルダ構造フィルタ) は検索ではないので
+rehydrate 側。`clear_page_edit_state()` 単独は上記 idx-keyed セットの正準 clear で、
+`replace_search_view_items` (Ctrl+G 結果差し替え) からも呼ばれる。
 `adjustment_favorite_params: HashMap<Uuid, AdjustParams>` は **起動時に 1 回**
 (`App::hydrate_adjustment_favorite_params`) 全件ロードされ、
 `settings.favorites` に存在しない orphan 行は `prune_favorite_params` で掃除される。

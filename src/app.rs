@@ -64,12 +64,20 @@ pub(crate) enum FolderNavMode {
 /// (旧来は `Option<bool>` で forward だけ持っていたが、スライドショー NextFolder の
 /// resume を deferred 経路でも引き継ぐため struct 化した。resume は自由 bool ではなく
 /// `FolderNavMode::SlideshowNext` 由来でセットされる。)
-#[derive(Clone, Copy, Debug)]
+///
+/// `target` は ★固定 (snapshot) ナビで未展開 ZIP/PDF 内の特定 leaf を開きに行く場合に
+/// セットされる (Codex P2 fix)。`SnapshotTarget` は `PathBuf`/`String` を含み `Copy` 不可
+/// なので、本 struct も `Clone` のみ (旧来の `Copy` は外した)。
+#[derive(Clone, Debug)]
 pub(crate) struct DeferredFsReopen {
     /// true なら reopen 後にスライドショーを再開する (SlideshowNext 由来のときだけ)。
     /// また true のときは先頭の **静止画のみ** (Video 除外) を開く。
     /// (DFS 方向 forward は deferred reopen では使わない: フォルダ先頭着地固定のため。)
     pub resume_slideshow: bool,
+    /// ★固定ナビで開きに行く特定 leaf (画像 / 動画 / ZipImage / PdfPage)。
+    /// `Some` なら列挙完了時にこの target を `items` から解決して開く。マッチしなければ
+    /// `find_fullscreen_nav_target_filtered` に fallback。フォルダナビ経路では常に `None`。
+    pub target: Option<crate::snapshot::SnapshotTarget>,
 }
 
 /// DFS スレッドから UI スレッドに送るメッセージ。結果 (Option) と、
@@ -7766,10 +7774,15 @@ impl App {
         // Ctrl+↑↓ フォルダナビから fullscreen で ZIP に遷移してきた場合、items が
         // 揃った今 fullscreen を開き直す (Codex P1: PDF と同じ処理を ZIP にも適用)。
         if let Some(deferred) = self.fs_nav_after_pdf_enumerate.take() {
+            // ★固定ナビ由来 (target Some) なら列挙完了した items から対象 leaf を解決する
+            // (Codex P2 fix)。マッチしなければ / フォルダナビ由来なら従来どおり先頭着地。
             // スライドショー NextFolder の deferred 再開は動画を開かず静止画のみに着地する。
-            if let Some(new_idx) =
-                self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow)
-            {
+            let new_idx = deferred
+                .target
+                .as_ref()
+                .and_then(|t| self.resolve_snapshot_target_idx(t))
+                .or_else(|| self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow));
+            if let Some(new_idx) = new_idx {
                 self.open_fullscreen(new_idx);
                 self.selected = Some(new_idx);
                 self.scroll_to_selected = true;
@@ -8199,10 +8212,18 @@ impl App {
                 // Ctrl+↑↓ フォルダナビから遷移してきた場合はここで fullscreen を開き直す。
                 // placeholder hit/miss 問わず必ず実行する (Codex P1-2)。
                 if let Some(deferred) = self.fs_nav_after_pdf_enumerate.take() {
-                    // スライドショー NextFolder の deferred 再開は動画を開かず静止画のみに着地する。
-                    if let Some(new_idx) =
-                        self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow)
-                    {
+                    // ★固定ナビ由来 (target Some) なら列挙完了した items から対象 leaf を
+                    // 解決する (Codex P2 fix)。マッチしなければ / フォルダナビ由来なら従来
+                    // どおり先頭着地。スライドショー NextFolder の deferred 再開は動画を
+                    // 開かず静止画のみに着地する。
+                    let new_idx = deferred
+                        .target
+                        .as_ref()
+                        .and_then(|t| self.resolve_snapshot_target_idx(t))
+                        .or_else(|| {
+                            self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow)
+                        });
+                    if let Some(new_idx) = new_idx {
                         self.open_fullscreen(new_idx);
                         self.selected = Some(new_idx);
                         self.scroll_to_selected = true;
@@ -10046,6 +10067,117 @@ impl App {
         }
     }
 
+    /// 現在の `items` に対して、idx-keyed なページ編集状態 (画像補正の個別パラメータ /
+    /// ローカル調整レイヤー / 最終段 crop / 消しゴムマスク / 隠蔽マスク) を一旦 clear し、
+    /// DB から再 hydrate する。
+    ///
+    /// `load_folder` (= `start_loading_items`) の hydration ブロック (perf イベント
+    /// `sli_adjustment_db` / `sli_local_adjust_db` / `sli_export_crop_db` / mask / conceal)
+    /// と同じ prefix 計算・DB メソッド・対象マップを使う。**あちらを変えたらこちらも揃える
+    /// こと** (= 同期漏れ防止。snapshot 経路だけ古い hydration を引きずると Codex P1 が再発する)。
+    ///
+    /// 用途: ★固定 (snapshot) の activate / deactivate / list 復帰のように、`load_folder` を
+    /// 通さずに `items` を差し替える経路。これらで呼ばないと、差し替え前 idx に紐付いた補正・
+    /// マスクが新しい items の別ページに乗る (Codex P1)。補正・マスク等の編集は `set_page_params`
+    /// 等が DB に同期保存するので、DB から読み直せば snapshot 中の編集も反映される。
+    ///
+    /// `prefix_path` は DB prefix クエリに使うフォルダ / ZIP / PDF パス (= snapshot origin)。
+    /// 検索 view 由来 snapshot のように prefix が合成 path / cross-folder の場合は DB が空ヒット
+    /// になり、マップは空のまま (= 検索 view は元々ページ編集状態を持たない設計と整合)。
+    ///
+    /// `local_adjust_selected_layers` は DB を持たない UI 選択状態なので clear のみ
+    /// (load_folder と同じ。再選択時に 0 始まりで復元される)。
+    /// idx-keyed なページ編集状態 (補正の個別パラメータ / ローカル調整レイヤー + 選択 idx /
+    /// 最終段 crop / 消しゴムマスク / 隠蔽マスクのバッジ集合) を全 clear する。
+    ///
+    /// `rehydrate_page_edit_state_for_current_items` の clear 段であり、
+    /// 「ページ編集 overlay を出さない」べき経路 (= 検索 view 由来 snapshot や
+    /// `replace_search_view_items`) からも単独で呼ぶ。**ここに列挙するマップ集合が
+    /// idx-keyed ページ編集状態の正準リスト**。新しい idx-keyed ページ編集マップを足したら
+    /// ここと `remove_items_batch` の shift 群の両方に追加すること。
+    pub(crate) fn clear_page_edit_state(&mut self) {
+        self.adjustment_page_params.clear();
+        self.local_adjust_page_layers.clear();
+        self.local_adjust_pages.clear();
+        self.local_adjust_selected_layers.clear();
+        self.export_crop_page_settings.clear();
+        self.export_crop_pages.clear();
+        self.mask_pages.clear();
+        self.conceal_pages.clear();
+    }
+
+    pub(crate) fn rehydrate_page_edit_state_for_current_items(
+        &mut self,
+        prefix_path: &std::path::Path,
+    ) {
+        self.clear_page_edit_state();
+
+        let prefix = crate::adjustment_db::normalize_path(prefix_path);
+
+        if let Some(db) = &self.adjustment_db {
+            let page_map = db.load_page_params(&prefix);
+            if !page_map.is_empty() {
+                for idx in 0..self.items.len() {
+                    if let Some(key) = self.page_path_key(idx) {
+                        if let Some(params) = page_map.get(&key) {
+                            self.adjustment_page_params.insert(idx, params.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(db) = &self.local_adjust_db {
+            let page_map = db.load_layers_by_prefix(&prefix);
+            if !page_map.is_empty() {
+                for idx in 0..self.items.len() {
+                    if let Some(key) = self.page_path_key(idx) {
+                        if let Some(layers) = page_map.get(&key) {
+                            self.local_adjust_page_layers.insert(idx, layers.clone());
+                            self.local_adjust_pages.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(db) = &self.export_crop_db {
+            let page_map = db.load_by_prefix(&prefix);
+            if !page_map.is_empty() {
+                for idx in 0..self.items.len() {
+                    if let Some(key) = self.page_path_key(idx) {
+                        if let Some(settings) = page_map.get(&key) {
+                            self.export_crop_page_settings.insert(idx, *settings);
+                            self.export_crop_pages.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(db) = &self.mask_db {
+            let mask_keys = db.load_mask_keys(&prefix);
+            if !mask_keys.is_empty() {
+                for idx in 0..self.items.len() {
+                    if let Some(key) = self.page_path_key(idx) {
+                        if mask_keys.contains(&key) {
+                            self.mask_pages.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(db) = &self.conceal_db {
+            let conceal_keys = db.load_conceal_keys(&prefix);
+            if !conceal_keys.is_empty() {
+                for idx in 0..self.items.len() {
+                    if let Some(key) = self.page_path_key(idx) {
+                        if conceal_keys.contains(&key) {
+                            self.conceal_pages.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 複数 idx をまとめて items から取り除く共通ルーチン。
     ///
     /// `sorted_desc_idxs` は降順ソート済み・重複なしの idx 配列を期待する。
@@ -10107,6 +10239,26 @@ impl App {
             .local_adjust_pages
             .iter()
             .filter_map(|&i| shift(i))
+            .collect();
+        // 選択中レイヤー idx も同じ old→new マッピングで shift する。抜けると削除後に
+        // 別ページへ古い選択状態が乗る / 対象ページが選択を失う (Codex P2)。
+        // `set_local_adjust_layers_for_idx_memory_only_inner` が
+        // local_adjust_page_layers / local_adjust_pages / local_adjust_selected_layers を
+        // セットで更新する不変条件に合わせる。値 (選択 layer idx) は削除でそのページの
+        // layer 配列が変わらないので基本そのまま有効だが、念のため shift 済みの
+        // local_adjust_page_layers の残存数で clamp する。
+        self.local_adjust_selected_layers = std::mem::take(&mut self.local_adjust_selected_layers)
+            .into_iter()
+            .filter_map(|(i, sel)| {
+                shift(i).map(|ni| {
+                    let cap = self
+                        .local_adjust_page_layers
+                        .get(&ni)
+                        .map(|layers| layers.len().saturating_sub(1))
+                        .unwrap_or(0);
+                    (ni, sel.min(cap))
+                })
+            })
             .collect();
         self.export_crop_page_settings = std::mem::take(&mut self.export_crop_page_settings)
             .into_iter()
@@ -13461,7 +13613,11 @@ impl App {
         restore_video_tile: bool,
         resume_slideshow: bool,
     ) -> &'static str {
-        let deferred = DeferredFsReopen { resume_slideshow };
+        // フォルダナビ経路は特定 leaf を持たない (= target: None)。先頭着地。
+        let deferred = DeferredFsReopen {
+            resume_slideshow,
+            target: None,
+        };
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
             self.fs_nav_after_pdf_enumerate = Some(deferred);
             return "enumerate_defer";

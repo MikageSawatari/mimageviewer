@@ -532,6 +532,14 @@ snapshot は image / video / Folder / ZipFile / PdfFile が混在する可能性
 | **P2-7 weak** header line 5 stale | header を `~1,500-1,700 行、2-3 commit` に修正、Step 表合計と整合 |
 | **P3-3** 旧 filter UI disabled 記述残存 | line 64 / 151 / 447 / 463 を新仕様に修正 (filter UI 操作可 / state は consume / 関連コード位置の `要調査` 削除) |
 
+### Codex review (= 2026-06-05、本体実装後の idx-keyed 状態 / async 経路指摘) と対応
+
+| Codex 指摘 | 対応 |
+|---|---|
+| **P1** snapshot 有効化で idx-keyed ページ編集状態が stale | `activate_snapshot` は items を subset へ差し替えるが、`adjustment_page_params` / `mask_pages` / `conceal_pages` / `local_adjust_page_layers` / `local_adjust_pages` / `local_adjust_selected_layers` / `export_crop_page_settings` / `export_crop_pages` を remap せず、元フォルダの別画像の補正・マスクが subset の別 idx に乗っていた。**`App::clear_page_edit_state()` (idx-keyed ページ編集状態の正準セット clear) + `App::rehydrate_page_edit_state_for_current_items(prefix)` (clear + `load_folder` と同じ DB ロード) を新設**。`activate_snapshot` / `deactivate_snapshot` (at_origin 非検索経路) / `snapshot_return_to_list_view` の 3 箇所で対称に処理する。編集は `set_page_params` 等が DB に同期保存するので、解除時に DB から読み直せば snapshot 中の編集も復元される。child folder drill は `load_folder` 由来で既に hydrate 済み。**cross-folder 検索 view 由来 snapshot (= Ctrl+S/Ctrl+G、判定は `pre_snapshot_search_origin.is_some()`) は clear のみ**: subset が cross-folder で単一 prefix hydrate できず、かつ origin が検索前の実 current_folder なので prefix 配下の subset item だけ部分 hydrate される不整合を避ける (検索 view は元々ページ編集 overlay を出さない設計と整合)。**Ctrl+F (単一フォルダ構造フィルタ) は検索ではなく rehydrate 側** (`search_was_active` では gate しない。あれは Ctrl+F も true になり誤 clear + list 復帰との非対称を生む)。回帰テスト 4 件 (通常フォルダ activate で b の補正が subset に leak しない / deactivate で元 idx に復元 / Ctrl+G snapshot は clear のみ / Ctrl+F snapshot は rehydrate) |
+| **P2** 削除時 `local_adjust_selected_layers` 未 shift | `remove_items_batch` は `local_adjust_page_layers` / `local_adjust_pages` を idx shift するが選択中レイヤー idx を残置 → 削除位置より後ろのページが選択状態を失う / 別ページへ古い選択が乗る。同じ shift マッピング + 残存 layer 数 clamp を追加。回帰テスト 2 件 |
+| **P2 (async)** 非同期 ZIP/PDF 列挙をまたぐ snapshot leaf target 喪失 | `snapshot_load_and_open` で未展開 ZIP/PDF を開くとき、`load_folder` が非同期列挙を開始 → 直後の同期 target lookup が空振りし first playable に着地していた。**`DeferredFsReopen` に `target: Option<SnapshotTarget>` を追加** (Copy 外し Clone のみ)、列挙 pending 時は target を載せた deferred を `fs_nav_after_pdf_enumerate` にセット。`poll_zip_enumerate` / `poll_pdf_enumerate` 完了時に `resolve_snapshot_target_idx(target)` で対象 leaf を解決 (マッチしなければ従来どおり先頭着地に fallback)。target マッチロジックは sync/deferred 両経路で共有 helper に集約。`capture_fs_nav_holdover` 由来の nav lock + holdover が既存の folder-nav deferred と同じ機構で継続するので画面継続性も保たれる。回帰テスト 1 件 (`resolve_snapshot_target_idx` の各 leaf 種別解決) |
+
 ## 7. 旧版 Codex レビュー時の論点 (= 2026-06-04 初回 review に対する論点リスト、参考)
 
 ### 設計の妥当性 (= 採用案 D が筋か)

@@ -4810,6 +4810,7 @@ mod favorite_adjustment_defaults_tests {
         app.items_generation += 1;
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
             resume_slideshow: false,
+            target: None,
         });
 
         app.poll_fs_nav_lock();
@@ -5277,6 +5278,269 @@ mod favorite_adjustment_defaults_tests {
             app.thumb_adjust_tex.is_empty(),
             "補正済み TextureHandle は stale なので削除後に再生成させる"
         );
+    }
+
+    /// Codex P2: 削除時に local_adjust_page_layers / local_adjust_pages だけでなく
+    /// local_adjust_selected_layers も idx shift する。抜けると削除位置より後ろの
+    /// ページが選択レイヤー状態を失う / 別ページへ古い選択が乗る。
+    #[test]
+    fn remove_items_batch_shifts_local_adjust_selected_layers() {
+        fn layer(name: &str) -> local_adjust_core::LocalAdjustmentLayer {
+            local_adjust_core::LocalAdjustmentLayer::new(
+                name,
+                local_adjust_core::LocalMask::Full,
+                local_adjust_core::LocalEffect::None,
+            )
+        }
+        let mut app = setup_app();
+        let a = push_image(&mut app, "C:/p/a.jpg");
+        let b = push_image(&mut app, "C:/p/b.jpg");
+        let c = push_image(&mut app, "C:/p/c.jpg");
+        assert_eq!((a, b, c), (0, 1, 2));
+
+        app.local_adjust_page_layers
+            .insert(a, vec![layer("A0"), layer("A1")]);
+        app.local_adjust_pages.insert(a);
+        app.local_adjust_selected_layers.insert(a, 1);
+
+        app.local_adjust_page_layers.insert(b, vec![layer("B0")]);
+        app.local_adjust_pages.insert(b);
+        app.local_adjust_selected_layers.insert(b, 0);
+
+        app.local_adjust_page_layers
+            .insert(c, vec![layer("C0"), layer("C1"), layer("C2")]);
+        app.local_adjust_pages.insert(c);
+        app.local_adjust_selected_layers.insert(c, 2);
+
+        // 中央 (b) を削除 → a は idx 0 のまま、c は idx 2 → 1 へ shift。
+        app.remove_items_batch(&[b]);
+
+        assert_eq!(app.items.len(), 2);
+        assert_eq!(
+            app.local_adjust_selected_layers.get(&0).copied(),
+            Some(1),
+            "先頭ページの選択レイヤーは idx 0 のまま残る"
+        );
+        assert_eq!(
+            app.local_adjust_selected_layers.get(&1).copied(),
+            Some(2),
+            "削除位置より後ろのページの選択レイヤーは新 idx 1 へ shift される"
+        );
+        assert_eq!(
+            app.local_adjust_selected_layers.len(),
+            2,
+            "削除対象ページの選択レイヤーエントリは残さない"
+        );
+        // page_layers / pages 側と idx が揃っていること (= セット更新の不変条件)
+        assert!(app.local_adjust_page_layers.contains_key(&1));
+        assert!(app.local_adjust_pages.contains(&1));
+    }
+
+    /// Codex P2 (clamp 部): 何らかの理由で選択レイヤー idx が残存 layer 数を超えていても、
+    /// shift 時に新 idx の layer 数で clamp して範囲内に収める。
+    #[test]
+    fn remove_items_batch_clamps_local_adjust_selected_layer_to_layer_count() {
+        let mut app = setup_app();
+        let a = push_image(&mut app, "C:/p/a.jpg");
+        let b = push_image(&mut app, "C:/p/b.jpg");
+        assert_eq!((a, b), (0, 1));
+
+        // b は 1 layer だが選択 idx を意図的に過大 (5) にしておく。
+        app.local_adjust_page_layers.insert(
+            b,
+            vec![local_adjust_core::LocalAdjustmentLayer::new(
+                "B0",
+                local_adjust_core::LocalMask::Full,
+                local_adjust_core::LocalEffect::None,
+            )],
+        );
+        app.local_adjust_pages.insert(b);
+        app.local_adjust_selected_layers.insert(b, 5);
+
+        // a を削除 → b は idx 1 → 0 へ shift。選択 idx は layer 数 1 に対して 0 へ clamp。
+        app.remove_items_batch(&[a]);
+
+        assert_eq!(
+            app.local_adjust_selected_layers.get(&0).copied(),
+            Some(0),
+            "残存 layer 数 (1) を超えた選択 idx は clamp される"
+        );
+    }
+
+    /// Codex P1: snapshot 有効化で items を subset へ差し替えたら、idx-keyed なページ編集
+    /// 状態 (補正の個別パラメータ等) も subset idx へ hydrate し直す。これをやらないと元
+    /// フォルダの別画像に紐付いた補正が subset の別 idx に乗って表示・エクスポートされる。
+    #[test]
+    fn activate_snapshot_remaps_page_params_to_subset_indices() {
+        let mut app = setup_app();
+        let a = push_image(&mut app, "C:/pics/a.jpg");
+        let b = push_image(&mut app, "C:/pics/b.jpg");
+        let c = push_image(&mut app, "C:/pics/c.jpg");
+        assert_eq!((a, b, c), (0, 1, 2));
+        app.current_folder = Some(PathBuf::from("C:/pics"));
+        // 3 枚それぞれ別 brightness を設定 (set_page_params が DB に同期保存)。
+        app.set_page_params(a, params_with_brightness(10.0));
+        app.set_page_params(b, params_with_brightness(20.0));
+        app.set_page_params(c, params_with_brightness(30.0));
+
+        // visible = [a, c] (b を除外) を固定する。
+        app.visible_indices = vec![a, c];
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+        // subset items = [a, c] (reindex 0,1)
+        assert_eq!(app.items.len(), 2);
+        // 旧バグでは orig-keyed の adjustment_page_params[1] (= b の 20) が subset idx 1
+        // (= c) に残って効いていた。
+        assert!(
+            (app.effective_params(0).brightness - 10.0).abs() < f32::EPSILON,
+            "subset idx0 は a の補正 (10)"
+        );
+        assert!(
+            (app.effective_params(1).brightness - 30.0).abs() < f32::EPSILON,
+            "subset idx1 は c の補正 (30)。b の 20 が stale leak しない"
+        );
+        // 除外された b の補正 (20) は subset のどのページにも乗らない。
+        assert!(
+            !(0..app.items.len())
+                .any(|i| (app.effective_params(i).brightness - 20.0).abs() < f32::EPSILON),
+            "除外された b の補正 (20) は subset のどのページにも現れない"
+        );
+    }
+
+    /// Codex P1 (対称性): snapshot 解除で items を元フォルダに戻したら、ページ編集状態も
+    /// 元 idx で hydrate し直す。subset hydrate しっぱなしだと解除後に subset-keyed の補正が
+    /// 元フォルダの別画像に乗る。
+    #[test]
+    fn deactivate_snapshot_restores_page_params_to_original_indices() {
+        let mut app = setup_app();
+        let a = push_image(&mut app, "C:/pics/a.jpg");
+        let b = push_image(&mut app, "C:/pics/b.jpg");
+        let c = push_image(&mut app, "C:/pics/c.jpg");
+        app.current_folder = Some(PathBuf::from("C:/pics"));
+        app.set_page_params(a, params_with_brightness(10.0));
+        app.set_page_params(b, params_with_brightness(20.0));
+        app.set_page_params(c, params_with_brightness(30.0));
+        app.visible_indices = vec![a, c];
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+        // 解除 (current_folder == origin なので at_origin 経路)。
+        app.deactivate_snapshot();
+        assert!(app.snapshot.is_none());
+        assert_eq!(app.items.len(), 3);
+        // 元 idx の補正が正しく復元される (subset-keyed の残骸が乗らない)。
+        assert!(
+            (app.effective_params(0).brightness - 10.0).abs() < f32::EPSILON,
+            "a=10 復元"
+        );
+        assert!(
+            (app.effective_params(1).brightness - 20.0).abs() < f32::EPSILON,
+            "b=20 復元 (subset では除外されていたが DB から戻る)"
+        );
+        assert!(
+            (app.effective_params(2).brightness - 30.0).abs() < f32::EPSILON,
+            "c=30 復元"
+        );
+    }
+
+    /// Codex P1 (検索 view snapshot): Ctrl+G 等の検索 view から★固定した場合は、origin
+    /// (= 検索前の実 current_folder) の DB から部分 hydrate せず clear のみにする。検索 view
+    /// は元々ページ編集 overlay を出さない設計なので、その snapshot もそれに揃える
+    /// (origin が cross-folder prefix なので prefix 配下の subset item だけ部分 hydrate される
+    /// 不整合を避ける)。
+    #[test]
+    fn activate_search_view_snapshot_clears_page_state_without_rehydrate() {
+        let mut app = setup_app();
+        let a = push_image(&mut app, "C:/pics/a.jpg");
+        let b = push_image(&mut app, "C:/pics/b.jpg");
+        app.current_folder = Some(PathBuf::from("C:/pics"));
+        // DB に補正を保存しておく (= 通常フォルダ由来なら hydrate される値)。
+        app.set_page_params(a, params_with_brightness(10.0));
+        app.set_page_params(b, params_with_brightness(20.0));
+        // 検索 view を模擬: global_search.active + saved_folder。検索 view では
+        // replace_search_view_items が maps を clear している状態を再現する。
+        app.global_search.active = true;
+        app.global_search.saved_folder = Some(PathBuf::from("C:/before"));
+        app.clear_page_edit_state();
+        app.visible_indices = vec![a, b];
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
+            query: "x".into(),
+        });
+        // 検索由来なので rehydrate されず、ページ編集状態は空のまま。
+        // (旧 P1 fix の素朴な rehydrate だと C:/pics の DB から a=10/b=20 が乗ってしまう。)
+        assert!(
+            app.adjustment_page_params.is_empty(),
+            "検索 view 由来 snapshot は origin の DB から部分 hydrate しない (clear のみ)"
+        );
+    }
+
+    /// Codex follow-up: Ctrl+F (= 単一フォルダの構造フィルタ) から★固定した場合は、
+    /// cross-folder 検索ではないので通常どおり origin から rehydrate する (clear-only に
+    /// しない)。`search_was_active` で gate すると Ctrl+F が誤って clear される退行のガード。
+    /// 判定は `pre_snapshot_search_origin.is_some()` (Ctrl+F では None)。
+    #[test]
+    fn activate_ctrl_f_filtered_snapshot_rehydrates_page_params() {
+        let mut app = setup_app();
+        let a = push_image(&mut app, "C:/pics/a.jpg");
+        let b = push_image(&mut app, "C:/pics/b.jpg");
+        let c = push_image(&mut app, "C:/pics/c.jpg");
+        app.current_folder = Some(PathBuf::from("C:/pics"));
+        app.set_page_params(a, params_with_brightness(10.0));
+        app.set_page_params(b, params_with_brightness(20.0));
+        app.set_page_params(c, params_with_brightness(30.0));
+        // Ctrl+F (テキスト検索バー) を立てる。global_search / favsearch は inactive のまま
+        // なので pre_snapshot_search_origin は None になり、cross-folder 検索ではない。
+        app.show_search_bar = true;
+        app.visible_indices = vec![a, c];
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert_eq!(app.items.len(), 2);
+        // Ctrl+F は単一フォルダなので rehydrate される (clear-only にならない)。
+        assert!(
+            (app.effective_params(0).brightness - 10.0).abs() < f32::EPSILON,
+            "subset idx0 = a の補正 10 が rehydrate される"
+        );
+        assert!(
+            (app.effective_params(1).brightness - 30.0).abs() < f32::EPSILON,
+            "subset idx1 = c の補正 30 が rehydrate される"
+        );
+    }
+
+    /// Codex P2: `clear_page_edit_state` は idx-keyed ページ編集状態の正準セットを全部落とす。
+    /// `replace_search_view_items` がこれを呼ぶことで、旧実装が取りこぼしていた
+    /// local_adjust_selected_layers / conceal_pages も確実に clear される。
+    #[test]
+    fn clear_page_edit_state_clears_all_idx_keyed_maps() {
+        let mut app = setup_app();
+        app.adjustment_page_params
+            .insert(0, params_with_brightness(5.0));
+        app.local_adjust_page_layers.insert(
+            0,
+            vec![local_adjust_core::LocalAdjustmentLayer::new(
+                "L",
+                local_adjust_core::LocalMask::Full,
+                local_adjust_core::LocalEffect::None,
+            )],
+        );
+        app.local_adjust_pages.insert(0);
+        app.local_adjust_selected_layers.insert(0, 3);
+        app.mask_pages.insert(0);
+        app.conceal_pages.insert(0);
+        app.export_crop_pages.insert(0);
+
+        app.clear_page_edit_state();
+
+        assert!(app.adjustment_page_params.is_empty());
+        assert!(app.local_adjust_page_layers.is_empty());
+        assert!(app.local_adjust_pages.is_empty());
+        assert!(
+            app.local_adjust_selected_layers.is_empty(),
+            "Codex P2: 旧 Ctrl+G clear が取りこぼしていた選択レイヤーも落とす"
+        );
+        assert!(app.mask_pages.is_empty());
+        assert!(
+            app.conceal_pages.is_empty(),
+            "Codex P2: 旧 Ctrl+G clear が取りこぼしていた隠蔽バッジも落とす"
+        );
+        assert!(app.export_crop_pages.is_empty());
     }
 
     // ─────────────────────────────────────────────────────────────────────
