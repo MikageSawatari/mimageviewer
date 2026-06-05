@@ -1,9 +1,14 @@
 # テキスト注釈(comic)機能 — 本体 mIV 統合計画
 
-Status: 計画 v2.6（**Inc 3 完了** = 座標逆写像(回転 D8)+選択+ドラッグ移動+IME 編集、基本 Inc 4
-編集も先行着手。Inc 0/1/2/3 完了済み）
-更新: 2026-06-05（Inc 3b/3c/3d 完了 + 基本 Inc 4a/4b/4d 編集着手。次は Inc 4 仕上げ → 5 → 6 → 7）
-対象ブランチ: `master`（lab を `6ac779b2` でマージ。comic-core は本体の依存）
+Status: 計画 v2.7（**Inc 3 完了** + **Inc 7 書き出し完了** + **Inc 6 変形ハンドル(回転/四隅
+リサイズ/しっぽ)完了** + 追加ダイアログのプレビューをラボ準拠に刷新。Inc 0/1/2/3/7 完了、
+Inc 6 の変形ハンドル部分完了。残: Inc 4c スタンプ / Inc 5 プリセット・フォント / Inc 6 Undo /
+Inc 4d/4e ウィンドウ・飾り詳細）
+更新: 2026-06-05（lab を `ff0efc98` で再マージ = テキスト回転ピボット + フォント/オノマトペ
+プリセット + text handles を取り込み。Inc 6 ハンドル移植 `c6d4d7cb`、Codex P2 対応 +
+吹き出し/ウィンドウ追加ダイアログを BubblePreset/paint_*_preview でラボ準拠プレビューに
+刷新 `4a64ad15`。次は Inc 4c スタンプ → Inc 5 プリセット → Inc 6 Undo）
+対象ブランチ: `master`（lab を初回 `6ac779b2`、追加分を `ff0efc98` でマージ。comic-core は本体の依存）
 
 ラボ（`tools/comic_lab` + `crates/comic-core`）で完成させた吹き出し/テキスト/スタンプ/
 メッセージウィンドウ注釈機能を、本体 mImageViewer（`C:\home\mimageviewer`、master）へ
@@ -382,11 +387,23 @@ master に対して再確認する**（このスナップショットに固定�
     （プリセット/追加ダイアログ/フォント見本/変形ハンドルは Inc 5/6 に依存するので、ここでは
     描画＋編集コントロールに限定して判定）。
 - **Inc 5: プリセット ＋ 追加/見本/ピッカー ダイアログ**
-  - セリフ/本体/ウィンドウ プリセット、吹き出し/ウィンドウ追加ダイアログ（レスポンシブ）、フォント見本、
+  - ✅ **追加ダイアログのプレビュー部分はラボ準拠に刷新済（2026-06-05、`4a64ad15`）**:
+    吹き出し追加は `BubblePreset`(18 種) + `paint_bubble_preview`(塗り三角形ファン + 統合
+    アウトライン + しっぽ + 集中線/流線/意識/なしの特殊描画) で「焼き上がりと一致するプレビュー」。
+    ウィンドウ追加は `WinPreset` + `paint_winpreset_preview`(塗り + 枠 + 本文見立て線)。
+  - ⏳ **残: セリフ/本体/ウィンドウ プリセットの保存/適用/更新/削除/リンク点灯**、フォント見本、
     スタンプピッカー。スナップショットテスト・glyph lint。
   - 受け入れ: 保存/適用/更新/削除/リンク点灯がラボ一致。名前見切れ無し。
 - **Inc 6: 変形ハンドル ＋ Undo/Redo ＋ パリティ最終署名**
-  - 四隅スケール/回転ノブ/しっぽハンドル、エディタ専用 Undo。**ここで §7 全消し込みを最終確認**。
+  - ✅ **変形ハンドル完了（2026-06-05、`c6d4d7cb`）**: 四隅スケール/回転ノブ/しっぽ(tip/base)
+    ハンドルをラボ `*_handle_points`/`handle_canvas_input` から移植。`TextDragKind`
+    (Move/Rotate/Corner/TailTip/TailBase) + `handle_points`/`tail_handle_points`/`pick_handle`/
+    `apply_text_drag`。`draw_text_selection` を回転反映の境界四角形 + 緑回転ノブ + 白四隅 +
+    cyan/橙しっぽに刷新。corner resize は局所軸へ逆回転して pivot 対称、テキストは中心固定
+    スケール、スタンプはアスペクト維持。回転中心は単独テキスト=レイアウト中心 / 他=pivot
+    (comic-core `object_rotation_pivot` と整合)。**Codex P2 対応**: press 直後の hold ではなく
+    画面 4px 超のドラッグまで変形を適用しない arm 閾値 (`TextDrag.start/armed`)。単体テスト 4 件。
+  - ⏳ **残: エディタ専用 Undo/Redo (Ctrl+Z/Y)**、§7 全消し込みの最終署名。
   - 受け入れ: Ctrl+Z/Y がモード内で動き `meta_undo` と干渉しない。§7 完了。
 - **Inc 7: 書き出し統合（Ctrl+E）** — ✅ **基本実装完了（2026-06-05）**
   - ✅ `comic_composited_pixels_for_export(ctx, idx)` を `export_page_pixels_for_idx` に挿し、注釈があれば最終
