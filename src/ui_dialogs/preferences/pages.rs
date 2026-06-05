@@ -728,6 +728,170 @@ pub(super) fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
     }
 }
 
+/// 編集用追加パック (オノマトペ向けフォント + 被写体分離モデル) の管理ページ。
+///
+/// 表示は `from_settings` で取ったスナップショット (`state.editing_addon_*`) を使う。
+/// 実際の DL / 削除 / フォルダオープンはボタンでリクエストフラグを立て、
+/// `show_preferences_dialog` の末尾 (closure 抜けた後) で App 側が処理する
+/// (TensorRT パック管理と同じパターン)。
+pub(super) fn page_editing_addon(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    use crate::editing_addon::AddonStatus;
+
+    ui.label(egui::RichText::new("編集用追加ファイル").strong());
+    ui.add_space(4.0);
+    ui.label(
+        "吹き出し・テキスト・オノマトペ機能と、補正レイヤーの被写体分離 (人物などの\n\
+         切り抜き) で使う、追加フォントと AI モデルをまとめて管理します。\n\
+         基本的なテキスト編集はこのパックが無くてもシステムフォントで利用できます。",
+    );
+    ui.add_space(8.0);
+
+    match state.editing_addon_status.clone() {
+        AddonStatus::Valid { version } => {
+            ui.colored_label(
+                egui::Color32::from_rgb(100, 200, 100),
+                format!("✓ 導入済み (バージョン {version})"),
+            );
+            ui.add_space(8.0);
+            ui.label(format!(
+                "ディスク使用量: 約 {} MiB",
+                state.editing_addon_size_mib
+            ));
+            ui.label(format!(
+                "含まれるフォント: {} 書体",
+                state.editing_addon_font_count
+            ));
+            if !state.editing_addon_subject_model.is_empty() {
+                ui.label(format!(
+                    "被写体分離モデル: {}",
+                    state.editing_addon_subject_model
+                ));
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("更新を確認・再ダウンロード")
+                    .on_hover_text(
+                        "配布一覧から最新の編集用追加パックを取得して導入し直します。\n\
+                         OK / キャンセルとは無関係に、すぐにダウンロードフローへ進みます。",
+                    )
+                    .clicked()
+                {
+                    state.start_editing_addon_install_requested = true;
+                }
+                if ui
+                    .button("インストール先を開く")
+                    .on_hover_text("追加ファイルの保存先フォルダを Explorer で開きます。")
+                    .clicked()
+                {
+                    state.open_editing_addon_folder_requested = true;
+                }
+            });
+            ui.add_space(8.0);
+            if ui
+                .button("削除")
+                .on_hover_text(
+                    "追加フォントと AI モデルを削除します。\n\
+                     ユーザー追加フォントや保存済み編集データは消えません。",
+                )
+                .clicked()
+            {
+                state.editing_addon_delete_confirm_open = true;
+            }
+
+            // 削除確認ダイアログ
+            if state.editing_addon_delete_confirm_open {
+                let mut do_delete = false;
+                let mut do_cancel = false;
+                let mut window_open = state.editing_addon_delete_confirm_open;
+                egui::Window::new("編集用追加ファイル削除の確認")
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut window_open)
+                    .show(ui.ctx(), |ui| {
+                        ui.label(format!(
+                            "編集用追加ファイル (約 {} MiB) を削除します。",
+                            state.editing_addon_size_mib
+                        ));
+                        ui.label(
+                            "削除してもユーザー追加フォントや保存済みの編集データは\n\
+                             消えません。再び必要になったらこのページから\n\
+                             再ダウンロードできます。",
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("削除する").clicked() {
+                                do_delete = true;
+                            }
+                            if ui.button("キャンセル").clicked() {
+                                do_cancel = true;
+                            }
+                        });
+                    });
+                // × ボタンでも閉じれるよう open フラグを書き戻す。
+                state.editing_addon_delete_confirm_open = window_open;
+                if do_delete {
+                    state.uninstall_editing_addon_requested = true;
+                    // 表示も即「未導入」へ同期 (= App 側で実際に削除される)。
+                    state.editing_addon_status = AddonStatus::Missing;
+                    state.editing_addon_size_mib = 0;
+                    state.editing_addon_font_count = 0;
+                    state.editing_addon_subject_model.clear();
+                    state.editing_addon_delete_confirm_open = false;
+                } else if do_cancel {
+                    state.editing_addon_delete_confirm_open = false;
+                }
+            }
+        }
+        AddonStatus::Missing => {
+            ui.colored_label(egui::Color32::from_rgb(200, 160, 80), "未導入です");
+            ui.add_space(6.0);
+            ui.label(
+                "初めて編集機能へ入ったときにも確認ダイアログが出ますが、ここから\n\
+                 先にダウンロードしておくこともできます (約 550 MB)。",
+            );
+            ui.add_space(10.0);
+            if ui
+                .button("ダウンロード")
+                .on_hover_text(
+                    "オノマトペ向けフォントと被写体分離モデルをダウンロードします。\n\
+                     OK / キャンセルとは無関係に、すぐにダウンロードフローへ進みます。",
+                )
+                .clicked()
+            {
+                state.start_editing_addon_install_requested = true;
+            }
+            ui.add_space(8.0);
+            if ui
+                .button("インストール先を開く")
+                .on_hover_text("追加ファイルの保存先フォルダを Explorer で開きます。")
+                .clicked()
+            {
+                state.open_editing_addon_folder_requested = true;
+            }
+        }
+        AddonStatus::Corrupt(msg) => {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 100, 100),
+                "⚠ 導入データが壊れています",
+            );
+            ui.add_space(4.0);
+            ui.label(msg);
+            ui.add_space(10.0);
+            ui.label("再ダウンロードすると修復できます。");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("再ダウンロード").clicked() {
+                    state.start_editing_addon_install_requested = true;
+                }
+                if ui.button("インストール先を開く").clicked() {
+                    state.open_editing_addon_folder_requested = true;
+                }
+            });
+        }
+    }
+}
+
 pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
 

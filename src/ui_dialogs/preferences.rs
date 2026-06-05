@@ -54,6 +54,8 @@ pub(crate) enum PreferencesPage {
     Video,
     /// VST3 プラグイン設定 (= 有効化 + チェーン編集)
     Vst3,
+    /// 編集用追加パック (オノマトペ向けフォント + 被写体分離モデル) の管理
+    EditingAddon,
     /// 開発者 / 診断 (ログ zip 書き出し・性能ログ)
     Developer,
 }
@@ -82,6 +84,7 @@ impl PreferencesPage {
             Self::UpdateCheck => "更新確認",
             Self::Video => "動画再生",
             Self::Vst3 => "VST3 プラグイン",
+            Self::EditingAddon => "編集用追加ファイル",
             Self::Developer => "開発者",
         }
     }
@@ -183,6 +186,12 @@ const TREE: &[TreeCategory] = &[
         page: Some(PreferencesPage::Vst3),
         children: &[],
     },
+    // 編集用追加パック (オノマトペ向けフォント + 被写体分離モデル) の導入 / 削除
+    TreeCategory {
+        label: "編集用追加ファイル",
+        page: Some(PreferencesPage::EditingAddon),
+        children: &[],
+    },
     // 開発者 / 診断 (ログ zip 書き出し・性能ログ記録)
     TreeCategory {
         label: "開発者",
@@ -238,6 +247,25 @@ pub(crate) struct PreferencesState {
     /// App 側で Preferences ウィンドウ closure 抜けた後に処理する
     /// (= worker pool が DLL を握ったままだと remove_dir_all が失敗するため)。
     pub uninstall_trt_pack_requested: bool,
+
+    // ── 編集用追加パック ページ用のキャッシュ ────────────────────
+    /// 編集用追加パックの導入状態 (環境設定ダイアログを開いた時点のスナップショット)。
+    pub editing_addon_status: crate::editing_addon::AddonStatus,
+    /// 導入済み pack のディスク使用量 (MiB)。未導入なら 0。
+    pub editing_addon_size_mib: u64,
+    /// 導入済み pack のフォント数。
+    pub editing_addon_font_count: usize,
+    /// 被写体分離モデル名 (manifest 由来、表示用)。
+    pub editing_addon_subject_model: String,
+    /// 「ダウンロード」/「更新・再ダウンロード」ボタンが押されたか。
+    /// Apply/Cancel 後に App 側で読み取って editing_addon install dialog を開く。
+    pub start_editing_addon_install_requested: bool,
+    /// 「削除」確認ダイアログ表示中フラグ。
+    pub editing_addon_delete_confirm_open: bool,
+    /// pack 削除をリクエスト。dialog closure 抜けた後に App 側で背景削除する。
+    pub uninstall_editing_addon_requested: bool,
+    /// インストール先フォルダを開くリクエスト。
+    pub open_editing_addon_folder_requested: bool,
 
     // ── VST3 プラグイン編集 ────────────────────────────────────────
     /// 環境設定を開いた時点でスキャンされていた VST3 プラグイン候補のスナップショット。
@@ -314,6 +342,24 @@ impl PreferencesState {
         let trt_engine_cache_size_mib =
             dir_size_bytes(&crate::ai::tensorrt_pack::engine_cache_dir()) / (1024 * 1024);
 
+        // 編集用追加パックの状態を 1 回だけ取得 (status は数 KB JSON + stat、fonts は
+        // 1 回の read_dir なので環境設定ダイアログを開く際の同期 I/O として許容範囲)。
+        let editing_addon_status = crate::editing_addon::addon_status();
+        let (editing_addon_size_mib, editing_addon_font_count, editing_addon_subject_model) =
+            if let crate::editing_addon::AddonStatus::Valid { version } = &editing_addon_status {
+                let size = dir_size_bytes(&crate::editing_addon::pack_dir(version)) / (1024 * 1024);
+                let fonts = crate::editing_addon::installed_fonts().len();
+                let model = crate::editing_addon::read_pack_manifest(version)
+                    .and_then(|m| {
+                        m.subject_matte_model()
+                            .map(|f| f.model_id.clone().unwrap_or_else(|| f.path.clone()))
+                    })
+                    .unwrap_or_default();
+                (size, fonts, model)
+            } else {
+                (0, 0, String::new())
+            };
+
         Self {
             settings: s.clone(),
             selected: PreferencesPage::Thumbnail,
@@ -338,6 +384,14 @@ impl PreferencesState {
             start_trt_install_requested: false,
             trt_cache_delete_confirm_open: false,
             uninstall_trt_pack_requested: false,
+            editing_addon_status,
+            editing_addon_size_mib,
+            editing_addon_font_count,
+            editing_addon_subject_model,
+            start_editing_addon_install_requested: false,
+            editing_addon_delete_confirm_open: false,
+            uninstall_editing_addon_requested: false,
+            open_editing_addon_folder_requested: false,
             #[cfg(windows)]
             vst3_discovered: Vec::new(),
             #[cfg(windows)]
@@ -690,6 +744,82 @@ impl App {
                 self.uninstall_trt_pack_now();
             }
         }
+
+        // 「編集用追加ファイルをダウンロード / 更新」ボタンが押されていたら、環境設定を
+        // 閉じて editing addon install dialog を開く (TRT と同じ即時実行フロー)。
+        if let Some(ps) = self.pref_state.as_mut() {
+            if ps.start_editing_addon_install_requested {
+                ps.start_editing_addon_install_requested = false;
+                self.pref_state = None;
+                self.show_preferences = false;
+                // 環境設定から明示的に要求したので、このセッションの辞退フラグは解除して
+                // 確実に確認ダイアログを開く。
+                self.editing_addon_declined_session = false;
+                self.editing_addon_install_state =
+                    Some(crate::ui_dialogs::editing_addon::EditingAddonInstallState::new());
+            }
+        }
+
+        // 「編集用追加ファイルを削除」が確定されていたら背景削除する。
+        if let Some(ps) = self.pref_state.as_mut() {
+            if ps.uninstall_editing_addon_requested {
+                ps.uninstall_editing_addon_requested = false;
+                self.uninstall_editing_addon_now();
+            }
+        }
+
+        // 「インストール先を開く」が押されていたら Explorer で開く。
+        if let Some(ps) = self.pref_state.as_mut() {
+            if ps.open_editing_addon_folder_requested {
+                ps.open_editing_addon_folder_requested = false;
+                self.open_editing_addon_folder();
+            }
+        }
+    }
+
+    /// 編集用追加パック削除フロー本体。
+    /// - `active.json` を即削除 (= `addon_status()` が即 Missing になる、フォントは次回ベイクで外れる)
+    /// - フォントキャッシュを無効化
+    /// - 大きいモデルを含む `packs/` / `downloads/` の削除は背景 thread (UI を止めない、CLAUDE.md)
+    pub(crate) fn uninstall_editing_addon_now(&mut self) {
+        // 1. active pointer を先に外す (= 機能側は即「未導入」扱いになる)。
+        let _ = std::fs::remove_file(crate::editing_addon::active_pointer_path());
+        // 2. フォントキャッシュ無効化 (次回ベイク時に追加パックフォントを外して読み直す)。
+        self.comic_fonts = None;
+        self.comic_fonts_loaded = false;
+        crate::logger::log(
+            "[editing pack] 削除を開始 (active.json 解除 + フォントキャッシュ無効化)".to_string(),
+        );
+        // 3. pack ディレクトリ / DL 残骸の削除は背景 thread に逃がす
+        //    (BiRefNet ~490MB を含むため remove_dir_all は数秒かかり得る)。
+        let packs = crate::editing_addon::packs_root();
+        let downloads = crate::editing_addon::downloads_dir();
+        std::thread::Builder::new()
+            .name("editing-pack-uninstall".to_string())
+            .spawn(move || {
+                for dir in [packs, downloads] {
+                    match std::fs::remove_dir_all(&dir) {
+                        Ok(()) => crate::logger::log(format!(
+                            "[editing pack] 削除しました: {}",
+                            dir.display()
+                        )),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => crate::logger::log(format!(
+                            "[editing pack] 削除に失敗: {} ({e})",
+                            dir.display()
+                        )),
+                    }
+                }
+            })
+            .ok();
+    }
+
+    /// 編集用追加パックのインストール先 (`%APPDATA%/mimageviewer/addons/editing/`) を
+    /// Explorer で開く。未作成なら作ってから開く。
+    pub(crate) fn open_editing_addon_folder(&mut self) {
+        let dir = crate::editing_addon::addon_root();
+        let _ = std::fs::create_dir_all(&dir);
+        crate::ui_helpers::open_external_player(&dir);
     }
 
     /// TRT パック削除フロー本体。
@@ -828,6 +958,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::UpdateCheck => page_update_check(ui, state),
         PreferencesPage::Video => page_video(ui, state),
         PreferencesPage::Vst3 => page_vst3(ui, state),
+        PreferencesPage::EditingAddon => page_editing_addon(ui, state),
         PreferencesPage::Developer => page_developer(ui, state),
     }
 }
