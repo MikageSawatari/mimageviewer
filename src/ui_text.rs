@@ -30,9 +30,10 @@ use crate::app::{App, TextDrag, TextDragKind};
 use crate::comic_presets::{ShapeStylePreset, TextStylePreset, WindowStylePreset};
 use crate::ui_fullscreen::{FsKeyAction, SpreadPair};
 use comic_core::{
-    AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, FillMode, FontSet, FrameStyle,
-    MessageWindowObject, Orientation, Rgba, SizeMode, StampObject, StrokeStyle, Tail, TailKind,
-    TextAlign, TextBlock, VAnchor, WindowPosition,
+    AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, DecoKind, DecoPlacement,
+    DecorationLayer, FillMode, FontSet, FrameStyle, IndicatorKind, MessageWindowObject,
+    NamePlateMode, Orientation, PortraitSide, Rgba, ShadowStyle, SizeMode, StampObject,
+    StrokeStyle, Tail, TailKind, TextAlign, TextBlock, VAnchor, WindowPosition,
 };
 
 /// パネル幅 (編集コントロールが入るので conceal より少し広い)。
@@ -47,7 +48,8 @@ const COMIC_UNDO_CAP: usize = 100;
 
 /// 右詳細パネルのカテゴリタブ。補正レイヤーの section-accent と同じく、各カテゴリに
 /// アクセント色を割り当て、タブボタン + コンテンツ左端の色帯で「カラーの縦線での分類」を
-/// 与える (ラボの `PropTab` 相当。mIV は飾り未対応なので セリフ/本体/しっぽ の 3 種)。
+/// 与える (ラボの `PropTab` 相当)。種別ごとに有効タブが異なる: テキスト=セリフのみ、
+/// 吹き出し=セリフ/本体/しっぽ/飾り、ウィンドウ=セリフ/枠(本体)/部品。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextPropTab {
     /// セリフ (本文テキスト): 青。
@@ -56,6 +58,10 @@ pub(crate) enum TextPropTab {
     Body,
     /// しっぽ (吹き出しのしっぽ): 橙。
     Tail,
+    /// 部品 (ウィンドウの名前プレート / 立ち絵枠 / 続き指標): 紫。
+    Parts,
+    /// 飾り (吹き出しの装飾レイヤー = きらきら / 花 / 泡): 桃。
+    Deco,
 }
 
 impl TextPropTab {
@@ -65,6 +71,8 @@ impl TextPropTab {
             TextPropTab::Serifu => egui::Color32::from_rgb(90, 170, 255), // 青
             TextPropTab::Body => egui::Color32::from_rgb(95, 208, 140),   // 緑
             TextPropTab::Tail => egui::Color32::from_rgb(255, 160, 60),   // 橙
+            TextPropTab::Parts => egui::Color32::from_rgb(170, 140, 240), // 紫
+            TextPropTab::Deco => egui::Color32::from_rgb(240, 130, 195),  // 桃
         }
     }
 
@@ -73,6 +81,8 @@ impl TextPropTab {
             TextPropTab::Serifu => "セリフ",
             TextPropTab::Body => "本体",
             TextPropTab::Tail => "しっぽ",
+            TextPropTab::Parts => "部品",
+            TextPropTab::Deco => "飾り",
         }
     }
 }
@@ -566,6 +576,11 @@ fn apply_text_drag(
                 let dy = img.1 - drag.last_img.1;
                 if dx != 0.0 || dy != 0.0 {
                     translate_object(o, dx, dy);
+                    // ウィンドウを手で動かしたら位置プリセットを解除する (= Free)。
+                    // でないと `resolve_window_placement` が次の編集で元位置へ戻してしまう。
+                    if let AnnotationKind::MessageWindow(w) = &mut o.kind {
+                        w.position = WindowPosition::Free;
+                    }
                     changed = true;
                 }
             }
@@ -1647,6 +1662,26 @@ impl App {
         if let Some(id) = preset_reqs.delete {
             if self.delete_user_preset(&mut objects, &id) {
                 changed = true;
+            }
+        }
+
+        // 位置プリセット (上/中/下/中央) のウィンドウは pivot をソース寸法に対して解決する。
+        // 何か編集された (changed) フレームだけ実行し、対象が非 Free のウィンドウのときに限る。
+        // 解決は冪等なので、配置と無関係な編集で呼んでも同じ pivot になる (Free はドラッグで
+        // 置いた位置を保持)。プリセット適用で位置が変わった直後にも効く。
+        if changed {
+            if let Some(id) = selected {
+                let is_positioned_window = objects.iter().any(|o| {
+                    o.id == id
+                        && matches!(
+                            &o.kind,
+                            AnnotationKind::MessageWindow(w) if w.position != WindowPosition::Free
+                        )
+                });
+                if is_positioned_window {
+                    let fonts = self.ensure_comic_fonts();
+                    resolve_window_placement(&mut objects, id, sw, sh, fonts.as_deref());
+                }
             }
         }
 
@@ -4489,12 +4524,21 @@ fn edit_object_ui(
             });
         }
         AnnotationKind::Bubble(b) => {
-            // セリフ / 本体 / しっぽ。しっぽタブには表示 on/off も入れるので常時有効
-            // (しっぽが無い吹き出しでも中の checkbox から付与できる)。
+            // セリフ / 本体 / しっぽ / 飾り。しっぽ・飾りタブには表示 on/off (= 追加) も
+            // 入れるので常時有効 (無い吹き出しでも中から付与できる)。部品はウィンドウ専用
+            // なので、ウィンドウ選択から持ち越した場合は本体へ正規化する。
+            if *tab == TextPropTab::Parts {
+                *tab = TextPropTab::Body;
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                for t in [TextPropTab::Serifu, TextPropTab::Body, TextPropTab::Tail] {
+                for t in [
+                    TextPropTab::Serifu,
+                    TextPropTab::Body,
+                    TextPropTab::Tail,
+                    TextPropTab::Deco,
+                ] {
                     if prop_tab_button(ui, t, *tab == t, true, t.label()) {
                         *tab = t;
                     }
@@ -4514,7 +4558,13 @@ fn edit_object_ui(
                         b.shape_preset_link = None;
                     }
                 }
-                TextPropTab::Body => {
+                TextPropTab::Deco => {
+                    // 飾りは形状プリセットに含まれない (ラボと同じ)。編集してもリンクは
+                    // 切らず、再ベイクのために changed を立てるだけ。
+                    bubble_deco_ui(ui, b, changed);
+                }
+                // Body (+ Parts/正規化済みは Body に倒れる)。
+                _ => {
                     shape_preset_bar(ui, b, pivot, presets, changed);
                     let snap = b.clone();
                     bubble_body_ui(ui, b, changed);
@@ -4525,14 +4575,18 @@ fn edit_object_ui(
             });
         }
         AnnotationKind::MessageWindow(w) => {
-            // セリフ / 枠 (= Body)。しっぽは無いので Body へ正規化する。
-            if *tab == TextPropTab::Tail {
+            // セリフ / 枠 (= Body) / 部品 (= Parts)。しっぽ・飾りは無いので Body へ正規化。
+            if matches!(*tab, TextPropTab::Tail | TextPropTab::Deco) {
                 *tab = TextPropTab::Body;
             }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                for (t, lbl) in [(TextPropTab::Serifu, "セリフ"), (TextPropTab::Body, "枠")] {
+                for (t, lbl) in [
+                    (TextPropTab::Serifu, "セリフ"),
+                    (TextPropTab::Body, "枠"),
+                    (TextPropTab::Parts, "部品"),
+                ] {
                     if prop_tab_button(ui, t, *tab == t, true, lbl) {
                         *tab = t;
                     }
@@ -4550,6 +4604,15 @@ fn edit_object_ui(
                         w.style_preset_link = None;
                     }
                 }
+                TextPropTab::Parts => {
+                    // 名前プレート / 立ち絵枠 / 続き指標。個別編集でウィンドウリンク解除。
+                    let snap = w.clone();
+                    window_parts_ui(ui, w, changed, open_font_picker);
+                    if w.style_preset_link.is_some() && window_style_diverged(&snap, w) {
+                        w.style_preset_link = None;
+                    }
+                }
+                // 枠 (Body)。
                 _ => {
                     window_preset_bar(ui, w, presets, changed);
                     let snap = w.clone();
@@ -5051,68 +5114,598 @@ fn bubble_tail_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
     }
 }
 
-/// メッセージウィンドウ「枠」タブ (枠・塗り・輪郭)。本文は セリフ タブへ分離。
+/// ウィンドウの位置プリセット (`position`) + サイズモード (`size_mode`) を、ソース画像
+/// 寸法 `(iw, ih)` に対して解決し、pivot (中心) と FullWidth の `half_w` を確定させる。
+/// 作成時 / 位置・サイズ・余白の変更時に呼ぶ。`Free` 配置・非ウィンドウ・対象 id 不在は
+/// no-op (ラボ `apply_window_placement` 相当)。`fonts` は AutoFitText の高さ算出に使う
+/// (None のときは `half_h` で代替)。
+fn resolve_window_placement(
+    objs: &mut [AnnotationObject],
+    id: u64,
+    iw: f32,
+    ih: f32,
+    fonts: Option<&FontSet>,
+) {
+    let Some(idx) = objs.iter().position(|o| o.id == id) else {
+        return;
+    };
+    let (pos, size_mode, margin) = match &objs[idx].kind {
+        AnnotationKind::MessageWindow(w) => (w.position, w.size_mode, w.margin_px),
+        _ => return,
+    };
+    // Free 配置は完全に手動 — ドラッグで置いた位置/幅をそのまま保つ。
+    if matches!(pos, WindowPosition::Free) {
+        return;
+    }
+    // 有効半高 (AutoFitText は本文から導出するので fonts が要る)。
+    let hh = match &objs[idx].kind {
+        AnnotationKind::MessageWindow(w) => match fonts {
+            Some(f) => comic_core::effective_window_half_extents(w, f).1,
+            None => w.half_h.max(1.0),
+        },
+        _ => return,
+    };
+    let (mut px, mut py) = objs[idx].pivot;
+    if matches!(size_mode, SizeMode::FullWidth) {
+        let new_hw = (iw * 0.5 - margin).max(40.0);
+        px = iw * 0.5;
+        if let AnnotationKind::MessageWindow(w) = &mut objs[idx].kind {
+            w.half_w = new_hw;
+        }
+    }
+    match pos {
+        WindowPosition::Top => py = margin + hh,
+        WindowPosition::Middle | WindowPosition::Center => py = ih * 0.5,
+        WindowPosition::Bottom => py = ih - margin - hh,
+        WindowPosition::Free => {}
+    }
+    objs[idx].pivot = (px, py);
+}
+
+/// メッセージウィンドウ「枠」タブ。位置 / サイズ / 角丸 / 背景 (塗り・グラデ・スクリム) /
+/// 枠 (二重線・間隔) / 影 / テキスト配置 (縦位置・折り返し) / 余白。本文は セリフ タブ、
+/// 名前/立ち絵/指標は 部品 タブへ分離 (ラボ `tab_window_body` 相当)。位置/サイズ/余白の
+/// 変更後は呼び出し側 (`draw_text_panel`) が `resolve_window_placement` で pivot を再解決する。
 fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut bool) {
-    // 枠。
-    let mut frame = w.frame;
-    egui::ComboBox::from_label("枠")
-        .selected_text(frame_label(frame))
-        .show_ui(ui, |ui| {
-            for f in [
-                FrameStyle::None,
-                FrameStyle::SolidRounded,
-                FrameStyle::DoubleLine,
-            ] {
-                ui.selectable_value(&mut frame, f, frame_label(f));
+    // 位置プリセット。
+    ui.horizontal(|ui| {
+        ui.label("位置");
+        for (lbl, p) in [
+            ("上", WindowPosition::Top),
+            ("中", WindowPosition::Middle),
+            ("下", WindowPosition::Bottom),
+            ("中央", WindowPosition::Center),
+            ("自由", WindowPosition::Free),
+        ] {
+            if ui.radio(w.position == p, lbl).clicked() {
+                w.position = p;
+                *changed = true;
             }
-        });
-    if frame != w.frame {
-        w.frame = frame;
-        *changed = true;
-    }
-    // 塗りモード。
-    let mut fm = w.fill_mode;
-    egui::ComboBox::from_label("塗り")
-        .selected_text(fill_label(fm))
-        .show_ui(ui, |ui| {
-            for f in [
-                FillMode::None,
-                FillMode::Solid,
-                FillMode::Translucent,
-                FillMode::GradientScrim,
-                FillMode::LinearGradient,
-            ] {
-                ui.selectable_value(&mut fm, f, fill_label(f));
+        }
+    });
+    // サイズモード。
+    ui.horizontal(|ui| {
+        ui.label("サイズ");
+        for (lbl, m) in [
+            ("全幅", SizeMode::FullWidth),
+            ("固定", SizeMode::Inset),
+            ("文字に合わせ", SizeMode::AutoFitText),
+        ] {
+            if ui.radio(w.size_mode == m, lbl).clicked() {
+                w.size_mode = m;
+                *changed = true;
             }
-        });
-    if fm != w.fill_mode {
-        w.fill_mode = fm;
-        *changed = true;
+        }
+    });
+    match w.size_mode {
+        SizeMode::Inset => {
+            *changed |= ui
+                .add(egui::Slider::new(&mut w.half_w, 40.0..=1200.0).text("半幅"))
+                .changed();
+            *changed |= ui
+                .add(egui::Slider::new(&mut w.half_h, 24.0..=800.0).text("半高"))
+                .changed();
+        }
+        SizeMode::FullWidth => {
+            *changed |= ui
+                .add(egui::Slider::new(&mut w.half_h, 24.0..=800.0).text("半高"))
+                .changed();
+            *changed |= ui
+                .add(egui::Slider::new(&mut w.margin_px, 0.0..=300.0).text("左右余白"))
+                .changed();
+        }
+        SizeMode::AutoFitText => {
+            ui.label(
+                egui::RichText::new("文字量に合わせて自動サイズ")
+                    .small()
+                    .weak(),
+            );
+        }
     }
-    if let Some(f) = &mut w.fill {
+    *changed |= ui
+        .add(egui::Slider::new(&mut w.corner_px, 0.0..=80.0).text("角丸"))
+        .changed();
+
+    // 背景 (塗り)。
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new("背景").strong());
+    ui.horizontal(|ui| {
+        ui.label("種類");
+        for (lbl, m) in [
+            ("なし", FillMode::None),
+            ("単色", FillMode::Solid),
+            ("半透明", FillMode::Translucent),
+            ("スクリム", FillMode::GradientScrim),
+            ("グラデ", FillMode::LinearGradient),
+        ] {
+            if ui.radio(w.fill_mode == m, lbl).clicked() {
+                w.fill_mode = m;
+                *changed = true;
+            }
+        }
+    });
+    if w.fill_mode != FillMode::None {
+        if w.fill.is_none() {
+            w.fill = Some(Rgba::new(20, 24, 48, 235));
+        }
+        if let Some(c) = &mut w.fill {
+            ui.horizontal(|ui| {
+                ui.label("色");
+                let mut col = to_c32(*c);
+                if ui.color_edit_button_srgba(&mut col).changed() {
+                    *c = from_c32(col);
+                    *changed = true;
+                }
+            });
+        }
+        *changed |= ui
+            .add(egui::Slider::new(&mut w.fill_opacity, 0.0..=1.0).text("不透明度"))
+            .changed();
+        if w.fill_mode == FillMode::GradientScrim {
+            ui.horizontal(|ui| {
+                ui.label("濃い側");
+                for (lbl, a) in [
+                    ("上", VAnchor::Top),
+                    ("中", VAnchor::Center),
+                    ("下", VAnchor::Bottom),
+                ] {
+                    if ui.radio(w.scrim_dense_side == a, lbl).clicked() {
+                        w.scrim_dense_side = a;
+                        *changed = true;
+                    }
+                }
+            });
+        }
+        if w.fill_mode == FillMode::LinearGradient {
+            if w.gradient_to.is_none() {
+                w.gradient_to = Some(Rgba::new(8, 12, 40, 255));
+            }
+            if let Some(c) = &mut w.gradient_to {
+                ui.horizontal(|ui| {
+                    ui.label("下端色");
+                    let mut col = to_c32(*c);
+                    if ui.color_edit_button_srgba(&mut col).changed() {
+                        *c = from_c32(col);
+                        *changed = true;
+                    }
+                });
+            }
+        }
+    }
+
+    // 枠 (フレーム)。
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new("枠").strong());
+    ui.horizontal(|ui| {
+        ui.label("種類");
+        for (lbl, f) in [
+            ("なし", FrameStyle::None),
+            ("単線", FrameStyle::SolidRounded),
+            ("二重線", FrameStyle::DoubleLine),
+        ] {
+            if ui.radio(w.frame == f, lbl).clicked() {
+                w.frame = f;
+                *changed = true;
+            }
+        }
+    });
+    if w.frame != FrameStyle::None {
         ui.horizontal(|ui| {
-            ui.label("塗り色");
-            let mut col = to_c32(*f);
+            ui.label("枠色");
+            let mut col = to_c32(w.outline.color);
             if ui.color_edit_button_srgba(&mut col).changed() {
-                *f = from_c32(col);
+                w.outline.color = from_c32(col);
+                *changed = true;
+            }
+        });
+        *changed |= ui
+            .add(egui::Slider::new(&mut w.outline.width_px, 0.0..=12.0).text("枠太さ"))
+            .changed();
+        if w.frame == FrameStyle::DoubleLine {
+            *changed |= ui
+                .add(egui::Slider::new(&mut w.frame_gap_px, 2.0..=24.0).text("二重間隔"))
+                .changed();
+        }
+    }
+
+    // 影 (ドロップシャドウ)。
+    ui.add_space(2.0);
+    let mut has_shadow = w.shadow.is_some();
+    if ui.checkbox(&mut has_shadow, "影").changed() {
+        w.shadow = if has_shadow {
+            Some(ShadowStyle::default())
+        } else {
+            None
+        };
+        *changed = true;
+    }
+    if let Some(sh) = &mut w.shadow {
+        ui.horizontal(|ui| {
+            ui.label("影色");
+            let mut col = to_c32(sh.color);
+            if ui.color_edit_button_srgba(&mut col).changed() {
+                sh.color = from_c32(col);
+                *changed = true;
+            }
+            ui.label("X");
+            *changed |= ui
+                .add(egui::DragValue::new(&mut sh.offset.0).speed(0.5))
+                .changed();
+            ui.label("Y");
+            *changed |= ui
+                .add(egui::DragValue::new(&mut sh.offset.1).speed(0.5))
+                .changed();
+        });
+    }
+
+    // テキスト配置 (縦位置 + 折り返し)。
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new("テキスト配置").strong());
+    ui.horizontal(|ui| {
+        ui.label("縦位置");
+        for (lbl, a) in [
+            ("上", VAnchor::Top),
+            ("中", VAnchor::Center),
+            ("下", VAnchor::Bottom),
+        ] {
+            if ui.radio(w.v_anchor == a, lbl).clicked() {
+                w.v_anchor = a;
+                *changed = true;
+            }
+        }
+    });
+    *changed |= ui
+        .checkbox(&mut w.wrap, "本文を折り返す (禁則処理)")
+        .changed();
+
+    // 余白 (per-side insets)。
+    ui.add_space(2.0);
+    ui.label("余白 (左/上/右/下)");
+    ui.horizontal(|ui| {
+        *changed |= ui
+            .add(egui::DragValue::new(&mut w.padding.left).speed(1.0))
+            .changed();
+        *changed |= ui
+            .add(egui::DragValue::new(&mut w.padding.top).speed(1.0))
+            .changed();
+        *changed |= ui
+            .add(egui::DragValue::new(&mut w.padding.right).speed(1.0))
+            .changed();
+        *changed |= ui
+            .add(egui::DragValue::new(&mut w.padding.bottom).speed(1.0))
+            .changed();
+    });
+}
+
+/// メッセージウィンドウ「部品」タブ。名前プレート (モード・名前・色 + 装飾) / 立ち絵枠
+/// プレースホルダ / 続き指標。ラボ `draw_window_name_header` + `tab_window_parts` をまとめた。
+fn window_parts_ui(
+    ui: &mut egui::Ui,
+    w: &mut MessageWindowObject,
+    changed: &mut bool,
+    open_font_picker: &mut bool,
+) {
+    // ── 名前プレート ──
+    ui.label(egui::RichText::new("名前プレート").strong());
+    ui.horizontal(|ui| {
+        ui.label("表示");
+        egui::ComboBox::from_id_salt("win_name_mode")
+            .selected_text(name_plate_mode_label(w.name_plate.mode))
+            .show_ui(ui, |ui| {
+                for m in [
+                    NamePlateMode::None,
+                    NamePlateMode::Inline,
+                    NamePlateMode::Boxed,
+                    NamePlateMode::Above,
+                ] {
+                    if ui
+                        .selectable_value(&mut w.name_plate.mode, m, name_plate_mode_label(m))
+                        .changed()
+                    {
+                        *changed = true;
+                    }
+                }
+            });
+        if w.name_plate.mode != NamePlateMode::None {
+            let mut col = to_c32(w.name_plate.name.color);
+            if ui.color_edit_button_srgba(&mut col).changed() {
+                w.name_plate.name.color = from_c32(col);
+                *changed = true;
+            }
+        }
+    });
+    if w.name_plate.mode != NamePlateMode::None {
+        *changed |= ui
+            .add(
+                egui::TextEdit::singleline(&mut w.name_plate.name.text)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("話者名"),
+            )
+            .changed();
+        if ui.button("名前のフォント…").clicked() {
+            *open_font_picker = true;
+        }
+        *changed |= ui
+            .add(egui::Slider::new(&mut w.name_plate.name.size_px, 8.0..=120.0).text("文字サイズ"))
+            .changed();
+        if matches!(
+            w.name_plate.mode,
+            NamePlateMode::Boxed | NamePlateMode::Above
+        ) {
+            let mut has_fill = w.name_plate.fill.is_some();
+            if ui.checkbox(&mut has_fill, "プレート塗り").changed() {
+                w.name_plate.fill = if has_fill {
+                    Some(Rgba::new(30, 32, 44, 255))
+                } else {
+                    None
+                };
+                *changed = true;
+            }
+            if let Some(c) = &mut w.name_plate.fill {
+                ui.horizontal(|ui| {
+                    ui.label("塗り色");
+                    let mut col = to_c32(*c);
+                    if ui.color_edit_button_srgba(&mut col).changed() {
+                        *c = from_c32(col);
+                        *changed = true;
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("枠色");
+                let mut col = to_c32(w.name_plate.outline.color);
+                if ui.color_edit_button_srgba(&mut col).changed() {
+                    w.name_plate.outline.color = from_c32(col);
+                    *changed = true;
+                }
+            });
+            *changed |= ui
+                .add(
+                    egui::Slider::new(&mut w.name_plate.outline.width_px, 0.0..=10.0)
+                        .text("枠太さ"),
+                )
+                .changed();
+            *changed |= ui
+                .add(egui::Slider::new(&mut w.name_plate.corner_px, 0.0..=40.0).text("角丸"))
+                .changed();
+            *changed |= ui
+                .add(egui::Slider::new(&mut w.name_plate.padding_px, 0.0..=40.0).text("余白"))
+                .changed();
+        }
+        ui.horizontal(|ui| {
+            ui.label("位置 X/Y");
+            *changed |= ui
+                .add(egui::DragValue::new(&mut w.name_plate.offset.0).speed(1.0))
+                .changed();
+            *changed |= ui
+                .add(egui::DragValue::new(&mut w.name_plate.offset.1).speed(1.0))
+                .changed();
+        });
+    }
+
+    // ── 立ち絵枠 (プレースホルダ) ──
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new("立ち絵枠 (プレースホルダ)").strong());
+    ui.horizontal(|ui| {
+        ui.label("配置");
+        for (lbl, s) in [
+            ("なし", PortraitSide::None),
+            ("左", PortraitSide::Left),
+            ("右", PortraitSide::Right),
+        ] {
+            if ui.radio(w.portrait.side == s, lbl).clicked() {
+                w.portrait.side = s;
+                *changed = true;
+            }
+        }
+    });
+    if w.portrait.side != PortraitSide::None {
+        *changed |= ui
+            .add(egui::Slider::new(&mut w.portrait.width_px, 40.0..=600.0).text("幅"))
+            .changed();
+        if w.portrait.fill.is_none() {
+            w.portrait.fill = Some(Rgba::new(70, 74, 92, 255));
+        }
+        if let Some(c) = &mut w.portrait.fill {
+            ui.horizontal(|ui| {
+                ui.label("色");
+                let mut col = to_c32(*c);
+                if ui.color_edit_button_srgba(&mut col).changed() {
+                    *c = from_c32(col);
+                    *changed = true;
+                }
+            });
+        }
+        *changed |= ui
+            .add(egui::Slider::new(&mut w.portrait.margin_px, 0.0..=60.0).text("余白"))
+            .changed();
+    }
+
+    // ── 続き指標 ──
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new("続き指標").strong());
+    ui.horizontal(|ui| {
+        for (lbl, k) in [
+            ("なし", IndicatorKind::None),
+            ("三角", IndicatorKind::Triangle),
+            ("山", IndicatorKind::Chevron),
+            ("菱", IndicatorKind::Diamond),
+            ("点々", IndicatorKind::Dots),
+        ] {
+            if ui.radio(w.indicator == k, lbl).clicked() {
+                w.indicator = k;
+                *changed = true;
+            }
+        }
+    });
+    if w.indicator != IndicatorKind::None {
+        // ゲーム風「まだ続きがある」挙動: 本文が枠から溢れた時だけ指標を出す。
+        *changed |= ui
+            .checkbox(&mut w.indicator_auto, "テキストが溢れた時だけ表示")
+            .changed();
+    }
+}
+
+fn name_plate_mode_label(m: NamePlateMode) -> &'static str {
+    match m {
+        NamePlateMode::None => "なし",
+        NamePlateMode::Inline => "ラベル",
+        NamePlateMode::Boxed => "枠付き",
+        NamePlateMode::Above => "上に",
+    }
+}
+
+/// 吹き出し「飾り」タブ。きらきら / 花 / 泡 の手続き的装飾レイヤーを追加・編集する
+/// (ラボ `tab_deco` 相当)。装飾は形状プリセットに含まれないので link は切らない。
+fn bubble_deco_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
+    if ui.button("装飾を追加").clicked() {
+        let mut layer = DecorationLayer::default();
+        // レイヤーごとに異なる seed を割り当てる。`place_decorations` は seed 決定的なので、
+        // 同一 seed のレイヤーを重ねると全く同じ位置に乗り「1 つしか描かれていない」ように
+        // 見える。max(既存)+1 で衝突を避ける。
+        layer.seed = b
+            .decorations
+            .iter()
+            .map(|l| l.seed)
+            .max()
+            .map(|m| m.wrapping_add(1))
+            .unwrap_or(0);
+        b.decorations.push(layer);
+        *changed = true;
+    }
+    if b.decorations.is_empty() {
+        ui.label(
+            egui::RichText::new("「装飾を追加」できらきら/花/泡を縁取りに配置できます")
+                .small()
+                .color(egui::Color32::from_gray(160)),
+        );
+        return;
+    }
+    let mut remove_deco: Option<usize> = None;
+    for (di, layer) in b.decorations.iter_mut().enumerate() {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(format!("装飾 {}", di + 1));
+            if ui.small_button("×").clicked() {
+                remove_deco = Some(di);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("種類");
+            for (label, kind) in [
+                ("きらきら", DecoKind::Sparkle),
+                ("花", DecoKind::Flower),
+                ("泡", DecoKind::Bubble),
+            ] {
+                if ui.radio(layer.kind == kind, label).clicked() {
+                    layer.kind = kind;
+                    *changed = true;
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("配置");
+            for (label, pl) in [
+                ("輪郭上", DecoPlacement::Outline),
+                ("外側", DecoPlacement::Outside),
+                ("内側", DecoPlacement::Inside),
+                ("しっぽ", DecoPlacement::Tail),
+            ] {
+                if ui.radio(layer.placement == pl, label).clicked() {
+                    layer.placement = pl;
+                    *changed = true;
+                }
+            }
+        });
+        *changed |= ui
+            .add(egui::Slider::new(&mut layer.density, 0.5..=12.0).text("密度"))
+            .changed();
+        *changed |= ui
+            .add(egui::Slider::new(&mut layer.size_ratio, 0.04..=0.6).text("大きさ"))
+            .changed();
+        ui.horizontal(|ui| {
+            ui.label("色");
+            let mut c = to_c32(layer.color);
+            if ui.color_edit_button_srgba(&mut c).changed() {
+                layer.color = from_c32(c);
+                *changed = true;
+            }
+        });
+
+        // 縁取り (0px = なし) + 縁取り色。
+        *changed |= ui
+            .add(egui::Slider::new(&mut layer.outline_width, 0.0..=10.0).text("縁取り太さ"))
+            .changed();
+        if layer.outline_width > 0.0 {
+            ui.horizontal(|ui| {
+                ui.label("縁取り色");
+                let mut c = to_c32(layer.outline_color);
+                if ui.color_edit_button_srgba(&mut c).changed() {
+                    layer.outline_color = from_c32(c);
+                    *changed = true;
+                }
+            });
+        }
+
+        // 種別固有の形状コントロール。
+        match layer.kind {
+            DecoKind::Sparkle => {
+                *changed |= ui
+                    .add(egui::Slider::new(&mut layer.points, 3..=12).text("とがり数"))
+                    .changed();
+            }
+            DecoKind::Flower => {
+                *changed |= ui
+                    .add(egui::Slider::new(&mut layer.petals, 3..=10).text("花びら数"))
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label("中央色");
+                    let mut c = to_c32(layer.center_color);
+                    if ui.color_edit_button_srgba(&mut c).changed() {
+                        layer.center_color = from_c32(c);
+                        *changed = true;
+                    }
+                });
+            }
+            DecoKind::Bubble => {
+                *changed |= ui
+                    .checkbox(&mut layer.gradient, "半透明グラデ (泡)")
+                    .changed();
+            }
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(format!("seed {}", layer.seed));
+            if ui.button("再生成").clicked() {
+                layer.seed = layer.seed.wrapping_add(1);
                 *changed = true;
             }
         });
     }
-    ui.horizontal(|ui| {
-        ui.label("線色");
-        let mut col = to_c32(w.outline.color);
-        if ui.color_edit_button_srgba(&mut col).changed() {
-            w.outline.color = from_c32(col);
-            *changed = true;
-        }
-        if ui
-            .add(egui::Slider::new(&mut w.outline.width_px, 0.0..=12.0).text("線幅"))
-            .changed()
-        {
-            *changed = true;
-        }
-    });
+    if let Some(di) = remove_deco {
+        b.decorations.remove(di);
+        *changed = true;
+    }
 }
 
 /// スタンプの編集 (画像 = 大きさ / 不透明度 / 反転 / ステッカー風縁取り + ソース差し替え)。
@@ -5206,24 +5799,6 @@ fn stamp_ui(
                 *changed = true;
             }
         });
-    }
-}
-
-fn frame_label(f: FrameStyle) -> &'static str {
-    match f {
-        FrameStyle::None => "なし",
-        FrameStyle::SolidRounded => "角丸",
-        FrameStyle::DoubleLine => "二重線",
-    }
-}
-
-fn fill_label(f: FillMode) -> &'static str {
-    match f {
-        FillMode::None => "なし",
-        FillMode::Solid => "ベタ",
-        FillMode::Translucent => "半透明",
-        FillMode::GradientScrim => "グラデ(スクリム)",
-        FillMode::LinearGradient => "グラデ(2色)",
     }
 }
 
@@ -5754,5 +6329,65 @@ mod tests {
         assert_eq!(undo.len(), COMIC_UNDO_CAP);
         // 先頭 (最古) は remove(0) されているので state(&[0]) ではない。
         assert_ne!(undo[0], state(&[0]));
+    }
+
+    // ── ウィンドウ配置解決 (Inc 4d) ──────────────────────────────────
+
+    /// 指定 position / size_mode の窓を 1 個だけ持つ objs を作る。pivot は (0,0) 始点。
+    fn window_objs(pos: WindowPosition, size_mode: SizeMode) -> Vec<AnnotationObject> {
+        let w = MessageWindowObject {
+            position: pos,
+            size_mode,
+            half_w: 100.0,
+            half_h: 60.0,
+            margin_px: 48.0,
+            ..MessageWindowObject::default()
+        };
+        vec![AnnotationObject::new_message_window(1, (0.0, 0.0), w)]
+    }
+
+    #[test]
+    fn placement_free_is_noop() {
+        let mut objs = window_objs(WindowPosition::Free, SizeMode::Inset);
+        objs[0].pivot = (123.0, 456.0);
+        resolve_window_placement(&mut objs, 1, 2000.0, 1000.0, None);
+        assert_eq!(objs[0].pivot, (123.0, 456.0), "Free はドラッグ位置を保持");
+    }
+
+    #[test]
+    fn placement_top_and_bottom_use_margin_and_half_height() {
+        // Inset (half_h=60, margin=48)。Top: py = margin + hh = 108。Bottom: ih - margin - hh。
+        let mut objs = window_objs(WindowPosition::Top, SizeMode::Inset);
+        resolve_window_placement(&mut objs, 1, 2000.0, 1000.0, None);
+        assert!((objs[0].pivot.1 - (48.0 + 60.0)).abs() < 1e-3);
+
+        let mut objs = window_objs(WindowPosition::Bottom, SizeMode::Inset);
+        resolve_window_placement(&mut objs, 1, 2000.0, 1000.0, None);
+        assert!((objs[0].pivot.1 - (1000.0 - 48.0 - 60.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn placement_center_and_middle_use_image_midline() {
+        for pos in [WindowPosition::Center, WindowPosition::Middle] {
+            let mut objs = window_objs(pos, SizeMode::Inset);
+            resolve_window_placement(&mut objs, 1, 2000.0, 1000.0, None);
+            assert!((objs[0].pivot.1 - 500.0).abs() < 1e-3, "{pos:?}");
+        }
+    }
+
+    #[test]
+    fn placement_fullwidth_recomputes_half_w_and_centers_x() {
+        // FullWidth: half_w = iw/2 - margin、px = iw/2。
+        let mut objs = window_objs(WindowPosition::Bottom, SizeMode::FullWidth);
+        resolve_window_placement(&mut objs, 1, 2000.0, 1000.0, None);
+        assert!((objs[0].pivot.0 - 1000.0).abs() < 1e-3, "px = iw/2");
+        if let AnnotationKind::MessageWindow(w) = &objs[0].kind {
+            assert!(
+                (w.half_w - (1000.0 - 48.0)).abs() < 1e-3,
+                "half_w = iw/2 - margin"
+            );
+        } else {
+            panic!("window");
+        }
     }
 }
