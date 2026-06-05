@@ -194,7 +194,9 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 2. `setup-ort.sh` — `vendor/ort/onnxruntime*.dll` を取得
 3. `setup-ffmpeg.sh` — `vendor/ffmpeg/{bin,include,lib}/` を取得
 4. `setup-susie-worker.sh` — `vendor/susie-worker/mimageviewer-susie32.exe` を再ビルド
-5. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
+5. `setup-twemoji.sh` — `vendor/twemoji/svg/*.svg` を取得 (注釈スタンプの絵文字。
+   build.rs が exe へ `include_bytes!` で同梱。未配置でもビルドは通るがスタンプは無効)
+6. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
    (= 一度 mIV をインストール / 起動して APPDATA に展開させた後でないと取れない)
 
 ### bootstrap で取れないもの

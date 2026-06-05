@@ -67,6 +67,10 @@ impl App {
                         ui.label("anime_classification");
                         ui.label("MIT — deepghs");
                         ui.end_row();
+
+                        ui.label("絵文字 (Twemoji)");
+                        ui.label("CC-BY 4.0 — Twitter, Inc. and other contributors");
+                        ui.end_row();
                     });
 
                 ui.add_space(8.0);

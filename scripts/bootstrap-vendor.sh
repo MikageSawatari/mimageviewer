@@ -61,6 +61,11 @@ run_step "FFmpeg LGPL shared" "vendor/ffmpeg/bin/avcodec-61.dll" \
 run_step "Susie 32bit worker" "vendor/susie-worker/mimageviewer-susie32.exe" \
     "bash scripts/setup-susie-worker.sh"
 
+# 絵文字スタンプ (Twemoji SVG)。build.rs が vendor/twemoji/svg/*.svg を exe に同梱する。
+# 未配置でもビルドは通る (スタンプはアセット導入後に有効) が、リリースには必要。
+run_step "Twemoji emoji (stamps)" "vendor/twemoji/svg" \
+    "bash scripts/setup-twemoji.sh"
+
 # ONNX モデル: APPDATA からコピー (= ローカル mIV インストール環境がないと取れない)
 echo "============================================================"
 echo "[ONNX models]"

@@ -159,6 +159,8 @@ Windows の「設定」→「アプリ」→「インストールされている
   - FFmpeg (LGPLv3-or-later): FFmpeg project
     Source and license notes: https://mikage.to/mimageviewer/
   - Steinberg VST3 SDK (MIT): Steinberg Media Technologies GmbH
+  - Twemoji 絵文字グラフィックス (CC-BY 4.0): Twitter, Inc. and other contributors
+    （注釈機能のスタンプに使用）
 
 AI モデルは各配布元のライセンスに従います。詳細は
 オンラインマニュアル（下記）を参照してください。
