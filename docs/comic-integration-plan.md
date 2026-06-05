@@ -8,9 +8,8 @@ Status: 計画 v2.10（**Inc 3 完了** + **Inc 7 書き出し完了** + **Inc 6
 **Inc 4c スタンプ(絵文字)完了 = Twemoji SVG を exe 同梱 (build.rs codegen + resvg)、
 ピッカー / 詳細編集 / 実画像ベイク**。
 Inc 0/1/2/3/7 完了、Inc 4c スタンプ完了、**Inc 4c オノマトペ + フォント基盤/選択
-完了**、Inc 6 の変形ハンドル部分完了。
-残: Inc 5 プリセット・フォント (テキスト/吹き出しスタイルプリセット) /
-Inc 6 Undo / Inc 4d/4e ウィンドウ・飾り詳細）
+完了**、**Inc 5 プリセット完了 (セリフ/本体/ウィンドウ)**、Inc 6 の変形ハンドル部分完了。
+残: Inc 6 Undo / Inc 4d/4e ウィンドウ・飾り詳細）
 更新: 2026-06-05（lab を `ff0efc98` で再マージ = テキスト回転ピボット + フォント/オノマトペ
 プリセット + text handles を取り込み。Inc 6 ハンドル移植 `c6d4d7cb`、Codex P2 対応 +
 吹き出し/ウィンドウ追加ダイアログを BubblePreset/paint_*_preview でラボ準拠プレビューに
@@ -406,8 +405,13 @@ master に対して再確認する**（このスナップショットに固定�
     吹き出し追加は `BubblePreset`(18 種) + `paint_bubble_preview`(塗り三角形ファン + 統合
     アウトライン + しっぽ + 集中線/流線/意識/なしの特殊描画) で「焼き上がりと一致するプレビュー」。
     ウィンドウ追加は `WinPreset` + `paint_winpreset_preview`(塗り + 枠 + 本文見立て線)。
-  - ⏳ **残: セリフ/本体/ウィンドウ プリセットの保存/適用/更新/削除/リンク点灯**、フォント見本、
-    スタンプピッカー。スナップショットテスト・glyph lint。
+  - ✅ **完了 (Inc 5、`abc7a503`)**: セリフ/本体/ウィンドウ スタイルプリセット
+    (`src/comic_presets.rs` = TextStylePreset/ShapeStylePreset/WindowStylePreset +
+    apply_to/from_* + presets.json 永続化)。組み込み (sys:*) + ユーザー (user:*)、
+    詳細パネルのプリセットバーで 適用 (リンク点灯) / 現在を保存 / 更新 / 削除。
+    組み込みは system_text_presets(4) / system_shape_presets(BubblePreset 由来) /
+    system_window_presets(WIN_PRESETS 由来)。
+  - ✅ フォント見本 / スタンプピッカーは Inc 4c で完了済。
   - 受け入れ: 保存/適用/更新/削除/リンク点灯がラボ一致。名前見切れ無し。
 - **Inc 6: 変形ハンドル ＋ Undo/Redo ＋ パリティ最終署名**
   - ✅ **変形ハンドル完了（2026-06-05、`c6d4d7cb`）**: 四隅スケール/回転ノブ/しっぽ(tip/base)
