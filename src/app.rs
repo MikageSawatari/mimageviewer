@@ -20560,13 +20560,40 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        // 診断 (Inc 1): デモが描画プロセスに届いているかを 1 度だけ記録する。単一
+        // インスタンス制御で env 無しの旧インスタンスが描画していると、ここが
+        // 一度も "ENABLED" を出さない = 原因の切り分けに使う。
+        if self.comic_demo_enabled {
+            use std::sync::Once;
+            static LOGGED: Once = Once::new();
+            LOGGED.call_once(|| {
+                crate::logger::log(
+                    "[comic] demo overlay ENABLED (MIV_COMIC_DEMO); fullscreen bake path reached"
+                        .to_string(),
+                );
+            });
+        }
         // 注釈が無い画像は下地に触れず即 None (通常閲覧はゼロオーバーヘッド、Codex P3)。
         if !self.comic_has_objects(idx) {
             return None;
         }
         // 下地は AI 完了済み (complete) の最終 composite。AI 待ちの間は None が返るので
         // comic はまだ出ない (= comic は AI より後段、正しい)。
-        let base = self.ensure_final_composite_pixels(ctx, idx)?;
+        let base = match self.ensure_final_composite_pixels(ctx, idx) {
+            Some(b) => b,
+            None => {
+                use std::sync::Once;
+                static LOGGED: Once = Once::new();
+                LOGGED.call_once(|| {
+                    crate::logger::log(
+                        "[comic] base final-composite pixels not ready (incomplete/AI pending); \
+                         overlay deferred"
+                            .to_string(),
+                    );
+                });
+                return None;
+            }
+        };
         let [w, h] = base.size;
         let comic_gen = self.comic_generation;
         if let Some(entry) = self.comic_cache.get(&idx) {
@@ -20584,6 +20611,10 @@ impl App {
             return None;
         }
         let fonts = self.ensure_comic_fonts()?;
+        // 同期ベイク (隠蔽 conceal と同流儀)。画像ごと 1 回・キャッシュ済みで毎フレーム
+        // ではないが、実コンテンツでの worker 化要否を判断できるよう計測する。閾値 (80ms)
+        // 超過は conceal と同じく perf ログに出す (§10、Inc 4+ で実測して判断)。
+        let bake_start = std::time::Instant::now();
         let overlay = comic_core::bake_overlay(&objects, w, h, &fonts);
         let composed = Arc::new(crate::comic_overlay::composite_overlay_over(
             &base, &overlay,
@@ -20594,6 +20625,13 @@ impl App {
             upload.into_owned(),
             egui::TextureOptions::LINEAR,
         );
+        let elapsed_ms = bake_start.elapsed().as_millis();
+        if elapsed_ms >= 80 {
+            crate::logger::log(format!(
+                "[comic] bake+composite+upload {elapsed_ms}ms idx={idx} {w}x{h} objs={}",
+                objects.len()
+            ));
+        }
         self.comic_cache.insert(
             idx,
             ComicCacheEntry {
