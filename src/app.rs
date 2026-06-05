@@ -20540,12 +20540,25 @@ impl App {
     /// 注釈ドキュメントを comic.db に保存し、メモリキャッシュ (`comic_docs`) も更新する。
     /// 空なら削除 (no-row = 空注釈)。Inc 2b でここに「設定のバックアップ」ON 時の
     /// `mimageviewer.dat` ミラーを足す。
-    fn save_comic_objects(&mut self, key: &str, objects: &[comic_core::AnnotationObject]) {
+    fn save_comic_objects(
+        &mut self,
+        idx: usize,
+        key: &str,
+        objects: &[comic_core::AnnotationObject],
+    ) {
         self.comic_docs.insert(key.to_string(), objects.to_vec());
         if let Some(db) = &self.comic_db {
             if let Err(e) = db.set(key, objects) {
                 crate::logger::log(format!("[comic] comic.db set failed key={key}: {e}"));
             }
+        }
+        // サイドカーミラー (mimageviewer.dat)。「設定のバックアップ」ON 時のみ書く
+        // (with_sidecar_mut が OFF なら no-op)。フォルダ移動で注釈を保持する (§6.2)。
+        if objects.is_empty() {
+            self.with_sidecar_mut(idx, |sc, rel| sc.remove_comic(rel));
+        } else {
+            let objs = objects.to_vec();
+            self.with_sidecar_mut(idx, move |sc, rel| sc.set_comic(rel, objs));
         }
     }
 
@@ -20646,8 +20659,17 @@ impl App {
         self.ensure_comic_doc_loaded(&key);
         let mut objects = self.comic_docs.get(&key).cloned().unwrap_or_default();
         if objects.is_empty() && self.comic_demo_enabled {
-            objects = crate::comic_overlay::demo_objects(w, h);
-            self.save_comic_objects(&key, &objects);
+            // 既存行 (壊れ JSON / 将来非互換版を含む) があればデモ seed で上書きしない
+            // (Codex P2: clobber 防止)。行が真に無い (missing) ときだけ seed する。
+            // 本番 (デモ OFF) では seed 経路自体が走らないので clobber は起きない。
+            let row_exists = self
+                .comic_db
+                .as_ref()
+                .is_some_and(|db| db.get_raw(&key).is_some());
+            if !row_exists {
+                objects = crate::comic_overlay::demo_objects(w, h);
+                self.save_comic_objects(idx, &key, &objects);
+            }
         }
         if objects.is_empty() {
             return None;
@@ -20856,20 +20878,23 @@ impl App {
                 self.conceal_db.as_ref(),
                 self.local_adjust_db.as_ref(),
                 self.export_crop_db.as_ref(),
+                self.comic_db.as_ref(),
             );
             if stats.imported_adjust > 0
                 || stats.imported_mask > 0
                 || stats.imported_conceal > 0
                 || stats.imported_local_adjust > 0
                 || stats.imported_export_crop > 0
+                || stats.imported_comic > 0
             {
                 crate::logger::log(format!(
-                    "sidecar: imported {} adjust + {} mask + {} conceal + {} local-adjust + {} crop entries from {}",
+                    "sidecar: imported {} adjust + {} mask + {} conceal + {} local-adjust + {} crop + {} comic entries from {}",
                     stats.imported_adjust,
                     stats.imported_mask,
                     stats.imported_conceal,
                     stats.imported_local_adjust,
                     stats.imported_export_crop,
+                    stats.imported_comic,
                     sidecar_folder.display()
                 ));
             }

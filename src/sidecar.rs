@@ -75,6 +75,11 @@ pub struct SidecarEntry {
     /// 最後段 crop 設定。表示・コピー・書き出しの最終段でだけ適用する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_crop: Option<crate::export_crop::CropSettings>,
+    /// テキスト注釈ドキュメント (comic、Inc 2)。中央 `comic.db` が authoritative で、
+    /// サイドカーはフォルダ移動時の復元用バックアップ。形式は `Vec<AnnotationObject>`
+    /// (serde)。`local_adjust_layers` と同じ二層方式。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comic: Option<Vec<comic_core::AnnotationObject>>,
 }
 
 impl SidecarEntry {
@@ -84,6 +89,7 @@ impl SidecarEntry {
             && self.conceal.is_none()
             && self.local_adjust_layers.is_none()
             && self.export_crop.is_none()
+            && self.comic.is_none()
     }
 }
 
@@ -292,6 +298,30 @@ impl SidecarFile {
         }
     }
 
+    /// テキスト注釈ドキュメントをセットする。空配列は削除と同じ扱い。
+    pub fn set_comic(&mut self, rel_key: &str, objects: Vec<comic_core::AnnotationObject>) {
+        if objects.is_empty() {
+            self.remove_comic(rel_key);
+            return;
+        }
+        let entry = self.items.entry(rel_key.to_string()).or_default();
+        entry.comic = Some(objects);
+        self.mark_dirty();
+    }
+
+    /// テキスト注釈ドキュメントを取り除く。
+    pub fn remove_comic(&mut self, rel_key: &str) {
+        if let Some(entry) = self.items.get_mut(rel_key) {
+            if entry.comic.is_some() {
+                entry.comic = None;
+                if entry.is_empty() {
+                    self.items.remove(rel_key);
+                }
+                self.mark_dirty();
+            }
+        }
+    }
+
     /// 最後段 crop 設定をセットする。
     pub fn set_export_crop(&mut self, rel_key: &str, settings: crate::export_crop::CropSettings) {
         let entry = self.items.entry(rel_key.to_string()).or_default();
@@ -476,11 +506,13 @@ pub struct ImportStats {
     pub imported_conceal: usize,
     pub imported_local_adjust: usize,
     pub imported_export_crop: usize,
+    pub imported_comic: usize,
     pub skipped_adjust: usize,
     pub skipped_mask: usize,
     pub skipped_conceal: usize,
     pub skipped_local_adjust: usize,
     pub skipped_export_crop: usize,
+    pub skipped_comic: usize,
 }
 
 /// サイドカーの各エントリを中央 DB へインポートする (純粋関数、テスト用に App から分離)。
@@ -497,6 +529,7 @@ pub fn import_to_dbs(
     conceal_db: Option<&crate::conceal_db::ConcealDb>,
     local_adjust_db: Option<&crate::local_adjust_db::LocalAdjustDb>,
     export_crop_db: Option<&crate::export_crop::CropDb>,
+    comic_db: Option<&crate::comic_db::ComicDb>,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
     for (rel_key, entry) in sidecar.items() {
@@ -579,6 +612,18 @@ pub fn import_to_dbs(
                 }
             } else {
                 stats.skipped_export_crop += 1;
+            }
+        }
+
+        if let (Some(db), Some(objects)) = (comic_db, &entry.comic) {
+            if !objects.is_empty() {
+                if db.get(&abs_key).is_none() {
+                    if db.set(&abs_key, objects).is_ok() {
+                        stats.imported_comic += 1;
+                    }
+                } else {
+                    stats.skipped_comic += 1;
+                }
             }
         }
     }
@@ -909,7 +954,7 @@ mod tests {
         let existing_key = reconstruct_image_key(folder, "existing.png");
         db.set_layers(&existing_key, &existing_layers).unwrap();
 
-        let stats = import_to_dbs(folder, &s, None, None, None, Some(&db), None);
+        let stats = import_to_dbs(folder, &s, None, None, None, Some(&db), None, None);
 
         assert_eq!(stats.imported_local_adjust, 1);
         assert_eq!(stats.skipped_local_adjust, 1);
@@ -941,12 +986,48 @@ mod tests {
         let existing_key = reconstruct_image_key(folder, "existing.png");
         db.set(&existing_key, existing_crop).unwrap();
 
-        let stats = import_to_dbs(folder, &s, None, None, None, None, Some(&db));
+        let stats = import_to_dbs(folder, &s, None, None, None, None, Some(&db), None);
 
         assert_eq!(stats.imported_export_crop, 1);
         assert_eq!(stats.skipped_export_crop, 1);
         assert_eq!(db.get(&fresh_key), Some(imported_crop));
         assert_eq!(db.get(&existing_key), Some(existing_crop));
+    }
+
+    #[test]
+    fn import_to_dbs_imports_comic_without_overwriting_db() {
+        use comic_core::{AnnotationObject, TextBlock};
+        let mk = |t: &str| {
+            vec![AnnotationObject::new_text(
+                1,
+                (10.0, 20.0),
+                TextBlock {
+                    text: t.to_string(),
+                    ..TextBlock::default()
+                },
+            )]
+        };
+        let sidecar_dir = tempfile::tempdir().unwrap();
+        let folder = sidecar_dir.path();
+        let mut s = SidecarFile::new(folder.to_path_buf());
+        let imported = mk("from sidecar");
+        let existing = mk("already in db");
+        s.set_comic("fresh.png", imported.clone());
+        s.set_comic("existing.png", mk("stale sidecar"));
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = crate::comic_db::ComicDb::open_at(&db_dir.path().join("comic.db")).unwrap();
+        let fresh_key = reconstruct_image_key(folder, "fresh.png");
+        let existing_key = reconstruct_image_key(folder, "existing.png");
+        db.set(&existing_key, &existing).unwrap();
+
+        let stats = import_to_dbs(folder, &s, None, None, None, None, None, Some(&db));
+
+        // 中央 DB に無い fresh は import、既に有る existing は上書きしない。
+        assert_eq!(stats.imported_comic, 1);
+        assert_eq!(stats.skipped_comic, 1);
+        assert_eq!(db.get(&fresh_key), Some(imported));
+        assert_eq!(db.get(&existing_key), Some(existing));
     }
 
     #[test]
