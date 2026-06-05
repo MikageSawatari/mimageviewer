@@ -20,6 +20,12 @@ always-active guidance.
   `Get-Content -Encoding UTF8` explicitly.
 - Check the current git status before editing. Do not revert or overwrite
   unrelated user changes.
+- In separate worktrees, do not create junctions, symlinks, or other reparse
+  point links for `vendor/`, `target/`, or runtime dependency directories. If a
+  worktree needs those files, copy the real files/directories into that
+  worktree or run the setup scripts there. Before removing a worktree or copied
+  dependency directory, verify the target path and do not recurse through
+  reparse points.
 
 ## Core Engineering Rules
 

@@ -1713,17 +1713,21 @@ awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
 の前に必ず `.\scripts\safe-worktree-remove.ps1 ...` に置換する。`gh`/`git` の他コマンドと
 混ぜて連続実行する場合も同じ。これは取り返しがつかない事故なので例外なし。
 
-#### 設計面の選択肢
+#### 設計面の鉄則
 
-**最も安全**: `vendor/` を worktree 間で **共有しない**。新規 worktree でも
-`bash scripts/bootstrap-vendor.sh` を流して per-worktree な `vendor/` を持つ。
-disk 容量 (~1GB) より復旧の手間の方が高い。
+`vendor/`, `target/`, runtime DLL / model / SDK などは worktree 間で **junction / symlink /
+reparse point 共有しない**。個別サブディレクトリ単位でも禁止。過去に worktree 撤収時の
+再帰削除で main 側の実体を消した事故が複数回あるため、リンク共有は選択肢に入れない。
 
-**junction 共有が必要な場合**: `vendor/` 全体ではなく **個別サブディレクトリ単位**
-(`vendor/pdfium/`, `vendor/ffmpeg/`, `vendor/models/`, `vendor/ort/`, `vendor/susie-worker/`)
-で junction を張る。こうすれば `git worktree remove` が中身を辿っても worktree 側の各
-junction が削除されるだけで **main の `vendor/` ディレクトリ自体は touch されない**
-(junction の親 dir が main 側にあるため)。それでもラッパー経由で撤去するのが安全。
+新規 worktree で依存ファイルが必要な場合は、以下のどちらかにする:
+
+- `bash scripts/bootstrap-vendor.sh` を worktree 側で流して per-worktree な `vendor/` を作る。
+- 既存 worktree / backup から必要なサブディレクトリを `Copy-Item -Recurse` などで**実体コピー**
+  する。例: `Copy-Item -Recurse C:\home\mimageviewer\vendor\ffmpeg vendor\ffmpeg`
+
+削除・撤収時は、対象が意図した worktree 配下であることと junction / symlink / reparse point で
+ないことを確認してから消す。worktree 自体の撤収は引き続き
+`scripts/safe-worktree-remove.ps1` 経由にする。
 
 ## User: Background
 
