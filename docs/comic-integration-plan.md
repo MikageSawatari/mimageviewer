@@ -1,7 +1,7 @@
 # テキスト注釈(comic)機能 — 本体 mIV 統合計画
 
-Status: 計画 v2.4（**Inc 2 完了** = comic.db 正本 + mimageviewer.dat ミラー。Inc 1 表示部も検証 PASS 済み）
-更新: 2026-06-05（Inc 2 永続化 完了。次は Inc 3 = 編集モード骨格 + IME）
+Status: 計画 v2.5（**Inc 3a 完了** = テキスト編集モード骨格 Ctrl+T。Inc 0/1/2 完了済み）
+更新: 2026-06-05（Inc 3a モード骨格 完了。次は Inc 3b = 座標逆写像(回転 D8) + 選択）
 対象ブランチ: `master`（lab を `6ac779b2` でマージ。comic-core は本体の依存）
 
 ラボ（`tools/comic_lab` + `crates/comic-core`）で完成させた吹き出し/テキスト/スタンプ/
@@ -345,9 +345,18 @@ master に対して再確認する**（このスナップショットに固定�
   - **Codex P3 フォローアップ（未対応・低リスク）**: ①comic.db の transient DB エラーも空キャッシュに潰れて
     再試行されない（no-row/壊れ JSON は意図的キャッシュ、DB エラーだけ区別する案）②`comic_docs` が
     セッション中無制限増加（小さい文字列。LRU/空エントリ prune 案）。Inc 8 仕上げで検討。
-- **Inc 3: 編集モード骨格 ＋ IME**
-  - 「テキスト」モード enter/exit、キャンバス入力捕捉、回転下の逆写像（D8）、選択・移動、IME 安全な
-    Enter/Escape ゲート。
+- **Inc 3: 編集モード骨格 ＋ IME** — 🚧 **3a 完了（2026-06-05）、3b/3c/3d 残**
+  - ✅ **3a モード骨格**: `src/ui_text.rs` 新規。Ctrl+T で入退場（消しゴム/隠蔽と同系列、D2）。
+    enter_text_mode（見開き→Single ピボット・`comic_docs` 作業セットロード）/ reset_text_mode（comic.db +
+    サイドカー保存）/ handle_text_keys（Esc/Ctrl+T 退場）/ 最小パネル（Area+Frame::popup+クリック吸収）。
+    `is_overlay_edit_mode_active` に text_mode、`close_fullscreen` で reset_text_mode（Codex P1 対応：
+    閉じ経路の flag リーク/保存漏れ防止）。テスト 1992 緑。
+  - 🚧 **3b（次）座標逆写像（回転 D8）＋ 選択**: `text_screen_to_image`/`text_image_to_screen` を回転対応で
+    実装（conceal は回転未対応なので改善）。クリックでオブジェクト選択（当たり判定＝comic-core ジオメトリ）。
+    **AI アップスケール時の source↔composite スケール（S = composite長辺/source長辺）の整合もここで**
+    （Inc 1 のデモは composite 座標で S=1 だが、実注釈は canonical source 座標 D8 なので bake 時に scale_scene）。
+  - 🚧 **3c 移動**: ドラッグ移動。編集確定で `comic_generation` を bump して再ベイク。
+  - 🚧 **3d IME 安全なテキスト編集**: `dialog_enter_pressed`/`dialog_escape_pressed` ゲート。
   - 受け入れ: 操作感が消しゴム/隠蔽と同等。選択・ドラッグがラボ一致。回転表示中も正しく掴める。IME 変換が
     壊れない。
 - **Inc 4: オブジェクト種別の描画＋インライン編集を移植**（4a→4e、各独立コミット）
