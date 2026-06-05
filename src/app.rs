@@ -1716,10 +1716,11 @@ pub(crate) struct ComicCacheEntry {
     #[allow(dead_code)]
     pub pixels: Arc<egui::ColorImage>,
     pub texture: egui::TextureHandle,
-    /// 下地 final composite pixels の Arc ポインタ identity。下地が作り直されると変わる
-    /// ので再ベイクのトリガになる (crop/色/AI/post-filter 変更を 1 つで捕捉)。ABA 回避の
-    /// ため、`comic_cache` は下地 (`final_composite_cache`) の clear 時に必ず連動破棄する。
-    pub base_ptr: usize,
+    /// 下地 final composite pixels の Arc 自体を保持する。`Arc::ptr_eq` で同一性を判定する
+    /// ことで、下地が作り直されたら (= 別アロケーション) 再ベイクし、かつ Arc を生かして
+    /// おくのでアドレス再利用による ABA を原理的に防ぐ (Codex P2)。下地が変わるのは
+    /// crop / 色補正 / AI / post-filter のいずれか = 1 つで捕捉できる。
+    pub base: Arc<egui::ColorImage>,
     /// `comic_generation` のスナップショット (注釈編集で進む。Inc 2 以降)。
     pub comic_gen: u64,
     /// 焼いた解像度 (下地寸法)。防御用。
@@ -20522,6 +20523,14 @@ impl App {
         }
     }
 
+    /// この画像 (idx) に表示すべき注釈があるかの安価な早期ゲート。下地 (final composite)
+    /// に触れる前に呼ぶことで、注釈無し画像の通常閲覧をゼロオーバーヘッドに保つ
+    /// (Codex P3)。Inc 1 はデモゲートのみ。Inc 2 で comic.db / メモリ上の注釈セットの
+    /// 有無を見るように差し替える。
+    fn comic_has_objects(&self, _idx: usize) -> bool {
+        self.comic_demo_enabled
+    }
+
     /// 注釈描画用フォントセットを遅延ロードして返す (1 度だけ試行)。フォントが見つから
     /// なければ `None` (= テキストを焼けないので comic 合成自体をスキップ)。本格的な
     /// フォント列挙・選択は Inc 4b。
@@ -20551,20 +20560,28 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        // 注釈が無い画像は下地に触れず即 None (通常閲覧はゼロオーバーヘッド、Codex P3)。
+        if !self.comic_has_objects(idx) {
+            return None;
+        }
         // 下地は AI 完了済み (complete) の最終 composite。AI 待ちの間は None が返るので
         // comic はまだ出ない (= comic は AI より後段、正しい)。
         let base = self.ensure_final_composite_pixels(ctx, idx)?;
         let [w, h] = base.size;
+        let comic_gen = self.comic_generation;
+        if let Some(entry) = self.comic_cache.get(&idx) {
+            // base の Arc 同一性 (ptr_eq) で下地の作り直しを検知。Arc を保持しているので
+            // アドレス再利用 (ABA) は起きない (Codex P2)。
+            if Arc::ptr_eq(&entry.base, &base)
+                && entry.comic_gen == comic_gen
+                && entry.dims == [w, h]
+            {
+                return Some(entry.texture.clone());
+            }
+        }
         let objects = self.comic_objects_for_idx(idx, w, h);
         if objects.is_empty() {
             return None;
-        }
-        let base_ptr = Arc::as_ptr(&base) as usize;
-        let comic_gen = self.comic_generation;
-        if let Some(entry) = self.comic_cache.get(&idx) {
-            if entry.base_ptr == base_ptr && entry.comic_gen == comic_gen && entry.dims == [w, h] {
-                return Some(entry.texture.clone());
-            }
         }
         let fonts = self.ensure_comic_fonts()?;
         let overlay = comic_core::bake_overlay(&objects, w, h, &fonts);
@@ -20573,7 +20590,7 @@ impl App {
         ));
         let upload = clamp_for_gpu(&composed);
         let texture = ctx.load_texture(
-            format!("comic_{idx}_{base_ptr}_{comic_gen}"),
+            format!("comic_{idx}_{}_{comic_gen}", Arc::as_ptr(&base) as usize),
             upload.into_owned(),
             egui::TextureOptions::LINEAR,
         );
@@ -20582,7 +20599,7 @@ impl App {
             ComicCacheEntry {
                 pixels: composed,
                 texture: texture.clone(),
-                base_ptr,
+                base: Arc::clone(&base),
                 comic_gen,
                 dims: [w, h],
             },
@@ -20655,6 +20672,9 @@ impl App {
             .retain(|key| keep_set.contains(&key.edit_key.idx));
         self.final_composite_cache
             .retain(|key, _| keep_set.contains(&key.edit_key.idx));
+        // comic は final composite を下地にするので keep_set に追従させる (Codex P2:
+        // フル解像度 comic を eviction で生き残らせない + 下地と整合)。
+        self.comic_cache.retain(|idx, _| keep_set.contains(idx));
         let to_cancel: Vec<FinalAiKey> = self
             .final_ai_pending
             .keys()
@@ -21720,12 +21740,15 @@ impl App {
         let Some(key) = self.metadata_cache_key(idx) else {
             self.final_composite_cache
                 .retain(|cache_key, _| cache_key.edit_key.idx != idx);
+            self.comic_cache.remove(&idx);
             return;
         };
         let slot = self.adjustment_generation.entry(key).or_insert(0);
         *slot = slot.saturating_add(1);
         self.final_composite_cache
             .retain(|cache_key, _| cache_key.edit_key.idx != idx);
+        // comic は final composite を下地にするので連動破棄 (Codex P2)。
+        self.comic_cache.remove(&idx);
     }
 
     /// `ai_upscale_generation` の全 entry を +1 する (saturating)。
