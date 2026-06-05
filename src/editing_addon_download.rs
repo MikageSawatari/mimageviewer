@@ -39,7 +39,8 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 
 use crate::editing_addon::{
-    self, IndexEntry, PackIndex, PackManifest, validate_pack_relpath, validate_version_dirname,
+    self, IndexEntry, PackIndex, PackManifest, validate_pack_relpath, validate_safe_filename,
+    validate_version_dirname,
 };
 
 /// pack アセットが置かれる GitHub Releases ベース URL。
@@ -261,6 +262,10 @@ fn run_install(cancel: Arc<AtomicBool>, tx: &mpsc::Sender<InstallProgress>) -> R
 
     // version は packs/<version>/ のディレクトリ名になるので検証する。
     validate_version_dirname(&entry.version)?;
+    // SECURITY: zip_name は downloads.join() と URL 連結に使うので、index 由来の値を
+    // そのまま信用せず単純ファイル名であることを検証する (path traversal 防止)。Codex P1。
+    validate_safe_filename(&entry.zip_name)
+        .map_err(|e| format!("index の zip_name が不正です: {e}"))?;
 
     let _ = tx.send(InstallProgress::IndexFetched {
         version: entry.version.clone(),
@@ -299,8 +304,13 @@ fn run_install(cancel: Arc<AtomicBool>, tx: &mpsc::Sender<InstallProgress>) -> R
     let manifest = read_staging_manifest(&staging)?;
     verify_manifest(&manifest, &entry, &staging)?;
     verify_files(&manifest, &staging, &cancel, tx)?;
+    // manifest に載っていないファイル (= per-file sha256 / license の管理外) は配置前に
+    // 取り除く。これで installed_fonts() が未検証フォントを拾うことを防ぐ。Codex P2。
+    prune_unmanifested(&manifest, &staging)?;
 
     // ── (5) 配置: staging → packs/<version>/ (atomic rename) ──
+    // 検証完了後・配置直前の遅い cancel も拾う (ここを過ぎると install は確定する)。Codex P3。
+    check_cancel(&cancel)?;
     let _ = tx.send(InstallProgress::Installing);
     install_staging(&staging, &entry.version)?;
 
@@ -493,10 +503,22 @@ fn try_download_one(
         if n == 0 {
             break;
         }
-        if let Err(e) = file.write_all(&buf[..n]) {
-            return Err(DownloadAttemptError::Permanent(format!("write chunk: {e}")));
+        // advertised サイズを超えて書かない (= 想定外に大きい応答で .partial を肥大化
+        // させない)。残量だけ書いて打ち切る。Codex P2 指摘。
+        let take = if entry.zip_bytes > 0 {
+            (n as u64).min(entry.zip_bytes.saturating_sub(bytes_done)) as usize
+        } else {
+            n
+        };
+        if take > 0 {
+            if let Err(e) = file.write_all(&buf[..take]) {
+                return Err(DownloadAttemptError::Permanent(format!("write chunk: {e}")));
+            }
+            bytes_done += take as u64;
         }
-        bytes_done += n as u64;
+        if entry.zip_bytes > 0 && bytes_done >= entry.zip_bytes {
+            break; // 必要量に到達
+        }
         if last_progress.elapsed().as_millis() >= 50 {
             let _ = tx.send(InstallProgress::Downloading {
                 bytes_done,
@@ -508,8 +530,17 @@ fn try_download_one(
     if let Err(e) = file.flush() {
         return Err(DownloadAttemptError::Retryable(format!("flush: {e}")));
     }
+    // EOF が advertised サイズより手前 = ストリーム途中切断。.partial は残したまま
+    // Retryable にして、次の attempt で Range resume させる (hash mismatch で消すより
+    // resume 進捗を温存する)。Codex P2 指摘。
+    if entry.zip_bytes > 0 && bytes_done < entry.zip_bytes {
+        return Err(DownloadAttemptError::Retryable(format!(
+            "truncated download: {bytes_done} / {} bytes",
+            entry.zip_bytes
+        )));
+    }
     let _ = tx.send(InstallProgress::Downloading {
-        bytes_done: entry.zip_bytes,
+        bytes_done: entry.zip_bytes.max(bytes_done),
         bytes_total: entry.zip_bytes,
     });
     Ok(())
@@ -551,9 +582,32 @@ fn extract_zip(
             fs::create_dir_all(parent).map_err(|e| format!("mkdir staging subdir: {e}"))?;
         }
         let mut out = fs::File::create(&dst).map_err(|e| format!("create staging file: {e}"))?;
-        std::io::copy(&mut zentry, &mut out).map_err(|e| format!("extract {rel_str}: {e}"))?;
+        // 大きな ONNX モデル (~490MB) の展開中も cancel に応答できるよう、チャンク単位で
+        // copy しながら cancel を確認する (std::io::copy は entry EOF まで戻らない)。Codex P3。
+        copy_with_cancel(&mut zentry, &mut out, cancel)
+            .map_err(|e| format!("extract {rel_str}: {e}"))?;
         out.sync_all()
             .map_err(|e| format!("sync staging file: {e}"))?;
+    }
+    Ok(())
+}
+
+/// reader → writer をチャンク単位でコピーしつつ、各チャンクで cancel を確認する。
+fn copy_with_cancel<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let mut buf = vec![0u8; DL_CHUNK_SIZE];
+    loop {
+        check_cancel(cancel)?;
+        let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        writer
+            .write_all(&buf[..n])
+            .map_err(|e| format!("write: {e}"))?;
     }
     Ok(())
 }
@@ -620,17 +674,95 @@ fn verify_files(
     Ok(())
 }
 
-/// `staging` を `packs/<version>/` へ atomic rename。既存 pack があれば置換。
+/// manifest に載っていない実ファイルを staging から取り除く。
+///
+/// zip 全体の sha256 は検証済みなので「攻撃者が紛れ込ませた」ものではないが、配布者の
+/// 手違いで余分なファイルが入っていると per-file sha256 / license 管理外のまま配置され、
+/// `installed_fonts()` がそれを拾ってしまう。許可するのは manifest.files の各 path +
+/// pack-manifest.json のみ。それ以外は削除して log する。Codex P2。
+fn prune_unmanifested(manifest: &PackManifest, staging: &Path) -> Result<(), String> {
+    use std::collections::HashSet;
+    // 許可セット (Windows は大小無視なので lowercase + 前方スラッシュ正規化)。
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert("pack-manifest.json".to_string());
+    for f in &manifest.files {
+        allowed.insert(f.path.replace('\\', "/").to_ascii_lowercase());
+    }
+    let mut files = Vec::new();
+    collect_files_rel(staging, staging, &mut files)?;
+    for rel in files {
+        let key = rel.replace('\\', "/").to_ascii_lowercase();
+        if !allowed.contains(&key) {
+            let full = staging.join(&rel);
+            crate::logger::log(format!(
+                "[editing pack] manifest 外のファイルを除外: {}",
+                rel
+            ));
+            let _ = fs::remove_file(&full);
+        }
+    }
+    Ok(())
+}
+
+/// `base` 配下の全ファイルを `base` からの相対パス文字列で再帰収集する。
+fn collect_files_rel(base: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if ft.is_dir() {
+            collect_files_rel(base, &path, out)?;
+        } else if ft.is_file() {
+            if let Ok(rel) = path.strip_prefix(base) {
+                out.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `staging` を `packs/<version>/` へ配置する。
+///
+/// 既存の同 version pack を上書きする場合、「remove → rename」の隙間でクラッシュすると
+/// 動作中 pack を失う。これを避けるため、既存があれば一旦 `<dir>.old-<ts>` へ rename して
+/// 退避 → staging を本番名へ rename → 退避を削除、の順で行う。配置確定後に sentinel /
+/// active.json を書くので、本関数の途中失敗では active pack は壊れない。Codex P2。
 fn install_staging(staging: &Path, version: &str) -> Result<(), String> {
     let final_dir = editing_addon::pack_dir(version);
     if let Some(parent) = final_dir.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create packs root: {e}"))?;
     }
-    if final_dir.exists() {
-        fs::remove_dir_all(&final_dir).map_err(|e| format!("remove old pack dir: {e}"))?;
+    let backup: Option<PathBuf> = if final_dir.exists() {
+        let b = final_dir.with_file_name(format!("{version}.old-{}", utc_now_iso8601_compact()));
+        fs::rename(&final_dir, &b).map_err(|e| format!("backup old pack dir: {e}"))?;
+        Some(b)
+    } else {
+        None
+    };
+    match fs::rename(staging, &final_dir) {
+        Ok(()) => {
+            // 退避した旧 pack を掃除 (best-effort、失敗してもインストールは成功)。
+            if let Some(b) = backup {
+                let _ = fs::remove_dir_all(&b);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // rename 失敗。退避した旧 pack を戻して元状態へ復旧する。
+            if let Some(b) = backup {
+                let _ = fs::rename(&b, &final_dir);
+            }
+            Err(format!("install (rename staging): {e}"))
+        }
     }
-    fs::rename(staging, &final_dir).map_err(|e| format!("install (rename staging): {e}"))?;
-    Ok(())
+}
+
+/// ファイル名に使える詰めた timestamp (YYYYMMDDThhmmssZ)。`.old-<ts>` 退避用。
+fn utc_now_iso8601_compact() -> String {
+    utc_now_iso8601().replace([':', '-'], "")
 }
 
 /// INSTALL_OK sentinel を atomic 書き込み (tmp → rename)。
@@ -769,6 +901,73 @@ fn is_leap(y: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editing_addon::{FileKind, PackFile};
+
+    fn mk_file(path: &str, kind: FileKind) -> PackFile {
+        PackFile {
+            path: path.to_string(),
+            kind,
+            license: String::new(),
+            sha256: String::new(),
+            bytes: 0,
+            model_id: None,
+        }
+    }
+
+    #[test]
+    fn prune_removes_unmanifested_files() {
+        let base = std::env::temp_dir().join("miv_editing_prune_test_a1");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("fonts")).unwrap();
+        fs::create_dir_all(base.join("models")).unwrap();
+        fs::write(base.join("pack-manifest.json"), "{}").unwrap();
+        fs::write(base.join("fonts/A.ttf"), "a").unwrap();
+        fs::write(base.join("fonts/Evil.ttf"), "evil").unwrap(); // manifest 外
+        fs::write(base.join("models/m.onnx"), "m").unwrap();
+        fs::write(base.join("README.txt"), "stray").unwrap(); // manifest 外
+
+        let manifest = PackManifest {
+            schema: 1,
+            pack_id: "x".to_string(),
+            version: "1".to_string(),
+            app_min_version: String::new(),
+            files: vec![
+                mk_file("fonts/A.ttf", FileKind::Font),
+                mk_file("models/m.onnx", FileKind::SubjectMatteModel),
+            ],
+        };
+        prune_unmanifested(&manifest, &base).unwrap();
+        assert!(base.join("fonts/A.ttf").exists());
+        assert!(base.join("models/m.onnx").exists());
+        assert!(base.join("pack-manifest.json").exists());
+        assert!(
+            !base.join("fonts/Evil.ttf").exists(),
+            "manifest 外フォントは除外される"
+        );
+        assert!(
+            !base.join("README.txt").exists(),
+            "manifest 外ファイルは除外される"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn collect_files_rel_recurses() {
+        let base = std::env::temp_dir().join("miv_editing_collect_test_a1");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("a/b")).unwrap();
+        fs::write(base.join("top.txt"), "1").unwrap();
+        fs::write(base.join("a/mid.txt"), "2").unwrap();
+        fs::write(base.join("a/b/deep.txt"), "3").unwrap();
+        let mut out = Vec::new();
+        collect_files_rel(&base, &base, &mut out).unwrap();
+        let norm: Vec<String> = out.iter().map(|s| s.replace('\\', "/")).collect();
+        assert_eq!(norm.len(), 3);
+        assert!(norm.contains(&"top.txt".to_string()));
+        assert!(norm.contains(&"a/mid.txt".to_string()));
+        assert!(norm.contains(&"a/b/deep.txt".to_string()));
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn hex_encode_basic() {

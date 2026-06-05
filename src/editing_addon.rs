@@ -291,6 +291,11 @@ pub fn addon_status() -> AddonStatus {
     if version.is_empty() {
         return AddonStatus::Corrupt("active.json の active_version が空です".to_string());
     }
+    // SECURITY: active.json は壊れている / 改竄され得るので、version を packs/<version>/
+    // のパスにする前に検証する (path traversal 防止)。Codex P2 指摘。
+    if validate_version_dirname(&version).is_err() {
+        return AddonStatus::Corrupt(format!("active.json の version が不正です: {version:?}"));
+    }
     // sentinel が無ければ未導入扱い (= DL 途中で中断した残骸かもしれない)。
     if !install_sentinel_path(&version).exists() {
         return AddonStatus::Missing;
@@ -305,6 +310,14 @@ pub fn addon_status() -> AddonStatus {
         return AddonStatus::Corrupt(format!(
             "pack schema {} は本バージョンの mIV では非対応です (対応上限 {})",
             manifest.schema, EXPECTED_PACK_SCHEMA
+        ));
+    }
+    // active pointer の version と manifest の version が食い違うのは壊れた状態。
+    // (= ディレクトリ名と中身の不整合。Codex P2 指摘)
+    if manifest.version != version {
+        return AddonStatus::Corrupt(format!(
+            "active_version ({}) と pack-manifest の version ({}) が一致しません",
+            version, manifest.version
         ));
     }
     AddonStatus::Valid { version }
@@ -432,6 +445,32 @@ pub fn validate_version_dirname(version: &str) -> Result<(), String> {
         return Err(format!(
             "pack version に使用できない文字が含まれます (英数 . - _ のみ可): {version:?}"
         ));
+    }
+    Ok(())
+}
+
+/// 単純なファイル名 (`editing-pack-2026.06.0.zip` 等) を local path / URL に使う前に
+/// 検証する。サブディレクトリを **許可しない** (= path separator / `..` / drive を拒否)。
+///
+/// SECURITY: index 由来の `zip_name` を `downloads.join()` や URL 連結に渡す前に通す。
+/// TRT pack の `validate_safe_filename` と同等。Codex P1 指摘。
+pub fn validate_safe_filename(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("ファイル名が空です".to_string());
+    }
+    if name.len() > 128 {
+        return Err("ファイル名が長すぎます".to_string());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains(':') {
+        return Err(format!(
+            "ファイル名に path separator が含まれます: {name:?}"
+        ));
+    }
+    if name.contains("..") {
+        return Err(format!("ファイル名に `..` が含まれます: {name:?}"));
+    }
+    if name.starts_with('.') {
+        return Err(format!("ファイル名が `.` で始まります: {name:?}"));
     }
     Ok(())
 }
@@ -597,6 +636,25 @@ mod tests {
         assert!(validate_version_dirname("C:evil").is_err());
         assert!(validate_version_dirname("a b").is_err()); // space not allowed
         assert!(validate_version_dirname(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn validate_safe_filename_accepts_normal() {
+        assert!(validate_safe_filename("editing-pack-2026.06.0.zip").is_ok());
+        assert!(validate_safe_filename("editing-pack-index.json").is_ok());
+    }
+
+    #[test]
+    fn validate_safe_filename_rejects_traversal() {
+        assert!(validate_safe_filename("").is_err());
+        assert!(validate_safe_filename("..").is_err());
+        assert!(validate_safe_filename("../evil.zip").is_err());
+        assert!(validate_safe_filename("sub/dir.zip").is_err());
+        assert!(validate_safe_filename("sub\\dir.zip").is_err());
+        assert!(validate_safe_filename("C:evil.zip").is_err());
+        assert!(validate_safe_filename(".hidden").is_err());
+        assert!(validate_safe_filename("foo..bar.zip").is_err());
+        assert!(validate_safe_filename(&"x".repeat(129)).is_err());
     }
 
     #[test]
