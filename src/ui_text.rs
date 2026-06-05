@@ -2235,30 +2235,13 @@ impl App {
         self.comic_window_presets = window;
     }
 
-    /// 再利用されないユニークな `user:<prefix><nanos>` プリセット id を作る。
+    /// 再利用されないユニークな `user:<prefix>-<uuid>` プリセット id を作る。
     ///
-    /// 単調増加 (エポックナノ秒) ベースにすることで、プリセットを削除しても同じ id が
-    /// 再発行されない。インデックス再利用方式だと、削除した id が別ページ (comic.db に
-    /// 保存済み) の旧リンクと衝突し、無関係なプリセットに点灯/再適用される (Codex P2)。
+    /// UUIDv4 にすることで、プリセットを削除しても同じ id が再発行されない (壁時計に
+    /// 依存しない)。インデックス再利用方式だと、削除した id が別ページ (comic.db に
+    /// 保存済み) の旧リンクと衝突し、無関係なプリセットに点灯/再適用される (Codex P2/P3)。
     fn next_user_preset_id(&self, prefix: &str) -> String {
-        let used: std::collections::HashSet<String> = self
-            .comic_text_presets
-            .iter()
-            .map(|p| p.id.clone())
-            .chain(self.comic_shape_presets.iter().map(|p| p.id.clone()))
-            .chain(self.comic_window_presets.iter().map(|p| p.id.clone()))
-            .collect();
-        let mut base = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        loop {
-            let id = format!("user:{prefix}{base}");
-            if !used.contains(&id) {
-                return id;
-            }
-            base += 1;
-        }
+        format!("user:{prefix}-{}", uuid::Uuid::new_v4())
     }
 
     /// 選択オブジェクトの現在のスタイルを新規ユーザープリセットとして保存し、その
@@ -4339,7 +4322,13 @@ fn edit_object_ui(
             let cur = *tab;
             draw_section_bar(ui, cur.color(), |ui| match cur {
                 TextPropTab::Serifu => {
-                    text_block_ui(ui, &mut w.text, changed, true, open_font_picker)
+                    // ウィンドウプリセットは本文 TEXT のスタイルも含むので、本文スタイル
+                    // 編集でウィンドウリンクを解除する (本文内容の編集では外さない)。
+                    let snap = w.text.clone();
+                    text_block_ui(ui, &mut w.text, changed, true, open_font_picker);
+                    if w.style_preset_link.is_some() && text_style_diverged(&snap, &w.text) {
+                        w.style_preset_link = None;
+                    }
                 }
                 _ => {
                     window_preset_bar(ui, w, presets, changed);
@@ -4404,8 +4393,19 @@ fn window_style_diverged(a: &MessageWindowObject, b: &MessageWindowObject) -> bo
         || a.wrap != b.wrap
         || a.indicator != b.indicator
         || a.indicator_auto != b.indicator_auto
-        || a.name_plate != b.name_plate
         || a.portrait != b.portrait
+        || name_plate_style_diverged(&a.name_plate, &b.name_plate)
+}
+
+/// 名前プレートの装飾差 (名前の TEXT 内容とフォントは apply で保持されるので無視)。
+fn name_plate_style_diverged(a: &comic_core::NamePlate, b: &comic_core::NamePlate) -> bool {
+    let mut an = a.clone();
+    let mut bn = b.clone();
+    an.name.text = String::new();
+    bn.name.text = String::new();
+    an.name.font_key = String::new();
+    bn.name.font_key = String::new();
+    an != bn
 }
 
 /// プリセットバー周りの状態。詳細パネルの外 (draw_text_panel) で結果を処理する。
