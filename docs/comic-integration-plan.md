@@ -1,7 +1,8 @@
 # テキスト注釈(comic)機能 — 本体 mIV 統合計画
 
-Status: 計画 v2.5（**Inc 3a 完了** = テキスト編集モード骨格 Ctrl+T。Inc 0/1/2 完了済み）
-更新: 2026-06-05（Inc 3a モード骨格 完了。次は Inc 3b = 座標逆写像(回転 D8) + 選択）
+Status: 計画 v2.6（**Inc 3 完了** = 座標逆写像(回転 D8)+選択+ドラッグ移動+IME 編集、基本 Inc 4
+編集も先行着手。Inc 0/1/2/3 完了済み）
+更新: 2026-06-05（Inc 3b/3c/3d 完了 + 基本 Inc 4a/4b/4d 編集着手。次は Inc 4 仕上げ → 5 → 6 → 7）
 対象ブランチ: `master`（lab を `6ac779b2` でマージ。comic-core は本体の依存）
 
 ラボ（`tools/comic_lab` + `crates/comic-core`）で完成させた吹き出し/テキスト/スタンプ/
@@ -351,14 +352,23 @@ master に対して再確認する**（このスナップショットに固定�
     サイドカー保存）/ handle_text_keys（Esc/Ctrl+T 退場）/ 最小パネル（Area+Frame::popup+クリック吸収）。
     `is_overlay_edit_mode_active` に text_mode、`close_fullscreen` で reset_text_mode（Codex P1 対応：
     閉じ経路の flag リーク/保存漏れ防止）。テスト 1992 緑。
-  - 🚧 **3b（次）座標逆写像（回転 D8）＋ 選択**: `text_screen_to_image`/`text_image_to_screen` を回転対応で
-    実装（conceal は回転未対応なので改善）。クリックでオブジェクト選択（当たり判定＝comic-core ジオメトリ）。
-    **AI アップスケール時の source↔composite スケール（S = composite長辺/source長辺）の整合もここで**
-    （Inc 1 のデモは composite 座標で S=1 だが、実注釈は canonical source 座標 D8 なので bake 時に scale_scene）。
-  - 🚧 **3c 移動**: ドラッグ移動。編集確定で `comic_generation` を bump して再ベイク。
-  - 🚧 **3d IME 安全なテキスト編集**: `dialog_enter_pressed`/`dialog_escape_pressed` ゲート。
-  - 受け入れ: 操作感が消しゴム/隠蔽と同等。選択・ドラッグがラボ一致。回転表示中も正しく掴める。IME 変換が
-    壊れない。
+  - ✅ **3b 座標逆写像（回転 D8）＋ 選択**: `TextImgView`（`text_img_view`）で画面 ↔ canonical ソース px を
+    **rotation_db 90°単位 + フリー回転 + zoom/pan 込みで逆変換**（conceal/local_adjust は回転未対応だったのを改善）。
+    `forward_uv`/`inverse_uv` は `draw_rotated_image_ex` の UV 割り当てと一致。クリックで `hit_test`（当たり判定＝
+    `object_bounds` = comic-core ジオメトリ：bubble は effective shape の outline、window/stamp は回転 AABB、text は
+    layout bounds）。選択は id ベース（削除/並べ替えでずれない）。選択枠を画面に描画。**ソース↔composite スケール**は
+    表示ベイクに `scale_scene(S = base長辺/source長辺)` を適用（`source_dims_for_idx` で source 寸法、AI OFF は S=1 で従来同一）。
+  - ✅ **3c 移動**: ドラッグで pivot（吹き出しは tail tip も）を移動、`mark_comic_dirty()`（`comic_generation` bump）で
+    再ベイク。release で comic.db + サイドカーへ即保存。
+  - ✅ **3d IME 安全なテキスト編集**: パネルの本文 TextEdit。Escape は `dialog_escape_pressed`（IME 変換中 false）で
+    判定し、フィールドフォーカス中は egui に委ねて消費しない（変換確定/キャンセルを壊さない）。Delete/Backspace で
+    選択削除（フォーカス外のみ）。
+  - ✅ **基本 Inc 4 編集も先行**: パネルから オブジェクト追加（テキスト/吹き出し/ウィンドウ）/ 一覧（選択・複製・削除・
+    前後 z・表示トグル）/ 種別別インライン編集（テキスト：内容・サイズ・色・向き・整列・袋文字・太斜・自動縦中横／
+    吹き出し：形状16・塗り・輪郭・自動サイズ・余白・しっぽ／ウィンドウ：枠・塗り・本文／スタンプ：不透明度・反転）。
+    スタンプ画像ピッカー（絵文字アセット）は Inc 4c、プリセット/追加ダイアログ/フォント見本は Inc 5、変形ハンドルは Inc 6。
+  - 受け入れ: ビルド緑 + テスト 2004（座標往復/UV 逆写像/hit_test/translate の単体 5 本追加）。**実機での選択・ドラッグ・
+    回転下の掴み・IME 確認はユーザー確認待ち**。
 - **Inc 4: オブジェクト種別の描画＋インライン編集を移植**（4a→4e、各独立コミット）
   - 4a 吹き出し（形状・しっぽ・結合・自動サイズ・本体パネル）/ 4b 単体テキスト（セリフパネル、IME）/
     4c スタンプ（ピッカー＋編集＋GPU quad＋絵文字アセット＋帰属＋§6.4 埋め込み）/ 4d ウィンドウ

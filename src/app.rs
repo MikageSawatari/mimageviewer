@@ -1727,6 +1727,17 @@ pub(crate) struct ComicCacheEntry {
     pub dims: [usize; 2],
 }
 
+/// テキスト注釈のキャンバス上ドラッグ移動の進行状態 (Inc 3c)。
+#[derive(Clone, Copy)]
+pub(crate) struct TextDrag {
+    /// ドラッグ中のオブジェクト id。
+    pub id: u64,
+    /// 直近のポインタ画像座標 (canonical ソース px)。毎フレームの差分で pivot を動かす。
+    pub last_img: (f32, f32),
+    /// 実際に動かしたか (press だけで動かさなかった場合に undo / dirty を出さない)。
+    pub moved: bool,
+}
+
 /// 消しゴムプレビュー (= preview ボタン押下時の MI-GAN 結果) を保持する一時キャッシュ。
 ///
 /// `fs_cache` を書き換えない隔離設計 (Codex P1 R4 #1)。プレビュー中だけ表示
@@ -3853,8 +3864,12 @@ pub struct App {
     // ── テキスト注釈 編集モード (Inc 3) ─────────────────────────
     /// 「テキスト」編集モード (消しゴム/隠蔽と同系列、D2)。Ctrl+T で入退場。
     pub(crate) text_mode: bool,
-    /// 選択中の注釈オブジェクトの index (`comic_docs[key]` 内)。Inc 3b で選択/移動に使う。
-    pub(crate) text_selected: Option<usize>,
+    /// 選択中の注釈オブジェクトの **id** (`comic_docs[key]` 内の `AnnotationObject::id`)。
+    /// index ではなく id で持つので、削除 / z 並べ替えで選択がずれない (Inc 3b)。
+    pub(crate) text_selected: Option<u64>,
+    /// キャンバス上のドラッグ移動の進行状態 (Inc 3c)。`last_img` は直近のポインタ画像
+    /// 座標で、毎フレームの差分でオブジェクトを動かす。
+    pub(crate) text_drag: Option<TextDrag>,
     /// 見開きから text モードに入ったときの spread 復元コンテキスト (conceal と同じ流儀)。
     pub(crate) text_spread_ctx: Option<EraseSpreadCtx>,
 
@@ -4946,6 +4961,7 @@ impl App {
             comic_docs: std::collections::HashMap::new(),
             text_mode: false,
             text_selected: None,
+            text_drag: None,
             text_spread_ctx: None,
             erase_preview_active: false,
             conceal_preview_active: false,
@@ -20597,7 +20613,7 @@ impl App {
     /// 注釈描画用フォントセットを遅延ロードして返す (1 度だけ試行)。フォントが見つから
     /// なければ `None` (= テキストを焼けないので comic 合成自体をスキップ)。本格的な
     /// フォント列挙・選択は Inc 4b。
-    fn ensure_comic_fonts(&mut self) -> Option<Arc<comic_core::FontSet>> {
+    pub(crate) fn ensure_comic_fonts(&mut self) -> Option<Arc<comic_core::FontSet>> {
         if !self.comic_fonts_loaded {
             self.comic_fonts_loaded = true;
             self.comic_fonts = crate::comic_overlay::load_comic_fonts().map(Arc::new);
@@ -20608,6 +20624,26 @@ impl App {
             }
         }
         self.comic_fonts.clone()
+    }
+
+    /// canonical(非回転・非アップスケール)ソース画素の寸法 `(W, H)` を返す。注釈座標
+    /// (D8) と消しゴム/隠蔽/補正レイヤーのマスクは全てこの空間で保持される。fs_cache の
+    /// デコード済みピクセル寸法を用いる (PDF/ZIP はレンダ済みページ寸法)。未ロード /
+    /// アニメーション等で取れなければ `None`。
+    pub(crate) fn source_dims_for_idx(&self, idx: usize) -> Option<(f32, f32)> {
+        match self.fs_cache.get(&idx) {
+            Some(crate::fs_animation::FsCacheEntry::Static { pixels, .. }) => {
+                Some((pixels.size[0].max(1) as f32, pixels.size[1].max(1) as f32))
+            }
+            _ => None,
+        }
+    }
+
+    /// 注釈編集を確定したときに呼ぶ。`comic_generation` を進めて comic_cache の各 entry を
+    /// 失効させ、次の `ensure_comic_composite_texture` で最新 `comic_docs` から再ベイク
+    /// させる (§5.5 のキャッシュ無効化規約)。サムネは非反映 (D3) なので触らない。
+    pub(crate) fn mark_comic_dirty(&mut self) {
+        self.comic_generation = self.comic_generation.wrapping_add(1);
     }
 
     /// 最終 composite (canonical ソース解像度・post-filter 後) の上に注釈を S=1 で焼いて
@@ -20675,18 +20711,25 @@ impl App {
         let Some(key) = self.page_path_key(idx) else {
             return None;
         };
+        // 注釈は canonical ソース画素座標で保持 (D8)。下地 (base) は AI アップスケール後
+        // の解像度なので、ソース→base の相似スケール S を掛けてから base 解像度で焼く
+        // (§5.4)。AI OFF では base==source なので S=1 (= 従来と同一、退行なし)。
+        let (src_w, src_h) = self
+            .source_dims_for_idx(idx)
+            .unwrap_or((w as f32, h as f32));
         self.ensure_comic_doc_loaded(&key);
         let mut objects = self.comic_docs.get(&key).cloned().unwrap_or_default();
         if objects.is_empty() && self.comic_demo_enabled {
             // 既存行 (壊れ JSON / 将来非互換版を含む) があればデモ seed で上書きしない
             // (Codex P2: clobber 防止)。行が真に無い (missing) ときだけ seed する。
             // 本番 (デモ OFF) では seed 経路自体が走らないので clobber は起きない。
+            // デモも canonical ソース座標で作る (D8、bake 時に S で base へ拡大)。
             let row_exists = self
                 .comic_db
                 .as_ref()
                 .is_some_and(|db| db.get_raw(&key).is_some());
             if !row_exists {
-                objects = crate::comic_overlay::demo_objects(w, h);
+                objects = crate::comic_overlay::demo_objects(src_w as usize, src_h as usize);
                 self.save_comic_objects(idx, &key, &objects);
             }
         }
@@ -20698,7 +20741,13 @@ impl App {
         // ではないが、実コンテンツでの worker 化要否を判断できるよう計測する。閾値 (80ms)
         // 超過は conceal と同じく perf ログに出す (§10、Inc 4+ で実測して判断)。
         let bake_start = std::time::Instant::now();
-        let overlay = comic_core::bake_overlay(&objects, w, h, &fonts);
+        let s_bake = (w.max(h) as f32) / src_w.max(src_h).max(1.0);
+        let scaled_objects = if (s_bake - 1.0).abs() > 1e-4 {
+            comic_core::scale_scene(&objects, s_bake)
+        } else {
+            objects.clone()
+        };
+        let overlay = comic_core::bake_overlay(&scaled_objects, w, h, &fonts);
         let composed = Arc::new(crate::comic_overlay::composite_overlay_over(
             &base, &overlay,
         ));

@@ -2175,13 +2175,15 @@ impl App {
                             ctx.request_repaint();
                         }
 
-                        // ── テキスト注釈モード: パネル描画 (Inc 3a) ──
-                        // Inc 3b 以降でキャンバスのオブジェクト選択 / 移動オーバーレイを足す。
+                        // ── テキスト注釈モード: キャンバス選択/移動 + パネル描画 ──
+                        // (Inc 3b 座標逆写像 + 選択 / 3c ドラッグ移動 / 3d IME 編集)。
                         if self.text_mode
                             && !is_spread_double
                             && !state.original_preview_active
                         {
-                            self.draw_text_overlay(ctx, full_rect);
+                            let zp = self.fs_zoom_pan();
+                            self.handle_text_canvas_input(ctx, image_rect, zp);
+                            self.draw_text_overlay(ui, ctx, image_rect, zp);
                             ctx.request_repaint();
                         } else if self.text_mode {
                             ctx.request_repaint();
