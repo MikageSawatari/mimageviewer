@@ -10,6 +10,8 @@ impl App {
         }
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
+        // 追加パックのライセンスサマリは closure の借用衝突を避けるため事前にキャプチャする。
+        let pack_about = self.ensure_editing_pack_about();
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
         egui::Window::new("バージョン情報")
             .open(&mut open)
@@ -72,6 +74,36 @@ impl App {
                         ui.label("CC-BY 4.0 — Twitter, Inc. and other contributors");
                         ui.end_row();
                     });
+
+                // 編集用追加パック (導入済みのときだけ表示、spec §10)。
+                if let Some(pack) = &pack_about {
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("編集用追加パック (v{})", pack.version))
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    egui::Grid::new("editing_pack_licenses")
+                        .num_columns(2)
+                        .spacing([8.0, 2.0])
+                        .show(ui, |ui| {
+                            ui.label(format!("オノマトペ向けフォント ({}書体)", pack.font_count));
+                            ui.label(format!("{} — Google Fonts 提供", pack.font_license));
+                            ui.end_row();
+
+                            ui.label(format!("被写体分離 ({})", pack.model_id));
+                            ui.label(format!("{} — ZhengPeng7/BiRefNet", pack.model_license));
+                            ui.end_row();
+                        });
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new("各ライセンス全文は追加パック内に同梱されています。")
+                            .size(10.0)
+                            .color(egui::Color32::from_gray(150)),
+                    );
+                }
 
                 ui.add_space(8.0);
                 ui.vertical_centered(|ui| {

@@ -3884,6 +3884,11 @@ pub struct App {
     /// ここにキャッシュし、起動時 / pack 導入完了 / pack 削除時にだけ
     /// `refresh_subject_matte_path()` で更新する。
     pub(crate) subject_matte_path: Option<std::path::PathBuf>,
+    /// バージョン情報ダイアログ (spec §10) 用の追加パックライセンスサマリ。
+    /// `editing_pack_about_loaded` が false の間だけ 1 度 manifest から組み立てる。
+    /// pack 導入完了 / 削除時に invalidate される。
+    pub(crate) editing_pack_about: Option<crate::editing_addon::PackLicenseSummary>,
+    pub(crate) editing_pack_about_loaded: bool,
     /// スタンプ画像のデコードキャッシュ (`stamp_source_key` → 512px straight-alpha
     /// `RgbaOverlay`)。絵文字 SVG / ユーザー画像を 1 度だけデコードし、各ベイクで
     /// id→Arc の `StampImages` を組み立てる際に再利用する (Inc 4c)。`None` =
@@ -5025,6 +5030,8 @@ impl App {
             comic_fonts: None,
             comic_fonts_loaded: false,
             subject_matte_path: crate::editing_addon::subject_matte_model_path(),
+            editing_pack_about: None,
+            editing_pack_about_loaded: false,
             comic_stamp_cache: std::collections::HashMap::new(),
             comic_demo_enabled: std::env::var("MIV_COMIC_DEMO")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -20715,6 +20722,9 @@ impl App {
     /// 伴うため、毎フレームではなく状態変化時にだけ呼ぶこと。
     pub(crate) fn refresh_subject_matte_path(&mut self) {
         self.subject_matte_path = crate::editing_addon::subject_matte_model_path();
+        // ライセンス表示キャッシュも次回ダイアログ表示時に組み直させる。
+        self.editing_pack_about_loaded = false;
+        self.editing_pack_about = None;
         crate::logger::log(format!(
             "[editing pack] 被写体マットモデル: {}",
             self.subject_matte_path
@@ -20722,6 +20732,19 @@ impl App {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "(未導入)".to_string())
         ));
+    }
+
+    /// バージョン情報ダイアログ用の追加パックライセンスサマリを遅延ロードする。
+    /// manifest 読み込みを伴うため、毎フレームではなく cache miss 時のみ評価する
+    /// (起動時 None → ダイアログ初回表示で 1 度ロード、install/uninstall で invalidate)。
+    pub(crate) fn ensure_editing_pack_about(
+        &mut self,
+    ) -> Option<crate::editing_addon::PackLicenseSummary> {
+        if !self.editing_pack_about_loaded {
+            self.editing_pack_about_loaded = true;
+            self.editing_pack_about = crate::editing_addon::pack_license_summary();
+        }
+        self.editing_pack_about.clone()
     }
 
     /// canonical(非回転・非アップスケール)ソース画素の寸法 `(W, H)` を返す。注釈座標

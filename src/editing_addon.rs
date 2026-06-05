@@ -376,6 +376,52 @@ pub fn subject_matte_model_path() -> Option<PathBuf> {
     if p.exists() { Some(p) } else { None }
 }
 
+/// ライセンス一覧表示 (spec §10) 用の追加パック内容サマリ。
+/// 導入済みかつ manifest が読めるときだけ `Some`。
+#[derive(Debug, Clone)]
+pub struct PackLicenseSummary {
+    /// pack バージョン。
+    pub version: String,
+    /// 同梱フォント数。
+    pub font_count: usize,
+    /// フォントのライセンス表記 (全フォント一律 OFL-1.1 の代表値)。
+    pub font_license: String,
+    /// 被写体分離モデルの表示名 (model_id)。
+    pub model_id: String,
+    /// 被写体分離モデルのライセンス表記。
+    pub model_license: String,
+}
+
+/// 導入済み追加パックのライセンスサマリを manifest から組み立てる。
+/// 未導入 / manifest 不正なら `None`。
+pub fn pack_license_summary() -> Option<PackLicenseSummary> {
+    let AddonStatus::Valid { version } = addon_status() else {
+        return None;
+    };
+    let manifest = read_pack_manifest(&version)?;
+    let font_count = manifest.fonts().count();
+    // フォントは一律 OFL-1.1 なので先頭フォントの license を代表値にする。
+    let font_license = manifest
+        .fonts()
+        .next()
+        .map(|f| f.license.clone())
+        .unwrap_or_else(|| "OFL-1.1".to_string());
+    let model = manifest.subject_matte_model();
+    let model_id = model
+        .and_then(|f| f.model_id.clone())
+        .unwrap_or_else(|| "—".to_string());
+    let model_license = model
+        .map(|f| f.license.clone())
+        .unwrap_or_else(|| "—".to_string());
+    Some(PackLicenseSummary {
+        version,
+        font_count,
+        font_license,
+        model_id,
+        model_license,
+    })
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // バージョン比較 (semver 簡易版)
 // ──────────────────────────────────────────────────────────────────────────
