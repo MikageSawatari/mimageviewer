@@ -31,5 +31,9 @@ bench_thumbs.tsv
 # TRT pack 配布物 (build_trt_pack の出力、~3 GB)
 dist/trt-pack-*/
 
+# 編集用追加パック 配布物 (build_editing_pack の出力) + モデル素材
+dist/editing-pack-*/
+/vendor/editing-pack/
+
 # 開発中の検証用一時ファイル
 /tmp-test/
