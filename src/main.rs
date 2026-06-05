@@ -29,6 +29,8 @@ pub mod diagnostics;
 #[cfg(windows)]
 pub mod dwm_iconic_thumbnail;
 pub mod dwm_transitions;
+pub mod editing_addon;
+pub mod editing_addon_download;
 pub mod exif_reader;
 pub mod export_crop;
 pub mod export_dialog;

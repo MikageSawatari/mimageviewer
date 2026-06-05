@@ -739,6 +739,11 @@ impl App {
         self.clear_meta_undo();
         self.ensure_comic_doc_loaded(&key);
 
+        // テキスト編集はシステムフォントでも動くが、初回入場時に追加パック (オノマトペ
+        // 向けフォント + 被写体分離モデル) の取得を案内する (spec §4.1)。未導入かつ
+        // 未辞退のときだけ確認モーダルを開く。
+        self.maybe_prompt_editing_addon();
+
         let obj_count = self.comic_docs.get(&key).map(Vec::len).unwrap_or(0);
         crate::logger::log(format!("text: enter mode, key={key}, objects={obj_count}"));
     }
