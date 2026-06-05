@@ -996,16 +996,19 @@ impl App {
         let editing_text = ctx.memory(|m| m.focused().is_some());
 
         // Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z: エディタ専用 Undo/Redo (D7)。
-        // テキストフィールドにフォーカスがある間は egui の TextEdit に Ctrl+Z を委ねて
-        // (= 消費しない) フィールド内テキストの undo を壊さない。フィールド外の編集
-        // (追加 / 削除 / 移動 / 変形 / パネル操作) のみここで undo する。
+        // テキスト入力中のウィジェット (TextEdit) が **キーボード入力を要求している間**は
+        // egui に Ctrl+Z を委ねて (= 消費しない) フィールド内テキストの undo を壊さない。
+        // 判定は `wants_keyboard_input()` を使う (ラボと同じ。`focused().is_some()` だと
+        // ボタン / スライダーへのフォーカスでも抑制してしまい、TextEdit でもないのに
+        // comic undo が効かなくなる — Codex P3)。フィールド外の編集 (追加 / 削除 / 移動 /
+        // 変形 / パネル操作) のみここで undo する。
         // **メタ undo との非干渉**: テキストモード中は `handle_fs_key_input` がこの関数で
-        // return するため、ここで消費しなかった (= editing_text 時の) key も含めて
-        // `handle_meta_undo_keys` (レーティング/タグ undo) には決して到達しない。
+        // return するため、ここで消費しなかった key も含めて `handle_meta_undo_keys`
+        // (レーティング/タグ undo) には決して到達しない。
         // consume 順は `handle_meta_undo_keys` と同じ: Ctrl+Shift+Z (redo) → Ctrl+Y (redo)
         // → Ctrl+Z (undo)。`Modifiers::CTRL` 指定の consume は Shift 併用 Z も拾うため
         // redo を先に握り、Ctrl+Shift+Z が undo 側へ流れないようにする。
-        if !editing_text {
+        if !ctx.wants_keyboard_input() {
             let (undo, redo) = ctx.input_mut(|i| {
                 let redo = i
                     .consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z)

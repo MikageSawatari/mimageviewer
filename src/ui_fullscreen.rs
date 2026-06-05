@@ -399,6 +399,7 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
             | egui::Key::I
             | egui::Key::X
             | egui::Key::Z
+            | egui::Key::Y
             | egui::Key::R
             | egui::Key::F1
             | egui::Key::F2
