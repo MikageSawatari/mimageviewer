@@ -342,20 +342,24 @@ impl PreferencesState {
         let trt_engine_cache_size_mib =
             dir_size_bytes(&crate::ai::tensorrt_pack::engine_cache_dir()) / (1024 * 1024);
 
-        // 編集用追加パックの状態を 1 回だけ取得 (status は数 KB JSON + stat、fonts は
-        // 1 回の read_dir なので環境設定ダイアログを開く際の同期 I/O として許容範囲)。
+        // 編集用追加パックの状態を 1 回だけ取得。size / フォント数 / モデル名はすべて
+        // manifest 1 回読みで賄い、ディレクトリ再帰走査 (dir_size_bytes) や read_dir
+        // (installed_fonts) といった UI スレッド同期 I/O を避ける (Codex P3)。
+        // 表示サイズは manifest の per-file bytes 合計 (= 展開後サイズ概算)。
         let editing_addon_status = crate::editing_addon::addon_status();
         let (editing_addon_size_mib, editing_addon_font_count, editing_addon_subject_model) =
             if let crate::editing_addon::AddonStatus::Valid { version } = &editing_addon_status {
-                let size = dir_size_bytes(&crate::editing_addon::pack_dir(version)) / (1024 * 1024);
-                let fonts = crate::editing_addon::installed_fonts().len();
-                let model = crate::editing_addon::read_pack_manifest(version)
-                    .and_then(|m| {
-                        m.subject_matte_model()
+                crate::editing_addon::read_pack_manifest(version)
+                    .map(|m| {
+                        let size = m.total_bytes() / (1024 * 1024);
+                        let fonts = m.fonts().count();
+                        let model = m
+                            .subject_matte_model()
                             .map(|f| f.model_id.clone().unwrap_or_else(|| f.path.clone()))
+                            .unwrap_or_default();
+                        (size, fonts, model)
                     })
-                    .unwrap_or_default();
-                (size, fonts, model)
+                    .unwrap_or((0, 0, String::new()))
             } else {
                 (0, 0, String::new())
             };

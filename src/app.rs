@@ -20725,6 +20725,13 @@ impl App {
         // ライセンス表示キャッシュも次回ダイアログ表示時に組み直させる。
         self.editing_pack_about_loaded = false;
         self.editing_pack_about = None;
+        // pack の入れ替え / 削除でモデル実体 (パス) が変わるので、AiRuntime にキャッシュ済みの
+        // SubjectMatte session を破棄して次回生成で新しいパスから読み直させる。
+        // 破棄しないと load_model() が「既にロード済み」で早期 return し、更新後も旧 BiRefNet
+        // session を使い続ける / uninstall 後も VRAM を抱えたままになる (Codex P2)。
+        if let Some(rt) = &self.ai_runtime {
+            rt.unload_model(crate::ai::ModelKind::SubjectMatte);
+        }
         crate::logger::log(format!(
             "[editing pack] 被写体マットモデル: {}",
             self.subject_matte_path

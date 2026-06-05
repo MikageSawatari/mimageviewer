@@ -219,6 +219,11 @@ impl PackManifest {
             .iter()
             .find(|f| f.kind == FileKind::SubjectMatteModel)
     }
+
+    /// 全ファイルの byte 合計 (= 展開後サイズ概算)。manifest 由来なのでディスク走査不要。
+    pub fn total_bytes(&self) -> u64 {
+        self.files.iter().map(|f| f.bytes).sum()
+    }
 }
 
 /// `active.json` の中身。現在有効な pack version を 1 つだけ保持する。
