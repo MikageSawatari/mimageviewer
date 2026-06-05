@@ -3795,6 +3795,7 @@ name = "mimageviewer"
 version = "1.0.0"
 dependencies = [
  "base64",
+ "comic-core",
  "cpal",
  "crossbeam-channel",
  "delharc",

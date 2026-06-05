@@ -114,6 +114,10 @@ png = "0.18"
 ttf-parser = "0.25"
 flate2 = "1"
 local-adjust-core = { path = "crates/local-adjust-core" }
+# テキスト注釈 (吹き出し/テキスト/スタンプ/メッセージウィンドウ) の純ロジック。
+# egui 非依存。bake_overlay_with_stamps / scale_scene 等を本体から呼ぶ (統合計画
+# docs/comic-integration-plan.md §2)。Inc 0 で配線、実使用は Inc 1 以降。
+comic-core = { path = "crates/comic-core" }
 kamadak-exif = "0.6"
 rexif = "0.7"
 rayon = "1.10"
