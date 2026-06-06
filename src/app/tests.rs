@@ -5984,7 +5984,7 @@ mod pipeline_cache_refactor_tests {
             edit_key,
             EditResultEntry {
                 pixels: Arc::clone(&pixels),
-                texture: edit_tex,
+                texture: Some(edit_tex),
             },
         );
 
@@ -6620,7 +6620,7 @@ mod pipeline_cache_refactor_tests {
             edit_key,
             EditResultEntry {
                 pixels: Arc::clone(&raw_pixels),
-                texture: edit_texture,
+                texture: Some(edit_texture),
             },
         );
 

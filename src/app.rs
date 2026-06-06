@@ -1832,7 +1832,34 @@ pub(crate) struct EditResultKey {
 
 pub(crate) struct EditResultEntry {
     pub(crate) pixels: Arc<egui::ColorImage>,
-    pub(crate) texture: egui::TextureHandle,
+    /// 表示用テクスチャ。先読み (CPU 専用) では `None` で積み、実際に表示パイプラインへ
+    /// 入る時に lazy アップロードする (F2: AI/編集先読みで非表示ページの GPU upload を
+    /// UI スレッドで前倒ししない)。holdover 表示 (`current_edit_result_texture`) は
+    /// `None` のとき単にこのソースを使わない (best-effort)。
+    pub(crate) texture: Option<egui::TextureHandle>,
+}
+
+/// 編集結果ピクセルを表示用テクスチャへアップロードする (`EditResultKey` 由来の安定名)。
+/// `ensure_edit_result_pixels` の通常経路と lazy アップロード経路が共用する。
+fn upload_edit_result_texture(
+    ctx: &egui::Context,
+    key: &EditResultKey,
+    pixels: &Arc<egui::ColorImage>,
+) -> egui::TextureHandle {
+    let upload = clamp_for_gpu(pixels);
+    ctx.load_texture(
+        format!(
+            "edit_result_{}_{}_{}_{}_{}_{}",
+            key.idx,
+            key.source_gen,
+            key.erase_mask_gen,
+            key.local_gen,
+            key.conceal_mask_gen,
+            key.conceal_gen
+        ),
+        upload.into_owned(),
+        egui::TextureOptions::LINEAR,
+    )
 }
 
 /// edit_result に色調補正を掛けた後の AI 処理結果。
@@ -19118,9 +19145,10 @@ impl App {
     /// - 同時起動は 1 ジョブのみ (= 旧設計の `current_done &&
     ///   ai_upscale_pending.is_empty()` 条件を踏襲)。これで一括 spawn による
     ///   ai_runtime の競合 / VRAM 不足を防ぐ。
-    /// - 各 idx ごとに `ensure_edit_result_pixels` を呼ぶため、隣接ページの source
+    /// - 各 idx ごとに `ensure_edit_result_pixels_cpu` を呼ぶため、隣接ページの source
     ///   pixels が `fs_cache` に乗っていなければそのターゲットは skip される
-    ///   (= fs_prefetch の完了を毎フレ retry で待つ、コスト軽い)。
+    ///   (= fs_prefetch の完了を毎フレ retry で待つ、コスト軽い)。CPU 専用なので
+    ///   非表示ページの GPU テクスチャ upload は発生しない (F2、表示時に lazy upload)。
     /// - `maybe_start_final_ai` 内の "active pending check" は cancel 済を除外
     ///   しないため、ここで `has_uncancelled_final_ai_pending` を別途 gate する。
     pub(crate) fn prefetch_final_ai(&mut self, ctx: &egui::Context, current_idx: usize) {
@@ -19137,7 +19165,10 @@ impl App {
             if self.has_uncancelled_final_ai_pending() {
                 return;
             }
-            let Some((edit_key, edit_pixels)) = self.ensure_edit_result_pixels(ctx, idx) else {
+            // 先読みは CPU 専用 (GPU upload しない)。AI 入力は CPU ピクセルで足りるので、
+            // 非表示の近隣ページの表示テクスチャを UI スレッドで前倒し upload しない (F2)。
+            // 表示に入った時に ensure_edit_result_pixels が lazy アップロードする。
+            let Some((edit_key, edit_pixels)) = self.ensure_edit_result_pixels_cpu(ctx, idx) else {
                 continue;
             };
             let params = self.effective_params(idx).clone();
@@ -20699,7 +20730,45 @@ impl App {
         }
     }
 
+    /// 表示パイプライン用: 編集結果ピクセル + 表示テクスチャを確保する。先読みで
+    /// CPU 専用キャッシュ済み (`texture == None`) なら、ここで lazy に GPU アップロードする。
     pub(crate) fn ensure_edit_result_pixels(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<(EditResultKey, Arc<egui::ColorImage>)> {
+        let key = self.current_edit_result_key(idx);
+        if let Some(entry) = self.edit_result_cache.get(&key) {
+            if entry.texture.is_some() {
+                return Some((key, Arc::clone(&entry.pixels)));
+            }
+            // 先読みで CPU 専用に積まれていた → 表示に入るので今テクスチャを焼く。
+            let pixels = Arc::clone(&entry.pixels);
+            let texture = upload_edit_result_texture(ctx, &key, &pixels);
+            if let Some(e) = self.edit_result_cache.get_mut(&key) {
+                e.texture = Some(texture);
+            }
+            return Some((key, pixels));
+        }
+
+        let pixels = self.assemble_edit_result_pixels(ctx, idx)?;
+        let texture = upload_edit_result_texture(ctx, &key, &pixels);
+        self.edit_result_cache.insert(
+            key,
+            EditResultEntry {
+                pixels: Arc::clone(&pixels),
+                texture: Some(texture),
+            },
+        );
+        Some((key, pixels))
+    }
+
+    /// 先読み用: 編集結果ピクセルだけを確保する (GPU アップロードしない)。AI 先読みの
+    /// 入力は CPU ピクセルで足り、表示テクスチャは実際に表示する時まで不要なので、
+    /// 非表示の近隣ページのテクスチャ upload を UI スレッドで前倒ししない (F2)。
+    /// キャッシュには `texture == None` で積み、毎フレームの再計算も防ぐ。表示パイプラインに
+    /// 入った時に `ensure_edit_result_pixels` が lazy アップロードする。
+    pub(crate) fn ensure_edit_result_pixels_cpu(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
@@ -20708,7 +20777,25 @@ impl App {
         if let Some(entry) = self.edit_result_cache.get(&key) {
             return Some((key, Arc::clone(&entry.pixels)));
         }
+        let pixels = self.assemble_edit_result_pixels(ctx, idx)?;
+        self.edit_result_cache.insert(
+            key,
+            EditResultEntry {
+                pixels: Arc::clone(&pixels),
+                texture: None,
+            },
+        );
+        Some((key, pixels))
+    }
 
+    /// 編集結果ピクセルの組み立て (raw / 消しゴム → 局所補正 → 隠蔽)。テクスチャ
+    /// アップロードもキャッシュ挿入もしない純粋な合成。`ensure_edit_result_pixels` /
+    /// `ensure_edit_result_pixels_cpu` が共用する。
+    fn assemble_edit_result_pixels(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<Arc<egui::ColorImage>> {
         let mut pixels = if self.mask_pages.contains(&idx) {
             let _ = self.ensure_erase_result_texture(ctx, idx)?;
             self.current_erase_result_pixels(idx)?
@@ -20732,38 +20819,16 @@ impl App {
                 pixels = Arc::clone(&entry.pixels);
             }
         }
-
         // crop は表示パイプラインでは適用しない (暗転 overlay のみ)。実際の切り出しは
         // capture / export の最終段で `export_crop_rect_for_pixels` を使って行う。
-        let upload = clamp_for_gpu(&pixels);
-        let texture = ctx.load_texture(
-            format!(
-                "edit_result_{}_{}_{}_{}_{}_{}",
-                key.idx,
-                key.source_gen,
-                key.erase_mask_gen,
-                key.local_gen,
-                key.conceal_mask_gen,
-                key.conceal_gen
-            ),
-            upload.into_owned(),
-            egui::TextureOptions::LINEAR,
-        );
-        self.edit_result_cache.insert(
-            key,
-            EditResultEntry {
-                pixels: Arc::clone(&pixels),
-                texture,
-            },
-        );
-        Some((key, pixels))
+        Some(pixels)
     }
 
     pub(crate) fn current_edit_result_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
         self.edit_result_cache
             .iter()
             .find(|(key, _)| key.idx == idx)
-            .map(|(_, entry)| entry.texture.clone())
+            .and_then(|(_, entry)| entry.texture.clone())
     }
 
     fn final_ai_key_for_pixels(
