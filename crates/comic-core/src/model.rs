@@ -981,11 +981,21 @@ impl Default for MessageWindowObject {
 /// Where a stamp's pixels come from. comic-core treats this as opaque data; the
 /// lab/app resolves it into RGBA. `Emoji` is a key into a bundled emoji set
 /// (e.g. a hyphen-joined codepoint string like `"1f600"` / `"1f1ef-1f1f5"`);
-/// `File` is a user image path.
+/// `File` is a user image path; `Embedded` carries a downscaled copy of a user
+/// image baked into the annotation data itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StampSource {
     Emoji(String),
     File(std::path::PathBuf),
+    /// A user image downscaled and embedded directly into the annotation, so it
+    /// survives folder moves / another PC / source-file deletion (a path
+    /// reference would dangle). `data` is the app's opaque encoding (base64 PNG);
+    /// comic-core never decodes it — the app builds `StampImages` from it.
+    /// `name` is a short display label for the object list / properties.
+    Embedded {
+        name: String,
+        data: String,
+    },
 }
 
 impl Default for StampSource {

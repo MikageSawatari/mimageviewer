@@ -12,8 +12,9 @@
 //! ラボ版 (`tools/comic_lab/src/stamp.rs`) との違いは、アセットをディスクから読むのではなく
 //! exe へ同梱した SVG バイト列から解決する点と、最近使用の保存先を `data_dir` に置く点のみ。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use comic_core::{RgbaOverlay, StampSource};
 
 // build.rs が生成する `pub static EMOJI_SVGS: &[(&str, &[u8])]` (key → SVG バイト列)。
@@ -29,6 +30,12 @@ pub const EMOJI_RENDER_PX: u32 = 512;
 /// セッションメモリを圧迫する (Codex P3)。長辺がこれを超える場合は面積平均縮小して
 /// から保持する (canvas へはバイリニア拡縮するので実用上の画質劣化は軽微)。
 pub const FILE_STAMP_MAX_PX: usize = 2048;
+
+/// ユーザー画像スタンプを注釈データへ **埋め込む** ときの長辺上限 (px)。フォルダ移動 /
+/// 別 PC / 元ファイル削除でも欠落しないよう、選択時にこのサイズへ面積平均縮小して PNG +
+/// base64 で `StampSource::Embedded` に格納する。大きすぎると comic.db が肥大化するので
+/// 画質とサイズのバランスでこの値にする (canvas へはバイリニア拡縮)。
+pub const FILE_STAMP_EMBED_PX: usize = 1024;
 
 /// ピッカーのカテゴリ。`all()` の順 = タブ順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,7 +230,17 @@ pub fn stamp_source_key(source: &StampSource) -> String {
     match source {
         StampSource::Emoji(key) => format!("e:{key}"),
         StampSource::File(path) => format!("f:{}", path.display()),
+        StampSource::Embedded { data, .. } => format!("b:{}", embedded_data_key(data)),
     }
+}
+
+/// 埋め込みデータ (base64 PNG) の安定キャッシュキー。data 全体は長いので決定的ハッシュを使う
+/// (DefaultHasher::new() は固定キーなので実行間で安定)。長さも混ぜて衝突を減らす。
+fn embedded_data_key(data: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut h);
+    format!("{:016x}-{}", h.finish(), data.len())
 }
 
 /// スタンプソースの短い表示名 (オブジェクト一覧 / プロパティ)。
@@ -245,6 +262,13 @@ pub fn stamp_label(source: &StampSource) -> String {
             .and_then(|s| s.to_str())
             .unwrap_or("image")
             .to_string(),
+        StampSource::Embedded { name, .. } => {
+            if name.is_empty() {
+                "画像".to_string()
+            } else {
+                name.clone()
+            }
+        }
     }
 }
 
@@ -267,11 +291,48 @@ pub fn load_stamp_image(source: &StampSource) -> Option<RgbaOverlay> {
                 Some(img)
             }
         }
+        StampSource::Embedded { data, .. } => {
+            // 注釈に埋め込んだ base64 PNG をデコードする (fs アクセスなし = 持ち運び可)。
+            let png = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .ok()?;
+            decode_raster(&png)
+        }
         StampSource::Emoji(key) => {
             let bytes = emoji_svg_bytes(key)?;
             render_svg(bytes, EMOJI_RENDER_PX)
         }
     }
+}
+
+/// ユーザー画像ファイルを **埋め込みスタンプ** へ変換する。読み込み→デコード→長辺
+/// `FILE_STAMP_EMBED_PX` へ面積平均縮小→PNG エンコード→base64 で `StampSource::Embedded`
+/// を返す。これで注釈データが自己完結し、フォルダ移動 / 別 PC / 元ファイル削除でも
+/// スタンプが欠落しない (Codex 監査 P1)。読めない / デコード不可なら `None`。
+pub fn embed_file_stamp(path: &Path) -> Option<StampSource> {
+    let bytes = std::fs::read(path).ok()?;
+    let img = decode_raster(&bytes)?;
+    let scaled = if img.w.max(img.h) > FILE_STAMP_EMBED_PX {
+        downscale_overlay(&img, FILE_STAMP_EMBED_PX)
+    } else {
+        img
+    };
+    let png = encode_overlay_png(&scaled)?;
+    let data = base64::engine::general_purpose::STANDARD.encode(&png);
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("画像")
+        .to_string();
+    Some(StampSource::Embedded { name, data })
+}
+
+/// straight-alpha オーバーレイを PNG バイト列へエンコードする (埋め込み用)。
+fn encode_overlay_png(img: &RgbaOverlay) -> Option<Vec<u8>> {
+    let rgba = image::RgbaImage::from_raw(img.w as u32, img.h as u32, img.pixels.clone())?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    rgba.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
 }
 
 /// ラスタ画像 (PNG/JPG/WebP/GIF/BMP) を straight-alpha オーバーレイへデコードする。
@@ -402,7 +463,12 @@ pub fn save_recent_stamps(recent: &[StampSource]) {
 }
 
 /// `source` を MRU リストの先頭へ (重複除去)、長さを上限で切り詰める。
+/// 埋め込みスタンプ (base64 PNG) は 1 件で数百 KB〜MB になり MRU json を肥大化させるので
+/// 積まない (持ち運びは注釈データ側の埋め込みで担保済み。MRU は絵文字主体に保つ)。
 pub fn push_recent_stamp(recent: &mut Vec<StampSource>, source: &StampSource) {
+    if matches!(source, StampSource::Embedded { .. }) {
+        return;
+    }
     recent.retain(|s| s != source);
     recent.insert(0, source.clone());
     recent.truncate(RECENT_STAMP_CAP);
@@ -461,5 +527,53 @@ mod tests {
         let f = StampSource::File(PathBuf::from("/x/y/cat.png"));
         assert_eq!(stamp_source_key(&f), "f:/x/y/cat.png");
         assert_eq!(stamp_label(&f), "cat.png");
+        let b = StampSource::Embedded {
+            name: "dog.png".into(),
+            data: "AAAA".into(),
+        };
+        assert_eq!(stamp_label(&b), "dog.png");
+        assert!(stamp_source_key(&b).starts_with("b:"));
+    }
+
+    #[test]
+    fn embedded_stamp_png_roundtrip() {
+        // 32x16 のオーバーレイを PNG+base64 へ畳んで Embedded にし、load で復元できること。
+        let mut pixels = vec![0u8; 32 * 16 * 4];
+        for (i, p) in pixels.chunks_exact_mut(4).enumerate() {
+            p[0] = (i % 256) as u8;
+            p[1] = 10;
+            p[2] = 20;
+            p[3] = 255;
+        }
+        let src = RgbaOverlay {
+            w: 32,
+            h: 16,
+            pixels,
+        };
+        let png = encode_overlay_png(&src).expect("encode png");
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        let embedded = StampSource::Embedded {
+            name: "t.png".into(),
+            data,
+        };
+        let loaded = load_stamp_image(&embedded).expect("load embedded");
+        assert_eq!((loaded.w, loaded.h), (32, 16), "size preserved");
+        // PNG はロスレスなので画素も一致する。
+        assert_eq!(loaded.pixels, src.pixels, "pixels preserved (lossless PNG)");
+    }
+
+    #[test]
+    fn embedded_not_pushed_to_recent() {
+        let mut recent = Vec::new();
+        push_recent_stamp(
+            &mut recent,
+            &StampSource::Embedded {
+                name: "x".into(),
+                data: "AAAA".into(),
+            },
+        );
+        assert!(recent.is_empty(), "embedded stamps stay out of the MRU");
+        push_recent_stamp(&mut recent, &StampSource::Emoji("1f600".into()));
+        assert_eq!(recent.len(), 1, "emoji still goes to MRU");
     }
 }

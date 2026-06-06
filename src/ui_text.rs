@@ -3043,7 +3043,9 @@ impl App {
                 .add_filter("画像", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
                 .pick_file()
             {
-                chosen = Some(comic_core::StampSource::File(path));
+                // パス参照ではなく画像を縮小して注釈に埋め込む (フォルダ移動 / 別 PC /
+                // 元削除でも欠落しない。Codex 監査 P1)。デコード不可なら追加しない。
+                chosen = crate::comic_stamp::embed_file_stamp(&path);
             }
         }
 
