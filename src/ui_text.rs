@@ -1659,6 +1659,12 @@ impl App {
             });
         // しっぽ stash を書き戻す (closure で更新された分を App 状態へ反映)。
         self.comic_tail_stash = tail_stash;
+        // 一覧パネルの削除など (object_list_actions_ui は stash を知らない) で消えた
+        // オブジェクトの stash を毎フレーム prune する。next_id = max+1 なので、消した
+        // 最大 id を放置すると新規オブジェクトが同 id を再利用して別物のしっぽを復元して
+        // しまう (Codex P2)。`objects` は書き戻し前の最新状態。
+        self.comic_tail_stash
+            .retain(|id, _| objects.iter().any(|o| o.id == *id));
 
         // 追加ボタンはダイアログを開く (実際の追加はダイアログ側)。
         if open_bubble_dialog {
@@ -3832,6 +3838,7 @@ fn system_text_presets(font: &str) -> Vec<TextStylePreset> {
         outline,
         auto_tcy: true,
         markup_enabled: true,
+        markup_rules: comic_core::default_markup_rules(),
         bold: false,
         italic: false,
     };
@@ -5272,6 +5279,14 @@ fn bubble_tail_ui(
     }
     if !tail_supported {
         resp.on_disabled_hover_text("この形状はしっぽに対応していません");
+        // 非対応形状に stale な b.tail が残っていても種別/幅は編集させない (見えない
+        // しっぽ状態を触らせない。Codex P3)。対応形状に切り替えれば下の編集が出る。
+        ui.label(
+            egui::RichText::new("この形状はしっぽに対応していません")
+                .small()
+                .color(egui::Color32::from_gray(160)),
+        );
+        return;
     }
     if let Some(t) = &mut b.tail {
         ui.horizontal(|ui| {

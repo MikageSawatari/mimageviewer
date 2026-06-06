@@ -14,9 +14,9 @@
 //! 依存するため `ui_text.rs` 側に置く。本モジュールはデータ構造と永続化のみ。
 
 use comic_core::{
-    BubbleObject, BubbleShape, FillMode, FrameStyle, IndicatorKind, Insets, MessageWindowObject,
-    NamePlate, Orientation, PortraitSlot, Rgba, ShadowStyle, SizeMode, StrokeStyle, TailKind,
-    TextAlign, TextBlock, VAnchor, WindowPosition,
+    BubbleObject, BubbleShape, FillMode, FrameStyle, IndicatorKind, Insets, MarkupRule,
+    MessageWindowObject, NamePlate, Orientation, PortraitSlot, Rgba, ShadowStyle, SizeMode,
+    StrokeStyle, TailKind, TextAlign, TextBlock, VAnchor, WindowPosition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +35,10 @@ pub struct TextStylePreset {
     pub outline: Option<StrokeStyle>,
     pub auto_tcy: bool,
     pub markup_enabled: bool,
+    /// 記法の記号セット (縦中横 / 横倒し のペア)。`markup_enabled` と対なので一緒に
+    /// 取り込む / 適用する。旧 presets.json 互換のため default 付き。
+    #[serde(default = "comic_core::default_markup_rules")]
+    pub markup_rules: Vec<MarkupRule>,
     #[serde(default)]
     pub bold: bool,
     #[serde(default)]
@@ -54,6 +58,7 @@ impl TextStylePreset {
         tb.outline = self.outline;
         tb.auto_tcy = self.auto_tcy;
         tb.markup_enabled = self.markup_enabled;
+        tb.markup_rules = self.markup_rules.clone();
         tb.bold = self.bold;
         tb.italic = self.italic;
         tb.preset_link = Some(self.id.clone());
@@ -74,6 +79,7 @@ impl TextStylePreset {
             outline: tb.outline,
             auto_tcy: tb.auto_tcy,
             markup_enabled: tb.markup_enabled,
+            markup_rules: tb.markup_rules.clone(),
             bold: tb.bold,
             italic: tb.italic,
         }
@@ -342,6 +348,7 @@ mod tests {
             }),
             auto_tcy: false,
             markup_enabled: true,
+            markup_rules: comic_core::markup_rules_angle(),
             bold: true,
             italic: false,
         };
@@ -355,6 +362,11 @@ mod tests {
         assert_eq!(tb.size_px, 72.0);
         assert_eq!(tb.align, TextAlign::End);
         assert!(tb.bold, "bold もプリセットから復元される");
+        assert_eq!(
+            tb.markup_rules,
+            comic_core::markup_rules_angle(),
+            "記号セットもプリセットから復元される"
+        );
         assert_eq!(tb.preset_link.as_deref(), Some("user:t1"));
     }
 
@@ -393,6 +405,7 @@ mod tests {
                 outline: None,
                 auto_tcy: false,
                 markup_enabled: false,
+                markup_rules: comic_core::default_markup_rules(),
                 bold: false,
                 italic: false,
             },
@@ -409,6 +422,7 @@ mod tests {
                 outline: None,
                 auto_tcy: false,
                 markup_enabled: false,
+                markup_rules: comic_core::default_markup_rules(),
                 bold: false,
                 italic: false,
             },
