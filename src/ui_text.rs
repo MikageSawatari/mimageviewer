@@ -1327,11 +1327,19 @@ impl App {
         self.draw_text_selection(ui, image_rect, zoom_pan);
         self.draw_text_panel(ctx, image_rect);
         // 追加ダイアログ (パネルが comic_docs を書き戻した後に描く)。
+        // これらは暗フレーム (Frame::window().fill(dark)) を強制するが、egui::Window の
+        // タイトルバー文字と × ボタンはビューポート ctx の visuals で描かれる。フルスクリーン
+        // ビューポートは OS テーマ連動でライトになる場合があり、その時タイトル/× が暗色になって
+        // 暗フレーム上で読めない (実機 FB 2026-06-06)。ダイアログ描画の間だけ ctx visuals を
+        // ダークへ上書きし、描画後に元へ戻す (他の fullscreen UI に影響させない)。
+        let prev_visuals = ctx.style().visuals.clone();
+        ctx.set_visuals(egui::Visuals::dark());
         self.draw_text_add_bubble_dialog(ctx);
         self.draw_text_add_window_dialog(ctx);
         self.draw_text_add_stamp_dialog(ctx);
         self.draw_text_add_onomatopoeia_dialog(ctx);
         self.draw_text_font_dialog(ctx);
+        ctx.set_visuals(prev_visuals);
         // フレーム末: 編集が settle (drag 終了 + フィールド非フォーカス) したら
         // coalesce した undo エントリを 1 つ commit する (Inc 6、ラボの frame-end
         // `commit_pending` 相当)。パネル / キャンバス / ダイアログの全編集が反映済みの

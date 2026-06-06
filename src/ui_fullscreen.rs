@@ -1819,6 +1819,24 @@ impl App {
                 if !embedded {
                     self.update_ime_state(ctx);
                 }
+                // IME 変換確定の Enter が multiline 本文欄 (セリフ) に改行として入るのを防ぐ
+                // (egui の既知挙動。実機 FB 2026-06-06)。変換確定自体は Ime::Commit が行うので、
+                // IME がアクティブ (変換中 or 直近 300ms に Ime イベント = Windows の別フレーム
+                // 配信吸収) の間は raw な Key::Enter を除去する。非変換時の Enter は通るので
+                // 意図的な改行は可能。テキスト注釈モードの本文編集中のみに限定する。
+                if self.text_mode && self.ime_input_active() {
+                    ctx.input_mut(|i| {
+                        i.events.retain(|e| {
+                            !matches!(
+                                e,
+                                egui::Event::Key {
+                                    key: egui::Key::Enter,
+                                    ..
+                                }
+                            )
+                        });
+                    });
+                }
                 if need_show && !embedded {
                     // embedded のときは専用 viewport を作らないので Visible/Focus は
                     // 送らない (main ウィンドウは既に表示・フォーカス済み)。
