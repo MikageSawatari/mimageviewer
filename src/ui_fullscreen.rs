@@ -4208,6 +4208,19 @@ impl App {
         } else if esc {
             action.close = true;
         }
+        // 自動オープン ZIP/PDF をフルスクリーンで開いている場合の BS = コンテナのページ一覧
+        // (L2) へ戻る。フルスクリーンは別ビューポートで grid 側の BS ハンドラ (親フォルダ移動)
+        // は抑止されるため、ここで plain BS を処理する。fs_zip_auto_opened を先に解除してから
+        // close すると、handle_fullscreen_close_request が (flag=false なので) 親復帰ではなく素の
+        // close_fullscreen を呼び、current_folder=ZIP/PDF のままページ一覧 (L2) が出る。
+        // Esc/Enter (flag 立ったまま) が L1 親へ戻るのと対をなす。Ctrl+BS (個別補正解除) は
+        // Modifiers::NONE 限定なので影響しない。
+        if self.fs_zip_auto_opened
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace))
+        {
+            self.fs_zip_auto_opened = false;
+            action.close = true;
+        }
         // 見開きダブル表示中は I/Z/R/L を無効化
         if key_i && !is_spread_double {
             self.show_metadata_panel = !self.show_metadata_panel;

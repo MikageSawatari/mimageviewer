@@ -70,7 +70,7 @@ impl App {
             ui.radio_value(
                 &mut self.settings.auto_fullscreen_zip_pdf,
                 true,
-                "開いたとき、1 ページ目を表示",
+                "開いたとき、ページをフルスクリーン表示",
             );
 
             ui.add_space(14.0);

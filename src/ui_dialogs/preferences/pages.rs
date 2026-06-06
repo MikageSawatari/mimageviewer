@@ -80,11 +80,12 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.radio_value(
         &mut state.settings.auto_fullscreen_zip_pdf,
         true,
-        "開いたとき、1 ページ目を表示",
+        "開いたとき、ページをフルスクリーン表示",
     );
     ui.label(
         egui::RichText::new(
-            "1 ページ目を表示する場合、フルスクリーン中の Enter / Esc で元の一覧へ戻り、\
+            "ページをフルスクリーン表示する場合、開く位置 (1 ページ目 / 続きから) は\
+             「位置の復元」設定に従います。フルスクリーン中の Enter / Esc で元の一覧へ戻り、\
              Backspace でそのファイルのページ一覧を表示します。",
         )
         .weak(),
