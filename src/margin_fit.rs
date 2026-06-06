@@ -39,8 +39,12 @@ const DETECT_LONG_SIDE: usize = 1000;
 const BORDER_MARGIN_FRAC: f32 = 0.80;
 
 /// 連結成分の面積 (縮小後 px) がこれ未満なら孤立した点/ゴミとみなして捨てる。
-/// 本文や線 (縦横どちらも) はこれを超えるので残る。
-const MIN_COMPONENT_AREA: usize = 12;
+/// 本文や線 (縦横どちらも) はこれを超えるので残る。**ページ番号(ノンブル)などの数字は
+/// この値以上の面積があるので残り、スキャンの糊汚れ・端のゴミ(より小さい孤立点)は捨てる**
+/// ように調整した値。ゴミが残って余白が詰まらない場合はこれを上げ、ページ番号や小さな中身が
+/// 消える場合は下げる (実機で調整して設定昇格する想定の固定値)。
+/// なお枠外へ伸びる線などは本文と連結しているのでこの値に関係なく残る。
+const MIN_COMPONENT_AREA: usize = 28;
 
 /// 検出 bbox を外側へ広げるセーフティパッド (各辺、正規化比)。端の線が切れないように。
 const SAFETY_PAD_FRAC: f32 = 0.006;
@@ -270,6 +274,29 @@ mod tests {
         // 点 (x,y≈2..5) は無視され、左/上はブロック (20/64≒0.31) 付近まで詰む。
         assert!(b.min.x > 0.20, "孤立点を無視して左を詰める: {}", b.min.x);
         assert!(b.min.y > 0.20, "孤立点を無視して上を詰める: {}", b.min.y);
+    }
+
+    #[test]
+    fn tiny_dirt_dropped_but_pagenumber_sized_kept() {
+        // 本体 + 隅の小さなゴミ (面積 9 < MIN) + 下のページ番号サイズの孤立マーク (面積 36 >= MIN)。
+        // ゴミは捨てられ、ページ番号サイズは残る (= ゴミは bbox を引っ張らないが番号は残る)。
+        let mut img = white(80, 80);
+        fill(&mut img, 30, 20, 60, 60, Color32::BLACK); // 本体 30x40
+        fill(&mut img, 4, 72, 7, 75, Color32::BLACK); // 3x3=9px の隅ゴミ → drop
+        fill(&mut img, 12, 72, 18, 78, Color32::BLACK); // 6x6=36px のページ番号相当 → keep
+        let b = detect_content_bbox(&img, DEFAULT_TOLERANCE).expect("検出");
+        // 隅ゴミ (x≈4/80=0.05) は無視され、左はページ番号 (x=12/80=0.15) で決まる。
+        assert!(
+            b.min.x > 0.10,
+            "隅ゴミは bbox を引っ張らない (左がゴミ位置 0.05 ではない): {}",
+            b.min.x
+        );
+        // ページ番号サイズは残るので下端まで含む。
+        assert!(
+            b.max.y > 0.9,
+            "ページ番号サイズの孤立マークは残る: {}",
+            b.max.y
+        );
     }
 
     #[test]
