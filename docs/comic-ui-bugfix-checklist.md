@@ -94,12 +94,12 @@
   フォルダロード/rehydrate 時に構築、draw_cell に has_comic を渡してピンク系「文」バッジ描画。
   save_comic_objects で idx 単位に即時メンテ、remove_items_batch shift / clear_page_edit_state も対応。
 
-### 💬 C5. 強縮小書き出しでテキストが甘い (規模・要判断) [Codex P1 / 設計 D10]
-- 設計 D10 は「ダウンサンプル後に最終解像度で焼く」、実装は「ダウンサンプル前 (base 解像度) で
-  焼く」(app.rs の comic_composited_pixels_for_export + worker scale_export_pixels)。
-- 対応 = comic を base に焼かず、worker で crop→縮小**後**に最終解像度で焼くよう書き出し経路を
-  再構成。**crop/scale/comic 座標の整合**が絡む中〜大の変更 (D10 コメントも「将来課題」と明記)。
-  座標バグのリスクがあるため、実機検証後にフレッシュな文脈で着手するのが安全。
+### ✗ C5. 強縮小書き出しでテキストが甘い — **実装しない判断** (2026-06-07) [Codex P1 / 設計 D10]
+- 設計 D10 は「ダウンサンプル後に最終解像度で焼く」、実装は「ダウンサンプル前 (base 解像度) で焼く」。
+- 正しく直すには comic を base に焼かず worker で crop→縮小**後**に焼く再構成が要り、source→base
+  (AI 倍率) →crop オフセット→最終縮小 と座標が多段で掛かる (scale_scene は scale のみで translate
+  不可)。**座標ズレの視覚バグが crop×強縮小×注釈の隅でしか出ず気づきにくい**。
+- **ユーザー判断: 最終出力の縮小は重視機能でなく、複雑さ/リスクに見合わないため実装しない。**
 
 ### ✅ B8. フォントのフォールバック (`f03f5f6e`) [Codex P2]
 - ユーザー判断: 吹き出し/メッセージウィンドウの規定は Yu Gothic のまま (Windows 常在で安定、
@@ -118,18 +118,25 @@
   upload する (layer cache 由来の既存挙動)。edit_result の universal upload は解消済み。完全 CPU 化
   には conceal/erase/local の CPU 専用版分離が要る (別途・中規模)。
 
-### 💬 残: AI Display 優先が実行中 prefetch を preempt しない [他セッションP1/P2]
-- queue は Display 優先だが、worker は 1 件を完了まで実行し、別 idx の prefetch を cancel しない。
-  重い prefetch 推論中にページ移動すると表示ページの AI が待たされる。対応 = Display enqueue 時に
-  running/queued prefetch へ cancel、または tile 間 cooperative preemption。AI スケジューラ領域・中〜大。
+### ✗ (c) AI Display preempt — **実装しない判断** (2026-06-07) [他セッションP1/P2]
+- queue は Display 優先だが worker は 1 件を完了まで実行。重い prefetch 推論中にページ移動すると
+  表示ページの AI が待たされる。
+- ただし: ①遅延は**高々 1 件**(prefetch は has_uncancelled_final_ai_pending で同時 1 ジョブに gate)、
+  ②AI 計算中も**フル解像度の非 AI 画像が即表示**され (ensure_final_composite_texture が AI pending
+  時は adjusted を complete=false で表示、結果到着で差し替え)、サムネ/空白待ちにはならない。
+- F2 で UI スレッドの詰まりは解消済み。残るワーカー側の 1 ジョブ遅延は「フル画像は出ていて AI
+  シャープ化が一拍遅れる」だけで非ジャーリング。**preempt/cancel は並行整合バグのリスクが高く、
+  得られる体感改善が小さいため実装しない** (重いフォルダで一拍重いのは許容)。
 
 ### ℹ️ C7. UI スレッド同期 I/O (font 列挙/読込・stamp file read) [Codex P2]
 - 通常閲覧では回避設計だが、注釈付き画像/大スタンプで一瞬固まりうる。worker 化は要検討 (低優先)。
 
-### ℹ️ B4/C9. 結合の z 隣接条件 (仕様) [Codex P2]
-- ユーザー再テストで「重ねて前面に設定」すれば結合 OK と確認。多数オブジェクト時に効かないのは
-  「z 順で直下が mergeable な吹き出し」でないと結合しない仕様のため。改善 (最近接 mergeable
-  まで探索) は要検討。
+### ✅ C6 / B4. 結合の z 隣接条件 — **文言で対応** (`c5781288`) [Codex P2]
+- 結合は z 順で「すぐ下 (直下)」の吹き出しとのみ融合する仕様。間に別オブジェクトが挟まる吹き出し
+  まで飛ばすと z 重なり順が壊れる (comic-core merge グルーピングは連続 z のみ 1 ユニット化) ため、
+  直下のみは**意図的**。z 探索拡張は z 順バグリスクのため見送り。
+- **ユーザー判断: ロジックは変えず、ラベルを「下の吹き出しと結合」→「すぐ下の吹き出しと結合」に
+  して直下条件を伝える文言対応とする。** コメントにも直下のみが意図的である旨を明記。
 
 ## 進め方
 - P0 → P1 → P2 の順。各修正は pathspec commit（src/ui_text.rs 等）、退避ブランチ `comic-inc6` 維持。
