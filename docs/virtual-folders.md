@@ -78,6 +78,28 @@ PDF は **非同期**で開く:
 PDF ワーカーは別プロセス (`mimageviewer.exe --pdf-worker`)。プロセス間通信は
 stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 
+### 2.3 自動 1 ページ目フルスクリーン (`auto_fullscreen_zip_pdf`)
+
+環境設定 ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開くと、ページ一覧
+(L2) を経由せず 1 ページ目を直接フルスクリーン (L3) で開く**。MangaMeeya 風の
+「本棚 → 本を開く → 読む → 閉じて本棚」フロー。
+
+- グリッド側の open (`ui_main` ダブルクリック / `handle_keyboard` Enter) で
+  `pending_auto_fs_open` を立てる (ZipFile/PdfFile のみ。Folder は対象外)。
+- `load_zip_as_folder` / `load_pdf_as_folder` がこれを `mem::take` し、enumerate 完了で
+  先頭画像を開く既存の遅延機構 `fs_nav_after_pdf_enumerate`
+  (`DeferredFsReopen { auto_opened_container: true }`) に載せ替える。Ctrl+↑↓ フォルダ
+  ナビと同じ consume 経路 (`finalize_zip_enumerate` / `poll_pdf_enumerate`) で
+  `find_fullscreen_nav_target_filtered` が先頭ページを開く。
+- 開いた時点で `fs_zip_auto_opened = true`。これにより**入口と対称な出口**にする:
+  - <kbd>Esc</kbd> / <kbd>Enter</kbd> → 親フォルダ一覧 (L1) へ直帰
+    (`handle_fullscreen_close_request` が `pending_return_to_parent` を立て、次フレームの
+    `handle_keyboard` が `AddressBarNav::Direct(parent)` を発行。L2 を 1 フレームも見せない)。
+  - <kbd>Backspace</kbd> → そのコンテナのページ一覧 (L2) を表示 (= `close_fullscreen` のみ)。
+- `close_fullscreen` で `fs_zip_auto_opened` をクリア。Ctrl+↑↓ で別フォルダへ移ると
+  `auto_opened_container: false` の deferred で上書きされ、自動オープン状態は解除される
+  (= 連続読書で次の本へ移ったら通常の出口に戻る。v1 の割り切り)。
+
 ---
 
 ## 3. 分岐ポイント (修正漏れ要注意)

@@ -811,6 +811,12 @@ pub struct Settings {
     #[serde(default)]
     pub default_spread_mode: SpreadMode,
 
+    /// ZIP/PDF を一覧から開いたとき、ページ一覧を経由せず 1 ページ目を即フルスクリーンで
+    /// 開く。ON のときフルスクリーン中の Esc/Enter は親フォルダ (一覧) へ戻り、
+    /// Backspace でコンテナのページ一覧を表示する。既定 OFF (従来どおりページ一覧を表示)。
+    #[serde(default)]
+    pub auto_fullscreen_zip_pdf: bool,
+
     // ── UI テーマ (v0.7.0) ──────────────────────────────────────
     /// 背景色テーマ (System / Light / Dark)。デフォルト `System` で Windows のアプリ用色に追従。
     #[serde(default)]
@@ -1711,6 +1717,7 @@ impl Default for Settings {
             capture_output_dir: None,
             capture_format: crate::capture::CaptureFormat::default(),
             default_spread_mode: SpreadMode::default(),
+            auto_fullscreen_zip_pdf: false,
             ui_theme: UiTheme::default(),
             tags: Vec::new(),
             show_toolbar_favorites: true,

@@ -3746,6 +3746,53 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// 自動オープン ZIP/PDF からのフルスクリーン close 要求は、その場で閉じず
+    /// 「親フォルダへ戻る」予約を立てる (= L2 ページ一覧を見せずに L1 へ抜けるため)。
+    #[test]
+    fn auto_opened_close_request_defers_to_parent() {
+        let mut app = setup_app();
+        app.fullscreen_idx = Some(0);
+        app.fs_zip_auto_opened = true;
+        app.pending_return_to_parent = false;
+
+        app.handle_fullscreen_close_request();
+
+        assert!(app.pending_return_to_parent, "親へ戻る予約が立つ");
+        assert!(!app.fs_zip_auto_opened, "フラグは消費される");
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "その場では close しない (L2 を 1 フレームも見せないため)"
+        );
+    }
+
+    /// 通常 (自動オープンでない) のフルスクリーン close 要求は即座に閉じる。
+    #[test]
+    fn normal_close_request_closes_immediately() {
+        let mut app = setup_app();
+        app.fullscreen_idx = Some(0);
+        app.fs_zip_auto_opened = false;
+        app.pending_return_to_parent = false;
+
+        app.handle_fullscreen_close_request();
+
+        assert!(!app.pending_return_to_parent, "親復帰予約は立たない");
+        assert_eq!(app.fullscreen_idx, None, "通常はその場で close");
+    }
+
+    /// `close_fullscreen` は自動オープンフラグをクリアする。
+    #[test]
+    fn close_fullscreen_clears_auto_opened_flag() {
+        let mut app = setup_app();
+        app.fullscreen_idx = Some(0);
+        app.fs_zip_auto_opened = true;
+
+        app.close_fullscreen();
+
+        assert!(!app.fs_zip_auto_opened);
+        assert_eq!(app.fullscreen_idx, None);
+    }
+
     /// 見開きから隠蔽加工に入ったあと `reset_conceal_mode` で元の見開き状態に戻ること。
     #[test]
     fn reset_conceal_mode_restores_saved_spread_state() {
@@ -4964,6 +5011,7 @@ mod favorite_adjustment_defaults_tests {
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
             resume_slideshow: false,
             target: None,
+            auto_opened_container: false,
         });
 
         app.poll_fs_nav_lock();

@@ -78,6 +78,11 @@ pub(crate) struct DeferredFsReopen {
     /// `Some` なら列挙完了時にこの target を `items` から解決して開く。マッチしなければ
     /// `find_fullscreen_nav_target_filtered` に fallback。フォルダナビ経路では常に `None`。
     pub target: Option<crate::snapshot::SnapshotTarget>,
+    /// 「ZIP/PDF の自動 1 ページ目フルスクリーン」(環境設定 ON で grid からコンテナを
+    /// 開いた) 由来か。true のとき列挙完了で fullscreen を開いたら `fs_zip_auto_opened`
+    /// を立て、Esc/Enter を「親フォルダ (一覧) へ戻る」/ Backspace を「ページ一覧へ」に切替える。
+    /// フォルダナビ (Ctrl+↑↓) / ★固定ナビ由来は false。
+    pub auto_opened_container: bool,
 }
 
 /// DFS スレッドから UI スレッドに送るメッセージ。結果 (Option) と、
@@ -3482,6 +3487,21 @@ pub struct App {
     /// するため) ので、単一フィールドで両方を賄える。
     pub(crate) fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
 
+    /// 「ZIP/PDF を grid から開いた瞬間に 1 ページ目をフルスクリーンで開く」(環境設定
+    /// `auto_fullscreen_zip_pdf`) の one-shot 予約。grid の Enter / ダブルクリックで
+    /// ZipFile / PdfFile を開くときに立て、`load_zip_as_folder` / `load_pdf_as_folder` が
+    /// `mem::take` して `fs_nav_after_pdf_enumerate`(auto_opened_container=true)へ変換する。
+    pub(crate) pending_auto_fs_open: bool,
+    /// 現在のフルスクリーンが「ZIP/PDF 自動 1 ページ目オープン」で入ったか。true のとき
+    /// Esc/Enter は親フォルダ (一覧) へ戻り、Backspace はコンテナのページ一覧へ戻る
+    /// (= 入口と出口を対称化)。`close_fullscreen` でクリア。
+    pub(crate) fs_zip_auto_opened: bool,
+    /// 自動オープン ZIP/PDF からの Esc/Enter で「親フォルダ (一覧) へ戻る」要求。
+    /// フルスクリーン handler が立て、次フレーム冒頭の `handle_keyboard` が
+    /// `AddressBarNav::Direct(parent)` として通常のナビ経路へ流す (= L2 ページ一覧を
+    /// 1 フレームも表示せずに L1 へ抜けるため、その場では close せず予約だけ立てる)。
+    pub(crate) pending_return_to_parent: bool,
+
     /// PDF メタキャッシュ (v1.0.0) ヒット時、placeholder grid を立てた page_count を覚えておく。
     ///
     /// `load_pdf_as_folder` で `catalog::pdf_meta` の hit があれば、即座に N セルの
@@ -5049,6 +5069,9 @@ impl App {
             pdf_enumerate_pending: None,
             zip_enumerate_pending: None,
             fs_nav_after_pdf_enumerate: None,
+            pending_auto_fs_open: false,
+            fs_zip_auto_opened: false,
+            pending_return_to_parent: false,
             pdf_placeholder_count: None,
             cached_handlers: None,
             cached_nav_indices: None,
@@ -7979,6 +8002,15 @@ impl App {
         self.zip_enumerate_pending = None;
         self.pdf_enumerate_pending = None;
         self.fs_nav_after_pdf_enumerate = None;
+        // 自動 1 ページ目フルスクリーン (環境設定 ON で grid から ZIP を開いた) の予約を、
+        // enumerate 完了で先頭ページを開く既存 deferred 機構へ載せ替える。
+        if std::mem::take(&mut self.pending_auto_fs_open) {
+            self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                resume_slideshow: false,
+                target: None,
+                auto_opened_container: true,
+            });
+        }
 
         // 旧サムネイルワーカーを即キャンセル (pending 完了後に start_loading_items でも
         // 再度 cancel されるが、先に止めておくことで worker キューの渋滞を防ぐ)。
@@ -8187,6 +8219,8 @@ impl App {
                 .or_else(|| self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow));
             if let Some(new_idx) = new_idx {
                 self.open_fullscreen(new_idx);
+                // 自動オープン由来なら退出ルーティングを「Esc/Enter→親 / BS→ページ一覧」へ。
+                self.fs_zip_auto_opened = deferred.auto_opened_container;
                 self.selected = Some(new_idx);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
@@ -8224,6 +8258,16 @@ impl App {
         self.zip_enumerate_pending = None;
         // 直前の cache-hit の placeholder 情報はクリア (= 新規 nav の出発点)。
         self.pdf_placeholder_count = None;
+        // 自動 1 ページ目フルスクリーン (環境設定 ON で grid から PDF を開いた) の予約を、
+        // enumerate 完了で先頭ページを開く既存 deferred 機構へ載せ替える。folder-nav は
+        // pending_auto_fs_open=false なのでここでは触らない (reopen が後段で set する)。
+        if std::mem::take(&mut self.pending_auto_fs_open) {
+            self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                resume_slideshow: false,
+                target: None,
+                auto_opened_container: true,
+            });
+        }
 
         // ── パスワード確認 ──
         // **`saved_password`** = この PDF 固有の保存パスワード (`pdf_passwords` 経由)。
@@ -8628,6 +8672,8 @@ impl App {
                         });
                     if let Some(new_idx) = new_idx {
                         self.open_fullscreen(new_idx);
+                        // 自動オープン由来なら退出ルーティングを「Esc/Enter→親 / BS→ページ一覧」へ。
+                        self.fs_zip_auto_opened = deferred.auto_opened_container;
                         self.selected = Some(new_idx);
                         self.scroll_to_selected = true;
                         self.update_last_selected_image();
@@ -13195,6 +13241,24 @@ impl App {
             crate::take_pending_mouse_nav()
         };
 
+        // 自動オープン ZIP/PDF からの Esc/Enter で立った「親フォルダ (一覧) へ戻る」予約を
+        // 最優先で処理する。フルスクリーン handler が前フレームに立てたもので、ここで通常の
+        // ナビ経路 (load → 内部で close_fullscreen) へ流すことで L2 ページ一覧を見せずに
+        // L1 へ抜ける。フォーカス/ダイアログ判定より前に出す (確実に消化するため)。
+        if std::mem::take(&mut self.pending_return_to_parent) {
+            if let Some(cur) = self.current_folder.clone() {
+                if let Some(parent) = cur.parent() {
+                    self.select_after_load = cur
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string());
+                    return Some(crate::ui_main::AddressBarNav::Direct(parent.to_path_buf()));
+                }
+            }
+            // 親が取れない (ドライブ root 等): 予約は消化済みなので通常 close にフォールバック。
+            self.close_fullscreen();
+        }
+
         // ウィンドウにフォーカスがない場合はキー入力を無視
         let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if !has_focus {
@@ -13543,6 +13607,16 @@ impl App {
                         Some(GridItem::Folder(p))
                         | Some(GridItem::ZipFile(p))
                         | Some(GridItem::PdfFile(p)) => {
+                            // 環境設定 ON のとき ZIP/PDF (フォルダは対象外) は 1 ページ目を
+                            // 即フルスクリーンで開く。
+                            if self.settings.auto_fullscreen_zip_pdf
+                                && matches!(
+                                    self.items.get(idx),
+                                    Some(GridItem::ZipFile(_)) | Some(GridItem::PdfFile(_))
+                                )
+                            {
+                                self.pending_auto_fs_open = true;
+                            }
                             let p = p.clone();
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
                             return Some(crate::ui_main::AddressBarNav::Direct(p));
@@ -13602,6 +13676,13 @@ impl App {
         // BS: 親フォルダへ (検索中はスタックを戻る)
         // Ctrl+BS は個別補正の解除に使うので除外する
         if (backspace && !ctrl_held) || alt_up {
+            // 自動オープン ZIP/PDF をフルスクリーンで読んでいる場合、BS は親フォルダではなく
+            // コンテナのページ一覧 (L2) を表示する (= フルスクリーンを閉じるだけ。current_folder
+            // は ZIP/PDF のままなのでページ一覧が出る)。Esc/Enter が L1 (親) へ戻るのと対をなす。
+            if self.fullscreen_idx.is_some() && self.fs_zip_auto_opened {
+                self.close_fullscreen();
+                return None;
+            }
             // Fix-B (ユーザー指摘): ★固定 中の BS は snapshot list view (= snapshot.items を
             // render する状態) に戻る。snapshot 内 child folder に居る場合のみ動作し、既に
             // snapshot root 表示中なら通常の親フォルダ移動を試みる (= load_folder guard で
@@ -14023,6 +14104,7 @@ impl App {
         let deferred = DeferredFsReopen {
             resume_slideshow,
             target: None,
+            auto_opened_container: false,
         };
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
             self.fs_nav_after_pdf_enumerate = Some(deferred);
@@ -17692,6 +17774,23 @@ impl App {
             .collect()
     }
 
+    /// フルスクリーンの「閉じる」要求 (Esc / Enter / ビューポート close) の共通処理。
+    ///
+    /// 通常はそのまま `close_fullscreen`。ただし「ZIP/PDF 自動 1 ページ目オープン」
+    /// (`fs_zip_auto_opened`) で入っていた場合は、ページ一覧 (L2) を経由せず親フォルダ
+    /// (L1, 一覧) へ戻る。入口で L2 をスキップしたので出口でも対称にスキップする。
+    /// 親へ戻る経路は L2 を 1 フレームも見せないため、その場では close せず
+    /// `pending_return_to_parent` を立てるだけにし、次フレーム冒頭の `handle_keyboard` が
+    /// 通常のナビ (load → 内部で close_fullscreen) を発行する。
+    pub(crate) fn handle_fullscreen_close_request(&mut self) {
+        if self.fs_zip_auto_opened {
+            self.fs_zip_auto_opened = false;
+            self.pending_return_to_parent = true;
+            return;
+        }
+        self.close_fullscreen();
+    }
+
     /// フルスクリーン表示を終了し、先読みキャッシュを全クリアする。
     ///
     /// `fs_viewport_shown` は意図的に残す: 次フレームの
@@ -17838,6 +17937,8 @@ impl App {
             }
         }
         self.fullscreen_idx = None;
+        // 自動オープン由来の退出ルーティングフラグはフルスクリーンを抜けたら必ずクリア。
+        self.fs_zip_auto_opened = false;
         self.metadata_panel_hover_active = false;
         // Ctrl+E ダイアログ / 進捗モーダルはフルスクリーン文脈に紐付くので、
         // close_fullscreen と同時に閉じる (Codex review CONFIRMED)。

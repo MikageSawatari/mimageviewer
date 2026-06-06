@@ -2143,6 +2143,22 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 ui.selectable_value(&mut s.default_spread_mode, mode, mode.label());
             }
         });
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.checkbox(
+        &mut s.auto_fullscreen_zip_pdf,
+        "ZIP/PDF を開いたら 1 ページ目をフルスクリーンで表示",
+    );
+    ui.label(
+        egui::RichText::new(
+            "一覧から ZIP/PDF を Enter / ダブルクリックで開いたとき、ページ一覧を経由せず\n\
+             1 ページ目を直接フルスクリーンで開きます。フルスクリーン中の Enter / Esc で\n\
+             元の一覧へ戻り、Backspace でそのファイルのページ一覧を表示します。",
+        )
+        .weak(),
+    );
 }
 
 pub(super) fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {

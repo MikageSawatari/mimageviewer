@@ -2181,6 +2181,10 @@ impl App {
                     // Folder 分岐とは global_search drill-in 判定が違うためここは別のまま。
                     let p = p.clone();
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
+                    // 環境設定 ON なら、ページ一覧を経由せず 1 ページ目を即フルスクリーンで開く。
+                    if self.settings.auto_fullscreen_zip_pdf {
+                        self.pending_auto_fs_open = true;
+                    }
                     nav = Some(p);
                 }
                 Some(GridItem::Image(_))

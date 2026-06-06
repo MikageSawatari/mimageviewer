@@ -3167,7 +3167,7 @@ impl App {
         }
         self.fs_viewport_shown = true;
         if close_fs {
-            self.close_fullscreen();
+            self.handle_fullscreen_close_request();
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
@@ -5316,7 +5316,7 @@ impl App {
         fs_idx: usize,
     ) {
         if close_fs {
-            self.close_fullscreen();
+            self.handle_fullscreen_close_request();
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             // keep_fullscreen_viewport_alive の cleanup フレーム (Visible(false) 送信) を保証。
             // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、偶発的な
