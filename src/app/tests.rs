@@ -3593,6 +3593,159 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.erase_mode);
     }
 
+    /// Ctrl+→ の「1 ページずらし」は、1 回押すごとに見開きが必ず 1 ページぶんずれる。
+    /// 固定パリティで「2 回押さないと見た目が変わらない」旧 Shift 挙動のリグレッション防止。
+    #[test]
+    fn spread_offset_nudge_shifts_one_page_ltr() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::SpreadPair;
+        let mut app = setup_app();
+        for k in 0..4 {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/p/{k}.jpg"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = vec![0, 1, 2, 3];
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::Ltr;
+        app.spread_phase = 0;
+        app.fullscreen_idx = Some(0);
+
+        assert_eq!(
+            app.resolve_spread_pair(0),
+            SpreadPair::Double { left: 0, right: 1 },
+            "初期ペアは [0,1]"
+        );
+
+        // Ctrl+→ 1 回 → [1,2]
+        let (new_idx, new_phase) = app
+            .compute_spread_offset_nudge(0, 1)
+            .expect("前方ずらしは範囲内");
+        assert_eq!(new_idx, 1);
+        app.spread_phase = new_phase;
+        app.fullscreen_idx = Some(new_idx);
+        assert_eq!(
+            app.resolve_spread_pair(new_idx),
+            SpreadPair::Double { left: 1, right: 2 },
+            "1 回で見開きが 1 ページずれる"
+        );
+
+        // もう 1 回 → [2,3]
+        let (new_idx, new_phase) = app
+            .compute_spread_offset_nudge(1, 1)
+            .expect("前方ずらしは範囲内");
+        assert_eq!(new_idx, 2);
+        app.spread_phase = new_phase;
+        app.fullscreen_idx = Some(new_idx);
+        assert_eq!(
+            app.resolve_spread_pair(new_idx),
+            SpreadPair::Double { left: 2, right: 3 }
+        );
+    }
+
+    /// 後方ずらし (Ctrl+←) は前方ずらしを巻き戻す。
+    #[test]
+    fn spread_offset_nudge_backward_reverses() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::SpreadPair;
+        let mut app = setup_app();
+        for k in 0..4 {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/p/{k}.jpg"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = vec![0, 1, 2, 3];
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::Ltr;
+        app.spread_phase = 1; // [1,2] を表示中
+        app.fullscreen_idx = Some(1);
+        assert_eq!(
+            app.resolve_spread_pair(1),
+            SpreadPair::Double { left: 1, right: 2 }
+        );
+
+        let (new_idx, new_phase) = app
+            .compute_spread_offset_nudge(1, -1)
+            .expect("後方ずらしは範囲内");
+        assert_eq!(new_idx, 0);
+        app.spread_phase = new_phase;
+        assert_eq!(
+            app.resolve_spread_pair(new_idx),
+            SpreadPair::Double { left: 0, right: 1 }
+        );
+    }
+
+    /// RTL でもずらしが効き、左右の割り当て (左=大 idx) を保つ。
+    #[test]
+    fn spread_offset_nudge_rtl_keeps_side_assignment() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::SpreadPair;
+        let mut app = setup_app();
+        for k in 0..4 {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/p/{k}.jpg"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = vec![0, 1, 2, 3];
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::Rtl;
+        app.spread_phase = 0;
+        app.fullscreen_idx = Some(0);
+        assert_eq!(
+            app.resolve_spread_pair(0),
+            SpreadPair::Double { left: 1, right: 0 },
+            "RTL は 左=大 idx, 右=小 idx"
+        );
+
+        let (new_idx, new_phase) = app
+            .compute_spread_offset_nudge(0, 1)
+            .expect("ずらしは範囲内");
+        assert_eq!(new_idx, 1);
+        app.spread_phase = new_phase;
+        assert_eq!(
+            app.resolve_spread_pair(1),
+            SpreadPair::Double { left: 2, right: 1 },
+            "RTL の左右割り当てを保ったまま 1 ページずれる"
+        );
+    }
+
+    /// 端ではずらしは no-op (None) を返す。
+    #[test]
+    fn spread_offset_nudge_boundary_is_none() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        let mut app = setup_app();
+        for k in 0..2 {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/p/{k}.jpg"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = vec![0, 1];
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::Ltr;
+        app.spread_phase = 0;
+        app.fullscreen_idx = Some(1);
+        assert!(
+            app.compute_spread_offset_nudge(1, 1).is_none(),
+            "末尾から前方ずらしは範囲外"
+        );
+        assert!(
+            app.compute_spread_offset_nudge(0, -1).is_none(),
+            "先頭から後方ずらしは範囲外"
+        );
+    }
+
     /// 見開きから隠蔽加工に入ったあと `reset_conceal_mode` で元の見開き状態に戻ること。
     #[test]
     fn reset_conceal_mode_restores_saved_spread_state() {

@@ -3289,6 +3289,11 @@ pub struct App {
     pub(crate) spread_db: Option<crate::spread_db::SpreadDb>,
     /// 現在のフォルダの見開きモード
     pub(crate) spread_mode: crate::settings::SpreadMode,
+    /// 見開きペアリングのパリティを実行時にずらす量 (Ctrl+←/→ の「1ページずらし」)。
+    /// 0 = canonical (= `spread_mode` の pair_start のまま)。実効 pair_start は
+    /// `(base_pair_start + spread_phase).rem_euclid(2)`。読書中に空白/欠落ページで綴じが
+    /// 1 ページずれたときの応急補正用で、**永続化しない** (フォルダ/本を開き直すと 0 に戻る)。
+    pub(crate) spread_phase: i32,
     /// 見開きモード切替ポップアップ表示中
     pub(crate) spread_popup_open: bool,
 
@@ -4983,6 +4988,7 @@ impl App {
             search_drilled_folder_counts: std::collections::HashMap::new(),
             spread_db,
             spread_mode: crate::settings::SpreadMode::default(),
+            spread_phase: 0,
             spread_popup_open: false,
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
@@ -9226,6 +9232,8 @@ impl App {
             .as_ref()
             .and_then(|db| db.get(&source_path))
             .unwrap_or(self.settings.default_spread_mode);
+        // フォルダ/本を切り替えたら 1 ページずらし (応急補正) はリセットする。
+        self.spread_phase = 0;
         self.spread_popup_open = false;
         self.search_filter = None;
         self.search_query.clear();

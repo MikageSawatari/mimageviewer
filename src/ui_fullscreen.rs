@@ -714,7 +714,7 @@ impl FsBoundaryHint {
 // ── 見開きペアリング ──────────────────────────────────────────────────────
 
 /// 見開き表示のペア解決結果。
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SpreadPair {
     /// 単独表示（1ページ表示 / 横長画像 / 表紙 / 末尾余り）
     Single,
@@ -2624,6 +2624,8 @@ impl App {
 
                         // ホバーバーのポップアップからモードが変更された場合
                         if self.spread_mode != spread_before {
+                            // canonical なモードを選び直したので「1 ページずらし」はリセット。
+                            self.spread_phase = 0;
                             if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
                                 let _ = db.set(folder, self.spread_mode, self.settings.default_spread_mode);
                             }
@@ -3234,8 +3236,14 @@ impl App {
             return SpreadPair::Single;
         };
 
-        // 表紙モード: pos=0 は常に単独
-        if self.spread_mode.has_cover() && pos == 0 {
+        // 実効ペアリング開始位置: base (表紙ありなら 1) に「1 ページずらし量」(spread_phase)
+        // を足してパリティ (0/1) を取る。Ctrl+←/→ で spread_phase が変わると全ペアが
+        // 1 ページずれる。
+        let base_pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
+        let pair_start = (base_pair_start + self.spread_phase).rem_euclid(2) as usize;
+
+        // pair_start=1 のとき pos=0 は相方が居ないので常に単独 (= ずれてあぶれた先頭ページ)
+        if pair_start == 1 && pos == 0 {
             return SpreadPair::Single;
         }
 
@@ -3243,9 +3251,6 @@ impl App {
         if is_landscape(idx, &self.fs_cache, &self.thumbnails) {
             return SpreadPair::Single;
         }
-
-        // ペアリング開始位置: 表紙ありなら pos=1 から、なしなら pos=0 から
-        let pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
 
         // ペア内の位置を計算 (0-indexed from pair_start)
         let relative = pos - pair_start;
@@ -3303,10 +3308,11 @@ impl App {
     }
 
     /// 見開きモードでの nav_delta を計算する。
-    /// 見開き表示中は2ページ送り、Single表示中は1ページ送り。
-    /// Shift が押されている場合は常に1ページ送り。
-    pub(crate) fn spread_nav_delta(&mut self, base_delta: i32, shift_held: bool) -> i32 {
-        if !self.spread_mode.is_spread() || shift_held {
+    /// 見開き表示中は 2 ページ送り、Single 表示 (横長等) や非見開きは 1 ページ送り。
+    /// 「1 ページずらし」は Ctrl+←/→ ([`Self::compute_spread_offset_nudge`]) が担当する
+    /// ので、ここでは扱わない。
+    pub(crate) fn spread_nav_delta(&mut self, base_delta: i32) -> i32 {
+        if !self.spread_mode.is_spread() {
             return base_delta;
         }
         let fs_idx = match self.fullscreen_idx {
@@ -3318,6 +3324,31 @@ impl App {
             SpreadPair::Single => base_delta,
             SpreadPair::Double { .. } => base_delta * 2,
         }
+    }
+
+    /// Ctrl+←/→ の「見開き 1 ページずらし」。現在ページ (`fs_idx`) を読み順で `dir`
+    /// (+1=前方 / -1=後方) に 1 つ動かし、その新ページがペアの先頭になるよう位相
+    /// (`spread_phase`) を決めて返す。これで「1 回押すと見開きが必ず 1 ページ分ずれる」。
+    ///
+    /// 戻り値 `(new_idx, new_phase)`。移動先が範囲外なら `None` (= 端で no-op)。
+    /// 純粋ロジック (副作用なし) なのでユニットテスト可能。
+    pub(crate) fn compute_spread_offset_nudge(
+        &mut self,
+        fs_idx: usize,
+        dir: i32,
+    ) -> Option<(usize, i32)> {
+        let nav = self.get_nav_indices();
+        let pos = nav.iter().position(|&i| i == fs_idx)?;
+        let new_pos = pos as i32 + dir;
+        if new_pos < 0 || new_pos as usize >= nav.len() {
+            return None;
+        }
+        let new_pos = new_pos as usize;
+        let new_idx = nav[new_pos];
+        // new_pos がペアの先頭になる位相: (base + phase) ≡ new_pos (mod 2)
+        let base = if self.spread_mode.has_cover() { 1 } else { 0 };
+        let new_phase = (new_pos as i32 - base).rem_euclid(2);
+        Some((new_idx, new_phase))
     }
 
     /// 見開きモード切替後、fullscreen_idx をペアの先頭に正規化する。
@@ -3333,9 +3364,10 @@ impl App {
             return;
         };
 
-        let pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
+        let base_pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
+        let pair_start = (base_pair_start + self.spread_phase).rem_euclid(2) as usize;
         if pos < pair_start {
-            return; // 表紙位置
+            return; // 表紙位置 (ずれてあぶれた先頭ページ)
         }
         let relative = pos - pair_start;
         if relative % 2 != 0 {
@@ -3622,11 +3654,15 @@ impl App {
             && enter_consume_ok
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let esc = esc || enter_close;
-        let shift_held = ctx.input(|i| i.modifiers.shift);
         // 左右キーは上下と分離して処理（RTL 反転のため）
-        // Shift+矢印（スプレッドナビ）にも対応するため、修飾キーを問わず消費
         let ctrl_d = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowDown));
         let ctrl_u = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowUp));
+        // Ctrl+←/→: 見開き「1 ページずらし」(応急補正)。Single モードでは 1 ページ移動に
+        // フォールバックする。動画は Ctrl+←/→ が 30 秒シークなので画像 (= !is_video_fs) のみ消費。
+        let ctrl_left = !is_video_fs
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft));
+        let ctrl_right = !is_video_fs
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight));
         let ctrl_page_down =
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown));
         let ctrl_page_up =
@@ -3931,6 +3967,8 @@ impl App {
         if let Some(mode) = new_spread {
             if mode != self.spread_mode {
                 self.spread_mode = mode;
+                // canonical なモードを選び直したので「1 ページずらし」(応急補正) はリセット。
+                self.spread_phase = 0;
                 self.spread_popup_open = false;
                 self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
                 // DB に保存
@@ -4299,10 +4337,27 @@ impl App {
         // 一部スキップしつつスライドショーを継続できる。フォルダをまたぐ Ctrl+↑↓ や
         // S / Space / Esc は従来どおり停止する。
         if nav_next && !ctrl_d {
-            action.nav_delta = self.spread_nav_delta(1, shift_held);
+            action.nav_delta = self.spread_nav_delta(1);
         }
         if nav_prev && !ctrl_u {
-            action.nav_delta = self.spread_nav_delta(-1, shift_held);
+            action.nav_delta = self.spread_nav_delta(-1);
+        }
+        // Ctrl+←/→: 見開きモードでは「1 ページずらし」(現在ページを軸に見開きを 1 ページ
+        // ぶんずらす)、Single モードでは 1 ページ移動。RTL は左右の意味を反転 (plain 矢印と同じ)。
+        let ctrl_nudge_next = (ctrl_right && !rtl) || (ctrl_left && rtl);
+        let ctrl_nudge_prev = (ctrl_left && !rtl) || (ctrl_right && rtl);
+        if ctrl_nudge_next || ctrl_nudge_prev {
+            let dir = if ctrl_nudge_next { 1 } else { -1 };
+            if self.spread_mode.is_spread() {
+                if let Some((new_idx, new_phase)) = self.compute_spread_offset_nudge(fs_idx, dir) {
+                    self.spread_phase = new_phase;
+                    action.jump_to = Some(new_idx);
+                    self.show_feedback_toast("見開きを1ページずらしました".to_string());
+                }
+            } else {
+                // Single モード: 1 ページ移動にフォールバック (ユーザー要望)
+                action.nav_delta = dir;
+            }
         }
         if ctrl_d || mouse_forward || browser_forward {
             action.ctrl_nav = Some(1);
@@ -4661,7 +4716,7 @@ impl App {
                     }
                 } else {
                     let base = if wheel_y < 0.0 { 1 } else { -1 };
-                    nav_delta = self.spread_nav_delta(base, false);
+                    nav_delta = self.spread_nav_delta(base);
                 }
             }
         }
@@ -4819,7 +4874,7 @@ impl App {
                                     && pos.y >= 60.0;
                                 if !in_right_panel && !in_left_panel {
                                     let base = if pos.x > full_rect.center().x { 1 } else { -1 };
-                                    nav_delta = self.spread_nav_delta(base, false);
+                                    nav_delta = self.spread_nav_delta(base);
                                 }
                             }
                         }
@@ -4884,7 +4939,7 @@ impl App {
     /// フォルダ末尾に到達したら `slideshow_end_action` 設定に従って
     /// ループ / 次フォルダ / 停止する。
     fn advance_slideshow(&mut self, ctx: &egui::Context, cur: usize) {
-        let slide_delta = self.spread_nav_delta(1, false);
+        let slide_delta = self.spread_nav_delta(1);
         if let Some(idx) = crate::ui_helpers::adjacent_slideshow_idx(
             &self.items,
             &self.visible_indices,
@@ -7955,11 +8010,11 @@ impl App {
                 );
 
                 let shortcut_label = match mode.to_int() {
-                    0 => "[5]",
-                    1 => "[6]",
-                    2 => "[7]",
-                    3 => "[8]",
-                    _ => "[9]",
+                    0 => "[1]",
+                    1 => "[2]",
+                    2 => "[3]",
+                    3 => "[4]",
+                    _ => "[5]",
                 };
                 ui.painter().text(
                     egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),

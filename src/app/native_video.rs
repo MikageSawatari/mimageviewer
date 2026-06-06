@@ -5124,7 +5124,7 @@ impl App {
         if !self.video_tile_mode_active {
             self.cancel_stale_video_tile_reopen(Some(fs_idx), "wheel-navigation");
         }
-        let nav_delta = self.spread_nav_delta(base_delta, false);
+        let nav_delta = self.spread_nav_delta(base_delta);
         if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
             &self.items,
             &self.visible_indices,
