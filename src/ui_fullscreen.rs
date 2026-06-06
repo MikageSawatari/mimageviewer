@@ -2639,8 +2639,6 @@ impl App {
 
                         // ホバーバーのポップアップからモードが変更された場合
                         if self.spread_mode != spread_before {
-                            // canonical なモードを選び直したので「1 ページずらし」はリセット。
-                            self.spread_phase = 0;
                             if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
                                 let _ = db.set(folder, self.spread_mode, self.settings.default_spread_mode);
                             }
@@ -3251,13 +3249,12 @@ impl App {
             return SpreadPair::Single;
         };
 
-        // 実効ペアリング開始位置: base (表紙ありなら 1) に「1 ページずらし量」(spread_phase)
-        // を足してパリティ (0/1) を取る。Ctrl+←/→ で spread_phase が変わると全ペアが
-        // 1 ページずれる。
-        let base_pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
-        let pair_start = (base_pair_start + self.spread_phase).rem_euclid(2) as usize;
+        // ペアリング開始位置: cover (表紙あり) なら 1 (先頭ページ単独 + 1 ページずれ)。
+        // 「1 ページずらし」(Ctrl+←/→) は cover/非cover を切り替えて表現するので、ここは
+        // mode の has_cover だけを見ればよい (専用の位相ステータスは持たない)。
+        let pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
 
-        // pair_start=1 のとき pos=0 は相方が居ないので常に単独 (= ずれてあぶれた先頭ページ)
+        // pair_start=1 のとき pos=0 は相方が居ないので常に単独 (= あぶれた先頭ページ)
         if pair_start == 1 && pos == 0 {
             return SpreadPair::Single;
         }
@@ -3342,16 +3339,19 @@ impl App {
     }
 
     /// Ctrl+←/→ の「見開き 1 ページずらし」。現在ページ (`fs_idx`) を読み順で `dir`
-    /// (+1=前方 / -1=後方) に 1 つ動かし、その新ページがペアの先頭になるよう位相
-    /// (`spread_phase`) を決めて返す。これで「1 回押すと見開きが必ず 1 ページ分ずれる」。
+    /// (+1=前方 / -1=後方) に 1 つ動かし、その新ページがペアの先頭になるよう
+    /// **見開きモード (cover/非cover)** を決めて返す。専用の位相ステータスを持たず
+    /// `spread_mode` を直接切り替えるので、ホバーバー/ポップアップ/数字キーと表示状態が
+    /// 一致し、`spread_db` でフォルダ単位に永続化される。
     ///
-    /// 戻り値 `(new_idx, new_phase)`。移動先が範囲外なら `None` (= 端で no-op)。
+    /// 戻り値 `(new_idx, new_mode)`。移動先が範囲外なら `None` (= 端で no-op)。
     /// 純粋ロジック (副作用なし) なのでユニットテスト可能。
     pub(crate) fn compute_spread_offset_nudge(
         &mut self,
         fs_idx: usize,
         dir: i32,
-    ) -> Option<(usize, i32)> {
+    ) -> Option<(usize, crate::settings::SpreadMode)> {
+        use crate::settings::SpreadMode;
         let nav = self.get_nav_indices();
         let pos = nav.iter().position(|&i| i == fs_idx)?;
         let new_pos = pos as i32 + dir;
@@ -3360,10 +3360,16 @@ impl App {
         }
         let new_pos = new_pos as usize;
         let new_idx = nav[new_pos];
-        // new_pos がペアの先頭になる位相: (base + phase) ≡ new_pos (mod 2)
-        let base = if self.spread_mode.has_cover() { 1 } else { 0 };
-        let new_phase = (new_pos as i32 - base).rem_euclid(2);
-        Some((new_idx, new_phase))
+        // new_pos がペアの先頭 (pair_start = new_pos % 2) になるよう、現在の読み方向を保った
+        // まま cover/非cover を選ぶ (cover = pair_start 1 = 先頭ページ単独 + 1 ページずれ)。
+        let want_cover = new_pos % 2 == 1;
+        let new_mode = match (self.spread_mode.is_rtl(), want_cover) {
+            (false, false) => SpreadMode::Ltr,
+            (false, true) => SpreadMode::LtrCover,
+            (true, false) => SpreadMode::Rtl,
+            (true, true) => SpreadMode::RtlCover,
+        };
+        Some((new_idx, new_mode))
     }
 
     /// 見開きモード切替後、fullscreen_idx をペアの先頭に正規化する。
@@ -3379,10 +3385,9 @@ impl App {
             return;
         };
 
-        let base_pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
-        let pair_start = (base_pair_start + self.spread_phase).rem_euclid(2) as usize;
+        let pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
         if pos < pair_start {
-            return; // 表紙位置 (ずれてあぶれた先頭ページ)
+            return; // 表紙位置 (先頭ページ単独)
         }
         let relative = pos - pair_start;
         if relative % 2 != 0 {
@@ -3982,8 +3987,6 @@ impl App {
         if let Some(mode) = new_spread {
             if mode != self.spread_mode {
                 self.spread_mode = mode;
-                // canonical なモードを選び直したので「1 ページずらし」(応急補正) はリセット。
-                self.spread_phase = 0;
                 self.spread_popup_open = false;
                 self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
                 // DB に保存
@@ -4372,8 +4375,15 @@ impl App {
         if ctrl_nudge_next || ctrl_nudge_prev {
             let dir = if ctrl_nudge_next { 1 } else { -1 };
             if self.spread_mode.is_spread() {
-                if let Some((new_idx, new_phase)) = self.compute_spread_offset_nudge(fs_idx, dir) {
-                    self.spread_phase = new_phase;
+                if let Some((new_idx, new_mode)) = self.compute_spread_offset_nudge(fs_idx, dir) {
+                    // 見開きモード (cover/非cover) を直接切り替えて 1 ページずらす。
+                    // フォルダ単位で永続化 (spread_db)。new_idx は新モードでペア先頭なので
+                    // normalize は no-op。
+                    self.spread_mode = new_mode;
+                    if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
+                        let _ = db.set(folder, new_mode, self.settings.default_spread_mode);
+                    }
+                    self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
                     action.jump_to = Some(new_idx);
                     self.show_feedback_toast("見開きを1ページずらしました".to_string());
                 }

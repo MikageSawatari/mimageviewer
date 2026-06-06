@@ -3611,7 +3611,6 @@ mod favorite_adjustment_defaults_tests {
         app.visible_indices = vec![0, 1, 2, 3];
         app.cached_nav_indices = None;
         app.spread_mode = SpreadMode::Ltr;
-        app.spread_phase = 0;
         app.fullscreen_idx = Some(0);
 
         assert_eq!(
@@ -3621,11 +3620,11 @@ mod favorite_adjustment_defaults_tests {
         );
 
         // Ctrl+→ 1 回 → [1,2]
-        let (new_idx, new_phase) = app
+        let (new_idx, new_mode) = app
             .compute_spread_offset_nudge(0, 1)
             .expect("前方ずらしは範囲内");
         assert_eq!(new_idx, 1);
-        app.spread_phase = new_phase;
+        app.spread_mode = new_mode;
         app.fullscreen_idx = Some(new_idx);
         assert_eq!(
             app.resolve_spread_pair(new_idx),
@@ -3634,11 +3633,11 @@ mod favorite_adjustment_defaults_tests {
         );
 
         // もう 1 回 → [2,3]
-        let (new_idx, new_phase) = app
+        let (new_idx, new_mode) = app
             .compute_spread_offset_nudge(1, 1)
             .expect("前方ずらしは範囲内");
         assert_eq!(new_idx, 2);
-        app.spread_phase = new_phase;
+        app.spread_mode = new_mode;
         app.fullscreen_idx = Some(new_idx);
         assert_eq!(
             app.resolve_spread_pair(new_idx),
@@ -3662,19 +3661,18 @@ mod favorite_adjustment_defaults_tests {
         }
         app.visible_indices = vec![0, 1, 2, 3];
         app.cached_nav_indices = None;
-        app.spread_mode = SpreadMode::Ltr;
-        app.spread_phase = 1; // [1,2] を表示中
+        app.spread_mode = SpreadMode::LtrCover; // pair_start=1 で [1,2] を表示中
         app.fullscreen_idx = Some(1);
         assert_eq!(
             app.resolve_spread_pair(1),
             SpreadPair::Double { left: 1, right: 2 }
         );
 
-        let (new_idx, new_phase) = app
+        let (new_idx, new_mode) = app
             .compute_spread_offset_nudge(1, -1)
             .expect("後方ずらしは範囲内");
         assert_eq!(new_idx, 0);
-        app.spread_phase = new_phase;
+        app.spread_mode = new_mode;
         assert_eq!(
             app.resolve_spread_pair(new_idx),
             SpreadPair::Double { left: 0, right: 1 }
@@ -3698,7 +3696,6 @@ mod favorite_adjustment_defaults_tests {
         app.visible_indices = vec![0, 1, 2, 3];
         app.cached_nav_indices = None;
         app.spread_mode = SpreadMode::Rtl;
-        app.spread_phase = 0;
         app.fullscreen_idx = Some(0);
         assert_eq!(
             app.resolve_spread_pair(0),
@@ -3706,11 +3703,11 @@ mod favorite_adjustment_defaults_tests {
             "RTL は 左=大 idx, 右=小 idx"
         );
 
-        let (new_idx, new_phase) = app
+        let (new_idx, new_mode) = app
             .compute_spread_offset_nudge(0, 1)
             .expect("ずらしは範囲内");
         assert_eq!(new_idx, 1);
-        app.spread_phase = new_phase;
+        app.spread_mode = new_mode;
         assert_eq!(
             app.resolve_spread_pair(1),
             SpreadPair::Double { left: 2, right: 1 },
@@ -3734,7 +3731,6 @@ mod favorite_adjustment_defaults_tests {
         app.visible_indices = vec![0, 1];
         app.cached_nav_indices = None;
         app.spread_mode = SpreadMode::Ltr;
-        app.spread_phase = 0;
         app.fullscreen_idx = Some(1);
         assert!(
             app.compute_spread_offset_nudge(1, 1).is_none(),
