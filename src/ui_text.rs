@@ -1587,6 +1587,31 @@ impl App {
             });
 
         // ── 右パネル: 詳細設定 (選択オブジェクトの編集) ──
+        // 選択が窓なら、本文が枠から溢れているかを fonts 込みで判定 (常時表示の本文欄を
+        // 赤枠警告にする)。窓以外は計算しない (ensure_comic_fonts はロード済みなら Arc
+        // clone を返すだけだが、無駄な呼び出しを避ける)。
+        let window_overflow = {
+            let sel_win = selected
+                .and_then(|id| objects.iter().find(|o| o.id == id))
+                .map(|o| matches!(o.kind, AnnotationKind::MessageWindow(_)))
+                .unwrap_or(false);
+            if sel_win {
+                let fonts = self.ensure_comic_fonts();
+                match (
+                    fonts.as_deref(),
+                    selected.and_then(|id| objects.iter().find(|o| o.id == id)),
+                ) {
+                    (Some(f), Some(o)) => matches!(
+                        &o.kind,
+                        AnnotationKind::MessageWindow(w)
+                            if comic_core::message_window_overflows(w, f)
+                    ),
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        };
         // しっぽ stash は App 状態だが、closure は self を借りないので `objects` と同様に
         // 一旦ローカルへ取り出して &mut を渡し、closure 後に書き戻す。
         let mut tail_stash = std::mem::take(&mut self.comic_tail_stash);
@@ -1642,6 +1667,7 @@ impl App {
                                                 &mut open_font_picker,
                                                 &mut pctx,
                                                 &mut tail_stash,
+                                                window_overflow,
                                             );
                                         } else {
                                             ui.label(
@@ -4546,6 +4572,11 @@ fn object_list_actions_ui(
 /// 右詳細パネルの本体。選択オブジェクトを「カラーの縦線での分類」(カテゴリタブ +
 /// 色帯) で編集する。`tab` はアプリ単位の選択状態で、オブジェクト種別に応じて
 /// 有効タブへ正規化する。
+/// 詳細パネルの中身。ラボ `draw_properties` と同じ **2 層構造**:
+/// ①「常時表示エリア」(タブの上) = よく使う 本文テキスト + 記号挿入 / (吹) 自動サイズ /
+/// プリセットバー (セリフ + 本体/ウィンドウ) / (吹) 構造トグル (結合・しっぽ) / (窓) 名前ヘッダ。
+/// ②「詳細タブ」= 種別ごとの細かい設定。`window_overflow` は窓本文が枠から溢れているか
+/// (呼び出し側が fonts 込みで判定して渡す。赤枠警告に使う)。
 fn edit_object_ui(
     ui: &mut egui::Ui,
     o: &mut AnnotationObject,
@@ -4555,9 +4586,12 @@ fn edit_object_ui(
     open_font_picker: &mut bool,
     presets: &mut PresetCtx,
     tail_stash: &mut HashMap<u64, Tail>,
+    window_overflow: bool,
 ) {
     ui.strong(kind_label(o));
-    // 回転 (全種共通、タブの外)。
+    ui.separator();
+
+    // 回転 (全種共通、タブの外)。mIV 独自 (ラボにはスライダーは無いがそのまま残す)。
     let mut deg = o.rotation_rad.to_degrees();
     if ui
         .add(egui::Slider::new(&mut deg, -180.0..=180.0).text("回転°"))
@@ -4569,15 +4603,99 @@ fn edit_object_ui(
     let pivot = o.pivot;
     let obj_id = o.id;
 
+    // スタンプは画像プロパティのみ (常時表示エリア / タブなし)。早期 return。
+    if let AnnotationKind::Stamp(s) = &mut o.kind {
+        stamp_ui(ui, s, changed, open_stamp_replace);
+        return;
+    }
+
+    let is_bubble = matches!(o.kind, AnnotationKind::Bubble(_));
+    let is_window = matches!(o.kind, AnnotationKind::MessageWindow(_));
+
+    // 選択種別に合わせて現在タブを正規化 (持ち越しを補正)。
+    if !is_bubble && !is_window {
+        *tab = TextPropTab::Serifu;
+    } else if is_window && matches!(*tab, TextPropTab::Tail | TextPropTab::Deco) {
+        *tab = TextPropTab::Body;
+    } else if is_bubble && *tab == TextPropTab::Parts {
+        *tab = TextPropTab::Body;
+    }
+
+    // ===== 常時表示エリア (タブの上) =====
+    // (窓) 名前ヘッダ — 話者名は頻繁に変えるのでタブではなく上部に置く。名前の「スタイル」
+    // (mode/色) 変更はウィンドウリンクを解除 (名前テキスト内容では解除しない = mIV 規約)。
+    if is_window {
+        if let AnnotationKind::MessageWindow(w) = &mut o.kind {
+            let snap = w.clone();
+            window_name_header_ui(ui, w, changed);
+            if w.style_preset_link.is_some() && window_style_diverged(&snap, w) {
+                w.style_preset_link = None;
+            }
+        }
+    }
+
+    // 本文テキスト欄 + (記法 ON 時) 記号挿入。窓が枠から溢れていれば赤枠 + 警告。
+    // 本文内容の編集はプリセットリンクを解除しない (mIV 規約)。
+    if is_window && window_overflow {
+        ui.colored_label(
+            egui::Color32::from_rgb(235, 100, 100),
+            "(!) テキストが枠に収まっていません",
+        );
+        egui::Frame::new()
+            .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(220, 70, 70)))
+            .inner_margin(3.0)
+            .show(ui, |ui| {
+                if let Some(tb) = o.text_block_mut() {
+                    text_body_ui(ui, tb, changed, obj_id);
+                }
+            });
+    } else if let Some(tb) = o.text_block_mut() {
+        text_body_ui(ui, tb, changed, obj_id);
+    }
+
+    // (吹) 自動サイズ — 記号挿入のすぐ下 (頻繁に切り替えるので本体タブに埋めない)。
+    if let AnnotationKind::Bubble(b) = &mut o.kind {
+        bubble_autosize_toggle_ui(ui, b, changed);
+    }
+
+    // プリセットバー (色帯): セリフ (常時) + 本体 (吹) / ウィンドウ (窓)。
+    ui.add_space(4.0);
+    draw_section_bar(ui, TextPropTab::Serifu.color(), |ui| {
+        if let Some(tb) = o.text_block_mut() {
+            text_preset_bar(ui, tb, presets, changed);
+        }
+    });
+    if let AnnotationKind::Bubble(b) = &mut o.kind {
+        draw_section_bar(ui, TextPropTab::Body.color(), |ui| {
+            shape_preset_bar(ui, b, pivot, presets, changed);
+        });
+    } else if let AnnotationKind::MessageWindow(w) = &mut o.kind {
+        draw_section_bar(ui, TextPropTab::Body.color(), |ui| {
+            window_preset_bar(ui, w, presets, changed);
+        });
+    }
+
+    // (吹) 構造トグル: 結合 / しっぽ表示。戻り値 = しっぽタブを有効化するか。
+    let tail_enabled = match &mut o.kind {
+        AnnotationKind::Bubble(b) => {
+            bubble_struct_toggles_ui(ui, b, changed, obj_id, pivot, tail_stash)
+        }
+        _ => false,
+    };
+    // しっぽタブが無効なのに選択されていたら本体へ退避。
+    if is_bubble && *tab == TextPropTab::Tail && !tail_enabled {
+        *tab = TextPropTab::Body;
+    }
+
+    // ===== 詳細タブ =====
+    ui.add_space(6.0);
+    ui.separator();
     match &mut o.kind {
         AnnotationKind::Text(t) => {
-            // テキストは セリフ カテゴリのみ。タブ行は出さず色帯だけ付ける。
-            *tab = TextPropTab::Serifu;
-            ui.add_space(4.0);
+            // テキストは セリフ のみ (タブ行なし)。スタイルを色帯で。
             draw_section_bar(ui, TextPropTab::Serifu.color(), |ui| {
-                text_preset_bar(ui, t, presets, changed);
                 let snap = t.clone();
-                text_block_ui(ui, t, changed, true, open_font_picker, obj_id);
+                text_block_ui(ui, t, changed, open_font_picker);
                 // 個別スタイル編集でプリセットリンクを解除 (本文内容の編集では外さない)。
                 if t.preset_link.is_some() && text_style_diverged(&snap, t) {
                     t.preset_link = None;
@@ -4585,13 +4703,6 @@ fn edit_object_ui(
             });
         }
         AnnotationKind::Bubble(b) => {
-            // セリフ / 本体 / しっぽ / 飾り。しっぽ・飾りタブには表示 on/off (= 追加) も
-            // 入れるので常時有効 (無い吹き出しでも中から付与できる)。部品はウィンドウ専用
-            // なので、ウィンドウ選択から持ち越した場合は本体へ正規化する。
-            if *tab == TextPropTab::Parts {
-                *tab = TextPropTab::Body;
-            }
-            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                 for t in [
@@ -4600,7 +4711,11 @@ fn edit_object_ui(
                     TextPropTab::Tail,
                     TextPropTab::Deco,
                 ] {
-                    if prop_tab_button(ui, t, *tab == t, true, t.label()) {
+                    let enabled = match t {
+                        TextPropTab::Tail => tail_enabled,
+                        _ => true,
+                    };
+                    if prop_tab_button(ui, t, *tab == t, enabled, t.label()) {
                         *tab = t;
                     }
                 }
@@ -4609,24 +4724,26 @@ fn edit_object_ui(
             let cur = *tab;
             draw_section_bar(ui, cur.color(), |ui| match cur {
                 TextPropTab::Serifu => {
-                    text_block_ui(ui, &mut b.text, changed, true, open_font_picker, obj_id)
+                    let snap = b.text.clone();
+                    text_block_ui(ui, &mut b.text, changed, open_font_picker);
+                    if b.text.preset_link.is_some() && text_style_diverged(&snap, &b.text) {
+                        b.text.preset_link = None;
+                    }
                 }
                 TextPropTab::Tail => {
                     let snap = b.clone();
-                    bubble_tail_ui(ui, b, changed, obj_id, pivot, tail_stash);
-                    // しっぽ種別の付与/除去はプリセット (tail_kind) と乖離する。
+                    bubble_tail_ui(ui, b, changed);
+                    // しっぽ種別はプリセット (tail_kind) に含まれる → 個別編集で link 解除。
                     if b.shape_preset_link.is_some() && shape_style_diverged(&snap, b) {
                         b.shape_preset_link = None;
                     }
                 }
                 TextPropTab::Deco => {
-                    // 飾りは形状プリセットに含まれない (ラボと同じ)。編集してもリンクは
-                    // 切らず、再ベイクのために changed を立てるだけ。
+                    // 飾りは形状プリセットに含まれない (ラボと同じ)。link は切らない。
                     bubble_deco_ui(ui, b, changed);
                 }
                 // Body (+ Parts/正規化済みは Body に倒れる)。
                 _ => {
-                    shape_preset_bar(ui, b, pivot, presets, changed);
                     let snap = b.clone();
                     bubble_body_ui(ui, b, changed);
                     if b.shape_preset_link.is_some() && shape_style_diverged(&snap, b) {
@@ -4636,11 +4753,6 @@ fn edit_object_ui(
             });
         }
         AnnotationKind::MessageWindow(w) => {
-            // セリフ / 枠 (= Body) / 部品 (= Parts)。しっぽ・飾りは無いので Body へ正規化。
-            if matches!(*tab, TextPropTab::Tail | TextPropTab::Deco) {
-                *tab = TextPropTab::Body;
-            }
-            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                 for (t, lbl) in [
@@ -4657,16 +4769,15 @@ fn edit_object_ui(
             let cur = *tab;
             draw_section_bar(ui, cur.color(), |ui| match cur {
                 TextPropTab::Serifu => {
-                    // ウィンドウプリセットは本文 TEXT のスタイルも含むので、本文スタイル
-                    // 編集でウィンドウリンクを解除する (本文内容の編集では外さない)。
+                    // 本文スタイル編集でウィンドウリンクを解除 (本文内容では外さない)。
                     let snap = w.text.clone();
-                    text_block_ui(ui, &mut w.text, changed, true, open_font_picker, obj_id);
+                    text_block_ui(ui, &mut w.text, changed, open_font_picker);
                     if w.style_preset_link.is_some() && text_style_diverged(&snap, &w.text) {
                         w.style_preset_link = None;
                     }
                 }
                 TextPropTab::Parts => {
-                    // 名前プレート / 立ち絵枠 / 続き指標。個別編集でウィンドウリンク解除。
+                    // 名前プレート詳細 / 立ち絵枠 / 続き指標。個別編集でウィンドウリンク解除。
                     let snap = w.clone();
                     window_parts_ui(ui, w, changed);
                     if w.style_preset_link.is_some() && window_style_diverged(&snap, w) {
@@ -4675,7 +4786,6 @@ fn edit_object_ui(
                 }
                 // 枠 (Body)。
                 _ => {
-                    window_preset_bar(ui, w, presets, changed);
                     let snap = w.clone();
                     window_body_ui(ui, w, changed);
                     if w.style_preset_link.is_some() && window_style_diverged(&snap, w) {
@@ -4684,10 +4794,179 @@ fn edit_object_ui(
                 }
             });
         }
-        AnnotationKind::Stamp(s) => {
-            // スタンプは画像プロパティのみ (タブなし)。
-            stamp_ui(ui, s, changed, open_stamp_replace);
+        // スタンプは上で早期 return 済み。
+        AnnotationKind::Stamp(_) => {}
+    }
+}
+
+/// 常時表示: 本文テキスト欄 + (記法 ON 時) カーソル位置への記号挿入ボタン。記法トグルと
+/// 記号セット選択は セリフ タブ側。本文内容の編集はプリセットリンクを切らない (mIV 規約)
+/// ので、ここでは `changed` を立てるだけ (リンク解除は呼び出し側のスタイル差分判定に任せる)。
+fn text_body_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool, sel: u64) {
+    // 安定 id を与えて記号挿入後にキャレットを復元できるようにする。
+    let text_edit_id = egui::Id::new(("comic_text_edit", sel));
+    let te_out = egui::TextEdit::multiline(&mut t.text)
+        .id(text_edit_id)
+        .desired_rows(3)
+        .desired_width(f32::INFINITY)
+        .hint_text("テキスト")
+        .show(ui);
+    if te_out.response.changed() {
+        *changed = true;
+    }
+    let text_sel: Option<(usize, usize)> = te_out
+        .cursor_range
+        .map(|r| (r.primary.index, r.secondary.index));
+    // 記法 ON のとき、本文欄の直下に記号挿入ボタンを出す。選択範囲があればそれを囲み、
+    // 無ければキャレット位置 (末尾) に空ペアを挿入する (ラボ `draw_text_body` 相当)。
+    if t.markup_enabled {
+        let rules = t.markup_rules.clone();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("記号挿入:");
+            for rule in &rules {
+                let dir_label = match rule.dir {
+                    InlineDir::TateChuYoko => "縦中横",
+                    InlineDir::Sideways => "横倒し",
+                    InlineDir::Upright => "正立",
+                };
+                if ui
+                    .button(format!("{}{} {}", rule.open, rule.close, dir_label))
+                    .clicked()
+                {
+                    let (a, b) = text_sel.unwrap_or_else(|| {
+                        let n = t.text.chars().count();
+                        (n, n)
+                    });
+                    let (s, e) = (a.min(b), a.max(b));
+                    let caret = insert_markers(&mut t.text, s, e, rule.open, rule.close);
+                    let ctx = ui.ctx();
+                    if let Some(mut st) = egui::text_edit::TextEditState::load(ctx, text_edit_id) {
+                        let cc = egui::text::CCursor::new(caret);
+                        st.cursor
+                            .set_char_range(Some(egui::text::CCursorRange::one(cc)));
+                        st.store(ctx, text_edit_id);
+                    }
+                    ctx.memory_mut(|m| m.request_focus(text_edit_id));
+                    *changed = true;
+                }
+            }
+        });
+    }
+}
+
+/// 常時表示 (吹き出し): 自動サイズトグル。頻繁に切り替えるので本体タブではなく上部に置く
+/// (ラボ `draw_bubble_autosize_toggle` 相当)。mIV はオフ時の形状凍結は行わない (現挙動維持)。
+fn bubble_autosize_toggle_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
+    let mut auto = b.auto_size;
+    if ui
+        .checkbox(&mut auto, "吹き出し自動サイズ")
+        .on_hover_text("文字に合わせて形状サイズを決める")
+        .changed()
+    {
+        b.auto_size = auto;
+        *changed = true;
+    }
+}
+
+/// 常時表示 (吹き出し): 構造トグル = 結合 / しっぽ表示 (ラボ `draw_bubble_toggles` 相当)。
+/// 戻り値はしっぽタブを有効化するか (= しっぽが存在し、かつ形状がしっぽを描く)。off→on は
+/// stash から復元して位置を覚える。結合・しっぽともに非対応形状ではトグルを無効化する。
+fn bubble_struct_toggles_ui(
+    ui: &mut egui::Ui,
+    b: &mut BubbleObject,
+    changed: &mut bool,
+    obj_id: u64,
+    pivot: (f32, f32),
+    tail_stash: &mut HashMap<u64, Tail>,
+) -> bool {
+    ui.add_space(2.0);
+    // 結合 (下の吹き出しと union)。塗りつぶせる本体を持つ形状のみ対応 — ぼかし系 /
+    // 線描画系 / テキストのみ (意識 / 集中線 / 流線 / なし) は不可なのでトグルを無効化し、
+    // 別形状で立った stale フラグをクリアする。
+    let merge_supported = comic_core::shape_is_mergeable(&b.shape);
+    if !merge_supported && b.merge_with_below {
+        b.merge_with_below = false;
+        *changed = true;
+    }
+    let merge_resp = ui.add_enabled(
+        merge_supported,
+        egui::Checkbox::new(&mut b.merge_with_below, "下の吹き出しと結合"),
+    );
+    if merge_supported && merge_resp.changed() {
+        *changed = true;
+    }
+    if !merge_supported {
+        merge_resp.on_disabled_hover_text("この形状は結合に対応していません");
+    }
+
+    // しっぽ表示 (off→on で stash 復元)。しっぽを描かない形状 (集中線 / 流線 / 意識 / なし)
+    // ではトグルを無効化する (見えない選択可能なしっぽ形状を作らせない)。
+    let tail_supported = comic_core::shape_renders_tail(&b.shape);
+    let mut has_tail = b.tail.is_some();
+    let tail_resp = ui.add_enabled(
+        tail_supported,
+        egui::Checkbox::new(&mut has_tail, "しっぽを表示"),
+    );
+    if tail_supported && tail_resp.changed() {
+        if has_tail {
+            b.tail = Some(
+                tail_stash
+                    .remove(&obj_id)
+                    .unwrap_or_else(|| default_bubble_tail(pivot)),
+            );
+        } else if let Some(t) = b.tail.take() {
+            tail_stash.insert(obj_id, t);
         }
+        // しっぽ種別は形状プリセットに含まれる → 付与/除去で link 解除 (glow off)。
+        b.shape_preset_link = None;
+        *changed = true;
+    }
+    if !tail_supported {
+        tail_resp.on_disabled_hover_text("この形状はしっぽに対応していません");
+    }
+
+    b.tail.is_some() && tail_supported
+}
+
+/// 常時表示 (ウィンドウ): 名前ヘッダ = 表示モード + 名前色 + 話者名。話者名は頻繁に変える
+/// ので部品タブではなく上部に置く (ラボ `draw_window_name_header` 相当)。プレートの詳細
+/// スタイル (サイズ / 塗り / 枠 / 角丸 / 余白 / オフセット) は 部品 タブ側 (`window_parts_ui`)。
+fn window_name_header_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.label("名前");
+        egui::ComboBox::from_id_salt("win_name_mode")
+            .selected_text(name_plate_mode_label(w.name_plate.mode))
+            .show_ui(ui, |ui| {
+                for m in [
+                    NamePlateMode::None,
+                    NamePlateMode::Inline,
+                    NamePlateMode::Boxed,
+                    NamePlateMode::Above,
+                ] {
+                    if ui
+                        .selectable_value(&mut w.name_plate.mode, m, name_plate_mode_label(m))
+                        .changed()
+                    {
+                        *changed = true;
+                    }
+                }
+            });
+        if w.name_plate.mode != NamePlateMode::None {
+            let mut col = to_c32(w.name_plate.name.color);
+            if ui.color_edit_button_srgba(&mut col).changed() {
+                w.name_plate.name.color = from_c32(col);
+                *changed = true;
+            }
+        }
+    });
+    if w.name_plate.mode != NamePlateMode::None {
+        *changed |= ui
+            .add(
+                egui::TextEdit::singleline(&mut w.name_plate.name.text)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("話者名"),
+            )
+            .changed();
     }
 }
 
@@ -4831,7 +5110,7 @@ fn text_preset_bar(
     presets: &mut PresetCtx,
     changed: &mut bool,
 ) {
-    ui.label(egui::RichText::new("プリセット").small());
+    ui.label(egui::RichText::new("セリフプリセット").strong());
     let entries: Vec<(String, String, bool)> = presets
         .text
         .iter()
@@ -4867,7 +5146,7 @@ fn shape_preset_bar(
     presets: &mut PresetCtx,
     changed: &mut bool,
 ) {
-    ui.label(egui::RichText::new("プリセット").small());
+    ui.label(egui::RichText::new("本体プリセット").strong());
     let entries: Vec<(String, String, bool)> = presets
         .shape
         .iter()
@@ -4902,7 +5181,7 @@ fn window_preset_bar(
     presets: &mut PresetCtx,
     changed: &mut bool,
 ) {
-    ui.label(egui::RichText::new("プリセット").small());
+    ui.label(egui::RichText::new("ウィンドウプリセット").strong());
     let entries: Vec<(String, String, bool)> = presets
         .window
         .iter()
@@ -4930,69 +5209,15 @@ fn window_preset_bar(
     ui.separator();
 }
 
-/// TextBlock の編集 (テキスト内容・サイズ・色・向き・整列・袋文字・太字/斜体)。
-/// `with_text` が false のときは本文編集欄を出さない (名前プレート等の流用余地)。
+/// セリフ タブの中身: TextBlock の **スタイル** 編集 (フォント・サイズ・色・太字/斜体・
+/// 向き・整列・袋文字・自動縦中横・記法・行間字間)。本文テキスト欄と記号挿入は常時表示の
+/// `text_body_ui` 側へ分離した (ラボ `draw_text_font` + `draw_serifu_tab` 相当)。
 fn text_block_ui(
     ui: &mut egui::Ui,
     t: &mut TextBlock,
     changed: &mut bool,
-    with_text: bool,
     open_font_picker: &mut bool,
-    sel: u64,
 ) {
-    if with_text {
-        // 安定 id を与えて記号挿入後にキャレットを復元できるようにする。
-        let text_edit_id = egui::Id::new(("comic_text_edit", sel));
-        let te_out = egui::TextEdit::multiline(&mut t.text)
-            .id(text_edit_id)
-            .desired_rows(2)
-            .desired_width(PANEL_W - 16.0)
-            .hint_text("テキスト")
-            .show(ui);
-        if te_out.response.changed() {
-            *changed = true;
-        }
-        let text_sel: Option<(usize, usize)> = te_out
-            .cursor_range
-            .map(|r| (r.primary.index, r.secondary.index));
-        // 記法 ON のとき、本文欄の直下に記号挿入ボタンを出す。選択範囲があればそれを囲み、
-        // 無ければキャレット位置 (末尾) に空ペアを挿入する (ラボ `draw_text_body` 相当)。
-        if t.markup_enabled {
-            let rules = t.markup_rules.clone();
-            ui.horizontal_wrapped(|ui| {
-                ui.label("記号挿入:");
-                for rule in &rules {
-                    let dir_label = match rule.dir {
-                        InlineDir::TateChuYoko => "縦中横",
-                        InlineDir::Sideways => "横倒し",
-                        InlineDir::Upright => "正立",
-                    };
-                    if ui
-                        .button(format!("{}{} {}", rule.open, rule.close, dir_label))
-                        .clicked()
-                    {
-                        let (a, b) = text_sel.unwrap_or_else(|| {
-                            let n = t.text.chars().count();
-                            (n, n)
-                        });
-                        let (s, e) = (a.min(b), a.max(b));
-                        let caret = insert_markers(&mut t.text, s, e, rule.open, rule.close);
-                        let ctx = ui.ctx();
-                        if let Some(mut st) =
-                            egui::text_edit::TextEditState::load(ctx, text_edit_id)
-                        {
-                            let cc = egui::text::CCursor::new(caret);
-                            st.cursor
-                                .set_char_range(Some(egui::text::CCursorRange::one(cc)));
-                            st.store(ctx, text_edit_id);
-                        }
-                        ctx.memory_mut(|m| m.request_focus(text_edit_id));
-                        *changed = true;
-                    }
-                }
-            });
-        }
-    }
     // フォント選択 (現在のフォント名 + 選択ボタン)。ピッカーは別ダイアログで開く。
     ui.horizontal(|ui| {
         ui.label("フォント");
@@ -5211,113 +5436,49 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
             *changed = true;
         }
     });
-    let mut auto = b.auto_size;
-    if ui
-        .checkbox(&mut auto, "自動サイズ")
-        .on_hover_text("文字に合わせて形状サイズを決める")
-        .changed()
-    {
-        b.auto_size = auto;
-        *changed = true;
-    }
+    // 内側余白。(自動サイズ・結合トグルは常時表示エリアへ移動した。)
     if ui
         .add(egui::Slider::new(&mut b.padding_px, 0.0..=120.0).text("余白"))
         .changed()
     {
         *changed = true;
     }
-    // 結合 (下の吹き出しと union)。塗りつぶせる本体を持つ形状のみ対応 — ぼかし系 /
-    // 線描画系 / テキストのみ (意識 / 集中線 / 流線 / なし) は不可なのでトグルを無効化し、
-    // 別形状で立った stale フラグをクリアする (ラボ `draw_bubble_toggles` 相当)。
-    let merge_supported = comic_core::shape_is_mergeable(&b.shape);
-    if !merge_supported && b.merge_with_below {
-        b.merge_with_below = false;
-        *changed = true;
-    }
-    let merge_resp = ui.add_enabled(
-        merge_supported,
-        egui::Checkbox::new(&mut b.merge_with_below, "下の吹き出しと結合"),
-    );
-    if merge_supported && merge_resp.changed() {
-        *changed = true;
-    }
-    if !merge_supported {
-        merge_resp.on_disabled_hover_text("この形状は結合に対応していません");
-    }
 }
 
-/// 吹き出し「しっぽ」タブ (表示 on/off + 種別 + 幅)。off→on で stash から復元し、位置を
-/// 覚える (ラボ `draw_bubble_toggles` のしっぽ部分相当)。しっぽを描かない形状 (集中線 /
-/// 流線 / 意識 / なし) ではトグルを無効化し無効ホバーを出す (§7.7 非対応で無効化)。
-fn bubble_tail_ui(
-    ui: &mut egui::Ui,
-    b: &mut BubbleObject,
-    changed: &mut bool,
-    obj_id: u64,
-    pivot: (f32, f32),
-    tail_stash: &mut HashMap<u64, Tail>,
-) {
-    let tail_supported = comic_core::shape_renders_tail(&b.shape);
-    let mut has_tail = b.tail.is_some();
-    let resp = ui.add_enabled(
-        tail_supported,
-        egui::Checkbox::new(&mut has_tail, "しっぽを表示"),
-    );
-    if tail_supported && resp.changed() {
-        if has_tail {
-            // off→on: stash があれば復元 (位置を覚える)、無ければ既定しっぽ。
-            b.tail = Some(
-                tail_stash
-                    .remove(&obj_id)
-                    .unwrap_or_else(|| default_bubble_tail(pivot)),
-            );
-        } else if let Some(t) = b.tail.take() {
-            // on→off: 現在のしっぽを stash して、次に on にしたとき復元できるようにする。
-            tail_stash.insert(obj_id, t);
-        }
-        *changed = true;
-    }
-    if !tail_supported {
-        resp.on_disabled_hover_text("この形状はしっぽに対応していません");
-        // 非対応形状に stale な b.tail が残っていても種別/幅は編集させない (見えない
-        // しっぽ状態を触らせない。Codex P3)。対応形状に切り替えれば下の編集が出る。
-        ui.label(
-            egui::RichText::new("この形状はしっぽに対応していません")
-                .small()
-                .color(egui::Color32::from_gray(160)),
-        );
-        return;
-    }
-    if let Some(t) = &mut b.tail {
-        ui.horizontal(|ui| {
-            ui.label("種別");
-            let mut k = t.kind;
-            if ui.selectable_label(k == TailKind::Spike, "会話").clicked() {
-                k = TailKind::Spike;
-            }
-            if ui
-                .selectable_label(k == TailKind::Thought, "思考")
-                .clicked()
-            {
-                k = TailKind::Thought;
-            }
-            if k != t.kind {
-                t.kind = k;
-                *changed = true;
-            }
-        });
-        if ui
-            .add(egui::Slider::new(&mut t.width_px, 4.0..=120.0).text("幅"))
-            .changed()
-        {
-            *changed = true;
-        }
-    } else {
+/// 吹き出し「しっぽ」タブ (詳細): 種別 + 幅。表示 on/off は常時表示の構造トグル
+/// (`bubble_struct_toggles_ui`) へ移動した。このタブはしっぽが存在するときだけ有効化される
+/// ので通常 `b.tail` は Some だが、防御的に None ヒントも出す (ラボ `tab_tail` 相当)。
+fn bubble_tail_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
+    let Some(t) = &mut b.tail else {
         ui.label(
             egui::RichText::new("「しっぽを表示」で会話/思考のしっぽを付けられます")
                 .small()
                 .color(egui::Color32::from_gray(160)),
         );
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.label("種別");
+        let mut k = t.kind;
+        if ui.selectable_label(k == TailKind::Spike, "会話").clicked() {
+            k = TailKind::Spike;
+        }
+        if ui
+            .selectable_label(k == TailKind::Thought, "思考")
+            .clicked()
+        {
+            k = TailKind::Thought;
+        }
+        if k != t.kind {
+            t.kind = k;
+            *changed = true;
+        }
+    });
+    if ui
+        .add(egui::Slider::new(&mut t.width_px, 4.0..=120.0).text("幅"))
+        .changed()
+    {
+        *changed = true;
     }
 }
 
@@ -5607,43 +5768,16 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
 /// メッセージウィンドウ「部品」タブ。名前プレート (モード・名前・色 + 装飾) / 立ち絵枠
 /// プレースホルダ / 続き指標。ラボ `draw_window_name_header` + `tab_window_parts` をまとめた。
 fn window_parts_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut bool) {
-    // ── 名前プレート ──
+    // ── 名前プレート (詳細スタイル。表示モード/名前色/話者名は常時表示の名前ヘッダ側) ──
     ui.label(egui::RichText::new("名前プレート").strong());
-    ui.horizontal(|ui| {
-        ui.label("表示");
-        egui::ComboBox::from_id_salt("win_name_mode")
-            .selected_text(name_plate_mode_label(w.name_plate.mode))
-            .show_ui(ui, |ui| {
-                for m in [
-                    NamePlateMode::None,
-                    NamePlateMode::Inline,
-                    NamePlateMode::Boxed,
-                    NamePlateMode::Above,
-                ] {
-                    if ui
-                        .selectable_value(&mut w.name_plate.mode, m, name_plate_mode_label(m))
-                        .changed()
-                    {
-                        *changed = true;
-                    }
-                }
-            });
-        if w.name_plate.mode != NamePlateMode::None {
-            let mut col = to_c32(w.name_plate.name.color);
-            if ui.color_edit_button_srgba(&mut col).changed() {
-                w.name_plate.name.color = from_c32(col);
-                *changed = true;
-            }
-        }
-    });
+    if w.name_plate.mode == NamePlateMode::None {
+        ui.label(
+            egui::RichText::new("上部の「名前」で表示モードを選ぶと詳細スタイルが出ます")
+                .small()
+                .color(egui::Color32::from_gray(160)),
+        );
+    }
     if w.name_plate.mode != NamePlateMode::None {
-        *changed |= ui
-            .add(
-                egui::TextEdit::singleline(&mut w.name_plate.name.text)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("話者名"),
-            )
-            .changed();
         *changed |= ui
             .add(egui::Slider::new(&mut w.name_plate.name.size_px, 8.0..=120.0).text("文字サイズ"))
             .changed();
