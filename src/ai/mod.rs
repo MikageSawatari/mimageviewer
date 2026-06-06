@@ -110,8 +110,6 @@ impl From<std::io::Error> for AiError {
 /// 使用可能な AI モデルの種類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelKind {
-    /// 画像タイプ分類（MobileNetV3）
-    ClassifierMobileNet,
     /// Real-ESRGAN x4plus（写真・CG、ノイズ除去強）
     UpscaleRealEsrganX4Plus,
     /// Real-ESRGAN Anime 6B（イラスト・アニメ、線画シャープ）
@@ -134,7 +132,6 @@ impl ModelKind {
     /// 設定保存用の文字列表現。
     pub fn as_str(&self) -> &'static str {
         match self {
-            ModelKind::ClassifierMobileNet => "classifier_mobilenet",
             ModelKind::UpscaleRealEsrganX4Plus => "realesrgan_x4plus",
             ModelKind::UpscaleRealEsrganAnime6B => "realesrgan_anime6b",
             ModelKind::UpscaleRealEsrGeneralV3 => "realesr_general_v3",
@@ -149,7 +146,6 @@ impl ModelKind {
     /// UI 表示用のラベル（用途ベース命名）。
     pub fn display_label(&self) -> &'static str {
         match self {
-            ModelKind::ClassifierMobileNet => "分類器 (MobileNetV3)",
             ModelKind::UpscaleRealEsrganX4Plus => "写真・CG (ノイズ除去強)",
             ModelKind::UpscaleRealEsrganAnime6B => "イラスト・アニメ",
             ModelKind::UpscaleRealCugan4x => "漫画 (トーン保持)",
@@ -164,7 +160,6 @@ impl ModelKind {
     /// 設定文字列からモデル種別を復元する。
     pub fn from_str(s: &str) -> Option<ModelKind> {
         match s {
-            "classifier_mobilenet" => Some(ModelKind::ClassifierMobileNet),
             "realesrgan_x4plus" => Some(ModelKind::UpscaleRealEsrganX4Plus),
             "realesrgan_anime6b" => Some(ModelKind::UpscaleRealEsrganAnime6B),
             // "waifu2x_cunet" は廃止。旧設定ファイルに存在する場合は無視

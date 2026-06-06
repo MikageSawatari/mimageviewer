@@ -71,7 +71,6 @@ echo "============================================================"
 echo "[ONNX models]"
 APPDATA_MODELS="${APPDATA:-$HOME/AppData/Roaming}/mimageviewer/models"
 MODELS_NEEDED=(
-    anime_classifier_mobilenetv3.onnx
     realesrgan_x4plus.onnx
     realesrgan_x4plus_anime_6b.onnx
     realesr_general_x4v3.onnx

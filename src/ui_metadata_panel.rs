@@ -244,7 +244,11 @@ impl App {
                         taggable_path.is_some(),
                         &mut clicked_tag,
                     );
-                    if tweet_info.is_some() || ai_metadata.is_some() || exif_info.is_some() {
+                    if tweet_info.is_some()
+                        || ai_metadata.is_some()
+                        || exif_info.is_some()
+                        || sidecar_info.is_some()
+                    {
                         ui.add_space(8.0);
                         ui.separator();
                         ui.add_space(8.0);

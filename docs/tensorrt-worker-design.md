@@ -20,17 +20,16 @@ PDFium ワーカーと同じ方式 (子プロセス) で TensorRT を分離す�
 ```
 mImageViewer.exe (メインプロセス、DirectML 専用)
 ├─ AiRuntime
-│   ├─ DirectML セッション (アップスケール / デノイズ / MI-GAN / 分類)
+│   ├─ DirectML セッション (アップスケール / デノイズ / MI-GAN)
 │   └─ TrtWorkerPool (Settings の ai_backend が TensorRt のときのみ起動)
 │       ├─ Worker 1: mImageViewer.exe --tensorrt-infer-worker
-│       └─ (1 ワーカーで十分。TRT セッションを 8 モデル分保持)
+│       └─ (1 ワーカーで十分。TRT セッションをモデル分保持)
 │
 └─ ai_backend = TensorRt 時の挙動:
     上述 worker pool に推論をルーティング (model別)
     - Upscale 系: Worker
     - Denoise: Worker
     - MI-GAN: メイン DirectML (TRT は遅い/不安定なため除外)
-    - Classifier: メイン DirectML (TRT で engine 生成されないため除外)
 ```
 
 メインは常に DirectML を保持。TensorRT が必要なときだけワーカーに丸投げ。
@@ -40,7 +39,7 @@ mImageViewer.exe (メインプロセス、DirectML 専用)
 逆 (メイン= TRT) ではなく メイン= DirectML を選ぶ理由:
 
 1. **TensorRT pack 未インストール時も DirectML は常に使える** = 起動失敗なし
-2. **MI-GAN や Classifier の DirectML フォールバックがメインで完結** = 別ワーカー不要
+2. **MI-GAN の DirectML フォールバックがメインで完結** = 別ワーカー不要
 3. **TensorRT を有効化したくないユーザー** はワーカープロセス起動コストすら払わなくて済む
 4. **TensorRT pack の更新中** でもメインは動いている
 
@@ -127,7 +126,6 @@ fn infer_target(kind: ModelKind, backend: AiBackend) -> InferTarget {
     match (backend, kind) {
         // TRT バックエンドでも、これらは常にメインの DirectML を使う
         (AiBackend::TensorRt, ModelKind::InpaintMiGan) => InferTarget::DirectMlLocal,
-        (AiBackend::TensorRt, ModelKind::ClassifierMobileNet) => InferTarget::DirectMlLocal,
         // TRT 効果が高いモデルはワーカーへ
         (AiBackend::TensorRt, _) => InferTarget::TrtWorker,
         // それ以外は全部ローカル DirectML
@@ -140,7 +138,7 @@ fn infer_target(kind: ModelKind, backend: AiBackend) -> InferTarget {
 - アップスケール: TRT で 1.4-3.4x 高速化
 - デノイズ: TRT で 4.5x 高速化
 - 消しゴム (MI-GAN): DirectML で 1-2 秒/推論 (現状維持)
-- 画像分類: DirectML で瞬時 (現状維持)
+- 画像タイプ自動判別: ヒューリスティクスで実行 (TRT 対象外)
 
 ## 設定 UI の変更
 
@@ -166,10 +164,10 @@ TrtWorkerPool::ensure_started() を呼ぶ
   ↓
 - pack 存在確認 → なければ「未インストール」表示で UI 通知
 - ワーカープロセス起動 (mimageviewer.exe --tensorrt-infer-worker)
-- ワーカー側で 8 モデルセッションをロード (キャッシュ済みエンジンなら数秒)
+- ワーカー側で TRT 対象モデルのセッションをロード (キャッシュ済みエンジンなら数秒)
   ↓
 完了通知が来たら、AiRuntime の dispatcher が TRT 経路を使い始める
-DirectML セッションはそのまま温存 (MI-GAN / Classifier 用)
+DirectML セッションはそのまま温存 (MI-GAN 用)
 
 ユーザーが DirectML に戻す
   ↓
@@ -363,7 +361,7 @@ RealCUGAN / MI-GAN) では engine compile を最初の `session.run()` まで遅
 
 実例 (Apr 28 のユーザー報告):
 
-- 「全エンジンビルド」で 8 モデル全て成功表示
+- 「全エンジンビルド」で対象モデル全て成功表示
 - TRT に切替えてフルスクリーンで上下キー操作
 - ログに `session_run=53389.690 ms` (= 53.4 秒) 等の異常値
 - フルスクリーン中はその時間で次画像へ移動 → cancel
@@ -375,18 +373,17 @@ runtime shape を返し、`load_model` 直後にダミー `session.run()` する
 
 | ModelKind | warmup shape (NCHW) | 由来 |
 |---|---|---|
-| ClassifierMobileNet | 1×3×384×384 | `ai/classify.rs::SIZE` |
 | DenoiseRealplksr | 1×3×256×256 | モデル仕様 (固定) |
 | InpaintMiGan | 1×**4**×512×512 | `ui_erase.rs::MIGAN_SIZE`、4 ch (RGB+mask) |
 | UpscaleRealEsrGeneralV3 | 1×3×512×512 | TRT tile=512 (pack v3 では build しないが warmup shape は残す) |
 | その他 Upscale 4 種 | 1×3×256×256 | TRT tile=256 |
 
-これらは `upscale.rs::model_tile_size` / `classify.rs::preprocess` /
-`ui_erase.rs::inpaint_migan` の実 runtime shape と一致させてある。
+これらは `upscale.rs::model_tile_size` / `ui_erase.rs::inpaint_migan`
+の実 runtime shape と一致させてある。
 変更時は同期忘れに注意 (一致しないと再び 30〜60 秒 hang が再発する)。
 
-副作用: 「全エンジンビルド」の所要時間が `LoadModel × 8 ≈ 数秒` から
-`(LoadModel + warmup) × 8 ≈ 5〜15 分` に伸びる。これが本来想定していた
+副作用: 「全エンジンビルド」の所要時間が `LoadModel × 対象モデル数 ≈ 数秒` から
+`(LoadModel + warmup) × 対象モデル数 ≈ 5〜15 分` に伸びる。これが本来想定していた
 コンパイル時間で、ユーザー向けマニュアルにも「初回 5〜15 分」と書いてある
 (短すぎたのが今までバグ)。
 

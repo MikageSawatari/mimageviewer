@@ -18,11 +18,6 @@ struct EmbeddedModel {
 /// exe に埋め込まれた全モデル。
 static EMBEDDED_MODELS: &[EmbeddedModel] = &[
     EmbeddedModel {
-        kind: ModelKind::ClassifierMobileNet,
-        filename: "anime_classifier_mobilenetv3.onnx",
-        bytes: include_bytes!("../../vendor/models/anime_classifier_mobilenetv3.onnx"),
-    },
-    EmbeddedModel {
         kind: ModelKind::UpscaleRealEsrganX4Plus,
         filename: "realesrgan_x4plus.onnx",
         bytes: include_bytes!("../../vendor/models/realesrgan_x4plus.onnx"),

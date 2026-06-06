@@ -1,46 +1,9 @@
-//! 画像タイプ分類（MobileNetV3 ベース）。
+//! 画像タイプ分類（ヒューリスティック）。
 //!
-//! deepghs/anime_classification の ONNX モデルを使い、
-//! 画像を Illustration / Comic / ThreeD / RealLife に分類する。
-//! 補助ヒューリスティクスでグレースケール判定も行う。
+//! 自動アップスケールモデル選択用に、画像を Illustration / Comic / RealLife に分類する。
+//! モノクロ漫画を優先的に拾い、それ以外は彩度からイラスト / 写真を大まかに推定する。
 
-use super::runtime::AiRuntime;
-use super::{AiError, ImageCategory, ModelKind};
-
-/// 画像を分類して最適なカテゴリを返す。
-///
-/// 1. グレースケール判定 → 高確率で Comic
-/// 2. MobileNetV3 で推論
-/// 3. softmax → argmax
-pub fn classify(
-    runtime: &AiRuntime,
-    image: &image::DynamicImage,
-) -> Result<ImageCategory, AiError> {
-    // ── Step 1: グレースケールヒューリスティクス ──
-    if is_likely_grayscale(image) {
-        return Ok(ImageCategory::Comic);
-    }
-
-    // ── Step 2: MobileNetV3 推論 ──
-    let input_array = preprocess(image);
-    let input_tensor = ort::value::Tensor::from_array(input_array)
-        .map_err(|e| AiError::Ort(format!("Tensor creation: {e}")))?;
-
-    let category = runtime.with_session(ModelKind::ClassifierMobileNet, |session| {
-        let outputs = session
-            .run(ort::inputs![input_tensor])
-            .map_err(|e| AiError::Ort(format!("run: {e}")))?;
-
-        // 出力テンソルからスコアを取得
-        let (_shape, scores) = outputs[0]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| AiError::Ort(format!("extract: {e}")))?;
-
-        Ok(argmax_to_category(scores))
-    })?;
-
-    Ok(category)
-}
+use super::ImageCategory;
 
 /// 画像がグレースケール（モノクロ漫画）かどうかを判定する。
 ///
@@ -78,70 +41,9 @@ pub fn is_likely_grayscale(image: &image::DynamicImage) -> bool {
     ratio > 0.95
 }
 
-/// 画像を MobileNetV3 入力用に前処理する。
+/// 分類器なしで使えるヒューリスティクス分類。
 ///
-/// - 384x384 にリサイズ（mobilenetv3_v1.5_dist の入力サイズ）
-/// - [0, 1] に正規化
-/// - ImageNet mean/std で標準化
-/// - NCHW 形式 [1, 3, 384, 384]
-fn preprocess(image: &image::DynamicImage) -> ndarray::Array4<f32> {
-    const SIZE: u32 = 384;
-    let resized = image.resize_exact(SIZE, SIZE, image::imageops::FilterType::Triangle);
-    let rgb = resized.to_rgb8();
-
-    // ImageNet の平均・標準偏差
-    let mean = [0.485f32, 0.456, 0.406];
-    let std = [0.229f32, 0.224, 0.225];
-
-    let mut tensor = ndarray::Array4::<f32>::zeros((1, 3, SIZE as usize, SIZE as usize));
-
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let pixel = rgb.get_pixel(x, y);
-            for c in 0..3 {
-                let val = pixel.0[c] as f32 / 255.0;
-                tensor[[0, c, y as usize, x as usize]] = (val - mean[c]) / std[c];
-            }
-        }
-    }
-
-    tensor
-}
-
-/// softmax スコアから ImageCategory に変換する。
-///
-/// mobilenetv3_v1.5_dist の出力クラス順序（meta.json による）:
-/// 0: "3d", 1: "bangumi", 2: "comic", 3: "illustration", 4: "not_painting"
-///
-/// bangumi は実質的に illustration に近いため Illustration として扱う。
-/// not_painting は写真として扱う。
-fn argmax_to_category(scores: &[f32]) -> ImageCategory {
-    if scores.len() < 4 {
-        return ImageCategory::RealLife;
-    }
-
-    let mut max_idx = 0;
-    let mut max_val = scores[0];
-    for (i, &s) in scores.iter().enumerate().skip(1) {
-        if s > max_val {
-            max_val = s;
-            max_idx = i;
-        }
-    }
-
-    match max_idx {
-        0 => ImageCategory::ThreeD,       // 3d
-        1 => ImageCategory::Illustration, // bangumi → illustration 扱い
-        2 => ImageCategory::Comic,        // comic
-        3 => ImageCategory::Illustration, // illustration
-        4 => ImageCategory::RealLife,     // not_painting → 写真扱い
-        _ => ImageCategory::RealLife,
-    }
-}
-
-/// 分類器なしで使えるヒューリスティクス分類（フォールバック用）。
-///
-/// モデルが未ダウンロードの場合にこちらを使う。
+/// 通常の自動アップスケールモデル選択ではこちらを使う。
 pub fn classify_heuristic(image: &image::DynamicImage) -> ImageCategory {
     if is_likely_grayscale(image) {
         return ImageCategory::Comic;

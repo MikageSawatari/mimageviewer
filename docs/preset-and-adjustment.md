@@ -671,7 +671,7 @@ MI-GAN / diffusion に渡す最終マスクと、オーバーレイ描画に使�
 | `upscale.rs` | タイル分割 + オーバーラップブレンド (2x/4x モデル) |
 | `denoise.rs` | 1x ノイズ除去 (タイル推論は upscale を流用) |
 | `ui_erase.rs` | MI-GAN によるマスク領域 inpaint (`InpaintMiGan` モデルを直接 `with_session` で呼び出し)。見開き中央ギャップ補完は精度不足で削除済み (タグ `v0.6.0-with-spread-inpaint` 参照) |
-| `classify.rs` | 画像種別分類 (MobileNetV3, Illustration/Comic/3D/RealLife) |
+| `classify.rs` | 画像種別分類 (ヒューリスティクス、Illustration/Comic/RealLife) |
 
 `ModelKind` でモデルを識別。セッションは最初の推論時に遅延生成される。
 メモリ負荷が大きいので、不要になった ModelKind はセッションを drop する (runtime.rs)。

@@ -67,12 +67,8 @@ fn test_runtime_and_model_loading() {
 
     let runtime = mimageviewer::ai::runtime::AiRuntime::new().expect("Failed to create AiRuntime");
 
-    // 全モデルのロードテスト
+    // 全推論モデルのロードテスト
     let models = [
-        (
-            mimageviewer::ai::ModelKind::ClassifierMobileNet,
-            "anime_classifier_mobilenetv3.onnx",
-        ),
         (
             mimageviewer::ai::ModelKind::UpscaleRealEsrganX4Plus,
             "realesrgan_x4plus.onnx",
@@ -113,41 +109,20 @@ fn test_runtime_and_model_loading() {
     }
 }
 
-/// 分類器テスト: 画像を入力して分類結果が得られるか。
+/// ヒューリスティック分類: モノクロ画像は漫画として扱う。
 #[test]
-fn test_classifier() {
-    let models_dir = find_models_dir();
-    let classifier_path = models_dir.join("anime_classifier_mobilenetv3.onnx");
-    if !classifier_path.exists() {
-        println!("SKIP: classifier model not found");
-        return;
+fn test_classify_heuristic_grayscale_is_comic() {
+    let mut img = image::RgbImage::new(64, 64);
+    for y in 0..64u32 {
+        for x in 0..64u32 {
+            let v = ((x + y) * 255 / 126) as u8;
+            img.put_pixel(x, y, image::Rgb([v, v, v]));
+        }
     }
 
-    let runtime = mimageviewer::ai::runtime::AiRuntime::new().unwrap();
-    runtime
-        .load_model(
-            mimageviewer::ai::ModelKind::ClassifierMobileNet,
-            &classifier_path,
-        )
-        .unwrap();
-
-    let img = get_test_image();
-    println!("Image size: {}x{}", img.width(), img.height());
-
-    // AI 分類
-    let category = mimageviewer::ai::classify::classify(&runtime, &img);
-    match category {
-        Ok(cat) => println!("Classification result: {:?} ({})", cat, cat.display_label()),
-        Err(e) => panic!("Classification failed: {}", e),
-    }
-
-    // ヒューリスティクス分類
-    let heuristic = mimageviewer::ai::classify::classify_heuristic(&img);
-    println!(
-        "Heuristic result: {:?} ({})",
-        heuristic,
-        heuristic.display_label()
-    );
+    let category =
+        mimageviewer::ai::classify::classify_heuristic(&image::DynamicImage::ImageRgb8(img));
+    assert_eq!(category, mimageviewer::ai::ImageCategory::Comic);
 }
 
 /// 各アップスケールモデルで小さいタイルを推論してみるテスト。

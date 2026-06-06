@@ -817,7 +817,7 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
     復旧しなければ DirectML フォールバック + バナー通知。
   - tile size の backend-aware 切替: TRT は 256、DirectML は 192 (実測ベース)
 - [x] AI JPEG ノイズ除去（RealPLKSR ~28MB、ブロックノイズ+モスキートノイズ除去）
-- [x] 画像タイプ自動判別（MobileNetV3 + ヒューリスティクス → モデル自動選択）
+- [x] 画像タイプ自動判別（ヒューリスティクス → モデル自動選択）
 - [x] 非破壊 AI 修復（消しゴムモード、MI-GAN タイル分割 inpaint、5 ツール、マスク永続化）
   - 旧「見開き AI 補完」は精度不足とアーティファクト過大により削除（タグ `v0.6.0-with-spread-inpaint` に保存）
 - [x] 画像補正パネル（グローバル + ページ個別、明るさ/コントラスト/ガンマ/彩度/色温度/レベル補正/AI ノイズ除去）
@@ -948,7 +948,6 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 | realcugan-x4-conservative | アップスケール「漫画 (トーン保持)」 | Real-CUGAN | ~5.4MB | MIT |
 | 4x_NMKD-Siax_200k | アップスケール「写真 (質感保持)」 | ESRGAN 派生 | ~69MB | WTFPL (public domain) |
 | realesr-general-x4v3 | アップスケール「高速汎用」 | SRVGGNetCompact | ~4.7MB | BSD-3-Clause |
-| anime_classification | 画像タイプ分類 | MobileNetV3 | — | MIT |
 | mi-gan-512 | 消しゴムツール inpainting | MI-GAN | — | MIT |
 | 1xDeJPG_realplksr_otf | JPEG ノイズ除去（高品質） | RealPLKSR | ~28MB | CC-BY-4.0 |
 

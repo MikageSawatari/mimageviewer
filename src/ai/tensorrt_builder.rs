@@ -144,14 +144,12 @@ pub fn run_worker_process() -> ! {
 /// 30〜60 秒の hang が発生する (Apr 28 のユーザー報告で発覚)。
 ///
 /// shape の出どころ:
-/// - `ClassifierMobileNet`: `ai/classify.rs::preprocess` の `SIZE = 384`
 /// - `DenoiseRealplksr`: 256×256 固定 (モデル仕様)
 /// - `InpaintMiGan`: `ui_erase.rs::MIGAN_SIZE = 512`、4 ch (RGB + mask)
 /// - `UpscaleRealEsrGeneralV3`: TRT tile = 512 (`upscale.rs::model_tile_size`)
 /// - その他アップスケール: TRT tile = 256
 fn warmup_input_shape(kind: ModelKind) -> (usize, usize, usize, usize) {
     match kind {
-        ModelKind::ClassifierMobileNet => (1, 3, 384, 384),
         ModelKind::DenoiseRealplksr => (1, 3, 256, 256),
         ModelKind::InpaintMiGan => (1, 4, 512, 512),
         // SubjectMatte (BiRefNet) は should_route_to_worker=false なので TRT engine は作らないが、

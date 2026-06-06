@@ -56,7 +56,6 @@ MODELS_DIR = REPO_ROOT / "vendor" / "models"
 
 # vendor/models/ 配下にある FP16 化対象ファイル一覧
 MODEL_FILES = [
-    "anime_classifier_mobilenetv3.onnx",
     "realesrgan_x4plus.onnx",
     "realesrgan_x4plus_anime_6b.onnx",
     "realesr_general_x4v3.onnx",

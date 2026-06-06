@@ -182,6 +182,7 @@ td {
   vertical-align: top;
   color: var(--text-sub);
 }
+td.time-cell { white-space: nowrap; }
 tr:last-child td { border-bottom: none; }
 tbody tr:hover td { background: var(--pink-bg); }
 

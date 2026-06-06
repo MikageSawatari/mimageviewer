@@ -232,7 +232,7 @@ fn ensure_ort_initialized(requested: AiBackend) -> Result<ActiveBackend, AiError
 /// する。これにより:
 ///
 /// - バックエンド切り替えで再起動が不要 (worker を attach/detach するだけ)
-/// - TRT で動かないモデル (MI-GAN, Classifier) は DirectML で動かせる
+/// - TRT で動かないモデル (MI-GAN など) は DirectML で動かせる
 /// - TRT クラッシュで GUI 全体が落ちない
 pub struct AiRuntime {
     /// ModelKind → Session のキャッシュ (DirectML ローカルセッション)。
@@ -379,7 +379,6 @@ impl AiRuntime {
     ///   - Upscale 系 (5 モデル): 1.4-3.4x 高速化
     ///   - Denoise: 4.5x 高速化
     ///   - MI-GAN: TRT エンジンビルドが 5+ 分かかるため、安定するまで DirectML
-    ///   - Classifier: TRT で engine 生成されない (CUDA EP fallback、効果なし)
     ///   - **UpscaleRealEsrGeneralV3**: 軽量モデルで bench 上 TRT/DirectML が
     ///     互角〜DirectML 微優位 (2026-05 RTX 4090 計測、tile=512)。worker IPC
     ///     overhead を払うほどの利得が無いため、TRT pack を入れていても本モデル
@@ -391,7 +390,6 @@ impl AiRuntime {
         }
         match kind {
             ModelKind::InpaintMiGan => false,
-            ModelKind::ClassifierMobileNet => false,
             ModelKind::SubjectMatte => false,
             ModelKind::UpscaleRealEsrGeneralV3 => false,
             ModelKind::UpscaleRealEsrganX4Plus

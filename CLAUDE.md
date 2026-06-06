@@ -50,7 +50,7 @@ dual-window approach.
 - **AI upscaling**: `ort` crate (ONNX Runtime v2、`load-dynamic` モード、`directml` + `cuda` + `tensorrt` features)。Real-ESRGAN / Real-CUGAN / NMKD-Siax ONNX モデルでタイル分割 4x アップスケール。バックエンドは Settings の `ai_backend` で DirectML / TensorRT を切替 (TRT は NVIDIA 専用)
 - **ONNX Runtime DLL**: `onnxruntime.dll` / `onnxruntime_providers_shared.dll` (Microsoft.ML.OnnxRuntime.DirectML NuGet v1.24.2) を exe に `include_bytes!` で埋め込み、初回 AiRuntime 作成時に `%APPDATA%/mimageviewer/` に展開。`ort::init_from()` で動的ロードする。これにより VC++ 再頒布可能パッケージ不要
 - **TensorRT 対応 (NVIDIA GPU 高速化、オプション)**: `Microsoft.ML.OnnxRuntime.Gpu.Windows` + NVIDIA CUDA Runtime / cuBLAS / cuFFT / cuRAND / cuSOLVER / cuSPARSE / NVRTC / nvJitLink / cuDNN / TensorRT (合計 ~6.8 GB) を `%APPDATA%/mimageviewer/tensorrt/` に展開して使用。pack DL は `scripts/setup-tensorrt-pack.ps1` (PoC 版、アプリ内 DL UI は将来実装)。実測 1.4-3.4x (アップスケール) / 4.5x (デノイズ) 高速化。エンジンビルダーは `mimageviewer.exe --tensorrt-build <model>` 子プロセス。詳細は [docs/tensorrt-batching-feasibility.md](docs/tensorrt-batching-feasibility.md)
-- **AI image classification**: deepghs/anime_classification MobileNetV3 (ONNX) + ヒューリスティクス。イラスト/漫画/CG/写真を自動判別
+- **AI image classification**: ヒューリスティクスでイラスト/漫画/CG/写真を自動判別
 - **AI inpainting**: MI-GAN (ONNX, DirectML) を消しゴムツールから利用してマスク領域を補完
   （見開きページ中央欠落補完は精度不足で削除済み。タグ `v0.6.0-with-spread-inpaint` 参照）
 - **AI model management**: exe に `include_bytes!` で埋め込み → 初回起動時に `%APPDATA%/mimageviewer/models/` に展開
@@ -76,7 +76,7 @@ mimageviewer/
 │   │   ├── mod.rs           # ModelKind, ImageCategory, AiError 型定義
 │   │   ├── runtime.rs       # ONNX Runtime (DirectML EP) セッション管理
 │   │   ├── model_manager.rs # モデル埋め込み・展開・パス管理
-│   │   ├── classify.rs      # 画像タイプ分類 (MobileNetV3 + ヒューリスティクス)
+│   │   ├── classify.rs      # 画像タイプ分類 (ヒューリスティクス)
 │   │   ├── denoise.rs       # JPEG ノイズ除去推論
 │   │   └── upscale.rs       # タイル分割 4x アップスケール推論
 │   ├── ui_main.rs           # メイン画面 UI（グリッド描画）
@@ -598,7 +598,7 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 
 ## ONNX Runtime 管理
 
-AI 機能 (アップスケール・ノイズ除去・画像分類・消しゴム) は ONNX Runtime + DirectML EP を
+AI 機能 (アップスケール・ノイズ除去・消しゴム) は ONNX Runtime + DirectML EP を
 使用する。`ort` クレートの `load-dynamic` 機能で、メイン exe は静的リンクせず、起動時に
 `%APPDATA%\mimageviewer\onnxruntime.dll` を動的ロードする。DLL は PDFium と同様
 `include_bytes!` で exe に埋め込み、初回 `AiRuntime::new()` で APPDATA へ展開する。
