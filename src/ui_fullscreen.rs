@@ -383,6 +383,7 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
             | egui::Key::W
             | egui::Key::Enter
             | egui::Key::Escape
+            | egui::Key::Backspace
             | egui::Key::Space
             | egui::Key::S
             | egui::Key::M
@@ -5453,7 +5454,9 @@ impl App {
             self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, delta > 0, false);
         } else if let Some(delta) = sibling_nav {
             self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, delta > 0, false);
-        } else if !close_fs {
+        } else if !close_fs && !close_to_page_list {
+            // close (Esc) / close_to_page_list (BS) は終端アクション。閉じた後に同フレームの
+            // wheel 由来 nav_delta 等で別項目を開き直さないようガードする。
             if let Some(new_idx) = jump_to {
                 self.open_fullscreen_from_fs_navigation(ctx, new_idx);
                 self.selected = Some(new_idx);
