@@ -35,8 +35,13 @@ pub const DEFAULT_TOLERANCE: u8 = 24;
 const DETECT_LONG_SIDE: usize = 1000;
 
 /// 縁ピクセルのうち、これ以上の割合が余白色でないと「一様な余白がある」とみなさない
-/// (= フルブリード扱いで `None`)。
-const BORDER_MARGIN_FRAC: f32 = 0.80;
+/// (= フルブリード扱いで `None`)。**漫画は絵が一部の辺だけ裁ち落とし (ブリード) で端まで
+/// 届くことが多い** (例: 左・上・下は端まで絵があり右だけ余白)。閾値を高くすると、こうした
+/// ページを「縁が余白でない」と誤判定して丸ごとカットしなくなり、余白のある辺 (右) も
+/// 詰まらない。0.50 にして「縁の過半が余白色なら、余白のある辺だけ詰める」方針にする。
+/// 縁の余白色は median 推定なので、過半が余白なら色推定は正しく、緩めても誤検出しない。
+/// (= 真のフルブリード: 縁の半分以上が絵 なら従来どおり `None`)。
+const BORDER_MARGIN_FRAC: f32 = 0.50;
 
 /// 連結成分の面積 (縮小後 px) がこれ未満なら孤立した点/ゴミとみなして捨てる。
 /// 本文や線 (縦横どちらも) はこれを超えるので残る。**ページ番号(ノンブル)などの数字は
@@ -456,6 +461,28 @@ mod tests {
         let mut img = white(64, 64);
         fill(&mut img, 0, 0, 64, 64, Color32::from_gray(40)); // ほぼ全面 ink
         assert!(detect_content_bbox(&img, DEFAULT_TOLERANCE).is_none());
+    }
+
+    #[test]
+    fn partial_bleed_cuts_only_margin_edges() {
+        // 漫画の裁ち落とし相当: 絵が左右の縁まで届き (border_frac が 0.80 未満に下がる)、
+        // 上下に余白。旧 BORDER_MARGIN_FRAC=0.80 だと丸ごと None だったが、緩和後は
+        // 余白のある上下だけ詰め、中身のある左右は端のまま残す。
+        let mut img = white(100, 100);
+        fill(&mut img, 0, 10, 100, 90, Color32::BLACK); // 全幅 y[10,90) (左右ブリード)
+        let b = detect_content_bbox(&img, DEFAULT_TOLERANCE).expect("部分ブリードでも検出される");
+        assert!(b.min.y > 0.05, "上の余白を詰める: {}", b.min.y);
+        assert!(b.max.y < 0.95, "下の余白を詰める: {}", b.max.y);
+        assert!(
+            b.min.x < 0.05,
+            "左は端まで (中身がある=詰めない): {}",
+            b.min.x
+        );
+        assert!(
+            b.max.x > 0.95,
+            "右は端まで (中身がある=詰めない): {}",
+            b.max.x
+        );
     }
 
     #[test]
