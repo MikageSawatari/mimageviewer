@@ -5593,7 +5593,7 @@ impl App {
             None => "None (通常フィット)".to_string(),
         };
         crate::logger::log(format!(
-            "[margin-fit diag] idx={} orig={}x{} downscaled={}x{} margin_luma={} border_frac={:.2} min_area={} tol={} 最終bbox={}",
+            "[margin-fit diag] idx={} orig={}x{} downscaled={}x{} margin_luma={} border_frac={:.2} min_area={} tol={} 成分数={} 最終bbox={}",
             idx,
             pixels.size[0],
             pixels.size[1],
@@ -5603,86 +5603,13 @@ impl App {
             diag.border_margin_frac,
             diag.min_area,
             diag.tol,
+            diag.components.len(),
             bbox_s
         ));
-        crate::logger::log(format!(
-            "[margin-fit diag] 成分数={} (面積降順・上位20、KEEP=面積>={})",
-            diag.components.len(),
-            diag.min_area
-        ));
-        for (i, c) in diag.components.iter().take(20).enumerate() {
-            crate::logger::log(format!(
-                "  #{:<2} area={:<6} rect=[{:.3},{:.3} .. {:.3},{:.3}] {}",
-                i + 1,
-                c.area,
-                c.rect.min.x,
-                c.rect.min.y,
-                c.rect.max.x,
-                c.rect.max.y,
-                if c.kept { "KEEP" } else { "drop" }
-            ));
-        }
-        let kept: Vec<&crate::margin_fit::DiagComponent> =
-            diag.components.iter().filter(|c| c.kept).collect();
-        if let (Some(l), Some(r), Some(t), Some(b)) = (
-            kept.iter()
-                .min_by(|a, b| a.rect.min.x.total_cmp(&b.rect.min.x)),
-            kept.iter()
-                .max_by(|a, b| a.rect.max.x.total_cmp(&b.rect.max.x)),
-            kept.iter()
-                .min_by(|a, b| a.rect.min.y.total_cmp(&b.rect.min.y)),
-            kept.iter()
-                .max_by(|a, b| a.rect.max.y.total_cmp(&b.rect.max.y)),
-        ) {
-            crate::logger::log(format!(
-                "[margin-fit diag] 端を決める KEEP 成分: 左 area={}@x{:.3} / 右 area={}@x{:.3} / 上 area={}@y{:.3} / 下 area={}@y{:.3}",
-                l.area,
-                l.rect.min.x,
-                r.area,
-                r.rect.max.x,
-                t.area,
-                t.rect.min.y,
-                b.area,
-                b.rect.max.y
-            ));
-        }
-        // 余白 (外周12%) に居る小さめの成分 = ページ番号 / ゴミ / 端の点 の候補。
-        // bbox を決める大ブロックではなく、これらの面積を見て MIN_COMPONENT_AREA の
-        // しきい値 (= ページ番号は残し・ゴミは落とす境目) を数値で決める。大ブロック
-        // (面積上位4) は本文なので除外し、それ以外で中心が外周にあるものを面積降順で出す。
-        let big = 4usize.min(diag.components.len());
-        let mut marks: Vec<&crate::margin_fit::DiagComponent> = diag
-            .components
-            .iter()
-            .skip(big)
-            .filter(|c| {
-                let cx = (c.rect.min.x + c.rect.max.x) * 0.5;
-                let cy = (c.rect.min.y + c.rect.max.y) * 0.5;
-                cx < 0.12 || cx > 0.88 || cy < 0.12 || cy > 0.88
-            })
-            .collect();
-        marks.sort_by(|a, b| b.area.cmp(&a.area));
-        crate::logger::log(format!(
-            "[margin-fit diag] 余白(外周12%)の成分 上位15 (ページ番号/ゴミ候補、KEEP=面積>={}):",
-            diag.min_area
-        ));
-        for (i, c) in marks.iter().take(15).enumerate() {
-            crate::logger::log(format!(
-                "  M{:<2} area={:<5} center=({:.3},{:.3}) rect=[{:.3},{:.3} .. {:.3},{:.3}] {}",
-                i + 1,
-                c.area,
-                (c.rect.min.x + c.rect.max.x) * 0.5,
-                (c.rect.min.y + c.rect.max.y) * 0.5,
-                c.rect.min.x,
-                c.rect.min.y,
-                c.rect.max.x,
-                c.rect.max.y,
-                if c.kept { "KEEP" } else { "drop" }
-            ));
-        }
-        // 実際にカットされる成分 = 最終 bbox の外へはみ出すもの。ページ番号が本当に切られて
-        // いるか・その面積はいくつかを確定する (= MIN_COMPONENT_AREA をいくつにすれば番号が
-        // bbox に含まれて切られなくなるか)。bbox=None (通常フィット) のときは何も切られない。
+        // 実際にカットされる成分 (= 最終 bbox の外へはみ出すもの) を上位5件だけ要約。原因
+        // 切り分け (番号/ゴミが切られているか・面積いくつか) に一番効くのでこれだけ残す。
+        // 詳しい全成分ダンプが要るときは margin_fit::diagnose の結果をここで展開すればよい。
+        // bbox=None (通常フィット) のときは何も切られない。
         if let Some(bb) = diag.bbox {
             let eps = 1e-4;
             let mut cut: Vec<&crate::margin_fit::DiagComponent> = diag
@@ -5696,24 +5623,24 @@ impl App {
                 })
                 .collect();
             cut.sort_by(|a, b| b.area.cmp(&a.area));
+            let shown: Vec<String> = cut
+                .iter()
+                .take(5)
+                .map(|c| {
+                    format!(
+                        "area={}@({:.3},{:.3}){}",
+                        c.area,
+                        (c.rect.min.x + c.rect.max.x) * 0.5,
+                        (c.rect.min.y + c.rect.max.y) * 0.5,
+                        if c.kept { "KEEP" } else { "" }
+                    )
+                })
+                .collect();
             crate::logger::log(format!(
-                "[margin-fit diag] カット対象 (bbox 外へはみ出す成分) {}件 上位15 (面積降順):",
-                cut.len()
+                "[margin-fit diag] カット対象 {}件 上位5: {}",
+                cut.len(),
+                shown.join(" / ")
             ));
-            for (i, c) in cut.iter().take(15).enumerate() {
-                crate::logger::log(format!(
-                    "  C{:<2} area={:<5} center=({:.3},{:.3}) rect=[{:.3},{:.3} .. {:.3},{:.3}] {}",
-                    i + 1,
-                    c.area,
-                    (c.rect.min.x + c.rect.max.x) * 0.5,
-                    (c.rect.min.y + c.rect.max.y) * 0.5,
-                    c.rect.min.x,
-                    c.rect.min.y,
-                    c.rect.max.x,
-                    c.rect.max.y,
-                    if c.kept { "KEEP" } else { "drop" }
-                ));
-            }
         }
     }
 
