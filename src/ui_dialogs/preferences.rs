@@ -41,6 +41,8 @@ pub(crate) enum PreferencesPage {
     DuplicateFiles,
     ExifDisplay,
     SpreadMode,
+    /// 読書/再生位置の復元 (動画・ZIP/PDF × 一覧から開く・Ctrl+↑↓ 移動)
+    PlaybackResume,
     SusiePlugins,
     /// v0.8.0: 自動インデクサ速度プロファイル
     IndexerSpeed,
@@ -77,6 +79,7 @@ impl PreferencesPage {
             Self::DuplicateFiles => "同名ファイル",
             Self::ExifDisplay => "EXIF表示",
             Self::SpreadMode => "見開き表示",
+            Self::PlaybackResume => "位置の復元",
             Self::SusiePlugins => "Susie プラグイン",
             Self::IndexerSpeed => "自動インデクサ速度",
             Self::TrayResidency => "タスクトレイ常駐",
@@ -147,6 +150,11 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "見開き表示",
         page: Some(PreferencesPage::SpreadMode),
+        children: &[],
+    },
+    TreeCategory {
+        label: "位置の復元",
+        page: Some(PreferencesPage::PlaybackResume),
         children: &[],
     },
     TreeCategory {
@@ -1038,6 +1046,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::DuplicateFiles => page_duplicate_files(ui, state),
         PreferencesPage::ExifDisplay => page_exif_display(ui, state, enter_pressed),
         PreferencesPage::SpreadMode => page_spread_mode(ui, state),
+        PreferencesPage::PlaybackResume => page_playback_resume(ui, state),
         PreferencesPage::SusiePlugins => page_susie_plugins(ui, state),
         PreferencesPage::IndexerSpeed => page_indexer_speed(ui, state),
         PreferencesPage::TrayResidency => page_tray_residency(ui, state),

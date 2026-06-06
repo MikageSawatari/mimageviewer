@@ -84,8 +84,9 @@ pub(crate) struct DeferredFsReopen {
     /// フォルダナビ (Ctrl+↑↓) / ★固定ナビ由来は false。
     pub auto_opened_container: bool,
     /// 列挙完了で開くページを「先頭」ではなく「保存済み読書位置 (続きから)」にするか。
-    /// grid から本を開いた (= `pending_auto_fs_open`) ときだけ true。Ctrl+↑↓ フォルダナビは
-    /// 「フォルダ先頭着地」の設計を保つため false。
+    /// grid から本を開いた経路は設定 `book_open_resume`、Ctrl+↑↓ フォルダナビ経路は
+    /// `book_nav_resume` で true/false を決める (位置復元マトリクス)。既定は grid=続き /
+    /// nav=先頭で従来挙動を維持。
     pub resume_to_last_page: bool,
 }
 
@@ -8031,7 +8032,8 @@ impl App {
                 resume_slideshow: false,
                 target: None,
                 auto_opened_container: true,
-                resume_to_last_page: true,
+                // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
+                resume_to_last_page: self.settings.book_open_resume.resumes(),
             });
         }
 
@@ -8295,7 +8297,8 @@ impl App {
                 resume_slideshow: false,
                 target: None,
                 auto_opened_container: true,
-                resume_to_last_page: true,
+                // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
+                resume_to_last_page: self.settings.book_open_resume.resumes(),
             });
         }
 
@@ -14173,7 +14176,8 @@ impl App {
                 resume_slideshow,
                 target: None,
                 auto_opened_container: self.auto_open_for_current_container(),
-                resume_to_last_page: false,
+                // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
+                resume_to_last_page: self.settings.book_nav_resume.resumes(),
             });
             return "enumerate_defer";
         }
@@ -14186,7 +14190,8 @@ impl App {
                 resume_slideshow,
                 target: None,
                 auto_opened_container: self.auto_open_for_current_container(),
-                resume_to_last_page: false,
+                // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
+                resume_to_last_page: self.settings.book_nav_resume.resumes(),
             });
             return "enumerate_defer";
         }
@@ -17011,6 +17016,7 @@ impl App {
                     saved_resume,
                     from_grid,
                     self.settings.video_grid_open_starts_from_beginning,
+                    self.settings.video_nav_resume,
                 )
             })
         };
@@ -29618,16 +29624,22 @@ pub(crate) fn color_image_to_dynamic_composited(
     image::DynamicImage::ImageRgb8(buf)
 }
 
+/// 動画 open 時の resume 位置を決める (位置復元マトリクスの動画行)。
+/// `from_grid` = 一覧から明示的に開いた (= `open_starts_from_beginning` で判定)、
+/// それ以外 (Ctrl+↑↓ / ホイール / キー移動 / 再開) は `nav_resume` で判定。
+/// 「最初から」なら `None` (= 先頭再生)、「続きから」なら保存済み位置。
 fn video_resume_for_open(
     saved_resume: Option<f64>,
     from_grid: bool,
-    grid_open_starts_from_beginning: bool,
+    open_starts_from_beginning: bool,
+    nav_resume: crate::settings::ResumeMode,
 ) -> Option<f64> {
-    if from_grid && grid_open_starts_from_beginning {
-        None
+    let from_start = if from_grid {
+        open_starts_from_beginning
     } else {
-        saved_resume
-    }
+        matches!(nav_resume, crate::settings::ResumeMode::FromStart)
+    };
+    if from_start { None } else { saved_resume }
 }
 
 #[cfg(windows)]

@@ -1291,13 +1291,13 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
         ui.label(egui::RichText::new("レジューム再生").strong());
         ui.add_space(4.0);
-        ui.checkbox(
-            &mut s.video_grid_open_starts_from_beginning,
-            "一覧から開いたときは最初から再生する",
-        )
-        .on_hover_text(
-            "ON: サムネイル一覧からダブルクリック / Enter で開いた動画は、保存済み再生位置があっても先頭から再生します。\n\
-         ホイール / ↑↓ などフルスクリーン中の動画移動では、従来どおり保存済み位置から再開します。",
+        ui.label(
+            egui::RichText::new(
+                "「続きから / 最初から」の切り替えは、左の「位置の復元」ページにまとめています\n\
+                 (動画・ZIP/PDF × 一覧から開く・Ctrl+↑↓ 移動)。",
+            )
+            .size(11.0)
+            .color(egui::Color32::from_gray(150)),
         );
         ui.add_space(6.0);
         let count = s.video_resume_positions.len();
@@ -2197,6 +2197,72 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 ui.selectable_value(&mut s.default_spread_mode, mode, mode.label());
             }
         });
+}
+
+pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    use crate::settings::ResumeMode;
+    let s = &mut state.settings;
+
+    ui.label(
+        "動画と ZIP/PDF (本) を「一覧から開いたとき」と「Ctrl+↑↓ で移動したとき」に、\n\
+         前回の位置 (続きから) で開くか、最初/先頭から開くかを設定します。\n\
+         保存された位置が無いときは自動的に先頭になります。",
+    );
+    ui.add_space(10.0);
+
+    // 「動画 × 一覧から開く」は互換のため既存 bool (video_grid_open_starts_from_beginning) が
+    // 保存先。accessor 経由で ResumeMode として読み書きする。他 3 セルは専用 enum フィールド。
+    let mut video_open = s.video_open_resume();
+    let mut video_nav = s.video_nav_resume;
+    let mut book_open = s.book_open_resume;
+    let mut book_nav = s.book_nav_resume;
+
+    let combo = |ui: &mut egui::Ui, id: &str, val: &mut ResumeMode| {
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(val.label())
+            .width(96.0)
+            .show_ui(ui, |ui| {
+                for &m in ResumeMode::all() {
+                    ui.selectable_value(val, m, m.label());
+                }
+            });
+    };
+
+    egui::Grid::new("playback_resume_grid")
+        .num_columns(3)
+        .spacing([24.0, 10.0])
+        .show(ui, |ui| {
+            ui.label("");
+            ui.strong("一覧から開く");
+            ui.strong("Ctrl+↑↓ で移動");
+            ui.end_row();
+
+            ui.strong("動画");
+            combo(ui, "pr_video_open", &mut video_open);
+            combo(ui, "pr_video_nav", &mut video_nav);
+            ui.end_row();
+
+            ui.strong("ZIP / PDF (本)");
+            combo(ui, "pr_book_open", &mut book_open);
+            combo(ui, "pr_book_nav", &mut book_nav);
+            ui.end_row();
+        });
+
+    s.set_video_open_resume(video_open);
+    s.video_nav_resume = video_nav;
+    s.book_open_resume = book_open;
+    s.book_nav_resume = book_nav;
+
+    ui.add_space(12.0);
+    ui.label(
+        egui::RichText::new(
+            "既定: 動画は「一覧から開く=続きから」「Ctrl+↑↓=続きから」。\n\
+             ZIP/PDF は「一覧から開く=続きから」「Ctrl+↑↓=先頭から」。\n\
+             例えば「Ctrl+↑↓ は続き・開いたら先頭」のように、セルごとに自由に組み合わせられます。",
+        )
+        .size(11.0)
+        .color(egui::Color32::from_gray(150)),
+    );
 }
 
 pub(super) fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {

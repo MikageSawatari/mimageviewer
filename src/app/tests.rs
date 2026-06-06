@@ -375,13 +375,35 @@ fn fullscreen_keep_set_keeps_current_image_when_filtered_out() {
 // ── passes_rating_filter (コンテナ/画像/Video の挙動) ──
 
 #[test]
-fn video_resume_for_open_can_ignore_grid_open_only() {
+fn video_resume_for_open_grid_and_nav_modes() {
+    use crate::settings::ResumeMode::{FromStart, Resume};
     let saved = Some(42.0);
 
-    assert_eq!(video_resume_for_open(saved, true, false), saved);
-    assert_eq!(video_resume_for_open(saved, false, true), saved);
-    assert_eq!(video_resume_for_open(saved, true, true), None);
-    assert_eq!(video_resume_for_open(None, true, true), None);
+    // 一覧から開く (from_grid=true): open_starts_from_beginning が判定、nav_resume は無視。
+    assert_eq!(
+        video_resume_for_open(saved, true, false, Resume),
+        saved,
+        "grid 開く・続きから"
+    );
+    assert_eq!(
+        video_resume_for_open(saved, true, true, Resume),
+        None,
+        "grid 開く・先頭から"
+    );
+    assert_eq!(video_resume_for_open(None, true, true, Resume), None);
+
+    // Ctrl+↑↓ / ホイール等 (from_grid=false): nav_resume が判定、open 設定は無視。
+    assert_eq!(
+        video_resume_for_open(saved, false, true, Resume),
+        saved,
+        "nav・続きから (open=先頭 でも無視)"
+    );
+    assert_eq!(
+        video_resume_for_open(saved, false, false, FromStart),
+        None,
+        "nav・先頭から"
+    );
+    assert_eq!(video_resume_for_open(None, false, false, Resume), None);
 }
 
 #[test]

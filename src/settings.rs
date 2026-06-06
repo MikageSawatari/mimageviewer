@@ -546,6 +546,41 @@ impl AiFeatureMode {
 }
 
 /// - `RtlCover`: 見開き 右→左（表紙あり）— [0] [1,2] [3,4] ...
+/// 動画 / ZIP・PDF 本を開く・移動したときに、前回位置 (続き) から始めるか先頭からか。
+/// 「エントリ方法 (一覧から開く / Ctrl+↑↓ 移動) × メディア (動画 / 本)」の各セルに使う共通 enum。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeMode {
+    /// 前回の位置 (動画=再生秒 / 本=最後に読んだページ) から。保存が無ければ先頭にフォールバック。
+    #[default]
+    Resume,
+    /// 常に先頭 (動画=0 秒 / 本=1 ページ目) から。
+    FromStart,
+}
+
+impl ResumeMode {
+    /// 続きから復元するか (= Resume)。
+    pub fn resumes(self) -> bool {
+        matches!(self, Self::Resume)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Resume => "続きから",
+            Self::FromStart => "最初から",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Resume, Self::FromStart]
+    }
+}
+
+/// `book_nav_resume` の serde 既定 (= 従来の「フォルダ先頭着地」)。
+fn default_resume_from_start() -> ResumeMode {
+    ResumeMode::FromStart
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum SpreadMode {
     #[default]
@@ -1110,9 +1145,23 @@ pub struct Settings {
     #[serde(default)]
     pub video_resume_positions: std::collections::HashMap<String, f64>,
     /// 一覧から明示的に動画を開いたとき、保存済み resume 位置を使わず先頭から開くか。
-    /// フルスクリーン中のホイール / キー移動では既存どおり resume 位置を使う。
+    /// (v0.9.0 リリース済みの bool。位置復元マトリクスの「動画 × 一覧から開く」セルの保存先を
+    /// 兼ねる。互換のため enum 化せず bool のまま残す。アクセスは `Settings::video_open_resume`
+    /// / `set_video_open_resume` 経由)。
     #[serde(default)]
     pub video_grid_open_starts_from_beginning: bool,
+    /// 動画を Ctrl+↑↓ / ホイール / キーで移動したとき、続きから再生するか最初からか。
+    /// (位置復元マトリクス「動画 × Ctrl+↑↓ 移動」。既定 = 続きから = 従来挙動)
+    #[serde(default)]
+    pub video_nav_resume: ResumeMode,
+    /// ZIP/PDF を一覧から開いたとき、保存済み読書位置 (続き) から開くか先頭からか。
+    /// (位置復元マトリクス「ZIP/PDF × 一覧から開く」。既定 = 続きから = 従来挙動)
+    #[serde(default)]
+    pub book_open_resume: ResumeMode,
+    /// ZIP/PDF を Ctrl+↑↓ フォルダナビで移動したとき、続きから開くか先頭からか。
+    /// (位置復元マトリクス「ZIP/PDF × Ctrl+↑↓ 移動」。既定 = 先頭から = 従来「フォルダ先頭着地」)
+    #[serde(default = "default_resume_from_start")]
+    pub book_nav_resume: ResumeMode,
     /// ハードウェアデコードを利用するか (Windows D3D11VA)。D3D11VA 非対応 codec は
     /// SW で再生し、D3D11VA 対応 codec の HW 初期化 / open 失敗はエラーとして扱う。
     /// HEVC / 4K 動画の CPU 負荷を大きく下げるため既定 ON。GPU ドライバの不具合等で
@@ -1871,6 +1920,9 @@ impl Default for Settings {
             video_muted: false,
             video_resume_positions: std::collections::HashMap::new(),
             video_grid_open_starts_from_beginning: false,
+            video_nav_resume: ResumeMode::Resume,
+            book_open_resume: ResumeMode::Resume,
+            book_nav_resume: ResumeMode::FromStart,
             video_hw_decode: true,
             video_deinterlace: VideoDeinterlaceMode::default(),
             video_thumb_use_sidecar_image: true,
@@ -2593,6 +2645,21 @@ fn reset_backup_state_for_test() {
 }
 
 impl Settings {
+    /// 位置復元マトリクス「動画 × 一覧から開く」セル。保存先は互換維持のため既存 bool
+    /// `video_grid_open_starts_from_beginning`。FromStart = 先頭から開く。
+    pub fn video_open_resume(&self) -> ResumeMode {
+        if self.video_grid_open_starts_from_beginning {
+            ResumeMode::FromStart
+        } else {
+            ResumeMode::Resume
+        }
+    }
+
+    /// 上記セルの設定。既存 bool に書き戻す (旧バージョンへ downgrade しても解釈できる)。
+    pub fn set_video_open_resume(&mut self, mode: ResumeMode) {
+        self.video_grid_open_starts_from_beginning = matches!(mode, ResumeMode::FromStart);
+    }
+
     #[allow(dead_code)] // Phase 3: 旧 JSON 経路で使われていた settings.json パス
     fn settings_path() -> PathBuf {
         crate::data_dir::get().join("settings.json")
