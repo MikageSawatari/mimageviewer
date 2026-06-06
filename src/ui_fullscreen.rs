@@ -4741,12 +4741,21 @@ impl App {
                             self.conceal_mode && self.conceal_panel_rect(full_rect).contains(p);
                         let in_export_crop_panel = self.export_crop_mode
                             && self.export_crop_panel_rect(full_rect).contains(p);
+                        // テキスト注釈モードの左 (一覧) / 右 (詳細) パネル。一覧 ScrollArea を
+                        // ホイールでスクロールしたいので、パネル上のホイールはズームに使わない
+                        // (実機 FB 2026-06-07)。text mode では image_rect == full_rect なので
+                        // (analysis/vst3_compact 以外。1992 行) text_panel_rect(full_rect) が
+                        // 実際のパネル矩形と一致する。
+                        let in_text_panel = self.text_mode
+                            && (self.text_panel_rect(full_rect).contains(p)
+                                || self.text_detail_panel_rect(full_rect).contains(p));
                         in_right
                             || in_left
                             || in_erase_panel
                             || in_local_adjust_panel
                             || in_conceal_panel
                             || in_export_crop_panel
+                            || in_text_panel
                     })
                     .unwrap_or(false)
             });
