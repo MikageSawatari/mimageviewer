@@ -817,6 +817,12 @@ pub struct Settings {
     #[serde(default)]
     pub auto_fullscreen_zip_pdf: bool,
 
+    /// 余白カットフィット: フルスクリーンの単ページ表示で、白/黒一色の余白を表示時に
+    /// 詰めて中身をウィンドウいっぱいに拡大する (ピクセルは変えず表示変換のみ)。
+    /// フルスクリーン上部ホバーバーのボタンでトグル。既定 OFF。
+    #[serde(default)]
+    pub margin_fit_enabled: bool,
+
     // ── UI テーマ (v0.7.0) ──────────────────────────────────────
     /// 背景色テーマ (System / Light / Dark)。デフォルト `System` で Windows のアプリ用色に追従。
     #[serde(default)]
@@ -1718,6 +1724,7 @@ impl Default for Settings {
             capture_format: crate::capture::CaptureFormat::default(),
             default_spread_mode: SpreadMode::default(),
             auto_fullscreen_zip_pdf: false,
+            margin_fit_enabled: false,
             ui_theme: UiTheme::default(),
             tags: Vec::new(),
             show_toolbar_favorites: true,

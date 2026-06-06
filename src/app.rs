@@ -2624,6 +2624,9 @@ pub struct App {
     pub(crate) fullscreen_idx: Option<usize>,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
     pub(crate) fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    /// 余白カットフィット用の中身 bbox キャッシュ (正規化座標)。idx → Some(bbox) / None(余白なし)。
+    /// `fs_cache` と同じタイミング (フォルダ移動・idx 無効化) でクリアする。
+    pub(crate) fs_margin_bbox_cache: std::collections::HashMap<usize, Option<egui::Rect>>,
     /// 表示パイプライン入力の世代番号。
     ///
     /// raw decode / AI / 補正など、消しゴム確定結果の入力になるレイヤが変わるたび
@@ -4814,6 +4817,7 @@ impl App {
             show_stats_dialog: false,
             fullscreen_idx: None,
             fs_cache: std::collections::HashMap::new(),
+            fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
             fs_upload_backlog: Vec::new(),
@@ -10521,6 +10525,7 @@ impl App {
         self.comic_cache.clear();
         self.fs_early_dims.clear();
         self.fs_cache.clear();
+        self.fs_margin_bbox_cache.clear();
         self.fs_upload_backlog.clear();
 
         // in-flight pending (idx-keyed) をキャンセル
@@ -18222,6 +18227,7 @@ impl App {
         let fc_drop_t0 = std::time::Instant::now();
         let fc_drop_count = self.fs_cache.len();
         self.fs_cache.clear();
+        self.fs_margin_bbox_cache.clear();
         let fc_drop_ms = fc_drop_t0.elapsed().as_secs_f64() * 1000.0;
         if crate::perf::is_enabled() {
             crate::perf::event(

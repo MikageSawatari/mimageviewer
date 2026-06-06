@@ -2025,6 +2025,9 @@ impl App {
                                         };
                                         let pixel_grid_enabled =
                                             self.fs_pixel_grid_enabled && !analysis_active;
+                                        // 余白カットフィット用 bbox (設定 OFF なら None)。bg_style が
+                                        // self を借用する前に算出しておく。
+                                        let content_bbox = self.fs_margin_bbox(fs_idx);
                                         let bg_style = self.fs_bg_style(ctx);
                                         Self::draw_fs_image(
                                             ui, image_rect,
@@ -2033,6 +2036,7 @@ impl App {
                                             state.fs_load_failed, fs_rotation, zp,
                                             free_rot, &bg_style, &state.location_display,
                                             pixel_grid_enabled,
+                                            content_bbox,
                                         );
                                         if let crate::app::CompareViewMode::Wipe { fraction } =
                                             compare_mode
@@ -2511,6 +2515,8 @@ impl App {
                             // spread / 補正 / rotate / capture / VST / play / tile) は全て隠す。
                             let panorama_mode_active = panorama_active;
                             let mut panorama_pressed = false;
+                            let margin_fit_active = self.settings.margin_fit_enabled;
+                            let mut margin_fit_pressed = false;
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
                                 &state.location_display,
@@ -2533,6 +2539,8 @@ impl App {
                                 &mut self.adjustment_mode,
                                 &mut self.local_adjust_mode,
                                 has_page_override,
+                                margin_fit_active,
+                                &mut margin_fit_pressed,
                                 state.pdf_content_type,
                                 is_video_mode,
                                 video_meta,
@@ -2549,6 +2557,13 @@ impl App {
                             );
                             if copy_capture_pressed {
                                 self.copy_image_capture_to_clipboard(ctx, fs_idx);
+                            }
+                            // 余白カットフィット トグル (設定を反転 + 保存、bbox キャッシュを破棄)。
+                            if margin_fit_pressed {
+                                self.settings.margin_fit_enabled = !self.settings.margin_fit_enabled;
+                                self.settings.save();
+                                self.fs_margin_bbox_cache.clear();
+                                ctx.request_repaint();
                             }
                             // 360 度パノラマビュー: トグル
                             if panorama_pressed {
@@ -5474,6 +5489,27 @@ impl App {
     /// `bg_style` が Default 以外のとき、画像 rect の直下に透過背景を塗る。
     ///
     /// 動画は native presenter が独立 HWND に直接描画するので、ここでは
+    /// 余白カットフィット用の中身 bbox を取得 (キャッシュ付き)。設定 OFF / 余白なし /
+    /// pixels 未取得 (アニメ等) なら None。補正前後で余白はほぼ不変なので raw fs_cache の
+    /// pixels から検出する。
+    pub(crate) fn fs_margin_bbox(&mut self, idx: usize) -> Option<egui::Rect> {
+        if !self.settings.margin_fit_enabled {
+            return None;
+        }
+        if let Some(cached) = self.fs_margin_bbox_cache.get(&idx) {
+            return *cached;
+        }
+        let bbox = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => crate::margin_fit::detect_content_bbox(
+                &**pixels,
+                crate::margin_fit::DEFAULT_TOLERANCE,
+            ),
+            _ => None,
+        };
+        self.fs_margin_bbox_cache.insert(idx, bbox);
+        bbox
+    }
+
     /// 静止画 / アニメーション / サムネイル / プレースホルダーだけを扱う。
     #[allow(clippy::too_many_arguments)]
     fn draw_fs_image(
@@ -5492,6 +5528,8 @@ impl App {
         // 空ならラベル描画をスキップ。
         location_display: &str,
         pixel_grid_enabled: bool,
+        // 余白カットフィット用の中身 bbox (正規化 0..1)。Some & rotation なしのとき適用。
+        content_bbox: Option<egui::Rect>,
     ) {
         let using_full_texture = tex.is_some();
         let display_tex = tex.or(thumb_tex);
@@ -5503,12 +5541,33 @@ impl App {
                 }
                 _ => tex_size,
             };
-            let fit_scale =
-                (full_rect.width() / display_size.x).min(full_rect.height() / display_size.y);
-            let (total_scale, center) = match zoom_pan {
+            // 余白カットフィット: rotation / フリー回転なし & content_bbox ありのとき、中身
+            // bbox をウィンドウにフィットさせる (= 余白分ズームイン + bbox 中心へ再センタリング)。
+            // ピクセルは変えず fit と中心をずらすだけ。bbox 無し時は従来の全体フィット。
+            let margin_bbox = content_bbox
+                .filter(|_| rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON);
+            let (fit_scale, content_center_px) = match margin_bbox {
+                Some(bbox) => {
+                    let bbox_w = (bbox.width() * display_size.x).max(1.0);
+                    let bbox_h = (bbox.height() * display_size.y).max(1.0);
+                    let s = (full_rect.width() / bbox_w).min(full_rect.height() / bbox_h);
+                    let cpx = egui::vec2(
+                        (bbox.center().x - 0.5) * display_size.x,
+                        (bbox.center().y - 0.5) * display_size.y,
+                    );
+                    (s, cpx)
+                }
+                None => (
+                    (full_rect.width() / display_size.x).min(full_rect.height() / display_size.y),
+                    egui::Vec2::ZERO,
+                ),
+            };
+            let (total_scale, base_center) = match zoom_pan {
                 Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
                 None => (fit_scale, full_rect.center()),
             };
+            // 中身 bbox の中心をウィンドウ中心へ寄せる (content_center_px=0 なら従来どおり)。
+            let center = base_center - content_center_px * total_scale;
             let img_rect = egui::Rect::from_center_size(center, display_size * total_scale);
             let needs_clip = zoom_pan.is_some() || free_rotation_rad.abs() > TRANSFORM_EPSILON;
             let painter = if needs_clip {
@@ -7554,6 +7613,9 @@ impl App {
         local_adjust_mode: &mut bool,
         // 現在ページに個別補正が適用されているか (ボタン点灯用)
         has_page_override: bool,
+        // 余白カットフィット トグル (画像のみ)。active = 現在 ON、pressed = クリックされた。
+        margin_fit_active: bool,
+        margin_fit_pressed: &mut bool,
         // PDF ページのコンテンツ種別 (非 PDF なら None)
         pdf_content_type: Option<PdfPageContentType>,
         // Phase 6: 動画モードか。true なら画像専用ボタンを隠し、▦ タイルボタンに
@@ -8043,6 +8105,29 @@ impl App {
         }
 
         if !is_video {
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
+
+        // 余白カットフィットボタン (画像のみ、見開きボタンの左)。白/黒の余白を表示時に
+        // 詰めて中身を拡大する (ピクセルは変えない)。
+        if !is_video && !panorama_mode_active {
+            let mf_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_margin_fit_btn",
+                |hovered| bar_button_bg(hovered, margin_fit_active),
+                margin_fit_active,
+                draw_margin_fit_icon,
+            );
+            let mf_resp =
+                mf_resp.hover_tip_dark("余白カットフィット (白/黒の余白を詰めて中身を拡大表示)");
+            if mf_resp.clicked() {
+                *margin_fit_pressed = true;
+            }
+            if mf_resp.hovered() {
+                *nav_delta = 0;
+            }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 

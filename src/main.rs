@@ -63,6 +63,7 @@ pub mod local_adjust_db;
 pub mod local_adjust_effect_ui;
 pub mod logger;
 mod manual_mask_tools;
+pub mod margin_fit;
 pub mod mask_db;
 pub mod monitor;
 pub mod name_bulk_indexer;

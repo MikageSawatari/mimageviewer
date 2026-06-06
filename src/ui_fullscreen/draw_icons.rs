@@ -852,6 +852,46 @@ pub(super) fn draw_rotate_icon(
 }
 
 /// 見開きモードアイコンを描画する。
+/// 余白カットフィットのアイコン: 外枠 (余白込みの画像) + 内枠 (中身) + 4 辺から内枠へ
+/// 向かう矢印 (= 余白を詰めて中身を拡大するイメージ)。
+pub(super) fn draw_margin_fit_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    // 外枠 (薄いグレー = 余白込みの画像全体)
+    let outer = egui::Rect::from_center_size(c, egui::vec2(r * 1.7, r * 2.0));
+    painter.rect_stroke(
+        outer,
+        1.0,
+        egui::Stroke::new(1.2, egui::Color32::from_gray(150)),
+        egui::StrokeKind::Middle,
+    );
+    // 内枠 (白 = 中身)
+    let inner = egui::Rect::from_center_size(c, egui::vec2(r * 0.9, r * 1.15));
+    painter.rect_stroke(
+        inner,
+        1.0,
+        egui::Stroke::new(1.8, egui::Color32::WHITE),
+        egui::StrokeKind::Middle,
+    );
+    let stroke = egui::Stroke::new(1.4, egui::Color32::WHITE);
+    let head = |tip: egui::Pos2, dir: egui::Vec2| {
+        let n = egui::vec2(-dir.y, dir.x) * 2.0;
+        let back = tip - dir * 3.0;
+        painter.line_segment([tip, back + n], stroke);
+        painter.line_segment([tip, back - n], stroke);
+    };
+    let t_tip = egui::pos2(c.x, inner.min.y - 1.5);
+    painter.line_segment([egui::pos2(c.x, outer.min.y + 2.0), t_tip], stroke);
+    head(t_tip, egui::vec2(0.0, 1.0));
+    let b_tip = egui::pos2(c.x, inner.max.y + 1.5);
+    painter.line_segment([egui::pos2(c.x, outer.max.y - 2.0), b_tip], stroke);
+    head(b_tip, egui::vec2(0.0, -1.0));
+    let l_tip = egui::pos2(inner.min.x - 1.5, c.y);
+    painter.line_segment([egui::pos2(outer.min.x + 2.0, c.y), l_tip], stroke);
+    head(l_tip, egui::vec2(1.0, 0.0));
+    let rt_tip = egui::pos2(inner.max.x + 1.5, c.y);
+    painter.line_segment([egui::pos2(outer.max.x - 2.0, c.y), rt_tip], stroke);
+    head(rt_tip, egui::vec2(-1.0, 0.0));
+}
+
 pub(super) fn draw_spread_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, mode: SpreadMode) {
     let white = egui::Color32::WHITE;
     let stroke = egui::Stroke::new(1.5, white);
