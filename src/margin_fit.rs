@@ -52,6 +52,12 @@ const SAFETY_PAD_FRAC: f32 = 0.006;
 /// どの辺もこの割合未満しかトリムされないなら「余白なし」とみなして `None` (無駄なズーム抑止)。
 const MIN_TRIM_FRACTION: f32 = 0.01;
 
+/// 各辺でトリムできる最大割合 (上限)。中身が極小/隅に偏った余白だらけのページで、その一部分
+/// だけが巨大に拡大される「やりすぎ」を防ぐ。20% なら最悪でも中央 60% 四方は必ず表示される。
+/// 通常の漫画ページ (余白 5〜10%) では上限に達しないので影響しない。実機で調整して設定昇格
+/// する想定の固定値。
+const MAX_TRIM_FRAC: f32 = 0.20;
+
 #[inline]
 fn luma(c: Color32) -> u8 {
     // 0.299R + 0.587G + 0.114B ≒ (77R + 150G + 29B) / 256
@@ -216,11 +222,20 @@ pub fn detect_content_bbox(img: &ColorImage, tol: u8) -> Option<Rect> {
         return None;
     }
 
-    // 正規化 (右/下は +1 して inclusive→exclusive) + セーフティパッド。
-    let nx0 = (x0 as f32 / w as f32 - SAFETY_PAD_FRAC).max(0.0);
-    let ny0 = (y0 as f32 / h as f32 - SAFETY_PAD_FRAC).max(0.0);
-    let nx1 = ((x1 + 1) as f32 / w as f32 + SAFETY_PAD_FRAC).min(1.0);
-    let ny1 = ((y1 + 1) as f32 / h as f32 + SAFETY_PAD_FRAC).min(1.0);
+    // 正規化 (右/下は +1 して inclusive→exclusive) + セーフティパッド + トリム上限。
+    // 各辺のトリムは MAX_TRIM_FRAC まで (隅の小さな中身だけに巨大ズームする "やりすぎ" を防ぐ)。
+    let nx0 = (x0 as f32 / w as f32 - SAFETY_PAD_FRAC)
+        .max(0.0)
+        .min(MAX_TRIM_FRAC);
+    let ny0 = (y0 as f32 / h as f32 - SAFETY_PAD_FRAC)
+        .max(0.0)
+        .min(MAX_TRIM_FRAC);
+    let nx1 = ((x1 + 1) as f32 / w as f32 + SAFETY_PAD_FRAC)
+        .min(1.0)
+        .max(1.0 - MAX_TRIM_FRAC);
+    let ny1 = ((y1 + 1) as f32 / h as f32 + SAFETY_PAD_FRAC)
+        .min(1.0)
+        .max(1.0 - MAX_TRIM_FRAC);
     if nx1 - nx0 < 0.05 || ny1 - ny0 < 0.05 {
         return None; // 退化したケースは諦める
     }
@@ -253,27 +268,27 @@ mod tests {
 
     #[test]
     fn centered_block_detected() {
-        // 64x64 白地、中央 [16,48) に黒ブロック。
+        // 64x64 白地、中央 [10,54) に黒ブロック (余白 ~15.6% で MAX_TRIM_FRAC 20% 未満)。
         let mut img = white(64, 64);
-        fill(&mut img, 16, 16, 48, 48, Color32::BLACK);
+        fill(&mut img, 10, 10, 54, 54, Color32::BLACK); // [10,54) x [10,54)
         let b = detect_content_bbox(&img, DEFAULT_TOLERANCE).expect("中身検出");
-        // 0.25..0.75 付近 (セーフティパッド分の余裕を見て assert)。
-        assert!((b.min.x - 0.25).abs() < 0.03, "left {}", b.min.x);
-        assert!((b.min.y - 0.25).abs() < 0.03, "top {}", b.min.y);
-        assert!((b.max.x - 0.75).abs() < 0.03, "right {}", b.max.x);
-        assert!((b.max.y - 0.75).abs() < 0.03, "bottom {}", b.max.y);
+        // 0.156..0.844 付近 (セーフティパッド分の余裕を見て assert)。
+        assert!((b.min.x - 0.156).abs() < 0.03, "left {}", b.min.x);
+        assert!((b.min.y - 0.156).abs() < 0.03, "top {}", b.min.y);
+        assert!((b.max.x - 0.844).abs() < 0.03, "right {}", b.max.x);
+        assert!((b.max.y - 0.844).abs() < 0.03, "bottom {}", b.max.y);
     }
 
     #[test]
     fn isolated_dot_in_margin_is_ignored() {
-        // 中央ブロック + 隅に孤立した小さな点 (ゴミ)。点は捨てられ bbox はブロックのみ。
+        // 中央ブロック (余白 ~15.6% < 上限) + 隅に孤立した小さな点 (ゴミ)。点は捨てられる。
         let mut img = white(64, 64);
-        fill(&mut img, 20, 20, 44, 44, Color32::BLACK); // 24x24 本体
+        fill(&mut img, 10, 10, 54, 54, Color32::BLACK); // 44x44 本体
         fill(&mut img, 2, 2, 5, 5, Color32::BLACK); // 3x3=9px の孤立点 (< MIN_COMPONENT_AREA)
         let b = detect_content_bbox(&img, DEFAULT_TOLERANCE).expect("検出");
-        // 点 (x,y≈2..5) は無視され、左/上はブロック (20/64≒0.31) 付近まで詰む。
-        assert!(b.min.x > 0.20, "孤立点を無視して左を詰める: {}", b.min.x);
-        assert!(b.min.y > 0.20, "孤立点を無視して上を詰める: {}", b.min.y);
+        // 点 (x,y≈2..5 → 0.03) は無視され、左/上はブロック (10/64≒0.156) 付近まで詰む。
+        assert!(b.min.x > 0.10, "孤立点を無視して左を詰める: {}", b.min.x);
+        assert!(b.min.y > 0.10, "孤立点を無視して上を詰める: {}", b.min.y);
     }
 
     #[test]
@@ -337,5 +352,28 @@ mod tests {
         let mut img = white(64, 64);
         fill(&mut img, 0, 0, 64, 64, Color32::from_gray(40)); // ほぼ全面 ink
         assert!(detect_content_bbox(&img, DEFAULT_TOLERANCE).is_none());
+    }
+
+    #[test]
+    fn mostly_empty_page_trim_is_capped() {
+        // ほぼ全面が余白色、左下隅にだけ小さな中身 (ロゴ相当)。トリム上限がないと隅だけに
+        // 巨大ズームしてしまうが、上限 (MAX_TRIM_FRAC) で中央付近は必ず残る。
+        let mut img = white(100, 100);
+        fill(&mut img, 5, 80, 30, 95, Color32::BLACK); // 25x15 の左下ロゴ (>= MIN_COMPONENT_AREA)
+        let b = detect_content_bbox(&img, DEFAULT_TOLERANCE).expect("検出");
+        // 中身は左下なので右/上はほぼ全部余白だが、トリム上限で右は 0.80 まで・上は 0.20 まで。
+        assert!(
+            b.max.x >= 0.80 - 1e-3,
+            "右トリムは上限で止まる: {}",
+            b.max.x
+        );
+        assert!(
+            b.min.y <= 0.20 + 1e-3,
+            "上トリムは上限で止まる: {}",
+            b.min.y
+        );
+        // 中身のある左/下は実位置まで詰む (上限内)。
+        assert!(b.min.x < 0.20, "左は中身位置まで詰む: {}", b.min.x);
+        assert!(b.max.y > 0.80, "下は中身位置まで詰む: {}", b.max.y);
     }
 }
