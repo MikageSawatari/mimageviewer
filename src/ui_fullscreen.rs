@@ -5646,6 +5646,40 @@ impl App {
                 b.rect.max.y
             ));
         }
+        // 余白 (外周12%) に居る小さめの成分 = ページ番号 / ゴミ / 端の点 の候補。
+        // bbox を決める大ブロックではなく、これらの面積を見て MIN_COMPONENT_AREA の
+        // しきい値 (= ページ番号は残し・ゴミは落とす境目) を数値で決める。大ブロック
+        // (面積上位4) は本文なので除外し、それ以外で中心が外周にあるものを面積降順で出す。
+        let big = 4usize.min(diag.components.len());
+        let mut marks: Vec<&crate::margin_fit::DiagComponent> = diag
+            .components
+            .iter()
+            .skip(big)
+            .filter(|c| {
+                let cx = (c.rect.min.x + c.rect.max.x) * 0.5;
+                let cy = (c.rect.min.y + c.rect.max.y) * 0.5;
+                cx < 0.12 || cx > 0.88 || cy < 0.12 || cy > 0.88
+            })
+            .collect();
+        marks.sort_by(|a, b| b.area.cmp(&a.area));
+        crate::logger::log(format!(
+            "[margin-fit diag] 余白(外周12%)の成分 上位15 (ページ番号/ゴミ候補、KEEP=面積>={}):",
+            diag.min_area
+        ));
+        for (i, c) in marks.iter().take(15).enumerate() {
+            crate::logger::log(format!(
+                "  M{:<2} area={:<5} center=({:.3},{:.3}) rect=[{:.3},{:.3} .. {:.3},{:.3}] {}",
+                i + 1,
+                c.area,
+                (c.rect.min.x + c.rect.max.x) * 0.5,
+                (c.rect.min.y + c.rect.max.y) * 0.5,
+                c.rect.min.x,
+                c.rect.min.y,
+                c.rect.max.x,
+                c.rect.max.y,
+                if c.kept { "KEEP" } else { "drop" }
+            ));
+        }
     }
 
     /// 静止画 / アニメーション / サムネイル / プレースホルダーだけを扱う。
