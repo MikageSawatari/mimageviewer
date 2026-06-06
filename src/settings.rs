@@ -464,6 +464,87 @@ impl UiTheme {
     }
 }
 
+// -----------------------------------------------------------------------
+// AiFeatureMode (AI 利用範囲)
+// -----------------------------------------------------------------------
+
+/// アプリ全体の AI 機能利用範囲。
+///
+/// ページ個別 / お気に入り標準 / グローバルプリセットに保存された AI 設定は保持したまま、
+/// 実行時に使うモデル範囲を制限する。低負荷モードへ切り替えてもユーザーのページ設定を
+/// 破棄せず、あとで高画質へ戻したときに復元できるようにする。
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AiFeatureMode {
+    /// AI アップスケール / AI ノイズ除去を実行しない。
+    Disabled,
+    /// 高速汎用 + 漫画トーン保持のみ。ノイズ除去は実行しない。
+    #[default]
+    Light,
+    /// すべてのアップスケールモデルとノイズ除去を許可する。
+    HighQuality,
+}
+
+impl AiFeatureMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "なし",
+            Self::Light => "軽量",
+            Self::HighQuality => "高画質",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Disabled => "AI アップスケールと AI ノイズ除去を使いません。",
+            Self::Light => "ミドルレンジGPU向け。高速汎用と漫画トーン保持モデルだけを使います。",
+            Self::HighQuality => {
+                "ハイエンドGPU向け。全アップスケールモデルとノイズ除去を使えます。"
+            }
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Disabled, Self::Light, Self::HighQuality]
+    }
+
+    pub fn allows_upscale_model(self, kind: crate::ai::ModelKind) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::Light => matches!(
+                kind,
+                crate::ai::ModelKind::UpscaleRealEsrGeneralV3
+                    | crate::ai::ModelKind::UpscaleRealCugan4x
+            ),
+            Self::HighQuality => crate::ai::ModelKind::upscale_models().contains(&kind),
+        }
+    }
+
+    pub fn allows_denoise(self) -> bool {
+        matches!(self, Self::HighQuality)
+    }
+
+    pub fn auto_upscale_model(
+        self,
+        category: crate::ai::ImageCategory,
+    ) -> Option<crate::ai::ModelKind> {
+        match self {
+            Self::Disabled => None,
+            Self::Light => match category {
+                crate::ai::ImageCategory::Comic => Some(crate::ai::ModelKind::UpscaleRealCugan4x),
+                crate::ai::ImageCategory::Illustration
+                | crate::ai::ImageCategory::ThreeD
+                | crate::ai::ImageCategory::RealLife => {
+                    Some(crate::ai::ModelKind::UpscaleRealEsrGeneralV3)
+                }
+            },
+            Self::HighQuality => Some(category.preferred_upscale_model()),
+        }
+    }
+}
+
 /// - `RtlCover`: 見開き 右→左（表紙あり）— [0] [1,2] [3,4] ...
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum SpreadMode {
@@ -827,6 +908,14 @@ pub struct Settings {
     /// 背景色テーマ (System / Light / Dark)。デフォルト `System` で Windows のアプリ用色に追従。
     #[serde(default)]
     pub ui_theme: UiTheme,
+
+    /// 初回セットアップダイアログを完了したか。
+    #[serde(default)]
+    pub first_setup_completed: bool,
+
+    /// AI アップスケール / ノイズ除去の利用範囲。
+    #[serde(default)]
+    pub ai_feature_mode: AiFeatureMode,
 
     // ── ツールバー項目フィルタ（Vec が空 = セクション非表示）──
     /// ツールバーに表示する列数の選択肢
@@ -1726,6 +1815,8 @@ impl Default for Settings {
             auto_fullscreen_zip_pdf: false,
             margin_fit_enabled: false,
             ui_theme: UiTheme::default(),
+            first_setup_completed: false,
+            ai_feature_mode: AiFeatureMode::default(),
             tags: Vec::new(),
             show_toolbar_favorites: true,
             show_toolbar_tags: true,
@@ -2939,6 +3030,42 @@ mod tests {
         assert!(s.show_address_bar_favorite_button);
         assert!(s.show_address_bar_history_menu);
         assert!(s.show_address_bar_folder_pin);
+        assert!(!s.first_setup_completed);
+        assert_eq!(s.ai_feature_mode, AiFeatureMode::Light);
+    }
+
+    #[test]
+    fn ai_feature_mode_limits_models_without_destroying_saved_choices() {
+        use crate::ai::{ImageCategory, ModelKind};
+
+        assert!(!AiFeatureMode::Disabled.allows_upscale_model(ModelKind::UpscaleRealCugan4x));
+        assert!(!AiFeatureMode::Disabled.allows_denoise());
+        assert_eq!(
+            AiFeatureMode::Disabled.auto_upscale_model(ImageCategory::Comic),
+            None
+        );
+
+        assert!(AiFeatureMode::Light.allows_upscale_model(ModelKind::UpscaleRealEsrGeneralV3));
+        assert!(AiFeatureMode::Light.allows_upscale_model(ModelKind::UpscaleRealCugan4x));
+        assert!(!AiFeatureMode::Light.allows_upscale_model(ModelKind::UpscaleRealEsrganX4Plus));
+        assert!(!AiFeatureMode::Light.allows_denoise());
+        assert_eq!(
+            AiFeatureMode::Light.auto_upscale_model(ImageCategory::Comic),
+            Some(ModelKind::UpscaleRealCugan4x)
+        );
+        assert_eq!(
+            AiFeatureMode::Light.auto_upscale_model(ImageCategory::RealLife),
+            Some(ModelKind::UpscaleRealEsrGeneralV3)
+        );
+
+        assert!(
+            AiFeatureMode::HighQuality.allows_upscale_model(ModelKind::UpscaleRealEsrganX4Plus)
+        );
+        assert!(AiFeatureMode::HighQuality.allows_denoise());
+        assert_eq!(
+            AiFeatureMode::HighQuality.auto_upscale_model(ImageCategory::Illustration),
+            Some(ImageCategory::Illustration.preferred_upscale_model())
+        );
     }
 
     // -- Settings JSON roundtrip --

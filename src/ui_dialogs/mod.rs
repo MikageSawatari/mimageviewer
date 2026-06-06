@@ -16,6 +16,7 @@ pub(crate) mod context_menu;
 pub(crate) mod editing_addon;
 mod fav_add;
 pub(crate) mod favorites_editor;
+mod first_setup;
 mod open_folder;
 mod pdf_password;
 pub(crate) mod preferences;

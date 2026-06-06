@@ -235,6 +235,26 @@ pub fn upscale_menu_items() -> Vec<(&'static str, Option<&'static str>)> {
     items
 }
 
+/// AI 利用範囲に合わせたアップスケールモデル UI メニュー。
+///
+/// 「なし」は常に表示する。AI 無効時は過去のページ設定を破棄しないための状態表示として
+/// 「自動」や個別モデルは隠し、実行時側でも同じ制限を掛ける。
+pub fn upscale_menu_items_for_mode(
+    mode: crate::settings::AiFeatureMode,
+) -> Vec<(&'static str, Option<&'static str>)> {
+    let mut items: Vec<(&'static str, Option<&'static str>)> = vec![("なし", None)];
+    if matches!(mode, crate::settings::AiFeatureMode::Disabled) {
+        return items;
+    }
+    items.push(("自動 (画像タイプ判別)", Some("auto")));
+    for kind in crate::ai::ModelKind::upscale_models() {
+        if mode.allows_upscale_model(*kind) {
+            items.push((kind.display_label(), Some(kind.as_str())));
+        }
+    }
+    items
+}
+
 /// アップスケールモデルキーから表示ラベルを取得する。
 pub fn upscale_model_label(key: Option<&str>) -> &'static str {
     upscale_menu_items()
@@ -775,6 +795,29 @@ mod tests {
         assert_eq!(slot_key_label(0), "1");
         assert_eq!(slot_key_label(8), "9");
         assert_eq!(slot_key_label(9), "0");
+    }
+
+    #[test]
+    fn upscale_menu_items_follow_ai_feature_mode() {
+        use crate::settings::AiFeatureMode;
+
+        let disabled = upscale_menu_items_for_mode(AiFeatureMode::Disabled);
+        assert_eq!(disabled, vec![("なし", None)]);
+
+        let light_keys: Vec<_> = upscale_menu_items_for_mode(AiFeatureMode::Light)
+            .into_iter()
+            .filter_map(|(_, key)| key)
+            .collect();
+        assert!(light_keys.contains(&"auto"));
+        assert!(light_keys.contains(&"realesr_general_v3"));
+        assert!(light_keys.contains(&"realcugan_4x"));
+        assert!(!light_keys.contains(&"realesrgan_x4plus"));
+        assert!(!light_keys.contains(&"realesrgan_anime6b"));
+
+        assert_eq!(
+            upscale_menu_items_for_mode(AiFeatureMode::HighQuality),
+            upscale_menu_items()
+        );
     }
 }
 

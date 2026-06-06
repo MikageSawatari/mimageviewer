@@ -1,11 +1,11 @@
 use super::*;
 use crate::settings::{
-    self, CachePolicy, Parallelism, SortOrder, SpreadMode, ThumbAspect, ToolbarSectionDisplay,
-    UiTheme,
+    self, AiFeatureMode, CachePolicy, Parallelism, SortOrder, SpreadMode, ThumbAspect,
+    ToolbarSectionDisplay, UiTheme,
 };
 
-pub(super) fn page_theme(ui: &mut egui::Ui, state: &mut PreferencesState) {
-    ui.label("背景色テーマ (v0.7.0)");
+pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.label(egui::RichText::new("テーマ").strong());
     ui.add_space(4.0);
     // Standard は旧設定互換のため enum に残っているが、UI では表示しない (System = 追従 or Light)。
     // 保存値が Standard になっていたら Light に寄せる (System に勝手に戻すのは避ける)。
@@ -32,6 +32,52 @@ pub(super) fn page_theme(ui: &mut egui::Ui, state: &mut PreferencesState) {
         egui::RichText::new(
             "フルスクリーン表示は画像鑑賞のためテーマに関係なく黒背景になります。\n\
              B キーで透過画像の背景色を循環させられます (黒 → 白 → 市松)。",
+        )
+        .weak(),
+    );
+
+    ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("AI 機能").strong());
+    ui.add_space(4.0);
+    for &mode in AiFeatureMode::all() {
+        let response = ui.radio_value(
+            &mut state.settings.ai_feature_mode,
+            mode,
+            format!("{} - {}", mode.label(), mode.description()),
+        );
+        if matches!(mode, AiFeatureMode::HighQuality) {
+            response.on_hover_text("GPU によっては処理に時間がかかる AI モデルが含まれます。");
+        }
+    }
+    ui.label(
+        egui::RichText::new(
+            "軽量は高速汎用と漫画トーン保持モデルのみを使用し、ノイズ除去は実行しません。\n\
+             高画質では写真・イラスト・質感保持モデルとノイズ除去も選択できます。",
+        )
+        .weak(),
+    );
+
+    ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("ZIP/PDF ファイル").strong());
+    ui.add_space(4.0);
+    ui.radio_value(
+        &mut state.settings.auto_fullscreen_zip_pdf,
+        false,
+        "開いたとき、ページ一覧を表示",
+    );
+    ui.radio_value(
+        &mut state.settings.auto_fullscreen_zip_pdf,
+        true,
+        "開いたとき、1 ページ目を表示",
+    );
+    ui.label(
+        egui::RichText::new(
+            "1 ページ目を表示する場合、フルスクリーン中の Enter / Esc で元の一覧へ戻り、\
+             Backspace でそのファイルのページ一覧を表示します。",
         )
         .weak(),
     );
@@ -2143,22 +2189,6 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 ui.selectable_value(&mut s.default_spread_mode, mode, mode.label());
             }
         });
-
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(8.0);
-    ui.checkbox(
-        &mut s.auto_fullscreen_zip_pdf,
-        "ZIP/PDF を開いたら 1 ページ目をフルスクリーンで表示",
-    );
-    ui.label(
-        egui::RichText::new(
-            "一覧から ZIP/PDF を Enter / ダブルクリックで開いたとき、ページ一覧を経由せず\n\
-             1 ページ目を直接フルスクリーンで開きます。フルスクリーン中の Enter / Esc で\n\
-             元の一覧へ戻り、Backspace でそのファイルのページ一覧を表示します。",
-        )
-        .weak(),
-    );
 }
 
 pub(super) fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {

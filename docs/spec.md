@@ -469,7 +469,7 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 | Escape | 現在表示中の項目にカーソルを戻してフルスクリーンを閉じる。動画のサムネイル一覧中は一覧を閉じて動画再生へ戻る |
 | Q / Ctrl+Backspace | 現在ページの個別補正設定を解除（標準値に戻す）。Q は片手操作用 |
 | U / Shift+U / Alt+U | AI アップスケールモデルを 次 / 前 / なし (リセット) へ切替 |
-| N | AI ノイズ除去を ON/OFF |
+| N | AI ノイズ除去を ON/OFF (`ai_feature_mode=high_quality` のとき有効) |
 | Ctrl + 1〜9 / Ctrl + 0 | 保存スロット 1〜10 を現在のページに適用 |
 | 画面右 1/4 | メタデータパネルをホバー表示 |
 | 画面上部 | ファイル情報バー + 操作ボタン |
@@ -528,6 +528,10 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 | `sort_order` | SortOrder | FileName | ソート順（FileName / Natural / MtimeAsc / MtimeDesc） |
 | `favorites` | Vec\<FavoriteEntry\> | [] | お気に入りフォルダ (`id: Uuid` + name + path + `auto_index_structure` / `auto_index_metadata` / `auto_index_thumbs` の 3 フラグ, v0.8.0〜) |
 | `last_folder` | Option\<PathBuf\> | None | 前回開いていたフォルダ |
+| `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ZIP・PDF の開き方) を完了したか |
+| `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
+| `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去 |
+| `auto_fullscreen_zip_pdf` | bool | false | ZIP/PDF を一覧から開いたとき、ページ一覧を経由せず 1 ページ目をフルスクリーンで表示する |
 
 ### 8.2 キャッシュ設定
 
@@ -800,7 +804,7 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
   - 推論は別プロセス (TRT worker) で動作。クラッシュ時は最大 3 回まで自動再起動、それでも
     復旧しなければ DirectML フォールバック + バナー通知。
   - tile size の backend-aware 切替: TRT は 256、DirectML は 192 (実測ベース)
-- [x] AI JPEG ノイズ除去（RealPLKSR ~28MB 高品質 / OmniSR ~5.5MB 軽量、ブロックノイズ+モスキートノイズ除去）
+- [x] AI JPEG ノイズ除去（RealPLKSR ~28MB、ブロックノイズ+モスキートノイズ除去）
 - [x] 画像タイプ自動判別（MobileNetV3 + ヒューリスティクス → モデル自動選択）
 - [x] 非破壊 AI 修復（消しゴムモード、MI-GAN タイル分割 inpaint、5 ツール、マスク永続化）
   - 旧「見開き AI 補完」は精度不足とアーティファクト過大により削除（タグ `v0.6.0-with-spread-inpaint` に保存）
@@ -935,7 +939,6 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 | anime_classification | 画像タイプ分類 | MobileNetV3 | — | MIT |
 | mi-gan-512 | 消しゴムツール inpainting | MI-GAN | — | MIT |
 | 1xDeJPG_realplksr_otf | JPEG ノイズ除去（高品質） | RealPLKSR | ~28MB | CC-BY-4.0 |
-| 1xDeJPG_OmniSR | JPEG ノイズ除去（軽量） | OmniSR | ~5.5MB | CC-BY-4.0 |
 
 すべてのモデルは exe に `include_bytes!` で埋め込まれ、初回起動時に `%APPDATA%/mimageviewer/models/` に展開される（サイズ一致ならスキップ）。
 
@@ -944,15 +947,26 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 JPEG 圧縮で発生するブロックノイズ・モスキートノイズを AI で除去する機能。
 
 - **対象**: フルスクリーン表示中の画像（補正パネルから選択）
-- **選択肢**: なし / JPEG (RealPLKSR) - 高品質 / JPEG (OmniSR) - 軽量
+- **選択肢**: なし / JPEG (RealPLKSR)
 - **処理順序**: ノイズ除去 → 補正 → アップスケールの順に適用
 - **設定**: `AdjustParams.denoise_model` フィールドに保存 (グローバルまたはページ個別)
-- **UI**: 補正パネルの「AI ノイズ除去」チェックボックスで切替
+- **UI**: 補正パネルの「AI ノイズ除去」チェックボックスで切替。`ai_feature_mode=high_quality`
+  のときだけ実行され、`disabled` / `light` では保存済み設定を保持したまま実行しない
 
 ### 10.3 AI アップスケール
 
 ONNX Runtime + DirectML EP でタイル分割 4x アップスケールを実行。
-画像タイプ自動判別（イラスト/漫画/3D/写真）に基づき、以下の 3 モデルに自動振り分け:
+環境設定「全体設定」の `ai_feature_mode` で利用範囲を選ぶ:
+
+- `disabled`: AI アップスケール / AI ノイズ除去を実行しない
+- `light`: ミドルレンジ GPU 向け。自動判別は漫画を `Real-CUGAN 4x conservative`、
+  それ以外を `Real-ESR General V3` に振り分ける。手動選択もこの 2 モデルに制限し、
+  ノイズ除去は実行しない
+- `high_quality`: ハイエンド GPU 向け。全アップスケールモデルとノイズ除去を許可する。
+  GPU によっては処理に時間がかかるモデルが含まれる
+
+`high_quality` では、画像タイプ自動判別（イラスト/漫画/3D/写真）に基づき、以下の
+3 モデルに自動振り分け:
 
 - イラスト・アニメ → `Real-ESRGAN Anime 6B`
 - 漫画 → `Real-CUGAN 4x conservative`（スクリーントーン保持）
@@ -962,6 +976,9 @@ ONNX Runtime + DirectML EP でタイル分割 4x アップスケールを実行�
 
 - `4x-NMKD-Siax-200k`: 写真向け、フィルム粒子や布目など質感を残す
 - `Real-ESR General V3`: 高速軽量、補正量控えめで破綻しにくい
+
+モデル範囲の制限は実行時に適用される。ページ個別 / お気に入り標準 / グローバル
+プリセットに保存済みの重いモデル設定は削除せず、モードを `high_quality` に戻すと再び有効になる。
 
 ### 10.4 非破壊 AI 修復（消しゴムモード）
 

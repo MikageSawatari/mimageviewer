@@ -26,7 +26,7 @@ pub enum Vst3ScanMessage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PreferencesPage {
-    Theme,
+    General,
     Thumbnail,
     Toolbar,
     Slideshow,
@@ -63,7 +63,7 @@ pub(crate) enum PreferencesPage {
 impl PreferencesPage {
     fn label(self) -> &'static str {
         match self {
-            Self::Theme => "テーマ",
+            Self::General => "全体設定",
             Self::Thumbnail => "サムネイル",
             Self::Toolbar => "ツールバー",
             Self::Slideshow => "スライドショー",
@@ -102,10 +102,14 @@ struct TreeCategory {
 
 const TREE: &[TreeCategory] = &[
     TreeCategory {
+        label: "全体設定",
+        page: Some(PreferencesPage::General),
+        children: &[],
+    },
+    TreeCategory {
         label: "表示",
         page: None,
         children: &[
-            PreferencesPage::Theme,
             PreferencesPage::Thumbnail,
             PreferencesPage::Toolbar,
             PreferencesPage::Slideshow,
@@ -380,7 +384,7 @@ impl PreferencesState {
 
         Self {
             settings: s.clone(),
-            selected: PreferencesPage::Thumbnail,
+            selected: PreferencesPage::General,
             expanded,
             manual_threads,
             capture_output_dir_input: s
@@ -629,6 +633,7 @@ impl App {
                 // AI バックエンド設定変更を検出してホットリロードトリガに使う
                 let old_ai_backend = self.settings.ai_backend.clone();
                 let new_ai_backend = state.settings.ai_backend.clone();
+                let old_ai_feature_mode = self.settings.ai_feature_mode;
 
                 // VST3 enable 状態 + チェーン構成の変化を検出してホットリロード。
                 let old_vst3_enabled = self.settings.vst3_enabled;
@@ -685,6 +690,9 @@ impl App {
                 // AI バックエンド変更のホットリロード処理 (Phase 3)
                 if old_ai_backend != new_ai_backend {
                     self.apply_ai_backend_change(new_ai_backend.as_deref());
+                }
+                if old_ai_feature_mode != self.settings.ai_feature_mode {
+                    self.apply_ai_feature_mode_change();
                 }
 
                 // 同名ファイル設定が変更された場合はフォルダを再読み込み
@@ -1016,7 +1024,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
     ui.add_space(8.0);
 
     match state.selected {
-        PreferencesPage::Theme => page_theme(ui, state),
+        PreferencesPage::General => page_general(ui, state),
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
         PreferencesPage::Toolbar => page_toolbar(ui, state),
         PreferencesPage::Slideshow => page_slideshow(ui, state),

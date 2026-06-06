@@ -6764,6 +6764,7 @@ macro_rules! slider_log_with_reset {
 fn draw_sliders(
     ui: &mut egui::Ui,
     params: &mut AdjustParams,
+    ai_feature_mode: crate::settings::AiFeatureMode,
     ai_denoise_disabled_threshold: Option<u32>,
     ai_upscale_disabled_threshold: Option<u32>,
 ) -> (bool, bool) {
@@ -6996,12 +6997,34 @@ fn draw_sliders(
                 .italics(),
         );
     }
+    if !ai_feature_mode.allows_denoise() {
+        let note = match ai_feature_mode {
+            crate::settings::AiFeatureMode::Disabled => {
+                "（AI機能なしではノイズ除去は実行されません）"
+            }
+            crate::settings::AiFeatureMode::Light => {
+                "（軽量ではノイズ除去は実行されません。保存済み設定は保持されます）"
+            }
+            crate::settings::AiFeatureMode::HighQuality => "",
+        };
+        if !note.is_empty() {
+            ui.label(
+                egui::RichText::new(note)
+                    .size(SECTION_FONT - 1.0)
+                    .color(egui::Color32::from_gray(150))
+                    .italics(),
+            );
+        }
+    }
     let is_on = params.denoise_model.is_some();
     let mut toggled = is_on;
     if ui
-        .checkbox(
-            &mut toggled,
-            egui::RichText::new("JPEG ノイズ除去を適用").color(LABEL_COLOR),
+        .add_enabled(
+            ai_feature_mode.allows_denoise(),
+            egui::Checkbox::new(
+                &mut toggled,
+                egui::RichText::new("JPEG ノイズ除去を適用").color(LABEL_COLOR),
+            ),
         )
         .changed()
     {
@@ -7027,7 +7050,25 @@ fn draw_sliders(
                 .italics(),
         );
     }
-    for (label, val) in &crate::adjustment::upscale_menu_items() {
+    let upscale_items = crate::adjustment::upscale_menu_items_for_mode(ai_feature_mode);
+    let current_upscale_blocked = match params.upscale_model_kind() {
+        None => false,
+        Some(None) => matches!(ai_feature_mode, crate::settings::AiFeatureMode::Disabled),
+        Some(Some(kind)) => !ai_feature_mode.allows_upscale_model(kind),
+    };
+    if current_upscale_blocked {
+        ui.label(
+            egui::RichText::new(format!(
+                "（現在の選択「{}」は {} モードでは実行されません）",
+                crate::adjustment::upscale_model_label(params.upscale_model.as_deref()),
+                ai_feature_mode.label()
+            ))
+            .size(SECTION_FONT - 1.0)
+            .color(egui::Color32::from_gray(150))
+            .italics(),
+        );
+    }
+    for (label, val) in &upscale_items {
         let is_sel = match (val, params.upscale_model.as_deref()) {
             (None, None) => true,
             (Some(a), Some(b)) => *a == b,
@@ -10949,6 +10990,7 @@ impl App {
                         let slider_result = draw_sliders(
                             ui,
                             &mut edit_params,
+                            self.settings.ai_feature_mode,
                             ai_denoise_disabled_threshold,
                             ai_upscale_disabled_threshold,
                         );

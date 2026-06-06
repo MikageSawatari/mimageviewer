@@ -4017,7 +4017,8 @@ impl App {
         if key_u || key_u_shift || key_u_alt {
             let scope = self.resolve_adjust_scope(fs_idx);
             let mut params = self.effective_params(fs_idx).clone();
-            let items = crate::adjustment::upscale_menu_items();
+            let items =
+                crate::adjustment::upscale_menu_items_for_mode(self.settings.ai_feature_mode);
             let cur = items
                 .iter()
                 .position(|(_, k)| match (k, params.upscale_model.as_deref()) {
@@ -4062,20 +4063,27 @@ impl App {
 
         // N キー: AI デノイズをトグル
         if key_n {
-            let scope = self.resolve_adjust_scope(fs_idx);
-            let mut params = self.effective_params(fs_idx).clone();
-            if params.denoise_model.is_some() {
-                params.denoise_model = None;
-                self.show_feedback_toast(format!("[N:{}デノイズ OFF]", scope.label()));
+            if !self.settings.ai_feature_mode.allows_denoise() {
+                self.show_feedback_toast(format!(
+                    "[N:デノイズ無効]\nAI 機能: {}",
+                    self.settings.ai_feature_mode.label()
+                ));
             } else {
-                params.denoise_model =
-                    Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string());
-                self.show_feedback_toast(format!("[N:{}デノイズ ON]", scope.label()));
+                let scope = self.resolve_adjust_scope(fs_idx);
+                let mut params = self.effective_params(fs_idx).clone();
+                if params.denoise_model.is_some() {
+                    params.denoise_model = None;
+                    self.show_feedback_toast(format!("[N:{}デノイズ OFF]", scope.label()));
+                } else {
+                    params.denoise_model =
+                        Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string());
+                    self.show_feedback_toast(format!("[N:{}デノイズ ON]", scope.label()));
+                }
+                self.capture_adjust_full("AI デノイズの切替".to_string(), |app| {
+                    app.write_params_for_scope(fs_idx, scope, params);
+                    app.clear_all_adjustment_and_ai_caches(fs_idx);
+                });
             }
-            self.capture_adjust_full("AI デノイズの切替".to_string(), |app| {
-                app.write_params_for_scope(fs_idx, scope, params);
-                app.clear_all_adjustment_and_ai_caches(fs_idx);
-            });
         }
 
         // T / Shift+T / Alt+T: ポストフィルタの次/前/なしへ切替。

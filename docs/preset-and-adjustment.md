@@ -169,6 +169,14 @@ disabled だった頃は顕在化していなかった 2 点を併せて修正�
 - AI 関連: `upscale_model`, `denoise_model` (`Option<String>`)
 - **ポストフィルタ**: `post_filter: PostFilter` (レトロ系表示エフェクト、色調補正の後に適用)
 
+AI 関連フィールドは「ページ / お気に入り / グローバルに保存された希望設定」であり、
+実際に走るモデル範囲はアプリ全体設定 `Settings::ai_feature_mode` でさらに制限される。
+`Disabled` ではアップスケール / ノイズ除去を実行しない。`Light` ではアップスケールを
+`Real-ESR General V3` と `Real-CUGAN 4x` のみに制限し、ノイズ除去は実行しない。
+`HighQuality` では全アップスケールモデルとノイズ除去を許可する。モード変更時も
+`AdjustParams` 自体は破棄しないため、低負荷モードから高画質へ戻すと保存済みの
+モデル指定が再び有効になる。
+
 ### 2.1 適用順序
 
 色調そのものは `adjustment.rs::apply_adjustments_fast` で次の順に適用する:

@@ -997,7 +997,10 @@ fn runtime_hash_with(f: impl FnOnce(&mut std::collections::hash_map::DefaultHash
     hasher.finish()
 }
 
-fn hash_adjust_color_ai_params(params: &crate::adjustment::AdjustParams) -> u64 {
+fn hash_adjust_color_ai_params(
+    params: &crate::adjustment::AdjustParams,
+    ai_feature_mode: crate::settings::AiFeatureMode,
+) -> u64 {
     use std::hash::Hash;
     runtime_hash_with(|h| {
         params.brightness.to_bits().hash(h);
@@ -1011,16 +1014,18 @@ fn hash_adjust_color_ai_params(params: &crate::adjustment::AdjustParams) -> u64 
         params.auto_mode.map(|mode| format!("{mode:?}")).hash(h);
         params.upscale_model.hash(h);
         params.denoise_model.hash(h);
+        ai_feature_mode.hash(h);
     })
 }
 
 fn hash_adjust_final_params(
     params: &crate::adjustment::AdjustParams,
+    ai_feature_mode: crate::settings::AiFeatureMode,
     post_filter_bypassed: bool,
 ) -> u64 {
     use std::hash::Hash;
     runtime_hash_with(|h| {
-        hash_adjust_color_ai_params(params).hash(h);
+        hash_adjust_color_ai_params(params, ai_feature_mode).hash(h);
         post_filter_bypassed.hash(h);
         if !post_filter_bypassed {
             format!("{:?}", params.post_filter).hash(h);
@@ -18399,6 +18404,23 @@ impl App {
         self.clear_final_pipeline_caches_for_idx(idx);
     }
 
+    /// AI 利用範囲が変わったとき、実行中/完了済み AI 出力を全体で無効化する。
+    pub(crate) fn apply_ai_feature_mode_change(&mut self) {
+        for (_, (cancel, _)) in self.ai_upscale_pending.drain() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.ai_upscale_cache.clear();
+        self.ai_upscale_failed.clear();
+        self.bump_all_ai_generations();
+        if let Some(idx) = self.fullscreen_idx {
+            self.sync_upscale_from_preset(idx);
+        } else {
+            self.ai_upscale_enabled = false;
+            self.ai_upscale_model_override = None;
+            self.ai_denoise_model = None;
+        }
+    }
+
     /// AI バックエンド設定変更をホットリロードする (Phase 3、再起動不要)。
     ///
     /// 引数 `new_backend_str`: 新しい設定値 (`"directml"` / `"tensorrt"` / `"cpu"` / None)。
@@ -18825,7 +18847,11 @@ impl App {
                             self.ai_classify_cache.insert(current_idx, cat);
                             cat
                         });
-                    category.preferred_upscale_model()
+                    let Some(kind) = self.settings.ai_feature_mode.auto_upscale_model(category)
+                    else {
+                        return;
+                    };
+                    kind
                 }
             };
             match manager.model_path(kind) {
@@ -20744,9 +20770,9 @@ impl App {
         let [w, h] = size;
         let w = w as u32;
         let h = h as u32;
-        let upscale_enabled = params.upscale_model_kind().is_some()
+        let upscale_enabled = self.effective_upscale_request(params).is_some()
             && crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px);
-        let denoise_enabled = params.denoise_model_kind().is_some()
+        let denoise_enabled = self.effective_denoise_request(params).is_some()
             && crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px);
         if !upscale_enabled && !denoise_enabled {
             return None;
@@ -20758,9 +20784,39 @@ impl App {
         };
         Some(FinalAiKey {
             edit_key,
-            color_ai_hash: hash_adjust_color_ai_params(params),
+            color_ai_hash: hash_adjust_color_ai_params(params, self.settings.ai_feature_mode),
             bg,
         })
+    }
+
+    fn effective_upscale_request(
+        &self,
+        params: &crate::adjustment::AdjustParams,
+    ) -> Option<Option<crate::ai::ModelKind>> {
+        if matches!(
+            self.settings.ai_feature_mode,
+            crate::settings::AiFeatureMode::Disabled
+        ) {
+            return None;
+        }
+        let request = params.upscale_model_kind()?;
+        match request {
+            None => Some(None),
+            Some(kind) if self.settings.ai_feature_mode.allows_upscale_model(kind) => {
+                Some(Some(kind))
+            }
+            Some(_) => None,
+        }
+    }
+
+    fn effective_denoise_request(
+        &self,
+        params: &crate::adjustment::AdjustParams,
+    ) -> Option<crate::ai::ModelKind> {
+        if !self.settings.ai_feature_mode.allows_denoise() {
+            return None;
+        }
+        params.denoise_model_kind()
     }
 
     fn maybe_start_final_ai(
@@ -20813,8 +20869,8 @@ impl App {
         let [w, h] = source_image.size;
         let w_u32 = w as u32;
         let h_u32 = h as u32;
-        let upscale_request = params.upscale_model_kind();
-        let denoise_request = params.denoise_model_kind();
+        let upscale_request = self.effective_upscale_request(&params);
+        let denoise_request = self.effective_denoise_request(&params);
         let upscale_in_range = upscale_request.is_some()
             && crate::ai::upscale::should_process(w_u32, h_u32, self.settings.ai_upscale_skip_px);
         let denoise_in_range = denoise_request.is_some()
@@ -20860,7 +20916,11 @@ impl App {
                             self.ai_classify_cache.insert(idx, cat);
                             cat
                         });
-                    category.preferred_upscale_model()
+                    let Some(kind) = self.settings.ai_feature_mode.auto_upscale_model(category)
+                    else {
+                        return;
+                    };
+                    kind
                 }
             };
             // モデルパス存在のみ確認。実ロード (sessions Mutex) は worker に委ねる。
@@ -20940,7 +21000,11 @@ impl App {
         let params = self.effective_params(idx).clone();
         let final_key = FinalCompositeKey {
             edit_key,
-            params_hash: hash_adjust_final_params(&params, self.post_filter_bypassed),
+            params_hash: hash_adjust_final_params(
+                &params,
+                self.settings.ai_feature_mode,
+                self.post_filter_bypassed,
+            ),
             bg: self
                 .final_ai_key_for_pixels(edit_key, edit_pixels.size, &params)
                 .map_or(0, |key| key.bg),
@@ -21014,7 +21078,11 @@ impl App {
         let params = self.effective_params(idx).clone();
         let final_key = FinalCompositeKey {
             edit_key,
-            params_hash: hash_adjust_final_params(&params, self.post_filter_bypassed),
+            params_hash: hash_adjust_final_params(
+                &params,
+                self.settings.ai_feature_mode,
+                self.post_filter_bypassed,
+            ),
             bg: self
                 .final_ai_key_for_pixels(edit_key, edit_pixels.size, &params)
                 .map_or(0, |key| key.bg),
@@ -21712,8 +21780,9 @@ impl App {
     /// 現在の有効パラメータに基づいて AI アップスケール/デノイズの状態を更新する。
     pub(crate) fn sync_upscale_from_preset(&mut self, idx: usize) {
         // effective_params は self を不変借用するので、派生値だけコピーして解放してから代入する
-        let upscale_kind = self.effective_params(idx).upscale_model_kind();
-        let denoise_kind = self.effective_params(idx).denoise_model_kind();
+        let params = self.effective_params(idx);
+        let upscale_kind = self.effective_upscale_request(params);
+        let denoise_kind = self.effective_denoise_request(params);
         match upscale_kind {
             None => {
                 self.ai_upscale_enabled = false;
@@ -26232,8 +26301,8 @@ impl eframe::App for App {
             self.initialized = true;
 
             // テーマは Settings::ui_theme が `System` であれば OS 設定に追従し、
-            // 明示的な Light / Dark 選択はそのまま使う。起動ダイアログは出さない
-            // (v0.7.0 フィードバック反映で撤去)。
+            // 明示的な Light / Dark 選択はそのまま使う。初回セットアップダイアログでは
+            // テーマ / AI 利用範囲 / ZIP/PDF の開き方をまとめて確認する。
 
             if let Some(folder) = self.settings.last_folder.clone() {
                 if let Some(resolved) = crate::folder_tree::resolve_openable_path(&folder) {
@@ -26637,6 +26706,7 @@ impl eframe::App for App {
         self.poll_tq_encode_pending(ctx);
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
+        self.show_first_setup_dialog(ctx);
         self.show_preferences_dialog(ctx);
         self.show_settings_restore_dialog(ctx);
         // VST3 プラグイン管理ウィンドウ + チェーンエディタ。
