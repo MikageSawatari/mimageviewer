@@ -96,9 +96,15 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
     (`handle_fullscreen_close_request` が `pending_return_to_parent` を立て、次フレームの
     `handle_keyboard` が `AddressBarNav::Direct(parent)` を発行。L2 を 1 フレームも見せない)。
   - <kbd>Backspace</kbd> → そのコンテナのページ一覧 (L2) を表示 (= `close_fullscreen` のみ)。
-- `close_fullscreen` で `fs_zip_auto_opened` をクリア。Ctrl+↑↓ で別フォルダへ移ると
-  `auto_opened_container: false` の deferred で上書きされ、自動オープン状態は解除される
-  (= 連続読書で次の本へ移ったら通常の出口に戻る。v1 の割り切り)。
+- `close_fullscreen` で `fs_zip_auto_opened` をクリア。
+- **Ctrl+↑↓ フォルダナビで ZIP/PDF コンテナへ移っても自動オープン扱いにする** (連続読書)。
+  `reopen_fullscreen_after_folder_nav_load` が `auto_open_for_current_container()`
+  (= 設定 ON & `current_folder` が ZIP/PDF & 非検索) を見て deferred の
+  `auto_opened_container` を立てる。folder_tree DFS は ZIP/PDF ファイルを個別に訪問する
+  ので、本→次の本 (sibling ZIP/PDF) や「loose 画像なしフォルダ → 先頭 ZIP を仮想展開」
+  のどちらの経路でも、移動先が ZIP/PDF なら次の本も Esc→親一覧 / Backspace→ページ一覧 に
+  なる。loose 画像の通常フォルダへ移った場合は (コンテナでないので) 通常の出口に戻る。
+  検索 (Ctrl+S/G) 中は Esc が検索を抜ける想定外を避けるため適用しない。
 
 ---
 

@@ -14094,6 +14094,22 @@ impl App {
         }
     }
 
+    /// Ctrl+↑↓ フォルダナビで ZIP/PDF コンテナへ入ったとき、grid から開いたとき
+    /// (`auto_fullscreen_zip_pdf`) と同じ「自動オープン」退出ルーティング
+    /// (Esc/Enter→親一覧 / Backspace→ページ一覧) を使うか判定する。
+    ///
+    /// 通常フォルダ (loose 画像) には適用しない。検索 (Ctrl+S / Ctrl+G) 中も、Esc が
+    /// 検索を抜けて実親フォルダへ飛ぶ想定外挙動を避けるため適用しない。
+    pub(crate) fn auto_open_for_current_container(&self) -> bool {
+        self.settings.auto_fullscreen_zip_pdf
+            && !self.global_search.active
+            && !self.favsearch.active
+            && self
+                .current_folder
+                .as_deref()
+                .is_some_and(crate::folder_tree::is_virtual_folder)
+    }
+
     fn reopen_fullscreen_after_folder_nav_load(
         &mut self,
         ctx: &egui::Context,
@@ -14101,19 +14117,26 @@ impl App {
         resume_slideshow: bool,
     ) -> &'static str {
         // フォルダナビ経路は特定 leaf を持たない (= target: None)。先頭着地。
-        let deferred = DeferredFsReopen {
-            resume_slideshow,
-            target: None,
-            auto_opened_container: false,
-        };
+        // auto_opened_container は「移動先が ZIP/PDF コンテナ & 設定 ON」のとき立てる
+        // (= Ctrl+↓ で次の本へ移っても grid open と同じ退出ルーティングにする)。
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
-            self.fs_nav_after_pdf_enumerate = Some(deferred);
+            self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                resume_slideshow,
+                target: None,
+                auto_opened_container: self.auto_open_for_current_container(),
+            });
             return "enumerate_defer";
         }
         // SlideshowNext の再開は動画を開かず静止画のみに着地する (Codex P2)。
         let target_idx = self.find_fullscreen_nav_target_filtered(!resume_slideshow);
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
-            self.fs_nav_after_pdf_enumerate = Some(deferred);
+            // find_fullscreen_nav_target_filtered が loose 画像なしフォルダで先頭 ZIP/PDF を
+            // 仮想展開した場合もここに来る (current_folder が ZIP/PDF になっている)。
+            self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                resume_slideshow,
+                target: None,
+                auto_opened_container: self.auto_open_for_current_container(),
+            });
             return "enumerate_defer";
         }
         if let Some(new_idx) = target_idx {
@@ -14123,6 +14146,8 @@ impl App {
             let _ = restore_video_tile;
 
             self.open_fullscreen(new_idx);
+            // 同期完了で ZIP/PDF に着地した稀ケース (spawn fail fallback 等) もここで反映。
+            self.fs_zip_auto_opened = self.auto_open_for_current_container();
             self.selected = Some(new_idx);
             self.scroll_to_selected = true;
             self.update_last_selected_image();

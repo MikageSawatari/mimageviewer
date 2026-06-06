@@ -3793,6 +3793,35 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.fullscreen_idx, None);
     }
 
+    /// Ctrl+↑↓ フォルダナビ用 `auto_open_for_current_container` のゲート判定。
+    /// ZIP/PDF コンテナへ入った & 設定 ON のときだけ自動オープン扱いにする。
+    #[test]
+    fn auto_open_for_current_container_gating() {
+        let mut app = setup_app();
+        app.settings.auto_fullscreen_zip_pdf = true;
+
+        app.current_folder = Some(std::path::PathBuf::from("c:/manga/series"));
+        assert!(
+            !app.auto_open_for_current_container(),
+            "通常フォルダは対象外"
+        );
+
+        app.current_folder = Some(std::path::PathBuf::from("c:/manga/book.zip"));
+        assert!(app.auto_open_for_current_container(), "ZIP コンテナは対象");
+
+        app.current_folder = Some(std::path::PathBuf::from("c:/manga/doc.pdf"));
+        assert!(app.auto_open_for_current_container(), "PDF コンテナは対象");
+
+        // 検索中は (Esc が検索を抜けて実親へ飛ぶ想定外を避けるため) 対象外。
+        app.global_search.active = true;
+        assert!(!app.auto_open_for_current_container(), "検索中は対象外");
+        app.global_search.active = false;
+
+        // 設定 OFF は常に対象外。
+        app.settings.auto_fullscreen_zip_pdf = false;
+        assert!(!app.auto_open_for_current_container(), "設定 OFF は対象外");
+    }
+
     /// 見開きから隠蔽加工に入ったあと `reset_conceal_mode` で元の見開き状態に戻ること。
     #[test]
     fn reset_conceal_mode_restores_saved_spread_state() {
