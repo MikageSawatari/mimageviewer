@@ -43,6 +43,14 @@ const DETECT_LONG_SIDE: usize = 1000;
 /// (= 真のフルブリード: 縁の半分以上が絵 なら従来どおり `None`)。
 const BORDER_MARGIN_FRAC: f32 = 0.50;
 
+/// 推定した余白色 (luma) がこの「中間調」帯 (DARK_MAX..LIGHT_MIN) に入るときは切らない。
+/// 漫画の余白は紙白か一様ベタ黒なので、中間調が余白色として出るのは「絵 (スクリーントーンの
+/// 平均など) を余白と誤推定している」サイン (BORDER_MARGIN_FRAC を 0.50 に下げた副作用で、
+/// 絵が縁の過半を占めると median が絵の色になり、本物の余白側を中身扱いして絵を切りうる)。
+/// 中間調余白は信頼できないので `None` (= 迷ったら切らない / 全部映る優先)。実機で調整可。
+const MARGIN_PAPER_LIGHT_MIN: u8 = 205;
+const MARGIN_PAPER_DARK_MAX: u8 = 50;
+
 /// 連結成分の面積 (縮小後 px) がこれ未満なら孤立した点/ゴミとみなして捨てる。
 /// 本文や線 (縦横どちらも) はこれを超えるので残る。**ページ番号(ノンブル)などの数字を残し、
 /// より小さいスキャンの糊汚れ・端のゴミは捨てる** 境目。
@@ -219,6 +227,10 @@ pub fn detect_content_bbox(img: &ColorImage, tol: u8) -> Option<Rect> {
     }
 
     let margin = border_median_luma(&lum, w, h);
+    // 余白色が中間調 = 絵を余白と誤推定している疑い → 切らない (反転して絵を切る事故を防ぐ)。
+    if margin > MARGIN_PAPER_DARK_MAX && margin < MARGIN_PAPER_LIGHT_MIN {
+        return None;
+    }
     // 縁が余白で埋まっていない = フルブリード扱い → 切らない。
     if border_margin_fraction(&lum, w, h, margin, tol) < BORDER_MARGIN_FRAC {
         return None;
@@ -491,6 +503,20 @@ mod tests {
             b.max.x > 0.95,
             "右は端まで (中身がある=詰めない): {}",
             b.max.x
+        );
+    }
+
+    #[test]
+    fn midtone_margin_color_is_not_cut() {
+        // 縁の過半が中間調 (絵が左/上/下まで来て、右だけ白い本物の余白という構成を模す)。
+        // median が絵の色 (mid-gray) になり、本物の白余白を中身扱いして絵を切る反転事故が
+        // 起きうるので、中間調が余白色に出たら None (= 切らない / 全部映る優先) にする。
+        let mut img = white(100, 100);
+        fill(&mut img, 0, 0, 100, 100, Color32::from_gray(128)); // 全面 mid-gray (= 絵)
+        fill(&mut img, 92, 0, 100, 100, Color32::WHITE); // 右に白い帯 (本物の余白)
+        assert!(
+            detect_content_bbox(&img, DEFAULT_TOLERANCE).is_none(),
+            "中間調が余白色なら切らない (絵を切る反転を防ぐ)"
         );
     }
 
