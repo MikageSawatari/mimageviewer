@@ -5276,7 +5276,17 @@ impl VideoPlayer {
 
         #[cfg(windows)]
         if self.error.is_none() && self.clock.decode_failed() {
-            self.error = Some("動画のハードウェアデコードに失敗しました".to_string());
+            // D3D11VA 対応コーデックの HW デコード初期化/open が失敗した場合はここで
+            // エラー停止する (= SW へは自動フォールバックしない、settings.rs の
+            // `video_hw_decode` doc 参照)。古い内蔵 GPU ドライバ (AMD Vega / Intel
+            // 旧世代) で実害が出るため、ユーザーが自力で対処できるよう設定への導線を
+            // 文言に含める。設定パス/ラベルは `ui_dialogs/preferences/pages.rs` の
+            // `page_video` と一致させること。
+            self.error = Some(
+                "動画のハードウェアデコードに失敗しました。環境設定 > 動画再生 の\
+                 「ハードウェアデコードを有効にする」をオフにすると再生できる場合があります"
+                    .to_string(),
+            );
             self.shutdown_workers_for_error();
         }
 
