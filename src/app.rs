@@ -3728,6 +3728,10 @@ pub struct App {
     /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
     /// フォルダロード時に mask_db から一括取得し、save/delete/apply でメンテナンスする。
     pub(crate) mask_pages: std::collections::HashSet<usize>,
+    /// 現フォルダでテキスト注釈 (comic) を持つページの item_idx 集合 (サムネイル「文」
+    /// バッジ描画用)。フォルダロード時に comic_db.load_comic_keys から一括取得し、
+    /// save_comic_objects で idx 単位にメンテナンスする (mask_pages と同形)。
+    pub(crate) comic_pages: std::collections::HashSet<usize>,
     /// 消しゴムマスクの世代番号。mask / shape の保存・削除で idx 単位に +1 する。
     pub(crate) erase_mask_generation: std::collections::HashMap<usize, u64>,
     /// 補正レイヤー合成結果 cache。現在 key と一致する entry だけ表示に採用する。
@@ -5205,6 +5209,7 @@ impl App {
             local_adjust_brush_deferred_render: None,
             local_adjust_generation: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
+            comic_pages: std::collections::HashSet::new(),
             erase_mask_generation: std::collections::HashMap::new(),
             local_adjust_cache: std::collections::HashMap::new(),
             edit_result_cache: std::collections::HashMap::new(),
@@ -9423,6 +9428,7 @@ impl App {
         self.erase_mask_generation.clear();
         self.conceal_pages.clear();
         self.conceal_mask_generation.clear();
+        self.comic_pages.clear();
         self.erase_result_cache.clear();
         self.input_generation.clear();
         self.edit_result_cache.clear();
@@ -9577,6 +9583,21 @@ impl App {
                     if let Some(key) = self.page_path_key(idx) {
                         if conceal_keys.contains(&key) {
                             self.conceal_pages.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        // テキスト注釈 (comic): バッジ用に「注釈を持つページ」を集合化 (mask_db と同様)。
+        if let Some(db) = &self.comic_db {
+            let prefix = crate::adjustment_db::normalize_path(&source_path);
+            let comic_keys = db.load_comic_keys(&prefix);
+            if !comic_keys.is_empty() {
+                for idx in 0..self.items.len() {
+                    if let Some(key) = self.page_path_key(idx) {
+                        if comic_keys.contains(&key) {
+                            self.comic_pages.insert(idx);
                         }
                     }
                 }
@@ -10648,6 +10669,7 @@ impl App {
         self.export_crop_pages.clear();
         self.mask_pages.clear();
         self.conceal_pages.clear();
+        self.comic_pages.clear();
     }
 
     pub(crate) fn rehydrate_page_edit_state_for_current_items(
@@ -10715,6 +10737,18 @@ impl App {
                     if let Some(key) = self.page_path_key(idx) {
                         if conceal_keys.contains(&key) {
                             self.conceal_pages.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(db) = &self.comic_db {
+            let comic_keys = db.load_comic_keys(&prefix);
+            if !comic_keys.is_empty() {
+                for idx in 0..self.items.len() {
+                    if let Some(key) = self.page_path_key(idx) {
+                        if comic_keys.contains(&key) {
+                            self.comic_pages.insert(idx);
                         }
                     }
                 }
@@ -10819,6 +10853,7 @@ impl App {
             .iter()
             .filter_map(|&i| shift(i))
             .collect();
+        self.comic_pages = self.comic_pages.iter().filter_map(|&i| shift(i)).collect();
         let shifted_thumb_pixels = std::mem::take(&mut self.thumb_pixels)
             .into_iter()
             .filter_map(|(i, v)| {
@@ -21208,6 +21243,13 @@ impl App {
         objects: &[comic_core::AnnotationObject],
     ) {
         self.comic_docs.insert(key.to_string(), objects.to_vec());
+        // グリッド「文」バッジ用の idx 集合を即時メンテ (mask_pages と同様)。注釈が
+        // 1 件でもあれば付与、空なら除去。
+        if objects.is_empty() {
+            self.comic_pages.remove(&idx);
+        } else {
+            self.comic_pages.insert(idx);
+        }
         if let Some(db) = &self.comic_db {
             if let Err(e) = db.set(key, objects) {
                 crate::logger::log(format!("[comic] comic.db set failed key={key}: {e}"));
@@ -28843,6 +28885,7 @@ pub(crate) fn draw_cell(
     has_local_adjust: bool,  // true なら左上に補正レイヤーバッジ「レ」を表示
     has_mask: bool,          // true なら左上に消しゴムマスクバッジ「消」を表示
     has_conceal: bool,       // true なら左上に隠蔽加工マスクバッジ「隠」を表示 (Phase 4)
+    has_comic: bool,         // true なら左上にテキスト注釈バッジ「文」を表示
     rating: u8,              // 0 = 非表示, 1-5 = ★バッジ
     item: &GridItem,
     thumb: &ThumbnailState,
@@ -29305,6 +29348,14 @@ pub(crate) fn draw_cell(
             draw_single_char_badge(
                 "隠",
                 egui::Color32::from_rgb(153, 102, 204),
+                egui::Color32::WHITE,
+            );
+        }
+        if has_comic {
+            // テキスト注釈バッジ: ピンク系 (補=青 / レ=緑 / 消=オレンジ / 隠=紫 と区別)。
+            draw_single_char_badge(
+                "文",
+                egui::Color32::from_rgb(210, 90, 160),
                 egui::Color32::WHITE,
             );
         }

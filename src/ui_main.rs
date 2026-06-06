@@ -2441,6 +2441,7 @@ impl App {
                                 let has_local_adjust = self.local_adjust_pages.contains(&idx);
                                 let has_mask = self.mask_pages.contains(&idx);
                                 let has_conceal = self.conceal_pages.contains(&idx);
+                                let has_comic = self.comic_pages.contains(&idx);
                                 let rating = self.get_rating(idx);
                                 // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
                                 // process_thumb_adjust_budget が逐次処理する。
@@ -2488,6 +2489,7 @@ impl App {
                                     has_local_adjust,
                                     has_mask,
                                     has_conceal,
+                                    has_comic,
                                     rating,
                                     &self.items[idx],
                                     &self.thumbnails[idx],
