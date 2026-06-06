@@ -59,7 +59,7 @@ Windows 向け高速サムネイルビューワー
 
 ## 動作環境
 
-- Windows 10 / 11（64bit）
+- Windows 11（64bit）
 - DirectX 12 対応 GPU
 - メモリ 4GB 以上推奨
 
