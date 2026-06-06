@@ -1612,7 +1612,10 @@ impl App {
                 .map(|o| matches!(o.kind, AnnotationKind::MessageWindow(_)))
                 .unwrap_or(false);
             if sel_win {
-                let fonts = self.ensure_comic_fonts();
+                // 参照フォント (カスタム/pack) も含めてロードしてから判定する。base のみの
+                // ensure_comic_fonts() だと未ロードフォントの窓で fallback metrics になり
+                // overflow 警告がずれる (Codex P3)。warm なら cache 済み Arc を返すだけ。
+                let fonts = self.ensure_comic_fonts_for(&objects);
                 match (
                     fonts.as_deref(),
                     selected.and_then(|id| objects.iter().find(|o| o.id == id)),
@@ -1742,11 +1745,13 @@ impl App {
         // プリセット要求の処理 (保存 / 更新 / 削除)。名前入力を書き戻し、操作が効いたら
         // changed を立てて下の保存 + 再ベイクに乗せる。
         self.comic_preset_name_input = preset_name_input;
-        if preset_reqs.save && self.save_current_as_preset(&mut objects, selected) {
-            changed = true;
+        if let Some(target) = preset_reqs.save {
+            if self.save_current_as_preset(&mut objects, selected, target) {
+                changed = true;
+            }
         }
-        if let Some(id) = preset_reqs.update {
-            if self.update_user_preset(&mut objects, selected, &id) {
+        if let Some((target, id)) = preset_reqs.update {
+            if self.update_user_preset(&mut objects, selected, target, &id) {
                 changed = true;
             }
         }
@@ -2605,6 +2610,7 @@ impl App {
         &mut self,
         objects: &mut [AnnotationObject],
         selected: Option<u64>,
+        target: PresetTarget,
     ) -> bool {
         let Some(sel) = selected else {
             return false;
@@ -2620,33 +2626,43 @@ impl App {
                 n.to_string()
             }
         };
-        let snapshot = objects[idx].clone(); // 読み取り用 (借用衝突回避)
-        match &snapshot.kind {
-            AnnotationKind::Text(t) => {
+        // どのプリセットバーから要求されたか (target) で保存先の種別を決める。オブジェクト
+        // 種別では判定しない (吹き出し/窓でセリフ + 本体/ウィンドウのバーが同時に出るため。
+        // Codex P2)。テキストプリセットは TextBlock を持つ全種 (Text/Bubble/Window) で保存可。
+        match target {
+            PresetTarget::Text => {
                 let id = self.next_user_preset_id("t");
-                self.comic_text_presets
-                    .push(TextStylePreset::from_text(id.clone(), name, t));
-                if let AnnotationKind::Text(tt) = &mut objects[idx].kind {
-                    tt.preset_link = Some(id);
+                let Some(tb) = objects[idx].text_block() else {
+                    return false;
+                };
+                let preset = TextStylePreset::from_text(id.clone(), name, tb);
+                self.comic_text_presets.push(preset);
+                if let Some(tbm) = objects[idx].text_block_mut() {
+                    tbm.preset_link = Some(id);
                 }
             }
-            AnnotationKind::Bubble(b) => {
+            PresetTarget::Shape => {
+                let AnnotationKind::Bubble(b) = &objects[idx].kind else {
+                    return false;
+                };
                 let id = self.next_user_preset_id("s");
-                self.comic_shape_presets
-                    .push(ShapeStylePreset::from_bubble(id.clone(), name, b));
+                let preset = ShapeStylePreset::from_bubble(id.clone(), name, b);
+                self.comic_shape_presets.push(preset);
                 if let AnnotationKind::Bubble(bb) = &mut objects[idx].kind {
                     bb.shape_preset_link = Some(id);
                 }
             }
-            AnnotationKind::MessageWindow(w) => {
+            PresetTarget::Window => {
+                let AnnotationKind::MessageWindow(w) = &objects[idx].kind else {
+                    return false;
+                };
                 let id = self.next_user_preset_id("w");
-                self.comic_window_presets
-                    .push(WindowStylePreset::from_window(id.clone(), name, w));
+                let preset = WindowStylePreset::from_window(id.clone(), name, w);
+                self.comic_window_presets.push(preset);
                 if let AnnotationKind::MessageWindow(ww) = &mut objects[idx].kind {
                     ww.style_preset_link = Some(id);
                 }
             }
-            AnnotationKind::Stamp(_) => return false,
         }
         self.comic_preset_name_input.clear();
         self.save_comic_presets_to_disk();
@@ -2659,6 +2675,7 @@ impl App {
         &mut self,
         objects: &mut [AnnotationObject],
         selected: Option<u64>,
+        target: PresetTarget,
         id: &str,
     ) -> bool {
         if crate::comic_presets::is_system_preset(id) {
@@ -2670,31 +2687,36 @@ impl App {
         let Some(idx) = objects.iter().position(|o| o.id == sel) else {
             return false;
         };
-        let snapshot = objects[idx].clone();
+        // 更新先の種別は target で決める (オブジェクト種別ではない。Codex P2)。
         let mut updated = false;
-        match &snapshot.kind {
-            AnnotationKind::Text(t) => {
-                if let Some(p) = self.comic_text_presets.iter_mut().find(|p| p.id == id) {
-                    let name = p.name.clone();
-                    *p = TextStylePreset::from_text(id.to_string(), name, t);
-                    updated = true;
+        match target {
+            PresetTarget::Text => {
+                if let Some(tb) = objects[idx].text_block() {
+                    if let Some(p) = self.comic_text_presets.iter_mut().find(|p| p.id == id) {
+                        let name = p.name.clone();
+                        *p = TextStylePreset::from_text(id.to_string(), name, tb);
+                        updated = true;
+                    }
                 }
             }
-            AnnotationKind::Bubble(b) => {
-                if let Some(p) = self.comic_shape_presets.iter_mut().find(|p| p.id == id) {
-                    let name = p.name.clone();
-                    *p = ShapeStylePreset::from_bubble(id.to_string(), name, b);
-                    updated = true;
+            PresetTarget::Shape => {
+                if let AnnotationKind::Bubble(b) = &objects[idx].kind {
+                    if let Some(p) = self.comic_shape_presets.iter_mut().find(|p| p.id == id) {
+                        let name = p.name.clone();
+                        *p = ShapeStylePreset::from_bubble(id.to_string(), name, b);
+                        updated = true;
+                    }
                 }
             }
-            AnnotationKind::MessageWindow(w) => {
-                if let Some(p) = self.comic_window_presets.iter_mut().find(|p| p.id == id) {
-                    let name = p.name.clone();
-                    *p = WindowStylePreset::from_window(id.to_string(), name, w);
-                    updated = true;
+            PresetTarget::Window => {
+                if let AnnotationKind::MessageWindow(w) = &objects[idx].kind {
+                    if let Some(p) = self.comic_window_presets.iter_mut().find(|p| p.id == id) {
+                        let name = p.name.clone();
+                        *p = WindowStylePreset::from_window(id.to_string(), name, w);
+                        updated = true;
+                    }
                 }
             }
-            AnnotationKind::Stamp(_) => {}
         }
         if updated {
             self.reapply_preset_to_linked(objects, id);
@@ -4699,11 +4721,23 @@ fn edit_object_ui(
 
     // プリセットバー (色帯): セリフ (常時) + 本体 (吹) / ウィンドウ (窓)。
     ui.add_space(4.0);
+    // 窓に対しテキストプリセットを当てると本文スタイルが変わり、ウィンドウプリセットが捉える
+    // 本文スタイルから乖離する → ウィンドウリンクを解除する (本文内容では解除しない規約と一貫。
+    // Codex P2)。適用検出のため当てる前の本文スタイルを控える。
+    let win_text_snap = match &o.kind {
+        AnnotationKind::MessageWindow(w) => Some(w.text.clone()),
+        _ => None,
+    };
     draw_section_bar(ui, TextPropTab::Serifu.color(), |ui| {
         if let Some(tb) = o.text_block_mut() {
             text_preset_bar(ui, tb, presets, changed);
         }
     });
+    if let (Some(snap), AnnotationKind::MessageWindow(w)) = (&win_text_snap, &mut o.kind) {
+        if w.style_preset_link.is_some() && text_style_diverged(snap, &w.text) {
+            w.style_preset_link = None;
+        }
+    }
     if let AnnotationKind::Bubble(b) = &mut o.kind {
         draw_section_bar(ui, TextPropTab::Body.color(), |ui| {
             shape_preset_bar(ui, b, pivot, presets, changed);
@@ -5079,14 +5113,25 @@ fn name_plate_style_diverged(a: &comic_core::NamePlate, b: &comic_core::NamePlat
     an != bn
 }
 
+/// プリセットの保存/更新対象の種別 (= どのプリセットバーから要求されたか)。常時表示エリアで
+/// セリフ + 本体/ウィンドウのバーが同時に出るようになったため、要求がどの種類のプリセットを
+/// 対象とするかを明示しないと、オブジェクト種別で誤判定する (Codex P2: 吹き出しのセリフバーの
+/// 「保存」が本体プリセットを保存してしまう問題)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PresetTarget {
+    Text,
+    Shape,
+    Window,
+}
+
 /// プリセットバー周りの状態。詳細パネルの外 (draw_text_panel) で結果を処理する。
 #[derive(Default)]
 struct PresetRequests {
-    /// 現在のスタイルを新規ユーザープリセットとして保存。
-    save: bool,
-    /// この user プリセット id を現在のスタイルで更新。
-    update: Option<String>,
-    /// この user プリセット id を削除。
+    /// 現在のスタイルを新規ユーザープリセットとして保存 (対象種別付き)。
+    save: Option<PresetTarget>,
+    /// (対象種別, id): この user プリセットを現在のスタイルで更新。
+    update: Option<(PresetTarget, String)>,
+    /// この user プリセット id を削除 (id ベースなので種別非依存)。
     delete: Option<String>,
 }
 
@@ -5103,6 +5148,7 @@ struct PresetCtx<'a> {
 /// 「現在を保存」/「更新」。適用された id を返し、保存/更新/削除は `reqs` に立てる。
 fn preset_buttons_ui(
     ui: &mut egui::Ui,
+    target: PresetTarget,
     entries: &[(String, String, bool)], // (id, name, is_system)
     linked: Option<&str>,
     name_input: &mut String,
@@ -5131,11 +5177,11 @@ fn preset_buttons_ui(
                 .desired_width(110.0),
         );
         if ui.button("現在を保存").clicked() {
-            reqs.save = true;
+            reqs.save = Some(target);
         }
         if let Some(id) = linked {
             if !crate::comic_presets::is_system_preset(id) && ui.button("更新").clicked() {
-                reqs.update = Some(id.to_string());
+                reqs.update = Some((target, id.to_string()));
             }
         }
     });
@@ -5163,6 +5209,7 @@ fn text_preset_bar(
         .collect();
     let applied = preset_buttons_ui(
         ui,
+        PresetTarget::Text,
         &entries,
         t.preset_link.as_deref(),
         presets.name_input,
@@ -5199,6 +5246,7 @@ fn shape_preset_bar(
         .collect();
     let applied = preset_buttons_ui(
         ui,
+        PresetTarget::Shape,
         &entries,
         b.shape_preset_link.as_deref(),
         presets.name_input,
@@ -5234,6 +5282,7 @@ fn window_preset_bar(
         .collect();
     let applied = preset_buttons_ui(
         ui,
+        PresetTarget::Window,
         &entries,
         w.style_preset_link.as_deref(),
         presets.name_input,
