@@ -86,10 +86,12 @@ case "$mode" in
         echo "  zip:   $ZIP"
         echo "  index: $INDEX"
 
-        # Release が無ければ作る。
+        # Release が無ければ作る。本体リリース (Latest) を奪わないよう prerelease で作成
+        # する (TensorRT pack と同方針)。--latest=false で Latest 昇格も明示的に防ぐ。
         if ! gh release view "$EDITING_PACK_TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "[publish-editing-pack] Release $EDITING_PACK_TAG が無いので作成します"
+            echo "[publish-editing-pack] Release $EDITING_PACK_TAG が無いので作成します (prerelease)"
             gh release create "$EDITING_PACK_TAG" --repo "$REPO" \
+                --prerelease --latest=false \
                 --title "Editing add-on pack" \
                 --notes "mImageViewer の編集用追加パック (オノマトペ向けフォント + 被写体分離モデル) 配信用。アプリが editing-pack-index.json を参照してダウンロードします。"
         fi
