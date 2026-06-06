@@ -4988,9 +4988,12 @@ fn bubble_struct_toggles_ui(
     tail_stash: &mut HashMap<u64, Tail>,
 ) -> bool {
     ui.add_space(2.0);
-    // 結合 (下の吹き出しと union)。塗りつぶせる本体を持つ形状のみ対応 — ぼかし系 /
-    // 線描画系 / テキストのみ (意識 / 集中線 / 流線 / なし) は不可なのでトグルを無効化し、
-    // 別形状で立った stale フラグをクリアする。
+    // 結合 (「すぐ下」= z 順で直下の吹き出しと union)。**直下のみ**なのは意図的 — 間に別
+    // オブジェクトが挟まる吹き出しまで飛ばして融合すると z 重なり順が壊れるため (comic-core
+    // raster の merge グルーピングが連続 z だけを 1 ユニット化する仕様)。ラベルを「すぐ下の
+    // 吹き出しと結合」にして利用者へ直下条件を伝える。塗りつぶせる本体を持つ形状のみ対応 —
+    // ぼかし系 / 線描画系 / テキストのみ (意識 / 集中線 / 流線 / なし) は不可なのでトグルを
+    // 無効化し、別形状で立った stale フラグをクリアする。
     let merge_supported = comic_core::shape_is_mergeable(&b.shape);
     if !merge_supported && b.merge_with_below {
         b.merge_with_below = false;
@@ -4998,7 +5001,7 @@ fn bubble_struct_toggles_ui(
     }
     let merge_resp = ui.add_enabled(
         merge_supported,
-        egui::Checkbox::new(&mut b.merge_with_below, "下の吹き出しと結合"),
+        egui::Checkbox::new(&mut b.merge_with_below, "すぐ下の吹き出しと結合"),
     );
     if merge_supported && merge_resp.changed() {
         *changed = true;
