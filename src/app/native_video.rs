@@ -2091,14 +2091,10 @@ impl App {
             self.mark_native_video_hud_activity(ctx);
             return;
         }
-        let scanning_this_video = self
-            .normalize_state
-            .as_ref()
-            .map(|state| state.fs_idx == fs_idx)
-            .unwrap_or(false);
+        let modal_scan_this_video = self.normalize_scan_is_modal_for_current_player(fs_idx);
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.toggle_play();
-            if will_request_play && player.audio_preroll_suspended() && !scanning_this_video {
+            if will_request_play && player.audio_preroll_suspended() && !modal_scan_this_video {
                 crate::logger::log(format!(
                     "[native-video] resume playback after deferred normalize scan was unavailable idx={fs_idx}"
                 ));
@@ -2648,8 +2644,20 @@ impl App {
     }
 
     #[cfg(windows)]
+    /// 仮 gain 適用前の scan は、未補正音の先読みを避けるため再生・キー操作を
+    /// モーダルに止める。`ProvisionalApplied` 後は同じ worker が走っていても
+    /// 確定値待ちのバックグラウンド scan なので通常操作を許可する。
+    fn normalize_scan_is_modal_for_current_player(&self, fs_idx: usize) -> bool {
+        self.normalize_scan_matches_current_player(fs_idx)
+            && self
+                .normalize_state
+                .as_ref()
+                .is_some_and(|state| !state.provisional_applied)
+    }
+
+    #[cfg(windows)]
     fn mark_existing_normalize_scan_for_deferred_play(&mut self, fs_idx: usize) -> bool {
-        if !self.normalize_scan_matches_current_player(fs_idx) {
+        if !self.normalize_scan_is_modal_for_current_player(fs_idx) {
             return false;
         }
         if let Some(state) = self.normalize_state.as_mut() {
@@ -2963,24 +2971,27 @@ impl App {
             .get(&fs_idx)
             .copied()
             .unwrap_or(NormalizeUiState::Off);
-        let progress = self
-            .normalize_state
-            .as_ref()
-            .filter(|s| s.fs_idx == fs_idx)
-            .map(|s| NormalizeProgressSnapshot {
-                pts_processed_ms: s
-                    .progress
-                    .pts_processed_ms
-                    .load(std::sync::atomic::Ordering::Acquire),
-                duration_ms: s
-                    .progress
-                    .duration_ms
-                    .load(std::sync::atomic::Ordering::Acquire),
-                indeterminate: s
-                    .progress
-                    .indeterminate
-                    .load(std::sync::atomic::Ordering::Acquire),
-            });
+        let progress = if matches!(ui_state, NormalizeUiState::Scanning) {
+            self.normalize_state
+                .as_ref()
+                .filter(|s| s.fs_idx == fs_idx)
+                .map(|s| NormalizeProgressSnapshot {
+                    pts_processed_ms: s
+                        .progress
+                        .pts_processed_ms
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    duration_ms: s
+                        .progress
+                        .duration_ms
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    indeterminate: s
+                        .progress
+                        .indeterminate
+                        .load(std::sync::atomic::Ordering::Acquire),
+                })
+        } else {
+            None
+        };
         player.set_native_normalize_state(NormalizeOverlayState { ui_state, progress });
     }
 
@@ -4504,14 +4515,10 @@ impl App {
         if key.alt {
             return;
         }
-        // Codex 5周目 P1: ノーマライズスキャン中はモーダル動作のため、ESC (cancel) 以外の
-        // キー入力 (Enter で再生再開、S で tile mode、B でブックマーク等) を全て遮断する。
-        // ESC だけ下の match に流す。
-        if self
-            .normalize_state
-            .as_ref()
-            .map(|s| s.fs_idx == fs_idx)
-            .unwrap_or(false)
+        // 仮 gain 適用前のノーマライズスキャンはモーダル動作のため、ESC (cancel)
+        // 以外のキー入力 (Enter で再生再開、S で tile mode、B でブックマーク等) を
+        // 全て遮断する。ProvisionalApplied 後のバックグラウンド scan 中は通常操作を許す。
+        if self.normalize_scan_is_modal_for_current_player(fs_idx)
             && !(key.virtual_key == 0x1B && !key.repeat)
         {
             return;
@@ -4550,15 +4557,10 @@ impl App {
             // Escape: close native fullscreen. If the native overlay has a text
             // editor focused this key is not forwarded here, so dialog editing
             // does not accidentally close the fullscreen window.
-            // Codex P1 反映: ノーマライズスキャン中の ESC は cancel に優先ルーティング。
-            // (overlay 側 progress UI のキャンセルボタン押下と等価)
+            // 仮 gain 適用前のモーダルスキャン中だけ ESC を cancel に優先ルーティング。
+            // ProvisionalApplied 後は通常の ESC として tile/fullscreen close に使う。
             0x1B if !key.repeat => {
-                if self
-                    .normalize_state
-                    .as_ref()
-                    .map(|s| s.fs_idx == fs_idx)
-                    .unwrap_or(false)
-                {
+                if self.normalize_scan_is_modal_for_current_player(fs_idx) {
                     self.handle_cancel_normalize_scan(ctx, fs_idx);
                 } else if self.close_video_tile_mode() {
                     self.sync_native_video_tile_overlay(ctx, fs_idx);

@@ -1916,7 +1916,10 @@ autoplay を一時的に false にしてから fs_cache に挿入し、`init_nor
 `PROVISIONAL_SCAN_AFTER_SECS` (= 10 分) に到達した時点で `Provisional` を返し、App は
 仮 gain を DB 保存せず現在 player へ適用して再生 intent と `audio_preroll_suspended` を
 復帰する。scanner はそのまま継続し、最終 `Done` のみ `audio_normalize.db` に保存して
-`OnApplied` へ遷移する。確定 gain への差分は audio-pump の 4 秒 ramp で追従する。
+`OnApplied` へ遷移する。`ProvisionalApplied` 後も `NormalizeScanState` は残るが、
+この段階は確定値待ちのバックグラウンド scan として扱い、キー入力 / seek / deferred-play
+経路でモーダル blocker や `audio_preroll_suspended` を再度立てない。確定 gain への差分は
+audio-pump の 4 秒 ramp で追従する。
 10 分未満の動画や、10 分時点で loudness がまだ有効でない動画は従来通り確定結果まで待つ。
 キャッシュ hit の動画を grid から再開する場合や、停止中の未測定動画をクリック / Enter で
 再生する場合も同じ deferred-play scan 経路を使う。
@@ -1928,10 +1931,11 @@ raw→processed 先読みを一時停止し、旧 gain の `processed` を作ら
 source-swap / `fs_cache` evict で旧 `VideoPlayer` を drop するときは、同じ fs_idx の
 `NormalizeScanState` も cancel + cleanup する。これを怠ると次動画の deferred scan が
 `normalize_state.is_some()` で開始できず、`audio_preroll_suspended` が解除されないまま
-Buffering に残る。既に同じ動画の scan が進行中に再生 intent が来た場合は、
+Buffering に残る。既に同じ動画の仮 gain 適用前 scan が進行中に再生 intent が来た場合は、
 `NormalizeScanState.was_playing=true` に更新して playback / preroll を抑止したまま
-scan 完了後に再開する。別動画の scan が残っている場合は現在の再生対象を優先し、古い scan
-を cancel して旧対象の UI state を `OnUnmeasured` へ戻してから、現在動画の scan を開始する。
+scan 完了または仮 gain 適用後に再開する。仮 gain 適用後のバックグラウンド scan は再生 intent
+を再度横取りしない。別動画の scan が残っている場合は現在の再生対象を優先し、古い scan を
+cancel して旧対象の UI state を `OnUnmeasured` へ戻してから、現在動画の scan を開始する。
 auto-scan 抑止などで deferred scan を開始できない場合だけ、保険として再生 intent と
 preroll suspension を復帰し、未補正でも再生不能にしない。
 全体 OFF も in-flight scan を cancel して同じ復帰処理を行う。
