@@ -211,7 +211,9 @@ quiet period を置き、その間は decoder を作らず `NativeOverlayNavigat
 移動先ファイル名と保存済み resume サムネ (無ければ黒背景) を表示する。quiet period 後に
 最新 target だけを open し、`native_video_fast_swap_pending` が最初の native frame 表示まで
 連続入力を抑制する。navigation preview も最初の native frame が実際に表示されるまで
-残し、decoder startup 中に旧動画の frame が露出しないようにする。画像⇄動画の遷移はこの fast path の対象外で、従来どおり
+残し、decoder startup 中に旧動画の frame が露出しないようにする。navigation preview は
+source swap 中の受動表示なのでカーソル idle をリセットせず、キーボードでの動画送りだけでは
+非表示カーソルを復活させない。画像⇄動画の遷移はこの fast path の対象外で、従来どおり
 `open_fullscreen` / `start_fs_load` 経路で扱う。
 
 動画タイルモード (`video_tile_state`) は再生中動画の `VideoInfo` からタイムスタンプ列を

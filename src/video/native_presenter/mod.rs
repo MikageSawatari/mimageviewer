@@ -5360,6 +5360,9 @@ impl NativeEguiOverlay {
         // 静止画側 `fs_ui_is_clean` がチェック状態を考慮しないのと挙動を揃える。
         // tile overlay は受動表示の側面が強いが、サムネがクリックで操作可能なので
         // カーソル可視を維持する側に含める。
+        // navigation preview は動画→動画 source swap 中の受動表示なので blocking に
+        // 含めない。含めるとキー操作の上下移動だけで非表示カーソルが復活する。
+        // マウス/ホイール操作の動画移動は App 側で明示的に cursor activity を入れる。
         //
         // 実機修正 (2026-05-12, Codex 助言 #3): **HUD activation zone (上端 76pt /
         // 下端 220pt)** に cursor が入っていれば auto-hide を抑制する。バーが「ふっと
@@ -5371,11 +5374,11 @@ impl NativeEguiOverlay {
         let in_bottom_activation_zone = pointer_pos
             .map(|p| p.y >= overlay_height_points - 220.0)
             .unwrap_or(false);
-        let cursor_blocking_overlay_visible = navigation_preview_visible
-            || tile_overlay_visible
+        let cursor_blocking_status_visible = status_visible && !navigation_preview_visible;
+        let cursor_blocking_overlay_visible = tile_overlay_visible
             || bottom_hud_visible
             || panel_chrome_visible
-            || status_visible
+            || cursor_blocking_status_visible
             || toast_visible
             || bookmark_title_edit_visible
             || bulk_bookmark_dialog_visible
