@@ -242,6 +242,110 @@ pub fn detect_content_bbox(img: &ColorImage, tol: u8) -> Option<Rect> {
     Some(Rect::from_min_max(pos2(nx0, ny0), pos2(nx1, ny1)))
 }
 
+/// 連結成分を全て (面積・bbox) 列挙する (診断用、min_area フィルタなし)。
+fn all_components(mask: &[bool], w: usize, h: usize) -> Vec<(usize, usize, usize, usize, usize)> {
+    let mut visited = vec![false; w * h];
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let mut out = Vec::new();
+    for sy in 0..h {
+        for sx in 0..w {
+            let si = sy * w + sx;
+            if !mask[si] || visited[si] {
+                continue;
+            }
+            stack.clear();
+            stack.push((sx, sy));
+            visited[si] = true;
+            let mut area = 0usize;
+            let (mut x0, mut y0, mut x1, mut y1) = (sx, sy, sx, sy);
+            while let Some((cx, cy)) = stack.pop() {
+                area += 1;
+                x0 = x0.min(cx);
+                y0 = y0.min(cy);
+                x1 = x1.max(cx);
+                y1 = y1.max(cy);
+                let xlo = cx.saturating_sub(1);
+                let xhi = (cx + 1).min(w - 1);
+                let ylo = cy.saturating_sub(1);
+                let yhi = (cy + 1).min(h - 1);
+                for ny in ylo..=yhi {
+                    for nx in xlo..=xhi {
+                        let ni = ny * w + nx;
+                        if mask[ni] && !visited[ni] {
+                            visited[ni] = true;
+                            stack.push((nx, ny));
+                        }
+                    }
+                }
+            }
+            out.push((area, x0, y0, x1, y1));
+        }
+    }
+    out
+}
+
+/// 1 連結成分の診断情報。
+#[derive(Clone, Debug)]
+pub struct DiagComponent {
+    /// 縮小後 px の面積。
+    pub area: usize,
+    /// 正規化 (0..1) の bbox。
+    pub rect: Rect,
+    /// 面積が `MIN_COMPONENT_AREA` 以上 (= 中身として bbox に効く) か。
+    pub kept: bool,
+}
+
+/// 余白カット検出の診断結果 (デバッグログ用)。
+pub struct MarginFitDiag {
+    /// 検出に使った縮小後サイズ。
+    pub downscaled: (usize, usize),
+    /// 推定した余白色 (luma)。
+    pub margin_luma: u8,
+    /// 縁が余白色だった割合。
+    pub border_margin_frac: f32,
+    /// 中身とみなす最小面積 (`MIN_COMPONENT_AREA`)。
+    pub min_area: usize,
+    /// 各辺のトリム上限 (`MAX_TRIM_FRAC`)。
+    pub max_trim_frac: f32,
+    /// 使った luma 許容差。
+    pub tol: u8,
+    /// 全連結成分 (面積降順)。
+    pub components: Vec<DiagComponent>,
+    /// 最終 bbox (cap+pad 込み、None なら通常フィット)。
+    pub bbox: Option<Rect>,
+}
+
+/// 余白カット検出の診断。検出と同じ前処理で全成分を列挙し、最終 bbox と併せて返す。
+/// `detect_content_bbox` には影響しない読み取り専用の解析。
+pub fn diagnose(img: &ColorImage, tol: u8) -> MarginFitDiag {
+    let (w, h, lum) = downscale_luma(img);
+    let margin = border_median_luma(&lum, w, h);
+    let bmf = border_margin_fraction(&lum, w, h, margin, tol);
+    let mask: Vec<bool> = lum.iter().map(|&v| v.abs_diff(margin) > tol).collect();
+    let mut comps: Vec<DiagComponent> = all_components(&mask, w, h)
+        .into_iter()
+        .map(|(area, x0, y0, x1, y1)| DiagComponent {
+            area,
+            rect: Rect::from_min_max(
+                pos2(x0 as f32 / w as f32, y0 as f32 / h as f32),
+                pos2((x1 + 1) as f32 / w as f32, (y1 + 1) as f32 / h as f32),
+            ),
+            kept: area >= MIN_COMPONENT_AREA,
+        })
+        .collect();
+    comps.sort_by(|a, b| b.area.cmp(&a.area));
+    MarginFitDiag {
+        downscaled: (w, h),
+        margin_luma: margin,
+        border_margin_frac: bmf,
+        min_area: MIN_COMPONENT_AREA,
+        max_trim_frac: MAX_TRIM_FRAC,
+        tol,
+        components: comps,
+        bbox: detect_content_bbox(img, tol),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +456,25 @@ mod tests {
         let mut img = white(64, 64);
         fill(&mut img, 0, 0, 64, 64, Color32::from_gray(40)); // ほぼ全面 ink
         assert!(detect_content_bbox(&img, DEFAULT_TOLERANCE).is_none());
+    }
+
+    #[test]
+    fn diagnose_lists_components_by_area() {
+        let mut img = white(64, 64);
+        fill(&mut img, 10, 10, 54, 54, Color32::BLACK); // 本体 (大)
+        fill(&mut img, 2, 2, 4, 4, Color32::BLACK); // 2x2=4 の小点 (< MIN)
+        let d = diagnose(&img, DEFAULT_TOLERANCE);
+        assert!(d.components.len() >= 2, "本体 + 小点で 2 成分以上");
+        assert!(
+            d.components[0].area >= d.components[1].area,
+            "面積降順でソート"
+        );
+        assert!(d.components[0].kept, "本体は KEEP");
+        assert!(
+            !d.components.last().unwrap().kept,
+            "最小成分 (小点) は drop"
+        );
+        assert!(d.bbox.is_some(), "bbox は検出される");
     }
 
     #[test]

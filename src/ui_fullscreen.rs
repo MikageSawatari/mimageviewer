@@ -2600,6 +2600,11 @@ impl App {
                                 self.settings.margin_fit_enabled = !self.settings.margin_fit_enabled;
                                 self.settings.save();
                                 self.fs_margin_bbox_cache.clear();
+                                // ON にしたとき、現在ページの余白カット検出診断をログに出す
+                                // (各成分の面積・位置・各辺を決める成分。原因/しきい値の調査用)。
+                                if self.settings.margin_fit_enabled {
+                                    self.log_margin_fit_diag(fs_idx);
+                                }
                                 ctx.request_repaint();
                             }
                             // 360 度パノラマビュー: トグル
@@ -5563,6 +5568,84 @@ impl App {
         };
         self.fs_margin_bbox_cache.insert(idx, bbox);
         bbox
+    }
+
+    /// 余白カット検出の診断を logger に出力する (デバッグ用、ボタン ON 時に呼ぶ)。
+    /// 検出された各連結成分の面積・位置と、各辺を決めている成分をログに出すので、
+    /// 「右が詰まらない原因 (小さな点/汚れ/本文が端まで届く)」やしきい値の目安が分かる。
+    pub(crate) fn log_margin_fit_diag(&self, idx: usize) {
+        let pixels = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => pixels.clone(),
+            _ => {
+                crate::logger::log(
+                    "[margin-fit diag] pixels 未取得 (再デコード待ち)。少し待って再度トグル"
+                        .to_string(),
+                );
+                return;
+            }
+        };
+        let diag = crate::margin_fit::diagnose(&pixels, crate::margin_fit::DEFAULT_TOLERANCE);
+        let bbox_s = match diag.bbox {
+            Some(r) => format!(
+                "[{:.3},{:.3} .. {:.3},{:.3}]",
+                r.min.x, r.min.y, r.max.x, r.max.y
+            ),
+            None => "None (通常フィット)".to_string(),
+        };
+        crate::logger::log(format!(
+            "[margin-fit diag] idx={} orig={}x{} downscaled={}x{} margin_luma={} border_frac={:.2} min_area={} tol={} 最終bbox={}",
+            idx,
+            pixels.size[0],
+            pixels.size[1],
+            diag.downscaled.0,
+            diag.downscaled.1,
+            diag.margin_luma,
+            diag.border_margin_frac,
+            diag.min_area,
+            diag.tol,
+            bbox_s
+        ));
+        crate::logger::log(format!(
+            "[margin-fit diag] 成分数={} (面積降順・上位20、KEEP=面積>={})",
+            diag.components.len(),
+            diag.min_area
+        ));
+        for (i, c) in diag.components.iter().take(20).enumerate() {
+            crate::logger::log(format!(
+                "  #{:<2} area={:<6} rect=[{:.3},{:.3} .. {:.3},{:.3}] {}",
+                i + 1,
+                c.area,
+                c.rect.min.x,
+                c.rect.min.y,
+                c.rect.max.x,
+                c.rect.max.y,
+                if c.kept { "KEEP" } else { "drop" }
+            ));
+        }
+        let kept: Vec<&crate::margin_fit::DiagComponent> =
+            diag.components.iter().filter(|c| c.kept).collect();
+        if let (Some(l), Some(r), Some(t), Some(b)) = (
+            kept.iter()
+                .min_by(|a, b| a.rect.min.x.total_cmp(&b.rect.min.x)),
+            kept.iter()
+                .max_by(|a, b| a.rect.max.x.total_cmp(&b.rect.max.x)),
+            kept.iter()
+                .min_by(|a, b| a.rect.min.y.total_cmp(&b.rect.min.y)),
+            kept.iter()
+                .max_by(|a, b| a.rect.max.y.total_cmp(&b.rect.max.y)),
+        ) {
+            crate::logger::log(format!(
+                "[margin-fit diag] 端を決める KEEP 成分: 左 area={}@x{:.3} / 右 area={}@x{:.3} / 上 area={}@y{:.3} / 下 area={}@y{:.3}",
+                l.area,
+                l.rect.min.x,
+                r.area,
+                r.rect.max.x,
+                t.area,
+                t.rect.min.y,
+                b.area,
+                b.rect.max.y
+            ));
+        }
     }
 
     /// 静止画 / アニメーション / サムネイル / プレースホルダーだけを扱う。
