@@ -5680,6 +5680,41 @@ impl App {
                 if c.kept { "KEEP" } else { "drop" }
             ));
         }
+        // 実際にカットされる成分 = 最終 bbox の外へはみ出すもの。ページ番号が本当に切られて
+        // いるか・その面積はいくつかを確定する (= MIN_COMPONENT_AREA をいくつにすれば番号が
+        // bbox に含まれて切られなくなるか)。bbox=None (通常フィット) のときは何も切られない。
+        if let Some(bb) = diag.bbox {
+            let eps = 1e-4;
+            let mut cut: Vec<&crate::margin_fit::DiagComponent> = diag
+                .components
+                .iter()
+                .filter(|c| {
+                    c.rect.min.x < bb.min.x - eps
+                        || c.rect.max.x > bb.max.x + eps
+                        || c.rect.min.y < bb.min.y - eps
+                        || c.rect.max.y > bb.max.y + eps
+                })
+                .collect();
+            cut.sort_by(|a, b| b.area.cmp(&a.area));
+            crate::logger::log(format!(
+                "[margin-fit diag] カット対象 (bbox 外へはみ出す成分) {}件 上位15 (面積降順):",
+                cut.len()
+            ));
+            for (i, c) in cut.iter().take(15).enumerate() {
+                crate::logger::log(format!(
+                    "  C{:<2} area={:<5} center=({:.3},{:.3}) rect=[{:.3},{:.3} .. {:.3},{:.3}] {}",
+                    i + 1,
+                    c.area,
+                    (c.rect.min.x + c.rect.max.x) * 0.5,
+                    (c.rect.min.y + c.rect.max.y) * 0.5,
+                    c.rect.min.x,
+                    c.rect.min.y,
+                    c.rect.max.x,
+                    c.rect.max.y,
+                    if c.kept { "KEEP" } else { "drop" }
+                ));
+            }
+        }
     }
 
     /// 静止画 / アニメーション / サムネイル / プレースホルダーだけを扱う。
