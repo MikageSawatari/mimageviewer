@@ -2065,8 +2065,10 @@ impl App {
     }
 
     /// 「オノマトペを追加」プリセットピッカー。実フォントで焼いたサムネイルのグリッドから
-    /// クリックで標準テキストオブジェクトを追加する (ラボ準拠)。追加パック未導入時は
-    /// 注意書き + 入手ボタンを出すが、既定フォントで追加することもできる。
+    /// クリックで標準テキストオブジェクトを追加する (ラボ準拠)。オノマトペは各プリセットが
+    /// OFL フォントを指定する前提なので、追加パック未導入時は **追加自体をブロック** し
+    /// (システム既定フォントへのフォールバックはしない)、注意書き + 入手ボタンを出す。
+    /// 後からパックを導入して保存済みオノマトペの見た目が変わる事故を防ぐため (実機 FB)。
     fn draw_text_add_onomatopoeia_dialog(&mut self, ctx: &egui::Context) {
         if !self.text_add_onomatopoeia_dialog {
             return;
@@ -2135,7 +2137,7 @@ impl App {
                     );
                     ui.label(
                         egui::RichText::new(
-                            "未導入のため、追加するとシステム既定フォントで作成されます。",
+                            "未導入のため追加できません。下のボタンから追加パックを導入してください。",
                         )
                         .size(11.0)
                         .color(egui::Color32::from_gray(170)),
@@ -2156,19 +2158,23 @@ impl App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let cols = ((ui.available_width() / (ONOMATO_CELL_W + 10.0)).floor()
-                            as usize)
-                            .max(1);
-                        ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
-                        for chunk in cards.chunks(cols) {
-                            ui.horizontal_top(|ui| {
-                                for (preset, tex) in chunk {
-                                    if draw_onomatopoeia_card(ui, *preset, tex.as_ref()) {
-                                        chosen = Some(*preset);
+                        // パック未導入時はカードを無効化して追加をブロックする (見本は見える
+                        // が灰色 + 非クリック。OFL フォント前提なのでフォールバック追加しない)。
+                        ui.add_enabled_ui(pack_installed, |ui| {
+                            let cols = ((ui.available_width() / (ONOMATO_CELL_W + 10.0)).floor()
+                                as usize)
+                                .max(1);
+                            ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+                            for chunk in cards.chunks(cols) {
+                                ui.horizontal_top(|ui| {
+                                    for (preset, tex) in chunk {
+                                        if draw_onomatopoeia_card(ui, *preset, tex.as_ref()) {
+                                            chosen = Some(*preset);
+                                        }
                                     }
-                                }
-                            });
-                        }
+                                });
+                            }
+                        });
                     });
             });
 
@@ -2178,7 +2184,8 @@ impl App {
             self.editing_addon_declined_session = false;
             self.maybe_prompt_editing_addon();
         }
-        if let Some(preset) = chosen {
+        // パック未導入時は追加をブロック (カード無効化に加えた防御。OFL フォント前提)。
+        if let Some(preset) = chosen.filter(|_| pack_installed) {
             self.add_onomatopoeia_object(fs_idx, &key, preset, sw, sh);
             self.text_add_onomatopoeia_dialog = false;
         }
