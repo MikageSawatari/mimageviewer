@@ -1518,44 +1518,60 @@ impl App {
                         });
                         ui.separator();
 
-                        // ── 追加 ── (ボタンが多いので折り返しレイアウトにする)
-                        ui.label("追加:");
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button("テキスト").clicked() {
-                                let id = next_id(&objects);
-                                let z = objects.len() as i32;
-                                let tb = TextBlock {
-                                    text: "テキスト".to_string(),
-                                    size_px: (sh * 0.04).clamp(24.0, 96.0),
-                                    color: Rgba::BLACK,
-                                    outline: Some(StrokeStyle {
-                                        color: Rgba::WHITE,
-                                        width_px: 4.0,
-                                    }),
-                                    font_key: font_key.clone(),
-                                    ..TextBlock::default()
-                                };
-                                let mut o =
-                                    AnnotationObject::new_text(id, (sw * 0.3, sh * 0.3), tb);
-                                o.z = z;
-                                objects.push(o);
-                                selected = Some(id);
-                                changed = true;
-                            }
-                            if ui.button("吹き出し").clicked() {
-                                // 形状を選ぶダイアログを開く (ラボの「吹き出しを追加」相当)。
-                                open_bubble_dialog = true;
-                            }
-                            if ui.button("ウィンドウ").clicked() {
-                                open_window_dialog = true;
-                            }
-                            if ui.button("スタンプ").clicked() {
-                                open_stamp_dialog = true;
-                            }
-                            if ui.button("オノマトペ").clicked() {
-                                open_onomatopoeia_dialog = true;
-                            }
-                        });
+                        // ── 追加 ── (ラボと同じく 1 行 1 ボタンの全幅レイアウト・同じ並び)。
+                        let add_w = PANEL_W - 16.0;
+                        if ui
+                            .add_sized([add_w, 26.0], egui::Button::new("吹き出し追加"))
+                            .clicked()
+                        {
+                            // 形状を選ぶダイアログを開く (ラボの「吹き出しを追加」相当)。
+                            open_bubble_dialog = true;
+                        }
+                        ui.add_space(2.0);
+                        if ui
+                            .add_sized([add_w, 26.0], egui::Button::new("ウィンドウ追加"))
+                            .clicked()
+                        {
+                            open_window_dialog = true;
+                        }
+                        ui.add_space(2.0);
+                        if ui
+                            .add_sized([add_w, 26.0], egui::Button::new("テキスト追加"))
+                            .clicked()
+                        {
+                            let id = next_id(&objects);
+                            let z = objects.len() as i32;
+                            let tb = TextBlock {
+                                text: "テキスト".to_string(),
+                                size_px: (sh * 0.04).clamp(24.0, 96.0),
+                                color: Rgba::BLACK,
+                                outline: Some(StrokeStyle {
+                                    color: Rgba::WHITE,
+                                    width_px: 4.0,
+                                }),
+                                font_key: font_key.clone(),
+                                ..TextBlock::default()
+                            };
+                            let mut o = AnnotationObject::new_text(id, (sw * 0.3, sh * 0.3), tb);
+                            o.z = z;
+                            objects.push(o);
+                            selected = Some(id);
+                            changed = true;
+                        }
+                        ui.add_space(2.0);
+                        if ui
+                            .add_sized([add_w, 26.0], egui::Button::new("オノマトペ追加"))
+                            .clicked()
+                        {
+                            open_onomatopoeia_dialog = true;
+                        }
+                        ui.add_space(2.0);
+                        if ui
+                            .add_sized([add_w, 26.0], egui::Button::new("スタンプ追加"))
+                            .clicked()
+                        {
+                            open_stamp_dialog = true;
+                        }
                         ui.separator();
 
                         // 一覧 (ScrollArea) と操作行 (固定) を分離。操作行ぶんの高さを
@@ -1900,7 +1916,7 @@ impl App {
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        egui::Window::new("ウィンドウを追加")
+        egui::Window::new("メッセージウィンドウを追加")
             .id(egui::Id::new("text_add_window_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
@@ -2396,7 +2412,7 @@ impl App {
                 1.0,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        egui::Window::new("フォントを選択")
+        egui::Window::new("フォントを見本から選択")
             .id(egui::Id::new("text_font_dialog"))
             .order(egui::Order::Foreground)
             .frame(frame)
@@ -4368,6 +4384,28 @@ fn draw_onomatopoeia_card(
 /// オブジェクト一覧の行部分 (選択ハイライト + 表示トグル)。補正レイヤーパネルと同じ見た目。
 /// 共通操作行 (↑ ↓ 複製 削除) は `object_list_actions_ui` に分離し、ScrollArea の外へ
 /// 固定表示する (一覧だけがスクロールし、操作ボタンは常に見える)。
+/// 一覧カード用の 1 行ラベル先頭の本文抜粋 (最初の行を 12 文字で省略、ラボ `short` 相当)。
+fn short_excerpt(s: &str) -> String {
+    let line = s.lines().next().unwrap_or("");
+    if line.chars().count() > 12 {
+        let t: String = line.chars().take(12).collect();
+        format!("{t}…")
+    } else {
+        line.to_string()
+    }
+}
+
+/// オブジェクト一覧カードのラベル「種類: 本文抜粋」(ラボ `draw_object_list` 相当)。
+fn object_list_label(o: &AnnotationObject) -> String {
+    let detail = match &o.kind {
+        AnnotationKind::Bubble(b) => short_excerpt(&b.text.text),
+        AnnotationKind::Text(t) => short_excerpt(&t.text),
+        AnnotationKind::MessageWindow(w) => short_excerpt(&w.text.text),
+        AnnotationKind::Stamp(s) => crate::comic_stamp::stamp_label(&s.source).to_string(),
+    };
+    format!("{}: {}", kind_label(o), detail)
+}
+
 fn object_list_rows_ui(
     ui: &mut egui::Ui,
     objects: &mut Vec<AnnotationObject>,
@@ -4396,7 +4434,7 @@ fn object_list_rows_ui(
         let o = &objects[i];
         let id = o.id;
         let is_sel = *selected == Some(id);
-        let label = format!("{}: {}", i + 1, kind_label(o));
+        let label = object_list_label(o);
         let text_color = if o.enabled {
             egui::Color32::WHITE
         } else {
@@ -4434,6 +4472,7 @@ fn object_list_rows_ui(
                     if ui
                         .add(
                             egui::Label::new(egui::RichText::new(label).color(text_color))
+                                .truncate()
                                 .sense(egui::Sense::click()),
                         )
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
