@@ -1574,29 +1574,27 @@ impl App {
                         }
                         ui.separator();
 
-                        // 一覧 (ScrollArea) と操作行 (固定) を分離。操作行ぶんの高さを
-                        // 先に確保し、残りを一覧スクロールに割り当てる。これで一覧を
-                        // 多数追加してスクロールしても ↑↓複製削除 が常に見える。
-                        let actions_h = 34.0_f32;
-                        let list_h = (body_height - actions_h).max(80.0);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(PANEL_W, list_h),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                egui::ScrollArea::vertical()
-                                    .id_salt("text_panel_scroll")
-                                    .max_height(list_h)
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        object_list_rows_ui(
-                                            ui,
-                                            &mut objects,
-                                            &mut selected,
-                                            &mut changed,
-                                        );
-                                    });
-                            },
-                        );
+                        // 一覧 (ScrollArea) の直下に操作行 (↑↓複製削除) を置く。一覧は内容に
+                        // 合わせて縦に縮み (auto_shrink 縦)、左パネルからあふれるときだけ
+                        // スクロールする (ラボ準拠 / 実機 FB 2026-06-06)。
+                        // スクロール上限は「現在のカーソル位置 → sink_rect 下端 − 操作行ぶん」
+                        // で算出する。これにより操作行は必ず sink_rect (= パネル矩形) 内に
+                        // 収まる。sink_rect の外に出ると handle_text_canvas_input が操作行の
+                        // クリックを「パネル外＝キャンバス操作」と誤判定し、選択が解除されて
+                        // 削除/複製/前後移動が無効化される (実機 FB)。追加ボタンを全幅縦に
+                        // した分パネルが縦に伸び、旧 body_height ベースの固定高では操作行が
+                        // 矩形外へはみ出していた。
+                        const ACTIONS_RESERVE: f32 = 40.0;
+                        let list_top = ui.cursor().top();
+                        let list_max =
+                            (sink_rect.bottom() - list_top - ACTIONS_RESERVE).clamp(80.0, 2000.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("text_panel_scroll")
+                            .max_height(list_max)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                object_list_rows_ui(ui, &mut objects, &mut selected, &mut changed);
+                            });
                         ui.separator();
                         object_list_actions_ui(ui, &mut objects, &mut selected, &mut changed);
                     });
@@ -5955,7 +5953,7 @@ fn resolve_window_placement(
 /// 変更後は呼び出し側 (`draw_text_panel`) が `resolve_window_placement` で pivot を再解決する。
 fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut bool) {
     // 位置プリセット。
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("位置");
         for (lbl, p) in [
             ("上", WindowPosition::Top),
@@ -5971,7 +5969,7 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
         }
     });
     // サイズモード。
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("サイズ");
         for (lbl, m) in [
             ("全幅", SizeMode::FullWidth),
@@ -6016,7 +6014,7 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
     // 背景 (塗り)。
     ui.add_space(2.0);
     ui.label(egui::RichText::new("背景").strong());
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("種類");
         for (lbl, m) in [
             ("なし", FillMode::None),
@@ -6049,7 +6047,7 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
             .add(egui::Slider::new(&mut w.fill_opacity, 0.0..=1.0).text("不透明度"))
             .changed();
         if w.fill_mode == FillMode::GradientScrim {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("濃い側");
                 for (lbl, a) in [
                     ("上", VAnchor::Top),
@@ -6083,7 +6081,7 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
     // 枠 (フレーム)。
     ui.add_space(2.0);
     ui.label(egui::RichText::new("枠").strong());
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("種類");
         for (lbl, f) in [
             ("なし", FrameStyle::None),
@@ -6296,7 +6294,7 @@ fn window_parts_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut
     // ── 続き指標 ──
     ui.add_space(2.0);
     ui.label(egui::RichText::new("続き指標").strong());
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for (lbl, k) in [
             ("なし", IndicatorKind::None),
             ("三角", IndicatorKind::Triangle),
@@ -6375,7 +6373,7 @@ fn bubble_deco_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
                 }
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("配置");
             for (label, pl) in [
                 ("輪郭上", DecoPlacement::Outline),

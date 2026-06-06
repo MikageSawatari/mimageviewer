@@ -26769,7 +26769,14 @@ impl eframe::App for App {
         // TRT pack オンラインインストールダイアログ (環境設定から起動)。
         self.show_trt_install_dialog(ctx);
         // 編集用追加パック (フォント + 被写体分離モデル) のオンライン取得ダイアログ。
-        self.show_editing_addon_dialog(ctx);
+        // ⚠️ フルスクリーン中はフルスクリーンビューポート側 (ui_fullscreen.rs) で描画する
+        //    (VST3 マネージャと同様。両ビューポートで描くと egui::Window の位置が二重管理に
+        //    なる)。テキスト/補正の編集導線はフルスクリーンから起動されるので、ここで
+        //    描くと背後 (メインビューポート) に隠れて「DL ボタンを押しても何も起きない」
+        //    状態になる (実機 FB 2026-06-06)。
+        if self.fullscreen_idx.is_none() {
+            self.show_editing_addon_dialog(ctx);
+        }
         self.show_stats_dialog_window(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);

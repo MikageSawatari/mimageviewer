@@ -2760,6 +2760,13 @@ impl App {
                     fs_vst_manager_ms = vst_t0.elapsed().as_secs_f64() * 1000.0;
                 }
 
+                // 編集用追加パック取得ダイアログ (フルスクリーン中も表示)。テキスト注釈 /
+                // 補正の編集導線 (オノマトペ追加・被写体マスク) からフルスクリーン中に
+                // 起動されるので、ここで描かないと背後 (メインビューポート) に隠れて
+                // 「DL ボタンを押しても何も起きない」状態になる (実機 FB 2026-06-06)。
+                // メイン update 側は fullscreen 中スキップするので二重描画にはならない。
+                self.show_editing_addon_dialog(ctx);
+
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
                 fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;
             };
