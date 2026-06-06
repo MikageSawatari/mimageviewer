@@ -2729,12 +2729,19 @@ impl App {
     fn reapply_preset_to_linked(&self, objects: &mut [AnnotationObject], id: &str) {
         for o in objects.iter_mut() {
             let pivot = o.pivot;
-            match &mut o.kind {
-                AnnotationKind::Text(t) if t.preset_link.as_deref() == Some(id) => {
+            // テキストプリセットは全種の本文 TextBlock (Text / Bubble.text / Window.text) に
+            // 反映する。常時表示セリフバーで吹き出し/窓にもテキストプリセットを当てられる
+            // ようになったため、standalone Text だけ見ると取りこぼす (Codex P2)。
+            if let Some(tb) = o.text_block_mut() {
+                if tb.preset_link.as_deref() == Some(id) {
                     if let Some(p) = self.comic_text_presets.iter().find(|p| p.id == id) {
-                        p.apply_to(t);
+                        p.apply_to(tb);
                     }
                 }
+            }
+            // 本体 / ウィンドウプリセットは形状 / 枠リンクへ (テキストとは独立。id 接頭辞が
+            // 違うので同一 id が両方に当たることはない)。
+            match &mut o.kind {
                 AnnotationKind::Bubble(b) if b.shape_preset_link.as_deref() == Some(id) => {
                     if let Some(p) = self.comic_shape_presets.iter().find(|p| p.id == id) {
                         p.apply_to(b, default_bubble_tail(pivot));
@@ -2768,10 +2775,14 @@ impl App {
             return false;
         }
         for o in objects.iter_mut() {
-            match &mut o.kind {
-                AnnotationKind::Text(t) if t.preset_link.as_deref() == Some(id) => {
-                    t.preset_link = None;
+            // テキストプリセットリンクは全種の本文 TextBlock で解除 (Bubble.text / Window.text
+            // も含む。常時表示セリフバーで当てられるため。Codex P2)。
+            if let Some(tb) = o.text_block_mut() {
+                if tb.preset_link.as_deref() == Some(id) {
+                    tb.preset_link = None;
                 }
+            }
+            match &mut o.kind {
                 AnnotationKind::Bubble(b) if b.shape_preset_link.as_deref() == Some(id) => {
                     b.shape_preset_link = None;
                 }
