@@ -89,13 +89,17 @@
   (fs アクセスなし)。フォルダ移動/別 PC/元削除でも欠落しない。MRU には積まない (肥大化回避)。
   既存 File も後方互換。未リリースなので移行不要。
 
-### 💬 C4. 注釈付きページのグリッドバッジ未接続 (要相談) [Codex P1]
-- comic_db::load_comic_keys は存在するが呼び出し無し。消しゴム mask_pages 相当の comic 版が未実装。
-- 対応 = 起動/フォルダロード時に comic キー集合をロード→グリッド描画でバッジ。小〜中規模。
+### ✅ C4. 注釈付きページのグリッドバッジ (`973b15dc`) [Codex P1]
+- comic_db::load_comic_keys を接続。comic_pages (item_idx 集合) を mask_pages と同形で
+  フォルダロード/rehydrate 時に構築、draw_cell に has_comic を渡してピンク系「文」バッジ描画。
+  save_comic_objects で idx 単位に即時メンテ、remove_items_batch shift / clear_page_edit_state も対応。
 
-### 💬 C5. 強縮小書き出しでテキストが甘い (要相談) [Codex P1 / 設計 D10]
-- 設計 D10 は「ダウンサンプル後に最終解像度で焼く」、実装は「ダウンサンプル前で焼く」。
-- 対応 = export ベイク経路の再構成。中規模。画質改善。
+### 💬 C5. 強縮小書き出しでテキストが甘い (規模・要判断) [Codex P1 / 設計 D10]
+- 設計 D10 は「ダウンサンプル後に最終解像度で焼く」、実装は「ダウンサンプル前 (base 解像度) で
+  焼く」(app.rs の comic_composited_pixels_for_export + worker scale_export_pixels)。
+- 対応 = comic を base に焼かず、worker で crop→縮小**後**に最終解像度で焼くよう書き出し経路を
+  再構成。**crop/scale/comic 座標の整合**が絡む中〜大の変更 (D10 コメントも「将来課題」と明記)。
+  座標バグのリスクがあるため、実機検証後にフレッシュな文脈で着手するのが安全。
 
 ### ✅ B8. フォントのフォールバック (`f03f5f6e`) [Codex P2]
 - ユーザー判断: 吹き出し/メッセージウィンドウの規定は Yu Gothic のまま (Windows 常在で安定、
@@ -109,6 +113,10 @@
   いた退行 (Pipeline P1 リファクタで旧 AI ゲート喪失)。CPU 専用 ensure_edit_result_pixels_cpu を
   追加、EditResultEntry.texture を Option 化、表示時に lazy upload。AI オン/オフ両方で先読み中の
   GPU 負担が消える。近隣 AI 推論はワーカーで先読み継続。
+- Codex レビュー: **P1 なし** (lazy upload・表示経路・borrow・Option 処理すべて正しい)。
+- 残 P2: 編集済み (conceal/局所補正/消しゴム) 近隣ページは prefetch 中まだ各自の layer テクスチャを
+  upload する (layer cache 由来の既存挙動)。edit_result の universal upload は解消済み。完全 CPU 化
+  には conceal/erase/local の CPU 専用版分離が要る (別途・中規模)。
 
 ### 💬 残: AI Display 優先が実行中 prefetch を preempt しない [他セッションP1/P2]
 - queue は Display 優先だが、worker は 1 件を完了まで実行し、別 idx の prefetch を cancel しない。
