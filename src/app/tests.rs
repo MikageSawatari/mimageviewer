@@ -6587,6 +6587,97 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
+    fn pano_source_switches_to_completed_final_composite() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pano-final.jpg");
+        app.fullscreen_idx = Some(idx);
+
+        let raw_color = egui::Color32::from_rgb(20, 30, 40);
+        let raw_pixels = Arc::new(egui::ColorImage::new([2, 1], vec![raw_color; 2]));
+        let raw_texture = ctx.load_texture(
+            "pano_final_raw",
+            (*raw_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: raw_texture,
+                pixels: Arc::clone(&raw_pixels),
+                source_dims: Some([2, 1]),
+                load_seq: 0,
+            },
+        );
+
+        let edit_key = dummy_edit_key(&app, idx);
+        let edit_texture = ctx.load_texture(
+            "pano_final_edit",
+            (*raw_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.edit_result_cache.insert(
+            edit_key,
+            EditResultEntry {
+                pixels: Arc::clone(&raw_pixels),
+                texture: edit_texture,
+            },
+        );
+
+        let params = app.effective_params(idx).clone();
+        let final_key = app.final_composite_key_for_pixels(edit_key, raw_pixels.size, &params);
+        let preview_texture = ctx.load_texture(
+            "pano_final_preview",
+            (*raw_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.final_composite_cache.insert(
+            final_key,
+            FinalCompositeEntry {
+                pixels: Arc::clone(&raw_pixels),
+                texture: preview_texture,
+                complete: false,
+            },
+        );
+
+        let fallback = app
+            .resolve_pano_source(&ctx, idx)
+            .expect("raw fallback should be available while final composite is incomplete");
+        assert_eq!(fallback.source_kind, crate::panorama::SOURCE_KIND_FS);
+        assert_eq!(fallback.pixels.size, [2, 1]);
+
+        let final_color = egui::Color32::from_rgb(200, 210, 220);
+        let final_pixels = Arc::new(egui::ColorImage::new([8, 4], vec![final_color; 32]));
+        let final_texture = ctx.load_texture(
+            "pano_final_complete",
+            (*final_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.final_composite_cache.insert(
+            final_key,
+            FinalCompositeEntry {
+                pixels: Arc::clone(&final_pixels),
+                texture: final_texture,
+                complete: true,
+            },
+        );
+
+        let completed = app
+            .resolve_pano_source(&ctx, idx)
+            .expect("completed final composite should be panorama-ready");
+        assert_eq!(
+            completed.source_kind,
+            crate::panorama::SOURCE_KIND_FINAL_COMPOSITE
+        );
+        assert_eq!(completed.pixels.size, [8, 4]);
+        assert_eq!(completed.pixels.pixels[0], final_color);
+        assert_ne!(
+            fallback.cache_key, completed.cache_key,
+            "AI/final completion must force the pano upload cache to refresh"
+        );
+    }
+
+    #[test]
     fn edit_generation_clears_only_the_changed_page_edit_and_final_caches() {
         let ctx = egui::Context::default();
         let mut app = setup_app();

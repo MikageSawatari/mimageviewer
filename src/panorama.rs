@@ -31,10 +31,12 @@ pub const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.001;
 /// - 1 = adjustment_cache (raw + 単純色調補正)
 /// - 2 = ai_upscale_cache (AI のみ)
 /// - 3 = adjustment_cache (AI + 補正)
+/// - 4 = final_composite_cache (通常表示と同じ最終パイプライン)
 pub const SOURCE_KIND_FS: u16 = 0;
 pub const SOURCE_KIND_ADJUST_RAW: u16 = 1;
 pub const SOURCE_KIND_AI: u16 = 2;
 pub const SOURCE_KIND_AI_ADJUST: u16 = 3;
+pub const SOURCE_KIND_FINAL_COMPOSITE: u16 = 4;
 
 /// 360 ビューのインタラクティブステート (フルスクリーン内のみ Some)。
 /// ファイル切替 / フルスクリーン退出で `panorama_state = None`。
@@ -766,7 +768,7 @@ pub fn render_settle_overlay(
 ///
 /// ```text
 /// [63..48]: idx_hash16   (CRC16 of source_key)
-/// [47..32]: source_kind  (0=fs_cache, 1=raw+adj, 2=ai, 3=ai+adj)
+/// [47..32]: source_kind  (0=fs_cache, 1=raw+adj, 2=ai, 3=ai+adj, 4=final)
 /// [31..16]: adjust_gen16 (App::adjustment_generation[source_key] の下位 16bit)
 /// [15..0] : ai_gen16     (App::ai_upscale_generation[source_key] の下位 16bit)
 /// ```

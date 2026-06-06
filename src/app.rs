@@ -20780,6 +20780,25 @@ impl App {
         })
     }
 
+    fn final_composite_key_for_pixels(
+        &self,
+        edit_key: EditResultKey,
+        size: [usize; 2],
+        params: &crate::adjustment::AdjustParams,
+    ) -> FinalCompositeKey {
+        FinalCompositeKey {
+            edit_key,
+            params_hash: hash_adjust_final_params(
+                params,
+                self.settings.ai_feature_mode,
+                self.post_filter_bypassed,
+            ),
+            bg: self
+                .final_ai_key_for_pixels(edit_key, size, params)
+                .map_or(0, |key| key.bg),
+        }
+    }
+
     fn effective_upscale_request(
         &self,
         params: &crate::adjustment::AdjustParams,
@@ -20989,17 +21008,7 @@ impl App {
     ) -> Option<egui::TextureHandle> {
         let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
         let params = self.effective_params(idx).clone();
-        let final_key = FinalCompositeKey {
-            edit_key,
-            params_hash: hash_adjust_final_params(
-                &params,
-                self.settings.ai_feature_mode,
-                self.post_filter_bypassed,
-            ),
-            bg: self
-                .final_ai_key_for_pixels(edit_key, edit_pixels.size, &params)
-                .map_or(0, |key| key.bg),
-        };
+        let final_key = self.final_composite_key_for_pixels(edit_key, edit_pixels.size, &params);
         let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, &params);
         let ai_ready = ai_key.and_then(|key| self.final_ai_cache.get(&key).cloned());
         if let Some(entry) = self.final_composite_cache.get(&final_key) {
@@ -21058,30 +21067,29 @@ impl App {
         Some(texture)
     }
 
+    pub(crate) fn ensure_final_composite_pixels_with_key(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<(FinalCompositeKey, Arc<egui::ColorImage>)> {
+        let texture = self.ensure_final_composite_texture(ctx, idx)?;
+        let _ = texture;
+        let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
+        let params = self.effective_params(idx).clone();
+        let final_key = self.final_composite_key_for_pixels(edit_key, edit_pixels.size, &params);
+        self.final_composite_cache
+            .get(&final_key)
+            .filter(|entry| entry.complete)
+            .map(|entry| (final_key, Arc::clone(&entry.pixels)))
+    }
+
     pub(crate) fn ensure_final_composite_pixels(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<Arc<egui::ColorImage>> {
-        let texture = self.ensure_final_composite_texture(ctx, idx)?;
-        let _ = texture;
-        let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
-        let params = self.effective_params(idx).clone();
-        let final_key = FinalCompositeKey {
-            edit_key,
-            params_hash: hash_adjust_final_params(
-                &params,
-                self.settings.ai_feature_mode,
-                self.post_filter_bypassed,
-            ),
-            bg: self
-                .final_ai_key_for_pixels(edit_key, edit_pixels.size, &params)
-                .map_or(0, |key| key.bg),
-        };
-        self.final_composite_cache
-            .get(&final_key)
-            .filter(|entry| entry.complete)
-            .map(|entry| Arc::clone(&entry.pixels))
+        self.ensure_final_composite_pixels_with_key(ctx, idx)
+            .map(|(_, pixels)| pixels)
     }
 
     pub(crate) fn current_final_composite_texture(
@@ -23043,7 +23051,7 @@ impl App {
             let Some(fs_idx) = self.fs_idx_of_source_key(&ready.source_key) else {
                 continue;
             };
-            let Some(resolution) = self.resolve_pano_source(fs_idx) else {
+            let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) else {
                 continue;
             };
             let state = self.pano_quality_state.get(&resolution.source_key).cloned();
@@ -23127,7 +23135,7 @@ impl App {
             self.clear_pano_refinement();
             return;
         }
-        let Some(resolution) = self.resolve_pano_source(fs_idx) else {
+        let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) else {
             return;
         };
         let Some(pano_state) = self.panorama_state.as_ref() else {
@@ -23665,15 +23673,16 @@ impl App {
 
     /// 360 ベーステクスチャのソース選択 + cache_key 計算を 1 関数に集約する (§4.3)。
     ///
-    /// 優先順位は `adjustment_cache → ai_upscale_cache → fs_cache`
-    /// (display-pipeline.md §2.3)。AI 由来判定は `ai_feature_active` flag を優先
-    /// (Codex P2 第 13: cache 残骸対策)。
+    /// 優先順位は `final_composite_cache → adjustment_cache → ai_upscale_cache → fs_cache`
+    /// (display-pipeline.md §2.3)。final pipeline が未完了の間だけ旧キャッシュ層へ
+    /// フォールバックし、AI 完了後は通常表示と同じ最終 composite を 360 ベースにする。
     ///
     /// Phase 1 ではこの戻り値の `pixels` を `color_image_to_rgba` で RGBA8 化し、
     /// `cache_key` を `pano_uploaded` の stale 判定 + callback に渡す。
     /// Phase 2a で `source_kind` を settle policy 判定にも使う。
     pub(crate) fn resolve_pano_source(
-        &self,
+        &mut self,
+        ctx: &egui::Context,
         fs_idx: usize,
     ) -> Option<crate::panorama::PanoSourceResolution> {
         use crate::panorama::*;
@@ -23684,6 +23693,8 @@ impl App {
         // (= settle を有効化できる、2026-05 ユーザー要望)。
         let ai_effective = self.ai_will_apply_to(fs_idx);
 
+        let final_source = self.ensure_final_composite_pixels_with_key(ctx, fs_idx);
+
         // ai_upscale_cache 参照は AI が実効的に動くときだけ (Codex P1 第 14 反映、
         // 2026-05 で機能 flag → 実効判定に強化)
         let ai_cache_entry = if ai_effective {
@@ -23692,35 +23703,46 @@ impl App {
             None
         };
 
-        let (pixels, source_kind) =
-            if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx) {
-                // adjustment_cache は AI 由来 / 通常由来の両方が入る (実コード line 15500)。
-                // ai_effective が true のときは AI 由来扱い (SOURCE_KIND_AI_ADJUST)、
-                // false のときは通常由来 (SOURCE_KIND_ADJUST_RAW)。
-                let kind = if ai_effective {
-                    SOURCE_KIND_AI_ADJUST
-                } else {
-                    SOURCE_KIND_ADJUST_RAW
-                };
-                (std::sync::Arc::clone(pixels), kind)
-            } else if let Some(FsCacheEntry::Static { pixels, .. }) = ai_cache_entry {
-                (std::sync::Arc::clone(pixels), SOURCE_KIND_AI)
-            } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&fs_idx) {
-                (std::sync::Arc::clone(pixels), SOURCE_KIND_FS)
+        let (pixels, source_kind, final_key_hash) = if let Some((final_key, pixels)) = final_source
+        {
+            let hash = runtime_hash_with(|h| {
+                use std::hash::Hash;
+                final_key.hash(h);
+            });
+            (pixels, SOURCE_KIND_FINAL_COMPOSITE, Some(hash))
+        } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx)
+        {
+            // adjustment_cache は AI 由来 / 通常由来の両方が入る (実コード line 15500)。
+            // ai_effective が true のときは AI 由来扱い (SOURCE_KIND_AI_ADJUST)、
+            // false のときは通常由来 (SOURCE_KIND_ADJUST_RAW)。
+            let kind = if ai_effective {
+                SOURCE_KIND_AI_ADJUST
             } else {
-                return None; // ColorImage がまだ無い (Animated / Failed / 未ロード)
+                SOURCE_KIND_ADJUST_RAW
             };
+            (std::sync::Arc::clone(pixels), kind, None)
+        } else if let Some(FsCacheEntry::Static { pixels, .. }) = ai_cache_entry {
+            (std::sync::Arc::clone(pixels), SOURCE_KIND_AI, None)
+        } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&fs_idx) {
+            (std::sync::Arc::clone(pixels), SOURCE_KIND_FS, None)
+        } else {
+            return None; // ColorImage がまだ無い (Animated / Failed / 未ロード)
+        };
 
-        let adjust_gen = self
+        let mut adjust_gen = self
             .adjustment_generation
             .get(&source_key)
             .copied()
             .unwrap_or(0) as u16;
-        let ai_gen = self
+        let mut ai_gen = self
             .ai_upscale_generation
             .get(&source_key)
             .copied()
             .unwrap_or(0) as u16;
+        if let Some(hash) = final_key_hash {
+            adjust_gen ^= hash as u16;
+            ai_gen ^= (hash >> 16) as u16;
+        }
         let cache_key =
             make_pano_cache_key(crc16_of_str(&source_key), source_kind, adjust_gen, ai_gen);
 
@@ -23754,7 +23776,8 @@ impl App {
     ) -> crate::panorama::PanoramaSettlePolicy {
         use crate::panorama::PanoramaSettlePolicy::*;
         use crate::panorama::{
-            SOURCE_KIND_ADJUST_RAW, SOURCE_KIND_AI, SOURCE_KIND_AI_ADJUST, SOURCE_KIND_FS,
+            SOURCE_KIND_ADJUST_RAW, SOURCE_KIND_AI, SOURCE_KIND_AI_ADJUST,
+            SOURCE_KIND_FINAL_COMPOSITE, SOURCE_KIND_FS,
         };
         // AI が「実際にこの画像に適用される」か判定。
         // 設定 ON でもサイズ閾値超でスキップされるケースは settle 許可する。
@@ -23788,6 +23811,15 @@ impl App {
                 if params.is_color_identity() {
                     // post_filter のみで adjustment_cache が出来た形跡 (上で除外済みのはず)
                     Disabled
+                } else {
+                    EnabledWithColorAdjustments {
+                        params: params.clone(),
+                    }
+                }
+            }
+            SOURCE_KIND_FINAL_COMPOSITE => {
+                if params.is_color_identity() {
+                    EnabledFromRaw
                 } else {
                     EnabledWithColorAdjustments {
                         params: params.clone(),
@@ -23940,6 +23972,7 @@ impl App {
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
         self.export_crop_spread_ctx = None;
+        self.fs_loupe_locked = false;
         self.local_adjust_canvas_drag = None;
         self.local_adjust_mask_brush_stroke = None;
         self.local_adjust_mask_lasso_points.clear();
@@ -24013,11 +24046,11 @@ impl App {
     /// 3. 一致 → 何もしない
     /// 4. `CallbackResources` への Arc clone 挿入は別経路 (`sync_pano_callback_resources`)
     #[cfg(windows)]
-    pub(crate) fn ensure_pano_upload(&mut self, fs_idx: usize) {
+    pub(crate) fn ensure_pano_upload(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let Some(render_state) = self.wgpu_render_state.clone() else {
             return;
         };
-        let Some(resolution) = self.resolve_pano_source(fs_idx) else {
+        let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) else {
             return;
         };
         // stale チェック (§4.2 + Codex P2 第 19 ラウンド):
@@ -24135,7 +24168,7 @@ impl App {
 
     /// 非 Windows ビルド (テスト等) ではアップロード経路を持たない。
     #[cfg(not(windows))]
-    pub(crate) fn ensure_pano_upload(&mut self, _fs_idx: usize) {}
+    pub(crate) fn ensure_pano_upload(&mut self, _ctx: &egui::Context, _fs_idx: usize) {}
 
     /// 非 Windows ビルド (テスト等) ではアップロード経路を持たない。
     #[cfg(not(windows))]

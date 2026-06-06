@@ -6312,7 +6312,7 @@ impl App {
     ) -> bool {
         // 1. アップロード経路を起動 (stale なら今フレで同期 upload)。
         //    実測で 40-110 ms かかり得るが、Phase 1 では UI スレッド許容 (§4.1.1)。
-        self.ensure_pano_upload(fs_idx);
+        self.ensure_pano_upload(ctx, fs_idx);
         // 2. 今フレの CallbackResources に Arc を載せる (毎フレ必須)。
         self.sync_pano_callback_resources();
 
@@ -6320,7 +6320,7 @@ impl App {
             return false;
         };
         let target_format = render_state.target_format;
-        let Some(resolution) = self.resolve_pano_source(fs_idx) else {
+        let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) else {
             return false;
         };
         let uploaded_ready = self
@@ -6906,7 +6906,7 @@ impl App {
                 self.pano_session_approved_max_pixels =
                     self.pano_session_approved_max_pixels.max(source_pixels);
             }
-            if let Some(resolution) = self.resolve_pano_source(fs_idx) {
+            if let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) {
                 self.start_pano_high_res_load(fs_idx, resolution.cache_key);
             }
             ctx.request_repaint();
@@ -7297,6 +7297,9 @@ impl App {
         thumb_tex: Option<&egui::TextureHandle>,
         spread_double: bool,
     ) {
+        if self.is_panorama_mode_active(fs_idx) {
+            return;
+        }
         if self.analysis_mode || self.adjustment_mode {
             return;
         }

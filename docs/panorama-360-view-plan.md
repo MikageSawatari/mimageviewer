@@ -426,8 +426,8 @@ mIV 再起動で 0 にリセット。将来 Phase 3 で「常に高品質」を�
 
 #### 3.6.2.1 settle overlay の適用範囲 (Codex P1 第 10 ラウンド反映、絞り込み確定)
 
-**問題**: 8K base は `adjustment_cache → ai_upscale_cache → fs_cache` の優先順位で
-選んだ**補正/AI 適用済みテクスチャ**からアップロードする (§4.3)。一方
+**問題**: 8K base は `final_composite_cache → adjustment_cache → ai_upscale_cache →
+fs_cache` の優先順位で選んだ**補正/AI 適用済みテクスチャ**からアップロードする (§4.3)。一方
 `pano_high_res_source` は **未補正の元 RGBA** をデコード時に作って保持する。
 何も対策しないと、ドラッグ中の 8K base と静止後の settle overlay で色が一致しない。
 
@@ -910,8 +910,9 @@ status indicator の `[8K 軽量に切替]` で BaseOnly に戻したケース)�
    一瞬発生する。**これは mIV 既存のフルスクリーン表示の挙動と同じで、360 機能で
    新規発生するものではない** (本機能のスコープ外)
 3. UI の 360 ボタンは押せる (= 360 モード自体は ON、8K base で描画)
-4. **360 ベーステクスチャは `fs_cache[idx].pixels` から `color_image_to_rgba` で
-   RGBA8 に変換し、raw `wgpu::Texture` を新規作成してアップロード**する
+4. **360 ベーステクスチャは `resolve_pano_source` が選んだ final composite / fallback
+   pixels から `color_image_to_rgba` で RGBA8 に変換し、raw `wgpu::Texture` を
+   新規作成してアップロード**する
    (`compare_wgpu.rs` 同じ経路、§4.3 参照)。
    ⚠️ **egui の `TextureHandle` 内部の wgpu リソースを流用しようとしない** —
    egui-wgpu renderer の texture map は内部実装で、直接アクセスする公開 API は無く、
@@ -1184,7 +1185,8 @@ worker 化の経路はオプションで Phase 1 に含める (テスト時に�
 ```rust
 // 64-bit packed:
 //   [63..48]: idx_hash16   (path-derived metadata key の crc16)
-//   [47..32]: source_kind  (0=fs_cache, 1=raw+adjustment, 2=ai_only, 3=ai+adjustment)
+//   [47..32]: source_kind  (0=fs_cache, 1=raw+adjustment, 2=ai_only, 3=ai+adjustment,
+//                            4=final_composite)
 //                            ※ Codex P2 第 14 反映で §4.6.1 と統一。high-res RGBA は
 //                            base texture には入れず settle 専用ストア
 //                            (`pano_high_res_source`) で別管理
@@ -1286,8 +1288,9 @@ if let Some(pano) = self.panorama_state.as_ref()
 このブロックは `§2.3 表示テクスチャの優先順位` (`docs/display-pipeline.md`) の
 **通常パスとは独立した第 0 層**として動かす。回転 / pan / zoom / spread はバイパス
 する (360 ビュー自身が yaw/pitch/fov を持つため)。**補正 (adjustment) と AI は適用後の
-RGBA を入力として受ける**ので、`adjustment_cache[idx]` → `ai_upscale_cache[idx]` →
-`fs_cache[idx]` の優先順位で選んだ ColorImage を `color_image_to_rgba` 変換して
+RGBA を入力として受ける**ので、完了済み `final_composite_cache` を最優先にし、
+未完了時だけ `adjustment_cache[idx]` → `ai_upscale_cache[idx]` → `fs_cache[idx]`
+の fallback で選んだ ColorImage を `color_image_to_rgba` 変換して
 アップロードに回せば、補正 / AI の効果が自動的に 360 ビューにも反映される (§4.3)。
 
 ### 4.3 ピクセル取得経路 (通常解像度: ≤ 8192)
@@ -1311,7 +1314,8 @@ let rgba: Arc<Vec<u8>> = Arc::new(crate::capture::color_image_to_rgba(&color_ima
 
 **ソース解決とキャッシュキーを 1 関数に集約** (Codex P2 第 9 + P1 第 10 ラウンド反映):
 
-ソース選択 (`adjustment → ai_upscale → fs_cache`) と `cache_key` 計算と settle policy を
+ソース選択 (`final_composite → adjustment → ai_upscale → fs_cache`) と `cache_key`
+計算と settle policy を
 **別々に管理するとズレた時に stale guard が機能しない**。**全部 1 関数で決める**。
 
 実コード型 (`src/app.rs` 2625 / 2663 行) に合わせた擬似コード:
@@ -1321,7 +1325,7 @@ pub struct PanoSourceResolution {
     pub source_key: String,                  // metadata_cache_key(idx)
     pub cache_key:  u64,                      // §4.1.2 packed key
     pub pixels:     Arc<egui::ColorImage>,    // 選択されたソースの pixels (8K base 用)
-    pub source_kind: u16,                     // 0=fs_cache / 1=raw+adj / 2=ai / 3=ai+adj
+    pub source_kind: u16,                     // 0=fs_cache / 1=raw+adj / 2=ai / 3=ai+adj / 4=final
     pub settle_policy: PanoramaSettlePolicy,  // §3.6.2.1 で判定
 }
 
@@ -1330,12 +1334,13 @@ impl App {
     /// このメソッドの返り値だけを使ってアップロード / cache_key / settle render を
     /// 構築すれば、§4.2 の ready 判定 / §4.1 callback stale guard / settle 整合が
     /// 全部一貫する。
-    pub(crate) fn resolve_pano_source(&self, fs_idx: usize) -> Option<PanoSourceResolution> {
+    pub(crate) fn resolve_pano_source(&mut self, ctx: &egui::Context, fs_idx: usize) -> Option<PanoSourceResolution> {
         let source_key = self.metadata_cache_key(fs_idx)?;
         let bg = self.effective_upscale_bg_mode();
 
-        // 8K base のソース選択: adjustment_cache → ai_upscale_cache → fs_cache
-        // (display-pipeline.md §2.3 の優先順位、本文と整合)
+        // 8K base のソース選択: final_composite_cache → adjustment_cache →
+        // ai_upscale_cache → fs_cache (display-pipeline.md §2.3 の優先順位と整合)
+        // final_composite が未完了 (final AI 待ち) の間だけ旧キャッシュ層へ fallback。
         // 実コード型: 全部 FsCacheEntry::Static の `pixels: Arc<ColorImage>` を取り出す
         // AI 由来判定は機能 ON flag を優先 (Codex P2 第 13 反映、cache 残骸対策)
         let ai_feature_active = self.ai_upscale_enabled || self.ai_denoise_model.is_some();
@@ -1346,7 +1351,11 @@ impl App {
         } else {
             None
         };
-        let (pixels, source_kind) = if let Some(FsCacheEntry::Static { pixels, .. })
+        let (pixels, source_kind) = if let Some((_final_key, pixels))
+            = self.ensure_final_composite_pixels_with_key(ctx, fs_idx)
+        {
+            (pixels, 4 /* final_composite */)
+        } else if let Some(FsCacheEntry::Static { pixels, .. })
             = self.adjustment_cache.get(&fs_idx)
         {
             // adjustment_cache は AI 由来 / 通常由来の両方が入る (実コード line 15458)
@@ -1395,8 +1404,10 @@ impl App {
 3. **`adjustment_cache` は AI 由来の可能性あり** (実コード line 15458)。`ai_upscale_cache`
    に該当エントリがあるかで `source_kind=1` (raw+adj) と `source_kind=3` (ai+adj) を
    区別
-4. **優先順位は `adjustment_cache → ai_upscale_cache → fs_cache`** (本文 / display-pipeline
-   §2.3 と整合、旧擬似コードは順序が逆だった)
+4. **優先順位は `final_composite_cache → adjustment_cache → ai_upscale_cache → fs_cache`**。
+   通常表示と同じ final pipeline を最優先にし、AI 完了待ちの間だけ旧キャッシュ層へ
+   fallback する。final key の hash も `cache_key` に混ぜ、AI 完了や post-filter
+   bypass の切替で stale upload を避ける
 
 **呼び出し側はこの関数だけを参照する**:
 
@@ -1413,7 +1424,9 @@ impl App {
 ### 4.4 高解像度キャッシュ (Phase 1 では不使用、案 A 確定で削除)
 
 **案 A (8K base) 確定により、Phase 1 では専用の高解像度キャッシュ層を作らない**。
-360 ベーステクスチャは `fs_cache[idx]` (= 既存の 8K clamp 後 ColorImage) を流用する。
+360 ベーステクスチャは完了済み `final_composite_cache` (= 既存の 8K clamp 後
+ColorImage、AI/補正/post-filter 適用後) を優先して流用する。final AI 未完了時は
+旧 `adjustment_cache` / `ai_upscale_cache` / `fs_cache` に一時 fallback する。
 `pano_source_pixels` / `clamp_panorama_for_gpu` / `max_pano_dim` は実装不要。
 
 ベーステクスチャアップロードの経路:
@@ -1984,9 +1997,10 @@ Ctrl+Wheel = 画像ズーム という運用が確立しているため、これ
 
 ### 6.4 補正 / AI との関係
 
-- 補正パネル (左オーバーレイ) / AI トグルはそのまま使える。360 ビュー側は
-  `display-pipeline.md §2.3` の優先順位で選ばれたテクスチャ (`adjustment_cache` →
-  `ai_upscale_cache` → `fs_cache`) をそのまま入力にする。
+- 360 中は補正パネルなどの編集 UI は閉じるが、設定済みの補正 / AI は表示に反映する。
+  360 ビュー側は `display-pipeline.md §2.3` と同じ final pipeline を優先し、完了済み
+  `final_composite_cache` を入力にする。final AI が未完了の間だけ `adjustment_cache` →
+  `ai_upscale_cache` → `fs_cache` に fallback する。
 - 消しゴム (erase) / 分析モードは 360 アクティブ中は使用不可 (相互排他)。
 
 ---
@@ -2002,13 +2016,14 @@ Ctrl+Wheel = 画像ズーム という運用が確立しているため、これ
 | spread (見開き) | 無効 (forced single) | 2 枚を並べる意味がない |
 | zoom (Ctrl+ホイール) | **FOV 操作にモード依存で切替** | "拡大方向の操作" という直感を保つ |
 | pan (左ドラッグ) | yaw/pitch ドラッグに転用 | panorama 自身が pan の意味を持つ |
-| 前後送り (通常 Wheel) | **既存どおり前後アイテム送り** (Codex P2) | 奪わない |
+| ルーペ (M / Shift) | 360 中は無効 | 球面投影中は平面画像の cursor→UV 変換と一致しないため |
+| 前後送り (通常 Wheel) | 360 中は無効。Wheel は修飾キー不問で FOV 操作に転用 | 意図せず別画像へ移動する事故を防ぐ |
 | 矢印キー | **既存どおりフルスクリーンナビ / 動画 seek** | 奪わない |
 | <kbd>Esc</kbd> | **既存どおりフルスクリーン全体を閉じる** | 360 解除はトグルボタン |
 | compare (X→C/Shift+C/Alt+C) | 360 中は無効 | パイプライン分岐の単純化 |
 | erase / analysis | 360 中は無効 | 同上 |
-| AI upscale / denoise | 適用される (入力テクスチャ経由、source_kind=2) | サンプル品質向上 |
-| プリセット補正 | 適用される (入力テクスチャ経由、source_kind=1) | 色補正は当然 |
+| AI upscale / denoise | 適用される (final composite 経由、source_kind=4) | 通常表示と 360 表示の画質を一致させる |
+| プリセット補正 | 適用される (final composite 経由、source_kind=4) | 通常表示と 360 表示の画質を一致させる |
 | ポストフィルタ | 適用される | CRT/減色も equirect の上で OK |
 | スライドショー | 360 中も次画像へ進む | equirect が続けば yaw/pitch 引き継ぎ |
 | アニメーション (GIF/APNG) | **将来検討**。当面は静的フレームのみ (`FsCacheEntry::Animated` は 360 対象外) | GIF 360 はレアケース |
@@ -2064,7 +2079,7 @@ mipmap / ミニコンパス / 慣性ドラッグ。
 - [ ] `src/panorama_wgpu.rs` (compare_wgpu.rs をテンプレートに WGSL を §3.3 のものに差替え、
       §4.1 のキャッシュキー設計 + `Arc::ptr_eq` 保険、Codex P1 反映)
 - [ ] **callback は `UploadedPanoTexture` 参照、テクスチャ実体を持たない** (§4.1)
-- [ ] アップロード経路: `fs_cache[idx].pixels` を `color_image_to_rgba` 変換 →
+- [ ] アップロード経路: `resolve_pano_source` が選んだ final composite / fallback pixels を `color_image_to_rgba` 変換 →
       raw wgpu テクスチャ生成 → `pano_uploaded` に格納 (§4.3 / §4.1.1)
 - [ ] `ui_fullscreen.rs` で 360 モード分岐 (描画 + 入力)
 - [ ] **左ドラッグで yaw/pitch、Ctrl+Wheel で FOV、Wheel 単独 / 矢印 / Esc は奪わない**
@@ -2435,7 +2450,8 @@ Phase 2a 完成後の包括的レビューで 15 件の指摘 (P0-P3) を網羅�
     - [ ] AI ON + 大画像 + state=SettleApproved + cache_key 不一致 →
           `settle_will_use_it=false` で 26K 再デコードが走らないこと
   - [ ] **AI 機能 flag による cache gate** (Codex P1 第 14 反映):
-    - [ ] AI ON で ai_upscale_cache に entry あり → 360 が AI 結果を使う (source_kind=2)
+    - [ ] final composite 完了済み → 360 が通常表示と同じ最終画像を使う (source_kind=4)
+    - [ ] final composite 未完了かつ AI ON で ai_upscale_cache に entry あり → fallback として AI 結果を使う (source_kind=2)
     - [ ] AI OFF で ai_upscale_cache に残骸あり → 360 は ai cache を**無視**して
           fs_cache or adjustment_cache を選ぶ (source_kind 0 or 1)
   - [ ] **high-res 完了時の state guard** (Codex P1 第 14 反映):
@@ -2684,8 +2700,8 @@ PCIe 転送がそのままブロッキングする。
 - 削除: `pano_source_pixels` / `max_pano_dim` / `clamp_panorama_for_gpu` /
   `WgpuConfiguration` の limit 引き上げ
 - 維持: 360 検出 / equirect WGSL シェーダ / 入力ハンドリング / UI トグル / GPano XMP
-- 360 ベーステクスチャは `fs_cache[idx].pixels` を `color_image_to_rgba` 変換した上で
-  毎回新規アップロード (LRU 1)
+- 360 ベーステクスチャは `resolve_pano_source` が選んだ final composite / fallback
+  pixels を `color_image_to_rgba` 変換した上で毎回新規アップロード (LRU 1)
 - Phase 2a 以降: 「settle が無いと >8K source は荒い」現象を許容するか、settle 不可な
   Off tier でも別経路 (例: 平面ズーム的なフォールバック) を出すか、別途検討
 

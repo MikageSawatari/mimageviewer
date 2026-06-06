@@ -364,6 +364,10 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 実装上は `ui_fullscreen.rs::resolve_fs_processed_texture` を通常表示の共通入口にする。
 単ページ、見開き、ルーペなどが `edit_result_cache → fs_cache` のような独自チェーンを
 再実装すると、新しい派生レイヤ (消しゴム / 隠蔽加工 / AI など) の横展開漏れが起きる。
+360 度パノラマ表示も同じ考え方で、完了済みの `final_composite_cache` を 8K base
+アップロード元として優先する。final AI が未完了の間だけ旧 `adjustment_cache` /
+`ai_upscale_cache` / `fs_cache` へフォールバックし、AI 完了後は cache_key を変えて
+再アップロードする。
 保存・比較・クリップボードのようなピクセル出力経路も、`prepare_capture_pixel_job` で
 同じ最終 composite pixels を取得する。補正レイヤーが有効だが `local_adjust_cache` がまだ
 無い場合、古い結果や下位画像は保存せず、完了後の再実行を促す。
