@@ -194,10 +194,16 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   反映された後に最短約 100ms 間隔で次の frame-step seek を発行する。
 - Windows のタスクバーで mIV アイコンを hover したときは、動画フルスクリーン中も
   現在位置近傍のフレームをアプリのプレビューサムネイルとして表示する。
-- 保存済み再生位置がある動画は通常、前回位置からレジューム再生する。環境設定
-  `video_grid_open_starts_from_beginning` が ON の場合、サムネイル一覧から開いた動画だけは
-  保存済み位置を無視して先頭から再生する。ホイール / ↑↓ などフルスクリーン中の
-  動画切り替えでは、誤移動から戻れるよう従来どおり保存済み位置を使う。
+- 保存済み再生位置がある動画は通常、前回位置からレジューム再生する。挙動は
+  **位置復元マトリクス**(環境設定「位置の復元」)で「メディア (動画 / ZIP・PDF) ×
+  エントリ方法 (一覧から開く / Ctrl+↑↓ 移動)」のセル単位に [続きから / 最初から] を選べる:
+  - 動画 × 一覧から開く: `video_open_resume`(= 互換維持のため旧 bool
+    `video_grid_open_starts_from_beginning` を保存先に流用、accessor 経由)。
+  - 動画 × Ctrl+↑↓ 移動: `video_nav_resume`(既定 = 続きから)。
+  - ZIP/PDF × 一覧から開く: `book_open_resume`(既定 = 続きから)。
+  - ZIP/PDF × Ctrl+↑↓ 移動: `book_nav_resume`(既定 = 先頭から = 従来のフォルダ先頭着地)。
+  video の判定は `video_resume_for_open`、本の判定は `DeferredFsReopen.resume_to_last_page`
+  (grid 経路は book_open_resume / nav 経路は book_nav_resume) で行う。
 - 動画フルスクリーン中にホイール / ↑↓ / Home / End などで別の動画へ移動する場合、
   native presenter の HWND / D3D11 presenter / overlay を保持したまま動画 source だけを
   切り替え、背後のウィンドウが露出しないようにする。ホイール連続入力中は 120ms
@@ -574,7 +580,10 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 | `video_muted` | bool | false | HUD のミュートボタン / M キーで最後に選んだミュート状態。動画切替と次回起動へ引き継ぐ |
 | `video_hw_decode` | bool | true | Windows D3D11VA ハードウェアデコードを試みる。D3D11VA 非対応 codec は CPU デコード、D3D11VA 対応 codec の HW 経路失敗は再生エラー |
 | `video_deinterlace` | VideoDeinterlaceMode | Auto | 動画再生時のデインターレース（Off / Auto / On）。Auto は frame interlaced flag と stream field_order を参照し、Auto/On は FFmpeg bwdif を表示前に適用 |
-| `video_grid_open_starts_from_beginning` | bool | false | ON のとき、サムネイル一覧から動画を開いた場合だけ保存済み再生位置を使わず先頭から再生する。フルスクリーン中の動画移動では保存済み位置を使う |
+| `video_grid_open_starts_from_beginning` | bool | false | 位置復元マトリクス「動画 × 一覧から開く」の保存先 (v0.9.0 リリース済み bool を流用)。ON = 先頭から / OFF = 続きから。UI からは `video_open_resume` / `set_video_open_resume` 経由で ResumeMode として読み書き |
+| `video_nav_resume` | ResumeMode | Resume | 位置復元マトリクス「動画 × Ctrl+↑↓ 移動 (ホイール/キー含む)」。Resume=続きから / FromStart=先頭から |
+| `book_open_resume` | ResumeMode | Resume | 位置復元マトリクス「ZIP/PDF × 一覧から開く」。Resume=続き (保存済み読書位置) / FromStart=先頭ページ |
+| `book_nav_resume` | ResumeMode | FromStart | 位置復元マトリクス「ZIP/PDF × Ctrl+↑↓ フォルダナビ移動」。既定 FromStart=従来のフォルダ先頭着地 / Resume=続き |
 | `audio_normalize_enabled` | bool | false | 動画音量ノーマライズのグローバル ON/OFF。ON のとき、open / Norm ボタン押下で per-file 測定値 (`audio_normalize.db`) を引いて -14 LUFS 相当に gain 適用。測定済み動画は再生開始前から初期 gain を入れる。未測定動画は再生前に自動スキャンし、長尺では約 10 分ぶん測れた時点で仮 gain により再生を開始、確定値が出たら DB 保存して数秒かけて gain を追従する。キャンセル / 失敗後は同 fs_idx の自動再試行を抑止する。全体 OFF は実行中のスキャンもキャンセルする。測定値は環境設定 → 動画から件数確認と全件クリアができる |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |
