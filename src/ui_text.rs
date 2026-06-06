@@ -5379,8 +5379,22 @@ fn text_block_ui(
     }
 }
 
-/// 吹き出し「本体」タブ (形状・塗り・輪郭・自動サイズ・余白)。本文は セリフ タブ、
-/// しっぽは しっぽ タブへ分離している。
+/// 形状の `seed` 表示 + 「再生成」ボタン (ラボ `tab_body` の seed 行)。クリックで seed を +1
+/// して手続き的形状 (トゲ/こぶ/集中線/流線等) の乱数配置を振り直す。
+fn shape_seed_row(ui: &mut egui::Ui, shape_seed: &mut u32, changed: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.label(format!("seed {shape_seed}"));
+        if ui.button("再生成").clicked() {
+            *shape_seed = shape_seed.wrapping_add(1);
+            *changed = true;
+        }
+    });
+}
+
+/// 吹き出し「本体」タブ (形状・形状別パラメータ・塗り・輪郭・余白)。本文は セリフ タブ、
+/// しっぽは しっぽ タブ、自動サイズ・結合は常時表示エリアへ分離している。形状別スライダーの
+/// 個別編集は `b.shape` を変えるので、呼び出し側の `shape_style_diverged` 判定でプリセット
+/// リンクが解除される (ラボ `tab_body` の match ブロック相当)。
 fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
     // 形状コンボ。
     let cur = ShapeKind::from_shape(&b.shape);
@@ -5397,6 +5411,280 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         b.shape = next.to_shape(hw, hh);
         b.shape_preset_link = None;
         *changed = true;
+    }
+
+    // 形状別パラメータの微調整。自動サイズ ON のときは寸法 (半幅/半高/rx/ry) を隠し、
+    // 文字量から決める。形状固有のパラメータ (トゲ数・こぶ数・辺の数・線の本数・角丸・
+    // 向き・線の間隔・seed) は自動サイズでも調整可能。
+    let auto = b.auto_size;
+    match &mut b.shape {
+        BubbleShape::Ellipse { rx, ry } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                    .changed();
+            }
+        }
+        BubbleShape::RoundRect {
+            half_w,
+            half_h,
+            corner_px,
+        } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                    .changed();
+            }
+            *changed |= ui
+                .add(egui::Slider::new(corner_px, 0.0..=200.0).text("角丸"))
+                .changed();
+        }
+        BubbleShape::Burst {
+            rx,
+            ry,
+            spikes,
+            jag,
+            shape_seed,
+        } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                    .changed();
+            }
+            *changed |= ui
+                .add(egui::Slider::new(spikes, 5..=40).text("トゲ数"))
+                .changed();
+            *changed |= ui
+                .add(egui::Slider::new(jag, 0.2..=0.9).text("トゲの深さ"))
+                .changed();
+            shape_seed_row(ui, shape_seed, changed);
+        }
+        BubbleShape::Cloud {
+            rx,
+            ry,
+            lobes,
+            amp,
+            shape_seed,
+        } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                    .changed();
+            }
+            *changed |= ui
+                .add(egui::Slider::new(lobes, 5..=24).text("こぶ数"))
+                .changed();
+            *changed |= ui
+                .add(egui::Slider::new(amp, 0.04..=0.4).text("こぶの深さ"))
+                .changed();
+            shape_seed_row(ui, shape_seed, changed);
+        }
+        BubbleShape::Polygon { rx, ry, sides } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                    .changed();
+            }
+            *changed |= ui
+                .add(egui::Slider::new(sides, 3..=12).text("辺の数"))
+                .changed();
+        }
+        BubbleShape::Diamond { half_w, half_h } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                    .changed();
+            }
+        }
+        BubbleShape::Heart { rx, ry } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                    .changed();
+            }
+        }
+        BubbleShape::Arrow {
+            half_w,
+            half_h,
+            dir_rad,
+        } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("長さ半分"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("幅半分"))
+                    .changed();
+            }
+            let mut deg = dir_rad.to_degrees();
+            if ui
+                .add(egui::Slider::new(&mut deg, -180.0..=180.0).text("向き(度)"))
+                .changed()
+            {
+                *dir_rad = deg.to_radians();
+                *changed = true;
+            }
+        }
+        BubbleShape::Soft {
+            half_w,
+            half_h,
+            corner_px,
+            shape_seed,
+        } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                    .changed();
+            }
+            *changed |= ui
+                .add(egui::Slider::new(corner_px, 0.0..=200.0).text("角丸"))
+                .changed();
+            shape_seed_row(ui, shape_seed, changed);
+        }
+        BubbleShape::MotionLines {
+            rx,
+            ry,
+            count,
+            shape_seed,
+        } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(rx, 40.0..=1000.0).text("外半径rx"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(ry, 40.0..=1000.0).text("外半径ry"))
+                    .changed();
+            }
+            *changed |= ui
+                .add(egui::Slider::new(count, 8..=200).text("線の本数"))
+                .changed();
+            shape_seed_row(ui, shape_seed, changed);
+        }
+        BubbleShape::SpeedLines {
+            half_w,
+            half_h,
+            dir_rad,
+            count,
+            shape_seed,
+        } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(half_w, 40.0..=1000.0).text("半幅"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(half_h, 40.0..=1000.0).text("半高"))
+                    .changed();
+            }
+            *changed |= ui
+                .add(egui::Slider::new(count, 8..=200).text("線の本数"))
+                .changed();
+            let mut deg = dir_rad.to_degrees();
+            if ui
+                .add(egui::Slider::new(&mut deg, -180.0..=180.0).text("向き(度)"))
+                .changed()
+            {
+                *dir_rad = deg.to_radians();
+                *changed = true;
+            }
+            shape_seed_row(ui, shape_seed, changed);
+        }
+        BubbleShape::TextOnly { half_w, half_h } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                    .changed();
+            }
+            ui.label(
+                egui::RichText::new("枠なし・テキストのみ (塗り/枠は描画されません)")
+                    .small()
+                    .weak(),
+            );
+        }
+        BubbleShape::Concentration { rx, ry, shape_seed } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(rx, 20.0..=800.0).text("rx"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(ry, 20.0..=800.0).text("ry"))
+                    .changed();
+            }
+            shape_seed_row(ui, shape_seed, changed);
+        }
+        BubbleShape::Strokes {
+            half_w,
+            half_h,
+            corner_px,
+            shape_seed,
+        } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                    .changed();
+            }
+            *changed |= ui
+                .add(egui::Slider::new(corner_px, 0.0..=200.0).text("角丸"))
+                .changed();
+            shape_seed_row(ui, shape_seed, changed);
+        }
+        BubbleShape::DoubleStroke {
+            half_w,
+            half_h,
+            corner_px,
+            gap_px,
+        } => {
+            if !auto {
+                *changed |= ui
+                    .add(egui::Slider::new(half_w, 20.0..=800.0).text("半幅"))
+                    .changed();
+                *changed |= ui
+                    .add(egui::Slider::new(half_h, 20.0..=800.0).text("半高"))
+                    .changed();
+            }
+            *changed |= ui
+                .add(egui::Slider::new(corner_px, 0.0..=200.0).text("角丸"))
+                .changed();
+            *changed |= ui
+                .add(egui::Slider::new(gap_px, 2.0..=40.0).text("線の間隔"))
+                .changed();
+        }
+    }
+    if auto {
+        ui.label(
+            egui::RichText::new("サイズは文字量に合わせて自動調整 (オフで手動)")
+                .small()
+                .weak(),
+        );
     }
 
     // 塗り。
@@ -5457,29 +5745,52 @@ fn bubble_tail_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         );
         return;
     };
+    // 形式 (三角=会話 / 思考(丸))。
     ui.horizontal(|ui| {
-        ui.label("種別");
-        let mut k = t.kind;
-        if ui.selectable_label(k == TailKind::Spike, "会話").clicked() {
-            k = TailKind::Spike;
-        }
+        ui.label("形式");
         if ui
-            .selectable_label(k == TailKind::Thought, "思考")
+            .radio(matches!(t.kind, TailKind::Spike), "三角")
             .clicked()
         {
-            k = TailKind::Thought;
+            t.kind = TailKind::Spike;
+            *changed = true;
         }
-        if k != t.kind {
-            t.kind = k;
+        if ui
+            .radio(matches!(t.kind, TailKind::Thought), "思考(丸)")
+            .clicked()
+        {
+            t.kind = TailKind::Thought;
             *changed = true;
         }
     });
-    if ui
-        .add(egui::Slider::new(&mut t.width_px, 4.0..=120.0).text("幅"))
-        .changed()
-    {
-        *changed = true;
+    // 先端 (tip) を画像座標で直接編集 (キャンバスのハンドルドラッグと等価)。
+    ui.horizontal(|ui| {
+        ui.label("先端");
+        *changed |= ui
+            .add(egui::DragValue::new(&mut t.tip.0).speed(1.0))
+            .changed();
+        *changed |= ui
+            .add(egui::DragValue::new(&mut t.tip.1).speed(1.0))
+            .changed();
+    });
+    // 付け根の自動配置: 中心→先端のレイが輪郭を抜ける位置に根を付ける (対象を指す)。
+    // オフにすると `base_t` で手動指定 (付け根ハンドルのドラッグでも切れる)。先端は固定。
+    *changed |= ui
+        .checkbox(&mut t.base_auto, "付け根を自動 (対象方向)")
+        .changed();
+    if !t.base_auto {
+        *changed |= ui
+            .add(egui::Slider::new(&mut t.base_t, 0.0..=1.0).text("付け根位置"))
+            .changed();
     }
+    let w_label = if matches!(t.kind, TailKind::Thought) {
+        "円の大きさ"
+    } else {
+        "付け根の太さ"
+    };
+    *changed |= ui
+        .add(egui::Slider::new(&mut t.width_px, 4.0..=200.0).text(w_label))
+        .changed();
 }
 
 /// ウィンドウの位置プリセット (`position`) + サイズモード (`size_mode`) を、ソース画像
