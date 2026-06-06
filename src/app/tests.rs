@@ -8306,6 +8306,110 @@ mod native_video_rating_key_tests {
 }
 
 #[cfg(test)]
+mod fullscreen_main_focus_guard_tests {
+    use super::*;
+
+    #[test]
+    fn main_focus_guard_closes_after_grace_without_fullscreen_root_key() {
+        assert!(should_close_fullscreen_from_main_focus(
+            true, true, false, false, false,
+        ));
+    }
+
+    #[test]
+    fn main_focus_guard_skips_close_when_fullscreen_root_key_was_handled() {
+        assert!(!should_close_fullscreen_from_main_focus(
+            true, true, false, false, true,
+        ));
+    }
+
+    #[test]
+    fn main_focus_guard_skips_close_during_grace_or_embedded_mode() {
+        assert!(!should_close_fullscreen_from_main_focus(
+            false, true, false, false, false,
+        ));
+        assert!(!should_close_fullscreen_from_main_focus(
+            true, true, false, true, false,
+        ));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod still_window_mode_key_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    fn push_image(app: &mut App, path: &str) -> usize {
+        app.items.push(GridItem::Image(PathBuf::from(path)));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.items.len() - 1
+    }
+
+    fn begin_root_key_pass(ctx: &egui::Context, key: egui::Key, repeat: bool) {
+        let modifiers = egui::Modifiers::NONE;
+        ctx.begin_pass(egui::RawInput {
+            modifiers,
+            ..Default::default()
+        });
+        ctx.input_mut(|i| {
+            i.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat,
+                modifiers,
+            });
+        });
+    }
+
+    #[test]
+    fn still_image_root_f11_toggles_window_mode_without_closing_fullscreen() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.video_in_window_mode = false;
+        app.native_video_in_window_active = false;
+
+        begin_root_key_pass(&ctx, egui::Key::F11, false);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(
+            handled,
+            "root-delivered F11 should be handled as fullscreen input"
+        );
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(idx),
+            "F11 must not close still fullscreen"
+        );
+        assert!(app.settings.video_in_window_mode);
+        assert!(app.native_video_in_window_active);
+    }
+
+    #[test]
+    fn still_image_root_f11_repeat_is_ignored() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.settings.video_in_window_mode = false;
+        app.native_video_in_window_active = false;
+
+        begin_root_key_pass(&ctx, egui::Key::F11, true);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled, "repeat F11 is still a fullscreen root key");
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert!(!app.settings.video_in_window_mode);
+        assert!(!app.native_video_in_window_active);
+    }
+}
+
+#[cfg(test)]
 mod file_operation_selection_tests {
     use super::phase_c_support::setup_app;
     use super::*;

@@ -34,6 +34,20 @@ pub(crate) enum FolderOpenOutcome {
 /// push 側が notify_one() で起こす。
 pub(crate) type NotifyQueue = (Mutex<Vec<LoadRequest>>, Condvar);
 
+fn should_close_fullscreen_from_main_focus(
+    fs_focus_grace_elapsed: bool,
+    main_viewport_focused: bool,
+    native_video_presenter_active: bool,
+    embedded_still: bool,
+    fullscreen_root_key_handled: bool,
+) -> bool {
+    fs_focus_grace_elapsed
+        && main_viewport_focused
+        && !native_video_presenter_active
+        && !embedded_still
+        && !fullscreen_root_key_handled
+}
+
 /// Ctrl+↑↓ フォルダナビゲーションの発火元モード。DFS 完了後に mode に応じて
 /// 異なる後処理 (grid は load_folder のみ、fullscreen は fs 再オープン、favsearch は
 /// sibling fallback 付き) を行うため、`FolderNavPending` に記憶させる。
@@ -26458,6 +26472,11 @@ impl eframe::App for App {
         self.process_scroll(ctx);
         let t_title_scroll = frame_t0.elapsed();
 
+        // フルスクリーンのキーが main/root 側に届いた場合は、main focus guard より先に
+        // 処理する。F11 の window/fullscreen 切替など、main が focused になること自体が
+        // 操作の副作用であるキーを、一覧へ戻りたい意図と誤認しないため。
+        let fullscreen_root_key_handled = self.handle_fullscreen_root_key_input(ctx);
+
         // ── フルスクリーン中にメインウィンドウへフォーカスが来たら閉じる ──
         // ボーダーレスウィンドウなので Alt-Tab 等でメインに戻れるが、
         // そのままだと両方のウィンドウがキー入力を無視して操作不能に見える。
@@ -26485,14 +26504,18 @@ impl eframe::App for App {
             let embedded_still = self.fullscreen_embedded_still_active();
             #[cfg(not(windows))]
             let embedded_still = false;
-            let main_has_focus =
-                self.fs_focus_grace_elapsed && ctx.input(|i| i.viewport().focused).unwrap_or(false);
-            if main_has_focus && !native_video_presenter_active && !embedded_still {
+            let main_viewport_focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
+            if should_close_fullscreen_from_main_focus(
+                self.fs_focus_grace_elapsed,
+                main_viewport_focused,
+                native_video_presenter_active,
+                embedded_still,
+                fullscreen_root_key_handled,
+            ) {
                 self.close_fullscreen();
             }
         }
 
-        let fullscreen_root_key_handled = self.handle_fullscreen_root_key_input(ctx);
         if !fullscreen_root_key_handled {
             self.handle_clipboard_shortcuts(ctx);
         }
