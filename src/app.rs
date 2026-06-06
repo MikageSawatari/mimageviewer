@@ -83,6 +83,10 @@ pub(crate) struct DeferredFsReopen {
     /// を立て、Esc/Enter を「親フォルダ (一覧) へ戻る」/ Backspace を「ページ一覧へ」に切替える。
     /// フォルダナビ (Ctrl+↑↓) / ★固定ナビ由来は false。
     pub auto_opened_container: bool,
+    /// 列挙完了で開くページを「先頭」ではなく「保存済み読書位置 (続きから)」にするか。
+    /// grid から本を開いた (= `pending_auto_fs_open`) ときだけ true。Ctrl+↑↓ フォルダナビは
+    /// 「フォルダ先頭着地」の設計を保つため false。
+    pub resume_to_last_page: bool,
 }
 
 /// DFS スレッドから UI スレッドに送るメッセージ。結果 (Option) と、
@@ -3289,6 +3293,14 @@ pub struct App {
     /// `[u32; 6]` の index 0=★なし, 1..5=★1..★5。`folder_rating_match` がここを優先参照する。
     pub(crate) search_drilled_folder_counts: std::collections::HashMap<String, [u32; 6]>,
 
+    // ── 読書位置レジューム ──────────────────────────────────────
+    /// 本 (フォルダ / ZIP / PDF) ごとの「最後に読んだページ index」永続化 DB。
+    /// 再起動を跨いで読書位置を復元する (動画の `video_resume_positions` の画像本版)。
+    pub(crate) book_resume_db: Option<crate::book_resume_db::BookResumeDb>,
+    /// 直近に DB へ書いた `(コンテナパス, page idx)`。フルスクリーンのページ送り毎の
+    /// 重複書き込みを抑止する dedup。
+    pub(crate) last_book_resume: Option<(PathBuf, usize)>,
+
     // ── 見開き表示 ──────────────────────────────────────────────
     /// 見開き DB (フォルダごとのモード永続化)
     pub(crate) spread_db: Option<crate::spread_db::SpreadDb>,
@@ -4695,6 +4707,10 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_spread", 0, t);
 
         let t = std::time::Instant::now();
+        let book_resume_db = crate::book_resume_db::BookResumeDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_book_resume", 0, t);
+
+        let t = std::time::Instant::now();
         let auto_aspect_cache_db = crate::auto_aspect_cache::AutoAspectCacheDb::open()
             .map_err(|e| crate::logger::log(format!("auto_aspect_cache_db open failed: {e}")))
             .ok();
@@ -5006,6 +5022,8 @@ impl App {
             folder_rating_counter_handle: None,
             folder_rating_counts_folder_key: None,
             search_drilled_folder_counts: std::collections::HashMap::new(),
+            book_resume_db,
+            last_book_resume: None,
             spread_db,
             spread_mode: crate::settings::SpreadMode::default(),
             spread_phase: 0,
@@ -8009,6 +8027,7 @@ impl App {
                 resume_slideshow: false,
                 target: None,
                 auto_opened_container: true,
+                resume_to_last_page: true,
             });
         }
 
@@ -8212,11 +8231,17 @@ impl App {
             // ★固定ナビ由来 (target Some) なら列挙完了した items から対象 leaf を解決する
             // (Codex P2 fix)。マッチしなければ / フォルダナビ由来なら従来どおり先頭着地。
             // スライドショー NextFolder の deferred 再開は動画を開かず静止画のみに着地する。
-            let new_idx = deferred
+            let mut new_idx = deferred
                 .target
                 .as_ref()
-                .and_then(|t| self.resolve_snapshot_target_idx(t))
-                .or_else(|| self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow));
+                .and_then(|t| self.resolve_snapshot_target_idx(t));
+            // grid から本を開いた場合は保存済み読書位置 (続きから) を優先。
+            if new_idx.is_none() && deferred.resume_to_last_page {
+                new_idx = self.resume_page_for_container();
+            }
+            if new_idx.is_none() {
+                new_idx = self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow);
+            }
             if let Some(new_idx) = new_idx {
                 self.open_fullscreen(new_idx);
                 // 自動オープン由来なら退出ルーティングを「Esc/Enter→親 / BS→ページ一覧」へ。
@@ -8266,6 +8291,7 @@ impl App {
                 resume_slideshow: false,
                 target: None,
                 auto_opened_container: true,
+                resume_to_last_page: true,
             });
         }
 
@@ -8663,13 +8689,18 @@ impl App {
                     // 解決する (Codex P2 fix)。マッチしなければ / フォルダナビ由来なら従来
                     // どおり先頭着地。スライドショー NextFolder の deferred 再開は動画を
                     // 開かず静止画のみに着地する。
-                    let new_idx = deferred
+                    let mut new_idx = deferred
                         .target
                         .as_ref()
-                        .and_then(|t| self.resolve_snapshot_target_idx(t))
-                        .or_else(|| {
-                            self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow)
-                        });
+                        .and_then(|t| self.resolve_snapshot_target_idx(t));
+                    // grid から本を開いた場合は保存済み読書位置 (続きから) を優先。
+                    if new_idx.is_none() && deferred.resume_to_last_page {
+                        new_idx = self.resume_page_for_container();
+                    }
+                    if new_idx.is_none() {
+                        new_idx =
+                            self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow);
+                    }
                     if let Some(new_idx) = new_idx {
                         self.open_fullscreen(new_idx);
                         // 自動オープン由来なら退出ルーティングを「Esc/Enter→親 / BS→ページ一覧」へ。
@@ -9693,6 +9724,21 @@ impl App {
                 // 前回保存時は可視だった sel が、現在のフィルタ状態では非可視かもしれない。
                 // `rebuild_visible_indices` 時点では selected が None だったので redirect が
                 // 走っておらず、ここで再度 redirect して WYSIWYG 不変条件を保つ (Codex P2)。
+                self.redirect_selected_to_visible();
+            }
+        }
+        // 同セッション履歴 (folder_history) に位置が無い (= 再起動後の初回など) かつ
+        // select_after_load も無い場合、永続化した読書位置 (book_resume_db) をグリッド選択に
+        // 復元する (= 再起動を跨いだ「続きから」)。
+        if !restored && !self.folder_history.contains_key(&source_path) {
+            let resume = self
+                .book_resume_db
+                .as_ref()
+                .and_then(|db| db.get(&source_path))
+                .filter(|&p| self.is_book_page_idx(p));
+            if let Some(page) = resume {
+                self.selected = Some(page);
+                self.scroll_to_selected = true;
                 self.redirect_selected_to_visible();
             }
         }
@@ -14124,6 +14170,7 @@ impl App {
                 resume_slideshow,
                 target: None,
                 auto_opened_container: self.auto_open_for_current_container(),
+                resume_to_last_page: false,
             });
             return "enumerate_defer";
         }
@@ -14136,6 +14183,7 @@ impl App {
                 resume_slideshow,
                 target: None,
                 auto_opened_container: self.auto_open_for_current_container(),
+                resume_to_last_page: false,
             });
             return "enumerate_defer";
         }
@@ -14789,6 +14837,47 @@ impl App {
     // フルスクリーン表示
     // -----------------------------------------------------------------------
 
+    /// 指定 idx が画像本のページ (Image / ZipImage / PdfPage) かどうか。
+    /// 読書位置レジュームの対象判定に使う (Folder/Zip/Pdf タイル・動画・区切りは対象外)。
+    fn is_book_page_idx(&self, idx: usize) -> bool {
+        matches!(
+            self.items.get(idx),
+            Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. })
+        )
+    }
+
+    /// 現在のフルスクリーンページを「最後に読んだページ」として永続記録する。
+    /// 画像本のページのみ対象。dedup 付きで連続ページ送り中の重複書き込みを抑える。
+    pub(crate) fn record_book_resume(&mut self, idx: usize) {
+        if !self.is_book_page_idx(idx) {
+            return;
+        }
+        let Some(folder) = self.current_folder.clone() else {
+            return;
+        };
+        if self.last_book_resume.as_ref() == Some(&(folder.clone(), idx)) {
+            return;
+        }
+        if let Some(db) = &self.book_resume_db {
+            let _ = db.set(&folder, idx);
+        }
+        self.last_book_resume = Some((folder, idx));
+    }
+
+    /// 現在のコンテナ (`current_folder`) の保存済み読書位置を、現在の `items` に対して
+    /// 検証して返す。範囲外 / 本ページでない場合は None (= 先頭にフォールバック)。
+    pub(crate) fn resume_page_for_container(&self) -> Option<usize> {
+        let folder = self.current_folder.as_deref()?;
+        let idx = self.book_resume_db.as_ref()?.get(folder)?;
+        if self.is_book_page_idx(idx) {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
     /// フルスクリーン表示を開始する。
     /// キャッシュ済みなら即座に表示し、そうでなければ読み込みを開始する。
     /// 動画アイテムの場合はサムネイル＋再生ボタンを表示するだけで読み込みは不要。
@@ -14808,6 +14897,9 @@ impl App {
         // スタックで管理する (画像移動でさらにクリアされる)。
         self.clear_meta_undo();
         self.fullscreen_idx = Some(idx);
+        // 本ごとの読書位置レジューム: 画像本のページを開くたびに最後のページを記録
+        // (再起動を跨いで復元する。dedup 付きなので連続ページ送りでも書き込みは最小)。
+        self.record_book_resume(idx);
         self.video_continuous_last_eof = None;
         #[cfg(windows)]
         let entering_native_video_fullscreen =

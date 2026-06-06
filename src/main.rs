@@ -10,6 +10,7 @@ pub mod archive_converter;
 pub mod audio_normalize_db;
 pub mod auto_aspect;
 pub mod auto_aspect_cache;
+pub mod book_resume_db;
 pub mod cache_maintenance;
 pub mod capture;
 pub mod catalog;

@@ -828,6 +828,7 @@ impl App {
                 resume_slideshow,
                 target,
                 auto_opened_container: false,
+                resume_to_last_page: false,
             });
             return;
         }

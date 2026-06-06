@@ -233,6 +233,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `local_adjust.db` | 補正レイヤーのページ単位 JSON。中央 DB が authoritative で、`mimageviewer.dat` の `local_adjust_layers` はフォルダ移動時の復元用バックアップ | `local_adjust_db.rs` + `sidecar.rs` |
 | `export_crop.db` | 最後段 crop のページ単位矩形。中央 DB が authoritative で、`mimageviewer.dat` の `export_crop` はフォルダ移動時の復元用バックアップ | `export_crop.rs` + `sidecar.rs` |
 | `spread.db` | フォルダ別見開きモード | `spread_db.rs` |
+| `book_resume.db` | 本 (フォルダ/ZIP/PDF) ごとの最後に読んだページ index。再起動を跨いで読書位置を復元する (動画 `video_resume_positions` の画像本版)。`open_fullscreen` で記録、自動オープン時に「続きから」開く / 通常オープン時はグリッド選択を復元 | `book_resume_db.rs` |
 | `folder_thumb_pins.db` | 親コンテナ (Folder/ZipFile/PdfFile) の代表サムネ手動ピン。container_key 主キー (= normalize_keep_drive 済みパス) で 1 行 1 コンテナ、source は kind + container 相対 rel + (zipentry の) entry / (pdfpage の) page。`apply_folder_thumb_pin` が cache key suffix `#pin:{source_id}` で identity を表現 | `folder_thumb_pins.rs` |
 | `video_pins.db` | ユーザーがフルスクリーン HUD で指定した動画フレームの抽出 WebP。`(path, pin_pts_secs, thumb_webp, thumb_pts_secs)`。folder thumb pin の source が動画のときは `seed_folder_video_pin_thumbs` が起動時にこの WebP を catalog にミラー seed する。左ジャンプパネルのピン行もこの WebP を再利用する | `video_pins.rs` |
 | `video_bookmarks.db` | 動画ブックマーク (pts / title / jump panel 用 WebP)。初回表示時に FFmpeg worker で取得したサムネを `thumb_webp` に保存し、次回以降は DB から復元する | `video_bookmarks.rs` |

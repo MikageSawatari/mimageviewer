@@ -3822,6 +3822,29 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.auto_open_for_current_container(), "設定 OFF は対象外");
     }
 
+    /// 読書位置レジュームの記録: 画像本のページだけを対象にし、dedup する。
+    #[test]
+    fn record_book_resume_targets_book_pages_with_dedup() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let folder = std::path::PathBuf::from("c:/manga/series");
+        app.current_folder = Some(folder.clone());
+        app.items.push(GridItem::Image(std::path::PathBuf::from(
+            "c:/manga/series/001.jpg",
+        )));
+        app.items.push(GridItem::Folder(std::path::PathBuf::from(
+            "c:/manga/series/sub",
+        )));
+
+        // 画像 (本ページ) idx 0 → 記録される
+        app.record_book_resume(0);
+        assert_eq!(app.last_book_resume, Some((folder.clone(), 0)));
+
+        // フォルダタイル idx 1 → 対象外。直近記録は据え置き
+        app.record_book_resume(1);
+        assert_eq!(app.last_book_resume, Some((folder, 0)));
+    }
+
     /// 見開きから隠蔽加工に入ったあと `reset_conceal_mode` で元の見開き状態に戻ること。
     #[test]
     fn reset_conceal_mode_restores_saved_spread_state() {
@@ -5041,6 +5064,7 @@ mod favorite_adjustment_defaults_tests {
             resume_slideshow: false,
             target: None,
             auto_opened_container: false,
+            resume_to_last_page: false,
         });
 
         app.poll_fs_nav_lock();
