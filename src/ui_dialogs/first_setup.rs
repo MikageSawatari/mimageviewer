@@ -48,6 +48,15 @@ impl App {
                 )
                 .weak(),
             );
+            if ui
+                .link("処理時間の目安を開く")
+                .on_hover_text("ブラウザでマニュアルの AI 処理時間表を開きます。")
+                .clicked()
+            {
+                let url =
+                    crate::ui_helpers::manual_url("settings.html", Some("ai-processing-time"));
+                crate::ui_helpers::open_url(&url);
+            }
 
             ui.add_space(12.0);
             ui.separator();

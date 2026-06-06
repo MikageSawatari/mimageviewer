@@ -895,6 +895,19 @@ pub fn open_url(url: &str) {
     }
 }
 
+/// オンラインマニュアルの URL を作る。
+pub fn manual_url(page: &str, anchor: Option<&str>) -> String {
+    let mut url = format!(
+        "https://www.mikage.to/mimageviewer/manual/{page}?version={}",
+        env!("CARGO_PKG_VERSION"),
+    );
+    if let Some(anchor) = anchor {
+        url.push('#');
+        url.push_str(anchor);
+    }
+    url
+}
+
 // -----------------------------------------------------------------------
 // Ctrl+G 結果コンテナ: 階層パス表示
 // -----------------------------------------------------------------------
@@ -1067,6 +1080,24 @@ pub fn draw_centered_elided_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_url_places_fragment_after_version_query() {
+        assert_eq!(
+            manual_url("settings.html", Some("ai-processing-time")),
+            format!(
+                "https://www.mikage.to/mimageviewer/manual/settings.html?version={}#ai-processing-time",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert_eq!(
+            manual_url("index.html", None),
+            format!(
+                "https://www.mikage.to/mimageviewer/manual/index.html?version={}",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
 
     #[test]
     fn format_count_basic() {

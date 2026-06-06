@@ -684,10 +684,7 @@ impl App {
 
                 ui.menu_button("ヘルプ", |ui| {
                     if ui.button("ヘルプサイトを開く").clicked() {
-                        let url = format!(
-                            "https://www.mikage.to/mimageviewer/manual/index.html?version={}",
-                            env!("CARGO_PKG_VERSION"),
-                        );
+                        let url = crate::ui_helpers::manual_url("index.html", None);
                         crate::ui_helpers::open_url(&url);
                         ui.close();
                     }

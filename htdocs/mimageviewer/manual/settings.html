@@ -383,12 +383,42 @@
         </thead>
         <tbody>
           <tr><td>テーマ</td><td>システム / ライト / ダーク。システムは Windows のアプリ用テーマに追従し、起動後に OS 側で切り替えても自動反映されます。</td><td>システム</td></tr>
-          <tr><td>AI 機能</td><td>なし / 軽量 / 高画質。軽量はミドルレンジ GPU 向けで高速汎用・漫画トーン保持モデルのみ使用し、ノイズ除去は実行しません。高画質はハイエンド GPU 向けで全アップスケールモデルとノイズ除去を許可します。</td><td>軽量</td></tr>
+          <tr><td>AI 機能</td><td>なし / 軽量 / 高画質。軽量はミドルレンジ GPU 向けで高速汎用・漫画トーン保持モデルのみ使用し、ノイズ除去は実行しません。高画質はハイエンド GPU 向けで全アップスケールモデルとノイズ除去を許可します（<a href="#ai-processing-time">処理時間の目安</a>）。</td><td>軽量</td></tr>
           <tr><td>ZIP/PDF ファイル</td><td>開いたときページ一覧を表示するか、1 ページ目を直接フルスクリーン表示するかを選べます。</td><td>ページ一覧</td></tr>
         </tbody>
       </table>
     </div>
     <p>初回起動時は、テーマ・AI 機能・ZIP/PDF の開き方をまとめて確認する初回設定ダイアログが表示されます。</p>
+
+    <h3 id="ai-processing-time">AI 処理時間の目安</h3>
+    <p>AI 処理時間は GPU、バックエンド、画像サイズ、モデル、同時に動いているアプリによって変わります。
+    ここでは「モード選択時の体感」を判断するための代表値を示します。数値は 1 枚あたりの平均処理時間で、初回のモデル読み込み時間は含みません。</p>
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        4060 Ti の値は DirectML / synthetic manga JPEG / warmup 1 回後 3 回平均の実測です。
+        1024×768 クラスは 768×1080 の列、長辺 2048px クラスは 1440×2048 の列を目安にしてください。
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>モデル / 処理</th><th>AI 機能モード</th><th>RTX 4060 Ti<br>768×1080</th><th>RTX 4060 Ti<br>1440×2048</th><th>備考</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>高速汎用<br><small>Real-ESR General V3</small></td><td>軽量 / 高画質</td><td>約 0.55 秒</td><td>約 1.42 秒</td><td>軽量モードで写真・イラスト・3D に自動割り当てされるモデル。</td></tr>
+          <tr><td>漫画 (トーン保持)<br><small>Real-CUGAN 4x</small></td><td>軽量 / 高画質</td><td>約 0.60 秒</td><td>未計測</td><td>軽量モードで漫画に自動割り当てされるモデル。</td></tr>
+          <tr><td>イラスト・アニメ<br><small>Real-ESRGAN Anime 6B</small></td><td>高画質</td><td>約 1.69 秒</td><td>約 5.78 秒</td><td>線画を強めに整えるため、軽量モデルより重くなります。</td></tr>
+          <tr><td>写真・CG (ノイズ除去強)<br><small>Real-ESRGAN x4plus</small></td><td>高画質</td><td>約 2.95 秒</td><td>未計測</td><td>高画質向けの汎用モデル。写真では効果が出やすい一方、負荷も高めです。</td></tr>
+          <tr><td>写真 (質感保持)<br><small>4x-NMKD-Siax-200k</small></td><td>高画質</td><td>約 4.76 秒</td><td>未計測</td><td>質感を残す写真向けモデル。4060 Ti では待ち時間が出やすいです。</td></tr>
+          <tr><td>JPEG ノイズ除去<br><small>RealPLKSR</small></td><td>高画質</td><td>約 2.72 秒</td><td>約 8.72 秒</td><td>アップスケールではなく 1x のノイズ除去。高画質モードでのみ実行されます。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>RTX 4090 では、2026-05 の TensorRT 検証時に 1024×1024 入力で高画質モデルが
+    DirectML 約 1.1〜4.0 秒、TensorRT 約 0.24〜1.8 秒でした。高速汎用モデルは DirectML のままでも軽く、
+    640×480 で約 0.13 秒、1280×720 で約 0.36 秒、1920×1080 で約 0.65 秒の目安です。
+    同じ画像セットで 4090 / 4060 Ti を測り直した場合は、この表を更新します。</p>
 
     <h2 id="tray-residency">タスクトレイ常駐（環境設定 → タスクトレイ常駐）</h2>
     <p>ウィンドウの [×] ボタンを押したときにプロセスを終了せず、タスクトレイ（通知領域）に

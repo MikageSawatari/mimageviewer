@@ -530,7 +530,7 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 | `last_folder` | Option\<PathBuf\> | None | 前回開いていたフォルダ |
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ZIP・PDF の開き方) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
-| `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去 |
+| `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去。初回セットアップと環境設定には、オンラインマニュアルの処理時間目安へのリンクを表示する |
 | `auto_fullscreen_zip_pdf` | bool | false | ZIP/PDF を一覧から開いたとき、ページ一覧を経由せず 1 ページ目をフルスクリーンで表示する |
 
 ### 8.2 キャッシュ設定
