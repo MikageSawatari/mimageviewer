@@ -78,11 +78,6 @@ pub(crate) struct DeferredFsReopen {
     /// `Some` なら列挙完了時にこの target を `items` から解決して開く。マッチしなければ
     /// `find_fullscreen_nav_target_filtered` に fallback。フォルダナビ経路では常に `None`。
     pub target: Option<crate::snapshot::SnapshotTarget>,
-    /// 「ZIP/PDF の自動 1 ページ目フルスクリーン」(環境設定 ON で grid からコンテナを
-    /// 開いた) 由来か。true のとき列挙完了で fullscreen を開いたら `fs_zip_auto_opened`
-    /// を立て、Esc/Enter を「親フォルダ (一覧) へ戻る」/ Backspace を「ページ一覧へ」に切替える。
-    /// フォルダナビ (Ctrl+↑↓) / ★固定ナビ由来は false。
-    pub auto_opened_container: bool,
     /// 列挙完了で開くページを「先頭」ではなく「保存済み読書位置 (続きから)」にするか。
     /// grid から本を開いた経路は設定 `book_open_resume`、Ctrl+↑↓ フォルダナビ経路は
     /// `book_nav_resume` で true/false を決める (位置復元マトリクス)。既定は grid=続き /
@@ -3507,13 +3502,10 @@ pub struct App {
     /// 「ZIP/PDF を grid から開いた瞬間に 1 ページ目をフルスクリーンで開く」(環境設定
     /// `auto_fullscreen_zip_pdf`) の one-shot 予約。grid の Enter / ダブルクリックで
     /// ZipFile / PdfFile を開くときに立て、`load_zip_as_folder` / `load_pdf_as_folder` が
-    /// `mem::take` して `fs_nav_after_pdf_enumerate`(auto_opened_container=true)へ変換する。
+    /// `mem::take` して `fs_nav_after_pdf_enumerate` へ変換する。
     pub(crate) pending_auto_fs_open: bool,
-    /// 現在のフルスクリーンが「ZIP/PDF 自動 1 ページ目オープン」で入ったか。true のとき
-    /// Esc/Enter は親フォルダ (一覧) へ戻り、Backspace はコンテナのページ一覧へ戻る
-    /// (= 入口と出口を対称化)。`close_fullscreen` でクリア。
-    pub(crate) fs_zip_auto_opened: bool,
-    /// 自動オープン ZIP/PDF からの Esc/Enter で「親フォルダ (一覧) へ戻る」要求。
+    /// モードB「ページをフルスクリーン表示」での Esc/Enter/右クリックで「親フォルダ (一覧)
+    /// へ戻る」要求。
     /// フルスクリーン handler が立て、次フレーム冒頭の `handle_keyboard` が
     /// `AddressBarNav::Direct(parent)` として通常のナビ経路へ流す (= L2 ページ一覧を
     /// 1 フレームも表示せずに L1 へ抜けるため、その場では close せず予約だけ立てる)。
@@ -5093,7 +5085,6 @@ impl App {
             zip_enumerate_pending: None,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
-            fs_zip_auto_opened: false,
             pending_return_to_parent: false,
             pdf_placeholder_count: None,
             cached_handlers: None,
@@ -8031,7 +8022,6 @@ impl App {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
                 resume_slideshow: false,
                 target: None,
-                auto_opened_container: true,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_open_resume.resumes(),
             });
@@ -8250,8 +8240,6 @@ impl App {
             }
             if let Some(new_idx) = new_idx {
                 self.open_fullscreen(new_idx);
-                // 自動オープン由来なら退出ルーティングを「Esc/Enter→親 / BS→ページ一覧」へ。
-                self.fs_zip_auto_opened = deferred.auto_opened_container;
                 self.selected = Some(new_idx);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
@@ -8296,7 +8284,6 @@ impl App {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
                 resume_slideshow: false,
                 target: None,
-                auto_opened_container: true,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_open_resume.resumes(),
             });
@@ -8710,8 +8697,6 @@ impl App {
                     }
                     if let Some(new_idx) = new_idx {
                         self.open_fullscreen(new_idx);
-                        // 自動オープン由来なら退出ルーティングを「Esc/Enter→親 / BS→ページ一覧」へ。
-                        self.fs_zip_auto_opened = deferred.auto_opened_container;
                         self.selected = Some(new_idx);
                         self.scroll_to_selected = true;
                         self.update_last_selected_image();
@@ -13728,13 +13713,8 @@ impl App {
         // BS: 親フォルダへ (検索中はスタックを戻る)
         // Ctrl+BS は個別補正の解除に使うので除外する
         if (backspace && !ctrl_held) || alt_up {
-            // 自動オープン ZIP/PDF をフルスクリーンで読んでいる場合、BS は親フォルダではなく
-            // コンテナのページ一覧 (L2) を表示する (= フルスクリーンを閉じるだけ。current_folder
-            // は ZIP/PDF のままなのでページ一覧が出る)。Esc/Enter が L1 (親) へ戻るのと対をなす。
-            if self.fullscreen_idx.is_some() && self.fs_zip_auto_opened {
-                self.close_fullscreen();
-                return None;
-            }
+            // フルスクリーン中の BS はフルスクリーン側ビューポートで処理する (ZIP/PDF ページ
+            // なら 1 段戻って L2 ページ一覧)。ここは grid (L1/L2) での BS = 親フォルダへ。
             // Fix-B (ユーザー指摘): ★固定 中の BS は snapshot list view (= snapshot.items を
             // render する状態) に戻る。snapshot 内 child folder に居る場合のみ動作し、既に
             // snapshot root 表示中なら通常の親フォルダ移動を試みる (= load_folder guard で
@@ -14169,13 +14149,12 @@ impl App {
         resume_slideshow: bool,
     ) -> &'static str {
         // フォルダナビ経路は特定 leaf を持たない (= target: None)。先頭着地。
-        // auto_opened_container は「移動先が ZIP/PDF コンテナ & 設定 ON」のとき立てる
-        // (= Ctrl+↓ で次の本へ移っても grid open と同じ退出ルーティングにする)。
+        // 退出ルーティング (Esc→L1 / BS→L2) は設定 auto_fullscreen_zip_pdf で決まるので
+        // ここでフラグを立てる必要はない。
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
                 resume_slideshow,
                 target: None,
-                auto_opened_container: self.auto_open_for_current_container(),
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_nav_resume.resumes(),
             });
@@ -14189,7 +14168,6 @@ impl App {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
                 resume_slideshow,
                 target: None,
-                auto_opened_container: self.auto_open_for_current_container(),
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_nav_resume.resumes(),
             });
@@ -14202,8 +14180,6 @@ impl App {
             let _ = restore_video_tile;
 
             self.open_fullscreen(new_idx);
-            // 同期完了で ZIP/PDF に着地した稀ケース (spawn fail fallback 等) もここで反映。
-            self.fs_zip_auto_opened = self.auto_open_for_current_container();
             self.selected = Some(new_idx);
             self.scroll_to_selected = true;
             self.update_last_selected_image();
@@ -17900,17 +17876,21 @@ impl App {
             .collect()
     }
 
-    /// フルスクリーンの「閉じる」要求 (Esc / Enter / ビューポート close) の共通処理。
+    /// フルスクリーンの「閉じる」要求 (Esc / Enter / 右クリック / ビューポート close) の共通処理。
     ///
-    /// 通常はそのまま `close_fullscreen`。ただし「ZIP/PDF 自動 1 ページ目オープン」
-    /// (`fs_zip_auto_opened`) で入っていた場合は、ページ一覧 (L2) を経由せず親フォルダ
-    /// (L1, 一覧) へ戻る。入口で L2 をスキップしたので出口でも対称にスキップする。
-    /// 親へ戻る経路は L2 を 1 フレームも見せないため、その場では close せず
+    /// **モードB「ページをフルスクリーン表示」(`auto_fullscreen_zip_pdf`) で ZIP/PDF ページを
+    /// 見ているとき**は、ページ一覧 (L2) を経由せずファイル一覧 (L1) まで戻る (= 入口で L2 を
+    /// スキップしたのと対称、"ESC 2 回分")。判定は `auto_open_for_current_container()`
+    /// (= 設定B & コンテナ内 & 非検索) のみで、入り方を覚える一時フラグは持たない。
+    /// それ以外 (モードA / 通常画像) は 1 段だけ閉じる (`close_fullscreen`: コンテナなら L2
+    /// ページ一覧、通常画像なら親フォルダグリッド)。
+    ///
+    /// L1 へ戻る経路は L2 を 1 フレームも見せないため、その場では close せず
     /// `pending_return_to_parent` を立てるだけにし、次フレーム冒頭の `handle_keyboard` が
-    /// 通常のナビ (load → 内部で close_fullscreen) を発行する。
+    /// 通常のナビ (load → 内部で close_fullscreen) を発行する。BS は階層を 1 段だけ戻す
+    /// (= 常に L2) ので本関数を通さず `close_fullscreen` を直接呼ぶ (ui_fullscreen 側)。
     pub(crate) fn handle_fullscreen_close_request(&mut self) {
-        if self.fs_zip_auto_opened {
-            self.fs_zip_auto_opened = false;
+        if self.auto_open_for_current_container() {
             self.pending_return_to_parent = true;
             return;
         }
@@ -18063,8 +18043,6 @@ impl App {
             }
         }
         self.fullscreen_idx = None;
-        // 自動オープン由来の退出ルーティングフラグはフルスクリーンを抜けたら必ずクリア。
-        self.fs_zip_auto_opened = false;
         self.metadata_panel_hover_active = false;
         // Ctrl+E ダイアログ / 進捗モーダルはフルスクリーン文脈に紐付くので、
         // close_fullscreen と同時に閉じる (Codex review CONFIRMED)。

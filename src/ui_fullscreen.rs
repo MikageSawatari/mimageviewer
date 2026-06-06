@@ -1454,7 +1454,12 @@ struct FsFrameState {
 /// フルスクリーンのキー入力結果。
 #[derive(Default)]
 pub(crate) struct FsKeyAction {
+    /// Esc / Enter / 右クリック相当。`handle_fullscreen_close_request` を通す
+    /// (= モードB のコンテナページなら L1、それ以外は 1 段 close)。
     pub(crate) close: bool,
+    /// BS = 階層を 1 段だけ戻す。コンテナページなら `close_fullscreen` を直接呼んで
+    /// L2 ページ一覧へ (設定で分岐しない)。
+    pub(crate) close_to_page_list: bool,
     pub(crate) nav_delta: i32,
     pub(crate) ctrl_nav: Option<i32>,
     pub(crate) sibling_nav: Option<i32>,
@@ -1748,6 +1753,7 @@ impl App {
         let state = self.prepare_fullscreen_state(ctx, fs_idx);
 
         let mut close_fs = false;
+        let mut close_to_page_list = false;
         let mut nav_delta: i32 = 0;
         let mut ctrl_nav: Option<i32> = None;
         let mut sibling_nav: Option<i32> = None;
@@ -1895,6 +1901,7 @@ impl App {
                         }
                         let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
                         if key_action.close { close_fs = true; }
+                        if key_action.close_to_page_list { close_to_page_list = true; }
                         nav_delta = key_action.nav_delta;
                         ctrl_nav = key_action.ctrl_nav;
                         sibling_nav = key_action.sibling_nav;
@@ -2846,6 +2853,7 @@ impl App {
         self.handle_fs_navigation(
             ctx,
             close_fs,
+            close_to_page_list,
             ctrl_nav,
             sibling_nav,
             nav_delta,
@@ -3484,13 +3492,14 @@ impl App {
             self.bump_input_seq("fs_root_ctrl_nav", None);
         } else if key_action.sibling_nav.is_some() {
             self.bump_input_seq("fs_root_sibling_nav", None);
-        } else if key_action.close {
+        } else if key_action.close || key_action.close_to_page_list {
             self.bump_input_seq("fs_root_close_key", None);
         }
 
         self.handle_fs_navigation(
             ctx,
             key_action.close,
+            key_action.close_to_page_list,
             key_action.ctrl_nav,
             key_action.sibling_nav,
             key_action.nav_delta,
@@ -3515,6 +3524,7 @@ impl App {
         let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         let mut action = FsKeyAction {
             close: false,
+            close_to_page_list: false,
             nav_delta: 0,
             ctrl_nav: None,
             sibling_nav: None,
@@ -4208,18 +4218,20 @@ impl App {
         } else if esc {
             action.close = true;
         }
-        // 自動オープン ZIP/PDF をフルスクリーンで開いている場合の BS = コンテナのページ一覧
-        // (L2) へ戻る。フルスクリーンは別ビューポートで grid 側の BS ハンドラ (親フォルダ移動)
-        // は抑止されるため、ここで plain BS を処理する。fs_zip_auto_opened を先に解除してから
-        // close すると、handle_fullscreen_close_request が (flag=false なので) 親復帰ではなく素の
-        // close_fullscreen を呼び、current_folder=ZIP/PDF のままページ一覧 (L2) が出る。
-        // Esc/Enter (flag 立ったまま) が L1 親へ戻るのと対をなす。Ctrl+BS (個別補正解除) は
-        // Modifiers::NONE 限定なので影響しない。
-        if self.fs_zip_auto_opened
+        // BS = 階層を 1 段だけ戻す。ZIP/PDF ページを見ているとき (current_folder がコンテナ)
+        // は、設定に関係なく常にコンテナのページ一覧 (L2) へ戻る (= close_fullscreen を直接呼ぶ。
+        // current_folder は ZIP/PDF のままなので L2 が出る)。Esc/Enter が設定で L1/L2 に分岐する
+        // のと違い、BS は分岐しない。フルスクリーンは別ビューポートで grid 側の BS ハンドラ
+        // (親フォルダ移動) は抑止されるため、ここで plain BS を処理する。Ctrl+BS (個別補正解除)
+        // は Modifiers::NONE 限定なので影響しない。通常画像 (非コンテナ) では BS は未処理。
+        let viewing_container_page = self
+            .current_folder
+            .as_deref()
+            .is_some_and(crate::folder_tree::is_virtual_folder);
+        if viewing_container_page
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace))
         {
-            self.fs_zip_auto_opened = false;
-            action.close = true;
+            action.close_to_page_list = true;
         }
         // 見開きダブル表示中は I/Z/R/L を無効化
         if key_i && !is_spread_double {
@@ -5397,6 +5409,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         close_fs: bool,
+        close_to_page_list: bool,
         ctrl_nav: Option<i32>,
         sibling_nav: Option<i32>,
         nav_delta: i32,
@@ -5410,12 +5423,19 @@ impl App {
             // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、偶発的な
             // input/focus repaint に頼らず明示的に次フレームを起こす。
             ctx.request_repaint();
+        } else if close_to_page_list {
+            // BS: 階層を 1 段戻す = コンテナのページ一覧 (L2) へ。close_fullscreen は
+            // current_folder=ZIP/PDF のまま閉じるので L2 が出る (設定で分岐しない)。
+            self.close_fullscreen();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
         }
         // fast-swap (動画タイル / native 動画) が進行中なら、swap 機構側が
         // 表示遷移を完結させるので、handle_fs_navigation 経由の通常 nav 経路は
         // 二重発火を避けるため早期 return する。
         #[cfg(windows)]
         if !close_fs
+            && !close_to_page_list
             && (self.video_tile_swap_pending.is_some()
                 || self.native_video_fast_swap_pending.is_some())
         {

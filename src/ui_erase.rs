@@ -471,6 +471,7 @@ impl App {
     pub(crate) fn handle_erase_keys(&mut self, ctx: &egui::Context, fs_idx: usize) -> FsKeyAction {
         let action = FsKeyAction {
             close: false,
+            close_to_page_list: false,
             nav_delta: 0,
             ctrl_nav: None,
             sibling_nav: None,

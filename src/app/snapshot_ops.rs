@@ -827,7 +827,6 @@ impl App {
             self.fs_nav_after_pdf_enumerate = Some(crate::app::DeferredFsReopen {
                 resume_slideshow,
                 target,
-                auto_opened_container: false,
                 resume_to_last_page: false,
             });
             return;

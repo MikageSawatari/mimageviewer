@@ -87,24 +87,35 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 - グリッド側の open (`ui_main` ダブルクリック / `handle_keyboard` Enter) で
   `pending_auto_fs_open` を立てる (ZipFile/PdfFile のみ。Folder は対象外)。
 - `load_zip_as_folder` / `load_pdf_as_folder` がこれを `mem::take` し、enumerate 完了で
-  先頭画像を開く既存の遅延機構 `fs_nav_after_pdf_enumerate`
-  (`DeferredFsReopen { auto_opened_container: true }`) に載せ替える。Ctrl+↑↓ フォルダ
-  ナビと同じ consume 経路 (`finalize_zip_enumerate` / `poll_pdf_enumerate`) で
-  `find_fullscreen_nav_target_filtered` が先頭ページを開く。
-- 開いた時点で `fs_zip_auto_opened = true`。これにより**入口と対称な出口**にする:
-  - <kbd>Esc</kbd> / <kbd>Enter</kbd> → 親フォルダ一覧 (L1) へ直帰
-    (`handle_fullscreen_close_request` が `pending_return_to_parent` を立て、次フレームの
-    `handle_keyboard` が `AddressBarNav::Direct(parent)` を発行。L2 を 1 フレームも見せない)。
-  - <kbd>Backspace</kbd> → そのコンテナのページ一覧 (L2) を表示 (= `close_fullscreen` のみ)。
-- `close_fullscreen` で `fs_zip_auto_opened` をクリア。
-- **Ctrl+↑↓ フォルダナビで ZIP/PDF コンテナへ移っても自動オープン扱いにする** (連続読書)。
-  `reopen_fullscreen_after_folder_nav_load` が `auto_open_for_current_container()`
-  (= 設定 ON & `current_folder` が ZIP/PDF & 非検索) を見て deferred の
-  `auto_opened_container` を立てる。folder_tree DFS は ZIP/PDF ファイルを個別に訪問する
-  ので、本→次の本 (sibling ZIP/PDF) や「loose 画像なしフォルダ → 先頭 ZIP を仮想展開」
-  のどちらの経路でも、移動先が ZIP/PDF なら次の本も Esc→親一覧 / Backspace→ページ一覧 に
-  なる。loose 画像の通常フォルダへ移った場合は (コンテナでないので) 通常の出口に戻る。
-  検索 (Ctrl+S/G) 中は Esc が検索を抜ける想定外を避けるため適用しない。
+  先頭画像を開く既存の遅延機構 `fs_nav_after_pdf_enumerate` (`DeferredFsReopen`) に
+  載せ替える。Ctrl+↑↓ フォルダナビと同じ consume 経路 (`finalize_zip_enumerate` /
+  `poll_pdf_enumerate`) で `find_fullscreen_nav_target_filtered` が先頭ページを開く。
+
+### 退出ルーティング = 「設定で固定分岐」(一時フラグなし)
+
+「どう入ったか」を覚える一時フラグ (旧 `fs_zip_auto_opened` / `auto_opened_container`) は
+**廃止**。階層 (L1 ファイル一覧 > L2 ページ一覧 > フルスクリーン) の概念は変えず、
+モードB はあくまで **L2 を飛ばすショートカット**として扱う。判定は設定
+`auto_fullscreen_zip_pdf` と「いまコンテナ (ZIP/PDF) の中か」だけ。
+
+- **分岐するのは 2 箇所だけ:**
+  1. **L1 でファイルを開く** (Enter/ダブルクリック): モードA → L2 ページ一覧 / モードB →
+     フルスクリーン (L2 スキップ)。
+  2. **フルスクリーンで <kbd>Esc</kbd> / <kbd>Enter</kbd> / 右クリック**
+     (`handle_fullscreen_close_request`): `auto_open_for_current_container()`
+     (= 設定B & `current_folder` が ZIP/PDF & 非検索) が真なら親一覧 (L1) へ直帰
+     (`pending_return_to_parent` を立て、次フレームの `handle_keyboard` が
+     `AddressBarNav::Direct(parent)` を発行。L2 を 1 フレームも見せない)。偽なら 1 段だけ
+     `close_fullscreen` (モードA のコンテナ → L2、通常画像 → 親グリッド)。
+- **<kbd>Backspace</kbd> は両モード共通で階層を 1 段戻す** (分岐なし):
+  - フルスクリーン (ZIP/PDF ページ) → L2 ページ一覧 (`FsKeyAction.close_to_page_list` →
+    `close_fullscreen`。`current_folder` がコンテナのまま閉じるので L2 が出る)。
+  - L2 ページ一覧 → L1 (通常の grid BS = 親フォルダ)。
+- **Ctrl+↑↓ フォルダナビで ZIP/PDF コンテナへ移っても**、退出は同じく設定で決まる
+  (連続読書)。`reopen_fullscreen_after_folder_nav_load` はフラグを立てる必要がなく、
+  移動先が ZIP/PDF なら次の本も Esc→親一覧 / Backspace→ページ一覧 になる。loose 画像の
+  通常フォルダへ移った場合は (コンテナでないので) 通常の出口に戻る。検索 (Ctrl+S/G) 中は
+  Esc が検索を抜ける想定外を避けるため `auto_open_for_current_container()` が偽になり適用しない。
 
 ---
 

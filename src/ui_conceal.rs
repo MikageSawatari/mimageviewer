@@ -464,6 +464,7 @@ impl App {
     ) -> FsKeyAction {
         let action = FsKeyAction {
             close: false,
+            close_to_page_list: false,
             nav_delta: 0,
             ctrl_nav: None,
             sibling_nav: None,

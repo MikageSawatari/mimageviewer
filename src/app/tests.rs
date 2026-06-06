@@ -3801,19 +3801,24 @@ mod favorite_adjustment_defaults_tests {
         assert!(spread_content_union(None, None, 100.0, 100.0, 200.0).is_none());
     }
 
-    /// 自動オープン ZIP/PDF からのフルスクリーン close 要求は、その場で閉じず
-    /// 「親フォルダへ戻る」予約を立てる (= L2 ページ一覧を見せずに L1 へ抜けるため)。
+    /// モードB「ページをフルスクリーン表示」(auto_fullscreen_zip_pdf=true) で ZIP/PDF ページを
+    /// 見ているときの close 要求 (Esc/Enter/右クリック) は、その場で閉じず「親フォルダ (L1) へ
+    /// 戻る」予約を立てる (= L2 ページ一覧を見せずに L1 へ抜ける、"ESC 2 回分")。判定は設定 +
+    /// コンテナ内かのみ (一時フラグ廃止)。
     #[test]
-    fn auto_opened_close_request_defers_to_parent() {
+    fn mode_b_container_close_request_defers_to_parent() {
         let mut app = setup_app();
         app.fullscreen_idx = Some(0);
-        app.fs_zip_auto_opened = true;
+        app.settings.auto_fullscreen_zip_pdf = true; // モードB
+        app.current_folder = Some(std::path::PathBuf::from("c:/manga/book.zip")); // コンテナページ
         app.pending_return_to_parent = false;
 
         app.handle_fullscreen_close_request();
 
-        assert!(app.pending_return_to_parent, "親へ戻る予約が立つ");
-        assert!(!app.fs_zip_auto_opened, "フラグは消費される");
+        assert!(
+            app.pending_return_to_parent,
+            "モードB+コンテナは親 (L1) へ戻る予約"
+        );
         assert_eq!(
             app.fullscreen_idx,
             Some(0),
@@ -3821,31 +3826,34 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
-    /// 通常 (自動オープンでない) のフルスクリーン close 要求は即座に閉じる。
+    /// モードA (設定OFF) / 通常フォルダ (非コンテナ) の close 要求は即座に閉じる
+    /// (= 1 段だけ戻る: コンテナなら L2 ページ一覧、通常画像なら親グリッド)。
     #[test]
-    fn normal_close_request_closes_immediately() {
+    fn mode_a_or_non_container_close_request_closes_immediately() {
+        // モードA (設定OFF) でコンテナページ → 即 close (= L2 ページ一覧)。
         let mut app = setup_app();
         app.fullscreen_idx = Some(0);
-        app.fs_zip_auto_opened = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.current_folder = Some(std::path::PathBuf::from("c:/manga/book.zip"));
         app.pending_return_to_parent = false;
-
         app.handle_fullscreen_close_request();
+        assert!(
+            !app.pending_return_to_parent,
+            "モードA は親復帰予約を立てない"
+        );
+        assert_eq!(app.fullscreen_idx, None, "その場で close");
 
-        assert!(!app.pending_return_to_parent, "親復帰予約は立たない");
-        assert_eq!(app.fullscreen_idx, None, "通常はその場で close");
-    }
-
-    /// `close_fullscreen` は自動オープンフラグをクリアする。
-    #[test]
-    fn close_fullscreen_clears_auto_opened_flag() {
-        let mut app = setup_app();
+        // 設定ON でも通常フォルダ (非コンテナ) → 即 close (= 親グリッド)。
         app.fullscreen_idx = Some(0);
-        app.fs_zip_auto_opened = true;
-
-        app.close_fullscreen();
-
-        assert!(!app.fs_zip_auto_opened);
-        assert_eq!(app.fullscreen_idx, None);
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.current_folder = Some(std::path::PathBuf::from("c:/manga/series"));
+        app.pending_return_to_parent = false;
+        app.handle_fullscreen_close_request();
+        assert!(
+            !app.pending_return_to_parent,
+            "非コンテナは親復帰予約を立てない"
+        );
+        assert_eq!(app.fullscreen_idx, None, "その場で close");
     }
 
     /// Ctrl+↑↓ フォルダナビ用 `auto_open_for_current_container` のゲート判定。
@@ -5118,7 +5126,6 @@ mod favorite_adjustment_defaults_tests {
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
             resume_slideshow: false,
             target: None,
-            auto_opened_container: false,
             resume_to_last_page: false,
         });
 
