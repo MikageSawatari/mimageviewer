@@ -158,6 +158,34 @@ fn border_margin_fraction(lum: &[u8], w: usize, h: usize, margin: u8, tol: u8) -
     }
 }
 
+/// 紙白寄り (luma >= MARGIN_PAPER_LIGHT_MIN) のサンプルの割合。
+fn light_fraction(samples: impl Iterator<Item = u8>) -> f32 {
+    let mut total = 0usize;
+    let mut light = 0usize;
+    for v in samples {
+        total += 1;
+        if v >= MARGIN_PAPER_LIGHT_MIN {
+            light += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        light as f32 / total as f32
+    }
+}
+
+/// 上下左右いずれかの縁 (1px ライン) が紙白寄りで過半 (60%) を占めるか。
+/// 「ベタ黒余白」と推定したのに別の辺が真っ白なら、黒い絵が縁の過半を占めて black margin と
+/// 誤推定し本物の白余白側を中身扱いしている疑い (反転) の検出に使う。
+fn any_border_side_is_light(lum: &[u8], w: usize, h: usize) -> bool {
+    const T: f32 = 0.60;
+    light_fraction((0..w).map(|x| lum[x])) >= T // top
+        || light_fraction((0..w).map(|x| lum[(h - 1) * w + x])) >= T // bottom
+        || light_fraction((0..h).map(|y| lum[y * w])) >= T // left
+        || light_fraction((0..h).map(|y| lum[y * w + (w - 1)])) >= T // right
+}
+
 /// 中身マスクを 8 連結でラベリングし、面積 `min_area` 以上の成分の bbox の union を返す。
 /// (minx, miny, maxx, maxy) inclusive。該当成分が無ければ `None`。
 fn union_bbox_of_large_components(
@@ -229,6 +257,12 @@ pub fn detect_content_bbox(img: &ColorImage, tol: u8) -> Option<Rect> {
     let margin = border_median_luma(&lum, w, h);
     // 余白色が中間調 = 絵を余白と誤推定している疑い → 切らない (反転して絵を切る事故を防ぐ)。
     if margin > MARGIN_PAPER_DARK_MAX && margin < MARGIN_PAPER_LIGHT_MIN {
+        return None;
+    }
+    // 余白色が暗い (ベタ黒余白) 推定なのに、いずれかの縁が真っ白なら、黒い絵が縁の過半を
+    // 占めて black margin と誤推定し本物の白余白側を中身扱いしている疑い → 切らない。
+    // (正当な全周ベタ黒余白はどの縁も白くないので通る。Codex P2 対応)
+    if margin <= MARGIN_PAPER_DARK_MAX && any_border_side_is_light(&lum, w, h) {
         return None;
     }
     // 縁が余白で埋まっていない = フルブリード扱い → 切らない。
@@ -517,6 +551,19 @@ mod tests {
         assert!(
             detect_content_bbox(&img, DEFAULT_TOLERANCE).is_none(),
             "中間調が余白色なら切らない (絵を切る反転を防ぐ)"
+        );
+    }
+
+    #[test]
+    fn black_art_bleed_with_white_margin_is_not_cut() {
+        // ベタ黒の絵が左/上/下の縁まで来て、右だけ白い余白。median はベタ黒 (<=50) になり
+        // 中間調ガードをすり抜けるが、右の縁が真っ白なので反転検出 (any_border_side_is_light)
+        // で None にし、黒い絵を切らない。
+        let mut img = white(100, 100);
+        fill(&mut img, 0, 0, 92, 100, Color32::BLACK); // 左 92% ベタ黒 (絵)、右 8% 白余白
+        assert!(
+            detect_content_bbox(&img, DEFAULT_TOLERANCE).is_none(),
+            "黒絵3辺ブリード+白余白は反転検出で切らない"
         );
     }
 
