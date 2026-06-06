@@ -3742,6 +3742,43 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// 見開きの余白カット: 左右ページの content を combined 空間で union する。
+    #[test]
+    fn spread_content_union_combines_both_pages() {
+        use crate::ui_fullscreen::spread_content_union;
+        use egui::{Rect, pos2};
+        let left = Some(Rect::from_min_max(pos2(0.1, 0.2), pos2(0.8, 0.9)));
+        let right = Some(Rect::from_min_max(pos2(0.0, 0.1), pos2(0.9, 1.0)));
+        // left_w=100, right_w=120, combined_h=200。
+        let (x0, y0, x1, y1) = spread_content_union(left, right, 100.0, 120.0, 200.0).unwrap();
+        // 左 x[10,80] 右 x[100,208] → union [10,208]。y 左[40,180] 右[20,200] → [20,200]。
+        assert!((x0 - 10.0).abs() < 1e-3, "x0 {x0}");
+        assert!((x1 - 208.0).abs() < 1e-3, "x1 {x1}");
+        assert!((y0 - 20.0).abs() < 1e-3, "y0 {y0}");
+        assert!((y1 - 200.0).abs() < 1e-3, "y1 {y1}");
+    }
+
+    /// bbox 無しのページは全域扱い (余白を切らない) で union される。
+    #[test]
+    fn spread_content_union_none_page_uses_full_region() {
+        use crate::ui_fullscreen::spread_content_union;
+        use egui::{Rect, pos2};
+        let left = Some(Rect::from_min_max(pos2(0.2, 0.2), pos2(0.7, 0.8)));
+        // 右は None → 右ページ全域 (x[100,200], y[0,200])。
+        let (x0, y0, x1, y1) = spread_content_union(left, None, 100.0, 100.0, 200.0).unwrap();
+        assert!((x0 - 20.0).abs() < 1e-3, "x0 {x0}");
+        assert!((x1 - 200.0).abs() < 1e-3, "x1 {x1}");
+        assert!((y0 - 0.0).abs() < 1e-3, "y0 {y0}");
+        assert!((y1 - 200.0).abs() < 1e-3, "y1 {y1}");
+    }
+
+    /// 両方 None なら余白カット無効 (None)。
+    #[test]
+    fn spread_content_union_both_none_returns_none() {
+        use crate::ui_fullscreen::spread_content_union;
+        assert!(spread_content_union(None, None, 100.0, 100.0, 200.0).is_none());
+    }
+
     /// 自動オープン ZIP/PDF からのフルスクリーン close 要求は、その場で閉じず
     /// 「親フォルダへ戻る」予約を立てる (= L2 ページ一覧を見せずに L1 へ抜けるため)。
     #[test]

@@ -417,7 +417,13 @@ AI/エクスポートには無影響。
 (枠外へ伸びる線は本文と連結するので残る)、
 (5) 残った成分の union bbox にセーフティパッドを足す。
 縁が余白で埋まっていない (フルブリード) / トリム量が極小 のときは `None` で通常フィットへ
-フォールバック (= 迷ったら切らない)。現状は単ページのみ (見開き `draw_fs_spread` は未対応)。
+フォールバック (= 迷ったら切らない)。
+
+**見開き (`draw_fs_spread`)** でも有効: 左右各ページの content bbox を `spread_content_union`
+で combined 空間 (左ページ x∈[0,left_w] / 右ページ x∈[left_w,left_w+right_w]) に写像して
+union を取り、セット全体の外周余白を詰める (bbox 無しのページは全域扱い=切らない)。
+`fit_scale` を union 基準にし、union 中心を画面中心へ寄せる。どちらかが回転していれば
+通常フィットにフォールバック。
 
 Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread_pair` で左右の idx と配置
 (LTR/RTL/Cover) を決め、両ページを「1 枚の合成画像」とみなしてレイアウトする:

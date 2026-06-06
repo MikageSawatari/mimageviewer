@@ -1350,6 +1350,43 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
         .collect()
 }
 
+/// 見開きの左右ページの content bbox (各ページ正規化座標 0..1) を combined 空間
+/// (幅 `left_w + right_w` × 高さ `combined_h`、左ページが x∈[0,left_w]、右ページが
+/// x∈[left_w, left_w+right_w]) に写像し、union を取って返す。両方 `None` のときは
+/// `None` (= 余白カット無効)。bbox 無しのページは全域 (余白を切らない) 扱い。
+/// 返り値 `(x0, y0, x1, y1)` は combined 空間の矩形。
+pub(crate) fn spread_content_union(
+    margin_left: Option<egui::Rect>,
+    margin_right: Option<egui::Rect>,
+    left_w: f32,
+    right_w: f32,
+    combined_h: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    if margin_left.is_none() && margin_right.is_none() {
+        return None;
+    }
+    let combined_w = left_w + right_w;
+    let (lx0, ly0, lx1, ly1) = match margin_left {
+        Some(b) => (
+            b.min.x * left_w,
+            b.min.y * combined_h,
+            b.max.x * left_w,
+            b.max.y * combined_h,
+        ),
+        None => (0.0, 0.0, left_w, combined_h),
+    };
+    let (rx0, ry0, rx1, ry1) = match margin_right {
+        Some(b) => (
+            left_w + b.min.x * right_w,
+            b.min.y * combined_h,
+            left_w + b.max.x * right_w,
+            b.max.y * combined_h,
+        ),
+        None => (left_w, 0.0, combined_w, combined_h),
+    };
+    Some((lx0.min(rx0), ly0.min(ry0), lx1.max(rx1), ly1.max(ry1)))
+}
+
 /// 指定インデックスの画像が横長（幅>高さ）かを判定する。
 /// テクスチャサイズが不明な場合は false（縦長として扱う）。
 fn is_landscape(
@@ -7278,6 +7315,19 @@ impl App {
         let zoom_pan = self.fs_zoom_pan();
         let left_rot = self.get_rotation(left_idx);
         let right_rot = self.get_rotation(right_idx);
+        // 余白カットフィット (見開き): 各ページの content bbox を取得し、後で左右セットの
+        // union をフィットさせる。回転ページは対象外 (single 同様)。`fs_margin_bbox` は
+        // &mut self なので bg_style の借用より前に算出しておく。
+        let margin_left = if left_rot.is_none() {
+            self.fs_margin_bbox(left_idx)
+        } else {
+            None
+        };
+        let margin_right = if right_rot.is_none() {
+            self.fs_margin_bbox(right_idx)
+        } else {
+            None
+        };
         // 各ページが読込中ブランチに落ちたときに出すパス。steady state では空文字列になり
         // `draw_centered_elided_label` が描画をスキップするので無駄な String 化を避ける。
         let left_location = self.location_display_for_loading(left_idx);
@@ -7328,13 +7378,37 @@ impl App {
 
             let combined_w = left_w + right_w;
 
-            // 画面にフィットするスケール
-            let fit_scale = (image_rect.width() / combined_w).min(image_rect.height() / combined_h);
+            // 余白カットフィット: 左右ページの content 矩形を combined 空間に写像して union を
+            // 取り、セット全体の外周余白を詰める (回転なし & 設定 ON & どちらかに bbox あり)。
+            let content = if self.settings.margin_fit_enabled {
+                spread_content_union(margin_left, margin_right, left_w, right_w, combined_h)
+            } else {
+                None
+            };
 
-            let (total_scale, center) = match zoom_pan {
+            // フィット基準: content (余白カット) があればその幅高さ、無ければ combined 全体。
+            let (fit_w, fit_h, content_center) = match content {
+                Some((cx0, cy0, cx1, cy1)) => (
+                    (cx1 - cx0).max(1.0),
+                    (cy1 - cy0).max(1.0),
+                    egui::vec2((cx0 + cx1) * 0.5, (cy0 + cy1) * 0.5),
+                ),
+                None => (
+                    combined_w,
+                    combined_h,
+                    egui::vec2(combined_w * 0.5, combined_h * 0.5),
+                ),
+            };
+            let fit_scale = (image_rect.width() / fit_w).min(image_rect.height() / fit_h);
+
+            let (total_scale, base_center) = match zoom_pan {
                 Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
                 None => (fit_scale, image_rect.center()),
             };
+            // content (= 余白カット後の中身) の中心を画面中心へ寄せる。
+            // content_center=combined 中心のとき (余白カット無効) は従来どおり 0 ずれ。
+            let combined_center = egui::vec2(combined_w * 0.5, combined_h * 0.5);
+            let center = base_center - (content_center - combined_center) * total_scale;
 
             let scaled_lw = left_w * total_scale;
             let scaled_rw = right_w * total_scale;
