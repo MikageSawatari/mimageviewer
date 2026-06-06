@@ -1285,29 +1285,10 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
             ui.label(crate::settings::format_video_volume_db(s.video_volume));
         });
 
+        // 再生位置レジューム (続き/先頭の切替・位置クリア) は「位置の復元」ページに集約。
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(8.0);
-
-        ui.label(egui::RichText::new("レジューム再生").strong());
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(
-                "「続きから / 最初から」の切り替えは、左の「位置の復元」ページにまとめています\n\
-                 (動画・ZIP/PDF × 一覧から開く・Ctrl+↑↓ 移動)。",
-            )
-            .size(11.0)
-            .color(egui::Color32::from_gray(150)),
-        );
-        ui.add_space(6.0);
-        let count = s.video_resume_positions.len();
-        ui.label(format!(
-            "現在 {count} 件の動画について再生位置を記憶しています。\n\
-         3 秒以上再生・かつ末尾 5 秒以内に到達していない場合のみ保存されます。"
-        ));
-        if count > 0 && ui.button("すべての再生位置をクリア").clicked() {
-            s.video_resume_positions.clear();
-        }
     }
 
     draw_audio_normalize_cache_controls(ui, state);
@@ -2263,6 +2244,40 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
         .size(11.0)
         .color(egui::Color32::from_gray(150)),
     );
+
+    // ── 保存済み位置の管理 (記憶件数の確認 + クリア) ──
+    // s (= &mut state.settings) の借用は上の書き戻しで終わるので、以降は state を直接使う。
+    ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("保存済み位置の管理").strong());
+    ui.add_space(4.0);
+
+    // 動画 (再生位置は settings 内の HashMap。クリアは OK 適用時に反映)。
+    let video_count = state.settings.video_resume_positions.len();
+    ui.label(format!(
+        "動画の再生位置: {video_count} 件を記憶 (3 秒以上再生・末尾 5 秒以内に未到達のときのみ保存)。"
+    ));
+    if video_count > 0 && ui.button("動画の再生位置をすべてクリア").clicked() {
+        state.settings.video_resume_positions.clear();
+    }
+
+    ui.add_space(8.0);
+
+    // ZIP/PDF (読書位置は専用 DB。クリアは App 側で即時実行)。
+    let book_count = state.book_resume_entry_count;
+    ui.label(format!("ZIP/PDF (本) の読書位置: {book_count} 件を記憶。"));
+    if book_count > 0 && ui.button("ZIP/PDF の読書位置をすべてクリア").clicked() {
+        state.book_resume_clear_requested = true;
+    }
+    if let Some(msg) = &state.book_resume_clear_result {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(msg)
+                .size(11.0)
+                .color(egui::Color32::from_gray(150)),
+        );
+    }
 }
 
 pub(super) fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {

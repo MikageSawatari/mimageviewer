@@ -247,6 +247,14 @@ pub(crate) struct PreferencesState {
     /// 直近の音量ノーマライズ測定値削除結果。
     pub audio_normalize_clear_result: Option<String>,
 
+    // ── 位置の復元ページ用 ─────────────────────────────────────
+    /// 環境設定を開いた時点 / 削除後の ZIP/PDF 読書位置の記憶件数。
+    pub book_resume_entry_count: usize,
+    /// ZIP/PDF 読書位置クリアを App 側へ伝える one-shot フラグ。
+    pub book_resume_clear_requested: bool,
+    /// 直近の ZIP/PDF 読書位置削除結果。
+    pub book_resume_clear_result: Option<String>,
+
     // ── AI バックエンド ページ用のキャッシュ ────────────────────
     /// プライマリ GPU のベンダー (NVIDIA でなければ TRT は disabled に)
     pub gpu_vendor: Option<crate::gpu_info::GpuVendor>,
@@ -332,6 +340,7 @@ impl PreferencesState {
         ai_runtime: Option<&crate::ai::runtime::AiRuntime>,
         audio_normalize_db_available: bool,
         audio_normalize_entry_count: usize,
+        book_resume_entry_count: usize,
     ) -> Self {
         let manual_threads = match &s.parallelism {
             Parallelism::Manual(n) => *n,
@@ -410,6 +419,9 @@ impl PreferencesState {
             audio_normalize_clear_confirm_open: false,
             audio_normalize_clear_requested: false,
             audio_normalize_clear_result: None,
+            book_resume_entry_count,
+            book_resume_clear_requested: false,
+            book_resume_clear_result: None,
             gpu_vendor,
             trt_worker_active,
             current_runtime_fallback_reason,
@@ -488,6 +500,10 @@ impl App {
                 self.ai_runtime.as_deref(),
                 self.audio_normalize_db.is_some(),
                 self.audio_normalize_db
+                    .as_ref()
+                    .map(|db| db.count())
+                    .unwrap_or(0),
+                self.book_resume_db
                     .as_ref()
                     .map(|db| db.count())
                     .unwrap_or(0),
@@ -800,6 +816,42 @@ impl App {
                     Err(err) => {
                         ps.audio_normalize_clear_result =
                             Some(format!("音量ノーマライズ測定値の削除に失敗しました: {err}"));
+                    }
+                }
+            }
+        }
+
+        // 位置の復元ページ: ZIP/PDF 読書位置クリア (one-shot)。
+        let mut clear_book_resume_requested = false;
+        if let Some(ps) = self.pref_state.as_mut() {
+            if ps.book_resume_clear_requested {
+                ps.book_resume_clear_requested = false;
+                clear_book_resume_requested = true;
+            }
+        }
+        if clear_book_resume_requested {
+            let result = match self.book_resume_db.as_ref() {
+                Some(db) => match db.clear_all() {
+                    Ok(deleted) => {
+                        crate::logger::log(format!(
+                            "[book_resume] cleared {deleted} reading positions"
+                        ));
+                        Ok((deleted, db.count()))
+                    }
+                    Err(e) => Err(format!("{e}")),
+                },
+                None => Err("読書位置 DB を開けませんでした".to_string()),
+            };
+            if let Some(ps) = self.pref_state.as_mut() {
+                match result {
+                    Ok((deleted, remaining)) => {
+                        ps.book_resume_entry_count = remaining;
+                        ps.book_resume_clear_result =
+                            Some(format!("ZIP/PDF の読書位置を {deleted} 件削除しました。"));
+                    }
+                    Err(err) => {
+                        ps.book_resume_clear_result =
+                            Some(format!("読書位置の削除に失敗しました: {err}"));
                     }
                 }
             }
