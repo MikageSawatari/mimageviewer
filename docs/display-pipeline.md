@@ -404,11 +404,20 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 **余白カットフィット** (`settings.margin_fit_enabled`、ホバーバーのボタンでトグル) が ON
 かつ rotation/フリー回転なしのとき、ステップ 6 のフィットを「画像全体」ではなく
 「中身の bbox」基準にする。`fs_margin_bbox`(idx) が `margin_fit::detect_content_bbox` で
-白/黒一様余白の bounding box (正規化座標) を検出してキャッシュ (`fs_margin_bbox_cache`、
+中身の bounding box (正規化座標) を検出してキャッシュ (`fs_margin_bbox_cache`、
 `fs_cache` と同じタイミングでクリア) し、`draw_fs_image` が `fit_scale` を bbox サイズで
 求めて中心を bbox 中心へ寄せる (= 余白分ズームイン)。**ピクセルは一切変えない**ので補正/
-AI/エクスポートには無影響。余白が一様でない (四隅が不揃い) 画像は `None` を返して通常
-フィットにフォールバックする。現状は単ページのみ (見開き `draw_fs_spread` は非対応)。
+AI/エクスポートには無影響。
+
+検出は「全部映る」優先の頑健化版 ([margin_fit.rs](../src/margin_fit.rs)):
+(1) 検出用に長辺 ~1000px へ面積平均で縮小 (サブピクセルのゴミを潰し線は残す)、
+(2) 余白色を縁ピクセルの median で推定 (四隅 1 点ではないので糊汚れ・勾配に強い)、
+(3) 広めの luma 許容で色味差を無視、
+(4) 中身マスクを 8 連結ラベリングし面積が小さい孤立塊 (点/ゴミ) を捨てて線・文字は残す
+(枠外へ伸びる線は本文と連結するので残る)、
+(5) 残った成分の union bbox にセーフティパッドを足す。
+縁が余白で埋まっていない (フルブリード) / トリム量が極小 のときは `None` で通常フィットへ
+フォールバック (= 迷ったら切らない)。現状は単ページのみ (見開き `draw_fs_spread` は未対応)。
 
 Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread_pair` で左右の idx と配置
 (LTR/RTL/Cover) を決め、両ページを「1 枚の合成画像」とみなしてレイアウトする:
