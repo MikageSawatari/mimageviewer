@@ -66,6 +66,51 @@
 
 ---
 
+## 追加発見（2 回目の実機 FB + Codex 監査 2026-06-07）
+
+### ✅ B9. 左右パネル上のホイールで画像がズーム (`e154a963`)
+- 原因: handle_fs_wheel_and_click の cursor_in_panel がテキストモードの左右パネルを未判定。
+- 修正: text mode は image_rect==full_rect なので text_panel_rect(full_rect)/
+  text_detail_panel_rect(full_rect) を cursor_in_panel に追加。パネル上ホイールは一覧スクロールへ。
+
+### ✅ C1. 保存/コピー/比較に注釈(comic)が焼かれない (`98da4e7b`) [Codex P0]
+- prepare_capture_pixel_job を comic_composited_pixels_for_export→素 composite fallback に。
+  Ctrl+E と同経路で「表示どおり保存/コピー/比較」。
+
+### ✅ C2. IME 確定 Enter (Codex も指摘) — B5 で対応済み (`f8ff6391`)
+- ラボの consume_ime_enter 相当を、本体はフルスクリーン closure 側 (viewport level) で実装。
+
+### ✅ C8. DL ダイアログ表示中のフルスクリーンキー漏れ (`98da4e7b`) [自Codex P2]
+- editing_addon_install_state を any_modal_dialog_open_for_fullscreen_keys / any_dialog_open に追加。
+
+### 💬 C3. ユーザー画像スタンプの持ち運び (要相談) [Codex P1]
+- 設計は「ダウンスケール RGBA を注釈データに埋め込み」だが、実装は StampSource::File(PathBuf) +
+  描画時 std::fs::read。フォルダ移動/別 PC/元削除でスタンプ欠落。
+- 対応 = データ形式変更 (comic.db/サイドカーに RGBA 埋め込み)。v1.1.0 未リリースなので破壊的可。中規模。
+
+### 💬 C4. 注釈付きページのグリッドバッジ未接続 (要相談) [Codex P1]
+- comic_db::load_comic_keys は存在するが呼び出し無し。消しゴム mask_pages 相当の comic 版が未実装。
+- 対応 = 起動/フォルダロード時に comic キー集合をロード→グリッド描画でバッジ。小〜中規模。
+
+### 💬 C5. 強縮小書き出しでテキストが甘い (要相談) [Codex P1 / 設計 D10]
+- 設計 D10 は「ダウンサンプル後に最終解像度で焼く」、実装は「ダウンサンプル前で焼く」。
+- 対応 = export ベイク経路の再構成。中規模。画質改善。
+
+### 💬 B8/C6. フォントのフォールバック廃止 (調査済み・方針相談) [Codex P2]
+- 現状: 既定 = システムフォント (Yu Gothic 等、同梱でない)。未ロードのパック/ユーザー
+  フォントはベイクで既定へフォールバック。オノマトペ追加は未導入時「システム既定で作成」
+  と警告しつつ許可。→ 後でパック導入すると見た目が変わる (ユーザー懸念)。
+- 方針候補: (a) 既定を同梱フォントに + パックフォントは導入後のみ選択可・フォールバック廃止、
+  (b) 実際に使ったフォントをオブジェクトに焼き付け、(c) その他。要ユーザー決定。
+
+### ℹ️ C7. UI スレッド同期 I/O (font 列挙/読込・stamp file read) [Codex P2]
+- 通常閲覧では回避設計だが、注釈付き画像/大スタンプで一瞬固まりうる。worker 化は要検討 (低優先)。
+
+### ℹ️ B4/C9. 結合の z 隣接条件 (仕様) [Codex P2]
+- ユーザー再テストで「重ねて前面に設定」すれば結合 OK と確認。多数オブジェクト時に効かないのは
+  「z 順で直下が mergeable な吹き出し」でないと結合しない仕様のため。改善 (最近接 mergeable
+  まで探索) は要検討。
+
 ## 進め方
 - P0 → P1 → P2 の順。各修正は pathspec commit（src/ui_text.rs 等）、退避ブランチ `comic-inc6` 維持。
 - まとまった単位で Codex レビュー。
