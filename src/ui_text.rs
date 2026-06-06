@@ -2732,10 +2732,16 @@ impl App {
             // テキストプリセットは全種の本文 TextBlock (Text / Bubble.text / Window.text) に
             // 反映する。常時表示セリフバーで吹き出し/窓にもテキストプリセットを当てられる
             // ようになったため、standalone Text だけ見ると取りこぼす (Codex P2)。
+            // 窓の場合、再適用で本文スタイルが実際に変わったら、ウィンドウプリセットが捉える
+            // 本文スタイルから乖離するのでウィンドウリンクも解除する (直接適用パスの
+            // text_style_diverged 判定と同じ規約。Codex P2 3rd)。
+            let mut window_text_changed = false;
             if let Some(tb) = o.text_block_mut() {
                 if tb.preset_link.as_deref() == Some(id) {
                     if let Some(p) = self.comic_text_presets.iter().find(|p| p.id == id) {
+                        let before = tb.clone();
                         p.apply_to(tb);
+                        window_text_changed = text_style_diverged(&before, tb);
                     }
                 }
             }
@@ -2751,6 +2757,9 @@ impl App {
                     if let Some(p) = self.comic_window_presets.iter().find(|p| p.id == id) {
                         p.apply_to(w);
                     }
+                }
+                AnnotationKind::MessageWindow(w) if window_text_changed => {
+                    w.style_preset_link = None;
                 }
                 _ => {}
             }
