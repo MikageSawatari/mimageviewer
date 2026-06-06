@@ -9360,9 +9360,15 @@ impl App {
         let basename = self
             .capture_basename_for_idx(idx)
             .ok_or_else(|| "このアイテムはキャプチャ保存できません".to_string())?;
-        let pixels = self
-            .ensure_final_composite_pixels(ctx, idx)
-            .ok_or_else(|| "最終合成の完了後に再実行してください".to_string())?;
+        // テキスト注釈 (comic) があれば最終 composite に焼き込んでから保存/コピー/比較する。
+        // 注釈が無ければ素の final composite。Ctrl+E export (export_page_pixels_for_idx) と
+        // 同じ経路にして「表示どおり保存/コピー/比較」する (Codex 監査 P0)。
+        let pixels = match self.comic_composited_pixels_for_export(ctx, idx) {
+            Some(p) => p,
+            None => self
+                .ensure_final_composite_pixels(ctx, idx)
+                .ok_or_else(|| "最終合成の完了後に再実行してください".to_string())?,
+        };
         let size = pixels.size;
         let mut job = crate::capture::CapturePixelJob::already_adjusted(basename, pixels);
         // crop は表示パイプラインでは適用しないので、最終段でここで切り出す。

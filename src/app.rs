@@ -6218,6 +6218,7 @@ impl App {
             || self.local_adjust_effect_picker_dialog_open
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
+            || self.editing_addon_install_state.is_some()
     }
 
     /// フルスクリーンのキー入力を止める必要があるモーダルダイアログ。
@@ -6245,6 +6246,10 @@ impl App {
             || self.local_adjust_effect_picker_dialog_open
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
+            // 編集用追加パック DL ダイアログ (フルスクリーンビューポートで描画)。表示中は
+            // フルスクリーンのキー (Enter で閉じる / Esc で選択解除・テキストモード退出 /
+            // 矢印ナビ) を止め、ダイアログ操作に集中させる (Codex 監査)。
+            || self.editing_addon_install_state.is_some()
     }
 
     /// ユーザー視点でのカレントフォルダ。変換済みアーカイブを開いているときは
