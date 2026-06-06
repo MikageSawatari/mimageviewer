@@ -111,6 +111,37 @@ activation zone 内なら HUD raise burst をエンキューする (= VST 手動
 ときに region を空に差し替える。HUD は穴のまま (= 不可視 / click-through) になり、preview / tile が
 消えるか mIV が前面へ戻れば次の publish で通常 region に戻る。動画切替・SwitchSource 自体は
 止めない (= 旧 presenter を閉じる normal open fallback の黒画面・背後ちらつきを再発させない)。
+**カーソル auto-hide と zero-delta `WM_MOUSEMOVE` (2026-06-06)**: navigation preview の全画面
+region 化は passive な source swap 表示なので、カーソルの auto-hide 状態を維持したい
+(= 動画→動画のキーナビ中はカーソルを隠したまま、マウス操作でだけ復帰させる、一般的な
+動画プレイヤーと同じ挙動)。ところが全画面 region 化で「カーソル下の window」が presenter HWND
+⇄ HUD HWND で切り替わると、OS は**位置不変 (zero-delta) の `WM_MOUSEMOVE`** を新しい window へ
+届ける。`cursor_polling_tick` の synthetic move も位置不変。さらにこの zero-delta move は
+3 つの ingress (overlay / HUD wndproc / App) のいずれでも「カーソル活動」と扱われうる。
+無条件に活動とみなすと、キー操作だけで auto-hide 済みカーソルが復活してしまう。対策は
+**「位置不変の move はどの ingress でもカーソルを復帰させない」** を 3 か所で徹底する:
+
+- **overlay (権威)**: `NativeEguiOverlay::push_native_event` の `MouseMove` は、`cursor_activity_pos`
+  (直近 client 座標、`MouseLeave` でクリアしない) と比較して**位置が実際に変わったときだけ**
+  `cursor_last_activity` をリセットする (純関数 `cursor_move_is_activity`)。`handle_window_events` は
+  forward 前に**全 native event**を `push_native_events` で処理するので、ここが活動判定の権威。
+  Button / Wheel は明確なユーザー意図なので無条件に活動扱い。
+- **HUD wndproc**: `WM_MOUSEMOVE` ではカーソルを復帰しない (move は zero-delta のことがあるため)。
+  実カーソル移動時の復帰は overlay ゲートが `cursor_hidden=false` にし、presenter の
+  `update_cursor_icon` が `SetCursor(IDC_ARROW)` を毎フレーム駆動する。render loop は
+  `sleep_until_message` (`MsgWaitForMultipleObjectsEx`/`QS_ALLINPUT`) で mouse message に即 wake する
+  ので復帰遅延は無い。`WM_MOUSEWHEEL` / `WM_*BUTTON*` だけは genuine なので即時復帰
+  (`restore_cursor_for_mouse_activity`)。`WM_SETCURSOR` は `LRESULT(1)` のみ (DefWindowProc の
+  クラスカーソル抑止、実アイコンは `update_cursor_icon` が駆動)。
+- **App**: `handle_native_video_window_event` の `MouseMove` は、forward された move の client 座標が
+  実際に変わったときだけ `mark_native_video_hud_activity` (= `player.mark_cursor_activity()` で
+  overlay を復帰させる) を呼ぶ。位置不変なら repaint のみ。これがないと overlay の位置ゲートを
+  バイパスしてカーソルが復活する。判定は overlay と同じ純関数 `cursor_move_is_activity` を
+  `self.cursor_hidden` 付きで使うので、クリックで入場して move を一度も転送していない (= 直近位置
+  None) 状態で auto-hide → キーナビした場合も復活しない (None かつ hidden は spurious 扱い)。
+
+この事象は fullscreen 限定 (HUD HWND + `cursor_polling_tick` + 全画面 region 化が fullscreen にしか
+無い) なので、window モードでは元から再現しない。
 
 **Z-order 再アサート (HUD raise burst)**:
 

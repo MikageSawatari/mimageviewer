@@ -4418,6 +4418,13 @@ pub struct App {
     /// Native fullscreen presenter 上の左クリック候補。overlay hit-test が入るまでの
     /// 暫定 transport 操作用で、drag と click を release 時に分ける。
     native_video_pointer_down: Option<NativeVideoPointerDown>,
+    #[cfg(windows)]
+    /// App へ転送された直近の native 動画 `MouseMove` の client 座標。実機修正
+    /// (2026-06-06): navigation preview の HUD 全画面化で OS が届ける zero-delta (位置不変)
+    /// move が `handle_native_video_window_event` の MouseMove → `mark_native_video_hud_activity`
+    /// を発火させると、overlay 側の位置ゲートをバイパスして auto-hide 済みカーソルが復活する。
+    /// 位置が実際に変わった move のときだけ hud activity を入れるためのゲート用。
+    native_video_last_move_client: Option<(i32, i32)>,
     /// ハング調査用: UI thread が最後に `App::update` を通過した時刻を通常ログへ残す。
     last_ui_heartbeat_log: std::time::Instant,
     /// 共有プレースメントスロット。UI スレッドが hide 時にセット、トレイスレッドが
@@ -5404,6 +5411,8 @@ impl App {
             pending_main_foreground_reclaim_force_at: None,
             #[cfg(windows)]
             native_video_pointer_down: None,
+            #[cfg(windows)]
+            native_video_last_move_client: None,
             last_ui_heartbeat_log: std::time::Instant::now(),
             placement_slot: None,
             activation_listener: None,

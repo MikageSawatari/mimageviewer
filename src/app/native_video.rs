@@ -1933,7 +1933,25 @@ impl App {
                 if mouse.x < 340 {
                     self.sync_native_video_timeline_markers(fs_idx);
                 }
-                self.mark_native_video_hud_activity(ctx);
+                // navigation preview の HUD 全画面化で OS が届ける zero-delta (位置不変) move では
+                // hud activity を入れない。`mark_native_video_hud_activity` は overlay の位置ゲートを
+                // バイパスして `player.mark_cursor_activity()` で auto-hide 済みカーソルを復活させて
+                // しまうため、**実際にカーソルが動いた move のときだけ** 呼ぶ (2026-06-06)。位置不変の
+                // ときは repaint だけ行う。直近位置不明 (None) の扱いは overlay と同じ純関数
+                // `cursor_move_is_activity` に委ねる: hidden 中の None は spurious とみなして抑制し、
+                // クリック入場 (= move 未転送) 直後の zero-delta nav でも復活しないようにする。
+                let pos = (mouse.x, mouse.y);
+                let moved = crate::video::native_presenter::cursor_move_is_activity(
+                    self.native_video_last_move_client,
+                    pos,
+                    self.cursor_hidden,
+                );
+                self.native_video_last_move_client = Some(pos);
+                if moved {
+                    self.mark_native_video_hud_activity(ctx);
+                } else {
+                    ctx.request_repaint();
+                }
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseButton(button) => {
                 self.handle_native_video_mouse_button(ctx, fs_idx, button);

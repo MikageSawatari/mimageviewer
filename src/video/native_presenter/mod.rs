@@ -443,6 +443,17 @@ struct NativeEguiOverlay {
     /// 余計な tick を止める。3 秒経過判定後に確実に 1 回 `SetCursor(None)` を打つために
     /// 「!cursor_hidden の間は tick 継続」という形で利用する。
     cursor_hidden: bool,
+    /// 直近に観測したカーソルの client 座標 (presenter / HUD どちらの wndproc 由来でも、
+    /// fullscreen では同一 origin なので比較可能)。`push_native_event` の `MouseMove` が
+    /// **実際に位置が動いたか** を判定して auto-hide の活動扱いをゲートするために使う。
+    /// 実機修正 (2026-06-06): 動画 fullscreen の video→video キーナビ中、navigation
+    /// preview で HUD HWND の region が全画面化すると「カーソル下の window」が
+    /// presenter HWND ⇄ HUD HWND で切り替わり、OS が**位置不変 (zero-delta) の
+    /// `WM_MOUSEMOVE`** を新しい window に届ける。`cursor_polling_tick` の synthetic move も
+    /// 位置不変。これらを無条件に活動とみなすと、キー操作だけで auto-hide 済みカーソルが
+    /// 復活してしまう。位置が変わったときだけ活動とみなすことで一般的な動画プレイヤーと
+    /// 挙動を揃える。`MouseLeave` ではクリアしない (= 同位置の再入を活動と誤認しないため)。
+    cursor_activity_pos: Option<(i32, i32)>,
     /// 実機修正 (2026-05-12 Codex P2 #6): cursor が `SetCursor(None)` で非表示にされたか
     /// (= `cursor_hidden` と同じ値) を **HUD wndproc から読める形で共有する atomic**。
     /// `update_cursor_icon` で書き込み、`WM_SETCURSOR` が読み出して隠れた cursor を復帰させる。
@@ -3547,6 +3558,25 @@ impl NativeBlackBackground {
     }
 }
 
+/// `MouseMove` をカーソル auto-hide のアクティビティ (= カーソル復帰) とみなすか判定する。
+///
+/// 位置が変わらない move は復帰させない。動画 fullscreen の navigation preview で HUD HWND の
+/// region が全画面化すると、カーソル下の window が presenter HWND ⇄ HUD HWND で切り替わり、
+/// OS は位置不変 (zero-delta) の `WM_MOUSEMOVE` を新しい window へ届ける。`cursor_polling_tick`
+/// の synthetic move も位置不変。これらでキー操作だけのナビ中に auto-hide 済みカーソルが
+/// 復活する事象を防ぐ (2026-06-06)。直近位置が不明 (`None`) のときは、表示中なら通常の活動、
+/// hidden 中なら region 切替由来の spurious move とみなして抑制する。
+pub(crate) fn cursor_move_is_activity(
+    prev: Option<(i32, i32)>,
+    pos: (i32, i32),
+    cursor_hidden: bool,
+) -> bool {
+    match prev {
+        Some(prev) => prev != pos,
+        None => !cursor_hidden,
+    }
+}
+
 impl NativeEguiOverlay {
     fn new(
         visual: IDCompositionVisual,
@@ -3706,6 +3736,7 @@ impl NativeEguiOverlay {
             height: height.max(1),
             cursor_last_activity: None,
             cursor_hidden: false,
+            cursor_activity_pos: None,
             cursor_was_hidden_shared,
             normalize_state: crate::video::normalize_types::NormalizeOverlayState::default(),
         };
@@ -3773,10 +3804,34 @@ impl NativeEguiOverlay {
         // カーソル auto-hide 用のアクティビティタイマ更新。キー操作では再表示せず、
         // pointer 系イベントだけを活動とみなす。MouseLeave は「カーソルがウィンドウ
         // から出た」ので活動とみなさない (= 隠す方向に進める)。
-        if matches!(
-            event,
-            NativeEvent::MouseMove(_) | NativeEvent::MouseButton(_) | NativeEvent::MouseWheel(_)
-        ) {
+        //
+        // 重要 (2026-06-06): `MouseMove` は **実際にカーソル位置が変わったときだけ** 活動と
+        // みなす。動画 fullscreen の video→video キーナビでは navigation preview 中に HUD HWND
+        // の region が全画面化し、「カーソル下の window」が presenter HWND ⇄ HUD HWND で
+        // 切り替わる。OS はこの切替で位置不変 (zero-delta) の `WM_MOUSEMOVE` を新しい window へ
+        // 届け、`cursor_polling_tick` も位置不変の synthetic move を流す。これらを無条件に活動
+        // とみなすと、キー操作だけのナビで auto-hide 済みカーソルが復活してしまう。詳細は
+        // `cursor_activity_pos` フィールドのコメント参照。Button / Wheel は明確なユーザー意図
+        // なので位置に関係なく活動扱いにする。
+        let cursor_activity = match &event {
+            NativeEvent::MouseMove(mouse) => {
+                let pos = (mouse.x, mouse.y);
+                let moved =
+                    cursor_move_is_activity(self.cursor_activity_pos, pos, self.cursor_hidden);
+                self.cursor_activity_pos = Some(pos);
+                moved
+            }
+            NativeEvent::MouseButton(button) => {
+                self.cursor_activity_pos = Some((button.x, button.y));
+                true
+            }
+            NativeEvent::MouseWheel(wheel) => {
+                self.cursor_activity_pos = Some((wheel.x, wheel.y));
+                true
+            }
+            _ => false,
+        };
+        if cursor_activity {
             self.cursor_last_activity = Some(Instant::now());
             self.cursor_hidden = false;
         }
@@ -7770,8 +7825,9 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 mod tests {
     use super::{
         NativeOverlayInputRouting, NativePixelSample, compare_pixel_probe,
-        compute_video_visual_transform, copy_cpu_rgba_to_swapchain_bgra, metadata_clean_text,
-        native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
+        compute_video_visual_transform, copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
+        metadata_clean_text, native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel,
+        should_claim_text_input_focus,
     };
     use crate::video::native_window::{
         NativeVideoKeyEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent,
@@ -7826,6 +7882,30 @@ mod tests {
             ..Default::default()
         };
         assert!(!over_ui.should_forward_to_ui(&wheel(true)));
+    }
+
+    #[test]
+    fn cursor_move_activity_ignores_zero_delta_moves() {
+        // 動画 fullscreen の video→video キーナビ回帰テスト:
+        // navigation preview の HUD 全画面化や cursor_polling_tick の synthetic move で
+        // 届く「位置不変」の MouseMove は auto-hide 済みカーソルを復帰させない。
+        // 直近位置 = (100, 200)、同じ位置への move は hidden の有無に関わらず非活動。
+        assert!(!cursor_move_is_activity(Some((100, 200)), (100, 200), true));
+        assert!(!cursor_move_is_activity(
+            Some((100, 200)),
+            (100, 200),
+            false
+        ));
+
+        // 実際にカーソルが動いた move は、auto-hide 中でも活動 = カーソル復帰。
+        assert!(cursor_move_is_activity(Some((100, 200)), (101, 200), true));
+        assert!(cursor_move_is_activity(Some((100, 200)), (100, 199), false));
+
+        // 直近位置が不明 (フルスクリーン入場直後など):
+        // - 表示中の move は通常どおり活動扱い。
+        // - hidden 中の move は region 切替由来の spurious move とみなして抑制する。
+        assert!(cursor_move_is_activity(None, (50, 50), false));
+        assert!(!cursor_move_is_activity(None, (50, 50), true));
     }
 
     #[test]

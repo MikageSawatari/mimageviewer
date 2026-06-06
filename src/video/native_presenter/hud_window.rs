@@ -28,6 +28,10 @@
 //!
 //! - `WM_MOUSEMOVE` / `WM_*BUTTONDOWN/UP` / `WM_MOUSEWHEEL` / `WM_MOUSELEAVE`:
 //!   既存の `native_window.rs` 内 helper で `NativeVideoWindowEvent` に変換 → `event_tx`。
+//!   idle auto-hide 中の cursor 復帰は **Wheel / Button のみ** ここで即時に行う。`WM_MOUSEMOVE`
+//!   は navigation preview の HUD 全画面化で OS が届ける zero-delta (位置不変) move を含むため
+//!   ここでは復帰せず、実カーソル移動の判定と復帰は overlay の位置ゲート
+//!   (`push_native_event` / `cursor_move_is_activity`) + presenter の `update_cursor_icon` に委ねる。
 //! - `WM_LBUTTONDOWN` / `WM_RBUTTONDOWN` / `WM_MBUTTONDOWN`:
 //!   1. down event 送出
 //!   2. `held_buttons |= bit` (capture 成否に関係なく必ず tracking、Codex 11 P1 #1)
@@ -106,9 +110,10 @@ pub struct HudOverlayConfig {
     /// `WM_NCHITTEST` まで届く mouse はほぼないが、フェイルセーフ)。
     pub regions: Arc<std::sync::Mutex<HudInteractiveRegions>>,
     /// 実機修正 (2026-05-12 Codex P2 #6 反映): cursor が直前 frame で `SetCursor(None)` で
-    /// 非表示にされたかどうか。HUD wndproc の `WM_SETCURSOR` で参照し、`true` なら
+    /// 非表示にされたかどうか。HUD wndproc の **Wheel / Button** ハンドラで参照し、`true` なら
     /// `IDC_ARROW` を明示復帰、`false` なら何もせず last set cursor (= egui setting) を維持。
-    /// presenter が `update_cursor_icon` で毎フレーム書き込む。
+    /// presenter が `update_cursor_icon` で毎フレーム書き込む。`WM_MOUSEMOVE` では参照しない
+    /// (2026-06-06: zero-delta move でカーソルが復活する事象を防ぐため。詳細は wndproc コメント)。
     pub cursor_was_hidden: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -651,6 +656,18 @@ fn emit_synthetic_button_cleanup(state: &mut WindowState) {
     state.mouse_tracking = false;
 }
 
+fn restore_cursor_for_mouse_activity(state: &WindowState) {
+    use std::sync::atomic::Ordering;
+    if !state.cursor_was_hidden.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    unsafe {
+        if let Ok(cursor) = LoadCursorW(None, IDC_ARROW) {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetCursor(Some(cursor));
+        }
+    }
+}
+
 fn window_state(hwnd: HWND) -> Option<&'static mut WindowState> {
     let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
     if ptr.is_null() {
@@ -682,34 +699,21 @@ unsafe extern "system" fn hud_wnd_proc(
 
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
 
-        // 実機修正 (2026-05-12 Codex P2 #6 反映): WM_SETCURSOR でカーソル非表示状態を復帰。
+        // 実機修正 (2026-05-12 Codex P2 #6 反映): cursor 非表示状態の扱い。
         //
         // 旧版 (P2 #6 修正前): TRUE を返すだけ + SetCursor 不要 → 直近設定の cursor 維持。
         // これは egui の ResizeHorizontal 等が WM_SETCURSOR で上書きされない利点はあるが、
         // **直前が `SetCursor(None)` (= idle で auto-hide) だと cursor 非表示が残る** バグ。
         //
-        // 修正 (P2 #6): `cursor_was_hidden` flag (presenter が `update_cursor_icon` で書き込む)
-        // を参照し:
-        //   - `true` (= 直前に SetCursor(None) で隠した) → IDC_ARROW を明示復帰 + flag clear
-        //   - `false` → SetCursor 呼ばずに TRUE 返す (= ちらつき回避、egui の cursor 維持)
-        //
-        // これで「activation zone 内に cursor が入った瞬間 HUD region が出るが cursor が
-        // 隠れたまま」症状が解消する。
-        WM_SETCURSOR => {
-            if let Some(state) = window_state(hwnd) {
-                use std::sync::atomic::Ordering;
-                if state.cursor_was_hidden.load(Ordering::Acquire) {
-                    unsafe {
-                        if let Ok(cursor) = LoadCursorW(None, IDC_ARROW) {
-                            let _ =
-                                windows::Win32::UI::WindowsAndMessaging::SetCursor(Some(cursor));
-                        }
-                    }
-                    state.cursor_was_hidden.store(false, Ordering::Release);
-                }
-            }
-            LRESULT(1)
-        }
+        // 現在の方針 (2026-06-06): WM_SETCURSOR では復帰も SetCursor もせず `LRESULT(1)` を返す
+        // だけ (= DefWindowProc がクラスカーソルを出すのを防ぎ、直近 SetCursor を維持)。
+        // navigation preview は source swap 中に HUD region を全画面化するため、キー操作だけでも
+        // 静止 cursor の下へ HUD HWND が広がり WM_SETCURSOR / zero-delta WM_MOUSEMOVE が発生する。
+        // ここ (や WM_MOUSEMOVE) で復帰すると「↓キーで次の動画に行くだけで cursor が復活」する。
+        // 実カーソルアイコンは presenter の `update_cursor_icon` が毎フレーム `SetCursor` で駆動し、
+        // 復帰判定は overlay の位置ゲート (`cursor_move_is_activity`) が担う。Wheel / Button だけは
+        // 明確なユーザー操作として各ハンドラで即時復帰する (= `restore_cursor_for_mouse_activity`)。
+        WM_SETCURSOR => LRESULT(1),
 
         WM_NCHITTEST => {
             // SetWindowRgn で region 外は OS が下層に転送するため通常ここまで来ない。
@@ -733,6 +737,15 @@ unsafe extern "system" fn hud_wnd_proc(
         WM_MOUSEMOVE => {
             if let Some(state) = window_state(hwnd) {
                 track_mouse_leave(hwnd, state);
+                // `WM_MOUSEMOVE` ではここで cursor を復帰しない。navigation preview の HUD
+                // 全画面化で「カーソル下の window」が presenter HWND ⇄ HUD HWND に切り替わると、
+                // OS は **位置不変 (zero-delta) の `WM_MOUSEMOVE`** を新しい window に届ける。これで
+                // `restore_cursor_for_mouse_activity` を呼ぶと、キー操作だけの動画ナビで auto-hide
+                // 済みカーソルが復活してしまう (2026-06-06)。実カーソル移動時の復帰は overlay の
+                // 位置ゲート (`push_native_event` / `cursor_move_is_activity`) が `cursor_hidden=false`
+                // にし、presenter の `update_cursor_icon` が `SetCursor(IDC_ARROW)` で駆動する。
+                // render loop は `sleep_until_message` で mouse message に即 wake するので遅延は無い。
+                // Wheel / Button (下記) は明確なユーザー操作なので即時復帰させる。
                 let event = NativeVideoMouseEvent {
                     x: signed_low_word(lparam.0),
                     y: signed_high_word(lparam.0),
@@ -763,6 +776,7 @@ unsafe extern "system" fn hud_wnd_proc(
 
         WM_MOUSEWHEEL => {
             if let Some(state) = window_state(hwnd) {
+                restore_cursor_for_mouse_activity(state);
                 // WM_MOUSEWHEEL は screen coordinates。client に変換。
                 let mut pt = POINT {
                     x: signed_low_word(lparam.0),
@@ -814,6 +828,7 @@ unsafe extern "system" fn hud_wnd_proc(
         | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK | WM_XBUTTONDOWN
         | WM_XBUTTONUP | WM_XBUTTONDBLCLK => {
             if let Some(state) = window_state(hwnd) {
+                restore_cursor_for_mouse_activity(state);
                 let (button, bit) = button_bit_for_msg(msg, wparam);
                 let down = mouse_message_is_down(msg);
                 let dbl = matches!(
