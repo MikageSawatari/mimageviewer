@@ -104,6 +104,17 @@
   追加して後から見た目が変わる事故を防ぐ。フォント選択ダイアログの「追加パック」タブは
   未導入時に空 = 吹き出し/窓でのパックフォント選択も既にブロック済み。
 
+### ✅ F2. AI/編集先読みの GPU upload を表示時まで遅延 (`0d10993f`) [他セッションP1]
+- prefetch_final_ai が非表示近隣ページの edit_result テクスチャを UI スレッドで前倒し upload して
+  いた退行 (Pipeline P1 リファクタで旧 AI ゲート喪失)。CPU 専用 ensure_edit_result_pixels_cpu を
+  追加、EditResultEntry.texture を Option 化、表示時に lazy upload。AI オン/オフ両方で先読み中の
+  GPU 負担が消える。近隣 AI 推論はワーカーで先読み継続。
+
+### 💬 残: AI Display 優先が実行中 prefetch を preempt しない [他セッションP1/P2]
+- queue は Display 優先だが、worker は 1 件を完了まで実行し、別 idx の prefetch を cancel しない。
+  重い prefetch 推論中にページ移動すると表示ページの AI が待たされる。対応 = Display enqueue 時に
+  running/queued prefetch へ cancel、または tile 間 cooperative preemption。AI スケジューラ領域・中〜大。
+
 ### ℹ️ C7. UI スレッド同期 I/O (font 列挙/読込・stamp file read) [Codex P2]
 - 通常閲覧では回避設計だが、注釈付き画像/大スタンプで一瞬固まりうる。worker 化は要検討 (低優先)。
 
