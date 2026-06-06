@@ -31,10 +31,11 @@ use crate::comic_presets::{ShapeStylePreset, TextStylePreset, WindowStylePreset}
 use crate::ui_fullscreen::{FsKeyAction, SpreadPair};
 use comic_core::{
     AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, DecoKind, DecoPlacement,
-    DecorationLayer, FillMode, FontSet, FrameStyle, IndicatorKind, MessageWindowObject,
-    NamePlateMode, Orientation, PortraitSide, Rgba, ShadowStyle, SizeMode, StampObject,
-    StrokeStyle, Tail, TailKind, TextAlign, TextBlock, VAnchor, WindowPosition,
+    DecorationLayer, FillMode, FontSet, FrameStyle, IndicatorKind, InlineDir, MarkupRule,
+    MessageWindowObject, NamePlateMode, Orientation, PortraitSide, Rgba, ShadowStyle, SizeMode,
+    StampObject, StrokeStyle, Tail, TailKind, TextAlign, TextBlock, VAnchor, WindowPosition,
 };
+use std::collections::HashMap;
 
 /// パネル幅 (編集コントロールが入るので conceal より少し広い)。
 const PANEL_W: f32 = 268.0;
@@ -706,6 +707,32 @@ fn normalize_z(objs: &mut [AnnotationObject]) {
     }
 }
 
+/// `text` の char 範囲 `[start, end)` を `open` / `close` で囲み、新しいキャレット位置
+/// (char index、close の直後) を返す (ラボ `insert_markers` 相当)。記号挿入ボタン用。
+fn insert_markers(text: &mut String, start: usize, end: usize, open: char, close: char) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let start = start.min(n);
+    let end = end.min(n).max(start);
+    let mut out = String::with_capacity(text.len() + open.len_utf8() + close.len_utf8());
+    out.extend(chars[..start].iter());
+    out.push(open);
+    out.extend(chars[start..end].iter());
+    out.push(close);
+    out.extend(chars[end..].iter());
+    *text = out;
+    start + 1 + (end - start)
+}
+
+/// 2 つの記法ルール列が open/close ペアとして等価か (dir は位置で固定なので無視)。
+/// 記号セットコンボの現在選択判定に使う (ラボ `marker_pairs_eq` 相当)。
+fn marker_pairs_eq(a: &[MarkupRule], b: &[MarkupRule]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.open == y.open && x.close == y.close)
+}
+
 fn kind_label(o: &AnnotationObject) -> &'static str {
     match &o.kind {
         AnnotationKind::Bubble(_) => "吹き出し",
@@ -864,6 +891,8 @@ impl App {
         self.comic_redo_stack.clear();
         self.comic_undo_baseline.clear();
         self.comic_undo_key = None;
+        // しっぽ stash もクリア (ページ / モードをまたいで持ち越さない)。
+        self.comic_tail_stash.clear();
 
         if let Some(ctx) = self.text_spread_ctx.take() {
             self.spread_mode = ctx.saved_mode;
@@ -984,6 +1013,12 @@ impl App {
         }
         // 復元の途中で握っていたドラッグ状態は無効化する (古い id / 座標基準が残る事故防止)。
         self.text_drag = None;
+        // undo/redo で消えたオブジェクトのしっぽ stash を prune (stash の desync 防止、
+        // ラボ `after_history_change` 相当)。
+        if let Some(objs) = self.comic_docs.get(key) {
+            self.comic_tail_stash
+                .retain(|id, _| objs.iter().any(|o| o.id == *id));
+        }
         // 再ベイク (comic_generation を進める) + 復元結果を comic.db + サイドカーへ
         // デバウンス保存に乗せる (退場時 reset_text_mode でも最終保存される)。
         self.mark_comic_dirty();
@@ -1093,6 +1128,8 @@ impl App {
         normalize_z(objs);
         let snapshot = objs.clone();
         self.text_selected = None;
+        // 削除したオブジェクトのしっぽ stash も破棄 (orphan 防止)。
+        self.comic_tail_stash.remove(&id);
         self.save_comic_objects(fs_idx, &key, &snapshot);
         self.text_dirty_at = None;
         self.mark_comic_dirty();
@@ -1550,6 +1587,9 @@ impl App {
             });
 
         // ── 右パネル: 詳細設定 (選択オブジェクトの編集) ──
+        // しっぽ stash は App 状態だが、closure は self を借りないので `objects` と同様に
+        // 一旦ローカルへ取り出して &mut を渡し、closure 後に書き戻す。
+        let mut tail_stash = std::mem::take(&mut self.comic_tail_stash);
         egui::Area::new(egui::Id::new("text_detail_panel"))
             .fixed_pos(detail_rect.min)
             .order(egui::Order::Foreground)
@@ -1601,6 +1641,7 @@ impl App {
                                                 &mut open_stamp_replace,
                                                 &mut open_font_picker,
                                                 &mut pctx,
+                                                &mut tail_stash,
                                             );
                                         } else {
                                             ui.label(
@@ -1616,6 +1657,8 @@ impl App {
                         );
                     });
             });
+        // しっぽ stash を書き戻す (closure で更新された分を App 状態へ反映)。
+        self.comic_tail_stash = tail_stash;
 
         // 追加ボタンはダイアログを開く (実際の追加はダイアログ側)。
         if open_bubble_dialog {
@@ -4504,6 +4547,7 @@ fn edit_object_ui(
     open_stamp_replace: &mut bool,
     open_font_picker: &mut bool,
     presets: &mut PresetCtx,
+    tail_stash: &mut HashMap<u64, Tail>,
 ) {
     ui.strong(kind_label(o));
     // 回転 (全種共通、タブの外)。
@@ -4516,6 +4560,7 @@ fn edit_object_ui(
         *changed = true;
     }
     let pivot = o.pivot;
+    let obj_id = o.id;
 
     match &mut o.kind {
         AnnotationKind::Text(t) => {
@@ -4525,7 +4570,7 @@ fn edit_object_ui(
             draw_section_bar(ui, TextPropTab::Serifu.color(), |ui| {
                 text_preset_bar(ui, t, presets, changed);
                 let snap = t.clone();
-                text_block_ui(ui, t, changed, true, open_font_picker);
+                text_block_ui(ui, t, changed, true, open_font_picker, obj_id);
                 // 個別スタイル編集でプリセットリンクを解除 (本文内容の編集では外さない)。
                 if t.preset_link.is_some() && text_style_diverged(&snap, t) {
                     t.preset_link = None;
@@ -4557,11 +4602,11 @@ fn edit_object_ui(
             let cur = *tab;
             draw_section_bar(ui, cur.color(), |ui| match cur {
                 TextPropTab::Serifu => {
-                    text_block_ui(ui, &mut b.text, changed, true, open_font_picker)
+                    text_block_ui(ui, &mut b.text, changed, true, open_font_picker, obj_id)
                 }
                 TextPropTab::Tail => {
                     let snap = b.clone();
-                    bubble_tail_ui(ui, b, changed);
+                    bubble_tail_ui(ui, b, changed, obj_id, pivot, tail_stash);
                     // しっぽ種別の付与/除去はプリセット (tail_kind) と乖離する。
                     if b.shape_preset_link.is_some() && shape_style_diverged(&snap, b) {
                         b.shape_preset_link = None;
@@ -4608,7 +4653,7 @@ fn edit_object_ui(
                     // ウィンドウプリセットは本文 TEXT のスタイルも含むので、本文スタイル
                     // 編集でウィンドウリンクを解除する (本文内容の編集では外さない)。
                     let snap = w.text.clone();
-                    text_block_ui(ui, &mut w.text, changed, true, open_font_picker);
+                    text_block_ui(ui, &mut w.text, changed, true, open_font_picker, obj_id);
                     if w.style_preset_link.is_some() && text_style_diverged(&snap, &w.text) {
                         w.style_preset_link = None;
                     }
@@ -4652,6 +4697,7 @@ fn text_style_diverged(a: &TextBlock, b: &TextBlock) -> bool {
         || a.outline != b.outline
         || a.auto_tcy != b.auto_tcy
         || a.markup_enabled != b.markup_enabled
+        || a.markup_rules != b.markup_rules
         || a.bold != b.bold
         || a.italic != b.italic
 }
@@ -4885,16 +4931,59 @@ fn text_block_ui(
     changed: &mut bool,
     with_text: bool,
     open_font_picker: &mut bool,
+    sel: u64,
 ) {
     if with_text {
-        let resp = ui.add(
-            egui::TextEdit::multiline(&mut t.text)
-                .desired_rows(2)
-                .desired_width(PANEL_W - 16.0)
-                .hint_text("テキスト"),
-        );
-        if resp.changed() {
+        // 安定 id を与えて記号挿入後にキャレットを復元できるようにする。
+        let text_edit_id = egui::Id::new(("comic_text_edit", sel));
+        let te_out = egui::TextEdit::multiline(&mut t.text)
+            .id(text_edit_id)
+            .desired_rows(2)
+            .desired_width(PANEL_W - 16.0)
+            .hint_text("テキスト")
+            .show(ui);
+        if te_out.response.changed() {
             *changed = true;
+        }
+        let text_sel: Option<(usize, usize)> = te_out
+            .cursor_range
+            .map(|r| (r.primary.index, r.secondary.index));
+        // 記法 ON のとき、本文欄の直下に記号挿入ボタンを出す。選択範囲があればそれを囲み、
+        // 無ければキャレット位置 (末尾) に空ペアを挿入する (ラボ `draw_text_body` 相当)。
+        if t.markup_enabled {
+            let rules = t.markup_rules.clone();
+            ui.horizontal_wrapped(|ui| {
+                ui.label("記号挿入:");
+                for rule in &rules {
+                    let dir_label = match rule.dir {
+                        InlineDir::TateChuYoko => "縦中横",
+                        InlineDir::Sideways => "横倒し",
+                        InlineDir::Upright => "正立",
+                    };
+                    if ui
+                        .button(format!("{}{} {}", rule.open, rule.close, dir_label))
+                        .clicked()
+                    {
+                        let (a, b) = text_sel.unwrap_or_else(|| {
+                            let n = t.text.chars().count();
+                            (n, n)
+                        });
+                        let (s, e) = (a.min(b), a.max(b));
+                        let caret = insert_markers(&mut t.text, s, e, rule.open, rule.close);
+                        let ctx = ui.ctx();
+                        if let Some(mut st) =
+                            egui::text_edit::TextEditState::load(ctx, text_edit_id)
+                        {
+                            let cc = egui::text::CCursor::new(caret);
+                            st.cursor
+                                .set_char_range(Some(egui::text::CCursorRange::one(cc)));
+                            st.store(ctx, text_edit_id);
+                        }
+                        ctx.memory_mut(|m| m.request_focus(text_edit_id));
+                        *changed = true;
+                    }
+                }
+            });
         }
     }
     // フォント選択 (現在のフォント名 + 選択ボタン)。ピッカーは別ダイアログで開く。
@@ -5011,6 +5100,51 @@ fn text_block_ui(
         t.auto_tcy = tcy;
         *changed = true;
     }
+    // 記法 (記号で囲んで縦中横/横倒し)。トグル + 記号セット選択。挿入ボタンは本文欄の下。
+    if ui
+        .checkbox(&mut t.markup_enabled, "記法を使う (記号で縦中横/横倒し)")
+        .changed()
+    {
+        *changed = true;
+    }
+    if t.markup_enabled {
+        // 3 つの記号セット。先頭ペア=縦中横 / 2 番目=横倒し。現在値は open/close 一致で判定。
+        let sets: [(&str, Vec<MarkupRule>); 3] = [
+            ("[ ]  { }", comic_core::markup_rules_brackets()),
+            ("〈 〉  《 》", comic_core::markup_rules_angle()),
+            ("〚 〛  〘 〙", comic_core::markup_rules_white()),
+        ];
+        let cur_idx = sets
+            .iter()
+            .position(|(_, r)| marker_pairs_eq(&t.markup_rules, r));
+        let cur_label = cur_idx.map(|i| sets[i].0).unwrap_or("カスタム");
+        ui.horizontal(|ui| {
+            ui.label("記号セット");
+            egui::ComboBox::from_id_salt("marker_set_combo")
+                .selected_text(cur_label)
+                .show_ui(ui, |ui| {
+                    for (i, (label, rules)) in sets.iter().enumerate() {
+                        if ui.selectable_label(cur_idx == Some(i), *label).clicked() {
+                            t.markup_rules = rules.clone();
+                            *changed = true;
+                        }
+                    }
+                });
+        });
+    }
+    // 行間 / 字間。
+    if ui
+        .add(egui::Slider::new(&mut t.line_gap, -20.0..=80.0).text("行間"))
+        .changed()
+    {
+        *changed = true;
+    }
+    if ui
+        .add(egui::Slider::new(&mut t.letter_gap, -10.0..=60.0).text("字間"))
+        .changed()
+    {
+        *changed = true;
+    }
 }
 
 /// 吹き出し「本体」タブ (形状・塗り・輪郭・自動サイズ・余白)。本文は セリフ タブ、
@@ -5085,18 +5219,59 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
     {
         *changed = true;
     }
+    // 結合 (下の吹き出しと union)。塗りつぶせる本体を持つ形状のみ対応 — ぼかし系 /
+    // 線描画系 / テキストのみ (意識 / 集中線 / 流線 / なし) は不可なのでトグルを無効化し、
+    // 別形状で立った stale フラグをクリアする (ラボ `draw_bubble_toggles` 相当)。
+    let merge_supported = comic_core::shape_is_mergeable(&b.shape);
+    if !merge_supported && b.merge_with_below {
+        b.merge_with_below = false;
+        *changed = true;
+    }
+    let merge_resp = ui.add_enabled(
+        merge_supported,
+        egui::Checkbox::new(&mut b.merge_with_below, "下の吹き出しと結合"),
+    );
+    if merge_supported && merge_resp.changed() {
+        *changed = true;
+    }
+    if !merge_supported {
+        merge_resp.on_disabled_hover_text("この形状は結合に対応していません");
+    }
 }
 
-/// 吹き出し「しっぽ」タブ (表示 on/off + 種別 + 幅)。
-fn bubble_tail_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
+/// 吹き出し「しっぽ」タブ (表示 on/off + 種別 + 幅)。off→on で stash から復元し、位置を
+/// 覚える (ラボ `draw_bubble_toggles` のしっぽ部分相当)。しっぽを描かない形状 (集中線 /
+/// 流線 / 意識 / なし) ではトグルを無効化し無効ホバーを出す (§7.7 非対応で無効化)。
+fn bubble_tail_ui(
+    ui: &mut egui::Ui,
+    b: &mut BubbleObject,
+    changed: &mut bool,
+    obj_id: u64,
+    pivot: (f32, f32),
+    tail_stash: &mut HashMap<u64, Tail>,
+) {
+    let tail_supported = comic_core::shape_renders_tail(&b.shape);
     let mut has_tail = b.tail.is_some();
-    if ui.checkbox(&mut has_tail, "しっぽを表示").changed() {
-        b.tail = if has_tail {
-            Some(comic_core::Tail::default())
-        } else {
-            None
-        };
+    let resp = ui.add_enabled(
+        tail_supported,
+        egui::Checkbox::new(&mut has_tail, "しっぽを表示"),
+    );
+    if tail_supported && resp.changed() {
+        if has_tail {
+            // off→on: stash があれば復元 (位置を覚える)、無ければ既定しっぽ。
+            b.tail = Some(
+                tail_stash
+                    .remove(&obj_id)
+                    .unwrap_or_else(|| default_bubble_tail(pivot)),
+            );
+        } else if let Some(t) = b.tail.take() {
+            // on→off: 現在のしっぽを stash して、次に on にしたとき復元できるようにする。
+            tail_stash.insert(obj_id, t);
+        }
         *changed = true;
+    }
+    if !tail_supported {
+        resp.on_disabled_hover_text("この形状はしっぽに対応していません");
     }
     if let Some(t) = &mut b.tail {
         ui.horizontal(|ui| {
@@ -6398,5 +6573,49 @@ mod tests {
         } else {
             panic!("window");
         }
+    }
+
+    // ── 記法の記号挿入 (Inc 4a 仕上げ) ────────────────────────────────
+
+    #[test]
+    fn insert_markers_wraps_selection() {
+        // "あいうえお" の char[1..4)=「いうえ」を [ ] で囲む。
+        let mut s = "あいうえお".to_string();
+        let caret = insert_markers(&mut s, 1, 4, '[', ']');
+        assert_eq!(s, "あ[いうえ]お");
+        // caret = 囲んだ内容の直後・閉じ記号の手前 = start(1) + 1 + (end-start)(3) = 5。
+        assert_eq!(caret, 5);
+        assert_eq!(s.chars().nth(caret - 1), Some('え')); // 直前 = 内容末尾
+        assert_eq!(s.chars().nth(caret), Some(']')); // 直後 = 閉じ記号
+    }
+
+    #[test]
+    fn insert_markers_empty_selection_inserts_pair_at_caret() {
+        let mut s = "ab".to_string();
+        let caret = insert_markers(&mut s, 2, 2, '〈', '〉');
+        assert_eq!(s, "ab〈〉");
+        assert_eq!(caret, 3); // open と close の間
+    }
+
+    #[test]
+    fn insert_markers_clamps_out_of_range() {
+        let mut s = "x".to_string();
+        // start/end が範囲外でも panic せず末尾にクランプ。
+        let caret = insert_markers(&mut s, 99, 99, '{', '}');
+        assert_eq!(s, "x{}");
+        assert_eq!(caret, 2);
+    }
+
+    #[test]
+    fn marker_pairs_eq_matches_same_set_ignores_dir() {
+        let brackets = comic_core::markup_rules_brackets();
+        let angle = comic_core::markup_rules_angle();
+        assert!(marker_pairs_eq(
+            &brackets,
+            &comic_core::markup_rules_brackets()
+        ));
+        assert!(!marker_pairs_eq(&brackets, &angle));
+        // 長さ違いは不一致。
+        assert!(!marker_pairs_eq(&brackets, &brackets[..1]));
     }
 }

@@ -4134,6 +4134,11 @@ pub struct App {
     /// ページ固定だが、防御的にキー不一致を検出したら再ベースライン化して
     /// cross-page の undo エントリができないようにする。
     pub(crate) comic_undo_key: Option<String>,
+    /// 吹き出しの「しっぽを表示」を off にしたときに、その時点のしっぽ (`Tail`) を退避
+    /// しておく場所 (オブジェクト id 別)。off→on で復元して位置を覚える (Inc 4d 仕上げ、
+    /// ラボ `tail_stash` 相当)。テキストモード退場でクリア、undo/redo 後に存在しない
+    /// オブジェクト分を prune する。
+    pub(crate) comic_tail_stash: std::collections::HashMap<u64, comic_core::Tail>,
 
     // ── フルスクリーン Ctrl+↑↓ ナビロック ─────────────────────────
     /// ナビ中の「次のページがまだ表示できない」ガード。`Some(gen)` の間は
@@ -5266,6 +5271,7 @@ impl App {
             comic_redo_stack: Vec::new(),
             comic_undo_baseline: Vec::new(),
             comic_undo_key: None,
+            comic_tail_stash: std::collections::HashMap::new(),
             erase_preview_active: false,
             conceal_preview_active: false,
             erase_base_tex_cache: std::collections::HashMap::new(),
