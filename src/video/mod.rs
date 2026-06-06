@@ -528,11 +528,13 @@ enum NativeVideoOutputCommand {
         request_id: u64,
         in_window: bool,
     },
-    /// eframe 経由のキー入力 (= `show_native_video_black_backdrop` で受け取って
-    /// `handle_native_video_key_event` に流すパス) など、native presenter HWND の
-    /// `push_native_event` を経由しない活動を伝搬する。NativeEguiOverlay の
-    /// cursor auto-hide タイマをリセットして即時にカーソルを再表示するため。
+    /// native presenter HWND の `push_native_event` を経由しない pointer 活動を
+    /// 伝搬する。NativeEguiOverlay の cursor auto-hide タイマをリセットして
+    /// 即時にカーソルを再表示するため。
     MarkCursorActivity,
+    /// キー操作後の HUD 更新など、カーソル auto-hide タイマには触れずに
+    /// native overlay の再描画だけを要求する。
+    RequestOverlayRender,
     /// 音量ノーマライズの UI 状態 + 進捗 snapshot を native overlay に配信する。
     /// App 側 `update` で normalize_ui_states と normalize_state.progress を読んで
     /// `NormalizeOverlayState` を作り、毎フレーム送る。overlay 側はボタン色 +
@@ -933,6 +935,12 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::MarkCursorActivity);
+    }
+
+    fn request_overlay_render(&self) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::RequestOverlayRender);
     }
 
     /// CP7: HUD overlay HWND を最前面に上げ直す要求を presenter thread に送る。
@@ -2134,6 +2142,9 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::MarkCursorActivity => {
                     presenter.mark_overlay_cursor_activity();
+                }
+                NativeVideoOutputCommand::RequestOverlayRender => {
+                    presenter.request_overlay_render();
                 }
                 NativeVideoOutputCommand::SetNormalizeOverlayState { state } => {
                     presenter.set_overlay_normalize_state(state);
@@ -4903,14 +4914,20 @@ impl VideoPlayer {
             .unwrap_or(0)
     }
 
-    /// eframe 経由のキー入力 (Space で pause/resume 等) は native presenter HWND を
-    /// 経由しないため、`push_native_event` で行われる cursor auto-hide タイマの
-    /// リセットが走らない。`mark_native_video_hud_activity` 等から呼んで明示的に
+    /// eframe 経由の pointer 活動は native presenter HWND を経由しないことがあるため、
+    /// `push_native_event` で行われる cursor auto-hide タイマのリセットを明示的に
     /// 伝搬する。command channel を介すので 1〜2 フレームの遅延はあるが許容範囲。
     #[cfg(windows)]
     pub fn mark_cursor_activity(&self) {
         if let Some(output) = self.native_output.as_ref() {
             output.mark_cursor_activity();
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn request_native_overlay_render(&self) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.request_overlay_render();
         }
     }
 

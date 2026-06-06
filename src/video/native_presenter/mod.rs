@@ -432,8 +432,8 @@ struct NativeEguiOverlay {
     /// 最終ユーザー活動時刻 / overlay 表示時刻のうち最新のもの。
     /// `!overlay_visible` 期間中、ここから `CURSOR_HIDE_IDLE_SECS` 経過したら
     /// `SetCursor(None)` でカーソルを隠す。更新タイミング:
-    /// - `push_native_event` (mouse / key 等の native event): `Some(now)` にリセット。
-    /// - `mark_cursor_activity` (eframe 経由のキー入力反映): `Some(now)` にリセット。
+    /// - `push_native_event` (mouse native event): `Some(now)` にリセット。
+    /// - `mark_cursor_activity` (eframe 経由の pointer 活動反映): `Some(now)` にリセット。
     /// - `render_once` で `overlay_visible == true` のフレーム: 毎回 `Some(now)` で再 bump
     ///   (= overlay が見えている間は countdown を 0 にし続け、消えた瞬間から 3 秒測る)。
     /// `None` は初期状態のみ (フルスクリーン入場直後で初回 render 前)。
@@ -2968,11 +2968,17 @@ impl NativeVideoPresenter {
         }
     }
 
-    /// eframe 経由でルーティングされた活動 (Space キー pause/resume 等) を
-    /// overlay に伝搬する。`push_native_event` を経由しないため明示的に呼ぶ必要がある。
+    /// eframe 経由でルーティングされた pointer 活動を overlay に伝搬する。
+    /// `push_native_event` を経由しないため明示的に呼ぶ必要がある。
     pub fn mark_overlay_cursor_activity(&mut self) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.mark_cursor_activity();
+        }
+    }
+
+    pub fn request_overlay_render(&mut self) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.request_render();
         }
     }
 
@@ -3764,9 +3770,13 @@ impl NativeEguiOverlay {
         };
 
         self.event_count = self.event_count.saturating_add(1);
-        // カーソル auto-hide 用のアクティビティタイマ更新。MouseLeave は「カーソルが
-        // ウィンドウから出た」ので活動とみなさない (= 隠す方向に進める)。
-        if !matches!(event, NativeEvent::MouseLeave) {
+        // カーソル auto-hide 用のアクティビティタイマ更新。キー操作では再表示せず、
+        // pointer 系イベントだけを活動とみなす。MouseLeave は「カーソルがウィンドウ
+        // から出た」ので活動とみなさない (= 隠す方向に進める)。
+        if matches!(
+            event,
+            NativeEvent::MouseMove(_) | NativeEvent::MouseButton(_) | NativeEvent::MouseWheel(_)
+        ) {
             self.cursor_last_activity = Some(Instant::now());
             self.cursor_hidden = false;
         }
@@ -4338,13 +4348,17 @@ impl NativeEguiOverlay {
         visible
     }
 
-    /// eframe 経由でルーティングされた活動 (Space で pause/resume 等) を反映する。
+    /// eframe 経由でルーティングされた pointer 活動を反映する。
     /// `push_native_event` を経由しない経路用の明示的な活動通知。
     /// `dirty = true` を立てて次フレームで `render_once` を強制実行し、
     /// `update_cursor_icon` を更新カーソルで上書きする (= 隠れていたら再表示)。
     fn mark_cursor_activity(&mut self) {
         self.cursor_last_activity = Some(Instant::now());
         self.cursor_hidden = false;
+        self.dirty = true;
+    }
+
+    fn request_render(&mut self) {
         self.dirty = true;
     }
 
@@ -7038,8 +7052,8 @@ impl NativeEguiOverlay {
         // 無操作が CURSOR_HIDE_IDLE_SECS 経過したらカーソルを隠す。
         // チェックマーク (`checked`) は単なる状態インジケータなので blocking には
         // 含めない (= 静止画側 `fs_ui_is_clean` の挙動と揃える)。
-        // egui の cursor_icon を SetCursor(None) で上書きする。次回イベント到来時に
-        // push_native_event 経由で cursor_last_activity が更新され、自然に復活する。
+        // egui の cursor_icon を SetCursor(None) で上書きする。次回 pointer event
+        // 到来時に push_native_event 経由で cursor_last_activity が更新され、自然に復活する。
         //
         // 状態機械 (シンプル版):
         // - cursor_blocking_overlay_visible == true: 毎フレーム cursor_last_activity を
@@ -7049,7 +7063,7 @@ impl NativeEguiOverlay {
         // - cursor_blocking_overlay_visible == false: cursor_last_activity をそのまま
         //   維持して idle を計算。3 秒経過したらカーソル非表示。
         // - cursor_should_hide は idle のみで判定 (cursor_hidden 状態の sticky carry は
-        //   不要 — push_native_event / mark_cursor_activity で適切にリセットされるため)。
+        //   不要 — pointer activity / overlay 表示で適切にリセットされるため)。
         if cursor_blocking_overlay_visible {
             self.cursor_last_activity = Some(Instant::now());
             self.cursor_hidden = false;

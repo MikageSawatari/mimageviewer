@@ -232,14 +232,15 @@ buffer を明示クリアしてから native presenter を渡し、前動画の�
 のを抑える。
 
 静止画フルスクリーンでも、動画再生中と同じ idle タイマ (`CURSOR_HIDE_IDLE_SECS`) を使う。
-UI / パネル / ダイアログが出ていない状態でマウス・キー入力が止まると `CursorIcon::None`
+UI / パネル / ダイアログが出ていない状態でマウス操作が止まると `CursorIcon::None`
 に加えて viewport の `CursorVisible(false)` を送るため、スライドショー再生中も OS カーソルが
-画面上に残らない。スライドショーのタイマー送りではこの idle 状態を次画像へ引き継ぎ、
-画像切替だけでカーソルを再表示しない。`open_fullscreen` の cursor リセットは fullscreen
-新規入場向けであり、ユーザー入力を伴わない fullscreen 内自動ナビでは呼び出し元が状態を
-引き継ぐ。カーソル非表示中は最後の hover 座標を stale とみなし、上バー / 右パネル /
+画面上に残らない。スライドショーのタイマー送りやキーによるページ送りではこの idle 状態を
+次画像へ引き継ぎ、画像切替だけでカーソルを再表示しない。`open_fullscreen` の cursor
+リセットは fullscreen 新規入場向けであり、fullscreen 内ナビでは呼び出し元が状態を引き継ぐ。
+カーソル非表示中は最後の hover 座標を stale とみなし、上バー / 右パネル /
 補正パネル edge hover / panel 内判定など、passive hover 由来の状態遷移では
-`!cursor_hidden` で gate する。入力または固定 UI 表示が戻ったら `CursorVisible(true)` で復帰する。
+`!cursor_hidden` で gate する。マウス操作または固定 UI 表示が戻ったら
+`CursorVisible(true)` で復帰する。
 
 #### 2.2.2 右パネルへの動的状態反映
 

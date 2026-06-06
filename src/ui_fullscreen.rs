@@ -28,6 +28,12 @@ use crate::pdf_loader::PdfPageContentType;
 use crate::settings::SpreadMode;
 use crate::ui_helpers::{HoverTipExt, open_external_player};
 
+#[derive(Clone, Copy)]
+pub(crate) struct FullscreenCursorState {
+    last_activity: Option<std::time::Instant>,
+    hidden: bool,
+}
+
 pub(crate) mod draw_icons;
 use self::draw_icons::*;
 
@@ -1833,7 +1839,8 @@ impl App {
                 self.fs_prev_focused = focused_now;
 
                 // カーソル自動非表示用のアクティビティ検出。マウス移動 / クリック /
-                // ホイール / キー入力のいずれかがあれば「活動中」とみなしタイマをリセット。
+                // ホイールがあれば「活動中」とみなしタイマをリセットする。キー操作は
+                // カーソルを再表示しない。
                 // `pointer.velocity()` ではなく `delta()` を使う (velocity は静止後も
                 // 慣性を残し、3 秒タイマがいつまでも進まない誤動作になるため)。
                 // `open_fullscreen` で Some 初期化されるが、想定外の入場経路で None の
@@ -1846,12 +1853,6 @@ impl App {
                         || i.pointer.any_pressed()
                         || i.pointer.any_click()
                         || i.smooth_scroll_delta != egui::Vec2::ZERO
-                        || i.events.iter().any(|e| {
-                            matches!(
-                                e,
-                                egui::Event::Key { pressed: true, .. } | egui::Event::Text(_)
-                            )
-                        })
                 });
                 if cursor_active {
                     self.cursor_last_activity = Some(std::time::Instant::now());
@@ -2696,7 +2697,7 @@ impl App {
                                 self.reset_analysis_mode();
                             }
                             self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
-                            self.normalize_spread_position();
+                            self.normalize_spread_position(ctx);
                         }
                     });
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
@@ -2709,7 +2710,7 @@ impl App {
                 // `any_dialog_open()` で `fs_ui_is_clean` が false を返すため抑制される。
                 //
                 // 状態機械:
-                // - 入力あり / UI 表示中: `cursor_last_activity = Some(now)`,
+                // - マウス操作あり / UI 表示中: `cursor_last_activity = Some(now)`,
                 //   `cursor_hidden = false` (idle タイマをリセット)。これにより
                 //   一時停止 (HUD 表示中) の間にタイマが古くなり、再開直後に即座に
                 //   カーソルが消える事故を防ぐ。
@@ -3423,8 +3424,31 @@ impl App {
         Some((new_idx, new_mode))
     }
 
+    pub(crate) fn fullscreen_cursor_state(&self) -> FullscreenCursorState {
+        FullscreenCursorState {
+            last_activity: self.cursor_last_activity,
+            hidden: self.cursor_hidden,
+        }
+    }
+
+    pub(crate) fn restore_fullscreen_cursor_state(
+        &mut self,
+        ctx: &egui::Context,
+        state: FullscreenCursorState,
+    ) {
+        self.cursor_last_activity = state.last_activity;
+        self.cursor_hidden = state.hidden;
+        if state.hidden {
+            ctx.send_viewport_cmd_to(
+                self.fullscreen_viewport_id(),
+                egui::ViewportCommand::CursorVisible(false),
+            );
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
+    }
+
     /// 見開きモード切替後、fullscreen_idx をペアの先頭に正規化する。
-    pub(crate) fn normalize_spread_position(&mut self) {
+    pub(crate) fn normalize_spread_position(&mut self, ctx: &egui::Context) {
         if !self.spread_mode.is_spread() {
             return;
         }
@@ -3444,7 +3468,9 @@ impl App {
         if relative % 2 != 0 {
             // ペアの2番目にいるので1番目に戻す
             let new_idx = nav[pos - 1];
+            let cursor_state = self.fullscreen_cursor_state();
             self.open_fullscreen(new_idx);
+            self.restore_fullscreen_cursor_state(ctx, cursor_state);
             self.selected = Some(new_idx);
         }
     }
@@ -4051,7 +4077,7 @@ impl App {
                     self.reset_analysis_mode();
                 }
                 // ページ位置を正規化
-                self.normalize_spread_position();
+                self.normalize_spread_position(ctx);
             }
             // フィードバック表示
             let key_num = if key_1 {
@@ -5202,7 +5228,13 @@ impl App {
             self.cancel_stale_video_tile_reopen(self.fullscreen_idx, "fs-navigation");
         }
 
+        let cursor_state = self.fullscreen_cursor_state();
         self.open_fullscreen(idx);
+        // `open_fullscreen` resets cursor idleness for a new fullscreen entry.
+        // Fullscreen-internal navigation should keep the mouse cursor state continuous;
+        // keyboard page turns must not revive a hidden cursor, while pointer navigation
+        // has already marked the cursor active before reaching this helper.
+        self.restore_fullscreen_cursor_state(ctx, cursor_state);
 
         #[cfg(windows)]
         {
@@ -5221,26 +5253,9 @@ impl App {
     }
 
     fn open_fullscreen_from_slideshow_navigation(&mut self, ctx: &egui::Context, idx: usize) {
-        let cursor_last_activity = self.cursor_last_activity;
-        let cursor_hidden = self.cursor_hidden;
+        // Timer-driven slideshow advances are fullscreen-internal navigation too, so
+        // use the same cursor-state carry path as keyboard/mouse page turns.
         self.open_fullscreen_from_fs_navigation(ctx, idx);
-        // `open_fullscreen` resets cursor idleness for a new fullscreen entry. Slideshow
-        // advances are timer-driven fullscreen-internal navigation, so keep the idle
-        // countdown/hidden state continuous across image changes; otherwise every slide
-        // briefly revives the OS cursor.
-        self.cursor_last_activity = cursor_last_activity;
-        self.cursor_hidden = cursor_hidden;
-        if cursor_hidden {
-            // The per-frame hide loop is skipped while panels/HUD are visible; assert the
-            // OS cursor state here so timer-driven slides cannot flash it back on.
-            // This helper runs after `show_viewport_immediate`, so target the fullscreen
-            // viewport explicitly rather than the root viewport context.
-            ctx.send_viewport_cmd_to(
-                self.fullscreen_viewport_id(),
-                egui::ViewportCommand::CursorVisible(false),
-            );
-            ctx.set_cursor_icon(egui::CursorIcon::None);
-        }
     }
 
     pub(crate) fn handle_fullscreen_ctrl_nav_context(
@@ -5384,7 +5399,7 @@ impl App {
         #[cfg(windows)]
         if native_toast {
             self.show_native_video_overlay_toast(Self::nav_noop_title(reason).to_string(), true);
-            self.mark_native_video_hud_activity(ctx);
+            self.request_native_video_hud_repaint(ctx);
             return;
         }
 

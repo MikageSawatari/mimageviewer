@@ -3793,13 +3793,13 @@ pub struct App {
     /// フィードバックトーストをクリックしたときに Explorer で選択表示する対象。
     /// 通常トーストでは None。キャプチャ保存成功時だけ Some にする。
     pub(crate) fs_feedback_toast_reveal_path: Option<PathBuf>,
-    /// フルスクリーンでマウスカーソルの最終活動時刻 (移動 / クリック / キー入力)。
+    /// フルスクリーンでマウスカーソルの最終活動時刻 (移動 / クリック / ホイール)。
     /// パネル / HUD が全て非表示で `CURSOR_HIDE_IDLE_SECS` 経過したらカーソルを隠す。
     /// `None` はまだ活動が記録されていない状態 (= 直前に活動があったとみなしカーソル表示)。
     /// パネル / HUD 表示中もタイマをリセットする (= 表示が消えてから 3 秒測り直し)。
     pub(crate) cursor_last_activity: Option<std::time::Instant>,
     /// 直前フレームでカーソルを `CursorIcon::None` で隠した sticky フラグ。
-    /// 隠した後は次の活動 / UI 表示までこの状態を維持する。これにより 3 秒経過直後の
+    /// 隠した後は次のマウス操作 / UI 表示までこの状態を維持する。これにより 3 秒経過直後の
     /// 1 フレームで隠した後、render が間引かれてもカーソルが復活しない (egui は
     /// 毎フレーム set_cursor_icon を呼ばないと cursor 状態が消えるため、`cursor_hidden`
     /// が true の間は毎フレーム None を打ち続ける)。
@@ -14935,9 +14935,9 @@ impl App {
         // 状態を引き継がないようにする)。前回フルスクリーンを 5 分放置した後に
         // すぐ再入場した場合、Some(<古い時刻>) のままだと 1 フレーム目で
         // 「3 秒以上経過」と判定されカーソルが即時消える事故を防ぐ。
-        // NOTE: この無条件リセットは「新規入場」向け。スライドショーのタイマー送りなど、
-        // ユーザー入力ではない fullscreen 内自動ナビは cursor 状態を保存・復元する
-        // `open_fullscreen_from_slideshow_navigation` のようなラッパーを通すこと。
+        // NOTE: この無条件リセットは「新規入場」向け。ページ送り / スライドショーなどの
+        // fullscreen 内ナビは cursor 状態を保存・復元する
+        // `open_fullscreen_from_fs_navigation` のようなラッパーを通すこと。
         self.cursor_last_activity = Some(std::time::Instant::now());
         self.cursor_hidden = false;
         self.refresh_fullscreen_video_marker_cache(idx);

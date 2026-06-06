@@ -128,6 +128,7 @@ pub(crate) struct NativeVideoSourceSwapPending {
     pub(crate) requested_at: std::time::Instant,
     pub(crate) deadline: std::time::Instant,
     pub(crate) input_seq: u64,
+    pub(crate) cursor_state: crate::ui_fullscreen::FullscreenCursorState,
 }
 
 #[cfg(windows)]
@@ -578,6 +579,7 @@ impl App {
             requested_at: now,
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: self.input_seq,
+            cursor_state: self.fullscreen_cursor_state(),
         });
         crate::logger::log(format!(
             "[native-video] defer source swap: reason={reason} from_idx={from_idx} -> target_idx={target_idx}"
@@ -741,6 +743,7 @@ impl App {
             reason,
             requested_at,
             input_seq,
+            cursor_state,
             ..
         } = pending;
 
@@ -768,6 +771,7 @@ impl App {
         );
         self.init_normalize_state_for_opened_video(target_idx);
         self.open_fullscreen(target_idx);
+        self.restore_fullscreen_cursor_state(ctx, cursor_state);
         if start_normalize_scan_before_play {
             if !self.start_normalize_scan_for_deferred_play_intent(target_idx) {
                 self.resume_deferred_normalize_playback_without_scan(target_idx);
@@ -1935,6 +1939,7 @@ impl App {
                 self.handle_native_video_mouse_button(ctx, fs_idx, button);
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseWheel(wheel) => {
+                self.mark_native_video_hud_activity(ctx);
                 if wheel.ctrl && self.video_tile_mode_active {
                     let delta = if wheel.delta > 0 { -1 } else { 1 };
                     self.adjust_native_video_tile_columns(ctx, fs_idx, delta);
@@ -1942,7 +1947,6 @@ impl App {
                     let delta = if wheel.delta < 0 { 1 } else { -1 };
                     self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
                 }
-                self.mark_native_video_hud_activity(ctx);
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseLeave => {
                 self.native_video_pointer_down = None;
@@ -4706,7 +4710,7 @@ impl App {
             // M: mute
             0x4D if !key.shift && !key.ctrl && !key.repeat => {
                 if self.toggle_video_session_mute_for_fs_idx(fs_idx) {
-                    self.mark_native_video_hud_activity(ctx);
+                    self.request_native_video_hud_repaint(ctx);
                 }
             }
             // L: loop (4 段階サイクル: Off → Full → Chapter → Bookmark)
@@ -4781,7 +4785,7 @@ impl App {
             }
         }
         if hud_activity {
-            self.mark_native_video_hud_activity(ctx);
+            self.request_native_video_hud_repaint(ctx);
         }
     }
 
@@ -5171,7 +5175,7 @@ impl App {
         };
         self.show_native_video_overlay_toast(Self::native_boundary_hint_text(hint), true);
         self.fs_boundary_hint = Some(hint);
-        self.mark_native_video_hud_activity(ctx);
+        self.request_native_video_hud_repaint(ctx);
     }
 
     #[cfg(windows)]
@@ -5655,7 +5659,9 @@ impl App {
 
         self.fs_video_open_autoplay_override = autoplay_override;
         self.fs_video_open_ignore_resume_once = ignore_resume;
+        let cursor_state = self.fullscreen_cursor_state();
         self.open_fullscreen(idx);
+        self.restore_fullscreen_cursor_state(ctx, cursor_state);
 
         if restore_video_tile && restore_target_is_video {
             self.set_native_video_tile_preparing_overlay(idx);
@@ -5739,20 +5745,29 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn mark_native_video_hud_activity(&mut self, ctx: &egui::Context) {
         let now = std::time::Instant::now();
-        // ネイティブビデオウィンドウのマウス/キー入力は eframe フルスクリーンビューポートの
+        // ネイティブビデオウィンドウの pointer 入力は eframe フルスクリーンビューポートの
         // input には現れないため、カーソル auto-hide のアクティビティタイマもここで更新する。
-        // 動画 HUD 活動 = ユーザーがマウスを動かしたかキー操作した = カーソル可視。
+        // キー操作はカーソルを再表示しないので `request_native_video_hud_repaint` を使う。
         self.cursor_last_activity = Some(now);
         self.cursor_hidden = false;
-        // eframe 経由のキー入力 (Space で pause/resume 等) は native presenter HWND の
-        // `push_native_event` を経由しないので、NativeEguiOverlay 側の cursor タイマが
-        // ズレる (= 一時停止前にカーソルが隠れていたまま再開しても消えたままになる)。
-        // current の player に明示的にアクティビティを伝搬してリセットさせる。
+        // eframe 経由の pointer 活動は native presenter HWND の `push_native_event` を
+        // 経由しないことがあるため、current の player に明示的に伝搬する。
         if let Some(idx) = self.fullscreen_idx
             && let Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) =
                 self.fs_cache.get(&idx)
         {
             player.mark_cursor_activity();
+        }
+        ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn request_native_video_hud_repaint(&mut self, ctx: &egui::Context) {
+        if let Some(idx) = self.fullscreen_idx
+            && let Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) =
+                self.fs_cache.get(&idx)
+        {
+            player.request_native_overlay_render();
         }
         ctx.request_repaint();
     }
