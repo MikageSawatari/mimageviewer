@@ -2738,6 +2738,9 @@ impl App {
                         // ── スタンプ埋め込み worker の進行表示 (中央「読み込み中」) ──
                         self.draw_stamp_embed_overlay(ui, full_rect, ctx);
 
+                        // ── 注釈ベイク worker の進行表示 (中央「テキスト処理中…」) ──
+                        self.draw_comic_bake_overlay(ui, full_rect, ctx);
+
                         // 動画ブックマーク名編集ダイアログは native presenter overlay の
                         // 中で描画される (= `native_presenter/overlay_draw.rs::draw_native_*`)。
                         // eframe ビューポートからは描画しない。
@@ -8727,6 +8730,121 @@ impl App {
             return;
         }
         let text = "スタンプ読み込み中…";
+        let font = egui::FontId::proportional(20.0);
+        let galley =
+            ui.painter()
+                .layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE);
+        let padding = egui::vec2(28.0, 18.0);
+        let box_size = galley.size() + padding * 2.0;
+        let rect = egui::Rect::from_center_size(full_rect.center(), box_size);
+        ui.painter().rect_filled(
+            rect,
+            10.0,
+            egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230),
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            font,
+            egui::Color32::WHITE,
+        );
+        // worker 完了を取りこぼさないよう毎フレーム再描画。
+        ctx.request_repaint();
+    }
+
+    /// 注釈ベイク worker (B) の完了を取り込み (GPU upload + `comic_cache` 挿入) し、現在表示中の
+    /// ページのベイクが進行中なら `true` を返す (トースト表示用)。`try_recv` は `&self` なので
+    /// iter 中に取り出し、完了/切断した idx を集めてから mutable 処理する。
+    pub(crate) fn poll_comic_bake(&mut self, ctx: &egui::Context) -> bool {
+        if self.comic_bake_pending.is_empty() {
+            return false;
+        }
+        let mut ready: Vec<(usize, crate::app::ComicBakeResult)> = Vec::new();
+        let mut dropped: Vec<usize> = Vec::new();
+        for (&i, p) in self.comic_bake_pending.iter() {
+            match p.rx.try_recv() {
+                Ok(r) => ready.push((i, r)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => dropped.push(i),
+            }
+        }
+        for i in dropped {
+            self.comic_bake_pending.remove(&i);
+        }
+        for (i, r) in ready {
+            let Some(p) = self.comic_bake_pending.remove(&i) else {
+                continue;
+            };
+            let composed = std::sync::Arc::new(r.pixels);
+            let t_up = std::time::Instant::now();
+            let upload = crate::app::clamp_for_gpu(&composed).into_owned();
+            let texture = ctx.load_texture(
+                format!(
+                    "comic_{i}_{}_{}_{}",
+                    std::sync::Arc::as_ptr(&p.base) as usize,
+                    p.comic_gen,
+                    p.preview_scale
+                ),
+                upload,
+                egui::TextureOptions::LINEAR,
+            );
+            let upload_ms = t_up.elapsed().as_secs_f64() * 1000.0;
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "fs",
+                    "comic_composite_build",
+                    None,
+                    0,
+                    &[
+                        ("ms", (r.bake_ms + r.composite_ms + upload_ms).into()),
+                        ("bake_ms", r.bake_ms.into()),
+                        ("composite_ms", r.composite_ms.into()),
+                        ("upload_ms", upload_ms.into()),
+                        ("w", (r.w as u64).into()),
+                        ("h", (r.h as u64).into()),
+                        ("objs", (r.objs as u64).into()),
+                        ("preview_scale", (p.preview_scale as u64).into()),
+                        ("idx", (i as u64).into()),
+                        ("worker", true.into()),
+                    ],
+                );
+            }
+            self.comic_cache.insert(
+                i,
+                crate::app::ComicCacheEntry {
+                    pixels: composed,
+                    texture,
+                    base: p.base,
+                    comic_gen: p.comic_gen,
+                    dims: p.dims,
+                    preview_scale: p.preview_scale,
+                },
+            );
+            ctx.request_repaint();
+        }
+        // 表示中ページのベイクが 150ms 以上続いていればトースト対象 (軽い注釈の高速ベイクで
+        // 一瞬チラつかせない)。完了の取り込み自体は上で常に行う (ensure 側が毎フレーム
+        // request_repaint するので、トースト非表示でも poll は回り続ける)。
+        self.fullscreen_idx.is_some_and(|fi| {
+            self.comic_bake_pending
+                .get(&fi)
+                .is_some_and(|p| p.started.elapsed().as_millis() >= 150)
+        })
+    }
+
+    /// 注釈ベイク worker の進行表示 (中央「テキスト処理中…」)。完了取り込み + 進行判定は
+    /// `poll_comic_bake` が行い、進行中のときだけトーストを描く (stamp embed と同流儀)。
+    pub(crate) fn draw_comic_bake_overlay(
+        &mut self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        ctx: &egui::Context,
+    ) {
+        if !self.poll_comic_bake(ctx) {
+            return;
+        }
+        let text = "テキスト処理中…";
         let font = egui::FontId::proportional(20.0);
         let galley =
             ui.painter()

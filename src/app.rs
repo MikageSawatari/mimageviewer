@@ -1777,6 +1777,36 @@ pub(crate) struct ComicPreviewBase {
     pub reduced: Arc<egui::ColorImage>,
 }
 
+/// 注釈ベイク worker (B) の結果。CPU 合成済みピクセル + perf 計測値。GPU upload は
+/// 受け取った UI スレッド側 (`poll_comic_bake`) で行う。
+pub(crate) struct ComicBakeResult {
+    pub pixels: egui::ColorImage,
+    pub bake_ms: f64,
+    pub composite_ms: f64,
+    pub objs: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+/// 進行中の注釈ベイク worker (idx をキーに `comic_bake_pending` で保持)。完了したら
+/// `poll_comic_bake` が upload して `comic_cache` に挿入する。下地が AI 等で作り直されたり
+/// 注釈が編集されたら条件不一致で破棄・再投入される。
+pub(crate) struct ComicBakePending {
+    /// 投入時の `comic_generation`。
+    pub comic_gen: u64,
+    /// 投入時の full-res 下地 (cache エントリの `base` に入れる。`Arc::ptr_eq` で同一性判定)。
+    pub base: Arc<egui::ColorImage>,
+    /// full base 寸法 (cache の `dims`)。
+    pub dims: [usize; 2],
+    /// 投入時のプレビュー解像度分母。
+    pub preview_scale: u32,
+    /// worker 投入時刻。軽い注釈 (高速ベイク) でトーストが一瞬チラつかないよう、一定時間
+    /// 以上かかっているベイクだけトーストを出すために使う。
+    pub started: std::time::Instant,
+    /// 合成済みピクセルの受信口。
+    pub rx: std::sync::mpsc::Receiver<ComicBakeResult>,
+}
+
 /// テキスト注釈のキャンバス上ドラッグの種別 (Inc 6 変形ハンドル)。
 /// どのハンドルを掴んでドラッグしているかを表す。
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -4118,6 +4148,10 @@ pub struct App {
     /// full base の Arc を握って `Arc::ptr_eq` + scale で同一性判定する (base 変化 / 倍率変更で
     /// 作り直し)。`text_preview_scale == 1` のときは None。
     pub(crate) comic_preview_base: Option<ComicPreviewBase>,
+    /// 進行中の注釈ベイク worker (idx-keyed、B)。ベイク + 合成は CPU 重め (テキスト効果) なので
+    /// バックグラウンドへ。UI は下地 (注釈なし) を表示し続け、`poll_comic_bake` が完了を取り込む。
+    /// 同時数は見開き想定で 2 までに制限。
+    pub(crate) comic_bake_pending: std::collections::HashMap<usize, ComicBakePending>,
     /// 注釈編集の世代番号 (Inc 2 以降で編集確定ごとに +1)。`comic_cache` の各 entry は
     /// この値と照合され、不一致なら miss 扱い (conceal_generation と同じ lazy eviction)。
     pub(crate) comic_generation: u64,
@@ -5356,6 +5390,7 @@ impl App {
             conceal_generation: 0,
             comic_cache: std::collections::HashMap::new(),
             comic_preview_base: None,
+            comic_bake_pending: std::collections::HashMap::new(),
             comic_generation: 0,
             comic_fonts: None,
             comic_fonts_loaded: false,
@@ -21633,21 +21668,7 @@ impl App {
         }
         // 下地は AI 完了済み (complete) の最終 composite。AI 待ちの間は None が返るので
         // comic はまだ出ない (= comic は AI より後段、正しい)。
-        let base = match self.ensure_final_composite_pixels(ctx, idx) {
-            Some(b) => b,
-            None => {
-                use std::sync::Once;
-                static LOGGED: Once = Once::new();
-                LOGGED.call_once(|| {
-                    crate::logger::log(
-                        "[comic] base final-composite pixels not ready (incomplete/AI pending); \
-                         overlay deferred"
-                            .to_string(),
-                    );
-                });
-                return None;
-            }
-        };
+        let base = self.ensure_final_composite_pixels(ctx, idx)?;
         let [w, h] = base.size;
         let comic_gen = self.comic_generation;
         // テキスト編集中のみプレビュー解像度を下げる (R2 perf)。ツールを閉じると 1 に戻り、
@@ -21668,6 +21689,25 @@ impl App {
             {
                 return Some(entry.texture.clone());
             }
+        }
+        // この idx の worker が同条件で進行中なら再投入しない (= 焼き上がり待ち)。進行中は
+        // `draw_comic_bake_overlay` が中央トーストを出し、`poll_comic_bake` が完了を取り込む。
+        if let Some(p) = self.comic_bake_pending.get(&idx) {
+            if p.comic_gen == comic_gen
+                && Arc::ptr_eq(&p.base, &base)
+                && p.preview_scale == preview_scale
+            {
+                ctx.request_repaint();
+                return None;
+            }
+            // 条件が変わった (注釈編集 / 下地再構築 / 倍率変更) → 破棄して下で再投入。
+            self.comic_bake_pending.remove(&idx);
+        }
+        // 同時ベイク数を抑える (見開き = 2 を想定)。埋まっていれば次フレームに回す
+        // (連打ナビで worker が大量に積み上がるのを防ぐ)。
+        if self.comic_bake_pending.len() >= 2 {
+            ctx.request_repaint();
+            return None;
         }
         // 注釈を comic.db から解決 (page_path_key)。デモ有効で永続注釈が無ければ、
         // デモをシードして comic.db に保存する (Inc 2 の round-trip 検証用。デモを
@@ -21727,80 +21767,61 @@ impl App {
             Arc::clone(&base)
         };
         let [bw, bh] = bake_base.size;
-        // 同期ベイク (隠蔽 conceal と同流儀)。画像ごと 1 回・キャッシュ済みで毎フレーム
-        // ではないが、実コンテンツでの worker 化要否を判断できるよう計測する。閾値 (80ms)
-        // 超過は conceal と同じく perf ログに出す (§10、Inc 4+ で実測して判断)。
-        let bake_start = std::time::Instant::now();
+        // ベイク + 合成は CPU 重め (テキスト効果) なので worker スレッドへ投入する (B)。
+        // UI は下地 (注釈なし) を表示し続け、完了したら `poll_comic_bake` が GPU upload して
+        // `comic_cache` に挿入する。進行中は `draw_comic_bake_overlay` が中央トーストを出す。
         let s_bake = (bw.max(bh) as f32) / src_w.max(src_h).max(1.0);
-        let scaled_objects = if (s_bake - 1.0).abs() > 1e-4 {
-            comic_core::scale_scene(&objects, s_bake)
-        } else {
-            objects.clone()
-        };
-        let stamp_images = self.build_stamp_images(&scaled_objects);
-        let t_bake0 = std::time::Instant::now();
-        let overlay =
-            comic_core::bake_overlay_with_stamps(&scaled_objects, bw, bh, &fonts, &stamp_images);
-        let cc_bake_ms = t_bake0.elapsed().as_secs_f64() * 1000.0;
-        let t_comp0 = std::time::Instant::now();
-        let composed = Arc::new(crate::comic_overlay::composite_overlay_over(
-            &bake_base, &overlay,
-        ));
-        let cc_composite_ms = t_comp0.elapsed().as_secs_f64() * 1000.0;
-        let upload = clamp_for_gpu(&composed);
-        let t_up0 = std::time::Instant::now();
-        let texture = ctx.load_texture(
-            format!(
-                "comic_{idx}_{}_{comic_gen}_{preview_scale}",
-                Arc::as_ptr(&base) as usize
-            ),
-            upload.into_owned(),
-            egui::TextureOptions::LINEAR,
-        );
-        let cc_upload_ms = t_up0.elapsed().as_secs_f64() * 1000.0;
-        let bake_total_ms = bake_start.elapsed().as_secs_f64() * 1000.0;
-        // 画像オープン/編集時のフリーズ調査用 perf 計装 (--perf-log)。注釈ベイク +
-        // overlay 合成 + GPU upload は UI スレッド同期。cache miss 時のみ emit
-        // (毎フレームではない)。bake_ms はテキスト効果込みの注釈描画、composite_ms は
-        // 下地への重畳 (rayon)、upload_ms は GPU 転送。
-        if crate::perf::is_enabled() {
-            crate::perf::event(
-                "fs",
-                "comic_composite_build",
-                None,
-                0,
-                &[
-                    ("ms", bake_total_ms.into()),
-                    ("bake_ms", cc_bake_ms.into()),
-                    ("composite_ms", cc_composite_ms.into()),
-                    ("upload_ms", cc_upload_ms.into()),
-                    ("w", (bw as u64).into()),
-                    ("h", (bh as u64).into()),
-                    ("objs", (objects.len() as u64).into()),
-                    ("preview_scale", (preview_scale as u64).into()),
-                    ("idx", (idx as u64).into()),
-                ],
-            );
-        }
-        let elapsed_ms = bake_total_ms as u128;
-        if elapsed_ms >= 80 {
-            crate::logger::log(format!(
-                "[comic] bake+composite+upload {elapsed_ms}ms idx={idx} {bw}x{bh} (scale 1/{preview_scale}) objs={}",
-                objects.len()
-            ));
-        }
-        self.comic_cache.insert(
+        // stamp 画像は decode キャッシュ (&mut self) を使うので UI スレッドで解決してから move。
+        // id はスケール非依存なので unscaled objects から引いてよい。
+        let stamp_images = self.build_stamp_images(&objects);
+        let objs_len = objects.len();
+        let fonts_worker = Arc::clone(&fonts);
+        let base_worker = Arc::clone(&bake_base);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("comic-bake".into())
+            .spawn(move || {
+                let scaled = if (s_bake - 1.0).abs() > 1e-4 {
+                    comic_core::scale_scene(&objects, s_bake)
+                } else {
+                    objects
+                };
+                let t_bake = std::time::Instant::now();
+                let overlay = comic_core::bake_overlay_with_stamps(
+                    &scaled,
+                    bw,
+                    bh,
+                    &fonts_worker,
+                    &stamp_images,
+                );
+                let bake_ms = t_bake.elapsed().as_secs_f64() * 1000.0;
+                let t_comp = std::time::Instant::now();
+                let composed = crate::comic_overlay::composite_overlay_over(&base_worker, &overlay);
+                let composite_ms = t_comp.elapsed().as_secs_f64() * 1000.0;
+                // rx が drop 済み (stale 破棄) なら send は失敗するだけ (worker は完走する)。
+                let _ = tx.send(crate::app::ComicBakeResult {
+                    pixels: composed,
+                    bake_ms,
+                    composite_ms,
+                    objs: objs_len,
+                    w: bw,
+                    h: bh,
+                });
+            })
+            .ok();
+        self.comic_bake_pending.insert(
             idx,
-            ComicCacheEntry {
-                pixels: composed,
-                texture: texture.clone(),
-                base: Arc::clone(&base),
+            ComicBakePending {
                 comic_gen,
+                base: Arc::clone(&base),
                 dims: [w, h],
                 preview_scale,
+                started: std::time::Instant::now(),
+                rx,
             },
         );
-        Some(texture)
+        ctx.request_repaint();
+        None
     }
 
     /// `comic_cache` の現エントリのテクスチャを副作用なしで返す (holdover / display-tex
