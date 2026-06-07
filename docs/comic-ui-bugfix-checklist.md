@@ -221,6 +221,22 @@
   overwrite_non_preferences_from に text_preview_scale を追加。
 - 確認済み: P1 分析ボタン経路統一・D10 コメント・ピン留め無効化・フル解像度 export。
 
+### ✅ FB. 実機 FB: 自動サイズ過大 + しっぽ先端の潜り込み (`bdb07ab2`)
+- 症状: セリフ自動サイズ ON で長文 (特に縦書き) だと吹き出しが過大に膨らみ左右余白が大きい。
+  さらに本体が育つと固定距離の既定しっぽ先端が内部に潜り、内向きツノに反転して崩れる。
+- 原因①: `tessellate::fit_bubble_shape` の `MAX_ASPECT=1.8` が縦書き長文 (例 アスペクト6:1) を
+  丸い楕円へ強制 → 横方向に約2.7倍水増し。
+- 原因②: `Tail.tip` は絶対座標で、auto_size の形状拡大は bake/幾何時に遅延計算され tip 更新
+  イベントが無い。既定 tip は pivot から固定106px → 楕円が半径〜300pxに育つと内部に入る。
+  `auto_base_t` の出口が tip より外になり三角形が内向きに反転。
+- 対応: ① `MAX_ASPECT` を 4.5 へ緩和 (縦長で文字に沿わせる)。② `resolve_tail_tip`
+  (内部 `project_tip_outside`) を新設 — 中心→tip の方向は保持し半径距離を「輪郭出口 +
+  `TAIL_MIN_OVERHANG(28px)`」以上へ投影。`bubble_geometry` の Spike/Thought 双方で使用、
+  `ui_text` / `comic_lab` の先端ハンドル・AABB も `resolve_tail_tip` 経由へ統一 (lab parity)。
+  保存 `tail.tip` は素のまま (描画/当たり判定のみ補正、手動の内側ドラッグでも潜らない)。
+- テスト: comic-core 97 passed (aspect 閾値更新 + `resolve_tail_tip_pushes_tip_outside` 追加)、
+  本体 bin 2100 passed。設計メモ = docs/speech-bubble-text-tool-plan.md §3.2。
+
 ## 進め方
 - P0 → P1 → P2 の順。各修正は pathspec commit（src/ui_text.rs 等）、退避ブランチ `comic-inc6` 維持。
 - まとまった単位で Codex レビュー。
