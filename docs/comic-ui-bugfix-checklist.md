@@ -162,10 +162,13 @@
   upload (ensure_conceal_texture / local-adjust render 完了 upload)。edit_result の universal upload
   は F2 で解消済み。完全 CPU 化は conceal/erase/local の CPU 専用版分離が要る中規模。**要方針判断**。
 
-### 💬 R2-6. ユーザー画像スタンプ追加が UI スレッドで重い [P2]
-- ファイル選択直後に embed_file_stamp (read→decode→縮小→PNG encode→base64) + apply 側で aspect 用に
-  埋め込み PNG を再 decode + comic.db 保存が同期。大判写真で ~100-250ms の一回限りフリーズ。**一発
-  操作 (file picker) なので許容 / worker 化 (中規模) のどちらかを方針判断**。
+### ✅ R2-6. ユーザー画像スタンプ追加が UI スレッドで重い (`8e9de7dc`) [P2]
+- 実測 (release・写真ライク): 12MP≈115ms / 24MP(10MBクラス)≈195ms / 48MP≈375ms (embed_file_stamp_timing
+  テスト)。JPEG DCT スケール decode も試したが 1024px ターゲットでは 1/4 止まり=エントロピー復号支配で
+  無効果だったため revert。
+- **ユーザー判断: 中央トースト付きで worker 化**。embed_file_stamp を背景スレッド (StampEmbedPending) へ
+  逃がし、処理中は画面中央に「スタンプ読み込み中…」(draw_stamp_embed_overlay)、完了で apply_stamp_choice。
+  UI は固まらず、サイズ上限不要。stale (ページ移動/モード終了/フォルダ変更) は cancel して破棄。
 
 ## 進め方
 - P0 → P1 → P2 の順。各修正は pathspec commit（src/ui_text.rs 等）、退避ブランチ `comic-inc6` 維持。
