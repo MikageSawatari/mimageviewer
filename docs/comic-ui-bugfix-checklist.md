@@ -237,6 +237,24 @@
 - テスト: comic-core 97 passed (aspect 閾値更新 + `resolve_tail_tip_pushes_tip_outside` 追加)、
   本体 bin 2100 passed。設計メモ = docs/speech-bubble-text-tool-plan.md §3.2。
 
+### ✅ FB2. 実機 FB: 注釈付き画像のオープンで8秒固まり (`8afd947c`, perf計装 `e18b412f`)
+- 症状: テキスト効果付き注釈のある画像を開くと数秒〜「応答なし」。perf-log で
+  `fs/comic_composite_build` が full解像度(3584x4608)で **bake_ms=7956 (約8秒)** と判明
+  (編集中の1/4プレビューでは55-66ms)。下地 `fs/final_composite_build` は最大44msで無罪。
+- 原因: `font::dilate_coverage` が総当たり円形ダイレート O(面積×半径²)。これを
+  `draw_layout_soft_mask` が影/グローで最大8パス + アウトライン分、グリフ毎に再ラスタ+
+  再ダイレート (キャッシュ無し) → 大判・大文字・大半径で爆発。閲覧は preview_scale=1
+  固定なので開く度に同期実行。別セッション `1aeba973 Add text annotation effects` 由来。
+- 対応 (方針A=高速化・同期維持): dilate_coverage を2パスのチャンファー距離変換に置換。
+  半径非依存の O(出力面積) で coverage=clamp(dilate+0.5-dist) を生成 (内部不透明・境界1px
+  AA)。種は旧挙動同様 coverage>0 全画素 (グリフ完全内包・細線維持)。D1=1/D2=√2。挙動不変。
+- 計装追加 (`e18b412f`): `fs/final_composite_build` (edit/adjust/post/clamp/upload_ms) と
+  `fs/comic_composite_build` (bake/composite/upload_ms) を cache miss 時のみ emit。
+- 実測 (effect_bake_bench, 巨大180px縦+影+グロー+太縁 @3584x4608): release 245ms /
+  debug 999ms (旧 ~8000ms)。約33倍。comic-core 100 passed。
+- 残: さらに詰めるならグリフ素ラスタ/距離場をベイク内キャッシュ (パス間再計算の削減)。
+  現状で「応答なし」は解消見込み。
+
 ## 進め方
 - P0 → P1 → P2 の順。各修正は pathspec commit（src/ui_text.rs 等）、退避ブランチ `comic-inc6` 維持。
 - まとまった単位で Codex レビュー。
