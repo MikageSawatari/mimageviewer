@@ -208,6 +208,11 @@ impl App {
                     .as_ref()
                     .map(|s| s.auto_fullscreen)
                     .unwrap_or(false);
+                // ブロック時に履歴スタックを巻き戻せるよう、state を drop する前に退避する。
+                let nav_history_rollback = self
+                    .archive_convert
+                    .as_ref()
+                    .and_then(|s| s.nav_history_rollback.clone());
                 self.archive_convert = None;
                 if auto_fs {
                     self.pending_auto_fs_open = true;
@@ -215,13 +220,19 @@ impl App {
                 self.load_folder(nav.clone());
                 // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると
                 // current_folder は変わらない。その場合は override / address / recent を
-                // 更新しない (current_folder は元の場所のまま override だけ範囲外アーカイブを
-                // 指す不整合を防ぐ、Codex P1)。
+                // 更新せず、変換ダイアログを開いたときに変えた履歴スタックも巻き戻す
+                // (override と current_folder の不整合・nav スタック残りを防ぐ、Codex P1/P2)。
                 let loaded = self
                     .current_folder
                     .as_ref()
                     .is_some_and(|cur| crate::folder_tree::path_eq(cur, &nav));
-                if loaded && let Some(src) = src {
+                if !loaded {
+                    if let Some(snapshot) = nav_history_rollback {
+                        self.restore_folder_nav_history(snapshot);
+                    }
+                    return;
+                }
+                if let Some(src) = src {
                     self.address = src.to_string_lossy().to_string();
                     // 検索 (Ctrl+G / Ctrl+S) 中は recent_folders を一切変更しない。
                     if !(self.global_search.active || self.favsearch.active) {
@@ -231,7 +242,7 @@ impl App {
                     }
                     self.archive_source_override = Some(src);
                 }
-                if loaded && self.favsearch.active {
+                if self.favsearch.active {
                     self.update_favsearch_address();
                 }
                 return;
