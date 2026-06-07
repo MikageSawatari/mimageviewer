@@ -850,19 +850,21 @@ mIV ウィンドウを OS のドロップターゲットに登録済みで、efr
   1. `file_drag::partition_dropped_paths` で **ディレクトリを全て除外** (v1.1.0 で
      フォルダ drop 無効化)。`folder_skipped` 件数は後段の notice/toast で通知する。
      フォルダ再導入時はここで `dir_copy_would_recurse()` の自己再帰除外を併用する。
-  2. 残り 0 件なら `CopyOutcome::notice` に「ドロップ先と重なる N 件を除外した結果、
-     コピー対象が 0 件になりました」をセットして送る (Codex P2-2 対応: 旧実装はここで
-     `CopyOutcome::default()` を送って poll が無音化していたため、ユーザーは
-     「コピーしています…」のあと拒否理由を見られなかった)。
+  2. 残り 0 件 (= ドロップが全てフォルダ) なら `CopyOutcome::notice` に「フォルダのドロップは
+     現在無効です (N 件をスキップ)。ファイルのみコピーできます」をセットして送る (poll が
+     無音化しないよう notice 経由で必ず通知する)。ファイル + フォルダ混在で `folder_skipped`
+     が残った場合は、コピー完了後の `outcome.notice` に「フォルダ N 件はスキップしました」を補う。
   3. 残りがあれば `copy_paths_into_folder` を呼んで内部 worker から `CopyOutcome` を受け取り、
      UI へ転送。`recv()` の `Err` は `CopyOutcome::all_failed(attempted, reason)` で
      全件失敗扱いに格上げする (Codex P2-1 対応: Disconnected を成功扱いに潰さない)。
 - `file_drag::dir_copy_would_recurse(src, dest)`: 両パスを `canonicalize` 正規化し、
   コピー先 `dest/basename(src)` が `src` 自身または配下かを小文字化 + コンポーネント
   単位の前方一致で判定する。純粋判定部 `copy_target_inside_src` はユニットテスト済み。
-- コピーは `ui_dialogs::context_menu::copy_paths_into_folder` —
-  `Copy-Item -LiteralPath -Recurse -Force` を `try/catch` で囲って失敗カウントと先頭 5 件の
-  エラーメッセージを stdout の `::FAILED::N` / `::ERR::msg` マーカーで返す。spawn 失敗 /
+  **v1.1.0 現在は未使用** (フォルダ drop を全 skip しているため)、フォルダ再導入用に保持。
+- コピーは `ui_dialogs::context_menu::copy_paths_into_folder` — **ディレクトリは skip し**
+  ファイルのみ `Copy-Item -LiteralPath -Force` (`-Recurse` なし) を `try/catch` で囲って失敗
+  カウントと先頭 5 件のエラーメッセージを stdout の `::FAILED::N` / `::ERR::msg` マーカーで
+  返す。spawn 失敗 /
   tmp 書き込み失敗 / `powershell` 実行失敗 / 非ゼロ終了 / マーカー欠落はすべて
   `failed=attempted` で報告する (Codex P2-1 対応: 旧実装は `SilentlyContinue` で全部
   飲んでいた)。
