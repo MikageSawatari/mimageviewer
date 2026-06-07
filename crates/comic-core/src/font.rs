@@ -13,7 +13,10 @@
 //! 縦中横 / 横倒し / column arrangement / kinsoku wrap stay in `layout.rs`
 //! (they are layout composition, not font features).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ab_glyph_rasterizer::{Point, Rasterizer, point};
 use rustybuzz::ttf_parser::{GlyphId, OutlineBuilder};
@@ -45,9 +48,40 @@ self_cell::self_cell!(
 );
 type RbFace<'a> = Face<'a>;
 
+/// Process-unique id assigned to each loaded font, used as the glyph-cache key
+/// prefix so two fonts never collide (the per-bake cache is shared across fonts).
+static FONT_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Per-bake glyph coverage cache (thread-local). Memoizes the expensive outline
+/// scan-conversion (`base`) and the dilated halos (`dilated`) so every repeated
+/// glyph, effect pass, and text block within one bake reuses the result. Cleared
+/// by [`reset_glyph_cache`] at the start of each overlay bake, so memory stays
+/// bounded to roughly one page's glyphs.
+#[derive(Default)]
+struct GlyphCache {
+    base: HashMap<(u64, u16, u32), Arc<GlyphBitmap>>,
+    dilated: HashMap<(u64, u16, u32, u32), Arc<GlyphBitmap>>,
+}
+
+thread_local! {
+    static GLYPH_CACHE: RefCell<GlyphCache> = RefCell::new(GlyphCache::default());
+}
+
+/// Clear the per-bake glyph cache. Called at the start of every overlay bake
+/// (`bake_overlay_with_stamps`) so the cache does not accumulate across pages.
+pub fn reset_glyph_cache() {
+    GLYPH_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.base.clear();
+        c.dilated.clear();
+    });
+}
+
 /// A single loaded font face: the bytes + the parsed face (cached) + design metrics.
 pub struct LoadedFont {
     pub key: String,
+    /// Process-unique id (glyph-cache key prefix).
+    id: u64,
     cell: FaceCell,
     upem: f32,
     ascent_fu: f32,
@@ -68,6 +102,7 @@ impl LoadedFont {
         let line_gap_fu = face.line_gap() as f32;
         Ok(LoadedFont {
             key: key.into(),
+            id: FONT_ID_SEQ.fetch_add(1, Ordering::Relaxed),
             cell,
             upem,
             ascent_fu,
@@ -184,12 +219,15 @@ impl LoadedFont {
     /// Rasterize a glyph id into a coverage bitmap via `ab_glyph_rasterizer`
     /// (the same coverage engine `ab_glyph` uses). `outline_dilate_px` expands
     /// the mask (袋文字 halo) by an 8-neighbour max dilation.
-    pub fn rasterize_gid(
-        &self,
-        gid: u16,
-        size_px: f32,
-        outline_dilate_px: f32,
-    ) -> Option<GlyphBitmap> {
+    /// The bare glyph coverage (no dilation) at `size_px`, memoized in the per-bake
+    /// glyph cache by (font, gid, size). The outline scan-conversion is the
+    /// expensive part and only depends on these, so caching it lets every effect
+    /// pass (which differ only in dilation) and every repeat of the glyph reuse it.
+    fn rasterize_base(&self, gid: u16, size_px: f32) -> Option<Arc<GlyphBitmap>> {
+        let key = (self.id, gid, size_px.to_bits());
+        if let Some(b) = GLYPH_CACHE.with(|c| c.borrow().base.get(&key).cloned()) {
+            return Some(b);
+        }
         let face = self.face();
         let mut col = OutlineCollector::default();
         let r = face.outline_glyph(GlyphId(gid), &mut col)?;
@@ -211,19 +249,50 @@ impl LoadedFont {
                 cov[idx] = a;
             }
         });
-        let base = GlyphBitmap {
+        let base = Arc::new(GlyphBitmap {
             width: base_w as usize,
             height: base_h as usize,
             coverage: cov,
             left: x_min,
             top: -y_max,
+        });
+        GLYPH_CACHE.with(|c| c.borrow_mut().base.insert(key, Arc::clone(&base)));
+        Some(base)
+    }
+
+    /// Coverage mask for `gid` at `size_px`, optionally dilated by
+    /// `outline_dilate_px` (袋文字 halo / glow / shadow base). Memoized per
+    /// (font, gid, size, dilate) in the per-bake cache so repeated glyphs and the
+    /// many effect passes that share a dilation reuse the result.
+    pub fn rasterize_gid(
+        &self,
+        gid: u16,
+        size_px: f32,
+        outline_dilate_px: f32,
+    ) -> Option<Arc<GlyphBitmap>> {
+        let dilate = outline_dilate_px.max(0.0);
+        let dkey = (self.id, gid, size_px.to_bits(), dilate.to_bits());
+        if let Some(b) = GLYPH_CACHE.with(|c| c.borrow().dilated.get(&dkey).cloned()) {
+            return Some(b);
+        }
+        let base = self.rasterize_base(gid, size_px)?;
+        let result = if dilate <= 0.0 {
+            Arc::clone(&base)
+        } else {
+            Arc::new(dilate_coverage(&base, dilate))
         };
-        Some(dilate_coverage(base, outline_dilate_px))
+        GLYPH_CACHE.with(|c| c.borrow_mut().dilated.insert(dkey, Arc::clone(&result)));
+        Some(result)
     }
 
     /// Convenience: rasterize by char (cmap glyph). Shaped/substituted glyphs use
     /// `rasterize_gid`.
-    pub fn rasterize(&self, ch: char, size_px: f32, outline_dilate_px: f32) -> Option<GlyphBitmap> {
+    pub fn rasterize(
+        &self,
+        ch: char,
+        size_px: f32,
+        outline_dilate_px: f32,
+    ) -> Option<Arc<GlyphBitmap>> {
         self.rasterize_gid(self.glyph_id(ch), size_px, outline_dilate_px)
     }
 }
@@ -244,10 +313,10 @@ impl LoadedFont {
 /// blur passes (× shadow/glow/outlines), a full-resolution text-effect bake of a
 /// few annotated glyphs took ~8s on the UI thread (perf log 2026-06-07,
 /// `fs/comic_composite_build`). The chamfer DT makes each pass radius-independent.
-fn dilate_coverage(base: GlyphBitmap, dilate_px: f32) -> GlyphBitmap {
+fn dilate_coverage(base: &GlyphBitmap, dilate_px: f32) -> GlyphBitmap {
     let dilate = dilate_px.max(0.0);
     if dilate <= 0.0 {
-        return base;
+        return base.clone();
     }
     // Solid out to `dilate` + 1px AA fade beyond → pad by ceil(dilate)+1.
     let pad = dilate.ceil() as i32 + 1;
@@ -515,14 +584,14 @@ mod tests {
     #[test]
     fn dilate_zero_returns_base_unchanged() {
         let b = solid(4, 4);
-        let out = dilate_coverage(b.clone(), 0.0);
+        let out = dilate_coverage(&b, 0.0);
         assert_eq!((out.width, out.height), (4, 4));
         assert_eq!(out.coverage, b.coverage);
     }
 
     #[test]
     fn dilate_expands_dims_and_offsets() {
-        let out = dilate_coverage(solid(4, 4), 5.0);
+        let out = dilate_coverage(&solid(4, 4), 5.0);
         // base + 2*(ceil(dilate)+1) on each axis (the +1 holds the AA fade);
         // origin shifts by -pad.
         assert_eq!((out.width, out.height), (16, 16));
@@ -542,7 +611,7 @@ mod tests {
             left: 0.0,
             top: 0.0,
         };
-        let out = dilate_coverage(base, r);
+        let out = dilate_coverage(&base, r);
         // Grid is base + 2*(ceil(r)+1) = 15x15; the single seed sits at the centre.
         assert_eq!((out.width, out.height), (15, 15));
         let cx = (out.width / 2) as i32; // 7
@@ -573,7 +642,7 @@ mod tests {
             left: 0.0,
             top: 0.0,
         };
-        let out = dilate_coverage(base, 2.0);
+        let out = dilate_coverage(&base, 2.0);
         let c = (out.width / 2) as i32;
         let cov = |x: i32, y: i32| out.coverage[(y as usize) * out.width + x as usize];
         assert!(cov(c + 2, c) > 0.99, "outline solid out to its width");

@@ -110,17 +110,36 @@ mod integration_tests {
             }),
             ..TextBlock::default()
         };
-        let obj = AnnotationObject::new_text(1, (1800.0, 200.0), text);
+        let obj = AnnotationObject::new_text(1, (1800.0, 200.0), text.clone());
         let (w, h) = (3584usize, 4608usize);
         let t0 = std::time::Instant::now();
         let overlay = bake_overlay(std::slice::from_ref(&obj), w, h, &fonts);
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("effect_bake_bench: {ms:.1}ms for {w}x{h} (was ~8000ms pre-fix)");
+        eprintln!(
+            "effect_bake_bench (1× 180px block): {ms:.1}ms for {w}x{h} (was ~8000ms pre-fix)"
+        );
         assert_eq!(overlay.w, w);
-        // Generous ceiling: pre-fix this was ~8s; the DT fix should be well under 1s.
+        assert!(ms < 2000.0, "single-block bake regressed to {ms:.1}ms");
+
+        // Realistic "many decorated text" scene: 30 effect-heavy blocks at a typical
+        // 48px, scattered. The per-bake glyph cache should let blocks that share
+        // glyph/size/dilate reuse coverage across the whole page.
+        let mut objs = Vec::new();
+        for i in 0..30u64 {
+            let mut t = text.clone();
+            t.size_px = 48.0;
+            let px = 200.0 + (i % 6) as f32 * 560.0;
+            let py = 200.0 + (i / 6) as f32 * 880.0;
+            objs.push(AnnotationObject::new_text(i + 1, (px, py), t));
+        }
+        let t1 = std::time::Instant::now();
+        let overlay2 = bake_overlay(&objs, w, h, &fonts);
+        let ms2 = t1.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("effect_bake_bench (30× 48px decorated blocks): {ms2:.1}ms for {w}x{h}");
+        assert_eq!(overlay2.w, w);
         assert!(
-            ms < 2000.0,
-            "effect bake regressed to {ms:.1}ms (expected <2s)"
+            ms2 < 2000.0,
+            "multi-block bake regressed to {ms2:.1}ms (expected <2s)"
         );
     }
 

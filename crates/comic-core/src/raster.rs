@@ -128,6 +128,10 @@ pub fn bake_overlay_with_stamps(
     if w == 0 || h == 0 {
         return overlay;
     }
+    // Start a fresh per-bake glyph cache: repeated glyphs / effect passes / text
+    // blocks on this page memoize their coverage, but the cache never accumulates
+    // across pages (memory stays bounded to ~one page's glyphs).
+    crate::font::reset_glyph_cache();
     let mut order: Vec<usize> = (0..objects.len()).filter(|&i| objects[i].enabled).collect();
     order.sort_by_key(|&i| objects[i].z);
 
