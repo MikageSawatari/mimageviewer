@@ -160,6 +160,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # crossbeam-channel を有効にして、重い std::mpsc を避ける。
 notify = { version = "8", default-features = false, features = ["crossbeam-channel"] }
 crossbeam-channel = "0.5"
+# Gamepad input is polled on a small background thread and dispatched on the UI thread.
+gilrs = "0.11"
 # タスクトレイアイコン。Windows では Shell_NotifyIcon を内部で使用し、
 # メニュー処理用の隠しウィンドウを自動作成する。メインスレッド以外で
 # 動かすため、専用スレッドで `PeekMessageW` ポンプを回す実装にしている

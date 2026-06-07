@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ゲームパッド操作 — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>ゲームパッド操作</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="search.html">検索機能</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html" class="active">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">ゲームパッド操作</h1>
+    <p class="page-desc">画像・動画を閲覧するための固定ゲームパッド割り当てです。編集、削除、レーティング、チェック切り替え、エクスポートなどの操作はゲームパッドには割り当てていません。</p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        Xbox 系の <kbd>A</kbd>/<kbd>B</kbd>/<kbd>X</kbd>/<kbd>Y</kbd>、方向パッド、左右スティック、<kbd>LB</kbd>/<kbd>RB</kbd>、<kbd>LT</kbd>/<kbd>RT</kbd>、<kbd>Select</kbd>/<kbd>Start</kbd> を想定しています。ゲームパッド操作の割り当て変更 UI は現在ありません。
+      </div>
+    </div>
+
+    <h2>共通ルール</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>ボタン</th><th>基本動作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>A</kbd></td><td>決定 / 開く / 次へ / 再生</td></tr>
+          <tr><td><kbd>B</kbd></td><td>戻る / 閉じる</td></tr>
+          <tr><td><kbd>LB</kbd> / <kbd>RB</kbd></td><td>前 / 次のフォルダへ移動。キーボードの <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>Ctrl</kbd>+<kbd>↓</kbd> と同じツリー順ナビゲーションです</td></tr>
+          <tr><td><kbd>Y</kbd></td><td>モードにより、単体操作または修飾ボタンとして使用します。<kbd>Y</kbd> を押しながら方向操作した場合、離したときの <kbd>Y</kbd> 単体操作は発火しません</td></tr>
+          <tr><td><kbd>Start</kbd></td><td>お気に入りフォルダを登録順に移動。現在地がどのお気に入りにも含まれない場合は 1 つ目へ移動し、以後は押すたびに次のお気に入りへ進みます</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>グリッド表示</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>入力</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>方向パッド / 左スティック</td><td>サムネイルの選択を上下左右に移動</td></tr>
+          <tr><td><kbd>A</kbd></td><td>選択中のアイテムを開く。画像・動画はフルスクリーン、フォルダ・ZIP・PDF はその場所へ移動</td></tr>
+          <tr><td><kbd>B</kbd></td><td>親フォルダへ戻る。検索結果表示中は検索結果の階層を 1 段戻る</td></tr>
+          <tr><td><kbd>LB</kbd> / <kbd>RB</kbd></td><td>ツリー順で前 / 次のフォルダへ移動</td></tr>
+          <tr><td><kbd>LT</kbd> / <kbd>RT</kbd></td><td>押している間、一覧を上 / 下へスクロール</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>画像フルスクリーン</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>入力</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>方向パッド</td><td>ページ送り。左右は現在の見開き方向に従い、キーボードの左右キーと同じ意味になります。上下は前 / 次のページです</td></tr>
+          <tr><td><kbd>A</kbd></td><td>次のページへ移動</td></tr>
+          <tr><td><kbd>B</kbd></td><td>フルスクリーンを閉じる</td></tr>
+          <tr><td><kbd>X</kbd></td><td>メタデータパネルの表示を切り替え。見開き 2 ページ表示中は無効です</td></tr>
+          <tr><td><kbd>Select</kbd></td><td>見開きモードを順に切り替え。単ページ → 見開き 左→右 → 見開き 左→右（表紙あり） → 見開き 右→左 → 見開き 右→左（表紙あり）</td></tr>
+          <tr><td><kbd>Y</kbd>+方向パッド左右</td><td>見開きを 1 ページずらす。キーボードの <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> と同じで、左右の意味は見開き方向に従います</td></tr>
+          <tr><td>左スティック</td><td>拡大中の画像をパン</td></tr>
+          <tr><td>右スティック上下</td><td>ズームイン / ズームアウト。細かい調整よりも素早い拡大縮小に向いた速度です</td></tr>
+          <tr><td><kbd>LT</kbd> / <kbd>RT</kbd></td><td>押している間、ズームアウト / ズームイン</td></tr>
+          <tr><td><kbd>LB</kbd> / <kbd>RB</kbd></td><td>前 / 次のフォルダへ移動し、移動先の先頭画像を開く</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>動画フルスクリーン</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>入力</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>方向パッド左右</td><td>通常再生中は 5 秒シーク。タイルモード中はタイルカーソルを前 / 次へ移動</td></tr>
+          <tr><td>方向パッド上下</td><td>前 / 次の動画・画像へ移動。タイル一覧を表示していても、キーボードの上下キーと同じく前後ファイル移動として動作します</td></tr>
+          <tr><td><kbd>A</kbd></td><td>通常再生中は再生 / 一時停止。タイルモード中は選択中のタイル位置から再生</td></tr>
+          <tr><td><kbd>B</kbd></td><td>タイルモード中はタイルを閉じる。通常再生中はフルスクリーンを閉じる</td></tr>
+          <tr><td><kbd>Y</kbd></td><td>タイルモードの表示 / 非表示を切り替え。キーボードの <kbd>S</kbd> と同じです</td></tr>
+          <tr><td><kbd>Y</kbd>+方向パッド左右</td><td>前 / 次のチャプター・ブックマーク・ピンへ移動。キーボードの <kbd>J</kbd> / <kbd>K</kbd> と同じです</td></tr>
+          <tr><td><kbd>LT</kbd> / <kbd>RT</kbd></td><td>押している間、戻る / 進む方向へ連続シーク。タイルモード中は左右キーと同じくタイルカーソル移動になります</td></tr>
+          <tr><td><kbd>LB</kbd> / <kbd>RB</kbd></td><td>前 / 次のフォルダへ移動し、移動先の先頭メディアを開く</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        ダイアログ表示中、テキスト入力中、消しゴム・隠蔽加工・補正レイヤー・テキスト注釈などの編集モード中は、通常のゲームパッド閲覧操作は無効になります。
+      </div>
+    </div>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

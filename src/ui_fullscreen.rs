@@ -1276,6 +1276,29 @@ impl App {
             }
         }
     }
+
+    pub(crate) fn apply_gamepad_fullscreen_zoom(&mut self, amount: f32, dt: f32) -> bool {
+        if self.analysis_mode || amount.abs() < 0.01 || dt <= 0.0 {
+            return false;
+        }
+        let old_zoom = self.fs_zoom;
+        let factor = 2.0_f32.powf(amount * dt);
+        self.fs_zoom = (self.fs_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+        if (self.fs_zoom - old_zoom).abs() <= f32::EPSILON {
+            return false;
+        }
+        self.maybe_rerender_pdf(self.fs_zoom);
+        true
+    }
+
+    pub(crate) fn apply_gamepad_fullscreen_pan(&mut self, delta: egui::Vec2) -> bool {
+        if self.analysis_mode || delta.length_sq() <= f32::EPSILON || self.fs_zoom <= ZOOM_NEAR_ONE
+        {
+            return false;
+        }
+        self.fs_pan += delta;
+        true
+    }
 }
 
 /// ピボット点 (`mouse`) が画面上で動かないように、zoom 変化に合わせて pan を補正した
@@ -5485,7 +5508,7 @@ impl App {
     }
 
     /// フルスクリーン終了・ナビゲーション・スライドショーを処理する。
-    fn handle_fs_navigation(
+    pub(crate) fn handle_fs_navigation(
         &mut self,
         ctx: &egui::Context,
         close_fs: bool,

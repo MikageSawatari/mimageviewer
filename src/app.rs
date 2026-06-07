@@ -6,6 +6,7 @@ use std::sync::{
     mpsc,
 };
 
+mod gamepad_input;
 #[cfg(windows)]
 mod native_video;
 pub(crate) mod normalize;
@@ -2602,6 +2603,8 @@ pub struct App {
     pub(crate) thumbnails: Vec<ThumbnailState>,
     pub(crate) selected: Option<usize>,
     pub(crate) settings: crate::settings::Settings,
+    pub(crate) gamepad: crate::gamepad::GamepadRuntime,
+    pub(crate) gamepad_state: crate::gamepad::GamepadInputState,
     pub(crate) tx: mpsc::Sender<ThumbMsg>,
     pub(crate) rx: mpsc::Receiver<ThumbMsg>,
     /// フォルダ移動時に true にセットすると旧ロードタスクが中断する
@@ -4922,6 +4925,8 @@ impl App {
             thumbnails: Vec::new(),
             selected: None,
             settings,
+            gamepad: crate::gamepad::GamepadRuntime::new(),
+            gamepad_state: crate::gamepad::GamepadInputState::default(),
             tx,
             rx,
             cancel_token: Arc::new(AtomicBool::new(false)),
@@ -27042,6 +27047,7 @@ impl eframe::App for App {
         } else {
             self.handle_keyboard(ctx)
         };
+        let gamepad_nav = self.handle_gamepad_input(ctx);
         let t_root_input = frame_t0.elapsed();
 
         // ── フルスクリーンビューポート ──────────────────────────────────
@@ -27122,9 +27128,36 @@ impl eframe::App for App {
                 // start_folder_nav で立てた fs_nav_lock が永続化して以降の
                 // 全ての folder/item nav が死ぬ。`fav_nav` / `toolbar_fav_nav` は
                 // この経路では menubar / toolbar を描画していないので必ず None で OK
-                // (= 競合なし、folder_nav が常に勝つ)。`keyboard_nav` は早期 return より
-                // 前 (line ~15015) で確定済みなので使える。
-                if let Some(result) = self.poll_folder_nav() {
+                // (= 競合なし、folder_nav が常に勝つ)。`keyboard_nav` / `gamepad_nav` は
+                // 早期 return より前で確定済みなので使える。
+                if let Some(crate::ui_main::AddressBarNav::Direct(path)) = gamepad_nav {
+                    let favsearch_rollback = if self.favsearch.active {
+                        Some(self.folder_nav_history_snapshot())
+                    } else {
+                        None
+                    };
+                    if self.favsearch.active {
+                        self.favsearch.nav_stack.push(path.clone());
+                    }
+                    let open_target = path.clone();
+                    let open_outcome = self.load_folder_or_convert_archive(path);
+                    if matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                        self.advance_drilled_current_path(&open_target);
+                    }
+                    match (open_outcome, favsearch_rollback) {
+                        (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
+                            self.attach_archive_convert_nav_history_rollback(snapshot);
+                        }
+                        (FolderOpenOutcome::Ignored, Some(snapshot)) => {
+                            self.restore_folder_nav_history(snapshot);
+                        }
+                        _ => {}
+                    }
+                    self.clear_pending_folder_nav_steps();
+                    if self.favsearch.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                        self.update_favsearch_address();
+                    }
+                } else if let Some(result) = self.poll_folder_nav() {
                     let folder_nav_wins = keyboard_nav.is_none();
                     if folder_nav_wins {
                         self.apply_folder_nav_result(ctx, result);
@@ -27518,14 +27551,15 @@ impl eframe::App for App {
         }
 
         // ── 非同期フォルダナビゲーションのポーリング ────────────────
-        // 優先度 (旧来踏襲): fav_nav > toolbar_fav_nav > keyboard_nav > folder_nav
+        // 優先度 (旧来踏襲): fav_nav > toolbar_fav_nav > keyboard/gamepad_nav > folder_nav
         //                     > address_nav > open_folder_nav > context_nav > grid_nav
-        // folder_nav は fav/toolbar/keyboard より後、address 以下より先。
+        // folder_nav は fav/toolbar/keyboard/gamepad より後、address 以下より先。
+        let input_nav = keyboard_nav.or(gamepad_nav);
         let folder_nav_result = self.poll_folder_nav();
         let folder_nav_wins = folder_nav_result.is_some()
             && fav_nav.is_none()
             && toolbar_fav_nav.is_none()
-            && keyboard_nav.is_none();
+            && input_nav.is_none();
 
         if folder_nav_wins {
             // folder_nav 勝利: モードに応じて load_folder / close+load+open_fullscreen /
@@ -27542,7 +27576,7 @@ impl eframe::App for App {
             let mut history_nav_rollback = None;
             let navigate = if higher_priority_direct_nav.is_some() {
                 higher_priority_direct_nav
-            } else if let Some(nav) = keyboard_nav.or(address_nav) {
+            } else if let Some(nav) = input_nav.or(address_nav) {
                 match nav {
                     crate::ui_main::AddressBarNav::Direct(path) => Some(path),
                     crate::ui_main::AddressBarNav::HistoryBack => {

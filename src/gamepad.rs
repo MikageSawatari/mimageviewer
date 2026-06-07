@@ -1,0 +1,400 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
+use std::time::{Duration, Instant};
+
+#[cfg(not(test))]
+use gilrs::{Axis, Button, EventType, Gilrs};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PadButton {
+    DPadUp,
+    DPadDown,
+    DPadLeft,
+    DPadRight,
+    South,
+    East,
+    West,
+    North,
+    LeftShoulder,
+    RightShoulder,
+    LeftTrigger,
+    RightTrigger,
+    Select,
+    Start,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PadAxis {
+    LeftX,
+    LeftY,
+    RightX,
+    RightY,
+    LeftTrigger,
+    RightTrigger,
+}
+
+impl PadAxis {
+    fn index(self) -> usize {
+        match self {
+            Self::LeftX => 0,
+            Self::LeftY => 1,
+            Self::RightX => 2,
+            Self::RightY => 3,
+            Self::LeftTrigger => 4,
+            Self::RightTrigger => 5,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PadEvent {
+    ButtonPressed(PadButton),
+    ButtonReleased(PadButton),
+    AxisChanged(PadAxis, f32),
+    Connected,
+    Disconnected,
+}
+
+pub struct GamepadRuntime {
+    rx: mpsc::Receiver<PadEvent>,
+    shutdown: Arc<AtomicBool>,
+    #[cfg(not(test))]
+    handle: Option<std::thread::JoinHandle<()>>,
+    started: bool,
+}
+
+impl Default for GamepadRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GamepadRuntime {
+    pub fn new() -> Self {
+        let (_tx, rx) = mpsc::channel();
+        Self {
+            rx,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            #[cfg(not(test))]
+            handle: None,
+            started: false,
+        }
+    }
+
+    pub fn drain(&mut self, ctx: &egui::Context) -> Vec<PadEvent> {
+        self.ensure_started(ctx);
+        let mut events = Vec::new();
+        while let Ok(event) = self.rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    #[cfg(test)]
+    fn ensure_started(&mut self, _ctx: &egui::Context) {
+        self.started = true;
+    }
+
+    #[cfg(not(test))]
+    fn ensure_started(&mut self, ctx: &egui::Context) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        let (tx, rx) = mpsc::channel();
+        self.rx = rx;
+        let shutdown = Arc::clone(&self.shutdown);
+        let repaint_ctx = ctx.clone();
+        self.handle = std::thread::Builder::new()
+            .name("miv-gamepad".to_string())
+            .spawn(move || {
+                let mut gilrs = match Gilrs::new() {
+                    Ok(gilrs) => gilrs,
+                    Err(err) => {
+                        crate::logger::log(format!("[gamepad] gilrs init failed: {err}"));
+                        return;
+                    }
+                };
+
+                while !shutdown.load(Ordering::Relaxed) {
+                    let mut sent_any = false;
+                    while let Some(event) = gilrs.next_event() {
+                        if let Some(mapped) = map_gilrs_event(event.event) {
+                            if tx.send(mapped).is_err() {
+                                return;
+                            }
+                            sent_any = true;
+                        }
+                    }
+                    if sent_any {
+                        repaint_ctx.request_repaint();
+                        std::thread::sleep(Duration::from_millis(2));
+                    } else {
+                        std::thread::sleep(Duration::from_millis(16));
+                    }
+                }
+            })
+            .map_err(|err| {
+                crate::logger::log(format!("[gamepad] thread spawn failed: {err}"));
+                err
+            })
+            .ok();
+    }
+}
+
+impl Drop for GamepadRuntime {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        #[cfg(not(test))]
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn map_gilrs_event(event: EventType) -> Option<PadEvent> {
+    match event {
+        EventType::ButtonPressed(button, _) => map_button(button).map(PadEvent::ButtonPressed),
+        EventType::ButtonReleased(button, _) => map_button(button).map(PadEvent::ButtonReleased),
+        EventType::ButtonChanged(button, value, _) => {
+            let axis = match button {
+                Button::LeftTrigger2 => Some(PadAxis::LeftTrigger),
+                Button::RightTrigger2 => Some(PadAxis::RightTrigger),
+                _ => None,
+            };
+            axis.map(|axis| PadEvent::AxisChanged(axis, value.clamp(0.0, 1.0)))
+        }
+        EventType::AxisChanged(axis, value, _) => {
+            map_axis(axis).map(|axis| PadEvent::AxisChanged(axis, value.clamp(-1.0, 1.0)))
+        }
+        EventType::Connected => Some(PadEvent::Connected),
+        EventType::Disconnected => Some(PadEvent::Disconnected),
+        _ => None,
+    }
+}
+
+#[cfg(not(test))]
+fn map_button(button: Button) -> Option<PadButton> {
+    match button {
+        Button::DPadUp => Some(PadButton::DPadUp),
+        Button::DPadDown => Some(PadButton::DPadDown),
+        Button::DPadLeft => Some(PadButton::DPadLeft),
+        Button::DPadRight => Some(PadButton::DPadRight),
+        Button::South => Some(PadButton::South),
+        Button::East => Some(PadButton::East),
+        Button::West => Some(PadButton::West),
+        Button::North => Some(PadButton::North),
+        Button::LeftTrigger => Some(PadButton::LeftShoulder),
+        Button::RightTrigger => Some(PadButton::RightShoulder),
+        Button::LeftTrigger2 => Some(PadButton::LeftTrigger),
+        Button::RightTrigger2 => Some(PadButton::RightTrigger),
+        Button::Select => Some(PadButton::Select),
+        Button::Start => Some(PadButton::Start),
+        _ => None,
+    }
+}
+
+#[cfg(not(test))]
+fn map_axis(axis: Axis) -> Option<PadAxis> {
+    match axis {
+        Axis::LeftStickX => Some(PadAxis::LeftX),
+        Axis::LeftStickY => Some(PadAxis::LeftY),
+        Axis::RightStickX => Some(PadAxis::RightX),
+        Axis::RightStickY => Some(PadAxis::RightY),
+        Axis::LeftZ => Some(PadAxis::LeftTrigger),
+        Axis::RightZ => Some(PadAxis::RightTrigger),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TriggerRange {
+    Unknown,
+    MinusOneToOne,
+}
+
+pub struct GamepadInputState {
+    buttons: HashSet<PadButton>,
+    axes: [f32; 6],
+    trigger_ranges: [TriggerRange; 2],
+    repeat_next: HashMap<PadButton, Instant>,
+    y_modifier_used: bool,
+    analog_last_tick: Option<Instant>,
+    left_stick_next_step: Option<Instant>,
+    trigger_next_step: Option<Instant>,
+}
+
+impl Default for GamepadInputState {
+    fn default() -> Self {
+        Self {
+            buttons: HashSet::new(),
+            axes: [0.0; 6],
+            trigger_ranges: [TriggerRange::Unknown; 2],
+            repeat_next: HashMap::new(),
+            y_modifier_used: false,
+            analog_last_tick: None,
+            left_stick_next_step: None,
+            trigger_next_step: None,
+        }
+    }
+}
+
+impl GamepadInputState {
+    pub fn set_button_down(&mut self, button: PadButton, down: bool, now: Instant) {
+        if down {
+            self.buttons.insert(button);
+            if button == PadButton::North {
+                self.y_modifier_used = false;
+            }
+        } else {
+            self.buttons.remove(&button);
+            self.repeat_next.remove(&button);
+        }
+        if down && is_repeatable_button(button) {
+            self.repeat_next
+                .insert(button, now + Duration::from_millis(300));
+        }
+    }
+
+    pub fn set_axis(&mut self, axis: PadAxis, value: f32) {
+        let value = value.clamp(-1.0, 1.0);
+        if axis == PadAxis::LeftTrigger || axis == PadAxis::RightTrigger {
+            let idx = if axis == PadAxis::LeftTrigger { 0 } else { 1 };
+            if value < -0.25 {
+                self.trigger_ranges[idx] = TriggerRange::MinusOneToOne;
+            }
+        }
+        self.axes[axis.index()] = value;
+    }
+
+    pub fn button_down(&self, button: PadButton) -> bool {
+        self.buttons.contains(&button)
+    }
+
+    pub fn axis(&self, axis: PadAxis) -> f32 {
+        self.axes[axis.index()]
+    }
+
+    pub fn trigger_value(&self, left: bool) -> f32 {
+        let (axis, button, range) = if left {
+            (
+                PadAxis::LeftTrigger,
+                PadButton::LeftTrigger,
+                self.trigger_ranges[0],
+            )
+        } else {
+            (
+                PadAxis::RightTrigger,
+                PadButton::RightTrigger,
+                self.trigger_ranges[1],
+            )
+        };
+        let axis_value = match range {
+            TriggerRange::Unknown => self.axis(axis).clamp(0.0, 1.0),
+            TriggerRange::MinusOneToOne => ((self.axis(axis) + 1.0) * 0.5).clamp(0.0, 1.0),
+        };
+        if self.button_down(button) {
+            axis_value.max(1.0)
+        } else {
+            axis_value
+        }
+    }
+
+    pub fn due_button_repeat(
+        &mut self,
+        button: PadButton,
+        now: Instant,
+        interval: Duration,
+    ) -> bool {
+        if !self.button_down(button) {
+            self.repeat_next.remove(&button);
+            return false;
+        }
+        let Some(next) = self.repeat_next.get_mut(&button) else {
+            return false;
+        };
+        if now < *next {
+            return false;
+        }
+        *next = now + interval;
+        true
+    }
+
+    pub fn mark_y_modifier_used(&mut self) {
+        if self.button_down(PadButton::North) {
+            self.y_modifier_used = true;
+        }
+    }
+
+    pub fn y_modifier_used(&self) -> bool {
+        self.y_modifier_used
+    }
+
+    pub fn analog_dt(&mut self, active: bool, now: Instant) -> f32 {
+        if !active {
+            self.analog_last_tick = None;
+            return 0.0;
+        }
+        let dt = self
+            .analog_last_tick
+            .map(|last| now.saturating_duration_since(last).as_secs_f32())
+            .unwrap_or(1.0 / 60.0)
+            .clamp(0.0, 0.05);
+        self.analog_last_tick = Some(now);
+        dt
+    }
+
+    pub fn left_stick_step_due(&mut self, active: bool, now: Instant, interval: Duration) -> bool {
+        step_due(&mut self.left_stick_next_step, active, now, interval)
+    }
+
+    pub fn trigger_step_due(&mut self, active: bool, now: Instant, interval: Duration) -> bool {
+        step_due(&mut self.trigger_next_step, active, now, interval)
+    }
+
+    pub fn repeat_active(&self) -> bool {
+        self.buttons
+            .iter()
+            .any(|&button| is_repeatable_button(button))
+    }
+}
+
+fn is_repeatable_button(button: PadButton) -> bool {
+    matches!(
+        button,
+        PadButton::DPadUp
+            | PadButton::DPadDown
+            | PadButton::DPadLeft
+            | PadButton::DPadRight
+            | PadButton::LeftShoulder
+            | PadButton::RightShoulder
+    )
+}
+
+fn step_due(
+    next_step: &mut Option<Instant>,
+    active: bool,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    if !active {
+        *next_step = None;
+        return false;
+    }
+    match next_step {
+        Some(next) if now >= *next => {
+            *next = now + interval;
+            true
+        }
+        Some(_) => false,
+        None => {
+            *next_step = Some(now + interval);
+            true
+        }
+    }
+}
