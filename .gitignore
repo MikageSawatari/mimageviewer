@@ -12,6 +12,7 @@ bench_thumbs.tsv
 /vendor/ffmpeg
 /vendor/vst3sdk
 /vendor/vst3-host
+/vendor/twemoji
 /vendor/bench_baseline.json
 /crates/vst3-host/build
 /dev/
@@ -34,6 +35,10 @@ dist/trt-pack-*/
 # 編集用追加パック 配布物 (build_editing_pack の出力) + モデル素材
 dist/editing-pack-*/
 /vendor/editing-pack/
+
+# ポータブル版 配布物 (build-portable.ps1 の出力、loose-deps zip + 展開フォルダ)
+dist/mImageViewer_portable_*/
+dist/mImageViewer_portable_*.zip
 
 # 開発中の検証用一時ファイル
 /tmp-test/
