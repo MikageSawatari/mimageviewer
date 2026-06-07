@@ -343,17 +343,148 @@ fn object_bounds(o: &AnnotationObject, fonts: Option<&FontSet>) -> egui::Rect {
     }
 }
 
-/// canonical 画素 `img_pt` に最も手前 (z 最大) で当たる有効オブジェクトの id。
-fn hit_test(
+/// 点 `(x,y)` が多角形 `poly` の内側か (ray-casting、even-odd)。頂点 3 未満は false。
+fn point_in_polygon(p: (f32, f32), poly: &[(f32, f32)]) -> bool {
+    if poly.len() < 3 {
+        return false;
+    }
+    let (x, y) = p;
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        // 走査線 y と辺 (i,j) が交差し、交点が点より右にあれば反転。
+        // (yi>y)!=(yj>y) の時点で yj!=yi が保証されるので除算は安全。
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// 点 `p`(canonical img px) がオブジェクト `o` の **実体**(実際に描画される不透明部分) 上にあるか。
+/// AABB ではなく実形状/アルファで判定するので、透過部分や非矩形の隙間は素通りする。
+/// - 吹き出し: 本体ポリゴン / 思考円 / しっぽ三角形のいずれか内側
+/// - メッセージウィンドウ: 回転を戻した半幅半高の矩形内 (角丸は無視 = 実害なし)
+/// - スタンプ: 画像 PNG のアルファ > 16
+/// - テキスト: 回転を戻したテキスト矩形内 (字間の透明は無視 = 近似。テキストは巨大遮蔽になりにくい)
+///
+/// フォント未ロード / スタンプ画像未解決などジオメトリを取れない時は AABB 内なら true (退行防止)。
+fn object_contains_point(
+    o: &AnnotationObject,
+    fonts: Option<&FontSet>,
+    stamps: &comic_core::StampImages,
+    p: (f32, f32),
+) -> bool {
+    use comic_core::{
+        bubble_geometry, effective_bubble_shape, effective_window_half_extents, resolve_tail_base,
+        resolve_tail_tip, shape_renders_tail, tessellate_tail,
+    };
+    // 安価な AABB で早期棄却。フォント無しはここで AABB 許容して終わる。
+    if !object_bounds(o, fonts).contains(egui::pos2(p.0, p.1)) {
+        return false;
+    }
+    match &o.kind {
+        AnnotationKind::Bubble(b) => {
+            let Some(fonts) = fonts else {
+                return true;
+            };
+            // クリック点を pivot 周りに逆回転して、非回転空間のジオメトリと比較する。
+            let lp = rotate_about(p, o.pivot, -o.rotation_rad);
+            let eff = effective_bubble_shape(b, fonts);
+            let tail = b.tail.as_ref().filter(|_| shape_renders_tail(&eff));
+            let geo = bubble_geometry(&eff, o.pivot, tail);
+            if geo.outline.is_empty() {
+                // 「なし」(TextOnly) 等は本体ポリゴンが無い → AABB 内なら許容。
+                return true;
+            }
+            if point_in_polygon(lp, &geo.outline) {
+                return true;
+            }
+            for &(cx, cy, r) in &geo.thought {
+                let (dx, dy) = (lp.0 - cx, lp.1 - cy);
+                if dx * dx + dy * dy <= r * r {
+                    return true;
+                }
+            }
+            if let Some(t) = tail {
+                let base = resolve_tail_base(&eff, o.pivot, t);
+                let tip = resolve_tail_tip(&eff, o.pivot, t);
+                let tri = tessellate_tail(base, tip, t.width_px.max(1.0));
+                if point_in_polygon(lp, &tri) {
+                    return true;
+                }
+            }
+            false
+        }
+        AnnotationKind::MessageWindow(w) => {
+            let Some(fonts) = fonts else {
+                return true;
+            };
+            let lp = rotate_about(p, o.pivot, -o.rotation_rad);
+            let (hw, hh) = effective_window_half_extents(w, fonts);
+            let m = w.outline.width_px.max(0.0) * 0.5;
+            (lp.0 - o.pivot.0).abs() <= hw + m && (lp.1 - o.pivot.1).abs() <= hh + m
+        }
+        AnnotationKind::Stamp(s) => {
+            if s.half_w <= 0.0 || s.half_h <= 0.0 {
+                return true;
+            }
+            let Some(img) = stamps.get(&o.id) else {
+                return true; // 画像未解決 → AABB 許容
+            };
+            if img.w == 0 || img.h == 0 {
+                return true;
+            }
+            let lp = rotate_about(p, o.pivot, -o.rotation_rad);
+            // スタンプ画像は half_w/half_h のボックスへ引き伸ばし配置 (draw_stamp と同じ)。
+            let u = (lp.0 - (o.pivot.0 - s.half_w)) / (2.0 * s.half_w);
+            let v = (lp.1 - (o.pivot.1 - s.half_h)) / (2.0 * s.half_h);
+            if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                return false;
+            }
+            let su = if s.flip_h { 1.0 - u } else { u };
+            let sv = if s.flip_v { 1.0 - v } else { v };
+            let px = ((su * img.w as f32).floor() as i32).clamp(0, img.w as i32 - 1) as usize;
+            let py = ((sv * img.h as f32).floor() as i32).clamp(0, img.h as i32 - 1) as usize;
+            img.pixels[(py * img.w + px) * 4 + 3] > 16
+        }
+        AnnotationKind::Text(t) => {
+            let Some(fonts) = fonts else {
+                return true;
+            };
+            // テキストは pivot=左上、回転は矩形中心まわり (object_bounds と同じ規約)。
+            let (bw, bh) = fonts
+                .get(&t.font_key)
+                .map(|font| {
+                    let l = comic_core::layout_text(t, font);
+                    (l.bounds.0.max(8.0), l.bounds.1.max(8.0))
+                })
+                .unwrap_or((100.0, 40.0));
+            let center = (o.pivot.0 + bw * 0.5, o.pivot.1 + bh * 0.5);
+            let lp = rotate_about(p, center, -o.rotation_rad);
+            lp.0 >= o.pivot.0
+                && lp.0 <= o.pivot.0 + bw
+                && lp.1 >= o.pivot.1
+                && lp.1 <= o.pivot.1 + bh
+        }
+    }
+}
+
+/// AABB 当たり判定の透過考慮版。クリック点の **実体** に最も手前 (z 最大) で当たるオブジェクトの id。
+/// 透過部分は素通りして奥のオブジェクトに当たる。クリック選択 / 非選択ドラッグの起点に使う。
+fn hit_test_visible(
     objects: &[AnnotationObject],
     img_pt: (f32, f32),
     fonts: Option<&FontSet>,
+    stamps: &comic_core::StampImages,
 ) -> Option<u64> {
-    let p = egui::pos2(img_pt.0, img_pt.1);
     let mut order: Vec<usize> = (0..objects.len()).filter(|&i| objects[i].enabled).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(objects[i].z));
     for &i in &order {
-        if object_bounds(&objects[i], fonts).contains(p) {
+        if object_contains_point(&objects[i], fonts, stamps, img_pt) {
             return Some(objects[i].id);
         }
     }
@@ -1222,6 +1353,16 @@ impl App {
             )
         });
 
+        // クリック (press / release) 時だけ、透過考慮の当たり判定用にスタンプ画像を用意する。
+        // ベイクと同じ build_stamp_images (comic_stamp_cache 経由) を使うので 2 回目以降は再デコード
+        // なし。毎フレームではなくクリックイベント時のみ作るので負荷は小さい。
+        let stamps = if pressed || released {
+            let objs = self.comic_docs.get(&key).cloned().unwrap_or_default();
+            self.build_stamp_images(&objs)
+        } else {
+            comic_core::StampImages::new()
+        };
+
         if pressed {
             if let Some(pos) = pos {
                 if panel_rect.contains(pos) || detail_rect.contains(pos) {
@@ -1238,11 +1379,12 @@ impl App {
                 let (drag_id, kind) = match handle {
                     Some(k) => (self.text_selected, Some(k)),
                     None => {
-                        // 本体クリック。選択中オブジェクトが click 位置を含むなら、最前面 (z 最大)
-                        // hit_test に奪われず選択中をそのまま Move する。これが無いと、パネルで
-                        // 選んだ・他に重なって隠れたオブジェクトをドラッグしようとしても、最前面
-                        // オブジェクトの AABB が click 点を覆って常に再選択されてしまう (実機 FB)。
-                        // 選択中が click 位置に無いときだけ最前面 hit_test で選び直す。
+                        // 本体クリックでの **ドラッグ対象** を決める (選択そのものは release 時に
+                        // 透過考慮で確定する。後述)。選択中オブジェクトの青枠 (AABB) 内を押した時は、
+                        // 手前に別オブジェクトが重なっていても・透明な穴でも、選択中をそのまま Move
+                        // できるようにする。これが無いと、巨大／透過の手前オブジェクトに掴みを奪われ、
+                        // 裏側の選択中オブジェクトをドラッグできなくなる (実機 FB / ユーザー要件)。
+                        // 選択中の枠外を押した時だけ、実体 (透過考慮) で掴む対象を選び直す。
                         let on_selected = self.text_selected.filter(|&sel| {
                             self.comic_docs.get(&key).is_some_and(|objs| {
                                 objs.iter().any(|o| {
@@ -1255,10 +1397,11 @@ impl App {
                         if let Some(sel) = on_selected {
                             (Some(sel), Some(TextDragKind::Move))
                         } else {
-                            let hit = self
-                                .comic_docs
-                                .get(&key)
-                                .and_then(|objs| hit_test(objs, img, fonts.as_deref()));
+                            // 非選択をつかむ時は「実体」(透過考慮) で最前面を選ぶ。透明な隙間は
+                            // 素通りして奥に当たる。ドラッグ対象として即選択する (枠が追従)。
+                            let hit = self.comic_docs.get(&key).and_then(|objs| {
+                                hit_test_visible(objs, img, fonts.as_deref(), &stamps)
+                            });
                             self.text_selected = hit;
                             (hit, hit.map(|_| TextDragKind::Move))
                         }
@@ -1306,6 +1449,14 @@ impl App {
                     let objs = self.comic_docs.get(&key).cloned().unwrap_or_default();
                     self.save_comic_objects(fs_idx, &key, &objs);
                     self.text_dirty_at = None;
+                } else if matches!(drag.kind, TextDragKind::Move) {
+                    // 動かさずに離した本体クリック (= ハンドル操作でない) は、クリック点の「実体」
+                    // (透過考慮) で選択し直す。選択中の透明な穴をクリックすれば奥のオブジェクトへ、
+                    // 実体が無ければ選択解除。ドラッグは選択中を青枠内どこでも掴める挙動のまま。
+                    let hit = self.comic_docs.get(&key).and_then(|objs| {
+                        hit_test_visible(objs, drag.last_img, fonts.as_deref(), &stamps)
+                    });
+                    self.text_selected = hit;
                 }
             }
         }
@@ -7444,12 +7595,69 @@ mod tests {
             o
         };
         let objs = vec![mk(1, 0, 100.0, 100.0), mk(2, 1, 110.0, 110.0)];
+        // フォント / スタンプ画像なし → AABB 判定 (旧 hit_test と同挙動)。
+        let stamps = comic_core::StampImages::new();
         // 両方に入る点 → z 最大 (id 2)。
-        assert_eq!(hit_test(&objs, (105.0, 105.0), None), Some(2));
+        assert_eq!(
+            hit_test_visible(&objs, (105.0, 105.0), None, &stamps),
+            Some(2)
+        );
         // obj1 のみ。
-        assert_eq!(hit_test(&objs, (55.0, 55.0), None), Some(1));
+        assert_eq!(
+            hit_test_visible(&objs, (55.0, 55.0), None, &stamps),
+            Some(1)
+        );
         // どれにも当たらない。
-        assert_eq!(hit_test(&objs, (5.0, 5.0), None), None);
+        assert_eq!(hit_test_visible(&objs, (5.0, 5.0), None, &stamps), None);
+    }
+
+    #[test]
+    fn hit_test_visible_falls_through_transparent_stamp() {
+        // 同位置に重なる 2 つのスタンプ。手前 (id 2) は中央に透明の穴。
+        // 透明部分のクリックは奥 (id 1) に当たる = 透過考慮の当たり判定。
+        let mk = |id: u64, z: i32| {
+            let mut o = AnnotationObject::new_stamp(
+                id,
+                (100.0, 100.0),
+                StampObject {
+                    half_w: 50.0,
+                    half_h: 50.0,
+                    ..StampObject::default()
+                },
+            );
+            o.z = z;
+            o
+        };
+        let solid = |hole: bool| {
+            let mut img = comic_core::RgbaOverlay::new(10, 10);
+            for i in 0..10 * 10 {
+                img.pixels[i * 4 + 3] = 255;
+            }
+            if hole {
+                for y in 4..7 {
+                    for x in 4..7 {
+                        img.pixels[(y * 10 + x) * 4 + 3] = 0;
+                    }
+                }
+            }
+            std::sync::Arc::new(img)
+        };
+        let objs = vec![mk(1, 0), mk(2, 1)];
+        let mut stamps = comic_core::StampImages::new();
+        stamps.insert(1, solid(false)); // 奥: 全面不透明
+        stamps.insert(2, solid(true)); // 手前: 中央に透明の穴
+        // 中央 (穴) → 手前を素通りして奥 (id 1)。
+        assert_eq!(
+            hit_test_visible(&objs, (100.0, 100.0), None, &stamps),
+            Some(1)
+        );
+        // 中央から外れた不透明部分 → 手前 (id 2)。
+        assert_eq!(
+            hit_test_visible(&objs, (125.0, 125.0), None, &stamps),
+            Some(2)
+        );
+        // どちらの AABB 外 → なし。
+        assert_eq!(hit_test_visible(&objs, (5.0, 5.0), None, &stamps), None);
     }
 
     #[test]

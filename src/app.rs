@@ -21684,7 +21684,7 @@ impl App {
     /// id は `scale_scene` でも保たれ、ソースはスケール非依存 (デコードは 512px ネイティブ、
     /// ベイカが canvas サイズへバイリニア縮小する) なので、元/スケール後どちらの集合から
     /// 組み立てても同じ map になる。
-    fn build_stamp_images(
+    pub(crate) fn build_stamp_images(
         &mut self,
         objects: &[comic_core::AnnotationObject],
     ) -> comic_core::StampImages {
