@@ -1238,12 +1238,30 @@ impl App {
                 let (drag_id, kind) = match handle {
                     Some(k) => (self.text_selected, Some(k)),
                     None => {
-                        let hit = self
-                            .comic_docs
-                            .get(&key)
-                            .and_then(|objs| hit_test(objs, img, fonts.as_deref()));
-                        self.text_selected = hit;
-                        (hit, hit.map(|_| TextDragKind::Move))
+                        // 本体クリック。選択中オブジェクトが click 位置を含むなら、最前面 (z 最大)
+                        // hit_test に奪われず選択中をそのまま Move する。これが無いと、パネルで
+                        // 選んだ・他に重なって隠れたオブジェクトをドラッグしようとしても、最前面
+                        // オブジェクトの AABB が click 点を覆って常に再選択されてしまう (実機 FB)。
+                        // 選択中が click 位置に無いときだけ最前面 hit_test で選び直す。
+                        let on_selected = self.text_selected.filter(|&sel| {
+                            self.comic_docs.get(&key).is_some_and(|objs| {
+                                objs.iter().any(|o| {
+                                    o.id == sel
+                                        && object_bounds(o, fonts.as_deref())
+                                            .contains(egui::pos2(img.0, img.1))
+                                })
+                            })
+                        });
+                        if let Some(sel) = on_selected {
+                            (Some(sel), Some(TextDragKind::Move))
+                        } else {
+                            let hit = self
+                                .comic_docs
+                                .get(&key)
+                                .and_then(|objs| hit_test(objs, img, fonts.as_deref()));
+                            self.text_selected = hit;
+                            (hit, hit.map(|_| TextDragKind::Move))
+                        }
                     }
                 };
                 self.text_drag = match (drag_id, kind) {

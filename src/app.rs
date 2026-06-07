@@ -21730,30 +21730,38 @@ impl App {
                 return Some(entry.texture.clone());
             }
         }
-        // この idx の worker が同条件で進行中なら再投入しない (= 焼き上がり待ち)。進行中は
-        // `draw_comic_bake_overlay` が中央トーストを出し、`poll_comic_bake` が完了を取り込む。
-        if let Some(p) = self.comic_bake_pending.get(&idx) {
-            if p.comic_gen == comic_gen
-                && Arc::ptr_eq(&p.base, &base)
-                && p.preview_scale == preview_scale
+        // worker 経路 (閲覧時) のみ pending dedup + 同時数 cap を行う。編集中 (text_mode) は
+        // 下でライブ同期ベイクするので、ここでは進行中の (閲覧時に投入された) worker を cancel
+        // するだけにする。
+        if !self.text_mode {
+            // この idx の worker が同条件で進行中なら再投入しない (= 焼き上がり待ち)。進行中は
+            // `draw_comic_bake_overlay` が中央トーストを出し、`poll_comic_bake` が完了を取り込む。
+            if let Some(p) = self.comic_bake_pending.get(&idx) {
+                if p.comic_gen == comic_gen
+                    && Arc::ptr_eq(&p.base, &base)
+                    && p.preview_scale == preview_scale
+                {
+                    ctx.request_repaint();
+                    return None;
+                }
+                // 条件が変わった (注釈編集 / 下地再構築 / 倍率変更) → cancel して破棄し下で再投入。
+                // cancel を立てることで orphan worker は残作業をスキップして inflight を早く戻す。
+                self.cancel_comic_bake_for_idx(idx);
+            }
+            // 同時ベイク数を抑える (見開き = 2 を想定)。**走行中 worker 数** (orphan 含む) で
+            // 上限判定する — pending.len() だと stale で外した走行中 worker を数えず、連続編集で
+            // worker が無制限に積み上がる (Codex P1)。埋まっていれば次フレームに回す。
+            if self
+                .comic_bake_inflight
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 2
             {
                 ctx.request_repaint();
                 return None;
             }
-            // 条件が変わった (注釈編集 / 下地再構築 / 倍率変更) → cancel して破棄し下で再投入。
-            // cancel を立てることで orphan worker は残作業をスキップして inflight を早く戻す。
+        } else {
+            // 編集中: 以前 (閲覧時) に投入した worker が残っていたら stale なので止める。
             self.cancel_comic_bake_for_idx(idx);
-        }
-        // 同時ベイク数を抑える (見開き = 2 を想定)。**走行中 worker 数** (orphan 含む) で
-        // 上限判定する — pending.len() だと stale で外した走行中 worker を数えず、連続編集で
-        // worker が無制限に積み上がる (Codex P1)。埋まっていれば次フレームに回す。
-        if self
-            .comic_bake_inflight
-            .load(std::sync::atomic::Ordering::Relaxed)
-            >= 2
-        {
-            ctx.request_repaint();
-            return None;
         }
         // 注釈を comic.db から解決 (page_path_key)。デモ有効で永続注釈が無ければ、
         // デモをシードして comic.db に保存する (Inc 2 の round-trip 検証用。デモを
@@ -21820,6 +21828,46 @@ impl App {
         // stamp 画像は decode キャッシュ (&mut self) を使うので UI スレッドで解決してから move。
         // id はスケール非依存なので unscaled objects から引いてよい。
         let stamp_images = self.build_stamp_images(&objects);
+
+        // 編集中 (text_mode) は **同期ベイク** でライブプレビューする。worker (非同期) だと
+        // オブジェクトのドラッグ中は毎フレーム comic_generation が進んで常に未完 → 下地
+        // (注釈なし) にフォールバックし、枠だけ動いてテキストが消える退行になる。編集時は
+        // preview_scale 1/N + rayon でベイクが軽いので同期で追従できる。閲覧時 (!text_mode、
+        // フル解像度・最大数百ms〜1s) だけ worker 化する (フリーズ回避はそちらが本命)。
+        if self.text_mode {
+            let scaled = if (s_bake - 1.0).abs() > 1e-4 {
+                comic_core::scale_scene(&objects, s_bake)
+            } else {
+                objects.clone()
+            };
+            let overlay =
+                comic_core::bake_overlay_with_stamps(&scaled, bw, bh, &fonts, &stamp_images);
+            let composed = Arc::new(crate::comic_overlay::composite_overlay_over(
+                &bake_base, &overlay,
+            ));
+            let upload = clamp_for_gpu(&composed).into_owned();
+            let texture = ctx.load_texture(
+                format!(
+                    "comic_{idx}_{}_{comic_gen}_{preview_scale}",
+                    Arc::as_ptr(&base) as usize
+                ),
+                upload,
+                egui::TextureOptions::LINEAR,
+            );
+            self.comic_cache.insert(
+                idx,
+                ComicCacheEntry {
+                    pixels: composed,
+                    texture: texture.clone(),
+                    base: Arc::clone(&base),
+                    comic_gen,
+                    dims: [w, h],
+                    preview_scale,
+                },
+            );
+            return Some(texture);
+        }
+
         let objs_len = objects.len();
         let fonts_worker = Arc::clone(&fonts);
         let base_worker = Arc::clone(&bake_base);
