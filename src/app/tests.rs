@@ -1088,6 +1088,36 @@ mod phase_c_folder_nav_history_tests {
     }
 
     #[test]
+    fn return_to_parent_uses_source_archive_parent_not_cache_folder() {
+        // 自動オープン ZIP/PDF の ESC で立つ `pending_return_to_parent` を、変換アーカイブ
+        // (current_folder = キャッシュ ZIP, archive_source_override = 元 .lzh) の状態で消化
+        // したとき、キャッシュフォルダではなく元 .lzh の親フォルダへ戻ること。
+        // 実機ログで確認した不具合 (Codex P1): 旧実装は current_folder.parent() を使っており
+        // `archive_cache\<hash2>\<hash>` (キャッシュフォルダ) へ飛んでいた。
+        let mut app = setup_app();
+        let source = PathBuf::from(r"H:\home\mimageviewer_old\testimage\C165_206.LZH");
+        let cached_zip = PathBuf::from(
+            r"C:\Users\mikag\AppData\Roaming\mimageviewer\archive_cache\55\hash\C165_206.zip",
+        );
+        app.current_folder = Some(cached_zip);
+        app.archive_source_override = Some(source.clone());
+
+        let nav = app
+            .resolve_return_to_parent_nav()
+            .expect("override の親が取れるので Some を返す");
+        let crate::ui_main::AddressBarNav::Direct(parent) = nav else {
+            panic!("AddressBarNav::Direct を期待");
+        };
+        assert_eq!(
+            parent,
+            source.parent().unwrap().to_path_buf(),
+            "ESC の戻り先はキャッシュフォルダではなく元 .lzh の親フォルダ"
+        );
+        // 戻り先で元アーカイブ (.lzh) を選択状態にするヒント。
+        assert_eq!(app.select_after_load.as_deref(), Some("C165_206.LZH"));
+    }
+
+    #[test]
     fn converted_archive_reload_does_not_record_cache_zip_in_folder_history() {
         let mut app = setup_app();
         let source = PathBuf::from(r"E:\share\18\dmm\comic\d_pa3584.lzh");

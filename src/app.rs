@@ -6529,6 +6529,25 @@ impl App {
             .or_else(|| self.current_folder.clone())
     }
 
+    /// `pending_return_to_parent` (自動オープン ZIP/PDF の Esc/Enter で立つ「親フォルダ
+    /// (一覧) へ戻る」予約) を消化したときのナビ先を返す。
+    ///
+    /// **変換アーカイブ対応 (Codex P1)**: 変換済み 7z/LZH 閲覧中は `current_folder` が
+    /// キャッシュ ZIP (`%APPDATA%\...\archive_cache\..\book.zip`) を指す。そのまま
+    /// `current_folder.parent()` へ戻すとキャッシュフォルダへ飛んでしまうため、ユーザー
+    /// 視点の元 `.lzh` / `.7z` を返す `effective_folder()` を基準に親を取る (通常 ZIP/PDF
+    /// では `effective_folder() == current_folder` なので挙動不変)。親が取れない
+    /// (ドライブ root 等) ときは `None` を返し、呼び出し側が close にフォールバックする。
+    pub(crate) fn resolve_return_to_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
+        let cur = self.effective_folder()?;
+        let parent = cur.parent()?;
+        self.select_after_load = cur
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+        Some(crate::ui_main::AddressBarNav::Direct(parent.to_path_buf()))
+    }
+
     pub(crate) fn local_search_blocks_parent_nav(&self) -> bool {
         self.show_search_bar
             && (self.search_filter.is_some() || self.search_pending.is_some())
@@ -9368,30 +9387,6 @@ impl App {
             && previous_folder
                 .as_ref()
                 .is_some_and(|prev| crate::folder_tree::path_eq(prev, &source_path));
-        // 診断: 変換アーカイブの元パス override が start_loading_items で
-        // PRESERVE / CLEAR どちらに倒れたかと、判定に使った 2 パスを記録する。
-        // 「BS で変換キャッシュフォルダに入る」(override が None に化ける) 不具合が
-        // 間欠再現するため、再現時にどの load がどのパスのミスマッチで CLEAR したかを
-        // 突き止める (override が絡む load 時のみ出るので低ノイズ)。
-        if previous_archive_source_override.is_some() {
-            crate::logger::log(format!(
-                "[archive-override] start_loading_items: {} | override={} | current_folder={} | source_path={}",
-                if preserve_archive_source_override {
-                    "PRESERVE"
-                } else {
-                    "CLEAR"
-                },
-                previous_archive_source_override
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                previous_folder
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "<none>".to_string()),
-                source_path.to_string_lossy(),
-            ));
-        }
 
         // 通常フォルダ / ZIP / 検索結果など PDF 以外への遷移では、残存する PDF
         // enumerate pending を無効化する。放置すると遅れて届いた結果を
@@ -13681,14 +13676,8 @@ impl App {
         // ナビ経路 (load → 内部で close_fullscreen) へ流すことで L2 ページ一覧を見せずに
         // L1 へ抜ける。フォーカス/ダイアログ判定より前に出す (確実に消化するため)。
         if std::mem::take(&mut self.pending_return_to_parent) {
-            if let Some(cur) = self.current_folder.clone() {
-                if let Some(parent) = cur.parent() {
-                    self.select_after_load = cur
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|s| s.to_string());
-                    return Some(crate::ui_main::AddressBarNav::Direct(parent.to_path_buf()));
-                }
+            if let Some(nav) = self.resolve_return_to_parent_nav() {
+                return Some(nav);
             }
             // 親が取れない (ドライブ root 等): 予約は消化済みなので通常 close にフォールバック。
             self.close_fullscreen();
