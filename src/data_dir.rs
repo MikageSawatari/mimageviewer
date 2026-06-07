@@ -28,6 +28,24 @@ pub fn init() {
         .find(|w| w[0] == "--data-dir")
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or_else(default);
+
+    // portable ビルド: `--data-dir` 未指定で既定の `<exe_dir>/data` が書込不可
+    // (read-only メディア / Program Files 等の保護先) の場合は、APPDATA へフォールバック
+    // **せず** 明確なエラーで起動を中止する。ポータブルを選ぶユーザーは「APPDATA を触らない
+    // 自己完結動作」を期待しており、黙ってフォールバックすると最も嫌われる挙動になるため。
+    // `--data-dir <書込可パス>` を明示した場合は read-only メディア上でも起動できる抜け道として
+    // チェックしない。詳細: docs/portable-build-plan.md §4.4。
+    #[cfg(all(feature = "portable", not(test)))]
+    {
+        let explicit_data_dir = args.windows(2).any(|w| w[0] == "--data-dir");
+        if !explicit_data_dir {
+            if let Err(e) = ensure_writable(&dir) {
+                portable_fatal_unwritable(&dir, &e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     DATA_DIR.set(dir).ok();
 }
 
@@ -138,12 +156,68 @@ fn default() -> PathBuf {
         ));
         p
     }
-    #[cfg(not(test))]
+    // portable: 既定の data_dir は exe と同じ場所の `data/` サブディレクトリ。
+    // これにより `data_dir::init()` を呼ぶ前に `get()` が呼ばれても (= worker など)
+    // APPDATA に逃げず、常にポータブル配下を指す。
+    #[cfg(all(not(test), feature = "portable"))]
+    {
+        crate::native_assets::bundled_root().join("data")
+    }
+    #[cfg(all(not(test), not(feature = "portable")))]
     {
         let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
         PathBuf::from(appdata).join("mimageviewer")
     }
 }
+
+/// portable: data_dir が実際に書き込み可能かを確認する。ACL を推測せず、ディレクトリ作成 +
+/// プローブファイルの write/remove を実際に試す (Windows の ACL は事前予測が不確実なため)。
+#[cfg(all(feature = "portable", not(test)))]
+fn ensure_writable(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("ディレクトリ作成に失敗: {e}"))?;
+    let probe = dir.join(".mimv_write_probe.tmp");
+    std::fs::write(&probe, b"ok").map_err(|e| format!("書き込みテストに失敗: {e}"))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
+/// portable: data_dir 書込不可時に、原因と対処を示すネイティブダイアログを出す。
+/// `logger::init()` 前に呼ばれ得るので stderr 併用 (ログには頼らない)。
+#[cfg(all(feature = "portable", not(test)))]
+fn portable_fatal_unwritable(dir: &Path, detail: &str) {
+    let msg = format!(
+        "ポータブル版はこのフォルダにデータを書き込めません:\n  {}\n\n\
+         書き込み可能な場所 (デスクトップ / D ドライブ / USB メモリ等) に\n\
+         展開し直してから起動してください。\n\n詳細: {}",
+        dir.display(),
+        detail
+    );
+    eprintln!("{msg}");
+    show_fatal_messagebox(&msg);
+}
+
+#[cfg(all(feature = "portable", not(test), windows))]
+fn show_fatal_messagebox(msg: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    use windows::core::PCWSTR;
+
+    let title: Vec<u16> = "mImageViewer (ポータブル版)"
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let body: Vec<u16> = msg.encode_utf16().chain([0]).collect();
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(all(feature = "portable", not(test), not(windows)))]
+fn show_fatal_messagebox(_msg: &str) {}
 
 /// `include_bytes!` で埋め込んだファイルを指定パスに展開する。
 ///

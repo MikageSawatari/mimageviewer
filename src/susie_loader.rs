@@ -44,6 +44,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
 /// 初回起動時に `%APPDATA%/mimageviewer/mimageviewer-susie32.exe` へ展開される。
 /// インストール先 (Program Files) に書き込み不要で、本体 exe のフォルダにも
 /// 追加ファイルを置かない。
+/// portable ビルドでは埋め込まず exe 隣の loose exe を直接使う。
+#[cfg(not(feature = "portable"))]
 static SUSIE_WORKER_BYTES: &[u8] =
     include_bytes!("../vendor/susie-worker/mimageviewer-susie32.exe");
 
@@ -65,49 +67,58 @@ fn worker_exe_cached_path() -> PathBuf {
     }
     WORKER_EXE_PATH
         .get_or_init(|| {
-            let dir = crate::data_dir::get();
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                crate::logger::log(format!(
-                    "susie: data_dir create failed: {e} (path: {})",
-                    dir.display()
-                ));
-                // 展開失敗時も期待パスを返す (is_ready=false で UI にエラーが出る)
-                return dir.join(WORKER_EXE_NAME);
+            // portable: 展開せず exe と同じディレクトリの loose worker exe を使う。
+            // 存在しなければ後段の起動が is_ready=false になり UI にエラーが出る。
+            #[cfg(feature = "portable")]
+            {
+                return crate::native_assets::bundled_root().join(WORKER_EXE_NAME);
             }
-            let exe_path = dir.join(WORKER_EXE_NAME);
-            // 埋め込みが空 (開発時 vendor/susie-worker 未設置) の場合は展開しない。
-            // 既存の実ファイルを 0 バイトで上書きして壊すのを避ける。
-            if SUSIE_WORKER_BYTES.is_empty() {
-                return exe_path;
-            }
-            // サイズ比較だけではアップデート時に同サイズ・別内容のバイナリを
-            // 取り違える可能性があるため、既存ファイル全体を読んで中身比較する。
-            // 169KB 程度なので起動時の 1 回読みは許容範囲。
-            let needs_extract = match std::fs::read(&exe_path) {
-                Ok(existing) => existing.as_slice() != SUSIE_WORKER_BYTES,
-                Err(_) => true,
-            };
-            if needs_extract {
-                // 他プロセス (旧 mImageViewer インスタンス) がワーカーを起動中で
-                // ファイルをロックしている場合 write は失敗する。その場合は
-                // 古いバイナリのまま続行 (次回起動で書き換わる)。
-                match std::fs::write(&exe_path, SUSIE_WORKER_BYTES) {
-                    Ok(()) => {
-                        crate::logger::log(format!(
-                            "susie: worker extracted to {} ({} bytes)",
-                            exe_path.display(),
-                            SUSIE_WORKER_BYTES.len(),
-                        ));
-                    }
-                    Err(e) => {
-                        crate::logger::log(format!(
-                            "susie: worker extract failed: {e} (path: {})",
-                            exe_path.display()
-                        ));
+            #[cfg(not(feature = "portable"))]
+            {
+                let dir = crate::data_dir::get();
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    crate::logger::log(format!(
+                        "susie: data_dir create failed: {e} (path: {})",
+                        dir.display()
+                    ));
+                    // 展開失敗時も期待パスを返す (is_ready=false で UI にエラーが出る)
+                    return dir.join(WORKER_EXE_NAME);
+                }
+                let exe_path = dir.join(WORKER_EXE_NAME);
+                // 埋め込みが空 (開発時 vendor/susie-worker 未設置) の場合は展開しない。
+                // 既存の実ファイルを 0 バイトで上書きして壊すのを避ける。
+                if SUSIE_WORKER_BYTES.is_empty() {
+                    return exe_path;
+                }
+                // サイズ比較だけではアップデート時に同サイズ・別内容のバイナリを
+                // 取り違える可能性があるため、既存ファイル全体を読んで中身比較する。
+                // 169KB 程度なので起動時の 1 回読みは許容範囲。
+                let needs_extract = match std::fs::read(&exe_path) {
+                    Ok(existing) => existing.as_slice() != SUSIE_WORKER_BYTES,
+                    Err(_) => true,
+                };
+                if needs_extract {
+                    // 他プロセス (旧 mImageViewer インスタンス) がワーカーを起動中で
+                    // ファイルをロックしている場合 write は失敗する。その場合は
+                    // 古いバイナリのまま続行 (次回起動で書き換わる)。
+                    match std::fs::write(&exe_path, SUSIE_WORKER_BYTES) {
+                        Ok(()) => {
+                            crate::logger::log(format!(
+                                "susie: worker extracted to {} ({} bytes)",
+                                exe_path.display(),
+                                SUSIE_WORKER_BYTES.len(),
+                            ));
+                        }
+                        Err(e) => {
+                            crate::logger::log(format!(
+                                "susie: worker extract failed: {e} (path: {})",
+                                exe_path.display()
+                            ));
+                        }
                     }
                 }
+                exe_path
             }
-            exe_path
         })
         .clone()
 }

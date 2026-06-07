@@ -225,6 +225,8 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 // PDFium DLL 埋め込み & 展開
 // -----------------------------------------------------------------------
 
+// portable ビルドでは埋め込まず exe 隣の loose pdfium.dll を使う (native_assets 参照)。
+#[cfg(not(feature = "portable"))]
 static PDFIUM_DLL_BYTES: &[u8] = include_bytes!("../vendor/pdfium/bin/pdfium.dll");
 
 static DLL_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
@@ -232,12 +234,20 @@ static DLL_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 fn ensure_dll_extracted() -> Result<&'static PathBuf, String> {
     DLL_PATH
         .get_or_init(|| {
-            let dir = crate::data_dir::get();
-            std::fs::create_dir_all(&dir).map_err(|e| format!("data_dir create failed: {e}"))?;
-            let dll_path = dir.join("pdfium.dll");
-            crate::data_dir::extract_embedded_file(&dll_path, PDFIUM_DLL_BYTES, "pdfium.dll")
-                .map_err(|e| format!("pdfium.dll extract failed: {e}"))?;
-            Ok(dll_path)
+            #[cfg(feature = "portable")]
+            {
+                crate::native_assets::bundled("pdfium.dll")
+            }
+            #[cfg(not(feature = "portable"))]
+            {
+                let dir = crate::data_dir::get();
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| format!("data_dir create failed: {e}"))?;
+                let dll_path = dir.join("pdfium.dll");
+                crate::data_dir::extract_embedded_file(&dll_path, PDFIUM_DLL_BYTES, "pdfium.dll")
+                    .map_err(|e| format!("pdfium.dll extract failed: {e}"))?;
+                Ok(dll_path)
+            }
         })
         .as_ref()
         .map_err(|e| e.clone())

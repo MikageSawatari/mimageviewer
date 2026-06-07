@@ -28,7 +28,10 @@ use ort::session::Session;
 
 use super::{AiBackend, AiError, ModelKind};
 
+// portable ビルドでは埋め込まず exe 隣の loose onnxruntime*.dll を使う (native_assets 参照)。
+#[cfg(not(feature = "portable"))]
 static ORT_DLL_BYTES: &[u8] = include_bytes!("../../vendor/ort/onnxruntime.dll");
+#[cfg(not(feature = "portable"))]
 static ORT_PROVIDERS_SHARED_BYTES: &[u8] =
     include_bytes!("../../vendor/ort/onnxruntime_providers_shared.dll");
 
@@ -183,17 +186,28 @@ fn ensure_ort_initialized(requested: AiBackend) -> Result<ActiveBackend, AiError
         }
 
         // DirectML 経路 (デフォルト or TensorRt フォールバック or Cpu)
-        let dll_path = dir.join("onnxruntime.dll");
-        let providers_path = dir.join("onnxruntime_providers_shared.dll");
+        // portable: exe 隣の loose onnxruntime.dll を使う (providers_shared.dll も同居必須なので
+        // 存在確認だけ行う)。通常: 埋め込みバイト列を data_dir へ展開する。
+        #[cfg(feature = "portable")]
+        let dll_path = {
+            let _ = crate::native_assets::bundled("onnxruntime_providers_shared.dll")?;
+            crate::native_assets::bundled("onnxruntime.dll")?
+        };
+        #[cfg(not(feature = "portable"))]
+        let dll_path = {
+            let dll_path = dir.join("onnxruntime.dll");
+            let providers_path = dir.join("onnxruntime_providers_shared.dll");
 
-        crate::data_dir::extract_embedded_file(&dll_path, ORT_DLL_BYTES, "onnxruntime.dll")
-            .map_err(|e| format!("onnxruntime.dll extract: {e}"))?;
-        crate::data_dir::extract_embedded_file(
-            &providers_path,
-            ORT_PROVIDERS_SHARED_BYTES,
-            "onnxruntime_providers_shared.dll",
-        )
-        .map_err(|e| format!("onnxruntime_providers_shared.dll extract: {e}"))?;
+            crate::data_dir::extract_embedded_file(&dll_path, ORT_DLL_BYTES, "onnxruntime.dll")
+                .map_err(|e| format!("onnxruntime.dll extract: {e}"))?;
+            crate::data_dir::extract_embedded_file(
+                &providers_path,
+                ORT_PROVIDERS_SHARED_BYTES,
+                "onnxruntime_providers_shared.dll",
+            )
+            .map_err(|e| format!("onnxruntime_providers_shared.dll extract: {e}"))?;
+            dll_path
+        };
 
         ort::init_from(&dll_path)
             .map_err(|e| format!("ort::init_from: {e}"))?

@@ -65,3 +65,8 @@ jobs:
   #       run: cargo clippy --workspace --all-targets -- -D warnings
   #     - name: test
   #       run: cargo test --workspace
+  #     - name: portable build guard
+  #       # ポータブルビルド (feature = "portable") の cfg 分岐が腐っていないか確認。
+  #       # 通常ビルドではコンパイルされない分岐なので、専用にチェックする。
+  #       # 有効化までは .git/hooks/pre-push の同コマンドがローカルの番人。
+  #       run: cargo check --bin mimageviewer-core --features portable

@@ -57,7 +57,16 @@ static SHUTDOWN_EVENT_RAW: std::sync::OnceLock<isize> = std::sync::OnceLock::new
 /// - `Global\` プレフィックス: ターミナルサービス (リモートデスクトップ) 配下でも
 ///   全セッションを通じて一意にする。管理者権限なしでも作成可能。
 /// - `_v1`: 将来の破壊的変更時に名前空間を切り替える余地。
+///
+/// portable ビルドは別名前空間 (`_portable_v1`) にして、インストール版がトレイ常駐中でも
+/// ポータブル版を独立起動できるようにする (別 data_dir なので DB 衝突なし)。
+/// ⚠ **非 portable の定義を先に置くこと**: launcher の `build.rs` (`extract_const`) が
+/// 最初の `pub const MUTEX_NAME` 行を拾う。launcher は常に非 portable なので非 portable 名が
+/// 先頭でないと埋め込み名がずれる。ACTIVATE_EVENT_NAME も同様。
+#[cfg(not(feature = "portable"))]
 pub const MUTEX_NAME: &str = "Global\\mImageViewerInstance_v1";
+#[cfg(feature = "portable")]
+pub const MUTEX_NAME: &str = "Global\\mImageViewerInstance_portable_v1";
 
 impl SingleInstanceGuard {
     /// `MUTEX_NAME` で Named Mutex を作成する。既存なら `is_first_instance() = false`。
@@ -154,13 +163,21 @@ impl Drop for SingleInstanceGuard {
 ///
 /// Global\ プレフィックスで全セッション共有。Auto-reset (マニュアル reset=FALSE) に
 /// することで、シグナルが届いた瞬間に自動で non-signaled に戻る → 連続再トリガ可能。
+/// portable は別名前空間にして、インストール版の activate event を叩かないようにする。
+#[cfg(not(feature = "portable"))]
 pub const ACTIVATE_EVENT_NAME: &str = "Global\\mImageViewerActivate_v1";
+#[cfg(feature = "portable")]
+pub const ACTIVATE_EVENT_NAME: &str = "Global\\mImageViewerActivate_portable_v1";
 
 /// インストーラ (Inno Setup `[Code]` / `SignalAppShutdown`) が、既存の mIV インスタンスに
 /// クリーン終了を要求するための Named Event 名。トレイ常駐中のインスタンスでも
 /// この event を拾うと `on_exit` 経由で DB 書き出し + 設定保存してから抜けるので、
 /// 「インストール時にトレイの "終了" を手動で押す」手順が要らなくなる。
+#[cfg(not(feature = "portable"))]
 pub const SHUTDOWN_EVENT_NAME: &str = "Global\\mImageViewerShutdown_v1";
+// portable はインストーラ非経由なので shutdown event 連携は使わないが、名前空間は分離しておく。
+#[cfg(feature = "portable")]
+pub const SHUTDOWN_EVENT_NAME: &str = "Global\\mImageViewerShutdown_portable_v1";
 
 /// 既存インスタンスに「ウィンドウを復帰させろ」と通知する。Windows 専用。
 /// 2 重起動検出時に呼び、既存プロセスが応答してから自プロセスを終了する想定。

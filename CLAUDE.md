@@ -1113,17 +1113,36 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 
 ## Distribution
 
-- **mikage.to**: インストーラ (.exe) + exe 単体の両方を提供
+3 つの配布形態がある (v1.1.0 以降):
+
+| 配布形態 | ファイル名 | 中身 / 性質 | data 保存先 | 管理者権限 |
+| --- | --- | --- | --- | --- |
+| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + FFmpeg DLL を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
+| **インストーラ版** | `mImageViewer_setup.exe` | Inno Setup 出力 | `%APPDATA%\mimageviewer` | **要 (UAC)** |
+| **ポータブル版** (v1.1.0 新) | `mImageViewer_portable_v<VER>.zip` | loose-deps。native 依存を埋め込まず exe 隣に同梱、展開ゼロ | `<exe_dir>\data` (APPDATA 不使用) | 不要 |
+
+> ⚠ **用語**: `mimageviewer.exe` (launcher 単体 exe) は APPDATA を使うので「ポータブル版」と
+> **呼ばない**。「単体exe版 / オールインワン版」と呼ぶ。「ポータブル」は loose-deps zip 専用。
+
+- **mikage.to**: インストーラ版 + 単体exe版 + ポータブル版 zip の 3 つを提供
 - **窓の杜**: インストーラ (.exe) を zip にまとめて申請
 - **Vector**: インストーラ (.exe) + `installer/readme.txt` (利用者向け説明書) を zip にまとめて申請。
   readme 同梱を Vector が要件化しているため、単体 exe やインストーラ単独での申請は不可。
 - **インストーラ**: Inno Setup 6（`installer/mimageviewer.iss`）
 - **ビルド**: `cargo build --release` → `ISCC.exe installer\mimageviewer.iss`
 - **出力**: `installer/Output/mImageViewer_setup.exe`
-- **Vector 申請用 zip**: `mImageViewer_v<VERSION>.zip` に `mImageViewer_setup.exe` と
-  `installer/readme.txt` を同梱する。readme の内容 (動作環境・連絡先・インストール手順・
-  取り扱い種別) は Vector のファイル掲載基準 (https://www.vector.co.jp/for_authors/upload/standard.html)
-  を満たしていること。
+- **Vector 申請用 zip**: `mImageViewer_installer_v<VERSION>.zip` に `mImageViewer_setup.exe` と
+  `installer/readme.txt` を同梱する (v1.1.0 で `mImageViewer_v<VERSION>.zip` から改名。ポータブル
+  zip と接尾辞 `_installer_` / `_portable_` で区別する。**リリース済みの過去版は遡って改名しない**)。
+  readme の内容 (動作環境・連絡先・インストール手順・取り扱い種別) は Vector のファイル掲載基準
+  (https://www.vector.co.jp/for_authors/upload/standard.html) を満たしていること。
+- **ポータブル版ビルド**: `.\scripts\build-portable.ps1` で
+  `cargo build --release --bin mimageviewer-core --features portable` → loose 同梱フォルダ +
+  `dist\mImageViewer_portable_v<VER>.zip` を生成する。`portable` feature で native 依存
+  (pdfium / onnxruntime / susie / vst3-host / モデル) を埋め込まず exe 隣から解決し、`data_dir` を
+  `<exe_dir>\data` に向ける。launcher は使わず core を `mimageviewer.exe` にリネームして同梱。
+  設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](docs/portable-build-plan.md)。
+  `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
 - **CRT 静的リンク**: `.cargo/config.toml` でメイン exe (x86_64) と Susie ワーカー (i686)
   の両方に `+crt-static` を有効にしている。これにより `VCRUNTIME140.dll` / `MSVCP140.dll`
   など Visual C++ 再頒布可能パッケージへの依存を排除している。
@@ -1131,7 +1150,8 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
     (静的リンク版 `onnxruntime.lib` は動的 CRT 前提でビルドされており、crt-static と
     両立しない)。どちらも触らないこと。
   - **解除すると Vector の「要ソフト」欄指摘が再発する**。
-- **設定保存先**: `%APPDATA%\mimageviewer`（インストーラ版・単体版共通）
+- **設定保存先**: インストーラ版・単体exe版は `%APPDATA%\mimageviewer`、
+  ポータブル版は `<exe_dir>\data` (書込不可なら APPDATA へフォールバックせずエラー起動拒否)。
 
 ## コード修正時のドキュメント同時更新
 
@@ -1255,7 +1275,10 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 1. `Cargo.toml` — バージョン番号
 2. `installer/mimageviewer.iss` — `MyAppVersion`
 3. `installer/readme.txt` — 先頭の版表記・更新履歴リンク (Vector 同梱用)
-4. `htdocs/mimageviewer/index.html` — ダウンロードセクションのバージョン表記
+3.5. `installer/readme_portable.txt` — 先頭の版表記 (ポータブル版 zip 同梱用、v1.1.0+)
+4. `htdocs/mimageviewer/index.html` — ダウンロードセクションのバージョン表記。
+   **ポータブル版のダウンロードリンク URL もバージョンを含む** (`mImageViewer_portable_v<VER>.zip`)
+   ので、バージョン表記と一緒に link href も更新すること (単体exe / setup.exe は非バージョン名で固定)。
 5. `htdocs/mimageviewer/manual/index.html` — マニュアルのバージョン表記
 6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
    - マニュアル左サイドバーのリンク一覧が全 14 ページで揃っているか
@@ -1317,11 +1340,19 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
       `bash scripts/build-release.sh` を使うと、実行中の `mimageviewer.exe` /
       `mimageviewer-susie32.exe` を自動停止してからビルドできる。手動の
       `Stop-Process` + `cargo build` を毎回打つ手間を省くだけのラッパー。
-11. 配布成果物を 3 種類用意する:
-    - `mimageviewer.exe` (ポータブル版、mikage.to のみ)
+11. 配布成果物を 4 種類用意する:
+    - `mimageviewer.exe` (単体exe版、mikage.to のみ)
     - `mImageViewer_setup.exe` (インストーラ版、mikage.to・窓の杜・Vector 共通)
-    - `mImageViewer_v<VERSION>.zip` (Vector 申請用。`mImageViewer_setup.exe` +
-      `installer/readme.txt` を同梱)
+    - `mImageViewer_installer_v<VERSION>.zip` (Vector 申請用。`mImageViewer_setup.exe` +
+      `installer/readme.txt` を同梱。v1.1.0 で `mImageViewer_v<VERSION>.zip` から改名)
+    - `mImageViewer_portable_v<VERSION>.zip` (ポータブル版、mikage.to のみ。
+      `.\scripts\build-portable.ps1` で生成。loose 同梱フォルダ全体を含む)
+11.5. **ポータブル版 smoke** (v1.1.0+):
+    - `dist\mImageViewer_portable_v<VER>\` を **C ドライブ以外の書込可フォルダ** (D:\ / USB 等) へ
+      解凍し、`mimageviewer.exe` を起動 → PDF 表示 / 動画再生 / AI アップスケール / Susie の
+      いずれかを 1 回ずつ確認。`<exe_dir>\data` が作られ APPDATA が触られないこと、
+      インストール版をトレイ常駐させたまま起動しても両方独立に動く (mutex 分離) ことを確認。
+      検証チェックリスト全項目は [docs/portable-build-plan.md](docs/portable-build-plan.md) §8。
 12. 依存 DLL の回帰チェック — リリース exe に対して `dumpbin /dependents` を走らせ、
     `VCRUNTIME140.dll` / `MSVCP140.dll` が現れていないことを確認する。もし現れていたら:
     - メイン exe: `ort` クレート機能から `load-dynamic` が抜けていないか確認

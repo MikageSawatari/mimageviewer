@@ -470,7 +470,7 @@
     <span class="badge">Rust 製</span>
   </div>
   <a class="btn-download" href="#download">ダウンロード</a>
-  <p class="download-note">無料 &nbsp;·&nbsp; インストーラ or 単体 exe</p>
+  <p class="download-note">無料 &nbsp;·&nbsp; インストール不要のポータブル版あり</p>
 </div>
 
 <!-- ===== Use-case Cards ===== -->
@@ -917,18 +917,71 @@
     <h2>ダウンロード</h2>
     <div class="download-box" style="flex-direction:column; align-items:stretch;">
       <div class="download-info" style="text-align:center;">
-        <div class="version">mImageViewer v1.0.0</div>
+        <div class="version">mImageViewer v1.1.0</div>
         <div class="meta">Windows 11（64bit）</div>
       </div>
       <div style="display:flex; gap:1rem; justify-content:center; flex-wrap:wrap;">
-        <a class="btn-download" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_setup.exe">インストーラをダウンロード</a>
-        <a class="btn-download" style="background:linear-gradient(135deg,#ffb0d9,#d63384);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mimageviewer.exe">単体 exe をダウンロード</a>
+        <a class="btn-download" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_setup.exe">インストーラ版</a>
+        <a class="btn-download" style="background:linear-gradient(135deg,#ffb0d9,#d63384);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mimageviewer.exe">単体 exe 版</a>
+        <a class="btn-download" style="background:linear-gradient(135deg,#7ee0c0,#1f9e7a);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_portable_v1.1.0.zip">ポータブル版（zip）</a>
       </div>
     </div>
+
+    <p style="margin-top:1.2rem; font-weight:600;">3 つの版の違い</p>
+    <div style="overflow-x:auto;">
+    <table style="width:100%; border-collapse:collapse; font-size:0.9rem; margin-top:0.3rem;">
+      <thead>
+        <tr style="border-bottom:2px solid #d63384; text-align:left;">
+          <th style="padding:0.5rem 0.7rem;">　</th>
+          <th style="padding:0.5rem 0.7rem;">インストーラ版</th>
+          <th style="padding:0.5rem 0.7rem;">単体 exe 版</th>
+          <th style="padding:0.5rem 0.7rem;">ポータブル版（zip）</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr style="border-bottom:1px solid #eee;">
+          <td style="padding:0.5rem 0.7rem; font-weight:600;">導入方法</td>
+          <td style="padding:0.5rem 0.7rem;">setup.exe を実行してインストール</td>
+          <td style="padding:0.5rem 0.7rem;">exe を置いて実行するだけ</td>
+          <td style="padding:0.5rem 0.7rem;">zip を解凍して exe を実行するだけ</td>
+        </tr>
+        <tr style="border-bottom:1px solid #eee;">
+          <td style="padding:0.5rem 0.7rem; font-weight:600;">管理者権限</td>
+          <td style="padding:0.5rem 0.7rem;"><strong>必要</strong>（UAC が表示されます）</td>
+          <td style="padding:0.5rem 0.7rem;">不要</td>
+          <td style="padding:0.5rem 0.7rem;">不要</td>
+        </tr>
+        <tr style="border-bottom:1px solid #eee;">
+          <td style="padding:0.5rem 0.7rem; font-weight:600;">設定・データの保存先</td>
+          <td style="padding:0.5rem 0.7rem;"><code>%APPDATA%\mimageviewer\</code></td>
+          <td style="padding:0.5rem 0.7rem;"><code>%APPDATA%\mimageviewer\</code></td>
+          <td style="padding:0.5rem 0.7rem;"><strong>exe と同じフォルダの</strong> <code>data\</code><br>（システムドライブの APPDATA を使いません）</td>
+        </tr>
+        <tr style="border-bottom:1px solid #eee;">
+          <td style="padding:0.5rem 0.7rem; font-weight:600;">アンインストール</td>
+          <td style="padding:0.5rem 0.7rem;">Windows の設定から削除</td>
+          <td style="padding:0.5rem 0.7rem;">exe を削除（設定は APPDATA に残る）</td>
+          <td style="padding:0.5rem 0.7rem;">フォルダごと削除で完全に消える</td>
+        </tr>
+        <tr>
+          <td style="padding:0.5rem 0.7rem; font-weight:600;">持ち運び</td>
+          <td style="padding:0.5rem 0.7rem;">―</td>
+          <td style="padding:0.5rem 0.7rem;">exe のみ（設定は移動しない）</td>
+          <td style="padding:0.5rem 0.7rem;">フォルダごと USB・別 PC へコピー可</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+
     <div class="info-box" style="margin-top:1rem;">
-      <strong>インストーラ版：</strong>スタートメニューへの登録・アンインストール機能付き。<br>
-      <strong>単体 exe 版：</strong>任意のフォルダに置いて実行するだけで使えます。アンインストールはファイルを削除するだけ。<br>
-      いずれの場合も、設定は <code>%APPDATA%\mimageviewer\</code> に保存されます。
+      <strong>どれを選べばいい？</strong><br>
+      ふつうにお使いなら <strong>インストーラ版</strong> がおすすめです（スタートメニュー登録・アップデート通知付き）。
+      ただしインストール時に<strong>管理者権限（UAC）が必要</strong>です。<br>
+      管理者権限を使いたくない・システムドライブを節約したい・USB メモリ等で持ち運びたい場合は
+      <strong>ポータブル版</strong> をどうぞ。zip を<strong>書き込み可能な場所</strong>（デスクトップ・D ドライブ・USB 等）に
+      解凍し、設定やキャッシュもそのフォルダ内の <code>data\</code> にまとまります。
+      <span style="color:#888;">※ <code>C:\Program Files\</code> など書き込みできない場所に置くと起動できません。</span><br>
+      <strong>単体 exe 版</strong> は 1 ファイルで手軽ですが、設定は APPDATA に保存されます。
     </div>
   </section>
 

@@ -78,6 +78,10 @@ pub mod os_theme;
 pub mod panorama;
 pub mod panorama_wgpu;
 pub mod path_key;
+// loose-deps ポータブルビルド専用の native ファイル所在解決 (exe 隣の bundled file)。
+// 通常ビルドでは中身が無いので宣言ごと cfg で落とす。詳細: docs/portable-build-plan.md
+#[cfg(feature = "portable")]
+pub mod native_assets;
 pub mod pdf_loader;
 pub mod pdf_passwords;
 pub mod perf;

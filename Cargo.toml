@@ -31,6 +31,13 @@ rust-version.workspace = true
 [features]
 manual-e2e = []
 
+# loose-deps ポータブルビルド。native 依存 (pdfium / onnxruntime / susie ワーカー /
+# vst3-host / AI モデル) を `include_bytes!` で埋め込まず、exe と同じディレクトリの
+# loose ファイルから解決する。data_dir も既定で `<exe_dir>/data` を指す (APPDATA を
+# 触らない)。配布は launcher を使わず core を `mimageviewer.exe` にリネームして同梱
+# DLL/モデルと一緒に zip 配布する。詳細: docs/portable-build-plan.md
+portable = []
+
 # 本体 exe のバイナリ名は `mimageviewer-core` (= 内部実体)。
 # 配布する `mimageviewer.exe` は別途 `crates/launcher/` のランチャーが生成する。
 # ランチャーは初回起動時に core と FFmpeg DLL を %APPDATA% に展開して core を spawn する
