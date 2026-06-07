@@ -571,10 +571,16 @@ mod integration_tests {
             plain.width,
             plain.height
         );
-        // The dilated mask must also cover at least as many pixels.
-        let plain_cov = plain.coverage.iter().filter(|&&c| c > 0.0).count();
-        let out_cov = outlined.coverage.iter().filter(|&&c| c > 0.0).count();
-        assert!(out_cov > plain_cov, "outlined coverage should exceed plain");
+        // The dilated mask must also cover more of the glyph SILHOUETTE (coverage
+        // >= 0.5). Counting `> 0.0` would fold in the rasterizer's wide faint-AA
+        // spread, which a correct contour outline intentionally does NOT dilate
+        // (that faint haze becoming a solid halo was the 袋文字-box bug, 2026-06-07).
+        let plain_cov = plain.coverage.iter().filter(|&&c| c >= 0.5).count();
+        let out_cov = outlined.coverage.iter().filter(|&&c| c >= 0.5).count();
+        assert!(
+            out_cov > plain_cov,
+            "outlined silhouette ({out_cov}) should exceed plain ({plain_cov})"
+        );
     }
 
     #[test]

@@ -368,12 +368,20 @@ fn dilate_coverage(base: &GlyphBitmap, dilate_px: f32) -> GlyphBitmap {
     const D2: f32 = std::f32::consts::SQRT_2;
     let mut dist = vec![FAR; n];
     let idx = |x: i32, y: i32| (y * out_w + x) as usize;
-    // Seed on ANY coverage (matches the old max-filter, which dilated every
-    // non-zero source pixel) so the halo fully contains the glyph incl. its AA
-    // fringe — keeps thin strokes from dropping out.
+    // Seed on the glyph SILHOUETTE (coverage >= 0.5), not on any non-zero coverage.
+    //
+    // The chamfer DT below makes every pixel within `dilate` of a seed FULLY opaque
+    // (it has only distance, not source magnitude). The rasterizer emits a wide band
+    // of faint partial coverage (≈50% of an 'O' bitmap is 0<c<0.5, fading from the
+    // stroke into the counter), so seeding on `> 0.0` turned that faint haze into a
+    // solid halo — the 袋文字 became a filled box around each glyph (2026-06-07 report).
+    // The 50% contour is the glyph's visual edge; the halo still extends `dilate`
+    // past it, so the real AA fringe (just outside the contour) stays covered. The
+    // old brute-force max-filter avoided this only because it wrote the *coverage
+    // value* (faint seed → invisible faint halo); the DT can't, so it must threshold.
     for sy in 0..base_h {
         for sx in 0..base_w {
-            if base.coverage[(sy * base_w + sx) as usize] > 0.0 {
+            if base.coverage[(sy * base_w + sx) as usize] >= 0.5 {
                 dist[idx(sx + pad, sy + pad)] = 0.0;
             }
         }
@@ -680,5 +688,86 @@ mod tests {
         let c = (out.width / 2) as i32;
         let cov = |x: i32, y: i32| out.coverage[(y as usize) * out.width + x as usize];
         assert!(cov(c + 2, c) > 0.99, "outline solid out to its width");
+    }
+
+    /// Regression for the 袋文字-becomes-a-box report (2026-06-07). A real glyph with
+    /// a counter ('O') given a thin outline must NOT fill its counter/corners: the
+    /// rasterizer emits a wide faint-coverage band, and seeding the dilation on any
+    /// non-zero coverage turned it into a solid box. Skips if no system font (CI).
+    #[test]
+    fn dilate_real_glyph_outline_is_not_a_box() {
+        let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\arial.ttf") else {
+            return;
+        };
+        let Ok(font) = LoadedFont::from_bytes("arial".to_string(), bytes) else {
+            return;
+        };
+        let out = font.rasterize('O', 200.0, 3.0).expect("outline");
+        let cov = |x: usize, y: usize| out.coverage[y * out.width + x];
+        let corners = [
+            cov(1, 1),
+            cov(out.width - 2, 1),
+            cov(1, out.height - 2),
+            cov(out.width - 2, out.height - 2),
+        ];
+        let center = cov(out.width / 2, out.height / 2);
+        let fill_ratio =
+            out.coverage.iter().filter(|&&c| c > 0.5).count() as f32 / out.coverage.len() as f32;
+        eprintln!(
+            "O outline {}x{} fill={:.2} center={:.2} corners={:?}",
+            out.width, out.height, fill_ratio, center, corners
+        );
+        assert!(
+            center < 0.5,
+            "'O' counter centre must stay clear, got {center}"
+        );
+        assert!(
+            corners.iter().cloned().fold(0.0f32, f32::max) < 0.5,
+            "'O' bbox corners must stay clear, got {corners:?}"
+        );
+        assert!(
+            fill_ratio < 0.6,
+            "a 3px outline of an 'O' must not nearly fill the bbox (box bug), got {fill_ratio:.2}"
+        );
+    }
+
+    /// Repro for the 袋文字-becomes-a-box report (2026-06-07). A square ring with a
+    /// large clear counter, dilated by a thin outline, must keep the counter clear —
+    /// a box bug fills it. Pure synthetic geometry (no font), so deterministic.
+    #[test]
+    fn dilate_ring_keeps_counter_clear() {
+        // 60x60. Ring = 2px-thick square border band; the interior is a big hole.
+        let w = 60usize;
+        let h = 60usize;
+        let mut cov = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let on_border = x < 2 || x >= w - 2 || y < 2 || y >= h - 2;
+                if on_border {
+                    cov[y * w + x] = 1.0;
+                }
+            }
+        }
+        let base = GlyphBitmap {
+            width: w,
+            height: h,
+            coverage: cov,
+            left: 0.0,
+            top: 0.0,
+        };
+        let out = dilate_coverage(&base, 3.0);
+        let cov = |b: &GlyphBitmap, x: usize, y: usize| b.coverage[y * b.width + x];
+        let center = cov(&out, out.width / 2, out.height / 2);
+        let fill_ratio =
+            out.coverage.iter().filter(|&&c| c > 0.5).count() as f32 / out.coverage.len() as f32;
+        eprintln!(
+            "ring out {}x{} fill={:.2} center={:.2}",
+            out.width, out.height, fill_ratio, center
+        );
+        // The counter centre is ~28px from the ring; a 3px dilation must leave it clear.
+        assert!(
+            center < 0.5,
+            "ring counter centre must stay clear after a 3px outline, got {center}"
+        );
     }
 }

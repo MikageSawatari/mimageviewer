@@ -4208,17 +4208,39 @@ fn paint_bubble_preview(painter: &egui::Painter, area: egui::Rect, preset: Bubbl
         return;
     }
     if let BubbleShape::Concentration { .. } = shape {
+        // 意識: the bake (raster::draw_concentration) is a feathered, wobbling
+        // もやもや blob — opaque core fading to a hand-drawn wobbling rim, not a
+        // clean ellipse. Mirror that here (concentric wobbly rings) so the card is
+        // distinguishable from the plain ellipse presets.
         let c = area.center();
-        let r = egui::vec2(area.width() * 0.44, area.height() * 0.44);
-        painter.add(egui::Shape::ellipse_filled(
-            c,
-            r,
-            Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+        let (rx, ry) = (area.width() * 0.44, area.height() * 0.44);
+        let n = 56;
+        let ring = |scale: f32| -> Vec<Pos2> {
+            (0..n)
+                .map(|i| {
+                    let a = i as f32 / n as f32 * std::f32::consts::TAU;
+                    // Same rim-wobble harmonics as draw_concentration (3θ + 7θ).
+                    let wob = 1.0 + 0.06 * (3.0 * a).sin() + 0.035 * (7.0 * a + 1.3).sin();
+                    let r = scale * wob;
+                    egui::pos2(c.x + rx * r * a.cos(), c.y + ry * r * a.sin())
+                })
+                .collect()
+        };
+        // Feathered fill: a fainter outer blob + a denser core.
+        painter.add(egui::Shape::convex_polygon(
+            ring(0.97),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+            egui::Stroke::NONE,
         ));
-        painter.add(egui::Shape::ellipse_stroke(
-            c,
-            r,
-            egui::Stroke::new(1.2, Color32::from_gray(180)),
+        painter.add(egui::Shape::convex_polygon(
+            ring(0.78),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 95),
+            egui::Stroke::NONE,
+        ));
+        // Soft wobbling rim ring (the fuzzy edge).
+        painter.add(egui::Shape::closed_line(
+            ring(0.9),
+            egui::Stroke::new(1.3, Color32::from_gray(185)),
         ));
         return;
     }
