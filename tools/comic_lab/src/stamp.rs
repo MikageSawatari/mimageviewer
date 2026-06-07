@@ -301,7 +301,7 @@ pub fn load_stamp_image(source: &StampSource) -> Option<RgbaOverlay> {
             // base64 PNG embedded in the annotation (no fs access = portable).
             use base64::Engine as _;
             let png = base64::engine::general_purpose::STANDARD
-                .decode(data)
+                .decode(data.as_bytes())
                 .ok()?;
             decode_raster(&png)
         }

@@ -9,7 +9,10 @@ name = "comic_core"
 path = "src/lib.rs"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+# "rc" は StampSource::Embedded の base64 PNG を Arc<str> で持つために必要。これで undo
+# スナップショット (objects.to_vec()) や comic_docs の clone が画像データを複製せず Arc
+# ポインタ複製だけで済む (大きい埋め込みスタンプでのメモリ/CPU 跳ねを防ぐ)。
+serde = { version = "1", features = ["derive", "rc"] }
 # Vertical text via OpenType features (docs/vertical-text-opentype-plan.md, 案B):
 # - rustybuzz: pure-Rust HarfBuzz port = the single font parser + shaper. Vertical
 #   runs are shaped with Direction::TopToBottom, so the font's `vert` feature (or

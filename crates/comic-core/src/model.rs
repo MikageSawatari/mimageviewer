@@ -992,9 +992,16 @@ pub enum StampSource {
     /// reference would dangle). `data` is the app's opaque encoding (base64 PNG);
     /// comic-core never decodes it — the app builds `StampImages` from it.
     /// `name` is a short display label for the object list / properties.
+    ///
+    /// `data` is `Arc<str>` (not `String`) so that cloning a `StampSource`
+    /// (undo snapshots `objects.to_vec()`, `comic_docs` copies) duplicates only an
+    /// Arc pointer, not the whole base64 image — large embedded stamps would
+    /// otherwise spike memory/CPU on every edit (undo cap = 100 snapshots).
+    /// serde's "rc" feature provides (de)serialization for `Arc<str>`; the JSON
+    /// shape is identical to a plain string, so the comic.db format is unchanged.
     Embedded {
         name: String,
-        data: String,
+        data: std::sync::Arc<str>,
     },
 }
 

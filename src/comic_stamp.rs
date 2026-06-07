@@ -294,7 +294,7 @@ pub fn load_stamp_image(source: &StampSource) -> Option<RgbaOverlay> {
         StampSource::Embedded { data, .. } => {
             // 注釈に埋め込んだ base64 PNG をデコードする (fs アクセスなし = 持ち運び可)。
             let png = base64::engine::general_purpose::STANDARD
-                .decode(data)
+                .decode(data.as_bytes())
                 .ok()?;
             decode_raster(&png)
         }
@@ -318,7 +318,9 @@ pub fn embed_file_stamp(path: &Path) -> Option<StampSource> {
         img
     };
     let png = encode_overlay_png(&scaled)?;
-    let data = base64::engine::general_purpose::STANDARD.encode(&png);
+    let data: std::sync::Arc<str> = base64::engine::general_purpose::STANDARD
+        .encode(&png)
+        .into();
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
@@ -551,7 +553,9 @@ mod tests {
             pixels,
         };
         let png = encode_overlay_png(&src).expect("encode png");
-        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        let data: std::sync::Arc<str> = base64::engine::general_purpose::STANDARD
+            .encode(&png)
+            .into();
         let embedded = StampSource::Embedded {
             name: "t.png".into(),
             data,
