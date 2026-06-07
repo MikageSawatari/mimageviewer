@@ -60,6 +60,80 @@ impl Default for StrokeStyle {
     }
 }
 
+/// Rounded background plate behind a TextBlock.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextBackgroundStyle {
+    pub fill: Rgba,
+    pub padding_px: f32,
+    pub corner_px: f32,
+}
+
+impl Default for TextBackgroundStyle {
+    fn default() -> Self {
+        TextBackgroundStyle {
+            fill: Rgba::new(0, 0, 0, 150),
+            padding_px: 12.0,
+            corner_px: 8.0,
+        }
+    }
+}
+
+/// Simple text drop shadow. Blur is rendered as a light-weight stepped halo.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextShadowStyle {
+    pub color: Rgba,
+    pub offset: (f32, f32),
+    pub blur_px: f32,
+    pub spread_px: f32,
+}
+
+impl Default for TextShadowStyle {
+    fn default() -> Self {
+        TextShadowStyle {
+            color: Rgba::new(0, 0, 0, 150),
+            offset: (4.0, 4.0),
+            blur_px: 4.0,
+            spread_px: 1.0,
+        }
+    }
+}
+
+/// Outer glow / soft halo around a TextBlock.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextGlowStyle {
+    pub color: Rgba,
+    pub radius_px: f32,
+    pub spread_px: f32,
+}
+
+impl Default for TextGlowStyle {
+    fn default() -> Self {
+        TextGlowStyle {
+            color: Rgba::new(255, 255, 255, 150),
+            radius_px: 8.0,
+            spread_px: 2.0,
+        }
+    }
+}
+
+/// Repeated offset copies behind the text (simple echo / splice style).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextEchoStyle {
+    pub color: Rgba,
+    pub offset: (f32, f32),
+    pub count: u32,
+}
+
+impl Default for TextEchoStyle {
+    fn default() -> Self {
+        TextEchoStyle {
+            color: Rgba::new(0, 0, 0, 110),
+            offset: (5.0, 5.0),
+            count: 3,
+        }
+    }
+}
+
 /// Text writing direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Orientation {
@@ -172,6 +246,18 @@ pub struct TextBlock {
     /// 袋文字 (outline / halo) drawn behind the glyph fill for readability.
     #[serde(default)]
     pub outline: Option<StrokeStyle>,
+    /// Additional outer outlines, drawn from widest to narrowest before
+    /// `outline`. Lets presets build white+black or colored multi-stroke text.
+    #[serde(default)]
+    pub extra_outlines: Vec<StrokeStyle>,
+    #[serde(default)]
+    pub shadow: Option<TextShadowStyle>,
+    #[serde(default)]
+    pub glow: Option<TextGlowStyle>,
+    #[serde(default)]
+    pub background: Option<TextBackgroundStyle>,
+    #[serde(default)]
+    pub echo: Option<TextEchoStyle>,
     #[serde(default)]
     pub bold: bool,
     #[serde(default)]
@@ -207,6 +293,11 @@ impl Default for TextBlock {
             line_gap: 0.0,
             letter_gap: 0.0,
             outline: None,
+            extra_outlines: Vec::new(),
+            shadow: None,
+            glow: None,
+            background: None,
+            echo: None,
             bold: false,
             italic: false,
             auto_tcy: true,

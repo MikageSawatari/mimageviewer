@@ -16,7 +16,8 @@
 use comic_core::{
     BubbleObject, BubbleShape, FillMode, FrameStyle, IndicatorKind, Insets, MarkupRule,
     MessageWindowObject, NamePlate, Orientation, PortraitSlot, Rgba, ShadowStyle, SizeMode,
-    StrokeStyle, TailKind, TextAlign, TextBlock, VAnchor, WindowPosition,
+    StrokeStyle, TailKind, TextAlign, TextBackgroundStyle, TextBlock, TextEchoStyle, TextGlowStyle,
+    TextShadowStyle, VAnchor, WindowPosition,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +34,16 @@ pub struct TextStylePreset {
     pub line_gap: f32,
     pub letter_gap: f32,
     pub outline: Option<StrokeStyle>,
+    #[serde(default)]
+    pub extra_outlines: Vec<StrokeStyle>,
+    #[serde(default)]
+    pub shadow: Option<TextShadowStyle>,
+    #[serde(default)]
+    pub glow: Option<TextGlowStyle>,
+    #[serde(default)]
+    pub background: Option<TextBackgroundStyle>,
+    #[serde(default)]
+    pub echo: Option<TextEchoStyle>,
     pub auto_tcy: bool,
     pub markup_enabled: bool,
     /// 記法の記号セット (縦中横 / 横倒し のペア)。`markup_enabled` と対なので一緒に
@@ -56,6 +67,11 @@ impl TextStylePreset {
         tb.line_gap = self.line_gap;
         tb.letter_gap = self.letter_gap;
         tb.outline = self.outline;
+        tb.extra_outlines = self.extra_outlines.clone();
+        tb.shadow = self.shadow;
+        tb.glow = self.glow;
+        tb.background = self.background;
+        tb.echo = self.echo;
         tb.auto_tcy = self.auto_tcy;
         tb.markup_enabled = self.markup_enabled;
         tb.markup_rules = self.markup_rules.clone();
@@ -77,6 +93,11 @@ impl TextStylePreset {
             line_gap: tb.line_gap,
             letter_gap: tb.letter_gap,
             outline: tb.outline,
+            extra_outlines: tb.extra_outlines.clone(),
+            shadow: tb.shadow,
+            glow: tb.glow,
+            background: tb.background,
+            echo: tb.echo,
             auto_tcy: tb.auto_tcy,
             markup_enabled: tb.markup_enabled,
             markup_rules: tb.markup_rules.clone(),
@@ -346,6 +367,14 @@ mod tests {
                 color: Rgba::WHITE,
                 width_px: 5.0,
             }),
+            extra_outlines: vec![StrokeStyle {
+                color: Rgba::BLACK,
+                width_px: 8.0,
+            }],
+            shadow: Some(TextShadowStyle::default()),
+            glow: Some(TextGlowStyle::default()),
+            background: Some(TextBackgroundStyle::default()),
+            echo: Some(TextEchoStyle::default()),
             auto_tcy: false,
             markup_enabled: true,
             markup_rules: comic_core::markup_rules_angle(),
@@ -362,6 +391,11 @@ mod tests {
         assert_eq!(tb.size_px, 72.0);
         assert_eq!(tb.align, TextAlign::End);
         assert!(tb.bold, "bold もプリセットから復元される");
+        assert_eq!(tb.extra_outlines.len(), 1);
+        assert!(tb.shadow.is_some());
+        assert!(tb.glow.is_some());
+        assert!(tb.background.is_some());
+        assert!(tb.echo.is_some());
         assert_eq!(
             tb.markup_rules,
             comic_core::markup_rules_angle(),
@@ -403,6 +437,11 @@ mod tests {
                 line_gap: 0.0,
                 letter_gap: 0.0,
                 outline: None,
+                extra_outlines: Vec::new(),
+                shadow: None,
+                glow: None,
+                background: None,
+                echo: None,
                 auto_tcy: false,
                 markup_enabled: false,
                 markup_rules: comic_core::default_markup_rules(),
@@ -420,6 +459,11 @@ mod tests {
                 line_gap: 0.0,
                 letter_gap: 0.0,
                 outline: None,
+                extra_outlines: Vec::new(),
+                shadow: None,
+                glow: None,
+                background: None,
+                echo: None,
                 auto_tcy: false,
                 markup_enabled: false,
                 markup_rules: comic_core::default_markup_rules(),

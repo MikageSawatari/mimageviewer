@@ -33,7 +33,8 @@ use comic_core::{
     AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, DecoKind, DecoPlacement,
     DecorationLayer, FillMode, FontSet, FrameStyle, IndicatorKind, InlineDir, MarkupRule,
     MessageWindowObject, NamePlateMode, Orientation, PortraitSide, Rgba, ShadowStyle, SizeMode,
-    StampObject, StrokeStyle, Tail, TailKind, TextAlign, TextBlock, VAnchor, WindowPosition,
+    StampObject, StrokeStyle, Tail, TailKind, TextAlign, TextBackgroundStyle, TextBlock,
+    TextEchoStyle, TextGlowStyle, TextShadowStyle, VAnchor, WindowPosition,
 };
 use std::collections::HashMap;
 
@@ -4079,11 +4080,36 @@ fn system_text_presets(font: &str) -> Vec<TextStylePreset> {
         line_gap: 0.0,
         letter_gap: 0.0,
         outline,
+        extra_outlines: Vec::new(),
+        shadow: None,
+        glow: None,
+        background: None,
+        echo: None,
         auto_tcy: true,
         markup_enabled: true,
         markup_rules: comic_core::default_markup_rules(),
         bold: false,
         italic: false,
+    };
+    let with_shadow = |mut p: TextStylePreset, shadow: TextShadowStyle| {
+        p.shadow = Some(shadow);
+        p
+    };
+    let with_glow = |mut p: TextStylePreset, glow: TextGlowStyle| {
+        p.glow = Some(glow);
+        p
+    };
+    let with_bg = |mut p: TextStylePreset, bg: TextBackgroundStyle| {
+        p.background = Some(bg);
+        p
+    };
+    let with_echo = |mut p: TextStylePreset, echo: TextEchoStyle| {
+        p.echo = Some(echo);
+        p
+    };
+    let with_extra_outline = |mut p: TextStylePreset, stroke: StrokeStyle| {
+        p.extra_outlines.push(stroke);
+        p
     };
     vec![
         base(
@@ -4110,6 +4136,77 @@ fn system_text_presets(font: &str) -> Vec<TextStylePreset> {
             "小声グレー",
             Rgba::new(120, 120, 120, 255),
             None,
+        ),
+        with_shadow(
+            base(
+                "sys:text_caption",
+                "字幕",
+                Rgba::WHITE,
+                Some(StrokeStyle {
+                    color: Rgba::BLACK,
+                    width_px: 3.0,
+                }),
+            ),
+            TextShadowStyle {
+                color: Rgba::new(0, 0, 0, 170),
+                offset: (3.0, 3.0),
+                blur_px: 5.0,
+                spread_px: 1.0,
+            },
+        ),
+        with_bg(
+            base("sys:text_plate", "半透明帯", Rgba::WHITE, None),
+            TextBackgroundStyle {
+                fill: Rgba::new(0, 0, 0, 150),
+                padding_px: 12.0,
+                corner_px: 8.0,
+            },
+        ),
+        {
+            let mut p = base(
+                "sys:text_hollow",
+                "中抜き",
+                Rgba::TRANSPARENT,
+                Some(StrokeStyle {
+                    color: Rgba::WHITE,
+                    width_px: 4.0,
+                }),
+            );
+            p.extra_outlines.push(StrokeStyle {
+                color: Rgba::BLACK,
+                width_px: 7.0,
+            });
+            p
+        },
+        with_glow(
+            base(
+                "sys:text_neon",
+                "ネオン",
+                Rgba::new(120, 245, 255, 255),
+                Some(StrokeStyle {
+                    color: Rgba::new(10, 40, 80, 255),
+                    width_px: 2.0,
+                }),
+            ),
+            TextGlowStyle {
+                color: Rgba::new(60, 220, 255, 170),
+                radius_px: 12.0,
+                spread_px: 2.0,
+            },
+        ),
+        with_echo(
+            with_extra_outline(
+                base("sys:text_echo", "Echo", Rgba::WHITE, None),
+                StrokeStyle {
+                    color: Rgba::BLACK,
+                    width_px: 3.0,
+                },
+            ),
+            TextEchoStyle {
+                color: Rgba::new(40, 90, 210, 150),
+                offset: (6.0, 5.0),
+                count: 3,
+            },
         ),
     ]
 }
@@ -5236,6 +5333,11 @@ fn text_style_diverged(a: &TextBlock, b: &TextBlock) -> bool {
         || a.line_gap != b.line_gap
         || a.letter_gap != b.letter_gap
         || a.outline != b.outline
+        || a.extra_outlines != b.extra_outlines
+        || a.shadow != b.shadow
+        || a.glow != b.glow
+        || a.background != b.background
+        || a.echo != b.echo
         || a.auto_tcy != b.auto_tcy
         || a.markup_enabled != b.markup_enabled
         || a.markup_rules != b.markup_rules
@@ -5593,6 +5695,7 @@ fn text_block_ui(
             }
         });
     }
+    text_effects_ui(ui, t, changed);
     let mut tcy = t.auto_tcy;
     if ui
         .checkbox(&mut tcy, "自動縦中横")
@@ -5646,6 +5749,173 @@ fn text_block_ui(
         .changed()
     {
         *changed = true;
+    }
+}
+
+fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("文字効果").strong());
+
+    if !t.extra_outlines.is_empty() {
+        let mut remove = None;
+        for (i, outline) in t.extra_outlines.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("外フチ{}", i + 1));
+                let mut col = to_c32(outline.color);
+                if ui.color_edit_button_srgba(&mut col).changed() {
+                    outline.color = from_c32(col);
+                    *changed = true;
+                }
+                *changed |= ui
+                    .add(egui::Slider::new(&mut outline.width_px, 0.0..=48.0).text("太さ"))
+                    .changed();
+                if ui.small_button("削除").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            t.extra_outlines.remove(i);
+            *changed = true;
+        }
+    }
+    if ui.button("外フチ追加").clicked() {
+        let next_w = t.outline.map(|s| s.width_px).unwrap_or(3.0).max(
+            t.extra_outlines
+                .iter()
+                .map(|s| s.width_px)
+                .fold(0.0, f32::max),
+        ) + 3.0;
+        t.extra_outlines.push(StrokeStyle {
+            color: Rgba::BLACK,
+            width_px: next_w.min(48.0),
+        });
+        *changed = true;
+    }
+
+    let mut has_shadow = t.shadow.is_some();
+    if ui.checkbox(&mut has_shadow, "影").changed() {
+        t.shadow = if has_shadow {
+            Some(TextShadowStyle::default())
+        } else {
+            None
+        };
+        *changed = true;
+    }
+    if let Some(sh) = &mut t.shadow {
+        ui.horizontal(|ui| {
+            ui.label("影色");
+            let mut col = to_c32(sh.color);
+            if ui.color_edit_button_srgba(&mut col).changed() {
+                sh.color = from_c32(col);
+                *changed = true;
+            }
+            ui.label("X");
+            *changed |= ui
+                .add(egui::DragValue::new(&mut sh.offset.0).speed(0.5))
+                .changed();
+            ui.label("Y");
+            *changed |= ui
+                .add(egui::DragValue::new(&mut sh.offset.1).speed(0.5))
+                .changed();
+        });
+        *changed |= ui
+            .add(egui::Slider::new(&mut sh.blur_px, 0.0..=48.0).text("ぼかし"))
+            .changed();
+        *changed |= ui
+            .add(egui::Slider::new(&mut sh.spread_px, 0.0..=24.0).text("広がり"))
+            .changed();
+    }
+
+    let mut has_glow = t.glow.is_some();
+    if ui.checkbox(&mut has_glow, "発光").changed() {
+        t.glow = if has_glow {
+            Some(TextGlowStyle::default())
+        } else {
+            None
+        };
+        *changed = true;
+    }
+    if let Some(glow) = &mut t.glow {
+        ui.horizontal(|ui| {
+            ui.label("発光色");
+            let mut col = to_c32(glow.color);
+            if ui.color_edit_button_srgba(&mut col).changed() {
+                glow.color = from_c32(col);
+                *changed = true;
+            }
+        });
+        *changed |= ui
+            .add(egui::Slider::new(&mut glow.radius_px, 0.0..=64.0).text("半径"))
+            .changed();
+        *changed |= ui
+            .add(egui::Slider::new(&mut glow.spread_px, 0.0..=32.0).text("広がり"))
+            .changed();
+    }
+
+    let mut has_bg = t.background.is_some();
+    if ui.checkbox(&mut has_bg, "背景プレート").changed() {
+        t.background = if has_bg {
+            Some(TextBackgroundStyle::default())
+        } else {
+            None
+        };
+        *changed = true;
+    }
+    if let Some(bg) = &mut t.background {
+        ui.horizontal(|ui| {
+            ui.label("背景色");
+            let mut col = to_c32(bg.fill);
+            if ui.color_edit_button_srgba(&mut col).changed() {
+                bg.fill = from_c32(col);
+                *changed = true;
+            }
+        });
+        *changed |= ui
+            .add(egui::Slider::new(&mut bg.padding_px, 0.0..=80.0).text("余白"))
+            .changed();
+        *changed |= ui
+            .add(egui::Slider::new(&mut bg.corner_px, 0.0..=80.0).text("角丸"))
+            .changed();
+    }
+
+    let mut has_echo = t.echo.is_some();
+    if ui.checkbox(&mut has_echo, "Echo").changed() {
+        t.echo = if has_echo {
+            Some(TextEchoStyle::default())
+        } else {
+            None
+        };
+        *changed = true;
+    }
+    if let Some(echo) = &mut t.echo {
+        ui.horizontal(|ui| {
+            ui.label("Echo色");
+            let mut col = to_c32(echo.color);
+            if ui.color_edit_button_srgba(&mut col).changed() {
+                echo.color = from_c32(col);
+                *changed = true;
+            }
+            ui.label("数");
+            let mut count = echo.count as i32;
+            if ui
+                .add(egui::DragValue::new(&mut count).range(1..=12))
+                .changed()
+            {
+                echo.count = count.clamp(1, 12) as u32;
+                *changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("X");
+            *changed |= ui
+                .add(egui::DragValue::new(&mut echo.offset.0).speed(0.5))
+                .changed();
+            ui.label("Y");
+            *changed |= ui
+                .add(egui::DragValue::new(&mut echo.offset.1).speed(0.5))
+                .changed();
+        });
     }
 }
 

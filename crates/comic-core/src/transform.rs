@@ -75,6 +75,35 @@ fn scale_opt_stroke(stroke: &Option<StrokeStyle>, s: f32) -> Option<StrokeStyle>
 }
 
 fn scale_text(t: &TextBlock, s: f32) -> TextBlock {
+    let scale_bg = |bg: &Option<crate::model::TextBackgroundStyle>| {
+        bg.as_ref().map(|b| crate::model::TextBackgroundStyle {
+            fill: b.fill,
+            padding_px: b.padding_px * s,
+            corner_px: b.corner_px * s,
+        })
+    };
+    let scale_shadow = |shadow: &Option<crate::model::TextShadowStyle>| {
+        shadow.as_ref().map(|sh| crate::model::TextShadowStyle {
+            color: sh.color,
+            offset: (sh.offset.0 * s, sh.offset.1 * s),
+            blur_px: sh.blur_px * s,
+            spread_px: sh.spread_px * s,
+        })
+    };
+    let scale_glow = |glow: &Option<crate::model::TextGlowStyle>| {
+        glow.as_ref().map(|g| crate::model::TextGlowStyle {
+            color: g.color,
+            radius_px: g.radius_px * s,
+            spread_px: g.spread_px * s,
+        })
+    };
+    let scale_echo = |echo: &Option<crate::model::TextEchoStyle>| {
+        echo.as_ref().map(|e| crate::model::TextEchoStyle {
+            color: e.color,
+            offset: (e.offset.0 * s, e.offset.1 * s),
+            count: e.count,
+        })
+    };
     TextBlock {
         text: t.text.clone(),
         font_key: t.font_key.clone(),
@@ -85,6 +114,15 @@ fn scale_text(t: &TextBlock, s: f32) -> TextBlock {
         line_gap: t.line_gap * s,
         letter_gap: t.letter_gap * s,
         outline: scale_opt_stroke(&t.outline, s),
+        extra_outlines: t
+            .extra_outlines
+            .iter()
+            .map(|st| scale_stroke(st, s))
+            .collect(),
+        shadow: scale_shadow(&t.shadow),
+        glow: scale_glow(&t.glow),
+        background: scale_bg(&t.background),
+        echo: scale_echo(&t.echo),
         bold: t.bold,
         italic: t.italic,
         auto_tcy: t.auto_tcy,

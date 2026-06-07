@@ -28,8 +28,9 @@ pub use model::{
     DecorationLayer, FillMode, FrameStyle, IndicatorKind, InlineDir, Insets, MarkupRule,
     MessageWindowObject, NamePlate, NamePlateMode, Orientation, PortraitSide, PortraitSlot, Rgba,
     ShadowStyle, SizeMode, StampObject, StampSource, StrokeStyle, Tail, TailKind, TextAlign,
-    TextBlock, VAnchor, WindowPosition, default_markup_rules, markup_rules_angle,
-    markup_rules_brackets, markup_rules_white,
+    TextBackgroundStyle, TextBlock, TextEchoStyle, TextGlowStyle, TextShadowStyle, VAnchor,
+    WindowPosition, default_markup_rules, markup_rules_angle, markup_rules_brackets,
+    markup_rules_white,
 };
 pub use raster::{
     RgbaOverlay, StampImages, bake_overlay, bake_overlay_with_stamps, composite_stamp_sticker,

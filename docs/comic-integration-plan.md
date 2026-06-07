@@ -305,6 +305,8 @@ Inc 6（変形ハンドル + Undo/Redo）→ Inc 4d（ウィンドウ詳細編�
 - [x] orientation 横書き / 縦書き（OpenType `vert`、`。、「」…ー` 縦字形）
 - [x] align（start/center/end）/ line_gap（行間）/ letter_gap（字間）— `734e34c0`
 - [x] outline 袋文字（色・太さ）
+- [x] 文字効果: 追加外フチ / ドロップシャドウ / 外側発光 / 背景プレート / Echo。Hollow / Neon /
+      Echo は組み込みセリフプリセットから適用可能
 - [x] bold / italic
 - [x] auto_tcy 自動縦中横（数字 2-3 桁 / `!?`）
 - [x] markup_enabled トグル ＋ 記法 3 セット（`[]{}` / `〈〉《》` / `〚〛〘〙`）の記号挿入ボタン — `734e34c0`

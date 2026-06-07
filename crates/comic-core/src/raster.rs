@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::font::{FontSet, LoadedFont, rotate_cw};
+use crate::font::{FontSet, GlyphBitmap, LoadedFont, rotate_cw};
 use crate::layout::{GlyphForm, TextLayout, layout_text, layout_text_wrapped};
 use crate::model::{
     AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, DecoKind, DecorationLayer,
@@ -824,12 +824,7 @@ fn object_local_aabb(obj: &AnnotationObject, fonts: &FontSet) -> Option<(f32, f3
             if let Some(font) = fonts.get(&bubble.text.font_key) {
                 if !bubble.text.text.is_empty() {
                     let (lw, lh) = layout_text(&bubble.text, font).bounds;
-                    let tm = bubble
-                        .text
-                        .outline
-                        .map(|s| s.width_px)
-                        .unwrap_or(0.0)
-                        .max(0.0);
+                    let tm = text_effect_padding(&bubble.text);
                     acc(obj.pivot.0 - lw * 0.5 - tm, obj.pivot.1 - lh * 0.5 - tm);
                     acc(obj.pivot.0 + lw * 0.5 + tm, obj.pivot.1 + lh * 0.5 + tm);
                 }
@@ -860,8 +855,8 @@ fn object_local_aabb(obj: &AnnotationObject, fonts: &FontSet) -> Option<(f32, f3
                 return None;
             }
             let (lw, lh) = layout_text(text, font).bounds;
-            // Standalone text: pivot is the layout top-left. Pad for 袋文字.
-            let m = text.outline.map(|s| s.width_px).unwrap_or(0.0).max(0.0) + 1.0;
+            // Standalone text: pivot is the layout top-left. Pad for text effects.
+            let m = text_effect_padding(text) + 1.0;
             acc(obj.pivot.0 - m, obj.pivot.1 - m);
             acc(obj.pivot.0 + lw + m, obj.pivot.1 + lh + m);
         }
@@ -893,9 +888,7 @@ fn object_local_aabb(obj: &AnnotationObject, fonts: &FontSet) -> Option<(f32, f3
                 let pad = np.padding_px.max(0.0);
                 let (pw, ph) = (nw + pad * 2.0, nh + pad * 2.0);
                 // Slack for the plate stroke + the name's 袋文字 halo.
-                let s = np.outline.width_px.max(0.0) * 0.5
-                    + np.name.outline.map(|o| o.width_px).unwrap_or(0.0).max(0.0)
-                    + 1.0;
+                let s = np.outline.width_px.max(0.0) * 0.5 + text_effect_padding(&np.name) + 1.0;
                 let px = obj.pivot.0 - hw + np.offset.0;
                 let py = obj.pivot.1 - hh + np.offset.1 - ph;
                 acc(px - s, py - s);
@@ -1380,75 +1373,98 @@ fn draw_layout_glyphs(
     origin_y: f32,
     clip: Option<(f32, f32, f32, f32)>,
 ) {
-    let outline = block.outline.filter(|s| s.width_px > 0.0);
-    let inside = |x: i32, y: i32| match clip {
-        None => true,
-        Some((x0, y0, x1, y1)) => {
-            let (xf, yf) = (x as f32, y as f32);
-            xf >= x0 && xf < x1 && yf >= y0 && yf < y1
-        }
-    };
-    for g in &layout.glyphs {
-        if g.form == GlyphForm::Sideways {
-            // 横倒し: rotate the coverage 90° CW and blit it CENTERED at the
-            // placement. Halo pass first.
-            let cx = origin_x + g.x;
-            let cy = origin_y + g.y;
-            if let Some(stroke) = outline {
-                if let Some(bmp) = font.rasterize_gid(g.glyph_id, g.size, stroke.width_px) {
-                    let rot = rotate_cw(&bmp);
-                    blit_centered(overlay, &rot, cx, cy, stroke.color, clip);
-                }
-            }
-            if let Some(bmp) = font.rasterize_gid(g.glyph_id, g.size, 0.0) {
-                let rot = rotate_cw(&bmp);
-                blit_centered(overlay, &rot, cx, cy, block.color, clip);
-            }
-            continue;
-        }
+    draw_text_background(overlay, layout, block, origin_x, origin_y, clip);
 
-        // Pass 1: 袋文字 halo (dilated mask in the outline color), drawn first.
-        if let Some(stroke) = outline {
-            if let Some(bmp) = font.rasterize_gid(g.glyph_id, g.size, stroke.width_px) {
-                let gx = origin_x + g.x + bmp.left;
-                let gy = origin_y + g.y + bmp.top;
-                for py in 0..bmp.height {
-                    for px in 0..bmp.width {
-                        let c = bmp.coverage[py * bmp.width + px];
-                        if c > 0.0 {
-                            let (ix, iy) = ((gx + px as f32) as i32, (gy + py as f32) as i32);
-                            if inside(ix, iy) {
-                                overlay.blend_px(ix, iy, stroke.color, c);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Pass 2: glyph fill on top.
-        if let Some(bmp) = font.rasterize_gid(g.glyph_id, g.size, 0.0) {
-            let gx = origin_x + g.x + bmp.left;
-            let gy = origin_y + g.y + bmp.top;
-            for py in 0..bmp.height {
-                for px in 0..bmp.width {
-                    let c = bmp.coverage[py * bmp.width + px];
-                    if c > 0.0 {
-                        let (ix, iy) = ((gx + px as f32) as i32, (gy + py as f32) as i32);
-                        if inside(ix, iy) {
-                            overlay.blend_px(ix, iy, block.color, c);
-                        }
-                    }
-                }
-            }
+    if let Some(shadow) = block.shadow {
+        draw_layout_soft_mask(
+            overlay,
+            layout,
+            font,
+            origin_x + shadow.offset.0,
+            origin_y + shadow.offset.1,
+            shadow.color,
+            shadow.spread_px,
+            shadow.blur_px,
+            clip,
+        );
+    }
+
+    if let Some(echo) = block.echo {
+        let count = echo.count.clamp(1, 12);
+        for i in (1..=count).rev() {
+            let t = i as f32;
+            let alpha_scale = 1.0 - (i - 1) as f32 / count as f32 * 0.45;
+            draw_layout_mask(
+                overlay,
+                layout,
+                font,
+                origin_x + echo.offset.0 * t,
+                origin_y + echo.offset.1 * t,
+                0.0,
+                color_with_alpha_scale(echo.color, alpha_scale),
+                clip,
+            );
         }
     }
+
+    if let Some(glow) = block.glow {
+        draw_layout_soft_mask(
+            overlay,
+            layout,
+            font,
+            origin_x,
+            origin_y,
+            glow.color,
+            glow.spread_px,
+            glow.radius_px,
+            clip,
+        );
+    }
+
+    let mut outlines: Vec<StrokeStyle> = block
+        .extra_outlines
+        .iter()
+        .copied()
+        .filter(|s| s.width_px > 0.0 && s.color.a > 0)
+        .collect();
+    if let Some(outline) = block.outline.filter(|s| s.width_px > 0.0 && s.color.a > 0) {
+        outlines.push(outline);
+    }
+    outlines.sort_by(|a, b| {
+        b.width_px
+            .partial_cmp(&a.width_px)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for stroke in outlines {
+        draw_layout_mask(
+            overlay,
+            layout,
+            font,
+            origin_x,
+            origin_y,
+            stroke.width_px,
+            stroke.color,
+            clip,
+        );
+    }
+
+    draw_layout_mask(
+        overlay,
+        layout,
+        font,
+        origin_x,
+        origin_y,
+        0.0,
+        block.color,
+        clip,
+    );
 }
 
 /// Blit a coverage bitmap centered at (cx, cy) in image space, in `color`,
 /// optionally clipped to a rect `(x0, y0, x1, y1)`.
 fn blit_centered(
     overlay: &mut RgbaOverlay,
-    bmp: &crate::font::GlyphBitmap,
+    bmp: &GlyphBitmap,
     cx: f32,
     cy: f32,
     color: Rgba,
@@ -1456,6 +1472,17 @@ fn blit_centered(
 ) {
     let left = cx - bmp.width as f32 * 0.5;
     let top = cy - bmp.height as f32 * 0.5;
+    blit_bitmap(overlay, bmp, left, top, color, clip);
+}
+
+fn blit_bitmap(
+    overlay: &mut RgbaOverlay,
+    bmp: &GlyphBitmap,
+    left: f32,
+    top: f32,
+    color: Rgba,
+    clip: Option<(f32, f32, f32, f32)>,
+) {
     for py in 0..bmp.height {
         for px in 0..bmp.width {
             let c = bmp.coverage[py * bmp.width + px];
@@ -1473,6 +1500,154 @@ fn blit_centered(
                 }
             }
         }
+    }
+}
+
+fn draw_layout_mask(
+    overlay: &mut RgbaOverlay,
+    layout: &TextLayout,
+    font: &LoadedFont,
+    origin_x: f32,
+    origin_y: f32,
+    dilate_px: f32,
+    color: Rgba,
+    clip: Option<(f32, f32, f32, f32)>,
+) {
+    if color.a == 0 {
+        return;
+    }
+    for g in &layout.glyphs {
+        let Some(bmp) = font.rasterize_gid(g.glyph_id, g.size, dilate_px.max(0.0)) else {
+            continue;
+        };
+        if g.form == GlyphForm::Sideways {
+            let rot = rotate_cw(&bmp);
+            blit_centered(overlay, &rot, origin_x + g.x, origin_y + g.y, color, clip);
+        } else {
+            blit_bitmap(
+                overlay,
+                &bmp,
+                origin_x + g.x + bmp.left,
+                origin_y + g.y + bmp.top,
+                color,
+                clip,
+            );
+        }
+    }
+}
+
+fn draw_layout_soft_mask(
+    overlay: &mut RgbaOverlay,
+    layout: &TextLayout,
+    font: &LoadedFont,
+    origin_x: f32,
+    origin_y: f32,
+    color: Rgba,
+    spread_px: f32,
+    blur_px: f32,
+    clip: Option<(f32, f32, f32, f32)>,
+) {
+    let spread = spread_px.max(0.0);
+    let blur = blur_px.max(0.0).min(48.0);
+    if blur <= 0.1 {
+        draw_layout_mask(
+            overlay, layout, font, origin_x, origin_y, spread, color, clip,
+        );
+        return;
+    }
+    let steps = ((blur / 3.0).ceil() as u32).clamp(2, 8);
+    // A translucent crisp core keeps the effect readable; wider low-alpha passes
+    // approximate blur without introducing a separate full-image blur buffer.
+    draw_layout_mask(
+        overlay,
+        layout,
+        font,
+        origin_x,
+        origin_y,
+        spread,
+        color_with_alpha_scale(color, 0.45),
+        clip,
+    );
+    for i in (1..=steps).rev() {
+        let t = i as f32 / steps as f32;
+        let dilate = spread + blur * t;
+        let alpha_scale = 0.75 / steps as f32 * (0.35 + 0.65 * t);
+        draw_layout_mask(
+            overlay,
+            layout,
+            font,
+            origin_x,
+            origin_y,
+            dilate,
+            color_with_alpha_scale(color, alpha_scale),
+            clip,
+        );
+    }
+}
+
+fn draw_text_background(
+    overlay: &mut RgbaOverlay,
+    layout: &TextLayout,
+    block: &TextBlock,
+    origin_x: f32,
+    origin_y: f32,
+    clip: Option<(f32, f32, f32, f32)>,
+) {
+    let Some(bg) = block.background else {
+        return;
+    };
+    if bg.fill.a == 0 {
+        return;
+    }
+    let pad = bg.padding_px.max(0.0);
+    let (lw, lh) = layout.bounds;
+    let x0 = origin_x - pad;
+    let y0 = origin_y - pad;
+    let x1 = origin_x + lw + pad;
+    let y1 = origin_y + lh + pad;
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let poly = tessellate_bubble(
+        &BubbleShape::RoundRect {
+            half_w: (x1 - x0) * 0.5,
+            half_h: (y1 - y0) * 0.5,
+            corner_px: bg.corner_px.max(0.0),
+        },
+        ((x0 + x1) * 0.5, (y0 + y1) * 0.5),
+    );
+    fill_polygon_clipped(overlay, &poly, bg.fill, clip);
+}
+
+fn text_effect_padding(block: &TextBlock) -> f32 {
+    let mut pad = block.outline.map(|s| s.width_px).unwrap_or(0.0).max(0.0);
+    for st in &block.extra_outlines {
+        pad = pad.max(st.width_px.max(0.0));
+    }
+    if let Some(bg) = block.background {
+        pad = pad.max(bg.padding_px.max(0.0));
+    }
+    if let Some(sh) = block.shadow {
+        let reach =
+            sh.spread_px.max(0.0) + sh.blur_px.max(0.0) + sh.offset.0.abs().max(sh.offset.1.abs());
+        pad = pad.max(reach);
+    }
+    if let Some(glow) = block.glow {
+        pad = pad.max(glow.spread_px.max(0.0) + glow.radius_px.max(0.0));
+    }
+    if let Some(echo) = block.echo {
+        let reach = echo.offset.0.abs().max(echo.offset.1.abs()) * echo.count.clamp(1, 12) as f32;
+        pad = pad.max(reach);
+    }
+    pad
+}
+
+fn color_with_alpha_scale(color: Rgba, scale: f32) -> Rgba {
+    Rgba {
+        a: (color.a as f32 * scale.clamp(0.0, 1.0))
+            .round()
+            .clamp(0.0, 255.0) as u8,
+        ..color
     }
 }
 
@@ -2039,6 +2214,52 @@ fn fill_polygon(overlay: &mut RgbaOverlay, poly: &[(f32, f32)], color: Rgba) {
     }
 }
 
+fn fill_polygon_clipped(
+    overlay: &mut RgbaOverlay,
+    poly: &[(f32, f32)],
+    color: Rgba,
+    clip: Option<(f32, f32, f32, f32)>,
+) {
+    if poly.len() < 3 || color.a == 0 {
+        return;
+    }
+    let min_y = poly.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+    let max_y = poly.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
+    let mut y0 = (min_y.floor() as i32).max(0);
+    let mut y1 = (max_y.ceil() as i32).min(overlay.h as i32 - 1);
+    if let Some((_, cy0, _, cy1)) = clip {
+        y0 = y0.max(cy0.floor() as i32);
+        y1 = y1.min(cy1.ceil() as i32);
+    }
+    for y in y0..=y1 {
+        let yc = y as f32 + 0.5;
+        let mut xs: Vec<f32> = Vec::new();
+        let n = poly.len();
+        for i in 0..n {
+            let (ax, ay) = poly[i];
+            let (bx, by) = poly[(i + 1) % n];
+            if (ay <= yc && by > yc) || (by <= yc && ay > yc) {
+                let t = (yc - ay) / (by - ay);
+                xs.push(ax + t * (bx - ax));
+            }
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut i = 0;
+        while i + 1 < xs.len() {
+            let mut xa = xs[i].ceil() as i32;
+            let mut xb = xs[i + 1].floor() as i32;
+            if let Some((cx0, _, cx1, _)) = clip {
+                xa = xa.max(cx0.floor() as i32);
+                xb = xb.min(cx1.ceil() as i32);
+            }
+            for x in xa..=xb {
+                overlay.blend_px(x, y, color, 1.0);
+            }
+            i += 2;
+        }
+    }
+}
+
 /// Stroke a closed polygon as a sequence of segments.
 fn stroke_polygon(overlay: &mut RgbaOverlay, poly: &[(f32, f32)], stroke: &StrokeStyle) {
     let n = poly.len();
@@ -2139,6 +2360,101 @@ mod tests {
         let pivot = object_rotation_pivot(&obj, &fonts);
         assert!((pivot.0 - (30.0 + w * 0.5)).abs() < 0.01);
         assert!((pivot.1 - (40.0 + h * 0.5)).abs() < 0.01);
+    }
+
+    #[test]
+    fn text_effects_expand_baked_coverage() {
+        let Some(font) = load_test_font() else {
+            eprintln!("skip: no Windows Japanese test font");
+            return;
+        };
+        let mut fonts = FontSet::new();
+        fonts.insert(font);
+        let base = TextBlock {
+            text: "A".to_string(),
+            font_key: "test".to_string(),
+            size_px: 72.0,
+            color: Rgba::BLACK,
+            ..TextBlock::default()
+        };
+        let mut fx = base.clone();
+        fx.extra_outlines.push(StrokeStyle {
+            color: Rgba::WHITE,
+            width_px: 5.0,
+        });
+        fx.shadow = Some(crate::model::TextShadowStyle {
+            color: Rgba::new(0, 0, 0, 160),
+            offset: (8.0, 7.0),
+            blur_px: 6.0,
+            spread_px: 2.0,
+        });
+        fx.glow = Some(crate::model::TextGlowStyle {
+            color: Rgba::new(80, 220, 255, 170),
+            radius_px: 10.0,
+            spread_px: 2.0,
+        });
+        fx.background = Some(crate::model::TextBackgroundStyle {
+            fill: Rgba::new(0, 0, 0, 90),
+            padding_px: 12.0,
+            corner_px: 4.0,
+        });
+        fx.echo = Some(crate::model::TextEchoStyle {
+            color: Rgba::new(40, 80, 220, 120),
+            offset: (5.0, 4.0),
+            count: 3,
+        });
+        let plain = bake_overlay(
+            &[AnnotationObject::new_text(1, (40.0, 40.0), base)],
+            180,
+            160,
+            &fonts,
+        );
+        let effect = bake_overlay(
+            &[AnnotationObject::new_text(1, (40.0, 40.0), fx)],
+            180,
+            160,
+            &fonts,
+        );
+        let alpha_count = |ov: &RgbaOverlay| ov.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+        assert!(
+            alpha_count(&effect) > alpha_count(&plain),
+            "effects should add visible pixels beyond the plain glyph"
+        );
+    }
+
+    #[test]
+    fn hollow_text_outline_bakes_with_transparent_fill() {
+        let Some(font) = load_test_font() else {
+            eprintln!("skip: no Windows Japanese test font");
+            return;
+        };
+        let mut fonts = FontSet::new();
+        fonts.insert(font);
+        let text = TextBlock {
+            text: "A".to_string(),
+            font_key: "test".to_string(),
+            size_px: 72.0,
+            color: Rgba::TRANSPARENT,
+            outline: Some(StrokeStyle {
+                color: Rgba::WHITE,
+                width_px: 4.0,
+            }),
+            extra_outlines: vec![StrokeStyle {
+                color: Rgba::BLACK,
+                width_px: 7.0,
+            }],
+            ..TextBlock::default()
+        };
+        let ov = bake_overlay(
+            &[AnnotationObject::new_text(1, (40.0, 40.0), text)],
+            180,
+            160,
+            &fonts,
+        );
+        assert!(
+            ov.pixels.chunks_exact(4).any(|p| p[3] > 0),
+            "hollow text should still draw its outlines"
+        );
     }
 
     #[test]
