@@ -653,11 +653,12 @@ impl App {
                 None
             }
             Some(GridItem::ConvertibleArchive { path, format }) => {
+                let auto_fs = self.settings.auto_fullscreen_zip_pdf;
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 if let Some(cached) = self.try_archive_cache_lookup(&path) {
-                    self.open_archive_via_cache(path, cached);
+                    self.open_archive_via_cache(path, cached, auto_fs);
                 } else {
-                    self.request_archive_convert(path, format);
+                    self.request_archive_convert(path, format, auto_fs);
                 }
                 None
             }

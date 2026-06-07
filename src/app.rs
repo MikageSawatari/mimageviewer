@@ -6864,10 +6864,11 @@ impl App {
                 {
                     self.suppress_folder_nav_record_once = true;
                 }
-                self.open_archive_via_cache(path, cached);
+                // 履歴の戻る/進む・アドレスバー経由は自動フルスクリーンしない (ZIP/PDF と同じ)。
+                self.open_archive_via_cache(path, cached, false);
                 return FolderOpenOutcome::Loaded;
             } else {
-                return if self.request_archive_convert(path, format) {
+                return if self.request_archive_convert(path, format, false) {
                     FolderOpenOutcome::ConversionDialogOpened
                 } else {
                     FolderOpenOutcome::Ignored
@@ -14069,11 +14070,12 @@ impl App {
                             let pf = path.clone();
                             let fmt = *format;
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
+                            let auto_fs = self.settings.auto_fullscreen_zip_pdf;
                             if let Some(cached) = self.try_archive_cache_lookup(&pf) {
-                                self.open_archive_via_cache(pf, cached);
+                                self.open_archive_via_cache(pf, cached, auto_fs);
                                 return None;
                             }
-                            self.request_archive_convert(pf, fmt);
+                            self.request_archive_convert(pf, fmt, auto_fs);
                         }
                         Some(GridItem::SearchContainer { path, kind, .. }) => {
                             // Ctrl+G 結果ビュー (Aggregated) でコンテナを Enter

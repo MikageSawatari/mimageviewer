@@ -80,6 +80,10 @@ pub(crate) struct ArchiveConvertState {
     /// 履歴の戻る/進むから未変換アーカイブに入ろうとしてダイアログが出た場合、
     /// キャンセル時に戻る/進むスタックをクリック前へ戻すためのスナップショット。
     pub nav_history_rollback: Option<crate::app::FolderNavHistorySnapshot>,
+    /// この変換完了後に 1 ページ目を自動フルスクリーン表示するか。明示的なオープン
+    /// (グリッド Enter / ダブルクリック / ゲームパッド × 設定 ON) のときだけ true。
+    /// キャンセル時は state ごと drop されるので stale フラグが残らない。
+    pub auto_fullscreen: bool,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -103,12 +107,18 @@ impl App {
     /// Enter / ダブルクリックのキャッシュヒット経路で使う。変換直後の
     /// pending_nav 経路は `show_archive_convert_dialog` 内で直接処理する
     /// (そちらは `archive_convert` のライフサイクルと絡むため)。
-    pub(crate) fn open_archive_via_cache(&mut self, src: PathBuf, cached_zip: PathBuf) {
-        // 設定 ON のとき、変換アーカイブ (LZH/7z) も ZIP/PDF と同じく 1 ページ目を自動
-        // フルスクリーン表示する。`load_folder(cache_zip)` → `load_zip_as_folder` が
-        // `pending_auto_fs_open` を消化する直前に立てるので、変換キャンセル等で stale
-        // 化しない (= 実際にアーカイブが開く直前にのみ立つ)。
-        if self.settings.auto_fullscreen_zip_pdf {
+    /// `auto_fullscreen` は **明示的なオープン** (グリッド Enter / ダブルクリック /
+    /// ゲームパッド × 設定 ON) のときだけ true。履歴の戻る/進む・アドレスバー経由の
+    /// `load_folder_or_convert_archive` からは false で呼び、ZIP/PDF と挙動を揃える
+    /// (ZIP/PDF も明示オープン時のみ自動フルスクリーン)。`load_folder(cache_zip)` →
+    /// `load_zip_as_folder` が同フレームで `pending_auto_fs_open` を消化するので stale 化しない。
+    pub(crate) fn open_archive_via_cache(
+        &mut self,
+        src: PathBuf,
+        cached_zip: PathBuf,
+        auto_fullscreen: bool,
+    ) {
+        if auto_fullscreen {
             self.pending_auto_fs_open = true;
         }
         self.load_folder(cached_zip.clone());
@@ -125,7 +135,12 @@ impl App {
 
     /// 変換ダイアログを開始する (スキャン fase から)。
     /// 既に別のダイアログが動作中なら無視 (二重起動防止)。
-    pub(crate) fn request_archive_convert(&mut self, src: PathBuf, format: ArchiveFormat) -> bool {
+    pub(crate) fn request_archive_convert(
+        &mut self,
+        src: PathBuf,
+        format: ArchiveFormat,
+        auto_fullscreen: bool,
+    ) -> bool {
         if self.archive_convert.is_some() {
             return false;
         }
@@ -142,6 +157,7 @@ impl App {
             rx,
             pending_nav: None,
             nav_history_rollback: None,
+            auto_fullscreen,
         });
         true
     }
@@ -171,10 +187,16 @@ impl App {
                 // 元 (7z/LZH) のパスを退避してから load_folder (キャッシュ ZIP) を実行、
                 // その後 override に元パスを書き戻すことで、UI 表示は元ファイルの場所のままに保つ。
                 let src = self.archive_convert.as_ref().map(|s| s.src_path.clone());
+                // 明示オープンからの変換 (state.auto_fullscreen=true) のときだけ、変換成功
+                // 直後に 1 ページ目を自動フルスクリーン表示する (履歴/アドレスバー経由の
+                // 変換は false なので発火しない)。
+                let auto_fs = self
+                    .archive_convert
+                    .as_ref()
+                    .map(|s| s.auto_fullscreen)
+                    .unwrap_or(false);
                 self.archive_convert = None;
-                // 変換成功直後も、設定 ON なら ZIP/PDF と同じく 1 ページ目を自動
-                // フルスクリーン表示する (load_folder が pending_auto_fs_open を消化)。
-                if self.settings.auto_fullscreen_zip_pdf {
+                if auto_fs {
                     self.pending_auto_fs_open = true;
                 }
                 self.load_folder(nav.clone());
