@@ -21180,7 +21180,13 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        // 画像オープン時のフリーズ調査用 perf 計装 (--perf-log)。この関数の build 経路
+        // (キャッシュミス時) は UI スレッドで同期実行され、AI アップスケール後の大判
+        // 画像では post_filter + GPU upload が数百ms かかりうる。cat="fs" /
+        // kind="final_composite_build" でサブ計時を出す (cache hit 時は emit しない)。
+        let fc_build_start = std::time::Instant::now();
         let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
+        let fc_edit_ms = fc_build_start.elapsed().as_secs_f64() * 1000.0;
         let params = self.effective_params(idx).clone();
         let final_key = self.final_composite_key_for_pixels(edit_key, edit_pixels.size, &params);
         let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, &params);
@@ -21191,6 +21197,7 @@ impl App {
             }
         }
 
+        let t_adjust0 = std::time::Instant::now();
         let adjusted = if params.is_color_identity() {
             Arc::clone(&edit_pixels)
         } else {
@@ -21199,6 +21206,7 @@ impl App {
                 &params,
             ))
         };
+        let fc_adjust_ms = t_adjust0.elapsed().as_secs_f64() * 1000.0;
 
         let (base_pixels, complete) = match (ai_key, ai_ready) {
             (Some(_), Some(pixels)) => (pixels, true),
@@ -21212,13 +21220,19 @@ impl App {
             (None, _) => (Arc::clone(&adjusted), true),
         };
 
+        let t_post0 = std::time::Instant::now();
         let post_filtered = Arc::new(self.apply_final_post_filter(&base_pixels, &params));
+        let fc_post_ms = t_post0.elapsed().as_secs_f64() * 1000.0;
+        let t_clamp0 = std::time::Instant::now();
         let upload = clamp_for_gpu(&post_filtered);
+        let fc_clamp_ms = t_clamp0.elapsed().as_secs_f64() * 1000.0;
         let tex_opts = if !self.post_filter_bypassed && params.post_filter.needs_nearest_sampler() {
             egui::TextureOptions::NEAREST
         } else {
             egui::TextureOptions::LINEAR
         };
+        let [fc_w, fc_h] = post_filtered.size;
+        let t_up0 = std::time::Instant::now();
         let texture = ctx.load_texture(
             format!(
                 "final_composite_{}_{}_{}_{}",
@@ -21230,6 +21244,7 @@ impl App {
             upload.into_owned(),
             tex_opts,
         );
+        let fc_upload_ms = t_up0.elapsed().as_secs_f64() * 1000.0;
         self.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
@@ -21238,6 +21253,29 @@ impl App {
                 complete,
             },
         );
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "fs",
+                "final_composite_build",
+                None,
+                0,
+                &[
+                    (
+                        "ms",
+                        (fc_build_start.elapsed().as_secs_f64() * 1000.0).into(),
+                    ),
+                    ("edit_ms", fc_edit_ms.into()),
+                    ("adjust_ms", fc_adjust_ms.into()),
+                    ("post_ms", fc_post_ms.into()),
+                    ("clamp_ms", fc_clamp_ms.into()),
+                    ("upload_ms", fc_upload_ms.into()),
+                    ("w", (fc_w as u64).into()),
+                    ("h", (fc_h as u64).into()),
+                    ("complete", complete.into()),
+                    ("idx", (idx as u64).into()),
+                ],
+            );
+        }
         Some(texture)
     }
 
@@ -21696,12 +21734,17 @@ impl App {
             objects.clone()
         };
         let stamp_images = self.build_stamp_images(&scaled_objects);
+        let t_bake0 = std::time::Instant::now();
         let overlay =
             comic_core::bake_overlay_with_stamps(&scaled_objects, bw, bh, &fonts, &stamp_images);
+        let cc_bake_ms = t_bake0.elapsed().as_secs_f64() * 1000.0;
+        let t_comp0 = std::time::Instant::now();
         let composed = Arc::new(crate::comic_overlay::composite_overlay_over(
             &bake_base, &overlay,
         ));
+        let cc_composite_ms = t_comp0.elapsed().as_secs_f64() * 1000.0;
         let upload = clamp_for_gpu(&composed);
+        let t_up0 = std::time::Instant::now();
         let texture = ctx.load_texture(
             format!(
                 "comic_{idx}_{}_{comic_gen}_{preview_scale}",
@@ -21710,7 +21753,32 @@ impl App {
             upload.into_owned(),
             egui::TextureOptions::LINEAR,
         );
-        let elapsed_ms = bake_start.elapsed().as_millis();
+        let cc_upload_ms = t_up0.elapsed().as_secs_f64() * 1000.0;
+        let bake_total_ms = bake_start.elapsed().as_secs_f64() * 1000.0;
+        // 画像オープン/編集時のフリーズ調査用 perf 計装 (--perf-log)。注釈ベイク +
+        // overlay 合成 + GPU upload は UI スレッド同期。cache miss 時のみ emit
+        // (毎フレームではない)。bake_ms はテキスト効果込みの注釈描画、composite_ms は
+        // 下地への重畳 (rayon)、upload_ms は GPU 転送。
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "fs",
+                "comic_composite_build",
+                None,
+                0,
+                &[
+                    ("ms", bake_total_ms.into()),
+                    ("bake_ms", cc_bake_ms.into()),
+                    ("composite_ms", cc_composite_ms.into()),
+                    ("upload_ms", cc_upload_ms.into()),
+                    ("w", (bw as u64).into()),
+                    ("h", (bh as u64).into()),
+                    ("objs", (objects.len() as u64).into()),
+                    ("preview_scale", (preview_scale as u64).into()),
+                    ("idx", (idx as u64).into()),
+                ],
+            );
+        }
+        let elapsed_ms = bake_total_ms as u128;
         if elapsed_ms >= 80 {
             crate::logger::log(format!(
                 "[comic] bake+composite+upload {elapsed_ms}ms idx={idx} {bw}x{bh} (scale 1/{preview_scale}) objs={}",

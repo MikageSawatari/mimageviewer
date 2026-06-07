@@ -674,17 +674,25 @@ fn project_tip_outside(body: &[(f32, f32)], pivot: (f32, f32), tip: (f32, f32)) 
     let dx = tip.0 - pivot.0;
     let dy = tip.1 - pivot.1;
     let len = (dx * dx + dy * dy).sqrt();
-    if len < 1e-3 {
-        return tip; // degenerate (tip at the pivot): no direction to project along.
-    }
+    // Unit direction of the tail. Degenerate (tip exactly at the pivot, e.g. a
+    // numeric edit or a drag to dead-centre) has no direction, so fall back to
+    // straight down (+y), matching the default tail's downward lean — this keeps
+    // the spike pointing outward instead of collapsing inside the bubble (a tip
+    // left at the pivot would otherwise stay submerged).
+    let (ux, uy) = if len < 1e-3 {
+        (0.0, 1.0)
+    } else {
+        (dx / len, dy / len)
+    };
     // Distance from the pivot to where the centre→tip ray crosses the outline.
-    let exit = arclen_point(body, auto_base_t(body, pivot, tip));
+    // A point one unit along the chosen direction gives auto_base_t the ray.
+    let exit = arclen_point(body, auto_base_t(body, pivot, (pivot.0 + ux, pivot.1 + uy)));
     let exit_len = ((exit.0 - pivot.0).powi(2) + (exit.1 - pivot.1).powi(2)).sqrt();
     let min_len = exit_len + TAIL_MIN_OVERHANG;
     if len >= min_len {
         tip
     } else {
-        (pivot.0 + dx / len * min_len, pivot.1 + dy / len * min_len)
+        (pivot.0 + ux * min_len, pivot.1 + uy * min_len)
     }
 }
 
@@ -1259,6 +1267,23 @@ mod tests {
         assert!(
             (t2.0 - 600.0).abs() < 1e-3 && t2.1.abs() < 1e-3,
             "far tip unchanged, got {t2:?}"
+        );
+
+        // Degenerate: tip exactly at the pivot (no direction). Must NOT stay at the
+        // pivot (= submerged); falls back to a downward spike outside the outline.
+        let degenerate = Tail {
+            tip: pivot,
+            ..Tail::default()
+        };
+        let t3 = resolve_tail_tip(&shape, pivot, &degenerate);
+        let t3_len = (t3.0 * t3.0 + t3.1 * t3.1).sqrt();
+        assert!(
+            t3_len >= 120.0 + TAIL_MIN_OVERHANG - 1e-2,
+            "degenerate tip pushed below ry+overhang, got {t3:?} len {t3_len}"
+        );
+        assert!(
+            t3.1 > 0.0,
+            "degenerate fallback points downward, got {t3:?}"
         );
     }
 
