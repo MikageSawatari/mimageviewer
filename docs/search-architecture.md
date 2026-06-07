@@ -427,6 +427,7 @@ UI (render_search_bar)
     Pass 2 (Image / Video、on-demand メタ):
        - target に応じて必要なメタだけ読む (PNG tEXt / EXIF / XMP /
          動画コンテナメタ / dc:subject)
+    → 検索中は item 単位の done/total を SearchPending の atomic snapshot に反映
     → 合格 idx を HashSet<usize> に反映 (search_filter)
 ```
 
@@ -438,6 +439,9 @@ UI (render_search_bar)
   バーも閉じる。
 - **ZIP 表示中は検索対象をファイル名に固定** (`grid_is_zip_entries`): ZIP 内
   画像のメタ検索は行わない (§4.6)。
+- 検索中表示は処理済み item 数 / 総 item 数を出す。分母・最終件数とも
+  `ZipSeparator` は除外する。1 item 内のメタ読み取り中は、その item が完了するまで
+  数字は進まない。
 - 件数バッジは可視マッチ全体を「X/Y 件」で数える (separator は除く)。
 
 **インデックスを使わない理由**: 対象が表示中の数十〜数千件に限定されるので、

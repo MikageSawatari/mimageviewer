@@ -1913,13 +1913,25 @@ impl App {
                 }
 
                 // 検索中インジケータ or マッチ件数 (separator の後に表示)
-                if self.search_pending.is_some() {
+                if let Some(pending) = self.search_pending.as_ref() {
                     ui.separator();
-                    ui.label(
-                        egui::RichText::new("検索中...")
+                    let progress = pending.progress_snapshot();
+                    let text = if progress.total == 0 {
+                        "検索中...".to_string()
+                    } else {
+                        format!("検索中 {}/{} 件", progress.done, progress.total)
+                    };
+                    let response = ui.label(
+                        egui::RichText::new(text)
                             .size(11.0)
                             .color(egui::Color32::from_rgb(180, 180, 80)),
                     );
+                    if progress.total > 0 {
+                        response.on_hover_text(format!(
+                            "ヒット {} 件 / 確認済み {} 件 / 全 {} 件",
+                            progress.matched, progress.done, progress.total
+                        ));
+                    }
                 } else if let Some(ref filter) = self.search_filter {
                     ui.separator();
                     // 構造アイテム (Folder/ZIP/PDF) も一貫して絞れるようになったので

@@ -8595,11 +8595,20 @@ mod ctrl_f_structural_filter_tests {
         items: &[GridItem],
         target: crate::fts_index::SearchTarget,
     ) -> std::collections::HashSet<usize> {
+        run_ctrl_f_with_progress(query, items, target).0
+    }
+
+    fn run_ctrl_f_with_progress(
+        query: &str,
+        items: &[GridItem],
+        target: crate::fts_index::SearchTarget,
+    ) -> (std::collections::HashSet<usize>, SearchProgressSnapshot) {
         let tokens = crate::search_query::parse(query);
         let xmp: std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>> =
             std::collections::HashMap::new();
         let pw = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
         let cancel = std::sync::atomic::AtomicBool::new(false);
+        let progress = SearchProgressShared::new(ctrl_f_progress_total(items));
         match run_metadata_search(
             &tokens,
             items,
@@ -8609,8 +8618,9 @@ mod ctrl_f_structural_filter_tests {
             &target,
             crate::search_query::MatchMode::And,
             &cancel,
+            Some(&progress),
         ) {
-            SearchThreadResult::Done { matches, .. } => matches,
+            SearchThreadResult::Done { matches, .. } => (matches, progress.snapshot()),
         }
     }
 
@@ -8632,6 +8642,57 @@ mod ctrl_f_structural_filter_tests {
             m,
             std::collections::HashSet::from([0, 2, 4]),
             "名前に sunset を含むフォルダ / ZIP / アーカイブだけ残る"
+        );
+    }
+
+    #[test]
+    fn progress_counts_countable_items_across_passes() {
+        // separator は最終件数表示と同じく分母から除外し、Pass 1 (ZIP) と
+        // Pass 2 (Image) の両方が item 単位で進捗を進める。
+        let zip = PathBuf::from(r"C:\g\book.zip");
+        let items = vec![
+            GridItem::ZipSeparator {
+                dir_display: "(root)".into(),
+            },
+            GridItem::ZipImage {
+                zip_path: zip,
+                entry_name: "sunset01.png".into(),
+            },
+            GridItem::Image(PathBuf::from(r"C:\g\sunset.jpg")),
+            GridItem::Folder(PathBuf::from(r"C:\g\documents")),
+        ];
+        let target =
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+        let (m, progress) = run_ctrl_f_with_progress("sunset", &items, target);
+
+        assert_eq!(m, std::collections::HashSet::from([0, 1, 2]));
+        assert_eq!(
+            progress,
+            SearchProgressSnapshot {
+                done: 3,
+                total: 3,
+                matched: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn progress_advances_when_image_target_cannot_contribute() {
+        // target=PdfMeta のように Image/Video の fallback hay が空確定する経路でも、
+        // UI の分母が残ったまま止まって見えないよう完了数は進める。
+        let items = vec![GridItem::Image(PathBuf::from(r"C:\g\sunset.jpg"))];
+        let target =
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::PdfMeta]);
+        let (m, progress) = run_ctrl_f_with_progress("sunset", &items, target);
+
+        assert!(m.is_empty());
+        assert_eq!(
+            progress,
+            SearchProgressSnapshot {
+                done: 1,
+                total: 1,
+                matched: 0,
+            }
         );
     }
 

@@ -1077,6 +1077,8 @@ pub(crate) enum SearchMode {
 pub(crate) struct SearchPending {
     /// 検索キャンセル用トークン。新クエリ / 検索バー閉じ / フォルダ切替で立てる。
     cancel: Arc<AtomicBool>,
+    /// UI が毎フレーム読む検索進捗。worker は item 完了ごとに更新する。
+    progress: Arc<SearchProgressShared>,
     /// ワーカースレッドから結果を受け取るチャネル。
     rx: mpsc::Receiver<SearchThreadResult>,
 }
@@ -1084,6 +1086,51 @@ pub(crate) struct SearchPending {
 impl SearchPending {
     pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn progress_snapshot(&self) -> SearchProgressSnapshot {
+        self.progress.snapshot()
+    }
+}
+
+/// Ctrl+F worker の item 単位進捗 snapshot。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SearchProgressSnapshot {
+    pub done: usize,
+    pub total: usize,
+    pub matched: usize,
+}
+
+/// Ctrl+F worker から UI へ渡す軽量進捗共有状態。
+pub(crate) struct SearchProgressShared {
+    total: AtomicUsize,
+    done: AtomicUsize,
+    matched: AtomicUsize,
+}
+
+impl SearchProgressShared {
+    fn new(total: usize) -> Self {
+        Self {
+            total: AtomicUsize::new(total),
+            done: AtomicUsize::new(0),
+            matched: AtomicUsize::new(0),
+        }
+    }
+
+    fn mark_item_done(&self, matched: bool) {
+        if matched {
+            self.matched.fetch_add(1, Ordering::Relaxed);
+        }
+        self.done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> SearchProgressSnapshot {
+        let total = self.total.load(Ordering::Relaxed);
+        SearchProgressSnapshot {
+            done: self.done.load(Ordering::Relaxed).min(total),
+            total,
+            matched: self.matched.load(Ordering::Relaxed).min(total),
+        }
     }
 }
 
@@ -1291,6 +1338,23 @@ fn run_metadata_load(
     })
 }
 
+fn ctrl_f_progress_countable(item: &GridItem) -> bool {
+    !matches!(item, GridItem::ZipSeparator { .. })
+}
+
+fn ctrl_f_progress_total(items: &[GridItem]) -> usize {
+    items
+        .iter()
+        .filter(|it| ctrl_f_progress_countable(it))
+        .count()
+}
+
+fn mark_ctrl_f_progress(progress: Option<&SearchProgressShared>, matched: bool) {
+    if let Some(progress) = progress {
+        progress.mark_item_done(matched);
+    }
+}
+
 /// Ctrl+F メタデータ検索のワーカー本体。UI スレッドから spawn され、結果は
 /// `SearchPending.rx` で受信される。`cancel` が立ったら中断して Cancelled を返す
 /// (呼び出し側はキャンセル時に Pending をクリアするので Done のみ送る実装でも OK)。
@@ -1303,6 +1367,7 @@ fn run_metadata_search(
     target: &crate::fts_index::SearchTarget,
     mode: crate::search_query::MatchMode,
     cancel: &AtomicBool,
+    progress: Option<&SearchProgressShared>,
 ) -> SearchThreadResult {
     // Ctrl+F (現在地フィルタ) はインデックスを使わず、表示中アイテムを on-demand に
     // 判定する (docs/search-container-item-redesign.md §4.1)。構造アイテム
@@ -1345,12 +1410,13 @@ fn run_metadata_search(
                 xmp_additions,
             };
         }
-        match item {
+        let processed_in_pass1 = match item {
             GridItem::Folder(_) | GridItem::ZipFile(_) | GridItem::ConvertibleArchive { .. } => {
                 // フォルダ / ZIP / 変換対象アーカイブ: ファイル名 (basename) で照合。
                 if use_name && crate::search_query::matches_with_mode(tokens, &item.name(), mode) {
                     matches.insert(idx);
                 }
+                true
             }
             GridItem::PdfFile(path) => {
                 // PDF: ファイル名 + PDF document info を 1 つの hay にまとめて判定する
@@ -1386,9 +1452,11 @@ fn run_metadata_search(
                     // PDF メタが検索対象外 → ファイル名のみで照合。
                     matches.insert(idx);
                 }
+                true
             }
             GridItem::Image(_) | GridItem::Video(_) => {
                 // Pass 2 で処理 (on-demand メタ読み取り)。
+                false
             }
             GridItem::ZipImage { entry_name, .. } => {
                 // §4.1.2: ZIP 内画像は常にファイル名 (エントリ basename) のみで照合。
@@ -1399,10 +1467,12 @@ fn run_metadata_search(
                         matches.insert(idx);
                     }
                 }
+                true
             }
             GridItem::ZipSeparator { .. } => {
                 // 付随グループに可視アイテムが残るかを Pass 1 完了後に判定する。
                 zip_separators.push(idx);
+                false
             }
             GridItem::PdfPage { .. } => {
                 // PDF ページ表示中は Ctrl+F 自体を無効化する (§4.1.1) ため通常は
@@ -1410,11 +1480,16 @@ fn run_metadata_search(
                 if use_name && crate::search_query::matches_with_mode(tokens, &item.name(), mode) {
                     matches.insert(idx);
                 }
+                true
             }
             GridItem::SearchContainer { .. } => {
                 // Ctrl+F と Ctrl+G は排他なので通常出現しない。防御的に常に残す。
                 matches.insert(idx);
+                true
             }
+        };
+        if processed_in_pass1 {
+            mark_ctrl_f_progress(progress, matches.contains(&idx));
         }
     }
 
@@ -1452,6 +1527,7 @@ fn run_metadata_search(
         // (Filename/PngPrompt/Exif/XmpTweet) を一つも含まないなら、fallback hay は常に
         // 空になり matches は必ず false → file I/O もバイト走査も全て無駄。
         if !fallback_contributes {
+            mark_ctrl_f_progress(progress, false);
             continue;
         }
         let name = path
@@ -1544,6 +1620,7 @@ fn run_metadata_search(
                 }
             }
         }
+        mark_ctrl_f_progress(progress, matches.contains(&idx));
     }
 
     SearchThreadResult::Done {
@@ -15806,6 +15883,10 @@ impl App {
         let mode: crate::search_query::MatchMode = self.search_or_mode.into();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
+        let progress = Arc::new(SearchProgressShared::new(ctrl_f_progress_total(
+            &items_snapshot,
+        )));
+        let progress_w = Arc::clone(&progress);
         let (tx, rx) = mpsc::channel();
         // perf 計装上、検索開始を input イベントとして記録する (input_seq は副作用で更新)。
         self.bump_input_seq("search", Some(&self.search_query.clone()));
@@ -15822,12 +15903,17 @@ impl App {
                     &target,
                     mode,
                     &cancel_w,
+                    Some(progress_w.as_ref()),
                 );
                 let _ = tx.send(result);
             })
             .ok();
 
-        self.search_pending = Some(SearchPending { cancel, rx });
+        self.search_pending = Some(SearchPending {
+            cancel,
+            progress,
+            rx,
+        });
     }
 
     /// in-flight 検索があればキャンセルする (検索バーを閉じる等の経路で呼ぶ)。
