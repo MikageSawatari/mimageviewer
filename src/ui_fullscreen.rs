@@ -2442,7 +2442,9 @@ impl App {
                                 ui, ctx, full_rect, image_rect, pixels.as_deref(),
                             );
                             if close_analysis {
-                                self.reset_analysis_mode();
+                                // × も Z / ホバーボタンと同じ経路 (ズーム/パン引き継ぎ込み) に
+                                // 揃える。analysis_mode は true なので OFF 方向にトグルされる。
+                                self.toggle_analysis_mode();
                             }
                         } else if state.is_video {
                             // 動画は native presenter (独立 HWND) が描画とオーバーレイを担うため、
