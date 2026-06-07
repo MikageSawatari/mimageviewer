@@ -245,6 +245,19 @@ pub(crate) struct CapturePending {
     pub(crate) rx: mpsc::Receiver<Result<PathBuf, String>>,
 }
 
+/// ユーザー画像スタンプの埋め込み worker (R2-6) の進行状態。file picker で選んだ画像を
+/// バックグラウンドで `embed_file_stamp` し、完了したら捕捉済みの適用先 (fs_idx / key /
+/// 元寸法 / 差し替え対象) で `apply_stamp_choice` する。worker 完了まで UI は固まらず、
+/// 中央に「スタンプ読み込み中…」を出す。
+pub(crate) struct StampEmbedPending {
+    pub(crate) fs_idx: usize,
+    pub(crate) key: String,
+    pub(crate) src_dims: (f32, f32),
+    pub(crate) replace_target: Option<u64>,
+    pub(crate) rx: mpsc::Receiver<Option<comic_core::StampSource>>,
+    pub(crate) cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum CompareViewMode {
     Off,
@@ -3824,6 +3837,10 @@ pub struct App {
     /// フィードバックトーストをクリックしたときに Explorer で選択表示する対象。
     /// 通常トーストでは None。キャプチャ保存成功時だけ Some にする。
     pub(crate) fs_feedback_toast_reveal_path: Option<PathBuf>,
+    /// ユーザー画像スタンプの埋め込み (read→decode→縮小→PNG→base64) を UI スレッドから
+    /// 逃がす worker の進行状態 (R2-6)。大判画像で file picker 後に固まるのを防ぐため、処理中は
+    /// 画面中央に「スタンプ読み込み中…」を出し、完了で `apply_stamp_choice` を適用する。
+    pub(crate) stamp_embed_pending: Option<StampEmbedPending>,
     /// フルスクリーンでマウスカーソルの最終活動時刻 (移動 / クリック / ホイール)。
     /// パネル / HUD が全て非表示で `CURSOR_HIDE_IDLE_SECS` 経過したらカーソルを隠す。
     /// `None` はまだ活動が記録されていない状態 (= 直前に活動があったとみなしカーソル表示)。
@@ -5243,6 +5260,7 @@ impl App {
             ime_last_event_at: None,
             fs_feedback_toast: None,
             fs_feedback_toast_reveal_path: None,
+            stamp_embed_pending: None,
             cursor_last_activity: None,
             cursor_hidden: false,
             video_playback_speed,
@@ -10670,6 +10688,10 @@ impl App {
         self.mask_pages.clear();
         self.conceal_pages.clear();
         self.comic_pages.clear();
+        // 進行中のスタンプ埋め込み worker は別フォルダ/別ページへ移ったので破棄 (R2-6)。
+        if let Some(p) = self.stamp_embed_pending.take() {
+            p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn rehydrate_page_edit_state_for_current_items(

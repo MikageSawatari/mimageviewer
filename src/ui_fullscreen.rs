@@ -2694,6 +2694,9 @@ impl App {
                         // ── 右上フィードバックトースト ──
                         self.draw_feedback_toast(ui, full_rect, ctx);
 
+                        // ── スタンプ埋め込み worker の進行表示 (中央「読み込み中」) ──
+                        self.draw_stamp_embed_overlay(ui, full_rect, ctx);
+
                         // 動画ブックマーク名編集ダイアログは native presenter overlay の
                         // 中で描画される (= `native_presenter/overlay_draw.rs::draw_native_*`)。
                         // eframe ビューポートからは描画しない。
@@ -8682,6 +8685,43 @@ impl App {
 }
 
 impl App {
+    /// スタンプ埋め込み worker (R2-6) の進行を画面中央に表示する。worker が完了していれば
+    /// `poll_stamp_embed` がここで適用し、まだ処理中なら中央に「スタンプ読み込み中…」を出して
+    /// 再描画を要求する (UI は固まらない)。
+    pub(crate) fn draw_stamp_embed_overlay(
+        &mut self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        ctx: &egui::Context,
+    ) {
+        // 完了チェック + stale 破棄。まだ処理中なら true。
+        if !self.poll_stamp_embed() {
+            return;
+        }
+        let text = "スタンプ読み込み中…";
+        let font = egui::FontId::proportional(20.0);
+        let galley =
+            ui.painter()
+                .layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE);
+        let padding = egui::vec2(28.0, 18.0);
+        let box_size = galley.size() + padding * 2.0;
+        let rect = egui::Rect::from_center_size(full_rect.center(), box_size);
+        ui.painter().rect_filled(
+            rect,
+            10.0,
+            egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230),
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            font,
+            egui::Color32::WHITE,
+        );
+        // worker 完了を取りこぼさないよう毎フレーム再描画。
+        ctx.request_repaint();
+    }
+
     /// 右上にフィードバックトーストを描画する。
     /// フルスクリーン側 (`render_fullscreen_viewport`) とグリッド側 (`render_grid`) の
     /// 両方から呼ばれる。どちらで描画しても同じ見た目になるよう、描画先 `ui` と

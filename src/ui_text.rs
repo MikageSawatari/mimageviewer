@@ -3044,17 +3044,110 @@ impl App {
                 .pick_file()
             {
                 // パス参照ではなく画像を縮小して注釈に埋め込む (フォルダ移動 / 別 PC /
-                // 元削除でも欠落しない。Codex 監査 P1)。デコード不可なら追加しない。
-                chosen = crate::comic_stamp::embed_file_stamp(&path);
+                // 元削除でも欠落しない。Codex 監査 P1)。read→decode→縮小→PNG→base64 は
+                // 大判画像で重い (R2-6) ので worker に逃がし、完了時に適用する。ダイアログは
+                // 即閉じ、処理中は中央に「スタンプ読み込み中…」を出す (draw_stamp_embed_overlay)。
+                self.start_stamp_embed(fs_idx, &key, (sw, sh), path);
+                self.text_add_stamp_dialog = false;
             }
         }
 
         if let Some(src) = chosen {
-            self.apply_stamp_choice(fs_idx, &key, (sw, sh), src);
+            // 絵文字 / 最近使用 (= 即時・デコード不要) はそのまま同期適用。
+            let replace_target = self.stamp_dialog_replace_target.take();
+            self.apply_stamp_choice(fs_idx, &key, (sw, sh), src, replace_target);
             self.text_add_stamp_dialog = false;
         } else if !open {
             // × で閉じた: 差し替え対象もクリア。
             self.stamp_dialog_replace_target = None;
+        }
+    }
+
+    /// ユーザー画像スタンプの埋め込みを worker で開始する (R2-6)。適用先 (fs_idx / key /
+    /// 元寸法 / 差し替え対象) を捕捉し、完了時に `poll_stamp_embed` が `apply_stamp_choice`
+    /// する。差し替え対象はここで take しておく (ダイアログを閉じても保持するため)。
+    fn start_stamp_embed(
+        &mut self,
+        fs_idx: usize,
+        key: &str,
+        src_dims: (f32, f32),
+        path: std::path::PathBuf,
+    ) {
+        use std::sync::atomic::AtomicBool;
+        // 既存の進行中 worker があれば破棄 (連打対策)。
+        if let Some(prev) = self.stamp_embed_pending.take() {
+            prev.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let replace_target = self.stamp_dialog_replace_target.take();
+        let c = std::sync::Arc::clone(&cancel);
+        std::thread::Builder::new()
+            .name("stamp-embed".into())
+            .spawn(move || {
+                if c.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let result = crate::comic_stamp::embed_file_stamp(&path);
+                let _ = tx.send(result);
+            })
+            .ok();
+        self.stamp_embed_pending = Some(crate::app::StampEmbedPending {
+            fs_idx,
+            key: key.to_string(),
+            src_dims,
+            replace_target,
+            rx,
+            cancel,
+        });
+    }
+
+    /// 埋め込み worker の完了をポーリングし、できていれば適用する (R2-6)。フルスクリーンの
+    /// 描画 (`draw_stamp_embed_overlay`) から毎フレーム呼ばれる。ページ移動 / テキストモード
+    /// 終了で stale 化したら cancel して破棄する。`true` を返すと「まだ処理中」(呼び出し側が
+    /// 中央トースト + repaint を出す)。
+    pub(crate) fn poll_stamp_embed(&mut self) -> bool {
+        if self.stamp_embed_pending.is_none() {
+            return false;
+        }
+        // stale guard: テキストモードを抜けた / 別ページに移った → cancel して破棄。
+        let stale = {
+            let p = self.stamp_embed_pending.as_ref().unwrap();
+            !self.text_mode || self.fullscreen_idx != Some(p.fs_idx)
+        };
+        if stale {
+            if let Some(p) = self.stamp_embed_pending.take() {
+                p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return false;
+        }
+        // 借用を閉じてから mutable 操作へ。
+        let recv = self.stamp_embed_pending.as_ref().unwrap().rx.try_recv();
+        match recv {
+            Ok(result) => {
+                let p = self.stamp_embed_pending.take().unwrap();
+                match result {
+                    Some(src) => {
+                        self.apply_stamp_choice(
+                            p.fs_idx,
+                            &p.key,
+                            p.src_dims,
+                            src,
+                            p.replace_target,
+                        );
+                    }
+                    None => {
+                        self.show_feedback_toast("画像を読み込めませんでした".to_string());
+                    }
+                }
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true, // まだ処理中
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.stamp_embed_pending = None;
+                false
+            }
         }
     }
 
@@ -3067,6 +3160,7 @@ impl App {
         key: &str,
         src_dims: (f32, f32),
         source: comic_core::StampSource,
+        replace_target: Option<u64>,
     ) {
         // ソースをデコードしてアスペクト (w/h) を得る (キャッシュ経由)。
         let skey = crate::comic_stamp::stamp_source_key(&source);
@@ -3082,7 +3176,7 @@ impl App {
         .max(1e-3);
 
         let mut objs = self.comic_docs.remove(key).unwrap_or_default();
-        match self.stamp_dialog_replace_target.take() {
+        match replace_target {
             Some(id) => {
                 // 既存スタンプのソース差し替え (長辺サイズ保持、短辺をアスペクト再フィット)。
                 if let Some(obj) = objs.iter_mut().find(|o| o.id == id) {

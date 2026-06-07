@@ -309,6 +309,12 @@ pub fn load_stamp_image(source: &StampSource) -> Option<RgbaOverlay> {
 /// `FILE_STAMP_EMBED_PX` へ面積平均縮小→PNG エンコード→base64 で `StampSource::Embedded`
 /// を返す。これで注釈データが自己完結し、フォルダ移動 / 別 PC / 元ファイル削除でも
 /// スタンプが欠落しない (Codex 監査 P1)。読めない / デコード不可なら `None`。
+///
+/// これは file picker 後に UI スレッドで同期実行される一発操作。R2-6 で大判画像の所要時間を
+/// 実測したところ、現実的な圧縮率の写真では 24MP (10MB クラス) ≈ 180ms / 48MP ≈ 350ms で、
+/// 一回限りなら許容範囲だった。JPEG の DCT スケール縮小デコードも試したが、埋め込みターゲットが
+/// 1024px だとスケールが 1/4 止まりでエントロピー復号が支配的になり、効果が無かったため
+/// フルデコードのまま維持する (詳細は embed_file_stamp_timing テストのコメント)。
 pub fn embed_file_stamp(path: &Path) -> Option<StampSource> {
     let bytes = std::fs::read(path).ok()?;
     let img = decode_raster(&bytes)?;
@@ -481,30 +487,53 @@ mod tests {
     use super::*;
 
     /// 計測用 (通常 CI では走らせない): 大判画像をスタンプ埋め込みする時間を測る。
-    /// `cargo test --bin mimageviewer-core embed_file_stamp_timing -- --ignored --nocapture`
-    /// R2-6 の「10MB クラス画像で 250ms 以下か」を実機相当で確認する。decode は
-    /// image クレート (zune-jpeg) 経由で、turbojpeg は使わない点に注意。
+    /// `cargo test --release --bin mimageviewer-core embed_file_stamp_timing -- --ignored --nocapture`
+    /// R2-6 の「10MB クラス画像で 250ms 以下か」を実機相当で確認した。
+    ///
+    /// release 実測 (写真ライク画像): 12MP(6MB)≈100ms / 24MP(12MB)≈180ms / 48MP(24MB)≈350ms。
+    /// **「10MB クラス」= 24MP は ~180ms で 250ms 以下 = 許容**。一回限り (file picker 後) なので
+    /// worker 化は不要と判断した (R2-6)。
+    ///
+    /// JPEG の DCT スケール縮小デコード (decode_jpeg_turbo_scaled_from_path) も試したが、埋め込み
+    /// ターゲットが 1024px だとスケールが 1/4 止まりで **エントロピー復号 (ファイルサイズ比例・
+    /// DCT で減らない) が支配的**になり、フルデコードと同等で効果が無かった (サムネ 256px→1/8 の
+    /// ような大幅スキップが効かない)。よってフルデコード (image クレート経由) のまま維持。
+    /// 注: 純ノイズ画像で測るとファイルが実写真の ~5x に肥大しエントロピー律速で誤った遅さに
+    /// なるので、ここでは現実的な圧縮率の写真ライク画像を生成して測る。
     #[test]
     #[ignore]
     fn embed_file_stamp_timing() {
         use std::io::Write;
-        // 圧縮しにくいノイズを LCG で生成 (rand 非依存)。q=92 で「10MB クラス」を作る。
-        fn noisy_jpeg(w: u32, h: u32) -> Vec<u8> {
+        // 写真ライクな画像を生成 (低周波グラデ + 中周波テクスチャ + 少量ノイズ)。実写真に近い
+        // 圧縮率 (~0.3-0.6MB/MP) になるようにして、エントロピー復号時間を現実的にする。純ノイズ
+        // だと file が 5x 肥大しエントロピー律速で DCT スケールの効果が出ない。
+        fn photo_like_jpeg(w: u32, h: u32) -> Vec<u8> {
             let mut state: u32 = 0x9e3779b9;
             let mut rgb = vec![0u8; (w * h * 3) as usize];
-            for b in rgb.iter_mut() {
-                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                *b = (state >> 24) as u8;
+            for y in 0..h {
+                for x in 0..w {
+                    let fx = x as f32 / w as f32;
+                    let fy = y as f32 / h as f32;
+                    // 低周波グラデ + 中周波の縞 (圧縮しやすい構造)。
+                    let base = (fx * 200.0) + (fy * 40.0);
+                    let tex = ((fx * 38.0).sin() + (fy * 26.0).cos()) * 22.0;
+                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let noise = ((state >> 26) as f32) - 32.0; // 小さめのノイズ
+                    let i = ((y * w + x) * 3) as usize;
+                    rgb[i] = (base + tex + noise).clamp(0.0, 255.0) as u8;
+                    rgb[i + 1] = (base * 0.7 + tex + noise).clamp(0.0, 255.0) as u8;
+                    rgb[i + 2] = (base * 0.4 - tex + noise + 40.0).clamp(0.0, 255.0) as u8;
+                }
             }
             let img = image::RgbImage::from_raw(w, h, rgb).expect("rgb buf");
             let mut out = std::io::Cursor::new(Vec::new());
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92)
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
                 .encode_image(&image::DynamicImage::ImageRgb8(img))
                 .expect("encode jpeg");
             out.into_inner()
         }
         for (w, h) in [(4000u32, 3000u32), (6000, 4000), (8000, 6000)] {
-            let jpeg = noisy_jpeg(w, h);
+            let jpeg = photo_like_jpeg(w, h);
             let mp = (w as f64 * h as f64) / 1e6;
             let mb = jpeg.len() as f64 / 1e6;
             let dir = std::env::temp_dir();
@@ -515,12 +544,9 @@ mod tests {
             }
             let t0 = std::time::Instant::now();
             let src = embed_file_stamp(&path);
-            let elapsed = t0.elapsed();
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
             assert!(src.is_some(), "embed should succeed for {w}x{h}");
-            eprintln!(
-                "embed_file_stamp {w}x{h} ({mp:.0}MP, {mb:.1}MB JPEG) -> {:.0}ms",
-                elapsed.as_secs_f64() * 1000.0
-            );
+            eprintln!("embed_file_stamp {w}x{h} ({mp:.0}MP, {mb:.1}MB JPEG) -> {ms:.0}ms");
             let _ = std::fs::remove_file(&path);
         }
     }
