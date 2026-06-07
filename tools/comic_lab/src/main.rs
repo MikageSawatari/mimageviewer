@@ -24,7 +24,7 @@ use comic_core::{
     SizeMode, StampImages, StampObject, StampSource, StrokeStyle, Tail, TailKind, TextAlign,
     TextBlock, VAnchor, WindowPosition, bake_overlay, bake_overlay_with_stamps, bubble_geometry,
     effective_bubble_shape, effective_window_half_extents, layout_text, markup_rules_angle,
-    markup_rules_brackets, markup_rules_white, nearest_base_t, resolve_tail_base,
+    markup_rules_brackets, markup_rules_white, nearest_base_t, resolve_tail_base, resolve_tail_tip,
     shape_renders_tail, tessellate_bubble,
 };
 use eframe::egui::{self, Color32, ColorImage, Pos2, Rect, Sense, TextureHandle, TextureOptions};
@@ -1532,7 +1532,10 @@ impl ComicLab {
                     acc(rcx + r, rcy + r);
                 }
                 if let Some(t) = tail {
-                    let (px, py) = rotate_about(t.tip, pivot, rot);
+                    // Drawn tip (kept outside the auto-sized outline), not the raw
+                    // stored tip, so the AABB matches the visible spike.
+                    let drawn_tip = resolve_tail_tip(&eff, pivot, t);
+                    let (px, py) = rotate_about(drawn_tip, pivot, rot);
                     acc(px, py);
                 }
                 if min.0 > max.0 {
@@ -5450,7 +5453,10 @@ impl ComicLab {
                         let bp = self.view.img_to_screen(base);
                         painter.circle_filled(bp, HANDLE_R, Color32::from_rgb(80, 200, 220));
                         painter.circle_stroke(bp, HANDLE_R, egui::Stroke::new(1.5, Color32::BLACK));
-                        let tip = rotate_about(tail.tip, obj.pivot, rot);
+                        // Handle follows the drawn tip (kept outside the auto-sized
+                        // outline), so it tracks the visible spike after auto-grow.
+                        let tip =
+                            rotate_about(resolve_tail_tip(&eff, obj.pivot, tail), obj.pivot, rot);
                         let p = self.view.img_to_screen(tip);
                         painter.circle_filled(p, HANDLE_R, Color32::from_rgb(255, 160, 60));
                         painter.circle_stroke(p, HANDLE_R, egui::Stroke::new(1.5, Color32::BLACK));
@@ -5568,13 +5574,19 @@ impl ComicLab {
                                 b.tail.as_ref().filter(|_| shape_renders_tail(&b.shape))
                             {
                                 let rot = obj.rotation_rad;
-                                let tip = rotate_about(tail.tip, obj.pivot, rot);
+                                let eff = effective_bubble_shape(b, &self.fonts);
+                                // Grab the drawn tip (kept outside the auto-sized
+                                // outline), matching the visible spike handle.
+                                let tip = rotate_about(
+                                    resolve_tail_tip(&eff, obj.pivot, tail),
+                                    obj.pivot,
+                                    rot,
+                                );
                                 let tip_screen = self.view.img_to_screen(tip);
                                 if (tip_screen - ptr).length() <= HANDLE_R + 4.0 {
                                     self.drag = DragKind::TailTip;
                                     started = true;
                                 } else {
-                                    let eff = effective_bubble_shape(b, &self.fonts);
                                     let base = rotate_about(
                                         resolve_tail_base(&eff, obj.pivot, tail),
                                         obj.pivot,

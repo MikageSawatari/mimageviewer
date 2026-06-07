@@ -206,11 +206,17 @@ pub fn fit_bubble_shape(
     const SQRT2: f32 = std::f32::consts::SQRT_2;
     let hw = (text_w * 0.5 + padding).max(8.0);
     let hh = (text_h * 0.5 + padding).max(8.0);
-    // Keep auto-sized bubbles from becoming extremely tall/narrow (a single
-    // vertical line) or flat/wide (a single long horizontal line): widen the
-    // shorter half-extent so the aspect ratio stays within MAX_ASPECT. This only
-    // ENLARGES the box, so the text still fits inside.
-    const MAX_ASPECT: f32 = 1.8;
+    // Keep auto-sized bubbles from becoming an extreme sliver (a single very long
+    // vertical/horizontal line) while still letting the bubble follow the text's
+    // natural aspect: widen the shorter half-extent so the aspect ratio stays
+    // within MAX_ASPECT. This only ENLARGES the box, so the text still fits.
+    //
+    // The old limit (1.8) forced long 縦書き text into a near-round ellipse, which
+    // wasted a huge amount of left/right margin (a tall column of text sat inside a
+    // bubble several times wider than it needed). A generous limit lets a tall text
+    // column get a proportionally tall, manga-like bubble and only reins in genuine
+    // slivers (e.g. a one-character-wide, very long single line). Tune as needed.
+    const MAX_ASPECT: f32 = 4.5;
     let (hw, hh) = if hh > hw * MAX_ASPECT {
         (hh / MAX_ASPECT, hh)
     } else if hw > hh * MAX_ASPECT {
@@ -654,6 +660,43 @@ fn effective_tail_base_width(
     requested.clamp(6.0, cap)
 }
 
+/// Minimum gap (source-image px) the tail tip is kept beyond the bubble outline,
+/// so an auto-sized bubble that grows past a previously-fine tip never swallows
+/// it. Small enough to stay snug, large enough that the spike always reads as
+/// pointing outward.
+const TAIL_MIN_OVERHANG: f32 = 28.0;
+
+/// Push `tip` outward along the centre→tip ray until it sits at least
+/// `TAIL_MIN_OVERHANG` beyond where that ray exits `body`. If the tip is already
+/// far enough out it is returned unchanged. The DIRECTION is preserved; only the
+/// radial distance is extended. `body` is the bubble outline (no tail spliced).
+fn project_tip_outside(body: &[(f32, f32)], pivot: (f32, f32), tip: (f32, f32)) -> (f32, f32) {
+    let dx = tip.0 - pivot.0;
+    let dy = tip.1 - pivot.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-3 {
+        return tip; // degenerate (tip at the pivot): no direction to project along.
+    }
+    // Distance from the pivot to where the centre→tip ray crosses the outline.
+    let exit = arclen_point(body, auto_base_t(body, pivot, tip));
+    let exit_len = ((exit.0 - pivot.0).powi(2) + (exit.1 - pivot.1).powi(2)).sqrt();
+    let min_len = exit_len + TAIL_MIN_OVERHANG;
+    if len >= min_len {
+        tip
+    } else {
+        (pivot.0 + dx / len * min_len, pivot.1 + dy / len * min_len)
+    }
+}
+
+/// The image-space tail tip actually drawn, after keeping it outside the
+/// (possibly auto-sized) bubble outline (see [`project_tip_outside`]). The
+/// rasterizer applies the same projection inside [`bubble_geometry`], so the
+/// lab/app call this for the tip handle + AABB to track the drawn spike. The
+/// stored `tail.tip` is left untouched (this only affects what is drawn / hit).
+pub fn resolve_tail_tip(shape: &BubbleShape, pivot: (f32, f32), tail: &Tail) -> (f32, f32) {
+    project_tip_outside(&tessellate_bubble(shape, pivot), pivot, tail.tip)
+}
+
 /// Build body + tail geometry. When a tail is present, `outline` is one closed
 /// polygon in which the tail is an outward spike that is part of the same
 /// contour as the bubble body.
@@ -665,28 +708,32 @@ pub fn bubble_geometry(
     let body = tessellate_bubble(shape, pivot);
     match tail {
         Some(t) if t.width_px > 0.0 => {
+            // Keep the tip outside the (possibly auto-sized) outline so an
+            // auto-grown bubble never swallows the spike. Direction is preserved,
+            // so the auto base (ray exit) is unchanged.
+            let tip = project_tip_outside(&body, pivot, t.tip);
             // Auto base: attach where the center→tip ray exits the outline.
             let base_t = if t.base_auto {
-                auto_base_t(&body, pivot, t.tip)
+                auto_base_t(&body, pivot, tip)
             } else {
                 t.base_t
             };
             // Cap the base width to the bubble's extent perpendicular to the tail
             // so a bottom tail on a tall/narrow bubble stays slim, while a side
             // tail (or a wide bubble) can be wider — proportionate, not fixed-px.
-            let eff_w = effective_tail_base_width(shape, pivot, t.tip, t.width_px);
+            let eff_w = effective_tail_base_width(shape, pivot, tip, t.width_px);
             match t.kind {
                 TailKind::Spike => {
-                    let (outline, b0, b1) = splice_tail(&body, base_t, t.tip, eff_w);
+                    let (outline, b0, b1) = splice_tail(&body, base_t, tip, eff_w);
                     BubbleGeometry {
                         body,
-                        tail: Some([b0, b1, t.tip]),
+                        tail: Some([b0, b1, tip]),
                         outline,
                         thought: Vec::new(),
                     }
                 }
                 TailKind::Thought => {
-                    let thought = thought_trail(&body, base_t, t.tip, eff_w);
+                    let thought = thought_trail(&body, base_t, tip, eff_w);
                     let outline = body.clone();
                     BubbleGeometry {
                         body,
@@ -1152,9 +1199,10 @@ mod tests {
 
     #[test]
     fn fit_clamps_extreme_aspect() {
-        // A single tall/narrow vertical line (e.g. 40×400) would otherwise make a
-        // very tall, thin ellipse. The aspect clamp widens it so height/width
-        // stays within ~1.8, while still containing the text.
+        // A single tall/narrow vertical line (e.g. 40×400) would otherwise make an
+        // unbounded sliver ellipse. The aspect clamp widens it so height/width
+        // stays within MAX_ASPECT (4.5) — a tall, manga-like bubble that still
+        // hugs the column, while containing the text.
         let pad = 12.0;
         let fitted = fit_bubble_shape(&BubbleShape::Ellipse { rx: 1.0, ry: 1.0 }, 40.0, 400.0, pad);
         let BubbleShape::Ellipse { rx, ry } = fitted else {
@@ -1162,7 +1210,7 @@ mod tests {
         };
         assert!(ry >= rx, "tall text still taller than wide");
         assert!(
-            ry / rx <= 1.8 + 1e-3,
+            ry / rx <= 4.5 + 1e-3,
             "aspect clamped within limit, got {}",
             ry / rx
         );
@@ -1170,6 +1218,48 @@ mod tests {
         let (hw, hh) = (40.0 * 0.5 + pad, 400.0 * 0.5 + pad);
         let cover = (hw / rx).powi(2) + (hh / ry).powi(2);
         assert!(cover <= 1.0 + 1e-3, "text still inside: {cover}");
+    }
+
+    #[test]
+    fn resolve_tail_tip_pushes_tip_outside() {
+        // A bubble large enough to swallow a tip placed near the pivot (the bug:
+        // an auto-grown bubble buried the fixed-distance default tail tip).
+        let shape = BubbleShape::Ellipse {
+            rx: 200.0,
+            ry: 120.0,
+        };
+        let pivot = (0.0, 0.0);
+        let inside = Tail {
+            tip: (30.0, 20.0),
+            ..Tail::default()
+        };
+        let t = resolve_tail_tip(&shape, pivot, &inside);
+        // Direction preserved (collinear with the stored tip from the pivot).
+        let cross = inside.tip.0 * t.1 - inside.tip.1 * t.0;
+        assert!(
+            cross.abs() < 1e-2,
+            "tail direction preserved, cross={cross}"
+        );
+        // Now radially beyond the outline exit + overhang.
+        let body = tessellate_bubble(&shape, pivot);
+        let exit = arclen_point(&body, auto_base_t(&body, pivot, inside.tip));
+        let exit_len = (exit.0 * exit.0 + exit.1 * exit.1).sqrt();
+        let tip_len = (t.0 * t.0 + t.1 * t.1).sqrt();
+        assert!(
+            tip_len >= exit_len + TAIL_MIN_OVERHANG - 1e-2,
+            "tip pushed beyond outline+overhang: {tip_len} vs exit {exit_len}"
+        );
+
+        // A tip already well outside is returned unchanged.
+        let outside = Tail {
+            tip: (600.0, 0.0),
+            ..Tail::default()
+        };
+        let t2 = resolve_tail_tip(&shape, pivot, &outside);
+        assert!(
+            (t2.0 - 600.0).abs() < 1e-3 && t2.1.abs() < 1e-3,
+            "far tip unchanged, got {t2:?}"
+        );
     }
 
     #[test]

@@ -276,7 +276,10 @@ fn object_bounds(o: &AnnotationObject, fonts: Option<&FontSet>) -> egui::Rect {
                     acc(rcx + r, rcy + r);
                 }
                 if let Some(t) = tail {
-                    let (px, py) = rotate_about(t.tip, pivot, rot);
+                    // Use the drawn tip (kept outside the auto-sized outline), not
+                    // the raw stored tip, so the AABB matches the visible spike.
+                    let drawn_tip = comic_core::resolve_tail_tip(&eff, pivot, t);
+                    let (px, py) = rotate_about(drawn_tip, pivot, rot);
                     acc(px, py);
                 }
                 let m = b.outline.width_px.max(0.0) * 0.5 + 2.0;
@@ -475,7 +478,13 @@ fn tail_handle_points(
         o.pivot,
         rot,
     );
-    let tip = rotate_about(tail.tip, o.pivot, rot);
+    // Handle follows the drawn tip (kept outside the auto-sized outline), so the
+    // grab point matches the visible spike even after the bubble auto-grows.
+    let tip = rotate_about(
+        comic_core::resolve_tail_tip(&eff, o.pivot, tail),
+        o.pivot,
+        rot,
+    );
     Some((base, tip))
 }
 
