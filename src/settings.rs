@@ -2880,6 +2880,9 @@ impl Settings {
         self.rating_filter = src.rating_filter;
         // ── サムネイル画質 (A/B 比較ダイアログで編集) ──
         self.thumb_px = src.thumb_px;
+        // テキスト編集中プレビュー解像度 (環境設定外の Ctrl+T 左パネルで編集)。環境設定 OK の
+        // 全体差し替えで巻き戻らないよう live 値を引き継ぐ (Codex P3)。
+        self.text_preview_scale = src.text_preview_scale;
         self.thumb_quality = src.thumb_quality;
         // ── キャッシュ系 (環境設定に出ていない項目) ──
         self.cache_videos_always = src.cache_videos_always;

@@ -6266,6 +6266,18 @@ impl App {
 
     /// いずれかのモーダルダイアログが開いているか。
     /// true の場合、キーボードショートカットやスクロールを無効化する。
+    /// テキスト注釈モードの子ダイアログ (吹き出し/ウィンドウ/スタンプ/オノマトペ/フォント
+    /// ピッカー) が開いているか。開いている間はキャンバスのポインタ操作 (選択/移動/削除) と
+    /// フルスクリーンキー (Esc 退場 / Delete / 矢印ナビ) を止め、ダイアログ操作に集中させる
+    /// (Codex P2: 子ダイアログが非モーダルで背面オブジェクトへ入力漏れしていた)。
+    pub(crate) fn text_subdialog_open(&self) -> bool {
+        self.text_add_bubble_dialog
+            || self.text_add_window_dialog
+            || self.text_add_stamp_dialog
+            || self.text_add_onomatopoeia_dialog
+            || self.text_font_dialog
+    }
+
     pub(crate) fn any_dialog_open(&self) -> bool {
         self.show_stats_dialog
             || self.show_favorites_editor
@@ -6289,6 +6301,7 @@ impl App {
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
             || self.editing_addon_install_state.is_some()
+            || self.text_subdialog_open()
     }
 
     /// フルスクリーンのキー入力を止める必要があるモーダルダイアログ。
@@ -6320,6 +6333,8 @@ impl App {
             // フルスクリーンのキー (Enter で閉じる / Esc で選択解除・テキストモード退出 /
             // 矢印ナビ) を止め、ダイアログ操作に集中させる (Codex 監査)。
             || self.editing_addon_install_state.is_some()
+            // テキスト注釈の子ダイアログ表示中も同様にフルスクリーンキーを止める (Codex P2)。
+            || self.text_subdialog_open()
     }
 
     /// ユーザー視点でのカレントフォルダ。変換済みアーカイブを開いているときは

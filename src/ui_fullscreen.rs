@@ -2279,7 +2279,12 @@ impl App {
                             && !state.original_preview_active
                         {
                             let zp = self.fs_zoom_pan();
-                            self.handle_text_canvas_input(ctx, image_rect, zp);
+                            // 子ダイアログ表示中はキャンバスのポインタ操作を止める (Codex P2:
+                            // ダイアログ上のクリック/ドラッグが背面オブジェクトの選択/移動/削除に
+                            // 漏れるのを防ぐ)。ダイアログ自体の描画は draw_text_overlay で行う。
+                            if !self.text_subdialog_open() {
+                                self.handle_text_canvas_input(ctx, image_rect, zp);
+                            }
                             self.draw_text_overlay(ui, ctx, image_rect, zp);
                             ctx.request_repaint();
                         } else if self.text_mode {
