@@ -7801,8 +7801,17 @@ impl App {
         to_norm: [f32; 2],
         paint: bool,
         edge_seed: Option<[u8; 3]>,
+        ctrl: bool,
         persist: bool,
     ) -> bool {
+        // 境界筆 + Ctrl = 境界を無視して通常筆で塗る (tooltip「Ctrl中は境界を表示しながら
+        // 通常筆」/ tools/local_adjust_lab の `modifiers.ctrl` 分岐に対応)。tool 自体は
+        // EdgeBrush のままにして境界オーバーレイは出し続け、塗りだけ通常筆へ差し替える。
+        let tool = if tool == LocalAdjustMaskTool::EdgeBrush && ctrl {
+            LocalAdjustMaskTool::Brush
+        } else {
+            tool
+        };
         match tool {
             LocalAdjustMaskTool::Brush => self.paint_local_adjust_mask_brush(
                 fs_idx, layer_idx, target, from_norm, to_norm, paint, persist,
@@ -8135,6 +8144,9 @@ impl App {
                 i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
             )
         });
+        // フルスクリーンビューポートでは `modifiers.ctrl` が stale になり得るので、Ctrl 依存の
+        // 境界筆→通常筆切替は OS 直読み (ソースプレビューの Ctrl 検出と同じ方式) を使う。
+        let ctrl_held = crate::ui_fullscreen::ctrl_held_via_os();
 
         if primary_released {
             if self.local_adjust_shape_drag.is_some() {
@@ -8211,6 +8223,7 @@ impl App {
                         norm,
                         stroke.paint,
                         stroke.edge_seed,
+                        ctrl_held,
                         false,
                     );
                     stroke.previous = norm;
@@ -8626,6 +8639,7 @@ impl App {
                             norm,
                             self.local_adjust_mask_paint_add,
                             edge_seed,
+                            ctrl_held,
                             false,
                         );
                     }

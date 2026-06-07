@@ -232,15 +232,18 @@ fn original_preview_shortcut_held(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.key_down(egui::Key::Num0))
 }
 
+/// 物理的な Ctrl キー押下を OS から直接読む。フルスクリーンビューポートでは
+/// `ctx.input(|i| i.modifiers.ctrl)` がキーフォーカス不在で stale (常に false) になり得る
+/// ため、Ctrl 依存の挙動 (ソースプレビュー / 補正レイヤー境界筆の通常筆切替) はこれを使う。
 #[cfg(windows)]
-fn ctrl_held_via_os() -> bool {
+pub(crate) fn ctrl_held_via_os() -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL};
 
     unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) < 0 }
 }
 
 #[cfg(not(windows))]
-fn ctrl_held_via_os() -> bool {
+pub(crate) fn ctrl_held_via_os() -> bool {
     false
 }
 
@@ -894,6 +897,15 @@ impl App {
             return false;
         }
         if self.local_adjust_mode && shift_held_via_os() {
+            return false;
+        }
+        // 補正レイヤーの境界筆では Ctrl を「境界無視の通常筆」に割り当てるため、Ctrl の
+        // ソースプレビューを抑止する。これで paint handler のゲート (`!original_preview_active`)
+        // が解け、Ctrl+ドラッグが通常筆として届く (handle_local_adjust_canvas_input 側で
+        // EdgeBrush→Brush に差し替え)。境界筆中だけの挙動なので他ツールの Ctrl=ソース比較は不変。
+        if self.local_adjust_mode
+            && self.local_adjust_mask_tool == crate::app::LocalAdjustMaskTool::EdgeBrush
+        {
             return false;
         }
         matches!(
