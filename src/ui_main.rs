@@ -2267,6 +2267,7 @@ impl App {
         if self.current_folder.is_some() {
             self.context_menu_idx = Some(usize::MAX);
             self.context_menu_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+            ctx.request_repaint();
         }
     }
 
@@ -2298,7 +2299,9 @@ impl App {
                     };
                     ui.centered_and_justified(|ui| ui.label(msg));
                     // 空フォルダでも右クリックでフォルダ操作可能にする
-                    if ui.ui_contains_pointer() && ctx.input(|i| i.pointer.secondary_clicked()) {
+                    if ui.rect_contains_pointer(ui.max_rect())
+                        && ctx.input(|i| i.pointer.secondary_clicked())
+                    {
                         self.open_current_folder_context_menu(ctx);
                     }
                     let full_rect = ui.max_rect();
@@ -2314,7 +2317,9 @@ impl App {
                             "検索結果なし"
                         });
                     });
-                    if ui.ui_contains_pointer() && ctx.input(|i| i.pointer.secondary_clicked()) {
+                    if ui.rect_contains_pointer(ui.max_rect())
+                        && ctx.input(|i| i.pointer.secondary_clicked())
+                    {
                         self.open_current_folder_context_menu(ctx);
                     }
                     let full_rect = ui.max_rect();
@@ -2530,19 +2535,19 @@ impl App {
                                 }
                             }
                         }
-
-                        // グリッドの空白部分で右クリック → フォルダメニュー。
-                        // Sense::click() だと左クリックも消費するので、ポインタ位置を
-                        // 直接チェックする。`ctx.input` はグローバルなので、ツールバーの
-                        // ★フィルタボタン等への右クリックまで拾ってグリッドの右クリック
-                        // メニューが同時に開いてしまう不具合があった。`ui_contains_pointer`
-                        // で CentralPanel 範囲内に限定する。
-                        let bg_right_clicked = ui.ui_contains_pointer()
-                            && ctx.input(|i| i.pointer.secondary_clicked());
-                        if bg_right_clicked && self.context_menu_idx.is_none() {
-                            self.open_current_folder_context_menu(ctx);
-                        }
                     });
+
+                // グリッドの空白部分で右クリック → フォルダメニュー。
+                // セルの右クリックは handle_cell_interaction 側で先に `context_menu_idx`
+                // をセットする。ここではそれが無かった場合だけ、ScrollArea の表示領域
+                // 全体を背景として扱う。content Ui の `ui_contains_pointer()` だと、
+                // サムネイル総高さが viewport より低いときに最後の行より下の余白を
+                // 拾えないため、`scroll_output.inner_rect` を使う。
+                let bg_right_clicked = ui.rect_contains_pointer(scroll_output.inner_rect)
+                    && ctx.input(|i| i.pointer.secondary_clicked());
+                if bg_right_clicked && self.context_menu_idx.is_none() {
+                    self.open_current_folder_context_menu(ctx);
+                }
 
                 // スクロールバードラッグによるオフセット変化を読み戻す。
                 // egui が内部で管理するオフセットと自前オフセットを同期させる。
