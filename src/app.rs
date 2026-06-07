@@ -22779,6 +22779,10 @@ impl App {
         self.pinned_compare_slot = None;
         self.compare_pin_pending = None;
         self.compare_pin_load_pending = None;
+        // スロットを消したら比較モードも Off に戻す (Codex P2)。残すと PinnedNormal 描画が
+        // ピン texture None でフォールバックせず画像が描かれないフレームになりうる。通常の
+        // ピン解除経路と同じ後始末。
+        self.compare_view_mode = CompareViewMode::Off;
     }
 
     /// 指定ページの補正関連キャッシュをクリアする。
