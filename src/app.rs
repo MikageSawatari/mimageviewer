@@ -9368,6 +9368,30 @@ impl App {
             && previous_folder
                 .as_ref()
                 .is_some_and(|prev| crate::folder_tree::path_eq(prev, &source_path));
+        // 診断: 変換アーカイブの元パス override が start_loading_items で
+        // PRESERVE / CLEAR どちらに倒れたかと、判定に使った 2 パスを記録する。
+        // 「BS で変換キャッシュフォルダに入る」(override が None に化ける) 不具合が
+        // 間欠再現するため、再現時にどの load がどのパスのミスマッチで CLEAR したかを
+        // 突き止める (override が絡む load 時のみ出るので低ノイズ)。
+        if previous_archive_source_override.is_some() {
+            crate::logger::log(format!(
+                "[archive-override] start_loading_items: {} | override={} | current_folder={} | source_path={}",
+                if preserve_archive_source_override {
+                    "PRESERVE"
+                } else {
+                    "CLEAR"
+                },
+                previous_archive_source_override
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                previous_folder
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<none>".to_string()),
+                source_path.to_string_lossy(),
+            ));
+        }
 
         // 通常フォルダ / ZIP / 検索結果など PDF 以外への遷移では、残存する PDF
         // enumerate pending を無効化する。放置すると遅れて届いた結果を
