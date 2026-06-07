@@ -21483,6 +21483,13 @@ impl App {
         if let Some(idx) = self.fullscreen_idx {
             self.invalidate_compare_prepared_for_idx(idx);
         }
+        // Codex P2: 進行中のスタンプ埋め込み worker は、この編集で stale になる (差し替え対象の
+        // オブジェクトが変わる / 別操作で上書きされる恐れ)。cancel して破棄し、完了しても適用
+        // させない。worker 完了経路は poll_stamp_embed が先に pending を take 済みなので、ここは
+        // no-op になる (= 正規完了とは競合しない)。
+        if let Some(p) = self.stamp_embed_pending.take() {
+            p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// 最終 composite (canonical ソース解像度・post-filter 後) の上に注釈を S=1 で焼いて
@@ -22693,6 +22700,17 @@ impl App {
         if prepared_affected || pending_affected {
             self.compare_wipe_dragging = false;
         }
+    }
+
+    /// 比較 (Wipe/Diff) の準備済みペア / 準備中ジョブを **両側 (current + pinned) とも** 落とす。
+    /// idx 単位の `invalidate_compare_prepared_for_idx` と違い、**全ページに影響する変更** で使う。
+    /// 例: 編集用追加パックの導入/削除でフォントソースが変わると、ピン留め側ページの焼き済み
+    /// 比較ピクセルも古くなるが、mark_comic_dirty は現在ページ (fullscreen_idx) しか無効化
+    /// しないため取りこぼす (Codex P2)。
+    pub(crate) fn invalidate_all_compare_prepared(&mut self) {
+        self.compare_prepared_pair = None;
+        self.compare_prepare_pending = None;
+        self.compare_wipe_dragging = false;
     }
 
     /// 指定ページの補正関連キャッシュをクリアする。

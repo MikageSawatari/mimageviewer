@@ -244,6 +244,9 @@ impl App {
         self.font_sample_failed.clear();
         self.onomatopoeia_thumb_cache.clear();
         self.mark_comic_dirty();
+        // フォントソースは全ページに影響するので、比較 (Wipe/Diff) のピン留め側を含む準備済み
+        // ピクセルも無効化する (mark_comic_dirty は現在ページしか落とさない、Codex P2)。
+        self.invalidate_all_compare_prepared();
         self.refresh_subject_matte_path();
         crate::logger::log(
             "[editing pack] install 完了、フォント / 被写体マットキャッシュを無効化".to_string(),

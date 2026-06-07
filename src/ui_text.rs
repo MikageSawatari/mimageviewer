@@ -883,6 +883,11 @@ impl App {
         // スタンプピッカーの差し替え対象を退場時にもクリア (Codex P2、enter 側と対)。
         self.text_add_stamp_dialog = false;
         self.stamp_dialog_replace_target = None;
+        // 進行中のスタンプ埋め込み worker も退場時に cancel して破棄 (Codex P3: フルスクリーンを
+        // 閉じると overlay の poll が走らず stale guard が遅延/喪失するため、ここで確実に止める)。
+        if let Some(p) = self.stamp_embed_pending.take() {
+            p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if was_text_mode {
             self.clear_meta_undo();
         }
