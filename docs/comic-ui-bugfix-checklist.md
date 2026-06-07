@@ -170,6 +170,22 @@
   逃がし、処理中は画面中央に「スタンプ読み込み中…」(draw_stamp_embed_overlay)、完了で apply_stamp_choice。
   UI は固まらず、サイズ上限不要。stale (ページ移動/モード終了/フォルダ変更) は cancel して破棄。
 
+### ✅ R2-7. 合成 (composite_overlay_over) の rayon 並列化 (`ff8a60d4`) [perf]
+- ドラッグ中は毎フレーム再ベイクし、composite_overlay_over (下地全画素 src-over) が最大の CPU
+  コスト (逐次)。各出力行は独立なので par_chunks_mut で行並列化。20MP・重オーバーレイ bench で
+  72.6ms→29.3ms (2.5x、画素は逐次と一致)。表示初回/書き出し/ドラッグの全経路に効く。
+- 限界: base clone と load_texture upload は並列対象外で残る。ドラッグ完全 60fps 化には別途
+  低解像度プレビュー (B 案) が必要 (今回は見送り、まず rayon の実機体感で要否判断)。
+
+### ✅ R2-8. Codex R2 追随 — embed worker の clobber/lingering + font 変更時の比較 (`69b24bc7`)
+- [P2] embed worker clobber: 進行中に別スタンプ操作すると古い結果が上書きしうる →
+  mark_comic_dirty で進行中 worker を cancel (完了経路は poll が先に take 済みで no-op)。
+- [P2] font 変更時の比較全無効化: パック導入/削除はフォントが全ページ影響だが mark_comic_dirty は
+  現在ページのみ無効化 → invalidate_all_compare_prepared 新設で両側 (current+pinned) を落とす。
+- [P3] embed worker lingering: フルスクリーン終了で poll が止まり stale guard が遅延 →
+  reset_text_mode でも cancel。
+- Codex R2 は **P1 なし**。Arc<str> 直列化互換・comic_lab match 追加も OK と確認済み。
+
 ## 進め方
 - P0 → P1 → P2 の順。各修正は pathspec commit（src/ui_text.rs 等）、退避ブランチ `comic-inc6` 維持。
 - まとまった単位で Codex レビュー。
