@@ -212,6 +212,15 @@
 - 確認済み (前回指摘): AI 完了待ち統一・Z 分析 raw 表示・w==0 防御・replace 消失復元・
   stamp worker stale cancel・比較全無効化・D10 主要 docs。
 
+### ✅ R2-11. Codex 追加レビュー対応 (`d943ccb2`)
+- [P2] テキスト子ダイアログ (吹き出し/ウィンドウ/スタンプ/オノマトペ/フォント) が非モーダルで、
+  ダイアログ上のクリック/ドラッグが handle_text_canvas_input に漏れて背面オブジェクトを選択/移動/
+  削除し、フルスクリーンキー (Esc/Delete/矢印) も漏れていた。`text_subdialog_open()` を新設し、
+  canvas 入力を gate + any_dialog_open / any_modal_dialog_open_for_fullscreen_keys に追加。
+- [P3] text_preview_scale が環境設定 OK で巻き戻る (snapshot 全体差し替えに live 値が無い) →
+  overwrite_non_preferences_from に text_preview_scale を追加。
+- 確認済み: P1 分析ボタン経路統一・D10 コメント・ピン留め無効化・フル解像度 export。
+
 ## 進め方
 - P0 → P1 → P2 の順。各修正は pathspec commit（src/ui_text.rs 等）、退避ブランチ `comic-inc6` 維持。
 - まとまった単位で Codex レビュー。
