@@ -67,10 +67,9 @@ Windows 向け高速サムネイルビューワー
 
 [Releases ページ](https://github.com/MikageSawatari/mimageviewer/releases/latest) から以下のいずれかをダウンロードできます。
 
-- **インストーラ版** (`mImageViewer_setup.exe`) — スタートメニュー登録・アンインストール機能付き
-- **単体 exe 版** (`mimageviewer.exe`) — 任意のフォルダに置いて実行するだけ
-
-設定は `%APPDATA%\mimageviewer\` に保存されます。
+- **インストーラ版** (`mImageViewer_setup.exe`) — setup.exe を実行してインストール。スタートメニュー登録・アンインストール機能付き（インストール時に管理者権限 / UAC が必要）。設定は `%APPDATA%\mimageviewer\` に保存されます
+- **単体 exe 版** (`mimageviewer.exe`) — 任意のフォルダに置いて実行するだけ。管理者権限不要。設定は `%APPDATA%\mimageviewer\` に保存されます
+- **ポータブル版** (`mImageViewer_portable_v<VERSION>.zip`) — zip を書き込み可能な場所（デスクトップ・D ドライブ・USB 等）に解凍して実行するだけ。管理者権限不要。設定・キャッシュは exe と同じフォルダの `data\` にまとまり、システムドライブの APPDATA を使いません。フォルダごとコピーで持ち運び・完全削除ができます（`C:\Program Files\` など書き込みできない場所に置くと起動できません）
 
 ## マニュアル
 
