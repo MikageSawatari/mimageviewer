@@ -1760,8 +1760,21 @@ pub(crate) struct ComicCacheEntry {
     pub base: Arc<egui::ColorImage>,
     /// `comic_generation` のスナップショット (注釈編集で進む。Inc 2 以降)。
     pub comic_gen: u64,
-    /// 焼いた解像度 (下地寸法)。防御用。
+    /// 焼いた解像度 (下地寸法 = full base の寸法)。防御用。
     pub dims: [usize; 2],
+    /// このエントリを焼いたときのプレビュー解像度分母 (1=原寸)。倍率を変えたら miss させる。
+    pub preview_scale: u32,
+}
+
+/// テキスト編集中のプレビュー解像度ダウンサンプル base キャッシュ (R2 perf)。
+pub(crate) struct ComicPreviewBase {
+    /// 元になった full-res final composite。`Arc::ptr_eq` で base 変化を検知 + Arc を生かして
+    /// アドレス再利用 (ABA) を防ぐ。
+    pub src_base: Arc<egui::ColorImage>,
+    /// 縮小に使った分母 (2/4/8)。
+    pub scale: u32,
+    /// 1/scale に面積平均縮小した下地。注釈ベイクの下地に使う。
+    pub reduced: Arc<egui::ColorImage>,
 }
 
 /// テキスト注釈のキャンバス上ドラッグの種別 (Inc 6 変形ハンドル)。
@@ -4099,6 +4112,12 @@ pub struct App {
     /// ラインの最終段 = 最前面 (D1)。`final_composite_cache` の clear に連動して破棄する
     /// (`clear_final_pipeline_caches_for_idx` / `clear_all_final_pipeline_caches`)。
     pub(crate) comic_cache: std::collections::HashMap<usize, ComicCacheEntry>,
+    /// テキスト編集中のプレビュー解像度ダウンサンプル base のキャッシュ (R2 perf)。
+    /// `settings.text_preview_scale > 1` のとき、full-res final composite を 1/N に一度だけ
+    /// 縮小して保持し、注釈ベイクの下地に使う (毎フレーム縮小しないための 1 回限りキャッシュ)。
+    /// full base の Arc を握って `Arc::ptr_eq` + scale で同一性判定する (base 変化 / 倍率変更で
+    /// 作り直し)。`text_preview_scale == 1` のときは None。
+    pub(crate) comic_preview_base: Option<ComicPreviewBase>,
     /// 注釈編集の世代番号 (Inc 2 以降で編集確定ごとに +1)。`comic_cache` の各 entry は
     /// この値と照合され、不一致なら miss 扱い (conceal_generation と同じ lazy eviction)。
     pub(crate) comic_generation: u64,
@@ -5336,6 +5355,7 @@ impl App {
             conceal_cache: std::collections::HashMap::new(),
             conceal_generation: 0,
             comic_cache: std::collections::HashMap::new(),
+            comic_preview_base: None,
             comic_generation: 0,
             comic_fonts: None,
             comic_fonts_loaded: false,
@@ -21573,12 +21593,21 @@ impl App {
         };
         let [w, h] = base.size;
         let comic_gen = self.comic_generation;
+        // テキスト編集中のみプレビュー解像度を下げる (R2 perf)。ツールを閉じると 1 に戻り、
+        // キャッシュ miss → フル解像度で焼き直す (= 閉じたタイミングで鮮明化)。
+        let preview_scale = if self.text_mode {
+            self.settings.text_preview_scale.clamp(1, 8)
+        } else {
+            1
+        };
         if let Some(entry) = self.comic_cache.get(&idx) {
             // base の Arc 同一性 (ptr_eq) で下地の作り直しを検知。Arc を保持しているので
-            // アドレス再利用 (ABA) は起きない (Codex P2)。
+            // アドレス再利用 (ABA) は起きない (Codex P2)。preview_scale も照合し、倍率変更 /
+            // ツール開閉で焼き直す。
             if Arc::ptr_eq(&entry.base, &base)
                 && entry.comic_gen == comic_gen
                 && entry.dims == [w, h]
+                && entry.preview_scale == preview_scale
             {
                 return Some(entry.texture.clone());
             }
@@ -21617,11 +21646,35 @@ impl App {
         // 参照フォント (pack オノマトペ / ユーザー選択) を含めてロード (Inc 4c)。font_key は
         // スケール非依存なので canonical オブジェクトで判定してよい。
         let fonts = self.ensure_comic_fonts_for(&objects)?;
+        // プレビュー解像度を下げる場合は full base を 1/N に **一度だけ** 縮小してキャッシュし、
+        // それを注釈ベイクの下地にする (毎フレーム縮小しない)。縮小後の寸法で焼くので、合成と
+        // GPU upload のコストが 1/N² になる。bake は任意 base 解像度に対応済み (s_bake) なので
+        // 縮小 base を渡すだけで位置・サイズは整う。保存/書き出しは別経路 (フル解像度) で不変。
+        let bake_base: Arc<egui::ColorImage> = if preview_scale > 1 {
+            let reuse = self
+                .comic_preview_base
+                .as_ref()
+                .is_some_and(|p| p.scale == preview_scale && Arc::ptr_eq(&p.src_base, &base));
+            if !reuse {
+                let reduced = Arc::new(downsample_color_image(&base, preview_scale));
+                self.comic_preview_base = Some(ComicPreviewBase {
+                    src_base: Arc::clone(&base),
+                    scale: preview_scale,
+                    reduced,
+                });
+            }
+            Arc::clone(&self.comic_preview_base.as_ref().unwrap().reduced)
+        } else {
+            // 原寸時はプレビュー base を解放してメモリを返す。
+            self.comic_preview_base = None;
+            Arc::clone(&base)
+        };
+        let [bw, bh] = bake_base.size;
         // 同期ベイク (隠蔽 conceal と同流儀)。画像ごと 1 回・キャッシュ済みで毎フレーム
         // ではないが、実コンテンツでの worker 化要否を判断できるよう計測する。閾値 (80ms)
         // 超過は conceal と同じく perf ログに出す (§10、Inc 4+ で実測して判断)。
         let bake_start = std::time::Instant::now();
-        let s_bake = (w.max(h) as f32) / src_w.max(src_h).max(1.0);
+        let s_bake = (bw.max(bh) as f32) / src_w.max(src_h).max(1.0);
         let scaled_objects = if (s_bake - 1.0).abs() > 1e-4 {
             comic_core::scale_scene(&objects, s_bake)
         } else {
@@ -21629,20 +21682,23 @@ impl App {
         };
         let stamp_images = self.build_stamp_images(&scaled_objects);
         let overlay =
-            comic_core::bake_overlay_with_stamps(&scaled_objects, w, h, &fonts, &stamp_images);
+            comic_core::bake_overlay_with_stamps(&scaled_objects, bw, bh, &fonts, &stamp_images);
         let composed = Arc::new(crate::comic_overlay::composite_overlay_over(
-            &base, &overlay,
+            &bake_base, &overlay,
         ));
         let upload = clamp_for_gpu(&composed);
         let texture = ctx.load_texture(
-            format!("comic_{idx}_{}_{comic_gen}", Arc::as_ptr(&base) as usize),
+            format!(
+                "comic_{idx}_{}_{comic_gen}_{preview_scale}",
+                Arc::as_ptr(&base) as usize
+            ),
             upload.into_owned(),
             egui::TextureOptions::LINEAR,
         );
         let elapsed_ms = bake_start.elapsed().as_millis();
         if elapsed_ms >= 80 {
             crate::logger::log(format!(
-                "[comic] bake+composite+upload {elapsed_ms}ms idx={idx} {w}x{h} objs={}",
+                "[comic] bake+composite+upload {elapsed_ms}ms idx={idx} {bw}x{bh} (scale 1/{preview_scale}) objs={}",
                 objects.len()
             ));
         }
@@ -21654,6 +21710,7 @@ impl App {
                 base: Arc::clone(&base),
                 comic_gen,
                 dims: [w, h],
+                preview_scale,
             },
         );
         Some(texture)
@@ -29824,6 +29881,20 @@ fn color_image_to_dynamic(ci: &egui::ColorImage) -> image::DynamicImage {
         }
     }
     image::DynamicImage::ImageRgba8(buf)
+}
+
+/// ColorImage を 1/scale に面積平均 (Triangle) 縮小する。テキスト編集中のプレビュー解像度
+/// 低減 (R2 perf) 用。`scale <= 1` はそのまま clone。
+pub(crate) fn downsample_color_image(ci: &egui::ColorImage, scale: u32) -> egui::ColorImage {
+    if scale <= 1 {
+        return ci.clone();
+    }
+    let [w, h] = ci.size;
+    let nw = (w / scale as usize).max(1) as u32;
+    let nh = (h / scale as usize).max(1) as u32;
+    let dynimg = color_image_to_dynamic(ci);
+    let resized = dynimg.resize_exact(nw, nh, image::imageops::FilterType::Triangle);
+    dynamic_image_to_color_image(&resized)
 }
 
 /// 透明度を持つ ColorImage を単色背景に合成して RGB の DynamicImage を返す。

@@ -704,6 +704,11 @@ pub struct Settings {
     /// サムネイルキャッシュの長辺ピクセル数
     #[serde(default = "default_thumb_px")]
     pub thumb_px: u32,
+    /// テキスト注釈 (Ctrl+T) 編集中のプレビュー解像度の分母 (1=原寸 / 2 / 4 / 8)。下げると
+    /// 編集中の合成 + GPU upload コストが 1/N² になりドラッグがスムーズになる (R2 perf)。
+    /// 表示プレビューだけ縮小し、保存/コピー/比較/書き出しはフル解像度のまま。
+    #[serde(default = "default_text_preview_scale")]
+    pub text_preview_scale: u32,
     /// サムネイルキャッシュの WebP 品質 (1–100)
     #[serde(default = "default_thumb_quality")]
     pub thumb_quality: u8,
@@ -1694,6 +1699,10 @@ fn default_folder_skip_limit() -> usize {
 fn default_thumb_px() -> u32 {
     512
 }
+
+fn default_text_preview_scale() -> u32 {
+    1
+}
 fn default_thumb_quality() -> u8 {
     75
 }
@@ -1835,6 +1844,7 @@ impl Default for Settings {
             folder_skip_limit: default_folder_skip_limit(),
             sort_order: SortOrder::default(),
             thumb_px: default_thumb_px(),
+            text_preview_scale: default_text_preview_scale(),
             thumb_quality: default_thumb_quality(),
             cache_policy: CachePolicy::default(),
             cache_threshold_ms: default_cache_threshold_ms(),

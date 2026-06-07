@@ -9132,4 +9132,26 @@ mod pano_settle_size_tests {
         let expected_h = (1920.0_f32 * 2160.0 / 5120.0).round() as u32;
         assert_eq!(h, expected_h);
     }
+
+    #[test]
+    fn downsample_color_image_dims() {
+        // テキストプレビュー解像度の縮小: 1/N で寸法が w/N, h/N になる。
+        let ci = egui::ColorImage::new([800, 400], vec![egui::Color32::RED; 800 * 400]);
+        assert_eq!(
+            downsample_color_image(&ci, 1).size,
+            [800, 400],
+            "原寸は素通し"
+        );
+        assert_eq!(downsample_color_image(&ci, 2).size, [400, 200]);
+        assert_eq!(downsample_color_image(&ci, 4).size, [200, 100]);
+        assert_eq!(downsample_color_image(&ci, 8).size, [100, 50]);
+    }
+
+    #[test]
+    fn downsample_color_image_clamps_to_one() {
+        // 極小画像でも 0 寸法にならず最低 1px を保つ (panic 防止)。
+        let ci = egui::ColorImage::new([3, 1], vec![egui::Color32::WHITE; 3]);
+        let out = downsample_color_image(&ci, 8);
+        assert!(out.size[0] >= 1 && out.size[1] >= 1, "got {:?}", out.size);
+    }
 }

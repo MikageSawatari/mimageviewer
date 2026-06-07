@@ -888,6 +888,8 @@ impl App {
         if let Some(p) = self.stamp_embed_pending.take() {
             p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // プレビュー解像度の縮小 base を解放 (R2 perf)。退場後はフル解像度で焼き直すので不要。
+        self.comic_preview_base = None;
         if was_text_mode {
             self.clear_meta_undo();
         }
@@ -1472,6 +1474,10 @@ impl App {
         let mut open_stamp_replace = false;
         let mut open_onomatopoeia_dialog = false;
         let mut open_font_picker = false;
+        // プレビュー解像度 (R2 perf): closure 内では self を借りない規約に従い、現在値を Copy で
+        // 取り出し、変更要求はローカルに溜めて closure 後に適用する。
+        let current_preview_scale = self.settings.text_preview_scale.clamp(1, 8);
+        let mut preview_scale_req: Option<u32> = None;
 
         // ── 左パネル: ヘッダ + 追加 + オブジェクト一覧 (補正レイヤー風) ──
         egui::Area::new(egui::Id::new("text_panel"))
@@ -1529,6 +1535,29 @@ impl App {
                                 },
                             );
                         });
+                        ui.separator();
+
+                        // ── プレビュー解像度 (R2 perf) ──。編集中だけ表示を 1/N に下げて合成 +
+                        // GPU upload を軽くし、ドラッグをスムーズにする。保存/コピー/比較/書き出しは
+                        // フル解像度のまま。ツールを閉じると原寸に戻る (鮮明化)。
+                        ui.horizontal(|ui| {
+                            ui.label("プレビュー解像度:");
+                            for (label, scale) in
+                                [("原寸", 1u32), ("1/2", 2), ("1/4", 4), ("1/8", 8)]
+                            {
+                                if ui
+                                    .selectable_label(current_preview_scale == scale, label)
+                                    .clicked()
+                                {
+                                    preview_scale_req = Some(scale);
+                                }
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new("※下げると操作がスムーズになります")
+                                .small()
+                                .weak(),
+                        );
                         ui.separator();
 
                         // ── 追加 ── (ラボと同じく 1 行 1 ボタンの全幅レイアウト・同じ並び)。
@@ -1812,6 +1841,15 @@ impl App {
             self.text_dirty_at = None;
         } else {
             self.comic_docs.insert(key, objects);
+        }
+        // プレビュー解像度の変更を適用 (R2 perf)。次フレームの ensure_comic_composite_texture が
+        // preview_scale 不一致で cache miss → 新倍率で焼き直す。設定は永続化する。
+        if let Some(scale) = preview_scale_req {
+            if self.settings.text_preview_scale != scale {
+                self.settings.text_preview_scale = scale;
+                self.settings.save();
+                ctx.request_repaint();
+            }
         }
         if close {
             self.reset_text_mode();
