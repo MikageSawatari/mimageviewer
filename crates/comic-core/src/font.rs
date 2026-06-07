@@ -228,48 +228,98 @@ impl LoadedFont {
     }
 }
 
-/// 8-neighbour max dilation of a coverage bitmap by `dilate_px` (袋文字 halo).
+/// Circular dilation of a coverage bitmap by `dilate_px` (袋文字 halo / glow /
+/// shadow base), via a two-pass chamfer distance transform.
+///
+/// The shape (glyph silhouette, coverage ≥ 0.5) is expanded outward by
+/// `dilate_px`, with a 1px anti-aliased ramp at the new boundary and full
+/// coverage inside. Cost is **O(output area), independent of radius**.
+///
+/// The previous implementation was a brute-force disk max-filter — for every
+/// covered source pixel it wrote into a (2r+1)² neighbourhood, i.e. O(area·r²).
+/// Combined with `draw_layout_soft_mask` re-dilating every glyph for up to ~8
+/// blur passes (× shadow/glow/outlines), a full-resolution text-effect bake of a
+/// few annotated glyphs took ~8s on the UI thread (perf log 2026-06-07,
+/// `fs/comic_composite_build`). The chamfer DT makes each pass radius-independent.
 fn dilate_coverage(base: GlyphBitmap, dilate_px: f32) -> GlyphBitmap {
-    let dilate = dilate_px.max(0.0).ceil() as i32;
-    if dilate == 0 {
+    let dilate = dilate_px.max(0.0);
+    let r = dilate.ceil() as i32;
+    if r == 0 {
         return base;
     }
     let base_w = base.width as i32;
     let base_h = base.height as i32;
-    let out_w = base_w + 2 * dilate;
-    let out_h = base_h + 2 * dilate;
-    let mut out = vec![0.0f32; (out_w * out_h) as usize];
-    let r2 = (dilate as f32) * (dilate as f32);
+    let out_w = base_w + 2 * r;
+    let out_h = base_h + 2 * r;
+    let n = (out_w * out_h) as usize;
+
+    // Distance field: 0 on the (thresholded) glyph silhouette, FAR elsewhere.
+    // Chamfer weights: D1 (orthogonal) = 1, D2 (diagonal) = √2 — exact on the
+    // axes/diagonals, ~octagonal in between (imperceptible for a halo).
+    const FAR: f32 = 1.0e9;
+    const D1: f32 = 1.0;
+    const D2: f32 = std::f32::consts::SQRT_2;
+    let mut dist = vec![FAR; n];
+    let idx = |x: i32, y: i32| (y * out_w + x) as usize;
+    // Seed on ANY coverage (matches the old max-filter, which dilated every
+    // non-zero source pixel) so the halo fully contains the glyph incl. its AA
+    // fringe — keeps thin strokes from dropping out.
     for sy in 0..base_h {
         for sx in 0..base_w {
-            let v = base.coverage[(sy * base_w + sx) as usize];
-            if v <= 0.0 {
-                continue;
-            }
-            for dy in -dilate..=dilate {
-                for dx in -dilate..=dilate {
-                    if (dx * dx + dy * dy) as f32 > r2 {
-                        continue;
-                    }
-                    let tx = sx + dilate + dx;
-                    let ty = sy + dilate + dy;
-                    if tx < 0 || ty < 0 || tx >= out_w || ty >= out_h {
-                        continue;
-                    }
-                    let oi = (ty * out_w + tx) as usize;
-                    if v > out[oi] {
-                        out[oi] = v;
-                    }
-                }
+            if base.coverage[(sy * base_w + sx) as usize] > 0.0 {
+                dist[idx(sx + r, sy + r)] = 0.0;
             }
         }
+    }
+    // Forward pass (top-left → bottom-right).
+    for y in 0..out_h {
+        for x in 0..out_w {
+            let mut d = dist[idx(x, y)];
+            if x > 0 {
+                d = d.min(dist[idx(x - 1, y)] + D1);
+            }
+            if y > 0 {
+                d = d.min(dist[idx(x, y - 1)] + D1);
+                if x > 0 {
+                    d = d.min(dist[idx(x - 1, y - 1)] + D2);
+                }
+                if x < out_w - 1 {
+                    d = d.min(dist[idx(x + 1, y - 1)] + D2);
+                }
+            }
+            dist[idx(x, y)] = d;
+        }
+    }
+    // Backward pass (bottom-right → top-left).
+    for y in (0..out_h).rev() {
+        for x in (0..out_w).rev() {
+            let mut d = dist[idx(x, y)];
+            if x < out_w - 1 {
+                d = d.min(dist[idx(x + 1, y)] + D1);
+            }
+            if y < out_h - 1 {
+                d = d.min(dist[idx(x, y + 1)] + D1);
+                if x < out_w - 1 {
+                    d = d.min(dist[idx(x + 1, y + 1)] + D2);
+                }
+                if x > 0 {
+                    d = d.min(dist[idx(x - 1, y + 1)] + D2);
+                }
+            }
+            dist[idx(x, y)] = d;
+        }
+    }
+    // Coverage: solid inside the dilated silhouette, 1px AA ramp at the boundary.
+    let mut out = vec![0.0f32; n];
+    for (o, &d) in out.iter_mut().zip(dist.iter()) {
+        *o = (dilate + 0.5 - d).clamp(0.0, 1.0);
     }
     GlyphBitmap {
         width: out_w as usize,
         height: out_h as usize,
         coverage: out,
-        left: base.left - dilate as f32,
-        top: base.top - dilate as f32,
+        left: base.left - r as f32,
+        top: base.top - r as f32,
     }
 }
 
@@ -440,5 +490,67 @@ impl FontSet {
             return Some(f);
         }
         self.default_key.as_ref().and_then(|k| self.fonts.get(k))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn solid(w: usize, h: usize) -> GlyphBitmap {
+        GlyphBitmap {
+            width: w,
+            height: h,
+            coverage: vec![1.0; w * h],
+            left: 0.0,
+            top: 0.0,
+        }
+    }
+
+    #[test]
+    fn dilate_zero_returns_base_unchanged() {
+        let b = solid(4, 4);
+        let out = dilate_coverage(b.clone(), 0.0);
+        assert_eq!((out.width, out.height), (4, 4));
+        assert_eq!(out.coverage, b.coverage);
+    }
+
+    #[test]
+    fn dilate_expands_dims_and_offsets() {
+        let out = dilate_coverage(solid(4, 4), 5.0);
+        // base + 2*ceil(dilate) on each axis; origin shifts by -r.
+        assert_eq!((out.width, out.height), (14, 14));
+        assert_eq!((out.left, out.top), (-5.0, -5.0));
+    }
+
+    #[test]
+    fn dilate_grows_a_single_pixel_into_a_disk() {
+        // One covered pixel, dilated by r: the chamfer DT must yield full coverage
+        // within ~r and fall to zero beyond ~r+1 (a roughly circular halo). The old
+        // brute force was O(area·r²); this asserts the new DT keeps the shape.
+        let r = 6.0f32;
+        let base = GlyphBitmap {
+            width: 1,
+            height: 1,
+            coverage: vec![1.0],
+            left: 0.0,
+            top: 0.0,
+        };
+        let out = dilate_coverage(base, r);
+        // Grid is base + 2*ceil(r) = 13x13; the single seed sits at the centre.
+        assert_eq!((out.width, out.height), (13, 13));
+        let cx = (out.width / 2) as i32; // 6
+        let cy = (out.height / 2) as i32; // 6
+        let cov = |x: i32, y: i32| out.coverage[(y as usize) * out.width + x as usize];
+        assert!(cov(cx, cy) > 0.99, "centre solid");
+        assert!(cov(cx + 3, cy) > 0.99, "inside the radius solid");
+        // At the axis edge (distance r) the ramp is partial but present.
+        assert!(cov(cx + 6, cy) > 0.0, "at radius has some coverage");
+        // Roughly circular: the corner (distance r·√2 ≈ 8.5 > r) is clear.
+        assert!(
+            cov(0, 0) < 0.01,
+            "corner beyond radius is clear, got {}",
+            cov(0, 0)
+        );
     }
 }

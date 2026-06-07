@@ -75,6 +75,55 @@ mod integration_tests {
         }
     }
 
+    /// Bench: full-resolution text-effect bake. Reproduces the 2026-06-07 freeze
+    /// (`fs/comic_composite_build` ≈ 8s for a few glyphs at 3584×4608) and the fix
+    /// (chamfer-DT dilation: O(area), radius-independent — see `font::dilate_coverage`).
+    /// Run with: `cargo test -p comic-core effect_bake_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn effect_bake_bench() {
+        let Some(font) = load_test_font() else {
+            eprintln!("skip: no Windows JP font available");
+            return;
+        };
+        let mut fonts = FontSet::new();
+        fonts.insert(font);
+        // Large text with shadow + glow + thick outline (the heavy-effect case).
+        let text = TextBlock {
+            text: "おはようございます。今日もいい天気ですね。".to_string(),
+            size_px: 180.0,
+            orientation: Orientation::Vertical,
+            outline: Some(StrokeStyle {
+                color: Rgba::BLACK,
+                width_px: 10.0,
+            }),
+            shadow: Some(TextShadowStyle {
+                color: Rgba::new(0, 0, 0, 150),
+                offset: (8.0, 8.0),
+                blur_px: 12.0,
+                spread_px: 3.0,
+            }),
+            glow: Some(TextGlowStyle {
+                color: Rgba::new(255, 255, 255, 180),
+                radius_px: 16.0,
+                spread_px: 3.0,
+            }),
+            ..TextBlock::default()
+        };
+        let obj = AnnotationObject::new_text(1, (1800.0, 200.0), text);
+        let (w, h) = (3584usize, 4608usize);
+        let t0 = std::time::Instant::now();
+        let overlay = bake_overlay(std::slice::from_ref(&obj), w, h, &fonts);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("effect_bake_bench: {ms:.1}ms for {w}x{h} (was ~8000ms pre-fix)");
+        assert_eq!(overlay.w, w);
+        // Generous ceiling: pre-fix this was ~8s; the DT fix should be well under 1s.
+        assert!(
+            ms < 2000.0,
+            "effect bake regressed to {ms:.1}ms (expected <2s)"
+        );
+    }
+
     #[test]
     fn vertical_columns_advance_right_to_left() {
         let Some(font) = load_test_font() else {
