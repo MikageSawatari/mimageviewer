@@ -940,7 +940,11 @@ impl App {
         if is_video {
             return None;
         }
-        if original_preview_active {
+        // Z 分析モードは AI / 補正 / 注釈 / 隠蔽 / 消しゴム / 局所補正をすべてバイパスして
+        // **raw 元画像**を表示する (右 Ctrl の original preview と同じ経路)。分析パネルの色取得・
+        // ヒストグラム・グレースケール/拡大鏡オーバーレイは raw fs_cache を読むので、表示も raw に
+        // 揃えることで「クリックした見た目の色 = 分析値」が一致する (Codex 指摘 + ユーザー要望)。
+        if original_preview_active || self.analysis_mode {
             return self.resolve_original_preview_tex(idx);
         }
 
