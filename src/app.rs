@@ -512,6 +512,24 @@ impl LocalAdjustMaskPreviewColors {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalAdjustEdgePreviewKey {
+    pub(crate) source_key: String,
+    pub(crate) input_gen: u64,
+    pub(crate) erase_mask_gen: u64,
+    pub(crate) source_size: [usize; 2],
+    pub(crate) preview_size: [usize; 2],
+    pub(crate) edge_threshold: u8,
+    pub(crate) ink_threshold: u8,
+    pub(crate) gap_px: u8,
+}
+
+#[derive(Clone)]
+pub(crate) struct LocalAdjustEdgePreviewCache {
+    pub(crate) key: LocalAdjustEdgePreviewKey,
+    pub(crate) texture: egui::TextureHandle,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalAdjustMaskTool {
     Select,
@@ -3863,10 +3881,14 @@ pub struct App {
     pub(crate) local_adjust_boundary_ink_threshold: f32,
     /// 補正レイヤー境界筆の境界検出ギャップ補完幅 (画像 px)。
     pub(crate) local_adjust_boundary_gap_px: f32,
+    /// 補正レイヤー多角形ツールの境界吸着半径 (画面 px)。
+    pub(crate) local_adjust_edge_snap_radius: f32,
     /// 補正レイヤー境界筆の開始色からの許容差。
     pub(crate) local_adjust_edge_brush_tolerance: f32,
     /// 補正レイヤー境界筆で塗り領域に接する境界線も含める。
     pub(crate) local_adjust_edge_brush_include_boundary: bool,
+    /// Ctrl 境界表示用の縮小 texture cache。
+    pub(crate) local_adjust_edge_preview_cache: Option<LocalAdjustEdgePreviewCache>,
     /// 補正レイヤー手描きマスクの囲み/多角形作成中ポイント (画像 px)。
     pub(crate) local_adjust_mask_lasso_points: Vec<[f32; 2]>,
     /// 補正レイヤー手描きマスクの図形ドラッグ開始点 (正規化座標)。
@@ -5405,8 +5427,10 @@ impl App {
             local_adjust_boundary_edge_threshold: 42.0,
             local_adjust_boundary_ink_threshold: 32.0,
             local_adjust_boundary_gap_px: 2.0,
+            local_adjust_edge_snap_radius: 16.0,
             local_adjust_edge_brush_tolerance: 48.0,
             local_adjust_edge_brush_include_boundary: false,
+            local_adjust_edge_preview_cache: None,
             local_adjust_mask_lasso_points: Vec::new(),
             local_adjust_mask_shape_drag_start: None,
             local_adjust_mask_shape_drag_end: None,

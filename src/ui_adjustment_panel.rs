@@ -19,9 +19,9 @@ use eframe::egui;
 
 use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
 use crate::app::{
-    AdjustSpreadTarget, App, LocalAdjustGeneratedMask, LocalAdjustMaskColorPreset,
-    LocalAdjustMaskEditTarget, LocalAdjustMaskShapeDrag, LocalAdjustMaskTool,
-    LocalAdjustRegionSegmentationScope,
+    AdjustSpreadTarget, App, LocalAdjustEdgePreviewCache, LocalAdjustEdgePreviewKey,
+    LocalAdjustGeneratedMask, LocalAdjustMaskColorPreset, LocalAdjustMaskEditTarget,
+    LocalAdjustMaskShapeDrag, LocalAdjustMaskTool, LocalAdjustRegionSegmentationScope,
 };
 use crate::local_adjust_catalog::{
     EFFECT_GROUPS, EffectKind, effect_picker_button_width, effect_picker_matches_query,
@@ -69,6 +69,12 @@ const LOCAL_ADJUST_MASK_PREVIEW_BASE_ALPHA: f32 = 155.0;
 const LOCAL_ADJUST_MASK_PREVIEW_EDIT_ALPHA: u8 = 225;
 const LOCAL_ADJUST_MASK_PREVIEW_MAX_TEXELS: f32 = 2048.0;
 const LOCAL_ADJUST_REGION_BOUNDARY_ANIM_INTERVAL_MS: u64 = 160;
+const LOCAL_ADJUST_EDGE_OVERLAY_REPAINT_MS: u64 = 90;
+const LOCAL_ADJUST_EDGE_PREVIEW_MAX_SIDE: usize = 640;
+pub(crate) const LOCAL_ADJUST_NUDGE_PIXELS: f32 = 1.0;
+pub(crate) const LOCAL_ADJUST_NUDGE_PIXELS_FAST: f32 = 10.0;
+pub(crate) const LOCAL_ADJUST_ROTATE_DEG_STEP: f32 = 0.1;
+pub(crate) const LOCAL_ADJUST_ROTATE_DEG_STEP_FAST: f32 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalAdjustBitmapMaskOp {
@@ -954,6 +960,49 @@ mod local_adjust_segmentation_tests {
         assert_ne!(labels[1], 0);
     }
 
+    #[test]
+    fn edge_preview_size_caps_long_side() {
+        assert_eq!(local_adjust_edge_preview_size(4000, 2000), [640, 320]);
+        assert_eq!(local_adjust_edge_preview_size(0, 0), [1, 1]);
+    }
+
+    #[test]
+    fn polygon_candidate_snaps_to_nearby_edge_when_ctrl_is_held() {
+        let width = 20;
+        let height = 10;
+        let mut pixels = vec![egui::Color32::from_rgb(245, 245, 245); width * height];
+        for y in 0..height {
+            pixels[y * width + 10] = egui::Color32::from_rgb(8, 8, 8);
+        }
+        let source = egui::ColorImage::new([width, height], pixels);
+        let raw = [7.5, 5.5];
+        let snapped = local_adjust_snap_point_to_edge(&source, raw, 5.0, 24.0, 28.0, 0);
+
+        assert!(snapped[0] > raw[0] + 1.0);
+        assert!(snapped[0] <= 11.5);
+    }
+
+    #[test]
+    fn polygon_candidate_does_not_snap_without_ctrl() {
+        let source =
+            egui::ColorImage::new([4, 4], vec![egui::Color32::from_rgb(240, 240, 240); 16]);
+        let norm = [0.4, 0.5];
+        let (candidate, raw, snapping) = local_adjust_polygon_candidate_point(
+            norm,
+            (4, 4),
+            Some(&source),
+            1.0,
+            false,
+            16.0,
+            24.0,
+            28.0,
+            0,
+        );
+
+        assert_eq!(candidate, raw);
+        assert!(!snapping);
+    }
+
     /// A-2 regression hardening: MAX_TEXELS は 2048 を下回ってはならない。
     ///
     /// 経緯: ef750308 で 768 → 2048 に上げた。理由は領域境界アニメーションが
@@ -1043,6 +1092,28 @@ mod local_adjust_segmentation_tests {
         assert!(super::local_adjust_shape_contains(ell, [220.0, 210.0]));
         // (30, 10) は (1.0 + 0.44) > 1 → 外
         assert!(!super::local_adjust_shape_contains(ell, [230.0, 210.0]));
+    }
+
+    #[test]
+    fn shape_keyboard_transform_translates_and_snaps_rotation() {
+        let rect = local_adjust_core::MaskShape::Rect {
+            op: local_adjust_core::ShapeOp::Add,
+            center: [100.0, 80.0],
+            half_w: 20.0,
+            half_h: 10.0,
+            rotation_rad: 0.0,
+        };
+        let moved = local_adjust_translate_shape(rect, 3.0, -4.0);
+        let local_adjust_core::MaskShape::Rect { center, .. } = moved else {
+            panic!("expected rect");
+        };
+        assert_eq!(center, [103.0, 76.0]);
+
+        let rotated = local_adjust_rotate_shape(rect, 7.0_f32.to_radians(), true);
+        let local_adjust_core::MaskShape::Rect { rotation_rad, .. } = rotated else {
+            panic!("expected rect");
+        };
+        assert!((rotation_rad - 0.0).abs() < 1e-6);
     }
 
     /// A-2 関連: アニメーション色は時間経過で十分に変化する。
@@ -2233,6 +2304,7 @@ fn draw_local_tool_settings(
     boundary_edge_threshold: &mut f32,
     boundary_ink_threshold: &mut f32,
     boundary_gap_px: &mut f32,
+    edge_snap_radius: &mut f32,
     edge_brush_tolerance: &mut f32,
     edge_brush_include_boundary: &mut bool,
 ) {
@@ -2303,8 +2375,14 @@ fn draw_local_tool_settings(
             );
         }
         LocalAdjustMaskTool::Polygon => {
+            ui.add(egui::Slider::new(boundary_edge_threshold, 0.0..=120.0).text("境界しきい値"));
+            ui.add(egui::Slider::new(boundary_ink_threshold, 0.0..=120.0).text("線内部しきい値"));
+            ui.add(egui::Slider::new(boundary_gap_px, 0.0..=4.0).text("境界ギャップ補完"));
+            ui.add(egui::Slider::new(edge_snap_radius, 2.0..=64.0).text("吸着半径"));
             ui.label(
-                egui::RichText::new("右クリックまたは始点クリックで確定します。")
+                egui::RichText::new(
+                    "Ctrl中は候補点が近くの境界へ吸着します。右クリックまたは始点クリックで確定します。",
+                )
                     .size(10.0)
                     .color(egui::Color32::from_gray(170)),
             );
@@ -2356,6 +2434,7 @@ fn draw_selected_local_adjust_layer_editor(
     boundary_edge_threshold: &mut f32,
     boundary_ink_threshold: &mut f32,
     boundary_gap_px: &mut f32,
+    edge_snap_radius: &mut f32,
     edge_brush_tolerance: &mut f32,
     edge_brush_include_boundary: &mut bool,
     region_color_tolerance: &mut f32,
@@ -2389,6 +2468,7 @@ fn draw_selected_local_adjust_layer_editor(
                 boundary_edge_threshold,
                 boundary_ink_threshold,
                 boundary_gap_px,
+                edge_snap_radius,
                 edge_brush_tolerance,
                 edge_brush_include_boundary,
             );
@@ -3473,6 +3553,160 @@ fn local_adjust_boundary_pixel_at(
             ))
 }
 
+fn local_adjust_boundary_strength_at(image: &egui::ColorImage, x: usize, y: usize) -> f32 {
+    local_adjust_edge_strength_at(image, x, y)
+        .max(local_adjust_line_interior_strength_at(image, x, y))
+}
+
+fn local_adjust_edge_preview_size(width: usize, height: usize) -> [usize; 2] {
+    let max_side = width.max(height).max(1);
+    if max_side <= LOCAL_ADJUST_EDGE_PREVIEW_MAX_SIDE {
+        [width.max(1), height.max(1)]
+    } else {
+        let scale = LOCAL_ADJUST_EDGE_PREVIEW_MAX_SIDE as f32 / max_side as f32;
+        [
+            ((width as f32 * scale).round() as usize).max(1),
+            ((height as f32 * scale).round() as usize).max(1),
+        ]
+    }
+}
+
+fn build_local_adjust_edge_preview_image(
+    source: &egui::ColorImage,
+    preview_size: [usize; 2],
+    edge_threshold: u8,
+    ink_threshold: u8,
+    gap_px: u8,
+) -> egui::ColorImage {
+    let [width, height] = source.size;
+    let [preview_w, preview_h] = preview_size;
+    if width == 0 || height == 0 || preview_w == 0 || preview_h == 0 {
+        return egui::ColorImage::new([1, 1], vec![egui::Color32::TRANSPARENT]);
+    }
+    let mut pixels = vec![egui::Color32::TRANSPARENT; preview_w.saturating_mul(preview_h)];
+    let edge_threshold_f = edge_threshold as f32;
+    let ink_threshold_f = ink_threshold as f32;
+    let gap_px = gap_px as usize;
+    for py in 0..preview_h {
+        let sy = ((py as f32 + 0.5) * height as f32 / preview_h as f32)
+            .floor()
+            .clamp(0.0, height.saturating_sub(1) as f32) as usize;
+        for px in 0..preview_w {
+            let sx = ((px as f32 + 0.5) * width as f32 / preview_w as f32)
+                .floor()
+                .clamp(0.0, width.saturating_sub(1) as f32) as usize;
+            if local_adjust_boundary_pixel_at(
+                source,
+                sx,
+                sy,
+                edge_threshold_f,
+                ink_threshold_f,
+                gap_px,
+            ) {
+                let strength = local_adjust_boundary_strength_at(source, sx, sy);
+                let base_threshold = edge_threshold_f.min(ink_threshold_f);
+                let alpha = ((strength - base_threshold) / 96.0)
+                    .clamp(0.18, 1.0)
+                    .mul_add(180.0, 0.0)
+                    .round() as u8;
+                pixels[py * preview_w + px] =
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
+            }
+        }
+    }
+    egui::ColorImage::new([preview_w, preview_h], pixels)
+}
+
+fn local_adjust_edge_overlay_color(ctx: &egui::Context, alpha: u8) -> egui::Color32 {
+    let t = ctx.input(|i| i.time);
+    let phase = ((t * 3.0).sin() * 0.5 + 0.5) as f32;
+    let r = 255_u8;
+    let g = (72.0 + 168.0 * phase).round() as u8;
+    let b = (220.0 - 156.0 * phase).round() as u8;
+    egui::Color32::from_rgba_unmultiplied(r, g, b, alpha)
+}
+
+fn local_adjust_snap_point_to_edge(
+    source: &egui::ColorImage,
+    point: [f32; 2],
+    radius: f32,
+    edge_threshold: f32,
+    ink_threshold: f32,
+    gap_px: usize,
+) -> [f32; 2] {
+    let [width, height] = source.size;
+    if width == 0 || height == 0 {
+        return point;
+    }
+    let radius = radius.max(1.0);
+    let min_x = (point[0] - radius).floor().max(0.0) as usize;
+    let max_x = (point[0] + radius)
+        .ceil()
+        .min(width.saturating_sub(1) as f32) as usize;
+    let min_y = (point[1] - radius).floor().max(0.0) as usize;
+    let max_y = (point[1] + radius)
+        .ceil()
+        .min(height.saturating_sub(1) as f32) as usize;
+    let radius_sq = radius * radius;
+    let mut best = None;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let dx = x as f32 + 0.5 - point[0];
+            let dy = y as f32 + 0.5 - point[1];
+            if dx * dx + dy * dy > radius_sq {
+                continue;
+            }
+            if !local_adjust_boundary_pixel_at(source, x, y, edge_threshold, ink_threshold, gap_px)
+            {
+                continue;
+            }
+            let strength = local_adjust_boundary_strength_at(source, x, y);
+            let distance = (dx * dx + dy * dy).sqrt();
+            let normalized_distance = distance / radius;
+            let score = strength / (1.0 + normalized_distance * 3.0);
+            if best
+                .map(|(_, _, best_score): (usize, usize, f32)| score > best_score)
+                .unwrap_or(true)
+            {
+                best = Some((x, y, score));
+            }
+        }
+    }
+    best.map(|(x, y, _)| [x as f32 + 0.5, y as f32 + 0.5])
+        .unwrap_or(point)
+}
+
+fn local_adjust_polygon_candidate_point(
+    norm: [f32; 2],
+    image_dims: (usize, usize),
+    source: Option<&egui::ColorImage>,
+    scale: f32,
+    ctrl_held: bool,
+    snap_radius: f32,
+    edge_threshold: f32,
+    ink_threshold: f32,
+    gap_px: usize,
+) -> ([f32; 2], [f32; 2], bool) {
+    let raw = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
+    let raw_point = [raw.0, raw.1];
+    let Some(source) = source else {
+        return (raw_point, raw_point, false);
+    };
+    if !ctrl_held || source.size != [image_dims.0, image_dims.1] {
+        return (raw_point, raw_point, false);
+    }
+    let snap_radius_image = snap_radius.max(2.0) / scale.max(0.001);
+    let snapped = local_adjust_snap_point_to_edge(
+        source,
+        raw_point,
+        snap_radius_image,
+        edge_threshold,
+        ink_threshold,
+        gap_px,
+    );
+    (snapped, raw_point, true)
+}
+
 fn local_adjust_edge_brush_pixel_allowed(
     image: &egui::ColorImage,
     x: usize,
@@ -4102,6 +4336,118 @@ fn vector_shape_to_local_adjust_shape(
             rx,
             ry,
             rotation_rad,
+        },
+    }
+}
+
+fn local_adjust_translate_shape(
+    shape: local_adjust_core::MaskShape,
+    dx: f32,
+    dy: f32,
+) -> local_adjust_core::MaskShape {
+    match shape {
+        local_adjust_core::MaskShape::Line {
+            op,
+            kind,
+            p0,
+            p1,
+            thickness,
+        } => local_adjust_core::MaskShape::Line {
+            op,
+            kind,
+            p0: [p0[0] + dx, p0[1] + dy],
+            p1: [p1[0] + dx, p1[1] + dy],
+            thickness,
+        },
+        local_adjust_core::MaskShape::Rect {
+            op,
+            center,
+            half_w,
+            half_h,
+            rotation_rad,
+        } => local_adjust_core::MaskShape::Rect {
+            op,
+            center: [center[0] + dx, center[1] + dy],
+            half_w,
+            half_h,
+            rotation_rad,
+        },
+        local_adjust_core::MaskShape::Ellipse {
+            op,
+            center,
+            rx,
+            ry,
+            rotation_rad,
+        } => local_adjust_core::MaskShape::Ellipse {
+            op,
+            center: [center[0] + dx, center[1] + dy],
+            rx,
+            ry,
+            rotation_rad,
+        },
+    }
+}
+
+fn local_adjust_rotate_shape(
+    shape: local_adjust_core::MaskShape,
+    delta_rad: f32,
+    snap_15deg: bool,
+) -> local_adjust_core::MaskShape {
+    let snap = |angle: f32| {
+        if snap_15deg {
+            let step = 15.0_f32.to_radians();
+            (angle / step).round() * step
+        } else {
+            angle
+        }
+    };
+    match shape {
+        local_adjust_core::MaskShape::Line {
+            op,
+            kind,
+            p0,
+            p1,
+            thickness,
+        } => {
+            let center = [(p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5];
+            let current = (p1[1] - p0[1]).atan2(p1[0] - p0[0]);
+            let next = snap(current + delta_rad);
+            let half_len =
+                (((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt() * 0.5).max(0.5);
+            let (s, c) = next.sin_cos();
+            local_adjust_core::MaskShape::Line {
+                op,
+                kind,
+                p0: [center[0] - c * half_len, center[1] - s * half_len],
+                p1: [center[0] + c * half_len, center[1] + s * half_len],
+                thickness,
+            }
+        }
+        local_adjust_core::MaskShape::Rect {
+            op,
+            center,
+            half_w,
+            half_h,
+            rotation_rad,
+        } => local_adjust_core::MaskShape::Rect {
+            op,
+            center,
+            half_w,
+            half_h,
+            rotation_rad: snap(rotation_rad + delta_rad),
+        },
+        local_adjust_core::MaskShape::Ellipse {
+            op,
+            center,
+            rx,
+            ry,
+            rotation_rad,
+        } => local_adjust_core::MaskShape::Ellipse {
+            op,
+            center,
+            rx,
+            ry,
+            rotation_rad: snap(rotation_rad + delta_rad),
         },
     }
 }
@@ -7874,6 +8220,206 @@ impl App {
         changed
     }
 
+    pub(crate) fn commit_local_adjust_polygon_from_shortcut(&mut self, fs_idx: usize) -> bool {
+        if self.local_adjust_mask_tool != LocalAdjustMaskTool::Polygon
+            || self.local_adjust_mask_lasso_points.len() < 3
+        {
+            return false;
+        }
+        let Some(layer_idx) = self.selected_local_adjust_layer_idx(fs_idx) else {
+            return false;
+        };
+        let Some(target) = self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .and_then(|layers| layers.get(layer_idx))
+            .and_then(|layer| {
+                effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target)
+            })
+        else {
+            return false;
+        };
+        let points = std::mem::take(&mut self.local_adjust_mask_lasso_points);
+        self.fill_local_adjust_mask_polygon(fs_idx, layer_idx, target, points)
+    }
+
+    pub(crate) fn cancel_local_adjust_canvas_edit_from_shortcut(&mut self) -> bool {
+        let shape_drag = self.local_adjust_shape_drag.take();
+        let brush_stroke = self.local_adjust_mask_brush_stroke.take();
+        let had_edit = self.local_adjust_selected_shape.take().is_some()
+            || shape_drag.is_some()
+            || self.local_adjust_mask_shape_drag_start.take().is_some()
+            || self.local_adjust_mask_shape_drag_end.take().is_some()
+            || brush_stroke.is_some()
+            || !self.local_adjust_mask_lasso_points.is_empty();
+        if let Some(drag) = shape_drag
+            && let Some(before) = self.local_adjust_shape_drag_before_layers.take()
+        {
+            self.set_local_adjust_layers_for_idx_memory_only(drag.fs_idx, before);
+        }
+        if let Some(stroke) = brush_stroke {
+            if let Some(before) = self.local_adjust_mask_brush_before_layers.take() {
+                self.set_local_adjust_layers_for_idx_memory_only(stroke.fs_idx, before);
+            }
+            self.cancel_deferred_local_adjust_brush_render(stroke.fs_idx);
+        }
+        self.local_adjust_mask_lasso_points.clear();
+        if had_edit {
+            self.local_adjust_shape_drag_before_layers = None;
+            self.local_adjust_mask_brush_before_layers = None;
+        }
+        had_edit
+    }
+
+    fn update_selected_local_adjust_shape(
+        &mut self,
+        fs_idx: usize,
+        undo_summary: &'static str,
+        mut update: impl FnMut(local_adjust_core::MaskShape) -> local_adjust_core::MaskShape,
+    ) -> bool {
+        let Some(selected) = self.local_adjust_selected_shape else {
+            return false;
+        };
+        let Some(layer_idx) = self.selected_local_adjust_layer_idx(fs_idx) else {
+            return false;
+        };
+        let Some(target) = self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .and_then(|layers| layers.get(layer_idx))
+            .and_then(|layer| {
+                effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target)
+            })
+        else {
+            return false;
+        };
+        let image_dims = local_adjust_image_dims(self, fs_idx);
+        let before = self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .cloned()
+            .unwrap_or_default();
+        let changed =
+            self.mutate_local_adjust_layer_from_canvas(fs_idx, layer_idx, false, |layer| {
+                let Some(mask) =
+                    local_adjust_target_raster_vector_mask_mut(layer, target, image_dims, false)
+                else {
+                    return false;
+                };
+                let Some(slot) = mask.shapes.get_mut(selected) else {
+                    return false;
+                };
+                *slot = update(*slot);
+                true
+            });
+        if changed {
+            self.local_adjust_show_mask = true;
+            self.local_adjust_selected_shape = Some(selected);
+            let layers = self
+                .local_adjust_page_layers
+                .get(&fs_idx)
+                .cloned()
+                .unwrap_or_default();
+            self.set_local_adjust_layers_for_idx_with_undo(
+                fs_idx,
+                before,
+                layers,
+                undo_summary.to_string(),
+            );
+        }
+        changed
+    }
+
+    pub(crate) fn delete_selected_local_adjust_shape_from_shortcut(
+        &mut self,
+        fs_idx: usize,
+    ) -> bool {
+        let Some(selected) = self.local_adjust_selected_shape else {
+            return false;
+        };
+        let Some(layer_idx) = self.selected_local_adjust_layer_idx(fs_idx) else {
+            return false;
+        };
+        let Some(target) = self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .and_then(|layers| layers.get(layer_idx))
+            .and_then(|layer| {
+                effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target)
+            })
+        else {
+            return false;
+        };
+        let image_dims = local_adjust_image_dims(self, fs_idx);
+        let before = self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .cloned()
+            .unwrap_or_default();
+        let changed =
+            self.mutate_local_adjust_layer_from_canvas(fs_idx, layer_idx, false, |layer| {
+                let Some(mask) =
+                    local_adjust_target_raster_vector_mask_mut(layer, target, image_dims, false)
+                else {
+                    return false;
+                };
+                if selected >= mask.shapes.len() {
+                    return false;
+                }
+                mask.shapes.remove(selected);
+                true
+            });
+        if changed {
+            self.local_adjust_show_mask = true;
+            self.local_adjust_selected_shape = None;
+            self.local_adjust_shape_drag = None;
+            let layers = self
+                .local_adjust_page_layers
+                .get(&fs_idx)
+                .cloned()
+                .unwrap_or_default();
+            self.set_local_adjust_layers_for_idx_with_undo(
+                fs_idx,
+                before,
+                layers,
+                "補正レイヤー図形マスク削除".to_string(),
+            );
+        }
+        changed
+    }
+
+    pub(crate) fn nudge_selected_local_adjust_shape_from_shortcut(
+        &mut self,
+        fs_idx: usize,
+        dx: f32,
+        dy: f32,
+    ) -> bool {
+        if dx == 0.0 && dy == 0.0 {
+            return false;
+        }
+        self.update_selected_local_adjust_shape(
+            fs_idx,
+            "補正レイヤー図形マスク移動",
+            |shape| local_adjust_translate_shape(shape, dx, dy),
+        )
+    }
+
+    pub(crate) fn rotate_selected_local_adjust_shape_from_shortcut(
+        &mut self,
+        fs_idx: usize,
+        delta_rad: f32,
+        snap_15deg: bool,
+    ) -> bool {
+        if delta_rad == 0.0 {
+            return false;
+        }
+        self.update_selected_local_adjust_shape(
+            fs_idx,
+            "補正レイヤー図形マスク回転",
+            |shape| local_adjust_rotate_shape(shape, delta_rad, snap_15deg),
+        )
+    }
+
     fn commit_local_adjust_mask_shape(
         &mut self,
         fs_idx: usize,
@@ -8146,7 +8692,7 @@ impl App {
         });
         // フルスクリーンビューポートでは `modifiers.ctrl` が stale になり得るので、Ctrl 依存の
         // 境界筆→通常筆切替は OS 直読み (ソースプレビューの Ctrl 検出と同じ方式) を使う。
-        let ctrl_held = crate::ui_fullscreen::ctrl_held_via_os();
+        let ctrl_held = modifiers.ctrl || crate::ui_fullscreen::ctrl_held_via_os();
 
         if primary_released {
             if self.local_adjust_shape_drag.is_some() {
@@ -8649,21 +9195,37 @@ impl App {
                         self.local_adjust_mask_lasso_points.push([p.0, p.1]);
                     }
                     LocalAdjustMaskTool::Polygon => {
-                        let p = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
+                        let scale = local_adjust_image_layout(image_rect, image_dims, zoom_pan)
+                            .map(|(scale, _)| scale)
+                            .unwrap_or(1.0);
+                        let source_pixels = self.current_local_adjust_source_pixels(fs_idx);
+                        let (point, _, _) = local_adjust_polygon_candidate_point(
+                            norm,
+                            image_dims,
+                            source_pixels.as_deref(),
+                            scale,
+                            ctrl_held,
+                            self.local_adjust_edge_snap_radius,
+                            self.local_adjust_boundary_edge_threshold.clamp(0.0, 255.0),
+                            self.local_adjust_boundary_ink_threshold.clamp(0.0, 255.0),
+                            self.local_adjust_boundary_gap_px.clamp(0.0, 8.0).round() as usize,
+                        );
+                        let polygon_points: Vec<(f32, f32)> = self
+                            .local_adjust_mask_lasso_points
+                            .iter()
+                            .map(|p| (p[0], p[1]))
+                            .collect();
                         let close = self.local_adjust_mask_lasso_points.len() >= 3
-                            && self
-                                .local_adjust_mask_lasso_points
-                                .first()
-                                .is_some_and(|first| {
-                                    let dx = first[0] - p.0;
-                                    let dy = first[1] - p.1;
-                                    dx * dx + dy * dy <= 12.0 * 12.0
-                                });
+                            && crate::manual_mask_tools::should_close_polygon(
+                                &polygon_points,
+                                (point[0], point[1]),
+                                scale,
+                            );
                         if close {
                             let points = std::mem::take(&mut self.local_adjust_mask_lasso_points);
                             self.fill_local_adjust_mask_polygon(fs_idx, layer_idx, target, points);
                         } else {
-                            self.local_adjust_mask_lasso_points.push([p.0, p.1]);
+                            self.local_adjust_mask_lasso_points.push(point);
                         }
                     }
                     LocalAdjustMaskTool::Line
@@ -8887,6 +9449,7 @@ impl App {
             .local_adjust_page_layers
             .get(&fs_idx)
             .and_then(|layers| layers.get(layer_idx))
+            .cloned()
         else {
             return;
         };
@@ -8905,15 +9468,15 @@ impl App {
             draw_local_adjust_mask_preview_overlay(
                 painter,
                 drawn_rect,
-                layer,
+                &layer,
                 source_pixels.as_deref(),
                 image_dims,
                 ui.ctx().input(|i| i.time) as f32,
                 self.local_adjust_mask_color_preset.colors(),
-                effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target),
+                effective_local_mask_edit_target(&layer, self.local_adjust_mask_edit_target),
                 &mut self.local_adjust_mask_preview_texture,
             );
-            if matches!(layer.mask, local_adjust_core::LocalMask::Segmentation(_)) {
+            if matches!(&layer.mask, local_adjust_core::LocalMask::Segmentation(_)) {
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(
                         LOCAL_ADJUST_REGION_BOUNDARY_ANIM_INTERVAL_MS,
@@ -8932,8 +9495,32 @@ impl App {
             }
         });
         let active_mask_edit_target =
-            effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target);
-        if effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target).is_some()
+            effective_local_mask_edit_target(&layer, self.local_adjust_mask_edit_target);
+        let ctrl_down =
+            ui.ctx().input(|i| i.modifiers.ctrl) || crate::ui_fullscreen::ctrl_held_via_os();
+        if ctrl_down
+            && active_mask_edit_target.is_some()
+            && matches!(
+                self.local_adjust_mask_tool,
+                LocalAdjustMaskTool::EdgeBrush | LocalAdjustMaskTool::Polygon
+            )
+            && let Some((_, drawn_rect)) = shape_layout
+            && let Some(edge_texture) =
+                self.ensure_local_adjust_edge_preview_texture(ui.ctx(), fs_idx)
+        {
+            let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+            painter.image(
+                edge_texture.id(),
+                drawn_rect,
+                uv,
+                local_adjust_edge_overlay_color(ui.ctx(), 230),
+            );
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(
+                    LOCAL_ADJUST_EDGE_OVERLAY_REPAINT_MS,
+                ));
+        }
+        if effective_local_mask_edit_target(&layer, self.local_adjust_mask_edit_target).is_some()
             && matches!(
                 self.local_adjust_mask_tool,
                 LocalAdjustMaskTool::Brush
@@ -8962,7 +9549,7 @@ impl App {
         }
         if let (Some(target), Some(to_screen)) = (active_mask_edit_target, shape_to_screen.as_ref())
         {
-            if let Some(mask) = local_adjust_target_raster_vector_mask_ref(layer, target) {
+            if let Some(mask) = local_adjust_target_raster_vector_mask_ref(&layer, target) {
                 let hovered_shape = if self.local_adjust_mask_tool == LocalAdjustMaskTool::Select
                     || self.local_adjust_selected_shape.is_some()
                 {
@@ -9061,6 +9648,82 @@ impl App {
                 let point = to_screen(self.local_adjust_mask_lasso_points[0]);
                 painter.circle_filled(point, 4.0, egui::Color32::from_rgb(255, 245, 120));
                 painter.circle_stroke(point, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
+            }
+
+            if self.local_adjust_mask_tool == LocalAdjustMaskTool::Polygon
+                && let Some(pointer) = ui.ctx().input(|i| i.pointer.hover_pos())
+                && let Some((scale, drawn_rect)) = shape_layout
+                && drawn_rect.contains(pointer)
+                && let Some(norm) =
+                    local_adjust_screen_to_norm(pointer, image_rect, image_dims, zoom_pan, true)
+            {
+                let (candidate, raw_candidate, snapping) = local_adjust_polygon_candidate_point(
+                    norm,
+                    image_dims,
+                    source_pixels.as_deref(),
+                    scale,
+                    ctrl_down,
+                    self.local_adjust_edge_snap_radius,
+                    self.local_adjust_boundary_edge_threshold.clamp(0.0, 255.0),
+                    self.local_adjust_boundary_ink_threshold.clamp(0.0, 255.0),
+                    self.local_adjust_boundary_gap_px.clamp(0.0, 8.0).round() as usize,
+                );
+                let candidate_screen = to_screen(candidate);
+                let raw_screen = to_screen(raw_candidate);
+                let color = if snapping {
+                    local_adjust_edge_overlay_color(ui.ctx(), 240)
+                } else {
+                    egui::Color32::from_rgb(255, 245, 120)
+                };
+                let guide_stroke = egui::Stroke::new(
+                    1.5,
+                    egui::Color32::from_rgba_unmultiplied(255, 245, 120, 190),
+                );
+                if let Some(&last) = self.local_adjust_mask_lasso_points.last() {
+                    painter.line_segment([to_screen(last), candidate_screen], guide_stroke);
+                }
+                if self.local_adjust_mask_lasso_points.len() >= 2 {
+                    painter.line_segment(
+                        [
+                            candidate_screen,
+                            to_screen(self.local_adjust_mask_lasso_points[0]),
+                        ],
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 105),
+                        ),
+                    );
+                }
+                if snapping {
+                    painter.circle_stroke(
+                        raw_screen,
+                        self.local_adjust_edge_snap_radius.max(2.0),
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90),
+                        ),
+                    );
+                    if candidate_screen.distance(raw_screen) > 1.5 {
+                        painter.line_segment(
+                            [raw_screen, candidate_screen],
+                            egui::Stroke::new(
+                                1.0,
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 125),
+                            ),
+                        );
+                    }
+                }
+                painter.circle_filled(candidate_screen, 5.0, color);
+                painter.circle_stroke(
+                    candidate_screen,
+                    5.0,
+                    egui::Stroke::new(1.0, egui::Color32::BLACK),
+                );
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(
+                        LOCAL_ADJUST_EDGE_OVERLAY_REPAINT_MS,
+                    ));
             }
 
             if let (Some(start), Some(end)) = (
@@ -9577,6 +10240,68 @@ impl App {
         let image_dims = local_adjust_image_dims(self, fs_idx);
         let layers = self.local_adjust_page_layers.get(&fs_idx)?;
         local_adjust_subject_mask_candidate_from_layers(layers, image_dims)
+    }
+
+    fn local_adjust_edge_preview_source_key(&self, fs_idx: usize) -> String {
+        self.page_path_key(fs_idx)
+            .or_else(|| self.perf_item_key(fs_idx))
+            .unwrap_or_else(|| format!("idx:{fs_idx}"))
+    }
+
+    fn ensure_local_adjust_edge_preview_texture(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        let source = self.current_local_adjust_source_pixels(fs_idx)?;
+        let preview_size = local_adjust_edge_preview_size(source.size[0], source.size[1]);
+        let edge_threshold = self
+            .local_adjust_boundary_edge_threshold
+            .clamp(0.0, 255.0)
+            .round() as u8;
+        let ink_threshold = self
+            .local_adjust_boundary_ink_threshold
+            .clamp(0.0, 255.0)
+            .round() as u8;
+        let gap_px = self.local_adjust_boundary_gap_px.clamp(0.0, 8.0).round() as u8;
+        let key = LocalAdjustEdgePreviewKey {
+            source_key: self.local_adjust_edge_preview_source_key(fs_idx),
+            input_gen: self.input_generation.get(&fs_idx).copied().unwrap_or(0),
+            erase_mask_gen: self
+                .erase_mask_generation
+                .get(&fs_idx)
+                .copied()
+                .unwrap_or(0),
+            source_size: source.size,
+            preview_size,
+            edge_threshold,
+            ink_threshold,
+            gap_px,
+        };
+        let rebuild = self
+            .local_adjust_edge_preview_cache
+            .as_ref()
+            .map(|cache| cache.key != key)
+            .unwrap_or(true);
+        if rebuild {
+            let image = build_local_adjust_edge_preview_image(
+                source.as_ref(),
+                preview_size,
+                edge_threshold,
+                ink_threshold,
+                gap_px,
+            );
+            let texture = ctx.load_texture(
+                format!("local_adjust_edge_preview_{fs_idx}"),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.local_adjust_edge_preview_cache =
+                Some(LocalAdjustEdgePreviewCache { key, texture });
+        }
+        self.local_adjust_edge_preview_cache
+            .as_ref()
+            .map(|cache| cache.texture.clone())
     }
 
     fn start_local_adjust_subject_segmentation(&mut self, fs_idx: usize, layer_idx: usize) {
@@ -10197,6 +10922,7 @@ impl App {
         let mut boundary_edge_threshold = self.local_adjust_boundary_edge_threshold;
         let mut boundary_ink_threshold = self.local_adjust_boundary_ink_threshold;
         let mut boundary_gap_px = self.local_adjust_boundary_gap_px;
+        let mut edge_snap_radius = self.local_adjust_edge_snap_radius;
         let mut edge_brush_tolerance = self.local_adjust_edge_brush_tolerance;
         let mut edge_brush_include_boundary = self.local_adjust_edge_brush_include_boundary;
         let mut region_color_tolerance = self.local_adjust_region_color_tolerance;
@@ -10442,6 +11168,7 @@ impl App {
                                         &mut boundary_edge_threshold,
                                         &mut boundary_ink_threshold,
                                         &mut boundary_gap_px,
+                                        &mut edge_snap_radius,
                                         &mut edge_brush_tolerance,
                                         &mut edge_brush_include_boundary,
                                         &mut region_color_tolerance,
@@ -10505,6 +11232,7 @@ impl App {
         self.local_adjust_boundary_edge_threshold = boundary_edge_threshold.clamp(0.0, 255.0);
         self.local_adjust_boundary_ink_threshold = boundary_ink_threshold.clamp(0.0, 255.0);
         self.local_adjust_boundary_gap_px = boundary_gap_px.clamp(0.0, 8.0);
+        self.local_adjust_edge_snap_radius = edge_snap_radius.clamp(2.0, 64.0);
         self.local_adjust_edge_brush_tolerance = edge_brush_tolerance.clamp(0.0, 255.0);
         self.local_adjust_edge_brush_include_boundary = edge_brush_include_boundary;
         self.local_adjust_region_color_tolerance = region_color_tolerance.clamp(4.0, 120.0);

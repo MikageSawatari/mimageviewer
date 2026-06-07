@@ -3696,6 +3696,19 @@ impl App {
         }
 
         if self.local_adjust_mode {
+            if self.local_adjust_mask_tool == crate::app::LocalAdjustMaskTool::Polygon
+                && !self.local_adjust_mask_lasso_points.is_empty()
+                && ctx.input(|i| {
+                    i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && !i.modifiers.shift
+                })
+            {
+                ctx.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::CTRL, egui::Key::Z);
+                });
+                self.local_adjust_mask_lasso_points.pop();
+                self.show_feedback_toast("多角形: 頂点を戻しました".to_string());
+                return action;
+            }
             self.handle_meta_undo_keys(ctx);
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Q)) {
                 self.local_adjust_show_source = !self.local_adjust_show_source;
@@ -3776,11 +3789,89 @@ impl App {
                     crate::app::LocalAdjustMaskTool::Ellipse,
                 );
             }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                && self.commit_local_adjust_polygon_from_shortcut(fs_idx)
+            {
+                self.show_feedback_toast("多角形マスクを確定しました".to_string());
+                ctx.request_repaint();
+                return action;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+                && self.delete_selected_local_adjust_shape_from_shortcut(fs_idx)
+            {
+                self.show_feedback_toast("図形マスクを削除しました".to_string());
+                ctx.request_repaint();
+                return action;
+            }
+            let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+            let step = if ctrl_held {
+                crate::ui_adjustment_panel::LOCAL_ADJUST_NUDGE_PIXELS_FAST
+            } else {
+                crate::ui_adjustment_panel::LOCAL_ADJUST_NUDGE_PIXELS
+            };
+            let (mut dx, mut dy) = (0.0_f32, 0.0_f32);
+            ctx.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft)
+                {
+                    dx -= step;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
+                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight)
+                {
+                    dx += step;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowUp)
+                {
+                    dy -= step;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowDown)
+                {
+                    dy += step;
+                }
+            });
+            if self.nudge_selected_local_adjust_shape_from_shortcut(fs_idx, dx, dy) {
+                ctx.request_repaint();
+                return action;
+            }
+            let rotate_step = if ctrl_held {
+                crate::ui_adjustment_panel::LOCAL_ADJUST_ROTATE_DEG_STEP_FAST
+            } else {
+                crate::ui_adjustment_panel::LOCAL_ADJUST_ROTATE_DEG_STEP
+            };
+            let mut rotate_deg = 0.0_f32;
+            ctx.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::OpenBracket)
+                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::OpenBracket)
+                {
+                    rotate_deg -= rotate_step;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::CloseBracket)
+                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::CloseBracket)
+                {
+                    rotate_deg += rotate_step;
+                }
+            });
+            if self.rotate_selected_local_adjust_shape_from_shortcut(
+                fs_idx,
+                rotate_deg.to_radians(),
+                ctx.input(|i| i.modifiers.shift),
+            ) {
+                ctx.request_repaint();
+                return action;
+            }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-                self.local_adjust_mode = false;
-                self.local_adjust_add_layer_dialog_open = false;
-                self.local_adjust_change_mask_dialog_open = false;
-                self.local_adjust_effect_picker_dialog_open = false;
+                if self.cancel_local_adjust_canvas_edit_from_shortcut() {
+                    self.show_feedback_toast("編集中の図形操作を解除しました".to_string());
+                    ctx.request_repaint();
+                } else {
+                    self.local_adjust_mode = false;
+                    self.local_adjust_add_layer_dialog_open = false;
+                    self.local_adjust_change_mask_dialog_open = false;
+                    self.local_adjust_effect_picker_dialog_open = false;
+                }
             }
             return action;
         }
