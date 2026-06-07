@@ -211,6 +211,63 @@ mod integration_tests {
     }
 
     #[test]
+    fn parallel_bake_rotated_objects_not_clipped() {
+        // Two ROTATED, effect-heavy text objects far apart → parallel path. Disjoint
+        // equality vs solo bakes catches any clipping of a rotated object's swung-out
+        // ink by its per-group buffer (the rotated-AABB local-pad case).
+        let Some(font) = load_test_font() else {
+            eprintln!("skip: no Windows JP font available");
+            return;
+        };
+        let mut fonts = FontSet::new();
+        fonts.insert(font);
+        let objs: Vec<AnnotationObject> = (0..2u64)
+            .map(|i| {
+                let t = TextBlock {
+                    text: "あ".to_string(),
+                    size_px: 80.0,
+                    outline: Some(StrokeStyle {
+                        color: Rgba::BLACK,
+                        width_px: 8.0,
+                    }),
+                    ..TextBlock::default()
+                };
+                let mut o = AnnotationObject::new_text(i + 1, (200.0 + i as f32 * 600.0, 220.0), t);
+                o.rotation_rad = 0.6; // ~34°
+                o
+            })
+            .collect();
+        let (w, h) = (1500usize, 520usize);
+        let combined = bake_overlay(&objs, w, h, &fonts);
+        let again = bake_overlay(&objs, w, h, &fonts);
+        // Same code path twice → bit-exact (parallel bake is deterministic).
+        assert_eq!(
+            combined.pixels, again.pixels,
+            "rotated parallel bake deterministic"
+        );
+        // vs solo bakes: rotation resamples (bilinear) at f32 coords that differ by an
+        // integer shift between the buffer-local and full-canvas bakes, so faint AA
+        // edges can differ by ±1 LSB — NOT bit-exact. What must hold is NO CLIPPING:
+        // the parallel path covers essentially the same ink as the per-object solo
+        // bakes into the full canvas. Compare covered-pixel counts (a clipped group
+        // buffer would drop a chunk of the rotated glyph).
+        let count_nz = |ov: &RgbaOverlay| ov.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+        let solo_total: usize = (0..2)
+            .map(|i| count_nz(&bake_overlay(&objs[i..i + 1], w, h, &fonts)))
+            .sum();
+        let combined_nz = count_nz(&combined);
+        assert!(
+            solo_total > 400,
+            "expected rotated glyph ink, got {solo_total}"
+        );
+        // Disjoint placement → combined ink ≈ Σ solo ink (allow a small AA-edge slack).
+        assert!(
+            combined_nz as f32 >= solo_total as f32 * 0.97,
+            "rotated ink clipped by group buffer: combined {combined_nz} vs solo {solo_total}"
+        );
+    }
+
+    #[test]
     fn vertical_columns_advance_right_to_left() {
         let Some(font) = load_test_font() else {
             eprintln!("skip: no Windows JP font available");

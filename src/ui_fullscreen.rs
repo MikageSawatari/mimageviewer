@@ -8776,6 +8776,13 @@ impl App {
             let Some(p) = self.comic_bake_pending.remove(&i) else {
                 continue;
             };
+            // フォルダ差し替え / 削除で items 世代が進んでいたら、この idx は別画像を指す可能性が
+            // あるので結果を捨てる (idx 使い回しによる誤 upload / 誤キャッシュ防止、Codex P1)。
+            // comic_gen / base は読み出し時 (ensure) の ptr_eq 照合でも守られるが、ここで弾けば
+            // 無駄な GPU upload と stale エントリ保持も避けられる。
+            if p.items_gen != self.items_generation {
+                continue;
+            }
             let composed = std::sync::Arc::new(r.pixels);
             let t_up = std::time::Instant::now();
             let upload = crate::app::clamp_for_gpu(&composed).into_owned();

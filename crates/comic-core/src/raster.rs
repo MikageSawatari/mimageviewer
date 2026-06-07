@@ -185,8 +185,14 @@ pub fn bake_overlay_with_stamps(
     // its OWN AABB-sized buffer in parallel, then composite the buffers back into
     // `overlay` in z (group) order. Objects are independent except for merge chains
     // (kept together in one group) and the z compositing order (preserved by the
-    // sequential composite below), so the parallel bake is order-independent and
-    // produces pixel-identical output to a sequential bake. Per-group buffers are
+    // sequential composite below), so the parallel bake is order-independent. For
+    // disjoint, unrotated, opaque groups the output is pixel-identical to a sequential
+    // bake (see `parallel_bake_matches_sequential_for_disjoint_objects`). Two cases
+    // differ by ±1 LSB and are accepted as imperceptible: (a) overlapping TRANSLUCENT
+    // groups (pre-compositing into an 8-bit buffer changes rounding order), and (b)
+    // ROTATED groups (bilinear resample runs at f32 coords shifted by the per-group
+    // buffer offset). Neither clips ink (covered area matches; see the rotated test).
+    // Per-group buffers are
     // sized to the object's effect-aware image AABB (the same extent the rotated
     // path already trusts), so memory is ~Σ(ink area), not N × full canvas.
     let baked: Vec<Option<(i32, i32, RgbaOverlay)>> = groups
@@ -287,6 +293,17 @@ fn object_image_aabb(obj: &AnnotationObject, fonts: &FontSet) -> Option<(f32, f3
     if obj.rotation_rad.abs() < 1e-4 {
         return Some((minx, miny, maxx, maxy));
     }
+    // Pad in LOCAL space before rotating, matching `bake_into` (which sizes its temp
+    // buffer to local_aabb + ROTATE_LOCAL_PAD then rotate-blits). If we rotated the
+    // unpadded bounds and padded only in screen space afterwards, a diagonal angle
+    // would project the local pad to >pad screen px and clip the rotated ink edge.
+    const ROTATE_LOCAL_PAD: f32 = 2.0;
+    let (minx, miny, maxx, maxy) = (
+        minx - ROTATE_LOCAL_PAD,
+        miny - ROTATE_LOCAL_PAD,
+        maxx + ROTATE_LOCAL_PAD,
+        maxy + ROTATE_LOCAL_PAD,
+    );
     let pivot = object_rotation_pivot(obj, fonts);
     let (sin, cos) = obj.rotation_rad.sin_cos();
     let rot = |x: f32, y: f32| -> (f32, f32) {

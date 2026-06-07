@@ -1794,6 +1794,9 @@ pub(crate) struct ComicBakeResult {
 pub(crate) struct ComicBakePending {
     /// 投入時の `comic_generation`。
     pub comic_gen: u64,
+    /// 投入時の `items_generation` (フォルダ差し替え / 削除で進む)。完了結果を取り込む前に
+    /// 現在値と照合し、別フォルダ等になっていたら破棄する (idx 使い回しによる誤挿入防止)。
+    pub items_gen: u64,
     /// 投入時の full-res 下地 (cache エントリの `base` に入れる。`Arc::ptr_eq` で同一性判定)。
     pub base: Arc<egui::ColorImage>,
     /// full base 寸法 (cache の `dims`)。
@@ -1803,8 +1806,21 @@ pub(crate) struct ComicBakePending {
     /// worker 投入時刻。軽い注釈 (高速ベイク) でトーストが一瞬チラつかないよう、一定時間
     /// 以上かかっているベイクだけトーストを出すために使う。
     pub started: std::time::Instant,
+    /// stale 化フラグ (編集 / 下地再構築 / ナビ / 無効化で立てる)。worker は段階ごとに見て、
+    /// 立っていれば残りの合成 / 送信をスキップする (in-flight CPU の早期打ち切り)。
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
     /// 合成済みピクセルの受信口。
     pub rx: std::sync::mpsc::Receiver<ComicBakeResult>,
+}
+
+/// 走行中の注釈ベイク worker を数える RAII ガード。worker 本体の先頭で生成し、return /
+/// panic のいずれでも Drop で必ずカウントを戻す。これにより同時走行数を **実際の走行数**で
+/// 制限でき、stale で pending から外した orphan worker も正しく数に含まれる (Codex P1)。
+struct ComicBakeInflightGuard(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for ComicBakeInflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// テキスト注釈のキャンバス上ドラッグの種別 (Inc 6 変形ハンドル)。
@@ -4152,6 +4168,11 @@ pub struct App {
     /// バックグラウンドへ。UI は下地 (注釈なし) を表示し続け、`poll_comic_bake` が完了を取り込む。
     /// 同時数は見開き想定で 2 までに制限。
     pub(crate) comic_bake_pending: std::collections::HashMap<usize, ComicBakePending>,
+    /// 実際に走行中の注釈ベイク worker 数 (orphan 含む)。`ComicBakeInflightGuard` が Drop で
+    /// 戻す。新規投入はこの値が上限未満のときだけ行う (= 連続編集で worker が無制限に増えるのを
+    /// 防ぐ、Codex P1)。`comic_bake_pending.len()` は pending エントリ数で、stale 化して外した
+    /// 走行中 worker を数えないため、こちらを cap に使う。`Arc` で worker と共有する。
+    pub(crate) comic_bake_inflight: Arc<std::sync::atomic::AtomicUsize>,
     /// 注釈編集の世代番号 (Inc 2 以降で編集確定ごとに +1)。`comic_cache` の各 entry は
     /// この値と照合され、不一致なら miss 扱い (conceal_generation と同じ lazy eviction)。
     pub(crate) comic_generation: u64,
@@ -5391,6 +5412,7 @@ impl App {
             comic_cache: std::collections::HashMap::new(),
             comic_preview_base: None,
             comic_bake_pending: std::collections::HashMap::new(),
+            comic_bake_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             comic_generation: 0,
             comic_fonts: None,
             comic_fonts_loaded: false,
@@ -10673,6 +10695,7 @@ impl App {
         self.conceal_base_cache.clear();
         self.conceal_cache.clear();
         self.comic_cache.clear();
+        self.cancel_all_comic_bakes();
         self.fs_early_dims.clear();
         self.fs_cache.clear();
         self.fs_margin_bbox_cache.clear();
@@ -18374,6 +18397,7 @@ impl App {
         self.conceal_base_cache.clear();
         self.conceal_cache.clear();
         self.comic_cache.clear();
+        self.cancel_all_comic_bakes();
         self.erase_result_cache.clear();
         self.edit_result_cache.clear();
         self.clear_all_final_pipeline_caches();
@@ -19910,6 +19934,8 @@ impl App {
             .retain(|key, _| key.edit_key.idx != idx);
         // comic は final composite を下地にするので連動破棄 (base_ptr の ABA 回避)。
         self.comic_cache.remove(&idx);
+        // 進行中の comic ベイク worker も cancel (stale 結果の upload を防ぐ、Codex P1)。
+        self.cancel_comic_bake_for_idx(idx);
     }
 
     fn clear_all_final_pipeline_caches(&mut self) {
@@ -19921,6 +19947,7 @@ impl App {
         self.final_ai_failed.clear();
         self.final_composite_cache.clear();
         self.comic_cache.clear();
+        self.cancel_all_comic_bakes();
     }
 
     /// 補正レイヤーが変わったことを idx 単位の世代で表す。
@@ -21700,12 +21727,18 @@ impl App {
                 ctx.request_repaint();
                 return None;
             }
-            // 条件が変わった (注釈編集 / 下地再構築 / 倍率変更) → 破棄して下で再投入。
-            self.comic_bake_pending.remove(&idx);
+            // 条件が変わった (注釈編集 / 下地再構築 / 倍率変更) → cancel して破棄し下で再投入。
+            // cancel を立てることで orphan worker は残作業をスキップして inflight を早く戻す。
+            self.cancel_comic_bake_for_idx(idx);
         }
-        // 同時ベイク数を抑える (見開き = 2 を想定)。埋まっていれば次フレームに回す
-        // (連打ナビで worker が大量に積み上がるのを防ぐ)。
-        if self.comic_bake_pending.len() >= 2 {
+        // 同時ベイク数を抑える (見開き = 2 を想定)。**走行中 worker 数** (orphan 含む) で
+        // 上限判定する — pending.len() だと stale で外した走行中 worker を数えず、連続編集で
+        // worker が無制限に積み上がる (Codex P1)。埋まっていれば次フレームに回す。
+        if self
+            .comic_bake_inflight
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 2
+        {
             ctx.request_repaint();
             return None;
         }
@@ -21778,9 +21811,22 @@ impl App {
         let fonts_worker = Arc::clone(&fonts);
         let base_worker = Arc::clone(&bake_base);
         let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
+        // inflight を投入前に +1。worker は先頭で RAII ガードを取り、return / panic いずれでも
+        // Drop で -1 する (= 実走行数を正確に保ち cap を効かせる、Codex P1)。
+        self.comic_bake_inflight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let inflight = Arc::clone(&self.comic_bake_inflight);
         std::thread::Builder::new()
             .name("comic-bake".into())
             .spawn(move || {
+                let _guard = ComicBakeInflightGuard(inflight);
+                use std::sync::atomic::Ordering::Relaxed;
+                // stale (ナビ / 編集 / 無効化) なら段階ごとに早期離脱して in-flight CPU を節約。
+                if cancel_worker.load(Relaxed) {
+                    return;
+                }
                 let scaled = if (s_bake - 1.0).abs() > 1e-4 {
                     comic_core::scale_scene(&objects, s_bake)
                 } else {
@@ -21795,9 +21841,15 @@ impl App {
                     &stamp_images,
                 );
                 let bake_ms = t_bake.elapsed().as_secs_f64() * 1000.0;
+                if cancel_worker.load(Relaxed) {
+                    return;
+                }
                 let t_comp = std::time::Instant::now();
                 let composed = crate::comic_overlay::composite_overlay_over(&base_worker, &overlay);
                 let composite_ms = t_comp.elapsed().as_secs_f64() * 1000.0;
+                if cancel_worker.load(Relaxed) {
+                    return;
+                }
                 // rx が drop 済み (stale 破棄) なら send は失敗するだけ (worker は完走する)。
                 let _ = tx.send(crate::app::ComicBakeResult {
                     pixels: composed,
@@ -21813,15 +21865,33 @@ impl App {
             idx,
             ComicBakePending {
                 comic_gen,
+                items_gen: self.items_generation,
                 base: Arc::clone(&base),
                 dims: [w, h],
                 preview_scale,
                 started: std::time::Instant::now(),
+                cancel,
                 rx,
             },
         );
         ctx.request_repaint();
         None
+    }
+
+    /// 進行中の注釈ベイク worker をすべて cancel + 破棄する (orphan worker は残作業をスキップし、
+    /// Drop で inflight を戻す)。`comic_cache` を広く無効化する箇所 (フォルダ読み込み /
+    /// フルスクリーン終了 / final パイプライン全 clear) で呼び、stale 結果の upload を防ぐ。
+    pub(crate) fn cancel_all_comic_bakes(&mut self) {
+        for (_, p) in self.comic_bake_pending.drain() {
+            p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 特定 idx の進行中ベイクを cancel + 破棄する (注釈編集 / 下地再構築 / 倍率変更時)。
+    pub(crate) fn cancel_comic_bake_for_idx(&mut self, idx: usize) {
+        if let Some(p) = self.comic_bake_pending.remove(&idx) {
+            p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// `comic_cache` の現エントリのテクスチャを副作用なしで返す (holdover / display-tex
