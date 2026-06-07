@@ -15185,7 +15185,9 @@ impl App {
         }
 
         if ctrl_v {
-            if let Some(folder) = self.current_favorite_target() {
+            // 検索結果ビュー中はペースト無効 (検索前の実フォルダへ誤って貼り付けない)。
+            let in_search = self.global_search.active || self.favsearch.active;
+            if !in_search && let Some(folder) = self.current_favorite_target() {
                 let rx = crate::ui_dialogs::context_menu::paste_files_from_clipboard(&folder);
                 self.paste_pending.push(rx);
             }

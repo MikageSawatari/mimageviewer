@@ -8573,9 +8573,10 @@ mod file_operation_selection_tests {
     }
 
     #[test]
-    fn checked_file_operation_paths_include_real_folders_and_files_and_skip_virtual_pages() {
+    fn checked_file_operation_paths_skip_folders_and_virtual_pages() {
         let mut app = setup_app();
 
+        // フォルダは整理対象外 (v1.1.0 で一旦無効化) なので checked に入れても除外される。
         let folder = push_item(&mut app, GridItem::Folder(PathBuf::from(r"C:\books")));
         let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
         let video = push_item(&mut app, GridItem::Video(PathBuf::from(r"C:\books\a.mp4")));
@@ -8619,7 +8620,6 @@ mod file_operation_selection_tests {
         assert_eq!(
             paths,
             vec![
-                PathBuf::from(r"C:\books"),
                 PathBuf::from(r"C:\books\a.7z"),
                 PathBuf::from(r"C:\books\a.jpg"),
                 PathBuf::from(r"C:\books\a.mp4"),
@@ -8637,9 +8637,8 @@ mod file_operation_selection_tests {
                 (zip, PathBuf::from(r"C:\books\a.zip")),
                 (video, PathBuf::from(r"C:\books\a.mp4")),
                 (image, PathBuf::from(r"C:\books\a.jpg")),
-                (folder, PathBuf::from(r"C:\books")),
             ],
-            "delete targets are sorted by descending index and exclude virtual pages",
+            "delete targets are sorted by descending index and exclude folders + virtual pages",
         );
     }
 }

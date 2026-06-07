@@ -195,15 +195,17 @@ impl GridItem {
         }
     }
 
-    /// ファイル整理系の操作 (コピー / カット / 削除) の対象になる実パス。
+    /// ファイル整理系の操作 (コピー / カット / 削除) の対象になる実ファイルのパス。
     ///
-    /// フォルダ・画像・動画・ZIP/PDF 本体・変換前アーカイブはディスク上に
-    /// 実体があるため、Explorer と同じく整理対象にする。ZIP/PDF 内ページなど
-    /// 仮想フォルダ内アイテムは独立した実パスを持たないため対象外。
+    /// 画像・動画・ZIP/PDF 本体・変換前アーカイブはディスク上に実体があるため整理対象。
+    /// **フォルダは対象外** — OS / エクスプローラ側で扱う領分にする。v1.1.0 でフォルダの
+    /// コピー/カット/ペーストを試みたが、ペーストの同名衝突・自己再帰・データ破壊リスクが
+    /// 大きく、Explorer 相当の衝突解決 (確認/リネーム/skip) と合わせて将来再導入する方針で
+    /// 一旦無効化した。ZIP/PDF 内ページなど仮想フォルダ内アイテムは独立した実パスを
+    /// 持たないため対象外。
     pub fn file_operation_path(&self) -> Option<&Path> {
         match self {
-            Self::Folder(p)
-            | Self::Image(p)
+            Self::Image(p)
             | Self::Video(p)
             | Self::ZipFile(p)
             | Self::PdfFile(p)
@@ -235,8 +237,8 @@ impl GridItem {
 
     /// チェックボックスで選択できるアイテムか。
     ///
-    /// 画像・動画・フォルダ・ZIP/PDF 本体・変換前アーカイブに加えて、
-    /// ZIP/PDF 内ページもページ操作用に対象にする。ZIP セパレータ・
+    /// 画像・動画・ZIP/PDF 本体・変換前アーカイブに加えて、ZIP/PDF 内ページも
+    /// ページ操作用に対象にする。**フォルダ** (整理対象外)・ZIP セパレータ・
     /// 検索集約コンテナは対象外。
     pub fn is_checkable(&self) -> bool {
         self.file_operation_path().is_some()
@@ -399,8 +401,9 @@ mod tests {
     }
 
     #[test]
-    fn checkable_includes_real_folders_and_files() {
-        assert!(GridItem::Folder(PathBuf::from(r"C:\books")).is_checkable());
+    fn checkable_includes_real_files_except_folders() {
+        // フォルダは整理対象外 (v1.1.0 で一旦無効化、将来 Explorer 相当の衝突解決と再導入)。
+        assert!(!GridItem::Folder(PathBuf::from(r"C:\books")).is_checkable());
         assert!(GridItem::Image(PathBuf::from(r"C:\books\a.jpg")).is_checkable());
         assert!(GridItem::Video(PathBuf::from(r"C:\books\a.mp4")).is_checkable());
         assert!(GridItem::ZipFile(PathBuf::from(r"C:\books\a.zip")).is_checkable());
@@ -445,14 +448,12 @@ mod tests {
     }
 
     #[test]
-    fn file_operation_path_is_for_real_folders_and_files() {
-        let folder = GridItem::Folder(PathBuf::from(r"C:\books"));
-        assert_eq!(
-            folder
+    fn file_operation_path_is_only_for_movable_files() {
+        // フォルダは整理対象外 (v1.1.0 で一旦無効化)。
+        assert!(
+            GridItem::Folder(PathBuf::from(r"C:\books"))
                 .file_operation_path()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str()),
-            Some("books")
+                .is_none()
         );
         assert!(
             GridItem::ZipImage {

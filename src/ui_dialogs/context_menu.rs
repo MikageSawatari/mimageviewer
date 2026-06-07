@@ -281,7 +281,13 @@ impl crate::app::App {
         let mut nav: Option<ContextMenuAction> = None;
         // 検索結果ビュー中だけ「フォルダに移動」を出す。
         let in_search = self.global_search.active || self.favsearch.active;
-        let paste_target = self.current_favorite_target();
+        // 検索結果ビュー中はペースト無効 (外部 D&D と同じく検索前の実フォルダへ誤って
+        // 貼り付けないようにする。keymap-spec でも検索結果では無効)。
+        let paste_target = if in_search {
+            None
+        } else {
+            self.current_favorite_target()
+        };
         let mut close = false;
 
         // 記録済みの座標に固定表示
@@ -1446,26 +1452,23 @@ fn set_rgba_to_clipboard(width: u32, height: u32, rgba: &[u8], my_seq: u64) {
 /// PowerShell 起動 + Shell clipboard I/O が数百ms〜秒級になることがあるため、worker で走らせる。
 /// 戻り値は「ペースト完了」を 1 回通知する `mpsc::Receiver`。App は pending に積み、
 /// 完了したらフォルダを再読込する (docs/ui-responsiveness.md §4)。
-/// クリップボード上のファイル / フォルダを `dest_folder` へ貼り付ける (Ctrl+V / 右クリック)。
+/// クリップボード上のファイルを `dest_folder` へ貼り付ける (Ctrl+V / 右クリック)。
 ///
-/// フォルダがコピー / カット対象に含まれるようになった (v1.1.0) ため、外部 D&D 経路
-/// ([`copy_paths_into_folder`]) と同じデータ安全策を備える:
-/// - **自己再帰ガード**: フォルダを自身 / その部分木へ貼り付けようとしたら skip
-///   (`Copy-Item -Recurse` が `A\B\A\B\...` と暴走するのを防ぐ)。同じ場所へのコピーも skip。
-/// - **失敗の可視化**: per-item try/catch + `-ErrorAction Stop` で失敗を数え、`CopyOutcome`
+/// **フォルダは対象外** — v1.1.0 で一旦フォルダのクリップボード貼り付けを無効化した
+/// (同名衝突の無確認上書き・自己再帰によるデータ破壊リスクが大きく、Explorer 相当の
+/// 衝突解決 (確認/リネーム/skip) と合わせて将来再導入する方針)。クリップボードにフォルダが
+/// 含まれていても (例: エクスプローラでフォルダをコピー) ディレクトリは全て skip し、
+/// ファイルだけを処理する。これで貼り付け元がどこであれフォルダ再帰コピーの事故を防ぐ。
+///
+/// データ安全策:
+/// - **失敗の可視化**: per-item try/catch + `-ErrorAction Stop` で失敗を数え `CopyOutcome`
 ///   で返す (旧実装は `Receiver<()>` で成功 / 失敗を区別できず黙って握りつぶしていた)。
-/// - **clipboard clear はカット成功時のみ**: 失敗 / skip が 1 件でもあれば clipboard を
-///   消さない (= 部分失敗したカットをユーザーが再試行できる)。
+/// - **clipboard clear はカット成功時のみ**: 失敗 / skip が 1 件でもあれば消さない
+///   (= 部分失敗したカットを再試行できる)。
+/// - **同じ場所へのコピーは skip** (ファイルを自身の上へ `-Force` コピーする自己衝突を回避)。
 ///
-/// 同名フォルダが既存の場合は `-Force` でマージ上書きする (D&D 経路と同挙動)。
-///
-/// 既知の制限: 自己再帰ガードは `GetFullPath` の文字列前方一致で判定する。dest が
-/// junction / symlink で物理的に src 配下を指す場合は文字列上は前方一致せず素通りしうる
-/// (PowerShell 5.1 では reparse point の最終ターゲット解決が容易でないため)。その場合でも
-/// `Copy-Item -Recurse` は MAX_PATH 等で頭打ちになり `-ErrorAction Stop` で失敗として
-/// 報告される (無限/無言にはならない)。D&D 経路の `dir_copy_would_recurse` は canonicalize
-/// 済みで完全。完全一致が必要になれば paste も Rust 側で clipboard を読んで canonicalize
-/// するよう寄せる。
+/// 既知の制限 (ファイル): コピー先に同名ファイルが既存だと `-Force` で無確認上書きする
+/// (v0.9.0 以来の既存挙動)。フォルダ対応と合わせて将来 衝突解決 UI を入れる予定。
 pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiver<CopyOutcome> {
     let (tx, rx) = mpsc::channel();
     #[cfg(windows)]
@@ -1494,16 +1497,15 @@ pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiv
             \x20 $attempted++\n\
             \x20 try {{\n\
             \x20   $srcFull = ([System.IO.Path]::GetFullPath($f)).TrimEnd($sep)\n\
-            \x20   $isDir = [System.IO.Directory]::Exists($srcFull)\n\
-            \x20   $srcParent = [System.IO.Path]::GetDirectoryName($srcFull)\n\
-            \x20   if ($isDir -and ($destFull -ieq $srcFull -or $destFull.StartsWith($srcFull + $sep, [System.StringComparison]::OrdinalIgnoreCase))) {{\n\
-            \x20     $skipped++; if ($errs.Count -lt 5) {{ [void]$errs.Add(\"フォルダを自身の中へは貼り付けできません: $f\") }}; continue\n\
+            \x20   if ([System.IO.Directory]::Exists($srcFull)) {{\n\
+            \x20     $skipped++; if ($errs.Count -lt 5) {{ [void]$errs.Add(\"フォルダの貼り付けは現在無効です: $f\") }}; continue\n\
             \x20   }}\n\
+            \x20   $srcParent = [System.IO.Path]::GetDirectoryName($srcFull)\n\
             \x20   if ($srcParent -ne $null -and ($srcParent -ieq $destFull)) {{\n\
             \x20     $skipped++; if (-not $isMove -and $errs.Count -lt 5) {{ [void]$errs.Add(\"同じ場所へはコピーできません: $f\") }}; continue\n\
             \x20   }}\n\
             \x20   if ($isMove) {{ Move-Item -LiteralPath $f -Destination $dest -Force -ErrorAction Stop }}\n\
-            \x20   else {{ Copy-Item -LiteralPath $f -Destination $dest -Force -Recurse -ErrorAction Stop }}\n\
+            \x20   else {{ Copy-Item -LiteralPath $f -Destination $dest -Force -ErrorAction Stop }}\n\
             \x20 }} catch {{\n\
             \x20   $failed++; if ($errs.Count -lt 5) {{ [void]$errs.Add(\"$($_.Exception.Message): $f\") }}\n\
             \x20 }}\n\
