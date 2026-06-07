@@ -257,6 +257,72 @@ fn copy_target_inside_src(src: &Path, dest: &Path) -> bool {
     lower(&target).starts_with(lower(src))
 }
 
+/// 外部ドロップされたパス群を「コピー対象 (ファイル)」と「skip したフォルダ数」に分ける。
+///
+/// **フォルダのドロップ受け取りは v1.1.0 で一旦無効化**したため、ディレクトリは全て
+/// 除外する (同名衝突の無確認上書き・再帰コピーのデータ破壊リスクのため。将来 Explorer
+/// 相当の衝突解決と合わせて再導入する)。`is_dir` を注入可能にしてユニットテストしやすく
+/// する (実利用では `|p| p.is_dir()`)。`App::handle_external_file_drop` の worker で使う。
+pub fn partition_dropped_paths(
+    paths: Vec<PathBuf>,
+    mut is_dir: impl FnMut(&Path) -> bool,
+) -> (Vec<PathBuf>, usize) {
+    let mut files = Vec::with_capacity(paths.len());
+    let mut folders_skipped = 0usize;
+    for p in paths {
+        if is_dir(&p) {
+            folders_skipped += 1;
+        } else {
+            files.push(p);
+        }
+    }
+    (files, folders_skipped)
+}
+
+#[cfg(test)]
+mod partition_dropped_paths_tests {
+    use super::partition_dropped_paths;
+    use std::path::PathBuf;
+
+    #[test]
+    fn skips_all_directories_keeps_files_in_order() {
+        let paths = vec![
+            PathBuf::from(r"C:\books\a.jpg"),
+            PathBuf::from(r"C:\books\sub"),
+            PathBuf::from(r"C:\books\b.png"),
+            PathBuf::from(r"C:\books\dir2"),
+        ];
+        let dirs = [r"C:\books\sub", r"C:\books\dir2"];
+        let (files, skipped) =
+            partition_dropped_paths(paths, |p| dirs.contains(&p.to_string_lossy().as_ref()));
+        assert_eq!(skipped, 2, "両ディレクトリを skip する");
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from(r"C:\books\a.jpg"),
+                PathBuf::from(r"C:\books\b.png"),
+            ],
+            "ファイルだけが順序を保って残る"
+        );
+    }
+
+    #[test]
+    fn all_files_pass_through() {
+        let paths = vec![PathBuf::from("a.jpg"), PathBuf::from("b.png")];
+        let (files, skipped) = partition_dropped_paths(paths.clone(), |_| false);
+        assert_eq!(skipped, 0);
+        assert_eq!(files, paths);
+    }
+
+    #[test]
+    fn all_folders_yield_empty_with_count() {
+        let paths = vec![PathBuf::from("d1"), PathBuf::from("d2")];
+        let (files, skipped) = partition_dropped_paths(paths, |_| true);
+        assert!(files.is_empty());
+        assert_eq!(skipped, 2);
+    }
+}
+
 #[cfg(all(test, windows))]
 mod shell_parse_path_tests {
     use super::shell_parse_wide_path;

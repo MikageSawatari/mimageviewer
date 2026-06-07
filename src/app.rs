@@ -11319,9 +11319,10 @@ impl App {
     /// まま残すため、それだけだと「直前のフォルダ」へ誤コピーしてしまう。検索結果
     /// 表示中は明示的に拒否する (Codex P2)。
     ///
-    /// ドロップされたディレクトリが表示中フォルダの祖先 / 自身だと `Copy-Item -Recurse`
-    /// が生成中のフォルダを再走査して無限再帰になる。該当ディレクトリはコピー対象から
-    /// 除外する (Codex P1、`file_drag::dir_copy_would_recurse`)。
+    /// **フォルダのドロップ受け取りは v1.1.0 で一旦無効化** — 同名衝突の無確認上書き・
+    /// 再帰コピーのデータ破壊リスクのため、Explorer 相当の衝突解決と合わせて将来へ延期。
+    /// ドロップされたディレクトリは全て skip し (notice で通知)、ファイルのみコピーする。
+    /// 再有効化時の自己再帰ガードは `file_drag::dir_copy_would_recurse` を流用する。
     ///
     /// 完了時のフォルダ再読み込みは `poll_paste_pending` が `pending_reload` を立てて行う。
     pub(crate) fn handle_external_file_drop(&mut self, paths: Vec<PathBuf>) {
@@ -11359,27 +11360,22 @@ impl App {
         let spawn_result = std::thread::Builder::new()
             .name("file-drop-validate".into())
             .spawn(move || {
-                let mut to_copy: Vec<PathBuf> = Vec::with_capacity(paths.len());
-                let mut recursive_skipped = 0usize;
-                for p in paths {
-                    if p.is_dir() && crate::file_drag::dir_copy_would_recurse(&p, &dest_for_worker)
-                    {
-                        recursive_skipped += 1;
-                    } else {
-                        to_copy.push(p);
-                    }
-                }
+                // フォルダのドロップ受け取りは v1.1.0 で一旦無効化 (同名衝突の無確認
+                // 上書き・再帰コピーのデータ破壊リスクのため、Explorer 相当の衝突解決と
+                // 合わせて将来へ延期)。ディレクトリは skip しファイルのみコピーする。
+                let (to_copy, folder_skipped) =
+                    crate::file_drag::partition_dropped_paths(paths, |p| p.is_dir());
                 if to_copy.is_empty() {
                     crate::logger::log(format!(
-                        "file_drop: all {recursive_skipped} paths excluded (self-recurse); nothing to copy"
+                        "file_drop: all {folder_skipped} dropped paths are folders; folder drop is disabled"
                     ));
-                    // **Codex P2-2 対応**: 全件除外で実コピーが走らなかった旨を
-                    // notice 経由で UI へ伝える。旧実装は `CopyOutcome::default()`
-                    // (failed=0) で送って poll が何も表示しなかったため、ユーザーは
-                    // 「コピーしています…」トーストの後に拒否理由を見られなかった。
-                    let notice = format!(
-                        "ドロップ先と重なる {recursive_skipped} 件を除外した結果、コピー対象が 0 件になりました"
-                    );
+                    let notice = if folder_skipped > 0 {
+                        format!(
+                            "フォルダのドロップは現在無効です ({folder_skipped} 件をスキップ)。ファイルのみコピーできます"
+                        )
+                    } else {
+                        "コピー対象がありませんでした".to_string()
+                    };
                     let _ = tx.send(crate::ui_dialogs::context_menu::CopyOutcome {
                         attempted: 0,
                         failed: 0,
@@ -11388,9 +11384,9 @@ impl App {
                     });
                     return;
                 }
-                if recursive_skipped > 0 {
+                if folder_skipped > 0 {
                     crate::logger::log(format!(
-                        "file_drop: {recursive_skipped} self-recursing dirs excluded; copying {} entries",
+                        "file_drop: {folder_skipped} folders skipped (folder drop disabled); copying {} files",
                         to_copy.len()
                     ));
                 }
@@ -11404,13 +11400,20 @@ impl App {
                 // 死んだ) を `CopyOutcome::default()` (= failed=0 の成功扱い) に潰さず、
                 // 全件失敗として伝える。実コピーが起きていない可能性が高い局面でも
                 // 「成功 N / 失敗 0」と表示されていた旧バグの修正。
-                let outcome = match copy_rx.recv() {
+                let mut outcome = match copy_rx.recv() {
                     Ok(o) => o,
                     Err(e) => crate::ui_dialogs::context_menu::CopyOutcome::all_failed(
                         to_copy_attempted,
                         format!("copy worker disconnected without sending outcome: {e}"),
                     ),
                 };
+                // ファイル + フォルダ混在ドロップで、ファイルのコピーは成功したが
+                // フォルダを skip した旨も通知する (copy 側 notice が無いときだけ上書き)。
+                if folder_skipped > 0 && outcome.notice.is_none() {
+                    outcome.notice = Some(format!(
+                        "フォルダ {folder_skipped} 件はスキップしました (フォルダのドロップは現在無効です)"
+                    ));
+                }
                 let _ = tx.send(outcome);
             });
         if let Err(e) = spawn_result {
@@ -15185,9 +15188,11 @@ impl App {
         }
 
         if ctrl_v {
-            // 検索結果ビュー中はペースト無効 (検索前の実フォルダへ誤って貼り付けない)。
-            let in_search = self.global_search.active || self.favsearch.active;
-            if !in_search && let Some(folder) = self.current_favorite_target() {
+            // 検索結果グリッド表示中はペースト無効 (D&D と同じ判定。検索前の実フォルダへ
+            // 誤って貼り付けない)。検索から実フォルダを開いた後は有効に戻る。
+            let on_search_results =
+                self.items_are_global_search_view || self.favsearch.on_results_grid();
+            if !on_search_results && let Some(folder) = self.current_favorite_target() {
                 let rx = crate::ui_dialogs::context_menu::paste_files_from_clipboard(&folder);
                 self.paste_pending.push(rx);
             }

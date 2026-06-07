@@ -281,9 +281,13 @@ impl crate::app::App {
         let mut nav: Option<ContextMenuAction> = None;
         // 検索結果ビュー中だけ「フォルダに移動」を出す。
         let in_search = self.global_search.active || self.favsearch.active;
-        // 検索結果ビュー中はペースト無効 (外部 D&D と同じく検索前の実フォルダへ誤って
-        // 貼り付けないようにする。keymap-spec でも検索結果では無効)。
-        let paste_target = if in_search {
+        // ペーストは「検索結果グリッドを表示中」だけ無効化する (外部 D&D と同じ判定)。
+        // 検索前の実フォルダへ誤って貼り付けないため。検索から実フォルダを開いた後は
+        // current_favorite_target が確定するのでペースト可に戻す (`active` ではなく
+        // on-results-grid で判定する点が重要)。
+        let on_search_results =
+            self.items_are_global_search_view || self.favsearch.on_results_grid();
+        let paste_target = if on_search_results {
             None
         } else {
             self.current_favorite_target()
@@ -467,16 +471,8 @@ impl crate::app::App {
                                 copy_path_text(ctx, p);
                                 close = true;
                             }
-                            if !is_folder_context {
-                                if ui.button("コピー").clicked() {
-                                    copy_files_to_clipboard(&[p.clone()]);
-                                    close = true;
-                                }
-                                if ui.button("カット").clicked() {
-                                    cut_files_to_clipboard(&[p.clone()]);
-                                    close = true;
-                                }
-                            }
+                            // フォルダのコピー / カット (クリップボード経由) は v1.1.0 で一旦
+                            // 無効化 (データ破壊リスクのため将来へ延期)。ここには出さない。
                             let open_label = if is_folder_context {
                                 "このフォルダを開く"
                             } else {
@@ -496,21 +492,19 @@ impl crate::app::App {
                                 close = true;
                             }
                             ui.separator();
-                            if is_folder_context {
-                                if ui
+                            // フォルダのカット/削除 (整理操作) も v1.1.0 で一旦無効化。
+                            // 背景 (現在フォルダ) コンテキストでは「新しいフォルダ」のみ出す。
+                            if is_folder_context
+                                && ui
                                     .add_enabled(
                                         paste_target.is_some(),
                                         egui::Button::new("新しいフォルダ…"),
                                     )
                                     .clicked()
-                                {
-                                    if let Some(folder) = paste_target.clone() {
-                                        self.request_new_folder_dialog(folder);
-                                    }
-                                    close = true;
+                            {
+                                if let Some(folder) = paste_target.clone() {
+                                    self.request_new_folder_dialog(folder);
                                 }
-                            } else if ui.button("削除 (ゴミ箱)").clicked() {
-                                self.request_delete_confirm(vec![(idx, p.clone())]);
                                 close = true;
                             }
                             if ui
