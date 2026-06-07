@@ -1146,6 +1146,7 @@ name = "comic-core"
 version = "0.1.0"
 dependencies = [
  "ab_glyph_rasterizer",
+ "rayon",
  "rustybuzz",
  "self_cell",
  "serde",

@@ -52,13 +52,21 @@ type RbFace<'a> = Face<'a>;
 /// prefix so two fonts never collide (the per-bake cache is shared across fonts).
 static FONT_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// Bumped by [`reset_glyph_cache`] at the start of each overlay bake. Each
+/// thread's [`GLYPH_CACHE`] lazily clears itself when its stored generation no
+/// longer matches this, so the cache is reset across ALL threads (incl. rayon
+/// worker threads used by the per-object parallel bake) without touching their
+/// thread-locals directly. Memory stays bounded to ~one page's glyphs per thread.
+static GLYPH_CACHE_GEN: AtomicU64 = AtomicU64::new(1);
+
 /// Per-bake glyph coverage cache (thread-local). Memoizes the expensive outline
 /// scan-conversion (`base`) and the dilated halos (`dilated`) so every repeated
-/// glyph, effect pass, and text block within one bake reuses the result. Cleared
-/// by [`reset_glyph_cache`] at the start of each overlay bake, so memory stays
-/// bounded to roughly one page's glyphs.
+/// glyph, effect pass, and text block within one bake reuses the result. `gen`
+/// tracks which bake generation the entries belong to; a mismatch with
+/// `GLYPH_CACHE_GEN` clears them (see [`sync_glyph_cache_gen`]).
 #[derive(Default)]
 struct GlyphCache {
+    generation: u64,
     base: HashMap<(u64, u16, u32), Arc<GlyphBitmap>>,
     dilated: HashMap<(u64, u16, u32, u32), Arc<GlyphBitmap>>,
 }
@@ -67,14 +75,24 @@ thread_local! {
     static GLYPH_CACHE: RefCell<GlyphCache> = RefCell::new(GlyphCache::default());
 }
 
-/// Clear the per-bake glyph cache. Called at the start of every overlay bake
-/// (`bake_overlay_with_stamps`) so the cache does not accumulate across pages.
-pub fn reset_glyph_cache() {
-    GLYPH_CACHE.with(|c| {
-        let mut c = c.borrow_mut();
+/// Clear this thread's glyph cache if it belongs to an older bake generation.
+/// Called under the cache borrow before every lookup/insert.
+#[inline]
+fn sync_glyph_cache_gen(c: &mut GlyphCache) {
+    let g = GLYPH_CACHE_GEN.load(Ordering::Relaxed);
+    if c.generation != g {
         c.base.clear();
         c.dilated.clear();
-    });
+        c.generation = g;
+    }
+}
+
+/// Start a fresh glyph-cache generation. Called at the start of every overlay
+/// bake (`bake_overlay_with_stamps`). Does not touch any thread-local directly;
+/// each thread clears lazily via [`sync_glyph_cache_gen`] on its next access, so
+/// rayon worker threads are reset correctly too.
+pub fn reset_glyph_cache() {
+    GLYPH_CACHE_GEN.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A single loaded font face: the bytes + the parsed face (cached) + design metrics.
@@ -225,7 +243,11 @@ impl LoadedFont {
     /// pass (which differ only in dilation) and every repeat of the glyph reuse it.
     fn rasterize_base(&self, gid: u16, size_px: f32) -> Option<Arc<GlyphBitmap>> {
         let key = (self.id, gid, size_px.to_bits());
-        if let Some(b) = GLYPH_CACHE.with(|c| c.borrow().base.get(&key).cloned()) {
+        if let Some(b) = GLYPH_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            sync_glyph_cache_gen(&mut c);
+            c.base.get(&key).cloned()
+        }) {
             return Some(b);
         }
         let face = self.face();
@@ -256,7 +278,11 @@ impl LoadedFont {
             left: x_min,
             top: -y_max,
         });
-        GLYPH_CACHE.with(|c| c.borrow_mut().base.insert(key, Arc::clone(&base)));
+        GLYPH_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            sync_glyph_cache_gen(&mut c);
+            c.base.insert(key, Arc::clone(&base));
+        });
         Some(base)
     }
 
@@ -272,7 +298,11 @@ impl LoadedFont {
     ) -> Option<Arc<GlyphBitmap>> {
         let dilate = outline_dilate_px.max(0.0);
         let dkey = (self.id, gid, size_px.to_bits(), dilate.to_bits());
-        if let Some(b) = GLYPH_CACHE.with(|c| c.borrow().dilated.get(&dkey).cloned()) {
+        if let Some(b) = GLYPH_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            sync_glyph_cache_gen(&mut c);
+            c.dilated.get(&dkey).cloned()
+        }) {
             return Some(b);
         }
         let base = self.rasterize_base(gid, size_px)?;
@@ -281,7 +311,11 @@ impl LoadedFont {
         } else {
             Arc::new(dilate_coverage(&base, dilate))
         };
-        GLYPH_CACHE.with(|c| c.borrow_mut().dilated.insert(dkey, Arc::clone(&result)));
+        GLYPH_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            sync_glyph_cache_gen(&mut c);
+            c.dilated.insert(dkey, Arc::clone(&result));
+        });
         Some(result)
     }
 

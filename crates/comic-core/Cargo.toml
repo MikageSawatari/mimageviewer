@@ -28,3 +28,7 @@ ab_glyph_rasterizer = "0.1.10"
 # Rebuilding Face::from_slice per metric/shape/raster call was a severe perf bug
 # (~46us each on a .ttc); caching the parsed face makes those calls ~free.
 self_cell = "1"
+# Per-object parallel bake (bake_overlay_with_stamps): independent objects/merge-groups
+# bake into their own AABB-sized buffers concurrently, then composite in z-order. The
+# glyph cache is generation-based so it works correctly across rayon worker threads.
+rayon = "1"

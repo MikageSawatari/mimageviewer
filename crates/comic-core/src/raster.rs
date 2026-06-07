@@ -22,6 +22,7 @@ use crate::tessellate::{
     PlacedDeco, bubble_geometry, fit_bubble_shape, place_decorations, resolve_tail_base,
     tessellate_bubble,
 };
+use rayon::prelude::*;
 
 /// The bubble shape actually drawn: when `auto_size` is on (and the bubble has
 /// non-empty text whose font is loaded), the dimensions are fitted to the text
@@ -146,6 +147,7 @@ pub fn bake_overlay_with_stamps(
         AnnotationKind::Bubble(b) => crate::tessellate::shape_is_mergeable(&b.shape),
         _ => false,
     };
+    let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut gi = 0;
     while gi < order.len() {
         let mut group = vec![order[gi]];
@@ -163,13 +165,177 @@ pub fn bake_overlay_with_stamps(
             }
         }
         gi += 1;
-        if group.len() == 1 {
-            bake_object(&mut overlay, &objects[group[0]], fonts, stamps);
-        } else {
-            bake_merge_group(&mut overlay, &group, objects, fonts);
+        groups.push(group);
+    }
+
+    // A single group (typical light page): bake directly into the overlay — no
+    // per-group buffer / rayon overhead.
+    if groups.len() <= 1 {
+        if let Some(group) = groups.first() {
+            if group.len() == 1 {
+                bake_object(&mut overlay, &objects[group[0]], fonts, stamps);
+            } else {
+                bake_merge_group(&mut overlay, group, objects, fonts);
+            }
         }
+        return overlay;
+    }
+
+    // Many groups: bake each independent group (single object or merge chain) into
+    // its OWN AABB-sized buffer in parallel, then composite the buffers back into
+    // `overlay` in z (group) order. Objects are independent except for merge chains
+    // (kept together in one group) and the z compositing order (preserved by the
+    // sequential composite below), so the parallel bake is order-independent and
+    // produces pixel-identical output to a sequential bake. Per-group buffers are
+    // sized to the object's effect-aware image AABB (the same extent the rotated
+    // path already trusts), so memory is ~Σ(ink area), not N × full canvas.
+    let baked: Vec<Option<(i32, i32, RgbaOverlay)>> = groups
+        .par_iter()
+        .map(|group| bake_group_to_buffer(group, objects, fonts, stamps, w, h))
+        .collect();
+    for (ox, oy, buf) in baked.into_iter().flatten() {
+        composite_subimage(&mut overlay, &buf, ox, oy);
     }
     overlay
+}
+
+/// Bake one group (single object or merge chain) into a fresh buffer sized to the
+/// group's effect-aware image AABB (clamped to the canvas), returning the buffer
+/// and its top-left offset in `overlay` space. Used by the parallel bake path.
+/// `None` when the group has no drawable extent.
+fn bake_group_to_buffer(
+    group: &[usize],
+    objects: &[AnnotationObject],
+    fonts: &FontSet,
+    stamps: &StampImages,
+    w: usize,
+    h: usize,
+) -> Option<(i32, i32, RgbaOverlay)> {
+    let (minx, miny, maxx, maxy) = group_image_aabb(group, objects, fonts)?;
+    // Pad for stroke/AA slack, then clamp to the canvas (off-canvas parts are
+    // clipped exactly as the direct-to-overlay path clips them).
+    const PAD: f32 = 2.0;
+    let minx = (minx - PAD).floor().max(0.0);
+    let miny = (miny - PAD).floor().max(0.0);
+    let maxx = (maxx + PAD).ceil().min(w as f32);
+    let maxy = (maxy + PAD).ceil().min(h as f32);
+    if maxx <= minx || maxy <= miny {
+        return None;
+    }
+    let tw = (maxx - minx) as usize;
+    let th = (maxy - miny) as usize;
+    if tw == 0 || th == 0 {
+        return None;
+    }
+    let (ox, oy) = (minx as i32, miny as i32);
+    let (dx, dy) = (-minx, -miny);
+    let mut buf = RgbaOverlay::new(tw, th);
+    if group.len() == 1 {
+        let shifted = shift_object(&objects[group[0]], dx, dy);
+        bake_object(&mut buf, &shifted, fonts, stamps);
+    } else {
+        let shifted: Vec<AnnotationObject> = group
+            .iter()
+            .map(|&i| shift_object(&objects[i], dx, dy))
+            .collect();
+        let idxs: Vec<usize> = (0..shifted.len()).collect();
+        bake_merge_group(&mut buf, &idxs, &shifted, fonts);
+    }
+    Some((ox, oy, buf))
+}
+
+/// Translate an object (pivot + bubble tail tip) by `(dx, dy)`. Used to re-base a
+/// group into its own buffer's local space. Mirrors the app's `translate_object`.
+fn shift_object(o: &AnnotationObject, dx: f32, dy: f32) -> AnnotationObject {
+    let mut n = o.clone();
+    n.pivot.0 += dx;
+    n.pivot.1 += dy;
+    if let AnnotationKind::Bubble(b) = &mut n.kind {
+        if let Some(t) = &mut b.tail {
+            t.tip.0 += dx;
+            t.tip.1 += dy;
+        }
+    }
+    n
+}
+
+/// Union of the group members' image-space AABBs (rotation included).
+fn group_image_aabb(
+    group: &[usize],
+    objects: &[AnnotationObject],
+    fonts: &FontSet,
+) -> Option<(f32, f32, f32, f32)> {
+    let mut acc: Option<(f32, f32, f32, f32)> = None;
+    for &i in group {
+        if let Some((x0, y0, x1, y1)) = object_image_aabb(&objects[i], fonts) {
+            acc = Some(match acc {
+                None => (x0, y0, x1, y1),
+                Some((ax0, ay0, ax1, ay1)) => (ax0.min(x0), ay0.min(y0), ax1.max(x1), ay1.max(y1)),
+            });
+        }
+    }
+    acc
+}
+
+/// Image-space AABB of an object including its rotation. `object_local_aabb` is
+/// the UNROTATED extent (effect-aware: it already pads for 袋文字 / shadow / glow /
+/// tail / decorations); rotating its 4 corners about the object's rotation pivot
+/// gives the on-canvas footprint, so a per-group buffer never clips a rotated
+/// object's swung-out corners.
+fn object_image_aabb(obj: &AnnotationObject, fonts: &FontSet) -> Option<(f32, f32, f32, f32)> {
+    let (minx, miny, maxx, maxy) = object_local_aabb(obj, fonts)?;
+    if obj.rotation_rad.abs() < 1e-4 {
+        return Some((minx, miny, maxx, maxy));
+    }
+    let pivot = object_rotation_pivot(obj, fonts);
+    let (sin, cos) = obj.rotation_rad.sin_cos();
+    let rot = |x: f32, y: f32| -> (f32, f32) {
+        let (rx, ry) = (x - pivot.0, y - pivot.1);
+        (pivot.0 + rx * cos - ry * sin, pivot.1 + rx * sin + ry * cos)
+    };
+    let corners = [
+        rot(minx, miny),
+        rot(maxx, miny),
+        rot(maxx, maxy),
+        rot(minx, maxy),
+    ];
+    let mut x0 = f32::INFINITY;
+    let mut y0 = f32::INFINITY;
+    let mut x1 = f32::NEG_INFINITY;
+    let mut y1 = f32::NEG_INFINITY;
+    for (x, y) in corners {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    Some((x0, y0, x1, y1))
+}
+
+/// Composite a (straight-alpha) sub-image into `dst` at offset `(ox, oy)` using
+/// the same source-over math as `blend_px`. Used to merge per-group buffers back
+/// into the full overlay after the parallel bake.
+fn composite_subimage(dst: &mut RgbaOverlay, src: &RgbaOverlay, ox: i32, oy: i32) {
+    for y in 0..src.h {
+        for x in 0..src.w {
+            let i = (y * src.w + x) * 4;
+            let a = src.pixels[i + 3];
+            if a == 0 {
+                continue;
+            }
+            dst.blend_px(
+                ox + x as i32,
+                oy + y as i32,
+                Rgba {
+                    r: src.pixels[i],
+                    g: src.pixels[i + 1],
+                    b: src.pixels[i + 2],
+                    a,
+                },
+                1.0,
+            );
+        }
+    }
 }
 
 /// Bake one object, honoring `obj.rotation_rad`, with `draw` selecting WHAT to

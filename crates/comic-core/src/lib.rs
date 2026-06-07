@@ -144,6 +144,73 @@ mod integration_tests {
     }
 
     #[test]
+    fn parallel_bake_matches_sequential_for_disjoint_objects() {
+        // The per-object parallel bake path (≥2 groups) must be deterministic and
+        // produce the same pixels as baking each object sequentially. Use 3 separate
+        // (non-mergeable) text objects far apart so each pixel has ≤1 contributor.
+        let Some(font) = load_test_font() else {
+            eprintln!("skip: no Windows JP font available");
+            return;
+        };
+        let mut fonts = FontSet::new();
+        fonts.insert(font);
+        let objs: Vec<AnnotationObject> = (0..3u64)
+            .map(|i| {
+                let t = TextBlock {
+                    text: "あ".to_string(),
+                    size_px: 60.0,
+                    ..TextBlock::default()
+                };
+                AnnotationObject::new_text(i + 1, (60.0 + i as f32 * 360.0, 60.0), t)
+            })
+            .collect();
+        let (w, h) = (1200usize, 220usize);
+        let combined = bake_overlay(&objs, w, h, &fonts); // parallel path (3 groups)
+        let again = bake_overlay(&objs, w, h, &fonts);
+        assert_eq!(
+            combined.pixels, again.pixels,
+            "parallel bake must be deterministic"
+        );
+        // Disjoint → each combined pixel equals whichever solo bake covers it.
+        let solos: Vec<_> = (0..3)
+            .map(|i| bake_overlay(&objs[i..i + 1], w, h, &fonts))
+            .collect();
+        let mut covered = 0usize;
+        for px in 0..(w * h) {
+            let oi = px * 4;
+            let mut expect = [0u8; 4];
+            let mut hits = 0;
+            for s in &solos {
+                if s.pixels[oi + 3] > 0 {
+                    expect = [
+                        s.pixels[oi],
+                        s.pixels[oi + 1],
+                        s.pixels[oi + 2],
+                        s.pixels[oi + 3],
+                    ];
+                    hits += 1;
+                }
+            }
+            assert!(
+                hits <= 1,
+                "test objects must be disjoint (pixel {px} hit {hits})"
+            );
+            if hits == 1 {
+                covered += 1;
+            }
+            assert_eq!(
+                &combined.pixels[oi..oi + 4],
+                &expect,
+                "parallel composite differs from sequential at pixel {px}"
+            );
+        }
+        assert!(
+            covered > 100,
+            "expected the 3 glyphs to leave ink, got {covered}"
+        );
+    }
+
+    #[test]
     fn vertical_columns_advance_right_to_left() {
         let Some(font) = load_test_font() else {
             eprintln!("skip: no Windows JP font available");
