@@ -1647,9 +1647,12 @@ pub struct CopyOutcome {
 /// 指定パス群を `dest_folder` へコピーする（エクスプローラ → mIV のドロップ受け取り用）。
 ///
 /// クリップボード経由ではなくパスを直接受け取る点が [`paste_files_from_clipboard`] と
-/// 異なる。同じく PowerShell worker で実行し、完了を `rx` で 1 回通知する。フォルダの
-/// ドロップにも対応するため `-Recurse`、コピー先に同名が既存なら上書き（`-Force`、
-/// paste と同じ挙動）。
+/// 異なる。同じく PowerShell worker で実行し、完了を `rx` で 1 回通知する。
+///
+/// **フォルダは v1.1.0 で一旦無効化したため、防御層としてここでもディレクトリは skip し
+/// ファイルのみコピーする** (呼び出し側 `handle_external_file_drop` も folder を除外済みだが、
+/// 将来の呼び出し追加で再帰コピーが復活しないよう二重化)。`-Recurse` は付けない (ファイル
+/// 専用)。コピー先に同名ファイルが既存なら上書き（`-Force`、paste と同じ挙動）。
 ///
 /// **review #15 対応**: 旧実装は `-ErrorAction SilentlyContinue` で全エラーを握りつぶし、
 /// `()` 完了通知だけを返していた。Locked file / 権限拒否 / disk full 等の per-file 失敗が
@@ -1681,8 +1684,9 @@ pub fn copy_paths_into_folder(
              $failed = 0\n\
              $errs = New-Object System.Collections.ArrayList\n\
              foreach ($f in @({list})) {{\n\
+            \x20 if ([System.IO.Directory]::Exists($f)) {{ continue }}\n\
             \x20 try {{\n\
-            \x20   Copy-Item -LiteralPath $f -Destination $dest -Force -Recurse -ErrorAction Stop\n\
+            \x20   Copy-Item -LiteralPath $f -Destination $dest -Force -ErrorAction Stop\n\
             \x20 }} catch {{\n\
             \x20   $failed++\n\
             \x20   if ($errs.Count -lt 5) {{ [void]$errs.Add(\"$($_.Exception.Message): $f\") }}\n\

@@ -808,8 +808,14 @@ CLAUDE.md「コード修正時のドキュメント同時更新」に従い、�
 
 ### 11.1 仕様
 
-- エクスプローラ等から mIV ウィンドウへファイル / フォルダをドロップすると、**現在
-  表示中の実フォルダへコピー** する (送出と対称の「ファイル整理」操作)。
+> ⚠ **v1.1.0 で「フォルダのドロップ受け取り」は一旦無効化した** (同名衝突の無確認
+> 上書き・再帰コピーのデータ破壊リスクのため、Explorer 相当の衝突解決と合わせて将来へ
+> 延期)。現在はドロップされたディレクトリを `file_drag::partition_dropped_paths` で
+> **全て skip** し、ファイルのみコピーする (skip 件数は notice/toast で通知)。以下の
+> 自己再帰ガードや旧フローは、フォルダ再導入時に使う設計として残している。
+
+- エクスプローラ等から mIV ウィンドウへファイルをドロップすると、**現在表示中の実
+  フォルダへコピー** する (送出と対称の「ファイル整理」操作)。フォルダは上記のとおり skip。
 - コピー先は `App::current_favorite_target()` — 実ディレクトリ表示中だけ `Some`。
   ZIP / PDF / 変換アーカイブ表示中は `None` で **トーストで拒否**。
 - **検索結果ビュー (Ctrl+G 合成 / Ctrl+S favsearch) も拒否** する。これらは
@@ -841,8 +847,9 @@ mIV ウィンドウを OS のドロップターゲットに登録済みで、efr
      コピー起動 + 完了待ちを `file-drop-validate` worker thread に丸ごと投げる
      (review #7 対応、`fs::canonicalize` × N が SMB 越しで UI を秒オーダー止めるのを回避)。
 - worker (`file-drop-validate`) の処理:
-  1. ドロップ済みパスのうち、ディレクトリかつ `file_drag::dir_copy_would_recurse()` が
-     true のもの (= 自己再帰になる祖先/自身) を除外。
+  1. `file_drag::partition_dropped_paths` で **ディレクトリを全て除外** (v1.1.0 で
+     フォルダ drop 無効化)。`folder_skipped` 件数は後段の notice/toast で通知する。
+     フォルダ再導入時はここで `dir_copy_would_recurse()` の自己再帰除外を併用する。
   2. 残り 0 件なら `CopyOutcome::notice` に「ドロップ先と重なる N 件を除外した結果、
      コピー対象が 0 件になりました」をセットして送る (Codex P2-2 対応: 旧実装はここで
      `CopyOutcome::default()` を送って poll が無音化していたため、ユーザーは
