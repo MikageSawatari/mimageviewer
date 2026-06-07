@@ -74,6 +74,11 @@ pub fn composite_overlay_over(base: &ColorImage, overlay: &RgbaOverlay) -> Color
     let mut pixels = base.pixels.clone();
     let cw = w.min(overlay.w);
     let ch = h.min(overlay.h);
+    // 防御: 空画像 / 重なり無しは合成不要。`par_chunks_mut(0)` は panic するので w==0 を弾く
+    // (この関数は「寸法ズレでも安全」な純関数、Codex P3)。
+    if w == 0 || h == 0 || cw == 0 || ch == 0 {
+        return ColorImage::new([w, h], pixels);
+    }
     // 各出力行は独立 = embarrassingly parallel。`par_chunks_mut(w)` で 1 行ずつ排他に持ち、
     // 上端 `ch` 行だけブレンドする (それ以下の行は下地 clone のまま)。これがドラッグ中の
     // 毎フレーム再ベイクで最大の CPU コスト (20MP 逐次で ~30-50ms) を N コアに分散する。

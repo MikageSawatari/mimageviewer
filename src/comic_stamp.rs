@@ -310,11 +310,12 @@ pub fn load_stamp_image(source: &StampSource) -> Option<RgbaOverlay> {
 /// を返す。これで注釈データが自己完結し、フォルダ移動 / 別 PC / 元ファイル削除でも
 /// スタンプが欠落しない (Codex 監査 P1)。読めない / デコード不可なら `None`。
 ///
-/// これは file picker 後に UI スレッドで同期実行される一発操作。R2-6 で大判画像の所要時間を
-/// 実測したところ、現実的な圧縮率の写真では 24MP (10MB クラス) ≈ 180ms / 48MP ≈ 350ms で、
-/// 一回限りなら許容範囲だった。JPEG の DCT スケール縮小デコードも試したが、埋め込みターゲットが
-/// 1024px だとスケールが 1/4 止まりでエントロピー復号が支配的になり、効果が無かったため
-/// フルデコードのまま維持する (詳細は embed_file_stamp_timing テストのコメント)。
+/// **呼び出しは背景スレッドから**: 大判画像で重い (R2-6 実測: 24MP(10MB クラス) ≈ 180-195ms /
+/// 48MP ≈ 350-375ms) ため、file picker 後に `App::start_stamp_embed` が worker スレッドで呼び、
+/// 処理中は中央トーストを出して UI を固めない。この関数自体は同期だが UI スレッドでは走らない。
+/// JPEG の DCT スケール縮小デコードも試したが、埋め込みターゲットが 1024px だとスケールが
+/// 1/4 止まりでエントロピー復号が支配的になり効果が無かったため、フルデコードのまま維持する
+/// (詳細は embed_file_stamp_timing テストのコメント)。
 pub fn embed_file_stamp(path: &Path) -> Option<StampSource> {
     let bytes = std::fs::read(path).ok()?;
     let img = decode_raster(&bytes)?;

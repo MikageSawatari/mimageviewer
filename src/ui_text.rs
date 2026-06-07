@@ -3184,18 +3184,25 @@ impl App {
         match replace_target {
             Some(id) => {
                 // 既存スタンプのソース差し替え (長辺サイズ保持、短辺をアスペクト再フィット)。
-                if let Some(obj) = objs.iter_mut().find(|o| o.id == id) {
-                    if let AnnotationKind::Stamp(s) = &mut obj.kind {
-                        let long = s.half_w.max(s.half_h);
-                        if aspect >= 1.0 {
-                            s.half_w = long;
-                            s.half_h = (long / aspect).max(8.0);
-                        } else {
-                            s.half_h = long;
-                            s.half_w = (long * aspect).max(8.0);
-                        }
-                        s.source = source.clone();
+                // 読み込み中に対象が削除された等で見つからない場合は、存在しない ID を選択して
+                // 未変更のまま dirty/save するのを避け、注釈を戻して中断する (Codex P2)。
+                let Some(obj) = objs.iter_mut().find(|o| o.id == id) else {
+                    self.comic_docs.insert(key.to_string(), objs);
+                    self.show_feedback_toast(
+                        "差し替え対象のスタンプが見つかりませんでした".to_string(),
+                    );
+                    return;
+                };
+                if let AnnotationKind::Stamp(s) = &mut obj.kind {
+                    let long = s.half_w.max(s.half_h);
+                    if aspect >= 1.0 {
+                        s.half_w = long;
+                        s.half_h = (long / aspect).max(8.0);
+                    } else {
+                        s.half_h = long;
+                        s.half_w = (long * aspect).max(8.0);
                     }
+                    s.source = source.clone();
                 }
                 self.text_selected = Some(id);
             }

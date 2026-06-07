@@ -19204,8 +19204,10 @@ impl App {
     ///   ai_runtime の競合 / VRAM 不足を防ぐ。
     /// - 各 idx ごとに `ensure_edit_result_pixels_cpu` を呼ぶため、隣接ページの source
     ///   pixels が `fs_cache` に乗っていなければそのターゲットは skip される
-    ///   (= fs_prefetch の完了を毎フレ retry で待つ、コスト軽い)。CPU 専用なので
-    ///   非表示ページの GPU テクスチャ upload は発生しない (F2、表示時に lazy upload)。
+    ///   (= fs_prefetch の完了を毎フレ retry で待つ、コスト軽い)。これで **edit_result の
+    ///   表示テクスチャ** の前倒し upload は避ける (F2、表示時に lazy upload)。
+    ///   ただし編集済みページ (隠蔽 / 局所補正 / 消しゴム) は `assemble_edit_result_pixels`
+    ///   内で各 layer の texture を UI スレッドで upload しうる (R2-5 既知残、別途・中規模)。
     /// - `maybe_start_final_ai` 内の "active pending check" は cancel 済を除外
     ///   しないため、ここで `has_uncancelled_final_ai_pending` を別途 gate する。
     pub(crate) fn prefetch_final_ai(&mut self, ctx: &egui::Context, current_idx: usize) {
@@ -19222,9 +19224,10 @@ impl App {
             if self.has_uncancelled_final_ai_pending() {
                 return;
             }
-            // 先読みは CPU 専用 (GPU upload しない)。AI 入力は CPU ピクセルで足りるので、
-            // 非表示の近隣ページの表示テクスチャを UI スレッドで前倒し upload しない (F2)。
-            // 表示に入った時に ensure_edit_result_pixels が lazy アップロードする。
+            // 先読みは edit_result の表示テクスチャを前倒し upload しない (F2)。AI 入力は CPU
+            // ピクセルで足りる。表示に入った時に ensure_edit_result_pixels が lazy アップロード
+            // する。(注: 編集済みページの conceal/局所補正/消しゴム layer texture は
+            // assemble_edit_result_pixels 内で upload されうる = R2-5 既知残。)
             let Some((edit_key, edit_pixels)) = self.ensure_edit_result_pixels_cpu(ctx, idx) else {
                 continue;
             };
