@@ -1,15 +1,25 @@
 //! 本 (フォルダ / ZIP / PDF) ごとの「最後に読んだページ」永続管理。
 //!
 //! `%APPDATA%/mimageviewer/book_resume.db` にコンテナパスごとの最後に表示した
-//! ページ index を保存する。`spread_db.rs` / `rotation_db.rs` と同パターンの
-//! SQLite 永続化で、アプリ再起動を跨いで読書位置を復元する (動画の
+//! ページ index を保存し、アプリ再起動を跨いで読書位置を復元する (動画の
 //! `video_resume_positions` の画像本版)。
+//!
+//! キーは `path_key::normalize` (= ドライブ文字除去・小文字化・スラッシュ統一) で、
+//! USB / 外付け HDD のドライブレター変化に追従する点を優先する `spread_db.rs` と
+//! 同じ規則。`rotation_db.rs` 等の per-item DB はドライブ文字を保持する別規則なので
+//! 混同しないこと (別ドライブの同名パスは同一キーに畳まれるトレードオフがある)。
 //!
 //! 値は `items` 内の index。ZIP/PDF は列挙順が決定的なので index が安定する。
 //! 通常フォルダはファイル追加削除で多少ずれるが、その場合は復元時に範囲・種別を
 //! 検証して妥当でなければ先頭にフォールバックする (呼び出し側の責務)。
+//!
+//! ページ送りのたびに書き込みが走るため、**書き込みは [`BookResumeWriter`] の専用
+//! スレッドへ逃がして UI スレッドの同期 SQLite I/O を避ける**。読み出し
+//! ([`BookResumeDb::get`]) は本を開くときに 1 回だけなので UI スレッド同期のまま。
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use crate::path_key;
 
@@ -26,6 +36,9 @@ impl BookResumeDb {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = rusqlite::Connection::open(&path)?;
+        // 読み (UI スレッド) と書き ([`BookResumeWriter`] スレッド) で 2 接続が同じ
+        // ファイルを触るため、稀な競合で SQLITE_BUSY を即時エラーにせず待たせる。
+        conn.busy_timeout(Duration::from_secs(3))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS book_resume (
                 path TEXT PRIMARY KEY,
@@ -88,6 +101,52 @@ impl BookResumeDb {
 
 fn normalize_path(path: &Path) -> String {
     path_key::normalize(path)
+}
+
+/// 読書位置の書き込みを UI スレッドから外す background writer。自前の write 用
+/// Connection を持つ専用スレッドへ `(path, page)` を送って upsert する。ページ送りの
+/// たびに走る書き込みで UI が引っかからないようにするのが目的 ([docs/ui-responsiveness.md]
+/// の「UI スレッドの同期 I/O は worker 化」)。読み出しは本 open 時の 1 回だけなので
+/// `BookResumeDb` 側 (UI スレッド) のままにしている。
+pub struct BookResumeWriter {
+    tx: mpsc::Sender<(PathBuf, usize)>,
+}
+
+impl BookResumeWriter {
+    /// writer スレッドを spawn する。DB を開けなければ `None` (= 書き込みは no-op)。
+    pub fn spawn() -> Option<Self> {
+        let (tx, rx) = mpsc::channel::<(PathBuf, usize)>();
+        let spawned = std::thread::Builder::new()
+            .name("book-resume-writer".into())
+            .spawn(move || {
+                let db = match BookResumeDb::open() {
+                    Ok(db) => db,
+                    Err(e) => {
+                        crate::logger::log(format!("book-resume writer: DB open failed: {e}"));
+                        return;
+                    }
+                };
+                // tx が全て drop されるまで (= App 終了まで) 受信し続ける。channel に
+                // 溜まっている分は Disconnected 前に drain されるので取りこぼしは最小。
+                while let Ok((path, page)) = rx.recv() {
+                    if let Err(e) = db.set(&path, page) {
+                        crate::logger::log(format!("book-resume writer: set failed: {e}"));
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => Some(Self { tx }),
+            Err(e) => {
+                crate::logger::log(format!("book-resume writer: thread spawn failed: {e}"));
+                None
+            }
+        }
+    }
+
+    /// 読書位置を非同期で記録する (送るだけ・UI スレッドはブロックしない)。
+    pub fn record(&self, path: &Path, page: usize) {
+        let _ = self.tx.send((path.to_path_buf(), page));
+    }
 }
 
 #[cfg(test)]

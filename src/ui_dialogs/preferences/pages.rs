@@ -39,7 +39,7 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(14.0);
     ui.separator();
     ui.add_space(8.0);
-    ui.label(egui::RichText::new("AI 機能").strong());
+    ui.label(egui::RichText::new("表示時の AI 処理 (アップスケール / ノイズ除去)").strong());
     ui.add_space(4.0);
     for &mode in AiFeatureMode::all() {
         let response = ui.radio_value(
@@ -53,8 +53,11 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     }
     ui.label(
         egui::RichText::new(
-            "軽量は高速汎用と漫画トーン保持モデルのみを使用し、ノイズ除去は実行しません。\n\
-             高画質では写真・イラスト・質感保持モデルとノイズ除去も選択できます。",
+            "画像を見るときの自動アップスケール / ノイズ除去だけを切り替えます。\n\
+             軽量は高速汎用と漫画トーン保持モデルのみを使用し、ノイズ除去は実行しません。\n\
+             高画質では写真・イラスト・質感保持モデルとノイズ除去も選択できます。\n\
+             消しゴムや補正の被写体マスクなど編集ツールの AI、動画アップスケールは\n\
+             この設定の影響を受けません。",
         )
         .weak(),
     );
@@ -2265,10 +2268,12 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
 
     ui.add_space(8.0);
 
-    // ZIP/PDF (読書位置は専用 DB。クリアは App 側で即時実行)。
+    // 本 = フォルダ / ZIP / PDF (読書位置は専用 DB。クリアは App 側で即時実行)。
     let book_count = state.book_resume_entry_count;
-    ui.label(format!("ZIP/PDF (本) の読書位置: {book_count} 件を記憶。"));
-    if book_count > 0 && ui.button("ZIP/PDF の読書位置をすべてクリア").clicked() {
+    ui.label(format!(
+        "本 (フォルダ / ZIP / PDF) の読書位置: {book_count} 件を記憶。"
+    ));
+    if book_count > 0 && ui.button("本の読書位置をすべてクリア").clicked() {
         state.book_resume_clear_requested = true;
     }
     if let Some(msg) = &state.book_resume_clear_result {

@@ -34,7 +34,9 @@ impl App {
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(8.0);
-            ui.label(egui::RichText::new("AI 機能").strong());
+            ui.label(
+                egui::RichText::new("表示時の AI 処理 (アップスケール / ノイズ除去)").strong(),
+            );
             for &mode in AiFeatureMode::all() {
                 ui.radio_value(
                     &mut self.settings.ai_feature_mode,
@@ -44,7 +46,9 @@ impl App {
             }
             ui.label(
                 egui::RichText::new(
-                    "高画質には、GPUによっては処理に時間がかかるAIモデルが含まれます。",
+                    "画像を見るときの自動アップスケール / ノイズ除去だけを切り替えます。\n\
+                     消しゴムや補正の被写体マスクなど編集ツールの AI は影響を受けません。\n\
+                     高画質には、GPU によっては処理に時間がかかる AI モデルが含まれます。",
                 )
                 .weak(),
             );

@@ -3004,7 +3004,8 @@ pub struct App {
     /// 実行中のペースト worker 完了待ち。完了するごとに `pending_reload` を立てる。
     /// PowerShell 経由の paste が完了する前に reload しても無駄走査になるため、
     /// 完了通知を待ってから再読込する (docs/ui-responsiveness.md §4)。
-    pub(crate) paste_pending: Vec<std::sync::mpsc::Receiver<()>>,
+    pub(crate) paste_pending:
+        Vec<std::sync::mpsc::Receiver<crate::ui_dialogs::context_menu::CopyOutcome>>,
     /// 外部 D&D 由来の copy worker 完了待ち (review #15 対応)。完了時に
     /// `CopyOutcome` を見て失敗があればトーストでユーザーに通知する。
     pub(crate) drop_copy_pending:
@@ -3505,6 +3506,9 @@ pub struct App {
     /// 本 (フォルダ / ZIP / PDF) ごとの「最後に読んだページ index」永続化 DB。
     /// 再起動を跨いで読書位置を復元する (動画の `video_resume_positions` の画像本版)。
     pub(crate) book_resume_db: Option<crate::book_resume_db::BookResumeDb>,
+    /// 読書位置の書き込みを UI スレッドから外す background writer (ページ送り毎の
+    /// 同期 SQLite I/O を避ける)。読み出しは `book_resume_db` (UI スレッド) のまま。
+    pub(crate) book_resume_writer: Option<crate::book_resume_db::BookResumeWriter>,
     /// 直近に DB へ書いた `(コンテナパス, page idx)`。フルスクリーンのページ送り毎の
     /// 重複書き込みを抑止する dedup。
     pub(crate) last_book_resume: Option<(PathBuf, usize)>,
@@ -4945,6 +4949,11 @@ impl App {
 
         let t = std::time::Instant::now();
         let book_resume_db = crate::book_resume_db::BookResumeDb::open().ok();
+        let book_resume_writer = if book_resume_db.is_some() {
+            crate::book_resume_db::BookResumeWriter::spawn()
+        } else {
+            None
+        };
         crate::perf::emit_ms("startup", "db_open_book_resume", 0, t);
 
         let t = std::time::Instant::now();
@@ -5273,6 +5282,7 @@ impl App {
             folder_rating_counts_folder_key: None,
             search_drilled_folder_counts: std::collections::HashMap::new(),
             book_resume_db,
+            book_resume_writer,
             last_book_resume: None,
             spread_db,
             spread_mode: crate::settings::SpreadMode::default(),
@@ -11416,14 +11426,39 @@ impl App {
     /// worker はデタッチ実行なので受信チャネル Disconnected == 完了とみなす (send か drop いずれも).
     pub(crate) fn poll_paste_pending(&mut self) {
         if !self.paste_pending.is_empty() {
-            let before = self.paste_pending.len();
+            let mut completed: Vec<crate::ui_dialogs::context_menu::CopyOutcome> = Vec::new();
             self.paste_pending.retain(|rx| match rx.try_recv() {
-                Ok(()) => false,
+                Ok(outcome) => {
+                    completed.push(outcome);
+                    false
+                }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
                 Err(std::sync::mpsc::TryRecvError::Empty) => true,
             });
-            if self.paste_pending.len() < before {
+            for outcome in completed {
                 self.pending_reload = true;
+                if outcome.failed > 0 {
+                    let attempted = outcome.attempted;
+                    let failed = outcome.failed;
+                    let succeeded = attempted.saturating_sub(failed);
+                    crate::logger::log(format!(
+                        "paste: outcome attempted={attempted} succeeded={succeeded} failed={failed}"
+                    ));
+                    for err in &outcome.first_errors {
+                        crate::logger::log(format!("paste: error: {err}"));
+                    }
+                    let summary = outcome.first_errors.first().cloned().unwrap_or_default();
+                    let toast = if summary.is_empty() {
+                        format!("貼り付け: 成功 {succeeded} / 失敗 {failed} (詳細はログ参照)")
+                    } else {
+                        format!("貼り付け: 成功 {succeeded} / 失敗 {failed} — 例: {summary}")
+                    };
+                    self.show_feedback_toast(toast);
+                } else if let Some(notice) = outcome.notice {
+                    // 自己再帰 / 同じ場所への貼り付けを skip したケースの通知。
+                    crate::logger::log(format!("paste: notice: {notice}"));
+                    self.show_feedback_toast(notice);
+                }
             }
         }
         // **review #15 対応**: 外部 D&D の copy worker は `CopyOutcome` を返す。
@@ -15184,8 +15219,9 @@ impl App {
         if self.last_book_resume.as_ref() == Some(&(folder.clone(), idx)) {
             return;
         }
-        if let Some(db) = &self.book_resume_db {
-            let _ = db.set(&folder, idx);
+        // 書き込みは background writer へ逃がす (ページ送り毎の UI スレッド同期 I/O 回避)。
+        if let Some(writer) = &self.book_resume_writer {
+            writer.record(&folder, idx);
         }
         self.last_book_resume = Some((folder, idx));
     }

@@ -1446,33 +1446,67 @@ fn set_rgba_to_clipboard(width: u32, height: u32, rgba: &[u8], my_seq: u64) {
 /// PowerShell 起動 + Shell clipboard I/O が数百ms〜秒級になることがあるため、worker で走らせる。
 /// 戻り値は「ペースト完了」を 1 回通知する `mpsc::Receiver`。App は pending に積み、
 /// 完了したらフォルダを再読込する (docs/ui-responsiveness.md §4)。
-pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiver<()> {
+/// クリップボード上のファイル / フォルダを `dest_folder` へ貼り付ける (Ctrl+V / 右クリック)。
+///
+/// フォルダがコピー / カット対象に含まれるようになった (v1.1.0) ため、外部 D&D 経路
+/// ([`copy_paths_into_folder`]) と同じデータ安全策を備える:
+/// - **自己再帰ガード**: フォルダを自身 / その部分木へ貼り付けようとしたら skip
+///   (`Copy-Item -Recurse` が `A\B\A\B\...` と暴走するのを防ぐ)。同じ場所へのコピーも skip。
+/// - **失敗の可視化**: per-item try/catch + `-ErrorAction Stop` で失敗を数え、`CopyOutcome`
+///   で返す (旧実装は `Receiver<()>` で成功 / 失敗を区別できず黙って握りつぶしていた)。
+/// - **clipboard clear はカット成功時のみ**: 失敗 / skip が 1 件でもあれば clipboard を
+///   消さない (= 部分失敗したカットをユーザーが再試行できる)。
+///
+/// 同名フォルダが既存の場合は `-Force` でマージ上書きする (D&D 経路と同挙動)。
+pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiver<CopyOutcome> {
     let (tx, rx) = mpsc::channel();
     #[cfg(windows)]
     {
         let dest = ps_quote(dest_folder);
         let script = format!(
             "Add-Type -AssemblyName System.Windows.Forms\n\
+             $dest = {dest}\n\
+             $sep = [System.IO.Path]::DirectorySeparatorChar\n\
+             $destFull = ([System.IO.Path]::GetFullPath($dest)).TrimEnd($sep)\n\
              $data = [System.Windows.Forms.Clipboard]::GetDataObject()\n\
-             if ($data -eq $null -or -not $data.ContainsFileDropList()) {{ exit }}\n\
+             if ($data -eq $null -or -not $data.ContainsFileDropList()) {{\n\
+            \x20 Write-Output \"::ATTEMPTED::0\"; Write-Output \"::FAILED::0\"; Write-Output \"::SKIPPED::0\"; exit\n\
+             }}\n\
              $files = $data.GetFileDropList()\n\
              $effect = $data.GetData('Preferred DropEffect')\n\
              $isMove = $false\n\
              if ($effect -ne $null) {{\n\
-               $bytes = New-Object byte[] 4\n\
-               $null = $effect.Read($bytes, 0, 4)\n\
-               if ([BitConverter]::ToInt32($bytes, 0) -eq 2) {{ $isMove = $true }}\n\
+            \x20 $bytes = New-Object byte[] 4\n\
+            \x20 $null = $effect.Read($bytes, 0, 4)\n\
+            \x20 if ([BitConverter]::ToInt32($bytes, 0) -eq 2) {{ $isMove = $true }}\n\
              }}\n\
+             $attempted = 0; $failed = 0; $skipped = 0\n\
+             $errs = New-Object System.Collections.ArrayList\n\
              foreach ($f in $files) {{\n\
-               if ($isMove) {{\n\
-                 Move-Item -LiteralPath $f -Destination {dest} -Force\n\
-               }} else {{\n\
-                 Copy-Item -LiteralPath $f -Destination {dest} -Force -Recurse\n\
-               }}\n\
+            \x20 $attempted++\n\
+            \x20 try {{\n\
+            \x20   $srcFull = ([System.IO.Path]::GetFullPath($f)).TrimEnd($sep)\n\
+            \x20   $isDir = [System.IO.Directory]::Exists($srcFull)\n\
+            \x20   $srcParent = [System.IO.Path]::GetDirectoryName($srcFull)\n\
+            \x20   if ($isDir -and ($destFull -ieq $srcFull -or $destFull.StartsWith($srcFull + $sep, [System.StringComparison]::OrdinalIgnoreCase))) {{\n\
+            \x20     $skipped++; if ($errs.Count -lt 5) {{ [void]$errs.Add(\"フォルダを自身の中へは貼り付けできません: $f\") }}; continue\n\
+            \x20   }}\n\
+            \x20   if ($srcParent -ne $null -and ($srcParent -ieq $destFull)) {{\n\
+            \x20     $skipped++; if (-not $isMove -and $errs.Count -lt 5) {{ [void]$errs.Add(\"同じ場所へはコピーできません: $f\") }}; continue\n\
+            \x20   }}\n\
+            \x20   if ($isMove) {{ Move-Item -LiteralPath $f -Destination $dest -Force -ErrorAction Stop }}\n\
+            \x20   else {{ Copy-Item -LiteralPath $f -Destination $dest -Force -Recurse -ErrorAction Stop }}\n\
+            \x20 }} catch {{\n\
+            \x20   $failed++; if ($errs.Count -lt 5) {{ [void]$errs.Add(\"$($_.Exception.Message): $f\") }}\n\
+            \x20 }}\n\
              }}\n\
-             if ($isMove) {{ [System.Windows.Forms.Clipboard]::Clear() }}\n"
+             Write-Output \"::ATTEMPTED::$attempted\"\n\
+             Write-Output \"::FAILED::$failed\"\n\
+             Write-Output \"::SKIPPED::$skipped\"\n\
+             foreach ($e in $errs) {{ Write-Output \"::ERR::$e\" }}\n\
+             if ($isMove -and $failed -eq 0 -and $skipped -eq 0) {{ [System.Windows.Forms.Clipboard]::Clear() }}\n"
         );
-        run_ps_script_async(script, Some(tx));
+        run_paste_script_with_outcome(script, tx);
     }
     #[cfg(not(windows))]
     {
@@ -1480,6 +1514,113 @@ pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiv
         let _ = tx; // drop — receiver will get Disconnected
     }
     rx
+}
+
+/// `paste_files_from_clipboard` の PowerShell スクリプトを worker スレッドで実行し、
+/// `::ATTEMPTED:: / ::FAILED:: / ::SKIPPED:: / ::ERR::` マーカーを parse して
+/// `CopyOutcome` で返す。clipboard 読み出しに `-STA` が要るので `copy_paths_into_folder`
+/// 用の `run_ps_script_with_outcome` とは別実装 (あちらは attempted を呼び出し側が知る)。
+#[cfg(windows)]
+fn run_paste_script_with_outcome(script: String, on_done: mpsc::Sender<CopyOutcome>) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("miv_ps_paste_{}_{}.ps1", std::process::id(), seq));
+    let tx_for_worker = on_done.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("powershell-paste-with-outcome".into())
+        .spawn(move || {
+            let outcome = execute_paste_script(&tmp, &script);
+            let _ = std::fs::remove_file(&tmp);
+            let _ = tx_for_worker.send(outcome);
+        });
+    if let Err(e) = spawn_result {
+        crate::logger::log(format!(
+            "run_paste_script_with_outcome: thread spawn failed: {e}"
+        ));
+        let _ = on_done.send(CopyOutcome::all_failed(
+            1,
+            format!("worker thread spawn failed: {e}"),
+        ));
+    }
+}
+
+#[cfg(windows)]
+fn execute_paste_script(tmp: &std::path::Path, script: &str) -> CopyOutcome {
+    let mut content = vec![0xEF, 0xBB, 0xBF];
+    content.extend_from_slice(script.as_bytes());
+    if let Err(e) = std::fs::write(tmp, &content) {
+        return CopyOutcome::all_failed(1, format!("script file write failed: {e}"));
+    }
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-STA",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &tmp.to_string_lossy(),
+    ]);
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => return CopyOutcome::all_failed(1, format!("powershell execution failed: {e}")),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut attempted: Option<usize> = None;
+    let mut failed: usize = 0;
+    let mut skipped: usize = 0;
+    let mut first_errors: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("::ATTEMPTED::") {
+            attempted = rest.trim().parse::<usize>().ok();
+        } else if let Some(rest) = line.strip_prefix("::FAILED::") {
+            if let Ok(n) = rest.trim().parse::<usize>() {
+                failed = n;
+            }
+        } else if let Some(rest) = line.strip_prefix("::SKIPPED::") {
+            if let Ok(n) = rest.trim().parse::<usize>() {
+                skipped = n;
+            }
+        } else if let Some(rest) = line.strip_prefix("::ERR::") {
+            first_errors.push(rest.to_string());
+        }
+    }
+    // 非ゼロ exit / マーカー欠落 = スクリプトが完走しなかった → 全件失敗扱い。
+    if !out.status.success() || attempted.is_none() {
+        let mut errs = if out.status.success() {
+            vec!["powershell did not emit ::ATTEMPTED:: marker (script crashed)".to_string()]
+        } else {
+            vec![format!("powershell exit code {:?}", out.status.code())]
+        };
+        for line in stderr.lines().take(3) {
+            let t = line.trim();
+            if !t.is_empty() {
+                errs.push(t.to_string());
+            }
+        }
+        errs.extend(first_errors.into_iter());
+        let n = attempted.unwrap_or(1).max(1);
+        return CopyOutcome {
+            attempted: n,
+            failed: n,
+            first_errors: errs.into_iter().take(5).collect(),
+            notice: None,
+        };
+    }
+    let attempted = attempted.unwrap_or(0);
+    let notice = (skipped > 0).then(|| {
+        format!("{skipped} 件をスキップしました (自身の中・同じ場所への貼り付けはできません)")
+    });
+    CopyOutcome {
+        attempted,
+        failed,
+        first_errors: first_errors.into_iter().take(5).collect(),
+        notice,
+    }
 }
 
 /// `copy_paths_into_folder` の完了結果。`failed > 0` のとき呼び出し側はトースト等で
@@ -1691,22 +1832,11 @@ fn execute_copy_script(tmp: &std::path::Path, script: &str, attempted: usize) ->
     }
 }
 
-/// PowerShell スクリプトを一時ファイル経由で worker スレッドで実行する共通ヘルパー。
-/// -STA (クリップボード API 必須) / -ExecutionPolicy Bypass / CREATE_NO_WINDOW で実行。
-/// スクリプトは UTF-8 BOM 付きで書き出す（日本語パス対応）。
-///
-/// 一時ファイル名は呼び出しごとにユニーク化して並行操作の衝突を避ける。
-/// 完了を知りたい呼び出し元は `on_done` に `mpsc::Sender<()>` を渡す (paste 用)。
-/// clipboard copy/cut はファイア & フォーゲットなので None を渡す。
-///
-/// paste 用 (クリップボードの書き込みではなく読み出し → FS 操作) には生 API の方を呼ぶ。
-#[cfg(windows)]
-fn run_ps_script_async(script: String, on_done: Option<mpsc::Sender<()>>) {
-    run_ps_script_inner(script, on_done, None);
-}
-
 /// clipboard copy/cut (PowerShell で書き込み) 用。seq が古ければ PowerShell 起動を
-/// スキップする。
+/// スキップする。一時ファイル経由・`-STA` (クリップボード API 必須) / `-ExecutionPolicy
+/// Bypass` / `CREATE_NO_WINDOW` で実行し、スクリプトは UTF-8 BOM 付きで書き出す
+/// (日本語パス対応)。一時ファイル名は呼び出しごとにユニーク化して衝突を避ける。
+/// clipboard copy/cut はファイア & フォーゲットなので `on_done` は通常 None。
 #[cfg(windows)]
 fn run_ps_script_async_seq(script: String, on_done: Option<mpsc::Sender<()>>, my_seq: u64) {
     run_ps_script_inner(script, on_done, Some(my_seq));

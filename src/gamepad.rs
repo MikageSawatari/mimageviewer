@@ -9,6 +9,12 @@ use std::time::{Duration, Instant};
 #[cfg(not(test))]
 use gilrs::{Axis, Button, EventType, Gilrs};
 
+/// 入力イベントの bounded channel 容量。UI が長時間 drain しない (最小化 / 長 stall) と
+/// 無制限チャネルにイベントが溜まってメモリスパイク / 復帰時ヒッチになるため上限を設け、
+/// 溢れた古い入力は producer 側で捨てる (リアルタイム入力なので stale は無価値)。
+#[cfg(not(test))]
+const GAMEPAD_EVENT_CAP: usize = 256;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PadButton {
     DPadUp,
@@ -105,7 +111,7 @@ impl GamepadRuntime {
             return;
         }
         self.started = true;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(GAMEPAD_EVENT_CAP);
         self.rx = rx;
         let shutdown = Arc::clone(&self.shutdown);
         let repaint_ctx = ctx.clone();
@@ -124,10 +130,12 @@ impl GamepadRuntime {
                     let mut sent_any = false;
                     while let Some(event) = gilrs.next_event() {
                         if let Some(mapped) = map_gilrs_event(event.event) {
-                            if tx.send(mapped).is_err() {
-                                return;
+                            match tx.try_send(mapped) {
+                                Ok(()) => sent_any = true,
+                                // チャネル満杯 = UI が長時間 drain していない。古い入力は捨てる。
+                                Err(mpsc::TrySendError::Full(_)) => {}
+                                Err(mpsc::TrySendError::Disconnected(_)) => return,
                             }
-                            sent_any = true;
                         }
                     }
                     if sent_any {
@@ -258,6 +266,31 @@ impl GamepadInputState {
         if down && is_repeatable_button(button) {
             self.repeat_next
                 .insert(button, now + Duration::from_millis(300));
+        }
+    }
+
+    /// 保持中のボタン / 軸 / リピート / step タイマをすべてクリアする。
+    /// コントローラ切断時に呼び、握ったまま切断 → リピート/アナログが止まらない
+    /// 不具合を防ぐ。トリガーのレンジ較正 (`trigger_ranges`) は次接続でも有効なので残す。
+    pub fn clear(&mut self) {
+        self.buttons.clear();
+        self.axes = [0.0; 6];
+        self.repeat_next.clear();
+        self.y_modifier_used = false;
+        self.analog_last_tick = None;
+        self.left_stick_next_step = None;
+        self.trigger_next_step = None;
+    }
+
+    /// ディスパッチがブロックされている間 (ダイアログ / IME / 編集モード) に押された
+    /// ボタンが、ブロック解除後に遅れて発火するのを防ぐ。リピート予約をクリアし
+    /// (= 解除後に保持中ボタンが勝手に連続発火しない)、保持中の Y は modifier 使用済み
+    /// 扱いにして「離し = タップ」を抑止する。軸 / ボタン保持状態自体は残すので、
+    /// 一瞬のポップアップ後もアナログ操作はそのまま継続できる。
+    pub fn suppress_pending_actions(&mut self) {
+        self.repeat_next.clear();
+        if self.buttons.contains(&PadButton::North) {
+            self.y_modifier_used = true;
         }
     }
 

@@ -4204,7 +4204,6 @@ impl App {
         // U キー: AI アップスケールモデルをサイクル
         // 現在効いているスコープ (個別 > お気に入り標準 > 標準) を書き換える。
         if key_u || key_u_shift || key_u_alt {
-            let scope = self.resolve_adjust_scope(fs_idx);
             let mut params = self.effective_params(fs_idx).clone();
             let items =
                 crate::adjustment::upscale_menu_items_for_mode(self.settings.ai_feature_mode);
@@ -4214,40 +4213,53 @@ impl App {
                     (None, None) => true,
                     (Some(a), Some(b)) => *a == b,
                     _ => false,
-                })
-                .unwrap_or(0);
-            let next = if key_u_alt {
-                0
-            } else if key_u_shift {
-                (cur + items.len() - 1) % items.len()
+                });
+            // 制限モードでは保存済みモデルを潰さない:
+            //   - Disabled は「なし」のみ (= items.len() <= 1) で循環の意味が無い。
+            //   - 保存済みモデルがこの AI モードのメニューに無い (cur=None) ときは、
+            //     そのモデルは隠れて保持されているだけ。U で None / 別モデルに上書きすると
+            //     full モードへ戻したときに選択が失われるため、変更せず維持する。
+            if items.len() <= 1 || cur.is_none() {
+                self.show_feedback_toast(format!(
+                    "[U:アップスケール]\nこの AI モード ({}) では変更しません (保存済み選択を維持)",
+                    self.settings.ai_feature_mode.label()
+                ));
             } else {
-                (cur + 1) % items.len()
-            };
-            let (label, key) = items[next];
-            params.upscale_model = key.map(|s| s.to_string());
-            // 切替先がアップスケール **有効** で、かつ画像サイズが
-            // `ai_upscale_skip_px` 閾値以上なら処理がスキップされる。
-            // 「切り替えたのに見た目が変わらない」違和感を避けるため
-            // トーストに 2 行目で明示する。
-            let mut toast = format!("[U:{}アップスケール {}]", scope.label(), label);
-            if key.is_some()
-                && let Some(crate::fs_animation::FsCacheEntry::Static { pixels, .. }) =
-                    self.fs_cache.get(&fs_idx)
-            {
-                let w = pixels.size[0] as u32;
-                let h = pixels.size[1] as u32;
-                let threshold = self.settings.ai_upscale_skip_px;
-                if !crate::ai::upscale::should_process(w, h, threshold) {
-                    toast.push_str(&format!(
-                        "\n(解像度が高いためアップスケール処理無効: {w}×{h} ≥ {threshold}px)"
-                    ));
+                let scope = self.resolve_adjust_scope(fs_idx);
+                let cur = cur.unwrap_or(0);
+                let next = if key_u_alt {
+                    0
+                } else if key_u_shift {
+                    (cur + items.len() - 1) % items.len()
+                } else {
+                    (cur + 1) % items.len()
+                };
+                let (label, key) = items[next];
+                params.upscale_model = key.map(|s| s.to_string());
+                // 切替先がアップスケール **有効** で、かつ画像サイズが
+                // `ai_upscale_skip_px` 閾値以上なら処理がスキップされる。
+                // 「切り替えたのに見た目が変わらない」違和感を避けるため
+                // トーストに 2 行目で明示する。
+                let mut toast = format!("[U:{}アップスケール {}]", scope.label(), label);
+                if key.is_some()
+                    && let Some(crate::fs_animation::FsCacheEntry::Static { pixels, .. }) =
+                        self.fs_cache.get(&fs_idx)
+                {
+                    let w = pixels.size[0] as u32;
+                    let h = pixels.size[1] as u32;
+                    let threshold = self.settings.ai_upscale_skip_px;
+                    if !crate::ai::upscale::should_process(w, h, threshold) {
+                        toast.push_str(&format!(
+                            "\n(解像度が高いためアップスケール処理無効: {w}×{h} ≥ {threshold}px)"
+                        ));
+                    }
                 }
+                self.show_feedback_toast(toast);
+                self.capture_adjust_full(format!("AI アップスケール: {label}"), |app| {
+                    app.write_params_for_scope(fs_idx, scope, params);
+                    app.clear_all_adjustment_and_ai_caches(fs_idx);
+                });
             }
-            self.show_feedback_toast(toast);
-            self.capture_adjust_full(format!("AI アップスケール: {label}"), |app| {
-                app.write_params_for_scope(fs_idx, scope, params);
-                app.clear_all_adjustment_and_ai_caches(fs_idx);
-            });
         }
 
         // N キー: AI デノイズをトグル

@@ -40,6 +40,29 @@ enum PadDir {
     Right,
 }
 
+/// mIV のいずれかのウィンドウ (メイン / フルスクリーン) が OS の前面ウィンドウかどうか。
+/// 前面ウィンドウの所有プロセスが自プロセスなら true。gilrs はフォーカス非依存で
+/// グローバル入力を拾うため、別アプリ前面時にコントローラ入力で mIV が動かないようにする。
+#[cfg(windows)]
+fn app_window_is_foreground() -> bool {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return false;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        pid != 0 && pid == GetCurrentProcessId()
+    }
+}
+
+#[cfg(not(windows))]
+fn app_window_is_foreground() -> bool {
+    true
+}
+
 impl App {
     pub(crate) fn handle_gamepad_input(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
         let now = Instant::now();
@@ -69,8 +92,13 @@ impl App {
                     saw_input_event = true;
                     self.gamepad_state.set_axis(axis, value);
                 }
-                PadEvent::Connected | PadEvent::Disconnected => {
+                PadEvent::Connected => {
                     saw_input_event = true;
+                }
+                PadEvent::Disconnected => {
+                    saw_input_event = true;
+                    // 握ったまま切断すると保持状態が残りリピート/アナログが止まらない。
+                    self.gamepad_state.clear();
                 }
             }
         }
@@ -102,6 +130,8 @@ impl App {
             }
         } else {
             self.reset_gamepad_continuous_steps(now);
+            // ブロック中に押されたボタンが解除後に遅れて発火しないよう抑止する。
+            self.gamepad_state.suppress_pending_actions();
         }
 
         if saw_input_event || dispatched {
@@ -116,8 +146,11 @@ impl App {
     }
 
     fn gamepad_dispatch_allowed(&self, ctx: &egui::Context) -> bool {
-        let main_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        if self.fullscreen_idx.is_none() && !main_focused {
+        // gilrs はグローバル入力 (ウィンドウフォーカス非依存) なので、mIV が前面に
+        // 無いときにバックグラウンドのコントローラ入力で操作されないよう OS の前面
+        // プロセスでゲートする。フルスクリーンは別ウィンドウ (別ビューポート) なので
+        // egui の viewport().focused (= メインビューポート) では正しく判定できない。
+        if !app_window_is_foreground() {
             return false;
         }
         if self.ime_input_active() {
