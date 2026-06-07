@@ -255,6 +255,23 @@
 - 残: さらに詰めるならグリフ素ラスタ/距離場をベイク内キャッシュ (パス間再計算の削減)。
   現状で「応答なし」は解消見込み。
 
+### ✅ FB3. 実機 FB: 装飾テキスト多数で開く時 ~1秒待ち (worker化+トースト+rayon)
+- 症状: ダイレート高速化後も装飾テキストが多いと注釈ベイクが ~1秒 UI を止め、その間
+  「補正なし画像」がフリーズ表示されて処理中か分からない。
+- 対応 B (worker化+トースト、`298c9d79`): ensure_comic_composite_texture を非同期化。CPU 重い
+  bake+composite をバックグラウンドスレッド (ComicBakePending/Result) へ。UI は下地を表示し続け、
+  poll_comic_bake が完了時に upload→comic_cache。進行中 (150ms 以上) は draw_comic_bake_overlay
+  が中央「テキスト処理中…」トースト。font は既存 Arc<FontSet>、stamp 画像は UI で解決して move。
+  idx-keyed pending (見開き 2 まで)。保存/コピー/比較/書き出しは別経路 (同期) なので影響なし。
+- 対応 ③ (rayon オブジェクト並列、`cf7141b2`): bake_overlay_with_stamps を z 順グループ
+  (単体 or 結合チェーン) に分け、各グループを自前 AABB バッファに並列ベイク→z 順で逐次合成。
+  バッファは既存の効果込み AABB (object_local_aabb + 回転 corner) を再利用 (新規 bbox コード無し・
+  フルバッファ無し→メモリ ~Σインク面積)。グリフキャッシュは世代方式に変更 (rayon スレッド跨ぎで
+  正しく reset)。1 グループ (軽ページ) は直接ベイク。並列==逐次の決定性テスト追加。
+- 実測 (release, 3584x4608): 30× 48px 装飾ブロック 335ms→**104ms** (3.2x)。B と合わせ背景で進む。
+- 検証: comic-core 102 passed、本体 bin 2100 passed。
+- 残 (任意): ②ソフトマスク簡素化 (パス削減、見た目変化のため要承認) は未着手。
+
 ## 進め方
 - P0 → P1 → P2 の順。各修正は pathspec commit（src/ui_text.rs 等）、退避ブランチ `comic-inc6` 維持。
 - まとまった単位で Codex レビュー。
