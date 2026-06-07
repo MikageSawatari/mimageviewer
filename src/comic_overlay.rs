@@ -69,38 +69,46 @@ pub fn load_comic_fonts() -> Option<FontSet> {
 /// `overlay` は §5.4 の S=1 ベイクで `base` と同寸になる前提だが、万一寸法がずれても
 /// 重なり矩形にクリップして安全に動く(防御的)。
 pub fn composite_overlay_over(base: &ColorImage, overlay: &RgbaOverlay) -> ColorImage {
+    use rayon::prelude::*;
     let [w, h] = base.size;
     let mut pixels = base.pixels.clone();
     let cw = w.min(overlay.w);
     let ch = h.min(overlay.h);
-    for y in 0..ch {
-        for x in 0..cw {
-            let oi = (y * overlay.w + x) * 4;
-            let oa = overlay.pixels[oi + 3];
-            if oa == 0 {
-                continue; // 完全透明: 下地そのまま
+    // 各出力行は独立 = embarrassingly parallel。`par_chunks_mut(w)` で 1 行ずつ排他に持ち、
+    // 上端 `ch` 行だけブレンドする (それ以下の行は下地 clone のまま)。これがドラッグ中の
+    // 毎フレーム再ベイクで最大の CPU コスト (20MP 逐次で ~30-50ms) を N コアに分散する。
+    // overlay.pixels は read-only 共有なので競合なし。
+    pixels
+        .par_chunks_mut(w)
+        .take(ch)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..cw {
+                let oi = (y * overlay.w + x) * 4;
+                let oa = overlay.pixels[oi + 3];
+                if oa == 0 {
+                    continue; // 完全透明: 下地そのまま
+                }
+                let [br, bg, bb, ba] = row[x].to_srgba_unmultiplied();
+                let oaf = oa as f32 / 255.0;
+                let baf = ba as f32 / 255.0;
+                let out_a = oaf + baf * (1.0 - oaf);
+                if out_a <= 0.0 {
+                    row[x] = Color32::TRANSPARENT;
+                    continue;
+                }
+                let blend = |fc: u8, bc: u8| -> u8 {
+                    let v = (fc as f32 * oaf + bc as f32 * baf * (1.0 - oaf)) / out_a;
+                    v.round().clamp(0.0, 255.0) as u8
+                };
+                row[x] = Color32::from_rgba_unmultiplied(
+                    blend(overlay.pixels[oi], br),
+                    blend(overlay.pixels[oi + 1], bg),
+                    blend(overlay.pixels[oi + 2], bb),
+                    (out_a * 255.0).round().clamp(0.0, 255.0) as u8,
+                );
             }
-            let di = y * w + x;
-            let [br, bg, bb, ba] = pixels[di].to_srgba_unmultiplied();
-            let oaf = oa as f32 / 255.0;
-            let baf = ba as f32 / 255.0;
-            let out_a = oaf + baf * (1.0 - oaf);
-            if out_a <= 0.0 {
-                pixels[di] = Color32::TRANSPARENT;
-                continue;
-            }
-            let blend = |fc: u8, bc: u8| -> u8 {
-                let v = (fc as f32 * oaf + bc as f32 * baf * (1.0 - oaf)) / out_a;
-                v.round().clamp(0.0, 255.0) as u8
-            };
-            pixels[di] = Color32::from_rgba_unmultiplied(
-                blend(overlay.pixels[oi], br),
-                blend(overlay.pixels[oi + 1], bg),
-                blend(overlay.pixels[oi + 2], bb),
-                (out_a * 255.0).round().clamp(0.0, 255.0) as u8,
-            );
-        }
-    }
+        });
     ColorImage::new([w, h], pixels)
 }
 
@@ -147,6 +155,85 @@ pub fn demo_objects(w: usize, h: usize) -> Vec<AnnotationObject> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 計測用 (通常 CI では走らせない): composite_overlay_over の rayon 並列 vs 逐次。
+    /// `cargo test --release --bin mimageviewer-core composite_overlay_bench -- --ignored --nocapture`
+    /// ドラッグ中の毎フレーム再ベイクで支配的な合成コストの並列化効果を測る。
+    #[test]
+    #[ignore]
+    fn composite_overlay_bench() {
+        let (w, h) = (5000usize, 4000usize); // 20MP
+        let base = ColorImage::new([w, h], vec![Color32::from_rgb(40, 60, 90); w * h]);
+        // 中央付近に不透明〜半透明の帯を作る (テキスト相当のスパースな非透明領域)。
+        let mut ov = RgbaOverlay::new(w, h);
+        for y in (h / 3)..(2 * h / 3) {
+            for x in (w / 4)..(3 * w / 4) {
+                let oi = (y * w + x) * 4;
+                ov.pixels[oi] = 230;
+                ov.pixels[oi + 1] = 30;
+                ov.pixels[oi + 2] = 30;
+                ov.pixels[oi + 3] = if (x + y) % 2 == 0 { 255 } else { 128 };
+            }
+        }
+        // 逐次参照 (旧実装と同じロジック)。
+        let seq = |base: &ColorImage, overlay: &RgbaOverlay| -> ColorImage {
+            let [w, h] = base.size;
+            let mut pixels = base.pixels.clone();
+            let cw = w.min(overlay.w);
+            let ch = h.min(overlay.h);
+            for y in 0..ch {
+                for x in 0..cw {
+                    let oi = (y * overlay.w + x) * 4;
+                    let oa = overlay.pixels[oi + 3];
+                    if oa == 0 {
+                        continue;
+                    }
+                    let di = y * w + x;
+                    let [br, bg, bb, ba] = pixels[di].to_srgba_unmultiplied();
+                    let oaf = oa as f32 / 255.0;
+                    let baf = ba as f32 / 255.0;
+                    let out_a = oaf + baf * (1.0 - oaf);
+                    let blend = |fc: u8, bc: u8| -> u8 {
+                        ((fc as f32 * oaf + bc as f32 * baf * (1.0 - oaf)) / out_a)
+                            .round()
+                            .clamp(0.0, 255.0) as u8
+                    };
+                    pixels[di] = Color32::from_rgba_unmultiplied(
+                        blend(overlay.pixels[oi], br),
+                        blend(overlay.pixels[oi + 1], bg),
+                        blend(overlay.pixels[oi + 2], bb),
+                        (out_a * 255.0).round().clamp(0.0, 255.0) as u8,
+                    );
+                }
+            }
+            ColorImage::new([w, h], pixels)
+        };
+        const N: u32 = 20;
+        // warmup + 計測 (逐次)。
+        let _ = seq(&base, &ov);
+        let t0 = std::time::Instant::now();
+        for _ in 0..N {
+            std::hint::black_box(seq(&base, &ov));
+        }
+        let seq_ms = t0.elapsed().as_secs_f64() * 1000.0 / N as f64;
+        // warmup + 計測 (並列, 現行 composite_overlay_over)。
+        let _ = composite_overlay_over(&base, &ov);
+        let t1 = std::time::Instant::now();
+        for _ in 0..N {
+            std::hint::black_box(composite_overlay_over(&base, &ov));
+        }
+        let par_ms = t1.elapsed().as_secs_f64() * 1000.0 / N as f64;
+        // 結果が一致することも確認 (並列化で画素が変わらない)。
+        assert_eq!(
+            seq(&base, &ov).pixels,
+            composite_overlay_over(&base, &ov).pixels,
+            "parallel result must match sequential"
+        );
+        eprintln!(
+            "composite_overlay_over {w}x{h} (20MP): seq={seq_ms:.1}ms  rayon={par_ms:.1}ms  ({:.1}x)",
+            seq_ms / par_ms.max(1e-6)
+        );
+    }
 
     #[test]
     fn opaque_overlay_replaces_base() {
