@@ -196,6 +196,19 @@
   reset_text_mode でも cancel。
 - Codex R2 は **P1 なし**。Arc<str> 直列化互換・comic_lab match 追加も OK と確認済み。
 
+### ✅ R2-10. Codex 追加レビュー対応 (`e0f222b2` / `4b503ae1`)
+- [P1] ホバーバー分析ボタンが analysis_mode を直接反転し Z キー副作用 (zoom/pan 引き継ぎ・
+  post_filter bypass enter/exit・補正排他) をバイパス → 「Z で ON → ボタンで OFF」で
+  post_filter_bypassed が残る退行。`toggle_analysis_mode()` を新設し Z / ホバーボタン / 分析パネル
+  × を全て合流 (spread 強制 OFF は handoff 不要で reset のまま)。
+- [P2] X 比較ピン留めスロットが font パック導入/削除後も旧フォント焼き込みを保持 →
+  invalidate_all_compare_prepared に pinned_compare_slot / compare_pin_pending /
+  compare_pin_load_pending のクリアを追加。
+- [P3] stale コメント: comic_composited_pixels_for_export の D10「将来リファイン」→「不採用」、
+  embed_file_stamp_timing テストの「worker 化不要」→「worker 化済み」。
+- 確認済み (前回指摘): AI 完了待ち統一・Z 分析 raw 表示・w==0 防御・replace 消失復元・
+  stamp worker stale cancel・比較全無効化・D10 主要 docs。
+
 ## 進め方
 - P0 → P1 → P2 の順。各修正は pathspec commit（src/ui_text.rs 等）、退避ブランチ `comic-inc6` 維持。
 - まとまった単位で Codex レビュー。
