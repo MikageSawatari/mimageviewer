@@ -4222,6 +4222,9 @@ pub struct App {
     /// 注釈の正本 = 中央 SQLite `comic.db` (D4/§6.1)。起動時に open。失敗時は None
     /// (= 永続化なしで表示のみ動作、クラッシュさせない)。
     pub(crate) comic_db: Option<crate::comic_db::ComicDb>,
+    /// ユーザー画像スタンプの再利用履歴 = `comic_user_stamps.db`。配置済みスタンプの
+    /// 正本ではなく、ピッカーから再選択するためのコピーを保持する。
+    pub(crate) comic_user_stamp_db: Option<crate::comic_user_stamps::ComicUserStampDb>,
     /// comic.db から読み込んだ注釈ドキュメントのメモリキャッシュ。**キーは
     /// `page_path_key`** (画像の identity = フォルダ移動・idx 入れ替えに非依存) なので、
     /// idx remap での無効化は不要。空 Vec = 「読み込み済みだが注釈なし」。編集モード中は
@@ -4282,6 +4285,9 @@ pub struct App {
     /// 遅延ロードする (`recent_stamps_loaded`)。
     pub(crate) recent_stamps: Vec<comic_core::StampSource>,
     pub(crate) recent_stamps_loaded: bool,
+    /// ユーザー画像スタンプ履歴 (`comic_user_stamps.db`)。初回ダイアログ表示時に遅延ロードする。
+    pub(crate) user_stamps: Vec<comic_core::StampSource>,
+    pub(crate) user_stamps_loaded: bool,
     /// スタンプピッカーのサムネイルテクスチャキャッシュ (`stamp_source_key` → テクスチャ)。
     pub(crate) stamp_thumb_cache: std::collections::HashMap<String, egui::TextureHandle>,
     /// 見開きから text モードに入ったときの spread 復元コンテキスト (conceal と同じ流儀)。
@@ -4884,6 +4890,10 @@ impl App {
         let comic_db = crate::comic_db::ComicDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_comic", 0, t);
 
+        let t = std::time::Instant::now();
+        let comic_user_stamp_db = crate::comic_user_stamps::ComicUserStampDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_comic_user_stamps", 0, t);
+
         let video_upscale_data_dir = crate::data_dir::get();
         let video_upscale_queue_lock =
             crate::video::upscale::queue::QueueLock::acquire(&video_upscale_data_dir).ok();
@@ -5433,6 +5443,7 @@ impl App {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             comic_db,
+            comic_user_stamp_db,
             comic_docs: std::collections::HashMap::new(),
             text_mode: false,
             text_selected: None,
@@ -5456,6 +5467,8 @@ impl App {
             stamp_dialog_category: crate::comic_stamp::EmojiCategory::Smileys,
             recent_stamps: Vec::new(),
             recent_stamps_loaded: false,
+            user_stamps: Vec::new(),
+            user_stamps_loaded: false,
             stamp_thumb_cache: std::collections::HashMap::new(),
             text_spread_ctx: None,
             comic_undo_stack: Vec::new(),

@@ -19,6 +19,7 @@ pub mod comic_db;
 pub mod comic_overlay;
 pub mod comic_presets;
 pub mod comic_stamp;
+pub mod comic_user_stamps;
 pub mod compare_wgpu;
 pub mod conceal;
 pub mod conceal_compose;

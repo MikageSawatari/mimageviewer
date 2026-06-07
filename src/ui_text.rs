@@ -2930,6 +2930,14 @@ impl App {
             self.recent_stamps = crate::comic_stamp::load_recent_stamps();
             self.recent_stamps_loaded = true;
         }
+        if !self.user_stamps_loaded {
+            self.user_stamps = self
+                .comic_user_stamp_db
+                .as_ref()
+                .map(|db| db.list_recent(crate::comic_user_stamps::USER_STAMP_PICKER_LIMIT))
+                .unwrap_or_default();
+            self.user_stamps_loaded = true;
+        }
 
         let assets = crate::comic_stamp::emoji_assets_available();
         let filter = self.stamp_dialog_filter.to_lowercase();
@@ -2961,6 +2969,10 @@ impl App {
         }
         let recents = self.recent_stamps.clone();
         for s in &recents {
+            self.ensure_stamp_thumb(ctx, s);
+        }
+        let user_stamps = self.user_stamps.clone();
+        for s in &user_stamps {
             self.ensure_stamp_thumb(ctx, s);
         }
         let thumbs = self.stamp_thumb_cache.clone();
@@ -3011,7 +3023,33 @@ impl App {
                     );
                 });
 
-                // 最近使った行。
+                // 履歴行。
+                if !user_stamps.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("ユーザー画像").weak());
+                    ui.horizontal_wrapped(|ui| {
+                        for s in &user_stamps {
+                            let k = crate::comic_stamp::stamp_source_key(s);
+                            let label = crate::comic_stamp::stamp_label(s);
+                            let resp = if let Some(tex) = thumbs.get(&k) {
+                                ui.add(
+                                    egui::Button::image(egui::load::SizedTexture::new(
+                                        tex.id(),
+                                        egui::vec2(34.0, 34.0),
+                                    ))
+                                    .corner_radius(4.0),
+                                )
+                            } else {
+                                ui.button(&label)
+                            };
+                            if resp.on_hover_text(&label).clicked() {
+                                chosen = Some(s.clone());
+                            }
+                        }
+                    });
+                    ui.separator();
+                }
+
                 if !recents.is_empty() {
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("最近使った").weak());
@@ -3204,6 +3242,36 @@ impl App {
         }
     }
 
+    fn remember_user_stamp(&mut self, source: &comic_core::StampSource) {
+        if !matches!(source, comic_core::StampSource::Embedded { .. }) {
+            return;
+        }
+        let db_source = source.clone();
+        let _ = std::thread::Builder::new()
+            .name("user-stamp-history".into())
+            .spawn(
+                move || match crate::comic_user_stamps::ComicUserStampDb::open() {
+                    Ok(db) => {
+                        if let Err(e) = db.upsert_embedded(&db_source) {
+                            crate::logger::log(format!(
+                                "[comic] user stamp history save failed: {e}"
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!("[comic] user stamp history open failed: {e}"));
+                    }
+                },
+            );
+        let key = crate::comic_stamp::stamp_source_key(source);
+        self.user_stamps
+            .retain(|s| crate::comic_stamp::stamp_source_key(s) != key);
+        self.user_stamps.insert(0, source.clone());
+        self.user_stamps
+            .truncate(crate::comic_user_stamps::USER_STAMP_PICKER_LIMIT);
+        self.user_stamps_loaded = true;
+    }
+
     /// ピッカーで選んだスタンプソースを適用する。差し替え対象があれば既存スタンプの
     /// ソースを差し替え (ジオメトリ保持・アスペクト再フィット)、無ければ画像中心へ新規追加。
     /// MRU 更新 + comic.db 保存まで行う。
@@ -3277,7 +3345,8 @@ impl App {
                 self.text_selected = Some(id);
             }
         }
-        // MRU 更新 + 永続化。
+        // ユーザー画像履歴 + MRU 更新 + 永続化。
+        self.remember_user_stamp(&source);
         crate::comic_stamp::push_recent_stamp(&mut self.recent_stamps, &source);
         crate::comic_stamp::save_recent_stamps(&self.recent_stamps);
         self.save_comic_objects(fs_idx, key, &objs);
