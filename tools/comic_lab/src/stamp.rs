@@ -200,7 +200,18 @@ pub fn stamp_source_key(source: &StampSource) -> String {
     match source {
         StampSource::Emoji(key) => format!("e:{key}"),
         StampSource::File(path) => format!("f:{}", path.display()),
+        StampSource::Embedded { data, .. } => format!("b:{}", embedded_data_key(data)),
     }
+}
+
+/// Stable cache key for embedded data (base64 PNG). The data string is long, so
+/// hash it deterministically (`DefaultHasher::new()` has a fixed key, stable
+/// across runs); mix in the length to reduce collisions. Mirrors the main app.
+fn embedded_data_key(data: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut h);
+    format!("{:016x}-{}", h.finish(), data.len())
 }
 
 /// A short human label for a stamp source (object list / properties).
@@ -222,6 +233,13 @@ pub fn stamp_label(source: &StampSource) -> String {
             .and_then(|s| s.to_str())
             .unwrap_or("image")
             .to_string(),
+        StampSource::Embedded { name, .. } => {
+            if name.is_empty() {
+                "画像".to_string()
+            } else {
+                name.clone()
+            }
+        }
     }
 }
 
@@ -278,6 +296,14 @@ pub fn load_stamp_image(source: &StampSource) -> Option<RgbaOverlay> {
         StampSource::File(path) => {
             let bytes = std::fs::read(path).ok()?;
             decode_raster(&bytes)
+        }
+        StampSource::Embedded { data, .. } => {
+            // base64 PNG embedded in the annotation (no fs access = portable).
+            use base64::Engine as _;
+            let png = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .ok()?;
+            decode_raster(&png)
         }
         StampSource::Emoji(key) => {
             let path = emoji_asset_path(key)?;

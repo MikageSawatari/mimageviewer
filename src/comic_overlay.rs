@@ -15,8 +15,13 @@
 //! 下地 (`ensure_final_composite_pixels`) は **canonical(非回転)ソース解像度** で
 //! 返るので、comic はその解像度に **等倍(S=1)** で焼く → くっきり。回転は paint-time
 //! (`draw_rotated_image_ex`) が下地と一緒に掛けるので、本モジュールでは回転を扱わない
-//! (D8)。エクスポート時のダウンサンプル後ベイク(D10)は Inc 7 で `comic_core::scale_scene`
-//! を併用する。
+//! (D8)。
+//!
+//! エクスポートの注釈ベイクは **base(canonical ソース)解像度で焼いてから crop+ダウンサンプル**
+//! する (`comic_composited_pixels_for_export`)。設計メモ D10 の「ダウンサンプル後に最終解像度で
+//! 直焼き」は **採用しない判断** (2026-06-07)。crop/scale/comic 座標が多段で掛かりズレ系の視覚
+//! バグが出やすく、最終出力縮小が重視機能でないため複雑さに見合わない。詳細は
+//! docs/comic-ui-bugfix-checklist.md の C5 エントリ。
 
 use comic_core::{
     AnnotationObject, FontSet, LoadedFont, Orientation, Rgba, RgbaOverlay, StrokeStyle, TextBlock,

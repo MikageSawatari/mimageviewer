@@ -21250,6 +21250,10 @@ impl App {
         } else {
             self.comic_pages.insert(idx);
         }
+        // 比較 (Wipe/Diff) 準備済みキャッシュは comic を焼き込むため、注釈の保存で旧ピクセルが
+        // stale になる。該当 idx の準備済みペア / 準備中ジョブを落とす (mark_comic_dirty が拾えない
+        // 非現在ページ保存もカバー)。
+        self.invalidate_compare_prepared_for_idx(idx);
         if let Some(db) = &self.comic_db {
             if let Err(e) = db.set(key, objects) {
                 crate::logger::log(format!("[comic] comic.db set failed key={key}: {e}"));
@@ -21449,6 +21453,14 @@ impl App {
     /// させる (§5.5 のキャッシュ無効化規約)。サムネは非反映 (D3) なので触らない。
     pub(crate) fn mark_comic_dirty(&mut self) {
         self.comic_generation = self.comic_generation.wrapping_add(1);
+        // 注釈内容が変わると、比較 (Wipe/Diff) 用に prepare_capture_pixel_job が焼いた準備済み
+        // pixels も古くなる (キャプチャ経路が comic を焼き込むため)。準備済みペアは idx だけで
+        // 一致判定するので、注釈編集後も無効化しないと比較側が旧ピクセルを使い続ける。live 編集は
+        // ここ (fullscreen の現在ページ) で一元的に落とす。永続化経路は save_comic_objects で idx
+        // 指定で落とす。
+        if let Some(idx) = self.fullscreen_idx {
+            self.invalidate_compare_prepared_for_idx(idx);
+        }
     }
 
     /// 最終 composite (canonical ソース解像度・post-filter 後) の上に注釈を S=1 で焼いて
