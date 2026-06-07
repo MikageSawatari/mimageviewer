@@ -204,6 +204,9 @@
 - [P2] X 比較ピン留めスロットが font パック導入/削除後も旧フォント焼き込みを保持 →
   invalidate_all_compare_prepared に pinned_compare_slot / compare_pin_pending /
   compare_pin_load_pending のクリアを追加。
+  - 追加 (`0600cd6a`): スロットを消すだけだと compare_view_mode が PinnedNormal/Wipe/Diff のまま
+    残り、PinnedNormal で pin texture None → 現在画像へフォールバックせず無描画フレームになる →
+    `compare_view_mode = Off` も併せて行う (通常のピン解除と同じ後始末)。
 - [P3] stale コメント: comic_composited_pixels_for_export の D10「将来リファイン」→「不採用」、
   embed_file_stamp_timing テストの「worker 化不要」→「worker 化済み」。
 - 確認済み (前回指摘): AI 完了待ち統一・Z 分析 raw 表示・w==0 防御・replace 消失復元・
