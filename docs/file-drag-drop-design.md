@@ -23,7 +23,7 @@
   「ドロップ先と重なる N 件を除外した結果、コピー対象が 0 件」をトースト表示
   (Codex P2-2: 旧実装は無音だった)。
 - 2026-05-22: Codex レビュー第 1 回を反映。主な修正点 — COM 初期化の寿命管理
-  (§5.1 / §6.3)、混在選択 (実ファイル + 仮想アイテム) の仕様化 (§5.4)、`SearchContainer`
+  (§5.1 / §6.3)、混在選択 (実パス + 仮想アイテム) の仕様化 (§5.4)、`SearchContainer`
   のスコープ明記 (§2 / §5.2)、pointer reset を「要実機検証」に格下げ (§6.1)、工数見積もりの
   引き上げ (§9)。Q1 / Q2 は解決済 (§8)。
 - 2026-05-22: Codex レビュー第 2 回を反映。主な修正点 — ポインタ固着対策に
@@ -94,7 +94,7 @@
 - **実フォルダ**: グリッド上段のフォルダ
 - ドロップ先: エクスプローラ、デスクトップ、他アプリ (`CF_HDROP` を受けるものすべて)
 - 操作: **コピーのみ** (移動・リンクはしない。後述 §6.4)
-- 複数選択ドラッグ: チェックボックスで複数選択した実ファイル群をまとめてドラッグ
+- 複数選択ドラッグ: チェックボックスで複数選択した実ファイル / 実フォルダをまとめてドラッグ
 
 ### 対象外 (やらない)
 
@@ -120,8 +120,8 @@
 | --- | --- | --- |
 | メインウィンドウ HWND | `App::main_hwnd: Option<isize>` ([app.rs:2872](../src/app.rs)) | 初フレームで `frame.window_handle()` から取得済 ([app.rs:16853](../src/app.rs)) |
 | `windows` crate 0.61 + 必要 feature | [Cargo.toml:37-70](../Cargo.toml) | `Win32_System_Ole` / `_Com` / `_Com_StructuredStorage` / `_UI_Shell` / `_UI_Shell_Common` / `_System_Memory` すべて有効 |
-| ドラッグ対象パス判定 | `GridItem::file_operation_path()` ([grid_item.rs:177](../src/grid_item.rs)) | 実ファイルパス抽出。ただしフォルダを除外しているので拡張が必要 (§5.2) |
-| 複数選択モデル | `App::checked: HashSet<usize>` | チェックボックス選択。`collect_checked_paths()` で実ファイルパス収集 |
+| ドラッグ対象パス判定 | `GridItem::drag_source_path()` ([grid_item.rs](../src/grid_item.rs)) | D&D 送出可能な実ファイル / 実フォルダのパス抽出 |
+| 複数選択モデル | `App::checked: HashSet<usize>` | チェックボックス選択。`collect_checked_paths()` で実ファイル / 実フォルダのパス収集 |
 | セルのクリック処理 | `App::handle_cell_interaction()` ([ui_main.rs:1474](../src/ui_main.rs)) | 現状 `egui::Sense::click()` |
 | クリップボード経由コピー | `copy_files_to_clipboard()` ([context_menu.rs:825](../src/ui_dialogs/context_menu.rs)) | **PowerShell 経由なので D&D には流用不可** (後述) |
 
@@ -321,12 +321,13 @@ pub enum FileDragError {
 
 ### 5.2 `GridItem` にドラッグ対象パス抽出を追加 (約 15 行)
 
-`file_operation_path()` はフォルダを除外している (コメント: 「フォルダは OS / エクスプローラ
-側で扱う領分」)。D&D ではフォルダも送出したいので別アクセサを追加する:
+実装当初の `file_operation_path()` はフォルダを除外していたが、後に
+Ctrl+X/C/V でもフォルダ整理を扱うようになったため、現在はフォルダも返す。
+D&D でも同じ実体パスだけを送出するため、別アクセサ `drag_source_path()` を使う:
 
 ```rust
 /// D&D で送出できる実ファイル / 実フォルダのパス。
-/// file_operation_path() との違いは Folder を含むこと。
+/// file_operation_path() と同じく実パスを持つアイテムだけを返す。
 /// 対象外:
 ///   - ZipImage / PdfPage  — 仮想フォルダ内 (ディスク上に実体がない)
 ///   - ZipSeparator        — 擬似アイテム
@@ -362,7 +363,7 @@ pub(crate) native_drag_just_finished: bool,
 pub(crate) struct PendingNativeDrag {
     /// ドラッグするファイル / フォルダの実パス群 (index 昇順、§5.4.2)。空ではない。
     pub paths: Vec<PathBuf>,
-    /// 混在選択 (実ファイル + 仮想アイテム) で除外が発生したとき、
+    /// 混在選択 (実パス + 仮想アイテム) で除外が発生したとき、
     /// **ドラッグ完了後**に出すトースト文言。除外なしなら None。
     /// drag_started() の時点でトーストを出すと、同じ update 末尾の SHDoDragDrop が
     /// 長時間ブロックする間にトーストの表示期限が切れてしまう (§5.4.3 / Codex 第 3 回)。
@@ -405,7 +406,7 @@ pub(crate) struct PendingNativeDrag {
 
 #### 5.4.2 ドラッグ対象の決定 — 混在選択の仕様
 
-⚠ **Codex 指摘の最重要修正点**: `checked` には実ファイルと仮想アイテム
+⚠ **Codex 指摘の最重要修正点**: `checked` には実パスを持つアイテムと仮想アイテム
 (`ZipImage` / `PdfPage`、どちらも `is_checkable()` が true) が混在しうる。素朴に
 `filter_map` で実ファイルだけ拾うと、ユーザーには **「選択したうち一部しかコピー
 されなかった」** ように見え危険。明示仕様にする。
@@ -426,7 +427,7 @@ index 昇順 = `items` 配列の並び順 = 通常フォルダでは現在のソ
 
 判定:
 
-- `draggable` が空 → ドラッグ開始しない。トースト「ドラッグできる実ファイルが
+- `draggable` が空 → ドラッグ開始しない。トースト「ドラッグできる実ファイル / フォルダが
   選択されていません」を**即時**表示してよい (ドラッグが走らない = `SHDoDragDrop` の
   ブロックが無いため期限切れの心配がない)。
 - `virtual_excluded` が非空 (= 混在選択) → **`draggable` をドラッグしつつ、除外を
@@ -437,7 +438,7 @@ index 昇順 = `items` 配列の並び順 = 通常フォルダでは現在のソ
     に積んで **ドラッグ完了後** (`SHDoDragDrop` が戻った後) に出す。`drag_started()` で
     即時に出すと、同じ update 末尾の `SHDoDragDrop` が長時間ブロックする間にトーストの
     表示期限が切れ、ユーザーが見られない (Codex 第 3 回指摘)。
-  - 文言は「`<N>` 件のフォルダ内画像は除外しました。実ファイル `<M>` 件をドラッグ
+  - 文言は「`<N>` 件のフォルダ内画像は除外しました。実ファイル / フォルダ `<M>` 件をドラッグ
     対象にしました」程度にする。**「コピーしました」とは書かない** — ユーザーが
     ドロップ前にキャンセルした場合に嘘になるため (`SHDoDragDrop` の結果に関わらず
     出る文言なので、確定している「ドラッグ対象にした」事実だけを述べる)。
@@ -551,7 +552,7 @@ if let Some(PendingNativeDrag { paths, post_drag_toast }) = self.pending_native_
 - `outcome.error` が `Some`、または `outcome.started == false` → ドラッグが実際に
   始まっていない / COM 失敗。「ドラッグを開始できませんでした」(未開始) または
   「ドラッグ中にエラーが発生しました」(`started == true` で `SHDoDragDrop` がエラー) を
-  出し、**`post_drag_toast` は抑止する**。抑止しないと「実ファイル N 件をドラッグ対象に
+  出し、**`post_drag_toast` は抑止する**。抑止しないと「実ファイル / フォルダ N 件をドラッグ対象に
   しました」だけが出て、実際は始まっていないのに成功したかのように誤解させる。
 - 正常時のみ → 除外トースト (`post_drag_toast`) と「N 件はドラッグできませんでした」
   (`failed_paths > 0`) を、2 連続 `show_feedback_toast` で上書きし合わないよう
@@ -686,7 +687,7 @@ OS モーダル操作のため `egui_kittest` スナップショットテスト�
 
 - `GridItem::drag_source_path()`: Folder/Image/Video/ZipFile/PdfFile/ConvertibleArchive が
   `Some`、ZipImage/PdfPage/ZipSeparator/SearchContainer が `None`。
-- `decide_drag_payload()` (§5.4.3): 単体実ファイル / 単体仮想 / 複数実ファイル /
+- `decide_drag_payload()` (§5.4.3): 単体実パス / 単体仮想 / 複数実パス /
   混在選択 (実 + 仮想) / 全仮想 / 未チェック item の各分岐で、`DragDecision` の種別・
   ドラッグ対象パス・`post_drag_toast` 文言が仕様通りか。payload が **index 昇順**で
   並ぶことも検証する (§5.4.2)。
@@ -704,9 +705,9 @@ OS モーダル操作なので自動化不可。以下を実機で確認する�
 
 **選択モデルとの組み合わせ**
 
-- 複数チェック選択 (全部実ファイル) → どれか 1 つを掴んでドラッグ → 選択全部がコピー。
-- **混在選択**: `checked` に実ファイルと ZipImage/PdfPage を混ぜる → ドラッグ →
-  実ファイルだけコピーされ、除外トーストが出る (§5.4.2(A))。
+- 複数チェック選択 (全部実ファイル / 実フォルダ) → どれか 1 つを掴んでドラッグ → 選択全部がコピー。
+- **混在選択**: `checked` に実パスと ZipImage/PdfPage を混ぜる → ドラッグ →
+  実パスだけコピーされ、除外トーストが出る (§5.4.2(A))。
 - **`checked` がある状態で未チェック item を掴んでドラッグ** → エクスプローラ流に
   掴んだ単体だけがコピーされ、選択集合は変わらない (§5.4.2(B))。
 - 全仮想アイテムだけを `checked` にしてドラッグ → ドラッグ開始せず、トースト表示。
@@ -740,7 +741,7 @@ OS モーダル操作なので自動化不可。以下を実機で確認する�
 - **Q2 — UI スレッドの STA 初期化**: 解決。winit 0.30.13 がウィンドウ作成時に
   `OleInitialize` + `RegisterDragDrop` 済み。あわせて「自前 `OleInitialize` の寿命管理」
   の誤りを修正 — `start_file_drag` 内では COM 初期化しない方針に確定。→ §5.1 / §6.3。
-- **混在選択の仕様** (Codex 指摘 4): 解決。実ファイル + 仮想アイテム混在時は実ファイルを
+- **混在選択の仕様** (Codex 指摘 4): 解決。実パス + 仮想アイテム混在時は実パスを
   ドラッグしつつ除外トーストを出す。modifier 競合も非競合と整理。→ §5.4。
 - **`SearchContainer` スコープ** (Codex 指摘 5): 解決。初版は対象外と明記。→ §2 / §5.2。
 
@@ -836,7 +837,7 @@ mIV ウィンドウを OS のドロップターゲットに登録済みで、efr
   1. 検索結果ビュー (`items_are_global_search_view` / `favsearch.on_results_grid()`) なら
      拒否トースト。
   2. `current_favorite_target()` が `None` (ZIP/PDF 等) なら拒否トースト。
-  3. UI スレッドからは「N 件のファイルをコピーしています…」トーストを即出して、検証 +
+  3. UI スレッドからは「N 件の項目をコピーしています…」トーストを即出して、検証 +
      コピー起動 + 完了待ちを `file-drop-validate` worker thread に丸ごと投げる
      (review #7 対応、`fs::canonicalize` × N が SMB 越しで UI を秒オーダー止めるのを回避)。
 - worker (`file-drop-validate`) の処理:

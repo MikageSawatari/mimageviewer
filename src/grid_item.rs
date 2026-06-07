@@ -195,14 +195,15 @@ impl GridItem {
         }
     }
 
-    /// ファイル整理系の操作 (コピー / カット / 削除) の対象になる実ファイルのパス。
+    /// ファイル整理系の操作 (コピー / カット / 削除) の対象になる実パス。
     ///
-    /// フォルダは OS / エクスプローラ側で扱う領分として、このアプリの複数選択
-    /// ファイル操作からは除外する。ZIP/PDF 本体や変換前アーカイブは仮想フォルダ
-    /// としても開けるが、ファイル整理では実ファイルとして扱う。
+    /// フォルダ・画像・動画・ZIP/PDF 本体・変換前アーカイブはディスク上に
+    /// 実体があるため、Explorer と同じく整理対象にする。ZIP/PDF 内ページなど
+    /// 仮想フォルダ内アイテムは独立した実パスを持たないため対象外。
     pub fn file_operation_path(&self) -> Option<&Path> {
         match self {
-            Self::Image(p)
+            Self::Folder(p)
+            | Self::Image(p)
             | Self::Video(p)
             | Self::ZipFile(p)
             | Self::PdfFile(p)
@@ -213,8 +214,8 @@ impl GridItem {
 
     /// D&D (ドラッグでコピー送出) で送出できる実ファイル / 実フォルダのパス。
     ///
-    /// [`Self::file_operation_path`] との違いは `Folder` を含むこと。エクスプローラ
-    /// などへドラッグするときはフォルダごとコピーできてよい。対象外:
+    /// [`Self::file_operation_path`] と同じく、実パスを持つフォルダ / ファイルだけを
+    /// 対象にする。対象外:
     /// - `ZipImage` / `PdfPage` — 仮想フォルダ内でディスク上に実体がない
     /// - `ZipSeparator` — 擬似アイテム
     /// - `SearchContainer` — 検索集約 UI のコンテナ。`path` は実フォルダ / ZIP を
@@ -234,9 +235,9 @@ impl GridItem {
 
     /// チェックボックスで選択できるアイテムか。
     ///
-    /// 画像・動画・ZIP/PDF 内ページに加えて、フォルダ以外の実ファイル
-    /// (ZIP/PDF 本体、変換前アーカイブ) もファイル整理のために対象にする。
-    /// フォルダ・ZIP セパレータ・検索集約コンテナは対象外。
+    /// 画像・動画・フォルダ・ZIP/PDF 本体・変換前アーカイブに加えて、
+    /// ZIP/PDF 内ページもページ操作用に対象にする。ZIP セパレータ・
+    /// 検索集約コンテナは対象外。
     pub fn is_checkable(&self) -> bool {
         self.file_operation_path().is_some()
             || matches!(self, Self::ZipImage { .. } | Self::PdfPage { .. })
@@ -398,8 +399,8 @@ mod tests {
     }
 
     #[test]
-    fn checkable_includes_real_files_except_folders() {
-        assert!(!GridItem::Folder(PathBuf::from(r"C:\books")).is_checkable());
+    fn checkable_includes_real_folders_and_files() {
+        assert!(GridItem::Folder(PathBuf::from(r"C:\books")).is_checkable());
         assert!(GridItem::Image(PathBuf::from(r"C:\books\a.jpg")).is_checkable());
         assert!(GridItem::Video(PathBuf::from(r"C:\books\a.mp4")).is_checkable());
         assert!(GridItem::ZipFile(PathBuf::from(r"C:\books\a.zip")).is_checkable());
@@ -444,11 +445,14 @@ mod tests {
     }
 
     #[test]
-    fn file_operation_path_is_only_for_movable_files() {
-        assert!(
-            GridItem::Folder(PathBuf::from(r"C:\books"))
+    fn file_operation_path_is_for_real_folders_and_files() {
+        let folder = GridItem::Folder(PathBuf::from(r"C:\books"));
+        assert_eq!(
+            folder
                 .file_operation_path()
-                .is_none()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("books")
         );
         assert!(
             GridItem::ZipImage {
@@ -486,7 +490,7 @@ mod tests {
 
     #[test]
     fn drag_source_path_includes_folders_and_real_files() {
-        // 実フォルダ / 実ファイルは Some。file_operation_path と違い Folder も含む。
+        // 実フォルダ / 実ファイルは Some。
         assert!(
             GridItem::Folder(PathBuf::from(r"C:\books"))
                 .drag_source_path()

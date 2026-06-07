@@ -2589,7 +2589,7 @@ pub(crate) struct NativeVideoModeSwitchPending {
 pub(crate) struct PendingNativeDrag {
     /// ドラッグするファイル / フォルダの実パス群 (index 昇順)。空ではない。
     pub paths: Vec<PathBuf>,
-    /// 混在選択 (実ファイル + 仮想アイテム) で除外が発生したとき、ドラッグ完了後に
+    /// 混在選択 (実パス + 仮想アイテム) で除外が発生したとき、ドラッグ完了後に
     /// 出すトースト文言。除外なしなら `None`。`drag_started` 時点で出すと、同じ
     /// `update` 末尾の `SHDoDragDrop` がブロックする間にトーストの表示期限が
     /// 切れてしまうため、完了後まで遅延させる。
@@ -2870,6 +2870,13 @@ pub struct App {
     pub(crate) open_folder_input: String,
     /// フォルダを開くダイアログのエラーメッセージ
     pub(crate) open_folder_error: Option<String>,
+
+    // ── 新規フォルダ作成ダイアログ ───────────────────────────────
+    pub(crate) show_new_folder_dialog: bool,
+    pub(crate) new_folder_parent: Option<PathBuf>,
+    pub(crate) new_folder_input: String,
+    pub(crate) new_folder_error: Option<String>,
+    pub(crate) new_folder_pending: Option<crate::ui_dialogs::new_folder::NewFolderReceiver>,
 
     // ── 統合環境設定ダイアログ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
@@ -4999,6 +5006,11 @@ impl App {
             show_open_folder_dialog: false,
             open_folder_input: String::new(),
             open_folder_error: None,
+            show_new_folder_dialog: false,
+            new_folder_parent: None,
+            new_folder_input: String::new(),
+            new_folder_error: None,
+            new_folder_pending: None,
             show_preferences: false,
             show_settings_restore: false,
             settings_restore_state:
@@ -6359,6 +6371,8 @@ impl App {
             || self.show_tag_editor
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
+            || self.show_new_folder_dialog
+            || self.new_folder_pending.is_some()
             || self.show_preferences
             || self.show_cache_manager
             || self.show_delete_confirm
@@ -6389,6 +6403,8 @@ impl App {
             || self.show_tag_editor
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
+            || self.show_new_folder_dialog
+            || self.new_folder_pending.is_some()
             || self.show_preferences
             || self.show_cache_manager
             || self.show_delete_confirm
@@ -11296,7 +11312,7 @@ impl App {
             return;
         }
         self.drop_copy_pending.push(rx);
-        self.show_feedback_toast(format!("{n_total} 件のファイルをコピーしています…"));
+        self.show_feedback_toast(format!("{n_total} 件の項目をコピーしています…"));
     }
 
     /// PowerShell ペースト worker の完了を拾い、完了ごとに `pending_reload` を立てる。
@@ -15033,8 +15049,8 @@ impl App {
         }
 
         if ctrl_v {
-            if let Some(ref folder) = self.current_folder.clone() {
-                let rx = crate::ui_dialogs::context_menu::paste_files_from_clipboard(folder);
+            if let Some(folder) = self.current_favorite_target() {
+                let rx = crate::ui_dialogs::context_menu::paste_files_from_clipboard(&folder);
                 self.paste_pending.push(rx);
             }
         }
@@ -22294,7 +22310,7 @@ impl App {
     /// ケース。`Some` でも COM 失敗 / 未開始がありうる。
     ///
     /// 失敗・未開始を最優先で通知する: ドラッグが実際に始まっていないのに混在選択の
-    /// 除外通知 (`post_drag_toast` =「実ファイル N 件をドラッグ対象にしました」) を出すと
+    /// 除外通知 (`post_drag_toast` =「実ファイル / フォルダ N 件をドラッグ対象にしました」) を出すと
     /// 「コピーできた」と誤解させるため、その場合は `post_drag_toast` を抑止して
     /// 「ドラッグを開始できませんでした」を出す (Codex P2)。
     ///
@@ -26747,7 +26763,7 @@ impl eframe::App for App {
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
         self.update_ime_state(ctx);
 
-        // エクスプローラ等から mIV へドロップされたファイルを現在のフォルダへコピーする
+        // エクスプローラ等から mIV へドロップされたファイル / フォルダを現在のフォルダへコピーする
         // (mIV → 外部 のドラッグ送出と対称の受け取り方向)。毎フレーム走るので、
         // ドロップが無い通常フレームでは空チェックだけで抜ける (Vec を確保しない)。
         if ctx.input(|i| !i.raw.dropped_files.is_empty()) {
@@ -26888,13 +26904,14 @@ impl eframe::App for App {
         self.poll_tag_prewarm_results();
         self.poll_delete_pending();
         self.poll_paste_pending();
+        self.poll_new_folder_pending(ctx);
         self.poll_capture_pending(ctx);
         self.poll_pipeline_debug_export_pending(ctx);
         self.poll_export_pending(ctx);
         self.poll_compare_pin_load_pending(ctx);
         self.poll_compare_pin_pending(ctx);
         self.poll_compare_prepare_pending(ctx);
-        if !self.paste_pending.is_empty() {
+        if !self.paste_pending.is_empty() || self.new_folder_pending.is_some() {
             ctx.request_repaint();
         }
         if self.capture_pending.is_some()
@@ -27246,6 +27263,7 @@ impl eframe::App for App {
         self.show_tag_editor_dialog(ctx);
         self.show_fav_add_dialog_window(ctx);
         let open_folder_nav = self.show_open_folder_dialog_window(ctx);
+        self.show_new_folder_dialog_window(ctx);
         self.show_cache_manager_dialog(ctx);
         self.show_archive_cache_manager_dialog(ctx);
         self.show_cache_creator_dialog(ctx);

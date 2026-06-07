@@ -8512,7 +8512,7 @@ mod file_operation_selection_tests {
     }
 
     #[test]
-    fn checked_file_operation_paths_include_real_files_and_skip_virtual_pages() {
+    fn checked_file_operation_paths_include_real_folders_and_files_and_skip_virtual_pages() {
         let mut app = setup_app();
 
         let folder = push_item(&mut app, GridItem::Folder(PathBuf::from(r"C:\books")));
@@ -8558,6 +8558,7 @@ mod file_operation_selection_tests {
         assert_eq!(
             paths,
             vec![
+                PathBuf::from(r"C:\books"),
                 PathBuf::from(r"C:\books\a.7z"),
                 PathBuf::from(r"C:\books\a.jpg"),
                 PathBuf::from(r"C:\books\a.mp4"),
@@ -8575,8 +8576,9 @@ mod file_operation_selection_tests {
                 (zip, PathBuf::from(r"C:\books\a.zip")),
                 (video, PathBuf::from(r"C:\books\a.mp4")),
                 (image, PathBuf::from(r"C:\books\a.jpg")),
+                (folder, PathBuf::from(r"C:\books")),
             ],
-            "delete targets are sorted by descending index and exclude folders/virtual pages",
+            "delete targets are sorted by descending index and exclude virtual pages",
         );
     }
 }

@@ -57,7 +57,7 @@ impl DeletePending {
     }
 }
 
-/// 削除ワーカーを spawn する。`paths` のファイルをゴミ箱に移動し、進捗を返す。
+/// 削除ワーカーを spawn する。`paths` のファイル / フォルダをゴミ箱に移動し、進捗を返す。
 pub fn spawn(paths: Vec<PathBuf>) -> DeletePending {
     let total = paths.len();
     let cancel = Arc::new(AtomicBool::new(false));

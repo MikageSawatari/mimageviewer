@@ -60,14 +60,14 @@ fn build_delete_confirm_label(
             format!("「{name}」をゴミ箱に移動しますか？")
         }
         (DeleteConfirmKind::RecycleBin, _, _) => {
-            format!("{count} 件のファイルをゴミ箱に移動しますか？")
+            format!("{count} 件の項目をゴミ箱に移動しますか？")
         }
         (DeleteConfirmKind::MayPermanent, 1, Some(name)) => format!(
             "「{name}」はゴミ箱に移動できない場所にある可能性があります。\n\
              完全に削除される場合があります。削除しますか？"
         ),
         (DeleteConfirmKind::MayPermanent, _, _) => format!(
-            "{count} 件のうち、ゴミ箱に移動できない場所のファイルがあります。\n\
+            "{count} 件のうち、ゴミ箱に移動できない場所の項目があります。\n\
              完全に削除される場合があります。削除しますか？"
         ),
     }
@@ -281,6 +281,7 @@ impl crate::app::App {
         let mut nav: Option<ContextMenuAction> = None;
         // 検索結果ビュー中だけ「フォルダに移動」を出す。
         let in_search = self.global_search.active || self.favsearch.active;
+        let paste_target = self.current_favorite_target();
         let mut close = false;
 
         // 記録済みの座標に固定表示
@@ -299,7 +300,7 @@ impl crate::app::App {
                 ui.set_min_width(200.0);
 
                 if has_checked {
-                    // ── 選択モード: チェック済みファイルに対する操作 ──
+                    // ── 選択モード: チェック済みアイテムに対する操作 ──
                     ui.label(
                         egui::RichText::new(format!("{checked_count} 件選択中"))
                             .strong()
@@ -356,9 +357,15 @@ impl crate::app::App {
                     }
 
                     // ペースト
-                    if ui.button("ペースト (Ctrl+V)").clicked() {
-                        if let Some(ref folder) = self.current_folder {
-                            let rx = paste_files_from_clipboard(folder);
+                    if ui
+                        .add_enabled(
+                            paste_target.is_some(),
+                            egui::Button::new("ペースト (Ctrl+V)"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(folder) = paste_target.clone() {
+                            let rx = paste_files_from_clipboard(&folder);
                             self.paste_pending.push(rx);
                         }
                         close = true;
@@ -430,9 +437,15 @@ impl crate::app::App {
                                 close = true;
                             }
                             ui.separator();
-                            if ui.button("ペースト (Ctrl+V)").clicked() {
-                                if let Some(ref folder) = self.current_folder {
-                                    let rx = paste_files_from_clipboard(folder);
+                            if ui
+                                .add_enabled(
+                                    paste_target.is_some(),
+                                    egui::Button::new("ペースト (Ctrl+V)"),
+                                )
+                                .clicked()
+                            {
+                                if let Some(folder) = paste_target.clone() {
+                                    let rx = paste_files_from_clipboard(&folder);
                                     self.paste_pending.push(rx);
                                 }
                                 close = true;
@@ -447,6 +460,16 @@ impl crate::app::App {
                             if ui.button(copy_label).clicked() {
                                 copy_path_text(ctx, p);
                                 close = true;
+                            }
+                            if !is_folder_context {
+                                if ui.button("コピー").clicked() {
+                                    copy_files_to_clipboard(&[p.clone()]);
+                                    close = true;
+                                }
+                                if ui.button("カット").clicked() {
+                                    cut_files_to_clipboard(&[p.clone()]);
+                                    close = true;
+                                }
                             }
                             let open_label = if is_folder_context {
                                 "このフォルダを開く"
@@ -467,9 +490,32 @@ impl crate::app::App {
                                 close = true;
                             }
                             ui.separator();
-                            if ui.button("ペースト (Ctrl+V)").clicked() {
-                                if let Some(ref folder) = self.current_folder {
-                                    let rx = paste_files_from_clipboard(folder);
+                            if is_folder_context {
+                                if ui
+                                    .add_enabled(
+                                        paste_target.is_some(),
+                                        egui::Button::new("新しいフォルダ…"),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some(folder) = paste_target.clone() {
+                                        self.request_new_folder_dialog(folder);
+                                    }
+                                    close = true;
+                                }
+                            } else if ui.button("削除 (ゴミ箱)").clicked() {
+                                self.request_delete_confirm(vec![(idx, p.clone())]);
+                                close = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    paste_target.is_some(),
+                                    egui::Button::new("ペースト (Ctrl+V)"),
+                                )
+                                .clicked()
+                            {
+                                if let Some(folder) = paste_target.clone() {
+                                    let rx = paste_files_from_clipboard(&folder);
                                     self.paste_pending.push(rx);
                                 }
                                 close = true;
@@ -515,9 +561,15 @@ impl crate::app::App {
                                 close = true;
                             }
                             ui.separator();
-                            if ui.button("ペースト (Ctrl+V)").clicked() {
-                                if let Some(ref folder) = self.current_folder {
-                                    let rx = paste_files_from_clipboard(folder);
+                            if ui
+                                .add_enabled(
+                                    paste_target.is_some(),
+                                    egui::Button::new("ペースト (Ctrl+V)"),
+                                )
+                                .clicked()
+                            {
+                                if let Some(folder) = paste_target.clone() {
+                                    let rx = paste_files_from_clipboard(&folder);
                                     self.paste_pending.push(rx);
                                 }
                                 close = true;
@@ -608,9 +660,15 @@ impl crate::app::App {
                                 close = true;
                             }
                             ui.separator();
-                            if ui.button("ペースト (Ctrl+V)").clicked() {
-                                if let Some(ref folder) = self.current_folder {
-                                    let rx = paste_files_from_clipboard(folder);
+                            if ui
+                                .add_enabled(
+                                    paste_target.is_some(),
+                                    egui::Button::new("ペースト (Ctrl+V)"),
+                                )
+                                .clicked()
+                            {
+                                if let Some(folder) = paste_target.clone() {
+                                    let rx = paste_files_from_clipboard(&folder);
                                     self.paste_pending.push(rx);
                                 }
                                 close = true;
@@ -1407,9 +1465,9 @@ pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiv
              }}\n\
              foreach ($f in $files) {{\n\
                if ($isMove) {{\n\
-                 Move-Item -Path $f -Destination {dest} -Force\n\
+                 Move-Item -LiteralPath $f -Destination {dest} -Force\n\
                }} else {{\n\
-                 Copy-Item -Path $f -Destination {dest} -Force -Recurse\n\
+                 Copy-Item -LiteralPath $f -Destination {dest} -Force -Recurse\n\
                }}\n\
              }}\n\
              if ($isMove) {{ [System.Windows.Forms.Clipboard]::Clear() }}\n"
@@ -1760,7 +1818,7 @@ mod delete_confirm_tests {
         assert_eq!(label, "「sample.jpg」をゴミ箱に移動しますか？");
 
         let label = build_delete_confirm_label(3, None, DeleteConfirmKind::RecycleBin);
-        assert_eq!(label, "3 件のファイルをゴミ箱に移動しますか？");
+        assert_eq!(label, "3 件の項目をゴミ箱に移動しますか？");
     }
 
     #[test]

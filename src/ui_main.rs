@@ -316,9 +316,9 @@ pub(crate) enum DragDecision {
 
 /// ドラッグ開始セル `idx` から、何をドラッグするかを決める純粋関数。
 ///
-/// - `idx` が複数選択 (`checked`) の一部 → checked 全件 (index 昇順) の実ファイルを
+/// - `idx` が複数選択 (`checked`) の一部 → checked 全件 (index 昇順) の実パスを
 ///   ドラッグ対象にする。仮想アイテム (`ZipImage` / `PdfPage`) が混在していれば除外し、
-///   完了後トーストで件数を明示する。実ファイルが 0 件なら即時トーストのみ。
+///   完了後トーストで件数を明示する。実パスが 0 件なら即時トーストのみ。
 /// - `idx` が複数選択外 → エクスプローラ流に、掴んだ単体だけをドラッグ
 ///   (実ファイル / 実フォルダのとき)。仮想アイテム等なら no-op。
 ///
@@ -345,12 +345,12 @@ pub(crate) fn decide_drag_payload(
         }
         if paths.is_empty() {
             return DragDecision::ImmediateToast(
-                "ドラッグできる実ファイルが選択されていません".to_string(),
+                "ドラッグできる実ファイル / フォルダが選択されていません".to_string(),
             );
         }
         let post_drag_toast = (virtual_excluded > 0).then(|| {
             format!(
-                "{} 件のフォルダ内画像は除外しました。実ファイル {} 件をドラッグ対象にしました",
+                "{} 件のフォルダ内画像は除外しました。実ファイル / フォルダ {} 件をドラッグ対象にしました",
                 virtual_excluded,
                 paths.len(),
             )
