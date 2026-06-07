@@ -231,9 +231,12 @@ impl LoadedFont {
 /// Circular dilation of a coverage bitmap by `dilate_px` (袋文字 halo / glow /
 /// shadow base), via a two-pass chamfer distance transform.
 ///
-/// The shape (glyph silhouette, coverage ≥ 0.5) is expanded outward by
-/// `dilate_px`, with a 1px anti-aliased ramp at the new boundary and full
-/// coverage inside. Cost is **O(output area), independent of radius**.
+/// The shape (any non-zero source coverage) is expanded outward so it is **fully
+/// opaque out to radius `dilate_px`**, then fades over a 1px anti-aliased ramp
+/// (`dilate_px`..`dilate_px + 1`). This keeps the old solid outline weight (a
+/// hard disk of radius `dilate`) while adding a smooth edge. The padding is
+/// `ceil(dilate) + 1` so the AA ramp is never clipped. Cost is **O(output area),
+/// independent of radius**.
 ///
 /// The previous implementation was a brute-force disk max-filter — for every
 /// covered source pixel it wrote into a (2r+1)² neighbourhood, i.e. O(area·r²).
@@ -243,14 +246,15 @@ impl LoadedFont {
 /// `fs/comic_composite_build`). The chamfer DT makes each pass radius-independent.
 fn dilate_coverage(base: GlyphBitmap, dilate_px: f32) -> GlyphBitmap {
     let dilate = dilate_px.max(0.0);
-    let r = dilate.ceil() as i32;
-    if r == 0 {
+    if dilate <= 0.0 {
         return base;
     }
+    // Solid out to `dilate` + 1px AA fade beyond → pad by ceil(dilate)+1.
+    let pad = dilate.ceil() as i32 + 1;
     let base_w = base.width as i32;
     let base_h = base.height as i32;
-    let out_w = base_w + 2 * r;
-    let out_h = base_h + 2 * r;
+    let out_w = base_w + 2 * pad;
+    let out_h = base_h + 2 * pad;
     let n = (out_w * out_h) as usize;
 
     // Distance field: 0 on the (thresholded) glyph silhouette, FAR elsewhere.
@@ -267,7 +271,7 @@ fn dilate_coverage(base: GlyphBitmap, dilate_px: f32) -> GlyphBitmap {
     for sy in 0..base_h {
         for sx in 0..base_w {
             if base.coverage[(sy * base_w + sx) as usize] > 0.0 {
-                dist[idx(sx + r, sy + r)] = 0.0;
+                dist[idx(sx + pad, sy + pad)] = 0.0;
             }
         }
     }
@@ -309,17 +313,18 @@ fn dilate_coverage(base: GlyphBitmap, dilate_px: f32) -> GlyphBitmap {
             dist[idx(x, y)] = d;
         }
     }
-    // Coverage: solid inside the dilated silhouette, 1px AA ramp at the boundary.
+    // Coverage: fully opaque out to `dilate`, then a 1px AA fade to `dilate + 1`
+    // (matches the old solid disk radius, with a smooth edge instead of a hard cut).
     let mut out = vec![0.0f32; n];
     for (o, &d) in out.iter_mut().zip(dist.iter()) {
-        *o = (dilate + 0.5 - d).clamp(0.0, 1.0);
+        *o = (dilate + 1.0 - d).clamp(0.0, 1.0);
     }
     GlyphBitmap {
         width: out_w as usize,
         height: out_h as usize,
         coverage: out,
-        left: base.left - r as f32,
-        top: base.top - r as f32,
+        left: base.left - pad as f32,
+        top: base.top - pad as f32,
     }
 }
 
@@ -518,16 +523,17 @@ mod tests {
     #[test]
     fn dilate_expands_dims_and_offsets() {
         let out = dilate_coverage(solid(4, 4), 5.0);
-        // base + 2*ceil(dilate) on each axis; origin shifts by -r.
-        assert_eq!((out.width, out.height), (14, 14));
-        assert_eq!((out.left, out.top), (-5.0, -5.0));
+        // base + 2*(ceil(dilate)+1) on each axis (the +1 holds the AA fade);
+        // origin shifts by -pad.
+        assert_eq!((out.width, out.height), (16, 16));
+        assert_eq!((out.left, out.top), (-6.0, -6.0));
     }
 
     #[test]
     fn dilate_grows_a_single_pixel_into_a_disk() {
-        // One covered pixel, dilated by r: the chamfer DT must yield full coverage
-        // within ~r and fall to zero beyond ~r+1 (a roughly circular halo). The old
-        // brute force was O(area·r²); this asserts the new DT keeps the shape.
+        // One covered pixel, dilated by r: the chamfer DT must be fully opaque out
+        // to r and clear beyond r+1 (a roughly circular halo). The old brute force
+        // was O(area·r²); this asserts the new DT keeps the shape + solid radius.
         let r = 6.0f32;
         let base = GlyphBitmap {
             width: 1,
@@ -537,20 +543,39 @@ mod tests {
             top: 0.0,
         };
         let out = dilate_coverage(base, r);
-        // Grid is base + 2*ceil(r) = 13x13; the single seed sits at the centre.
-        assert_eq!((out.width, out.height), (13, 13));
-        let cx = (out.width / 2) as i32; // 6
-        let cy = (out.height / 2) as i32; // 6
+        // Grid is base + 2*(ceil(r)+1) = 15x15; the single seed sits at the centre.
+        assert_eq!((out.width, out.height), (15, 15));
+        let cx = (out.width / 2) as i32; // 7
+        let cy = (out.height / 2) as i32; // 7
         let cov = |x: i32, y: i32| out.coverage[(y as usize) * out.width + x as usize];
         assert!(cov(cx, cy) > 0.99, "centre solid");
         assert!(cov(cx + 3, cy) > 0.99, "inside the radius solid");
-        // At the axis edge (distance r) the ramp is partial but present.
-        assert!(cov(cx + 6, cy) > 0.0, "at radius has some coverage");
-        // Roughly circular: the corner (distance r·√2 ≈ 8.5 > r) is clear.
+        // Solid all the way out to the requested radius (dist == r).
+        assert!(cov(cx + 6, cy) > 0.99, "solid out to radius r");
+        // Just past the radius the AA has fully faded.
+        assert!(cov(cx + 7, cy) < 0.01, "beyond radius+1 is clear");
+        // Roughly circular: the corner (distance r·√2 ≈ 9.9 > r) is clear.
         assert!(
             cov(0, 0) < 0.01,
             "corner beyond radius is clear, got {}",
             cov(0, 0)
         );
+    }
+
+    #[test]
+    fn dilate_thin_outline_keeps_solid_weight() {
+        // A 2px outline must stay fully opaque out to 2px (the old hard disk),
+        // not soften to ~0.5α at the boundary (Codex P3 follow-up). Single seed.
+        let base = GlyphBitmap {
+            width: 1,
+            height: 1,
+            coverage: vec![1.0],
+            left: 0.0,
+            top: 0.0,
+        };
+        let out = dilate_coverage(base, 2.0);
+        let c = (out.width / 2) as i32;
+        let cov = |x: i32, y: i32| out.coverage[(y as usize) * out.width + x as usize];
+        assert!(cov(c + 2, c) > 0.99, "outline solid out to its width");
     }
 }

@@ -856,7 +856,13 @@ pub fn auto_base_t(body: &[(f32, f32)], center: (f32, f32), tip: (f32, f32)) -> 
 pub fn resolve_tail_base(shape: &BubbleShape, pivot: (f32, f32), tail: &Tail) -> (f32, f32) {
     let body = tessellate_bubble(shape, pivot);
     let base_t = if tail.base_auto {
-        auto_base_t(&body, pivot, tail.tip)
+        // Use the projected (drawn) tip so the base matches `bubble_geometry`,
+        // which also derives the auto base from the projected tip. For a normal
+        // tip this is the same ray/direction; it only matters for the degenerate
+        // `tip == pivot` fallback, where the drawn tail points downward — the base
+        // handle must follow it rather than snapping to the 0.0 fallback.
+        let tip = project_tip_outside(&body, pivot, tail.tip);
+        auto_base_t(&body, pivot, tip)
     } else {
         tail.base_t
     };

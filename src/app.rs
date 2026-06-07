@@ -21184,9 +21184,11 @@ impl App {
         // (キャッシュミス時) は UI スレッドで同期実行され、AI アップスケール後の大判
         // 画像では post_filter + GPU upload が数百ms かかりうる。cat="fs" /
         // kind="final_composite_build" でサブ計時を出す (cache hit 時は emit しない)。
-        let fc_build_start = std::time::Instant::now();
+        // 計時は perf-log 有効時のみ (cache hit 経路は毎フレーム走るので clock 読みを足さない)。
+        let perf_on = crate::perf::is_enabled();
+        let fc_build_start = perf_on.then(std::time::Instant::now);
         let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
-        let fc_edit_ms = fc_build_start.elapsed().as_secs_f64() * 1000.0;
+        let fc_edit_ms = fc_build_start.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
         let params = self.effective_params(idx).clone();
         let final_key = self.final_composite_key_for_pixels(edit_key, edit_pixels.size, &params);
         let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, &params);
@@ -21197,7 +21199,7 @@ impl App {
             }
         }
 
-        let t_adjust0 = std::time::Instant::now();
+        let t_adjust0 = perf_on.then(std::time::Instant::now);
         let adjusted = if params.is_color_identity() {
             Arc::clone(&edit_pixels)
         } else {
@@ -21206,7 +21208,7 @@ impl App {
                 &params,
             ))
         };
-        let fc_adjust_ms = t_adjust0.elapsed().as_secs_f64() * 1000.0;
+        let fc_adjust_ms = t_adjust0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
 
         let (base_pixels, complete) = match (ai_key, ai_ready) {
             (Some(_), Some(pixels)) => (pixels, true),
@@ -21220,19 +21222,19 @@ impl App {
             (None, _) => (Arc::clone(&adjusted), true),
         };
 
-        let t_post0 = std::time::Instant::now();
+        let t_post0 = perf_on.then(std::time::Instant::now);
         let post_filtered = Arc::new(self.apply_final_post_filter(&base_pixels, &params));
-        let fc_post_ms = t_post0.elapsed().as_secs_f64() * 1000.0;
-        let t_clamp0 = std::time::Instant::now();
+        let fc_post_ms = t_post0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+        let t_clamp0 = perf_on.then(std::time::Instant::now);
         let upload = clamp_for_gpu(&post_filtered);
-        let fc_clamp_ms = t_clamp0.elapsed().as_secs_f64() * 1000.0;
+        let fc_clamp_ms = t_clamp0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
         let tex_opts = if !self.post_filter_bypassed && params.post_filter.needs_nearest_sampler() {
             egui::TextureOptions::NEAREST
         } else {
             egui::TextureOptions::LINEAR
         };
         let [fc_w, fc_h] = post_filtered.size;
-        let t_up0 = std::time::Instant::now();
+        let t_up0 = perf_on.then(std::time::Instant::now);
         let texture = ctx.load_texture(
             format!(
                 "final_composite_{}_{}_{}_{}",
@@ -21244,7 +21246,7 @@ impl App {
             upload.into_owned(),
             tex_opts,
         );
-        let fc_upload_ms = t_up0.elapsed().as_secs_f64() * 1000.0;
+        let fc_upload_ms = t_up0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
         self.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
@@ -21253,7 +21255,7 @@ impl App {
                 complete,
             },
         );
-        if crate::perf::is_enabled() {
+        if perf_on {
             crate::perf::event(
                 "fs",
                 "final_composite_build",
@@ -21262,7 +21264,9 @@ impl App {
                 &[
                     (
                         "ms",
-                        (fc_build_start.elapsed().as_secs_f64() * 1000.0).into(),
+                        fc_build_start
+                            .map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0)
+                            .into(),
                     ),
                     ("edit_ms", fc_edit_ms.into()),
                     ("adjust_ms", fc_adjust_ms.into()),
