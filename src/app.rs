@@ -3236,6 +3236,10 @@ pub struct App {
     pub(crate) search_query: String,
     /// 検索結果フィルタ: Some = フィルタ中（表示するアイテムの元インデックス集合）
     pub(crate) search_filter: Option<std::collections::HashSet<usize>>,
+    /// Ctrl+F のフィルタが作られたユーザー視点のフォルダ。
+    /// この場所では BS / Alt+↑ / ⬆ による親移動を止め、子フォルダ等へ移動して
+    /// フィルタが解除された後は通常どおり親へ戻れるようにする。
+    pub(crate) search_filter_origin_folder: Option<PathBuf>,
 
     /// 非同期実行中のメタデータ検索。`execute_search` で spawn、`poll_search` で受信。
     /// 大フォルダで `read_tweet_info` / `build_searchable_from_path` が UI スレッドを
@@ -5200,6 +5204,7 @@ impl App {
             tag_prewarm_queued: std::collections::HashSet::new(),
             delete_pending: None,
             search_filter: None,
+            search_filter_origin_folder: None,
             visible_indices: Vec::new(),
             pending_finalize: std::collections::HashSet::new(),
             last_vis_range: (0, 0),
@@ -6512,6 +6517,19 @@ impl App {
         self.archive_source_override
             .clone()
             .or_else(|| self.current_folder.clone())
+    }
+
+    pub(crate) fn local_search_blocks_parent_nav(&self) -> bool {
+        self.show_search_bar
+            && (self.search_filter.is_some() || self.search_pending.is_some())
+            && self
+                .search_filter_origin_folder
+                .as_ref()
+                .is_some_and(|origin| {
+                    self.effective_folder()
+                        .as_ref()
+                        .is_some_and(|cur| crate::folder_tree::path_eq(cur, origin))
+                })
     }
 
     fn push_folder_nav_stack(stack: &mut Vec<PathBuf>, path: PathBuf) {
@@ -7920,6 +7938,7 @@ impl App {
             self.show_search_bar = false;
             self.search_query.clear();
             self.search_filter = None;
+            self.search_filter_origin_folder = None;
             self.search_has_focus = false;
             self.cancel_search_pending();
             self.rebuild_visible_indices();
@@ -9584,6 +9603,7 @@ impl App {
             .unwrap_or(self.settings.default_spread_mode);
         self.spread_popup_open = false;
         self.search_filter = None;
+        self.search_filter_origin_folder = None;
         self.search_query.clear();
         // 非同期検索 in-flight があればキャンセル (フォルダ切替で items が変わるため
         // 検索結果インデックスが意味を失う)
@@ -14056,6 +14076,10 @@ impl App {
                 // favsearch_back 内で load_folder 済み。navigate 経路には流さない。
                 return None;
             }
+            if self.local_search_blocks_parent_nav() {
+                self.cancel_pending_folder_nav();
+                return None;
+            }
             if let Some(ref cur) = self.effective_folder() {
                 if let Some(parent) = cur.parent() {
                     // 親に戻ったとき、元のフォルダ名を選択するようにヒントを設定
@@ -15852,9 +15876,11 @@ impl App {
         let tokens = crate::search_query::parse(&self.search_query);
         if tokens.is_empty() {
             self.search_filter = None;
+            self.search_filter_origin_folder = None;
             self.rebuild_visible_indices();
             return;
         }
+        self.search_filter_origin_folder = self.effective_folder();
 
         // スレッドに渡すスナップショット: items は中身 PathBuf を含むので clone コストは
         // あるが、検索は低頻度操作なので許容範囲。xmp_cache は既読分のルックアップ
@@ -15967,6 +15993,7 @@ impl App {
                     self.xmp_cache.entry(key).or_insert(xmp);
                 }
                 self.search_filter = Some(matches);
+                self.search_filter_origin_folder = self.effective_folder();
                 self.rebuild_visible_indices();
                 self.selected = None;
                 self.scroll_offset_y = 0.0;
@@ -27429,6 +27456,7 @@ impl eframe::App for App {
                 self.show_search_bar = false;
                 self.search_query.clear();
                 self.search_filter = None;
+                self.search_filter_origin_folder = None;
                 self.search_has_focus = false;
                 self.cancel_search_pending();
                 self.rebuild_visible_indices();

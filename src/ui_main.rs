@@ -1367,6 +1367,7 @@ impl App {
         // 動ける状態。最上位ではこれらを disabled にする条件)。
         let search_drilled_in = (self.global_search.active && self.global_search.drill.is_some())
             || (self.favsearch.active && !self.favsearch.nav_stack.is_empty());
+        let local_search_blocks_parent = self.local_search_blocks_parent_nav();
 
         // 現在表示中フォルダ / ZIP / PDF のコンテナレーティングを取得。
         // 0 のときは非表示、1〜5 のときは★バッジをアドレス欄の右端に表示する。
@@ -1466,6 +1467,9 @@ impl App {
                             // Codex P2-1: ★固定 中は親への移動 (= scope 外) を disabled
                             let parent_hover = if snapshot_active {
                                 "★固定中は親フォルダへ移動できません".to_string()
+                            } else if local_search_blocks_parent {
+                                "Ctrl+F フィルタ中は親フォルダへ移動できません\nEsc または × で検索を閉じます"
+                                    .to_string()
                             } else {
                                 parent_target
                                     .as_ref()
@@ -1474,7 +1478,9 @@ impl App {
                             };
                             if ui
                                 .add_enabled(
-                                    parent_target.is_some() && !snapshot_active,
+                                    parent_target.is_some()
+                                        && !snapshot_active
+                                        && !local_search_blocks_parent,
                                     egui::Button::new("⬆"),
                                 )
                                 .hover_tip(parent_hover)
@@ -1757,6 +1763,7 @@ impl App {
             self.show_search_bar = false;
             self.search_query.clear();
             self.search_filter = None;
+            self.search_filter_origin_folder = None;
             self.search_has_focus = false;
             self.cancel_search_pending();
             self.rebuild_visible_indices();
@@ -1858,6 +1865,7 @@ impl App {
                     self.show_search_bar = false;
                     self.search_query.clear();
                     self.search_filter = None;
+                    self.search_filter_origin_folder = None;
                     self.search_has_focus = false;
                     self.cancel_search_pending();
                     self.rebuild_visible_indices();
@@ -1907,6 +1915,7 @@ impl App {
                     self.show_search_bar = false;
                     self.search_query.clear();
                     self.search_filter = None;
+                    self.search_filter_origin_folder = None;
                     self.search_has_focus = false;
                     self.cancel_search_pending();
                     self.rebuild_visible_indices();

@@ -783,6 +783,28 @@ mod phase_c_key_tests {
     use super::phase_c_support::setup_app;
     use super::*;
 
+    fn grid_key_nav(
+        app: &mut App,
+        modifiers: egui::Modifiers,
+        key: egui::Key,
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        });
+        let nav = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+        nav
+    }
+
     /// ベースライン: 新規 App はどの検索バーも開いていないこと。
     #[test]
     fn new_app_has_no_search_bar_open() {
@@ -860,6 +882,45 @@ mod phase_c_key_tests {
         assert!(app.global_search.active);
         assert!(!app.show_search_bar, "Ctrl+G should close Ctrl+F");
         assert!(!app.favsearch.active);
+    }
+
+    /// Ctrl+F のフィルタが現在フォルダに効いている間は、BS でフィルタ外の親へ
+    /// 抜けない。検索を閉じる操作 (Esc / ×) と親移動を分けるための回帰ガード。
+    #[test]
+    fn ctrl_f_filter_blocks_backspace_parent_nav_at_origin() {
+        let mut app = setup_app();
+        let origin = PathBuf::from("C:/pics/origin");
+        app.current_folder = Some(origin.clone());
+        app.show_search_bar = true;
+        app.search_filter = Some(std::collections::HashSet::new());
+        app.search_filter_origin_folder = Some(origin);
+
+        let nav = grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Backspace);
+
+        assert!(
+            nav.is_none(),
+            "Ctrl+F フィルタ元フォルダでは BS で親フォルダへ抜けない"
+        );
+    }
+
+    /// Ctrl+F の検索結果から子フォルダへ入った後の BS は、元フォルダへ戻る通常ナビとして
+    /// 通す。origin と現在地が異なる限り、検索バー表示だけでは親移動を止めない。
+    #[test]
+    fn ctrl_f_filter_allows_backspace_from_child_folder() {
+        let mut app = setup_app();
+        let origin = PathBuf::from("C:/pics/origin");
+        let child = origin.join("child");
+        app.current_folder = Some(child);
+        app.show_search_bar = true;
+        app.search_filter = Some(std::collections::HashSet::new());
+        app.search_filter_origin_folder = Some(origin.clone());
+
+        let nav = grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Backspace);
+
+        match nav {
+            Some(crate::ui_main::AddressBarNav::Direct(path)) => assert_eq!(path, origin),
+            _ => panic!("子フォルダでは BS で Ctrl+F 元フォルダへ戻れること"),
+        }
     }
 
     /// Codex P2 #3: 選択中の Ctrl+S お気に入りフィルタが設定から消えたら、
