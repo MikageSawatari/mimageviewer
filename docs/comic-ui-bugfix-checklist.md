@@ -138,6 +138,35 @@
 - **ユーザー判断: ロジックは変えず、ラベルを「下の吹き出しと結合」→「すぐ下の吹き出しと結合」に
   して直下条件を伝える文言対応とする。** コメントにも直下のみが意図的である旨を明記。
 
+## 他セッションレビュー 第2ラウンド (2026-06-07)
+
+### ✅ R2-1. comic_lab ビルド不能 (`5f6d5367`) [P0]
+- StampSource::Embedded 追加に対し tools/comic_lab/src/stamp.rs の 3 match (key/label/decode) が
+  未カバーで E0004。本体と同等の embedded 分岐 + embedded_data_key を移植 (base64 は既存依存)。
+
+### ✅ R2-2. 比較準備キャッシュの注釈無効化漏れ (`5f6d5367`) [P1]
+- prepare_capture_pixel_job が comic を焼くようになり注釈も比較入力。compare_prepared_pair_matches
+  は idx だけで一致判定するので、注釈編集で旧ピクセルが残る。mark_comic_dirty (live・現在ページ) と
+  save_comic_objects (永続化・idx 指定) の両方で invalidate_compare_prepared_for_idx を呼ぶ。
+
+### ✅ R2-3. D10 文書/コメントの矛盾 (`5f6d5367`) [P2]
+- docs/comic-integration-plan.md D10 行 + src/comic_overlay.rs ヘッダを「不採用 (2026-06-07)」に更新。
+
+### ✅ R2-4. 埋め込みスタンプ data の undo clone 肥大 (`a7e4e0ba`) [P2]
+- StampSource::Embedded.data を String→Arc<str> 化。undo snapshot (objects.to_vec、cap=100) /
+  comic_docs の clone が画像データを複製せず Arc ポインタだけになる。serde "rc" feature 有効化
+  (JSON 形状不変 = comic.db 互換)。
+
+### 💬 R2-5. AI prefetch の CPU 化が下位レイヤで破れる [P2、F2 残と同件]
+- 編集済み (conceal/局所補正/消しゴム) 近隣ページは prefetch 中も各 layer texture を UI スレッドで
+  upload (ensure_conceal_texture / local-adjust render 完了 upload)。edit_result の universal upload
+  は F2 で解消済み。完全 CPU 化は conceal/erase/local の CPU 専用版分離が要る中規模。**要方針判断**。
+
+### 💬 R2-6. ユーザー画像スタンプ追加が UI スレッドで重い [P2]
+- ファイル選択直後に embed_file_stamp (read→decode→縮小→PNG encode→base64) + apply 側で aspect 用に
+  埋め込み PNG を再 decode + comic.db 保存が同期。大判写真で ~100-250ms の一回限りフリーズ。**一発
+  操作 (file picker) なので許容 / worker 化 (中規模) のどちらかを方針判断**。
+
 ## 進め方
 - P0 → P1 → P2 の順。各修正は pathspec commit（src/ui_text.rs 等）、退避ブランチ `comic-inc6` 維持。
 - まとまった単位で Codex レビュー。
