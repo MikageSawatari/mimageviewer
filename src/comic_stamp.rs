@@ -492,8 +492,9 @@ mod tests {
     /// R2-6 の「10MB クラス画像で 250ms 以下か」を実機相当で確認した。
     ///
     /// release 実測 (写真ライク画像): 12MP(6MB)≈100ms / 24MP(12MB)≈180ms / 48MP(24MB)≈350ms。
-    /// **「10MB クラス」= 24MP は ~180ms で 250ms 以下 = 許容**。一回限り (file picker 後) なので
-    /// worker 化は不要と判断した (R2-6)。
+    /// この計測を踏まえ、最終的に **embed_file_stamp は worker 化済み** (App::start_stamp_embed が
+    /// 背景スレッドで呼び、中央トーストを出して UI を固めない、R2-6)。本テストはその worker が
+    /// 呼ぶ関数の実コストを計測する。
     ///
     /// JPEG の DCT スケール縮小デコード (decode_jpeg_turbo_scaled_from_path) も試したが、埋め込み
     /// ターゲットが 1024px だとスケールが 1/4 止まりで **エントロピー復号 (ファイルサイズ比例・

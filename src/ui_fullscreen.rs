@@ -768,6 +768,30 @@ impl App {
         }
     }
 
+    /// 分析モードを ON/OFF トグルする。**Z キーとホバーバー分析ボタンの共通経路** (Codex P1:
+    /// ボタンが `analysis_mode` を直接反転して副作用 = ズーム/パン引き継ぎ・post-filter
+    /// bypass の enter/exit・補正パネル排他 を飛ばしていた退行を防ぐ)。
+    pub(crate) fn toggle_analysis_mode(&mut self) {
+        if self.analysis_mode {
+            // 分析→通常: ズーム/パンを引き継ぐ
+            self.fs_zoom = self.analysis_zoom;
+            self.fs_pan = self.analysis_pan;
+            self.reset_analysis_mode();
+        } else {
+            // 通常→分析: ズーム/パンを引き継ぐ
+            self.analysis_zoom = self.fs_zoom;
+            self.analysis_pan = self.fs_pan;
+            self.analysis_mode = true;
+            self.enter_analysis_mode_bypass();
+            // 補正パネルと排他
+            self.adjustment_mode = false;
+            self.local_adjust_mode = false;
+            self.local_adjust_add_layer_dialog_open = false;
+            self.local_adjust_change_mask_dialog_open = false;
+            self.local_adjust_effect_picker_dialog_open = false;
+        }
+    }
+
     /// `idx` に対する「現在表示できる最良の既存テクスチャ」を Arc::clone で取り出す。
     /// 優先順: final composite cache → edit cache → fs_cache (Static / Animated 現フレーム)
     /// → サムネ (`include_thumb=true` のときのみ)。
@@ -2585,6 +2609,7 @@ impl App {
                             let mut panorama_pressed = false;
                             let margin_fit_active = self.settings.margin_fit_enabled;
                             let mut margin_fit_pressed = false;
+                            let mut bar_analysis_pressed = false;
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
                                 &state.location_display,
@@ -2596,7 +2621,8 @@ impl App {
                                 &mut self.slideshow_playing,
                                 &mut self.settings.slideshow_interval_secs,
                                 &mut bar_rotate_cw, &mut bar_rotate_ccw,
-                                &mut self.analysis_mode,
+                                self.analysis_mode,
+                                &mut bar_analysis_pressed,
                                 panorama_trigger,
                                 panorama_active,
                                 panorama_mode_active,
@@ -2625,6 +2651,10 @@ impl App {
                             );
                             if copy_capture_pressed {
                                 self.copy_image_capture_to_clipboard(ctx, fs_idx);
+                            }
+                            // 分析ボタン押下は Z キーと同じ経路へ合流 (副作用込み、Codex P1)。
+                            if bar_analysis_pressed && !is_spread_double {
+                                self.toggle_analysis_mode();
                             }
                             // 余白カットフィット トグル (設定を反転 + 保存、bbox キャッシュを破棄)。
                             if margin_fit_pressed {
@@ -4304,24 +4334,7 @@ impl App {
             self.toggle_panorama_mode(fs_idx);
         }
         if key_z && !is_spread_double {
-            if self.analysis_mode {
-                // 分析→通常: ズーム/パンを引き継ぐ
-                self.fs_zoom = self.analysis_zoom;
-                self.fs_pan = self.analysis_pan;
-                self.reset_analysis_mode();
-            } else {
-                // 通常→分析: ズーム/パンを引き継ぐ
-                self.analysis_zoom = self.fs_zoom;
-                self.analysis_pan = self.fs_pan;
-                self.analysis_mode = true;
-                self.enter_analysis_mode_bypass();
-                // 補正パネルと排他
-                self.adjustment_mode = false;
-                self.local_adjust_mode = false;
-                self.local_adjust_add_layer_dialog_open = false;
-                self.local_adjust_change_mask_dialog_open = false;
-                self.local_adjust_effect_picker_dialog_open = false;
-            }
+            self.toggle_analysis_mode();
         }
         if self.analysis_mode && !is_spread_double {
             if key_g {
@@ -7858,7 +7871,11 @@ impl App {
         _slideshow_interval: &mut f32,
         rotate_cw: &mut bool,
         rotate_ccw: &mut bool,
-        show_analysis: &mut bool,
+        // 分析ボタン: 表示状態 (active) は値で受け、押下は out フラグで返す。`analysis_mode` を
+        // 直接反転すると Z キー経路の副作用 (ズーム/パン引き継ぎ・bypass enter/exit・補正排他) を
+        // 飛ばすため、呼び出し側で `toggle_analysis_mode()` に合流させる (Codex P1)。
+        analysis_active: bool,
+        analysis_pressed: &mut bool,
         // 360 度パノラマビュー (docs/panorama-360-view-plan.md §5.3):
         // - trigger Some(Auto/Hint) のとき球体アイコンを表示。None なら disabled 表示。
         // - panorama_active=true なら強調背景。
@@ -8187,13 +8204,13 @@ impl App {
                 next_x,
                 bar_rect.min.y + BAR_BUTTON_MARGIN,
                 "fs_analysis_btn",
-                |hovered| bar_button_bg(hovered, *show_analysis),
-                *show_analysis,
+                |hovered| bar_button_bg(hovered, analysis_active),
+                analysis_active,
                 |p, c, r| draw_analysis_icon(p, c, r),
             );
             let analysis_resp = analysis_resp.hover_tip_dark("分析ツール [Z]");
             if analysis_resp.clicked() {
-                *show_analysis = !*show_analysis;
+                *analysis_pressed = true;
             }
             if analysis_resp.hovered() {
                 *nav_delta = 0;

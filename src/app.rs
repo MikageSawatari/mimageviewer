@@ -21730,10 +21730,12 @@ impl App {
     /// 使う)。表示と同じ S=base長辺/source長辺 で base 解像度に焼くので、呼び出し側
     /// (export) はこの上に crop + ダウンサンプルを掛ける (Inc 7)。
     ///
-    /// 注: 現状はダウンサンプル**前**(base 解像度)で焼くため、強い縮小時はテキストが
-    /// 下地と一緒に縮小される。D10 の「ダウンサンプル後に最終解像度直焼き」は将来の
-    /// 鮮明化リファイン (等倍/軽縮小では差は出ない)。フルスクリーン Ctrl+E 経路は
-    /// conceal_mask=None なので、ここで焼いた注釈が conceal preset に潰されることはない。
+    /// 注: ダウンサンプル**前**(base 解像度)で焼くため、強い縮小時はテキストが下地と一緒に
+    /// 縮小される。D10 の「ダウンサンプル後に最終解像度直焼き」は **不採用 (2026-06-07)** —
+    /// 座標多段でズレ系バグが出やすく、最終出力縮小は重視機能でないため (詳細は
+    /// docs/comic-ui-bugfix-checklist.md C5 / docs/comic-integration-plan.md D10)。等倍/軽縮小では
+    /// 差は出ない。フルスクリーン Ctrl+E 経路は conceal_mask=None なので、ここで焼いた注釈が
+    /// conceal preset に潰されることはない。
     pub(crate) fn comic_composited_pixels_for_export(
         &mut self,
         ctx: &egui::Context,
@@ -22771,6 +22773,12 @@ impl App {
         self.compare_prepared_pair = None;
         self.compare_prepare_pending = None;
         self.compare_wipe_dragging = false;
+        // ピン留め (X) スロットは焼き込み済み pixels を保持するので、フォントソース変更では
+        // 旧フォントのまま残る。スロット + 進行中の pin worker / load も落とす (Codex P2)。
+        // ユーザーは必要なら再ピンする (フォントパック導入/削除は稀な操作)。
+        self.pinned_compare_slot = None;
+        self.compare_pin_pending = None;
+        self.compare_pin_load_pending = None;
     }
 
     /// 指定ページの補正関連キャッシュをクリアする。
