@@ -6895,6 +6895,11 @@ impl App {
             && !self.snapshot_internal_nav
             && self.snapshot_owner_entry(&path).is_none()
         {
+            // 範囲外で load がブロックされると、開く直前に立てた自動フルスクリーン予約を
+            // load_zip_as_folder が消化できず stale 化する (Codex P3: ★固定中に範囲外の
+            // 変換アーカイブ/ZIP/PDF を開こうとしたケース)。ここで明示的にクリアして、
+            // 次の正当な open が誤ってフルスクリーンになるのを防ぐ。
+            self.pending_auto_fs_open = false;
             self.show_feedback_toast(
                 "スナップショット中は範囲外のフォルダに移動できません (★固定を解除してください)"
                     .into(),
