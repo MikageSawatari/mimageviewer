@@ -33,6 +33,10 @@ impl ComicUserStampDb {
     }
 
     fn from_connection(conn: rusqlite::Connection) -> Result<Self, rusqlite::Error> {
+        // 履歴書き込みは配置ごとに別スレッドから走り、読み出し (ピッカー) は UI スレッドの
+        // 別コネクションから走る。同時アクセスで SQLITE_BUSY → 取りこぼし/失敗にならないよう
+        // ロック待ちを許す (書き込みは小さいので待ちは一瞬)。
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS user_stamps (
                 id              TEXT    PRIMARY KEY,
@@ -54,14 +58,21 @@ impl ComicUserStampDb {
     }
 
     /// `StampSource::Embedded` を履歴へ保存する。絵文字や旧 `File` 参照は対象外。
-    pub fn upsert_embedded(&self, source: &StampSource) -> Result<Option<String>, rusqlite::Error> {
-        self.upsert_embedded_with_cap(source, USER_STAMP_HISTORY_CAP)
+    /// `use_at_ms` は **UI スレッドで採番**した使用時刻 (= 操作順)。書き込み worker 内で時刻を
+    /// 取ると worker スケジューリング順になり最近順が乱れるため、呼び出し側で渡す (Codex P3)。
+    pub fn upsert_embedded(
+        &self,
+        source: &StampSource,
+        use_at_ms: i64,
+    ) -> Result<Option<String>, rusqlite::Error> {
+        self.upsert_embedded_with_cap(source, USER_STAMP_HISTORY_CAP, use_at_ms)
     }
 
     fn upsert_embedded_with_cap(
         &self,
         source: &StampSource,
         cap: usize,
+        use_at_ms: i64,
     ) -> Result<Option<String>, rusqlite::Error> {
         let StampSource::Embedded { name, data } = source else {
             return Ok(None);
@@ -70,7 +81,6 @@ impl ComicUserStampDb {
             return Ok(None);
         };
         let id = stable_png_id(&png);
-        let now = now_ms();
         self.conn.execute(
             "INSERT INTO user_stamps
                 (id, name, png, created_at_ms, last_used_at_ms, use_count)
@@ -80,7 +90,7 @@ impl ComicUserStampDb {
                 png = excluded.png,
                 last_used_at_ms = excluded.last_used_at_ms,
                 use_count = user_stamps.use_count + 1",
-            rusqlite::params![id, name, png, now],
+            rusqlite::params![id, name, png, use_at_ms],
         )?;
         self.prune_to(cap)?;
         Ok(Some(id))
@@ -138,7 +148,9 @@ fn stable_png_id(png: &[u8]) -> String {
     out
 }
 
-fn now_ms() -> i64 {
+/// 現在の Unix エポックからのミリ秒。履歴の使用時刻は **UI スレッドでこれを採番**して
+/// `upsert_embedded` に渡す (書き込み worker 内で取らない、Codex P3)。
+pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
@@ -177,7 +189,7 @@ mod tests {
         let db = db();
         let src = embedded("stamp-a", b"png-a");
 
-        assert!(db.upsert_embedded(&src).unwrap().is_some());
+        assert!(db.upsert_embedded(&src, 1).unwrap().is_some());
         let list = db.list_recent(10);
 
         assert_eq!(list.len(), 1);
@@ -190,7 +202,7 @@ mod tests {
         let db = db();
 
         assert_eq!(
-            db.upsert_embedded(&StampSource::Emoji("1f600".to_string()))
+            db.upsert_embedded(&StampSource::Emoji("1f600".to_string()), 1)
                 .unwrap(),
             None
         );
@@ -202,11 +214,11 @@ mod tests {
         let db = db();
 
         let id1 = db
-            .upsert_embedded(&embedded("old", b"same-png"))
+            .upsert_embedded(&embedded("old", b"same-png"), 1)
             .unwrap()
             .unwrap();
         let id2 = db
-            .upsert_embedded(&embedded("new", b"same-png"))
+            .upsert_embedded(&embedded("new", b"same-png"), 2)
             .unwrap()
             .unwrap();
 
@@ -226,14 +238,17 @@ mod tests {
     fn cap_prunes_old_entries() {
         let db = db();
 
-        db.upsert_embedded_with_cap(&embedded("a", b"a"), 2)
+        db.upsert_embedded_with_cap(&embedded("a", b"a"), 2, 1)
             .unwrap();
-        db.upsert_embedded_with_cap(&embedded("b", b"b"), 2)
+        db.upsert_embedded_with_cap(&embedded("b", b"b"), 2, 2)
             .unwrap();
-        db.upsert_embedded_with_cap(&embedded("c", b"c"), 2)
+        db.upsert_embedded_with_cap(&embedded("c", b"c"), 2, 3)
             .unwrap();
 
         let list = db.list_recent(10);
         assert_eq!(list.len(), 2);
+        // 最新 2 件 (c, b) が残り、最古 (a) が prune される (use_at 昇順で投入)。
+        assert_eq!(crate::comic_stamp::stamp_label(&list[0]), "c");
+        assert_eq!(crate::comic_stamp::stamp_label(&list[1]), "b");
     }
 }

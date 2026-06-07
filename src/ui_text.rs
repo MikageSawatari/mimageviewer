@@ -2986,12 +2986,28 @@ impl App {
             }
         }
         let recents = self.recent_stamps.clone();
-        for s in &recents {
-            self.ensure_stamp_thumb(ctx, s);
-        }
         let user_stamps = self.user_stamps.clone();
-        for s in &user_stamps {
+        // 埋め込み画像サムネ (最近使った + ユーザー画像) は大きい (最大 FILE_STAMP_MAX_PX) ので、
+        // 初回開封で全件 (最大数十枚) を一度にデコードするとモーダルがカクつく (Codex P2)。
+        // 1 フレームあたり数件だけデコードし、未デコードはラベルボタンのまま次フレーム以降に
+        // 回す (request_repaint で継続)。絵文字は軽量なので上の一括デコードのまま。
+        const HEAVY_THUMB_PER_FRAME: usize = 2;
+        let mut thumb_budget = HEAVY_THUMB_PER_FRAME;
+        let mut more_thumbs = false;
+        for s in recents.iter().chain(user_stamps.iter()) {
+            let k = crate::comic_stamp::stamp_source_key(s);
+            if self.stamp_thumb_cache.contains_key(&k) {
+                continue;
+            }
+            if thumb_budget == 0 {
+                more_thumbs = true;
+                break;
+            }
             self.ensure_stamp_thumb(ctx, s);
+            thumb_budget -= 1;
+        }
+        if more_thumbs {
+            ctx.request_repaint();
         }
         let thumbs = self.stamp_thumb_cache.clone();
         let replacing = self.stamp_dialog_replace_target.is_some();
@@ -3265,12 +3281,16 @@ impl App {
             return;
         }
         let db_source = source.clone();
+        // 使用時刻は **UI スレッドで採番** (= 操作順)。worker 内で取ると複数 worker の実行順に
+        // なって最近順が乱れる (Codex P3)。busy_timeout も設定済みなので並行書き込みは待って
+        // 直列化され取りこぼさない。
+        let use_at = crate::comic_user_stamps::now_ms();
         let _ = std::thread::Builder::new()
             .name("user-stamp-history".into())
             .spawn(
                 move || match crate::comic_user_stamps::ComicUserStampDb::open() {
                     Ok(db) => {
-                        if let Err(e) = db.upsert_embedded(&db_source) {
+                        if let Err(e) = db.upsert_embedded(&db_source, use_at) {
                             crate::logger::log(format!(
                                 "[comic] user stamp history save failed: {e}"
                             ));
@@ -3288,6 +3308,31 @@ impl App {
         self.user_stamps
             .truncate(crate::comic_user_stamps::USER_STAMP_PICKER_LIMIT);
         self.user_stamps_loaded = true;
+        // truncate で一覧から落ちた埋め込み画像のサムネ / フル画像キャッシュは、どこからも
+        // 参照されなければ破棄する (セッションメモリの無制限増加を防ぐ、Codex P3)。
+        self.prune_stamp_caches();
+    }
+
+    /// スタンプのサムネ (`stamp_thumb_cache`) / フル画像 (`comic_stamp_cache`) デコードキャッシュ
+    /// から、もうどこからも参照されない **埋め込み画像 (`b:` キー)** のエントリを破棄する。
+    /// 参照元 = 最近使った / ユーザー画像履歴 / 読み込み済み注釈ドキュメント中のスタンプ。
+    /// 絵文字 (`e:`) / ファイル参照 (`f:`) キーは小さいので残す (再デコードは安いが頻度低)。
+    fn prune_stamp_caches(&mut self) {
+        use std::collections::HashSet;
+        let mut live: HashSet<String> = HashSet::new();
+        for s in self.recent_stamps.iter().chain(self.user_stamps.iter()) {
+            live.insert(crate::comic_stamp::stamp_source_key(s));
+        }
+        for objs in self.comic_docs.values() {
+            for o in objs {
+                if let comic_core::AnnotationKind::Stamp(st) = &o.kind {
+                    live.insert(crate::comic_stamp::stamp_source_key(&st.source));
+                }
+            }
+        }
+        let keep = |k: &String| !k.starts_with("b:") || live.contains(k);
+        self.stamp_thumb_cache.retain(|k, _| keep(k));
+        self.comic_stamp_cache.retain(|k, _| keep(k));
     }
 
     /// ピッカーで選んだスタンプソースを適用する。差し替え対象があれば既存スタンプの
