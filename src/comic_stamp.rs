@@ -480,6 +480,51 @@ pub fn push_recent_stamp(recent: &mut Vec<StampSource>, source: &StampSource) {
 mod tests {
     use super::*;
 
+    /// 計測用 (通常 CI では走らせない): 大判画像をスタンプ埋め込みする時間を測る。
+    /// `cargo test --bin mimageviewer-core embed_file_stamp_timing -- --ignored --nocapture`
+    /// R2-6 の「10MB クラス画像で 250ms 以下か」を実機相当で確認する。decode は
+    /// image クレート (zune-jpeg) 経由で、turbojpeg は使わない点に注意。
+    #[test]
+    #[ignore]
+    fn embed_file_stamp_timing() {
+        use std::io::Write;
+        // 圧縮しにくいノイズを LCG で生成 (rand 非依存)。q=92 で「10MB クラス」を作る。
+        fn noisy_jpeg(w: u32, h: u32) -> Vec<u8> {
+            let mut state: u32 = 0x9e3779b9;
+            let mut rgb = vec![0u8; (w * h * 3) as usize];
+            for b in rgb.iter_mut() {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                *b = (state >> 24) as u8;
+            }
+            let img = image::RgbImage::from_raw(w, h, rgb).expect("rgb buf");
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92)
+                .encode_image(&image::DynamicImage::ImageRgb8(img))
+                .expect("encode jpeg");
+            out.into_inner()
+        }
+        for (w, h) in [(4000u32, 3000u32), (6000, 4000), (8000, 6000)] {
+            let jpeg = noisy_jpeg(w, h);
+            let mp = (w as f64 * h as f64) / 1e6;
+            let mb = jpeg.len() as f64 / 1e6;
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!("miv_stamp_timing_{w}x{h}.jpg"));
+            {
+                let mut f = std::fs::File::create(&path).expect("create temp");
+                f.write_all(&jpeg).expect("write temp");
+            }
+            let t0 = std::time::Instant::now();
+            let src = embed_file_stamp(&path);
+            let elapsed = t0.elapsed();
+            assert!(src.is_some(), "embed should succeed for {w}x{h}");
+            eprintln!(
+                "embed_file_stamp {w}x{h} ({mp:.0}MP, {mb:.1}MB JPEG) -> {:.0}ms",
+                elapsed.as_secs_f64() * 1000.0
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     #[test]
     fn catalog_keys_unique_and_named() {
         let mut seen = std::collections::HashSet::new();
