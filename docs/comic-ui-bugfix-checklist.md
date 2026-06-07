@@ -270,6 +270,10 @@
   正しく reset)。1 グループ (軽ページ) は直接ベイク。並列==逐次の決定性テスト追加。
 - 実測 (release, 3584x4608): 30× 48px 装飾ブロック 335ms→**104ms** (3.2x)。B と合わせ背景で進む。
 - 検証: comic-core 102 passed、本体 bin 2100 passed。
+- Codex 追随 (`9ba7896d`): P1 worker 無制限増加→comic_bake_inflight (実走行数で上限2) + cancel フラグ。
+  P1 stale 結果→poll の items_gen 検証 + cancel_all/for_idx を無効化箇所に配線。P2 回転 AABB を
+  local pad 後に回転 (bake_into 一致、回転 no-clip 回帰テスト)。P3 ±1 LSB (重なり半透明/回転) は許容+明記。
+  comic-core 103 passed、本体 bin 2100 passed。
 - 残 (任意): ②ソフトマスク簡素化 (パス削減、見た目変化のため要承認) は未着手。
 
 ## 進め方
