@@ -104,6 +104,13 @@ impl App {
     /// pending_nav 経路は `show_archive_convert_dialog` 内で直接処理する
     /// (そちらは `archive_convert` のライフサイクルと絡むため)。
     pub(crate) fn open_archive_via_cache(&mut self, src: PathBuf, cached_zip: PathBuf) {
+        // 設定 ON のとき、変換アーカイブ (LZH/7z) も ZIP/PDF と同じく 1 ページ目を自動
+        // フルスクリーン表示する。`load_folder(cache_zip)` → `load_zip_as_folder` が
+        // `pending_auto_fs_open` を消化する直前に立てるので、変換キャンセル等で stale
+        // 化しない (= 実際にアーカイブが開く直前にのみ立つ)。
+        if self.settings.auto_fullscreen_zip_pdf {
+            self.pending_auto_fs_open = true;
+        }
         self.load_folder(cached_zip.clone());
         self.address = src.to_string_lossy().to_string();
         // 検索 (Ctrl+G / Ctrl+S) 中は recent_folders を一切変更しない
@@ -165,6 +172,11 @@ impl App {
                 // その後 override に元パスを書き戻すことで、UI 表示は元ファイルの場所のままに保つ。
                 let src = self.archive_convert.as_ref().map(|s| s.src_path.clone());
                 self.archive_convert = None;
+                // 変換成功直後も、設定 ON なら ZIP/PDF と同じく 1 ページ目を自動
+                // フルスクリーン表示する (load_folder が pending_auto_fs_open を消化)。
+                if self.settings.auto_fullscreen_zip_pdf {
+                    self.pending_auto_fs_open = true;
+                }
                 self.load_folder(nav.clone());
                 if let Some(src) = src {
                     self.address = src.to_string_lossy().to_string();
