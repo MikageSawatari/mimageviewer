@@ -1458,6 +1458,14 @@ fn set_rgba_to_clipboard(width: u32, height: u32, rgba: &[u8], my_seq: u64) {
 ///   消さない (= 部分失敗したカットをユーザーが再試行できる)。
 ///
 /// 同名フォルダが既存の場合は `-Force` でマージ上書きする (D&D 経路と同挙動)。
+///
+/// 既知の制限: 自己再帰ガードは `GetFullPath` の文字列前方一致で判定する。dest が
+/// junction / symlink で物理的に src 配下を指す場合は文字列上は前方一致せず素通りしうる
+/// (PowerShell 5.1 では reparse point の最終ターゲット解決が容易でないため)。その場合でも
+/// `Copy-Item -Recurse` は MAX_PATH 等で頭打ちになり `-ErrorAction Stop` で失敗として
+/// 報告される (無限/無言にはならない)。D&D 経路の `dir_copy_would_recurse` は canonicalize
+/// 済みで完全。完全一致が必要になれば paste も Rust 側で clipboard を読んで canonicalize
+/// するよう寄せる。
 pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiver<CopyOutcome> {
     let (tx, rx) = mpsc::channel();
     #[cfg(windows)]
@@ -1571,16 +1579,14 @@ fn execute_paste_script(tmp: &std::path::Path, script: &str) -> CopyOutcome {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let mut attempted: Option<usize> = None;
-    let mut failed: usize = 0;
+    let mut failed: Option<usize> = None;
     let mut skipped: usize = 0;
     let mut first_errors: Vec<String> = Vec::new();
     for line in stdout.lines() {
         if let Some(rest) = line.strip_prefix("::ATTEMPTED::") {
             attempted = rest.trim().parse::<usize>().ok();
         } else if let Some(rest) = line.strip_prefix("::FAILED::") {
-            if let Ok(n) = rest.trim().parse::<usize>() {
-                failed = n;
-            }
+            failed = rest.trim().parse::<usize>().ok();
         } else if let Some(rest) = line.strip_prefix("::SKIPPED::") {
             if let Ok(n) = rest.trim().parse::<usize>() {
                 skipped = n;
@@ -1589,10 +1595,15 @@ fn execute_paste_script(tmp: &std::path::Path, script: &str) -> CopyOutcome {
             first_errors.push(rest.to_string());
         }
     }
-    // 非ゼロ exit / マーカー欠落 = スクリプトが完走しなかった → 全件失敗扱い。
-    if !out.status.success() || attempted.is_none() {
+    // 非ゼロ exit / 必須マーカー (ATTEMPTED, FAILED) 欠落 = スクリプトが完走しなかった
+    // → 全件失敗扱い (copy 経路と同じく、欠落を成功に潰さない)。SKIPPED は notice 用なので
+    // 欠落しても 0 扱いで可。
+    if !out.status.success() || attempted.is_none() || failed.is_none() {
         let mut errs = if out.status.success() {
-            vec!["powershell did not emit ::ATTEMPTED:: marker (script crashed)".to_string()]
+            vec![
+                "powershell did not emit required ::ATTEMPTED::/::FAILED:: markers (script crashed)"
+                    .to_string(),
+            ]
         } else {
             vec![format!("powershell exit code {:?}", out.status.code())]
         };
@@ -1612,6 +1623,7 @@ fn execute_paste_script(tmp: &std::path::Path, script: &str) -> CopyOutcome {
         };
     }
     let attempted = attempted.unwrap_or(0);
+    let failed = failed.unwrap_or(0);
     let notice = (skipped > 0).then(|| {
         format!("{skipped} 件をスキップしました (自身の中・同じ場所への貼り付けはできません)")
     });

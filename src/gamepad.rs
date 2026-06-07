@@ -1,17 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
-    mpsc,
 };
 use std::time::{Duration, Instant};
 
 #[cfg(not(test))]
 use gilrs::{Axis, Button, EventType, Gilrs};
 
-/// 入力イベントの bounded channel 容量。UI が長時間 drain しない (最小化 / 長 stall) と
-/// 無制限チャネルにイベントが溜まってメモリスパイク / 復帰時ヒッチになるため上限を設け、
-/// 溢れた古い入力は producer 側で捨てる (リアルタイム入力なので stale は無価値)。
+/// 入力イベントキューの上限。UI が長時間 drain しない (最小化 / 長 stall) と無制限に
+/// 溜まってメモリスパイク / 復帰時ヒッチになるため上限を設ける。溢れたときは **最古** を
+/// 捨てて最新を残す (= release / disconnect / 中立軸 などの重要イベントを失わない)。
 #[cfg(not(test))]
 const GAMEPAD_EVENT_CAP: usize = 256;
 
@@ -66,7 +65,11 @@ pub enum PadEvent {
 }
 
 pub struct GamepadRuntime {
-    rx: mpsc::Receiver<PadEvent>,
+    /// producer (gilrs スレッド) → consumer (UI スレッド) の共有キュー。mpsc を使わず
+    /// `VecDeque` にしているのは、満杯時に **最古** を捨てて最新を残す (drop-oldest) ため。
+    /// mpsc の sync_channel は満杯時に送ろうとした最新を捨ててしまい、release / disconnect /
+    /// 中立軸を取りこぼして状態が固着しうる。
+    queue: Arc<Mutex<VecDeque<PadEvent>>>,
     shutdown: Arc<AtomicBool>,
     #[cfg(not(test))]
     handle: Option<std::thread::JoinHandle<()>>,
@@ -81,9 +84,8 @@ impl Default for GamepadRuntime {
 
 impl GamepadRuntime {
     pub fn new() -> Self {
-        let (_tx, rx) = mpsc::channel();
         Self {
-            rx,
+            queue: Arc::new(Mutex::new(VecDeque::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             #[cfg(not(test))]
             handle: None,
@@ -93,11 +95,8 @@ impl GamepadRuntime {
 
     pub fn drain(&mut self, ctx: &egui::Context) -> Vec<PadEvent> {
         self.ensure_started(ctx);
-        let mut events = Vec::new();
-        while let Ok(event) = self.rx.try_recv() {
-            events.push(event);
-        }
-        events
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.drain(..).collect()
     }
 
     #[cfg(test)]
@@ -111,8 +110,7 @@ impl GamepadRuntime {
             return;
         }
         self.started = true;
-        let (tx, rx) = mpsc::sync_channel(GAMEPAD_EVENT_CAP);
-        self.rx = rx;
+        let queue = Arc::clone(&self.queue);
         let shutdown = Arc::clone(&self.shutdown);
         let repaint_ctx = ctx.clone();
         self.handle = std::thread::Builder::new()
@@ -130,12 +128,14 @@ impl GamepadRuntime {
                     let mut sent_any = false;
                     while let Some(event) = gilrs.next_event() {
                         if let Some(mapped) = map_gilrs_event(event.event) {
-                            match tx.try_send(mapped) {
-                                Ok(()) => sent_any = true,
-                                // チャネル満杯 = UI が長時間 drain していない。古い入力は捨てる。
-                                Err(mpsc::TrySendError::Full(_)) => {}
-                                Err(mpsc::TrySendError::Disconnected(_)) => return,
+                            let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                            // 満杯時は最古を捨てて最新を残す (release/disconnect/中立軸を守る)。
+                            if q.len() >= GAMEPAD_EVENT_CAP {
+                                q.pop_front();
                             }
+                            q.push_back(mapped);
+                            drop(q);
+                            sent_any = true;
                         }
                     }
                     if sent_any {

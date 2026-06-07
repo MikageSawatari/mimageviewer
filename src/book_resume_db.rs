@@ -109,7 +109,10 @@ fn normalize_path(path: &Path) -> String {
 /// の「UI スレッドの同期 I/O は worker 化」)。読み出しは本 open 時の 1 回だけなので
 /// `BookResumeDb` 側 (UI スレッド) のままにしている。
 pub struct BookResumeWriter {
-    tx: mpsc::Sender<(PathBuf, usize)>,
+    /// `Option` なのは `Drop` で先に Sender を落として writer スレッドの recv ループを
+    /// 終了させてから join するため。
+    tx: Option<mpsc::Sender<(PathBuf, usize)>>,
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl BookResumeWriter {
@@ -127,7 +130,7 @@ impl BookResumeWriter {
                     }
                 };
                 // tx が全て drop されるまで (= App 終了まで) 受信し続ける。channel に
-                // 溜まっている分は Disconnected 前に drain されるので取りこぼしは最小。
+                // 溜まっている分は Disconnected 前に drain されるので取りこぼしは無い。
                 while let Ok((path, page)) = rx.recv() {
                     if let Err(e) = db.set(&path, page) {
                         crate::logger::log(format!("book-resume writer: set failed: {e}"));
@@ -135,7 +138,10 @@ impl BookResumeWriter {
                 }
             });
         match spawned {
-            Ok(_) => Some(Self { tx }),
+            Ok(handle) => Some(Self {
+                tx: Some(tx),
+                handle: Some(handle),
+            }),
             Err(e) => {
                 crate::logger::log(format!("book-resume writer: thread spawn failed: {e}"));
                 None
@@ -145,7 +151,21 @@ impl BookResumeWriter {
 
     /// 読書位置を非同期で記録する (送るだけ・UI スレッドはブロックしない)。
     pub fn record(&self, path: &Path, page: usize) {
-        let _ = self.tx.send((path.to_path_buf(), page));
+        if let Some(tx) = &self.tx {
+            let _ = tx.send((path.to_path_buf(), page));
+        }
+    }
+}
+
+impl Drop for BookResumeWriter {
+    fn drop(&mut self) {
+        // Sender を先に落とすと writer の `rx.recv()` がキュー分を drain し切ってから
+        // `Err` を返してループを抜ける。その後 join して、終了時に積んでいた書き込みが
+        // ディスクへ反映されるのを待つ (デタッチのままだとプロセス終了で取りこぼす)。
+        self.tx = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
