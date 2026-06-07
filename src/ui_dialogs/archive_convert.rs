@@ -117,11 +117,23 @@ impl App {
         src: PathBuf,
         cached_zip: PathBuf,
         auto_fullscreen: bool,
-    ) {
+    ) -> bool {
         if auto_fullscreen {
             self.pending_auto_fs_open = true;
         }
         self.load_folder(cached_zip.clone());
+        // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると current_folder は
+        // 変わらない (load_zip_as_folder が current_folder = cache_zip を同期セットする前に
+        // return するため)。その場合は override / address / recent を更新しない
+        // (current_folder は元の場所のまま override だけ範囲外アーカイブを指す不整合を防ぐ、
+        // Codex P1)。戻り値でブロックを呼び出し側にも伝える。
+        if !self
+            .current_folder
+            .as_ref()
+            .is_some_and(|cur| crate::folder_tree::path_eq(cur, &cached_zip))
+        {
+            return false;
+        }
         self.address = src.to_string_lossy().to_string();
         // 検索 (Ctrl+G / Ctrl+S) 中は recent_folders を一切変更しない
         // (remember_recent_folder 自体もガード済みだが、retain も検索中は走らせない)。
@@ -131,6 +143,7 @@ impl App {
             self.remember_recent_folder(&src);
         }
         self.archive_source_override = Some(src);
+        true
     }
 
     /// 変換ダイアログを開始する (スキャン fase から)。
@@ -200,7 +213,15 @@ impl App {
                     self.pending_auto_fs_open = true;
                 }
                 self.load_folder(nav.clone());
-                if let Some(src) = src {
+                // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると
+                // current_folder は変わらない。その場合は override / address / recent を
+                // 更新しない (current_folder は元の場所のまま override だけ範囲外アーカイブを
+                // 指す不整合を防ぐ、Codex P1)。
+                let loaded = self
+                    .current_folder
+                    .as_ref()
+                    .is_some_and(|cur| crate::folder_tree::path_eq(cur, &nav));
+                if loaded && let Some(src) = src {
                     self.address = src.to_string_lossy().to_string();
                     // 検索 (Ctrl+G / Ctrl+S) 中は recent_folders を一切変更しない。
                     if !(self.global_search.active || self.favsearch.active) {
@@ -210,7 +231,7 @@ impl App {
                     }
                     self.archive_source_override = Some(src);
                 }
-                if self.favsearch.active {
+                if loaded && self.favsearch.active {
                     self.update_favsearch_address();
                 }
                 return;

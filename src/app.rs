@@ -6865,8 +6865,13 @@ impl App {
                     self.suppress_folder_nav_record_once = true;
                 }
                 // 履歴の戻る/進む・アドレスバー経由は自動フルスクリーンしない (ZIP/PDF と同じ)。
-                self.open_archive_via_cache(path, cached, false);
-                return FolderOpenOutcome::Loaded;
+                // ★固定 ガード等でブロックされたら Ignored を返し、後続の drill 進行に
+                // 流さない (Codex P1)。
+                return if self.open_archive_via_cache(path, cached, false) {
+                    FolderOpenOutcome::Loaded
+                } else {
+                    FolderOpenOutcome::Ignored
+                };
             } else {
                 return if self.request_archive_convert(path, format, false) {
                     FolderOpenOutcome::ConversionDialogOpened
