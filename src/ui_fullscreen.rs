@@ -689,11 +689,42 @@ fn continuous_reading_page_rects(
     rects
 }
 
-fn continuous_separator_base_size(flow: ReadingFlow, fallback: egui::Vec2) -> egui::Vec2 {
-    if flow.is_horizontal() {
-        egui::vec2((fallback.x * 0.16).clamp(140.0, 320.0), fallback.y.max(1.0))
-    } else {
-        egui::vec2(fallback.x.max(1.0), (fallback.y * 0.16).clamp(90.0, 220.0))
+fn continuous_separator_base_size(_flow: ReadingFlow, fallback: egui::Vec2) -> egui::Vec2 {
+    egui::vec2(fallback.x.max(1.0), fallback.y.max(1.0))
+}
+
+fn nearest_continuous_page_unit_size(
+    units: &[ContinuousReadingUnitSpec],
+    sizes: &[ContinuousReadingUnitSize],
+    pos: usize,
+) -> Option<(f32, f32)> {
+    for prev in (0..pos).rev() {
+        if units.get(prev).is_some_and(|unit| !unit.pages.is_empty()) {
+            let size = sizes.get(prev)?;
+            return Some((size.width, size.height));
+        }
+    }
+    for next in pos + 1..units.len() {
+        if units.get(next).is_some_and(|unit| !unit.pages.is_empty()) {
+            let size = sizes.get(next)?;
+            return Some((size.width, size.height));
+        }
+    }
+    None
+}
+
+fn apply_continuous_separator_unit_sizes(
+    units: &[ContinuousReadingUnitSpec],
+    sizes: &mut [ContinuousReadingUnitSize],
+) {
+    for pos in 0..units.len().min(sizes.len()) {
+        if units[pos].separator_text.is_none() {
+            continue;
+        }
+        if let Some((width, height)) = nearest_continuous_page_unit_size(units, sizes, pos) {
+            sizes[pos].width = width.max(1.0);
+            sizes[pos].height = height.max(1.0);
+        }
     }
 }
 
@@ -7447,6 +7478,7 @@ impl App {
                     self.continuous_unit_size_for_flow(unit, flow, image_rect, zoom, fallback),
                 );
             }
+            apply_continuous_separator_unit_sizes(units, &mut sizes);
             let extents = sizes
                 .iter()
                 .map(|s| {
@@ -13413,6 +13445,79 @@ mod tests {
         assert!(units[0].contains_idx(10));
         assert!(units[0].pages.is_empty());
         assert_eq!(App::continuous_visible_page_count(&units, &[0, 1]), 2);
+    }
+
+    #[test]
+    fn continuous_separator_unit_copies_neighbor_page_size() {
+        let units = vec![
+            ContinuousReadingUnitSpec::pages(1, vec![1]),
+            ContinuousReadingUnitSpec::separator(2, "chapter".to_owned()),
+            ContinuousReadingUnitSpec::pages(3, vec![3]),
+        ];
+        let mut sizes = vec![
+            ContinuousReadingUnitSize {
+                pages: vec![ContinuousReadingPageSize {
+                    idx: 1,
+                    width: 320.0,
+                    height: 480.0,
+                }],
+                width: 320.0,
+                height: 480.0,
+                page_gap: 0.0,
+            },
+            ContinuousReadingUnitSize {
+                pages: Vec::new(),
+                width: 80.0,
+                height: 120.0,
+                page_gap: 0.0,
+            },
+            ContinuousReadingUnitSize {
+                pages: vec![ContinuousReadingPageSize {
+                    idx: 3,
+                    width: 500.0,
+                    height: 700.0,
+                }],
+                width: 500.0,
+                height: 700.0,
+                page_gap: 0.0,
+            },
+        ];
+
+        apply_continuous_separator_unit_sizes(&units, &mut sizes);
+
+        assert_eq!(sizes[1].width, 320.0);
+        assert_eq!(sizes[1].height, 480.0);
+    }
+
+    #[test]
+    fn leading_continuous_separator_unit_copies_next_page_size() {
+        let units = vec![
+            ContinuousReadingUnitSpec::separator(1, "root".to_owned()),
+            ContinuousReadingUnitSpec::pages(2, vec![2]),
+        ];
+        let mut sizes = vec![
+            ContinuousReadingUnitSize {
+                pages: Vec::new(),
+                width: 80.0,
+                height: 120.0,
+                page_gap: 0.0,
+            },
+            ContinuousReadingUnitSize {
+                pages: vec![ContinuousReadingPageSize {
+                    idx: 2,
+                    width: 640.0,
+                    height: 360.0,
+                }],
+                width: 640.0,
+                height: 360.0,
+                page_gap: 0.0,
+            },
+        ];
+
+        apply_continuous_separator_unit_sizes(&units, &mut sizes);
+
+        assert_eq!(sizes[0].width, 640.0);
+        assert_eq!(sizes[0].height, 360.0);
     }
 
     // ── decide_local_adjust_preview_action unit tests ─────────────────────
