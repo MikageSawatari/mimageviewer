@@ -8696,22 +8696,41 @@ impl App {
         // (ソースプレビューの Ctrl 検出と同じ方式)。
         let ctrl_held = crate::ui_fullscreen::ctrl_held_via_os();
 
-        // Space ホールド中はキャンバスをパンする (ラボの `pan_mode = Space/中ボタン` 相当)。
-        // 補正モードでは主ボタンが塗り/図形に取られて従来のドラッグパンが効かないため、
-        // Space を押している間だけ主ボタンドラッグをパンへ振り替える。Space の検出は
-        // FS ビューポートでの stale を避けて Ctrl/Shift と同様 OS 直読みにする。
-        if crate::ui_fullscreen::space_held_via_os() {
-            if primary_down {
-                let delta = ctx.input(|i| i.pointer.delta());
-                if delta != egui::Vec2::ZERO {
-                    self.fs_pan += delta;
-                    ctx.request_repaint();
+        // Space+ドラッグ: 一時パン (消しゴム/隠蔽モードと同じ Photoshop 流)。補正モードでは
+        // 主ボタンが塗り/図形に取られて従来のドラッグパンが効かないため、Space ホールド中だけ
+        // 主ボタンドラッグをパンへ振り替える。Space 検出は FS ビューポートで stale になる
+        // key_down を避け OS 直読みにする。描画ドラッグ進行中は Space を無視して描画を完結させる。
+        let space_held = crate::ui_fullscreen::space_held_via_os();
+        let drawing_in_progress = self.local_adjust_mask_brush_stroke.is_some()
+            || self.local_adjust_shape_drag.is_some()
+            || self.local_adjust_canvas_drag.is_some()
+            || self.local_adjust_mask_shape_drag_start.is_some()
+            || !self.local_adjust_mask_lasso_points.is_empty();
+        if space_held && !drawing_in_progress {
+            if primary_pressed {
+                if let Some(pos) = pointer_pos {
+                    self.fs_pan_drag_start = Some((pos, self.fs_pan));
                 }
-                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-            } else {
-                ctx.set_cursor_icon(egui::CursorIcon::Grab);
+            } else if primary_down {
+                if let Some((start_pos, start_pan)) = self.fs_pan_drag_start {
+                    if let Some(pos) = pointer_pos {
+                        self.fs_pan = start_pan + (pos - start_pos);
+                    }
+                }
             }
+            if primary_released {
+                self.fs_pan_drag_start = None;
+            }
+            ctx.set_cursor_icon(if primary_down {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            });
             return;
+        }
+        // Space 離した瞬間の取りこぼし対策: 描画パスへ戻る前に pan drag を片付ける。
+        if !space_held && self.fs_pan_drag_start.is_some() {
+            self.fs_pan_drag_start = None;
         }
 
         if primary_released {

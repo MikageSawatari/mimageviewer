@@ -984,7 +984,9 @@ impl App {
         let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let paint = self.conceal_paint_mode;
-        let space_held = ctx.input(|i| i.key_down(egui::Key::Space));
+        // Space 検出は OS 直読み。FS ビューポートでは `key_down(Space)` がフォーカス不在で
+        // stale になり Space+ドラッグ パンが発火しないため (Ctrl 境界筆と同じ stale 問題)。
+        let space_held = crate::ui_fullscreen::space_held_via_os();
         let modifiers = ctx.input(|i| i.modifiers);
 
         // パネル上のクリックはツール操作に使わない。ただし、画像上で進行中のドラッグを
