@@ -313,15 +313,24 @@ impl App {
 
         let mut changed = false;
         if pan_active {
-            if let Some(axis) =
-                continuous_reading_stick_axis(self.reading_flow, self.reading_direction, left)
+            // 連続読みのスクロールは、レンダラが実際に連続描画しているとき (continuous_active)
+            // だけ。reading_flow だけで判定すると、解析(Z)/比較(X/C)/オーバーレイ編集で単ページに
+            // フォールバックしているのにスティックがスクロールへ吸われ、ページ送りできなくなる。
+            let continuous_active = self
+                .fullscreen_idx
+                .is_some_and(|idx| self.continuous_reading_active_for_idx(idx));
+            if continuous_active
+                && let Some(axis) =
+                    continuous_reading_stick_axis(self.reading_flow, self.reading_direction, left)
             {
                 let delta = axis * CONTINUOUS_READING_SCROLL_SPEED_PX_PER_SEC * dt;
                 if delta.abs() > 0.5 {
                     self.scroll_vertical_reading_by(ctx, delta);
                     changed = true;
                 }
-            } else if self.reading_flow.is_vertical() || self.reading_flow.is_horizontal() {
+            } else if continuous_active
+                && (self.reading_flow.is_vertical() || self.reading_flow.is_horizontal())
+            {
                 if self.dispatch_gamepad_still_stick_step(ctx, now, left) {
                     changed = true;
                 }
@@ -431,7 +440,10 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
-        if self.current_fullscreen_is_video(fs_idx) {
+        // キーボード key_6 と同条件: 連続読み対応アイテム (画像/ZIP画像/PDFページ) のときだけ
+        // 連結方式を切り替える。動画/非対応アイテム上で切り替えると、見えない flow が
+        // フォルダに永続化され、ナビや各モードキーが壊れる。supported 判定が動画も除外する。
+        if !self.vertical_reading_supported_idx(fs_idx) {
             return;
         }
         let next = self.reading_flow.next();
@@ -506,7 +518,10 @@ impl App {
     }
 
     fn handle_gamepad_still_direction(&mut self, ctx: &egui::Context, fs_idx: usize, dir: PadDir) {
-        if self.reading_flow.is_vertical() {
+        // 連続読みのスクロールは、レンダラが連続描画しているときだけ。そうでなければ
+        // (解析/比較/オーバーレイ編集中など) 下のページ送りへフォールバックさせる。
+        let continuous_active = self.continuous_reading_active_for_idx(fs_idx);
+        if continuous_active && self.reading_flow.is_vertical() {
             match dir {
                 PadDir::Down => {
                     self.scroll_vertical_reading_step(ctx, 1.0);
@@ -518,7 +533,7 @@ impl App {
                 }
                 PadDir::Left | PadDir::Right => {}
             }
-        } else if self.reading_flow.is_horizontal() {
+        } else if continuous_active && self.reading_flow.is_horizontal() {
             let axis_rtl = self.reading_direction == ReadingDirection::Rtl;
             match dir {
                 PadDir::Right if !axis_rtl => {

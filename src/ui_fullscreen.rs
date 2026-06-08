@@ -2251,16 +2251,10 @@ impl App {
                                         compare_mode,
                                         crate::app::CompareViewMode::Off
                                     );
-                                    let continuous_reading_active = !self.reading_flow.is_paged()
-                                        && !analysis_active
-                                        && !state.is_video
-                                        && self.vertical_reading_supported_idx(fs_idx)
-                                        && matches!(
-                                            compare_mode,
-                                            crate::app::CompareViewMode::Off
-                                        )
-                                        && !self.is_overlay_edit_mode_active()
-                                        && !self.is_panorama_mode_active(fs_idx);
+                                    // 入力ハンドラ (キー / ホイール / クリック / gamepad) と
+                                    // 同一述語で判定し、描画と入力の食い違いを構造的に防ぐ。
+                                    let continuous_reading_active =
+                                        self.continuous_reading_active_for_idx(fs_idx);
                                     if continuous_reading_active {
                                         self.draw_fs_continuous_reading(
                                             ui,
@@ -3995,64 +3989,69 @@ impl App {
                 ctx.request_repaint();
                 return action;
             }
-            let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
-            let step = if ctrl_held {
-                crate::ui_adjustment_panel::LOCAL_ADJUST_NUDGE_PIXELS_FAST
-            } else {
-                crate::ui_adjustment_panel::LOCAL_ADJUST_NUDGE_PIXELS
-            };
-            let (mut dx, mut dy) = (0.0_f32, 0.0_f32);
-            ctx.input_mut(|i| {
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
-                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft)
-                {
-                    dx -= step;
+            // 図形が選択されているときだけ矢印 (nudge) / ブラケット (rotate) を consume する。
+            // 未選択時に consume すると、補正パネルでフォーカス中のスライダー等へ矢印が
+            // 届かなくなり微調整できなくなる (ラボ復旧時の回帰防止)。
+            if self.local_adjust_selected_shape.is_some() {
+                let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+                let step = if ctrl_held {
+                    crate::ui_adjustment_panel::LOCAL_ADJUST_NUDGE_PIXELS_FAST
+                } else {
+                    crate::ui_adjustment_panel::LOCAL_ADJUST_NUDGE_PIXELS
+                };
+                let (mut dx, mut dy) = (0.0_f32, 0.0_f32);
+                ctx.input_mut(|i| {
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft)
+                    {
+                        dx -= step;
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
+                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight)
+                    {
+                        dx += step;
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowUp)
+                    {
+                        dy -= step;
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowDown)
+                    {
+                        dy += step;
+                    }
+                });
+                if self.nudge_selected_local_adjust_shape_from_shortcut(fs_idx, dx, dy) {
+                    ctx.request_repaint();
+                    return action;
                 }
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
-                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight)
-                {
-                    dx += step;
+                let rotate_step = if ctrl_held {
+                    crate::ui_adjustment_panel::LOCAL_ADJUST_ROTATE_DEG_STEP_FAST
+                } else {
+                    crate::ui_adjustment_panel::LOCAL_ADJUST_ROTATE_DEG_STEP
+                };
+                let mut rotate_deg = 0.0_f32;
+                ctx.input_mut(|i| {
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::OpenBracket)
+                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::OpenBracket)
+                    {
+                        rotate_deg -= rotate_step;
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::CloseBracket)
+                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::CloseBracket)
+                    {
+                        rotate_deg += rotate_step;
+                    }
+                });
+                if self.rotate_selected_local_adjust_shape_from_shortcut(
+                    fs_idx,
+                    rotate_deg.to_radians(),
+                    ctx.input(|i| i.modifiers.shift),
+                ) {
+                    ctx.request_repaint();
+                    return action;
                 }
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
-                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowUp)
-                {
-                    dy -= step;
-                }
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
-                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowDown)
-                {
-                    dy += step;
-                }
-            });
-            if self.nudge_selected_local_adjust_shape_from_shortcut(fs_idx, dx, dy) {
-                ctx.request_repaint();
-                return action;
-            }
-            let rotate_step = if ctrl_held {
-                crate::ui_adjustment_panel::LOCAL_ADJUST_ROTATE_DEG_STEP_FAST
-            } else {
-                crate::ui_adjustment_panel::LOCAL_ADJUST_ROTATE_DEG_STEP
-            };
-            let mut rotate_deg = 0.0_f32;
-            ctx.input_mut(|i| {
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::OpenBracket)
-                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::OpenBracket)
-                {
-                    rotate_deg -= rotate_step;
-                }
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::CloseBracket)
-                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::CloseBracket)
-                {
-                    rotate_deg += rotate_step;
-                }
-            });
-            if self.rotate_selected_local_adjust_shape_from_shortcut(
-                fs_idx,
-                rotate_deg.to_radians(),
-                ctx.input(|i| i.modifiers.shift),
-            ) {
-                ctx.request_repaint();
-                return action;
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                 if self.cancel_local_adjust_canvas_edit_from_shortcut() {
@@ -4156,7 +4155,10 @@ impl App {
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown));
         let ctrl_page_up =
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp));
-        let continuous_mode_for_page_keys = !self.reading_flow.is_paged();
+        // PageUp/Down のスクロール用 consume も、実際に連続描画している条件
+        // (continuous_reading_active_for_idx) に揃える。reading_flow だけで判定すると、
+        // 非対応アイテム/解析/比較中に PageUp/Down を消費しておきながら無反応 (デッドキー) になる。
+        let continuous_mode_for_page_keys = self.continuous_reading_active_for_idx(fs_idx);
         let page_down = continuous_mode_for_page_keys
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown));
         let page_up = continuous_mode_for_page_keys
@@ -4501,7 +4503,11 @@ impl App {
             };
             self.show_feedback_toast(format!("[{}:{}]", key_num, mode.label()));
         }
-        if key_6 {
+        // 連結方式トグルは連続読み対応アイテム (画像 / ZIP画像 / PDFページ) のときだけ許可する。
+        // 動画やセパレータ上で切り替えると、見えない flow がフォルダ単位で永続化され、
+        // arrow ナビや AI/消しゴム/比較キーが壊れる (レンダラは動画では flow を無視するため
+        // 画面は通常表示のままになり、原因が分かりにくい)。supported 判定が Video/separator を除外する。
+        if key_6 && self.vertical_reading_supported_idx(fs_idx) {
             let flow = self.reading_flow.next();
             self.set_reading_flow_for_fullscreen(ctx, fs_idx, flow);
             self.show_feedback_toast(format!("[6:{}]", flow.label()));
@@ -4860,8 +4866,13 @@ impl App {
         // ── ナビゲーション ──
         // RTL モードでは左右キーの意味を反転
         let rtl = self.spread_mode.is_rtl();
-        let vertical_reading = self.reading_flow.is_vertical();
-        let horizontal_reading = self.reading_flow.is_horizontal();
+        // 連続読みのスクロール/ナビ分岐は、レンダラが実際に連続描画している条件と一致させる。
+        // これで縦/横読み中に解析(Z)・比較(X/C)・オーバーレイ編集・動画/非対応アイテムへ
+        // 入ったとき、↑↓ がスクロールへ吸われてナビもスクロールもしない (デッド入力) のを防ぎ、
+        // フォールバック描画 (単ページ) に対して通常のページ送りが効くようにする。
+        let continuous_active = self.continuous_reading_active_for_idx(fs_idx);
+        let vertical_reading = continuous_active && self.reading_flow.is_vertical();
+        let horizontal_reading = continuous_active && self.reading_flow.is_horizontal();
         if vertical_reading || horizontal_reading {
             let mut scroll_delta = 0.0;
             if vertical_reading {
@@ -5051,6 +5062,13 @@ impl App {
     ) -> (i32, bool) {
         let mut nav_delta = 0i32;
         let mut close = false;
+
+        // レンダラが連続読みを描画しているか。クリックのページジャンプ抑制と、連続読み中の
+        // デッドな pan-drag (fs_pan に書いても縦/横描画は fs_vertical_scroll しか見ないため
+        // has_transform だけ汚す) の抑制に使う。キー側の continuous_active と同一述語。
+        let continuous_active = self
+            .fullscreen_idx
+            .is_some_and(|idx| self.continuous_reading_active_for_idx(idx));
 
         // VST editor windows are bridge-process native windows. In the
         // cross-process owner-popup case, egui can still report this viewport as
@@ -5391,10 +5409,12 @@ impl App {
                         }
                     }
                 }
-            } else if self.fs_zoom > ZOOM_NEAR_ONE
-                || self.fs_free_rotation.abs() > TRANSFORM_EPSILON
+            } else if !continuous_active
+                && (self.fs_zoom > ZOOM_NEAR_ONE || self.fs_free_rotation.abs() > TRANSFORM_EPSILON)
             {
-                // ズームまたは回転中: ドラッグでパン
+                // ズームまたは回転中: ドラッグでパン (連続読み中は fs_zoom が自動インフレ
+                // されるが、その pan は描画に反映されず has_transform を汚すだけなので除外。
+                // 連続読みのスクロールはホイール / 矢印 / gamepad で行う)
                 if primary_pressed {
                     if let Some(pos) = pointer_pos {
                         self.fs_pan_drag_start = Some((pos, self.fs_pan));
@@ -5473,7 +5493,11 @@ impl App {
                                 let in_left_panel = self.adjustment_mode
                                     && pos.x < adjustment_panel_rect(full_rect).max.x
                                     && pos.y >= 60.0;
-                                if !in_right_panel && !in_left_panel {
+                                // 連続読み中はクリックでのページジャンプを抑制する。連続読みは
+                                // 連続スクロール表示なので、左半分/右半分クリックで別ファイルへ
+                                // 飛ぶのはモデルに反する (特に fs_zoom が一瞬インフレされず
+                                // has_transform=false になった隙のクリックで誤爆する)。
+                                if !in_right_panel && !in_left_panel && !continuous_active {
                                     let base = if pos.x > full_rect.center().x { 1 } else { -1 };
                                     nav_delta = self.spread_nav_delta(base);
                                 }
@@ -6416,13 +6440,33 @@ impl App {
         }
     }
 
-    fn vertical_reading_supported_idx(&self, idx: usize) -> bool {
+    pub(crate) fn vertical_reading_supported_idx(&self, idx: usize) -> bool {
         matches!(
             self.items.get(idx),
             Some(GridItem::Image(_))
                 | Some(GridItem::ZipImage { .. })
                 | Some(GridItem::PdfPage { .. })
         )
+    }
+
+    /// レンダラが連続読み (縦/横スクロール) を実際に描画する条件と同一の述語。
+    ///
+    /// 入力ハンドラ (キー / ホイール / クリック / gamepad) は「連続読みとして扱うか」を
+    /// この 1 箇所で判定し、レンダリングと入力の食い違いを防ぐ。例:
+    /// - 縦/横読み中に Z(解析) や X/C(比較) へ入るとレンダラは単ページにフォールバックする
+    ///   のに、入力側が `reading_flow` だけ見て ↑↓ をスクロールへ吸い、ナビもスクロールも
+    ///   しない (デッド入力) 状態になる。
+    /// - 動画や非対応アイテム上で連結方式が誤適用される。
+    ///
+    /// 描画側 (`continuous_reading_active`) の判定とこの述語を揃えること。
+    pub(crate) fn continuous_reading_active_for_idx(&self, idx: usize) -> bool {
+        !self.reading_flow.is_paged()
+            && !self.analysis_mode
+            && !matches!(self.items.get(idx), Some(GridItem::Video(_)))
+            && self.vertical_reading_supported_idx(idx)
+            && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
+            && !self.is_overlay_edit_mode_active()
+            && !self.is_panorama_mode_active(idx)
     }
 
     fn continuous_reading_units_and_pos(

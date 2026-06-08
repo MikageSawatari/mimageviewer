@@ -3722,6 +3722,50 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.erase_mode);
     }
 
+    /// `continuous_reading_active_for_idx` がレンダラの連続読み描画条件と一致し、入力ハンドラ
+    /// (キー/ホイール/クリック/gamepad) のゲートとして使える述語であることを固定する回帰テスト。
+    /// 縦/横読み中に解析・比較・動画・非対応アイテムへ入ったら false を返し、入力がページ送りへ
+    /// フォールバックできること (= ↑↓ がスクロールに吸われてナビもスクロールもしないデッド入力に
+    /// ならないこと) を担保する。
+    #[test]
+    fn continuous_reading_active_predicate_gates_correctly() {
+        use crate::grid_item::GridItem;
+        use crate::settings::ReadingFlow;
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg"))); // idx 0: 対応画像
+        app.items
+            .push(GridItem::Video(std::path::PathBuf::from("c:/p/v.mp4"))); // idx 1: 動画
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+
+        // paged flow では常に非アクティブ
+        app.reading_flow = ReadingFlow::Paged;
+        assert!(!app.continuous_reading_active_for_idx(0));
+
+        // 縦読み + 対応画像 + 競合モード無し → アクティブ (縦・横どちらも)
+        app.reading_flow = ReadingFlow::Vertical;
+        assert!(app.continuous_reading_active_for_idx(0));
+        app.reading_flow = ReadingFlow::Horizontal;
+        assert!(app.continuous_reading_active_for_idx(0));
+
+        // 動画は対応外 → 非アクティブ (連結方式トグル / scroll の誤適用を防ぐ)
+        assert!(!app.continuous_reading_active_for_idx(1));
+
+        // 解析モード中はレンダラが単ページへフォールバックするので非アクティブ
+        app.analysis_mode = true;
+        assert!(!app.continuous_reading_active_for_idx(0));
+        app.analysis_mode = false;
+
+        // 比較モード中も非アクティブ
+        app.compare_view_mode = crate::app::CompareViewMode::PinnedNormal;
+        assert!(!app.continuous_reading_active_for_idx(0));
+        app.compare_view_mode = crate::app::CompareViewMode::Off;
+
+        // 範囲外 idx でも panic せず false
+        assert!(!app.continuous_reading_active_for_idx(99));
+    }
+
     /// Ctrl+→ の「1 ページずらし」は、1 回押すごとに見開きが必ず 1 ページぶんずれる。
     /// 固定パリティで「2 回押さないと見た目が変わらない」旧 Shift 挙動のリグレッション防止。
     #[test]
