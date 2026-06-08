@@ -1727,9 +1727,183 @@ pub(crate) struct FsKeyAction {
     pub(crate) jump_to: Option<usize>,
 }
 
+struct FsSeekInfo {
+    image_indices: Vec<usize>,
+    current_pos: usize,
+    nav_count: usize,
+    video_count: usize,
+    other_count: usize,
+}
+
 impl App {
     fn fullscreen_viewport_id(&self) -> egui::ViewportId {
         egui::ViewportId::from_hash_of(("fullscreen_viewer", self.fs_viewport_generation))
+    }
+
+    fn fullscreen_seek_info(&self, fs_idx: usize) -> Option<FsSeekInfo> {
+        let image_indices = build_image_reading_indices(&self.items, &self.visible_indices);
+        let current_pos = image_indices.iter().position(|&idx| idx == fs_idx)?;
+        let nav_indices = build_nav_indices(&self.items, &self.visible_indices);
+        let video_count = nav_indices
+            .iter()
+            .filter(|&&idx| matches!(self.items.get(idx), Some(GridItem::Video(_))))
+            .count();
+        let other_count = nav_indices
+            .len()
+            .saturating_sub(image_indices.len())
+            .saturating_sub(video_count);
+        Some(FsSeekInfo {
+            image_indices,
+            current_pos,
+            nav_count: nav_indices.len(),
+            video_count,
+            other_count,
+        })
+    }
+
+    fn fullscreen_mixed_media_summary(info: &FsSeekInfo) -> String {
+        let mut parts = Vec::new();
+        if !info.image_indices.is_empty() {
+            parts.push(format!("画像 {} ファイル", info.image_indices.len()));
+        }
+        if info.video_count > 0 {
+            parts.push(format!("動画 {} ファイル", info.video_count));
+        }
+        if info.other_count > 0 {
+            parts.push(format!("その他 {} 件", info.other_count));
+        }
+        parts.join("、")
+    }
+
+    fn seek_to_continuous_page(&mut self, ctx: &egui::Context, target_idx: usize) {
+        self.fullscreen_idx = Some(target_idx);
+        self.selected = Some(target_idx);
+        self.scroll_to_selected = true;
+        self.fs_vertical_scroll = 0.0;
+        self.update_last_selected_image();
+        self.record_book_resume(target_idx);
+        ctx.request_repaint();
+    }
+
+    fn draw_fullscreen_seek_overlay(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        fs_idx: usize,
+    ) -> Option<usize> {
+        let Some(info) = self.fullscreen_seek_info(fs_idx) else {
+            self.fs_seek_drag_active = false;
+            return None;
+        };
+        if self.any_dialog_open() || self.is_overlay_edit_mode_active() {
+            self.fs_seek_drag_active = false;
+            return None;
+        }
+
+        let primary_down = ctx.input(|i| i.pointer.primary_down());
+        if !primary_down {
+            self.fs_seek_drag_active = false;
+        }
+        let bottom_band = egui::Rect::from_min_max(
+            egui::pos2(full_rect.left(), full_rect.bottom() - 96.0),
+            full_rect.right_bottom(),
+        );
+        let bottom_hover = ctx.input(|i| {
+            i.pointer
+                .hover_pos()
+                .is_some_and(|pos| bottom_band.contains(pos))
+        });
+        if !bottom_hover && !self.fs_seek_drag_active {
+            return None;
+        }
+
+        let panel_rect = egui::Rect::from_min_max(
+            egui::pos2(full_rect.left() + 32.0, full_rect.bottom() - 66.0),
+            egui::pos2(full_rect.right() - 32.0, full_rect.bottom() - 18.0),
+        );
+        let panel_rect = panel_rect.intersect(full_rect.shrink2(egui::vec2(12.0, 8.0)));
+        if panel_rect.width() < 160.0 {
+            return None;
+        }
+
+        let painter = ui.painter();
+        painter.rect_filled(
+            panel_rect,
+            6.0,
+            egui::Color32::from_rgba_unmultiplied(8, 10, 14, 210),
+        );
+        painter.rect_stroke(
+            panel_rect,
+            6.0,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
+            ),
+            egui::StrokeKind::Inside,
+        );
+
+        let all_nav_items_are_images =
+            info.nav_count == info.image_indices.len() && !info.image_indices.is_empty();
+        if !all_nav_items_are_images {
+            let summary = Self::fullscreen_mixed_media_summary(&info);
+            painter.text(
+                panel_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                summary,
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_rgb(235, 238, 242),
+            );
+            return None;
+        }
+
+        let total = info.image_indices.len();
+        let mut page_no = (info.current_pos + 1) as i32;
+        let label = format!("{}/{}", page_no, total);
+        let label_width = 68.0;
+        let is_rtl = self.reading_direction == ReadingDirection::Rtl;
+        let inner = panel_rect.shrink2(egui::vec2(14.0, 8.0));
+        let mut target = None;
+        let mut panel_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(inner)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        panel_ui.set_clip_rect(panel_rect);
+        let label_text = egui::RichText::new(label)
+            .monospace()
+            .color(egui::Color32::from_rgb(242, 244, 247));
+        if is_rtl {
+            panel_ui.add_sized([label_width, 24.0], egui::Label::new(label_text.clone()));
+            panel_ui.add_space(8.0);
+        }
+        let slider_width = (inner.width() - label_width - 12.0).max(80.0);
+        let response = panel_ui.add_sized(
+            [slider_width, 24.0],
+            egui::Slider::new(&mut page_no, 1..=total as i32).show_value(false),
+        );
+        if response.dragged() {
+            self.fs_seek_drag_active = true;
+        }
+        if response.changed() {
+            let pos = (page_no as usize).saturating_sub(1).min(total - 1);
+            let target_idx = info.image_indices[pos];
+            if target_idx != fs_idx || self.continuous_reading_active_for_idx(fs_idx) {
+                if self.continuous_reading_active_for_idx(fs_idx) {
+                    self.seek_to_continuous_page(ctx, target_idx);
+                } else {
+                    target = Some(target_idx);
+                }
+            }
+        }
+        if !is_rtl {
+            panel_ui.add_space(8.0);
+            panel_ui.add_sized([label_width, 24.0], egui::Label::new(label_text));
+        }
+        if !primary_down && self.fs_seek_drag_active {
+            self.fs_seek_drag_active = false;
+        }
+        target
     }
 
     /// フルスクリーンビューポートのライフサイクル後始末を行う。
@@ -2659,6 +2833,12 @@ impl App {
                         self.draw_slideshow_progress_indicator(ui, full_rect, ctx);
                         if !state.is_video {
                             self.draw_compare_pin_indicator(ui, full_rect, ctx);
+                        }
+                        if !state.is_video
+                            && let Some(seek_target) =
+                                self.draw_fullscreen_seek_overlay(ui, ctx, full_rect, fs_idx)
+                        {
+                            jump_to = Some(seek_target);
                         }
                         fs_overlay_ms = overlay_t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -4804,18 +4984,19 @@ impl App {
         }
         // BS = 階層を 1 段だけ戻す。ZIP/PDF ページを見ているとき (current_folder がコンテナ)
         // は、設定に関係なく常にコンテナのページ一覧 (L2) へ戻る (= close_fullscreen を直接呼ぶ。
-        // current_folder は ZIP/PDF のままなので L2 が出る)。Esc/Enter が設定で L1/L2 に分岐する
-        // のと違い、BS は分岐しない。フルスクリーンは別ビューポートで grid 側の BS ハンドラ
-        // (親フォルダ移動) は抑止されるため、ここで plain BS を処理する。Ctrl+BS (個別補正解除)
-        // は Modifiers::NONE 限定なので影響しない。通常画像 (非コンテナ) では BS は未処理。
+        // current_folder は ZIP/PDF のままなので L2 が出る)。通常フォルダ内画像では、グリッド
+        // 側の BS ハンドラが別ビューポート中は抑止されるため、ここで一覧へ戻す。Ctrl+BS
+        // (個別補正解除) は Modifiers::NONE 限定なので影響しない。
         let viewing_container_page = self
             .current_folder
             .as_deref()
             .is_some_and(crate::folder_tree::is_virtual_folder);
-        if viewing_container_page
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace))
-        {
-            action.close_to_page_list = true;
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)) {
+            if viewing_container_page {
+                action.close_to_page_list = true;
+            } else {
+                action.close = true;
+            }
         }
         // 見開きダブル表示中は I/Z/R/L を無効化
         if key_i && !is_spread_double {

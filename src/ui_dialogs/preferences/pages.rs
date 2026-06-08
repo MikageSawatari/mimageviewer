@@ -1,7 +1,8 @@
 use super::*;
 use crate::settings::{
     self, AiFeatureMode, CachePolicy, FullscreenFitMode, Parallelism, ReadingDirection,
-    ReadingFlow, SortOrder, SpreadMode, ThumbAspect, ToolbarSectionDisplay, UiTheme,
+    ReadingFlow, SortOrder, SpreadMode, StartupFolderMode, ThumbAspect, ToolbarSectionDisplay,
+    UiTheme,
 };
 
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -96,6 +97,69 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
 }
 
+pub(super) fn page_startup_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.label(egui::RichText::new("起動時に開く場所").strong());
+    ui.add_space(4.0);
+
+    ui.radio_value(
+        &mut state.settings.startup_folder_mode,
+        StartupFolderMode::Previous,
+        StartupFolderMode::Previous.label(),
+    );
+    ui.radio_value(
+        &mut state.settings.startup_folder_mode,
+        StartupFolderMode::Desktop,
+        StartupFolderMode::Desktop.label(),
+    );
+    ui.radio_value(
+        &mut state.settings.startup_folder_mode,
+        StartupFolderMode::Specific,
+        StartupFolderMode::Specific.label(),
+    );
+
+    ui.add_space(8.0);
+    ui.add_enabled_ui(
+        state.settings.startup_folder_mode == StartupFolderMode::Specific,
+        |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("指定フォルダ:");
+                let edit_width = (ui.available_width() - 120.0).clamp(180.0, 420.0);
+                let mut output = egui::TextEdit::singleline(&mut state.startup_folder_path_input)
+                    .desired_width(edit_width)
+                    .hint_text("例: D:\\Images")
+                    .show(ui);
+                let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+                    ui,
+                    &mut output,
+                    &mut state.startup_folder_path_input,
+                );
+                let response = output.response;
+                if response.changed() || menu_changed {
+                    let trimmed = state.startup_folder_path_input.trim();
+                    state.settings.startup_folder_path = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(std::path::PathBuf::from(trimmed))
+                    };
+                }
+                if ui.button("フォルダを開く").clicked()
+                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                {
+                    state.startup_folder_path_input = dir.display().to_string();
+                    state.settings.startup_folder_path = Some(dir);
+                    state.settings.startup_folder_mode = StartupFolderMode::Specific;
+                }
+            });
+        },
+    );
+    ui.label(
+        egui::RichText::new(
+            "指定フォルダが開けない場合はデスクトップに、デスクトップも取得できない場合は前回フォルダにフォールバックします。",
+        )
+        .weak(),
+    );
+}
+
 pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.checkbox(
         &mut state.settings.thumb_idle_upgrade,
@@ -109,6 +173,7 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
 pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
+    let mut clear_recent_folders_clicked = false;
 
     ui.label(
         "チェックを外した項目はツールバーから隠れます。\n\
@@ -158,6 +223,18 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "└ 最近開いたフォルダ履歴メニュー",
         ),
     );
+    ui.add_enabled_ui(s.show_toolbar_folder, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("最近開いたフォルダ履歴をクリア").clicked() {
+                clear_recent_folders_clicked = true;
+            }
+            ui.label(
+                egui::RichText::new(format!("現在 {} 件", s.recent_folders.len()))
+                    .size(11.0)
+                    .weak(),
+            );
+        });
+    });
     // 代表サムネ固定 (📌) ボタンはフォルダバーの一部だが、機能としては独立した
     // 切り替えを提供する (= 自動代表サムネで運用するユーザー向けに非表示にできる)。
     ui.add_enabled(
@@ -264,6 +341,10 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.checkbox(&mut s.show_toolbar_rating, "レーティング (★ フィルタ)");
     ui.checkbox(&mut s.show_toolbar_favorites, "お気に入り");
     ui.checkbox(&mut s.show_toolbar_tags, "タグ");
+    if clear_recent_folders_clicked {
+        s.recent_folders.clear();
+        state.recent_folders_clear_requested = true;
+    }
 }
 
 pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -337,9 +418,10 @@ pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     ui.add_space(8.0);
     ui.label("保存先フォルダ");
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
+        let edit_width = (ui.available_width() - 190.0).clamp(180.0, 360.0);
         let mut output = egui::TextEdit::singleline(&mut state.capture_output_dir_input)
-            .desired_width(360.0)
+            .desired_width(edit_width)
             .hint_text(crate::capture::default_output_dir().display().to_string())
             .show(ui);
         let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(

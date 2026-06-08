@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::settings::StartupFolderMode;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuickLocation {
     pub label: &'static str,
@@ -32,10 +34,23 @@ pub fn quick_locations() -> Vec<QuickLocation> {
     locations
 }
 
-pub fn startup_folder(last_folder: Option<&Path>) -> Option<PathBuf> {
-    last_folder
-        .and_then(resolve_startup_last_folder)
-        .or_else(desktop_dir)
+pub fn startup_folder(
+    mode: StartupFolderMode,
+    last_folder: Option<&Path>,
+    specific_folder: Option<&Path>,
+) -> Option<PathBuf> {
+    match mode {
+        StartupFolderMode::Previous => last_folder
+            .and_then(resolve_startup_last_folder)
+            .or_else(desktop_dir),
+        StartupFolderMode::Desktop => {
+            desktop_dir().or_else(|| last_folder.and_then(resolve_startup_last_folder))
+        }
+        StartupFolderMode::Specific => specific_folder
+            .and_then(resolve_startup_last_folder)
+            .or_else(desktop_dir)
+            .or_else(|| last_folder.and_then(resolve_startup_last_folder)),
+    }
 }
 
 /// 起動時の last_folder を復元する。フォルダ (または仮想フォルダ ZIP/PDF) がそのまま
@@ -149,7 +164,8 @@ pub fn available_drives() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{QuickLocation, push_unique_location};
+    use super::{QuickLocation, push_unique_location, startup_folder};
+    use crate::settings::StartupFolderMode;
     use std::path::PathBuf;
 
     #[test]
@@ -164,5 +180,13 @@ mod tests {
             Some(PathBuf::from(r"C:\Users\me\Desktop")),
         );
         assert_eq!(locations.len(), 1);
+    }
+
+    #[test]
+    fn startup_folder_specific_uses_existing_folder() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let chosen = startup_folder(StartupFolderMode::Specific, None, Some(tmp.path()))
+            .expect("existing specific folder should be returned");
+        assert_eq!(chosen, tmp.path());
     }
 }

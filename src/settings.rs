@@ -860,6 +860,32 @@ pub struct RecentApp {
 }
 
 // -----------------------------------------------------------------------
+// StartupFolderMode (起動時に開く場所)
+// -----------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupFolderMode {
+    /// 前回終了時に開いていたフォルダ。既存挙動との互換のためデフォルト。
+    #[default]
+    Previous,
+    /// Windows のデスクトップ。
+    Desktop,
+    /// ユーザー指定フォルダ。無効な場合は Desktop にフォールバック。
+    Specific,
+}
+
+impl StartupFolderMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Previous => "前回終了したフォルダ",
+            Self::Desktop => "デスクトップ",
+            Self::Specific => "指定フォルダ",
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // Settings
 // -----------------------------------------------------------------------
 
@@ -880,6 +906,12 @@ pub struct Settings {
     pub favorites: Vec<FavoriteEntry>,
     #[serde(default)]
     pub last_folder: Option<PathBuf>,
+    #[serde(default)]
+    pub startup_folder_mode: StartupFolderMode,
+    #[serde(default)]
+    pub startup_folder_path: Option<PathBuf>,
+    #[serde(default)]
+    pub recent_folders: Vec<PathBuf>,
     /// ウィンドウ左上座標 (outer rect)
     #[serde(default)]
     pub window_pos: Option<[f32; 2]>,
@@ -2073,6 +2105,9 @@ impl Default for Settings {
             thumb_aspect_auto: false,
             favorites: Vec::new(),
             last_folder: None,
+            startup_folder_mode: StartupFolderMode::default(),
+            startup_folder_path: None,
+            recent_folders: Vec::new(),
             window_pos: None,
             window_size: None,
             parallelism: Parallelism::default(),
@@ -3150,6 +3185,7 @@ impl Settings {
         self.batch_cache_pdf_contents = src.batch_cache_pdf_contents;
         // ── ウィンドウ / ナビゲーション状態 ──
         self.last_folder = src.last_folder.take();
+        self.recent_folders = std::mem::take(&mut src.recent_folders);
         self.window_pos = src.window_pos;
         self.window_size = src.window_size;
         // ── お気に入り / タグ (専用ダイアログで編集) ──
@@ -3344,6 +3380,9 @@ mod tests {
         assert_eq!(s.thumb_aspect, ThumbAspect::Square);
         assert!(s.favorites.is_empty());
         assert!(s.last_folder.is_none());
+        assert_eq!(s.startup_folder_mode, StartupFolderMode::Previous);
+        assert!(s.startup_folder_path.is_none());
+        assert!(s.recent_folders.is_empty());
         assert!(s.window_pos.is_none());
         assert!(s.window_size.is_none());
         assert_eq!(s.prefetch_back, 4);
@@ -3472,7 +3511,13 @@ mod tests {
 
     #[test]
     fn settings_roundtrip_json() {
-        let original = Settings::default();
+        let mut original = Settings::default();
+        original.startup_folder_mode = StartupFolderMode::Specific;
+        original.startup_folder_path = Some(PathBuf::from(r"D:\Images"));
+        original.recent_folders = vec![
+            PathBuf::from(r"D:\Images"),
+            PathBuf::from(r"C:\Users\test\Pictures"),
+        ];
         let json = serde_json::to_string(&original).unwrap();
         let loaded: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.grid_cols, original.grid_cols);
@@ -3480,6 +3525,9 @@ mod tests {
         assert_eq!(loaded.thumb_quality, original.thumb_quality);
         assert_eq!(loaded.cache_threshold_ms, original.cache_threshold_ms);
         assert_eq!(loaded.prefetch_back, original.prefetch_back);
+        assert_eq!(loaded.startup_folder_mode, original.startup_folder_mode);
+        assert_eq!(loaded.startup_folder_path, original.startup_folder_path);
+        assert_eq!(loaded.recent_folders, original.recent_folders);
     }
 
     #[test]

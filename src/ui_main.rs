@@ -50,6 +50,7 @@ enum FavoriteButtonClick {
 }
 
 fn resolve_folder_bar_nav_path(path: &Path) -> Option<PathBuf> {
+    let path = normalize_folder_bar_input_path(path);
     let convertible_archive = path.is_file()
         && path
             .extension()
@@ -57,10 +58,22 @@ fn resolve_folder_bar_nav_path(path: &Path) -> Option<PathBuf> {
             .and_then(crate::archive_converter::ArchiveFormat::from_extension)
             .is_some();
     if convertible_archive {
-        Some(path.to_path_buf())
+        Some(path)
     } else {
-        crate::folder_tree::resolve_openable_path(path)
+        crate::folder_tree::resolve_openable_path(&path)
     }
+}
+
+fn normalize_folder_bar_input_path(path: &Path) -> PathBuf {
+    let raw = path.as_os_str().to_string_lossy();
+    let trimmed = raw.trim();
+    if trimmed.len() == 2 {
+        let bytes = trimmed.as_bytes();
+        if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return PathBuf::from(format!("{}\\", trimmed));
+        }
+    }
+    path.to_path_buf()
 }
 
 /// 📌 ボタン描画用の状態スナップショット。`render_address_bar` 入口で 1 度算出する。
@@ -2745,31 +2758,41 @@ impl App {
             .order(egui::Order::Middle)
             .fixed_pos(area_pos)
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style())
-                    .fill(egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230))
-                    .show(ui, |ui| {
-                        let inner_width = (cell_w - 12.0).max(40.0);
-                        ui.set_min_width(inner_width);
-                        ui.set_max_width(inner_width);
-                        // フルパスをセル幅で折り返し、最大 3 行まで表示する。
-                        // パスは空白の無い長い連結文字列なので break_anywhere で
-                        // セグメント途中でも改行させる。3 行を超える分は末尾を
-                        // overflow_character (…) で省略する。
-                        let mut job = egui::text::LayoutJob::single_section(
-                            text,
-                            egui::TextFormat {
-                                font_id: egui::TextStyle::Monospace.resolve(ui.style()),
-                                color: egui::Color32::WHITE,
-                                ..Default::default()
-                            },
-                        );
-                        job.wrap.max_width = inner_width;
-                        job.wrap.max_rows = 3;
-                        job.wrap.break_anywhere = true;
-                        job.wrap.overflow_character = Some('…');
-                        let galley = ui.painter().layout_job(job);
-                        ui.add(egui::Label::new(galley));
-                    });
+                let dark = ui.visuals().dark_mode;
+                let (fill, text_color) = if dark {
+                    (
+                        egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230),
+                        egui::Color32::WHITE,
+                    )
+                } else {
+                    (
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 245),
+                        egui::Color32::from_gray(25),
+                    )
+                };
+                egui::Frame::popup(ui.style()).fill(fill).show(ui, |ui| {
+                    let inner_width = (cell_w - 12.0).max(40.0);
+                    ui.set_min_width(inner_width);
+                    ui.set_max_width(inner_width);
+                    // フルパスをセル幅で折り返し、最大 3 行まで表示する。
+                    // パスは空白の無い長い連結文字列なので break_anywhere で
+                    // セグメント途中でも改行させる。3 行を超える分は末尾を
+                    // overflow_character (…) で省略する。
+                    let mut job = egui::text::LayoutJob::single_section(
+                        text,
+                        egui::TextFormat {
+                            font_id: egui::TextStyle::Monospace.resolve(ui.style()),
+                            color: text_color,
+                            ..Default::default()
+                        },
+                    );
+                    job.wrap.max_width = inner_width;
+                    job.wrap.max_rows = 3;
+                    job.wrap.break_anywhere = true;
+                    job.wrap.overflow_character = Some('…');
+                    let galley = ui.painter().layout_job(job);
+                    ui.add(egui::Label::new(galley));
+                });
             });
     }
 }
@@ -2808,6 +2831,30 @@ mod rating_filter_op_tests {
         let visible_indices: Vec<usize> = (0..20).collect();
 
         assert_eq!(thumbnail_count_label(&items, &visible_indices), "( 20/100)");
+    }
+
+    #[test]
+    fn folder_bar_drive_letter_input_becomes_drive_root() {
+        assert_eq!(
+            normalize_folder_bar_input_path(Path::new("D:")),
+            PathBuf::from(r"D:\")
+        );
+        assert_eq!(
+            normalize_folder_bar_input_path(Path::new(" d: ")),
+            PathBuf::from(r"d:\")
+        );
+    }
+
+    #[test]
+    fn folder_bar_non_drive_input_is_preserved() {
+        assert_eq!(
+            normalize_folder_bar_input_path(Path::new(r"D:\books")),
+            PathBuf::from(r"D:\books")
+        );
+        assert_eq!(
+            normalize_folder_bar_input_path(Path::new(r"D:books")),
+            PathBuf::from(r"D:books")
+        );
     }
 
     #[test]

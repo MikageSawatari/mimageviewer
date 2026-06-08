@@ -27,6 +27,7 @@ pub enum Vst3ScanMessage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PreferencesPage {
     General,
+    StartupFolder,
     Thumbnail,
     Toolbar,
     Slideshow,
@@ -66,6 +67,7 @@ impl PreferencesPage {
     fn label(self) -> &'static str {
         match self {
             Self::General => "全体設定",
+            Self::StartupFolder => "開始フォルダ",
             Self::Thumbnail => "サムネイル",
             Self::Toolbar => "ツールバー",
             Self::Slideshow => "スライドショー",
@@ -107,6 +109,11 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "全体設定",
         page: Some(PreferencesPage::General),
+        children: &[],
+    },
+    TreeCategory {
+        label: "開始フォルダ",
+        page: Some(PreferencesPage::StartupFolder),
         children: &[],
     },
     TreeCategory {
@@ -225,6 +232,8 @@ pub(crate) struct PreferencesState {
     // ページ固有の一時状態
     pub manual_threads: usize,
     pub capture_output_dir_input: String,
+    pub startup_folder_path_input: String,
+    pub recent_folders_clear_requested: bool,
     pub exif_add_tag_input: String,
     /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
     pub exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
@@ -409,6 +418,12 @@ impl PreferencesState {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            startup_folder_path_input: s
+                .startup_folder_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            recent_folders_clear_requested: false,
             exif_add_tag_input: String::new(),
             exif_collapsed_groups: HashSet::new(),
             exif_scroll_to_added: None,
@@ -596,7 +611,12 @@ impl App {
                     ui.visuals().widgets.noninteractive.bg_stroke,
                 );
 
-                // 右パネル
+                // 右パネル。ScrollArea のスクロールバー領域を content width から差し引く。
+                // ページ側はこの内側の `ui.available_width()` だけを使うことで、区切り線や
+                // right_to_left レイアウトのボタンが右スクロールバーに重ならない。
+                const PREF_PANEL_SCROLLBAR_GUTTER: f32 = 28.0;
+                let panel_content_width =
+                    (right_rect.width() - PREF_PANEL_SCROLLBAR_GUTTER).max(120.0);
                 let mut right_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(right_rect)
@@ -606,7 +626,8 @@ impl App {
                     .id_salt("pref_panel")
                     .max_height(main_height)
                     .show(&mut right_ui, |ui| {
-                        ui.set_min_width(400.0);
+                        ui.set_width(panel_content_width);
+                        ui.set_max_width(panel_content_width);
                         draw_page(ui, state, enter_pressed);
                     });
 
@@ -679,6 +700,7 @@ impl App {
                 // VST3 ページで再スキャンした候補を App 側に反映
                 #[cfg(windows)]
                 let new_vst3_discovered = state.vst3_discovered.clone();
+                let clear_recent_folders_requested = state.recent_folders_clear_requested;
 
                 // ダイアログを開いた時点の `state.settings` は self.settings の snapshot。
                 // 開いている間に他ダイアログ (お気に入り編集 / タグ編集 / 補正プリセット /
@@ -693,6 +715,9 @@ impl App {
                     .overwrite_non_preferences_from(&mut self.settings);
 
                 self.settings = state.settings;
+                if clear_recent_folders_requested {
+                    self.clear_recent_folders();
+                }
                 self.settings.save();
 
                 // 動画ループモードが変わったらフルスクリーン中の player に反映する
@@ -1088,6 +1113,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 
     match state.selected {
         PreferencesPage::General => page_general(ui, state),
+        PreferencesPage::StartupFolder => page_startup_folder(ui, state),
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
         PreferencesPage::Toolbar => page_toolbar(ui, state),
         PreferencesPage::Slideshow => page_slideshow(ui, state),

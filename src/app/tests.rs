@@ -1045,6 +1045,34 @@ mod phase_c_folder_nav_history_tests {
     }
 
     #[test]
+    fn recent_folder_updates_are_mirrored_to_settings() {
+        let mut app = setup_app();
+        let a = PathBuf::from(r"C:\miv-test\a");
+        let b = PathBuf::from(r"C:\miv-test\b");
+
+        app.remember_recent_folder(&a);
+        app.remember_recent_folder(&b);
+
+        assert_eq!(app.recent_folders, vec![b.clone(), a.clone()]);
+        assert_eq!(app.settings.recent_folders, vec![b, a]);
+    }
+
+    #[test]
+    fn clear_recent_folders_updates_session_and_settings() {
+        let mut app = setup_app();
+        app.recent_folders = vec![
+            PathBuf::from(r"C:\miv-test\a"),
+            PathBuf::from(r"C:\miv-test\b"),
+        ];
+        app.settings.recent_folders = app.recent_folders.clone();
+
+        app.clear_recent_folders();
+
+        assert!(app.recent_folders.is_empty());
+        assert!(app.settings.recent_folders.is_empty());
+    }
+
+    #[test]
     fn converted_archive_keeps_source_path_after_zip_enumerate_finishes() {
         let mut app = setup_app();
         let original_dir = app.tmp.path().join("share/18/dmm/comic");
@@ -8736,6 +8764,30 @@ mod still_window_mode_key_tests {
         assert!(!app.settings.video_in_window_mode);
         assert!(!app.native_video_in_window_active);
     }
+
+    #[test]
+    fn still_image_root_backspace_closes_to_grid() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.current_folder = Some(PathBuf::from(r"C:\pics"));
+        app.selected = Some(idx);
+        app.fullscreen_idx = Some(idx);
+
+        begin_root_key_pass(&ctx, egui::Key::Backspace, false);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(
+            handled,
+            "root-delivered Backspace should be handled as fullscreen input"
+        );
+        assert_eq!(
+            app.fullscreen_idx, None,
+            "Backspace on a regular image should close fullscreen and return to the grid"
+        );
+        assert_eq!(app.selected, Some(idx));
+    }
 }
 
 #[cfg(test)]
@@ -8817,6 +8869,54 @@ mod file_operation_selection_tests {
             ],
             "delete targets are sorted by descending index and exclude folders + virtual pages",
         );
+    }
+}
+
+#[cfg(test)]
+mod always_visible_selection_cursor_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    fn push_item(app: &mut App, item: GridItem) -> usize {
+        app.items.push(item);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.image_metas.push(None);
+        app.items.len() - 1
+    }
+
+    #[test]
+    fn rebuild_visible_indices_selects_first_visible_item_when_none_selected() {
+        let mut app = setup_app();
+        push_item(
+            &mut app,
+            GridItem::ZipSeparator {
+                dir_display: "(root)".into(),
+            },
+        );
+        let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\pics\a.jpg")));
+
+        app.selected = None;
+        app.rebuild_visible_indices();
+
+        assert_eq!(app.selected, Some(image));
+        assert!(app.scroll_to_selected);
+    }
+
+    #[test]
+    fn rebuild_visible_indices_does_not_select_zip_separator_only() {
+        let mut app = setup_app();
+        push_item(
+            &mut app,
+            GridItem::ZipSeparator {
+                dir_display: "(root)".into(),
+            },
+        );
+
+        app.selected = None;
+        app.rebuild_visible_indices();
+
+        assert_eq!(app.visible_indices, vec![0]);
+        assert_eq!(app.selected, None);
     }
 }
 

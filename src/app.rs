@@ -3604,6 +3604,8 @@ pub struct App {
     pub(crate) fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
     /// 連結読みモードのスクロール量。現在ページ中心を 0 とし、正方向で次のユニットへ進む。
     pub(crate) fs_vertical_scroll: f32,
+    /// フルスクリーン下部シークバーをドラッグ中か。下端ホバー外へ出てもバーを維持する。
+    pub(crate) fs_seek_drag_active: bool,
     /// 連結読み描画で最後に計算した raw/final/comic cache の保持対象。
     pub(crate) fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
     /// 任意角度回転（ラジアン、一時的・保存しない）
@@ -4898,7 +4900,7 @@ impl App {
     ///
     /// spec §8 で並列 `Settings::load()` を撲滅した結果、production では main thread の
     /// `Settings::load()` が唯一の呼び出し点になっており、その結果を ここに引き渡す。
-    pub fn new_from_settings(settings: crate::settings::Settings) -> Self {
+    pub fn new_from_settings(mut settings: crate::settings::Settings) -> Self {
         let (tx, rx) = mpsc::channel();
         let (pdf_ct_tx, pdf_ct_rx) = mpsc::channel();
         // 360 度パノラマビュー Phase 2a: NeedsUserConfirmation → SettleApproved の
@@ -5049,6 +5051,9 @@ impl App {
             &mut video_upscale_queue,
         );
         let _ = video_upscale_queue.save_atomic(&video_upscale_queue_path);
+
+        settings.recent_folders.truncate(MAX_RECENT_FOLDERS);
+        let recent_folders = settings.recent_folders.clone();
 
         let mut app = Self {
             address: String::new(),
@@ -5235,7 +5240,7 @@ impl App {
             address_has_focus: false,
             folder_nav_back_stack: Vec::new(),
             folder_nav_forward_stack: Vec::new(),
-            recent_folders: Vec::new(),
+            recent_folders,
             suppress_folder_nav_record_once: false,
             suppress_nav_record_for_search_restore: false,
             folder_history: std::collections::HashMap::new(),
@@ -5343,6 +5348,7 @@ impl App {
             fs_pan: egui::Vec2::ZERO,
             fs_pan_drag_start: None,
             fs_vertical_scroll: 0.0,
+            fs_seek_drag_active: false,
             fs_vertical_cache_keep_set: std::collections::HashSet::new(),
             fs_free_rotation: 0.0,
             fs_rotation_drag_start: None,
@@ -6634,6 +6640,12 @@ impl App {
             .retain(|p| !crate::folder_tree::path_eq(p, path));
         self.recent_folders.insert(0, path.to_path_buf());
         self.recent_folders.truncate(MAX_RECENT_FOLDERS);
+        self.settings.recent_folders = self.recent_folders.clone();
+    }
+
+    pub(crate) fn clear_recent_folders(&mut self) {
+        self.recent_folders.clear();
+        self.settings.recent_folders.clear();
     }
 
     /// `load_folder*` 入口で呼ぶ。現在地から `target` への遷移を履歴に記録する。
@@ -10160,6 +10172,7 @@ impl App {
         let save_t0 = std::time::Instant::now();
         if source_path != search_results_synthetic_path() {
             self.settings.last_folder = Some(source_path);
+            self.settings.recent_folders = self.recent_folders.clone();
             self.settings.save();
         }
         if crate::perf::is_enabled() {
@@ -15520,6 +15533,7 @@ impl App {
         self.fs_pan = egui::Vec2::ZERO;
         self.fs_pan_drag_start = None;
         self.fs_vertical_scroll = 0.0;
+        self.fs_seek_drag_active = false;
         self.fs_vertical_cache_keep_set.clear();
         self.fs_free_rotation = 0.0;
         self.fs_rotation_drag_start = None;
@@ -15935,7 +15949,7 @@ impl App {
             let vi = &self.visible_indices;
             self.checked.retain(|idx| vi.binary_search(idx).is_ok());
         }
-        self.redirect_selected_to_visible();
+        self.ensure_selected_visible_or_first();
     }
 
     /// `visible_indices` に含まれる (= フィルタ後の一覧に出ている) かを返す。
@@ -15992,6 +16006,24 @@ impl App {
         let next = vi.get(pos).copied();
         self.selected = prev.or(next);
         if self.selected.is_some() {
+            self.scroll_to_selected = true;
+        }
+    }
+
+    /// 選択カーソルを常に可視アイテム上に置く。フィルタやフォルダ切替で未選択に
+    /// なった場合は、章見出し (`ZipSeparator`) 以外の先頭可視アイテムを選ぶ。
+    pub(crate) fn ensure_selected_visible_or_first(&mut self) {
+        self.redirect_selected_to_visible();
+        if self.selected.is_some() {
+            return;
+        }
+        let first_selectable = self
+            .visible_indices
+            .iter()
+            .copied()
+            .find(|&idx| !matches!(self.items.get(idx), Some(GridItem::ZipSeparator { .. })));
+        if let Some(idx) = first_selectable {
+            self.selected = Some(idx);
             self.scroll_to_selected = true;
         }
     }
@@ -18631,6 +18663,7 @@ impl App {
         self.fs_suppress_primary_until_release = false;
         self.fs_secondary_press_start = None;
         self.fs_middle_zoom_drag = None;
+        self.fs_seek_drag_active = false;
         self.fs_context_menu_idx = None;
         // Phase 5.5: タイルモードもフルスクリーン解除と同時に閉じる (Codex H2 反映)。
         #[cfg(windows)]
@@ -27105,9 +27138,11 @@ impl eframe::App for App {
             // 明示的な Light / Dark 選択はそのまま使う。初回セットアップダイアログでは
             // テーマ / AI 利用範囲 / ZIP/PDF の開き方をまとめて確認する。
 
-            if let Some(folder) =
-                crate::known_folders::startup_folder(self.settings.last_folder.as_deref())
-            {
+            if let Some(folder) = crate::known_folders::startup_folder(
+                self.settings.startup_folder_mode,
+                self.settings.last_folder.as_deref(),
+                self.settings.startup_folder_path.as_deref(),
+            ) {
                 self.load_folder(folder);
             }
 
