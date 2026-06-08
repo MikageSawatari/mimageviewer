@@ -370,6 +370,31 @@ pub(crate) fn decide_drag_payload(
     }
 }
 
+fn menubar_hover_switch_target(
+    open_popup_index: Option<usize>,
+    hovered_index: Option<usize>,
+) -> Option<usize> {
+    match (open_popup_index, hovered_index) {
+        (Some(open), Some(hovered)) if open != hovered => Some(hovered),
+        _ => None,
+    }
+}
+
+fn switch_menubar_popup_on_hover(ctx: &egui::Context, responses: &[egui::Response]) {
+    let open_popup_index = responses.iter().position(|response| {
+        egui::Popup::is_id_open(ctx, egui::Popup::default_response_id(response))
+    });
+    let hovered_index = responses.iter().position(egui::Response::hovered);
+
+    if let Some(target_index) = menubar_hover_switch_target(open_popup_index, hovered_index) {
+        egui::Popup::open_id(
+            ctx,
+            egui::Popup::default_response_id(&responses[target_index]),
+        );
+        ctx.request_repaint();
+    }
+}
+
 impl App {
     // ── メニューバー ─────────────────────────────────────────────────
 
@@ -388,7 +413,9 @@ impl App {
 
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("ファイル", |ui| {
+                let mut top_menu_responses = Vec::with_capacity(6);
+
+                let response = ui.menu_button("ファイル", |ui| {
                     if ui.button("フォルダを開く…").clicked() {
                         // 既に現在フォルダが設定されていれば初期値として補完
                         self.open_folder_input = self
@@ -417,8 +444,9 @@ impl App {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
+                top_menu_responses.push(response.response);
 
-                ui.menu_button("お気に入り", |ui| {
+                let response = ui.menu_button("お気に入り", |ui| {
                     // このフォルダを追加 (クリック時は名称入力ダイアログを開く)。
                     // お気に入りは索引ルートになるため、ZIP/PDF/変換キャッシュではなく
                     // 実ディレクトリだけを対象にする。
@@ -478,8 +506,9 @@ impl App {
                         }
                     }
                 });
+                top_menu_responses.push(response.response);
 
-                ui.menu_button("動画", |ui| {
+                let response = ui.menu_button("動画", |ui| {
                     let can_apply_to_selected = selected_video_path.is_some();
                     if ui
                         .add_enabled(
@@ -511,9 +540,10 @@ impl App {
                         ui.close();
                     }
                 });
+                top_menu_responses.push(response.response);
 
                 // タグメニュー (docs/tag-feature.md §4.2)
-                ui.menu_button("タグ", |ui| {
+                let response = ui.menu_button("タグ", |ui| {
                     if ui.button("タグを編集…").clicked() {
                         self.open_tag_editor();
                         ui.close();
@@ -552,8 +582,9 @@ impl App {
                         }
                     }
                 });
+                top_menu_responses.push(response.response);
 
-                ui.menu_button("設定", |ui| {
+                let response = ui.menu_button("設定", |ui| {
                     ui.menu_button("サムネイル列数", |ui| {
                         for cols in crate::settings::MIN_GRID_COLS..=crate::settings::MAX_GRID_COLS
                         {
@@ -681,8 +712,9 @@ impl App {
                     // 動画再生中はホバーバー / ツールバーの VST ボタンから
                     // プレイバックパネルを開く運用。
                 });
+                top_menu_responses.push(response.response);
 
-                ui.menu_button("ヘルプ", |ui| {
+                let response = ui.menu_button("ヘルプ", |ui| {
                     if ui.button("ヘルプサイトを開く").clicked() {
                         let url = crate::ui_helpers::manual_url("index.html", None);
                         crate::ui_helpers::open_url(&url);
@@ -716,6 +748,7 @@ impl App {
                         ui.close();
                     }
                 });
+                top_menu_responses.push(response.response);
 
                 // メニュー項目の右側に新バージョン通知バッジを表示する。
                 // 押すと更新ダイアログを開き、リリースページへの誘導 / skip 操作を行える。
@@ -744,6 +777,8 @@ impl App {
                         }
                     });
                 }
+
+                switch_menubar_popup_on_hover(ui.ctx(), &top_menu_responses);
             });
         });
 
@@ -2736,6 +2771,28 @@ impl App {
                         ui.add(egui::Label::new(galley));
                     });
             });
+    }
+}
+
+#[cfg(test)]
+mod menubar_hover_switch_tests {
+    use super::*;
+
+    #[test]
+    fn switches_to_hovered_sibling_only_while_menu_is_open() {
+        assert_eq!(menubar_hover_switch_target(Some(0), Some(1)), Some(1));
+        assert_eq!(menubar_hover_switch_target(Some(5), Some(2)), Some(2));
+    }
+
+    #[test]
+    fn does_not_open_cold_menu_on_hover() {
+        assert_eq!(menubar_hover_switch_target(None, Some(1)), None);
+    }
+
+    #[test]
+    fn keeps_current_menu_when_hovering_open_button_or_nothing() {
+        assert_eq!(menubar_hover_switch_target(Some(2), Some(2)), None);
+        assert_eq!(menubar_hover_switch_target(Some(2), None), None);
     }
 }
 
