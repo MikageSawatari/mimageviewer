@@ -472,6 +472,19 @@ impl App {
     }
 
     fn handle_gamepad_still_direction(&mut self, ctx: &egui::Context, fs_idx: usize, dir: PadDir) {
+        if self.spread_mode.is_vertical() {
+            match dir {
+                PadDir::Down => {
+                    self.scroll_vertical_reading_step(ctx, 1.0);
+                    return;
+                }
+                PadDir::Up => {
+                    self.scroll_vertical_reading_step(ctx, -1.0);
+                    return;
+                }
+                PadDir::Left | PadDir::Right => {}
+            }
+        }
         let rtl = self.spread_mode.is_rtl();
         let base_delta = match dir {
             PadDir::Right if !rtl => 1,
@@ -716,10 +729,16 @@ impl App {
             self.spread_mode = mode;
             self.spread_popup_open = false;
             self.adjust_spread_target = AdjustSpreadTarget::Left;
+            if mode.is_vertical() {
+                self.fs_vertical_scroll = 0.0;
+                self.fs_pan = egui::Vec2::ZERO;
+                self.fs_free_rotation = 0.0;
+            }
+            self.fs_vertical_cache_keep_set.clear();
             if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
                 let _ = db.set(folder, mode, self.settings.default_spread_mode);
             }
-            if mode.is_spread() && self.analysis_mode {
+            if (mode.is_spread() || mode.is_vertical()) && self.analysis_mode {
                 self.reset_analysis_mode();
             }
             self.normalize_spread_position(ctx);

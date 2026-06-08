@@ -3531,13 +3531,13 @@ pub struct App {
     /// 重複書き込みを抑止する dedup。
     pub(crate) last_book_resume: Option<(PathBuf, usize)>,
 
-    // ── 見開き表示 ──────────────────────────────────────────────
-    /// 見開き DB (フォルダごとのモード永続化)
+    // ── フルスクリーン表示モード ──────────────────────────────
+    /// 表示モード DB (フォルダごとのモード永続化)
     pub(crate) spread_db: Option<crate::spread_db::SpreadDb>,
-    /// 現在のフォルダの見開きモード。「1 ページずらし」(Ctrl+←/→) も cover/非cover の
-    /// 切替としてこの値に反映され、`spread_db` でフォルダ単位に永続化される。
+    /// 現在のフォルダの表示モード。見開きの「1 ページずらし」(Ctrl+←/→) も
+    /// cover/非cover の切替としてこの値に反映され、`spread_db` でフォルダ単位に永続化される。
     pub(crate) spread_mode: crate::settings::SpreadMode,
-    /// 見開きモード切替ポップアップ表示中
+    /// 表示モード切替ポップアップ表示中
     pub(crate) spread_popup_open: bool,
 
     // ── スライドショー ────────────────────────────────────────────
@@ -3593,6 +3593,10 @@ pub struct App {
     pub(crate) fs_pan: egui::Vec2,
     /// 通常フルスクリーンのパンドラッグ開始状態
     pub(crate) fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
+    /// 縦読みモードのスクロール量。現在ページ中心を 0 とし、正方向で下のページへ進む。
+    pub(crate) fs_vertical_scroll: f32,
+    /// 縦読み描画で最後に計算した raw/final/comic cache の保持対象。
+    pub(crate) fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
     /// 任意角度回転（ラジアン、一時的・保存しない）
     pub(crate) fs_free_rotation: f32,
     /// 回転ドラッグ開始状態（開始位置, 開始時の回転角）
@@ -5327,6 +5331,8 @@ impl App {
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
             fs_pan_drag_start: None,
+            fs_vertical_scroll: 0.0,
+            fs_vertical_cache_keep_set: std::collections::HashSet::new(),
             fs_free_rotation: 0.0,
             fs_rotation_drag_start: None,
             fs_loupe_locked: false,
@@ -9659,7 +9665,7 @@ impl App {
                 )],
             );
         }
-        // 見開きモード: DB から読み込み、なければデフォルト値
+        // 表示モード: DB から読み込み、なければデフォルト値
         self.spread_mode = self
             .spread_db
             .as_ref()
@@ -15476,6 +15482,8 @@ impl App {
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
         self.fs_pan_drag_start = None;
+        self.fs_vertical_scroll = 0.0;
+        self.fs_vertical_cache_keep_set.clear();
         self.fs_free_rotation = 0.0;
         self.fs_rotation_drag_start = None;
         // 透過背景は「一時的な好み」なので画像切替時にリセット (plan-v0.7.0.md の方針)
@@ -15491,7 +15499,9 @@ impl App {
                 } else if !self.fs_pending.contains_key(&idx) {
                     self.start_fs_load(idx);
                 }
-                self.update_prefetch_window(idx);
+                if !self.spread_mode.is_vertical() {
+                    self.update_prefetch_window(idx);
+                }
             }
             Some(GridItem::Video(_)) => {
                 // 動画はインライン再生 (フルスクリーン化と同時に VideoPlayer を起動)。
@@ -22302,8 +22312,10 @@ impl App {
         }
     }
 
-    fn evict_final_pipeline_cache(&mut self, current_idx: usize) {
-        let keep_set = self.compute_keep_set(current_idx);
+    pub(crate) fn evict_final_pipeline_cache_for_keep_set(
+        &mut self,
+        keep_set: &std::collections::HashSet<usize>,
+    ) {
         self.edit_result_cache
             .retain(|key, _| keep_set.contains(&key.idx));
         self.final_ai_cache
@@ -22326,6 +22338,11 @@ impl App {
                 pending.cancel.store(true, Ordering::Relaxed);
             }
         }
+    }
+
+    fn evict_final_pipeline_cache(&mut self, current_idx: usize) {
+        let keep_set = self.compute_keep_set(current_idx);
+        self.evict_final_pipeline_cache_for_keep_set(&keep_set);
     }
 
     /// サイドカーからまだ DB に無いエントリを取り込み、両 DB を更新する。
@@ -24964,10 +24981,18 @@ impl App {
         }
     }
 
+    /// 補正キャッシュを evict する（指定 keep set の範囲外）。
+    pub(crate) fn evict_adjustment_cache_for_keep_set(
+        &mut self,
+        keep_set: &std::collections::HashSet<usize>,
+    ) {
+        self.adjustment_cache.retain(|k, _| keep_set.contains(k));
+    }
+
     /// 補正キャッシュを evict する（prefetch 範囲外）。
     pub(crate) fn evict_adjustment_cache(&mut self, current_idx: usize) {
         let keep_set = self.compute_keep_set(current_idx);
-        self.adjustment_cache.retain(|k, _| keep_set.contains(k));
+        self.evict_adjustment_cache_for_keep_set(&keep_set);
     }
 
     /// `self.selected` に対応するアイテムが画像の場合、パスを last_selected_image_path に保存する。
@@ -25251,7 +25276,12 @@ impl App {
             // 保存済みマスクがあれば自動で inpaint 適用
             self.auto_apply_saved_mask(ctx, key);
             if self.fullscreen_idx == Some(key) {
-                self.update_prefetch_window(key);
+                // 縦読みモードの keep/prefetch 範囲は viewport 上の可視ページから
+                // ui_fullscreen 側で毎フレーム計算する。ここで通常の前後ページ window を
+                // 適用すると、可視ページを読み込んだ直後に evict してしまう。
+                if !self.spread_mode.is_vertical() {
+                    self.update_prefetch_window(key);
+                }
                 // 360 候補のトースト補完 (Codex P3 第 19 ラウンド):
                 // ChatGPT 生成画像のような XMP なし 2:1 画像は、`fs_cache.source_dims`
                 // が確定して初めて aspect 判定可能になる。`open_fullscreen` 時点で
@@ -27170,14 +27200,29 @@ impl eframe::App for App {
         if let Some(fs_idx) = self.fullscreen_idx {
             // プリセットに基づいてアップスケール設定を同期
             self.sync_upscale_from_preset(fs_idx);
-            self.evict_final_pipeline_cache(fs_idx);
+            let vertical_keep_set = if self.spread_mode.is_vertical()
+                && self.fs_vertical_cache_keep_set.contains(&fs_idx)
+            {
+                Some(self.fs_vertical_cache_keep_set.clone())
+            } else {
+                None
+            };
+            if let Some(keep_set) = vertical_keep_set.as_ref() {
+                self.evict_final_pipeline_cache_for_keep_set(keep_set);
+            } else {
+                self.evict_final_pipeline_cache(fs_idx);
+            }
             let spread_pair = self.resolve_spread_pair(fs_idx);
             if let crate::ui_fullscreen::SpreadPair::Double { left, right } = spread_pair {
                 let other = if left == fs_idx { right } else { left };
                 self.maybe_start_local_adjust_render(other);
             }
             self.maybe_start_local_adjust_render(fs_idx);
-            self.evict_adjustment_cache(fs_idx);
+            if let Some(keep_set) = vertical_keep_set.as_ref() {
+                self.evict_adjustment_cache_for_keep_set(keep_set);
+            } else {
+                self.evict_adjustment_cache(fs_idx);
+            }
             // AI 先読み (新パイプライン v1.1.0)。現在ページの final_ai が完了 / 不要
             // のときだけ隣接ページを起動するため、毎フレーム呼んでも spawn の競合を
             // 起こさない (= 内部で has_uncancelled_final_ai_pending を gate に使う)。

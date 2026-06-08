@@ -1,6 +1,6 @@
-//! 見開き表示モードの永続管理。
+//! フルスクリーン表示モードの永続管理。
 //!
-//! `%APPDATA%/mimageviewer/spread.db` にフォルダごとの見開きモードを保存する。
+//! `%APPDATA%/mimageviewer/spread.db` にフォルダごとの表示モードを保存する。
 //! `rotation_db.rs` と同パターンの SQLite 永続化。
 
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::path_key;
 use crate::settings::SpreadMode;
 
-/// 見開き DB ハンドル
+/// 表示モード DB ハンドル
 pub struct SpreadDb {
     conn: rusqlite::Connection,
 }
@@ -35,7 +35,7 @@ impl SpreadDb {
         crate::data_dir::get().join("spread.db")
     }
 
-    /// フォルダの見開きモードを取得。未登録なら None。
+    /// フォルダの表示モードを取得。未登録なら None。
     pub fn get(&self, path: &Path) -> Option<SpreadMode> {
         let key = normalize_path(path);
         let mut stmt = self
@@ -49,7 +49,7 @@ impl SpreadDb {
         .ok()
     }
 
-    /// 見開きモードを設定する。デフォルト値と同じ場合はレコードを削除する。
+    /// 表示モードを設定する。デフォルト値と同じ場合はレコードを削除する。
     pub fn set(
         &self,
         path: &Path,

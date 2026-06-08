@@ -78,7 +78,7 @@ impl PreferencesPage {
             Self::Folder => "フォルダ",
             Self::DuplicateFiles => "同名ファイル",
             Self::ExifDisplay => "EXIF表示",
-            Self::SpreadMode => "見開き表示",
+            Self::SpreadMode => "表示モード",
             Self::PlaybackResume => "位置の復元",
             Self::SusiePlugins => "Susie プラグイン",
             Self::IndexerSpeed => "自動インデクサ速度",
@@ -148,7 +148,7 @@ const TREE: &[TreeCategory] = &[
         ],
     },
     TreeCategory {
-        label: "見開き表示",
+        label: "表示モード",
         page: Some(PreferencesPage::SpreadMode),
         children: &[],
     },

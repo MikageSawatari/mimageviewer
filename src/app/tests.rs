@@ -6134,6 +6134,46 @@ mod pipeline_cache_refactor_tests {
         key
     }
 
+    #[test]
+    fn explicit_keep_set_evicts_pipeline_and_adjustment_caches() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let keep_idx = push_image(&mut app, "C:/pics/keep.jpg");
+        let drop_idx = push_image(&mut app, "C:/pics/drop.jpg");
+
+        let (keep_edit, keep_final) = insert_edit_and_final_cache(&mut app, &ctx, keep_idx, "keep");
+        let (drop_edit, drop_final) = insert_edit_and_final_cache(&mut app, &ctx, drop_idx, "drop");
+        for (idx, label) in [(keep_idx, "keep_adjust"), (drop_idx, "drop_adjust")] {
+            let image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(30, 40, 50)]);
+            let texture = ctx.load_texture(label, image.clone(), egui::TextureOptions::LINEAR);
+            app.adjustment_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex: texture,
+                    pixels: Arc::new(image),
+                    source_dims: None,
+                    load_seq: 0,
+                },
+            );
+        }
+
+        let keep_set = std::collections::HashSet::from([keep_idx]);
+        app.evict_final_pipeline_cache_for_keep_set(&keep_set);
+        app.evict_adjustment_cache_for_keep_set(&keep_set);
+
+        assert!(app.edit_result_cache.contains_key(&keep_edit));
+        assert!(!app.edit_result_cache.contains_key(&drop_edit));
+        assert!(app.final_composite_cache.contains_key(&keep_final));
+        assert!(!app.final_composite_cache.contains_key(&drop_final));
+        assert!(
+            app.final_ai_cache
+                .keys()
+                .all(|key| key.edit_key.idx == keep_idx)
+        );
+        assert!(app.adjustment_cache.contains_key(&keep_idx));
+        assert!(!app.adjustment_cache.contains_key(&drop_idx));
+    }
+
     fn brush_layer() -> local_adjust_core::LocalAdjustmentLayer {
         local_adjust_core::LocalAdjustmentLayer::new(
             "brush",

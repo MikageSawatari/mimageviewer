@@ -70,6 +70,22 @@ const MIDDLE_DRAG_THRESHOLD_PX: f32 = 4.0;
 const ZOOM_MIN: f32 = 0.1;
 /// ズーム倍率の上限
 const ZOOM_MAX: f32 = 50.0;
+/// 縦読み: ページ間の既定余白。
+const VERTICAL_READING_GAP_PX: f32 = 12.0;
+/// 縦読み: ↑↓キー/ゲームパッド 1 入力あたりのスクロール量。
+const VERTICAL_READING_SCROLL_STEP_PX: f32 = 90.0;
+/// 縦読み: PageUp/PageDown で進む画面高の割合。
+const VERTICAL_READING_PAGE_SCROLL_FRAC: f32 = 0.85;
+/// 縦読み: 同時に画面に入るページ数の上限。
+const VERTICAL_READING_MAX_VISIBLE_PAGES: usize = 16;
+/// 縦読み: 可視範囲の上下に保持する先読みページ数。
+const VERTICAL_READING_PREFETCH_PAD: usize = 2;
+/// 縦読み: fs_cache に残すページ数上限。
+const VERTICAL_READING_MAX_CACHE_PAGES: usize = 20;
+/// 縦読み: fs_cache に残すテクスチャの推定総ピクセル数上限。
+const VERTICAL_READING_MAX_CACHE_TEXELS: usize = 320_000_000;
+/// 縦読み: final composite / comic 合成を新規生成するページ数の 1 フレーム上限。
+const VERTICAL_READING_PROCESSED_UPLOADS_PER_FRAME: usize = 1;
 /// ズームが 1.0 とみなせるしきい値
 const ZOOM_NEAR_ONE: f32 = 1.001;
 /// 回転・パンがゼロとみなせるしきい値
@@ -558,6 +574,19 @@ pub struct FsSpreadLayout {
     pub left_rect: egui::Rect,
     pub right_idx: usize,
     pub right_rect: egui::Rect,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VerticalReadingPage {
+    idx: usize,
+    rect: egui::Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VerticalReadingSize {
+    idx: usize,
+    width: f32,
+    height: f32,
 }
 
 /// 透過背景の描画スタイル。B キーで 3 モードを循環する。
@@ -1420,6 +1449,98 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
         .collect()
 }
 
+fn build_image_reading_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
+    visible_indices
+        .iter()
+        .copied()
+        .filter(|&i| {
+            matches!(
+                items.get(i),
+                Some(GridItem::Image(_))
+                    | Some(GridItem::ZipImage { .. })
+                    | Some(GridItem::PdfPage { .. })
+            )
+        })
+        .collect()
+}
+
+fn vertical_reading_offsets(heights: &[f32], gap: f32, current_pos: usize) -> Vec<f32> {
+    if heights.is_empty() || current_pos >= heights.len() {
+        return Vec::new();
+    }
+    let mut offsets = vec![0.0; heights.len()];
+    for pos in current_pos + 1..heights.len() {
+        offsets[pos] = offsets[pos - 1] + (heights[pos - 1] + heights[pos]) * 0.5 + gap.max(0.0);
+    }
+    for pos in (0..current_pos).rev() {
+        offsets[pos] = offsets[pos + 1] - (heights[pos] + heights[pos + 1]) * 0.5 - gap.max(0.0);
+    }
+    offsets
+}
+
+fn clamp_vertical_reading_scroll(
+    scroll: f32,
+    offsets: &[f32],
+    heights: &[f32],
+    viewport_h: f32,
+) -> f32 {
+    if offsets.is_empty() || heights.is_empty() || offsets.len() != heights.len() {
+        return 0.0;
+    }
+    let center_y = viewport_h * 0.5;
+    let min_scroll = center_y + offsets[0] - heights[0] * 0.5;
+    let last = offsets.len() - 1;
+    let max_scroll = center_y + offsets[last] + heights[last] * 0.5 - viewport_h;
+    if min_scroll <= max_scroll {
+        scroll.clamp(min_scroll, max_scroll)
+    } else {
+        (min_scroll + max_scroll) * 0.5
+    }
+}
+
+fn vertical_reading_visible_positions(
+    offsets: &[f32],
+    heights: &[f32],
+    scroll: f32,
+    viewport_h: f32,
+) -> Vec<usize> {
+    if offsets.len() != heights.len() {
+        return Vec::new();
+    }
+    let center_y = viewport_h * 0.5;
+    offsets
+        .iter()
+        .zip(heights.iter())
+        .enumerate()
+        .filter_map(|(pos, (&offset, &height))| {
+            let page_center_y = center_y - scroll + offset;
+            let top = page_center_y - height * 0.5;
+            let bottom = page_center_y + height * 0.5;
+            (bottom >= 0.0 && top <= viewport_h).then_some(pos)
+        })
+        .collect()
+}
+
+fn vertical_reading_nearest_position(offsets: &[f32], scroll: f32) -> Option<usize> {
+    offsets
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (*a - scroll)
+                .abs()
+                .partial_cmp(&(*b - scroll).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(pos, _)| pos)
+}
+
+fn vertical_reading_reanchor_scroll(scroll: f32, old_offsets: &[f32], new_pos: usize) -> f32 {
+    old_offsets
+        .get(new_pos)
+        .map(|offset| scroll - *offset)
+        .unwrap_or(scroll)
+}
+
 /// 見開きの左右ページの content bbox (各ページ正規化座標 0..1) を combined 空間
 /// (幅 `left_w + right_w` × 高さ `combined_h`、左ページが x∈[0,left_w]、右ページが
 /// x∈[left_w, left_w+right_w]) に写像し、union を取って返す。両方 `None` のときは
@@ -2117,39 +2238,102 @@ impl App {
                                         compare_mode,
                                         crate::app::CompareViewMode::Off
                                     );
-                                    if compare_requested {
+                                    let vertical_reading_active = self.spread_mode.is_vertical()
+                                        && !analysis_active
+                                        && !state.is_video
+                                        && self.vertical_reading_supported_idx(fs_idx)
+                                        && matches!(
+                                            compare_mode,
+                                            crate::app::CompareViewMode::Off
+                                        )
+                                        && !self.is_overlay_edit_mode_active();
+                                    if vertical_reading_active {
+                                        self.draw_fs_vertical_reading(
+                                            ui,
+                                            ctx,
+                                            image_rect,
+                                            fs_idx,
+                                            state.original_preview_active,
+                                        );
+                                    } else if compare_requested {
                                         self.ensure_compare_prepared_pair(ctx, fs_idx);
-                                    }
-                                    if compare_requested
-                                        && self.draw_compare_prepared_mode(
+                                        if self.draw_compare_prepared_mode(
                                             ui,
                                             ctx,
                                             image_rect,
                                             compare_mode,
                                             zp,
-                                        )
-                                    {
-                                        // 比較表示側で描画済み。
-                                    } else if matches!(
-                                        compare_mode,
-                                        crate::app::CompareViewMode::PinnedNormal
-                                    ) {
-                                        let compare_tex = self.ensure_compare_pinned_texture(ctx);
-                                        if let Some(tex) = compare_tex.as_ref() {
+                                        ) {
+                                            // 比較表示側で描画済み。
+                                        } else if matches!(
+                                            compare_mode,
+                                            crate::app::CompareViewMode::PinnedNormal
+                                        ) {
+                                            let compare_tex =
+                                                self.ensure_compare_pinned_texture(ctx);
+                                            if let Some(tex) = compare_tex.as_ref() {
+                                                let bg_style = self.fs_bg_style(ctx);
+                                                Self::draw_compare_pinned_image(
+                                                    ui, image_rect, tex, zp, &bg_style, None,
+                                                );
+                                            }
+                                        } else {
+                                            let fallback_compare_tex = if matches!(
+                                                compare_mode,
+                                                crate::app::CompareViewMode::Wipe { .. }
+                                            ) {
+                                                self.ensure_compare_pinned_texture(ctx)
+                                            } else {
+                                                None
+                                            };
+                                            let pixel_grid_enabled =
+                                                self.fs_pixel_grid_enabled && !analysis_active;
+                                            // 余白カットフィット用 bbox (設定 OFF なら None)。bg_style が
+                                            // self を借用する前に算出しておく。
+                                            let content_bbox = self.fs_margin_bbox(fs_idx);
                                             let bg_style = self.fs_bg_style(ctx);
-                                            Self::draw_compare_pinned_image(
-                                                ui, image_rect, tex, zp, &bg_style, None,
+                                            Self::draw_fs_image(
+                                                ui,
+                                                image_rect,
+                                                state.tex.as_ref(),
+                                                state.thumb_tex.as_ref(),
+                                                state.is_video,
+                                                state.vst3_waiting_for_video,
+                                                state.fs_load_failed,
+                                                fs_rotation,
+                                                zp,
+                                                free_rot,
+                                                &bg_style,
+                                                &state.location_display,
+                                                pixel_grid_enabled,
+                                                content_bbox,
                                             );
+                                            if let crate::app::CompareViewMode::Wipe { fraction } =
+                                                compare_mode
+                                            {
+                                                if let Some(tex) = fallback_compare_tex.as_ref() {
+                                                    let wipe_x = image_rect.left()
+                                                        + image_rect.width()
+                                                            * fraction.clamp(0.05, 0.95);
+                                                    let clip = egui::Rect::from_min_max(
+                                                        image_rect.min,
+                                                        egui::pos2(wipe_x, image_rect.max.y),
+                                                    );
+                                                    Self::draw_compare_pinned_image(
+                                                        ui,
+                                                        image_rect,
+                                                        tex,
+                                                        zp,
+                                                        &bg_style,
+                                                        Some(clip),
+                                                    );
+                                                    Self::draw_compare_wipe_line(
+                                                        ui, image_rect, fraction,
+                                                    );
+                                                }
+                                            }
                                         }
                                     } else {
-                                        let fallback_compare_tex = if matches!(
-                                            compare_mode,
-                                            crate::app::CompareViewMode::Wipe { .. }
-                                        ) {
-                                            self.ensure_compare_pinned_texture(ctx)
-                                        } else {
-                                            None
-                                        };
                                         let pixel_grid_enabled =
                                             self.fs_pixel_grid_enabled && !analysis_active;
                                         // 余白カットフィット用 bbox (設定 OFF なら None)。bg_style が
@@ -2165,30 +2349,6 @@ impl App {
                                             pixel_grid_enabled,
                                             content_bbox,
                                         );
-                                        if let crate::app::CompareViewMode::Wipe { fraction } =
-                                            compare_mode
-                                        {
-                                            if let Some(tex) = fallback_compare_tex.as_ref() {
-                                                let wipe_x = image_rect.left()
-                                                    + image_rect.width()
-                                                        * fraction.clamp(0.05, 0.95);
-                                                let clip = egui::Rect::from_min_max(
-                                                    image_rect.min,
-                                                    egui::pos2(wipe_x, image_rect.max.y),
-                                                );
-                                                Self::draw_compare_pinned_image(
-                                                    ui,
-                                                    image_rect,
-                                                    tex,
-                                                    zp,
-                                                    &bg_style,
-                                                    Some(clip),
-                                                );
-                                                Self::draw_compare_wipe_line(
-                                                    ui, image_rect, fraction,
-                                                );
-                                            }
-                                        }
                                     }
                                     // 単一表示時は見開きレイアウトキャッシュを破棄
                                     self.fs_spread_layout = None;
@@ -2793,7 +2953,13 @@ impl App {
                             if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
                                 let _ = db.set(folder, self.spread_mode, self.settings.default_spread_mode);
                             }
-                            if self.spread_mode.is_spread() && self.analysis_mode {
+                            if self.spread_mode.is_vertical() {
+                                self.fs_vertical_scroll = 0.0;
+                                self.fs_pan = egui::Vec2::ZERO;
+                                self.fs_free_rotation = 0.0;
+                            }
+                            self.fs_vertical_cache_keep_set.clear();
+                            if (self.spread_mode.is_spread() || self.spread_mode.is_vertical()) && self.analysis_mode {
                                 self.reset_analysis_mode();
                             }
                             self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
@@ -3964,6 +4130,11 @@ impl App {
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown));
         let ctrl_page_up =
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp));
+        let vertical_mode_for_page_keys = self.spread_mode.is_vertical();
+        let page_down = vertical_mode_for_page_keys
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown));
+        let page_up = vertical_mode_for_page_keys
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp));
         // マウス戻る/進む (Extra1/Extra2 = native XButton) を Ctrl+↑/↓ と等価に扱う。
         let mouse_back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
         let mouse_forward = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2));
@@ -4201,12 +4372,13 @@ impl App {
         // 消しゴムモード中は ui_erase が先に Ctrl+Z を吸収する。
         self.handle_meta_undo_keys(ctx);
 
-        // 見開きモード切替 (1-5 キー)
+        // 表示モード切替 (1-6 キー)
         let key_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num1));
         let key_2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num2));
         let key_3 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num3));
         let key_4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num4));
         let key_5 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num5));
+        let key_6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num6));
 
         // U / Shift+U / Alt+U: AI アップスケールモデル サイクル (次 / 前 / なしリセット)
         // 注意: egui の consume_key は matches_logically で判定されるため、Modifiers::NONE が
@@ -4246,7 +4418,7 @@ impl App {
                 || i.consume_key(egui::Modifiers::NONE, egui::Key::Q)
         });
 
-        // 見開きモード切替 + フィードバック表示
+        // 表示モード切替 + フィードバック表示
         let new_spread = if key_1 {
             Some(SpreadMode::Single)
         } else if key_2 {
@@ -4257,6 +4429,8 @@ impl App {
             Some(SpreadMode::Rtl)
         } else if key_5 {
             Some(SpreadMode::RtlCover)
+        } else if key_6 {
+            Some(SpreadMode::Vertical)
         } else {
             None
         };
@@ -4266,12 +4440,18 @@ impl App {
                 self.spread_mode = mode;
                 self.spread_popup_open = false;
                 self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+                if mode.is_vertical() {
+                    self.fs_vertical_scroll = 0.0;
+                    self.fs_pan = egui::Vec2::ZERO;
+                    self.fs_free_rotation = 0.0;
+                }
+                self.fs_vertical_cache_keep_set.clear();
                 // DB に保存
                 if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
                     let _ = db.set(folder, mode, self.settings.default_spread_mode);
                 }
                 // 分析モードを解除 (post-filter バイパスも戻す)
-                if mode.is_spread() && self.analysis_mode {
+                if (mode.is_spread() || mode.is_vertical()) && self.analysis_mode {
                     self.reset_analysis_mode();
                 }
                 // ページ位置を正規化
@@ -4286,8 +4466,10 @@ impl App {
                 3
             } else if key_4 {
                 4
-            } else {
+            } else if key_5 {
                 5
+            } else {
+                6
             };
             self.show_feedback_toast(format!("[{}:{}]", key_num, mode.label()));
         }
@@ -4643,8 +4825,28 @@ impl App {
         // ── ナビゲーション ──
         // RTL モードでは左右キーの意味を反転
         let rtl = self.spread_mode.is_rtl();
-        let nav_next = (arrow_right && !rtl) || (arrow_left && rtl) || arrow_down;
-        let nav_prev = (arrow_left && !rtl) || (arrow_right && rtl) || arrow_up;
+        let vertical_reading = self.spread_mode.is_vertical();
+        if vertical_reading {
+            let mut scroll_delta = 0.0;
+            if arrow_down && !ctrl_d {
+                scroll_delta += VERTICAL_READING_SCROLL_STEP_PX;
+            }
+            if arrow_up && !ctrl_u {
+                scroll_delta -= VERTICAL_READING_SCROLL_STEP_PX;
+            }
+            let page_step = ctx.content_rect().height() * VERTICAL_READING_PAGE_SCROLL_FRAC;
+            if page_down {
+                scroll_delta += page_step;
+            }
+            if page_up {
+                scroll_delta -= page_step;
+            }
+            self.scroll_vertical_reading_by(ctx, scroll_delta);
+        }
+        let nav_next =
+            (arrow_right && !rtl) || (arrow_left && rtl) || (!vertical_reading && arrow_down);
+        let nav_prev =
+            (arrow_left && !rtl) || (arrow_right && rtl) || (!vertical_reading && arrow_up);
 
         // 矢印キーでのフォルダ内移動はスライドショーを止めない (ホイール / クリックと統一)。
         // 一部スキップしつつスライドショーを継続できる。フォルダをまたぐ Ctrl+↑↓ や
@@ -5026,6 +5228,15 @@ impl App {
                 // 2026-05 ユーザー要望: 拡大縮小のつもりでホイールを回して画像が切り替
                 // わる事故を避けるため、360 ON 時はホイール全部 (= 修飾キー無視) を
                 // FOV 操作に振る。前後ナビは矢印キーで行う。
+            } else if self.spread_mode.is_vertical()
+                && !ctrl_held
+                && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
+                && self
+                    .fullscreen_idx
+                    .is_some_and(|idx| self.vertical_reading_supported_idx(idx))
+                && !self.is_overlay_edit_mode_active()
+            {
+                self.scroll_vertical_reading_by(ctx, -wheel_y);
             } else {
                 if should_zoom_fullscreen_wheel(ctrl_held, self.is_overlay_edit_mode_active()) {
                     // 通常モード: Ctrl+ホイールでズーム。
@@ -5102,7 +5313,7 @@ impl App {
             let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
 
             // 見開き 2 ページ表示中はフリー回転が描画に反映されないため、Ctrl+ドラッグ回転を無効化する
-            if mods.ctrl && !is_spread_double {
+            if mods.ctrl && !is_spread_double && !self.spread_mode.is_vertical() {
                 // Ctrl+ドラッグ → 回転
                 if primary_pressed {
                     if let Some(pos) = pointer_pos {
@@ -6037,6 +6248,475 @@ impl App {
                 full_rect.center().y + 22.0,
                 20.0,
             );
+        }
+    }
+
+    pub(crate) fn scroll_vertical_reading_by(&mut self, ctx: &egui::Context, delta: f32) {
+        if delta.abs() <= 0.5 {
+            return;
+        }
+        self.fs_vertical_scroll += delta;
+        ctx.request_repaint();
+    }
+
+    pub(crate) fn scroll_vertical_reading_step(&mut self, ctx: &egui::Context, direction: f32) {
+        self.scroll_vertical_reading_by(ctx, direction * VERTICAL_READING_SCROLL_STEP_PX);
+    }
+
+    fn vertical_reading_supported_idx(&self, idx: usize) -> bool {
+        matches!(
+            self.items.get(idx),
+            Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. })
+        )
+    }
+
+    fn vertical_reading_indices_and_pos(&self, idx: usize) -> Option<(Vec<usize>, usize)> {
+        let image_indices = build_image_reading_indices(&self.items, &self.visible_indices);
+        let pos = image_indices.iter().position(|&i| i == idx)?;
+        Some((image_indices, pos))
+    }
+
+    fn vertical_reading_base_size(&mut self, idx: usize, fallback: egui::Vec2) -> egui::Vec2 {
+        let rotation = self.get_rotation(idx);
+        let raw = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static {
+                tex, source_dims, ..
+            }) => match source_dims {
+                Some([w, h]) => Some(egui::vec2(*w as f32, *h as f32)),
+                None => Some(tex.size_vec2()),
+            },
+            Some(FsCacheEntry::Animated {
+                frames,
+                current_frame,
+                ..
+            }) => frames.get(*current_frame).map(|(tex, _)| tex.size_vec2()),
+            _ => None,
+        }
+        .or_else(|| {
+            self.fs_early_dims
+                .get(&idx)
+                .map(|[w, h]| egui::vec2(*w as f32, *h as f32))
+        })
+        .or_else(|| match self.thumbnails.get(idx) {
+            Some(ThumbnailState::Loaded {
+                tex, source_dims, ..
+            }) => source_dims
+                .map(|(w, h)| egui::vec2(w as f32, h as f32))
+                .or_else(|| Some(tex.size_vec2())),
+            _ => None,
+        })
+        .unwrap_or(fallback);
+
+        let size = match rotation {
+            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
+                egui::vec2(raw.y, raw.x)
+            }
+            _ => raw,
+        };
+        if size.x > 0.0 && size.y > 0.0 {
+            size
+        } else {
+            egui::vec2(fallback.x.max(1.0), fallback.y.max(1.0))
+        }
+    }
+
+    fn vertical_reading_page_size_for_width(
+        &mut self,
+        idx: usize,
+        target_width: f32,
+        fallback: egui::Vec2,
+    ) -> VerticalReadingSize {
+        let base = self.vertical_reading_base_size(idx, fallback);
+        let width = target_width.max(1.0);
+        let height = (base.y * (width / base.x.max(1.0))).max(1.0);
+        VerticalReadingSize { idx, width, height }
+    }
+
+    fn vertical_reading_loaded_texels(&self, idx: usize) -> usize {
+        match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { tex, .. }) => {
+                let s = tex.size_vec2();
+                (s.x.max(1.0) as usize).saturating_mul(s.y.max(1.0) as usize)
+            }
+            Some(FsCacheEntry::Animated { frames, .. }) => frames
+                .iter()
+                .map(|(tex, _)| {
+                    let s = tex.size_vec2();
+                    (s.x.max(1.0) as usize).saturating_mul(s.y.max(1.0) as usize)
+                })
+                .sum(),
+            _ => 0,
+        }
+    }
+
+    fn vertical_reading_layout(
+        &mut self,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        image_indices: &[usize],
+        current_pos: usize,
+    ) -> Option<(Vec<VerticalReadingPage>, Vec<usize>, Vec<f32>)> {
+        if image_indices.is_empty() || current_pos >= image_indices.len() {
+            return None;
+        }
+        let fallback = egui::vec2(image_rect.width().max(1.0), image_rect.height().max(1.0));
+        let mut zoom = self.fs_zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        let mut sizes = Vec::new();
+        let mut offsets = Vec::new();
+        let mut visible_positions = Vec::new();
+
+        for _ in 0..8 {
+            let page_width = (image_rect.width() * zoom).max(1.0);
+            sizes.clear();
+            for &idx in image_indices {
+                sizes.push(self.vertical_reading_page_size_for_width(idx, page_width, fallback));
+            }
+            let heights = sizes.iter().map(|s| s.height).collect::<Vec<_>>();
+            offsets = vertical_reading_offsets(&heights, VERTICAL_READING_GAP_PX, current_pos);
+            self.fs_vertical_scroll = clamp_vertical_reading_scroll(
+                self.fs_vertical_scroll,
+                &offsets,
+                &heights,
+                image_rect.height().max(1.0),
+            );
+            visible_positions = vertical_reading_visible_positions(
+                &offsets,
+                &heights,
+                self.fs_vertical_scroll,
+                image_rect.height().max(1.0),
+            );
+            if visible_positions.len() <= VERTICAL_READING_MAX_VISIBLE_PAGES || zoom >= ZOOM_MAX {
+                break;
+            }
+            let factor = ((visible_positions.len() as f32
+                / VERTICAL_READING_MAX_VISIBLE_PAGES as f32)
+                .sqrt()
+                * 1.05)
+                .max(1.05);
+            zoom = (zoom * factor).min(ZOOM_MAX);
+        }
+
+        if zoom > self.fs_zoom + TRANSFORM_EPSILON {
+            self.fs_zoom = zoom;
+            ctx.request_repaint();
+        }
+
+        if visible_positions.len() > VERTICAL_READING_MAX_VISIBLE_PAGES {
+            visible_positions.sort_by(|a, b| {
+                (offsets[*a] - self.fs_vertical_scroll)
+                    .abs()
+                    .partial_cmp(&(offsets[*b] - self.fs_vertical_scroll).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            visible_positions.truncate(VERTICAL_READING_MAX_VISIBLE_PAGES);
+            visible_positions.sort_unstable();
+        }
+
+        let center_x = image_rect.center().x + self.fs_pan.x;
+        let pages = visible_positions
+            .iter()
+            .copied()
+            .filter_map(|list_pos| {
+                let size = sizes.get(list_pos)?;
+                let center_y = image_rect.center().y - self.fs_vertical_scroll + offsets[list_pos];
+                Some(VerticalReadingPage {
+                    idx: size.idx,
+                    rect: egui::Rect::from_center_size(
+                        egui::pos2(center_x, center_y),
+                        egui::vec2(size.width, size.height),
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Some((pages, visible_positions, offsets))
+    }
+
+    fn update_vertical_reading_prefetch_window(
+        &mut self,
+        image_indices: &[usize],
+        visible_positions: &[usize],
+    ) {
+        if image_indices.is_empty() {
+            return;
+        }
+        let current_pos = self
+            .fullscreen_idx
+            .and_then(|idx| image_indices.iter().position(|&i| i == idx))
+            .unwrap_or_else(|| visible_positions.first().copied().unwrap_or(0));
+        let first_visible = visible_positions
+            .first()
+            .copied()
+            .unwrap_or(current_pos)
+            .min(image_indices.len() - 1);
+        let last_visible = visible_positions
+            .last()
+            .copied()
+            .unwrap_or(current_pos)
+            .min(image_indices.len() - 1);
+        let keep_start = first_visible.saturating_sub(VERTICAL_READING_PREFETCH_PAD);
+        let keep_end = (last_visible + VERTICAL_READING_PREFETCH_PAD).min(image_indices.len() - 1);
+        let center_pos = (first_visible + last_visible) as f32 * 0.5;
+        let mut keep_positions = (keep_start..=keep_end).collect::<Vec<_>>();
+        if keep_positions.len() > VERTICAL_READING_MAX_CACHE_PAGES {
+            keep_positions.sort_by(|a, b| {
+                (*a as f32 - center_pos)
+                    .abs()
+                    .partial_cmp(&(*b as f32 - center_pos).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            keep_positions.truncate(VERTICAL_READING_MAX_CACHE_PAGES);
+            keep_positions.sort_unstable();
+        }
+
+        let visible_set = visible_positions
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let mut keep_set = keep_positions
+            .iter()
+            .map(|&pos| image_indices[pos])
+            .collect::<std::collections::HashSet<_>>();
+
+        let mut loaded_texels: usize = keep_set
+            .iter()
+            .map(|&idx| self.vertical_reading_loaded_texels(idx))
+            .sum();
+        if loaded_texels > VERTICAL_READING_MAX_CACHE_TEXELS {
+            let mut removable = keep_positions
+                .iter()
+                .copied()
+                .filter(|pos| !visible_set.contains(pos))
+                .collect::<Vec<_>>();
+            removable.sort_by(|a, b| {
+                (*b as f32 - center_pos)
+                    .abs()
+                    .partial_cmp(&(*a as f32 - center_pos).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for pos in removable {
+                let idx = image_indices[pos];
+                if keep_set.remove(&idx) {
+                    loaded_texels =
+                        loaded_texels.saturating_sub(self.vertical_reading_loaded_texels(idx));
+                    if loaded_texels <= VERTICAL_READING_MAX_CACHE_TEXELS {
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.fs_vertical_cache_keep_set = keep_set.clone();
+        self.evict_final_pipeline_cache_for_keep_set(&keep_set);
+        self.evict_adjustment_cache_for_keep_set(&keep_set);
+
+        self.save_all_video_resume_positions();
+        self.fs_cache
+            .retain(|k, v| keep_set.contains(k) || matches!(v, FsCacheEntry::Video { .. }));
+
+        let current_idx = self.fullscreen_idx.unwrap_or(image_indices[current_pos]);
+        let current_loading =
+            keep_set.contains(&current_idx) && !self.fs_cache.contains_key(&current_idx);
+        let to_cancel = self
+            .fs_pending
+            .keys()
+            .filter(|&&k| {
+                if k == current_idx {
+                    return false;
+                }
+                current_loading || !keep_set.contains(&k)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        for idx in to_cancel {
+            if let Some((cancel, _, _)) = self.fs_pending.remove(&idx) {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.fs_early_dims.remove(&idx);
+        }
+        if current_loading {
+            return;
+        }
+
+        let mut targets = keep_positions;
+        targets.sort_by(|a, b| {
+            (*a as f32 - current_pos as f32)
+                .abs()
+                .partial_cmp(&(*b as f32 - current_pos as f32).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for pos in targets {
+            let idx = image_indices[pos];
+            if keep_set.contains(&idx)
+                && !self.fs_cache.contains_key(&idx)
+                && !self.fs_pending.contains_key(&idx)
+            {
+                self.start_fs_load(idx);
+            }
+        }
+    }
+
+    fn vertical_reading_processed_texture_cached(&self, idx: usize) -> bool {
+        if self.comic_pages.contains(&idx) {
+            self.current_comic_composite_texture(idx).is_some()
+        } else {
+            self.current_final_composite_texture(idx).is_some()
+        }
+    }
+
+    fn vertical_reading_process_indices(
+        &self,
+        pages: &[VerticalReadingPage],
+        current_idx: usize,
+        image_rect: egui::Rect,
+    ) -> std::collections::HashSet<usize> {
+        let mut candidates = pages.iter().collect::<Vec<_>>();
+        candidates.sort_by(|a, b| {
+            let a_current = a.idx != current_idx;
+            let b_current = b.idx != current_idx;
+            a_current.cmp(&b_current).then_with(|| {
+                (a.rect.center().y - image_rect.center().y)
+                    .abs()
+                    .partial_cmp(&(b.rect.center().y - image_rect.center().y).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+
+        let mut process = std::collections::HashSet::new();
+        for page in candidates {
+            if page.idx != current_idx && self.vertical_reading_processed_texture_cached(page.idx) {
+                continue;
+            }
+            process.insert(page.idx);
+            if process.len() >= VERTICAL_READING_PROCESSED_UPLOADS_PER_FRAME {
+                break;
+            }
+        }
+        process
+    }
+
+    fn draw_fs_vertical_reading(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+        original_preview_active: bool,
+    ) {
+        let Some((image_indices, current_pos)) = self.vertical_reading_indices_and_pos(fs_idx)
+        else {
+            self.fs_spread_layout = None;
+            return;
+        };
+        let Some((pages, visible_positions, offsets)) =
+            self.vertical_reading_layout(ctx, image_rect, &image_indices, current_pos)
+        else {
+            self.fs_spread_layout = None;
+            return;
+        };
+        self.update_vertical_reading_prefetch_window(&image_indices, &visible_positions);
+
+        let bg_tex = if self.fs_transparent_bg_mode == 2 {
+            self.ensure_checker_texture(ctx);
+            self.fs_checker_texture.clone()
+        } else {
+            None
+        };
+        let bg_style = transparent_bg_style(self.fs_transparent_bg_mode, bg_tex.as_ref());
+        let painter = ui.painter().with_clip_rect(image_rect);
+        let holdover_for_locked = if self.fs_nav_is_locked() {
+            self.fs_holdover_tex.clone()
+        } else {
+            None
+        };
+
+        let process_indices = if original_preview_active {
+            std::collections::HashSet::new()
+        } else {
+            self.vertical_reading_process_indices(
+                &pages,
+                self.fullscreen_idx.unwrap_or(fs_idx),
+                image_rect,
+            )
+        };
+        let has_deferred_processed = !original_preview_active
+            && pages.iter().any(|page| {
+                !process_indices.contains(&page.idx)
+                    && !self.vertical_reading_processed_texture_cached(page.idx)
+            });
+
+        let mut any_loading = false;
+        for page in pages {
+            self.advance_animation(ctx, page.idx);
+            let rotation = self.get_rotation(page.idx);
+            let location = self.location_display_for_loading(page.idx);
+            let display_tex = if original_preview_active {
+                self.resolve_original_preview_tex(page.idx)
+                    .or_else(|| self.resolve_fs_display_tex(page.idx, true))
+            } else if process_indices.contains(&page.idx) {
+                // 縦読みでも単ページ/見開きと同じ final pipeline を使う。ただし
+                // 新規 GPU upload は中央付近から 1 フレームずつ進め、スクロール中の
+                // 大量同期生成を避ける。
+                self.resolve_fs_processed_texture(ctx, page.idx, false)
+            } else {
+                self.resolve_fs_display_tex(page.idx, true)
+            };
+            if matches!(self.fs_cache.get(&page.idx), Some(FsCacheEntry::Failed)) {
+                painter.text(
+                    page.rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "読込失敗",
+                    egui::FontId::proportional(18.0),
+                    egui::Color32::from_rgb(255, 140, 140),
+                );
+                continue;
+            }
+            if !self.fs_cache.contains_key(&page.idx) {
+                any_loading = true;
+            }
+            Self::draw_fs_spread_page(
+                &painter,
+                page.rect,
+                page.idx,
+                rotation,
+                &self.thumbnails,
+                &bg_style,
+                &location,
+                holdover_for_locked.as_ref(),
+                display_tex.as_ref(),
+            );
+            let gap_y = page.rect.max.y + VERTICAL_READING_GAP_PX * 0.5;
+            painter.line_segment(
+                [
+                    egui::pos2(page.rect.min.x, gap_y),
+                    egui::pos2(page.rect.max.x, gap_y),
+                ],
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
+                ),
+            );
+        }
+
+        if let Some(new_pos) = vertical_reading_nearest_position(&offsets, self.fs_vertical_scroll)
+            && new_pos != current_pos
+            && let Some(&new_idx) = image_indices.get(new_pos)
+        {
+            self.fs_vertical_scroll =
+                vertical_reading_reanchor_scroll(self.fs_vertical_scroll, &offsets, new_pos);
+            self.fullscreen_idx = Some(new_idx);
+            self.selected = Some(new_idx);
+            self.scroll_to_selected = true;
+            self.update_last_selected_image();
+            self.record_book_resume(new_idx);
+            ctx.request_repaint();
+        }
+
+        self.fs_spread_layout = None;
+        if any_loading || has_deferred_processed {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
 
@@ -8413,9 +9093,9 @@ impl App {
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
-        // 📖 見開きモードボタン (画像のみ。動画では非表示)
+        // 📖 表示モードボタン (画像のみ。動画では非表示)
         // 360 モード中も非表示 (360 は強制 Single)。
-        let spread_active = spread_mode.is_spread();
+        let spread_active = spread_mode.is_spread() || spread_mode.is_vertical();
         let sm = *spread_mode;
         let mut spread_resp_rect = egui::Rect::NOTHING;
         if !is_video && !panorama_mode_active {
@@ -8428,7 +9108,7 @@ impl App {
                 spread_active,
                 |p, c, r| draw_spread_icon(p, c, r, sm),
             );
-            let spread_resp = spread_resp.hover_tip_dark("見開き設定 [1-5]");
+            let spread_resp = spread_resp.hover_tip_dark("表示モード [1-6]");
             spread_resp_rect = spread_resp.rect;
             if spread_resp.clicked() {
                 *spread_popup_open = !*spread_popup_open;
@@ -8437,16 +9117,16 @@ impl App {
                 *nav_delta = 0;
             }
         } else if *spread_popup_open {
-            // 動画モードに切り替わったときは popup を閉じる (見開きは画像のみ)
+            // 動画モードに切り替わったときは popup を閉じる (表示モードは画像のみ)
             *spread_popup_open = false;
         }
 
-        // 見開きポップアップ (画像のみ)
+        // 表示モードポップアップ (画像のみ)
         if *spread_popup_open && !is_video {
             let popup_x = next_x;
             let popup_y = bar_rect.max.y + 4.0;
             let popup_w = 200.0_f32;
-            let popup_h = 5.0 * 36.0 + 8.0; // 5 items + padding
+            let popup_h = SpreadMode::all().len() as f32 * 36.0 + 8.0;
             let popup_rect = egui::Rect::from_min_size(
                 egui::pos2(popup_x, popup_y),
                 egui::vec2(popup_w, popup_h),
@@ -8502,13 +9182,7 @@ impl App {
                     egui::Color32::from_gray(220),
                 );
 
-                let shortcut_label = match mode.to_int() {
-                    0 => "[1]",
-                    1 => "[2]",
-                    2 => "[3]",
-                    3 => "[4]",
-                    _ => "[5]",
-                };
+                let shortcut_label = format!("[{}]", mode.to_int() + 1);
                 ui.painter().text(
                     egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
                     egui::Align2::RIGHT_CENTER,
@@ -11247,6 +11921,52 @@ mod tests {
         assert!(should_zoom_fullscreen_wheel(true, false));
         assert!(should_zoom_fullscreen_wheel(false, true));
         assert!(!should_zoom_fullscreen_wheel(false, false));
+    }
+
+    #[test]
+    fn vertical_reading_offsets_center_current_page() {
+        let offsets = vertical_reading_offsets(&[100.0, 100.0, 100.0], 10.0, 1);
+        assert_eq!(offsets, vec![-110.0, 0.0, 110.0]);
+    }
+
+    #[test]
+    fn vertical_reading_visible_positions_follow_scroll() {
+        let heights = [100.0, 100.0, 100.0];
+        let offsets = vertical_reading_offsets(&heights, 10.0, 1);
+
+        assert_eq!(
+            vertical_reading_visible_positions(&offsets, &heights, 0.0, 100.0),
+            vec![1]
+        );
+        assert_eq!(
+            vertical_reading_visible_positions(&offsets, &heights, 110.0, 100.0),
+            vec![2]
+        );
+        assert_eq!(vertical_reading_nearest_position(&offsets, 110.0), Some(2));
+    }
+
+    #[test]
+    fn vertical_reading_scroll_clamps_to_book_edges() {
+        let heights = [100.0, 100.0];
+        let offsets = vertical_reading_offsets(&heights, 10.0, 0);
+
+        assert_eq!(
+            clamp_vertical_reading_scroll(-500.0, &offsets, &heights, 100.0),
+            0.0
+        );
+        assert_eq!(
+            clamp_vertical_reading_scroll(500.0, &offsets, &heights, 100.0),
+            110.0
+        );
+    }
+
+    #[test]
+    fn vertical_reading_reanchor_keeps_visual_position() {
+        let heights = [100.0, 100.0, 100.0];
+        let offsets = vertical_reading_offsets(&heights, 10.0, 1);
+
+        assert_eq!(vertical_reading_reanchor_scroll(110.0, &offsets, 2), 0.0);
+        assert_eq!(vertical_reading_reanchor_scroll(-110.0, &offsets, 0), 0.0);
     }
 
     // ── decide_local_adjust_preview_action unit tests ─────────────────────

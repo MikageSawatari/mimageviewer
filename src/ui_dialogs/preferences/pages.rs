@@ -2172,7 +2172,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     let s = &mut state.settings;
 
     ui.label(
-        "フルスクリーンで画像を開いたときの初期表示モード。\n数字キー 1-5 でも切り替えできます。",
+        "フルスクリーンで画像を開いたときの初期表示モード。\n数字キー 1-6 でも切り替えできます。",
     );
     ui.add_space(4.0);
     egui::ComboBox::from_label("デフォルトの表示モード")

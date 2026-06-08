@@ -851,7 +851,7 @@ pub(super) fn draw_rotate_icon(
     painter.line_segment([arrow_pt, p2], stroke);
 }
 
-/// 見開きモードアイコンを描画する。
+/// 表示モードアイコンを描画する。
 /// 余白カットフィットのアイコン: 外枠 (余白込みの画像) + 内枠 (中身) + 4 辺から内枠へ
 /// 向かう矢印 (= 余白を詰めて中身を拡大するイメージ)。
 pub(super) fn draw_margin_fit_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
@@ -948,6 +948,24 @@ pub(super) fn draw_spread_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, m
             painter.rect_stroke(right_rect, 1.0, stroke, egui::StrokeKind::Outside);
             // 方向矢印
             draw_spread_direction_arrow(painter, c, r, mode.is_rtl());
+        }
+        SpreadMode::Vertical => {
+            // 縦読み: 縦に連なるページ + 下向き矢印
+            let stack_w = page_w * 0.9;
+            let stack_h = page_h * 0.48;
+            let gap = r * 0.10;
+            for offset in [-1.0, 0.0, 1.0] {
+                let rect = egui::Rect::from_center_size(
+                    egui::pos2(c.x, c.y + offset * (stack_h + gap)),
+                    egui::vec2(stack_w, stack_h),
+                );
+                painter.rect_stroke(rect, 1.0, stroke, egui::StrokeKind::Outside);
+            }
+            let tip = egui::pos2(c.x + stack_w * 0.55, c.y + r * 0.72);
+            let top = egui::pos2(c.x + stack_w * 0.55, c.y - r * 0.62);
+            painter.line_segment([top, tip], stroke);
+            painter.line_segment([tip, tip + egui::vec2(-r * 0.22, -r * 0.22)], stroke);
+            painter.line_segment([tip, tip + egui::vec2(r * 0.22, -r * 0.22)], stroke);
         }
     }
 }

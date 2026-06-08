@@ -424,15 +424,9 @@ impl Parallelism {
 }
 
 // -----------------------------------------------------------------------
-// SpreadMode (見開き表示)
+// UiTheme (UI 背景色テーマ)
 // -----------------------------------------------------------------------
 
-/// 見開き表示モード。
-///
-/// - `Single`: 通常の1ページ表示
-/// - `Ltr`: 見開き 左→右（表紙なし）— [0,1] [2,3] ...
-/// - `LtrCover`: 見開き 左→右（表紙あり）— [0] [1,2] [3,4] ...
-/// - `Rtl`: 見開き 右→左（表紙なし）— [0,1] [2,3] ...
 /// UI 背景色テーマ (v0.7.0)。
 ///
 /// - `System` (デフォルト): Windows の「アプリ用の色」に追従。レジストリから検出し、
@@ -581,6 +575,18 @@ fn default_resume_from_start() -> ResumeMode {
     ResumeMode::FromStart
 }
 
+// -----------------------------------------------------------------------
+// SpreadMode (フルスクリーン表示モード)
+// -----------------------------------------------------------------------
+
+/// フルスクリーンの表示モード。
+///
+/// - `Single`: 通常の1ページ表示
+/// - `Ltr`: 見開き 左→右（表紙なし）— [0,1] [2,3] ...
+/// - `LtrCover`: 見開き 左→右（表紙あり）— [0] [1,2] [3,4] ...
+/// - `Rtl`: 見開き 右→左（表紙なし）— [0,1] [2,3] ...
+/// - `RtlCover`: 見開き 右→左（表紙あり）— [0] [2,1] [4,3] ...
+/// - `Vertical`: 縦読み
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum SpreadMode {
     #[default]
@@ -589,12 +595,21 @@ pub enum SpreadMode {
     LtrCover,
     Rtl,
     RtlCover,
+    Vertical,
 }
 
 impl SpreadMode {
     /// 見開きモードか
     pub fn is_spread(self) -> bool {
-        !matches!(self, Self::Single)
+        matches!(
+            self,
+            Self::Ltr | Self::LtrCover | Self::Rtl | Self::RtlCover
+        )
+    }
+
+    /// 縦読みモードか
+    pub fn is_vertical(self) -> bool {
+        matches!(self, Self::Vertical)
     }
 
     /// 右→左（RTL）モードか
@@ -607,13 +622,14 @@ impl SpreadMode {
         matches!(self, Self::LtrCover | Self::RtlCover)
     }
 
-    /// 整数値 (0-4) から生成
+    /// 整数値 (0-5) から生成
     pub fn from_int(v: i32) -> Self {
         match v {
             1 => Self::Ltr,
             2 => Self::LtrCover,
             3 => Self::Rtl,
             4 => Self::RtlCover,
+            5 => Self::Vertical,
             _ => Self::Single,
         }
     }
@@ -626,6 +642,7 @@ impl SpreadMode {
             Self::LtrCover => 2,
             Self::Rtl => 3,
             Self::RtlCover => 4,
+            Self::Vertical => 5,
         }
     }
 
@@ -636,6 +653,7 @@ impl SpreadMode {
             Self::LtrCover => "見開き 左→右（表紙あり）",
             Self::Rtl => "見開き 右→左",
             Self::RtlCover => "見開き 右→左（表紙あり）",
+            Self::Vertical => "縦読み",
         }
     }
 
@@ -646,6 +664,7 @@ impl SpreadMode {
             Self::LtrCover,
             Self::Rtl,
             Self::RtlCover,
+            Self::Vertical,
         ]
     }
 }
@@ -927,8 +946,8 @@ pub struct Settings {
     #[serde(default = "default_export_batch_selection")]
     pub export_batch_selection: [bool; 5],
 
-    // ── 見開き表示 ──────────────────────────────────────────
-    /// デフォルトの見開き表示モード
+    // ── フルスクリーン表示モード ────────────────────────────
+    /// デフォルトの表示モード
     #[serde(default)]
     pub default_spread_mode: SpreadMode,
 

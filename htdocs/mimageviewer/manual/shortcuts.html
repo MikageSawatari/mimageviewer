@@ -243,8 +243,9 @@
           <tr><th>キー</th><th>操作</th></tr>
         </thead>
         <tbody>
-          <tr><td><kbd>→</kbd> / <kbd>↓</kbd></td><td>次の画像へ</td></tr>
-          <tr><td><kbd>←</kbd> / <kbd>↑</kbd></td><td>前の画像へ</td></tr>
+          <tr><td><kbd>→</kbd> / <kbd>↓</kbd></td><td>次の画像へ。縦読み中の <kbd>↓</kbd> は下へスクロール</td></tr>
+          <tr><td><kbd>←</kbd> / <kbd>↑</kbd></td><td>前の画像へ。縦読み中の <kbd>↑</kbd> は上へスクロール</td></tr>
+          <tr><td><kbd>PageUp</kbd> / <kbd>PageDown</kbd></td><td>縦読み中は画面単位で上下スクロール</td></tr>
           <tr><td><kbd>Home</kbd></td><td>フォルダ内の最初の画像へ</td></tr>
           <tr><td><kbd>End</kbd></td><td>フォルダ内の最後の画像へ</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>フルスクリーンのまま次フォルダの先頭画像へジャンプ</td></tr>
@@ -255,7 +256,7 @@
       </table>
     </div>
 
-    <h3>見開き表示</h3>
+    <h3>表示モード</h3>
     <div class="table-wrap">
       <table>
         <thead>
@@ -267,6 +268,7 @@
           <tr><td><kbd>3</kbd></td><td>見開き 左→右（表紙あり）</td></tr>
           <tr><td><kbd>4</kbd></td><td>見開き 右→左</td></tr>
           <tr><td><kbd>5</kbd></td><td>見開き 右→左（表紙あり）</td></tr>
+          <tr><td><kbd>6</kbd></td><td>縦読み（ホイール・<kbd>↑</kbd>/<kbd>↓</kbd>・<kbd>PageUp</kbd>/<kbd>PageDown</kbd> でスクロール）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>見開きの「1ページずらし」。空白ページや欠落でページの組み合わせがずれたとき、見開きを1ページぶんずらして合わせ直します（押すたびに必ず1ページ分ずれます）。ずらした状態は見開きモード（表紙あり／なし）として扱われ、フォルダごとに保存されます。1ページ表示中は前後のページへ移動します</td></tr>
         </tbody>
       </table>
@@ -275,7 +277,7 @@
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
         右→左モード（<kbd>4</kbd>/<kbd>5</kbd>）では <kbd>←</kbd> と <kbd>→</kbd> の意味が反転します。
-        <kbd>↑</kbd>/<kbd>↓</kbd> は常に前/次です。
+        縦読みモードでは <kbd>↑</kbd>/<kbd>↓</kbd> とホイールがスクロールになり、<kbd>←</kbd>/<kbd>→</kbd> は前後ページ移動のままです。
       </div>
     </div>
 
@@ -389,7 +391,7 @@
           <tr><th>操作</th><th>説明</th></tr>
         </thead>
         <tbody>
-          <tr><td>マウスホイール（上/下）</td><td>前後の画像に移動</td></tr>
+          <tr><td>マウスホイール（上/下）</td><td>前後の画像に移動。縦読み中は上下スクロール</td></tr>
           <tr><td><kbd>Ctrl</kbd>+マウスホイール</td><td>マウス位置を中心にズーム（0.1〜50 倍）</td></tr>
           <tr><td>左ドラッグ（ズーム中）</td><td>パン（表示範囲を移動）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+左ドラッグ</td><td>画像を任意の角度に回転（一時的、保存なし）</td></tr>
