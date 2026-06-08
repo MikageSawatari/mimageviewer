@@ -164,15 +164,19 @@ fn is_image_ext(ext_lower: &str) -> bool {
     crate::folder_tree::is_recognized_image_ext(ext_lower)
 }
 
-/// エントリ名に ".zip/" 境界があれば境界位置 (境界 '/' の絶対 byte 位置) を列挙。
-/// 大文字小文字を区別しない。
+/// エントリ名に ".zip/" / ".cbz/" 境界があれば境界位置 (境界 '/' の絶対 byte 位置) を列挙。
+/// 大文字小文字を区別しない。CBZ は実体が ZIP なので、列挙 (`enumerate_image_entries`)
+/// 側でネスト .cbz も再帰展開する。それと一致させ、読み戻し (`read_entry_bytes`) でも
+/// .cbz 境界で分割できるようにする (両者がずれると「列挙されるが読めない」不整合になる)。
+/// `.zip/` と `.cbz/` はどちらも 5 byte で対称。
 fn find_nested_zip_boundaries(entry_name: &str) -> Vec<usize> {
     let lower = entry_name.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let mut boundaries = Vec::new();
     let mut i = 0;
     while i + 5 <= bytes.len() {
-        if &bytes[i..i + 5] == b".zip/" {
+        let seg = &bytes[i..i + 5];
+        if seg == b".zip/" || seg == b".cbz/" {
             boundaries.push(i + 4); // '/' の絶対位置
             i += 5;
         } else {
@@ -706,5 +710,25 @@ mod tests {
     fn split_nested_with_subdir_between() {
         let parts = split_nested_zip_path("pack.zip/sub/inner.zip/img.png");
         assert_eq!(parts, vec!["pack.zip", "sub/inner.zip", "img.png"]);
+    }
+
+    #[test]
+    fn split_nested_cbz_boundary() {
+        // CBZ は実体が ZIP。列挙側がネスト .cbz を再帰するので、読み戻し側も .cbz/ で
+        // 分割できないと「列挙されるが読めない」不整合になる (Codex P1 回帰防止)。
+        let parts = split_nested_zip_path("chapters/ch01.cbz/page01.jpg");
+        assert_eq!(parts, vec!["chapters/ch01.cbz", "page01.jpg"]);
+    }
+
+    #[test]
+    fn split_nested_mixed_zip_and_cbz() {
+        assert_eq!(
+            split_nested_zip_path("a.cbz/b.zip/img.png"),
+            vec!["a.cbz", "b.zip", "img.png"]
+        );
+        assert_eq!(
+            split_nested_zip_path("a.zip/b.cbz/img.png"),
+            vec!["a.zip", "b.cbz", "img.png"]
+        );
     }
 }

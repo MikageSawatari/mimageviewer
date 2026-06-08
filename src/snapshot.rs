@@ -238,16 +238,21 @@ pub fn split_archive_path(path: &Path) -> Option<(PathBuf, String)> {
     let s = path.to_string_lossy().to_string();
     // forward slash 統一 (= 検索しやすくするため)
     let unified = s.replace('\\', "/");
-    // 拡張子 `.zip` / `.pdf` の境界を探す (= 大文字小文字混在対応で小文字化済みを使う)
+    // 拡張子 `.zip` / `.cbz` / `.pdf` の境界を探す (= 大文字小文字混在対応で小文字化済みを使う)。
+    // CBZ は実体が ZIP でトップレベルをネイティブに開くため、内側画像の path は
+    // `<...>.cbz/<entry>` 形式になる。これを ZIP/PDF と同じく container/inner に分割する。
     let lower = unified.to_lowercase();
-    for needle in [".zip/", ".pdf/"] {
-        if let Some(idx) = lower.find(needle) {
-            // needle は `.zip/` / `.pdf/` の 5 文字、container は idx + 4 (= `.zip` まで)
-            let container_end = idx + 4;
-            let container_str = &unified[..container_end];
-            let inner_str = &unified[container_end + 1..];
-            return Some((PathBuf::from(container_str), inner_str.to_string()));
-        }
+    // 複数境界が混在 (例: ネストした `a.cbz/b.zip/img`) しても**最も外側 (= 最左)** で
+    // 分割する。どの needle も `.XXX/` の 5 文字なので container_end は idx + 4 で共通。
+    let leftmost = [".zip/", ".cbz/", ".pdf/"]
+        .iter()
+        .filter_map(|needle| lower.find(needle))
+        .min();
+    if let Some(idx) = leftmost {
+        let container_end = idx + 4;
+        let container_str = &unified[..container_end];
+        let inner_str = &unified[container_end + 1..];
+        return Some((PathBuf::from(container_str), inner_str.to_string()));
     }
     None
 }
@@ -605,6 +610,24 @@ mod tests {
         let (container, _) = split_archive_path(Path::new(r"E:\Foo.ZIP\inner.png")).unwrap();
         // container は元の大小を保持 (= normalize_fs 側で小文字化する責務)
         assert_eq!(container, PathBuf::from(r"E:\Foo.ZIP"));
+    }
+
+    #[test]
+    fn split_archive_path_detects_cbz_inner_image() {
+        // CBZ はネイティブ ZIP として開くので内側画像 path は `<...>.cbz/<entry>` 形式。
+        // ZIP と同じく container/inner に分割できること (Codex P2 回帰防止)。
+        let (container, inner) =
+            split_archive_path(Path::new(r"E:\books\vol01.cbz\page01.png")).unwrap();
+        assert_eq!(container, PathBuf::from(r"E:\books\vol01.cbz"));
+        assert_eq!(inner, "page01.png");
+    }
+
+    #[test]
+    fn split_archive_path_mixed_nest_splits_at_outermost() {
+        // ネスト混在は最も外側 (最左境界) で分割する。
+        let (container, inner) = split_archive_path(Path::new(r"E:\a.cbz\b.zip\img.png")).unwrap();
+        assert_eq!(container, PathBuf::from(r"E:\a.cbz"));
+        assert_eq!(inner, "b.zip/img.png");
     }
 
     // ─── snapshot_key_from_path ──────────────────────────────────
