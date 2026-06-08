@@ -2759,40 +2759,61 @@ impl App {
             .fixed_pos(area_pos)
             .show(ctx, |ui| {
                 let dark = ui.visuals().dark_mode;
-                let (fill, text_color) = if dark {
+                let (fill, text_color, stroke, shadow) = if dark {
                     (
                         egui::Color32::from_rgba_unmultiplied(20, 25, 35, 230),
                         egui::Color32::WHITE,
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 38),
+                        ),
+                        egui::Shadow {
+                            offset: [0, 2],
+                            blur: 10,
+                            spread: 0,
+                            color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90),
+                        },
                     )
                 } else {
                     (
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 245),
+                        egui::Color32::from_rgba_unmultiplied(232, 235, 240, 248),
                         egui::Color32::from_gray(25),
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(172)),
+                        egui::Shadow {
+                            offset: [0, 2],
+                            blur: 12,
+                            spread: 0,
+                            color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 52),
+                        },
                     )
                 };
-                egui::Frame::popup(ui.style()).fill(fill).show(ui, |ui| {
-                    let inner_width = (cell_w - 12.0).max(40.0);
-                    ui.set_min_width(inner_width);
-                    ui.set_max_width(inner_width);
-                    // フルパスをセル幅で折り返し、最大 3 行まで表示する。
-                    // パスは空白の無い長い連結文字列なので break_anywhere で
-                    // セグメント途中でも改行させる。3 行を超える分は末尾を
-                    // overflow_character (…) で省略する。
-                    let mut job = egui::text::LayoutJob::single_section(
-                        text,
-                        egui::TextFormat {
-                            font_id: egui::TextStyle::Monospace.resolve(ui.style()),
-                            color: text_color,
-                            ..Default::default()
-                        },
-                    );
-                    job.wrap.max_width = inner_width;
-                    job.wrap.max_rows = 3;
-                    job.wrap.break_anywhere = true;
-                    job.wrap.overflow_character = Some('…');
-                    let galley = ui.painter().layout_job(job);
-                    ui.add(egui::Label::new(galley));
-                });
+                egui::Frame::popup(ui.style())
+                    .fill(fill)
+                    .stroke(stroke)
+                    .shadow(shadow)
+                    .show(ui, |ui| {
+                        let inner_width = (cell_w - 12.0).max(40.0);
+                        ui.set_min_width(inner_width);
+                        ui.set_max_width(inner_width);
+                        // フルパスをセル幅で折り返し、最大 3 行まで表示する。
+                        // パスは空白の無い長い連結文字列なので break_anywhere で
+                        // セグメント途中でも改行させる。3 行を超える分は末尾を
+                        // overflow_character (…) で省略する。
+                        let mut job = egui::text::LayoutJob::single_section(
+                            text,
+                            egui::TextFormat {
+                                font_id: egui::TextStyle::Monospace.resolve(ui.style()),
+                                color: text_color,
+                                ..Default::default()
+                            },
+                        );
+                        job.wrap.max_width = inner_width;
+                        job.wrap.max_rows = 3;
+                        job.wrap.break_anywhere = true;
+                        job.wrap.overflow_character = Some('…');
+                        let galley = ui.painter().layout_job(job);
+                        ui.add(egui::Label::new(galley));
+                    });
             });
     }
 }

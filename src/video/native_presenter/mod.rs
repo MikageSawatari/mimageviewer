@@ -1028,7 +1028,8 @@ fn native_video_fullscreen_shortcut_key(
     }
     matches!(
         key.virtual_key,
-        0x0D // Enter
+        0x08 // Backspace
+            | 0x0D // Enter
             | 0x1B // Escape
             | 0x20 // Space
             | 0x23 // End
@@ -7917,6 +7918,7 @@ mod tests {
         };
 
         assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x20))));
+        assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x08))));
         assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x0D))));
         assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x70))));
         assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x75))));
@@ -7938,6 +7940,7 @@ mod tests {
         };
 
         assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x20))));
+        assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x08))));
         assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x0D))));
         assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x70))));
         assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x75))));

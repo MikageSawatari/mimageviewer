@@ -153,6 +153,7 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | キー / 入力 | 動作 | 備考 |
 |---|---|---|
 | <kbd>Space</kbd> / <kbd>Enter</kbd> | 再生 / 一時停止トグル | 動画 HUD 2 段化リデザイン (Phase 1) で Space を再生/停止に変更 (旧: 選択トグル)。チェックしたい場合は Esc で一覧へ戻る |
+| <kbd>Backspace</kbd> | 一覧へ戻る | 画像フルスクリーンと同じ。native presenter 経路でも App 側へ転送する |
 | <kbd>Shift</kbd>+<kbd>Enter</kbd> | 外部プレイヤー起動 | |
 | <kbd>←</kbd> / <kbd>→</kbd> | 5 秒シーク (デフォルト) | |
 | <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 1 秒シーク (細かい) | Phase 7.H |

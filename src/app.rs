@@ -3606,6 +3606,9 @@ pub struct App {
     pub(crate) fs_vertical_scroll: f32,
     /// フルスクリーン下部シークバーをドラッグ中か。下端ホバー外へ出てもバーを維持する。
     pub(crate) fs_seek_drag_active: bool,
+    /// フルスクリーン下部シークバー / 混在サマリをこのフレームで表示しているか。
+    /// 左下ステータスをバーの上へ逃がすために使う。
+    pub(crate) fs_seek_overlay_visible: bool,
     /// 連結読み描画で最後に計算した raw/final/comic cache の保持対象。
     pub(crate) fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
     /// 任意角度回転（ラジアン、一時的・保存しない）
@@ -5349,6 +5352,7 @@ impl App {
             fs_pan_drag_start: None,
             fs_vertical_scroll: 0.0,
             fs_seek_drag_active: false,
+            fs_seek_overlay_visible: false,
             fs_vertical_cache_keep_set: std::collections::HashSet::new(),
             fs_free_rotation: 0.0,
             fs_rotation_drag_start: None,
@@ -15534,6 +15538,7 @@ impl App {
         self.fs_pan_drag_start = None;
         self.fs_vertical_scroll = 0.0;
         self.fs_seek_drag_active = false;
+        self.fs_seek_overlay_visible = false;
         self.fs_vertical_cache_keep_set.clear();
         self.fs_free_rotation = 0.0;
         self.fs_rotation_drag_start = None;
@@ -18664,6 +18669,7 @@ impl App {
         self.fs_secondary_press_start = None;
         self.fs_middle_zoom_drag = None;
         self.fs_seek_drag_active = false;
+        self.fs_seek_overlay_visible = false;
         self.fs_context_menu_idx = None;
         // Phase 5.5: タイルモードもフルスクリーン解除と同時に閉じる (Codex H2 反映)。
         #[cfg(windows)]
@@ -27128,9 +27134,8 @@ impl eframe::App for App {
             }
         }
 
-        // 初回フレームで前回フォルダを復元する。
-        // 有効な last_folder は優先し、削除済み・取り外し済みのパスや初回起動では
-        // Known Folder API で取得した Desktop を開始地点にする。
+        // 初回フレームで設定された開始フォルダを開く。前回フォルダ / Desktop /
+        // 指定フォルダの優先順位と fallback は known_folders::startup_folder に集約する。
         if !self.initialized {
             self.initialized = true;
 

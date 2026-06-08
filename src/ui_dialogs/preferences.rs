@@ -12,6 +12,15 @@ use crate::settings::{Parallelism, Settings};
 mod pages;
 use self::pages::*;
 
+fn pref_panel_scroll_style() -> egui::style::ScrollStyle {
+    let mut scroll = egui::style::ScrollStyle::solid();
+    scroll.bar_width = 10.0;
+    scroll.bar_inner_margin = 8.0;
+    scroll.bar_outer_margin = 2.0;
+    scroll.foreground_color = true;
+    scroll
+}
+
 #[cfg(windows)]
 pub enum Vst3ScanMessage {
     Progress {
@@ -611,23 +620,23 @@ impl App {
                     ui.visuals().widgets.noninteractive.bg_stroke,
                 );
 
-                // 右パネル。ScrollArea のスクロールバー領域を content width から差し引く。
-                // ページ側はこの内側の `ui.available_width()` だけを使うことで、区切り線や
-                // right_to_left レイアウトのボタンが右スクロールバーに重ならない。
-                const PREF_PANEL_SCROLLBAR_GUTTER: f32 = 28.0;
-                let panel_content_width =
-                    (right_rect.width() - PREF_PANEL_SCROLLBAR_GUTTER).max(120.0);
                 let mut right_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(right_rect)
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
+                // 右パネルは solid スクロールバーで実幅を確保する。既定の floating
+                // スクロールバーは本文上に重なるため、右端ボタンや区切り線が読みにくくなる。
+                right_ui.spacing_mut().scroll = pref_panel_scroll_style();
                 egui::ScrollArea::vertical()
                     .id_salt("pref_panel")
+                    .scroll_bar_visibility(
+                        egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                    )
+                    .auto_shrink([false, false])
                     .max_height(main_height)
                     .show(&mut right_ui, |ui| {
-                        ui.set_width(panel_content_width);
-                        ui.set_max_width(panel_content_width);
+                        ui.set_width(ui.available_width());
                         draw_page(ui, state, enter_pressed);
                     });
 

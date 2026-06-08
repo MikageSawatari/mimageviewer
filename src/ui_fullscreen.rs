@@ -1533,6 +1533,21 @@ fn build_image_reading_indices(items: &[GridItem], visible_indices: &[usize]) ->
         .collect()
 }
 
+fn count_seek_overlay_non_image_items(items: &[GridItem], nav_indices: &[usize]) -> (usize, usize) {
+    nav_indices
+        .iter()
+        .fold((0usize, 0usize), |(videos, others), &idx| {
+            match items.get(idx) {
+                Some(GridItem::Video(_)) => (videos + 1, others),
+                Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. })
+                | Some(GridItem::ZipSeparator { .. }) => (videos, others),
+                Some(_) | None => (videos, others + 1),
+            }
+        })
+}
+
 fn vertical_reading_offsets(heights: &[f32], gap: f32, current_pos: usize) -> Vec<f32> {
     if heights.is_empty() || current_pos >= heights.len() {
         return Vec::new();
@@ -1730,7 +1745,7 @@ pub(crate) struct FsKeyAction {
 struct FsSeekInfo {
     image_indices: Vec<usize>,
     current_pos: usize,
-    nav_count: usize,
+    media_count: usize,
     video_count: usize,
     other_count: usize,
 }
@@ -1744,18 +1759,13 @@ impl App {
         let image_indices = build_image_reading_indices(&self.items, &self.visible_indices);
         let current_pos = image_indices.iter().position(|&idx| idx == fs_idx)?;
         let nav_indices = build_nav_indices(&self.items, &self.visible_indices);
-        let video_count = nav_indices
-            .iter()
-            .filter(|&&idx| matches!(self.items.get(idx), Some(GridItem::Video(_))))
-            .count();
-        let other_count = nav_indices
-            .len()
-            .saturating_sub(image_indices.len())
-            .saturating_sub(video_count);
+        let (video_count, other_count) =
+            count_seek_overlay_non_image_items(&self.items, &nav_indices);
+        let media_count = image_indices.len() + video_count + other_count;
         Some(FsSeekInfo {
             image_indices,
             current_pos,
-            nav_count: nav_indices.len(),
+            media_count,
             video_count,
             other_count,
         })
@@ -1792,6 +1802,7 @@ impl App {
         full_rect: egui::Rect,
         fs_idx: usize,
     ) -> Option<usize> {
+        self.fs_seek_overlay_visible = false;
         let Some(info) = self.fullscreen_seek_info(fs_idx) else {
             self.fs_seek_drag_active = false;
             return None;
@@ -1805,8 +1816,11 @@ impl App {
         if !primary_down {
             self.fs_seek_drag_active = false;
         }
+        const SEEK_HOVER_HEIGHT: f32 = 78.0;
+        const SEEK_BAR_HEIGHT: f32 = 38.0;
+
         let bottom_band = egui::Rect::from_min_max(
-            egui::pos2(full_rect.left(), full_rect.bottom() - 96.0),
+            egui::pos2(full_rect.left(), full_rect.bottom() - SEEK_HOVER_HEIGHT),
             full_rect.right_bottom(),
         );
         let bottom_hover = ctx.input(|i| {
@@ -1819,32 +1833,32 @@ impl App {
         }
 
         let panel_rect = egui::Rect::from_min_max(
-            egui::pos2(full_rect.left() + 32.0, full_rect.bottom() - 66.0),
-            egui::pos2(full_rect.right() - 32.0, full_rect.bottom() - 18.0),
-        );
-        let panel_rect = panel_rect.intersect(full_rect.shrink2(egui::vec2(12.0, 8.0)));
+            egui::pos2(full_rect.left(), full_rect.bottom() - SEEK_BAR_HEIGHT),
+            full_rect.right_bottom(),
+        )
+        .intersect(full_rect);
         if panel_rect.width() < 160.0 {
             return None;
         }
 
+        self.fs_seek_overlay_visible = true;
         let painter = ui.painter();
         painter.rect_filled(
             panel_rect,
-            6.0,
-            egui::Color32::from_rgba_unmultiplied(8, 10, 14, 210),
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(8, 10, 14, 224),
         );
-        painter.rect_stroke(
-            panel_rect,
-            6.0,
+        painter.hline(
+            panel_rect.x_range(),
+            panel_rect.top(),
             egui::Stroke::new(
                 1.0,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 42),
             ),
-            egui::StrokeKind::Inside,
         );
 
         let all_nav_items_are_images =
-            info.nav_count == info.image_indices.len() && !info.image_indices.is_empty();
+            info.media_count == info.image_indices.len() && !info.image_indices.is_empty();
         if !all_nav_items_are_images {
             let summary = Self::fullscreen_mixed_media_summary(&info);
             painter.text(
@@ -1858,35 +1872,77 @@ impl App {
         }
 
         let total = info.image_indices.len();
-        let mut page_no = (info.current_pos + 1) as i32;
-        let label = format!("{}/{}", page_no, total);
-        let label_width = 68.0;
         let is_rtl = self.reading_direction == ReadingDirection::Rtl;
-        let inner = panel_rect.shrink2(egui::vec2(14.0, 8.0));
-        let mut target = None;
-        let mut panel_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(inner)
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        let inner = panel_rect.shrink2(egui::vec2(12.0, 7.0));
+        let font = egui::FontId::monospace(13.0);
+        let sample_label = format!("{}/{}", total, total);
+        let sample_galley = painter.layout_no_wrap(
+            sample_label,
+            font.clone(),
+            egui::Color32::from_rgb(242, 244, 247),
         );
-        panel_ui.set_clip_rect(panel_rect);
-        let label_text = egui::RichText::new(label)
-            .monospace()
-            .color(egui::Color32::from_rgb(242, 244, 247));
-        if is_rtl {
-            panel_ui.add_sized([label_width, 24.0], egui::Label::new(label_text.clone()));
-            panel_ui.add_space(8.0);
+        let label_width = (sample_galley.size().x + 18.0)
+            .max(64.0)
+            .min((inner.width() * 0.32).max(64.0));
+        let gap = 12.0;
+        let (label_rect, track_rect) = if is_rtl {
+            let label_rect =
+                egui::Rect::from_min_size(inner.min, egui::vec2(label_width, inner.height()));
+            let track_rect = egui::Rect::from_min_max(
+                egui::pos2(label_rect.right() + gap, inner.center().y - 4.0),
+                egui::pos2(inner.right(), inner.center().y + 4.0),
+            );
+            (label_rect, track_rect)
+        } else {
+            let label_rect = egui::Rect::from_min_max(
+                egui::pos2(inner.right() - label_width, inner.top()),
+                inner.right_bottom(),
+            );
+            let track_rect = egui::Rect::from_min_max(
+                egui::pos2(inner.left(), inner.center().y - 4.0),
+                egui::pos2(label_rect.left() - gap, inner.center().y + 4.0),
+            );
+            (label_rect, track_rect)
+        };
+        if track_rect.width() < 48.0 {
+            return None;
         }
-        let slider_width = (inner.width() - label_width - 12.0).max(80.0);
-        let response = panel_ui.add_sized(
-            [slider_width, 24.0],
-            egui::Slider::new(&mut page_no, 1..=total as i32).show_value(false),
+
+        let mut display_pos = info.current_pos.min(total - 1);
+        let mut target = None;
+        let hit_rect = track_rect.expand2(egui::vec2(0.0, 14.0));
+        let response = ui.interact(
+            hit_rect,
+            ui.make_persistent_id("fullscreen_seek_track"),
+            egui::Sense::click_and_drag(),
         );
+        if response.hovered() || response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
+        let seek_pointer = if response.dragged() || response.clicked() {
+            response.interact_pointer_pos()
+        } else {
+            None
+        };
         if response.dragged() {
             self.fs_seek_drag_active = true;
         }
-        if response.changed() {
-            let pos = (page_no as usize).saturating_sub(1).min(total - 1);
+        if let Some(pointer_pos) = seek_pointer {
+            let raw_fraction =
+                ((pointer_pos.x - track_rect.left()) / track_rect.width()).clamp(0.0, 1.0);
+            let fraction = if is_rtl {
+                1.0 - raw_fraction
+            } else {
+                raw_fraction
+            };
+            let pos = if total <= 1 {
+                0
+            } else {
+                (fraction * (total - 1) as f32).round() as usize
+            }
+            .min(total - 1);
+            display_pos = pos;
             let target_idx = info.image_indices[pos];
             if target_idx != fs_idx || self.continuous_reading_active_for_idx(fs_idx) {
                 if self.continuous_reading_active_for_idx(fs_idx) {
@@ -1896,10 +1952,54 @@ impl App {
                 }
             }
         }
-        if !is_rtl {
-            panel_ui.add_space(8.0);
-            panel_ui.add_sized([label_width, 24.0], egui::Label::new(label_text));
-        }
+
+        painter.rect_filled(
+            track_rect,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(92, 98, 110, 170),
+        );
+        let fraction = if total <= 1 {
+            0.0
+        } else {
+            display_pos as f32 / (total - 1) as f32
+        };
+        let knob_x = if is_rtl {
+            track_rect.right() - track_rect.width() * fraction
+        } else {
+            track_rect.left() + track_rect.width() * fraction
+        };
+        let filled_rect = if is_rtl {
+            egui::Rect::from_min_max(
+                egui::pos2(knob_x, track_rect.top()),
+                track_rect.right_bottom(),
+            )
+        } else {
+            egui::Rect::from_min_max(track_rect.min, egui::pos2(knob_x, track_rect.bottom()))
+        };
+        painter.rect_filled(
+            filled_rect,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(112, 174, 255, 230),
+        );
+        painter.circle_filled(
+            egui::pos2(knob_x, track_rect.center().y),
+            6.0,
+            egui::Color32::from_rgb(232, 240, 255),
+        );
+        painter.circle_stroke(
+            egui::pos2(knob_x, track_rect.center().y),
+            6.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(10, 16, 26, 180)),
+        );
+
+        let label = format!("{}/{}", display_pos + 1, total);
+        painter.text(
+            label_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            font,
+            egui::Color32::from_rgb(242, 244, 247),
+        );
         if !primary_down && self.fs_seek_drag_active {
             self.fs_seek_drag_active = false;
         }
@@ -10546,9 +10646,14 @@ impl App {
         const FONT_SIZE: f32 = 13.0;
 
         let ctx = ui.ctx().clone();
+        let bottom_offset = if self.fs_seek_overlay_visible {
+            -58.0
+        } else {
+            -12.0
+        };
         egui::Area::new("fs_ai_status_overlay".into())
             .order(egui::Order::Foreground)
-            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(12.0, -12.0))
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(12.0, bottom_offset))
             .show(&ctx, |ui| {
                 ui.set_opacity(alpha);
                 ui.set_min_width(MIN_WIDTH);
@@ -12999,6 +13104,57 @@ mod tests {
         assert!(should_zoom_fullscreen_wheel(true, false));
         assert!(should_zoom_fullscreen_wheel(false, true));
         assert!(!should_zoom_fullscreen_wheel(false, false));
+    }
+
+    #[test]
+    fn seek_overlay_counts_zip_separator_as_non_media() {
+        let zip = PathBuf::from(r"C:\books\comic.zip");
+        let items = vec![
+            GridItem::ZipSeparator {
+                dir_display: "(root)".into(),
+            },
+            GridItem::ZipImage {
+                zip_path: zip.clone(),
+                entry_name: "chapter1/page01.jpg".into(),
+            },
+            GridItem::ZipSeparator {
+                dir_display: "chapter2".into(),
+            },
+            GridItem::ZipImage {
+                zip_path: zip,
+                entry_name: "chapter2/page01.jpg".into(),
+            },
+        ];
+        let visible_indices = vec![0, 1, 2, 3];
+        let nav_indices = build_nav_indices(&items, &visible_indices);
+
+        assert_eq!(
+            build_image_reading_indices(&items, &visible_indices),
+            vec![1, 3]
+        );
+        assert_eq!(
+            count_seek_overlay_non_image_items(&items, &nav_indices),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn seek_overlay_counts_video_as_mixed_media() {
+        let items = vec![
+            GridItem::Image(PathBuf::from(r"C:\books\page01.jpg")),
+            GridItem::Video(PathBuf::from(r"C:\books\bonus.mp4")),
+        ];
+        let visible_indices = vec![0, 1];
+        let nav_indices = build_nav_indices(&items, &visible_indices);
+
+        assert_eq!(
+            build_image_reading_indices(&items, &visible_indices),
+            vec![0]
+        );
+        assert_eq!(
+            count_seek_overlay_non_image_items(&items, &nav_indices),
+            (1, 0)
+        );
     }
 
     #[test]
