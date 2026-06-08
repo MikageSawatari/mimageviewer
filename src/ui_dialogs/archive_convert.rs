@@ -60,7 +60,10 @@ pub(crate) enum ArchiveConvertPhase {
     /// 事前スキャン中 (画像数カウント)
     Scanning,
     /// RAR パスワード入力待ち
-    PasswordRequired { message: Option<String> },
+    PasswordRequired {
+        message: Option<String>,
+        resume: ArchivePasswordResume,
+    },
     /// スキャン完了、ユーザーの確認待ち
     Confirm { summary: ArchiveImageSummary },
     /// 変換実行中
@@ -70,6 +73,12 @@ pub(crate) enum ArchiveConvertPhase {
     },
     /// エラー (ユーザーが閉じるまで表示)
     Error { message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchivePasswordResume {
+    Scan,
+    Convert,
 }
 
 pub(crate) struct ArchiveConvertState {
@@ -102,6 +111,25 @@ fn spawn_archive_scan(
         let _ = tx.send(ArchiveConvertMsg::ScanDone(result));
     });
     rx
+}
+
+fn prepare_archive_password_retry(
+    state: &mut ArchiveConvertState,
+) -> Option<(ArchivePasswordResume, String)> {
+    if state.format != ArchiveFormat::Rar {
+        return None;
+    }
+    let password = state.password_input.trim().to_string();
+    if password.is_empty() {
+        return None;
+    }
+    let resume = match &state.phase {
+        ArchiveConvertPhase::PasswordRequired { resume, .. } => *resume,
+        _ => ArchivePasswordResume::Scan,
+    };
+    state.password = Some(password.clone());
+    state.password_input.clear();
+    Some((resume, password))
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -320,7 +348,7 @@ impl App {
                         }
                         ctx.request_repaint_after(std::time::Duration::from_millis(100));
                     }
-                    ArchiveConvertPhase::PasswordRequired { message } => {
+                    ArchiveConvertPhase::PasswordRequired { message, .. } => {
                         ui.label(format!(
                             "この{fmt_label}ファイルを開くにはパスワードが必要です:"
                         ));
@@ -525,13 +553,17 @@ impl App {
                 ArchiveConvertMsg::ScanDone(Err(ConvertError::PasswordRequired)) => {
                     state.password = None;
                     state.password_input.clear();
-                    state.phase = ArchiveConvertPhase::PasswordRequired { message: None };
+                    state.phase = ArchiveConvertPhase::PasswordRequired {
+                        message: None,
+                        resume: ArchivePasswordResume::Scan,
+                    };
                 }
                 ArchiveConvertMsg::ScanDone(Err(ConvertError::BadPassword)) => {
                     state.password = None;
                     state.password_input.clear();
                     state.phase = ArchiveConvertPhase::PasswordRequired {
                         message: Some("パスワードが正しくありません".to_string()),
+                        resume: ArchivePasswordResume::Scan,
                     };
                 }
                 ArchiveConvertMsg::ScanDone(Err(e)) => {
@@ -569,13 +601,17 @@ impl App {
                 ArchiveConvertMsg::ConvertDone(Err(ConvertError::PasswordRequired)) => {
                     state.password = None;
                     state.password_input.clear();
-                    state.phase = ArchiveConvertPhase::PasswordRequired { message: None };
+                    state.phase = ArchiveConvertPhase::PasswordRequired {
+                        message: None,
+                        resume: ArchivePasswordResume::Convert,
+                    };
                 }
                 ArchiveConvertMsg::ConvertDone(Err(ConvertError::BadPassword)) => {
                     state.password = None;
                     state.password_input.clear();
                     state.phase = ArchiveConvertPhase::PasswordRequired {
                         message: Some("パスワードが正しくありません".to_string()),
+                        resume: ArchivePasswordResume::Convert,
                     };
                 }
                 ArchiveConvertMsg::ConvertDone(Err(e)) => {
@@ -588,20 +624,26 @@ impl App {
     }
 
     fn apply_archive_password(&mut self) {
-        let Some(state) = self.archive_convert.as_mut() else {
+        let Some((resume, password, src, format)) =
+            self.archive_convert.as_mut().and_then(|state| {
+                let (resume, password) = prepare_archive_password_retry(state)?;
+                Some((resume, password, state.src_path.clone(), state.format))
+            })
+        else {
             return;
         };
-        if state.format != ArchiveFormat::Rar {
-            return;
+
+        match resume {
+            ArchivePasswordResume::Scan => {
+                if let Some(state) = self.archive_convert.as_mut() {
+                    state.rx = spawn_archive_scan(src, format, Some(password));
+                    state.phase = ArchiveConvertPhase::Scanning;
+                }
+            }
+            ArchivePasswordResume::Convert => {
+                self.start_archive_convert();
+            }
         }
-        let password = state.password_input.trim().to_string();
-        if password.is_empty() {
-            return;
-        }
-        state.password = Some(password.clone());
-        state.password_input.clear();
-        state.rx = spawn_archive_scan(state.src_path.clone(), state.format, Some(password));
-        state.phase = ArchiveConvertPhase::Scanning;
     }
 
     /// Confirm 段階で「変換して開く」が押されたときの遷移。
@@ -690,5 +732,50 @@ impl App {
         });
         state.phase = ArchiveConvertPhase::Converting { progress, cancel };
         state.rx = rx;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_for_password_resume(resume: ArchivePasswordResume) -> ArchiveConvertState {
+        let (_tx, rx) = mpsc::channel();
+        ArchiveConvertState {
+            src_path: PathBuf::from(r"C:\tmp\locked.rar"),
+            format: ArchiveFormat::Rar,
+            password: None,
+            password_input: "  mivtest2026  ".to_string(),
+            phase: ArchiveConvertPhase::PasswordRequired {
+                message: None,
+                resume,
+            },
+            rx,
+            pending_nav: None,
+            nav_history_rollback: None,
+            auto_fullscreen: false,
+        }
+    }
+
+    #[test]
+    fn prepare_password_retry_keeps_scan_resume() {
+        let mut state = state_for_password_resume(ArchivePasswordResume::Scan);
+        let (resume, password) = prepare_archive_password_retry(&mut state).unwrap();
+
+        assert_eq!(resume, ArchivePasswordResume::Scan);
+        assert_eq!(password, "mivtest2026");
+        assert_eq!(state.password.as_deref(), Some("mivtest2026"));
+        assert!(state.password_input.is_empty());
+    }
+
+    #[test]
+    fn prepare_password_retry_keeps_convert_resume() {
+        let mut state = state_for_password_resume(ArchivePasswordResume::Convert);
+        let (resume, password) = prepare_archive_password_retry(&mut state).unwrap();
+
+        assert_eq!(resume, ArchivePasswordResume::Convert);
+        assert_eq!(password, "mivtest2026");
+        assert_eq!(state.password.as_deref(), Some("mivtest2026"));
+        assert!(state.password_input.is_empty());
     }
 }
