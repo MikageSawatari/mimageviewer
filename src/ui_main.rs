@@ -1544,6 +1544,53 @@ impl App {
                         ui.separator();
                     }
 
+                    let place_nav_enabled = !search_active && !snapshot_active;
+                    ui.add_enabled_ui(place_nav_enabled, |ui| {
+                        ui.menu_button("場所▼", |ui| {
+                            ui.set_min_width(220.0);
+                            let quick_locations = crate::known_folders::quick_locations();
+                            for location in quick_locations {
+                                let full = location.path.to_string_lossy().to_string();
+                                if ui.button(location.label).hover_tip(&full).clicked() {
+                                    if let Some(resolved) =
+                                        resolve_folder_bar_nav_path(&location.path)
+                                    {
+                                        result = Some(AddressBarNav::Direct(resolved));
+                                    }
+                                    ui.close();
+                                }
+                            }
+
+                            let drives = crate::known_folders::available_drives();
+                            if !drives.is_empty() {
+                                ui.separator();
+                            }
+                            for drive in drives {
+                                let label = drive.to_string_lossy().to_string();
+                                if ui
+                                    .button(egui::RichText::new(&label).monospace())
+                                    .hover_tip(&label)
+                                    .clicked()
+                                {
+                                    if let Some(resolved) = resolve_folder_bar_nav_path(&drive) {
+                                        result = Some(AddressBarNav::Direct(resolved));
+                                    }
+                                    ui.close();
+                                }
+                            }
+                        })
+                        .response
+                        .hover_tip(if snapshot_active {
+                            "★固定中は場所ジャンプを使用できません"
+                        } else if search_active {
+                            "検索中は場所ジャンプを使用できません"
+                        } else {
+                            "デスクトップ / 主要フォルダ / ドライブへ移動"
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.separator();
+
                     // ★バッジは右寄せで先に配置し、残り幅を TextEdit が埋める。
                     // right_to_left レイアウトで ★ → TextEdit の順に追加すると、
                     // TextEdit は available width いっぱいに広がる。
@@ -1681,11 +1728,23 @@ impl App {
                             if let Some(suffix) = snap_suffix {
                                 ui.colored_label(egui::Color32::from_rgb(58, 110, 165), suffix);
                             }
-                            let resp = ui.add_enabled(
-                                !is_snap_active,
-                                egui::TextEdit::singleline(&mut self.address)
-                                    .desired_width(f32::INFINITY),
-                            );
+                            let resp = if is_snap_active {
+                                ui.add_enabled(
+                                    false,
+                                    egui::TextEdit::singleline(&mut self.address)
+                                        .desired_width(f32::INFINITY),
+                                )
+                            } else {
+                                let mut output = egui::TextEdit::singleline(&mut self.address)
+                                    .desired_width(f32::INFINITY)
+                                    .show(ui);
+                                crate::ui_helpers::singleline_text_edit_context_menu(
+                                    ui,
+                                    &mut output,
+                                    &mut self.address,
+                                );
+                                output.response
+                            };
                             self.address_has_focus = resp.has_focus();
                             if !is_snap_active && resp.lost_focus() && enter_pressed {
                                 let p = PathBuf::from(&self.address);
@@ -1788,12 +1847,17 @@ impl App {
                     "現在地フィルタ (Ctrl+F): 今開いているフォルダ / ZIP の表示中\n\
                      アイテムを名前やメタ情報で絞り込みます (索引不要・再帰なし)。",
                 );
-                let response = ui.add_sized(
-                    [320.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.search_query).hint_text(
-                        r#"現在地のアイテムを名前やメタ情報で絞り込み (AND / -除外 / "…")"#,
-                    ),
+                let mut output = egui::TextEdit::singleline(&mut self.search_query)
+                    .hint_text(r#"現在地のアイテムを名前やメタ情報で絞り込み (AND / -除外 / "…")"#)
+                    .desired_width(320.0)
+                    .min_size(egui::vec2(320.0, 20.0))
+                    .show(ui);
+                let _menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+                    ui,
+                    &mut output,
+                    &mut self.search_query,
                 );
+                let response = output.response;
 
                 // フォーカスリクエスト
                 if self.search_focus_request {
@@ -1983,11 +2047,17 @@ impl App {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("コンテナ検索:");
-                let response = ui.add_sized(
-                    [320.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.favsearch.query)
-                        .hint_text(r#"フォルダ・ZIP・PDF をコンテナ名で探す (AND / -除外 / "…")"#),
+                let mut output = egui::TextEdit::singleline(&mut self.favsearch.query)
+                    .hint_text(r#"フォルダ・ZIP・PDF をコンテナ名で探す (AND / -除外 / "…")"#)
+                    .desired_width(320.0)
+                    .min_size(egui::vec2(320.0, 20.0))
+                    .show(ui);
+                let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+                    ui,
+                    &mut output,
+                    &mut self.favsearch.query,
                 );
+                let response = output.response;
 
                 if self.favsearch.focus_request {
                     self.favsearch.focus_request = false;
@@ -1996,7 +2066,7 @@ impl App {
                 self.favsearch.has_focus = response.has_focus();
 
                 // 入力が変わるたびに即座に検索を再実行 (小規模 DB 前提)
-                if response.changed() {
+                if response.changed() || menu_changed {
                     query_changed = true;
                 }
                 // Enter で確定的に再実行 (IME 変換確定の Enter も同じ扱い)

@@ -6,7 +6,7 @@ use eframe::egui;
 use super::{AdjustSpreadTarget, App, FolderNavMode};
 use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent};
 use crate::grid_item::GridItem;
-use crate::settings::ReadingDirection;
+use crate::settings::{ReadingDirection, ReadingFlow};
 use crate::ui_main::AddressBarNav;
 
 const BUTTON_REPEAT_INTERVAL: Duration = Duration::from_millis(95);
@@ -16,6 +16,7 @@ const TRIGGER_STEP_INTERVAL: Duration = Duration::from_millis(150);
 const DEADZONE: f32 = 0.25;
 const TRIGGER_THRESHOLD: f32 = 0.35;
 const PAN_SPEED_PX_PER_SEC: f32 = 720.0;
+const CONTINUOUS_READING_SCROLL_SPEED_PX_PER_SEC: f32 = 720.0;
 const RIGHT_STICK_ZOOM_MULTIPLIER: f32 = 2.0;
 const GAMEPAD_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -312,8 +313,24 @@ impl App {
 
         let mut changed = false;
         if pan_active {
-            let pan = egui::vec2(left.x, -left.y) * (PAN_SPEED_PX_PER_SEC * dt);
-            if self.apply_gamepad_fullscreen_pan(pan) {
+            if let Some(axis) =
+                continuous_reading_stick_axis(self.reading_flow, self.reading_direction, left)
+            {
+                let delta = axis * CONTINUOUS_READING_SCROLL_SPEED_PX_PER_SEC * dt;
+                if delta.abs() > 0.5 {
+                    self.scroll_vertical_reading_by(ctx, delta);
+                    changed = true;
+                }
+            } else if self.reading_flow.is_vertical() || self.reading_flow.is_horizontal() {
+                if self.dispatch_gamepad_still_stick_step(ctx, now, left) {
+                    changed = true;
+                }
+            } else if self.fs_zoom > 1.0 {
+                let pan = egui::vec2(left.x, -left.y) * (PAN_SPEED_PX_PER_SEC * dt);
+                if self.apply_gamepad_fullscreen_pan(pan) {
+                    changed = true;
+                }
+            } else if self.dispatch_gamepad_still_stick_step(ctx, now, left) {
                 changed = true;
             }
         }
@@ -324,6 +341,27 @@ impl App {
             ctx.request_repaint();
         }
         changed
+    }
+
+    fn dispatch_gamepad_still_stick_step(
+        &mut self,
+        ctx: &egui::Context,
+        now: Instant,
+        stick: egui::Vec2,
+    ) -> bool {
+        let stick_dir = dominant_stick_dir(stick);
+        let stick_active = stick_dir.is_some();
+        if self
+            .gamepad_state
+            .left_stick_step_due(stick_active, now, STICK_STEP_INTERVAL)
+            && let Some(fs_idx) = self.fullscreen_idx
+            && let Some(dir) = stick_dir
+        {
+            self.handle_gamepad_still_direction(ctx, fs_idx, dir);
+            true
+        } else {
+            false
+        }
     }
 
     fn dispatch_gamepad_video_analog(
@@ -826,5 +864,83 @@ fn dominant_stick_dir(stick: egui::Vec2) -> Option<PadDir> {
         Some(PadDir::Up)
     } else {
         Some(PadDir::Down)
+    }
+}
+
+fn continuous_reading_stick_axis(
+    reading_flow: ReadingFlow,
+    reading_direction: ReadingDirection,
+    stick: egui::Vec2,
+) -> Option<f32> {
+    let axis = if reading_flow.is_vertical() {
+        -stick.y
+    } else if reading_flow.is_horizontal() {
+        if reading_direction == ReadingDirection::Rtl {
+            -stick.x
+        } else {
+            stick.x
+        }
+    } else {
+        return None;
+    };
+    (axis.abs() > 0.0).then_some(axis)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::continuous_reading_stick_axis;
+    use crate::settings::{ReadingDirection, ReadingFlow};
+    use eframe::egui;
+
+    #[test]
+    fn vertical_reading_stick_down_scrolls_forward() {
+        assert_eq!(
+            continuous_reading_stick_axis(
+                ReadingFlow::Vertical,
+                ReadingDirection::Ltr,
+                egui::vec2(0.0, -1.0),
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            continuous_reading_stick_axis(
+                ReadingFlow::Vertical,
+                ReadingDirection::Ltr,
+                egui::vec2(0.0, 1.0),
+            ),
+            Some(-1.0)
+        );
+    }
+
+    #[test]
+    fn horizontal_reading_stick_respects_reading_direction() {
+        assert_eq!(
+            continuous_reading_stick_axis(
+                ReadingFlow::Horizontal,
+                ReadingDirection::Ltr,
+                egui::vec2(1.0, 0.0),
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            continuous_reading_stick_axis(
+                ReadingFlow::Horizontal,
+                ReadingDirection::Rtl,
+                egui::vec2(1.0, 0.0),
+            ),
+            Some(-1.0)
+        );
+    }
+
+    #[test]
+    fn paged_reading_has_no_continuous_axis() {
+        assert_eq!(
+            continuous_reading_stick_axis(
+                ReadingFlow::Paged,
+                ReadingDirection::Ltr,
+                egui::vec2(1.0, 1.0),
+            ),
+            None
+        );
     }
 }

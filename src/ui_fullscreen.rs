@@ -11199,11 +11199,16 @@ impl App {
                 ui.label(&state.source_label);
                 ui.add_space(6.0);
                 ui.label("ファイル名");
-                let basename_resp = ui.add(
-                    egui::TextEdit::singleline(&mut state.basename)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("出力ファイル名"),
+                let mut basename_output = egui::TextEdit::singleline(&mut state.basename)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("出力ファイル名")
+                    .show(ui);
+                crate::ui_helpers::singleline_text_edit_context_menu(
+                    ui,
+                    &mut basename_output,
+                    &mut state.basename,
                 );
+                let basename_resp = basename_output.response;
                 // 初回フレームのみ basename にフォーカス。毎フレーム request_focus
                 // すると他フィールドへフォーカス移動が直ちに巻き戻される
                 // (Codex review CONFIRMED)。
@@ -11216,10 +11221,15 @@ impl App {
                 ui.horizontal(|ui| {
                     let buttons_width = 144.0;
                     let edit_width = (ui.available_width() - buttons_width).max(180.0);
-                    ui.add(
+                    let mut output_dir_output =
                         egui::TextEdit::singleline(&mut state.output_dir_text)
                             .desired_width(edit_width)
-                            .hint_text("保存先フォルダ"),
+                            .hint_text("保存先フォルダ")
+                            .show(ui);
+                    crate::ui_helpers::singleline_text_edit_context_menu(
+                        ui,
+                        &mut output_dir_output,
+                        &mut state.output_dir_text,
                     );
                     if ui.button("変更...").clicked() {
                         pick_folder = true;

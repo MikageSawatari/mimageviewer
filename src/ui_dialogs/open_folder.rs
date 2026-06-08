@@ -41,11 +41,16 @@ impl App {
                 ui.label("開きたいフォルダのパスを入力してください:");
                 ui.add_space(4.0);
 
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.open_folder_input)
-                        .desired_width(f32::INFINITY)
-                        .hint_text(r"例: C:\Users\you\Pictures"),
+                let mut output = egui::TextEdit::singleline(&mut self.open_folder_input)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(r"例: C:\Users\you\Pictures")
+                    .show(ui);
+                crate::ui_helpers::singleline_text_edit_context_menu(
+                    ui,
+                    &mut output,
+                    &mut self.open_folder_input,
                 );
+                let resp = output.response;
                 // 初回フォーカス
                 if !resp.has_focus() && !ui.memory(|m| m.focused().is_some()) {
                     resp.request_focus();

@@ -48,12 +48,13 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
             format!("{} - {}", mode.label(), mode.description()),
         );
         if matches!(mode, AiFeatureMode::HighQuality) {
-            response.on_hover_text("GPU によっては処理に時間がかかる AI モデルが含まれます。");
+            response.on_hover_text("GPU 負荷が高く、環境によっては表示が重くなります。");
         }
     }
     ui.label(
         egui::RichText::new(
             "画像を見るときの自動アップスケール / ノイズ除去だけを切り替えます。\n\
+             表示が重い、オンボード GPU、低スペック環境では「なし」を推奨します。\n\
              軽量は高速汎用と漫画トーン保持モデルのみを使用し、ノイズ除去は実行しません。\n\
              高画質では写真・イラスト・質感保持モデルとノイズ除去も選択できます。\n\
              消しゴムや補正の被写体マスクなど編集ツールの AI、動画アップスケールは\n\
@@ -337,12 +338,17 @@ pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(8.0);
     ui.label("保存先フォルダ");
     ui.horizontal(|ui| {
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut state.capture_output_dir_input)
-                .desired_width(360.0)
-                .hint_text(crate::capture::default_output_dir().display().to_string()),
+        let mut output = egui::TextEdit::singleline(&mut state.capture_output_dir_input)
+            .desired_width(360.0)
+            .hint_text(crate::capture::default_output_dir().display().to_string())
+            .show(ui);
+        let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+            ui,
+            &mut output,
+            &mut state.capture_output_dir_input,
         );
-        if response.changed() {
+        let response = output.response;
+        if response.changed() || menu_changed {
             let trimmed = state.capture_output_dir_input.trim();
             s.capture_output_dir = if trimmed.is_empty() {
                 None
@@ -1716,10 +1722,14 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label("検索:");
-        ui.add(
-            egui::TextEdit::singleline(&mut state.vst3_filter)
-                .hint_text("プラグイン名…")
-                .desired_width(f32::INFINITY),
+        let mut output = egui::TextEdit::singleline(&mut state.vst3_filter)
+            .hint_text("プラグイン名…")
+            .desired_width(f32::INFINITY)
+            .show(ui);
+        crate::ui_helpers::singleline_text_edit_context_menu(
+            ui,
+            &mut output,
+            &mut state.vst3_filter,
         );
     });
     if state.vst3_discovered.iter().any(|p| p.hidden_by_default()) {

@@ -45,6 +45,9 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 - **⬆ 親フォルダボタン**: `Backspace` と同じく親フォルダへ移動し、元フォルダを選択状態にする。Ctrl+F フィルタが現在フォルダに効いている間は disabled になり、Esc / × で検索を閉じるまで親へ抜けない
 - **▲ / ▼ ツリー順ボタン**: `Ctrl+↑/↓` と同じく、深さ優先のツリー順で前 / 次の
   画像・動画・ZIP・PDF フォルダへ移動する
+- **場所▼ メニュー**: デスクトップ / ピクチャ / ダウンロード / 利用可能なドライブ
+  (`C:\` など) へ直接移動する。既知フォルダは Windows Known Folder API を優先し、
+  OneDrive やリダイレクトされた Desktop に追従する。検索中と ★固定中は disabled
 - **♡ / ♥ お気に入りボタン**: 未登録の現在フォルダではお気に入り追加ダイアログを開く。
   登録済みの現在フォルダではお気に入り編集ダイアログを開く。検索・索引の
   ルートになるため、追加対象は実フォルダのみで、ZIP / PDF / 変換済みアーカイブ
@@ -506,7 +509,7 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 
 | 入力 | 動作 |
 |------|------|
-| 方向パッド / 左スティック | グリッドでは選択移動。画像フルスクリーンではページ送り。縦連結では上下がスクロール、左右がページ送り。横連結では左右がスクロール、上下がページ送り。動画フルスクリーンでは左右がシーク / タイルカーソル移動、上下が前後ファイル移動 |
+| 方向パッド / 左スティック | グリッドでは選択移動。画像フルスクリーンではページ送り。縦連結では上下がスクロール、左右がページ送り。横連結では左右がスクロール、上下がページ送り。左スティックは連結方向を連続スクロールする。動画フルスクリーンでは左右がシーク / タイルカーソル移動、上下が前後ファイル移動 |
 | A / B | 決定・開く・再生 / 戻る・閉じる |
 | LB / RB | Ctrl+↑ / Ctrl+↓ と同じツリー順の前 / 次フォルダ移動 |
 | LT / RT | グリッドでは連続スクロール、画像ではズームアウト / ズームイン、動画では連続シーク |
@@ -568,10 +571,10 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 | `thumb_aspect_auto` | bool | false | サムネイル比率の自動選択モード。`true` のときフォルダ内画像の比率に応じてグリッドセル比率を自動で切り替える。フォルダごとの前回確定値は `auto_aspect_cache.db` に保存され、再訪時の初期比率に使われる。キャッシュ復元時は保存時の sample 数と同等以上の実測 sample が集まるまで、途中統計による上書きを抑制する。キャッシュ管理ダイアログの現在フォルダ削除 / 全削除 / 古いキャッシュ削除で、この判定結果も対応する範囲だけ削除される (詳細: [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md))。 |
 | `sort_order` | SortOrder | FileName | ソート順（FileName / Natural / MtimeAsc / MtimeDesc） |
 | `favorites` | Vec\<FavoriteEntry\> | [] | お気に入りフォルダ (`id: Uuid` + name + path + `auto_index_structure` / `auto_index_metadata` / `auto_index_thumbs` の 3 フラグ, v0.8.0〜) |
-| `last_folder` | Option\<PathBuf\> | None | 前回開いていたフォルダ |
+| `last_folder` | Option\<PathBuf\> | None | 前回開いていたフォルダ。有効なフォルダ / ZIP / PDF が残っていればそれを優先し、未設定または開けない場合は Windows Known Folder API で取得した Desktop を初期フォルダとして開く |
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ZIP・PDF の開き方) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
-| `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去。初回セットアップと環境設定には、オンラインマニュアルの処理時間目安へのリンクを表示する |
+| `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去。初回セットアップと環境設定には、GPU 負荷が高く低スペック環境では OFF 推奨である案内とオンラインマニュアルの処理時間目安へのリンクを表示する |
 | `auto_fullscreen_zip_pdf` | bool | false | ZIP/PDF を一覧から開いたとき、ページ一覧を経由せずページをフルスクリーンで表示する。開く位置 (1 ページ目 / 続きから) は位置復元マトリクスの `book_open_resume` に従う。フルスクリーン中の Esc/Enter で親一覧 (L1)、Backspace でそのファイルのページ一覧 (L2) へ戻る |
 
 ### 8.2 キャッシュ設定
@@ -1045,12 +1048,13 @@ JPEG 圧縮で発生するブロックノイズ・モスキートノイズを AI
 ONNX Runtime + DirectML EP でタイル分割 4x アップスケールを実行。
 環境設定「全体設定」の `ai_feature_mode` で利用範囲を選ぶ:
 
-- `disabled`: AI アップスケール / AI ノイズ除去を実行しない
-- `light`: ミドルレンジ GPU 向け。自動判別は漫画を `Real-CUGAN 4x conservative`、
+- `disabled`: 低スペック環境向け。AI アップスケール / AI ノイズ除去を実行しない。
+  表示が重い環境ではこの設定を推奨する
+- `light`: 軽め。自動判別は漫画を `Real-CUGAN 4x conservative`、
   それ以外を `Real-ESR General V3` に振り分ける。手動選択もこの 2 モデルに制限し、
   ノイズ除去は実行しない
-- `high_quality`: ハイエンド GPU 向け。全アップスケールモデルとノイズ除去を許可する。
-  GPU によっては処理に時間がかかるモデルが含まれる
+- `high_quality`: GPU 負荷高め。全アップスケールモデルとノイズ除去を許可する。
+  GPU によっては表示や処理に時間がかかるモデルが含まれる
 
 `high_quality` では、画像タイプ自動判別（イラスト/漫画/3D/写真）に基づき、以下の
 3 モデルに自動振り分け:

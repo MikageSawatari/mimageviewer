@@ -27095,9 +27095,9 @@ impl eframe::App for App {
             }
         }
 
-        // 初回フレームで前回フォルダを復元
-        // ZIP ファイルや、削除済み・取り外し済みのパスでもクラッシュしないよう
-        // resolve_openable_path で最も近い既存ディレクトリに解決する。
+        // 初回フレームで前回フォルダを復元する。
+        // 有効な last_folder は優先し、削除済み・取り外し済みのパスや初回起動では
+        // Known Folder API で取得した Desktop を開始地点にする。
         if !self.initialized {
             self.initialized = true;
 
@@ -27105,10 +27105,10 @@ impl eframe::App for App {
             // 明示的な Light / Dark 選択はそのまま使う。初回セットアップダイアログでは
             // テーマ / AI 利用範囲 / ZIP/PDF の開き方をまとめて確認する。
 
-            if let Some(folder) = self.settings.last_folder.clone() {
-                if let Some(resolved) = crate::folder_tree::resolve_openable_path(&folder) {
-                    self.load_folder(resolved);
-                }
+            if let Some(folder) =
+                crate::known_folders::startup_folder(self.settings.last_folder.as_deref())
+            {
+                self.load_folder(folder);
             }
 
             // AI ランタイムを初期化

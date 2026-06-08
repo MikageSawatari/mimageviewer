@@ -213,6 +213,182 @@ impl HoverTipExt for egui::Response {
     }
 }
 
+/// 単一行 `TextEdit` に Windows 標準に近い右クリックメニューを追加する。
+///
+/// egui 0.33 の `TextEdit` は `show()` の戻り値から cursor state を更新できるため、
+/// 入力中の IME composition には触れず、メニュー操作で確定済み文字列だけを編集する。
+/// 戻り値はテキスト内容を変更したかどうか。
+#[allow(dead_code)]
+pub(crate) fn singleline_text_edit_context_menu(
+    _ui: &mut egui::Ui,
+    output: &mut egui::widgets::text_edit::TextEditOutput,
+    text: &mut String,
+) -> bool {
+    use egui::TextBuffer as _;
+    use egui::text::{CCursor, CCursorRange};
+
+    let id = output.response.id;
+    let state = output.state.clone();
+    let char_count = text.chars().count();
+    let selection = clamp_cursor_range(
+        output.cursor_range.or_else(|| state.cursor.char_range()),
+        char_count,
+    );
+    let has_selection = !selection.is_empty();
+    let selected_text = has_selection.then(|| selection.slice_str(text).to_owned());
+
+    let mut changed = false;
+    output.response.context_menu(|ui| {
+        let paste_text = read_clipboard_text().map(|s| singleline_clipboard_text(&s));
+        let can_paste = paste_text.as_ref().is_some_and(|s| !s.is_empty());
+
+        if ui
+            .add_enabled(has_selection, egui::Button::new("切り取り"))
+            .clicked()
+        {
+            if let Some(selected) = selected_text.as_ref() {
+                ui.ctx().copy_text(selected.clone());
+                let range = selection.as_sorted_char_range();
+                let cursor = CCursor::new(range.start);
+                text.delete_char_range(range);
+                store_text_edit_cursor(ui.ctx(), id, &state, CCursorRange::one(cursor));
+                output.response.request_focus();
+                changed = true;
+            }
+            ui.close();
+        }
+        if ui
+            .add_enabled(has_selection, egui::Button::new("コピー"))
+            .clicked()
+        {
+            if let Some(selected) = selected_text.as_ref() {
+                ui.ctx().copy_text(selected.clone());
+            }
+            output.response.request_focus();
+            ui.close();
+        }
+        if ui
+            .add_enabled(can_paste, egui::Button::new("貼り付け"))
+            .clicked()
+        {
+            if let Some(paste) = paste_text.as_ref() {
+                let range = selection.as_sorted_char_range();
+                let insert_at = range.start;
+                if range.start != range.end {
+                    text.delete_char_range(range);
+                }
+                let inserted = text.insert_text(paste, insert_at);
+                store_text_edit_cursor(
+                    ui.ctx(),
+                    id,
+                    &state,
+                    CCursorRange::one(CCursor::new(insert_at + inserted)),
+                );
+                output.response.request_focus();
+                changed = true;
+            }
+            ui.close();
+        }
+        if ui
+            .add_enabled(char_count > 0, egui::Button::new("すべて選択"))
+            .clicked()
+        {
+            store_text_edit_cursor(
+                ui.ctx(),
+                id,
+                &state,
+                CCursorRange::two(CCursor::new(0), CCursor::new(char_count)),
+            );
+            output.response.request_focus();
+            ui.close();
+        }
+    });
+
+    if changed {
+        output.response.mark_changed();
+    }
+    changed
+}
+
+fn clamp_cursor_range(
+    range: Option<egui::text::CCursorRange>,
+    char_count: usize,
+) -> egui::text::CCursorRange {
+    use egui::text::{CCursor, CCursorRange};
+
+    let Some(mut range) = range else {
+        return CCursorRange::one(CCursor::new(char_count));
+    };
+    range.primary.index = range.primary.index.min(char_count);
+    range.secondary.index = range.secondary.index.min(char_count);
+    range
+}
+
+fn store_text_edit_cursor(
+    ctx: &egui::Context,
+    id: egui::Id,
+    state: &egui::widgets::text_edit::TextEditState,
+    range: egui::text::CCursorRange,
+) {
+    let mut state = state.clone();
+    state.cursor.set_char_range(Some(range));
+    state.store(ctx, id);
+}
+
+fn singleline_clipboard_text(text: &str) -> String {
+    normalize_clipboard_newlines(text).replace('\n', " ")
+}
+
+fn normalize_clipboard_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+#[cfg(windows)]
+fn read_clipboard_text() -> Option<String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    unsafe {
+        if OpenClipboard(Some(HWND::default())).is_err() {
+            return None;
+        }
+        let hmem = match GetClipboardData(CF_UNICODETEXT.0 as u32) {
+            Ok(h) => h,
+            Err(_) => {
+                let _ = CloseClipboard();
+                return None;
+            }
+        };
+        if hmem.is_invalid() {
+            let _ = CloseClipboard();
+            return None;
+        }
+        let global = windows::Win32::Foundation::HGLOBAL(hmem.0);
+        let ptr = GlobalLock(global) as *const u16;
+        if ptr.is_null() {
+            let _ = CloseClipboard();
+            return None;
+        }
+        let max_u16 = GlobalSize(global) / 2;
+        let mut len = 0usize;
+        while len < max_u16 && *ptr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        let text = String::from_utf16_lossy(slice);
+        let _ = GlobalUnlock(global);
+        let _ = CloseClipboard();
+        if text.is_empty() { None } else { Some(text) }
+    }
+}
+
+#[cfg(not(windows))]
+fn read_clipboard_text() -> Option<String> {
+    None
+}
+
 // -----------------------------------------------------------------------
 // F1〜F6 のレーティングキー
 // -----------------------------------------------------------------------

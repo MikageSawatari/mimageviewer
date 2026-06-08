@@ -2096,18 +2096,23 @@ impl App {
                      アイテム索引が作成されていないお気に入りは対象になりません。\n\
                      お気に入り編集で「アイテムを索引化する」を有効にしてください。",
                 );
-                let response = ui.add_sized(
-                    [320.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.global_search.query).hint_text(
-                        r#"画像・PDF・動画をファイル名やメタ情報で検索 (AND / -除外 / "…")"#,
-                    ),
+                let mut output = egui::TextEdit::singleline(&mut self.global_search.query)
+                    .hint_text(r#"画像・PDF・動画をファイル名やメタ情報で検索 (AND / -除外 / "…")"#)
+                    .desired_width(320.0)
+                    .min_size(egui::vec2(320.0, 20.0))
+                    .show(ui);
+                let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+                    ui,
+                    &mut output,
+                    &mut self.global_search.query,
                 );
+                let response = output.response;
                 if self.global_search.focus_request {
                     self.global_search.focus_request = false;
                     response.request_focus();
                 }
                 self.global_search.has_focus = response.has_focus();
-                if response.changed() {
+                if response.changed() || menu_changed {
                     query_changed = true;
                 }
                 if response.lost_focus() && raw_enter {

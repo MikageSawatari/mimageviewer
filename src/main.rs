@@ -60,6 +60,7 @@ pub mod indexer_supervisor;
 pub mod ingest_text;
 pub mod ingest_worker;
 pub mod io_semaphore;
+pub mod known_folders;
 pub mod local_adjust_catalog;
 pub mod local_adjust_db;
 pub mod local_adjust_effect_ui;

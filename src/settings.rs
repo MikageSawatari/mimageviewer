@@ -492,11 +492,11 @@ impl AiFeatureMode {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Disabled => "AI アップスケールと AI ノイズ除去を使いません。",
-            Self::Light => "ミドルレンジGPU向け。高速汎用と漫画トーン保持モデルだけを使います。",
-            Self::HighQuality => {
-                "ハイエンドGPU向け。全アップスケールモデルとノイズ除去を使えます。"
+            Self::Disabled => {
+                "低スペック環境向け。AI アップスケールと AI ノイズ除去を実行しません。"
             }
+            Self::Light => "軽め。高速汎用と漫画トーン保持モデルだけを使います。",
+            Self::HighQuality => "GPU負荷高め。全アップスケールモデルとノイズ除去を使えます。",
         }
     }
 
