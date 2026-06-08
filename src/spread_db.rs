@@ -190,13 +190,23 @@ fn ensure_column(
         }
         found
     };
-    if !exists {
-        conn.execute(
-            &format!("ALTER TABLE spreads ADD COLUMN {column} {definition}"),
-            [],
-        )?;
+    if exists {
+        return Ok(());
     }
-    Ok(())
+    // PRAGMA→ALTER は非アトミックなので、複数接続が同時に open した場合 (テスト並列実行や
+    // 同一 data_dir を指す installed/portable 同時起動) は両方が「列なし」と判定して ALTER
+    // し得る。後勝ちの "duplicate column" は目的 (列の存在) が既に達成されているので冪等に
+    // 握りつぶす。それ以外のエラーは伝播させる。archive_cache.rs の ADD COLUMN と同じ方針。
+    match conn.execute(
+        &format!("ALTER TABLE spreads ADD COLUMN {column} {definition}"),
+        [],
+    ) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column") => {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +228,10 @@ mod tests {
 
     #[test]
     fn db_set_get_clear() {
+        // 実体の data_dir/spread.db を触らず専用 temp に隔離する。ガードはグローバル
+        // ロックを保持するので、open() の PRAGMA→ALTER マイグレーションが他テストと
+        // 並列衝突して "duplicate column" で落ちることもない。
+        let _guard = crate::data_dir::TestDataDirGuard::new();
         let db = SpreadDb::open().unwrap();
         let p = Path::new("C:/test/folder");
         let default = SpreadMode::Single;
@@ -275,6 +289,7 @@ mod tests {
 
     #[test]
     fn legacy_vertical_mode_maps_to_vertical_flow() {
+        let _guard = crate::data_dir::TestDataDirGuard::new();
         let db = SpreadDb::open().unwrap();
         let p = Path::new("C:/test/legacy-vertical");
 
