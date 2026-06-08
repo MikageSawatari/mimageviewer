@@ -616,6 +616,50 @@ struct ContinuousReadingUnitSize {
     page_gap: f32,
 }
 
+fn continuous_spread_fit_width(
+    page_count: usize,
+    base_width: f32,
+    spread_mode: SpreadMode,
+    flow: ReadingFlow,
+    fit_mode: FullscreenFitMode,
+    spread_gap: f32,
+) -> (f32, f32) {
+    if page_count == 1
+        && spread_mode.is_spread()
+        && flow.is_vertical()
+        && matches!(fit_mode, FullscreenFitMode::Width)
+    {
+        ((base_width * 2.0).max(1.0), spread_gap.max(0.0))
+    } else {
+        (
+            base_width.max(1.0),
+            spread_gap.max(0.0) * page_count.saturating_sub(1) as f32,
+        )
+    }
+}
+
+fn continuous_reading_page_rects(
+    unit_rect: egui::Rect,
+    size: &ContinuousReadingUnitSize,
+) -> Vec<(usize, egui::Rect)> {
+    let mut rects = Vec::with_capacity(size.pages.len());
+    let mut x = unit_rect.min.x;
+    for page in &size.pages {
+        let rect = if size.pages.len() == 1 {
+            egui::Rect::from_center_size(unit_rect.center(), egui::vec2(page.width, page.height))
+        } else {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(x, unit_rect.min.y),
+                egui::vec2(page.width, page.height),
+            );
+            x += page.width + size.page_gap;
+            rect
+        };
+        rects.push((page.idx, rect));
+    }
+    rects
+}
+
 /// 透過背景の描画スタイル。B キーで 3 モードを循環する。
 ///
 /// フルスクリーンのビューポート背景は `ui_fullscreen.rs` で `Color32::BLACK` に
@@ -6879,17 +6923,25 @@ impl App {
         fallback: egui::Vec2,
     ) -> ContinuousReadingUnitSize {
         let mut base = self.continuous_unit_base_size(unit, fallback);
+        let fit_mode = self.effective_fullscreen_fit_mode();
+        let spread_gap = self.settings.spread_page_gap_px.min(200) as f32;
         let page_gap = if base.pages.len() > 1 {
-            self.settings.spread_page_gap_px.min(200) as f32
+            spread_gap
         } else {
             0.0
         };
-        let page_gap_total = page_gap * base.pages.len().saturating_sub(1) as f32;
-        let fit_mode = self.effective_fullscreen_fit_mode();
-        let target_w = (image_rect.width() * zoom - page_gap_total).max(1.0);
+        let (fit_width, fit_gap_total) = continuous_spread_fit_width(
+            base.pages.len(),
+            base.width,
+            self.spread_mode,
+            flow,
+            fit_mode,
+            spread_gap,
+        );
+        let target_w = (image_rect.width() * zoom - fit_gap_total).max(1.0);
         let target_h = (image_rect.height() * zoom).max(1.0);
         let scale = match fit_mode {
-            FullscreenFitMode::Width => target_w / base.width.max(1.0),
+            FullscreenFitMode::Width => target_w / fit_width.max(1.0),
             FullscreenFitMode::Height => target_h / base.height.max(1.0),
             FullscreenFitMode::Original => zoom,
             FullscreenFitMode::Page => {
@@ -6899,11 +6951,11 @@ impl App {
                 if flow.is_horizontal() {
                     target_h / base.height.max(1.0)
                 } else {
-                    target_w / base.width.max(1.0)
+                    target_w / fit_width.max(1.0)
                 }
             }
         };
-        base.width = (base.width * scale + page_gap_total).max(1.0);
+        base.width = (fit_width * scale + fit_gap_total).max(1.0);
         base.height = (base.height * scale).max(1.0);
         base.page_gap = page_gap;
         for page in &mut base.pages {
@@ -7054,22 +7106,8 @@ impl App {
             };
             let unit_rect =
                 egui::Rect::from_center_size(unit_center, egui::vec2(size.width, size.height));
-            let mut x = unit_rect.min.x;
-            for page in &size.pages {
-                let rect = if size.pages.len() == 1 {
-                    unit_rect
-                } else {
-                    let rect = egui::Rect::from_min_size(
-                        egui::pos2(x, unit_rect.min.y),
-                        egui::vec2(page.width, page.height),
-                    );
-                    x += page.width + size.page_gap;
-                    rect
-                };
-                pages.push(VerticalReadingPage {
-                    idx: page.idx,
-                    rect,
-                });
+            for (idx, rect) in continuous_reading_page_rects(unit_rect, size) {
+                pages.push(VerticalReadingPage { idx, rect });
             }
         }
 
@@ -12808,6 +12846,64 @@ mod tests {
 
         assert_eq!(vertical_reading_reanchor_scroll(110.0, &offsets, 2), 0.0);
         assert_eq!(vertical_reading_reanchor_scroll(-110.0, &offsets, 0), 0.0);
+    }
+
+    #[test]
+    fn vertical_spread_cover_uses_virtual_two_page_width_for_width_fit() {
+        assert_eq!(
+            continuous_spread_fit_width(
+                1,
+                100.0,
+                SpreadMode::RtlCover,
+                ReadingFlow::Vertical,
+                FullscreenFitMode::Width,
+                4.0,
+            ),
+            (200.0, 4.0)
+        );
+        assert_eq!(
+            continuous_spread_fit_width(
+                1,
+                100.0,
+                SpreadMode::RtlCover,
+                ReadingFlow::Vertical,
+                FullscreenFitMode::Height,
+                4.0,
+            ),
+            (100.0, 0.0)
+        );
+        assert_eq!(
+            continuous_spread_fit_width(
+                1,
+                100.0,
+                SpreadMode::Single,
+                ReadingFlow::Vertical,
+                FullscreenFitMode::Width,
+                4.0,
+            ),
+            (100.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn continuous_single_page_rect_is_centered_inside_virtual_unit() {
+        let unit_rect =
+            egui::Rect::from_center_size(egui::pos2(100.0, 50.0), egui::vec2(200.0, 100.0));
+        let size = ContinuousReadingUnitSize {
+            pages: vec![ContinuousReadingPageSize {
+                idx: 42,
+                width: 96.0,
+                height: 100.0,
+            }],
+            width: 200.0,
+            height: 100.0,
+            page_gap: 0.0,
+        };
+        let rects = continuous_reading_page_rects(unit_rect, &size);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].0, 42);
+        assert!((rects[0].1.center().x - unit_rect.center().x).abs() < 0.001);
+        assert!((rects[0].1.width() - 96.0).abs() < 0.001);
     }
 
     // ── decide_local_adjust_preview_action unit tests ─────────────────────
