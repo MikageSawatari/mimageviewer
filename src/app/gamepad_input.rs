@@ -6,7 +6,7 @@ use eframe::egui;
 use super::{AdjustSpreadTarget, App, FolderNavMode};
 use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent};
 use crate::grid_item::GridItem;
-use crate::settings::SpreadMode;
+use crate::settings::ReadingDirection;
 use crate::ui_main::AddressBarNav;
 
 const BUTTON_REPEAT_INTERVAL: Duration = Duration::from_millis(95);
@@ -396,13 +396,9 @@ impl App {
         if self.current_fullscreen_is_video(fs_idx) {
             return;
         }
-        let all = SpreadMode::all();
-        let current = all
-            .iter()
-            .position(|mode| *mode == self.spread_mode)
-            .unwrap_or(0);
-        let next = all[(current + 1) % all.len()];
-        self.set_gamepad_spread_mode(ctx, next);
+        let next = self.reading_flow.next();
+        self.set_reading_flow_for_fullscreen(ctx, fs_idx, next);
+        self.show_feedback_toast(format!("[Pad:{}]", next.label()));
     }
 
     fn handle_gamepad_y_tap(&mut self, ctx: &egui::Context) {
@@ -472,7 +468,7 @@ impl App {
     }
 
     fn handle_gamepad_still_direction(&mut self, ctx: &egui::Context, fs_idx: usize, dir: PadDir) {
-        if self.spread_mode.is_vertical() {
+        if self.reading_flow.is_vertical() {
             match dir {
                 PadDir::Down => {
                     self.scroll_vertical_reading_step(ctx, 1.0);
@@ -483,6 +479,27 @@ impl App {
                     return;
                 }
                 PadDir::Left | PadDir::Right => {}
+            }
+        } else if self.reading_flow.is_horizontal() {
+            let axis_rtl = self.reading_direction == ReadingDirection::Rtl;
+            match dir {
+                PadDir::Right if !axis_rtl => {
+                    self.scroll_vertical_reading_step(ctx, 1.0);
+                    return;
+                }
+                PadDir::Left if axis_rtl => {
+                    self.scroll_vertical_reading_step(ctx, 1.0);
+                    return;
+                }
+                PadDir::Left if !axis_rtl => {
+                    self.scroll_vertical_reading_step(ctx, -1.0);
+                    return;
+                }
+                PadDir::Right if axis_rtl => {
+                    self.scroll_vertical_reading_step(ctx, -1.0);
+                    return;
+                }
+                PadDir::Up | PadDir::Down | PadDir::Left | PadDir::Right => {}
             }
         }
         let rtl = self.spread_mode.is_rtl();
@@ -518,9 +535,9 @@ impl App {
         if self.spread_mode.is_spread() {
             if let Some((new_idx, new_mode)) = self.compute_spread_offset_nudge(fs_idx, nudge_dir) {
                 self.spread_mode = new_mode;
-                if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
-                    let _ = db.set(folder, new_mode, self.settings.default_spread_mode);
-                }
+                self.update_reading_direction_from_spread_mode(new_mode);
+                self.persist_current_spread_mode();
+                self.persist_current_reading_flow();
                 self.adjust_spread_target = AdjustSpreadTarget::Left;
                 self.bump_input_seq("gamepad_fs_nudge", Some(&format!("idx={new_idx}")));
                 self.handle_fs_navigation(ctx, false, false, None, None, 0, Some(new_idx), fs_idx);
@@ -722,28 +739,6 @@ impl App {
                 Some(&format!("offset={:.0}", self.scroll_offset_y)),
             );
         }
-    }
-
-    fn set_gamepad_spread_mode(&mut self, ctx: &egui::Context, mode: SpreadMode) {
-        if mode != self.spread_mode {
-            self.spread_mode = mode;
-            self.spread_popup_open = false;
-            self.adjust_spread_target = AdjustSpreadTarget::Left;
-            if mode.is_vertical() {
-                self.fs_vertical_scroll = 0.0;
-                self.fs_pan = egui::Vec2::ZERO;
-                self.fs_free_rotation = 0.0;
-            }
-            self.fs_vertical_cache_keep_set.clear();
-            if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
-                let _ = db.set(folder, mode, self.settings.default_spread_mode);
-            }
-            if (mode.is_spread() || mode.is_vertical()) && self.analysis_mode {
-                self.reset_analysis_mode();
-            }
-            self.normalize_spread_position(ctx);
-        }
-        self.show_feedback_toast(format!("[Pad:{}]", mode.label()));
     }
 
     fn current_fullscreen_is_video(&self, fs_idx: usize) -> bool {

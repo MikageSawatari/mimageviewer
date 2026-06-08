@@ -3537,11 +3537,15 @@ pub struct App {
     pub(crate) last_book_resume: Option<(PathBuf, usize)>,
 
     // ── フルスクリーン表示モード ──────────────────────────────
-    /// 表示モード DB (フォルダごとのモード永続化)
+    /// 表示モード DB (フォルダごとのページ構成 / 連結方式永続化)
     pub(crate) spread_db: Option<crate::spread_db::SpreadDb>,
-    /// 現在のフォルダの表示モード。見開きの「1 ページずらし」(Ctrl+←/→) も
+    /// 現在のフォルダのページ構成。見開きの「1 ページずらし」(Ctrl+←/→) も
     /// cover/非cover の切替としてこの値に反映され、`spread_db` でフォルダ単位に永続化される。
     pub(crate) spread_mode: crate::settings::SpreadMode,
+    /// 現在の連結方式（ページ単位 / 縦連結 / 横連結）。
+    pub(crate) reading_flow: crate::settings::ReadingFlow,
+    /// 横連結時の読書方向。
+    pub(crate) reading_direction: crate::settings::ReadingDirection,
     /// 表示モード切替ポップアップ表示中
     pub(crate) spread_popup_open: bool,
 
@@ -3598,9 +3602,9 @@ pub struct App {
     pub(crate) fs_pan: egui::Vec2,
     /// 通常フルスクリーンのパンドラッグ開始状態
     pub(crate) fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
-    /// 縦読みモードのスクロール量。現在ページ中心を 0 とし、正方向で下のページへ進む。
+    /// 連結読みモードのスクロール量。現在ページ中心を 0 とし、正方向で次のユニットへ進む。
     pub(crate) fs_vertical_scroll: f32,
-    /// 縦読み描画で最後に計算した raw/final/comic cache の保持対象。
+    /// 連結読み描画で最後に計算した raw/final/comic cache の保持対象。
     pub(crate) fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
     /// 任意角度回転（ラジアン、一時的・保存しない）
     pub(crate) fs_free_rotation: f32,
@@ -5317,6 +5321,8 @@ impl App {
             last_book_resume: None,
             spread_db,
             spread_mode: crate::settings::SpreadMode::default(),
+            reading_flow: crate::settings::ReadingFlow::default(),
+            reading_direction: crate::settings::ReadingDirection::default(),
             spread_popup_open: false,
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
@@ -9670,12 +9676,38 @@ impl App {
                 )],
             );
         }
-        // 表示モード: DB から読み込み、なければデフォルト値
-        self.spread_mode = self
+        // 表示モード: DB から読み込み、なければデフォルト値。
+        // 旧実装の SpreadMode::Vertical は新しい 2 軸モデルでは
+        // 「単ページ + 縦連結」として解釈する。
+        let stored_spread = self
             .spread_db
             .as_ref()
             .and_then(|db| db.get(&source_path))
             .unwrap_or(self.settings.default_spread_mode);
+        self.reading_flow = self
+            .spread_db
+            .as_ref()
+            .and_then(|db| db.get_flow(&source_path))
+            .unwrap_or(self.settings.default_reading_flow);
+        self.reading_direction = self
+            .spread_db
+            .as_ref()
+            .and_then(|db| db.get_direction(&source_path))
+            .unwrap_or(self.settings.default_reading_direction);
+        if stored_spread == crate::settings::SpreadMode::Vertical {
+            self.spread_mode = crate::settings::SpreadMode::Single;
+            self.reading_flow = crate::settings::ReadingFlow::Vertical;
+        } else {
+            self.spread_mode = stored_spread;
+        }
+        if self.spread_mode.is_rtl() {
+            self.reading_direction = crate::settings::ReadingDirection::Rtl;
+        } else if matches!(
+            self.spread_mode,
+            crate::settings::SpreadMode::Ltr | crate::settings::SpreadMode::LtrCover
+        ) {
+            self.reading_direction = crate::settings::ReadingDirection::Ltr;
+        }
         self.spread_popup_open = false;
         self.search_filter = None;
         self.search_filter_origin_folder = None;
@@ -15504,7 +15536,7 @@ impl App {
                 } else if !self.fs_pending.contains_key(&idx) {
                     self.start_fs_load(idx);
                 }
-                if !self.spread_mode.is_vertical() {
+                if self.reading_flow.is_paged() {
                     self.update_prefetch_window(idx);
                 }
             }
@@ -25281,10 +25313,10 @@ impl App {
             // 保存済みマスクがあれば自動で inpaint 適用
             self.auto_apply_saved_mask(ctx, key);
             if self.fullscreen_idx == Some(key) {
-                // 縦読みモードの keep/prefetch 範囲は viewport 上の可視ページから
+                // 連結表示の keep/prefetch 範囲は viewport 上の可視ページから
                 // ui_fullscreen 側で毎フレーム計算する。ここで通常の前後ページ window を
                 // 適用すると、可視ページを読み込んだ直後に evict してしまう。
-                if !self.spread_mode.is_vertical() {
+                if self.reading_flow.is_paged() {
                     self.update_prefetch_window(key);
                 }
                 // 360 候補のトースト補完 (Codex P3 第 19 ラウンド):
@@ -27205,14 +27237,14 @@ impl eframe::App for App {
         if let Some(fs_idx) = self.fullscreen_idx {
             // プリセットに基づいてアップスケール設定を同期
             self.sync_upscale_from_preset(fs_idx);
-            let vertical_keep_set = if self.spread_mode.is_vertical()
+            let continuous_keep_set = if !self.reading_flow.is_paged()
                 && self.fs_vertical_cache_keep_set.contains(&fs_idx)
             {
                 Some(self.fs_vertical_cache_keep_set.clone())
             } else {
                 None
             };
-            if let Some(keep_set) = vertical_keep_set.as_ref() {
+            if let Some(keep_set) = continuous_keep_set.as_ref() {
                 self.evict_final_pipeline_cache_for_keep_set(keep_set);
             } else {
                 self.evict_final_pipeline_cache(fs_idx);
@@ -27223,7 +27255,7 @@ impl eframe::App for App {
                 self.maybe_start_local_adjust_render(other);
             }
             self.maybe_start_local_adjust_render(fs_idx);
-            if let Some(keep_set) = vertical_keep_set.as_ref() {
+            if let Some(keep_set) = continuous_keep_set.as_ref() {
                 self.evict_adjustment_cache_for_keep_set(keep_set);
             } else {
                 self.evict_adjustment_cache(fs_idx);

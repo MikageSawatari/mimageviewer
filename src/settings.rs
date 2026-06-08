@@ -576,17 +576,17 @@ fn default_resume_from_start() -> ResumeMode {
 }
 
 // -----------------------------------------------------------------------
-// SpreadMode (フルスクリーン表示モード)
+// SpreadMode (フルスクリーンページ構成)
 // -----------------------------------------------------------------------
 
-/// フルスクリーンの表示モード。
+/// フルスクリーンのページ構成。
 ///
 /// - `Single`: 通常の1ページ表示
 /// - `Ltr`: 見開き 左→右（表紙なし）— [0,1] [2,3] ...
 /// - `LtrCover`: 見開き 左→右（表紙あり）— [0] [1,2] [3,4] ...
 /// - `Rtl`: 見開き 右→左（表紙なし）— [0,1] [2,3] ...
 /// - `RtlCover`: 見開き 右→左（表紙あり）— [0] [2,1] [4,3] ...
-/// - `Vertical`: 縦読み
+/// - `Vertical`: 旧DB互換用。新規 UI では `ReadingFlow::Vertical` を使う。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum SpreadMode {
     #[default]
@@ -599,7 +599,7 @@ pub enum SpreadMode {
 }
 
 impl SpreadMode {
-    /// 見開きモードか
+    /// 見開き構成か
     pub fn is_spread(self) -> bool {
         matches!(
             self,
@@ -607,7 +607,7 @@ impl SpreadMode {
         )
     }
 
-    /// 縦読みモードか
+    /// 旧DB互換の縦読みモードか。新規表示切替では `ReadingFlow::Vertical` を使う。
     pub fn is_vertical(self) -> bool {
         matches!(self, Self::Vertical)
     }
@@ -653,7 +653,7 @@ impl SpreadMode {
             Self::LtrCover => "見開き 左→右（表紙あり）",
             Self::Rtl => "見開き 右→左",
             Self::RtlCover => "見開き 右→左（表紙あり）",
-            Self::Vertical => "縦読み",
+            Self::Vertical => "縦読み（旧）",
         }
     }
 
@@ -664,8 +664,103 @@ impl SpreadMode {
             Self::LtrCover,
             Self::Rtl,
             Self::RtlCover,
-            Self::Vertical,
         ]
+    }
+}
+
+// -----------------------------------------------------------------------
+// ReadingFlow (フルスクリーン連結方式)
+// -----------------------------------------------------------------------
+
+/// フルスクリーンの連結方式。
+///
+/// `SpreadMode` が「1ページ / 見開き」を決め、こちらは表示ユニットを
+/// 連結せずページ単位で見るか、縦・横に連続配置するかを決める。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReadingFlow {
+    #[default]
+    Paged,
+    Vertical,
+    Horizontal,
+}
+
+impl ReadingFlow {
+    pub fn is_paged(self) -> bool {
+        matches!(self, Self::Paged)
+    }
+
+    pub fn is_vertical(self) -> bool {
+        matches!(self, Self::Vertical)
+    }
+
+    pub fn is_horizontal(self) -> bool {
+        matches!(self, Self::Horizontal)
+    }
+
+    pub fn from_int(v: i32) -> Self {
+        match v {
+            1 => Self::Vertical,
+            2 => Self::Horizontal,
+            _ => Self::Paged,
+        }
+    }
+
+    pub fn to_int(self) -> i32 {
+        match self {
+            Self::Paged => 0,
+            Self::Vertical => 1,
+            Self::Horizontal => 2,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Paged => "ページ単位",
+            Self::Vertical => "縦連結",
+            Self::Horizontal => "横連結",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Paged, Self::Vertical, Self::Horizontal]
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Paged => Self::Vertical,
+            Self::Vertical => Self::Horizontal,
+            Self::Horizontal => Self::Paged,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReadingDirection {
+    #[default]
+    Ltr,
+    Rtl,
+}
+
+impl ReadingDirection {
+    pub fn from_int(v: i32) -> Self {
+        match v {
+            1 => Self::Rtl,
+            _ => Self::Ltr,
+        }
+    }
+
+    pub fn to_int(self) -> i32 {
+        match self {
+            Self::Ltr => 0,
+            Self::Rtl => 1,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ltr => "左→右",
+            Self::Rtl => "右→左",
+        }
     }
 }
 
@@ -947,9 +1042,15 @@ pub struct Settings {
     pub export_batch_selection: [bool; 5],
 
     // ── フルスクリーン表示モード ────────────────────────────
-    /// デフォルトの表示モード
+    /// デフォルトのページ構成
     #[serde(default)]
     pub default_spread_mode: SpreadMode,
+    /// デフォルトの連結方式
+    #[serde(default)]
+    pub default_reading_flow: ReadingFlow,
+    /// デフォルトの横連結方向
+    #[serde(default)]
+    pub default_reading_direction: ReadingDirection,
 
     /// ZIP/PDF を一覧から開いたとき、ページ一覧を経由せず 1 ページ目を即フルスクリーンで
     /// 開く。ON のときフルスクリーン中の Esc/Enter は親フォルダ (一覧) へ戻り、
@@ -1890,6 +1991,8 @@ impl Default for Settings {
             capture_output_dir: None,
             capture_format: crate::capture::CaptureFormat::default(),
             default_spread_mode: SpreadMode::default(),
+            default_reading_flow: ReadingFlow::default(),
+            default_reading_direction: ReadingDirection::default(),
             auto_fullscreen_zip_pdf: false,
             margin_fit_enabled: false,
             ui_theme: UiTheme::default(),

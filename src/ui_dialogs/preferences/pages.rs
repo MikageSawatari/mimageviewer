@@ -1,7 +1,7 @@
 use super::*;
 use crate::settings::{
-    self, AiFeatureMode, CachePolicy, Parallelism, SortOrder, SpreadMode, ThumbAspect,
-    ToolbarSectionDisplay, UiTheme,
+    self, AiFeatureMode, CachePolicy, Parallelism, ReadingDirection, ReadingFlow, SortOrder,
+    SpreadMode, ThumbAspect, ToolbarSectionDisplay, UiTheme,
 };
 
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -2172,14 +2172,33 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     let s = &mut state.settings;
 
     ui.label(
-        "フルスクリーンで画像を開いたときの初期表示モード。\n数字キー 1-6 でも切り替えできます。",
+        "フルスクリーンで画像を開いたときの初期表示。\n数字キー 1-5 でページ構成、6 で連結方式を切り替えできます。",
     );
     ui.add_space(4.0);
-    egui::ComboBox::from_label("デフォルトの表示モード")
+    egui::ComboBox::from_label("デフォルトのページ構成")
         .selected_text(s.default_spread_mode.label())
         .show_ui(ui, |ui| {
             for &mode in SpreadMode::all() {
                 ui.selectable_value(&mut s.default_spread_mode, mode, mode.label());
+            }
+        });
+    ui.add_space(8.0);
+    egui::ComboBox::from_label("デフォルトの連結方式")
+        .selected_text(s.default_reading_flow.label())
+        .show_ui(ui, |ui| {
+            for &flow in ReadingFlow::all() {
+                ui.selectable_value(&mut s.default_reading_flow, flow, flow.label());
+            }
+        });
+    egui::ComboBox::from_label("横連結の方向")
+        .selected_text(s.default_reading_direction.label())
+        .show_ui(ui, |ui| {
+            for &direction in &[ReadingDirection::Ltr, ReadingDirection::Rtl] {
+                ui.selectable_value(
+                    &mut s.default_reading_direction,
+                    direction,
+                    direction.label(),
+                );
             }
         });
 }

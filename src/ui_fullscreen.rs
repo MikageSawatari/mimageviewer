@@ -25,7 +25,7 @@ use crate::app::App;
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::pdf_loader::PdfPageContentType;
-use crate::settings::SpreadMode;
+use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
 use crate::ui_helpers::{HoverTipExt, open_external_player};
 
 #[derive(Clone, Copy)]
@@ -70,21 +70,21 @@ const MIDDLE_DRAG_THRESHOLD_PX: f32 = 4.0;
 const ZOOM_MIN: f32 = 0.1;
 /// ズーム倍率の上限
 const ZOOM_MAX: f32 = 50.0;
-/// 縦読み: ページ間の既定余白。
+/// 連結読み: ページ間の既定余白。
 const VERTICAL_READING_GAP_PX: f32 = 12.0;
-/// 縦読み: ↑↓キー/ゲームパッド 1 入力あたりのスクロール量。
+/// 連結読み: キー/ゲームパッド 1 入力あたりのスクロール量。
 const VERTICAL_READING_SCROLL_STEP_PX: f32 = 90.0;
-/// 縦読み: PageUp/PageDown で進む画面高の割合。
+/// 連結読み: PageUp/PageDown で進む画面長の割合。
 const VERTICAL_READING_PAGE_SCROLL_FRAC: f32 = 0.85;
-/// 縦読み: 同時に画面に入るページ数の上限。
+/// 連結読み: 同時に画面に入るページ数の上限。
 const VERTICAL_READING_MAX_VISIBLE_PAGES: usize = 16;
-/// 縦読み: 可視範囲の上下に保持する先読みページ数。
+/// 連結読み: 可視範囲の前後に保持する先読みページ数。
 const VERTICAL_READING_PREFETCH_PAD: usize = 2;
-/// 縦読み: fs_cache に残すページ数上限。
+/// 連結読み: fs_cache に残すページ数上限。
 const VERTICAL_READING_MAX_CACHE_PAGES: usize = 20;
-/// 縦読み: fs_cache に残すテクスチャの推定総ピクセル数上限。
+/// 連結読み: fs_cache に残すテクスチャの推定総ピクセル数上限。
 const VERTICAL_READING_MAX_CACHE_TEXELS: usize = 320_000_000;
-/// 縦読み: final composite / comic 合成を新規生成するページ数の 1 フレーム上限。
+/// 連結読み: final composite / comic 合成を新規生成するページ数の 1 フレーム上限。
 const VERTICAL_READING_PROCESSED_UPLOADS_PER_FRAME: usize = 1;
 /// ズームが 1.0 とみなせるしきい値
 const ZOOM_NEAR_ONE: f32 = 1.001;
@@ -582,9 +582,22 @@ struct VerticalReadingPage {
     rect: egui::Rect,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct VerticalReadingSize {
+#[derive(Clone, Debug)]
+struct ContinuousReadingUnitSpec {
+    anchor_idx: usize,
+    pages: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct ContinuousReadingPageSize {
     idx: usize,
+    width: f32,
+    height: f32,
+}
+
+#[derive(Clone, Debug)]
+struct ContinuousReadingUnitSize {
+    pages: Vec<ContinuousReadingPageSize>,
     width: f32,
     height: f32,
 }
@@ -2238,7 +2251,7 @@ impl App {
                                         compare_mode,
                                         crate::app::CompareViewMode::Off
                                     );
-                                    let vertical_reading_active = self.spread_mode.is_vertical()
+                                    let continuous_reading_active = !self.reading_flow.is_paged()
                                         && !analysis_active
                                         && !state.is_video
                                         && self.vertical_reading_supported_idx(fs_idx)
@@ -2246,9 +2259,10 @@ impl App {
                                             compare_mode,
                                             crate::app::CompareViewMode::Off
                                         )
-                                        && !self.is_overlay_edit_mode_active();
-                                    if vertical_reading_active {
-                                        self.draw_fs_vertical_reading(
+                                        && !self.is_overlay_edit_mode_active()
+                                        && !self.is_panorama_mode_active(fs_idx);
+                                    if continuous_reading_active {
+                                        self.draw_fs_continuous_reading(
                                             ui,
                                             ctx,
                                             image_rect,
@@ -2727,6 +2741,8 @@ impl App {
                         let mut bar_rotate_cw = false;
                         let mut bar_rotate_ccw = false;
                         let spread_before = self.spread_mode;
+                        let reading_flow_before = self.reading_flow;
+                        let reading_direction_before = self.reading_direction;
                         // AI 処理情報を計算（ホバーバーのファイル情報に表示）
                         let ai_info_model_name: String;
                         let ai_upscale_info = if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
@@ -2829,7 +2845,10 @@ impl App {
                                 panorama_active,
                                 panorama_mode_active,
                                 &mut panorama_pressed,
-                                &mut self.spread_mode, &mut self.spread_popup_open,
+                                &mut self.spread_mode,
+                                &mut self.reading_flow,
+                                &mut self.reading_direction,
+                                &mut self.spread_popup_open,
                                 is_spread_double,
                                 ai_upscale_info,
                                 &mut self.adjustment_mode,
@@ -2950,20 +2969,27 @@ impl App {
 
                         // ホバーバーのポップアップからモードが変更された場合
                         if self.spread_mode != spread_before {
-                            if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
-                                let _ = db.set(folder, self.spread_mode, self.settings.default_spread_mode);
+                            self.update_reading_direction_from_spread_mode(self.spread_mode);
+                            self.persist_current_spread_mode();
+                            if !self.reading_flow.is_paged() {
+                                self.reset_continuous_reading_transform();
+                                self.disable_non_paged_fullscreen_modes(fs_idx);
                             }
-                            if self.spread_mode.is_vertical() {
-                                self.fs_vertical_scroll = 0.0;
-                                self.fs_pan = egui::Vec2::ZERO;
-                                self.fs_free_rotation = 0.0;
-                            }
-                            self.fs_vertical_cache_keep_set.clear();
-                            if (self.spread_mode.is_spread() || self.spread_mode.is_vertical()) && self.analysis_mode {
+                            if self.spread_mode.is_spread() && self.analysis_mode {
                                 self.reset_analysis_mode();
                             }
                             self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
                             self.normalize_spread_position(ctx);
+                        }
+                        if self.reading_flow != reading_flow_before
+                            || self.reading_direction != reading_direction_before
+                        {
+                            self.reset_continuous_reading_transform();
+                            if !self.reading_flow.is_paged() {
+                                self.disable_non_paged_fullscreen_modes(fs_idx);
+                            }
+                            self.persist_current_reading_flow();
+                            ctx.request_repaint();
                         }
                     });
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
@@ -4130,10 +4156,10 @@ impl App {
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown));
         let ctrl_page_up =
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp));
-        let vertical_mode_for_page_keys = self.spread_mode.is_vertical();
-        let page_down = vertical_mode_for_page_keys
+        let continuous_mode_for_page_keys = !self.reading_flow.is_paged();
+        let page_down = continuous_mode_for_page_keys
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown));
-        let page_up = vertical_mode_for_page_keys
+        let page_up = continuous_mode_for_page_keys
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp));
         // マウス戻る/進む (Extra1/Extra2 = native XButton) を Ctrl+↑/↓ と等価に扱う。
         let mouse_back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
@@ -4217,6 +4243,7 @@ impl App {
         //   / I (メタデータ) / C 系 (比較)
         // - 抑止しない: V (= 360 を抜ける手段)、Esc / 矢印 / Wheel / F1-F5 / BS (= ナビ・レーティング)
         let pano_active_now = self.is_panorama_mode_active(fs_idx);
+        let continuous_reading = !self.reading_flow.is_paged();
         let key_z = key_z && !pano_active_now;
         let key_s = key_s && !pano_active_now;
         let key_e = key_e && !pano_active_now;
@@ -4228,6 +4255,13 @@ impl App {
         let key_compare_alt_c = key_compare_alt_c && !pano_active_now;
         let key_compare_shift_c = key_compare_shift_c && !pano_active_now;
         let key_compare_c = key_compare_c && !pano_active_now;
+        let key_z = key_z && !continuous_reading;
+        let key_e = key_e && !continuous_reading;
+        let key_v_panorama = key_v_panorama && !continuous_reading;
+        let key_compare_x = key_compare_x && !continuous_reading;
+        let key_compare_alt_c = key_compare_alt_c && !continuous_reading;
+        let key_compare_shift_c = key_compare_shift_c && !continuous_reading;
+        let key_compare_c = key_compare_c && !continuous_reading;
         // P: 現在表示中アイテムを親コンテナの代表サムネに固定 / 解除。
         // 動画フルスクリーンの P は handle_video_input が先に「現在フレームをピン留め」として
         // consume するため、ここでは静止画系アイテムだけを対象にする。
@@ -4372,7 +4406,7 @@ impl App {
         // 消しゴムモード中は ui_erase が先に Ctrl+Z を吸収する。
         self.handle_meta_undo_keys(ctx);
 
-        // 表示モード切替 (1-6 キー)
+        // ページ構成 (1-5) / 連結方式 (6) 切替
         let key_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num1));
         let key_2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num2));
         let key_3 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num3));
@@ -4429,8 +4463,6 @@ impl App {
             Some(SpreadMode::Rtl)
         } else if key_5 {
             Some(SpreadMode::RtlCover)
-        } else if key_6 {
-            Some(SpreadMode::Vertical)
         } else {
             None
         };
@@ -4438,20 +4470,18 @@ impl App {
         if let Some(mode) = new_spread {
             if mode != self.spread_mode {
                 self.spread_mode = mode;
+                self.update_reading_direction_from_spread_mode(mode);
                 self.spread_popup_open = false;
                 self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
-                if mode.is_vertical() {
-                    self.fs_vertical_scroll = 0.0;
-                    self.fs_pan = egui::Vec2::ZERO;
-                    self.fs_free_rotation = 0.0;
+                if !self.reading_flow.is_paged() {
+                    self.reset_continuous_reading_transform();
+                    self.disable_non_paged_fullscreen_modes(fs_idx);
                 }
-                self.fs_vertical_cache_keep_set.clear();
                 // DB に保存
-                if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
-                    let _ = db.set(folder, mode, self.settings.default_spread_mode);
-                }
+                self.persist_current_spread_mode();
+                self.persist_current_reading_flow();
                 // 分析モードを解除 (post-filter バイパスも戻す)
-                if (mode.is_spread() || mode.is_vertical()) && self.analysis_mode {
+                if mode.is_spread() && self.analysis_mode {
                     self.reset_analysis_mode();
                 }
                 // ページ位置を正規化
@@ -4466,17 +4496,20 @@ impl App {
                 3
             } else if key_4 {
                 4
-            } else if key_5 {
-                5
             } else {
-                6
+                5
             };
             self.show_feedback_toast(format!("[{}:{}]", key_num, mode.label()));
+        }
+        if key_6 {
+            let flow = self.reading_flow.next();
+            self.set_reading_flow_for_fullscreen(ctx, fs_idx, flow);
+            self.show_feedback_toast(format!("[6:{}]", flow.label()));
         }
 
         // U キー: AI アップスケールモデルをサイクル
         // 現在効いているスコープ (個別 > お気に入り標準 > 標準) を書き換える。
-        if key_u || key_u_shift || key_u_alt {
+        if (key_u || key_u_shift || key_u_alt) && self.reading_flow.is_paged() {
             let mut params = self.effective_params(fs_idx).clone();
             let items =
                 crate::adjustment::upscale_menu_items_for_mode(self.settings.ai_feature_mode);
@@ -4536,7 +4569,7 @@ impl App {
         }
 
         // N キー: AI デノイズをトグル
-        if key_n {
+        if key_n && self.reading_flow.is_paged() {
             if !self.settings.ai_feature_mode.allows_denoise() {
                 self.show_feedback_toast(format!(
                     "[N:デノイズ無効]\nAI 機能: {}",
@@ -4562,7 +4595,7 @@ impl App {
 
         // T / Shift+T / Alt+T: ポストフィルタの次/前/なしへ切替。
         // AI 再実行は発生させないため色調キャッシュのみクリア。
-        if key_t || key_t_shift || key_t_alt {
+        if (key_t || key_t_shift || key_t_alt) && self.reading_flow.is_paged() {
             let scope = self.resolve_adjust_scope(fs_idx);
             let mut params = self.effective_params(fs_idx).clone();
             let all = crate::adjustment::PostFilter::ALL;
@@ -4594,7 +4627,7 @@ impl App {
 
         // Ctrl+数字キー: 保存スロットを現在ページに適用 (= ページ個別化)
         for (slot_idx, &pressed) in slot_keys.iter().enumerate() {
-            if pressed {
+            if pressed && self.reading_flow.is_paged() {
                 self.capture_adjust_full(
                     format!(
                         "スロット{}を適用",
@@ -4606,7 +4639,7 @@ impl App {
         }
 
         // Ctrl+Backspace: 個別設定があれば解除、なければフィードバックのみ
-        if clear_page_key {
+        if clear_page_key && self.reading_flow.is_paged() {
             if self.adjustment_page_params.contains_key(&fs_idx) {
                 self.capture_adjust_full("個別設定の解除".to_string(), |app| {
                     app.clear_page_params(fs_idx)
@@ -4749,6 +4782,7 @@ impl App {
             && !self.analysis_mode
             && !self.adjustment_mode
             && !self.erase_mode
+            && self.reading_flow.is_paged()
             && !is_video_fs
         {
             self.enter_conceal_mode(fs_idx);
@@ -4762,6 +4796,7 @@ impl App {
             && !self.adjustment_mode
             && !self.erase_mode
             && !self.conceal_mode
+            && self.reading_flow.is_paged()
             && !is_video_fs
         {
             self.enter_text_mode(fs_idx);
@@ -4825,16 +4860,32 @@ impl App {
         // ── ナビゲーション ──
         // RTL モードでは左右キーの意味を反転
         let rtl = self.spread_mode.is_rtl();
-        let vertical_reading = self.spread_mode.is_vertical();
-        if vertical_reading {
+        let vertical_reading = self.reading_flow.is_vertical();
+        let horizontal_reading = self.reading_flow.is_horizontal();
+        if vertical_reading || horizontal_reading {
             let mut scroll_delta = 0.0;
-            if arrow_down && !ctrl_d {
-                scroll_delta += VERTICAL_READING_SCROLL_STEP_PX;
+            if vertical_reading {
+                if arrow_down && !ctrl_d {
+                    scroll_delta += VERTICAL_READING_SCROLL_STEP_PX;
+                }
+                if arrow_up && !ctrl_u {
+                    scroll_delta -= VERTICAL_READING_SCROLL_STEP_PX;
+                }
+            } else {
+                let axis_rtl = self.reading_direction == ReadingDirection::Rtl;
+                if ((arrow_right && !axis_rtl) || (arrow_left && axis_rtl)) && !ctrl_d {
+                    scroll_delta += VERTICAL_READING_SCROLL_STEP_PX;
+                }
+                if ((arrow_left && !axis_rtl) || (arrow_right && axis_rtl)) && !ctrl_u {
+                    scroll_delta -= VERTICAL_READING_SCROLL_STEP_PX;
+                }
             }
-            if arrow_up && !ctrl_u {
-                scroll_delta -= VERTICAL_READING_SCROLL_STEP_PX;
-            }
-            let page_step = ctx.content_rect().height() * VERTICAL_READING_PAGE_SCROLL_FRAC;
+            let viewport = ctx.content_rect();
+            let page_step = if horizontal_reading {
+                viewport.width()
+            } else {
+                viewport.height()
+            } * VERTICAL_READING_PAGE_SCROLL_FRAC;
             if page_down {
                 scroll_delta += page_step;
             }
@@ -4843,10 +4894,20 @@ impl App {
             }
             self.scroll_vertical_reading_by(ctx, scroll_delta);
         }
-        let nav_next =
-            (arrow_right && !rtl) || (arrow_left && rtl) || (!vertical_reading && arrow_down);
-        let nav_prev =
-            (arrow_left && !rtl) || (arrow_right && rtl) || (!vertical_reading && arrow_up);
+        let nav_next = if vertical_reading {
+            (arrow_right && !rtl) || (arrow_left && rtl)
+        } else if horizontal_reading {
+            arrow_down
+        } else {
+            (arrow_right && !rtl) || (arrow_left && rtl) || arrow_down
+        };
+        let nav_prev = if vertical_reading {
+            (arrow_left && !rtl) || (arrow_right && rtl)
+        } else if horizontal_reading {
+            arrow_up
+        } else {
+            (arrow_left && !rtl) || (arrow_right && rtl) || arrow_up
+        };
 
         // 矢印キーでのフォルダ内移動はスライドショーを止めない (ホイール / クリックと統一)。
         // 一部スキップしつつスライドショーを継続できる。フォルダをまたぐ Ctrl+↑↓ や
@@ -4869,9 +4930,9 @@ impl App {
                     // フォルダ単位で永続化 (spread_db)。new_idx は新モードでペア先頭なので
                     // normalize は no-op。
                     self.spread_mode = new_mode;
-                    if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
-                        let _ = db.set(folder, new_mode, self.settings.default_spread_mode);
-                    }
+                    self.update_reading_direction_from_spread_mode(new_mode);
+                    self.persist_current_spread_mode();
+                    self.persist_current_reading_flow();
                     self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
                     action.jump_to = Some(new_idx);
                     self.show_feedback_toast("見開きを1ページずらしました".to_string());
@@ -5155,7 +5216,7 @@ impl App {
                         })
                         .unwrap_or(false)
                 });
-            if edge_hover && !self.analysis_mode {
+            if edge_hover && !self.analysis_mode && self.reading_flow.is_paged() {
                 self.adjustment_mode = true;
             } else if !cursor_in_panel
                 && !edge_hover
@@ -5228,7 +5289,7 @@ impl App {
                 // 2026-05 ユーザー要望: 拡大縮小のつもりでホイールを回して画像が切り替
                 // わる事故を避けるため、360 ON 時はホイール全部 (= 修飾キー無視) を
                 // FOV 操作に振る。前後ナビは矢印キーで行う。
-            } else if self.spread_mode.is_vertical()
+            } else if !self.reading_flow.is_paged()
                 && !ctrl_held
                 && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
                 && self
@@ -5313,7 +5374,7 @@ impl App {
             let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
 
             // 見開き 2 ページ表示中はフリー回転が描画に反映されないため、Ctrl+ドラッグ回転を無効化する
-            if mods.ctrl && !is_spread_double && !self.spread_mode.is_vertical() {
+            if mods.ctrl && !is_spread_double && self.reading_flow.is_paged() {
                 // Ctrl+ドラッグ → 回転
                 if primary_pressed {
                     if let Some(pos) = pointer_pos {
@@ -6263,6 +6324,98 @@ impl App {
         self.scroll_vertical_reading_by(ctx, direction * VERTICAL_READING_SCROLL_STEP_PX);
     }
 
+    pub(crate) fn persist_current_spread_mode(&self) {
+        if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
+            let _ = db.set(
+                folder,
+                self.spread_mode,
+                self.settings.default_spread_mode,
+                self.settings.default_reading_flow,
+                self.settings.default_reading_direction,
+            );
+        }
+    }
+
+    pub(crate) fn persist_current_reading_flow(&self) {
+        if let (Some(db), Some(folder)) = (&self.spread_db, &self.current_folder) {
+            let _ = db.set_flow(
+                folder,
+                self.reading_flow,
+                self.reading_direction,
+                self.settings.default_spread_mode,
+                self.settings.default_reading_flow,
+                self.settings.default_reading_direction,
+            );
+        }
+    }
+
+    pub(crate) fn reset_continuous_reading_transform(&mut self) {
+        self.fs_vertical_scroll = 0.0;
+        self.fs_pan = egui::Vec2::ZERO;
+        self.fs_free_rotation = 0.0;
+        self.fs_vertical_cache_keep_set.clear();
+    }
+
+    pub(crate) fn disable_non_paged_fullscreen_modes(&mut self, fs_idx: usize) {
+        self.compare_view_mode = crate::app::CompareViewMode::Off;
+        if self.is_panorama_mode_active(fs_idx) {
+            self.toggle_panorama_mode(fs_idx);
+        }
+        if self.analysis_mode {
+            self.reset_analysis_mode();
+        }
+        self.adjustment_mode = false;
+        if self.erase_mode {
+            self.reset_erase_mode();
+        }
+        if self.conceal_mode {
+            self.reset_conceal_mode();
+        }
+        if self.text_mode {
+            self.text_spread_ctx = None;
+            self.reset_text_mode();
+        }
+        if self.export_crop_mode {
+            self.export_crop_spread_ctx = None;
+            self.reset_export_crop_mode();
+        }
+        self.local_adjust_mode = false;
+        self.local_adjust_add_layer_dialog_open = false;
+        self.local_adjust_change_mask_dialog_open = false;
+        self.local_adjust_change_mask_keep_manual_override = true;
+        self.local_adjust_effect_picker_dialog_open = false;
+        self.local_adjust_canvas_drag = None;
+        self.local_adjust_mask_brush_stroke = None;
+        self.local_adjust_mask_lasso_points.clear();
+        self.local_adjust_selected_shape = None;
+    }
+
+    pub(crate) fn set_reading_flow_for_fullscreen(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        flow: ReadingFlow,
+    ) {
+        if flow == self.reading_flow {
+            return;
+        }
+        self.reading_flow = flow;
+        self.reset_continuous_reading_transform();
+        if !flow.is_paged() {
+            self.disable_non_paged_fullscreen_modes(fs_idx);
+        }
+        self.persist_current_reading_flow();
+        ctx.request_repaint();
+    }
+
+    pub(crate) fn update_reading_direction_from_spread_mode(&mut self, mode: SpreadMode) {
+        if mode.is_rtl() {
+            self.reading_direction = ReadingDirection::Rtl;
+        } else if matches!(mode, SpreadMode::Ltr | SpreadMode::LtrCover) {
+            self.reading_direction = ReadingDirection::Ltr;
+        }
+    }
+
     fn vertical_reading_supported_idx(&self, idx: usize) -> bool {
         matches!(
             self.items.get(idx),
@@ -6272,10 +6425,80 @@ impl App {
         )
     }
 
-    fn vertical_reading_indices_and_pos(&self, idx: usize) -> Option<(Vec<usize>, usize)> {
+    fn continuous_reading_units_and_pos(
+        &self,
+        idx: usize,
+    ) -> Option<(Vec<ContinuousReadingUnitSpec>, usize)> {
         let image_indices = build_image_reading_indices(&self.items, &self.visible_indices);
-        let pos = image_indices.iter().position(|&i| i == idx)?;
-        Some((image_indices, pos))
+        let mut units = Vec::new();
+
+        if self.spread_mode.is_spread() {
+            let pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
+            let mut pos = 0usize;
+            while pos < image_indices.len() {
+                let current = image_indices[pos];
+                if (pair_start == 1 && pos == 0)
+                    || is_landscape(current, &self.fs_cache, &self.thumbnails)
+                {
+                    units.push(ContinuousReadingUnitSpec {
+                        anchor_idx: current,
+                        pages: vec![current],
+                    });
+                    pos += 1;
+                    continue;
+                }
+
+                if (pos - pair_start) % 2 != 0 {
+                    units.push(ContinuousReadingUnitSpec {
+                        anchor_idx: current,
+                        pages: vec![current],
+                    });
+                    pos += 1;
+                    continue;
+                }
+
+                let Some(&partner) = image_indices.get(pos + 1) else {
+                    units.push(ContinuousReadingUnitSpec {
+                        anchor_idx: current,
+                        pages: vec![current],
+                    });
+                    pos += 1;
+                    continue;
+                };
+                if is_landscape(partner, &self.fs_cache, &self.thumbnails) {
+                    units.push(ContinuousReadingUnitSpec {
+                        anchor_idx: current,
+                        pages: vec![current],
+                    });
+                    pos += 1;
+                    continue;
+                }
+
+                let pages = if self.spread_mode.is_rtl() {
+                    vec![partner, current]
+                } else {
+                    vec![current, partner]
+                };
+                units.push(ContinuousReadingUnitSpec {
+                    anchor_idx: current,
+                    pages,
+                });
+                pos += 2;
+            }
+        } else {
+            units.extend(
+                image_indices
+                    .iter()
+                    .copied()
+                    .map(|idx| ContinuousReadingUnitSpec {
+                        anchor_idx: idx,
+                        pages: vec![idx],
+                    }),
+            );
+        }
+
+        let pos = units.iter().position(|unit| unit.pages.contains(&idx))?;
+        Some((units, pos))
     }
 
     fn vertical_reading_base_size(&mut self, idx: usize, fallback: egui::Vec2) -> egui::Vec2 {
@@ -6322,16 +6545,75 @@ impl App {
         }
     }
 
-    fn vertical_reading_page_size_for_width(
+    fn continuous_unit_base_size(
         &mut self,
-        idx: usize,
-        target_width: f32,
+        unit: &ContinuousReadingUnitSpec,
         fallback: egui::Vec2,
-    ) -> VerticalReadingSize {
-        let base = self.vertical_reading_base_size(idx, fallback);
-        let width = target_width.max(1.0);
-        let height = (base.y * (width / base.x.max(1.0))).max(1.0);
-        VerticalReadingSize { idx, width, height }
+    ) -> ContinuousReadingUnitSize {
+        let mut page_bases = unit
+            .pages
+            .iter()
+            .copied()
+            .map(|idx| {
+                let base = self.vertical_reading_base_size(idx, fallback);
+                ContinuousReadingPageSize {
+                    idx,
+                    width: base.x.max(1.0),
+                    height: base.y.max(1.0),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if page_bases.len() <= 1 {
+            let page = page_bases.pop().unwrap_or(ContinuousReadingPageSize {
+                idx: unit.anchor_idx,
+                width: fallback.x.max(1.0),
+                height: fallback.y.max(1.0),
+            });
+            return ContinuousReadingUnitSize {
+                width: page.width,
+                height: page.height,
+                pages: vec![page],
+            };
+        }
+
+        let combined_h = page_bases
+            .iter()
+            .map(|page| page.height)
+            .fold(1.0_f32, f32::max);
+        let mut combined_w = 0.0;
+        for page in &mut page_bases {
+            page.width *= combined_h / page.height.max(1.0);
+            page.height = combined_h;
+            combined_w += page.width;
+        }
+        ContinuousReadingUnitSize {
+            pages: page_bases,
+            width: combined_w.max(1.0),
+            height: combined_h.max(1.0),
+        }
+    }
+
+    fn continuous_unit_size_for_flow(
+        &mut self,
+        unit: &ContinuousReadingUnitSpec,
+        flow: crate::settings::ReadingFlow,
+        target_cross: f32,
+        fallback: egui::Vec2,
+    ) -> ContinuousReadingUnitSize {
+        let mut base = self.continuous_unit_base_size(unit, fallback);
+        let scale = if flow.is_horizontal() {
+            target_cross.max(1.0) / base.height.max(1.0)
+        } else {
+            target_cross.max(1.0) / base.width.max(1.0)
+        };
+        base.width = (base.width * scale).max(1.0);
+        base.height = (base.height * scale).max(1.0);
+        for page in &mut base.pages {
+            page.width = (page.width * scale).max(1.0);
+            page.height = (page.height * scale).max(1.0);
+        }
+        base
     }
 
     fn vertical_reading_loaded_texels(&self, idx: usize) -> usize {
@@ -6351,50 +6633,80 @@ impl App {
         }
     }
 
-    fn vertical_reading_layout(
+    fn continuous_visible_page_count(
+        units: &[ContinuousReadingUnitSpec],
+        visible_positions: &[usize],
+    ) -> usize {
+        visible_positions
+            .iter()
+            .filter_map(|&pos| units.get(pos))
+            .map(|unit| unit.pages.len())
+            .sum()
+    }
+
+    fn continuous_reading_layout(
         &mut self,
         ctx: &egui::Context,
         image_rect: egui::Rect,
-        image_indices: &[usize],
+        units: &[ContinuousReadingUnitSpec],
         current_pos: usize,
     ) -> Option<(Vec<VerticalReadingPage>, Vec<usize>, Vec<f32>)> {
-        if image_indices.is_empty() || current_pos >= image_indices.len() {
+        if units.is_empty() || current_pos >= units.len() {
             return None;
         }
+        let flow = self.reading_flow;
         let fallback = egui::vec2(image_rect.width().max(1.0), image_rect.height().max(1.0));
+        let viewport_len = if flow.is_horizontal() {
+            image_rect.width().max(1.0)
+        } else {
+            image_rect.height().max(1.0)
+        };
         let mut zoom = self.fs_zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         let mut sizes = Vec::new();
         let mut offsets = Vec::new();
         let mut visible_positions = Vec::new();
 
         for _ in 0..8 {
-            let page_width = (image_rect.width() * zoom).max(1.0);
-            sizes.clear();
-            for &idx in image_indices {
-                sizes.push(self.vertical_reading_page_size_for_width(idx, page_width, fallback));
+            let target_cross = if flow.is_horizontal() {
+                image_rect.height() * zoom
+            } else {
+                image_rect.width() * zoom
             }
-            let heights = sizes.iter().map(|s| s.height).collect::<Vec<_>>();
-            offsets = vertical_reading_offsets(&heights, VERTICAL_READING_GAP_PX, current_pos);
+            .max(1.0);
+            sizes.clear();
+            for unit in units {
+                sizes.push(self.continuous_unit_size_for_flow(unit, flow, target_cross, fallback));
+            }
+            let extents = sizes
+                .iter()
+                .map(|s| {
+                    if flow.is_horizontal() {
+                        s.width
+                    } else {
+                        s.height
+                    }
+                })
+                .collect::<Vec<_>>();
+            offsets = vertical_reading_offsets(&extents, VERTICAL_READING_GAP_PX, current_pos);
             self.fs_vertical_scroll = clamp_vertical_reading_scroll(
                 self.fs_vertical_scroll,
                 &offsets,
-                &heights,
-                image_rect.height().max(1.0),
+                &extents,
+                viewport_len,
             );
             visible_positions = vertical_reading_visible_positions(
                 &offsets,
-                &heights,
+                &extents,
                 self.fs_vertical_scroll,
-                image_rect.height().max(1.0),
+                viewport_len,
             );
-            if visible_positions.len() <= VERTICAL_READING_MAX_VISIBLE_PAGES || zoom >= ZOOM_MAX {
+            let visible_pages = Self::continuous_visible_page_count(units, &visible_positions);
+            if visible_pages <= VERTICAL_READING_MAX_VISIBLE_PAGES || zoom >= ZOOM_MAX {
                 break;
             }
-            let factor = ((visible_positions.len() as f32
-                / VERTICAL_READING_MAX_VISIBLE_PAGES as f32)
-                .sqrt()
-                * 1.05)
-                .max(1.05);
+            let factor =
+                ((visible_pages as f32 / VERTICAL_READING_MAX_VISIBLE_PAGES as f32).sqrt() * 1.05)
+                    .max(1.05);
             zoom = (zoom * factor).min(ZOOM_MAX);
         }
 
@@ -6403,82 +6715,149 @@ impl App {
             ctx.request_repaint();
         }
 
-        if visible_positions.len() > VERTICAL_READING_MAX_VISIBLE_PAGES {
-            visible_positions.sort_by(|a, b| {
-                (offsets[*a] - self.fs_vertical_scroll)
-                    .abs()
-                    .partial_cmp(&(offsets[*b] - self.fs_vertical_scroll).abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            visible_positions.truncate(VERTICAL_READING_MAX_VISIBLE_PAGES);
-            visible_positions.sort_unstable();
+        while Self::continuous_visible_page_count(units, &visible_positions)
+            > VERTICAL_READING_MAX_VISIBLE_PAGES
+        {
+            let Some((remove_idx, _)) =
+                visible_positions
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| {
+                        (offsets[**a] - self.fs_vertical_scroll)
+                            .abs()
+                            .partial_cmp(&(offsets[**b] - self.fs_vertical_scroll).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            else {
+                break;
+            };
+            visible_positions.remove(remove_idx);
         }
 
-        let center_x = image_rect.center().x + self.fs_pan.x;
-        let pages = visible_positions
-            .iter()
-            .copied()
-            .filter_map(|list_pos| {
-                let size = sizes.get(list_pos)?;
-                let center_y = image_rect.center().y - self.fs_vertical_scroll + offsets[list_pos];
-                Some(VerticalReadingPage {
-                    idx: size.idx,
-                    rect: egui::Rect::from_center_size(
-                        egui::pos2(center_x, center_y),
-                        egui::vec2(size.width, size.height),
-                    ),
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut pages = Vec::new();
+        for list_pos in visible_positions.iter().copied() {
+            let Some(size) = sizes.get(list_pos) else {
+                continue;
+            };
+            let unit_center = if flow.is_horizontal() {
+                let sign = if self.reading_direction == crate::settings::ReadingDirection::Rtl {
+                    -1.0
+                } else {
+                    1.0
+                };
+                egui::pos2(
+                    image_rect.center().x + sign * (offsets[list_pos] - self.fs_vertical_scroll),
+                    image_rect.center().y + self.fs_pan.y,
+                )
+            } else {
+                egui::pos2(
+                    image_rect.center().x + self.fs_pan.x,
+                    image_rect.center().y - self.fs_vertical_scroll + offsets[list_pos],
+                )
+            };
+            let unit_rect =
+                egui::Rect::from_center_size(unit_center, egui::vec2(size.width, size.height));
+            let mut x = unit_rect.min.x;
+            for page in &size.pages {
+                let rect = if size.pages.len() == 1 {
+                    unit_rect
+                } else {
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(x, unit_rect.min.y),
+                        egui::vec2(page.width, page.height),
+                    );
+                    x += page.width;
+                    rect
+                };
+                pages.push(VerticalReadingPage {
+                    idx: page.idx,
+                    rect,
+                });
+            }
+        }
 
         Some((pages, visible_positions, offsets))
     }
 
-    fn update_vertical_reading_prefetch_window(
+    fn update_continuous_reading_prefetch_window(
         &mut self,
-        image_indices: &[usize],
+        units: &[ContinuousReadingUnitSpec],
         visible_positions: &[usize],
     ) {
-        if image_indices.is_empty() {
+        if units.is_empty() {
             return;
         }
         let current_pos = self
             .fullscreen_idx
-            .and_then(|idx| image_indices.iter().position(|&i| i == idx))
-            .unwrap_or_else(|| visible_positions.first().copied().unwrap_or(0));
+            .and_then(|idx| units.iter().position(|unit| unit.pages.contains(&idx)))
+            .unwrap_or_else(|| visible_positions.first().copied().unwrap_or(0))
+            .min(units.len() - 1);
+        let mut visible_positions = visible_positions
+            .iter()
+            .copied()
+            .filter(|&pos| pos < units.len())
+            .collect::<Vec<_>>();
+        if visible_positions.is_empty() {
+            visible_positions.push(current_pos);
+        }
+        visible_positions.sort_unstable();
+        visible_positions.dedup();
+
         let first_visible = visible_positions
             .first()
             .copied()
             .unwrap_or(current_pos)
-            .min(image_indices.len() - 1);
+            .min(units.len() - 1);
         let last_visible = visible_positions
             .last()
             .copied()
             .unwrap_or(current_pos)
-            .min(image_indices.len() - 1);
+            .min(units.len() - 1);
         let keep_start = first_visible.saturating_sub(VERTICAL_READING_PREFETCH_PAD);
-        let keep_end = (last_visible + VERTICAL_READING_PREFETCH_PAD).min(image_indices.len() - 1);
+        let keep_end = (last_visible + VERTICAL_READING_PREFETCH_PAD).min(units.len() - 1);
         let center_pos = (first_visible + last_visible) as f32 * 0.5;
-        let mut keep_positions = (keep_start..=keep_end).collect::<Vec<_>>();
-        if keep_positions.len() > VERTICAL_READING_MAX_CACHE_PAGES {
-            keep_positions.sort_by(|a, b| {
-                (*a as f32 - center_pos)
-                    .abs()
-                    .partial_cmp(&(*b as f32 - center_pos).abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            keep_positions.truncate(VERTICAL_READING_MAX_CACHE_PAGES);
-            keep_positions.sort_unstable();
-        }
-
         let visible_set = visible_positions
             .iter()
             .copied()
             .collect::<std::collections::HashSet<_>>();
-        let mut keep_set = keep_positions
-            .iter()
-            .map(|&pos| image_indices[pos])
-            .collect::<std::collections::HashSet<_>>();
+
+        let mut candidates = (keep_start..=keep_end).collect::<Vec<_>>();
+        candidates.sort_by(|a, b| {
+            let a_visible = visible_set.contains(a);
+            let b_visible = visible_set.contains(b);
+            b_visible.cmp(&a_visible).then_with(|| {
+                (*a as f32 - center_pos)
+                    .abs()
+                    .partial_cmp(&(*b as f32 - center_pos).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+
+        let mut keep_positions = Vec::new();
+        let mut keep_page_count = 0usize;
+        for pos in candidates {
+            let page_count = units[pos].pages.len();
+            if visible_set.contains(&pos)
+                || keep_page_count + page_count <= VERTICAL_READING_MAX_CACHE_PAGES
+            {
+                keep_page_count += page_count;
+                keep_positions.push(pos);
+            }
+        }
+        keep_positions.sort_unstable();
+
+        let mut keep_set = std::collections::HashSet::new();
+        for &pos in &keep_positions {
+            keep_set.extend(units[pos].pages.iter().copied());
+        }
+        if keep_set.is_empty() {
+            keep_set.extend(units[current_pos].pages.iter().copied());
+        }
+        if let Some(current_idx) = self.fullscreen_idx {
+            if units[current_pos].pages.contains(&current_idx) {
+                keep_set.insert(current_idx);
+            }
+        }
 
         let mut loaded_texels: usize = keep_set
             .iter()
@@ -6497,16 +6876,28 @@ impl App {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             for pos in removable {
-                let idx = image_indices[pos];
-                if keep_set.remove(&idx) {
-                    loaded_texels =
-                        loaded_texels.saturating_sub(self.vertical_reading_loaded_texels(idx));
-                    if loaded_texels <= VERTICAL_READING_MAX_CACHE_TEXELS {
-                        break;
+                for &idx in &units[pos].pages {
+                    if keep_set.remove(&idx) {
+                        loaded_texels =
+                            loaded_texels.saturating_sub(self.vertical_reading_loaded_texels(idx));
                     }
+                }
+                if loaded_texels <= VERTICAL_READING_MAX_CACHE_TEXELS {
+                    break;
                 }
             }
         }
+
+        let mut keep_positions_for_load = keep_positions
+            .iter()
+            .copied()
+            .filter(|&pos| units[pos].pages.iter().any(|idx| keep_set.contains(idx)))
+            .collect::<Vec<_>>();
+        if keep_positions_for_load.is_empty() {
+            keep_positions_for_load.push(current_pos);
+        }
+        keep_positions_for_load.sort_unstable();
+        keep_positions_for_load.dedup();
 
         self.fs_vertical_cache_keep_set = keep_set.clone();
         self.evict_final_pipeline_cache_for_keep_set(&keep_set);
@@ -6516,7 +6907,7 @@ impl App {
         self.fs_cache
             .retain(|k, v| keep_set.contains(k) || matches!(v, FsCacheEntry::Video { .. }));
 
-        let current_idx = self.fullscreen_idx.unwrap_or(image_indices[current_pos]);
+        let current_idx = self.fullscreen_idx.unwrap_or(units[current_pos].anchor_idx);
         let current_loading =
             keep_set.contains(&current_idx) && !self.fs_cache.contains_key(&current_idx);
         let to_cancel = self
@@ -6537,18 +6928,31 @@ impl App {
             self.fs_early_dims.remove(&idx);
         }
         if current_loading {
+            if !self.fs_pending.contains_key(&current_idx) {
+                self.start_fs_load(current_idx);
+            }
             return;
         }
 
-        let mut targets = keep_positions;
+        let mut targets = Vec::new();
+        for pos in keep_positions_for_load {
+            for &idx in &units[pos].pages {
+                if keep_set.contains(&idx) {
+                    targets.push((pos, idx));
+                }
+            }
+        }
         targets.sort_by(|a, b| {
-            (*a as f32 - current_pos as f32)
-                .abs()
-                .partial_cmp(&(*b as f32 - current_pos as f32).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let a_current = a.1 != current_idx;
+            let b_current = b.1 != current_idx;
+            a_current.cmp(&b_current).then_with(|| {
+                (a.0 as f32 - current_pos as f32)
+                    .abs()
+                    .partial_cmp(&(b.0 as f32 - current_pos as f32).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
-        for pos in targets {
-            let idx = image_indices[pos];
+        for (_, idx) in targets {
             if keep_set.contains(&idx)
                 && !self.fs_cache.contains_key(&idx)
                 && !self.fs_pending.contains_key(&idx)
@@ -6573,13 +6977,24 @@ impl App {
         image_rect: egui::Rect,
     ) -> std::collections::HashSet<usize> {
         let mut candidates = pages.iter().collect::<Vec<_>>();
+        let horizontal = self.reading_flow.is_horizontal();
+        let center = image_rect.center();
         candidates.sort_by(|a, b| {
             let a_current = a.idx != current_idx;
             let b_current = b.idx != current_idx;
+            let a_dist = if horizontal {
+                (a.rect.center().x - center.x).abs()
+            } else {
+                (a.rect.center().y - center.y).abs()
+            };
+            let b_dist = if horizontal {
+                (b.rect.center().x - center.x).abs()
+            } else {
+                (b.rect.center().y - center.y).abs()
+            };
             a_current.cmp(&b_current).then_with(|| {
-                (a.rect.center().y - image_rect.center().y)
-                    .abs()
-                    .partial_cmp(&(b.rect.center().y - image_rect.center().y).abs())
+                a_dist
+                    .partial_cmp(&b_dist)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
         });
@@ -6597,7 +7012,7 @@ impl App {
         process
     }
 
-    fn draw_fs_vertical_reading(
+    fn draw_fs_continuous_reading(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
@@ -6605,18 +7020,17 @@ impl App {
         fs_idx: usize,
         original_preview_active: bool,
     ) {
-        let Some((image_indices, current_pos)) = self.vertical_reading_indices_and_pos(fs_idx)
-        else {
+        let Some((units, current_pos)) = self.continuous_reading_units_and_pos(fs_idx) else {
             self.fs_spread_layout = None;
             return;
         };
         let Some((pages, visible_positions, offsets)) =
-            self.vertical_reading_layout(ctx, image_rect, &image_indices, current_pos)
+            self.continuous_reading_layout(ctx, image_rect, &units, current_pos)
         else {
             self.fs_spread_layout = None;
             return;
         };
-        self.update_vertical_reading_prefetch_window(&image_indices, &visible_positions);
+        self.update_continuous_reading_prefetch_window(&units, &visible_positions);
 
         let bg_tex = if self.fs_transparent_bg_mode == 2 {
             self.ensure_checker_texture(ctx);
@@ -6656,7 +7070,7 @@ impl App {
                 self.resolve_original_preview_tex(page.idx)
                     .or_else(|| self.resolve_fs_display_tex(page.idx, true))
             } else if process_indices.contains(&page.idx) {
-                // 縦読みでも単ページ/見開きと同じ final pipeline を使う。ただし
+                // 連結読みでも単ページ/見開きと同じ final pipeline を使う。ただし
                 // 新規 GPU upload は中央付近から 1 フレームずつ進め、スクロール中の
                 // 大量同期生成を避ける。
                 self.resolve_fs_processed_texture(ctx, page.idx, false)
@@ -6687,23 +7101,40 @@ impl App {
                 holdover_for_locked.as_ref(),
                 display_tex.as_ref(),
             );
-            let gap_y = page.rect.max.y + VERTICAL_READING_GAP_PX * 0.5;
-            painter.line_segment(
-                [
-                    egui::pos2(page.rect.min.x, gap_y),
-                    egui::pos2(page.rect.max.x, gap_y),
-                ],
-                egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
-                ),
+            let stroke = egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
             );
+            if self.reading_flow.is_horizontal() {
+                let gap_x = if self.reading_direction == ReadingDirection::Rtl {
+                    page.rect.min.x - VERTICAL_READING_GAP_PX * 0.5
+                } else {
+                    page.rect.max.x + VERTICAL_READING_GAP_PX * 0.5
+                };
+                painter.line_segment(
+                    [
+                        egui::pos2(gap_x, page.rect.min.y),
+                        egui::pos2(gap_x, page.rect.max.y),
+                    ],
+                    stroke,
+                );
+            } else {
+                let gap_y = page.rect.max.y + VERTICAL_READING_GAP_PX * 0.5;
+                painter.line_segment(
+                    [
+                        egui::pos2(page.rect.min.x, gap_y),
+                        egui::pos2(page.rect.max.x, gap_y),
+                    ],
+                    stroke,
+                );
+            }
         }
 
         if let Some(new_pos) = vertical_reading_nearest_position(&offsets, self.fs_vertical_scroll)
             && new_pos != current_pos
-            && let Some(&new_idx) = image_indices.get(new_pos)
+            && let Some(unit) = units.get(new_pos)
         {
+            let new_idx = unit.anchor_idx;
             self.fs_vertical_scroll =
                 vertical_reading_reanchor_scroll(self.fs_vertical_scroll, &offsets, new_pos);
             self.fullscreen_idx = Some(new_idx);
@@ -8715,6 +9146,8 @@ impl App {
         panorama_mode_active: bool,
         panorama_pressed: &mut bool,
         spread_mode: &mut SpreadMode,
+        reading_flow: &mut ReadingFlow,
+        reading_direction: &mut ReadingDirection,
         spread_popup_open: &mut bool,
         is_spread_double: bool,
         // AI アップスケール後のサイズとモデル名（表示用）。動画モードでは無視される。
@@ -9026,7 +9459,7 @@ impl App {
 
         // 🔬 分析ボタン（見開きダブル中は非表示。動画では意味を持たないため非表示）
         // 360 モード中も非表示。
-        if !is_spread_double && !is_video && !panorama_mode_active {
+        if !is_spread_double && !is_video && !panorama_mode_active && reading_flow.is_paged() {
             let analysis_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -9052,7 +9485,7 @@ impl App {
         // - **360 モード ON 時はボタンを隠す** (× が 360 解除を兼ねるため、
         //   2026-05 ユーザー要望)
         // 元設計 (常時表示 + 強調背景) はユーザーフィードバックで取り下げ。
-        if !is_video && !is_spread_double && !panorama_active {
+        if !is_video && !is_spread_double && !panorama_active && reading_flow.is_paged() {
             let tooltip = match panorama_trigger {
                 Some(crate::panorama::PanoramaTrigger::Auto) => "360° 画像 (XMP 検出) [V]",
                 Some(crate::panorama::PanoramaTrigger::Hint) => {
@@ -9095,7 +9528,7 @@ impl App {
 
         // 📖 表示モードボタン (画像のみ。動画では非表示)
         // 360 モード中も非表示 (360 は強制 Single)。
-        let spread_active = spread_mode.is_spread() || spread_mode.is_vertical();
+        let spread_active = spread_mode.is_spread() || !reading_flow.is_paged();
         let sm = *spread_mode;
         let mut spread_resp_rect = egui::Rect::NOTHING;
         if !is_video && !panorama_mode_active {
@@ -9108,7 +9541,7 @@ impl App {
                 spread_active,
                 |p, c, r| draw_spread_icon(p, c, r, sm),
             );
-            let spread_resp = spread_resp.hover_tip_dark("表示モード [1-6]");
+            let spread_resp = spread_resp.hover_tip_dark("表示モード [1-5] / 連結方式 [6]");
             spread_resp_rect = spread_resp.rect;
             if spread_resp.clicked() {
                 *spread_popup_open = !*spread_popup_open;
@@ -9125,8 +9558,9 @@ impl App {
         if *spread_popup_open && !is_video {
             let popup_x = next_x;
             let popup_y = bar_rect.max.y + 4.0;
-            let popup_w = 200.0_f32;
-            let popup_h = SpreadMode::all().len() as f32 * 36.0 + 8.0;
+            let popup_w = 230.0_f32;
+            let popup_h =
+                (SpreadMode::all().len() + ReadingFlow::all().len() + 2) as f32 * 36.0 + 92.0;
             let popup_rect = egui::Rect::from_min_size(
                 egui::pos2(popup_x, popup_y),
                 egui::vec2(popup_w, popup_h),
@@ -9149,6 +9583,14 @@ impl App {
             );
 
             let mut item_y = popup_rect.min.y + 4.0;
+            ui.painter().text(
+                egui::pos2(popup_rect.min.x + 12.0, item_y + 16.0),
+                egui::Align2::LEFT_CENTER,
+                "ページ構成",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(150),
+            );
+            item_y += 28.0;
             for &mode in SpreadMode::all() {
                 let item_rect = egui::Rect::from_min_size(
                     egui::pos2(popup_rect.min.x + 4.0, item_y),
@@ -9193,6 +9635,104 @@ impl App {
 
                 if item_resp.clicked() {
                     *spread_mode = mode;
+                    if mode.is_rtl() {
+                        *reading_direction = ReadingDirection::Rtl;
+                    } else if matches!(mode, SpreadMode::Ltr | SpreadMode::LtrCover) {
+                        *reading_direction = ReadingDirection::Ltr;
+                    }
+                    *spread_popup_open = false;
+                }
+                item_y += 36.0;
+            }
+
+            ui.painter().text(
+                egui::pos2(popup_rect.min.x + 12.0, item_y + 16.0),
+                egui::Align2::LEFT_CENTER,
+                "連結方式",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(150),
+            );
+            item_y += 28.0;
+            for &flow in ReadingFlow::all() {
+                let item_rect = egui::Rect::from_min_size(
+                    egui::pos2(popup_rect.min.x + 4.0, item_y),
+                    egui::vec2(popup_w - 8.0, 32.0),
+                );
+                let item_resp = ui.interact(
+                    item_rect,
+                    egui::Id::new(format!("reading_flow_popup_{}", flow.to_int())),
+                    egui::Sense::click(),
+                );
+                let is_current = *reading_flow == flow;
+                let bg = if is_current {
+                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                } else if item_resp.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(item_rect, 4.0, bg);
+                ui.painter().text(
+                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    flow.label(),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_gray(220),
+                );
+                ui.painter().text(
+                    egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    if flow == ReadingFlow::Paged {
+                        "[6]"
+                    } else {
+                        "[6循環]"
+                    },
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_gray(140),
+                );
+                if item_resp.clicked() {
+                    *reading_flow = flow;
+                    *spread_popup_open = false;
+                }
+                item_y += 36.0;
+            }
+
+            ui.painter().text(
+                egui::pos2(popup_rect.min.x + 12.0, item_y + 16.0),
+                egui::Align2::LEFT_CENTER,
+                "横方向",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(150),
+            );
+            item_y += 28.0;
+            for &direction in &[ReadingDirection::Ltr, ReadingDirection::Rtl] {
+                let item_rect = egui::Rect::from_min_size(
+                    egui::pos2(popup_rect.min.x + 4.0, item_y),
+                    egui::vec2(popup_w - 8.0, 32.0),
+                );
+                let item_resp = ui.interact(
+                    item_rect,
+                    egui::Id::new(format!("reading_direction_popup_{}", direction.to_int())),
+                    egui::Sense::click(),
+                );
+                let is_current = *reading_direction == direction;
+                let bg = if is_current {
+                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                } else if item_resp.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(item_rect, 4.0, bg);
+                ui.painter().text(
+                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    direction.label(),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_gray(220),
+                );
+                if item_resp.clicked() {
+                    *reading_direction = direction;
                     *spread_popup_open = false;
                 }
                 item_y += 36.0;
@@ -9238,7 +9778,7 @@ impl App {
 
         // 🎨 画像補正パネルトグルボタン (動画では非表示)
         // 補正ボタン (360 モード中は非表示)
-        if !is_video && !panorama_mode_active {
+        if !is_video && !panorama_mode_active && reading_flow.is_paged() {
             let btn_rect = egui::Rect::from_min_size(
                 egui::pos2(next_x, bar_rect.min.y + BAR_BUTTON_MARGIN),
                 egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
