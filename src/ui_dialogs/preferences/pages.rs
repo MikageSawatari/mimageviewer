@@ -2182,7 +2182,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     let s = &mut state.settings;
 
     ui.label(
-        "フルスクリーンで画像を開いたときの初期表示。\n数字キー 1-5 でページ構成、6 で連結方式を切り替えできます。",
+        "フルスクリーンで画像を開いたときの初期表示。\n数字キー 1-5 でページ構成、6 で連結方式、7 で横方向を切り替えできます。",
     );
     ui.add_space(4.0);
     egui::ComboBox::from_label("デフォルトのページ構成")

@@ -3766,6 +3766,53 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.continuous_reading_active_for_idx(99));
     }
 
+    #[test]
+    fn continuous_reading_active_stays_enabled_for_spread_double() {
+        use crate::grid_item::GridItem;
+        use crate::settings::{ReadingFlow, SpreadMode};
+        use crate::ui_fullscreen::SpreadPair;
+        let mut app = setup_app();
+        for name in ["a.jpg", "b.jpg"] {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/p/{name}"
+                ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = vec![0, 1];
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::Ltr;
+        app.reading_flow = ReadingFlow::Vertical;
+        app.fullscreen_idx = Some(0);
+
+        assert_eq!(
+            app.resolve_spread_pair(0),
+            SpreadPair::Double { left: 0, right: 1 }
+        );
+        assert!(app.continuous_reading_active_for_idx(0));
+        assert!(app.continuous_reading_active_for_idx(1));
+    }
+
+    #[test]
+    fn reading_direction_sync_updates_spread_mode_preserving_cover() {
+        use crate::settings::{ReadingDirection, SpreadMode};
+        let mut app = setup_app();
+
+        app.spread_mode = SpreadMode::LtrCover;
+        app.reading_direction = ReadingDirection::Rtl;
+        assert!(app.sync_spread_mode_from_reading_direction());
+        assert_eq!(app.spread_mode, SpreadMode::RtlCover);
+
+        app.reading_direction = ReadingDirection::Ltr;
+        assert!(app.sync_spread_mode_from_reading_direction());
+        assert_eq!(app.spread_mode, SpreadMode::LtrCover);
+
+        app.spread_mode = SpreadMode::Single;
+        app.reading_direction = ReadingDirection::Rtl;
+        assert!(!app.sync_spread_mode_from_reading_direction());
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+    }
+
     /// Ctrl+→ の「1 ページずらし」は、1 回押すごとに見開きが必ず 1 ページぶんずれる。
     /// 固定パリティで「2 回押さないと見た目が変わらない」旧 Shift 挙動のリグレッション防止。
     #[test]

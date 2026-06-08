@@ -2193,6 +2193,14 @@ impl App {
                         let media_t0 = std::time::Instant::now();
                         if let Some(sep) = state.separator_text.as_ref() {
                             Self::draw_fs_separator(ui, image_rect, sep);
+                        } else if self.continuous_reading_active_for_idx(fs_idx) {
+                            self.draw_fs_continuous_reading(
+                                ui,
+                                ctx,
+                                image_rect,
+                                fs_idx,
+                                state.original_preview_active,
+                            );
                         } else {
                             match spread_pair {
                                 SpreadPair::Single => {
@@ -2961,9 +2969,14 @@ impl App {
                         self.draw_export_dialog(ctx);
                         self.draw_export_progress_dialog(ctx);
 
+                        let spread_changed_from_direction =
+                            self.reading_direction != reading_direction_before
+                                && self.sync_spread_mode_from_reading_direction();
                         // ホバーバーのポップアップからモードが変更された場合
                         if self.spread_mode != spread_before {
-                            self.update_reading_direction_from_spread_mode(self.spread_mode);
+                            if !spread_changed_from_direction {
+                                self.update_reading_direction_from_spread_mode(self.spread_mode);
+                            }
                             self.persist_current_spread_mode();
                             if !self.reading_flow.is_paged() {
                                 self.reset_continuous_reading_transform();
@@ -2973,7 +2986,9 @@ impl App {
                                 self.reset_analysis_mode();
                             }
                             self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
-                            self.normalize_spread_position(ctx);
+                            if !spread_changed_from_direction {
+                                self.normalize_spread_position(ctx);
+                            }
                         }
                         if self.reading_flow != reading_flow_before
                             || self.reading_direction != reading_direction_before
@@ -4408,13 +4423,20 @@ impl App {
         // 消しゴムモード中は ui_erase が先に Ctrl+Z を吸収する。
         self.handle_meta_undo_keys(ctx);
 
-        // ページ構成 (1-5) / 連結方式 (6) 切替
+        // ページ構成 (1-5) / 連結方式 (6) / 横方向 (7) 切替
         let key_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num1));
         let key_2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num2));
         let key_3 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num3));
         let key_4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num4));
         let key_5 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num5));
         let key_6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num6));
+        let key_7 = ctx.input_mut(|i| {
+            if i.modifiers.is_none() {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Num7)
+            } else {
+                false
+            }
+        });
 
         // U / Shift+U / Alt+U: AI アップスケールモデル サイクル (次 / 前 / なしリセット)
         // 注意: egui の consume_key は matches_logically で判定されるため、Modifiers::NONE が
@@ -4511,6 +4533,11 @@ impl App {
             let flow = self.reading_flow.next();
             self.set_reading_flow_for_fullscreen(ctx, fs_idx, flow);
             self.show_feedback_toast(format!("[6:{}]", flow.label()));
+        }
+        if key_7 && self.vertical_reading_supported_idx(fs_idx) {
+            let direction = self.reading_direction.next();
+            self.set_reading_direction_for_fullscreen(ctx, fs_idx, direction);
+            self.show_feedback_toast(format!("[7:{}]", direction.label()));
         }
 
         // U キー: AI アップスケールモデルをサイクル
@@ -6438,6 +6465,41 @@ impl App {
         } else if matches!(mode, SpreadMode::Ltr | SpreadMode::LtrCover) {
             self.reading_direction = ReadingDirection::Ltr;
         }
+    }
+
+    pub(crate) fn sync_spread_mode_from_reading_direction(&mut self) -> bool {
+        let new_mode = self
+            .spread_mode
+            .with_reading_direction(self.reading_direction);
+        if new_mode == self.spread_mode {
+            return false;
+        }
+        self.spread_mode = new_mode;
+        self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+        true
+    }
+
+    pub(crate) fn set_reading_direction_for_fullscreen(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        direction: ReadingDirection,
+    ) {
+        let direction_changed = direction != self.reading_direction;
+        self.reading_direction = direction;
+        let spread_changed = self.sync_spread_mode_from_reading_direction();
+        if !direction_changed && !spread_changed {
+            return;
+        }
+        self.reset_continuous_reading_transform();
+        if !self.reading_flow.is_paged() {
+            self.disable_non_paged_fullscreen_modes(fs_idx);
+        }
+        if spread_changed {
+            self.persist_current_spread_mode();
+        }
+        self.persist_current_reading_flow();
+        ctx.request_repaint();
     }
 
     pub(crate) fn vertical_reading_supported_idx(&self, idx: usize) -> bool {
@@ -9585,7 +9647,8 @@ impl App {
                 spread_active,
                 |p, c, r| draw_spread_icon(p, c, r, sm),
             );
-            let spread_resp = spread_resp.hover_tip_dark("表示モード [1-5] / 連結方式 [6]");
+            let spread_resp =
+                spread_resp.hover_tip_dark("表示モード [1-5] / 連結方式 [6] / 横方向 [7]");
             spread_resp_rect = spread_resp.rect;
             if spread_resp.clicked() {
                 *spread_popup_open = !*spread_popup_open;
@@ -9774,6 +9837,13 @@ impl App {
                     direction.label(),
                     egui::FontId::proportional(13.0),
                     egui::Color32::from_gray(220),
+                );
+                ui.painter().text(
+                    egui::pos2(item_rect.max.x - 8.0, item_rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    "[7]",
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_gray(140),
                 );
                 if item_resp.clicked() {
                     *reading_direction = direction;

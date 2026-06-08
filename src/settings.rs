@@ -666,6 +666,19 @@ impl SpreadMode {
             Self::RtlCover,
         ]
     }
+
+    /// 見開きの表紙有無を保ったまま横方向だけを差し替える。
+    ///
+    /// Single / 旧 Vertical は見開き構成ではないため、そのまま返す。
+    pub fn with_reading_direction(self, direction: ReadingDirection) -> Self {
+        match (self, direction) {
+            (Self::Ltr | Self::Rtl, ReadingDirection::Ltr) => Self::Ltr,
+            (Self::Ltr | Self::Rtl, ReadingDirection::Rtl) => Self::Rtl,
+            (Self::LtrCover | Self::RtlCover, ReadingDirection::Ltr) => Self::LtrCover,
+            (Self::LtrCover | Self::RtlCover, ReadingDirection::Rtl) => Self::RtlCover,
+            (mode, _) => mode,
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -760,6 +773,13 @@ impl ReadingDirection {
         match self {
             Self::Ltr => "左→右",
             Self::Rtl => "右→左",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Ltr => Self::Rtl,
+            Self::Rtl => Self::Ltr,
         }
     }
 }
@@ -3234,6 +3254,32 @@ mod tests {
         assert!(s.show_address_bar_folder_pin);
         assert!(!s.first_setup_completed);
         assert_eq!(s.ai_feature_mode, AiFeatureMode::Light);
+    }
+
+    #[test]
+    fn spread_mode_with_reading_direction_preserves_cover_phase() {
+        assert_eq!(
+            SpreadMode::Ltr.with_reading_direction(ReadingDirection::Rtl),
+            SpreadMode::Rtl
+        );
+        assert_eq!(
+            SpreadMode::Rtl.with_reading_direction(ReadingDirection::Ltr),
+            SpreadMode::Ltr
+        );
+        assert_eq!(
+            SpreadMode::LtrCover.with_reading_direction(ReadingDirection::Rtl),
+            SpreadMode::RtlCover
+        );
+        assert_eq!(
+            SpreadMode::RtlCover.with_reading_direction(ReadingDirection::Ltr),
+            SpreadMode::LtrCover
+        );
+        assert_eq!(
+            SpreadMode::Single.with_reading_direction(ReadingDirection::Rtl),
+            SpreadMode::Single
+        );
+        assert_eq!(ReadingDirection::Ltr.next(), ReadingDirection::Rtl);
+        assert_eq!(ReadingDirection::Rtl.next(), ReadingDirection::Ltr);
     }
 
     #[test]
