@@ -2211,6 +2211,25 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 );
             }
         });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label("見開きのページ間隔");
+        ui.add(
+            egui::DragValue::new(&mut s.spread_page_gap_px)
+                .range(0..=200u32)
+                .speed(1)
+                .suffix(" px"),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("連結読みのページ間隔");
+        ui.add(
+            egui::DragValue::new(&mut s.continuous_reading_gap_px)
+                .range(0..=200u32)
+                .speed(1)
+                .suffix(" px"),
+        );
+    });
 }
 
 pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesState) {

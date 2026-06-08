@@ -1071,6 +1071,12 @@ pub struct Settings {
     /// デフォルトの横連結方向
     #[serde(default)]
     pub default_reading_direction: ReadingDirection,
+    /// 見開き内の左右ページ間隔 (画面 px)。0 でページを隙間なく接続する。
+    #[serde(default = "default_spread_page_gap_px")]
+    pub spread_page_gap_px: u32,
+    /// 縦/横連結読みで、次のページまたは次の見開きユニットまで空ける間隔 (画面 px)。
+    #[serde(default = "default_continuous_reading_gap_px")]
+    pub continuous_reading_gap_px: u32,
 
     /// ZIP/PDF を一覧から開いたとき、ページ一覧を経由せず 1 ページ目を即フルスクリーンで
     /// 開く。ON のときフルスクリーン中の Esc/Enter は親フォルダ (一覧) へ戻り、
@@ -1946,6 +1952,12 @@ pub fn default_image_ext_priority() -> Vec<String> {
 fn default_slideshow_interval() -> f32 {
     3.0
 }
+fn default_spread_page_gap_px() -> u32 {
+    4
+}
+fn default_continuous_reading_gap_px() -> u32 {
+    20
+}
 fn default_toolbar_cols_items() -> Vec<usize> {
     (MIN_GRID_COLS..=MAX_GRID_COLS).collect()
 }
@@ -2013,6 +2025,8 @@ impl Default for Settings {
             default_spread_mode: SpreadMode::default(),
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
+            spread_page_gap_px: default_spread_page_gap_px(),
+            continuous_reading_gap_px: default_continuous_reading_gap_px(),
             auto_fullscreen_zip_pdf: false,
             margin_fit_enabled: false,
             ui_theme: UiTheme::default(),
@@ -2986,6 +3000,8 @@ impl Settings {
         self.video_volume = clamp_video_volume(self.video_volume);
         self.video_playback_speed =
             crate::video::clock::clamp_playback_speed(self.video_playback_speed);
+        self.spread_page_gap_px = self.spread_page_gap_px.min(200);
+        self.continuous_reading_gap_px = self.continuous_reading_gap_px.min(200);
 
         // v0.8 マイグレーション: お気に入りの UUID が nil なら発行する。
         // 旧形式 / id フィールド欠落時は deserialize で Uuid::nil() が入っているので、
@@ -3243,6 +3259,8 @@ mod tests {
         assert_eq!(s.thumb_next_pages, 4);
         assert_eq!(s.thumb_vram_cap_percent, 50);
         assert!(s.thumb_idle_upgrade);
+        assert_eq!(s.spread_page_gap_px, 4);
+        assert_eq!(s.continuous_reading_gap_px, 20);
         assert!(s.show_toolbar_favorites);
         assert!(s.show_toolbar_folder);
         assert!(s.show_address_bar_history_nav);
@@ -3403,6 +3421,16 @@ mod tests {
         s.folder_skip_limit = 999;
         s.sanitize();
         assert_eq!(s.folder_skip_limit, 30);
+    }
+
+    #[test]
+    fn sanitize_clamps_fullscreen_gap_settings() {
+        let mut s = Settings::default();
+        s.spread_page_gap_px = 999;
+        s.continuous_reading_gap_px = 999;
+        s.sanitize();
+        assert_eq!(s.spread_page_gap_px, 200);
+        assert_eq!(s.continuous_reading_gap_px, 200);
     }
 
     #[test]

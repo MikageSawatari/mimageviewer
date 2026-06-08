@@ -70,8 +70,6 @@ const MIDDLE_DRAG_THRESHOLD_PX: f32 = 4.0;
 const ZOOM_MIN: f32 = 0.1;
 /// ズーム倍率の上限
 const ZOOM_MAX: f32 = 50.0;
-/// 連結読み: ページ間の既定余白。
-const VERTICAL_READING_GAP_PX: f32 = 12.0;
 /// 連結読み: キー/ゲームパッド 1 入力あたりのスクロール量。
 const VERTICAL_READING_SCROLL_STEP_PX: f32 = 90.0;
 /// 連結読み: PageUp/PageDown で進む画面長の割合。
@@ -600,6 +598,7 @@ struct ContinuousReadingUnitSize {
     pages: Vec<ContinuousReadingPageSize>,
     width: f32,
     height: f32,
+    page_gap: f32,
 }
 
 /// 透過背景の描画スタイル。B キーで 3 モードを循環する。
@@ -672,8 +671,6 @@ pub(crate) fn paint_transparent_bg(
 }
 /// チェックマーク円のマージン（画面端からの距離）
 const CHECKMARK_MARGIN: f32 = 16.0;
-/// 見開き表示の区切り線の幅 (px)
-const SPREAD_DIVIDER_WIDTH: f32 = 2.0;
 /// フィードバックトースト表示時間（秒）。短い確認系トーストの既定値。
 /// 複数行の案内文は `show_feedback_toast_with_duration` で長めを指定する。
 pub(crate) const FEEDBACK_TOAST_DURATION: f32 = 1.2;
@@ -6679,6 +6676,7 @@ impl App {
             return ContinuousReadingUnitSize {
                 width: page.width,
                 height: page.height,
+                page_gap: 0.0,
                 pages: vec![page],
             };
         }
@@ -6697,6 +6695,7 @@ impl App {
             pages: page_bases,
             width: combined_w.max(1.0),
             height: combined_h.max(1.0),
+            page_gap: 0.0,
         }
     }
 
@@ -6708,13 +6707,20 @@ impl App {
         fallback: egui::Vec2,
     ) -> ContinuousReadingUnitSize {
         let mut base = self.continuous_unit_base_size(unit, fallback);
+        let page_gap = if base.pages.len() > 1 {
+            self.settings.spread_page_gap_px.min(200) as f32
+        } else {
+            0.0
+        };
+        let page_gap_total = page_gap * base.pages.len().saturating_sub(1) as f32;
         let scale = if flow.is_horizontal() {
             target_cross.max(1.0) / base.height.max(1.0)
         } else {
-            target_cross.max(1.0) / base.width.max(1.0)
+            (target_cross.max(1.0) - page_gap_total).max(1.0) / base.width.max(1.0)
         };
-        base.width = (base.width * scale).max(1.0);
+        base.width = (base.width * scale + page_gap_total).max(1.0);
         base.height = (base.height * scale).max(1.0);
+        base.page_gap = page_gap;
         for page in &mut base.pages {
             page.width = (page.width * scale).max(1.0);
             page.height = (page.height * scale).max(1.0);
@@ -6793,7 +6799,11 @@ impl App {
                     }
                 })
                 .collect::<Vec<_>>();
-            offsets = vertical_reading_offsets(&extents, VERTICAL_READING_GAP_PX, current_pos);
+            offsets = vertical_reading_offsets(
+                &extents,
+                self.settings.continuous_reading_gap_px.min(200) as f32,
+                current_pos,
+            );
             self.fs_vertical_scroll = clamp_vertical_reading_scroll(
                 self.fs_vertical_scroll,
                 &offsets,
@@ -6872,7 +6882,7 @@ impl App {
                         egui::pos2(x, unit_rect.min.y),
                         egui::vec2(page.width, page.height),
                     );
-                    x += page.width;
+                    x += page.width + size.page_gap;
                     rect
                 };
                 pages.push(VerticalReadingPage {
@@ -7207,33 +7217,6 @@ impl App {
                 holdover_for_locked.as_ref(),
                 display_tex.as_ref(),
             );
-            let stroke = egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
-            );
-            if self.reading_flow.is_horizontal() {
-                let gap_x = if self.reading_direction == ReadingDirection::Rtl {
-                    page.rect.min.x - VERTICAL_READING_GAP_PX * 0.5
-                } else {
-                    page.rect.max.x + VERTICAL_READING_GAP_PX * 0.5
-                };
-                painter.line_segment(
-                    [
-                        egui::pos2(gap_x, page.rect.min.y),
-                        egui::pos2(gap_x, page.rect.max.y),
-                    ],
-                    stroke,
-                );
-            } else {
-                let gap_y = page.rect.max.y + VERTICAL_READING_GAP_PX * 0.5;
-                painter.line_segment(
-                    [
-                        egui::pos2(page.rect.min.x, gap_y),
-                        egui::pos2(page.rect.max.x, gap_y),
-                    ],
-                    stroke,
-                );
-            }
         }
 
         if let Some(new_pos) = vertical_reading_nearest_position(&offsets, self.fs_vertical_scroll)
@@ -8854,7 +8837,7 @@ impl App {
     }
 
     /// 見開きモードの2ページ描画。
-    /// 2枚の画像を隙間なく中央に配置し、境界に薄い黒線を描画する。
+    /// 2枚の画像を中央に配置し、設定されたページ間隔だけ黒背景を見せる。
     fn draw_fs_spread(
         &mut self,
         ui: &mut egui::Ui,
@@ -8923,6 +8906,7 @@ impl App {
         };
 
         if let (Some(ls), Some(rs)) = (left_size, right_size) {
+            let spread_gap = self.settings.spread_page_gap_px.min(200) as f32;
             // 両ページの高さを揃える（高い方に合わせる）
             let combined_h = ls.y.max(rs.y);
             let left_w = ls.x * (combined_h / ls.y);
@@ -8951,7 +8935,8 @@ impl App {
                     egui::vec2(combined_w * 0.5, combined_h * 0.5),
                 ),
             };
-            let fit_scale = (image_rect.width() / fit_w).min(image_rect.height() / fit_h);
+            let fit_scale = ((image_rect.width() - spread_gap).max(1.0) / fit_w)
+                .min(image_rect.height() / fit_h);
 
             let (total_scale, base_center) = match zoom_pan {
                 Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
@@ -8967,7 +8952,7 @@ impl App {
             let scaled_h = combined_h * total_scale;
 
             // 全体を中央に配置
-            let total_w = scaled_lw + scaled_rw;
+            let total_w = scaled_lw + spread_gap + scaled_rw;
             let start_x = center.x - total_w * 0.5;
             let start_y = center.y - scaled_h * 0.5;
 
@@ -8976,7 +8961,7 @@ impl App {
                 egui::vec2(scaled_lw, scaled_h),
             );
             let right_rect = egui::Rect::from_min_size(
-                egui::pos2(start_x + scaled_lw, start_y),
+                egui::pos2(start_x + scaled_lw + spread_gap, start_y),
                 egui::vec2(scaled_rw, scaled_h),
             );
 
@@ -9028,24 +9013,15 @@ impl App {
                 right_idx,
                 right_rect,
             });
-
-            // 区切り線（2px 黒線）
-            let divider_x = start_x + scaled_lw;
-            painter.line_segment(
-                [
-                    egui::pos2(divider_x, start_y),
-                    egui::pos2(divider_x, start_y + scaled_h),
-                ],
-                egui::Stroke::new(SPREAD_DIVIDER_WIDTH, egui::Color32::BLACK),
-            );
         } else {
             // サイズ不明の場合は均等分割フォールバック
             // (ズーム/パンはサイズが分かってからでないと正しく計算できないため適用しない)
-            let half_w = image_rect.width() / 2.0;
+            let spread_gap = self.settings.spread_page_gap_px.min(200) as f32;
+            let half_w = (image_rect.width() - spread_gap).max(2.0) / 2.0;
             let left_rect =
                 egui::Rect::from_min_size(image_rect.min, egui::vec2(half_w, image_rect.height()));
             let right_rect = egui::Rect::from_min_size(
-                egui::pos2(image_rect.min.x + half_w, image_rect.min.y),
+                egui::pos2(image_rect.min.x + half_w + spread_gap, image_rect.min.y),
                 egui::vec2(half_w, image_rect.height()),
             );
             // フォールバック分岐でも nav ロック中の holdover を渡す (上のパス参照)。
