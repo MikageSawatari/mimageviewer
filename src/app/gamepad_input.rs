@@ -16,7 +16,6 @@ const TRIGGER_STEP_INTERVAL: Duration = Duration::from_millis(150);
 const DEADZONE: f32 = 0.25;
 const TRIGGER_THRESHOLD: f32 = 0.35;
 const PAN_SPEED_PX_PER_SEC: f32 = 720.0;
-const CONTINUOUS_READING_SCROLL_SPEED_PX_PER_SEC: f32 = 720.0;
 const RIGHT_STICK_ZOOM_MULTIPLIER: f32 = 2.0;
 const GAMEPAD_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -323,7 +322,7 @@ impl App {
                 && let Some(axis) =
                     continuous_reading_stick_axis(self.reading_flow, self.reading_direction, left)
             {
-                let delta = axis * CONTINUOUS_READING_SCROLL_SPEED_PX_PER_SEC * dt;
+                let delta = axis * self.continuous_reading_gamepad_speed_px_per_sec(ctx) * dt;
                 if delta.abs() > 0.5 {
                     self.scroll_vertical_reading_by(ctx, delta);
                     changed = true;

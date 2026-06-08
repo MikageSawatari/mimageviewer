@@ -25,7 +25,7 @@ use crate::app::App;
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::pdf_loader::PdfPageContentType;
-use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+use crate::settings::{FullscreenFitMode, ReadingDirection, ReadingFlow, SpreadMode};
 use crate::ui_helpers::{HoverTipExt, open_external_player};
 
 #[derive(Clone, Copy)]
@@ -70,8 +70,8 @@ const MIDDLE_DRAG_THRESHOLD_PX: f32 = 4.0;
 const ZOOM_MIN: f32 = 0.1;
 /// ズーム倍率の上限
 const ZOOM_MAX: f32 = 50.0;
-/// 連結読み: キー/ゲームパッド 1 入力あたりのスクロール量。
-const VERTICAL_READING_SCROLL_STEP_PX: f32 = 90.0;
+/// 連結読み: ホイール 1 ノッチ相当として扱う raw scroll delta。
+const CONTINUOUS_READING_WHEEL_REFERENCE_DELTA: f32 = 120.0;
 /// 連結読み: PageUp/PageDown で進む画面長の割合。
 const VERTICAL_READING_PAGE_SCROLL_FRAC: f32 = 0.85;
 /// 連結読み: 同時に画面に入るページ数の上限。
@@ -2303,6 +2303,11 @@ impl App {
                                                 self.fs_pixel_grid_enabled && !analysis_active;
                                             // 余白カットフィット用 bbox (設定 OFF なら None)。bg_style が
                                             // self を借用する前に算出しておく。
+                                            let fit_mode = if analysis_active {
+                                                FullscreenFitMode::Page
+                                            } else {
+                                                self.effective_fullscreen_fit_mode()
+                                            };
                                             let content_bbox = self.fs_margin_bbox(fs_idx);
                                             let bg_style = self.fs_bg_style(ctx);
                                             Self::draw_fs_image(
@@ -2319,6 +2324,7 @@ impl App {
                                                 &bg_style,
                                                 &state.location_display,
                                                 pixel_grid_enabled,
+                                                fit_mode,
                                                 content_bbox,
                                             );
                                             if let crate::app::CompareViewMode::Wipe { fraction } =
@@ -2351,6 +2357,11 @@ impl App {
                                             self.fs_pixel_grid_enabled && !analysis_active;
                                         // 余白カットフィット用 bbox (設定 OFF なら None)。bg_style が
                                         // self を借用する前に算出しておく。
+                                        let fit_mode = if analysis_active {
+                                            FullscreenFitMode::Page
+                                        } else {
+                                            self.effective_fullscreen_fit_mode()
+                                        };
                                         let content_bbox = self.fs_margin_bbox(fs_idx);
                                         let bg_style = self.fs_bg_style(ctx);
                                         Self::draw_fs_image(
@@ -2360,6 +2371,7 @@ impl App {
                                             state.fs_load_failed, fs_rotation, zp,
                                             free_rot, &bg_style, &state.location_display,
                                             pixel_grid_enabled,
+                                            fit_mode,
                                             content_bbox,
                                         );
                                     }
@@ -2824,8 +2836,8 @@ impl App {
                             // spread / 補正 / rotate / capture / VST / play / tile) は全て隠す。
                             let panorama_mode_active = panorama_active;
                             let mut panorama_pressed = false;
-                            let margin_fit_active = self.settings.margin_fit_enabled;
-                            let mut margin_fit_pressed = false;
+                            let fit_mode = self.effective_fullscreen_fit_mode();
+                            let mut fit_mode_pressed = false;
                             let mut bar_analysis_pressed = false;
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
@@ -2853,8 +2865,8 @@ impl App {
                                 &mut self.adjustment_mode,
                                 &mut self.local_adjust_mode,
                                 has_page_override,
-                                margin_fit_active,
-                                &mut margin_fit_pressed,
+                                fit_mode,
+                                &mut fit_mode_pressed,
                                 state.pdf_content_type,
                                 is_video_mode,
                                 video_meta,
@@ -2876,17 +2888,9 @@ impl App {
                             if bar_analysis_pressed && !is_spread_double {
                                 self.toggle_analysis_mode();
                             }
-                            // 余白カットフィット トグル (設定を反転 + 保存、bbox キャッシュを破棄)。
-                            if margin_fit_pressed {
-                                self.settings.margin_fit_enabled = !self.settings.margin_fit_enabled;
-                                self.settings.save();
-                                self.fs_margin_bbox_cache.clear();
-                                // ON にしたとき、現在ページの余白カット検出診断をログに出す
-                                // (各成分の面積・位置・各辺を決める成分。原因/しきい値の調査用)。
-                                if self.settings.margin_fit_enabled {
-                                    self.log_margin_fit_diag(fs_idx);
-                                }
-                                ctx.request_repaint();
+                            // ズーム/フィットモード切替 (0 キーと同じ循環)。
+                            if fit_mode_pressed {
+                                self.cycle_fullscreen_fit_mode(ctx, fs_idx);
                             }
                             // 360 度パノラマビュー: トグル
                             if panorama_pressed {
@@ -2987,10 +2991,17 @@ impl App {
                                 self.normalize_spread_position(ctx);
                             }
                         }
-                        if self.reading_flow != reading_flow_before
-                            || self.reading_direction != reading_direction_before
+                        let reading_flow_changed = self.reading_flow != reading_flow_before;
+                        if reading_flow_changed || self.reading_direction != reading_direction_before
                         {
                             self.reset_continuous_reading_transform();
+                            if reading_flow_changed {
+                                self.set_default_fullscreen_fit_for_flow(
+                                    ctx,
+                                    fs_idx,
+                                    self.reading_flow,
+                                );
+                            }
                             if !self.reading_flow.is_paged() {
                                 self.disable_non_paged_fullscreen_modes(fs_idx);
                             }
@@ -4434,6 +4445,13 @@ impl App {
                 false
             }
         });
+        let key_0 = ctx.input_mut(|i| {
+            if i.modifiers.is_none() {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Num0)
+            } else {
+                false
+            }
+        });
 
         // U / Shift+U / Alt+U: AI アップスケールモデル サイクル (次 / 前 / なしリセット)
         // 注意: egui の consume_key は matches_logically で判定されるため、Modifiers::NONE が
@@ -4535,6 +4553,13 @@ impl App {
             let direction = self.reading_direction.next();
             self.set_reading_direction_for_fullscreen(ctx, fs_idx, direction);
             self.show_feedback_toast(format!("[7:{}]", direction.label()));
+        }
+        if key_0 && self.vertical_reading_supported_idx(fs_idx) {
+            self.cycle_fullscreen_fit_mode(ctx, fs_idx);
+            self.show_feedback_toast(format!(
+                "[0:{}]",
+                self.effective_fullscreen_fit_mode().label()
+            ));
         }
 
         // U キー: AI アップスケールモデルをサイクル
@@ -4899,20 +4924,21 @@ impl App {
         let horizontal_reading = continuous_active && self.reading_flow.is_horizontal();
         if vertical_reading || horizontal_reading {
             let mut scroll_delta = 0.0;
+            let key_step = self.continuous_reading_key_step_px(ctx);
             if vertical_reading {
                 if arrow_down && !ctrl_d {
-                    scroll_delta += VERTICAL_READING_SCROLL_STEP_PX;
+                    scroll_delta += key_step;
                 }
                 if arrow_up && !ctrl_u {
-                    scroll_delta -= VERTICAL_READING_SCROLL_STEP_PX;
+                    scroll_delta -= key_step;
                 }
             } else {
                 let axis_rtl = self.reading_direction == ReadingDirection::Rtl;
                 if ((arrow_right && !axis_rtl) || (arrow_left && axis_rtl)) && !ctrl_d {
-                    scroll_delta += VERTICAL_READING_SCROLL_STEP_PX;
+                    scroll_delta += key_step;
                 }
                 if ((arrow_left && !axis_rtl) || (arrow_right && axis_rtl)) && !ctrl_u {
-                    scroll_delta -= VERTICAL_READING_SCROLL_STEP_PX;
+                    scroll_delta -= key_step;
                 }
             }
             let viewport = ctx.content_rect();
@@ -5339,7 +5365,8 @@ impl App {
                     .is_some_and(|idx| self.vertical_reading_supported_idx(idx))
                 && !self.is_overlay_edit_mode_active()
             {
-                self.scroll_vertical_reading_by(ctx, -wheel_y);
+                let delta = self.continuous_reading_wheel_delta_px(ctx, wheel_y);
+                self.scroll_vertical_reading_by(ctx, delta);
             } else {
                 if should_zoom_fullscreen_wheel(ctrl_held, self.is_overlay_edit_mode_active()) {
                     // 通常モード: Ctrl+ホイールでズーム。
@@ -5433,8 +5460,22 @@ impl App {
                         }
                     }
                 }
+            } else if continuous_active && primary_down && !cursor_in_panel {
+                let pointer_delta = ctx.input(|i| i.pointer.delta());
+                let scroll_delta = if self.reading_flow.is_horizontal() {
+                    if self.reading_direction == ReadingDirection::Rtl {
+                        pointer_delta.x
+                    } else {
+                        -pointer_delta.x
+                    }
+                } else {
+                    -pointer_delta.y
+                };
+                self.scroll_vertical_reading_by(ctx, scroll_delta);
             } else if !continuous_active
-                && (self.fs_zoom > ZOOM_NEAR_ONE || self.fs_free_rotation.abs() > TRANSFORM_EPSILON)
+                && (self.fullscreen_fit_allows_drag_pan()
+                    || self.fs_zoom > ZOOM_NEAR_ONE
+                    || self.fs_free_rotation.abs() > TRANSFORM_EPSILON)
             {
                 // ズームまたは回転中: ドラッグでパン (連続読み中は fs_zoom が自動インフレ
                 // されるが、その pan は描画に反映されず has_transform を汚すだけなので除外。
@@ -6126,7 +6167,10 @@ impl App {
     /// pixels 未取得 (アニメ等) なら None。補正前後で余白はほぼ不変なので raw fs_cache の
     /// pixels から検出する。
     pub(crate) fn fs_margin_bbox(&mut self, idx: usize) -> Option<egui::Rect> {
-        if !self.settings.margin_fit_enabled {
+        if !matches!(
+            self.effective_fullscreen_fit_mode(),
+            FullscreenFitMode::MarginFit
+        ) {
             return None;
         }
         if let Some(cached) = self.fs_margin_bbox_cache.get(&idx) {
@@ -6235,6 +6279,7 @@ impl App {
         // 空ならラベル描画をスキップ。
         location_display: &str,
         pixel_grid_enabled: bool,
+        fit_mode: FullscreenFitMode,
         // 余白カットフィット用の中身 bbox (正規化 0..1)。Some & rotation なしのとき適用。
         content_bbox: Option<egui::Rect>,
     ) {
@@ -6248,13 +6293,13 @@ impl App {
                 }
                 _ => tex_size,
             };
-            // 余白カットフィット: rotation / フリー回転なし & content_bbox ありのとき、中身
-            // bbox をウィンドウにフィットさせる (= 余白分ズームイン + bbox 中心へ再センタリング)。
-            // ピクセルは変えず fit と中心をずらすだけ。bbox 無し時は従来の全体フィット。
             let margin_bbox = content_bbox
                 .filter(|_| rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON);
-            let (fit_scale, content_center_px) = match margin_bbox {
-                Some(bbox) => {
+            let page_fit =
+                || (full_rect.width() / display_size.x).min(full_rect.height() / display_size.y);
+            let (fit_scale, content_center_px) = match fit_mode {
+                FullscreenFitMode::MarginFit if margin_bbox.is_some() => {
+                    let bbox = margin_bbox.unwrap();
                     let bbox_w = (bbox.width() * display_size.x).max(1.0);
                     let bbox_h = (bbox.height() * display_size.y).max(1.0);
                     let s = (full_rect.width() / bbox_w).min(full_rect.height() / bbox_h);
@@ -6264,10 +6309,12 @@ impl App {
                     );
                     (s, cpx)
                 }
-                None => (
-                    (full_rect.width() / display_size.x).min(full_rect.height() / display_size.y),
-                    egui::Vec2::ZERO,
-                ),
+                FullscreenFitMode::Width => (full_rect.width() / display_size.x, egui::Vec2::ZERO),
+                FullscreenFitMode::Height => {
+                    (full_rect.height() / display_size.y, egui::Vec2::ZERO)
+                }
+                FullscreenFitMode::Original => (1.0, egui::Vec2::ZERO),
+                _ => (page_fit(), egui::Vec2::ZERO),
             };
             let (total_scale, base_center) = match zoom_pan {
                 Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
@@ -6276,7 +6323,9 @@ impl App {
             // 中身 bbox の中心をウィンドウ中心へ寄せる (content_center_px=0 なら従来どおり)。
             let center = base_center - content_center_px * total_scale;
             let img_rect = egui::Rect::from_center_size(center, display_size * total_scale);
-            let needs_clip = zoom_pan.is_some() || free_rotation_rad.abs() > TRANSFORM_EPSILON;
+            let needs_clip = zoom_pan.is_some()
+                || free_rotation_rad.abs() > TRANSFORM_EPSILON
+                || !matches!(fit_mode, FullscreenFitMode::Page);
             let painter = if needs_clip {
                 ui.painter().with_clip_rect(full_rect)
             } else {
@@ -6368,8 +6417,46 @@ impl App {
         ctx.request_repaint();
     }
 
+    fn continuous_reading_viewport_len_for_flow(&self, ctx: &egui::Context) -> f32 {
+        let viewport = ctx.content_rect();
+        if self.reading_flow.is_horizontal() {
+            viewport.width().max(1.0)
+        } else {
+            viewport.height().max(1.0)
+        }
+    }
+
+    fn continuous_reading_key_step_px(&self, ctx: &egui::Context) -> f32 {
+        self.continuous_reading_viewport_len_for_flow(ctx)
+            * (self
+                .settings
+                .continuous_reading_key_scroll_percent
+                .clamp(1, 100) as f32
+                / 100.0)
+    }
+
+    fn continuous_reading_wheel_delta_px(&self, ctx: &egui::Context, wheel_y: f32) -> f32 {
+        let notches = wheel_y / CONTINUOUS_READING_WHEEL_REFERENCE_DELTA;
+        -notches
+            * self.continuous_reading_viewport_len_for_flow(ctx)
+            * (self
+                .settings
+                .continuous_reading_wheel_scroll_percent
+                .clamp(1, 100) as f32
+                / 100.0)
+    }
+
+    pub(crate) fn continuous_reading_gamepad_speed_px_per_sec(&self, ctx: &egui::Context) -> f32 {
+        self.continuous_reading_viewport_len_for_flow(ctx)
+            * (self
+                .settings
+                .continuous_reading_gamepad_scroll_percent_per_sec
+                .clamp(10, 300) as f32
+                / 100.0)
+    }
+
     pub(crate) fn scroll_vertical_reading_step(&mut self, ctx: &egui::Context, direction: f32) {
-        self.scroll_vertical_reading_by(ctx, direction * VERTICAL_READING_SCROLL_STEP_PX);
+        self.scroll_vertical_reading_by(ctx, direction * self.continuous_reading_key_step_px(ctx));
     }
 
     pub(crate) fn persist_current_spread_mode(&self) {
@@ -6402,6 +6489,74 @@ impl App {
         self.fs_pan = egui::Vec2::ZERO;
         self.fs_free_rotation = 0.0;
         self.fs_vertical_cache_keep_set.clear();
+    }
+
+    fn reset_fullscreen_fit_transform(&mut self, fs_idx: usize) {
+        self.fs_zoom = 1.0;
+        self.fs_pan = egui::Vec2::ZERO;
+        self.fs_free_rotation = 0.0;
+        self.maybe_rerender_pdf(1.0);
+        if matches!(
+            self.settings.fullscreen_fit_mode,
+            FullscreenFitMode::MarginFit
+        ) {
+            self.log_margin_fit_diag(fs_idx);
+        }
+    }
+
+    fn effective_fullscreen_fit_mode(&self) -> FullscreenFitMode {
+        self.settings
+            .fullscreen_fit_mode
+            .effective_for_flow(self.reading_flow)
+    }
+
+    fn fullscreen_fit_allows_drag_pan(&self) -> bool {
+        matches!(
+            self.effective_fullscreen_fit_mode(),
+            FullscreenFitMode::Width | FullscreenFitMode::Height | FullscreenFitMode::Original
+        )
+    }
+
+    fn set_fullscreen_fit_mode_for_current(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        mode: FullscreenFitMode,
+    ) {
+        let mode = mode.effective_for_flow(self.reading_flow);
+        if self.settings.fullscreen_fit_mode == mode
+            && self.settings.margin_fit_enabled == matches!(mode, FullscreenFitMode::MarginFit)
+        {
+            return;
+        }
+        self.settings.fullscreen_fit_mode = mode;
+        self.settings.margin_fit_enabled = matches!(mode, FullscreenFitMode::MarginFit);
+        self.fs_margin_bbox_cache.clear();
+        self.reset_fullscreen_fit_transform(fs_idx);
+        self.settings.save();
+        ctx.request_repaint();
+    }
+
+    fn cycle_fullscreen_fit_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let next = self
+            .effective_fullscreen_fit_mode()
+            .next_for_flow(self.reading_flow);
+        self.set_fullscreen_fit_mode_for_current(ctx, fs_idx, next);
+    }
+
+    fn set_default_fullscreen_fit_for_flow(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        flow: ReadingFlow,
+    ) {
+        let mode = FullscreenFitMode::default_for_flow(flow);
+        self.settings.fullscreen_fit_mode = mode;
+        self.settings.margin_fit_enabled = false;
+        self.fs_margin_bbox_cache.clear();
+        self.reset_fullscreen_fit_transform(fs_idx);
+        self.settings.save();
+        ctx.request_repaint();
     }
 
     pub(crate) fn disable_non_paged_fullscreen_modes(&mut self, fs_idx: usize) {
@@ -6449,6 +6604,7 @@ impl App {
         }
         self.reading_flow = flow;
         self.reset_continuous_reading_transform();
+        self.set_default_fullscreen_fit_for_flow(ctx, fs_idx, flow);
         if !flow.is_paged() {
             self.disable_non_paged_fullscreen_modes(fs_idx);
         }
@@ -6703,7 +6859,8 @@ impl App {
         &mut self,
         unit: &ContinuousReadingUnitSpec,
         flow: crate::settings::ReadingFlow,
-        target_cross: f32,
+        image_rect: egui::Rect,
+        zoom: f32,
         fallback: egui::Vec2,
     ) -> ContinuousReadingUnitSize {
         let mut base = self.continuous_unit_base_size(unit, fallback);
@@ -6713,10 +6870,23 @@ impl App {
             0.0
         };
         let page_gap_total = page_gap * base.pages.len().saturating_sub(1) as f32;
-        let scale = if flow.is_horizontal() {
-            target_cross.max(1.0) / base.height.max(1.0)
-        } else {
-            (target_cross.max(1.0) - page_gap_total).max(1.0) / base.width.max(1.0)
+        let fit_mode = self.effective_fullscreen_fit_mode();
+        let target_w = (image_rect.width() * zoom - page_gap_total).max(1.0);
+        let target_h = (image_rect.height() * zoom).max(1.0);
+        let scale = match fit_mode {
+            FullscreenFitMode::Width => target_w / base.width.max(1.0),
+            FullscreenFitMode::Height => target_h / base.height.max(1.0),
+            FullscreenFitMode::Original => zoom,
+            FullscreenFitMode::Page => {
+                (target_w / base.width.max(1.0)).min(target_h / base.height.max(1.0))
+            }
+            FullscreenFitMode::MarginFit => {
+                if flow.is_horizontal() {
+                    target_h / base.height.max(1.0)
+                } else {
+                    target_w / base.width.max(1.0)
+                }
+            }
         };
         base.width = (base.width * scale + page_gap_total).max(1.0);
         base.height = (base.height * scale).max(1.0);
@@ -6779,15 +6949,11 @@ impl App {
         let mut visible_positions = Vec::new();
 
         for _ in 0..8 {
-            let target_cross = if flow.is_horizontal() {
-                image_rect.height() * zoom
-            } else {
-                image_rect.width() * zoom
-            }
-            .max(1.0);
             sizes.clear();
             for unit in units {
-                sizes.push(self.continuous_unit_size_for_flow(unit, flow, target_cross, fallback));
+                sizes.push(
+                    self.continuous_unit_size_for_flow(unit, flow, image_rect, zoom, fallback),
+                );
             }
             let extents = sizes
                 .iter()
@@ -8848,6 +9014,7 @@ impl App {
         original_preview_active: bool,
     ) {
         let zoom_pan = self.fs_zoom_pan();
+        let fit_mode = self.effective_fullscreen_fit_mode();
         let left_rot = self.get_rotation(left_idx);
         let right_rot = self.get_rotation(right_idx);
         // 余白カットフィット (見開き): 各ページの content bbox を取得し、後で左右セットの
@@ -8899,7 +9066,7 @@ impl App {
 
         // ズーム/パンが有効な場合は image_rect でクリップする
         // (ズーム時にページが image_rect 外へはみ出して他の UI を覆わないようにするため)
-        let painter = if zoom_pan.is_some() {
+        let painter = if zoom_pan.is_some() || !matches!(fit_mode, FullscreenFitMode::Page) {
             ui.painter().with_clip_rect(image_rect)
         } else {
             ui.painter().clone()
@@ -8916,7 +9083,7 @@ impl App {
 
             // 余白カットフィット: 左右ページの content 矩形を combined 空間に写像して union を
             // 取り、セット全体の外周余白を詰める (回転なし & 設定 ON & どちらかに bbox あり)。
-            let content = if self.settings.margin_fit_enabled {
+            let content = if matches!(fit_mode, FullscreenFitMode::MarginFit) {
                 spread_content_union(margin_left, margin_right, left_w, right_w, combined_h)
             } else {
                 None
@@ -8935,8 +9102,20 @@ impl App {
                     egui::vec2(combined_w * 0.5, combined_h * 0.5),
                 ),
             };
-            let fit_scale = ((image_rect.width() - spread_gap).max(1.0) / fit_w)
-                .min(image_rect.height() / fit_h);
+            let page_fit = || {
+                ((image_rect.width() - spread_gap).max(1.0) / combined_w)
+                    .min(image_rect.height() / combined_h)
+            };
+            let fit_scale = match fit_mode {
+                FullscreenFitMode::MarginFit if content.is_some() => {
+                    ((image_rect.width() - spread_gap).max(1.0) / fit_w)
+                        .min(image_rect.height() / fit_h)
+                }
+                FullscreenFitMode::Width => (image_rect.width() - spread_gap).max(1.0) / combined_w,
+                FullscreenFitMode::Height => image_rect.height() / combined_h,
+                FullscreenFitMode::Original => 1.0,
+                _ => page_fit(),
+            };
 
             let (total_scale, base_center) = match zoom_pan {
                 Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
@@ -9239,9 +9418,9 @@ impl App {
         local_adjust_mode: &mut bool,
         // 現在ページに個別補正が適用されているか (ボタン点灯用)
         has_page_override: bool,
-        // 余白カットフィット トグル (画像のみ)。active = 現在 ON、pressed = クリックされた。
-        margin_fit_active: bool,
-        margin_fit_pressed: &mut bool,
+        // ズーム/フィットモード循環 (画像のみ)。pressed = クリックされた。
+        fit_mode: FullscreenFitMode,
+        fit_mode_pressed: &mut bool,
         // PDF ページのコンテンツ種別 (非 PDF なら None)
         pdf_content_type: Option<PdfPageContentType>,
         // Phase 6: 動画モードか。true なら画像専用ボタンを隠し、▦ タイルボタンに
@@ -9843,22 +10022,29 @@ impl App {
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
-        // 余白カットフィットボタン (画像のみ、見開きボタンの左)。白/黒の余白を表示時に
-        // 詰めて中身を拡大する (ピクセルは変えない)。
+        // ズーム/フィットボタン (画像のみ、見開きボタンの左)。
         if !is_video && !panorama_mode_active {
+            let fit_active = !matches!(fit_mode, FullscreenFitMode::Page);
             let mf_resp = draw_bar_button(
                 ui,
                 next_x,
                 bar_rect.min.y + BAR_BUTTON_MARGIN,
                 "fs_margin_fit_btn",
-                |hovered| bar_button_bg(hovered, margin_fit_active),
-                margin_fit_active,
+                |hovered| bar_button_bg(hovered, fit_active),
+                fit_active,
                 draw_margin_fit_icon,
             );
-            let mf_resp =
-                mf_resp.hover_tip_dark("余白カットフィット (白/黒の余白を詰めて中身を拡大表示)");
+            let fit_tip = if !reading_flow.is_paged() {
+                format!(
+                    "ズーム/フィット: {} [0]\n連結モードでは余白カットフィットをスキップ",
+                    fit_mode.label()
+                )
+            } else {
+                format!("ズーム/フィット: {} [0]", fit_mode.label())
+            };
+            let mf_resp = mf_resp.hover_tip_dark(fit_tip);
             if mf_resp.clicked() {
-                *margin_fit_pressed = true;
+                *fit_mode_pressed = true;
             }
             if mf_resp.hovered() {
                 *nav_delta = 0;

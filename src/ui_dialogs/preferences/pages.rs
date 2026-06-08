@@ -1,7 +1,7 @@
 use super::*;
 use crate::settings::{
-    self, AiFeatureMode, CachePolicy, Parallelism, ReadingDirection, ReadingFlow, SortOrder,
-    SpreadMode, ThumbAspect, ToolbarSectionDisplay, UiTheme,
+    self, AiFeatureMode, CachePolicy, FullscreenFitMode, Parallelism, ReadingDirection,
+    ReadingFlow, SortOrder, SpreadMode, ThumbAspect, ToolbarSectionDisplay, UiTheme,
 };
 
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -2182,7 +2182,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     let s = &mut state.settings;
 
     ui.label(
-        "フルスクリーンで画像を開いたときの初期表示。\n数字キー 1-5 でページ構成、6 で連結方式、7 で横方向を切り替えできます。",
+        "フルスクリーンで画像を開いたときの初期表示。\n数字キー 1-5 でページ構成、6 で連結方式、7 で横方向、0 でズーム/フィットを切り替えできます。",
     );
     ui.add_space(4.0);
     egui::ComboBox::from_label("デフォルトのページ構成")
@@ -2211,6 +2211,13 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 );
             }
         });
+    egui::ComboBox::from_label("ズーム/フィット")
+        .selected_text(s.fullscreen_fit_mode.label())
+        .show_ui(ui, |ui| {
+            for &mode in FullscreenFitMode::all() {
+                ui.selectable_value(&mut s.fullscreen_fit_mode, mode, mode.label());
+            }
+        });
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label("見開きのページ間隔");
@@ -2228,6 +2235,35 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 .range(0..=200u32)
                 .speed(1)
                 .suffix(" px"),
+        );
+    });
+    ui.add_space(8.0);
+    ui.label("連結読みのスクロール量 (画面サイズ基準)");
+    ui.horizontal(|ui| {
+        ui.label("ホイール 1 ノッチ");
+        ui.add(
+            egui::DragValue::new(&mut s.continuous_reading_wheel_scroll_percent)
+                .range(1..=100u32)
+                .speed(1)
+                .suffix(" %"),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("矢印キー / D-pad 1 回");
+        ui.add(
+            egui::DragValue::new(&mut s.continuous_reading_key_scroll_percent)
+                .range(1..=100u32)
+                .speed(1)
+                .suffix(" %"),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("左スティック最大");
+        ui.add(
+            egui::DragValue::new(&mut s.continuous_reading_gamepad_scroll_percent_per_sec)
+                .range(10..=300u32)
+                .speed(1)
+                .suffix(" %/秒"),
         );
     });
 }

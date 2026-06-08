@@ -785,6 +785,71 @@ impl ReadingDirection {
 }
 
 // -----------------------------------------------------------------------
+// FullscreenFitMode (フルスクリーン倍率/フィット基準)
+// -----------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FullscreenFitMode {
+    #[default]
+    Page,
+    MarginFit,
+    Width,
+    Height,
+    Original,
+}
+
+impl FullscreenFitMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Page => "ページ全体",
+            Self::MarginFit => "ページ全体（余白カットフィット）",
+            Self::Width => "横幅フィット",
+            Self::Height => "縦幅フィット",
+            Self::Original => "100%原寸",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Page,
+            Self::MarginFit,
+            Self::Width,
+            Self::Height,
+            Self::Original,
+        ]
+    }
+
+    pub fn default_for_flow(flow: ReadingFlow) -> Self {
+        if flow.is_vertical() {
+            Self::Width
+        } else if flow.is_horizontal() {
+            Self::Height
+        } else {
+            Self::Page
+        }
+    }
+
+    pub fn effective_for_flow(self, flow: ReadingFlow) -> Self {
+        if !flow.is_paged() && matches!(self, Self::MarginFit) {
+            Self::default_for_flow(flow)
+        } else {
+            self
+        }
+    }
+
+    pub fn next_for_flow(self, flow: ReadingFlow) -> Self {
+        let modes: &[Self] = if flow.is_paged() {
+            Self::all()
+        } else {
+            &[Self::Page, Self::Width, Self::Height, Self::Original]
+        };
+        let current = self.effective_for_flow(flow);
+        let pos = modes.iter().position(|&m| m == current).unwrap_or(0);
+        modes[(pos + 1) % modes.len()]
+    }
+}
+
+// -----------------------------------------------------------------------
 // RecentApp (アプリケーションで開く 履歴)
 // -----------------------------------------------------------------------
 
@@ -1077,6 +1142,18 @@ pub struct Settings {
     /// 縦/横連結読みで、次のページまたは次の見開きユニットまで空ける間隔 (画面 px)。
     #[serde(default = "default_continuous_reading_gap_px")]
     pub continuous_reading_gap_px: u32,
+    /// フルスクリーンの倍率/フィット基準。
+    #[serde(default)]
+    pub fullscreen_fit_mode: FullscreenFitMode,
+    /// 連結読みのホイール 1 ノッチあたりスクロール量 (画面サイズ比 %)。
+    #[serde(default = "default_continuous_reading_wheel_scroll_percent")]
+    pub continuous_reading_wheel_scroll_percent: u32,
+    /// 連結読みの矢印キー / D-pad 1 回あたりスクロール量 (画面サイズ比 %)。
+    #[serde(default = "default_continuous_reading_key_scroll_percent")]
+    pub continuous_reading_key_scroll_percent: u32,
+    /// 連結読みの左スティック最大入力時スクロール速度 (画面サイズ比 %/秒)。
+    #[serde(default = "default_continuous_reading_gamepad_scroll_percent_per_sec")]
+    pub continuous_reading_gamepad_scroll_percent_per_sec: u32,
 
     /// ZIP/PDF を一覧から開いたとき、ページ一覧を経由せず 1 ページ目を即フルスクリーンで
     /// 開く。ON のときフルスクリーン中の Esc/Enter は親フォルダ (一覧) へ戻り、
@@ -1084,9 +1161,8 @@ pub struct Settings {
     #[serde(default)]
     pub auto_fullscreen_zip_pdf: bool,
 
-    /// 余白カットフィット: フルスクリーンの単ページ表示で、白/黒一色の余白を表示時に
-    /// 詰めて中身をウィンドウいっぱいに拡大する (ピクセルは変えず表示変換のみ)。
-    /// フルスクリーン上部ホバーバーのボタンでトグル。既定 OFF。
+    /// 旧設定互換用。新規コードでは `fullscreen_fit_mode == MarginFit` を source of truth
+    /// として扱い、sanitize/save 時に同期する。
     #[serde(default)]
     pub margin_fit_enabled: bool,
 
@@ -1958,6 +2034,15 @@ fn default_spread_page_gap_px() -> u32 {
 fn default_continuous_reading_gap_px() -> u32 {
     20
 }
+fn default_continuous_reading_wheel_scroll_percent() -> u32 {
+    20
+}
+fn default_continuous_reading_key_scroll_percent() -> u32 {
+    16
+}
+fn default_continuous_reading_gamepad_scroll_percent_per_sec() -> u32 {
+    130
+}
 fn default_toolbar_cols_items() -> Vec<usize> {
     (MIN_GRID_COLS..=MAX_GRID_COLS).collect()
 }
@@ -2027,6 +2112,12 @@ impl Default for Settings {
             default_reading_direction: ReadingDirection::default(),
             spread_page_gap_px: default_spread_page_gap_px(),
             continuous_reading_gap_px: default_continuous_reading_gap_px(),
+            fullscreen_fit_mode: FullscreenFitMode::default(),
+            continuous_reading_wheel_scroll_percent:
+                default_continuous_reading_wheel_scroll_percent(),
+            continuous_reading_key_scroll_percent: default_continuous_reading_key_scroll_percent(),
+            continuous_reading_gamepad_scroll_percent_per_sec:
+                default_continuous_reading_gamepad_scroll_percent_per_sec(),
             auto_fullscreen_zip_pdf: false,
             margin_fit_enabled: false,
             ui_theme: UiTheme::default(),
@@ -3002,6 +3093,17 @@ impl Settings {
             crate::video::clock::clamp_playback_speed(self.video_playback_speed);
         self.spread_page_gap_px = self.spread_page_gap_px.min(200);
         self.continuous_reading_gap_px = self.continuous_reading_gap_px.min(200);
+        self.continuous_reading_wheel_scroll_percent =
+            self.continuous_reading_wheel_scroll_percent.clamp(1, 100);
+        self.continuous_reading_key_scroll_percent =
+            self.continuous_reading_key_scroll_percent.clamp(1, 100);
+        self.continuous_reading_gamepad_scroll_percent_per_sec = self
+            .continuous_reading_gamepad_scroll_percent_per_sec
+            .clamp(10, 300);
+        if self.margin_fit_enabled && matches!(self.fullscreen_fit_mode, FullscreenFitMode::Page) {
+            self.fullscreen_fit_mode = FullscreenFitMode::MarginFit;
+        }
+        self.margin_fit_enabled = matches!(self.fullscreen_fit_mode, FullscreenFitMode::MarginFit);
 
         // v0.8 マイグレーション: お気に入りの UUID が nil なら発行する。
         // 旧形式 / id フィールド欠落時は deserialize で Uuid::nil() が入っているので、
@@ -3261,6 +3363,10 @@ mod tests {
         assert!(s.thumb_idle_upgrade);
         assert_eq!(s.spread_page_gap_px, 4);
         assert_eq!(s.continuous_reading_gap_px, 20);
+        assert_eq!(s.fullscreen_fit_mode, FullscreenFitMode::Page);
+        assert_eq!(s.continuous_reading_wheel_scroll_percent, 20);
+        assert_eq!(s.continuous_reading_key_scroll_percent, 16);
+        assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 130);
         assert!(s.show_toolbar_favorites);
         assert!(s.show_toolbar_folder);
         assert!(s.show_address_bar_history_nav);
@@ -3298,6 +3404,34 @@ mod tests {
         );
         assert_eq!(ReadingDirection::Ltr.next(), ReadingDirection::Rtl);
         assert_eq!(ReadingDirection::Rtl.next(), ReadingDirection::Ltr);
+    }
+
+    #[test]
+    fn fullscreen_fit_mode_cycles_skip_margin_fit_in_continuous_flow() {
+        assert_eq!(
+            FullscreenFitMode::default_for_flow(ReadingFlow::Paged),
+            FullscreenFitMode::Page
+        );
+        assert_eq!(
+            FullscreenFitMode::default_for_flow(ReadingFlow::Vertical),
+            FullscreenFitMode::Width
+        );
+        assert_eq!(
+            FullscreenFitMode::default_for_flow(ReadingFlow::Horizontal),
+            FullscreenFitMode::Height
+        );
+        assert_eq!(
+            FullscreenFitMode::Page.next_for_flow(ReadingFlow::Paged),
+            FullscreenFitMode::MarginFit
+        );
+        assert_eq!(
+            FullscreenFitMode::Page.next_for_flow(ReadingFlow::Vertical),
+            FullscreenFitMode::Width
+        );
+        assert_eq!(
+            FullscreenFitMode::MarginFit.effective_for_flow(ReadingFlow::Horizontal),
+            FullscreenFitMode::Height
+        );
     }
 
     #[test]
@@ -3391,6 +3525,13 @@ mod tests {
         assert_eq!(loaded.thumb_quality, 75);
         assert_eq!(loaded.video_volume, VIDEO_VOLUME_DEFAULT);
         assert_eq!(loaded.video_playback_speed, 1.0);
+        assert_eq!(loaded.fullscreen_fit_mode, FullscreenFitMode::Page);
+        assert_eq!(loaded.continuous_reading_wheel_scroll_percent, 20);
+        assert_eq!(loaded.continuous_reading_key_scroll_percent, 16);
+        assert_eq!(
+            loaded.continuous_reading_gamepad_scroll_percent_per_sec,
+            130
+        );
         assert_eq!(
             loaded.video_continuous_mode,
             crate::video::VideoContinuousMode::Off
@@ -3428,9 +3569,32 @@ mod tests {
         let mut s = Settings::default();
         s.spread_page_gap_px = 999;
         s.continuous_reading_gap_px = 999;
+        s.continuous_reading_wheel_scroll_percent = 0;
+        s.continuous_reading_key_scroll_percent = 999;
+        s.continuous_reading_gamepad_scroll_percent_per_sec = 999;
         s.sanitize();
         assert_eq!(s.spread_page_gap_px, 200);
         assert_eq!(s.continuous_reading_gap_px, 200);
+        assert_eq!(s.continuous_reading_wheel_scroll_percent, 1);
+        assert_eq!(s.continuous_reading_key_scroll_percent, 100);
+        assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 300);
+    }
+
+    #[test]
+    fn sanitize_migrates_legacy_margin_fit_bool_to_fit_mode() {
+        let mut s = Settings::default();
+        s.margin_fit_enabled = true;
+        s.fullscreen_fit_mode = FullscreenFitMode::Page;
+        s.sanitize();
+        assert_eq!(s.fullscreen_fit_mode, FullscreenFitMode::MarginFit);
+        assert!(s.margin_fit_enabled);
+
+        let mut s = Settings::default();
+        s.margin_fit_enabled = true;
+        s.fullscreen_fit_mode = FullscreenFitMode::Width;
+        s.sanitize();
+        assert_eq!(s.fullscreen_fit_mode, FullscreenFitMode::Width);
+        assert!(!s.margin_fit_enabled);
     }
 
     #[test]

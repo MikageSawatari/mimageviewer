@@ -405,12 +405,17 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 3. ユーザーのフリー回転 (fs_free_rotation, 一時的・非永続)
 4. Zoom (fs_zoom, 0.1〜50.0)
 5. Pan (fs_pan)
-6. アスペクト比フィット (余白はレターボックス)
+6. フィットモード (ページ全体 / 余白カット / 横幅 / 縦幅 / 100%原寸)
 ```
 
-**余白カットフィット** (`settings.margin_fit_enabled`、ホバーバーのボタンでトグル) が ON
-かつ rotation/フリー回転なしのとき、ステップ 6 のフィットを「画像全体」ではなく
-「中身の bbox」基準にする。`fs_margin_bbox`(idx) が `margin_fit::detect_content_bbox` で
+`settings.fullscreen_fit_mode` はホバーバーのフィットボタンまたは <kbd>0</kbd> で
+循環する。ページ単位へ切り替えたときはページ全体、縦連結へ切り替えたときは横幅フィット、
+横連結へ切り替えたときは縦幅フィットに戻す。連結モード中は余白カットフィットを
+候補から外し、保存値が余白カットでも表示時は flow に応じた既定フィットへフォールバックする。
+
+**余白カットフィット** (`FullscreenFitMode::MarginFit`) は rotation/フリー回転なしのとき、
+ステップ 6 のフィットを「画像全体」ではなく「中身の bbox」基準にする。
+`fs_margin_bbox`(idx) が `margin_fit::detect_content_bbox` で
 中身の bounding box (正規化座標) を検出してキャッシュ (`fs_margin_bbox_cache`、
 `fs_cache` と同じタイミングでクリア) し、`draw_fs_image` が `fit_scale` を bbox サイズで
 求めて中心を bbox 中心へ寄せる (= 余白分ズームイン)。**ピクセルは一切変えない**ので補正/
@@ -429,7 +434,7 @@ AI/エクスポートには無影響。
 だけ端まで届く。例: 左上下はブリード・右だけ余白) は、union bbox が自然に各辺へ追従するので、
 余白のある辺だけ詰まる** (縁ゲートを 0.80→0.50 に緩めて、3 辺ブリードのページを丸ごと諦め
 ない。縁の余白色は median 推定なので過半が余白なら緩めても誤検出しない)。
-診断: 余白カットボタン ON 時に `log_margin_fit_diag` が各成分の面積・位置・各辺の決定要因を
+診断: 余白カットモードへ切り替えた時に `log_margin_fit_diag` が各成分の面積・位置・各辺の決定要因を
 logger へ出力 (`[margin-fit diag]`)。
 
 **見開き (`draw_fs_spread`)** でも有効: 左右各ページの content bbox を `spread_content_union`
@@ -442,7 +447,7 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 (LTR/RTL/Cover) を決め、両ページを「1 枚の合成画像」とみなしてレイアウトする:
 
 1. 各ページの表示サイズ (回転考慮) を算出し、高い方に揃えた連結幅・高さを計算
-2. `spread_page_gap_px` を左右ページの画面上の間隔として差し込み、`image_rect` にフィットする `fit_scale` を求める
+2. `spread_page_gap_px` を左右ページの画面上の間隔として差し込み、フィットモードに応じた `fit_scale` を求める
 3. ズーム/パンを `(fit_scale * fs_zoom, image_rect.center() + fs_pan)` として合成し、合成中心から
    左右ページ矩形を配置する (ズーム/パンは左右ページで共有、ページ間の分割位置は不変)
 4. ズーム/パンが有効なフレームでは `image_rect` にクリップして他の UI 領域へのはみ出しを防ぐ
@@ -450,7 +455,7 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 見開きのページ間隔は環境設定から変更でき、既定 4px、0px で左右ページを隙間なく接続する。
 見開き中は `fs_free_rotation` (Ctrl+ドラッグのフリー回転) と `rotation_db` の単独ページ回転 (R/L)
 は描画に反映されないため、Ctrl+ドラッグは `handle_fs_wheel_and_click` 側で no-op にしている。
-ズーム中のパン (非修飾ドラッグ) と Ctrl+ホイールズーム、ダブルクリックリセットのみが見開きで有効。
+ズーム中または横幅/縦幅/原寸フィット中のパン (非修飾ドラッグ) と Ctrl+ホイールズーム、ダブルクリックリセットのみが見開きで有効。
 
 連結読み (`draw_fs_continuous_reading`) は、`SpreadMode` のページ構成 (単ページ / 見開き)
 を表示ユニットとして縦または横へ仮想配置する。巨大キャンバスは作らず、各ユニットの表示矩形を
@@ -461,7 +466,9 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 通常見開きと同じ `spread_page_gap_px` を使う。横連結では `ReadingDirection` により
 左→右 / 右→左の座標符号を反転する。UI で横方向を変更した場合は `SpreadMode` の
 表紙あり/なしを保ったまま LTR/RTL も同期し、ページ単位の見開き方向と横連結方向が
-食い違わないように保存する。
+食い違わないように保存する。ホイール 1 ノッチ、矢印キー/D-pad 1 回、左スティック最大入力の
+スクロール量は、それぞれ画面幅/高さに対する割合として `continuous_reading_*_percent`
+設定に保存する。PageUp/PageDown は従来どおり画面長の 85% で移動する。
 
 ---
 
