@@ -38,14 +38,14 @@ pub fn startup_folder(last_folder: Option<&Path>) -> Option<PathBuf> {
         .or_else(desktop_dir)
 }
 
+/// 起動時の last_folder を復元する。フォルダ (または仮想フォルダ ZIP/PDF) がそのまま
+/// 開けるならそれを、消えていたら**直近の存在する親フォルダ**を返す。どの親も辿れない
+/// (ドライブ自体が無い等) ときだけ None で、呼び出し側が Desktop にフォールバックする。
+///
+/// 末端サブフォルダだけ削除されたケース (例: `D:\Photos\2024\Jan` の `Jan` だけ消えた)
+/// で、いきなり Desktop へ飛ばさず `D:\Photos\2024` を開くための祖先遡上。
 fn resolve_startup_last_folder(path: &Path) -> Option<PathBuf> {
-    if path.is_dir() {
-        return Some(path.to_path_buf());
-    }
-    if path.is_file() && crate::folder_tree::is_virtual_folder(path) {
-        return Some(path.to_path_buf());
-    }
-    None
+    crate::folder_tree::resolve_openable_path(path)
 }
 
 fn push_unique_location(

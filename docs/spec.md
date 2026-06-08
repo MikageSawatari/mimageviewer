@@ -571,7 +571,7 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 | `thumb_aspect_auto` | bool | false | サムネイル比率の自動選択モード。`true` のときフォルダ内画像の比率に応じてグリッドセル比率を自動で切り替える。フォルダごとの前回確定値は `auto_aspect_cache.db` に保存され、再訪時の初期比率に使われる。キャッシュ復元時は保存時の sample 数と同等以上の実測 sample が集まるまで、途中統計による上書きを抑制する。キャッシュ管理ダイアログの現在フォルダ削除 / 全削除 / 古いキャッシュ削除で、この判定結果も対応する範囲だけ削除される (詳細: [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md))。 |
 | `sort_order` | SortOrder | FileName | ソート順（FileName / Natural / MtimeAsc / MtimeDesc） |
 | `favorites` | Vec\<FavoriteEntry\> | [] | お気に入りフォルダ (`id: Uuid` + name + path + `auto_index_structure` / `auto_index_metadata` / `auto_index_thumbs` の 3 フラグ, v0.8.0〜) |
-| `last_folder` | Option\<PathBuf\> | None | 前回開いていたフォルダ。有効なフォルダ / ZIP / PDF が残っていればそれを優先し、未設定または開けない場合は Windows Known Folder API で取得した Desktop を初期フォルダとして開く |
+| `last_folder` | Option\<PathBuf\> | None | 前回開いていたフォルダ。有効なフォルダ / ZIP / PDF が残っていればそれを優先する。末端だけ消えている場合は直近の存在する親フォルダへ遡って開き、どの親も辿れない (ドライブ自体が無い等) / 未設定のときだけ Windows Known Folder API で取得した Desktop を初期フォルダとして開く |
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ZIP・PDF の開き方) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
 | `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去。初回セットアップと環境設定には、GPU 負荷が高く低スペック環境では OFF 推奨である案内とオンラインマニュアルの処理時間目安へのリンクを表示する |
