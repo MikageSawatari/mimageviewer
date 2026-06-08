@@ -8701,12 +8701,18 @@ impl App {
         // 主ボタンドラッグをパンへ振り替える。Space 検出は FS ビューポートで stale になる
         // key_down を避け OS 直読みにする。描画ドラッグ進行中は Space を無視して描画を完結させる。
         let space_held = crate::ui_fullscreen::space_held_via_os();
+        // 左/ツールパネル上のポインタはキャンバスパンに使わない (消しゴム/隠蔽と揃える。
+        // パネル除外を Space pan 開始より前に通す)。
+        let pointer_over_panel = pointer_pos.is_some_and(|pos| {
+            self.local_adjust_panel_rect(full_rect).contains(pos)
+                || self.local_adjust_tool_panel_rect(full_rect).contains(pos)
+        });
         let drawing_in_progress = self.local_adjust_mask_brush_stroke.is_some()
             || self.local_adjust_shape_drag.is_some()
             || self.local_adjust_canvas_drag.is_some()
             || self.local_adjust_mask_shape_drag_start.is_some()
             || !self.local_adjust_mask_lasso_points.is_empty();
-        if space_held && !drawing_in_progress {
+        if space_held && !drawing_in_progress && !pointer_over_panel {
             if primary_pressed {
                 if let Some(pos) = pointer_pos {
                     self.fs_pan_drag_start = Some((pos, self.fs_pan));
@@ -8728,8 +8734,9 @@ impl App {
             });
             return;
         }
-        // Space 離した瞬間の取りこぼし対策: 描画パスへ戻る前に pan drag を片付ける。
-        if !space_held && self.fs_pan_drag_start.is_some() {
+        // pan drag の後始末。Space 離し時に加え、パネル上でボタンを離した場合 (上の分岐に
+        // 入らず primary_released を取りこぼす) も拾えるよう primary_released も条件に含める。
+        if self.fs_pan_drag_start.is_some() && (!space_held || primary_released) {
             self.fs_pan_drag_start = None;
         }
 

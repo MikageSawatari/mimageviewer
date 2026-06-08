@@ -3964,15 +3964,13 @@ impl App {
         }
 
         if self.local_adjust_mode {
+            // Ctrl+Z はイベントベースの consume_key で拾う。FS viewport で stale になり得る
+            // i.modifiers.ctrl/shift の状態読みは使わない。Modifiers::CTRL の完全一致なので
+            // Ctrl+Shift+Z (やり直し) は対象外で、未消費なら下の handle_meta_undo_keys へ流れる。
             if self.local_adjust_mask_tool == crate::app::LocalAdjustMaskTool::Polygon
                 && !self.local_adjust_mask_lasso_points.is_empty()
-                && ctx.input(|i| {
-                    i.key_pressed(egui::Key::Z) && i.modifiers.ctrl && !i.modifiers.shift
-                })
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z))
             {
-                ctx.input_mut(|i| {
-                    i.consume_key(egui::Modifiers::CTRL, egui::Key::Z);
-                });
                 self.local_adjust_mask_lasso_points.pop();
                 self.show_feedback_toast("多角形: 頂点を戻しました".to_string());
                 return action;
@@ -4075,7 +4073,10 @@ impl App {
             // 未選択時に consume すると、補正パネルでフォーカス中のスライダー等へ矢印が
             // 届かなくなり微調整できなくなる (ラボ復旧時の回帰防止)。
             if self.local_adjust_selected_shape.is_some() {
-                let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+                // 高速化/15度スナップの修飾キーは OS 直読み (FS viewport の stale 回避)。
+                // 矢印/ブラケットの consume_key は NONE/CTRL 両方を拾うので step/snap だけ
+                // OS 状態で決めれば、Ctrl/Shift を離した後の残留も起きない。
+                let ctrl_held = ctrl_held_via_os();
                 let step = if ctrl_held {
                     crate::ui_adjustment_panel::LOCAL_ADJUST_NUDGE_PIXELS_FAST
                 } else {
@@ -4129,7 +4130,7 @@ impl App {
                 if self.rotate_selected_local_adjust_shape_from_shortcut(
                     fs_idx,
                     rotate_deg.to_radians(),
-                    ctx.input(|i| i.modifiers.shift),
+                    shift_held_via_os(),
                 ) {
                     ctx.request_repaint();
                     return action;
