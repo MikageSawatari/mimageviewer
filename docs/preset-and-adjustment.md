@@ -193,8 +193,8 @@ Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturatio
 
 ### 2.2 ポストフィルタ (PostFilter enum)
 
-レトロ系 (CRT ブラウン管風・機種別減色・複合) と写真系 (カラーグレーディング・アナログ・絵画風・実用)
-をまとめて扱う表示エフェクト。全 38 バリアント:
+レトロ系 (CRT ブラウン管風・機種別減色・複合) と写真系 (カラーグレーディング・アナログ・絵画風・実用)、
+漫画 疑似カラーをまとめて扱う表示エフェクト。全 40 バリアント:
 
 | グループ | バリアント | 内容 |
 | --- | --- | --- |
@@ -232,6 +232,8 @@ Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturatio
 | 絵画風 | `Halftone` | 6×6 セルの輝度平均 + 距離判定ドット、2 階調グレー |
 | 絵画風 | `OilPaint` | 7×7 Kuwahara フィルタ (4 象限の輝度分散最小領域の平均色) |
 | 絵画風 | `Sketch` | Sobel 3×3 + 強度反転グレー |
+| 疑似カラー | `PseudoColor4` | モノクロ原画の輝度 → クアッドトーン着色 (影=青 / 明部=橙)。GiCoCu `4color4.cur` 由来 |
+| 疑似カラー | `PseudoColorSkin` | モノクロ原画の輝度 → 肌色寄り暖色着色。再現実装 `c4.cur` 由来 |
 | 実用 | `Sharpen` | 5-tap 分離可能ブラーのアンシャープマスク (amount 0.6) |
 
 **複合プリセットの方針**: **非液晶機種 (CRT TV / モニタ接続が標準)** とブラウン管フィルタを
@@ -240,6 +242,21 @@ Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturatio
 **写真系の alpha 保持**: 全フィルタが元ピクセルの alpha を `from_rgba_unmultiplied` で伝播する。
 透過 PNG / WebP / GIF を通しても透過部分が不透明化しない。CRT 系は bilinear で alpha も補間
 (`BilinearYCtx::sample_rgba`)、減色系・写真系は元ピクセルから単純継承。
+
+### 漫画 疑似カラーの設計方針 (`mod pseudocolor`)
+
+モノクロ漫画ビューア「マンガミーヤ」で使われていた **GiCoCu (AviSynth + GIMP トーンカーブ)
+由来の「疑似四色刷り」** を再現したもの。元データは GIMP `.cur` カーブファイル (5ch ×
+制御点形式) で、合成 (value) カーブを先に適用してから R/G/B カーブを当てる。実装では
+**輝度 (0..255) → RGB の最終 256-entry LUT** にオフラインで畳み込んだ定数 (`C4_*` / `SKIN_*`)
+を持ち、ピクセル輝度 (`pixel_lum_f32`) を index に LUT を引くだけ (`#[rustfmt::skip]` の固定表)。
+
+- `PseudoColor4` = `4color4.cur` (GiCoCu 運用の定番、影=青 / 明部=橙のクアッドトーン)
+- `PseudoColorSkin` = `c4.cur` (再現実装由来、中間〜明部を肌色寄りの暖色に着色)
+- 入力はモノクロ原画想定。カラー入力でも輝度を取って着色するので duotone 的に振る舞う。
+- LUT 定数は `dist/manga_pseudocolor/gen_rust_lut.py` が `.cur` から生成 (制御点 → Catmull-Rom
+  補間 → 256-entry)。元 `.cur` の出所と解析スクリプトも同ディレクトリ (git 管理外)。
+- 退行ガード: `post_filter::tests::pseudocolor_maps_known_gray_values` が代表点の RGB を固定。
 
 ### 減色の分類: 固定 vs 適応
 

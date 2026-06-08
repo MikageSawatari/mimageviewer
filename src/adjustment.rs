@@ -112,6 +112,14 @@ pub enum PostFilter {
     /// スケッチ風 (エッジ抽出 + グレー化)
     Sketch,
 
+    // ── 漫画 疑似カラー (モノクロ原画の擬似着色) ──
+    /// 疑似カラー・4色刷り風 (影=青 / 明部=橙のクアッドトーン)。
+    /// マンガミーヤの GiCoCu 用 4color4.cur トーンカーブを LUT 化したもの。
+    PseudoColor4,
+    /// 疑似カラー・肌色 (中間〜明部を肌色寄りに着色)。
+    /// マンガミーヤ系再現実装の c4.cur トーンカーブを LUT 化したもの。
+    PseudoColorSkin,
+
     // ── 実用 ────────────────────────────────────────────────────────
     /// シャープ化 (アンシャープマスク)
     Sharpen,
@@ -163,6 +171,9 @@ impl PostFilter {
         Self::Halftone,
         Self::OilPaint,
         Self::Sketch,
+        // 漫画 疑似カラー
+        Self::PseudoColor4,
+        Self::PseudoColorSkin,
         // 実用
         Self::Sharpen,
     ];
@@ -207,6 +218,8 @@ impl PostFilter {
             Self::Halftone => "ハーフトーン（漫画風）",
             Self::OilPaint => "オイルペイント風",
             Self::Sketch => "スケッチ風",
+            Self::PseudoColor4 => "疑似カラー（4色刷り）",
+            Self::PseudoColorSkin => "疑似カラー（肌色）",
             Self::Sharpen => "シャープ化",
         }
     }

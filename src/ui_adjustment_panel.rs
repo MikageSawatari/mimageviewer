@@ -7648,6 +7648,18 @@ fn draw_sliders(
                 PostFilter::Sketch.display_label(),
             );
             ui.separator();
+            group_heading(ui, "── 漫画 疑似カラー ──");
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::PseudoColor4,
+                PostFilter::PseudoColor4.display_label(),
+            );
+            ui.selectable_value(
+                &mut params.post_filter,
+                PostFilter::PseudoColorSkin,
+                PostFilter::PseudoColorSkin.display_label(),
+            );
+            ui.separator();
             group_heading(ui, "── 実用 ──");
             ui.selectable_value(
                 &mut params.post_filter,
