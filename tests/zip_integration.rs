@@ -55,6 +55,37 @@ fn enumerate_image_entries_from_real_zip() {
 }
 
 #[test]
+fn read_entry_bytes_accepts_backslash_zip_entry_names() {
+    let tmp = TempDir::new().unwrap();
+    let zip_path = tmp.path().join("legacy-backslash.zip");
+
+    {
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip_writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        zip_writer
+            .start_file("chapter-01\\001-left.png", options)
+            .unwrap();
+        zip_writer.write_all(b"png bytes").unwrap();
+        zip_writer.finish().unwrap();
+    }
+
+    let entries = zip_loader::enumerate_image_entries(&zip_path).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].entry_name, "chapter-01/001-left.png");
+
+    let data = zip_loader::read_entry_bytes(&zip_path, "chapter-01/001-left.png").unwrap();
+    assert_eq!(data, b"png bytes");
+
+    let mut archive = zip_loader::open_archive(&zip_path).unwrap();
+    let data =
+        zip_loader::read_entry_from_archive(&mut archive, "chapter-01/001-left.png").unwrap();
+    assert_eq!(data, b"png bytes");
+}
+
+#[test]
 fn enumerate_empty_zip_returns_empty() {
     let tmp = TempDir::new().unwrap();
     let zip_path = tmp.path().join("empty.zip");
@@ -150,6 +181,40 @@ fn read_entry_bytes_from_nested_zip() {
     let data =
         zip_loader::read_entry_bytes(&zip_path, "chapters/ch01.zip/sub/inner_img2.png").unwrap();
     assert_eq!(data, b"inner png 2");
+}
+
+#[test]
+fn read_entry_bytes_accepts_backslash_names_across_nested_zip() {
+    let tmp = TempDir::new().unwrap();
+    let zip_path = tmp.path().join("outer-backslash.zip");
+
+    let mut inner_cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut w = zip::ZipWriter::new(&mut inner_cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file("sub\\inner.png", options).unwrap();
+        w.write_all(b"inner png").unwrap();
+        w.finish().unwrap();
+    }
+    let inner_bytes = inner_cursor.into_inner();
+
+    {
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut w = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.start_file("chapters\\ch01.zip", options).unwrap();
+        w.write_all(&inner_bytes).unwrap();
+        w.finish().unwrap();
+    }
+
+    let entries = zip_loader::enumerate_image_entries(&zip_path).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].entry_name, "chapters/ch01.zip/sub/inner.png");
+
+    let data = zip_loader::read_entry_bytes(&zip_path, "chapters/ch01.zip/sub/inner.png").unwrap();
+    assert_eq!(data, b"inner png");
 }
 
 #[test]

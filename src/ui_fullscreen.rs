@@ -418,6 +418,16 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
             | egui::Key::End
             | egui::Key::PageUp
             | egui::Key::PageDown
+            | egui::Key::Num0
+            | egui::Key::Num1
+            | egui::Key::Num2
+            | egui::Key::Num3
+            | egui::Key::Num4
+            | egui::Key::Num5
+            | egui::Key::Num6
+            | egui::Key::Num7
+            | egui::Key::Num8
+            | egui::Key::Num9
             | egui::Key::W
             | egui::Key::Enter
             | egui::Key::Escape
@@ -4965,21 +4975,21 @@ impl App {
             };
             self.show_feedback_toast(format!("[{}:{}]", key_num, mode.label()));
         }
-        // 連結方式トグルは連続読み対応アイテム (画像 / ZIP画像 / PDFページ) のときだけ許可する。
-        // 動画やセパレータ上で切り替えると、見えない flow がフォルダ単位で永続化され、
-        // arrow ナビや AI/消しゴム/比較キーが壊れる (レンダラは動画では flow を無視するため
-        // 画面は通常表示のままになり、原因が分かりにくい)。supported 判定が Video/separator を除外する。
-        if key_6 && self.vertical_reading_supported_idx(fs_idx) {
+        // 表示操作の数字キーは、連結読みで画面中央に来る ZIP 区切りページ上でも有効にする。
+        // セパレータは画像処理の対象ではないが、0/6/7 はフォルダ単位の表示設定なので
+        // レンダラと同じ連結読み対応判定 (画像 / ZIP画像 / PDFページ / ZipSeparator) を使う。
+        let display_mode_keys_supported = self.continuous_reading_supported_idx(fs_idx);
+        if key_6 && display_mode_keys_supported {
             let flow = self.reading_flow.next();
             self.set_reading_flow_for_fullscreen(ctx, fs_idx, flow);
             self.show_feedback_toast(format!("[6:{}]", flow.label()));
         }
-        if key_7 && self.vertical_reading_supported_idx(fs_idx) {
+        if key_7 && display_mode_keys_supported {
             let direction = self.reading_direction.next();
             self.set_reading_direction_for_fullscreen(ctx, fs_idx, direction);
             self.show_feedback_toast(format!("[7:{}]", direction.label()));
         }
-        if key_0 && self.vertical_reading_supported_idx(fs_idx) {
+        if key_0 && display_mode_keys_supported {
             self.cycle_fullscreen_fit_mode(ctx, fs_idx);
             self.show_feedback_toast(format!(
                 "[0:{}]",
@@ -6615,7 +6625,13 @@ impl App {
             (band.height() * 0.28).clamp(20.0, 44.0)
         };
         let sub_size = (title_size * 0.52).clamp(12.0, 20.0);
-        let title_y = band.center().y - title_size * 0.62;
+        let show_sub = band.height() >= 72.0 && band.width() >= 120.0;
+        let line_gap = (title_size * 0.22).clamp(8.0, 14.0);
+        let title_y = if show_sub {
+            band.center().y - (title_size + line_gap + sub_size) * 0.5
+        } else {
+            band.center().y - title_size * 0.5
+        };
         crate::ui_helpers::draw_centered_elided_label(
             painter,
             band,
@@ -6626,14 +6642,14 @@ impl App {
             18.0,
         );
 
-        if band.height() >= 72.0 && band.width() >= 120.0 {
+        if show_sub {
             crate::ui_helpers::draw_centered_elided_label(
                 painter,
                 band,
                 "作品の区切り",
                 sub_size,
                 egui::Color32::from_rgb(150, 180, 220),
-                band.center().y + sub_size * 0.35,
+                title_y + title_size + line_gap,
                 18.0,
             );
         }

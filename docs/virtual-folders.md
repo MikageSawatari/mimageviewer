@@ -80,6 +80,9 @@ RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<h
      `get_pool()` がブロックして init 完了を待つ (通常数百 ms、一度だけ)。
    - __MACOSX/ やドットファイル (._*) を除外
    - Vec<ZipImageEntry> を返す (path, uncompressed_size, mtime)
+   - Windows ツール由来などで ZIP 内エントリ名に `\` が含まれる場合も、列挙時は
+     `/` に正規化する。読み戻し (`read_entry_bytes` / `read_entry_from_archive`) では
+     `/` で見つからない場合だけ `\` 名も試し、古い/非標準寄り ZIP との互換性を保つ。
    - **v0.7.0 以降: 外側 ZIP 内の .zip エントリは再帰展開され**、
      entry_name は "chapters/ch01.zip/page01.jpg" のように親 ZIP 名を含む
      パスになる。内側 ZIP バイト列は zip_loader 内の LRU キャッシュ (256MB) に
@@ -321,8 +324,13 @@ ZipSeparator は **UI 上の区切り線**なので、以下のように特殊�
 - サムネイルロード対象外 (LoadRequest を作らない)
 - キーボードナビゲーションでスキップされる
 - ソート時に境界として機能 (隣のグループに渡らない)
+- フルスクリーンの表示モード操作 (`0`〜`7`) は例外的に有効。連結読みでは
+  区切りページ自体が画面中央に来るため、そこでページ構成・連結方式・横方向・
+  フィットを切り替えられるようにする。
 
 新しいキーボード操作や一括処理を追加する時、ZipSeparator をスキップするのを忘れないこと。
+ただし表示設定のように区切りページ上でも操作できるべきものは、描画側の
+`continuous_reading_supported_idx` と判定を揃える。
 
 ---
 

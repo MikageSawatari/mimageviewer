@@ -543,6 +543,23 @@ fn read_by_name<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
 ) -> std::io::Result<Vec<u8>> {
+    match read_by_exact_name(archive, entry_name) {
+        Ok(bytes) => Ok(bytes),
+        Err(first_err) if first_err.kind() == std::io::ErrorKind::NotFound => {
+            let legacy_name = entry_name.replace('/', "\\");
+            if legacy_name == entry_name {
+                return Err(first_err);
+            }
+            read_by_exact_name(archive, &legacy_name).map_err(|_| first_err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn read_by_exact_name<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    entry_name: &str,
+) -> std::io::Result<Vec<u8>> {
     let mut entry = archive
         .by_name(entry_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;

@@ -3779,6 +3779,10 @@ mod favorite_adjustment_defaults_tests {
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg"))); // idx 0: 対応画像
         app.items
             .push(GridItem::Video(std::path::PathBuf::from("c:/p/v.mp4"))); // idx 1: 動画
+        app.items.push(GridItem::ZipSeparator {
+            dir_display: "chapter".to_owned(),
+        }); // idx 2: ZIP 区切り
+        app.thumbnails.push(ThumbnailState::Pending);
         app.thumbnails.push(ThumbnailState::Pending);
         app.thumbnails.push(ThumbnailState::Pending);
 
@@ -3794,10 +3798,13 @@ mod favorite_adjustment_defaults_tests {
 
         // 動画は対応外 → 非アクティブ (連結方式トグル / scroll の誤適用を防ぐ)
         assert!(!app.continuous_reading_active_for_idx(1));
+        // ZIP 区切りは連結読みの仮想ページとして扱う
+        assert!(app.continuous_reading_active_for_idx(2));
 
         // 解析モード中はレンダラが単ページへフォールバックするので非アクティブ
         app.analysis_mode = true;
         assert!(!app.continuous_reading_active_for_idx(0));
+        assert!(!app.continuous_reading_active_for_idx(2));
         app.analysis_mode = false;
 
         // 比較モード中も非アクティブ
@@ -8718,6 +8725,15 @@ mod still_window_mode_key_tests {
         app.items.len() - 1
     }
 
+    fn push_zip_separator(app: &mut App, label: &str) -> usize {
+        app.items.push(GridItem::ZipSeparator {
+            dir_display: label.to_owned(),
+        });
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.items.len() - 1
+    }
+
     fn begin_root_key_pass(ctx: &egui::Context, key: egui::Key, repeat: bool) {
         let modifiers = egui::Modifiers::NONE;
         ctx.begin_pass(egui::RawInput {
@@ -8802,6 +8818,63 @@ mod still_window_mode_key_tests {
             "Backspace on a regular image should close fullscreen and return to the grid"
         );
         assert_eq!(app.selected, Some(idx));
+    }
+
+    #[test]
+    fn zip_separator_root_num6_cycles_reading_flow() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_zip_separator(&mut app, "chapter-01");
+        app.fullscreen_idx = Some(idx);
+        app.reading_flow = crate::settings::ReadingFlow::Paged;
+
+        begin_root_key_pass(&ctx, egui::Key::Num6, false);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled);
+        assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
+    }
+
+    #[test]
+    fn zip_separator_root_num7_changes_reading_direction_and_spread() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_zip_separator(&mut app, "chapter-01");
+        app.fullscreen_idx = Some(idx);
+        app.spread_mode = crate::settings::SpreadMode::LtrCover;
+        app.reading_direction = crate::settings::ReadingDirection::Ltr;
+
+        begin_root_key_pass(&ctx, egui::Key::Num7, false);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled);
+        assert_eq!(
+            app.reading_direction,
+            crate::settings::ReadingDirection::Rtl
+        );
+        assert_eq!(app.spread_mode, crate::settings::SpreadMode::RtlCover);
+    }
+
+    #[test]
+    fn zip_separator_root_num0_cycles_fit_mode_in_continuous_reading() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_zip_separator(&mut app, "chapter-01");
+        app.fullscreen_idx = Some(idx);
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
+
+        begin_root_key_pass(&ctx, egui::Key::Num0, false);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled);
+        assert_ne!(
+            app.settings.fullscreen_fit_mode,
+            crate::settings::FullscreenFitMode::Width
+        );
     }
 }
 
