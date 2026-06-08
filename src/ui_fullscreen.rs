@@ -273,6 +273,21 @@ fn shift_held_via_os() -> bool {
     false
 }
 
+/// 物理的な Space キー押下を OS から直接読む (`ctrl_held_via_os` と同じ理由)。
+/// 補正レイヤー編集中の Space+ドラッグ パンに使う。FS ビューポートでは
+/// `ctx.input(|i| i.key_down(Space))` がフォーカス不在で stale になり得るため。
+#[cfg(windows)]
+pub(crate) fn space_held_via_os() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SPACE};
+
+    unsafe { GetAsyncKeyState(VK_SPACE.0 as i32) < 0 }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn space_held_via_os() -> bool {
+    false
+}
+
 /// 静止画フルスクリーンで Enter キーをフルスクリーン解除トリガーとして消費すべきか
 /// 判定する純関数 (副作用ゼロ)。
 ///

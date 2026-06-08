@@ -8690,9 +8690,29 @@ impl App {
                 i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
             )
         });
-        // フルスクリーンビューポートでは `modifiers.ctrl` が stale になり得るので、Ctrl 依存の
-        // 境界筆→通常筆切替は OS 直読み (ソースプレビューの Ctrl 検出と同じ方式) を使う。
-        let ctrl_held = modifiers.ctrl || crate::ui_fullscreen::ctrl_held_via_os();
+        // フルスクリーンビューポートでは `modifiers.ctrl` が stale (Ctrl を離しても true の
+        // まま) になり得る。それを OR で混ぜると境界筆が常時「通常筆」化して境界の向こう側まで
+        // 塗る回帰になるため、Ctrl 依存の境界筆→通常筆切替は OS 直読みのみを使う
+        // (ソースプレビューの Ctrl 検出と同じ方式)。
+        let ctrl_held = crate::ui_fullscreen::ctrl_held_via_os();
+
+        // Space ホールド中はキャンバスをパンする (ラボの `pan_mode = Space/中ボタン` 相当)。
+        // 補正モードでは主ボタンが塗り/図形に取られて従来のドラッグパンが効かないため、
+        // Space を押している間だけ主ボタンドラッグをパンへ振り替える。Space の検出は
+        // FS ビューポートでの stale を避けて Ctrl/Shift と同様 OS 直読みにする。
+        if crate::ui_fullscreen::space_held_via_os() {
+            if primary_down {
+                let delta = ctx.input(|i| i.pointer.delta());
+                if delta != egui::Vec2::ZERO {
+                    self.fs_pan += delta;
+                    ctx.request_repaint();
+                }
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else {
+                ctx.set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            return;
+        }
 
         if primary_released {
             if self.local_adjust_shape_drag.is_some() {
@@ -9496,8 +9516,9 @@ impl App {
         });
         let active_mask_edit_target =
             effective_local_mask_edit_target(&layer, self.local_adjust_mask_edit_target);
-        let ctrl_down =
-            ui.ctx().input(|i| i.modifiers.ctrl) || crate::ui_fullscreen::ctrl_held_via_os();
+        // 塗り経路 (`ctrl_held`) と同じく OS 直読みのみ。stale な `modifiers.ctrl` を混ぜると
+        // Ctrl 非押下でも境界オーバーレイ表示/吸着が出てしまう。
+        let ctrl_down = crate::ui_fullscreen::ctrl_held_via_os();
         if ctrl_down
             && active_mask_edit_target.is_some()
             && matches!(
