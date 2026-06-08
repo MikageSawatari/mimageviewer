@@ -596,9 +596,38 @@ struct VerticalReadingPage {
 }
 
 #[derive(Clone, Debug)]
+struct VerticalReadingSeparator {
+    text: String,
+    rect: egui::Rect,
+}
+
+#[derive(Clone, Debug)]
 struct ContinuousReadingUnitSpec {
     anchor_idx: usize,
     pages: Vec<usize>,
+    separator_text: Option<String>,
+}
+
+impl ContinuousReadingUnitSpec {
+    fn pages(anchor_idx: usize, pages: Vec<usize>) -> Self {
+        Self {
+            anchor_idx,
+            pages,
+            separator_text: None,
+        }
+    }
+
+    fn separator(anchor_idx: usize, text: String) -> Self {
+        Self {
+            anchor_idx,
+            pages: Vec::new(),
+            separator_text: Some(text),
+        }
+    }
+
+    fn contains_idx(&self, idx: usize) -> bool {
+        self.anchor_idx == idx || self.pages.contains(&idx)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -658,6 +687,14 @@ fn continuous_reading_page_rects(
         rects.push((page.idx, rect));
     }
     rects
+}
+
+fn continuous_separator_base_size(flow: ReadingFlow, fallback: egui::Vec2) -> egui::Vec2 {
+    if flow.is_horizontal() {
+        egui::vec2((fallback.x * 0.16).clamp(140.0, 320.0), fallback.y.max(1.0))
+    } else {
+        egui::vec2(fallback.x.max(1.0), (fallback.y * 0.16).clamp(90.0, 220.0))
+    }
 }
 
 /// 透過背景の描画スタイル。B キーで 3 モードを循環する。
@@ -2521,9 +2558,7 @@ impl App {
 
                         // ── 画像 / 動画 / セパレータ描画 ──
                         let media_t0 = std::time::Instant::now();
-                        if let Some(sep) = state.separator_text.as_ref() {
-                            Self::draw_fs_separator(ui, image_rect, sep);
-                        } else if self.continuous_reading_active_for_idx(fs_idx) {
+                        if self.continuous_reading_active_for_idx(fs_idx) {
                             self.draw_fs_continuous_reading(
                                 ui,
                                 ctx,
@@ -2531,6 +2566,8 @@ impl App {
                                 fs_idx,
                                 state.original_preview_active,
                             );
+                        } else if let Some(sep) = state.separator_text.as_ref() {
+                            Self::draw_fs_separator(ui, image_rect, sep);
                         } else {
                             match spread_pair {
                                 SpreadPair::Single => {
@@ -5715,14 +5752,7 @@ impl App {
                 // 2026-05 ユーザー要望: 拡大縮小のつもりでホイールを回して画像が切り替
                 // わる事故を避けるため、360 ON 時はホイール全部 (= 修飾キー無視) を
                 // FOV 操作に振る。前後ナビは矢印キーで行う。
-            } else if !self.reading_flow.is_paged()
-                && !ctrl_held
-                && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
-                && self
-                    .fullscreen_idx
-                    .is_some_and(|idx| self.vertical_reading_supported_idx(idx))
-                && !self.is_overlay_edit_mode_active()
-            {
+            } else if !ctrl_held && continuous_active {
                 let delta = self.continuous_reading_wheel_delta_px(ctx, wheel_y);
                 self.scroll_vertical_reading_by(ctx, delta);
             } else {
@@ -6516,6 +6546,68 @@ impl App {
         );
     }
 
+    /// 連結読み中の ZIP セパレータを、画像ページ間の軽い区切り帯として描画する。
+    fn draw_fs_continuous_separator(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        sep: &str,
+        flow: crate::settings::ReadingFlow,
+    ) {
+        let inset = if flow.is_horizontal() {
+            egui::vec2(8.0, 18.0)
+        } else {
+            egui::vec2(18.0, 8.0)
+        };
+        let band = rect.shrink2(inset);
+        if band.width() < 32.0 || band.height() < 32.0 {
+            return;
+        }
+
+        painter.rect_filled(
+            band,
+            8.0,
+            egui::Color32::from_rgba_unmultiplied(30, 45, 80, 180),
+        );
+        painter.rect_stroke(
+            band,
+            8.0,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(135, 165, 215, 130),
+            ),
+            egui::StrokeKind::Outside,
+        );
+
+        let title_size = if flow.is_horizontal() {
+            (band.width() * 0.11).clamp(18.0, 32.0)
+        } else {
+            (band.height() * 0.28).clamp(20.0, 44.0)
+        };
+        let sub_size = (title_size * 0.52).clamp(12.0, 20.0);
+        let title_y = band.center().y - title_size * 0.62;
+        crate::ui_helpers::draw_centered_elided_label(
+            painter,
+            band,
+            sep,
+            title_size,
+            egui::Color32::WHITE,
+            title_y,
+            18.0,
+        );
+
+        if band.height() >= 72.0 && band.width() >= 120.0 {
+            crate::ui_helpers::draw_centered_elided_label(
+                painter,
+                band,
+                "作品の区切り",
+                sub_size,
+                egui::Color32::from_rgb(150, 180, 220),
+                band.center().y + sub_size * 0.35,
+                18.0,
+            );
+        }
+    }
+
     /// フルスクリーンの画像 / 動画 / 読込中 / 失敗 表示を描画する。
     /// zoom/pan が Some のとき分析モードのズーム/パンを適用する。
     /// `bg_style` が Default 以外のとき、画像 rect の直下に透過背景を塗る。
@@ -7022,6 +7114,11 @@ impl App {
         )
     }
 
+    fn continuous_reading_supported_idx(&self, idx: usize) -> bool {
+        self.vertical_reading_supported_idx(idx)
+            || matches!(self.items.get(idx), Some(GridItem::ZipSeparator { .. }))
+    }
+
     /// レンダラが連続読み (縦/横スクロール) を実際に描画する条件と同一の述語。
     ///
     /// 入力ハンドラ (キー / ホイール / クリック / gamepad) は「連続読みとして扱うか」を
@@ -7036,7 +7133,7 @@ impl App {
         !self.reading_flow.is_paged()
             && !self.analysis_mode
             && !matches!(self.items.get(idx), Some(GridItem::Video(_)))
-            && self.vertical_reading_supported_idx(idx)
+            && self.continuous_reading_supported_idx(idx)
             && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
             && !self.is_overlay_edit_mode_active()
             && !self.is_panorama_mode_active(idx)
@@ -7047,7 +7144,7 @@ impl App {
         idx: usize,
     ) -> Option<(Vec<ContinuousReadingUnitSpec>, usize)> {
         let image_indices = build_image_reading_indices(&self.items, &self.visible_indices);
-        let mut units = Vec::new();
+        let mut image_units = Vec::new();
 
         if self.spread_mode.is_spread() {
             let pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
@@ -7057,36 +7154,24 @@ impl App {
                 if (pair_start == 1 && pos == 0)
                     || is_landscape(current, &self.fs_cache, &self.thumbnails)
                 {
-                    units.push(ContinuousReadingUnitSpec {
-                        anchor_idx: current,
-                        pages: vec![current],
-                    });
+                    image_units.push(ContinuousReadingUnitSpec::pages(current, vec![current]));
                     pos += 1;
                     continue;
                 }
 
                 if (pos - pair_start) % 2 != 0 {
-                    units.push(ContinuousReadingUnitSpec {
-                        anchor_idx: current,
-                        pages: vec![current],
-                    });
+                    image_units.push(ContinuousReadingUnitSpec::pages(current, vec![current]));
                     pos += 1;
                     continue;
                 }
 
                 let Some(&partner) = image_indices.get(pos + 1) else {
-                    units.push(ContinuousReadingUnitSpec {
-                        anchor_idx: current,
-                        pages: vec![current],
-                    });
+                    image_units.push(ContinuousReadingUnitSpec::pages(current, vec![current]));
                     pos += 1;
                     continue;
                 };
                 if is_landscape(partner, &self.fs_cache, &self.thumbnails) {
-                    units.push(ContinuousReadingUnitSpec {
-                        anchor_idx: current,
-                        pages: vec![current],
-                    });
+                    image_units.push(ContinuousReadingUnitSpec::pages(current, vec![current]));
                     pos += 1;
                     continue;
                 }
@@ -7096,25 +7181,50 @@ impl App {
                 } else {
                     vec![current, partner]
                 };
-                units.push(ContinuousReadingUnitSpec {
-                    anchor_idx: current,
-                    pages,
-                });
+                image_units.push(ContinuousReadingUnitSpec::pages(current, pages));
                 pos += 2;
             }
         } else {
-            units.extend(
+            image_units.extend(
                 image_indices
                     .iter()
                     .copied()
-                    .map(|idx| ContinuousReadingUnitSpec {
-                        anchor_idx: idx,
-                        pages: vec![idx],
-                    }),
+                    .map(|idx| ContinuousReadingUnitSpec::pages(idx, vec![idx])),
             );
         }
 
-        let pos = units.iter().position(|unit| unit.pages.contains(&idx))?;
+        let mut unit_by_page = std::collections::HashMap::new();
+        for (unit_pos, unit) in image_units.iter().enumerate() {
+            for &page_idx in &unit.pages {
+                unit_by_page.insert(page_idx, unit_pos);
+            }
+        }
+
+        let mut inserted_image_units = std::collections::HashSet::new();
+        let mut units = Vec::new();
+        for &visible_idx in &self.visible_indices {
+            match self.items.get(visible_idx) {
+                Some(GridItem::ZipSeparator { dir_display }) => {
+                    units.push(ContinuousReadingUnitSpec::separator(
+                        visible_idx,
+                        dir_display.clone(),
+                    ));
+                }
+                Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. }) => {
+                    let Some(&unit_pos) = unit_by_page.get(&visible_idx) else {
+                        continue;
+                    };
+                    if inserted_image_units.insert(unit_pos) {
+                        units.push(image_units[unit_pos].clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let pos = units.iter().position(|unit| unit.contains_idx(idx))?;
         Some((units, pos))
     }
 
@@ -7165,8 +7275,19 @@ impl App {
     fn continuous_unit_base_size(
         &mut self,
         unit: &ContinuousReadingUnitSpec,
+        flow: crate::settings::ReadingFlow,
         fallback: egui::Vec2,
     ) -> ContinuousReadingUnitSize {
+        if unit.separator_text.is_some() {
+            let size = continuous_separator_base_size(flow, fallback);
+            return ContinuousReadingUnitSize {
+                width: size.x,
+                height: size.y,
+                page_gap: 0.0,
+                pages: Vec::new(),
+            };
+        }
+
         let mut page_bases = unit
             .pages
             .iter()
@@ -7221,7 +7342,7 @@ impl App {
         zoom: f32,
         fallback: egui::Vec2,
     ) -> ContinuousReadingUnitSize {
-        let mut base = self.continuous_unit_base_size(unit, fallback);
+        let mut base = self.continuous_unit_base_size(unit, flow, fallback);
         let fit_mode = self.effective_fullscreen_fit_mode();
         let spread_gap = self.settings.spread_page_gap_px.min(200) as f32;
         let page_gap = if base.pages.len() > 1 {
@@ -7298,7 +7419,12 @@ impl App {
         image_rect: egui::Rect,
         units: &[ContinuousReadingUnitSpec],
         current_pos: usize,
-    ) -> Option<(Vec<VerticalReadingPage>, Vec<usize>, Vec<f32>)> {
+    ) -> Option<(
+        Vec<VerticalReadingPage>,
+        Vec<VerticalReadingSeparator>,
+        Vec<usize>,
+        Vec<f32>,
+    )> {
         if units.is_empty() || current_pos >= units.len() {
             return None;
         }
@@ -7383,6 +7509,7 @@ impl App {
         }
 
         let mut pages = Vec::new();
+        let mut separators = Vec::new();
         for list_pos in visible_positions.iter().copied() {
             let Some(size) = sizes.get(list_pos) else {
                 continue;
@@ -7405,12 +7532,19 @@ impl App {
             };
             let unit_rect =
                 egui::Rect::from_center_size(unit_center, egui::vec2(size.width, size.height));
+            if let Some(text) = units[list_pos].separator_text.as_ref() {
+                separators.push(VerticalReadingSeparator {
+                    text: text.clone(),
+                    rect: unit_rect,
+                });
+                continue;
+            }
             for (idx, rect) in continuous_reading_page_rects(unit_rect, size) {
                 pages.push(VerticalReadingPage { idx, rect });
             }
         }
 
-        Some((pages, visible_positions, offsets))
+        Some((pages, separators, visible_positions, offsets))
     }
 
     fn update_continuous_reading_prefetch_window(
@@ -7423,7 +7557,7 @@ impl App {
         }
         let current_pos = self
             .fullscreen_idx
-            .and_then(|idx| units.iter().position(|unit| unit.pages.contains(&idx)))
+            .and_then(|idx| units.iter().position(|unit| unit.contains_idx(idx)))
             .unwrap_or_else(|| visible_positions.first().copied().unwrap_or(0))
             .min(units.len() - 1);
         let mut visible_positions = visible_positions
@@ -7658,7 +7792,7 @@ impl App {
             self.fs_spread_layout = None;
             return;
         };
-        let Some((pages, visible_positions, offsets)) =
+        let Some((pages, separators, visible_positions, offsets)) =
             self.continuous_reading_layout(ctx, image_rect, &units, current_pos)
         else {
             self.fs_spread_layout = None;
@@ -7734,6 +7868,14 @@ impl App {
                 &location,
                 holdover_for_locked.as_ref(),
                 display_tex.as_ref(),
+            );
+        }
+        for separator in separators {
+            Self::draw_fs_continuous_separator(
+                &painter,
+                separator.rect,
+                &separator.text,
+                self.reading_flow,
             );
         }
 
@@ -13259,6 +13401,18 @@ mod tests {
         assert_eq!(rects[0].0, 42);
         assert!((rects[0].1.center().x - unit_rect.center().x).abs() < 0.001);
         assert!((rects[0].1.width() - 96.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn continuous_separator_unit_does_not_count_as_page() {
+        let units = vec![
+            ContinuousReadingUnitSpec::separator(10, "chapter".to_owned()),
+            ContinuousReadingUnitSpec::pages(11, vec![11, 12]),
+        ];
+
+        assert!(units[0].contains_idx(10));
+        assert!(units[0].pages.is_empty());
+        assert_eq!(App::continuous_visible_page_count(&units, &[0, 1]), 2);
     }
 
     // ── decide_local_adjust_preview_action unit tests ─────────────────────
