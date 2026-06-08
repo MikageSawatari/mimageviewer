@@ -30,7 +30,7 @@ impl ArchiveFormat {
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_ascii_lowercase().as_str() {
             "rar" | "cbr" => Some(Self::Rar),
-            "7z" => Some(Self::SevenZ),
+            "7z" | "cb7" => Some(Self::SevenZ),
             "lzh" | "lha" => Some(Self::Lzh),
             _ => None,
         }
@@ -643,7 +643,18 @@ mod tests {
             ArchiveFormat::from_extension("CBR"),
             Some(ArchiveFormat::Rar)
         );
+        // CB7 は 7z と同じ変換経路。
+        assert_eq!(
+            ArchiveFormat::from_extension("cb7"),
+            Some(ArchiveFormat::SevenZ)
+        );
+        assert_eq!(
+            ArchiveFormat::from_extension("CB7"),
+            Some(ArchiveFormat::SevenZ)
+        );
+        // CBZ / ZIP はネイティブ ZIP 扱いなので変換フォーマットではない (folder_tree 側で判定)。
         assert_eq!(ArchiveFormat::from_extension("zip"), None);
+        assert_eq!(ArchiveFormat::from_extension("cbz"), None);
     }
 
     #[test]

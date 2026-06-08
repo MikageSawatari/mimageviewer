@@ -459,7 +459,7 @@ fn format_to_db(f: ArchiveFormat) -> &'static str {
 fn format_from_db(s: &str) -> Option<ArchiveFormat> {
     match s {
         "rar" | "cbr" => Some(ArchiveFormat::Rar),
-        "7z" => Some(ArchiveFormat::SevenZ),
+        "7z" | "cb7" => Some(ArchiveFormat::SevenZ),
         "lzh" | "lha" => Some(ArchiveFormat::Lzh),
         _ => None,
     }

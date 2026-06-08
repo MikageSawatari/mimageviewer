@@ -93,14 +93,21 @@ pub fn is_apple_double(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// .zip / .pdf ファイルを仮想フォルダとして扱うかの判定。
+/// `.zip` と、その別名 (comic-book) 拡張子 `.cbz` を ZIP 仮想フォルダとして扱うかの判定。
+/// 入力は小文字化済みの拡張子 (他の `is_*_ext` と同じ規約)。CBZ は実体が ZIP なので
+/// 変換せずネイティブ ZIP として最速で閲覧する。
+pub fn is_zip_extension(ext: &str) -> bool {
+    ext == "zip" || ext == "cbz"
+}
+
+/// .zip / .cbz / .pdf ファイルを仮想フォルダとして扱うかの判定。
 pub fn is_virtual_folder(path: &Path) -> bool {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
-    ext == "zip" || ext == "pdf"
+    is_zip_extension(&ext) || ext == "pdf"
 }
 
 // -----------------------------------------------------------------------
@@ -155,7 +162,9 @@ fn folder_qualifies(path: &Path, cancel: Option<&AtomicBool>, include_video: boo
             .unwrap_or_default();
         return match ext.as_str() {
             "pdf" => true,
-            "zip" => crate::zip_loader::first_image_entry(path, cancel).is_some(),
+            e if is_zip_extension(e) => {
+                crate::zip_loader::first_image_entry(path, cancel).is_some()
+            }
             _ => false,
         };
     }
@@ -553,6 +562,30 @@ mod tests {
         for ext in ["jpg", "jpeg", "png", "webp", "bmp", "gif"] {
             assert!(SUPPORTED_EXTENSIONS.contains(&ext), "missing: {}", ext);
         }
+    }
+
+    #[test]
+    fn zip_extension_includes_cbz() {
+        // CBZ は実体が ZIP なのでネイティブ ZIP として扱う (入力は小文字化済み拡張子)。
+        assert!(is_zip_extension("zip"));
+        assert!(is_zip_extension("cbz"));
+        assert!(!is_zip_extension("pdf"));
+        assert!(!is_zip_extension("rar"));
+        assert!(!is_zip_extension("cbr"));
+        assert!(!is_zip_extension("7z"));
+        assert!(!is_zip_extension("cb7"));
+    }
+
+    #[test]
+    fn virtual_folder_recognizes_cbz_and_zip_and_pdf() {
+        assert!(is_virtual_folder(Path::new(r"C:\books\a.cbz")));
+        assert!(is_virtual_folder(Path::new(r"C:\books\a.CBZ"))); // 大文字も
+        assert!(is_virtual_folder(Path::new(r"C:\books\a.zip")));
+        assert!(is_virtual_folder(Path::new(r"C:\books\a.pdf")));
+        // RAR/7z 系は変換対象であって仮想フォルダ (ネイティブ閲覧) ではない。
+        assert!(!is_virtual_folder(Path::new(r"C:\books\a.cbr")));
+        assert!(!is_virtual_folder(Path::new(r"C:\books\a.cb7")));
+        assert!(!is_virtual_folder(Path::new(r"C:\books\a.jpg")));
     }
 
     #[test]

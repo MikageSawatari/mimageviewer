@@ -14,7 +14,7 @@ ZIP アーカイブと PDF ドキュメントは「中身のページをフォ�
 | `Folder(PathBuf)` | 通常フォルダ | 実ファイルシステムのディレクトリ |
 | `Image(PathBuf)` | 通常フォルダ内 | 画像ファイル |
 | `Video(PathBuf)` | 通常フォルダ内 | 動画ファイル |
-| `ZipFile(PathBuf)` | 通常フォルダ内 | ZIP アーカイブ (未展開) |
+| `ZipFile(PathBuf)` | 通常フォルダ内 | ZIP アーカイブ (未展開)。`.zip` と別名 `.cbz` を含む (`folder_tree::is_zip_extension` で判定) |
 | `PdfFile(PathBuf)` | 通常フォルダ内 | PDF ドキュメント (未展開) |
 | `ZipImage { zip_path, entry_name }` | ZIP を開いた中 | ZIP 内の画像エントリ |
 | `ZipSeparator { dir_display }` | ZIP 内にサブディレクトリがある時 | 区切り表示用の疑似アイテム (ロード対象外) |
@@ -23,6 +23,23 @@ ZIP アーカイブと PDF ドキュメントは「中身のページをフォ�
 `Folder/Image/Video/ZipFile/PdfFile` は「外側」= 通常フォルダのリスト。
 `ZipImage/ZipSeparator/PdfPage` は「内側」= 仮想フォルダのリスト。
 同じリストに両者が混在することはない。
+
+### 拡張子 → 扱いの対応 (comic-book 別名を含む)
+
+`scan_directory` (`src/app.rs`) はファイル拡張子で次のように分類する:
+
+| 拡張子 | 扱い | GridItem | 根拠 |
+| --- | --- | --- | --- |
+| `.zip` / **`.cbz`** | ネイティブ ZIP (変換不要で最速ブラウズ) | `ZipFile` | `folder_tree::is_zip_extension` |
+| `.pdf` | ネイティブ PDF | `PdfFile` | `ext == "pdf"` |
+| `.rar` / **`.cbr`** | クリックで ZIP 変換 | `ConvertibleArchive{Rar}` | `archive_converter::ArchiveFormat::from_extension` |
+| `.7z` / **`.cb7`** | クリックで ZIP 変換 | `ConvertibleArchive{SevenZ}` | 同上 |
+| `.lzh` / `.lha` | クリックで ZIP 変換 | `ConvertibleArchive{Lzh}` | 同上 |
+
+comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱い。**CBZ は ZIP と同じ
+ネイティブ閲覧経路**に乗るので `is_zip_extension` を見ている箇所すべて (`is_virtual_folder` /
+`load_folder_with_scan` の分岐 / `build_and_save_one` のサムネ catch-up / ネスト ZIP 再帰) を
+通す必要がある。`.cbt` (tar) / `.cba` (ace) は未対応。
 
 ---
 

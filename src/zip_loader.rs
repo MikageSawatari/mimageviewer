@@ -27,8 +27,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
-const ZIP_EXT: &str = "zip";
-
 // ── 内側 ZIP バイト列キャッシュ ──────────────────────────────────
 
 /// ネスト ZIP の展開済みバイト列を保持するキャッシュ。
@@ -269,7 +267,7 @@ fn enumerate_recursive<R: Read + Seek>(
             });
             continue;
         }
-        if ext == ZIP_EXT {
+        if crate::folder_tree::is_zip_extension(&ext) {
             let size = entry.size();
             let cached = NESTED_CACHE.get(outer_zip_path, &full_name);
             let bytes = match cached {
@@ -344,7 +342,7 @@ fn first_image_recursive<R: Read + Seek>(
         if is_image_ext(&ext) {
             return Some(full_name);
         }
-        if ext == ZIP_EXT {
+        if crate::folder_tree::is_zip_extension(&ext) {
             let size = entry.size();
             let cached = NESTED_CACHE.get(outer_zip_path, &full_name);
             let bytes = match cached {
@@ -438,7 +436,7 @@ fn read_first_image_recursive<R: Read + Seek>(
             }
             return Some((full_name, bytes));
         }
-        if ext == ZIP_EXT {
+        if crate::folder_tree::is_zip_extension(&ext) {
             let size = entry.size();
             let cached = NESTED_CACHE.get(outer_zip_path, &full_name);
             let bytes = match cached {

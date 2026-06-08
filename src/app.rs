@@ -903,7 +903,7 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
                 all_media.push((p, false, mtime, file_size));
             } else if SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()) {
                 all_media.push((p, true, mtime, file_size));
-            } else if ext_lower == "zip" {
+            } else if crate::folder_tree::is_zip_extension(&ext_lower) {
                 folders.push((GridItem::ZipFile(p), Some((mtime, file_size))));
             } else if ext_lower == "pdf" {
                 folders.push((GridItem::PdfFile(p), Some((mtime, file_size))));
@@ -7000,14 +7000,14 @@ impl App {
             let _ = crate::pdf_loader::bump_render_context_epoch();
         }
         self.record_folder_nav_transition(&path);
-        // パスが .zip / .pdf ファイルなら仮想フォルダとして開く
+        // パスが .zip / .cbz / .pdf ファイルなら仮想フォルダとして開く
         if path.is_file() {
             let ext = path
                 .extension()
                 .and_then(|e| e.to_str())
                 .map(|e| e.to_ascii_lowercase())
                 .unwrap_or_default();
-            if ext == "zip" {
+            if crate::folder_tree::is_zip_extension(&ext) {
                 self.load_zip_as_folder(path);
                 if crate::perf::is_enabled() {
                     crate::perf::event(
@@ -9205,7 +9205,7 @@ impl App {
                     true,
                 )
             }
-            Some("zip") => {
+            Some("zip") | Some("cbz") => {
                 let Some((target_idx, entry_name)) =
                     self.items.iter().enumerate().find_map(|(i, it)| match it {
                         GridItem::ZipImage { entry_name, .. } => Some((i, entry_name.clone())),
@@ -26196,7 +26196,7 @@ impl App {
                             if let Some((mt, fs)) = meta() {
                                 images.push((p, mt, fs));
                             }
-                        } else if ext_lower == "zip" {
+                        } else if crate::folder_tree::is_zip_extension(&ext_lower) {
                             if let Some((mt, fs)) = meta() {
                                 zip_files.push((p, mt, fs));
                             }
