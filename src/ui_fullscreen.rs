@@ -3964,12 +3964,29 @@ impl App {
         }
 
         if self.local_adjust_mode {
-            // Ctrl+Z はイベントベースの consume_key で拾う。FS viewport で stale になり得る
-            // i.modifiers.ctrl/shift の状態読みは使わない。Modifiers::CTRL の完全一致なので
-            // Ctrl+Shift+Z (やり直し) は対象外で、未消費なら下の handle_meta_undo_keys へ流れる。
+            // 多角形作成中の Ctrl+Z は頂点戻し。ただし consume_key は matches_logically 判定の
+            // ため Modifiers::CTRL 指定でも Ctrl+Shift+Z (やり直し) を吸ってしまう
+            // (undo_ops.rs handle_meta_undo_keys の注記と同じ罠)。そこでイベントの修飾子を
+            // matches_exact(CTRL) で完全一致判定し、Ctrl 単独の Z だけを消費する。Ctrl+Shift+Z は
+            // 残して下の handle_meta_undo_keys で redo へ流す。FS viewport で stale になる
+            // i.modifiers の状態読みは使わない。
             if self.local_adjust_mask_tool == crate::app::LocalAdjustMaskTool::Polygon
                 && !self.local_adjust_mask_lasso_points.is_empty()
-                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z))
+                && ctx.input_mut(|i| {
+                    let before = i.events.len();
+                    i.events.retain(|e| {
+                        !matches!(
+                            e,
+                            egui::Event::Key {
+                                key: egui::Key::Z,
+                                pressed: true,
+                                modifiers,
+                                ..
+                            } if modifiers.matches_exact(egui::Modifiers::CTRL)
+                        )
+                    });
+                    i.events.len() != before
+                })
             {
                 self.local_adjust_mask_lasso_points.pop();
                 self.show_feedback_toast("多角形: 頂点を戻しました".to_string());
