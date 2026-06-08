@@ -41,6 +41,27 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 `load_folder_with_scan` の分岐 / `build_and_save_one` のサムネ catch-up / ネスト ZIP 再帰) を
 通す必要がある。`.cbt` (tar) / `.cba` (ace) は未対応。
 
+### 変換アーカイブ閲覧中の current_folder と「ユーザー視点パス」の二重化
+
+RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<hash>\book.zip`)、以降は
+それを通常 ZIP として開く。このとき **`current_folder` はキャッシュ ZIP を指す**が、ユーザー
+視点 (address bar / BS の親 / 次回起動の復元) では **元アーカイブ** を見せる必要がある。両者は
+`archive_source_override` で橋渡しする (`open_archive_via_cache` が set、`effective_folder()` =
+`archive_source_override.or(current_folder)`)。
+
+新しく「現在のフォルダ」を永続化・ナビゲーションに使う箇所を足すときは、`current_folder` を
+直接使わず **`effective_folder()` を使う** こと。過去に漏れた実例:
+
+- **`last_folder` (次回起動の復元先)**: `start_loading_items` の保存で `source_path` (= キャッシュ
+  ZIP) を入れていたため、再起動で `archive_cache\..\book.zip` を素の ZIP として開き、address に
+  キャッシュパスが漏れた。`effective_folder()` を保存するよう修正。
+- **起動時復元のルーティング**: `App::update` 初回フレームは `load_folder` ではなく
+  `load_folder_or_convert_archive` を通す。元アーカイブパスを渡すとキャッシュ参照 →
+  `open_archive_via_cache` で開き直し、キャッシュが無ければ変換ダイアログを出す。
+- **`resolve_openable_path` / `is_convertible_archive_path`**: 起動復元・アドレスバー入力で
+  変換アーカイブを「開けるパス」として返す (ネイティブ ZIP/PDF を判定する `is_virtual_folder`
+  とは別関数)。これが無いと変換アーカイブのパスが親フォルダに丸められて本を開き直せない。
+
 ---
 
 ## 2. 仮想フォルダの展開

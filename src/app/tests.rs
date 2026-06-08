@@ -1117,6 +1117,21 @@ mod phase_c_folder_nav_history_tests {
             Some(original_dir),
             "BS should resolve to the source archive's parent, not the cache directory"
         );
+        // 次回起動の復元用 last_folder も、キャッシュ ZIP ではなく元アーカイブを保存する
+        // (= startup_folder_mode=previous で開き直すと元 .lzh を再変換/再キャッシュして開く)。
+        assert_eq!(
+            app.settings.last_folder.as_ref(),
+            Some(&source),
+            "last_folder must persist the source archive for startup restore"
+        );
+        assert!(
+            !app.settings
+                .last_folder
+                .as_ref()
+                .map(|p| p.to_string_lossy().contains("archive_cache"))
+                .unwrap_or(false),
+            "last_folder must not leak the converted cache ZIP path"
+        );
     }
 
     #[test]

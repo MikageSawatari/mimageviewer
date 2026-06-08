@@ -10175,7 +10175,13 @@ impl App {
         // 検索結果用の合成パスは last_folder に記録しない (次回起動時に復元しないため)
         let save_t0 = std::time::Instant::now();
         if source_path != search_results_synthetic_path() {
-            self.settings.last_folder = Some(source_path);
+            // 変換アーカイブ (RAR/CBR/7z/LZH) 閲覧中は source_path (= current_folder) が
+            // キャッシュ ZIP (`archive_cache\..\book.zip`) を指す。次回起動で復元すべきは
+            // 元アーカイブなので、archive_source_override を反映した effective_folder() を
+            // 保存する (通常フォルダ / ネイティブ ZIP/PDF では override が無く source_path と
+            // 一致するので挙動不変)。recent_folders は open_archive_via_cache が既に元
+            // アーカイブを記録済み。
+            self.settings.last_folder = Some(self.effective_folder().unwrap_or(source_path));
             self.settings.recent_folders = self.recent_folders.clone();
             self.settings.save();
         }
@@ -27148,7 +27154,12 @@ impl eframe::App for App {
                 self.settings.last_folder.as_deref(),
                 self.settings.startup_folder_path.as_deref(),
             ) {
-                self.load_folder(folder);
+                // last_folder には変換アーカイブ (RAR/CBR/7z/LZH) の元パスが入りうるので、
+                // load_folder ではなく load_folder_or_convert_archive を通す。キャッシュが
+                // あれば open_archive_via_cache が元アーカイブを開き直し (current_folder は
+                // キャッシュ ZIP だが address/override は元アーカイブ)、無ければ変換ダイアログを
+                // 出す。通常フォルダ / ネイティブ ZIP/PDF は format=None なので load_folder に委譲され挙動不変。
+                let _ = self.load_folder_or_convert_archive(folder);
             }
 
             // AI ランタイムを初期化

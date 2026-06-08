@@ -110,6 +110,18 @@ pub fn is_virtual_folder(path: &Path) -> bool {
     is_zip_extension(&ext) || ext == "pdf"
 }
 
+/// RAR/CBR / 7z/CB7 / LZH/LHA など、クリックで ZIP に変換してから開くアーカイブか。
+///
+/// `is_virtual_folder` (= 変換不要でネイティブに開ける ZIP/PDF) とは別物。起動時の
+/// last_folder 復元やアドレスバー入力で、変換アーカイブも「開けるパス」として扱うために使う。
+/// 実際の変換 / キャッシュ参照は呼び出し側 (`load_folder_or_convert_archive`) の責務。
+pub fn is_convertible_archive_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .and_then(crate::archive_converter::ArchiveFormat::from_extension)
+        .is_some()
+}
+
 // -----------------------------------------------------------------------
 // 画像有無の判定
 // -----------------------------------------------------------------------
@@ -505,7 +517,9 @@ pub fn path_eq(a: &Path, b: &Path) -> bool {
 /// 与えられたパスを「開けるパス」に解決する。
 ///
 /// - 通常のディレクトリならそのまま返す
-/// - `.zip` ファイル (ファイルとして存在) ならそのまま返す
+/// - `.zip` / `.cbz` / `.pdf` ファイル (ファイルとして存在) ならそのまま返す
+/// - RAR/CBR / 7z/CB7 / LZH/LHA など変換対応アーカイブ (ファイルとして存在) もそのまま返す
+///   (実際の変換 / キャッシュ参照は呼び出し側 `load_folder_or_convert_archive` が行う)
 /// - 存在しない/開けない場合は親ディレクトリを再帰的に遡り、最初に見つかった
 ///   有効なディレクトリを返す
 /// - どこにも辿り着けない場合 (ドライブ自体が存在しない等) は `None`
@@ -517,7 +531,7 @@ pub fn resolve_openable_path(path: &Path) -> Option<std::path::PathBuf> {
     if path.is_dir() {
         return Some(path.to_path_buf());
     }
-    if path.is_file() && is_virtual_folder(path) {
+    if path.is_file() && (is_virtual_folder(path) || is_convertible_archive_path(path)) {
         return Some(path.to_path_buf());
     }
 
@@ -586,6 +600,34 @@ mod tests {
         assert!(!is_virtual_folder(Path::new(r"C:\books\a.cbr")));
         assert!(!is_virtual_folder(Path::new(r"C:\books\a.cb7")));
         assert!(!is_virtual_folder(Path::new(r"C:\books\a.jpg")));
+    }
+
+    #[test]
+    fn convertible_archive_path_detection() {
+        for ext in ["rar", "cbr", "7z", "cb7", "lzh", "lha", "RAR", "CBR"] {
+            assert!(
+                is_convertible_archive_path(&PathBuf::from(format!(r"C:\books\a.{ext}"))),
+                "{ext} should be a convertible archive"
+            );
+        }
+        // ネイティブ ZIP/PDF は変換対象ではない (is_virtual_folder の領分)。
+        for ext in ["zip", "cbz", "pdf", "jpg"] {
+            assert!(
+                !is_convertible_archive_path(&PathBuf::from(format!(r"C:\books\a.{ext}"))),
+                "{ext} should not be a convertible archive"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_openable_path_keeps_convertible_archive() {
+        // 変換アーカイブ (CBR) は親フォルダに丸めず、そのパス自身を返す。
+        // (旧実装は is_virtual_folder=false で親フォルダへ落ちていた → 起動時に元の本を
+        //  開き直せなかった回帰の防止)
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cbr = tmp.path().join("book.cbr");
+        std::fs::write(&cbr, b"rar").unwrap();
+        assert_eq!(resolve_openable_path(&cbr).as_deref(), Some(cbr.as_path()));
     }
 
     #[test]
