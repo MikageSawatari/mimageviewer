@@ -69,7 +69,7 @@ pub enum SnapshotTarget {
     /// 通常 filesystem path (= Folder / Image / Video / ZipFile / PdfFile)。
     /// GridItem への復元は kind と組み合わせて行う。
     Fs(PathBuf),
-    /// 7z / LZH 等の変換対応アーカイブ (Codex P3 修正: format を保持)。
+    /// RAR / 7z / LZH 等の変換対応アーカイブ (Codex P3 修正: format を保持)。
     /// 旧版は SnapshotTarget::Fs にまとめて reconstruct で Folder に退化していたが、
     /// snapshot 範囲内で再 open する際に変換 dialog を出せず壊れる原因になっていた。
     ConvertibleArchive {

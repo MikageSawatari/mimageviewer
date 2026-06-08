@@ -131,15 +131,18 @@ $miv = Get-Process mimageviewer
 - BS で親フォルダに遷移する
 - 遷移前のフォルダがハイライトされる
 
-### 5. アーカイブ変換 + Ctrl+↑↓ ナビゲーション（v0.7.0）
+### 5. アーカイブ変換 + Ctrl+↑↓ ナビゲーション（v0.7.0 / RAR は v1.1.0）
 
-**目的:** 7z/LZH → ZIP 変換機能と既存の Ctrl+↑↓ ナビゲーションが整合することを確認する。
+**目的:** RAR/7z/LZH → ZIP 変換機能と既存の Ctrl+↑↓ ナビゲーションが整合することを確認する。
 過去に `filter_virtual_folder_duplicates` / skip-limit 関連で複数回の回帰が起きた経路。
 
 **事前準備:**
 
 - `testimage/archive/` に以下を配置:
   - `vol01.7z` （画像のみ、小さめの 7z。変換対象）
+  - `vol01.rar` または `vol01.cbr` （画像のみ、小さめの RAR。変換対象）
+  - `locked.rar` または `locked.cbr` （画像入りのパスワード付き RAR。変換対象）
+  - `split.part01.rar` / `split.part02.rar` （分割 RAR。`part01` のみ表示対象）
   - `vol02/` （展開済みの通常フォルダ、画像入り）
   - `vol03.zip` （通常 ZIP、画像入り）
   - `cover_only.lzh` （画像 1〜2 枚の LZH。変換対象）
@@ -159,9 +162,24 @@ $miv = Get-Process mimageviewer
 **確認項目:**
 - Ctrl+↓ で次の兄弟（`vol02/` または `vol03.zip`）へ移動する
 - Ctrl+↑ で `vol01.7z` が開かれた状態へ戻る（タイトルバー／アドレスバーも元 7z に戻る）
-- 変換済み 7z は `sorted_subdirs` の対象外なので、DFS は隣の通常フォルダ・ZIP を辿る
+- 変換済み RAR/7z/LZH は `sorted_subdirs` の対象外なので、DFS は隣の通常フォルダ・ZIP を辿る
 
-#### 5-2. 同名フォルダが存在する 7z のスキップ動作
+#### 5-1b. パスワード付き RAR / CBR
+
+**手順:**
+1. `locked.rar` をクリック
+2. パスワード入力ダイアログで、変換後 ZIP キャッシュがパスワードなしで保存される旨が表示されることを確認
+3. 誤ったパスワードを入力し、エラー表示後に再入力できることを確認
+4. 正しいパスワードを入力し、確認ダイアログから「変換して開く」
+5. いったん親フォルダに戻り、同じ `locked.rar` を再度開く
+
+**確認項目:**
+- RAR パスワード自体は保存されない
+- 変換済み ZIP キャッシュが残っている間は、2 回目以降はパスワード入力なしで開ける
+- 「設定 → 変換済みアーカイブキャッシュ管理…」で該当行の形式欄に `PW` が表示される
+- キャッシュ削除後に再度開くと、改めてパスワード入力が必要になる
+
+#### 5-2. 同名フォルダが存在する変換対象アーカイブのスキップ動作
 
 **手順:**
 1. `testimage/archive/` に `vol02.7z` を配置（中身は何でも良い）
@@ -173,6 +191,7 @@ $miv = Get-Process mimageviewer
 - `vol02.7z` は同名フォルダ `vol02/` があれば非表示
 - 設定 OFF にすると `vol02.7z` がグリッドに現れる
 - 設定 ON に戻すと再度消える（`load_folder` が再実行される）
+- `split.part02.rar` など分割 RAR の後続パートは設定に関係なくグリッドに現れない
 
 #### 5-3. 環境設定を開いて OK を押しても元アーカイブ文脈が保たれる
 
@@ -191,7 +210,7 @@ $miv = Get-Process mimageviewer
 #### 5-4. 変換中の Ctrl+↑↓（過渡状態）
 
 **手順:**
-1. 大きめの 7z（100MB 以上）をクリックして変換開始
+1. 大きめの RAR または 7z（100MB 以上）をクリックして変換開始
 2. 進捗ダイアログが表示されている最中に <kbd>Ctrl</kbd>+<kbd>↓</kbd> を押す
 3. ダイアログ上の <kbd>Esc</kbd> またはキャンセルボタンを確認
 
@@ -258,16 +277,17 @@ $miv = Get-Process mimageviewer
 - 次の画像を開くと黒背景に戻る（保存されない）
 - 不透明画像では B キーで「透過画像ではないため背景は切り替えできません」と案内される
 
-### 7. WIC / Susie 画像 × ZIP / LZH のサムネイル認識（v0.7.0）
+### 7. WIC / Susie 画像 × ZIP / RAR / LZH のサムネイル認識（v0.7.0 / RAR は v1.1.0）
 
 **目的:** v0.7.0 で `zip_loader::IMAGE_EXTS` の独自ハードコードを廃して
-`folder_tree::is_recognized_image_ext` に統一したため、ZIP/7z/LZH の中に
+`folder_tree::is_recognized_image_ext` に統一したため、ZIP/RAR/7z/LZH の中に
 HEIC / AVIF / JXL / RAW や PI / MAG のような非ネイティブ画像があっても
 本体・通常フォルダと同じ集合で認識される。
 
 **事前準備:**
 - `testimage/16bit/zip/C165_206.ZIP`（PI / MAG が混在する実サンプル）
 - HEIC / AVIF / RAW などを含む任意の ZIP（`testimage/heic_sample.zip` 等）
+- HEIC / AVIF / RAW または PI / MAG を含む任意の RAR / CBR
 - `testimage/16bit/lzh/C165.LZH` のような実 LZH ファイル
 - Susie プラグイン (ifpi.spi / ifmag.spi) が `susie_plugins/` に配置済み
 

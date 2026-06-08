@@ -157,6 +157,7 @@
         </thead>
         <tbody>
           <tr><td><code>.zip</code></td><td>ZIP</td><td>アーカイブ内の画像をそのまま閲覧可能。ネストされた ZIP（ZIP in ZIP）もフラット展開で表示</td></tr>
+          <tr><td><code>.rar</code> / <code>.cbr</code></td><td>RAR / CBR</td><td>クリックで ZIP に変換して閲覧（パスワード付き対応。パスワード自体は保存せず、変換後 ZIP キャッシュはパスワードなし。分割 RAR は先頭パートから開く）</td></tr>
           <tr><td><code>.7z</code></td><td>7z</td><td>クリックで ZIP に変換して閲覧（変換は初回のみ、2 回目以降はキャッシュから高速表示）</td></tr>
           <tr><td><code>.lzh</code> / <code>.lha</code></td><td>LZH</td><td>クリックで ZIP に変換して閲覧（7z と同様）</td></tr>
         </tbody>
@@ -165,8 +166,8 @@
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        RAR はライセンス都合で非対応です。詳しくは <a href="faq.html#archive-rar">FAQ</a> を参照してください。
         変換済み ZIP のキャッシュは「設定 → 変換済みアーカイブキャッシュ管理…」から一覧・削除できます。
+        RAR 展開には RARLAB UnRAR を使用します。詳しくは <a href="faq.html#archive-rar">FAQ</a> を参照してください。
       </div>
     </div>
 

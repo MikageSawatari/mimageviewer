@@ -29,7 +29,7 @@ pub enum CacheMaintTask {
         folder: PathBuf,
         /// Auto 比率キャッシュ側で削除するユーザー視点の対象。
         ///
-        /// 通常は `folder` と同じだが、変換済み 7z/LZH 閲覧中は `folder` が
+        /// 通常は `folder` と同じだが、変換済み RAR/7z/LZH 閲覧中は `folder` が
         /// キャッシュ ZIP、Auto 比率キャッシュは元アーカイブパスで保存される。
         auto_aspect_folder: Option<PathBuf>,
     },

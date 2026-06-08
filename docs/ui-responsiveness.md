@@ -313,7 +313,7 @@ v0.8.1 で Codex レビューが指摘したが、通常運用での体感影響
 - **archive cache hit 判定** — [src/ui_dialogs/archive_convert.rs `try_archive_cache_lookup`](../src/ui_dialogs/archive_convert.rs)
   - `std::fs::metadata(src)` + `ArchiveCacheDb::lookup()` (SQLite SELECT + cache ZIP の
     `exists()`、stale 時は `remove_file()`) を UI スレッドで実行。
-  - 発火点は `ConvertibleArchive` (7z/LZH) を Enter / ダブルクリックする瞬間のみで、
+  - 発火点は `ConvertibleArchive` (RAR/7z/LZH) を Enter / ダブルクリックする瞬間のみで、
     通常閲覧・サムネイル処理のホットパスではない。ローカルでは 1ms 以下。
   - 直すなら `ArchiveConvertPhase::CheckingCache` を追加して worker で lookup、結果で
     cache 即開 / 変換確認へ分岐する形が素直。

@@ -154,7 +154,7 @@ fn lowercase_ext(name: &str) -> Option<String> {
 
 /// ZIP 内エントリが画像として扱える拡張子か判定する。
 ///
-/// 通常フォルダ・7z/LZH 変換と同じ [`crate::folder_tree::is_recognized_image_ext`]
+/// 通常フォルダ・RAR/7z/LZH 変換と同じ [`crate::folder_tree::is_recognized_image_ext`]
 /// に委譲することで、ネイティブ (image クレート) ・WIC (HEIC / AVIF / JXL / TIFF /
 /// RAW) ・ロード済み Susie プラグイン (PI / MAG / Q0 等) の対応拡張子が
 /// すべて ZIP 内でも同じように認識される。

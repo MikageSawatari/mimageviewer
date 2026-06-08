@@ -236,6 +236,13 @@ fn convert_format_detection_from_path() {
         ArchiveFormat::from_extension("lha"),
         Some(ArchiveFormat::Lzh)
     );
+    assert_eq!(
+        ArchiveFormat::from_extension("rar"),
+        Some(ArchiveFormat::Rar)
+    );
+    assert_eq!(
+        ArchiveFormat::from_extension("cbr"),
+        Some(ArchiveFormat::Rar)
+    );
     assert_eq!(ArchiveFormat::from_extension("zip"), None);
-    assert_eq!(ArchiveFormat::from_extension("rar"), None);
 }

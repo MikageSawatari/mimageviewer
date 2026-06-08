@@ -1,7 +1,7 @@
-//! 7z / LZH → ZIP 変換の確認・進捗ダイアログ (v0.7.0 Task 15)。
+//! RAR / 7z / LZH → ZIP 変換の確認・進捗ダイアログ。
 //!
 //! フロー:
-//!   1. グリッドで 7z / LZH をクリック → `App::request_archive_convert` が
+//!   1. グリッドで RAR / 7z / LZH をクリック → `App::request_archive_convert` が
 //!      `ArchiveConvertState::Scanning` に遷移し、バックグラウンドで画像エントリを数える。
 //!   2. スキャン完了 → `Confirm` フェーズに遷移し、画像数・サイズ見積もりを表示。
 //!   3. [ 変換して開く ] → `Converting` フェーズに遷移、変換ワーカーを spawn。
@@ -23,7 +23,8 @@ use eframe::egui;
 use crate::app::App;
 use crate::archive_cache::ArchiveCacheDb;
 use crate::archive_converter::{
-    ArchiveFormat, ArchiveImageSummary, ConvertError, ConvertProgress, convert_to_zip, scan_summary,
+    ArchiveFormat, ArchiveImageSummary, ConvertError, ConvertProgress,
+    convert_to_zip_with_password, scan_summary_with_password,
 };
 
 // ──────────────────────────────────────────────────────────────────────
@@ -58,6 +59,8 @@ impl ArchiveConvertProgressShared {
 pub(crate) enum ArchiveConvertPhase {
     /// 事前スキャン中 (画像数カウント)
     Scanning,
+    /// RAR パスワード入力待ち
+    PasswordRequired { message: Option<String> },
     /// スキャン完了、ユーザーの確認待ち
     Confirm { summary: ArchiveImageSummary },
     /// 変換実行中
@@ -72,6 +75,8 @@ pub(crate) enum ArchiveConvertPhase {
 pub(crate) struct ArchiveConvertState {
     pub src_path: PathBuf,
     pub format: ArchiveFormat,
+    pub password: Option<String>,
+    pub password_input: String,
     pub phase: ArchiveConvertPhase,
     pub rx: mpsc::Receiver<ArchiveConvertMsg>,
     /// 変換完了後にメイン UI がナビゲーションに使うキャッシュ ZIP パス。
@@ -84,6 +89,19 @@ pub(crate) struct ArchiveConvertState {
     /// (グリッド Enter / ダブルクリック / ゲームパッド × 設定 ON) のときだけ true。
     /// キャンセル時は state ごと drop されるので stale フラグが残らない。
     pub auto_fullscreen: bool,
+}
+
+fn spawn_archive_scan(
+    src: PathBuf,
+    format: ArchiveFormat,
+    password: Option<String>,
+) -> mpsc::Receiver<ArchiveConvertMsg> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = scan_summary_with_password(&src, format, password.as_deref());
+        let _ = tx.send(ArchiveConvertMsg::ScanDone(result));
+    });
+    rx
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -100,7 +118,7 @@ impl App {
         db.lookup(src, mtime, size)
     }
 
-    /// 変換済みアーカイブを開く。`src` は元 (7z/LZH)、`cached_zip` は
+    /// 変換済みアーカイブを開く。`src` は元 (RAR/7z/LZH)、`cached_zip` は
     /// 変換済み ZIP のパス。キャッシュ ZIP を load_folder し、その後
     /// `archive_source_override` / `address` を元パスに書き戻す。
     ///
@@ -157,15 +175,12 @@ impl App {
         if self.archive_convert.is_some() {
             return false;
         }
-        let (tx, rx) = mpsc::channel();
-        let src_for_scan = src.clone();
-        thread::spawn(move || {
-            let result = scan_summary(&src_for_scan, format);
-            let _ = tx.send(ArchiveConvertMsg::ScanDone(result));
-        });
+        let rx = spawn_archive_scan(src.clone(), format, None);
         self.archive_convert = Some(ArchiveConvertState {
             src_path: src,
             format,
+            password: None,
+            password_input: String::new(),
             phase: ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,
@@ -197,7 +212,7 @@ impl App {
                     };
                 }
             } else {
-                // 元 (7z/LZH) のパスを退避してから load_folder (キャッシュ ZIP) を実行、
+                // 元 (RAR/7z/LZH) のパスを退避してから load_folder (キャッシュ ZIP) を実行、
                 // その後 override に元パスを書き戻すことで、UI 表示は元ファイルの場所のままに保つ。
                 let src = self.archive_convert.as_ref().map(|s| s.src_path.clone());
                 // 明示オープンからの変換 (state.auto_fullscreen=true) のときだけ、変換成功
@@ -249,7 +264,9 @@ impl App {
             }
         }
 
-        let Some(state) = self.archive_convert.as_ref() else {
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let Some(state) = self.archive_convert.as_mut() else {
             return;
         };
         let src_name = state
@@ -263,10 +280,13 @@ impl App {
         let mut should_close = false;
         let mut start_convert = false;
         let mut cancel_convert = false;
-        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let mut apply_password = false;
 
         let title = match &state.phase {
             ArchiveConvertPhase::Scanning => format!("{fmt_label} を読み込み中..."),
+            ArchiveConvertPhase::PasswordRequired { .. } => {
+                format!("{fmt_label} パスワード入力")
+            }
             ArchiveConvertPhase::Confirm { .. } => {
                 format!("{fmt_label} を ZIP に変換")
             }
@@ -300,6 +320,60 @@ impl App {
                         }
                         ctx.request_repaint_after(std::time::Duration::from_millis(100));
                     }
+                    ArchiveConvertPhase::PasswordRequired { message } => {
+                        ui.label(format!(
+                            "この{fmt_label}ファイルを開くにはパスワードが必要です:"
+                        ));
+                        ui.label(
+                            egui::RichText::new(src_name.as_str())
+                                .size(12.0)
+                                .color(egui::Color32::from_gray(120)),
+                        );
+                        ui.add_space(4.0);
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut state.password_input)
+                                .password(true)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("パスワード"),
+                        );
+                        if !resp.has_focus() && !ui.memory(|m| m.focused().is_some()) {
+                            resp.request_focus();
+                        }
+                        if enter_pressed && (resp.has_focus() || resp.lost_focus()) {
+                            apply_password = true;
+                        }
+                        if let Some(message) = message {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(message.as_str())
+                                    .color(crate::ui_helpers::ERROR_TEXT_COLOR)
+                                    .size(crate::ui_helpers::ERROR_TEXT_SIZE),
+                            );
+                        }
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "パスワードは保存しません。変換後の ZIP キャッシュはパスワードなしで保存され、キャッシュが残っている間は次回以降そのまま開けます。",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let can_apply = !state.password_input.trim().is_empty();
+                            if ui
+                                .add_enabled(can_apply, egui::Button::new("  OK  "))
+                                .clicked()
+                            {
+                                apply_password = true;
+                            }
+                            if ui.button("キャンセル").clicked() {
+                                should_close = true;
+                            }
+                        });
+                    }
                     ArchiveConvertPhase::Confirm { summary } => {
                         ui.label(format!(
                             "{fmt_label} を ZIP に変換して閲覧できるようにします。"
@@ -309,6 +383,15 @@ impl App {
                              キャッシュとして作成されます。",
                         );
                         ui.label("キャッシュ管理メニューから削除することができます。");
+                        if state.format == ArchiveFormat::Rar && state.password.is_some() {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "この変換キャッシュはパスワードなしの ZIP として保存されます。",
+                                )
+                                .color(egui::Color32::from_rgb(170, 120, 40)),
+                            );
+                        }
                         ui.add_space(10.0);
                         ui.separator();
                         ui.add_space(6.0);
@@ -401,6 +484,9 @@ impl App {
         if start_convert {
             self.start_archive_convert();
         }
+        if apply_password {
+            self.apply_archive_password();
+        }
         if should_close {
             // 変換中ならキャンセル信号も立てておく (ワーカーは後で気付いて停止)
             if let Some(state) = self.archive_convert.as_ref() {
@@ -436,6 +522,18 @@ impl App {
                         state.phase = ArchiveConvertPhase::Confirm { summary };
                     }
                 }
+                ArchiveConvertMsg::ScanDone(Err(ConvertError::PasswordRequired)) => {
+                    state.password = None;
+                    state.password_input.clear();
+                    state.phase = ArchiveConvertPhase::PasswordRequired { message: None };
+                }
+                ArchiveConvertMsg::ScanDone(Err(ConvertError::BadPassword)) => {
+                    state.password = None;
+                    state.password_input.clear();
+                    state.phase = ArchiveConvertPhase::PasswordRequired {
+                        message: Some("パスワードが正しくありません".to_string()),
+                    };
+                }
                 ArchiveConvertMsg::ScanDone(Err(e)) => {
                     state.phase = ArchiveConvertPhase::Error {
                         message: format!("スキャン失敗: {e}"),
@@ -468,6 +566,18 @@ impl App {
                     }
                     return;
                 }
+                ArchiveConvertMsg::ConvertDone(Err(ConvertError::PasswordRequired)) => {
+                    state.password = None;
+                    state.password_input.clear();
+                    state.phase = ArchiveConvertPhase::PasswordRequired { message: None };
+                }
+                ArchiveConvertMsg::ConvertDone(Err(ConvertError::BadPassword)) => {
+                    state.password = None;
+                    state.password_input.clear();
+                    state.phase = ArchiveConvertPhase::PasswordRequired {
+                        message: Some("パスワードが正しくありません".to_string()),
+                    };
+                }
                 ArchiveConvertMsg::ConvertDone(Err(e)) => {
                     state.phase = ArchiveConvertPhase::Error {
                         message: format!("変換失敗: {e}"),
@@ -475,6 +585,23 @@ impl App {
                 }
             }
         }
+    }
+
+    fn apply_archive_password(&mut self) {
+        let Some(state) = self.archive_convert.as_mut() else {
+            return;
+        };
+        if state.format != ArchiveFormat::Rar {
+            return;
+        }
+        let password = state.password_input.trim().to_string();
+        if password.is_empty() {
+            return;
+        }
+        state.password = Some(password.clone());
+        state.password_input.clear();
+        state.rx = spawn_archive_scan(state.src_path.clone(), state.format, Some(password));
+        state.phase = ArchiveConvertPhase::Scanning;
     }
 
     /// Confirm 段階で「変換して開く」が押されたときの遷移。
@@ -503,6 +630,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let src = state.src_path.clone();
         let format = state.format;
+        let password = state.password.clone();
         let cancel_worker = cancel.clone();
         let progress_worker = progress.clone();
         let db_worker = Arc::clone(&db);
@@ -523,7 +651,14 @@ impl App {
                     .bytes_written
                     .store(p.bytes_written, Ordering::Relaxed);
             };
-            let result = convert_to_zip(&src, &dst, format, &cancel_worker, Some(&cb));
+            let result = convert_to_zip_with_password(
+                &src,
+                &dst,
+                format,
+                password.as_deref(),
+                &cancel_worker,
+                Some(&cb),
+            );
             let msg = match result {
                 Ok(summary) => {
                     let cached_size = std::fs::metadata(&dst).map(|m| m.len() as i64).unwrap_or(0);
@@ -539,6 +674,7 @@ impl App {
                             &dst,
                             cached_size,
                             summary.image_count,
+                            format == ArchiveFormat::Rar && password.is_some(),
                         );
                     }
                     ArchiveConvertMsg::ConvertDone(Ok((summary, dst, cached_size)))

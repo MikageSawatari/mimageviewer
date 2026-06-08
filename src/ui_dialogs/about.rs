@@ -46,6 +46,10 @@ impl App {
                         ui.label("LGPLv3-or-later — FFmpeg project");
                         ui.end_row();
 
+                        ui.label("UnRAR");
+                        ui.label("UnRAR license — Alexander Roshal / RARLAB");
+                        ui.end_row();
+
                         ui.label("Real-ESRGAN");
                         ui.label("BSD-3-Clause — Xintao");
                         ui.end_row();

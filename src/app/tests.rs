@@ -591,9 +591,9 @@ fn path_in_subtree_ci_keeps_drive_letter_distinct() {
     ));
 }
 
-/// 同名フォルダがある ZIP/PDF/ConvertibleArchive (7z/LZH) は
+/// 同名フォルダがある ZIP/PDF/ConvertibleArchive (RAR/7z/LZH) は
 /// `filter_virtual_folder_duplicates` でスキップされる。
-/// v0.7.0 の Task 17 で 7z/LZH への拡張を入れた回帰テスト。
+/// v0.7.0 の Task 17 で 7z/LZH への拡張を入れ、v1.1.0 で RAR も同じ経路に載せた回帰テスト。
 #[test]
 fn filter_virtual_folder_skips_archive_matching_folder() {
     let mut folders: Vec<GridItem> = vec![
@@ -606,11 +606,15 @@ fn filter_virtual_folder_skips_archive_matching_folder() {
             format: ArchiveFormat::SevenZ,
         },
         GridItem::ConvertibleArchive {
+            path: PathBuf::from("/r/vol01.rar"), // 同名フォルダあり → 消える
+            format: ArchiveFormat::Rar,
+        },
+        GridItem::ConvertibleArchive {
             path: PathBuf::from("/r/bonus.lzh"), // 同名フォルダなし → 残る
             format: ArchiveFormat::Lzh,
         },
     ];
-    let mut folder_metas: Vec<Option<(i64, i64)>> = vec![None, None, None, None, None, None];
+    let mut folder_metas: Vec<Option<(i64, i64)>> = vec![None, None, None, None, None, None, None];
 
     App::filter_virtual_folder_duplicates(&mut folders, &mut folder_metas);
 
@@ -630,7 +634,7 @@ fn filter_virtual_folder_skips_archive_matching_folder() {
     assert_eq!(
         remaining_names,
         vec!["vol01", "other.zip", "bonus.lzh"],
-        "同名フォルダ vol01 があるアーカイブ 3 件は消え、他は残る",
+        "同名フォルダ vol01 があるアーカイブ 4 件は消え、他は残る",
     );
     assert_eq!(folders.len(), folder_metas.len(), "metas も同期して削除");
 }
@@ -1164,6 +1168,8 @@ mod phase_c_folder_nav_history_tests {
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: archive.clone(),
             format: ArchiveFormat::Lzh,
+            password: None,
+            password_input: String::new(),
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,
@@ -1202,6 +1208,8 @@ mod phase_c_folder_nav_history_tests {
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: archive,
             format: ArchiveFormat::Lzh,
+            password: None,
+            password_input: String::new(),
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,
@@ -1230,6 +1238,8 @@ mod phase_c_folder_nav_history_tests {
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: PathBuf::from(r"C:\miv-test\book.lzh"),
             format: ArchiveFormat::Lzh,
+            password: None,
+            password_input: String::new(),
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,
@@ -1263,6 +1273,8 @@ mod phase_c_folder_nav_history_tests {
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: PathBuf::from(r"C:\miv-test\book.lzh"),
             format: ArchiveFormat::Lzh,
+            password: None,
+            password_input: String::new(),
             phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,

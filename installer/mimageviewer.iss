@@ -58,6 +58,9 @@ Source: "readme.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; FFmpeg LGPL ライセンス本文は %APPDATA% に展開する核に同梱されるが、
 ; ライセンス対応のためインストール先にも配置しておく (ユーザーが見つけやすいように)。
 Source: "..\vendor\ffmpeg\LICENSE.txt"; DestDir: "{app}"; DestName: "FFmpeg-LICENSE.txt"; Flags: ignoreversion
+; RAR 展開には unrar crate 経由で RARLAB UnRAR ソースを組み込むため、
+; UnRAR ライセンス本文をインストール先にも配置する。
+Source: "..\UNRAR-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

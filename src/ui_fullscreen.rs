@@ -1627,7 +1627,7 @@ struct FsFrameState {
     /// 通常画像は `<folder>\<filename>`、ZIP 内画像は `<archive-path> > <entry>`、
     /// PDF ページは `<pdf-path> > Page N` の形で事前に整形して格納する。
     /// 変換済みアーカイブ閲覧中は `archive_source_override` を用いて元の
-    /// 7z/LZH のパスを表示する (キャッシュ ZIP のパスは見せない)。
+    /// RAR/7z/LZH のパスを表示する (キャッシュ ZIP のパスは見せない)。
     location_display: String,
     image_dims: Option<(u32, u32)>,
     image_file_size: Option<u64>,
@@ -12266,9 +12266,9 @@ mod tests {
         assert_eq!(out, r"C:\docs\manual.pdf > Page 5");
     }
 
-    /// 変換済み 7z/LZH を閲覧中は `effective_folder()` が元アーカイブのパスを
+    /// 変換済み RAR/7z/LZH を閲覧中は `effective_folder()` が元アーカイブのパスを
     /// 返す想定。`base_folder` にその値が渡ってくるので、キャッシュ ZIP のパス
-    /// ではなく元 7z/LZH が表示される。
+    /// ではなく元 RAR/7z/LZH が表示される。
     #[test]
     fn location_display_uses_override_path_for_converted_archives() {
         let out = compute_location_display(

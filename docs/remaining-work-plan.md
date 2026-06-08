@@ -350,7 +350,7 @@ Phase 0〜6 の主要シナリオを `tests/` 配下の統合テスト (`#[test]
 
 その他の参照:
 - `tests/zip_integration.rs` — ZIP からの読み出しテスト
-- `tests/test_archive_convert.rs` — 7z/LZH 変換テスト
+- `tests/test_archive_convert.rs` — RAR/7z/LZH 変換テスト
 - `src/mask_db.rs::tests` — ShapeOp 永続化、レガシー JSON 互換 (Phase 0 で実装済み)
 - `src/conceal_db.rs::tests` — ラウンドトリップ (Phase 4 で実装済み)
 

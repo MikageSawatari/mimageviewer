@@ -550,8 +550,8 @@ pub fn draw_pdf_badge(painter: &egui::Painter, cell_rect: egui::Rect) {
     );
 }
 
-/// 変換対象アーカイブ (7z / LZH) のサムネイルに表示するバッジ（左下、橙系）。
-/// `label` は "7z" / "LZH" など形式表示。
+/// 変換対象アーカイブ (RAR / 7z / LZH) のサムネイルに表示するバッジ（左下、橙系）。
+/// `label` は "RAR" / "7z" / "LZH" など形式表示。
 pub fn draw_archive_badge(painter: &egui::Painter, cell_rect: egui::Rect, label: &str) {
     draw_file_badge(
         painter,

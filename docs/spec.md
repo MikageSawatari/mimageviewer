@@ -324,7 +324,7 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 - **優先順位**: 手動ピン > 自動代表選定 > フォルダ/ZIP/PDF アイコン fallback
 - **無効化条件**: pin 先のファイルが存在しない / mtime/size 変化で identity が変わった
   場合、自動的に新キャッシュキーで再生成 (古い WebP は `delete_missing` で掃除される)
-- **対象外**: 検索アグリゲートビュー (Ctrl+G)、7z/LZH の変換キャッシュ ZIP を内側から
+- **対象外**: 検索アグリゲートビュー (Ctrl+G)、RAR/7z/LZH の変換キャッシュ ZIP を内側から
   閲覧中、空フォルダ、`ConvertibleArchive` 未変換アイテム (= disabled、変換完了後に
   設定可能)
 - **設定**: `環境設定 → ツールバー → 代表サムネ固定 (📌) ボタンを表示` でフォルダバー
@@ -910,6 +910,7 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - [x] 設定永続化（JSON）
 - [x] カスタマイズ可能なツールバー
 - [x] ZIP アーカイブ対応
+- [x] RAR / CBR / 7z / LZH アーカイブをクリックで無圧縮 ZIP に変換して閲覧（RAR は UnRAR 使用、パスワード付き RAR は入力ダイアログを表示。パスワード自体は保存せず、変換済み ZIP キャッシュはパスワードなしで保存。分割 RAR は先頭パートのみ表示）
 - [x] ZIP/PDF ファイルのサムネイル＋バッジ表示（フォルダ一覧で 1 枚目/1 ページ目を表示、キャッシュ対応）
 - [x] WIC 経由の画像デコード（HEIC / AVIF / JXL / TIFF / RAW）
 - [x] 動画サムネイル（Windows Shell API 経由）

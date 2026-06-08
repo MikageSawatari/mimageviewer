@@ -103,6 +103,7 @@ $copies = @(
     @{ src = 'vendor\susie-worker\mimageviewer-susie32.exe'; dst = 'mimageviewer-susie32.exe' }
     @{ src = 'vendor\vst3-host\mimageviewer-vst3-host.exe';  dst = 'mimageviewer-vst3-host.exe' }
     @{ src = 'vendor\ffmpeg\LICENSE.txt';            dst = 'LICENSE-ffmpeg.txt' }
+    @{ src = 'UNRAR-LICENSE.txt';                     dst = 'UNRAR-LICENSE.txt' }
     @{ src = 'installer\readme_portable.txt';        dst = 'readme.txt' }
 )
 

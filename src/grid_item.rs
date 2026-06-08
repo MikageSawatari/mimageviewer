@@ -18,7 +18,7 @@ pub enum GridItem {
     ZipFile(PathBuf),
     /// フォルダ一覧に表示される PDF ファイル (1ページ目のサムネイル + バッジ)
     PdfFile(PathBuf),
-    /// 7z / LZH など「ZIP に変換してから閲覧する」対象のアーカイブ (v0.7.0)。
+    /// RAR / 7z / LZH など「ZIP に変換してから閲覧する」対象のアーカイブ。
     /// クリック時に変換ダイアログを表示し、変換済み ZIP を ZipFile 相当として開く。
     ConvertibleArchive {
         path: PathBuf,

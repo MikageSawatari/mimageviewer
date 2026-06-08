@@ -757,7 +757,7 @@ impl App {
                 true
             }
             SnapshotEntryKind::ConvertibleArchive => {
-                // ConvertibleArchive (= 7z/LZH 等) は format を保持して別経路 (= 変換 cache
+                // ConvertibleArchive (= RAR/7z/LZH 等) は format を保持して別経路 (= 変換 cache
                 // 確認 + 必要なら変換 dialog) で開く。snapshot 中の自動 open は cache hit 時
                 // のみサポート (= dialog が出る case は snapshot scope を逸脱するため skip)。
                 let SnapshotTarget::ConvertibleArchive { path, format } = entry_target else {

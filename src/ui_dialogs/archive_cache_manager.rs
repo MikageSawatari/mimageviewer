@@ -1,10 +1,10 @@
-//! 変換済みアーカイブキャッシュ (7z/LZH → ZIP) の管理ダイアログ (v0.7.0)。
+//! 変換済みアーカイブキャッシュ (RAR/7z/LZH → ZIP) の管理ダイアログ。
 //!
 //! サムネイルキャッシュとは別のメニュー項目として提供する。
 //! キャッシュ 1 エントリは数百 MB 〜 GB になりうるため、
 //! ユーザーが一覧から容量を把握して手動で整理できる UI を重視する。
 //!
-//! - 一覧: 元ファイル名 (存在しないものは ✗ + 赤字)・形式 (7z / LZH)・
+//! - 一覧: 元ファイル名 (存在しないものは ✗ + 赤字)・形式 (RAR / 7z / LZH)・
 //!   キャッシュ ZIP サイズ・画像数
 //! - 操作: 個別選択削除 / 元ファイル消失を一括削除 / 全削除 / 再読込
 
@@ -274,7 +274,16 @@ fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
                                 .color(egui::Color32::from_rgb(180, 60, 60))
                         };
                         ui.label(label).on_hover_text(path_text);
-                        ui.label(entry.format.label());
+                        let format_resp = if entry.password_required {
+                            ui.label(format!("{} / PW", entry.format.label()))
+                        } else {
+                            ui.label(entry.format.label())
+                        };
+                        if entry.password_required {
+                            format_resp.on_hover_text(
+                                "パスワード付き RAR から作成したキャッシュです。ZIP キャッシュ自体は暗号化されていません。",
+                            );
+                        }
                         ui.label(format_bytes(entry.cached_zip_size.max(0) as u64));
                         ui.label(format!("{}", entry.image_count));
                         ui.end_row();

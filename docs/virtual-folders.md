@@ -187,7 +187,7 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
   弾き、`base_req` にフォールバックする。
 - **UI**: アドレスバー 📌 ボタン (左クリック toggle / 右クリック解除) + 右クリック
   メニュー「📌 代表サムネに固定 / 解除」。`Settings.show_address_bar_folder_pin` で
-  ボタン表示を切替。Ctrl+G アグリゲートビュー / 7z/LZH 変換キャッシュの drill-down
+  ボタン表示を切替。Ctrl+G アグリゲートビュー / RAR/7z/LZH 変換キャッシュの drill-down
   (`archive_source_override` Some) / 空フォルダ (idx=usize::MAX) では UI を出さない。
   ConvertibleArchive アイテム選択時は disabled + tooltip「変換後に設定可能」。
 - **書き換え反映経路**: `set_folder_thumb_pin` / `remove_folder_thumb_pin` が DB

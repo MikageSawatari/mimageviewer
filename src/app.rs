@@ -910,6 +910,11 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
             } else if let Some(fmt) =
                 crate::archive_converter::ArchiveFormat::from_extension(&ext_lower)
             {
+                if fmt == crate::archive_converter::ArchiveFormat::Rar
+                    && crate::archive_converter::is_non_first_rar_part(&p)
+                {
+                    continue;
+                }
                 folders.push((
                     GridItem::ConvertibleArchive {
                         path: p,
@@ -3078,7 +3083,7 @@ pub struct App {
     pub(crate) archive_cache_maint_pending: Option<crate::cache_maintenance::ArchiveMaintPending>,
 
     // ── 変換済みアーカイブキャッシュ (v0.7.0) ───────────────────
-    /// 7z / LZH → ZIP 変換キャッシュ DB。初期化失敗時は None。
+    /// RAR / 7z / LZH → ZIP 変換キャッシュ DB。初期化失敗時は None。
     pub(crate) archive_cache_db: Option<Arc<crate::archive_cache::ArchiveCacheDb>>,
     /// 進行中の変換ダイアログ状態。None ならダイアログ非表示。
     pub(crate) archive_convert: Option<crate::ui_dialogs::archive_convert::ArchiveConvertState>,
@@ -3090,7 +3095,7 @@ pub struct App {
     pub(crate) video_upscale_running:
         Option<crate::ui_dialogs::video_upscale::VideoUpscaleRunningTask>,
     pub(crate) video_upscale_delete_pending: Vec<std::sync::mpsc::Receiver<PathBuf>>,
-    /// 変換済みアーカイブを開いているとき、元 (7z/LZH) のパスを保持する。
+    /// 変換済みアーカイブを開いているとき、元 (RAR/7z/LZH) のパスを保持する。
     /// `current_folder` はキャッシュ ZIP を指しているので、UI 表示 / BS /
     /// Ctrl+↑↓ / タイトルバーでは本フィールドを優先する。
     /// 通常フォルダ / 通常 ZIP / PDF を開いたら load_folder が None にリセットする。
@@ -6551,7 +6556,7 @@ impl App {
     }
 
     /// ユーザー視点でのカレントフォルダ。変換済みアーカイブを開いているときは
-    /// 元 (7z/LZH) のパスを返す。通常時は `current_folder` と同じ。
+    /// 元 (RAR/7z/LZH) のパスを返す。通常時は `current_folder` と同じ。
     /// BS / Ctrl+↑↓ / タイトルバー / アドレスバー表示で使うこと。
     pub(crate) fn effective_folder(&self) -> Option<PathBuf> {
         self.archive_source_override
@@ -6562,7 +6567,7 @@ impl App {
     /// `pending_return_to_parent` (自動オープン ZIP/PDF の Esc/Enter で立つ「親フォルダ
     /// (一覧) へ戻る」予約) を消化したときのナビ先を返す。
     ///
-    /// **変換アーカイブ対応 (Codex P1)**: 変換済み 7z/LZH 閲覧中は `current_folder` が
+    /// **変換アーカイブ対応 (Codex P1)**: 変換済み RAR/7z/LZH 閲覧中は `current_folder` が
     /// キャッシュ ZIP (`%APPDATA%\...\archive_cache\..\book.zip`) を指す。そのまま
     /// `current_folder.parent()` へ戻すとキャッシュフォルダへ飛んでしまうため、ユーザー
     /// 視点の元 `.lzh` / `.7z` を返す `effective_folder()` を基準に親を取る (通常 ZIP/PDF
@@ -6760,8 +6765,8 @@ impl App {
     }
 
     /// 現在のフォルダを再読み込みする。変換済みアーカイブ閲覧中 (キャッシュ ZIP を
-    /// `current_folder` に、元 7z/LZH を `archive_source_override` に持っている状態)
-    /// は再読み込み後も override/address を元 7z/LZH に戻し、UI コンテキストを維持する。
+    /// `current_folder` に、元 RAR/7z/LZH を `archive_source_override` に持っている状態)
+    /// は再読み込み後も override/address を元 RAR/7z/LZH に戻し、UI コンテキストを維持する。
     ///
     /// 用途: 環境設定 OK 押下時の同名ファイル設定変更・Susie 設定変更など、再読み込みは
     /// 必要だが元アーカイブの文脈を保ちたいケース。
@@ -6876,7 +6881,7 @@ impl App {
         self.load_folder_with_scan(path, None);
     }
 
-    /// 通常のフォルダ / ZIP / PDF はそのまま開き、変換対応アーカイブ (7z/LZH)
+    /// 通常のフォルダ / ZIP / PDF はそのまま開き、変換対応アーカイブ (RAR/7z/LZH)
     /// は有効なキャッシュがあれば元パス表示を維持したまま開く。未変換なら既存の
     /// 変換確認ダイアログを出す。
     pub(crate) fn load_folder_or_convert_archive(&mut self, path: PathBuf) -> FolderOpenOutcome {
@@ -9553,7 +9558,7 @@ impl App {
         self.reset_folder_rating_counts();
         // ★フィルタ suppression scope の判定: anchor の subtree 外に出たら復元する。
         // 判定は current_folder 反映直後に行うため、`effective_folder()` が最新値を返す。
-        // 7z/LZH キャッシュ ZIP の async enumerate 完了時は、呼び出し元が設定した
+        // RAR/7z/LZH キャッシュ ZIP の async enumerate 完了時は、呼び出し元が設定した
         // archive_source_override がまだ生きているため、ユーザー視点の元アーカイブ
         // パスを基準に判定できる。
         self.maybe_restore_rating_filter_if_out_of_scope();
@@ -10499,7 +10504,7 @@ impl App {
         if *container == search_results_synthetic_path() {
             return None;
         }
-        // ConvertibleArchive (7z/LZH) を変換キャッシュ ZIP として開いている drill-down 状態
+        // ConvertibleArchive (RAR/7z/LZH) を変換キャッシュ ZIP として開いている drill-down 状態
         // では container = キャッシュ ZIP 実体になっているため、ピンを書いてもユーザーが
         // 期待する「親フォルダの ConvertibleArchive タイル」には適用されない (キャッシュ
         // ZIP は他の grid に出現しないので事実上 dead pin になる)。ここでは UI を隠して
@@ -10585,7 +10590,7 @@ impl App {
     /// **silent no-op 条件** (`compute_folder_pin_button_state` で UI を隠す条件と整合):
     /// - `current_folder` 無し / 検索合成パス
     /// - Ctrl+G アグリゲートビュー (`items_are_global_search_view`)
-    /// - 7z/LZH 変換キャッシュ ZIP の drill-down (`archive_source_override` Some)
+    /// - RAR/7z/LZH 変換キャッシュ ZIP の drill-down (`archive_source_override` Some)
     /// - 選択無し / 選択アイテムが pin 不能 (ConvertibleArchive / SearchContainer /
     ///   ZipSeparator、または container を指す `rel=""` ケース)
     ///
@@ -16427,7 +16432,7 @@ impl App {
             return;
         }
         // bucket の index safety + `accepts_rating` 判定を passes_rating_filter に委譲。
-        // ConvertibleArchive (7z/LZH) は accepts_rating=false で get_rating が必ず 0 を
+        // ConvertibleArchive (RAR/7z/LZH) は accepts_rating=false で get_rating が必ず 0 を
         // 返すため、上の 1..=5 check で先に弾かれる (このブランチには到達しない)。
         let item = &self.items[idx];
         if !passes_rating_filter(item, stars, &self.settings.rating_filter) {
@@ -27234,7 +27239,7 @@ impl eframe::App for App {
 
         // タイトルバーに現在のフォルダパスを表示する。
         // フォルダ未選択時や読み込み途中はアプリ名のみ。
-        // 変換済みアーカイブを開いているときは元 (7z/LZH) のパスを表示する。
+        // 変換済みアーカイブを開いているときは元 (RAR/7z/LZH) のパスを表示する。
         //
         // 名前索引 / メタ索引の supervisor が `in_full_scan=true` を示している間は
         // 「(インデックス更新中)」をサフィックスに付け、検索結果が不完全である
@@ -29704,7 +29709,7 @@ pub(crate) fn draw_cell(
             );
         }
         GridItem::ConvertibleArchive { path, format } => {
-            // 7z / LZH: クリック時に ZIP 変換→閲覧のフロー。サムネイルなしで
+            // RAR / 7z / LZH: クリック時に ZIP 変換→閲覧のフロー。サムネイルなしで
             // 汎用アーカイブアイコン + 形式バッジで表示する。
             painter.rect_filled(inner, 2.0, pending_placeholder_bg);
             painter.text(

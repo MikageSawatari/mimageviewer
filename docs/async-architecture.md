@@ -695,7 +695,7 @@ single-row I/O に収めてあるため `cargo run --perf-log` でも hitches �
 保留する (Codex Phase D P2 指摘の対応)。
 
 **Codex Phase D P2 (drill-down dead pin) 対応**: `archive_source_override.is_some()`
-(= 7z/LZH の変換キャッシュ ZIP を drill-down 中) では UI 経路の `compute_folder_pin_
+(= RAR/7z/LZH の変換キャッシュ ZIP を drill-down 中) では UI 経路の `compute_folder_pin_
 button_state` / `render_folder_pin_menu_entry` が `None`/false を返してエントリ自体を
 出さない。キャッシュ ZIP に書いてもユーザーに到達しないため。
 

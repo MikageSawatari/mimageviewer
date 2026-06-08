@@ -35,7 +35,7 @@ GPU アクセラレーションによるサムネイルグリッド表示を特�
   - EXIF 表示（日本語タグ名対応）
   - 非破壊回転
   - ZIP 内画像のブラウズ（展開不要）
-  - 7z / LZH の ZIP 変換閲覧
+  - RAR / CBR / 7z / LZH の ZIP 変換閲覧（RAR / CBR はパスワード付きにも対応）
   - PDF 表示（PDF 表示エンジン内蔵、パスワード付き対応）
   - RAW / HEIC / AVIF / JPEG XL 表示（Windows WIC 経由）
   - Susie 画像プラグイン（.spi、32bit）対応
@@ -159,6 +159,8 @@ Windows の「設定」→「アプリ」→「インストールされている
   - eframe / egui (MIT or Apache-2.0): Rerun Technologies
   - FFmpeg (LGPLv3-or-later): FFmpeg project
     Source and license notes: https://mikage.to/mimageviewer/
+  - UnRAR source code (UnRAR license): Alexander Roshal / RARLAB
+    RAR 展開に使用します。ライセンス全文は UNRAR-LICENSE.txt を参照してください。
   - Steinberg VST3 SDK (MIT): Steinberg Media Technologies GmbH
   - Twemoji 絵文字グラフィックス (CC-BY 4.0): Twitter, Inc. and other contributors
     （注釈機能のスタンプに使用）

@@ -1,4 +1,4 @@
-//! 変換済みアーカイブ (7z / LZH → ZIP) のキャッシュ管理 (v0.7.0)。
+//! 変換済みアーカイブ (RAR / 7z / LZH → ZIP) のキャッシュ管理。
 //!
 //! [`archive_converter`] が生成する無圧縮 ZIP を
 //! `<data_dir>/archive_cache/<hash>/<basename>.zip` に保存し、
@@ -74,7 +74,7 @@ pub struct ArchiveCacheEntry {
     pub src_mtime: i64,
     /// 元ファイルのバイトサイズ (記録時点)
     pub src_size: i64,
-    /// 変換形式 (7z / LZH)
+    /// 変換形式 (RAR / 7z / LZH)
     pub format: ArchiveFormat,
     /// 変換済み ZIP の絶対パス
     pub cached_zip_path: PathBuf,
@@ -86,6 +86,9 @@ pub struct ArchiveCacheEntry {
     pub last_access_at: i64,
     /// 変換対象となった画像エントリ数
     pub image_count: i64,
+    /// 変換時にパスワードが必要だったか。
+    /// 管理 UI の表示用メタ情報であり、キャッシュ ZIP 自体は暗号化されない。
+    pub password_required: bool,
     /// 元ファイルが現在もディスク上に存在するか
     pub src_exists: bool,
 }
@@ -211,6 +214,7 @@ impl ArchiveCacheDb {
         cached_zip_path: &Path,
         cached_zip_size: i64,
         image_count: u32,
+        password_required: bool,
     ) -> rusqlite::Result<()> {
         let key = crate::path_key::normalize(src_path);
         let src_str = src_path.to_string_lossy().to_string();
@@ -221,8 +225,8 @@ impl ArchiveCacheDb {
         conn.execute(
             "INSERT OR REPLACE INTO converted_archives \
              (src_path_key, src_path, src_mtime, src_size, format, \
-              cached_zip_path, cached_zip_size, converted_at, last_access_at, image_count) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)",
+              cached_zip_path, cached_zip_size, converted_at, last_access_at, image_count, password_required) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10)",
             params![
                 &key,
                 src_str,
@@ -233,6 +237,7 @@ impl ArchiveCacheDb {
                 cached_zip_size,
                 now,
                 image_count as i64,
+                if password_required { 1i64 } else { 0i64 },
             ],
         )?;
         Ok(())
@@ -244,11 +249,11 @@ impl ArchiveCacheDb {
     /// は lock を落としてから実行する。件数が多いと数十〜数百 ms かかるので、その間に UI が
     /// 別の DB 操作で mutex 待ちにならないようにする。
     pub fn list_all(&self) -> rusqlite::Result<Vec<ArchiveCacheEntry>> {
-        let raw: Vec<(String, i64, i64, String, String, i64, i64, i64, i64)> = {
+        let raw: Vec<(String, i64, i64, String, String, i64, i64, i64, i64, i64)> = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn.prepare(
                 "SELECT src_path, src_mtime, src_size, format, \
-                        cached_zip_path, cached_zip_size, converted_at, last_access_at, image_count \
+                        cached_zip_path, cached_zip_size, converted_at, last_access_at, image_count, password_required \
                  FROM converted_archives \
                  ORDER BY last_access_at DESC",
             )?;
@@ -263,6 +268,7 @@ impl ArchiveCacheDb {
                     r.get::<_, i64>(6)?,
                     r.get::<_, i64>(7)?,
                     r.get::<_, i64>(8)?,
+                    r.get::<_, i64>(9)?,
                 ))
             })?;
             rows.flatten().collect()
@@ -278,6 +284,7 @@ impl ArchiveCacheDb {
             converted_at,
             last_access_at,
             image_count,
+            password_required,
         ) in raw
         {
             let src_path = PathBuf::from(&src_str);
@@ -296,6 +303,7 @@ impl ArchiveCacheDb {
                 converted_at,
                 last_access_at,
                 image_count,
+                password_required: password_required != 0,
                 src_exists,
             });
         }
@@ -430,13 +438,19 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             cached_zip_size  INTEGER NOT NULL, \
             converted_at     INTEGER NOT NULL, \
             last_access_at   INTEGER NOT NULL, \
-            image_count      INTEGER NOT NULL\
+            image_count      INTEGER NOT NULL, \
+            password_required INTEGER NOT NULL DEFAULT 0\
          );",
-    )
+    )?;
+    let _ = conn.execute_batch(
+        "ALTER TABLE converted_archives ADD COLUMN password_required INTEGER NOT NULL DEFAULT 0;",
+    );
+    Ok(())
 }
 
 fn format_to_db(f: ArchiveFormat) -> &'static str {
     match f {
+        ArchiveFormat::Rar => "rar",
         ArchiveFormat::SevenZ => "7z",
         ArchiveFormat::Lzh => "lzh",
     }
@@ -444,6 +458,7 @@ fn format_to_db(f: ArchiveFormat) -> &'static str {
 
 fn format_from_db(s: &str) -> Option<ArchiveFormat> {
     match s {
+        "rar" | "cbr" => Some(ArchiveFormat::Rar),
         "7z" => Some(ArchiveFormat::SevenZ),
         "lzh" | "lha" => Some(ArchiveFormat::Lzh),
         _ => None,
@@ -508,5 +523,26 @@ mod tests {
         let _g = crate::data_dir::TestDataDirGuard::new();
         let p = cache_zip_path_for(Path::new(r"C:\archives\manga_vol01.7z"));
         assert!(p.to_string_lossy().ends_with("manga_vol01.zip"));
+    }
+
+    #[test]
+    fn password_required_cache_is_reusable_but_marked() {
+        let g = crate::data_dir::TestDataDirGuard::new();
+        let db = ArchiveCacheDb::open().unwrap();
+        let src = g.path().join("secret.rar");
+        let cached = g.path().join("secret.zip");
+        std::fs::write(&src, b"rar").unwrap();
+        std::fs::write(&cached, b"zip").unwrap();
+        let meta = std::fs::metadata(&src).unwrap();
+        let mtime = crate::ui_helpers::mtime_secs(&meta);
+        let size = meta.len() as i64;
+
+        db.record(&src, mtime, size, ArchiveFormat::Rar, &cached, 3, 1, true)
+            .unwrap();
+
+        assert_eq!(db.lookup(&src, mtime, size), Some(cached.clone()));
+        let rows = db.list_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].password_required);
     }
 }

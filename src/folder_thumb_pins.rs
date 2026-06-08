@@ -177,7 +177,7 @@ pub fn source_from_grid_item(
                 page: *page_num,
             })
         }
-        // ConvertibleArchive: 7z/LZH は変換完了前に thumb 生成できないので
+        // ConvertibleArchive: RAR/7z/LZH は変換完了前に thumb 生成できないので
         // UI 側で disabled + tooltip 表示する (本関数は None を返すだけ)
         GridItem::ConvertibleArchive { .. } => None,
         // ピン対象として意味がないもの

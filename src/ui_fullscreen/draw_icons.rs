@@ -629,7 +629,7 @@ pub(super) fn draw_fs_checkmark(ui: &mut egui::Ui, full_rect: egui::Rect) {
 /// - それ以外: `<folder>\<filename>` (Windows パス区切り)
 ///
 /// `base_folder` は `effective_folder()` の表示文字列を想定 (変換済みアーカイブ
-/// 閲覧中は元 7z/LZH のパスが渡ってくる)。空文字列なら基底パス部分を省略する。
+/// 閲覧中は元 RAR/7z/LZH のパスが渡ってくる)。空文字列なら基底パス部分を省略する。
 pub(super) fn compute_location_display(
     item: Option<&GridItem>,
     base_folder: &str,
