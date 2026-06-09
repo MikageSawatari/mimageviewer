@@ -789,15 +789,23 @@ mod palette {
 
 // ── 漫画 疑似カラー (モノクロ原画の擬似着色) ──────────────────────
 //
-// マンガミーヤで使われていた GiCoCu (AviSynth + GIMP トーンカーブ) 由来の
-// 「疑似四色刷り」を再現する。元データは GIMP `.cur` (5ch × 制御点) で、合成
-// カーブを先に適用してから R/G/B カーブを当てる。ここでは輝度 (0..255) →
-// RGB の最終 256-entry LUT にオフラインで畳み込んだものを定数で持つ。
-// 入力はモノクロ原画想定なので、ピクセル輝度を index にして色を引く。
+// モノクロ漫画ビューア「マンガミーヤ」で使われていた GiCoCu (AviSynth + GIMP
+// トーンカーブ) 由来の「疑似四色刷り」を再現する。元データは GIMP `.cur`
+// (5ch × 制御点形式) で、合成カーブを先に適用してから R/G/B カーブを当てる。
+// ここでは輝度 (0..255) → RGB の最終 256-entry LUT にオフラインで畳み込んだ
+// ものを定数で持ち、入力モノクロ原画のピクセル輝度を index にして色を引く。
 //
-// LUT は dist/manga_pseudocolor/gen_rust_lut.py が生成。元 .cur:
-//   - 4color4.cur : nalltama/RAIV (GiCoCu 運用の定番、影=青/明部=橙)
-//   - c4.cur      : umjammer/vavi-image-sandbox (肌色寄りの暖色着色)
+// 元 .cur の出所・制御点・sha256・経緯は docs/preset-and-adjustment.md
+// 「漫画 疑似カラーの設計方針」に全て転記済み (dist/ が無くても監査・再生成可)。
+//   - PseudoColor4   ← 4color4.cur。当時コミュニティで定番だった
+//     「疑似四色刷り "旧形式" アルファ補正付き.cur」を 4color4.cur にリネームした
+//     もの。"新形式" は無色化・フリーズの不具合で避けられていた版なので、再現の
+//     正は "旧形式" = この 4color4.cur。**新形式へは寄せない** (寄せると劣化)。
+//   - PseudoColorSkin ← c4.cur (肌色寄りの暖色着色)。
+//
+// 注意: LUT は上記 .cur の制御点を Catmull-Rom 補間して 256-entry 化した
+// **再現 (近似)** であり、GiCoCu 本体の厳密な補間出力とのバイト単位一致は
+// 主張しない (視覚差は数レベル)。
 mod pseudocolor {
     use super::*;
 
@@ -1662,8 +1670,9 @@ mod tests {
 
     #[test]
     fn pseudocolor_maps_known_gray_values() {
-        // 復元した GIMP カーブの代表点 (gen_rust_lut.py / analyze_cur.py の出力と一致)。
-        // LUT が壊れた / 入れ替わった場合の退行ガード。
+        // 復元した GIMP カーブの代表点。LUT が壊れた / 入れ替わった場合の退行ガード
+        // であり、GiCoCu 厳密出力との一致 (= 再現の忠実度) を主張するものではない
+        // (LUT は制御点の Catmull-Rom 補間による近似。docs/preset-and-adjustment.md 参照)。
         let gray = |v: u8| ColorImage::new([1, 1], vec![Color32::from_rgb(v, v, v)]);
         let a = apply(&gray(159), PostFilter::PseudoColor4).pixels[0];
         assert_eq!((a.r(), a.g(), a.b()), (183, 103, 39), "4色刷り gray159");
