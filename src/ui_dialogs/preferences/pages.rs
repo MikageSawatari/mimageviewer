@@ -113,13 +113,13 @@ pub(super) fn page_startup_folder(ui: &mut egui::Ui, state: &mut PreferencesStat
     );
     ui.radio_value(
         &mut state.settings.startup_folder_mode,
-        StartupFolderMode::Specific,
-        StartupFolderMode::Specific.label(),
+        StartupFolderMode::Drives,
+        StartupFolderMode::Drives.label(),
     );
     ui.radio_value(
         &mut state.settings.startup_folder_mode,
-        StartupFolderMode::Drives,
-        StartupFolderMode::Drives.label(),
+        StartupFolderMode::Specific,
+        StartupFolderMode::Specific.label(),
     );
 
     ui.add_space(8.0);
