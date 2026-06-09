@@ -1129,12 +1129,18 @@ impl FullscreenFitMode {
         }
     }
 
-    pub fn next_for_flow(self, flow: ReadingFlow) -> Self {
-        let modes: &[Self] = if flow.is_paged() {
+    /// フロー上で選べるモード一覧 (ツールバーのメニュー・[0] 循環で共有)。
+    /// 連結読み (非ページ) では余白カットフィットを除外する。
+    pub fn selectable_for_flow(flow: ReadingFlow) -> &'static [Self] {
+        if flow.is_paged() {
             Self::all()
         } else {
             &[Self::Page, Self::Width, Self::Height, Self::Original]
-        };
+        }
+    }
+
+    pub fn next_for_flow(self, flow: ReadingFlow) -> Self {
+        let modes = Self::selectable_for_flow(flow);
         let current = self.effective_for_flow(flow);
         let pos = modes.iter().position(|&m| m == current).unwrap_or(0);
         modes[(pos + 1) % modes.len()]
@@ -3851,6 +3857,25 @@ mod tests {
             FullscreenFitMode::MarginFit.effective_for_flow(ReadingFlow::Horizontal),
             FullscreenFitMode::Height
         );
+    }
+
+    #[test]
+    fn fit_mode_menu_list_matches_flow() {
+        // ページ表示ではメニューに 5 モード全て (余白カットフィット含む)。
+        assert_eq!(
+            FullscreenFitMode::selectable_for_flow(ReadingFlow::Paged),
+            FullscreenFitMode::all()
+        );
+        // 連結読み (縦/横) では余白カットフィットを除く 4 モード。
+        for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+            let modes = FullscreenFitMode::selectable_for_flow(flow);
+            assert_eq!(modes.len(), 4);
+            assert!(!modes.contains(&FullscreenFitMode::MarginFit));
+            // メニュー一覧は [0] 循環の対象集合と一致する。
+            for &m in modes {
+                assert!(modes.contains(&m.next_for_flow(flow)));
+            }
+        }
     }
 
     #[test]

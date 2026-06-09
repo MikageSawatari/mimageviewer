@@ -4010,6 +4010,8 @@ pub struct App {
     pub(crate) reading_direction: crate::settings::ReadingDirection,
     /// 表示モード切替ポップアップ表示中
     pub(crate) spread_popup_open: bool,
+    /// ズーム/フィット切替ポップアップ表示中
+    pub(crate) fit_popup_open: bool,
 
     // ── スライドショー ────────────────────────────────────────────
     /// スライドショー再生中フラグ
@@ -5830,6 +5832,7 @@ impl App {
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             spread_popup_open: false,
+            fit_popup_open: false,
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
             slideshow_anchor_idx: None,

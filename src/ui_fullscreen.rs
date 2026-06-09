@@ -3276,7 +3276,7 @@ impl App {
                             let panorama_mode_active = panorama_active;
                             let mut panorama_pressed = false;
                             let fit_mode = self.effective_fullscreen_fit_mode();
-                            let mut fit_mode_pressed = false;
+                            let mut fit_mode_choice: Option<FullscreenFitMode> = None;
                             let mut bar_analysis_pressed = false;
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
@@ -3305,7 +3305,8 @@ impl App {
                                 &mut self.local_adjust_mode,
                                 has_page_override,
                                 fit_mode,
-                                &mut fit_mode_pressed,
+                                &mut self.fit_popup_open,
+                                &mut fit_mode_choice,
                                 state.pdf_content_type,
                                 is_video_mode,
                                 video_meta,
@@ -3327,9 +3328,10 @@ impl App {
                             if bar_analysis_pressed && !is_spread_double {
                                 self.toggle_analysis_mode();
                             }
-                            // ズーム/フィットモード切替 (0 キーと同じ循環)。
-                            if fit_mode_pressed {
-                                self.cycle_fullscreen_fit_mode(ctx, fs_idx);
+                            // ズーム/フィットモード: ツールバーボタンはメニューから選択
+                            // (0 キーは従来どおり循環)。
+                            if let Some(mode) = fit_mode_choice {
+                                self.set_fullscreen_fit_mode_for_current(ctx, fs_idx, mode);
                             }
                             // 360 度パノラマビュー: トグル
                             if panorama_pressed {
@@ -5982,7 +5984,7 @@ impl App {
                         }
                     } else if fs_response.clicked() {
                         // ポップアップ表示中はクリックでのページ送りを抑制
-                        let any_popup = self.spread_popup_open;
+                        let any_popup = self.spread_popup_open || self.fit_popup_open;
                         if !any_popup {
                             if let Some(pos) = fs_response.interact_pointer_pos() {
                                 let panel_threshold = full_rect.max.x - full_rect.width() * 0.25;
@@ -9914,6 +9916,7 @@ impl App {
             && !self.is_overlay_edit_mode_active()
             && !self.analysis_mode
             && !self.spread_popup_open
+            && !self.fit_popup_open
             && self.fs_context_menu_idx.is_none()
             && !self.any_dialog_open()
     }
@@ -9967,9 +9970,12 @@ impl App {
         local_adjust_mode: &mut bool,
         // 現在ページに個別補正が適用されているか (ボタン点灯用)
         has_page_override: bool,
-        // ズーム/フィットモード循環 (画像のみ)。pressed = クリックされた。
+        // ズーム/フィットモード (画像のみ)。fit_mode = 現在の実効モード。
+        // ボタンクリックで fit_popup_open をトグルし、メニュー項目選択で
+        // fit_mode_choice に選択モードを返す ([0] キーの循環とは別系統)。
         fit_mode: FullscreenFitMode,
-        fit_mode_pressed: &mut bool,
+        fit_popup_open: &mut bool,
+        fit_mode_choice: &mut Option<FullscreenFitMode>,
         // PDF ページのコンテンツ種別 (非 PDF なら None)
         pdf_content_type: Option<PdfPageContentType>,
         // Phase 6: 動画モードか。true なら画像専用ボタンを隠し、▦ タイルボタンに
@@ -10002,7 +10008,12 @@ impl App {
                     .unwrap_or(false)
         });
         // adjustment_mode がオンならオーバーレイとして常に表示
-        if !hover_in_top && !force_show && !*spread_popup_open && !*adjustment_mode {
+        if !hover_in_top
+            && !force_show
+            && !*spread_popup_open
+            && !*fit_popup_open
+            && !*adjustment_mode
+        {
             return;
         }
 
@@ -10356,6 +10367,7 @@ impl App {
             spread_resp_rect = spread_resp.rect;
             if spread_resp.clicked() {
                 *spread_popup_open = !*spread_popup_open;
+                *fit_popup_open = false;
             }
             if spread_resp.hovered() {
                 *nav_delta = 0;
@@ -10571,7 +10583,9 @@ impl App {
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
-        // ズーム/フィットボタン (画像のみ、見開きボタンの左)。
+        // ズーム/フィットボタン (画像のみ、見開きボタンの左)。クリックでメニューを開く。
+        let fit_btn_x = next_x;
+        let mut fit_resp_rect = egui::Rect::NOTHING;
         if !is_video && !panorama_mode_active {
             let fit_active = !matches!(fit_mode, FullscreenFitMode::Page);
             let mf_resp = draw_bar_button(
@@ -10585,20 +10599,110 @@ impl App {
             );
             let fit_tip = if !reading_flow.is_paged() {
                 format!(
-                    "ズーム/フィット: {} [0]\n連結モードでは余白カットフィットをスキップ",
+                    "ズーム/フィット: {} [クリックで選択 / 0で循環]\n連結モードでは余白カットフィットをスキップ",
                     fit_mode.label()
                 )
             } else {
-                format!("ズーム/フィット: {} [0]", fit_mode.label())
+                format!(
+                    "ズーム/フィット: {} [クリックで選択 / 0で循環]",
+                    fit_mode.label()
+                )
             };
             let mf_resp = mf_resp.hover_tip_dark(fit_tip);
+            fit_resp_rect = mf_resp.rect;
             if mf_resp.clicked() {
-                *fit_mode_pressed = true;
+                *fit_popup_open = !*fit_popup_open;
+                *spread_popup_open = false;
             }
             if mf_resp.hovered() {
                 *nav_delta = 0;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        } else if *fit_popup_open {
+            // 動画 / 360 モードに切り替わったら閉じる (フィットは画像のみ)
+            *fit_popup_open = false;
+        }
+
+        // ズーム/フィットポップアップ (画像のみ)。現在モードを青でハイライト。
+        if *fit_popup_open && !is_video && !panorama_mode_active {
+            let modes = FullscreenFitMode::selectable_for_flow(*reading_flow);
+            let header_h = 28.0_f32;
+            let item_h = 36.0_f32;
+            let popup_w = 264.0_f32;
+            let popup_h = header_h + modes.len() as f32 * item_h + 8.0;
+            let popup_rect = egui::Rect::from_min_size(
+                egui::pos2(fit_btn_x, bar_rect.max.y + 4.0),
+                egui::vec2(popup_w, popup_h),
+            );
+
+            ui.painter().rect_filled(
+                popup_rect,
+                6.0,
+                egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240),
+            );
+            ui.painter().rect_stroke(
+                popup_rect,
+                6.0,
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(100, 100, 100, 180),
+                ),
+                egui::StrokeKind::Outside,
+            );
+
+            let mut item_y = popup_rect.min.y + 4.0;
+            ui.painter().text(
+                egui::pos2(popup_rect.min.x + 12.0, item_y + 16.0),
+                egui::Align2::LEFT_CENTER,
+                "ズーム/フィット  [0で循環]",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(150),
+            );
+            item_y += header_h;
+            for &mode in modes {
+                let item_rect = egui::Rect::from_min_size(
+                    egui::pos2(popup_rect.min.x + 4.0, item_y),
+                    egui::vec2(popup_w - 8.0, 32.0),
+                );
+                let item_resp = ui.interact(
+                    item_rect,
+                    egui::Id::new(format!("fit_popup_{mode:?}")),
+                    egui::Sense::click(),
+                );
+                let is_current = fit_mode == mode;
+                let bg = if is_current {
+                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                } else if item_resp.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(item_rect, 4.0, bg);
+
+                ui.painter().text(
+                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    mode.label(),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_gray(220),
+                );
+
+                if item_resp.clicked() {
+                    *fit_mode_choice = Some(mode);
+                    *fit_popup_open = false;
+                }
+                item_y += item_h;
+            }
+
+            // ポップアップ外クリックで閉じる
+            if let Some(pos) = ctx.input(|i| i.pointer.press_origin()) {
+                if !popup_rect.contains(pos)
+                    && !fit_resp_rect.contains(pos)
+                    && ctx.input(|i| i.pointer.any_pressed())
+                {
+                    *fit_popup_open = false;
+                }
+            }
         }
 
         // 🎨 画像補正パネルトグルボタン (動画では非表示)
