@@ -671,6 +671,7 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 | `cache_webp_always` | bool | true | 既存 .webp は常にキャッシュ |
 | `cache_pdf_always` | bool | true | PDF ページは常にキャッシュ |
 | `cache_zip_always` | bool | true | ZIP 内画像は常にキャッシュ |
+| `archive_cache_max_bytes` | u64 | 0 | RAR / 7z / LZH から作成した変換済み ZIP キャッシュの容量上限。`0` は無制限。上限を超えた場合は、次回の変換完了後に最終アクセスが古いキャッシュから削除する。直近で作成したキャッシュは、単体で上限を超えても削除しない |
 | `batch_cache_zip_contents` | bool | false | 一括キャッシュ作成で ZIP 内の全画像をキャッシュ |
 | `batch_cache_pdf_contents` | bool | false | 一括キャッシュ作成で PDF 内の全ページをキャッシュ |
 | `search_index_checks` | Vec\<PathBuf\> | [] | お気に入り検索インデックス作成でチェック済みのフォルダ |

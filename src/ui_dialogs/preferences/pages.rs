@@ -1109,6 +1109,52 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "ZIP 内画像は常にキャッシュ (処理が重いため推奨)",
         );
     });
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    ui.label(egui::RichText::new("変換済みアーカイブキャッシュ").strong());
+    ui.add_space(4.0);
+    ui.label(
+        "RAR / 7z / LZH から作成した ZIP キャッシュの容量上限です。\n\
+         上限を超えた場合、次回の変換完了後に最終アクセスが古いものから削除します。",
+    );
+    let mut archive_limit_enabled = s.archive_cache_max_bytes > 0;
+    if ui
+        .checkbox(&mut archive_limit_enabled, "容量上限を有効にする")
+        .changed()
+    {
+        s.archive_cache_max_bytes = if archive_limit_enabled {
+            20 * 1024 * 1024 * 1024
+        } else {
+            0
+        };
+    }
+    if archive_limit_enabled {
+        let mut limit_mb = (s.archive_cache_max_bytes / 1_000_000).max(1);
+        if ui
+            .horizontal(|ui| {
+                ui.label("上限:");
+                ui.add(
+                    egui::DragValue::new(&mut limit_mb)
+                        .range(1..=1_000_000u64)
+                        .speed(100.0)
+                        .suffix(" MB"),
+                )
+            })
+            .inner
+            .changed()
+        {
+            s.archive_cache_max_bytes = limit_mb.saturating_mul(1_000_000);
+        }
+        ui.label(format!(
+            "現在の上限: {}",
+            crate::ui_helpers::format_bytes(s.archive_cache_max_bytes)
+        ));
+    } else {
+        ui.label("現在の上限: 無制限");
+    }
 }
 
 /// v0.8.0: 自動インデクサの速度プロファイル設定ページ。

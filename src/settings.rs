@@ -1289,6 +1289,10 @@ pub struct Settings {
     /// Auto モード: ZIP 内画像を無条件でキャッシュ対象にする（解凍+デコードの二重コスト）
     #[serde(default = "default_true")]
     pub cache_zip_always: bool,
+    /// 変換済みアーカイブキャッシュ (RAR / 7z / LZH → ZIP) の容量上限。
+    /// 0 は無制限 (= 既存挙動)。
+    #[serde(default)]
+    pub archive_cache_max_bytes: u64,
     /// 一括キャッシュ作成: ZIP 内の全画像をキャッシュ対象にする
     #[serde(default)]
     pub batch_cache_zip_contents: bool,
@@ -2468,6 +2472,7 @@ impl Default for Settings {
             cache_webp_always: true,
             cache_pdf_always: true,
             cache_zip_always: true,
+            archive_cache_max_bytes: 0,
             batch_cache_zip_contents: false,
             batch_cache_pdf_contents: false,
             search_index_checks: Vec::new(),
@@ -3754,6 +3759,7 @@ mod tests {
         assert_eq!(s.cache_size_threshold_bytes, 2_000_000);
         assert!(s.cache_videos_always);
         assert!(s.cache_webp_always);
+        assert_eq!(s.archive_cache_max_bytes, 0);
         assert_eq!(s.thumb_prev_pages, 2);
         assert_eq!(s.thumb_next_pages, 4);
         assert_eq!(s.thumb_vram_cap_percent, 50);

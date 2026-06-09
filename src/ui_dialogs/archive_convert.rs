@@ -676,6 +676,7 @@ impl App {
         let cancel_worker = cancel.clone();
         let progress_worker = progress.clone();
         let db_worker = Arc::clone(&db);
+        let archive_cache_max_bytes = self.settings.archive_cache_max_bytes;
         thread::spawn(move || {
             // 変換と保守 (clear_all / delete_entry) を直列化する。guard は worker thread
             // スコープを抜けるまで保持され、その間は maintenance がブロックされる。
@@ -708,7 +709,7 @@ impl App {
                     if let Ok(meta) = std::fs::metadata(&src) {
                         let src_mtime = crate::ui_helpers::mtime_secs(&meta);
                         let src_size = meta.len() as i64;
-                        let _ = db_worker.record(
+                        let record_result = db_worker.record(
                             &src,
                             src_mtime,
                             src_size,
@@ -718,6 +719,29 @@ impl App {
                             summary.image_count,
                             format == ArchiveFormat::Rar && password.is_some(),
                         );
+                        match record_result {
+                            Ok(()) => {
+                                if archive_cache_max_bytes > 0 {
+                                    match db_worker
+                                        .prune_to_size_limit_locked(archive_cache_max_bytes, &src)
+                                    {
+                                        Ok(removed) if removed > 0 => {
+                                            crate::logger::log(format!(
+                                                "archive_cache: pruned {removed} entries to stay under {} bytes",
+                                                archive_cache_max_bytes
+                                            ));
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => crate::logger::log(format!(
+                                            "archive_cache: prune_to_size_limit failed: {e}"
+                                        )),
+                                    }
+                                }
+                            }
+                            Err(e) => crate::logger::log(format!(
+                                "archive_cache: record failed after convert: {e}"
+                            )),
+                        }
                     }
                     ArchiveConvertMsg::ConvertDone(Ok((summary, dst, cached_size)))
                 }

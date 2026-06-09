@@ -411,6 +411,78 @@ impl ArchiveCacheDb {
         Ok(total.max(0) as u64)
     }
 
+    /// 合計容量が `max_bytes` 以内になるまで、最終アクセスが古いキャッシュから削除する。
+    ///
+    /// `max_bytes == 0` は無制限。`protected_src_path` は直近で作成したキャッシュで、
+    /// 単体で上限を超えていても削除しない。呼び出し側は変換完了直後に
+    /// [`Self::begin_convert`] の guard を保持したまま呼ぶこと。これにより、変換完了直後の
+    /// 自動掃除と明示的な管理操作 (`delete_entry` / `clear_all`) が同時に同じファイルを
+    /// 触らない。
+    pub fn prune_to_size_limit_locked(
+        &self,
+        max_bytes: u64,
+        protected_src_path: &Path,
+    ) -> rusqlite::Result<usize> {
+        if max_bytes == 0 {
+            return Ok(0);
+        }
+
+        let protected_key = crate::path_key::normalize(protected_src_path);
+        let rows: Vec<(String, String, u64)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT src_path_key, cached_zip_path, cached_zip_size \
+                 FROM converted_archives \
+                 ORDER BY last_access_at ASC, converted_at ASC, src_path_key ASC",
+            )?;
+            stmt.query_map([], |r| {
+                let size: i64 = r.get(2)?;
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    size.max(0) as u64,
+                ))
+            })?
+            .flatten()
+            .collect()
+        };
+
+        let mut total = rows
+            .iter()
+            .fold(0u64, |acc, (_, _, size)| acc.saturating_add(*size));
+        if total <= max_bytes {
+            return Ok(0);
+        }
+
+        let mut remove_keys = Vec::new();
+        for (key, cached_path, size) in rows {
+            if key == protected_key {
+                continue;
+            }
+            remove_cache_file_and_dirs(Path::new(&cached_path));
+            remove_keys.push(key);
+            total = total.saturating_sub(size);
+            if total <= max_bytes {
+                break;
+            }
+        }
+
+        if remove_keys.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM converted_archives WHERE src_path_key = ?1")?;
+            for key in &remove_keys {
+                stmt.execute(params![key])?;
+            }
+        }
+        tx.commit()?;
+        Ok(remove_keys.len())
+    }
+
     /// 変換完了時に使う予定の出力パスを返す (親ディレクトリも作成する)。
     /// ファイル自体は作成しない。
     pub fn reserve_cache_zip_path(&self, src: &Path) -> std::io::Result<PathBuf> {
@@ -544,5 +616,64 @@ mod tests {
         let rows = db.list_all().unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].password_required);
+    }
+
+    #[test]
+    fn prune_to_size_limit_removes_old_entries_but_keeps_protected() {
+        let g = crate::data_dir::TestDataDirGuard::new();
+        let db = ArchiveCacheDb::open().unwrap();
+
+        let old_src = g.path().join("old.7z");
+        let warm_src = g.path().join("warm.7z");
+        let new_src = g.path().join("new.7z");
+        std::fs::write(&old_src, b"old").unwrap();
+        std::fs::write(&warm_src, b"warm").unwrap();
+        std::fs::write(&new_src, b"new").unwrap();
+
+        let old_cached = record_test_cache(&db, &old_src, 700);
+        let warm_cached = record_test_cache(&db, &warm_src, 500);
+        let new_cached = record_test_cache(&db, &new_src, 900);
+        set_test_last_access(&db, &old_src, 10);
+        set_test_last_access(&db, &warm_src, 20);
+        set_test_last_access(&db, &new_src, 30);
+
+        let _guard = db.begin_convert();
+        let removed = db.prune_to_size_limit_locked(500, &new_src).expect("prune");
+        drop(_guard);
+
+        assert_eq!(removed, 2);
+        assert!(!old_cached.exists());
+        assert!(!warm_cached.exists());
+        assert!(new_cached.exists(), "protected fresh cache must survive");
+        assert_eq!(db.list_all().unwrap().len(), 1);
+    }
+
+    fn record_test_cache(db: &ArchiveCacheDb, src: &Path, cached_size: usize) -> PathBuf {
+        let cached = db.reserve_cache_zip_path(src).unwrap();
+        std::fs::write(&cached, vec![b'x'; cached_size]).unwrap();
+        let meta = std::fs::metadata(src).unwrap();
+        db.record(
+            src,
+            crate::ui_helpers::mtime_secs(&meta),
+            meta.len() as i64,
+            ArchiveFormat::SevenZ,
+            &cached,
+            cached_size as i64,
+            1,
+            false,
+        )
+        .unwrap();
+        cached
+    }
+
+    fn set_test_last_access(db: &ArchiveCacheDb, src: &Path, last_access_at: i64) {
+        let key = crate::path_key::normalize(src);
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE converted_archives SET last_access_at = ?1, converted_at = ?1 \
+             WHERE src_path_key = ?2",
+            params![last_access_at, key],
+        )
+        .unwrap();
     }
 }
