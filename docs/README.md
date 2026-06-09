@@ -38,6 +38,7 @@
 | [comic-lab-validation-checklist.md](comic-lab-validation-checklist.md) | `tools/comic_lab` / `crates/comic-core` の実機検証チェックリスト。縦書き約物、IME、フォント、しっぽ、装飾、メッセージウィンドウ、本体統合時の P0 を整理 |
 | [ai-suggested-mask-v1.1.0-plan.md](ai-suggested-mask-v1.1.0-plan.md) | **Codex 案**。v1.1.0 候補の AI 提案マスク設計案。標準の顔検出 + ユーザー指定 ONNX 検出モデルを、消しゴム / 隠蔽加工のマスクオブジェクト生成に接続する。バッチ生成を v1.1.0 に含め、ShapeMeta / モデル登録 UI を提案 |
 | [auto-mask-detection-plan.md](auto-mask-detection-plan.md) | **Claude 案** (上記 Codex 案と対). 同じ v1.1.0 自動マスク機能を実コードの型/関数 (`Shape`@mask_db.rs / `commit_conceal_shape`@ui_conceal.rs / `runtime.rs` / `ai_upscale` worker) に接続して設計。標準=MIT 同梱 YuNet、追加=BYO (`DetectorProfile`+`OutputFormat`、deepghs サイドカー自動読取)。v1.1.0 は現ページ対象・一括は将来フェーズ。検証済みライセンス表付き |
+| [nested-zip-tree-plan.md](nested-zip-tree-plan.md) | **v1.3.0 候補 (設計確定/実装着手前)**。ネスト ZIP を現在のフラット展開からツリーナビへ変える設計。`entry_name` を不変に保ち表示層のみ追加 (DB 移行ゼロ)、Ctrl+G ドリルダウンを流用して内側 ZIP/サブフォルダを階層移動。items が現在の本だけになるので見開きペアリングが本ごとにリセットされ相性問題を解消。Claude/Codex 独立合意の設計を固定 |
 
 ## 設計メモ (特定領域の詳細)
 
