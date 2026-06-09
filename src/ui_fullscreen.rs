@@ -1920,7 +1920,10 @@ impl App {
             self.fs_seek_drag_active = false;
             return None;
         };
-        if self.any_dialog_open() || self.is_overlay_edit_mode_active() {
+        // 分析モード中は対象画像に集中するため、下端のページシークバーを出さない
+        // (分析パネルの手描き content が下端にあり、clip しないままシークバーへはみ出す
+        // 問題も併せて解消される)。
+        if self.any_dialog_open() || self.is_overlay_edit_mode_active() || self.analysis_mode {
             self.fs_seek_drag_active = false;
             return None;
         }

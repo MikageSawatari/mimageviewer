@@ -977,14 +977,10 @@ impl App {
         }
 
         // ── パネル UI ──
-        // 下端のページシークバーと重ならないよう、下端をシークバー分空ける。
-        let panel_rect = egui::Rect::from_min_max(
-            egui::pos2(image_rect.max.x, full_rect.min.y),
-            egui::pos2(
-                full_rect.max.x,
-                full_rect.max.y - crate::ui_fullscreen::FS_SEEK_BAR_HEIGHT,
-            ),
-        );
+        // 分析モードではページシークバーを出さない (draw_fullscreen_seek_overlay 側で抑制)
+        // ため、パネルは全高を使ってよい。
+        let panel_rect =
+            egui::Rect::from_min_max(egui::pos2(image_rect.max.x, full_rect.min.y), full_rect.max);
         ui.painter().rect_filled(
             panel_rect,
             0.0,
