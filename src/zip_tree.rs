@@ -26,6 +26,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::grid_item::GridItem;
+use crate::settings::SortOrder;
 use crate::zip_loader::{ZipImageEntry, entry_basename, entry_dir};
 
 /// 開いている外側 ZIP の階層ツリー (列挙完了時に構築し、ナビ中は保持)。
@@ -101,13 +103,16 @@ impl ZipTree {
     ///
     /// `start` のノードが存在しない場合は `start` をそのまま返す (判定は呼び出し側)。
     ///
-    /// ⚠ **Phase 3 ナビ契約 (Codex P2)**: これは **表示 (materialize) 時のみ**適用する
-    /// 純粋な view 変換であり、**戻り値を navigation prefix として保存し直してはならない**。
-    /// `ZipNavState.prefix` は常に「ユーザーが明示的に降りた論理 prefix」を保持し、
-    /// collapse は描画直前に都度かけること。保存し直すと Backspace が
-    /// `["vol01"] -> pop -> [] -> collapse -> ["vol01"]` でループして抜けられなくなる。
-    /// 論理 prefix が空 (= ルート) のとき collapse 後の表示から Backspace すると ZIP を
-    /// 抜けて実フォルダ親へ戻る (= ラッパーは「入った」扱いにしない) のが正しい挙動。
+    /// ⚠ **Phase 3 ナビ契約 (Codex P2)**: collapse は「次に降りる階層の実効 prefix」を
+    /// 算出するためだけに使う。Phase 3 は **collapse 後の実効 prefix を nav スタックに
+    /// 積む** (= スタックの各エントリは描画した実効 prefix)。Backspace はスタックを 1 段
+    /// pop する (= 直前に描画した実効 prefix へ戻る)。スタック最下段 (ルート) で Backspace
+    /// すると ZIP を抜けて実フォルダ親へ戻る。
+    ///
+    /// 「論理 prefix を 1 セグメントずつ pop して毎回 collapse し直す」方式は採らない。
+    /// それだと root が単一ラッパーへ collapse する木で
+    /// `[] -> 表示は ["vol01"] -> back で [] -> 再 collapse で ["vol01"]` と同じ画面に
+    /// 戻り続けて抜けられなくなる。スタック方式ならこの罠を構造的に回避できる。
     pub fn collapse_redundant(&self, start: &[String]) -> Vec<String> {
         let mut prefix: Vec<String> = start.to_vec();
         loop {
@@ -128,6 +133,108 @@ impl ZipTree {
         }
         prefix
     }
+
+    /// `prefix` (= **既に collapse 済みの実効 prefix**) の階層を `GridItem` 列に変換する。
+    ///
+    /// 戻り値は `(items, image_metas)` で、`image_metas[i]` は `items[i]` に対応する
+    /// `Some((mtime, uncompressed_size))` (コンテナ ZipDir は `None`)。
+    /// `finalize_zip_enumerate` / Phase 3 ナビが `start_loading_items` にそのまま渡せる
+    /// 形にする (= 既存フラット経路と同じ型)。
+    ///
+    /// 並び: グリッド慣習に従い **子コンテナ (ZipDir) を先・画像 (ZipImage) を後**。
+    /// どちらも `sort` で並べる。ZipDir のソートキーはセグメント名 (mtime なし)、
+    /// ZipImage は basename + mtime。
+    ///
+    /// collapse はここでは行わない (純粋な「この階層を描く」関数)。ラッパー自動降下が
+    /// 必要な呼び出し側は `collapse_redundant` で実効 prefix を出してから渡すこと。
+    pub fn materialize_level(
+        &self,
+        prefix: &[String],
+        sort: SortOrder,
+    ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+        let mut items: Vec<GridItem> = Vec::new();
+        let mut metas: Vec<Option<(i64, i64)>> = Vec::new();
+        let Some(node) = self.node_at(prefix) else {
+            return (items, metas);
+        };
+
+        // 現在階層までの prefix 文字列 ("chapters/" や ""、末尾 '/' 付き)。
+        let prefix_str = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix.join("/"))
+        };
+
+        // 1) 子コンテナ (ZipDir)。セグメント名で sort。
+        let mut dirs: Vec<(&String, &ZipTreeNode)> = node.dirs.iter().collect();
+        dirs.sort_by(|(a, _), (b, _)| {
+            sort.compare(a, 0, b, 0, crate::ui_helpers::natural_sort_key)
+        });
+        for (seg, child) in dirs {
+            items.push(GridItem::ZipDir {
+                zip_path: self.zip_path.clone(),
+                dir_prefix: format!("{prefix_str}{seg}/"),
+                is_archive: segment_is_archive(seg),
+                representative: representative_image(child, sort).map(|e| e.entry_name.clone()),
+            });
+            metas.push(None);
+        }
+
+        // 2) 直下画像 (ZipImage)。basename + mtime で sort。
+        let mut imgs: Vec<&ZipImageEntry> = node.images.iter().collect();
+        imgs.sort_by(|a, b| {
+            let an = entry_basename(&a.entry_name);
+            let bn = entry_basename(&b.entry_name);
+            sort.compare(
+                an,
+                a.mtime,
+                bn,
+                b.mtime,
+                crate::ui_helpers::natural_sort_key,
+            )
+        });
+        for e in imgs {
+            items.push(GridItem::ZipImage {
+                zip_path: self.zip_path.clone(),
+                entry_name: e.entry_name.clone(),
+            });
+            metas.push(Some((e.mtime, e.uncompressed_size as i64)));
+        }
+
+        (items, metas)
+    }
+}
+
+/// セグメント名 (entry_name の一区切り) が内側アーカイブ (.zip / .cbz) か。
+/// `ZipDir.is_archive` バッジ用の suffix 推定 (accepted ambiguity、計画書 §9)。
+fn segment_is_archive(seg: &str) -> bool {
+    let lower = seg.to_ascii_lowercase();
+    lower.ends_with(".zip") || lower.ends_with(".cbz")
+}
+
+/// 部分木の代表画像 (= ZipDir 代表サムネ) を **sort 準拠**で選ぶ。
+///
+/// この階層に直下画像があれば sort 先頭を返す。無ければ sort 先頭の子ディレクトリへ
+/// 再帰する (= 「最初の本の 1 ページ目」を表紙にする)。`ZipTreeNode::first_image_in_subtree`
+/// (列挙順 fallback) と違い、表示順の先頭ページを選ぶ (Codex P3 対応)。
+fn representative_image(node: &ZipTreeNode, sort: SortOrder) -> Option<&ZipImageEntry> {
+    if !node.images.is_empty() {
+        return node.images.iter().min_by(|a, b| {
+            let an = entry_basename(&a.entry_name);
+            let bn = entry_basename(&b.entry_name);
+            sort.compare(
+                an,
+                a.mtime,
+                bn,
+                b.mtime,
+                crate::ui_helpers::natural_sort_key,
+            )
+        });
+    }
+    node.dirs
+        .iter()
+        .min_by(|(a, _), (b, _)| sort.compare(a, 0, b, 0, crate::ui_helpers::natural_sort_key))
+        .and_then(|(_, child)| representative_image(child, sort))
 }
 
 impl ZipTreeNode {
@@ -355,5 +462,152 @@ mod tests {
         let node = t.node_at(&["a".to_string()]).unwrap();
         // 葉の entry_name は元のまま (改変しない)。
         assert_eq!(img_names(node), vec!["a//b.jpg"]);
+    }
+
+    // ── materialize_level / 代表サムネ / is_archive ──────────────────
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// ZipDir セルの (dir_prefix, is_archive, representative) を取り出す。
+    fn as_zipdir(item: &GridItem) -> (&str, bool, Option<&str>) {
+        match item {
+            GridItem::ZipDir {
+                dir_prefix,
+                is_archive,
+                representative,
+                ..
+            } => (dir_prefix.as_str(), *is_archive, representative.as_deref()),
+            _ => panic!("expected GridItem::ZipDir"),
+        }
+    }
+
+    /// ZipImage セルの entry_name を取り出す。
+    fn as_zipimage(item: &GridItem) -> &str {
+        match item {
+            GridItem::ZipImage { entry_name, .. } => entry_name.as_str(),
+            _ => panic!("expected GridItem::ZipImage"),
+        }
+    }
+
+    #[test]
+    fn segment_is_archive_detects_zip_cbz() {
+        assert!(segment_is_archive("ch01.zip"));
+        assert!(segment_is_archive("ch01.CBZ"));
+        assert!(segment_is_archive("Vol.Zip"));
+        assert!(!segment_is_archive("chapters"));
+        assert!(!segment_is_archive("ch01.rar"));
+    }
+
+    #[test]
+    fn materialize_flat_root_images_only() {
+        let t = tree(&["b.jpg", "a.jpg", "c.jpg"]);
+        let (items, metas) = t.materialize_level(&[], SortOrder::FileName);
+        // 画像のみ・FileName 昇順。
+        let names: Vec<&str> = items.iter().map(as_zipimage).collect();
+        assert_eq!(names, vec!["a.jpg", "b.jpg", "c.jpg"]);
+        assert_eq!(items.len(), metas.len());
+        assert!(metas.iter().all(|m| m.is_some()));
+    }
+
+    #[test]
+    fn materialize_multiple_books_containers_first() {
+        let t = tree(&[
+            "ch02.zip/p01.jpg",
+            "ch01.zip/p02.jpg",
+            "ch01.zip/p01.jpg",
+            "loose.jpg",
+        ]);
+        let (items, metas) = t.materialize_level(&[], SortOrder::FileName);
+        assert_eq!(items.len(), metas.len());
+        // コンテナ (ZipDir) が先、画像が後。ZipDir は名前順 (ch01.zip, ch02.zip)。
+        let (p0, a0, rep0) = as_zipdir(&items[0]);
+        assert_eq!(p0, "ch01.zip/");
+        assert!(a0);
+        // 代表サムネ = sort 先頭ページ (p01.jpg)。
+        assert_eq!(rep0, Some("ch01.zip/p01.jpg"));
+        assert!(metas[0].is_none());
+        let (p1, _, rep1) = as_zipdir(&items[1]);
+        assert_eq!(p1, "ch02.zip/");
+        assert_eq!(rep1, Some("ch02.zip/p01.jpg"));
+        // 最後に直下画像。
+        assert_eq!(as_zipimage(&items[2]), "loose.jpg");
+        assert!(metas[2].is_some());
+    }
+
+    #[test]
+    fn materialize_mixed_dir_then_images() {
+        let t = tree(&["sub/x.jpg", "a.jpg", "b.jpg"]);
+        let (items, _) = t.materialize_level(&[], SortOrder::FileName);
+        // sub (ZipDir, 非アーカイブ) が先頭。
+        let (prefix, is_archive, _) = as_zipdir(&items[0]);
+        assert_eq!(prefix, "sub/");
+        assert!(!is_archive);
+        assert_eq!(as_zipimage(&items[1]), "a.jpg");
+        assert_eq!(as_zipimage(&items[2]), "b.jpg");
+    }
+
+    #[test]
+    fn materialize_nested_prefix_builds_full_dir_prefix() {
+        let t = tree(&["chapters/ch01.zip/p01.jpg", "chapters/ch02.zip/p01.jpg"]);
+        let (items, _) = t.materialize_level(&s(&["chapters"]), SortOrder::FileName);
+        let (p0, a0, rep0) = as_zipdir(&items[0]);
+        assert_eq!(p0, "chapters/ch01.zip/");
+        assert!(a0);
+        assert_eq!(rep0, Some("chapters/ch01.zip/p01.jpg"));
+        let (p1, _, _) = as_zipdir(&items[1]);
+        assert_eq!(p1, "chapters/ch02.zip/");
+    }
+
+    #[test]
+    fn materialize_representative_sort_aware() {
+        // 列挙順は [b, a] だが FileName sort では代表は a.jpg。
+        let t = tree(&["book/b.jpg", "book/a.jpg"]);
+        let (items, _) = t.materialize_level(&[], SortOrder::FileName);
+        let (_, _, rep) = as_zipdir(&items[0]);
+        assert_eq!(rep, Some("book/a.jpg"));
+    }
+
+    #[test]
+    fn materialize_representative_recurses_into_first_subdir() {
+        // 直下画像なし → sort 先頭の子ディレクトリ (sub_a) の先頭画像。
+        let t = tree(&["wrap/sub_b/y.jpg", "wrap/sub_a/x.jpg"]);
+        let (items, _) = t.materialize_level(&[], SortOrder::FileName);
+        // root 直下は "wrap" のみ。
+        let (prefix, _, rep) = as_zipdir(&items[0]);
+        assert_eq!(prefix, "wrap/");
+        assert_eq!(rep, Some("wrap/sub_a/x.jpg"));
+    }
+
+    #[test]
+    fn materialize_numeric_sort_natural_order() {
+        let t = tree(&["p10.jpg", "p2.jpg", "p1.jpg"]);
+        let (items, _) = t.materialize_level(&[], SortOrder::Numeric);
+        let names: Vec<&str> = items.iter().map(as_zipimage).collect();
+        assert_eq!(names, vec!["p1.jpg", "p2.jpg", "p10.jpg"]);
+    }
+
+    #[test]
+    fn materialize_missing_prefix_is_empty() {
+        let t = tree(&["a.jpg"]);
+        let (items, metas) = t.materialize_level(&s(&["nope"]), SortOrder::FileName);
+        assert!(items.is_empty());
+        assert!(metas.is_empty());
+    }
+
+    #[test]
+    fn materialize_meta_values_match_entry() {
+        let t = ZipTree::build(
+            PathBuf::from("C:/test/outer.zip"),
+            vec![ZipImageEntry {
+                entry_name: "a.jpg".to_string(),
+                uncompressed_size: 1234,
+                mtime: 99,
+            }],
+        );
+        let (items, metas) = t.materialize_level(&[], SortOrder::FileName);
+        assert_eq!(items.len(), 1);
+        assert_eq!(metas[0], Some((99, 1234)));
     }
 }
