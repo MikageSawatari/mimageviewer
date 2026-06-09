@@ -404,8 +404,9 @@ enum GridViewMode {
 - 詳細モードでも選択・チェック・右クリック・D&D・Enter/ダブルクリックの意味は既存グリッドと
   そろえる。
 - 実装では、詳細モードへ入ると `keep_range` / `keep_set` を空にして新規サムネ要求を止め、
-  既存 `Loaded` テクスチャも 1 回だけ `Evicted` にして VRAM を解放する。毎フレーム O(n) で
-  drain/evict しないよう `details_thumb_suppression_applied` で抑制済み状態を持つ。
+  既存 `Loaded` テクスチャも 1 回だけ `Evicted` にして VRAM を解放する。ただし動画サムネは
+  フォルダロード時の専用 worker でしか取得しないため、詳細モード中も `Loaded` を保持する。
+  毎フレーム O(n) で drain/evict しないよう `details_thumb_suppression_applied` で抑制済み状態を持つ。
 
 ### 15.2 列は「軽量列」と「遅延列」を同じ列定義で扱う
 

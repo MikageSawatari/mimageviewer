@@ -345,6 +345,11 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.separator();
     ui.add_space(2.0);
     ui.checkbox(&mut s.show_toolbar_rating, "レーティング (★ フィルタ)");
+    ui.checkbox(
+        &mut s.show_toolbar_facet_filter,
+        "スマートフィルタ (絞り込みバー)",
+    )
+    .on_hover_text("非表示にしても、適用中の絞り込み条件そのものは保持されます。");
     ui.checkbox(&mut s.show_toolbar_favorites, "お気に入り");
     ui.checkbox(&mut s.show_toolbar_tags, "タグ");
     if clear_recent_folders_clicked {

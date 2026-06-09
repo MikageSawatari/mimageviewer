@@ -13709,7 +13709,13 @@ impl App {
             self.keep_end_shared.store(0, Ordering::Relaxed);
             self.thumb_pixels.clear();
             self.thumb_adjust_tex.clear();
-            for thumb in self.thumbnails.iter_mut() {
+            for (item, thumb) in self.items.iter().zip(self.thumbnails.iter_mut()) {
+                // Video thumbnails are produced by the dedicated Shell/sidecar worker at
+                // folder-load time, not by make_load_request. If we evict them here,
+                // returning from details view cannot request them again.
+                if matches!(item, GridItem::Video(_)) {
+                    continue;
+                }
                 if matches!(thumb, ThumbnailState::Loaded { .. }) {
                     *thumb = ThumbnailState::Evicted;
                 }

@@ -1371,6 +1371,9 @@ pub struct Settings {
     /// ツールバーに「レーティングフィルタ」セクション (☆|なし 1 2 3 4 5) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_rating: bool,
+    /// ツールバー下のスマートフィルタバー (絞り込み) を表示する。
+    #[serde(default = "default_true")]
+    pub show_toolbar_facet_filter: bool,
     /// フォルダバーに「お気に入り追加 / 設定」(♡/♥) ボタンを表示する。
     #[serde(default = "default_true")]
     pub show_address_bar_favorite_button: bool,
@@ -2524,6 +2527,7 @@ impl Default for Settings {
             show_toolbar_next_folder: true,
             show_toolbar_vst3: true,
             show_toolbar_rating: true,
+            show_toolbar_facet_filter: true,
             show_address_bar_favorite_button: true,
             show_address_bar_history_menu: true,
             show_address_bar_folder_pin: true,
@@ -3786,6 +3790,8 @@ mod tests {
         assert!(s.show_toolbar_parent_button);
         assert!(s.show_toolbar_prev_folder);
         assert!(s.show_toolbar_next_folder);
+        assert!(s.show_toolbar_rating);
+        assert!(s.show_toolbar_facet_filter);
         assert!(s.show_address_bar_favorite_button);
         assert!(s.show_address_bar_history_menu);
         assert!(s.show_address_bar_folder_pin);
@@ -5284,6 +5290,7 @@ mod tests {
             s.toolbar_cols_display = ToolbarSectionDisplay::Dropdown;
             s.toolbar_aspect_display = ToolbarSectionDisplay::Dropdown;
             s.toolbar_sort_display = ToolbarSectionDisplay::Dropdown;
+            s.show_toolbar_facet_filter = false;
             s.save();
 
             reset_backup_state_for_test();
@@ -5407,6 +5414,10 @@ mod tests {
                 loaded.toolbar_sort_display,
                 ToolbarSectionDisplay::Dropdown,
                 "toolbar_sort_display should survive roundtrip"
+            );
+            assert!(
+                !loaded.show_toolbar_facet_filter,
+                "show_toolbar_facet_filter (false override) should survive roundtrip"
             );
             assert_eq!(
                 loaded.thumb_aspect,

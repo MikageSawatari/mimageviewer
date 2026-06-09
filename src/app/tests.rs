@@ -5624,6 +5624,53 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn details_thumbnail_suppression_keeps_loaded_video_thumbnails() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let image_tex = ctx.load_texture(
+            "details-suppress-image",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let video_tex = ctx.load_texture(
+            "details-suppress-video",
+            egui::ColorImage::filled([1, 1], egui::Color32::BLACK),
+            egui::TextureOptions::LINEAR,
+        );
+
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.thumbnails.push(ThumbnailState::Loaded {
+            tex: image_tex,
+            from_cache: false,
+            rendered_at_px: 1,
+            source_dims: None,
+        });
+        app.items
+            .push(GridItem::Video(std::path::PathBuf::from("c:/p/b.mp4")));
+        app.thumbnails.push(ThumbnailState::Loaded {
+            tex: video_tex,
+            from_cache: false,
+            rendered_at_px: 1,
+            source_dims: None,
+        });
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+
+        app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
+
+        assert!(
+            matches!(app.thumbnails[0], ThumbnailState::Evicted),
+            "detail view should still release ordinary image thumbnails"
+        );
+        assert!(
+            matches!(app.thumbnails[1], ThumbnailState::Loaded { .. }),
+            "video thumbnails must survive details mode because they are not reload-queued"
+        );
+    }
+
+    #[test]
     fn folder_nav_mode_same_kind_distinguishes_favsearch_scope() {
         let root_a = PathBuf::from("c:/fav-a");
         let root_b = PathBuf::from("c:/fav-b");

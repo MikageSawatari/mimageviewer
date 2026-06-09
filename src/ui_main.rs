@@ -1728,6 +1728,9 @@ impl App {
     // ── スマートフィルタバー ────────────────────────────────────────
 
     pub(crate) fn render_facet_filter_bar(&mut self, ctx: &egui::Context) {
+        if !self.settings.show_toolbar_facet_filter {
+            return;
+        }
         if self.items.is_empty() || self.items_are_drive_list {
             return;
         }
