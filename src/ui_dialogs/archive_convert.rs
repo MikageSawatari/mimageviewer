@@ -98,8 +98,8 @@ pub(crate) struct ArchiveConvertState {
     /// (グリッド Enter / ダブルクリック / ゲームパッド × 設定 ON) のときだけ true。
     /// キャンセル時は state ごと drop されるので stale フラグが残らない。
     pub auto_fullscreen: bool,
-    /// true の場合、Scanning / Converting のウィンドウを出さず、Confirm を自動通過する。
-    /// パスワード入力とエラーはユーザー操作が必要なので表示する。
+    /// true の場合、Scanning のウィンドウを出さず、Confirm を自動通過する。
+    /// 変換中の進捗、パスワード入力、エラーは表示する。
     pub suppress_confirm: bool,
     /// Confirm 画面の「次回から表示しない」。変換開始時に設定へ反映する。
     pub suppress_confirm_next_time: bool,
@@ -138,11 +138,7 @@ fn prepare_archive_password_retry(
 }
 
 fn archive_convert_window_suppressed(phase: &ArchiveConvertPhase, suppress_confirm: bool) -> bool {
-    suppress_confirm
-        && matches!(
-            phase,
-            ArchiveConvertPhase::Scanning | ArchiveConvertPhase::Converting { .. }
-        )
+    suppress_confirm && matches!(phase, ArchiveConvertPhase::Scanning)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -848,12 +844,12 @@ mod tests {
     }
 
     #[test]
-    fn suppress_confirm_hides_only_passive_phases() {
+    fn suppress_confirm_hides_only_scanning_phase() {
         assert!(archive_convert_window_suppressed(
             &ArchiveConvertPhase::Scanning,
             true
         ));
-        assert!(archive_convert_window_suppressed(
+        assert!(!archive_convert_window_suppressed(
             &ArchiveConvertPhase::Converting {
                 progress: Arc::new(ArchiveConvertProgressShared::new()),
                 cancel: Arc::new(AtomicBool::new(false)),

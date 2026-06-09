@@ -1293,8 +1293,8 @@ pub struct Settings {
     /// 0 は無制限 (= 既存挙動)。
     #[serde(default)]
     pub archive_cache_max_bytes: u64,
-    /// RAR / 7z / LZH を開くとき、確認ダイアログを出さずに変換キャッシュを作成する。
-    /// パスワード入力やエラーは引き続きダイアログ表示する。
+    /// RAR / 7z / LZH を開くとき、確認ダイアログを省略して変換キャッシュを作成する。
+    /// 変換中の進捗、パスワード入力、エラーは引き続きダイアログ表示する。
     #[serde(default)]
     pub archive_convert_without_dialog: bool,
     /// 一括キャッシュ作成: ZIP 内の全画像をキャッシュ対象にする

@@ -1128,11 +1128,11 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     ui.checkbox(
         &mut s.archive_convert_without_dialog,
-        "ダイアログを開かずキャッシュを作成する",
+        "確認ダイアログを省略してキャッシュを作成する",
     );
     ui.label(
         egui::RichText::new(
-            "ON にすると、未変換の RAR / 7z / LZH を開いたときに確認画面を省略して変換します。パスワード入力やエラーは表示されます。",
+            "ON にすると、未変換の RAR / 7z / LZH を開いたときに確認画面を省略して変換します。変換中の進捗、パスワード入力、エラーは表示されます。",
         )
         .small()
         .weak(),
