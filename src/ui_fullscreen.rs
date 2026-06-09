@@ -56,8 +56,14 @@ fn should_handle_fullscreen_wheel(
     in_video_tile: bool,
     ctrl_held: bool,
     modal_for_keys: bool,
+    // 表示モード / フィットのポップアップメニュー表示中は、メニュー上でも画像上でも
+    // ホイールを背後のページ送り・連結スクロール・ズームへ流さない (modal と同様に全抑制)。
+    popup_open: bool,
 ) -> bool {
-    !modal_for_keys && (!in_video_tile || !ctrl_held) && (ctrl_held || !cursor_in_panel)
+    !modal_for_keys
+        && !popup_open
+        && (!in_video_tile || !ctrl_held)
+        && (ctrl_held || !cursor_in_panel)
 }
 
 fn should_zoom_fullscreen_wheel(ctrl_held: bool, overlay_edit_mode: bool) -> bool {
@@ -5784,6 +5790,7 @@ impl App {
             in_video_tile,
             ctrl_held,
             modal_for_keys,
+            self.spread_popup_open || self.fit_popup_open,
         );
         if wheel_y.abs() > 0.5 && handle_wheel_here {
             ctx.input_mut(|i| {
@@ -6026,9 +6033,15 @@ impl App {
         }
         // 分析モード中は右クリックを色固定に使うため、終了トリガーにしない
         // コンテキストメニュー表示中は右クリック処理をスキップ
+        // 表示モード / フィットのポップアップ表示中も、右クリックはメニューを閉じる
+        // 用途 (popup 側の外クリック判定) に専念させ、フルスクリーン終了 / コンテキスト
+        // メニューを誤発火させない。handle_fs_wheel_and_click は hover bar 描画より前に
+        // 走るため、ここで読む popup 状態はまだ閉じられていない。
         if !self.analysis_mode
             && !self.is_overlay_edit_mode_active()
             && self.fs_context_menu_idx.is_none()
+            && !self.spread_popup_open
+            && !self.fit_popup_open
         {
             let secondary_down = ctx.input(|i| i.pointer.secondary_down());
             let secondary_released = ctx.input(|i| i.pointer.secondary_released());
@@ -13394,10 +13407,22 @@ mod tests {
 
     #[test]
     fn ctrl_wheel_is_handled_even_over_panels() {
-        assert!(should_handle_fullscreen_wheel(true, false, true, false));
-        assert!(!should_handle_fullscreen_wheel(true, false, false, false));
-        assert!(should_handle_fullscreen_wheel(false, false, false, false));
-        assert!(!should_handle_fullscreen_wheel(false, false, true, true));
+        assert!(should_handle_fullscreen_wheel(
+            true, false, true, false, false
+        ));
+        assert!(!should_handle_fullscreen_wheel(
+            true, false, false, false, false
+        ));
+        assert!(should_handle_fullscreen_wheel(
+            false, false, false, false, false
+        ));
+        assert!(!should_handle_fullscreen_wheel(
+            false, false, true, true, false
+        ));
+        // 表示モード / フィットのポップアップ表示中は Ctrl+ホイールでも抑制する。
+        assert!(!should_handle_fullscreen_wheel(
+            false, false, true, false, true
+        ));
     }
 
     #[test]

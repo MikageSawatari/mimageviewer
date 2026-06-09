@@ -10401,6 +10401,7 @@ impl App {
             self.reading_direction = crate::settings::ReadingDirection::Ltr;
         }
         self.spread_popup_open = false;
+        self.fit_popup_open = false;
         self.search_filter = None;
         self.search_filter_origin_folder = None;
         self.search_query.clear();
@@ -20469,6 +20470,10 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        // 表示モード / フィットのポップアップを開いたまま抜けると、次回フルスクリーンで
+        // メニューが残り、カーソル自動非表示やページ送りの抑制が効いたままになるため解除する。
+        self.spread_popup_open = false;
+        self.fit_popup_open = false;
         // フルスクリーン解除前に動画再生位置を保存 (drop で消える前に)
         self.save_all_video_resume_positions();
         // 進行中のノーマライズスキャンをキャンセル + 全 fs_idx の UI 状態をクリア
