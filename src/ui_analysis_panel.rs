@@ -977,10 +977,16 @@ impl App {
         }
 
         // ── パネル UI ──
-        // 分析モードではページシークバーを出さない (draw_fullscreen_seek_overlay 側で抑制)
-        // ため、パネルは全高を使ってよい。
-        let panel_rect =
-            egui::Rect::from_min_max(egui::pos2(image_rect.max.x, full_rect.min.y), full_rect.max);
+        // 上端は上部ホバーバー分だけ空ける。さもないとヘッダの × ボタンに上バーが
+        // 重なってクリックできない。下端は分析モードではシークバーを出さない
+        // (draw_fullscreen_seek_overlay 側で抑制) ので全高まで使う。
+        let panel_rect = egui::Rect::from_min_max(
+            egui::pos2(
+                image_rect.max.x,
+                full_rect.min.y + crate::ui_fullscreen::TOP_BAR_HEIGHT,
+            ),
+            full_rect.max,
+        );
         ui.painter().rect_filled(
             panel_rect,
             0.0,

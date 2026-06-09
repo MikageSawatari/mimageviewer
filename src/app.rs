@@ -20474,6 +20474,11 @@ impl App {
         // メニューが残り、カーソル自動非表示やページ送りの抑制が効いたままになるため解除する。
         self.spread_popup_open = false;
         self.fit_popup_open = false;
+        // 分析モード (Z) は一覧に戻ったら必ず解除する。さもないと次にフルスクリーンを
+        // 開いたとき分析モードのまま起動してしまう (fullscreen_idx がまだ有効なうちに呼ぶ)。
+        if self.analysis_mode {
+            self.reset_analysis_mode();
+        }
         // フルスクリーン解除前に動画再生位置を保存 (drop で消える前に)
         self.save_all_video_resume_positions();
         // 進行中のノーマライズスキャンをキャンセル + 全 fs_idx の UI 状態をクリア

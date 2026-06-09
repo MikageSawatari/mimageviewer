@@ -43,7 +43,7 @@ use self::draw_icons::*;
 /// メタデータパネルの最大幅
 const METADATA_PANEL_WIDTH: f32 = 380.0;
 /// ホバー時トップバーの高さ
-const TOP_BAR_HEIGHT: f32 = 44.0;
+pub(crate) const TOP_BAR_HEIGHT: f32 = 44.0;
 /// 静止画フルスクリーン下端のページシークバーの高さ。下端まで伸びる左右パネル
 /// (補正パネル / メタデータパネル) はこの分だけ下端を空けてシークバーと重ならない
 /// ようにする (`draw_fullscreen_seek_overlay` の panel_rect と同じ高さ)。
