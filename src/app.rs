@@ -31086,6 +31086,26 @@ fn make_load_request(
             zip_entry: Some(entry_name.clone()),
             ..base
         }),
+        GridItem::ZipDir {
+            zip_path,
+            dir_prefix,
+            representative,
+            ..
+        } => {
+            // ネスト ZIP ツリーの子コンテナ代表サムネ (v1.3.0)。代表画像 (representative)
+            // のバイトを zip_entry 経由で読み、カタログには zipdir:{dir_prefix} キーで保存
+            // する (entry_name キーと非衝突, additive)。cache_key_override が zipdir: で
+            // folder/zip thumb prefix と一致しないため、ワーカーはコンテナ列挙ではなく
+            // 「zip_entry を直接読む」経路に乗る。representative は materialize が必ず
+            // Some にする (空サブツリーは構造上生成されない) ので、None なら要求を出さない。
+            let rep = representative.clone()?;
+            Some(LoadRequest {
+                path: zip_path.clone(),
+                zip_entry: Some(rep),
+                cache_key_override: Some(crate::grid_item::zipdir_cache_key(dir_prefix)),
+                ..base
+            })
+        }
         GridItem::PdfPage {
             pdf_path, page_num, ..
         } => Some(LoadRequest {

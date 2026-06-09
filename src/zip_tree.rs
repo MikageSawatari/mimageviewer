@@ -171,13 +171,20 @@ impl ZipTree {
             sort.compare(a, 0, b, 0, crate::ui_helpers::natural_sort_key)
         });
         for (seg, child) in dirs {
+            // 代表画像。build() は画像エントリの経路上にしかノードを作らないので、
+            // 任意の子ノードは部分木に必ず 1 枚以上画像を持つ → rep は実質的に常に Some。
+            let rep = representative_image(child, sort);
             items.push(GridItem::ZipDir {
                 zip_path: self.zip_path.clone(),
                 dir_prefix: format!("{prefix_str}{seg}/"),
                 is_archive: segment_is_archive(seg),
-                representative: representative_image(child, sort).map(|e| e.entry_name.clone()),
+                representative: rep.map(|e| e.entry_name.clone()),
             });
-            metas.push(None);
+            // 代表画像の mtime/size を meta に載せる。これがないと enqueue 経路
+            // (image_metas[i]==None を skip) が ZipDir のサムネ要求を出さず、セルが
+            // 永久 Pending → 毎フレーム repaint になる (Phase 2 Codex P2)。size 列に
+            // 代表画像サイズが出るのは許容 (date 列は details_created_time_path で None)。
+            metas.push(rep.map(|e| (e.mtime, e.uncompressed_size as i64)));
         }
 
         // 2) 直下画像 (ZipImage)。basename + mtime で sort。
@@ -527,7 +534,9 @@ mod tests {
         assert!(a0);
         // 代表サムネ = sort 先頭ページ (p01.jpg)。
         assert_eq!(rep0, Some("ch01.zip/p01.jpg"));
-        assert!(metas[0].is_none());
+        // ZipDir meta は代表画像の (mtime, size) を載せる (enqueue gate 用)。
+        // テスト entry は mtime=0/size=0。
+        assert_eq!(metas[0], Some((0, 0)));
         let (p1, _, rep1) = as_zipdir(&items[1]);
         assert_eq!(p1, "ch02.zip/");
         assert_eq!(rep1, Some("ch02.zip/p01.jpg"));
@@ -567,6 +576,19 @@ mod tests {
         let (items, _) = t.materialize_level(&[], SortOrder::FileName);
         let (_, _, rep) = as_zipdir(&items[0]);
         assert_eq!(rep, Some("book/a.jpg"));
+    }
+
+    #[test]
+    fn materialize_representative_prefers_direct_image_over_subdir() {
+        // 混在ノード (直下に cover.jpg + 子 ch01/): 代表は直下画像 (cover.jpg) を優先する。
+        // 設計判断 (Codex P3): 表紙は通常ルート直下の loose ファイルなので、materialize の
+        // 表示順 (ZipDir 先) とは別に「表紙 = 直下画像優先」を採る。entering 時の先頭セルは
+        // ch01/ になるが、代表サムネは cover.jpg になる (意図的な非一致)。
+        let t = tree(&["book/cover.jpg", "book/ch01/page01.jpg"]);
+        let (items, _) = t.materialize_level(&[], SortOrder::FileName);
+        let (prefix, _, rep) = as_zipdir(&items[0]);
+        assert_eq!(prefix, "book/");
+        assert_eq!(rep, Some("book/cover.jpg"));
     }
 
     #[test]

@@ -188,8 +188,22 @@ navigation でこの関数を呼ぶだけ (再列挙なし = in-memory)。見開
 - `ZipDir` の代表サムネ = 新キー `zipdir:{dir_prefix}` (zip の catalog 配下、**additive**)。
   選定は in-memory tree の部分木先頭画像 (sort 準拠)。worker が bytes 遅延読み。
   - Phase 1 の `ZipTreeNode::first_image_in_subtree` は **sort 非対応の fallback**
-    (直下画像=列挙順先頭、子=BTreeMap キー順)。Phase 2 の代表選定は表示 `SortOrder`
-    準拠の先頭画像を別途選ぶこと (Phase 1 Codex P3)。
+    (直下画像=列挙順先頭、子=BTreeMap キー順)。Phase 2b の `representative_image` は
+    表示 `SortOrder` 準拠の先頭画像を選ぶ (Phase 1 Codex P3 対応)。
+  - **代表選定は「直下画像優先」** (混在ノードでは ZipDir 表示順より前に直下画像を採る)。
+    表紙はルート直下の loose ファイルが普通なので、materialize の表示順 (ZipDir 先) とは
+    意図的に非一致 (Phase 2 Codex P3、`materialize_representative_prefers_direct_image_over_subdir`)。
+  - **Phase 2c thumbnail 配線 (Phase 2 Codex P2 対応)**: `materialize_level` は ZipDir の
+    `image_metas` に代表画像の `(mtime, size)` を載せる (None だと enqueue 経路が要求を
+    出さずセルが永久 Pending → 毎フレーム repaint)。`make_load_request` の ZipDir 分岐は
+    `path=zip_path` / `zip_entry=Some(representative)` / `cache_key_override=zipdir_cache_key`。
+    `zipdir:` prefix は folder/zip thumb prefix と一致しないので、worker はコンテナ列挙では
+    なく「zip_entry を直接読む」経路に乗り、代表バイトを zipdir: キーで保存する。
+  - **Phase 3 で existing_keys を全ツリーから構築する**: フラット実装は finalize が全
+    entry_name を `existing_keys` に入れて `delete_missing` のプルーン基準にしていた。
+    ツリーでは finalize がルート階層しか materialize しないため、`existing_keys` は
+    **ツリー全体を walk して全 leaf `entry_name` + 全 dir の `zipdir:{prefix}`** を集める
+    こと。さもないと深い階層の thumbnail が再オープン時に stale 削除される (Phase 2 Codex P2)。
 - **`is_archive` バッジは suffix 推定 (accepted ambiguity)**: 葉の `entry_name` 文字列
   だけからは「実在するネスト .zip アーカイブ」と「`.zip` という名前のただのフォルダ」
   を区別できない (`enumerate_recursive` が両者を同じ `"foo.zip/img.jpg"` 文字列に
