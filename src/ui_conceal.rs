@@ -998,42 +998,28 @@ impl App {
         // パネル上で離した場合は state を片付けないとリーク (Codex P2 #6) する。
         // → release 検知時は通常 dispatch を通し、各 tool ハンドラが state リセットする。
         let panel_rect = self.conceal_panel_rect(full_rect);
-        if let Some(pos) = pointer_pos {
-            if panel_rect.contains(pos) && !primary_released {
-                return;
-            }
-        }
-
-        // Space+ドラッグ: 一時パン (Photoshop 流)
         let drawing_in_progress = self.conceal_last_paint_pos.is_some()
             || self.conceal_line_start.is_some()
             || self.conceal_shape_drag_start.is_some()
             || self.conceal_drag.is_some()
             || !self.conceal_lasso_points.is_empty();
-        if space_held && !drawing_in_progress {
-            if primary_pressed {
-                if let Some(pos) = pointer_pos {
-                    self.fs_pan_drag_start = Some((pos, self.fs_pan));
-                }
-            } else if primary_down {
-                if let Some((start_pos, start_pan)) = self.fs_pan_drag_start {
-                    if let Some(pos) = pointer_pos {
-                        self.fs_pan = start_pan + (pos - start_pos);
-                    }
-                }
-            }
-            if primary_released {
-                self.fs_pan_drag_start = None;
-            }
-            ctx.set_cursor_icon(if primary_down {
-                egui::CursorIcon::Grabbing
-            } else {
-                egui::CursorIcon::Grab
-            });
+        let pointer_over_panel = pointer_pos.is_some_and(|pos| panel_rect.contains(pos));
+        if !drawing_in_progress
+            && self.handle_overlay_space_pan_drag(
+                ctx,
+                space_held,
+                !pointer_over_panel,
+                primary_pressed,
+                primary_down,
+                primary_released,
+                pointer_pos,
+            )
+        {
             return;
         }
-        if !space_held && self.fs_pan_drag_start.is_some() {
-            self.fs_pan_drag_start = None;
+
+        if pointer_over_panel && !primary_released {
+            return;
         }
 
         // ⚠ 旧版は「Select 以外のツール開始時に選択を解除」していたが、これだと

@@ -508,10 +508,11 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - ConcealSpacePan `Space` (KH, Ph6) / ConcealNudge 矢印 (固定候補)
 
 ### Crop (Ph3) ★
-- CropExit `Esc`(予約) / CropExecute `Ctrl+E`
+- CropExit `Esc`(予約) / CropExecute `Ctrl+E` / CropSpacePan `Space` (KH)
 
 ### Text (Ph3) ★
 - TextConfirm `Ctrl+T` / TextRedo `Ctrl+Y`,`Ctrl+Shift+Z` / TextUndo `Ctrl+Z`
+- TextSpacePan `Space` (KH)
 - TextDeleteChar `Delete`,`Backspace` は編集中の text field / IME と絡むため固定候補
 - TextCancel `Esc`(予約)
 
@@ -519,6 +520,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - LaShowSource `Q` / LaShowMask `W` / LaPaintAdd `D` / LaPaintErase `F` / LaExit `Esc`(予約)
 - LaToolBrush/EdgeBrush/GapFill/Lasso/Polygon/Select/Line/VLine/HLine/Rect/Ellipse
   `B/A/G/L/P/S/I/V/H/R/O`
+- LaSpacePan `Space` (KH)
 - Ctrl / Ctrl+Shift の source/layer bypass は一時 modifier 状態を使うため固定。
 
 ### 固定・対象外として明示するもの

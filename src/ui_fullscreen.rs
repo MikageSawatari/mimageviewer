@@ -274,21 +274,6 @@ fn shift_held_via_os() -> bool {
     false
 }
 
-/// 物理的な Space キー押下を OS から直接読む (`ctrl_held_via_os` と同じ理由)。
-/// 補正レイヤー編集中の Space+ドラッグ パンに使う。FS ビューポートでは
-/// `ctx.input(|i| i.key_down(Space))` がフォーカス不在で stale になり得るため。
-#[cfg(windows)]
-pub(crate) fn space_held_via_os() -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SPACE};
-
-    unsafe { GetAsyncKeyState(VK_SPACE.0 as i32) < 0 }
-}
-
-#[cfg(not(windows))]
-pub(crate) fn space_held_via_os() -> bool {
-    false
-}
-
 /// 静止画フルスクリーンで Enter キーをフルスクリーン解除トリガーとして消費すべきか
 /// 判定する純関数 (副作用ゼロ)。
 ///
@@ -1076,15 +1061,6 @@ impl App {
         if self.local_adjust_mode && shift_held_via_os() {
             return false;
         }
-        // 補正レイヤーの境界筆では Ctrl を「境界無視の通常筆」に割り当てるため、Ctrl の
-        // ソースプレビューを抑止する。これで paint handler のゲート (`!original_preview_active`)
-        // が解け、Ctrl+ドラッグが通常筆として届く (handle_local_adjust_canvas_input 側で
-        // EdgeBrush→Brush に差し替え)。境界筆中だけの挙動なので他ツールの Ctrl=ソース比較は不変。
-        if self.local_adjust_mode
-            && self.local_adjust_mask_tool == crate::app::LocalAdjustMaskTool::EdgeBrush
-        {
-            return false;
-        }
         matches!(
             self.items.get(idx),
             Some(GridItem::Image(_))
@@ -1438,6 +1414,50 @@ impl App {
         }
 
         false
+    }
+
+    /// Overlay editing tools share Photoshop-style temporary pan: hold Space and
+    /// drag with the primary button. `can_start` should be false over tool panels,
+    /// but an already-started pan continues if the pointer crosses a panel.
+    pub(crate) fn handle_overlay_space_pan_drag(
+        &mut self,
+        ctx: &egui::Context,
+        space_held: bool,
+        can_start: bool,
+        primary_pressed: bool,
+        primary_down: bool,
+        primary_released: bool,
+        pointer_pos: Option<egui::Pos2>,
+    ) -> bool {
+        let active = self.fs_pan_drag_start.is_some();
+        if !space_held {
+            if active {
+                self.fs_pan_drag_start = None;
+            }
+            return false;
+        }
+        if !active && !can_start {
+            return false;
+        }
+
+        if primary_pressed && !active {
+            if let Some(pos) = pointer_pos {
+                self.fs_pan_drag_start = Some((pos, self.fs_pan));
+            }
+        } else if primary_down
+            && let (Some((start_pos, start_pan)), Some(pos)) = (self.fs_pan_drag_start, pointer_pos)
+        {
+            self.fs_pan = start_pan + (pos - start_pos);
+        }
+        if primary_released {
+            self.fs_pan_drag_start = None;
+        }
+        ctx.set_cursor_icon(if primary_down {
+            egui::CursorIcon::Grabbing
+        } else {
+            egui::CursorIcon::Grab
+        });
+        true
     }
 
     /// ホイールによるマウス位置固定ズームを適用する。ズームが変化したら true を返す。

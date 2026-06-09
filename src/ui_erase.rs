@@ -1225,14 +1225,6 @@ impl App {
         // (Codex P2 R3 #2、隠蔽側 `ui_conceal.rs::handle_conceal_paint` の同条件
         // と揃える)。
         let panel_rect = self.erase_panel_rect(full_rect);
-        if let Some(pos) = pointer_pos
-            && panel_rect.contains(pos)
-            && !primary_released
-        {
-            return;
-        }
-
-        // ── Space+ドラッグ: 一時パン (Photoshop 流) ─────────────────
         // 描画ドラッグ進行中は Space を無視し、現在の描画を最後まで完結させる。
         // (途中で Space 検知 → パンに切替するとマスクが中途半端に確定するため)
         let drawing_in_progress = self.erase_last_paint_pos.is_some()
@@ -1240,31 +1232,23 @@ impl App {
             || self.erase_shape_drag_start.is_some()
             || self.erase_drag.is_some()
             || !self.erase_lasso_points.is_empty();
-        if space_held && !drawing_in_progress {
-            if primary_pressed {
-                if let Some(pos) = pointer_pos {
-                    self.fs_pan_drag_start = Some((pos, self.fs_pan));
-                }
-            } else if primary_down {
-                if let Some((start_pos, start_pan)) = self.fs_pan_drag_start {
-                    if let Some(pos) = pointer_pos {
-                        self.fs_pan = start_pan + (pos - start_pos);
-                    }
-                }
-            }
-            if primary_released {
-                self.fs_pan_drag_start = None;
-            }
-            ctx.set_cursor_icon(if primary_down {
-                egui::CursorIcon::Grabbing
-            } else {
-                egui::CursorIcon::Grab
-            });
+        let pointer_over_panel = pointer_pos.is_some_and(|pos| panel_rect.contains(pos));
+        if !drawing_in_progress
+            && self.handle_overlay_space_pan_drag(
+                ctx,
+                space_held,
+                !pointer_over_panel,
+                primary_pressed,
+                primary_down,
+                primary_released,
+                pointer_pos,
+            )
+        {
             return;
         }
-        // Space 離した瞬間の取りこぼし対策: 描画パスへ戻る前に pan drag を片付ける。
-        if !space_held && self.fs_pan_drag_start.is_some() {
-            self.fs_pan_drag_start = None;
+
+        if pointer_over_panel && !primary_released {
+            return;
         }
 
         // ── ベクタオブジェクト編集パス (選択ツール時のみ) ───────────

@@ -203,6 +203,7 @@
 # ConcealSpacePan = Space
 
 [Crop]
+# CropSpacePan = Space
 # CropExecute = Ctrl+E
 
 [Text]
@@ -210,6 +211,7 @@
 # TextRedo.1 = Ctrl+Y
 # TextRedo.2 = Ctrl+Shift+Z
 # TextUndo = Ctrl+Z
+# TextSpacePan = Space
 
 [LocalAdjust]
 # LaShowSource = Q
@@ -227,3 +229,4 @@
 # LaToolHLine = H
 # LaToolRect = R
 # LaToolEllipse = O
+# LaSpacePan = Space

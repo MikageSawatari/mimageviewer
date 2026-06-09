@@ -819,10 +819,12 @@ pub enum KeyAction {
     ConcealToolRect,
     ConcealToolEllipse,
     ConcealSpacePan,
+    CropSpacePan,
     CropExecute,
     TextConfirm,
     TextRedo,
     TextUndo,
+    TextSpacePan,
     LaShowSource,
     LaShowMask,
     LaPaintAdd,
@@ -838,6 +840,7 @@ pub enum KeyAction {
     LaToolHLine,
     LaToolRect,
     LaToolEllipse,
+    LaSpacePan,
 }
 
 const ALL_ACTIONS: &[KeyAction] = &[
@@ -990,10 +993,12 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ConcealToolRect,
     KeyAction::ConcealToolEllipse,
     KeyAction::ConcealSpacePan,
+    KeyAction::CropSpacePan,
     KeyAction::CropExecute,
     KeyAction::TextConfirm,
     KeyAction::TextRedo,
     KeyAction::TextUndo,
+    KeyAction::TextSpacePan,
     KeyAction::LaShowSource,
     KeyAction::LaShowMask,
     KeyAction::LaPaintAdd,
@@ -1009,6 +1014,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::LaToolHLine,
     KeyAction::LaToolRect,
     KeyAction::LaToolEllipse,
+    KeyAction::LaSpacePan,
 ];
 // Keep this list in sync with `KeyAction`. The keymap tests compare the enum
 // inventory and this array so newly added actions cannot silently miss ini generation.
@@ -1170,10 +1176,12 @@ impl KeyAction {
             ConcealToolRect => "ConcealToolRect",
             ConcealToolEllipse => "ConcealToolEllipse",
             ConcealSpacePan => "ConcealSpacePan",
+            CropSpacePan => "CropSpacePan",
             CropExecute => "CropExecute",
             TextConfirm => "TextConfirm",
             TextRedo => "TextRedo",
             TextUndo => "TextUndo",
+            TextSpacePan => "TextSpacePan",
             LaShowSource => "LaShowSource",
             LaShowMask => "LaShowMask",
             LaPaintAdd => "LaPaintAdd",
@@ -1189,6 +1197,7 @@ impl KeyAction {
             LaToolHLine => "LaToolHLine",
             LaToolRect => "LaToolRect",
             LaToolEllipse => "LaToolEllipse",
+            LaSpacePan => "LaSpacePan",
         }
     }
 
@@ -1286,11 +1295,11 @@ impl KeyAction {
             | ConcealToolBrush | ConcealToolLasso | ConcealToolPolygon | ConcealToolLine
             | ConcealToolVLine | ConcealToolHLine | ConcealToolRect | ConcealToolEllipse
             | ConcealSpacePan => KeyContext::Conceal,
-            CropExecute => KeyContext::Crop,
-            TextConfirm | TextRedo | TextUndo => KeyContext::Text,
+            CropExecute | CropSpacePan => KeyContext::Crop,
+            TextConfirm | TextRedo | TextUndo | TextSpacePan => KeyContext::Text,
             LaShowSource | LaShowMask | LaPaintAdd | LaPaintErase | LaToolBrush
             | LaToolEdgeBrush | LaToolGapFill | LaToolLasso | LaToolPolygon | LaToolSelect
-            | LaToolLine | LaToolVLine | LaToolHLine | LaToolRect | LaToolEllipse => {
+            | LaToolLine | LaToolVLine | LaToolHLine | LaToolRect | LaToolEllipse | LaSpacePan => {
                 KeyContext::LocalAdjust
             }
         }
@@ -1300,7 +1309,9 @@ impl KeyAction {
         use KeyAction::*;
         match self {
             FsLoupeHold => KeyTrigger::ModifierHold,
-            EraseSpacePan | ConcealSpacePan => KeyTrigger::KeyHold,
+            EraseSpacePan | ConcealSpacePan | CropSpacePan | TextSpacePan | LaSpacePan => {
+                KeyTrigger::KeyHold
+            }
             GlobalLocalSearch
             | GlobalFavSearch
             | GlobalMetadataSearch
@@ -1622,10 +1633,12 @@ impl KeyAction {
             ConcealToolRect => ChordList::one(Chord::key(R)),
             ConcealToolEllipse => ChordList::one(Chord::key(O)),
             ConcealSpacePan => ChordList::one(Chord::key(Space)),
+            CropSpacePan => ChordList::one(Chord::key(Space)),
             CropExecute => ChordList::one(Chord::ctrl(E)),
             TextConfirm => ChordList::one(Chord::ctrl(T)),
             TextRedo => ChordList::two(Chord::ctrl(Y), Chord::ctrl_shift(Z)),
             TextUndo => ChordList::one(Chord::ctrl(Z)),
+            TextSpacePan => ChordList::one(Chord::key(Space)),
             LaShowSource => ChordList::one(Chord::key(Q)),
             LaShowMask => ChordList::one(Chord::key(W)),
             LaPaintAdd => ChordList::one(Chord::key(D)),
@@ -1641,6 +1654,7 @@ impl KeyAction {
             LaToolHLine => ChordList::one(Chord::key(H)),
             LaToolRect => ChordList::one(Chord::key(R)),
             LaToolEllipse => ChordList::one(Chord::key(O)),
+            LaSpacePan => ChordList::one(Chord::key(Space)),
         }
     }
 }

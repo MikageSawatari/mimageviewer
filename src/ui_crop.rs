@@ -425,6 +425,23 @@ impl App {
             });
         const HANDLE_HIT: f32 = 32.0;
         const CREATE_DRAG_THRESHOLD: f32 = 4.0;
+        let pointer_pos = hover_pos.or(press_origin);
+        let crop_drag_in_progress =
+            self.export_crop_drag.is_some() || self.export_crop_create_drag.is_some();
+        if !crop_drag_in_progress
+            && self.handle_overlay_space_pan_drag(
+                ui.ctx(),
+                self.keymap
+                    .key_held_action(ui.ctx(), KeyAction::CropSpacePan),
+                pointer_pos.is_some_and(|pos| image_rect.contains(pos)),
+                primary_pressed,
+                primary_down,
+                primary_released,
+                pointer_pos,
+            )
+        {
+            return true;
+        }
 
         let target_at = |pos: egui::Pos2| -> Option<CropHandle> {
             for (handle, center) in handles {

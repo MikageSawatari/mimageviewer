@@ -1348,6 +1348,21 @@ impl App {
                 i.pointer.interact_pos(),
             )
         });
+        let pointer_over_panel =
+            pos.is_some_and(|p| panel_rect.contains(p) || detail_rect.contains(p));
+        if self.text_drag.is_none()
+            && self.handle_overlay_space_pan_drag(
+                ctx,
+                self.keymap.key_held_action(ctx, KeyAction::TextSpacePan),
+                !pointer_over_panel,
+                pressed,
+                down,
+                released,
+                pos,
+            )
+        {
+            return;
+        }
 
         // クリック (press / release) 時だけ、透過考慮の当たり判定用にスタンプ画像を用意する。
         // ベイクと同じ build_stamp_images (comic_stamp_cache 経由) を使うので 2 回目以降は再デコード
@@ -1361,7 +1376,7 @@ impl App {
 
         if pressed {
             if let Some(pos) = pos {
-                if panel_rect.contains(pos) || detail_rect.contains(pos) {
+                if pointer_over_panel {
                     return; // パネル上のクリックはキャンバス操作にしない
                 }
                 let img = view.screen_to_image(pos);

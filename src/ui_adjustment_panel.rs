@@ -23,6 +23,7 @@ use crate::app::{
     LocalAdjustGeneratedMask, LocalAdjustMaskColorPreset, LocalAdjustMaskEditTarget,
     LocalAdjustMaskShapeDrag, LocalAdjustMaskTool, LocalAdjustRegionSegmentationScope,
 };
+use crate::keymap::KeyAction;
 use crate::local_adjust_catalog::{
     EFFECT_GROUPS, EffectKind, effect_picker_button_width, effect_picker_matches_query,
 };
@@ -8679,12 +8680,6 @@ impl App {
             return;
         };
         self.ensure_local_adjust_masks_match_source_dims(fs_idx);
-        let Some(layer_idx) = self.selected_local_adjust_layer_idx(fs_idx) else {
-            self.local_adjust_canvas_drag = None;
-            self.local_adjust_mask_brush_stroke = None;
-            return;
-        };
-        let image_dims = local_adjust_image_dims(self, fs_idx);
         let (
             primary_pressed,
             primary_down,
@@ -8702,19 +8697,7 @@ impl App {
                 i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
             )
         });
-        // フルスクリーンビューポートでは `modifiers.ctrl` が stale (Ctrl を離しても true の
-        // まま) になり得る。それを OR で混ぜると境界筆が常時「通常筆」化して境界の向こう側まで
-        // 塗る回帰になるため、Ctrl 依存の境界筆→通常筆切替は OS 直読みのみを使う
-        // (ソースプレビューの Ctrl 検出と同じ方式)。
-        let ctrl_held = crate::ui_fullscreen::ctrl_held_via_os();
 
-        // Space+ドラッグ: 一時パン (消しゴム/隠蔽モードと同じ Photoshop 流)。補正モードでは
-        // 主ボタンが塗り/図形に取られて従来のドラッグパンが効かないため、Space ホールド中だけ
-        // 主ボタンドラッグをパンへ振り替える。Space 検出は FS ビューポートで stale になる
-        // key_down を避け OS 直読みにする。描画ドラッグ進行中は Space を無視して描画を完結させる。
-        let space_held = crate::ui_fullscreen::space_held_via_os();
-        // 左/ツールパネル上のポインタはキャンバスパンに使わない (消しゴム/隠蔽と揃える。
-        // パネル除外を Space pan 開始より前に通す)。
         let pointer_over_panel = pointer_pos.is_some_and(|pos| {
             self.local_adjust_panel_rect(full_rect).contains(pos)
                 || self.local_adjust_tool_panel_rect(full_rect).contains(pos)
@@ -8724,33 +8707,31 @@ impl App {
             || self.local_adjust_canvas_drag.is_some()
             || self.local_adjust_mask_shape_drag_start.is_some()
             || !self.local_adjust_mask_lasso_points.is_empty();
-        if space_held && !drawing_in_progress && !pointer_over_panel {
-            if primary_pressed {
-                if let Some(pos) = pointer_pos {
-                    self.fs_pan_drag_start = Some((pos, self.fs_pan));
-                }
-            } else if primary_down {
-                if let Some((start_pos, start_pan)) = self.fs_pan_drag_start {
-                    if let Some(pos) = pointer_pos {
-                        self.fs_pan = start_pan + (pos - start_pos);
-                    }
-                }
-            }
-            if primary_released {
-                self.fs_pan_drag_start = None;
-            }
-            ctx.set_cursor_icon(if primary_down {
-                egui::CursorIcon::Grabbing
-            } else {
-                egui::CursorIcon::Grab
-            });
+        if !drawing_in_progress
+            && self.handle_overlay_space_pan_drag(
+                ctx,
+                self.keymap.key_held_action(ctx, KeyAction::LaSpacePan),
+                !pointer_over_panel,
+                primary_pressed,
+                primary_down,
+                primary_released,
+                pointer_pos,
+            )
+        {
             return;
         }
-        // pan drag の後始末。Space 離し時に加え、パネル上でボタンを離した場合 (上の分岐に
-        // 入らず primary_released を取りこぼす) も拾えるよう primary_released も条件に含める。
-        if self.fs_pan_drag_start.is_some() && (!space_held || primary_released) {
-            self.fs_pan_drag_start = None;
-        }
+
+        let Some(layer_idx) = self.selected_local_adjust_layer_idx(fs_idx) else {
+            self.local_adjust_canvas_drag = None;
+            self.local_adjust_mask_brush_stroke = None;
+            return;
+        };
+        let image_dims = local_adjust_image_dims(self, fs_idx);
+        // フルスクリーンビューポートでは `modifiers.ctrl` が stale (Ctrl を離しても true の
+        // まま) になり得る。それを OR で混ぜると境界筆が常時「通常筆」化して境界の向こう側まで
+        // 塗る回帰になるため、Ctrl 依存の境界筆→通常筆切替は OS 直読みのみを使う
+        // (ソースプレビューの Ctrl 検出と同じ方式)。
+        let ctrl_held = crate::ui_fullscreen::ctrl_held_via_os();
 
         if primary_released {
             if self.local_adjust_shape_drag.is_some() {
