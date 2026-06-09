@@ -486,26 +486,25 @@ impl App {
     }
 
     fn handle_gamepad_direction_for_grid(&mut self, dir: PadDir) {
-        let vi_len = self.visible_indices.len();
+        let display_order = self.current_grid_order().to_vec();
+        let vi_len = display_order.len();
         if vi_len == 0 {
             return;
         }
         let cols = self.settings.grid_cols.max(1);
+        let details_mode = self.settings.grid_view_mode == crate::settings::GridViewMode::Details;
+        let cell_h = self.last_cell_h.max(1.0);
+        let visible_rows = (self.last_viewport_h / cell_h).floor() as usize;
         let sel = self
             .selected
-            .unwrap_or_else(|| self.visible_indices.first().copied().unwrap_or(0));
-        let vis_pos = self
-            .visible_indices
+            .unwrap_or_else(|| display_order.first().copied().unwrap_or(0));
+        let vis_pos = display_order
             .iter()
             .position(|&idx| idx == sel)
             .unwrap_or(0);
-        let new_pos = match dir {
-            PadDir::Right => (vis_pos + 1).min(vi_len - 1),
-            PadDir::Left => vis_pos.saturating_sub(1),
-            PadDir::Down => (vis_pos + cols).min(vi_len - 1),
-            PadDir::Up => vis_pos.saturating_sub(cols),
-        };
-        let Some(new_sel) = self.visible_indices.get(new_pos).copied() else {
+        let new_pos =
+            gamepad_grid_nav_target_pos(vis_pos, vi_len, cols, visible_rows, details_mode, dir);
+        let Some(new_sel) = display_order.get(new_pos).copied() else {
             return;
         };
         if self.selected != Some(new_sel) {
@@ -830,6 +829,37 @@ impl App {
     }
 }
 
+fn gamepad_grid_nav_target_pos(
+    vis_pos: usize,
+    vi_len: usize,
+    cols: usize,
+    visible_rows: usize,
+    details_mode: bool,
+    dir: PadDir,
+) -> usize {
+    if vi_len == 0 {
+        return 0;
+    }
+    let last_pos = vi_len - 1;
+    if details_mode {
+        let page_items = visible_rows.max(1);
+        match dir {
+            PadDir::Right => (vis_pos + page_items).min(last_pos),
+            PadDir::Left => vis_pos.saturating_sub(page_items),
+            PadDir::Down => (vis_pos + 1).min(last_pos),
+            PadDir::Up => vis_pos.saturating_sub(1),
+        }
+    } else {
+        let cols = cols.max(1);
+        match dir {
+            PadDir::Right => (vis_pos + 1).min(last_pos),
+            PadDir::Left => vis_pos.saturating_sub(1),
+            PadDir::Down => (vis_pos + cols).min(last_pos),
+            PadDir::Up => vis_pos.saturating_sub(cols),
+        }
+    }
+}
+
 const REPEAT_BUTTONS: [PadButton; 6] = [
     PadButton::DPadUp,
     PadButton::DPadDown,
@@ -902,9 +932,45 @@ fn continuous_reading_stick_axis(
 
 #[cfg(test)]
 mod tests {
-    use super::continuous_reading_stick_axis;
+    use super::{PadDir, continuous_reading_stick_axis, gamepad_grid_nav_target_pos};
     use crate::settings::{ReadingDirection, ReadingFlow};
     use eframe::egui;
+
+    #[test]
+    fn details_grid_gamepad_up_down_move_one_row() {
+        assert_eq!(
+            gamepad_grid_nav_target_pos(10, 30, 5, 12, true, PadDir::Down),
+            11
+        );
+        assert_eq!(
+            gamepad_grid_nav_target_pos(10, 30, 5, 12, true, PadDir::Up),
+            9
+        );
+    }
+
+    #[test]
+    fn details_grid_gamepad_left_right_move_by_visible_rows() {
+        assert_eq!(
+            gamepad_grid_nav_target_pos(10, 30, 5, 8, true, PadDir::Right),
+            18
+        );
+        assert_eq!(
+            gamepad_grid_nav_target_pos(10, 30, 5, 8, true, PadDir::Left),
+            2
+        );
+    }
+
+    #[test]
+    fn thumbnail_grid_gamepad_preserves_grid_geometry() {
+        assert_eq!(
+            gamepad_grid_nav_target_pos(5, 30, 5, 8, false, PadDir::Right),
+            6
+        );
+        assert_eq!(
+            gamepad_grid_nav_target_pos(5, 30, 5, 8, false, PadDir::Down),
+            10
+        );
+    }
 
     #[test]
     fn vertical_reading_stick_down_scrolls_forward() {

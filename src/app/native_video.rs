@@ -4686,11 +4686,9 @@ impl App {
             // Home: 先頭アイテムへ。既に先頭なら境界トーストを出す
             // (Phase 1: 画像と挙動を揃える、Codex 第 1 ラウンド P2 反映)。
             0x24 if !key.shift && !key.ctrl && !key.repeat => {
-                let target = crate::ui_helpers::boundary_navigable_idx(
-                    &self.items,
-                    &self.visible_indices,
-                    false,
-                );
+                let display_order = self.current_grid_order().to_vec();
+                let target =
+                    crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, false);
                 match target {
                     Some(idx) if idx != fs_idx => {
                         self.open_native_video_fullscreen_from_navigation(ctx, idx);
@@ -4702,11 +4700,9 @@ impl App {
             }
             // End: 末尾アイテムへ。既に末尾なら境界トーストを出す。
             0x23 if !key.shift && !key.ctrl && !key.repeat => {
-                let target = crate::ui_helpers::boundary_navigable_idx(
-                    &self.items,
-                    &self.visible_indices,
-                    true,
-                );
+                let display_order = self.current_grid_order().to_vec();
+                let target =
+                    crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, true);
                 match target {
                     Some(idx) if idx != fs_idx => {
                         self.open_native_video_fullscreen_from_navigation(ctx, idx);
@@ -5212,9 +5208,10 @@ impl App {
             self.cancel_stale_video_tile_reopen(Some(fs_idx), "wheel-navigation");
         }
         let nav_delta = self.spread_nav_delta(base_delta);
+        let display_order = self.current_grid_order().to_vec();
         if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
             &self.items,
-            &self.visible_indices,
+            &display_order,
             fs_idx,
             nav_delta,
         ) {

@@ -16036,6 +16036,18 @@ impl App {
         }
     }
 
+    fn suppress_popup_wheel_before_grid(&self, ctx: &egui::Context) {
+        if !ctx.is_popup_open() {
+            return;
+        }
+        ctx.input_mut(|i| {
+            i.raw_scroll_delta = egui::Vec2::ZERO;
+            i.smooth_scroll_delta = egui::Vec2::ZERO;
+            i.events
+                .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+        });
+    }
+
     /// カーソルキー移動後、選択行がビューポートに収まるようオフセットを調整する
     pub(crate) fn apply_scroll_to_selected(&mut self, cols: usize, cell_h: f32) {
         let sel = match self.selected {
@@ -17511,10 +17523,10 @@ impl App {
                 if !facet_item_supports_tags(&item) {
                     return false;
                 }
-                let tags = self.cell_tag_list(idx);
-                let untagged_match = filter.include_untagged && tags.is_empty();
-                let selected_match =
-                    if filter.tags.is_empty() {
+                if self.cell_tags_loaded(idx) {
+                    let tags = self.cell_tag_list(idx);
+                    let untagged_match = filter.include_untagged && tags.is_empty();
+                    let selected_match = if filter.tags.is_empty() {
                         false
                     } else {
                         match filter.tag_mode {
@@ -17526,8 +17538,9 @@ impl App {
                             }),
                         }
                     };
-                if !untagged_match && !selected_match {
-                    return false;
+                    if !untagged_match && !selected_match {
+                        return false;
+                    }
                 }
             }
         }
@@ -17590,10 +17603,12 @@ impl App {
                     FacetEditFlag::Annotation => self.comic_pages.contains(&idx),
                     FacetEditFlag::Rotation => !self.get_rotation(idx).is_none(),
                     FacetEditFlag::Tagged => {
-                        facet_item_supports_tags(&item) && !self.cell_tag_list(idx).is_empty()
+                        facet_item_supports_tags(&item)
+                            && (!self.cell_tags_loaded(idx) || !self.cell_tag_list(idx).is_empty())
                     }
                     FacetEditFlag::Untagged => {
-                        facet_item_supports_tags(&item) && self.cell_tag_list(idx).is_empty()
+                        facet_item_supports_tags(&item)
+                            && (!self.cell_tags_loaded(idx) || self.cell_tag_list(idx).is_empty())
                     }
                     FacetEditFlag::Rated => item.accepts_rating() && stars > 0,
                     FacetEditFlag::Unrated => item.accepts_rating() && stars == 0,
@@ -17709,6 +17724,7 @@ impl App {
     }
 
     pub(crate) fn rebuild_details_order(&mut self) {
+        self.cached_nav_indices = None;
         let mut key = self.settings.details_sort_key;
         let mut ascending = self.settings.details_sort_ascending;
         if !self.details_sort_key_visible(key) {
@@ -19041,6 +19057,15 @@ impl App {
             .unwrap_or(&[])
     }
 
+    fn cell_tags_loaded(&self, idx: usize) -> bool {
+        let p = match self.items.get(idx) {
+            Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => p,
+            _ => return true,
+        };
+        let key = crate::adjustment_db::normalize_path(p);
+        self.tags_cache.contains_key(&key)
+    }
+
     /// F 系・Ctrl+Num 系の一括適用で使う、グリッド上の対象 idx を決める共通規則。
     /// チェック済みがあればそれら、無ければカーソル位置 (selected)、それも無ければ空。
     /// 述語で「受け入れる GridItem 種別」を切り替える:
@@ -20369,13 +20394,13 @@ impl App {
         }
     }
 
-    /// `visible_indices` の中の画像アイテム (通常 + ZIP 内 + PDF) の item_idx 一覧を返す。
+    /// 現在の表示順の中の画像アイテム (通常 + ZIP 内 + PDF) の item_idx 一覧を返す。
     ///
-    /// フルスクリーンの前後移動 / スライドショーはフィルタ後の `visible_indices` を
-    /// 使うため、先読みも同じ display list に揃える。★フィルタや Ctrl+F で疎な一覧に
-    /// なっても、非表示の raw idx を先読みしない。
+    /// フルスクリーンの前後移動 / スライドショーはフィルタ後かつ詳細表示では
+    /// `details_order` 適用後の display list を使うため、先読みも同じ順序に揃える。
+    /// ★フィルタや Ctrl+F で疎な一覧になっても、非表示の raw idx を先読みしない。
     fn collect_image_indices(&self) -> Vec<usize> {
-        Self::collect_image_indices_from(&self.items, &self.visible_indices)
+        Self::collect_image_indices_from(&self.items, self.current_grid_order())
     }
 
     fn collect_image_indices_from(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
@@ -27455,26 +27480,26 @@ impl App {
         }
     }
 
-    pub(crate) fn find_next_video_in_visible_indices_from(
+    pub(crate) fn find_next_video_in_display_order_from(
         items: &[GridItem],
-        visible_indices: &[usize],
+        display_order: &[usize],
         current_idx: usize,
         wrap: bool,
     ) -> Option<usize> {
         let is_video = |idx: usize| matches!(items.get(idx), Some(GridItem::Video(_)));
-        let Some(pos) = visible_indices.iter().position(|&idx| idx == current_idx) else {
+        let Some(pos) = display_order.iter().position(|&idx| idx == current_idx) else {
             return wrap
-                .then(|| visible_indices.iter().copied().find(|&idx| is_video(idx)))
+                .then(|| display_order.iter().copied().find(|&idx| is_video(idx)))
                 .flatten();
         };
 
-        for &idx in visible_indices.iter().skip(pos + 1) {
+        for &idx in display_order.iter().skip(pos + 1) {
             if is_video(idx) {
                 return Some(idx);
             }
         }
         if wrap {
-            for &idx in visible_indices.iter().take(pos + 1) {
+            for &idx in display_order.iter().take(pos + 1) {
                 if is_video(idx) {
                     return Some(idx);
                 }
@@ -27483,10 +27508,10 @@ impl App {
         None
     }
 
-    fn find_next_video_in_visible_indices(&self, current_idx: usize, wrap: bool) -> Option<usize> {
-        Self::find_next_video_in_visible_indices_from(
+    fn find_next_video_in_display_order(&self, current_idx: usize, wrap: bool) -> Option<usize> {
+        Self::find_next_video_in_display_order_from(
             &self.items,
-            &self.visible_indices,
+            self.current_grid_order(),
             current_idx,
             wrap,
         )
@@ -27554,7 +27579,7 @@ impl App {
         }
         self.video_continuous_last_eof = Some(eof_key);
 
-        let Some(next_idx) = self.find_next_video_in_visible_indices(fs_idx, mode.wraps()) else {
+        let Some(next_idx) = self.find_next_video_in_display_order(fs_idx, mode.wraps()) else {
             #[cfg(windows)]
             self.show_native_video_overlay_toast(
                 "フォルダ末尾です (Ctrl+↓ で次フォルダ)".to_string(),
@@ -29860,6 +29885,7 @@ impl eframe::App for App {
         // ── スマートフィルタバー (サムネ/詳細共通) ───────────────────
         self.render_facet_filter_bar(ctx);
         self.render_details_lazy_status_bar(ctx);
+        self.suppress_popup_wheel_before_grid(ctx);
 
         // ── サムネイルグリッド ────────────────────────────────────────
         let t_pre_grid = frame_t0.elapsed();

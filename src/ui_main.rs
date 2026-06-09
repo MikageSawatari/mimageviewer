@@ -238,6 +238,11 @@ fn facet_menu_label(base: &str, active: usize) -> String {
     }
 }
 
+fn prepare_facet_menu_popup(ui: &mut egui::Ui) {
+    ui.set_min_width(180.0);
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+}
+
 fn facet_chip(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.label(egui::RichText::new(text.into()).small().strong());
 }
@@ -1837,6 +1842,7 @@ impl App {
         let mut changed = false;
         let label = facet_menu_label("種類", self.settings.facet_filter.kinds.len());
         ui.menu_button(label, |ui| {
+            prepare_facet_menu_popup(ui);
             let mut counts = self.facet_kind_counts();
             for kind in &self.settings.facet_filter.kinds {
                 counts.entry(*kind).or_insert(0);
@@ -1872,6 +1878,7 @@ impl App {
         let mut changed = false;
         let label = facet_menu_label("拡張子", self.settings.facet_filter.exts.len());
         ui.menu_button(label, |ui| {
+            prepare_facet_menu_popup(ui);
             let mut counts = self.facet_ext_counts();
             for ext in &self.settings.facet_filter.exts {
                 counts.entry(ext.clone()).or_insert(0);
@@ -1907,6 +1914,7 @@ impl App {
         let active = if self.rating_filter_active() { 1 } else { 0 };
         let mut changed = false;
         ui.menu_button(facet_menu_label("★", active), |ui| {
+            prepare_facet_menu_popup(ui);
             if ui.small_button("すべて表示").clicked() {
                 self.settings.rating_filter = crate::settings::default_rating_filter();
                 changed = true;
@@ -1933,6 +1941,7 @@ impl App {
             + usize::from(self.settings.facet_filter.include_untagged);
         let mut changed = false;
         ui.menu_button(facet_menu_label("タグ", active), |ui| {
+            prepare_facet_menu_popup(ui);
             let (mut counts, untagged_count) = self.facet_tag_counts();
             for tag in &self.settings.facet_filter.tags {
                 counts.entry(tag.clone()).or_insert(0);
@@ -2000,6 +2009,7 @@ impl App {
         let active = usize::from(self.settings.facet_filter.date_preset.is_some());
         let mut changed = false;
         ui.menu_button(facet_menu_label("日付", active), |ui| {
+            prepare_facet_menu_popup(ui);
             let current = self.settings.facet_filter.date_preset;
             if ui.selectable_label(current.is_none(), "すべて").clicked() {
                 self.settings.facet_filter.date_preset = None;
@@ -2025,6 +2035,7 @@ impl App {
         let active = usize::from(self.settings.facet_filter.size_preset.is_some());
         let mut changed = false;
         ui.menu_button(facet_menu_label("サイズ", active), |ui| {
+            prepare_facet_menu_popup(ui);
             let current = self.settings.facet_filter.size_preset;
             if ui.selectable_label(current.is_none(), "すべて").clicked() {
                 self.settings.facet_filter.size_preset = None;
@@ -2050,6 +2061,7 @@ impl App {
         let mut changed = false;
         let label = facet_menu_label("状態", self.settings.facet_filter.edits.len());
         ui.menu_button(label, |ui| {
+            prepare_facet_menu_popup(ui);
             if self.settings.facet_filter.edits.is_empty() {
                 ui.label("すべて");
             } else if ui.small_button("状態フィルタを解除").clicked() {

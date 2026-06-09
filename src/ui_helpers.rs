@@ -884,16 +884,16 @@ pub fn draw_format_rows(ui: &mut egui::Ui, rows: &[(&str, u64, f64)]) {
 /// items の中で current から delta 分（±1）移動した「表示可能」アイテム
 /// (画像 + 動画 + ZIP 画像 + ZIP セパレータ) の item index を返す。
 /// 境界では None を返す（ラップアラウンドなし）。
-/// `visible_indices` (フィルタ適用済み) の中からナビゲーション可能な
+/// `display_order` (フィルタ適用済み・詳細ソート適用済み) の中からナビゲーション可能な
 /// 前後のアイテムインデックスを返す。
 pub fn adjacent_navigable_idx(
     items: &[GridItem],
-    visible_indices: &[usize],
+    display_order: &[usize],
     current: usize,
     delta: i32,
 ) -> Option<usize> {
-    // visible_indices の中でナビゲーション可能なもの (画像・動画・セパレータ)
-    let nav_indices: Vec<usize> = visible_indices
+    // display_order の中でナビゲーション可能なもの (画像・動画・セパレータ)
+    let nav_indices: Vec<usize> = display_order
         .iter()
         .copied()
         .filter(|&i| {
@@ -910,14 +910,7 @@ pub fn adjacent_navigable_idx(
     if nav_indices.is_empty() {
         return None;
     }
-    // current がフィルタで外されている (例: フルスクリーンで F1-F6 により
-    // レーティング変更後) 場合は、items 順で方向側の最寄りを返す。
-    // nav_indices は visible_indices (昇順) の部分列なのでこちらも昇順。
-    // `partition_point` で insert 位置を求めれば prev/next を O(log n) で取れる。
-    let insert_pos = nav_indices.partition_point(|&i| i < current);
-    let current_in_list = nav_indices.get(insert_pos).is_some_and(|&i| i == current);
-    if current_in_list {
-        let pos = insert_pos;
+    if let Some(pos) = nav_indices.iter().position(|&i| i == current) {
         let new_pos = (pos as i32 + delta).clamp(0, nav_indices.len() as i32 - 1) as usize;
         if new_pos == pos {
             None
@@ -925,9 +918,9 @@ pub fn adjacent_navigable_idx(
             Some(nav_indices[new_pos])
         }
     } else if delta > 0 {
-        nav_indices.get(insert_pos).copied()
+        nav_indices.iter().copied().filter(|&i| i > current).min()
     } else if delta < 0 {
-        insert_pos.checked_sub(1).map(|p| nav_indices[p])
+        nav_indices.iter().copied().filter(|&i| i < current).max()
     } else {
         None
     }
@@ -939,11 +932,11 @@ pub fn adjacent_navigable_idx(
 /// 境界では None を返す (ラップアラウンドなし)。
 pub fn adjacent_slideshow_idx(
     items: &[GridItem],
-    visible_indices: &[usize],
+    display_order: &[usize],
     current: usize,
     delta: i32,
 ) -> Option<usize> {
-    let nav_indices: Vec<usize> = visible_indices
+    let nav_indices: Vec<usize> = display_order
         .iter()
         .copied()
         .filter(|&i| {
@@ -959,10 +952,7 @@ pub fn adjacent_slideshow_idx(
     if nav_indices.is_empty() {
         return None;
     }
-    let insert_pos = nav_indices.partition_point(|&i| i < current);
-    let current_in_list = nav_indices.get(insert_pos).is_some_and(|&i| i == current);
-    if current_in_list {
-        let pos = insert_pos;
+    if let Some(pos) = nav_indices.iter().position(|&i| i == current) {
         let new_pos = (pos as i32 + delta).clamp(0, nav_indices.len() as i32 - 1) as usize;
         if new_pos == pos {
             None
@@ -970,20 +960,20 @@ pub fn adjacent_slideshow_idx(
             Some(nav_indices[new_pos])
         }
     } else if delta > 0 {
-        nav_indices.get(insert_pos).copied()
+        nav_indices.iter().copied().filter(|&i| i > current).min()
     } else if delta < 0 {
-        insert_pos.checked_sub(1).map(|p| nav_indices[p])
+        nav_indices.iter().copied().filter(|&i| i < current).max()
     } else {
         None
     }
 }
 
-/// スライドショーの折り返し / 先頭着地用に、`visible_indices` の中で先頭の
+/// スライドショーの折り返し / 先頭着地用に、`display_order` の中で先頭の
 /// 静止画系アイテム (Image / ZipImage / PdfPage、Video と ZipSeparator は除外) を返す。
 /// LoopFolder の折り返し先は章タイトル (ZipSeparator) ではなく実画像にするため、
 /// `adjacent_slideshow_idx` のフィルタとは別に separator も除外する。
-pub fn first_slideshow_still_idx(items: &[GridItem], visible_indices: &[usize]) -> Option<usize> {
-    visible_indices.iter().copied().find(|&i| {
+pub fn first_slideshow_still_idx(items: &[GridItem], display_order: &[usize]) -> Option<usize> {
+    display_order.iter().copied().find(|&i| {
         matches!(
             items.get(i),
             Some(GridItem::Image(_))
@@ -993,15 +983,15 @@ pub fn first_slideshow_still_idx(items: &[GridItem], visible_indices: &[usize]) 
     })
 }
 
-/// `visible_indices` の中の「ナビゲーション可能」なアイテム列から、
+/// `display_order` の中の「ナビゲーション可能」なアイテム列から、
 /// 末尾 (`last=true`) または先頭 (`last=false`) の item index を返す。
 /// `adjacent_navigable_idx` と同じフィルタを適用する。
 pub fn boundary_navigable_idx(
     items: &[GridItem],
-    visible_indices: &[usize],
+    display_order: &[usize],
     last: bool,
 ) -> Option<usize> {
-    let mut iter = visible_indices.iter().copied().filter(|&i| {
+    let mut iter = display_order.iter().copied().filter(|&i| {
         matches!(
             items.get(i),
             Some(GridItem::Image(_))
@@ -1446,6 +1436,16 @@ mod tests {
         assert_eq!(adjacent_navigable_idx(&items, &vi, 0, -1), None);
     }
 
+    #[test]
+    fn adjacent_navigable_idx_respects_display_order_when_reordered() {
+        let items = img_items(5);
+        let order = vec![4, 2, 0, 3, 1];
+        assert_eq!(adjacent_navigable_idx(&items, &order, 0, 1), Some(3));
+        assert_eq!(adjacent_navigable_idx(&items, &order, 0, -1), Some(2));
+        assert_eq!(adjacent_navigable_idx(&items, &order, 4, -1), None);
+        assert_eq!(adjacent_navigable_idx(&items, &order, 1, 1), None);
+    }
+
     /// current が visible_indices から外れている (フィルタで除外された) ときは
     /// items 順で方向側の最寄り visible idx を返す。
     #[test]
@@ -1491,6 +1491,19 @@ mod tests {
         assert_eq!(adjacent_slideshow_idx(&items, &vi, 2, -1), Some(0));
         // 通常の隣接探索は video(1) に止まれる (対比)。
         assert_eq!(adjacent_navigable_idx(&items, &vi, 0, 1), Some(1));
+    }
+
+    #[test]
+    fn adjacent_slideshow_idx_respects_display_order_when_reordered() {
+        let items = vec![
+            GridItem::Image(std::path::PathBuf::from("/a/0.jpg")),
+            GridItem::Video(std::path::PathBuf::from("/a/1.mp4")),
+            GridItem::Image(std::path::PathBuf::from("/a/2.jpg")),
+            GridItem::Image(std::path::PathBuf::from("/a/3.jpg")),
+        ];
+        let order = vec![3, 1, 0, 2];
+        assert_eq!(adjacent_slideshow_idx(&items, &order, 3, 1), Some(0));
+        assert_eq!(adjacent_slideshow_idx(&items, &order, 0, -1), Some(3));
     }
 
     /// スライドショー送りは ZipSeparator は残す (章タイトルを同間隔で表示)。

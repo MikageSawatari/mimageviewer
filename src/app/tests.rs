@@ -300,7 +300,7 @@ fn interleaved_prefetch_targets_boundary_cases() {
 }
 
 #[test]
-fn next_video_search_uses_visible_indices_and_skips_non_video_items() {
+fn next_video_search_uses_display_order_and_skips_non_video_items() {
     use crate::grid_item::GridItem;
 
     let items = vec![
@@ -324,29 +324,34 @@ fn next_video_search_uses_visible_indices_and_skips_non_video_items() {
     let visible_indices = vec![0, 1, 2, 3, 4, 5, 6];
 
     assert_eq!(
-        App::find_next_video_in_visible_indices_from(&items, &visible_indices, 0, false),
+        App::find_next_video_in_display_order_from(&items, &visible_indices, 0, false),
         Some(4),
         "画像 / ZIP 内画像 / PDF ページ / フォルダ / セパレータを飛ばして次の動画を選ぶ"
     );
     assert_eq!(
-        App::find_next_video_in_visible_indices_from(&items, &visible_indices, 4, false),
+        App::find_next_video_in_display_order_from(&items, &visible_indices, 4, false),
         None,
         "末尾側に動画が無ければ Continuous は停止する"
     );
     assert_eq!(
-        App::find_next_video_in_visible_indices_from(&items, &visible_indices, 4, true),
+        App::find_next_video_in_display_order_from(&items, &visible_indices, 4, true),
         Some(0),
-        "ContinuousLoop は visible_indices の先頭側へ wrap する"
+        "ContinuousLoop は display_order の先頭側へ wrap する"
+    );
+    assert_eq!(
+        App::find_next_video_in_display_order_from(&items, &[4, 3, 2, 0], 4, true),
+        Some(0),
+        "詳細ソート等で並び替わった表示順を使って wrap する"
     );
 
     let filtered = vec![4];
     assert_eq!(
-        App::find_next_video_in_visible_indices_from(&items, &filtered, 4, true),
+        App::find_next_video_in_display_order_from(&items, &filtered, 4, true),
         Some(4),
         "表示リストに動画 1 本だけなら同じ動画を繰り返す"
     );
     assert_eq!(
-        App::find_next_video_in_visible_indices_from(&items, &[1, 2, 3], 4, true),
+        App::find_next_video_in_display_order_from(&items, &[1, 2, 3], 4, true),
         None,
         "現在動画が表示リスト外で、wrap しても動画候補が無ければ None"
     );

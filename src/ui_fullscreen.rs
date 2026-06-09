@@ -1855,9 +1855,10 @@ impl App {
     }
 
     fn fullscreen_seek_info(&self, fs_idx: usize) -> Option<FsSeekInfo> {
-        let image_indices = build_image_reading_indices(&self.items, &self.visible_indices);
+        let display_order = self.current_grid_order();
+        let image_indices = build_image_reading_indices(&self.items, display_order);
         let current_pos = image_indices.iter().position(|&idx| idx == fs_idx)?;
-        let nav_indices = build_nav_indices(&self.items, &self.visible_indices);
+        let nav_indices = build_nav_indices(&self.items, display_order);
         let (video_count, other_count) =
             count_seek_overlay_non_image_items(&self.items, &nav_indices);
         let media_count = image_indices.len() + video_count + other_count;
@@ -4039,7 +4040,7 @@ impl App {
         if let Some(ref cached) = self.cached_nav_indices {
             return cached.clone();
         }
-        let nav = build_nav_indices(&self.items, &self.visible_indices);
+        let nav = build_nav_indices(&self.items, self.current_grid_order());
         self.cached_nav_indices = Some(nav.clone());
         nav
     }
@@ -5459,8 +5460,9 @@ impl App {
         }
 
         if key_home {
+            let display_order = self.current_grid_order().to_vec();
             if let Some(first) =
-                crate::ui_helpers::boundary_navigable_idx(&self.items, &self.visible_indices, false)
+                crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, false)
             {
                 if first != fs_idx {
                     // Home もフォルダ内移動なのでスライドショーは止めない。
@@ -5474,8 +5476,9 @@ impl App {
             }
         }
         if key_end {
+            let display_order = self.current_grid_order().to_vec();
             if let Some(last) =
-                crate::ui_helpers::boundary_navigable_idx(&self.items, &self.visible_indices, true)
+                crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, true)
             {
                 if last != fs_idx {
                     // End もフォルダ内移動なのでスライドショーは止めない。
@@ -6065,12 +6068,10 @@ impl App {
     /// ループ / 次フォルダ / 停止する。
     fn advance_slideshow(&mut self, ctx: &egui::Context, cur: usize) {
         let slide_delta = self.spread_nav_delta(1);
-        if let Some(idx) = crate::ui_helpers::adjacent_slideshow_idx(
-            &self.items,
-            &self.visible_indices,
-            cur,
-            slide_delta,
-        ) {
+        let display_order = self.current_grid_order().to_vec();
+        if let Some(idx) =
+            crate::ui_helpers::adjacent_slideshow_idx(&self.items, &display_order, cur, slide_delta)
+        {
             // フォルダ内の次の静止画系アイテムへ前進。
             self.slideshow_anchor_idx = None;
             self.open_fullscreen_from_slideshow_navigation(ctx, idx);
@@ -6099,8 +6100,8 @@ impl App {
     /// フォルダ内の先頭の静止画系アイテム (Video / ZipSeparator 除外) へ折り返す。
     /// 静止画系が一つも無ければスライドショーを停止する。
     fn loop_slideshow_to_first(&mut self, ctx: &egui::Context) {
-        if let Some(idx) =
-            crate::ui_helpers::first_slideshow_still_idx(&self.items, &self.visible_indices)
+        let display_order = self.current_grid_order().to_vec();
+        if let Some(idx) = crate::ui_helpers::first_slideshow_still_idx(&self.items, &display_order)
         {
             self.slideshow_anchor_idx = None;
             self.open_fullscreen_from_slideshow_navigation(ctx, idx);
@@ -6476,9 +6477,10 @@ impl App {
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
             } else if nav_delta != 0 {
+                let display_order = self.current_grid_order().to_vec();
                 if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
                     &self.items,
-                    &self.visible_indices,
+                    &display_order,
                     fs_idx,
                     nav_delta,
                 ) {
@@ -6495,7 +6497,7 @@ impl App {
                     crate::logger::log(format!(
                         "[NAV] adjacent_navigable_idx returned None: fs_idx={fs_idx}, delta={nav_delta}, items={}, visible={}",
                         self.items.len(),
-                        self.visible_indices.len()
+                        display_order.len()
                     ));
                 }
             }
@@ -7196,7 +7198,8 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<(Vec<ContinuousReadingUnitSpec>, usize)> {
-        let image_indices = build_image_reading_indices(&self.items, &self.visible_indices);
+        let display_order = self.current_grid_order().to_vec();
+        let image_indices = build_image_reading_indices(&self.items, &display_order);
         let mut image_units = Vec::new();
 
         if self.spread_mode.is_spread() {
@@ -7255,7 +7258,7 @@ impl App {
 
         let mut inserted_image_units = std::collections::HashSet::new();
         let mut units = Vec::new();
-        for &visible_idx in &self.visible_indices {
+        for &visible_idx in &display_order {
             match self.items.get(visible_idx) {
                 Some(GridItem::ZipSeparator { dir_display }) => {
                     units.push(ContinuousReadingUnitSpec::separator(
