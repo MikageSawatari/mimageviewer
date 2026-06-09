@@ -17,7 +17,7 @@ members = [
 # 旧バージョンの runtime dir に新本体を上書きしてしまう。susie-worker / vst3-host-tester
 # / png2mag は独立した内部ヘルパーなので workspace inherit せず個別管理。
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 # let-chain (Rust 1.88 で安定化) を本体・サブクレート共通で使っているため明示。
 rust-version = "1.88"
