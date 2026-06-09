@@ -59,6 +59,9 @@ impl ZipTree {
     /// 防御的処理:
     /// - basename が空のエントリ (例: `"dir/"`、通常は列挙されない) はスキップ。
     /// - 連続スラッシュ (`"a//b.jpg"`) は空セグメントを除去して `a > b.jpg` 扱い。
+    ///   これは意図的なナビ正規化で、`"a/b.jpg"` と `"a//b.jpg"` は同じ階層ノードに
+    ///   alias される (= 同じ navigation prefix を共有)。ただし葉の `entry_name` は
+    ///   元の文字列のまま (DB キー identity は崩さない) (Codex P3)。
     pub fn build(zip_path: PathBuf, entries: Vec<ZipImageEntry>) -> Self {
         let mut root = ZipTreeNode::default();
         for entry in entries {
@@ -97,6 +100,14 @@ impl ZipTree {
     /// アーカイブ (`ZIP > {ch01.zip, ch02.zip}`) は分岐で止まるのでツリーのまま残る。
     ///
     /// `start` のノードが存在しない場合は `start` をそのまま返す (判定は呼び出し側)。
+    ///
+    /// ⚠ **Phase 3 ナビ契約 (Codex P2)**: これは **表示 (materialize) 時のみ**適用する
+    /// 純粋な view 変換であり、**戻り値を navigation prefix として保存し直してはならない**。
+    /// `ZipNavState.prefix` は常に「ユーザーが明示的に降りた論理 prefix」を保持し、
+    /// collapse は描画直前に都度かけること。保存し直すと Backspace が
+    /// `["vol01"] -> pop -> [] -> collapse -> ["vol01"]` でループして抜けられなくなる。
+    /// 論理 prefix が空 (= ルート) のとき collapse 後の表示から Backspace すると ZIP を
+    /// 抜けて実フォルダ親へ戻る (= ラッパーは「入った」扱いにしない) のが正しい挙動。
     pub fn collapse_redundant(&self, start: &[String]) -> Vec<String> {
         let mut prefix: Vec<String> = start.to_vec();
         loop {
@@ -137,10 +148,13 @@ impl ZipTreeNode {
 
     /// この部分木の代表画像 (= ZipDir セルのサムネ候補) を返す。
     ///
-    /// 深さ優先で「この階層の直下画像 → 子ディレクトリ (BTreeMap 順)」の順に探し、
-    /// 最初に見つかった画像を返す。これは **列挙順 (ZIP 内出現順) の先頭**であり、
-    /// 表示ソート順の先頭とは限らない (サムネの代表選定は cosmetic なので Phase 1 では
-    /// 決定的な列挙順で十分。必要なら materialize 側で sort 準拠に精緻化する)。
+    /// 深さ優先で「この階層の直下画像 → 子ディレクトリ (BTreeMap キー順)」の順に探し、
+    /// 最初に見つかった画像を返す。これは決定的だが **表示ソート順の先頭ではない**
+    /// (直下画像は列挙順の先頭、子は BTreeMap キー順)。
+    ///
+    /// 代表サムネ選定は cosmetic なので Phase 1 ではこの決定的順序で十分。**これは
+    /// あくまで sort 非対応の fallback** であり、Phase 2 の ZipDir 代表サムネ選定は
+    /// 表示 `SortOrder` に準拠した先頭画像を別途選ぶべき (Codex P3)。
     pub fn first_image_in_subtree(&self) -> Option<&ZipImageEntry> {
         if let Some(img) = self.images.first() {
             return Some(img);

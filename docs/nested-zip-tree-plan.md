@@ -152,6 +152,14 @@ navigation でこの関数を呼ぶだけ (再列挙なし = in-memory)。見開
 - 状態リセット境界: 同一 ZIP 内のナビでは `ZipNavState.tree` を保持し再列挙しない。
   別 ZIP/フォルダへ出るときのみ `clear_nested_cache` + tree 破棄。
 
+### ⚠ 論理 prefix と表示 prefix を分ける (Phase 1 Codex P2 で確定)
+`ZipNavState.prefix` は **常に「ユーザーが明示的に降りた論理 prefix」** を保持する。
+`collapse_redundant` (D1 の冗長ラッパー自動降下) は **materialize 直前の view 変換**
+としてのみ適用し、**その結果を `prefix` に保存し直さない**。保存し直すと
+`["vol01"] → pop → [] → collapse → ["vol01"]` で Backspace がループして ZIP を
+抜けられなくなる。論理 prefix が空 (ルート) のとき、collapse 後の表示から Backspace
+すると ZIP を抜けて実フォルダ親へ戻る (= 自動降下したラッパーは「入った」扱いにしない)。
+
 ---
 
 ## 7. 見開き (改修不要で直る理由)
@@ -179,6 +187,16 @@ navigation でこの関数を呼ぶだけ (再列挙なし = in-memory)。見開
 - `ZipImage` のサムネキー = `entry_name` 直 → **不変** (既存キャッシュ命中)。
 - `ZipDir` の代表サムネ = 新キー `zipdir:{dir_prefix}` (zip の catalog 配下、**additive**)。
   選定は in-memory tree の部分木先頭画像 (sort 準拠)。worker が bytes 遅延読み。
+  - Phase 1 の `ZipTreeNode::first_image_in_subtree` は **sort 非対応の fallback**
+    (直下画像=列挙順先頭、子=BTreeMap キー順)。Phase 2 の代表選定は表示 `SortOrder`
+    準拠の先頭画像を別途選ぶこと (Phase 1 Codex P3)。
+- **`is_archive` バッジは suffix 推定 (accepted ambiguity)**: 葉の `entry_name` 文字列
+  だけからは「実在するネスト .zip アーカイブ」と「`.zip` という名前のただのフォルダ」
+  を区別できない (`enumerate_recursive` が両者を同じ `"foo.zip/img.jpg"` 文字列に
+  畳むため。フラット実装からの継承)。Phase 2 の `ZipDir.is_archive` はセグメント
+  suffix (`.zip`/`.cbz`) で判定し、同一 stem 衝突は許容する。バッジは表示のみで
+  バイト読み出しは既存 `read_entry_bytes` の `.zip/` 境界判定に委ねる。Phase 2 で
+  suffix 判定のテストを 1 本足す (Phase 1 Codex P3)。
 
 ---
 
