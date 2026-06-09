@@ -9378,6 +9378,10 @@ impl App {
         self.scroll_to_selected = false;
         self.scroll_hint
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        // レーティングフィルタ有効時、rebuild_visible_indices が item ごとに get_rating で
+        // SQLite を引くと UI スレッドが詰まる。start_loading_items と同じく事前に
+        // バッチ prewarm しておく (Codex P3 perf parity)。
+        self.prewarm_rating_cache();
         // ★ visible_indices を再構築。これがないと旧レベルの stale index が
         // update_keep_range_and_requests で thumbnails[i] を範囲外参照して panic する (Codex P1)。
         self.rebuild_visible_indices();
