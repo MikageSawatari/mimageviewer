@@ -25,6 +25,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::grid_item::GridItem;
 use crate::settings::SortOrder;
@@ -210,6 +211,103 @@ impl ZipTree {
 
         (items, metas)
     }
+
+    /// ツリー全階層の catalog cache キーを集める (Phase 3 の `existing_keys` 用)。
+    ///
+    /// = 全 leaf 画像の `entry_name` + 全ディレクトリの `zipdir:{prefix}`。
+    /// フラット実装は finalize が全 entry_name を `existing_keys` に入れて `delete_missing`
+    /// のプルーン基準にしていた。ツリーでは finalize がルート階層しか materialize しない
+    /// ため、ここで**全階層**のキーを集めて渡さないと、深い階層のサムネが再オープン時に
+    /// stale 削除されて再生成ループになる (Phase 2 Codex P2)。
+    pub fn all_cache_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut prefix: Vec<String> = Vec::new();
+        collect_cache_keys(&self.root, &mut prefix, &mut keys);
+        keys
+    }
+}
+
+/// `all_cache_keys` の再帰本体。`prefix` は現在辿っている dir セグメント列。
+fn collect_cache_keys(node: &ZipTreeNode, prefix: &mut Vec<String>, out: &mut Vec<String>) {
+    for img in &node.images {
+        out.push(img.entry_name.clone());
+    }
+    for (seg, child) in &node.dirs {
+        prefix.push(seg.clone());
+        // materialize_level の dir_prefix と同形式 ("a/b/"、末尾 '/') にする。
+        let dir_prefix = format!("{}/", prefix.join("/"));
+        out.push(crate::grid_item::zipdir_cache_key(&dir_prefix));
+        collect_cache_keys(child, prefix, out);
+        prefix.pop();
+    }
+}
+
+/// 開いている外側 ZIP のツリーナビ状態 (Phase 3)。
+///
+/// スタックの各エントリは「**実際に描画した実効 prefix**」(= `collapse_redundant` 済み)。
+/// `stack[0]` はルートを collapse した初期表示で、スタックは常に非空。
+/// 「論理 prefix を 1 セグメントずつ pop して毎回 collapse し直す」方式の Backspace 罠
+/// (`[] -> 表示 ["vol01"] -> back [] -> 再 collapse ["vol01"]` の無限ループ) を、
+/// 描画した実効 prefix をそのまま積む/pop することで構造的に回避する (Codex P2)。
+pub struct ZipNavState {
+    /// 開いている外側 ZIP のツリー (列挙完了時に構築、ナビ中は保持)。
+    pub tree: Arc<ZipTree>,
+    /// 実効 prefix のスタック。`stack[0]` = `collapse_redundant(&[])`。常に非空。
+    stack: Vec<Vec<String>>,
+}
+
+impl ZipNavState {
+    /// ZIP を開いたときの初期状態。ルートを collapse した実効 prefix を底に積む。
+    pub fn new(tree: Arc<ZipTree>) -> Self {
+        let root_effective = tree.collapse_redundant(&[]);
+        Self {
+            tree,
+            stack: vec![root_effective],
+        }
+    }
+
+    /// 現在描画すべき実効 prefix。
+    pub fn current(&self) -> &[String] {
+        self.stack.last().expect("ZipNavState stack is never empty")
+    }
+
+    /// 現在が ZIP のルート表示か (= スタック底)。Backspace で ZIP を抜けるか判定に使う。
+    pub fn at_root(&self) -> bool {
+        self.stack.len() == 1
+    }
+
+    /// `ZipDir` セルへ降りる。`dir_prefix` は `GridItem::ZipDir.dir_prefix`
+    /// ("a/b/" 形式、ルートからの絶対パス、末尾 '/')。子の実効 prefix を `collapse_redundant`
+    /// で算出してスタックに積む。
+    pub fn enter(&mut self, dir_prefix: &str) {
+        let segs = split_prefix(dir_prefix);
+        let effective = self.tree.collapse_redundant(&segs);
+        self.stack.push(effective);
+    }
+
+    /// 1 段戻る。スタックを pop する。戻れたら `true`、既にルート (底) なら `false`
+    /// (= 呼び出し側が ZIP を抜けて実フォルダ親へ遷移する)。
+    pub fn back(&mut self) -> bool {
+        if self.stack.len() <= 1 {
+            return false;
+        }
+        self.stack.pop();
+        true
+    }
+
+    /// 現在階層を materialize した `(items, image_metas)` を返す薄いラッパー。
+    pub fn materialize_current(&self, sort: SortOrder) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+        self.tree.materialize_level(self.current(), sort)
+    }
+}
+
+/// "a/b/" 形式の dir_prefix をセグメント列に分解 (末尾 '/'・空セグメント除去)。
+fn split_prefix(dir_prefix: &str) -> Vec<String> {
+    dir_prefix
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// セグメント名 (entry_name の一区切り) が内側アーカイブ (.zip / .cbz) か。
@@ -631,5 +729,117 @@ mod tests {
         let (items, metas) = t.materialize_level(&[], SortOrder::FileName);
         assert_eq!(items.len(), 1);
         assert_eq!(metas[0], Some((99, 1234)));
+    }
+
+    // ── all_cache_keys ───────────────────────────────────────────────
+
+    #[test]
+    fn all_cache_keys_covers_every_level() {
+        let t = tree(&[
+            "cover.jpg",
+            "ch01.zip/p01.jpg",
+            "ch01.zip/p02.jpg",
+            "extras/sub/x.jpg",
+        ]);
+        let mut keys = t.all_cache_keys();
+        keys.sort();
+        let mut expected = vec![
+            // 全 leaf 画像の entry_name (そのまま)。
+            "cover.jpg".to_string(),
+            "ch01.zip/p01.jpg".to_string(),
+            "ch01.zip/p02.jpg".to_string(),
+            "extras/sub/x.jpg".to_string(),
+            // 全ディレクトリの zipdir: キー。
+            "zipdir:ch01.zip/".to_string(),
+            "zipdir:extras/".to_string(),
+            "zipdir:extras/sub/".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn all_cache_keys_zipdir_format_matches_materialize() {
+        // all_cache_keys の zipdir: キーが materialize_level の cache_key_override と一致する
+        // ことを保証する (= delete_missing が消さない)。
+        let t = tree(&["chapters/ch01.zip/p01.jpg"]);
+        let keys = t.all_cache_keys();
+        // materialize で chapters を開いたときの ZipDir cache key。
+        let (items, _) = t.materialize_level(&s(&["chapters"]), SortOrder::FileName);
+        let (dir_prefix, _, _) = as_zipdir(&items[0]);
+        let mat_key = crate::grid_item::zipdir_cache_key(dir_prefix);
+        assert!(keys.contains(&mat_key), "{mat_key} not in {keys:?}");
+    }
+
+    // ── ZipNavState (スタック方式ナビ) ───────────────────────────────
+
+    fn nav(names: &[&str]) -> ZipNavState {
+        ZipNavState::new(Arc::new(tree(names)))
+    }
+
+    #[test]
+    fn nav_flat_root_is_empty_prefix() {
+        // ルートに画像があれば collapse しない → current = [].
+        let n = nav(&["a.jpg", "b.jpg"]);
+        assert_eq!(n.current(), &[] as &[String]);
+        assert!(n.at_root());
+        // ルートで back は false (= ZIP を抜ける)。
+        let mut n = n;
+        assert!(!n.back());
+    }
+
+    #[test]
+    fn nav_single_wrapper_collapses_at_open() {
+        // ZIP > vol01 > [pages]: 開いた時点で vol01 まで自動降下。at_root のまま。
+        let n = nav(&["vol01/p01.jpg", "vol01/p02.jpg"]);
+        assert_eq!(n.current(), &s(&["vol01"])[..]);
+        assert!(n.at_root());
+    }
+
+    #[test]
+    fn nav_multi_book_enter_and_back_no_trap() {
+        // ZIP > vol01 > {ch01.zip, ch02.zip}: 単一ラッパー vol01 を skip して
+        // [ch01.zip, ch02.zip] を表示。
+        let mut n = nav(&["vol01/ch01.zip/p01.jpg", "vol01/ch02.zip/p01.jpg"]);
+        assert_eq!(n.current(), &s(&["vol01"])[..]);
+        assert!(n.at_root());
+
+        // ch01.zip へ降りる (dir_prefix は materialize 由来の絶対パス)。
+        n.enter("vol01/ch01.zip/");
+        assert_eq!(n.current(), &s(&["vol01", "ch01.zip"])[..]);
+        assert!(!n.at_root());
+
+        // back で [ch01,ch02] 表示へ戻る。
+        assert!(n.back());
+        assert_eq!(n.current(), &s(&["vol01"])[..]);
+        assert!(n.at_root());
+
+        // ルートで back → false (ZIP を抜ける)。罠 (同じ画面に戻り続ける) は起きない。
+        assert!(!n.back());
+    }
+
+    #[test]
+    fn nav_enter_collapses_nested_wrapper() {
+        // ch01.zip の中がさらに単一ラッパー (only/) なら enter 時に collapse する。
+        let mut n = nav(&["ch01.zip/only/p01.jpg", "ch02.zip/p01.jpg"]);
+        // root は分岐 (ch01.zip, ch02.zip) なので collapse なし。
+        assert_eq!(n.current(), &[] as &[String]);
+        n.enter("ch01.zip/");
+        // ch01.zip > only > [pages] の only まで降りる。
+        assert_eq!(n.current(), &s(&["ch01.zip", "only"])[..]);
+    }
+
+    #[test]
+    fn nav_materialize_current_reflects_level() {
+        let mut n = nav(&["ch01.zip/p01.jpg", "ch02.zip/p01.jpg"]);
+        // root: 2 つの ZipDir。
+        let (items, _) = n.materialize_current(SortOrder::FileName);
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], GridItem::ZipDir { .. }));
+        // ch01.zip へ降りると画像 1 枚。
+        n.enter("ch01.zip/");
+        let (items, _) = n.materialize_current(SortOrder::FileName);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], GridItem::ZipImage { .. }));
     }
 }
