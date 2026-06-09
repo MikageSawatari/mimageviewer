@@ -743,7 +743,9 @@ fn draw_line_field(
             half_h,
             dir_rad,
             count,
-            shape_seed,
+            // SpeedLines spreads lines evenly with no seed-driven jitter (unlike
+            // the Flash/burst arms), so the seed is intentionally unused here.
+            shape_seed: _,
         } => {
             let count = count.clamp(8, 1000);
             let (dx, dy) = (dir_rad.cos(), dir_rad.sin()); // along-line dir

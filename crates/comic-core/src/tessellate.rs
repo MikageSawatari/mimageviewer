@@ -513,7 +513,7 @@ fn round_rect_dense(cx: f32, cy: f32, half_w: f32, half_h: f32, corner: f32) -> 
     const EDGE_SEG: usize = 12;
     let half_pi = 0.5 * std::f32::consts::PI;
     let mut pts = Vec::new();
-    let mut edge = |a: (f32, f32), b: (f32, f32), pts: &mut Vec<(f32, f32)>| {
+    let edge = |a: (f32, f32), b: (f32, f32), pts: &mut Vec<(f32, f32)>| {
         // Exclusive of the end point (next corner arc starts there).
         for i in 0..EDGE_SEG {
             let f = i as f32 / EDGE_SEG as f32;
