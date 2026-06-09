@@ -108,7 +108,7 @@ pub struct Chord {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyName { A, B, /* ...Z */ Num0, /* ...Num9 */ F1, /* ...F12 */
     Left, Right, Up, Down, Home, End, PageUp, PageDown,
-    Space, Enter, Esc, Tab, Backspace, Delete, OpenBracket, CloseBracket }
+    Space, Enter, Esc, Tab, Backspace, Delete, OpenBracket, CloseBracket, Minus }
 
 impl KeyName {
     pub fn parse(s: &str) -> Option<KeyName>;   // "P" "F7" "Left" "[" 等
@@ -432,7 +432,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   GlobalMetadataSearch `Ctrl+G` (P) / GlobalOpenFolder `Ctrl+O` (P)
   - いずれも dialog / address / search focus / fullscreen 中は既存ガードで無効化される。
 - GridSelectAll `Ctrl+A` (P) / GridDeselect `Ctrl+D`,`Ctrl+Shift+A` (P)
-- GridColumnCount1..10 `Alt+1`..`Alt+0` (P)
+- GridColumnCount1..10 `Alt+1`..`Alt+0`、GridToggleDetailsView `Alt+-` (P)
 
 ### Grid (Ph4)
 - GridCursorRight/Left/Up/Down `矢印` (P)(予約候補) / GridOpen `Enter`(予約) /
@@ -553,6 +553,6 @@ egui 側で通常の数字キーと同じ `Num1` などに畳まれるため別�
 | 矢印 | Left/Right/Up/Down | Arrow* | 0x25/0x27/0x26/0x28 |
 | ナビ | Home/End/PageUp/PageDown | 同名 | 0x24/0x23/0x21/0x22 |
 | 編集 | Space/Enter/Esc/Tab/Backspace/Delete | 同名 | 0x20/0x0D/0x1B/0x09/0x08/0x2E |
-| 記号 | OpenBracket/CloseBracket | 同名 | 0xDB/0xDD (※配列依存・要実機確認) |
+| 記号 | OpenBracket/CloseBracket/Minus | 同名 | 0xDB/0xDD/0xBD (※配列依存・要実機確認) |
 
 修飾: Ctrl/Shift/Alt のみ。Win キー・AltGr は対象外。

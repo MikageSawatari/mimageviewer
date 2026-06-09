@@ -320,9 +320,13 @@ impl App {
         }
         // 成功分は即座に tags_cache へ反映 (just_completed を待たず)。
         // これで bulk トグルの途中フレームでも、処理済みのセルからバッジが更新されていく。
+        let tags_cache_changed = !cache_updates.is_empty();
         for (path, tags) in cache_updates {
             let key = crate::adjustment_db::normalize_path(&path);
             self.tags_cache.insert(key, tags);
+        }
+        if tags_cache_changed && self.settings.facet_filter.uses_tag_state() {
+            self.rebuild_visible_indices();
         }
         // pending_tag_undos に worker 結果を集計し、完了したトランザクションは
         // UndoEntry::Tag を組み立てて meta_undo に push する。

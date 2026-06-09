@@ -152,10 +152,15 @@ pub enum KeyName {
     Delete,
     OpenBracket,
     CloseBracket,
+    Minus,
 }
 
 impl KeyName {
     pub fn parse(s: &str) -> Option<Self> {
+        let trimmed = s.trim();
+        if matches!(trimmed, "-" | "−") {
+            return Some(KeyName::Minus);
+        }
         let normalized = s.trim().replace([' ', '_', '-'], "");
         let upper = normalized.to_ascii_uppercase();
         Some(match upper.as_str() {
@@ -223,6 +228,7 @@ impl KeyName {
             "DELETE" | "DEL" => KeyName::Delete,
             "[" | "OPENBRACKET" | "LBRACKET" => KeyName::OpenBracket,
             "]" | "CLOSEBRACKET" | "RBRACKET" => KeyName::CloseBracket,
+            "MINUS" => KeyName::Minus,
             _ => return None,
         })
     }
@@ -293,6 +299,7 @@ impl KeyName {
             KeyName::Delete => egui::Key::Delete,
             KeyName::OpenBracket => egui::Key::OpenBracket,
             KeyName::CloseBracket => egui::Key::CloseBracket,
+            KeyName::Minus => egui::Key::Minus,
         }
     }
 
@@ -362,6 +369,7 @@ impl KeyName {
             egui::Key::Delete => KeyName::Delete,
             egui::Key::OpenBracket => KeyName::OpenBracket,
             egui::Key::CloseBracket => KeyName::CloseBracket,
+            egui::Key::Minus => KeyName::Minus,
             _ => return None,
         })
     }
@@ -432,6 +440,7 @@ impl KeyName {
             KeyName::Delete => 0x2E,
             KeyName::OpenBracket => 0xDB,
             KeyName::CloseBracket => 0xDD,
+            KeyName::Minus => 0xBD,
         }
     }
 
@@ -501,6 +510,7 @@ impl KeyName {
             KeyName::Delete => "Delete",
             KeyName::OpenBracket => "OpenBracket",
             KeyName::CloseBracket => "CloseBracket",
+            KeyName::Minus => "-",
         }
     }
 }
@@ -710,6 +720,7 @@ pub enum KeyAction {
     GridColumnCount8,
     GridColumnCount9,
     GridColumnCount10,
+    GridToggleDetailsView,
     GridAdjustSlot1,
     GridAdjustSlot2,
     GridAdjustSlot3,
@@ -896,6 +907,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridColumnCount8,
     KeyAction::GridColumnCount9,
     KeyAction::GridColumnCount10,
+    KeyAction::GridToggleDetailsView,
     KeyAction::GridAdjustSlot1,
     KeyAction::GridAdjustSlot2,
     KeyAction::GridAdjustSlot3,
@@ -1117,6 +1129,7 @@ impl KeyAction {
             GridColumnCount8 => "GridColumnCount8",
             GridColumnCount9 => "GridColumnCount9",
             GridColumnCount10 => "GridColumnCount10",
+            GridToggleDetailsView => "GridToggleDetailsView",
             GridAdjustSlot1 => "GridAdjustSlot1",
             GridAdjustSlot2 => "GridAdjustSlot2",
             GridAdjustSlot3 => "GridAdjustSlot3",
@@ -1313,6 +1326,7 @@ impl KeyAction {
             GridColumnCount8 => "サムネイル列数を8列にする",
             GridColumnCount9 => "サムネイル列数を9列にする",
             GridColumnCount10 => "サムネイル列数を10列にする",
+            GridToggleDetailsView => "サムネイル一覧と詳細一覧を切り替える",
             GridAdjustSlot1 => "補正プリセットスロット1を適用する",
             GridAdjustSlot2 => "補正プリセットスロット2を適用する",
             GridAdjustSlot3 => "補正プリセットスロット3を適用する",
@@ -1484,13 +1498,35 @@ impl KeyAction {
             GlobalLocalSearch | GlobalFavSearch | GlobalMetadataSearch | GlobalOpenFolder => {
                 KeyContext::Global
             }
-            GridSelectAll | GridDeselect | GridToggleCheck | GridRotateCw | GridRotateCcw
-            | GridPin | GridComparePin | GridColumnCount1 | GridColumnCount2 | GridColumnCount3
-            | GridColumnCount4 | GridColumnCount5 | GridColumnCount6 | GridColumnCount7
-            | GridColumnCount8 | GridColumnCount9 | GridColumnCount10 | GridAdjustSlot1
-            | GridAdjustSlot2 | GridAdjustSlot3 | GridAdjustSlot4 | GridAdjustSlot5
-            | GridAdjustSlot6 | GridAdjustSlot7 | GridAdjustSlot8 | GridAdjustSlot9
-            | GridAdjustSlot10 | GridClearAdjust => KeyContext::Grid,
+            GridSelectAll
+            | GridDeselect
+            | GridToggleCheck
+            | GridRotateCw
+            | GridRotateCcw
+            | GridPin
+            | GridComparePin
+            | GridColumnCount1
+            | GridColumnCount2
+            | GridColumnCount3
+            | GridColumnCount4
+            | GridColumnCount5
+            | GridColumnCount6
+            | GridColumnCount7
+            | GridColumnCount8
+            | GridColumnCount9
+            | GridColumnCount10
+            | GridToggleDetailsView
+            | GridAdjustSlot1
+            | GridAdjustSlot2
+            | GridAdjustSlot3
+            | GridAdjustSlot4
+            | GridAdjustSlot5
+            | GridAdjustSlot6
+            | GridAdjustSlot7
+            | GridAdjustSlot8
+            | GridAdjustSlot9
+            | GridAdjustSlot10
+            | GridClearAdjust => KeyContext::Grid,
             FsToggleMetadata | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => {
                 KeyContext::FsCommon
             }
@@ -1606,6 +1642,7 @@ impl KeyAction {
             | GridColumnCount8
             | GridColumnCount9
             | GridColumnCount10
+            | GridToggleDetailsView
             | GridAdjustSlot1
             | GridAdjustSlot2
             | GridAdjustSlot3
@@ -1790,6 +1827,7 @@ impl KeyAction {
             GridColumnCount8 => ChordList::one(Chord::alt(Num8)),
             GridColumnCount9 => ChordList::one(Chord::alt(Num9)),
             GridColumnCount10 => ChordList::one(Chord::alt(Num0)),
+            GridToggleDetailsView => ChordList::one(Chord::alt(Minus)),
             GridAdjustSlot1 => ChordList::one(Chord::ctrl(Num1)),
             GridAdjustSlot2 => ChordList::one(Chord::ctrl(Num2)),
             GridAdjustSlot3 => ChordList::one(Chord::ctrl(Num3)),
@@ -2329,7 +2367,7 @@ impl Keymap {
         out.push_str("# - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。\n");
         out.push_str("# - キー名の例: A..Z, 0..9, F1..F12, Left, Right, Up, Down,\n");
         out.push_str(
-            "#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete, [, ]\n",
+            "#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete, [, ], -\n",
         );
         out.push_str("# - テンキー数字は通常の数字キーと同じ扱いです。\n");
         out.push_str("#   Numpad1 などの名前は受け付けますが、1 の別キーとしては使えません。\n");

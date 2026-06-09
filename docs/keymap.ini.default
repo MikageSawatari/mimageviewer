@@ -19,7 +19,7 @@
 # - ModifierHold は Ctrl / Shift / Alt のいずれか 1 つだけ指定できます。
 # - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。
 # - キー名の例: A..Z, 0..9, F1..F12, Left, Right, Up, Down,
-#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete, [, ]
+#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete, [, ], -
 # - テンキー数字は通常の数字キーと同じ扱いです。
 #   Numpad1 などの名前は受け付けますが、1 の別キーとしては使えません。
 # - Alt+F4 / Alt+Tab / Alt+Esc / Alt+Space / Ctrl+Alt+Del / Win キー系など、
@@ -68,6 +68,7 @@
 # GridColumnCount8 = Alt+8 ; サムネイル列数を8列にする
 # GridColumnCount9 = Alt+9 ; サムネイル列数を9列にする
 # GridColumnCount10 = Alt+0 ; サムネイル列数を10列にする
+# GridToggleDetailsView = Alt+- ; サムネイル一覧と詳細一覧を切り替える
 # GridAdjustSlot1 = Ctrl+1 ; 補正プリセットスロット1を適用する
 # GridAdjustSlot2 = Ctrl+2 ; 補正プリセットスロット2を適用する
 # GridAdjustSlot3 = Ctrl+3 ; 補正プリセットスロット3を適用する

@@ -834,6 +834,98 @@ pub(crate) struct MetadataLoadResult {
     sidecar: Option<crate::external_metadata::SidecarDisplay>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LazyColumnState {
+    Disabled,
+    NotRequested,
+    Loading { done: usize, total: usize },
+    Ready { failed: usize },
+    Cancelled,
+}
+
+impl LazyColumnState {
+    pub(crate) fn is_ready(self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+
+    fn is_loading(self) -> bool {
+        matches!(self, Self::Loading { .. })
+    }
+}
+
+impl Default for LazyColumnState {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+const DETAILS_LAZY_META_STALE_CAP: usize = 50_000;
+
+#[derive(Clone, Default)]
+pub(crate) struct DetailsLazyMeta {
+    pub(crate) source_mtime: i64,
+    pub(crate) source_size: i64,
+    pub(crate) created_at: Option<i64>,
+    pub(crate) created_at_failed: bool,
+    pub(crate) image_dims: Option<(u32, u32)>,
+    pub(crate) image_dims_failed: bool,
+    pub(crate) video_duration_secs: Option<f64>,
+    pub(crate) video_dims: Option<(u32, u32)>,
+    pub(crate) video_codec: Option<String>,
+    pub(crate) video_meta_failed: bool,
+}
+
+impl DetailsLazyMeta {
+    fn matches_source(&self, source: Option<(i64, i64)>) -> bool {
+        let (mtime, size) = source.unwrap_or((0, 0));
+        self.source_mtime == mtime && self.source_size == size
+    }
+}
+
+struct DetailsMetaPending {
+    visible_revision: u64,
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<DetailsMetaEvent>,
+}
+
+enum DetailsMetaEvent {
+    Progress {
+        generation: u64,
+        done: usize,
+        total: usize,
+    },
+    Item {
+        generation: u64,
+        key: String,
+        meta: DetailsLazyMeta,
+    },
+    Finished {
+        generation: u64,
+        failed: usize,
+    },
+}
+
+#[derive(Clone)]
+struct DetailsMetaTarget {
+    key: String,
+    item: GridItem,
+    source_mtime: i64,
+    source_size: i64,
+    catalog_folder: Option<PathBuf>,
+    catalog_key: Option<String>,
+    warm_image_dims: Option<(u32, u32)>,
+    load_created_at: bool,
+    load_image_dims: bool,
+    load_video_meta: bool,
+    priority: crate::io_semaphore::IoPriority,
+}
+
+struct DetailsVideoProbe {
+    duration_secs: Option<f64>,
+    dims: Option<(u32, u32)>,
+    codec: Option<String>,
+}
+
 /// 非同期お気に入り検索 (Ctrl+S) の状態。
 ///
 /// `search_index_db.search()` は SQLite クエリでインデックス化された名前検索だが、
@@ -1243,6 +1335,145 @@ fn passes_rating_filter(item: &GridItem, stars: u8, rating_filter: &[bool; 6]) -
     }
 }
 
+fn cmp_option_last<T: Ord>(a: Option<T>, b: Option<T>, ascending: bool) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) if ascending => a.cmp(&b),
+        (Some(a), Some(b)) => b.cmp(&a),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn path_extension_lower(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn format_details_duration(secs: f64) -> String {
+    if !secs.is_finite() || secs <= 0.0 {
+        return String::new();
+    }
+    let total = secs.round() as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+#[cfg(windows)]
+fn format_details_timestamp(secs: i64) -> String {
+    if secs <= 0 {
+        return String::new();
+    }
+    const WINDOWS_TICKS_PER_SEC: i128 = 10_000_000;
+    const UNIX_TO_WINDOWS_SECS: i128 = 11_644_473_600;
+    let ticks = (secs as i128 + UNIX_TO_WINDOWS_SECS) * WINDOWS_TICKS_PER_SEC;
+    if ticks <= 0 || ticks > u64::MAX as i128 {
+        return String::new();
+    }
+
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+    use windows::Win32::System::Time::FileTimeToSystemTime;
+
+    let ticks = ticks as u64;
+    let filetime = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut local_filetime = FILETIME::default();
+    let mut st = SYSTEMTIME::default();
+    if unsafe { FileTimeToLocalFileTime(&filetime, &mut local_filetime) }.is_err()
+        || unsafe { FileTimeToSystemTime(&local_filetime, &mut st) }.is_err()
+    {
+        return String::new();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
+    )
+}
+
+#[cfg(not(windows))]
+fn format_details_timestamp(secs: i64) -> String {
+    if secs <= 0 {
+        String::new()
+    } else {
+        secs.to_string()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FacetField {
+    Kind,
+    Ext,
+    Tags,
+    Date,
+    Size,
+    Edits,
+}
+
+enum DetailsSortPrimary {
+    None,
+    Text(String),
+    U8(u8),
+    U32(u32),
+    U64(Option<u64>),
+    I64(Option<i64>),
+}
+
+struct DetailsSortRow {
+    idx: usize,
+    primary: DetailsSortPrimary,
+    name_key: Vec<crate::ui_helpers::NaturalChunk>,
+    name_lower: String,
+}
+
+fn facet_kind_for_item(item: &GridItem) -> crate::settings::FacetItemKind {
+    use crate::settings::FacetItemKind;
+    match item {
+        GridItem::Folder(_) => FacetItemKind::Folder,
+        GridItem::Image(_) => FacetItemKind::Image,
+        GridItem::Video(_) => FacetItemKind::Video,
+        GridItem::ZipFile(_) => FacetItemKind::Zip,
+        GridItem::PdfFile(_) => FacetItemKind::Pdf,
+        GridItem::ConvertibleArchive { .. } => FacetItemKind::Archive,
+        GridItem::ZipImage { .. } => FacetItemKind::ZipImage,
+        GridItem::PdfPage { .. } => FacetItemKind::PdfPage,
+        GridItem::ZipSeparator { .. } => FacetItemKind::Separator,
+        GridItem::SearchContainer { .. } => FacetItemKind::SearchContainer,
+    }
+}
+
+fn facet_ext_for_item(item: &GridItem) -> String {
+    match item {
+        GridItem::Folder(_) | GridItem::ZipSeparator { .. } => String::new(),
+        GridItem::Image(p)
+        | GridItem::Video(p)
+        | GridItem::ZipFile(p)
+        | GridItem::PdfFile(p)
+        | GridItem::ConvertibleArchive { path: p, .. }
+        | GridItem::SearchContainer { path: p, .. } => path_extension_lower(p),
+        GridItem::ZipImage { entry_name, .. } => Path::new(entry_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase(),
+        GridItem::PdfPage { .. } => "pdf".to_string(),
+    }
+}
+
+fn facet_item_supports_tags(item: &GridItem) -> bool {
+    matches!(item, GridItem::Image(_) | GridItem::Video(_))
+}
+
 /// `current` が `anchor` 配下 (= 同一 or 子孫) かを case-insensitive に判定する。
 /// Windows の case-insensitive FS 対応 (`C:\Photos` と `c:\photos` を同一扱い)。
 /// ドライブ文字は保持するので、cross-drive の偶然一致を起こさない
@@ -1360,6 +1591,209 @@ fn run_metadata_load(
         xmp,
         panorama,
         sidecar,
+    })
+}
+
+fn run_details_meta_load(
+    generation: u64,
+    targets: Vec<DetailsMetaTarget>,
+    initial_done: usize,
+    initial_failed: usize,
+    total: usize,
+    cache_dir: PathBuf,
+    io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::Sender<DetailsMetaEvent>,
+) {
+    let mut done = initial_done;
+    let mut failed = initial_failed;
+    let mut catalog_maps: std::collections::HashMap<
+        PathBuf,
+        Option<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+    > = std::collections::HashMap::new();
+
+    for target in targets {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut created_at = None;
+        let mut dims = if target.load_image_dims {
+            target.warm_image_dims
+        } else {
+            None
+        };
+        let mut video_probe: Option<DetailsVideoProbe> = None;
+        if target.load_created_at
+            && let Some(path) = details_created_time_path(&target.item)
+        {
+            created_at = {
+                let _permit = io_sem.acquire(target.priority);
+                std::fs::metadata(path)
+                    .ok()
+                    .and_then(|m| m.created().ok().and_then(|t| system_time_to_unix_secs(t)))
+            };
+        }
+
+        if target.load_image_dims
+            && dims.is_none()
+            && let (Some(folder), Some(key)) =
+                (target.catalog_folder.as_ref(), target.catalog_key.as_ref())
+        {
+            if !catalog_maps.contains_key(folder) {
+                let map = {
+                    let _permit = io_sem.acquire(target.priority);
+                    crate::catalog::CatalogDb::open(&cache_dir, folder)
+                        .and_then(|db| db.load_all())
+                        .ok()
+                };
+                catalog_maps.insert(folder.clone(), map);
+            }
+            dims = catalog_maps
+                .get(folder)
+                .and_then(|m| m.as_ref())
+                .and_then(|m| m.get(key))
+                .filter(|entry| {
+                    entry.mtime == target.source_mtime && entry.file_size == target.source_size
+                })
+                .and_then(|entry| entry.source_dims);
+        }
+
+        if target.load_image_dims
+            && dims.is_none()
+            && let GridItem::Image(path) = &target.item
+        {
+            let probed = {
+                let _permit = io_sem.acquire(target.priority);
+                crate::fast_resize::probe_dims(path)
+            };
+            dims = probed.map(|[w, h]| (w as u32, h as u32));
+        }
+
+        if target.load_video_meta
+            && let GridItem::Video(path) = &target.item
+        {
+            video_probe = {
+                let _permit = io_sem.acquire(target.priority);
+                probe_video_details(path, &cancel)
+            };
+        }
+
+        let image_dims_failed = matches!(
+            target.item,
+            GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
+        ) && target.load_image_dims
+            && dims.is_none();
+        let video_meta_failed = target.load_video_meta
+            && matches!(target.item, GridItem::Video(_))
+            && video_probe.is_none();
+        let created_at_failed = target.load_created_at && created_at.is_none();
+        failed += usize::from(image_dims_failed || video_meta_failed || created_at_failed);
+        let (video_duration_secs, video_dims, video_codec) = video_probe
+            .map(|probe| (probe.duration_secs, probe.dims, probe.codec))
+            .unwrap_or((None, None, None));
+        let meta = DetailsLazyMeta {
+            source_mtime: target.source_mtime,
+            source_size: target.source_size,
+            created_at,
+            created_at_failed,
+            image_dims: dims,
+            image_dims_failed,
+            video_duration_secs,
+            video_dims,
+            video_codec,
+            video_meta_failed,
+        };
+        if tx
+            .send(DetailsMetaEvent::Item {
+                generation,
+                key: target.key,
+                meta,
+            })
+            .is_err()
+        {
+            return;
+        }
+
+        done = (done + 1).min(total);
+        if tx
+            .send(DetailsMetaEvent::Progress {
+                generation,
+                done,
+                total,
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    let _ = tx.send(DetailsMetaEvent::Finished { generation, failed });
+}
+
+fn details_duration_to_secs(duration: i64) -> Option<f64> {
+    if duration == i64::MIN || duration <= 0 {
+        return None;
+    }
+    let secs = duration as f64 / 1_000_000.0;
+    (secs.is_finite() && secs > 0.0).then_some(secs)
+}
+
+fn system_time_to_unix_secs(time: std::time::SystemTime) -> Option<i64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+}
+
+fn details_created_time_path(item: &GridItem) -> Option<&Path> {
+    match item {
+        GridItem::Folder(path)
+        | GridItem::Image(path)
+        | GridItem::Video(path)
+        | GridItem::ZipFile(path)
+        | GridItem::PdfFile(path) => Some(path.as_path()),
+        GridItem::ConvertibleArchive { path, .. } | GridItem::SearchContainer { path, .. } => {
+            Some(path.as_path())
+        }
+        GridItem::ZipImage { .. } | GridItem::ZipSeparator { .. } | GridItem::PdfPage { .. } => {
+            None
+        }
+    }
+}
+
+fn probe_video_details(path: &Path, cancel: &AtomicBool) -> Option<DetailsVideoProbe> {
+    use ffmpeg::media::Type as MediaType;
+    use ffmpeg_the_third as ffmpeg;
+
+    ffmpeg::init().ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let input = ffmpeg::format::input_with_interrupt(path, move || {
+        cancel.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline
+    })
+    .ok()?;
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let duration_secs = details_duration_to_secs(input.duration());
+    let video_stream = input.streams().best(MediaType::Video)?;
+    let params = video_stream.parameters();
+    let codec = params.id().name().to_string();
+    let ctx = ffmpeg::codec::context::Context::from_parameters(params).ok()?;
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let decoder = ctx.decoder().video().ok()?;
+    let dims = match (decoder.width(), decoder.height()) {
+        (w, h) if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    };
+    Some(DetailsVideoProbe {
+        duration_secs,
+        dims,
+        codec: (!codec.is_empty()).then_some(codec),
     })
 }
 
@@ -2767,7 +3201,8 @@ pub struct App {
     pub(crate) cache_gen_done: Arc<AtomicUsize>,
 
     // ── 段階 B: ページ単位先読み / eviction ──────────────────────
-    /// アイテム idx → 画像メタデータ (mtime, file_size)。フォルダ・動画は None
+    /// アイテム idx → 表示/サムネ用メタデータ (mtime, file_size)。
+    /// 動画も詳細表示用に値を持つが、`make_load_request` は Video を対象外にする。
     pub(crate) image_metas: Vec<Option<(i64, i64)>>,
     /// 永続ワーカーがサムネイルを処理するためのキュー（UI からは push のみ）
     /// 通常画像 (Image, ZipImage, PdfPage) + PdfFile (フォルダ代表画、IPC 待ち) 用
@@ -2790,6 +3225,10 @@ pub struct App {
     /// ★フィルタや Ctrl+F で疎になった `visible_indices` でも、非可視 idx が
     /// 先読みキューに流入しないよう、raw range ではなく set 判定に統一する。
     pub(crate) keep_set: std::collections::HashSet<usize>,
+    /// 詳細表示中にサムネ要求抑制 / 既存テクスチャ破棄を適用済みか。
+    /// 詳細モードは `update_keep_range_and_requests` が毎フレーム呼ばれるので、
+    /// O(n) の eviction とキュー drain を初回だけに抑える。
+    pub(crate) details_thumb_suppression_applied: bool,
     /// ワーカー共有用: keep_range の start/end をアトミックに公開。
     /// ワーカーは pick 後にこの範囲を確認し、範囲外のリクエストをスキップする。
     /// (set そのものを共有するのは実装負荷が大きいため bounding box で近似する。
@@ -3299,6 +3738,22 @@ pub struct App {
     /// フィルタ適用後の表示アイテムインデックスリスト（フィルタなしなら全アイテム）。
     /// グリッド表示・フルスクリーンナビ・スライドショーで共有。
     pub(crate) visible_indices: Vec<usize>,
+    /// 詳細表示専用の表示順。`visible_indices` は昇順のまま保ち、詳細モードの描画 /
+    /// キーボード移動 / Shift 範囲選択だけこの順序を見る。
+    pub(crate) details_order: Vec<usize>,
+    /// 詳細表示で現在画面付近にある idx。サムネ用 `keep_set` を空にしても、
+    /// タグ列 / タグ facet の XMP prewarm はこの集合で可視行だけ進める。
+    pub(crate) details_tag_prewarm_indices: Vec<usize>,
+    /// 詳細表示の遅延メタ結果。キーは `metadata_cache_key` 相当の安定キー。
+    pub(crate) details_lazy_meta: std::collections::HashMap<String, DetailsLazyMeta>,
+    /// 詳細表示の遅延メタ worker。
+    details_meta_pending: Option<DetailsMetaPending>,
+    /// 詳細遅延列の対象集合 revision。フィルタ変更で進め、古い worker 完了時に再要求する。
+    details_lazy_visible_revision: u64,
+    /// 画像解像度列の readiness。列全体が Ready になるまでソート/フィルタは無効。
+    pub(crate) details_image_dims_state: LazyColumnState,
+    /// フォルダ固有 facet (タグ/拡張子) の適用元。場所が変わったら無界値 facet を解除する。
+    pub(crate) facet_filter_scope: Option<PathBuf>,
 
     /// 第2シグナル (`finalized=true`) を受け取ったが、第1シグナルの ColorImage が
     /// `texture_backlog` でアップロード待ちのため `requested` から remove できなかった
@@ -5127,6 +5582,7 @@ impl App {
             requested: std::collections::HashMap::new(),
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
+            details_thumb_suppression_applied: false,
             keep_start_shared: Arc::new(AtomicUsize::new(0)),
             keep_end_shared: Arc::new(AtomicUsize::new(0)),
             texture_backlog: Vec::new(),
@@ -5293,6 +5749,13 @@ impl App {
             search_filter: None,
             search_filter_origin_folder: None,
             visible_indices: Vec::new(),
+            details_order: Vec::new(),
+            details_tag_prewarm_indices: Vec::new(),
+            details_lazy_meta: std::collections::HashMap::new(),
+            details_meta_pending: None,
+            details_lazy_visible_revision: 0,
+            details_image_dims_state: LazyColumnState::Disabled,
+            facet_filter_scope: None,
             pending_finalize: std::collections::HashSet::new(),
             last_vis_range: (0, 0),
             vis_settle_at: None,
@@ -5955,9 +6418,9 @@ impl App {
     /// 呼び出し位置: `start_loading_items` 内の `delete_missing()` 完了後、
     /// `spawn_thumbnail_workers()` 起動前。設計: [docs/auto-thumb-aspect-plan.md §4.1.2](../docs/auto-thumb-aspect-plan.md)
     ///
-    /// 動画は `image_metas[idx] = None` で `make_load_request` も `None` を返すため
-    /// 初期 seed では拾えない。`poll_thumbnails` 経路で動画サムネ完了通知を受けた
-    /// ときに `record_aspect_sample` で集計される。
+    /// 動画は詳細表示用に `image_metas[idx]` を持つが、`make_load_request` が `None` を
+    /// 返すため初期 seed では拾えない。`poll_thumbnails` 経路で動画サムネ完了通知を
+    /// 受けたときに `record_aspect_sample` で集計される。
     pub(crate) fn reset_and_seed_auto_aspect(
         &mut self,
         cache_map: &Arc<
@@ -7334,7 +7797,7 @@ impl App {
             let item_idx = folder_count + offset;
             if *is_video {
                 items.push(GridItem::Video(p.clone()));
-                image_metas.push(None);
+                image_metas.push(Some((*mtime, *file_size)));
                 video_items.push((item_idx, p.clone(), (*file_size).max(0) as u64));
             } else {
                 items.push(GridItem::Image(p.clone()));
@@ -8493,7 +8956,7 @@ impl App {
             };
             let idx = items.len();
             if matches!(item, GridItem::Video(_)) {
-                image_metas.push(None);
+                image_metas.push(Some((e.mtime, 0)));
                 video_items.push((idx, e.path.clone(), 0));
             } else {
                 image_metas.push(Some((e.mtime, 0)));
@@ -8621,6 +9084,12 @@ impl App {
         self.thumbnails.clear();
         self.image_metas.clear();
         self.visible_indices.clear();
+        self.details_order.clear();
+        self.details_tag_prewarm_indices.clear();
+        if let Some(pending) = self.details_meta_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.details_image_dims_state = LazyColumnState::Disabled;
         self.selected = None;
         self.scroll_offset_y = 0.0;
         self.current_folder = Some(zip_path.clone());
@@ -10409,6 +10878,15 @@ impl App {
             .map(|_| ThumbnailState::Pending)
             .collect();
         self.items_generation = self.items_generation.wrapping_add(1);
+        if let Some(pending) = self.details_meta_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
+        self.details_image_dims_state = if self.details_any_lazy_columns_enabled() {
+            LazyColumnState::NotRequested
+        } else {
+            LazyColumnState::Disabled
+        };
         // 既定は「実ビュー」。`replace_search_view_items` (= 合成ビュー経路) は
         // この後で true に上書きする。
         self.items_are_global_search_view = false;
@@ -13195,6 +13673,39 @@ impl App {
         if self.delete_pending.is_some() {
             return;
         }
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
+            if self.details_thumb_suppression_applied {
+                return;
+            }
+            self.keep_range = (0, 0);
+            self.keep_set.clear();
+            self.keep_start_shared.store(0, Ordering::Relaxed);
+            self.keep_end_shared.store(0, Ordering::Relaxed);
+            self.thumb_pixels.clear();
+            self.thumb_adjust_tex.clear();
+            for thumb in self.thumbnails.iter_mut() {
+                if matches!(thumb, ThumbnailState::Loaded { .. }) {
+                    *thumb = ThumbnailState::Evicted;
+                }
+            }
+            if let Some(queue_arc) = self.reload_queue.clone() {
+                let (ref mtx, _) = *queue_arc;
+                let mut q = mtx.lock().unwrap();
+                for r in q.drain(..) {
+                    self.requested.remove(&r.idx);
+                }
+            }
+            if let Some(queue_arc) = self.heavy_io_queue.clone() {
+                let (ref mtx, _) = *queue_arc;
+                let mut q = mtx.lock().unwrap();
+                for r in q.drain(..) {
+                    self.requested.remove(&r.idx);
+                }
+            }
+            self.details_thumb_suppression_applied = true;
+            return;
+        }
+        self.details_thumb_suppression_applied = false;
         let total = self.items.len();
         if total == 0 {
             // keep_set と worker atomic boundary も同時にクリアしないと、
@@ -14309,7 +14820,8 @@ impl App {
         // コンテナ★の Undo/Redo も空表示時に効くよう、可視アイテム数には依存させない。
         self.handle_meta_undo_keys(ctx);
 
-        let vi = &self.visible_indices;
+        let display_order = self.current_grid_order().to_vec();
+        let vi = display_order.as_slice();
         let vi_len = vi.len();
 
         if vi_len > 0 {
@@ -14320,18 +14832,24 @@ impl App {
             let vis_pos = vi.iter().position(|&i| i == sel).unwrap_or(0);
             let cell_h = self.last_cell_h.max(1.0);
             let visible_rows = (self.last_viewport_h / cell_h).floor() as usize;
-            let page_items = visible_rows.max(1) * cols;
+            let nav_cols = if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            {
+                1
+            } else {
+                cols.max(1)
+            };
+            let page_items = visible_rows.max(1) * nav_cols;
 
-            // visible_indices 上で移動し、raw index に変換
+            // 画面上の表示順で移動し、raw index に変換する。
             // Ctrl+矢印はフォルダ移動に使うので、通常カーソル移動から除外
             let new_vis_pos = if right && !ctrl_held && !alt_held {
                 Some((vis_pos + 1).min(vi_len - 1))
             } else if left && !ctrl_held && !alt_held {
                 Some(vis_pos.saturating_sub(1))
             } else if down && !ctrl_down && !alt_held {
-                Some((vis_pos + cols).min(vi_len - 1))
+                Some((vis_pos + nav_cols).min(vi_len - 1))
             } else if up && !ctrl_up && !alt_held {
-                Some(vis_pos.saturating_sub(cols))
+                Some(vis_pos.saturating_sub(nav_cols))
             } else if home {
                 Some(0)
             } else if end {
@@ -15524,9 +16042,9 @@ impl App {
             Some(s) => s,
             None => return,
         };
-        // フィルタ中は visible_indices 内での位置から行を計算する
+        // フィルタ中/詳細表示中は画面上の表示順での位置から行を計算する。
         let vis_pos = self
-            .visible_indices
+            .current_grid_order()
             .iter()
             .position(|&i| i == sel)
             .unwrap_or(sel);
@@ -16145,6 +16663,546 @@ impl App {
         }
     }
 
+    pub(crate) fn poll_details_meta_load(&mut self, ctx: &egui::Context) {
+        if !self.details_lazy_columns_visible() {
+            if let Some(pending) = self.details_meta_pending.take() {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+            self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
+            self.details_image_dims_state = LazyColumnState::Disabled;
+            return;
+        }
+
+        let mut disconnected = false;
+        loop {
+            let event = match self.details_meta_pending.as_ref() {
+                Some(pending) => match pending.rx.try_recv() {
+                    Ok(event) => Some(event),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        None
+                    }
+                },
+                None => None,
+            };
+            let Some(event) = event else {
+                break;
+            };
+            match event {
+                DetailsMetaEvent::Progress {
+                    generation,
+                    done,
+                    total,
+                } if generation == self.items_generation => {
+                    self.details_image_dims_state = LazyColumnState::Loading { done, total };
+                    ctx.request_repaint();
+                }
+                DetailsMetaEvent::Item {
+                    generation,
+                    key,
+                    meta,
+                } if generation == self.items_generation => {
+                    self.details_lazy_meta.insert(key, meta);
+                    ctx.request_repaint();
+                }
+                DetailsMetaEvent::Finished { generation, failed }
+                    if generation == self.items_generation =>
+                {
+                    let revision_matches = self
+                        .details_meta_pending
+                        .as_ref()
+                        .is_some_and(|p| p.visible_revision == self.details_lazy_visible_revision);
+                    self.details_meta_pending = None;
+                    if revision_matches {
+                        self.details_image_dims_state = LazyColumnState::Ready { failed };
+                        self.prune_details_lazy_meta_cache();
+                        if matches!(
+                            self.settings.details_sort_key,
+                            crate::settings::DetailsSortKey::ImageDimensions
+                                | crate::settings::DetailsSortKey::Created
+                                | crate::settings::DetailsSortKey::VideoDuration
+                                | crate::settings::DetailsSortKey::VideoDimensions
+                                | crate::settings::DetailsSortKey::VideoCodec
+                        ) {
+                            self.rebuild_details_order();
+                        }
+                    } else {
+                        self.details_image_dims_state = LazyColumnState::NotRequested;
+                    }
+                    ctx.request_repaint();
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if disconnected {
+            self.details_meta_pending = None;
+            if self.details_image_dims_state.is_loading() {
+                self.details_image_dims_state = LazyColumnState::Cancelled;
+            }
+        }
+
+        if matches!(self.details_image_dims_state, LazyColumnState::NotRequested) {
+            self.start_details_meta_load(ctx);
+        }
+    }
+
+    pub(crate) fn cancel_details_meta_loading(&mut self) {
+        if let Some(pending) = self.details_meta_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        if self.details_lazy_columns_visible() {
+            self.details_image_dims_state = LazyColumnState::Cancelled;
+        } else {
+            self.details_image_dims_state = LazyColumnState::Disabled;
+        }
+    }
+
+    pub(crate) fn resume_details_meta_loading(&mut self) {
+        if self.details_lazy_columns_visible() {
+            self.details_image_dims_state = LazyColumnState::NotRequested;
+        }
+    }
+
+    pub(crate) fn details_lazy_columns_visible(&self) -> bool {
+        self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && self.details_any_lazy_columns_enabled()
+            && !self.items_are_drive_list
+            && !self.items.is_empty()
+    }
+
+    fn details_any_lazy_columns_enabled(&self) -> bool {
+        self.settings.details_show_created
+            || self.settings.details_show_image_dimensions
+            || self.settings.details_show_video_duration
+            || self.settings.details_show_video_dimensions
+            || self.settings.details_show_video_codec
+    }
+
+    pub(crate) fn details_image_dims_sort_ready(&self) -> bool {
+        self.details_image_dims_state.is_ready()
+    }
+
+    pub(crate) fn details_lazy_sort_ready(&self) -> bool {
+        self.details_image_dims_state.is_ready()
+    }
+
+    pub(crate) fn details_created_text(&self, idx: usize) -> String {
+        if !self.details_item_supports_created_at(idx) {
+            return "-".to_string();
+        }
+        if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
+            if let Some(created_at) = meta.created_at {
+                return format_details_timestamp(created_at);
+            }
+            if meta.created_at_failed {
+                return "-".to_string();
+            }
+        }
+        match self.details_image_dims_state {
+            LazyColumnState::Disabled => String::new(),
+            LazyColumnState::Ready { .. } => "-".to_string(),
+            LazyColumnState::NotRequested
+            | LazyColumnState::Loading { .. }
+            | LazyColumnState::Cancelled => "...".to_string(),
+        }
+    }
+
+    pub(crate) fn details_created_sort_value(&self, idx: usize) -> Option<i64> {
+        if !self.details_lazy_sort_ready() {
+            return None;
+        }
+        self.details_lazy_meta_for_idx(idx)
+            .and_then(|meta| meta.created_at)
+    }
+
+    pub(crate) fn details_image_dims_text(&self, idx: usize) -> String {
+        if !self.details_item_supports_image_dims(idx) {
+            return "-".to_string();
+        }
+        if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
+            if let Some((w, h)) = meta.image_dims {
+                return format!("{w}x{h}");
+            }
+            if meta.image_dims_failed {
+                return "-".to_string();
+            }
+        }
+        match self.details_image_dims_state {
+            LazyColumnState::Disabled => String::new(),
+            LazyColumnState::Ready { .. } => "-".to_string(),
+            LazyColumnState::NotRequested
+            | LazyColumnState::Loading { .. }
+            | LazyColumnState::Cancelled => "...".to_string(),
+        }
+    }
+
+    pub(crate) fn details_image_dims_sort_value(&self, idx: usize) -> Option<u64> {
+        if !self.details_image_dims_sort_ready() {
+            return None;
+        }
+        self.details_lazy_meta_for_idx(idx)
+            .and_then(|meta| meta.image_dims)
+            .map(|(w, h)| (w as u64) * (h as u64))
+    }
+
+    pub(crate) fn details_video_duration_text(&self, idx: usize) -> String {
+        if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+            return "-".to_string();
+        }
+        if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
+            if let Some(secs) = meta.video_duration_secs {
+                return format_details_duration(secs);
+            }
+            if meta.video_meta_failed {
+                return "-".to_string();
+            }
+        }
+        match self.details_image_dims_state {
+            LazyColumnState::Disabled => String::new(),
+            LazyColumnState::Ready { .. } => "-".to_string(),
+            LazyColumnState::NotRequested
+            | LazyColumnState::Loading { .. }
+            | LazyColumnState::Cancelled => "...".to_string(),
+        }
+    }
+
+    pub(crate) fn details_video_dims_text(&self, idx: usize) -> String {
+        if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+            return "-".to_string();
+        }
+        if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
+            if let Some((w, h)) = meta.video_dims {
+                return format!("{w}x{h}");
+            }
+            if meta.video_meta_failed {
+                return "-".to_string();
+            }
+        }
+        match self.details_image_dims_state {
+            LazyColumnState::Disabled => String::new(),
+            LazyColumnState::Ready { .. } => "-".to_string(),
+            LazyColumnState::NotRequested
+            | LazyColumnState::Loading { .. }
+            | LazyColumnState::Cancelled => "...".to_string(),
+        }
+    }
+
+    pub(crate) fn details_video_codec_text(&self, idx: usize) -> String {
+        if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+            return "-".to_string();
+        }
+        if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
+            if let Some(codec) = meta.video_codec.as_ref() {
+                return codec.clone();
+            }
+            if meta.video_meta_failed {
+                return "-".to_string();
+            }
+        }
+        match self.details_image_dims_state {
+            LazyColumnState::Disabled => String::new(),
+            LazyColumnState::Ready { .. } => "-".to_string(),
+            LazyColumnState::NotRequested
+            | LazyColumnState::Loading { .. }
+            | LazyColumnState::Cancelled => "...".to_string(),
+        }
+    }
+
+    pub(crate) fn details_video_duration_sort_value(&self, idx: usize) -> Option<u64> {
+        if !self.details_image_dims_sort_ready() {
+            return None;
+        }
+        self.details_lazy_meta_for_idx(idx)
+            .and_then(|meta| meta.video_duration_secs)
+            .filter(|secs| secs.is_finite() && *secs > 0.0)
+            .map(|secs| (secs * 1000.0).round() as u64)
+    }
+
+    pub(crate) fn details_video_dims_sort_value(&self, idx: usize) -> Option<u64> {
+        if !self.details_image_dims_sort_ready() {
+            return None;
+        }
+        self.details_lazy_meta_for_idx(idx)
+            .and_then(|meta| meta.video_dims)
+            .map(|(w, h)| (w as u64) * (h as u64))
+    }
+
+    pub(crate) fn details_video_codec_sort_value(&self, idx: usize) -> Option<String> {
+        if !self.details_image_dims_sort_ready() {
+            return None;
+        }
+        self.details_lazy_meta_for_idx(idx)
+            .and_then(|meta| meta.video_codec.clone())
+    }
+
+    fn start_details_meta_load(&mut self, ctx: &egui::Context) {
+        if self.details_meta_pending.is_some() {
+            return;
+        }
+
+        let generation = self.items_generation;
+        let visible_near: std::collections::HashSet<usize> =
+            self.details_tag_prewarm_indices.iter().copied().collect();
+        let order = self.current_grid_order().to_vec();
+        let mut visible_targets = Vec::new();
+        let mut background_targets = Vec::new();
+        let mut cached_done = 0usize;
+        let mut cached_failed = 0usize;
+        let mut total = 0usize;
+
+        for idx in order {
+            if !self.details_item_requires_lazy_meta(idx) {
+                continue;
+            }
+            total += 1;
+            if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
+                if self.details_lazy_meta_satisfies_idx(idx, meta) {
+                    cached_done += 1;
+                    cached_failed += usize::from(
+                        meta.image_dims_failed || meta.video_meta_failed || meta.created_at_failed,
+                    );
+                    continue;
+                }
+            }
+            if let Some(target) = self.details_meta_target_for_idx(idx, &visible_near) {
+                if target.priority >= crate::io_semaphore::IoPriority::Normal {
+                    visible_targets.push(target);
+                } else {
+                    background_targets.push(target);
+                }
+            }
+        }
+
+        visible_targets.extend(background_targets);
+        let targets = visible_targets;
+
+        if total == 0 || targets.is_empty() {
+            self.details_image_dims_state = LazyColumnState::Ready {
+                failed: cached_failed,
+            };
+            if matches!(
+                self.settings.details_sort_key,
+                crate::settings::DetailsSortKey::ImageDimensions
+                    | crate::settings::DetailsSortKey::Created
+                    | crate::settings::DetailsSortKey::VideoDuration
+                    | crate::settings::DetailsSortKey::VideoDimensions
+                    | crate::settings::DetailsSortKey::VideoCodec
+            ) {
+                self.rebuild_details_order();
+            }
+            return;
+        }
+
+        self.details_image_dims_state = LazyColumnState::Loading {
+            done: cached_done,
+            total,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_w = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let cache_dir = crate::catalog::default_cache_dir();
+        let io_sem = self
+            .indexer_manager
+            .as_ref()
+            .map(|mgr| mgr.io_sem())
+            .unwrap_or_else(|| {
+                Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(
+                    self.settings.indexer_speed_profile.io_permits().max(1),
+                ))
+            });
+
+        std::thread::Builder::new()
+            .name("details-meta-load".to_string())
+            .spawn(move || {
+                run_details_meta_load(
+                    generation,
+                    targets,
+                    cached_done,
+                    cached_failed,
+                    total,
+                    cache_dir,
+                    io_sem,
+                    cancel_w,
+                    tx,
+                );
+            })
+            .ok();
+
+        self.details_meta_pending = Some(DetailsMetaPending {
+            visible_revision: self.details_lazy_visible_revision,
+            cancel,
+            rx,
+        });
+        ctx.request_repaint();
+    }
+
+    fn details_lazy_meta_for_idx(&self, idx: usize) -> Option<&DetailsLazyMeta> {
+        let key = self.metadata_cache_key(idx)?;
+        let source = self.image_metas.get(idx).copied().flatten();
+        self.details_lazy_meta
+            .get(&key)
+            .filter(|meta| meta.matches_source(source))
+    }
+
+    fn prune_details_lazy_meta_cache(&mut self) {
+        if self.details_lazy_meta.len() <= DETAILS_LAZY_META_STALE_CAP {
+            return;
+        }
+        let current_keys: std::collections::HashSet<String> = (0..self.items.len())
+            .filter_map(|idx| self.metadata_cache_key(idx))
+            .collect();
+        if current_keys.is_empty() {
+            self.details_lazy_meta.clear();
+            return;
+        }
+        self.details_lazy_meta
+            .retain(|key, _| current_keys.contains(key));
+    }
+
+    fn details_lazy_meta_satisfies_idx(&self, idx: usize, meta: &DetailsLazyMeta) -> bool {
+        if self.settings.details_show_created
+            && self.details_item_supports_created_at(idx)
+            && meta.created_at.is_none()
+            && !meta.created_at_failed
+        {
+            return false;
+        }
+        if self.settings.details_show_image_dimensions
+            && self.details_item_supports_image_dims(idx)
+            && meta.image_dims.is_none()
+            && !meta.image_dims_failed
+        {
+            return false;
+        }
+        if (self.settings.details_show_video_duration
+            || self.settings.details_show_video_dimensions
+            || self.settings.details_show_video_codec)
+            && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+            && meta.video_duration_secs.is_none()
+            && meta.video_dims.is_none()
+            && meta.video_codec.is_none()
+            && !meta.video_meta_failed
+        {
+            return false;
+        }
+        true
+    }
+
+    fn details_item_supports_created_at(&self, idx: usize) -> bool {
+        self.items
+            .get(idx)
+            .and_then(details_created_time_path)
+            .is_some()
+    }
+
+    fn details_item_supports_image_dims(&self, idx: usize) -> bool {
+        matches!(
+            self.items.get(idx),
+            Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. })
+        )
+    }
+
+    fn details_item_requires_lazy_meta(&self, idx: usize) -> bool {
+        (self.settings.details_show_created && self.details_item_supports_created_at(idx))
+            || (self.settings.details_show_image_dimensions
+                && self.details_item_supports_image_dims(idx))
+            || ((self.settings.details_show_video_duration
+                || self.settings.details_show_video_dimensions
+                || self.settings.details_show_video_codec)
+                && matches!(self.items.get(idx), Some(GridItem::Video(_))))
+    }
+
+    fn details_meta_target_for_idx(
+        &self,
+        idx: usize,
+        visible_near: &std::collections::HashSet<usize>,
+    ) -> Option<DetailsMetaTarget> {
+        let item = self.items.get(idx)?.clone();
+        let key = self.metadata_cache_key(idx)?;
+        let (source_mtime, source_size) = self
+            .image_metas
+            .get(idx)
+            .copied()
+            .flatten()
+            .unwrap_or((0, 0));
+        let (catalog_folder, catalog_key) = self.details_catalog_lookup_for_item(&item);
+        let priority = if visible_near.contains(&idx) {
+            crate::io_semaphore::IoPriority::Normal
+        } else {
+            crate::io_semaphore::IoPriority::Low
+        };
+        let load_image_dims = self.settings.details_show_image_dimensions
+            && self.details_item_supports_image_dims(idx);
+        let load_video_meta = (self.settings.details_show_video_duration
+            || self.settings.details_show_video_dimensions
+            || self.settings.details_show_video_codec)
+            && matches!(self.items.get(idx), Some(GridItem::Video(_)));
+        let load_created_at =
+            self.settings.details_show_created && self.details_item_supports_created_at(idx);
+        Some(DetailsMetaTarget {
+            key,
+            item,
+            source_mtime,
+            source_size,
+            catalog_folder,
+            catalog_key,
+            warm_image_dims: self.details_warm_image_dims(idx),
+            load_created_at,
+            load_image_dims,
+            load_video_meta,
+            priority,
+        })
+    }
+
+    fn details_catalog_lookup_for_item(
+        &self,
+        item: &GridItem,
+    ) -> (Option<PathBuf>, Option<String>) {
+        match item {
+            GridItem::Image(path) => {
+                if self.use_full_path_cache_keys() {
+                    (
+                        self.current_folder.clone(),
+                        Some(image_full_path_cache_key(path)),
+                    )
+                } else {
+                    (
+                        path.parent().map(Path::to_path_buf),
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(str::to_string),
+                    )
+                }
+            }
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => (Some(zip_path.clone()), Some(entry_name.clone())),
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => (
+                Some(pdf_path.clone()),
+                Some(crate::grid_item::pdf_page_cache_key(*page_num)),
+            ),
+            _ => (None, None),
+        }
+    }
+
+    fn details_warm_image_dims(&self, idx: usize) -> Option<(u32, u32)> {
+        match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static {
+                source_dims: Some([w, h]),
+                ..
+            }) if *w > 0 && *h > 0 => Some((*w as u32, *h as u32)),
+            _ => None,
+        }
+    }
+
     /// 同名ファイルフィルタを適用する。
     fn apply_duplicate_filters(
         &mut self,
@@ -16305,6 +17363,7 @@ impl App {
     /// ページ単位 (Image / ZipImage / PdfPage) + コンテナ (Folder / ZipFile / PdfFile) の両方。
     /// 動画 / セパレータ / ConvertibleArchive などは常に通す。
     pub(crate) fn rebuild_visible_indices(&mut self) {
+        self.sync_facet_filter_scope();
         let search_filter = self.search_filter.clone();
         // Codex P1-2 fix: effective_rating_filter() で ★一時解除中は [true;6] が返るので
         // 表示は全 ON 相当になる。旧版は settings.rating_filter を書き換えて同じ効果を
@@ -16329,9 +17388,24 @@ impl App {
                     }
                 }
             }
+            if !self.passes_facet_filter(i, None) {
+                continue;
+            }
             result.push(i);
         }
         self.visible_indices = result;
+        self.details_thumb_suppression_applied = false;
+        if self.details_any_lazy_columns_enabled() {
+            self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
+            if self.details_meta_pending.is_none() {
+                self.details_image_dims_state = LazyColumnState::NotRequested;
+            }
+        }
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
+            self.rebuild_details_order();
+        } else {
+            self.details_order.clear();
+        }
         self.cached_nav_indices = None;
         // WYSIWYG 原則: 非表示になったアイテムは checked / selected の対象から外す。
         // これで `handle_grid_keys` の `position().unwrap_or(0)` 起因の
@@ -16341,6 +17415,502 @@ impl App {
             self.checked.retain(|idx| vi.binary_search(idx).is_ok());
         }
         self.ensure_selected_visible_or_first();
+    }
+
+    fn sync_facet_filter_scope(&mut self) {
+        let scope = self.effective_folder();
+        if self.facet_filter_scope == scope {
+            return;
+        }
+        let had_previous_scope = self.facet_filter_scope.is_some();
+        self.facet_filter_scope = scope;
+        if had_previous_scope
+            && (!self.settings.facet_filter.tags.is_empty()
+                || self.settings.facet_filter.include_untagged
+                || !self.settings.facet_filter.exts.is_empty())
+        {
+            self.settings.facet_filter.tags.clear();
+            self.settings.facet_filter.include_untagged = false;
+            self.settings.facet_filter.exts.clear();
+            self.settings.save();
+        }
+    }
+
+    pub(crate) fn facet_candidate_indices(&mut self, ignore: FacetField) -> Vec<usize> {
+        let search_filter = self.search_filter.clone();
+        let rating_filter = self.effective_rating_filter();
+        let rating_filter_active = !self.items_are_drive_list && !rating_filter.iter().all(|&b| b);
+        let mut out = Vec::new();
+        for i in 0..self.items.len() {
+            if let Some(ref f) = search_filter {
+                if !f.contains(&i) {
+                    continue;
+                }
+            }
+            if rating_filter_active {
+                let stars = self.get_rating(i);
+                if let Some(item) = self.items.get(i) {
+                    if !passes_rating_filter(item, stars, &rating_filter) {
+                        continue;
+                    }
+                }
+            }
+            if self.passes_facet_filter(i, Some(ignore)) {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    pub(crate) fn facet_item_kind(&self, idx: usize) -> Option<crate::settings::FacetItemKind> {
+        self.items.get(idx).map(facet_kind_for_item)
+    }
+
+    pub(crate) fn facet_item_ext(&self, idx: usize) -> String {
+        self.items
+            .get(idx)
+            .map(facet_ext_for_item)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn facet_filter_active(&self) -> bool {
+        self.settings.facet_filter.is_active()
+    }
+
+    fn passes_facet_filter(&mut self, idx: usize, ignore: Option<FacetField>) -> bool {
+        use crate::settings::{FacetEditFlag, FacetTagMode};
+
+        if !self.settings.facet_filter.is_active() {
+            return true;
+        }
+        let Some(item) = self.items.get(idx).cloned() else {
+            return false;
+        };
+
+        if ignore != Some(FacetField::Kind)
+            && !self.settings.facet_filter.kinds.is_empty()
+            && !self
+                .settings
+                .facet_filter
+                .kinds
+                .contains(&facet_kind_for_item(&item))
+        {
+            return false;
+        }
+
+        if ignore != Some(FacetField::Ext) && !self.settings.facet_filter.exts.is_empty() {
+            let ext = facet_ext_for_item(&item);
+            if ext.is_empty() || !self.settings.facet_filter.exts.contains(&ext) {
+                return false;
+            }
+        }
+
+        if ignore != Some(FacetField::Tags) {
+            let filter = &self.settings.facet_filter;
+            if !filter.tags.is_empty() || filter.include_untagged {
+                if !facet_item_supports_tags(&item) {
+                    return false;
+                }
+                let tags = self.cell_tag_list(idx);
+                let untagged_match = filter.include_untagged && tags.is_empty();
+                let selected_match =
+                    if filter.tags.is_empty() {
+                        false
+                    } else {
+                        match filter.tag_mode {
+                            FacetTagMode::Any => filter.tags.iter().any(|wanted| {
+                                tags.iter().any(|tag| tag.eq_ignore_ascii_case(wanted))
+                            }),
+                            FacetTagMode::All => filter.tags.iter().all(|wanted| {
+                                tags.iter().any(|tag| tag.eq_ignore_ascii_case(wanted))
+                            }),
+                        }
+                    };
+                if !untagged_match && !selected_match {
+                    return false;
+                }
+            }
+        }
+
+        if ignore != Some(FacetField::Date) {
+            if let Some(preset) = self.settings.facet_filter.date_preset {
+                let Some((mtime, _)) = self.details_meta_value(idx) else {
+                    return false;
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(i64::MAX);
+                if mtime < now.saturating_sub(preset.seconds()) {
+                    return false;
+                }
+            }
+        }
+
+        if ignore != Some(FacetField::Size) {
+            if let Some(preset) = self.settings.facet_filter.size_preset {
+                let Some((_, size)) = self.details_meta_value(idx) else {
+                    return false;
+                };
+                if size <= 0 {
+                    return false;
+                }
+                let size = size as u64;
+                let (min, max) = preset.range_bytes();
+                if size < min || max.is_some_and(|m| size >= m) {
+                    return false;
+                }
+            }
+        }
+
+        let edit_flags =
+            if ignore != Some(FacetField::Edits) && !self.settings.facet_filter.edits.is_empty() {
+                self.settings
+                    .facet_filter
+                    .edits
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+
+        if !edit_flags.is_empty() {
+            let stars = if item.accepts_rating() {
+                self.get_rating(idx)
+            } else {
+                0
+            };
+            for flag in edit_flags {
+                let matched = match flag {
+                    FacetEditFlag::Adjustment => self.adjustment_page_params.contains_key(&idx),
+                    FacetEditFlag::LocalAdjustment => self.local_adjust_pages.contains(&idx),
+                    FacetEditFlag::Mask => self.mask_pages.contains(&idx),
+                    FacetEditFlag::Conceal => self.conceal_pages.contains(&idx),
+                    FacetEditFlag::Annotation => self.comic_pages.contains(&idx),
+                    FacetEditFlag::Rotation => !self.get_rotation(idx).is_none(),
+                    FacetEditFlag::Tagged => {
+                        facet_item_supports_tags(&item) && !self.cell_tag_list(idx).is_empty()
+                    }
+                    FacetEditFlag::Untagged => {
+                        facet_item_supports_tags(&item) && self.cell_tag_list(idx).is_empty()
+                    }
+                    FacetEditFlag::Rated => item.accepts_rating() && stars > 0,
+                    FacetEditFlag::Unrated => item.accepts_rating() && stars == 0,
+                };
+                if !matched {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    pub(crate) fn current_grid_order(&self) -> &[usize] {
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && self.details_order.len() == self.visible_indices.len()
+        {
+            &self.details_order
+        } else {
+            &self.visible_indices
+        }
+    }
+
+    pub(crate) fn set_grid_view_mode(&mut self, mode: crate::settings::GridViewMode) {
+        if self.settings.grid_view_mode == mode {
+            return;
+        }
+        self.settings.grid_view_mode = mode;
+        self.details_thumb_suppression_applied = false;
+        match mode {
+            crate::settings::GridViewMode::Details => {
+                self.rebuild_details_order();
+                if self.details_any_lazy_columns_enabled() {
+                    self.details_image_dims_state = LazyColumnState::NotRequested;
+                }
+            }
+            crate::settings::GridViewMode::Thumbnail => {
+                self.cancel_details_meta_loading();
+                self.details_order.clear();
+                self.details_tag_prewarm_indices.clear();
+            }
+        }
+        self.scroll_to_selected = true;
+        self.settings.save();
+    }
+
+    pub(crate) fn toggle_grid_details_view(&mut self) {
+        let next = if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
+            crate::settings::GridViewMode::Thumbnail
+        } else {
+            crate::settings::GridViewMode::Details
+        };
+        self.set_grid_view_mode(next);
+    }
+
+    pub(crate) fn details_header_sort_active(&self) -> bool {
+        self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && self.settings.details_sort_key != crate::settings::DetailsSortKey::Toolbar
+    }
+
+    pub(crate) fn reset_details_sort_if_hidden(&mut self) {
+        if !self.details_sort_key_visible(self.settings.details_sort_key) {
+            self.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
+            self.settings.details_sort_ascending = true;
+            self.rebuild_details_order();
+        }
+    }
+
+    fn details_sort_key_visible(&self, key: crate::settings::DetailsSortKey) -> bool {
+        use crate::settings::DetailsSortKey;
+        match key {
+            DetailsSortKey::Toolbar | DetailsSortKey::Name => true,
+            DetailsSortKey::Rating => self.settings.details_show_rating,
+            DetailsSortKey::Tags => self.settings.details_show_tags,
+            DetailsSortKey::Kind => self.settings.details_show_kind,
+            DetailsSortKey::Size => self.settings.details_show_size,
+            DetailsSortKey::Modified => self.settings.details_show_modified,
+            DetailsSortKey::Created => self.settings.details_show_created,
+            DetailsSortKey::State => self.settings.details_show_state,
+            DetailsSortKey::ImageDimensions => self.settings.details_show_image_dimensions,
+            DetailsSortKey::VideoDuration => self.settings.details_show_video_duration,
+            DetailsSortKey::VideoDimensions => self.settings.details_show_video_dimensions,
+            DetailsSortKey::VideoCodec => self.settings.details_show_video_codec,
+        }
+    }
+
+    pub(crate) fn set_details_sort_key(&mut self, key: crate::settings::DetailsSortKey) {
+        let lazy_key = matches!(
+            key,
+            crate::settings::DetailsSortKey::Created
+                | crate::settings::DetailsSortKey::ImageDimensions
+                | crate::settings::DetailsSortKey::VideoDuration
+                | crate::settings::DetailsSortKey::VideoDimensions
+                | crate::settings::DetailsSortKey::VideoCodec
+        );
+        if lazy_key && !self.details_lazy_sort_ready() {
+            return;
+        }
+        if self.settings.details_sort_key == key {
+            if self.settings.details_sort_ascending {
+                self.settings.details_sort_ascending = false;
+            } else {
+                self.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
+                self.settings.details_sort_ascending = true;
+            }
+        } else {
+            self.settings.details_sort_key = key;
+            self.settings.details_sort_ascending = true;
+        }
+        self.rebuild_details_order();
+        self.scroll_to_selected = true;
+        self.settings.save();
+    }
+
+    pub(crate) fn rebuild_details_order(&mut self) {
+        let mut key = self.settings.details_sort_key;
+        let mut ascending = self.settings.details_sort_ascending;
+        if !self.details_sort_key_visible(key) {
+            self.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
+            self.settings.details_sort_ascending = true;
+            key = self.settings.details_sort_key;
+            ascending = self.settings.details_sort_ascending;
+        }
+        if key == crate::settings::DetailsSortKey::Toolbar {
+            self.details_order = self.visible_indices.clone();
+            return;
+        }
+        let visible = self.visible_indices.clone();
+        let mut rows: Vec<DetailsSortRow> = visible
+            .into_iter()
+            .map(|idx| self.details_sort_row(idx, key))
+            .collect();
+        rows.sort_by(|a, b| Self::compare_details_sort_rows(a, b, key, ascending));
+        self.details_order = rows.into_iter().map(|row| row.idx).collect();
+    }
+
+    fn details_sort_row(
+        &mut self,
+        idx: usize,
+        key: crate::settings::DetailsSortKey,
+    ) -> DetailsSortRow {
+        use crate::settings::DetailsSortKey;
+        let name = self
+            .items
+            .get(idx)
+            .map(|item| item.name().into_owned())
+            .unwrap_or_default();
+        let primary = match key {
+            DetailsSortKey::Toolbar => DetailsSortPrimary::None,
+            DetailsSortKey::Name => DetailsSortPrimary::None,
+            DetailsSortKey::Rating => DetailsSortPrimary::U8(self.get_rating(idx)),
+            DetailsSortKey::Tags => DetailsSortPrimary::Text(self.cell_tag_list(idx).join(" ")),
+            DetailsSortKey::Kind => DetailsSortPrimary::Text(self.details_kind_sort_key(idx)),
+            DetailsSortKey::Size => {
+                DetailsSortPrimary::I64(self.details_meta_value(idx).map(|(_, size)| size))
+            }
+            DetailsSortKey::Modified => {
+                DetailsSortPrimary::I64(self.details_meta_value(idx).map(|(mtime, _)| mtime))
+            }
+            DetailsSortKey::Created => {
+                DetailsSortPrimary::I64(self.details_created_sort_value(idx))
+            }
+            DetailsSortKey::State => DetailsSortPrimary::U32(self.details_state_bits_for_sort(idx)),
+            DetailsSortKey::ImageDimensions => {
+                DetailsSortPrimary::U64(self.details_image_dims_sort_value(idx))
+            }
+            DetailsSortKey::VideoDuration => {
+                DetailsSortPrimary::U64(self.details_video_duration_sort_value(idx))
+            }
+            DetailsSortKey::VideoDimensions => {
+                DetailsSortPrimary::U64(self.details_video_dims_sort_value(idx))
+            }
+            DetailsSortKey::VideoCodec => DetailsSortPrimary::Text(
+                self.details_video_codec_sort_value(idx).unwrap_or_default(),
+            ),
+        };
+        DetailsSortRow {
+            idx,
+            primary,
+            name_key: natural_sort_key(&name),
+            name_lower: name.to_lowercase(),
+        }
+    }
+
+    fn compare_details_sort_rows(
+        a: &DetailsSortRow,
+        b: &DetailsSortRow,
+        key: crate::settings::DetailsSortKey,
+        ascending: bool,
+    ) -> std::cmp::Ordering {
+        use crate::settings::DetailsSortKey;
+        use std::cmp::Ordering;
+
+        let primary = match key {
+            DetailsSortKey::Toolbar => Ordering::Equal,
+            DetailsSortKey::Name => Self::compare_details_sort_names(a, b),
+            DetailsSortKey::Size | DetailsSortKey::Modified | DetailsSortKey::Created => {
+                let DetailsSortPrimary::I64(av) = &a.primary else {
+                    return Ordering::Equal;
+                };
+                let DetailsSortPrimary::I64(bv) = &b.primary else {
+                    return Ordering::Equal;
+                };
+                cmp_option_last(*av, *bv, ascending)
+            }
+            DetailsSortKey::ImageDimensions
+            | DetailsSortKey::VideoDuration
+            | DetailsSortKey::VideoDimensions => {
+                let DetailsSortPrimary::U64(av) = &a.primary else {
+                    return Ordering::Equal;
+                };
+                let DetailsSortPrimary::U64(bv) = &b.primary else {
+                    return Ordering::Equal;
+                };
+                cmp_option_last(*av, *bv, ascending)
+            }
+            _ => Self::compare_details_sort_primary(&a.primary, &b.primary),
+        };
+
+        let primary = match key {
+            DetailsSortKey::Size
+            | DetailsSortKey::Modified
+            | DetailsSortKey::Created
+            | DetailsSortKey::ImageDimensions
+            | DetailsSortKey::VideoDuration
+            | DetailsSortKey::VideoDimensions => primary,
+            _ if ascending => primary,
+            _ => primary.reverse(),
+        };
+
+        if primary != Ordering::Equal {
+            return primary;
+        }
+        Self::compare_details_sort_names(a, b).then_with(|| a.idx.cmp(&b.idx))
+    }
+
+    fn compare_details_sort_primary(
+        a: &DetailsSortPrimary,
+        b: &DetailsSortPrimary,
+    ) -> std::cmp::Ordering {
+        match (a, b) {
+            (DetailsSortPrimary::Text(a), DetailsSortPrimary::Text(b)) => a.cmp(b),
+            (DetailsSortPrimary::U8(a), DetailsSortPrimary::U8(b)) => a.cmp(b),
+            (DetailsSortPrimary::U32(a), DetailsSortPrimary::U32(b)) => a.cmp(b),
+            (DetailsSortPrimary::U64(a), DetailsSortPrimary::U64(b)) => a.cmp(b),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
+    fn compare_details_sort_names(a: &DetailsSortRow, b: &DetailsSortRow) -> std::cmp::Ordering {
+        a.name_key
+            .cmp(&b.name_key)
+            .then_with(|| a.name_lower.cmp(&b.name_lower))
+    }
+
+    fn details_meta_value(&self, idx: usize) -> Option<(i64, i64)> {
+        self.image_metas
+            .get(idx)
+            .copied()
+            .flatten()
+            .filter(|(mtime, size)| *mtime > 0 || *size > 0)
+    }
+
+    fn details_kind_sort_key(&self, idx: usize) -> String {
+        let Some(item) = self.items.get(idx) else {
+            return String::new();
+        };
+        match item {
+            GridItem::Folder(_) => "0-folder".to_string(),
+            GridItem::Image(p) => format!("1-image-{}", path_extension_lower(p)),
+            GridItem::Video(p) => format!("2-video-{}", path_extension_lower(p)),
+            GridItem::ZipFile(p) => format!("3-zip-{}", path_extension_lower(p)),
+            GridItem::PdfFile(p) => format!("4-pdf-{}", path_extension_lower(p)),
+            GridItem::ConvertibleArchive { format, .. } => format!("5-{}", format.label()),
+            GridItem::ZipImage { .. } => "6-zip-image".to_string(),
+            GridItem::PdfPage { .. } => "7-pdf-page".to_string(),
+            GridItem::ZipSeparator { .. } => "8-separator".to_string(),
+            GridItem::SearchContainer { kind, .. } => match kind {
+                crate::grid_item::SearchContainerKind::Folder => "9-search-folder".to_string(),
+                crate::grid_item::SearchContainerKind::Zip => "9-search-zip".to_string(),
+            },
+        }
+    }
+
+    fn details_state_bits(&self, idx: usize) -> u32 {
+        let mut bits = 0u32;
+        if self.adjustment_page_params.contains_key(&idx) {
+            bits |= 1 << 0;
+        }
+        if self.local_adjust_pages.contains(&idx) {
+            bits |= 1 << 1;
+        }
+        if self.mask_pages.contains(&idx) {
+            bits |= 1 << 2;
+        }
+        if self.conceal_pages.contains(&idx) {
+            bits |= 1 << 3;
+        }
+        if self.comic_pages.contains(&idx) {
+            bits |= 1 << 4;
+        }
+        if self
+            .rotation_cache
+            .get(&idx)
+            .is_some_and(|rot| !rot.is_none())
+        {
+            bits |= 1 << 5;
+        }
+        bits
+    }
+
+    fn details_state_bits_for_sort(&mut self, idx: usize) -> u32 {
+        let mut bits = self.details_state_bits(idx);
+        if !self.get_rotation(idx).is_none() {
+            bits |= 1 << 5;
+        }
+        bits
     }
 
     /// `visible_indices` に含まれる (= フィルタ後の一覧に出ている) かを返す。
@@ -17251,12 +18821,10 @@ impl App {
 
     /// グリッドのタグバッジ表示用キャッシュを埋める。フォルダ切替時に 1 回呼ぶ。
     ///
-    /// 1. **fts_meta.db から一括取得** (同期・高速): `auto_index_metadata=true` な
-    ///    お気に入り配下のファイルは、SQLite `IN (...)` 1 回ですべて引ける。
-    ///    非可視分も含めて一気に cache に載せる (HDD アクセスなし、DB は 1 クエリ)。
-    /// 2. **残りの path の XMP 直読みは `enqueue_visible_tag_prewarms` に任せる**:
-    ///    ここでは空キューの worker だけ用意しておき、以降のフレームで `keep_range`
-    ///    分を逐次 push する。大規模フォルダで全 XMP をフォルダ開時に読む暴走を防ぐ。
+    /// INDEX_VERSION=5 以降、fts_meta.db からのタグ一括取得は廃止し、XMP 直読みを
+    /// `enqueue_visible_tag_prewarms` に任せる。ここでは空キューの worker だけ用意しておき、
+    /// 以降のフレームで画面付近の idx を逐次 push する。大規模フォルダで全 XMP を
+    /// フォルダ開時に読む暴走を防ぐ。
     ///
     /// **重要**: `tags_cache` は `ui_metadata_panel::get_current_tags_cached` とも共有で、
     /// 値が `Some(Vec)` ならキャッシュヒットとして扱われ XMP 直読みをスキップする。
@@ -17276,8 +18844,12 @@ impl App {
         self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
     }
 
-    /// 毎フレーム呼ぶ: 現在の `keep_set` (可視範囲 + prev/next ページの display list 部分列) に
-    /// 含まれる Image アイテムのうち、`tags_cache` にまだ無いものを `tag_prewarm` worker に push する。
+    /// 毎フレーム呼ぶ: 現在の画面付近にある Image/Video のうち、`tags_cache` にまだ無いものを
+    /// `tag_prewarm` worker に push する。
+    ///
+    /// サムネモードは `keep_set` (可視範囲 + prev/next ページの display list 部分列) を使う。
+    /// 詳細モードはサムネ要求抑制のため `keep_set` が空なので、`render_details_list` が
+    /// 記録した詳細行の可視近傍を使う。
     /// `tag_prewarm_queued` (idx セット) で二重 push を防ぐので、毎フレームの走査は
     /// ~175 件 × HashSet lookup で十分軽い (過去は keep_range bounding box 比較で
     /// アイドルフレームを早期終了していたが、フィルタ変更で bbox 不変 × 内部構成変化 の
@@ -17291,10 +18863,23 @@ impl App {
         let Some(pending) = self.tag_prewarm_pending.as_ref() else {
             return;
         };
-        if self.keep_set.is_empty() {
-            return;
-        }
-        for idx in self.keep_set_sorted() {
+        let targets = if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
+            if self.details_tag_prewarm_indices.is_empty() {
+                self.current_grid_order()
+                    .iter()
+                    .copied()
+                    .take(128)
+                    .collect::<Vec<_>>()
+            } else {
+                self.details_tag_prewarm_indices.clone()
+            }
+        } else {
+            if self.keep_set.is_empty() {
+                return;
+            }
+            self.keep_set_sorted()
+        };
+        for idx in targets {
             if idx >= self.items.len() {
                 continue;
             }
@@ -17340,6 +18925,7 @@ impl App {
         };
         // このフレームで届いた分だけ drain (or_insert 挙動は stale XMP 防御)。
         let mut rating_hydrations: Vec<(PathBuf, u8)> = Vec::new();
+        let mut tags_inserted = false;
         loop {
             match pending.rx.try_recv() {
                 Ok(res) => {
@@ -17350,7 +18936,12 @@ impl App {
                             rating_hydrations.push((res.path.clone(), stars));
                         }
                     }
-                    self.tags_cache.entry(res.cache_key).or_insert(res.tags);
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        self.tags_cache.entry(res.cache_key)
+                    {
+                        entry.insert(res.tags);
+                        tags_inserted = true;
+                    }
                     pending.on_result_drained();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -17365,6 +18956,15 @@ impl App {
         // 期待するのは DB が 0 = 未登録のときだけ)。
         if !rating_hydrations.is_empty() {
             self.hydrate_ratings_from_xmp(rating_hydrations);
+        }
+        if tags_inserted {
+            if self.settings.facet_filter.uses_tag_state() {
+                self.rebuild_visible_indices();
+            } else if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+                && self.settings.details_sort_key == crate::settings::DetailsSortKey::Tags
+            {
+                self.rebuild_details_order();
+            }
         }
     }
 
@@ -27604,6 +29204,7 @@ impl eframe::App for App {
         self.poll_search();
         self.poll_favsearch();
         self.poll_metadata_load();
+        self.poll_details_meta_load(ctx);
         // 360 度パノラマビュー Phase 2a (docs/panorama-360-view-plan.md §4.6.3):
         // 1. NeedsUserConfirmation → SettleApproved 経路の追加 worker 結果取り込み
         // 2. settle 静止検出 + render spawn + 結果ポーリング
@@ -27654,6 +29255,7 @@ impl eframe::App for App {
         if self.search_pending.is_some()
             || self.favsearch_pending.is_some()
             || self.metadata_pending.is_some()
+            || self.details_meta_pending.is_some()
             || !self.local_adjust_pending.is_empty()
             || self.local_adjust_layer_bypass_pending.is_some()
             || self.local_adjust_prefix_preview_pending.is_some()
@@ -28208,13 +29810,19 @@ impl eframe::App for App {
             }
         }
 
-        // ── Alt+1〜0: 列数切り替え ──────────────────────────────────
+        // ── Alt+1〜0: 列数切り替え / Alt+-: 詳細表示切り替え ─────────
         if !self.address_has_focus
             && !self.search_has_focus
             && !self.favsearch.has_focus
             && self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
         {
+            if self
+                .keymap
+                .pressed_action(ctx, KeyAction::GridToggleDetailsView)
+            {
+                self.toggle_grid_details_view();
+            }
             let alt_col = [
                 (KeyAction::GridColumnCount1, 1),
                 (KeyAction::GridColumnCount2, 2),
@@ -28231,6 +29839,7 @@ impl eframe::App for App {
             .find(|(action, _)| self.keymap.pressed_action(ctx, *action))
             .map(|(_, cols)| cols);
             if let Some(cols) = alt_col {
+                self.set_grid_view_mode(crate::settings::GridViewMode::Thumbnail);
                 if cols != self.settings.grid_cols {
                     self.settings.grid_cols = cols;
                     self.settings.save();
@@ -28247,6 +29856,10 @@ impl eframe::App for App {
 
         // ── Ctrl+G グローバルメタ検索バー (docs §10.3) ────────────────
         self.render_global_search_bar(ctx);
+
+        // ── スマートフィルタバー (サムネ/詳細共通) ───────────────────
+        self.render_facet_filter_bar(ctx);
+        self.render_details_lazy_status_bar(ctx);
 
         // ── サムネイルグリッド ────────────────────────────────────────
         let t_pre_grid = frame_t0.elapsed();

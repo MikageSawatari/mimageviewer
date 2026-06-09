@@ -3,13 +3,18 @@
 //! `App::update()` から呼ばれるメニューバー・ツールバー・フォルダバー・
 //! グリッド・進捗オーバーレイ・選択情報オーバーレイの描画メソッドを集約。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use eframe::egui;
 
-use crate::app::App;
+use crate::app::{App, FacetField, LazyColumnState};
 use crate::grid_item::{GridItem, ThumbnailState};
+use crate::settings::{
+    DetailsSortKey, FacetDatePreset, FacetEditFlag, FacetItemKind, FacetSizePreset, FacetTagMode,
+    GridViewMode,
+};
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
 
@@ -225,6 +230,18 @@ fn thumbnail_count_label(items: &[GridItem], visible_indices: &[usize]) -> Strin
     format!("({:>width$}/{})", visible, total, width = width)
 }
 
+fn facet_menu_label(base: &str, active: usize) -> String {
+    if active == 0 {
+        base.to_string()
+    } else {
+        format!("{base} ({active})")
+    }
+}
+
+fn facet_chip(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.label(egui::RichText::new(text.into()).small().strong());
+}
+
 /// ★フィルタのボタン 1 個を描画し、状態が変わったら true を返す。
 /// `enabled = false` の間はクリックを無視し、見た目も disabled スタイルで描画する。
 ///
@@ -407,6 +424,266 @@ fn switch_menubar_popup_on_hover(ctx: &egui::Context, responses: &[egui::Respons
             egui::Popup::default_response_id(&responses[target_index]),
         );
         ctx.request_repaint();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum DetailsColumn {
+    Name,
+    Rating,
+    Tags,
+    Kind,
+    Size,
+    Modified,
+    Created,
+    State,
+    ImageDimensions,
+    VideoDuration,
+    VideoDimensions,
+    VideoCodec,
+}
+
+impl DetailsColumn {
+    fn all() -> &'static [Self] {
+        &[
+            Self::Name,
+            Self::Rating,
+            Self::Tags,
+            Self::Kind,
+            Self::Size,
+            Self::Modified,
+            Self::Created,
+            Self::State,
+            Self::ImageDimensions,
+            Self::VideoDuration,
+            Self::VideoDimensions,
+            Self::VideoCodec,
+        ]
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Name => "名前",
+            Self::Rating => "★",
+            Self::Tags => "タグ",
+            Self::Kind => "種類",
+            Self::Size => "サイズ",
+            Self::Modified => "更新日時",
+            Self::Created => "作成日時",
+            Self::State => "状態",
+            Self::ImageDimensions => "解像度",
+            Self::VideoDuration => "動画長さ",
+            Self::VideoDimensions => "動画解像度",
+            Self::VideoCodec => "コーデック",
+        }
+    }
+
+    fn sort_key(self) -> DetailsSortKey {
+        match self {
+            Self::Name => DetailsSortKey::Name,
+            Self::Rating => DetailsSortKey::Rating,
+            Self::Tags => DetailsSortKey::Tags,
+            Self::Kind => DetailsSortKey::Kind,
+            Self::Size => DetailsSortKey::Size,
+            Self::Modified => DetailsSortKey::Modified,
+            Self::Created => DetailsSortKey::Created,
+            Self::State => DetailsSortKey::State,
+            Self::ImageDimensions => DetailsSortKey::ImageDimensions,
+            Self::VideoDuration => DetailsSortKey::VideoDuration,
+            Self::VideoDimensions => DetailsSortKey::VideoDimensions,
+            Self::VideoCodec => DetailsSortKey::VideoCodec,
+        }
+    }
+
+    fn is_lazy(self) -> bool {
+        matches!(
+            self,
+            Self::Created
+                | Self::ImageDimensions
+                | Self::VideoDuration
+                | Self::VideoDimensions
+                | Self::VideoCodec
+        )
+    }
+
+    fn visible(self, settings: &crate::settings::Settings) -> bool {
+        match self {
+            Self::Name => true,
+            Self::Rating => settings.details_show_rating,
+            Self::Tags => settings.details_show_tags,
+            Self::Kind => settings.details_show_kind,
+            Self::Size => settings.details_show_size,
+            Self::Modified => settings.details_show_modified,
+            Self::Created => settings.details_show_created,
+            Self::State => settings.details_show_state,
+            Self::ImageDimensions => settings.details_show_image_dimensions,
+            Self::VideoDuration => settings.details_show_video_duration,
+            Self::VideoDimensions => settings.details_show_video_dimensions,
+            Self::VideoCodec => settings.details_show_video_codec,
+        }
+    }
+
+    fn default_width(self) -> f32 {
+        match self {
+            Self::Name => 140.0,
+            Self::Rating => 58.0,
+            Self::Tags => 160.0,
+            Self::Kind => 96.0,
+            Self::Size => 92.0,
+            Self::Modified | Self::Created => 138.0,
+            Self::State => 92.0,
+            Self::ImageDimensions => 108.0,
+            Self::VideoDuration => 94.0,
+            Self::VideoDimensions => 112.0,
+            Self::VideoCodec => 112.0,
+        }
+    }
+}
+
+fn details_column_rects(
+    rect: egui::Rect,
+    settings: &crate::settings::Settings,
+) -> Vec<(DetailsColumn, egui::Rect)> {
+    let mut non_name = DetailsColumn::all()
+        .iter()
+        .copied()
+        .filter(|col| *col != DetailsColumn::Name && col.visible(settings))
+        .map(|col| (col, col.default_width()))
+        .collect::<Vec<_>>();
+    let name_min = DetailsColumn::Name.default_width();
+    let fixed: f32 = non_name.iter().map(|(_, width)| *width).sum();
+    if fixed > 0.0 && rect.width() < name_min + fixed {
+        let scale = ((rect.width() - name_min).max(0.0) / fixed).clamp(0.55, 1.0);
+        for (_, width) in &mut non_name {
+            *width *= scale;
+        }
+    }
+    let fixed: f32 = non_name.iter().map(|(_, width)| *width).sum();
+    let name = (rect.width() - fixed).max(96.0);
+    let mut specs = Vec::with_capacity(non_name.len() + 1);
+    specs.push((DetailsColumn::Name, name));
+    specs.extend(non_name);
+
+    let mut x = rect.left();
+    let mut out = Vec::with_capacity(specs.len());
+    for (pos, (col, width)) in specs.iter().copied().enumerate() {
+        let right = if pos + 1 == specs.len() {
+            rect.right()
+        } else {
+            (x + width).min(rect.right())
+        };
+        out.push((
+            col,
+            egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(right, rect.bottom())),
+        ));
+        x = right;
+    }
+    out
+}
+
+fn draw_details_text(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    text: &str,
+    align: egui::Align2,
+    color: egui::Color32,
+    strong: bool,
+) {
+    if text.is_empty() || rect.width() <= 4.0 {
+        return;
+    }
+    let clip = rect.shrink2(egui::vec2(6.0, 1.0));
+    if clip.width() <= 1.0 {
+        return;
+    }
+    let x = if matches!(
+        align,
+        egui::Align2::RIGHT_TOP | egui::Align2::RIGHT_CENTER | egui::Align2::RIGHT_BOTTOM
+    ) {
+        clip.right()
+    } else {
+        clip.left()
+    };
+    let font = if strong {
+        egui::TextStyle::Button.resolve(ui.style())
+    } else {
+        egui::TextStyle::Body.resolve(ui.style())
+    };
+    ui.painter().with_clip_rect(clip).text(
+        egui::pos2(x, clip.center().y),
+        align,
+        text,
+        font,
+        color,
+    );
+}
+
+fn details_kind_label(item: &GridItem) -> String {
+    match item {
+        GridItem::Folder(_) => "フォルダ".to_string(),
+        GridItem::Image(path) => details_ext_kind(path, "画像"),
+        GridItem::Video(path) => details_ext_kind(path, "動画"),
+        GridItem::ZipFile(path) => details_ext_kind(path, "ZIP"),
+        GridItem::PdfFile(path) => details_ext_kind(path, "PDF"),
+        GridItem::ConvertibleArchive { format, .. } => format.label().to_string(),
+        GridItem::ZipImage { .. } => "ZIP 内画像".to_string(),
+        GridItem::ZipSeparator { .. } => "見出し".to_string(),
+        GridItem::PdfPage { .. } => "PDF ページ".to_string(),
+        GridItem::SearchContainer { kind, .. } => match kind {
+            crate::grid_item::SearchContainerKind::Folder => "検索フォルダ".to_string(),
+            crate::grid_item::SearchContainerKind::Zip => "検索ZIP".to_string(),
+        },
+    }
+}
+
+fn details_ext_kind(path: &Path, fallback: &str) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty())
+        .map(|e| format!("{} {}", e.to_ascii_uppercase(), fallback))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+#[cfg(windows)]
+fn format_details_mtime(secs: i64) -> String {
+    if secs <= 0 {
+        return String::new();
+    }
+    const WINDOWS_TICKS_PER_SEC: i128 = 10_000_000;
+    const UNIX_TO_WINDOWS_SECS: i128 = 11_644_473_600;
+    let ticks = (secs as i128 + UNIX_TO_WINDOWS_SECS) * WINDOWS_TICKS_PER_SEC;
+    if ticks <= 0 || ticks > u64::MAX as i128 {
+        return String::new();
+    }
+
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+    use windows::Win32::System::Time::FileTimeToSystemTime;
+
+    let ticks = ticks as u64;
+    let filetime = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut local_filetime = FILETIME::default();
+    let mut st = SYSTEMTIME::default();
+    if unsafe { FileTimeToLocalFileTime(&filetime, &mut local_filetime) }.is_err()
+        || unsafe { FileTimeToSystemTime(&local_filetime, &mut st) }.is_err()
+    {
+        return String::new();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
+    )
+}
+
+#[cfg(not(windows))]
+fn format_details_mtime(secs: i64) -> String {
+    if secs <= 0 {
+        String::new()
+    } else {
+        secs.to_string()
     }
 }
 
@@ -945,11 +1222,13 @@ impl App {
         let tb_cols = self.settings.toolbar_cols_items.clone();
         let tb_aspects = self.settings.toolbar_aspect_items.clone();
         let tb_sorts = self.settings.toolbar_sort_items.clone();
+        let details_mode = self.settings.grid_view_mode == GridViewMode::Details;
         let show_cols = !tb_cols.is_empty();
         // 比率セクション: 手動 7 種を全部外しても「自動」だけ ON なら表示する
         // (Codex P3 2026-05)。`toolbar_aspect_auto_visible` は別フラグなので
         // tb_aspects 空 + auto_visible で section が消える事故を防ぐ。
-        let show_aspect = self.settings.toolbar_aspect_auto_visible || !tb_aspects.is_empty();
+        let show_aspect =
+            !details_mode && (self.settings.toolbar_aspect_auto_visible || !tb_aspects.is_empty());
         let show_sort = !tb_sorts.is_empty();
         let show_favs = self.settings.show_toolbar_favorites;
         let show_rating = self.settings.show_toolbar_rating;
@@ -1040,15 +1319,27 @@ impl App {
                     match self.settings.toolbar_cols_display {
                         crate::settings::ToolbarSectionDisplay::Buttons => {
                             for &cols in &tb_cols {
-                                let selected = self.settings.grid_cols == cols;
+                                let selected = !details_mode && self.settings.grid_cols == cols;
                                 if ui.selectable_label(selected, format!(" {cols} ")).clicked() {
+                                    self.set_grid_view_mode(GridViewMode::Thumbnail);
                                     self.settings.grid_cols = cols;
                                     self.settings.save();
                                 }
                             }
+                            if ui
+                                .selectable_label(details_mode, " 詳細 ")
+                                .on_hover_text("サムネイルなしの詳細一覧に切り替えます (Alt+-)")
+                                .clicked()
+                            {
+                                self.set_grid_view_mode(GridViewMode::Details);
+                            }
                         }
                         crate::settings::ToolbarSectionDisplay::Dropdown => {
-                            let current_text = format!("{} 列", self.settings.grid_cols);
+                            let current_text = if details_mode {
+                                "詳細".to_string()
+                            } else {
+                                format!("{} 列", self.settings.grid_cols)
+                            };
                             egui::ComboBox::from_id_salt("toolbar_cols_combo")
                                 .width(64.0)
                                 .selected_text(current_text)
@@ -1057,15 +1348,19 @@ impl App {
                                     for &cols in &tb_cols {
                                         if ui
                                             .selectable_label(
-                                                self.settings.grid_cols == cols,
+                                                !details_mode && self.settings.grid_cols == cols,
                                                 format!("{cols} 列"),
                                             )
                                             .clicked()
-                                            && self.settings.grid_cols != cols
                                         {
+                                            self.set_grid_view_mode(GridViewMode::Thumbnail);
                                             self.settings.grid_cols = cols;
                                             self.settings.save();
                                         }
+                                    }
+                                    ui.separator();
+                                    if ui.selectable_label(details_mode, "詳細").clicked() {
+                                        self.set_grid_view_mode(GridViewMode::Details);
                                     }
                                 });
                         }
@@ -1164,42 +1459,53 @@ impl App {
                     if !first_section {
                         ui.separator();
                     }
-                    toolbar_label(ui, "ソート:", 54.0);
-                    match self.settings.toolbar_sort_display {
-                        crate::settings::ToolbarSectionDisplay::Buttons => {
-                            for &order in &tb_sorts {
-                                let selected = self.settings.sort_order == order;
-                                if ui.selectable_label(selected, order.short_label()).clicked()
-                                    && !selected
-                                {
-                                    self.settings.sort_order = order;
-                                    self.settings.save();
-                                    toolbar_sort_changed = true;
+                    let sort_disabled = self.details_header_sort_active();
+                    let sort_label = toolbar_label(ui, "ソート:", 54.0);
+                    if sort_disabled {
+                        sort_label.hover_tip(
+                            "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。",
+                        );
+                    }
+                    ui.add_enabled_ui(!sort_disabled, |ui| {
+                        match self.settings.toolbar_sort_display {
+                            crate::settings::ToolbarSectionDisplay::Buttons => {
+                                for &order in &tb_sorts {
+                                    let selected = self.settings.sort_order == order;
+                                    if ui
+                                        .selectable_label(selected, order.short_label())
+                                        .clicked()
+                                        && !selected
+                                    {
+                                        self.settings.sort_order = order;
+                                        self.settings.save();
+                                        toolbar_sort_changed = true;
+                                    }
                                 }
                             }
-                        }
-                        crate::settings::ToolbarSectionDisplay::Dropdown => {
-                            let current_text = self.settings.sort_order.short_label().to_string();
-                            egui::ComboBox::from_id_salt("toolbar_sort_combo")
-                                .width(100.0)
-                                .selected_text(current_text)
-                                .show_ui(ui, |ui| {
-                                    apply_toolbar_style(ui);
-                                    for &order in &tb_sorts {
-                                        let selected = self.settings.sort_order == order;
-                                        if ui
-                                            .selectable_label(selected, order.short_label())
-                                            .clicked()
-                                            && !selected
-                                        {
-                                            self.settings.sort_order = order;
-                                            self.settings.save();
-                                            toolbar_sort_changed = true;
+                            crate::settings::ToolbarSectionDisplay::Dropdown => {
+                                let current_text =
+                                    self.settings.sort_order.short_label().to_string();
+                                egui::ComboBox::from_id_salt("toolbar_sort_combo")
+                                    .width(100.0)
+                                    .selected_text(current_text)
+                                    .show_ui(ui, |ui| {
+                                        apply_toolbar_style(ui);
+                                        for &order in &tb_sorts {
+                                            let selected = self.settings.sort_order == order;
+                                            if ui
+                                                .selectable_label(selected, order.short_label())
+                                                .clicked()
+                                                && !selected
+                                            {
+                                                self.settings.sort_order = order;
+                                                self.settings.save();
+                                                toolbar_sort_changed = true;
+                                            }
                                         }
-                                    }
-                                });
+                                    });
+                            }
                         }
-                    }
+                    });
                     first_section = false;
                 }
                 if show_rating {
@@ -1380,6 +1686,456 @@ impl App {
         // (旧) VST3 プラグイン管理ボタンの click handler はツールバーボタン削除に伴い撤去。
 
         toolbar_fav_nav
+    }
+
+    // ── スマートフィルタバー ────────────────────────────────────────
+
+    pub(crate) fn render_facet_filter_bar(&mut self, ctx: &egui::Context) {
+        if self.items.is_empty() || self.items_are_drive_list {
+            return;
+        }
+
+        let mut facet_changed = false;
+        let mut rating_changed = false;
+        egui::TopBottomPanel::top("facet_filter_bar").show(ctx, |ui| {
+            ui.add_space(1.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("絞り込み:").small());
+                facet_changed |= self.draw_facet_kind_menu(ui);
+                facet_changed |= self.draw_facet_ext_menu(ui);
+                rating_changed |= self.draw_facet_rating_menu(ui);
+                facet_changed |= self.draw_facet_tag_menu(ui);
+                facet_changed |= self.draw_facet_date_menu(ui);
+                facet_changed |= self.draw_facet_size_menu(ui);
+                facet_changed |= self.draw_facet_edit_menu(ui);
+
+                if self.facet_filter_active() || self.rating_filter_active() {
+                    ui.separator();
+                    self.draw_facet_active_chips(ui);
+                    if ui.small_button("全解除").clicked() {
+                        if self.facet_filter_active() {
+                            self.settings.facet_filter.clear();
+                            facet_changed = true;
+                        }
+                        if self.rating_filter_active() {
+                            self.settings.rating_filter = crate::settings::default_rating_filter();
+                            rating_changed = true;
+                        }
+                    }
+                }
+                ui.separator();
+                ui.label(egui::RichText::new(format!("{} 件", self.visible_indices.len())).small());
+            });
+            ui.add_space(1.0);
+        });
+
+        if rating_changed {
+            self.drop_rating_filter_suppression_on_user_edit();
+        }
+        if facet_changed || rating_changed {
+            self.settings.save();
+            if rating_changed && self.global_search.active && self.items_are_global_search_view {
+                self.rebuild_items_from_global_search();
+            } else {
+                self.rebuild_visible_indices();
+            }
+        }
+    }
+
+    pub(crate) fn render_details_lazy_status_bar(&mut self, ctx: &egui::Context) {
+        if self.settings.grid_view_mode != GridViewMode::Details
+            || !(self.settings.details_show_created
+                || self.settings.details_show_image_dimensions
+                || self.settings.details_show_video_duration
+                || self.settings.details_show_video_dimensions
+                || self.settings.details_show_video_codec)
+            || self.items.is_empty()
+        {
+            return;
+        }
+
+        let show = match self.details_image_dims_state {
+            LazyColumnState::Loading { .. }
+            | LazyColumnState::NotRequested
+            | LazyColumnState::Cancelled => true,
+            LazyColumnState::Ready { failed } => failed > 0,
+            LazyColumnState::Disabled => false,
+        };
+        if !show {
+            return;
+        }
+
+        egui::TopBottomPanel::top("details_lazy_status_bar")
+            .exact_height(25.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    match self.details_image_dims_state {
+                        LazyColumnState::NotRequested => {
+                            ui.label("詳細情報を読み込み準備中");
+                        }
+                        LazyColumnState::Loading { done, total } => {
+                            ui.label(format!(
+                                "詳細情報を読み込み中 {}/{}   遅延列 {}/{}",
+                                done, total, done, total
+                            ));
+                            if ui.small_button("停止").clicked() {
+                                self.cancel_details_meta_loading();
+                            }
+                        }
+                        LazyColumnState::Cancelled => {
+                            ui.label("詳細情報の読み込みを停止中");
+                            if ui.small_button("再開").clicked() {
+                                self.resume_details_meta_loading();
+                                ctx.request_repaint();
+                            }
+                        }
+                        LazyColumnState::Ready { failed } => {
+                            if failed > 0 {
+                                facet_chip(ui, format!("詳細情報: {failed}件取得失敗"));
+                            }
+                        }
+                        LazyColumnState::Disabled => {}
+                    }
+                });
+            });
+    }
+
+    fn draw_facet_kind_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        let label = facet_menu_label("種類", self.settings.facet_filter.kinds.len());
+        ui.menu_button(label, |ui| {
+            let mut counts = self.facet_kind_counts();
+            for kind in &self.settings.facet_filter.kinds {
+                counts.entry(*kind).or_insert(0);
+            }
+            if self.settings.facet_filter.kinds.is_empty() {
+                ui.label("すべて");
+            } else if ui.small_button("種類フィルタを解除").clicked() {
+                self.settings.facet_filter.kinds.clear();
+                changed = true;
+                ui.close();
+            }
+            ui.separator();
+            if counts.is_empty() {
+                ui.label("候補なし");
+            }
+            for (kind, count) in counts {
+                let mut selected = self.settings.facet_filter.kinds.contains(&kind);
+                let text = format!("{} ({count})", kind.label());
+                if ui.checkbox(&mut selected, text).changed() {
+                    if selected {
+                        self.settings.facet_filter.kinds.insert(kind);
+                    } else {
+                        self.settings.facet_filter.kinds.remove(&kind);
+                    }
+                    changed = true;
+                }
+            }
+        });
+        changed
+    }
+
+    fn draw_facet_ext_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        let label = facet_menu_label("拡張子", self.settings.facet_filter.exts.len());
+        ui.menu_button(label, |ui| {
+            let mut counts = self.facet_ext_counts();
+            for ext in &self.settings.facet_filter.exts {
+                counts.entry(ext.clone()).or_insert(0);
+            }
+            if self.settings.facet_filter.exts.is_empty() {
+                ui.label("すべて");
+            } else if ui.small_button("拡張子フィルタを解除").clicked() {
+                self.settings.facet_filter.exts.clear();
+                changed = true;
+                ui.close();
+            }
+            ui.separator();
+            if counts.is_empty() {
+                ui.label("候補なし");
+            }
+            for (ext, count) in counts {
+                let mut selected = self.settings.facet_filter.exts.contains(&ext);
+                let text = format!(".{} ({count})", ext);
+                if ui.checkbox(&mut selected, text).changed() {
+                    if selected {
+                        self.settings.facet_filter.exts.insert(ext);
+                    } else {
+                        self.settings.facet_filter.exts.remove(&ext);
+                    }
+                    changed = true;
+                }
+            }
+        });
+        changed
+    }
+
+    fn draw_facet_rating_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let active = if self.rating_filter_active() { 1 } else { 0 };
+        let mut changed = false;
+        ui.menu_button(facet_menu_label("★", active), |ui| {
+            if ui.small_button("すべて表示").clicked() {
+                self.settings.rating_filter = crate::settings::default_rating_filter();
+                changed = true;
+                ui.close();
+            }
+            ui.separator();
+            for idx in 0..6 {
+                let mut selected = self.settings.rating_filter[idx];
+                if ui
+                    .checkbox(&mut selected, rating_button_label(idx))
+                    .on_hover_text(rating_tooltip(idx))
+                    .changed()
+                {
+                    self.settings.rating_filter[idx] = selected;
+                    changed = true;
+                }
+            }
+        });
+        changed
+    }
+
+    fn draw_facet_tag_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let active = self.settings.facet_filter.tags.len()
+            + usize::from(self.settings.facet_filter.include_untagged);
+        let mut changed = false;
+        ui.menu_button(facet_menu_label("タグ", active), |ui| {
+            let (mut counts, untagged_count) = self.facet_tag_counts();
+            for tag in &self.settings.facet_filter.tags {
+                counts.entry(tag.clone()).or_insert(0);
+            }
+            ui.horizontal(|ui| {
+                ui.label("一致:");
+                let mut mode = self.settings.facet_filter.tag_mode;
+                if ui
+                    .selectable_value(&mut mode, FacetTagMode::Any, FacetTagMode::Any.label())
+                    .changed()
+                {
+                    self.settings.facet_filter.tag_mode = mode;
+                    changed = true;
+                }
+                if ui
+                    .selectable_value(&mut mode, FacetTagMode::All, FacetTagMode::All.label())
+                    .changed()
+                {
+                    self.settings.facet_filter.tag_mode = mode;
+                    changed = true;
+                }
+            });
+            if self.settings.facet_filter.tags.is_empty()
+                && !self.settings.facet_filter.include_untagged
+            {
+                ui.label("すべて");
+            } else if ui.small_button("タグフィルタを解除").clicked() {
+                self.settings.facet_filter.tags.clear();
+                self.settings.facet_filter.include_untagged = false;
+                changed = true;
+                ui.close();
+            }
+            ui.separator();
+            let mut include_untagged = self.settings.facet_filter.include_untagged;
+            if ui
+                .checkbox(
+                    &mut include_untagged,
+                    format!("タグなし ({untagged_count})"),
+                )
+                .changed()
+            {
+                self.settings.facet_filter.include_untagged = include_untagged;
+                changed = true;
+            }
+            if counts.is_empty() {
+                ui.label("タグ候補なし");
+            }
+            for (tag, count) in counts {
+                let mut selected = self.settings.facet_filter.tags.contains(&tag);
+                let text = format!("{tag} ({count})");
+                if ui.checkbox(&mut selected, text).changed() {
+                    if selected {
+                        self.settings.facet_filter.tags.insert(tag);
+                    } else {
+                        self.settings.facet_filter.tags.remove(&tag);
+                    }
+                    changed = true;
+                }
+            }
+        });
+        changed
+    }
+
+    fn draw_facet_date_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let active = usize::from(self.settings.facet_filter.date_preset.is_some());
+        let mut changed = false;
+        ui.menu_button(facet_menu_label("日付", active), |ui| {
+            let current = self.settings.facet_filter.date_preset;
+            if ui.selectable_label(current.is_none(), "すべて").clicked() {
+                self.settings.facet_filter.date_preset = None;
+                changed = true;
+                ui.close();
+            }
+            ui.separator();
+            for &preset in FacetDatePreset::all() {
+                if ui
+                    .selectable_label(current == Some(preset), preset.label())
+                    .clicked()
+                {
+                    self.settings.facet_filter.date_preset = Some(preset);
+                    changed = true;
+                    ui.close();
+                }
+            }
+        });
+        changed
+    }
+
+    fn draw_facet_size_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let active = usize::from(self.settings.facet_filter.size_preset.is_some());
+        let mut changed = false;
+        ui.menu_button(facet_menu_label("サイズ", active), |ui| {
+            let current = self.settings.facet_filter.size_preset;
+            if ui.selectable_label(current.is_none(), "すべて").clicked() {
+                self.settings.facet_filter.size_preset = None;
+                changed = true;
+                ui.close();
+            }
+            ui.separator();
+            for &preset in FacetSizePreset::all() {
+                if ui
+                    .selectable_label(current == Some(preset), preset.label())
+                    .clicked()
+                {
+                    self.settings.facet_filter.size_preset = Some(preset);
+                    changed = true;
+                    ui.close();
+                }
+            }
+        });
+        changed
+    }
+
+    fn draw_facet_edit_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        let label = facet_menu_label("状態", self.settings.facet_filter.edits.len());
+        ui.menu_button(label, |ui| {
+            if self.settings.facet_filter.edits.is_empty() {
+                ui.label("すべて");
+            } else if ui.small_button("状態フィルタを解除").clicked() {
+                self.settings.facet_filter.edits.clear();
+                changed = true;
+                ui.close();
+            }
+            ui.separator();
+            for &flag in FacetEditFlag::all() {
+                let mut selected = self.settings.facet_filter.edits.contains(&flag);
+                if ui.checkbox(&mut selected, flag.menu_label()).changed() {
+                    if selected {
+                        self.settings.facet_filter.edits.insert(flag);
+                    } else {
+                        self.settings.facet_filter.edits.remove(&flag);
+                    }
+                    changed = true;
+                }
+            }
+        });
+        changed
+    }
+
+    fn draw_facet_active_chips(&self, ui: &mut egui::Ui) {
+        let filter = &self.settings.facet_filter;
+        if !filter.kinds.is_empty() {
+            facet_chip(ui, format!("種類:{}", filter.kinds.len()));
+        }
+        if !filter.exts.is_empty() {
+            let values = filter
+                .exts
+                .iter()
+                .take(3)
+                .map(|ext| format!(".{ext}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            facet_chip(ui, format!("拡張子:{values}"));
+        }
+        if self.rating_filter_active() {
+            let values = (0..6)
+                .filter(|&idx| self.settings.rating_filter[idx])
+                .map(rating_button_label)
+                .collect::<Vec<_>>()
+                .join(",");
+            facet_chip(ui, format!("★:{values}"));
+        }
+        if !filter.tags.is_empty() || filter.include_untagged {
+            let mut parts = filter.tags.iter().take(3).cloned().collect::<Vec<_>>();
+            if filter.include_untagged {
+                parts.push("タグなし".to_string());
+            }
+            facet_chip(
+                ui,
+                format!("タグ:{} {}", filter.tag_mode.label(), parts.join(",")),
+            );
+        }
+        if let Some(preset) = filter.date_preset {
+            facet_chip(ui, format!("日付:{}", preset.label()));
+        }
+        if let Some(preset) = filter.size_preset {
+            facet_chip(ui, format!("サイズ:{}", preset.label()));
+        }
+        if !filter.edits.is_empty() {
+            let values = filter
+                .edits
+                .iter()
+                .take(3)
+                .map(|flag| flag.label())
+                .collect::<Vec<_>>()
+                .join(",");
+            facet_chip(ui, format!("状態:{values}"));
+        }
+    }
+
+    fn facet_kind_counts(&mut self) -> BTreeMap<FacetItemKind, usize> {
+        let indices = self.facet_candidate_indices(FacetField::Kind);
+        let mut counts = BTreeMap::new();
+        for idx in indices {
+            if let Some(kind) = self.facet_item_kind(idx) {
+                *counts.entry(kind).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    fn facet_ext_counts(&mut self) -> BTreeMap<String, usize> {
+        let indices = self.facet_candidate_indices(FacetField::Ext);
+        let mut counts = BTreeMap::new();
+        for idx in indices {
+            let ext = self.facet_item_ext(idx);
+            if !ext.is_empty() {
+                *counts.entry(ext).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    fn facet_tag_counts(&mut self) -> (BTreeMap<String, usize>, usize) {
+        let indices = self.facet_candidate_indices(FacetField::Tags);
+        let mut counts = BTreeMap::new();
+        let mut untagged = 0usize;
+        for idx in indices {
+            let Some(kind) = self.facet_item_kind(idx) else {
+                continue;
+            };
+            if !matches!(kind, FacetItemKind::Image | FacetItemKind::Video) {
+                continue;
+            }
+            let tags = self.cell_tag_list(idx);
+            if tags.is_empty() {
+                untagged += 1;
+            } else {
+                for tag in tags {
+                    *counts.entry(tag.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        (counts, untagged)
     }
 
     // ── フォルダバー ─────────────────────────────────────────────────
@@ -2279,16 +3035,19 @@ impl App {
             if shift {
                 // Shift+クリック: 前回選択位置から現在位置までを範囲チェック
                 if let Some(prev_sel) = self.selected {
-                    let vi = &self.visible_indices;
-                    let prev_pos = vi.iter().position(|&i| i == prev_sel).unwrap_or(0);
-                    let cur_pos = vi.iter().position(|&i| i == idx).unwrap_or(0);
+                    let display_order = self.current_grid_order().to_vec();
+                    let prev_pos = display_order
+                        .iter()
+                        .position(|&i| i == prev_sel)
+                        .unwrap_or(0);
+                    let cur_pos = display_order.iter().position(|&i| i == idx).unwrap_or(0);
                     let (start, end) = if prev_pos <= cur_pos {
                         (prev_pos, cur_pos)
                     } else {
                         (cur_pos, prev_pos)
                     };
                     for vp in start..=end {
-                        if let Some(&vidx) = vi.get(vp) {
+                        if let Some(&vidx) = display_order.get(vp) {
                             if self.items.get(vidx).is_some_and(|it| it.is_checkable()) {
                                 self.checked.insert(vidx);
                             }
@@ -2434,6 +3193,495 @@ impl App {
         }
     }
 
+    // ── 詳細リスト ───────────────────────────────────────────────────
+
+    const DETAILS_HEADER_H: f32 = 26.0;
+    const DETAILS_ROW_H: f32 = 28.0;
+
+    fn render_details_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        scroll_to: bool,
+    ) -> Option<PathBuf> {
+        let avail_w = ui.available_width().max(1.0);
+
+        if (avail_w - self.last_cell_size).abs() > 0.5
+            || (Self::DETAILS_ROW_H - self.last_cell_h).abs() > 0.5
+        {
+            self.last_cell_size = avail_w;
+            self.last_cell_h = Self::DETAILS_ROW_H;
+        }
+
+        if scroll_to {
+            self.apply_scroll_to_selected(1, Self::DETAILS_ROW_H);
+        }
+
+        let (header_rect, _) = ui.allocate_exact_size(
+            egui::vec2(avail_w, Self::DETAILS_HEADER_H),
+            egui::Sense::hover(),
+        );
+        self.draw_details_header(ui, header_rect);
+
+        if self.details_order.len() != self.visible_indices.len() {
+            self.rebuild_details_order();
+        }
+        let display_order = self.current_grid_order().to_vec();
+        let row_count = display_order.len();
+        let natural_h = row_count as f32 * Self::DETAILS_ROW_H;
+        let total_h = if natural_h <= self.last_viewport_h {
+            natural_h
+        } else {
+            let raw_max = natural_h - self.last_viewport_h;
+            let snapped_max = (raw_max / Self::DETAILS_ROW_H).ceil() * Self::DETAILS_ROW_H;
+            snapped_max + self.last_viewport_h
+        };
+        let max_offset = if total_h <= self.last_viewport_h {
+            0.0
+        } else {
+            total_h - self.last_viewport_h
+        };
+        self.scroll_offset_y = self.scroll_offset_y.clamp(0.0, max_offset);
+
+        let mut nav: Option<PathBuf> = None;
+        let scroll_output = egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .vertical_scroll_offset(self.scroll_offset_y)
+            .show_viewport(ui, |ui, viewport| {
+                self.last_viewport_h = viewport.height();
+
+                let (content_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(avail_w, total_h), egui::Sense::hover());
+
+                let first_row = (viewport.min.y / Self::DETAILS_ROW_H) as usize;
+                let last_row = ((viewport.max.y / Self::DETAILS_ROW_H) as usize + 2).min(row_count);
+                let prewarm_first = first_row.saturating_sub(8);
+                let prewarm_last = (last_row + 8).min(row_count);
+                self.details_tag_prewarm_indices.clear();
+                self.details_tag_prewarm_indices.extend(
+                    display_order
+                        .get(prewarm_first..prewarm_last)
+                        .unwrap_or(&[])
+                        .iter()
+                        .copied(),
+                );
+
+                let vis_first_idx = display_order.get(first_row).copied().unwrap_or(0);
+                self.scroll_hint.store(vis_first_idx, Ordering::Relaxed);
+                let vis_end_idx = display_order
+                    .get(last_row.saturating_sub(1).min(row_count.saturating_sub(1)))
+                    .copied()
+                    .map(|i| i + 1)
+                    .unwrap_or(vis_first_idx);
+                self.visible_end_shared
+                    .store(vis_end_idx, Ordering::Relaxed);
+
+                for row in first_row..last_row {
+                    let Some(&idx) = display_order.get(row) else {
+                        continue;
+                    };
+                    let row_rect = egui::Rect::from_min_size(
+                        content_rect.min + egui::vec2(0.0, row as f32 * Self::DETAILS_ROW_H),
+                        egui::vec2(avail_w, Self::DETAILS_ROW_H),
+                    );
+
+                    if let Some(n) = self.handle_cell_interaction(ui, ctx, row_rect, idx) {
+                        nav = Some(n);
+                    }
+                    if idx >= self.items.len() {
+                        break;
+                    }
+
+                    self.draw_details_row(ui, row_rect, idx, row);
+                    if self.selected == Some(idx) {
+                        self.selected_cell_rect = Some(row_rect);
+                    }
+                }
+            });
+
+        let bg_right_clicked = ui.rect_contains_pointer(scroll_output.inner_rect)
+            && ctx.input(|i| i.pointer.secondary_clicked());
+        if bg_right_clicked && self.context_menu_idx.is_none() {
+            self.open_current_folder_context_menu(ctx);
+        }
+
+        let egui_offset = scroll_output.state.offset.y;
+        if (egui_offset - self.scroll_offset_y).abs() > Self::DETAILS_ROW_H * 0.5 {
+            self.scroll_offset_y =
+                (egui_offset / Self::DETAILS_ROW_H).round() * Self::DETAILS_ROW_H;
+        }
+
+        let full_rect = ui.max_rect();
+        self.draw_feedback_toast(ui, full_rect, ctx);
+
+        nav
+    }
+
+    fn draw_details_header(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let bg = ui.visuals().extreme_bg_color;
+        let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+        let text_color = ui.visuals().strong_text_color();
+        let hover_bg = ui.visuals().widgets.hovered.bg_fill;
+        ui.painter().rect_filled(rect, 0.0, bg);
+        ui.painter().line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            egui::Stroke::new(1.0, stroke_color),
+        );
+
+        for (col, col_rect) in details_column_rects(rect, &self.settings) {
+            let response = ui.interact(
+                col_rect,
+                ui.id().with(("details_header", col)),
+                egui::Sense::click(),
+            );
+            if response.hovered() {
+                ui.painter().rect_filled(col_rect, 0.0, hover_bg);
+            }
+            let sort_key = col.sort_key();
+            let lazy_sort = col.is_lazy();
+            let sort_enabled = !lazy_sort || self.details_lazy_sort_ready();
+            if response.clicked() && sort_enabled {
+                self.set_details_sort_key(col.sort_key());
+            }
+            let sorted = self.settings.details_sort_key == sort_key;
+            let mut base_title = col.title().to_string();
+            if matches!(
+                col,
+                DetailsColumn::Created
+                    | DetailsColumn::ImageDimensions
+                    | DetailsColumn::VideoDuration
+                    | DetailsColumn::VideoDimensions
+                    | DetailsColumn::VideoCodec
+            ) && matches!(
+                self.details_image_dims_state,
+                LazyColumnState::Loading { .. } | LazyColumnState::NotRequested
+            ) {
+                base_title.push_str(" ...");
+            }
+            let title = if sorted {
+                format!(
+                    "{} {}",
+                    base_title,
+                    if self.settings.details_sort_ascending {
+                        "↑"
+                    } else {
+                        "↓"
+                    }
+                )
+            } else {
+                base_title
+            };
+            draw_details_text(
+                ui,
+                col_rect,
+                &title,
+                egui::Align2::LEFT_CENTER,
+                text_color,
+                true,
+            );
+            ui.painter().line_segment(
+                [col_rect.right_top(), col_rect.right_bottom()],
+                egui::Stroke::new(1.0, stroke_color),
+            );
+            let response = if sort_enabled {
+                response.hover_tip("クリックで 昇順 → 降順 → ソートなし")
+            } else {
+                response.hover_tip("詳細情報の読み込み完了後に並べ替えできます")
+            };
+            response.context_menu(|ui| {
+                self.draw_details_column_context_menu(ui);
+            });
+        }
+    }
+
+    fn draw_details_column_context_menu(&mut self, ui: &mut egui::Ui) {
+        ui.label("表示する列");
+        ui.separator();
+        let mut name_visible = true;
+        ui.add_enabled(false, egui::Checkbox::new(&mut name_visible, "名前"));
+
+        let old_lazy = (
+            self.settings.details_show_created,
+            self.settings.details_show_image_dimensions,
+            self.settings.details_show_video_duration,
+            self.settings.details_show_video_dimensions,
+            self.settings.details_show_video_codec,
+        );
+        let mut changed = false;
+        changed |= ui
+            .checkbox(&mut self.settings.details_show_rating, "★")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.details_show_tags, "タグ")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.details_show_kind, "種類")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.details_show_size, "サイズ")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.details_show_modified, "更新日時")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.details_show_state, "状態")
+            .changed();
+
+        ui.separator();
+        changed |= ui
+            .checkbox(&mut self.settings.details_show_created, "作成日時")
+            .on_hover_text("ファイルシステムの作成日時をバックグラウンドで読み込みます")
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.details_show_image_dimensions,
+                "画像解像度",
+            )
+            .on_hover_text("必要な値をバックグラウンドで読み込みます")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.details_show_video_duration, "動画長さ")
+            .on_hover_text("FFmpeg で動画情報をバックグラウンド読み込みします")
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.details_show_video_dimensions,
+                "動画解像度",
+            )
+            .on_hover_text("FFmpeg で動画情報をバックグラウンド読み込みします")
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.details_show_video_codec,
+                "動画コーデック",
+            )
+            .on_hover_text("FFmpeg で動画情報をバックグラウンド読み込みします")
+            .changed();
+
+        if changed {
+            let new_lazy = (
+                self.settings.details_show_created,
+                self.settings.details_show_image_dimensions,
+                self.settings.details_show_video_duration,
+                self.settings.details_show_video_dimensions,
+                self.settings.details_show_video_codec,
+            );
+            if old_lazy != new_lazy {
+                let has_lazy = self.settings.details_show_created
+                    || self.settings.details_show_image_dimensions
+                    || self.settings.details_show_video_duration
+                    || self.settings.details_show_video_dimensions
+                    || self.settings.details_show_video_codec;
+                if has_lazy {
+                    self.details_image_dims_state = LazyColumnState::NotRequested;
+                } else {
+                    self.cancel_details_meta_loading();
+                }
+            }
+            self.reset_details_sort_if_hidden();
+            self.rebuild_details_order();
+            self.settings.save();
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn draw_details_row(&mut self, ui: &mut egui::Ui, rect: egui::Rect, idx: usize, row: usize) {
+        let Some(item) = self.items.get(idx).cloned() else {
+            return;
+        };
+        let visuals = ui.visuals();
+        let selected = self.selected == Some(idx);
+        let checked = self.checked.contains(&idx);
+        let bg = if selected {
+            visuals.selection.bg_fill
+        } else if checked {
+            visuals.widgets.active.bg_fill
+        } else if row % 2 == 0 {
+            visuals.panel_fill
+        } else {
+            visuals.faint_bg_color
+        };
+        let text_color = if selected {
+            visuals.selection.stroke.color
+        } else {
+            visuals.text_color()
+        };
+
+        let painter = ui.painter();
+        painter.rect_filled(rect, 0.0, bg);
+        if checked && !selected {
+            let accent = egui::Rect::from_min_max(
+                rect.left_top(),
+                egui::pos2(rect.left() + 3.0, rect.bottom()),
+            );
+            painter.rect_filled(accent, 0.0, visuals.selection.bg_fill);
+        }
+        painter.line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+        );
+
+        let name = item.name().into_owned();
+        let rating = if self.items_are_drive_list {
+            0
+        } else {
+            self.get_rating(idx)
+        };
+        let rating_text = if rating == 0 {
+            String::new()
+        } else {
+            "★".repeat(rating as usize)
+        };
+        let tags_text = self.cell_tag_list(idx).join(" ");
+        let kind_text = details_kind_label(&item);
+        let (size_text, modified_text) = self
+            .image_metas
+            .get(idx)
+            .and_then(|m| *m)
+            .map(|(mtime, size)| {
+                let size_text = if size > 0 {
+                    crate::ui_helpers::format_bytes(size as u64)
+                } else {
+                    String::new()
+                };
+                (size_text, format_details_mtime(mtime))
+            })
+            .unwrap_or_else(|| (String::new(), String::new()));
+        let state_text = self.details_state_text(idx, &item);
+
+        for (col, col_rect) in details_column_rects(rect, &self.settings) {
+            match col {
+                DetailsColumn::Name => draw_details_text(
+                    ui,
+                    col_rect,
+                    &name,
+                    egui::Align2::LEFT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::Rating => draw_details_text(
+                    ui,
+                    col_rect,
+                    &rating_text,
+                    egui::Align2::LEFT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::Tags => draw_details_text(
+                    ui,
+                    col_rect,
+                    &tags_text,
+                    egui::Align2::LEFT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::Kind => draw_details_text(
+                    ui,
+                    col_rect,
+                    &kind_text,
+                    egui::Align2::LEFT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::Size => draw_details_text(
+                    ui,
+                    col_rect,
+                    &size_text,
+                    egui::Align2::RIGHT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::Modified => draw_details_text(
+                    ui,
+                    col_rect,
+                    &modified_text,
+                    egui::Align2::LEFT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::Created => draw_details_text(
+                    ui,
+                    col_rect,
+                    &self.details_created_text(idx),
+                    egui::Align2::LEFT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::ImageDimensions => draw_details_text(
+                    ui,
+                    col_rect,
+                    &self.details_image_dims_text(idx),
+                    egui::Align2::RIGHT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::VideoDuration => draw_details_text(
+                    ui,
+                    col_rect,
+                    &self.details_video_duration_text(idx),
+                    egui::Align2::RIGHT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::VideoDimensions => draw_details_text(
+                    ui,
+                    col_rect,
+                    &self.details_video_dims_text(idx),
+                    egui::Align2::RIGHT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::VideoCodec => draw_details_text(
+                    ui,
+                    col_rect,
+                    &self.details_video_codec_text(idx),
+                    egui::Align2::LEFT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::State => draw_details_text(
+                    ui,
+                    col_rect,
+                    &state_text,
+                    egui::Align2::LEFT_CENTER,
+                    text_color,
+                    false,
+                ),
+            }
+        }
+    }
+
+    fn details_state_text(&mut self, idx: usize, item: &GridItem) -> String {
+        let mut flags = Vec::new();
+        if self.adjustment_page_params.contains_key(&idx) {
+            flags.push("補");
+        }
+        if self.local_adjust_pages.contains(&idx) {
+            flags.push("レ");
+        }
+        if self.mask_pages.contains(&idx) {
+            flags.push("消");
+        }
+        if self.conceal_pages.contains(&idx) {
+            flags.push("隠");
+        }
+        if self.comic_pages.contains(&idx) {
+            flags.push("文");
+        }
+        if !self.get_rotation(idx).is_none() {
+            flags.push("回");
+        }
+        if let Some(cur) = self.current_folder.as_ref() {
+            let cur_key = crate::path_key::normalize_keep_drive(cur);
+            if self.folder_pin_map.get(&cur_key).is_some_and(|pin_src| {
+                crate::folder_thumb_pins::source_from_grid_item(cur, item).as_ref() == Some(pin_src)
+            }) {
+                flags.push("ピ");
+            }
+        }
+        flags.join(" ")
+    }
+
     // ── サムネイルグリッド ───────────────────────────────────────────
 
     /// サムネイルグリッドを描画し、フォルダナビゲーション先を返す。
@@ -2488,6 +3736,10 @@ impl App {
                     let full_rect = ui.max_rect();
                     self.draw_feedback_toast(ui, full_rect, ctx);
                     return None;
+                }
+
+                if self.settings.grid_view_mode == GridViewMode::Details {
+                    return self.render_details_list(ui, ctx, scroll_to);
                 }
 
                 let cols = self.settings.grid_cols.max(1);
@@ -2747,6 +3999,9 @@ impl App {
     pub(crate) fn render_selection_info(&self, ctx: &egui::Context) {
         // フルスクリーン中は出さない (独自のホバーヘッダーを持つため)。
         if self.fullscreen_idx.is_some() {
+            return;
+        }
+        if self.settings.grid_view_mode == GridViewMode::Details {
             return;
         }
 

@@ -221,6 +221,298 @@ impl ThumbAspect {
 }
 
 // -----------------------------------------------------------------------
+// グリッド表示モード
+// -----------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GridViewMode {
+    #[default]
+    Thumbnail,
+    Details,
+}
+
+impl GridViewMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Thumbnail => "サムネ",
+            Self::Details => "詳細",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Thumbnail, Self::Details]
+    }
+}
+
+// -----------------------------------------------------------------------
+// 詳細表示ソート
+// -----------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DetailsSortKey {
+    #[default]
+    Toolbar,
+    Name,
+    Rating,
+    Tags,
+    Kind,
+    Size,
+    Modified,
+    Created,
+    State,
+    ImageDimensions,
+    VideoDuration,
+    VideoDimensions,
+    VideoCodec,
+}
+
+impl DetailsSortKey {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Toolbar => "ツールバー順",
+            Self::Name => "名前",
+            Self::Rating => "★",
+            Self::Tags => "タグ",
+            Self::Kind => "種類",
+            Self::Size => "サイズ",
+            Self::Modified => "更新日時",
+            Self::Created => "作成日時",
+            Self::State => "状態",
+            Self::ImageDimensions => "画像解像度",
+            Self::VideoDuration => "動画長さ",
+            Self::VideoDimensions => "動画解像度",
+            Self::VideoCodec => "動画コーデック",
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// スマートフィルタ (軽量 facet)
+// -----------------------------------------------------------------------
+
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+pub enum FacetItemKind {
+    Folder,
+    Image,
+    Video,
+    Zip,
+    Pdf,
+    Archive,
+    ZipImage,
+    PdfPage,
+    Separator,
+    SearchContainer,
+}
+
+impl FacetItemKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Folder => "フォルダ",
+            Self::Image => "画像",
+            Self::Video => "動画",
+            Self::Zip => "ZIP",
+            Self::Pdf => "PDF",
+            Self::Archive => "変換アーカイブ",
+            Self::ZipImage => "ZIP内画像",
+            Self::PdfPage => "PDFページ",
+            Self::Separator => "見出し",
+            Self::SearchContainer => "検索コンテナ",
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FacetTagMode {
+    #[default]
+    Any,
+    All,
+}
+
+impl FacetTagMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Any => "OR",
+            Self::All => "AND",
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FacetDatePreset {
+    Last7Days,
+    Last30Days,
+    Last365Days,
+}
+
+impl FacetDatePreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Last7Days => "7日以内",
+            Self::Last30Days => "30日以内",
+            Self::Last365Days => "1年以内",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Last7Days, Self::Last30Days, Self::Last365Days]
+    }
+
+    pub fn seconds(self) -> i64 {
+        match self {
+            Self::Last7Days => 7 * 24 * 60 * 60,
+            Self::Last30Days => 30 * 24 * 60 * 60,
+            Self::Last365Days => 365 * 24 * 60 * 60,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FacetSizePreset {
+    Under1MiB,
+    MiB1To10,
+    MiB10To100,
+    Over100MiB,
+}
+
+impl FacetSizePreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Under1MiB => "1MB未満",
+            Self::MiB1To10 => "1〜10MB",
+            Self::MiB10To100 => "10〜100MB",
+            Self::Over100MiB => "100MB以上",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Under1MiB,
+            Self::MiB1To10,
+            Self::MiB10To100,
+            Self::Over100MiB,
+        ]
+    }
+
+    pub fn range_bytes(self) -> (u64, Option<u64>) {
+        const MIB: u64 = 1024 * 1024;
+        match self {
+            Self::Under1MiB => (0, Some(MIB)),
+            Self::MiB1To10 => (MIB, Some(10 * MIB)),
+            Self::MiB10To100 => (10 * MIB, Some(100 * MIB)),
+            Self::Over100MiB => (100 * MIB, None),
+        }
+    }
+}
+
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+pub enum FacetEditFlag {
+    Adjustment,
+    LocalAdjustment,
+    Mask,
+    Conceal,
+    Annotation,
+    Rotation,
+    Tagged,
+    Untagged,
+    Rated,
+    Unrated,
+}
+
+impl FacetEditFlag {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Adjustment => "補",
+            Self::LocalAdjustment => "レ",
+            Self::Mask => "消",
+            Self::Conceal => "隠",
+            Self::Annotation => "文",
+            Self::Rotation => "回",
+            Self::Tagged => "タグあり",
+            Self::Untagged => "タグなし",
+            Self::Rated => "★あり",
+            Self::Unrated => "★なし",
+        }
+    }
+
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            Self::Adjustment => "補（補正）",
+            Self::LocalAdjustment => "レ（補正レイヤー）",
+            Self::Mask => "消（消しゴムマスク）",
+            Self::Conceal => "隠（隠蔽加工）",
+            Self::Annotation => "文（テキスト注釈）",
+            Self::Rotation => "回（回転）",
+            Self::Tagged => "タグあり",
+            Self::Untagged => "タグなし",
+            Self::Rated => "★あり",
+            Self::Unrated => "★なし",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Adjustment,
+            Self::LocalAdjustment,
+            Self::Mask,
+            Self::Conceal,
+            Self::Annotation,
+            Self::Rotation,
+            Self::Tagged,
+            Self::Untagged,
+            Self::Rated,
+            Self::Unrated,
+        ]
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct FacetFilter {
+    #[serde(default)]
+    pub kinds: std::collections::BTreeSet<FacetItemKind>,
+    #[serde(default)]
+    pub exts: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub tags: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub tag_mode: FacetTagMode,
+    #[serde(default)]
+    pub include_untagged: bool,
+    #[serde(default)]
+    pub date_preset: Option<FacetDatePreset>,
+    #[serde(default)]
+    pub size_preset: Option<FacetSizePreset>,
+    #[serde(default)]
+    pub edits: std::collections::BTreeSet<FacetEditFlag>,
+}
+
+impl FacetFilter {
+    pub fn is_active(&self) -> bool {
+        !self.kinds.is_empty()
+            || !self.exts.is_empty()
+            || !self.tags.is_empty()
+            || self.include_untagged
+            || self.date_preset.is_some()
+            || self.size_preset.is_some()
+            || !self.edits.is_empty()
+    }
+
+    pub fn uses_tag_state(&self) -> bool {
+        !self.tags.is_empty()
+            || self.include_untagged
+            || self.edits.contains(&FacetEditFlag::Tagged)
+            || self.edits.contains(&FacetEditFlag::Untagged)
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+// -----------------------------------------------------------------------
 // ツールバーセクションの表示形式
 // -----------------------------------------------------------------------
 
@@ -896,6 +1188,36 @@ impl StartupFolderMode {
 pub struct Settings {
     #[serde(default = "default_grid_cols")]
     pub grid_cols: usize,
+    #[serde(default)]
+    pub grid_view_mode: GridViewMode,
+    #[serde(default)]
+    pub details_sort_key: DetailsSortKey,
+    #[serde(default = "default_details_sort_ascending")]
+    pub details_sort_ascending: bool,
+    #[serde(default = "default_true")]
+    pub details_show_rating: bool,
+    #[serde(default = "default_true")]
+    pub details_show_tags: bool,
+    #[serde(default = "default_true")]
+    pub details_show_kind: bool,
+    #[serde(default = "default_true")]
+    pub details_show_size: bool,
+    #[serde(default = "default_true")]
+    pub details_show_modified: bool,
+    #[serde(default)]
+    pub details_show_created: bool,
+    #[serde(default = "default_true")]
+    pub details_show_state: bool,
+    #[serde(default)]
+    pub details_show_image_dimensions: bool,
+    #[serde(default)]
+    pub details_show_video_duration: bool,
+    #[serde(default)]
+    pub details_show_video_dimensions: bool,
+    #[serde(default)]
+    pub details_show_video_codec: bool,
+    #[serde(default)]
+    pub facet_filter: FacetFilter,
     /// ユーザーが手動で選んだ比率。Auto モードでも **書き換えない**
     /// (= Manual に戻したときに直前の手動値が復活するよう保持)。
     /// Auto 未確定時の effective 値ではない (= `App::effective_thumb_aspect` 参照)。
@@ -1944,6 +2266,9 @@ pub const MAX_GRID_COLS: usize = 10;
 fn default_grid_cols() -> usize {
     4
 }
+fn default_details_sort_ascending() -> bool {
+    true
+}
 fn default_prefetch_back() -> usize {
     4
 }
@@ -2104,6 +2429,21 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             grid_cols: default_grid_cols(),
+            grid_view_mode: GridViewMode::default(),
+            details_sort_key: DetailsSortKey::default(),
+            details_sort_ascending: default_details_sort_ascending(),
+            details_show_rating: true,
+            details_show_tags: true,
+            details_show_kind: true,
+            details_show_size: true,
+            details_show_modified: true,
+            details_show_created: false,
+            details_show_state: true,
+            details_show_image_dimensions: false,
+            details_show_video_duration: false,
+            details_show_video_dimensions: false,
+            details_show_video_codec: false,
+            facet_filter: FacetFilter::default(),
             thumb_aspect: ThumbAspect::default(),
             thumb_aspect_auto: false,
             favorites: Vec::new(),
@@ -3173,6 +3513,21 @@ impl Settings {
     pub fn overwrite_non_preferences_from(&mut self, src: &mut Settings) {
         // ── グリッド / ツールバー runtime 状態 ──
         self.grid_cols = src.grid_cols;
+        self.grid_view_mode = src.grid_view_mode;
+        self.details_sort_key = src.details_sort_key;
+        self.details_sort_ascending = src.details_sort_ascending;
+        self.details_show_rating = src.details_show_rating;
+        self.details_show_tags = src.details_show_tags;
+        self.details_show_kind = src.details_show_kind;
+        self.details_show_size = src.details_show_size;
+        self.details_show_modified = src.details_show_modified;
+        self.details_show_created = src.details_show_created;
+        self.details_show_state = src.details_show_state;
+        self.details_show_image_dimensions = src.details_show_image_dimensions;
+        self.details_show_video_duration = src.details_show_video_duration;
+        self.details_show_video_dimensions = src.details_show_video_dimensions;
+        self.details_show_video_codec = src.details_show_video_codec;
+        self.facet_filter = src.facet_filter.clone();
         self.thumb_aspect = src.thumb_aspect;
         self.sort_order = src.sort_order;
         self.rating_filter = src.rating_filter;
@@ -4884,6 +5239,28 @@ mod tests {
             assert!(data_db_path(&env).exists());
 
             let mut s = Settings::default();
+            s.grid_view_mode = GridViewMode::Details;
+            s.details_sort_key = DetailsSortKey::Size;
+            s.details_sort_ascending = false;
+            s.details_show_rating = false;
+            s.details_show_tags = false;
+            s.details_show_kind = false;
+            s.details_show_size = false;
+            s.details_show_modified = false;
+            s.details_show_created = true;
+            s.details_show_state = false;
+            s.details_show_image_dimensions = true;
+            s.details_show_video_duration = true;
+            s.details_show_video_dimensions = true;
+            s.details_show_video_codec = true;
+            s.facet_filter.kinds.insert(FacetItemKind::Image);
+            s.facet_filter.exts.insert("png".to_string());
+            s.facet_filter.tags.insert("#原神".to_string());
+            s.facet_filter.include_untagged = true;
+            s.facet_filter.tag_mode = FacetTagMode::All;
+            s.facet_filter.date_preset = Some(FacetDatePreset::Last30Days);
+            s.facet_filter.size_preset = Some(FacetSizePreset::MiB10To100);
+            s.facet_filter.edits.insert(FacetEditFlag::Tagged);
             s.thumb_aspect_auto = true;
             s.thumb_aspect = ThumbAspect::Portrait2x3;
             s.toolbar_aspect_auto_visible = false;
@@ -4897,6 +5274,99 @@ mod tests {
             assert!(
                 loaded.thumb_aspect_auto,
                 "thumb_aspect_auto should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.grid_view_mode,
+                GridViewMode::Details,
+                "grid_view_mode should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.details_sort_key,
+                DetailsSortKey::Size,
+                "details_sort_key should survive roundtrip"
+            );
+            assert!(
+                !loaded.details_sort_ascending,
+                "details_sort_ascending should survive roundtrip"
+            );
+            assert!(
+                !loaded.details_show_rating,
+                "details_show_rating should survive roundtrip"
+            );
+            assert!(
+                !loaded.details_show_tags,
+                "details_show_tags should survive roundtrip"
+            );
+            assert!(
+                !loaded.details_show_kind,
+                "details_show_kind should survive roundtrip"
+            );
+            assert!(
+                !loaded.details_show_size,
+                "details_show_size should survive roundtrip"
+            );
+            assert!(
+                !loaded.details_show_modified,
+                "details_show_modified should survive roundtrip"
+            );
+            assert!(
+                loaded.details_show_created,
+                "details_show_created should survive roundtrip"
+            );
+            assert!(
+                !loaded.details_show_state,
+                "details_show_state should survive roundtrip"
+            );
+            assert!(
+                loaded.details_show_image_dimensions,
+                "details_show_image_dimensions should survive roundtrip"
+            );
+            assert!(
+                loaded.details_show_video_duration,
+                "details_show_video_duration should survive roundtrip"
+            );
+            assert!(
+                loaded.details_show_video_dimensions,
+                "details_show_video_dimensions should survive roundtrip"
+            );
+            assert!(
+                loaded.details_show_video_codec,
+                "details_show_video_codec should survive roundtrip"
+            );
+            assert!(
+                loaded.facet_filter.kinds.contains(&FacetItemKind::Image),
+                "facet_filter kinds should survive roundtrip"
+            );
+            assert!(
+                loaded.facet_filter.exts.contains("png"),
+                "facet_filter extensions should survive roundtrip"
+            );
+            assert!(
+                loaded.facet_filter.tags.contains("#原神"),
+                "facet_filter tags should survive roundtrip"
+            );
+            assert!(
+                loaded.facet_filter.include_untagged,
+                "facet_filter include_untagged should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.facet_filter.tag_mode,
+                FacetTagMode::All,
+                "facet_filter tag mode should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.facet_filter.date_preset,
+                Some(FacetDatePreset::Last30Days),
+                "facet_filter date preset should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.facet_filter.size_preset,
+                Some(FacetSizePreset::MiB10To100),
+                "facet_filter size preset should survive roundtrip"
+            );
+            assert!(
+                loaded.facet_filter.edits.contains(&FacetEditFlag::Tagged),
+                "facet_filter edit flags should survive roundtrip"
             );
             assert!(
                 !loaded.toolbar_aspect_auto_visible,
