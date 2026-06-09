@@ -927,6 +927,54 @@ mod phase_c_key_tests {
         }
     }
 
+    #[test]
+    fn backspace_at_drive_root_returns_drive_list_nav() {
+        let mut app = setup_app();
+        let root = PathBuf::from(r"C:\");
+        app.current_folder = Some(root.clone());
+
+        let nav = grid_key_nav(&mut app, egui::Modifiers::NONE, egui::Key::Backspace);
+
+        match nav {
+            Some(crate::ui_main::AddressBarNav::DriveList(Some(origin))) => {
+                assert!(crate::folder_tree::path_eq(&origin, &root));
+            }
+            other => panic!("ドライブルートの BS は DriveList nav を返すこと: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_drive_list_sets_virtual_state_without_last_folder_update() {
+        let mut app = setup_app();
+        let previous = PathBuf::from(r"C:\pics");
+        app.current_folder = Some(previous.clone());
+        app.scroll_offset_y = 42.0;
+        app.selected = Some(3);
+
+        app.enter_drive_list(None);
+
+        assert!(app.items_are_drive_list);
+        assert!(app.current_folder.is_none());
+        assert!(app.address.is_empty());
+        assert!(app.settings.last_folder.is_none());
+        assert_eq!(app.folder_history.get(&previous), Some(&(42.0, Some(3))));
+        assert_eq!(app.items.len(), app.image_metas.len());
+        assert!(app.image_metas.iter().all(Option::is_none));
+        assert!(
+            app.items
+                .iter()
+                .all(|item| matches!(item, GridItem::Folder(_)))
+        );
+        assert!(
+            app.reload_queue.is_none(),
+            "ピンが無ければ drive-list 用 worker queue は作らない"
+        );
+        assert!(
+            app.heavy_io_queue.is_none(),
+            "ピンが無ければ drive-list 用 I/O queue は作らない"
+        );
+    }
+
     /// Codex P2 #3: 選択中の Ctrl+S お気に入りフィルタが設定から消えたら、
     /// `execute_favsearch` が UI と整合を取るために filter を None にクリアする。
     #[test]

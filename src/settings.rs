@@ -873,6 +873,8 @@ pub enum StartupFolderMode {
     Desktop,
     /// ユーザー指定フォルダ。無効な場合は Desktop にフォールバック。
     Specific,
+    /// 実フォルダではなく、接続済みドライブ一覧を表示する。
+    Drives,
 }
 
 impl StartupFolderMode {
@@ -881,6 +883,7 @@ impl StartupFolderMode {
             Self::Previous => "前回終了したフォルダ",
             Self::Desktop => "デスクトップ",
             Self::Specific => "指定フォルダ",
+            Self::Drives => "ドライブ一覧",
         }
     }
 }

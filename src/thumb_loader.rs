@@ -76,6 +76,13 @@ pub enum ResolveStrategy {
     /// `req.path` は ZIP。`zip_loader::read_first_image_bytes` で先頭画像を取り出す
     ZipFirstImage,
 }
+
+/// Drive-list thumbnails are cache-only: the UI thread checks the local pin DB
+/// and asks the worker to use an already-cataloged pinned thumbnail. Missing
+/// cache falls back to the fixed drive icon instead of touching the drive.
+pub struct PinnedOnlyRequest {
+    pub cache_key_prefix: String,
+}
 /// Ctrl+G アグリゲートビューの「代表サムネ」用キャッシュキープレフィックス (v0.8.1)。
 /// filename 単体だと別コンテナ同士の同名画像 (例: `cover.jpg`) でキャッシュ衝突し、
 /// placeholder mtime=0 で相手の thumb を読み込んでしまうため、**コンテナ path 丸ごと**
@@ -205,6 +212,9 @@ pub struct LoadRequest {
     /// 判定 (is_folder_thumb / is_zip_thumb) を無視してここで指定された戦略で
     /// resolve する。`None` のときは従来通り prefix で判定する。
     pub resolve_override: Option<ResolveStrategy>,
+    /// 明示ピンだけを解決する特殊要求。未解決 / Folder leaf はアイコン fallback
+    /// に倒し、通常フォルダ代表探索には進ませない。
+    pub pinned_only: Option<PinnedOnlyRequest>,
     /// パフォーマンス計装用: エンキュー時の input_seq (相関キー)。
     /// 0 は未設定を意味する。`--perf-log` 無効時は使われない。
     pub input_seq: u64,
@@ -764,6 +774,69 @@ pub fn compute_display_px(cell_w: f32, cell_h: f32, dpi: f32) -> u32 {
 // メインのリクエスト処理
 // -----------------------------------------------------------------------
 
+fn send_thumb_failed(req: &LoadRequest, tx: &mpsc::Sender<ThumbMsg>, gen_done: &Arc<AtomicUsize>) {
+    let _ = tx.send(ThumbMsg {
+        idx: req.idx,
+        image: None,
+        from_cache: false,
+        source_dims: None,
+        canceled: false,
+        finalized: false,
+        input_seq: req.input_seq,
+        items_gen: req.items_gen,
+    });
+    gen_done.fetch_add(1, Ordering::Relaxed);
+}
+
+fn send_pinned_only_cached(
+    req: &LoadRequest,
+    pin: &PinnedOnlyRequest,
+    cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+    tx: &mpsc::Sender<ThumbMsg>,
+    gen_done: &Arc<AtomicUsize>,
+) -> bool {
+    let cached = cache_map.read().ok().and_then(|map| {
+        map.iter()
+            .filter(|(key, _)| key.starts_with(&pin.cache_key_prefix))
+            .max_by_key(|(_, entry)| (entry.mtime, entry.file_size))
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    entry.jpeg_data.clone(),
+                    entry.source_dims,
+                    entry.mtime,
+                    entry.file_size,
+                )
+            })
+    });
+
+    let Some((filename, webp_data, source_dims, mtime, file_size)) = cached else {
+        crate::logger::log(format!(
+            "drive-list pin: cached thumbnail missing ({})",
+            pin.cache_key_prefix
+        ));
+        return false;
+    };
+
+    let ci = crate::catalog::decode_thumb_to_color_image(&webp_data);
+    let _ = tx.send(ThumbMsg {
+        idx: req.idx,
+        image: ci,
+        from_cache: true,
+        source_dims,
+        canceled: false,
+        finalized: false,
+        input_seq: req.input_seq,
+        items_gen: req.items_gen,
+    });
+    gen_done.fetch_add(1, Ordering::Relaxed);
+    crate::logger::log(format!(
+        "    idx={:>4} drive_list_pin_cache_hit  {filename} ({mtime}/{file_size})",
+        req.idx,
+    ));
+    true
+}
+
 /// 段階 B: 1 つの `LoadRequest` を処理する。
 ///
 /// - 通常: `cache_map` を参照しキャッシュヒットしていれば WebP を復号して送信する
@@ -793,6 +866,13 @@ pub fn process_load_request(
     // cascade 解決する。`None` のとき従来の純粋 auto-pick になる。
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
 ) {
+    if let Some(pin) = req.pinned_only.as_ref() {
+        if !send_pinned_only_cached(req, pin, cache_map, tx, gen_done) {
+            send_thumb_failed(req, tx, gen_done);
+        }
+        return;
+    }
+
     // 内部関数向けに `&CatalogDb` を取り出しておく (= 既存シグネチャ互換)
     let catalog_ref: Option<&crate::catalog::CatalogDb> = catalog.map(|a| a.as_ref());
     // カタログキーを共通 helper で組み立て (auto_aspect の seed フェーズと共有)。
@@ -888,18 +968,20 @@ pub fn process_load_request(
     let is_folder_thumb = match req.resolve_override {
         Some(ResolveStrategy::FolderRepresentative) => true,
         Some(_) => false,
-        None => req
+        None if req.zip_entry.is_none() && req.pdf_page.is_none() => req
             .cache_key_override
             .as_deref()
             .is_some_and(|k| k.starts_with(CACHE_KEY_FOLDER)),
+        None => false,
     };
     let is_zip_thumb = match req.resolve_override {
         Some(ResolveStrategy::ZipFirstImage) => true,
         Some(_) => false,
-        None => req
+        None if req.zip_entry.is_none() && req.pdf_page.is_none() => req
             .cache_key_override
             .as_deref()
             .is_some_and(|k| k.starts_with(CACHE_KEY_ZIP)),
+        None => false,
     };
     let needs_heavy_io = is_folder_thumb || is_zip_thumb;
 

@@ -50,6 +50,7 @@ pub fn startup_folder(
             .and_then(resolve_startup_last_folder)
             .or_else(desktop_dir)
             .or_else(|| last_folder.and_then(resolve_startup_last_folder)),
+        StartupFolderMode::Drives => None,
     }
 }
 
@@ -188,5 +189,18 @@ mod tests {
         let chosen = startup_folder(StartupFolderMode::Specific, None, Some(tmp.path()))
             .expect("existing specific folder should be returned");
         assert_eq!(chosen, tmp.path());
+    }
+
+    #[test]
+    fn startup_folder_drives_is_virtual_and_returns_none() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        assert_eq!(
+            startup_folder(
+                StartupFolderMode::Drives,
+                Some(tmp.path()),
+                Some(tmp.path())
+            ),
+            None
+        );
     }
 }

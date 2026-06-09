@@ -36,8 +36,10 @@ enum PinButtonClick {
     Remove,
 }
 
+#[derive(Debug)]
 pub(crate) enum AddressBarNav {
     Direct(PathBuf),
+    DriveList(Option<PathBuf>),
     HistoryBack,
     HistoryForward,
 }
@@ -1399,6 +1401,7 @@ impl App {
         let forward_target = self.folder_history_forward_target().cloned();
         // Codex P2-1: ★固定 中は履歴/親/ツリーボタンを disabled (= 余計な処理を起動しない)
         let snapshot_active = self.is_snapshot_active();
+        let drive_list_active = self.items_are_drive_list;
         let recent_folders: Vec<PathBuf> = self.recent_folder_entries().to_vec();
         let favorite_target = self.current_favorite_target();
         let current_is_favorite = favorite_target.as_ref().is_some_and(|p| {
@@ -1449,7 +1452,9 @@ impl App {
                         // 検索 (Ctrl+G / Ctrl+S) 中は ←/→ を無効化する。検索は透明な
                         // 一時オーバーレイで、フォルダ履歴の概念が適用されないため。
                         // ★固定 中も同様に無効化 (Codex P2-1)。
-                        let back_hover = if snapshot_active {
+                        let back_hover = if drive_list_active {
+                            "ドライブ一覧では履歴ナビを使用できません".to_string()
+                        } else if snapshot_active {
                             "★固定中は履歴ナビを使用できません".to_string()
                         } else if search_active {
                             "検索中はフォルダ履歴を使用できません".to_string()
@@ -1461,7 +1466,10 @@ impl App {
                         };
                         if ui
                             .add_enabled(
-                                back_target.is_some() && !search_active && !snapshot_active,
+                                back_target.is_some()
+                                    && !search_active
+                                    && !snapshot_active
+                                    && !drive_list_active,
                                 egui::Button::new("←"),
                             )
                             .hover_tip(back_hover)
@@ -1469,7 +1477,9 @@ impl App {
                         {
                             result = Some(AddressBarNav::HistoryBack);
                         }
-                        let forward_hover = if snapshot_active {
+                        let forward_hover = if drive_list_active {
+                            "ドライブ一覧では履歴ナビを使用できません".to_string()
+                        } else if snapshot_active {
                             "★固定中は履歴ナビを使用できません".to_string()
                         } else if search_active {
                             "検索中はフォルダ履歴を使用できません".to_string()
@@ -1481,7 +1491,10 @@ impl App {
                         };
                         if ui
                             .add_enabled(
-                                forward_target.is_some() && !search_active && !snapshot_active,
+                                forward_target.is_some()
+                                    && !search_active
+                                    && !snapshot_active
+                                    && !drive_list_active,
                                 egui::Button::new("→"),
                             )
                             .hover_tip(forward_hover)
@@ -1596,6 +1609,11 @@ impl App {
                     ui.add_enabled_ui(place_nav_enabled, |ui| {
                         ui.menu_button("場所▼", |ui| {
                             ui.set_min_width(220.0);
+                            if ui.button("ドライブ一覧").clicked() {
+                                result = Some(AddressBarNav::DriveList(None));
+                                ui.close();
+                            }
+                            ui.separator();
                             let quick_locations = crate::known_folders::quick_locations();
                             for location in quick_locations {
                                 let full = location.path.to_string_lossy().to_string();
@@ -1795,8 +1813,11 @@ impl App {
                             };
                             self.address_has_focus = resp.has_focus();
                             if !is_snap_active && resp.lost_focus() && enter_pressed {
-                                let p = PathBuf::from(&self.address);
-                                if let Some(resolved) = resolve_folder_bar_nav_path(&p) {
+                                if self.address.trim().is_empty() {
+                                    result = Some(AddressBarNav::DriveList(None));
+                                } else if let Some(resolved) =
+                                    resolve_folder_bar_nav_path(&PathBuf::from(&self.address))
+                                {
                                     result = Some(AddressBarNav::Direct(resolved));
                                 }
                             }
@@ -2373,7 +2394,7 @@ impl App {
             }
         }
         // 右クリック → コンテキストメニュー
-        if response.secondary_clicked() {
+        if !self.items_are_drive_list && response.secondary_clicked() {
             self.selected = Some(idx);
             self.update_last_selected_image();
             self.context_menu_idx = Some(idx);
@@ -2383,7 +2404,9 @@ impl App {
         // ── native ファイル D&D の開始検出 (docs/file-drag-drop-design.md §5.4) ──
         // primary (左) ボタンのドラッグだけを起点にする。native drag 直後の
         // 1 フレームは抑止 (幽霊ドラッグ防止の保険、§6.1)。
-        if !self.native_drag_just_finished && response.drag_started_by(egui::PointerButton::Primary)
+        if !self.items_are_drive_list
+            && !self.native_drag_just_finished
+            && response.drag_started_by(egui::PointerButton::Primary)
         {
             match decide_drag_payload(&self.items, &self.checked, idx) {
                 DragDecision::Start {
@@ -2587,7 +2610,11 @@ impl App {
                                 let has_mask = self.mask_pages.contains(&idx);
                                 let has_conceal = self.conceal_pages.contains(&idx);
                                 let has_comic = self.comic_pages.contains(&idx);
-                                let rating = self.get_rating(idx);
+                                let rating = if self.items_are_drive_list {
+                                    0
+                                } else {
+                                    self.get_rating(idx)
+                                };
                                 // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
                                 // process_thumb_adjust_budget が逐次処理する。
                                 // ドラッグ中は両経路ともスキップして生サムネ表示に戻す
@@ -2601,7 +2628,11 @@ impl App {
                                     self.thumb_adjust_tex.get(&idx)
                                 };
                                 let tags = self.cell_tag_list(idx).to_vec();
-                                let filter_match = self.folder_rating_match(idx);
+                                let filter_match = if self.items_are_drive_list {
+                                    None
+                                } else {
+                                    self.folder_rating_match(idx)
+                                };
                                 let filter_match_count = filter_match.map(|(c, _)| c);
                                 // 📌 バッジ (金色) — ユーザーが Pin 操作した対象アイテムの
                                 // 目印。「現在表示中のコンテナの pin source = この item」
@@ -2643,6 +2674,7 @@ impl App {
                                     &tags,
                                     filter_match_count,
                                     has_pin,
+                                    self.items_are_drive_list,
                                 );
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
                                 // ★内訳 tooltip を出す。

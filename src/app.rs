@@ -2887,6 +2887,10 @@ pub struct App {
     /// このフラグが true のときだけ (Codex P2): Ctrl+G から実フォルダ/ZIP/PDF を
     /// 開いた後に rating 変更して合成ビューが書き戻される事故を防ぐ。
     pub(crate) items_are_global_search_view: bool,
+    /// 現在の `items` がドライブ一覧の仮想ビューかを示す。
+    /// `current_folder = None` と併用し、通常フォルダの D&D / rating / 代表サムネ探索
+    /// を明示的に止める。
+    pub(crate) items_are_drive_list: bool,
 
     // ── お気に入り編集ポップアップ ────────────────────────────────
     pub(crate) show_favorites_editor: bool,
@@ -5146,6 +5150,7 @@ impl App {
             fs_early_dims: std::collections::HashMap::new(),
             items_generation: 0,
             items_are_global_search_view: false,
+            items_are_drive_list: false,
             show_favorites_editor: false,
             favorite_delete_confirm: None,
             favorites_index_size_cache: None,
@@ -6931,6 +6936,149 @@ impl App {
     /// すべての呼び出しが通る。
     pub fn load_folder(&mut self, path: PathBuf) {
         self.load_folder_with_scan(path, None);
+    }
+
+    pub(crate) fn enter_drive_list(&mut self, origin: Option<PathBuf>) {
+        crate::logger::log("=== enter_drive_list ===");
+
+        if let Some(cur) = self.current_folder.clone() {
+            let leaving_search_view = self.items_are_global_search_view
+                || crate::folder_tree::path_eq(&cur, &search_results_synthetic_path());
+            if !leaving_search_view && !self.items_are_drive_list {
+                self.folder_history
+                    .insert(cur, (self.scroll_offset_y, self.selected));
+            }
+        }
+
+        self.close_fullscreen();
+        if let Some(pending) = self.folder_nav_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.clear_pending_folder_nav_steps();
+        self.bump_full_context_for_load();
+
+        let (tx, rx) = mpsc::channel();
+        self.tx = tx.clone();
+        self.rx = rx;
+
+        self.current_folder = None;
+        self.current_folder_last_mtime = None;
+        self.current_folder_signature = None;
+        self.current_folder_rating_cache = None;
+        self.archive_source_override = None;
+        self.address.clear();
+        self.selected = None;
+        self.scroll_offset_y = 0.0;
+        self.scroll_to_selected = false;
+        self.scroll_hint.store(0, Ordering::Relaxed);
+        self.search_filter = None;
+        self.search_filter_origin_folder = None;
+        self.search_query.clear();
+        self.show_search_bar = false;
+        self.checked.clear();
+        self.requested.clear();
+        self.pending_finalize.clear();
+        self.texture_backlog.clear();
+        self.keep_range = (0, 0);
+        self.keep_set.clear();
+        self.keep_start_shared.store(0, Ordering::Relaxed);
+        self.keep_end_shared.store(0, Ordering::Relaxed);
+        self.visible_end_shared.store(0, Ordering::Relaxed);
+        self.metadata_cache.clear();
+        self.exif_cache.clear();
+        self.xmp_cache.clear();
+        self.xmp_panorama_info.clear();
+        self.tags_cache.clear();
+        self.rotation_cache.clear();
+        self.rating_cache.clear();
+        self.reset_folder_rating_counts();
+        self.adjustment_cache.clear();
+        self.thumb_pixels.clear();
+        self.thumb_adjust_tex.clear();
+        self.fs_cache.clear();
+        self.fs_upload_backlog.clear();
+        self.fs_pending.clear();
+        self.input_generation.clear();
+        self.clear_all_final_pipeline_caches();
+
+        if let Some(pending) = self.search_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(pending) = self.metadata_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.pdf_enumerate_pending = None;
+        self.zip_enumerate_pending = None;
+        self.fs_nav_after_pdf_enumerate = None;
+        self.virtual_folder_writeback = None;
+        self.pdf_prefetch_grace_until = None;
+
+        let items: Vec<GridItem> = crate::known_folders::available_drives()
+            .into_iter()
+            .map(GridItem::Folder)
+            .collect();
+        let image_metas = vec![None; items.len()];
+        self.install_new_items(items, image_metas);
+        self.items_are_drive_list = true;
+
+        for idx in 0..self.items.len() {
+            let has_pin = match &self.items[idx] {
+                GridItem::Folder(path) => {
+                    let key = crate::path_key::normalize_keep_drive(path);
+                    self.folder_pin_map.contains_key(&key)
+                }
+                _ => false,
+            };
+            if !has_pin {
+                self.thumbnails[idx] = ThumbnailState::Failed;
+            }
+        }
+
+        self.rebuild_visible_indices();
+        if let Some(origin) = origin {
+            self.selected = self.items.iter().position(|item| {
+                matches!(item, GridItem::Folder(path) if crate::folder_tree::path_eq(path, &origin))
+            });
+            if self.selected.is_some() {
+                self.scroll_to_selected = true;
+            }
+        }
+        if self.selected.is_none() {
+            self.selected = self.visible_indices.first().copied();
+        }
+
+        if self.folder_pin_map.is_empty() {
+            self.reload_queue = None;
+            self.heavy_io_queue = None;
+            return;
+        }
+
+        let catalog_arc = self.get_or_open_catalog(&drive_list_catalog_path());
+        let cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = Arc::new(std::sync::RwLock::new(
+            catalog_arc
+                .as_ref()
+                .and_then(|catalog| catalog.load_all().ok())
+                .unwrap_or_default(),
+        ));
+        self.seed_drive_list_pin_thumbs_from_catalog(&cache_map, catalog_arc.as_ref());
+        self.cache_gen_total = 0;
+        self.cache_gen_done = Arc::new(AtomicUsize::new(0));
+        let reload_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let heavy_io_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        self.reload_queue = Some(Arc::clone(&reload_queue));
+        self.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
+        let cancel = Arc::clone(&self.cancel_token);
+        self.spawn_thumbnail_workers(
+            &tx,
+            cancel,
+            reload_queue,
+            heavy_io_queue,
+            cache_map,
+            catalog_arc,
+            self.folder_thumb_pin_db.clone(),
+        );
     }
 
     /// 通常のフォルダ / ZIP / PDF はそのまま開き、変換対応アーカイブ (RAR/7z/LZH)
@@ -10264,6 +10412,7 @@ impl App {
         // 既定は「実ビュー」。`replace_search_view_items` (= 合成ビュー経路) は
         // この後で true に上書きする。
         self.items_are_global_search_view = false;
+        self.items_are_drive_list = false;
         // 親コンテナ (Folder/ZipFile/PdfFile) のピン情報を 1 度の lookup_many で取得し、
         // make_load_request からの per-frame DB ヒットを回避する。pin がレアケースで
         // 大半は empty なので、典型的なフォルダで HashMap は数百 bytes に収まる。
@@ -10468,6 +10617,161 @@ impl App {
             crate::logger::log(format!(
                 "folder_thumb_pin: video seed = {seeded}, purged stale = {purged}"
             ));
+        }
+    }
+
+    fn drive_list_pin_seed_entry(
+        &mut self,
+        leaf_container: &std::path::Path,
+        leaf_source: &crate::folder_thumb_pins::FolderPinSource,
+    ) -> Option<crate::catalog::CacheEntry> {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        match leaf_source {
+            FolderPinSource::File { rel, kind } => {
+                let fname = direct_pin_rel_file_name(rel)?;
+                match kind {
+                    FileKind::Image => {
+                        let cat = self.get_or_open_catalog(leaf_container)?;
+                        cat.load_one(&fname).ok().flatten()
+                    }
+                    FileKind::Video => {
+                        let video_path = leaf_container.join(rel);
+                        let webp = self
+                            .video_pin_db
+                            .as_ref()
+                            .and_then(|db| db.lookup(&video_path))
+                            .map(|pin| pin.thumb_webp)
+                            .filter(|b| !b.is_empty())?;
+                        Some(crate::catalog::CacheEntry {
+                            mtime: 0,
+                            file_size: 0,
+                            jpeg_data: webp,
+                            source_dims: None,
+                        })
+                    }
+                    FileKind::ZipFile => {
+                        let cat = self.get_or_open_catalog(leaf_container)?;
+                        cat.load_one(&format!("{}{}", CACHE_KEY_ZIP, fname))
+                            .ok()
+                            .flatten()
+                    }
+                    FileKind::PdfFile => {
+                        let cat = self.get_or_open_catalog(leaf_container)?;
+                        cat.load_one(&format!("{}{}", CACHE_KEY_PDF, fname))
+                            .ok()
+                            .flatten()
+                    }
+                    FileKind::Folder => None,
+                }
+            }
+            FolderPinSource::ZipEntry { zip_rel, entry } => {
+                let zip_path = if zip_rel.is_empty() {
+                    leaf_container.to_path_buf()
+                } else {
+                    leaf_container.join(zip_rel)
+                };
+                let cat = self.get_or_open_catalog(&zip_path)?;
+                cat.load_one(entry).ok().flatten()
+            }
+            FolderPinSource::PdfPage { pdf_rel, page } => {
+                let pdf_path = if pdf_rel.is_empty() {
+                    leaf_container.to_path_buf()
+                } else {
+                    leaf_container.join(pdf_rel)
+                };
+                let cat = self.get_or_open_catalog(&pdf_path)?;
+                cat.load_one(&crate::grid_item::pdf_page_cache_key(*page))
+                    .ok()
+                    .flatten()
+            }
+        }
+    }
+
+    fn seed_drive_list_pin_thumbs_from_catalog(
+        &mut self,
+        cache_map: &Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        >,
+        drive_list_catalog: Option<&Arc<crate::catalog::CatalogDb>>,
+    ) {
+        if self.folder_pin_map.is_empty() {
+            return;
+        }
+        let Some(target_cat) = drive_list_catalog.cloned() else {
+            return;
+        };
+        let pin_db = self.folder_thumb_pin_db.clone();
+        let pin_db_ref = pin_db.as_deref();
+        let mut seeded = 0u32;
+        for idx in 0..self.items.len() {
+            let Some((container_path, source, base_key)) = self.items.get(idx).and_then(|item| {
+                let GridItem::Folder(path) = item else {
+                    return None;
+                };
+                let key = crate::path_key::normalize_keep_drive(path);
+                let source = self.folder_pin_map.get(&key)?.clone();
+                let base_key = container_cache_base_key(
+                    item,
+                    true,
+                    Some(self.settings.folder_thumb_sort),
+                    self.settings.folder_thumb_depth,
+                )?;
+                Some((path.clone(), source, base_key))
+            }) else {
+                continue;
+            };
+            let Some((leaf_container, leaf_source)) = resolve_drive_list_pin_source_no_io(
+                &container_path,
+                &source,
+                pin_db_ref,
+                self.settings.folder_thumb_depth as usize,
+            ) else {
+                continue;
+            };
+            let Some(prefix) = drive_list_pinned_cache_key_prefix(&base_key, &leaf_source) else {
+                continue;
+            };
+            let Some(entry) = self.drive_list_pin_seed_entry(&leaf_container, &leaf_source) else {
+                continue;
+            };
+            let key = drive_list_pinned_cache_key(&prefix, entry.mtime, entry.file_size);
+            let already_cached = cache_map
+                .read()
+                .ok()
+                .and_then(|map| map.get(&key).cloned())
+                .is_some_and(|cached| {
+                    cached.mtime == entry.mtime
+                        && cached.file_size == entry.file_size
+                        && cached.jpeg_data == entry.jpeg_data
+                });
+            if already_cached {
+                continue;
+            }
+            match target_cat.save_thumb_bytes(
+                &key,
+                entry.mtime,
+                entry.file_size,
+                entry.source_dims,
+                &entry.jpeg_data,
+            ) {
+                Ok(true) => {
+                    if let Ok(mut map) = cache_map.write() {
+                        map.insert(key, entry);
+                    }
+                    seeded += 1;
+                }
+                Ok(false) => {
+                    crate::logger::log(format!(
+                        "drive-list pin seed: cached bytes are not decodable ({prefix})"
+                    ));
+                }
+                Err(e) => {
+                    crate::logger::log(format!("drive-list pin seed failed: {e} ({prefix})"));
+                }
+            }
+        }
+        if seeded > 0 {
+            crate::logger::log(format!("drive-list pin seed = {seeded}"));
         }
     }
 
@@ -13102,27 +13406,44 @@ impl App {
             if !need_load {
                 continue;
             }
-            let Some((mtime, file_size)) = self.image_metas.get(i).copied().flatten() else {
-                continue;
-            };
             // T54: Ctrl+S 検索結果は full-path キーで衝突回避
             let use_full_path_keys = self.use_full_path_cache_keys();
-            let Some(mut req) = self.items.get(i).and_then(|item| {
-                make_load_request(
-                    item,
-                    i,
-                    mtime,
-                    file_size,
-                    false,
-                    self.pdf_current_password.as_deref(),
-                    Some(self.settings.folder_thumb_sort),
-                    self.settings.folder_thumb_depth,
-                    &self.folder_pin_map,
-                    self.folder_thumb_pin_db.as_deref(),
-                    self.video_pin_db.as_ref(),
-                    use_full_path_keys,
-                )
-            }) else {
+            let req_opt = if self.items_are_drive_list {
+                self.items.get(i).and_then(|item| {
+                    make_drive_list_pin_load_request(
+                        item,
+                        i,
+                        self.settings.folder_thumb_sort,
+                        self.settings.folder_thumb_depth,
+                        &self.folder_pin_map,
+                        self.folder_thumb_pin_db.as_deref(),
+                    )
+                })
+            } else {
+                let Some((mtime, file_size)) = self.image_metas.get(i).copied().flatten() else {
+                    continue;
+                };
+                self.items.get(i).and_then(|item| {
+                    make_load_request(
+                        item,
+                        i,
+                        mtime,
+                        file_size,
+                        false,
+                        self.pdf_current_password.as_deref(),
+                        Some(self.settings.folder_thumb_sort),
+                        self.settings.folder_thumb_depth,
+                        &self.folder_pin_map,
+                        self.folder_thumb_pin_db.as_deref(),
+                        self.video_pin_db.as_ref(),
+                        use_full_path_keys,
+                    )
+                })
+            };
+            let Some(mut req) = req_opt else {
+                if self.items_are_drive_list {
+                    self.thumbnails[i] = ThumbnailState::Failed;
+                }
                 continue;
             };
             req.priority = i >= visible_raw_start && i < visible_raw_end;
@@ -13548,7 +13869,7 @@ impl App {
         /// 占有させないために、`last_input_at` ベースのクールダウンを追加している。
         const INPUT_IDLE_SECS: f64 = 0.5;
 
-        if !self.settings.thumb_idle_upgrade {
+        if !self.settings.thumb_idle_upgrade || self.items_are_drive_list {
             return;
         }
 
@@ -14251,6 +14572,8 @@ impl App {
                         .and_then(|n| n.to_str())
                         .map(|s| s.to_string());
                     return Some(crate::ui_main::AddressBarNav::Direct(parent.to_path_buf()));
+                } else {
+                    return Some(crate::ui_main::AddressBarNav::DriveList(Some(cur.clone())));
                 }
             }
         }
@@ -14258,6 +14581,7 @@ impl App {
         let history_shortcut_allowed = !self.global_search.active
             && !self.favsearch.active
             && !self.show_search_bar
+            && !self.items_are_drive_list
             && !self.is_snapshot_active(); // Codex P2-1: ★固定 中は履歴ナビ block
         if alt_left && history_shortcut_allowed {
             return Some(crate::ui_main::AddressBarNav::HistoryBack);
@@ -15941,7 +16265,7 @@ impl App {
         // 出していたが、ユーザー設定が壊れる hidden mode だった。
         let rating_filter = self.effective_rating_filter();
         // すべてのバケットが true ならレーティングフィルタは無効 (常に通す)
-        let rating_filter_active = !rating_filter.iter().all(|&b| b);
+        let rating_filter_active = !self.items_are_drive_list && !rating_filter.iter().all(|&b| b);
 
         let n = self.items.len();
         let mut result = Vec::with_capacity(n);
@@ -17380,6 +17704,9 @@ impl App {
     }
 
     pub(crate) fn apply_rating_to_selection(&mut self, stars: u8) {
+        if self.items_are_drive_list {
+            return;
+        }
         let stars = stars.min(5);
         let targets = self.ratable_targets();
         if targets.is_empty() {
@@ -27159,7 +27486,9 @@ impl eframe::App for App {
             // 明示的な Light / Dark 選択はそのまま使う。初回セットアップダイアログでは
             // テーマ / AI 利用範囲 / ZIP/PDF の開き方をまとめて確認する。
 
-            if let Some(folder) = crate::known_folders::startup_folder(
+            if self.settings.startup_folder_mode == crate::settings::StartupFolderMode::Drives {
+                self.enter_drive_list(None);
+            } else if let Some(folder) = crate::known_folders::startup_folder(
                 self.settings.startup_folder_mode,
                 self.settings.last_folder.as_deref(),
                 self.settings.startup_folder_path.as_deref(),
@@ -27929,6 +28258,10 @@ impl eframe::App for App {
             } else if let Some(nav) = input_nav.or(address_nav) {
                 match nav {
                     crate::ui_main::AddressBarNav::Direct(path) => Some(path),
+                    crate::ui_main::AddressBarNav::DriveList(origin) => {
+                        self.enter_drive_list(origin);
+                        None
+                    }
                     crate::ui_main::AddressBarNav::HistoryBack => {
                         let snapshot = self.folder_nav_history_snapshot();
                         let target = self.navigate_folder_history_back();
@@ -28849,6 +29182,165 @@ fn image_full_path_cache_key(path: &std::path::Path) -> String {
     format!("imgthumb:{}", path.to_string_lossy())
 }
 
+fn drive_list_catalog_path() -> PathBuf {
+    PathBuf::from("__mimageviewer_drive_list__")
+}
+
+fn drive_display_label(path: &std::path::Path) -> Option<String> {
+    let s = path.as_os_str().to_string_lossy();
+    let trimmed = s.trim_end_matches(['\\', '/']);
+    let bytes = trimmed.as_bytes();
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        Some(trimmed.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
+fn pin_source_id_cache_prefix(source: &crate::folder_thumb_pins::FolderPinSource) -> String {
+    let entry_part = match source {
+        crate::folder_thumb_pins::FolderPinSource::ZipEntry { entry, .. } => entry.as_str(),
+        _ => "-",
+    };
+    let page_part = match source {
+        crate::folder_thumb_pins::FolderPinSource::PdfPage { page, .. } => page.to_string(),
+        _ => "-".to_string(),
+    };
+    format!(
+        "{}|{}|{}|{}|",
+        source.db_kind(),
+        source.rel(),
+        entry_part,
+        page_part
+    )
+}
+
+fn drive_list_pinned_cache_key_prefix(
+    base_key: &str,
+    source: &crate::folder_thumb_pins::FolderPinSource,
+) -> Option<String> {
+    if matches!(
+        source,
+        crate::folder_thumb_pins::FolderPinSource::File {
+            kind: crate::folder_thumb_pins::FileKind::Folder,
+            ..
+        }
+    ) {
+        return None;
+    }
+    Some(format!(
+        "{}{}{}",
+        base_key,
+        crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+        pin_source_id_cache_prefix(source)
+    ))
+}
+
+fn drive_list_pinned_cache_key(prefix: &str, mtime: i64, file_size: i64) -> String {
+    format!("{prefix}{mtime}|{file_size}")
+}
+
+fn direct_pin_rel_file_name(rel: &str) -> Option<String> {
+    let path = std::path::Path::new(rel);
+    if path.components().count() != 1 {
+        return None;
+    }
+    path.file_name().and_then(|n| n.to_str()).map(str::to_owned)
+}
+
+fn resolve_drive_list_pin_source_no_io(
+    container: &std::path::Path,
+    immediate_source: &crate::folder_thumb_pins::FolderPinSource,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    max_depth: usize,
+) -> Option<(PathBuf, crate::folder_thumb_pins::FolderPinSource)> {
+    use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(crate::path_key::normalize_keep_drive(container));
+    let mut current_container = container.to_path_buf();
+    let mut current_source = immediate_source.clone();
+    let mut cascades_remaining = max_depth;
+    loop {
+        let FolderPinSource::File {
+            rel,
+            kind: FileKind::Folder,
+        } = &current_source
+        else {
+            return Some((current_container, current_source));
+        };
+        if cascades_remaining == 0 {
+            return Some((current_container, current_source));
+        }
+        let next_container = current_container.join(rel);
+        let next_key = crate::path_key::normalize_keep_drive(&next_container);
+        if visited.contains(&next_key) {
+            crate::logger::log(format!(
+                "drive-list pin: cascade cycle at {}",
+                next_container.display()
+            ));
+            return Some((current_container, current_source));
+        }
+        let next_source = pin_db.and_then(|db| db.lookup(&next_container))?;
+        let compatible = match &next_source {
+            FolderPinSource::File { .. } => true,
+            FolderPinSource::ZipEntry { zip_rel, .. } => !zip_rel.is_empty(),
+            FolderPinSource::PdfPage { pdf_rel, .. } => !pdf_rel.is_empty(),
+        };
+        if !compatible {
+            crate::logger::log(format!(
+                "drive-list pin: incompatible cascade source at {}",
+                next_container.display()
+            ));
+            return Some((current_container, current_source));
+        }
+        visited.insert(next_key);
+        current_container = next_container;
+        current_source = next_source;
+        cascades_remaining -= 1;
+    }
+}
+
+fn make_drive_list_pin_load_request(
+    item: &GridItem,
+    idx: usize,
+    folder_thumb_sort: crate::settings::SortOrder,
+    folder_thumb_depth: u32,
+    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+) -> Option<LoadRequest> {
+    let GridItem::Folder(container_path) = item else {
+        return None;
+    };
+    let container_key = crate::path_key::normalize_keep_drive(container_path);
+    let source = pin_map.get(&container_key)?;
+    if !pin_source_compatible_with_container(ContainerKindForPin::Folder, source) {
+        crate::logger::log(format!(
+            "drive-list pin: incompatible source for {} (source={:?})",
+            container_path.display(),
+            source,
+        ));
+        return None;
+    }
+    let base_key =
+        container_cache_base_key(item, true, Some(folder_thumb_sort), folder_thumb_depth)?;
+    let (_, leaf_source) = resolve_drive_list_pin_source_no_io(
+        container_path,
+        source,
+        pin_db,
+        folder_thumb_depth as usize,
+    )?;
+    let cache_key_prefix = drive_list_pinned_cache_key_prefix(&base_key, &leaf_source)?;
+    Some(LoadRequest {
+        idx,
+        path: container_path.clone(),
+        cache_key_override: Some(base_key.clone()),
+        folder_thumb_sort: Some(folder_thumb_sort),
+        folder_thumb_depth,
+        pinned_only: Some(crate::thumb_loader::PinnedOnlyRequest { cache_key_prefix }),
+        ..Default::default()
+    })
+}
+
 /// GridItem から LoadRequest を構築する。画像 / ZIP 内画像 / PDF ページ / フォルダ以外は None を返す。
 ///
 /// `pin_map` は親コンテナ (Folder/ZipFile/PdfFile) のピン source 一覧で、
@@ -29302,6 +29794,7 @@ fn apply_folder_thumb_pin(
             input_seq: base_req.input_seq,
             items_gen: base_req.items_gen,
             context_epoch: base_req.context_epoch,
+            pinned_only: None,
         };
     }
 
@@ -29336,6 +29829,7 @@ fn apply_folder_thumb_pin(
         input_seq: base_req.input_seq,
         items_gen: base_req.items_gen,
         context_epoch: base_req.context_epoch,
+        pinned_only: None,
     }
 }
 
@@ -29623,6 +30117,53 @@ pub(crate) fn cell_has_lower_left_container_badge(item: &GridItem, thumb: &Thumb
     }
 }
 
+fn draw_drive_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) {
+    let side = inner.width().min(inner.height());
+    let w = (side * 0.48).clamp(36.0, 72.0);
+    let h = (side * 0.34).clamp(24.0, 48.0);
+    let center = inner.center() - egui::vec2(0.0, 12.0);
+    let body = egui::Rect::from_center_size(center, egui::vec2(w, h));
+    let fill = if dark {
+        egui::Color32::from_rgb(78, 88, 100)
+    } else {
+        egui::Color32::from_rgb(210, 218, 226)
+    };
+    let face = if dark {
+        egui::Color32::from_rgb(48, 56, 66)
+    } else {
+        egui::Color32::from_rgb(244, 247, 250)
+    };
+    let stroke = if dark {
+        egui::Color32::from_rgb(130, 145, 160)
+    } else {
+        egui::Color32::from_rgb(120, 134, 150)
+    };
+    painter.rect_filled(body, 5.0, fill);
+    painter.rect_stroke(
+        body,
+        5.0,
+        egui::Stroke::new(1.5, stroke),
+        egui::StrokeKind::Middle,
+    );
+    let front = egui::Rect::from_min_max(
+        egui::pos2(body.min.x + w * 0.12, body.center().y + h * 0.12),
+        egui::pos2(body.max.x - w * 0.12, body.max.y - h * 0.16),
+    );
+    painter.rect_filled(front, 2.0, face);
+    painter.line_segment(
+        [
+            egui::pos2(body.min.x + w * 0.18, body.min.y + h * 0.32),
+            egui::pos2(body.max.x - w * 0.18, body.min.y + h * 0.32),
+        ],
+        egui::Stroke::new(1.4, stroke),
+    );
+    painter.circle_filled(
+        egui::pos2(front.max.x - w * 0.10, front.center().y),
+        (side * 0.025).clamp(2.0, 3.5),
+        egui::Color32::from_rgb(70, 190, 120),
+    );
+}
+
 pub(crate) fn draw_cell(
     ui: &egui::Ui,
     rect: egui::Rect,
@@ -29650,6 +30191,7 @@ pub(crate) fn draw_cell(
     // **そのアイテムに対して** Pin 操作したわけではないので badge は出さない (= 状態の
     // 二重提示を避け、「badge = 自分が Pin 操作した対象」を 1 対 1 で対応させる)。
     has_pin: bool,
+    is_drive_list: bool,
 ) {
     if !ui.is_rect_visible(rect) {
         return;
@@ -29688,7 +30230,13 @@ pub(crate) fn draw_cell(
 
     match item {
         GridItem::Folder(path) => {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let label;
+            let name = if is_drive_list {
+                label = drive_display_label(path).unwrap_or_else(|| path.display().to_string());
+                label.as_str()
+            } else {
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+            };
             match thumb {
                 ThumbnailState::Loaded { tex, .. } => {
                     let use_tex = adjusted_tex.unwrap_or(tex);
@@ -29696,13 +30244,17 @@ pub(crate) fn draw_cell(
                     draw_folder_badge(painter, inner, name);
                 }
                 ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
-                    painter.text(
-                        inner.center() - egui::vec2(0.0, 14.0),
-                        egui::Align2::CENTER_CENTER,
-                        "📁",
-                        egui::FontId::proportional(42.0),
-                        egui::Color32::from_rgb(220, 170, 30),
-                    );
+                    if is_drive_list {
+                        draw_drive_icon(painter, inner, dark);
+                    } else {
+                        painter.text(
+                            inner.center() - egui::vec2(0.0, 14.0),
+                            egui::Align2::CENTER_CENTER,
+                            "📁",
+                            egui::FontId::proportional(42.0),
+                            egui::Color32::from_rgb(220, 170, 30),
+                        );
+                    }
                     crate::ui_helpers::draw_cell_filename(
                         painter,
                         inner,
