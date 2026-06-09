@@ -123,3 +123,4 @@ pub mod wic_decoder;
 pub mod xmp_reader;
 pub mod xmp_writer;
 pub mod zip_loader;
+pub mod zip_tree;
