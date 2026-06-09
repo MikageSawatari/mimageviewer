@@ -24,9 +24,16 @@
 | ZIP / PDF 対応が必要な機能 | [docs/virtual-folders.md](docs/virtual-folders.md) |
 | 補正 / プリセット / AI アップスケール / 消しゴム | [docs/preset-and-adjustment.md](docs/preset-and-adjustment.md) |
 | 補正レイヤー / ローカル調整 / レイヤー合成 | [docs/local-adjustment-layer-v1.1.0-plan.md](docs/local-adjustment-layer-v1.1.0-plan.md) と [docs/local-adjust-filter-candidates.md](docs/local-adjust-filter-candidates.md) |
+| キーボード操作 / ショートカット / `consume_key` / `key_pressed` / native VK 判定 | [docs/keymap-spec.md](docs/keymap-spec.md) と [docs/key-customization-impl-plan.md](docs/key-customization-impl-plan.md)。新しいキー操作は原則 `KeyAction` + keymap helper 経由にする |
 | UI の見た目・配色を変える修正 | [docs/ui-snapshot-policy.md](docs/ui-snapshot-policy.md) (egui_kittest スナップショットの更新手順) |
 
 **設計を変えたら該当ドキュメントも同時に更新する** (下の「コード修正時のドキュメント同時更新」参照)。
+
+キー操作を追加・変更するときは、ユーザーが明示していなくても keymap 対応を検討する。
+閲覧・編集・動画の通常ショートカットは `KeyAction` に追加し、`ini_name()` / `context()` /
+`trigger()` / `default_chords()` / `ALL_ACTIONS` / 呼び出し側 helper / `docs/keymap.ini.default` を
+揃える。IME 確定、OS clipboard、D&D、右クリック、マウス、ゲームパッドなど固定扱いにする
+入力は、固定である理由を `docs/keymap-spec.md` に残す。
 
 ## Overview
 
@@ -1201,6 +1208,9 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 - `docs/ui-responsiveness.md` — UI スレッドから新しい I/O / GPU アップロード / read_dir 走査を呼ぶとき、または関連の計装/チェックリストを改定したとき
 - `docs/virtual-folders.md` — ZIP/PDF の分岐表・キャッシュキー規則・DB キー正規化を変えたとき
 - `docs/preset-and-adjustment.md` — キャッシュ無効化ルール・補正/AI の適用順序・プリセットの保存先を変えたとき
+- `docs/keymap-spec.md` / `docs/key-customization-impl-plan.md` / `docs/keymap.ini.default` —
+  キーボード操作やショートカット割り当てを追加・変更したとき。新しいキー操作を固定扱いに
+  する場合も、keymap 対象外である理由を明記する
 
 コードだけ修正してドキュメントを放置しない。設計ドキュメントが腐ると次の修正で同じ罠を踏む。
 

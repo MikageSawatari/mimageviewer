@@ -214,8 +214,8 @@ enum KeyCode { A, B, ... Z, Num0..Num9, F1..F12, Arrow{Up,Down,Left,Right},
 impl KeyCode {
     fn from_egui(k: egui::Key) -> Option<Self>;
     fn to_egui(self) -> Option<egui::Key>;
-    fn from_vk(vk: u16) -> Option<Self>;   // native 動画経路
-    fn to_vk(self) -> Option<u16>;
+    fn from_vk(vk: u32) -> Option<Self>;   // native 動画経路
+    fn to_vk(self) -> Option<u32>;
 }
 
 /// 1 つのキー組み合わせ。key=None は「修飾キー単独」(Shift hold 等)。
@@ -448,3 +448,143 @@ MVP だけでも「各モードのツールキーや M/Z/S 等の再割当」と
 - `docs/architecture-overview.md` — `keymap.rs` モジュールと永続化追記。
 - `htdocs/mimageviewer/manual/` + `index.html` — ユーザー向け説明 (内部用語禁止、
   バージョンタグ禁止)。
+
+---
+
+## 8. 簡易版 (テキスト ini / GUI なし / 競合検知なし) — **推奨方針**
+
+ユーザー提案 (2026-06-08) を採用した軽量版。§5 の最重量・最高リスクだった
+**設定 UI (フェーズ C)** と **競合検知 / 汎用 hold 基盤** を削れる。
+実装時の詳細は [key-customization-impl-plan.md](key-customization-impl-plan.md) を優先する。
+
+### 8.1 仕様
+
+- 判定箇所に「機能 (Action) 単位」の keymap 変換を挟む。**デフォルトキーはコードに残し
+  (= 現状の引数をそのまま渡す)、ini には上書き分だけを書く。** 未移行 / 未上書きの箇所は
+  従来通り動く (段階移行・低リスク)。
+- keymap は `%APPDATA%/mimageviewer/keymap.ini` 等のテキストを**上級者が手書き**。
+  起動時に 1 回読むだけ (ファイル監視やリロード UI は任意)。
+- **競合検知しない。** 同じキーに複数機能を割り当てても警告しない:
+  - **consume 経路** (フルスクリーン/編集): イベント消費型なので**先に判定した方が勝つ**
+    (= 提案通りの挙動)。
+  - **VK match 経路** (動画): `match` のアーム順で**先頭一致が勝つ**。
+  - **key_pressed 経路** (グリッド): 非消費なので衝突すると**両方発火**する点だけ注意
+    (件数が少なく実害は小さいが、仕様として明記する)。
+- **修飾キーは「修飾として検出できるキー」にだけ差し替え可。** Shift→Ctrl / Alt は可、
+  Shift→M は不可。これにより hold ジェスチャ (ルーペ = `i.modifiers.shift`) は
+  `i.modifiers.<別修飾>` を読むだけで済み、§4.1 の hold 基盤が**不要**になる。
+
+### 8.2 中核 (UI なし版)
+
+```rust
+// 機能の identity。コンテキストを名前に畳み込むと「線引き」が明示的になる。
+// 同じ物理キーでも文脈が違えば別 Action (S=slideshow / S=select tool / S=tile)。
+// 同じ機能を複数箇所で参照する場合 (例: keydown サマリと実消費) は同じ Action を渡す。
+enum Action { FsSlideshow, FsRotateCw, EraseToolSelect, VideoMute, GridOpen, /* ... */ }
+
+struct Chord { ctrl: bool, shift: bool, alt: bool, key: Option<KeyName> } // None=修飾単独 hold
+struct Keymap { overrides: HashMap<Action, Vec<Chord>> }          // ini 由来。無ければ空
+
+impl Keymap {
+    // (A) consume 経路: 上書きがあればそれを、無ければ渡されたデフォルトを consume。
+    fn consume(&self, ctx, act: Action, def_mods: egui::Modifiers, def_key: egui::Key) -> bool;
+    // (B) key_pressed 経路 (非消費)
+    fn pressed(&self, ctx, act: Action, def_key: egui::Key, def_mods: egui::Modifiers) -> bool;
+    // (C) VK 経路 (動画)
+    fn matches_vk(&self, act: Action, key: &NativeVideoKeyEvent,
+                  def_vk: u32, def_ctrl: bool, def_shift: bool, def_alt: bool) -> bool;
+    // (C-2) native presenter/HUD から UI 側へ転送すべきキーか
+    fn native_video_shortcut_key(&self, key: &NativeVideoKeyEvent) -> bool;
+    // (D) hold (修飾のみ可): 上書き修飾 or デフォルト修飾を i.modifiers から読む
+    fn modifier_held(&self, ctx, act: Action, def: ModKind) -> bool;
+}
+```
+
+### 8.3 1 箇所あたりの差分 (最小)
+
+```rust
+// before
+let key_s = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S));
+// after — デフォルトは引数で同居。ini に FsSlideshow 上書きがあればそちらを使う。
+let key_s = self.keymap.consume(ctx, Action::FsSlideshow, egui::Modifiers::NONE, egui::Key::S);
+```
+
+```ini
+# keymap.ini (上書きだけ書く。書かない機能はコードのデフォルトのまま)
+[FsImage]
+FsSlideshow = P            ; スライドショーを P に戻す
+FsRotateCw  = Ctrl+R
+
+[Erase]
+EraseToolSelect = A
+
+[FsImage.hold]
+FsLoupeHold = Ctrl         ; ルーペ修飾を Shift→Ctrl に (修飾のみ可)
+```
+
+### 8.4 規模の差 (§5 比)
+
+| フェーズ | フル版 | 簡易版 |
+|---|---|---|
+| A 基盤 | 中〜大 (800–1200) | **小〜中 (300–500)** 競合/UI 状態/hold 基盤を削減 |
+| B 配線 | 大 (≈300 箇所) | 大 (同数だが各差分は機械的・低リスク・段階可) |
+| C 設定 UI | 中〜大 (600–900) | **ほぼ 0** (ini を起動時に読むだけ) |
+| D 仕上げ | 小〜中 | 小 (ini 書式と Action 一覧の文書化) |
+
+**合計目安: 5〜8 日相当** (フル版 9〜14 → 短縮)。最長ポールは配線 (B) のままだが、
+危険箇所 (キャプチャ widget・競合・hold 基盤) が消える。
+
+### 8.5 簡易版で割り切る点 (要確認)
+
+- **M キーでルーペ (初回メッセージの例) は不可になる。** §8.1 の「修飾は修飾にだけ
+  差し替え」制約により、ルーペは Shift→Ctrl/Alt の差し替えまで。M (非修飾) で hold は
+  この簡易版の枠外。
+  - もし M ルーペだけは欲しい場合: ルーペ 1 機能だけ「修飾 or 単キー hold」を許す
+    特例 (`def: ModKind` を `Key or Modifier` 型にする) を入れれば小コストで対応可。
+    全機能の hold 基盤を作るより遥かに安い。
+- VK ↔ egui ↔ テキスト名の変換不能キー (記号・テンキー・非 US 配列) は、その経路で
+  上書きを**無視 + ログ警告**で済ませる (whitelist UI は不要)。
+- ini の書式エラー / 未知 Action は**その行だけ警告して無視**、他は生かす。
+
+### 8.6 入力パターンの分類 (確定)
+
+コード上の検出形は実は 3 種類。差し替え可能方向を以下に固定する:
+
+| パターン | 検出 (例) | 該当例 | 差し替え可能方向 |
+|---|---|---|---|
+| **Press** (通常キー押下) | `consume_key(mods,key)` / `key_pressed` / VK match | 大多数。**M=ルーペ・ロックのトグル** ([ui_fullscreen.rs:4754](../src/ui_fullscreen.rs)) もこれ | キー↔任意の通常キー、修飾↔任意の修飾 (自由) |
+| **Modifier-hold** (修飾保持) | `i.modifiers.shift` | Shift 押しっぱなしルーペ ([ui_fullscreen.rs:7340](../src/ui_fullscreen.rs)) | **修飾↔修飾のみ** (Shift→Ctrl/Alt 可、通常キー不可) |
+| **Key-hold** (通常キー保持) | `i.key_down(key)` | Space+ドラッグ一時パン ([ui_erase.rs:1214](../src/ui_erase.rs)) | キー↔通常キー |
+
+- ユーザーの言う「通常キーパターン / モディファイヤパターンの 2 つ」はこの表の
+  Press と Modifier-hold にほぼ対応。Key-hold (Space パン) は稀なので
+  「Press と同じく通常キー同士で差し替え」扱いにすれば実質 2 系統で考えてよい。
+- **唯一できない方向 = 「通常キーを修飾キーとして振る舞わせる」**。通常キーは
+  `i.modifiers` に現れないため。`i.key_down(M)` で *Key-hold* にはできるが、それは
+  「M を他チョードの修飾として使う」ことではない。本簡易版ではこの方向は非対応で確定。
+- 具体例の確認:
+  - **M トグル → L トグル**: 両方 Press。**自由に差し替え可**。✓ (ユーザー許容範囲)
+  - **Shift ルーペ → Ctrl/Alt ルーペ**: Modifier-hold の修飾差し替え。✓
+  - **Shift ルーペ → M ルーペ**: 不可 (M は修飾でない)。✓ ユーザー合意済み
+
+### 8.7 1 機能に複数チョード (確定)
+
+Ctrl+Y / Ctrl+Shift+Z のように 1 機能へ複数キーを割り当てるケースは、
+内部的には `Vec<Chord>` で持ち、ini は**`.1` サフィックスで最大 3 つまで**:
+
+```ini
+[FsImage]
+FsSlideshow.1 = P
+FsSlideshow.2 = S
+[Text]
+TextRedo.1 = Ctrl+Y
+TextRedo.2 = Ctrl+Shift+Z
+```
+
+- **上書きセマンティクス = 全置換**: ある機能に 1 つでも上書き行があれば、その機能の
+  コードデフォルトは**全部無効化**し、ini の列挙だけが有効になる (= デフォルトの一部を
+  捨てたり順序を変えたりが明示的にできる)。
+- 判定は列挙順に試し、consume 経路では最初にマッチしたものを消費 (= §8.1 の先勝ちと整合)。
+- 上限 3 は ini 書式・文書化の都合の soft cap。内部 `Vec` 自体は個数制限不要。
+- 末尾数字ではなく `.1` 形式にする。`FsRate1` / `FsAdjustSlot1` のように Action 名自体が
+  数字で終わるものと衝突させないため。

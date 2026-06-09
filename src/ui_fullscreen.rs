@@ -24,6 +24,7 @@ use std::sync::Arc;
 use crate::app::App;
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
+use crate::keymap::KeyAction;
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::{FullscreenFitMode, ReadingDirection, ReadingFlow, SpreadMode};
 use crate::ui_helpers::{HoverTipExt, open_external_player};
@@ -4351,7 +4352,7 @@ impl App {
                 return action;
             }
             self.handle_meta_undo_keys(ctx);
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Q)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaShowSource) {
                 self.local_adjust_show_source = !self.local_adjust_show_source;
                 self.show_feedback_toast(if self.local_adjust_show_source {
                     "補正レイヤー: 元画像表示 ON".to_string()
@@ -4359,7 +4360,7 @@ impl App {
                     "補正レイヤー: 元画像表示 OFF".to_string()
                 });
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaShowMask) {
                 self.local_adjust_show_mask = !self.local_adjust_show_mask;
                 self.show_feedback_toast(if self.local_adjust_show_mask {
                     "補正レイヤー: マスク表示 ON".to_string()
@@ -4367,65 +4368,65 @@ impl App {
                     "補正レイヤー: マスク表示 OFF".to_string()
                 });
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::D)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaPaintAdd) {
                 self.local_adjust_mask_paint_add = true;
                 self.show_feedback_toast("手動マスク: 描画".to_string());
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaPaintErase) {
                 self.local_adjust_mask_paint_add = false;
                 self.show_feedback_toast("手動マスク: 消去".to_string());
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaToolBrush) {
                 self.set_local_adjust_mask_tool_from_shortcut(
                     crate::app::LocalAdjustMaskTool::Brush,
                 );
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::A)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaToolEdgeBrush) {
                 self.set_local_adjust_mask_tool_from_shortcut(
                     crate::app::LocalAdjustMaskTool::EdgeBrush,
                 );
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::G)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaToolGapFill) {
                 self.set_local_adjust_mask_tool_from_shortcut(
                     crate::app::LocalAdjustMaskTool::GapFillBrush,
                 );
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaToolLasso) {
                 self.set_local_adjust_mask_tool_from_shortcut(
                     crate::app::LocalAdjustMaskTool::Lasso,
                 );
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaToolPolygon) {
                 self.set_local_adjust_mask_tool_from_shortcut(
                     crate::app::LocalAdjustMaskTool::Polygon,
                 );
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaToolSelect) {
                 self.set_local_adjust_mask_tool_from_shortcut(
                     crate::app::LocalAdjustMaskTool::Select,
                 );
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::I)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaToolLine) {
                 self.set_local_adjust_mask_tool_from_shortcut(
                     crate::app::LocalAdjustMaskTool::Line,
                 );
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaToolVLine) {
                 self.set_local_adjust_mask_tool_from_shortcut(
                     crate::app::LocalAdjustMaskTool::VertLine,
                 );
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaToolHLine) {
                 self.set_local_adjust_mask_tool_from_shortcut(
                     crate::app::LocalAdjustMaskTool::HorizLine,
                 );
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaToolRect) {
                 self.set_local_adjust_mask_tool_from_shortcut(
                     crate::app::LocalAdjustMaskTool::Rect,
                 );
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::O)) {
+            if self.keymap.consume_action(ctx, KeyAction::LaToolEllipse) {
                 self.set_local_adjust_mask_tool_from_shortcut(
                     crate::app::LocalAdjustMaskTool::Ellipse,
                 );
@@ -4601,26 +4602,32 @@ impl App {
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let esc = esc || enter_close;
         // 左右キーは上下と分離して処理（RTL 反転のため）
-        let ctrl_d = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowDown));
-        let ctrl_u = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowUp));
+        let ctrl_d = self.keymap.consume_action(ctx, KeyAction::FsCtrlNavNext);
+        let ctrl_u = self.keymap.consume_action(ctx, KeyAction::FsCtrlNavPrev);
         // Ctrl+←/→: 見開き「1 ページずらし」(応急補正)。Single モードでは 1 ページ移動に
         // フォールバックする。動画は Ctrl+←/→ が 30 秒シークなので画像 (= !is_video_fs) のみ消費。
         let ctrl_left = !is_video_fs
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft));
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsSpreadShiftLeft);
         let ctrl_right = !is_video_fs
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight));
-        let ctrl_page_down =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown));
-        let ctrl_page_up =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp));
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsSpreadShiftRight);
+        let ctrl_page_down = self.keymap.consume_action(ctx, KeyAction::FsSiblingNext);
+        let ctrl_page_up = self.keymap.consume_action(ctx, KeyAction::FsSiblingPrev);
         // PageUp/Down のスクロール用 consume も、実際に連続描画している条件
         // (continuous_reading_active_for_idx) に揃える。reading_flow だけで判定すると、
         // 非対応アイテム/解析/比較中に PageUp/Down を消費しておきながら無反応 (デッドキー) になる。
         let continuous_mode_for_page_keys = self.continuous_reading_active_for_idx(fs_idx);
         let page_down = continuous_mode_for_page_keys
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown));
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsContinuousScrollForward);
         let page_up = continuous_mode_for_page_keys
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp));
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsContinuousScrollBack);
         // マウス戻る/進む (Extra1/Extra2 = native XButton) を Ctrl+↑/↓ と等価に扱う。
         let mouse_back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
         let mouse_forward = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2));
@@ -4650,10 +4657,7 @@ impl App {
         });
         let key_home = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Home));
         let key_end = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::End));
-        let key_i = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::I)
-                || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
-        });
+        let key_i = self.keymap.consume_action(ctx, KeyAction::FsToggleMetadata);
         // Space: スライドショー関連 (変数名の紛らわしさ回避のため key_space)。
         // 動画モードでは `handle_video_input` 側で play/pause として消費するため、ここでは
         // 画像系処理に流さない。**`is_video_fs` ではなく純粋な「現在アイテムが Video か」で
@@ -4663,41 +4667,43 @@ impl App {
         let current_item_is_video_for_space =
             matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         let key_space = !current_item_is_video_for_space
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+            && self.keymap.consume_action(ctx, KeyAction::FsSpaceCheck);
         let key_ctrl_s_capture = !is_video_fs
             && self.fs_context_menu_idx.is_none()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S));
+            && self.keymap.consume_action(ctx, KeyAction::FsCapture);
         let key_ctrl_e_export = !is_video_fs
             && self.fs_context_menu_idx.is_none()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E));
+            && self.keymap.consume_action(ctx, KeyAction::FsExport);
         let key_compare_x = !is_video_fs
             && self.fs_context_menu_idx.is_none()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::X));
+            && self.keymap.consume_action(ctx, KeyAction::FsCompareToggle);
         let key_compare_alt_c = !is_video_fs
             && self.fs_context_menu_idx.is_none()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::C));
+            && self.keymap.consume_action(ctx, KeyAction::FsCompareDiff);
         let key_compare_shift_c = !is_video_fs
             && self.fs_context_menu_idx.is_none()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::C));
+            && self.keymap.consume_action(ctx, KeyAction::FsCompareWipe);
         let key_compare_c = !is_video_fs
             && self.fs_context_menu_idx.is_none()
             && !key_compare_alt_c
             && !key_compare_shift_c
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::C));
+            && self.keymap.consume_action(ctx, KeyAction::FsCompareCycle);
         // S: スライドショー 再生/停止 (旧 P キー、左手で押しやすいよう S に移行)
-        let key_s = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S));
-        let key_r = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R));
-        let key_l = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
-        let key_z = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Z));
+        let key_s = self.keymap.consume_action(ctx, KeyAction::FsSlideshow);
+        let key_r = self.keymap.consume_action(ctx, KeyAction::FsRotateCw);
+        let key_l = self.keymap.consume_action(ctx, KeyAction::FsRotateCcw);
+        let key_z = self.keymap.consume_action(ctx, KeyAction::FsAnalysis);
         // V: 360 度パノラマビューワーモード トグル (docs/panorama-360-view-plan.md)。
         // 消しゴムモード中は ui_erase 側が V (vertical line tool) を先に consume するので、
         // ここで奪っても消しゴム中は届かない (= mode-scoped 共存)。
-        let key_v_panorama = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V));
-        let key_g = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::G));
-        let key_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M));
-        let key_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E));
+        let key_v_panorama = self.keymap.consume_action(ctx, KeyAction::FsPanorama);
+        let key_g = self.keymap.consume_action(ctx, KeyAction::FsPixelGrid);
+        let key_m = self
+            .keymap
+            .consume_action(ctx, KeyAction::FsLoupeLockToggle);
+        let key_e = self.keymap.consume_action(ctx, KeyAction::FsEraseMode);
         // B: 透過画像の背景サイクル。消しゴムモードでは ui_erase が B (筆ツール) を既に消費している。
-        let key_b_bg = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
+        let key_b_bg = self.keymap.consume_action(ctx, KeyAction::FsBgCycle);
         // 360 モード中は他モード切替系のキーを抑止 (= フィードバック反映の「機能制限モード」)。
         // - 抑止対象: Z (分析) / S (スライドショー) / E (消しゴム) / M (ルーペ) / B (bg cycle)
         //   / I (メタデータ) / C 系 (比較)
@@ -4726,13 +4732,7 @@ impl App {
         // 動画フルスクリーンの P は handle_video_input が先に「現在フレームをピン留め」として
         // consume するため、ここでは静止画系アイテムだけを対象にする。
         let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
-        let key_p_pin = !current_item_is_video
-            && ctx.input_mut(|i| {
-                !i.modifiers.shift
-                    && !i.modifiers.alt
-                    && !i.modifiers.ctrl
-                    && i.consume_key(egui::Modifiers::NONE, egui::Key::P)
-            });
+        let key_p_pin = !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsPin);
 
         // Shift+F1-F5: 開いている画像が属するコンテナ (フォルダ / ZIP / PDF) に
         // レーティング / Shift+F6: コンテナレーティング解除。
@@ -4777,18 +4777,16 @@ impl App {
         // (消しゴムモードに入らず、1 キーで inpaint までを一気に実行)
         // F9/F10: 隠蔽マスクスロット 1/2 を現ページに適用
         // Shift+F7/F8/F9/F10: 適用済みマスクを削除
-        let delete_erase_mask = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::SHIFT, egui::Key::F7)
-                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::F8)
-        });
-        let delete_conceal_mask = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::SHIFT, egui::Key::F9)
-                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::F10)
-        });
-        let key_f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F7));
-        let key_f8 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F8));
-        let key_f9 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F9));
-        let key_f10 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F10));
+        let delete_erase_mask = self
+            .keymap
+            .consume_action(ctx, KeyAction::FsDeleteEraseMask);
+        let delete_conceal_mask = self
+            .keymap
+            .consume_action(ctx, KeyAction::FsDeleteConcealMask);
+        let key_f7 = self.keymap.consume_action(ctx, KeyAction::FsApplyErase1);
+        let key_f8 = self.keymap.consume_action(ctx, KeyAction::FsApplyErase2);
+        let key_f9 = self.keymap.consume_action(ctx, KeyAction::FsApplyConceal1);
+        let key_f10 = self.keymap.consume_action(ctx, KeyAction::FsApplyConceal2);
         if delete_erase_mask {
             self.delete_erase_mask_in_viewing_mode();
         }
@@ -4867,64 +4865,55 @@ impl App {
         self.handle_meta_undo_keys(ctx);
 
         // ページ構成 (1-5) / 連結方式 (6) / 横方向 (7) 切替
-        let key_1 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num1));
-        let key_2 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num2));
-        let key_3 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num3));
-        let key_4 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num4));
-        let key_5 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num5));
-        let key_6 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Num6));
-        let key_7 = ctx.input_mut(|i| {
-            if i.modifiers.is_none() {
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Num7)
-            } else {
-                false
-            }
-        });
-        let key_0 = ctx.input_mut(|i| {
-            if i.modifiers.is_none() {
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Num0)
-            } else {
-                false
-            }
-        });
+        let key_1 = self.keymap.consume_action(ctx, KeyAction::FsSpreadSingle);
+        let key_2 = self.keymap.consume_action(ctx, KeyAction::FsSpreadLtr);
+        let key_3 = self.keymap.consume_action(ctx, KeyAction::FsSpreadLtrCover);
+        let key_4 = self.keymap.consume_action(ctx, KeyAction::FsSpreadRtl);
+        let key_5 = self.keymap.consume_action(ctx, KeyAction::FsSpreadRtlCover);
+        let key_6 = self
+            .keymap
+            .consume_action(ctx, KeyAction::FsReadingFlowCycle);
+        let key_7 = self
+            .keymap
+            .consume_action(ctx, KeyAction::FsReadingDirectionToggle);
+        let key_0 = self.keymap.consume_action(ctx, KeyAction::FsFitModeCycle);
 
         // U / Shift+U / Alt+U: AI アップスケールモデル サイクル (次 / 前 / なしリセット)
         // 注意: egui の consume_key は matches_logically で判定されるため、Modifiers::NONE が
         // Shift/Alt を伴う入力まで吸収する。具体的な修飾子から先に consume する必要がある。
-        let key_u_alt = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::U));
-        let key_u_shift = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::U));
-        let key_u = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::U));
+        let key_u_alt = self.keymap.consume_action(ctx, KeyAction::FsAiModelReset);
+        let key_u_shift = self.keymap.consume_action(ctx, KeyAction::FsAiModelPrev);
+        let key_u = self.keymap.consume_action(ctx, KeyAction::FsAiModelNext);
         // N キー: AI デノイズサイクル
-        let key_n = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::N));
+        let key_n = self.keymap.consume_action(ctx, KeyAction::FsDenoiseCycle);
         // T / Shift+T / Alt+T: ポストフィルタ (レトロ系) サイクル (次 / 前 / なしリセット)
         // P はグリッド / 動画フルスクリーンのピン留めに統一する。F は動画の FPS/Perf 表示に
         // 使っているため、ポストフィルタは T (Tone / posT filter) に割り当てる。
         // 同様に Alt+T → Shift+T → T の順で consume (matches_logically 対策)。
-        let key_t_alt = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::T));
-        let key_t_shift = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::T));
-        let key_t = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::T));
+        let key_t_alt = self
+            .keymap
+            .consume_action(ctx, KeyAction::FsPostFilterReset);
+        let key_t_shift = self.keymap.consume_action(ctx, KeyAction::FsPostFilterPrev);
+        let key_t = self.keymap.consume_action(ctx, KeyAction::FsPostFilterNext);
 
         // Ctrl+数字キー: 保存スロットからロード
         // (Shift+数字はキー配列によって記号化され egui::Key::Num1 等にマッチしないため CTRL を採用)
         let slot_keys: [bool; 10] = [
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num1)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num2)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num3)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num4)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num5)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num6)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num7)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num8)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num9)),
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Num0)),
+            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot1),
+            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot2),
+            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot3),
+            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot4),
+            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot5),
+            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot6),
+            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot7),
+            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot8),
+            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot9),
+            self.keymap.consume_action(ctx, KeyAction::FsAdjustSlot10),
         ];
 
         // Ctrl+Backspace / Q: 現在ページの個別補正設定を解除 (標準値に戻す)
         // Q は片手で押しやすいショートカット (補正パネルでの操作中に素早く元に戻したい用途)
-        let clear_page_key = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::CTRL, egui::Key::Backspace)
-                || i.consume_key(egui::Modifiers::NONE, egui::Key::Q)
-        });
+        let clear_page_key = self.keymap.consume_action(ctx, KeyAction::FsClearAdjust);
 
         // 表示モード切替 + フィードバック表示
         let new_spread = if key_1 {
@@ -5268,7 +5257,7 @@ impl App {
         // Ctrl+M: 隠蔽加工モード入退場 (分析・補正中は無効)。Phase 1。
         // 見開き / 動画 / モーダル状態は `enter_conceal_mode` 側で適切に分岐する。
         // (Conceal モード中の Ctrl+M / Esc は本関数冒頭の早期 return で処理済み。)
-        let key_ctrl_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::M));
+        let key_ctrl_m = self.keymap.consume_action(ctx, KeyAction::FsConcealMode);
         if key_ctrl_m
             && !self.analysis_mode
             && !self.adjustment_mode
@@ -5281,7 +5270,7 @@ impl App {
 
         // Ctrl+T: テキスト注釈モード入場 (分析・補正・消しゴム・隠蔽・動画中は無効)。
         // テキストモード中の Ctrl+T / Esc は本関数冒頭の早期 return で処理済み。
-        let key_ctrl_t = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::T));
+        let key_ctrl_t = self.keymap.consume_action(ctx, KeyAction::FsTextMode);
         if key_ctrl_t
             && !self.analysis_mode
             && !self.adjustment_mode
@@ -9389,7 +9378,7 @@ impl App {
     /// ルーペ (局所拡大) 描画。
     ///
     /// 有効条件:
-    /// - `fs_loupe_locked` が true (M キーでトグル) か、Shift キーホールド中
+    /// - `fs_loupe_locked` が true (M キーでトグル) か、keymap のルーペ保持修飾キー押下中
     /// - ビューポートにフォーカスがある
     /// - 分析モード・補正モードに入っていない
     /// - カーソルが `full_rect` 内
@@ -9413,17 +9402,15 @@ impl App {
         if self.analysis_mode || self.adjustment_mode {
             return;
         }
-        let (hover, shift_held, focused) = ctx.input(|i| {
-            (
-                i.pointer.hover_pos(),
-                i.modifiers.shift,
-                i.viewport().focused.unwrap_or(true),
-            )
-        });
+        let (hover, focused) =
+            ctx.input(|i| (i.pointer.hover_pos(), i.viewport().focused.unwrap_or(true)));
+        let loupe_hold = self
+            .keymap
+            .modifier_held_action(ctx, KeyAction::FsLoupeHold);
         if !focused {
             return;
         }
-        if !self.fs_loupe_locked && !shift_held {
+        if !self.fs_loupe_locked && !loupe_hold {
             return;
         }
         let Some(cursor) = hover else { return };
@@ -9538,8 +9525,8 @@ impl App {
             egui::Stroke::new(2.0, egui::Color32::WHITE),
             egui::StrokeKind::Outside,
         );
-        // Shift ホールド中は再描画を継続 (キー離したら止める)
-        if shift_held {
+        // ルーペ保持中は再描画を継続 (キー離したら止める)
+        if loupe_hold {
             ctx.request_repaint();
         }
     }
@@ -12797,23 +12784,14 @@ impl App {
         // トグルに追加。Enter / Shift+Enter は既存どおり (Enter = 再生/停止、Shift+Enter = 外部
         // プレイヤー)。egui の `consume_key` は修飾子マッチが厳密 (Caps Lock + Shift などで
         // 取りこぼす) ので、`modifiers.shift` を見た fallback も併用する。
-        let shift_held_now = ctx.input(|i| i.modifiers.shift);
-        let shift_enter = ctx.input_mut(|i| {
-            let direct = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter);
-            let fallback = shift_held_now && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
-            direct || fallback
-        });
+        let shift_enter = self
+            .keymap
+            .consume_action(ctx, KeyAction::VideoExternalPlayer);
         if shift_enter {
             crate::logger::log("video Shift+Enter pressed → external player".to_string());
         }
-        // Enter 単独: 再生 / 一時停止トグル。Shift+Enter は上で先に取っているので
-        // ここでは shift 無しの Enter のみが残っている。
-        let enter = !shift_held_now
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        // Space 単独: 再生 / 一時停止トグル (= Enter と等価、動画プレイヤー慣習)。
-        // 上位の image key_space ハンドラは `!is_video_fs` で gate されているので
-        // 動画モードでは消費されず、ここで取れる。
-        let key_space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+        // 再生 / 一時停止トグル。Shift+Enter は上で先に取っているので残らない。
+        let play_pause = self.keymap.consume_action(ctx, KeyAction::VideoPlayPause);
         // Phase 7.H シーク粒度: ←→=5 秒、Shift+←→=1 秒、Ctrl+←→=30 秒。
         // タイル中は seek せずカーソル移動に切り替える。Ctrl 併用時だけ 1 行分移動。
         // ↑↓ は consume せず後段の image arrow_up/down (= 前後ファイル) に流す
@@ -12896,40 +12874,42 @@ impl App {
         let right = !frame_step_key
             && !ctrl_shift_held_now
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight));
-        let shift_up = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp));
-        let shift_down =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown));
+        let shift_up = self.keymap.consume_action(ctx, KeyAction::VideoVolumeUp);
+        let shift_down = self.keymap.consume_action(ctx, KeyAction::VideoVolumeDown);
         // ↑↓ プレーンは consume しない (= image handler が file navigation に使う)。
-        let mute_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M));
-        let loop_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
+        let mute_key = self.keymap.consume_action(ctx, KeyAction::VideoMute);
+        let loop_key = self.keymap.consume_action(ctx, KeyAction::VideoLoop);
         // Phase 5.4.1: B キーで現在位置にブックマーク追加 (動画モード限定)。
         // 画像モードの B (透過背景循環) とは handle_video_input 先行 consume で分離。
-        let bookmark_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
-        let save_frame_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S));
+        let bookmark_key = self.keymap.consume_action(ctx, KeyAction::VideoBookmark);
+        let save_frame_key = self.keymap.consume_action(ctx, KeyAction::VideoCapture);
         // Phase 5.5: S キーでタイルモード トグル (動画モード限定)。画像モードの
         // S (スライドショー) とは handle_video_input 先行 consume で分離する。
-        let tile_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S));
+        let tile_key = self.keymap.consume_action(ctx, KeyAction::VideoTileMode);
         // F キーでフレームレート / Perf オーバーレイのトグル (動画モード限定)。
         // 以前 P を使っていたが、P は「現在フレームをピン留め」に再割り当てしたので
         // 移動した (F = Frames / FPS の mnemonic)。画像モードの F は未使用なので
         // 競合しない。
-        let perf_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F));
+        let perf_key = self.keymap.consume_action(ctx, KeyAction::VideoPerfOverlay);
         // P キーで現在再生位置をピン留め (動画モード限定)。グリッドモードの P
         // (folder_thumb_pin toggle) と統一した「P = Pin」の mnemonic。画像モードの
         // ポストフィルタは T に移動済み。
-        let pin_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
+        let pin_key = self.keymap.consume_action(ctx, KeyAction::VideoPin);
         // 比較ビューは静止画 / ZIP / PDF 限定。動画では passthrough させず silent no-op として消費する。
-        let compare_x = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::X));
-        let compare_alt_c = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::C));
-        let compare_shift_c =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::C));
-        let compare_c = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::C));
+        let compare_x = self
+            .keymap
+            .consume_action(ctx, KeyAction::VideoCompareToggle);
+        let compare_alt_c = self.keymap.consume_action(ctx, KeyAction::VideoCompareDiff);
+        let compare_shift_c = self.keymap.consume_action(ctx, KeyAction::VideoCompareWipe);
+        let compare_c = self
+            .keymap
+            .consume_action(ctx, KeyAction::VideoCompareCycle);
         // W キー: 頭出し (= seek to 0 + play)。左手で押しやすく、画像モードでも未使用。
-        let rewind_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W));
+        let rewind_key = self.keymap.consume_action(ctx, KeyAction::VideoSeekStart);
         // J/K: チャプター・ブックマーク・ピンを 1 本のマーカー列にまとめて前後ジャンプ。
         // 矢印キーは既に固定秒数シークに使っているので別キー。J=前、K=次。
-        let prev_marker_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::J));
-        let next_marker_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::K));
+        let prev_marker_key = self.keymap.consume_action(ctx, KeyAction::VideoMarkerPrev);
+        let next_marker_key = self.keymap.consume_action(ctx, KeyAction::VideoMarkerNext);
         // タイルモード中は ESC でも閉じれるようにする (= 一般的な「全画面モード解除」)。
         // ただし ESC は元々フルスクリーン全体を閉じるキーなので、タイルモード中だけ
         // 横取りする。
@@ -12942,7 +12922,7 @@ impl App {
             }
             return;
         }
-        if (enter || key_space) && self.video_tile_mode_active {
+        if play_pause && self.video_tile_mode_active {
             self.play_selected_video_tile(ctx, fs_idx);
             return;
         }
@@ -12979,7 +12959,7 @@ impl App {
         // player に作用させる (借用はこの if-let のスコープ内で完結)
         let mut seek_outcome: Option<crate::video::RelativeSeekOutcome> = None;
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            if enter || key_space {
+            if play_pause {
                 player.toggle_play();
             }
             if ctrl_shift_left {

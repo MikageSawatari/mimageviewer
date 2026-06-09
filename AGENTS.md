@@ -15,6 +15,10 @@ always-active guidance.
   virtual folders, presets, adjustments, AI features, or UI responsiveness,
   read the related document listed near the top of `CLAUDE.md` in the
   required-before-work section.
+- If a task touches keyboard shortcuts, key events, or shortcut documentation,
+  read `docs/keymap-spec.md` and `docs/key-customization-impl-plan.md`. New
+  keyboard operations should go through `KeyAction` / keymap helpers unless the
+  operation is intentionally fixed and documented as outside keymap scope.
 - On Japanese Windows, PowerShell 5.1 may mojibake UTF-8 files without a BOM.
   When reading repository documents through PowerShell, use
   `Get-Content -Encoding UTF8` explicitly.

@@ -6,6 +6,8 @@ use std::sync::{
     mpsc,
 };
 
+use crate::keymap::KeyAction;
+
 mod gamepad_input;
 #[cfg(windows)]
 mod native_video;
@@ -2703,6 +2705,7 @@ pub struct App {
     pub(crate) thumbnails: Vec<ThumbnailState>,
     pub(crate) selected: Option<usize>,
     pub(crate) settings: crate::settings::Settings,
+    pub(crate) keymap: crate::keymap::Keymap,
     pub(crate) gamepad: crate::gamepad::GamepadRuntime,
     pub(crate) gamepad_state: crate::gamepad::GamepadInputState,
     pub(crate) tx: mpsc::Sender<ThumbMsg>,
@@ -5057,6 +5060,32 @@ impl App {
 
         settings.recent_folders.truncate(MAX_RECENT_FOLDERS);
         let recent_folders = settings.recent_folders.clone();
+        let keymap = if cfg!(test) {
+            crate::keymap::Keymap::empty()
+        } else {
+            let path = crate::data_dir::get().join("keymap.ini");
+            let default_path = crate::data_dir::get().join("keymap.ini.default");
+            if let Err(err) = crate::keymap::Keymap::write_user_ini_if_missing(&path) {
+                crate::logger::log(format!(
+                    "[keymap] failed to create keymap.ini ({}): {}",
+                    path.display(),
+                    err
+                ));
+            }
+            if let Err(err) = crate::keymap::Keymap::write_default_reference_ini(&default_path) {
+                crate::logger::log(format!(
+                    "[keymap] failed to update keymap.ini.default ({}): {}",
+                    default_path.display(),
+                    err
+                ));
+            }
+            let keymap = crate::keymap::Keymap::load_from_file(&path);
+            for warning in keymap.warnings() {
+                crate::logger::log(format!("[keymap] {warning}"));
+            }
+            keymap
+        };
+        keymap.install_global_native_video_shortcuts();
 
         let mut app = Self {
             address: String::new(),
@@ -5065,6 +5094,7 @@ impl App {
             thumbnails: Vec::new(),
             selected: None,
             settings,
+            keymap,
             gamepad: crate::gamepad::GamepadRuntime::new(),
             gamepad_state: crate::gamepad::GamepadInputState::default(),
             tx,
@@ -13845,9 +13875,6 @@ impl App {
             end,
             page_up,
             page_down,
-            space,
-            key_r,
-            key_l,
             mouse_back,
             mouse_forward,
         ) = ctx.input(|i| {
@@ -13864,9 +13891,6 @@ impl App {
                 i.key_pressed(egui::Key::End),
                 i.key_pressed(egui::Key::PageUp),
                 i.key_pressed(egui::Key::PageDown),
-                i.key_pressed(egui::Key::Space),
-                i.key_pressed(egui::Key::R),
-                i.key_pressed(egui::Key::L),
                 i.pointer.button_pressed(egui::PointerButton::Extra1),
                 i.pointer.button_pressed(egui::PointerButton::Extra2),
             )
@@ -13876,6 +13900,9 @@ impl App {
         // 関数頭で drain 済み) を消費。詳細は main.rs の `install_mouse_nav_hook` 参照。
         let browser_back = browser_back_count > 0;
         let browser_forward = browser_forward_count > 0;
+        let space = self.keymap.pressed_action(ctx, KeyAction::GridToggleCheck);
+        let key_r = self.keymap.pressed_action(ctx, KeyAction::GridRotateCw);
+        let key_l = self.keymap.pressed_action(ctx, KeyAction::GridRotateCcw);
 
         // Ctrl+矢印: modifiers.ctrl に加え ctrl_held (key_down) でも判定。
         // マウス戻る/進む (Extra1/Extra2 = native XButton、または Browser_Back/Forward
@@ -13995,13 +14022,7 @@ impl App {
 
             // X: サムネイル一覧から比較スロットへピン留め。
             // Ctrl+X のファイルカットとは競合させないため、修飾キーなしのみ拾う。
-            let compare_pin_key = ctx.input_mut(|i| {
-                !i.modifiers.ctrl
-                    && !i.modifiers.shift
-                    && !i.modifiers.alt
-                    && !i.modifiers.mac_cmd
-                    && i.consume_key(egui::Modifiers::NONE, egui::Key::X)
-            });
+            let compare_pin_key = self.keymap.consume_action(ctx, KeyAction::GridComparePin);
             if compare_pin_key {
                 self.toggle_compare_pin_from_grid_selection(ctx);
             }
@@ -14075,26 +14096,21 @@ impl App {
 
             // Ctrl+1〜0: 補正プリセットスロットを一括適用
             {
-                const SLOT_KEYS: [egui::Key; 10] = [
-                    egui::Key::Num1,
-                    egui::Key::Num2,
-                    egui::Key::Num3,
-                    egui::Key::Num4,
-                    egui::Key::Num5,
-                    egui::Key::Num6,
-                    egui::Key::Num7,
-                    egui::Key::Num8,
-                    egui::Key::Num9,
-                    egui::Key::Num0,
+                const SLOT_ACTIONS: [KeyAction; 10] = [
+                    KeyAction::GridAdjustSlot1,
+                    KeyAction::GridAdjustSlot2,
+                    KeyAction::GridAdjustSlot3,
+                    KeyAction::GridAdjustSlot4,
+                    KeyAction::GridAdjustSlot5,
+                    KeyAction::GridAdjustSlot6,
+                    KeyAction::GridAdjustSlot7,
+                    KeyAction::GridAdjustSlot8,
+                    KeyAction::GridAdjustSlot9,
+                    KeyAction::GridAdjustSlot10,
                 ];
-                let preset_slot = ctx.input_mut(|i| {
-                    if !i.modifiers.ctrl {
-                        return None;
-                    }
-                    SLOT_KEYS
-                        .iter()
-                        .position(|k| i.consume_key(egui::Modifiers::CTRL, *k))
-                });
+                let preset_slot = SLOT_ACTIONS
+                    .iter()
+                    .position(|action| self.keymap.consume_action(ctx, *action));
                 if let Some(slot) = preset_slot {
                     // capture_adjust_full でラップして、N ページの一括書き換えを
                     // 1 つの UndoEntry にまとめて Ctrl+Z で全部戻せるようにする (Codex P2)。
@@ -14112,10 +14128,7 @@ impl App {
             // フルスクリーン側 (ui_fullscreen.rs) と同じキー割当。
             // Ctrl+Backspace は consume_key しておかないと後段の「BS で親フォルダ」と衝突する。
             {
-                let clear_key = ctx.input_mut(|i| {
-                    i.consume_key(egui::Modifiers::CTRL, egui::Key::Backspace)
-                        || i.consume_key(egui::Modifiers::NONE, egui::Key::Q)
-                });
+                let clear_key = self.keymap.consume_action(ctx, KeyAction::GridClearAdjust);
                 if clear_key {
                     self.capture_adjust_full("個別設定を一括解除".to_string(), |app| {
                         app.clear_page_params_for_selection()
@@ -27721,7 +27734,9 @@ impl eframe::App for App {
             && !self.global_search.active
             && !self.grid_is_pdf_pages()
         {
-            let ctrl_f = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F));
+            let ctrl_f = self
+                .keymap
+                .pressed_action(ctx, KeyAction::GlobalLocalSearch);
             if ctrl_f {
                 // 他の検索バーが開いていれば閉じて Ctrl+F に切り替え (相互排他)
                 self.open_local_metadata_search();
@@ -27739,17 +27754,8 @@ impl eframe::App for App {
             && self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
         {
-            let (ctrl_a, deselect) = ctx.input(|i| {
-                let ctrl = i.modifiers.ctrl;
-                let shift = i.modifiers.shift;
-                let a = i.key_pressed(egui::Key::A);
-                let d = i.key_pressed(egui::Key::D);
-                // Ctrl+Shift+A は Ctrl+A と同一フレームに見えるので、shift 付きなら
-                // Ctrl+A ではなく deselect 側にだけ立てる (全選択の暴発を防ぐ)。
-                let select_all = ctrl && !shift && a;
-                let deselect = ctrl && (d || (shift && a));
-                (select_all, deselect)
-            });
+            let ctrl_a = self.keymap.pressed_action(ctx, KeyAction::GridSelectAll);
+            let deselect = self.keymap.pressed_action(ctx, KeyAction::GridDeselect);
             if ctrl_a {
                 for &idx in &self.visible_indices {
                     if self.items.get(idx).is_some_and(|it| it.is_checkable()) {
@@ -27775,14 +27781,7 @@ impl eframe::App for App {
             && self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
         {
-            let pressed_p = ctx.input_mut(|i| {
-                // Plain P only (no modifier)。修飾キー付き P は他用途に
-                // 開放しておく (現状未割当だが将来予約)。
-                !i.modifiers.shift
-                    && !i.modifiers.alt
-                    && !i.modifiers.ctrl
-                    && i.consume_key(egui::Modifiers::NONE, egui::Key::P)
-            });
+            let pressed_p = self.keymap.consume_action(ctx, KeyAction::GridPin);
             if pressed_p {
                 self.toggle_folder_pin_from_selection();
             }
@@ -27796,7 +27795,7 @@ impl eframe::App for App {
             && !self.favsearch.has_focus
             && !self.global_search.has_focus
         {
-            let ctrl_s = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S));
+            let ctrl_s = self.keymap.pressed_action(ctx, KeyAction::GlobalFavSearch);
             if ctrl_s {
                 // 他の検索バーを閉じるのは open_favsearch 内で行う (相互排他)
                 self.open_favsearch();
@@ -27810,7 +27809,9 @@ impl eframe::App for App {
             && !self.search_has_focus
             && !self.favsearch.has_focus
         {
-            let ctrl_g = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::G));
+            let ctrl_g = self
+                .keymap
+                .pressed_action(ctx, KeyAction::GlobalMetadataSearch);
             if ctrl_g {
                 // 相互排他は toggle_global_search → open_global_search 内で行う
                 self.toggle_global_search();
@@ -27824,7 +27825,7 @@ impl eframe::App for App {
             && !self.search_has_focus
             && !self.favsearch.has_focus
         {
-            let ctrl_o = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::O));
+            let ctrl_o = self.keymap.pressed_action(ctx, KeyAction::GlobalOpenFolder);
             if ctrl_o {
                 self.open_folder_input = self
                     .current_folder
@@ -27842,26 +27843,21 @@ impl eframe::App for App {
             && self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
         {
-            let alt_col = ctx.input(|i| {
-                if !i.modifiers.alt {
-                    return None;
-                }
-                let keys = [
-                    (egui::Key::Num1, 1),
-                    (egui::Key::Num2, 2),
-                    (egui::Key::Num3, 3),
-                    (egui::Key::Num4, 4),
-                    (egui::Key::Num5, 5),
-                    (egui::Key::Num6, 6),
-                    (egui::Key::Num7, 7),
-                    (egui::Key::Num8, 8),
-                    (egui::Key::Num9, 9),
-                    (egui::Key::Num0, 10),
-                ];
-                keys.iter()
-                    .find(|(k, _)| i.key_pressed(*k))
-                    .map(|&(_, c)| c)
-            });
+            let alt_col = [
+                (KeyAction::GridColumnCount1, 1),
+                (KeyAction::GridColumnCount2, 2),
+                (KeyAction::GridColumnCount3, 3),
+                (KeyAction::GridColumnCount4, 4),
+                (KeyAction::GridColumnCount5, 5),
+                (KeyAction::GridColumnCount6, 6),
+                (KeyAction::GridColumnCount7, 7),
+                (KeyAction::GridColumnCount8, 8),
+                (KeyAction::GridColumnCount9, 9),
+                (KeyAction::GridColumnCount10, 10),
+            ]
+            .into_iter()
+            .find(|(action, _)| self.keymap.pressed_action(ctx, *action))
+            .map(|(_, cols)| cols);
             if let Some(cols) = alt_col {
                 if cols != self.settings.grid_cols {
                     self.settings.grid_cols = cols;

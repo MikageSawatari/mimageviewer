@@ -1,5 +1,6 @@
 use crate::app::{App, ExportCropCreateDrag, ExportCropDrag};
 use crate::export_crop::{CropAspectMode, CropHandle, CropRect, CropSettings};
+use crate::keymap::KeyAction;
 
 const PANEL_W: f32 = 220.0;
 const PANEL_MARGIN: f32 = 14.0;
@@ -126,7 +127,7 @@ impl App {
             self.reset_export_crop_mode();
             return action;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E)) {
+        if self.keymap.consume_action(ctx, KeyAction::CropExecute) {
             self.reset_export_crop_mode();
             self.open_export_dialog_for_current(ctx, fs_idx);
         }

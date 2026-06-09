@@ -28,6 +28,7 @@
 
 use crate::app::{App, TextDrag, TextDragKind};
 use crate::comic_presets::{ShapeStylePreset, TextStylePreset, WindowStylePreset};
+use crate::keymap::KeyAction;
 use crate::ui_fullscreen::{FsKeyAction, SpreadPair};
 use comic_core::{
     AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, DecoKind, DecoPlacement,
@@ -1185,7 +1186,7 @@ impl App {
         let action = FsKeyAction::default();
 
         // Ctrl+T: 再押下で退場。
-        let ctrl_t = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::T));
+        let ctrl_t = self.keymap.consume_action(ctx, KeyAction::TextConfirm);
         if ctrl_t {
             self.reset_text_mode();
             return action;
@@ -1207,13 +1208,8 @@ impl App {
         // → Ctrl+Z (undo)。`Modifiers::CTRL` 指定の consume は Shift 併用 Z も拾うため
         // redo を先に握り、Ctrl+Shift+Z が undo 側へ流れないようにする。
         if !ctx.wants_keyboard_input() {
-            let (undo, redo) = ctx.input_mut(|i| {
-                let redo = i
-                    .consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z)
-                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::Y);
-                let undo = i.consume_key(egui::Modifiers::CTRL, egui::Key::Z);
-                (undo, redo)
-            });
+            let redo = self.keymap.consume_action(ctx, KeyAction::TextRedo);
+            let undo = self.keymap.consume_action(ctx, KeyAction::TextUndo);
             if undo {
                 self.do_comic_undo();
                 return action;

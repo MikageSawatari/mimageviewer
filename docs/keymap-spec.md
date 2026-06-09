@@ -8,6 +8,17 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 横断仕様と現状差分は [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md)
 を参照すること。
 
+一部のキーボード操作は上級者向けの `%APPDATA%\mimageviewer\keymap.ini`
+で上書きできる。Action 名・書式・固定扱いの入力は
+[keymap.ini.default](keymap.ini.default) と、起動時に生成される `keymap.ini` /
+`keymap.ini.default` の先頭コメントを正とする。マウス、ゲームパッド、
+OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対象外。
+
+開発者向けメモ: 新しいキーボード操作を追加・変更するときは、ユーザーから明示されて
+いなくても keymap 対応要否を確認する。通常ショートカットは `KeyAction` に追加し、
+`docs/key-customization-impl-plan.md` の「新しいキー操作を追加するとき」に従って
+`docs/keymap.ini.default` まで更新する。固定扱いにする入力は、この文書の該当節に理由を残す。
+
 ## グリッドビュー (フルスクリーン外) 共通
 
 | キー | 動作 |

@@ -1020,48 +1020,7 @@ mod clipboard_normalize_tests {
 fn native_video_fullscreen_shortcut_key(
     key: &crate::video::native_window::NativeVideoKeyEvent,
 ) -> bool {
-    if key.alt {
-        return false;
-    }
-    if matches!(key.virtual_key, 0x21 | 0x22) {
-        return key.ctrl && !key.shift;
-    }
-    matches!(
-        key.virtual_key,
-        0x08 // Backspace
-            | 0x0D // Enter
-            | 0x1B // Escape
-            | 0x20 // Space
-            | 0x23 // End
-            | 0x24 // Home
-            | 0x25 // Left
-            | 0x26 // Up
-            | 0x27 // Right
-            | 0x28 // Down
-            | 0x42 // B
-            | 0x43 // C (comparison-view no-op in video fullscreen)
-            | 0x46 // F (perf overlay toggle、v0.9.x で旧 P から移動)
-            | 0x4A // J
-            | 0x4B // K
-            | 0x4C // L
-            | 0x4D // M
-            | 0x50 // P (pin current frame、v0.9.x で perf から再割り当て)
-            | 0x53 // S
-            | 0x57 // W
-            | 0x58 // X (comparison-view no-op in video fullscreen)
-            | 0x70 // F1 (rating)
-            | 0x71 // F2 (rating)
-            | 0x72 // F3 (rating)
-            | 0x73 // F4 (rating)
-            | 0x74 // F5 (rating)
-            | 0x75 // F6 (clear rating)
-            | 0x7A // F11 (window/fullscreen toggle、HUD ボタンと同等)
-            | 0xA6 // VK_BROWSER_BACK — マウス戻るボタン (driver / AHK 経由)。
-                   // overlay が wants_keyboard_input でも fullscreen ショートカットとして
-                   // App ハンドラへ流す (= マウスナビゲーションが overlay text input 等で
-                   // 殺されないようにする、Codex P2)。
-            | 0xA7 // VK_BROWSER_FORWARD — 同上。
-    )
+    crate::keymap::native_video_fullscreen_shortcut_key(key)
 }
 
 #[derive(Clone, Debug)]

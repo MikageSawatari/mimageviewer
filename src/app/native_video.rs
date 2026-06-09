@@ -1,4 +1,5 @@
 use super::*;
+use crate::keymap::KeyAction;
 
 /// 動画ピン留めの「ピン位置のフレームをサムネ DB に書き戻す」非同期待ち用。
 ///
@@ -4563,17 +4564,30 @@ impl App {
             }
             // Shift+Enter: open in external player, matching the legacy egui
             // fullscreen video path.
-            0x0D if key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoExternalPlayer, &key) =>
+            {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     crate::ui_helpers::open_external_player(player.path());
                 }
             }
             // Enter in tile mode: start playback from the keyboard cursor.
-            0x0D if !key.shift && !key.ctrl && !key.repeat && self.video_tile_mode_active => {
+            _ if !key.repeat
+                && self.video_tile_mode_active
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
+            {
                 self.play_selected_video_tile(ctx, fs_idx);
             }
             // Enter: play / pause.
-            0x0D if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
+            {
                 self.handle_native_video_toggle_play_command(ctx, fs_idx);
             }
             // Escape: close native fullscreen. If the native overlay has a text
@@ -4591,7 +4605,11 @@ impl App {
                 }
             }
             // W: seek to start and play.
-            0x57 if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoSeekStart, &key) =>
+            {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     // `seek(0.0)` 自体が `apply_command(Play)` 経由で autoplay intent
                     // を立てるので、追加 `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
@@ -4664,10 +4682,16 @@ impl App {
             0xA7 => {
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
             }
-            0x26 if !key.shift && !key.ctrl => {
+            _ if self
+                .keymap
+                .matches_vk_action(KeyAction::VideoPrevFile, &key) =>
+            {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, -1);
             }
-            0x28 if !key.shift && !key.ctrl => {
+            _ if self
+                .keymap
+                .matches_vk_action(KeyAction::VideoNextFile, &key) =>
+            {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, 1);
             }
             // Home / End: jump to the first / last visible navigable item.
@@ -4707,7 +4731,10 @@ impl App {
             // Shift+Up / Shift+Down: volume. Plain Up/Down remains for the
             // future full overlay phase as well, but the native HWND can already
             // perform the same item navigation without involving egui input.
-            0x26 if key.shift && !key.ctrl => {
+            _ if self
+                .keymap
+                .matches_vk_action(KeyAction::VideoVolumeUp, &key) =>
+            {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     let v =
                         crate::settings::step_video_volume_by_fader_key_step(player.volume(), 1);
@@ -4716,7 +4743,10 @@ impl App {
                     self.settings.save();
                 }
             }
-            0x28 if key.shift && !key.ctrl => {
+            _ if self
+                .keymap
+                .matches_vk_action(KeyAction::VideoVolumeDown, &key) =>
+            {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     let v =
                         crate::settings::step_video_volume_by_fader_key_step(player.volume(), -1);
@@ -4726,36 +4756,56 @@ impl App {
                 }
             }
             // M: mute
-            0x4D if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::VideoMute, &key) => {
                 if self.toggle_video_session_mute_for_fs_idx(fs_idx) {
                     self.request_native_video_hud_repaint(ctx);
                 }
             }
             // L: loop (4 段階サイクル: Off → Full → Chapter → Bookmark)
-            0x4C if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::VideoLoop, &key) => {
                 self.cycle_native_video_loop_common(ctx, fs_idx);
             }
             // J / K: previous / next chapter, bookmark, or pin marker.
-            0x4A if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoMarkerPrev, &key) =>
+            {
                 self.jump_native_video_marker(fs_idx, false);
             }
-            0x4B if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoMarkerNext, &key) =>
+            {
                 self.jump_native_video_marker(fs_idx, true);
             }
             // Space in tile mode: start playback from the keyboard cursor (= Enter と同じ).
             // 動画 HUD 2 段化リデザイン (Phase 1): Space を動画プレイヤー慣習に合わせて
             // 再生/停止トグルに変更。tile mode では選択タイル再生 (= Enter と同じ tile-aware 挙動)。
             // 旧 Space = チェックトグルは削除 (チェックしたい場合は Esc → 一覧 Space)。
-            0x20 if !key.shift && !key.ctrl && !key.repeat && self.video_tile_mode_active => {
+            _ if !key.repeat
+                && self.video_tile_mode_active
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
+            {
                 self.play_selected_video_tile(ctx, fs_idx);
             }
             // Space: play / pause (= Enter と等価)。
-            0x20 if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
+            {
                 self.handle_native_video_toggle_play_command(ctx, fs_idx);
             }
             // P: pin the selected tile while tile mode is open; otherwise pin
             // the current frame (= HUD 📌 button).
-            0x50 if !key.shift && !key.ctrl && !key.repeat && self.video_tile_mode_active => {
+            _ if !key.repeat
+                && self.video_tile_mode_active
+                && self.keymap.matches_vk_action(KeyAction::VideoPin, &key) =>
+            {
                 // If tile metadata is not ready or contains no timestamps, tile-mode P is an
                 // intentional no-op; falling back to current playback position would pin a
                 // different frame than the highlighted tile UI suggests.
@@ -4766,7 +4816,7 @@ impl App {
             // P: pin current frame (= HUD 📌 ボタンと同等)。グリッドの P と統一した
             // 「P = Pin」の mnemonic。v0.9.x で perf overlay の P から再割り当て、
             // perf overlay は F に移動した。
-            0x50 if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::VideoPin, &key) => {
                 let target = self
                     .fs_video_player(fs_idx)
                     .map(|p| p.position())
@@ -4774,28 +4824,53 @@ impl App {
                 self.handle_native_video_set_pin_command(ctx, fs_idx, target);
             }
             // F: perf / framerate overlay toggle (旧 P)。Frames / FPS mnemonic。
-            0x46 if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoPerfOverlay, &key) =>
+            {
                 self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.set_native_perf_overlay_visible(self.video_perf_overlay_visible);
                 }
             }
             // Ctrl+S: save current video frame to the capture folder.
-            0x53 if !key.shift && key.ctrl && !key.repeat => {
+            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::VideoCapture, &key) => {
                 self.save_video_frame_to_file(ctx, fs_idx);
             }
             // X / C: comparison view is static-image only. Consume as silent no-op.
-            0x43 | 0x58 if !key.ctrl && !key.repeat => {
+            _ if !key.repeat
+                && (self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoCompareToggle, &key)
+                    || self
+                        .keymap
+                        .matches_vk_action(KeyAction::VideoCompareCycle, &key)
+                    || self
+                        .keymap
+                        .matches_vk_action(KeyAction::VideoCompareWipe, &key)
+                    || self
+                        .keymap
+                        .matches_vk_action(KeyAction::VideoCompareDiff, &key)) =>
+            {
                 hud_activity = false;
             }
             // S: tile mode toggle.
-            0x53 if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoTileMode, &key) =>
+            {
                 let screen = self.video_tile_layout_size(fs_idx, ctx);
                 self.toggle_video_tile_mode(fs_idx, screen);
                 self.sync_native_video_tile_overlay(ctx, fs_idx);
             }
             // B: add video bookmark.
-            0x42 if !key.shift && !key.ctrl && !key.repeat => {
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoBookmark, &key) =>
+            {
                 self.add_native_video_bookmark(fs_idx, None);
             }
             _ => {

@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::app::{App, ConcealSnapshot, EraseSpreadCtx, MaskDirtyRect};
 use crate::conceal::ConcealTool;
+use crate::keymap::KeyAction;
 use crate::mask_db::{LineKind, Shape, ShapeOp};
 use crate::ui_fullscreen::FsKeyAction;
 use crate::ui_fullscreen::draw_icons::{PanelToggleColors, panel_toggle_button};
@@ -502,14 +503,14 @@ impl App {
         }
 
         // Ctrl+M: モード終了 (再押下で抜ける、ui_fullscreen から委譲済み判定用)
-        let ctrl_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::M));
+        let ctrl_m = self.keymap.consume_action(ctx, KeyAction::ConcealExit);
         if ctrl_m {
             self.reset_conceal_mode();
             return action;
         }
 
         // G: 通常フルスクリーンと同じピクセル境界グリッドの表示切替。
-        let key_g = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::G));
+        let key_g = self.keymap.consume_action(ctx, KeyAction::ConcealPixelGrid);
         if key_g {
             self.fs_pixel_grid_enabled = !self.fs_pixel_grid_enabled;
             self.show_feedback_toast(if self.fs_pixel_grid_enabled {
@@ -520,7 +521,7 @@ impl App {
         }
 
         // Ctrl+Z: Undo
-        let ctrl_z = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z));
+        let ctrl_z = self.keymap.consume_action(ctx, KeyAction::ConcealUndo);
         if ctrl_z {
             if self.conceal_tool == ConcealTool::Polygon
                 && self.conceal_lasso_points.pop().is_some()
@@ -536,7 +537,9 @@ impl App {
         }
 
         // Delete: 選択中の Shape を削除
-        let key_del = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete));
+        let key_del = self
+            .keymap
+            .consume_action(ctx, KeyAction::ConcealDeleteShape);
         if key_del
             && let Some(idx) = self.conceal_selected_shape
             && idx < self.conceal_shapes.len()
@@ -590,35 +593,42 @@ impl App {
 
         // ツール切替: S/B/L/P/I/V/H/R/O
         let mut switched: Option<ConcealTool> = None;
-        ctx.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::S) {
-                switched = Some(ConcealTool::Select);
-            }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::B) {
-                switched = Some(ConcealTool::Brush);
-            }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::L) {
-                switched = Some(ConcealTool::Lasso);
-            }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::P) {
-                switched = Some(ConcealTool::Polygon);
-            }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::I) {
-                switched = Some(ConcealTool::Line);
-            }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::V) {
-                switched = Some(ConcealTool::VertLine);
-            }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::H) {
-                switched = Some(ConcealTool::HorizLine);
-            }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::R) {
-                switched = Some(ConcealTool::Rect);
-            }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::O) {
-                switched = Some(ConcealTool::Ellipse);
-            }
-        });
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::ConcealToolSelect)
+        {
+            switched = Some(ConcealTool::Select);
+        }
+        if self.keymap.consume_action(ctx, KeyAction::ConcealToolBrush) {
+            switched = Some(ConcealTool::Brush);
+        }
+        if self.keymap.consume_action(ctx, KeyAction::ConcealToolLasso) {
+            switched = Some(ConcealTool::Lasso);
+        }
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::ConcealToolPolygon)
+        {
+            switched = Some(ConcealTool::Polygon);
+        }
+        if self.keymap.consume_action(ctx, KeyAction::ConcealToolLine) {
+            switched = Some(ConcealTool::Line);
+        }
+        if self.keymap.consume_action(ctx, KeyAction::ConcealToolVLine) {
+            switched = Some(ConcealTool::VertLine);
+        }
+        if self.keymap.consume_action(ctx, KeyAction::ConcealToolHLine) {
+            switched = Some(ConcealTool::HorizLine);
+        }
+        if self.keymap.consume_action(ctx, KeyAction::ConcealToolRect) {
+            switched = Some(ConcealTool::Rect);
+        }
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::ConcealToolEllipse)
+        {
+            switched = Some(ConcealTool::Ellipse);
+        }
         if let Some(tool) = switched
             && tool != self.conceal_tool
         {
@@ -642,8 +652,8 @@ impl App {
         }
 
         // D: 描画モード, F: 消去モード
-        let key_d = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::D));
-        let key_f = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F));
+        let key_d = self.keymap.consume_action(ctx, KeyAction::ConcealPaintMode);
+        let key_f = self.keymap.consume_action(ctx, KeyAction::ConcealEraseMode);
         if key_d {
             self.conceal_paint_mode = true;
             self.show_feedback_toast("[描画モード]".to_string());
@@ -655,7 +665,7 @@ impl App {
 
         // T: 隠蔽タイプを順次切替 (Mosaic → WhiteFill → BlackFill → Blur → Mosaic …)。
         // タイプ変更はグローバルパラメータの変更なので世代を bump。
-        let key_t = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::T));
+        let key_t = self.keymap.consume_action(ctx, KeyAction::ConcealTypeCycle);
         if key_t {
             let next = self.settings.conceal_type.next();
             self.settings.conceal_type = next;
@@ -666,19 +676,14 @@ impl App {
         // 1/2/3/4: プリセット適用 (modifier なし)。consume_key の結果を一旦ローカル
         // 変数に集めてから input_mut の借用を解放したあと `apply_conceal_preset` を呼ぶ
         // (self mut + input mut の同時借用を避ける)。
-        let mut preset_slot: Option<usize> = None;
-        ctx.input_mut(|i| {
-            for (k, slot) in [
-                (egui::Key::Num1, 0usize),
-                (egui::Key::Num2, 1),
-                (egui::Key::Num3, 2),
-                (egui::Key::Num4, 3),
-            ] {
-                if i.consume_key(egui::Modifiers::NONE, k) {
-                    preset_slot = Some(slot);
-                }
-            }
-        });
+        let preset_slot = [
+            KeyAction::ConcealPreset1,
+            KeyAction::ConcealPreset2,
+            KeyAction::ConcealPreset3,
+            KeyAction::ConcealPreset4,
+        ]
+        .iter()
+        .position(|action| self.keymap.consume_action(ctx, *action));
         if let Some(slot) = preset_slot {
             self.apply_conceal_preset(slot);
         }
@@ -984,9 +989,9 @@ impl App {
         let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let paint = self.conceal_paint_mode;
-        // Space 検出は OS 直読み。FS ビューポートでは `key_down(Space)` がフォーカス不在で
-        // stale になり Space+ドラッグ パンが発火しないため (Ctrl 境界筆と同じ stale 問題)。
-        let space_held = crate::ui_fullscreen::space_held_via_os();
+        // KeyHold は keymap 経由。Windows では内部で OS 状態も読むので、
+        // FS ビューポートの stale key_down 問題を避けられる。
+        let space_held = self.keymap.key_held_action(ctx, KeyAction::ConcealSpacePan);
         let modifiers = ctx.input(|i| i.modifiers);
 
         // パネル上のクリックはツール操作に使わない。ただし、画像上で進行中のドラッグを

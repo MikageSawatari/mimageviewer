@@ -21,6 +21,7 @@ use std::sync::mpsc;
 
 use crate::app::{App, EraseSnapshot, EraseTool, MaskDirtyRect};
 use crate::fs_animation::FsCacheEntry;
+use crate::keymap::KeyAction;
 use crate::mask_db::{LineKind, Shape, ShapeOp};
 use crate::ui_fullscreen::FsKeyAction;
 use crate::ui_fullscreen::draw_icons::{PanelToggleColors, panel_toggle_button};
@@ -501,7 +502,7 @@ impl App {
         }
 
         // E: inpaint 実行 (ESC と同じく execute_erase_inpaint を呼ぶ)
-        let key_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E));
+        let key_e = self.keymap.consume_action(ctx, KeyAction::EraseConfirm);
         if key_e {
             self.execute_erase_inpaint(ctx, fs_idx);
             return action;
@@ -521,7 +522,7 @@ impl App {
         }
 
         // Ctrl+Z: Undo
-        let ctrl_z = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z));
+        let ctrl_z = self.keymap.consume_action(ctx, KeyAction::EraseUndo);
         if ctrl_z {
             if self.erase_tool == EraseTool::Polygon && self.erase_lasso_points.pop().is_some() {
                 self.show_feedback_toast("[頂点を戻す]".to_string());
@@ -535,7 +536,7 @@ impl App {
         }
 
         // Delete: 選択中のベクタオブジェクトを削除
-        let key_del = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete));
+        let key_del = self.keymap.consume_action(ctx, KeyAction::EraseDeleteShape);
         if key_del {
             if let Some(idx) = self.erase_selected_shape {
                 if idx < self.erase_shapes.len() {
@@ -618,15 +619,15 @@ impl App {
         }
 
         // S/B/L/P/V/H/I/R/O: ツール切替
-        let key_s_tool = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S));
-        let key_b = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
-        let key_l = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
-        let key_p = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
-        let key_v = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V));
-        let key_h = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H));
-        let key_i = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::I));
-        let key_r_tool = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R));
-        let key_o_tool = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::O));
+        let key_s_tool = self.keymap.consume_action(ctx, KeyAction::EraseToolSelect);
+        let key_b = self.keymap.consume_action(ctx, KeyAction::EraseToolBrush);
+        let key_l = self.keymap.consume_action(ctx, KeyAction::EraseToolLasso);
+        let key_p = self.keymap.consume_action(ctx, KeyAction::EraseToolPolygon);
+        let key_v = self.keymap.consume_action(ctx, KeyAction::EraseToolVLine);
+        let key_h = self.keymap.consume_action(ctx, KeyAction::EraseToolHLine);
+        let key_i = self.keymap.consume_action(ctx, KeyAction::EraseToolLine);
+        let key_r_tool = self.keymap.consume_action(ctx, KeyAction::EraseToolRect);
+        let key_o_tool = self.keymap.consume_action(ctx, KeyAction::EraseToolEllipse);
         if key_s_tool {
             self.switch_erase_tool(EraseTool::Select, "[選択]");
         }
@@ -656,8 +657,8 @@ impl App {
         }
 
         // D: 描画モード, F: 消去モード
-        let key_d = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::D));
-        let key_f = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F));
+        let key_d = self.keymap.consume_action(ctx, KeyAction::ErasePaintMode);
+        let key_f = self.keymap.consume_action(ctx, KeyAction::EraseEraseMode);
         if key_d {
             self.erase_paint_mode = true;
             self.show_feedback_toast("[描画モード]".to_string());
@@ -1211,9 +1212,9 @@ impl App {
         let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let paint = self.erase_paint_mode;
-        // Space 検出は OS 直読み。FS ビューポートでは `key_down(Space)` がフォーカス不在で
-        // stale になり Space+ドラッグ パンが発火しないため (Ctrl 境界筆と同じ stale 問題)。
-        let space_held = crate::ui_fullscreen::space_held_via_os();
+        // KeyHold は keymap 経由。Windows では内部で OS 状態も読むので、
+        // FS ビューポートの stale key_down 問題を避けられる。
+        let space_held = self.keymap.key_held_action(ctx, KeyAction::EraseSpacePan);
 
         // パネル上のクリックはツール操作に使わない。
         //

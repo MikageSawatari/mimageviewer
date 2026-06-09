@@ -422,6 +422,15 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 
 ## 7. キーボード操作
 
+一部のキーボード操作は上級者向け設定ファイル
+`%APPDATA%\mimageviewer\keymap.ini` で変更できる。存在しない場合は起動時に
+全キー定義行をコメントアウトした `keymap.ini` を生成してから読む。コメント解除した
+行だけが上書きになり、コメントのままの操作はビルトイン既定キー (将来の変更を含む)
+に追従する。現在バージョンの標準 Action 一覧は、起動時に更新生成される
+`%APPDATA%\mimageviewer\keymap.ini.default` と `docs/keymap.ini.default` を参照する。
+GUI での編集、競合検知、マウス /
+ゲームパッド / OS クリップボード / D&D の割り当て変更は対象外。
+
 ### 7.1 サムネイル表示モード
 
 | キー | 動作 |
@@ -550,6 +559,9 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 (2026-05 移行。旧 `settings.json` からは初回起動時に自動 migration し、旧ファイルは
 `settings.json.migrated-<ts>` にリネームされる)。詳細は
 [settings-sqlite-migration.md](settings-sqlite-migration.md) を参照。
+キーボード割り当ての上級者向け上書きだけは DB に入れず、
+`%APPDATA%\mimageviewer\keymap.ini` を起動時に存在しなければ生成し、1 回読む。
+`keymap.ini.default` は現在の標準 Action 一覧として起動時に更新する。
 
 ### 永続化と復旧の仕組み
 

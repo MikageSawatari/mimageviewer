@@ -16,6 +16,7 @@
 | [preset-and-adjustment.md](preset-and-adjustment.md) | 補正・プリセット・AI キャッシュを触るとき。**無効化ルールの早見表** |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G の経路 + インデクサパイプライン + DB 責任分離** |
 | [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md) | フルスクリーン / 検索結果 / 動画タイルをまたぐ Ctrl+↑↓・境界ヒント・前後移動の統一仕様メモ |
+| [keymap-spec.md](keymap-spec.md) + [key-customization-impl-plan.md](key-customization-impl-plan.md) | キーボード操作 / ショートカット / `consume_key` / `key_pressed` / native VK 判定を触るとき。新しいキー操作は keymap 対応要否を必ず確認 |
 
 ## 仕様・機能
 
@@ -23,6 +24,8 @@
 | --- | --- |
 | [spec.md](spec.md) | アプリ全体の仕様書 (設定項目・機能一覧) |
 | [feature-expansion-ideas.md](feature-expansion-ideas.md) | v0.10 候補 3 機能 (キャプチャ保存 / 比較ビュー / 動画連続再生) + スクロールバー視認性改善 の詳細仕様。Codex 第 2 ラウンドレビュー反映済、実装状況と設計メモを併記 |
+| [key-customization-plan.md](key-customization-plan.md) | **設計履歴**。キー操作カスタマイズの調査・設計。現状の 3 入力経路 (egui consume / key_pressed / Win32 VK)・hold ジェスチャ・コンテキスト分割を調査し、フル版と簡易版 (テキスト ini / GUI なし / 競合検知なし) を比較。§8 が簡易版の確定設計 (入力パターン分類・複数チョード) |
+| [key-customization-impl-plan.md](key-customization-impl-plan.md) | **実装済みメモ**。簡易版 (テキスト ini / GUI なし / 競合検知なし) の手順書と実装判断。`src/keymap.rs` の型・コメントアウト済み `keymap.ini` / `keymap.ini.default` 生成・ini 仕様 (`Action.1` 形式)・exact match ヘルパー・native 動画転送対応・エッジケース規則・`KeyAction` インベントリ (付録 A)・キー変換ホワイトリスト (付録 B) |
 | [file-drag-drop-design.md](file-drag-drop-design.md) | グリッドからエクスプローラ等へファイルをドラッグ送出 (コピー) する機能の実装設計＋実装メモ。シェル `IDataObject` + `SHDoDragDrop` 方式。実装済み (2026-05、`src/file_drag.rs`)、残るは §8.2 の実機検証 |
 | [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md) | サムネイル比率の自動選択 (`thumb_aspect_auto`) の設計と実装計画。`log(ratio)` の中央値 → 最近接バケット方式 + 6 段ゲート (min_samples / 連勝継続 / cooldown / 切替上限 / 入力 idle / log 距離マージン)。実装済み (2026-05、`src/auto_aspect.rs`) |
 | [local-adjustment-layer-v1.1.0-plan.md](local-adjustment-layer-v1.1.0-plan.md) | **Codex 案**。v1.1.0 候補の画像補正ピボット計画。全体補正の強化、手描き/グラデーション/範囲/セグメンテーション生成マスク、マスク反転付きの部分補正レイヤーを、消しゴム後・隠蔽加工前の非破壊レイヤーとして追加する設計 |
