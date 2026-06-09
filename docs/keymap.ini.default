@@ -109,11 +109,11 @@
 # FsSpreadShiftLeft = Ctrl+Left ; 見開き表示を左方向へ1ページずらす
 # FsSpreadShiftRight = Ctrl+Right ; 見開き表示を右方向へ1ページずらす
 # FsSlideshow = S ; スライドショーの再生または停止を切り替える
-# FsSpaceCheck = Space ; 現在の画像のチェックを切り替える
+# FsSpaceCheck = Space ; 現在の画像のチェックを切り替える。スライドショー中は停止する
 # FsCapture = Ctrl+S ; 現在の表示画像をキャプチャ保存する
 # FsExport = Ctrl+E ; 現在の表示結果を別ファイルへ書き出す
-# FsCompareToggle = X ; 比較スロットの画像と現在画像を切り替える
-# FsCompareCycle = C ; 比較表示を切り替える
+# FsCompareToggle = X ; 現在の画像を比較スロットに固定または解除する
+# FsCompareCycle = C ; 比較スロットのピン画像と現在画像を切り替えて表示する
 # FsCompareWipe = Shift+C ; ワイプ比較を切り替える
 # FsCompareDiff = Alt+C ; 差分比較を切り替える
 # FsRotateCw = R ; 現在の画像を右に90度回転する
@@ -174,7 +174,7 @@
 # VideoNextFile = Down ; 次のファイルへ移動する
 # VideoPrevFile = Up ; 前のファイルへ移動する
 # VideoMute = M ; 動画のミュートを切り替える
-# VideoLoop = L ; 動画のループ再生を切り替える
+# VideoLoop = L ; 動画のループ方式を順に切り替える
 # VideoMarkerPrev = J ; 前のチャプター/ブックマーク/ピンへ移動する
 # VideoMarkerNext = K ; 次のチャプター/ブックマーク/ピンへ移動する
 # VideoPin = P ; 現在の再生位置を代表フレームとしてピン留めする
