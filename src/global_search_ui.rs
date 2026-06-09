@@ -1049,6 +1049,10 @@ impl App {
     ) {
         use std::sync::atomic::Ordering;
         debug_assert_eq!(items.len(), image_metas.len());
+        // 検索ビューに切り替えるのでネスト ZIP ツリーナビ状態を破棄する。
+        // (zip_nav 維持の軽量経路 zip_nav_show_current_level は install_new_items を
+        // 直接呼ぶのでここを通らない。)
+        self.zip_nav = None;
         // 旧タスク停止: インデックスが付け替わるので in-flight は意味を失う
         if let Some(pending) = self.search_pending.take() {
             pending.cancel();

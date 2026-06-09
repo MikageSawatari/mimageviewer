@@ -749,10 +749,11 @@ impl App {
                 self.drill_into_container(path, is_zip);
                 None
             }
-            // TODO(Phase 3): ネスト ZIP ツリーの子コンテナへ降りる (zip_nav drill)。
-            // Phase 2 では materialize が finalize に未配線なので ZipDir セルは出現せず、
-            // ここには到達しない。
-            Some(GridItem::ZipDir { .. }) => None,
+            // ネスト ZIP ツリーの子コンテナへ降りる (Phase 3)。
+            Some(GridItem::ZipDir { dir_prefix, .. }) => {
+                self.zip_nav_enter(&dir_prefix);
+                None
+            }
             None => None,
         }
     }
@@ -773,6 +774,10 @@ impl App {
         }
         if self.local_search_blocks_parent_nav() {
             self.cancel_pending_folder_nav();
+            return None;
+        }
+        // ネスト ZIP ツリー内なら 1 階層戻る (ルートなら false → 親フォルダへ抜ける)。
+        if self.zip_nav_back() {
             return None;
         }
         self.resolve_grid_parent_nav()

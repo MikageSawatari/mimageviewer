@@ -4197,6 +4197,14 @@ pub struct App {
     /// harmless に抜ける (Drop の自動 cancel と同じ構造)。
     pub(crate) zip_enumerate_pending: Option<ZipEnumeratePending>,
 
+    /// ネスト ZIP ツリーナビ状態 (v1.3.0、`docs/nested-zip-tree-plan.md`)。
+    /// ZIP を開いている間だけ `Some`。`finalize_zip_enumerate` がツリー構築後に設定し、
+    /// `start_loading_items` が別コンテナ (フォルダ/PDF/別 ZIP) へ遷移するとき先頭で
+    /// クリアする (= 単一チョークポイント)。階層内ナビ (enter/back) は
+    /// `zip_nav_show_current_level` の軽量経路 (install_new_items) を使い、これは
+    /// `zip_nav` を維持する。
+    pub(crate) zip_nav: Option<crate::zip_tree::ZipNavState>,
+
     // ── PDF 非同期ロード ────────────────────────────────────────
     /// PDF レンダリング完了時に content_type を受け取るチャネル
     pub(crate) pdf_content_type_tx: mpsc::Sender<(usize, crate::pdf_loader::PdfPageContentType)>,
@@ -5906,6 +5914,7 @@ impl App {
             pdf_content_type_rx: pdf_ct_rx,
             pdf_enumerate_pending: None,
             zip_enumerate_pending: None,
+            zip_nav: None,
             fs_nav_after_pdf_enumerate: None,
             pending_auto_fs_open: false,
             pending_return_to_parent: false,
@@ -7756,6 +7765,9 @@ impl App {
         // 外側の ZIP/PDF/フォルダを切り替えたので、ネスト ZIP バイト列キャッシュを破棄する。
         // これで古い外側アーカイブのバイト列が RAM に居残るのを防ぐ。
         crate::zip_loader::clear_nested_cache();
+        // ZIP を出るのでツリーナビ状態も破棄 (start_loading_items でも消えるが、
+        // enumerate pending 窓中の stale 参照を防ぐため早期にクリア)。
+        self.zip_nav = None;
 
         // ── ディレクトリ走査（画像はメタデータも収集）────────────────
         // pre_scan が与えられていれば DFS スレッドで既に走査済み (UI 非ブロック)。
@@ -9115,6 +9127,9 @@ impl App {
         // 上書き消去するレースが起きる。ここで同期実行すれば load_zip_as_folder 呼び出し
         // の直列順で確実にクリアされる (clear 自体は軽量: NESTED_CACHE.clear())。
         crate::zip_loader::clear_nested_cache();
+        // 旧 ZIP のツリーナビ状態を破棄 (新ツリーは finalize_zip_enumerate が設定)。
+        // enumerate pending 窓中に stale nav を参照しないよう早期クリア。
+        self.zip_nav = None;
 
         // UI 即応: items をクリアして grid が「読み込み中…」を出せる状態にし、
         // address / current_folder を zip_path にして breadcrumb と BS (parent) を正しく動かす。
@@ -9255,46 +9270,20 @@ impl App {
         };
         crate::logger::log(format!("  zip: {} image entries", entries.len()));
 
-        // サブディレクトリごとにグルーピング + 各グループ内ソート (純粋 in-memory)
-        let mut groups: std::collections::BTreeMap<String, Vec<crate::zip_loader::ZipImageEntry>> =
-            std::collections::BTreeMap::new();
-        for e in entries {
-            let dir = crate::zip_loader::entry_dir(&e.entry_name).to_string();
-            groups.entry(dir).or_default().push(e);
-        }
-        for list in groups.values_mut() {
-            list.sort_by(|a, b| {
-                let an = crate::zip_loader::entry_basename(&a.entry_name);
-                let bn = crate::zip_loader::entry_basename(&b.entry_name);
-                sort.compare(an, a.mtime, bn, b.mtime, natural_sort_key)
-            });
-        }
-
-        let insert_separators = groups.len() > 1;
-        let mut items: Vec<GridItem> = Vec::new();
-        let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
-        let mut existing_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (dir, list) in groups {
-            if insert_separators {
-                let display = if dir.is_empty() {
-                    "(ルート)".to_string()
-                } else {
-                    dir.clone()
-                };
-                items.push(GridItem::ZipSeparator {
-                    dir_display: display,
-                });
-                image_metas.push(None);
-            }
-            for e in list {
-                existing_keys.insert(e.entry_name.clone());
-                items.push(GridItem::ZipImage {
-                    zip_path: zip_path.clone(),
-                    entry_name: e.entry_name,
-                });
-                image_metas.push(Some((e.mtime, e.uncompressed_size as i64)));
-            }
-        }
+        // ネスト ZIP ツリーナビ (v1.3.0、docs/nested-zip-tree-plan.md Strategy A)。
+        // フラット展開 + ZipSeparator をやめ、entry_name の '/' 区切りでツリーを構築し、
+        // ルート階層 (冗長ラッパーは自動降下) だけを materialize して表示する。これで
+        // 内側 ZIP / サブフォルダが「入れるコンテナ」になり、見開きペアリングが本ごとに
+        // リセットされる (= 平坦な並びの偶奇で複数本を 1 冊に連結してしまう問題の根治)。
+        // ツリー構築は純ロジック (I/O なし) なので 1100 エントリでも数 ms。
+        let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path.clone(), entries));
+        // existing_keys は **全階層** のキー (全 leaf entry_name + 全 dir の zipdir:) を
+        // 集める。ルート階層しか materialize しないので、これがないと深い階層の
+        // サムネが delete_missing で stale 削除されて再生成ループになる (Codex P2)。
+        let existing_keys: std::collections::HashSet<String> =
+            tree.all_cache_keys().into_iter().collect();
+        let nav = crate::zip_tree::ZipNavState::new(tree);
+        let (items, image_metas) = nav.materialize_current(sort);
 
         self.start_loading_items(
             zip_path,
@@ -9304,6 +9293,8 @@ impl App {
             Vec::new(),
             None,
         );
+        // start_loading_items が zip_nav を None にした後で、新しいツリーナビを設定する。
+        self.zip_nav = Some(nav);
 
         // Ctrl+↑↓ フォルダナビから fullscreen で ZIP に遷移してきた場合、items が
         // 揃った今 fullscreen を開き直す (Codex P1: PDF と同じ処理を ZIP にも適用)。
@@ -9335,6 +9326,51 @@ impl App {
         }
     }
 
+    /// 現在の `zip_nav` 階層を materialize して grid に表示する (軽量経路、Phase 3)。
+    ///
+    /// `start_loading_items` を通さない: catalog / worker は同一コンテナ (外側 ZIP) で
+    /// 再構築不要、かつ階層内移動でフォルダ履歴 / last_folder を汚さないため。
+    /// Ctrl+G の `replace_search_view_items` と同様に `install_new_items` +
+    /// `invalidate_idx_state_and_queues` で idx 状態と in-flight キューを破棄し、
+    /// サムネは永続ワーカー + 毎フレーム reconcile が Pending を拾って再ロードする。
+    /// `zip_nav` 自体は維持される (= ナビ継続)。
+    fn zip_nav_show_current_level(&mut self) {
+        let (items, metas) = {
+            let Some(nav) = self.zip_nav.as_ref() else {
+                return;
+            };
+            nav.materialize_current(self.settings.sort_order)
+        };
+        self.install_new_items(items, metas);
+        self.invalidate_idx_state_and_queues();
+        self.selected = None;
+        self.scroll_offset_y = 0.0;
+        self.scroll_to_selected = false;
+    }
+
+    /// `ZipDir` セルへ降りる (Enter / ダブルクリック / ゲームパッド accept)。
+    /// `dir_prefix` は `GridItem::ZipDir.dir_prefix` (ルートからの絶対パス、末尾 '/')。
+    pub(crate) fn zip_nav_enter(&mut self, dir_prefix: &str) {
+        let Some(nav) = self.zip_nav.as_mut() else {
+            return;
+        };
+        nav.enter(dir_prefix);
+        self.zip_nav_show_current_level();
+    }
+
+    /// ZIP 階層を 1 段戻る。戻れたら `true`、ルート (スタック底) なら `false`
+    /// (= 呼び出し側が ZIP を抜けて実フォルダ親へ遷移する)。
+    pub(crate) fn zip_nav_back(&mut self) -> bool {
+        let Some(nav) = self.zip_nav.as_mut() else {
+            return false;
+        };
+        if !nav.back() {
+            return false;
+        }
+        self.zip_nav_show_current_level();
+        true
+    }
+
     /// PDF ファイルを仮想フォルダとして開く (非同期)。
     ///
     /// ワーカーにページ列挙リクエストを送り、即座に return する。
@@ -9348,6 +9384,8 @@ impl App {
 
         // PDF を開く際、直前に ZIP を見ていた可能性があるためネスト ZIP キャッシュを破棄する。
         crate::zip_loader::clear_nested_cache();
+        // ZIP を出るのでツリーナビ状態も破棄。
+        self.zip_nav = None;
 
         // 旧サムネイルワーカーを即座にキャンセルして PDF ワーカーキューの渋滞を防ぐ。
         // start_loading_items は enumerate 完了後に呼ばれるため、ここで先行キャンセルする。
@@ -10136,6 +10174,12 @@ impl App {
         video_items: Vec<(usize, PathBuf, u64)>,
         folder_signature: Option<u64>,
     ) {
+        // ネスト ZIP ツリーナビの単一チョークポイント: 別コンテナ (フォルダ/PDF/別 ZIP/
+        // 検索結果) への遷移は必ずここを通るので、旧 zip_nav を破棄する。ZIP を開く
+        // 経路 (finalize_zip_enumerate) は start_loading_items の **後**で zip_nav を
+        // 再設定するので、ここでクリアしても問題ない。階層内ナビ (enter/back) は
+        // install_new_items の軽量経路を使い start_loading_items を通らない (= 維持)。
+        self.zip_nav = None;
         let previous_folder = self.current_folder.clone();
         let previous_archive_source_override = self.archive_source_override.clone();
         let preserve_archive_source_override = previous_archive_source_override.is_some()
@@ -15130,9 +15174,11 @@ impl App {
                             self.drill_into_container(p, is_zip);
                             return None;
                         }
-                        // TODO(Phase 3): ネスト ZIP ツリーの子コンテナへ Enter で降りる。
-                        // Phase 2 では materialize 未配線で ZipDir セルが出ないため未到達。
-                        Some(GridItem::ZipDir { .. }) => {}
+                        // ネスト ZIP ツリーの子コンテナへ Enter で降りる (Phase 3)。
+                        Some(GridItem::ZipDir { dir_prefix, .. }) => {
+                            let dp = dir_prefix.clone();
+                            self.zip_nav_enter(&dp);
+                        }
                         None => {}
                     }
                 }
@@ -15176,6 +15222,12 @@ impl App {
             }
             if self.local_search_blocks_parent_nav() {
                 self.cancel_pending_folder_nav();
+                return None;
+            }
+            // ネスト ZIP ツリー内なら、実フォルダ親へ抜ける前に 1 階層戻る (Phase 3)。
+            // ルート (スタック底) では zip_nav_back は false → そのまま親フォルダへ抜ける
+            // (= load_folder が zip_nav をクリアして ZIP を出る)。
+            if self.zip_nav_back() {
                 return None;
             }
             return self.resolve_grid_parent_nav();

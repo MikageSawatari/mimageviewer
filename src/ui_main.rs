@@ -3205,9 +3205,11 @@ impl App {
                     self.maybe_suppress_rating_filter_for_opened_container_path(&p);
                     self.drill_into_container(p, is_zip);
                 }
-                // TODO(Phase 3): ネスト ZIP ツリーの子コンテナへダブルクリックで降りる。
-                // Phase 2 では materialize 未配線で ZipDir セルが出ないため未到達。
-                Some(GridItem::ZipDir { .. }) => {}
+                // ネスト ZIP ツリーの子コンテナへダブルクリックで降りる (Phase 3)。
+                Some(GridItem::ZipDir { dir_prefix, .. }) => {
+                    let dp = dir_prefix.clone();
+                    self.zip_nav_enter(&dp);
+                }
                 None => {}
             }
         }
