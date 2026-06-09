@@ -82,6 +82,13 @@ seed する。worker は通常の cache_hit で取り出すので、Shell API �
 (Codex post-merge P2)。詳細:
 [virtual-folders.md §3.1.1](virtual-folders.md#311-親コンテナの代表サムネピン-folder-thumb-pinv09x)。
 
+**ドライブ一覧用の保存例外**: ドライブルート (`C:\` 等) を通常フォルダとして
+表示している間、そのドライブの手動ピン代表そのもののセルだけは
+`LoadRequest::force_cache` を立て、`CachePolicy` が Auto/Off でも親 catalog に
+サムネを残す。ドライブ一覧ビュー自体はこの catalog / `video_pins.db` を cache-only で
+読むだけで、表示時にドライブルートの `read_dir`、代表探索、metadata 確認、ピン先
+デコードは行わない。
+
 ### 1.4 表示時の変換
 
 サムネイルには以下が適用される:

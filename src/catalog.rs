@@ -143,6 +143,50 @@ impl CatalogDb {
         Ok(None)
     }
 
+    /// `filename` が `prefix` で始まるエントリのうち、mtime / size が最も新しいものを
+    /// 1 件だけ返す。フォルダ代表サムネのように base key と `#pin:` 派生 key の
+    /// どちらにも既存サムネが残り得る場合の cache-only 参照に使う。
+    pub fn load_latest_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> rusqlite::Result<Option<(String, CacheEntry)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT filename, mtime, file_size, thumb_data, source_width, source_height \
+             FROM thumbnails \
+             WHERE substr(filename, 1, ?1) = ?2 \
+             ORDER BY mtime DESC, file_size DESC, filename DESC \
+             LIMIT 1",
+        )?;
+        let mut iter = stmt.query_map(params![prefix.chars().count() as i64, prefix], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Option<u32>>(4)?,
+                row.get::<_, Option<u32>>(5)?,
+            ))
+        })?;
+        if let Some(item) = iter.next() {
+            let (filename, mtime, file_size, jpeg_data, src_w, src_h) = item?;
+            let source_dims = match (src_w, src_h) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+                _ => None,
+            };
+            return Ok(Some((
+                filename,
+                CacheEntry {
+                    mtime,
+                    file_size,
+                    jpeg_data,
+                    source_dims,
+                },
+            )));
+        }
+        Ok(None)
+    }
+
     /// サムネイルを INSERT OR REPLACE で保存する。
     ///
     /// `width` / `height` はキャッシュされる WebP サムネイルの寸法、
@@ -714,6 +758,33 @@ mod tests {
         // 二度目の delete (存在しないキー) もエラーにしない
         db.delete_one("a.jpg").unwrap();
         db.delete_one("never_existed.jpg").unwrap();
+    }
+
+    #[test]
+    fn catalog_load_latest_with_prefix_picks_newest_matching_pin_entry() {
+        let db = open_in_memory();
+        db.save("folderthumb:child", 10, 1, 8, 8, None, b"base")
+            .unwrap();
+        db.save(
+            "folderthumb:child#pin:image|cover|-|-|20|2",
+            20,
+            2,
+            8,
+            8,
+            None,
+            b"pin",
+        )
+        .unwrap();
+        db.save("folderthumb:child-other", 99, 9, 8, 8, None, b"other")
+            .unwrap();
+
+        let (filename, entry) = db
+            .load_latest_with_prefix("folderthumb:child#pin:")
+            .unwrap()
+            .expect("narrow prefix hit");
+        assert_eq!(filename, "folderthumb:child#pin:image|cover|-|-|20|2");
+        assert_eq!(entry.jpeg_data, b"pin");
+        assert!(db.load_latest_with_prefix("missing:").unwrap().is_none());
     }
 
     #[test]

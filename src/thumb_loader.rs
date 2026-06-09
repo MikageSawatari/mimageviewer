@@ -215,6 +215,10 @@ pub struct LoadRequest {
     /// 明示ピンだけを解決する特殊要求。未解決 / Folder leaf はアイコン fallback
     /// に倒し、通常フォルダ代表探索には進ませない。
     pub pinned_only: Option<PinnedOnlyRequest>,
+    /// CachePolicy に関係なく、このリクエストの結果を catalog に保存する。
+    /// ドライブ直下フォルダの明示ピン代表など、後段の cache-only 表示がユーザーの
+    /// 明示操作に依存する場合だけ UI 側で true にする。
+    pub force_cache: bool,
     /// パフォーマンス計装用: エンキュー時の input_seq (相関キー)。
     /// 0 は未設定を意味する。`--perf-log` 無効時は使われない。
     pub input_seq: u64,
@@ -1191,6 +1195,7 @@ pub fn process_load_request(
         req.items_gen,
         req.context_epoch,
         cancel_policy,
+        req.force_cache,
     );
     if crate::perf::is_enabled() {
         let total_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
@@ -1975,6 +1980,9 @@ pub fn load_one_cached(
     // cache 保存に進む (cache savable な PDF render thumbnail のみ)。
     // 詳細は `pdf_loader::CancelWaitPolicy` doc 参照。
     cancel_policy: crate::pdf_loader::CancelWaitPolicy,
+    // CachePolicy に関係なく catalog に残す。ユーザー明示ピンなど cache-only 復元が
+    // 後続で必要なリクエストに限って使う。
+    force_cache: bool,
 ) {
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
     // process_load_request 側と同じキー形式を使うこと��
@@ -2344,8 +2352,8 @@ pub fn load_one_cached(
     // (B) キャッシュ保存判定 (段階 C)
     //     catalog 未指定時は保存不可
     //     それ以外は CacheDecision の判定に従う
-    let should_save =
-        catalog.is_some() && cache_decision.should_cache(path, file_size, decode_ms, display_ms);
+    let policy_should_save = cache_decision.should_cache(path, file_size, decode_ms, display_ms);
+    let should_save = catalog.is_some() && (force_cache || policy_should_save);
 
     if should_save {
         let cat = catalog.expect("should_save => catalog is Some");
@@ -2386,8 +2394,13 @@ pub fn load_one_cached(
                         );
                     }
                 }
+                let force_note = if force_cache && !policy_should_save {
+                    " force-cache"
+                } else {
+                    ""
+                };
                 crate::logger::log(format!(
-                    "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms  {display_name}  -> save_key=`{name}`"
+                    "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms{force_note}  {display_name}  -> save_key=`{name}`"
                 ));
             }
             None => {
@@ -2746,6 +2759,59 @@ mod tests {
         let d = make_decision(CachePolicy::Off, 25, 2_000_000);
         let p = PathBuf::from("huge.jpg");
         assert!(!d.should_cache(&p, 100_000_000, 999.0, 999.0));
+    }
+
+    #[test]
+    fn force_cache_saves_even_when_policy_off() {
+        let tmp = TempDir::new().expect("tempdir");
+        let img_path = tmp.path().join("img.png");
+        let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([32, 64, 128, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .save(&img_path)
+            .expect("write image");
+
+        let cache_dir = tmp.path().join("cache");
+        let catalog = crate::catalog::CatalogDb::open(&cache_dir, tmp.path()).unwrap();
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let gen_done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stats = std::sync::Arc::new(std::sync::Mutex::new(crate::stats::ThumbStats::default()));
+
+        load_one_cached(
+            &img_path,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            &tx,
+            Some(&catalog),
+            Some(&cache_map),
+            123,
+            0,
+            &gen_done,
+            64,
+            75,
+            64,
+            make_decision(CachePolicy::Off, 25, 2_000_000),
+            &stats,
+            None,
+            true,
+            1,
+            1,
+            0,
+            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+            true,
+        );
+
+        let entry = catalog
+            .load_one("img.png")
+            .unwrap()
+            .expect("force_cache should write catalog entry");
+        assert_eq!(entry.mtime, 123);
+        assert_eq!(entry.file_size, 0);
+        assert!(cache_map.read().unwrap().contains_key("img.png"));
     }
 
     #[test]

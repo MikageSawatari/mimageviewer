@@ -326,7 +326,7 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 | 種別 | 表示内容 |
 |------|---------|
 | **フォルダ** | 代表画像サムネイル＋フォルダ名（画像がなければフォルダアイコン📁）。代表画像はフォルダ内を再帰的に探索（最大3階層）し、最初に見つかった画像をソート順で選択。**ユーザーが📌で手動指定**したアイテムがあれば自動選定を上書きする |
-| **ドライブ一覧** | `C:` / `D:` など接続済みドライブを並べる仮想ビュー。場所欄は空欄、ボリューム名は取得しない。未ピン時は painter 描画の固定ドライブアイコンを表示し、DB に代表サムネピンがあるドライブだけ既存カタログ / 動画ピン DB のサムネを cache-only で表示する。ピン先がフォルダの場合も、親 catalog に残っているフォルダタイルの既存サムネだけを使う。キャッシュ未作成時はアイコンへ戻し、ドライブ一覧表示だけでは `read_dir` / 代表画像探索 / metadata 確認 / ピン先デコードを行わない。D&D・チェック・レーティング・右クリックメニューは無効 |
+| **ドライブ一覧** | `C:` / `D:` など接続済みドライブを並べる仮想ビュー。場所欄は空欄、ボリューム名は取得しない。未ピン時は painter 描画の固定ドライブアイコンを表示し、DB に代表サムネピンがあるドライブだけ既存カタログ / 動画ピン DB のサムネを cache-only で表示する。ピン先がフォルダの場合も、親 catalog に残っているフォルダタイルの既存サムネだけを使う。通常のドライブルート表示中にピン代表セルが生成された場合は、そのセルだけ `CachePolicy` に関わらず保存して後続の cache-only 表示に使う。キャッシュ未作成時はアイコンへ戻し、ドライブ一覧表示だけでは `read_dir` / 代表画像探索 / metadata 確認 / ピン先デコードを行わない。D&D・チェック・レーティング・右クリックメニューは無効 |
 | **画像ファイル** | サムネイル画像 |
 | **動画ファイル** | サムネイル画像（Windows Shell API 経由）。フルスクリーン HUD でユーザーが指定したフレームがあればそれを優先 |
 | **ZIP ファイル** | 1枚目の画像サムネイル＋ZIP バッジ（ダブルクリックで中を開く）。**ユーザーが📌で手動指定**したエントリがあれば自動選定を上書きする |
@@ -606,8 +606,8 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 | `thumb_aspect_auto` | bool | false | サムネイル比率の自動選択モード。`true` のときフォルダ内画像の比率に応じてグリッドセル比率を自動で切り替える。フォルダごとの前回確定値は `auto_aspect_cache.db` に保存され、再訪時の初期比率に使われる。キャッシュ復元時は保存時の sample 数と同等以上の実測 sample が集まるまで、途中統計による上書きを抑制する。キャッシュ管理ダイアログの現在フォルダ削除 / 全削除 / 古いキャッシュ削除で、この判定結果も対応する範囲だけ削除される (詳細: [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md))。 |
 | `sort_order` | SortOrder | FileName | ソート順（FileName / Natural / MtimeAsc / MtimeDesc） |
 | `favorites` | Vec\<FavoriteEntry\> | [] | お気に入りフォルダ (`id: Uuid` + name + path + `auto_index_structure` / `auto_index_metadata` / `auto_index_thumbs` の 3 フラグ, v0.8.0〜) |
-| `last_folder` | Option\<PathBuf\> | None | 前回開いていたフォルダ。起動時の場所が「前回終了したフォルダ」のときに使用する。末端だけ消えている場合は直近の存在する親フォルダへ遡って開く |
-| `startup_folder_mode` | StartupFolderMode | Previous | 起動時に開く場所。`Previous`=前回終了したフォルダ、`Desktop`=Windows Known Folder API のデスクトップ、`Drives`=ドライブ一覧、`Specific`=指定フォルダ |
+| `last_folder` | Option\<PathBuf\> | None | 前回終了した場所。実フォルダの場合はそのパス、ドライブ一覧の場合は空パス sentinel を保存する。起動時の場所が「前回終了した場所」のときに使用する。実フォルダの末端だけ消えている場合は直近の存在する親フォルダへ遡って開く |
+| `startup_folder_mode` | StartupFolderMode | Previous | 起動時に開く場所。`Previous`=前回終了した場所、`Desktop`=Windows Known Folder API のデスクトップ、`Drives`=ドライブ一覧、`Specific`=指定フォルダ |
 | `startup_folder_path` | Option\<PathBuf\> | None | `startup_folder_mode = Specific` の指定フォルダ。開けない場合は Desktop、Desktop も取得できない場合は前回フォルダへフォールバックする |
 | `recent_folders` | Vec\<PathBuf\> | [] | フォルダバーの履歴▼に表示する最近開いたフォルダ履歴。最大 20 件、検索中の一時移動は記録しない。環境設定 → ツールバーからクリアできる |
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ZIP・PDF の開き方) を完了したか |

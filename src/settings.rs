@@ -866,7 +866,7 @@ pub struct RecentApp {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupFolderMode {
-    /// 前回終了時に開いていたフォルダ。既存挙動との互換のためデフォルト。
+    /// 前回終了時に表示していた場所。既存挙動との互換のためデフォルト。
     #[default]
     Previous,
     /// Windows のデスクトップ。
@@ -880,7 +880,7 @@ pub enum StartupFolderMode {
 impl StartupFolderMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Previous => "前回終了したフォルダ",
+            Self::Previous => "前回終了した場所",
             Self::Desktop => "デスクトップ",
             Self::Specific => "指定フォルダ",
             Self::Drives => "ドライブ一覧",

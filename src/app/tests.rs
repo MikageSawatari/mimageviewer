@@ -944,7 +944,7 @@ mod phase_c_key_tests {
     }
 
     #[test]
-    fn enter_drive_list_sets_virtual_state_without_last_folder_update() {
+    fn enter_drive_list_sets_virtual_state_and_last_folder_sentinel() {
         let mut app = setup_app();
         let previous = PathBuf::from(r"C:\pics");
         app.current_folder = Some(previous.clone());
@@ -956,7 +956,13 @@ mod phase_c_key_tests {
         assert!(app.items_are_drive_list);
         assert!(app.current_folder.is_none());
         assert!(app.address.is_empty());
-        assert!(app.settings.last_folder.is_none());
+        assert!(
+            app.settings
+                .last_folder
+                .as_deref()
+                .is_some_and(is_drive_list_last_folder),
+            "ドライブ一覧は last_folder の空パス sentinel として保存する"
+        );
         assert_eq!(app.folder_history.get(&previous), Some(&(42.0, Some(3))));
         assert_eq!(app.items.len(), app.image_metas.len());
         assert!(app.image_metas.iter().all(Option::is_none));
@@ -972,6 +978,49 @@ mod phase_c_key_tests {
         assert!(
             app.heavy_io_queue.is_none(),
             "ピンが無ければ drive-list 用 I/O queue は作らない"
+        );
+    }
+
+    #[test]
+    fn previous_startup_reopens_drive_list_sentinel() {
+        let mut settings = crate::settings::Settings {
+            startup_folder_mode: crate::settings::StartupFolderMode::Previous,
+            last_folder: Some(drive_list_last_folder_sentinel()),
+            ..Default::default()
+        };
+        assert!(should_start_in_drive_list(&settings));
+
+        settings.startup_folder_mode = crate::settings::StartupFolderMode::Desktop;
+        assert!(
+            !should_start_in_drive_list(&settings),
+            "空パス sentinel は Previous 起動時だけドライブ一覧として扱う"
+        );
+    }
+
+    #[test]
+    fn drive_root_pin_representative_forces_cache_for_drive_list_seed() {
+        let mut app = setup_app();
+        let drive_root = PathBuf::from(r"C:\");
+        let pinned = GridItem::Folder(PathBuf::from(r"C:\PinnedFolder"));
+        let other = GridItem::Folder(PathBuf::from(r"C:\OtherFolder"));
+        let source = crate::folder_thumb_pins::source_from_grid_item(&drive_root, &pinned).unwrap();
+        app.current_folder = Some(drive_root.clone());
+        app.folder_pin_map
+            .insert(crate::path_key::normalize_keep_drive(&drive_root), source);
+
+        assert!(
+            app.should_force_cache_for_drive_list_pin(&pinned),
+            "ドライブ直下でピン代表そのもののセルは cache-only seed のため保存を強制する"
+        );
+        assert!(
+            !app.should_force_cache_for_drive_list_pin(&other),
+            "ピン代表ではないセルまで cache を強制しない"
+        );
+
+        app.current_folder = Some(PathBuf::from(r"C:\Users"));
+        assert!(
+            !app.should_force_cache_for_drive_list_pin(&pinned),
+            "ドライブルート以外の通常フォルダでは drive-list 用の保存強制をしない"
         );
     }
 
@@ -1007,8 +1056,21 @@ mod phase_c_key_tests {
                 image::ImageFormat::WebP,
             )
             .unwrap();
+        let pinned_parent_key = format!(
+            "{}{}image|cover.jpg|-|-|111|4096",
+            parent_key,
+            crate::thumb_loader::CACHE_KEY_PIN_SUFFIX
+        );
         parent_db
-            .save(&parent_key, 111, 0, 4, 4, Some((80, 60)), &webp_bytes)
+            .save(
+                &pinned_parent_key,
+                111,
+                4096,
+                4,
+                4,
+                Some((80, 60)),
+                &webp_bytes,
+            )
             .unwrap();
 
         app.items = vec![GridItem::Folder(drive_root.clone())];
@@ -1040,7 +1102,7 @@ mod phase_c_key_tests {
             .expect("drive-list requests use pinned-only")
             .cache_key_prefix
             .clone();
-        let drive_list_key = drive_list_pinned_cache_key(&prefix, 111, 0);
+        let drive_list_key = drive_list_pinned_cache_key(&prefix, 111, 4096);
         let seeded = drive_list_db
             .load_one(&drive_list_key)
             .unwrap()

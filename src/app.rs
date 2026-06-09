@@ -6967,6 +6967,7 @@ impl App {
         self.current_folder_rating_cache = None;
         self.archive_source_override = None;
         self.address.clear();
+        self.settings.last_folder = Some(drive_list_last_folder_sentinel());
         self.selected = None;
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
@@ -10622,20 +10623,22 @@ impl App {
 
     fn drive_list_pin_seed_entry(
         &mut self,
-        leaf_container: &std::path::Path,
-        leaf_source: &crate::folder_thumb_pins::FolderPinSource,
+        container: &std::path::Path,
+        source: &crate::folder_thumb_pins::FolderPinSource,
+        pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+        max_depth: usize,
     ) -> Option<crate::catalog::CacheEntry> {
         use crate::folder_thumb_pins::{FileKind, FolderPinSource};
-        match leaf_source {
+        match source {
             FolderPinSource::File { rel, kind } => {
                 let fname = direct_pin_rel_file_name(rel)?;
                 match kind {
                     FileKind::Image => {
-                        let cat = self.get_or_open_catalog(leaf_container)?;
+                        let cat = self.get_or_open_catalog(container)?;
                         cat.load_one(&fname).ok().flatten()
                     }
                     FileKind::Video => {
-                        let video_path = leaf_container.join(rel);
+                        let video_path = container.join(rel);
                         let webp = self
                             .video_pin_db
                             .as_ref()
@@ -10650,19 +10653,19 @@ impl App {
                         })
                     }
                     FileKind::ZipFile => {
-                        let cat = self.get_or_open_catalog(leaf_container)?;
+                        let cat = self.get_or_open_catalog(container)?;
                         cat.load_one(&format!("{}{}", CACHE_KEY_ZIP, fname))
                             .ok()
                             .flatten()
                     }
                     FileKind::PdfFile => {
-                        let cat = self.get_or_open_catalog(leaf_container)?;
+                        let cat = self.get_or_open_catalog(container)?;
                         cat.load_one(&format!("{}{}", CACHE_KEY_PDF, fname))
                             .ok()
                             .flatten()
                     }
                     FileKind::Folder => {
-                        let folder_path = leaf_container.join(rel);
+                        let folder_path = container.join(rel);
                         let folder_item = GridItem::Folder(folder_path);
                         let key = container_cache_base_key(
                             &folder_item,
@@ -10670,25 +10673,43 @@ impl App {
                             Some(self.settings.folder_thumb_sort),
                             self.settings.folder_thumb_depth,
                         )?;
-                        let cat = self.get_or_open_catalog(leaf_container)?;
-                        cat.load_one(&key).ok().flatten()
+                        let cat = self.get_or_open_catalog(container)?;
+                        let base_entry = cat.load_one(&key).ok().flatten();
+                        let pinned_prefix =
+                            format!("{}{}", key, crate::thumb_loader::CACHE_KEY_PIN_SUFFIX);
+                        let pinned_entry = cat
+                            .load_latest_with_prefix(&pinned_prefix)
+                            .ok()
+                            .flatten()
+                            .map(|(_, entry)| entry);
+                        let entry = pinned_entry.or(base_entry);
+                        if let Some(entry) = entry {
+                            return Some(entry);
+                        }
+                        let (leaf_container, leaf_source) = resolve_drive_list_pin_source_no_io(
+                            container, source, pin_db, max_depth,
+                        )?;
+                        if leaf_container == container && leaf_source == *source {
+                            return None;
+                        }
+                        self.drive_list_pin_seed_entry(&leaf_container, &leaf_source, pin_db, 0)
                     }
                 }
             }
             FolderPinSource::ZipEntry { zip_rel, entry } => {
                 let zip_path = if zip_rel.is_empty() {
-                    leaf_container.to_path_buf()
+                    container.to_path_buf()
                 } else {
-                    leaf_container.join(zip_rel)
+                    container.join(zip_rel)
                 };
                 let cat = self.get_or_open_catalog(&zip_path)?;
                 cat.load_one(entry).ok().flatten()
             }
             FolderPinSource::PdfPage { pdf_rel, page } => {
                 let pdf_path = if pdf_rel.is_empty() {
-                    leaf_container.to_path_buf()
+                    container.to_path_buf()
                 } else {
-                    leaf_container.join(pdf_rel)
+                    container.join(pdf_rel)
                 };
                 let cat = self.get_or_open_catalog(&pdf_path)?;
                 cat.load_one(&crate::grid_item::pdf_page_cache_key(*page))
@@ -10731,16 +10752,13 @@ impl App {
             }) else {
                 continue;
             };
-            let Some((leaf_container, leaf_source)) = resolve_drive_list_pin_source_no_io(
+            let prefix = drive_list_pinned_cache_key_prefix(&base_key, &source);
+            let Some(entry) = self.drive_list_pin_seed_entry(
                 &container_path,
                 &source,
                 pin_db_ref,
                 self.settings.folder_thumb_depth as usize,
             ) else {
-                continue;
-            };
-            let prefix = drive_list_pinned_cache_key_prefix(&base_key, &leaf_source);
-            let Some(entry) = self.drive_list_pin_seed_entry(&leaf_container, &leaf_source) else {
                 continue;
             };
             let key = drive_list_pinned_cache_key(&prefix, entry.mtime, entry.file_size);
@@ -10821,6 +10839,31 @@ impl App {
             return;
         }
         self.folder_pin_map = db.lookup_many(container_paths);
+    }
+
+    fn should_force_cache_for_drive_list_pin(&self, item: &GridItem) -> bool {
+        let Some(container) = self.current_folder.as_ref() else {
+            return false;
+        };
+        if self.items_are_drive_list || !is_drive_or_share_root(container) {
+            return false;
+        }
+        let Some(source) = crate::folder_thumb_pins::source_from_grid_item(container, item) else {
+            return false;
+        };
+        if matches!(
+            source,
+            crate::folder_thumb_pins::FolderPinSource::File {
+                kind: crate::folder_thumb_pins::FileKind::Video,
+                ..
+            }
+        ) {
+            return false;
+        }
+        let container_key = crate::path_key::normalize_keep_drive(container);
+        self.folder_pin_map
+            .get(&container_key)
+            .is_some_and(|pinned| pinned == &source)
     }
 
     /// 指定 container の代表サムネピンを `source` に設定 (上書き) し、再ロード予約を立てる。
@@ -13455,6 +13498,12 @@ impl App {
                 }
                 continue;
             };
+            if !self.items_are_drive_list
+                && let Some(item) = self.items.get(i)
+                && self.should_force_cache_for_drive_list_pin(item)
+            {
+                req.force_cache = true;
+            }
             req.priority = i >= visible_raw_start && i < visible_raw_end;
             // prefetch suppression: スクロール中 / visible 待ち中は非 priority (= prefetch) を
             // enqueue しない。visible (= priority=true) は常に enqueue する。
@@ -27495,7 +27544,7 @@ impl eframe::App for App {
             // 明示的な Light / Dark 選択はそのまま使う。初回セットアップダイアログでは
             // テーマ / AI 利用範囲 / ZIP/PDF の開き方をまとめて確認する。
 
-            if self.settings.startup_folder_mode == crate::settings::StartupFolderMode::Drives {
+            if should_start_in_drive_list(&self.settings) {
                 self.enter_drive_list(None);
             } else if let Some(folder) = crate::known_folders::startup_folder(
                 self.settings.startup_folder_mode,
@@ -29195,6 +29244,27 @@ fn drive_list_catalog_path() -> PathBuf {
     PathBuf::from("__mimageviewer_drive_list__")
 }
 
+fn drive_list_last_folder_sentinel() -> PathBuf {
+    PathBuf::new()
+}
+
+fn is_drive_list_last_folder(path: &std::path::Path) -> bool {
+    path.as_os_str().is_empty()
+}
+
+fn is_drive_or_share_root(path: &std::path::Path) -> bool {
+    path.parent().is_none()
+}
+
+fn should_start_in_drive_list(settings: &crate::settings::Settings) -> bool {
+    settings.startup_folder_mode == crate::settings::StartupFolderMode::Drives
+        || (settings.startup_folder_mode == crate::settings::StartupFolderMode::Previous
+            && settings
+                .last_folder
+                .as_deref()
+                .is_some_and(is_drive_list_last_folder))
+}
+
 fn drive_display_label(path: &std::path::Path) -> Option<String> {
     let s = path.as_os_str().to_string_lossy();
     let trimmed = s.trim_end_matches(['\\', '/']);
@@ -29308,7 +29378,7 @@ fn make_drive_list_pin_load_request(
     folder_thumb_sort: crate::settings::SortOrder,
     folder_thumb_depth: u32,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
-    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    _pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
 ) -> Option<LoadRequest> {
     let GridItem::Folder(container_path) = item else {
         return None;
@@ -29325,13 +29395,7 @@ fn make_drive_list_pin_load_request(
     }
     let base_key =
         container_cache_base_key(item, true, Some(folder_thumb_sort), folder_thumb_depth)?;
-    let (_, leaf_source) = resolve_drive_list_pin_source_no_io(
-        container_path,
-        source,
-        pin_db,
-        folder_thumb_depth as usize,
-    )?;
-    let cache_key_prefix = drive_list_pinned_cache_key_prefix(&base_key, &leaf_source);
+    let cache_key_prefix = drive_list_pinned_cache_key_prefix(&base_key, source);
     Some(LoadRequest {
         idx,
         path: container_path.clone(),
@@ -29797,6 +29861,7 @@ fn apply_folder_thumb_pin(
             items_gen: base_req.items_gen,
             context_epoch: base_req.context_epoch,
             pinned_only: None,
+            force_cache: false,
         };
     }
 
@@ -29832,6 +29897,7 @@ fn apply_folder_thumb_pin(
         items_gen: base_req.items_gen,
         context_epoch: base_req.context_epoch,
         pinned_only: None,
+        force_cache: false,
     }
 }
 
