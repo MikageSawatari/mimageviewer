@@ -7468,6 +7468,11 @@ impl App {
         }
         self.clear_pending_folder_nav_steps();
         self.bump_full_context_for_load();
+        // ドライブ一覧は start_loading_items を通らない経路。残った ZIP ツリーナビ状態を
+        // 破棄しないと、BS / gamepad-back が zip_nav_back() を先に拾って current_folder=None の
+        // まま旧 ZIP 階層を復活させてしまう (Codex P2)。ネスト ZIP バイト列キャッシュも破棄。
+        self.zip_nav = None;
+        crate::zip_loader::clear_nested_cache();
 
         let (tx, rx) = mpsc::channel();
         self.tx = tx.clone();
@@ -9335,17 +9340,49 @@ impl App {
     /// サムネは永続ワーカー + 毎フレーム reconcile が Pending を拾って再ロードする。
     /// `zip_nav` 自体は維持される (= ナビ継続)。
     fn zip_nav_show_current_level(&mut self) {
-        let (items, metas) = {
+        let (items, metas, zip_path) = {
             let Some(nav) = self.zip_nav.as_ref() else {
                 return;
             };
-            nav.materialize_current(self.settings.sort_order)
+            let (items, metas) = nav.materialize_current(self.settings.sort_order);
+            (items, metas, nav.tree.zip_path.clone())
         };
+        // 旧レベルの in-flight 検索 / 詳細メタ pending を停止 (idx が付け替わるので無意味)。
+        if let Some(pending) = self.search_pending.take() {
+            pending.cancel();
+        }
+        if let Some(pending) = self.metadata_pending.take() {
+            pending.cancel();
+        }
+        // items / image_metas / thumbnails 差し替え + items_generation bump。
         self.install_new_items(items, metas);
+        // idx ベース状態 + in-flight キューを破棄 (replace_search_view_items / snapshot と同じ)。
         self.invalidate_idx_state_and_queues();
+        // idx-keyed ページ編集状態 (補正 / ローカル調整 / 最終段 crop / 消しゴム / 隠蔽) を
+        // clear して、新レベルの entry に対し DB から再 hydrate する。entry_name キーで引くので
+        // 階層が変わっても各ページの保存済み補正・マスクが正しく載り、旧 idx の編集が別 entry に
+        // 漏れない (Codex P1)。invalidate はこれらを意図的に触らないので明示的に呼ぶ必要がある。
+        self.rehydrate_page_edit_state_for_current_items(&zip_path);
+        self.local_adjust_generation.clear();
+        self.local_adjust_cache.clear();
+        // path-keyed メタキャッシュは新レベルの別 entry 用にリセット。
+        self.metadata_cache.clear();
+        self.exif_cache.clear();
+        self.xmp_cache.clear();
+        self.tags_cache.clear();
+        // Ctrl+F フィルタの残留を解除 (旧レベルの entry 向けなので新レベルでは無効)。
+        self.search_filter = None;
+        self.search_query.clear();
         self.selected = None;
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
+        self.scroll_hint
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        // ★ visible_indices を再構築。これがないと旧レベルの stale index が
+        // update_keep_range_and_requests で thumbnails[i] を範囲外参照して panic する (Codex P1)。
+        self.rebuild_visible_indices();
+        // tag prewarm worker は invalidate で cancel 済み → 新レベル向けに再起動。
+        self.prewarm_grid_tags();
     }
 
     /// `ZipDir` セルへ降りる (Enter / ダブルクリック / ゲームパッド accept)。
@@ -18202,14 +18239,21 @@ impl App {
 
     /// グリッドが ZIP 内エントリで構成されているか (= ZIP を開いている)。
     /// ZIP 内では Ctrl+F をファイル名フィルタに固定する (§4.1.2)。
+    ///
+    /// ネスト ZIP ツリーナビ (v1.3.0) では、ルート階層が ZipDir のみ (直下画像 0 枚) の
+    /// ことがある。その場合 items に ZipImage が無いので、`zip_nav` の有無も見て ZIP 内と
+    /// 判定する。さもないと Ctrl+F が filename 固定にならず、検索対象が tags/EXIF 等のとき
+    /// ZipDir の名前照合 (filename 次元) が無効化されてコンテナが全消えする (Codex P2)。
     pub(crate) fn grid_is_zip_entries(&self) -> bool {
-        self.items.iter().any(|it| {
-            matches!(
-                it,
-                crate::grid_item::GridItem::ZipImage { .. }
-                    | crate::grid_item::GridItem::ZipSeparator { .. }
-            )
-        })
+        self.zip_nav.is_some()
+            || self.items.iter().any(|it| {
+                matches!(
+                    it,
+                    crate::grid_item::GridItem::ZipImage { .. }
+                        | crate::grid_item::GridItem::ZipSeparator { .. }
+                        | crate::grid_item::GridItem::ZipDir { .. }
+                )
+            })
     }
 
     /// in-flight 検索の結果を非同期に受信する。

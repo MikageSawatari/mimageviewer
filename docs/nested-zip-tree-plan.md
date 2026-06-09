@@ -101,14 +101,22 @@ GridItem::ZipDir {
 - 画像 leaf は **既存の `ZipImage { zip_path, entry_name }` のまま** (identity 不変)。
 - 代表サムネ = 部分木の先頭画像 (in-memory ツリーから選定、bytes は worker が遅延読み)。
 
-### 3.3 ナビゲーション状態 (新規、Ctrl+G DrillState 相当)
+### 3.3 ナビゲーション状態 (Phase 3a 実装、Ctrl+G DrillState 相当)
 ```
 ZipNavState {
     tree: Arc<ZipTree>,            // 開いている外側 ZIP のツリー (列挙完了時に構築)
-    prefix: Vec<String>,           // 現在いる階層 (segment 列。空 = ルート)
+    stack: Vec<Vec<String>>,       // 「描画した実効 prefix」のスタック。stack[0]=collapse([])、常に非空
 }
 ```
-- 別フォルダ / 別 ZIP / PDF へ移ると破棄 (既存 `clear_nested_cache` と同タイミング)。
+- **実効 prefix スタック方式** (Phase 1 当初の「単一 logical prefix + 都度 collapse」案から変更)。
+  各エントリは collapse 済みの実効 prefix。`enter(dir_prefix)` は子の実効 prefix を push、
+  `back()` は pop (底=ルートなら false で ZIP を抜ける)。これで「root が単一ラッパーへ
+  collapse する木で Backspace が同じ画面に戻り続ける」罠を構造的に回避する (Codex P2)。
+  詳細は `collapse_redundant` の doc-comment 参照。
+- 別フォルダ / 別 ZIP / PDF へ移ると破棄。クリアの単一チョークポイントは
+  `start_loading_items` 先頭 + leaving 経路 (`load_folder` / `load_zip` / `load_pdf` の
+  `clear_nested_cache` 隣 / `enter_drive_list` / `replace_search_view_items`)。
+  `finalize_zip_enumerate` が `start_loading_items` の **後**で再設定する。
 
 ---
 
@@ -152,13 +160,20 @@ navigation でこの関数を呼ぶだけ (再列挙なし = in-memory)。見開
 - 状態リセット境界: 同一 ZIP 内のナビでは `ZipNavState.tree` を保持し再列挙しない。
   別 ZIP/フォルダへ出るときのみ `clear_nested_cache` + tree 破棄。
 
-### ⚠ 論理 prefix と表示 prefix を分ける (Phase 1 Codex P2 で確定)
-`ZipNavState.prefix` は **常に「ユーザーが明示的に降りた論理 prefix」** を保持する。
-`collapse_redundant` (D1 の冗長ラッパー自動降下) は **materialize 直前の view 変換**
-としてのみ適用し、**その結果を `prefix` に保存し直さない**。保存し直すと
-`["vol01"] → pop → [] → collapse → ["vol01"]` で Backspace がループして ZIP を
-抜けられなくなる。論理 prefix が空 (ルート) のとき、collapse 後の表示から Backspace
-すると ZIP を抜けて実フォルダ親へ戻る (= 自動降下したラッパーは「入った」扱いにしない)。
+### ⚠ 実効 prefix スタック方式で Backspace 罠を回避 (Phase 1 Codex P2 → Phase 3a 実装で確定)
+当初案は「`ZipNavState.prefix` に論理 prefix を持ち、collapse は materialize 直前の
+view 変換としてのみ適用 (結果を保存し直さない)」だったが、**実装では実効 prefix の
+スタック方式**を採った (同じ罠回避をより単純に達成できるため)。
+
+- `stack` の各エントリは「実際に描画した実効 prefix」(= collapse 済み)。
+- `enter(dir_prefix)`: 子の実効 prefix を `collapse_redundant` で算出して push。
+- `back()`: pop。底 (= `stack.len()==1`、ルート表示) なら `false` を返し、呼び出し側が
+  ZIP を抜けて実フォルダ親へ遷移する。
+- これで `[] → pop → [] → collapse → ["vol01"]` のように同じ画面へ戻り続ける罠が
+  構造的に起きない (各 back は「直前に描画した実効 prefix」へ正確に戻る)。
+- root が単一ラッパー (`vol01/`) へ collapse する木では、開いた時点で `stack[0]=["vol01"]`
+  となり `at_root()`。ここで Backspace すると即 ZIP を抜ける (= ラッパーは「入った」扱いに
+  しない)。
 
 ---
 
@@ -284,3 +299,11 @@ Claude はコンパイル + ユニットテストまでしか検証できない�
 - per-book の読書再開位置 / 見開きモード永続化 (D4、将来)
 - ZipDir の代表サムネ手動ピン (folder_thumb_pins への ZipDir 追加、将来)
 - 書き込み系 (ZIP 内ファイルの編集/移動) — 従来どおり read-only
+
+**既知の制限 (Phase 4 以降で精緻化、Phase 3 Codex P3)**:
+- **ドリル位置が一部操作で保持されない**: ソート順変更 / Ctrl+G を drill 済み ZIP 階層で
+  実行すると `current_folder` (= 外側 ZIP) 基準でリロードされ、ZIP のルート (collapse 後)
+  へ戻る。データ破壊ではなく状態ロスト (UX)。階層を保ったまま再 materialize する対応は将来。
+- **複数本 ZIP の auto-fullscreen 着地 / cross-book resume**: ルートが ZipDir のみのとき
+  自動フルスクリーンは画像を見つけられず本一覧表示に留まる。「続きから」も保存頁が
+  ルート階層に無いと先頭フォールバック。先頭本への自動進入 / 深い階層への resume は Phase 4。
