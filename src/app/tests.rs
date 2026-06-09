@@ -949,6 +949,55 @@ mod phase_c_key_tests {
     }
 
     #[test]
+    fn toolbar_parent_target_at_drive_root_returns_drive_list_nav() {
+        let mut app = setup_app();
+        let root = PathBuf::from(r"C:\");
+        app.current_folder = Some(root.clone());
+
+        let nav = app.grid_parent_nav_target();
+
+        match nav {
+            Some(crate::ui_main::AddressBarNav::DriveList(Some(origin))) => {
+                assert!(crate::folder_tree::path_eq(&origin, &root));
+            }
+            other => panic!("ドライブルートの ⬆ は DriveList nav を返すこと: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gamepad_back_at_drive_root_returns_drive_list_nav() {
+        let mut app = setup_app();
+        let root = PathBuf::from(r"C:\");
+        app.current_folder = Some(root.clone());
+
+        let nav = app.handle_gamepad_grid_back();
+
+        match nav {
+            Some(crate::ui_main::AddressBarNav::DriveList(Some(origin))) => {
+                assert!(crate::folder_tree::path_eq(&origin, &root));
+            }
+            other => panic!("ドライブルートの Pad B は DriveList nav を返すこと: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gamepad_back_respects_ctrl_f_origin_filter_block() {
+        let mut app = setup_app();
+        let origin = PathBuf::from("C:/pics/origin");
+        app.current_folder = Some(origin.clone());
+        app.show_search_bar = true;
+        app.search_filter = Some(std::collections::HashSet::new());
+        app.search_filter_origin_folder = Some(origin);
+
+        let nav = app.handle_gamepad_grid_back();
+
+        assert!(
+            nav.is_none(),
+            "Pad B も Ctrl+F フィルタ元フォルダでは親フォルダへ抜けない"
+        );
+    }
+
+    #[test]
     fn enter_drive_list_sets_virtual_state_and_last_folder_sentinel() {
         let mut app = setup_app();
         let previous = PathBuf::from(r"C:\pics");

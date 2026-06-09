@@ -7078,6 +7078,32 @@ impl App {
             .or_else(|| self.current_folder.clone())
     }
 
+    /// グリッド上の「親へ戻る」操作 (Backspace / Alt+↑ / ツールバー⬆ / Pad B) の
+    /// 共通ナビゲーション先を返す。ドライブルートでは親 `Path` が無いので、ドライブ
+    /// 一覧へ戻す専用ナビを返す。
+    pub(crate) fn grid_parent_nav_target(&self) -> Option<crate::ui_main::AddressBarNav> {
+        let cur = self.effective_folder()?;
+        if let Some(parent) = cur.parent() {
+            Some(crate::ui_main::AddressBarNav::Direct(parent.to_path_buf()))
+        } else {
+            Some(crate::ui_main::AddressBarNav::DriveList(Some(cur)))
+        }
+    }
+
+    pub(crate) fn resolve_grid_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
+        let cur = self.effective_folder()?;
+        let nav = if let Some(parent) = cur.parent() {
+            self.select_after_load = cur
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+            crate::ui_main::AddressBarNav::Direct(parent.to_path_buf())
+        } else {
+            crate::ui_main::AddressBarNav::DriveList(Some(cur))
+        };
+        Some(nav)
+    }
+
     /// `pending_return_to_parent` (自動オープン ZIP/PDF の Esc/Enter で立つ「親フォルダ
     /// (一覧) へ戻る」予約) を消化したときのナビ先を返す。
     ///
@@ -15128,18 +15154,7 @@ impl App {
                 self.cancel_pending_folder_nav();
                 return None;
             }
-            if let Some(ref cur) = self.effective_folder() {
-                if let Some(parent) = cur.parent() {
-                    // 親に戻ったとき、元のフォルダ名を選択するようにヒントを設定
-                    self.select_after_load = cur
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|s| s.to_string());
-                    return Some(crate::ui_main::AddressBarNav::Direct(parent.to_path_buf()));
-                } else {
-                    return Some(crate::ui_main::AddressBarNav::DriveList(Some(cur.clone())));
-                }
-            }
+            return self.resolve_grid_parent_nav();
         }
 
         let history_shortcut_allowed = !self.global_search.active

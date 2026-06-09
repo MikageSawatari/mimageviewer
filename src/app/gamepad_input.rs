@@ -753,7 +753,7 @@ impl App {
         }
     }
 
-    fn handle_gamepad_grid_back(&mut self) -> Option<AddressBarNav> {
+    pub(crate) fn handle_gamepad_grid_back(&mut self) -> Option<AddressBarNav> {
         if self.is_snapshot_active() && self.snapshot_return_to_list_view() {
             return None;
         }
@@ -767,16 +767,11 @@ impl App {
             self.favsearch_back();
             return None;
         }
-        if let Some(cur) = self.effective_folder()
-            && let Some(parent) = cur.parent()
-        {
-            self.select_after_load = cur
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.to_string());
-            return Some(AddressBarNav::Direct(parent.to_path_buf()));
+        if self.local_search_blocks_parent_nav() {
+            self.cancel_pending_folder_nav();
+            return None;
         }
-        None
+        self.resolve_grid_parent_nav()
     }
 
     fn scroll_gamepad_grid(&mut self, direction: f32) {

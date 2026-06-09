@@ -2194,9 +2194,7 @@ impl App {
         let enter_pressed = self.dialog_enter_pressed(ctx);
         let effective_folder = self.effective_folder();
         let has_current = effective_folder.is_some();
-        let parent_target = effective_folder
-            .as_ref()
-            .and_then(|p| p.parent().map(|parent| parent.to_path_buf()));
+        let parent_nav_target = self.grid_parent_nav_target();
         let back_target = self.folder_history_back_target().cloned();
         let forward_target = self.folder_history_forward_target().cloned();
         // Codex P2-1: ★固定 中は履歴/親/ツリーボタンを disabled (= 余計な処理を起動しない)
@@ -2332,28 +2330,33 @@ impl App {
                                 "Ctrl+F フィルタ中は親フォルダへ移動できません\nEsc または × で検索を閉じます"
                                     .to_string()
                             } else {
-                                parent_target
-                                    .as_ref()
-                                    .map(|p| format!("親フォルダへ [BS]\n{}", p.to_string_lossy()))
-                                    .unwrap_or_else(|| "親フォルダへ [BS]".to_string())
+                                match parent_nav_target.as_ref() {
+                                    Some(AddressBarNav::Direct(p)) => {
+                                        format!("親フォルダへ [BS]\n{}", p.to_string_lossy())
+                                    }
+                                    Some(AddressBarNav::DriveList(Some(origin))) => {
+                                        format!("ドライブ一覧へ [BS]\n{}", origin.to_string_lossy())
+                                    }
+                                    Some(AddressBarNav::DriveList(None)) => {
+                                        "ドライブ一覧へ [BS]".to_string()
+                                    }
+                                    Some(
+                                        AddressBarNav::HistoryBack | AddressBarNav::HistoryForward,
+                                    )
+                                    | None => "親フォルダへ [BS]".to_string(),
+                                }
                             };
                             if ui
                                 .add_enabled(
-                                    parent_target.is_some()
+                                    parent_nav_target.is_some()
                                         && !snapshot_active
                                         && !local_search_blocks_parent,
                                     egui::Button::new("⬆"),
                                 )
                                 .hover_tip(parent_hover)
                                 .clicked()
-                                && let (Some(cur), Some(parent)) =
-                                    (effective_folder.as_ref(), parent_target.as_ref())
                             {
-                                self.select_after_load = cur
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .map(|s| s.to_string());
-                                result = Some(AddressBarNav::Direct(parent.clone()));
+                                result = self.resolve_grid_parent_nav();
                             }
                         }
                     }
