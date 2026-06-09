@@ -2202,8 +2202,8 @@ mod phase_c_drill_nav_tests {
         );
     }
 
-    /// 旧選択アイテムが新 items から消えた場合は selected = None に戻し、
-    /// 先頭スクロールにフォールバックする (= 復元不能時の安全側挙動)。
+    /// 旧選択アイテムが新 items から消えた場合は内容キー復元を諦め、
+    /// 常時可視カーソルの不変条件に従って先頭の選択可能アイテムへフォールバックする。
     #[test]
     fn streaming_rebuild_clears_selected_when_item_disappears() {
         use crate::grid_item::GridItem;
@@ -2219,8 +2219,13 @@ mod phase_c_drill_nav_tests {
         let after = vec![GridItem::Image(std::path::PathBuf::from("c:/a.jpg"))];
         app.replace_search_view_items(after, vec![None]);
 
-        assert_eq!(app.selected, None, "旧選択アイテムが消えたので None");
+        assert_eq!(
+            app.selected,
+            Some(0),
+            "旧選択アイテムが消えたので先頭の可視アイテムへフォールバック"
+        );
         assert_eq!(app.scroll_offset_y, 0.0, "復元失敗時は先頭スクロール");
+        assert!(app.scroll_to_selected);
     }
 
     /// Codex P2: Ctrl+G から実フォルダ/ZIP/PDF を開いた状態で rating 変更すると、
