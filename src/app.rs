@@ -10661,7 +10661,18 @@ impl App {
                             .ok()
                             .flatten()
                     }
-                    FileKind::Folder => None,
+                    FileKind::Folder => {
+                        let folder_path = leaf_container.join(rel);
+                        let folder_item = GridItem::Folder(folder_path);
+                        let key = container_cache_base_key(
+                            &folder_item,
+                            false,
+                            Some(self.settings.folder_thumb_sort),
+                            self.settings.folder_thumb_depth,
+                        )?;
+                        let cat = self.get_or_open_catalog(leaf_container)?;
+                        cat.load_one(&key).ok().flatten()
+                    }
                 }
             }
             FolderPinSource::ZipEntry { zip_rel, entry } => {
@@ -10728,9 +10739,7 @@ impl App {
             ) else {
                 continue;
             };
-            let Some(prefix) = drive_list_pinned_cache_key_prefix(&base_key, &leaf_source) else {
-                continue;
-            };
+            let prefix = drive_list_pinned_cache_key_prefix(&base_key, &leaf_source);
             let Some(entry) = self.drive_list_pin_seed_entry(&leaf_container, &leaf_source) else {
                 continue;
             };
@@ -29218,22 +29227,13 @@ fn pin_source_id_cache_prefix(source: &crate::folder_thumb_pins::FolderPinSource
 fn drive_list_pinned_cache_key_prefix(
     base_key: &str,
     source: &crate::folder_thumb_pins::FolderPinSource,
-) -> Option<String> {
-    if matches!(
-        source,
-        crate::folder_thumb_pins::FolderPinSource::File {
-            kind: crate::folder_thumb_pins::FileKind::Folder,
-            ..
-        }
-    ) {
-        return None;
-    }
-    Some(format!(
+) -> String {
+    format!(
         "{}{}{}",
         base_key,
         crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
         pin_source_id_cache_prefix(source)
-    ))
+    )
 }
 
 fn drive_list_pinned_cache_key(prefix: &str, mtime: i64, file_size: i64) -> String {
@@ -29280,7 +29280,9 @@ fn resolve_drive_list_pin_source_no_io(
             ));
             return Some((current_container, current_source));
         }
-        let next_source = pin_db.and_then(|db| db.lookup(&next_container))?;
+        let Some(next_source) = pin_db.and_then(|db| db.lookup(&next_container)) else {
+            return Some((current_container, current_source));
+        };
         let compatible = match &next_source {
             FolderPinSource::File { .. } => true,
             FolderPinSource::ZipEntry { zip_rel, .. } => !zip_rel.is_empty(),
@@ -29329,7 +29331,7 @@ fn make_drive_list_pin_load_request(
         pin_db,
         folder_thumb_depth as usize,
     )?;
-    let cache_key_prefix = drive_list_pinned_cache_key_prefix(&base_key, &leaf_source)?;
+    let cache_key_prefix = drive_list_pinned_cache_key_prefix(&base_key, &leaf_source);
     Some(LoadRequest {
         idx,
         path: container_path.clone(),

@@ -975,6 +975,84 @@ mod phase_c_key_tests {
         );
     }
 
+    #[test]
+    fn drive_list_folder_pin_seeds_cached_folder_tile_thumb() {
+        let mut app = setup_app();
+        let drive_root = app.tmp.path().join("drive-root");
+        let pinned_folder = drive_root.join("PinnedFolder");
+        let source = crate::folder_thumb_pins::FolderPinSource::File {
+            rel: "PinnedFolder".to_string(),
+            kind: crate::folder_thumb_pins::FileKind::Folder,
+        };
+
+        let resolved = resolve_drive_list_pin_source_no_io(&drive_root, &source, None, 3).unwrap();
+        assert_eq!(resolved.0, drive_root);
+        assert_eq!(resolved.1, source);
+
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent_db = crate::catalog::CatalogDb::open(&cache_dir, &drive_root).unwrap();
+        let folder_item = GridItem::Folder(pinned_folder);
+        let parent_key = container_cache_base_key(
+            &folder_item,
+            false,
+            Some(app.settings.folder_thumb_sort),
+            app.settings.folder_thumb_depth,
+        )
+        .unwrap();
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([48, 96, 160, 255]));
+        let mut webp_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut webp_bytes),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        parent_db
+            .save(&parent_key, 111, 0, 4, 4, Some((80, 60)), &webp_bytes)
+            .unwrap();
+
+        app.items = vec![GridItem::Folder(drive_root.clone())];
+        app.image_metas = vec![None];
+        app.folder_pin_map
+            .insert(crate::path_key::normalize_keep_drive(&drive_root), source);
+
+        let drive_list_db = std::sync::Arc::new(
+            crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
+        );
+        let cache_map: std::sync::Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        app.seed_drive_list_pin_thumbs_from_catalog(&cache_map, Some(&drive_list_db));
+
+        let req = make_drive_list_pin_load_request(
+            &app.items[0],
+            0,
+            app.settings.folder_thumb_sort,
+            app.settings.folder_thumb_depth,
+            &app.folder_pin_map,
+            app.folder_thumb_pin_db.as_deref(),
+        )
+        .expect("drive-list folder pin should create a cache-only request");
+        let prefix = req
+            .pinned_only
+            .as_ref()
+            .expect("drive-list requests use pinned-only")
+            .cache_key_prefix
+            .clone();
+        let drive_list_key = drive_list_pinned_cache_key(&prefix, 111, 0);
+        let seeded = drive_list_db
+            .load_one(&drive_list_key)
+            .unwrap()
+            .expect("drive-list catalog should receive the cached folder tile thumb");
+        assert_eq!(seeded.jpeg_data, webp_bytes);
+        assert_eq!(seeded.source_dims, Some((80, 60)));
+        assert!(
+            cache_map.read().unwrap().contains_key(&drive_list_key),
+            "worker の cache-only lookup 用 map にも seed される"
+        );
+    }
+
     /// Codex P2 #3: 選択中の Ctrl+S お気に入りフィルタが設定から消えたら、
     /// `execute_favsearch` が UI と整合を取るために filter を None にクリアする。
     #[test]
