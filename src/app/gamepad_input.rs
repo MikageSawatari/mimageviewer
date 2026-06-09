@@ -749,6 +749,10 @@ impl App {
                 self.drill_into_container(path, is_zip);
                 None
             }
+            // TODO(Phase 3): ネスト ZIP ツリーの子コンテナへ降りる (zip_nav drill)。
+            // Phase 2 では materialize が finalize に未配線なので ZipDir セルは出現せず、
+            // ここには到達しない。
+            Some(GridItem::ZipDir { .. }) => None,
             None => None,
         }
     }

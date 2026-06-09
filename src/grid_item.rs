@@ -35,6 +35,24 @@ pub enum GridItem {
         /// 表示されるディレクトリ名 (ルート直下の場合は "(root)")
         dir_display: String,
     },
+    /// ネスト ZIP ツリーナビ (v1.3.0、`docs/nested-zip-tree-plan.md` Strategy A) で、
+    /// 開いている外側 ZIP の現在階層にある「入れる子ディレクトリ / 内側アーカイブ」を表す
+    /// 1 セル。Enter / ダブルクリックでその階層へ降りる (ナビは `ZipNavState`)。
+    /// 実ファイルパスを持たない仮想コンテナなので、ファイル整理 / D&D / レーティング /
+    /// チェックの対象外 (helper は全て None / false を返す)。
+    ZipDir {
+        /// 外側 ZIP の実ファイルパス (= 仮想フォルダのルート identity)。
+        zip_path: PathBuf,
+        /// この子コンテナの prefix。末尾 '/' 付き ("chapters/" や "chapters/ch01.zip/")。
+        dir_prefix: String,
+        /// セグメントが `.zip` / `.cbz` で終わるか (バッジ区別用の suffix 推定。
+        /// 実アーカイブと同名フォルダは entry_name 文字列だけでは区別不能なので
+        /// accepted ambiguity。計画書 §9 参照)。
+        is_archive: bool,
+        /// 代表サムネに使う部分木の画像 `entry_name` (フルパス、sort 準拠で materialize
+        /// が選定)。画像 0 枚の階層では None (アイコン表示にフォールバック)。
+        representative: Option<String>,
+    },
     /// PDF ファイル内の 1 ページ
     PdfPage {
         pdf_path: PathBuf,
@@ -162,6 +180,7 @@ impl GridItem {
                 Cow::Borrowed(crate::zip_loader::entry_basename(entry_name))
             }
             GridItem::ZipSeparator { dir_display } => Cow::Borrowed(dir_display),
+            GridItem::ZipDir { dir_prefix, .. } => Cow::Borrowed(zipdir_display_name(dir_prefix)),
             GridItem::PdfPage { page_num, .. } => Cow::Owned(format!("Page {}", page_num + 1)),
             GridItem::SearchContainer { path, .. } => {
                 Cow::Borrowed(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
@@ -192,6 +211,11 @@ impl GridItem {
                 pdf_path, page_num, ..
             } => format!("{}:Page {}", pdf_path.display(), page_num + 1),
             GridItem::ZipSeparator { dir_display } => dir_display.clone(),
+            GridItem::ZipDir {
+                zip_path,
+                dir_prefix,
+                ..
+            } => format!("{}:{}", zip_path.display(), dir_prefix),
         }
     }
 
@@ -263,6 +287,13 @@ impl GridItem {
             GridItem::ZipSeparator { dir_display } => {
                 format!("zipsep::{dir_display}")
             }
+            GridItem::ZipDir {
+                zip_path,
+                dir_prefix,
+                ..
+            } => {
+                format!("zipdir::{}#{}", zip_path.display(), dir_prefix)
+            }
             GridItem::PdfPage {
                 pdf_path, page_num, ..
             } => pdf_page_perf_key(pdf_path, *page_num),
@@ -278,6 +309,23 @@ impl GridItem {
             }
         }
     }
+}
+
+/// `ZipDir` の `dir_prefix` ("chapters/ch01.zip/") から表示名 (最後のセグメント、
+/// 例 "ch01.zip") を取り出す。末尾 '/' を除去してから最後の '/' 以降を返す。
+/// ルート ("") の場合は空文字列 (通常 ZipDir はルートを指さない)。
+pub fn zipdir_display_name(dir_prefix: &str) -> &str {
+    let trimmed = dir_prefix.strip_suffix('/').unwrap_or(dir_prefix);
+    match trimmed.rfind('/') {
+        Some(pos) => &trimmed[pos + 1..],
+        None => trimmed,
+    }
+}
+
+/// `ZipDir` 代表サムネのカタログキー。`zipdir:` プレフィックスで通常の `entry_name`
+/// キー (ZIP 内パス) と衝突しない (entry_name に ':' を含む ZIP は稀)。additive。
+pub fn zipdir_cache_key(dir_prefix: &str) -> String {
+    format!("zipdir:{dir_prefix}")
 }
 
 /// PDF ファイル (フォルダ一覧上) 用の perf 相関キー。
@@ -391,6 +439,64 @@ mod tests {
             dir_display: "Chapter 1".to_string(),
         };
         assert_eq!(item.name(), "Chapter 1");
+    }
+
+    fn zipdir(prefix: &str, is_archive: bool) -> GridItem {
+        GridItem::ZipDir {
+            zip_path: PathBuf::from(r"C:\books\vol.zip"),
+            dir_prefix: prefix.to_string(),
+            is_archive,
+            representative: None,
+        }
+    }
+
+    #[test]
+    fn zipdir_display_name_helper() {
+        assert_eq!(zipdir_display_name("chapters/ch01.zip/"), "ch01.zip");
+        assert_eq!(zipdir_display_name("chapters/"), "chapters");
+        assert_eq!(zipdir_display_name("a/b/c/"), "c");
+        // 末尾 '/' なしでも動く
+        assert_eq!(zipdir_display_name("chapters/ch01.zip"), "ch01.zip");
+        assert_eq!(zipdir_display_name(""), "");
+    }
+
+    #[test]
+    fn zipdir_name_is_last_segment() {
+        assert_eq!(zipdir(r"chapters/ch01.zip/", true).name(), "ch01.zip");
+        assert_eq!(zipdir(r"chapters/", false).name(), "chapters");
+    }
+
+    #[test]
+    fn zipdir_display_path_and_perf_key() {
+        let item = zipdir("chapters/ch01.zip/", true);
+        assert_eq!(item.display_path(), r"C:\books\vol.zip:chapters/ch01.zip/");
+        assert_eq!(
+            item.perf_key(),
+            r"zipdir::C:\books\vol.zip#chapters/ch01.zip/"
+        );
+    }
+
+    #[test]
+    fn zipdir_is_virtual_non_actionable_container() {
+        let item = zipdir("chapters/ch01.zip/", true);
+        // 仮想コンテナ: 実パス系 helper は全て None / false。
+        assert!(item.container_path().is_none());
+        assert!(item.file_operation_path().is_none());
+        assert!(item.drag_source_path().is_none());
+        assert!(!item.is_checkable());
+        assert!(!item.has_page_data());
+        assert!(!item.is_rating_leaf());
+        assert!(!item.is_container_ratable());
+        assert!(!item.accepts_rating());
+        assert!(!item.is_heavy_io());
+    }
+
+    #[test]
+    fn zipdir_cache_key_is_prefixed() {
+        assert_eq!(
+            zipdir_cache_key("chapters/ch01.zip/"),
+            "zipdir:chapters/ch01.zip/"
+        );
     }
 
     #[test]

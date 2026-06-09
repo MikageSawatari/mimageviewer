@@ -634,6 +634,12 @@ fn details_kind_label(item: &GridItem) -> String {
         GridItem::ZipImage { .. } => "ZIP 内画像".to_string(),
         GridItem::ZipSeparator { .. } => "見出し".to_string(),
         GridItem::PdfPage { .. } => "PDF ページ".to_string(),
+        GridItem::ZipDir { is_archive, .. } => if *is_archive {
+            "内側 ZIP"
+        } else {
+            "ZIP 内フォルダ"
+        }
+        .to_string(),
         GridItem::SearchContainer { kind, .. } => match kind {
             crate::grid_item::SearchContainerKind::Folder => "検索フォルダ".to_string(),
             crate::grid_item::SearchContainerKind::Zip => "検索ZIP".to_string(),
@@ -3199,6 +3205,9 @@ impl App {
                     self.maybe_suppress_rating_filter_for_opened_container_path(&p);
                     self.drill_into_container(p, is_zip);
                 }
+                // TODO(Phase 3): ネスト ZIP ツリーの子コンテナへダブルクリックで降りる。
+                // Phase 2 では materialize 未配線で ZipDir セルが出ないため未到達。
+                Some(GridItem::ZipDir { .. }) => {}
                 None => {}
             }
         }

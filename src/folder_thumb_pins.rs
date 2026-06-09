@@ -180,8 +180,12 @@ pub fn source_from_grid_item(
         // ConvertibleArchive: RAR/7z/LZH は変換完了前に thumb 生成できないので
         // UI 側で disabled + tooltip 表示する (本関数は None を返すだけ)
         GridItem::ConvertibleArchive { .. } => None,
-        // ピン対象として意味がないもの
-        GridItem::SearchContainer { .. } | GridItem::ZipSeparator { .. } => None,
+        // ピン対象として意味がないもの。
+        // ZipDir はネスト ZIP ツリーの仮想コンテナ。初版 (v1.3.0) ではピン対象外
+        // (代表サムネ手動ピンは将来課題、計画書 §14 非目標)。
+        GridItem::SearchContainer { .. }
+        | GridItem::ZipSeparator { .. }
+        | GridItem::ZipDir { .. } => None,
     }
 }
 

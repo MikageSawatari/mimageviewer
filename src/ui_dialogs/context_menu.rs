@@ -597,6 +597,18 @@ impl crate::app::App {
                         GridItem::ZipSeparator { .. } => {
                             close = true;
                         }
+                        GridItem::ZipDir {
+                            zip_path,
+                            dir_prefix,
+                            ..
+                        } => {
+                            // ネスト ZIP の子コンテナ: 仮想パスのコピーのみ (実ファイル操作は不可)。
+                            let display = format!("{}:{}", native_path_text(zip_path), dir_prefix);
+                            if ui.button("パスをコピー").clicked() {
+                                ctx.copy_text(display);
+                                close = true;
+                            }
+                        }
                         GridItem::SearchContainer { path, .. } => {
                             // Ctrl+G 結果コンテナ: フォルダ扱いで最小限の操作を出す
                             if ui.button("パスをコピー").clicked() {
@@ -855,7 +867,10 @@ impl crate::app::App {
                             close = true;
                         }
                     }
-                    GridItem::Folder(_) | GridItem::ZipSeparator { .. } => {
+                    // ZipDir はフルスクリーン対象外 (ナビコンテナ) なので FS では最小限。
+                    GridItem::Folder(_)
+                    | GridItem::ZipSeparator { .. }
+                    | GridItem::ZipDir { .. } => {
                         close = true;
                     }
                     GridItem::ConvertibleArchive { path, .. } => {

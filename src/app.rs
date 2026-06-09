@@ -1449,12 +1449,17 @@ fn facet_kind_for_item(item: &GridItem) -> crate::settings::FacetItemKind {
         GridItem::PdfPage { .. } => FacetItemKind::PdfPage,
         GridItem::ZipSeparator { .. } => FacetItemKind::Separator,
         GridItem::SearchContainer { .. } => FacetItemKind::SearchContainer,
+        // ZipDir はネスト ZIP ツリーの仮想サブコンテナ。ZIP 内には実フォルダが無いので、
+        // facet 上は Folder バケツに入れる (= 「フォルダ」絞り込みで子コンテナだけが出る)。
+        GridItem::ZipDir { .. } => FacetItemKind::Folder,
     }
 }
 
 fn facet_ext_for_item(item: &GridItem) -> String {
     match item {
-        GridItem::Folder(_) | GridItem::ZipSeparator { .. } => String::new(),
+        GridItem::Folder(_) | GridItem::ZipSeparator { .. } | GridItem::ZipDir { .. } => {
+            String::new()
+        }
         GridItem::Image(p)
         | GridItem::Video(p)
         | GridItem::ZipFile(p)
@@ -1758,9 +1763,10 @@ fn details_created_time_path(item: &GridItem) -> Option<&Path> {
         GridItem::ConvertibleArchive { path, .. } | GridItem::SearchContainer { path, .. } => {
             Some(path.as_path())
         }
-        GridItem::ZipImage { .. } | GridItem::ZipSeparator { .. } | GridItem::PdfPage { .. } => {
-            None
-        }
+        GridItem::ZipImage { .. }
+        | GridItem::ZipSeparator { .. }
+        | GridItem::ZipDir { .. }
+        | GridItem::PdfPage { .. } => None,
     }
 }
 
@@ -1870,8 +1876,13 @@ fn run_metadata_search(
             };
         }
         let processed_in_pass1 = match item {
-            GridItem::Folder(_) | GridItem::ZipFile(_) | GridItem::ConvertibleArchive { .. } => {
-                // フォルダ / ZIP / 変換対象アーカイブ: ファイル名 (basename) で照合。
+            GridItem::Folder(_)
+            | GridItem::ZipFile(_)
+            | GridItem::ConvertibleArchive { .. }
+            | GridItem::ZipDir { .. } => {
+                // フォルダ / ZIP / 変換対象アーカイブ / ネスト ZIP 子コンテナ:
+                // ファイル名 (basename = ZipDir は最後のセグメント) で照合。
+                // ZipDir の子は現階層 items に含まれないので group 可視判定は不要 (名前照合のみ)。
                 if use_name && crate::search_query::matches_with_mode(tokens, &item.name(), mode) {
                     matches.insert(idx);
                 }
@@ -15119,6 +15130,9 @@ impl App {
                             self.drill_into_container(p, is_zip);
                             return None;
                         }
+                        // TODO(Phase 3): ネスト ZIP ツリーの子コンテナへ Enter で降りる。
+                        // Phase 2 では materialize 未配線で ZipDir セルが出ないため未到達。
+                        Some(GridItem::ZipDir { .. }) => {}
                         None => {}
                     }
                 }
@@ -17912,6 +17926,9 @@ impl App {
             GridItem::ZipImage { .. } => "6-zip-image".to_string(),
             GridItem::PdfPage { .. } => "7-pdf-page".to_string(),
             GridItem::ZipSeparator { .. } => "8-separator".to_string(),
+            // ネスト ZIP 子コンテナ: ZIP 内には実フォルダが無いので、コンテナ慣習に従い
+            // 先頭グループ (ZipImage より前) に並べる。
+            GridItem::ZipDir { .. } => "0-zipdir".to_string(),
             GridItem::SearchContainer { kind, .. } => match kind {
                 crate::grid_item::SearchContainerKind::Folder => "9-search-folder".to_string(),
                 crate::grid_item::SearchContainerKind::Zip => "9-search-zip".to_string(),
@@ -32036,6 +32053,66 @@ pub(crate) fn draw_cell(
                 dark,
                 crate::ui_helpers::estimated_file_badge_width(inner),
             );
+        }
+        GridItem::ZipDir {
+            is_archive,
+            dir_prefix,
+            ..
+        } => {
+            // ネスト ZIP ツリーの子コンテナ (v1.3.0)。内側アーカイブは ZipFile 風
+            // (📦 + ZIP バッジ + 下部ファイル名)、ただのサブフォルダは Folder 風
+            // (📁 + フォルダ名バッジ) に描く。代表サムネがロード済みならそれを使う。
+            let name = crate::grid_item::zipdir_display_name(dir_prefix);
+            if *is_archive {
+                match thumb {
+                    ThumbnailState::Loaded { tex, .. } => {
+                        draw_thumb_texture(painter, inner, tex, rotation);
+                    }
+                    ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
+                        painter.rect_filled(inner, 2.0, pending_placeholder_bg);
+                        painter.text(
+                            inner.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "📦",
+                            egui::FontId::proportional(32.0),
+                            egui::Color32::from_gray(120),
+                        );
+                    }
+                }
+                crate::ui_helpers::draw_zip_badge(painter, inner);
+                crate::ui_helpers::draw_cell_filename(
+                    painter,
+                    inner,
+                    name,
+                    name_text_color,
+                    dark,
+                    crate::ui_helpers::estimated_file_badge_width(inner),
+                );
+            } else {
+                match thumb {
+                    ThumbnailState::Loaded { tex, .. } => {
+                        draw_thumb_texture(painter, inner, tex, rotation);
+                        crate::ui_helpers::draw_folder_badge(painter, inner, name);
+                    }
+                    ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
+                        painter.text(
+                            inner.center() - egui::vec2(0.0, 14.0),
+                            egui::Align2::CENTER_CENTER,
+                            "📁",
+                            egui::FontId::proportional(42.0),
+                            egui::Color32::from_rgb(220, 170, 30),
+                        );
+                        crate::ui_helpers::draw_cell_filename(
+                            painter,
+                            inner,
+                            name,
+                            name_text_color,
+                            dark,
+                            0.0,
+                        );
+                    }
+                }
+            }
         }
         GridItem::ZipSeparator { dir_display } => {
             // 作品境界のセパレータ: 1 セル全体に目立つ背景 + フォルダ名
