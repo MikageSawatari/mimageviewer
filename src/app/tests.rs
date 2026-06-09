@@ -1115,6 +1115,133 @@ mod phase_c_key_tests {
         );
     }
 
+    #[test]
+    fn drive_list_root_folder_pin_uses_drive_aware_full_path_tile_key() {
+        let mut app = setup_app();
+        let drive_root = PathBuf::from(r"C:\");
+        let pinned_folder = PathBuf::from(r"C:\Photos");
+        let source = crate::folder_thumb_pins::FolderPinSource::File {
+            rel: "Photos".to_string(),
+            kind: crate::folder_thumb_pins::FileKind::Folder,
+        };
+
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent_db = crate::catalog::CatalogDb::open(&cache_dir, &drive_root).unwrap();
+        let folder_item = GridItem::Folder(pinned_folder);
+        let parent_key = container_cache_base_key(
+            &folder_item,
+            true,
+            Some(app.settings.folder_thumb_sort),
+            app.settings.folder_thumb_depth,
+        )
+        .unwrap();
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([16, 120, 48, 255]));
+        let mut webp_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut webp_bytes),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        parent_db
+            .save(&parent_key, 222, 0, 4, 4, Some((100, 50)), &webp_bytes)
+            .unwrap();
+
+        app.items = vec![GridItem::Folder(drive_root.clone())];
+        app.image_metas = vec![None];
+        app.folder_pin_map
+            .insert(crate::path_key::normalize_keep_drive(&drive_root), source);
+
+        let drive_list_db = std::sync::Arc::new(
+            crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
+        );
+        let cache_map: std::sync::Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        app.seed_drive_list_pin_thumbs_from_catalog(&cache_map, Some(&drive_list_db));
+
+        let req = make_drive_list_pin_load_request(
+            &app.items[0],
+            0,
+            app.settings.folder_thumb_sort,
+            app.settings.folder_thumb_depth,
+            &app.folder_pin_map,
+            app.folder_thumb_pin_db.as_deref(),
+        )
+        .expect("drive-list folder pin should create a cache-only request");
+        let prefix = req.pinned_only.unwrap().cache_key_prefix;
+        let drive_list_key = drive_list_pinned_cache_key(&prefix, 222, 0);
+        let seeded = drive_list_db
+            .load_one(&drive_list_key)
+            .unwrap()
+            .expect("drive-aware root folder tile should seed");
+        assert_eq!(seeded.jpeg_data, webp_bytes);
+        assert_eq!(seeded.source_dims, Some((100, 50)));
+    }
+
+    #[test]
+    fn drive_list_root_folder_pin_without_root_tile_does_not_seed_from_child_catalog() {
+        let mut app = setup_app();
+        let drive_root = PathBuf::from(r"C:\");
+        let pinned_folder = PathBuf::from(r"C:\Photos");
+        let source = crate::folder_thumb_pins::FolderPinSource::File {
+            rel: "Photos".to_string(),
+            kind: crate::folder_thumb_pins::FileKind::Folder,
+        };
+        let child_source = crate::folder_thumb_pins::FolderPinSource::File {
+            rel: "cover.jpg".to_string(),
+            kind: crate::folder_thumb_pins::FileKind::Image,
+        };
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(&pinned_folder, &child_source)
+            .unwrap();
+
+        let cache_dir = crate::catalog::default_cache_dir();
+        let child_db = crate::catalog::CatalogDb::open(&cache_dir, &pinned_folder).unwrap();
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([220, 40, 80, 255]));
+        let mut wrong_webp_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut wrong_webp_bytes),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        child_db
+            .save(
+                "cover.jpg",
+                333,
+                2048,
+                4,
+                4,
+                Some((120, 80)),
+                &wrong_webp_bytes,
+            )
+            .unwrap();
+
+        app.items = vec![GridItem::Folder(drive_root.clone())];
+        app.image_metas = vec![None];
+        app.folder_pin_map
+            .insert(crate::path_key::normalize_keep_drive(&drive_root), source);
+
+        let drive_list_db = std::sync::Arc::new(
+            crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
+        );
+        let cache_map: std::sync::Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        app.seed_drive_list_pin_thumbs_from_catalog(&cache_map, Some(&drive_list_db));
+
+        assert!(
+            drive_list_db.load_all().unwrap().is_empty(),
+            "root catalog に正しいフォルダタイルが無い場合は子 catalog を掘らずアイコンに戻す"
+        );
+        assert!(cache_map.read().unwrap().is_empty());
+    }
+
     /// Codex P2 #3: 選択中の Ctrl+S お気に入りフィルタが設定から消えたら、
     /// `execute_favsearch` が UI と整合を取るために filter を None にクリアする。
     #[test]

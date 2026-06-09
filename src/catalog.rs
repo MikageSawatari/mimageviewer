@@ -17,7 +17,15 @@ use crate::path_key;
 /// `{cache_dir}/{xx}/{sha256}.db` の形式で DB ファイルパスを返す。
 /// xx はハッシュ hex 先頭2文字（256サブフォルダに分散）。
 pub fn db_path_for(cache_dir: &Path, folder_path: &Path) -> PathBuf {
-    let normalized = path_key::normalize(folder_path);
+    // 通常のサブフォルダは従来どおりドライブ文字を捨て、リムーバブルドライブの
+    // レター変更でもキャッシュを引き継ぐ。一方でドライブルートだけは `C:\Photos`
+    // と `D:\Photos` のような直下同名項目が同じ root catalog / 同じ basename key に
+    // 衝突するため、ドライブ文字を保持して DB 自体を分離する。
+    let normalized = if path_key::is_drive_or_share_root(folder_path) {
+        path_key::normalize_keep_drive(folder_path)
+    } else {
+        path_key::normalize(folder_path)
+    };
     let hash = format!("{:x}", Sha256::digest(normalized.as_bytes()));
     cache_dir.join(&hash[..2]).join(format!("{}.db", hash))
 }
@@ -648,6 +656,22 @@ mod tests {
         let b = db_path_for(cache, Path::new(r"D:\photos\vacation"));
         // ドライブ文字は除去され、小文字化されるので同じパスになるはず
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn db_path_for_drive_roots_keeps_drive_letter() {
+        let cache = Path::new(r"C:\cache");
+        let c = db_path_for(cache, Path::new(r"C:\"));
+        let d = db_path_for(cache, Path::new(r"D:\"));
+        assert_ne!(c, d, "ドライブルート catalog は直下同名項目の衝突を避ける");
+    }
+
+    #[test]
+    fn db_path_for_non_root_still_ignores_drive_letter() {
+        let cache = Path::new(r"C:\cache");
+        let c = db_path_for(cache, Path::new(r"C:\Photos"));
+        let d = db_path_for(cache, Path::new(r"D:\photos"));
+        assert_eq!(c, d, "非 root は従来どおりドライブレター変更に追従する");
     }
 
     #[test]

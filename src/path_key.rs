@@ -8,6 +8,14 @@
 
 use std::path::Path;
 
+/// ドライブルート (`C:\` など) または共有ルートとして扱うパスか。
+///
+/// ルート catalog とドライブ一覧 seed はこの判定を共有し、ドライブ直下の同名項目が
+/// 別ドライブのキャッシュを拾わないようにする。
+pub fn is_drive_or_share_root(path: &Path) -> bool {
+    path.parent().is_none()
+}
+
 /// ドライブ文字を除いて小文字化・スラッシュ統一したパス文字列を返す。
 pub fn normalize(path: &Path) -> String {
     let s = path.to_string_lossy();
@@ -55,5 +63,11 @@ mod tests {
             normalize(Path::new(r"C:\Mixed/Slash\Path")),
             "/mixed/slash/path"
         );
+    }
+
+    #[test]
+    fn drive_root_detection_matches_parent_boundary() {
+        assert!(is_drive_or_share_root(Path::new(r"C:\")));
+        assert!(!is_drive_or_share_root(Path::new(r"C:\Photos")));
     }
 }

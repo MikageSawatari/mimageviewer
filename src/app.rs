@@ -7375,8 +7375,7 @@ impl App {
                     self.folder_thumb_pin_db.as_deref(),
                     Some(self.settings.folder_thumb_sort),
                     self.settings.folder_thumb_depth,
-                    // 通常 load_folder 経路は basename ベース (= 同じ親内なので unique)
-                    false,
+                    use_full_path_cache_keys_for_folder(&path),
                 )
             })
             .collect();
@@ -10632,10 +10631,16 @@ impl App {
         match source {
             FolderPinSource::File { rel, kind } => {
                 let fname = direct_pin_rel_file_name(rel)?;
+                let use_full_path_key = crate::path_key::is_drive_or_share_root(container);
                 match kind {
                     FileKind::Image => {
                         let cat = self.get_or_open_catalog(container)?;
-                        cat.load_one(&fname).ok().flatten()
+                        let key = if use_full_path_key {
+                            image_full_path_cache_key(&container.join(rel))
+                        } else {
+                            fname
+                        };
+                        cat.load_one(&key).ok().flatten()
                     }
                     FileKind::Video => {
                         let video_path = container.join(rel);
@@ -10654,22 +10659,24 @@ impl App {
                     }
                     FileKind::ZipFile => {
                         let cat = self.get_or_open_catalog(container)?;
-                        cat.load_one(&format!("{}{}", CACHE_KEY_ZIP, fname))
-                            .ok()
-                            .flatten()
+                        let item = GridItem::ZipFile(container.join(rel));
+                        let key = container_cache_base_key(&item, use_full_path_key, None, 0)
+                            .unwrap_or_else(|| format!("{}{}", CACHE_KEY_ZIP, fname));
+                        cat.load_one(&key).ok().flatten()
                     }
                     FileKind::PdfFile => {
                         let cat = self.get_or_open_catalog(container)?;
-                        cat.load_one(&format!("{}{}", CACHE_KEY_PDF, fname))
-                            .ok()
-                            .flatten()
+                        let item = GridItem::PdfFile(container.join(rel));
+                        let key = container_cache_base_key(&item, use_full_path_key, None, 0)
+                            .unwrap_or_else(|| format!("{}{}", CACHE_KEY_PDF, fname));
+                        cat.load_one(&key).ok().flatten()
                     }
                     FileKind::Folder => {
                         let folder_path = container.join(rel);
                         let folder_item = GridItem::Folder(folder_path);
                         let key = container_cache_base_key(
                             &folder_item,
-                            false,
+                            use_full_path_key,
                             Some(self.settings.folder_thumb_sort),
                             self.settings.folder_thumb_depth,
                         )?;
@@ -10685,6 +10692,9 @@ impl App {
                         let entry = pinned_entry.or(base_entry);
                         if let Some(entry) = entry {
                             return Some(entry);
+                        }
+                        if use_full_path_key {
+                            return None;
                         }
                         let (leaf_container, leaf_source) = resolve_drive_list_pin_source_no_io(
                             container, source, pin_db, max_depth,
@@ -10845,7 +10855,7 @@ impl App {
         let Some(container) = self.current_folder.as_ref() else {
             return false;
         };
-        if self.items_are_drive_list || !is_drive_or_share_root(container) {
+        if self.items_are_drive_list || !crate::path_key::is_drive_or_share_root(container) {
             return false;
         }
         let Some(source) = crate::folder_thumb_pins::source_from_grid_item(container, item) else {
@@ -29221,16 +29231,21 @@ fn container_cache_base_key(
 impl App {
     /// サムネイル cache key に full-path を使うべきコンテキストか。
     ///
-    /// Ctrl+S 検索結果 (synthetic フォルダ) と Ctrl+G 検索結果ビュー (一覧 / 集約 /
-    /// ドリルイン) では、複数フォルダの同名アイテムが 1 リストに混在しうるため、
-    /// basename ベースの cache key だと別フォルダのサムネを誤表示し、catalog も
-    /// 汚染する (Codex P1)。このメソッドが true を返すコンテキストでは
-    /// `make_load_request` が full-path を含むキーを使う。サムネ読み出し側と
-    /// seed 側で必ず同じ判定を共有すること。
+    /// Ctrl+S 検索結果 / Ctrl+G 検索結果ビューとドライブルートでは、basename ベースの
+    /// cache key だと別スコープの同名項目を誤表示しうる。このメソッドが true を返す
+    /// コンテキストでは `make_load_request` が full-path を含むキーを使う。
+    /// サムネ読み出し側、`delete_missing` の存続キー、seed 側で必ず同じ判定を共有すること。
     pub(crate) fn use_full_path_cache_keys(&self) -> bool {
-        self.current_folder.as_deref() == Some(search_results_synthetic_path().as_path())
+        self.current_folder
+            .as_deref()
+            .is_some_and(use_full_path_cache_keys_for_folder)
             || self.items_are_global_search_view
     }
+}
+
+fn use_full_path_cache_keys_for_folder(path: &std::path::Path) -> bool {
+    path == search_results_synthetic_path().as_path()
+        || crate::path_key::is_drive_or_share_root(path)
 }
 
 /// 検索結果ビュー (Ctrl+S / Ctrl+G) の画像用 full-path cache key (Codex P1)。
@@ -29250,10 +29265,6 @@ fn drive_list_last_folder_sentinel() -> PathBuf {
 
 fn is_drive_list_last_folder(path: &std::path::Path) -> bool {
     path.as_os_str().is_empty()
-}
-
-fn is_drive_or_share_root(path: &std::path::Path) -> bool {
-    path.parent().is_none()
 }
 
 fn should_start_in_drive_list(settings: &crate::settings::Settings) -> bool {
@@ -29592,19 +29603,22 @@ fn folder_thumb_existing_keys_for(
     folder_thumb_sort: Option<crate::settings::SortOrder>,
     folder_thumb_depth: u32,
     // T54 follow-on (Codex post-merge / 2026-05-16): make_load_request と同じく
-    // 検索結果コンテキストでは full-path 込みキーを使う。`delete_missing` の存続キー
-    // 集合と make_load_request の読み書きキーが乖離しないように、必ず同じ helper
-    // (`container_cache_base_key`) を経由する。
+    // 検索結果 / ドライブルートのコンテキストでは full-path 込みキーを使う。
+    // `delete_missing` の存続キー集合と make_load_request の読み書きキーが乖離
+    // しないように、必ず同じ helper (`container_cache_base_key`) を経由する。
     use_full_path_keys: bool,
 ) -> Vec<String> {
     let container_path = match item {
         GridItem::Image(p) => {
             // Image はそもそも pinned 経路に乗らないので 1 つだけ。
-            return p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| vec![n.to_string()])
-                .unwrap_or_default();
+            return if use_full_path_keys {
+                vec![image_full_path_cache_key(p)]
+            } else {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| vec![n.to_string()])
+                    .unwrap_or_default()
+            };
         }
         GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => p,
         _ => return Vec::new(),
