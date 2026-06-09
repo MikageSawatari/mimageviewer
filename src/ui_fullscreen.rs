@@ -2890,12 +2890,20 @@ impl App {
                                         {
                                             if let Some(tex) = fallback_compare_tex.as_ref() {
                                                 let bg_style = self.fs_bg_style(ctx);
-                                                let wipe_x = image_rect.left()
-                                                    + image_rect.width()
+                                                // 線 / clip はフィット後の実表示画像矩形基準にして
+                                                // 切り替え位置と一致させる (single 側と同じ)。
+                                                let ref_rect = Self::compare_image_draw_rect(
+                                                    image_rect,
+                                                    tex.size(),
+                                                    zoom_pan,
+                                                )
+                                                .unwrap_or(image_rect);
+                                                let wipe_x = ref_rect.left()
+                                                    + ref_rect.width()
                                                         * fraction.clamp(0.05, 0.95);
                                                 let clip = egui::Rect::from_min_max(
-                                                    image_rect.min,
-                                                    egui::pos2(wipe_x, image_rect.max.y),
+                                                    ref_rect.min,
+                                                    egui::pos2(wipe_x, ref_rect.max.y),
                                                 );
                                                 Self::draw_compare_pinned_image(
                                                     ui,
@@ -2906,7 +2914,7 @@ impl App {
                                                     Some(clip),
                                                 );
                                                 Self::draw_compare_wipe_line(
-                                                    ui, image_rect, fraction,
+                                                    ui, ref_rect, fraction,
                                                 );
                                             }
                                         }
@@ -5777,11 +5785,21 @@ impl App {
         } else {
             (full_rect, self.fs_zoom_pan())
         };
-        let compare_drag_rect = self
+        // pair が準備中 (Shift+C 直後、worker 完了前) は pinned スロットの元サイズで
+        // フィット矩形を作る。compare_image_draw_rect はアスペクト比だけで矩形が決まるので
+        // target_size でも source_size でも同じ実表示画像矩形になり、描画 fallback と一致する。
+        let compare_target_size = self
             .compare_prepared_pair
             .as_ref()
-            .and_then(|pair| {
-                Self::compare_image_draw_rect(compare_base_rect, pair.target_size, compare_zoom_pan)
+            .map(|pair| pair.target_size)
+            .or_else(|| {
+                self.pinned_compare_slot
+                    .as_ref()
+                    .map(|slot| slot.source_size)
+            });
+        let compare_drag_rect = compare_target_size
+            .and_then(|size| {
+                Self::compare_image_draw_rect(compare_base_rect, size, compare_zoom_pan)
             })
             .unwrap_or(compare_base_rect);
         if !cursor_in_panel && self.handle_compare_wipe_drag(ctx, compare_drag_rect) {
