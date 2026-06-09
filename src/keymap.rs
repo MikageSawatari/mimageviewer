@@ -36,6 +36,22 @@ impl KeyContext {
         }
     }
 
+    pub fn description(self) -> &'static str {
+        match self {
+            KeyContext::Global => "全体共通",
+            KeyContext::Grid => "サムネイル一覧",
+            KeyContext::FsCommon => "フルスクリーン共通",
+            KeyContext::Rating => "レーティング",
+            KeyContext::FsImage => "画像フルスクリーン",
+            KeyContext::FsVideo => "動画フルスクリーン",
+            KeyContext::Erase => "消しゴムモード",
+            KeyContext::Conceal => "隠蔽加工モード",
+            KeyContext::Crop => "切り取りモード",
+            KeyContext::Text => "テキスト注釈モード",
+            KeyContext::LocalAdjust => "補正レイヤー",
+        }
+    }
+
     fn parse(section: &str) -> Option<Self> {
         let base = section.split('.').next().unwrap_or(section).trim();
         [
@@ -1273,6 +1289,195 @@ impl KeyAction {
             .find(|action| action.ini_name().eq_ignore_ascii_case(name.trim()))
     }
 
+    pub fn description(self) -> &'static str {
+        use KeyAction::*;
+        match self {
+            GlobalLocalSearch => "現在地の一覧を絞り込み検索する",
+            GlobalFavSearch => "お気に入りフォルダを横断検索する",
+            GlobalMetadataSearch => "全フォルダのメタデータを検索する",
+            GlobalOpenFolder => "フォルダを開くダイアログを表示する",
+            GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
+            GridDeselect => "チェックをすべて解除する",
+            GridToggleCheck => "選択中の項目のチェックを切り替える",
+            GridRotateCw => "選択中の画像を右に90度回転する",
+            GridRotateCcw => "選択中の画像を左に90度回転する",
+            GridPin => "選択中の項目を代表サムネイルに固定または解除する",
+            GridComparePin => "選択中の画像を比較スロットに固定または解除する",
+            GridColumnCount1 => "サムネイル列数を1列にする",
+            GridColumnCount2 => "サムネイル列数を2列にする",
+            GridColumnCount3 => "サムネイル列数を3列にする",
+            GridColumnCount4 => "サムネイル列数を4列にする",
+            GridColumnCount5 => "サムネイル列数を5列にする",
+            GridColumnCount6 => "サムネイル列数を6列にする",
+            GridColumnCount7 => "サムネイル列数を7列にする",
+            GridColumnCount8 => "サムネイル列数を8列にする",
+            GridColumnCount9 => "サムネイル列数を9列にする",
+            GridColumnCount10 => "サムネイル列数を10列にする",
+            GridAdjustSlot1 => "補正プリセットスロット1を適用する",
+            GridAdjustSlot2 => "補正プリセットスロット2を適用する",
+            GridAdjustSlot3 => "補正プリセットスロット3を適用する",
+            GridAdjustSlot4 => "補正プリセットスロット4を適用する",
+            GridAdjustSlot5 => "補正プリセットスロット5を適用する",
+            GridAdjustSlot6 => "補正プリセットスロット6を適用する",
+            GridAdjustSlot7 => "補正プリセットスロット7を適用する",
+            GridAdjustSlot8 => "補正プリセットスロット8を適用する",
+            GridAdjustSlot9 => "補正プリセットスロット9を適用する",
+            GridAdjustSlot10 => "補正プリセットスロット10を適用する",
+            GridClearAdjust => "選択中の画像の補正を解除する",
+            FsToggleMetadata => "メタデータパネルの固定表示を切り替える",
+            FsCtrlNavPrev => "前のフォルダまたは検索結果へ移動する",
+            FsCtrlNavNext => "次のフォルダまたは検索結果へ移動する",
+            FsSiblingPrev => "前の兄弟フォルダへ移動する",
+            FsSiblingNext => "次の兄弟フォルダへ移動する",
+            RatingItem1 => "現在の画像または動画に星1を付ける",
+            RatingItem2 => "現在の画像または動画に星2を付ける",
+            RatingItem3 => "現在の画像または動画に星3を付ける",
+            RatingItem4 => "現在の画像または動画に星4を付ける",
+            RatingItem5 => "現在の画像または動画に星5を付ける",
+            RatingItemClear => "現在の画像または動画のレーティングを解除する",
+            RatingContainer1 => "現在のフォルダまたはZIP/PDF本体に星1を付ける",
+            RatingContainer2 => "現在のフォルダまたはZIP/PDF本体に星2を付ける",
+            RatingContainer3 => "現在のフォルダまたはZIP/PDF本体に星3を付ける",
+            RatingContainer4 => "現在のフォルダまたはZIP/PDF本体に星4を付ける",
+            RatingContainer5 => "現在のフォルダまたはZIP/PDF本体に星5を付ける",
+            RatingContainerClear => "現在のフォルダまたはZIP/PDF本体のレーティングを解除する",
+            FsContinuousScrollForward => "連結表示中に次の画面分へスクロールする",
+            FsContinuousScrollBack => "連結表示中に前の画面分へスクロールする",
+            FsSpreadShiftLeft => "見開き表示を左方向へ1ページずらす",
+            FsSpreadShiftRight => "見開き表示を右方向へ1ページずらす",
+            FsSlideshow => "スライドショーの再生または停止を切り替える",
+            FsSpaceCheck => "現在の画像のチェックを切り替える",
+            FsCapture => "現在の表示画像をキャプチャ保存する",
+            FsExport => "現在の表示結果を別ファイルへ書き出す",
+            FsCompareToggle => "比較スロットの画像と現在画像を切り替える",
+            FsCompareCycle => "比較表示を切り替える",
+            FsCompareWipe => "ワイプ比較を切り替える",
+            FsCompareDiff => "差分比較を切り替える",
+            FsRotateCw => "現在の画像を右に90度回転する",
+            FsRotateCcw => "現在の画像を左に90度回転する",
+            FsAnalysis => "画像分析モードを開く",
+            FsPanorama => "360度パノラマモードを切り替える",
+            FsPixelGrid => "ピクセルグリッド表示を切り替える",
+            FsLoupeLockToggle => "ルーペの固定表示を切り替える",
+            FsLoupeHold => "押している間だけルーペを表示する",
+            FsEraseMode => "消しゴムモードを開始または確定する",
+            FsConcealMode => "隠蔽加工モードを開始または終了する",
+            FsTextMode => "テキスト注釈モードを開始または終了する",
+            FsBgCycle => "透過背景色を切り替える",
+            FsPin => "現在の項目を代表サムネイルに固定または解除する",
+            FsSpreadSingle => "単ページ表示に切り替える",
+            FsSpreadLtr => "左開き見開き表示に切り替える",
+            FsSpreadLtrCover => "左開き表紙単独の見開き表示に切り替える",
+            FsSpreadRtl => "右開き見開き表示に切り替える",
+            FsSpreadRtlCover => "右開き表紙単独の見開き表示に切り替える",
+            FsReadingFlowCycle => "ページ単位/縦連結/横連結を切り替える",
+            FsReadingDirectionToggle => "横方向の読み進み方向を切り替える",
+            FsFitModeCycle => "ズーム/フィット方式を切り替える",
+            FsAiModelNext => "AIモデルを次へ切り替える",
+            FsAiModelPrev => "AIモデルを前へ切り替える",
+            FsAiModelReset => "AIモデルを標準に戻す",
+            FsDenoiseCycle => "デノイズ設定を切り替える",
+            FsPostFilterNext => "ポストフィルタを次へ切り替える",
+            FsPostFilterPrev => "ポストフィルタを前へ切り替える",
+            FsPostFilterReset => "ポストフィルタを標準に戻す",
+            FsAdjustSlot1 => "補正プリセットスロット1を適用する",
+            FsAdjustSlot2 => "補正プリセットスロット2を適用する",
+            FsAdjustSlot3 => "補正プリセットスロット3を適用する",
+            FsAdjustSlot4 => "補正プリセットスロット4を適用する",
+            FsAdjustSlot5 => "補正プリセットスロット5を適用する",
+            FsAdjustSlot6 => "補正プリセットスロット6を適用する",
+            FsAdjustSlot7 => "補正プリセットスロット7を適用する",
+            FsAdjustSlot8 => "補正プリセットスロット8を適用する",
+            FsAdjustSlot9 => "補正プリセットスロット9を適用する",
+            FsAdjustSlot10 => "補正プリセットスロット10を適用する",
+            FsClearAdjust => "現在の画像の補正を解除する",
+            FsApplyErase1 => "消しゴムマスクスロット1を現在ページに適用する",
+            FsApplyErase2 => "消しゴムマスクスロット2を現在ページに適用する",
+            FsApplyConceal1 => "隠蔽マスクスロット1を現在ページに適用する",
+            FsApplyConceal2 => "隠蔽マスクスロット2を現在ページに適用する",
+            FsDeleteEraseMask => "現在ページの消しゴムマスクを削除する",
+            FsDeleteConcealMask => "現在ページの隠蔽マスクを削除する",
+            VideoExternalPlayer => "現在の動画を外部プレイヤーで開く",
+            VideoPlayPause => "動画の再生または一時停止を切り替える",
+            VideoSeekStart => "動画の先頭へ移動して再生する",
+            VideoVolumeUp => "動画音量を上げる",
+            VideoVolumeDown => "動画音量を下げる",
+            VideoNextFile => "次のファイルへ移動する",
+            VideoPrevFile => "前のファイルへ移動する",
+            VideoMute => "動画のミュートを切り替える",
+            VideoLoop => "動画のループ再生を切り替える",
+            VideoMarkerPrev => "前のチャプター/ブックマーク/ピンへ移動する",
+            VideoMarkerNext => "次のチャプター/ブックマーク/ピンへ移動する",
+            VideoPin => "現在の再生位置を代表フレームとしてピン留めする",
+            VideoPerfOverlay => "動画の性能オーバーレイを切り替える",
+            VideoTileMode => "動画タイルモードを切り替える",
+            VideoBookmark => "現在の再生位置にブックマークを追加する",
+            VideoCapture => "現在の動画フレームをキャプチャ保存する",
+            VideoCompareToggle => "動画では比較表示キーを何もしない操作として消費する",
+            VideoCompareCycle => "動画では比較切り替えキーを何もしない操作として消費する",
+            VideoCompareWipe => "動画ではワイプ比較キーを何もしない操作として消費する",
+            VideoCompareDiff => "動画では差分比較キーを何もしない操作として消費する",
+            EraseConfirm => "消しゴム処理を実行して終了する",
+            EraseUndo => "消しゴム編集を元に戻す",
+            EraseDeleteShape => "選択中の消しゴム図形を削除する",
+            EraseToolSelect => "選択ツールに切り替える",
+            EraseToolBrush => "筆ツールに切り替える",
+            EraseToolLasso => "囲みツールに切り替える",
+            EraseToolPolygon => "多角形ツールに切り替える",
+            EraseToolVLine => "縦線ツールに切り替える",
+            EraseToolHLine => "横線ツールに切り替える",
+            EraseToolLine => "直線ツールに切り替える",
+            EraseToolRect => "矩形ツールに切り替える",
+            EraseToolEllipse => "楕円ツールに切り替える",
+            ErasePaintMode => "描画モードに切り替える",
+            EraseEraseMode => "消去モードに切り替える",
+            EraseSpacePan => "押している間だけ画像をパン操作する",
+            ConcealExit => "隠蔽加工モードを終了する",
+            ConcealUndo => "隠蔽加工編集を元に戻す",
+            ConcealDeleteShape => "選択中の隠蔽図形を削除する",
+            ConcealPixelGrid => "ピクセルグリッド表示を切り替える",
+            ConcealTypeCycle => "隠蔽タイプを切り替える",
+            ConcealPreset1 => "隠蔽プリセット1を呼び出す",
+            ConcealPreset2 => "隠蔽プリセット2を呼び出す",
+            ConcealPreset3 => "隠蔽プリセット3を呼び出す",
+            ConcealPreset4 => "隠蔽プリセット4を呼び出す",
+            ConcealPaintMode => "描画モードに切り替える",
+            ConcealEraseMode => "消去モードに切り替える",
+            ConcealToolSelect => "選択ツールに切り替える",
+            ConcealToolBrush => "筆ツールに切り替える",
+            ConcealToolLasso => "囲みツールに切り替える",
+            ConcealToolPolygon => "多角形ツールに切り替える",
+            ConcealToolLine => "直線ツールに切り替える",
+            ConcealToolVLine => "縦線ツールに切り替える",
+            ConcealToolHLine => "横線ツールに切り替える",
+            ConcealToolRect => "矩形ツールに切り替える",
+            ConcealToolEllipse => "楕円ツールに切り替える",
+            ConcealSpacePan => "押している間だけ画像をパン操作する",
+            CropSpacePan => "押している間だけ画像をパン操作する",
+            CropExecute => "切り取りを実行する",
+            TextConfirm => "テキスト注釈モードを確定または終了する",
+            TextRedo => "テキスト注釈編集をやり直す",
+            TextUndo => "テキスト注釈編集を元に戻す",
+            TextSpacePan => "押している間だけ画像をパン操作する",
+            LaShowSource => "元画像表示を切り替える",
+            LaShowMask => "マスク表示を切り替える",
+            LaPaintAdd => "補正マスクの追加描画モードにする",
+            LaPaintErase => "補正マスクの消去描画モードにする",
+            LaToolBrush => "筆ツールに切り替える",
+            LaToolEdgeBrush => "境界ブラシツールに切り替える",
+            LaToolGapFill => "すき間塗りツールに切り替える",
+            LaToolLasso => "囲みツールに切り替える",
+            LaToolPolygon => "多角形ツールに切り替える",
+            LaToolSelect => "選択ツールに切り替える",
+            LaToolLine => "直線ツールに切り替える",
+            LaToolVLine => "縦線ツールに切り替える",
+            LaToolHLine => "横線ツールに切り替える",
+            LaToolRect => "矩形ツールに切り替える",
+            LaToolEllipse => "楕円ツールに切り替える",
+            LaSpacePan => "押している間だけ画像をパン操作する",
+        }
+    }
+
     pub fn context(self) -> KeyContext {
         use KeyAction::*;
         match self {
@@ -2078,68 +2283,84 @@ impl Keymap {
             }
         }
         out.push_str("#\n");
-        out.push_str("# Advanced users only.\n");
+        out.push_str("# 上級者向けのキーボード割り当て設定です。\n");
         match kind {
             IniTemplateKind::UserConfig => {
                 out.push_str(
-                    "# Generated at %APPDATA%\\mimageviewer\\keymap.ini when this file is missing.\n",
+                    "# %APPDATA%\\mimageviewer\\keymap.ini が無いときに自動生成されます。\n",
                 );
                 out.push_str(
-                    "# Uncomment only the actions you want to override, then edit the values after '='.\n",
+                    "# 変更したい行だけ先頭の # を外し、= の右側のキーを編集してください。\n",
                 );
                 out.push_str(
-                    "# Commented lines follow the current built-in defaults, including future updates.\n",
+                    "# コメントアウトされたままの行は、アプリ内蔵の既定キーを使います。\n",
                 );
                 out.push_str(
-                    "# See keymap.ini.default for the latest full reference after an update.\n",
+                    "# 更新後の最新の標準一覧は keymap.ini.default を参照してください。\n",
                 );
             }
             IniTemplateKind::DefaultReference => {
-                out.push_str("# Reference only. Do not edit this file.\n");
+                out.push_str("# 参照用です。このファイルは編集しないでください。\n");
                 out.push_str(
-                    "# This file is overwritten by mimageviewer when built-in defaults change.\n",
+                    "# アプリ内蔵の既定キーが変わると mimageviewer がこのファイルを上書きします。\n",
                 );
                 out.push_str(
-                    "# Copy lines to keymap.ini and uncomment them if you want to override defaults.\n",
+                    "# 変更したい行は keymap.ini へコピーするか、keymap.ini 側の同じ行を編集してください。\n",
                 );
             }
         }
-        out.push_str("# The file is loaded once at startup.\n");
+        out.push_str("# keymap.ini は起動時に 1 回だけ読み込まれます。\n");
         out.push_str("#\n");
-        out.push_str("# Rules:\n");
-        out.push_str("# - All key definition lines below are commented out by default.\n");
-        out.push_str("# - Leaving a line commented keeps the built-in default.\n");
+        out.push_str("# 書式:\n");
+        out.push_str("# - 下のキー定義行はすべてコメントアウトされています。\n");
+        out.push_str("# - コメントアウトされた行は、内蔵の既定キーに追従します。\n");
         out.push_str(
-            "# - Uncommenting one line for an action replaces all defaults for that action.\n",
+            "# - 1 つの Action でもコメント解除すると、その Action の既定キーは全置換されます。\n",
         );
-        out.push_str("# - Use Action.1, Action.2, Action.3 to bind up to three chords.\n");
-        out.push_str("# - Use \"none\" to disable an action.\n");
-        out.push_str("# - Conflicts are not detected; the first matching handler wins.\n");
-        out.push_str("# - Press actions can use Ctrl/Shift/Alt plus one normal key.\n");
-        out.push_str("# - ModifierHold actions accept Ctrl, Shift, or Alt only.\n");
-        out.push_str("# - KeyHold actions accept one normal key only.\n");
-        out.push_str("# - Numpad number keys are treated the same as the top-row number keys.\n");
-        out.push_str("#   Names such as Numpad1 are accepted only as aliases for 1.\n");
-        out.push_str("# - OS-reserved shortcuts such as Alt+F4, Alt+Tab, Alt+Esc, Alt+Space,\n");
-        out.push_str("#   Ctrl+Alt+Del, and Windows-key combinations cannot be overridden here.\n");
-        out.push_str("# - Alt combinations are not forwarded from the native video presenter.\n");
         out.push_str(
-            "# - Mouse, gamepad, drag-and-drop, OS clipboard shortcuts, IME confirmation,\n",
+            "# - 既定キーを残したい場合は、残したいキーも Action.1..3 として明示してください。\n",
         );
-        out.push_str("#   right-click menus, Escape/Enter navigation, and most arrow\n");
-        out.push_str("#   navigation are intentionally fixed.\n");
+        out.push_str("# - 1 つの Action には Action.1 / Action.2 / Action.3 で最大 3 個まで割り当てできます。\n");
+        out.push_str("# - none を指定すると、その Action を無効化できます。\n");
+        out.push_str("# - 行末の ; 以降は説明コメントです。コメント解除後も残してかまいません。\n");
+        out.push_str("# - 競合は検出しません。競合時は先に判定された操作が有効になります。\n");
+        out.push_str("# - 通常の押下操作は Ctrl/Shift/Alt + 通常キーを指定できます。\n");
+        out.push_str("# - ModifierHold は Ctrl / Shift / Alt のいずれか 1 つだけ指定できます。\n");
+        out.push_str("# - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。\n");
+        out.push_str("# - キー名の例: A..Z, 0..9, F1..F12, Left, Right, Up, Down,\n");
+        out.push_str(
+            "#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete, [, ]\n",
+        );
+        out.push_str("# - テンキー数字は通常の数字キーと同じ扱いです。\n");
+        out.push_str("#   Numpad1 などの名前は受け付けますが、1 の別キーとしては使えません。\n");
+        out.push_str(
+            "# - Alt+F4 / Alt+Tab / Alt+Esc / Alt+Space / Ctrl+Alt+Del / Win キー系など、\n",
+        );
+        out.push_str("#   OS が予約しているショートカットは keymap.ini では上書きできません。\n");
+        out.push_str(
+            "# - native 動画フルスクリーンでは Alt を含む組み合わせはアプリ側へ転送されません。\n",
+        );
+        out.push_str(
+            "# - マウス、ゲームパッド、ドラッグ&ドロップ、OS/egui のコピー/切り取り/貼り付け、\n",
+        );
+        out.push_str("#   IME 確定、右クリックメニュー、Escape/Enter ナビゲーション、多くの矢印ナビゲーションは固定です。\n");
         out.push_str("#\n");
-        out.push_str("# Examples:\n");
+        out.push_str("# 例:\n");
         out.push_str("# [FsImage]\n");
-        out.push_str("# FsSlideshow.1 = P\n");
-        out.push_str("# FsSlideshow.2 = S\n");
-        out.push_str("# FsCapture = none\n");
-        out.push_str("# FsLoupeLockToggle = L\n");
-        out.push_str("# FsLoupeHold = Ctrl\n");
+        out.push_str("# FsSlideshow.1 = P      ; スライドショーを P に変更\n");
+        out.push_str("# FsSlideshow.2 = S      ; S も残したい場合は明示的に併記\n");
+        out.push_str("# FsCapture = none       ; キャプチャ保存キーを無効化\n");
+        out.push_str("# FsLoupeLockToggle = L  ; ルーペ固定表示のトグルを L に変更\n");
+        out.push_str(
+            "# FsLoupeHold = Ctrl     ; 押している間だけルーペ表示する修飾キーを Ctrl に変更\n",
+        );
+        out.push_str("#\n");
+        out.push_str("# [Rating]\n");
+        out.push_str("# RatingItem1 = Ctrl+F1  ; 現在の画像または動画に星1を付ける\n");
         out.push_str("#\n");
         out.push_str("# [Text]\n");
-        out.push_str("# TextRedo.1 = Ctrl+Y\n");
-        out.push_str("# TextRedo.2 = Ctrl+Shift+Z\n\n");
+        out.push_str("# TextRedo.1 = Ctrl+Y        ; やり直し\n");
+        out.push_str("# TextRedo.2 = Ctrl+Shift+Z  ; やり直しの別割り当て\n\n");
         let sections = [
             KeyContext::Global,
             KeyContext::Grid,
@@ -2154,12 +2375,17 @@ impl Keymap {
             KeyContext::LocalAdjust,
         ];
         for (section_idx, section) in sections.iter().copied().enumerate() {
-            out.push_str(&format!("[{}]\n", section.ini_name()));
+            out.push_str(&format!(
+                "[{}] ; {}\n",
+                section.ini_name(),
+                section.description()
+            ));
             for action in KeyAction::all()
                 .iter()
                 .copied()
                 .filter(|action| action.context() == section)
             {
+                let description = action.description();
                 let defaults: Vec<String> = action
                     .default_chords()
                     .iter()
@@ -2170,11 +2396,14 @@ impl Keymap {
                         .first()
                         .cloned()
                         .unwrap_or_else(|| "none".to_string());
-                    out.push_str(&format!("# {} = {default}\n", action.ini_name()));
+                    out.push_str(&format!(
+                        "# {} = {default} ; {description}\n",
+                        action.ini_name()
+                    ));
                 } else {
                     for (idx, default) in defaults.iter().enumerate() {
                         out.push_str(&format!(
-                            "# {}.{} = {default}\n",
+                            "# {}.{} = {default} ; {description}\n",
                             action.ini_name(),
                             idx + 1
                         ));
@@ -2608,9 +2837,10 @@ mod tests {
     #[test]
     fn user_ini_template_is_parseable_and_comment_only() {
         let user_ini = Keymap::user_ini_template();
+        assert!(user_ini.contains("上級者向けのキーボード割り当て設定です。"));
         assert!(user_ini.contains("[FsImage]"));
-        assert!(user_ini.contains("[Rating]"));
-        assert!(user_ini.contains("# RatingItem1 = F1"));
+        assert!(user_ini.contains("[Rating] ; レーティング"));
+        assert!(user_ini.contains("# RatingItem1 = F1 ; 現在の画像または動画に星1を付ける"));
         assert!(user_ini.contains("# FsSlideshow = S"));
         assert!(user_ini.contains("# TextRedo.1 = Ctrl+Y"));
         assert!(!user_ini.contains("\nFsSlideshow = S"));
@@ -2628,8 +2858,11 @@ mod tests {
     fn default_reference_ini_is_parseable_and_comment_only() {
         let default_ini = Keymap::default_reference_ini();
         assert!(default_ini.contains("keymap.ini.default"));
-        assert!(default_ini.contains("[Rating]"));
-        assert!(default_ini.contains("# RatingContainerClear = Shift+F6"));
+        assert!(default_ini.contains("参照用です。このファイルは編集しないでください。"));
+        assert!(default_ini.contains("[Rating] ; レーティング"));
+        assert!(default_ini.contains(
+            "# RatingContainerClear = Shift+F6 ; 現在のフォルダまたはZIP/PDF本体のレーティングを解除する"
+        ));
         assert!(default_ini.contains("# FsSlideshow = S"));
         assert!(default_ini.contains("# TextRedo.1 = Ctrl+Y"));
         assert!(!default_ini.contains("\nFsSlideshow = S"));

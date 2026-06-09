@@ -399,7 +399,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
    D&D、右クリック、マウス、ゲームパッドなど固定扱いにする入力は、`docs/keymap-spec.md`
    の該当節に「対象外」の理由を残す。
 2. **対象なら `KeyAction` を追加する。**
-   `ini_name()` / `context()` / `trigger()` / `default_chords()` を埋める。`trigger()` は
+   `ini_name()` / `description()` / `context()` / `trigger()` / `default_chords()` を埋める。
+   `description()` は生成される `keymap.ini` / `keymap.ini.default` の行末コメントになるため、
+   ユーザーが設定ファイル単体で操作内容を判断できる日本語説明にする。`trigger()` は
    `_ => Press` を使わない網羅 match なので、新 variant を分類しないとコンパイルで止まる。
 3. **`ALL_ACTIONS` に追加する。**
    `KeyAction::all()` は `keymap.ini` / `keymap.ini.default` 生成、ini parse、native 動画転送 whitelist の入口。
@@ -410,7 +412,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
    hold は `modifier_held_action` / `key_held_action`、native 動画は `matches_vk_action` と
    `native_video_shortcut_key` の連動を確認する。
 5. **ドキュメントと同梱 `.default` を更新する。**
-   `docs/keymap-spec.md` に操作仕様、`docs/keymap.ini.default` に標準設定を反映する。
+   `docs/keymap-spec.md` に操作仕様、`docs/keymap.ini.default` に標準設定と行末説明を反映する。
    `bundled_keymap_default_matches_generated_reference` がコード生成結果とのズレを検知する。
 6. **狭いテストから回す。**
    最低限 `cargo test keymap --bin mimageviewer-core`。動画 VK を触ったら
