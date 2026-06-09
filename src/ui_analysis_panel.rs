@@ -977,8 +977,14 @@ impl App {
         }
 
         // ── パネル UI ──
-        let panel_rect =
-            egui::Rect::from_min_max(egui::pos2(image_rect.max.x, full_rect.min.y), full_rect.max);
+        // 下端のページシークバーと重ならないよう、下端をシークバー分空ける。
+        let panel_rect = egui::Rect::from_min_max(
+            egui::pos2(image_rect.max.x, full_rect.min.y),
+            egui::pos2(
+                full_rect.max.x,
+                full_rect.max.y - crate::ui_fullscreen::FS_SEEK_BAR_HEIGHT,
+            ),
+        );
         ui.painter().rect_filled(
             panel_rect,
             0.0,

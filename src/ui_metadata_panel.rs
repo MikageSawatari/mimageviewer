@@ -61,7 +61,11 @@ impl App {
         let panel_top = full_rect.min.y + TOP_BAR_H;
         let panel_rect = egui::Rect::from_min_max(
             egui::pos2(full_rect.max.x - panel_w, panel_top),
-            full_rect.max,
+            // 下端のページシークバーと重ならないよう、下端をシークバー分空ける。
+            egui::pos2(
+                full_rect.max.x,
+                full_rect.max.y - crate::ui_fullscreen::FS_SEEK_BAR_HEIGHT,
+            ),
         );
 
         if !force_show {

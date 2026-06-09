@@ -44,6 +44,10 @@ use self::draw_icons::*;
 const METADATA_PANEL_WIDTH: f32 = 380.0;
 /// ホバー時トップバーの高さ
 const TOP_BAR_HEIGHT: f32 = 44.0;
+/// 静止画フルスクリーン下端のページシークバーの高さ。下端まで伸びる左右パネル
+/// (補正パネル / メタデータパネル) はこの分だけ下端を空けてシークバーと重ならない
+/// ようにする (`draw_fullscreen_seek_overlay` の panel_rect と同じ高さ)。
+pub(crate) const FS_SEEK_BAR_HEIGHT: f32 = 38.0;
 /// ホイール感度（raw_scroll_delta の除数）
 const WHEEL_SENSITIVITY: f32 = 30.0;
 
@@ -1582,7 +1586,10 @@ fn adjustment_panel_rect(full_rect: egui::Rect) -> egui::Rect {
         egui::pos2(full_rect.min.x, full_rect.min.y + TOP_BAR_HEIGHT),
         egui::pos2(
             full_rect.min.x + crate::ui_adjustment_panel::LEFT_PANEL_WIDTH,
-            full_rect.max.y - crate::ui_adjustment_panel::LEFT_PANEL_BOTTOM_MARGIN,
+            // 下端のページシークバーと重ならないよう、元の下端マージンとシークバー高さの
+            // 大きい方だけ下端を空ける。
+            full_rect.max.y
+                - crate::ui_adjustment_panel::LEFT_PANEL_BOTTOM_MARGIN.max(FS_SEEK_BAR_HEIGHT),
         ),
     )
 }
@@ -1917,7 +1924,7 @@ impl App {
             self.fs_seek_drag_active = false;
         }
         const SEEK_HOVER_HEIGHT: f32 = 78.0;
-        const SEEK_BAR_HEIGHT: f32 = 38.0;
+        const SEEK_BAR_HEIGHT: f32 = FS_SEEK_BAR_HEIGHT;
 
         let bottom_band = egui::Rect::from_min_max(
             egui::pos2(full_rect.left(), full_rect.bottom() - SEEK_HOVER_HEIGHT),
