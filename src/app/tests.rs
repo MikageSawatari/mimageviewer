@@ -1034,10 +1034,6 @@ mod phase_c_key_tests {
             kind: crate::folder_thumb_pins::FileKind::Folder,
         };
 
-        let resolved = resolve_drive_list_pin_source_no_io(&drive_root, &source, None, 3).unwrap();
-        assert_eq!(resolved.0, drive_root);
-        assert_eq!(resolved.1, source);
-
         let cache_dir = crate::catalog::default_cache_dir();
         let parent_db = crate::catalog::CatalogDb::open(&cache_dir, &drive_root).unwrap();
         let folder_item = GridItem::Folder(pinned_folder);

@@ -10624,8 +10624,6 @@ impl App {
         &mut self,
         container: &std::path::Path,
         source: &crate::folder_thumb_pins::FolderPinSource,
-        pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
-        max_depth: usize,
     ) -> Option<crate::catalog::CacheEntry> {
         use crate::folder_thumb_pins::{FileKind, FolderPinSource};
         match source {
@@ -10689,20 +10687,7 @@ impl App {
                             .ok()
                             .flatten()
                             .map(|(_, entry)| entry);
-                        let entry = pinned_entry.or(base_entry);
-                        if let Some(entry) = entry {
-                            return Some(entry);
-                        }
-                        if use_full_path_key {
-                            return None;
-                        }
-                        let (leaf_container, leaf_source) = resolve_drive_list_pin_source_no_io(
-                            container, source, pin_db, max_depth,
-                        )?;
-                        if leaf_container == container && leaf_source == *source {
-                            return None;
-                        }
-                        self.drive_list_pin_seed_entry(&leaf_container, &leaf_source, pin_db, 0)
+                        pinned_entry.or(base_entry)
                     }
                 }
             }
@@ -10742,8 +10727,6 @@ impl App {
         let Some(target_cat) = drive_list_catalog.cloned() else {
             return;
         };
-        let pin_db = self.folder_thumb_pin_db.clone();
-        let pin_db_ref = pin_db.as_deref();
         let mut seeded = 0u32;
         for idx in 0..self.items.len() {
             let Some((container_path, source, base_key)) = self.items.get(idx).and_then(|item| {
@@ -10763,12 +10746,7 @@ impl App {
                 continue;
             };
             let prefix = drive_list_pinned_cache_key_prefix(&base_key, &source);
-            let Some(entry) = self.drive_list_pin_seed_entry(
-                &container_path,
-                &source,
-                pin_db_ref,
-                self.settings.folder_thumb_depth as usize,
-            ) else {
+            let Some(entry) = self.drive_list_pin_seed_entry(&container_path, &source) else {
                 continue;
             };
             let key = drive_list_pinned_cache_key(&prefix, entry.mtime, entry.file_size);
@@ -29327,60 +29305,6 @@ fn direct_pin_rel_file_name(rel: &str) -> Option<String> {
         return None;
     }
     path.file_name().and_then(|n| n.to_str()).map(str::to_owned)
-}
-
-fn resolve_drive_list_pin_source_no_io(
-    container: &std::path::Path,
-    immediate_source: &crate::folder_thumb_pins::FolderPinSource,
-    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
-    max_depth: usize,
-) -> Option<(PathBuf, crate::folder_thumb_pins::FolderPinSource)> {
-    use crate::folder_thumb_pins::{FileKind, FolderPinSource};
-    let mut visited = std::collections::HashSet::new();
-    visited.insert(crate::path_key::normalize_keep_drive(container));
-    let mut current_container = container.to_path_buf();
-    let mut current_source = immediate_source.clone();
-    let mut cascades_remaining = max_depth;
-    loop {
-        let FolderPinSource::File {
-            rel,
-            kind: FileKind::Folder,
-        } = &current_source
-        else {
-            return Some((current_container, current_source));
-        };
-        if cascades_remaining == 0 {
-            return Some((current_container, current_source));
-        }
-        let next_container = current_container.join(rel);
-        let next_key = crate::path_key::normalize_keep_drive(&next_container);
-        if visited.contains(&next_key) {
-            crate::logger::log(format!(
-                "drive-list pin: cascade cycle at {}",
-                next_container.display()
-            ));
-            return Some((current_container, current_source));
-        }
-        let Some(next_source) = pin_db.and_then(|db| db.lookup(&next_container)) else {
-            return Some((current_container, current_source));
-        };
-        let compatible = match &next_source {
-            FolderPinSource::File { .. } => true,
-            FolderPinSource::ZipEntry { zip_rel, .. } => !zip_rel.is_empty(),
-            FolderPinSource::PdfPage { pdf_rel, .. } => !pdf_rel.is_empty(),
-        };
-        if !compatible {
-            crate::logger::log(format!(
-                "drive-list pin: incompatible cascade source at {}",
-                next_container.display()
-            ));
-            return Some((current_container, current_source));
-        }
-        visited.insert(next_key);
-        current_container = next_container;
-        current_source = next_source;
-        cascades_remaining -= 1;
-    }
 }
 
 fn make_drive_list_pin_load_request(
