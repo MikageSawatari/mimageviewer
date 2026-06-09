@@ -1134,18 +1134,24 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     ui.add_space(8.0);
     let mut archive_limit_enabled = s.archive_cache_max_bytes > 0;
+    const ARCHIVE_CACHE_LIMIT_BYTES_PER_MB: u64 = 1_000_000;
+    const DEFAULT_ARCHIVE_CACHE_LIMIT_MB: u64 = 20_000;
     if ui
         .checkbox(&mut archive_limit_enabled, "容量上限を有効にする")
         .changed()
     {
         s.archive_cache_max_bytes = if archive_limit_enabled {
-            20 * 1024 * 1024 * 1024
+            DEFAULT_ARCHIVE_CACHE_LIMIT_MB * ARCHIVE_CACHE_LIMIT_BYTES_PER_MB
         } else {
             0
         };
     }
     if archive_limit_enabled {
-        let mut limit_mb = (s.archive_cache_max_bytes / 1_000_000).max(1);
+        let mut limit_mb = (s
+            .archive_cache_max_bytes
+            .saturating_add(ARCHIVE_CACHE_LIMIT_BYTES_PER_MB - 1)
+            / ARCHIVE_CACHE_LIMIT_BYTES_PER_MB)
+            .max(1);
         if ui
             .horizontal(|ui| {
                 ui.label("上限:");
@@ -1159,11 +1165,11 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
             .inner
             .changed()
         {
-            s.archive_cache_max_bytes = limit_mb.saturating_mul(1_000_000);
+            s.archive_cache_max_bytes = limit_mb.saturating_mul(ARCHIVE_CACHE_LIMIT_BYTES_PER_MB);
         }
         ui.label(format!(
-            "現在の上限: {}",
-            crate::ui_helpers::format_bytes(s.archive_cache_max_bytes)
+            "現在の上限: {} MB",
+            crate::ui_helpers::format_count(limit_mb)
         ));
     } else {
         ui.label("現在の上限: 無制限");
