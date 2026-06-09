@@ -1222,8 +1222,9 @@ impl App {
         let tb_cols = self.settings.toolbar_cols_items.clone();
         let tb_aspects = self.settings.toolbar_aspect_items.clone();
         let tb_sorts = self.settings.toolbar_sort_items.clone();
+        let toolbar_details_visible = self.settings.toolbar_cols_details_visible;
         let details_mode = self.settings.grid_view_mode == GridViewMode::Details;
-        let show_cols = !tb_cols.is_empty();
+        let show_cols = !tb_cols.is_empty() || toolbar_details_visible;
         // 比率セクション: 手動 7 種を全部外しても「自動」だけ ON なら表示する
         // (Codex P3 2026-05)。`toolbar_aspect_auto_visible` は別フラグなので
         // tb_aspects 空 + auto_visible で section が消える事故を防ぐ。
@@ -1242,6 +1243,7 @@ impl App {
         let mut toolbar_sort_changed = false;
         let mut toolbar_rating_changed = false;
         let mut toolbar_tag_click: Option<String> = None;
+        let mut toolbar_combo_popup_open = false;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(2.0);
@@ -1281,6 +1283,10 @@ impl App {
                 ui.spacing_mut().interact_size.y = 22.0;
                 ui.spacing_mut().button_padding.y = 1.0;
             }
+
+            const TOOLBAR_COLS_COMBO_HEIGHT: f32 = 320.0;
+            const TOOLBAR_ASPECT_COMBO_HEIGHT: f32 = 280.0;
+            const TOOLBAR_SORT_COMBO_HEIGHT: f32 = 240.0;
 
             ui.scope(|ui| {
                 // ツールバー本体に toolbar スタイルを適用 (Yu Gothic の glyph 上寄り問題を
@@ -1326,22 +1332,27 @@ impl App {
                                     self.settings.save();
                                 }
                             }
-                            if ui
-                                .selectable_label(details_mode, " 詳細 ")
-                                .on_hover_text("サムネイルなしの詳細一覧に切り替えます (Alt+-)")
-                                .clicked()
-                            {
-                                self.set_grid_view_mode(GridViewMode::Details);
+                            if toolbar_details_visible {
+                                if ui
+                                    .selectable_label(details_mode, " 詳細 ")
+                                    .on_hover_text(
+                                        "サムネイルなしの詳細一覧に切り替えます (Alt+-)",
+                                    )
+                                    .clicked()
+                                {
+                                    self.set_grid_view_mode(GridViewMode::Details);
+                                }
                             }
                         }
                         crate::settings::ToolbarSectionDisplay::Dropdown => {
-                            let current_text = if details_mode {
+                            let current_text = if details_mode && toolbar_details_visible {
                                 "詳細".to_string()
                             } else {
                                 format!("{} 列", self.settings.grid_cols)
                             };
-                            egui::ComboBox::from_id_salt("toolbar_cols_combo")
+                            let combo = egui::ComboBox::from_id_salt("toolbar_cols_combo")
                                 .width(64.0)
+                                .height(TOOLBAR_COLS_COMBO_HEIGHT)
                                 .selected_text(current_text)
                                 .show_ui(ui, |ui| {
                                     apply_toolbar_style(ui);
@@ -1358,11 +1369,17 @@ impl App {
                                             self.settings.save();
                                         }
                                     }
-                                    ui.separator();
-                                    if ui.selectable_label(details_mode, "詳細").clicked() {
-                                        self.set_grid_view_mode(GridViewMode::Details);
+                                    if toolbar_details_visible {
+                                        if !tb_cols.is_empty() {
+                                            ui.separator();
+                                        }
+                                        if ui.selectable_label(details_mode, "詳細").clicked() {
+                                            self.set_grid_view_mode(GridViewMode::Details);
+                                        }
                                     }
                                 });
+                            toolbar_combo_popup_open |=
+                                egui::ComboBox::is_open(ctx, combo.response.id);
                         }
                     }
                     first_section = false;
@@ -1428,8 +1445,9 @@ impl App {
                             } else {
                                 self.settings.thumb_aspect.label().to_string()
                             };
-                            egui::ComboBox::from_id_salt("toolbar_aspect_combo")
+                            let combo = egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                 .width(120.0)
+                                .height(TOOLBAR_ASPECT_COMBO_HEIGHT)
                                 .selected_text(current_text)
                                 .show_ui(ui, |ui| {
                                     apply_toolbar_style(ui);
@@ -1451,6 +1469,8 @@ impl App {
                                         }
                                     }
                                 });
+                            toolbar_combo_popup_open |=
+                                egui::ComboBox::is_open(ctx, combo.response.id);
                         }
                     }
                     first_section = false;
@@ -1485,8 +1505,9 @@ impl App {
                             crate::settings::ToolbarSectionDisplay::Dropdown => {
                                 let current_text =
                                     self.settings.sort_order.short_label().to_string();
-                                egui::ComboBox::from_id_salt("toolbar_sort_combo")
+                                let combo = egui::ComboBox::from_id_salt("toolbar_sort_combo")
                                     .width(100.0)
+                                    .height(TOOLBAR_SORT_COMBO_HEIGHT)
                                     .selected_text(current_text)
                                     .show_ui(ui, |ui| {
                                         apply_toolbar_style(ui);
@@ -1503,6 +1524,8 @@ impl App {
                                             }
                                         }
                                     });
+                                toolbar_combo_popup_open |=
+                                    egui::ComboBox::is_open(ctx, combo.response.id);
                             }
                         }
                     });
@@ -1644,6 +1667,15 @@ impl App {
             });
             ui.add_space(2.0);
         });
+
+        if toolbar_combo_popup_open {
+            ctx.input_mut(|i| {
+                i.raw_scroll_delta = egui::Vec2::ZERO;
+                i.smooth_scroll_delta = egui::Vec2::ZERO;
+                i.events
+                    .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+            });
+        }
 
         // ツールバーのソート変更は borrow の関係で遅延実行
         if toolbar_sort_changed {

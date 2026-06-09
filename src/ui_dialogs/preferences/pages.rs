@@ -291,6 +291,7 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 }
             }
         }
+        ui.checkbox(&mut s.toolbar_cols_details_visible, "詳細");
     });
 
     // ── 比率 ──

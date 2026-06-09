@@ -1544,6 +1544,9 @@ pub struct Settings {
     /// ツールバーに表示する列数の選択肢
     #[serde(default = "default_toolbar_cols_items")]
     pub toolbar_cols_items: Vec<usize>,
+    /// ツールバーの列セクションに「詳細」切替を表示するか
+    #[serde(default = "default_true")]
+    pub toolbar_cols_details_visible: bool,
     /// ツールバーに表示するアスペクト比の選択肢
     #[serde(default = "default_toolbar_aspect_items")]
     pub toolbar_aspect_items: Vec<ThumbAspect>,
@@ -2521,6 +2524,7 @@ impl Default for Settings {
             show_address_bar_folder_pin: true,
             rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),
+            toolbar_cols_details_visible: true,
             toolbar_aspect_items: default_toolbar_aspect_items(),
             toolbar_aspect_auto_visible: default_toolbar_aspect_auto_visible(),
             toolbar_cols_display: ToolbarSectionDisplay::default(),
@@ -5269,6 +5273,7 @@ mod tests {
             s.facet_filter.edits.insert(FacetEditFlag::Tagged);
             s.thumb_aspect_auto = true;
             s.thumb_aspect = ThumbAspect::Portrait2x3;
+            s.toolbar_cols_details_visible = false;
             s.toolbar_aspect_auto_visible = false;
             s.toolbar_cols_display = ToolbarSectionDisplay::Dropdown;
             s.toolbar_aspect_display = ToolbarSectionDisplay::Dropdown;
@@ -5373,6 +5378,10 @@ mod tests {
             assert!(
                 loaded.facet_filter.edits.contains(&FacetEditFlag::Tagged),
                 "facet_filter edit flags should survive roundtrip"
+            );
+            assert!(
+                !loaded.toolbar_cols_details_visible,
+                "toolbar_cols_details_visible (false override) should survive roundtrip"
             );
             assert!(
                 !loaded.toolbar_aspect_auto_visible,
