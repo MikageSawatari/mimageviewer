@@ -1534,6 +1534,8 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
+            suppress_confirm: false,
+            suppress_confirm_next_time: false,
         });
         app.attach_archive_convert_nav_history_rollback(snapshot);
         let rollback = app
@@ -1574,6 +1576,8 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
+            suppress_confirm: false,
+            suppress_confirm_next_time: false,
         });
         app.attach_archive_convert_nav_history_rollback(snapshot);
         let rollback = app
@@ -1604,6 +1608,8 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             nav_history_rollback: Some(snapshot),
             auto_fullscreen: false,
+            suppress_confirm: false,
+            suppress_confirm_next_time: false,
         });
 
         let target = app.tmp.path().join("loaded");
@@ -1639,6 +1645,8 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             nav_history_rollback: Some(snapshot),
             auto_fullscreen: false,
+            suppress_confirm: false,
+            suppress_confirm_next_time: false,
         });
 
         app.load_folder(current);

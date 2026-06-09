@@ -1121,6 +1121,18 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
         "RAR / 7z / LZH から作成した ZIP キャッシュの容量上限です。\n\
          上限を超えた場合、次回の変換完了後に最終アクセスが古いものから削除します。",
     );
+    ui.checkbox(
+        &mut s.archive_convert_without_dialog,
+        "ダイアログを開かずキャッシュを作成する",
+    );
+    ui.label(
+        egui::RichText::new(
+            "ON にすると、未変換の RAR / 7z / LZH を開いたときに確認画面を省略して変換します。パスワード入力やエラーは表示されます。",
+        )
+        .small()
+        .weak(),
+    );
+    ui.add_space(8.0);
     let mut archive_limit_enabled = s.archive_cache_max_bytes > 0;
     if ui
         .checkbox(&mut archive_limit_enabled, "容量上限を有効にする")

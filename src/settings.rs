@@ -1293,6 +1293,10 @@ pub struct Settings {
     /// 0 は無制限 (= 既存挙動)。
     #[serde(default)]
     pub archive_cache_max_bytes: u64,
+    /// RAR / 7z / LZH を開くとき、確認ダイアログを出さずに変換キャッシュを作成する。
+    /// パスワード入力やエラーは引き続きダイアログ表示する。
+    #[serde(default)]
+    pub archive_convert_without_dialog: bool,
     /// 一括キャッシュ作成: ZIP 内の全画像をキャッシュ対象にする
     #[serde(default)]
     pub batch_cache_zip_contents: bool,
@@ -2476,6 +2480,7 @@ impl Default for Settings {
             cache_pdf_always: true,
             cache_zip_always: true,
             archive_cache_max_bytes: 0,
+            archive_convert_without_dialog: false,
             batch_cache_zip_contents: false,
             batch_cache_pdf_contents: false,
             search_index_checks: Vec::new(),
@@ -3764,6 +3769,7 @@ mod tests {
         assert!(s.cache_videos_always);
         assert!(s.cache_webp_always);
         assert_eq!(s.archive_cache_max_bytes, 0);
+        assert!(!s.archive_convert_without_dialog);
         assert_eq!(s.thumb_prev_pages, 2);
         assert_eq!(s.thumb_next_pages, 4);
         assert_eq!(s.thumb_vram_cap_percent, 50);

@@ -98,6 +98,11 @@ pub(crate) struct ArchiveConvertState {
     /// (グリッド Enter / ダブルクリック / ゲームパッド × 設定 ON) のときだけ true。
     /// キャンセル時は state ごと drop されるので stale フラグが残らない。
     pub auto_fullscreen: bool,
+    /// true の場合、Scanning / Converting のウィンドウを出さず、Confirm を自動通過する。
+    /// パスワード入力とエラーはユーザー操作が必要なので表示する。
+    pub suppress_confirm: bool,
+    /// Confirm 画面の「次回から表示しない」。変換開始時に設定へ反映する。
+    pub suppress_confirm_next_time: bool,
 }
 
 fn spawn_archive_scan(
@@ -130,6 +135,14 @@ fn prepare_archive_password_retry(
     state.password = Some(password.clone());
     state.password_input.clear();
     Some((resume, password))
+}
+
+fn archive_convert_window_suppressed(phase: &ArchiveConvertPhase, suppress_confirm: bool) -> bool {
+    suppress_confirm
+        && matches!(
+            phase,
+            ArchiveConvertPhase::Scanning | ArchiveConvertPhase::Converting { .. }
+        )
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -204,6 +217,7 @@ impl App {
             return false;
         }
         let rx = spawn_archive_scan(src.clone(), format, None);
+        let suppress_confirm = self.settings.archive_convert_without_dialog;
         self.archive_convert = Some(ArchiveConvertState {
             src_path: src,
             format,
@@ -214,6 +228,8 @@ impl App {
             pending_nav: None,
             nav_history_rollback: None,
             auto_fullscreen,
+            suppress_confirm,
+            suppress_confirm_next_time: false,
         });
         true
     }
@@ -290,6 +306,15 @@ impl App {
                 }
                 return;
             }
+        }
+
+        if self
+            .archive_convert
+            .as_ref()
+            .is_some_and(|s| archive_convert_window_suppressed(&s.phase, s.suppress_confirm))
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
         }
 
         let enter_pressed = self.dialog_enter_pressed(ctx);
@@ -438,6 +463,8 @@ impl App {
                             .color(egui::Color32::from_gray(160)),
                         );
                         ui.add_space(10.0);
+                        ui.checkbox(&mut state.suppress_confirm_next_time, "次回から表示しない");
+                        ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             if ui
                                 .add_enabled(
@@ -510,6 +537,14 @@ impl App {
             }
         }
         if start_convert {
+            let suppress_next_time = self
+                .archive_convert
+                .as_ref()
+                .is_some_and(|state| state.suppress_confirm_next_time);
+            if suppress_next_time && !self.settings.archive_convert_without_dialog {
+                self.settings.archive_convert_without_dialog = true;
+                self.settings.save();
+            }
             self.start_archive_convert();
         }
         if apply_password {
@@ -538,6 +573,7 @@ impl App {
         let Some(state) = self.archive_convert.as_mut() else {
             return;
         };
+        let mut start_convert_after_poll = false;
         while let Ok(msg) = state.rx.try_recv() {
             match msg {
                 ArchiveConvertMsg::ScanDone(Ok(summary)) => {
@@ -546,6 +582,9 @@ impl App {
                             message: "このアーカイブには画像ファイルが含まれていません。"
                                 .to_string(),
                         };
+                    } else if state.suppress_confirm {
+                        state.phase = ArchiveConvertPhase::Confirm { summary };
+                        start_convert_after_poll = true;
                     } else {
                         state.phase = ArchiveConvertPhase::Confirm { summary };
                     }
@@ -620,6 +659,9 @@ impl App {
                     };
                 }
             }
+        }
+        if start_convert_after_poll && self.archive_convert.is_some() {
+            self.start_archive_convert();
         }
     }
 
@@ -778,6 +820,8 @@ mod tests {
             pending_nav: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
+            suppress_confirm: false,
+            suppress_confirm_next_time: false,
         }
     }
 
@@ -801,5 +845,37 @@ mod tests {
         assert_eq!(password, "mivtest2026");
         assert_eq!(state.password.as_deref(), Some("mivtest2026"));
         assert!(state.password_input.is_empty());
+    }
+
+    #[test]
+    fn suppress_confirm_hides_only_passive_phases() {
+        assert!(archive_convert_window_suppressed(
+            &ArchiveConvertPhase::Scanning,
+            true
+        ));
+        assert!(archive_convert_window_suppressed(
+            &ArchiveConvertPhase::Converting {
+                progress: Arc::new(ArchiveConvertProgressShared::new()),
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            true
+        ));
+        assert!(!archive_convert_window_suppressed(
+            &ArchiveConvertPhase::PasswordRequired {
+                message: None,
+                resume: ArchivePasswordResume::Scan,
+            },
+            true
+        ));
+        assert!(!archive_convert_window_suppressed(
+            &ArchiveConvertPhase::Error {
+                message: "failed".to_string(),
+            },
+            true
+        ));
+        assert!(!archive_convert_window_suppressed(
+            &ArchiveConvertPhase::Scanning,
+            false
+        ));
     }
 }

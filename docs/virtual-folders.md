@@ -58,6 +58,8 @@ RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<h
 - **起動時復元のルーティング**: `App::update` 初回フレームは `load_folder` ではなく
   `load_folder_or_convert_archive` を通す。元アーカイブパスを渡すとキャッシュ参照 →
   `open_archive_via_cache` で開き直し、キャッシュが無ければ変換ダイアログを出す。
+  `archive_convert_without_dialog` が ON の場合は Confirm 画面だけを省略して自動変換する
+  (パスワード入力 / エラーは引き続き表示)。
 - **`resolve_openable_path` / `is_convertible_archive_path`**: 起動復元・アドレスバー入力で
   変換アーカイブを「開けるパス」として返す (ネイティブ ZIP/PDF を判定する `is_virtual_folder`
   とは別関数)。これが無いと変換アーカイブのパスが親フォルダに丸められて本を開き直せない。
