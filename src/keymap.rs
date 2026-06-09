@@ -9,6 +9,7 @@ pub enum KeyContext {
     Global,
     Grid,
     FsCommon,
+    Rating,
     FsImage,
     FsVideo,
     Erase,
@@ -24,6 +25,7 @@ impl KeyContext {
             KeyContext::Global => "Global",
             KeyContext::Grid => "Grid",
             KeyContext::FsCommon => "FsCommon",
+            KeyContext::Rating => "Rating",
             KeyContext::FsImage => "FsImage",
             KeyContext::FsVideo => "FsVideo",
             KeyContext::Erase => "Erase",
@@ -40,6 +42,7 @@ impl KeyContext {
             KeyContext::Global,
             KeyContext::Grid,
             KeyContext::FsCommon,
+            KeyContext::Rating,
             KeyContext::FsImage,
             KeyContext::FsVideo,
             KeyContext::Erase,
@@ -166,16 +169,16 @@ impl KeyName {
             "X" => KeyName::X,
             "Y" => KeyName::Y,
             "Z" => KeyName::Z,
-            "0" | "NUM0" | "DIGIT0" => KeyName::Num0,
-            "1" | "NUM1" | "DIGIT1" => KeyName::Num1,
-            "2" | "NUM2" | "DIGIT2" => KeyName::Num2,
-            "3" | "NUM3" | "DIGIT3" => KeyName::Num3,
-            "4" | "NUM4" | "DIGIT4" => KeyName::Num4,
-            "5" | "NUM5" | "DIGIT5" => KeyName::Num5,
-            "6" | "NUM6" | "DIGIT6" => KeyName::Num6,
-            "7" | "NUM7" | "DIGIT7" => KeyName::Num7,
-            "8" | "NUM8" | "DIGIT8" => KeyName::Num8,
-            "9" | "NUM9" | "DIGIT9" => KeyName::Num9,
+            "0" | "NUM0" | "DIGIT0" | "NUMPAD0" => KeyName::Num0,
+            "1" | "NUM1" | "DIGIT1" | "NUMPAD1" => KeyName::Num1,
+            "2" | "NUM2" | "DIGIT2" | "NUMPAD2" => KeyName::Num2,
+            "3" | "NUM3" | "DIGIT3" | "NUMPAD3" => KeyName::Num3,
+            "4" | "NUM4" | "DIGIT4" | "NUMPAD4" => KeyName::Num4,
+            "5" | "NUM5" | "DIGIT5" | "NUMPAD5" => KeyName::Num5,
+            "6" | "NUM6" | "DIGIT6" | "NUMPAD6" => KeyName::Num6,
+            "7" | "NUM7" | "DIGIT7" | "NUMPAD7" => KeyName::Num7,
+            "8" | "NUM8" | "DIGIT8" | "NUMPAD8" => KeyName::Num8,
+            "9" | "NUM9" | "DIGIT9" | "NUMPAD9" => KeyName::Num9,
             "F1" => KeyName::F1,
             "F2" => KeyName::F2,
             "F3" => KeyName::F3,
@@ -707,6 +710,18 @@ pub enum KeyAction {
     FsCtrlNavNext,
     FsSiblingPrev,
     FsSiblingNext,
+    RatingItem1,
+    RatingItem2,
+    RatingItem3,
+    RatingItem4,
+    RatingItem5,
+    RatingItemClear,
+    RatingContainer1,
+    RatingContainer2,
+    RatingContainer3,
+    RatingContainer4,
+    RatingContainer5,
+    RatingContainerClear,
     FsContinuousScrollForward,
     FsContinuousScrollBack,
     FsSpreadShiftLeft,
@@ -881,6 +896,18 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsCtrlNavNext,
     KeyAction::FsSiblingPrev,
     KeyAction::FsSiblingNext,
+    KeyAction::RatingItem1,
+    KeyAction::RatingItem2,
+    KeyAction::RatingItem3,
+    KeyAction::RatingItem4,
+    KeyAction::RatingItem5,
+    KeyAction::RatingItemClear,
+    KeyAction::RatingContainer1,
+    KeyAction::RatingContainer2,
+    KeyAction::RatingContainer3,
+    KeyAction::RatingContainer4,
+    KeyAction::RatingContainer5,
+    KeyAction::RatingContainerClear,
     KeyAction::FsContinuousScrollForward,
     KeyAction::FsContinuousScrollBack,
     KeyAction::FsSpreadShiftLeft,
@@ -1019,6 +1046,32 @@ const ALL_ACTIONS: &[KeyAction] = &[
 // Keep this list in sync with `KeyAction`. The keymap tests compare the enum
 // inventory and this array so newly added actions cannot silently miss ini generation.
 
+const RATING_ITEM_ACTIONS: &[(KeyAction, u8)] = &[
+    (KeyAction::RatingItem1, 1),
+    (KeyAction::RatingItem2, 2),
+    (KeyAction::RatingItem3, 3),
+    (KeyAction::RatingItem4, 4),
+    (KeyAction::RatingItem5, 5),
+    (KeyAction::RatingItemClear, 0),
+];
+
+const RATING_CONTAINER_ACTIONS: &[(KeyAction, u8)] = &[
+    (KeyAction::RatingContainer1, 1),
+    (KeyAction::RatingContainer2, 2),
+    (KeyAction::RatingContainer3, 3),
+    (KeyAction::RatingContainer4, 4),
+    (KeyAction::RatingContainer5, 5),
+    (KeyAction::RatingContainerClear, 0),
+];
+
+fn rating_actions(container: bool) -> &'static [(KeyAction, u8)] {
+    if container {
+        RATING_CONTAINER_ACTIONS
+    } else {
+        RATING_ITEM_ACTIONS
+    }
+}
+
 impl KeyAction {
     pub fn all() -> &'static [KeyAction] {
         ALL_ACTIONS
@@ -1064,6 +1117,18 @@ impl KeyAction {
             FsCtrlNavNext => "FsCtrlNavNext",
             FsSiblingPrev => "FsSiblingPrev",
             FsSiblingNext => "FsSiblingNext",
+            RatingItem1 => "RatingItem1",
+            RatingItem2 => "RatingItem2",
+            RatingItem3 => "RatingItem3",
+            RatingItem4 => "RatingItem4",
+            RatingItem5 => "RatingItem5",
+            RatingItemClear => "RatingItemClear",
+            RatingContainer1 => "RatingContainer1",
+            RatingContainer2 => "RatingContainer2",
+            RatingContainer3 => "RatingContainer3",
+            RatingContainer4 => "RatingContainer4",
+            RatingContainer5 => "RatingContainer5",
+            RatingContainerClear => "RatingContainerClear",
             FsContinuousScrollForward => "FsContinuousScrollForward",
             FsContinuousScrollBack => "FsContinuousScrollBack",
             FsSpreadShiftLeft => "FsSpreadShiftLeft",
@@ -1224,6 +1289,9 @@ impl KeyAction {
             FsToggleMetadata | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => {
                 KeyContext::FsCommon
             }
+            RatingItem1 | RatingItem2 | RatingItem3 | RatingItem4 | RatingItem5
+            | RatingItemClear | RatingContainer1 | RatingContainer2 | RatingContainer3
+            | RatingContainer4 | RatingContainer5 | RatingContainerClear => KeyContext::Rating,
             FsContinuousScrollForward
             | FsContinuousScrollBack
             | FsSpreadShiftLeft
@@ -1349,6 +1417,18 @@ impl KeyAction {
             | FsCtrlNavNext
             | FsSiblingPrev
             | FsSiblingNext
+            | RatingItem1
+            | RatingItem2
+            | RatingItem3
+            | RatingItem4
+            | RatingItem5
+            | RatingItemClear
+            | RatingContainer1
+            | RatingContainer2
+            | RatingContainer3
+            | RatingContainer4
+            | RatingContainer5
+            | RatingContainerClear
             | FsContinuousScrollForward
             | FsContinuousScrollBack
             | FsSpreadShiftLeft
@@ -1521,6 +1601,18 @@ impl KeyAction {
             FsCtrlNavNext => ChordList::one(Chord::ctrl(Down)),
             FsSiblingPrev => ChordList::one(Chord::ctrl(PageUp)),
             FsSiblingNext => ChordList::one(Chord::ctrl(PageDown)),
+            RatingItem1 => ChordList::one(Chord::key(F1)),
+            RatingItem2 => ChordList::one(Chord::key(F2)),
+            RatingItem3 => ChordList::one(Chord::key(F3)),
+            RatingItem4 => ChordList::one(Chord::key(F4)),
+            RatingItem5 => ChordList::one(Chord::key(F5)),
+            RatingItemClear => ChordList::one(Chord::key(F6)),
+            RatingContainer1 => ChordList::one(Chord::shift(F1)),
+            RatingContainer2 => ChordList::one(Chord::shift(F2)),
+            RatingContainer3 => ChordList::one(Chord::shift(F3)),
+            RatingContainer4 => ChordList::one(Chord::shift(F4)),
+            RatingContainer5 => ChordList::one(Chord::shift(F5)),
+            RatingContainerClear => ChordList::one(Chord::shift(F6)),
             FsContinuousScrollForward => ChordList::one(Chord::key(PageDown)),
             FsContinuousScrollBack => ChordList::one(Chord::key(PageUp)),
             FsSpreadShiftLeft => ChordList::one(Chord::ctrl(Left)),
@@ -1669,6 +1761,12 @@ pub struct Keymap {
 enum IniTemplateKind {
     UserConfig,
     DefaultReference,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RatingKey {
+    pub container: bool,
+    pub stars: u8,
 }
 
 impl Keymap {
@@ -1829,6 +1927,31 @@ impl Keymap {
         &self.warnings
     }
 
+    pub fn consume_rating_action(&self, ctx: &egui::Context, container: bool) -> Option<u8> {
+        rating_actions(container)
+            .iter()
+            .copied()
+            .find_map(|(action, stars)| self.consume_action(ctx, action).then_some(stars))
+    }
+
+    #[cfg(windows)]
+    pub fn native_video_rating_action(
+        &self,
+        key: &crate::video::native_window::NativeVideoKeyEvent,
+    ) -> Option<RatingKey> {
+        if key.repeat {
+            return None;
+        }
+        for container in [true, false] {
+            for (action, stars) in rating_actions(container).iter().copied() {
+                if self.matches_vk_action(action, key) {
+                    return Some(RatingKey { container, stars });
+                }
+            }
+        }
+        None
+    }
+
     pub fn consume_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         if let Some(chords) = self.overrides.get(&action) {
@@ -1924,7 +2047,7 @@ impl Keymap {
         for action in KeyAction::all()
             .iter()
             .copied()
-            .filter(|action| action.context() == KeyContext::FsVideo)
+            .filter(|action| matches!(action.context(), KeyContext::FsVideo | KeyContext::Rating))
         {
             if let Some(override_chords) = self.overrides.get(&action) {
                 chords.extend(override_chords.iter().copied());
@@ -1995,12 +2118,15 @@ impl Keymap {
         out.push_str("# - Press actions can use Ctrl/Shift/Alt plus one normal key.\n");
         out.push_str("# - ModifierHold actions accept Ctrl, Shift, or Alt only.\n");
         out.push_str("# - KeyHold actions accept one normal key only.\n");
+        out.push_str("# - Numpad number keys are treated the same as the top-row number keys.\n");
+        out.push_str("#   Names such as Numpad1 are accepted only as aliases for 1.\n");
+        out.push_str("# - OS-reserved shortcuts such as Alt+F4, Alt+Tab, Alt+Esc, Alt+Space,\n");
+        out.push_str("#   Ctrl+Alt+Del, and Windows-key combinations cannot be overridden here.\n");
+        out.push_str("# - Alt combinations are not forwarded from the native video presenter.\n");
         out.push_str(
             "# - Mouse, gamepad, drag-and-drop, OS clipboard shortcuts, IME confirmation,\n",
         );
-        out.push_str(
-            "#   right-click menus, rating F1-F6, Escape/Enter navigation, and most arrow\n",
-        );
+        out.push_str("#   right-click menus, Escape/Enter navigation, and most arrow\n");
         out.push_str("#   navigation are intentionally fixed.\n");
         out.push_str("#\n");
         out.push_str("# Examples:\n");
@@ -2018,6 +2144,7 @@ impl Keymap {
             KeyContext::Global,
             KeyContext::Grid,
             KeyContext::FsCommon,
+            KeyContext::Rating,
             KeyContext::FsImage,
             KeyContext::FsVideo,
             KeyContext::Erase,
@@ -2182,7 +2309,7 @@ pub fn native_video_fullscreen_shortcut_key(
     KeyAction::all()
         .iter()
         .copied()
-        .filter(|action| action.context() == KeyContext::FsVideo)
+        .filter(|action| matches!(action.context(), KeyContext::FsVideo | KeyContext::Rating))
         .any(|action| fallback.matches_vk_action(action, key))
 }
 
@@ -2200,12 +2327,6 @@ fn native_video_fixed_shortcut_key(virtual_key: u32, ctrl: bool, shift: bool) ->
             | 0x26 // Up
             | 0x27 // Right
             | 0x28 // Down
-            | 0x70 // F1
-            | 0x71 // F2
-            | 0x72 // F3
-            | 0x73 // F4
-            | 0x74 // F5
-            | 0x75 // F6
             | 0x7A // F11
             | 0xA6 // Browser back
             | 0xA7 // Browser forward
@@ -2417,6 +2538,41 @@ mod tests {
     }
 
     #[test]
+    fn rating_actions_are_exact_and_customizable() {
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+
+        begin_key_pass(&ctx, egui::Key::F2, egui::Modifiers::SHIFT);
+        assert_eq!(keymap.consume_rating_action(&ctx, false), None);
+        assert_eq!(keymap.consume_rating_action(&ctx, true), Some(2));
+        assert_eq!(ctx.input(|i| i.events.len()), 0);
+        let _ = ctx.end_pass();
+
+        let keymap = Keymap::from_ini_str(
+            r#"
+            [Rating]
+            RatingItem1 = Ctrl+F1
+            "#,
+        );
+        assert!(keymap.warnings().is_empty());
+        begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::NONE);
+        assert_eq!(keymap.consume_rating_action(&ctx, false), None);
+        assert_eq!(ctx.input(|i| i.events.len()), 1);
+        let _ = ctx.end_pass();
+
+        begin_key_pass(&ctx, egui::Key::F1, egui::Modifiers::CTRL);
+        assert_eq!(keymap.consume_rating_action(&ctx, false), Some(1));
+        assert_eq!(ctx.input(|i| i.events.len()), 0);
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn numpad_names_parse_as_number_aliases() {
+        assert_eq!(KeyName::parse("Numpad1"), Some(KeyName::Num1));
+        assert_eq!(KeyName::parse("Numpad0"), Some(KeyName::Num0));
+    }
+
+    #[test]
     fn none_disables_action() {
         let keymap = Keymap::from_ini_str(
             r#"
@@ -2453,6 +2609,8 @@ mod tests {
     fn user_ini_template_is_parseable_and_comment_only() {
         let user_ini = Keymap::user_ini_template();
         assert!(user_ini.contains("[FsImage]"));
+        assert!(user_ini.contains("[Rating]"));
+        assert!(user_ini.contains("# RatingItem1 = F1"));
         assert!(user_ini.contains("# FsSlideshow = S"));
         assert!(user_ini.contains("# TextRedo.1 = Ctrl+Y"));
         assert!(!user_ini.contains("\nFsSlideshow = S"));
@@ -2470,6 +2628,8 @@ mod tests {
     fn default_reference_ini_is_parseable_and_comment_only() {
         let default_ini = Keymap::default_reference_ini();
         assert!(default_ini.contains("keymap.ini.default"));
+        assert!(default_ini.contains("[Rating]"));
+        assert!(default_ini.contains("# RatingContainerClear = Shift+F6"));
         assert!(default_ini.contains("# FsSlideshow = S"));
         assert!(default_ini.contains("# TextRedo.1 = Ctrl+Y"));
         assert!(!default_ini.contains("\nFsSlideshow = S"));

@@ -16,8 +16,13 @@
 # - Press actions can use Ctrl/Shift/Alt plus one normal key.
 # - ModifierHold actions accept Ctrl, Shift, or Alt only.
 # - KeyHold actions accept one normal key only.
+# - Numpad number keys are treated the same as the top-row number keys.
+#   Names such as Numpad1 are accepted only as aliases for 1.
+# - OS-reserved shortcuts such as Alt+F4, Alt+Tab, Alt+Esc, Alt+Space,
+#   Ctrl+Alt+Del, and Windows-key combinations cannot be overridden here.
+# - Alt combinations are not forwarded from the native video presenter.
 # - Mouse, gamepad, drag-and-drop, OS clipboard shortcuts, IME confirmation,
-#   right-click menus, rating F1-F6, Escape/Enter navigation, and most arrow
+#   right-click menus, Escape/Enter navigation, and most arrow
 #   navigation are intentionally fixed.
 #
 # Examples:
@@ -77,6 +82,20 @@
 # FsCtrlNavNext = Ctrl+Down
 # FsSiblingPrev = Ctrl+PageUp
 # FsSiblingNext = Ctrl+PageDown
+
+[Rating]
+# RatingItem1 = F1
+# RatingItem2 = F2
+# RatingItem3 = F3
+# RatingItem4 = F4
+# RatingItem5 = F5
+# RatingItemClear = F6
+# RatingContainer1 = Shift+F1
+# RatingContainer2 = Shift+F2
+# RatingContainer3 = Shift+F3
+# RatingContainer4 = Shift+F4
+# RatingContainer5 = Shift+F5
+# RatingContainerClear = Shift+F6
 
 [FsImage]
 # FsContinuousScrollForward = PageDown

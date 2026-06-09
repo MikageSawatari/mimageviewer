@@ -17,7 +17,7 @@
   更新生成する。起動時に読むのは `keymap.ini` だけ。警告はログへ出す。テストではユーザー環境の ini を読まない。
 - 画像フルスクリーン、編集モード (消しゴム / 隠蔽 / 切り取り / テキスト / 補正レイヤー)、
   グリッド主要操作、egui/native 動画主要操作を keymap 経由にした。
-- Esc / Enter ナビゲーション、矢印ナビゲーション、F1-F6 レーティング、OS clipboard、
+- Esc / Enter ナビゲーション、矢印ナビゲーション、OS clipboard、
   D&D、マウス、ゲームパッド、IME 確定は固定扱いのまま。
 
 ---
@@ -154,7 +154,7 @@ pub struct Keymap {
 
 パース規則:
 - 行 = `Action = <chord>` または `Action.<番号> = <chord>`。番号は 1..3 のみ。
-  末尾数字ではなく `.` で分けることで、`FsRate1` / `FsAdjustSlot1` のような Action 名と衝突させない。
+  末尾数字ではなく `.` で分けることで、`RatingItem1` / `FsAdjustSlot1` のような Action 名と衝突させない。
 - chord = `+` 区切り。`Ctrl`/`Shift`/`Alt` を修飾として拾い、残り 1 トークンを `KeyName::parse`。
   修飾単独 (キーなし) は ModifierHold 専用。
 - `none` / `None` / 空値はその Action を明示的に無効化する。`Action.1 = none` と
@@ -324,8 +324,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 4. **exact match**: §4 の「修飾完全一致」を helper 内で保証。同一キーに NONE と SHIFT が
    ある場合 (例 C / Shift+C / Alt+C、矢印 alias) は、デフォルト chord を複数持たせて
    現行挙動を再現する。`consume_key(Modifiers::NONE, key)` へ直に寄せない。
-5. **VK 変換不能キー**: 記号・テンキー・非 US 配列は `to_vk()==None`。動画経路ではその上書きを
-   スキップ + 警告 (付録 B のホワイトリスト)。
+5. **VK 変換不能キー**: 記号の一部・非 US 配列は `to_vk()==None`。動画経路ではその上書きを
+   スキップ + 警告 (付録 B のホワイトリスト)。テンキー数字は通常の数字キー alias として扱い、
+   別アサインはできない。
 6. **native 動画の転送ホワイトリスト**: `src/video/native_presenter/mod.rs` の
    `native_video_fullscreen_shortcut_key` を keymap 連動にしない限り、カスタムした VK が
    UI 側へ届かない。Ph5 の必須作業にする。
@@ -339,8 +340,10 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 10. **OS/egui 由来の clipboard / D&D は固定**: `Event::Copy` / `Event::Cut`、
     Win32 クリップボード paste、ファイル D&D は keyboard keymap の範囲外。対象にするなら
     Grid の別フェーズで明示的に設計する。
-11. **レーティング F1-F6** は `consume_rating_fkey` 集約ヘルパー (ui_helpers.rs:225) 経由。
-   MVP では F キー固定とし、カスタム対象外にしておくのが安全 (family 一括判定のため)。
+11. **レーティング F1-F6** は `[Rating]` コンテキストの `RatingItem1..5/Clear` と
+   `RatingContainer1..5/Clear` に集約する。グリッド / 画像フルスクリーン / native 動画の
+   入口は `Keymap::consume_rating_action` / `native_video_rating_action` を使い、保存処理は既存の
+   `set_rating` / `set_current_folder_rating` 経路を共有する。
 12. **生 Event::Key / OS 状態参照経路** (F11=ui_fullscreen.rs:3998、
     pipeline debug=pipeline_debug.rs:104、右 Ctrl の original/source preview 系) は
    特殊。MVP では keymap 対象外の固定操作。
@@ -439,8 +442,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - GridApplyErase1/2 `F7/F8` / GridApplyConceal1/2 `F9/F10` /
   GridDeleteErase1/2 `Shift+F7/F8` / GridDeleteConceal1/2 `Shift+F9/F10`
   (family・予約候補)
-- GridRate1..5/Clear `F1-F6` / GridRateContainer1..5/Clear `Shift+F1-F6`
-  (family・MVP固定)
+- RatingItem1..5/Clear `F1-F6` / RatingContainer1..5/Clear `Shift+F1-F6`
+  (専用 `[Rating]` グループ。グリッド / 画像フルスクリーン / 動画フルスクリーンで共有)
 - GridClipboardCopy/Cut/Paste `Ctrl+C/X/V`、GridDeleteFiles `Delete`、D&D、右クリック操作は
   OS/clipboard/マウス経路を含むため本計画では固定。
 - Shift+矢印の範囲選択は GridCursor の派生動作として固定。
@@ -452,7 +455,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
     Ph5 で「FsCommon に置くか、FsImage 専用にするか」を実コードで確定する。
 - FsCtrlNavPrev/Next `Ctrl+↑/↓` (P) / FsSiblingPrev/Next `Ctrl+PageUp/Down` (P)
 - FsToggleWindowMode `F11` (固定)
-- FsRate1..5/Clear `F1-F6` / FsRateContainer1..5/Clear `Shift+F1-F6` (family・MVP固定)
+- レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` を共有する。
 - BrowserBack/Forward、マウス戻る/進む、ホイール、クリックは固定。
 
 ### FsImage (Ph2) ★
@@ -536,8 +539,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 ## 付録 B. KeyName ⇔ egui::Key ⇔ VK 変換ホワイトリスト
 
-双方向に安全変換できるキーのみカスタム許可。リスト外 (記号の一部・テンキー・非 US 配列・
-メディアキー) は ini で警告して無視。
+双方向に安全変換できるキーのみカスタム許可。リスト外 (記号の一部・非 US 配列・
+メディアキー) は ini で警告して無視。テンキー数字は `Numpad1` などの名前を受け付けるが、
+egui 側で通常の数字キーと同じ `Num1` などに畳まれるため別アサインはできない。
 
 | 分類 | KeyName | egui::Key | VK (16) |
 |---|---|---|---|

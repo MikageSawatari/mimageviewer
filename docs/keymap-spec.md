@@ -13,6 +13,10 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 [keymap.ini.default](keymap.ini.default) と、起動時に生成される `keymap.ini` /
 `keymap.ini.default` の先頭コメントを正とする。マウス、ゲームパッド、
 OS/egui clipboard、D&D、IME 確定、右クリックメニューは keymap 対象外。
+レーティングは専用の `[Rating]` グループ (`RatingItem1..5/Clear`、
+`RatingContainer1..5/Clear`) で、グリッド / 画像フルスクリーン / 動画フルスクリーンが
+同じ割り当てを共有する。テンキー数字は通常の数字キーと区別できない。
+OS 予約ショートカット (例: Alt+F4 / Alt+Tab / Win キー系) は keymap では上書きできない。
 
 開発者向けメモ: 新しいキーボード操作を追加・変更するときは、ユーザーから明示されて
 いなくても keymap 対応要否を確認する。通常ショートカットは `KeyAction` に追加し、

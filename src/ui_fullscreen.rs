@@ -4754,21 +4754,18 @@ impl App {
         let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         let key_p_pin = !current_item_is_video && self.keymap.consume_action(ctx, KeyAction::FsPin);
 
-        // Shift+F1-F5: 開いている画像が属するコンテナ (フォルダ / ZIP / PDF) に
-        // レーティング / Shift+F6: コンテナレーティング解除。
+        // コンテナ★ (既定: Shift+F1〜F6): 開いている画像が属するコンテナ
+        // (フォルダ / ZIP / PDF) にレーティング / 解除。
         // current_folder がそのまま親コンテナなので、そちらに書き込めば一覧画面で★絞り込みできる。
-        // matches_logically 対策で Shift 版を先に consume する (NONE だと Shift 入りも吸収される)。
-        let container_rating_key: Option<u8> =
-            ctx.input_mut(|i| crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::SHIFT));
+        let container_rating_key = self.keymap.consume_rating_action(ctx, true);
         if let Some(stars) = container_rating_key
             && self.set_current_folder_rating(stars)
         {
             self.show_container_rating_toast(stars);
         }
 
-        // F1-F5: レーティング 1〜5 / F6: レーティング解除
-        let rating_key: Option<u8> =
-            ctx.input_mut(|i| crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::NONE));
+        // レーティング 1〜5 / 解除 (既定: F1〜F6)
+        let rating_key = self.keymap.consume_rating_action(ctx, false);
         if let Some(stars) = rating_key {
             // Undo 用にフルスクリーン現在ページの before/after を 1 件分積む。
             let before = self.rating_cache.get(&fs_idx).copied().unwrap_or(0);

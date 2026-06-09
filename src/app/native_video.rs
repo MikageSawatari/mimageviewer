@@ -70,19 +70,6 @@ fn encode_native_overlay_tile_thumbnail_webp(
 }
 
 #[cfg(windows)]
-fn native_rating_stars_from_fkey(virtual_key: u32) -> u8 {
-    match virtual_key {
-        0x70 => 1, // F1
-        0x71 => 2, // F2
-        0x72 => 3, // F3
-        0x73 => 4, // F4
-        0x74 => 5, // F5
-        0x75 => 0, // F6
-        _ => 0,
-    }
-}
-
-#[cfg(windows)]
 struct NativeVideoSourceSwapStarted {
     from_idx: usize,
     target_idx: usize,
@@ -4547,21 +4534,22 @@ impl App {
             return;
         }
         let mut hud_activity = true;
-        match key.virtual_key {
-            // F1-F5: rating 1-5 / F6: clear rating. Shift+F1-F6 applies the
-            // container rating, matching the regular fullscreen path.
-            0x70..=0x75 if !key.ctrl && !key.repeat => {
-                let stars = native_rating_stars_from_fkey(key.virtual_key);
-                if key.shift {
-                    if self.set_current_folder_rating(stars) {
-                        self.show_container_rating_toast(stars);
-                    } else {
-                        hud_activity = false;
-                    }
+        if let Some(rating_key) = self.keymap.native_video_rating_action(&key) {
+            if rating_key.container {
+                if self.set_current_folder_rating(rating_key.stars) {
+                    self.show_container_rating_toast(rating_key.stars);
                 } else {
-                    self.apply_native_video_rating_key(fs_idx, stars);
+                    hud_activity = false;
                 }
+            } else {
+                self.apply_native_video_rating_key(fs_idx, rating_key.stars);
             }
+            if hud_activity {
+                self.request_native_video_hud_repaint(ctx);
+            }
+            return;
+        }
+        match key.virtual_key {
             // Shift+Enter: open in external player, matching the legacy egui
             // fullscreen video path.
             _ if !key.repeat
