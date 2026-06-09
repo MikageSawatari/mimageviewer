@@ -2780,12 +2780,20 @@ impl App {
                                                 compare_mode
                                             {
                                                 if let Some(tex) = fallback_compare_tex.as_ref() {
-                                                    let wipe_x = image_rect.left()
-                                                        + image_rect.width()
+                                                    // 線 / clip はフィット後の実表示画像矩形基準に
+                                                    // して、画像の切り替え位置と一致させる。
+                                                    let ref_rect = Self::compare_image_draw_rect(
+                                                        image_rect,
+                                                        tex.size(),
+                                                        zp,
+                                                    )
+                                                    .unwrap_or(image_rect);
+                                                    let wipe_x = ref_rect.left()
+                                                        + ref_rect.width()
                                                             * fraction.clamp(0.05, 0.95);
                                                     let clip = egui::Rect::from_min_max(
-                                                        image_rect.min,
-                                                        egui::pos2(wipe_x, image_rect.max.y),
+                                                        ref_rect.min,
+                                                        egui::pos2(wipe_x, ref_rect.max.y),
                                                     );
                                                     Self::draw_compare_pinned_image(
                                                         ui,
@@ -2796,7 +2804,7 @@ impl App {
                                                         Some(clip),
                                                     );
                                                     Self::draw_compare_wipe_line(
-                                                        ui, image_rect, fraction,
+                                                        ui, ref_rect, fraction,
                                                     );
                                                 }
                                             }
@@ -5758,11 +5766,24 @@ impl App {
             }
         }
 
-        let compare_drag_rect = if self.analysis_mode && !is_spread_double {
-            analysis_image_rect(full_rect)
+        // Wipe のドラッグ基準は、白線 / clip / シェーダー合成境界と同じ「フィット後の実表示
+        // 画像矩形」にする。full_rect (黒帯込み) で取ると線・切り替え位置とドラッグがズレる。
+        // base 矩形と zoom_pan は描画側 (image_rect / zp) と一致させる。
+        let (compare_base_rect, compare_zoom_pan) = if self.analysis_mode && !is_spread_double {
+            (
+                analysis_image_rect(full_rect),
+                Some((self.analysis_zoom, self.analysis_pan)),
+            )
         } else {
-            full_rect
+            (full_rect, self.fs_zoom_pan())
         };
+        let compare_drag_rect = self
+            .compare_prepared_pair
+            .as_ref()
+            .and_then(|pair| {
+                Self::compare_image_draw_rect(compare_base_rect, pair.target_size, compare_zoom_pan)
+            })
+            .unwrap_or(compare_base_rect);
         if !cursor_in_panel && self.handle_compare_wipe_drag(ctx, compare_drag_rect) {
             return (0, false);
         }
@@ -9099,7 +9120,8 @@ impl App {
             paint_transparent_bg(ui.painter(), draw_rect, &bg_style);
             ui.painter().add(shape);
             if let crate::app::CompareViewMode::Wipe { fraction } = mode {
-                Self::draw_compare_wipe_line(ui, image_rect, fraction);
+                // 白線はシェーダーの合成境界 (draw_rect = フィット後の実表示画像矩形) に揃える。
+                Self::draw_compare_wipe_line(ui, draw_rect, fraction);
             }
             return true;
         }
@@ -9125,9 +9147,12 @@ impl App {
                 };
                 let bg_style = self.fs_bg_style(ctx);
                 Self::draw_compare_pinned_image(ui, image_rect, current, zoom_pan, &bg_style, None);
-                let wipe_x = image_rect.left() + image_rect.width() * fraction.clamp(0.05, 0.95);
+                // 線 / clip はフィット後の実表示画像矩形基準にして、画像の切り替え位置と一致させる。
+                let ref_rect = Self::compare_image_draw_rect(image_rect, current.size(), zoom_pan)
+                    .unwrap_or(image_rect);
+                let wipe_x = ref_rect.left() + ref_rect.width() * fraction.clamp(0.05, 0.95);
                 let clip =
-                    egui::Rect::from_min_max(image_rect.min, egui::pos2(wipe_x, image_rect.max.y));
+                    egui::Rect::from_min_max(ref_rect.min, egui::pos2(wipe_x, ref_rect.max.y));
                 Self::draw_compare_pinned_image(
                     ui,
                     image_rect,
@@ -9136,7 +9161,7 @@ impl App {
                     &bg_style,
                     Some(clip),
                 );
-                Self::draw_compare_wipe_line(ui, image_rect, fraction);
+                Self::draw_compare_wipe_line(ui, ref_rect, fraction);
                 true
             }
             crate::app::CompareViewMode::Diff => {
@@ -13426,6 +13451,26 @@ mod tests {
         assert!(!should_handle_fullscreen_wheel(
             false, false, true, false, true
         ));
+    }
+
+    #[test]
+    fn compare_wipe_reference_rect_is_letterbox_fitted_not_full_rect() {
+        // 横長ウィンドウ + 縦長画像 → 左右に黒帯。比較 Wipe の白線 / clip / ドラッグ /
+        // シェーダー合成境界は、この「フィット後の実表示画像矩形」を基準にしなければ
+        // ならない。full_rect (黒帯込み) と混在させると、同じ fraction でも線の位置と
+        // 切り替わり位置がズレる (本バグの本質)。
+        let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+        let fitted = App::compare_image_draw_rect(full, [400, 800], None).unwrap();
+        // 高さフィット (800/800=1.0)、幅 400 → 中央寄せで左右に黒帯。
+        assert!((fitted.height() - 800.0).abs() < 0.5);
+        assert!((fitted.width() - 400.0).abs() < 0.5);
+        assert!(fitted.width() < full.width()); // = full_rect とは別物
+        assert!((fitted.center().x - full.center().x).abs() < 0.5); // 中央寄せ
+        // 同一 fraction でも基準が違えば線の x がズレる。
+        let f = 0.25_f32;
+        let x_fitted = fitted.left() + fitted.width() * f;
+        let x_full = full.left() + full.width() * f;
+        assert!((x_fitted - x_full).abs() > 100.0);
     }
 
     #[test]
