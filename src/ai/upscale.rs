@@ -277,6 +277,14 @@ pub fn upscale_with_timings(
     }
 
     // 出力バッファ: RGB float 累積 + 重み累積（ブレンド用）
+    //
+    // ⚠ メモリ過大ガードは**意図的に持たない** (2026-06-10 ユーザー判断、Codex P2 回答):
+    // サイズ上限の最悪ケース (4095x4095 → 4x = 268MP) で累積 4 面 ≈ 4.3 GB、最終
+    // ColorImage と合わせたピークは ≈ 5.4 GB に達するが、空きメモリ量で AI 適用可否を
+    // 変えると挙動が予測できなくなるため、判定はサイズ上限のみで決定的にする。
+    // 高負荷上限を明示的に選んだ環境で実メモリ不足ならクラッシュ (alloc abort) で良い。
+    // `try_reserve` での graceful fail も非決定性を生むため入れない。
+    // 詳細: docs/ai-processing-size-threshold-plan.md「メモリ目安」。
     let npixels = (out_w * out_h) as usize;
     let mut accum_r = vec![0.0f32; npixels];
     let mut accum_g = vec![0.0f32; npixels];
