@@ -7465,6 +7465,64 @@ impl App {
         }
     }
 
+    /// 見開き設定 (`spread_db`) のコンテナキー。
+    ///
+    /// ネスト ZIP ツリー閲覧中は **`zip_path` + 現在の実効 prefix** を合成パスにして、
+    /// **本 (= 内側 ZIP / サブフォルダ) ごとに独立**して見開き向き / 表紙有無 / 連結方向を
+    /// 記憶する (ユーザー要望)。`spread_db` は path 文字列を PRIMARY KEY にするだけなので、
+    /// 実在しない合成パス (`C:\x.zip\01_inner\chapterA.zip`) でも一意キーとして機能する
+    /// (ZIP 自身のキー `C:\x.zip` とも衝突しない)。通常フォルダ / 単純 ZIP は従来どおり
+    /// `current_folder`。
+    pub(crate) fn spread_container_key(&self) -> Option<PathBuf> {
+        if let Some(nav) = self.zip_nav.as_ref() {
+            let mut p = nav.tree.zip_path.clone();
+            for seg in nav.current() {
+                p.push(seg);
+            }
+            Some(p)
+        } else {
+            self.current_folder.clone()
+        }
+    }
+
+    /// 指定キーの見開きモード / 連結方式 / 綴じ方向を `spread_db` から読み込んで
+    /// `self.spread_mode` / `reading_flow` / `reading_direction` に適用する。
+    /// 未登録なら settings の既定値。旧 `SpreadMode::Vertical` は「単ページ + 縦連結」に読み替え。
+    ///
+    /// `start_loading_items` (フォルダ / 初回 ZIP open) と、ネスト ZIP の階層切替
+    /// (`zip_nav_show_current_level` / finalize 後) の両方から呼び、本ごとに設定を復元する。
+    pub(crate) fn apply_spread_for_key(&mut self, key: &std::path::Path) {
+        let stored_spread = self
+            .spread_db
+            .as_ref()
+            .and_then(|db| db.get(key))
+            .unwrap_or(self.settings.default_spread_mode);
+        self.reading_flow = self
+            .spread_db
+            .as_ref()
+            .and_then(|db| db.get_flow(key))
+            .unwrap_or(self.settings.default_reading_flow);
+        self.reading_direction = self
+            .spread_db
+            .as_ref()
+            .and_then(|db| db.get_direction(key))
+            .unwrap_or(self.settings.default_reading_direction);
+        if stored_spread == crate::settings::SpreadMode::Vertical {
+            self.spread_mode = crate::settings::SpreadMode::Single;
+            self.reading_flow = crate::settings::ReadingFlow::Vertical;
+        } else {
+            self.spread_mode = stored_spread;
+        }
+        if self.spread_mode.is_rtl() {
+            self.reading_direction = crate::settings::ReadingDirection::Rtl;
+        } else if matches!(
+            self.spread_mode,
+            crate::settings::SpreadMode::Ltr | crate::settings::SpreadMode::LtrCover
+        ) {
+            self.reading_direction = crate::settings::ReadingDirection::Ltr;
+        }
+    }
+
     /// 通常の (事前スキャンなしの) フォルダロード。`scan_directory` を UI スレッドで
     /// 同期実行する。初期化 / 履歴復元 / 直接パス指定など、Ctrl+↑↓ 連打以外の
     /// すべての呼び出しが通る。
@@ -9324,6 +9382,11 @@ impl App {
         self.zip_nav = Some(nav);
         // アドレス欄をパンくず表示に更新 (単一ラッパー ZIP は collapse 済み実効 prefix を反映)。
         self.update_zip_nav_address();
+        // ルート本の見開き設定を本ごとのキー (zip_path + 実効 prefix) で読み直す。
+        // start_loading_items は zip_path キーで読んだので、ここで上書きする。
+        if let Some(key) = self.spread_container_key() {
+            self.apply_spread_for_key(&key);
+        }
 
         // Ctrl+↑↓ フォルダナビから fullscreen で ZIP に遷移してきた場合、items が
         // 揃った今 fullscreen を開き直す (Codex P1: PDF と同じ処理を ZIP にも適用)。
@@ -9413,6 +9476,12 @@ impl App {
         self.prewarm_grid_tags();
         // アドレス欄を「元 ZIP パス > ZIP 内パス」のパンくず表示に更新。
         self.update_zip_nav_address();
+        // 入った本 (= 現在の階層) の見開き設定を本ごとのキーで読み直す。これで BS 戻り /
+        // Ctrl+↓ 等どの経路で本を切り替えても、その本の見開き向き / 連結方向が一貫して
+        // 復元される (ユーザー要望: 本ごとに独立記憶)。
+        if let Some(key) = self.spread_container_key() {
+            self.apply_spread_for_key(&key);
+        }
     }
 
     /// アドレス欄をネスト ZIP ツリーナビのパンくず表示にする。
@@ -10511,38 +10580,11 @@ impl App {
                 )],
             );
         }
-        // 表示モード: DB から読み込み、なければデフォルト値。
-        // 旧実装の SpreadMode::Vertical は新しい 2 軸モデルでは
-        // 「単ページ + 縦連結」として解釈する。
-        let stored_spread = self
-            .spread_db
-            .as_ref()
-            .and_then(|db| db.get(&source_path))
-            .unwrap_or(self.settings.default_spread_mode);
-        self.reading_flow = self
-            .spread_db
-            .as_ref()
-            .and_then(|db| db.get_flow(&source_path))
-            .unwrap_or(self.settings.default_reading_flow);
-        self.reading_direction = self
-            .spread_db
-            .as_ref()
-            .and_then(|db| db.get_direction(&source_path))
-            .unwrap_or(self.settings.default_reading_direction);
-        if stored_spread == crate::settings::SpreadMode::Vertical {
-            self.spread_mode = crate::settings::SpreadMode::Single;
-            self.reading_flow = crate::settings::ReadingFlow::Vertical;
-        } else {
-            self.spread_mode = stored_spread;
-        }
-        if self.spread_mode.is_rtl() {
-            self.reading_direction = crate::settings::ReadingDirection::Rtl;
-        } else if matches!(
-            self.spread_mode,
-            crate::settings::SpreadMode::Ltr | crate::settings::SpreadMode::LtrCover
-        ) {
-            self.reading_direction = crate::settings::ReadingDirection::Ltr;
-        }
+        // 表示モード: DB から読み込み、なければデフォルト値 (本体は apply_spread_for_key)。
+        // 旧実装の SpreadMode::Vertical は「単ページ + 縦連結」として解釈する。
+        // ZIP の場合はここで一旦 zip_path キーで読むが、finalize_zip_enumerate が zip_nav
+        // 設定後に「ルート本のキー (zip_path + 実効 prefix)」で読み直す (本ごと独立記憶)。
+        self.apply_spread_for_key(&source_path);
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.search_filter = None;
