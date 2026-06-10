@@ -4534,6 +4534,137 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.last_book_resume, Some((folder, 0)));
     }
 
+    /// テスト用のネスト ZIP ナビ状態を作る (`C:\test\outer.zip` 固定)。
+    fn test_zip_nav(names: &[&str]) -> crate::zip_tree::ZipNavState {
+        let entries: Vec<crate::zip_loader::ZipImageEntry> = names
+            .iter()
+            .map(|n| crate::zip_loader::ZipImageEntry {
+                entry_name: n.to_string(),
+                uncompressed_size: 0,
+                mtime: 0,
+            })
+            .collect();
+        let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(
+            std::path::PathBuf::from(r"C:\test\outer.zip"),
+            entries,
+        ));
+        crate::zip_tree::ZipNavState::new(tree)
+    }
+
+    /// 読書位置レジュームはネスト ZIP の本の中 (スタック深さ ≥ 2) では記録しない。
+    /// idx は階層ローカルだが、再オープン時はルート階層 items に対して検証されるため、
+    /// 同 idx の別アイテムへ誤って「続きから」着地し得る (レビュー P3)。
+    #[test]
+    fn record_book_resume_skipped_inside_zip_book_level() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+        app.items.push(GridItem::ZipImage {
+            zip_path: zip_path.clone(),
+            entry_name: "bookA/p1.jpg".to_string(),
+        });
+
+        // 本の中 (深さ 2) → 記録されない
+        let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
+        nav.enter("bookA/");
+        app.zip_nav = Some(nav);
+        app.record_book_resume(0);
+        assert_eq!(app.last_book_resume, None, "本の中では resume を記録しない");
+
+        // ルート表示 (フラット ZIP 相当) → 従来どおり記録される
+        app.items[0] = GridItem::ZipImage {
+            zip_path: zip_path.clone(),
+            entry_name: "p1.jpg".to_string(),
+        };
+        app.zip_nav = Some(test_zip_nav(&["p1.jpg", "p2.jpg"]));
+        app.record_book_resume(0);
+        assert_eq!(app.last_book_resume, Some((zip_path, 0)));
+    }
+
+    /// ピンキーはルート表示では zip_path (= 外側 ZIP の代表、v1.2.x フラット UI 互換)、
+    /// 本の中では実効 prefix の合成キー。見開きキー (spread_container_key) はルートでも
+    /// collapse 済み実効 prefix を使う (= 本ごと独立記憶) ので、両者はルートで意図的に異なる。
+    #[test]
+    fn pin_container_key_root_uses_zip_path_even_when_collapsed() {
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+
+        // 単一ラッパー ZIP: 開いた時点で vol01 へ collapse するが at_root のまま。
+        app.zip_nav = Some(test_zip_nav(&["vol01/p1.jpg", "vol01/p2.jpg"]));
+        assert_eq!(app.pin_container_key(), Some(zip_path.clone()));
+        assert_eq!(app.spread_container_key(), Some(zip_path.join("vol01")));
+
+        // 本の中 (深さ 2) ではピンキーも本キー (= 実効 prefix 合成パス)。
+        let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
+        nav.enter("bookA/");
+        app.zip_nav = Some(nav);
+        assert_eq!(app.pin_container_key(), Some(zip_path.join("bookA")));
+        assert_eq!(app.spread_container_key(), Some(zip_path.join("bookA")));
+    }
+
+    /// BS で本から出たとき、出てきた本の ZipDir セルが選択される (レビュー P3 UX)。
+    /// collapse で深く降りていた本 (literal "bookB/" → 実効 "bookB/only/") でも
+    /// 前方一致でセルを特定できる。
+    #[test]
+    fn zip_nav_back_selects_book_cell_left_from() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path);
+
+        let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/only/p1.jpg"]);
+        nav.enter("bookB/"); // collapse で ["bookB", "only"] まで降りる
+        app.zip_nav = Some(nav);
+
+        assert!(app.zip_nav_back());
+        // root レベル: [ZipDir bookA/, ZipDir bookB/] (FileName 順)
+        assert_eq!(app.items.len(), 2);
+        let selected = app.selected.expect("出てきた本のセルが選択される");
+        match &app.items[selected] {
+            GridItem::ZipDir { dir_prefix, .. } => assert_eq!(dir_prefix, "bookB/"),
+            _ => panic!("expected GridItem::ZipDir at selected idx"),
+        }
+        assert!(app.scroll_to_selected);
+    }
+
+    /// 単一ラッパー本のピン: 本の中で set される「実効 prefix キー」のピンが、親階層の
+    /// ZipDir セルが引く「literal prefix キー」へ alias 登録される (レビュー P2:
+    /// set/lookup キー不一致の根治)。
+    #[test]
+    fn folder_pin_map_aliases_effective_prefix_for_wrapper_book() {
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+
+        // bookB はラッパー (bookB/only/ に実体)。本の中で P したときの set キーは
+        // 実効 prefix の合成キー (pin_container_key 相当)。
+        app.zip_nav = Some(test_zip_nav(&["bookA/p1.jpg", "bookB/only/p1.jpg"]));
+        let effective_key = zip_path.join("bookB").join("only");
+        assert!(app.set_folder_thumb_pin(
+            &effective_key,
+            crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                zip_rel: String::new(),
+                entry: "bookB/only/p1.jpg".to_string(),
+            },
+        ));
+
+        // root レベルを materialize → install で refresh_folder_pin_map が走る。
+        let (items, metas) = {
+            let nav = app.zip_nav.as_ref().unwrap();
+            nav.materialize_current(crate::settings::SortOrder::FileName)
+        };
+        app.install_new_items(items, metas);
+
+        // make_load_request が引く literal キー (zip_path + "bookB") でピンが引ける。
+        let literal_norm = crate::path_key::normalize_keep_drive(&zip_path.join("bookB"));
+        assert!(
+            app.folder_pin_map.contains_key(&literal_norm),
+            "実効キーのピンが literal キーへ alias 登録される: {:?}",
+            app.folder_pin_map.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// 見開きから隠蔽加工に入ったあと `reset_conceal_mode` で元の見開き状態に戻ること。
     #[test]
     fn reset_conceal_mode_restores_saved_spread_state() {

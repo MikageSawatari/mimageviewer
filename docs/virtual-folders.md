@@ -114,9 +114,24 @@ RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<h
    - 子コンテナ → `GridItem::ZipDir`、直下画像 → `GridItem::ZipImage` (コンテナ先・画像後)
    - image_metas に (mtime, uncompressed_size) を記録 (ZipDir は代表画像の meta)
    - `existing_keys` は `tree.all_cache_keys()` (全階層の entry_name + zipdir: キー) +
-     pinned ZipDir の `#pin` キーを含める (`delete_missing` の存続基準)
+     pinned ZipDir の `#pin` キーを含める (`delete_missing` の存続基準)。pin の DB キーは
+     **literal prefix を `collapse_redundant` した実効 prefix の合成パス** で、lookup は
+     `lookup_many` 1 回に束ねる (per-dir 逐次 lookup は UI スレッドを dirs 数比例で
+     ブロックするため)
    - 階層内の移動 (enter/back/sibling) は `zip_nav_show_current_level` の軽量経路
      (`install_new_items`、`start_loading_items` を通さない)
+   - **本ごとピン (Model B) のキー規則**: set 側は `App::pin_container_key()` =
+     ルート表示なら `zip_path` (= 外側 ZIP の代表。親フォルダの ZipFile セルが引くキー /
+     v1.2.x フラット UI のピンと互換)、本の中なら `zip_path` + 実効 prefix の合成パス。
+     lookup 側 (`make_load_request` の ZipDir 分岐) は cell の literal prefix キーで
+     `folder_pin_map` を引くが、`refresh_folder_pin_map` が実効 prefix で DB を引いた
+     結果を literal キーへ **alias 登録**するので、単一ラッパー本でも一致する
+   - **★固定 (snapshot) との相互作用**: snapshot は items を `start_loading_items` を
+     通さず差し替えるため、`activate_snapshot` が `zip_nav` を **take して
+     `SnapshotState::saved_zip_nav` へ退避**し、at_origin の解除で `saved_items` と対で
+     復元する。`snapshot_return_to_list_view` も (snapshot 内から開いた子 ZIP の)
+     zip_nav を破棄する。退避しないと snapshot 表示中の BS が `zip_nav_back()` に
+     落ちて stale な ZIP 階層を snapshot ビューへ上書きする
 ```
 
 非同期。列挙 (`enumerate_image_entries`) は `d1a6e99f` 以降ワーカースレッドで行い

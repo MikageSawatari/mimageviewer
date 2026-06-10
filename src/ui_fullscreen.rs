@@ -6200,6 +6200,23 @@ impl App {
         if self.global_search.active || self.favsearch.active || self.show_search_bar {
             return false;
         }
+        // ネスト ZIP の本の中: 手動 Ctrl+↓ (#4) と同じく次の兄弟本へ進み、スライドショーを
+        // 継続する (レビュー P3: ここで start_folder_nav に流すと残りの兄弟本をスキップして
+        // ZIP ごと脱出してしまう)。端 (最後の本) では従来どおり下の共通経路に落ちて ZIP を
+        // 抜け、次の実フォルダへ進む。holdover / 端での lock 残留対策は
+        // zip_nav_sibling_fullscreen 側に集約されている。
+        if self.zip_nav.as_ref().is_some_and(|n| !n.at_root()) {
+            if self.zip_nav_sibling_fullscreen(fs_idx, true) {
+                // 移動先の本に画像が無くフルスクリーンが閉じた場合 (sibling 内で
+                // slideshow_playing=false 済み) はスケジュールしない。
+                if self.fullscreen_idx.is_some() {
+                    self.slideshow_playing = true;
+                    self.schedule_next_slideshow_from_now();
+                }
+                return true;
+            }
+            // 端 (兄弟なし): fall through して ZIP を抜けて次フォルダへ。
+        }
         let Some(folder) = self.current_folder.clone() else {
             return false;
         };
@@ -6400,8 +6417,9 @@ impl App {
         // ネスト ZIP の本の中: Ctrl+↑↓ で兄弟本へ移り、その本の先頭画像を開く (#4)。
         // ルート (本一覧) では下の current_folder 分岐へ流して ZIP を抜ける (BS と対称)。
         // holdover は移動確定後に zip_nav_sibling_fullscreen 内で取る (端で lock が残るのを防ぐ)。
+        // 端 (兄弟なし = false) では何もしない (読書中に ZIP を抜けない)。
         if self.zip_nav.as_ref().is_some_and(|n| !n.at_root()) {
-            self.zip_nav_sibling_fullscreen(fs_idx, forward);
+            let _ = self.zip_nav_sibling_fullscreen(fs_idx, forward);
             return;
         }
 

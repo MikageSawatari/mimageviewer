@@ -255,6 +255,12 @@ impl App {
             std::mem::replace(&mut self.visible_indices, snapshot_visible_indices);
         let saved_scroll_offset_y = std::mem::replace(&mut self.scroll_offset_y, 0.0);
         let saved_selected = std::mem::replace(&mut self.selected, new_selected);
+        // ネスト ZIP ツリーナビ状態は必ず take して退避する。snapshot は items を
+        // start_loading_items を通さず差し替えるので、残したままだと snapshot 表示中の
+        // BS が zip_nav_back() に落ちて stale な ZIP 階層を snapshot ビューへ上書き
+        // materialize する (レビュー P2)。at_origin の deactivate で saved_items と
+        // 対で復元する。
+        let saved_zip_nav = self.zip_nav.take();
         // 新 selected がある場合は次フレームで画面内にスクロール (= 表示されたカーソルが
         // 画面外にあるとユーザー視認できないため)。new_selected が None なら scroll_offset_y
         // = 0.0 のままで先頭表示。
@@ -281,6 +287,7 @@ impl App {
             saved_visible_indices,
             saved_scroll_offset_y,
             saved_selected,
+            saved_zip_nav,
             list_view_items,
             list_view_thumbnails,
             pre_snapshot_search_origin,
@@ -416,6 +423,10 @@ impl App {
             self.visible_indices = snap.saved_visible_indices;
             self.scroll_offset_y = snap.saved_scroll_offset_y;
             self.selected = snap.saved_selected;
+            // ネスト ZIP 由来の snapshot: saved_items (= ZIP 階層の items) と対で
+            // ナビ状態も復元する。これをしないと「ZIP items なのに nav なし」になり、
+            // BS が階層を戻らず ZIP ごと抜ける / ZipDir セルの Enter が無反応になる。
+            self.zip_nav = snap.saved_zip_nav;
             // items_generation bump + invalidate (= Codex P1-1)
             // items を saved に戻したので、snapshot 中に走った ThumbMsg / pending が
             // 新 idx 配置に着地して壊さないよう invalidate。merged_thumbnails は
@@ -487,6 +498,13 @@ impl App {
         // fullscreen 中なら閉じる
         if self.fullscreen_idx.is_some() {
             self.close_fullscreen();
+        }
+        // snapshot 内から ZipFile を開いていた場合、その子 ZIP の zip_nav が残っている。
+        // list view は start_loading_items を通さず items を差し替えるので、ここで明示的に
+        // 破棄しないと stale zip_nav が list view 上の BS で旧 ZIP 階層を復活させる
+        // (レビュー P2)。子 ZIP を離れるのでネスト ZIP バイト列キャッシュも合わせて破棄。
+        if self.zip_nav.take().is_some() {
+            crate::zip_loader::clear_nested_cache();
         }
         // items 入れ替え (= 保存したサムネ付き state を復帰)
         self.items = list_items;
@@ -1202,6 +1220,53 @@ mod tests {
         assert!(!app.is_snapshot_active());
         assert_eq!(app.snapshot_count(), None);
         assert!(app.snapshot_origin().is_none());
+    }
+
+    /// ネスト ZIP の本の中で ★固定 → zip_nav は必ず退避 (take) され、at_origin の解除で
+    /// saved_items と対で復元される。残したままだと snapshot 表示中の BS が
+    /// `zip_nav_back()` に落ちて stale な ZIP 階層を snapshot ビューへ上書きする
+    /// (レビュー P2)。
+    #[test]
+    fn activate_parks_zip_nav_and_deactivate_restores_it() {
+        let zip_path = PathBuf::from(r"E:\test\outer.zip");
+        let mut app = test_app_with_items(vec![GridItem::ZipImage {
+            zip_path: zip_path.clone(),
+            entry_name: "bookA/p1.jpg".to_string(),
+        }]);
+        app.current_folder = Some(zip_path.clone());
+
+        let entries = vec![
+            crate::zip_loader::ZipImageEntry {
+                entry_name: "bookA/p1.jpg".to_string(),
+                uncompressed_size: 0,
+                mtime: 0,
+            },
+            crate::zip_loader::ZipImageEntry {
+                entry_name: "bookB/p1.jpg".to_string(),
+                uncompressed_size: 0,
+                mtime: 0,
+            },
+        ];
+        let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
+        let mut nav = crate::zip_tree::ZipNavState::new(tree);
+        nav.enter("bookA/"); // 本の中 (スタック深さ 2)
+        app.zip_nav = Some(nav);
+
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        assert!(
+            app.zip_nav.is_none(),
+            "snapshot 中に zip_nav が残ると BS が ZIP 階層を復活させる"
+        );
+
+        // at_origin (= current_folder 不変) の解除で nav も復元される。
+        app.deactivate_snapshot();
+        assert!(!app.is_snapshot_active());
+        let nav = app.zip_nav.as_ref().expect("saved_zip_nav が復元される");
+        assert!(
+            !nav.at_root(),
+            "退避時のスタック深さ (本の中) ごと復元される"
+        );
     }
 
     #[test]

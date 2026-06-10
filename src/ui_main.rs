@@ -2356,7 +2356,12 @@ impl App {
                                 .hover_tip(parent_hover)
                                 .clicked()
                             {
-                                result = self.resolve_grid_parent_nav();
+                                // BS と同じ優先順位: ネスト ZIP ツリー内なら実フォルダ親へ
+                                // 抜ける前に 1 階層戻る (tooltip も「[BS]」と同挙動を謳って
+                                // いるため。レビュー P3)。ルートでは false → 従来どおり親へ。
+                                if !self.zip_nav_back() {
+                                    result = self.resolve_grid_parent_nav();
+                                }
                             }
                         }
                     }
@@ -3725,9 +3730,10 @@ impl App {
         if !self.get_rotation(idx).is_none() {
             flags.push("回");
         }
-        // 代表サムネピン (ネスト ZIP では本ごとピン Model B に合わせて book キー + ZipEntry)。
+        // 代表サムネピン (ネスト ZIP では本ごとピン Model B: ルート = zip_path /
+        // 本の中 = 実効 prefix の book キー + ZipEntry)。
         if let (Some(pin_container), Some(src)) = (
-            self.spread_container_key(),
+            self.pin_container_key(),
             self.folder_pin_selected_source(idx),
         ) {
             let key = crate::path_key::normalize_keep_drive(&pin_container);
@@ -3951,9 +3957,10 @@ impl App {
                                 // 「pin で表示されているサムネ」と「auto-pick で選ばれたサムネ」を
                                 // 区別させないことで、「badge = 自分が Pin 操作した対象」を 1 対 1
                                 // で対応させる)。
-                                // ネスト ZIP では本ごとピン (Model B): book キー + ZipEntry source。
+                                // ネスト ZIP では本ごとピン (Model B): book キー + ZipEntry source
+                                // (ルート = zip_path / 本の中 = 実効 prefix)。
                                 let has_pin = if let (Some(pin_container), Some(src)) = (
-                                    self.spread_container_key(),
+                                    self.pin_container_key(),
                                     self.folder_pin_selected_source(idx),
                                 ) {
                                     let key = crate::path_key::normalize_keep_drive(&pin_container);

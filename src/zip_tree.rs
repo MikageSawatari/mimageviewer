@@ -249,6 +249,10 @@ fn collect_cache_keys(node: &ZipTreeNode, prefix: &mut Vec<String>, out: &mut Ve
 /// 「論理 prefix を 1 セグメントずつ pop して毎回 collapse し直す」方式の Backspace 罠
 /// (`[] -> 表示 ["vol01"] -> back [] -> 再 collapse ["vol01"]` の無限ループ) を、
 /// 描画した実効 prefix をそのまま積む/pop することで構造的に回避する (Codex P2)。
+///
+/// `Clone` は ★固定 (snapshot) の退避用 (`SnapshotState::saved_zip_nav`)。`tree` は
+/// `Arc` 共有なので clone は stack の浅いコピーだけで済む。
+#[derive(Clone)]
 pub struct ZipNavState {
     /// 開いている外側 ZIP のツリー (列挙完了時に構築、ナビ中は保持)。
     pub tree: Arc<ZipTree>,

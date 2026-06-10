@@ -501,6 +501,14 @@ pub struct SnapshotState {
     pub saved_scroll_offset_y: f32,
     /// snapshot ON 時点の `App.selected` (= 選択中セル idx、復元用)
     pub saved_selected: Option<usize>,
+    /// snapshot ON 時点の `App.zip_nav` (= ネスト ZIP ツリーナビ状態)。
+    ///
+    /// snapshot は items を `start_loading_items` を通さず直接差し替えるため、ここで
+    /// **必ず take して退避**する。残したままだと、snapshot 表示中の BS が
+    /// `zip_nav_back()` に落ちて stale な ZIP 階層を snapshot ビューへ上書き
+    /// materialize してしまう (レビュー P2)。deactivate の at_origin 復元で
+    /// `saved_items` (= ZIP 階層の items) と対で書き戻す。
+    pub saved_zip_nav: Option<crate::zip_tree::ZipNavState>,
 
     // ── snapshot list view 用の固定 state (= BS で復帰したときに使う) ──
     /// snapshot list view を構成する GridItem 一覧 (= snapshot subset の clone)。

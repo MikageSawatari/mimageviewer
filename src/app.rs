@@ -7485,6 +7485,30 @@ impl App {
         }
     }
 
+    /// 代表サムネピン (`folder_thumb_pins`) のコンテナキー。見開きキーとは
+    /// **ルート表示の扱いだけ** 異なる。
+    ///
+    /// ネスト ZIP ツリー閲覧中:
+    /// - **ルート表示 (`at_root`)**: `zip_path` そのもの。ルート本の代表 = 外側 ZIP の
+    ///   代表であり、親フォルダの ZipFile セル (`make_load_request`) は `zip_path` で
+    ///   ピンを引くため。単一ラッパー ZIP (開いた時点で collapse 済み) で
+    ///   `spread_container_key` (= `zip_path\vol01`) を使うと、ピンしても親セルに反映
+    ///   されず、v1.2.x のフラット UI で付けた既存ピン (key=`zip_path`) も解除不能に
+    ///   なる (レビュー P2)。
+    /// - **本の中 (スタック深さ ≥ 2)**: `spread_container_key` と同じ実効 prefix 合成パス。
+    ///   親階層の ZipDir セル側は `refresh_folder_pin_map` が実効 prefix で alias 登録
+    ///   するので一致する。
+    ///
+    /// 通常フォルダは `current_folder`。
+    pub(crate) fn pin_container_key(&self) -> Option<PathBuf> {
+        if let Some(nav) = self.zip_nav.as_ref() {
+            if nav.at_root() {
+                return Some(nav.tree.zip_path.clone());
+            }
+        }
+        self.spread_container_key()
+    }
+
     /// 指定キーの見開きモード / 連結方式 / 綴じ方向を `spread_db` から読み込んで
     /// `self.spread_mode` / `reading_flow` / `reading_direction` に適用する。
     /// 未登録なら settings の既定値。旧 `SpreadMode::Vertical` は「単ページ + 縦連結」に読み替え。
@@ -7492,20 +7516,32 @@ impl App {
     /// `start_loading_items` (フォルダ / 初回 ZIP open) と、ネスト ZIP の階層切替
     /// (`zip_nav_show_current_level` / finalize 後) の両方から呼び、本ごとに設定を復元する。
     pub(crate) fn apply_spread_for_key(&mut self, key: &std::path::Path) {
-        let stored_spread = self
-            .spread_db
-            .as_ref()
+        self.apply_spread_for_key_with_fallback(key, None);
+    }
+
+    /// `apply_spread_for_key` の fallback キー付き版。`key` に保存が無い項目を
+    /// `fallback` キーから読む。ネスト ZIP の本キー (`zip_path\book`) に未保存のとき
+    /// `zip_path` (= v1.2.x フラット時代の保存先 / ZIP 全体の既定) へフォールバックする
+    /// ことで、旧バージョンで保存した単一ラッパー ZIP の見開き設定が collapse 後の
+    /// キーでも生き、ZIP 全体の設定を各本が継承する。本ごとに変更した時点で本キーの
+    /// 行が書かれ、以降は本キーが勝つ (レビュー P2)。
+    pub(crate) fn apply_spread_for_key_with_fallback(
+        &mut self,
+        key: &std::path::Path,
+        fallback: Option<&std::path::Path>,
+    ) {
+        let db = self.spread_db.as_ref();
+        let stored_spread = db
             .and_then(|db| db.get(key))
+            .or_else(|| fallback.and_then(|fb| db.and_then(|db| db.get(fb))))
             .unwrap_or(self.settings.default_spread_mode);
-        self.reading_flow = self
-            .spread_db
-            .as_ref()
+        self.reading_flow = db
             .and_then(|db| db.get_flow(key))
+            .or_else(|| fallback.and_then(|fb| db.and_then(|db| db.get_flow(fb))))
             .unwrap_or(self.settings.default_reading_flow);
-        self.reading_direction = self
-            .spread_db
-            .as_ref()
+        self.reading_direction = db
             .and_then(|db| db.get_direction(key))
+            .or_else(|| fallback.and_then(|fb| db.and_then(|db| db.get_direction(fb))))
             .unwrap_or(self.settings.default_reading_direction);
         if stored_spread == crate::settings::SpreadMode::Vertical {
             self.spread_mode = crate::settings::SpreadMode::Single;
@@ -9369,20 +9405,39 @@ impl App {
             tree.all_cache_keys().into_iter().collect();
         // 本ごとピン (Model B) の代表サムネは zipdir:{prefix}#pin:{entry} キーで保存される。
         // base の zipdir:{prefix} しか existing に無いと delete_missing が pinned 行を毎回
-        // 消して再生成になる (Codex P2)。全 ZipDir の book key を pin DB で引き、pinned
-        // cache key も存続キーに含める。
+        // 消して再生成になる (Codex P2)。pinned cache key も存続キーに含める。
+        // - DB キーは「set 側 = nav スタックの実効 prefix」なので、literal prefix を
+        //   `collapse_redundant` で実効 prefix に解決してから引く (単一ラッパー本の
+        //   set/lookup キー不一致の根治、レビュー P2)。cache key 側は literal のまま
+        //   (= `make_load_request` の `zipdir_cache_key(dir_prefix)` と一致させる)。
+        // - lookup は `lookup_many` 1 回に束ねる。per-dir の逐次 SQLite lookup は UI
+        //   スレッドで dirs 数に比例してブロックする (レビュー P3)。
         if let Some(pin_db) = self.folder_thumb_pin_db.as_ref() {
-            let pinned: Vec<String> = existing_keys
+            let dir_keys: Vec<(String, PathBuf)> = existing_keys
                 .iter()
                 .filter_map(|k| k.strip_prefix("zipdir:").map(|p| p.to_string()))
-                .filter_map(|prefix| {
-                    let book_key = book_container_key(&tree.zip_path, &prefix);
-                    match pin_db.lookup(&book_key) {
+                .map(|prefix| {
+                    let segs: Vec<String> = prefix
+                        .split('/')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect();
+                    let effective = tree.collapse_redundant(&segs);
+                    let book_key = book_container_key_from_segs(&tree.zip_path, &effective);
+                    (prefix, book_key)
+                })
+                .collect();
+            let pin_map = pin_db.lookup_many(dir_keys.iter().map(|(_, k)| k.clone()));
+            let pinned: Vec<String> = dir_keys
+                .iter()
+                .filter_map(|(prefix, book_key)| {
+                    let norm = crate::path_key::normalize_keep_drive(book_key);
+                    match pin_map.get(&norm) {
                         Some(crate::folder_thumb_pins::FolderPinSource::ZipEntry {
                             entry, ..
                         }) => Some(format!(
                             "{}{}{}",
-                            crate::grid_item::zipdir_cache_key(&prefix),
+                            crate::grid_item::zipdir_cache_key(prefix),
                             crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
                             entry
                         )),
@@ -9409,8 +9464,10 @@ impl App {
         self.update_zip_nav_address();
         // ルート本の見開き設定を本ごとのキー (zip_path + 実効 prefix) で読み直す。
         // start_loading_items は zip_path キーで読んだので、ここで上書きする。
+        // 本キーに未保存の項目は zip_path キーへフォールバック (v1.2.x 保存分の互換)。
         if let Some(key) = self.spread_container_key() {
-            self.apply_spread_for_key(&key);
+            let fb = self.zip_nav.as_ref().map(|nav| nav.tree.zip_path.clone());
+            self.apply_spread_for_key_with_fallback(&key, fb.as_deref());
         }
 
         // Ctrl+↑↓ フォルダナビから fullscreen で ZIP に遷移してきた場合、items が
@@ -9466,10 +9523,58 @@ impl App {
         if let Some(pending) = self.metadata_pending.take() {
             pending.cancel();
         }
+        // Loaded 済みサムネを content key で確保しておき、install 後に新 idx へ転送する
+        // (Ctrl+G `replace_search_view_items` の thumb_reuse_key と同じ発想、レビュー P3)。
+        // enter/back は新旧レベルの item が交わらないため実質 no-op だが、**同一階層の
+        // 再 materialize (ソート変更 / ピン dirty 再表示)** では同じ item が並び替わる
+        // だけなので、全 Pending リセットによる一瞬のプレースホルダフラッシュを防げる。
+        // zip_path は同一なので key は ZipImage = entry_name / ZipDir = dir_prefix で
+        // 足りる (末尾 '/' の有無で衝突しない)。補正対象の source pixels も同じ key で
+        // 移す (Ctrl+G と同様、補正済み tex は再生成)。
+        let preserved: std::collections::HashMap<String, crate::grid_item::ThumbnailState> = self
+            .items
+            .iter()
+            .zip(self.thumbnails.iter())
+            .filter_map(|(it, st)| match st {
+                crate::grid_item::ThumbnailState::Loaded { .. } => {
+                    zip_level_thumb_reuse_key(it).map(|k| (k, st.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let preserved_thumb_pixels: std::collections::HashMap<String, Arc<egui::ColorImage>> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| {
+                self.thumb_pixels
+                    .get(&i)
+                    .cloned()
+                    .and_then(|pixels| zip_level_thumb_reuse_key(it).map(|k| (k, pixels)))
+            })
+            .collect();
         // items / image_metas / thumbnails 差し替え + items_generation bump。
         self.install_new_items(items, metas);
         // idx ベース状態 + in-flight キューを破棄 (replace_search_view_items / snapshot と同じ)。
         self.invalidate_idx_state_and_queues();
+        // 確保しておいた Loaded サムネを新 idx に転送 (invalidate の後 = thumb_pixels が
+        // clear された後)。Loaded のままなら upload backlog に乗らず同一フレームで前回の
+        // テクスチャが見え続けるのでちらつかない。
+        if !preserved.is_empty() {
+            for i in 0..self.items.len() {
+                let Some(key) = zip_level_thumb_reuse_key(&self.items[i]) else {
+                    continue;
+                };
+                if let Some(state) = preserved.get(&key) {
+                    self.thumbnails[i] = state.clone();
+                    if is_thumb_adjust_target(Some(&self.items[i])) {
+                        if let Some(pixels) = preserved_thumb_pixels.get(&key) {
+                            self.thumb_pixels.insert(i, Arc::clone(pixels));
+                        }
+                    }
+                }
+            }
+        }
         // idx-keyed ページ編集状態 (補正 / ローカル調整 / 最終段 crop / 消しゴム / 隠蔽) を
         // clear して、新レベルの entry に対し DB から再 hydrate する。entry_name キーで引くので
         // 階層が変わっても各ページの保存済み補正・マスクが正しく載り、旧 idx の編集が別 entry に
@@ -9503,9 +9608,11 @@ impl App {
         self.update_zip_nav_address();
         // 入った本 (= 現在の階層) の見開き設定を本ごとのキーで読み直す。これで BS 戻り /
         // Ctrl+↓ 等どの経路で本を切り替えても、その本の見開き向き / 連結方向が一貫して
-        // 復元される (ユーザー要望: 本ごとに独立記憶)。
+        // 復元される (ユーザー要望: 本ごとに独立記憶)。本キーに未保存の項目は zip_path
+        // キーへフォールバック (v1.2.x 保存分の互換 + ZIP 全体設定の継承)。
         if let Some(key) = self.spread_container_key() {
-            self.apply_spread_for_key(&key);
+            let fb = self.zip_nav.as_ref().map(|nav| nav.tree.zip_path.clone());
+            self.apply_spread_for_key_with_fallback(&key, fb.as_deref());
         }
     }
 
@@ -9550,14 +9657,36 @@ impl App {
 
     /// ZIP 階層を 1 段戻る。戻れたら `true`、ルート (スタック底) なら `false`
     /// (= 呼び出し側が ZIP を抜けて実フォルダ親へ遷移する)。
+    ///
+    /// 戻った後、出てきた本の ZipDir セルを選択して「どの本から出たか」を示す
+    /// (BS で実フォルダ親へ抜けたとき `select_after_load` が ZIP を選ぶのと同じ慣習、
+    /// レビュー P3)。collapse で深く降りていた本でも、セルの literal prefix は
+    /// 出てきた実効 prefix の先頭部分に一致するので前方一致で探せる。
     pub(crate) fn zip_nav_back(&mut self) -> bool {
-        let Some(nav) = self.zip_nav.as_mut() else {
-            return false;
+        let left = {
+            let Some(nav) = self.zip_nav.as_mut() else {
+                return false;
+            };
+            let left: Vec<String> = nav.current().to_vec();
+            if !nav.back() {
+                return false;
+            }
+            left
         };
-        if !nav.back() {
-            return false;
-        }
         self.zip_nav_show_current_level();
+        let target = self.items.iter().position(|it| match it {
+            GridItem::ZipDir { dir_prefix, .. } => {
+                let segs: Vec<&str> = dir_prefix.split('/').filter(|s| !s.is_empty()).collect();
+                !segs.is_empty()
+                    && segs.len() <= left.len()
+                    && segs.iter().zip(left.iter()).all(|(a, b)| *a == b.as_str())
+            }
+            _ => false,
+        });
+        if let Some(idx) = target {
+            self.selected = Some(idx);
+            self.scroll_to_selected = true;
+        }
         true
     }
 
@@ -9590,6 +9719,7 @@ impl App {
 
     /// フルスクリーン中の Ctrl+↑↓ 本またぎ移動 (#4)。兄弟本へ移って、その本の先頭画像を
     /// フルスクリーンで開く。端 (兄弟なし) では何もしない (= ZIP を抜けずその場に留まる)。
+    /// 戻り値は「兄弟本へ移動したか」(スライドショー next-folder の分岐用)。
     ///
     /// ⚠ holdover キャプチャ (`capture_fs_nav_holdover`) は **移動が確定してから**行う。
     /// holdover は `fs_nav_locked_gen = items_generation` を立て、`poll_fs_nav_lock` は
@@ -9597,7 +9727,7 @@ impl App {
     /// 変わらず lock が永久に残り、以降のフルスクリーン Ctrl+↑↓ が無視される (Codex P1)。
     /// `sibling()` は nav スタックのみ変更し items は触らないので、移動確定後
     /// `zip_nav_show_current_level` の前に capture すれば旧ページの holdover を正しく取れる。
-    pub(crate) fn zip_nav_sibling_fullscreen(&mut self, fs_idx: usize, forward: bool) {
+    pub(crate) fn zip_nav_sibling_fullscreen(&mut self, fs_idx: usize, forward: bool) -> bool {
         let sort = self.settings.sort_order;
         let moved = self
             .zip_nav
@@ -9605,7 +9735,7 @@ impl App {
             .map(|n| n.sibling(forward, sort))
             .unwrap_or(false);
         if !moved {
-            return;
+            return false;
         }
         // 移動確定 → holdover を取ってから items を差し替える。
         self.capture_fs_nav_holdover(fs_idx);
@@ -9617,7 +9747,21 @@ impl App {
             self.selected = Some(new_idx);
             self.scroll_to_selected = true;
             self.update_last_selected_image();
+        } else {
+            // 移動先の本に直下画像が無い (子コンテナだけの分岐ノード / レーティング
+            // フィルタで全 hidden)。open_fullscreen に到達しないまま放置すると、
+            // ① 旧 fs_idx が新 items の範囲外なら poll_fs_nav_lock の解除条件
+            //    (thumbnails[idx] Loaded / fs_cache) に永遠に達せず holdover lock が
+            //    残留して以降の Ctrl+↑↓ が全部無視される、
+            // ② 範囲内なら ZipDir セルをフルスクリーン表示してしまう (レビュー P1)。
+            // lock を明示解放してフルスクリーンを閉じ、グリッドに本一覧を見せる
+            // (= グリッド側 Ctrl+↓ でこの本へ移動したときと同じ着地)。
+            self.release_fs_nav_lock();
+            self.slideshow_playing = false;
+            self.slideshow_anchor_idx = None;
+            self.close_fullscreen();
         }
+        true
     }
 
     /// PDF ファイルを仮想フォルダとして開く (非同期)。
@@ -11589,32 +11733,56 @@ impl App {
         };
         // 所有権付き PathBuf で集める (ZipDir の本キーは合成パスで借用できないため)。
         // lookup_many が内部で重複除去するので manual dedup は不要。
-        let mut container_paths: Vec<PathBuf> = self
-            .items
-            .iter()
-            .filter_map(|it| match it {
+        let mut container_paths: Vec<PathBuf> = Vec::with_capacity(self.items.len() + 2);
+        // ZipDir セルのピンは「本の中で set した実効 prefix キー」(`pin_container_key`)
+        // に保存されるが、`make_load_request` は cell の literal prefix から作った
+        // book key で folder_pin_map を引く。単一ラッパー本では両者がずれる
+        // (literal "bookB/" vs 実効 "bookB/inner/") ので、実効キーで DB を引いた結果を
+        // literal キーへ **alias 登録**して一致させる (レビュー P2: set/lookup キー不一致の根治)。
+        let mut zipdir_aliases: Vec<(String, String)> = Vec::new(); // (literal, effective) 正規化済み
+        for it in self.items.iter() {
+            match it {
                 GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
-                    Some(p.clone())
+                    container_paths.push(p.clone());
                 }
-                // ネスト ZIP の子コンテナ (本) は zip_path + dir_prefix の合成キーでピンを引く。
                 GridItem::ZipDir {
                     zip_path,
                     dir_prefix,
                     ..
-                } => Some(book_container_key(zip_path, dir_prefix)),
-                _ => None,
-            })
-            .collect();
+                } => {
+                    let literal = book_container_key(zip_path, dir_prefix);
+                    let effective_key = if let Some(nav) = self.zip_nav.as_ref() {
+                        let segs: Vec<String> = dir_prefix
+                            .split('/')
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                            .collect();
+                        let effective = nav.tree.collapse_redundant(&segs);
+                        book_container_key_from_segs(zip_path, &effective)
+                    } else {
+                        literal.clone()
+                    };
+                    let lit_norm = crate::path_key::normalize_keep_drive(&literal);
+                    let eff_norm = crate::path_key::normalize_keep_drive(&effective_key);
+                    if lit_norm != eff_norm {
+                        zipdir_aliases.push((lit_norm, eff_norm));
+                    }
+                    container_paths.push(effective_key);
+                }
+                _ => {}
+            }
+        }
         // current_folder 自身も lookup 対象に含める (検索合成パス / アグリゲートビューは除外)。
         if let Some(cur) = self.current_folder.as_ref() {
             if *cur != search_results_synthetic_path() && !self.items_are_global_search_view {
                 container_paths.push(cur.clone());
             }
         }
-        // ネスト ZIP 閲覧中は「現在の本」のキー (zip_path + 実効 prefix) も含める。
-        // 本の中で P を押したときの「既にピン済みか」判定 (folder_thumb_pin_for) 用。
+        // ネスト ZIP 閲覧中は「現在の本」のピンキーも含める (P トグル / 📌 ボタン /
+        // 「ピ」バッジの folder_thumb_pin_for 判定用)。ルート表示では zip_path
+        // (= 外側 ZIP の代表キー、v1.2.x 互換)。
         if self.zip_nav.is_some() {
-            if let Some(book_key) = self.spread_container_key() {
+            if let Some(book_key) = self.pin_container_key() {
                 container_paths.push(book_key);
             }
         }
@@ -11622,6 +11790,13 @@ impl App {
             return;
         }
         self.folder_pin_map = db.lookup_many(container_paths);
+        // 実効キーで見つかったピンを literal キーでも引けるように alias を張る
+        // (make_load_request 側は literal キーで get する)。
+        for (lit_norm, eff_norm) in zipdir_aliases {
+            if let Some(pin) = self.folder_pin_map.get(&eff_norm).cloned() {
+                self.folder_pin_map.insert(lit_norm, pin);
+            }
+        }
     }
 
     fn should_force_cache_for_drive_list_pin(&self, item: &GridItem) -> bool {
@@ -11761,10 +11936,11 @@ impl App {
         if self.archive_source_override.is_some() {
             return None;
         }
-        // ピン対象コンテナ: ネスト ZIP では本キー (zip_path+階層)、通常は current_folder。
-        // P キー (toggle_folder_pin_for_idx) と同じ対象を見て highlight/tooltip を一致させる。
+        // ピン対象コンテナ: ネスト ZIP では本キー (ルート = zip_path / 本の中 = zip_path+階層)、
+        // 通常は current_folder。P キー (toggle_folder_pin_for_idx) と同じ対象を見て
+        // highlight/tooltip を一致させる。
         let pin_container = self
-            .spread_container_key()
+            .pin_container_key()
             .unwrap_or_else(|| container.clone());
         // 既存 pin (もしあれば) を引いておく
         let existing_pin = self.folder_thumb_pin_for(&pin_container).cloned();
@@ -11865,7 +12041,9 @@ impl App {
         if self.zip_nav.is_some() {
             match self.items.get(idx).cloned() {
                 Some(GridItem::ZipImage { entry_name, .. }) => {
-                    let Some(book_key) = self.spread_container_key() else {
+                    // ルート表示では zip_path キー (= 外側 ZIP の代表、v1.2.x のフラット UI で
+                    // 付けたピンと互換)。本の中では実効 prefix の本キー。
+                    let Some(book_key) = self.pin_container_key() else {
                         return;
                     };
                     let source = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
@@ -12055,11 +12233,11 @@ impl App {
 
     /// アドレスバー 📌 ボタンの右クリック / コンテキストメニューの「解除」ハンドラ。
     pub(crate) fn remove_folder_pin_for_current_container(&mut self) {
-        // ネスト ZIP では本キー (spread_container_key) のピンを解除する。📌 ボタン状態が
-        // 本キーを見ているので、右クリック解除も同じキーにしないと外側 ZIP を消してしまう
-        // (Codex P2)。
+        // ネスト ZIP では本キー (pin_container_key: ルート = zip_path / 本の中 = 実効 prefix)
+        // のピンを解除する。📌 ボタン状態が本キーを見ているので、右クリック解除も同じ
+        // キーにしないとずれる (Codex P2)。
         let in_zip = self.zip_nav.is_some();
-        let Some(container) = self.spread_container_key() else {
+        let Some(container) = self.pin_container_key() else {
             return;
         };
         self.remove_folder_thumb_pin(&container);
@@ -12120,7 +12298,7 @@ impl App {
         let (pin_container, source) = if self.zip_nav.is_some() {
             match item {
                 GridItem::ZipImage { entry_name, .. } => {
-                    let Some(bk) = self.spread_container_key() else {
+                    let Some(bk) = self.pin_container_key() else {
                         return false;
                     };
                     (
@@ -16683,6 +16861,15 @@ impl App {
     /// 画像本のページのみ対象。dedup 付きで連続ページ送り中の重複書き込みを抑える。
     pub(crate) fn record_book_resume(&mut self, idx: usize) {
         if !self.is_book_page_idx(idx) {
+            return;
+        }
+        // ネスト ZIP の本の中 (スタック深さ ≥ 2) では記録しない: ここでの idx は
+        // 「現在の階層」ローカルだが、resume_page_for_container は再オープン時の
+        // ルート階層 items に対して idx を検証するため、同 idx の別アイテムに誤って
+        // 「続きから」着地し得る (レビュー P3)。ルート表示 (フラット ZIP / collapse 済み
+        // 単一ラッパー) は再オープン時と同じ階層が materialize されるので従来どおり記録する。
+        // 深い階層への cross-book resume は将来課題 (docs/nested-zip-tree-plan.md §14)。
+        if self.zip_nav.as_ref().is_some_and(|n| !n.at_root()) {
             return;
         }
         let Some(folder) = self.current_folder.clone() else {
@@ -31456,6 +31643,27 @@ fn book_container_key(zip_path: &std::path::Path, dir_prefix: &str) -> PathBuf {
         p.push(seg);
     }
     p
+}
+
+/// `book_container_key` のセグメント列版 (`collapse_redundant` の実効 prefix から作る)。
+fn book_container_key_from_segs(zip_path: &std::path::Path, segs: &[String]) -> PathBuf {
+    let mut p = zip_path.to_path_buf();
+    for seg in segs {
+        p.push(seg);
+    }
+    p
+}
+
+/// ネスト ZIP の階層 re-materialize (`zip_nav_show_current_level`) でサムネを使い回す
+/// ための content key。同一 ZIP 内の移動専用なので zip_path は含めない。
+/// ZipImage は entry_name (フルパス)、ZipDir は dir_prefix (末尾 '/' 付き) で、
+/// 両者は末尾 '/' の有無により衝突しない。
+fn zip_level_thumb_reuse_key(item: &GridItem) -> Option<String> {
+    match item {
+        GridItem::ZipImage { entry_name, .. } => Some(entry_name.clone()),
+        GridItem::ZipDir { dir_prefix, .. } => Some(dir_prefix.clone()),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
