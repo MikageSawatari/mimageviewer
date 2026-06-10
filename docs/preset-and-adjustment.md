@@ -383,7 +383,10 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
 - **UI**: 補正パネルのポストフィルタの上に `シャープ化 0..=100` の 1 本スライダー。
   詳細パラメータ (半径 / 輪郭しきい値 / ハロー抑制) は出さない。
 - **内部マッピング**: `adjustment::smart_sharpen_params_for_strength` が強度から
-  `local_adjust_core::SmartSharpenParams` を生成 (アンカー 0/30/60/100 の線形補間)。
+  `local_adjust_core::SmartSharpenParams` を生成 (アンカー 0/25/50/75/100 の線形補間。
+  100 = amount 2.0 / 半径 3.0 = 計算式の clamp 上限。当初は 30/60/100 配置で最大
+  amount 1.25 だったが控えめだったため、未リリースのうちに上へ拡張した。
+  目安: 25 弱め / 50 標準 / 75 強め / 100 最大)。
   本体は `local_adjust_core::apply_smart_sharpen_rgba` (補正レイヤーの
   `LocalEffect::SmartSharpen` と同じ計算式、rayon 行並列、radius は 3.0 に clamp)。
 - **AI アップスケール実行時のスキップ (固定動作、設定なし)**:

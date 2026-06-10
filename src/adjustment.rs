@@ -477,14 +477,21 @@ pub fn pixel_lum_f32(c: egui::Color32) -> f32 {
 
 /// 強度スライダー (0..=100) → `SmartSharpenParams` の補間アンカー。
 /// (strength, amount, radius_px, edge_threshold, halo_suppression)。
-/// strength 0 のアンカーは 1..30 の補間起点 (amount のみ 0 へ漸減) で、
+/// strength 0 のアンカーは 1..25 の補間起点 (amount のみ 0 へ漸減) で、
 /// strength == 0 自体は OFF (`smart_sharpen_params_for_strength` が None)。
-/// 数値の出所は docs/final-smart-sharpen-plan.md の内部パラメータ案。
-const SMART_SHARPEN_ANCHORS: [(f32, f32, f32, f32, f32); 4] = [
+/// 数値の出所は docs/final-smart-sharpen-plan.md の内部パラメータ案 (当初は
+/// 30/60/100 に配置)。最大 100 が控えめだったため、未リリースのうちに
+/// 旧アンカーを 25/50/75 へ詰めて 100 = 計算式上限 (amount 2.0 / 半径 3.0、
+/// `apply_smart_sharpen_rgba` の clamp 値) まで拡張した (2026-06-10 ユーザー要望。
+/// 0-255 案は「255 基準は画素値そのものを表す黒点/白点専用」のため不採用)。
+/// ハロー抑制は高強度側でも高く保つ (緩めるとフチ浮きが復活してアンシャープ
+/// マスクとの差別化が消えるため)。
+const SMART_SHARPEN_ANCHORS: [(f32, f32, f32, f32, f32); 5] = [
     (0.0, 0.0, 0.80, 0.06, 0.45),
-    (30.0, 0.40, 0.80, 0.06, 0.45),
-    (60.0, 0.80, 1.20, 0.08, 0.60),
-    (100.0, 1.25, 1.60, 0.11, 0.78),
+    (25.0, 0.40, 0.80, 0.06, 0.45),
+    (50.0, 0.80, 1.20, 0.08, 0.60),
+    (75.0, 1.25, 1.60, 0.11, 0.78),
+    (100.0, 2.0, 3.0, 0.12, 0.80),
 ];
 
 /// 1 本スライダーの強度 (0..=100) からスマートシャープの内部パラメータを生成する。
@@ -1029,29 +1036,38 @@ mod tests {
     fn smart_sharpen_strength_mapping_anchors() {
         assert!(smart_sharpen_params_for_strength(0).is_none());
 
-        let p30 = smart_sharpen_params_for_strength(30).unwrap();
-        assert!((p30.amount - 0.40).abs() < 1e-5);
-        assert!((p30.radius_px - 0.80).abs() < 1e-5);
-        assert!((p30.edge_threshold - 0.06).abs() < 1e-5);
-        assert!((p30.halo_suppression - 0.45).abs() < 1e-5);
+        let p25 = smart_sharpen_params_for_strength(25).unwrap();
+        assert!((p25.amount - 0.40).abs() < 1e-5);
+        assert!((p25.radius_px - 0.80).abs() < 1e-5);
+        assert!((p25.edge_threshold - 0.06).abs() < 1e-5);
+        assert!((p25.halo_suppression - 0.45).abs() < 1e-5);
 
-        let p60 = smart_sharpen_params_for_strength(60).unwrap();
-        assert!((p60.amount - 0.80).abs() < 1e-5);
-        assert!((p60.radius_px - 1.20).abs() < 1e-5);
+        let p50 = smart_sharpen_params_for_strength(50).unwrap();
+        assert!((p50.amount - 0.80).abs() < 1e-5);
+        assert!((p50.radius_px - 1.20).abs() < 1e-5);
 
+        let p75 = smart_sharpen_params_for_strength(75).unwrap();
+        assert!((p75.amount - 1.25).abs() < 1e-5);
+        assert!((p75.radius_px - 1.60).abs() < 1e-5);
+        assert!((p75.edge_threshold - 0.11).abs() < 1e-5);
+        assert!((p75.halo_suppression - 0.78).abs() < 1e-5);
+
+        // 100 = 計算式上限 (apply_smart_sharpen_rgba の clamp 値と一致)
         let p100 = smart_sharpen_params_for_strength(100).unwrap();
-        assert!((p100.amount - 1.25).abs() < 1e-5);
-        assert!((p100.radius_px - 1.60).abs() < 1e-5);
-        assert!((p100.edge_threshold - 0.11).abs() < 1e-5);
-        assert!((p100.halo_suppression - 0.78).abs() < 1e-5);
+        assert!((p100.amount - 2.0).abs() < 1e-5);
+        assert!((p100.radius_px - 3.0).abs() < 1e-5);
+        assert!((p100.edge_threshold - 0.12).abs() < 1e-5);
+        assert!((p100.halo_suppression - 0.80).abs() < 1e-5);
 
         // 100 超の入力 (将来の互換用) は 100 と同じ。
         let p255 = smart_sharpen_params_for_strength(255).unwrap();
         assert_eq!(p255, p100);
 
         // アンカー間は単調増加 (中間値が区間内にある)。
-        let p45 = smart_sharpen_params_for_strength(45).unwrap();
-        assert!(p45.amount > p30.amount && p45.amount < p60.amount);
+        let p40 = smart_sharpen_params_for_strength(40).unwrap();
+        assert!(p40.amount > p25.amount && p40.amount < p50.amount);
+        let p85 = smart_sharpen_params_for_strength(85).unwrap();
+        assert!(p85.amount > p75.amount && p85.amount < p100.amount);
     }
 
     #[test]
