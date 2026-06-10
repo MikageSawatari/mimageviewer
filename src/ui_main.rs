@@ -3601,7 +3601,7 @@ impl App {
                 (size_text, format_details_mtime(mtime))
             })
             .unwrap_or_else(|| (String::new(), String::new()));
-        let state_text = self.details_state_text(idx, &item);
+        let state_text = self.details_state_text(idx);
 
         for (col, col_rect) in details_column_rects(rect, &self.settings) {
             match col {
@@ -3705,7 +3705,7 @@ impl App {
         }
     }
 
-    fn details_state_text(&mut self, idx: usize, item: &GridItem) -> String {
+    fn details_state_text(&mut self, idx: usize) -> String {
         let mut flags = Vec::new();
         if self.adjustment_page_params.contains_key(&idx) {
             flags.push("補");
@@ -3725,11 +3725,13 @@ impl App {
         if !self.get_rotation(idx).is_none() {
             flags.push("回");
         }
-        if let Some(cur) = self.current_folder.as_ref() {
-            let cur_key = crate::path_key::normalize_keep_drive(cur);
-            if self.folder_pin_map.get(&cur_key).is_some_and(|pin_src| {
-                crate::folder_thumb_pins::source_from_grid_item(cur, item).as_ref() == Some(pin_src)
-            }) {
+        // 代表サムネピン (ネスト ZIP では本ごとピン Model B に合わせて book キー + ZipEntry)。
+        if let (Some(pin_container), Some(src)) = (
+            self.spread_container_key(),
+            self.folder_pin_selected_source(idx),
+        ) {
+            let key = crate::path_key::normalize_keep_drive(&pin_container);
+            if self.folder_pin_map.get(&key) == Some(&src) {
                 flags.push("ピ");
             }
         }
@@ -3949,16 +3951,13 @@ impl App {
                                 // 「pin で表示されているサムネ」と「auto-pick で選ばれたサムネ」を
                                 // 区別させないことで、「badge = 自分が Pin 操作した対象」を 1 対 1
                                 // で対応させる)。
-                                let has_pin = if let Some(cur) = self.current_folder.as_ref() {
-                                    let cur_key = crate::path_key::normalize_keep_drive(cur);
-                                    self.folder_pin_map.get(&cur_key).is_some_and(|pin_src| {
-                                        crate::folder_thumb_pins::source_from_grid_item(
-                                            cur,
-                                            &self.items[idx],
-                                        )
-                                        .as_ref()
-                                            == Some(pin_src)
-                                    })
+                                // ネスト ZIP では本ごとピン (Model B): book キー + ZipEntry source。
+                                let has_pin = if let (Some(pin_container), Some(src)) = (
+                                    self.spread_container_key(),
+                                    self.folder_pin_selected_source(idx),
+                                ) {
+                                    let key = crate::path_key::normalize_keep_drive(&pin_container);
+                                    self.folder_pin_map.get(&key) == Some(&src)
                                 } else {
                                     false
                                 };

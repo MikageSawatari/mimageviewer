@@ -11667,6 +11667,31 @@ impl App {
         self.folder_pin_map.get(&key)
     }
 
+    /// 選択中アイテムを代表サムネにピンするときの `source`。ネスト ZIP ツリー閲覧中は
+    /// 「本ごとピン」(Model B) に合わせ、ZipImage を ZipEntry source にする (ZipDir/その他は
+    /// 本の中では不可 → None)。通常フォルダは `source_from_grid_item(current_folder, item)`。
+    /// ピン対象コンテナは `spread_container_key()` (zip 内は本キー、通常は current_folder)。
+    /// 📌 ボタン状態 / コンテキストメニュー / グリッドバッジで P キーと同じ判定を共有する。
+    pub(crate) fn folder_pin_selected_source(
+        &self,
+        idx: usize,
+    ) -> Option<crate::folder_thumb_pins::FolderPinSource> {
+        let item = self.items.get(idx)?;
+        if self.zip_nav.is_some() {
+            return match item {
+                GridItem::ZipImage { entry_name, .. } => {
+                    Some(crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                        zip_rel: String::new(),
+                        entry: entry_name.clone(),
+                    })
+                }
+                _ => None,
+            };
+        }
+        let container = self.current_folder.as_ref()?;
+        crate::folder_thumb_pins::source_from_grid_item(container, item)
+    }
+
     /// アドレスバー 📌 ボタンの表示状態を算出する (UI 描画から呼ばれる)。
     ///
     /// 返り値:
@@ -11695,8 +11720,13 @@ impl App {
         if self.archive_source_override.is_some() {
             return None;
         }
+        // ピン対象コンテナ: ネスト ZIP では本キー (zip_path+階層)、通常は current_folder。
+        // P キー (toggle_folder_pin_for_idx) と同じ対象を見て highlight/tooltip を一致させる。
+        let pin_container = self
+            .spread_container_key()
+            .unwrap_or_else(|| container.clone());
         // 既存 pin (もしあれば) を引いておく
-        let existing_pin = self.folder_thumb_pin_for(container).cloned();
+        let existing_pin = self.folder_thumb_pin_for(&pin_container).cloned();
         // 空フォルダ (= ピン可能なアイテムが 1 つも無い) で、なおかつ既存 pin も無い場合は
         // ボタン自体を隠す (Codex 最終レビュー P3 指摘: 「空フォルダは対象外」の
         // ドキュメント記述と挙動を揃える)。既存 pin がある場合は「右クリックで解除」を
@@ -11704,11 +11734,11 @@ impl App {
         if self.items.is_empty() && existing_pin.is_none() {
             return None;
         }
-        // 選択中アイテムから source を組み立てる (= 「左クリックで何を pin するか」)
+        // 選択中アイテムから source を組み立てる (= 「左クリックで何を pin するか」)。
+        // ネスト ZIP では本ごとピン (Model B) に合わせた source を使う。
         let selected_source: Option<crate::folder_thumb_pins::FolderPinSource> = self
             .selected
-            .and_then(|i| self.items.get(i))
-            .and_then(|item| crate::folder_thumb_pins::source_from_grid_item(container, item));
+            .and_then(|i| self.folder_pin_selected_source(i));
 
         let selected_item = self.selected.and_then(|i| self.items.get(i));
         let is_convertible = matches!(selected_item, Some(GridItem::ConvertibleArchive { .. }));
@@ -12031,11 +12061,33 @@ impl App {
                 .on_hover_text("変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)");
             return false;
         }
-        let Some(source) = crate::folder_thumb_pins::source_from_grid_item(&container, item) else {
-            // rel が空 (= container 自身を指している) などの理由で source 取れず → skip
-            return false;
+        // ピン対象コンテナ / source。ネスト ZIP では本ごとピン (Model B、P キーと一致)。
+        let (pin_container, source) = if self.zip_nav.is_some() {
+            match item {
+                GridItem::ZipImage { entry_name, .. } => {
+                    let Some(bk) = self.spread_container_key() else {
+                        return false;
+                    };
+                    (
+                        bk,
+                        crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                            zip_rel: String::new(),
+                            entry: entry_name.clone(),
+                        },
+                    )
+                }
+                // ZipDir / その他は本の中では menu からはピンしない (本を開いて画像で P)。
+                _ => return false,
+            }
+        } else {
+            let Some(source) = crate::folder_thumb_pins::source_from_grid_item(&container, item)
+            else {
+                // rel が空 (= container 自身を指している) などの理由で source 取れず → skip
+                return false;
+            };
+            (container.clone(), source)
         };
-        let existing = self.folder_thumb_pin_for(&container).cloned();
+        let existing = self.folder_thumb_pin_for(&pin_container).cloned();
         let is_current = existing.as_ref() == Some(&source);
         let label = if is_current {
             "📌 代表サムネ固定を解除"
@@ -12044,10 +12096,16 @@ impl App {
         };
         ui.separator();
         if ui.button(label).clicked() {
+            let in_zip = self.zip_nav.is_some();
             if is_current {
-                self.remove_folder_thumb_pin(&container);
+                self.remove_folder_thumb_pin(&pin_container);
             } else {
-                self.try_set_folder_thumb_pin_with_video_guard(&container, source);
+                self.try_set_folder_thumb_pin_with_video_guard(&pin_container, source);
+            }
+            // 本の中では対象セルが親階層にあり現ビューに無いので、再 materialize (scroll
+            // リセット) は不要。dirty を消して読書位置を保つ (親へ戻れば refresh が拾う)。
+            if in_zip {
+                self.folder_thumb_pin_dirty = false;
             }
             return true;
         }
