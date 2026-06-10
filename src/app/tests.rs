@@ -4646,6 +4646,47 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.spread_container_key(), Some(zip_path.join("bookA")));
     }
 
+    /// 変換キャッシュ閲覧中の選択情報パス: ZIP 内アイテムのコンテナ部分が
+    /// archive_cache の実体パスではなくユーザー視点の元アーカイブになる
+    /// (実機フィードバック: ツールチップにキャッシュパスが漏れていた)。
+    #[test]
+    fn user_facing_display_path_swaps_cache_zip_for_source_archive() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let cache = std::path::PathBuf::from(r"C:\Users\x\AppData\Roaming\miv\ac\ab\book.zip");
+        let src = std::path::PathBuf::from(r"C:\books\nested_rar_test.rar");
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(src.clone());
+
+        let img = GridItem::ZipImage {
+            zip_path: cache.clone(),
+            entry_name: "inner.rar/p1.png".to_string(),
+        };
+        assert_eq!(
+            app.user_facing_display_path(&img),
+            format!("{}:inner.rar/p1.png", src.display())
+        );
+        let dir = GridItem::ZipDir {
+            zip_path: cache.clone(),
+            dir_prefix: "inner.rar/".to_string(),
+            is_archive: true,
+            representative: None,
+        };
+        assert_eq!(
+            app.user_facing_display_path(&dir),
+            format!("{}:inner.rar/", src.display())
+        );
+        // 別 ZIP のアイテム (current_folder と不一致) は置き換えない。
+        let other = GridItem::ZipImage {
+            zip_path: std::path::PathBuf::from(r"C:\other.zip"),
+            entry_name: "a.png".to_string(),
+        };
+        assert_eq!(app.user_facing_display_path(&other), other.display_path());
+        // override なし → 素の display_path。
+        app.archive_source_override = None;
+        assert_eq!(app.user_facing_display_path(&img), img.display_path());
+    }
+
     /// BS で本から出たとき、出てきた本の ZipDir セルが選択される (レビュー P3 UX)。
     /// collapse で深く降りていた本 (literal "bookB/" → 実効 "bookB/only/") でも
     /// 前方一致でセルを特定できる。

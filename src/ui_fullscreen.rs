@@ -6232,7 +6232,10 @@ impl App {
             }
             // ツリーの端 (これ以上先の本がない): fall through して ZIP を抜けて次フォルダへ。
         }
-        let Some(folder) = self.current_folder.clone() else {
+        // 変換キャッシュ閲覧中は current_folder がキャッシュ ZIP を指すため、必ず
+        // effective_folder() (= archive_source_override 優先) を起点にする。さもないと
+        // archive_cache ディレクトリ基準で次フォルダを探索してしまう (Codex P2)。
+        let Some(folder) = self.effective_folder() else {
             return false;
         };
         self.slideshow_playing = false;
@@ -6438,7 +6441,10 @@ impl App {
             return;
         }
 
-        if let Some(cur) = self.current_folder.clone() {
+        // 変換キャッシュ閲覧中は current_folder がキャッシュ ZIP を指すため、
+        // effective_folder() を起点にする (グリッド側と同じ。Codex P2: さもないと
+        // ZIP ツリーの端から抜けたとき archive_cache ディレクトリを探索してしまう)。
+        if let Some(cur) = self.effective_folder() {
             self.capture_fs_nav_holdover(fs_idx);
             self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
         }
@@ -6488,7 +6494,8 @@ impl App {
             return;
         }
 
-        if let Some(cur) = self.current_folder.clone() {
+        // 変換キャッシュ閲覧中の起点はユーザー視点の元アーカイブ (Codex P2、上と同様)。
+        if let Some(cur) = self.effective_folder() {
             self.capture_fs_nav_holdover(fs_idx);
             self.start_folder_nav(cur, forward, crate::app::FolderNavMode::SiblingFullscreen);
         }

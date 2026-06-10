@@ -634,12 +634,23 @@ fn details_kind_label(item: &GridItem) -> String {
         GridItem::ZipImage { .. } => "ZIP 内画像".to_string(),
         GridItem::ZipSeparator { .. } => "見出し".to_string(),
         GridItem::PdfPage { .. } => "PDF ページ".to_string(),
-        GridItem::ZipDir { is_archive, .. } => if *is_archive {
-            "内側 ZIP"
-        } else {
-            "ZIP 内フォルダ"
+        GridItem::ZipDir {
+            is_archive,
+            dir_prefix,
+            ..
+        } => {
+            if *is_archive {
+                // セグメント拡張子から実フォーマット名 (展開キャッシュの rar/7z/lzh 含む)。
+                let name = crate::grid_item::zipdir_display_name(dir_prefix);
+                let ext = name.rsplit('.').next().unwrap_or("");
+                let label = crate::archive_converter::ArchiveFormat::nested_from_extension(ext)
+                    .map(|f| f.label())
+                    .unwrap_or("ZIP");
+                format!("内側 {label}")
+            } else {
+                "ZIP 内フォルダ".to_string()
+            }
         }
-        .to_string(),
         GridItem::SearchContainer { kind, .. } => match kind {
             crate::grid_item::SearchContainerKind::Folder => "検索フォルダ".to_string(),
             crate::grid_item::SearchContainerKind::Zip => "検索ZIP".to_string(),
@@ -4079,10 +4090,12 @@ impl App {
 
         // フルパスを表示する (ファイル名だけだとセル幅の表示と大差なく、置き場所が
         // 分かりにくいため)。長いパスは下の折り返し表示で複数行に展開する。
+        // 変換キャッシュ閲覧中はユーザー視点の元アーカイブパスに置き換える
+        // (archive_cache の実体パスを漏らさない)。
         let path = self
             .items
             .get(idx)
-            .map(|it| it.display_path())
+            .map(|it| self.user_facing_display_path(it))
             .unwrap_or_default();
         // 元画像のピクセル寸法 (ThumbnailState::Loaded.source_dims から取得)
         let dims_str = match self.thumbnails.get(idx) {

@@ -7110,6 +7110,34 @@ impl App {
             .or_else(|| self.current_folder.clone())
     }
 
+    /// アイテムの UI 表示用フルパス。変換キャッシュ閲覧中 (`archive_source_override`)
+    /// は ZIP 内アイテムのコンテナ部分をユーザー視点の元アーカイブパスへ置き換える
+    /// (選択情報ツールチップ等に archive_cache の実体パスを漏らさない、実機フィードバック)。
+    pub(crate) fn user_facing_display_path(&self, item: &GridItem) -> String {
+        if let (Some(src), Some(cur)) = (
+            self.archive_source_override.as_ref(),
+            self.current_folder.as_ref(),
+        ) {
+            match item {
+                GridItem::ZipImage {
+                    zip_path,
+                    entry_name,
+                } if crate::folder_tree::path_eq(zip_path, cur) => {
+                    return format!("{}:{}", src.display(), entry_name);
+                }
+                GridItem::ZipDir {
+                    zip_path,
+                    dir_prefix,
+                    ..
+                } if crate::folder_tree::path_eq(zip_path, cur) => {
+                    return format!("{}:{}", src.display(), dir_prefix);
+                }
+                _ => {}
+            }
+        }
+        item.display_path()
+    }
+
     /// グリッド上の「親へ戻る」操作 (Backspace / Alt+↑ / ツールバー⬆ / Pad B) の
     /// 共通ナビゲーション先を返す。ドライブルートでは親 `Path` が無いので、ドライブ
     /// 一覧へ戻す専用ナビを返す。
@@ -16218,11 +16246,13 @@ impl App {
         self.pending_folder_nav_steps += if forward { -1 } else { 1 };
         let mode = self.pending_folder_nav_mode.clone();
         // mode に応じて「次のステップの起点」は変わる:
-        //   Grid / Fullscreen → self.current_folder
+        //   Grid / Fullscreen → effective_folder() (変換キャッシュに着地した直後は
+        //     current_folder がキャッシュ ZIP を指すため、ユーザー視点の元アーカイブを
+        //     起点にしないと次の累積ステップが archive_cache 側へ逸れる、Codex P2)
         //   Favsearch        → favsearch.nav_stack.last() (= 現在位置)
         let current = match mode {
             FolderNavMode::Favsearch { .. } => self.favsearch.nav_stack.last().cloned(),
-            _ => self.current_folder.clone(),
+            _ => self.effective_folder(),
         };
         if let Some(cur) = current {
             self.spawn_folder_nav(cur, forward, mode);
@@ -33098,7 +33128,16 @@ pub(crate) fn draw_cell(
                         );
                     }
                 }
-                crate::ui_helpers::draw_zip_badge(painter, inner);
+                // バッジは実フォーマットで出す: zip/cbz は青 ZIP バッジ、RAR/7z/LZH 由来の
+                // セグメント (展開済み変換キャッシュのフラットパス) は ConvertibleArchive と
+                // 同じ橙の形式バッジ (rar の本に "ZIP" と出る誤表示の修正、実機フィードバック)。
+                let seg_ext = name.rsplit('.').next().unwrap_or("");
+                match crate::archive_converter::ArchiveFormat::nested_from_extension(seg_ext) {
+                    Some(fmt) if fmt != crate::archive_converter::ArchiveFormat::Zip => {
+                        crate::ui_helpers::draw_archive_badge(painter, inner, fmt.label());
+                    }
+                    _ => crate::ui_helpers::draw_zip_badge(painter, inner),
+                }
                 crate::ui_helpers::draw_cell_filename(
                     painter,
                     inner,
