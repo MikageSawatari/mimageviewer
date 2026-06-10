@@ -7464,10 +7464,14 @@ fn draw_sliders(
             dragging = true;
         }
         let mut skip_after_ai = params.smart_sharpen_skip_after_ai;
+        // 強度 0 のときは効かない設定なので disabled 表示にする (Codex P3)。
         if ui
-            .checkbox(
-                &mut skip_after_ai,
-                egui::RichText::new("AI アップスケール実行時は適用しない").color(LABEL_COLOR),
+            .add_enabled(
+                params.smart_sharpen > 0,
+                egui::Checkbox::new(
+                    &mut skip_after_ai,
+                    egui::RichText::new("AI アップスケール実行時は適用しない").color(LABEL_COLOR),
+                ),
             )
             .on_hover_text(
                 "AI アップスケールで拡大した画像は既に輪郭が強調されていることが多いため、\n\

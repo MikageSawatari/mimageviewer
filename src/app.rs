@@ -24286,6 +24286,11 @@ impl App {
         // アップスケール出力 (= 元よりサイズの大きい AI 結果) のときだけ発動する。
         // デノイズのみの AI 結果はサイズ不変なので通常どおり掛かる。AI 未完了の暫定
         // 合成 (complete=false) は非 AI 画像なので掛かり、AI 完了時の再合成で外れる。
+        //
+        // ⚠ サイズ比較は「final_ai_cache にはモデル出力がモデル倍率のまま入る
+        // (AI 後にリサイズする段が無い)」という現行不変条件に依存する (Codex P2)。
+        // 将来 AI 出力を cache 前に縮小する段を入れる場合は、final_ai_cache の
+        // entry に used_upscale フラグを持たせてこの判定を置き換えること。
         let output_is_ai_upscaled = base_is_ai && base_pixels.size != edit_pixels.size;
         let sharpen_strength = params.effective_smart_sharpen(output_is_ai_upscaled);
         let t_sharpen0 = perf_on.then(std::time::Instant::now);

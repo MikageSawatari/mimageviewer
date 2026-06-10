@@ -8832,7 +8832,8 @@ mod pipeline_cache_refactor_tests {
         };
 
         // skip ON (既定): 合成は AI 結果そのまま (シャープ非適用)
-        app.ensure_final_composite_texture(&ctx, idx)
+        let _ = app
+            .ensure_final_composite_texture(&ctx, idx)
             .expect("composite with skip ON");
         let skipped = composite_pixels(&app);
         assert_eq!(skipped.size, [8, 2], "AI 結果のサイズで合成される");
@@ -8846,7 +8847,8 @@ mod pipeline_cache_refactor_tests {
         params_off.smart_sharpen_skip_after_ai = false;
         app.adjustment_page_params.insert(idx, params_off);
         app.final_composite_cache.clear();
-        app.ensure_final_composite_texture(&ctx, idx)
+        let _ = app
+            .ensure_final_composite_texture(&ctx, idx)
             .expect("composite with skip OFF");
         let sharpened = composite_pixels(&app);
         assert_eq!(sharpened.size, [8, 2]);

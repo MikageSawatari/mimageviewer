@@ -390,7 +390,10 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
   アップスケールモデルの出力は既に輪郭強調済みのことが多く、二重シャープで見た目が
   悪化しやすいため、既定でスキップする (パネルのチェックボックスで解除可)。判定は
   「設定が AI ON か」ではなく **合成ベースが実際にアップスケール出力か**
-  (`base_is_ai && base_pixels.size != edit_pixels.size`)。したがって:
+  (`base_is_ai && base_pixels.size != edit_pixels.size`)。サイズ比較は
+  「final_ai_cache にはモデル出力がモデル倍率のまま入る (AI 後のリサイズ段が無い)」
+  という現行不変条件に依存する — AI 出力を cache 前に縮小する段を将来入れる場合は
+  entry に used_upscale フラグを持たせて置き換える (Codex P2 指摘)。したがって:
   - デノイズのみの AI 結果 (サイズ不変) には通常どおり掛かる
   - サイズ上限 (`ai_upscale_skip_px`) で AI がスキップされたページにも掛かる
   - AI 未完了中の暫定合成 (complete=false、非 AI 画像) には掛かり、AI 完了時の
