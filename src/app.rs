@@ -9300,6 +9300,8 @@ impl App {
         );
         // start_loading_items が zip_nav を None にした後で、新しいツリーナビを設定する。
         self.zip_nav = Some(nav);
+        // アドレス欄をパンくず表示に更新 (単一ラッパー ZIP は collapse 済み実効 prefix を反映)。
+        self.update_zip_nav_address();
 
         // Ctrl+↑↓ フォルダナビから fullscreen で ZIP に遷移してきた場合、items が
         // 揃った今 fullscreen を開き直す (Codex P1: PDF と同じ処理を ZIP にも適用)。
@@ -9387,6 +9389,29 @@ impl App {
         self.rebuild_visible_indices();
         // tag prewarm worker は invalidate で cancel 済み → 新レベル向けに再起動。
         self.prewarm_grid_tags();
+        // アドレス欄を「元 ZIP パス > ZIP 内パス」のパンくず表示に更新。
+        self.update_zip_nav_address();
+    }
+
+    /// アドレス欄をネスト ZIP ツリーナビのパンくず表示にする。
+    /// `元 ZIP のフルパス > seg1 > seg2 …` (ルート階層なら ZIP パスのみ)。
+    /// 検索ドリルの breadcrumb (`update_global_search_address`) と同じ " > " 区切り表記。
+    /// `self.address` は nav イベント時のみ更新され毎フレーム再計算されないので、
+    /// ここで設定したパンくずは次のフォルダ遷移まで保持される。
+    pub(crate) fn update_zip_nav_address(&mut self) {
+        let addr = {
+            let Some(nav) = self.zip_nav.as_ref() else {
+                return;
+            };
+            let zip = nav.tree.zip_path.display().to_string();
+            let segs = nav.current();
+            if segs.is_empty() {
+                zip
+            } else {
+                format!("{zip} > {}", segs.join(" > "))
+            }
+        };
+        self.address = addr;
     }
 
     /// `ZipDir` セルへ降りる (Enter / ダブルクリック / ゲームパッド accept)。
