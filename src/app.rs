@@ -9555,6 +9555,30 @@ impl App {
         true
     }
 
+    /// フルスクリーン中の Ctrl+↑↓ 本またぎ移動 (#4)。兄弟本へ移って、その本の先頭画像を
+    /// フルスクリーンで開く。端 (兄弟なし) では何もしない (= ZIP を抜けずその場に留まる)。
+    /// holdover キャプチャは呼び出し側 (ui_fullscreen) が事前に行う。
+    pub(crate) fn zip_nav_sibling_fullscreen(&mut self, forward: bool) {
+        let sort = self.settings.sort_order;
+        let moved = self
+            .zip_nav
+            .as_mut()
+            .map(|n| n.sibling(forward, sort))
+            .unwrap_or(false);
+        if !moved {
+            return;
+        }
+        // 新しい本のページに差し替え + その本の見開き設定を適用。
+        self.zip_nav_show_current_level();
+        // 新しい本の先頭画像をフルスクリーンで開く (Ctrl+↑↓ 慣習: 常に先頭着地)。
+        if let Some(new_idx) = self.find_fullscreen_nav_target_filtered(true) {
+            self.open_fullscreen(new_idx);
+            self.selected = Some(new_idx);
+            self.scroll_to_selected = true;
+            self.update_last_selected_image();
+        }
+    }
+
     /// PDF ファイルを仮想フォルダとして開く (非同期)。
     ///
     /// ワーカーにページ列挙リクエストを送り、即座に return する。

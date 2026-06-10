@@ -6397,6 +6397,14 @@ impl App {
             return;
         }
 
+        // ネスト ZIP の本の中: Ctrl+↑↓ で兄弟本へ移り、その本の先頭画像を開く (#4)。
+        // ルート (本一覧) では下の current_folder 分岐へ流して ZIP を抜ける (BS と対称)。
+        if self.zip_nav.as_ref().is_some_and(|n| !n.at_root()) {
+            self.capture_fs_nav_holdover(fs_idx);
+            self.zip_nav_sibling_fullscreen(forward);
+            return;
+        }
+
         if let Some(cur) = self.current_folder.clone() {
             self.capture_fs_nav_holdover(fs_idx);
             self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
