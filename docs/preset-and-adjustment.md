@@ -360,7 +360,7 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
 - **分析**: ヒストグラムは `fs_cache` の生ピクセルから計算されるため、表示だけを生に揃える
 
 `AdjustParams` には:
-- `is_identity()` = 色調 identity **かつ** `post_filter == None`
+- `is_identity()` = 色調 identity **かつ** `post_filter == None` **かつ** `smart_sharpen == 0`
 - `is_color_identity()` = 色調 identity のみ (バイパス中の早期 return 判定用)
 
 ### 2.4 元画像プレビュー
