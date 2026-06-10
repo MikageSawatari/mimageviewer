@@ -160,6 +160,9 @@ RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<h
    - **本ごとピン (Model B) のキー規則**: set 側は `App::pin_container_key()` =
      ルート表示なら `zip_path` (= 外側 ZIP の代表。親フォルダの ZipFile セルが引くキー /
      v1.2.x フラット UI のピンと互換)、本の中なら `zip_path` + 実効 prefix の合成パス。
+     RAR/7z/LZH 変換キャッシュ ZIP を閲覧中は `zip_path` の代わりに
+     `archive_source_override` (= 元アーカイブ) を root にする。これにより、変換後ビューで
+     付けたピンが親フォルダの `ConvertibleArchive` タイルにも反映される。
      lookup 側 (`make_load_request` の ZipDir 分岐) は cell の literal prefix キーで
      `folder_pin_map` を引くが、`refresh_folder_pin_map` が実効 prefix で DB を引いた
      結果を literal キーへ **alias 登録**するので、単一ラッパー本でも一致する
@@ -245,6 +248,7 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 | Folder | None | None | `folderthumb:auto-vN:{sort}:d{depth}:{dirname-or-fullpath}` | 再帰的に代表画像を探してデコード |
 | ZipFile | None | None | `zipthumb:{filename}` | `zip_loader::read_first_image_bytes` で先頭画像 |
 | PdfFile | None | Some(0) | `pdfthumb:{filename}` | PDF ワーカーでページ 0 をレンダリング |
+| ConvertibleArchive | None または Some(entry) | None | `archivethumb:{format}:{filename-or-fullpath}` | 有効な変換キャッシュ ZIP があれば、その ZIP から先頭画像またはピン画像を読む。キャッシュ未作成/失効時は LoadRequest なしでアイコン表示 |
 | ZipImage | Some(entry) | None | なし (entry が自動キー) | ZIP からエントリバイト → decode → bytes から EXIF Orientation 適用 |
 | PdfPage | None | Some(page) | `pdf_page_cache_key(page)` | PDF ワーカーでそのページをレンダリング |
 
@@ -301,9 +305,12 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
   弾き、`base_req` にフォールバックする。
 - **UI**: アドレスバー 📌 ボタン (左クリック toggle / 右クリック解除) + 右クリック
   メニュー「📌 代表サムネに固定 / 解除」。`Settings.show_address_bar_folder_pin` で
-  ボタン表示を切替。Ctrl+G アグリゲートビュー / RAR/7z/LZH 変換キャッシュの drill-down
-  (`archive_source_override` Some) / 空フォルダ (idx=usize::MAX) では UI を出さない。
-  ConvertibleArchive アイテム選択時は disabled + tooltip「変換後に設定可能」。
+  ボタン表示を切替。Ctrl+G アグリゲートビュー / 空フォルダ (idx=usize::MAX) では UI を
+  出さない。RAR/7z/LZH 変換キャッシュの drill-down は `zip_nav` が生きていれば
+  `archive_source_override` を root にしてピン可能。`zip_nav` が無い中途半端な override
+  状態だけは dead pin 回避のため UI を出さない。親フォルダで ConvertibleArchive
+  アイテム自体を選択した場合は、まだ中のエントリを選べないため disabled + tooltip
+  「変換後に設定可能」。
 - **書き換え反映経路**: `set_folder_thumb_pin` / `remove_folder_thumb_pin` が DB
   書き込み + `folder_pin_map` 更新 + `folder_thumb_pin_dirty = true`。
   `consume_folder_thumb_pin_dirty` が **`update` 内 (fullscreen 中以外)** および
@@ -371,13 +378,14 @@ JPEG など EXIF Orientation を持つ ZIP 内画像は、サムネイル・フ�
 
 ### 3.4 「先頭 1 枚」の取得
 
-Folder/ZipFile/PdfFile のサムネイルはそれぞれ別ロジックで「代表画像」を取ってくる:
+Folder/ZipFile/PdfFile/ConvertibleArchive のサムネイルはそれぞれ別ロジックで「代表画像」を取ってくる:
 
 | 容器 | 実装 | 「先頭」の定義 |
 | --- | --- | --- |
 | Folder | `thumb_loader::resolve_folder_thumb_image` で再帰走査 | cache miss 時に、グリッドのブロック順に揃えてサブフォルダを `folder_thumb_sort` で先に辿り、見つからなければ直接画像を同じ sort で選ぶ。深さは `folder_thumb_depth` |
 | ZipFile | `zip_loader::read_first_image_bytes` | エントリ名の昇順で最初の画像拡張子 |
 | PdfFile | PDF ワーカーでページ 0 を固定取得 | 常に `page_num = 0` |
+| ConvertibleArchive | 変換キャッシュ ZIP に対して `zip_loader::read_first_image_bytes` | 有効な `archive_cache.db` 行がある場合のみ ZIP と同じ。未変換/失効時はアイコン |
 
 Folder 自動代表の cache key には自動選定アルゴリズム版・`folder_thumb_sort`・
 `folder_thumb_depth` を含める。キャッシュヒット時は表示速度を優先して毎回の

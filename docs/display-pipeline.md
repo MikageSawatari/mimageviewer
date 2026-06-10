@@ -31,7 +31,8 @@ Failed は単発の終端ステート。デコードエラー時のみ。
 2. **エビクション**: keep_range 外の Loaded を `Evicted` に遷移 (GPU テクスチャを drop)
 3. **要求投入**: keep_range 内の Pending / Evicted に対して `LoadRequest` を作り
    - 通常キュー: `reload_queue` (Image/ZipImage/PdfPage)
-   - 重 I/O キュー: `heavy_io_queue` (Folder/ZipFile/PdfFile — 全体走査が必要)
+   - 重 I/O キュー: `heavy_io_queue` (Folder/ZipFile/ConvertibleArchive — 全体走査や
+     ZIP セントラルディレクトリ読みが必要。PdfFile は PDF ワーカー IPC なので通常キュー)
 4. **アイドル時品質アップグレード**: スクロールが止まって ~1 秒経つと、`from_cache: true` の Loaded に対して `skip_cache: true` で再要求 → 高品質デコード
 
 ### 1.3 ワーカー側の流れ
@@ -53,7 +54,7 @@ Failed は単発の終端ステート。デコードエラー時のみ。
 
 ### 1.3.1 親コンテナの代表サムネ — 優先順位
 
-親コンテナ (Folder/ZipFile/PdfFile) の代表サムネは次の順で決まる:
+親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネは次の順で決まる:
 
 1. **手動ピン (`folder_thumb_pins.db`)** — ユーザーがアドレスバー 📌 ボタンや
    右クリックメニュー「📌 代表サムネに固定」で指定した子アイテム。`make_load_request`
@@ -70,7 +71,10 @@ Failed は単発の終端ステート。デコードエラー時のみ。
    変わったときは自然にミスして再スキャンされる。キャッシュミス時の Folder
    自動選定は、グリッドのブロック順に揃えて「サブフォルダ (folder_thumb_sort 順) →
    直接画像 (sort 順)」で候補を辿る。
-3. **フォルダ / ZIP / PDF アイコン fallback** — 中身が空 / 全部エラーで上 2 段が失敗
+   ConvertibleArchive は有効な変換キャッシュ ZIP がある場合だけ、その ZIP の先頭画像を
+   `archivethumb:{format}:{identity}` キーで読む。キャッシュ未作成/失効時は要求を出さず
+   アイコンに戻す。
+3. **フォルダ / ZIP / PDF / アーカイブアイコン fallback** — 中身が空 / 全部エラーで上 2 段が失敗
    したときの最終フォールバック。`grid_item.rs` の draw_cell でアイコン表示。
 
 **Video ピンの特殊経路**: pin source が動画の場合は `seed_folder_video_pin_thumbs`

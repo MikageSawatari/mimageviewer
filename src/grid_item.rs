@@ -38,8 +38,8 @@ pub enum GridItem {
     /// ネスト ZIP ツリーナビ (v1.3.0、`docs/nested-zip-tree-plan.md` Strategy A) で、
     /// 開いている外側 ZIP の現在階層にある「入れる子ディレクトリ / 内側アーカイブ」を表す
     /// 1 セル。Enter / ダブルクリックでその階層へ降りる (ナビは `ZipNavState`)。
-    /// 実ファイルパスを持たない仮想コンテナなので、ファイル整理 / D&D / レーティング /
-    /// チェックの対象外 (helper は全て None / false を返す)。
+    /// 実ファイルパスを持たない仮想コンテナなので、ファイル整理 / D&D / チェックの対象外。
+    /// レーティング / ピン / 見開き設定は zip_path + prefix の合成キーで扱う。
     ZipDir {
         /// 外側 ZIP の実ファイルパス (= 仮想フォルダのルート identity)。
         zip_path: PathBuf,
@@ -138,11 +138,15 @@ impl GridItem {
     }
 
     /// 代表サムネ生成に本物の同期 I/O を伴うか (heavy_io_queue 振り分け用)。
-    /// Folder は `fs::read_dir` 再帰探索、ZipFile はセントラルディレクトリ読み込みで
+    /// Folder は `fs::read_dir` 再帰探索、ZipFile / ConvertibleArchive は
+    /// セントラルディレクトリ読み込みで
     /// メインプロセス内が秒単位ブロックされる。PdfFile は別プロセス IPC 待ちで
     /// メインプロセス内 CPU を消費しないため通常 reload_queue に振る。
     pub fn is_heavy_io(&self) -> bool {
-        matches!(self, Self::Folder(_) | Self::ZipFile(_))
+        matches!(
+            self,
+            Self::Folder(_) | Self::ZipFile(_) | Self::ConvertibleArchive { .. }
+        )
     }
 
     /// コンテナ系アイテム (Folder / ZipFile / PdfFile / ConvertibleArchive) のパスを返す。

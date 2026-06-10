@@ -4579,6 +4579,13 @@ mod favorite_adjustment_defaults_tests {
 
     /// テスト用のネスト ZIP ナビ状態を作る (`C:\test\outer.zip` 固定)。
     fn test_zip_nav(names: &[&str]) -> crate::zip_tree::ZipNavState {
+        test_zip_nav_for(std::path::PathBuf::from(r"C:\test\outer.zip"), names)
+    }
+
+    fn test_zip_nav_for(
+        zip_path: std::path::PathBuf,
+        names: &[&str],
+    ) -> crate::zip_tree::ZipNavState {
         let entries: Vec<crate::zip_loader::ZipImageEntry> = names
             .iter()
             .map(|n| crate::zip_loader::ZipImageEntry {
@@ -4587,11 +4594,104 @@ mod favorite_adjustment_defaults_tests {
                 mtime: 0,
             })
             .collect();
-        let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(
-            std::path::PathBuf::from(r"C:\test\outer.zip"),
-            entries,
-        ));
+        let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
         crate::zip_tree::ZipNavState::new(tree)
+    }
+
+    #[test]
+    fn convertible_archive_with_cache_builds_zip_first_thumb_request() {
+        use crate::folder_thumb_pins::FolderPinSource;
+        use crate::grid_item::GridItem;
+        use crate::thumb_loader::ResolveStrategy;
+
+        let src = std::path::PathBuf::from(r"C:\books\book.7z");
+        let cache = std::path::PathBuf::from(r"C:\cache\book.zip");
+        let item = GridItem::ConvertibleArchive {
+            path: src.clone(),
+            format: crate::archive_converter::ArchiveFormat::SevenZ,
+        };
+        let mut converted = std::collections::HashMap::new();
+        converted.insert(crate::path_key::normalize_keep_drive(&src), cache.clone());
+        let pins: std::collections::HashMap<String, FolderPinSource> =
+            std::collections::HashMap::new();
+
+        let req = make_load_request(
+            &item,
+            4,
+            111,
+            222,
+            false,
+            None,
+            Some(crate::settings::SortOrder::Numeric),
+            3,
+            &pins,
+            &converted,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("converted archive with a valid cache should request a thumbnail");
+
+        assert_eq!(req.path, cache);
+        assert_eq!(req.mtime, 111);
+        assert_eq!(req.file_size, 222);
+        assert_eq!(req.resolve_override, Some(ResolveStrategy::ZipFirstImage));
+        assert_eq!(
+            req.cache_key_override.as_deref(),
+            Some("archivethumb:7z:book.7z")
+        );
+    }
+
+    #[test]
+    fn convertible_archive_pin_uses_cached_zip_entry_thumb_request() {
+        use crate::folder_thumb_pins::FolderPinSource;
+        use crate::grid_item::GridItem;
+
+        let src = std::path::PathBuf::from(r"C:\books\book.rar");
+        let cache = std::path::PathBuf::from(r"C:\cache\book.zip");
+        let item = GridItem::ConvertibleArchive {
+            path: src.clone(),
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        };
+        let source = FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "inner/p01.png".to_string(),
+        };
+        let mut converted = std::collections::HashMap::new();
+        converted.insert(crate::path_key::normalize_keep_drive(&src), cache.clone());
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(crate::path_key::normalize_keep_drive(&src), source.clone());
+
+        let req = make_load_request(
+            &item,
+            2,
+            333,
+            444,
+            false,
+            None,
+            Some(crate::settings::SortOrder::Numeric),
+            3,
+            &pins,
+            &converted,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("pinned converted archive should read the pinned entry from cache zip");
+
+        let base = "archivethumb:rar:book.rar";
+        let expected_key = convertible_archive_pinned_cache_key(base, &source, 333, 444);
+        assert_eq!(req.path, cache);
+        assert_eq!(req.zip_entry.as_deref(), Some("inner/p01.png"));
+        assert_eq!(req.resolve_override, None);
+        assert_eq!(
+            req.cache_key_override.as_deref(),
+            Some(expected_key.as_str())
+        );
     }
 
     /// 読書位置レジュームはネスト ZIP の本の中 (スタック深さ ≥ 2) では記録しない。
@@ -4644,6 +4744,134 @@ mod favorite_adjustment_defaults_tests {
         app.zip_nav = Some(nav);
         assert_eq!(app.pin_container_key(), Some(zip_path.join("bookA")));
         assert_eq!(app.spread_container_key(), Some(zip_path.join("bookA")));
+    }
+
+    #[test]
+    fn pin_container_key_uses_source_archive_for_converted_cache_zip() {
+        let mut app = setup_app();
+        let cache = std::path::PathBuf::from(r"C:\cache\converted\book.zip");
+        let source = std::path::PathBuf::from(r"C:\books\book.rar");
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(source.clone());
+
+        app.zip_nav = Some(test_zip_nav_for(
+            cache.clone(),
+            &["vol01/p1.jpg", "vol01/p2.jpg"],
+        ));
+        assert_eq!(app.pin_container_key(), Some(source.clone()));
+
+        let mut nav = test_zip_nav_for(cache, &["bookA/p1.jpg", "bookB/p1.jpg"]);
+        nav.enter("bookA/");
+        app.zip_nav = Some(nav);
+        assert_eq!(app.pin_container_key(), Some(source.join("bookA")));
+    }
+
+    #[test]
+    fn converted_archive_zipdir_pin_alias_uses_source_archive_root() {
+        let mut app = setup_app();
+        let cache = std::path::PathBuf::from(r"C:\cache\converted\book.zip");
+        let source = std::path::PathBuf::from(r"C:\books\book.7z");
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(source.clone());
+        app.zip_nav = Some(test_zip_nav_for(
+            cache.clone(),
+            &["bookA/p1.jpg", "bookB/only/p1.jpg"],
+        ));
+
+        let effective_key = source.join("bookB").join("only");
+        assert!(app.set_folder_thumb_pin(
+            &effective_key,
+            crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                zip_rel: String::new(),
+                entry: "bookB/only/p1.jpg".to_string(),
+            },
+        ));
+
+        let (items, metas) = {
+            let nav = app.zip_nav.as_ref().unwrap();
+            nav.materialize_current(crate::settings::SortOrder::FileName)
+        };
+        app.install_new_items(items, metas);
+
+        let literal_norm = crate::path_key::normalize_keep_drive(&source.join("bookB"));
+        assert!(
+            app.folder_pin_map.contains_key(&literal_norm),
+            "変換キャッシュ閲覧中の ZipDir pin alias は cache zip ではなく元アーカイブ root に張る: {:?}",
+            app.folder_pin_map.keys().collect::<Vec<_>>()
+        );
+
+        let book_b = app
+            .items
+            .iter()
+            .position(
+                |it| matches!(it, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "bookB/"),
+            )
+            .expect("root should contain bookB ZipDir");
+        let req = make_load_request(
+            &app.items[book_b],
+            book_b,
+            app.image_metas[book_b].unwrap().0,
+            app.image_metas[book_b].unwrap().1,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            app.settings.folder_thumb_depth,
+            &app.folder_pin_map,
+            &app.converted_archive_cache_paths,
+            app.archive_source_override.as_deref(),
+            app.current_folder.as_deref(),
+            app.folder_thumb_pin_db.as_deref(),
+            app.video_pin_db.as_ref(),
+            false,
+        )
+        .expect("ZipDir with source-root alias should build a pinned request");
+        assert_eq!(req.path, cache);
+        assert_eq!(req.zip_entry.as_deref(), Some("bookB/only/p1.jpg"));
+        assert!(
+            req.cache_key_override
+                .as_deref()
+                .is_some_and(|key| key.contains("#pin:bookB/only/p1.jpg")),
+            "pinned ZipDir cache key should include pinned entry: {:?}",
+            req.cache_key_override
+        );
+    }
+
+    #[test]
+    fn toggle_pin_inside_converted_archive_sets_source_archive_key() {
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        let cache = std::path::PathBuf::from(r"C:\cache\converted\book.zip");
+        let source = std::path::PathBuf::from(r"C:\books\book.cbr");
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(source.clone());
+        let mut nav = test_zip_nav_for(cache.clone(), &["bookA/p1.jpg", "bookB/p1.jpg"]);
+        nav.enter("bookA/");
+        app.zip_nav = Some(nav);
+        app.items = vec![GridItem::ZipImage {
+            zip_path: cache,
+            entry_name: "bookA/p1.jpg".to_string(),
+        }];
+        app.image_metas = vec![Some((10, 20))];
+        app.selected = Some(0);
+
+        app.toggle_folder_pin_for_idx(0);
+
+        let book_key = source.join("bookA");
+        assert_eq!(
+            app.folder_thumb_pin_for(&book_key),
+            Some(&crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                zip_rel: String::new(),
+                entry: "bookA/p1.jpg".to_string(),
+            })
+        );
+
+        app.settings.show_address_bar_folder_pin = true;
+        let state = app
+            .compute_folder_pin_button_state()
+            .expect("converted archive zip_nav should show the pin button");
+        assert!(state.enabled);
+        assert!(state.matches_current_pin);
     }
 
     /// ネスト ZIP の本 (ZipDir) はコンテナレーティング対象で、キーは zip_path +

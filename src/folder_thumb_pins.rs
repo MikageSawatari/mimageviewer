@@ -177,12 +177,13 @@ pub fn source_from_grid_item(
                 page: *page_num,
             })
         }
-        // ConvertibleArchive: RAR/7z/LZH は変換完了前に thumb 生成できないので
-        // UI 側で disabled + tooltip 表示する (本関数は None を返すだけ)
+        // ConvertibleArchive: 親フォルダ上の未展開アイテム自体は中のエントリを
+        // 選択できないので UI 側で disabled + tooltip 表示する。変換キャッシュ ZIP の
+        // 内部で選んだ ZipImage は App 側の zip_nav 経路で ZipEntry source になる。
         GridItem::ConvertibleArchive { .. } => None,
         // ピン対象として意味がないもの。
-        // ZipDir はネスト ZIP ツリーの仮想コンテナ。初版 (v1.3.0) ではピン対象外
-        // (代表サムネ手動ピンは将来課題、計画書 §14 非目標)。
+        // ZipDir はネスト ZIP ツリーの仮想コンテナ。本そのものを選んでピンするのではなく、
+        // 本の中に入って ZipImage を選ぶ Model B なので、この generic helper では None。
         GridItem::SearchContainer { .. }
         | GridItem::ZipSeparator { .. }
         | GridItem::ZipDir { .. } => None,

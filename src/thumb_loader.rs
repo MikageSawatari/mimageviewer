@@ -44,6 +44,8 @@ pub fn worker_priority_key(
 pub const CACHE_KEY_ZIP: &str = "zipthumb:";
 /// カタログ内の PdfFile サムネイル用キャッシュキープレフィックス
 pub const CACHE_KEY_PDF: &str = "pdfthumb:";
+/// カタログ内の変換済みアーカイブ (RAR/7z/LZH) サムネイル用キャッシュキープレフィックス
+pub const CACHE_KEY_ARCHIVE: &str = "archivethumb:";
 /// カタログ内のフォルダサムネイル用キャッシュキープレフィックス
 pub const CACHE_KEY_FOLDER: &str = "folderthumb:";
 /// フォルダ代表サムネの自動選定アルゴリズム世代。

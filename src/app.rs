@@ -1319,7 +1319,9 @@ use crate::folder_tree::{
 };
 
 // キャッシュキー定数は thumb_loader.rs に定義 (ベンチマーク bin からも参照するため)
-pub(crate) use crate::thumb_loader::{CACHE_KEY_PDF, CACHE_KEY_SEARCH_REP, CACHE_KEY_ZIP};
+pub(crate) use crate::thumb_loader::{
+    CACHE_KEY_ARCHIVE, CACHE_KEY_PDF, CACHE_KEY_SEARCH_REP, CACHE_KEY_ZIP,
+};
 
 /// レーティングフィルタを 1 アイテムに適用し、可視かを返す。
 ///
@@ -3849,6 +3851,11 @@ pub struct App {
     /// 同期参照する (per-frame DB アクセス回避)。キーは `normalize_keep_drive(container)`。
     pub(crate) folder_pin_map:
         std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    /// 現在ロード済み items のうち、変換済みキャッシュを持つ RAR/7z/LZH の対応表。
+    /// キーは元アーカイブの `normalize_keep_drive(path)`、値は読み取り元の cache ZIP。
+    /// 親フォルダ上の `ConvertibleArchive` タイルはこの ZIP の先頭画像 / ピン画像を
+    /// `archivethumb:` キーで表示する。
+    pub(crate) converted_archive_cache_paths: std::collections::HashMap<String, PathBuf>,
     /// 親コンテナのピン書き換えがあったので、次の機会にフォルダを再ロードして
     /// グリッドサムネに反映する必要があるフラグ (`video_thumb_overrides_dirty` と同じ作法)。
     pub(crate) folder_thumb_pin_dirty: bool,
@@ -5806,6 +5813,7 @@ impl App {
             video_chapter_thumb_db,
             folder_thumb_pin_db,
             folder_pin_map: std::collections::HashMap::new(),
+            converted_archive_cache_paths: std::collections::HashMap::new(),
             folder_thumb_pin_dirty: false,
             #[cfg(windows)]
             video_tile_mode_active: false,
@@ -6503,6 +6511,9 @@ impl App {
                     Some(self.settings.folder_thumb_sort),
                     self.settings.folder_thumb_depth,
                     &self.folder_pin_map,
+                    &self.converted_archive_cache_paths,
+                    self.archive_source_override.as_deref(),
+                    self.current_folder.as_deref(),
                     self.folder_thumb_pin_db.as_deref(),
                     self.video_pin_db.as_ref(),
                     use_full_path_keys,
@@ -7526,24 +7537,34 @@ impl App {
     /// **ルート表示の扱いだけ** 異なる。
     ///
     /// ネスト ZIP ツリー閲覧中:
-    /// - **ルート表示 (`at_root`)**: `zip_path` そのもの。ルート本の代表 = 外側 ZIP の
-    ///   代表であり、親フォルダの ZipFile セル (`make_load_request`) は `zip_path` で
-    ///   ピンを引くため。単一ラッパー ZIP (開いた時点で collapse 済み) で
-    ///   `spread_container_key` (= `zip_path\vol01`) を使うと、ピンしても親セルに反映
+    /// - **ルート表示 (`at_root`)**: 通常 ZIP は `zip_path` そのもの。変換キャッシュ ZIP
+    ///   では `archive_source_override` (= 元 RAR/7z/LZH) を使う。ルート本の代表 =
+    ///   親フォルダの ZipFile / ConvertibleArchive セルが引くキーであり、単一ラッパー
+    ///   ZIP (開いた時点で collapse 済み) で `spread_container_key`
+    ///   (= `zip_path\vol01`) を使うと、ピンしても親セルに反映
     ///   されず、v1.2.x のフラット UI で付けた既存ピン (key=`zip_path`) も解除不能に
     ///   なる (レビュー P2)。
-    /// - **本の中 (スタック深さ ≥ 2)**: `spread_container_key` と同じ実効 prefix 合成パス。
-    ///   親階層の ZipDir セル側は `refresh_folder_pin_map` が実効 prefix で alias 登録
-    ///   するので一致する。
+    /// - **本の中 (スタック深さ ≥ 2)**: 同じ root + 実効 prefix 合成パス。親階層の
+    ///   ZipDir セル側は `refresh_folder_pin_map` が実効 prefix で alias 登録するので一致する。
     ///
     /// 通常フォルダは `current_folder`。
     pub(crate) fn pin_container_key(&self) -> Option<PathBuf> {
         if let Some(nav) = self.zip_nav.as_ref() {
+            let root = zip_pin_root_path(
+                &nav.tree.zip_path,
+                self.archive_source_override.as_deref(),
+                self.current_folder.as_deref(),
+            );
             if nav.at_root() {
-                return Some(nav.tree.zip_path.clone());
+                return Some(root.to_path_buf());
             }
+            let mut p = root.to_path_buf();
+            for seg in nav.current() {
+                p.push(seg);
+            }
+            return Some(p);
         }
-        self.spread_container_key()
+        self.current_folder.clone()
     }
 
     /// 指定キーの見開きモード / 連結方式 / 綴じ方向を `spread_db` から読み込んで
@@ -8028,6 +8049,7 @@ impl App {
                     GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
                         Some(p.as_path())
                     }
+                    GridItem::ConvertibleArchive { path, .. } => Some(path.as_path()),
                     _ => None,
                 })
                 .collect();
@@ -8041,9 +8063,11 @@ impl App {
         };
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
-            .flat_map(|it| {
+            .zip(image_metas.iter())
+            .flat_map(|(it, meta)| {
                 folder_thumb_existing_keys_for(
                     it,
+                    *meta,
                     &pin_map_for_existing,
                     self.folder_thumb_pin_db.as_deref(),
                     Some(self.settings.folder_thumb_sort),
@@ -9200,9 +9224,11 @@ impl App {
         };
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
-            .flat_map(|it| {
+            .zip(image_metas.iter())
+            .flat_map(|(it, meta)| {
                 folder_thumb_existing_keys_for(
                     it,
+                    *meta,
                     &pin_map_for_existing,
                     self.folder_thumb_pin_db.as_deref(),
                     Some(self.settings.folder_thumb_sort),
@@ -11512,10 +11538,35 @@ impl App {
         // この後で true に上書きする。
         self.items_are_global_search_view = false;
         self.items_are_drive_list = false;
-        // 親コンテナ (Folder/ZipFile/PdfFile) のピン情報を 1 度の lookup_many で取得し、
+        // 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) のピン情報を 1 度の lookup_many で取得し、
         // make_load_request からの per-frame DB ヒットを回避する。pin がレアケースで
         // 大半は empty なので、典型的なフォルダで HashMap は数百 bytes に収まる。
+        self.refresh_converted_archive_cache_paths();
         self.refresh_folder_pin_map();
+    }
+
+    /// 現在 items の `ConvertibleArchive` について、有効な変換キャッシュ ZIP を
+    /// `make_load_request` から同期参照できる map にまとめる。
+    ///
+    /// lookup は `install_new_items` 時に 1 回だけ行う。スクロール中 / 毎フレームの
+    /// サムネ要求で archive_cache.db を叩かないための小さなキャッシュ。
+    fn refresh_converted_archive_cache_paths(&mut self) {
+        self.converted_archive_cache_paths.clear();
+        let Some(db) = self.archive_cache_db.as_ref() else {
+            return;
+        };
+        for (idx, item) in self.items.iter().enumerate() {
+            let GridItem::ConvertibleArchive { path, .. } = item else {
+                continue;
+            };
+            let Some((mtime, file_size)) = self.image_metas.get(idx).and_then(|m| *m) else {
+                continue;
+            };
+            if let Some(cached_zip) = db.lookup(path, mtime, file_size) {
+                self.converted_archive_cache_paths
+                    .insert(crate::path_key::normalize_keep_drive(path), cached_zip);
+            }
+        }
     }
 
     /// Phase C: フォルダピンの source が Video のときに、`video_pins` DB の WebP を
@@ -11889,7 +11940,7 @@ impl App {
         }
     }
 
-    /// 現在 items 中の親コンテナ (Folder/ZipFile/PdfFile) 分のピン + `current_folder`
+    /// 現在 items 中の親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive/ZipDir) 分のピン + `current_folder`
     /// 自身のピンを DB から一括取得して `folder_pin_map` に格納する。pin DB が未開なら no-op。
     ///
     /// `current_folder` 自身を含めるのは、アドレスバー 📌 ボタンの `folder_thumb_pin_for
@@ -11915,12 +11966,20 @@ impl App {
                 GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
                     container_paths.push(p.clone());
                 }
+                GridItem::ConvertibleArchive { path, .. } => {
+                    container_paths.push(path.clone());
+                }
                 GridItem::ZipDir {
                     zip_path,
                     dir_prefix,
                     ..
                 } => {
-                    let literal = book_container_key(zip_path, dir_prefix);
+                    let book_root = zip_pin_root_path(
+                        zip_path,
+                        self.archive_source_override.as_deref(),
+                        self.current_folder.as_deref(),
+                    );
+                    let literal = book_container_key(book_root, dir_prefix);
                     let effective_key = if let Some(nav) = self.zip_nav.as_ref() {
                         let segs: Vec<String> = dir_prefix
                             .split('/')
@@ -11928,7 +11987,7 @@ impl App {
                             .map(|s| s.to_string())
                             .collect();
                         let effective = nav.tree.collapse_redundant(&segs);
-                        book_container_key_from_segs(zip_path, &effective)
+                        book_container_key_from_segs(book_root, &effective)
                     } else {
                         literal.clone()
                     };
@@ -12056,7 +12115,7 @@ impl App {
     /// 選択中アイテムを代表サムネにピンするときの `source`。ネスト ZIP ツリー閲覧中は
     /// 「本ごとピン」(Model B) に合わせ、ZipImage を ZipEntry source にする (ZipDir/その他は
     /// 本の中では不可 → None)。通常フォルダは `source_from_grid_item(current_folder, item)`。
-    /// ピン対象コンテナは `spread_container_key()` (zip 内は本キー、通常は current_folder)。
+    /// ピン対象コンテナは `pin_container_key()` (zip 内は本キー、通常は current_folder)。
     /// 📌 ボタン状態 / コンテキストメニュー / グリッドバッジで P キーと同じ判定を共有する。
     pub(crate) fn folder_pin_selected_source(
         &self,
@@ -12098,16 +12157,15 @@ impl App {
         if *container == search_results_synthetic_path() {
             return None;
         }
-        // ConvertibleArchive (RAR/7z/LZH) を変換キャッシュ ZIP として開いている drill-down 状態
-        // では container = キャッシュ ZIP 実体になっているため、ピンを書いてもユーザーが
-        // 期待する「親フォルダの ConvertibleArchive タイル」には適用されない (キャッシュ
-        // ZIP は他の grid に出現しないので事実上 dead pin になる)。ここでは UI を隠して
-        // 混乱を避ける (Codex Phase D P2 指摘)。
-        if self.archive_source_override.is_some() {
+        // 変換キャッシュ ZIP の内部を `zip_nav` で見ている場合は、pin_container_key()
+        // が元アーカイブパスへ戻すのでピン可能。zip_nav が無い中途半端な override 状態
+        // だけは dead pin を避けるため隠す。
+        if self.archive_source_override.is_some() && self.zip_nav.is_none() {
             return None;
         }
-        // ピン対象コンテナ: ネスト ZIP では本キー (ルート = zip_path / 本の中 = zip_path+階層)、
-        // 通常は current_folder。P キー (toggle_folder_pin_for_idx) と同じ対象を見て
+        // ピン対象コンテナ: ネスト ZIP では本キー (通常 ZIP は zip_path root、
+        // 変換キャッシュは元アーカイブ root)、通常は current_folder。
+        // P キー (toggle_folder_pin_for_idx) と同じ対象を見て
         // highlight/tooltip を一致させる。
         let pin_container = self
             .pin_container_key()
@@ -12190,7 +12248,7 @@ impl App {
     /// **silent no-op 条件** (`compute_folder_pin_button_state` で UI を隠す条件と整合):
     /// - `current_folder` 無し / 検索合成パス
     /// - Ctrl+G アグリゲートビュー (`items_are_global_search_view`)
-    /// - RAR/7z/LZH 変換キャッシュ ZIP の drill-down (`archive_source_override` Some)
+    /// - RAR/7z/LZH 変換キャッシュ ZIP の drill-down だが `zip_nav` が無い中途半端な状態
     /// - 選択無し / 選択アイテムが pin 不能 (ConvertibleArchive / SearchContainer /
     ///   ZipSeparator、または container を指す `rel=""` ケース)
     ///
@@ -12200,9 +12258,9 @@ impl App {
     /// 親フォルダ自身の代表画を pinned_key 下に保存してしまい、ユーザーから見ると
     /// 「動画 pin したのにサムネが変わらない」状態になる (= 効果が無い pin)。
     pub(crate) fn toggle_folder_pin_for_idx(&mut self, idx: usize) {
-        // 変換キャッシュ ZIP (RAR/7z/LZH) の drill-down では dead pin になるのでピン不可。
-        // button/menu の非表示条件と揃える (Codex P3。zip_nav 分岐より前にガードする)。
-        if self.archive_source_override.is_some() {
+        // zip_nav がある変換キャッシュ閲覧中は元アーカイブパスへピンできる。
+        // zip_nav が無い override 状態だけは dead pin を避ける。
+        if self.archive_source_override.is_some() && self.zip_nav.is_none() {
             return;
         }
         // ネスト ZIP ツリー (Model B): 本 (= 現在の階層) ごとに代表サムネを記憶する。
@@ -12249,9 +12307,6 @@ impl App {
             return;
         }
         if self.items_are_global_search_view {
-            return;
-        }
-        if self.archive_source_override.is_some() {
             return;
         }
         let Some(item) = self.items.get(idx).cloned() else {
@@ -12444,10 +12499,9 @@ impl App {
         if container == search_results_synthetic_path() {
             return false;
         }
-        // ConvertibleArchive 変換キャッシュ ZIP の drill-down 状態では dead pin になる
-        // ためエントリを出さない (Codex Phase D P2 指摘、`compute_folder_pin_button_state`
-        // と挙動を揃える)。
-        if self.archive_source_override.is_some() {
+        // zip_nav がある変換キャッシュ閲覧中は元アーカイブパスへピンできる。
+        // zip_nav が無い override 状態だけは dead pin を避ける。
+        if self.archive_source_override.is_some() && self.zip_nav.is_none() {
             return false;
         }
         // pin 不能 variant: 描画スキップ
@@ -14768,6 +14822,9 @@ impl App {
                         Some(self.settings.folder_thumb_sort),
                         self.settings.folder_thumb_depth,
                         &self.folder_pin_map,
+                        &self.converted_archive_cache_paths,
+                        self.archive_source_override.as_deref(),
+                        self.current_folder.as_deref(),
                         self.folder_thumb_pin_db.as_deref(),
                         self.video_pin_db.as_ref(),
                         use_full_path_keys,
@@ -15316,6 +15373,9 @@ impl App {
                     Some(self.settings.folder_thumb_sort),
                     self.settings.folder_thumb_depth,
                     &self.folder_pin_map,
+                    &self.converted_archive_cache_paths,
+                    self.archive_source_override.as_deref(),
+                    self.current_folder.as_deref(),
                     self.folder_thumb_pin_db.as_deref(),
                     self.video_pin_db.as_ref(),
                     use_full_path_keys,
@@ -31841,6 +31901,60 @@ fn container_cache_base_key(
     }
 }
 
+fn archive_thumb_format_token(format: crate::archive_converter::ArchiveFormat) -> &'static str {
+    match format {
+        crate::archive_converter::ArchiveFormat::Rar => "rar",
+        crate::archive_converter::ArchiveFormat::SevenZ => "7z",
+        crate::archive_converter::ArchiveFormat::Lzh => "lzh",
+        crate::archive_converter::ArchiveFormat::Zip => "zip",
+    }
+}
+
+fn convertible_archive_cache_base_key(
+    path: &std::path::Path,
+    format: crate::archive_converter::ArchiveFormat,
+    use_full_path: bool,
+) -> Option<String> {
+    let identity = if use_full_path {
+        path.to_string_lossy().into_owned()
+    } else {
+        path.file_name().and_then(|n| n.to_str())?.to_string()
+    };
+    Some(format!(
+        "{}{}:{}",
+        CACHE_KEY_ARCHIVE,
+        archive_thumb_format_token(format),
+        identity
+    ))
+}
+
+fn pin_source_id_with_container_identity(
+    source: &crate::folder_thumb_pins::FolderPinSource,
+    mtime: i64,
+    file_size: i64,
+) -> String {
+    format!(
+        "{}{}|{}",
+        pin_source_id_cache_prefix(source),
+        mtime,
+        file_size
+    )
+}
+
+fn convertible_archive_pinned_cache_key(
+    base_key: &str,
+    source: &crate::folder_thumb_pins::FolderPinSource,
+    mtime: i64,
+    file_size: i64,
+) -> String {
+    format!(
+        "{}{}{}",
+        base_key,
+        crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+        pin_source_id_with_container_identity(source, mtime, file_size)
+    )
+}
+
 impl App {
     /// サムネイル cache key に full-path を使うべきコンテキストか。
     ///
@@ -32004,6 +32118,26 @@ fn book_container_key_from_segs(zip_path: &std::path::Path, segs: &[String]) -> 
     p
 }
 
+/// ZIP ツリーナビ内の「本」キーで使う root path。
+///
+/// 通常 ZIP は `zip_path` そのものを使う。RAR/7z/LZH を変換キャッシュ ZIP として
+/// 開いているときだけ、ユーザー視点の元アーカイブ (`archive_source_override`) を
+/// root にする。これにより、変換後ビュー内で付けたピンが親フォルダの
+/// `ConvertibleArchive` タイルからも同じ key で参照できる。
+fn zip_pin_root_path<'a>(
+    zip_path: &'a std::path::Path,
+    archive_source_override: Option<&'a std::path::Path>,
+    current_folder: Option<&std::path::Path>,
+) -> &'a std::path::Path {
+    if let Some(source) = archive_source_override
+        && current_folder.is_some_and(|cur| crate::folder_tree::path_eq(cur, zip_path))
+    {
+        source
+    } else {
+        zip_path
+    }
+}
+
 /// ネスト ZIP の階層 re-materialize (`zip_nav_show_current_level`) でサムネを使い回す
 /// ための content key。同一 ZIP 内の移動専用なので zip_path は含めない。
 ///
@@ -32044,6 +32178,9 @@ fn make_load_request(
     folder_thumb_sort: Option<crate::settings::SortOrder>,
     folder_thumb_depth: u32,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    converted_archive_cache_paths: &std::collections::HashMap<String, PathBuf>,
+    archive_source_override: Option<&std::path::Path>,
+    current_folder: Option<&std::path::Path>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     video_pin_db: Option<&crate::video_pins::VideoPinDb>,
     // T54 (Codex R-SEARCH-001 / 2026-05-16): Ctrl+S 結果のように「複数フォルダの
@@ -32097,8 +32234,9 @@ fn make_load_request(
             // 画像を代表にする。ピン時は cache_key に #pin:{entry} を付けて auto キャッシュと
             // 分離する。collapse 済みラッパー本では set 側 (effective prefix) と lookup 側
             // (dir_prefix) のキーがずれてピンが反映されない (= 非崩しの通常本では一致)。
+            let book_root = zip_pin_root_path(zip_path, archive_source_override, current_folder);
             let book_key =
-                crate::path_key::normalize_keep_drive(&book_container_key(zip_path, dir_prefix));
+                crate::path_key::normalize_keep_drive(&book_container_key(book_root, dir_prefix));
             let pinned_entry = pin_map.get(&book_key).and_then(|src| match src {
                 crate::folder_thumb_pins::FolderPinSource::ZipEntry { entry, .. } => {
                     Some(entry.clone())
@@ -32135,6 +32273,32 @@ fn make_load_request(
             pdf_password: pdf_password.map(String::from),
             ..base
         }),
+        GridItem::ConvertibleArchive { path, format } => {
+            let archive_key = crate::path_key::normalize_keep_drive(path);
+            let cached_zip = converted_archive_cache_paths.get(&archive_key)?;
+            let base_key = convertible_archive_cache_base_key(path, *format, use_full_path_keys)?;
+            if let Some(
+                source @ crate::folder_thumb_pins::FolderPinSource::ZipEntry { zip_rel, entry },
+            ) = pin_map.get(&archive_key)
+                && zip_rel.is_empty()
+                && !entry.is_empty()
+            {
+                return Some(LoadRequest {
+                    path: cached_zip.clone(),
+                    zip_entry: Some(entry.clone()),
+                    cache_key_override: Some(convertible_archive_pinned_cache_key(
+                        &base_key, source, mtime, file_size,
+                    )),
+                    ..base
+                });
+            }
+            Some(LoadRequest {
+                path: cached_zip.clone(),
+                cache_key_override: Some(base_key),
+                resolve_override: Some(crate::thumb_loader::ResolveStrategy::ZipFirstImage),
+                ..base
+            })
+        }
         GridItem::ZipFile(p) => {
             // zip_entry は None のままにしておき、ワーカー側でキャッシュミス時に
             // 遅延解決する (UI スレッドで ZIP を開く I/O を避けるため)。
@@ -32253,6 +32417,7 @@ fn make_load_request(
 /// (Codex Phase B P2 指摘)。
 fn folder_thumb_existing_keys_for(
     item: &GridItem,
+    item_meta: Option<(i64, i64)>,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     folder_thumb_sort: Option<crate::settings::SortOrder>,
@@ -32263,7 +32428,7 @@ fn folder_thumb_existing_keys_for(
     // しないように、必ず同じ helper (`container_cache_base_key`) を経由する。
     use_full_path_keys: bool,
 ) -> Vec<String> {
-    let container_path = match item {
+    let (container_path, convertible_format) = match item {
         GridItem::Image(p) => {
             // Image はそもそも pinned 経路に乗らないので 1 つだけ。
             return if use_full_path_keys {
@@ -32275,9 +32440,33 @@ fn folder_thumb_existing_keys_for(
                     .unwrap_or_default()
             };
         }
-        GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => p,
+        GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => (p, None),
+        GridItem::ConvertibleArchive { path, format } => (path, Some(*format)),
         _ => return Vec::new(),
     };
+
+    if let Some(format) = convertible_format {
+        let Some(base_key) =
+            convertible_archive_cache_base_key(container_path, format, use_full_path_keys)
+        else {
+            return Vec::new();
+        };
+        let mut keys = vec![base_key.clone()];
+        let container_key = crate::path_key::normalize_keep_drive(container_path);
+        if let (Some((mtime, file_size)), Some(source)) = (item_meta, pin_map.get(&container_key))
+            && matches!(
+                source,
+                crate::folder_thumb_pins::FolderPinSource::ZipEntry { zip_rel, entry }
+                    if zip_rel.is_empty() && !entry.is_empty()
+            )
+        {
+            keys.push(convertible_archive_pinned_cache_key(
+                &base_key, source, mtime, file_size,
+            ));
+        }
+        return keys;
+    }
+
     let Some(base_key) = container_cache_base_key(
         item,
         use_full_path_keys,
@@ -33115,16 +33304,23 @@ pub(crate) fn draw_cell(
             );
         }
         GridItem::ConvertibleArchive { path, format } => {
-            // RAR / 7z / LZH: クリック時に ZIP 変換→閲覧のフロー。サムネイルなしで
-            // 汎用アーカイブアイコン + 形式バッジで表示する。
-            painter.rect_filled(inner, 2.0, pending_placeholder_bg);
-            painter.text(
-                inner.center(),
-                egui::Align2::CENTER_CENTER,
-                "🗜",
-                egui::FontId::proportional(32.0),
-                egui::Color32::from_gray(120),
-            );
+            // RAR / 7z / LZH: 有効な変換キャッシュ ZIP があれば、その先頭画像 / ピン画像を
+            // 表示する。未変換・キャッシュ失効時は汎用アーカイブアイコンへフォールバック。
+            match thumb {
+                ThumbnailState::Loaded { tex, .. } => {
+                    draw_thumb_texture(painter, inner, tex, rotation);
+                }
+                ThumbnailState::Pending | ThumbnailState::Evicted | ThumbnailState::Failed => {
+                    painter.rect_filled(inner, 2.0, pending_placeholder_bg);
+                    painter.text(
+                        inner.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "🗜",
+                        egui::FontId::proportional(32.0),
+                        egui::Color32::from_gray(120),
+                    );
+                }
+            }
             crate::ui_helpers::draw_archive_badge(painter, inner, format.label());
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             crate::ui_helpers::draw_cell_filename(
