@@ -85,6 +85,13 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 - 実機サンプル生成: `python scripts/make_nested_archive_test.py` (7z 系は 7-Zip、
   rar 系は WinRAR が必要)
 
+**受容済みトレードオフ (設計時合意、Codex P2 で再確認)**: 非 ZIP 入れ子を含む ZIP を
+変換すると、ページの永続キーが `元ZIP::entry` から `キャッシュZIP::entry` に変わる
+(回転/補正/レーティング/タグの紐付け基準が変換後キーに移る)。変換**前**にその ZIP で
+付けた編集は変換後ビューに現れない。RAR 等の入れ子を含む ZIP は元々中身が見えて
+いなかった = 編集対象になりにくく、実害は限定的と判断して受容。純 ZIP-in-ZIP は
+無変換のままなので一般ケースの entry_name 不変は維持される。
+
 ### 変換アーカイブ閲覧中の current_folder と「ユーザー視点パス」の二重化
 
 RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<hash>\book.zip`)、以降は

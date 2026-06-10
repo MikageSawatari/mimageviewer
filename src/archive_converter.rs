@@ -489,8 +489,7 @@ fn do_convert(
     };
     drop(ctx);
 
-    zw.finish()
-        .map_err(|e| ConvertError::Archive(e.to_string()))?;
+    zw.finish().map_err(zip_writer_error)?;
     Ok(summary)
 }
 
@@ -557,7 +556,7 @@ impl ConvertCtx<'_> {
         let name = dedup_entry_name(name, &mut self.seen_names);
         self.zw
             .start_file(&name, store_options())
-            .map_err(|e| ConvertError::Archive(e.to_string()))?;
+            .map_err(zip_writer_error)?;
         let copied = match std::io::copy(r, &mut *self.zw) {
             Ok(n) => n,
             Err(e) => {
@@ -574,7 +573,7 @@ impl ConvertCtx<'_> {
         let name = dedup_entry_name(name, &mut self.seen_names);
         self.zw
             .start_file(&name, store_options())
-            .map_err(|e| ConvertError::Archive(e.to_string()))?;
+            .map_err(zip_writer_error)?;
         if let Err(e) = self.zw.write_all(data) {
             let _ = self.zw.abort_file();
             return Err(ConvertError::Io(e));
@@ -587,6 +586,17 @@ impl ConvertCtx<'_> {
         self.bytes_written = self.bytes_written.saturating_add(copied);
         self.files_done += 1;
         self.emit_progress();
+    }
+}
+
+/// 出力 ZIP writer のエラーを ConvertError へ写像する。**Io は Io のまま保つ**こと:
+/// `expand_nested_guarded` は Archive 系 (入れ子アーカイブ自体の解析失敗) だけを
+/// 握って skip するので、出力側のディスク/ストリーム障害を Archive に丸めると
+/// 「エントリの欠けた cache ZIP が成功扱いで残る」事故になる (Codex P2)。
+fn zip_writer_error(e: zip::result::ZipError) -> ConvertError {
+    match e {
+        zip::result::ZipError::Io(io) => ConvertError::Io(io),
+        other => ConvertError::Archive(other.to_string()),
     }
 }
 

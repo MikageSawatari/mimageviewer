@@ -9503,6 +9503,29 @@ impl App {
             self.apply_spread_for_key_with_fallback(&key, fb.as_deref());
         }
 
+        // 列挙で非 ZIP アーカイブ (RAR/7z/LZH) を検出した場合の変換提案の段取り。
+        // 自動フルスクリーン予約 (deferred) と同フレームでぶつかると、提案ダイアログが
+        // メインビューポート側に出てフルスクリーンビューポートの裏に隠れる (Codex P2):
+        // - 読書中の流入 (fs_nav lock 保持 = Ctrl+↑↓ / スライドショー / ★固定ナビ):
+        //   フルスクリーン継続を優先して今回は提案しない (グリッドから開き直すと出る)
+        // - グリッドからの自動フルスクリーン予約 (lock なし): FS 予約を取り下げて提案を
+        //   出し、変換完了後の自動フルスクリーンへ引き継ぐ (ConvertState.auto_fullscreen)
+        let offer_foreign = has_foreign_archives
+            && self
+                .zip_nav
+                .as_ref()
+                .is_some_and(|nav| self.zip_foreign_offer_applicable(&nav.tree.zip_path));
+        let mut offer_now = offer_foreign;
+        let mut offer_auto_fs = false;
+        if offer_foreign && self.fs_nav_after_pdf_enumerate.is_some() {
+            if self.fs_nav_is_locked() {
+                offer_now = false;
+            } else {
+                self.fs_nav_after_pdf_enumerate = None;
+                offer_auto_fs = true;
+            }
+        }
+
         // Ctrl+↑↓ フォルダナビから fullscreen で ZIP に遷移してきた場合、items が
         // 揃った今 fullscreen を開き直す (Codex P1: PDF と同じ処理を ZIP にも適用)。
         if let Some(deferred) = self.fs_nav_after_pdf_enumerate.take() {
@@ -9535,44 +9558,45 @@ impl App {
         // 列挙で非 ZIP アーカイブ (RAR/7z/LZH) を検出した場合、入れ子を展開した
         // 閲覧用キャッシュへの変換を提案する (v1.3.0)。ツリー表示は既に出ている
         // (非 ZIP の中身だけが見えない) ので、キャンセルしてもそのまま閲覧できる。
-        if has_foreign_archives {
-            let zip_path = self
-                .zip_nav
-                .as_ref()
-                .map(|nav| nav.tree.zip_path.clone())
-                .unwrap_or_default();
-            if !zip_path.as_os_str().is_empty() {
-                self.offer_zip_foreign_archive_conversion(&zip_path);
+        if offer_now {
+            let zip_path = self.zip_nav.as_ref().map(|nav| nav.tree.zip_path.clone());
+            if let Some(zip_path) = zip_path {
+                self.offer_zip_foreign_archive_conversion(&zip_path, offer_auto_fs);
             }
         }
+    }
+
+    /// `offer_zip_foreign_archive_conversion` を出してよい状況か (ループ / 多重防止)。
+    /// - キャッシュ ZIP 自身では提案しない (変換出力は非 ZIP アーカイブのファイル
+    ///   エントリを含まないので通常 flag 自体立たないが、手作りの類似 ZIP への防御)
+    /// - RAR 等の変換キャッシュを開いている最中 (`archive_source_override`) も同様
+    /// - 既に別の変換ダイアログが動作中なら出さない
+    fn zip_foreign_offer_applicable(&self, zip_path: &Path) -> bool {
+        !crate::archive_cache::is_under_cache_root(zip_path)
+            && self.archive_source_override.is_none()
+            && self.archive_convert.is_none()
     }
 
     /// ZIP 列挙で非 ZIP アーカイブ (RAR/7z/LZH) を検出したときの「入れ子を展開した
     /// 閲覧用キャッシュへの変換」提案 (v1.3.0)。`ArchiveFormat::Zip` で既存の変換
     /// ダイアログ (`request_archive_convert`) に乗せる。変換完了後はキャッシュ ZIP を
     /// `archive_source_override` 付きで開く (RAR 等と同じ pending_nav 経路)。
-    fn offer_zip_foreign_archive_conversion(&mut self, zip_path: &Path) {
-        // キャッシュ ZIP 自身では提案しない (変換出力は非 ZIP アーカイブのファイル
-        // エントリを含まないので通常 flag 自体立たないが、手作りの類似 ZIP への防御)。
-        // RAR 等の変換キャッシュを開いている最中 (archive_source_override) も同様。
-        if crate::archive_cache::is_under_cache_root(zip_path)
-            || self.archive_source_override.is_some()
-        {
+    /// `auto_fullscreen` はグリッドの自動フルスクリーン予約を取り下げて提案に
+    /// 置き換えた場合に true (変換完了後に 1 ページ目を自動フルスクリーン表示)。
+    fn offer_zip_foreign_archive_conversion(&mut self, zip_path: &Path, auto_fullscreen: bool) {
+        if !self.zip_foreign_offer_applicable(zip_path) {
             return;
-        }
-        if self.archive_convert.is_some() {
-            return; // 既に別の変換ダイアログが動作中 (二重起動防止)
         }
         // 既にキャッシュがある (開いている間に別経路で変換が完了した等) なら
         // ダイアログを出さずそのまま振り替える。
         if let Some(cached) = self.try_archive_cache_lookup(zip_path) {
-            let _ = self.open_archive_via_cache(zip_path.to_path_buf(), cached, false);
+            let _ = self.open_archive_via_cache(zip_path.to_path_buf(), cached, auto_fullscreen);
             return;
         }
         let _ = self.request_archive_convert(
             zip_path.to_path_buf(),
             crate::archive_converter::ArchiveFormat::Zip,
-            false,
+            auto_fullscreen,
         );
     }
 

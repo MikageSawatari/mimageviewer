@@ -548,6 +548,9 @@ pub fn read_entry_bytes(zip_path: &Path, entry_name: &str) -> std::io::Result<Ve
     // - 変換キャッシュ: 常にここで解決される (ネスト展開コストなし)。
     // - 実ネスト ZIP: フルネームのエントリは存在しないので 1 回 miss して従来経路へ。
     //   miss を払うのは NESTED_CACHE が冷えている初回だけ (ヒット後はこの分岐に来ない)。
+    // - 病的ケース: 同一 ZIP が実エントリ "book.zip" と literal "book.zip/p.jpg" を
+    //   **両方**持つ場合、cold 読みは literal 側を返す (列挙も両方を別エントリとして
+    //   挙げており identity は元々曖昧。どちらかを決定的に選ぶ仕様とする、Codex P3)。
     if current_bytes.is_none() {
         if let Ok(bytes) = read_entry_from_disk(zip_path, entry_name) {
             return Ok(bytes);
