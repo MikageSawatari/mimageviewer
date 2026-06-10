@@ -1174,12 +1174,7 @@ fn hash_adjust_final_params(
         // 最終表示段スマートシャープ。post_filter バイパス (消しゴム / 隠蔽 / 分析) 中も
         // 色調補正と同様に適用したままにするので、bypassed の条件外で hash する。
         // color_ai hash には含めない (= 強度変更で final AI を再実行させない)。
-        // skip フラグは強度 0 のとき出力に影響しない no-op なので hash にも含めない
-        // (正規化前の一時状態でも無意味な composite 再生成を起こさない、Codex P2)。
         params.smart_sharpen.hash(h);
-        if params.smart_sharpen != 0 {
-            params.smart_sharpen_skip_after_ai.hash(h);
-        }
     })
 }
 
@@ -24319,8 +24314,8 @@ impl App {
 
         // 最終表示段スマートシャープ: 色調補正 → final AI → **ここ** → post_filter。
         // AI 入力 (`adjusted`) には掛けない (シャープ強度の変更で AI を再実行させない)。
-        // 「AI アップスケール実行時は適用しない」(既定 ON) は、ベースが実際に
-        // アップスケール出力 (= 元よりサイズの大きい AI 結果) のときだけ発動する。
+        // AI アップスケール実行時のスキップは**固定動作** (設定なし): ベースが実際に
+        // アップスケール出力 (= 元よりサイズの大きい AI 結果) のときは常に掛けない。
         // デノイズのみの AI 結果はサイズ不変なので通常どおり掛かる。AI 未完了の暫定
         // 合成 (complete=false) は非 AI 画像なので掛かり、AI 完了時の再合成で外れる。
         //
@@ -25486,9 +25481,6 @@ impl App {
     /// グローバルが AI ON の状態で個別に「AI OFF」を設定したいケースを取りこぼしたため、
     /// 標準との等価比較に変更した。お気に入り標準もこれで同じ扱いになる。
     pub(crate) fn set_page_params(&mut self, idx: usize, params: crate::adjustment::AdjustParams) {
-        // 保存前正規化: 強度 0 の skip フラグのような no-op 差分を既定値へ戻す
-        // (残すとフラグだけの個別設定が matches_default をすり抜ける、Codex P2)。
-        let params = params.normalized();
         // サムネ補正テクスチャは色調 (brightness..midtone + auto_mode) が変わるときだけ
         // 落とす。post_filter / smart_sharpen はサムネに乗らないため温存できる。
         let thumb_color_changed = !self.effective_params(idx).color_settings_eq(&params);
@@ -25601,8 +25593,6 @@ impl App {
     /// 書換の前後で AI 設定 (upscale/denoise) が変わったページは ai_upscale_cache /
     /// failed / pending もクリアして、次フレームで再実行されるようにする。
     pub(crate) fn apply_params_to_all_pages(&mut self, params: crate::adjustment::AdjustParams) {
-        // 保存前正規化 (set_page_params と同じ理由、Codex P2)。
-        let params = params.normalized();
         let (indices, keys) = self.collect_image_page_keys();
         let sidecar_coords = self.collect_image_sidecar_coords();
         // 書換後の effective params は全画像ページで `params` になる。
@@ -25702,8 +25692,6 @@ impl App {
     /// global の AI 設定が変わった場合、個別設定を持たない (= global を継承している)
     /// 画像ページの AI キャッシュもクリアして、新 global での再実行を促す。
     pub(crate) fn copy_params_to_global(&mut self, params: crate::adjustment::AdjustParams) {
-        // 保存前正規化 (set_page_params と同じ理由、Codex P2)。
-        let params = params.normalized();
         let ai_changed = !self.settings.global_preset.ai_settings_eq(&params);
         let ai_changed_indices: Vec<usize> = if ai_changed {
             // global を継承しているページ (個別 / お気に入り標準のどちらもない) だけ影響
@@ -25726,8 +25714,6 @@ impl App {
         favorite_id: uuid::Uuid,
         new_value: Option<crate::adjustment::AdjustParams>,
     ) {
-        // 保存前正規化 (set_page_params と同じ理由、Codex P2)。
-        let new_value = new_value.map(crate::adjustment::AdjustParams::normalized);
         let old = self.adjustment_favorite_params.get(&favorite_id).cloned();
         let new_effective = new_value
             .clone()
@@ -26107,7 +26093,7 @@ impl App {
         self.compare_view_mode = CompareViewMode::Off;
     }
 
-    /// final 専用フィールド (post_filter / smart_sharpen / skip フラグ) **だけ** が
+    /// final 専用フィールド (post_filter / smart_sharpen) **だけ** が
     /// 変わったときの cache clear。
     ///
     /// これらは final AI より後段にしか効かず、final AI の入力 (色調補正後の edit 画像)

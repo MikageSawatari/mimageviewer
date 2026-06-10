@@ -7448,7 +7448,10 @@ fn draw_sliders(
             )
             .on_hover_text(
                 "最終表示に輪郭中心のシャープ化 (スマートシャープ) を適用します。\n\
-                 コピー・書き出しにも反映されます。サムネイルには反映されません。",
+                 コピー・書き出しにも反映されます。サムネイルには反映されません。\n\
+                 AI アップスケールで拡大した画像は既に輪郭が強調されているため、\n\
+                 アップスケール実行時は適用されません (ノイズ除去のみの場合や、\n\
+                 サイズ上限でアップスケールされなかった画像には適用されます)。",
             );
             if strength != 0.0
                 && ui
@@ -7461,6 +7464,20 @@ fn draw_sliders(
                 changed = true;
             }
         });
+        // AI アップスケールが実行される画像では掛からない (固定動作。チェックボックス
+        // 案は「強度 0 のとき意味を持たないフラグが個別設定として残る」問題が UX と
+        // 両立せず撤回、2026-06-10 ユーザー判断)。サイズ上限の無効表示と同じ形で案内する。
+        let upscale_will_run = params.upscale_model.is_some()
+            && !current_upscale_blocked
+            && ai_upscale_disabled_limit.is_none();
+        if upscale_will_run {
+            ui.label(
+                egui::RichText::new("（AI アップスケール実行時は適用されません）")
+                    .size(SECTION_FONT - 1.0)
+                    .color(egui::Color32::from_gray(150))
+                    .italics(),
+            );
+        }
         let r = ui.add(egui::Slider::new(&mut strength, 0.0..=100.0).step_by(1.0));
         if r.changed() {
             params.smart_sharpen = strength as u8;
@@ -7468,26 +7485,6 @@ fn draw_sliders(
         }
         if r.dragged() {
             dragging = true;
-        }
-        let mut skip_after_ai = params.smart_sharpen_skip_after_ai;
-        // 強度 0 のときは効かない設定なので disabled 表示にする (Codex P3)。
-        if ui
-            .add_enabled(
-                params.smart_sharpen > 0,
-                egui::Checkbox::new(
-                    &mut skip_after_ai,
-                    egui::RichText::new("AI アップスケール実行時は適用しない").color(LABEL_COLOR),
-                ),
-            )
-            .on_hover_text(
-                "AI アップスケールで拡大した画像は既に輪郭が強調されていることが多いため、\n\
-                 二重にシャープがかかるのを防ぎます。ノイズ除去のみの場合や、サイズ上限で\n\
-                 アップスケールが実行されなかった画像には通常どおり適用されます。",
-            )
-            .changed()
-        {
-            params.smart_sharpen_skip_after_ai = skip_after_ai;
-            changed = true;
         }
     }
 
@@ -12119,9 +12116,7 @@ impl App {
         if confirmed && !name_input.trim().is_empty() {
             self.settings.preset_slots.slots[slot_idx] = Some(PresetSlot {
                 name: name_input.trim().to_string(),
-                // 保存前正規化: 強度 0 の skip フラグのような no-op 差分を既定値へ
-                // (set_page_params と同じ理由、Codex P2)。
-                params: params.normalized(),
+                params,
             });
             self.settings.save();
             let key_label = crate::adjustment::slot_key_label(slot_idx);

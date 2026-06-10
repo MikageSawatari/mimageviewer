@@ -8764,36 +8764,30 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
-    /// Codex P2 再現手順: 強度を上げる → skip チェックを外す → ↩ で強度 0 に戻す。
-    /// 正規化 (`AdjustParams::normalized`) により no-op の skip フラグ差分だけの
-    /// 個別設定 (補バッジ / DB 行) が残らないこと。
+    /// シャープ化以外が既定のページで、強度を上げてから ↩ で 0 に戻すと
+    /// 個別設定 (補バッジ / DB 行) が綺麗に消えること。AI 時スキップは固定動作で
+    /// 保存フィールドを持たないため、no-op 設定が残る経路が存在しない
+    /// (旧チェックボックス実装で問題化した Codex P2 / 2026-06-10 ユーザー要望の回帰ガード)。
     #[test]
-    fn resetting_strength_to_zero_drops_noop_skip_flag_override() {
+    fn resetting_strength_to_zero_removes_override_cleanly() {
         let mut app = setup_app();
-        let idx = push_image(&mut app, "C:/pics/noop-skip.jpg");
+        let idx = push_image(&mut app, "C:/pics/reset-clean.jpg");
 
-        // 強度 60 + skip OFF → 個別設定として保存される
         let mut active = app.effective_params(idx).clone();
         active.smart_sharpen = 60;
-        active.smart_sharpen_skip_after_ai = false;
         app.set_page_params(idx, active.clone());
         assert!(
             app.adjustment_page_params.contains_key(&idx),
-            "active sharpen settings must persist as a page override"
-        );
-        // 強度 > 0 の間はユーザーの skip OFF 選択が保持される
-        assert!(
-            !app.effective_params(idx).smart_sharpen_skip_after_ai,
-            "skip=false must be preserved while strength > 0"
+            "non-zero strength must persist as a page override"
         );
 
-        // ↩ リセット相当: 強度だけ 0 に戻す (UI は skip フラグを触らない)
+        // ↩ リセット相当: 強度を 0 に戻す → 既定と完全一致して個別設定が消える
         let mut reset = active;
         reset.smart_sharpen = 0;
         app.set_page_params(idx, reset);
         assert!(
             !app.adjustment_page_params.contains_key(&idx),
-            "no-op skip flag must be normalized away so the override is removed"
+            "resetting strength to 0 must remove the override (no residual fields)"
         );
     }
 
@@ -8986,27 +8980,6 @@ mod pipeline_cache_refactor_tests {
             hash_adjust_final_params(&base, mode, true),
             hash_adjust_final_params(&sharpened, mode, true),
         );
-        // 「AI アップスケール実行時は適用しない」フラグも final hash にだけ乗る。
-        // ただし強度 0 のときは出力に影響しない no-op なので hash に含めない (Codex P2)。
-        let mut skip_off_at_zero = base.clone();
-        skip_off_at_zero.smart_sharpen_skip_after_ai = false;
-        assert_eq!(
-            hash_adjust_final_params(&base, mode, false),
-            hash_adjust_final_params(&skip_off_at_zero, mode, false),
-            "no-op skip flag (strength 0) must not split the final hash"
-        );
-        let mut skip_off_active = sharpened.clone();
-        skip_off_active.smart_sharpen_skip_after_ai = false;
-        assert_ne!(
-            hash_adjust_final_params(&sharpened, mode, false),
-            hash_adjust_final_params(&skip_off_active, mode, false),
-            "skip flag must invalidate the final composite cache when strength > 0"
-        );
-        assert_eq!(
-            hash_adjust_color_ai_params(&sharpened, mode),
-            hash_adjust_color_ai_params(&skip_off_active, mode),
-            "skip flag must NOT invalidate the final AI cache"
-        );
     }
 
     /// 「AI アップスケール実行時は適用しない」(既定 ON): 合成ベースが実際に
@@ -9044,11 +9017,10 @@ mod pipeline_cache_refactor_tests {
             },
         );
 
-        // ページ個別: シャープ 100 + アップスケール指定 (skip フラグは既定 ON)
+        // ページ個別: シャープ 100 + アップスケール指定
         let mut params = crate::adjustment::AdjustParams::default();
         params.smart_sharpen = 100;
         params.upscale_model = Some("realesr_general_v3".to_string());
-        assert!(params.smart_sharpen_skip_after_ai);
         app.adjustment_page_params.insert(idx, params.clone());
 
         // 2x アップスケール済みの AI 結果 (8x2) を final_ai_cache に直接投入
@@ -9069,30 +9041,39 @@ mod pipeline_cache_refactor_tests {
                 .expect("final composite must exist")
         };
 
-        // skip ON (既定): 合成は AI 結果そのまま (シャープ非適用)
+        // アップスケール出力 (サイズが入力と異なる) には固定でシャープを掛けない
         let _ = app
             .ensure_final_composite_texture(&ctx, idx)
-            .expect("composite with skip ON");
+            .expect("composite with upscaled AI result");
         let skipped = composite_pixels(&app);
         assert_eq!(skipped.size, [8, 2], "AI 結果のサイズで合成される");
         assert_eq!(
             skipped.pixels, ai_image.pixels,
-            "skip ON では AI アップスケール出力にシャープを掛けない"
+            "AI アップスケール出力にはシャープを掛けない (固定動作)"
         );
 
-        // skip OFF: 同じ AI 結果にシャープが掛かり、エッジ画素が変化する
-        let mut params_off = params.clone();
-        params_off.smart_sharpen_skip_after_ai = false;
-        app.adjustment_page_params.insert(idx, params_off);
+        // 対照: サイズ不変の AI 結果 (デノイズのみ相当) には通常どおりシャープが掛かる
+        let mut params_dn = crate::adjustment::AdjustParams::default();
+        params_dn.smart_sharpen = 100;
+        params_dn.denoise_model = Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string());
+        app.adjustment_page_params.insert(idx, params_dn.clone());
+        let dn_image = edge_row(4, 1);
+        let dn_key = FinalAiKey {
+            edit_key,
+            color_ai_hash: hash_adjust_color_ai_params(&params_dn, app.settings.ai_feature_mode),
+            bg: 0,
+        };
+        app.final_ai_cache
+            .insert(dn_key, Arc::new(dn_image.clone()));
         app.final_composite_cache.clear();
         let _ = app
             .ensure_final_composite_texture(&ctx, idx)
-            .expect("composite with skip OFF");
+            .expect("composite with denoise-only AI result");
         let sharpened = composite_pixels(&app);
-        assert_eq!(sharpened.size, [8, 2]);
+        assert_eq!(sharpened.size, [4, 1]);
         assert_ne!(
-            sharpened.pixels, ai_image.pixels,
-            "skip OFF では AI 出力にもシャープが掛かる"
+            sharpened.pixels, dn_image.pixels,
+            "サイズ不変の AI 結果 (デノイズのみ) には通常どおりシャープが掛かる"
         );
     }
 

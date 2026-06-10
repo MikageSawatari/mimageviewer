@@ -301,19 +301,17 @@ pub struct AdjustParams {
     /// サムネイルには反映せず、フルスクリーン最終表示・コピー・書き出しの final pixels に
     /// だけ掛かる (docs/final-smart-sharpen-plan.md)。色調補正 → final AI の後、
     /// post_filter の前に適用される。
-    #[serde(default)]
-    pub smart_sharpen: u8,
-    /// AI アップスケールが実行された合成にはシャープ化を掛けない (既定 ON)。
+    ///
+    /// AI アップスケールが実行された合成には**常に掛けない** (固定動作、設定なし)。
     /// アップスケールモデルの出力は既に輪郭強調済みのことが多く、二重シャープで
     /// 見た目が悪化しやすいため。判定は「設定が AI ON か」ではなく「この合成が実際に
     /// アップスケール出力 (サイズの変わった AI 結果) を採用したか」で行うので、
-    /// デノイズのみ・サイズ上限スキップのページには通常どおり掛かる。
-    #[serde(default = "default_smart_sharpen_skip_after_ai")]
-    pub smart_sharpen_skip_after_ai: bool,
-}
-
-fn default_smart_sharpen_skip_after_ai() -> bool {
-    true
+    /// デノイズのみ・サイズ上限スキップのページには通常どおり掛かる
+    /// (`effective_smart_sharpen`)。当初はチェックボックスで切替可能にしていたが、
+    /// 「強度 0 のとき意味を持たないフラグが個別設定として残る」問題が UX と両立
+    /// できず、固定動作に変更した (2026-06-10 ユーザー判断)。
+    #[serde(default)]
+    pub smart_sharpen: u8,
 }
 
 impl Default for AdjustParams {
@@ -332,7 +330,6 @@ impl Default for AdjustParams {
             denoise_model: None,
             post_filter: PostFilter::None,
             smart_sharpen: 0,
-            smart_sharpen_skip_after_ai: default_smart_sharpen_skip_after_ai(),
         }
     }
 }
@@ -391,8 +388,8 @@ impl AdjustParams {
             && self.auto_mode == other.auto_mode
     }
 
-    /// other との差分が final 専用フィールド (`post_filter` / `smart_sharpen` /
-    /// `smart_sharpen_skip_after_ai`) のみ (または差分なし) か。
+    /// other との差分が final 専用フィールド (`post_filter` / `smart_sharpen`)
+    /// のみ (または差分なし) か。
     /// これらは final pipeline の final AI より後段にしか効かないので、変更時に
     /// final AI cache を保持したまま再合成だけで済ませられる
     /// (`App::clear_final_stage_only_caches`)。final 専用フィールドを増やしたら
@@ -401,34 +398,19 @@ impl AdjustParams {
         let mut probe = self.clone();
         probe.post_filter = other.post_filter;
         probe.smart_sharpen = other.smart_sharpen;
-        probe.smart_sharpen_skip_after_ai = other.smart_sharpen_skip_after_ai;
         probe == *other
     }
 
     /// 最終合成で実際に使うシャープ化強度を解決する。
     /// `output_is_ai_upscaled` = 合成ベースが AI アップスケール出力 (元よりサイズの
-    /// 大きい AI 結果) のとき true。「AI アップスケール実行時は適用しない」が ON で
-    /// アップスケール出力なら 0 (= スキップ) を返す。
+    /// 大きい AI 結果) のとき true。アップスケール出力には常に 0 (= スキップ、
+    /// 固定動作)。デノイズのみ・サイズ上限スキップには通常どおり強度を返す。
     pub fn effective_smart_sharpen(&self, output_is_ai_upscaled: bool) -> u8 {
-        if self.smart_sharpen_skip_after_ai && output_is_ai_upscaled {
+        if output_is_ai_upscaled {
             0
         } else {
             self.smart_sharpen
         }
-    }
-
-    /// 保存前の正規化。シャープ強度 0 のとき `smart_sharpen_skip_after_ai` は
-    /// 効果を持たない no-op なので既定値へ戻す。これをしないと「強度を上げる →
-    /// チェックを外す → ↩ で 0 に戻す」の手順で、見た目は完全無効なのにフラグ差分
-    /// だけの個別設定 (補バッジ / DB 行) が残る (Codex P2 2026-06-10)。
-    /// パラメータの書き込み入口 (set_page_params / bulk / グローバル / お気に入り /
-    /// スロット保存) で呼ぶ。no-op になりうる正規化対象フィールドを増やしたら
-    /// ここに追加する。
-    pub fn normalized(mut self) -> Self {
-        if self.smart_sharpen == 0 {
-            self.smart_sharpen_skip_after_ai = default_smart_sharpen_skip_after_ai();
-        }
-        self
     }
 
     pub fn upscale_model_kind(&self) -> Option<Option<crate::ai::ModelKind>> {
@@ -994,10 +976,6 @@ mod tests {
         assert!(base.differs_only_in_final_stage(&sharpen));
         // 差分なしも true (最も安い clear 経路に流れるだけで無害)
         assert!(base.differs_only_in_final_stage(&base));
-        // skip フラグのトグルも final 専用の差分 (AI 入力不変)
-        let mut skip_toggled = base.clone();
-        skip_toggled.smart_sharpen_skip_after_ai = !base.smart_sharpen_skip_after_ai;
-        assert!(base.differs_only_in_final_stage(&skip_toggled));
         // post_filter のみ / post_filter + シャープ併用も final 専用の差分
         let mut pf_only = base.clone();
         pf_only.post_filter = PostFilter::Sepia;
@@ -1015,52 +993,36 @@ mod tests {
     }
 
     #[test]
-    fn smart_sharpen_skip_after_ai_defaults_on_and_resolves_strength() {
-        let params = AdjustParams::default();
-        assert!(
-            params.smart_sharpen_skip_after_ai,
-            "既定は ON (AI 時スキップ)"
-        );
-
-        let mut sharpen = params.clone();
+    fn effective_smart_sharpen_always_skips_upscaled_output() {
+        // AI アップスケール出力には固定でスキップ (設定なし)。
+        // 非 AI 合成 (デノイズのみ / サイズ上限スキップ含む) には強度どおり掛ける。
+        let mut sharpen = AdjustParams::default();
         sharpen.smart_sharpen = 60;
-        // skip ON: アップスケール出力には掛けない / 非 AI 合成には掛ける
         assert_eq!(sharpen.effective_smart_sharpen(true), 0);
         assert_eq!(sharpen.effective_smart_sharpen(false), 60);
-        // skip OFF: 常に掛ける
-        sharpen.smart_sharpen_skip_after_ai = false;
-        assert_eq!(sharpen.effective_smart_sharpen(true), 60);
-        assert_eq!(sharpen.effective_smart_sharpen(false), 60);
-    }
-
-    #[test]
-    fn normalized_resets_noop_skip_flag_at_zero_strength() {
-        // 強度 0 でフラグだけ非既定 → 正規化で既定に戻り、default と等価になる
-        // (= no-op の個別設定が残らない、Codex P2)。
-        let mut noop = AdjustParams::default();
-        noop.smart_sharpen_skip_after_ai = false;
-        assert_eq!(noop.normalized(), AdjustParams::default());
-
-        // 強度 > 0 ならユーザーの選択 (フラグ OFF) は保持される。
-        let mut active = AdjustParams::default();
-        active.smart_sharpen = 60;
-        active.smart_sharpen_skip_after_ai = false;
-        let normalized = active.clone().normalized();
-        assert_eq!(normalized, active);
-        assert!(!normalized.smart_sharpen_skip_after_ai);
+        let off = AdjustParams::default();
+        assert_eq!(off.effective_smart_sharpen(true), 0);
+        assert_eq!(off.effective_smart_sharpen(false), 0);
     }
 
     #[test]
     fn smart_sharpen_fields_deserialize_with_defaults_when_missing() {
-        // 旧形式 JSON (シャープ化フィールドなし) からの読み込みで
-        // strength=0 / skip=ON に解決されること (#[serde(default)] の回帰ガード)。
+        // 旧形式 JSON (シャープ化フィールドなし) からの読み込みで strength=0 に
+        // 解決されること (#[serde(default)] の回帰ガード)。
         let mut value = serde_json::to_value(AdjustParams::default()).unwrap();
         let obj = value.as_object_mut().unwrap();
         obj.remove("smart_sharpen");
-        obj.remove("smart_sharpen_skip_after_ai");
+        let loaded: AdjustParams = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(loaded.smart_sharpen, 0);
+
+        // 開発期に存在した撤去済みフィールド (smart_sharpen_skip_after_ai) が
+        // 残っている JSON も無視して読めること (serde は未知フィールドを許容)。
+        value.as_object_mut().unwrap().insert(
+            "smart_sharpen_skip_after_ai".to_string(),
+            serde_json::Value::Bool(false),
+        );
         let loaded: AdjustParams = serde_json::from_value(value).unwrap();
         assert_eq!(loaded.smart_sharpen, 0);
-        assert!(loaded.smart_sharpen_skip_after_ai);
     }
 
     #[test]

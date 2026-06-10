@@ -386,9 +386,15 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
   `local_adjust_core::SmartSharpenParams` を生成 (アンカー 0/30/60/100 の線形補間)。
   本体は `local_adjust_core::apply_smart_sharpen_rgba` (補正レイヤーの
   `LocalEffect::SmartSharpen` と同じ計算式、rayon 行並列、radius は 3.0 に clamp)。
-- **AI アップスケール実行時のスキップ (`smart_sharpen_skip_after_ai`、既定 ON)**:
+- **AI アップスケール実行時のスキップ (固定動作、設定なし)**:
   アップスケールモデルの出力は既に輪郭強調済みのことが多く、二重シャープで見た目が
-  悪化しやすいため、既定でスキップする (パネルのチェックボックスで解除可)。判定は
+  悪化しやすいため、アップスケール出力には**常に掛けない**。パネルにはサイズ上限の
+  無効表示と同じ形式で「（AI アップスケール実行時は適用されません）」の注記を出す。
+  当初はチェックボックス (`smart_sharpen_skip_after_ai`、既定 ON) で切替可能にして
+  いたが、「強度 0 のとき意味を持たないフラグが個別設定 (補バッジ / DB 行) として
+  残る」問題が、保存時正規化 (チェックが勝手に戻る) とも disabled 化 (操作不能) とも
+  UX が両立せず、固定動作に変更した (2026-06-10 ユーザー判断。AI 後に追いシャープ
+  したい要望が出たら別途検討)。判定は
   「設定が AI ON か」ではなく **合成ベースが実際にアップスケール出力か**
   (`base_is_ai && base_pixels.size != edit_pixels.size`)。サイズ比較の前提:
   アップスケール出力は `run_final_ai_job` の `clamp_color_image_for_gpu` で 8192px
@@ -405,8 +411,7 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
     で近似 (final pipeline 側がサイズ比較で厳密判定する)
 - **適用位置**: final pipeline の `色調補正 → final AI → スマートシャープ → post_filter`。
   AI 入力には掛けないので、強度変更で final AI は再実行されない
-  (`hash_adjust_final_params` には乗るが `hash_adjust_color_ai_params` には乗せない。
-  skip フラグも同様に final hash のみ)。
+  (`hash_adjust_final_params` には乗るが `hash_adjust_color_ai_params` には乗せない)。
   単ページ書き換え経路 (スライダー / T キーのポストフィルタ循環 / スロット適用 /
   見開き L/R コピー) は `App::clear_caches_for_param_change(idx, old, new)` で差分を
   分類し、「final 専用項目 (post_filter / smart_sharpen) だけの変更」なら
@@ -414,20 +419,6 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
   bulk 系 (全画像に適用 / 標準にする / お気に入り標準) は従来どおり
   `clear_all_color_caches` で final AI ごと全クリアされる (既知の過剰クリア。
   ワンショット操作なので許容)。
-- **保存前正規化 (`AdjustParams::normalized`)**: シャープ強度 0 のとき skip フラグは
-  no-op なので既定値 (ON) へ戻してから保存する。これをしないと「強度を上げる →
-  チェックを外す → ↩ で 0 に戻す」で、見た目は完全無効なのにフラグ差分だけの
-  個別設定 (補バッジ / DB 行) が残る (Codex P2 2026-06-10)。正規化はパラメータの
-  書き込み入口 (`set_page_params` / `apply_params_to_all_pages` /
-  `copy_params_to_global` / `apply_favorite_change` / スロット保存) で行う。
-  `hash_adjust_final_params` も強度 0 のときは skip フラグを hash に含めない
-  (正規化前の一時状態でも無意味な composite 再生成を起こさない)。
-  強度 > 0 の間はユーザーの skip OFF 選択は保持される。
-  **load / import 側 (DB ロード・favorite hydrate・settings ロード・sidecar import) は
-  意図的に正規化しない**: 書き込み入口が全て正規化するため、非正規データは
-  「正規化導入前に開発機で保存されたもの」しかありえず、本機能は未リリースなので
-  マイグレーション不要 (CLAUDE.md の永続データポリシー)。残骸の no-op 行があっても
-  次の書き込みで正規化されるか、Q (個別解除) で消える。
 - **サムネ無効化の色調 gate**: `set_page_params` / `clear_page_params` は
   `color_settings_eq` (brightness..midtone + auto_mode) が変わるときだけ
   `thumb_adjust_tex` を落とす。スライダードラッグ release の全クリアも
