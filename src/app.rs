@@ -7443,6 +7443,28 @@ impl App {
         }
     }
 
+    /// ソート順変更後の再表示。現在のビュー種別を保ったまま並べ替える。
+    ///
+    /// - **ネスト ZIP ツリー閲覧中**: 現在の階層を保ったまま新ソートで再 materialize。
+    ///   `load_folder(zip_path)` で開き直すと ZIP のルートへ飛んでしまうため
+    ///   (ユーザー報告: ソート変更で階層がリセットされる)。
+    /// - **Ctrl+G 検索結果ビュー**: 検索結果の並べ替えに反映 (実フォルダを再ロードしない)。
+    /// - **通常フォルダ**: スクロール履歴を捨てて先頭から再ロード。
+    pub(crate) fn apply_sort_change_reload(&mut self) {
+        if self.zip_nav.is_some() {
+            self.zip_nav_show_current_level();
+            return;
+        }
+        if self.global_search.active && self.items_are_global_search_view {
+            self.rebuild_items_from_global_search();
+            return;
+        }
+        if let Some(path) = self.current_folder.clone() {
+            self.folder_history.remove(&path);
+            self.load_folder(path);
+        }
+    }
+
     /// 通常の (事前スキャンなしの) フォルダロード。`scan_directory` を UI スレッドで
     /// 同期実行する。初期化 / 履歴復元 / 直接パス指定など、Ctrl+↑↓ 連打以外の
     /// すべての呼び出しが通る。
@@ -11751,7 +11773,12 @@ impl App {
     /// になる (Codex Phase D P2 指摘)。
     pub(crate) fn consume_folder_thumb_pin_dirty(&mut self) {
         if std::mem::take(&mut self.folder_thumb_pin_dirty) {
-            if let Some(cur) = self.current_folder.clone() {
+            // ネスト ZIP ツリー閲覧中は現在の階層を保ったまま再 materialize する。
+            // load_folder(zip_path) で開き直すと ZIP のルートに飛んでしまう
+            // (ユーザー報告: 内側ファイルを P でピンするとトップ階層にジャンプ)。
+            if self.zip_nav.is_some() {
+                self.zip_nav_show_current_level();
+            } else if let Some(cur) = self.current_folder.clone() {
                 self.folder_history.remove(&cur);
                 self.load_folder(cur);
             }

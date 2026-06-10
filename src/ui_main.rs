@@ -1090,11 +1090,8 @@ impl App {
         }
         if sort_changed {
             self.settings.save();
-            if let Some(path) = self.current_folder.clone() {
-                // スクロール履歴を捨てて先頭から再ロード
-                self.folder_history.remove(&path);
-                self.load_folder(path);
-            }
+            // ネスト ZIP は階層維持で再ソート、Ctrl+G は検索結果再ソート、通常は再ロード。
+            self.apply_sort_change_reload();
         }
 
         (fav_nav, sort_changed)
@@ -1688,17 +1685,11 @@ impl App {
             });
         }
 
-        // ツールバーのソート変更は borrow の関係で遅延実行
+        // ツールバーのソート変更は borrow の関係で遅延実行。
+        // ネスト ZIP は階層維持で再ソート、Ctrl+G は検索結果再ソート (§4.3.3。実フォルダを
+        // 再ロードすると Ctrl+G ビューから抜けるため)、通常フォルダは再ロード。
         if toolbar_sort_changed {
-            // Ctrl+G 検索結果ビュー (一覧 / ドリルイン) では、メインのソート変更を
-            // 検索結果の並べ替えに反映する (§4.3.3)。実フォルダを再ロードすると
-            // Ctrl+G ビューから抜けてしまうため load_folder は使わない。
-            if self.global_search.active && self.items_are_global_search_view {
-                self.rebuild_items_from_global_search();
-            } else if let Some(path) = self.current_folder.clone() {
-                self.folder_history.remove(&path);
-                self.load_folder(path);
-            }
+            self.apply_sort_change_reload();
         }
 
         // レーティングフィルタ変更: 設定を保存して visible_indices を再計算。
