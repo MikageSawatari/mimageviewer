@@ -211,6 +211,34 @@ impl ArchiveCacheDb {
         Some(zip_path)
     }
 
+    /// [`Self::lookup`] の読み取り専用版。`last_access_at` を更新せず、無効エントリの
+    /// 掃除もしない (SELECT + `exists()` のみ、書き込みトランザクションなし)。
+    ///
+    /// 用途: フォルダ一覧の `ConvertibleArchive` サムネ用一括参照
+    /// (`refresh_converted_archive_cache_paths`)。フォルダを**表示しただけ**で中の
+    /// 全アーカイブに UPDATE を発行して UI スレッドを書き込みで塞がない / LRU prune の
+    /// 「最終アクセス」を閲覧していないアーカイブで汚さないため。実際に開く経路
+    /// (`try_archive_cache_lookup`) は従来どおり `lookup` を使い、access 時刻を更新する。
+    pub fn peek(&self, src_path: &Path, src_mtime: i64, src_size: i64) -> Option<PathBuf> {
+        let key = crate::path_key::normalize(src_path);
+        let row: Option<(i64, i64, String)> = {
+            let conn = self.conn.lock().ok()?;
+            conn.query_row(
+                "SELECT src_mtime, src_size, cached_zip_path FROM converted_archives \
+                 WHERE src_path_key = ?1",
+                params![&key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok()
+        };
+        let (m, s, cached) = row?;
+        if m != src_mtime || s != src_size {
+            return None;
+        }
+        let zip_path = PathBuf::from(cached);
+        zip_path.exists().then_some(zip_path)
+    }
+
     /// 変換完了時に 1 行 upsert する。
     pub fn record(
         &self,
@@ -658,6 +686,42 @@ mod tests {
         assert!(!warm_cached.exists());
         assert!(new_cached.exists(), "protected fresh cache must survive");
         assert_eq!(db.list_all().unwrap().len(), 1);
+    }
+
+    /// peek は lookup と同じ有効性判定 (mtime/size 一致 + キャッシュ実在) を行うが、
+    /// `last_access_at` を更新しない (フォルダ一覧の一括参照で書き込みを発行しない)。
+    #[test]
+    fn peek_validates_without_touching_last_access() {
+        let _guard = crate::data_dir::TestDataDirGuard::new();
+        let db = ArchiveCacheDb::open().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("book.7z");
+        std::fs::write(&src, b"archive").unwrap();
+        let cached = record_test_cache(&db, &src, 100);
+        set_test_last_access(&db, &src, 42);
+
+        let meta = std::fs::metadata(&src).unwrap();
+        let mtime = crate::ui_helpers::mtime_secs(&meta);
+        let size = meta.len() as i64;
+
+        // ヒット: cache ZIP パスが返る。
+        assert_eq!(
+            db.peek(&src, mtime, size).as_deref(),
+            Some(cached.as_path())
+        );
+        // last_access_at が更新されていない (lookup と違い読み取り専用)。
+        let entries = db.list_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].last_access_at, 42);
+
+        // mtime 不一致 → None (掃除もしない: 行とファイルは残る)。
+        assert!(db.peek(&src, mtime + 1, size).is_none());
+        assert!(cached.exists());
+        assert_eq!(db.list_all().unwrap().len(), 1);
+
+        // キャッシュ ZIP が消えていたら None。
+        std::fs::remove_file(&cached).unwrap();
+        assert!(db.peek(&src, mtime, size).is_none());
     }
 
     fn record_test_cache(db: &ArchiveCacheDb, src: &Path, cached_size: usize) -> PathBuf {

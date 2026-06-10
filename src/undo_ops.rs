@@ -291,10 +291,11 @@ impl App {
                 let _ = db.set(&c.path_key, target);
             }
             self.user_set_rating_keys.insert(c.path_key.clone());
-            if let Some(folder) = &self.current_folder {
-                if crate::adjustment_db::normalize_path(folder) == c.path_key {
-                    self.current_folder_rating_cache = Some(target);
-                }
+            if self
+                .current_container_rating_key_and_source()
+                .is_some_and(|(key, _)| key == c.path_key)
+            {
+                self.current_folder_rating_cache = Some(target);
             }
             if self.settings.write_rating_to_xmp
                 && crate::xmp_writer::is_writable_format(&c.source_path)
@@ -561,12 +562,11 @@ impl App {
         self.push_rating_undo_entry(changes, summary);
     }
 
-    /// コンテナレーティング (Shift+F*) 用。current_folder 1 件の変更だけを積む。
+    /// コンテナレーティング (Shift+F*) 用。現在表示中コンテナ 1 件の変更だけを積む。
     pub(crate) fn capture_container_rating_undo(&mut self, before: u8, after: u8) {
-        let Some(folder) = self.current_folder.clone() else {
+        let Some((path_key, source_path)) = self.current_container_rating_key_and_source() else {
             return;
         };
-        let path_key = crate::adjustment_db::normalize_path(&folder);
         let summary = if after == 0 {
             "コンテナの★解除".to_string()
         } else {
@@ -575,7 +575,7 @@ impl App {
         self.push_rating_undo_entry(
             vec![RatingChange {
                 path_key,
-                source_path: folder,
+                source_path,
                 before,
                 after,
             }],

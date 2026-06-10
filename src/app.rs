@@ -9515,6 +9515,16 @@ impl App {
         // - lookup は `lookup_many` 1 回に束ねる。per-dir の逐次 SQLite lookup は UI
         //   スレッドで dirs 数に比例してブロックする (レビュー P3)。
         if let Some(pin_db) = self.folder_thumb_pin_db.as_ref() {
+            // 変換キャッシュ ZIP では pin DB キーの root が元アーカイブ
+            // (`zip_pin_root_path`) になる。ここを cache ZIP root のまま引くと
+            // 変換アーカイブ内の本ピンだけ existing_keys に乗らず、delete_missing が
+            // pinned 行を毎回 prune して再生成ループになる (set/lookup 側との対称性)。
+            let pin_root = zip_pin_root_path(
+                &tree.zip_path,
+                self.archive_source_override.as_deref(),
+                self.current_folder.as_deref(),
+            )
+            .to_path_buf();
             let dir_keys: Vec<(String, PathBuf)> = existing_keys
                 .iter()
                 .filter_map(|k| k.strip_prefix("zipdir:").map(|p| p.to_string()))
@@ -9525,7 +9535,7 @@ impl App {
                         .map(|s| s.to_string())
                         .collect();
                     let effective = tree.collapse_redundant(&segs);
-                    let book_key = book_container_key_from_segs(&tree.zip_path, &effective);
+                    let book_key = book_container_key_from_segs(&pin_root, &effective);
                     (prefix, book_key)
                 })
                 .collect();
@@ -9731,6 +9741,9 @@ impl App {
         self.install_new_items(items, metas);
         // idx ベース状態 + in-flight キューを破棄 (replace_search_view_items / snapshot と同じ)。
         self.invalidate_idx_state_and_queues();
+        // ZIP 内の階層ごとに Shift+F のコンテナ★キーが変わるため、アドレスバー★の
+        // メモ化値も階層切替ごとに捨てる。
+        self.current_folder_rating_cache = None;
         // 確保しておいた Loaded サムネを新 idx に転送 (invalidate の後 = thumb_pixels が
         // clear された後)。Loaded のままなら upload backlog に乗らず同一フレームで前回の
         // テクスチャが見え続けるのでちらつかない。
@@ -11562,7 +11575,9 @@ impl App {
             let Some((mtime, file_size)) = self.image_metas.get(idx).and_then(|m| *m) else {
                 continue;
             };
-            if let Some(cached_zip) = db.lookup(path, mtime, file_size) {
+            // peek = 読み取り専用 lookup。フォルダを表示しただけで全アーカイブに
+            // last_access UPDATE (書き込みトランザクション) を発行しない (Codex R3 P3)。
+            if let Some(cached_zip) = db.peek(path, mtime, file_size) {
                 self.converted_archive_cache_paths
                     .insert(crate::path_key::normalize_keep_drive(path), cached_zip);
             }
@@ -19625,7 +19640,39 @@ impl App {
         }
     }
 
-    /// `current_folder` (現在一覧表示中のフォルダ / ZIP / PDF) のレーティングを取得する。
+    /// Shift+F1〜F6 / アドレスバー★が対象にする「現在表示中コンテナ」の
+    /// rating DB キーと、Undo/XMP 判定用の source path を返す。
+    ///
+    /// 通常フォルダ / ZIP / PDF は従来どおり `current_folder`。ネスト ZIP ツリー内では
+    /// - ルート表示: 外側 ZIP 本体 (`zip_path`)
+    /// - 本の中: BS で戻った親階層に表示される `ZipDir` セルと同じ合成キー
+    /// を使う。collapse で `bookB/only/` まで自動降下していても、親セルが `bookB/`
+    /// なら `zip_path\bookB` に保存する。
+    pub(crate) fn current_container_rating_key_and_source(&self) -> Option<(String, PathBuf)> {
+        if self.global_search.active {
+            return None;
+        }
+        if let Some(nav) = self.zip_nav.as_ref() {
+            let key_path = if nav.at_root() {
+                nav.tree.zip_path.clone()
+            } else {
+                let prefix = nav.current_parent_zipdir_prefix()?;
+                book_container_key_from_segs(&nav.tree.zip_path, &prefix)
+            };
+            return Some((
+                crate::adjustment_db::normalize_path(&key_path),
+                nav.tree.zip_path.clone(),
+            ));
+        }
+        let folder = self.current_folder.as_ref()?;
+        if folder == &search_results_synthetic_path() {
+            return None;
+        }
+        Some((crate::adjustment_db::normalize_path(folder), folder.clone()))
+    }
+
+    /// 現在一覧表示中のコンテナ (フォルダ / ZIP / PDF / ネスト ZIP の本) の
+    /// レーティングを取得する。
     /// アドレスバー右端の★表示で毎フレーム呼ばれるため、`current_folder_rating_cache`
     /// でメモ化して SQLite クエリと path 正規化コストを回避する。
     /// 検索結果ビューなど、実在しない合成パスに対しては 0 を返す。
@@ -19635,17 +19682,10 @@ impl App {
         if let Some(v) = self.current_folder_rating_cache {
             return v;
         }
-        let value = if self.global_search.active {
-            0
-        } else {
-            match self.current_folder.as_ref() {
-                Some(folder) if folder != &search_results_synthetic_path() => {
-                    let key = crate::adjustment_db::normalize_path(folder);
-                    self.rating_db.as_ref().map(|db| db.get(&key)).unwrap_or(0)
-                }
-                _ => 0,
-            }
-        };
+        let value = self
+            .current_container_rating_key_and_source()
+            .and_then(|(key, _)| self.rating_db.as_ref().map(|db| db.get(&key)))
+            .unwrap_or(0);
         self.current_folder_rating_cache = Some(value);
         value
     }
@@ -19661,23 +19701,16 @@ impl App {
         self.show_feedback_toast(msg);
     }
 
-    /// `current_folder` にレーティングを設定する (Shift+F1〜F6 用)。
+    /// 現在一覧表示中のコンテナにレーティングを設定する (Shift+F1〜F6 用)。
     /// 合成パス (検索結果ビュー等) はスキップして false を返す。
     /// Ctrl+G 検索中は `current_folder` が検索前のフォルダを指したままなので、
     /// 直前に開いていた実フォルダを誤って書き換えないよう false を返す。
     /// 成功時は rating_cache も同期し、visible_indices を rebuild する。
     pub(crate) fn set_current_folder_rating(&mut self, stars: u8) -> bool {
-        if self.global_search.active {
-            return false;
-        }
-        let Some(folder) = self.current_folder.clone() else {
+        let Some((key, _)) = self.current_container_rating_key_and_source() else {
             return false;
         };
-        if folder == search_results_synthetic_path() {
-            return false;
-        }
         let stars = stars.min(5);
-        let key = crate::adjustment_db::normalize_path(&folder);
         // Undo 用に変更前の値をキャッシュ or DB から取得 (なければ 0)。
         let before = self
             .current_folder_rating_cache
@@ -19690,23 +19723,16 @@ impl App {
             let _ = db.set(&key, stars);
         }
         self.current_folder_rating_cache = Some(stars);
-        // items 内の同じコンテナパスを指す Folder/ZipFile/PdfFile があればキャッシュ更新。
+        // items 内の同じ rating key を指すコンテナがあればキャッシュ更新。
         // (1 階層上に戻ったときに cached な古い値を表示しないため。通常 current_folder は
-        // items に含まれないが、search container 絞り込みビュー中は含まれうる。)
+        // items に含まれないが、search container 絞り込みビュー中は含まれうる。ZipDir も
+        // 親階層に表示中なら同じ経路で同期できる。)
         let matching: Vec<usize> = self
             .items
             .iter()
             .enumerate()
-            .filter_map(|(i, it)| {
-                let p = match it {
-                    GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => p,
-                    _ => return None,
-                };
-                if crate::adjustment_db::normalize_path(p) == key {
-                    Some(i)
-                } else {
-                    None
-                }
+            .filter_map(|(i, _)| {
+                (self.rating_path_key(i).as_deref() == Some(key.as_str())).then_some(i)
             })
             .collect();
         for i in matching {

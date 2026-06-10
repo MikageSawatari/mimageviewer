@@ -4911,6 +4911,98 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.get_rating(1), 2);
     }
 
+    #[test]
+    fn shift_container_rating_inside_zip_book_updates_parent_zipdir_rating() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+
+        let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
+        nav.enter("bookA/");
+        app.zip_nav = Some(nav);
+        app.zip_nav_show_current_level();
+
+        assert!(app.set_current_folder_rating(4));
+
+        let book_key = crate::adjustment_db::normalize_path(&zip_path.join("bookA"));
+        let outer_key = crate::adjustment_db::normalize_path(&zip_path);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&book_key), 4);
+        assert_eq!(
+            app.rating_db.as_ref().unwrap().get(&outer_key),
+            0,
+            "ZIP 内の本を評価しても外側 ZIP 本体へ誤保存しない"
+        );
+
+        assert!(app.zip_nav_back());
+        let idx = app
+            .items
+            .iter()
+            .position(
+                |it| matches!(it, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "bookA/"),
+            )
+            .expect("parent level should contain bookA ZipDir");
+        app.rating_cache.clear();
+        assert_eq!(app.get_rating(idx), 4);
+    }
+
+    #[test]
+    fn shift_container_rating_inside_collapsed_zip_book_uses_parent_zipdir_key() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+
+        let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/only/p1.jpg"]);
+        nav.enter("bookB/"); // 実表示は bookB/only/ まで collapse される。
+        app.zip_nav = Some(nav);
+        app.zip_nav_show_current_level();
+
+        assert!(app.set_current_folder_rating(5));
+
+        let literal_key = crate::adjustment_db::normalize_path(&zip_path.join("bookB"));
+        let effective_key =
+            crate::adjustment_db::normalize_path(&zip_path.join("bookB").join("only"));
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&literal_key), 5);
+        assert_eq!(
+            app.rating_db.as_ref().unwrap().get(&effective_key),
+            0,
+            "BS 後に表示される ZipDir セルと同じ literal prefix キーに保存する"
+        );
+
+        assert!(app.zip_nav_back());
+        let idx = app
+            .items
+            .iter()
+            .position(
+                |it| matches!(it, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "bookB/"),
+            )
+            .expect("parent level should contain bookB ZipDir");
+        app.rating_cache.clear();
+        assert_eq!(app.get_rating(idx), 5);
+    }
+
+    #[test]
+    fn undo_restores_zip_book_container_rating_key() {
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+
+        let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
+        nav.enter("bookA/");
+        app.zip_nav = Some(nav);
+        app.zip_nav_show_current_level();
+
+        assert!(app.set_current_folder_rating(3));
+        let book_key = crate::adjustment_db::normalize_path(&zip_path.join("bookA"));
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&book_key), 3);
+
+        app.apply_meta_undo();
+
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&book_key), 0);
+        assert_eq!(app.current_folder_rating_cache, Some(0));
+    }
+
     /// 変換キャッシュ閲覧中の選択情報パス: ZIP 内アイテムのコンテナ部分が
     /// archive_cache の実体パスではなくユーザー視点の元アーカイブになる
     /// (実機フィードバック: ツールチップにキャッシュパスが漏れていた)。

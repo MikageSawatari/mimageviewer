@@ -280,6 +280,26 @@ impl ZipNavState {
         self.stack.len() == 1
     }
 
+    /// 現在階層を親から見たときの `ZipDir.dir_prefix` 相当 prefix を返す。
+    ///
+    /// `current()` は collapse 後の実効 prefix なので、`bookB/` に入って
+    /// `bookB/only/` まで自動降下した場合は `["bookB", "only"]` になる。親階層で
+    /// 表示されるセルは literal な `bookB/` なので、親 prefix + 次の 1 セグメントだけを
+    /// 返す。ルート表示では親セルが無いため `None`。
+    pub fn current_parent_zipdir_prefix(&self) -> Option<Vec<String>> {
+        if self.stack.len() < 2 {
+            return None;
+        }
+        let parent = &self.stack[self.stack.len() - 2];
+        let current = self.current();
+        if current.len() <= parent.len() || !current.starts_with(parent) {
+            return None;
+        }
+        let mut prefix = parent.clone();
+        prefix.push(current[parent.len()].clone());
+        Some(prefix)
+    }
+
     /// `ZipDir` セルへ降りる。`dir_prefix` は `GridItem::ZipDir.dir_prefix`
     /// ("a/b/" 形式、ルートからの絶対パス、末尾 '/')。子の実効 prefix を `collapse_redundant`
     /// で算出してスタックに積む。
