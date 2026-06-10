@@ -8791,6 +8791,78 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// AI 失敗確定後、AI 待ちの暫定 final composite (complete=false) が complete に
+    /// 昇格すること (Codex P2 2026-06-10)。昇格しないと表示は暫定画像で見えるのに、
+    /// complete のみ受け付けるコピー / 書き出し
+    /// (`ensure_final_composite_pixels_with_key`) が永久に「最終合成待ち」になる。
+    #[test]
+    fn ai_failure_promotes_provisional_composite_to_complete() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+        let idx = push_image(&mut app, "C:/pics/ai-fail.jpg");
+
+        // source 解像度の edit 結果を直接投入
+        let edit_image = egui::ColorImage::new([2, 1], vec![egui::Color32::GRAY; 2]);
+        let edit_key = dummy_edit_key(&app, idx);
+        let edit_tex = ctx.load_texture(
+            "ai_fail_edit",
+            edit_image.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.edit_result_cache.insert(
+            edit_key,
+            EditResultEntry {
+                pixels: Arc::new(edit_image),
+                texture: Some(edit_tex),
+            },
+        );
+
+        // アップスケール要求あり → AI 未完了の暫定 composite (complete=false) ができる。
+        // (テスト環境はモデル未展開なので maybe_start_final_ai が直接 failed を
+        // 立てることもあるが、立てない環境でも下の手動 insert で同じ状態にする)
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.upscale_model = Some("realesr_general_v3".to_string());
+        app.adjustment_page_params.insert(idx, params.clone());
+        let _ = app
+            .ensure_final_composite_texture(&ctx, idx)
+            .expect("provisional composite");
+
+        // AI 失敗を確定させる (poll 経由 / モデル不在直接 insert の両経路を代表)
+        let ai_key = FinalAiKey {
+            edit_key,
+            color_ai_hash: hash_adjust_color_ai_params(&params, app.settings.ai_feature_mode),
+            bg: 0,
+        };
+        app.final_ai_failed.insert(ai_key);
+        if let Some(pending) = app.final_ai_pending.remove(&ai_key) {
+            pending
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // 再度 ensure すると failed 分岐で complete=true に昇格し、
+        // コピー / 書き出し経路 (complete のみ受け付ける) も復帰する
+        let _ = app
+            .ensure_final_composite_texture(&ctx, idx)
+            .expect("composite after AI failure");
+        let complete = app
+            .final_composite_cache
+            .iter()
+            .find(|(key, _)| key.edit_key.idx == idx)
+            .map(|(_, entry)| entry.complete)
+            .expect("final composite must exist");
+        assert!(
+            complete,
+            "AI failure must promote the provisional composite to complete"
+        );
+        assert!(
+            app.ensure_final_composite_pixels_with_key(&ctx, idx)
+                .is_some(),
+            "copy/export path must recover after AI failure"
+        );
+    }
+
     /// final 専用項目 (シャープ化 / post_filter) だけの変更は
     /// `clear_final_stage_only_caches` 経由で final AI cache を保持する
     /// (Codex P1: `clear_adjustment_caches` に流すと強度スライダーや T キー循環の

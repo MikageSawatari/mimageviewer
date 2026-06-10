@@ -366,7 +366,9 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 0. 右 Ctrl ホールド中の元画像プレビュー (fs_cache の raw decode)
 1. erase / local_adjust / conceal の編集中プレビュー (各 UI の in-memory state)
 2. final_composite_cache[edit_key, params_hash, bg]
-   (= edit_result_cache + 色調補正 + final AI + post_filter)
+   (= edit_result_cache + 色調補正 + final AI + スマートシャープ + post_filter。
+    スマートシャープは AI アップスケール出力には掛からない —
+    preset-and-adjustment.md §2.6)
 3. edit_result_cache[edit_key]
    (= raw -> erase -> local_adjust -> conceal -> crop。最終段待ちの fallback)
 4. fs_cache[idx] (生デコード結果、raw 専用)
@@ -528,7 +530,11 @@ ZIP の章区切り (`ZipSeparator`) は GPU テクスチャ化せず、前後�
 7. AI アップスケール / デノイズ (Real-ESRGAN / Real-CUGAN / NMKD-Siax / 1x denoise)
    → final_ai_cache[FinalAiKey]。未完了中は色補正後の画像を暫定表示する。
    ↓
-8. ポストフィルタ (CRT エミュレート / 減色 / モノクロ / 複合エフェクト)
+8. スマートシャープ (シャープ化スライダー 0..=100、輪郭中心の最終段シャープ)
+   → AI アップスケール出力には掛からない (固定動作)。デノイズのみ / AI なしには掛かる。
+     詳細は preset-and-adjustment.md §2.6
+   ↓
+9. ポストフィルタ (CRT エミュレート / 減色 / モノクロ / 複合エフェクト)
    → final_composite_cache[FinalCompositeKey]
 ```
 
@@ -543,6 +549,10 @@ ZIP の章区切り (`ZipSeparator`) は GPU テクスチャ化せず、前後�
 - **補正 (adjustment)**: `ensure_final_composite_texture` が `edit_result_cache` のピクセルへ
   `apply_adjustments_fast` を適用する。色系パラメータ変更では `edit_result_cache` を保持し、
   `final_ai_cache` / `final_composite_cache` だけを落とす。
+- **スマートシャープ (シャープ化)**: final AI の後・ポストフィルタの前に
+  `apply_final_smart_sharpen` を適用する。AI アップスケール出力には掛からない
+  (固定動作)。サムネイルには反映しない。詳細は
+  [preset-and-adjustment.md §2.6](preset-and-adjustment.md)。
 - **ポストフィルタ**: AI の後段で CPU 処理 (CRT/減色/複合)。rayon 並列化済み。
   `PostFilter::Nearest` のみ NEAREST サンプラー、それ以外は LINEAR でアップロードする。
 - **消しゴム/隠蔽加工/分析モード中の一時バイパス**: `App::post_filter_bypassed = true` の間は
@@ -567,8 +577,10 @@ ZIP の章区切り (`ZipSeparator`) は GPU テクスチャ化せず、前後�
 - **元画像プレビュー**: 右 Ctrl を押している間だけ描画時のテクスチャ選択を
   raw 専用の `fs_cache` に切り替える。DB・補正設定・AI queue は変更しない。
 - **何かを変えたら正しいキャッシュをクリア**:
-  - 補正パラメータ / AI / post_filter 変更 → `final_ai_cache` / `final_composite_cache` をクリア
-    (`edit_result_cache` は保持)
+  - 色調パラメータ / AI 変更 → `final_ai_cache` / `final_composite_cache` をクリア
+    (`edit_result_cache` は保持)。post_filter / シャープ化**のみ**の変更は
+    `final_composite_cache` だけクリアして final AI を保持する
+    (preset-and-adjustment.md §4)
   - 消しゴム / 補正レイヤー / 隠蔽加工 / crop 変更 → source 解像度の edit cache と final cache をクリア
   - 消しゴム/隠蔽加工/分析モード入出 → 該当 idx の final cache のみクリア (bypass 切替のため)
   - フォルダ切替 → edit / final / thumb 系 cache をグローバルクリア

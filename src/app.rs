@@ -24283,8 +24283,16 @@ impl App {
         let final_key = self.final_composite_key_for_pixels(edit_key, edit_pixels.size, &params);
         let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, &params);
         let ai_ready = ai_key.and_then(|key| self.final_ai_cache.get(&key).cloned());
+        // AI が失敗確定 (final_ai_failed) した場合、AI 待ちの暫定 entry (complete=false)
+        // を返し続けない。表示画素は同じだが complete が立たないままだと、complete
+        // のみ受け付けるコピー / 書き出し (`ensure_final_composite_pixels_with_key`)
+        // が永久に「最終合成待ち」になる (Codex P2 2026-06-10)。failed は poll 経由
+        // だけでなく `maybe_start_final_ai` がモデル不在時に直接立てる経路もあるため、
+        // poll 側の cleanup ではなくここで判定して再合成 (failed 分岐 → complete=true)
+        // に流す。
+        let ai_failed = ai_key.is_some_and(|key| self.final_ai_failed.contains(&key));
         if let Some(entry) = self.final_composite_cache.get(&final_key) {
-            if entry.complete || ai_ready.is_none() {
+            if entry.complete || (ai_ready.is_none() && !ai_failed) {
                 return Some(entry.texture.clone());
             }
         }

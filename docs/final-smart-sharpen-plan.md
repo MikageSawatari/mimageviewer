@@ -152,7 +152,12 @@ final composite cache にはスマートシャープ後の pixels を入れる�
 そのため `FinalCompositeKey` の `params_hash` へ `smart_sharpen` を含める必要がある。
 
 AI 未完了中は、色調補正済み画像にスマートシャープを掛けた暫定表示になる。
-AI 完了後は final composite を作り直し、AI 後の画像にスマートシャープを掛ける。
+AI 完了後は final composite を作り直す。
+
+> **実装時の変更 (2026-06-10)**: AI **アップスケール**が実行された合成には
+> スマートシャープを掛けない固定動作にした (二重シャープ防止、ユーザー判断)。
+> デノイズのみ (サイズ不変) の AI 結果には計画どおり掛かる。
+> 詳細は [preset-and-adjustment.md §2.6](preset-and-adjustment.md)。
 
 ## テスト観点
 
@@ -160,7 +165,8 @@ AI 完了後は final composite を作り直し、AI 後の画像にスマート
 - `smart_sharpen` 変更で final composite cache が切り替わる。
 - `smart_sharpen` 変更で `thumb_adjust_tex` は不要に再生成されない。
 - post_filter と併用できる。疑似カラー / CRT / Nearest と排他にならない。
-- AI アップスケール / AI ノイズ除去後にも適用される。
+- AI ノイズ除去後にも適用される (AI アップスケール実行時は固定でスキップ —
+  上記「実装時の変更 (2026-06-10)」参照)。
 - 連結読み / 見開きでも左右ページそれぞれに適用される。
 - 透明ピクセルやアルファ境界で hidden RGB が漏れない。
 - 4K, 8K 相当で UI スレッドを長く止めない。
