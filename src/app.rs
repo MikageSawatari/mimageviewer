@@ -9571,10 +9571,15 @@ impl App {
     ///   エントリを含まないので通常 flag 自体立たないが、手作りの類似 ZIP への防御)
     /// - RAR 等の変換キャッシュを開いている最中 (`archive_source_override`) も同様
     /// - 既に別の変換ダイアログが動作中なら出さない
+    /// - ★固定 (snapshot) 中も出さない: キャッシュ ZIP は snapshot 範囲外なので
+    ///   振り替え (`load_folder`) が範囲外ガードでブロックされ、自動フルスクリーン
+    ///   予約だけ消える中途半端な状態になる (Codex R2 P3)。固定解除後に開き直せば
+    ///   通常どおり提案される。
     fn zip_foreign_offer_applicable(&self, zip_path: &Path) -> bool {
         !crate::archive_cache::is_under_cache_root(zip_path)
             && self.archive_source_override.is_none()
             && self.archive_convert.is_none()
+            && !self.is_snapshot_active()
     }
 
     /// ZIP 列挙で非 ZIP アーカイブ (RAR/7z/LZH) を検出したときの「入れ子を展開した
