@@ -420,6 +420,11 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
   `hash_adjust_final_params` も強度 0 のときは skip フラグを hash に含めない
   (正規化前の一時状態でも無意味な composite 再生成を起こさない)。
   強度 > 0 の間はユーザーの skip OFF 選択は保持される。
+  **load / import 側 (DB ロード・favorite hydrate・settings ロード・sidecar import) は
+  意図的に正規化しない**: 書き込み入口が全て正規化するため、非正規データは
+  「正規化導入前に開発機で保存されたもの」しかありえず、本機能は未リリースなので
+  マイグレーション不要 (CLAUDE.md の永続データポリシー)。残骸の no-op 行があっても
+  次の書き込みで正規化されるか、Q (個別解除) で消える。
 - **サムネ無効化の色調 gate**: `set_page_params` / `clear_page_params` は
   `color_settings_eq` (brightness..midtone + auto_mode) が変わるときだけ
   `thumb_adjust_tex` を落とす。スライダードラッグ release の全クリアも
