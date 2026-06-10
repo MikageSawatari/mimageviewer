@@ -417,6 +417,20 @@ impl AdjustParams {
         }
     }
 
+    /// 保存前の正規化。シャープ強度 0 のとき `smart_sharpen_skip_after_ai` は
+    /// 効果を持たない no-op なので既定値へ戻す。これをしないと「強度を上げる →
+    /// チェックを外す → ↩ で 0 に戻す」の手順で、見た目は完全無効なのにフラグ差分
+    /// だけの個別設定 (補バッジ / DB 行) が残る (Codex P2 2026-06-10)。
+    /// パラメータの書き込み入口 (set_page_params / bulk / グローバル / お気に入り /
+    /// スロット保存) で呼ぶ。no-op になりうる正規化対象フィールドを増やしたら
+    /// ここに追加する。
+    pub fn normalized(mut self) -> Self {
+        if self.smart_sharpen == 0 {
+            self.smart_sharpen_skip_after_ai = default_smart_sharpen_skip_after_ai();
+        }
+        self
+    }
+
     pub fn upscale_model_kind(&self) -> Option<Option<crate::ai::ModelKind>> {
         match self.upscale_model.as_deref() {
             None => None,
@@ -1017,6 +1031,23 @@ mod tests {
         sharpen.smart_sharpen_skip_after_ai = false;
         assert_eq!(sharpen.effective_smart_sharpen(true), 60);
         assert_eq!(sharpen.effective_smart_sharpen(false), 60);
+    }
+
+    #[test]
+    fn normalized_resets_noop_skip_flag_at_zero_strength() {
+        // 強度 0 でフラグだけ非既定 → 正規化で既定に戻り、default と等価になる
+        // (= no-op の個別設定が残らない、Codex P2)。
+        let mut noop = AdjustParams::default();
+        noop.smart_sharpen_skip_after_ai = false;
+        assert_eq!(noop.normalized(), AdjustParams::default());
+
+        // 強度 > 0 ならユーザーの選択 (フラグ OFF) は保持される。
+        let mut active = AdjustParams::default();
+        active.smart_sharpen = 60;
+        active.smart_sharpen_skip_after_ai = false;
+        let normalized = active.clone().normalized();
+        assert_eq!(normalized, active);
+        assert!(!normalized.smart_sharpen_skip_after_ai);
     }
 
     #[test]

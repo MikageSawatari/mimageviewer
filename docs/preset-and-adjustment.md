@@ -411,6 +411,15 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
   bulk 系 (全画像に適用 / 標準にする / お気に入り標準) は従来どおり
   `clear_all_color_caches` で final AI ごと全クリアされる (既知の過剰クリア。
   ワンショット操作なので許容)。
+- **保存前正規化 (`AdjustParams::normalized`)**: シャープ強度 0 のとき skip フラグは
+  no-op なので既定値 (ON) へ戻してから保存する。これをしないと「強度を上げる →
+  チェックを外す → ↩ で 0 に戻す」で、見た目は完全無効なのにフラグ差分だけの
+  個別設定 (補バッジ / DB 行) が残る (Codex P2 2026-06-10)。正規化はパラメータの
+  書き込み入口 (`set_page_params` / `apply_params_to_all_pages` /
+  `copy_params_to_global` / `apply_favorite_change` / スロット保存) で行う。
+  `hash_adjust_final_params` も強度 0 のときは skip フラグを hash に含めない
+  (正規化前の一時状態でも無意味な composite 再生成を起こさない)。
+  強度 > 0 の間はユーザーの skip OFF 選択は保持される。
 - **サムネ無効化の色調 gate**: `set_page_params` / `clear_page_params` は
   `color_settings_eq` (brightness..midtone + auto_mode) が変わるときだけ
   `thumb_adjust_tex` を落とす。スライダードラッグ release の全クリアも

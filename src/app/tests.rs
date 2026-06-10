@@ -8623,6 +8623,39 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// Codex P2 再現手順: 強度を上げる → skip チェックを外す → ↩ で強度 0 に戻す。
+    /// 正規化 (`AdjustParams::normalized`) により no-op の skip フラグ差分だけの
+    /// 個別設定 (補バッジ / DB 行) が残らないこと。
+    #[test]
+    fn resetting_strength_to_zero_drops_noop_skip_flag_override() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/noop-skip.jpg");
+
+        // 強度 60 + skip OFF → 個別設定として保存される
+        let mut active = app.effective_params(idx).clone();
+        active.smart_sharpen = 60;
+        active.smart_sharpen_skip_after_ai = false;
+        app.set_page_params(idx, active.clone());
+        assert!(
+            app.adjustment_page_params.contains_key(&idx),
+            "active sharpen settings must persist as a page override"
+        );
+        // 強度 > 0 の間はユーザーの skip OFF 選択が保持される
+        assert!(
+            !app.effective_params(idx).smart_sharpen_skip_after_ai,
+            "skip=false must be preserved while strength > 0"
+        );
+
+        // ↩ リセット相当: 強度だけ 0 に戻す (UI は skip フラグを触らない)
+        let mut reset = active;
+        reset.smart_sharpen = 0;
+        app.set_page_params(idx, reset);
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "no-op skip flag must be normalized away so the override is removed"
+        );
+    }
+
     /// final 専用項目 (シャープ化 / post_filter) だけの変更は
     /// `clear_final_stage_only_caches` 経由で final AI cache を保持する
     /// (Codex P1: `clear_adjustment_caches` に流すと強度スライダーや T キー循環の
@@ -8813,16 +8846,24 @@ mod pipeline_cache_refactor_tests {
             hash_adjust_final_params(&sharpened, mode, true),
         );
         // 「AI アップスケール実行時は適用しない」フラグも final hash にだけ乗る。
-        let mut skip_off = base.clone();
-        skip_off.smart_sharpen_skip_after_ai = false;
-        assert_ne!(
+        // ただし強度 0 のときは出力に影響しない no-op なので hash に含めない (Codex P2)。
+        let mut skip_off_at_zero = base.clone();
+        skip_off_at_zero.smart_sharpen_skip_after_ai = false;
+        assert_eq!(
             hash_adjust_final_params(&base, mode, false),
-            hash_adjust_final_params(&skip_off, mode, false),
-            "skip flag must invalidate the final composite cache"
+            hash_adjust_final_params(&skip_off_at_zero, mode, false),
+            "no-op skip flag (strength 0) must not split the final hash"
+        );
+        let mut skip_off_active = sharpened.clone();
+        skip_off_active.smart_sharpen_skip_after_ai = false;
+        assert_ne!(
+            hash_adjust_final_params(&sharpened, mode, false),
+            hash_adjust_final_params(&skip_off_active, mode, false),
+            "skip flag must invalidate the final composite cache when strength > 0"
         );
         assert_eq!(
-            hash_adjust_color_ai_params(&base, mode),
-            hash_adjust_color_ai_params(&skip_off, mode),
+            hash_adjust_color_ai_params(&sharpened, mode),
+            hash_adjust_color_ai_params(&skip_off_active, mode),
             "skip flag must NOT invalidate the final AI cache"
         );
     }

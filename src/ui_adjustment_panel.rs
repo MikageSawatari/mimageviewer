@@ -12105,7 +12105,9 @@ impl App {
         if confirmed && !name_input.trim().is_empty() {
             self.settings.preset_slots.slots[slot_idx] = Some(PresetSlot {
                 name: name_input.trim().to_string(),
-                params,
+                // 保存前正規化: 強度 0 の skip フラグのような no-op 差分を既定値へ
+                // (set_page_params と同じ理由、Codex P2)。
+                params: params.normalized(),
             });
             self.settings.save();
             let key_label = crate::adjustment::slot_key_label(slot_idx);
