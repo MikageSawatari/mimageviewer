@@ -17,6 +17,13 @@
 >   入らない。`output_is_ai_upscaled` のサイズ比較は縮小後も成立する (入力長辺 < 4096 <
 >   縮小後長辺 8192) — 詳細は `docs/preset-and-adjustment.md` のスマートシャープ節。
 > - 2x モデル追加・streaming downsample・ノイズ除去の原寸適用は本書記載どおり未実装。
+> - 既知の制限 (Codex P2 指摘、実装前からの既存挙動): PDF ページの初回フルスクリーン
+>   レンダは content_type 未解析のため 4096px 固定 (`start_fs_load`)。final AI はレンダ
+>   後のピクセルサイズで判定するので、ラスターページでも初回表示では AI が掛からない
+>   (旧しきい値 2048 でも同じ)。ズーム操作で `request_pdf_rerender` がサイズ上限内の
+>   ラスターページを native 解像度で再レンダした時点で AI が効く。content_type 解析後の
+>   自動再レンダ (= 初回表示から AI を効かせる) は PDF pool 負荷とのトレードオフがあり
+>   本実装のスコープ外。
 
 ## 目的
 

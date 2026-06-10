@@ -715,6 +715,22 @@ fn clamp_color_image_for_gpu_scales_oversize() {
     assert_eq!(out.pixels[0], egui::Color32::from_rgb(100, 50, 25));
 }
 
+/// 半透明ピクセル (premultiplied 格納) も縮小後に値が保持される (Codex P3)。
+/// `clamp_color_image_for_gpu` は unmultiply せず premultiplied バイト列のまま
+/// リサイズ → `from_rgba_premultiplied` で戻すので、均一色なら厳密一致するはず。
+#[test]
+fn clamp_color_image_for_gpu_preserves_premultiplied_alpha() {
+    let c = egui::Color32::from_rgba_unmultiplied(200, 100, 40, 128);
+    let ci = egui::ColorImage::filled([16384, 64], c);
+    let out = clamp_color_image_for_gpu(ci);
+    assert_eq!(out.size, [8192, 32]);
+    assert_eq!(
+        out.pixels[0], c,
+        "uniform semi-transparent color must roundtrip premultiplied"
+    );
+    assert_eq!(out.pixels[out.pixels.len() / 2], c);
+}
+
 // =======================================================================
 // Phase C (App-level) テスト
 //
@@ -8634,6 +8650,104 @@ mod pipeline_cache_refactor_tests {
         assert!(
             !app.final_ai_cache.contains_key(&unknown_key),
             "result for a key not in pending must be dropped (stale)"
+        );
+    }
+
+    /// AI 処理サイズ上限の変更 (`apply_ai_size_limit_change`) は final AI cache /
+    /// failed / live pending / final composite と旧 AI cache 系を全て無効化する
+    /// (Codex P3)。サイズ上限はキャッシュ key に含まれないため、明示破棄しないと
+    /// 旧判定での結果 (failed 含む) が残り続け、上限を上げても再処理されない。
+    #[test]
+    fn apply_ai_size_limit_change_invalidates_ai_caches() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+
+        let edit_key = EditResultKey {
+            idx: 0,
+            source_gen: 0,
+            erase_mask_gen: 0,
+            local_gen: 0,
+            conceal_mask_gen: 0,
+            conceal_gen: 0,
+        };
+        let base_key = FinalAiKey {
+            edit_key,
+            color_ai_hash: 0,
+            bg: 0,
+        };
+        app.final_ai_cache.insert(
+            base_key,
+            Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
+        );
+        app.final_ai_failed.insert(FinalAiKey {
+            color_ai_hash: 1,
+            ..base_key
+        });
+        let (pending, final_cancel) = make_fake_final_ai_pending();
+        app.final_ai_pending.insert(
+            FinalAiKey {
+                color_ai_hash: 2,
+                ..base_key
+            },
+            pending,
+        );
+
+        let tex = ctx.load_texture(
+            "size_limit_test",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.final_composite_cache.insert(
+            FinalCompositeKey {
+                edit_key,
+                params_hash: 0,
+                bg: 0,
+            },
+            FinalCompositeEntry {
+                pixels: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
+                texture: tex.clone(),
+                complete: true,
+            },
+        );
+
+        // 旧 AI 経路 (legacy cache) も無効化対象
+        app.ai_upscale_cache.insert(
+            (0, 0),
+            crate::fs_animation::FsCacheEntry::Static {
+                tex,
+                pixels: Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
+                source_dims: None,
+                load_seq: 0,
+            },
+        );
+        app.ai_upscale_failed.insert((1, 0));
+        let legacy_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel::<crate::ai::upscale::UpscaleResult>();
+        app.ai_upscale_pending
+            .insert((2, 0), (Arc::clone(&legacy_cancel), rx));
+
+        app.apply_ai_size_limit_change();
+
+        assert!(app.final_ai_cache.is_empty(), "final_ai_cache cleared");
+        assert!(app.final_ai_failed.is_empty(), "final_ai_failed cleared");
+        assert!(app.final_ai_pending.is_empty(), "final_ai_pending cleared");
+        assert!(
+            final_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "live final AI pending must be cancelled"
+        );
+        assert!(
+            app.final_composite_cache.is_empty(),
+            "final_composite_cache cleared"
+        );
+        assert!(app.ai_upscale_cache.is_empty(), "legacy AI cache cleared");
+        assert!(app.ai_upscale_failed.is_empty(), "legacy AI failed cleared");
+        assert!(
+            app.ai_upscale_pending.is_empty(),
+            "legacy AI pending drained"
+        );
+        assert!(
+            legacy_cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "legacy pending must be cancelled"
         );
     }
 
