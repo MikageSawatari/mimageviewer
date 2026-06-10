@@ -20883,12 +20883,23 @@ impl App {
 
         // 上限 8192: これ以上大きいとテクスチャメモリが巨大になりクラッシュする
         // (8192px 正方形 ≈ 256 MB RGBA、16384px ≈ 1 GB)
-        // ラスターページでネイティブ解像度が AI アップスケール対象内の場合のみ
-        // 原寸基準でレンダリング。それ以外は従来通り 4096px 基準。
+        // ラスターページでネイティブ解像度が AI 処理対象 (アップスケール / デノイズ
+        // いずれかのサイズ上限内) の場合のみ原寸基準でレンダリング。それ以外は従来通り
+        // 4096px 基準。final AI はレンダ後のピクセルサイズで判定するため、4096 固定の
+        // ままだと上限内の原寸ページでも AI がスキップされる。デノイズ側の上限も見るのは
+        // Codex P2 指摘 (アップスケール上限だけ見ると、デノイズのみ範囲内のページが
+        // 4096 でレンダされてデノイズが掛からない)。
         let base_px = match content_type {
             Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }) => {
                 let native_long = w.max(h);
-                if crate::ai::upscale::should_process_rect(w, h, self.settings.ai_upscale_limit()) {
+                let in_ai_range =
+                    crate::ai::upscale::should_process_rect(w, h, self.settings.ai_upscale_limit())
+                        || crate::ai::upscale::should_process_rect(
+                            w,
+                            h,
+                            self.settings.ai_denoise_limit(),
+                        );
+                if in_ai_range {
                     native_long as f32
                 } else {
                     4096.0
