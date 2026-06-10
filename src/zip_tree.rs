@@ -295,6 +295,51 @@ impl ZipNavState {
         true
     }
 
+    /// 現在の本 (スタック最上段) を、**親階層の兄弟ディレクトリ**の前/次へ切り替える
+    /// (Ctrl+↑↓ の本またぎ移動)。`sort` 順で並べた親の子ディレクトリ列のうち、現在の本の
+    /// 次 (`forward=true`) / 前 (`forward=false`) へ移る。移動できたら `true`。
+    ///
+    /// ルート表示 (親なし) / 端 (次/前の兄弟が無い) では `false` (= その場に留まる)。
+    /// wrap-around はしない。新しい本の実効 prefix は `collapse_redundant` を通すので、
+    /// 兄弟がさらに単一ラッパーでも自動降下する。
+    pub fn sibling(&mut self, forward: bool, sort: SortOrder) -> bool {
+        if self.stack.len() < 2 {
+            return false; // 親がいない (= ルート表示)
+        }
+        let parent = self.stack[self.stack.len() - 2].clone();
+        let parent_len = parent.len();
+        // 現在の本の、親から見た最初のセグメント (collapse で深く降りていても parent_len 位置)。
+        let Some(seg) = self.current().get(parent_len).cloned() else {
+            return false;
+        };
+        let Some(parent_node) = self.tree.node_at(&parent) else {
+            return false;
+        };
+        // 親の子ディレクトリを sort 順に並べる (materialize_level の ZipDir 並びと一致)。
+        let mut dirs: Vec<&String> = parent_node.dirs.keys().collect();
+        dirs.sort_by(|a, b| sort.compare(a, 0, b, 0, crate::ui_helpers::natural_sort_key));
+        let Some(pos) = dirs.iter().position(|d| **d == seg) else {
+            return false;
+        };
+        let new_pos = if forward {
+            pos + 1
+        } else {
+            match pos.checked_sub(1) {
+                Some(p) => p,
+                None => return false,
+            }
+        };
+        let Some(new_seg) = dirs.get(new_pos) else {
+            return false; // 端
+        };
+        let mut child = parent;
+        child.push((*new_seg).clone());
+        let effective = self.tree.collapse_redundant(&child);
+        self.stack.pop();
+        self.stack.push(effective);
+        true
+    }
+
     /// 現在階層を materialize した `(items, image_metas)` を返す薄いラッパー。
     pub fn materialize_current(&self, sort: SortOrder) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
         self.tree.materialize_level(self.current(), sort)
@@ -827,6 +872,57 @@ mod tests {
         n.enter("ch01.zip/");
         // ch01.zip > only > [pages] の only まで降りる。
         assert_eq!(n.current(), &s(&["ch01.zip", "only"])[..]);
+    }
+
+    #[test]
+    fn nav_sibling_moves_between_books() {
+        // root に 3 冊。chapterA に入って Ctrl+↓ で chapterB → chapterC、端で no-op。
+        let mut n = nav(&[
+            "chapterA.zip/p1.png",
+            "chapterB.zip/p1.png",
+            "chapterC.zip/p1.png",
+        ]);
+        n.enter("chapterA.zip/");
+        assert_eq!(n.current(), &s(&["chapterA.zip"])[..]);
+        assert!(n.sibling(true, SortOrder::FileName)); // → B
+        assert_eq!(n.current(), &s(&["chapterB.zip"])[..]);
+        assert!(n.sibling(true, SortOrder::FileName)); // → C
+        assert_eq!(n.current(), &s(&["chapterC.zip"])[..]);
+        assert!(!n.sibling(true, SortOrder::FileName)); // 端 = no-op
+        assert_eq!(n.current(), &s(&["chapterC.zip"])[..]);
+        assert!(n.sibling(false, SortOrder::FileName)); // ← B
+        assert_eq!(n.current(), &s(&["chapterB.zip"])[..]);
+    }
+
+    #[test]
+    fn nav_sibling_false_at_root() {
+        // ルート表示では親がいないので sibling は false。
+        let mut n = nav(&["a.jpg", "b.jpg"]);
+        assert!(n.at_root());
+        assert!(!n.sibling(true, SortOrder::FileName));
+        assert!(!n.sibling(false, SortOrder::FileName));
+    }
+
+    #[test]
+    fn nav_sibling_collapses_wrapper_sibling() {
+        // 兄弟がさらに単一ラッパーなら自動降下する。
+        let mut n = nav(&["b1.zip/p1.png", "b2.zip/only/p1.png"]);
+        n.enter("b1.zip/");
+        assert_eq!(n.current(), &s(&["b1.zip"])[..]);
+        assert!(n.sibling(true, SortOrder::FileName));
+        // b2.zip > only > pages の only まで降りる。
+        assert_eq!(n.current(), &s(&["b2.zip", "only"])[..]);
+    }
+
+    #[test]
+    fn nav_sibling_back_after_sibling_returns_to_parent() {
+        // sibling で移動後も back は親 (本一覧) へ正しく戻る (スタック深さは保たれる)。
+        let mut n = nav(&["a.zip/p1.png", "b.zip/p1.png"]);
+        n.enter("a.zip/");
+        n.sibling(true, SortOrder::FileName); // → b.zip
+        assert!(!n.at_root());
+        assert!(n.back()); // → root (本一覧)
+        assert!(n.at_root());
     }
 
     #[test]

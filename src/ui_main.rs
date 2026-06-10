@@ -2663,6 +2663,8 @@ impl App {
                         self.global_search_ctrl_nav(forward);
                     } else if self.favsearch.active && !self.favsearch.nav_stack.is_empty() {
                         self.favsearch_ctrl_nav(forward);
+                    } else if self.zip_nav_handle_ctrl_updown(forward) {
+                        // ネスト ZIP の本の中: 兄弟本へ移動 (#4)。
                     } else if let Some(cur) = effective_folder.clone() {
                         self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Grid);
                     }

@@ -9528,6 +9528,33 @@ impl App {
         true
     }
 
+    /// Ctrl+↑↓ をネスト ZIP の本またぎ移動として処理する (#4)。
+    ///
+    /// 戻り値 `true` = 消費した (= 通常のフォルダ DFS ナビへ流さない)。
+    /// - **本の中 (スタック深さ ≥ 2)**: 兄弟本へ移動。端で移動できなくても **消費**して
+    ///   その場に留まる (読書中に ZIP を抜けない)。
+    /// - **ルート表示 (本一覧)**: `false` を返し、呼び出し側が従来どおり ZIP を抜けて
+    ///   実フォルダの兄弟へ移動する (BS でルートから抜けるのと対称)。
+    pub(crate) fn zip_nav_handle_ctrl_updown(&mut self, forward: bool) -> bool {
+        let at_root = match self.zip_nav.as_ref() {
+            Some(nav) => nav.at_root(),
+            None => return false,
+        };
+        if at_root {
+            return false;
+        }
+        let sort = self.settings.sort_order;
+        let moved = self
+            .zip_nav
+            .as_mut()
+            .map(|n| n.sibling(forward, sort))
+            .unwrap_or(false);
+        if moved {
+            self.zip_nav_show_current_level();
+        }
+        true
+    }
+
     /// PDF ファイルを仮想フォルダとして開く (非同期)。
     ///
     /// ワーカーにページ列挙リクエストを送り、即座に return する。
@@ -15408,6 +15435,9 @@ impl App {
                 self.cancel_pending_folder_nav();
             } else if in_favsearch {
                 self.favsearch_ctrl_nav(true);
+            } else if self.zip_nav_handle_ctrl_updown(true) {
+                // ネスト ZIP の本の中: 兄弟本へ移動 (#4)。ルート (本一覧) では false が返り、
+                // 下の effective_folder 分岐で従来どおり ZIP を抜けて実フォルダ兄弟へ。
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, true, FolderNavMode::Grid);
             }
@@ -15427,6 +15457,8 @@ impl App {
                 self.cancel_pending_folder_nav();
             } else if in_favsearch {
                 self.favsearch_ctrl_nav(false);
+            } else if self.zip_nav_handle_ctrl_updown(false) {
+                // ネスト ZIP の本の中: 前の兄弟本へ移動 (#4)。
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, false, FolderNavMode::Grid);
             }
