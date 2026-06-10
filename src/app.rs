@@ -9528,9 +9528,9 @@ impl App {
         // enter/back は新旧レベルの item が交わらないため実質 no-op だが、**同一階層の
         // 再 materialize (ソート変更 / ピン dirty 再表示)** では同じ item が並び替わる
         // だけなので、全 Pending リセットによる一瞬のプレースホルダフラッシュを防げる。
-        // zip_path は同一なので key は ZipImage = entry_name / ZipDir = dir_prefix で
-        // 足りる (末尾 '/' の有無で衝突しない)。補正対象の source pixels も同じ key で
-        // 移す (Ctrl+G と同様、補正済み tex は再生成)。
+        // key の構成は `zip_level_thumb_reuse_key` 参照 (ZipDir は representative 込み:
+        // ソート変更で代表が変わったセルは意図的にキー不一致 → 新代表で読み直す、Codex P2)。
+        // 補正対象の source pixels も同じ key で移す (Ctrl+G と同様、補正済み tex は再生成)。
         let preserved: std::collections::HashMap<String, crate::grid_item::ThumbnailState> = self
             .items
             .iter()
@@ -31656,12 +31656,29 @@ fn book_container_key_from_segs(zip_path: &std::path::Path, segs: &[String]) -> 
 
 /// ネスト ZIP の階層 re-materialize (`zip_nav_show_current_level`) でサムネを使い回す
 /// ための content key。同一 ZIP 内の移動専用なので zip_path は含めない。
-/// ZipImage は entry_name (フルパス)、ZipDir は dir_prefix (末尾 '/' 付き) で、
-/// 両者は末尾 '/' の有無により衝突しない。
+///
+/// - ZipImage = `i:{entry_name}` (フルパス)。
+/// - ZipDir = `d:{dir_prefix}#{representative}`。**`representative` を必ず含める**:
+///   `materialize_level` は代表画像をソート順準拠で選ぶため、ソート変更の
+///   re-materialize で同じ `dir_prefix` でも代表が変わり得る。`dir_prefix` だけで
+///   同一視すると旧代表の Loaded サムネが移植されたまま再ロードが走らず、
+///   表紙が古いまま残る (Codex P2)。代表が変わったセルはキー不一致 → Pending に
+///   戻って新代表で読み直す。ピン済みセルは表示が pinned entry なので代表変化は
+///   無関係だが、キー不一致で再ロードされるだけ (キャッシュ hit、無害) なので
+///   ここでは pin を考慮しない。
+/// - `i:`/`d:` の型タグでキー空間を分離する (`#` を含む entry 名と
+///   `{dir_prefix}#{representative}` の理論衝突を防ぐ)。
 fn zip_level_thumb_reuse_key(item: &GridItem) -> Option<String> {
     match item {
-        GridItem::ZipImage { entry_name, .. } => Some(entry_name.clone()),
-        GridItem::ZipDir { dir_prefix, .. } => Some(dir_prefix.clone()),
+        GridItem::ZipImage { entry_name, .. } => Some(format!("i:{entry_name}")),
+        GridItem::ZipDir {
+            dir_prefix,
+            representative,
+            ..
+        } => Some(format!(
+            "d:{dir_prefix}#{}",
+            representative.as_deref().unwrap_or("")
+        )),
         _ => None,
     }
 }

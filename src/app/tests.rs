@@ -4665,6 +4665,41 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// 階層 re-materialize のサムネ再利用キー: ZipDir は representative 込みで同一視する。
+    /// dir_prefix だけで同一視すると、ソート変更 (apply_sort_change_reload →
+    /// zip_nav_show_current_level) で代表画像が変わっても旧 Loaded サムネが移植されて
+    /// 表紙が古いまま残る (Codex P2)。
+    #[test]
+    fn zip_level_thumb_reuse_key_distinguishes_representative_change() {
+        use crate::grid_item::GridItem;
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        let zipdir = |rep: Option<&str>| GridItem::ZipDir {
+            zip_path: zip_path.clone(),
+            dir_prefix: "book/".to_string(),
+            is_archive: false,
+            representative: rep.map(|s| s.to_string()),
+        };
+
+        // 同じ dir_prefix でも代表が違えばキー不一致 (= Pending に戻して新代表で読み直す)。
+        let asc = zip_level_thumb_reuse_key(&zipdir(Some("book/a.jpg"))).unwrap();
+        let desc = zip_level_thumb_reuse_key(&zipdir(Some("book/z.jpg"))).unwrap();
+        assert_ne!(asc, desc, "代表画像が変わったら再利用しない");
+
+        // 代表が同じなら一致 (= ソート変更でも代表が変わらない本は再利用される)。
+        assert_eq!(
+            zip_level_thumb_reuse_key(&zipdir(Some("book/a.jpg"))).unwrap(),
+            asc
+        );
+
+        // ZipImage とはキー空間を型タグで分離 ('#' を含む entry 名との衝突防止):
+        // ZipDir("book/", rep "a.jpg") と entry "book/#a.jpg" が同一キーにならない。
+        let img = GridItem::ZipImage {
+            zip_path,
+            entry_name: "book/#a.jpg".to_string(),
+        };
+        assert_ne!(zip_level_thumb_reuse_key(&img).unwrap(), asc);
+    }
+
     /// 見開きから隠蔽加工に入ったあと `reset_conceal_mode` で元の見開き状態に戻ること。
     #[test]
     fn reset_conceal_mode_restores_saved_spread_state() {
