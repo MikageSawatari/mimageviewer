@@ -11522,25 +11522,35 @@ impl App {
         let Some(db) = self.folder_thumb_pin_db.as_ref() else {
             return;
         };
-        let mut container_paths: Vec<&std::path::Path> = self
+        // 所有権付き PathBuf で集める (ZipDir の本キーは合成パスで借用できないため)。
+        // lookup_many が内部で重複除去するので manual dedup は不要。
+        let mut container_paths: Vec<PathBuf> = self
             .items
             .iter()
             .filter_map(|it| match it {
                 GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
-                    Some(p.as_path())
+                    Some(p.clone())
                 }
+                // ネスト ZIP の子コンテナ (本) は zip_path + dir_prefix の合成キーでピンを引く。
+                GridItem::ZipDir {
+                    zip_path,
+                    dir_prefix,
+                    ..
+                } => Some(book_container_key(zip_path, dir_prefix)),
                 _ => None,
             })
             .collect();
         // current_folder 自身も lookup 対象に含める (検索合成パス / アグリゲートビューは除外)。
-        // 子 items 由来のパスとは container_key が異なるので、`apply_folder_thumb_pin` が
-        // 子の解決で誤って自分自身のピンを引くことはない。
         if let Some(cur) = self.current_folder.as_ref() {
-            if *cur != search_results_synthetic_path()
-                && !self.items_are_global_search_view
-                && !container_paths.iter().any(|p| *p == cur.as_path())
-            {
-                container_paths.push(cur.as_path());
+            if *cur != search_results_synthetic_path() && !self.items_are_global_search_view {
+                container_paths.push(cur.clone());
+            }
+        }
+        // ネスト ZIP 閲覧中は「現在の本」のキー (zip_path + 実効 prefix) も含める。
+        // 本の中で P を押したときの「既にピン済みか」判定 (folder_thumb_pin_for) 用。
+        if self.zip_nav.is_some() {
+            if let Some(book_key) = self.spread_container_key() {
+                container_paths.push(book_key);
             }
         }
         if container_paths.is_empty() {
@@ -11749,6 +11759,41 @@ impl App {
     /// 親フォルダ自身の代表画を pinned_key 下に保存してしまい、ユーザーから見ると
     /// 「動画 pin したのにサムネが変わらない」状態になる (= 効果が無い pin)。
     pub(crate) fn toggle_folder_pin_for_idx(&mut self, idx: usize) {
+        // ネスト ZIP ツリー (Model B): 本 (= 現在の階層) ごとに代表サムネを記憶する。
+        // 本の中で画像に P → その本の代表を設定/解除。ZipDir セルに P → 操作ガイドを出す
+        // (代表は本の中で画像を選んで設定する仕様)。
+        if self.zip_nav.is_some() {
+            match self.items.get(idx).cloned() {
+                Some(GridItem::ZipImage { entry_name, .. }) => {
+                    let Some(book_key) = self.spread_container_key() else {
+                        return;
+                    };
+                    let source = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                        zip_rel: String::new(),
+                        entry: entry_name,
+                    };
+                    if self.folder_thumb_pin_for(&book_key) == Some(&source) {
+                        self.remove_folder_thumb_pin(&book_key);
+                        self.show_feedback_toast("この本の代表サムネを解除しました".to_string());
+                    } else {
+                        self.set_folder_thumb_pin(&book_key, source);
+                        self.show_feedback_toast("この本の代表サムネに設定しました".to_string());
+                    }
+                    // 設定対象 (本) のセルは親階層にあり現在のビューには無いので、ここでの
+                    // 再 materialize (= scroll/selected リセット) は不要。dirty を消して
+                    // 読書位置を保つ。親へ戻ると zip_nav_back の refresh_folder_pin_map が
+                    // ピンを拾ってセルに反映する。
+                    self.folder_thumb_pin_dirty = false;
+                }
+                Some(GridItem::ZipDir { .. }) => {
+                    self.show_feedback_toast(
+                        "本を開いて、代表にしたい画像で P を押してください".to_string(),
+                    );
+                }
+                _ => {}
+            }
+            return;
+        }
         let Some(container) = self.current_folder.clone() else {
             return;
         };
@@ -31264,6 +31309,18 @@ fn make_drive_list_pin_load_request(
 /// `App::folder_pin_map` の参照を渡す。空 HashMap でも構わない (= pin 機能なし相当)。
 /// pin が見つかったコンテナは `apply_folder_thumb_pin` で `LoadRequest` を target
 /// 種別の形に書き換える (cache_key は親 prefix を維持し suffix で identity を載せる)。
+/// ネスト ZIP の「本」(= 内側 ZIP / サブフォルダ) の代表サムネピン用コンテナキー。
+/// `zip_path` に `dir_prefix` ("a/b/") のセグメントを join した合成パス。
+/// `App::spread_container_key` (zip_path + 現在の実効 prefix) と同じ構成で、非崩しの
+/// 通常本では「本の中で pin したキー」と「親で ZipDir セルを引くキー」が一致する。
+fn book_container_key(zip_path: &std::path::Path, dir_prefix: &str) -> PathBuf {
+    let mut p = zip_path.to_path_buf();
+    for seg in dir_prefix.split('/').filter(|s| !s.is_empty()) {
+        p.push(seg);
+    }
+    p
+}
+
 #[allow(clippy::too_many_arguments)]
 fn make_load_request(
     item: &GridItem,
@@ -31318,17 +31375,43 @@ fn make_load_request(
             representative,
             ..
         } => {
-            // ネスト ZIP ツリーの子コンテナ代表サムネ (v1.3.0)。代表画像 (representative)
-            // のバイトを zip_entry 経由で読み、カタログには zipdir:{dir_prefix} キーで保存
-            // する (entry_name キーと非衝突, additive)。cache_key_override が zipdir: で
+            // ネスト ZIP ツリーの子コンテナ代表サムネ (v1.3.0)。代表画像のバイトを
+            // zip_entry 経由で読み、カタログには zipdir:{dir_prefix} キーで保存する
+            // (entry_name キーと非衝突, additive)。cache_key_override が zipdir: で
             // folder/zip thumb prefix と一致しないため、ワーカーはコンテナ列挙ではなく
-            // 「zip_entry を直接読む」経路に乗る。representative は materialize が必ず
-            // Some にする (空サブツリーは構造上生成されない) ので、None なら要求を出さない。
-            let rep = representative.clone()?;
+            // 「zip_entry を直接読む」経路に乗る。
+            //
+            // Model B: 本ごとの代表サムネピン (zip_path + dir_prefix キー) があれば、その
+            // 画像を代表にする。ピン時は cache_key に #pin:{entry} を付けて auto キャッシュと
+            // 分離する。collapse 済みラッパー本では set 側 (effective prefix) と lookup 側
+            // (dir_prefix) のキーがずれてピンが反映されない (= 非崩しの通常本では一致)。
+            let book_key =
+                crate::path_key::normalize_keep_drive(&book_container_key(zip_path, dir_prefix));
+            let pinned_entry = pin_map.get(&book_key).and_then(|src| match src {
+                crate::folder_thumb_pins::FolderPinSource::ZipEntry { entry, .. } => {
+                    Some(entry.clone())
+                }
+                _ => None,
+            });
+            let (entry, cache_key) = if let Some(e) = pinned_entry {
+                let ck = format!(
+                    "{}{}{}",
+                    crate::grid_item::zipdir_cache_key(dir_prefix),
+                    crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+                    e
+                );
+                (e, ck)
+            } else {
+                // 代表は materialize が原則 Some にする (空サブツリーは構造上生成されない)。
+                (
+                    representative.clone()?,
+                    crate::grid_item::zipdir_cache_key(dir_prefix),
+                )
+            };
             Some(LoadRequest {
                 path: zip_path.clone(),
-                zip_entry: Some(rep),
-                cache_key_override: Some(crate::grid_item::zipdir_cache_key(dir_prefix)),
+                zip_entry: Some(entry),
+                cache_key_override: Some(cache_key),
                 ..base
             })
         }
