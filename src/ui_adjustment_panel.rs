@@ -7463,6 +7463,22 @@ fn draw_sliders(
         if r.dragged() {
             dragging = true;
         }
+        let mut skip_after_ai = params.smart_sharpen_skip_after_ai;
+        if ui
+            .checkbox(
+                &mut skip_after_ai,
+                egui::RichText::new("AI アップスケール実行時は適用しない").color(LABEL_COLOR),
+            )
+            .on_hover_text(
+                "AI アップスケールで拡大した画像は既に輪郭が強調されていることが多いため、\n\
+                 二重にシャープがかかるのを防ぎます。ノイズ除去のみの場合や、サイズ上限で\n\
+                 アップスケールが実行されなかった画像には通常どおり適用されます。",
+            )
+            .changed()
+        {
+            params.smart_sharpen_skip_after_ai = skip_after_ai;
+            changed = true;
+        }
     }
 
     // ── ポストフィルタ (レトロ系 + 写真系エフェクト) ──

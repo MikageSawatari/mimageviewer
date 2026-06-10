@@ -8756,6 +8756,104 @@ mod pipeline_cache_refactor_tests {
             hash_adjust_final_params(&base, mode, true),
             hash_adjust_final_params(&sharpened, mode, true),
         );
+        // 「AI アップスケール実行時は適用しない」フラグも final hash にだけ乗る。
+        let mut skip_off = base.clone();
+        skip_off.smart_sharpen_skip_after_ai = false;
+        assert_ne!(
+            hash_adjust_final_params(&base, mode, false),
+            hash_adjust_final_params(&skip_off, mode, false),
+            "skip flag must invalidate the final composite cache"
+        );
+        assert_eq!(
+            hash_adjust_color_ai_params(&base, mode),
+            hash_adjust_color_ai_params(&skip_off, mode),
+            "skip flag must NOT invalidate the final AI cache"
+        );
+    }
+
+    /// 「AI アップスケール実行時は適用しない」(既定 ON): 合成ベースが実際に
+    /// アップスケール出力 (サイズの変わった AI 結果) のときだけシャープ化を外す。
+    #[test]
+    fn smart_sharpen_skips_when_composite_uses_upscaled_ai_result() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+        let idx = push_image(&mut app, "C:/pics/skip-after-ai.jpg");
+
+        // source 解像度の edit 結果 (4x1 の強エッジ)
+        let edge_row = |w: usize, h: usize| {
+            let mut px = Vec::with_capacity(w * h);
+            for _ in 0..h {
+                for x in 0..w {
+                    let v = if x < w / 2 { 40 } else { 200 };
+                    px.push(egui::Color32::from_rgb(v, v, v));
+                }
+            }
+            egui::ColorImage::new([w, h], px)
+        };
+        let edit_image = edge_row(4, 1);
+        let edit_key = dummy_edit_key(&app, idx);
+        let edit_tex = ctx.load_texture(
+            "skip_ai_edit",
+            edit_image.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.edit_result_cache.insert(
+            edit_key,
+            EditResultEntry {
+                pixels: Arc::new(edit_image),
+                texture: Some(edit_tex),
+            },
+        );
+
+        // ページ個別: シャープ 100 + アップスケール指定 (skip フラグは既定 ON)
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.smart_sharpen = 100;
+        params.upscale_model = Some("realesr_general_v3".to_string());
+        assert!(params.smart_sharpen_skip_after_ai);
+        app.adjustment_page_params.insert(idx, params.clone());
+
+        // 2x アップスケール済みの AI 結果 (8x2) を final_ai_cache に直接投入
+        let ai_image = edge_row(8, 2);
+        let ai_key = FinalAiKey {
+            edit_key,
+            color_ai_hash: hash_adjust_color_ai_params(&params, app.settings.ai_feature_mode),
+            bg: 0,
+        };
+        app.final_ai_cache
+            .insert(ai_key, Arc::new(ai_image.clone()));
+
+        let composite_pixels = |app: &App| {
+            app.final_composite_cache
+                .iter()
+                .find(|(key, _)| key.edit_key.idx == idx)
+                .map(|(_, entry)| Arc::clone(&entry.pixels))
+                .expect("final composite must exist")
+        };
+
+        // skip ON (既定): 合成は AI 結果そのまま (シャープ非適用)
+        app.ensure_final_composite_texture(&ctx, idx)
+            .expect("composite with skip ON");
+        let skipped = composite_pixels(&app);
+        assert_eq!(skipped.size, [8, 2], "AI 結果のサイズで合成される");
+        assert_eq!(
+            skipped.pixels, ai_image.pixels,
+            "skip ON では AI アップスケール出力にシャープを掛けない"
+        );
+
+        // skip OFF: 同じ AI 結果にシャープが掛かり、エッジ画素が変化する
+        let mut params_off = params.clone();
+        params_off.smart_sharpen_skip_after_ai = false;
+        app.adjustment_page_params.insert(idx, params_off);
+        app.final_composite_cache.clear();
+        app.ensure_final_composite_texture(&ctx, idx)
+            .expect("composite with skip OFF");
+        let sharpened = composite_pixels(&app);
+        assert_eq!(sharpened.size, [8, 2]);
+        assert_ne!(
+            sharpened.pixels, ai_image.pixels,
+            "skip OFF では AI 出力にもシャープが掛かる"
+        );
     }
 
     /// P5-3: `is_idx_final_ai_done_or_skipped` は source pixels が無い idx を

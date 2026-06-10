@@ -1014,6 +1014,9 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
     (`色調補正 → final AI → シャープ化 → post_filter`) に追加したもの。AI モデルは使わない
   - サムネイルには反映しない。フルスクリーン最終表示・コピー (Ctrl+S)・書き出し (Ctrl+E) に反映
   - ポストフィルタと併用可能 (排他ではない)。強度変更で final AI は再実行されない
+  - 「AI アップスケール実行時は適用しない」チェックボックス (既定 ON)。アップスケール出力は
+    既に輪郭強調済みのことが多く、二重シャープを防ぐ。デノイズのみ / サイズ上限スキップの
+    ページには通常どおり適用される
   - CPU + rayon 行並列。radius は内部で最大 3.0 に clamp
   - 詳細: [final-smart-sharpen-plan.md](final-smart-sharpen-plan.md) /
     [preset-and-adjustment.md §2.6](preset-and-adjustment.md)

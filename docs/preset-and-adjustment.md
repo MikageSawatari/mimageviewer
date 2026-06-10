@@ -386,9 +386,21 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
   `local_adjust_core::SmartSharpenParams` を生成 (アンカー 0/30/60/100 の線形補間)。
   本体は `local_adjust_core::apply_smart_sharpen_rgba` (補正レイヤーの
   `LocalEffect::SmartSharpen` と同じ計算式、rayon 行並列、radius は 3.0 に clamp)。
+- **AI アップスケール実行時のスキップ (`smart_sharpen_skip_after_ai`、既定 ON)**:
+  アップスケールモデルの出力は既に輪郭強調済みのことが多く、二重シャープで見た目が
+  悪化しやすいため、既定でスキップする (パネルのチェックボックスで解除可)。判定は
+  「設定が AI ON か」ではなく **合成ベースが実際にアップスケール出力か**
+  (`base_is_ai && base_pixels.size != edit_pixels.size`)。したがって:
+  - デノイズのみの AI 結果 (サイズ不変) には通常どおり掛かる
+  - サイズ上限 (`ai_upscale_skip_px`) で AI がスキップされたページにも掛かる
+  - AI 未完了中の暫定合成 (complete=false、非 AI 画像) には掛かり、AI 完了時の
+    再合成で外れる (= complete フラグの再合成機構にそのまま乗る)
+  - legacy の `apply_sync_adjustment` 経路は `ai_upscale_enabled && ai_upscale_cache hit`
+    で近似 (final pipeline 側がサイズ比較で厳密判定する)
 - **適用位置**: final pipeline の `色調補正 → final AI → スマートシャープ → post_filter`。
   AI 入力には掛けないので、強度変更で final AI は再実行されない
-  (`hash_adjust_final_params` には乗るが `hash_adjust_color_ai_params` には乗せない)。
+  (`hash_adjust_final_params` には乗るが `hash_adjust_color_ai_params` には乗せない。
+  skip フラグも同様に final hash のみ)。
   単ページ書き換え経路 (スライダー / スロット適用 / 見開き L/R コピー) は
   `App::clear_caches_for_param_change(idx, old, new)` で差分を分類し、
   「smart_sharpen だけの変更」なら `clear_smart_sharpen_only_caches` で

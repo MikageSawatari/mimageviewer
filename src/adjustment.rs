@@ -303,6 +303,17 @@ pub struct AdjustParams {
     /// post_filter の前に適用される。
     #[serde(default)]
     pub smart_sharpen: u8,
+    /// AI アップスケールが実行された合成にはシャープ化を掛けない (既定 ON)。
+    /// アップスケールモデルの出力は既に輪郭強調済みのことが多く、二重シャープで
+    /// 見た目が悪化しやすいため。判定は「設定が AI ON か」ではなく「この合成が実際に
+    /// アップスケール出力 (サイズの変わった AI 結果) を採用したか」で行うので、
+    /// デノイズのみ・サイズ上限スキップのページには通常どおり掛かる。
+    #[serde(default = "default_smart_sharpen_skip_after_ai")]
+    pub smart_sharpen_skip_after_ai: bool,
+}
+
+fn default_smart_sharpen_skip_after_ai() -> bool {
+    true
 }
 
 impl Default for AdjustParams {
@@ -321,6 +332,7 @@ impl Default for AdjustParams {
             denoise_model: None,
             post_filter: PostFilter::None,
             smart_sharpen: 0,
+            smart_sharpen_skip_after_ai: default_smart_sharpen_skip_after_ai(),
         }
     }
 }
@@ -379,13 +391,26 @@ impl AdjustParams {
             && self.auto_mode == other.auto_mode
     }
 
-    /// other との差分が `smart_sharpen` のみ (または差分なし) か。
-    /// final AI の入力が不変なので、cache clear を
+    /// other との差分がシャープ化設定 (`smart_sharpen` / `smart_sharpen_skip_after_ai`)
+    /// のみ (または差分なし) か。final AI の入力が不変なので、cache clear を
     /// `App::clear_smart_sharpen_only_caches` (final AI cache 保持) に振り分けられる。
     pub fn differs_only_in_smart_sharpen(&self, other: &Self) -> bool {
         let mut probe = self.clone();
         probe.smart_sharpen = other.smart_sharpen;
+        probe.smart_sharpen_skip_after_ai = other.smart_sharpen_skip_after_ai;
         probe == *other
+    }
+
+    /// 最終合成で実際に使うシャープ化強度を解決する。
+    /// `output_is_ai_upscaled` = 合成ベースが AI アップスケール出力 (元よりサイズの
+    /// 大きい AI 結果) のとき true。「AI アップスケール実行時は適用しない」が ON で
+    /// アップスケール出力なら 0 (= スキップ) を返す。
+    pub fn effective_smart_sharpen(&self, output_is_ai_upscaled: bool) -> u8 {
+        if self.smart_sharpen_skip_after_ai && output_is_ai_upscaled {
+            0
+        } else {
+            self.smart_sharpen
+        }
     }
 
     pub fn upscale_model_kind(&self) -> Option<Option<crate::ai::ModelKind>> {
@@ -951,12 +976,48 @@ mod tests {
         assert!(base.differs_only_in_smart_sharpen(&sharpen));
         // 差分なしも true (最も安い clear 経路に流れるだけで無害)
         assert!(base.differs_only_in_smart_sharpen(&base));
+        // skip フラグのトグルも「シャープ化設定のみの差分」(AI 入力不変)
+        let mut skip_toggled = base.clone();
+        skip_toggled.smart_sharpen_skip_after_ai = !base.smart_sharpen_skip_after_ai;
+        assert!(base.differs_only_in_smart_sharpen(&skip_toggled));
         let mut mixed = sharpen.clone();
         mixed.brightness = 5.0;
         assert!(!base.differs_only_in_smart_sharpen(&mixed));
         let mut with_pf = sharpen.clone();
         with_pf.post_filter = PostFilter::Sepia;
         assert!(!base.differs_only_in_smart_sharpen(&with_pf));
+    }
+
+    #[test]
+    fn smart_sharpen_skip_after_ai_defaults_on_and_resolves_strength() {
+        let params = AdjustParams::default();
+        assert!(
+            params.smart_sharpen_skip_after_ai,
+            "既定は ON (AI 時スキップ)"
+        );
+
+        let mut sharpen = params.clone();
+        sharpen.smart_sharpen = 60;
+        // skip ON: アップスケール出力には掛けない / 非 AI 合成には掛ける
+        assert_eq!(sharpen.effective_smart_sharpen(true), 0);
+        assert_eq!(sharpen.effective_smart_sharpen(false), 60);
+        // skip OFF: 常に掛ける
+        sharpen.smart_sharpen_skip_after_ai = false;
+        assert_eq!(sharpen.effective_smart_sharpen(true), 60);
+        assert_eq!(sharpen.effective_smart_sharpen(false), 60);
+    }
+
+    #[test]
+    fn smart_sharpen_fields_deserialize_with_defaults_when_missing() {
+        // 旧形式 JSON (シャープ化フィールドなし) からの読み込みで
+        // strength=0 / skip=ON に解決されること (#[serde(default)] の回帰ガード)。
+        let mut value = serde_json::to_value(AdjustParams::default()).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("smart_sharpen");
+        obj.remove("smart_sharpen_skip_after_ai");
+        let loaded: AdjustParams = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.smart_sharpen, 0);
+        assert!(loaded.smart_sharpen_skip_after_ai);
     }
 
     #[test]

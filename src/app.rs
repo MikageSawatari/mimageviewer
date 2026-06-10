@@ -1175,6 +1175,7 @@ fn hash_adjust_final_params(
         // 色調補正と同様に適用したままにするので、bypassed の条件外で hash する。
         // color_ai hash には含めない (= 強度変更で final AI を再実行させない)。
         params.smart_sharpen.hash(h);
+        params.smart_sharpen_skip_after_ai.hash(h);
     })
 }
 
@@ -24267,27 +24268,33 @@ impl App {
         };
         let fc_adjust_ms = t_adjust0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
 
-        let (base_pixels, complete) = match (ai_key, ai_ready) {
-            (Some(_), Some(pixels)) => (pixels, true),
+        let (base_pixels, complete, base_is_ai) = match (ai_key, ai_ready) {
+            (Some(_), Some(pixels)) => (pixels, true, true),
             (Some(key), None) if self.final_ai_failed.contains(&key) => {
-                (Arc::clone(&adjusted), true)
+                (Arc::clone(&adjusted), true, false)
             }
             (Some(key), None) => {
                 self.maybe_start_final_ai(idx, key, Arc::clone(&adjusted), params.clone());
-                (Arc::clone(&adjusted), false)
+                (Arc::clone(&adjusted), false, false)
             }
-            (None, _) => (Arc::clone(&adjusted), true),
+            (None, _) => (Arc::clone(&adjusted), true, false),
         };
 
         // 最終表示段スマートシャープ: 色調補正 → final AI → **ここ** → post_filter。
         // AI 入力 (`adjusted`) には掛けない (シャープ強度の変更で AI を再実行させない)。
+        // 「AI アップスケール実行時は適用しない」(既定 ON) は、ベースが実際に
+        // アップスケール出力 (= 元よりサイズの大きい AI 結果) のときだけ発動する。
+        // デノイズのみの AI 結果はサイズ不変なので通常どおり掛かる。AI 未完了の暫定
+        // 合成 (complete=false) は非 AI 画像なので掛かり、AI 完了時の再合成で外れる。
+        let output_is_ai_upscaled = base_is_ai && base_pixels.size != edit_pixels.size;
+        let sharpen_strength = params.effective_smart_sharpen(output_is_ai_upscaled);
         let t_sharpen0 = perf_on.then(std::time::Instant::now);
-        let sharpened = if params.smart_sharpen == 0 {
+        let sharpened = if sharpen_strength == 0 {
             base_pixels
         } else {
             Arc::new(crate::adjustment::apply_final_smart_sharpen(
                 &base_pixels,
-                params.smart_sharpen,
+                sharpen_strength,
             ))
         };
         let fc_sharpen_ms = t_sharpen0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
@@ -25874,12 +25881,14 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
         pixels: &std::sync::Arc<egui::ColorImage>,
+        source_is_upscaled_ai: bool,
     ) {
         let params = self.effective_params(idx).clone();
         // post-filter をバイパスする場合: 色調もシャープ化も identity ならスキップ可能
         let apply_pf =
             !self.post_filter_bypassed && params.post_filter != crate::adjustment::PostFilter::None;
-        let apply_sharpen = params.smart_sharpen != 0;
+        let sharpen_strength = params.effective_smart_sharpen(source_is_upscaled_ai);
+        let apply_sharpen = sharpen_strength != 0;
         if params.is_color_identity() && !apply_pf && !apply_sharpen {
             return;
         }
@@ -25887,7 +25896,7 @@ impl App {
         // final pipeline と同じ順: 色調 → シャープ化 → post_filter (ソースが AI 由来でも
         // AI は上流適用済みなので順序は崩れない)。
         let sharpened = if apply_sharpen {
-            crate::adjustment::apply_final_smart_sharpen(&adjusted, params.smart_sharpen)
+            crate::adjustment::apply_final_smart_sharpen(&adjusted, sharpen_strength)
         } else {
             adjusted
         };
@@ -25985,18 +25994,23 @@ impl App {
             return;
         }
         // ソース画像を取得 (AI アップスケール済み or 元画像)
-        let source = if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
-            self.ai_upscale_cache
-                .get(&(idx, bg))
-                .or_else(|| self.fs_cache.get(&idx))
-        } else {
-            self.fs_cache.get(&idx)
-        };
+        let (source, source_is_upscaled_ai) =
+            if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
+                match self.ai_upscale_cache.get(&(idx, bg)) {
+                    // ai_upscale_cache はアップスケール / デノイズ両方の出力が入るので、
+                    // 「アップスケール出力か」はアップスケール有効フラグで近似する
+                    // (legacy 経路。final pipeline 側はサイズ比較で厳密判定)。
+                    Some(entry) => (Some(entry), self.ai_upscale_enabled),
+                    None => (self.fs_cache.get(&idx), false),
+                }
+            } else {
+                (self.fs_cache.get(&idx), false)
+            };
         let Some(FsCacheEntry::Static { pixels, .. }) = source else {
             return;
         };
         let pixels = std::sync::Arc::clone(pixels);
-        self.apply_sync_adjustment(ctx, idx, &pixels);
+        self.apply_sync_adjustment(ctx, idx, &pixels, source_is_upscaled_ai);
     }
 
     pub(crate) fn invalidate_compare_prepared_for_idx(&mut self, idx: usize) {
@@ -27975,7 +27989,7 @@ impl App {
                     // 表示中の画像のみ色調補正を即座に適用（チラつき防止）
                     // 先読み分は maybe_apply_adjustment に委ねる
                     if self.fullscreen_idx == Some(key) {
-                        self.apply_sync_adjustment(ctx, key, &pixels);
+                        self.apply_sync_adjustment(ctx, key, &pixels, false);
                     }
                     FsCacheEntry::Static {
                         tex: handle,
@@ -28071,7 +28085,7 @@ impl App {
                         self.pano_quality_state.insert(source_key, state);
                     }
                     if self.fullscreen_idx == Some(key) {
-                        self.apply_sync_adjustment(ctx, key, &pixels);
+                        self.apply_sync_adjustment(ctx, key, &pixels, false);
                     }
                     FsCacheEntry::Static {
                         tex: handle,
