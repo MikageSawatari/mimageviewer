@@ -125,6 +125,13 @@ impl App {
                     self.set_page_params(session.fs_idx, p);
                 }
             }
+            // 中断したドラッグの色調 dirty を清算する。色調が動いていたなら
+            // 旧コンテキストのサムネ補正を作り直し、シャープ化だけなら温存する
+            // (release 遷移を経由しないのでここで明示的に処理する)。
+            if self.thumb_adjust_drag_color_dirty {
+                self.thumb_adjust_tex.clear();
+            }
+            self.thumb_adjust_drag_color_dirty = false;
         }
         // 進行中のタグ操作の保留 Undo entry を破棄する。worker 結果は引き続き来るが、
         // poll_tag_write_results 側で「対応する pending が無い」ことを検出して
