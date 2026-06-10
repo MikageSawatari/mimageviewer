@@ -26029,6 +26029,26 @@ impl App {
         self.compare_view_mode = CompareViewMode::Off;
     }
 
+    /// シャープ化 (smart_sharpen) **だけ** が変わったときの cache clear。
+    ///
+    /// final AI の入力 (色調補正後の edit 画像) は不変なので、`final_ai_cache` /
+    /// pending / failed は保持し、下流の final composite (+ legacy adjustment_cache /
+    /// comic) だけを落とす。これを `clear_adjustment_caches` に流すと、強度スライダーの
+    /// 変更ごとに final AI が cancel → 再実行されてしまう (Codex P1 2026-06-10)。
+    /// `thumb_adjust_tex` もサムネにシャープ化が乗らないため触らない。
+    pub(crate) fn clear_smart_sharpen_only_caches(&mut self, idx: usize) {
+        self.adjustment_cache.remove(&idx);
+        self.invalidate_compare_prepared_for_idx(idx);
+        // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
+        self.bump_adjustment_generation(idx);
+        self.final_composite_cache
+            .retain(|key, _| key.edit_key.idx != idx);
+        // comic は final composite を下地にするので連動破棄 + 進行中 bake も cancel
+        // (clear_final_pipeline_caches_for_idx と同じ理由)。
+        self.comic_cache.remove(&idx);
+        self.cancel_comic_bake_for_idx(idx);
+    }
+
     /// 指定ページの補正関連キャッシュをクリアする。
     /// 色調パラメータ変更時は adjustment_cache のみクリア。
     /// AI モデル設定変更時は ai_upscale_cache もクリアする。

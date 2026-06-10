@@ -389,6 +389,10 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
 - **適用位置**: final pipeline の `色調補正 → final AI → スマートシャープ → post_filter`。
   AI 入力には掛けないので、強度変更で final AI は再実行されない
   (`hash_adjust_final_params` には乗るが `hash_adjust_color_ai_params` には乗せない)。
+  補正パネル側も「強度だけの変更」を検出して `clear_smart_sharpen_only_caches` を使い、
+  `final_ai_cache` / pending を保持する (§4 の表参照)。bulk 系 (全画像に適用 / 標準にする /
+  お気に入り標準) は従来どおり `clear_all_color_caches` で final AI ごと全クリアされる
+  (post_filter のみ変更時と同じ既知の過剰クリア。ワンショット操作なので許容)。
 - **サムネイル非反映**: `is_color_identity()` には参加しないため、`thumb_adjust_tex` の
   生成判定・内容に影響しない。
 - **post_filter バイパス (消しゴム / 隠蔽 / 分析) 中も適用したまま** (色調補正と同じ扱い)。
@@ -514,7 +518,7 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 | --- | --- | --- | --- | --- |
 | 色系パラメータ変更* (ページ個別) | 残す | 該当 idx の final cache をクリア | 該当 idx のみクリア | final AI は該当 idx をキャンセル |
 | **ポストフィルタ変更** (ページ個別) | 残す | 該当 idx の final cache をクリア | 触らない (サムネ非対象) | final AI は必要なら残せるが現実装は idx 単位 clear |
-| **シャープ化 (smart_sharpen) 変更** (ページ個別) | 残す | 該当 idx の final cache をクリア (`hash_adjust_final_params` に強度が乗る) | 触らない (サムネ非対象、`is_color_identity` にも不参加) | final AI cache は保持 (`ai_settings_eq` / color_ai hash 不変) |
+| **シャープ化 (smart_sharpen) のみ変更** (ページ個別) | 残す | 該当 idx の final **composite** のみクリア (`clear_smart_sharpen_only_caches`)。**final AI cache / pending は保持** (AI 入力不変、Codex P1 2026-06-10) | 触らない (サムネ非対象、`is_color_identity` にも不参加) | final AI は触らない |
 | AI モデル変更 (ページ個別) | 残す | 該当 idx の final cache / pending / failed をクリア | 触らない (サムネ非対象) | final AI をキャンセル |
 | 消しゴム/隠蔽加工/分析モードの入出 (`post_filter_bypassed` 切替) | 残す | 該当 idx の final cache のみクリア (`input_generation` は進めない) | 触らない | final AI は該当 idx をキャンセル |
 | 保存スロット読込 → 現ページに適用 | 残す | 該当 idx の final cache をクリア | 該当 idx のみクリア | AI 設定が変われば final AI キャンセル |

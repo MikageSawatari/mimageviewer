@@ -11905,6 +11905,13 @@ impl App {
         // ラジオ・コンボボックス・リセット↩ ボタンなどの非ドラッグ変更は即時通常パス。
         if changed {
             let ai_changed = !original.ai_settings_eq(&edit_params);
+            // シャープ化だけの変更か。final AI の入力は不変なので、cache を保持して
+            // 再合成 (sharpen + post_filter + upload) だけで済ませる。
+            let sharpen_only_changed = {
+                let mut probe = edit_params.clone();
+                probe.smart_sharpen = original.smart_sharpen;
+                probe == original
+            };
             if is_dragging {
                 self.adjustment_page_params
                     .insert(fs_idx, edit_params.clone());
@@ -11925,6 +11932,8 @@ impl App {
             }
             if ai_changed {
                 self.clear_all_adjustment_and_ai_caches(fs_idx);
+            } else if sharpen_only_changed {
+                self.clear_smart_sharpen_only_caches(fs_idx);
             } else {
                 self.clear_adjustment_caches(fs_idx);
             }

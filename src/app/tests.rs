@@ -8623,6 +8623,44 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// シャープ強度だけの変更は `clear_smart_sharpen_only_caches` 経由で
+    /// final AI cache を保持する (Codex P1: `clear_adjustment_caches` に流すと
+    /// 強度スライダーごとに final AI が cancel → 再実行されてしまう)。
+    #[test]
+    fn smart_sharpen_only_clear_keeps_final_ai_cache() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/sharpen.jpg");
+        let (edit_key, final_key) = insert_edit_and_final_cache(&mut app, &ctx, idx, "sharpen");
+
+        app.clear_smart_sharpen_only_caches(idx);
+
+        assert!(
+            app.final_ai_cache
+                .keys()
+                .any(|key| key.edit_key == edit_key),
+            "sharpen-only clear must keep final_ai_cache (AI input unchanged)"
+        );
+        assert!(
+            !app.final_composite_cache.contains_key(&final_key),
+            "sharpen-only clear must drop the final composite"
+        );
+        assert!(
+            app.edit_result_cache.contains_key(&edit_key),
+            "sharpen-only clear must keep the edit result"
+        );
+
+        // 対照: 通常の色調系 clear は final AI cache も落とす (AI 入力が変わるため)。
+        let (edit_key2, _) = insert_edit_and_final_cache(&mut app, &ctx, idx, "sharpen2");
+        app.clear_adjustment_caches(idx);
+        assert!(
+            !app.final_ai_cache
+                .keys()
+                .any(|key| key.edit_key == edit_key2),
+            "color-path clear must still drop final_ai_cache"
+        );
+    }
+
     /// 最終表示段スマートシャープ: 強度変更で final composite key は切り替わるが、
     /// final AI key (color_ai hash) は不変 — AI 再実行なしで再合成だけが走る。
     #[test]
