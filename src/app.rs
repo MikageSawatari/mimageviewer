@@ -1326,7 +1326,7 @@ pub(crate) use crate::thumb_loader::{
 /// レーティングフィルタを 1 アイテムに適用し、可視かを返す。
 ///
 /// レーティング対象 (コンテナ + 画像系) は全 6 バケット (★なし + ★1〜5) で判定し、
-/// 非レーティング対象 (Video / Separator / ConvertibleArchive 等) は常に可視。
+/// 非レーティング対象 (Separator 等) は常に可視。
 /// 「★5 のみ表示」操作で未評価フォルダが残らないよう、コンテナもページ系と
 /// 同じ厳密フィルタに揃えた (★なしフォルダに入りたいときは「なし」を ON に戻す)。
 ///
@@ -19103,6 +19103,9 @@ impl App {
             | GridItem::ZipFile(p)
             | GridItem::PdfFile(p)
             | GridItem::Video(p) => Some(crate::adjustment_db::normalize_path(p)),
+            GridItem::ConvertibleArchive { path, .. } => {
+                Some(crate::adjustment_db::normalize_path(path))
+            }
             // ネスト ZIP ツリーの本 (v1.3.0): 実パスを持たないので、ピン/見開きと同じ
             // 合成パス (zip_path + literal prefix セグメント) を正規化してキーにする。
             // set/get とも同じセル (literal dir_prefix) 経由なので自己整合する。
@@ -19110,9 +19113,16 @@ impl App {
                 zip_path,
                 dir_prefix,
                 ..
-            } => Some(crate::adjustment_db::normalize_path(&book_container_key(
-                zip_path, dir_prefix,
-            ))),
+            } => {
+                let root = zip_rating_root_path(
+                    zip_path,
+                    self.archive_source_override.as_deref(),
+                    self.current_folder.as_deref(),
+                );
+                Some(crate::adjustment_db::normalize_path(&book_container_key(
+                    root, dir_prefix,
+                )))
+            }
             _ => None,
         }
     }
@@ -19127,9 +19137,16 @@ impl App {
             | GridItem::Folder(p)
             | GridItem::ZipFile(p)
             | GridItem::PdfFile(p) => Some(p.clone()),
-            GridItem::ZipImage { zip_path, .. } | GridItem::ZipDir { zip_path, .. } => {
-                Some(zip_path.clone())
-            }
+            GridItem::ConvertibleArchive { path, .. } => Some(path.clone()),
+            GridItem::ZipImage { zip_path, .. } => Some(zip_path.clone()),
+            GridItem::ZipDir { zip_path, .. } => Some(
+                zip_rating_root_path(
+                    zip_path,
+                    self.archive_source_override.as_deref(),
+                    self.current_folder.as_deref(),
+                )
+                .to_path_buf(),
+            ),
             GridItem::PdfPage { pdf_path, .. } => Some(pdf_path.clone()),
             _ => None,
         }
@@ -19185,10 +19202,7 @@ impl App {
         }
         // コンテナへの rating 変更は current_folder と同じパスを指す可能性があるので
         // アドレスバーキャッシュを lazy 再計算させる。
-        if matches!(
-            self.items.get(idx),
-            Some(GridItem::Folder(_) | GridItem::ZipFile(_) | GridItem::PdfFile(_))
-        ) {
+        if matches!(self.items.get(idx), Some(it) if it.is_container_ratable()) {
             self.current_folder_rating_cache = None;
         }
         // 設定 ON + Image (JPEG/PNG/WebP) のときだけ XMP にも書き込む。
@@ -19369,8 +19383,8 @@ impl App {
             return;
         }
         // bucket の index safety + `accepts_rating` 判定を passes_rating_filter に委譲。
-        // ConvertibleArchive (RAR/7z/LZH) は accepts_rating=false で get_rating が必ず 0 を
-        // 返すため、上の 1..=5 check で先に弾かれる (このブランチには到達しない)。
+        // RAR/7z/LZH などの ConvertibleArchive もコンテナ★対象なので、ZIP/PDF と同じく
+        // 自身の★がフィルタを通るときだけ一時解除する。
         let item = &self.items[idx];
         if !passes_rating_filter(item, stars, &self.settings.rating_filter) {
             // 自身の★が現在フィルタに通っていない = 親ビューで見えなかったはず
@@ -19643,25 +19657,31 @@ impl App {
     /// Shift+F1〜F6 / アドレスバー★が対象にする「現在表示中コンテナ」の
     /// rating DB キーと、Undo/XMP 判定用の source path を返す。
     ///
-    /// 通常フォルダ / ZIP / PDF は従来どおり `current_folder`。ネスト ZIP ツリー内では
-    /// - ルート表示: 外側 ZIP 本体 (`zip_path`)
+    /// 通常フォルダ / ZIP / PDF / RAR 等は従来どおりユーザー視点のコンテナ。
+    /// ネスト ZIP ツリー内では
+    /// - ルート表示: 外側 ZIP 本体。RAR/7z/LZH 変換キャッシュ閲覧中は元アーカイブ
     /// - 本の中: BS で戻った親階層に表示される `ZipDir` セルと同じ合成キー
     /// を使う。collapse で `bookB/only/` まで自動降下していても、親セルが `bookB/`
-    /// なら `zip_path\bookB` に保存する。
+    /// なら `root\bookB` に保存する。
     pub(crate) fn current_container_rating_key_and_source(&self) -> Option<(String, PathBuf)> {
         if self.global_search.active {
             return None;
         }
         if let Some(nav) = self.zip_nav.as_ref() {
+            let root = zip_rating_root_path(
+                &nav.tree.zip_path,
+                self.archive_source_override.as_deref(),
+                self.current_folder.as_deref(),
+            );
             let key_path = if nav.at_root() {
-                nav.tree.zip_path.clone()
+                root.to_path_buf()
             } else {
                 let prefix = nav.current_parent_zipdir_prefix()?;
-                book_container_key_from_segs(&nav.tree.zip_path, &prefix)
+                book_container_key_from_segs(root, &prefix)
             };
             return Some((
                 crate::adjustment_db::normalize_path(&key_path),
-                nav.tree.zip_path.clone(),
+                root.to_path_buf(),
             ));
         }
         let folder = self.current_folder.as_ref()?;
@@ -32162,6 +32182,19 @@ fn zip_pin_root_path<'a>(
     } else {
         zip_path
     }
+}
+
+/// ZIP ツリーナビ内のコンテナレーティングで使う root path。
+///
+/// 通常 ZIP は `zip_path`、RAR/7z/LZH 変換キャッシュ ZIP では元アーカイブを使う。
+/// これにより、親フォルダの `ConvertibleArchive` セルに F2 で付けた★と、
+/// 変換後ビューの root で Shift+F2 した★が同じ key を共有する。
+fn zip_rating_root_path<'a>(
+    zip_path: &'a std::path::Path,
+    archive_source_override: Option<&'a std::path::Path>,
+    current_folder: Option<&std::path::Path>,
+) -> &'a std::path::Path {
+    zip_pin_root_path(zip_path, archive_source_override, current_folder)
 }
 
 /// ネスト ZIP の階層 re-materialize (`zip_nav_show_current_level`) でサムネを使い回す

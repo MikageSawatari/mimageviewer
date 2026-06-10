@@ -367,12 +367,17 @@ JPEG など EXIF Orientation を持つ ZIP 内画像は、サムネイル・フ�
 `normalize_path` / page_key 生成に揃えること。**キー規則がズレると ZIP/PDF の回転や補正が保存されない**。
 
 `rating_db.rs` はページ単位 (画像 / ZIP 内画像 / PDF ページ) とコンテナ (フォルダ / ZIP / PDF
-本体) の両方を同じテーブルに格納する。キーは `App::rating_path_key` 経由:
+本体 / RAR・7z・LZH 等の変換前アーカイブ / ZipDir) の両方を同じテーブルに格納する。
+キーは `App::rating_path_key` 経由:
 - ページ単位は `App::page_path_key` と同じ (`adjustment_db::normalize_path` 形式、ZipImage は
   `::entry`、PdfPage は `::page_N` 区切り)
 - コンテナは `normalize_path(path)` のみで、`::` セパレータが付かない。
   この構造により「ZIP ファイルへのコンテナ★」と「その ZIP 内エントリへのページ★」が同じ
   DB 内で衝突せずに共存できる。
+- RAR/7z/LZH を変換キャッシュ ZIP として開いているときのコンテナ★は、cache ZIP ではなく
+  `archive_source_override` (= 元アーカイブ) を root にする。親フォルダの
+  `ConvertibleArchive` セルに F1〜F6 で付けた★と、変換後ビュー root の Shift+F1〜F6 は
+  同じキーを共有する。ZipDir も `元アーカイブ + literal prefix` の合成キーを使う。
 新規ページ単位 DB を追加する際は `page_path_key` を使い、コンテナ単位は
 `normalize_path(path)` を直接使う。
 

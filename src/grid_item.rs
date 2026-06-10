@@ -126,14 +126,19 @@ impl GridItem {
         )
     }
 
-    /// コンテナ (フォルダ / ZIP ファイル / PDF ファイル / ネスト ZIP の本) 自体への
-    /// レーティング対象か。一覧画面でコンテナを★絞り込みできるようにするための判定。
+    /// コンテナ (フォルダ / ZIP ファイル / PDF ファイル / 変換アーカイブ /
+    /// ネスト ZIP の本) 自体へのレーティング対象か。一覧画面でコンテナを★絞り込み
+    /// できるようにするための判定。
     /// ZipDir (v1.3.0 ツリーナビの本セル) は実パスを持たないが、ピン/見開きと同じ
     /// 合成パスキーでレーティングを持てる (`App::rating_path_key` 参照)。
     pub fn is_container_ratable(&self) -> bool {
         matches!(
             self,
-            Self::Folder(_) | Self::ZipFile(_) | Self::PdfFile(_) | Self::ZipDir { .. }
+            Self::Folder(_)
+                | Self::ZipFile(_)
+                | Self::PdfFile(_)
+                | Self::ConvertibleArchive { .. }
+                | Self::ZipDir { .. }
         )
     }
 
@@ -162,8 +167,8 @@ impl GridItem {
 
     /// レーティング★を付与できるアイテムかの総合判定。
     /// 単一ファイル (画像 / 動画 / ZIP 内画像 / PDF ページ) とコンテナ (フォルダ / ZIP /
-    /// PDF) の両方を含む。補正プリセット等のページ専用データとは別物なので区別すること
-    /// (補正用には [`Self::has_page_data`])。
+    /// PDF / 変換アーカイブ / ネスト ZIP の本) の両方を含む。補正プリセット等のページ
+    /// 専用データとは別物なので区別すること (補正用には [`Self::has_page_data`])。
     pub fn accepts_rating(&self) -> bool {
         self.is_rating_leaf() || self.is_container_ratable()
     }
@@ -500,6 +505,18 @@ mod tests {
         assert!(item.is_container_ratable());
         assert!(item.accepts_rating());
         assert!(!item.is_heavy_io());
+    }
+
+    #[test]
+    fn convertible_archive_is_ratable_container() {
+        let item = GridItem::ConvertibleArchive {
+            path: PathBuf::from(r"C:\books\a.rar"),
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        };
+
+        assert!(item.is_container_ratable());
+        assert!(item.accepts_rating());
+        assert!(!item.is_rating_leaf());
     }
 
     #[test]

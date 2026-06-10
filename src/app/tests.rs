@@ -4912,6 +4912,129 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn convertible_archive_is_ratable_with_source_archive_key() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let src = std::path::PathBuf::from(r"C:\books\nested_rar_test.rar");
+        app.items.push(GridItem::ConvertibleArchive {
+            path: src.clone(),
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        });
+        app.thumbnails.push(ThumbnailState::Pending);
+
+        assert!(app.items[0].accepts_rating());
+        assert!(app.items[0].is_container_ratable());
+        let expected = crate::adjustment_db::normalize_path(&src);
+        assert_eq!(app.rating_path_key(0).as_deref(), Some(expected.as_str()));
+
+        app.set_rating(0, 2);
+        assert_eq!(app.get_rating(0), 2);
+        app.rating_cache.clear();
+        assert_eq!(app.get_rating(0), 2);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&expected), 2);
+    }
+
+    #[test]
+    fn convertible_archive_participates_in_rating_filter() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let src = std::path::PathBuf::from(r"C:\books\nested_rar_test.rar");
+        app.items.push(GridItem::ConvertibleArchive {
+            path: src,
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        });
+        app.thumbnails.push(ThumbnailState::Pending);
+
+        app.set_rating(0, 2);
+
+        let mut rf = [false; 6];
+        rf[2] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![0]);
+
+        let mut rf = [false; 6];
+        rf[3] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_visible_indices();
+        assert!(
+            app.visible_indices.is_empty(),
+            "RAR/7z/LZH もフォルダや ZIP と同じコンテナ★フィルタ対象"
+        );
+    }
+
+    #[test]
+    fn converted_archive_root_shift_rating_uses_source_archive_key() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let cache = std::path::PathBuf::from(r"C:\cache\converted\nested_rar_test.zip");
+        let src = std::path::PathBuf::from(r"C:\books\nested_rar_test.rar");
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(src.clone());
+        app.zip_nav = Some(test_zip_nav_for(cache.clone(), &["p1.jpg", "p2.jpg"]));
+        app.zip_nav_show_current_level();
+
+        assert!(app.set_current_folder_rating(2));
+
+        let source_key = crate::adjustment_db::normalize_path(&src);
+        let cache_key = crate::adjustment_db::normalize_path(&cache);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&source_key), 2);
+        assert_eq!(
+            app.rating_db.as_ref().unwrap().get(&cache_key),
+            0,
+            "変換キャッシュ ZIP root ではなく、元 RAR ファイルのキーに保存する"
+        );
+
+        app.zip_nav = None;
+        app.archive_source_override = None;
+        app.current_folder = Some(src.parent().unwrap().to_path_buf());
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: src,
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.rating_cache.clear();
+        assert_eq!(app.get_rating(0), 2);
+    }
+
+    #[test]
+    fn converted_archive_zipdir_rating_uses_source_archive_root() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let cache = std::path::PathBuf::from(r"C:\cache\converted\nested_rar_test.zip");
+        let src = std::path::PathBuf::from(r"C:\books\nested_rar_test.rar");
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(src.clone());
+
+        let mut nav = test_zip_nav_for(cache.clone(), &["bookA/p1.jpg", "bookB/p1.jpg"]);
+        nav.enter("bookA/");
+        app.zip_nav = Some(nav);
+        app.zip_nav_show_current_level();
+
+        assert!(app.set_current_folder_rating(4));
+
+        let source_book_key = crate::adjustment_db::normalize_path(&src.join("bookA"));
+        let cache_book_key = crate::adjustment_db::normalize_path(&cache.join("bookA"));
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&source_book_key), 4);
+        assert_eq!(
+            app.rating_db.as_ref().unwrap().get(&cache_book_key),
+            0,
+            "変換アーカイブ内の ZipDir 評価も cache ZIP ではなく元アーカイブ root を使う"
+        );
+
+        assert!(app.zip_nav_back());
+        let idx = app
+            .items
+            .iter()
+            .position(
+                |it| matches!(it, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "bookA/"),
+            )
+            .expect("parent level should contain bookA ZipDir");
+        app.rating_cache.clear();
+        assert_eq!(app.get_rating(idx), 4);
+    }
+
+    #[test]
     fn shift_container_rating_inside_zip_book_updates_parent_zipdir_rating() {
         use crate::grid_item::GridItem;
         let mut app = setup_app();
