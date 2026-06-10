@@ -9324,6 +9324,21 @@ impl App {
         self.details_image_dims_state = LazyColumnState::Disabled;
         self.selected = None;
         self.scroll_offset_y = 0.0;
+        // 変換キャッシュの override は「current_folder == そのキャッシュ ZIP」の間だけ
+        // 有効なペア。**別の ZIP へ遷移するならここで同期的に破棄する** (キャッシュ経由で
+        // 開く経路は open_archive_via_cache / 変換完了 pending_nav が load 後に再設定する)。
+        // ここで消さないと、下で current_folder を新 ZIP に書き換える → async 列挙完了時の
+        // start_loading_items では previous_folder == source_path となり preserve 判定が
+        // 常に真 → stale override が残留する。その結果 effective_folder() が古い元
+        // アーカイブを指し続け、Ctrl+↑↓ の脱出 DFS が毎回「古いアーカイブの次 = 同じ隣の
+        // ZIP」へ着地して、押しっぱなしで同じ ZIP を再走破し続けるループになる (実機報告)。
+        if !self
+            .current_folder
+            .as_ref()
+            .is_some_and(|cur| crate::folder_tree::path_eq(cur, &zip_path))
+        {
+            self.archive_source_override = None;
+        }
         self.current_folder = Some(zip_path.clone());
         self.current_folder_rating_cache = None;
         self.current_folder_last_mtime = None;
