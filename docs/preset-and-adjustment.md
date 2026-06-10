@@ -404,12 +404,13 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
   AI 入力には掛けないので、強度変更で final AI は再実行されない
   (`hash_adjust_final_params` には乗るが `hash_adjust_color_ai_params` には乗せない。
   skip フラグも同様に final hash のみ)。
-  単ページ書き換え経路 (スライダー / スロット適用 / 見開き L/R コピー) は
-  `App::clear_caches_for_param_change(idx, old, new)` で差分を分類し、
-  「smart_sharpen だけの変更」なら `clear_smart_sharpen_only_caches` で
-  `final_ai_cache` / pending を保持する (§4 の表参照)。bulk 系 (全画像に適用 / 標準にする /
-  お気に入り標準) は従来どおり `clear_all_color_caches` で final AI ごと全クリアされる
-  (post_filter のみ変更時と同じ既知の過剰クリア。ワンショット操作なので許容)。
+  単ページ書き換え経路 (スライダー / T キーのポストフィルタ循環 / スロット適用 /
+  見開き L/R コピー) は `App::clear_caches_for_param_change(idx, old, new)` で差分を
+  分類し、「final 専用項目 (post_filter / smart_sharpen) だけの変更」なら
+  `clear_final_stage_only_caches` で `final_ai_cache` / pending を保持する (§4 の表参照)。
+  bulk 系 (全画像に適用 / 標準にする / お気に入り標準) は従来どおり
+  `clear_all_color_caches` で final AI ごと全クリアされる (既知の過剰クリア。
+  ワンショット操作なので許容)。
 - **サムネ無効化の色調 gate**: `set_page_params` / `clear_page_params` は
   `color_settings_eq` (brightness..midtone + auto_mode) が変わるときだけ
   `thumb_adjust_tex` を落とす。スライダードラッグ release の全クリアも
@@ -539,8 +540,7 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 | 変更された内容 | `edit_result_cache` | `final_ai_cache` / `final_composite_cache` | `thumb_adjust_tex` | pending |
 | --- | --- | --- | --- | --- |
 | 色系パラメータ変更* (ページ個別) | 残す | 該当 idx の final cache をクリア | 該当 idx のみクリア | final AI は該当 idx をキャンセル |
-| **ポストフィルタ変更** (ページ個別) | 残す | 該当 idx の final cache をクリア | 触らない (サムネ非対象) | final AI は必要なら残せるが現実装は idx 単位 clear |
-| **シャープ化 (smart_sharpen) のみ変更** (ページ個別) | 残す | 該当 idx の final **composite** のみクリア (`clear_smart_sharpen_only_caches`)。**final AI cache / pending は保持** (AI 入力不変、Codex P1 2026-06-10) | 触らない (サムネ非対象、`is_color_identity` にも不参加) | final AI は触らない |
+| **final 専用項目 (ポストフィルタ / シャープ化) のみ変更** (ページ個別。パネル / T キー循環 / スロット / 見開きコピー) | 残す | 該当 idx の final **composite** のみクリア (`clear_final_stage_only_caches`)。**final AI cache / pending は保持** (AI 入力不変、Codex P1/P3 2026-06-10) | 触らない (サムネ非対象、`is_color_identity` にも不参加) | final AI は触らない |
 | AI モデル変更 (ページ個別) | 残す | 該当 idx の final cache / pending / failed をクリア | 触らない (サムネ非対象) | final AI をキャンセル |
 | 消しゴム/隠蔽加工/分析モードの入出 (`post_filter_bypassed` 切替) | 残す | 該当 idx の final cache のみクリア (`input_generation` は進めない) | 触らない | final AI は該当 idx をキャンセル |
 | 保存スロット読込 → 現ページに適用 | 残す | `clear_caches_for_param_change` で差分分類 (シャープのみなら final AI 保持) | 色調が変わるときだけ該当 idx をクリア | AI 設定が変われば final AI キャンセル |
@@ -558,7 +558,8 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 | crop 変更 | **クリアしない** (表示は overlay のみ) | **クリアしない** | 触らない | **触らない** (AI を無駄にキャンセルしない) |
 
 *「色系」= brightness/contrast/gamma/saturation/temperature/levels/auto_mode
-(ポストフィルタは AI 設定を変えないので `ai_settings_eq` には含まれず、色系変更と同じ扱い)
+(ポストフィルタ / シャープ化は final 専用項目で、単独変更なら上記の
+`clear_final_stage_only_caches` 行の扱い。色系と同時に変わった場合は色系変更として扱う)
 
 消しゴムマスク変更時は `erase_mask_generation[idx]` を進め、`erase_result_cache` と
 `local_adjust_cache` / `conceal_cache[idx]` / `edit_result_cache` / final cache を stale 化する。
@@ -580,6 +581,11 @@ fn clear_edit_result_caches_for_idx(&mut self, idx: usize)
 
 fn clear_final_pipeline_caches_for_idx(&mut self, idx: usize)
     // final_ai_pending / final_ai_cache / final_ai_failed / final_composite_cache を idx 単位でクリア
+
+fn clear_final_stage_only_caches(&mut self, idx: usize)
+    // final composite (+ legacy adjustment_cache / comic) のみクリア、final AI は保持。
+    // post_filter / smart_sharpen のような final 専用項目だけが変わったとき用
+    // (clear_caches_for_param_change が differs_only_in_final_stage で振り分ける)
 
 fn clear_all_final_pipeline_caches(&mut self)
     // final AI pending をキャンセルし、final AI / final composite を全クリア

@@ -26059,14 +26059,18 @@ impl App {
         self.compare_view_mode = CompareViewMode::Off;
     }
 
-    /// シャープ化 (smart_sharpen) **だけ** が変わったときの cache clear。
+    /// final 専用フィールド (post_filter / smart_sharpen / skip フラグ) **だけ** が
+    /// 変わったときの cache clear。
     ///
-    /// final AI の入力 (色調補正後の edit 画像) は不変なので、`final_ai_cache` /
-    /// pending / failed は保持し、下流の final composite (+ legacy adjustment_cache /
-    /// comic) だけを落とす。これを `clear_adjustment_caches` に流すと、強度スライダーの
-    /// 変更ごとに final AI が cancel → 再実行されてしまう (Codex P1 2026-06-10)。
-    /// `thumb_adjust_tex` もサムネにシャープ化が乗らないため触らない。
-    pub(crate) fn clear_smart_sharpen_only_caches(&mut self, idx: usize) {
+    /// これらは final AI より後段にしか効かず、final AI の入力 (色調補正後の edit 画像)
+    /// は不変なので、`final_ai_cache` / pending / failed は保持し、下流の final composite
+    /// (+ legacy adjustment_cache / comic) だけを落とす。これを `clear_adjustment_caches`
+    /// に流すと、シャープ強度スライダーの変更や T キーのポストフィルタ循環ごとに
+    /// final AI が cancel → 再実行されてしまう (Codex P1/P3 2026-06-10)。
+    /// `thumb_adjust_tex` もサムネに final 専用項目が乗らないため触らない。
+    /// NEAREST/LINEAR サンプラー切替 (needs_nearest_sampler) は final composite の
+    /// 再生成時に新テクスチャへ反映されるのでここでの追加処理は不要。
+    pub(crate) fn clear_final_stage_only_caches(&mut self, idx: usize) {
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
         // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
@@ -26080,10 +26084,12 @@ impl App {
     }
 
     /// 単ページのパラメータ書き換え後の cache clear を差分内容で振り分ける共通経路。
-    /// スライダー / スロット適用 / 見開きコピーのように old → new が分かる場所で使う。
+    /// スライダー / T キー循環 / スロット適用 / 見開きコピーのように old → new が
+    /// 分かる場所で使う。
     /// - AI 設定が変わった → `clear_all_adjustment_and_ai_caches`
-    /// - smart_sharpen だけ変わった → `clear_smart_sharpen_only_caches` (final AI 保持)
-    /// - それ以外 (色調 / post_filter) → `clear_adjustment_caches`
+    /// - final 専用項目 (post_filter / シャープ化) だけ変わった →
+    ///   `clear_final_stage_only_caches` (final AI 保持)
+    /// - それ以外 (色調) → `clear_adjustment_caches`
     pub(crate) fn clear_caches_for_param_change(
         &mut self,
         idx: usize,
@@ -26092,8 +26098,8 @@ impl App {
     ) {
         if !old.ai_settings_eq(new) {
             self.clear_all_adjustment_and_ai_caches(idx);
-        } else if old.differs_only_in_smart_sharpen(new) {
-            self.clear_smart_sharpen_only_caches(idx);
+        } else if old.differs_only_in_final_stage(new) {
+            self.clear_final_stage_only_caches(idx);
         } else {
             self.clear_adjustment_caches(idx);
         }

@@ -391,11 +391,15 @@ impl AdjustParams {
             && self.auto_mode == other.auto_mode
     }
 
-    /// other との差分がシャープ化設定 (`smart_sharpen` / `smart_sharpen_skip_after_ai`)
-    /// のみ (または差分なし) か。final AI の入力が不変なので、cache clear を
-    /// `App::clear_smart_sharpen_only_caches` (final AI cache 保持) に振り分けられる。
-    pub fn differs_only_in_smart_sharpen(&self, other: &Self) -> bool {
+    /// other との差分が final 専用フィールド (`post_filter` / `smart_sharpen` /
+    /// `smart_sharpen_skip_after_ai`) のみ (または差分なし) か。
+    /// これらは final pipeline の final AI より後段にしか効かないので、変更時に
+    /// final AI cache を保持したまま再合成だけで済ませられる
+    /// (`App::clear_final_stage_only_caches`)。final 専用フィールドを増やしたら
+    /// この probe にも追加すること。
+    pub fn differs_only_in_final_stage(&self, other: &Self) -> bool {
         let mut probe = self.clone();
+        probe.post_filter = other.post_filter;
         probe.smart_sharpen = other.smart_sharpen;
         probe.smart_sharpen_skip_after_ai = other.smart_sharpen_skip_after_ai;
         probe == *other
@@ -969,23 +973,31 @@ mod tests {
     }
 
     #[test]
-    fn differs_only_in_smart_sharpen_detection() {
+    fn differs_only_in_final_stage_detection() {
         let base = AdjustParams::default();
         let mut sharpen = base.clone();
         sharpen.smart_sharpen = 60;
-        assert!(base.differs_only_in_smart_sharpen(&sharpen));
+        assert!(base.differs_only_in_final_stage(&sharpen));
         // 差分なしも true (最も安い clear 経路に流れるだけで無害)
-        assert!(base.differs_only_in_smart_sharpen(&base));
-        // skip フラグのトグルも「シャープ化設定のみの差分」(AI 入力不変)
+        assert!(base.differs_only_in_final_stage(&base));
+        // skip フラグのトグルも final 専用の差分 (AI 入力不変)
         let mut skip_toggled = base.clone();
         skip_toggled.smart_sharpen_skip_after_ai = !base.smart_sharpen_skip_after_ai;
-        assert!(base.differs_only_in_smart_sharpen(&skip_toggled));
+        assert!(base.differs_only_in_final_stage(&skip_toggled));
+        // post_filter のみ / post_filter + シャープ併用も final 専用の差分
+        let mut pf_only = base.clone();
+        pf_only.post_filter = PostFilter::Sepia;
+        assert!(base.differs_only_in_final_stage(&pf_only));
+        let mut pf_and_sharpen = sharpen.clone();
+        pf_and_sharpen.post_filter = PostFilter::Sepia;
+        assert!(base.differs_only_in_final_stage(&pf_and_sharpen));
+        // 色調 / AI が混ざったら false
         let mut mixed = sharpen.clone();
         mixed.brightness = 5.0;
-        assert!(!base.differs_only_in_smart_sharpen(&mixed));
-        let mut with_pf = sharpen.clone();
-        with_pf.post_filter = PostFilter::Sepia;
-        assert!(!base.differs_only_in_smart_sharpen(&with_pf));
+        assert!(!base.differs_only_in_final_stage(&mixed));
+        let mut with_ai = pf_only.clone();
+        with_ai.upscale_model = Some("auto".into());
+        assert!(!base.differs_only_in_final_stage(&with_ai));
     }
 
     #[test]

@@ -5125,10 +5125,12 @@ impl App {
         }
 
         // T / Shift+T / Alt+T: ポストフィルタの次/前/なしへ切替。
-        // AI 再実行は発生させないため色調キャッシュのみクリア。
+        // post_filter は final AI の後段なので、差分分類 (clear_caches_for_param_change)
+        // 経由で final AI cache を保持したまま final composite だけ作り直す。
         if (key_t || key_t_shift || key_t_alt) && self.reading_flow.is_paged() {
             let scope = self.resolve_adjust_scope(fs_idx);
-            let mut params = self.effective_params(fs_idx).clone();
+            let old_params = self.effective_params(fs_idx).clone();
+            let mut params = old_params.clone();
             let all = crate::adjustment::PostFilter::ALL;
             let cur = all
                 .iter()
@@ -5147,9 +5149,11 @@ impl App {
             self.capture_adjust_full(
                 format!("ポストフィルタ: {}", next.display_label()),
                 |app| {
-                    app.write_params_for_scope(fs_idx, scope, params);
+                    app.write_params_for_scope(fs_idx, scope, params.clone());
                     match scope {
-                        AdjustScope::PageOverride => app.clear_adjustment_caches(fs_idx),
+                        AdjustScope::PageOverride => {
+                            app.clear_caches_for_param_change(fs_idx, &old_params, &params)
+                        }
                         AdjustScope::FavoriteDefault(_) | AdjustScope::Global => {}
                     }
                 },

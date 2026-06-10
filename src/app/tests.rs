@@ -8623,17 +8623,18 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
-    /// シャープ強度だけの変更は `clear_smart_sharpen_only_caches` 経由で
-    /// final AI cache を保持する (Codex P1: `clear_adjustment_caches` に流すと
-    /// 強度スライダーごとに final AI が cancel → 再実行されてしまう)。
+    /// final 専用項目 (シャープ化 / post_filter) だけの変更は
+    /// `clear_final_stage_only_caches` 経由で final AI cache を保持する
+    /// (Codex P1: `clear_adjustment_caches` に流すと強度スライダーや T キー循環の
+    /// たびに final AI が cancel → 再実行されてしまう)。
     #[test]
-    fn smart_sharpen_only_clear_keeps_final_ai_cache() {
+    fn final_stage_only_clear_keeps_final_ai_cache() {
         let ctx = egui::Context::default();
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/sharpen.jpg");
         let (edit_key, final_key) = insert_edit_and_final_cache(&mut app, &ctx, idx, "sharpen");
 
-        app.clear_smart_sharpen_only_caches(idx);
+        app.clear_final_stage_only_caches(idx);
 
         assert!(
             app.final_ai_cache
@@ -8658,6 +8659,61 @@ mod pipeline_cache_refactor_tests {
                 .keys()
                 .any(|key| key.edit_key == edit_key2),
             "color-path clear must still drop final_ai_cache"
+        );
+    }
+
+    /// post_filter のみの変更 (T キー循環 / パネルのコンボ変更) も差分分類で
+    /// final AI cache を保持し、サムネ補正テクスチャも温存する (Codex P3 対応)。
+    #[test]
+    fn post_filter_only_change_keeps_final_ai_cache_and_thumb() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/postfilter.jpg");
+        let (edit_key, _) = insert_edit_and_final_cache(&mut app, &ctx, idx, "pf_only");
+        app.thumb_adjust_tex.insert(
+            idx,
+            ctx.load_texture(
+                "pf_thumb",
+                egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            ),
+        );
+
+        // T キーハンドラ / パネルと同じ流れ: 書き込み → 差分分類 clear
+        let old = app.effective_params(idx).clone();
+        let mut new = old.clone();
+        new.post_filter = PostFilter::Sepia;
+        app.set_page_params(idx, new.clone());
+        app.clear_caches_for_param_change(idx, &old, &new);
+
+        assert!(
+            app.final_ai_cache
+                .keys()
+                .any(|key| key.edit_key == edit_key),
+            "post_filter-only change must keep final_ai_cache"
+        );
+        assert!(
+            !app.final_composite_cache
+                .keys()
+                .any(|key| key.edit_key.idx == idx),
+            "post_filter-only change must drop the final composite"
+        );
+        assert!(
+            app.thumb_adjust_tex.contains_key(&idx),
+            "post_filter-only change must keep the thumb adjust texture"
+        );
+
+        // 対照: 色調も同時に変わったら従来どおり final AI も落ちる
+        let (edit_key2, _) = insert_edit_and_final_cache(&mut app, &ctx, idx, "pf_color");
+        let mut color_change = new.clone();
+        color_change.brightness = 25.0;
+        app.set_page_params(idx, color_change.clone());
+        app.clear_caches_for_param_change(idx, &new, &color_change);
+        assert!(
+            !app.final_ai_cache
+                .keys()
+                .any(|key| key.edit_key == edit_key2),
+            "color+post_filter change must drop final_ai_cache"
         );
     }
 
