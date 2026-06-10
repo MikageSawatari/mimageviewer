@@ -118,7 +118,7 @@ RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<h
      **literal prefix を `collapse_redundant` した実効 prefix の合成パス** で、lookup は
      `lookup_many` 1 回に束ねる (per-dir 逐次 lookup は UI スレッドを dirs 数比例で
      ブロックするため)
-   - 階層内の移動 (enter/back/sibling) は `zip_nav_show_current_level` の軽量経路
+   - 階層内の移動 (enter/back/dfs_step) は `zip_nav_show_current_level` の軽量経路
      (`install_new_items`、`start_loading_items` を通さない)
    - **本ごとピン (Model B) のキー規則**: set 側は `App::pin_container_key()` =
      ルート表示なら `zip_path` (= 外側 ZIP の代表。親フォルダの ZipFile セルが引くキー /
