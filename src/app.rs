@@ -9557,8 +9557,14 @@ impl App {
 
     /// フルスクリーン中の Ctrl+↑↓ 本またぎ移動 (#4)。兄弟本へ移って、その本の先頭画像を
     /// フルスクリーンで開く。端 (兄弟なし) では何もしない (= ZIP を抜けずその場に留まる)。
-    /// holdover キャプチャは呼び出し側 (ui_fullscreen) が事前に行う。
-    pub(crate) fn zip_nav_sibling_fullscreen(&mut self, forward: bool) {
+    ///
+    /// ⚠ holdover キャプチャ (`capture_fs_nav_holdover`) は **移動が確定してから**行う。
+    /// holdover は `fs_nav_locked_gen = items_generation` を立て、`poll_fs_nav_lock` は
+    /// items_generation が進むまで解除しない。端で移動しないのに先に capture すると items が
+    /// 変わらず lock が永久に残り、以降のフルスクリーン Ctrl+↑↓ が無視される (Codex P1)。
+    /// `sibling()` は nav スタックのみ変更し items は触らないので、移動確定後
+    /// `zip_nav_show_current_level` の前に capture すれば旧ページの holdover を正しく取れる。
+    pub(crate) fn zip_nav_sibling_fullscreen(&mut self, fs_idx: usize, forward: bool) {
         let sort = self.settings.sort_order;
         let moved = self
             .zip_nav
@@ -9568,6 +9574,8 @@ impl App {
         if !moved {
             return;
         }
+        // 移動確定 → holdover を取ってから items を差し替える。
+        self.capture_fs_nav_holdover(fs_idx);
         // 新しい本のページに差し替え + その本の見開き設定を適用。
         self.zip_nav_show_current_level();
         // 新しい本の先頭画像をフルスクリーンで開く (Ctrl+↑↓ 慣習: 常に先頭着地)。
@@ -11813,6 +11821,11 @@ impl App {
     /// 親フォルダ自身の代表画を pinned_key 下に保存してしまい、ユーザーから見ると
     /// 「動画 pin したのにサムネが変わらない」状態になる (= 効果が無い pin)。
     pub(crate) fn toggle_folder_pin_for_idx(&mut self, idx: usize) {
+        // 変換キャッシュ ZIP (RAR/7z/LZH) の drill-down では dead pin になるのでピン不可。
+        // button/menu の非表示条件と揃える (Codex P3。zip_nav 分岐より前にガードする)。
+        if self.archive_source_override.is_some() {
+            return;
+        }
         // ネスト ZIP ツリー (Model B): 本 (= 現在の階層) ごとに代表サムネを記憶する。
         // 本の中で画像に P → その本の代表を設定/解除。ZipDir セルに P → 操作ガイドを出す
         // (代表は本の中で画像を選んで設定する仕様)。
@@ -12009,10 +12022,19 @@ impl App {
 
     /// アドレスバー 📌 ボタンの右クリック / コンテキストメニューの「解除」ハンドラ。
     pub(crate) fn remove_folder_pin_for_current_container(&mut self) {
-        let Some(container) = self.current_folder.clone() else {
+        // ネスト ZIP では本キー (spread_container_key) のピンを解除する。📌 ボタン状態が
+        // 本キーを見ているので、右クリック解除も同じキーにしないと外側 ZIP を消してしまう
+        // (Codex P2)。
+        let in_zip = self.zip_nav.is_some();
+        let Some(container) = self.spread_container_key() else {
             return;
         };
         self.remove_folder_thumb_pin(&container);
+        // 本の中では対象セルが親階層にあり現ビューに無いので、再 materialize (scroll
+        // リセット) は不要。dirty を消して読書位置を保つ。
+        if in_zip {
+            self.folder_thumb_pin_dirty = false;
+        }
     }
 
     /// コンテキストメニューに「代表サムネに固定 / 解除」エントリ (separator + ボタン)

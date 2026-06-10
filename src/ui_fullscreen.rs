@@ -6399,9 +6399,9 @@ impl App {
 
         // ネスト ZIP の本の中: Ctrl+↑↓ で兄弟本へ移り、その本の先頭画像を開く (#4)。
         // ルート (本一覧) では下の current_folder 分岐へ流して ZIP を抜ける (BS と対称)。
+        // holdover は移動確定後に zip_nav_sibling_fullscreen 内で取る (端で lock が残るのを防ぐ)。
         if self.zip_nav.as_ref().is_some_and(|n| !n.at_root()) {
-            self.capture_fs_nav_holdover(fs_idx);
-            self.zip_nav_sibling_fullscreen(forward);
+            self.zip_nav_sibling_fullscreen(fs_idx, forward);
             return;
         }
 
