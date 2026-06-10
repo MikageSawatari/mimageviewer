@@ -7106,14 +7106,14 @@ macro_rules! slider_log_with_reset {
     }};
 }
 
-/// スライダー UI (純関数)。ai_denoise_disabled_threshold / ai_upscale_disabled_threshold が
-/// Some なら画像サイズ閾値により AI 機能が無効になる旨を表示する。
+/// スライダー UI (純関数)。ai_denoise_disabled_limit / ai_upscale_disabled_limit が
+/// Some なら画像サイズ上限により AI 機能が無効になる旨を表示する。
 fn draw_sliders(
     ui: &mut egui::Ui,
     params: &mut AdjustParams,
     ai_feature_mode: crate::settings::AiFeatureMode,
-    ai_denoise_disabled_threshold: Option<u32>,
-    ai_upscale_disabled_threshold: Option<u32>,
+    ai_denoise_disabled_limit: Option<crate::ai::upscale::AiProcessSizeLimit>,
+    ai_upscale_disabled_limit: Option<crate::ai::upscale::AiProcessSizeLimit>,
 ) -> (bool, bool) {
     let mut changed = false;
     let mut dragging = false;
@@ -7336,12 +7336,15 @@ fn draw_sliders(
             .size(SECTION_FONT)
             .color(LABEL_COLOR),
     );
-    if let Some(px) = ai_denoise_disabled_threshold {
+    if let Some(limit) = ai_denoise_disabled_limit {
         ui.label(
-            egui::RichText::new(format!("（この画像は {}px 以上なので実行されません）", px))
-                .size(SECTION_FONT - 1.0)
-                .color(egui::Color32::from_gray(150))
-                .italics(),
+            egui::RichText::new(format!(
+                "（この画像は処理対象サイズ {} 未満の範囲外なので実行されません）",
+                limit.label()
+            ))
+            .size(SECTION_FONT - 1.0)
+            .color(egui::Color32::from_gray(150))
+            .italics(),
         );
     }
     if !ai_feature_mode.allows_denoise() {
@@ -7389,12 +7392,15 @@ fn draw_sliders(
             .size(SECTION_FONT)
             .color(LABEL_COLOR),
     );
-    if let Some(px) = ai_upscale_disabled_threshold {
+    if let Some(limit) = ai_upscale_disabled_limit {
         ui.label(
-            egui::RichText::new(format!("（この画像は {}px 以上なので実行されません）", px))
-                .size(SECTION_FONT - 1.0)
-                .color(egui::Color32::from_gray(150))
-                .italics(),
+            egui::RichText::new(format!(
+                "（この画像は処理対象サイズ {} 未満の範囲外なので実行されません）",
+                limit.label()
+            ))
+            .size(SECTION_FONT - 1.0)
+            .color(egui::Color32::from_gray(150))
+            .italics(),
         );
     }
     let upscale_items = crate::adjustment::upscale_menu_items_for_mode(ai_feature_mode);
@@ -11674,20 +11680,28 @@ impl App {
         let mut edit_params = self.effective_params(fs_idx).clone();
         let original = edit_params.clone();
 
-        // しきい値以上ならスキップされる → その場合は「無効」を UI に反映する
-        let ai_denoise_disabled_threshold = match image_dims {
+        // サイズ上限以上ならスキップされる → その場合は「無効」を UI に反映する
+        let ai_denoise_disabled_limit = match image_dims {
             Some((w, h))
-                if !crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px) =>
+                if !crate::ai::upscale::should_process_rect(
+                    w,
+                    h,
+                    self.settings.ai_denoise_limit(),
+                ) =>
             {
-                Some(self.settings.ai_denoise_skip_px)
+                Some(self.settings.ai_denoise_limit())
             }
             _ => None,
         };
-        let ai_upscale_disabled_threshold = match image_dims {
+        let ai_upscale_disabled_limit = match image_dims {
             Some((w, h))
-                if !crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px) =>
+                if !crate::ai::upscale::should_process_rect(
+                    w,
+                    h,
+                    self.settings.ai_upscale_limit(),
+                ) =>
             {
-                Some(self.settings.ai_upscale_skip_px)
+                Some(self.settings.ai_upscale_limit())
             }
             _ => None,
         };
@@ -11828,8 +11842,8 @@ impl App {
                             ui,
                             &mut edit_params,
                             self.settings.ai_feature_mode,
-                            ai_denoise_disabled_threshold,
-                            ai_upscale_disabled_threshold,
+                            ai_denoise_disabled_limit,
+                            ai_upscale_disabled_limit,
                         );
 
                         // ── 保存スロット (5x2 grid) ──

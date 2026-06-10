@@ -303,8 +303,12 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
 - UI スレッドの `clamp_for_gpu(&ColorImage)` は異常経路の安全網。通常パスでは
   `Cow::Borrowed` で返り、Triangle リサイズは走らない。発動したらログに
   `clamp_for_gpu (UI-thread fallback)` が出る。
-- AI アップスケールは `ai_upscale_skip_px` (既定 2048) で長辺 2047 以下のみ処理、
-  ×4 倍で最大 8188 なので 8192 を越えない。final AI でも同じ上限を使う。
+- AI アップスケールは `ai_upscale_size_limit` (長辺 x 短辺、既定 2048 x 2048。
+  旧 `ai_upscale_skip_px` からの読み替えは `Settings::ai_upscale_limit()`) で
+  対象を制限する。`4096 x 2048` 等の大きい上限では ×4 出力が 8192 を超えるため、
+  `run_final_ai_job` (AI worker) が `clamp_color_image_for_gpu` で長辺 8192 以下へ
+  縮小してから `final_ai_cache` に入れる (= UI スレッドの `clamp_for_gpu` 安全網に
+  流さない)。final AI / 旧 AI 経路とも判定は `ai::upscale::should_process_rect`。
 - `apply_adjustments_fast` は pointwise 変換なので入力サイズを保つ → 入力が 8192 以内
   ならば出力も 8192 以内。`edit_result_cache` / final AI 結果を入力に取るので成立する。
 - 消しゴム (MI-GAN) / PDF 再レンダ (`request_pdf_rerender` の `.clamp(256, 8192)`) も

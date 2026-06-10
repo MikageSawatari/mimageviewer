@@ -583,25 +583,77 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 
     ui.add_space(12.0);
-    ui.label(egui::RichText::new("AI 処理のスキップしきい値").strong());
+    ui.label(egui::RichText::new("AI 処理のサイズ上限").strong());
     ui.add_space(4.0);
-    ui.label("画像の幅または高さがしきい値以上の場合、AI 処理をスキップします。");
+    ui.label("長辺と短辺がどちらも上限未満の画像のみ AI 処理を実行します (上限以上はスキップ)。");
     ui.add_space(4.0);
-
-    let skip_options = [512, 1024, 2048];
 
     ui.horizontal(|ui| {
         ui.label("アップスケール:");
-        for &px in &skip_options {
-            ui.radio_value(&mut s.ai_upscale_skip_px, px, format!("{px} px"));
+        if let Some(new_limit) =
+            ai_size_limit_combo(ui, "pref_ai_upscale_size_limit", s.ai_upscale_limit())
+        {
+            s.ai_upscale_size_limit = Some(new_limit);
         }
     });
     ui.horizontal(|ui| {
         ui.label("ノイズ除去:");
-        for &px in &skip_options {
-            ui.radio_value(&mut s.ai_denoise_skip_px, px, format!("{px} px"));
+        if let Some(new_limit) =
+            ai_size_limit_combo(ui, "pref_ai_denoise_size_limit", s.ai_denoise_limit())
+        {
+            s.ai_denoise_size_limit = Some(new_limit);
         }
     });
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(
+            "アップスケールは処理後の画像 (4 倍) が大きくなるため、大きい上限ほど\n\
+             メモリと処理時間を消費します。8192px を超えた結果は自動的に縮小されます。",
+        )
+        .size(11.0)
+        .weak(),
+    );
+}
+
+/// AI 処理サイズ上限の候補 (長辺, 短辺, 表示ラベル)。
+/// 判定は `ai::upscale::should_process_rect` (長辺・短辺とも未満なら処理) を参照。
+const AI_SIZE_LIMIT_OPTIONS: [(u32, u32, &str); 6] = [
+    (512, 512, "512 x 512 未満"),
+    (1024, 1024, "1024 x 1024 未満"),
+    (2048, 1024, "2048 x 1024 未満"),
+    (2048, 2048, "2048 x 2048 未満"),
+    (4096, 2048, "4096 x 2048 未満"),
+    (4096, 4096, "4096 x 4096 未満 (高負荷)"),
+];
+
+/// 「長辺 x 短辺 未満」候補のコンボボックスを描画し、選択が変わったら Some を返す。
+/// 現在値が候補に無い場合 (旧設定の読み替え値等) は現在値をそのまま表示する。
+fn ai_size_limit_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    current: crate::ai::upscale::AiProcessSizeLimit,
+) -> Option<crate::ai::upscale::AiProcessSizeLimit> {
+    let selected_label = AI_SIZE_LIMIT_OPTIONS
+        .iter()
+        .find(|(long, short, _)| *long == current.long_edge_px && *short == current.short_edge_px)
+        .map(|(_, _, label)| (*label).to_string())
+        .unwrap_or_else(|| format!("{} 未満", current.label()));
+    let mut picked = None;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected_label)
+        .width(200.0)
+        .show_ui(ui, |ui| {
+            for (long, short, label) in AI_SIZE_LIMIT_OPTIONS {
+                let is_sel = long == current.long_edge_px && short == current.short_edge_px;
+                if ui.selectable_label(is_sel, label).clicked() && !is_sel {
+                    picked = Some(crate::ai::upscale::AiProcessSizeLimit {
+                        long_edge_px: long,
+                        short_edge_px: short,
+                    });
+                }
+            }
+        });
+    picked
 }
 
 pub(super) fn page_gpu_memory(ui: &mut egui::Ui, state: &mut PreferencesState) {

@@ -105,9 +105,40 @@ pub struct UpscaleTimings {
     pub in_h: u32,
 }
 
-/// 画像サイズがしきい値未満か（しきい値以上ならスキップ）。
-pub fn should_process(width: u32, height: u32, threshold: u32) -> bool {
-    width < threshold && height < threshold
+/// AI 処理対象サイズの上限 (長辺 / 短辺で指定)。
+///
+/// 「長辺 < `long_edge_px` かつ 短辺 < `short_edge_px`」の画像のみ AI 処理対象。
+/// 旧来の単一しきい値 `N` (`width < N && height < N`) は `N x N` と等価
+/// (`max(w,h) < N` と同値) なので、`square(N)` で読み替えられる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AiProcessSizeLimit {
+    pub long_edge_px: u32,
+    pub short_edge_px: u32,
+}
+
+impl AiProcessSizeLimit {
+    /// 旧単一しきい値 `N` を `N x N` として読み替える。
+    pub fn square(px: u32) -> Self {
+        Self {
+            long_edge_px: px,
+            short_edge_px: px,
+        }
+    }
+
+    /// UI 表示用の「長辺 x 短辺」ラベル (例: `4096 x 2048`)。
+    pub fn label(&self) -> String {
+        format!("{} x {}", self.long_edge_px, self.short_edge_px)
+    }
+}
+
+/// 画像の長辺・短辺がどちらもサイズ上限未満か (上限以上ならスキップ)。
+/// 縦横どちら向きでも同じ判定になるよう、画像側も上限側も長辺/短辺へ正規化して比べる。
+pub fn should_process_rect(width: u32, height: u32, limit: AiProcessSizeLimit) -> bool {
+    let long = width.max(height);
+    let short = width.min(height);
+    let limit_long = limit.long_edge_px.max(limit.short_edge_px);
+    let limit_short = limit.long_edge_px.min(limit.short_edge_px);
+    long < limit_long && short < limit_short
 }
 
 /// 1 タイルを推論してスケール倍率を検出する（結果をキャッシュ）。
@@ -752,5 +783,78 @@ fn blend_tile(
             accum_b[dst_idx] += tile_out.data[2 * plane_size + src_idx] * weight;
             accum_w[dst_idx] += weight;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 旧単一しきい値 `N` (`w < N && h < N`) と `square(N)` が同じ判定になる。
+    #[test]
+    fn square_limit_matches_legacy_threshold() {
+        let limit = AiProcessSizeLimit::square(2048);
+        // 旧: w < 2048 && h < 2048
+        assert!(should_process_rect(2047, 2047, limit));
+        assert!(!should_process_rect(2048, 2047, limit));
+        assert!(!should_process_rect(2047, 2048, limit));
+        assert!(!should_process_rect(4000, 100, limit));
+    }
+
+    /// 2720x1920 は 2048x2048 では対象外、4096x2048 では対象になる (計画書のテスト観点)。
+    #[test]
+    fn wide_image_allowed_by_long_edge_limit() {
+        assert!(!should_process_rect(
+            2720,
+            1920,
+            AiProcessSizeLimit::square(2048)
+        ));
+        let limit = AiProcessSizeLimit {
+            long_edge_px: 4096,
+            short_edge_px: 2048,
+        };
+        assert!(should_process_rect(2720, 1920, limit));
+        // 短辺が上限以上ならスキップ (3000x3000 は長辺 4096 未満でも短辺 2048 以上)
+        assert!(!should_process_rect(3000, 3000, limit));
+    }
+
+    /// 縦横が逆でも同じ判定になる。
+    #[test]
+    fn orientation_independent() {
+        let limit = AiProcessSizeLimit {
+            long_edge_px: 4096,
+            short_edge_px: 2048,
+        };
+        assert_eq!(
+            should_process_rect(2720, 1920, limit),
+            should_process_rect(1920, 2720, limit)
+        );
+        assert_eq!(
+            should_process_rect(4096, 2047, limit),
+            should_process_rect(2047, 4096, limit)
+        );
+    }
+
+    /// 上限側の長辺/短辺が入れ替わっていても正規化されて同じ判定になる。
+    #[test]
+    fn limit_fields_normalized() {
+        let swapped = AiProcessSizeLimit {
+            long_edge_px: 2048,
+            short_edge_px: 4096,
+        };
+        assert!(should_process_rect(2720, 1920, swapped));
+        assert!(!should_process_rect(3000, 3000, swapped));
+    }
+
+    /// 境界値: 長辺・短辺ともちょうど上限と同じならスキップ (`<` 判定)。
+    #[test]
+    fn boundary_is_exclusive() {
+        let limit = AiProcessSizeLimit {
+            long_edge_px: 4096,
+            short_edge_px: 2048,
+        };
+        assert!(should_process_rect(4095, 2047, limit));
+        assert!(!should_process_rect(4096, 2047, limit));
+        assert!(!should_process_rect(4095, 2048, limit));
     }
 }

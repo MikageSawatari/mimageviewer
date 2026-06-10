@@ -689,6 +689,13 @@ impl App {
                 let new_ai_backend = state.settings.ai_backend.clone();
                 let old_ai_feature_mode = self.settings.ai_feature_mode;
 
+                // AI 処理サイズ上限の変更検出 (final AI cache / failed / pending の
+                // 無効化トリガに使う)
+                let old_ai_size_limits = (
+                    self.settings.ai_upscale_limit(),
+                    self.settings.ai_denoise_limit(),
+                );
+
                 // VST3 enable 状態 + チェーン構成の変化を検出してホットリロード。
                 let old_vst3_enabled = self.settings.vst3_enabled;
                 let new_vst3_enabled = state.settings.vst3_enabled;
@@ -751,6 +758,13 @@ impl App {
                 }
                 if old_ai_feature_mode != self.settings.ai_feature_mode {
                     self.apply_ai_feature_mode_change();
+                }
+                let new_ai_size_limits = (
+                    self.settings.ai_upscale_limit(),
+                    self.settings.ai_denoise_limit(),
+                );
+                if old_ai_size_limits != new_ai_size_limits {
+                    self.apply_ai_size_limit_change();
                 }
 
                 // 同名ファイル設定が変更された場合はフォルダを再読み込み

@@ -3235,8 +3235,17 @@ impl App {
                                 Some((ai_info_model_name.as_str(), s.x as u32, s.y as u32))
                             } else if self.ai_upscale_enabled {
                                 if let Some((w, h)) = state.image_dims {
-                                    if crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px) {
-                                        Some((ai_info_model_name.as_str(), w * 4, h * 4))
+                                    if crate::ai::upscale::should_process_rect(w, h, self.settings.ai_upscale_limit()) {
+                                        // 4x 推定。8192px 超は worker 側で縮小される
+                                        // (`clamp_color_image_for_gpu`) ので推定値も合わせる。
+                                        let (mut ew, mut eh) = (w * 4, h * 4);
+                                        let max_dim = crate::app::MAX_TEXTURE_DIM as u32;
+                                        if ew.max(eh) > max_dim {
+                                            let scale = max_dim as f64 / ew.max(eh) as f64;
+                                            ew = ((ew as f64 * scale).round() as u32).max(1);
+                                            eh = ((eh as f64 * scale).round() as u32).max(1);
+                                        }
+                                        Some((ai_info_model_name.as_str(), ew, eh))
                                     } else {
                                         None
                                     }
@@ -5074,7 +5083,7 @@ impl App {
                 let (label, key) = items[next];
                 params.upscale_model = key.map(|s| s.to_string());
                 // 切替先がアップスケール **有効** で、かつ画像サイズが
-                // `ai_upscale_skip_px` 閾値以上なら処理がスキップされる。
+                // `ai_upscale_size_limit` のサイズ上限以上なら処理がスキップされる。
                 // 「切り替えたのに見た目が変わらない」違和感を避けるため
                 // トーストに 2 行目で明示する。
                 let mut toast = format!("[U:{}アップスケール {}]", scope.label(), label);
@@ -5084,10 +5093,11 @@ impl App {
                 {
                     let w = pixels.size[0] as u32;
                     let h = pixels.size[1] as u32;
-                    let threshold = self.settings.ai_upscale_skip_px;
-                    if !crate::ai::upscale::should_process(w, h, threshold) {
+                    let limit = self.settings.ai_upscale_limit();
+                    if !crate::ai::upscale::should_process_rect(w, h, limit) {
                         toast.push_str(&format!(
-                            "\n(解像度が高いためアップスケール処理無効: {w}×{h} ≥ {threshold}px)"
+                            "\n(解像度が高いためアップスケール処理無効: {w}×{h} は上限 {} 未満の範囲外)",
+                            limit.label()
                         ));
                     }
                 }

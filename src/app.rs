@@ -20888,8 +20888,7 @@ impl App {
         let base_px = match content_type {
             Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }) => {
                 let native_long = w.max(h);
-                let threshold = self.settings.ai_upscale_skip_px;
-                if native_long < threshold {
+                if crate::ai::upscale::should_process_rect(w, h, self.settings.ai_upscale_limit()) {
                     native_long as f32
                 } else {
                     4096.0
@@ -21604,6 +21603,21 @@ impl App {
         }
     }
 
+    /// AI 処理サイズ上限 (`ai_upscale_size_limit` / `ai_denoise_size_limit`) の変更を
+    /// 反映する。キャッシュ key にサイズ上限は含まれないため、明示的に破棄しないと
+    /// 旧判定での結果 (failed 含む) が残り続ける。final AI cache / failed / pending と
+    /// 旧 AI cache の両系統を無効化する。
+    pub(crate) fn apply_ai_size_limit_change(&mut self) {
+        for (_, (cancel, _)) in self.ai_upscale_pending.drain() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.ai_upscale_cache.clear();
+        self.ai_upscale_failed.clear();
+        // bump_all_ai_generations が clear_all_final_pipeline_caches を内包する
+        // (= final_ai_pending cancel + final_ai_cache / failed / composite 破棄)。
+        self.bump_all_ai_generations();
+    }
+
     /// AI バックエンド設定変更をホットリロードする (Phase 3、再起動不要)。
     ///
     /// 引数 `new_backend_str`: 新しい設定値 (`"directml"` / `"tensorrt"` / `"cpu"` / None)。
@@ -21913,7 +21927,7 @@ impl App {
         }
 
         // 表示中画像が **実際に AI 処理されるか** を、先読みキャンセルより前に確定させる。
-        // ここで源泉 (fs_cache の Static) を取得し、サイズ閾値 (`should_process`) で
+        // ここで源泉 (fs_cache の Static) を取得し、サイズ上限 (`should_process_rect`) で
         // 範囲外なら即 return する。源泉あり + サイズ範囲内のときだけ、下の
         // 「先読みを優先キャンセル」ブロックに進む。
         //
@@ -21931,9 +21945,9 @@ impl App {
 
         let (w, h) = (source_image.size[0] as u32, source_image.size[1] as u32);
         let upscale_in_range =
-            crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px);
+            crate::ai::upscale::should_process_rect(w, h, self.settings.ai_upscale_limit());
         let denoise_in_range =
-            crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px);
+            crate::ai::upscale::should_process_rect(w, h, self.settings.ai_denoise_limit());
         // 両方の範囲外ならスキップ (先読みをキャンセルする前に抜ける)
         if (!upscale_enabled || !upscale_in_range) && (!denoise_enabled || !denoise_in_range) {
             return;
@@ -23998,9 +24012,9 @@ impl App {
         let w = w as u32;
         let h = h as u32;
         let upscale_enabled = self.effective_upscale_request(params).is_some()
-            && crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px);
+            && crate::ai::upscale::should_process_rect(w, h, self.settings.ai_upscale_limit());
         let denoise_enabled = self.effective_denoise_request(params).is_some()
-            && crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px);
+            && crate::ai::upscale::should_process_rect(w, h, self.settings.ai_denoise_limit());
         if !upscale_enabled && !denoise_enabled {
             return None;
         }
@@ -24118,9 +24132,17 @@ impl App {
         let upscale_request = self.effective_upscale_request(&params);
         let denoise_request = self.effective_denoise_request(&params);
         let upscale_in_range = upscale_request.is_some()
-            && crate::ai::upscale::should_process(w_u32, h_u32, self.settings.ai_upscale_skip_px);
+            && crate::ai::upscale::should_process_rect(
+                w_u32,
+                h_u32,
+                self.settings.ai_upscale_limit(),
+            );
         let denoise_in_range = denoise_request.is_some()
-            && crate::ai::upscale::should_process(w_u32, h_u32, self.settings.ai_denoise_skip_px);
+            && crate::ai::upscale::should_process_rect(
+                w_u32,
+                h_u32,
+                self.settings.ai_denoise_limit(),
+            );
         if !upscale_in_range && !denoise_in_range {
             return;
         }
@@ -24291,10 +24313,12 @@ impl App {
         // デノイズのみの AI 結果はサイズ不変なので通常どおり掛かる。AI 未完了の暫定
         // 合成 (complete=false) は非 AI 画像なので掛かり、AI 完了時の再合成で外れる。
         //
-        // ⚠ サイズ比較は「final_ai_cache にはモデル出力がモデル倍率のまま入る
-        // (AI 後にリサイズする段が無い)」という現行不変条件に依存する (Codex P2)。
-        // 将来 AI 出力を cache 前に縮小する段を入れる場合は、final_ai_cache の
-        // entry に used_upscale フラグを持たせてこの判定を置き換えること。
+        // ⚠ サイズ比較の前提 (Codex P2): アップスケール出力は `run_final_ai_job` の
+        // `clamp_color_image_for_gpu` で MAX_TEXTURE_DIM (8192) まで縮小されることが
+        // あるが、AI 入力はサイズ上限 (長辺 < 4096) 未満なので縮小後 (長辺 8192) も
+        // 必ず入力より大きい。よって「アップスケール出力 ⇔ サイズが入力と異なる」の
+        // 対応は保たれる。等倍以下へ縮む経路 (1x モデル等) を将来入れる場合は、
+        // final_ai_cache の entry に used_upscale フラグを持たせてこの判定を置き換えること。
         let output_is_ai_upscaled = base_is_ai && base_pixels.size != edit_pixels.size;
         let sharpen_strength = params.effective_smart_sharpen(output_is_ai_upscaled);
         let t_sharpen0 = perf_on.then(std::time::Instant::now);
@@ -27347,7 +27371,7 @@ impl App {
     /// AI なしなら `EnabledFromRaw`。
     ///
     /// **AI 機能 ON の判定** (2026-05 ユーザー要望反映):
-    /// 設定 ON でも画像サイズ (`should_process`) で実際に AI が動かないケースでは
+    /// 設定 ON でも画像サイズ (`should_process_rect`) で実際に AI が動かないケースでは
     /// settle を有効化する。判定は以下の OR:
     ///   - `ai_upscale_enabled && upscale_in_range` (実効的にアップスケール対象)
     ///   - `ai_denoise_model.is_some() && denoise_in_range` (実効的にデノイズ対象)
@@ -27419,7 +27443,7 @@ impl App {
     }
 
     /// AI 機能 (upscale / denoise) がこの画像に実効的に適用されるか判定する。
-    /// 設定 ON でもサイズ閾値超 (`should_process(w, h, skip_px) == false`) なら false。
+    /// 設定 ON でもサイズ上限超 (`should_process_rect(w, h, limit) == false`) なら false。
     /// fs_cache に entry がまだ無い場合は判定不能なので保守的に true (= 適用予定)。
     pub(crate) fn ai_will_apply_to(&self, fs_idx: usize) -> bool {
         let upscale_on = self.ai_upscale_enabled;
@@ -27432,7 +27456,7 @@ impl App {
         // 他の cache 層 (adjustment_cache / ai_upscale_cache) からも探す (Codex P3 第 5、
         // 2026-05): cache が複数層に分散したフレームで settle が誤って Disabled 化
         // するのを防ぐ。後段の cache 層は pixels.size しか持たない (= GPU clamp 後の
-        // 8K cap dims) ので、AI 適用閾値 (skip_px は最大でも数 K) との比較なら問題ない。
+        // 8K cap dims) ので、AI 適用サイズ上限 (最大でも数 K) との比較なら問題ない。
         let bg = self.effective_upscale_bg_mode();
         let dims: Option<(u32, u32)> = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Static {
@@ -27465,9 +27489,9 @@ impl App {
             return true;
         };
         let upscale_will_apply = upscale_on
-            && crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px);
+            && crate::ai::upscale::should_process_rect(w, h, self.settings.ai_upscale_limit());
         let denoise_will_apply = denoise_on
-            && crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px);
+            && crate::ai::upscale::should_process_rect(w, h, self.settings.ai_denoise_limit());
         upscale_will_apply || denoise_will_apply
     }
 
@@ -27502,9 +27526,17 @@ impl App {
                 let w = pixels.size[0] as u32;
                 let h = pixels.size[1] as u32;
                 let upscale_active = self.ai_upscale_enabled
-                    && crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px);
+                    && crate::ai::upscale::should_process_rect(
+                        w,
+                        h,
+                        self.settings.ai_upscale_limit(),
+                    );
                 let denoise_active = self.ai_denoise_model.is_some()
-                    && crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px);
+                    && crate::ai::upscale::should_process_rect(
+                        w,
+                        h,
+                        self.settings.ai_denoise_limit(),
+                    );
                 // 範囲内 = これから処理される → まだ done でない (current 優先で待つ)。
                 // upscale / denoise 双方とも範囲外 = AI 不適用 → done (denoise の skip も
                 // 見ることで「denoise 有効 + 両方サイズ超過で先読み停止」も解消)。
@@ -32442,6 +32474,41 @@ pub(crate) fn clamp_for_gpu(ci: &egui::ColorImage) -> std::borrow::Cow<'_, egui:
     std::borrow::Cow::Owned(dynamic_image_to_color_image(&resized))
 }
 
+/// worker スレッド向け: GPU 上限を超える `ColorImage` を SIMD リサイズで縮小する。
+///
+/// final AI (4x アップスケール) の出力が `MAX_TEXTURE_DIM` を超えるケース
+/// (例: サイズ上限 4096 x 2048 で 2720x1920 を 4x → 10880x7680) で使う。
+/// UI スレッドの `clamp_for_gpu` まで遅らせると秒単位の同期ハングになるため、
+/// `run_final_ai_job` (AI worker) 内で final_ai_cache へ格納する前に縮小する。
+/// 上限内なら入力をそのまま返す (クローンなし)。
+///
+/// `Color32` は premultiplied RGBA8 なのでバイト列をそのまま U8x4 として
+/// リサイズし、premultiplied のまま `ColorImage` に戻す (unmultiply 往復による
+/// 精度損失と余分な変換コストを避ける)。
+pub(crate) fn clamp_color_image_for_gpu(ci: egui::ColorImage) -> egui::ColorImage {
+    let [w, h] = ci.size;
+    if w <= MAX_TEXTURE_DIM && h <= MAX_TEXTURE_DIM {
+        return ci;
+    }
+    let scale = MAX_TEXTURE_DIM as f64 / w.max(h) as f64;
+    let new_w = ((w as f64 * scale).round() as u32).max(1);
+    let new_h = ((h as f64 * scale).round() as u32).max(1);
+    let t0 = std::time::Instant::now();
+    let src = image::RgbaImage::from_raw(w as u32, h as u32, ci.as_raw().to_vec())
+        .expect("ColorImage raw buffer matches dimensions");
+    let resized = crate::fast_resize::resize_rgba8_exact(
+        &src,
+        new_w,
+        new_h,
+        crate::fast_resize::Quality::Bilinear,
+    );
+    crate::logger::log(format!(
+        "  clamp_color_image_for_gpu: {w}x{h} → {new_w}x{new_h} (limit {MAX_TEXTURE_DIM}) in {:.0}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    ));
+    egui::ColorImage::from_rgba_premultiplied([new_w as usize, new_h as usize], resized.as_raw())
+}
+
 /// worker スレッド向け: GPU 上限を超える `DynamicImage` を Bilinear リサイズで縮小する。
 /// `fast_image_resize` (AVX2/SSE4.1 SIMD) 実装を使うので、image crate の
 /// スカラー `resize_exact(Triangle)` に比べて 7K-9K クラスで 5-10 倍速い。
@@ -33586,7 +33653,13 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
 
     if let Some(upscale_kind) = upscale_model {
         match crate::ai::upscale::upscale(runtime, upscale_kind, &dynimg, cancel) {
-            Ok(image) => FinalAiResult::Ready { key, image },
+            // 4x 出力が GPU テクスチャ上限を超えるケース (サイズ上限 2048 超を許可した
+            // 場合に発生) は worker 側でここで縮小する。UI スレッドの `clamp_for_gpu`
+            // 安全網に流すと同期ハングし、cache にも 16K 級画像を抱えてしまう。
+            Ok(image) => FinalAiResult::Ready {
+                key,
+                image: clamp_color_image_for_gpu(image),
+            },
             Err(err) => {
                 if cancel.load(Ordering::Relaxed) {
                     FinalAiResult::Cancelled { key }

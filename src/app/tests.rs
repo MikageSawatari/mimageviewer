@@ -688,6 +688,33 @@ fn clamp_dynamic_for_gpu_scales_landscape_oversize() {
     assert_eq!(out.height(), 2048);
 }
 
+/// `clamp_color_image_for_gpu` (final AI worker 用) も同じ規約:
+/// 8192 以内は no-op、超えたら長辺 8192 にアスペクト比保持で縮小する。
+/// 4x アップスケール後の final AI 結果が `final_ai_cache` / texture upload へ
+/// 8192px 超のまま流れない不変条件のガード (docs/ai-processing-size-threshold-plan.md)。
+#[test]
+fn clamp_color_image_for_gpu_noop_within_limit() {
+    let ci = egui::ColorImage::filled([8192, 16], egui::Color32::from_rgb(10, 20, 30));
+    let out = clamp_color_image_for_gpu(ci);
+    assert_eq!(out.size, [8192, 16]);
+    assert_eq!(out.pixels[0], egui::Color32::from_rgb(10, 20, 30));
+}
+
+#[test]
+fn clamp_color_image_for_gpu_scales_oversize() {
+    // 実際の発生例は 2720x1920 の 4x = 10880x7680 (4096 x 2048 上限時)。テストでは
+    // ピクセル数を抑えるため細長い 16384x64 で長辺超過だけ検証する → 8192x32。
+    let ci = egui::ColorImage::filled([16384, 64], egui::Color32::from_rgb(100, 50, 25));
+    let out = clamp_color_image_for_gpu(ci);
+    assert_eq!(out.size, [8192, 32], "長辺 8192 + アスペクト比保持");
+    assert!(
+        out.size[0] <= MAX_TEXTURE_DIM && out.size[1] <= MAX_TEXTURE_DIM,
+        "final AI 結果は幅・高さとも MAX_TEXTURE_DIM 以下"
+    );
+    // 均一色入力は縮小後も均一色 (premultiplied roundtrip の検証)
+    assert_eq!(out.pixels[0], egui::Color32::from_rgb(100, 50, 25));
+}
+
 // =======================================================================
 // Phase C (App-level) テスト
 //
@@ -10359,8 +10386,9 @@ mod ai_upscale_livelock_tests {
             egui::TextureOptions::LINEAR,
         );
 
-        // アップスケール ON / デノイズ OFF。閾値を極小 (=2) にして、4x4 でも
-        // should_process(4,4,2)=false (= 範囲外/スキップ) になるようにする。
+        // アップスケール ON / デノイズ OFF。上限を極小 (=2x2) にして、4x4 でも
+        // should_process_rect = false (= 範囲外/スキップ) になるようにする。
+        // 旧フィールド (skip_px) 経由で設定する = N x N 読み替え fallback の動作確認も兼ねる。
         app.ai_upscale_enabled = true;
         app.ai_denoise_model = None;
         app.settings.ai_upscale_skip_px = 2;

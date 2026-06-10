@@ -390,12 +390,15 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
   アップスケールモデルの出力は既に輪郭強調済みのことが多く、二重シャープで見た目が
   悪化しやすいため、既定でスキップする (パネルのチェックボックスで解除可)。判定は
   「設定が AI ON か」ではなく **合成ベースが実際にアップスケール出力か**
-  (`base_is_ai && base_pixels.size != edit_pixels.size`)。サイズ比較は
-  「final_ai_cache にはモデル出力がモデル倍率のまま入る (AI 後のリサイズ段が無い)」
-  という現行不変条件に依存する — AI 出力を cache 前に縮小する段を将来入れる場合は
-  entry に used_upscale フラグを持たせて置き換える (Codex P2 指摘)。したがって:
+  (`base_is_ai && base_pixels.size != edit_pixels.size`)。サイズ比較の前提:
+  アップスケール出力は `run_final_ai_job` の `clamp_color_image_for_gpu` で 8192px
+  まで縮小されることがあるが、AI 入力はサイズ上限 (長辺 < 4096) 未満なので縮小後
+  (長辺 8192) も必ず入力より大きく、「アップスケール出力 ⇔ サイズが入力と異なる」は
+  保たれる。等倍以下へ縮む経路 (1x モデル等) を将来入れる場合は entry に
+  used_upscale フラグを持たせて置き換える (Codex P2 指摘)。したがって:
   - デノイズのみの AI 結果 (サイズ不変) には通常どおり掛かる
-  - サイズ上限 (`ai_upscale_skip_px`) で AI がスキップされたページにも掛かる
+  - サイズ上限 (`ai_upscale_size_limit`、長辺 x 短辺) で AI がスキップされた
+    ページにも掛かる
   - AI 未完了中の暫定合成 (complete=false、非 AI 画像) には掛かり、AI 完了時の
     再合成で外れる (= complete フラグの再合成機構にそのまま乗る)
   - legacy の `apply_sync_adjustment` 経路は `ai_upscale_enabled && ai_upscale_cache hit`

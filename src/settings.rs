@@ -1617,12 +1617,28 @@ pub struct Settings {
     pub ai_upscale_prefetch_forward: usize,
 
     /// AI アップスケール: スキップしきい値（この値以上の画像はスキップ）
+    ///
+    /// 旧形式 (単一値)。読み書きは `ai_upscale_limit()` / `ai_upscale_size_limit` 経由に
+    /// 移行済みで、このフィールドは `ai_upscale_size_limit` が無い旧設定の読み替え元と
+    /// してのみ参照される (旧バージョンへの downgrade 互換のため当面残す)。
     #[serde(default = "default_ai_upscale_skip_px")]
     pub ai_upscale_skip_px: u32,
 
     /// AI ノイズ除去: スキップしきい値（この値以上の画像はスキップ）
+    ///
+    /// 旧形式 (単一値)。扱いは `ai_upscale_skip_px` と同じ。
     #[serde(default = "default_ai_denoise_skip_px")]
     pub ai_denoise_skip_px: u32,
+
+    /// AI アップスケール: 処理対象サイズ上限 (長辺 x 短辺、どちらも未満なら処理)。
+    /// `None` = 新フィールド未保存の旧設定。旧 `ai_upscale_skip_px` の値 `N` を
+    /// `N x N` として読み替える (`ai_upscale_limit()` 参照)。
+    #[serde(default)]
+    pub ai_upscale_size_limit: Option<crate::ai::upscale::AiProcessSizeLimit>,
+
+    /// AI ノイズ除去: 処理対象サイズ上限。`None` の扱いは `ai_upscale_size_limit` と同じ。
+    #[serde(default)]
+    pub ai_denoise_size_limit: Option<crate::ai::upscale::AiProcessSizeLimit>,
 
     /// AI バックエンド (Execution Provider グループ)
     /// None = DirectML (デフォルト)、"directml" / "tensorrt" / "cpu"
@@ -2556,6 +2572,8 @@ impl Default for Settings {
             ai_upscale_prefetch_forward: default_ai_upscale_prefetch_forward(),
             ai_upscale_skip_px: default_ai_upscale_skip_px(),
             ai_denoise_skip_px: default_ai_denoise_skip_px(),
+            ai_upscale_size_limit: None,
+            ai_denoise_size_limit: None,
             ai_backend: None,
             global_preset: crate::adjustment::AdjustParams::default(),
             preset_slots: crate::adjustment::PresetSlots::default(),
@@ -3329,6 +3347,21 @@ impl Settings {
         self.favorites.iter().find(|f| f.id == id)
     }
 
+    /// AI アップスケールの実効サイズ上限。新フィールドが無い旧設定では
+    /// 旧単一しきい値 `N` を `N x N` として読み替える (挙動互換)。
+    pub fn ai_upscale_limit(&self) -> crate::ai::upscale::AiProcessSizeLimit {
+        self.ai_upscale_size_limit.unwrap_or_else(|| {
+            crate::ai::upscale::AiProcessSizeLimit::square(self.ai_upscale_skip_px)
+        })
+    }
+
+    /// AI ノイズ除去の実効サイズ上限。読み替え規則は `ai_upscale_limit()` と同じ。
+    pub fn ai_denoise_limit(&self) -> crate::ai::upscale::AiProcessSizeLimit {
+        self.ai_denoise_size_limit.unwrap_or_else(|| {
+            crate::ai::upscale::AiProcessSizeLimit::square(self.ai_denoise_skip_px)
+        })
+    }
+
     /// 音量ノーマライズの target_lufs_milli を、設定ファイル直接編集による
     /// 異常値から守るため `[-60_000, 0]` の範囲にクランプして返す。
     pub fn clamped_audio_normalize_target_lufs_milli(&self) -> i32 {
@@ -3803,6 +3836,49 @@ mod tests {
         assert!(s.show_address_bar_folder_pin);
         assert!(!s.first_setup_completed);
         assert_eq!(s.ai_feature_mode, AiFeatureMode::Light);
+    }
+
+    /// 旧設定 (`ai_upscale_skip_px` のみ、新フィールドなし) は `N x N` として
+    /// 読み替えられ、新フィールドがあればそちらが優先される
+    /// (docs/ai-processing-size-threshold-plan.md)。
+    #[test]
+    fn ai_size_limit_falls_back_to_legacy_skip_px() {
+        use crate::ai::upscale::AiProcessSizeLimit;
+        let mut s = Settings::default();
+        s.ai_upscale_skip_px = 1024;
+        s.ai_denoise_skip_px = 512;
+        assert_eq!(s.ai_upscale_limit(), AiProcessSizeLimit::square(1024));
+        assert_eq!(s.ai_denoise_limit(), AiProcessSizeLimit::square(512));
+
+        let limit = AiProcessSizeLimit {
+            long_edge_px: 4096,
+            short_edge_px: 2048,
+        };
+        s.ai_upscale_size_limit = Some(limit);
+        assert_eq!(s.ai_upscale_limit(), limit);
+        // denoise 側は引き続き旧値から読み替え
+        assert_eq!(s.ai_denoise_limit(), AiProcessSizeLimit::square(512));
+    }
+
+    /// 新フィールドが無い JSON (旧バージョンが保存した設定) を deserialize すると
+    /// `None` になり、旧しきい値 `2048` 相当の挙動が維持される (serde 互換ガード)。
+    #[test]
+    fn ai_size_limit_deserializes_as_none_from_legacy_json() {
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("ai_upscale_size_limit");
+        obj.remove("ai_denoise_size_limit");
+        obj.insert("ai_upscale_skip_px".into(), 1024.into());
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert!(s.ai_upscale_size_limit.is_none());
+        assert_eq!(
+            s.ai_upscale_limit(),
+            crate::ai::upscale::AiProcessSizeLimit::square(1024)
+        );
+        assert_eq!(
+            s.ai_denoise_limit(),
+            crate::ai::upscale::AiProcessSizeLimit::square(2048)
+        );
     }
 
     #[test]

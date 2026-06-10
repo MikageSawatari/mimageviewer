@@ -273,7 +273,7 @@ Phase 1 では既存の `fs_cache` (8K clamp 後) を 360 ベーステクスチ�
 | --- | --- |
 | CPU RAM | `fs_cache.pixels` が 1 枚あたり 4× (16K で 512 MB) |
 | UI ヒッチ | `ctx.load_texture` のアップロードが 100ms 級になり得て、フレームを 6 フレーム飛ばす |
-| AI ガード | `ai_upscale_skip_px=2048` を ×4 すると 8188 = 8K に収まる前提。16K にすると 64K となり破綻、ガード再設計必要 |
+| AI ガード | 執筆時は `ai_upscale_skip_px=2048` ×4 = 8188 で 8K に収まる前提だった。現在はサイズ上限 (`ai_upscale_size_limit`) が 4096 系まで選べる代わりに、`run_final_ai_job` が ×4 出力を 8192 以下へ縮小して格納する (docs/ai-processing-size-threshold-plan.md)。16K 化するならこの縮小段も含めて再設計が必要 |
 | 補正 / mask / erase / undo | 内部寸法仮定の点検が必要 |
 | 利得 | フィット表示では 16K→4K にダウンサンプルされるので、8K→4K と見え方はほぼ同じ。100% ピクセル等倍時のみ差が出る |
 
