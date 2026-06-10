@@ -1008,6 +1008,15 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
   - 全フィルタで **alpha チャネル保持**。透過 PNG / WebP / GIF は透過のまま表示される
   - v1.1.0 以降は消しゴム / 補正レイヤー / 隠蔽加工 / crop の後、最終表示段で適用
   - 消しゴム / 分析モード中は post-filter を一時バイパス (`post_filter_bypassed` フラグ)
+- [x] **シャープ化 (最終表示段スマートシャープ)** (v1.3.0)
+  - 補正パネルのポストフィルタ上に 1 本スライダー (0..=100、0 = OFF)。詳細パラメータは出さない
+  - 既存補正レイヤーの `SmartSharpen` 系計算式 (エッジ重み + ハロー抑制) を final pipeline
+    (`色調補正 → final AI → シャープ化 → post_filter`) に追加したもの。AI モデルは使わない
+  - サムネイルには反映しない。フルスクリーン最終表示・コピー (Ctrl+S)・書き出し (Ctrl+E) に反映
+  - ポストフィルタと併用可能 (排他ではない)。強度変更で final AI は再実行されない
+  - CPU + rayon 行並列。radius は内部で最大 3.0 に clamp
+  - 詳細: [final-smart-sharpen-plan.md](final-smart-sharpen-plan.md) /
+    [preset-and-adjustment.md §2.6](preset-and-adjustment.md)
 
 ### Phase 3（お気に入り・設定）✅ 完了
 

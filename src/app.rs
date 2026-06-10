@@ -1171,6 +1171,10 @@ fn hash_adjust_final_params(
         if !post_filter_bypassed {
             format!("{:?}", params.post_filter).hash(h);
         }
+        // 最終表示段スマートシャープ。post_filter バイパス (消しゴム / 隠蔽 / 分析) 中も
+        // 色調補正と同様に適用したままにするので、bypassed の条件外で hash する。
+        // color_ai hash には含めない (= 強度変更で final AI を再実行させない)。
+        params.smart_sharpen.hash(h);
     })
 }
 
@@ -24269,8 +24273,21 @@ impl App {
             (None, _) => (Arc::clone(&adjusted), true),
         };
 
+        // 最終表示段スマートシャープ: 色調補正 → final AI → **ここ** → post_filter。
+        // AI 入力 (`adjusted`) には掛けない (シャープ強度の変更で AI を再実行させない)。
+        let t_sharpen0 = perf_on.then(std::time::Instant::now);
+        let sharpened = if params.smart_sharpen == 0 {
+            base_pixels
+        } else {
+            Arc::new(crate::adjustment::apply_final_smart_sharpen(
+                &base_pixels,
+                params.smart_sharpen,
+            ))
+        };
+        let fc_sharpen_ms = t_sharpen0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+
         let t_post0 = perf_on.then(std::time::Instant::now);
-        let post_filtered = Arc::new(self.apply_final_post_filter(&base_pixels, &params));
+        let post_filtered = Arc::new(self.apply_final_post_filter(&sharpened, &params));
         let fc_post_ms = t_post0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
         let t_clamp0 = perf_on.then(std::time::Instant::now);
         let upload = clamp_for_gpu(&post_filtered);
@@ -24317,6 +24334,7 @@ impl App {
                     ),
                     ("edit_ms", fc_edit_ms.into()),
                     ("adjust_ms", fc_adjust_ms.into()),
+                    ("sharpen_ms", fc_sharpen_ms.into()),
                     ("post_ms", fc_post_ms.into()),
                     ("clamp_ms", fc_clamp_ms.into()),
                     ("upload_ms", fc_upload_ms.into()),
@@ -25847,17 +25865,25 @@ impl App {
         pixels: &std::sync::Arc<egui::ColorImage>,
     ) {
         let params = self.effective_params(idx).clone();
-        // post-filter をバイパスする場合: 色調も identity ならスキップ可能
+        // post-filter をバイパスする場合: 色調もシャープ化も identity ならスキップ可能
         let apply_pf =
             !self.post_filter_bypassed && params.post_filter != crate::adjustment::PostFilter::None;
-        if params.is_color_identity() && !apply_pf {
+        let apply_sharpen = params.smart_sharpen != 0;
+        if params.is_color_identity() && !apply_pf && !apply_sharpen {
             return;
         }
         let adjusted = crate::adjustment::apply_adjustments_fast(pixels, &params);
-        let post_filtered = if apply_pf {
-            crate::post_filter::apply(&adjusted, params.post_filter)
+        // final pipeline と同じ順: 色調 → シャープ化 → post_filter (ソースが AI 由来でも
+        // AI は上流適用済みなので順序は崩れない)。
+        let sharpened = if apply_sharpen {
+            crate::adjustment::apply_final_smart_sharpen(&adjusted, params.smart_sharpen)
         } else {
             adjusted
+        };
+        let post_filtered = if apply_pf {
+            crate::post_filter::apply(&sharpened, params.post_filter)
+        } else {
+            sharpened
         };
         let adjusted_pixels = std::sync::Arc::new(post_filtered);
         let upload = clamp_for_gpu(&adjusted_pixels);
@@ -25940,11 +25966,11 @@ impl App {
         {
             return;
         }
-        // bypass 中は post-filter を考慮せず、色調のみで判定する
+        // bypass 中は post-filter を考慮せず、色調 + シャープ化で判定する
         let params_ref = self.effective_params(idx);
         let apply_pf = !self.post_filter_bypassed
             && params_ref.post_filter != crate::adjustment::PostFilter::None;
-        if params_ref.is_color_identity() && !apply_pf {
+        if params_ref.is_color_identity() && !apply_pf && params_ref.smart_sharpen == 0 {
             return;
         }
         // ソース画像を取得 (AI アップスケール済み or 元画像)
@@ -27259,6 +27285,11 @@ impl App {
             return Disabled;
         }
         if params.post_filter != crate::adjustment::PostFilter::None {
+            return Disabled;
+        }
+        // 最終表示段スマートシャープも settle 再レンダリングでは再現しない
+        // (EnabledWithColorAdjustments は色調のみ適用) ため post_filter と同じ扱い。
+        if params.smart_sharpen != 0 {
             return Disabled;
         }
         match source_kind {

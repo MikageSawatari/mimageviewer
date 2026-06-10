@@ -327,11 +327,17 @@ pub fn run_pixel_job(job: CapturePixelJob) -> Result<(String, u32, u32, Vec<u8>)
     let mut image = if job.source_already_adjusted {
         job.source.as_ref().clone()
     } else {
+        // final pipeline と同じ順: 色調 → スマートシャープ → post_filter。
         let adjusted = crate::adjustment::apply_adjustments_fast(&job.source, &job.params);
-        if job.params.post_filter == crate::adjustment::PostFilter::None {
+        let sharpened = if job.params.smart_sharpen == 0 {
             adjusted
         } else {
-            crate::post_filter::apply(&adjusted, job.params.post_filter)
+            crate::adjustment::apply_final_smart_sharpen(&adjusted, job.params.smart_sharpen)
+        };
+        if job.params.post_filter == crate::adjustment::PostFilter::None {
+            sharpened
+        } else {
+            crate::post_filter::apply(&sharpened, job.params.post_filter)
         }
     };
     if let Some(conceal) = job.conceal {
@@ -708,6 +714,37 @@ mod tests {
         assert_eq!(rgba[0], rgba[1]);
         assert_eq!(rgba[1], rgba[2]);
         assert_eq!(rgba[3], 255);
+    }
+
+    #[test]
+    fn run_pixel_job_applies_smart_sharpen_on_worker_path() {
+        // 強エッジを跨ぐ 4x1。シャープ化で暗側がより暗く / 明側がより明るくなる。
+        let pixels = vec![
+            egui::Color32::from_rgb(40, 40, 40),
+            egui::Color32::from_rgb(40, 40, 40),
+            egui::Color32::from_rgb(200, 200, 200),
+            egui::Color32::from_rgb(200, 200, 200),
+        ];
+        let src = egui::ColorImage::new([4, 1], pixels);
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.smart_sharpen = 100;
+        let job =
+            CapturePixelJob::needs_adjustment("sample".to_string(), Arc::new(src.clone()), params);
+
+        let (_basename, width, height, rgba) = run_pixel_job(job).unwrap();
+
+        assert_eq!((width, height), (4, 1));
+        assert!(rgba[4] < 40, "dark side of the edge must get darker");
+        assert!(rgba[8] > 200, "bright side of the edge must get brighter");
+
+        // smart_sharpen = 0 なら従来どおり無変化。
+        let job_off = CapturePixelJob::needs_adjustment(
+            "sample".to_string(),
+            Arc::new(src.clone()),
+            crate::adjustment::AdjustParams::default(),
+        );
+        let (_, _, _, rgba_off) = run_pixel_job(job_off).unwrap();
+        assert_eq!(rgba_off, crate::capture::color_image_to_rgba(&src));
     }
 
     #[test]

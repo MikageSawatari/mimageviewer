@@ -8623,6 +8623,44 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// 最終表示段スマートシャープ: 強度変更で final composite key は切り替わるが、
+    /// final AI key (color_ai hash) は不変 — AI 再実行なしで再合成だけが走る。
+    #[test]
+    fn smart_sharpen_changes_final_hash_but_not_color_ai_hash() {
+        let mode = crate::settings::AiFeatureMode::HighQuality;
+        let base = crate::adjustment::AdjustParams::default();
+        let sharpened = crate::adjustment::AdjustParams {
+            smart_sharpen: 60,
+            ..Default::default()
+        };
+
+        assert_ne!(
+            hash_adjust_final_params(&base, mode, false),
+            hash_adjust_final_params(&sharpened, mode, false),
+            "smart_sharpen must invalidate the final composite cache"
+        );
+        assert_eq!(
+            hash_adjust_color_ai_params(&base, mode),
+            hash_adjust_color_ai_params(&sharpened, mode),
+            "smart_sharpen must NOT invalidate the final AI cache"
+        );
+        // 強度違い同士も別 key になる。
+        let stronger = crate::adjustment::AdjustParams {
+            smart_sharpen: 100,
+            ..Default::default()
+        };
+        assert_ne!(
+            hash_adjust_final_params(&sharpened, mode, false),
+            hash_adjust_final_params(&stronger, mode, false),
+        );
+        // post_filter バイパス中 (消しゴム / 隠蔽 / 分析) もシャープ化は hash に乗る
+        // (= バイパス中も適用されたまま)。
+        assert_ne!(
+            hash_adjust_final_params(&base, mode, true),
+            hash_adjust_final_params(&sharpened, mode, true),
+        );
+    }
+
     /// P5-3: `is_idx_final_ai_done_or_skipped` は source pixels が無い idx を
     /// pending 扱い (= false) にする。fs_prefetch が走るのを待っている状態。
     #[test]

@@ -168,6 +168,9 @@ disabled だった頃は顕在化していなかった 2 点を併せて修正�
 - `auto_mode`: `None` / `Auto` / `MangaCleanup` (自動補正モード)
 - AI 関連: `upscale_model`, `denoise_model` (`Option<String>`)
 - **ポストフィルタ**: `post_filter: PostFilter` (レトロ系表示エフェクト、色調補正の後に適用)
+- **シャープ化**: `smart_sharpen: u8` (0 = OFF, 1..=100。最終表示段スマートシャープの強度。
+  final pipeline 専用でサムネイルには反映しない。§2.6 と
+  [final-smart-sharpen-plan.md](final-smart-sharpen-plan.md) を参照)
 
 AI 関連フィールドは「ページ / お気に入り / グローバルに保存された希望設定」であり、
 実際に走るモデル範囲はアプリ全体設定 `Settings::ai_feature_mode` でさらに制限される。
@@ -188,8 +191,9 @@ Levels (黒点/白点/中間調) → Gamma → Brightness/Contrast → Saturatio
 - `temperature == 0` なら u8→u8 LUT で高速処理
 - `temperature != 0` なら f32 パイプライン (やや遅い)
 - v1.1.0 以降のフルスクリーン通常表示では、source 解像度の edit 結果
-  (`edit_result_cache`) に色調補正を掛け、その後に final AI、最後に
-  `post_filter::apply` を掛けて `final_composite_cache` に格納する。
+  (`edit_result_cache`) に色調補正を掛け、その後に final AI、スマートシャープ
+  (`smart_sharpen`、§2.6)、最後に `post_filter::apply` を掛けて
+  `final_composite_cache` に格納する。
 
 ### 2.2 ポストフィルタ (PostFilter enum)
 
@@ -372,6 +376,31 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
 - **Auto**: ヒストグラムの 0.5/99.5 パーセンタイルでレベル補正
 - **MangaCleanup**: 紙/インク検出 → グレースケール → S 字カーブ → γ=0.85 → コントラスト ≥15
 
+### 2.6 最終表示段スマートシャープ (`smart_sharpen`、v1.3.0)
+
+設計の出所は [final-smart-sharpen-plan.md](final-smart-sharpen-plan.md)。
+
+- **UI**: 補正パネルのポストフィルタの上に `シャープ化 0..=100` の 1 本スライダー。
+  詳細パラメータ (半径 / 輪郭しきい値 / ハロー抑制) は出さない。
+- **内部マッピング**: `adjustment::smart_sharpen_params_for_strength` が強度から
+  `local_adjust_core::SmartSharpenParams` を生成 (アンカー 0/30/60/100 の線形補間)。
+  本体は `local_adjust_core::apply_smart_sharpen_rgba` (補正レイヤーの
+  `LocalEffect::SmartSharpen` と同じ計算式、rayon 行並列、radius は 3.0 に clamp)。
+- **適用位置**: final pipeline の `色調補正 → final AI → スマートシャープ → post_filter`。
+  AI 入力には掛けないので、強度変更で final AI は再実行されない
+  (`hash_adjust_final_params` には乗るが `hash_adjust_color_ai_params` には乗せない)。
+- **サムネイル非反映**: `is_color_identity()` には参加しないため、`thumb_adjust_tex` の
+  生成判定・内容に影響しない。
+- **post_filter バイパス (消しゴム / 隠蔽 / 分析) 中も適用したまま** (色調補正と同じ扱い)。
+  消しゴム / MI-GAN / 補正レイヤーの入力は source 解像度の edit pipeline から取るので、
+  シャープ結果が編集系の入力へ混入することはない。
+- **コピー / 書き出し**: final composite 経由 (`source_already_adjusted=true`) は自動で
+  反映。worker 側で再補正する fallback 経路 (`capture::run_pixel_job`) にも同順で実装済み。
+- **alpha**: unmultiplied RGBA に展開して RGB のみ強調 → 再 premultiply。透明部に
+  hidden RGB を作らない (`adjustment::apply_final_smart_sharpen`)。
+- **360 パノラマ settle**: settle 再レンダリングはシャープ化を再現しないため、
+  `smart_sharpen != 0` のページは post_filter と同様 settle Disabled。
+
 ---
 
 ## 3. キャッシュ構造 (フルスクリーン時)
@@ -384,7 +413,7 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
 | `conceal_cache` | `HashMap<idx, ConcealCacheEntry>` | 隠蔽加工合成済みテクスチャ |
 | `edit_result_cache` | `HashMap<EditResultKey, EditResultEntry>` | `raw -> erase -> local_adjust -> conceal` の source 解像度 edit 結果。AdjustParams / AI / post_filter / crop は含めない |
 | `final_ai_cache` | `HashMap<FinalAiKey, Arc<ColorImage>>` | 色調補正後の edit 結果へ AI アップスケール / デノイズを適用した結果 |
-| `final_composite_cache` | `HashMap<FinalCompositeKey, FinalCompositeEntry>` | edit 結果に AdjustParams 全項目、final AI、post_filter を適用した通常表示用テクスチャ |
+| `final_composite_cache` | `HashMap<FinalCompositeKey, FinalCompositeEntry>` | edit 結果に AdjustParams 全項目、final AI、スマートシャープ、post_filter を適用した通常表示用テクスチャ |
 
 描画時 ([display-pipeline.md](display-pipeline.md) を参照) は:
 
@@ -427,11 +456,12 @@ AI を無駄に再実行してしまう)。
 
 1. 色調補正 (`apply_adjustments_fast`)
 2. final AI アップスケール / デノイズ (`final_ai_pending` → `final_ai_cache`)
-3. post_filter (`post_filter::apply`)
-4. GPU upload (`final_composite_cache`)
+3. スマートシャープ (`apply_final_smart_sharpen`、`smart_sharpen != 0` のときだけ。§2.6)
+4. post_filter (`post_filter::apply`)
+5. GPU upload (`final_composite_cache`)
 
-の順で最終表示を作る。AI 未完了中は色調補正済みの画像を暫定表示し、
-AI 完了時に未完了の final composite を捨てて再合成する。
+の順で最終表示を作る。AI 未完了中は色調補正済み (+シャープ化済み) の画像を暫定表示し、
+AI 完了時に未完了の final composite を捨てて AI 後の画像へ掛け直して再合成する。
 
 ### 3.3 サムネイル補正
 
@@ -484,6 +514,7 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 | --- | --- | --- | --- | --- |
 | 色系パラメータ変更* (ページ個別) | 残す | 該当 idx の final cache をクリア | 該当 idx のみクリア | final AI は該当 idx をキャンセル |
 | **ポストフィルタ変更** (ページ個別) | 残す | 該当 idx の final cache をクリア | 触らない (サムネ非対象) | final AI は必要なら残せるが現実装は idx 単位 clear |
+| **シャープ化 (smart_sharpen) 変更** (ページ個別) | 残す | 該当 idx の final cache をクリア (`hash_adjust_final_params` に強度が乗る) | 触らない (サムネ非対象、`is_color_identity` にも不参加) | final AI cache は保持 (`ai_settings_eq` / color_ai hash 不変) |
 | AI モデル変更 (ページ個別) | 残す | 該当 idx の final cache / pending / failed をクリア | 触らない (サムネ非対象) | final AI をキャンセル |
 | 消しゴム/隠蔽加工/分析モードの入出 (`post_filter_bypassed` 切替) | 残す | 該当 idx の final cache のみクリア (`input_generation` は進めない) | 触らない | final AI は該当 idx をキャンセル |
 | 保存スロット読込 → 現ページに適用 | 残す | 該当 idx の final cache をクリア | 該当 idx のみクリア | AI 設定が変われば final AI キャンセル |
@@ -728,6 +759,9 @@ MI-GAN / diffusion に渡す最終マスクと、オーバーレイ描画に使�
   色系であれば `thumb_adjust_tex` 経由で自動適用される。`is_color_identity()` の
   判定に参加するよう、新フィールドのデフォルトは「効果なし」にしておくこと
   (そうでないとサムネが常時再生成される)。
+- [ ] **final pipeline 専用の項目** (post_filter / smart_sharpen のようにサムネへ乗せない
+  もの) は逆に `is_color_identity()` へ参加させず、`is_identity()` と
+  `hash_adjust_final_params` にだけ追加する (§2.6 のシャープ化が実例)。
 
 ---
 

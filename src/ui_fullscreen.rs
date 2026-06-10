@@ -8942,6 +8942,9 @@ impl App {
         if params.post_filter != crate::adjustment::PostFilter::None {
             return "ポストフィルタ ON";
         }
+        if params.smart_sharpen != 0 {
+            return "シャープ化 ON";
+        }
         if source_kind == crate::panorama::SOURCE_KIND_FS && !params.is_color_identity() {
             return "補正適用待ち";
         }

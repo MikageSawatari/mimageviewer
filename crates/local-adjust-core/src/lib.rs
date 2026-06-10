@@ -6314,44 +6314,51 @@ fn box_blur_rgba(src: &[u8], width: usize, height: usize, radius: usize) -> Vec<
     if radius == 0 || width == 0 || height == 0 {
         return src.to_vec();
     }
+    // 水平 / 垂直とも出力行単位で独立しているため rayon で行並列化する
+    // (整数加算 + 除算のみなので逐次版と bit 一致の結果になる)。
+    let row_bytes = width * 4;
     let mut tmp = vec![0_u8; src.len()];
+    tmp.par_chunks_exact_mut(row_bytes)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..width {
+                let x0 = x.saturating_sub(radius);
+                let x1 = (x + radius).min(width - 1);
+                let count = (x1 - x0 + 1) as u32;
+                let mut sum = [0_u32; 4];
+                for xx in x0..=x1 {
+                    let i = (y * width + xx) * 4;
+                    for c in 0..4 {
+                        sum[c] += src[i + c] as u32;
+                    }
+                }
+                let o = x * 4;
+                for c in 0..4 {
+                    row[o + c] = (sum[c] / count) as u8;
+                }
+            }
+        });
     let mut out = vec![0_u8; src.len()];
-    for y in 0..height {
-        for x in 0..width {
-            let x0 = x.saturating_sub(radius);
-            let x1 = (x + radius).min(width - 1);
-            let count = (x1 - x0 + 1) as u32;
-            let mut sum = [0_u32; 4];
-            for xx in x0..=x1 {
-                let i = (y * width + xx) * 4;
+    out.par_chunks_exact_mut(row_bytes)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let y0 = y.saturating_sub(radius);
+            let y1 = (y + radius).min(height - 1);
+            let count = (y1 - y0 + 1) as u32;
+            for x in 0..width {
+                let mut sum = [0_u32; 4];
+                for yy in y0..=y1 {
+                    let i = (yy * width + x) * 4;
+                    for c in 0..4 {
+                        sum[c] += tmp[i + c] as u32;
+                    }
+                }
+                let o = x * 4;
                 for c in 0..4 {
-                    sum[c] += src[i + c] as u32;
+                    row[o + c] = (sum[c] / count) as u8;
                 }
             }
-            let o = (y * width + x) * 4;
-            for c in 0..4 {
-                tmp[o + c] = (sum[c] / count) as u8;
-            }
-        }
-    }
-    for y in 0..height {
-        let y0 = y.saturating_sub(radius);
-        let y1 = (y + radius).min(height - 1);
-        let count = (y1 - y0 + 1) as u32;
-        for x in 0..width {
-            let mut sum = [0_u32; 4];
-            for yy in y0..=y1 {
-                let i = (yy * width + x) * 4;
-                for c in 0..4 {
-                    sum[c] += tmp[i + c] as u32;
-                }
-            }
-            let o = (y * width + x) * 4;
-            for c in 0..4 {
-                out[o + c] = (sum[c] / count) as u8;
-            }
-        }
-    }
+        });
     out
 }
 
@@ -9236,35 +9243,63 @@ fn apply_smart_sharpen(
     let blur = box_blur_rgba(src, width, height, radius);
     let mut out = src.to_vec();
     let edge_softness = 0.12_f32.max(edge_threshold * 0.75);
-    for y in 0..height {
-        for x in 0..width {
-            let i = (y * width + x) * 4;
-            let edge = luma_edge_strength(src, width, height, x, y);
-            let edge_weight = smoothstep(edge_threshold, edge_threshold + edge_softness, edge);
-            if edge_weight <= f32::EPSILON {
-                continue;
+    // 出力合成は行単位で独立しているため rayon で並列化する (final pipeline では
+    // AI アップスケール後の大判画像にも UI スレッド同期で掛かるため)。
+    out.par_chunks_exact_mut(width * 4)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for x in 0..width {
+                let i = (y * width + x) * 4;
+                let edge = luma_edge_strength(src, width, height, x, y);
+                let edge_weight = smoothstep(edge_threshold, edge_threshold + edge_softness, edge);
+                if edge_weight <= f32::EPSILON {
+                    continue;
+                }
+                let base_luma = luma01(
+                    src[i] as f32 / 255.0,
+                    src[i + 1] as f32 / 255.0,
+                    src[i + 2] as f32 / 255.0,
+                );
+                for c in 0..3 {
+                    let base = src[i + c] as f32;
+                    let detail = base - blur[i + c] as f32;
+                    let headroom = if detail >= 0.0 {
+                        1.0 - base_luma
+                    } else {
+                        base_luma
+                    };
+                    let halo_gate =
+                        lerp_f32(1.0, smoothstep(0.02, 0.42, headroom), halo_suppression);
+                    row[x * 4 + c] = (base + detail * amount * edge_weight * halo_gate)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
             }
-            let base_luma = luma01(
-                src[i] as f32 / 255.0,
-                src[i + 1] as f32 / 255.0,
-                src[i + 2] as f32 / 255.0,
-            );
-            for c in 0..3 {
-                let base = src[i + c] as f32;
-                let detail = base - blur[i + c] as f32;
-                let headroom = if detail >= 0.0 {
-                    1.0 - base_luma
-                } else {
-                    base_luma
-                };
-                let halo_gate = lerp_f32(1.0, smoothstep(0.02, 0.42, headroom), halo_suppression);
-                out[i + c] = (base + detail * amount * edge_weight * halo_gate)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
-            }
-        }
-    }
+        });
     out
+}
+
+/// 最終表示段 (mIV final pipeline) 用スマートシャープの公開 API。
+///
+/// 入力は unmultiplied RGBA8。alpha チャンネルは変更しない (RGB のみ強調)。
+/// `radius_px` は内部で 0..=3.0 に clamp する — final pipeline は AI アップスケール後の
+/// 大判画像にも同期で掛かるため、巨大半径による UI ブロックを構造的に防ぐ。
+/// 各パラメータの clamp 値は `LocalEffect::SmartSharpen` 経路と同一。
+pub fn apply_smart_sharpen_rgba(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: &SmartSharpenParams,
+) -> Vec<u8> {
+    apply_smart_sharpen(
+        src,
+        width,
+        height,
+        params.radius_px.clamp(0.0, 3.0).round() as usize,
+        params.amount.clamp(0.0, 2.0),
+        params.edge_threshold.clamp(0.0, 1.0),
+        params.halo_suppression.clamp(0.0, 1.0),
+    )
 }
 
 fn luma_edge_strength(src: &[u8], width: usize, height: usize, x: usize, y: usize) -> f32 {
@@ -18093,6 +18128,154 @@ mod tests {
         assert!(out.pixels[4] < src.pixels[4]);
         assert!(out.pixels[8] > src.pixels[8]);
         assert_eq!(out.pixels[11], 255);
+    }
+
+    #[test]
+    fn apply_smart_sharpen_rgba_zero_amount_is_identity() {
+        let src = RgbaImageBuf::new(
+            4,
+            1,
+            vec![
+                40, 40, 40, 255, 40, 40, 40, 255, 180, 180, 180, 255, 180, 180, 180, 255,
+            ],
+        )
+        .unwrap();
+        let out = apply_smart_sharpen_rgba(
+            &src.pixels,
+            4,
+            1,
+            &SmartSharpenParams {
+                amount: 0.0,
+                radius_px: 1.2,
+                edge_threshold: 0.08,
+                halo_suppression: 0.6,
+            },
+        );
+        assert_eq!(out, src.pixels);
+    }
+
+    #[test]
+    fn apply_smart_sharpen_rgba_emphasizes_edges_and_keeps_alpha() {
+        // 強エッジを跨ぐ 1 行画像 + アルファ境界 (右端は半透明)。
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                40, 40, 40, 255, 40, 40, 40, 255, 180, 180, 180, 255, 180, 180, 180, 255, 180, 180,
+                180, 96,
+            ],
+        )
+        .unwrap();
+        let out = apply_smart_sharpen_rgba(
+            &src.pixels,
+            5,
+            1,
+            &SmartSharpenParams {
+                amount: 1.25,
+                radius_px: 1.6,
+                edge_threshold: 0.05,
+                halo_suppression: 0.2,
+            },
+        );
+        // 暗側はより暗く / 明側はより明るく (アンシャープ系の基本挙動)。
+        assert!(out[4] < src.pixels[4]);
+        assert!(out[8] > src.pixels[8]);
+        // alpha は全画素で不変 (RGB のみ強調)。
+        for (i, px) in out.chunks_exact(4).enumerate() {
+            assert_eq!(px[3], src.pixels[i * 4 + 3], "alpha changed at {i}");
+        }
+    }
+
+    #[test]
+    fn apply_smart_sharpen_rgba_clamps_huge_radius() {
+        // radius_px は 3.0 に clamp される (巨大半径で UI を止めないための番人)。
+        // clamp 後の radius=3 でもエッジ画素は強調される (= 結果が壊れていない) ことを確認。
+        let mut pixels = Vec::new();
+        for x in 0..16 {
+            let v = if x < 8 { 40 } else { 200 };
+            pixels.extend_from_slice(&[v, v, v, 255]);
+        }
+        let src = RgbaImageBuf::new(16, 1, pixels).unwrap();
+        let huge = apply_smart_sharpen_rgba(
+            &src.pixels,
+            16,
+            1,
+            &SmartSharpenParams {
+                amount: 1.0,
+                radius_px: 100.0,
+                edge_threshold: 0.05,
+                halo_suppression: 0.2,
+            },
+        );
+        let clamped = apply_smart_sharpen_rgba(
+            &src.pixels,
+            16,
+            1,
+            &SmartSharpenParams {
+                amount: 1.0,
+                radius_px: 3.0,
+                edge_threshold: 0.05,
+                halo_suppression: 0.2,
+            },
+        );
+        assert_eq!(huge, clamped);
+        assert!(huge[7 * 4] < src.pixels[7 * 4]);
+        assert!(huge[8 * 4] > src.pixels[8 * 4]);
+    }
+
+    #[test]
+    fn box_blur_rgba_parallel_matches_serial_reference() {
+        // 行並列化が逐次版と bit 一致することを、独立実装の逐次リファレンスで確認する。
+        let width = 13;
+        let height = 7;
+        let radius = 2;
+        let mut pixels = Vec::with_capacity(width * height * 4);
+        for i in 0..(width * height) {
+            // 決定論的な疑似パターン (Date 非依存)
+            let v = ((i * 37 + 11) % 251) as u8;
+            pixels.extend_from_slice(&[v, v.wrapping_add(40), v.wrapping_add(90), 255]);
+        }
+        let out = box_blur_rgba(&pixels, width, height, radius);
+
+        let mut tmp = vec![0_u8; pixels.len()];
+        for y in 0..height {
+            for x in 0..width {
+                let x0 = x.saturating_sub(radius);
+                let x1 = (x + radius).min(width - 1);
+                let count = (x1 - x0 + 1) as u32;
+                let mut sum = [0_u32; 4];
+                for xx in x0..=x1 {
+                    let i = (y * width + xx) * 4;
+                    for c in 0..4 {
+                        sum[c] += pixels[i + c] as u32;
+                    }
+                }
+                let o = (y * width + x) * 4;
+                for c in 0..4 {
+                    tmp[o + c] = (sum[c] / count) as u8;
+                }
+            }
+        }
+        let mut expected = vec![0_u8; pixels.len()];
+        for y in 0..height {
+            let y0 = y.saturating_sub(radius);
+            let y1 = (y + radius).min(height - 1);
+            let count = (y1 - y0 + 1) as u32;
+            for x in 0..width {
+                let mut sum = [0_u32; 4];
+                for yy in y0..=y1 {
+                    let i = (yy * width + x) * 4;
+                    for c in 0..4 {
+                        sum[c] += tmp[i + c] as u32;
+                    }
+                }
+                let o = (y * width + x) * 4;
+                for c in 0..4 {
+                    expected[o + c] = (sum[c] / count) as u8;
+                }
+            }
+        }
+        assert_eq!(out, expected);
     }
 
     #[test]

@@ -7430,6 +7430,41 @@ fn draw_sliders(
         }
     }
 
+    // ── シャープ化 (最終表示段スマートシャープ、サムネ非反映) ──
+    ui.add_space(12.0);
+    {
+        let mut strength = params.smart_sharpen as f32;
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("シャープ化")
+                    .size(SECTION_FONT)
+                    .color(LABEL_COLOR),
+            )
+            .on_hover_text(
+                "最終表示に輪郭中心のシャープ化 (スマートシャープ) を適用します。\n\
+                 コピー・書き出しにも反映されます。サムネイルには反映されません。",
+            );
+            if strength != 0.0
+                && ui
+                    .small_button("↩")
+                    .on_hover_text("デフォルトに戻す")
+                    .clicked()
+            {
+                strength = 0.0;
+                params.smart_sharpen = 0;
+                changed = true;
+            }
+        });
+        let r = ui.add(egui::Slider::new(&mut strength, 0.0..=100.0).step_by(1.0));
+        if r.changed() {
+            params.smart_sharpen = strength as u8;
+            changed = true;
+        }
+        if r.dragged() {
+            dragging = true;
+        }
+    }
+
     // ── ポストフィルタ (レトロ系 + 写真系エフェクト) ──
     ui.add_space(12.0);
     ui.label(

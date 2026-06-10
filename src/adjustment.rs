@@ -297,6 +297,12 @@ pub struct AdjustParams {
     /// ポストフィルタ (レトロ系表示エフェクト)。デフォルト = None
     #[serde(default)]
     pub post_filter: PostFilter,
+    /// 最終表示段スマートシャープの強度。0 = OFF, 1..=100。
+    /// サムネイルには反映せず、フルスクリーン最終表示・コピー・書き出しの final pixels に
+    /// だけ掛かる (docs/final-smart-sharpen-plan.md)。色調補正 → final AI の後、
+    /// post_filter の前に適用される。
+    #[serde(default)]
+    pub smart_sharpen: u8,
 }
 
 impl Default for AdjustParams {
@@ -314,14 +320,15 @@ impl Default for AdjustParams {
             upscale_model: None,
             denoise_model: None,
             post_filter: PostFilter::None,
+            smart_sharpen: 0,
         }
     }
 }
 
 impl AdjustParams {
-    /// すべてのパラメータがデフォルト値 (無補正かつ post-filter 無し) か。
+    /// すべてのパラメータがデフォルト値 (無補正かつ post-filter / シャープ化無し) か。
     pub fn is_identity(&self) -> bool {
-        self.is_color_identity() && self.post_filter == PostFilter::None
+        self.is_color_identity() && self.post_filter == PostFilter::None && self.smart_sharpen == 0
     }
 
     /// 色調パラメータのみ無補正か (post-filter は問わない)。
@@ -415,6 +422,71 @@ fn pixel_lum(c: &egui::Color32) -> u8 {
 #[inline]
 pub fn pixel_lum_f32(c: egui::Color32) -> f32 {
     (c.r() as f32 * 0.299 + c.g() as f32 * 0.587 + c.b() as f32 * 0.114) / 255.0
+}
+
+// ── 最終表示段スマートシャープ ─────────────────────────────────
+
+/// 強度スライダー (0..=100) → `SmartSharpenParams` の補間アンカー。
+/// (strength, amount, radius_px, edge_threshold, halo_suppression)。
+/// strength 0 のアンカーは 1..30 の補間起点 (amount のみ 0 へ漸減) で、
+/// strength == 0 自体は OFF (`smart_sharpen_params_for_strength` が None)。
+/// 数値の出所は docs/final-smart-sharpen-plan.md の内部パラメータ案。
+const SMART_SHARPEN_ANCHORS: [(f32, f32, f32, f32, f32); 4] = [
+    (0.0, 0.0, 0.80, 0.06, 0.45),
+    (30.0, 0.40, 0.80, 0.06, 0.45),
+    (60.0, 0.80, 1.20, 0.08, 0.60),
+    (100.0, 1.25, 1.60, 0.11, 0.78),
+];
+
+/// 1 本スライダーの強度 (0..=100) からスマートシャープの内部パラメータを生成する。
+/// 0 は OFF (None)。アンカー間は線形補間。100 超は 100 として扱う。
+pub fn smart_sharpen_params_for_strength(
+    strength: u8,
+) -> Option<local_adjust_core::SmartSharpenParams> {
+    if strength == 0 {
+        return None;
+    }
+    let s = strength.min(100) as f32;
+    let mut lo = SMART_SHARPEN_ANCHORS[0];
+    let mut hi = SMART_SHARPEN_ANCHORS[SMART_SHARPEN_ANCHORS.len() - 1];
+    for pair in SMART_SHARPEN_ANCHORS.windows(2) {
+        if s >= pair[0].0 && s <= pair[1].0 {
+            lo = pair[0];
+            hi = pair[1];
+            break;
+        }
+    }
+    let t = if hi.0 > lo.0 {
+        (s - lo.0) / (hi.0 - lo.0)
+    } else {
+        0.0
+    };
+    let lerp = |a: f32, b: f32| a + (b - a) * t;
+    Some(local_adjust_core::SmartSharpenParams {
+        amount: lerp(lo.1, hi.1),
+        radius_px: lerp(lo.2, hi.2),
+        edge_threshold: lerp(lo.3, hi.3),
+        halo_suppression: lerp(lo.4, hi.4),
+    })
+}
+
+/// 最終表示段スマートシャープを適用する。
+///
+/// final pipeline (色調補正 → final AI → **ここ** → post_filter) 専用で、
+/// サムネイル経路 (`apply_adjustments_fast`) には乗せない。
+/// premultiplied の `ColorImage` を unmultiplied RGBA に展開してから処理し、
+/// alpha は不変のまま再 premultiply して戻す (= 透明部の hidden RGB を作らない)。
+pub fn apply_final_smart_sharpen(src: &egui::ColorImage, strength: u8) -> egui::ColorImage {
+    let Some(params) = smart_sharpen_params_for_strength(strength) else {
+        return src.clone();
+    };
+    let [w, h] = src.size;
+    if w == 0 || h == 0 {
+        return src.clone();
+    }
+    let rgba = crate::capture::color_image_to_rgba(src);
+    let sharpened = local_adjust_core::apply_smart_sharpen_rgba(&rgba, w, h, &params);
+    egui::ColorImage::from_rgba_unmultiplied([w, h], &sharpened)
 }
 
 /// フルサイズ画像に全補正を適用する (テスト用)。
@@ -808,6 +880,92 @@ mod tests {
         assert_eq!(slot_key_label(0), "1");
         assert_eq!(slot_key_label(8), "9");
         assert_eq!(slot_key_label(9), "0");
+    }
+
+    #[test]
+    fn smart_sharpen_breaks_identity_but_not_color_identity() {
+        let params = AdjustParams {
+            smart_sharpen: 60,
+            ..Default::default()
+        };
+        // is_identity は false (final pipeline の再生成が要る)。
+        assert!(!params.is_identity());
+        assert!(!params.is_removable());
+        // 色調は identity のまま (サムネ補正テクスチャは生成されない)。
+        assert!(params.is_color_identity());
+        // AI 設定比較には影響しない (final AI cache を無駄に落とさない)。
+        assert!(params.ai_settings_eq(&AdjustParams::default()));
+    }
+
+    #[test]
+    fn smart_sharpen_strength_mapping_anchors() {
+        assert!(smart_sharpen_params_for_strength(0).is_none());
+
+        let p30 = smart_sharpen_params_for_strength(30).unwrap();
+        assert!((p30.amount - 0.40).abs() < 1e-5);
+        assert!((p30.radius_px - 0.80).abs() < 1e-5);
+        assert!((p30.edge_threshold - 0.06).abs() < 1e-5);
+        assert!((p30.halo_suppression - 0.45).abs() < 1e-5);
+
+        let p60 = smart_sharpen_params_for_strength(60).unwrap();
+        assert!((p60.amount - 0.80).abs() < 1e-5);
+        assert!((p60.radius_px - 1.20).abs() < 1e-5);
+
+        let p100 = smart_sharpen_params_for_strength(100).unwrap();
+        assert!((p100.amount - 1.25).abs() < 1e-5);
+        assert!((p100.radius_px - 1.60).abs() < 1e-5);
+        assert!((p100.edge_threshold - 0.11).abs() < 1e-5);
+        assert!((p100.halo_suppression - 0.78).abs() < 1e-5);
+
+        // 100 超の入力 (将来の互換用) は 100 と同じ。
+        let p255 = smart_sharpen_params_for_strength(255).unwrap();
+        assert_eq!(p255, p100);
+
+        // アンカー間は単調増加 (中間値が区間内にある)。
+        let p45 = smart_sharpen_params_for_strength(45).unwrap();
+        assert!(p45.amount > p30.amount && p45.amount < p60.amount);
+    }
+
+    #[test]
+    fn apply_final_smart_sharpen_zero_is_passthrough() {
+        let pixels = vec![
+            egui::Color32::from_rgb(40, 40, 40),
+            egui::Color32::from_rgb(40, 40, 40),
+            egui::Color32::from_rgb(200, 200, 200),
+            egui::Color32::from_rgb(200, 200, 200),
+        ];
+        let src = egui::ColorImage::new([4, 1], pixels.clone());
+        let out = apply_final_smart_sharpen(&src, 0);
+        assert_eq!(out.pixels, pixels);
+    }
+
+    #[test]
+    fn apply_final_smart_sharpen_keeps_transparency() {
+        // 完全透明画素は premultiplied で RGB=0 のまま (hidden RGB を作らない)。
+        // 不透明エッジは強調される。
+        let pixels = vec![
+            egui::Color32::TRANSPARENT,
+            egui::Color32::from_rgb(40, 40, 40),
+            egui::Color32::from_rgb(40, 40, 40),
+            egui::Color32::from_rgb(220, 220, 220),
+            egui::Color32::from_rgb(220, 220, 220),
+        ];
+        let src = egui::ColorImage::new([5, 1], pixels);
+        let out = apply_final_smart_sharpen(&src, 100);
+        let t = out.pixels[0];
+        assert_eq!(t.a(), 0);
+        assert_eq!((t.r(), t.g(), t.b()), (0, 0, 0));
+        // 強エッジ (idx 2/3 間) は暗側がより暗く、明側がより明るく。
+        assert!(out.pixels[2].r() <= 40);
+        assert!(out.pixels[3].r() >= 220);
+        assert!(
+            out.pixels[2].r() < 40 || out.pixels[3].r() > 220,
+            "expected the strong edge to be emphasized"
+        );
+        // alpha は全画素で不変。
+        for (i, px) in out.pixels.iter().enumerate() {
+            assert_eq!(px.a(), src.pixels[i].a(), "alpha changed at {i}");
+        }
     }
 
     #[test]
