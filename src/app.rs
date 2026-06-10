@@ -9699,53 +9699,74 @@ impl App {
         true
     }
 
-    /// Ctrl+↑↓ をネスト ZIP の本またぎ移動として処理する (#4)。
+    /// Ctrl+↑↓ をネスト ZIP ツリーの DFS 前順ナビとして処理する (#4 改)。
     ///
-    /// 戻り値 `true` = 消費した (= 通常のフォルダ DFS ナビへ流さない)。
-    /// - **本の中 (スタック深さ ≥ 2)**: 兄弟本へ移動。端で移動できなくても **消費**して
-    ///   その場に留まる (読書中に ZIP を抜けない)。
-    /// - **ルート表示 (本一覧)**: `false` を返し、呼び出し側が従来どおり ZIP を抜けて
-    ///   実フォルダの兄弟へ移動する (BS でルートから抜けるのと対称)。
+    /// 実フォルダの Ctrl+↑↓ と同じ規則 (次 = 最初の子 → 次の兄弟 → 祖先の次の兄弟、
+    /// 前 = 前の兄弟の最後の子孫 → 親) を ZIP 内ツリーに適用する。ルート表示でも
+    /// 子の本があれば降りる (実機 3 巡目フィードバック: 旧仕様はルートで子を素通りして
+    /// 次の実 ZIP へスキップ + 本の中から ZIP を抜けられなかった)。
+    ///
+    /// 戻り値 `true` = 消費した (= 通常のフォルダ DFS ナビへ流さない)。ツリーの端
+    /// (forward=最後のノードの後 / backward=ルートの前) では `false` を返し、呼び出し側が
+    /// 従来どおり ZIP を抜けて実フォルダの DFS ナビへ続く (= ZIP の中身を実フォルダ
+    /// ツリーの一部として通過できる)。
     pub(crate) fn zip_nav_handle_ctrl_updown(&mut self, forward: bool) -> bool {
-        let at_root = match self.zip_nav.as_ref() {
-            Some(nav) => nav.at_root(),
-            None => return false,
-        };
-        if at_root {
+        if self.zip_nav.is_none() {
             return false;
         }
         let sort = self.settings.sort_order;
         let moved = self
             .zip_nav
             .as_mut()
-            .map(|n| n.sibling(forward, sort))
+            .map(|n| n.dfs_step(forward, sort))
             .unwrap_or(false);
         if moved {
             self.zip_nav_show_current_level();
+            true
+        } else {
+            false
         }
-        true
     }
 
-    /// フルスクリーン中の Ctrl+↑↓ 本またぎ移動 (#4)。兄弟本へ移って、その本の先頭画像を
-    /// フルスクリーンで開く。端 (兄弟なし) では何もしない (= ZIP を抜けずその場に留まる)。
-    /// 戻り値は「兄弟本へ移動したか」(スライドショー next-folder の分岐用)。
+    /// フルスクリーン中の Ctrl+↑↓ DFS ナビ (#4 改)。**直下画像を持つ**次/前のノード
+    /// (= 読めるページがある階層) まで DFS 前順で進み、その先頭画像をフルスクリーンで
+    /// 開く。子コンテナだけの分岐ノードは読書中の停止点として意味が無いのでスキップする
+    /// (グリッド側 `zip_nav_handle_ctrl_updown` は全ノードに停止する — 実フォルダの
+    /// グリッド Ctrl+↑↓ が画像なしフォルダにも止まるのと同じ非対称)。
+    /// ツリーの端に達したら nav 状態を変えず `false` (= 呼び出し側が ZIP を抜けて
+    /// 次/前の実フォルダへ。スライドショー next-folder の分岐にも使う)。
     ///
     /// ⚠ holdover キャプチャ (`capture_fs_nav_holdover`) は **移動が確定してから**行う。
     /// holdover は `fs_nav_locked_gen = items_generation` を立て、`poll_fs_nav_lock` は
     /// items_generation が進むまで解除しない。端で移動しないのに先に capture すると items が
     /// 変わらず lock が永久に残り、以降のフルスクリーン Ctrl+↑↓ が無視される (Codex P1)。
-    /// `sibling()` は nav スタックのみ変更し items は触らないので、移動確定後
+    /// 探索は clone した nav 上で行い items は触らないので、着地確定後
     /// `zip_nav_show_current_level` の前に capture すれば旧ページの holdover を正しく取れる。
-    pub(crate) fn zip_nav_sibling_fullscreen(&mut self, fs_idx: usize, forward: bool) -> bool {
+    pub(crate) fn zip_nav_dfs_fullscreen(&mut self, fs_idx: usize, forward: bool) -> bool {
         let sort = self.settings.sort_order;
-        let moved = self
-            .zip_nav
-            .as_mut()
-            .map(|n| n.sibling(forward, sort))
-            .unwrap_or(false);
-        if !moved {
+        let Some(nav) = self.zip_nav.as_ref() else {
+            return false;
+        };
+        // 直下画像のあるノードまで clone 上で DFS 探索し、見つかったときだけ本体へ
+        // 書き戻す (端に達したケースで途中まで進んだ状態が残らないように)。
+        // dfs_step は前順を強制前進するのでループは必ず有限で終わる。
+        let mut probe = nav.clone();
+        let landed = loop {
+            if !probe.dfs_step(forward, sort) {
+                break false; // ツリーの端: ZIP を抜ける (呼び出し側で実フォルダ nav へ)
+            }
+            let has_images = probe
+                .tree
+                .node_at(probe.current())
+                .is_some_and(|n| !n.images.is_empty());
+            if has_images {
+                break true;
+            }
+        };
+        if !landed {
             return false;
         }
+        self.zip_nav = Some(probe);
         // 移動確定 → holdover を取ってから items を差し替える。
         self.capture_fs_nav_holdover(fs_idx);
         // 新しい本のページに差し替え + その本の見開き設定を適用。
@@ -9757,14 +9778,14 @@ impl App {
             self.scroll_to_selected = true;
             self.update_last_selected_image();
         } else {
-            // 移動先の本に直下画像が無い (子コンテナだけの分岐ノード / レーティング
-            // フィルタで全 hidden)。open_fullscreen に到達しないまま放置すると、
+            // 直下画像はあるがレーティングフィルタで全 hidden のケース。
+            // open_fullscreen に到達しないまま放置すると、
             // ① 旧 fs_idx が新 items の範囲外なら poll_fs_nav_lock の解除条件
             //    (thumbnails[idx] Loaded / fs_cache) に永遠に達せず holdover lock が
             //    残留して以降の Ctrl+↑↓ が全部無視される、
             // ② 範囲内なら ZipDir セルをフルスクリーン表示してしまう (レビュー P1)。
-            // lock を明示解放してフルスクリーンを閉じ、グリッドに本一覧を見せる
-            // (= グリッド側 Ctrl+↓ でこの本へ移動したときと同じ着地)。
+            // lock を明示解放してフルスクリーンを閉じ、グリッドにこの階層を見せる
+            // (= グリッド側 Ctrl+↓ でこの階層へ移動したときと同じ着地)。
             self.release_fs_nav_lock();
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
@@ -15806,8 +15827,8 @@ impl App {
             } else if in_favsearch {
                 self.favsearch_ctrl_nav(true);
             } else if self.zip_nav_handle_ctrl_updown(true) {
-                // ネスト ZIP の本の中: 兄弟本へ移動 (#4)。ルート (本一覧) では false が返り、
-                // 下の effective_folder 分岐で従来どおり ZIP を抜けて実フォルダ兄弟へ。
+                // ネスト ZIP 内: ツリーを DFS 前順で次のノードへ (#4 改)。ツリーの端では
+                // false が返り、下の effective_folder 分岐で ZIP を抜けて実フォルダ DFS へ。
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, true, FolderNavMode::Grid);
             }
@@ -15828,7 +15849,7 @@ impl App {
             } else if in_favsearch {
                 self.favsearch_ctrl_nav(false);
             } else if self.zip_nav_handle_ctrl_updown(false) {
-                // ネスト ZIP の本の中: 前の兄弟本へ移動 (#4)。
+                // ネスト ZIP 内: ツリーを DFS 逆前順で前のノードへ (#4 改)。
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, false, FolderNavMode::Grid);
             }

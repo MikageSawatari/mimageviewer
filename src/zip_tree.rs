@@ -299,55 +299,129 @@ impl ZipNavState {
         true
     }
 
-    /// 現在の本 (スタック最上段) を、**親階層の兄弟ディレクトリ**の前/次へ切り替える
-    /// (Ctrl+↑↓ の本またぎ移動)。`sort` 順で並べた親の子ディレクトリ列のうち、現在の本の
-    /// 次 (`forward=true`) / 前 (`forward=false`) へ移る。移動できたら `true`。
+    /// Ctrl+↑↓ の ZIP 内ナビを **DFS 前順トラバーサル** で 1 ノード進める/戻す。
+    /// 実フォルダの Ctrl+↑↓ (深さ優先) と同じ規則をツリーノード (= 階層/本) に適用する:
+    /// - 次 (`forward=true`) = 最初の子 → 次の兄弟 → 祖先の次の兄弟 (再帰)
+    /// - 前 (`forward=false`) = 前の兄弟の最後の子孫 → 親
     ///
-    /// ルート表示 (親なし) / 端 (次/前の兄弟が無い) では `false` (= その場に留まる)。
-    /// wrap-around はしない。新しい本の実効 prefix は `collapse_redundant` を通すので、
-    /// 兄弟がさらに単一ラッパーでも自動降下する。
-    pub fn sibling(&mut self, forward: bool, sort: SortOrder) -> bool {
-        if self.stack.len() < 2 {
-            return false; // 親がいない (= ルート表示)
-        }
-        let parent = self.stack[self.stack.len() - 2].clone();
-        let parent_len = parent.len();
-        // 現在の本の、親から見た最初のセグメント (collapse で深く降りていても parent_len 位置)。
-        let Some(seg) = self.current().get(parent_len).cloned() else {
-            return false;
-        };
-        let Some(parent_node) = self.tree.node_at(&parent) else {
-            return false;
-        };
-        // 親の子ディレクトリを sort 順に並べる (materialize_level の ZipDir 並びと一致)。
-        let mut dirs: Vec<&String> = parent_node.dirs.keys().collect();
-        dirs.sort_by(|a, b| sort.compare(a, 0, b, 0, crate::ui_helpers::natural_sort_key));
-        let Some(pos) = dirs.iter().position(|d| **d == seg) else {
-            return false;
-        };
-        let new_pos = if forward {
-            pos + 1
+    /// ルート表示でも子の本があれば降りる (ZIP の中身を実フォルダツリーと同様に扱う)。
+    /// 進めたら stack を更新して `true`。ツリーの端 (forward=最後のノードの後 /
+    /// backward=ルートの前) では **stack を変更せず** `false` を返す (= 呼び出し側が
+    /// ZIP を抜けて実フォルダの DFS ナビへ脱出する)。forward の遡行探索は途中で pop
+    /// しながら進むため、作業はローカルコピーで行い確定時のみ書き戻す (端で抜ける
+    /// ケースに巻き戻り状態が残ると、以降の BS / ピン / 見開きキーが表示とずれる)。
+    ///
+    /// 各降下は `collapse_redundant` を通す (単一ラッパーは中間段として現れない)。
+    /// 兄弟列・子列の並びは `materialize_level` の ZipDir 並びと同じ sort 順。
+    pub fn dfs_step(&mut self, forward: bool, sort: SortOrder) -> bool {
+        let mut stack = self.stack.clone();
+        let moved = if forward {
+            dfs_forward_step(&self.tree, &mut stack, sort)
         } else {
-            match pos.checked_sub(1) {
-                Some(p) => p,
-                None => return false,
-            }
+            dfs_backward_step(&self.tree, &mut stack, sort)
         };
-        let Some(new_seg) = dirs.get(new_pos) else {
-            return false; // 端
-        };
-        let mut child = parent;
-        child.push((*new_seg).clone());
-        let effective = self.tree.collapse_redundant(&child);
-        self.stack.pop();
-        self.stack.push(effective);
-        true
+        if moved {
+            self.stack = stack;
+        }
+        moved
     }
 
     /// 現在階層を materialize した `(items, image_metas)` を返す薄いラッパー。
     pub fn materialize_current(&self, sort: SortOrder) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
         self.tree.materialize_level(self.current(), sort)
     }
+}
+
+/// `node` の子ディレクトリ名を表示 sort 順 (= `materialize_level` の ZipDir 並び) で返す。
+fn sorted_dirs(node: &ZipTreeNode, sort: SortOrder) -> Vec<&String> {
+    let mut dirs: Vec<&String> = node.dirs.keys().collect();
+    dirs.sort_by(|a, b| sort.compare(a, 0, b, 0, crate::ui_helpers::natural_sort_key));
+    dirs
+}
+
+/// `stack` 最上段ノードについて、親 (`stack[len-2]`) の sort 済み子ディレクトリ列と、
+/// その中での現在ノードの位置を返す。スタック深さ < 2 (= ルート表示) や tree との
+/// 不整合時は None。collapse で深く降りた実効 prefix でも、親から見た分岐セグメント
+/// は `parent.len()` 位置にある (実効 prefix は親の実効 prefix の真の延長のため)。
+fn parent_dirs_and_pos<'t>(
+    tree: &'t ZipTree,
+    stack: &[Vec<String>],
+    sort: SortOrder,
+) -> Option<(Vec<&'t String>, usize)> {
+    if stack.len() < 2 {
+        return None;
+    }
+    let parent = &stack[stack.len() - 2];
+    let seg = stack.last()?.get(parent.len())?;
+    let parent_node = tree.node_at(parent)?;
+    let dirs = sorted_dirs(parent_node, sort);
+    let pos = dirs.iter().position(|d| *d == seg)?;
+    Some((dirs, pos))
+}
+
+/// DFS 前順で次のノードへ。進めたら `true` (stack 更新済み)。ツリー末尾なら `false` —
+/// このとき stack は遡行 pop で壊れているので、**呼び出し側は必ずコピーに対して使う**
+/// (`ZipNavState::dfs_step` がその規約を担保する)。
+fn dfs_forward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrder) -> bool {
+    // 1) 子があれば sort 先頭の子へ降りる (ルートの本一覧からも最初の本へ降りる)。
+    let current = stack.last().expect("zip nav stack is never empty").clone();
+    if let Some(node) = tree.node_at(&current) {
+        if let Some(first) = sorted_dirs(node, sort).first() {
+            let mut child = current;
+            child.push((*first).clone());
+            stack.push(tree.collapse_redundant(&child));
+            return true;
+        }
+    }
+    // 2) 葉: 次の兄弟へ。無ければ祖先を遡って「祖先の次の兄弟」を探す。
+    loop {
+        let Some((dirs, pos)) = parent_dirs_and_pos(tree, stack, sort) else {
+            return false; // ルートまで遡って次が無い = ツリーの端
+        };
+        if let Some(next_seg) = dirs.get(pos + 1) {
+            let next_seg = (*next_seg).clone();
+            let mut child = stack[stack.len() - 2].clone();
+            child.push(next_seg);
+            let effective = tree.collapse_redundant(&child);
+            stack.pop();
+            stack.push(effective);
+            return true;
+        }
+        stack.pop(); // この階層に次の兄弟なし → 親へ遡って続行
+    }
+}
+
+/// DFS 逆前順で前のノードへ: 前の兄弟が居ればその「最後の子孫」へ降り切り、居なければ
+/// 親へ上がる。ルート表示では `false` (stack 不変、= ZIP の前へ抜ける)。
+fn dfs_backward_step(tree: &ZipTree, stack: &mut Vec<Vec<String>>, sort: SortOrder) -> bool {
+    let Some((dirs, pos)) = parent_dirs_and_pos(tree, stack, sort) else {
+        return false;
+    };
+    let Some(prev_pos) = pos.checked_sub(1) else {
+        // 最初の子: 前順の 1 つ前 = 親階層そのもの。
+        stack.pop();
+        return true;
+    };
+    let prev_seg = dirs[prev_pos].clone();
+    let mut effective = stack[stack.len() - 2].clone();
+    effective.push(prev_seg);
+    let mut effective = tree.collapse_redundant(&effective);
+    stack.pop();
+    stack.push(effective.clone());
+    // 前の兄弟の「最後の子孫」へ、各段 stack に積みながら降り切る (enter と同じ形を
+    // 保つので、着地後の BS が 1 段ずつ正しく戻れる)。
+    loop {
+        let Some(last) = tree
+            .node_at(&effective)
+            .and_then(|n| sorted_dirs(n, sort).last().map(|s| (*s).clone()))
+        else {
+            break;
+        };
+        effective.push(last);
+        effective = tree.collapse_redundant(&effective);
+        stack.push(effective.clone());
+    }
+    true
 }
 
 /// "a/b/" 形式の dir_prefix をセグメント列に分解 (末尾 '/'・空セグメント除去)。
@@ -879,53 +953,153 @@ mod tests {
     }
 
     #[test]
-    fn nav_sibling_moves_between_books() {
-        // root に 3 冊。chapterA に入って Ctrl+↓ で chapterB → chapterC、端で no-op。
+    fn nav_dfs_root_descends_into_first_book() {
+        // ルート (本一覧) で Ctrl+↓ → 最初の本へ降りる (旧仕様の「即 ZIP 脱出」を廃止)。
+        let mut n = nav(&["chapterA.zip/p1.png", "chapterB.zip/p1.png"]);
+        assert!(n.at_root());
+        assert!(n.dfs_step(true, SortOrder::FileName));
+        assert_eq!(n.current(), &s(&["chapterA.zip"])[..]);
+        assert!(!n.at_root());
+    }
+
+    #[test]
+    fn nav_dfs_forward_walks_siblings_then_exits() {
+        // 葉の本どうしは兄弟移動。最後の本の後はツリーの端 = false (stack 不変)。
         let mut n = nav(&[
             "chapterA.zip/p1.png",
             "chapterB.zip/p1.png",
             "chapterC.zip/p1.png",
         ]);
         n.enter("chapterA.zip/");
-        assert_eq!(n.current(), &s(&["chapterA.zip"])[..]);
-        assert!(n.sibling(true, SortOrder::FileName)); // → B
+        assert!(n.dfs_step(true, SortOrder::FileName)); // → B
         assert_eq!(n.current(), &s(&["chapterB.zip"])[..]);
-        assert!(n.sibling(true, SortOrder::FileName)); // → C
+        assert!(n.dfs_step(true, SortOrder::FileName)); // → C
         assert_eq!(n.current(), &s(&["chapterC.zip"])[..]);
-        assert!(!n.sibling(true, SortOrder::FileName)); // 端 = no-op
+        assert!(!n.dfs_step(true, SortOrder::FileName)); // 端 = ZIP を抜ける
+        // 端で false のとき stack は不変 (遡行 pop が残らない)。
         assert_eq!(n.current(), &s(&["chapterC.zip"])[..]);
-        assert!(n.sibling(false, SortOrder::FileName)); // ← B
+        assert!(!n.at_root());
+        assert!(n.dfs_step(false, SortOrder::FileName)); // ← B
         assert_eq!(n.current(), &s(&["chapterB.zip"])[..]);
     }
 
     #[test]
-    fn nav_sibling_false_at_root() {
-        // ルート表示では親がいないので sibling は false。
+    fn nav_dfs_forward_ascends_to_uncle() {
+        // 深い本の最後から「祖先の次の兄弟」へ抜ける (実フォルダ DFS と同じ)。
+        // 01_arc/{a.zip,b.zip}, 02_plain/p.png: b.zip の次は 02_plain。
+        let mut n = nav(&[
+            "01_arc/a.zip/p1.png",
+            "01_arc/b.zip/p1.png",
+            "02_plain/p1.png",
+        ]);
+        n.enter("01_arc/");
+        n.enter("01_arc/b.zip/");
+        assert_eq!(n.current(), &s(&["01_arc", "b.zip"])[..]);
+        assert!(n.dfs_step(true, SortOrder::FileName));
+        assert_eq!(n.current(), &s(&["02_plain"])[..]);
+        // 遡って移った先の深さは 1 段 (root の子)。BS 1 回で root へ。
+        assert!(n.back());
+        assert!(n.at_root());
+    }
+
+    #[test]
+    fn nav_dfs_flat_root_exits_both_ways() {
+        // フラット ZIP (子なし): 前後どちらも端 = false で従来どおり ZIP を抜ける。
         let mut n = nav(&["a.jpg", "b.jpg"]);
         assert!(n.at_root());
-        assert!(!n.sibling(true, SortOrder::FileName));
-        assert!(!n.sibling(false, SortOrder::FileName));
+        assert!(!n.dfs_step(true, SortOrder::FileName));
+        assert!(!n.dfs_step(false, SortOrder::FileName));
+        assert!(n.at_root());
     }
 
     #[test]
-    fn nav_sibling_collapses_wrapper_sibling() {
-        // 兄弟がさらに単一ラッパーなら自動降下する。
-        let mut n = nav(&["b1.zip/p1.png", "b2.zip/only/p1.png"]);
-        n.enter("b1.zip/");
-        assert_eq!(n.current(), &s(&["b1.zip"])[..]);
-        assert!(n.sibling(true, SortOrder::FileName));
-        // b2.zip > only > pages の only まで降りる。
-        assert_eq!(n.current(), &s(&["b2.zip", "only"])[..]);
-    }
-
-    #[test]
-    fn nav_sibling_back_after_sibling_returns_to_parent() {
-        // sibling で移動後も back は親 (本一覧) へ正しく戻る (スタック深さは保たれる)。
+    fn nav_dfs_backward_first_child_goes_to_parent_then_exits() {
+        // 最初の本で Ctrl+↑ → 親 (本一覧) へ。ルートでもう一度 → false (ZIP の前へ抜ける)。
         let mut n = nav(&["a.zip/p1.png", "b.zip/p1.png"]);
         n.enter("a.zip/");
-        n.sibling(true, SortOrder::FileName); // → b.zip
-        assert!(!n.at_root());
-        assert!(n.back()); // → root (本一覧)
+        assert!(n.dfs_step(false, SortOrder::FileName));
+        assert!(n.at_root());
+        assert!(!n.dfs_step(false, SortOrder::FileName));
+        assert!(n.at_root());
+    }
+
+    #[test]
+    fn nav_dfs_backward_descends_to_last_descendant() {
+        // 前の兄弟が子を持つ場合、その「最後の子孫」へ降り切る (逆前順)。
+        // 01_arc/{a.zip,b.zip}, 02_plain/p.png: 02_plain の前は 01_arc/b.zip。
+        let mut n = nav(&[
+            "01_arc/a.zip/p1.png",
+            "01_arc/b.zip/p1.png",
+            "02_plain/p1.png",
+        ]);
+        n.enter("02_plain/");
+        assert!(n.dfs_step(false, SortOrder::FileName));
+        assert_eq!(n.current(), &s(&["01_arc", "b.zip"])[..]);
+        // 降り切った先からの BS は 1 段ずつ (01_arc → root)。
+        assert!(n.back());
+        assert_eq!(n.current(), &s(&["01_arc"])[..]);
+        assert!(n.back());
+        assert!(n.at_root());
+    }
+
+    #[test]
+    fn nav_dfs_collapses_wrapper_sibling() {
+        // 移動先がさらに単一ラッパーなら自動降下する (enter と同じ collapse)。
+        let mut n = nav(&["b1.zip/p1.png", "b2.zip/only/p1.png"]);
+        n.enter("b1.zip/");
+        assert!(n.dfs_step(true, SortOrder::FileName));
+        // b2.zip > only > pages の only まで降りる。
+        assert_eq!(n.current(), &s(&["b2.zip", "only"])[..]);
+        // 逆方向も collapse 済みの 1 ノードとして扱われ b1.zip へ戻る。
+        assert!(n.dfs_step(false, SortOrder::FileName));
+        assert_eq!(n.current(), &s(&["b1.zip"])[..]);
+    }
+
+    #[test]
+    fn nav_dfs_mixed_node_descends_before_sibling() {
+        // 直下画像 + 子コンテナの混在ノード: forward は兄弟より先に子へ降りる (前順)。
+        let mut n = nav(&["05_mixed/m_01.png", "05_mixed/extra.zip/p1.png", "06/p.png"]);
+        n.enter("05_mixed/");
+        assert!(n.dfs_step(true, SortOrder::FileName));
+        assert_eq!(n.current(), &s(&["05_mixed", "extra.zip"])[..]);
+        assert!(n.dfs_step(true, SortOrder::FileName));
+        assert_eq!(n.current(), &s(&["06"])[..]);
+    }
+
+    #[test]
+    fn nav_dfs_full_preorder_round_trip() {
+        // 前順の全順序: forward で全ノードを 1 度ずつ辿って端で false、backward で
+        // 逆順に root まで戻って false (対称性 = Ctrl+↓ → Ctrl+↑ で同じ場所に戻る)。
+        let mut n = nav(&[
+            "01/a.zip/p1.png",
+            "01/b.zip/p1.png",
+            "02/p1.png",
+            "root.png",
+        ]);
+        let sort = SortOrder::FileName;
+        let expected: Vec<Vec<String>> = vec![
+            s(&["01"]),
+            s(&["01", "a.zip"]),
+            s(&["01", "b.zip"]),
+            s(&["02"]),
+        ];
+        let mut visited: Vec<Vec<String>> = Vec::new();
+        while n.dfs_step(true, sort) {
+            visited.push(n.current().to_vec());
+        }
+        assert_eq!(visited, expected);
+        let mut back_visited: Vec<Vec<String>> = Vec::new();
+        while n.dfs_step(false, sort) {
+            back_visited.push(n.current().to_vec());
+        }
+        // 逆順 (末尾の 02 から root まで)。root は current=[] で表現される。
+        let mut expected_back: Vec<Vec<String>> = expected[..expected.len() - 1]
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
+        expected_back.push(Vec::new());
+        assert_eq!(back_visited, expected_back);
         assert!(n.at_root());
     }
 
