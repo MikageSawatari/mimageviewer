@@ -389,10 +389,17 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
 - **適用位置**: final pipeline の `色調補正 → final AI → スマートシャープ → post_filter`。
   AI 入力には掛けないので、強度変更で final AI は再実行されない
   (`hash_adjust_final_params` には乗るが `hash_adjust_color_ai_params` には乗せない)。
-  補正パネル側も「強度だけの変更」を検出して `clear_smart_sharpen_only_caches` を使い、
+  単ページ書き換え経路 (スライダー / スロット適用 / 見開き L/R コピー) は
+  `App::clear_caches_for_param_change(idx, old, new)` で差分を分類し、
+  「smart_sharpen だけの変更」なら `clear_smart_sharpen_only_caches` で
   `final_ai_cache` / pending を保持する (§4 の表参照)。bulk 系 (全画像に適用 / 標準にする /
   お気に入り標準) は従来どおり `clear_all_color_caches` で final AI ごと全クリアされる
   (post_filter のみ変更時と同じ既知の過剰クリア。ワンショット操作なので許容)。
+- **サムネ無効化の色調 gate**: `set_page_params` / `clear_page_params` は
+  `color_settings_eq` (brightness..midtone + auto_mode) が変わるときだけ
+  `thumb_adjust_tex` を落とす。スライダードラッグ release の全クリアも
+  `thumb_adjust_drag_color_dirty` (ドラッグ中に色調が動いたときだけ立つ) で gate される。
+  シャープ化 / post_filter のみの変更・ドラッグではサムネ補正を再生成しない。
 - **サムネイル非反映**: `is_color_identity()` には参加しないため、`thumb_adjust_tex` の
   生成判定・内容に影響しない。
 - **post_filter バイパス (消しゴム / 隠蔽 / 分析) 中も適用したまま** (色調補正と同じ扱い)。
@@ -521,12 +528,12 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 | **シャープ化 (smart_sharpen) のみ変更** (ページ個別) | 残す | 該当 idx の final **composite** のみクリア (`clear_smart_sharpen_only_caches`)。**final AI cache / pending は保持** (AI 入力不変、Codex P1 2026-06-10) | 触らない (サムネ非対象、`is_color_identity` にも不参加) | final AI は触らない |
 | AI モデル変更 (ページ個別) | 残す | 該当 idx の final cache / pending / failed をクリア | 触らない (サムネ非対象) | final AI をキャンセル |
 | 消しゴム/隠蔽加工/分析モードの入出 (`post_filter_bypassed` 切替) | 残す | 該当 idx の final cache のみクリア (`input_generation` は進めない) | 触らない | final AI は該当 idx をキャンセル |
-| 保存スロット読込 → 現ページに適用 | 残す | 該当 idx の final cache をクリア | 該当 idx のみクリア | AI 設定が変われば final AI キャンセル |
+| 保存スロット読込 → 現ページに適用 | 残す | `clear_caches_for_param_change` で差分分類 (シャープのみなら final AI 保持) | 色調が変わるときだけ該当 idx をクリア | AI 設定が変われば final AI キャンセル |
 | 「全画像に適用」 / 「全画像から削除」 | 残す | final cache を対象範囲でクリア | **全クリア** | AI 設定が変わる idx の final AI をキャンセル |
 | 「標準にする」 (global_preset 更新) | 残す | final cache を継承ページ中心にクリア | **全クリア** | AI 設定が変わる idx の final AI をキャンセル |
 | 「個別設定を解除」 (Ctrl+Backspace) | 残す | 該当 idx の final cache をクリア | 該当 idx のみクリア | AI 設定が変われば final AI キャンセル |
 | スライダードラッグ中 | 残す | 毎フレーム final composite のみ再生成 | **抑制** (描画時 `adjusted_tex = None`) | edit 系 pending は触らない |
-| スライダー release (true→false 遷移) | 残す | (変化なし) | **全クリア** → visible 優先で再生成 | — |
+| スライダー release (true→false 遷移) | 残す | (変化なし) | ドラッグ中に色調が動いたときだけ**全クリア** → visible 優先で再生成 (`thumb_adjust_drag_color_dirty`)。シャープ化のみのドラッグでは温存 | — |
 | フォルダ切替 | 全クリア | 全クリア | **全クリア** + `thumb_pixels` も全クリア | pending をキャンセル |
 | keep_range からの eviction | 該当 idx の edit/final を evict | 該当 idx の final を evict | 該当 idx のみクリア + `thumb_pixels` も drop | 対象外 |
 | 回転変更 | **クリアしない** (描画時の GPU 行列で回転) | **クリアしない** (同左) | **クリアしない** | — |

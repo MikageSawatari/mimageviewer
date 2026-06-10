@@ -364,6 +364,30 @@ impl AdjustParams {
         self.upscale_model == other.upscale_model && self.denoise_model == other.denoise_model
     }
 
+    /// 色調設定 (サムネ補正に乗る brightness..midtone + auto_mode) が other と同じか。
+    /// `thumb_adjust_tex` の無効化要否判定に使う。post_filter / smart_sharpen / AI は
+    /// サムネに乗らないため比較対象外。
+    pub fn color_settings_eq(&self, other: &Self) -> bool {
+        self.brightness == other.brightness
+            && self.contrast == other.contrast
+            && self.gamma == other.gamma
+            && self.saturation == other.saturation
+            && self.temperature == other.temperature
+            && self.black_point == other.black_point
+            && self.white_point == other.white_point
+            && self.midtone == other.midtone
+            && self.auto_mode == other.auto_mode
+    }
+
+    /// other との差分が `smart_sharpen` のみ (または差分なし) か。
+    /// final AI の入力が不変なので、cache clear を
+    /// `App::clear_smart_sharpen_only_caches` (final AI cache 保持) に振り分けられる。
+    pub fn differs_only_in_smart_sharpen(&self, other: &Self) -> bool {
+        let mut probe = self.clone();
+        probe.smart_sharpen = other.smart_sharpen;
+        probe == *other
+    }
+
     pub fn upscale_model_kind(&self) -> Option<Option<crate::ai::ModelKind>> {
         match self.upscale_model.as_deref() {
             None => None,
@@ -895,6 +919,44 @@ mod tests {
         assert!(params.is_color_identity());
         // AI 設定比較には影響しない (final AI cache を無駄に落とさない)。
         assert!(params.ai_settings_eq(&AdjustParams::default()));
+    }
+
+    #[test]
+    fn color_settings_eq_ignores_final_only_fields() {
+        let base = AdjustParams::default();
+        let mut sharpen = base.clone();
+        sharpen.smart_sharpen = 60;
+        let mut pf = base.clone();
+        pf.post_filter = PostFilter::Sepia;
+        let mut ai = base.clone();
+        ai.upscale_model = Some("auto".into());
+        let mut color = base.clone();
+        color.brightness = 10.0;
+        let mut auto = base.clone();
+        auto.auto_mode = Some(AutoMode::Auto);
+        // サムネに乗らない項目は等価扱い
+        assert!(base.color_settings_eq(&sharpen));
+        assert!(base.color_settings_eq(&pf));
+        assert!(base.color_settings_eq(&ai));
+        // 色調 / auto_mode の差分は検出される
+        assert!(!base.color_settings_eq(&color));
+        assert!(!base.color_settings_eq(&auto));
+    }
+
+    #[test]
+    fn differs_only_in_smart_sharpen_detection() {
+        let base = AdjustParams::default();
+        let mut sharpen = base.clone();
+        sharpen.smart_sharpen = 60;
+        assert!(base.differs_only_in_smart_sharpen(&sharpen));
+        // 差分なしも true (最も安い clear 経路に流れるだけで無害)
+        assert!(base.differs_only_in_smart_sharpen(&base));
+        let mut mixed = sharpen.clone();
+        mixed.brightness = 5.0;
+        assert!(!base.differs_only_in_smart_sharpen(&mixed));
+        let mut with_pf = sharpen.clone();
+        with_pf.post_filter = PostFilter::Sepia;
+        assert!(!base.differs_only_in_smart_sharpen(&with_pf));
     }
 
     #[test]

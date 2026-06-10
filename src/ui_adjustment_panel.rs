@@ -11904,14 +11904,6 @@ impl App {
         // 永続化 + Undo エントリを積む経路 (下部の `drag_just_ended` ブロック) に流す。
         // ラジオ・コンボボックス・リセット↩ ボタンなどの非ドラッグ変更は即時通常パス。
         if changed {
-            let ai_changed = !original.ai_settings_eq(&edit_params);
-            // シャープ化だけの変更か。final AI の入力は不変なので、cache を保持して
-            // 再合成 (sharpen + post_filter + upload) だけで済ませる。
-            let sharpen_only_changed = {
-                let mut probe = edit_params.clone();
-                probe.smart_sharpen = original.smart_sharpen;
-                probe == original
-            };
             if is_dragging {
                 self.adjustment_page_params
                     .insert(fs_idx, edit_params.clone());
@@ -11930,12 +11922,12 @@ impl App {
                     "ページ個別の補正".to_string(),
                 );
             }
-            if ai_changed {
-                self.clear_all_adjustment_and_ai_caches(fs_idx);
-            } else if sharpen_only_changed {
-                self.clear_smart_sharpen_only_caches(fs_idx);
-            } else {
-                self.clear_adjustment_caches(fs_idx);
+            // 差分内容で clear を振り分け (AI 変更 / シャープ化のみ / 色調・post_filter)。
+            self.clear_caches_for_param_change(fs_idx, &original, &edit_params);
+            // ドラッグ中に色調が動いたら、release 時のサムネ補正テクスチャ全クリアを
+            // 予約する (シャープ化だけのドラッグではサムネを無駄に再生成しない)。
+            if is_dragging && !original.color_settings_eq(&edit_params) {
+                self.thumb_adjust_drag_color_dirty = true;
             }
         }
 

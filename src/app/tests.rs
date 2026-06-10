@@ -8661,6 +8661,65 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// smart_sharpen / post_filter だけの変更ではサムネ補正テクスチャを温存し、
+    /// 色調が変わったときだけ再生成させる (set_page_params の色調差分 gate)。
+    #[test]
+    fn set_page_params_keeps_thumb_adjust_tex_for_sharpen_only_change() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/thumb-keep.jpg");
+
+        app.thumb_adjust_tex.insert(
+            idx,
+            ctx.load_texture(
+                "thumb_keep",
+                egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            ),
+        );
+        let mut sharpen_only = app.effective_params(idx).clone();
+        sharpen_only.smart_sharpen = 60;
+        app.set_page_params(idx, sharpen_only);
+        assert!(
+            app.thumb_adjust_tex.contains_key(&idx),
+            "sharpen-only change must keep the thumb adjust texture"
+        );
+
+        let mut color_change = app.effective_params(idx).clone();
+        color_change.brightness = 25.0;
+        app.set_page_params(idx, color_change);
+        assert!(
+            !app.thumb_adjust_tex.contains_key(&idx),
+            "color change must drop the thumb adjust texture"
+        );
+    }
+
+    /// スロット適用も `clear_caches_for_param_change` に乗り、シャープ強度だけが
+    /// 違うスロットなら final AI cache を保持する (Codex P1 第 2 ラウンド)。
+    #[test]
+    fn apply_slot_with_sharpen_only_diff_keeps_final_ai_cache() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/slot-sharpen.jpg");
+        let (edit_key, _) = insert_edit_and_final_cache(&mut app, &ctx, idx, "slot_sharpen");
+
+        let mut slot_params = app.effective_params(idx).clone();
+        slot_params.smart_sharpen = 60;
+        app.settings.preset_slots.slots[0] = Some(crate::adjustment::PresetSlot {
+            name: "sharpen".to_string(),
+            params: slot_params,
+        });
+
+        app.apply_slot_to_idx(0, idx);
+
+        assert!(
+            app.final_ai_cache
+                .keys()
+                .any(|key| key.edit_key == edit_key),
+            "sharpen-only slot apply must keep final_ai_cache"
+        );
+    }
+
     /// 最終表示段スマートシャープ: 強度変更で final composite key は切り替わるが、
     /// final AI key (color_ai hash) は不変 — AI 再実行なしで再合成だけが走る。
     #[test]

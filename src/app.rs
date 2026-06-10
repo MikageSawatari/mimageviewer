@@ -4491,6 +4491,10 @@ pub struct App {
     /// 前フレームのスライダードラッグ状態。true→false 遷移を検知して
     /// release 時に `thumb_adjust_tex` を全無効化する。
     pub(crate) thumb_adjust_was_dragging: bool,
+    /// 進行中のスライダードラッグで **色調系** パラメータが動いたか。
+    /// release 時の `thumb_adjust_tex` 全クリアをこのフラグで gate する
+    /// (シャープ化 / post_filter だけのドラッグではサムネを無駄に再生成しない)。
+    pub(crate) thumb_adjust_drag_color_dirty: bool,
     /// スライダードラッグ中フラグ（パネル内ウィジェットのドラッグ検出）
     pub(crate) adjustment_dragging: bool,
     /// 補正 DB ハンドル
@@ -6020,6 +6024,7 @@ impl App {
             thumb_pixels: std::collections::HashMap::new(),
             thumb_adjust_tex: std::collections::HashMap::new(),
             thumb_adjust_was_dragging: false,
+            thumb_adjust_drag_color_dirty: false,
             adjustment_dragging: false,
             adjustment_db,
             local_adjust_db,
@@ -10845,6 +10850,7 @@ impl App {
         self.thumb_pixels.clear();
         self.thumb_adjust_tex.clear();
         self.thumb_adjust_was_dragging = false;
+        self.thumb_adjust_drag_color_dirty = false;
         self.adjustment_page_params.clear();
         self.adjustment_dragging = false;
         self.adjustment_mode = false;
@@ -25429,6 +25435,9 @@ impl App {
     /// グローバルが AI ON の状態で個別に「AI OFF」を設定したいケースを取りこぼしたため、
     /// 標準との等価比較に変更した。お気に入り標準もこれで同じ扱いになる。
     pub(crate) fn set_page_params(&mut self, idx: usize, params: crate::adjustment::AdjustParams) {
+        // サムネ補正テクスチャは色調 (brightness..midtone + auto_mode) が変わるときだけ
+        // 落とす。post_filter / smart_sharpen はサムネに乗らないため温存できる。
+        let thumb_color_changed = !self.effective_params(idx).color_settings_eq(&params);
         let matches_default = params == *self.effective_default_for_idx(idx);
         if matches_default {
             self.adjustment_page_params.remove(&idx);
@@ -25452,7 +25461,9 @@ impl App {
         // AI キャッシュは ai_settings_eq 差分判定が必要なので呼び出し側に任せる。
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
-        self.thumb_adjust_tex.remove(&idx);
+        if thumb_color_changed {
+            self.thumb_adjust_tex.remove(&idx);
+        }
         // 360 度パノラマビュー: 補正パラメータが変わったので世代 bump (§3.6.2.2)。
         self.bump_adjustment_generation(idx);
     }
@@ -25477,7 +25488,10 @@ impl App {
         self.invalidate_compare_prepared_for_idx(idx);
         // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
         self.bump_adjustment_generation(idx);
-        self.thumb_adjust_tex.remove(&idx);
+        // サムネは色調が実際に変わるときだけ再生成 (post_filter / smart_sharpen は非対象)。
+        if !old_params.color_settings_eq(&new_params) {
+            self.thumb_adjust_tex.remove(&idx);
+        }
         if !old_params.ai_settings_eq(&new_params) {
             self.purge_upscale_for_idx(idx);
         }
@@ -25748,13 +25762,9 @@ impl App {
         let Some(slot) = self.settings.preset_slots.slots[slot_idx].clone() else {
             return;
         };
-        let ai_changed = !self.effective_params(idx).ai_settings_eq(&slot.params);
-        self.set_page_params(idx, slot.params);
-        if ai_changed {
-            self.clear_all_adjustment_and_ai_caches(idx);
-        } else {
-            self.clear_adjustment_caches(idx);
-        }
+        let old_params = self.effective_params(idx).clone();
+        self.set_page_params(idx, slot.params.clone());
+        self.clear_caches_for_param_change(idx, &old_params, &slot.params);
         let key_label = crate::adjustment::slot_key_label(slot_idx);
         self.show_feedback_toast(format!("[スロット{}:{}]", key_label, slot.name));
     }
@@ -25801,11 +25811,12 @@ impl App {
 
         let mut any_ai_changed = false;
         for &idx in &targets {
-            if !self.effective_params(idx).ai_settings_eq(&slot.params) {
+            let old_params = self.effective_params(idx).clone();
+            if !old_params.ai_settings_eq(&slot.params) {
                 any_ai_changed = true;
             }
             self.set_page_params(idx, slot.params.clone());
-            self.clear_adjustment_caches(idx);
+            self.clear_caches_for_param_change(idx, &old_params, &slot.params);
         }
         // AI 設定が変わった target が 1 件でもあれば AI キャッシュ / 進行中 pending を
         // 全体単位で畳む (AI キャッシュは item idx キーでフラグメント化できないため)。
@@ -26049,6 +26060,26 @@ impl App {
         self.cancel_comic_bake_for_idx(idx);
     }
 
+    /// 単ページのパラメータ書き換え後の cache clear を差分内容で振り分ける共通経路。
+    /// スライダー / スロット適用 / 見開きコピーのように old → new が分かる場所で使う。
+    /// - AI 設定が変わった → `clear_all_adjustment_and_ai_caches`
+    /// - smart_sharpen だけ変わった → `clear_smart_sharpen_only_caches` (final AI 保持)
+    /// - それ以外 (色調 / post_filter) → `clear_adjustment_caches`
+    pub(crate) fn clear_caches_for_param_change(
+        &mut self,
+        idx: usize,
+        old: &crate::adjustment::AdjustParams,
+        new: &crate::adjustment::AdjustParams,
+    ) {
+        if !old.ai_settings_eq(new) {
+            self.clear_all_adjustment_and_ai_caches(idx);
+        } else if old.differs_only_in_smart_sharpen(new) {
+            self.clear_smart_sharpen_only_caches(idx);
+        } else {
+            self.clear_adjustment_caches(idx);
+        }
+    }
+
     /// 指定ページの補正関連キャッシュをクリアする。
     /// 色調パラメータ変更時は adjustment_cache のみクリア。
     /// AI モデル設定変更時は ai_upscale_cache もクリアする。
@@ -26155,7 +26186,12 @@ impl App {
         let was = self.thumb_adjust_was_dragging;
         let now = self.adjustment_dragging;
         if was && !now {
-            self.thumb_adjust_tex.clear();
+            // 色調が動いたドラッグだけサムネ補正を作り直す。シャープ化 / post_filter
+            // のみのドラッグではサムネ内容が変わらないので既存テクスチャを温存する。
+            if self.thumb_adjust_drag_color_dirty {
+                self.thumb_adjust_tex.clear();
+            }
+            self.thumb_adjust_drag_color_dirty = false;
         }
         self.thumb_adjust_was_dragging = now;
     }
@@ -27746,17 +27782,14 @@ impl App {
             return;
         }
         let new_params = self.effective_params(src_idx).clone();
-        let ai_changed = !self.effective_params(dst_idx).ai_settings_eq(&new_params);
+        let old_params = self.effective_params(dst_idx).clone();
 
+        let apply_params = new_params.clone();
         self.capture_adjust_full("見開き補正コピー".to_string(), |app| {
-            app.set_page_params(dst_idx, new_params);
+            app.set_page_params(dst_idx, apply_params);
         });
 
-        if ai_changed {
-            self.clear_all_adjustment_and_ai_caches(dst_idx);
-        } else {
-            self.clear_adjustment_caches(dst_idx);
-        }
+        self.clear_caches_for_param_change(dst_idx, &old_params, &new_params);
     }
 
     /// 指定された複数 idx について AI キャッシュ (ai_upscale_cache / failed / pending) を
