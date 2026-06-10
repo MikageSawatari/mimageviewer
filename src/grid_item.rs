@@ -126,10 +126,15 @@ impl GridItem {
         )
     }
 
-    /// コンテナ (フォルダ / ZIP ファイル / PDF ファイル) 自体へのレーティング対象か。
-    /// 一覧画面でコンテナを★絞り込みできるようにするための判定。
+    /// コンテナ (フォルダ / ZIP ファイル / PDF ファイル / ネスト ZIP の本) 自体への
+    /// レーティング対象か。一覧画面でコンテナを★絞り込みできるようにするための判定。
+    /// ZipDir (v1.3.0 ツリーナビの本セル) は実パスを持たないが、ピン/見開きと同じ
+    /// 合成パスキーでレーティングを持てる (`App::rating_path_key` 参照)。
     pub fn is_container_ratable(&self) -> bool {
-        matches!(self, Self::Folder(_) | Self::ZipFile(_) | Self::PdfFile(_))
+        matches!(
+            self,
+            Self::Folder(_) | Self::ZipFile(_) | Self::PdfFile(_) | Self::ZipDir { .. }
+        )
     }
 
     /// 代表サムネ生成に本物の同期 I/O を伴うか (heavy_io_queue 振り分け用)。
@@ -486,8 +491,10 @@ mod tests {
         assert!(!item.is_checkable());
         assert!(!item.has_page_data());
         assert!(!item.is_rating_leaf());
-        assert!(!item.is_container_ratable());
-        assert!(!item.accepts_rating());
+        // コンテナレーティングは対象 (実機フィードバック: 本にも★を付けたい)。
+        // キーは実パスではなく合成パス (App::rating_path_key の ZipDir arm)。
+        assert!(item.is_container_ratable());
+        assert!(item.accepts_rating());
         assert!(!item.is_heavy_io());
     }
 

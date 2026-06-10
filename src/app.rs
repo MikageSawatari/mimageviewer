@@ -19028,6 +19028,16 @@ impl App {
             | GridItem::ZipFile(p)
             | GridItem::PdfFile(p)
             | GridItem::Video(p) => Some(crate::adjustment_db::normalize_path(p)),
+            // ネスト ZIP ツリーの本 (v1.3.0): 実パスを持たないので、ピン/見開きと同じ
+            // 合成パス (zip_path + literal prefix セグメント) を正規化してキーにする。
+            // set/get とも同じセル (literal dir_prefix) 経由なので自己整合する。
+            GridItem::ZipDir {
+                zip_path,
+                dir_prefix,
+                ..
+            } => Some(crate::adjustment_db::normalize_path(&book_container_key(
+                zip_path, dir_prefix,
+            ))),
             _ => None,
         }
     }
@@ -19042,7 +19052,9 @@ impl App {
             | GridItem::Folder(p)
             | GridItem::ZipFile(p)
             | GridItem::PdfFile(p) => Some(p.clone()),
-            GridItem::ZipImage { zip_path, .. } => Some(zip_path.clone()),
+            GridItem::ZipImage { zip_path, .. } | GridItem::ZipDir { zip_path, .. } => {
+                Some(zip_path.clone())
+            }
             GridItem::PdfPage { pdf_path, .. } => Some(pdf_path.clone()),
             _ => None,
         }
@@ -32867,12 +32879,18 @@ const BADGE_TEXT_BOTTOM_PAD: f32 = 1.0;
 /// - `ZipFile` / `PdfFile`: thumb の状態に関わらず常に badge_fn が呼ばれる
 ///   (Loaded はサムネ + ラベル、Pending はアイコンプレースホルダ + ラベル)。
 /// - `ConvertibleArchive`: 常に `draw_archive_badge` が呼ばれる。
+/// - `ZipDir` (v1.3.0): 内側アーカイブ (`is_archive`) は ZipFile と同じく常に
+///   形式バッジ。ただのサブフォルダは Folder と同じく Loaded のときだけ
+///   `draw_folder_badge` (Pending はセンター 📁 + ファイル名)。
 /// - その他 (Image / Video / ZipImage / PdfPage / ZipSeparator): 左下にコンテナ
 ///   バッジは描かない (= false)。
 pub(crate) fn cell_has_lower_left_container_badge(item: &GridItem, thumb: &ThumbnailState) -> bool {
     match item {
         GridItem::Folder(_) => matches!(thumb, ThumbnailState::Loaded { .. }),
         GridItem::ZipFile(_) | GridItem::PdfFile(_) | GridItem::ConvertibleArchive { .. } => true,
+        GridItem::ZipDir { is_archive, .. } => {
+            *is_archive || matches!(thumb, ThumbnailState::Loaded { .. })
+        }
         _ => false,
     }
 }

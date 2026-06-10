@@ -4646,6 +4646,43 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.spread_container_key(), Some(zip_path.join("bookA")));
     }
 
+    /// ネスト ZIP の本 (ZipDir) はコンテナレーティング対象で、キーは zip_path +
+    /// literal prefix の合成パス (実機フィードバック: RAR 本 / inner フォルダに
+    /// ★が付けられなかった)。set/get がセル経由で自己整合することも確認する。
+    #[test]
+    fn zipdir_is_ratable_with_book_container_key() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        app.items.push(GridItem::ZipDir {
+            zip_path: zip_path.clone(),
+            dir_prefix: "inner/part1.7z/".to_string(),
+            is_archive: true,
+            representative: None,
+        });
+        app.items.push(GridItem::ZipDir {
+            zip_path: zip_path.clone(),
+            dir_prefix: "02_plain/vol_X/".to_string(),
+            is_archive: false,
+            representative: None,
+        });
+
+        for idx in 0..2 {
+            assert!(app.items[idx].accepts_rating(), "idx {idx}");
+            assert!(app.items[idx].is_container_ratable(), "idx {idx}");
+            assert!(!app.items[idx].is_rating_leaf(), "idx {idx}");
+        }
+        // キー = ピン/見開きと同じ合成パス (zip_path + prefix セグメント) の正規化。
+        let expected =
+            crate::adjustment_db::normalize_path(&zip_path.join("inner").join("part1.7z"));
+        assert_eq!(app.rating_path_key(0).as_deref(), Some(expected.as_str()));
+        // set → get ラウンドトリップ (rating_db 無しでもキャッシュ経由で一貫)。
+        app.set_rating(0, 4);
+        assert_eq!(app.get_rating(0), 4);
+        app.set_rating(1, 2);
+        assert_eq!(app.get_rating(1), 2);
+    }
+
     /// 変換キャッシュ閲覧中の選択情報パス: ZIP 内アイテムのコンテナ部分が
     /// archive_cache の実体パスではなくユーザー視点の元アーカイブになる
     /// (実機フィードバック: ツールチップにキャッシュパスが漏れていた)。
