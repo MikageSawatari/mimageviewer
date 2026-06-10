@@ -276,6 +276,10 @@ Codex CLI は `codex exec` (1 回目) → `codex exec resume --last` (以降) �
 
 ## 13. 実機確認チェックリスト (ユーザー復帰時)
 
+**テスト ZIP + 詳細チェックリストは [nested-zip-test-guide.md](nested-zip-test-guide.md)。**
+`python scripts/make_nested_zip_test.py [--big]` で `dist/ziptest/` に自己説明的な
+テスト ZIP を生成する (各頁画像に本名・頁番号・構造説明入り)。以下は要点の要約:
+
 Claude はコンパイル + ユニットテストまでしか検証できない。以下は実機で要確認:
 - [ ] 内側 ZIP / サブフォルダが「入れるセル」として表示され、Enter で降りられる
 - [ ] Backspace で 1 段ずつ戻り、ルートで実フォルダ親へ抜ける
