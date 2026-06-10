@@ -7,7 +7,7 @@ ZIP アーカイブと PDF ドキュメントは「中身のページをフォ�
 
 ## 1. GridItem バリアント
 
-`grid_item.rs` の `GridItem` 列挙型は以下の 8 バリアント:
+`grid_item.rs` の `GridItem` 列挙型は以下の 11 バリアント:
 
 | バリアント | 発生元 | 中身 |
 | --- | --- | --- |
@@ -16,13 +16,27 @@ ZIP アーカイブと PDF ドキュメントは「中身のページをフォ�
 | `Video(PathBuf)` | 通常フォルダ内 | 動画ファイル |
 | `ZipFile(PathBuf)` | 通常フォルダ内 | ZIP アーカイブ (未展開)。`.zip` と別名 `.cbz` を含む (`folder_tree::is_zip_extension` で判定) |
 | `PdfFile(PathBuf)` | 通常フォルダ内 | PDF ドキュメント (未展開) |
-| `ZipImage { zip_path, entry_name }` | ZIP を開いた中 | ZIP 内の画像エントリ |
-| `ZipSeparator { dir_display }` | ZIP 内にサブディレクトリがある時 | 区切り表示用の疑似アイテム (ロード対象外) |
-| `PdfPage { pdf_path, page_num }` | PDF を開いた中 | PDF のページ (0-indexed) |
+| `ConvertibleArchive { path, format }` | 通常フォルダ内 | RAR/7z/LZH 等。クリックで ZIP 変換キャッシュ経由で開く (v0.7.0) |
+| `ZipImage { zip_path, entry_name }` | ZIP を開いた中 | ZIP 内の画像エントリ。`entry_name` はネストでも `"outer/ch01.zip/p.jpg"` のフルパス |
+| `ZipDir { zip_path, dir_prefix, is_archive, representative }` | ネスト ZIP を開いた中 (v1.3.0) | 「入れる」子ディレクトリ / 内側アーカイブ。Enter で降りる。仮想コンテナで実パスなし |
+| `ZipSeparator { dir_display }` | **(レガシー、現在は未生成)** | 旧フラット展開時の区切り疑似アイテム。v1.3.0 のツリーナビ化で `finalize_zip_enumerate` は生成しなくなった。variant 自体と各 match arm は後方互換で残置 |
+| `PdfPage { pdf_path, page_num, content_type }` | PDF を開いた中 | PDF のページ (0-indexed) |
+| `SearchContainer { path, kind, hit_count, representative }` | Ctrl+G 検索集約ビュー | ヒットを含む親フォルダ/ZIP を 1 セルで表現 (v0.8.0) |
 
-`Folder/Image/Video/ZipFile/PdfFile` は「外側」= 通常フォルダのリスト。
-`ZipImage/ZipSeparator/PdfPage` は「内側」= 仮想フォルダのリスト。
-同じリストに両者が混在することはない。
+`Folder/Image/Video/ZipFile/PdfFile/ConvertibleArchive` は「外側」= 通常フォルダのリスト。
+`ZipImage/ZipDir/PdfPage` は「内側」= 仮想フォルダのリスト。`SearchContainer` は Ctrl+G 専用ビュー。
+同じリストに外側と内側が混在することはない。
+
+### ネスト ZIP のツリーナビ (v1.3.0)
+
+ネスト ZIP (ZIP 内に内側 ZIP/サブフォルダ) は、**フラット展開 + `ZipSeparator` をやめ**、
+`entry_name` の `/` 区切りでメモリ上にツリー (`src/zip_tree.rs` の `ZipTree`) を組み、
+現在階層だけを `materialize_level` で表示する。子コンテナは `ZipDir` セルになり、
+Enter/ダブルクリック/ゲームパッド/Ctrl+↑↓(本またぎ)/Backspace でツリー内を移動する
+(状態は `ZipNavState`、`App.zip_nav`)。**`entry_name` は一切変えない**ので回転/補正/
+レーティング/タグ等の永続キーは不変 (DB 移行不要)。見開きペアリングは `self.items` が
+現在の本のページだけになるため本ごとに自動リセットされる。詳細は
+[nested-zip-tree-plan.md](nested-zip-tree-plan.md)。
 
 ### 拡張子 → 扱いの対応 (comic-book 別名を含む)
 
@@ -90,20 +104,25 @@ RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<h
      パスになる。内側 ZIP バイト列は zip_loader 内の LRU キャッシュ (256MB) に
      保持され、後続の read_entry_bytes で再展開せずに参照される。
 
-2. エントリをサブディレクトリで BTreeMap にグループ化
-   - `entry_dir` が返すパスにネスト ZIP 境界 (.zip/) を含むため、グループ名が
-     "chapters/ch01.zip" のように .zip を含むことがある。表示上はそのまま
-     見出し ("chapters/ch01.zip") として出る。
+2. **(v1.3.0〜) `entry_name` の `/` 区切りでツリー (`zip_tree::ZipTree`) を構築**
+   - `.zip`/`.cbz` 境界も構造上はただのディレクトリ階層 (`entry_name` 中で既に `/` 区切り)。
+   - 旧実装の「サブディレクトリで BTreeMap グループ化 + 2 つ以上で ZipSeparator 挿入 +
+     全エントリをフラットに ZipImage」は廃止 (ZipSeparator は生成しない)。
 
-3. items に:
-   - グループが 2 つ以上あれば各グループの先頭に ZipSeparator を挿入
-   - 各エントリを GridItem::ZipImage として追加
-   - image_metas に (mtime, uncompressed_size) を記録
+3. ルート階層だけを `materialize_level` で items 化:
+   - 冗長ラッパー (画像 0・子 1) は `collapse_redundant` で自動降下
+   - 子コンテナ → `GridItem::ZipDir`、直下画像 → `GridItem::ZipImage` (コンテナ先・画像後)
+   - image_metas に (mtime, uncompressed_size) を記録 (ZipDir は代表画像の meta)
+   - `existing_keys` は `tree.all_cache_keys()` (全階層の entry_name + zipdir: キー) +
+     pinned ZipDir の `#pin` キーを含める (`delete_missing` の存続基準)
+   - 階層内の移動 (enter/back/sibling) は `zip_nav_show_current_level` の軽量経路
+     (`install_new_items`、`start_loading_items` を通さない)
 ```
 
-同期処理。ZIP は比較的高速に列挙できるため UI スレッドでそのまま実行している。
-ネスト ZIP が多いと列挙時に内側 ZIP を展開する分 I/O が発生するが、同一
-セッション内の再列挙・サムネイル読み込みでは LRU キャッシュに当たる。
+非同期。列挙 (`enumerate_image_entries`) は `d1a6e99f` 以降ワーカースレッドで行い
+(約 1100 エントリで UI を 2.3 秒ブロックした実害があったため)、ツリー構築 + materialize は
+純ロジックなので受信後に UI スレッドで行う。内側 ZIP バイト列は zip_loader 内の LRU
+キャッシュに保持され、後続の read_entry_bytes / 深い階層のサムネ読み込みで再展開せず参照される。
 
 ### 2.2 PDF を開く (`App::load_pdf_as_folder`)
 

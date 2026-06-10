@@ -9365,8 +9365,33 @@ impl App {
         // existing_keys は **全階層** のキー (全 leaf entry_name + 全 dir の zipdir:) を
         // 集める。ルート階層しか materialize しないので、これがないと深い階層の
         // サムネが delete_missing で stale 削除されて再生成ループになる (Codex P2)。
-        let existing_keys: std::collections::HashSet<String> =
+        let mut existing_keys: std::collections::HashSet<String> =
             tree.all_cache_keys().into_iter().collect();
+        // 本ごとピン (Model B) の代表サムネは zipdir:{prefix}#pin:{entry} キーで保存される。
+        // base の zipdir:{prefix} しか existing に無いと delete_missing が pinned 行を毎回
+        // 消して再生成になる (Codex P2)。全 ZipDir の book key を pin DB で引き、pinned
+        // cache key も存続キーに含める。
+        if let Some(pin_db) = self.folder_thumb_pin_db.as_ref() {
+            let pinned: Vec<String> = existing_keys
+                .iter()
+                .filter_map(|k| k.strip_prefix("zipdir:").map(|p| p.to_string()))
+                .filter_map(|prefix| {
+                    let book_key = book_container_key(&tree.zip_path, &prefix);
+                    match pin_db.lookup(&book_key) {
+                        Some(crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                            entry, ..
+                        }) => Some(format!(
+                            "{}{}{}",
+                            crate::grid_item::zipdir_cache_key(&prefix),
+                            crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+                            entry
+                        )),
+                        _ => None,
+                    }
+                })
+                .collect();
+            existing_keys.extend(pinned);
+        }
         let nav = crate::zip_tree::ZipNavState::new(tree);
         let (items, image_metas) = nav.materialize_current(sort);
 
@@ -9494,7 +9519,15 @@ impl App {
             let Some(nav) = self.zip_nav.as_ref() else {
                 return;
             };
-            let zip = nav.tree.zip_path.display().to_string();
+            // 変換キャッシュ ZIP (RAR/7z/LZH/CBR/CB7) を開いている場合、表示根はユーザー視点の
+            // 元アーカイブパス (archive_source_override) にする。nav.tree.zip_path は内部の
+            // キャッシュ ZIP 実体なので、そのまま出すとユーザーに見せるべきでないパスが漏れる
+            // (Codex P2)。通常 ZIP は override 無しなので zip_path をそのまま使う。
+            let root = self
+                .archive_source_override
+                .as_ref()
+                .unwrap_or(&nav.tree.zip_path);
+            let zip = root.display().to_string();
             let segs = nav.current();
             if segs.is_empty() {
                 zip
