@@ -3115,12 +3115,12 @@ mod phase_c_drill_address_tests {
 /// 自動的に解除されること (Codex P2) を担保する。
 #[cfg(test)]
 mod favorite_adjustment_defaults_tests {
-    use super::phase_c_support::setup_app;
+    use super::phase_c_support::{AppTestEnv, setup_app};
     use super::*;
     use crate::adjustment::AdjustParams;
     use crate::settings::FavoriteEntry;
     use crate::ui_fullscreen::AdjustScope;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// テスト用: 画像 1 枚だけを items に詰めて idx 0 を返す。
     fn push_image(app: &mut App, path: &str) -> usize {
@@ -4596,6 +4596,511 @@ mod favorite_adjustment_defaults_tests {
             .collect();
         let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
         crate::zip_tree::ZipNavState::new(tree)
+    }
+
+    fn rating_key_for(path: &Path) -> String {
+        crate::adjustment_db::normalize_path(path)
+    }
+
+    fn current_container_rating_key(app: &App) -> String {
+        app.current_container_rating_key_and_source()
+            .expect("current container should be ratable")
+            .0
+    }
+
+    fn zip_dir_prefixes(app: &App) -> Vec<String> {
+        app.items
+            .iter()
+            .filter_map(|it| match it {
+                GridItem::ZipDir { dir_prefix, .. } => Some(dir_prefix.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn zip_image_entries(app: &App) -> Vec<String> {
+        app.items
+            .iter()
+            .filter_map(|it| match it {
+                GridItem::ZipImage { entry_name, .. } => Some(entry_name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn app_with_zip_entries(
+        zip_path: PathBuf,
+        entries: Vec<crate::zip_loader::ZipImageEntry>,
+        source_override: Option<PathBuf>,
+    ) -> AppTestEnv {
+        let mut app = setup_app();
+        app.settings.sort_order = crate::settings::SortOrder::FileName;
+        app.current_folder = Some(zip_path.clone());
+        app.archive_source_override = source_override;
+        let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
+        app.zip_nav = Some(crate::zip_tree::ZipNavState::new(tree));
+        app.zip_nav_show_current_level();
+        app
+    }
+
+    fn ziptest_sample(name: &str) -> Option<PathBuf> {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("dist")
+            .join("ziptest")
+            .join(name);
+        p.exists().then_some(p)
+    }
+
+    fn convert_ziptest_sample(
+        name: &str,
+        archive_format: crate::archive_converter::ArchiveFormat,
+    ) -> Option<(tempfile::TempDir, PathBuf, PathBuf)> {
+        let src = ziptest_sample(name)?;
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join(format!("{name}.converted.zip"));
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        crate::archive_converter::convert_to_zip(&src, &dst, archive_format, &cancel, None)
+            .expect("ziptest fixture should convert");
+        Some((dir, src, dst))
+    }
+
+    #[test]
+    fn zip_nav_container_keys_cover_plain_wrapped_and_converted_archives() {
+        let mut app = setup_app();
+        let zip_path = PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+
+        app.zip_nav = Some(test_zip_nav_for(zip_path.clone(), &["p1.jpg", "p2.jpg"]));
+        let (key, source) = app
+            .current_container_rating_key_and_source()
+            .expect("plain zip root should be ratable");
+        assert_eq!(key, rating_key_for(&zip_path));
+        assert_eq!(source, zip_path);
+        assert_eq!(
+            app.pin_container_key(),
+            Some(PathBuf::from(r"C:\test\outer.zip"))
+        );
+        assert_eq!(
+            app.spread_container_key(),
+            Some(PathBuf::from(r"C:\test\outer.zip"))
+        );
+
+        let zip_path = PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav_for(
+            zip_path.clone(),
+            &["vol01/p1.jpg", "vol01/p2.jpg"],
+        ));
+        assert_eq!(
+            current_container_rating_key(&app),
+            rating_key_for(&zip_path)
+        );
+        assert_eq!(app.pin_container_key(), Some(zip_path.clone()));
+        assert_eq!(app.spread_container_key(), Some(zip_path.join("vol01")));
+
+        let mut nav = test_zip_nav_for(zip_path.clone(), &["bookA/p1.jpg", "bookB/only/p1.jpg"]);
+        nav.enter("bookB/");
+        app.zip_nav = Some(nav);
+        assert_eq!(
+            current_container_rating_key(&app),
+            rating_key_for(&zip_path.join("bookB"))
+        );
+        assert_eq!(
+            app.pin_container_key(),
+            Some(zip_path.join("bookB").join("only"))
+        );
+        assert_eq!(
+            app.spread_container_key(),
+            Some(zip_path.join("bookB").join("only"))
+        );
+
+        let cache = PathBuf::from(r"C:\cache\converted\nested_rar_test.zip");
+        let src = PathBuf::from(r"C:\books\nested_rar_test.rar");
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(src.clone());
+        app.zip_nav = Some(test_zip_nav_for(cache.clone(), &["p1.jpg", "p2.jpg"]));
+        let (key, source) = app
+            .current_container_rating_key_and_source()
+            .expect("converted archive root should be ratable");
+        assert_eq!(key, rating_key_for(&src));
+        assert_eq!(source, src);
+        assert_eq!(
+            app.pin_container_key(),
+            Some(PathBuf::from(r"C:\books\nested_rar_test.rar"))
+        );
+        assert_eq!(app.spread_container_key(), Some(cache.clone()));
+
+        let src = PathBuf::from(r"C:\books\nested_rar_test.rar");
+        let mut nav = test_zip_nav_for(cache.clone(), &["bookA/p1.jpg", "bookB/only/p1.jpg"]);
+        nav.enter("bookB/");
+        app.zip_nav = Some(nav);
+        assert_eq!(
+            current_container_rating_key(&app),
+            rating_key_for(&src.join("bookB"))
+        );
+        assert_eq!(
+            app.pin_container_key(),
+            Some(src.join("bookB").join("only"))
+        );
+        assert_eq!(
+            app.spread_container_key(),
+            Some(cache.join("bookB").join("only"))
+        );
+    }
+
+    #[test]
+    fn zip_nav_ctrl_updown_traverses_dfs_and_materializes_full_dir_prefixes() {
+        let mut app = setup_app();
+        let zip_path = PathBuf::from(r"C:\test\nested_tree_test.zip");
+        app.settings.sort_order = crate::settings::SortOrder::FileName;
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav_for(
+            zip_path.clone(),
+            &[
+                "01_inner_archives/chapterA.zip/p1.png",
+                "01_inner_archives/chapterB.cbz/b_01.png",
+                "01_inner_archives/chapterC.zip/c_01.png",
+                "02_plain_subfolders/vol_X/x_01.png",
+                "02_plain_subfolders/vol_Y/y_01.png",
+                "03_single_wrapper/only/w_01.png",
+                "05_mixed/extra.zip/ms_01.png",
+                "05_mixed/m_01.png",
+                "root_a.png",
+            ],
+        ));
+        app.zip_nav_show_current_level();
+
+        assert_eq!(
+            zip_dir_prefixes(&app),
+            vec![
+                "01_inner_archives/",
+                "02_plain_subfolders/",
+                "03_single_wrapper/",
+                "05_mixed/",
+            ]
+        );
+        assert_eq!(zip_image_entries(&app), vec!["root_a.png"]);
+        assert_eq!(
+            current_container_rating_key(&app),
+            rating_key_for(&zip_path)
+        );
+
+        assert!(app.zip_nav_handle_ctrl_updown(true));
+        assert_eq!(
+            zip_dir_prefixes(&app),
+            vec![
+                "01_inner_archives/chapterA.zip/",
+                "01_inner_archives/chapterB.cbz/",
+                "01_inner_archives/chapterC.zip/",
+            ],
+            "子階層の ZipDir はルートからの完全 prefix を持つ"
+        );
+        assert_eq!(
+            current_container_rating_key(&app),
+            rating_key_for(&zip_path.join("01_inner_archives"))
+        );
+
+        assert!(app.zip_nav_handle_ctrl_updown(true));
+        assert_eq!(
+            zip_image_entries(&app),
+            vec!["01_inner_archives/chapterA.zip/p1.png"]
+        );
+        assert_eq!(
+            current_container_rating_key(&app),
+            rating_key_for(&zip_path.join("01_inner_archives").join("chapterA.zip"))
+        );
+
+        assert!(app.zip_nav_handle_ctrl_updown(true));
+        assert_eq!(
+            zip_image_entries(&app),
+            vec!["01_inner_archives/chapterB.cbz/b_01.png"]
+        );
+
+        assert!(app.zip_nav_handle_ctrl_updown(true));
+        assert_eq!(
+            zip_image_entries(&app),
+            vec!["01_inner_archives/chapterC.zip/c_01.png"]
+        );
+
+        assert!(app.zip_nav_handle_ctrl_updown(true));
+        assert_eq!(
+            zip_dir_prefixes(&app),
+            vec!["02_plain_subfolders/vol_X/", "02_plain_subfolders/vol_Y/"]
+        );
+        assert_eq!(
+            current_container_rating_key(&app),
+            rating_key_for(&zip_path.join("02_plain_subfolders"))
+        );
+
+        assert!(app.zip_nav_handle_ctrl_updown(false));
+        assert_eq!(
+            zip_image_entries(&app),
+            vec!["01_inner_archives/chapterC.zip/c_01.png"],
+            "前方向は前の兄弟枝の最後の子孫へ戻る"
+        );
+    }
+
+    #[test]
+    fn zip_nav_ctrl_updown_collapsed_wrapper_uses_literal_rating_key() {
+        let mut app = setup_app();
+        let zip_path = PathBuf::from(r"C:\test\nested_tree_test.zip");
+        app.settings.sort_order = crate::settings::SortOrder::FileName;
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav_for(
+            zip_path.clone(),
+            &[
+                "01_first/p1.png",
+                "02_wrapper/only/w_01.png",
+                "03_last/p1.png",
+            ],
+        ));
+        app.zip_nav_show_current_level();
+
+        assert!(app.zip_nav_handle_ctrl_updown(true));
+        assert_eq!(zip_image_entries(&app), vec!["01_first/p1.png"]);
+        assert!(app.zip_nav_handle_ctrl_updown(true));
+        assert_eq!(zip_image_entries(&app), vec!["02_wrapper/only/w_01.png"]);
+        assert_eq!(
+            current_container_rating_key(&app),
+            rating_key_for(&zip_path.join("02_wrapper")),
+            "collapse で only まで表示しても親に見える ZipDir と同じ literal key にする"
+        );
+        assert_eq!(
+            app.pin_container_key(),
+            Some(zip_path.join("02_wrapper").join("only")),
+            "PIN/見開きは現在読んでいる effective prefix を使う"
+        );
+        assert_eq!(
+            app.address,
+            format!("{} > 02_wrapper > only", zip_path.display())
+        );
+
+        assert!(app.zip_nav_back());
+        assert_eq!(
+            zip_dir_prefixes(&app),
+            vec!["01_first/", "02_wrapper/", "03_last/"]
+        );
+        let selected = app.selected.expect("left book should be selected after BS");
+        assert!(matches!(
+            &app.items[selected],
+            GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "02_wrapper/"
+        ));
+    }
+
+    #[test]
+    fn zip_nav_ctrl_updown_in_converted_archive_uses_source_rating_and_pin_keys() {
+        let mut app = setup_app();
+        let cache = PathBuf::from(r"C:\cache\converted\nested_rar_test.zip");
+        let src = PathBuf::from(r"C:\books\nested_rar_test.rar");
+        app.settings.sort_order = crate::settings::SortOrder::FileName;
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(src.clone());
+        app.zip_nav = Some(test_zip_nav_for(
+            cache,
+            &[
+                "01_inner/p1.png",
+                "02_wrapper/only/w_01.png",
+                "03_tail/p1.png",
+            ],
+        ));
+        app.zip_nav_show_current_level();
+
+        assert!(app.zip_nav_handle_ctrl_updown(true));
+        assert_eq!(
+            current_container_rating_key(&app),
+            rating_key_for(&src.join("01_inner"))
+        );
+        assert_eq!(app.pin_container_key(), Some(src.join("01_inner")));
+        assert_eq!(app.address, format!("{} > 01_inner", src.display()));
+
+        assert!(app.zip_nav_handle_ctrl_updown(true));
+        assert_eq!(zip_image_entries(&app), vec!["02_wrapper/only/w_01.png"]);
+        assert_eq!(
+            current_container_rating_key(&app),
+            rating_key_for(&src.join("02_wrapper"))
+        );
+        assert_eq!(
+            app.pin_container_key(),
+            Some(src.join("02_wrapper").join("only"))
+        );
+        assert_eq!(
+            app.address,
+            format!("{} > 02_wrapper > only", src.display())
+        );
+    }
+
+    #[test]
+    fn ziptest_zip_fixtures_materialize_expected_tree_paths_if_present() {
+        let Some(src) = ziptest_sample("nested_tree_test.zip") else {
+            return;
+        };
+        let detail = crate::zip_loader::enumerate_image_entries_detailed(&src).unwrap();
+        assert!(!detail.has_foreign_archives);
+        let mut app = app_with_zip_entries(src.clone(), detail.entries, None);
+        assert_eq!(
+            zip_dir_prefixes(&app),
+            vec![
+                "01_inner_archives/",
+                "02_plain_subfolders/",
+                "03_single_wrapper/",
+                "04_deep_nest/",
+                "05_mixed/",
+            ]
+        );
+        assert_eq!(zip_image_entries(&app), vec!["root_a.png", "root_b.png"]);
+
+        app.zip_nav_enter("01_inner_archives/");
+        assert_eq!(
+            zip_dir_prefixes(&app),
+            vec![
+                "01_inner_archives/chapterA.zip/",
+                "01_inner_archives/chapterB.cbz/",
+                "01_inner_archives/chapterC.zip/",
+            ]
+        );
+        app.zip_nav_enter("01_inner_archives/chapterA.zip/");
+        assert!(
+            zip_image_entries(&app)
+                .iter()
+                .any(|n| n == "01_inner_archives/chapterA.zip/p1.png")
+        );
+        drop(app);
+
+        let Some(wrapper) = ziptest_sample("single_book_wrapper.zip") else {
+            return;
+        };
+        let entries = crate::zip_loader::enumerate_image_entries(&wrapper).unwrap();
+        let app = app_with_zip_entries(wrapper, entries, None);
+        assert!(zip_dir_prefixes(&app).is_empty());
+        assert!(
+            zip_image_entries(&app)
+                .iter()
+                .all(|n| n.starts_with("the_only_folder/"))
+        );
+        drop(app);
+
+        let Some(flat) = ziptest_sample("simple_flat.zip") else {
+            return;
+        };
+        let entries = crate::zip_loader::enumerate_image_entries(&flat).unwrap();
+        let mut app = app_with_zip_entries(flat, entries, None);
+        assert!(zip_dir_prefixes(&app).is_empty());
+        assert!(!app.zip_nav_handle_ctrl_updown(true));
+        assert!(!app.zip_nav_handle_ctrl_updown(false));
+    }
+
+    #[test]
+    fn ziptest_foreign_zip_fixture_shows_native_zip_part_before_conversion_if_present() {
+        let Some(src) = ziptest_sample("foreign_in_zip.zip") else {
+            return;
+        };
+        let detail = crate::zip_loader::enumerate_image_entries_detailed(&src).unwrap();
+        assert!(detail.has_foreign_archives);
+        let mut app = app_with_zip_entries(src, detail.entries, None);
+        assert_eq!(zip_dir_prefixes(&app), vec!["inner/"]);
+        assert_eq!(zip_image_entries(&app), vec!["cover_root.png"]);
+
+        app.zip_nav_enter("inner/");
+        let dirs = zip_dir_prefixes(&app);
+        let images = zip_image_entries(&app);
+        assert!(
+            dirs == vec!["inner/part2.zip/"]
+                || (dirs.is_empty() && images.iter().all(|n| n.starts_with("inner/part2.zip/"))),
+            "変換前の ZIP ネイティブ経路では part2.zip だけ見え、RAR/7z は提案対象として残る: dirs={dirs:?} images={images:?}"
+        );
+    }
+
+    #[test]
+    fn ziptest_converted_archive_fixtures_materialize_expected_tree_paths_if_present() {
+        let cases: &[(
+            &str,
+            crate::archive_converter::ArchiveFormat,
+            &[&str],
+            &[&str],
+        )] = &[
+            (
+                "nested_7z_test.7z",
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &["deep.7z/", "inside.zip/", "sub/"],
+                &["z7_01.png", "z7_02.png"],
+            ),
+            (
+                "rar_in_zip.zip",
+                crate::archive_converter::ArchiveFormat::Zip,
+                &["inner.rar/"],
+                &["front.png"],
+            ),
+            (
+                "zip_in_rar.rar",
+                crate::archive_converter::ArchiveFormat::Rar,
+                &["inner.zip/"],
+                &["zr_01.png", "zr_02.png"],
+            ),
+            (
+                "nested_rar_test.rar",
+                crate::archive_converter::ArchiveFormat::Rar,
+                &["inner.rar/"],
+                &["zr_01.png", "zr_02.png"],
+            ),
+        ];
+
+        for (name, format, expected_dirs, expected_root_images) in cases {
+            let Some((_dir, source, converted_zip)) = convert_ziptest_sample(name, *format) else {
+                continue;
+            };
+            let entries = crate::zip_loader::enumerate_image_entries(&converted_zip).unwrap();
+            let mut app = app_with_zip_entries(converted_zip, entries, Some(source.clone()));
+            assert_eq!(zip_dir_prefixes(&app), *expected_dirs, "{name}");
+            for image in *expected_root_images {
+                assert!(
+                    zip_image_entries(&app).iter().any(|n| n == image),
+                    "{name}: missing root image {image}"
+                );
+            }
+            let first_dir = expected_dirs[0];
+            app.zip_nav_enter(first_dir);
+            assert!(
+                zip_image_entries(&app)
+                    .iter()
+                    .any(|n| n.starts_with(first_dir)),
+                "{name}: entering {first_dir} should reveal pages"
+            );
+            let dir_key = first_dir.trim_end_matches('/');
+            assert_eq!(
+                current_container_rating_key(&app),
+                rating_key_for(&source.join(dir_key)),
+                "{name}: converted archive child rating key should use source archive root"
+            );
+        }
+    }
+
+    #[test]
+    fn ziptest_converted_foreign_zip_fixture_materializes_all_archive_parts_if_present() {
+        let Some((_dir, source, converted_zip)) = convert_ziptest_sample(
+            "foreign_in_zip.zip",
+            crate::archive_converter::ArchiveFormat::Zip,
+        ) else {
+            return;
+        };
+        let entries = crate::zip_loader::enumerate_image_entries(&converted_zip).unwrap();
+        let has_part3_rar = entries
+            .iter()
+            .any(|entry| entry.entry_name.starts_with("inner/part3.rar/"));
+        let mut app = app_with_zip_entries(converted_zip, entries, Some(source.clone()));
+        assert_eq!(zip_dir_prefixes(&app), vec!["inner/"]);
+        assert_eq!(zip_image_entries(&app), vec!["cover_root.png"]);
+        assert_eq!(current_container_rating_key(&app), rating_key_for(&source));
+
+        app.zip_nav_enter("inner/");
+        let mut expected = vec!["inner/part1.7z/", "inner/part2.zip/"];
+        if has_part3_rar {
+            expected.push("inner/part3.rar/");
+        }
+        assert_eq!(zip_dir_prefixes(&app), expected);
+        assert_eq!(
+            current_container_rating_key(&app),
+            rating_key_for(&source.join("inner"))
+        );
     }
 
     #[test]
@@ -10431,8 +10936,25 @@ mod still_window_mode_key_tests {
         app.items.len() - 1
     }
 
-    fn begin_root_key_pass(ctx: &egui::Context, key: egui::Key, repeat: bool) {
-        let modifiers = egui::Modifiers::NONE;
+    fn test_zip_nav_for(zip_path: PathBuf, names: &[&str]) -> crate::zip_tree::ZipNavState {
+        let entries: Vec<crate::zip_loader::ZipImageEntry> = names
+            .iter()
+            .map(|n| crate::zip_loader::ZipImageEntry {
+                entry_name: n.to_string(),
+                uncompressed_size: 0,
+                mtime: 0,
+            })
+            .collect();
+        let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
+        crate::zip_tree::ZipNavState::new(tree)
+    }
+
+    fn begin_root_key_pass_with_modifiers(
+        ctx: &egui::Context,
+        key: egui::Key,
+        repeat: bool,
+        modifiers: egui::Modifiers,
+    ) {
         ctx.begin_pass(egui::RawInput {
             modifiers,
             ..Default::default()
@@ -10446,6 +10968,10 @@ mod still_window_mode_key_tests {
                 modifiers,
             });
         });
+    }
+
+    fn begin_root_key_pass(ctx: &egui::Context, key: egui::Key, repeat: bool) {
+        begin_root_key_pass_with_modifiers(ctx, key, repeat, egui::Modifiers::NONE);
     }
 
     #[test]
@@ -10515,6 +11041,83 @@ mod still_window_mode_key_tests {
             "Backspace on a regular image should close fullscreen and return to the grid"
         );
         assert_eq!(app.selected, Some(idx));
+    }
+
+    #[test]
+    fn still_image_fullscreen_shift_fkey_rates_converted_archive_root_source_key() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let cache = PathBuf::from(r"C:\cache\converted\nested_rar_test.zip");
+        let src = PathBuf::from(r"C:\books\nested_rar_test.rar");
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(src.clone());
+        app.zip_nav = Some(test_zip_nav_for(cache.clone(), &["p1.jpg", "p2.jpg"]));
+        app.zip_nav_show_current_level();
+        let idx = app
+            .items
+            .iter()
+            .position(
+                |it| matches!(it, GridItem::ZipImage { entry_name, .. } if entry_name == "p1.jpg"),
+            )
+            .expect("root page should be materialized");
+        app.selected = Some(idx);
+        app.fullscreen_idx = Some(idx);
+
+        begin_root_key_pass_with_modifiers(&ctx, egui::Key::F2, false, egui::Modifiers::SHIFT);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled);
+        let source_key = crate::adjustment_db::normalize_path(&src);
+        let cache_key = crate::adjustment_db::normalize_path(&cache);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&source_key), 2);
+        assert_eq!(
+            app.rating_db.as_ref().unwrap().get(&cache_key),
+            0,
+            "fullscreen Shift+F2 should not rate the converted cache zip path"
+        );
+    }
+
+    #[test]
+    fn still_image_fullscreen_shift_fkey_rates_collapsed_converted_child_literal_key() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let cache = PathBuf::from(r"C:\cache\converted\nested_rar_test.zip");
+        let src = PathBuf::from(r"C:\books\nested_rar_test.rar");
+        app.current_folder = Some(cache.clone());
+        app.archive_source_override = Some(src.clone());
+        app.zip_nav = Some(test_zip_nav_for(
+            cache.clone(),
+            &["bookA/p1.jpg", "bookB/only/p1.jpg"],
+        ));
+        app.zip_nav_enter("bookB/");
+        let idx = app
+            .items
+            .iter()
+            .position(|it| matches!(it, GridItem::ZipImage { entry_name, .. } if entry_name == "bookB/only/p1.jpg"))
+            .expect("collapsed child page should be materialized");
+        app.selected = Some(idx);
+        app.fullscreen_idx = Some(idx);
+
+        begin_root_key_pass_with_modifiers(&ctx, egui::Key::F4, false, egui::Modifiers::SHIFT);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled);
+        let literal_key = crate::adjustment_db::normalize_path(&src.join("bookB"));
+        let effective_key = crate::adjustment_db::normalize_path(&src.join("bookB").join("only"));
+        let cache_literal_key = crate::adjustment_db::normalize_path(&cache.join("bookB"));
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&literal_key), 4);
+        assert_eq!(
+            app.rating_db.as_ref().unwrap().get(&effective_key),
+            0,
+            "fullscreen Shift+F4 should match the parent ZipDir literal key"
+        );
+        assert_eq!(
+            app.rating_db.as_ref().unwrap().get(&cache_literal_key),
+            0,
+            "converted archive child ratings must use the source archive root"
+        );
     }
 
     #[test]
