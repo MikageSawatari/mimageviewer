@@ -118,7 +118,7 @@ pub(crate) struct FolderNavThreadResult {
 pub(crate) struct ZipEnumeratePending {
     pub zip_path: PathBuf,
     pub cancel: Arc<AtomicBool>,
-    pub rx: mpsc::Receiver<Result<Vec<crate::zip_loader::ZipImageEntry>, String>>,
+    pub rx: mpsc::Receiver<Result<crate::zip_loader::ZipEnumeration, String>>,
     /// 結果受信後のグルーピング/ソートで使う。起動時の `settings.sort_order` をキャプチャ
     /// (worker 実行中にユーザーが設定を変えても、このロード分は開始時の値で処理する)。
     pub sort_order: crate::settings::SortOrder,
@@ -9230,6 +9230,25 @@ impl App {
             zip_path.display()
         ));
 
+        // 入れ子に RAR/7z/LZH を含み、過去に「展開キャッシュ」へ変換済みの ZIP は、
+        // キャッシュ ZIP へ振り替えて開く (RAR 等のキャッシュヒット経路と同じ、v1.3.0)。
+        // キャッシュ ZIP 自身を開く内側の再帰呼び出しでは lookup が miss するので
+        // 無限再帰にはならない。lookup は mtime+size 検証付き (元 ZIP が更新されたら
+        // miss して通常経路 → 列挙で再検出 → 再変換提案)。
+        if let Some(cached) = self.try_archive_cache_lookup(&zip_path)
+            && !crate::folder_tree::path_eq(&cached, &zip_path)
+        {
+            crate::logger::log(format!(
+                "  zip: converted-archive cache hit -> {}",
+                cached.display()
+            ));
+            if self.open_archive_via_cache(zip_path.clone(), cached, false) {
+                return;
+            }
+            // ★固定の範囲外ガード等で振り替えがブロックされた場合は通常の ZIP 経路へ
+            // 落とす (元 ZIP のツリー表示は従来どおり可能、非 ZIP の中身だけ見えない)。
+        }
+
         // 旧 ZIP / PDF pending を Drop (cancel 自動伝搬)。
         // fs_nav_after_pdf_enumerate も一緒に捨てないと、後続の別 PDF で古い方向で
         // fullscreen が勝手に開いてしまう (Codex P2)。
@@ -9301,8 +9320,8 @@ impl App {
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }
-                let result =
-                    crate::zip_loader::enumerate_image_entries(&path_w).map_err(|e| e.to_string());
+                let result = crate::zip_loader::enumerate_image_entries_detailed(&path_w)
+                    .map_err(|e| e.to_string());
                 let _ = tx.send(result);
             });
 
@@ -9314,8 +9333,8 @@ impl App {
                 "zip-enumerate: spawn failed ({e}), falling back to synchronous enumerate"
             ));
             drop(rx);
-            let result =
-                crate::zip_loader::enumerate_image_entries(&zip_path).map_err(|e| e.to_string());
+            let result = crate::zip_loader::enumerate_image_entries_detailed(&zip_path)
+                .map_err(|e| e.to_string());
             self.finalize_zip_enumerate(zip_path, self.settings.sort_order, result);
             return;
         }
@@ -9377,9 +9396,9 @@ impl App {
         &mut self,
         zip_path: PathBuf,
         sort: crate::settings::SortOrder,
-        result: Result<Vec<crate::zip_loader::ZipImageEntry>, String>,
+        result: Result<crate::zip_loader::ZipEnumeration, String>,
     ) {
-        let entries = match result {
+        let enumeration = match result {
             Ok(e) => e,
             Err(e) => {
                 crate::logger::log(format!("  zip enumerate failed: {e}"));
@@ -9398,7 +9417,12 @@ impl App {
                 return;
             }
         };
-        crate::logger::log(format!("  zip: {} image entries", entries.len()));
+        let has_foreign_archives = enumeration.has_foreign_archives;
+        let entries = enumeration.entries;
+        crate::logger::log(format!(
+            "  zip: {} image entries (foreign archives: {has_foreign_archives})",
+            entries.len()
+        ));
 
         // ネスト ZIP ツリーナビ (v1.3.0、docs/nested-zip-tree-plan.md Strategy A)。
         // フラット展開 + ZipSeparator をやめ、entry_name の '/' 区切りでツリーを構築し、
@@ -9507,6 +9531,49 @@ impl App {
                 }
             }
         }
+
+        // 列挙で非 ZIP アーカイブ (RAR/7z/LZH) を検出した場合、入れ子を展開した
+        // 閲覧用キャッシュへの変換を提案する (v1.3.0)。ツリー表示は既に出ている
+        // (非 ZIP の中身だけが見えない) ので、キャンセルしてもそのまま閲覧できる。
+        if has_foreign_archives {
+            let zip_path = self
+                .zip_nav
+                .as_ref()
+                .map(|nav| nav.tree.zip_path.clone())
+                .unwrap_or_default();
+            if !zip_path.as_os_str().is_empty() {
+                self.offer_zip_foreign_archive_conversion(&zip_path);
+            }
+        }
+    }
+
+    /// ZIP 列挙で非 ZIP アーカイブ (RAR/7z/LZH) を検出したときの「入れ子を展開した
+    /// 閲覧用キャッシュへの変換」提案 (v1.3.0)。`ArchiveFormat::Zip` で既存の変換
+    /// ダイアログ (`request_archive_convert`) に乗せる。変換完了後はキャッシュ ZIP を
+    /// `archive_source_override` 付きで開く (RAR 等と同じ pending_nav 経路)。
+    fn offer_zip_foreign_archive_conversion(&mut self, zip_path: &Path) {
+        // キャッシュ ZIP 自身では提案しない (変換出力は非 ZIP アーカイブのファイル
+        // エントリを含まないので通常 flag 自体立たないが、手作りの類似 ZIP への防御)。
+        // RAR 等の変換キャッシュを開いている最中 (archive_source_override) も同様。
+        if crate::archive_cache::is_under_cache_root(zip_path)
+            || self.archive_source_override.is_some()
+        {
+            return;
+        }
+        if self.archive_convert.is_some() {
+            return; // 既に別の変換ダイアログが動作中 (二重起動防止)
+        }
+        // 既にキャッシュがある (開いている間に別経路で変換が完了した等) なら
+        // ダイアログを出さずそのまま振り替える。
+        if let Some(cached) = self.try_archive_cache_lookup(zip_path) {
+            let _ = self.open_archive_via_cache(zip_path.to_path_buf(), cached, false);
+            return;
+        }
+        let _ = self.request_archive_convert(
+            zip_path.to_path_buf(),
+            crate::archive_converter::ArchiveFormat::Zip,
+            false,
+        );
     }
 
     /// 現在の `zip_nav` 階層を materialize して grid に表示する (軽量経路、Phase 3)。

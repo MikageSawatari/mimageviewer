@@ -218,6 +218,17 @@ pub struct ZipImageEntry {
     pub mtime: i64,
 }
 
+/// `enumerate_image_entries_detailed` の結果 (エントリ + 付帯情報)。
+#[derive(Debug)]
+pub struct ZipEnumeration {
+    pub entries: Vec<ZipImageEntry>,
+    /// ZIP 内 (ネスト ZIP 内含む) に、変換対応の**非 ZIP** アーカイブ
+    /// (RAR/CBR/7z/CB7/LZH/LHA) のファイルエントリが存在したか。それらの中身は
+    /// この列挙には**含まれない** (ZIP ネイティブ経路では読めないため)。true の場合、
+    /// 呼び出し側が「入れ子を展開した閲覧用キャッシュへの変換」を提案する (v1.3.0)。
+    pub has_foreign_archives: bool,
+}
+
 /// ZIP ファイル内の画像エントリをすべて列挙する。
 ///
 /// 戻り値はディレクトリ構造を保持した相対パスの順序 (ZIP 内出現順)。
@@ -225,6 +236,11 @@ pub struct ZipImageEntry {
 /// (例: "outer/ch01.zip/page01.jpg")。
 /// 呼び出し側でサブディレクトリグループ化とソートを行う。
 pub fn enumerate_image_entries(zip_path: &Path) -> std::io::Result<Vec<ZipImageEntry>> {
+    enumerate_image_entries_detailed(zip_path).map(|d| d.entries)
+}
+
+/// `enumerate_image_entries` + 付帯情報 (非 ZIP アーカイブの有無)。
+pub fn enumerate_image_entries_detailed(zip_path: &Path) -> std::io::Result<ZipEnumeration> {
     let file = File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(BufReader::new(file))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
@@ -235,8 +251,19 @@ pub fn enumerate_image_entries(zip_path: &Path) -> std::io::Result<Vec<ZipImageE
         .map_or(0, |m| crate::ui_helpers::mtime_secs(&m));
 
     let mut out: Vec<ZipImageEntry> = Vec::new();
-    enumerate_recursive(&mut archive, zip_path, "", zip_mtime, &mut out);
-    Ok(out)
+    let mut has_foreign = false;
+    enumerate_recursive(
+        &mut archive,
+        zip_path,
+        "",
+        zip_mtime,
+        &mut out,
+        &mut has_foreign,
+    );
+    Ok(ZipEnumeration {
+        entries: out,
+        has_foreign_archives: has_foreign,
+    })
 }
 
 fn enumerate_recursive<R: Read + Seek>(
@@ -245,6 +272,7 @@ fn enumerate_recursive<R: Read + Seek>(
     prefix: &str,
     zip_mtime: i64,
     out: &mut Vec<ZipImageEntry>,
+    has_foreign: &mut bool,
 ) {
     let len = archive.len();
     for i in 0..len {
@@ -269,6 +297,12 @@ fn enumerate_recursive<R: Read + Seek>(
                 uncompressed_size: entry.size(),
                 mtime: zip_mtime,
             });
+            continue;
+        }
+        // RAR/7z/LZH 等の非 ZIP アーカイブはこの経路では読めない (スキップされる)。
+        // 検出だけして呼び出し側に伝え、「展開キャッシュへの変換」の提案につなげる (v1.3.0)。
+        if crate::archive_converter::ArchiveFormat::from_extension(&ext).is_some() {
+            *has_foreign = true;
             continue;
         }
         if crate::folder_tree::is_zip_extension(&ext) {
@@ -299,7 +333,14 @@ fn enumerate_recursive<R: Read + Seek>(
                 continue;
             };
             let new_prefix = format!("{full_name}/");
-            enumerate_recursive(&mut inner, outer_zip_path, &new_prefix, zip_mtime, out);
+            enumerate_recursive(
+                &mut inner,
+                outer_zip_path,
+                &new_prefix,
+                zip_mtime,
+                out,
+                has_foreign,
+            );
         }
     }
 }
@@ -498,6 +539,18 @@ pub fn read_entry_bytes(zip_path: &Path, entry_name: &str) -> std::io::Result<Ve
             current_bytes = Some(b);
             start_level = level;
             break;
+        }
+    }
+
+    // 変換キャッシュ ZIP (入れ子アーカイブ展開済み、v1.3.0) は "inner.zip/p01.jpg" の
+    // ような **literal なフラットエントリ** を持つ (エントリ名自体に ".zip/" 区切りが
+    // 含まれる)。ネスト境界として分割解決する前に、まずフルネーム一致を直接試す:
+    // - 変換キャッシュ: 常にここで解決される (ネスト展開コストなし)。
+    // - 実ネスト ZIP: フルネームのエントリは存在しないので 1 回 miss して従来経路へ。
+    //   miss を払うのは NESTED_CACHE が冷えている初回だけ (ヒット後はこの分岐に来ない)。
+    if current_bytes.is_none() {
+        if let Ok(bytes) = read_entry_from_disk(zip_path, entry_name) {
+            return Ok(bytes);
         }
     }
 
@@ -747,5 +800,97 @@ mod tests {
             split_nested_zip_path("a.zip/b.cbz/img.png"),
             vec!["a.zip", "b.cbz", "img.png"]
         );
+    }
+
+    // ── v1.3.0: 変換キャッシュ (入れ子展開) との整合 ─────────────────
+
+    /// テスト用 ZIP をディスクに作る。entries = (エントリ名, 中身)。
+    fn write_test_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in entries {
+            zw.start_file(*name, opts).unwrap();
+            use std::io::Write as _;
+            zw.write_all(data).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    /// 変換キャッシュ ZIP は "inner.zip/p.jpg" のような literal なフラットエントリを
+    /// 持つ (入れ子アーカイブ展開の出力)。".zip/" 境界の分割解決より先にフルネーム
+    /// 一致で読めること (exact-name fallback)。
+    #[test]
+    fn read_entry_bytes_resolves_literal_flat_cache_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("cache_like.zip");
+        write_test_zip(
+            &zip_path,
+            &[
+                ("inner.zip/p1.jpg", b"ZIPSEG"),
+                ("books/inner.rar/p2.jpg", b"RARSEG"),
+                ("plain.jpg", b"PLAIN"),
+            ],
+        );
+        // ".zip/" を含む literal エントリ (旧実装ではネスト解決を試みて NotFound だった)。
+        assert_eq!(
+            read_entry_bytes(&zip_path, "inner.zip/p1.jpg").unwrap(),
+            b"ZIPSEG"
+        );
+        // ".rar/" セグメントは元々分割対象外 → 直接読み (回帰確認)。
+        assert_eq!(
+            read_entry_bytes(&zip_path, "books/inner.rar/p2.jpg").unwrap(),
+            b"RARSEG"
+        );
+        assert_eq!(read_entry_bytes(&zip_path, "plain.jpg").unwrap(), b"PLAIN");
+    }
+
+    /// 実ネスト ZIP (本物の .zip エントリ) は従来どおり境界分割で読める
+    /// (exact-name fallback が先に走っても、フルネームのエントリは存在しないので
+    /// miss して従来経路に落ちる)。
+    #[test]
+    fn read_entry_bytes_still_resolves_real_nested_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        // 内側 ZIP バイト列を作る
+        let inner_path = dir.path().join("inner_src.zip");
+        write_test_zip(&inner_path, &[("page01.jpg", b"NESTED")]);
+        let inner_bytes = std::fs::read(&inner_path).unwrap();
+        let zip_path = dir.path().join("outer.zip");
+        write_test_zip(&zip_path, &[("ch01.zip", &inner_bytes)]);
+        assert_eq!(
+            read_entry_bytes(&zip_path, "ch01.zip/page01.jpg").unwrap(),
+            b"NESTED"
+        );
+    }
+
+    /// 非 ZIP アーカイブ (RAR/7z/LZH) のファイルエントリ検出フラグ (v1.3.0)。
+    /// ネスト ZIP の中にあっても検出される。
+    #[test]
+    fn enumerate_detects_foreign_archives() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 直下に rar (中身はゴミで OK、拡張子判定のみ)
+        let z1 = dir.path().join("with_rar.zip");
+        write_test_zip(&z1, &[("a.jpg", b"A"), ("b.rar", b"junk")]);
+        let d1 = enumerate_image_entries_detailed(&z1).unwrap();
+        assert!(d1.has_foreign_archives);
+        assert_eq!(d1.entries.len(), 1);
+
+        // ネスト ZIP の中に 7z
+        let inner_path = dir.path().join("inner_src.zip");
+        write_test_zip(&inner_path, &[("c.jpg", b"C"), ("deep.7z", b"junk7z")]);
+        let inner_bytes = std::fs::read(&inner_path).unwrap();
+        let z2 = dir.path().join("with_nested_7z.zip");
+        write_test_zip(&z2, &[("inner.zip", &inner_bytes)]);
+        let d2 = enumerate_image_entries_detailed(&z2).unwrap();
+        assert!(d2.has_foreign_archives);
+        assert_eq!(d2.entries.len(), 1); // inner.zip/c.jpg
+
+        // 純 ZIP (フラグ無し)
+        let z3 = dir.path().join("plain.zip");
+        write_test_zip(&z3, &[("d.jpg", b"D")]);
+        let d3 = enumerate_image_entries_detailed(&z3).unwrap();
+        assert!(!d3.has_foreign_archives);
     }
 }

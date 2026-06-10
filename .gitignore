@@ -42,3 +42,6 @@ dist/mImageViewer_portable_*.zip
 
 # 開発中の検証用一時ファイル
 /tmp-test/
+
+# Python bytecode (scripts/ のヘルパー実行で生成)
+__pycache__/

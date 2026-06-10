@@ -147,6 +147,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 sevenz-rust2 = "0.20"
 delharc = "0.6"
 unrar = "0.5.8"
+# アーカイブ変換の入れ子展開で、内側アーカイブを一時ファイル化するのに使用
+# (unrar / sevenz / delharc はファイルパス前提のため)。dev-dependencies にも別掲あり。
+tempfile = "3"
 turbojpeg = { version = "1", features = ["image"] }
 pdfium-render = { version = "0.8", features = ["thread_safe"] }
 windows-dpapi = "0.2"

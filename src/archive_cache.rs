@@ -31,6 +31,13 @@ pub fn cache_root() -> PathBuf {
     crate::data_dir::get().join("archive_cache")
 }
 
+/// `path` が変換キャッシュ ZIP の置き場 (cache_root 配下) にあるか。
+/// キャッシュ ZIP 自身を開いたときに「入れ子アーカイブ検出 → 再変換提案」の
+/// ループに入らないためのガードに使う (v1.3.0)。
+pub fn is_under_cache_root(path: &Path) -> bool {
+    path.starts_with(cache_root())
+}
+
 /// DB ファイルのパス。
 pub fn db_path() -> PathBuf {
     crate::data_dir::get().join("archive_cache.db")
@@ -525,6 +532,10 @@ fn format_to_db(f: ArchiveFormat) -> &'static str {
         ArchiveFormat::Rar => "rar",
         ArchiveFormat::SevenZ => "7z",
         ArchiveFormat::Lzh => "lzh",
+        // v1.3.0: 入れ子に非 ZIP アーカイブを含む ZIP の変換キャッシュ。
+        // 旧バージョンの format_from_db は "zip" を None として無視するだけなので
+        // ダウングレードしても DB 破壊にはならない (行は読み飛ばされる)。
+        ArchiveFormat::Zip => "zip",
     }
 }
 
@@ -533,6 +544,7 @@ fn format_from_db(s: &str) -> Option<ArchiveFormat> {
         "rar" | "cbr" => Some(ArchiveFormat::Rar),
         "7z" | "cb7" => Some(ArchiveFormat::SevenZ),
         "lzh" | "lha" => Some(ArchiveFormat::Lzh),
+        "zip" | "cbz" => Some(ArchiveFormat::Zip),
         _ => None,
     }
 }

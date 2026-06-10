@@ -169,6 +169,36 @@ ZIP の中身が実フォルダツリーの一部であるかのように Ctrl+�
 - [ ] レーティングフィルタで移動先の本の頁が全部 hidden の場合のみ、フルスクリーンが
       閉じてグリッドにその階層が出る (従来のフォールバック)
 
+## 入れ子アーカイブ展開 (RAR/7z in ZIP、ZIP in RAR 等、v1.3.0)
+
+サンプル生成 (7-Zip 必須、RAR 系は WinRAR 必須):
+
+```bash
+python scripts/make_nested_archive_test.py
+```
+
+| ファイル | 構造 | 確認ポイント |
+| --- | --- | --- |
+| `foreign_in_zip.zip` | ZIP > {直下画像, part1.7z, part2.zip, part3.rar} | 変換提案ダイアログ |
+| `nested_7z_test.7z` | 7z > {直下画像, inside.zip, deep.7z, sub/} | 変換の再帰展開 |
+| `rar_in_zip.zip` | ZIP > inner.rar | zip/rar 最小ケース |
+| `zip_in_rar.rar` | RAR > inner.zip | rar/zip 最小ケース |
+| `nested_rar_test.rar` | RAR > inner.rar | rar 入れ子 |
+
+- [ ] `foreign_in_zip.zip` を開くと、まず通常のツリー (cover_root + part2.zip のみ) が出て、
+      その上に**「ZIP 内のアーカイブを展開」ダイアログ**が出る
+- [ ] ダイアログを**キャンセル** → そのまま閲覧継続 (part1.7z / part3.rar の本は見えない)
+- [ ] もう一度開いて**変換** → part1.7z / part3.rar が本 (アーカイブバッジ) として現れ、
+      アドレスバーは元 ZIP のパスのまま (キャッシュパスが漏れない)
+- [ ] 変換後、part1.7z の本に入って頁が読める / 見開きが本単位 / Ctrl+↑↓ DFS も効く
+- [ ] **2 回目以降のオープンはダイアログなし**で即変換済みツリーが出る (キャッシュヒット)
+- [ ] `nested_7z_test.7z` → 変換後 inside.zip / deep.7z / sub の 3 冊 + 直下頁がツリーで見える
+- [ ] `zip_in_rar.rar` / `nested_rar_test.rar` → 変換後 inner.zip / inner.rar が本として見える
+      (従来はこれらの中身が**無言で消えていた**)
+- [ ] 変換キャッシュ管理 (環境設定) に "ZIP" 形式の行が出て、削除→再オープンで再提案される
+- [ ] 入れ子の頁に補正/レーティング/タグを付けて出入りしても保持される (キー = キャッシュ ZIP
+      の entry_name)
+
 ## 既知の制限 (将来 / 今回は未対応で OK)
 
 - 複数本 ZIP を**自動フルスクリーン**で開くと、ルートが ZipDir のみのとき本一覧表示に

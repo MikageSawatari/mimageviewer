@@ -437,7 +437,14 @@ fn split_prefix(dir_prefix: &str) -> Vec<String> {
 /// `ZipDir.is_archive` バッジ用の suffix 推定 (accepted ambiguity、計画書 §9)。
 fn segment_is_archive(seg: &str) -> bool {
     let lower = seg.to_ascii_lowercase();
-    lower.ends_with(".zip") || lower.ends_with(".cbz")
+    // .rar 以下は変換キャッシュ ZIP のフラットパス ("inner.rar/p01.jpg") 由来の
+    // セグメント (v1.3.0 入れ子展開)。実 ZIP 内の生 RAR は列挙されないので、
+    // これらが現れるのは展開済みキャッシュを開いたときだけ。
+    [
+        ".zip", ".cbz", ".rar", ".cbr", ".7z", ".cb7", ".lzh", ".lha",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
 }
 
 /// 部分木の代表画像 (= ZipDir 代表サムネ) を **sort 準拠**で選ぶ。
@@ -725,7 +732,10 @@ mod tests {
         assert!(segment_is_archive("ch01.CBZ"));
         assert!(segment_is_archive("Vol.Zip"));
         assert!(!segment_is_archive("chapters"));
-        assert!(!segment_is_archive("ch01.rar"));
+        // v1.3.0: 変換キャッシュのフラットパス由来セグメント (入れ子展開) もアーカイブバッジ。
+        assert!(segment_is_archive("ch01.rar"));
+        assert!(segment_is_archive("ch02.7z"));
+        assert!(segment_is_archive("old.LZH"));
     }
 
     #[test]

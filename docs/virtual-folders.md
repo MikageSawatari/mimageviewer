@@ -55,6 +55,36 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 `load_folder_with_scan` の分岐 / `build_and_save_one` のサムネ catch-up / ネスト ZIP 再帰) を
 通す必要がある。`.cbt` (tar) / `.cba` (ace) は未対応。
 
+### 入れ子アーカイブの再帰展開 (v1.3.0)
+
+アーカイブの**中に別のアーカイブ**が入っているケースの扱い:
+
+| 外側 | 入れ子 | 挙動 |
+| --- | --- | --- |
+| ZIP/CBZ | ZIP/CBZ のみ | 従来どおり**無変換**でネスト ZIP ツリー表示 (`entry_name` 不変、一般ケース最速) |
+| ZIP/CBZ | RAR/CBR/7z/CB7/LZH/LHA を含む | 列挙 (`enumerate_image_entries_detailed`) が `has_foreign_archives` フラグを立て、`finalize_zip_enumerate` → `offer_zip_foreign_archive_conversion` が **`ArchiveFormat::Zip` で変換ダイアログを提案**。キャンセルしても非 ZIP の中身が見えないだけでツリー閲覧は継続できる |
+| RAR/7z/LZH | 任意のアーカイブ | 変換時に**再帰展開** (従来は skip で中身が消えていた) |
+
+変換器 (`archive_converter`) の再帰展開は `ConvertCtx` + `expand_{zip,rar,7z,lzh}` で行い、
+入れ子は一時ファイル化 (`tempfile`) してから対応リーダーで開く。出力 cache ZIP には
+**フラットな literal エントリ名** (`"books/inner.rar/p01.jpg"`) で書くので、ツリー表示は
+`/` split だけで入れ子アーカイブが「本」ノードになる。要点:
+
+- 深さ上限 `MAX_NESTED_ARCHIVE_DEPTH` (=8)。超過・壊れた・パスワード付き入れ子は
+  ログ + skip (変換全体は続行。`expand_nested_guarded` が Archive 系エラーだけ握る)
+- **読み戻し**: cache ZIP の literal な `".zip/"` 入りエントリ名は、`read_entry_bytes` の
+  **exact-name fallback** (NESTED_CACHE 未ヒット時にフルネーム直接読みを先に試す) で
+  解決される。`".rar/"` 等の境界はそもそも分割対象でないので直接読みになる
+- 変換済み ZIP の再オープンは `load_zip_as_folder` 冒頭の `try_archive_cache_lookup` で
+  cache ZIP へ振り替え (`archive_source_override` = 元 ZIP)。mtime/size 不一致なら miss
+  して通常経路 → 列挙で再検出 → 再変換提案
+- ループガード: cache ZIP 自身 (`archive_cache::is_under_cache_root`) と
+  `archive_source_override` 表示中は提案しない
+- `zip_tree::segment_is_archive` は `.rar/.cbr/.7z/.cb7/.lzh/.lha` セグメントも
+  アーカイブバッジにする (展開済み cache のフラットパス由来)
+- 実機サンプル生成: `python scripts/make_nested_archive_test.py` (7z 系は 7-Zip、
+  rar 系は WinRAR が必要)
+
 ### 変換アーカイブ閲覧中の current_folder と「ユーザー視点パス」の二重化
 
 RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<hash>\book.zip`)、以降は

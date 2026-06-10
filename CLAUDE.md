@@ -140,8 +140,8 @@ mimageviewer/
 │   │       ├── clock.rs     # MasterClock + ClockAnchor (純粋値オブジェクト)
 │   │       └── audio_bookkeeping.rs # 音声バッファ会計 (atomic、unit test 容易)
 │   ├── video_thumb.rs       # 動画サムネイル取得（Windows Shell API）
-│   ├── zip_loader.rs        # ZIP アーカイブ内画像列挙・読み込み（ZIP in ZIP フラット展開、画像判定は is_recognized_image_ext 経由）
-│   ├── archive_converter.rs # 7z/LZH → 無圧縮 ZIP 変換（sevenz-rust2 / delharc）（v0.7.0）
+│   ├── zip_loader.rs        # ZIP アーカイブ内画像列挙・読み込み（ZIP in ZIP 再帰列挙 + 非 ZIP アーカイブ検出フラグ、画像判定は is_recognized_image_ext 経由）
+│   ├── archive_converter.rs # RAR/7z/LZH/(入れ子入り)ZIP → 無圧縮 ZIP 変換（unrar / sevenz-rust2 / delharc、入れ子アーカイブは再帰展開、v1.3.0）
 │   ├── archive_cache.rs     # 変換済み ZIP のマッピング DB（SQLite）（v0.7.0）
 │   ├── pdf_loader.rs        # PDF ページ列挙・レンダリング（PDFium）
 │   ├── pdf_passwords.rs     # PDF パスワード DPAPI 暗号化保存

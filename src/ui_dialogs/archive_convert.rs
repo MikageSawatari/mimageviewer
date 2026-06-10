@@ -331,13 +331,22 @@ impl App {
         let mut cancel_convert = false;
         let mut apply_password = false;
 
+        // ZIP (入れ子アーカイブ展開、v1.3.0) は「ZIP を ZIP に変換」だと意味が通らない
+        // ので展開系の文言にする。
+        let is_zip_expand = state.format == ArchiveFormat::Zip;
         let title = match &state.phase {
             ArchiveConvertPhase::Scanning => format!("{fmt_label} を読み込み中..."),
             ArchiveConvertPhase::PasswordRequired { .. } => {
                 format!("{fmt_label} パスワード入力")
             }
+            ArchiveConvertPhase::Confirm { .. } if is_zip_expand => {
+                "ZIP 内のアーカイブを展開".to_string()
+            }
             ArchiveConvertPhase::Confirm { .. } => {
                 format!("{fmt_label} を ZIP に変換")
+            }
+            ArchiveConvertPhase::Converting { .. } if is_zip_expand => {
+                "ZIP 内のアーカイブを展開中".to_string()
             }
             ArchiveConvertPhase::Converting { .. } => {
                 format!("{fmt_label} を ZIP に変換中")
@@ -424,9 +433,20 @@ impl App {
                         });
                     }
                     ArchiveConvertPhase::Confirm { summary } => {
-                        ui.label(format!(
-                            "{fmt_label} を ZIP に変換して閲覧できるようにします。"
-                        ));
+                        if is_zip_expand {
+                            ui.label(
+                                "この ZIP には RAR / 7z / LZH などのアーカイブが\
+                                 入れ子になっています。",
+                            );
+                            ui.label(
+                                "中身の画像も表示できるように、入れ子を展開した\
+                                 閲覧用キャッシュを作成します。",
+                            );
+                        } else {
+                            ui.label(format!(
+                                "{fmt_label} を ZIP に変換して閲覧できるようにします。"
+                            ));
+                        }
                         ui.label(
                             "元ファイルはそのまま残り、変換したファイルが\
                              キャッシュとして作成されます。",
@@ -449,24 +469,32 @@ impl App {
                                 .size(12.0)
                                 .color(egui::Color32::from_gray(160)),
                         );
+                        let mut info = format!(
+                            "画像ファイル数: {} / 変換後 ZIP の目安: 約 {}",
+                            summary.image_count,
+                            crate::ui_helpers::format_bytes(summary.total_uncompressed_bytes)
+                        );
+                        if summary.nested_archive_count > 0 {
+                            info.push_str(&format!(
+                                " / 入れ子アーカイブ: {} 個 (変換時に展開され、画像数が増えます)",
+                                summary.nested_archive_count
+                            ));
+                        }
                         ui.label(
-                            egui::RichText::new(format!(
-                                "画像ファイル数: {} / 変換後 ZIP の目安: 約 {}",
-                                summary.image_count,
-                                crate::ui_helpers::format_bytes(summary.total_uncompressed_bytes)
-                            ))
-                            .size(12.0)
-                            .color(egui::Color32::from_gray(160)),
+                            egui::RichText::new(info)
+                                .size(12.0)
+                                .color(egui::Color32::from_gray(160)),
                         );
                         ui.add_space(10.0);
                         ui.checkbox(&mut state.suppress_confirm_next_time, "次回から表示しない");
                         ui.add_space(6.0);
+                        // 直下画像が 0 でも入れ子アーカイブがあれば変換する価値がある
+                        // (中身の画像は変換時に展開されて初めて数えられる)。
+                        let convertible =
+                            summary.image_count > 0 || summary.nested_archive_count > 0;
                         ui.horizontal(|ui| {
                             if ui
-                                .add_enabled(
-                                    summary.image_count > 0,
-                                    egui::Button::new("変換して開く"),
-                                )
+                                .add_enabled(convertible, egui::Button::new("変換して開く"))
                                 .clicked()
                             {
                                 start_convert = true;
@@ -475,7 +503,7 @@ impl App {
                                 should_close = true;
                             }
                         });
-                        if summary.image_count == 0 {
+                        if !convertible {
                             ui.add_space(4.0);
                             ui.label(
                                 egui::RichText::new(
@@ -573,7 +601,8 @@ impl App {
         while let Ok(msg) = state.rx.try_recv() {
             match msg {
                 ArchiveConvertMsg::ScanDone(Ok(summary)) => {
-                    if summary.image_count == 0 {
+                    // 直下画像 0 でも入れ子アーカイブがあれば変換対象 (展開で画像が出る)。
+                    if summary.image_count == 0 && summary.nested_archive_count == 0 {
                         state.phase = ArchiveConvertPhase::Error {
                             message: "このアーカイブには画像ファイルが含まれていません。"
                                 .to_string(),
