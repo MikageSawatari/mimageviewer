@@ -22356,7 +22356,8 @@ impl App {
             {
                 continue;
             }
-            self.maybe_start_final_ai(idx, key, edit_pixels, params);
+            // prefetch 経路は戻り値不要 (composite を作らないので complete 判定がない)。
+            let _ = self.maybe_start_final_ai(idx, key, edit_pixels, params);
         }
     }
 
@@ -24085,18 +24086,25 @@ impl App {
         params.denoise_model_kind()
     }
 
+    /// 戻り値: この key の AI 結果がいずれ届く見込みがあるか。
+    /// - `true` = job を enqueue した / 既に cache・pending にある / 同 idx の別 job
+    ///   完了後に再試行される — 呼び出し側は暫定合成 (complete=false) にする
+    /// - `false` = 実行できない (failed 確定・runtime 初期化失敗・モデル不在・
+    ///   自動判別でモデルなし等) — 暫定合成を complete=false で置くと早期 return が
+    ///   それを返し続け、コピー / 書き出しが永久に待つので、呼び出し側は
+    ///   complete=true にすること (Codex P2 第 2 ラウンド 2026-06-10)
     fn maybe_start_final_ai(
         &mut self,
         idx: usize,
         key: FinalAiKey,
         source_image: Arc<egui::ColorImage>,
         params: crate::adjustment::AdjustParams,
-    ) {
-        if self.final_ai_cache.contains_key(&key)
-            || self.final_ai_pending.contains_key(&key)
-            || self.final_ai_failed.contains(&key)
-        {
-            return;
+    ) -> bool {
+        if self.final_ai_cache.contains_key(&key) || self.final_ai_pending.contains_key(&key) {
+            return true;
+        }
+        if self.final_ai_failed.contains(&key) {
+            return false;
         }
 
         if self.fullscreen_idx == Some(idx) {
@@ -24126,10 +24134,12 @@ impl App {
         // (= prefetch) の pending が走っていても自分は spawn する (= display 優先)。
         // ai_runtime は内部で worker 並列を捌けるので、display + prefetch 1 件ずつ
         // 並走しても VRAM 競合は問題にならない (旧 ai_upscale_cache 経路でも同様)。
+        // true: 別 job の Ready が同 edit_key の未完了 composite を破棄するので、
+        // その再合成で自分が再試行される。
         if self.final_ai_pending.iter().any(|(pending_key, pending)| {
             pending_key.edit_key.idx == idx && !pending.cancel.load(Ordering::Relaxed)
         }) {
-            return;
+            return true;
         }
 
         let [w, h] = source_image.size;
@@ -24150,23 +24160,23 @@ impl App {
                 self.settings.ai_denoise_limit(),
             );
         if !upscale_in_range && !denoise_in_range {
-            return;
+            return false;
         }
 
         self.ensure_ai_runtime();
         let Some(runtime) = self.ai_runtime.clone() else {
-            return;
+            return false;
         };
         self.maybe_start_trt_worker_pool_for_ai_use(&runtime);
         let manager = self.ai_model_manager.clone();
 
         let denoise_model = if denoise_in_range {
             let Some(kind) = denoise_request else {
-                return;
+                return false;
             };
             // モデルパス存在のみ確認。実ロード (sessions Mutex) は worker に委ねる。
             if manager.model_path(kind).is_none() {
-                return;
+                return false;
             }
             Some(kind)
         } else {
@@ -24175,7 +24185,7 @@ impl App {
 
         let upscale_model = if upscale_in_range {
             let Some(upscale_request) = upscale_request else {
-                return;
+                return false;
             };
             let kind = match upscale_request {
                 Some(kind) => kind,
@@ -24192,7 +24202,7 @@ impl App {
                         });
                     let Some(kind) = self.settings.ai_feature_mode.auto_upscale_model(category)
                     else {
-                        return;
+                        return false;
                     };
                     kind
                 }
@@ -24213,7 +24223,7 @@ impl App {
 
         if denoise_model.is_none() && upscale_model.is_none() {
             self.final_ai_failed.insert(key);
-            return;
+            return false;
         }
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -24249,6 +24259,7 @@ impl App {
             "[AI] Final AI queued idx={idx} bg={} denoise={:?} upscale={:?} priority={:?}",
             key.bg, denoise_model, upscale_model, priority
         ));
+        true
     }
 
     fn apply_final_post_filter(
@@ -24314,8 +24325,14 @@ impl App {
                 (Arc::clone(&adjusted), true, false)
             }
             (Some(key), None) => {
-                self.maybe_start_final_ai(idx, key, Arc::clone(&adjusted), params.clone());
-                (Arc::clone(&adjusted), false, false)
+                // 起動できなかった (= 結果が届く見込みがない) 場合はこの合成を
+                // complete 扱いにする。complete=false のまま置くと早期 return が
+                // 暫定 entry を返し続け、コピー / 書き出しが永久に待つ
+                // (Codex P2 第 2 ラウンド: 同フレーム内の failed 直接 insert や、
+                // runtime 初期化失敗 / モデル不在で何も立てずに return する経路)。
+                let ai_will_arrive =
+                    self.maybe_start_final_ai(idx, key, Arc::clone(&adjusted), params.clone());
+                (Arc::clone(&adjusted), !ai_will_arrive, false)
             }
             (None, _) => (Arc::clone(&adjusted), true, false),
         };

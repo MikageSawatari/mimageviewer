@@ -8818,28 +8818,32 @@ mod pipeline_cache_refactor_tests {
             },
         );
 
-        // アップスケール要求あり → AI 未完了の暫定 composite (complete=false) ができる。
-        // (テスト環境はモデル未展開なので maybe_start_final_ai が直接 failed を
-        // 立てることもあるが、立てない環境でも下の手動 insert で同じ状態にする)
         let mut params = crate::adjustment::AdjustParams::default();
         params.upscale_model = Some("realesr_general_v3".to_string());
         app.adjustment_page_params.insert(idx, params.clone());
         let _ = app
             .ensure_final_composite_texture(&ctx, idx)
-            .expect("provisional composite");
+            .expect("first composite");
 
-        // AI 失敗を確定させる (poll 経由 / モデル不在直接 insert の両経路を代表)
+        // 「AI ジョブ実行中に作られた暫定 entry + その後 poll で失敗確定」の状態を
+        // 決定論的に再現する (テスト環境では AI が起動できず最初から complete に
+        // なることがあるため、incomplete を明示的に作る)。
         let ai_key = FinalAiKey {
             edit_key,
             color_ai_hash: hash_adjust_color_ai_params(&params, app.settings.ai_feature_mode),
             bg: 0,
         };
-        app.final_ai_failed.insert(ai_key);
+        for (key, entry) in app.final_composite_cache.iter_mut() {
+            if key.edit_key.idx == idx {
+                entry.complete = false;
+            }
+        }
         if let Some(pending) = app.final_ai_pending.remove(&ai_key) {
             pending
                 .cancel
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        app.final_ai_failed.insert(ai_key);
 
         // 再度 ensure すると failed 分岐で complete=true に昇格し、
         // コピー / 書き出し経路 (complete のみ受け付ける) も復帰する
@@ -8860,6 +8864,61 @@ mod pipeline_cache_refactor_tests {
             app.ensure_final_composite_pixels_with_key(&ctx, idx)
                 .is_some(),
             "copy/export path must recover after AI failure"
+        );
+    }
+
+    /// Codex P2 第 2 ラウンド: 最初の ensure 呼び出しの**中**で AI が起動できない
+    /// (同フレームで failed 直接 insert / runtime 初期化失敗・モデル不在で何も
+    /// 立てずに return) 場合も、stuck な incomplete entry を残さないこと。
+    /// 不変条件: incomplete entry が存在してよいのは「AI 結果がまだ届きうる
+    /// (pending or cache 済み)」ときだけ。
+    #[test]
+    fn ensure_final_composite_never_leaves_stuck_incomplete_entry() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+        let idx = push_image(&mut app, "C:/pics/ai-no-start.jpg");
+
+        let edit_image = egui::ColorImage::new([2, 1], vec![egui::Color32::GRAY; 2]);
+        let edit_key = dummy_edit_key(&app, idx);
+        let edit_tex = ctx.load_texture(
+            "ai_no_start_edit",
+            edit_image.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.edit_result_cache.insert(
+            edit_key,
+            EditResultEntry {
+                pixels: Arc::new(edit_image),
+                texture: Some(edit_tex),
+            },
+        );
+
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.upscale_model = Some("realesr_general_v3".to_string());
+        app.adjustment_page_params.insert(idx, params.clone());
+        let _ = app
+            .ensure_final_composite_texture(&ctx, idx)
+            .expect("composite");
+
+        let ai_key = FinalAiKey {
+            edit_key,
+            color_ai_hash: hash_adjust_color_ai_params(&params, app.settings.ai_feature_mode),
+            bg: 0,
+        };
+        let complete = app
+            .final_composite_cache
+            .iter()
+            .find(|(key, _)| key.edit_key.idx == idx)
+            .map(|(_, entry)| entry.complete)
+            .expect("final composite must exist");
+        let ai_may_still_arrive =
+            app.final_ai_pending.contains_key(&ai_key) || app.final_ai_cache.contains_key(&ai_key);
+        assert!(
+            complete || ai_may_still_arrive,
+            "an incomplete composite may exist only while an AI result can still arrive \
+             (failed={})",
+            app.final_ai_failed.contains(&ai_key)
         );
     }
 

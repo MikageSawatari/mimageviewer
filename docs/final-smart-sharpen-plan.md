@@ -102,6 +102,12 @@
   halo_suppression 0.78
 ```
 
+> **実装時の変更 (2026-06-10)**: 上記 30/60/100 のプリセット値は 25/50/75 に
+> そのまま再配置し、100 = amount 2.0 / radius 3.0 (計算式の clamp 上限) まで
+> 拡張した (最大 100 が控えめでレンジ上端に張り付いたため、ユーザー判断)。
+> 実装済みアンカーの正本は `adjustment.rs::SMART_SHARPEN_ANCHORS` と
+> [preset-and-adjustment.md §2.6](preset-and-adjustment.md)。
+
 スライダー値は保存互換を考えて `u8` または `f32` で `AdjustParams` に持つ。
 UI 表示が 0..100 なので、内部も `u8` のほうが差分が小さい。
 
