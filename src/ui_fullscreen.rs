@@ -757,6 +757,39 @@ fn apply_continuous_separator_unit_sizes(
     }
 }
 
+fn rotated_display_size(size: egui::Vec2, rotation: crate::rotation_db::Rotation) -> egui::Vec2 {
+    match rotation {
+        crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
+            egui::vec2(size.y, size.x)
+        }
+        _ => size,
+    }
+}
+
+fn valid_layout_size_or_fallback(size: egui::Vec2, fallback: egui::Vec2) -> egui::Vec2 {
+    if size.x > 0.0 && size.y > 0.0 {
+        size
+    } else {
+        egui::vec2(fallback.x.max(1.0), fallback.y.max(1.0))
+    }
+}
+
+fn choose_layout_base_size(
+    processed: Option<egui::Vec2>,
+    raw: Option<egui::Vec2>,
+    fallback: egui::Vec2,
+    rotation: crate::rotation_db::Rotation,
+    prefer_processed: bool,
+) -> egui::Vec2 {
+    let selected = if prefer_processed {
+        processed.or(raw)
+    } else {
+        raw.or(processed)
+    }
+    .unwrap_or(fallback);
+    valid_layout_size_or_fallback(rotated_display_size(selected, rotation), fallback)
+}
+
 /// 透過背景の描画スタイル。B キーで 3 モードを循環する。
 ///
 /// フルスクリーンのビューポート背景は `ui_fullscreen.rs` で `Color32::BLACK` に
@@ -7492,7 +7525,18 @@ impl App {
         Some((units, pos))
     }
 
-    fn vertical_reading_base_size(&mut self, idx: usize, fallback: egui::Vec2) -> egui::Vec2 {
+    fn current_processed_layout_size(&self, idx: usize) -> Option<egui::Vec2> {
+        self.current_comic_composite_texture(idx)
+            .or_else(|| self.current_final_composite_texture(idx))
+            .map(|tex| tex.size_vec2())
+    }
+
+    fn vertical_reading_base_size(
+        &mut self,
+        idx: usize,
+        fallback: egui::Vec2,
+        prefer_processed: bool,
+    ) -> egui::Vec2 {
         let rotation = self.get_rotation(idx);
         let raw = match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static {
@@ -7520,20 +7564,9 @@ impl App {
                 .map(|(w, h)| egui::vec2(w as f32, h as f32))
                 .or_else(|| Some(tex.size_vec2())),
             _ => None,
-        })
-        .unwrap_or(fallback);
-
-        let size = match rotation {
-            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-                egui::vec2(raw.y, raw.x)
-            }
-            _ => raw,
-        };
-        if size.x > 0.0 && size.y > 0.0 {
-            size
-        } else {
-            egui::vec2(fallback.x.max(1.0), fallback.y.max(1.0))
-        }
+        });
+        let processed = self.current_processed_layout_size(idx);
+        choose_layout_base_size(processed, raw, fallback, rotation, prefer_processed)
     }
 
     fn continuous_unit_base_size(
@@ -7541,6 +7574,7 @@ impl App {
         unit: &ContinuousReadingUnitSpec,
         flow: crate::settings::ReadingFlow,
         fallback: egui::Vec2,
+        prefer_processed: bool,
     ) -> ContinuousReadingUnitSize {
         if unit.separator_text.is_some() {
             let size = continuous_separator_base_size(flow, fallback);
@@ -7557,7 +7591,7 @@ impl App {
             .iter()
             .copied()
             .map(|idx| {
-                let base = self.vertical_reading_base_size(idx, fallback);
+                let base = self.vertical_reading_base_size(idx, fallback, prefer_processed);
                 ContinuousReadingPageSize {
                     idx,
                     width: base.x.max(1.0),
@@ -7605,8 +7639,9 @@ impl App {
         image_rect: egui::Rect,
         zoom: f32,
         fallback: egui::Vec2,
+        prefer_processed: bool,
     ) -> ContinuousReadingUnitSize {
-        let mut base = self.continuous_unit_base_size(unit, flow, fallback);
+        let mut base = self.continuous_unit_base_size(unit, flow, fallback, prefer_processed);
         let fit_mode = self.effective_fullscreen_fit_mode();
         let spread_gap = self.settings.spread_page_gap_px.min(200) as f32;
         let page_gap = if base.pages.len() > 1 {
@@ -7695,6 +7730,7 @@ impl App {
         image_rect: egui::Rect,
         units: &[ContinuousReadingUnitSpec],
         current_pos: usize,
+        prefer_processed: bool,
     ) -> Option<(
         Vec<VerticalReadingPage>,
         Vec<VerticalReadingSeparator>,
@@ -7719,9 +7755,14 @@ impl App {
         for _ in 0..8 {
             sizes.clear();
             for unit in units {
-                sizes.push(
-                    self.continuous_unit_size_for_flow(unit, flow, image_rect, zoom, fallback),
-                );
+                sizes.push(self.continuous_unit_size_for_flow(
+                    unit,
+                    flow,
+                    image_rect,
+                    zoom,
+                    fallback,
+                    prefer_processed,
+                ));
             }
             apply_continuous_separator_unit_sizes(units, &mut sizes);
             let extents = sizes
@@ -8069,9 +8110,14 @@ impl App {
             self.fs_spread_layout = None;
             return;
         };
-        let Some((pages, separators, visible_positions, offsets)) =
-            self.continuous_reading_layout(ctx, image_rect, &units, current_pos)
-        else {
+        let prefer_processed_layout = !original_preview_active && !self.analysis_mode;
+        let Some((pages, separators, visible_positions, offsets)) = self.continuous_reading_layout(
+            ctx,
+            image_rect,
+            &units,
+            current_pos,
+            prefer_processed_layout,
+        ) else {
             self.fs_spread_layout = None;
             return;
         };
@@ -9853,6 +9899,10 @@ impl App {
         // `draw_centered_elided_label` が描画をスキップするので無駄な String 化を避ける。
         let left_location = self.location_display_for_loading(left_idx);
         let right_location = self.location_display_for_loading(right_idx);
+        let left_display_tex =
+            self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active);
+        let right_display_tex =
+            self.resolve_fs_processed_texture(ctx, right_idx, original_preview_active);
         // 透過背景スタイル (bg_style はテクスチャ借用を含むため左右描画の前後で寿命に注意)
         // fs_bg_style は &mut self を要求するため先に解決してから以降は shared borrow に切り替える。
         // 透過画像が見開きの片方だけの場合もあるので両ページに同じ bg を適用する。
@@ -9869,19 +9919,25 @@ impl App {
         // 両方フルサイズが揃うまではサムネイルサイズに統一する
         let both_in_fs_cache =
             self.fs_cache.contains_key(&left_idx) && self.fs_cache.contains_key(&right_idx);
-        let (left_size, right_size) = if both_in_fs_cache {
-            (
-                Self::get_display_size(left_idx, left_rot, &self.fs_cache, &self.thumbnails),
-                Self::get_display_size(right_idx, right_rot, &self.fs_cache, &self.thumbnails),
-            )
-        } else {
-            // サムネイルのみ使用（fs_cache を空マップとして渡す）
-            let empty = std::collections::HashMap::new();
-            (
-                Self::get_display_size(left_idx, left_rot, &empty, &self.thumbnails),
-                Self::get_display_size(right_idx, right_rot, &empty, &self.thumbnails),
-            )
-        };
+        let (left_size, right_size) =
+            if let (Some(left_tex), Some(right_tex)) = (&left_display_tex, &right_display_tex) {
+                (
+                    Some(rotated_display_size(left_tex.size_vec2(), left_rot)),
+                    Some(rotated_display_size(right_tex.size_vec2(), right_rot)),
+                )
+            } else if both_in_fs_cache {
+                (
+                    Self::get_display_size(left_idx, left_rot, &self.fs_cache, &self.thumbnails),
+                    Self::get_display_size(right_idx, right_rot, &self.fs_cache, &self.thumbnails),
+                )
+            } else {
+                // サムネイルのみ使用（fs_cache を空マップとして渡す）
+                let empty = std::collections::HashMap::new();
+                (
+                    Self::get_display_size(left_idx, left_rot, &empty, &self.thumbnails),
+                    Self::get_display_size(right_idx, right_rot, &empty, &self.thumbnails),
+                )
+            };
 
         // ズーム/パンが有効な場合は image_rect でクリップする
         // (ズーム時にページが image_rect 外へはみ出して他の UI を覆わないようにするため)
@@ -9975,10 +10031,6 @@ impl App {
             } else {
                 None
             };
-            let left_display_tex =
-                self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active);
-            let right_display_tex =
-                self.resolve_fs_processed_texture(ctx, right_idx, original_preview_active);
             for (rect, idx, rot, location, display_tex) in [
                 (
                     left_rect,
@@ -10032,10 +10084,6 @@ impl App {
             } else {
                 None
             };
-            let left_display_tex =
-                self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active);
-            let right_display_tex =
-                self.resolve_fs_processed_texture(ctx, right_idx, original_preview_active);
             for (rect, idx, rot, location, display_tex) in [
                 (
                     left_rect,
@@ -13857,6 +13905,51 @@ mod tests {
         assert!((rect.height() - 200.0).abs() < 0.5);
         assert!(rect.width() > full.width());
         assert!(rect.height() > full.height());
+    }
+
+    #[test]
+    fn layout_base_size_prefers_processed_when_requested() {
+        let raw = Some(egui::vec2(100.0, 50.0));
+        let processed = Some(egui::vec2(400.0, 200.0));
+        let fallback = egui::vec2(10.0, 10.0);
+
+        assert_eq!(
+            choose_layout_base_size(
+                processed,
+                raw,
+                fallback,
+                crate::rotation_db::Rotation::None,
+                true,
+            ),
+            egui::vec2(400.0, 200.0)
+        );
+        assert_eq!(
+            choose_layout_base_size(
+                processed,
+                raw,
+                fallback,
+                crate::rotation_db::Rotation::None,
+                false,
+            ),
+            egui::vec2(100.0, 50.0)
+        );
+    }
+
+    #[test]
+    fn layout_base_size_rotates_after_selecting_processed_size() {
+        let processed = Some(egui::vec2(400.0, 200.0));
+        let fallback = egui::vec2(10.0, 10.0);
+
+        assert_eq!(
+            choose_layout_base_size(
+                processed,
+                None,
+                fallback,
+                crate::rotation_db::Rotation::Cw90,
+                true,
+            ),
+            egui::vec2(200.0, 400.0)
+        );
     }
 
     #[test]
