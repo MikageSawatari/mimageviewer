@@ -42,6 +42,7 @@ v1.3.0 のリリースレビュー (Claude マルチエージェント + Codex) 
 | 毎フレーム `GetDriveTypeW`×最大26 | `folder_pane.rs` `refresh_drives` → `known_folders::available_drives` | ペイン表示中、`sync_to_active` から毎フレーム全ドライブ種別を列挙 + Vec alloc。通常はキャッシュ済みマウント情報で軽いが冗長。`last_drive_refresh` で 1〜2 秒 throttle、または明示トリガ (↻ / combo open) のみに | P3 (perf) |
 | scan worker の perf 計装 + thread 構成 | `folder_pane.rs` `ensure_scan` / `scan_real_subfolders` | (1) `scan_real_subfolders` に `perf::event` を入れて低速共有でのスキャン悪化を `analyze_perf.py` で検知できるように (docs/ui-responsiveness.md §4)。(2) ノードごとに `thread::spawn` しているのを dispatcher/pool 方式に寄せるか検討 (現状は短命・cancel 付きで thread leak なし) | P3 (style/perf) |
 | reparse-point / junction の再帰ガード | `folder_pane.rs` `scan_real_subfolders` / `push_visible_rows` の `seen` | `file_type().is_dir()` が junction も通し、render の `seen` は**正規化パス文字列**なので、異なる字句パスで到達するジャンクションループを手動展開で無限に降りられる (自動爆発はしない)。reparse-point を skip、または canonical / file-id 追跡 + 深さ上限 | P3 (robustness, Codex) |
+| フォルダペイン open scan の優先順位整理 | `app.rs` `poll_folder_pane_open` / `start_folder_pane_open` | worker 完了時に nav 優先順位判定の前で即 `load_folder_with_scan` へ流れるため、保留中クリックと同フレームの検索開始 / 別ナビが競合すると古いクリック先が一瞬または副作用込みで適用される余地がある。folder_pane open を通常の nav と同じ優先順位で裁定するか、高優先操作・検索開始時に `cancel_folder_pane_open` する | P3 (UX/priority) |
 
 ### 1.4 起動 / 単一インスタンス / Explorer 連携
 
@@ -49,6 +50,7 @@ v1.3.0 のリリースレビュー (Claude マルチエージェント + Codex) 
 | --- | --- | --- | --- |
 | 名前付きパイプにセキュリティ記述子なし | `single_instance.rs` `CreateNamedPipeW` (lpSecurityAttributes=None) | 既定 ACL なので同一マシンのローカルプロセスが「このパスを開け」を送れる (デコードは bounds-checked でメモリ安全)。単一ユーザーのデスクトップビューアでは低影響だが、ユーザー SID 限定の DACL + `PIPE_REJECT_REMOTE_CLIENTS` で攻撃面を縮小。受信パスの妥当性検証も検討 | P3 (security, 要判断) |
 | `open_startup_path` の UI スレッド FS stat | `app.rs` `open_startup_path` → `folder_tree::resolve_openable_path` | 転送パス activate 経路 (稼働中 UI) で `is_file`/`is_dir` + 親探索が走る。遅い/切断ネットワークパスで stall。worker 化 or 最低限 perf 計装 | P3 (perf) |
+| `--version` / `-V` CLI フラグ未実装 | `main.rs` `main()` 冒頭 (`--pdf-worker` 等の特殊モード判定と同じ場所) | GUI アプリのため未知の引数は無視されて通常起動する。`mimageviewer-core.exe --version` がウィンドウを開いてしまい、CLI からバージョン確認できない (リリース時の版確認は版リソース `(Get-Item).VersionInfo.FileVersion` で代替できるが不便)。`env!("CARGO_PKG_VERSION")` を print して GUI を開かず即 exit する `--version`/`-V` (ついでに `--help`) を追加する。launcher 側にも同フラグを通す | P3 (devex) |
 
 ### 1.5 補正 / AI
 
@@ -57,7 +59,13 @@ v1.3.0 のリリースレビュー (Claude マルチエージェント + Codex) 
 | capture 再補正経路の sharpen | `capture.rs` `run_pixel_job` の re-adjust 分岐 | `effective_smart_sharpen` を経由せず raw `smart_sharpen` を適用。**本番呼出元なし (テスト専用) で latent**。AI アップスケール済みソースに繋ぐなら `output_is_ai_upscaled` を渡すか、テスト専用である旨のコメント | P3 (latent) |
 | lazy-load layers の入場時同期 DB 読み | `app.rs` `ensure_local_adjust_layers_loaded` | フルスクリーン入場の初回フレームで `LocalAdjustDb::get_layers` を UI スレッド同期実行 (= 意図的な tradeoff、フォルダ open 一括 ~2.5s を回避)。数十 MB の単一ページで一過性 hitch の可能性。実測で問題が出たら worker 化 (read-only 経路は既に not-loaded を None 返ししている) | P3 (monitor) |
 
-### 1.6 デッドコード / クリーンアップ
+### 1.6 ドキュメント / マニュアル整合
+
+| 項目 | 場所 | 内容 / 対応方針 | 優先 |
+| --- | --- | --- | --- |
+| ゲームパッド Select の説明ずれ | `docs/keymap-spec.md` / `docs/spec.md` / `htdocs/mimageviewer/manual/gamepad.html` | 実装 (`SpreadMode::next_in_spread_cycle`、単ページ→見開き4種→単ページ巡回) を正とし、3 ドキュメントを見開きモード巡回の説明へ同期。HTML マニュアル末尾の「縦読み」も除去 | 対応済 (v1.3.0) |
+
+### 1.7 デッドコード / クリーンアップ
 
 | 項目 | 場所 | 内容 |
 | --- | --- | --- |
