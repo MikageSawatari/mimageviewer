@@ -165,6 +165,122 @@ pub(super) fn page_startup_folder(ui: &mut egui::Ui, state: &mut PreferencesStat
     );
 }
 
+pub(super) fn page_explorer_integration(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    refresh_send_to_status_if_needed(state);
+
+    ui.label(
+        "Windows の「送る」メニューに mImageViewer を追加します。\n\
+         エクスプローラでファイルやフォルダを右クリック → 送る → mImageViewer から開けます。",
+    );
+    ui.add_space(10.0);
+
+    ui.label(egui::RichText::new("SendTo").strong());
+    ui.add_space(4.0);
+
+    match &state.send_to_status {
+        Some(Ok(status)) => {
+            if status.registered && status.target_matches {
+                ui.colored_label(egui::Color32::from_rgb(120, 200, 120), "登録済みです。");
+            } else if status.registered {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 190, 90),
+                    "登録済みですが、現在の mImageViewer とは別の実行ファイルを指しています。",
+                );
+            } else {
+                ui.label("未登録です。");
+            }
+
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "ショートカット: {}",
+                    status.shortcut_path.display()
+                ))
+                .monospace()
+                .weak(),
+            );
+            ui.label(
+                egui::RichText::new(format!("登録先: {}", status.expected_target.display()))
+                    .monospace()
+                    .weak(),
+            );
+            if let Some(target) = &status.target
+                && !status.target_matches
+            {
+                ui.label(
+                    egui::RichText::new(format!("現在のリンク先: {}", target.display()))
+                        .monospace()
+                        .weak(),
+                );
+            }
+        }
+        Some(Err(err)) => {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 120, 120),
+                format!("状態を確認できませんでした: {err}"),
+            );
+        }
+        None => {}
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("SendTo に登録").clicked() {
+            state.send_to_status = Some(crate::explorer_integration::register_send_to_shortcut());
+            state.send_to_action_message = Some(match &state.send_to_status {
+                Some(Ok(_)) => "SendTo に登録しました。".to_string(),
+                Some(Err(err)) => format!("登録に失敗しました: {err}"),
+                None => String::new(),
+            });
+        }
+        if ui.button("SendTo から削除").clicked() {
+            state.send_to_status = Some(crate::explorer_integration::unregister_send_to_shortcut());
+            state.send_to_action_message = Some(match &state.send_to_status {
+                Some(Ok(_)) => "SendTo から削除しました。".to_string(),
+                Some(Err(err)) => format!("削除に失敗しました: {err}"),
+                None => String::new(),
+            });
+        }
+        if ui.button("SendTo フォルダを開く").clicked()
+            && let Some(Ok(status)) = &state.send_to_status
+        {
+            open_in_explorer(&status.send_to_dir);
+        }
+        if ui.button("状態を更新").clicked() {
+            refresh_send_to_status(state);
+        }
+    });
+
+    if let Some(msg) = &state.send_to_action_message {
+        ui.add_space(6.0);
+        let color = if msg.contains("失敗") {
+            egui::Color32::from_rgb(230, 120, 120)
+        } else {
+            egui::Color32::from_rgb(120, 200, 120)
+        };
+        ui.colored_label(color, msg);
+    }
+
+    ui.add_space(10.0);
+    ui.label(
+        egui::RichText::new(
+            "SendTo には現在起動している mImageViewer の実行ファイルを登録します。\n\
+             インストーラ版では launcher、ポータブル版や開発実行では現在の exe を使います。",
+        )
+        .weak(),
+    );
+}
+
+fn refresh_send_to_status_if_needed(state: &mut PreferencesState) {
+    if state.send_to_status.is_none() {
+        refresh_send_to_status(state);
+    }
+}
+
+fn refresh_send_to_status(state: &mut PreferencesState) {
+    state.send_to_status = Some(crate::explorer_integration::send_to_shortcut_status());
+}
+
 pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.checkbox(
         &mut state.settings.thumb_idle_upgrade,
@@ -189,6 +305,10 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     // Phase 6.E 以降、フォルダ移動系はアドレス欄と同じ行の「フォルダバー」に集約。
     ui.label(egui::RichText::new("フォルダバー").strong());
+    ui.checkbox(
+        &mut s.folder_tree_pane_visible,
+        "フォルダツリーペインを表示",
+    );
     ui.checkbox(&mut s.show_toolbar_folder, "フォルダ入力欄を表示");
     ui.add_enabled(
         s.show_toolbar_folder,
@@ -2428,6 +2548,11 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 ui.selectable_value(&mut s.fullscreen_fit_mode, mode, mode.label());
             }
         });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut s.fullscreen_fit_no_upscale, "拡大しない");
+        ui.checkbox(&mut s.fullscreen_fit_no_downscale, "縮小しない");
+    });
+    ui.small("自動フィット時の倍率制限。ホイールなどの手動ズームは制限しません。");
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label("見開きのページ間隔");

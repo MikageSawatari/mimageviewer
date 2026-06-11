@@ -4,26 +4,41 @@
 //! 対応フォーマット:
 //! - A1111 / Forge: key=`parameters` (平文テキスト)
 //! - ComfyUI: key=`prompt` (JSON) + key=`workflow` (JSON, optional)
+//! - NovelAI: key=`Description` + key=`Comment` (JSON)
+//! - InvokeAI / SwarmUI / Fooocus 系: JSON 形式の PNG tEXt / EXIF UserComment
 //! - Midjourney: key=`Description` (平文テキスト)
 
 use std::io::Read;
 use std::path::Path;
 
-/// Negative Prompt を含みうる AI 生成メタデータの tEXt キー。
-/// `build_searchable_from_chunks` の Unknown フォールバックで素の値を
-/// 取り込まないよう除外するためのリスト。`detect_and_parse` に新しい AI
-/// フォーマットの分岐を追加したら、その起点キーをここにも足さないと
-/// 「未検出時に Negative prompt を含んだ生文字列ごと検索対象に入ってしまう」
-/// 不具合になる。
-const AI_METADATA_KEYS: &[&str] = &["parameters", "prompt", "workflow", "Description"];
-
 // ---------------------------------------------------------------------------
 // データ構造
 // ---------------------------------------------------------------------------
 
-/// A1111 / Forge / Midjourney 形式のメタデータ
+/// 正/負プロンプトと生成パラメータに正規化できる AI 生成メタデータの出自。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AiToolKind {
+    A1111,
+    NovelAI,
+    InvokeAI,
+    SwarmUI,
+    Fooocus,
+    Midjourney,
+    /// EXIF UserComment に保存された A1111 互換テキスト。
+    JpegExif,
+}
+
+/// メタデータの格納元。検索時に EXIF UserComment の二重取り込みを避けるために使う。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataOrigin {
+    PngText,
+    ExifUserComment,
+}
+
+/// A1111 / Forge / Midjourney 形式、および他ツールを正規化したメタデータ
 #[derive(Clone, Debug)]
 pub struct A1111Metadata {
+    pub tool: AiToolKind,
     pub prompt: String,
     pub negative_prompt: String,
     /// (Key, Value) ペア: Steps, Sampler, CFG scale, Seed, Model 等
@@ -52,6 +67,14 @@ pub enum AiMetadata {
     ComfyUI(ComfyUIMetadata),
     /// 未知の tEXt チャンク群（表示はできる）
     Unknown(Vec<(String, String)>),
+}
+
+#[derive(Clone, Debug)]
+struct ParseOutcome {
+    meta: AiMetadata,
+    /// このフォーマットが解釈に使ったチャンクキー。検索テキスト構築時に、
+    /// Negative を含みうる生値を非 AI チャンクとして再混入させないために使う。
+    consumed_keys: Vec<&'static str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,59 +196,151 @@ fn decompress_zlib(data: &[u8]) -> std::io::Result<String> {
 // フォーマット判別 & 高レベル API
 // ---------------------------------------------------------------------------
 
-/// ファイルパスからメタデータを抽出する（PNG のみ対応）。
+/// ファイルパスからメタデータを抽出する。
+///
+/// PNG は tEXt/iTXt/zTXt、JPEG/JFIF は EXIF UserComment を見る。
 pub fn extract_metadata(path: &Path) -> Option<AiMetadata> {
+    extract_metadata_with_origin(path).map(|(meta, _)| meta)
+}
+
+pub fn extract_metadata_with_origin(path: &Path) -> Option<(AiMetadata, MetadataOrigin)> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    if ext != "png" {
-        return None;
+    match ext.as_str() {
+        "png" => {
+            let chunks = read_png_text_chunks(path).ok()?;
+            detect_and_parse_outcome(&chunks).map(|outcome| (outcome.meta, MetadataOrigin::PngText))
+        }
+        "jpg" | "jpeg" | "jfif" => extract_exif_user_comment_metadata_from_path(path)
+            .map(|meta| (meta, MetadataOrigin::ExifUserComment)),
+        _ => None,
     }
-    let chunks = read_png_text_chunks(path).ok()?;
-    detect_and_parse(&chunks)
 }
 
-/// バイト列からメタデータを抽出する（ZIP 内 PNG 用）。
+/// バイト列からメタデータを抽出する（ZIP 内画像用）。
 pub fn extract_metadata_from_bytes(bytes: &[u8]) -> Option<AiMetadata> {
-    let chunks = read_png_text_chunks_from_bytes(bytes).ok()?;
-    detect_and_parse(&chunks)
+    extract_metadata_from_bytes_with_origin(bytes).map(|(meta, _)| meta)
 }
 
+pub fn extract_metadata_from_bytes_with_origin(
+    bytes: &[u8],
+) -> Option<(AiMetadata, MetadataOrigin)> {
+    if is_png_bytes(bytes) {
+        let chunks = read_png_text_chunks_from_bytes(bytes).ok()?;
+        return detect_and_parse_outcome(&chunks)
+            .map(|outcome| (outcome.meta, MetadataOrigin::PngText));
+    }
+    extract_exif_user_comment_metadata_from_bytes(bytes)
+        .map(|meta| (meta, MetadataOrigin::ExifUserComment))
+}
+
+fn is_png_bytes(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && &bytes[..8] == b"\x89PNG\r\n\x1a\n"
+}
+
+#[cfg(test)]
 fn detect_and_parse(chunks: &[(String, String)]) -> Option<AiMetadata> {
+    detect_and_parse_outcome(chunks).map(|outcome| outcome.meta)
+}
+
+fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome> {
     if chunks.is_empty() {
         return None;
     }
 
-    // ComfyUI: "prompt" キーの存在で判定
-    let prompt_json = chunks.iter().find(|(k, _)| k == "prompt");
-    if let Some((_, json_str)) = prompt_json {
+    // ComfyUI: "prompt" キーの JSON object
+    if let Some(json_str) = chunk_value(chunks, "prompt") {
         // ComfyUI の prompt は JSON 形式
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
             if val.is_object() {
-                let workflow = chunks
-                    .iter()
-                    .find(|(k, _)| k == "workflow")
-                    .and_then(|(_, s)| serde_json::from_str::<serde_json::Value>(s).ok());
-                return Some(AiMetadata::ComfyUI(parse_comfyui(val, workflow)));
+                let workflow = chunk_value(chunks, "workflow")
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+                return Some(ParseOutcome {
+                    meta: AiMetadata::ComfyUI(parse_comfyui(val, workflow)),
+                    consumed_keys: vec!["prompt", "workflow"],
+                });
             }
         }
     }
 
-    // A1111 / Forge: "parameters" キー
-    if let Some((_, raw)) = chunks.iter().find(|(k, _)| k == "parameters") {
-        if let Some(meta) = parse_a1111(raw) {
-            return Some(AiMetadata::A1111(meta));
+    // JSON を持つ parameters は A1111 平文として読まない。まず JSON 系へ分岐する。
+    if let Some(raw) = chunk_value(chunks, "parameters") {
+        if let Some(json) = parse_json_object(raw) {
+            let mut consumed = vec!["parameters"];
+            if chunk_value(chunks, "fooocus_scheme").is_some() {
+                consumed.push("fooocus_scheme");
+            }
+            if let Some(meta) = parse_parameters_json(raw, &json, chunks) {
+                return Some(ParseOutcome {
+                    meta: AiMetadata::A1111(meta),
+                    consumed_keys: consumed,
+                });
+            }
+            return Some(ParseOutcome {
+                meta: AiMetadata::Unknown(vec![("parameters".to_string(), raw.to_string())]),
+                consumed_keys: consumed,
+            });
+        }
+    }
+
+    // InvokeAI: 現行 JSON / 旧 JSON / 旧 Dream テキスト
+    if let Some(raw) = chunk_value(chunks, "invokeai_metadata")
+        && let Some(json) = parse_json_object(raw)
+        && let Some(meta) = parse_invokeai_json(raw, &json)
+    {
+        return Some(ParseOutcome {
+            meta: AiMetadata::A1111(meta),
+            consumed_keys: vec!["invokeai_metadata", "invokeai_workflow", "invokeai_graph"],
+        });
+    }
+    if let Some(raw) = chunk_value(chunks, "sd-metadata")
+        && let Some(json) = parse_json_object(raw)
+        && let Some(meta) = parse_invokeai_legacy_json(raw, &json)
+    {
+        return Some(ParseOutcome {
+            meta: AiMetadata::A1111(meta),
+            consumed_keys: vec!["sd-metadata", "Dream"],
+        });
+    }
+    if let Some(raw) = chunk_value(chunks, "Dream")
+        && let Some(meta) = parse_invokeai_dream(raw)
+    {
+        return Some(ParseOutcome {
+            meta: AiMetadata::A1111(meta),
+            consumed_keys: vec!["Dream", "sd-metadata"],
+        });
+    }
+
+    // NovelAI は Description と Comment を併用するため、Description 汎用分岐より前に置く。
+    if let Some(meta) = parse_novelai(chunks) {
+        return Some(ParseOutcome {
+            meta: AiMetadata::A1111(meta),
+            consumed_keys: vec!["Description", "Comment", "Software", "Source", "Title"],
+        });
+    }
+
+    // A1111 / Forge: "parameters" キー (平文)
+    if let Some(raw) = chunk_value(chunks, "parameters") {
+        if let Some(meta) = parse_a1111_as(raw, AiToolKind::A1111) {
+            return Some(ParseOutcome {
+                meta: AiMetadata::A1111(meta),
+                consumed_keys: vec!["parameters"],
+            });
         }
     }
 
     // Midjourney: "Description" キー
-    if let Some((_, raw)) = chunks.iter().find(|(k, _)| k == "Description") {
-        if let Some(meta) = parse_a1111(raw) {
-            return Some(AiMetadata::A1111(meta));
+    if let Some(raw) = chunk_value(chunks, "Description") {
+        if let Some(meta) = parse_a1111_as(raw, AiToolKind::Midjourney) {
+            return Some(ParseOutcome {
+                meta: AiMetadata::A1111(meta),
+                consumed_keys: vec!["Description"],
+            });
         }
         // Description があるが A1111 形式でない場合は Unknown として表示
-        return Some(AiMetadata::Unknown(vec![(
-            "Description".to_string(),
-            raw.clone(),
-        )]));
+        return Some(ParseOutcome {
+            meta: AiMetadata::Unknown(vec![("Description".to_string(), raw.to_string())]),
+            consumed_keys: Vec::new(),
+        });
     }
 
     // 何らかの tEXt チャンクはあるが既知フォーマットに一致しない
@@ -244,8 +359,618 @@ fn detect_and_parse(chunks: &[(String, String)]) -> Option<AiMetadata> {
     if interesting.is_empty() {
         None
     } else {
-        Some(AiMetadata::Unknown(interesting))
+        Some(ParseOutcome {
+            meta: AiMetadata::Unknown(interesting),
+            consumed_keys: Vec::new(),
+        })
     }
+}
+
+fn chunk_value<'a>(chunks: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    chunks
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+fn parse_json_object(raw: &str) -> Option<serde_json::Value> {
+    let val = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    val.is_object().then_some(val)
+}
+
+fn parse_parameters_json(
+    raw: &str,
+    json: &serde_json::Value,
+    chunks: &[(String, String)],
+) -> Option<A1111Metadata> {
+    if let Some(meta) = parse_swarmui_json(raw, json) {
+        return Some(meta);
+    }
+    if let Some(meta) = parse_ruinedfooocus_json(raw, json) {
+        return Some(meta);
+    }
+    if let Some(meta) = parse_fooocus_json(raw, json, chunks) {
+        return Some(meta);
+    }
+    None
+}
+
+fn parse_swarmui_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metadata> {
+    let params_obj = json.get("sui_image_params")?.as_object()?;
+    let prompt = json_value_to_text(params_obj.get("prompt")?).unwrap_or_default();
+    let negative_prompt = params_obj
+        .get("negativeprompt")
+        .and_then(json_value_to_text)
+        .unwrap_or_default();
+    if prompt.trim().is_empty() && negative_prompt.trim().is_empty() {
+        return None;
+    }
+
+    let mut params = scalar_params_from_object(
+        params_obj,
+        &[
+            "prompt",
+            "negativeprompt",
+            "originalprompt",
+            "originalnegativeprompt",
+        ],
+    );
+    if let Some(extra) = json.get("sui_extra_data").and_then(|v| v.as_object()) {
+        params.extend(prefix_scalar_params("extra.", extra, &[]));
+    }
+    if let Some(models) = json.get("sui_models").and_then(|v| v.as_array()) {
+        for model in models {
+            if let Some(obj) = model.as_object() {
+                let name = obj.get("name").and_then(json_value_to_text);
+                let hash = obj.get("hash").and_then(json_value_to_text);
+                match (name, hash) {
+                    (Some(name), Some(hash)) if !hash.is_empty() => {
+                        params.push(("model".to_string(), format!("{name} ({hash})")));
+                    }
+                    (Some(name), _) => params.push(("model".to_string(), name)),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Some(A1111Metadata {
+        tool: AiToolKind::SwarmUI,
+        prompt,
+        negative_prompt,
+        params,
+        raw: raw.to_string(),
+    })
+}
+
+fn parse_fooocus_json(
+    raw: &str,
+    json: &serde_json::Value,
+    chunks: &[(String, String)],
+) -> Option<A1111Metadata> {
+    let obj = json.as_object()?;
+    let has_scheme = chunk_value(chunks, "fooocus_scheme").is_some();
+    let has_fingerprint = [
+        "base_model",
+        "guidance_scale",
+        "full_prompt",
+        "full_negative_prompt",
+        "performance",
+        "styles",
+        "refiner_model",
+    ]
+    .iter()
+    .any(|key| obj.contains_key(*key));
+    if !has_scheme && !(obj.contains_key("prompt") && has_fingerprint) {
+        return None;
+    }
+
+    let prompt = first_json_text(
+        json,
+        &[
+            &["prompt"],
+            &["full_prompt"],
+            &["raw_prompt"],
+            &["Prompt"],
+            &["Full prompt"],
+        ],
+    )
+    .unwrap_or_default();
+    let negative_prompt = first_json_text(
+        json,
+        &[
+            &["negative_prompt"],
+            &["full_negative_prompt"],
+            &["raw_negative_prompt"],
+            &["Negative"],
+            &["Negative Prompt"],
+        ],
+    )
+    .unwrap_or_default();
+    if prompt.trim().is_empty() && negative_prompt.trim().is_empty() {
+        return None;
+    }
+
+    let params = scalar_params_from_object(
+        obj,
+        &[
+            "prompt",
+            "full_prompt",
+            "raw_prompt",
+            "Prompt",
+            "Full prompt",
+            "negative_prompt",
+            "full_negative_prompt",
+            "raw_negative_prompt",
+            "Negative",
+            "Negative Prompt",
+        ],
+    );
+    Some(A1111Metadata {
+        tool: AiToolKind::Fooocus,
+        prompt,
+        negative_prompt,
+        params,
+        raw: raw.to_string(),
+    })
+}
+
+fn parse_ruinedfooocus_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metadata> {
+    let obj = json.as_object()?;
+    let software = obj
+        .get("software")
+        .or_else(|| obj.get("Software"))
+        .and_then(json_value_to_text)
+        .unwrap_or_default();
+    if !software.eq_ignore_ascii_case("RuinedFooocus") {
+        return None;
+    }
+    let prompt = first_json_text(json, &[&["Prompt"], &["prompt"]]).unwrap_or_default();
+    let negative_prompt =
+        first_json_text(json, &[&["Negative"], &["negative"], &["negative_prompt"]])
+            .unwrap_or_default();
+    let params = scalar_params_from_object(
+        obj,
+        &[
+            "Prompt",
+            "prompt",
+            "Negative",
+            "negative",
+            "negative_prompt",
+        ],
+    );
+    Some(A1111Metadata {
+        tool: AiToolKind::Fooocus,
+        prompt,
+        negative_prompt,
+        params,
+        raw: raw.to_string(),
+    })
+}
+
+fn parse_invokeai_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metadata> {
+    let prompt = first_json_text(
+        json,
+        &[
+            &["positive_prompt"],
+            &["positive"],
+            &["prompt"],
+            &["metadata", "positive_prompt"],
+        ],
+    )
+    .unwrap_or_default();
+    let style_prompt = first_json_text(json, &[&["positive_style_prompt"]]).unwrap_or_default();
+    let prompt = join_non_empty(&[prompt.as_str(), style_prompt.as_str()], "\n");
+
+    let negative_prompt = first_json_text(
+        json,
+        &[
+            &["negative_prompt"],
+            &["negative"],
+            &["metadata", "negative_prompt"],
+        ],
+    )
+    .unwrap_or_default();
+    let negative_style = first_json_text(json, &[&["negative_style_prompt"]]).unwrap_or_default();
+    let negative_prompt =
+        join_non_empty(&[negative_prompt.as_str(), negative_style.as_str()], "\n");
+
+    if prompt.trim().is_empty() && negative_prompt.trim().is_empty() {
+        return None;
+    }
+
+    let mut params = Vec::new();
+    for key in [
+        "generation_mode",
+        "width",
+        "height",
+        "seed",
+        "rand_device",
+        "cfg_scale",
+        "cfg_rescale_multiplier",
+        "steps",
+        "scheduler",
+        "clip_skip",
+        "model",
+        "strength",
+        "vae",
+        "app_version",
+    ] {
+        if let Some(v) = json.get(key).and_then(json_value_to_text) {
+            params.push((key.to_string(), v));
+        }
+    }
+
+    Some(A1111Metadata {
+        tool: AiToolKind::InvokeAI,
+        prompt,
+        negative_prompt,
+        params,
+        raw: raw.to_string(),
+    })
+}
+
+fn parse_invokeai_legacy_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metadata> {
+    let prompt = first_json_text(
+        json,
+        &[
+            &["image", "prompt"],
+            &["prompt"],
+            &["image", "positive_prompt"],
+        ],
+    )
+    .unwrap_or_default();
+    let negative_prompt = first_json_text(
+        json,
+        &[
+            &["image", "negative_prompt"],
+            &["negative_prompt"],
+            &["image", "negative"],
+        ],
+    )
+    .unwrap_or_default();
+    if prompt.trim().is_empty() && negative_prompt.trim().is_empty() {
+        return None;
+    }
+
+    let mut params = Vec::new();
+    if let Some(obj) = json.as_object() {
+        params.extend(prefix_scalar_params(
+            "",
+            obj,
+            &["image", "prompt", "negative_prompt"],
+        ));
+    }
+    Some(A1111Metadata {
+        tool: AiToolKind::InvokeAI,
+        prompt,
+        negative_prompt,
+        params,
+        raw: raw.to_string(),
+    })
+}
+
+fn parse_invokeai_dream(raw: &str) -> Option<A1111Metadata> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (prompt_part, flags_part) = split_dream_prompt_and_flags(trimmed);
+    let mut prompt = prompt_part.trim().trim_matches('"').to_string();
+    let mut negative_prompt = String::new();
+    if let Some((before, inside, after)) = extract_square_bracket_segment(&prompt) {
+        prompt = join_non_empty(&[before.trim(), after.trim()], " ");
+        negative_prompt = inside.trim().to_string();
+    }
+
+    let params = parse_dream_flags(flags_part);
+    Some(A1111Metadata {
+        tool: AiToolKind::InvokeAI,
+        prompt,
+        negative_prompt,
+        params,
+        raw: raw.to_string(),
+    })
+}
+
+fn parse_novelai(chunks: &[(String, String)]) -> Option<A1111Metadata> {
+    let software_is_novelai =
+        chunk_value(chunks, "Software").is_some_and(|s| s.trim().eq_ignore_ascii_case("NovelAI"));
+    let comment_raw = chunk_value(chunks, "Comment")?;
+    let comment = parse_json_object(comment_raw)?;
+    let looks_novelai =
+        software_is_novelai || comment.get("uc").is_some() || comment.get("v4_prompt").is_some();
+    if !looks_novelai {
+        return None;
+    }
+
+    let prompt = comment
+        .get("v4_prompt")
+        .and_then(novelai_v4_caption_text)
+        .or_else(|| chunk_value(chunks, "Description").map(str::to_string))
+        .or_else(|| comment.get("prompt").and_then(json_value_to_text))
+        .unwrap_or_default();
+    let negative_prompt = comment
+        .get("v4_negative_prompt")
+        .and_then(novelai_v4_caption_text)
+        .or_else(|| comment.get("uc").and_then(json_value_to_text))
+        .unwrap_or_default();
+    if prompt.trim().is_empty() && negative_prompt.trim().is_empty() {
+        return None;
+    }
+
+    let mut params = Vec::new();
+    if let Some(obj) = comment.as_object() {
+        params.extend(scalar_params_from_object(
+            obj,
+            &["prompt", "uc", "v4_prompt", "v4_negative_prompt"],
+        ));
+    }
+    for key in ["Title", "Source", "Software"] {
+        if let Some(v) = chunk_value(chunks, key).filter(|v| !v.trim().is_empty()) {
+            params.push((key.to_string(), v.to_string()));
+        }
+    }
+
+    Some(A1111Metadata {
+        tool: AiToolKind::NovelAI,
+        prompt,
+        negative_prompt,
+        params,
+        raw: comment_raw.to_string(),
+    })
+}
+
+fn extract_exif_user_comment_metadata_from_path(path: &Path) -> Option<AiMetadata> {
+    let exif = rexif::parse_file(path.to_str()?).ok()?;
+    extract_exif_user_comment_metadata_from_entries(&exif.entries)
+}
+
+fn extract_exif_user_comment_metadata_from_bytes(bytes: &[u8]) -> Option<AiMetadata> {
+    let exif = rexif::parse_buffer(bytes).ok()?;
+    extract_exif_user_comment_metadata_from_entries(&exif.entries)
+}
+
+fn extract_exif_user_comment_metadata_from_entries(
+    entries: &[rexif::ExifEntry],
+) -> Option<AiMetadata> {
+    let raw = entries
+        .iter()
+        .find(|entry| matches!(entry.tag, rexif::ExifTag::UserComment))
+        .and_then(decode_user_comment_entry)?;
+    parse_user_comment_metadata(&raw).map(AiMetadata::A1111)
+}
+
+fn decode_user_comment_entry(entry: &rexif::ExifEntry) -> Option<String> {
+    match &entry.value {
+        rexif::TagValue::Undefined(bytes, le) => decode_user_comment_bytes(bytes, *le),
+        rexif::TagValue::Ascii(s) => Some(clean_user_comment_text(s)),
+        _ => {
+            let s = entry.value_more_readable.trim();
+            (!s.is_empty()).then(|| clean_user_comment_text(s))
+        }
+    }
+}
+
+fn decode_user_comment_bytes(bytes: &[u8], le: bool) -> Option<String> {
+    const ASCII: &[u8; 8] = b"ASCII\0\0\0";
+    const UNICODE: &[u8; 8] = b"UNICODE\0";
+    const JIS: &[u8; 8] = b"JIS\0\0\0\0\0";
+    let text = if let Some(rest) = bytes.strip_prefix(ASCII) {
+        String::from_utf8_lossy(rest).into_owned()
+    } else if let Some(rest) = bytes.strip_prefix(UNICODE) {
+        let mut u16s = Vec::with_capacity(rest.len() / 2);
+        for pair in rest.chunks_exact(2) {
+            let code = if le {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            };
+            u16s.push(code);
+        }
+        String::from_utf16_lossy(&u16s)
+    } else if let Some(rest) = bytes.strip_prefix(JIS) {
+        String::from_utf8_lossy(rest).into_owned()
+    } else if bytes.len() > 8 && bytes[..8].iter().all(|&b| b == 0) {
+        String::from_utf8_lossy(&bytes[8..]).into_owned()
+    } else {
+        // Pillow/Fooocus は EXIF UserComment に charset preamble 無しの UTF-8 文字列を
+        // 書くことがある。rexif の表示文字列に頼ると "undefined encoding [..]" になるため、
+        // raw bytes を UTF-8 lossy で直接扱う。
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    let cleaned = clean_user_comment_text(&text);
+    (!cleaned.trim().is_empty()).then_some(cleaned)
+}
+
+fn clean_user_comment_text(s: &str) -> String {
+    s.trim_matches('\0').trim().to_string()
+}
+
+fn parse_user_comment_metadata(raw: &str) -> Option<A1111Metadata> {
+    if let Some(json) = parse_json_object(raw) {
+        if let Some(meta) = parse_swarmui_json(raw, &json) {
+            return Some(meta);
+        }
+        if let Some(meta) = parse_ruinedfooocus_json(raw, &json) {
+            return Some(meta);
+        }
+        if let Some(meta) = parse_fooocus_json(raw, &json, &[]) {
+            return Some(meta);
+        }
+        if let Some(meta) = parse_invokeai_json(raw, &json) {
+            return Some(meta);
+        }
+        if let Some(meta) = parse_invokeai_legacy_json(raw, &json) {
+            return Some(meta);
+        }
+        return None;
+    }
+    parse_a1111_as(raw, AiToolKind::JpegExif)
+}
+
+fn first_json_text(json: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
+    for path in paths {
+        if let Some(v) = json_path(json, path).and_then(json_value_to_text) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn json_path<'a>(json: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+    let mut cur = json;
+    for key in path {
+        cur = cur.get(*key)?;
+    }
+    Some(cur)
+}
+
+fn json_value_to_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(v) => Some(v.to_string()),
+        serde_json::Value::Number(v) => Some(v.to_string()),
+        serde_json::Value::String(v) => Some(v.clone()),
+        serde_json::Value::Array(values) => {
+            let parts: Vec<String> = values.iter().filter_map(json_value_to_text).collect();
+            (!parts.is_empty()).then(|| parts.join(", "))
+        }
+        serde_json::Value::Object(_) => serde_json::to_string(value).ok(),
+    }
+}
+
+fn scalar_params_from_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    skip: &[&str],
+) -> Vec<(String, String)> {
+    prefix_scalar_params("", obj, skip)
+}
+
+fn prefix_scalar_params(
+    prefix: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    skip: &[&str],
+) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    for (key, value) in obj {
+        if skip.iter().any(|candidate| key == candidate) {
+            continue;
+        }
+        if let Some(text) = json_value_to_text(value).filter(|s| !s.trim().is_empty()) {
+            params.push((format!("{prefix}{key}"), text));
+        }
+    }
+    params
+}
+
+fn join_non_empty(parts: &[&str], sep: &str) -> String {
+    parts
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+fn novelai_v4_caption_text(value: &serde_json::Value) -> Option<String> {
+    let mut parts = Vec::new();
+    collect_novelai_caption_parts(value, &mut parts);
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn collect_novelai_caption_parts(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) if !s.trim().is_empty() => out.push(s.trim().to_string()),
+        serde_json::Value::Object(obj) => {
+            if let Some(caption) = obj.get("caption") {
+                collect_novelai_caption_parts(caption, out);
+            }
+            for key in ["base_caption", "char_caption"] {
+                if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+                    if !s.trim().is_empty() {
+                        out.push(s.trim().to_string());
+                    }
+                }
+            }
+            for key in ["char_captions", "characters"] {
+                if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
+                    for child in arr {
+                        collect_novelai_caption_parts(child, out);
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr {
+                collect_novelai_caption_parts(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn split_dream_prompt_and_flags(raw: &str) -> (&str, &str) {
+    if let Some(stripped) = raw.strip_prefix('"') {
+        let mut escaped = false;
+        for (idx, ch) in stripped.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                let end = idx + 2; // opening quote + closing quote byte position
+                return (&raw[..end], raw[end..].trim());
+            }
+        }
+    }
+    if let Some(pos) = raw.find(" -") {
+        (&raw[..pos], raw[pos..].trim())
+    } else {
+        (raw, "")
+    }
+}
+
+fn extract_square_bracket_segment(s: &str) -> Option<(String, String, String)> {
+    let end = s.rfind(']')?;
+    let start = s[..end].rfind('[')?;
+    Some((
+        s[..start].to_string(),
+        s[start + 1..end].to_string(),
+        s[end + 1..].to_string(),
+    ))
+}
+
+fn parse_dream_flags(flags: &str) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    let mut iter = flags.split_whitespace().peekable();
+    while let Some(flag) = iter.next() {
+        if !flag.starts_with('-') {
+            continue;
+        }
+        let key = match flag {
+            "-s" | "--steps" => "Steps",
+            "-S" | "--seed" => "Seed",
+            "-W" | "--width" => "Width",
+            "-H" | "--height" => "Height",
+            "-C" | "--cfg_scale" => "CFG scale",
+            "-A" | "--sampler" => "Sampler",
+            "-m" | "--model" => "Model",
+            _ => flag.trim_start_matches('-'),
+        };
+        let Some(value) = iter.peek().copied().filter(|v| !v.starts_with('-')) else {
+            continue;
+        };
+        iter.next();
+        params.push((key.to_string(), value.trim_matches('"').to_string()));
+    }
+    params
 }
 
 // ---------------------------------------------------------------------------
@@ -314,26 +1039,44 @@ fn append_kv(out: &mut String, k: &str, v: &str) {
 /// - Author / Comment / Software など AI 以外のチャンクは常に含める。
 /// - AI メタデータが認識できなかった場合は全チャンクの値を素通しで含める。
 pub fn build_searchable_from_chunks(chunks: &[(String, String)]) -> String {
-    let meta = detect_and_parse(chunks);
+    let outcome = detect_and_parse_outcome(chunks);
     let mut out = String::new();
 
-    if let Some(ref m) = meta {
-        append_line(&mut out, &build_searchable_text(m));
+    if let Some(ref parsed) = outcome {
+        // 未知の parameters JSON は表示用には Unknown として保持するが、検索には
+        // raw JSON を入れない。JSON 内に negative 系キーがある場合の混入を避ける。
+        let suppress_unknown_raw =
+            matches!(parsed.meta, AiMetadata::Unknown(_)) && !parsed.consumed_keys.is_empty();
+        if !suppress_unknown_raw {
+            append_line(&mut out, &build_searchable_text(&parsed.meta));
+        }
     }
 
-    // A1111 / ComfyUI: AI キーの生値には Negative が残っているので再掲しない。
-    //                  非 AI チャンク (Author, Comment 等) だけ追加する。
-    // Unknown:         build_searchable_text ですでに全チャンクを含めた。
-    // なし:            チャンクを素通しで含める (取りこぼし回避)。
-    let include_non_ai_chunks = match meta {
-        Some(AiMetadata::A1111(_)) | Some(AiMetadata::ComfyUI(_)) => true,
-        Some(AiMetadata::Unknown(_)) => false,
+    // 認識済み AI キーの生値には Negative が残っているので再掲しない。
+    // Unknown でも consumed_keys がある場合 (未知 parameters JSON など) は、
+    // consumed 以外の非 AI チャンクだけを足す。
+    let include_non_ai_chunks = match outcome {
+        Some(ParseOutcome {
+            meta: AiMetadata::A1111(_) | AiMetadata::ComfyUI(_),
+            ..
+        }) => true,
+        Some(ParseOutcome {
+            meta: AiMetadata::Unknown(_),
+            ref consumed_keys,
+        }) if !consumed_keys.is_empty() => true,
+        Some(ParseOutcome {
+            meta: AiMetadata::Unknown(_),
+            ..
+        }) => false,
         None => true,
     };
 
     if include_non_ai_chunks {
         for (k, v) in chunks {
-            if AI_METADATA_KEYS.contains(&k.as_str()) {
+            if outcome
+                .as_ref()
+                .is_some_and(|parsed| parsed.consumed_keys.contains(&k.as_str()))
+            {
                 continue;
             }
             append_line(&mut out, v);
@@ -346,20 +1089,62 @@ pub fn build_searchable_from_chunks(chunks: &[(String, String)]) -> String {
 /// PNG ファイルパスから Negative Prompt を除外した検索対象文字列を取得する。
 /// 読み取りに失敗した場合 / 有効な tEXt チャンクが無い場合は空文字列を返す。
 pub fn build_searchable_from_path(path: &Path) -> String {
-    let chunks = read_png_text_chunks(path).unwrap_or_default();
-    if chunks.is_empty() {
-        return String::new();
+    build_searchable_from_path_with_origin(path).0
+}
+
+pub fn build_searchable_from_path_with_origin(path: &Path) -> (String, Option<MetadataOrigin>) {
+    let Some(ext) = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return (String::new(), None);
+    };
+    match ext.as_str() {
+        "png" => {
+            let chunks = read_png_text_chunks(path).unwrap_or_default();
+            if chunks.is_empty() {
+                (String::new(), None)
+            } else {
+                (
+                    build_searchable_from_chunks(&chunks),
+                    Some(MetadataOrigin::PngText),
+                )
+            }
+        }
+        "jpg" | "jpeg" | "jfif" => {
+            let Some(meta) = extract_exif_user_comment_metadata_from_path(path) else {
+                return (String::new(), None);
+            };
+            (
+                build_searchable_text(&meta),
+                Some(MetadataOrigin::ExifUserComment),
+            )
+        }
+        _ => (String::new(), None),
     }
-    build_searchable_from_chunks(&chunks)
 }
 
 /// PNG バイト列から Negative Prompt を除外した検索対象文字列を取得する。
 pub fn build_searchable_from_bytes(bytes: &[u8]) -> String {
-    let chunks = read_png_text_chunks_from_bytes(bytes).unwrap_or_default();
-    if chunks.is_empty() {
-        return String::new();
+    build_searchable_from_bytes_with_origin(bytes).0
+}
+
+pub fn build_searchable_from_bytes_with_origin(bytes: &[u8]) -> (String, Option<MetadataOrigin>) {
+    if is_png_bytes(bytes) {
+        let chunks = read_png_text_chunks_from_bytes(bytes).unwrap_or_default();
+        if chunks.is_empty() {
+            return (String::new(), None);
+        }
+        return (
+            build_searchable_from_chunks(&chunks),
+            Some(MetadataOrigin::PngText),
+        );
     }
-    build_searchable_from_chunks(&chunks)
+    let Some((meta, origin)) = extract_metadata_from_bytes_with_origin(bytes) else {
+        return (String::new(), None);
+    };
+    (build_searchable_text(&meta), Some(origin))
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +1160,10 @@ pub fn build_searchable_from_bytes(bytes: &[u8]) -> String {
 /// Steps: 20, Sampler: Euler, CFG scale: 7, Seed: 12345, ...
 /// ```
 pub fn parse_a1111(raw: &str) -> Option<A1111Metadata> {
+    parse_a1111_as(raw, AiToolKind::A1111)
+}
+
+fn parse_a1111_as(raw: &str, tool: AiToolKind) -> Option<A1111Metadata> {
     if raw.trim().is_empty() {
         return None;
     }
@@ -403,6 +1192,7 @@ pub fn parse_a1111(raw: &str) -> Option<A1111Metadata> {
     };
 
     Some(A1111Metadata {
+        tool,
         prompt,
         negative_prompt,
         params,
@@ -716,6 +1506,20 @@ fn extract_text_from_ref_node(
 mod tests {
     use super::*;
 
+    fn chunks(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn expect_prompt_meta(meta: Option<AiMetadata>) -> A1111Metadata {
+        match meta {
+            Some(AiMetadata::A1111(meta)) => meta,
+            other => panic!("expected normalized prompt metadata, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_parse_a1111_basic() {
         let raw = "beautiful landscape, high quality\n\
@@ -908,6 +1712,258 @@ mod tests {
         // 非 AI チャンクは残る
         assert!(lower.contains("alice"));
         assert!(lower.contains("my favorite"));
+    }
+
+    #[test]
+    fn test_detect_novelai_before_description_and_excludes_uc() {
+        let chunks = chunks(&[
+            ("Title", "AI generated image"),
+            ("Description", "masterpiece cat in space"),
+            ("Software", "NovelAI"),
+            ("Source", "Stable Diffusion abcdef"),
+            (
+                "Comment",
+                r#"{"steps":28,"sampler":"k_euler","scale":5.5,"seed":123,"uc":"novelai-negative-leak"}"#,
+            ),
+        ]);
+        let meta = expect_prompt_meta(detect_and_parse(&chunks));
+        assert_eq!(meta.tool, AiToolKind::NovelAI);
+        assert_eq!(meta.prompt, "masterpiece cat in space");
+        assert_eq!(meta.negative_prompt, "novelai-negative-leak");
+        assert!(
+            meta.params
+                .iter()
+                .any(|(k, v)| k == "sampler" && v == "k_euler")
+        );
+
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(text.contains("masterpiece cat"));
+        assert!(text.contains("k_euler"));
+        assert!(!text.contains("novelai-negative-leak"), "text={text}");
+    }
+
+    #[test]
+    fn test_detect_novelai_v4_caption_shape() {
+        let chunks = chunks(&[
+            ("Software", "NovelAI"),
+            (
+                "Comment",
+                r#"{
+                    "v4_prompt": {"caption": {
+                        "base_caption": "base scene",
+                        "char_captions": [{"char_caption": "hero character"}]
+                    }},
+                    "v4_negative_prompt": {"caption": {"base_caption": "v4-negative-leak"}},
+                    "seed": 45
+                }"#,
+            ),
+        ]);
+        let meta = expect_prompt_meta(detect_and_parse(&chunks));
+        assert_eq!(meta.tool, AiToolKind::NovelAI);
+        assert!(meta.prompt.contains("base scene"));
+        assert!(meta.prompt.contains("hero character"));
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(!text.contains("v4-negative-leak"), "text={text}");
+    }
+
+    #[test]
+    fn test_parameters_json_unknown_does_not_leak_raw_negative() {
+        let chunks = chunks(&[(
+            "parameters",
+            r#"{"prompt":"unknown positive","negative_prompt":"json-negative-leak"}"#,
+        )]);
+        assert!(matches!(
+            detect_and_parse(&chunks),
+            Some(AiMetadata::Unknown(_))
+        ));
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(
+            !text.contains("json-negative-leak"),
+            "unknown parameters JSON must not be searched raw: {text}"
+        );
+        assert!(
+            !text.contains("unknown positive"),
+            "unknown parameters JSON is display-only until a concrete extractor recognizes it: {text}"
+        );
+    }
+
+    #[test]
+    fn test_detect_swarmui_parameters_json() {
+        let chunks = chunks(&[(
+            "parameters",
+            r#"{
+                "sui_image_params": {
+                    "prompt": "a photo of a cat",
+                    "negativeprompt": "swarm-negative-leak",
+                    "model": "OfficialStableDiffusion/sd_xl_base_1.0",
+                    "seed": 1,
+                    "steps": 20,
+                    "cfgscale": 7.0
+                }
+            }"#,
+        )]);
+        let meta = expect_prompt_meta(detect_and_parse(&chunks));
+        assert_eq!(meta.tool, AiToolKind::SwarmUI);
+        assert_eq!(meta.prompt, "a photo of a cat");
+        assert_eq!(meta.negative_prompt, "swarm-negative-leak");
+        assert!(
+            meta.params
+                .iter()
+                .any(|(k, v)| k == "model" && v.contains("sd_xl"))
+        );
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(text.contains("a photo of a cat"));
+        assert!(!text.contains("swarm-negative-leak"), "text={text}");
+    }
+
+    #[test]
+    fn test_detect_fooocus_parameters_json() {
+        let chunks = chunks(&[
+            (
+                "parameters",
+                r#"{
+                    "prompt": "fooocus positive",
+                    "negative_prompt": "fooocus-negative-leak",
+                    "base_model": "juggernautXL",
+                    "guidance_scale": 4,
+                    "sampler": "dpmpp_2m_sde_gpu",
+                    "seed": 222
+                }"#,
+            ),
+            ("fooocus_scheme", "fooocus"),
+        ]);
+        let meta = expect_prompt_meta(detect_and_parse(&chunks));
+        assert_eq!(meta.tool, AiToolKind::Fooocus);
+        assert_eq!(meta.prompt, "fooocus positive");
+        assert!(
+            meta.params
+                .iter()
+                .any(|(k, v)| k == "base_model" && v == "juggernautXL")
+        );
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(text.contains("fooocus positive"));
+        assert!(text.contains("juggernautXL"));
+        assert!(!text.contains("fooocus-negative-leak"), "text={text}");
+    }
+
+    #[test]
+    fn test_detect_ruinedfooocus_parameters_json() {
+        let chunks = chunks(&[(
+            "parameters",
+            r#"{
+                "software": "RuinedFooocus",
+                "Prompt": "ruined positive",
+                "Negative": "ruined-negative-leak",
+                "Seed": 333
+            }"#,
+        )]);
+        let meta = expect_prompt_meta(detect_and_parse(&chunks));
+        assert_eq!(meta.tool, AiToolKind::Fooocus);
+        assert_eq!(meta.prompt, "ruined positive");
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(!text.contains("ruined-negative-leak"), "text={text}");
+    }
+
+    #[test]
+    fn test_detect_invokeai_metadata_json() {
+        let chunks = chunks(&[(
+            "invokeai_metadata",
+            r#"{
+                "positive_prompt": "invoke positive",
+                "negative_prompt": "invoke-negative-leak",
+                "seed": 444,
+                "steps": 30,
+                "cfg_scale": 6.5,
+                "model": {"name": "invoke-model"}
+            }"#,
+        )]);
+        let meta = expect_prompt_meta(detect_and_parse(&chunks));
+        assert_eq!(meta.tool, AiToolKind::InvokeAI);
+        assert_eq!(meta.prompt, "invoke positive");
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(text.contains("invoke positive"));
+        assert!(text.contains("invoke-model"));
+        assert!(!text.contains("invoke-negative-leak"), "text={text}");
+    }
+
+    #[test]
+    fn test_detect_invokeai_legacy_sd_metadata_json() {
+        let chunks = chunks(&[(
+            "sd-metadata",
+            r#"{"image":{"prompt":"legacy positive","negative_prompt":"legacy-negative-leak"},"seed":555}"#,
+        )]);
+        let meta = expect_prompt_meta(detect_and_parse(&chunks));
+        assert_eq!(meta.tool, AiToolKind::InvokeAI);
+        assert_eq!(meta.prompt, "legacy positive");
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(!text.contains("legacy-negative-leak"), "text={text}");
+    }
+
+    #[test]
+    fn test_detect_invokeai_dream_text() {
+        let chunks = chunks(&[(
+            "Dream",
+            r#""dream positive [dream-negative-leak]" -s 24 -S 999 -W 512 -H 768 -C 7.5 -A k_lms"#,
+        )]);
+        let meta = expect_prompt_meta(detect_and_parse(&chunks));
+        assert_eq!(meta.tool, AiToolKind::InvokeAI);
+        assert_eq!(meta.prompt, "dream positive");
+        assert_eq!(meta.negative_prompt, "dream-negative-leak");
+        assert!(meta.params.iter().any(|(k, v)| k == "Steps" && v == "24"));
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(!text.contains("dream-negative-leak"), "text={text}");
+    }
+
+    #[test]
+    fn test_user_comment_ascii_a1111_is_ai_metadata() {
+        let raw = "jpeg positive\nNegative prompt: jpeg-negative-leak\nSteps: 18, Seed: 123";
+        let mut bytes = b"ASCII\0\0\0".to_vec();
+        bytes.extend_from_slice(raw.as_bytes());
+        let decoded = decode_user_comment_bytes(&bytes, true).unwrap();
+        let meta = parse_user_comment_metadata(&decoded).unwrap();
+        assert_eq!(meta.tool, AiToolKind::JpegExif);
+        let text = build_searchable_text(&AiMetadata::A1111(meta));
+        assert!(text.contains("jpeg positive"));
+        assert!(!text.contains("jpeg-negative-leak"), "text={text}");
+    }
+
+    #[test]
+    fn test_user_comment_json_prefers_ai_reader_over_generic_json() {
+        let raw = r#"{
+            "sui_image_params": {
+                "prompt": "json usercomment positive",
+                "negativeprompt": "json-usercomment-negative-leak",
+                "model": "model-name"
+            }
+        }"#;
+        let meta = parse_user_comment_metadata(raw).unwrap();
+        assert_eq!(meta.tool, AiToolKind::SwarmUI);
+        let text = build_searchable_text(&AiMetadata::A1111(meta));
+        assert!(text.contains("json usercomment positive"));
+        assert!(text.contains("model-name"));
+        assert!(
+            !text.contains("json-usercomment-negative-leak"),
+            "text={text}"
+        );
+    }
+
+    #[test]
+    fn optional_external_novelai_sample_smoke() {
+        let Some(dir) = std::env::var_os("MIV_AI_METADATA_SAMPLE_DIR") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(dir).join("novelai-sample-cat.png");
+        if !path.exists() {
+            return;
+        }
+        let meta = expect_prompt_meta(extract_metadata(&path));
+        assert_eq!(meta.tool, AiToolKind::NovelAI);
+        let text = build_searchable_from_path(&path);
+        assert!(text.contains("cat"));
+        assert!(
+            !text.contains("lowres"),
+            "NovelAI uc leaked into search text"
+        );
     }
 
     #[test]

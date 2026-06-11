@@ -1352,6 +1352,9 @@ pub struct Settings {
     /// ツールバーに「タグ」セクションを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_tags: bool,
+    /// 左側の実フォルダツリーペインを表示する
+    #[serde(default)]
+    pub folder_tree_pane_visible: bool,
     /// フォルダバー (フォルダ入力行) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder: bool,
@@ -1519,6 +1522,12 @@ pub struct Settings {
     /// フルスクリーンの倍率/フィット基準。
     #[serde(default)]
     pub fullscreen_fit_mode: FullscreenFitMode,
+    /// 自動フィット時に 100% を超える拡大をしない。
+    #[serde(default)]
+    pub fullscreen_fit_no_upscale: bool,
+    /// 自動フィット時に 100% 未満へ縮小しない。
+    #[serde(default)]
+    pub fullscreen_fit_no_downscale: bool,
     /// 連結読みのホイール 1 ノッチあたりスクロール量 (画面サイズ比 %)。
     #[serde(default = "default_continuous_reading_wheel_scroll_percent")]
     pub continuous_reading_wheel_scroll_percent: u32,
@@ -2529,6 +2538,8 @@ impl Default for Settings {
             spread_page_gap_px: default_spread_page_gap_px(),
             continuous_reading_gap_px: default_continuous_reading_gap_px(),
             fullscreen_fit_mode: FullscreenFitMode::default(),
+            fullscreen_fit_no_upscale: false,
+            fullscreen_fit_no_downscale: false,
             continuous_reading_wheel_scroll_percent:
                 default_continuous_reading_wheel_scroll_percent(),
             continuous_reading_key_scroll_percent: default_continuous_reading_key_scroll_percent(),
@@ -2542,6 +2553,7 @@ impl Default for Settings {
             tags: Vec::new(),
             show_toolbar_favorites: true,
             show_toolbar_tags: true,
+            folder_tree_pane_visible: false,
             show_toolbar_folder: true,
             show_address_bar_history_nav: true,
             show_toolbar_parent_button: true,
@@ -3824,6 +3836,7 @@ mod tests {
         assert_eq!(s.continuous_reading_key_scroll_percent, 16);
         assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 130);
         assert!(s.show_toolbar_favorites);
+        assert!(!s.folder_tree_pane_visible);
         assert!(s.show_toolbar_folder);
         assert!(s.show_address_bar_history_nav);
         assert!(s.show_toolbar_parent_button);

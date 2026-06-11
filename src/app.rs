@@ -1510,11 +1510,14 @@ fn stem_lower(path: &std::path::Path) -> String {
         .to_lowercase()
 }
 
-/// ファイルパスが PNG 拡張子か (大文字小文字無視)。
-fn is_png_path(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+/// ファイルパスが AI 生成メタデータ抽出対象の画像拡張子か (大文字小文字無視)。
+fn is_ai_metadata_path(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "jfif"
+        )
+    })
 }
 
 /// フルスクリーン画像のメタデータ (AI プロンプト / EXIF / XMP) を読み込むワーカー本体。
@@ -2012,10 +2015,10 @@ fn run_metadata_search(
             .unwrap_or("")
             .to_string();
         // 最初は PNG tEXt だけ読む (cheap hay)。EXIF / XMP は NeedsMore の時だけ lazy 読み。
-        let meta_text = if is_image && use_png && is_png_path(path) {
-            crate::png_metadata::build_searchable_from_path(path)
+        let (meta_text, meta_origin) = if is_image && use_png && is_ai_metadata_path(path) {
+            crate::png_metadata::build_searchable_from_path_with_origin(path)
         } else {
-            String::new()
+            (String::new(), None)
         };
         let name_for_hay = if use_name { name.as_str() } else { "" };
         let hay_no_xmp = hay_of(&meta_text, name_for_hay, None);
@@ -2045,7 +2048,11 @@ fn run_metadata_search(
                 let mut extended_meta = meta_text.clone();
                 if is_image && use_exif {
                     if let Some(exif) = crate::exif_reader::read_exif(path, &[]) {
-                        let exif_part = exif_hay(&exif);
+                        let exif_part = exif_hay(
+                            &exif,
+                            meta_origin
+                                == Some(crate::png_metadata::MetadataOrigin::ExifUserComment),
+                        );
                         if !exif_part.is_empty() {
                             if !extended_meta.is_empty() {
                                 extended_meta.push('\n');
@@ -2145,10 +2152,13 @@ fn hay_of(meta_text: &str, name: &str, xmp: Option<&crate::xmp_reader::XmpTweetI
 ///
 /// Tantivy 側 `exif_text` STORED (ingest_text::append_exif 経由で生成) と同じ形に揃え、
 /// Ctrl+F の on-demand fallback 経路でも EXIF を検索対象に含める。
-fn exif_hay(info: &crate::exif_reader::ExifInfo) -> String {
+fn exif_hay(info: &crate::exif_reader::ExifInfo, skip_user_comment: bool) -> String {
     let mut out = String::new();
     for (_group, tags) in &info.sections {
         for (_name, value) in tags {
+            if skip_user_comment && _name == "UserComment" {
+                continue;
+            }
             if !value.is_empty() {
                 if !out.is_empty() {
                     out.push(' ');
@@ -3696,6 +3706,8 @@ pub struct App {
     // ── アドレスバーフォーカス管理 ───────────────────────────────
     /// true のときアドレスバーが入力中 → キーショートカットを無効化
     pub(crate) address_has_focus: bool,
+    /// 左側の実フォルダツリーペインの状態。ZIP/PDF などの仮想フォルダは含めない。
+    pub(crate) folder_pane: crate::folder_pane::FolderPaneState,
 
     // ── フォルダ移動履歴（戻る/進む + 履歴メニュー）───────────────
     /// フォルダ移動履歴の戻るスタック。末尾が次に戻る先。
@@ -4160,6 +4172,9 @@ pub struct App {
 
     // ── 起動時の前回フォルダ復元フラグ ──────────────────────────
     pub(crate) initialized: bool,
+    /// ショートカット D&D / SendTo / CLI で指定された起動時の開く対象。
+    /// `Settings` には保存せず、初回 update で通常の起動復元より優先して消費する。
+    pub(crate) startup_open_path: Option<PathBuf>,
 
     // ── UI テーマ (v0.7.0) ──────────────────────────────────────
     /// 直近に ctx に適用した「解決後」のテーマ (Light / Dark)。
@@ -5196,6 +5211,12 @@ pub struct App {
     /// 要求を拾うためのリスナースレッドハンドル。最初のフレームで HWND が取れた
     /// タイミングで spawn し、Drop で join する。
     pub(crate) activation_listener: Option<crate::single_instance::ActivationListener>,
+    /// 2 重起動されたプロセスが Named Pipe で送ってきた「開くパス」を UI スレッドへ
+    /// 渡すための channel。listener thread は App を直接触らず、ここへ積むだけにする。
+    #[cfg(windows)]
+    pub(crate) activation_open_path_tx: mpsc::Sender<PathBuf>,
+    #[cfg(windows)]
+    pub(crate) activation_open_path_rx: mpsc::Receiver<PathBuf>,
     /// 明示的な終了要求フラグ (`[×]` による close intercept を通過させる)。
     /// set する経路:
     /// - インストーラ (Inno Setup) が Named Event で発火 → activation_listener thread
@@ -5404,6 +5425,8 @@ impl App {
     pub fn new_from_settings(mut settings: crate::settings::Settings) -> Self {
         let (tx, rx) = mpsc::channel();
         let (pdf_ct_tx, pdf_ct_rx) = mpsc::channel();
+        #[cfg(windows)]
+        let (activation_open_path_tx, activation_open_path_rx) = mpsc::channel();
         // 360 度パノラマビュー Phase 2a: NeedsUserConfirmation → SettleApproved の
         // 追加 worker → UI channel (docs/panorama-360-view-plan.md §4.6.0)。
         let (pano_high_res_tx, pano_high_res_rx) = mpsc::channel();
@@ -5768,6 +5791,7 @@ impl App {
             metadata_show_raw_workflow: false,
             exif_sections_open: std::collections::HashMap::new(),
             address_has_focus: false,
+            folder_pane: crate::folder_pane::FolderPaneState::default(),
             folder_nav_back_stack: Vec::new(),
             folder_nav_forward_stack: Vec::new(),
             recent_folders,
@@ -5913,6 +5937,7 @@ impl App {
             analysis_hist_cache: None,
             analysis_sv_cache: None,
             initialized: false,
+            startup_open_path: None,
             applied_ui_theme: None,
             #[cfg(windows)]
             wgpu_render_state: None,
@@ -6254,6 +6279,10 @@ impl App {
             last_ui_heartbeat_log: std::time::Instant::now(),
             placement_slot: None,
             activation_listener: None,
+            #[cfg(windows)]
+            activation_open_path_tx,
+            #[cfg(windows)]
+            activation_open_path_rx,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             current_folder_last_mtime: None,
             current_folder_signature: None,
@@ -15569,6 +15598,13 @@ impl App {
         if (self.show_search_bar || self.favsearch.active || self.global_search.active)
             && self.ime_input_active()
         {
+            return None;
+        }
+
+        if let Some(nav) = self.handle_folder_pane_keyboard(ctx) {
+            return Some(nav);
+        }
+        if self.folder_pane_blocks_grid_keyboard() {
             return None;
         }
 
@@ -29799,6 +29835,74 @@ impl App {
     }
 }
 
+impl App {
+    pub(crate) fn set_startup_open_path(&mut self, path: PathBuf) {
+        self.startup_open_path = Some(path);
+    }
+
+    #[cfg(windows)]
+    fn poll_activation_open_paths(&mut self, ctx: &egui::Context) {
+        let paths: Vec<PathBuf> = self.activation_open_path_rx.try_iter().collect();
+        let Some(path) = paths.into_iter().last() else {
+            return;
+        };
+        crate::logger::log(format!(
+            "single_instance: opening forwarded path on UI thread: {}",
+            path.display()
+        ));
+        let _ = self.open_startup_path(path);
+        ctx.request_repaint();
+    }
+
+    fn open_startup_path(&mut self, requested: PathBuf) -> bool {
+        let Some(openable) = crate::folder_tree::resolve_openable_path(&requested) else {
+            crate::logger::log(format!(
+                "startup open: no openable path for {}",
+                requested.display()
+            ));
+            return false;
+        };
+
+        crate::logger::log(format!(
+            "startup open: requested={} resolved={}",
+            requested.display(),
+            openable.display()
+        ));
+
+        let select_requested_file = requested.is_file() && openable.is_dir();
+        let outcome = self.load_folder_or_convert_archive(openable);
+        if matches!(outcome, FolderOpenOutcome::Ignored) {
+            return false;
+        }
+        if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
+            self.select_startup_file_if_visible(&requested);
+        }
+        true
+    }
+
+    fn select_startup_file_if_visible(&mut self, requested: &Path) {
+        let Some(idx) = self.items.iter().position(|item| match item {
+            GridItem::Folder(path)
+            | GridItem::Image(path)
+            | GridItem::Video(path)
+            | GridItem::ZipFile(path)
+            | GridItem::PdfFile(path) => crate::folder_tree::path_eq(path, requested),
+            GridItem::ConvertibleArchive { path, .. } => {
+                crate::folder_tree::path_eq(path, requested)
+            }
+            _ => false,
+        }) else {
+            crate::logger::log(format!(
+                "startup open: requested file not found in loaded folder: {}",
+                requested.display()
+            ));
+            return;
+        };
+        self.selected = Some(idx);
+        self.scroll_to_selected = true;
+    }
+}
+
 // -----------------------------------------------------------------------
 // eframe::App 実装
 // -----------------------------------------------------------------------
@@ -29887,6 +29991,7 @@ impl eframe::App for App {
                         ctx.clone(),
                         slot,
                         self.shutdown_requested.clone(),
+                        self.activation_open_path_tx.clone(),
                     );
                 }
             }
@@ -30259,7 +30364,19 @@ impl eframe::App for App {
             // 明示的な Light / Dark 選択はそのまま使う。初回セットアップダイアログでは
             // テーマ / AI 利用範囲 / ZIP/PDF の開き方をまとめて確認する。
 
-            if should_start_in_drive_list(&self.settings) {
+            if let Some(path) = self.startup_open_path.take() {
+                if !self.open_startup_path(path) {
+                    if should_start_in_drive_list(&self.settings) {
+                        self.enter_drive_list(None);
+                    } else if let Some(folder) = crate::known_folders::startup_folder(
+                        self.settings.startup_folder_mode,
+                        self.settings.last_folder.as_deref(),
+                        self.settings.startup_folder_path.as_deref(),
+                    ) {
+                        let _ = self.load_folder_or_convert_archive(folder);
+                    }
+                }
+            } else if should_start_in_drive_list(&self.settings) {
                 self.enter_drive_list(None);
             } else if let Some(folder) = crate::known_folders::startup_folder(
                 self.settings.startup_folder_mode,
@@ -30289,6 +30406,9 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
             }
         }
+
+        #[cfg(windows)]
+        self.poll_activation_open_paths(ctx);
 
         self.track_window_rect(ctx);
 
@@ -30988,6 +31108,7 @@ impl eframe::App for App {
         self.render_facet_filter_bar(ctx);
         self.render_details_lazy_status_bar(ctx);
         self.suppress_popup_wheel_before_grid(ctx);
+        let folder_pane_nav = self.render_folder_pane(ctx);
 
         // ── サムネイルグリッド ────────────────────────────────────────
         let t_pre_grid = frame_t0.elapsed();
@@ -31075,6 +31196,8 @@ impl eframe::App for App {
                 let path = action.into_path();
                 self.apply_jump_from_search_to(&path);
                 Some(path)
+            } else if let Some(p) = folder_pane_nav {
+                Some(p)
             } else {
                 grid_nav
             };

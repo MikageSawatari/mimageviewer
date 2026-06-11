@@ -422,9 +422,10 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 1. テクスチャ選択 (上記の優先順位)
 2. 回転 (rotation_db, 0/90/180/270)
 3. ユーザーのフリー回転 (fs_free_rotation, 一時的・非永続)
-4. Zoom (fs_zoom, 0.1〜50.0)
-5. Pan (fs_pan)
-6. フィットモード (ページ全体 / 余白カット / 横幅 / 縦幅 / 100%原寸)
+4. フィットモード (ページ全体 / 余白カット / 横幅 / 縦幅 / 100%原寸)
+5. 自動フィット倍率制限 (`fullscreen_fit_no_upscale` / `fullscreen_fit_no_downscale`)
+6. Zoom (fs_zoom, 0.1〜50.0)
+7. Pan (fs_pan)
 ```
 
 `settings.fullscreen_fit_mode` は <kbd>0</kbd> で循環する。ホバーバーのフィットボタンは
@@ -437,8 +438,15 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 余白カットフィットを候補から外し、保存値が余白カットでも表示時は flow に応じた既定フィットへ
 フォールバックする。
 
+フィットメニュー下部の「拡大しない」「縮小しない」は `FullscreenFitScaleLimits` として
+自動フィット倍率にだけ適用する。つまりページ全体/横幅/縦幅/余白カットが求めた `fit_scale`
+を 100% で clamp してから、ユーザー操作の `fs_zoom` を掛ける。明示的な Ctrl+ホイール、
+中ボタンドラッグ、ゲームパッド等の手動ズームは制限しない。`縮小しない` が ON の場合は
+ページ全体フィットでも 100% 表示で画面外へはみ出すことがあるため、`fullscreen_fit_allows_drag_pan`
+も true 扱いにしてパンできるようにする。
+
 **余白カットフィット** (`FullscreenFitMode::MarginFit`) は rotation/フリー回転なしのとき、
-ステップ 6 のフィットを「画像全体」ではなく「中身の bbox」基準にする。
+ステップ 4 のフィットを「画像全体」ではなく「中身の bbox」基準にする。
 `fs_margin_bbox`(idx) が `margin_fit::detect_content_bbox` で
 中身の bounding box (正規化座標) を検出してキャッシュ (`fs_margin_bbox_cache`、
 `fs_cache` と同じタイミングでクリア) し、`draw_fs_image` が `fit_scale` を bbox サイズで

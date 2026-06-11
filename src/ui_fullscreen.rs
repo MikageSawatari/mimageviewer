@@ -673,6 +673,29 @@ fn continuous_spread_fit_width(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct FullscreenFitScaleLimits {
+    no_upscale: bool,
+    no_downscale: bool,
+}
+
+impl FullscreenFitScaleLimits {
+    fn active(self) -> bool {
+        self.no_upscale || self.no_downscale
+    }
+
+    fn apply(self, scale: f32) -> f32 {
+        let mut scale = scale;
+        if self.no_upscale {
+            scale = scale.min(1.0);
+        }
+        if self.no_downscale {
+            scale = scale.max(1.0);
+        }
+        scale
+    }
+}
+
 fn continuous_reading_page_rects(
     unit_rect: egui::Rect,
     size: &ContinuousReadingUnitSize,
@@ -2709,6 +2732,7 @@ impl App {
                                     // 同一述語で判定し、描画と入力の食い違いを構造的に防ぐ。
                                     let continuous_reading_active =
                                         self.continuous_reading_active_for_idx(fs_idx);
+                                    let fit_scale_limits = self.fullscreen_fit_scale_limits();
                                     if continuous_reading_active {
                                         self.draw_fs_continuous_reading(
                                             ui,
@@ -2736,7 +2760,13 @@ impl App {
                                             if let Some(tex) = compare_tex.as_ref() {
                                                 let bg_style = self.fs_bg_style(ctx);
                                                 Self::draw_compare_pinned_image(
-                                                    ui, image_rect, tex, zp, &bg_style, None,
+                                                    ui,
+                                                    image_rect,
+                                                    tex,
+                                                    zp,
+                                                    &bg_style,
+                                                    None,
+                                                    fit_scale_limits,
                                                 );
                                             }
                                         } else {
@@ -2774,6 +2804,7 @@ impl App {
                                                 &state.location_display,
                                                 pixel_grid_enabled,
                                                 fit_mode,
+                                                fit_scale_limits,
                                                 content_bbox,
                                             );
                                             if let crate::app::CompareViewMode::Wipe { fraction } =
@@ -2786,6 +2817,7 @@ impl App {
                                                         image_rect,
                                                         tex.size(),
                                                         zp,
+                                                        fit_scale_limits,
                                                     )
                                                     .unwrap_or(image_rect);
                                                     let wipe_x = ref_rect.left()
@@ -2802,6 +2834,7 @@ impl App {
                                                         zp,
                                                         &bg_style,
                                                         Some(clip),
+                                                        fit_scale_limits,
                                                     );
                                                     Self::draw_compare_wipe_line(
                                                         ui, ref_rect, fraction,
@@ -2829,6 +2862,7 @@ impl App {
                                             free_rot, &bg_style, &state.location_display,
                                             pixel_grid_enabled,
                                             fit_mode,
+                                            fit_scale_limits,
                                             content_bbox,
                                         );
                                     }
@@ -2839,6 +2873,7 @@ impl App {
                                 SpreadPair::Double { left, right } => {
                                     let compare_mode = self.compare_view_mode;
                                     let zoom_pan = self.fs_zoom_pan();
+                                    let fit_scale_limits = self.fullscreen_fit_scale_limits();
                                     let compare_requested = !matches!(
                                         compare_mode,
                                         crate::app::CompareViewMode::Off
@@ -2864,7 +2899,13 @@ impl App {
                                         if let Some(tex) = compare_tex.as_ref() {
                                             let bg_style = self.fs_bg_style(ctx);
                                             Self::draw_compare_pinned_image(
-                                                ui, image_rect, tex, zoom_pan, &bg_style, None,
+                                                ui,
+                                                image_rect,
+                                                tex,
+                                                zoom_pan,
+                                                &bg_style,
+                                                None,
+                                                fit_scale_limits,
                                             );
                                             self.fs_spread_layout = None;
                                         }
@@ -2896,6 +2937,7 @@ impl App {
                                                     image_rect,
                                                     tex.size(),
                                                     zoom_pan,
+                                                    fit_scale_limits,
                                                 )
                                                 .unwrap_or(image_rect);
                                                 let wipe_x = ref_rect.left()
@@ -2912,6 +2954,7 @@ impl App {
                                                     zoom_pan,
                                                     &bg_style,
                                                     Some(clip),
+                                                    fit_scale_limits,
                                                 );
                                                 Self::draw_compare_wipe_line(
                                                     ui, ref_rect, fraction,
@@ -3317,7 +3360,11 @@ impl App {
                             let panorama_mode_active = panorama_active;
                             let mut panorama_pressed = false;
                             let fit_mode = self.effective_fullscreen_fit_mode();
+                            let fit_no_upscale = self.settings.fullscreen_fit_no_upscale;
+                            let fit_no_downscale = self.settings.fullscreen_fit_no_downscale;
                             let mut fit_mode_choice: Option<FullscreenFitMode> = None;
+                            let mut fit_no_upscale_choice: Option<bool> = None;
+                            let mut fit_no_downscale_choice: Option<bool> = None;
                             let mut bar_analysis_pressed = false;
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
@@ -3346,8 +3393,12 @@ impl App {
                                 &mut self.local_adjust_mode,
                                 has_page_override,
                                 fit_mode,
+                                fit_no_upscale,
+                                fit_no_downscale,
                                 &mut self.fit_popup_open,
                                 &mut fit_mode_choice,
+                                &mut fit_no_upscale_choice,
+                                &mut fit_no_downscale_choice,
                                 state.pdf_content_type,
                                 is_video_mode,
                                 video_meta,
@@ -3373,6 +3424,15 @@ impl App {
                             // (0 キーは従来どおり循環)。
                             if let Some(mode) = fit_mode_choice {
                                 self.set_fullscreen_fit_mode_for_current(ctx, fs_idx, mode);
+                            }
+                            if fit_no_upscale_choice.is_some() || fit_no_downscale_choice.is_some()
+                            {
+                                self.set_fullscreen_fit_scale_limits(
+                                    ctx,
+                                    fs_idx,
+                                    fit_no_upscale_choice.unwrap_or(fit_no_upscale),
+                                    fit_no_downscale_choice.unwrap_or(fit_no_downscale),
+                                );
                             }
                             // 360 度パノラマビュー: トグル
                             if panorama_pressed {
@@ -5813,7 +5873,12 @@ impl App {
             });
         let compare_drag_rect = compare_target_size
             .and_then(|size| {
-                Self::compare_image_draw_rect(compare_base_rect, size, compare_zoom_pan)
+                Self::compare_image_draw_rect(
+                    compare_base_rect,
+                    size,
+                    compare_zoom_pan,
+                    self.fullscreen_fit_scale_limits(),
+                )
             })
             .unwrap_or(compare_base_rect);
         if !cursor_in_panel && self.handle_compare_wipe_drag(ctx, compare_drag_rect) {
@@ -6897,6 +6962,7 @@ impl App {
         location_display: &str,
         pixel_grid_enabled: bool,
         fit_mode: FullscreenFitMode,
+        fit_scale_limits: FullscreenFitScaleLimits,
         // 余白カットフィット用の中身 bbox (正規化 0..1)。Some & rotation なしのとき適用。
         content_bbox: Option<egui::Rect>,
     ) {
@@ -6933,6 +6999,7 @@ impl App {
                 FullscreenFitMode::Original => (1.0, egui::Vec2::ZERO),
                 _ => (page_fit(), egui::Vec2::ZERO),
             };
+            let fit_scale = fit_scale_limits.apply(fit_scale);
             let (total_scale, base_center) = match zoom_pan {
                 Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
                 None => (fit_scale, full_rect.center()),
@@ -6942,7 +7009,8 @@ impl App {
             let img_rect = egui::Rect::from_center_size(center, display_size * total_scale);
             let needs_clip = zoom_pan.is_some()
                 || free_rotation_rad.abs() > TRANSFORM_EPSILON
-                || !matches!(fit_mode, FullscreenFitMode::Page);
+                || !matches!(fit_mode, FullscreenFitMode::Page)
+                || fit_scale_limits.active();
             let painter = if needs_clip {
                 ui.painter().with_clip_rect(full_rect)
             } else {
@@ -7128,11 +7196,19 @@ impl App {
             .effective_for_flow(self.reading_flow)
     }
 
+    fn fullscreen_fit_scale_limits(&self) -> FullscreenFitScaleLimits {
+        FullscreenFitScaleLimits {
+            no_upscale: self.settings.fullscreen_fit_no_upscale,
+            no_downscale: self.settings.fullscreen_fit_no_downscale,
+        }
+    }
+
     fn fullscreen_fit_allows_drag_pan(&self) -> bool {
-        matches!(
-            self.effective_fullscreen_fit_mode(),
-            FullscreenFitMode::Width | FullscreenFitMode::Height | FullscreenFitMode::Original
-        )
+        self.settings.fullscreen_fit_no_downscale
+            || matches!(
+                self.effective_fullscreen_fit_mode(),
+                FullscreenFitMode::Width | FullscreenFitMode::Height | FullscreenFitMode::Original
+            )
     }
 
     fn set_fullscreen_fit_mode_for_current(
@@ -7150,6 +7226,25 @@ impl App {
         self.settings.fullscreen_fit_mode = mode;
         self.settings.margin_fit_enabled = matches!(mode, FullscreenFitMode::MarginFit);
         self.fs_margin_bbox_cache.clear();
+        self.reset_fullscreen_fit_transform(fs_idx);
+        self.settings.save();
+        ctx.request_repaint();
+    }
+
+    fn set_fullscreen_fit_scale_limits(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        no_upscale: bool,
+        no_downscale: bool,
+    ) {
+        if self.settings.fullscreen_fit_no_upscale == no_upscale
+            && self.settings.fullscreen_fit_no_downscale == no_downscale
+        {
+            return;
+        }
+        self.settings.fullscreen_fit_no_upscale = no_upscale;
+        self.settings.fullscreen_fit_no_downscale = no_downscale;
         self.reset_fullscreen_fit_transform(fs_idx);
         self.settings.save();
         ctx.request_repaint();
@@ -7529,19 +7624,31 @@ impl App {
         );
         let target_w = (image_rect.width() * zoom - fit_gap_total).max(1.0);
         let target_h = (image_rect.height() * zoom).max(1.0);
-        let scale = match fit_mode {
-            FullscreenFitMode::Width => target_w / fit_width.max(1.0),
-            FullscreenFitMode::Height => target_h / base.height.max(1.0),
-            FullscreenFitMode::Original => zoom,
-            FullscreenFitMode::Page => {
-                (target_w / base.width.max(1.0)).min(target_h / base.height.max(1.0))
-            }
-            FullscreenFitMode::MarginFit => {
-                if flow.is_horizontal() {
-                    target_h / base.height.max(1.0)
-                } else {
-                    target_w / fit_width.max(1.0)
+        let fit_scale_limits = self.fullscreen_fit_scale_limits();
+        let scale = {
+            let scale_for = |target_w: f32, target_h: f32| match fit_mode {
+                FullscreenFitMode::Width => target_w / fit_width.max(1.0),
+                FullscreenFitMode::Height => target_h / base.height.max(1.0),
+                FullscreenFitMode::Original => 1.0,
+                FullscreenFitMode::Page => {
+                    (target_w / base.width.max(1.0)).min(target_h / base.height.max(1.0))
                 }
+                FullscreenFitMode::MarginFit => {
+                    if flow.is_horizontal() {
+                        target_h / base.height.max(1.0)
+                    } else {
+                        target_w / fit_width.max(1.0)
+                    }
+                }
+            };
+            if fit_scale_limits.active() {
+                let auto_target_w = (image_rect.width() - fit_gap_total).max(1.0);
+                let auto_target_h = image_rect.height().max(1.0);
+                fit_scale_limits.apply(scale_for(auto_target_w, auto_target_h)) * zoom
+            } else if matches!(fit_mode, FullscreenFitMode::Original) {
+                zoom
+            } else {
+                scale_for(target_w, target_h)
             }
         };
         base.width = (fit_width * scale + fit_gap_total).max(1.0);
@@ -8366,6 +8473,7 @@ impl App {
         full_rect: egui::Rect,
         image_size: [usize; 2],
         zoom_pan: Option<(f32, egui::Vec2)>,
+        fit_scale_limits: FullscreenFitScaleLimits,
     ) -> Option<egui::Rect> {
         let tex_size = egui::vec2(image_size[0] as f32, image_size[1] as f32);
         if tex_size.x <= 0.0
@@ -8375,7 +8483,8 @@ impl App {
         {
             return None;
         }
-        let fit_scale = (full_rect.width() / tex_size.x).min(full_rect.height() / tex_size.y);
+        let fit_scale = fit_scale_limits
+            .apply((full_rect.width() / tex_size.x).min(full_rect.height() / tex_size.y));
         let (total_scale, center) = match zoom_pan {
             Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
             None => (fit_scale, full_rect.center()),
@@ -8393,7 +8502,12 @@ impl App {
         zoom_pan: Option<(f32, egui::Vec2)>,
     ) -> Option<(egui::Rect, egui::Shape)> {
         let target_format = self.wgpu_render_state.as_ref()?.target_format;
-        let draw_rect = Self::compare_image_draw_rect(image_rect, pair.target_size, zoom_pan)?;
+        let draw_rect = Self::compare_image_draw_rect(
+            image_rect,
+            pair.target_size,
+            zoom_pan,
+            self.fullscreen_fit_scale_limits(),
+        )?;
         let callback = crate::compare_wgpu::CompareShaderCallback {
             key: pair.key,
             width: pair.target_size[0] as u32,
@@ -9196,6 +9310,7 @@ impl App {
             return true;
         }
 
+        let fit_scale_limits = self.fullscreen_fit_scale_limits();
         match mode {
             crate::app::CompareViewMode::PinnedNormal => {
                 let tex =
@@ -9204,7 +9319,15 @@ impl App {
                     return false;
                 };
                 let bg_style = self.fs_bg_style(ctx);
-                Self::draw_compare_pinned_image(ui, image_rect, tex, zoom_pan, &bg_style, None);
+                Self::draw_compare_pinned_image(
+                    ui,
+                    image_rect,
+                    tex,
+                    zoom_pan,
+                    &bg_style,
+                    None,
+                    fit_scale_limits,
+                );
                 true
             }
             crate::app::CompareViewMode::Wipe { fraction } => {
@@ -9216,10 +9339,23 @@ impl App {
                     return false;
                 };
                 let bg_style = self.fs_bg_style(ctx);
-                Self::draw_compare_pinned_image(ui, image_rect, current, zoom_pan, &bg_style, None);
+                Self::draw_compare_pinned_image(
+                    ui,
+                    image_rect,
+                    current,
+                    zoom_pan,
+                    &bg_style,
+                    None,
+                    fit_scale_limits,
+                );
                 // 線 / clip はフィット後の実表示画像矩形基準にして、画像の切り替え位置と一致させる。
-                let ref_rect = Self::compare_image_draw_rect(image_rect, current.size(), zoom_pan)
-                    .unwrap_or(image_rect);
+                let ref_rect = Self::compare_image_draw_rect(
+                    image_rect,
+                    current.size(),
+                    zoom_pan,
+                    fit_scale_limits,
+                )
+                .unwrap_or(image_rect);
                 let wipe_x = ref_rect.left() + ref_rect.width() * fraction.clamp(0.05, 0.95);
                 let clip =
                     egui::Rect::from_min_max(ref_rect.min, egui::pos2(wipe_x, ref_rect.max.y));
@@ -9230,6 +9366,7 @@ impl App {
                     zoom_pan,
                     &bg_style,
                     Some(clip),
+                    fit_scale_limits,
                 );
                 Self::draw_compare_wipe_line(ui, ref_rect, fraction);
                 true
@@ -9241,7 +9378,15 @@ impl App {
                     return false;
                 };
                 let bg_style = self.fs_bg_style(ctx);
-                Self::draw_compare_pinned_image(ui, image_rect, tex, zoom_pan, &bg_style, None);
+                Self::draw_compare_pinned_image(
+                    ui,
+                    image_rect,
+                    tex,
+                    zoom_pan,
+                    &bg_style,
+                    None,
+                    fit_scale_limits,
+                );
                 true
             }
             crate::app::CompareViewMode::Off => false,
@@ -9255,10 +9400,14 @@ impl App {
         zoom_pan: Option<(f32, egui::Vec2)>,
         bg_style: &FsBgStyle<'_>,
         clip_rect: Option<egui::Rect>,
+        fit_scale_limits: FullscreenFitScaleLimits,
     ) {
-        let Some(img_rect) =
-            Self::compare_image_draw_rect(full_rect, [tex.size()[0], tex.size()[1]], zoom_pan)
-        else {
+        let Some(img_rect) = Self::compare_image_draw_rect(
+            full_rect,
+            [tex.size()[0], tex.size()[1]],
+            zoom_pan,
+            fit_scale_limits,
+        ) else {
             return;
         };
         let clip = clip_rect
@@ -9684,6 +9833,7 @@ impl App {
     ) {
         let zoom_pan = self.fs_zoom_pan();
         let fit_mode = self.effective_fullscreen_fit_mode();
+        let fit_scale_limits = self.fullscreen_fit_scale_limits();
         let left_rot = self.get_rotation(left_idx);
         let right_rot = self.get_rotation(right_idx);
         // 余白カットフィット (見開き): 各ページの content bbox を取得し、後で左右セットの
@@ -9735,7 +9885,10 @@ impl App {
 
         // ズーム/パンが有効な場合は image_rect でクリップする
         // (ズーム時にページが image_rect 外へはみ出して他の UI を覆わないようにするため)
-        let painter = if zoom_pan.is_some() || !matches!(fit_mode, FullscreenFitMode::Page) {
+        let painter = if zoom_pan.is_some()
+            || !matches!(fit_mode, FullscreenFitMode::Page)
+            || fit_scale_limits.active()
+        {
             ui.painter().with_clip_rect(image_rect)
         } else {
             ui.painter().clone()
@@ -9785,6 +9938,7 @@ impl App {
                 FullscreenFitMode::Original => 1.0,
                 _ => page_fit(),
             };
+            let fit_scale = fit_scale_limits.apply(fit_scale);
 
             let (total_scale, base_center) = match zoom_pan {
                 Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
@@ -10092,8 +10246,12 @@ impl App {
         // ボタンクリックで fit_popup_open をトグルし、メニュー項目選択で
         // fit_mode_choice に選択モードを返す ([0] キーの循環とは別系統)。
         fit_mode: FullscreenFitMode,
+        fit_no_upscale: bool,
+        fit_no_downscale: bool,
         fit_popup_open: &mut bool,
         fit_mode_choice: &mut Option<FullscreenFitMode>,
+        fit_no_upscale_choice: &mut Option<bool>,
+        fit_no_downscale_choice: &mut Option<bool>,
         // PDF ページのコンテンツ種別 (非 PDF なら None)
         pdf_content_type: Option<PdfPageContentType>,
         // Phase 6: 動画モードか。true なら画像専用ボタンを隠し、▦ タイルボタンに
@@ -10705,7 +10863,8 @@ impl App {
         let fit_btn_x = next_x;
         let mut fit_resp_rect = egui::Rect::NOTHING;
         if !is_video && !panorama_mode_active {
-            let fit_active = !matches!(fit_mode, FullscreenFitMode::Page);
+            let fit_active =
+                !matches!(fit_mode, FullscreenFitMode::Page) || fit_no_upscale || fit_no_downscale;
             let mf_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -10715,15 +10874,22 @@ impl App {
                 fit_active,
                 draw_margin_fit_icon,
             );
+            let limit_tip = format!(
+                "拡大しない: {}\n縮小しない: {}",
+                if fit_no_upscale { "ON" } else { "OFF" },
+                if fit_no_downscale { "ON" } else { "OFF" }
+            );
             let fit_tip = if !reading_flow.is_paged() {
                 format!(
-                    "ズーム/フィット: {} [クリックで選択 / 0で循環]\n連結モードでは余白カットフィットをスキップ",
-                    fit_mode.label()
+                    "ズーム/フィット: {} [クリックで選択 / 0で循環]\n{}\n連結モードでは余白カットフィットをスキップ",
+                    fit_mode.label(),
+                    limit_tip
                 )
             } else {
                 format!(
-                    "ズーム/フィット: {} [クリックで選択 / 0で循環]",
-                    fit_mode.label()
+                    "ズーム/フィット: {} [クリックで選択 / 0で循環]\n{}",
+                    fit_mode.label(),
+                    limit_tip
                 )
             };
             let mf_resp = mf_resp.hover_tip_dark(fit_tip);
@@ -10746,8 +10912,9 @@ impl App {
             let modes = FullscreenFitMode::selectable_for_flow(*reading_flow);
             let header_h = 28.0_f32;
             let item_h = 36.0_f32;
-            let popup_w = 264.0_f32;
-            let popup_h = header_h + modes.len() as f32 * item_h + 8.0;
+            let section_h = 28.0_f32;
+            let popup_w = 280.0_f32;
+            let popup_h = header_h + modes.len() as f32 * item_h + section_h + item_h * 2.0 + 8.0;
             let popup_rect = egui::Rect::from_min_size(
                 egui::pos2(fit_btn_x, bar_rect.max.y + 4.0),
                 egui::vec2(popup_w, popup_h),
@@ -10808,6 +10975,73 @@ impl App {
                 if item_resp.clicked() {
                     *fit_mode_choice = Some(mode);
                     *fit_popup_open = false;
+                }
+                item_y += item_h;
+            }
+
+            let sep_y = item_y - 2.0;
+            ui.painter().line_segment(
+                [
+                    egui::pos2(popup_rect.min.x + 8.0, sep_y),
+                    egui::pos2(popup_rect.max.x - 8.0, sep_y),
+                ],
+                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(90, 90, 90, 170)),
+            );
+            ui.painter().text(
+                egui::pos2(popup_rect.min.x + 12.0, item_y + 16.0),
+                egui::Align2::LEFT_CENTER,
+                "倍率制限",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(150),
+            );
+            item_y += section_h;
+            for (id, label, active, out) in [
+                (
+                    "fit_no_upscale",
+                    "拡大しない",
+                    fit_no_upscale,
+                    fit_no_upscale_choice,
+                ),
+                (
+                    "fit_no_downscale",
+                    "縮小しない",
+                    fit_no_downscale,
+                    fit_no_downscale_choice,
+                ),
+            ] {
+                let item_rect = egui::Rect::from_min_size(
+                    egui::pos2(popup_rect.min.x + 4.0, item_y),
+                    egui::vec2(popup_w - 8.0, 32.0),
+                );
+                let item_resp = ui.interact(item_rect, egui::Id::new(id), egui::Sense::click());
+                let bg = if active {
+                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                } else if item_resp.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(item_rect, 4.0, bg);
+                ui.painter().text(
+                    egui::pos2(item_rect.min.x + 16.0, item_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_gray(220),
+                );
+                ui.painter().text(
+                    egui::pos2(item_rect.max.x - 16.0, item_rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    if active { "ON" } else { "OFF" },
+                    egui::FontId::proportional(12.0),
+                    if active {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_gray(150)
+                    },
+                );
+                if item_resp.clicked() {
+                    *out = Some(!active);
                 }
                 item_y += item_h;
             }
@@ -13530,7 +13764,13 @@ mod tests {
         // ならない。full_rect (黒帯込み) と混在させると、同じ fraction でも線の位置と
         // 切り替わり位置がズレる (本バグの本質)。
         let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
-        let fitted = App::compare_image_draw_rect(full, [400, 800], None).unwrap();
+        let fitted = App::compare_image_draw_rect(
+            full,
+            [400, 800],
+            None,
+            FullscreenFitScaleLimits::default(),
+        )
+        .unwrap();
         // 高さフィット (800/800=1.0)、幅 400 → 中央寄せで左右に黒帯。
         assert!((fitted.height() - 800.0).abs() < 0.5);
         assert!((fitted.width() - 400.0).abs() < 0.5);
@@ -13541,6 +13781,82 @@ mod tests {
         let x_fitted = fitted.left() + fitted.width() * f;
         let x_full = full.left() + full.width() * f;
         assert!((x_fitted - x_full).abs() > 100.0);
+    }
+
+    #[test]
+    fn fullscreen_fit_scale_limits_clamp_automatic_scale_only() {
+        assert_eq!(
+            FullscreenFitScaleLimits {
+                no_upscale: true,
+                no_downscale: false,
+            }
+            .apply(2.0),
+            1.0
+        );
+        assert_eq!(
+            FullscreenFitScaleLimits {
+                no_upscale: false,
+                no_downscale: true,
+            }
+            .apply(0.5),
+            1.0
+        );
+        assert_eq!(
+            FullscreenFitScaleLimits {
+                no_upscale: true,
+                no_downscale: true,
+            }
+            .apply(0.5),
+            1.0
+        );
+        assert_eq!(
+            FullscreenFitScaleLimits {
+                no_upscale: true,
+                no_downscale: true,
+            }
+            .apply(2.0),
+            1.0
+        );
+    }
+
+    #[test]
+    fn compare_draw_rect_honors_no_upscale_limit() {
+        let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+        let rect = App::compare_image_draw_rect(
+            full,
+            [100, 50],
+            None,
+            FullscreenFitScaleLimits {
+                no_upscale: true,
+                no_downscale: false,
+            },
+        )
+        .unwrap();
+
+        assert!((rect.width() - 100.0).abs() < 0.5);
+        assert!((rect.height() - 50.0).abs() < 0.5);
+        assert!((rect.center().x - full.center().x).abs() < 0.5);
+        assert!((rect.center().y - full.center().y).abs() < 0.5);
+    }
+
+    #[test]
+    fn compare_draw_rect_honors_no_downscale_limit() {
+        let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let rect = App::compare_image_draw_rect(
+            full,
+            [400, 200],
+            None,
+            FullscreenFitScaleLimits {
+                no_upscale: false,
+                no_downscale: true,
+            },
+        )
+        .unwrap();
+
+        assert!((rect.width() - 400.0).abs() < 0.5);
+        assert!((rect.height() - 200.0).abs() < 0.5);
+        assert!(rect.width() > full.width());
+        assert!(rect.height() > full.height());
     }
 
     #[test]

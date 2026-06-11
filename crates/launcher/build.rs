@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use sha2::{Digest, Sha256};
 
 /// `pub const NAME: &str = "value";` 形式の文字列リテラル定数を抽出する。
-/// `src/single_instance.rs` から MUTEX_NAME / ACTIVATE_EVENT_NAME を拾うために使用。
+/// `src/single_instance.rs` から single-instance 関連の文字列定数を拾うために使用。
 fn extract_const(src: &str, name: &str) -> Option<String> {
     for line in src.lines() {
         let line = line.trim();
@@ -104,8 +104,13 @@ fn main() {
         eprintln!("could not extract ACTIVATE_EVENT_NAME from src/single_instance.rs");
         std::process::exit(1);
     });
+    let open_path_pipe_name = extract_const(&src, "OPEN_PATH_PIPE_NAME").unwrap_or_else(|| {
+        eprintln!("could not extract OPEN_PATH_PIPE_NAME from src/single_instance.rs");
+        std::process::exit(1);
+    });
     println!("cargo:rustc-env=MIMV_MUTEX_NAME={mutex_name}");
     println!("cargo:rustc-env=MIMV_ACTIVATE_EVENT_NAME={activate_name}");
+    println!("cargo:rustc-env=MIMV_OPEN_PATH_PIPE_NAME={open_path_pipe_name}");
     println!("cargo:rerun-if-changed={}", single_instance_rs.display());
 
     #[cfg(target_os = "windows")]

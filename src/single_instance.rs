@@ -169,6 +169,14 @@ pub const ACTIVATE_EVENT_NAME: &str = "Global\\mImageViewerActivate_v1";
 #[cfg(feature = "portable")]
 pub const ACTIVATE_EVENT_NAME: &str = "Global\\mImageViewerActivate_portable_v1";
 
+/// 2 重起動されたプロセスから既存インスタンスへ「このパスを開いてほしい」を渡す
+/// Named Pipe。activate event は値を運べないので、ウィンドウ復帰通知とは別に
+/// 小さな byte stream IPC を使う。
+#[cfg(not(feature = "portable"))]
+pub const OPEN_PATH_PIPE_NAME: &str = r"\\.\pipe\mImageViewerOpenPath_v1";
+#[cfg(feature = "portable")]
+pub const OPEN_PATH_PIPE_NAME: &str = r"\\.\pipe\mImageViewerOpenPath_portable_v1";
+
 /// インストーラ (Inno Setup `[Code]` / `SignalAppShutdown`) が、既存の mIV インスタンスに
 /// クリーン終了を要求するための Named Event 名。トレイ常駐中のインスタンスでも
 /// この event を拾うと `on_exit` 経由で DB 書き出し + 設定保存してから抜けるので、
@@ -214,12 +222,296 @@ pub fn signal_activate_existing() -> bool {
     }
 }
 
+#[cfg(windows)]
+const OPEN_PATH_MAX_U16: usize = 32_767;
+#[cfg(windows)]
+const OPEN_PATH_PIPE_BUFFER_BYTES: u32 = 64 * 1024;
+
+/// 2 重起動時に既存インスタンスへ「開くパス」を送る。Windows 専用。
+/// 成否に関わらず呼び出し側は `signal_activate_existing()` で前面化も要求する。
+pub fn send_open_path_to_existing(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        let Some(message) = encode_open_path_message(path) else {
+            crate::logger::log(format!(
+                "single_instance: open path is too long or empty: {}",
+                path.display()
+            ));
+            return false;
+        };
+        send_open_path_message_to_existing(&message, true)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+#[cfg(windows)]
+fn encode_open_path_message(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.is_empty() || wide.len() > OPEN_PATH_MAX_U16 {
+        return None;
+    }
+    let mut message = Vec::with_capacity(4 + wide.len() * 2);
+    message.extend_from_slice(&(wide.len() as u32).to_le_bytes());
+    for unit in wide {
+        message.extend_from_slice(&unit.to_le_bytes());
+    }
+    Some(message)
+}
+
+#[cfg(windows)]
+fn decode_open_path_message(message: &[u8]) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+
+    if message.len() < 4 {
+        return None;
+    }
+    let len = u32::from_le_bytes(message[0..4].try_into().ok()?) as usize;
+    if len == 0 || len > OPEN_PATH_MAX_U16 {
+        return None;
+    }
+    let body_len = len.checked_mul(2)?;
+    if message.len() != 4 + body_len {
+        return None;
+    }
+    let mut units = Vec::with_capacity(len);
+    for chunk in message[4..].chunks_exact(2) {
+        units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+        &units,
+    )))
+}
+
+#[cfg(windows)]
+fn open_path_pipe_name_wide() -> Vec<u16> {
+    OPEN_PATH_PIPE_NAME.encode_utf16().chain([0]).collect()
+}
+
+#[cfg(windows)]
+fn send_open_path_message_to_existing(message: &[u8], retry_not_found: bool) -> bool {
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GetLastError,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+    use windows::Win32::System::Pipes::WaitNamedPipeW;
+    use windows::core::PCWSTR;
+
+    let name_wide = open_path_pipe_name_wide();
+    let max_attempts = if retry_not_found { 60 } else { 1 };
+    for attempt in 0..max_attempts {
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(name_wide.as_ptr()),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        };
+        match handle {
+            Ok(handle) => {
+                let ok = write_pipe_all(handle, message);
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                if !ok {
+                    crate::logger::log("single_instance: open path pipe write failed");
+                }
+                return ok;
+            }
+            Err(e) => {
+                let last = unsafe { GetLastError() };
+                if last == ERROR_PIPE_BUSY {
+                    unsafe {
+                        let _ = WaitNamedPipeW(PCWSTR(name_wide.as_ptr()), 100);
+                    }
+                    continue;
+                }
+                if retry_not_found && last == ERROR_FILE_NOT_FOUND && attempt + 1 < max_attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                crate::logger::log(format!(
+                    "single_instance: open path pipe connect failed: {e:?}"
+                ));
+                return false;
+            }
+        }
+    }
+    crate::logger::log("single_instance: open path pipe connect timed out");
+    false
+}
+
+#[cfg(windows)]
+fn write_pipe_all(handle: windows::Win32::Foundation::HANDLE, mut bytes: &[u8]) -> bool {
+    use windows::Win32::Storage::FileSystem::WriteFile;
+
+    while !bytes.is_empty() {
+        let mut written = 0_u32;
+        if unsafe { WriteFile(handle, Some(bytes), Some(&mut written), None) }.is_err()
+            || written == 0
+        {
+            return false;
+        }
+        bytes = &bytes[written as usize..];
+    }
+    true
+}
+
+#[cfg(windows)]
+fn poke_open_path_listener() {
+    let message = 0_u32.to_le_bytes();
+    let _ = send_open_path_message_to_existing(&message, false);
+}
+
+#[cfg(windows)]
+fn spawn_open_path_listener(
+    stop_event_raw: isize,
+    egui_ctx: eframe::egui::Context,
+    open_path_tx: std::sync::mpsc::Sender<std::path::PathBuf>,
+) -> Option<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("mimv-open-path-listener".into())
+        .spawn(move || open_path_listener_loop(stop_event_raw, egui_ctx, open_path_tx))
+        .ok()
+}
+
+#[cfg(windows)]
+fn open_path_listener_loop(
+    stop_event_raw: isize,
+    egui_ctx: eframe::egui::Context,
+    open_path_tx: std::sync::mpsc::Sender<std::path::PathBuf>,
+) {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, GetLastError, HANDLE};
+    use windows::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, NAMED_PIPE_MODE,
+        PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
+    use windows::core::PCWSTR;
+
+    let stop_event = HANDLE(stop_event_raw as *mut _);
+    let name_wide = open_path_pipe_name_wide();
+    loop {
+        if stop_event_is_set(stop_event) {
+            break;
+        }
+
+        let pipe_mode = NAMED_PIPE_MODE(PIPE_TYPE_BYTE.0 | PIPE_READMODE_BYTE.0 | PIPE_WAIT.0);
+        let pipe = unsafe {
+            CreateNamedPipeW(
+                PCWSTR(name_wide.as_ptr()),
+                PIPE_ACCESS_INBOUND,
+                pipe_mode,
+                1,
+                0,
+                OPEN_PATH_PIPE_BUFFER_BYTES,
+                0,
+                None,
+            )
+        };
+        if pipe.is_invalid() {
+            crate::logger::log("single_instance: CreateNamedPipeW(open path) failed");
+            break;
+        }
+
+        let connected = unsafe {
+            ConnectNamedPipe(pipe, None).is_ok() || GetLastError() == ERROR_PIPE_CONNECTED
+        };
+        if !connected {
+            unsafe {
+                let _ = CloseHandle(pipe);
+            }
+            continue;
+        }
+
+        let path = read_open_path_message(pipe);
+        unsafe {
+            let _ = DisconnectNamedPipe(pipe);
+            let _ = CloseHandle(pipe);
+        }
+
+        if stop_event_is_set(stop_event) {
+            break;
+        }
+        let Some(path) = path else {
+            continue;
+        };
+        crate::logger::log(format!(
+            "single_instance: received open path: {}",
+            path.display()
+        ));
+        if open_path_tx.send(path).is_err() {
+            break;
+        }
+        egui_ctx.request_repaint();
+    }
+    crate::logger::log("single_instance: open path listener thread exiting");
+}
+
+#[cfg(windows)]
+fn stop_event_is_set(stop_event: windows::Win32::Foundation::HANDLE) -> bool {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    unsafe { WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0 }
+}
+
+#[cfg(windows)]
+fn read_open_path_message(pipe: windows::Win32::Foundation::HANDLE) -> Option<std::path::PathBuf> {
+    let mut message = read_pipe_exact(pipe, 4)?;
+    let len = u32::from_le_bytes(message[0..4].try_into().ok()?) as usize;
+    if len == 0 {
+        return None;
+    }
+    if len > OPEN_PATH_MAX_U16 {
+        crate::logger::log(format!(
+            "single_instance: open path message too long: {len} u16"
+        ));
+        return None;
+    }
+    let body = read_pipe_exact(pipe, len.checked_mul(2)?)?;
+    message.extend_from_slice(&body);
+    decode_open_path_message(&message)
+}
+
+#[cfg(windows)]
+fn read_pipe_exact(handle: windows::Win32::Foundation::HANDLE, len: usize) -> Option<Vec<u8>> {
+    use windows::Win32::Storage::FileSystem::ReadFile;
+
+    let mut buf = vec![0_u8; len];
+    let mut offset = 0;
+    while offset < len {
+        let mut read = 0_u32;
+        if unsafe { ReadFile(handle, Some(&mut buf[offset..]), Some(&mut read), None) }.is_err()
+            || read == 0
+        {
+            return None;
+        }
+        offset += read as usize;
+    }
+    Some(buf)
+}
+
 /// アクティベーションリスナースレッドのハンドル。
 /// Drop でシャットダウン: `stop_event` を signal → waiter スレッドが抜ける。
 pub struct ActivationListener {
     #[cfg(windows)]
     stop_event: windows::Win32::Foundation::HANDLE,
     thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(windows)]
+    path_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// メインプロセス側のシングルインスタンスリスナーを起動する。3 種のイベントを待機:
@@ -242,6 +534,7 @@ pub fn spawn_activation_listener(
     egui_ctx: eframe::egui::Context,
     placement_slot: crate::tray::PlacementSlot,
     shutdown_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    open_path_tx: std::sync::mpsc::Sender<std::path::PathBuf>,
 ) -> Option<ActivationListener> {
     #[cfg(windows)]
     {
@@ -283,6 +576,8 @@ pub fn spawn_activation_listener(
             shutdown: shutdown_event_raw,
             stop: stop_event.0 as isize,
         };
+        let path_thread =
+            spawn_open_path_listener(stop_event.0 as isize, egui_ctx.clone(), open_path_tx);
 
         let thread = std::thread::Builder::new()
             .name("mimv-activate-listener".into())
@@ -373,11 +668,18 @@ pub fn spawn_activation_listener(
         Some(ActivationListener {
             stop_event,
             thread: Some(thread),
+            path_thread,
         })
     }
     #[cfg(not(windows))]
     {
-        let _ = (hwnd_raw, egui_ctx, shutdown_requested);
+        let _ = (
+            hwnd_raw,
+            egui_ctx,
+            placement_slot,
+            shutdown_requested,
+            open_path_tx,
+        );
         None
     }
 }
@@ -391,12 +693,33 @@ impl Drop for ActivationListener {
             unsafe {
                 let _ = SetEvent(self.stop_event);
             }
+            poke_open_path_listener();
             if let Some(th) = self.thread.take() {
+                let _ = th.join();
+            }
+            if let Some(th) = self.path_thread.take() {
                 let _ = th.join();
             }
             unsafe {
                 let _ = CloseHandle(self.stop_event);
             }
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_path_message_round_trips_unicode_path() {
+        let path = std::path::PathBuf::from(r"C:\books\日本語\book.cbr");
+        let message = encode_open_path_message(&path).expect("encoded");
+        assert_eq!(decode_open_path_message(&message), Some(path));
+    }
+
+    #[test]
+    fn open_path_message_rejects_empty_wake_message() {
+        assert_eq!(decode_open_path_message(&0_u32.to_le_bytes()), None);
     }
 }

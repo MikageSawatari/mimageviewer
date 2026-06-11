@@ -35,12 +35,14 @@ pub mod dwm_transitions;
 pub mod editing_addon;
 pub mod editing_addon_download;
 pub mod exif_reader;
+pub mod explorer_integration;
 pub mod export_crop;
 pub mod export_dialog;
 pub mod external_links;
 pub mod external_metadata;
 pub mod fast_resize;
 pub mod file_drag;
+pub mod folder_pane;
 pub mod folder_rating_counter;
 pub mod folder_thumb_pins;
 pub mod folder_tree;
@@ -118,6 +120,7 @@ mod ui_conceal;
 mod ui_crop;
 pub mod ui_dialogs;
 mod ui_erase;
+mod ui_folder_pane;
 pub mod ui_fonts;
 mod ui_fullscreen;
 pub mod ui_helpers;
@@ -623,6 +626,7 @@ fn main() -> eframe::Result {
     #[cfg(windows)]
     let dcomp_presenter_config = dcomp_presenter_test::parse_config();
     let perf_log_path = parse_perf_log_path_arg();
+    let startup_open_path = parse_startup_open_path_arg();
 
     // --pdf-worker モード: GUI なしで PDFium ワーカープロセスとして起動
     if std::env::args().any(|a| a == pdf_loader::PDF_WORKER_ARG) {
@@ -671,11 +675,14 @@ fn main() -> eframe::Result {
     } else {
         let guard = single_instance::SingleInstanceGuard::acquire();
         if !guard.is_first_instance() {
+            let forwarded = startup_open_path
+                .as_ref()
+                .is_some_and(|path| single_instance::send_open_path_to_existing(path));
             // 2 重起動: 既存インスタンスの activate event を叩いてウィンドウを前面に出す。
             // ユーザーが「もう一度 mIV を起動」した意図を既存インスタンスで復帰として解釈する。
             let signaled = single_instance::signal_activate_existing();
             eprintln!(
-                "mImageViewer is already running (activate signaled: {signaled}). Exiting second instance."
+                "mImageViewer is already running (path forwarded: {forwarded}, activate signaled: {signaled}). Exiting second instance."
             );
             std::process::exit(0);
         }
@@ -921,6 +928,9 @@ fn main() -> eframe::Result {
             // では事前に読んだ `saved` を直接受け取って boot race を完全に排除する。
             let mut app = app::App::new_from_settings(saved.clone());
             emit_startup("app_default", Some(t));
+            if let Some(path) = startup_open_path.clone() {
+                app.set_startup_open_path(path);
+            }
             if let Some(config) = play_test_config.clone() {
                 app.configure_play_test(config);
             }
@@ -1104,6 +1114,68 @@ fn parse_play_test_config() -> Option<app::PlayTestConfig> {
     })
 }
 
+fn parse_startup_open_path_arg() -> Option<std::path::PathBuf> {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    parse_startup_open_path_arg_from(&args).map(absolutize_startup_open_path)
+}
+
+fn parse_startup_open_path_arg_from(args: &[std::ffi::OsString]) -> Option<std::path::PathBuf> {
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg.as_os_str() == std::ffi::OsStr::new("--") {
+            return args
+                .get(i + 1)
+                .map(|arg| std::path::PathBuf::from(arg.as_os_str()));
+        }
+
+        if let Some(flag) = arg.to_str() {
+            if flag.starts_with("--") {
+                if flag == "--perf-log"
+                    && args
+                        .get(i + 1)
+                        .and_then(|next| next.to_str())
+                        .is_some_and(|next| !next.starts_with("--"))
+                {
+                    i += 2;
+                    continue;
+                }
+                i += if cli_flag_takes_value(flag) { 2 } else { 1 };
+                continue;
+            }
+        }
+
+        return Some(std::path::PathBuf::from(arg.as_os_str()));
+    }
+    None
+}
+
+fn absolutize_startup_open_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(&path))
+        .unwrap_or(path)
+}
+
+fn cli_flag_takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--data-dir"
+            | "--window-size"
+            | "--perf-log-path"
+            | "--play-test"
+            | "--play-duration"
+            | "--play-test-start"
+            | "--dcomp-presenter-test"
+            | "--dcomp-duration"
+            | "--dcomp-window-size"
+            | "--dcomp-sync-interval"
+            | "--dcomp-start"
+    )
+}
+
 /// メインウィンドウの最小 inner サイズ (論理ポイント)。これ以下ではアドレスバーの
 /// ウィジェットが重なり、in-window 表示の消しゴムパネル (非スクロール、高さ約 572px)
 /// が下端で切れる。
@@ -1128,5 +1200,71 @@ fn load_icon() -> egui::IconData {
         rgba: img.into_raw(),
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn startup_open_path_uses_first_positional_path() {
+        let args = os_args(&["mimageviewer.exe", r"C:\books\book.zip"]);
+        assert_eq!(
+            parse_startup_open_path_arg_from(&args),
+            Some(PathBuf::from(r"C:\books\book.zip"))
+        );
+    }
+
+    #[test]
+    fn startup_open_path_skips_known_option_values() {
+        let args = os_args(&[
+            "mimageviewer.exe",
+            "--data-dir",
+            r"D:\miv-data",
+            "--window-size",
+            "1400x860",
+            r"C:\books\book.rar",
+        ]);
+        assert_eq!(
+            parse_startup_open_path_arg_from(&args),
+            Some(PathBuf::from(r"C:\books\book.rar"))
+        );
+    }
+
+    #[test]
+    fn startup_open_path_skips_perf_log_optional_path() {
+        let args = os_args(&[
+            "mimageviewer.exe",
+            "--perf-log",
+            r"C:\logs\startup.jsonl",
+            r"C:\books\book.cbz",
+        ]);
+        assert_eq!(
+            parse_startup_open_path_arg_from(&args),
+            Some(PathBuf::from(r"C:\books\book.cbz"))
+        );
+    }
+
+    #[test]
+    fn startup_open_path_allows_delimiter() {
+        let args = os_args(&["mimageviewer.exe", "--", r"C:\books\--book.zip"]);
+        assert_eq!(
+            parse_startup_open_path_arg_from(&args),
+            Some(PathBuf::from(r"C:\books\--book.zip"))
+        );
+    }
+
+    #[test]
+    fn startup_open_path_absolutizes_relative_path() {
+        let path = absolutize_startup_open_path(PathBuf::from("book.zip"));
+        assert!(path.is_absolute());
+        assert!(path.ends_with("book.zip"));
     }
 }

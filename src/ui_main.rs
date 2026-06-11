@@ -1252,7 +1252,13 @@ impl App {
         let show_sort = !tb_sorts.is_empty();
         let show_favs = self.settings.show_toolbar_favorites;
         let show_rating = self.settings.show_toolbar_rating;
-        let any_toolbar_section = show_cols || show_aspect || show_sort || show_favs || show_rating;
+        let show_folder_tree_button = true;
+        let any_toolbar_section = show_folder_tree_button
+            || show_cols
+            || show_aspect
+            || show_sort
+            || show_favs
+            || show_rating;
 
         if !any_toolbar_section {
             return None;
@@ -1336,6 +1342,25 @@ impl App {
                 // VST ボタンから開く (フルスクリーンビューポート内で完結)。
                 // 通常表示中はパネルを開く手段は無く、設定変更は環境設定→
                 // VST3 プラグイン から行う運用。
+                if show_folder_tree_button {
+                    let active = self.settings.folder_tree_pane_visible;
+                    let resp = ui
+                        .selectable_label(active, "ツリー")
+                        .on_hover_text("左側に実フォルダツリーを表示");
+                    if resp.clicked() {
+                        self.settings.folder_tree_pane_visible = !active;
+                        if self.settings.folder_tree_pane_visible {
+                            let active = self.effective_folder();
+                            self.folder_pane
+                                .sync_to_active(active.as_deref(), self.settings.sort_order);
+                            self.folder_pane.set_focus_tree_at_active();
+                        } else {
+                            self.folder_pane.set_focus_grid();
+                        }
+                        self.settings.save();
+                    }
+                    first_section = false;
+                }
                 if show_cols {
                     if !first_section {
                         ui.separator();
@@ -3094,6 +3119,9 @@ impl App {
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
         let response = ui.interact(cell_rect, ui.id().with(idx), egui::Sense::click_and_drag());
         let mut nav = None;
+        if response.clicked() || response.double_clicked() || response.secondary_clicked() {
+            self.folder_pane.set_focus_grid();
+        }
         if response.clicked() {
             let ctrl = ctx.input(|i| i.modifiers.ctrl);
             let shift = ctx.input(|i| i.modifiers.shift);

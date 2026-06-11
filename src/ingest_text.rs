@@ -154,23 +154,16 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
         out.name = normalize_for_match(name);
     }
 
-    // 2. EXIF (rexif が自前で開く。内部パーサーが IFD を読むだけなので全読みしない想定)
-    if let Some(exif) = crate::exif_reader::read_exif(path, &[]) {
-        let mut buf = String::with_capacity(128);
-        append_exif(&mut buf, &exif);
-        if !buf.trim().is_empty() {
-            out.exif = normalize_for_match(&buf);
-        }
-    }
-
-    // 3. XMP / PNG / dc:subject は同じファイル実体を 3 回読む path-based 版を使うと
+    // 2. XMP / PNG / EXIF UserComment AI メタ / dc:subject は同じファイル実体を
+    //    複数回読む path-based 版を使うと
     //    AI 生成 PNG (10-30MB) で 3x 倍のディスク読み取りになり、インデクサが
     //    350MB/秒級でディスクを占有してしまう (Codex perf 報告)。
     //    ここで一度だけ読んで bytes 版に渡すことで I/O を 3 分の 1 に減らす。
     let is_video_sidecar = crate::xmp_writer::is_video_for_sidecar(path);
+    let mut ai_from_exif_user_comment = false;
 
     if let Some(bytes) = read_metadata_bytes(path) {
-        // 3a. XMP (mXD Twitter メタ)
+        // 2a. XMP (mXD Twitter メタ)
         if let Some(xmp) = crate::xmp_reader::read_tweet_info_from_bytes(&bytes) {
             let mut buf = String::with_capacity(128);
             append_xmp(&mut buf, &xmp);
@@ -178,16 +171,31 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
                 out.xmp_tweet = normalize_for_match(&buf);
             }
         }
-        // 3b. PNG AI プロンプト (tEXt/iTXt/zTXt)
-        let png_text = crate::png_metadata::build_searchable_from_bytes(&bytes);
-        if !png_text.is_empty() {
-            out.png_prompt = normalize_for_match(&png_text);
+        // 2b. AI プロンプト (PNG tEXt/iTXt/zTXt / EXIF UserComment)
+        let (ai_text, ai_origin) =
+            crate::png_metadata::build_searchable_from_bytes_with_origin(&bytes);
+        if !ai_text.is_empty() {
+            out.png_prompt = normalize_for_match(&ai_text);
         }
-        // 3c. XMP dc:subject タグ。動画は本体ではなくサイドカーが authoritative なので
+        if ai_origin == Some(crate::png_metadata::MetadataOrigin::ExifUserComment) {
+            ai_from_exif_user_comment = true;
+        }
+        // 2c. XMP dc:subject タグ。動画は本体ではなくサイドカーが authoritative なので
         //     ここでは触らず後段に任せる (本体に古い XMP が残っていても無視する)。
         if !is_video_sidecar {
             let dc_tags = crate::xmp_reader::read_dc_subject_from_bytes(&bytes);
             out.tags = build_tags_column(&dc_tags);
+        }
+    }
+
+    // 3. EXIF (rexif が自前で開く。内部パーサーが IFD を読むだけなので全読みしない想定)
+    //    UserComment が AI メタとして認識された場合は png_prompt 側に正規化済みで載るため、
+    //    EXIF 側には再掲しない (Negative prompt の二重取り込み防止)。
+    if let Some(exif) = crate::exif_reader::read_exif(path, &[]) {
+        let mut buf = String::with_capacity(128);
+        append_exif(&mut buf, &exif, ai_from_exif_user_comment);
+        if !buf.trim().is_empty() {
+            out.exif = normalize_for_match(&buf);
         }
     }
 
@@ -355,7 +363,12 @@ pub fn build_per_source_from_bytes(display_name: &str, bytes: &[u8]) -> PerSourc
 
     if let Some(exif) = crate::exif_reader::read_exif_from_bytes(bytes, &[]) {
         let mut buf = String::with_capacity(128);
-        append_exif(&mut buf, &exif);
+        let (_, ai_origin) = crate::png_metadata::build_searchable_from_bytes_with_origin(bytes);
+        append_exif(
+            &mut buf,
+            &exif,
+            ai_origin == Some(crate::png_metadata::MetadataOrigin::ExifUserComment),
+        );
         if !buf.trim().is_empty() {
             out.exif = normalize_for_match(&buf);
         }
@@ -396,9 +409,12 @@ pub fn build_per_source_for_pdf(display_name: &str, info_text: &str) -> PerSourc
     }
 }
 
-fn append_exif(out: &mut String, info: &crate::exif_reader::ExifInfo) {
+fn append_exif(out: &mut String, info: &crate::exif_reader::ExifInfo, skip_user_comment: bool) {
     for (_group, tags) in &info.sections {
-        for (_name, value) in tags {
+        for (name, value) in tags {
+            if skip_user_comment && name == "UserComment" {
+                continue;
+            }
             // タグ名自体は検索キーワードとしての価値が薄い (ユーザが "ExposureTime" と
             // 打つことは稀)。値だけを入れる。カメラ名・レンズ名・撮影地名など
             // 人間が検索しそうなのは value 側に入っている。
@@ -500,6 +516,27 @@ mod tests {
     fn build_from_bytes_works() {
         let pst = build_per_source_from_bytes("photo.jpg", b"no real metadata");
         assert!(pst.name.contains("photo.jpg"));
+    }
+
+    #[test]
+    fn append_exif_can_skip_ai_user_comment() {
+        let info = crate::exif_reader::ExifInfo {
+            sections: vec![(
+                crate::exif_reader::TagGroup::Other,
+                vec![
+                    (
+                        "UserComment".to_string(),
+                        "positive\nNegative prompt: should-not-leak".to_string(),
+                    ),
+                    ("LensModel".to_string(), "safe lens".to_string()),
+                ],
+            )],
+        };
+        let mut buf = String::new();
+        append_exif(&mut buf, &info, true);
+        assert!(buf.contains("safe lens"));
+        assert!(!buf.contains("should-not-leak"), "buf={buf}");
+        assert!(!buf.contains("positive"), "buf={buf}");
     }
 
     #[test]

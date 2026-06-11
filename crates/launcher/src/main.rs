@@ -66,8 +66,10 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    let user_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+
     #[cfg(windows)]
-    if try_activate_existing() {
+    if try_activate_existing(&user_args) {
         return Ok(());
     }
 
@@ -87,11 +89,14 @@ fn run() -> Result<(), String> {
     }
 
     let core_path = runtime_dir.join("mimageviewer-core.exe");
-    let user_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let launcher_path = std::env::current_exe().ok();
 
-    Command::new(&core_path)
-        .args(&user_args)
-        .spawn()
+    let mut cmd = Command::new(&core_path);
+    cmd.args(&user_args);
+    if let Some(path) = launcher_path {
+        cmd.env("MIV_LAUNCHER_EXE_PATH", path);
+    }
+    cmd.spawn()
         .map_err(|e| format!("spawn core failed ({}): {e}", core_path.display()))?;
 
     Ok(())
@@ -195,7 +200,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 #[cfg(windows)]
-fn try_activate_existing() -> bool {
+fn try_activate_existing(user_args: &[OsString]) -> bool {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
         EVENT_MODIFY_STATE, OpenEventW, OpenMutexW, SYNCHRONIZATION_ACCESS_RIGHTS, SetEvent,
@@ -215,6 +220,12 @@ fn try_activate_existing() -> bool {
         let _ = CloseHandle(mutex_handle);
     }
 
+    if let Some(path) =
+        parse_startup_open_path_arg_from(user_args).map(absolutize_startup_open_path)
+    {
+        let _ = send_open_path_to_existing(&path);
+    }
+
     let event_wide = wide_nul(ACTIVATE_EVENT_NAME);
     if let Ok(event_handle) =
         unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(event_wide.as_ptr())) }
@@ -225,6 +236,134 @@ fn try_activate_existing() -> bool {
         }
     }
     true
+}
+
+#[cfg(windows)]
+fn parse_startup_open_path_arg_from(args: &[OsString]) -> Option<PathBuf> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg.as_os_str() == std::ffi::OsStr::new("--") {
+            return args.get(i + 1).map(|arg| PathBuf::from(arg.as_os_str()));
+        }
+
+        if let Some(flag) = arg.to_str()
+            && flag.starts_with("--")
+        {
+            if flag == "--perf-log"
+                && args
+                    .get(i + 1)
+                    .and_then(|next| next.to_str())
+                    .is_some_and(|next| !next.starts_with("--"))
+            {
+                i += 2;
+                continue;
+            }
+            i += if cli_flag_takes_value(flag) { 2 } else { 1 };
+            continue;
+        }
+
+        return Some(PathBuf::from(arg.as_os_str()));
+    }
+    None
+}
+
+#[cfg(windows)]
+fn absolutize_startup_open_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(&path))
+        .unwrap_or(path)
+}
+
+#[cfg(windows)]
+fn cli_flag_takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--data-dir"
+            | "--window-size"
+            | "--perf-log-path"
+            | "--play-test"
+            | "--play-duration"
+            | "--play-test-start"
+            | "--dcomp-presenter-test"
+            | "--dcomp-duration"
+            | "--dcomp-window-size"
+            | "--dcomp-sync-interval"
+            | "--dcomp-start"
+    )
+}
+
+#[cfg(windows)]
+fn send_open_path_to_existing(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_BUSY, GetLastError};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING, WriteFile,
+    };
+    use windows::Win32::System::Pipes::WaitNamedPipeW;
+    use windows::core::PCWSTR;
+
+    const OPEN_PATH_MAX_U16: usize = 32_767;
+    const OPEN_PATH_PIPE_NAME: &str = env!("MIMV_OPEN_PATH_PIPE_NAME");
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.is_empty() || wide.len() > OPEN_PATH_MAX_U16 {
+        return false;
+    }
+    let mut message = Vec::with_capacity(4 + wide.len() * 2);
+    message.extend_from_slice(&(wide.len() as u32).to_le_bytes());
+    for unit in wide {
+        message.extend_from_slice(&unit.to_le_bytes());
+    }
+
+    let name_wide = wide_nul(OPEN_PATH_PIPE_NAME);
+    for _ in 0..60 {
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(name_wide.as_ptr()),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        };
+        match handle {
+            Ok(handle) => {
+                let mut bytes = message.as_slice();
+                let mut ok = true;
+                while !bytes.is_empty() {
+                    let mut written = 0_u32;
+                    if unsafe { WriteFile(handle, Some(bytes), Some(&mut written), None) }.is_err()
+                        || written == 0
+                    {
+                        ok = false;
+                        break;
+                    }
+                    bytes = &bytes[written as usize..];
+                }
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                return ok;
+            }
+            Err(_) => {
+                if unsafe { GetLastError() } == ERROR_PIPE_BUSY {
+                    unsafe {
+                        let _ = WaitNamedPipeW(PCWSTR(name_wide.as_ptr()), 100);
+                    }
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
+    false
 }
 
 #[cfg(windows)]

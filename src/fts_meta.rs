@@ -1,4 +1,4 @@
-//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=8)。
+//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=9)。
 //!
 //! docs/search-architecture.md に準拠する。
 //!
@@ -41,7 +41,8 @@ use crate::search_index_db::normalize_path;
 ///      post-filter の SQLite SELECT も削除。
 /// - 7: 動画メタデータ検索 (IndexKind::Video + video_meta_text) を追加。
 /// - 8: 外部メタデータサイドカー検索 (SourceKind::Sidecar + sidecar_text) を追加。
-pub const INDEX_VERSION: i64 = 8;
+/// - 9: AI 生成メタデータの対応形式拡充と EXIF UserComment の Negative 除外。
+pub const INDEX_VERSION: i64 = 9;
 
 /// 後始末 (VACUUM 等) を要求するスキーマ世代。`PRAGMA application_id` に書き込み、
 /// 既に最新なら再実行しない。INDEX_VERSION とは別管理で、データ移行を伴わない

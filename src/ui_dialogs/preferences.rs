@@ -37,6 +37,7 @@ pub enum Vst3ScanMessage {
 pub(crate) enum PreferencesPage {
     General,
     StartupFolder,
+    ExplorerIntegration,
     Thumbnail,
     Toolbar,
     Slideshow,
@@ -77,6 +78,7 @@ impl PreferencesPage {
         match self {
             Self::General => "全体設定",
             Self::StartupFolder => "開始フォルダ",
+            Self::ExplorerIntegration => "エクスプローラ連携",
             Self::Thumbnail => "サムネイル",
             Self::Toolbar => "ツールバー",
             Self::Slideshow => "スライドショー",
@@ -123,6 +125,11 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "開始フォルダ",
         page: Some(PreferencesPage::StartupFolder),
+        children: &[],
+    },
+    TreeCategory {
+        label: "エクスプローラ連携",
+        page: Some(PreferencesPage::ExplorerIntegration),
         children: &[],
     },
     TreeCategory {
@@ -272,6 +279,12 @@ pub(crate) struct PreferencesState {
     pub book_resume_clear_requested: bool,
     /// 直近の ZIP/PDF 読書位置削除結果。
     pub book_resume_clear_result: Option<String>,
+
+    // ── エクスプローラ連携ページ用 ──────────────────────────────
+    /// SendTo ショートカットの状態。ページを初めて開いた時と操作後に更新する。
+    pub send_to_status: Option<Result<crate::explorer_integration::SendToShortcutStatus, String>>,
+    /// SendTo 登録/削除ボタンの直近メッセージ。
+    pub send_to_action_message: Option<String>,
 
     // ── AI バックエンド ページ用のキャッシュ ────────────────────
     /// プライマリ GPU のベンダー (NVIDIA でなければ TRT は disabled に)
@@ -446,6 +459,8 @@ impl PreferencesState {
             book_resume_entry_count,
             book_resume_clear_requested: false,
             book_resume_clear_result: None,
+            send_to_status: None,
+            send_to_action_message: None,
             gpu_vendor,
             trt_worker_active,
             current_runtime_fallback_reason,
@@ -1137,6 +1152,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
     match state.selected {
         PreferencesPage::General => page_general(ui, state),
         PreferencesPage::StartupFolder => page_startup_folder(ui, state),
+        PreferencesPage::ExplorerIntegration => page_explorer_integration(ui, state),
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
         PreferencesPage::Toolbar => page_toolbar(ui, state),
         PreferencesPage::Slideshow => page_slideshow(ui, state),

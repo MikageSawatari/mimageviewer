@@ -1,6 +1,6 @@
 //! Tantivy ベースの全文検索インデックス (docs/search-architecture.md)。
 //!
-//! ## 役割 (INDEX_VERSION=8)
+//! ## 役割 (INDEX_VERSION=9)
 //!
 //! - bigram tokenizer (`NgramTokenizer(2, 2)` + `lower_caser`) で画像 / PDF / 動画メタを転置索引化
 //! - **検索原文 (post-filter 用) を STORED で保持する**。`*_text` フィールドが bigram
@@ -12,7 +12,7 @@
 //!   投入 → batch commit + reader reload に成功したフレームでのみ `fts_meta` を更新
 //!   する (Tantivy First)。詳細は [search-architecture.md §4.2](../docs/search-architecture.md)
 //!
-//! ## スキーマ (INDEX_VERSION=8)
+//! ## スキーマ (INDEX_VERSION=9)
 //!
 //! ```text
 //! path             STRING | STORED            完全一致キー、正規化済み
@@ -25,7 +25,7 @@
 //! name             TEXT   bigram | STORED     ファイル名 / ZIP エントリ名
 //! exif_text        TEXT   bigram | STORED     EXIF
 //! xmp_tweet_text   TEXT   bigram | STORED     XMP / mXD ツイート情報
-//! png_prompt_text  TEXT   bigram | STORED     PNG tEXt/iTXt AI プロンプト
+//! png_prompt_text  TEXT   bigram | STORED     PNG tEXt/iTXt / EXIF UserComment AI プロンプト
 //! pdf_meta_text    TEXT   bigram | STORED     PDFium document info
 //! video_meta_text  TEXT   bigram | STORED     FFmpeg container metadata (video only)
 //! tags             TEXT   bigram | STORED     XMP dc:subject (#プレフィックス付き)

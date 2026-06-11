@@ -45,6 +45,7 @@ pub mod dwm_transitions;
 pub mod editing_addon;
 pub mod editing_addon_download;
 pub mod exif_reader;
+pub mod explorer_integration;
 pub mod export_crop;
 pub mod export_dialog;
 pub mod external_links;

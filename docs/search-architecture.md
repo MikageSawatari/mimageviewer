@@ -383,6 +383,24 @@ commit した最新原文を旧値で潰してしまうため、上記 #2 / #3 �
   `purge_favorite_metadata` で `sidecar_text` ごと消える。
 - **動画 / ZIP 内 / PDF ページは対象外** (動画は既存 `.xmp` サイドカーの mIV タグ経路を維持)。
 
+### 4.11 AI 生成メタデータ (INDEX_VERSION=9)
+
+PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた生成メタデータを
+`png_prompt_text` フィールドへ正規化して入れる。実装は
+[png_metadata.rs](../src/png_metadata.rs) に集約し、メタデータパネル、Ctrl+F、Ctrl+G
+の 3 経路で同じ判別器を使う。
+
+- `prompt` が JSON object の場合は ComfyUI として扱う。
+- `parameters` が JSON object の場合は SwarmUI / Fooocus 系などの生成メタデータとして
+  先に分岐し、未知の生成 JSON は生 JSON をプロンプト扱いしない。
+- NovelAI は `Description` 分岐より前に判別し、`Comment.uc` などの Negative を
+  検索対象へ戻さない。
+- JPEG/JFIF の EXIF UserComment が AI 生成メタデータとして解釈できた場合は、
+  `exif_text` 側から UserComment を除外して二重取り込みと Negative 混入を避ける。
+- 検索テキスト構築は静的な AI キー一覧ではなく、判別器が実際に消費したキー
+  (`consumed_keys`) を素通し除外に使う。新フォーマット追加時のキー追加漏れで
+  Negative が混入する事故を防ぐため。
+
 ---
 
 ## 5. クエリ実行パス
@@ -425,7 +443,7 @@ UI (render_search_bar)
        - ZipImage … ファイル名のみ (ZIP を開いてメタを読む経路は持たない)
        - ZipSeparator … 付随グループに可視 ZipImage が残るときだけ表示
     Pass 2 (Image / Video、on-demand メタ):
-       - target に応じて必要なメタだけ読む (PNG tEXt / EXIF / XMP /
+       - target に応じて必要なメタだけ読む (PNG tEXt / JPEG EXIF UserComment AI メタ / EXIF / XMP /
          動画コンテナメタ / dc:subject)
     → 検索中は item 単位の done/total を SearchPending の atomic snapshot に反映
     → 合格 idx を HashSet<usize> に反映 (search_filter)
@@ -658,7 +676,7 @@ Mutex を横取りし、先に待ち始めたスレッドが秒単位で待た�
 ### 8.1 統合テスト
 
 - [tests/search_metadata_e2e.rs](../tests/search_metadata_e2e.rs) — メタ索引 E2E
-  (PNG tEXt → ingest → Tantivy → post-filter、notify-rs での追加 / 削除 / rename 追従)
+  (PNG tEXt / AI メタ → ingest → Tantivy → post-filter、notify-rs での追加 / 削除 / rename 追従)
 - [tests/search_name_e2e.rs](../tests/search_name_e2e.rs) — 名前索引 E2E
   (初期バルク + watcher による新規フォルダ / ZIP 追加 + 並列動作)
 - [tests/common/mod.rs](../tests/common/mod.rs) — `FixtureRoot` / `start_indexer_at` /

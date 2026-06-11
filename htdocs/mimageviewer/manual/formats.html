@@ -60,7 +60,7 @@
           <tr><th>拡張子</th><th>フォーマット</th><th>備考</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>.jpg</code> / <code>.jpeg</code></td><td>JPEG</td><td>EXIF メタデータ対応</td></tr>
+          <tr><td><code>.jpg</code> / <code>.jpeg</code></td><td>JPEG</td><td>EXIF メタデータ / UserComment 生成情報対応</td></tr>
           <tr><td><code>.png</code></td><td>PNG</td><td>AI 生成メタデータ（tEXt / iTXt / zTXt）対応</td></tr>
           <tr><td><code>.gif</code></td><td>GIF</td><td>アニメーション GIF 対応</td></tr>
           <tr><td><code>.webp</code></td><td>WebP</td><td>静止画のみ（アニメーションは非対応）</td></tr>
@@ -212,17 +212,16 @@
     </div>
 
     <h2>AI 生成メタデータ対応</h2>
-    <p>以下の PNG メタデータ形式に対応し、フルスクリーンのメタデータパネルで表示します。</p>
+    <p>PNG テキストチャンクや JPEG EXIF UserComment に埋め込まれた主要な生成メタデータ形式に対応し、フルスクリーンのメタデータパネルで表示します。</p>
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>ツール</th><th>メタデータ形式</th></tr>
+          <tr><th>保存場所</th><th>メタデータ形式</th></tr>
         </thead>
         <tbody>
-          <tr><td>AUTOMATIC1111 (Stable Diffusion WebUI)</td><td><code>tEXt::parameters</code> チャンク</td></tr>
-          <tr><td>NovelAI</td><td><code>tEXt::Comment</code> / <code>tEXt::Description</code> チャンク</td></tr>
-          <tr><td>ComfyUI</td><td><code>tEXt::workflow</code> / <code>tEXt::prompt</code> チャンク</td></tr>
-          <tr><td>その他</td><td>iTXt / zTXt チャンクにも対応</td></tr>
+          <tr><td>PNG</td><td><code>tEXt</code> / <code>iTXt</code> / <code>zTXt</code> の生成パラメータ、ワークフロー JSON、説明チャンク</td></tr>
+          <tr><td>JPEG</td><td>EXIF <code>UserComment</code> に保存された生成パラメータ</td></tr>
+          <tr><td>検索</td><td>Negative Prompt は表示用に保持しつつ、メタデータ検索の対象からは除外します</td></tr>
         </tbody>
       </table>
     </div>
