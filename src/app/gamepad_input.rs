@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use super::{AdjustSpreadTarget, App, FolderNavMode};
+use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
 use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent};
 use crate::grid_item::GridItem;
 use crate::settings::{ReadingDirection, ReadingFlow};
@@ -208,6 +209,9 @@ impl App {
             PadActionKind::Release => None,
             PadActionKind::Press | PadActionKind::Repeat => {
                 if let Some(dir) = button_dir(action.button) {
+                    if self.handle_gamepad_folder_tree_direction(dir) {
+                        return None;
+                    }
                     self.handle_gamepad_direction(ctx, dir, action.kind == PadActionKind::Repeat);
                     return None;
                 }
@@ -269,6 +273,20 @@ impl App {
         let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
         let stick_dir = dominant_stick_dir(stick);
         let stick_active = stick_dir.is_some();
+        if self.folder_pane_blocks_grid_keyboard() {
+            if self
+                .gamepad_state
+                .left_stick_step_due(stick_active, now, STICK_STEP_INTERVAL)
+                && let Some(dir) = stick_dir
+            {
+                changed = self.handle_gamepad_folder_tree_direction(dir);
+            }
+            let _ = self
+                .gamepad_state
+                .trigger_step_due(false, now, Duration::from_millis(70));
+            let _ = self.gamepad_state.analog_dt(stick_active, now);
+            return changed;
+        }
         if self
             .gamepad_state
             .left_stick_step_due(stick_active, now, STICK_STEP_INTERVAL)
@@ -452,6 +470,13 @@ impl App {
 
     fn handle_gamepad_y_tap(&mut self, ctx: &egui::Context) {
         let Some(fs_idx) = self.fullscreen_idx else {
+            if self.folder_pane_disabled() {
+                self.show_feedback_toast(
+                    "スナップショット中は他のフォルダに移動できません".to_string(),
+                );
+                return;
+            }
+            self.set_folder_tree_pane_visible(true);
             return;
         };
         if self.current_fullscreen_is_video(fs_idx) {
@@ -513,6 +538,22 @@ impl App {
             self.update_last_selected_image();
             self.bump_input_seq("gamepad_grid_nav", Some(&format!("sel={new_sel}")));
         }
+    }
+
+    fn handle_gamepad_folder_tree_direction(&mut self, dir: PadDir) -> bool {
+        if !self.folder_pane_blocks_grid_keyboard() {
+            return false;
+        }
+        let key = match dir {
+            PadDir::Up => FolderPaneTreeKey::Up,
+            PadDir::Down => FolderPaneTreeKey::Down,
+            PadDir::Left => FolderPaneTreeKey::Left,
+            PadDir::Right => FolderPaneTreeKey::Right,
+        };
+        let _ = self
+            .folder_pane
+            .handle_tree_key(key, self.settings.sort_order);
+        true
     }
 
     fn handle_gamepad_still_direction(&mut self, ctx: &egui::Context, fs_idx: usize, dir: PadDir) {
@@ -710,6 +751,18 @@ impl App {
     }
 
     fn handle_gamepad_grid_accept(&mut self) -> Option<AddressBarNav> {
+        if self.folder_pane_blocks_grid_keyboard() {
+            if let Some(FolderPaneCommand::Open(path)) = self
+                .folder_pane
+                .handle_tree_key(FolderPaneTreeKey::Enter, self.settings.sort_order)
+            {
+                self.settings.folder_tree_pane_visible = false;
+                self.folder_pane.set_focus_grid();
+                self.settings.save();
+                return Some(AddressBarNav::Direct(path));
+            }
+            return None;
+        }
         let idx = self.selected?;
         let item = self.items.get(idx).cloned();
         match item {

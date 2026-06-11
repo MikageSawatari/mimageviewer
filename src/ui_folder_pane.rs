@@ -6,7 +6,32 @@ use crate::app::App;
 use crate::folder_pane::{self, FolderPaneCommand, FolderPaneTreeKey};
 use crate::ui_main::AddressBarNav;
 
+const FOLDER_PANE_MIN_WIDTH: f32 = 180.0;
+const FOLDER_PANE_MAX_WIDTH: f32 = 900.0;
+const FOLDER_PANE_MIN_RATIO: f32 = 0.12;
+const FOLDER_PANE_MAX_RATIO: f32 = 0.45;
+const FOLDER_PANE_ROW_HEIGHT: f32 = 24.0;
+const FOLDER_PANE_INDENT_WIDTH: f32 = 14.0;
+const FOLDER_PANE_ARROW_WIDTH: f32 = 24.0;
+
 impl App {
+    pub(crate) fn set_folder_tree_pane_visible(&mut self, visible: bool) {
+        self.settings.folder_tree_pane_visible = visible;
+        if visible {
+            let active = self.effective_folder();
+            self.folder_pane
+                .sync_to_active(active.as_deref(), self.settings.sort_order);
+            self.folder_pane.set_focus_tree_at_active();
+        } else {
+            self.folder_pane.set_focus_grid();
+        }
+        self.settings.save();
+    }
+
+    pub(crate) fn toggle_folder_tree_pane_visible(&mut self) {
+        self.set_folder_tree_pane_visible(!self.settings.folder_tree_pane_visible);
+    }
+
     pub(crate) fn sync_folder_pane_state(&mut self, ctx: &egui::Context) {
         if !self.settings.folder_tree_pane_visible {
             self.folder_pane.set_focus_grid();
@@ -107,10 +132,15 @@ impl App {
         }
 
         let mut nav = None;
-        egui::SidePanel::left("folder_tree_pane")
+        let content_width = ctx.content_rect().width().max(1.0);
+        let max_width =
+            FOLDER_PANE_MAX_WIDTH.min((content_width - 240.0).max(FOLDER_PANE_MIN_WIDTH));
+        let default_width = (self.settings.folder_tree_pane_width_ratio * content_width)
+            .clamp(FOLDER_PANE_MIN_WIDTH, max_width);
+        let panel = egui::SidePanel::left("folder_tree_pane")
             .resizable(true)
-            .default_width(260.0)
-            .width_range(180.0..=460.0)
+            .default_width(default_width)
+            .width_range(FOLDER_PANE_MIN_WIDTH..=max_width)
             .show(ctx, |ui| {
                 ui.add_enabled_ui(!disabled, |ui| {
                     self.render_folder_pane_header(ui);
@@ -118,6 +148,13 @@ impl App {
                     nav = self.render_folder_pane_tree(ui);
                 });
             });
+        let width_ratio = (panel.response.rect.width() / content_width)
+            .clamp(FOLDER_PANE_MIN_RATIO, FOLDER_PANE_MAX_RATIO);
+        if width_ratio.is_finite()
+            && (self.settings.folder_tree_pane_width_ratio - width_ratio).abs() > 0.0005
+        {
+            self.settings.folder_tree_pane_width_ratio = width_ratio;
+        }
         nav
     }
 
@@ -180,18 +217,22 @@ impl App {
             .id_salt("folder_pane_tree_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 for row in rows {
                     let mut row_response = None;
                     ui.horizontal(|ui| {
-                        ui.add_space(row.depth as f32 * 14.0);
+                        ui.set_height(FOLDER_PANE_ROW_HEIGHT);
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        ui.add_space(row.depth as f32 * FOLDER_PANE_INDENT_WIDTH);
                         let arrow = if row.has_children_or_unknown {
-                            if row.expanded { "▾" } else { "▸" }
+                            if row.expanded { "▼" } else { "▶" }
                         } else {
                             " "
                         };
                         let arrow_resp = ui.add_sized(
-                            egui::vec2(18.0, 20.0),
-                            egui::Button::new(arrow).small().frame(false),
+                            egui::vec2(FOLDER_PANE_ARROW_WIDTH, FOLDER_PANE_ROW_HEIGHT),
+                            egui::Button::new(egui::RichText::new(arrow).size(16.0).strong())
+                                .frame(false),
                         );
                         if row.has_children_or_unknown && arrow_resp.clicked() {
                             self.folder_pane.set_focus_tree();
@@ -215,9 +256,36 @@ impl App {
                             text = text.color(ui.visuals().warn_fg_color);
                         }
                         let selected = row.is_cursor && self.folder_pane.has_focus;
-                        let resp = ui
-                            .selectable_label(selected, text)
-                            .on_hover_text(row.path.display().to_string());
+                        let trailing_width = if row.loading || row.error.is_some() {
+                            18.0
+                        } else {
+                            0.0
+                        };
+                        let label_width = (ui.available_width() - trailing_width).max(16.0);
+                        let (label_rect, label_resp) = ui.allocate_exact_size(
+                            egui::vec2(label_width, FOLDER_PANE_ROW_HEIGHT),
+                            egui::Sense::click(),
+                        );
+                        if selected {
+                            ui.painter().rect_filled(
+                                label_rect,
+                                ui.visuals().widgets.active.corner_radius,
+                                ui.visuals().selection.bg_fill,
+                            );
+                        }
+                        let mut label_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(label_rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        );
+                        label_ui.set_clip_rect(label_rect.intersect(ui.clip_rect()));
+                        label_ui.add(
+                            egui::Label::new(text)
+                                .truncate()
+                                .selectable(false)
+                                .halign(egui::Align::Min),
+                        );
+                        let resp = label_resp.on_hover_text(row.path.display().to_string());
                         if resp.clicked() {
                             self.folder_pane.set_focus_tree();
                             self.folder_pane.set_cursor(row.path.clone());

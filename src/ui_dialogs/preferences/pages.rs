@@ -305,10 +305,6 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     // Phase 6.E 以降、フォルダ移動系はアドレス欄と同じ行の「フォルダバー」に集約。
     ui.label(egui::RichText::new("フォルダバー").strong());
-    ui.checkbox(
-        &mut s.folder_tree_pane_visible,
-        "フォルダツリーペインを表示",
-    );
     ui.checkbox(&mut s.show_toolbar_folder, "フォルダ入力欄を表示");
     ui.add_enabled(
         s.show_toolbar_folder,
@@ -464,6 +460,10 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(6.0);
     ui.separator();
     ui.add_space(2.0);
+    ui.checkbox(
+        &mut s.show_toolbar_folder_tree_button,
+        "ツリー（フォルダツリー表示切り替え）",
+    );
     ui.checkbox(&mut s.show_toolbar_rating, "レーティング (★ フィルタ)");
     ui.checkbox(
         &mut s.show_toolbar_facet_filter,

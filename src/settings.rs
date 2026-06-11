@@ -1355,9 +1355,15 @@ pub struct Settings {
     /// 左側の実フォルダツリーペインを表示する
     #[serde(default)]
     pub folder_tree_pane_visible: bool,
+    /// フォルダツリー左右境界位置 (ウィンドウ幅に対する比率)。
+    #[serde(default = "default_folder_tree_pane_width_ratio")]
+    pub folder_tree_pane_width_ratio: f32,
     /// フォルダバー (フォルダ入力行) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder: bool,
+    /// ツールバーに「ツリー」ボタンを表示する
+    #[serde(default = "default_true")]
+    pub show_toolbar_folder_tree_button: bool,
     /// フォルダバーに「履歴を戻る/進む」ボタンを表示する。
     #[serde(default = "default_true")]
     pub show_address_bar_history_nav: bool,
@@ -2342,6 +2348,9 @@ fn default_cache_size_threshold_bytes() -> u64 {
 fn default_true() -> bool {
     true
 }
+pub(crate) fn default_folder_tree_pane_width_ratio() -> f32 {
+    0.22
+}
 fn default_thumb_prev_pages() -> u32 {
     2
 }
@@ -2554,7 +2563,9 @@ impl Default for Settings {
             show_toolbar_favorites: true,
             show_toolbar_tags: true,
             folder_tree_pane_visible: false,
+            folder_tree_pane_width_ratio: default_folder_tree_pane_width_ratio(),
             show_toolbar_folder: true,
+            show_toolbar_folder_tree_button: true,
             show_address_bar_history_nav: true,
             show_toolbar_parent_button: true,
             show_toolbar_prev_folder: true,
@@ -3600,6 +3611,8 @@ impl Settings {
         self.thumb_aspect = src.thumb_aspect;
         self.sort_order = src.sort_order;
         self.rating_filter = src.rating_filter;
+        self.folder_tree_pane_visible = src.folder_tree_pane_visible;
+        self.folder_tree_pane_width_ratio = src.folder_tree_pane_width_ratio;
         // ── サムネイル画質 (A/B 比較ダイアログで編集) ──
         self.thumb_px = src.thumb_px;
         // テキスト編集中プレビュー解像度 (環境設定外の Ctrl+T 左パネルで編集)。環境設定 OK の
@@ -3837,7 +3850,12 @@ mod tests {
         assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 130);
         assert!(s.show_toolbar_favorites);
         assert!(!s.folder_tree_pane_visible);
+        assert_eq!(
+            s.folder_tree_pane_width_ratio,
+            default_folder_tree_pane_width_ratio()
+        );
         assert!(s.show_toolbar_folder);
+        assert!(s.show_toolbar_folder_tree_button);
         assert!(s.show_address_bar_history_nav);
         assert!(s.show_toolbar_parent_button);
         assert!(s.show_toolbar_prev_folder);

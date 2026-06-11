@@ -1252,7 +1252,7 @@ impl App {
         let show_sort = !tb_sorts.is_empty();
         let show_favs = self.settings.show_toolbar_favorites;
         let show_rating = self.settings.show_toolbar_rating;
-        let show_folder_tree_button = true;
+        let show_folder_tree_button = self.settings.show_toolbar_folder_tree_button;
         let any_toolbar_section = show_folder_tree_button
             || show_cols
             || show_aspect
@@ -1348,16 +1348,7 @@ impl App {
                         .selectable_label(active, "ツリー")
                         .on_hover_text("左側に実フォルダツリーを表示");
                     if resp.clicked() {
-                        self.settings.folder_tree_pane_visible = !active;
-                        if self.settings.folder_tree_pane_visible {
-                            let active = self.effective_folder();
-                            self.folder_pane
-                                .sync_to_active(active.as_deref(), self.settings.sort_order);
-                            self.folder_pane.set_focus_tree_at_active();
-                        } else {
-                            self.folder_pane.set_focus_grid();
-                        }
-                        self.settings.save();
+                        self.set_folder_tree_pane_visible(!active);
                     }
                     first_section = false;
                 }

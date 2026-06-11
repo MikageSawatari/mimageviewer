@@ -440,7 +440,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - GridTreePrev/Next `Ctrl+↑/↓` (P) / GridSiblingPrev/Next `Ctrl+PageUp/Down` (P)
 - GridParentAlt `Alt+↑` (P) / GridHistoryBack/Forward `Alt+←/→` (P)
 - GridHome/End/PageUp/PageDown (P)(予約候補)
-- GridRotateCw `R` (P) / GridRotateCcw `L` (P) / GridPin `P` (P) / GridCompareX `X` (P)
+- GridToggleFolderTreePane `T` (P) / GridRotateCw `R` (P) / GridRotateCcw `L` (P) /
+  GridPin `P` (P) / GridCompareX `X` (P)
 - GridApplyErase1/2 `F7/F8` / GridApplyConceal1/2 `F9/F10` /
   GridDeleteErase1/2 `Shift+F7/F8` / GridDeleteConceal1/2 `Shift+F9/F10`
   (family・予約候補)

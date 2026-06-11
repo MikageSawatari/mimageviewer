@@ -170,11 +170,16 @@ impl FolderPaneState {
     }
 
     pub(crate) fn select_drive(&mut self, drive: PathBuf, sort_order: SortOrder) {
+        self.has_focus = true;
         if self
             .selected_drive
             .as_ref()
             .is_some_and(|current| crate::folder_tree::path_eq(current, &drive))
         {
+            self.cursor_path = Some(drive.clone());
+            self.scroll_to_cursor = true;
+            self.ensure_node(drive.clone());
+            self.ensure_scan(&drive, sort_order);
             return;
         }
         self.selected_drive = Some(drive.clone());
@@ -224,14 +229,23 @@ impl FolderPaneState {
 
         if let Some(active_folder) = active_folder {
             if let Some(root) = root_of_path(&active_folder) {
-                self.selected_drive = Some(root.clone());
-                self.ensure_node(root.clone());
-                let chain = ancestor_chain(&root, &active_folder);
-                for ancestor in chain.iter().take(chain.len().saturating_sub(1)) {
-                    self.auto_expanded.insert(key_for(ancestor));
-                    self.ensure_node(ancestor.clone());
+                let sync_selected_drive = !self.has_focus
+                    || self
+                        .selected_drive
+                        .as_ref()
+                        .is_none_or(|drive| crate::folder_tree::path_eq(drive, &root));
+                if sync_selected_drive {
+                    self.selected_drive = Some(root.clone());
+                    self.ensure_node(root.clone());
+                    let chain = ancestor_chain(&root, &active_folder);
+                    for ancestor in chain.iter().take(chain.len().saturating_sub(1)) {
+                        self.auto_expanded.insert(key_for(ancestor));
+                        self.ensure_node(ancestor.clone());
+                    }
+                    self.ensure_node(active_folder);
+                } else if let Some(drive) = self.selected_drive.clone() {
+                    self.ensure_node(drive);
                 }
-                self.ensure_node(active_folder);
             }
         } else if let Some(drive) = self.selected_drive.clone() {
             self.ensure_node(drive);

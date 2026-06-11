@@ -15773,6 +15773,19 @@ impl App {
         // 関数頭で drain 済み) を消費。詳細は main.rs の `install_mouse_nav_hook` 参照。
         let browser_back = browser_back_count > 0;
         let browser_forward = browser_forward_count > 0;
+        if !self.address_has_focus
+            && !self.search_has_focus
+            && !self.favsearch.has_focus
+            && !self.global_search.has_focus
+            && self.fullscreen_idx.is_none()
+            && !self.any_dialog_open()
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::GridToggleFolderTreePane)
+        {
+            self.toggle_folder_tree_pane_visible();
+            return None;
+        }
         let space = self.keymap.pressed_action(ctx, KeyAction::GridToggleCheck);
         let key_r = self.keymap.pressed_action(ctx, KeyAction::GridRotateCw);
         let key_l = self.keymap.pressed_action(ctx, KeyAction::GridRotateCcw);
