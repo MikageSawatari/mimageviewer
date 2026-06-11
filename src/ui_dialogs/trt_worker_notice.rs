@@ -2,8 +2,8 @@
 //!
 //! 表示条件:
 //! - **起動失敗**: 設定で TensorRT ON にしたが pack 不在 / engine 不整合 / DLL
-//!   ロード失敗等で `TrtWorkerPool::start()` が Err を返した。AI は DirectML で
-//!   動作しているがユーザーは「TRT になっていない」ことを知らないので通知する。
+//!   ロード失敗等で `TrtWorkerPool::start()` が Err を返した。transient timeout 系は
+//!   1 回だけ silent retry し、それでも駄目ならユーザーに通知する。
 //! - **推論中の死亡**: 一度起動成功した後の `infer` / `load_model` 中に
 //!   stdin/stdout が破断した (子プロセスが crash 等で死亡)。`infer_via_worker` 内で
 //!   pool が detach 済みなので以降の推論は DirectML にフォールバック。バナーで
@@ -26,22 +26,53 @@ use crate::app::App;
 /// (= TRT pack の異常 / モデル特定の crash 等が疑われ、無限ループにしないため)。
 /// 1 回の死亡で 1 つ消費する。手動再起動 (バナーボタン) でカウンタを 0 にリセット。
 const MAX_TRT_AUTO_RESTART_ATTEMPTS: u32 = 3;
+/// 起動段階の transient 失敗は 1 回だけ自動再試行する。
+const MAX_TRT_SPAWN_RESTART_ATTEMPTS: u32 = 1;
+/// 起動失敗直後に同じ provider 初期化へ突っ込まないための短い猶予。
+const TRT_SPAWN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl App {
     /// `AiRuntime::take_worker_notice()` をポーリングし、新しい通知があれば
     /// 処理する。バナー本体の描画は別メソッド。
     ///
     /// **DiedDuringInfer の場合は自動再起動を試みる** (`MAX_TRT_AUTO_RESTART_ATTEMPTS`
-    /// 回まで silent)。それを超えたらバナーを出してユーザーに手動再起動を促す。
-    /// SpawnFailed (= 起動段階での失敗) は環境問題が濃厚なので即バナー表示。
+    /// 回まで silent)。起動時の transient failure も 1 回だけ silent retry する。
+    /// それを超えたらバナーを出してユーザーに手動再起動を促す。
     pub(crate) fn poll_trt_worker_notice(&mut self) {
         let Some(rt) = self.ai_runtime.as_ref() else {
             return;
         };
+        if rt.has_worker_pool() {
+            if self.trt_auto_restart_attempts != 0 || self.trt_spawn_restart_attempts != 0 {
+                crate::logger::log(format!(
+                    "[AI] TRT worker pool 稼働を確認、自動再起動カウンタをリセット \
+                     (died={}, spawn={})",
+                    self.trt_auto_restart_attempts, self.trt_spawn_restart_attempts
+                ));
+            }
+            self.trt_auto_restart_attempts = 0;
+            self.trt_spawn_restart_attempts = 0;
+        }
         let Some(notice) = rt.take_worker_notice() else {
             return;
         };
         match notice.kind {
+            crate::ai::runtime::WorkerNoticeKind::SpawnFailed
+                if self.trt_spawn_restart_attempts < MAX_TRT_SPAWN_RESTART_ATTEMPTS
+                    && is_transient_spawn_failure(&notice.detail) =>
+            {
+                self.trt_spawn_restart_attempts += 1;
+                crate::logger::log(format!(
+                    "[AI] TRT worker 起動失敗は一時的な可能性があるため自動再試行 \
+                     (#{} / {}): {}",
+                    self.trt_spawn_restart_attempts, MAX_TRT_SPAWN_RESTART_ATTEMPTS, notice.detail
+                ));
+                Self::spawn_trt_worker_pool_guarded_after(
+                    rt,
+                    self.trt_restart_in_flight.clone(),
+                    TRT_SPAWN_RETRY_BACKOFF,
+                );
+            }
             crate::ai::runtime::WorkerNoticeKind::DiedDuringInfer
                 if self.trt_auto_restart_attempts < MAX_TRT_AUTO_RESTART_ATTEMPTS =>
             {
@@ -115,6 +146,7 @@ impl App {
             // (= ユーザー的には「リセット」操作なので、また 3 回 silent recovery が
             // 利く状態に戻す)
             self.trt_auto_restart_attempts = 0;
+            self.trt_spawn_restart_attempts = 0;
             // 通知を消してから再起動 (失敗したらまた通知される)
             self.trt_worker_notice = None;
             if let Some(rt) = self.ai_runtime.as_ref() {
@@ -124,6 +156,44 @@ impl App {
         } else if close_clicked {
             self.trt_worker_notice = None;
         }
+    }
+}
+
+fn is_transient_spawn_failure(detail: &str) -> bool {
+    let detail_lower = detail.to_ascii_lowercase();
+    detail.contains("worker 応答 timeout")
+        || detail.contains("worker stdout が EOF")
+        || detail.contains("worker stdout reader thread が終了している")
+        || detail.contains("通信失敗")
+        || detail_lower.contains("0x8007045a")
+        || detail.contains("DLL 初期化")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transient_spawn_failure;
+
+    #[test]
+    fn classifies_transient_spawn_failures() {
+        assert!(is_transient_spawn_failure(
+            "ワーカー起動 timeout / 通信失敗: worker 応答 timeout (45 秒)"
+        ));
+        assert!(is_transient_spawn_failure(
+            "provider preload failed: HRESULT(0x8007045A)"
+        ));
+        assert!(is_transient_spawn_failure(
+            "provider preload failed: HRESULT(0x8007045a)"
+        ));
+    }
+
+    #[test]
+    fn leaves_non_transient_spawn_failures_for_user_notice() {
+        assert!(!is_transient_spawn_failure(
+            "TensorRT pack が見つかりません: tensorrt_pack"
+        ));
+        assert!(!is_transient_spawn_failure(
+            "engine metadata mismatch: expected fp16"
+        ));
     }
 }
 

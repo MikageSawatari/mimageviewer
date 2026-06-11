@@ -4574,6 +4574,10 @@ pub struct App {
     /// バナーを出してユーザー操作を待つ (= TRT pack 自体の問題等で永久ループしない
     /// ためのガード)。
     pub(crate) trt_auto_restart_attempts: u32,
+    /// セッション中に worker 起動失敗 → 自動再試行を試みた回数。
+    /// 起動時の provider DLL 初期化 timeout は一時的なことがあるため 1 回だけ
+    /// silent retry する。worker attach 成功で 0 に戻す。
+    pub(crate) trt_spawn_restart_attempts: u32,
     /// 自動再起動が現在進行中か (= spawn_trt_worker_pool の background thread が
     /// 起動中で、まだ attach も failure 通知もしていない状態)。
     /// 並行する複数の AI 推論が同じ「死亡」イベントを観測したときに 2 重 spawn を
@@ -6074,6 +6078,7 @@ impl App {
             video_session_muted,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
+            trt_spawn_restart_attempts: 0,
             trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             trt_install_state: None,
             editing_addon_install_state: None,
@@ -22066,7 +22071,11 @@ impl App {
     /// 並行する複数の AI 推論が同じ DiedDuringInfer を観測しても 1 回しか
     /// 新 pool を起こさない (Codex P2 指摘)。
     pub(crate) fn spawn_trt_worker_pool(runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>) {
-        Self::spawn_trt_worker_pool_inner(runtime, /* guard = */ None);
+        Self::spawn_trt_worker_pool_inner(
+            runtime,
+            /* guard = */ None,
+            std::time::Duration::ZERO,
+        );
     }
 
     /// `spawn_trt_worker_pool` の guard 付き版。worker 死亡時の自動再起動から
@@ -22075,12 +22084,23 @@ impl App {
         runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
         guard: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
-        Self::spawn_trt_worker_pool_inner(runtime, Some(guard));
+        Self::spawn_trt_worker_pool_inner(runtime, Some(guard), std::time::Duration::ZERO);
+    }
+
+    /// `spawn_trt_worker_pool_guarded` の遅延版。起動 timeout 直後の transient retry で
+    /// CUDA / TensorRT provider 初期化状態を少し落ち着かせるために使う。
+    pub(crate) fn spawn_trt_worker_pool_guarded_after(
+        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
+        guard: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        delay: std::time::Duration,
+    ) {
+        Self::spawn_trt_worker_pool_inner(runtime, Some(guard), delay);
     }
 
     fn spawn_trt_worker_pool_inner(
         runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
         guard: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        delay: std::time::Duration,
     ) {
         // CAS: false → true。すでに in-flight なら true のままで、ここは false 戻り → skip。
         if let Some(g) = guard.as_ref() {
@@ -22099,10 +22119,17 @@ impl App {
             }
         }
         let runtime_for_thread = runtime.clone();
-        let guard_for_thread = guard;
-        std::thread::Builder::new()
+        let guard_for_thread = guard.clone();
+        if let Err(e) = std::thread::Builder::new()
             .name("trt-worker-spawn".to_string())
             .spawn(move || {
+                if !delay.is_zero() {
+                    crate::logger::log(format!(
+                        "[AI] TRT worker pool 再起動を {} ms 待ってから試行します",
+                        delay.as_millis()
+                    ));
+                    std::thread::sleep(delay);
+                }
                 crate::logger::log(
                     "[AI] TRT worker pool バックグラウンド起動を試行中...".to_string(),
                 );
@@ -22112,21 +22139,32 @@ impl App {
                         crate::logger::log(
                             "[AI] TRT worker pool 起動成功、attach 完了".to_string(),
                         );
+                        // spawn 試行が完了 → guard を解放。
+                        if let Some(g) = guard_for_thread.as_ref() {
+                            g.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
                     }
                     Err(e) => {
                         // 起動失敗 (TRT pack 不在 / engine 不整合 / DLL ロード失敗 等)。
                         // DirectML で動作続行するが、UI に通知して気付かせる
                         // (Phase 3 Step 5)。ログだけだとユーザーが「なぜ TRT に
                         // ならないか」を追えない。
+                        //
+                        // 通知を見た UI が同じ frame で retry を起動できるよう、
+                        // report 前に guard を下ろしておく。
+                        if let Some(g) = guard_for_thread.as_ref() {
+                            g.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
                         runtime_for_thread.report_worker_spawn_failed(e);
                     }
                 }
-                // spawn 試行が完了 (success / failure 両方) → guard を解放。
-                if let Some(g) = guard_for_thread {
-                    g.store(false, std::sync::atomic::Ordering::SeqCst);
-                }
             })
-            .ok();
+        {
+            crate::logger::log(format!("[AI] TRT worker pool 起動 thread 作成に失敗: {e}"));
+            if let Some(g) = guard {
+                g.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
     }
 
     /// AI アップスケールの完了をポーリングし、テクスチャに変換してキャッシュする。

@@ -74,8 +74,9 @@ const WORKER_RESP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// 起動ハンドシェイクの最大待機時間。`AiRuntime::new_with_backend` 内で
 /// `ort::init_from` + provider DLL preload + TRT pack scan が走るため、
-/// 通常枠より長めの 30 秒。
-const WORKER_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// 通常枠より長めに待つ。NVIDIA provider 初期化が 20 秒台後半まで
+/// 伸びる環境があるので、30 秒より少し余裕を持たせる。
+const WORKER_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 impl WorkerHandle {
     /// 親プロセス側でワーカー子プロセスを起動し、ハンドシェイクを待つ。
