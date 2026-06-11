@@ -28584,11 +28584,46 @@ impl App {
     /// する。現在フルスクリーン表示中の idx は即時アップロードして表示遅延ゼロ。
     /// これにより 20MP JPEG 連続 prefetch 時の 500ms 級 UI フリーズを回避する。
     pub(crate) fn poll_prefetch(&mut self, ctx: &egui::Context) {
-        // PDF ページの content_type を更新 (render 完了時にワーカーから受信)
+        // PDF ページの content_type を更新 (render 完了時にワーカーから受信)。
+        //
+        // ラスターページのネイティブ解像度が判明した時点で、表示中ページかつ AI が
+        // 実効適用される (native 寸法がサイズ上限内 + 設定 ON) なら、4096px 固定で
+        // レンダされた現行ラスターを native 解像度で **一度だけ** 再レンダして final AI を
+        // 起動させる。初回フルスクリーンは content_type 未解析のため 4096px 固定で
+        // レンダされ (`start_fs_load`)、final AI はレンダ後のピクセルサイズで判定するため、
+        // この再レンダが無いとサイズ上限内のラスター PDF でも初回表示で AI が掛からない
+        // (GitHub issue #1。従来は docs/ai-processing-size-threshold-plan.md「既知の制限」
+        // として先送りしていた挙動。content_type 解析後の自動再レンダで解消)。
+        // 表示中ページ (`fullscreen_idx`) のみに絞ることで PDF pool への負荷も抑える。
+        let mut pdf_native_rerender: Option<usize> = None;
         while let Ok((idx, ct)) = self.pdf_content_type_rx.try_recv() {
             if let Some(GridItem::PdfPage { content_type, .. }) = self.items.get_mut(idx) {
                 *content_type = Some(ct);
             }
+            // `ai_upscale_enabled` / `ai_denoise_model` は `sync_upscale_from_preset` で
+            // 現在表示ページの実効設定に同期済み。`fullscreen_idx` 限定なので一致する。
+            // AI が実際に効くケースだけ再レンダし、非 AI 利用時は 4096px 表示を維持する
+            // (range 内ラスターを常に native へ落とすと非 AI ユーザーの表示解像度が下がるため)。
+            if Some(idx) == self.fullscreen_idx
+                && let crate::pdf_loader::PdfPageContentType::Raster { w, h } = ct
+                && crate::ai::upscale::pdf_should_native_rerender_for_ai(
+                    w,
+                    h,
+                    self.ai_upscale_enabled,
+                    self.settings.ai_upscale_limit(),
+                    self.ai_denoise_model.is_some(),
+                    self.settings.ai_denoise_limit(),
+                )
+            {
+                pdf_native_rerender = Some(idx);
+            }
+        }
+        if let Some(idx) = pdf_native_rerender {
+            // `request_pdf_rerender` が content_type (= Raster) を見て native 解像度基準で
+            // 再レンダする。既に native 解像度なら内部 dedup (ratio 0.9..=1.1) で no-op。
+            // 再レンダ結果が fs_cache に載るとき `bump_input_generation` で下流 (edit /
+            // final / AI) cache が無効化され、final AI が native 寸法で再評価される。
+            self.request_pdf_rerender(idx, self.fs_zoom);
         }
 
         // `DimsOnly` は非終端 (後続メッセージあり) なので fs_pending は維持して

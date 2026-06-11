@@ -141,6 +141,30 @@ pub fn should_process_rect(width: u32, height: u32, limit: AiProcessSizeLimit) -
     long < limit_long && short < limit_short
 }
 
+/// PDF ラスターページの content_type (native 寸法) 判明後に、native 解像度で再レンダして
+/// final AI を起動すべきか判定する純関数 (GitHub issue #1)。
+///
+/// 初回フルスクリーンは content_type 未解析のため 4096px 固定でレンダされ、final AI は
+/// レンダ後のピクセルサイズで判定するため、サイズ上限内のラスター PDF でも初回表示では
+/// AI がスキップされる。判定には **fs_cache のレンダ後サイズではなく native 寸法 (`native_w`,
+/// `native_h`)** を渡すこと (レンダ後サイズを渡すと常に false になり意味がない)。
+///
+/// AI が実効適用される場合 (= 設定 ON かつ native 寸法がサイズ上限内) のみ true。
+/// 非 AI 利用時に range 内ラスターを native へ落とすと表示解像度が下がるため、
+/// あえて設定 ON を AND 条件にしている。
+pub fn pdf_should_native_rerender_for_ai(
+    native_w: u32,
+    native_h: u32,
+    upscale_on: bool,
+    upscale_limit: AiProcessSizeLimit,
+    denoise_on: bool,
+    denoise_limit: AiProcessSizeLimit,
+) -> bool {
+    let upscale_will_apply = upscale_on && should_process_rect(native_w, native_h, upscale_limit);
+    let denoise_will_apply = denoise_on && should_process_rect(native_w, native_h, denoise_limit);
+    upscale_will_apply || denoise_will_apply
+}
+
 /// 1 タイルを推論してスケール倍率を検出する（結果をキャッシュ）。
 fn detect_scale_factor(runtime: &AiRuntime, model_kind: ModelKind) -> Result<u32, AiError> {
     // キャッシュ済みならそのまま返す
@@ -864,5 +888,67 @@ mod tests {
         assert!(should_process_rect(4095, 2047, limit));
         assert!(!should_process_rect(4096, 2047, limit));
         assert!(!should_process_rect(4095, 2048, limit));
+    }
+
+    /// GitHub issue #1: native 寸法がサイズ上限内 + AI 設定 ON の PDF ラスターは
+    /// native 解像度で再レンダして AI を起動する。
+    #[test]
+    fn pdf_native_rerender_when_ai_applies() {
+        let limit = AiProcessSizeLimit::square(2048);
+        // issue 添付の native 寸法 824x1200 (両軸 2048 未満) + アップスケール ON → 再レンダ。
+        assert!(pdf_should_native_rerender_for_ai(
+            824, 1200, true, limit, false, limit
+        ));
+        // デノイズだけ ON でも range 内なら再レンダ。
+        assert!(pdf_should_native_rerender_for_ai(
+            824, 1200, false, limit, true, limit
+        ));
+    }
+
+    /// AI 設定が両方 OFF なら、range 内ラスターでも再レンダしない
+    /// (非 AI ユーザーの 4096px 表示解像度を保つ)。
+    #[test]
+    fn pdf_no_native_rerender_when_ai_off() {
+        let limit = AiProcessSizeLimit::square(2048);
+        assert!(!pdf_should_native_rerender_for_ai(
+            824, 1200, false, limit, false, limit
+        ));
+    }
+
+    /// native 寸法がサイズ上限超なら、AI 設定 ON でも再レンダしない
+    /// (AI はどのみちスキップされるので 4096px 固定のまま)。
+    #[test]
+    fn pdf_no_native_rerender_when_native_over_limit() {
+        let limit = AiProcessSizeLimit::square(2048);
+        // 3000x4000 は短辺 3000 ≥ 2048 で range 外。
+        assert!(!pdf_should_native_rerender_for_ai(
+            3000, 4000, true, limit, true, limit
+        ));
+    }
+
+    /// アップスケールとデノイズで別々のサイズ上限を持つケース:
+    /// デノイズ上限だけ広ければデノイズ起動で再レンダする。
+    #[test]
+    fn pdf_native_rerender_respects_separate_limits() {
+        let upscale_limit = AiProcessSizeLimit::square(1024);
+        let denoise_limit = AiProcessSizeLimit::square(2048);
+        // 1500x1500: upscale 上限 1024 では range 外、denoise 上限 2048 では range 内。
+        assert!(pdf_should_native_rerender_for_ai(
+            1500,
+            1500,
+            true,
+            upscale_limit,
+            true,
+            denoise_limit
+        ));
+        // upscale だけ ON なら range 外なので再レンダしない。
+        assert!(!pdf_should_native_rerender_for_ai(
+            1500,
+            1500,
+            true,
+            upscale_limit,
+            false,
+            denoise_limit
+        ));
     }
 }
