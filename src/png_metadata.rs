@@ -23,6 +23,7 @@ pub enum AiToolKind {
     InvokeAI,
     SwarmUI,
     Fooocus,
+    EasyDiffusion,
     Midjourney,
     /// EXIF UserComment に保存された A1111 互換テキスト。
     JpegExif,
@@ -318,6 +319,30 @@ fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome>
         });
     }
 
+    // Fooocus 系の Comment JSON: 新しめの Fooocus / Fooocus-MRE は parameters では
+    // なく Comment チャンクに JSON を書く (receyuki / DiffusionToolkit と同じ判別)。
+    // NovelAI も Comment を使うため、NovelAI 判定より後に置くこと。
+    if let Some(raw) = chunk_value(chunks, "Comment")
+        && let Some(json) = parse_json_object(raw)
+        && let Some(meta) =
+            parse_ruinedfooocus_json(raw, &json).or_else(|| parse_fooocus_json(raw, &json, chunks))
+    {
+        return Some(ParseOutcome {
+            meta: AiMetadata::A1111(meta),
+            consumed_keys: vec!["Comment"],
+        });
+    }
+
+    // EasyDiffusion: フィールドごとに独立した tEXt チャンクで保存される
+    // (sdkit の save_dicts(output_format="embed"))。リーダー実装
+    // (receyuki / DiffusionToolkit) と同じく negative_prompt チャンクの存在で判別。
+    if let Some(meta) = parse_easydiffusion_chunks(chunks) {
+        return Some(ParseOutcome {
+            meta: AiMetadata::A1111(meta),
+            consumed_keys: EASYDIFFUSION_KEYS.to_vec(),
+        });
+    }
+
     // A1111 / Forge: "parameters" キー (平文)
     if let Some(raw) = chunk_value(chunks, "parameters") {
         if let Some(meta) = parse_a1111_as(raw, AiToolKind::A1111) {
@@ -458,6 +483,9 @@ fn parse_fooocus_json(
         "performance",
         "styles",
         "refiner_model",
+        // prompt + negative_prompt の組は生成メタデータとして十分特異。
+        // 未知亜種でも negative を検索へ漏らさないために拾う。
+        "negative_prompt",
     ]
     .iter()
     .any(|key| obj.contains_key(*key));
@@ -471,6 +499,8 @@ fn parse_fooocus_json(
             &["prompt"],
             &["full_prompt"],
             &["raw_prompt"],
+            // Fooocus-MRE: prompt 展開後の配列
+            &["real_prompt"],
             &["Prompt"],
             &["Full prompt"],
         ],
@@ -482,6 +512,7 @@ fn parse_fooocus_json(
             &["negative_prompt"],
             &["full_negative_prompt"],
             &["raw_negative_prompt"],
+            &["real_negative_prompt"],
             &["Negative"],
             &["Negative Prompt"],
         ],
@@ -497,11 +528,13 @@ fn parse_fooocus_json(
             "prompt",
             "full_prompt",
             "raw_prompt",
+            "real_prompt",
             "Prompt",
             "Full prompt",
             "negative_prompt",
             "full_negative_prompt",
             "raw_negative_prompt",
+            "real_negative_prompt",
             "Negative",
             "Negative Prompt",
         ],
@@ -545,6 +578,107 @@ fn parse_ruinedfooocus_json(raw: &str, json: &serde_json::Value) -> Option<A1111
         negative_prompt,
         params,
         raw: raw.to_string(),
+    })
+}
+
+/// EasyDiffusion が PNG に書く tEXt キー (sdkit `save_dicts(output_format="embed")` が
+/// メタデータ dict をフィールドごとに独立チャンクとして保存する)。キー名は
+/// バージョン / 設定により内部名 (negative_prompt 等) と表示名 (Negative Prompt 等)
+/// の 2 系統がある (easydiffusion `save_utils.py` の TASK_TEXT_MAPPING)。
+const EASYDIFFUSION_KEYS: &[&str] = &[
+    "prompt",
+    "Prompt",
+    "negative_prompt",
+    "Negative Prompt",
+    "seed",
+    "Seed",
+    "use_stable_diffusion_model",
+    "Stable Diffusion model",
+    "clip_skip",
+    "Clip Skip",
+    "use_controlnet_model",
+    "ControlNet model",
+    "control_filter_to_apply",
+    "ControlNet Filter",
+    "control_alpha",
+    "ControlNet Strength",
+    "use_vae_model",
+    "VAE model",
+    "sampler_name",
+    "Sampler",
+    "width",
+    "Width",
+    "height",
+    "Height",
+    "num_inference_steps",
+    "Steps",
+    "guidance_scale",
+    "Guidance Scale",
+    "use_lora_model",
+    "LoRA model",
+    "lora_alpha",
+    "LoRA Strength",
+    "use_hypernetwork_model",
+    "Hypernetwork model",
+    "hypernetwork_strength",
+    "Hypernetwork Strength",
+    "use_embeddings_model",
+    "Embedding models",
+    "tiling",
+    "Seamless Tiling",
+    "use_face_correction",
+    "Use Face Correction",
+    "use_upscale",
+    "Use Upscaling",
+    "upscale_amount",
+    "Upscale By",
+    "latent_upscaler_steps",
+    "Latent Upscaler Steps",
+];
+
+fn parse_easydiffusion_chunks(chunks: &[(String, String)]) -> Option<A1111Metadata> {
+    // negative_prompt / Negative Prompt の独立チャンクは EasyDiffusion 固有
+    // (他ツールは parameters / Comment 等の単一チャンクにまとめる)。
+    let negative_prompt = chunk_value(chunks, "negative_prompt")
+        .or_else(|| chunk_value(chunks, "Negative Prompt"))?
+        .to_string();
+    let prompt = chunk_value(chunks, "prompt")
+        .or_else(|| chunk_value(chunks, "Prompt"))
+        .unwrap_or("")
+        .to_string();
+    if prompt.trim().is_empty() && negative_prompt.trim().is_empty() {
+        return None;
+    }
+
+    let mut params = Vec::new();
+    let mut raw = String::new();
+    for (k, v) in chunks {
+        if !EASYDIFFUSION_KEYS.contains(&k.as_str()) {
+            continue;
+        }
+        if !raw.is_empty() {
+            raw.push('\n');
+        }
+        raw.push_str(k);
+        raw.push_str(": ");
+        raw.push_str(v);
+        if matches!(
+            k.as_str(),
+            "prompt" | "Prompt" | "negative_prompt" | "Negative Prompt"
+        ) {
+            continue;
+        }
+        if !v.trim().is_empty() {
+            params.push((k.clone(), v.clone()));
+        }
+    }
+
+    Some(A1111Metadata {
+        tool: AiToolKind::EasyDiffusion,
+        prompt,
+        negative_prompt,
+        params,
+        raw,
     })
 }
 
@@ -611,16 +745,31 @@ fn parse_invokeai_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metad
 }
 
 fn parse_invokeai_legacy_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metadata> {
-    let prompt = first_json_text(
-        json,
-        &[
-            &["image", "prompt"],
-            &["prompt"],
-            &["image", "positive_prompt"],
-        ],
-    )
-    .unwrap_or_default();
-    let negative_prompt = first_json_text(
+    // 旧 sd-metadata の image.prompt は [{"prompt": "...", "weight": 1.0}] という
+    // 配列のことがある。要素の prompt フィールドだけを取り出す (生 JSON を
+    // prompt として扱わない)。
+    let array_prompt = json_path(json, &["image", "prompt"])
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.get("prompt").and_then(json_value_to_text))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|s| !s.trim().is_empty());
+    let mut prompt = array_prompt
+        .or_else(|| {
+            first_json_text(
+                json,
+                &[
+                    &["image", "prompt"],
+                    &["prompt"],
+                    &["image", "positive_prompt"],
+                ],
+            )
+        })
+        .unwrap_or_default();
+    let mut negative_prompt = first_json_text(
         json,
         &[
             &["image", "negative_prompt"],
@@ -629,6 +778,13 @@ fn parse_invokeai_legacy_json(raw: &str, json: &serde_json::Value) -> Option<A11
         ],
     )
     .unwrap_or_default();
+    // 旧 InvokeAI は Dream 形式と同様、prompt 中の [..] が negative。
+    if negative_prompt.trim().is_empty()
+        && let Some((before, inside, after)) = extract_square_bracket_segment(&prompt)
+    {
+        prompt = join_non_empty(&[before.trim(), after.trim()], " ");
+        negative_prompt = inside.trim().to_string();
+    }
     if prompt.trim().is_empty() && negative_prompt.trim().is_empty() {
         return None;
     }
@@ -1767,10 +1923,28 @@ mod tests {
     }
 
     #[test]
-    fn test_parameters_json_unknown_does_not_leak_raw_negative() {
+    fn test_parameters_json_prompt_negative_pair_is_recognized() {
+        // prompt + negative_prompt の組は未知亜種でも生成メタデータとして解釈する
+        // (Fooocus 系の汎用指紋)。positive は検索でき、negative は混入しない。
         let chunks = chunks(&[(
             "parameters",
             r#"{"prompt":"unknown positive","negative_prompt":"json-negative-leak"}"#,
+        )]);
+        let meta = expect_prompt_meta(detect_and_parse(&chunks));
+        assert_eq!(meta.prompt, "unknown positive");
+        assert_eq!(meta.negative_prompt, "json-negative-leak");
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(text.contains("unknown positive"));
+        assert!(!text.contains("json-negative-leak"), "text={text}");
+    }
+
+    #[test]
+    fn test_parameters_json_unknown_does_not_leak_raw_negative() {
+        // どの抽出器にも一致しない未知 JSON は表示専用 Unknown のまま、
+        // 検索には raw を入れない (negative 系キーの混入防止)。
+        let chunks = chunks(&[(
+            "parameters",
+            r#"{"caption":"unknown positive","custom_negative":"json-negative-leak"}"#,
         )]);
         assert!(matches!(
             detect_and_parse(&chunks),
@@ -1964,6 +2138,166 @@ mod tests {
             !text.contains("lowres"),
             "NovelAI uc leaked into search text"
         );
+    }
+
+    #[test]
+    fn test_easydiffusion_chunks_internal_keys() {
+        // sdkit の embed はメタデータ dict をフィールドごとに独立チャンクで書く。
+        let chunks = vec![
+            ("prompt".to_string(), "ed positive prompt".to_string()),
+            (
+                "negative_prompt".to_string(),
+                "ed-negative-leak".to_string(),
+            ),
+            ("seed".to_string(), "12345".to_string()),
+            (
+                "use_stable_diffusion_model".to_string(),
+                "sd-v1-5".to_string(),
+            ),
+            ("num_inference_steps".to_string(), "25".to_string()),
+        ];
+        let meta = expect_prompt_meta(detect_and_parse(&chunks));
+        assert_eq!(meta.tool, AiToolKind::EasyDiffusion);
+        assert_eq!(meta.prompt, "ed positive prompt");
+        assert_eq!(meta.negative_prompt, "ed-negative-leak");
+        assert!(meta.params.iter().any(|(k, v)| k == "seed" && v == "12345"));
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(text.contains("ed positive prompt"));
+        assert!(text.contains("sd-v1-5"));
+        assert!(!text.contains("ed-negative-leak"), "text={text}");
+    }
+
+    #[test]
+    fn test_easydiffusion_chunks_label_keys() {
+        // 表示名キー (TASK_TEXT_MAPPING の値側) を書くバージョンもある。
+        let chunks = vec![
+            ("Prompt".to_string(), "label positive".to_string()),
+            (
+                "Negative Prompt".to_string(),
+                "label-negative-leak".to_string(),
+            ),
+            ("Stable Diffusion model".to_string(), "sd-v1-4".to_string()),
+        ];
+        let meta = expect_prompt_meta(detect_and_parse(&chunks));
+        assert_eq!(meta.tool, AiToolKind::EasyDiffusion);
+        assert_eq!(meta.prompt, "label positive");
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(text.contains("sd-v1-4"));
+        assert!(!text.contains("label-negative-leak"), "text={text}");
+    }
+
+    #[test]
+    fn test_fooocus_mre_comment_json() {
+        // Fooocus-MRE / 新しめの Fooocus は Comment チャンクに JSON を書く
+        // (DiffusionToolkit の ReadFooocusMREParameters と同じキー構成)。
+        let comment = r#"{
+            "prompt": "mre positive",
+            "real_prompt": ["mre expanded positive"],
+            "negative_prompt": "mre-negative-leak",
+            "real_negative_prompt": ["mre-real-negative-leak"],
+            "steps": 30, "cfg": 4.0, "width": 1152, "height": 896,
+            "seed": 42, "sampler": "dpmpp_2m_sde_gpu",
+            "base_model": "sd_xl_base_1.0", "performance": "Speed"
+        }"#;
+        let chunks = vec![("Comment".to_string(), comment.to_string())];
+        let meta = expect_prompt_meta(detect_and_parse(&chunks));
+        assert_eq!(meta.tool, AiToolKind::Fooocus);
+        assert_eq!(meta.prompt, "mre positive");
+        assert_eq!(meta.negative_prompt, "mre-negative-leak");
+        let text = build_searchable_from_chunks(&chunks);
+        assert!(text.contains("mre positive"));
+        assert!(text.contains("sd_xl_base_1.0"));
+        assert!(!text.contains("mre-negative-leak"), "text={text}");
+        assert!(!text.contains("mre-real-negative-leak"), "text={text}");
+    }
+
+    #[test]
+    fn optional_external_sdparsers_samples_smoke() {
+        let Some(dir) = std::env::var_os("MIV_AI_METADATA_SAMPLE_DIR") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        // (ファイル名, 期待ツール, 検索テキストに必要な正プロンプト断片,
+        //  混入してはならない negative 断片)
+        let cases: &[(&str, AiToolKind, &str, &str)] = &[
+            (
+                "sdparsers-automatic1111_cropped.png",
+                AiToolKind::A1111,
+                "photo of a duck",
+                "monochrome",
+            ),
+            // zTXt parameters が IDAT より後ろにあるエッジケース
+            (
+                "sdparsers-text_after_idat.png",
+                AiToolKind::A1111,
+                "photo of a duck",
+                "monochrome",
+            ),
+            (
+                "sdparsers-fooocus1_cropped.png",
+                AiToolKind::Fooocus,
+                "a smiling goldfish",
+                "worst quality",
+            ),
+            (
+                "sdparsers-invokeai_imeta1.png",
+                AiToolKind::InvokeAI,
+                "digital artwork, oil painting",
+                "oversaturated",
+            ),
+            (
+                "sdparsers-invokeai_sdmeta1.png",
+                AiToolKind::InvokeAI,
+                "professional full body photo",
+                "glowing eyes",
+            ),
+            (
+                "sdparsers-invokeai_dream1.png",
+                AiToolKind::InvokeAI,
+                "professional full body photo",
+                "glowing eyes",
+            ),
+            (
+                "sdparsers-novelai1_cropped.png",
+                AiToolKind::NovelAI,
+                "cat, space, icon",
+                "lowres",
+            ),
+        ];
+        for (name, tool, positive, negative) in cases {
+            let path = dir.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let meta = expect_prompt_meta(extract_metadata(&path));
+            assert_eq!(meta.tool, *tool, "{name}");
+            let text = build_searchable_from_path(&path);
+            assert!(
+                text.contains(positive),
+                "{name}: positive prompt missing from search text: {text}"
+            );
+            assert!(
+                !text.contains(negative),
+                "{name}: negative prompt leaked into search text"
+            );
+        }
+
+        // JPEG (EXIF UserComment) 経由の A1111 互換テキスト
+        let jpg = dir.join("sdparsers-automatic1111_cropped.jpg");
+        if jpg.exists() {
+            let meta = expect_prompt_meta(extract_metadata(&jpg));
+            assert_eq!(meta.tool, AiToolKind::JpegExif);
+            assert!(meta.prompt.contains("photo of a duck"));
+            let text = build_searchable_text(&AiMetadata::A1111(meta));
+            assert!(!text.contains("monochrome"));
+        }
+
+        // stealth pnginfo (アルファ LSB のみ、テキストチャンクなし) はスコープ外。
+        // 誤検出して Unknown 等を返さないこと。
+        let stealth = dir.join("sdparsers-automatic1111_stealth.png");
+        if stealth.exists() {
+            assert!(extract_metadata(&stealth).is_none());
+        }
     }
 
     #[test]

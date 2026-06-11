@@ -372,7 +372,7 @@
     対応フォーマット: JPEG、PNG、TIFF、MP4、MOV、M4V。</p>
 
     <h3>AI 生成情報</h3>
-    <p>Stable Diffusion などのツールで生成した PNG 画像には、
+    <p>Stable Diffusion などのツールで生成した画像には、
     プロンプト情報が埋め込まれている場合があります。
     対応している形式を以下に示します：</p>
     <div class="table-wrap">
@@ -381,9 +381,14 @@
           <tr><th>形式</th><th>説明</th></tr>
         </thead>
         <tbody>
-          <tr><td>AUTOMATIC1111 / Forge 形式</td><td><code>parameters</code> チャンクにプロンプト・ネガティブプロンプト・生成パラメータ</td></tr>
-          <tr><td>NovelAI 形式</td><td><code>Comment</code> チャンクに JSON 形式のパラメータ</td></tr>
+          <tr><td>AUTOMATIC1111 / Forge 形式</td><td><code>parameters</code> チャンクにプロンプト・ネガティブプロンプト・生成パラメータ（Tensor.Art / SD.Next など互換ツールを含む）</td></tr>
+          <tr><td>NovelAI 形式</td><td><code>Comment</code> チャンクに JSON 形式のパラメータ（v4 のキャラクター別プロンプトにも対応）</td></tr>
           <tr><td>ComfyUI 形式</td><td><code>workflow</code> / <code>prompt</code> チャンクにノードグラフ情報</td></tr>
+          <tr><td>InvokeAI 形式</td><td><code>invokeai_metadata</code> チャンクの JSON（旧形式の <code>sd-metadata</code> / <code>Dream</code> にも対応）</td></tr>
+          <tr><td>SwarmUI 形式</td><td><code>parameters</code> チャンクの JSON（<code>sui_image_params</code>）</td></tr>
+          <tr><td>Fooocus 形式</td><td><code>parameters</code> または <code>Comment</code> チャンクの JSON（RuinedFooocus / Fooocus-MRE を含む）</td></tr>
+          <tr><td>Easy Diffusion 形式</td><td>項目ごとに分かれたテキストチャンク</td></tr>
+          <tr><td>JPEG（EXIF）</td><td>EXIF <code>UserComment</code> に保存された AUTOMATIC1111 互換テキスト</td></tr>
         </tbody>
       </table>
     </div>

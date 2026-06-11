@@ -13,10 +13,27 @@
 - JPEG/JFIF の EXIF UserComment を AI 生成メタデータとして扱い、AI として認識できた
   UserComment は EXIF 検索テキストから除外して二重取り込みと Negative 混入を避ける。
 - INDEX_VERSION は 9 に更新済み。更新後の初回起動時にアイテム検索索引が再構築される。
-- 実サンプルはリポジトリに入れず、
-  `%USERPROFILE%\.codex\mimageviewer-ai-metadata-samples` に配置する。再取得用スクリプトは
-  `scripts/collect-ai-metadata-samples.ps1`。
-- サンプル未入手の EasyDiffusion / Fooocus-MRE / stealth pnginfo は今回スコープ外。
+- 実サンプルはリポジトリに入れず、`H:\home\mimageviewer_old\testimage\metadata` に
+  配置する (他のテスト画像置き場と同じツリー)。再取得用スクリプトは
+  `scripts/collect-ai-metadata-samples.ps1` (既定出力先も同パス)。スモークテストは
+  `MIV_AI_METADATA_SAMPLE_DIR` にこのパスを設定して
+  `cargo test --bin mimageviewer-core optional_external_` で実行する。
+- 実サンプルの出典 (2026-06-11 追加): d3x-at/sd-parsers (MIT) の
+  tests/resources — A1111 (PNG/JPEG EXIF/stealth)、Fooocus (`fooocus_scheme` 付き
+  parameters JSON)、InvokeAI 3 形式 (Dream / sd-metadata / invokeai_metadata)、
+  NovelAI v3、zTXt parameters が IDAT より後ろにあるエッジケース。
+- 追加実装 (2026-06-11、サンプル/リーダー実装の裏取り後):
+  - **EasyDiffusion**: sdkit `save_dicts(output_format="embed")` がフィールドごとに
+    独立 tEXt チャンクを書く形式 (キーは内部名/表示名の 2 系統)。判別は
+    receyuki / DiffusionToolkit と同じ negative_prompt チャンクの存在。
+  - **Fooocus-MRE / 新 Fooocus の Comment JSON**: `Comment` チャンクに JSON を書く
+    系列 (DiffusionToolkit は非 NovelAI の Comment JSON を MRE と判別)。NovelAI
+    判定の後に Comment JSON → Fooocus 系の分岐を追加し、未対応だった negative
+    混入経路を塞いだ。`real_prompt` / `real_negative_prompt` (MRE) も処理。
+  - **旧 sd-metadata の配列 prompt**: `image.prompt` が `[{"prompt": ...}]` 配列の
+    場合に要素の prompt のみ抽出し、Dream 同様 `[..]` を negative として分離。
+- サンプル未入手のまま残るのは stealth pnginfo (アルファ LSB、スコープ外。
+  ただし stealth 画像をテキストチャンク無しとして誤検出しないことはスモークで確認)。
 
 ## 0. 背景と目的
 
@@ -292,11 +309,24 @@ bytes 経路 (`extract_metadata_from_bytes` / `build_searchable_from_bytes`) は
 
 ## 10. 残件 / 将来検討
 
-1. **未入手サンプル**: EasyDiffusion / Fooocus-MRE は実サンプル未入手のため未対応。
-   NovelAI v4 は公開情報ベースの caption 形を合成テストで押さえたが、実画像 smoke は
-   サンプル入手後に追加する。
-2. **公開文書の表記**: ツール固有名の列挙は避け、PNG テキストチャンク /
-   JPEG EXIF UserComment のような保存場所ベースの中立表記へ寄せた。
+1. ~~**未入手サンプル**: EasyDiffusion / Fooocus-MRE は実サンプル未入手のため未対応。~~
+   → **2026-06-11 解消**: 形式の正は各ツール自身の書き込み実装で裏取りした
+   (EasyDiffusion = sdkit `save_dicts` + easydiffusion `TASK_TEXT_MAPPING`、
+   Fooocus-MRE = DiffusionToolkit `ReadFooocusMREParameters` のキー構成)。両形式とも
+   実装済み・合成フィクスチャでテスト済み。実画像サンプルは sd-parsers (MIT) の
+   テストフィクスチャ 9 点を取得済み (実装メモ参照)。NovelAI v4 の実画像 smoke のみ
+   引き続きサンプル待ち (X/Discord 投稿はメタデータが剥がされるため入手困難。
+   NovelAI 利用機会があれば 1 枚生成して `H:\home\mimageviewer_old\testimage\metadata`
+   へ置き、smoke のケース表に追加する)。
+2. **公開文書の表記 (ユーザー判断確定 2026-06-11)**: 利用規約上グレーなツール
+   (動画ダウンローダ等) を避ける趣旨であり、**画像生成ツールの固有名は公開文書に
+   直接書いてよい**。マニュアル (fullscreen.html) の対応形式表に
+   InvokeAI / SwarmUI / Fooocus 系 / Easy Diffusion / JPEG EXIF を明記済み。
+   アプリ UI のパネル見出しは従来どおり中立文言のまま (ツール名表示の必要が出たら別途)。
 3. **WebP EXIF**: `rexif` は WebP RIFF コンテナを直接読まないため今回未対応。
    対応する場合は WebP の `EXIF` チャンクを取り出して TIFF バイト列として渡す
    小さな RIFF walk を別途追加する。
+4. **未知 JSON の安全側変更 (2026-06-11)**: `prompt` + `negative_prompt` を持つ JSON は
+   未知亜種でも生成メタデータとして解釈する (Fooocus 系の汎用指紋に
+   `negative_prompt` を追加)。prompt キーすら無い未知 JSON は従来どおり表示専用
+   Unknown で検索には入れない。
