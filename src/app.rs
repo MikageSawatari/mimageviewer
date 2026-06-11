@@ -29913,12 +29913,12 @@ impl App {
             return false;
         }
         if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
-            self.select_startup_file_if_visible(&requested);
+            self.open_startup_file_if_visible(&requested);
         }
         true
     }
 
-    fn select_startup_file_if_visible(&mut self, requested: &Path) {
+    fn open_startup_file_if_visible(&mut self, requested: &Path) {
         let Some(idx) = self.items.iter().position(|item| match item {
             GridItem::Folder(path)
             | GridItem::Image(path)
@@ -29938,7 +29938,20 @@ impl App {
         };
         self.selected = Some(idx);
         self.scroll_to_selected = true;
+        if startup_file_should_open_fullscreen(&self.items[idx]) {
+            crate::logger::log(format!(
+                "startup open: opening requested file in fullscreen: {}",
+                requested.display()
+            ));
+            self.bump_input_seq_for_item("startup_open_file", idx);
+            self.fs_open_intent_from_grid = true;
+            self.open_fullscreen(idx);
+        }
     }
+}
+
+fn startup_file_should_open_fullscreen(item: &GridItem) -> bool {
+    matches!(item, GridItem::Image(_) | GridItem::Video(_))
 }
 
 // -----------------------------------------------------------------------

@@ -113,6 +113,35 @@ fn scan_directory_keeps_sources_when_upscaled_stem_is_ambiguous() {
     );
 }
 
+#[test]
+fn startup_file_open_fullscreen_for_images_and_videos() {
+    assert!(startup_file_should_open_fullscreen(&GridItem::Image(
+        PathBuf::from(r"C:\photos\a.jpg")
+    )));
+    assert!(startup_file_should_open_fullscreen(&GridItem::Video(
+        PathBuf::from(r"C:\videos\a.mp4")
+    )));
+}
+
+#[test]
+fn startup_file_open_keeps_containers_on_navigation_path() {
+    assert!(!startup_file_should_open_fullscreen(&GridItem::Folder(
+        PathBuf::from(r"C:\photos")
+    )));
+    assert!(!startup_file_should_open_fullscreen(&GridItem::ZipFile(
+        PathBuf::from(r"C:\books\a.zip")
+    )));
+    assert!(!startup_file_should_open_fullscreen(&GridItem::PdfFile(
+        PathBuf::from(r"C:\books\a.pdf")
+    )));
+    assert!(!startup_file_should_open_fullscreen(
+        &GridItem::ConvertibleArchive {
+            path: PathBuf::from(r"C:\books\a.rar"),
+            format: ArchiveFormat::Rar,
+        }
+    ));
+}
+
 // ── cell_has_lower_left_container_badge ───────────────────────────────────
 //
 // レーティング ★ バッジを左下に出す際、コンテナバッジ (folder 名 / "ZIP" / "PDF" /
