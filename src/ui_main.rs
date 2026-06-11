@@ -3236,6 +3236,9 @@ impl App {
                 // ネスト ZIP ツリーの子コンテナへダブルクリックで降りる (Phase 3)。
                 Some(GridItem::ZipDir { dir_prefix, .. }) => {
                     let dp = dir_prefix.clone();
+                    // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ
+                    // (Codex P2)。enter 前に抑制を仕込む。
+                    self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
                     self.zip_nav_enter(&dp);
                 }
                 None => {}

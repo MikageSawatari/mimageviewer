@@ -5086,25 +5086,7 @@ impl App {
         };
 
         if let Some(mode) = new_spread {
-            if mode != self.spread_mode {
-                self.spread_mode = mode;
-                self.update_reading_direction_from_spread_mode(mode);
-                self.spread_popup_open = false;
-                self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
-                if !self.reading_flow.is_paged() {
-                    self.reset_continuous_reading_transform();
-                    self.disable_non_paged_fullscreen_modes(fs_idx);
-                }
-                // DB に保存
-                self.persist_current_spread_mode();
-                self.persist_current_reading_flow();
-                // 分析モードを解除 (post-filter バイパスも戻す)
-                if mode.is_spread() && self.analysis_mode {
-                    self.reset_analysis_mode();
-                }
-                // ページ位置を正規化
-                self.normalize_spread_position(ctx);
-            }
+            self.apply_fullscreen_spread_mode(ctx, fs_idx, mode);
             // フィードバック表示
             let key_num = if key_1 {
                 1
@@ -7338,6 +7320,37 @@ impl App {
         self.local_adjust_mask_brush_stroke = None;
         self.local_adjust_mask_lasso_points.clear();
         self.local_adjust_selected_shape = None;
+    }
+
+    /// 見開きモード (`SpreadMode`) を適用する。キーボードのショートカット 1〜5 と
+    /// ゲームパッド Select の両方から呼ぶ共通処理 (連結方式 `reading_flow` の切替とは別物)。
+    /// トースト表示は呼び出し側で行う。
+    pub(crate) fn apply_fullscreen_spread_mode(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        mode: SpreadMode,
+    ) {
+        if mode == self.spread_mode {
+            return;
+        }
+        self.spread_mode = mode;
+        self.update_reading_direction_from_spread_mode(mode);
+        self.spread_popup_open = false;
+        self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+        if !self.reading_flow.is_paged() {
+            self.reset_continuous_reading_transform();
+            self.disable_non_paged_fullscreen_modes(fs_idx);
+        }
+        // DB に保存
+        self.persist_current_spread_mode();
+        self.persist_current_reading_flow();
+        // 分析モードを解除 (post-filter バイパスも戻す)
+        if mode.is_spread() && self.analysis_mode {
+            self.reset_analysis_mode();
+        }
+        // ページ位置を正規化
+        self.normalize_spread_position(ctx);
     }
 
     pub(crate) fn set_reading_flow_for_fullscreen(

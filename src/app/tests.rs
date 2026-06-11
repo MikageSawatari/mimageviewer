@@ -5771,6 +5771,83 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.get_rating(idx), 5);
     }
 
+    /// Codex P2: ★付きのネスト ZIP の本を絞り込み中に開くと、中身 (未評価) が
+    /// フィルタで全部消える事故を防ぐ。本を開くと一時解除、本より上の階層へ戻ると復元。
+    #[test]
+    fn opening_starred_zip_book_under_filter_suppresses_then_restores() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+
+        // ルート階層 (bookA / bookB の ZipDir セルが並ぶ) を表示。
+        let nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
+        app.zip_nav = Some(nav);
+        app.zip_nav_show_current_level();
+
+        // bookA を ★5 に設定。
+        let book_key = crate::adjustment_db::normalize_path(&zip_path.join("bookA"));
+        app.rating_db.as_ref().unwrap().set(&book_key, 5).unwrap();
+        app.rating_cache.clear();
+
+        // ★5 フィルタ ON。
+        let mut rf = [false; 6];
+        rf[5] = true;
+        app.settings.rating_filter = rf;
+
+        let idx = app
+            .items
+            .iter()
+            .position(
+                |it| matches!(it, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "bookA/"),
+            )
+            .expect("root level should contain bookA ZipDir");
+
+        // 本を開く → 抑制起動。
+        app.maybe_suppress_rating_filter_for_opened_zip_book(idx);
+        app.zip_nav_enter("bookA/");
+        assert!(
+            app.rating_filter_suppressed_at.is_some(),
+            "★付きの本を開いた直後は一時解除されているべき"
+        );
+
+        // 本より上 (ルート) へ戻る → 復元。
+        assert!(app.zip_nav_back());
+        assert!(
+            app.rating_filter_suppressed_at.is_none(),
+            "本より上の階層へ戻ったらフィルタは復元されるべき"
+        );
+    }
+
+    /// ★が付いていない本を開いても抑制は起動しない (= フィルタ維持)。
+    #[test]
+    fn opening_unrated_zip_book_does_not_suppress_filter() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+        let nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
+        app.zip_nav = Some(nav);
+        app.zip_nav_show_current_level();
+
+        let mut rf = [false; 6];
+        rf[5] = true;
+        app.settings.rating_filter = rf;
+
+        let idx = app
+            .items
+            .iter()
+            .position(
+                |it| matches!(it, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "bookA/"),
+            )
+            .expect("root level should contain bookA ZipDir");
+        app.maybe_suppress_rating_filter_for_opened_zip_book(idx);
+        assert!(
+            app.rating_filter_suppressed_at.is_none(),
+            "★なしの本では一時解除しない (= ユーザー設定フィルタを維持)"
+        );
+    }
+
     #[test]
     fn undo_restores_zip_book_container_rating_key() {
         let mut app = setup_app();

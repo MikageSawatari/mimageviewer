@@ -32,6 +32,32 @@ use crate::folder_tree::{is_recognized_image_ext, path_eq};
 /// 超えた入れ子はログして skip する。
 pub const MAX_NESTED_ARCHIVE_DEPTH: u32 = 8;
 
+/// 1 エントリ (画像 or 入れ子アーカイブ) の展開後サイズ上限。圧縮率の高い細工
+/// エントリが GB 級に膨らむ「展開爆弾」で disk / RAM を枯渇させないためのガード。
+/// 正規の高解像度画像・入れ子アーカイブでも到達しない余裕を持たせた固定値
+/// (実行時の空き容量で変えない = deterministic over adaptive)。
+const MAX_SINGLE_ENTRY_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+
+/// 変換出力 (cache ZIP) の累積サイズ上限。入れ子再帰で多数のエントリが積み上がっても
+/// 出力全体がこの値を超えたら中断する。
+const MAX_CONVERT_OUTPUT_BYTES: u64 = 32 * 1024 * 1024 * 1024; // 32 GiB
+
+/// `r` から最大 `limit` バイトまで `w` へストリーミングコピーする。`limit` を超える入力が
+/// あれば [`ConvertError::TooLarge`] を返す (展開爆弾ガード)。`limit + 1` まで読んで超過を
+/// 検出するので、`w` へ書かれるのは最大 `limit + 1` バイト (呼び出し側が abort / 破棄する)。
+fn copy_capped<R: Read + ?Sized, W: Write + ?Sized>(
+    r: &mut R,
+    w: &mut W,
+    limit: u64,
+) -> Result<u64, ConvertError> {
+    let mut limited = r.take(limit.saturating_add(1));
+    let copied = std::io::copy(&mut limited, w).map_err(ConvertError::Io)?;
+    if copied > limit {
+        return Err(ConvertError::TooLarge);
+    }
+    Ok(copied)
+}
+
 /// 変換対応アーカイブ形式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
@@ -141,6 +167,9 @@ pub enum ConvertError {
     Archive(String),
     /// 画像エントリが 0 件だった
     NoImages,
+    /// 展開後サイズが上限を超えた (展開爆弾ガード)。Cancelled / Io と同じく
+    /// **入れ子でも skip せず伝播** させて変換全体を中断する。
+    TooLarge,
 }
 
 impl std::fmt::Display for ConvertError {
@@ -152,6 +181,7 @@ impl std::fmt::Display for ConvertError {
             Self::BadPassword => write!(f, "パスワードが正しくありません"),
             Self::Archive(s) => write!(f, "アーカイブエラー: {s}"),
             Self::NoImages => write!(f, "画像ファイルが含まれていません"),
+            Self::TooLarge => write!(f, "展開後サイズが上限を超えました"),
         }
     }
 }
@@ -544,6 +574,14 @@ impl ConvertCtx<'_> {
         }
     }
 
+    /// 画像 1 枚に許す copy 上限 = min(残り総予算, 単一エントリ上限)。これを超える入力は
+    /// 展開爆弾とみなして [`ConvertError::TooLarge`] にする。
+    fn image_copy_limit(&self) -> u64 {
+        MAX_CONVERT_OUTPUT_BYTES
+            .saturating_sub(self.bytes_written)
+            .min(MAX_SINGLE_ENTRY_BYTES)
+    }
+
     /// 画像 1 枚を STORE で書く (ストリーミング copy)。`name` は prefix 込みの
     /// 正規化済みフルパス。copy 途中で失敗したら書きかけエントリを `abort_file` で
     /// 取り除いてから伝播する (上位の入れ子 skip ガードが握っても出力 ZIP が
@@ -553,15 +591,17 @@ impl ConvertCtx<'_> {
         name: String,
         r: &mut R,
     ) -> Result<(), ConvertError> {
+        let limit = self.image_copy_limit();
         let name = dedup_entry_name(name, &mut self.seen_names);
         self.zw
             .start_file(&name, store_options())
             .map_err(zip_writer_error)?;
-        let copied = match std::io::copy(r, &mut *self.zw) {
+        // copy_capped が Io / TooLarge いずれを返しても abort_file で書きかけエントリを除去。
+        let copied = match copy_capped(r, &mut *self.zw, limit) {
             Ok(n) => n,
             Err(e) => {
                 let _ = self.zw.abort_file();
-                return Err(ConvertError::Io(e));
+                return Err(e);
             }
         };
         self.finish_image(copied);
@@ -570,6 +610,9 @@ impl ConvertCtx<'_> {
 
     /// 画像 1 枚を STORE で書く (メモリ上のバイト列。unrar はストリーミング API が無い)。
     fn write_image_bytes(&mut self, name: String, data: &[u8]) -> Result<(), ConvertError> {
+        if data.len() as u64 > self.image_copy_limit() {
+            return Err(ConvertError::TooLarge);
+        }
         let name = dedup_entry_name(name, &mut self.seen_names);
         self.zw
             .start_file(&name, store_options())
@@ -610,7 +653,9 @@ fn write_reader_to_temp<R: Read + ?Sized>(
         .prefix("miv-nested-")
         .suffix(kind.temp_suffix())
         .tempfile()?;
-    std::io::copy(r, tmp.as_file_mut())?;
+    // 入れ子アーカイブ 1 個の展開後サイズも上限でガード (展開爆弾の中間 temp が
+    // disk を埋めるのを防ぐ)。tmp は Drop で削除されるので途中失敗も後始末される。
+    copy_capped(r, tmp.as_file_mut(), MAX_SINGLE_ENTRY_BYTES)?;
     tmp.as_file_mut().flush()?;
     Ok(tmp)
 }
@@ -620,6 +665,9 @@ fn write_bytes_to_temp(
     data: &[u8],
     kind: ArchiveFormat,
 ) -> Result<tempfile::NamedTempFile, ConvertError> {
+    if data.len() as u64 > MAX_SINGLE_ENTRY_BYTES {
+        return Err(ConvertError::TooLarge);
+    }
     let mut tmp = tempfile::Builder::new()
         .prefix("miv-nested-")
         .suffix(kind.temp_suffix())
@@ -653,7 +701,8 @@ fn expand_nested_guarded(
     };
     match result {
         Ok(()) => Ok(()),
-        Err(e @ (ConvertError::Cancelled | ConvertError::Io(_))) => Err(e),
+        // TooLarge は展開爆弾なので skip せず伝播 (Cancelled / Io と同じ扱い)。
+        Err(e @ (ConvertError::Cancelled | ConvertError::Io(_) | ConvertError::TooLarge)) => Err(e),
         Err(e) => {
             crate::logger::log(format!(
                 "archive_converter: 入れ子アーカイブ {prefix} の展開に失敗、skip: {e}"
@@ -763,6 +812,10 @@ fn expand_rar(
         };
         let entry = header.entry();
         let raw_name = entry.filename.to_string_lossy().to_string();
+        // 宣言サイズで RAM ガード。unrar はストリーミング API が無く header.read() が
+        // entry 全体を Vec へ読むので、巨大宣言サイズは read 前に弾く (展開爆弾の
+        // RAM 枯渇防止)。実データが宣言より大きい嘘ヘッダは read 後の write 側上限が拾う。
+        let unpacked_size = entry.unpacked_size;
         let normalized = raw_name.replace('\\', "/");
         let action = if !entry.is_file() || should_ignore_entry(&normalized) {
             RarEntryAction::Skip
@@ -790,12 +843,18 @@ fn expand_rar(
         archive = match action {
             RarEntryAction::Skip => header.skip().map_err(rar_error)?,
             RarEntryAction::Image(name) => {
+                if unpacked_size > MAX_SINGLE_ENTRY_BYTES {
+                    return Err(ConvertError::TooLarge);
+                }
                 let (data, next) = header.read().map_err(rar_error)?;
                 ctx.check_cancel()?;
                 ctx.write_image_bytes(format!("{prefix}{name}"), &data)?;
                 next
             }
             RarEntryAction::Nested(name, kind) => {
+                if unpacked_size > MAX_SINGLE_ENTRY_BYTES {
+                    return Err(ConvertError::TooLarge);
+                }
                 // unrar にストリーミング API が無いため一旦メモリへ読み、一時ファイル化
                 // して再帰する (メモリピーク = 入れ子アーカイブ 1 個分)。
                 let (data, next) = header.read().map_err(rar_error)?;
@@ -899,10 +958,14 @@ fn expand_7z(
         std::io::copy(r, &mut std::io::sink())?;
         Ok(true)
     });
-    iter_result.map_err(|e| ConvertError::Archive(e.to_string()))?;
+    // deferred (= ネスト write の Io / Cancelled) を **先に** 返す。`for_each_entries` が
+    // stop/cleanup で Err を返すと、後で map_err すると Archive 扱いに化けて、せっかくの
+    // Io / Cancelled が握り潰され、切り詰めた cache が「成功」として record され得る
+    // (expand_nested_guarded は Io / Cancelled 以外を skip するため)。
     if let Some(e) = deferred {
         return Err(e);
     }
+    iter_result.map_err(|e| ConvertError::Archive(e.to_string()))?;
     Ok(())
 }
 
@@ -1015,6 +1078,39 @@ fn expand_lzh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_capped_passes_input_within_limit() {
+        let src = vec![0u8; 100];
+        let mut out = Vec::new();
+        let copied = copy_capped(&mut src.as_slice(), &mut out, 100).unwrap();
+        assert_eq!(copied, 100);
+        assert_eq!(out.len(), 100);
+    }
+
+    #[test]
+    fn copy_capped_rejects_input_over_limit() {
+        let src = vec![0u8; 101];
+        let mut out = Vec::new();
+        let err = copy_capped(&mut src.as_slice(), &mut out, 100).unwrap_err();
+        assert!(matches!(err, ConvertError::TooLarge));
+        // limit+1 までしか読まないので出力は最大 limit+1 バイトで止まる (爆弾でも有界)。
+        assert!(out.len() as u64 <= 101);
+    }
+
+    #[test]
+    fn copy_capped_zero_limit_rejects_nonempty() {
+        let src = vec![0u8; 1];
+        let mut out = Vec::new();
+        assert!(matches!(
+            copy_capped(&mut src.as_slice(), &mut out, 0),
+            Err(ConvertError::TooLarge)
+        ));
+        // 空入力は 0 バイトで OK。
+        let empty: Vec<u8> = Vec::new();
+        let mut out2 = Vec::new();
+        assert_eq!(copy_capped(&mut empty.as_slice(), &mut out2, 0).unwrap(), 0);
+    }
 
     // ── 入れ子アーカイブ再帰展開 (v1.3.0) のテストヘルパー ──────────────
 

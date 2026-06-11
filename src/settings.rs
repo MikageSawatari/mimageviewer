@@ -926,6 +926,24 @@ impl SpreadMode {
         }
     }
 
+    /// 見開きモードの巡回トグルで次のモードを返す。キーボードのショートカット 1〜5 と
+    /// 同じ並び (Single → Ltr → LtrCover → Rtl → RtlCover → Single …) を巡回する。
+    /// 巡回外のモード (旧 `Vertical` 等) からは先頭 (`Single`) へ。
+    /// ゲームパッド Select の見開き切替に使う。
+    pub fn next_in_spread_cycle(self) -> Self {
+        const CYCLE: [SpreadMode; 5] = [
+            SpreadMode::Single,
+            SpreadMode::Ltr,
+            SpreadMode::LtrCover,
+            SpreadMode::Rtl,
+            SpreadMode::RtlCover,
+        ];
+        match CYCLE.iter().position(|&m| m == self) {
+            Some(i) => CYCLE[(i + 1) % CYCLE.len()],
+            None => CYCLE[0],
+        }
+    }
+
     /// 整数値を返す
     pub fn to_int(self) -> i32 {
         match self {
@@ -3909,6 +3927,25 @@ mod tests {
         assert_eq!(
             s.ai_denoise_limit(),
             crate::ai::upscale::AiProcessSizeLimit::square(2048)
+        );
+    }
+
+    #[test]
+    fn spread_cycle_loops_through_keys_1_to_5() {
+        // ゲームパッド Select / 見開きトグルはキーボード 1〜5 と同じ順で巡回する。
+        assert_eq!(SpreadMode::Single.next_in_spread_cycle(), SpreadMode::Ltr);
+        assert_eq!(SpreadMode::Ltr.next_in_spread_cycle(), SpreadMode::LtrCover);
+        assert_eq!(SpreadMode::LtrCover.next_in_spread_cycle(), SpreadMode::Rtl);
+        assert_eq!(SpreadMode::Rtl.next_in_spread_cycle(), SpreadMode::RtlCover);
+        // 末尾 RtlCover からは先頭 Single へループ。
+        assert_eq!(
+            SpreadMode::RtlCover.next_in_spread_cycle(),
+            SpreadMode::Single
+        );
+        // 巡回外モード (Vertical) からは先頭 Single へ。
+        assert_eq!(
+            SpreadMode::Vertical.next_in_spread_cycle(),
+            SpreadMode::Single
         );
     }
 

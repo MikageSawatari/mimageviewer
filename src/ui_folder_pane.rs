@@ -28,8 +28,23 @@ impl App {
         self.settings.save();
     }
 
-    pub(crate) fn toggle_folder_tree_pane_visible(&mut self) {
-        self.set_folder_tree_pane_visible(!self.settings.folder_tree_pane_visible);
+    /// トグルキー (キーボード T / ゲームパッド Y) でフォルダツリーペインを開閉する。
+    /// - 非表示 → 表示 (カーソルはアクティブフォルダに置かれる)。
+    /// - 表示中 → 閉じる。ただしカーソルが別フォルダへ動いていれば、Enter と同じく
+    ///   そのフォルダへ移動してグリッド一覧に戻ってから閉じる
+    ///   (worker scan 経由なので UI スレッドの read_dir で固まらない)。
+    pub(crate) fn toggle_folder_tree_pane_from_key(&mut self) {
+        if !self.settings.folder_tree_pane_visible {
+            self.set_folder_tree_pane_visible(true);
+            return;
+        }
+        // 閉じる前に「カーソルが別フォルダへ動いていれば」その移動先を取得する。
+        let target = self.folder_pane.cursor_nav_target_if_moved();
+        // set_folder_tree_pane_visible(false) が focus をグリッドへ戻し settings も保存する。
+        self.set_folder_tree_pane_visible(false);
+        if let Some(target) = target {
+            self.start_folder_pane_open(target);
+        }
     }
 
     pub(crate) fn sync_folder_pane_state(&mut self, ctx: &egui::Context) {
@@ -95,7 +110,11 @@ impl App {
                     .handle_tree_key(key, self.settings.sort_order)
                 {
                     self.folder_pane.set_focus_grid();
-                    return Some(AddressBarNav::Direct(path));
+                    // クリック経路と同じく worker scan 経由で開く (UI スレッドの
+                    // read_dir ブロック回避)。Enter は consume 済みなので、この後
+                    // grid keyboard へ抜けても二重発火しない。
+                    self.start_folder_pane_open(path);
+                    return None;
                 }
             }
             return None;

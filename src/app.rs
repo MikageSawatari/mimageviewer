@@ -782,6 +782,19 @@ pub(crate) struct FolderNavPending {
     mode: FolderNavMode,
 }
 
+/// フォルダツリーペインのクリック/Enter ナビを **worker で事前 scan** してから開くための
+/// 保留状態。UI スレッドで `scan_directory` (大/遅/ネットワークフォルダで read_dir が
+/// 数百 ms〜秒) を直接走らせると、ツリーを次々クリックするたびに UI が固まるため
+/// (docs/ui-responsiveness.md §4)。`spawn_folder_nav` の DFS pre-scan と同じ方式。
+pub(crate) struct FolderPaneOpenPending {
+    /// 開く対象 (= 完了時に `load_folder_with_scan(path, Some(scan))` する実ディレクトリ)。
+    path: PathBuf,
+    /// 旧 pending を上書き/別 nav 勝利時に立てるキャンセルトークン。
+    cancel: Arc<AtomicBool>,
+    /// scan worker からの結果チャネル。
+    rx: mpsc::Receiver<ScannedDir>,
+}
+
 /// `poll_folder_nav` がワーカー完了を検知したときに返す情報。
 pub(crate) struct FolderNavResult {
     /// DFS が見つけた次フォルダ (None なら DFS が尽きた)。
@@ -2050,8 +2063,7 @@ fn run_metadata_search(
                     if let Some(exif) = crate::exif_reader::read_exif(path, &[]) {
                         let exif_part = exif_hay(
                             &exif,
-                            meta_origin
-                                == Some(crate::png_metadata::MetadataOrigin::ExifUserComment),
+                            meta_origin.is_some_and(|o| o.suppresses_exif_user_comment()),
                         );
                         if !exif_part.is_empty() {
                             if !extended_meta.is_empty() {
@@ -3269,6 +3281,9 @@ pub struct App {
     /// Ctrl+↑↓ のバックグラウンドフォルダナビゲーション結果待ち。
     /// navigate_folder_with_skip をワーカースレッドで実行し、UIスレッドをブロックしない。
     folder_nav_pending: Option<FolderNavPending>,
+    /// フォルダツリーペインのクリック/Enter ナビの worker scan 待ち
+    /// ([`FolderPaneOpenPending`])。UI スレッドの `scan_directory` ブロックを回避する。
+    folder_pane_open_pending: Option<FolderPaneOpenPending>,
     /// Ctrl+↑↓ 連打アキュームレータ。in-flight 中の追加プレスをここに貯め、
     /// 現 nav が完了するたびに 1 消費して次の nav を連鎖させる。
     /// 符号: 正=forward (↓), 負=backward (↑)。異方向を押すと相殺される。
@@ -5652,6 +5667,7 @@ impl App {
             keep_end_shared: Arc::new(AtomicUsize::new(0)),
             texture_backlog: Vec::new(),
             folder_nav_pending: None,
+            folder_pane_open_pending: None,
             pending_folder_nav_steps: 0,
             pending_folder_nav_mode: FolderNavMode::Grid,
             progress_normal_peak: 0,
@@ -7662,6 +7678,8 @@ impl App {
 
     pub(crate) fn enter_drive_list(&mut self, origin: Option<PathBuf>) {
         crate::logger::log("=== enter_drive_list ===");
+        // ドライブ一覧へ移るので in-flight のフォルダペイン open scan は破棄する。
+        self.cancel_folder_pane_open();
 
         if let Some(cur) = self.current_folder.clone() {
             let leaving_search_view = self.items_are_global_search_view
@@ -7853,6 +7871,10 @@ impl App {
     /// をスキップできる。`path` が ZIP/PDF ファイルのときは仮想フォルダとして
     /// 別ルートに入るため `pre_scan` は無視される (None 相当で委譲)。
     pub fn load_folder_with_scan(&mut self, path: PathBuf, pre_scan: Option<ScannedDir>) {
+        // 別経路の load が走ったら、in-flight のフォルダペイン open scan は stale なので
+        // 破棄する (完了しても旧クリック先を後追いで開かない)。poll_folder_pane_open は
+        // pending を take してから呼ぶので、自分の適用ではここは no-op になる。
+        self.cancel_folder_pane_open();
         // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
         // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能
         // (§4.4 「captured folder の中の child folder」)。判定は `snapshot_owner_entry`
@@ -9857,6 +9879,9 @@ impl App {
             let fb = self.zip_nav.as_ref().map(|nav| nav.tree.zip_path.clone());
             self.apply_spread_for_key_with_fallback(&key, fb.as_deref());
         }
+        // ★付きの本を開いて一時解除したフィルタを、本より上の階層へ戻ったら復元する
+        // (実フォルダの maybe_restore_rating_filter_if_out_of_scope に相当)。
+        self.maybe_restore_rating_filter_after_zip_level_change();
     }
 
     /// アドレス欄をネスト ZIP ツリーナビのパンくず表示にする。
@@ -11612,6 +11637,12 @@ impl App {
         let Some(db) = self.archive_cache_db.as_ref() else {
             return;
         };
+        // UI スレッドで per-archive の SQLite peek + cache ZIP の `exists()` を回す
+        // (install_new_items 時に 1 回)。ローカルディスクなら軽いが、変換アーカイブが
+        // 多数あるフォルダでは累積し得るので perf 計装する (docs/ui-responsiveness.md §4)。
+        let t0 = crate::perf::is_enabled().then(std::time::Instant::now);
+        let mut peeked = 0usize;
+        let mut hits = 0usize;
         for (idx, item) in self.items.iter().enumerate() {
             let GridItem::ConvertibleArchive { path, .. } = item else {
                 continue;
@@ -11619,12 +11650,30 @@ impl App {
             let Some((mtime, file_size)) = self.image_metas.get(idx).and_then(|m| *m) else {
                 continue;
             };
+            peeked += 1;
             // peek = 読み取り専用 lookup。フォルダを表示しただけで全アーカイブに
             // last_access UPDATE (書き込みトランザクション) を発行しない (Codex R3 P3)。
             if let Some(cached_zip) = db.peek(path, mtime, file_size) {
+                hits += 1;
                 self.converted_archive_cache_paths
                     .insert(crate::path_key::normalize_keep_drive(path), cached_zip);
             }
+        }
+        if let Some(t0) = t0 {
+            crate::perf::event(
+                "nav",
+                "archive_cache_peek",
+                None,
+                self.input_seq,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("peeked", serde_json::Value::from(peeked)),
+                    ("hits", serde_json::Value::from(hits)),
+                ],
+            );
         }
     }
 
@@ -15705,6 +15754,25 @@ impl App {
         if let Some(nav) = self.handle_folder_pane_keyboard(ctx) {
             return Some(nav);
         }
+        // ペイン開閉トグル (T) は `folder_pane_blocks_grid_keyboard()` の early-return
+        // より **前** で処理する。ペイン表示は即フォーカスを奪う (set_folder_tree_pane_visible)
+        // ため、early-return の後ろに置くと「T で開く」はできても「T で閉じる」が
+        // 効かない片道トグルになる (ペインにフォーカスがある間は閉じられない)。
+        // 閉じる時はカーソルが別フォルダへ動いていれば Enter 相当でそこへ移動する
+        // (`toggle_folder_tree_pane_from_key`)。
+        if !self.address_has_focus
+            && !self.search_has_focus
+            && !self.favsearch.has_focus
+            && !self.global_search.has_focus
+            && self.fullscreen_idx.is_none()
+            && !self.any_dialog_open()
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::GridToggleFolderTreePane)
+        {
+            self.toggle_folder_tree_pane_from_key();
+            return None;
+        }
         if self.folder_pane_blocks_grid_keyboard() {
             return None;
         }
@@ -15773,19 +15841,6 @@ impl App {
         // 関数頭で drain 済み) を消費。詳細は main.rs の `install_mouse_nav_hook` 参照。
         let browser_back = browser_back_count > 0;
         let browser_forward = browser_forward_count > 0;
-        if !self.address_has_focus
-            && !self.search_has_focus
-            && !self.favsearch.has_focus
-            && !self.global_search.has_focus
-            && self.fullscreen_idx.is_none()
-            && !self.any_dialog_open()
-            && self
-                .keymap
-                .consume_action(ctx, KeyAction::GridToggleFolderTreePane)
-        {
-            self.toggle_folder_tree_pane_visible();
-            return None;
-        }
         let space = self.keymap.pressed_action(ctx, KeyAction::GridToggleCheck);
         let key_r = self.keymap.pressed_action(ctx, KeyAction::GridRotateCw);
         let key_l = self.keymap.pressed_action(ctx, KeyAction::GridRotateCcw);
@@ -16094,6 +16149,9 @@ impl App {
                         // ネスト ZIP ツリーの子コンテナへ Enter で降りる (Phase 3)。
                         Some(GridItem::ZipDir { dir_prefix, .. }) => {
                             let dp = dir_prefix.clone();
+                            // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ
+                            // (Codex P2)。enter 前に抑制を仕込む。
+                            self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
                             self.zip_nav_enter(&dp);
                         }
                         None => {}
@@ -16501,6 +16559,60 @@ impl App {
 
     /// バックグラウンドフォルダナビゲーションの結果を非同期にポーリングする。
     /// 結果が到着していれば `Some(FolderNavResult)` を返し、未完了なら `None` を返す。
+    /// フォルダツリーペインのクリック/Enter ナビを worker scan 経由で開始する。
+    /// UI スレッドで `scan_directory` を直接走らせず、worker で read_dir + メタ取得を
+    /// 済ませてから `poll_folder_pane_open` が `load_folder_with_scan(path, Some(scan))`
+    /// する。対象は実ディレクトリ前提 (フォルダペインは実フォルダのみ表示する)。
+    pub(crate) fn start_folder_pane_open(&mut self, path: PathBuf) {
+        // 旧 pending を破棄 (連打で最後のクリックだけ生かす)。
+        if let Some(prev) = self.folder_pane_open_pending.take() {
+            prev.cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_w = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let scan_path = path.clone();
+        std::thread::spawn(move || {
+            if cancel_w.load(Ordering::Relaxed) {
+                return;
+            }
+            let scan = scan_directory(&scan_path);
+            if !cancel_w.load(Ordering::Relaxed) {
+                let _ = tx.send(scan);
+            }
+        });
+        self.folder_pane_open_pending = Some(FolderPaneOpenPending { path, cancel, rx });
+    }
+
+    /// 進行中のフォルダペイン open scan をキャンセルして破棄する。
+    /// 別の nav 源 (アドレスバー / Ctrl+↑↓ / グリッド) が勝ったときに呼ぶ。
+    fn cancel_folder_pane_open(&mut self) {
+        if let Some(prev) = self.folder_pane_open_pending.take() {
+            prev.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// `start_folder_pane_open` の worker 完了を毎フレーム回収する。完了したら
+    /// pre-scan 付きで `load_folder_with_scan` し、UI スレッドの read_dir を省く。
+    fn poll_folder_pane_open(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.folder_pane_open_pending.as_ref() else {
+            return;
+        };
+        match pending.rx.try_recv() {
+            Ok(scan) => {
+                let pending = self.folder_pane_open_pending.take().unwrap();
+                self.load_folder_with_scan(pending.path, Some(scan));
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // worker が cancel で send せず終了 (= 自分でキャンセルしたケースのみ)。破棄。
+                self.folder_pane_open_pending = None;
+            }
+        }
+    }
+
     fn poll_folder_nav(&mut self) -> Option<FolderNavResult> {
         let pending = self.folder_nav_pending.as_ref()?;
         match pending.rx.try_recv() {
@@ -19549,6 +19661,51 @@ impl App {
         self.show_feedback_toast("★フィルタ一時解除中 (親へ戻ると復元)".to_string());
     }
 
+    /// ネスト ZIP の本 (`GridItem::ZipDir`) を開く時に呼ぶ。本自身に★が付いていて
+    /// それが現在のフィルタを通るなら、フィルタを一時解除する。
+    ///
+    /// `maybe_suppress_rating_filter_for_opened_container` の ZipDir 版。ZipDir は
+    /// 実パスを持たず `container_path()` が `None` を返すので既存ヘルパーでは扱えない。
+    /// アンカーには本の合成キー (`book_container_key` = zip_path + literal prefix) を使う。
+    /// これで `★5 の本を絞り込みで見つけて開く → 中身が未評価で全部消える` 事故を防ぐ
+    /// (Codex P2)。復元は `maybe_restore_rating_filter_after_zip_level_change` が
+    /// 本より上の階層へ戻ったときに、ZIP を抜けたときは `load_folder` 末尾の
+    /// `maybe_restore_rating_filter_if_out_of_scope` が行う。
+    pub(crate) fn maybe_suppress_rating_filter_for_opened_zip_book(&mut self, idx: usize) {
+        if self.rating_filter_suppressed_at.is_some() || !self.rating_filter_active() {
+            return;
+        }
+        let Some(GridItem::ZipDir {
+            zip_path,
+            dir_prefix,
+            ..
+        }) = self.items.get(idx)
+        else {
+            return;
+        };
+        let zip_path = zip_path.clone();
+        let dir_prefix = dir_prefix.clone();
+        let stars = self.get_rating(idx);
+        if !(1..=5).contains(&stars) {
+            return;
+        }
+        let s = stars as usize;
+        if s > 5 || !self.settings.rating_filter[s] {
+            // 本の★が現在のフィルタを通っていない = 親階層で見えていなかったはず
+            // (= ユーザーが Ctrl+↑↓ / アドレス欄で直接辿り着いた)。意図操作とみなし保持。
+            return;
+        }
+        let root = zip_rating_root_path(
+            &zip_path,
+            self.archive_source_override.as_deref(),
+            self.current_folder.as_deref(),
+        );
+        let anchor = book_container_key(root, &dir_prefix);
+        let saved = self.settings.rating_filter;
+        self.rating_filter_suppressed_at = Some((anchor, saved));
+        self.show_feedback_toast("★フィルタ一時解除中 (本から戻ると復元)".to_string());
+    }
+
     /// `load_folder` の最後に呼ぶ: suppression の自動再評価。
     ///
     /// 1. 既に suppress 中 + anchor の subtree 内 → 維持 (= 子孫探索中は継続)
@@ -19606,6 +19763,31 @@ impl App {
     /// 復元はせず (現在のフィルタはユーザー自身の操作なのでそれが正)、anchor だけ消す。
     pub(crate) fn drop_rating_filter_suppression_on_user_edit(&mut self) {
         self.rating_filter_suppressed_at = None;
+    }
+
+    /// ZIP 階層の移動 (`zip_nav_show_current_level`) 後に呼ぶ: ★付きの本を開いて
+    /// 一時解除したフィルタを、その本より上の階層へ戻ったら復元する。
+    ///
+    /// 判定はアンカーの正規化キー (= 抑制した本の rating キー) と現在階層のコンテナ
+    /// キーの **接頭辞包含** で行う。本のセル literal prefix は入った後の effective
+    /// prefix の接頭辞なので、collapse された本でも「中にいる間は cur_key が anchor_key を
+    /// 接頭辞に持つ」が成り立つ (= 中にいる限り誤復元しない)。判定不能 (検索ビュー等で
+    /// `current_container_rating_key_and_source` が `None`) のときは **復元しない**
+    /// (= 保持側に倒す)。ZIP を完全に抜けた場合は `load_folder` 末尾の
+    /// `maybe_restore_rating_filter_if_out_of_scope` が拾う。
+    fn maybe_restore_rating_filter_after_zip_level_change(&mut self) {
+        let Some((anchor, _)) = self.rating_filter_suppressed_at.as_ref() else {
+            return;
+        };
+        let anchor_key = crate::adjustment_db::normalize_path(anchor);
+        let Some((cur_key, _)) = self.current_container_rating_key_and_source() else {
+            return;
+        };
+        let inside = cur_key == anchor_key || cur_key.starts_with(&format!("{anchor_key}/"));
+        if !inside {
+            self.restore_rating_filter_suppression();
+            self.current_folder_rating_cache = None;
+        }
     }
 
     /// 毎フレーム呼ぶ: フィルタ ON かつ現フォルダ未スキャンなら worker 起動、
@@ -31317,6 +31499,8 @@ impl eframe::App for App {
         //                     > address_nav > open_folder_nav > context_nav > grid_nav
         // folder_nav は fav/toolbar/keyboard/gamepad より後、address 以下より先。
         let input_nav = keyboard_nav.or(gamepad_nav);
+        // フォルダツリーペインの worker scan 完了を回収 (完了したら load_folder_with_scan)。
+        self.poll_folder_pane_open(ctx);
         let folder_nav_result = self.poll_folder_nav();
         let folder_nav_wins = folder_nav_result.is_some()
             && fav_nav.is_none()
@@ -31372,7 +31556,12 @@ impl eframe::App for App {
                 self.apply_jump_from_search_to(&path);
                 Some(path)
             } else if let Some(p) = folder_pane_nav {
-                Some(p)
+                // フォルダツリーペインのクリック/Enter ナビは worker で scan_directory を
+                // 済ませてから開く (UI スレッドの read_dir が大/遅/ネットワークフォルダで
+                // 固まるのを防ぐ)。同期 load はせず、`poll_folder_pane_open` が完了時に
+                // `load_folder_with_scan(path, Some(scan))` する。対象は実ディレクトリ前提。
+                self.start_folder_pane_open(p);
+                None
             } else {
                 grid_nav
             };

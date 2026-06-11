@@ -177,7 +177,7 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
         if !ai_text.is_empty() {
             out.png_prompt = normalize_for_match(&ai_text);
         }
-        if ai_origin == Some(crate::png_metadata::MetadataOrigin::ExifUserComment) {
+        if ai_origin.is_some_and(|o| o.suppresses_exif_user_comment()) {
             ai_from_exif_user_comment = true;
         }
         // 2c. XMP dc:subject タグ。動画は本体ではなくサイドカーが authoritative なので
@@ -367,7 +367,7 @@ pub fn build_per_source_from_bytes(display_name: &str, bytes: &[u8]) -> PerSourc
         append_exif(
             &mut buf,
             &exif,
-            ai_origin == Some(crate::png_metadata::MetadataOrigin::ExifUserComment),
+            ai_origin.is_some_and(|o| o.suppresses_exif_user_comment()),
         );
         if !buf.trim().is_empty() {
             out.exif = normalize_for_match(&buf);

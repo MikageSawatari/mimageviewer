@@ -33,7 +33,26 @@ pub enum AiToolKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MetadataOrigin {
     PngText,
+    /// 認識した AI メタデータが EXIF UserComment 由来。Negative を除外した検索文字列を
+    /// 別途 index するので、生 UserComment タグは EXIF 索引から外す。
     ExifUserComment,
+    /// EXIF UserComment が未知の JSON object だった。Positive/Negative を分離できず
+    /// AI prompt として index しないが、生 JSON (negative 含む) を EXIF 索引へ流すと
+    /// negative がリークするため、UserComment タグを索引から外す
+    /// (PNG 側の `suppress_unknown_raw` と同じ方針)。
+    ExifUserCommentSuppressed,
+}
+
+impl MetadataOrigin {
+    /// この origin のとき、生 EXIF UserComment タグを検索索引から除外すべきか。
+    /// AI 認識済み (Negative 除外テキストを別途 index) と未知 JSON (negative リーク防止)
+    /// の両方で true。
+    pub fn suppresses_exif_user_comment(self) -> bool {
+        matches!(
+            self,
+            Self::ExifUserComment | Self::ExifUserCommentSuppressed
+        )
+    }
 }
 
 /// A1111 / Forge / Midjourney 形式、および他ツールを正規化したメタデータ
@@ -897,6 +916,41 @@ fn extract_exif_user_comment_metadata_from_entries(
     parse_user_comment_metadata(&raw).map(AiMetadata::A1111)
 }
 
+/// EXIF UserComment を **検索向け** に分類して (検索テキスト, origin) を返す。
+/// 表示用 (`extract_exif_user_comment_metadata_*`) と違い、未知 JSON を
+/// `ExifUserCommentSuppressed` として返し、生 UserComment を索引から外させる。
+/// - `Ai`         → Negative 除外テキスト + `ExifUserComment`
+/// - `UnknownJson`→ 空テキスト + `ExifUserCommentSuppressed` (negative リーク防止)
+/// - `Plain`      → `None` (AI ではないので通常 EXIF コメントとして索引させる)
+fn exif_user_comment_searchable_from_entries(
+    entries: &[rexif::ExifEntry],
+) -> Option<(String, MetadataOrigin)> {
+    let raw = entries
+        .iter()
+        .find(|entry| matches!(entry.tag, rexif::ExifTag::UserComment))
+        .and_then(decode_user_comment_entry)?;
+    match classify_user_comment(&raw) {
+        UserCommentClass::Ai(meta) => Some((
+            build_searchable_text(&AiMetadata::A1111(meta)),
+            MetadataOrigin::ExifUserComment,
+        )),
+        UserCommentClass::UnknownJson => {
+            Some((String::new(), MetadataOrigin::ExifUserCommentSuppressed))
+        }
+        UserCommentClass::Plain => None,
+    }
+}
+
+fn exif_user_comment_searchable_from_bytes(bytes: &[u8]) -> Option<(String, MetadataOrigin)> {
+    let exif = rexif::parse_buffer(bytes).ok()?;
+    exif_user_comment_searchable_from_entries(&exif.entries)
+}
+
+fn exif_user_comment_searchable_from_path(path: &Path) -> Option<(String, MetadataOrigin)> {
+    let exif = rexif::parse_file(path.to_str()?).ok()?;
+    exif_user_comment_searchable_from_entries(&exif.entries)
+}
+
 fn decode_user_comment_entry(entry: &rexif::ExifEntry) -> Option<String> {
     match &entry.value {
         rexif::TagValue::Undefined(bytes, le) => decode_user_comment_bytes(bytes, *le),
@@ -943,26 +997,60 @@ fn clean_user_comment_text(s: &str) -> String {
     s.trim_matches('\0').trim().to_string()
 }
 
-fn parse_user_comment_metadata(raw: &str) -> Option<A1111Metadata> {
+/// EXIF UserComment を A1111 形式とみなしてよいシグネチャがあるか。
+///
+/// `parse_a1111_as` は空でない任意のテキストに `Some` を返すため、これで前置判定しないと
+/// **普通の写真キャプション** (例: 「旅行の写真」) まで AI メタデータと誤分類し、
+/// メタデータパネルに偽の AI ツールバッジが出て、検索索引でも EXIF コメントとして
+/// 扱われなくなる。A1111 / Forge の JPEG は必ず Negative prompt 行か Steps パラメータ行を
+/// 持つので、それを必須にする。
+fn looks_like_a1111(raw: &str) -> bool {
+    raw.contains("\nNegative prompt:") || find_params_line(raw).is_some()
+}
+
+/// EXIF UserComment の検索/表示向け分類。
+enum UserCommentClass {
+    /// 認識した AI メタデータ。
+    Ai(A1111Metadata),
+    /// 未知の JSON object。Positive/Negative を分離できないので AI として index/display
+    /// しないが、生 JSON を EXIF 索引へ流すと negative がリークするので suppress する。
+    UnknownJson,
+    /// AI ではない通常テキストコメント。EXIF として通常 index する。
+    Plain,
+}
+
+fn classify_user_comment(raw: &str) -> UserCommentClass {
     if let Some(json) = parse_json_object(raw) {
         if let Some(meta) = parse_swarmui_json(raw, &json) {
-            return Some(meta);
+            return UserCommentClass::Ai(meta);
         }
         if let Some(meta) = parse_ruinedfooocus_json(raw, &json) {
-            return Some(meta);
+            return UserCommentClass::Ai(meta);
         }
         if let Some(meta) = parse_fooocus_json(raw, &json, &[]) {
-            return Some(meta);
+            return UserCommentClass::Ai(meta);
         }
         if let Some(meta) = parse_invokeai_json(raw, &json) {
-            return Some(meta);
+            return UserCommentClass::Ai(meta);
         }
         if let Some(meta) = parse_invokeai_legacy_json(raw, &json) {
-            return Some(meta);
+            return UserCommentClass::Ai(meta);
         }
-        return None;
+        return UserCommentClass::UnknownJson;
     }
-    parse_a1111_as(raw, AiToolKind::JpegExif)
+    if looks_like_a1111(raw)
+        && let Some(meta) = parse_a1111_as(raw, AiToolKind::JpegExif)
+    {
+        return UserCommentClass::Ai(meta);
+    }
+    UserCommentClass::Plain
+}
+
+fn parse_user_comment_metadata(raw: &str) -> Option<A1111Metadata> {
+    match classify_user_comment(raw) {
+        UserCommentClass::Ai(meta) => Some(meta),
+        UserCommentClass::UnknownJson | UserCommentClass::Plain => None,
+    }
 }
 
 fn first_json_text(json: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
@@ -1269,13 +1357,10 @@ pub fn build_searchable_from_path_with_origin(path: &Path) -> (String, Option<Me
             }
         }
         "jpg" | "jpeg" | "jfif" => {
-            let Some(meta) = extract_exif_user_comment_metadata_from_path(path) else {
+            let Some((text, origin)) = exif_user_comment_searchable_from_path(path) else {
                 return (String::new(), None);
             };
-            (
-                build_searchable_text(&meta),
-                Some(MetadataOrigin::ExifUserComment),
-            )
+            (text, Some(origin))
         }
         _ => (String::new(), None),
     }
@@ -1297,10 +1382,10 @@ pub fn build_searchable_from_bytes_with_origin(bytes: &[u8]) -> (String, Option<
             Some(MetadataOrigin::PngText),
         );
     }
-    let Some((meta, origin)) = extract_metadata_from_bytes_with_origin(bytes) else {
+    let Some((text, origin)) = exif_user_comment_searchable_from_bytes(bytes) else {
         return (String::new(), None);
     };
-    (build_searchable_text(&meta), Some(origin))
+    (text, Some(origin))
 }
 
 // ---------------------------------------------------------------------------
@@ -2119,6 +2204,46 @@ mod tests {
             !text.contains("json-usercomment-negative-leak"),
             "text={text}"
         );
+    }
+
+    #[test]
+    fn user_comment_plain_text_is_not_ai_metadata() {
+        // 普通の写真キャプション (A1111 シグネチャ無し) は AI メタとして拾わない。
+        // これがないとパネルに偽の AI バッジが出て、検索でも EXIF コメント扱いされない。
+        assert!(parse_user_comment_metadata("旅行の写真 2026 夏").is_none());
+        assert!(parse_user_comment_metadata("Shot on my camera at the beach").is_none());
+        assert!(matches!(
+            classify_user_comment("just a normal note"),
+            UserCommentClass::Plain
+        ));
+    }
+
+    #[test]
+    fn user_comment_a1111_signature_is_still_ai_metadata() {
+        // Negative prompt 行があれば AI。
+        let meta = parse_user_comment_metadata("pos\nNegative prompt: neg\nSteps: 20").unwrap();
+        assert_eq!(meta.tool, AiToolKind::JpegExif);
+        // Steps パラメータ行だけでも AI。
+        assert!(parse_user_comment_metadata("a cat\nSteps: 20, Seed: 1").is_some());
+    }
+
+    #[test]
+    fn user_comment_unknown_json_is_suppressed() {
+        // 認識できない JSON は AI として index しない (positive/negative を分離できず、
+        // 生 JSON を索引へ流すと negative がリークするため suppress する)。
+        let raw = r#"{"some_tool":{"prompt":"p","secret_negative":"should-not-leak"}}"#;
+        assert!(parse_user_comment_metadata(raw).is_none());
+        assert!(matches!(
+            classify_user_comment(raw),
+            UserCommentClass::UnknownJson
+        ));
+    }
+
+    #[test]
+    fn suppressed_origin_skips_raw_user_comment() {
+        assert!(MetadataOrigin::ExifUserComment.suppresses_exif_user_comment());
+        assert!(MetadataOrigin::ExifUserCommentSuppressed.suppresses_exif_user_comment());
+        assert!(!MetadataOrigin::PngText.suppresses_exif_user_comment());
     }
 
     #[test]

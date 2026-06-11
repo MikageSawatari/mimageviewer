@@ -457,26 +457,32 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
-        // キーボード key_6 と同条件: 連続読み対応アイテム (画像/ZIP画像/PDFページ) のときだけ
-        // 連結方式を切り替える。動画/非対応アイテム上で切り替えると、見えない flow が
-        // フォルダに永続化され、ナビや各モードキーが壊れる。supported 判定が動画も除外する。
+        // 見開きモード (キーボードのショートカット 1〜5) を巡回トグルする。
+        // Single → Ltr → LtrCover → Rtl → RtlCover → Single … の順。
+        // 連結方式 (reading_flow) の切替は key_6 / 別操作の役割であり、Select ではない。
+        // 対応アイテム (画像/ZIP画像/PDFページ) のときだけ。動画/非対応アイテム上で
+        // 切り替えると、見えないモードがフォルダに永続化されてナビや各モードキーが壊れる。
         if !self.vertical_reading_supported_idx(fs_idx) {
             return;
         }
-        let next = self.reading_flow.next();
-        self.set_reading_flow_for_fullscreen(ctx, fs_idx, next);
+        let next = self.spread_mode.next_in_spread_cycle();
+        self.apply_fullscreen_spread_mode(ctx, fs_idx, next);
         self.show_feedback_toast(format!("[Pad:{}]", next.label()));
     }
 
     fn handle_gamepad_y_tap(&mut self, ctx: &egui::Context) {
         let Some(fs_idx) = self.fullscreen_idx else {
-            if self.folder_pane_disabled() {
+            // 非フルスクリーン: Y でツリーをトグル。閉じる時はカーソルが別フォルダへ
+            // 動いていれば Enter 相当でそこへ移動して閉じる
+            // (`toggle_folder_tree_pane_from_key`)。
+            if self.folder_pane_disabled() && !self.settings.folder_tree_pane_visible {
+                // 非表示→表示しようとした: スナップショット中は移動不可なので拒否。
                 self.show_feedback_toast(
                     "スナップショット中は他のフォルダに移動できません".to_string(),
                 );
                 return;
             }
-            self.set_folder_tree_pane_visible(true);
+            self.toggle_folder_tree_pane_from_key();
             return;
         };
         if self.current_fullscreen_is_video(fs_idx) {
@@ -759,7 +765,9 @@ impl App {
                 self.settings.folder_tree_pane_visible = false;
                 self.folder_pane.set_focus_grid();
                 self.settings.save();
-                return Some(AddressBarNav::Direct(path));
+                // worker scan 経由で開く (UI スレッドの read_dir ブロック回避)。
+                self.start_folder_pane_open(path);
+                return None;
             }
             return None;
         }
@@ -806,6 +814,8 @@ impl App {
             }
             // ネスト ZIP ツリーの子コンテナへ降りる (Phase 3)。
             Some(GridItem::ZipDir { dir_prefix, .. }) => {
+                // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ (Codex P2)。
+                self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
                 self.zip_nav_enter(&dir_prefix);
                 None
             }

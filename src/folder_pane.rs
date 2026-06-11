@@ -152,6 +152,22 @@ impl FolderPaneState {
         self.has_focus = false;
     }
 
+    /// トグルキー (キーボード T / ゲームパッド Y) でペインを閉じる時に、カーソルが
+    /// 現在のアクティブフォルダと **別のフォルダ** を指していれば、その移動先パスを返す
+    /// (= Enter 相当でそこへ移動して閉じる)。カーソルが動いていなければ `None`
+    /// (= 単に閉じる)。
+    pub(crate) fn cursor_nav_target_if_moved(&self) -> Option<PathBuf> {
+        let cursor = self.cursor_path.as_ref()?;
+        if self
+            .active_path
+            .as_deref()
+            .is_some_and(|active| crate::folder_tree::path_eq(active, cursor))
+        {
+            return None;
+        }
+        Some(cursor.clone())
+    }
+
     pub(crate) fn refresh_drives(&mut self) {
         let drives = crate::known_folders::available_drives();
         if drives == self.drives {
@@ -206,9 +222,16 @@ impl FolderPaneState {
 
     pub(crate) fn sync_to_active(&mut self, active: Option<&Path>, sort_order: SortOrder) {
         self.refresh_drives();
-        if self.last_sort_order != sort_order {
+        let sort_changed = self.last_sort_order != sort_order;
+        if sort_changed {
+            // ソート順変更でツリーを作り直す。展開状態 (user_expanded / auto_expanded) も
+            // クリアして「nodes は消えたが展開キーだけ残る」orphan (= 展開表示なのに子を
+            // ロードできない行) を防ぐ。現在のフォルダまでの祖先チェーンは下で
+            // auto_expanded に再構築されるので、現在地までの展開は維持される。
             self.cancel_pending();
             self.nodes.clear();
+            self.user_expanded.clear();
+            self.auto_expanded.clear();
             self.user_collapsed.clear();
             self.last_sort_order = sort_order;
         }
@@ -249,6 +272,15 @@ impl FolderPaneState {
             }
         } else if let Some(drive) = self.selected_drive.clone() {
             self.ensure_node(drive);
+        }
+
+        // ソート順変更直後は、作り直したツリーで現在のフォルダまでスクロールし直す
+        // (= ESC でグリッド→ツリーへ抜けたときの `set_focus_tree_at_active` と同じ
+        //  「現在地へ追従」挙動)。フォーカスは奪わない (グリッド操作中のソート変更で
+        //  ツリーに focus が飛ばないように、scroll だけ要求する)。
+        if sort_changed && let Some(active) = self.active_path.clone() {
+            self.cursor_path = Some(active);
+            self.scroll_to_cursor = true;
         }
 
         self.ensure_scans_for_expanded(sort_order);
@@ -583,11 +615,15 @@ pub(crate) fn active_filesystem_folder(path: &Path) -> Option<PathBuf> {
     if path.as_os_str().is_empty() {
         return None;
     }
-    if path.is_dir() {
-        return Some(path.to_path_buf());
-    }
-    if path.is_file()
-        || crate::folder_tree::is_virtual_folder(path)
+    // 字句判定のみ (filesystem syscall なし)。`sync_to_active` はペイン表示中 **毎フレーム**
+    // これを呼ぶので、ここで `Path::is_dir()` / `is_file()` を叩くと切断ネットワークドライブ等で
+    // 毎フレーム GetFileAttributes が SMB タイムアウトし UI が固まる
+    // (docs/ui-responsiveness.md §4 の禁止事項)。
+    //
+    // 入力は `App::effective_folder()`、すなわち実ディレクトリ (current_folder) か
+    // ZIP/PDF/変換アーカイブを仮想フォルダ source として開いたファイルパスのいずれか。
+    // 後者は拡張子で判定して親ディレクトリを返し、それ以外はディレクトリとして扱う。
+    if crate::folder_tree::is_virtual_folder(path)
         || crate::folder_tree::is_convertible_archive_path(path)
     {
         return path.parent().map(Path::to_path_buf);
@@ -708,6 +744,42 @@ mod tests {
                 .user_expanded
                 .contains(&key_for(Path::new(r"C:\manual")))
         );
+    }
+
+    #[test]
+    fn cursor_nav_target_only_when_cursor_moved_off_active() {
+        let mut state = FolderPaneState::default();
+        state.sync_to_active(Some(Path::new(r"C:\a\b")), SortOrder::FileName);
+        // 開いた直後はカーソル = アクティブなので移動先なし (= 単に閉じる)。
+        assert_eq!(state.cursor_nav_target_if_moved(), None);
+        // カーソルを別フォルダへ動かすと、その移動先を返す (= Enter 相当で移動)。
+        state.cursor_path = Some(p(r"C:\a\c"));
+        assert_eq!(state.cursor_nav_target_if_moved(), Some(p(r"C:\a\c")));
+    }
+
+    #[test]
+    fn sort_change_resets_expansion_and_scrolls_to_active() {
+        let mut state = FolderPaneState::default();
+        state.sync_to_active(Some(Path::new(r"C:\a\b")), SortOrder::FileName);
+        // ユーザーが現在地と無関係な枝を手動展開している状態を作る。
+        state.user_expanded.insert(key_for(Path::new(r"C:\manual")));
+        state.ensure_node(p(r"C:\manual"));
+        state.scroll_to_cursor = false;
+
+        // ソート順を変更すると作り直しが走る (active は同じ C:\a\b)。
+        state.sync_to_active(Some(Path::new(r"C:\a\b")), SortOrder::DateDesc);
+
+        // 手動展開は捨てられ orphan 行を残さない。
+        assert!(
+            !state
+                .user_expanded
+                .contains(&key_for(Path::new(r"C:\manual")))
+        );
+        // 現在地までの祖先チェーンは再構築される。
+        assert!(state.auto_expanded.contains(&key_for(Path::new(r"C:\a"))));
+        // そして現在のフォルダへスクロールし直す (= 現在地を見失わない)。
+        assert!(state.scroll_to_cursor);
+        assert_eq!(state.cursor_path.as_deref(), Some(Path::new(r"C:\a\b")));
     }
 
     #[test]
