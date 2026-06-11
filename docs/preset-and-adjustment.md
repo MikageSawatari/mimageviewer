@@ -52,10 +52,15 @@ ZIP/PDF を開いている最中は `container(idx)` が ZIP/PDF 本体のパス
 ★固定 (snapshot) の activate / deactivate / list 復帰のように `load_folder` を通さずに
 `items` を差し替える経路では、`App::rehydrate_page_edit_state_for_current_items(prefix)`
 が同じ clear + DB ロードを行って idx-keyed 状態 (この `adjustment_page_params` に加え
-`local_adjust_page_layers` / `local_adjust_pages` / `local_adjust_selected_layers` /
+`local_adjust_pages` (バッジ用 key 集合) / `local_adjust_page_layers` (遅延ロード済み JSON cache) /
+`local_adjust_selected_layers` /
 `export_crop_page_settings` / `export_crop_pages` / `mask_pages` / `conceal_pages`) を新しい
 idx へ hydrate し直す。これをやらないと差し替え前 idx の補正・マスクが別ページに乗る
-(Codex P1 2026-06-05)。**`load_folder` 側の hydration を変えたら同関数も揃えること**。
+(Codex P1 2026-06-05)。補正レイヤーはフォルダロード / rehydrate 時点では
+`local_adjust.db` の `page_path` exact lookup (`IN`) で `local_adjust_pages` だけを復元し、
+巨大な `layers_json` はフルスクリーン表示 / 補正レイヤーパネルに入ったタイミングで
+`LocalAdjustDb::get_layers` から 1 ページ分だけ遅延ロードする。
+**`load_folder` 側の hydration を変えたら同関数も揃えること**。
 ただし **cross-folder 検索 (Ctrl+S/Ctrl+G) 由来 snapshot は `App::clear_page_edit_state()`
 で clear のみ** (= subset が cross-folder で単一 prefix hydrate できず、検索 view は元々
 ページ編集 overlay を出さない)。Ctrl+F (単一フォルダ構造フィルタ) は検索ではないので
@@ -513,6 +518,9 @@ edit 系 (erase / local_adjust / conceal) や crop は反映しない。post_fil
 入力は `erase_result_cache > fs_cache` の順で解決し、
 結果を `local_adjust_cache` に格納する。消しゴムマスクが存在するが現在世代の
 `erase_result_cache` がまだ無い場合は、古い補正レイヤー結果を表示せず、消しゴム結果の生成を待つ。
+フォルダロード / グリッド表示では `local_adjust_pages` の存在判定だけを使い、
+`layers_json` の実体は `ensure_local_adjust_layers_loaded(idx)` でフルスクリーン表示、
+補正レイヤーパネル、エクスポート準備など実際に必要になったページだけ読む。
 
 生成中または stale の間は、下位レイヤの画像をそのまま表示する。これにより補正レイヤーの古い結果が
 一瞬残ることを避け、非同期完了後に最新の `local_adjust_cache` へ差し替える。サムネイルには

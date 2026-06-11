@@ -4337,12 +4337,14 @@ pub struct App {
     pub(crate) adjustment_favorite_params:
         std::collections::HashMap<uuid::Uuid, crate::adjustment::AdjustParams>,
     /// ページ個別の補正レイヤー: item_idx → LocalAdjustmentLayer 配列。
-    /// フォルダロード時に `local_adjust_db` から復元し、表示合成は後段の
+    /// フォルダロード時は `local_adjust_pages` だけを復元し、JSON 本体は
+    /// フルスクリーン表示 / 補正レイヤーパネルで遅延ロードする。表示合成は後段の
     /// `local_adjust_cache` / worker が担当する。
     pub(crate) local_adjust_page_layers:
         std::collections::HashMap<usize, Vec<local_adjust_core::LocalAdjustmentLayer>>,
     /// 現フォルダで補正レイヤーを持つページの item_idx 集合 (サムネイルバッジ用)。
-    /// サムネイルには補正レイヤー結果自体を反映しない。
+    /// `local_adjust.db` の `page_path` exact lookup だけで復元し、サムネイルには
+    /// 補正レイヤー結果自体を反映しない。
     pub(crate) local_adjust_pages: std::collections::HashSet<usize>,
     /// ページ個別の最後段 crop 設定: item_idx → CropSettings。
     pub(crate) export_crop_page_settings:
@@ -11222,23 +11224,11 @@ impl App {
             );
         }
 
-        // 補正レイヤー: ページ単位のレイヤー配列を DB から復元。
-        // サムネイルには結果を反映しないが、バッジ判定用に idx 集合も保持する。
+        // 補正レイヤー: グリッドではバッジ判定だけに使うため、巨大な JSON 本体は
+        // 読まず、現在 items の page key に対応する行の存在だけを復元する。
+        // レイヤー配列はフルスクリーン表示 / 補正レイヤーパネルで遅延ロードする。
         let local_adjust_t0 = std::time::Instant::now();
-        if let Some(db) = &self.local_adjust_db {
-            let prefix = crate::adjustment_db::normalize_path(&source_path);
-            let page_map = db.load_layers_by_prefix(&prefix);
-            if !page_map.is_empty() {
-                for idx in 0..self.items.len() {
-                    if let Some(key) = self.page_path_key(idx) {
-                        if let Some(layers) = page_map.get(&key) {
-                            self.local_adjust_page_layers.insert(idx, layers.clone());
-                            self.local_adjust_pages.insert(idx);
-                        }
-                    }
-                }
-            }
-        }
+        self.hydrate_local_adjust_layer_keys_for_current_items();
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -12799,8 +12789,10 @@ impl App {
     ///
     /// `load_folder` (= `start_loading_items`) の hydration ブロック (perf イベント
     /// `sli_adjustment_db` / `sli_local_adjust_db` / `sli_export_crop_db` / mask / conceal)
-    /// と同じ prefix 計算・DB メソッド・対象マップを使う。**あちらを変えたらこちらも揃える
-    /// こと** (= 同期漏れ防止。snapshot 経路だけ古い hydration を引きずると Codex P1 が再発する)。
+    /// と同じ対象マップを使う。補正レイヤーは `local_adjust_pages` のキー存在だけを
+    /// hydrate し、巨大な JSON 本体はフルスクリーン表示側で遅延ロードする。**あちらを
+    /// 変えたらこちらも揃えること** (= 同期漏れ防止。snapshot 経路だけ古い hydration を
+    /// 引きずると Codex P1 が再発する)。
     ///
     /// 用途: ★固定 (snapshot) の activate / deactivate / list 復帰のように、`load_folder` を
     /// 通さずに `items` を差し替える経路。これらで呼ばないと、差し替え前 idx に紐付いた補正・
@@ -12837,6 +12829,65 @@ impl App {
         }
     }
 
+    fn hydrate_local_adjust_layer_keys_for_current_items(&mut self) {
+        self.local_adjust_page_layers.clear();
+        self.local_adjust_pages.clear();
+        self.local_adjust_selected_layers.clear();
+
+        let key_by_idx = (0..self.items.len())
+            .filter_map(|idx| self.page_path_key(idx).map(|key| (idx, key)))
+            .collect::<Vec<_>>();
+        if key_by_idx.is_empty() {
+            return;
+        }
+
+        let Some(db) = &self.local_adjust_db else {
+            return;
+        };
+        let keys = key_by_idx
+            .iter()
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        let existing = db.load_existing_layer_keys(&keys);
+        if existing.is_empty() {
+            return;
+        }
+
+        for (idx, key) in key_by_idx {
+            if existing.contains(&key) {
+                self.local_adjust_pages.insert(idx);
+            }
+        }
+    }
+
+    pub(crate) fn ensure_local_adjust_layers_loaded(&mut self, idx: usize) -> bool {
+        if self.local_adjust_page_layers.contains_key(&idx) {
+            return true;
+        }
+        if !self.local_adjust_pages.contains(&idx) {
+            return false;
+        }
+
+        let Some(key) = self.page_path_key(idx) else {
+            self.local_adjust_pages.remove(&idx);
+            self.local_adjust_selected_layers.remove(&idx);
+            return false;
+        };
+        let Some(layers) = self
+            .local_adjust_db
+            .as_ref()
+            .and_then(|db| db.get_layers(&key))
+        else {
+            self.local_adjust_pages.remove(&idx);
+            self.local_adjust_selected_layers.remove(&idx);
+            return false;
+        };
+
+        let loaded = !layers.is_empty();
+        self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
+        loaded
+    }
+
     pub(crate) fn rehydrate_page_edit_state_for_current_items(
         &mut self,
         prefix_path: &std::path::Path,
@@ -12857,19 +12908,7 @@ impl App {
                 }
             }
         }
-        if let Some(db) = &self.local_adjust_db {
-            let page_map = db.load_layers_by_prefix(&prefix);
-            if !page_map.is_empty() {
-                for idx in 0..self.items.len() {
-                    if let Some(key) = self.page_path_key(idx) {
-                        if let Some(layers) = page_map.get(&key) {
-                            self.local_adjust_page_layers.insert(idx, layers.clone());
-                            self.local_adjust_pages.insert(idx);
-                        }
-                    }
-                }
-            }
-        }
+        self.hydrate_local_adjust_layer_keys_for_current_items();
         if let Some(db) = &self.export_crop_db {
             let page_map = db.load_by_prefix(&prefix);
             if !page_map.is_empty() {
@@ -23563,6 +23602,9 @@ impl App {
     }
 
     pub(crate) fn maybe_start_local_adjust_render(&mut self, idx: usize) {
+        if !self.ensure_local_adjust_layers_loaded(idx) {
+            return;
+        }
         self.ensure_local_adjust_masks_match_source_dims(idx);
         if self.current_local_adjust_texture(idx).is_some() {
             return;
@@ -23606,6 +23648,9 @@ impl App {
         idx: usize,
         layer_idx: usize,
     ) {
+        if !self.ensure_local_adjust_layers_loaded(idx) {
+            return;
+        }
         self.ensure_local_adjust_masks_match_source_dims(idx);
         if self
             .current_local_adjust_layer_bypass_texture(idx, layer_idx)
@@ -23656,6 +23701,9 @@ impl App {
         idx: usize,
         layer_count: usize,
     ) {
+        if !self.ensure_local_adjust_layers_loaded(idx) {
+            return;
+        }
         self.ensure_local_adjust_masks_match_source_dims(idx);
         if self
             .current_local_adjust_prefix_preview_texture(idx, layer_count)
@@ -24105,6 +24153,11 @@ impl App {
         if self.has_active_local_adjust_layers(idx) {
             return None;
         }
+        if self.local_adjust_pages.contains(&idx)
+            && !self.local_adjust_page_layers.contains_key(&idx)
+        {
+            return None;
+        }
         if let Some(pixels) = self.current_erase_result_pixels(idx) {
             return Some((pixels, "erase_result"));
         }
@@ -24147,6 +24200,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        self.ensure_local_adjust_layers_loaded(idx);
         // 消しゴム編集中: 隠蔽はパイプライン下流なので、編集中は焼き込まない
         // (= ユーザーは消しゴムマスクを見たいので、その上に紫モザイクが乗ると
         // 視認性が落ちる)。プレビュー中もエラーザーが選んだ「inpaint 結果のみ」を
@@ -24392,7 +24446,7 @@ impl App {
             self.current_raw_source_pixels(idx)?
         };
 
-        if self.has_active_local_adjust_layers(idx) {
+        if self.ensure_local_adjust_layers_loaded(idx) && self.has_active_local_adjust_layers(idx) {
             self.maybe_start_local_adjust_render(idx);
             pixels = self.current_local_adjust_pixels(idx)?;
         }

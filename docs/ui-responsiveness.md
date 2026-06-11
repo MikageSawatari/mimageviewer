@@ -330,6 +330,20 @@ v0.8.1 で Codex レビューが指摘したが、通常運用での体感影響
 どちらも Codex P3 (confidence 0.76-0.78)。§4 チェックリスト違反なので新しい同期 I/O を
 足すときの悪例として参照してよい。
 
+### フォルダオープン時の巨大 local_adjust JSON 読み (2026-06 解決済み)
+
+`h:\home\mimageviewer_old\testimage` の cold open 調査で、`sli_local_adjust_db` が
+約 2.5 秒を占めるケースを確認した。原因は `local_adjust.db` の `layers_json` が
+1 ページ数十 MB まで肥大化している状態で、グリッドの `局` バッジ表示のためだけに
+`load_layers_by_prefix` が JSON 本体まで一括取得・deserialize していたこと。
+
+対策として、`load_folder` / `rehydrate_page_edit_state_for_current_items` は
+現在 `items` の page key に対して `page_path IN (...)` の exact lookup だけを行い、
+`local_adjust_pages` を復元する。`page_path` は PRIMARY KEY なので追加 index は不要。
+実際の `layers_json` は `ensure_local_adjust_layers_loaded(idx)` で、フルスクリーン表示、
+補正レイヤーパネル、エクスポート準備など該当ページの実体が必要になった時点で
+1 ページ分だけ読む。
+
 ### 全検索 (Ctrl+G) の大量件数時スパイク
 
 上記 2 件が「UI スレッドでの同期 I/O」なのに対し、こちらは「UI スレッドでの O(N) 計算」。

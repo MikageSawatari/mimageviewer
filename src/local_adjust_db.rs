@@ -107,6 +107,49 @@ impl LocalAdjustDb {
         set
     }
 
+    /// 指定ページキーのうち、補正レイヤー行が存在するキー集合を返す。
+    ///
+    /// `page_path` は PRIMARY KEY なので、`IN` の exact lookup は既存 index だけで足りる。
+    /// グリッド表示のバッジ判定では巨大な `layers_json` を読まず、このキー集合だけを使う。
+    pub fn load_existing_layer_keys(&self, page_keys: &[String]) -> HashSet<String> {
+        const CHUNK_SIZE: usize = 500;
+
+        let mut set = HashSet::new();
+        if page_keys.is_empty() {
+            return set;
+        }
+
+        let mut unique_keys = Vec::new();
+        let mut seen = HashSet::new();
+        for key in page_keys {
+            if seen.insert(key.as_str()) {
+                unique_keys.push(key.as_str());
+            }
+        }
+
+        for chunk in unique_keys.chunks(CHUNK_SIZE) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT page_path FROM local_adjust_pages WHERE page_path IN ({placeholders})"
+            );
+            let Ok(mut stmt) = self.conn.prepare_cached(&sql) else {
+                continue;
+            };
+            let Ok(rows) = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                    row.get::<_, String>(0)
+                })
+            else {
+                continue;
+            };
+            for row in rows.flatten() {
+                set.insert(row);
+            }
+        }
+
+        set
+    }
+
     /// 指定プレフィックスで始まるページの補正レイヤー配列を一括取得する。
     pub fn load_layers_by_prefix(
         &self,
@@ -190,6 +233,28 @@ mod tests {
 
         assert!(keys.contains("c:/imgs/100%/a.png"));
         assert!(!keys.contains("c:/imgs/100x/b.png"));
+    }
+
+    #[test]
+    fn load_existing_layer_keys_returns_exact_matches_only() {
+        let (_temp, db) = open_temp_db();
+        db.set_layers("c:/imgs/a.png", &[sample_layer("a")])
+            .unwrap();
+        db.set_layers("c:/imgs/sub/b.png", &[sample_layer("b")])
+            .unwrap();
+
+        let keys = vec![
+            "c:/imgs/a.png".to_string(),
+            "c:/imgs/a.png".to_string(),
+            "c:/imgs/missing.png".to_string(),
+            "c:/imgs/sub".to_string(),
+        ];
+        let existing = db.load_existing_layer_keys(&keys);
+
+        assert!(existing.contains("c:/imgs/a.png"));
+        assert!(!existing.contains("c:/imgs/missing.png"));
+        assert!(!existing.contains("c:/imgs/sub"));
+        assert_eq!(existing.len(), 1);
     }
 
     #[test]

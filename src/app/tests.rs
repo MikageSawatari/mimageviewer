@@ -7752,6 +7752,52 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// フォルダ / snapshot rehydrate ではグリッドの `局` バッジ用 key 集合だけを復元し、
+    /// 巨大な `layers_json` 本体はフルスクリーン表示側で遅延ロードする。
+    #[test]
+    fn rehydrate_local_adjust_loads_badge_keys_without_layer_json() {
+        let mut app = setup_app();
+        let a = push_image(&mut app, "C:/pics/a.jpg");
+        let b = push_image(&mut app, "C:/pics/b.jpg");
+        assert_eq!((a, b), (0, 1));
+
+        let layers = vec![local_adjust_core::LocalAdjustmentLayer::new(
+            "lazy",
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::None,
+        )];
+        let key = app.page_path_key(b).unwrap();
+        app.local_adjust_db
+            .as_ref()
+            .unwrap()
+            .set_layers(&key, &layers)
+            .unwrap();
+
+        app.local_adjust_page_layers.insert(
+            a,
+            vec![local_adjust_core::LocalAdjustmentLayer::new(
+                "stale",
+                local_adjust_core::LocalMask::Full,
+                local_adjust_core::LocalEffect::None,
+            )],
+        );
+        app.local_adjust_pages.insert(a);
+        app.local_adjust_selected_layers.insert(a, 0);
+
+        app.rehydrate_page_edit_state_for_current_items(&PathBuf::from("C:/pics"));
+
+        assert!(!app.local_adjust_pages.contains(&a));
+        assert!(app.local_adjust_pages.contains(&b));
+        assert!(
+            app.local_adjust_page_layers.is_empty(),
+            "rehydrate should not deserialize layers_json"
+        );
+        assert!(app.local_adjust_selected_layers.is_empty());
+
+        assert!(app.ensure_local_adjust_layers_loaded(b));
+        assert_eq!(app.local_adjust_page_layers.get(&b), Some(&layers));
+    }
+
     /// Codex P1: snapshot 有効化で items を subset へ差し替えたら、idx-keyed なページ編集
     /// 状態 (補正の個別パラメータ等) も subset idx へ hydrate し直す。これをやらないと元
     /// フォルダの別画像に紐付いた補正が subset の別 idx に乗って表示・エクスポートされる。

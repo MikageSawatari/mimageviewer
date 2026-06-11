@@ -95,6 +95,7 @@ impl App {
             crate::ui_fullscreen::SpreadPair::Single => None,
         };
         let target_idx = spread_pair.map(|(l, _)| l).unwrap_or(fs_idx);
+        self.ensure_local_adjust_layers_loaded(target_idx);
 
         // 元画像取得 (state mutation 前)。プレビュー合成と同じ優先順位
         // (erase_result > adjustment > ai_upscale > fs) で source を決める。
@@ -187,6 +188,7 @@ impl App {
         self.conceal_line_end = None;
         self.conceal_shape_drag_start = None;
         self.conceal_shape_drag_end = None;
+        self.ensure_local_adjust_layers_loaded(idx);
         if let Some((pixels, _)) = self.current_conceal_source_pixels(idx) {
             self.rescale_active_conceal_edit_to_size(idx, pixels.size, reason);
         }

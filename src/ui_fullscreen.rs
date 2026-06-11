@@ -1225,6 +1225,7 @@ impl App {
             // フルスクリーンが OS フォーカスを持つ間は modifier event が届かないため、
             // `original_preview_active` と同じく OS キー状態を見る (fs_prev_focused
             // ガードは decide 関数内に集約済み)。
+            self.ensure_local_adjust_layers_loaded(idx);
             let total_layers = self
                 .local_adjust_page_layers
                 .get(&idx)
@@ -12457,6 +12458,7 @@ impl App {
         indices: &[usize],
     ) -> Result<(), String> {
         for &idx in indices {
+            self.ensure_local_adjust_layers_loaded(idx);
             if self.has_active_local_adjust_layers(idx) {
                 self.maybe_start_local_adjust_render(idx);
                 if self.current_local_adjust_pixels(idx).is_none() {

@@ -10956,6 +10956,7 @@ impl App {
                 }
                 SpreadPair::Single => (fs_root_idx, None),
             };
+        self.ensure_local_adjust_layers_loaded(fs_idx);
         self.ensure_local_adjust_masks_match_source_dims(fs_idx);
         let layers = self
             .local_adjust_page_layers
