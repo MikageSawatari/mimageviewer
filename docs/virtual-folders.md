@@ -151,10 +151,11 @@ RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<h
    - 子コンテナ → `GridItem::ZipDir`、直下画像 → `GridItem::ZipImage` (コンテナ先・画像後)
    - image_metas に (mtime, uncompressed_size) を記録 (ZipDir は代表画像の meta)
    - `existing_keys` は `tree.all_cache_keys()` (全階層の entry_name + zipdir: キー) +
-     pinned ZipDir の `#pin` キーを含める (`delete_missing` の存続基準)。pin の DB キーは
-     **literal prefix を `collapse_redundant` した実効 prefix の合成パス** で、lookup は
-     `lookup_many` 1 回に束ねる (per-dir 逐次 lookup は UI スレッドを dirs 数比例で
-     ブロックするため)
+     pinned ZipDir の `#pin` キーを含める (`delete_missing` の存続基準)。ZipDir の
+     pinned key は、直接画像 source と `FolderPinSource::ZipDir` の cascade leaf の両方を
+     解決して追加する。pin の DB キーは **literal prefix を `collapse_redundant` した
+     実効 prefix の合成パス** で、lookup は `lookup_many` 1 回に束ねる (per-dir 逐次 lookup
+     は UI スレッドを dirs 数比例でブロックするため)
    - 階層内の移動 (enter/back/dfs_step) は `zip_nav_show_current_level` の軽量経路
      (`install_new_items`、`start_loading_items` を通さない)
    - **本ごとピン (Model B) のキー規則**: set 側は `App::pin_container_key()` =
@@ -165,7 +166,9 @@ RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<h
      付けたピンが親フォルダの `ConvertibleArchive` タイルにも反映される。
      lookup 側 (`make_load_request` の ZipDir 分岐) は cell の literal prefix キーで
      `folder_pin_map` を引くが、`refresh_folder_pin_map` が実効 prefix で DB を引いた
-     結果を literal キーへ **alias 登録**するので、単一ラッパー本でも一致する
+     結果を literal キーへ **alias 登録**するので、単一ラッパー本でも一致する。
+     ZipDir セル自体を `P` した場合は `source_kind=zipdir` に実効 prefix を保存し、
+     通常フォルダの Folder source と同じ cascade で子の pin を辿る。
    - **★固定 (snapshot) との相互作用**: snapshot は items を `start_loading_items` を
      通さず差し替えるため、`activate_snapshot` が `zip_nav` を **take して
      `SnapshotState::saved_zip_nav` へ退避**し、at_origin の解除で `saved_items` と対で
@@ -250,6 +253,7 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 | PdfFile | None | Some(0) | `pdfthumb:{filename}` | PDF ワーカーでページ 0 をレンダリング |
 | ConvertibleArchive | None または Some(entry) | None | `archivethumb:{format}:{filename-or-fullpath}` | 有効な変換キャッシュ ZIP があれば、その ZIP から先頭画像またはピン画像を読む。キャッシュ未作成/失効時は LoadRequest なしでアイコン表示 |
 | ZipImage | Some(entry) | None | なし (entry が自動キー) | ZIP からエントリバイト → decode → bytes から EXIF Orientation 適用 |
+| ZipDir | Some(representative) または None (`ZipDirRepresentative`) | None | `zipdir:{dir_prefix}` | 通常は部分木代表 entry を直接読む。ZipDir source pin は `zip_dir_prefix` を worker に渡し、同じ sort で部分木代表を選び直す |
 | PdfPage | None | Some(page) | `pdf_page_cache_key(page)` | PDF ワーカーでそのページをレンダリング |
 
 **キャッシュキーの命名規則**を勝手に変えないこと。Folder 自動代表は選定
@@ -262,7 +266,9 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 
 - **DB**: `%APPDATA%/mimageviewer/folder_thumb_pins.db` (`folder_thumb_pins.rs`)。
   schema は `(container_key, source_kind, source_rel, source_entry, source_page)`。
-  container_key は `path_key::normalize_keep_drive` で正規化。
+  container_key は `path_key::normalize_keep_drive` で正規化。`source_kind` は
+  `image` / `video` / `folder` / `zipfile` / `pdffile` / `zipentry` / `zipdir` /
+  `pdfpage` で、`zipdir` は `source_entry` に ZIP 内 prefix を保存する。
 - **解決パス**: `make_load_request` 経由で `apply_folder_thumb_pin` が pin map
   (= `App::folder_pin_map`、load 開始時に `lookup_many` で一括取得) を引き、
   pin があれば `LoadRequest` を target アイテム用の形 (path/zip_entry/pdf_page/
@@ -286,10 +292,13 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
     Shell 遅延でフォルダ移動が固まるため。これにより seed は軽い DB→DB コピーのみに
     なり UI スレッドのヒッチが消える。動画を folder pin したいユーザーは先にフルスクリーン
     で `P` キー / HUD ピンボタンでフレームを保存する。
-- **Folder source の cascade 解決** (v0.9.x+): pin source がサブフォルダ
-  (`FolderRepresentative`) の場合、`resolve_pin_target_cascaded` が `folder_thumb_pins.db`
-  を順に lookup して **Folder→Folder の pin 連鎖を最終 leaf まで辿る**。例: A が B
+- **Folder / ZipDir source の cascade 解決** (v0.9.x+ / ZipDir は v1.3.x+): pin source が
+  サブフォルダ (`FolderRepresentative`) または ZIP 内コンテナ (`ZipDirRepresentative`) の
+  場合、`resolve_pin_target_cascaded` が `folder_thumb_pins.db` を順に lookup して
+  **Folder→Folder / ZipDir→ZipDir の pin 連鎖を最終 leaf まで辿る**。例: A が B
   (Folder) を pin、B が C (Image) を pin → A の親グリッドでの A のタイルは C を表示する。
+  ZIP 内でも、外側 root + ZipDir prefix を合成した仮想 container key で lookup し、子の
+  `ZipEntry` / `ZipDir` pin を通常フォルダと同じ規則で辿る。
   cascade の段数上限は `Settings.folder_thumb_depth` (規定 3、範囲 0〜10) に揃える
   (= `resolve_folder_thumb_image` のサブフォルダ探索深度と同じ仕様)。
   - サイクル検出: `visited` HashSet で normalize_keep_drive 済みパスを記録。A↔B 循環は

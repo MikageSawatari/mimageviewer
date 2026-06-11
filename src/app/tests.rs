@@ -5408,6 +5408,138 @@ mod favorite_adjustment_defaults_tests {
         assert!(state.matches_current_pin);
     }
 
+    #[test]
+    fn toggle_pin_on_zipdir_sets_zipdir_source() {
+        use crate::folder_thumb_pins::FolderPinSource;
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav_for(
+            zip_path.clone(),
+            &["bookA/p1.jpg", "bookB/only/p1.jpg"],
+        ));
+        app.zip_nav_show_current_level();
+
+        let idx = app
+            .items
+            .iter()
+            .position(
+                |it| matches!(it, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "bookB/"),
+            )
+            .expect("root should contain bookB ZipDir");
+        app.toggle_folder_pin_for_idx(idx);
+
+        assert_eq!(
+            app.folder_thumb_pin_for(&zip_path),
+            Some(&FolderPinSource::ZipDir {
+                zip_rel: String::new(),
+                dir_prefix: "bookB/only/".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn zipdir_thumb_request_cascades_zipdir_pin_to_child_entry() {
+        use crate::folder_thumb_pins::FolderPinSource;
+        use crate::grid_item::GridItem;
+        use crate::thumb_loader::ResolveStrategy;
+        use std::io::Write;
+
+        let app = setup_app();
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("outer.zip");
+        std::fs::File::create(&zip_path)
+            .unwrap()
+            .write_all(b"PK\x03\x04 dummy")
+            .unwrap();
+
+        let item = GridItem::ZipDir {
+            zip_path: zip_path.clone(),
+            dir_prefix: "bookA/".to_string(),
+            is_archive: false,
+            representative: Some("bookA/auto.jpg".to_string()),
+        };
+        let book_key = zip_path.join("bookA");
+        let child_key = book_key.join("ch02");
+        let source = FolderPinSource::ZipDir {
+            zip_rel: String::new(),
+            dir_prefix: "bookA/ch02/".to_string(),
+        };
+        let child_source = FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "bookA/ch02/page01.jpg".to_string(),
+        };
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(&child_key, &child_source)
+            .unwrap();
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(crate::path_key::normalize_keep_drive(&book_key), source);
+
+        let req = make_load_request(
+            &item,
+            0,
+            10,
+            20,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            &pins,
+            &app.converted_archive_cache_paths,
+            None,
+            Some(&zip_path),
+            app.folder_thumb_pin_db.as_deref(),
+            app.video_pin_db.as_ref(),
+            false,
+        )
+        .expect("ZipDir pin should cascade to the child ZipEntry");
+
+        assert_eq!(req.path, zip_path);
+        assert_eq!(req.zip_entry.as_deref(), Some("bookA/ch02/page01.jpg"));
+        assert_eq!(req.zip_dir_prefix, None);
+        assert_eq!(req.resolve_override, None);
+        assert!(
+            req.cache_key_override
+                .as_deref()
+                .is_some_and(|key| key.contains("#pin:zipentry||bookA/ch02/page01.jpg|-|")),
+            "cache key should use cascaded leaf source id: {:?}",
+            req.cache_key_override
+        );
+
+        let unresolved = make_load_request(
+            &GridItem::ZipDir {
+                zip_path: req.path.clone(),
+                dir_prefix: "bookA/".to_string(),
+                is_archive: false,
+                representative: Some("bookA/auto.jpg".to_string()),
+            },
+            0,
+            10,
+            20,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            0,
+            &pins,
+            &app.converted_archive_cache_paths,
+            None,
+            Some(&req.path),
+            None,
+            app.video_pin_db.as_ref(),
+            false,
+        )
+        .expect("without cascade DB, ZipDir source should resolve as prefix representative");
+        assert_eq!(
+            unresolved.resolve_override,
+            Some(ResolveStrategy::ZipDirRepresentative)
+        );
+        assert_eq!(unresolved.zip_dir_prefix.as_deref(), Some("bookA/ch02/"));
+    }
+
     /// ネスト ZIP の本 (ZipDir) はコンテナレーティング対象で、キーは zip_path +
     /// literal prefix の合成パス (実機フィードバック: RAR 本 / inner フォルダに
     /// ★が付けられなかった)。set/get がセル経由で自己整合することも確認する。

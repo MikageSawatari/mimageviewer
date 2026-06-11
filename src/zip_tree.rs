@@ -92,6 +92,21 @@ impl ZipTree {
         Some(node)
     }
 
+    /// `dir_prefix` ("a/b/", empty = root) の部分木から、表示 sort と同じ代表画像を返す。
+    pub fn representative_for_prefix_str(
+        &self,
+        dir_prefix: &str,
+        sort: SortOrder,
+    ) -> Option<&ZipImageEntry> {
+        let segs: Vec<String> = dir_prefix
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        let node = self.node_at(&segs)?;
+        representative_image(node, sort)
+    }
+
     /// 冗長ラッパー階層の自動降下 (D1)。
     ///
     /// `start` から始めて、「直下画像 0 枚・子ディレクトリちょうど 1 個」の階層を
@@ -827,6 +842,15 @@ mod tests {
         let (items, _) = t.materialize_level(&[], SortOrder::FileName);
         let (_, _, rep) = as_zipdir(&items[0]);
         assert_eq!(rep, Some("book/a.jpg"));
+    }
+
+    #[test]
+    fn representative_for_prefix_str_matches_materialize_representative() {
+        let t = tree(&["book/b.jpg", "book/a.jpg"]);
+        let rep = t
+            .representative_for_prefix_str("book/", SortOrder::FileName)
+            .expect("representative");
+        assert_eq!(rep.entry_name, "book/a.jpg");
     }
 
     #[test]

@@ -77,6 +77,8 @@ pub enum ResolveStrategy {
     FolderRepresentative,
     /// `req.path` は ZIP。`zip_loader::read_first_image_bytes` で先頭画像を取り出す
     ZipFirstImage,
+    /// `req.path` は ZIP。`LoadRequest::zip_dir_prefix` の部分木代表画像を取り出す
+    ZipDirRepresentative,
 }
 
 /// Drive-list thumbnails are cache-only: the UI thread checks the local pin DB
@@ -198,6 +200,8 @@ pub struct LoadRequest {
     /// タスク 3: `Some(name)` なら ZIP エントリとして読む。
     /// `path` が ZIP ファイル、`name` が内部エントリ名。
     pub zip_entry: Option<String>,
+    /// ZIP 内仮想ディレクトリ代表を遅延解決するときの prefix ("a/b/", root は空)。
+    pub zip_dir_prefix: Option<String>,
     /// `Some(page_num)` なら PDF ページとしてレンダリングする。
     /// `path` が PDF ファイル、`page_num` が 0-indexed ページ番号。
     pub pdf_page: Option<u32>,
@@ -989,7 +993,11 @@ pub fn process_load_request(
             .is_some_and(|k| k.starts_with(CACHE_KEY_ZIP)),
         None => false,
     };
-    let needs_heavy_io = is_folder_thumb || is_zip_thumb;
+    let is_zip_dir_thumb = matches!(
+        req.resolve_override,
+        Some(ResolveStrategy::ZipDirRepresentative)
+    );
+    let needs_heavy_io = is_folder_thumb || is_zip_thumb || is_zip_dir_thumb;
 
     // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替え。
     // pin-aware: 再帰中に見つけたサブフォルダに pin があれば cascade 解決して
@@ -1042,6 +1050,45 @@ pub fn process_load_request(
     let zip_entry_ref: Option<&str> = if req.zip_entry.is_some() {
         preloaded_zip_bytes = None;
         req.zip_entry.as_deref()
+    } else if is_zip_dir_thumb {
+        let t_zip = std::time::Instant::now();
+        let name = req.zip_dir_prefix.as_deref().and_then(|prefix| {
+            let entries = crate::zip_loader::enumerate_image_entries(&req.path).ok()?;
+            let tree = crate::zip_tree::ZipTree::build(req.path.clone(), entries);
+            tree.representative_for_prefix_str(
+                prefix,
+                req.folder_thumb_sort
+                    .unwrap_or(crate::settings::SortOrder::Numeric),
+            )
+            .map(|e| e.entry_name.clone())
+        });
+        match name {
+            Some(name) => {
+                let zip_ms = t_zip.elapsed().as_secs_f64() * 1000.0;
+                crate::logger::log(format!(
+                    "    idx={:>4} zipdir_resolve={zip_ms:>6.1}ms  {}",
+                    req.idx,
+                    req.path.display(),
+                ));
+                resolved_zip_entry = Some(name);
+                preloaded_zip_bytes = None;
+                resolved_zip_entry.as_deref()
+            }
+            None => {
+                let _ = tx.send(ThumbMsg {
+                    idx: req.idx,
+                    image: None,
+                    from_cache: false,
+                    source_dims: None,
+                    canceled: false,
+                    finalized: false,
+                    input_seq: req.input_seq,
+                    items_gen: req.items_gen,
+                });
+                gen_done.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
     } else if is_zip_thumb {
         // cache_key_override あり + pdf_page なし + フォルダでない = ZipFile サムネイル
         // ZIP を 1 回だけ開いてエントリ名 + バイト列を同時取得

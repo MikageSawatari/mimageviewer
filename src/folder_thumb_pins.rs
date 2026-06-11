@@ -12,9 +12,9 @@
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS folder_thumb_pins (
 //!     container_key TEXT PRIMARY KEY,  -- 親フォルダ / ZIP / PDF のパス、normalize_keep_drive 済み
-//!     source_kind   TEXT NOT NULL,     -- "image"/"video"/"folder"/"zipfile"/"pdffile"/"zipentry"/"pdfpage"
+//!     source_kind   TEXT NOT NULL,     -- "image"/"video"/"folder"/"zipfile"/"pdffile"/"zipentry"/"zipdir"/"pdfpage"
 //!     source_rel    TEXT NOT NULL,     -- container 相対パス (zipentry/pdfpage で container 自身を指すときは空)
-//!     source_entry  TEXT,              -- source_kind = "zipentry" のときの ZIP エントリ名
+//!     source_entry  TEXT,              -- source_kind = "zipentry" のときの ZIP エントリ名 / "zipdir" のときの prefix
 //!     source_page   INTEGER            -- source_kind = "pdfpage" のときのページ番号 (0-indexed)
 //! );
 //! ```
@@ -80,6 +80,13 @@ pub enum FolderPinSource {
     /// `zip_rel` が空文字なら container 自身が対象 ZIP (= ZIP を内側から閲覧中に
     /// ピン留めしたケース)。非空なら container 直下 / サブの ZIP ファイル。
     ZipEntry { zip_rel: String, entry: String },
+    /// ZIP 内の仮想サブコンテナ (ネスト ZIP ツリーナビの `ZipDir`)。
+    ///
+    /// `zip_rel` が空文字なら container 自身が対象 ZIP。`dir_prefix` は ZIP ルートからの
+    /// full prefix で、末尾 `/` 付き (`"bookA/"`, `"bookA/ch01.zip/"` など)。
+    /// 通常フォルダの `FileKind::Folder` と同じく、解決時にこの子コンテナ自身の pin を
+    /// cascade して leaf まで辿る。
+    ZipDir { zip_rel: String, dir_prefix: String },
     /// PDF 内のページ。
     ///
     /// `pdf_rel` が空文字なら container 自身が対象 PDF (= PDF を内側から閲覧中に
@@ -93,6 +100,7 @@ impl FolderPinSource {
         match self {
             FolderPinSource::File { kind, .. } => kind.as_db_str(),
             FolderPinSource::ZipEntry { .. } => "zipentry",
+            FolderPinSource::ZipDir { .. } => "zipdir",
             FolderPinSource::PdfPage { .. } => "pdfpage",
         }
     }
@@ -102,6 +110,7 @@ impl FolderPinSource {
         match self {
             FolderPinSource::File { rel, .. } => rel,
             FolderPinSource::ZipEntry { zip_rel, .. } => zip_rel,
+            FolderPinSource::ZipDir { zip_rel, .. } => zip_rel,
             FolderPinSource::PdfPage { pdf_rel, .. } => pdf_rel,
         }
     }
@@ -182,8 +191,9 @@ pub fn source_from_grid_item(
         // 内部で選んだ ZipImage は App 側の zip_nav 経路で ZipEntry source になる。
         GridItem::ConvertibleArchive { .. } => None,
         // ピン対象として意味がないもの。
-        // ZipDir はネスト ZIP ツリーの仮想コンテナ。本そのものを選んでピンするのではなく、
-        // 本の中に入って ZipImage を選ぶ Model B なので、この generic helper では None。
+        // ZipDir はネスト ZIP ツリーの仮想コンテナで、pin source としては有効。ただし
+        // 冗長ラッパー collapse 後の実効 prefix を保存する必要があるため、zip_nav を
+        // 知らない generic helper では作れない。App::folder_pin_selected_source 側で扱う。
         GridItem::SearchContainer { .. }
         | GridItem::ZipSeparator { .. }
         | GridItem::ZipDir { .. } => None,
@@ -218,6 +228,8 @@ pub enum FolderPinError {
     DriveLetter(String),
     /// ZIP entry 名が空。
     EmptyZipEntry,
+    /// ZIP 内ディレクトリ prefix が空。
+    EmptyZipDirPrefix,
     /// SQLite エラー。
     Sql(rusqlite::Error),
 }
@@ -235,6 +247,7 @@ impl std::fmt::Display for FolderPinError {
             }
             FolderPinError::DriveLetter(p) => write!(f, "drive letter prefix is not allowed: {p}"),
             FolderPinError::EmptyZipEntry => write!(f, "zip entry name is empty"),
+            FolderPinError::EmptyZipDirPrefix => write!(f, "zip dir prefix is empty"),
             FolderPinError::Sql(e) => write!(f, "sql error: {e}"),
         }
     }
@@ -402,9 +415,12 @@ impl FolderThumbPinDb {
         validate_source(source)?;
         let key = Self::container_key(container);
         let rel_norm = source.rel().replace('\\', "/");
-        let (entry, page): (Option<&str>, Option<i64>) = match source {
+        let (entry, page): (Option<String>, Option<i64>) = match source {
             FolderPinSource::File { .. } => (None, None),
-            FolderPinSource::ZipEntry { entry, .. } => (Some(entry.as_str()), None),
+            FolderPinSource::ZipEntry { entry, .. } => (Some(entry.clone()), None),
+            FolderPinSource::ZipDir { dir_prefix, .. } => {
+                (Some(normalize_zip_dir_prefix(dir_prefix)), None)
+            }
             FolderPinSource::PdfPage { page, .. } => (None, Some(*page as i64)),
         };
         let conn = self
@@ -419,7 +435,7 @@ impl FolderThumbPinDb {
                 source_rel   = excluded.source_rel, \
                 source_entry = excluded.source_entry, \
                 source_page  = excluded.source_page",
-            params![key, source.db_kind(), rel_norm, entry, page],
+            params![key, source.db_kind(), rel_norm, entry.as_deref(), page],
         )?;
         Ok(())
     }
@@ -450,6 +466,7 @@ pub struct ResolvedPinTarget {
     pub kind: ResolvedKind,
     pub abs_path: PathBuf,
     pub zip_entry: Option<String>,
+    pub zip_dir_prefix: Option<String>,
     pub pdf_page: Option<u32>,
     pub mtime: i64,
     pub file_size: i64,
@@ -476,6 +493,8 @@ pub enum ResolvedKind {
     PdfFirstPage,
     /// 既知 ZIP entry を直接 decode
     ZipEntry,
+    /// ZIP 内サブコンテナの代表画像を worker 側で選んで decode
+    ZipDirRepresentative,
     /// 既知 PDF page を render
     PdfPage,
 }
@@ -489,7 +508,7 @@ pub enum ResolvedKind {
 /// この関数は `std::fs::metadata` を 1 回呼ぶ (= cheap stat syscall)。
 /// UI スレッドからの呼び出しを想定。
 pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<ResolvedPinTarget> {
-    let (abs_path, zip_entry, pdf_page, kind) = match source {
+    let (abs_path, zip_entry, zip_dir_prefix, pdf_page, kind) = match source {
         FolderPinSource::File { rel, kind } => {
             let abs = container.join(rel);
             let (rk, page) = match kind {
@@ -499,15 +518,38 @@ pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<
                 FileKind::ZipFile => (ResolvedKind::ZipFirstImage, None),
                 FileKind::PdfFile => (ResolvedKind::PdfFirstPage, Some(0u32)),
             };
-            (abs, None, page, rk)
+            (abs, None, None, page, rk)
         }
         FolderPinSource::ZipEntry { zip_rel, entry } => {
             let abs_zip = if zip_rel.is_empty() {
-                container.to_path_buf()
+                zip_root_from_container_key(container).unwrap_or_else(|| container.to_path_buf())
             } else {
                 container.join(zip_rel)
             };
-            (abs_zip, Some(entry.clone()), None, ResolvedKind::ZipEntry)
+            (
+                abs_zip,
+                Some(entry.clone()),
+                None,
+                None,
+                ResolvedKind::ZipEntry,
+            )
+        }
+        FolderPinSource::ZipDir {
+            zip_rel,
+            dir_prefix,
+        } => {
+            let abs_zip = if zip_rel.is_empty() {
+                zip_root_from_container_key(container).unwrap_or_else(|| container.to_path_buf())
+            } else {
+                container.join(zip_rel)
+            };
+            (
+                abs_zip,
+                None,
+                Some(normalize_zip_dir_prefix(dir_prefix)),
+                None,
+                ResolvedKind::ZipDirRepresentative,
+            )
         }
         FolderPinSource::PdfPage { pdf_rel, page } => {
             let abs_pdf = if pdf_rel.is_empty() {
@@ -515,7 +557,7 @@ pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<
             } else {
                 container.join(pdf_rel)
             };
-            (abs_pdf, None, Some(*page), ResolvedKind::PdfPage)
+            (abs_pdf, None, None, Some(*page), ResolvedKind::PdfPage)
         }
     };
 
@@ -534,8 +576,13 @@ pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<
     //   "pdfpage|sub.pdf|-|42|1700000000|1048576"
     //   "zipentry|scans.zip|page-01.png|-|1700000000|2097152"
     // pin/unpin/target 変更で必ず変わるので、古い pin の WebP を取り違えない。
+    let normalized_dir_prefix;
     let entry_part = match source {
         FolderPinSource::ZipEntry { entry, .. } => entry.as_str(),
+        FolderPinSource::ZipDir { dir_prefix, .. } => {
+            normalized_dir_prefix = normalize_zip_dir_prefix(dir_prefix);
+            normalized_dir_prefix.as_str()
+        }
         _ => "-",
     };
     let page_part = match source {
@@ -557,6 +604,7 @@ pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<
         kind,
         abs_path,
         zip_entry,
+        zip_dir_prefix,
         pdf_page,
         mtime,
         file_size,
@@ -590,13 +638,22 @@ where
     let mut cascades_remaining = max_depth;
     loop {
         let resolved = resolve_pin_target(&current_container, &current_source)?;
-        if !matches!(resolved.kind, ResolvedKind::Folder) {
+        if !matches!(
+            resolved.kind,
+            ResolvedKind::Folder | ResolvedKind::ZipDirRepresentative
+        ) {
             return Some(resolved);
         }
         if cascades_remaining == 0 {
             return Some(resolved);
         }
-        let next_container = resolved.abs_path.clone();
+        let next_container = match resolved.kind {
+            ResolvedKind::Folder => resolved.abs_path.clone(),
+            ResolvedKind::ZipDirRepresentative => {
+                zip_dir_container_key(&resolved.abs_path, resolved.zip_dir_prefix.as_deref()?)
+            }
+            _ => unreachable!("non-container pin target returned earlier"),
+        };
         let next_key = crate::path_key::normalize_keep_drive(&next_container);
         if visited.contains(&next_key) {
             crate::logger::log(format!(
@@ -608,12 +665,24 @@ where
         let Some(next_source) = lookup(&next_container) else {
             return Some(resolved);
         };
-        // Folder container の compat 規則 (= 任意の source kind を受け入れるが
-        // ZipEntry/PdfPage の zip_rel/pdf_rel は非空) を inline で適用。
-        let compatible = match &next_source {
-            FolderPinSource::File { .. } => true,
-            FolderPinSource::ZipEntry { zip_rel, .. } => !zip_rel.is_empty(),
-            FolderPinSource::PdfPage { pdf_rel, .. } => !pdf_rel.is_empty(),
+        // 次の container 種別ごとの compat 規則を inline で適用。
+        let compatible = match (resolved.kind, &next_source) {
+            // Folder container: 任意の source kind を受け入れるが、内側参照は非空 rel 必須。
+            (ResolvedKind::Folder, FolderPinSource::File { .. }) => true,
+            (ResolvedKind::Folder, FolderPinSource::ZipEntry { zip_rel, .. }) => {
+                !zip_rel.is_empty()
+            }
+            (ResolvedKind::Folder, FolderPinSource::ZipDir { zip_rel, .. }) => !zip_rel.is_empty(),
+            (ResolvedKind::Folder, FolderPinSource::PdfPage { pdf_rel, .. }) => !pdf_rel.is_empty(),
+            // ZipDir container: ZIP 内なので empty zip_rel の ZipEntry / ZipDir だけ有効。
+            (ResolvedKind::ZipDirRepresentative, FolderPinSource::ZipEntry { zip_rel, .. }) => {
+                zip_rel.is_empty()
+            }
+            (ResolvedKind::ZipDirRepresentative, FolderPinSource::ZipDir { zip_rel, .. }) => {
+                zip_rel.is_empty()
+            }
+            (ResolvedKind::ZipDirRepresentative, _) => false,
+            _ => false,
         };
         if !compatible {
             crate::logger::log(format!(
@@ -652,6 +721,21 @@ fn decode_row(
             FolderPinSource::ZipEntry {
                 zip_rel: rel.to_string(),
                 entry,
+            }
+        }
+        "zipdir" => {
+            let dir_prefix = match entry {
+                Some(e) if !e.is_empty() => normalize_zip_dir_prefix(e),
+                _ => {
+                    crate::logger::log(format!(
+                        "folder_thumb_pins: skipping zipdir row with empty/NULL prefix (rel={rel:?})"
+                    ));
+                    return None;
+                }
+            };
+            FolderPinSource::ZipDir {
+                zip_rel: rel.to_string(),
+                dir_prefix,
             }
         }
         "pdfpage" => {
@@ -713,6 +797,20 @@ fn validate_source(source: &FolderPinSource) -> Result<(), FolderPinError> {
                 validate_rel(zip_rel)
             }
         }
+        FolderPinSource::ZipDir {
+            zip_rel,
+            dir_prefix,
+        } => {
+            if dir_prefix.is_empty() {
+                return Err(FolderPinError::EmptyZipDirPrefix);
+            }
+            if zip_rel.is_empty() {
+                // container 自身が ZIP のケースは許可
+                Ok(())
+            } else {
+                validate_rel(zip_rel)
+            }
+        }
         FolderPinSource::PdfPage { pdf_rel, .. } => {
             if pdf_rel.is_empty() {
                 Ok(())
@@ -750,6 +848,44 @@ fn validate_rel(rel: &str) -> Result<(), FolderPinError> {
         }
     }
     Ok(())
+}
+
+fn normalize_zip_dir_prefix(prefix: &str) -> String {
+    let mut out = prefix.replace('\\', "/");
+    while out.starts_with('/') {
+        out.remove(0);
+    }
+    let parts: Vec<&str> = out.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", parts.join("/"))
+    }
+}
+
+fn zip_root_from_container_key(container: &Path) -> Option<PathBuf> {
+    let mut root = PathBuf::new();
+    for comp in container.components() {
+        root.push(comp.as_os_str());
+        let Component::Normal(seg) = comp else {
+            continue;
+        };
+        let Some(ext) = Path::new(seg).extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if crate::archive_converter::ArchiveFormat::nested_from_extension(ext).is_some() {
+            return Some(root);
+        }
+    }
+    None
+}
+
+fn zip_dir_container_key(zip_root: &Path, dir_prefix: &str) -> PathBuf {
+    let mut p = zip_root.to_path_buf();
+    for seg in dir_prefix.split('/').filter(|s| !s.is_empty()) {
+        p.push(seg);
+    }
+    p
 }
 
 #[cfg(test)]
@@ -805,6 +941,24 @@ mod tests {
         };
         db.set(container, &src).unwrap();
         assert_eq!(db.lookup(container), Some(src));
+    }
+
+    #[test]
+    fn roundtrip_zipdir_in_container_itself_normalizes_prefix() {
+        let db = open_in_memory();
+        let container = Path::new("C:/Albums/Trip.zip");
+        let src = FolderPinSource::ZipDir {
+            zip_rel: String::new(),
+            dir_prefix: r"bookA\chapter01".to_string(),
+        };
+        db.set(container, &src).unwrap();
+        assert_eq!(
+            db.lookup(container),
+            Some(FolderPinSource::ZipDir {
+                zip_rel: String::new(),
+                dir_prefix: "bookA/chapter01/".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -1006,6 +1160,21 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, FolderPinError::EmptyZipEntry));
+    }
+
+    #[test]
+    fn set_rejects_empty_zipdir_prefix() {
+        let db = open_in_memory();
+        let err = db
+            .set(
+                Path::new("C:/Archives/book.zip"),
+                &FolderPinSource::ZipDir {
+                    zip_rel: String::new(),
+                    dir_prefix: String::new(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, FolderPinError::EmptyZipDirPrefix));
     }
 
     #[test]
@@ -1298,6 +1467,71 @@ mod tests {
         assert_eq!(resolved.abs_path, zip);
         assert_eq!(resolved.zip_entry.as_deref(), Some("p01.png"));
         assert!(resolved.source_id.starts_with("zipentry||p01.png|-|"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_pin_target_zipdir_carries_prefix() {
+        use std::io::Write;
+        let tmp =
+            std::env::temp_dir().join(format!("miv_pin_resolve_zipdir_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let zip = tmp.join("outer.zip");
+        std::fs::File::create(&zip)
+            .unwrap()
+            .write_all(b"PK\x03\x04 dummy")
+            .unwrap();
+        let source = FolderPinSource::ZipDir {
+            zip_rel: String::new(),
+            dir_prefix: "bookA".to_string(),
+        };
+
+        let resolved = resolve_pin_target(&zip, &source).unwrap();
+        assert_eq!(resolved.kind, ResolvedKind::ZipDirRepresentative);
+        assert_eq!(resolved.abs_path, zip);
+        assert_eq!(resolved.zip_dir_prefix.as_deref(), Some("bookA/"));
+        assert!(resolved.source_id.starts_with("zipdir||bookA/|-|"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cascade_zipdir_follows_child_pin_like_folder() {
+        use std::io::Write;
+        let tmp =
+            std::env::temp_dir().join(format!("miv_pin_cascade_zipdir_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let zip = tmp.join("outer.zip");
+        std::fs::File::create(&zip)
+            .unwrap()
+            .write_all(b"PK\x03\x04 dummy")
+            .unwrap();
+        let immediate = FolderPinSource::ZipDir {
+            zip_rel: String::new(),
+            dir_prefix: "bookA/".to_string(),
+        };
+        let child_container = zip.join("bookA");
+        let child_key = crate::path_key::normalize_keep_drive(&child_container);
+
+        let resolved = resolve_pin_target_cascaded_via(
+            &zip,
+            &immediate,
+            |p| {
+                (crate::path_key::normalize_keep_drive(p) == child_key).then(|| {
+                    FolderPinSource::ZipEntry {
+                        zip_rel: String::new(),
+                        entry: "bookA/page01.jpg".to_string(),
+                    }
+                })
+            },
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.kind, ResolvedKind::ZipEntry);
+        assert_eq!(resolved.abs_path, zip);
+        assert_eq!(resolved.zip_entry.as_deref(), Some("bookA/page01.jpg"));
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

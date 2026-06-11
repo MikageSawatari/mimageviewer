@@ -9580,13 +9580,33 @@ impl App {
                     let norm = crate::path_key::normalize_keep_drive(book_key);
                     match pin_map.get(&norm) {
                         Some(crate::folder_thumb_pins::FolderPinSource::ZipEntry {
-                            entry, ..
-                        }) => Some(format!(
+                            zip_rel,
+                            entry,
+                        }) if zip_rel.is_empty() => Some(format!(
                             "{}{}{}",
                             crate::grid_item::zipdir_cache_key(prefix),
                             crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
                             entry
                         )),
+                        Some(
+                            source @ crate::folder_thumb_pins::FolderPinSource::ZipDir {
+                                zip_rel,
+                                ..
+                            },
+                        ) if zip_rel.is_empty() => resolve_pin_target_cascaded(
+                            book_key,
+                            source,
+                            Some(pin_db.as_ref()),
+                            self.settings.folder_thumb_depth as usize,
+                        )
+                        .map(|resolved| {
+                            format!(
+                                "{}{}{}",
+                                crate::grid_item::zipdir_cache_key(prefix),
+                                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+                                resolved.source_id,
+                            )
+                        }),
                         _ => None,
                     }
                 })
@@ -11899,6 +11919,26 @@ impl App {
                 let cat = self.get_or_open_catalog(&zip_path)?;
                 cat.load_one(entry).ok().flatten()
             }
+            FolderPinSource::ZipDir {
+                zip_rel,
+                dir_prefix,
+            } => {
+                let zip_path = if zip_rel.is_empty() {
+                    container.to_path_buf()
+                } else {
+                    container.join(zip_rel)
+                };
+                let cat = self.get_or_open_catalog(&zip_path)?;
+                let key = crate::grid_item::zipdir_cache_key(dir_prefix);
+                let base_entry = cat.load_one(&key).ok().flatten();
+                let pinned_prefix = format!("{}{}", key, crate::thumb_loader::CACHE_KEY_PIN_SUFFIX);
+                let pinned_entry = cat
+                    .load_latest_with_prefix(&pinned_prefix)
+                    .ok()
+                    .flatten()
+                    .map(|(_, entry)| entry);
+                pinned_entry.or(base_entry)
+            }
             FolderPinSource::PdfPage { pdf_rel, page } => {
                 let pdf_path = if pdf_rel.is_empty() {
                     container.to_path_buf()
@@ -12162,8 +12202,8 @@ impl App {
     }
 
     /// 選択中アイテムを代表サムネにピンするときの `source`。ネスト ZIP ツリー閲覧中は
-    /// 「本ごとピン」(Model B) に合わせ、ZipImage を ZipEntry source にする (ZipDir/その他は
-    /// 本の中では不可 → None)。通常フォルダは `source_from_grid_item(current_folder, item)`。
+    /// ZipImage を ZipEntry、ZipDir を ZipDir source にする。通常フォルダは
+    /// `source_from_grid_item(current_folder, item)`。
     /// ピン対象コンテナは `pin_container_key()` (zip 内は本キー、通常は current_folder)。
     /// 📌 ボタン状態 / コンテキストメニュー / グリッドバッジで P キーと同じ判定を共有する。
     pub(crate) fn folder_pin_selected_source(
@@ -12171,13 +12211,26 @@ impl App {
         idx: usize,
     ) -> Option<crate::folder_thumb_pins::FolderPinSource> {
         let item = self.items.get(idx)?;
-        if self.zip_nav.is_some() {
+        if let Some(nav) = self.zip_nav.as_ref() {
             return match item {
                 GridItem::ZipImage { entry_name, .. } => {
                     Some(crate::folder_thumb_pins::FolderPinSource::ZipEntry {
                         zip_rel: String::new(),
                         entry: entry_name.clone(),
                     })
+                }
+                GridItem::ZipDir { dir_prefix, .. } => {
+                    let segs = zip_dir_prefix_segments(dir_prefix);
+                    let effective = nav.tree.collapse_redundant(&segs);
+                    let dir_prefix = zip_dir_prefix_from_segs(&effective);
+                    if dir_prefix.is_empty() {
+                        None
+                    } else {
+                        Some(crate::folder_thumb_pins::FolderPinSource::ZipDir {
+                            zip_rel: String::new(),
+                            dir_prefix,
+                        })
+                    }
                 }
                 _ => None,
             };
@@ -12312,41 +12365,28 @@ impl App {
         if self.archive_source_override.is_some() && self.zip_nav.is_none() {
             return;
         }
-        // ネスト ZIP ツリー (Model B): 本 (= 現在の階層) ごとに代表サムネを記憶する。
-        // 本の中で画像に P → その本の代表を設定/解除。ZipDir セルに P → 操作ガイドを出す
-        // (代表は本の中で画像を選んで設定する仕様)。
+        // ネスト ZIP ツリー: 現在の本 (= pin_container_key) ごとに代表サムネを記憶する。
+        // ZipImage は直接画像、ZipDir は通常フォルダの子フォルダ pin と同じく container
+        // source として保存し、表示時に cascade 解決する。
         if self.zip_nav.is_some() {
-            match self.items.get(idx).cloned() {
-                Some(GridItem::ZipImage { entry_name, .. }) => {
-                    // ルート表示では zip_path キー (= 外側 ZIP の代表、v1.2.x のフラット UI で
-                    // 付けたピンと互換)。本の中では実効 prefix の本キー。
-                    let Some(book_key) = self.pin_container_key() else {
-                        return;
-                    };
-                    let source = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
-                        zip_rel: String::new(),
-                        entry: entry_name,
-                    };
-                    if self.folder_thumb_pin_for(&book_key) == Some(&source) {
-                        self.remove_folder_thumb_pin(&book_key);
-                        self.show_feedback_toast("この本の代表サムネを解除しました".to_string());
-                    } else {
-                        self.set_folder_thumb_pin(&book_key, source);
-                        self.show_feedback_toast("この本の代表サムネに設定しました".to_string());
-                    }
-                    // 設定対象 (本) のセルは親階層にあり現在のビューには無いので、ここでの
-                    // 再 materialize (= scroll/selected リセット) は不要。dirty を消して
-                    // 読書位置を保つ。親へ戻ると zip_nav_back の refresh_folder_pin_map が
-                    // ピンを拾ってセルに反映する。
-                    self.folder_thumb_pin_dirty = false;
-                }
-                Some(GridItem::ZipDir { .. }) => {
-                    self.show_feedback_toast(
-                        "本を開いて、代表にしたい画像で P を押してください".to_string(),
-                    );
-                }
-                _ => {}
+            let Some(book_key) = self.pin_container_key() else {
+                return;
+            };
+            let Some(source) = self.folder_pin_selected_source(idx) else {
+                return;
+            };
+            if self.folder_thumb_pin_for(&book_key) == Some(&source) {
+                self.remove_folder_thumb_pin(&book_key);
+                self.show_feedback_toast("この本の代表サムネを解除しました".to_string());
+            } else {
+                self.set_folder_thumb_pin(&book_key, source);
+                self.show_feedback_toast("この本の代表サムネに設定しました".to_string());
             }
+            // 設定対象 (本) のセルは親階層にあり現在のビューには無いので、ここでの
+            // 再 materialize (= scroll/selected リセット) は不要。dirty を消して
+            // 読書位置を保つ。親へ戻ると zip_nav_back の refresh_folder_pin_map が
+            // ピンを拾ってセルに反映する。
+            self.folder_thumb_pin_dirty = false;
             return;
         }
         let Some(container) = self.current_folder.clone() else {
@@ -12567,8 +12607,8 @@ impl App {
                 .on_hover_text("変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)");
             return false;
         }
-        // ピン対象コンテナ / source。ネスト ZIP では本ごとピン (Model B、P キーと一致)。
-        let (pin_container, source) = if self.zip_nav.is_some() {
+        // ピン対象コンテナ / source。ネスト ZIP では P キーと同じく本キーへ保存する。
+        let (pin_container, source) = if let Some(nav) = self.zip_nav.as_ref() {
             match item {
                 GridItem::ZipImage { entry_name, .. } => {
                     let Some(bk) = self.pin_container_key() else {
@@ -12582,7 +12622,24 @@ impl App {
                         },
                     )
                 }
-                // ZipDir / その他は本の中では menu からはピンしない (本を開いて画像で P)。
+                GridItem::ZipDir { dir_prefix, .. } => {
+                    let Some(bk) = self.pin_container_key() else {
+                        return false;
+                    };
+                    let segs = zip_dir_prefix_segments(dir_prefix);
+                    let effective = nav.tree.collapse_redundant(&segs);
+                    let dir_prefix = zip_dir_prefix_from_segs(&effective);
+                    if dir_prefix.is_empty() {
+                        return false;
+                    }
+                    (
+                        bk,
+                        crate::folder_thumb_pins::FolderPinSource::ZipDir {
+                            zip_rel: String::new(),
+                            dir_prefix,
+                        },
+                    )
+                }
                 _ => return false,
             }
         } else {
@@ -32237,6 +32294,7 @@ fn drive_display_label(path: &std::path::Path) -> Option<String> {
 fn pin_source_id_cache_prefix(source: &crate::folder_thumb_pins::FolderPinSource) -> String {
     let entry_part = match source {
         crate::folder_thumb_pins::FolderPinSource::ZipEntry { entry, .. } => entry.as_str(),
+        crate::folder_thumb_pins::FolderPinSource::ZipDir { dir_prefix, .. } => dir_prefix.as_str(),
         _ => "-",
     };
     let page_part = match source {
@@ -32336,6 +32394,22 @@ fn book_container_key_from_segs(zip_path: &std::path::Path, segs: &[String]) -> 
         p.push(seg);
     }
     p
+}
+
+fn zip_dir_prefix_segments(dir_prefix: &str) -> Vec<String> {
+    dir_prefix
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn zip_dir_prefix_from_segs(segs: &[String]) -> String {
+    if segs.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", segs.join("/"))
+    }
 }
 
 /// ZIP ツリーナビ内の「本」キーで使う root path。
@@ -32463,38 +32537,81 @@ fn make_load_request(
             // folder/zip thumb prefix と一致しないため、ワーカーはコンテナ列挙ではなく
             // 「zip_entry を直接読む」経路に乗る。
             //
-            // Model B: 本ごとの代表サムネピン (zip_path + dir_prefix キー) があれば、その
-            // 画像を代表にする。ピン時は cache_key に #pin:{entry} を付けて auto キャッシュと
-            // 分離する。collapse 済みラッパー本では set 側 (effective prefix) と lookup 側
-            // (dir_prefix) のキーがずれてピンが反映されない (= 非崩しの通常本では一致)。
+            // 本ごとの代表サムネピン (zip_path + dir_prefix キー) があれば、それを代表にする。
+            // ZipDir source は通常フォルダの子フォルダ pin と同じく cascade 解決する。
             let book_root = zip_pin_root_path(zip_path, archive_source_override, current_folder);
-            let book_key =
-                crate::path_key::normalize_keep_drive(&book_container_key(book_root, dir_prefix));
-            let pinned_entry = pin_map.get(&book_key).and_then(|src| match src {
-                crate::folder_thumb_pins::FolderPinSource::ZipEntry { entry, .. } => {
-                    Some(entry.clone())
+            let book_container = book_container_key(book_root, dir_prefix);
+            let book_key = crate::path_key::normalize_keep_drive(&book_container);
+            if let Some(source) = pin_map.get(&book_key) {
+                match source {
+                    crate::folder_thumb_pins::FolderPinSource::ZipEntry { zip_rel, entry }
+                        if zip_rel.is_empty() && !entry.is_empty() =>
+                    {
+                        return Some(LoadRequest {
+                            path: zip_path.clone(),
+                            zip_entry: Some(entry.clone()),
+                            cache_key_override: Some(format!(
+                                "{}{}{}",
+                                crate::grid_item::zipdir_cache_key(dir_prefix),
+                                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+                                entry
+                            )),
+                            ..base
+                        });
+                    }
+                    crate::folder_thumb_pins::FolderPinSource::ZipDir { zip_rel, .. }
+                        if zip_rel.is_empty() =>
+                    {
+                        if let Some(resolved) = resolve_pin_target_cascaded(
+                            &book_container,
+                            source,
+                            pin_db,
+                            folder_thumb_depth as usize,
+                        ) {
+                            let cache_key = format!(
+                                "{}{}{}",
+                                crate::grid_item::zipdir_cache_key(dir_prefix),
+                                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+                                resolved.source_id,
+                            );
+                            match resolved.kind {
+                                crate::folder_thumb_pins::ResolvedKind::ZipEntry => {
+                                    return Some(LoadRequest {
+                                        path: zip_path.clone(),
+                                        zip_entry: resolved.zip_entry,
+                                        cache_key_override: Some(cache_key),
+                                        mtime: resolved.mtime,
+                                        file_size: resolved.file_size,
+                                        ..base
+                                    });
+                                }
+                                crate::folder_thumb_pins::ResolvedKind::ZipDirRepresentative => {
+                                    return Some(LoadRequest {
+                                        path: zip_path.clone(),
+                                        zip_dir_prefix: resolved.zip_dir_prefix,
+                                        cache_key_override: Some(cache_key),
+                                        resolve_override: Some(
+                                            crate::thumb_loader::ResolveStrategy::ZipDirRepresentative,
+                                        ),
+                                        folder_thumb_sort,
+                                        folder_thumb_depth,
+                                        mtime: resolved.mtime,
+                                        file_size: resolved.file_size,
+                                        ..base
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => None,
-            });
-            let (entry, cache_key) = if let Some(e) = pinned_entry {
-                let ck = format!(
-                    "{}{}{}",
-                    crate::grid_item::zipdir_cache_key(dir_prefix),
-                    crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-                    e
-                );
-                (e, ck)
-            } else {
-                // 代表は materialize が原則 Some にする (空サブツリーは構造上生成されない)。
-                (
-                    representative.clone()?,
-                    crate::grid_item::zipdir_cache_key(dir_prefix),
-                )
-            };
+            }
+            let entry = representative.clone()?;
             Some(LoadRequest {
                 path: zip_path.clone(),
                 zip_entry: Some(entry),
-                cache_key_override: Some(cache_key),
+                cache_key_override: Some(crate::grid_item::zipdir_cache_key(dir_prefix)),
                 ..base
             })
         }
@@ -32524,6 +32641,47 @@ fn make_load_request(
                     )),
                     ..base
                 });
+            }
+            if let Some(source @ crate::folder_thumb_pins::FolderPinSource::ZipDir { zip_rel, .. }) =
+                pin_map.get(&archive_key)
+                && zip_rel.is_empty()
+                && let Some(resolved) =
+                    resolve_pin_target_cascaded(path, source, pin_db, folder_thumb_depth as usize)
+            {
+                let cache_key = format!(
+                    "{}{}{}",
+                    base_key,
+                    crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+                    resolved.source_id,
+                );
+                match resolved.kind {
+                    crate::folder_thumb_pins::ResolvedKind::ZipEntry => {
+                        return Some(LoadRequest {
+                            path: cached_zip.clone(),
+                            zip_entry: resolved.zip_entry,
+                            cache_key_override: Some(cache_key),
+                            mtime: resolved.mtime,
+                            file_size: resolved.file_size,
+                            ..base
+                        });
+                    }
+                    crate::folder_thumb_pins::ResolvedKind::ZipDirRepresentative => {
+                        return Some(LoadRequest {
+                            path: cached_zip.clone(),
+                            zip_dir_prefix: resolved.zip_dir_prefix,
+                            cache_key_override: Some(cache_key),
+                            resolve_override: Some(
+                                crate::thumb_loader::ResolveStrategy::ZipDirRepresentative,
+                            ),
+                            folder_thumb_sort,
+                            folder_thumb_depth,
+                            mtime: resolved.mtime,
+                            file_size: resolved.file_size,
+                            ..base
+                        });
+                    }
+                    _ => {}
+                }
             }
             Some(LoadRequest {
                 path: cached_zip.clone(),
@@ -32697,6 +32855,23 @@ fn folder_thumb_existing_keys_for(
                 &base_key, source, mtime, file_size,
             ));
         }
+        if let Some(source @ crate::folder_thumb_pins::FolderPinSource::ZipDir { zip_rel, .. }) =
+            pin_map.get(&container_key)
+            && zip_rel.is_empty()
+            && let Some(resolved) = resolve_pin_target_cascaded(
+                container_path,
+                source,
+                pin_db,
+                folder_thumb_depth as usize,
+            )
+        {
+            keys.push(format!(
+                "{}{}{}",
+                base_key,
+                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+                resolved.source_id,
+            ));
+        }
         return keys;
     }
 
@@ -32743,9 +32918,9 @@ enum ContainerKindForPin {
 /// container と source の組合せが妥当か検査する。
 ///
 /// 妥当な組合せ:
-/// - **Folder**: 全 source 形を受け入れる (File/ZipEntry/PdfPage)。
+/// - **Folder**: 全 source 形を受け入れる (File/ZipEntry/ZipDir/PdfPage)。
 ///   - ただし ZipEntry / PdfPage は `*_rel` が **空でない** (= サブの ZIP/PDF を指す) ことを要求。
-/// - **ZipFile**: `ZipEntry { zip_rel: "" }` のみ (= container 自身の中身)
+/// - **ZipFile**: `ZipEntry { zip_rel: "" }` / `ZipDir { zip_rel: "" }` (= container 自身の中身)
 /// - **PdfFile**: `PdfPage { pdf_rel: "" }` のみ
 fn pin_source_compatible_with_container(
     container: ContainerKindForPin,
@@ -32756,9 +32931,11 @@ fn pin_source_compatible_with_container(
         // Folder は何でも受け入れる (ただし内側参照 (`_rel==""`) は不可)
         (ContainerKindForPin::Folder, S::File { .. }) => true,
         (ContainerKindForPin::Folder, S::ZipEntry { zip_rel, .. }) => !zip_rel.is_empty(),
+        (ContainerKindForPin::Folder, S::ZipDir { zip_rel, .. }) => !zip_rel.is_empty(),
         (ContainerKindForPin::Folder, S::PdfPage { pdf_rel, .. }) => !pdf_rel.is_empty(),
-        // ZipFile は内側 ZipEntry のみ
+        // ZipFile は内側 ZipEntry / ZipDir のみ
         (ContainerKindForPin::ZipFile, S::ZipEntry { zip_rel, .. }) => zip_rel.is_empty(),
+        (ContainerKindForPin::ZipFile, S::ZipDir { zip_rel, .. }) => zip_rel.is_empty(),
         (ContainerKindForPin::ZipFile, _) => false,
         // PdfFile は内側 PdfPage のみ
         (ContainerKindForPin::PdfFile, S::PdfPage { pdf_rel, .. }) => pdf_rel.is_empty(),
@@ -32935,6 +33112,7 @@ fn apply_folder_thumb_pin(
         return LoadRequest {
             path: container.to_path_buf(),
             zip_entry: None,
+            zip_dir_prefix: None,
             pdf_page: None,
             pdf_password: pdf_password.map(String::from),
             cache_key_override: Some(pinned_key),
@@ -32957,13 +33135,24 @@ fn apply_folder_thumb_pin(
     }
 
     // dispatch field を target 種別ごとに組み立てる。
-    let (resolve_override, zip_entry, pdf_page) = match resolved.kind {
-        ResolvedKind::Image => (Some(ResolveStrategy::DirectImage), None, None),
-        ResolvedKind::Folder => (Some(ResolveStrategy::FolderRepresentative), None, None),
-        ResolvedKind::ZipFirstImage => (Some(ResolveStrategy::ZipFirstImage), None, None),
-        ResolvedKind::PdfFirstPage => (None, None, Some(0u32)),
-        ResolvedKind::ZipEntry => (None, resolved.zip_entry.clone(), None),
-        ResolvedKind::PdfPage => (None, None, resolved.pdf_page),
+    let (resolve_override, zip_entry, zip_dir_prefix, pdf_page) = match resolved.kind {
+        ResolvedKind::Image => (Some(ResolveStrategy::DirectImage), None, None, None),
+        ResolvedKind::Folder => (
+            Some(ResolveStrategy::FolderRepresentative),
+            None,
+            None,
+            None,
+        ),
+        ResolvedKind::ZipFirstImage => (Some(ResolveStrategy::ZipFirstImage), None, None, None),
+        ResolvedKind::ZipDirRepresentative => (
+            Some(ResolveStrategy::ZipDirRepresentative),
+            None,
+            resolved.zip_dir_prefix.clone(),
+            None,
+        ),
+        ResolvedKind::PdfFirstPage => (None, None, None, Some(0u32)),
+        ResolvedKind::ZipEntry => (None, resolved.zip_entry.clone(), None, None),
+        ResolvedKind::PdfPage => (None, None, None, resolved.pdf_page),
         // Video は上で early-return 済み
         ResolvedKind::Video => unreachable!("Video pin handled above"),
     };
@@ -32971,6 +33160,7 @@ fn apply_folder_thumb_pin(
     LoadRequest {
         path: resolved.abs_path,
         zip_entry,
+        zip_dir_prefix,
         pdf_page,
         pdf_password: pdf_password.map(String::from),
         cache_key_override: Some(pinned_key),

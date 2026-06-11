@@ -214,6 +214,9 @@ view 変換としてのみ適用 (結果を保存し直さない)」だったが
     `path=zip_path` / `zip_entry=Some(representative)` / `cache_key_override=zipdir_cache_key`。
     `zipdir:` prefix は folder/zip thumb prefix と一致しないので、worker はコンテナ列挙では
     なく「zip_entry を直接読む」経路に乗り、代表バイトを zipdir: キーで保存する。
+    ZipDir セル自体が代表サムネ pin source の場合は `source_kind=zipdir` に実効 prefix を
+    保存し、cache miss 時に worker が `ZipDirRepresentative` として同じ sort で部分木代表を
+    選び直す。これにより通常フォルダの Folder source と同じ cascade で子の pin を辿る。
   - **Phase 3 で existing_keys を全ツリーから構築する**: フラット実装は finalize が全
     entry_name を `existing_keys` に入れて `delete_missing` のプルーン基準にしていた。
     ツリーでは finalize がルート階層しか materialize しないため、`existing_keys` は
@@ -240,7 +243,8 @@ view 変換としてのみ適用 (結果を保存し直さない)」だったが
 - [ui_fullscreen.rs](../src/ui_fullscreen.rs): nav index 構築・ZipDir はフルスクリーン対象外扱い
 - ナビ: Ctrl+↑↓ DFS・Backspace・アドレスバー・スライドショー (ZipDir スキップ)
 - [snapshot.rs](../src/snapshot.rs): ナビ状態の復元 (entry_name 不変なので leaf は互換)
-- [folder_thumb_pins.rs](../src/folder_thumb_pins.rs): ZipDir をピン対象にするか (初版は対象外可)
+- [folder_thumb_pins.rs](../src/folder_thumb_pins.rs): ZipDir は pin source として有効。
+  通常フォルダと同じ cascade で子の `ZipEntry` / `ZipDir` pin を辿る
 - [context_menu.rs](../src/ui_dialogs/context_menu.rs) / gamepad / undo / search drill
 
 ---
@@ -305,6 +309,8 @@ Claude はコンパイル + ユニットテストまでしか検証できない�
 - ソート変更 / 内側ファイルのピンで ZIP ルートに飛ぶバグを修正 (#2/#3、階層維持)。
 - Ctrl+↑↓ で本またぎ移動 (グリッド/フルスクリーン両方、#4)。
 - ZipDir 代表サムネの手動ピン = **本ごとピン (Model B)** (#3b。当初将来予定を前倒し)。
+  ZipDir セル自体を `P` した場合も `FolderPinSource::ZipDir` として保存し、通常フォルダと
+  同じ cascade で内側の pin に追従する。
 
 **入れ子アーカイブの再帰展開 (v1.3.0、実機 3 巡目後の追加対応)**:
 ZIP↔RAR/7z/LZH が混在した入れ子は、どちらの向きも従来は中身が消えていた
@@ -348,7 +354,9 @@ ZIP↔RAR/7z/LZH が混在した入れ子は、どちらの向きも従来は中
   (ルート表示 = `zip_path`、本の中 = 実効 prefix 合成パス)、lookup 側 =
   `refresh_folder_pin_map` が実効 prefix で DB を引いて literal キーへ alias 登録。
   ルート表示のピンが `zip_path` キーになったことで、親フォルダの ZipFile セルへの反映と
-  v1.2.x フラット UI で付けた既存ピンの解除/付け替えも回復。
+  v1.2.x フラット UI で付けた既存ピンの解除/付け替えも回復。ZipDir source の場合は
+  `collapse_redundant` 後の実効 prefix を保存し、cascade leaf の `source_id` を pinned key に
+  反映する。
 - **v1.2.x 保存の見開き設定**: 本キーに未保存の項目は `zip_path` キーへフォールバック
   (`apply_spread_for_key_with_fallback`)。単一ラッパー ZIP の旧設定が生き、ZIP 全体
   設定を各本が継承する。
