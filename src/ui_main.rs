@@ -2434,6 +2434,10 @@ impl App {
         // 検索の仮想階層でドリルイン中か (= ⬆ で 1 段戻れる / ▲▼ で前後ヒットへ
         // 動ける状態。最上位ではこれらを disabled にする条件)。
         let search_drilled_in = (self.global_search.active && self.global_search.drill.is_some())
+            || (self.favsearch.active && !self.favsearch.nav_stack.is_empty())
+            || (self.tag_view.active && !self.tag_view.nav_stack.is_empty());
+        let search_tree_drilled_in = (self.global_search.active
+            && self.global_search.drill.is_some())
             || (self.favsearch.active && !self.favsearch.nav_stack.is_empty());
         let local_search_blocks_parent = self.local_search_blocks_parent_nav();
 
@@ -2596,7 +2600,7 @@ impl App {
                             // snapshot 中も ▲▼ は使える: snapshot 内 container 巡回 (= キー Ctrl+↑↓ と一致)
                             true
                         } else if search_active {
-                            search_drilled_in
+                            search_tree_drilled_in
                         } else {
                             has_current
                         };
@@ -2901,6 +2905,8 @@ impl App {
                         self.drill_back_one_level();
                     } else if self.favsearch.active {
                         self.favsearch_back();
+                    } else if self.tag_view.active {
+                        self.tag_view_back();
                     }
                 }
                 result
@@ -3283,7 +3289,9 @@ impl App {
                     query_changed = true;
                 }
                 if response.lost_focus() && raw_enter_pressed {
-                    query_changed = true;
+                    response.request_focus();
+                    self.tag_view.focus_request = true;
+                    self.tag_view.has_focus = true;
                 }
 
                 if ui
@@ -3522,11 +3530,47 @@ impl App {
                     let pf = path.clone();
                     let fmt = *format;
                     let auto_fs = self.settings.auto_fullscreen_zip_pdf;
-                    self.maybe_suppress_rating_filter_for_opened_container(idx);
-                    if let Some(cached) = self.try_archive_cache_lookup(&pf) {
-                        self.open_archive_via_cache(pf, cached, auto_fs);
+                    let search_rollback = if self.favsearch.active || self.tag_view.active {
+                        Some(self.folder_nav_history_snapshot())
                     } else {
-                        self.request_archive_convert(pf, fmt, auto_fs);
+                        None
+                    };
+                    if self.favsearch.active {
+                        self.favsearch.nav_stack.push(pf.clone());
+                    }
+                    if self.tag_view.active {
+                        self.record_tag_view_nav_open(&pf);
+                    }
+                    self.maybe_suppress_rating_filter_for_opened_container(idx);
+                    let open_outcome = if let Some(cached) = self.try_archive_cache_lookup(&pf) {
+                        if self.open_archive_via_cache(pf, cached, auto_fs) {
+                            crate::app::FolderOpenOutcome::Loaded
+                        } else {
+                            crate::app::FolderOpenOutcome::Ignored
+                        }
+                    } else if self.request_archive_convert(pf, fmt, auto_fs) {
+                        crate::app::FolderOpenOutcome::ConversionDialogOpened
+                    } else {
+                        crate::app::FolderOpenOutcome::Ignored
+                    };
+                    match (open_outcome, search_rollback) {
+                        (crate::app::FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
+                            self.attach_archive_convert_nav_history_rollback(snapshot);
+                        }
+                        (crate::app::FolderOpenOutcome::Ignored, Some(snapshot)) => {
+                            self.restore_folder_nav_history(snapshot);
+                        }
+                        _ => {}
+                    }
+                    if self.favsearch.active
+                        && matches!(open_outcome, crate::app::FolderOpenOutcome::Loaded)
+                    {
+                        self.update_favsearch_address();
+                    }
+                    if self.tag_view.active
+                        && matches!(open_outcome, crate::app::FolderOpenOutcome::Loaded)
+                    {
+                        self.update_tag_view_address();
                     }
                 }
                 Some(GridItem::SearchContainer { path, kind, .. }) => {

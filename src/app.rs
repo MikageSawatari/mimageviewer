@@ -24,6 +24,7 @@ pub(crate) struct FolderNavHistorySnapshot {
     recent_folders: Vec<PathBuf>,
     suppress_record_once: bool,
     favsearch_nav_stack: Vec<PathBuf>,
+    tag_view_nav_stack: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7412,6 +7413,7 @@ impl App {
             recent_folders: self.recent_folders.clone(),
             suppress_record_once: self.suppress_folder_nav_record_once,
             favsearch_nav_stack: self.favsearch.nav_stack.clone(),
+            tag_view_nav_stack: self.tag_view.nav_stack.clone(),
         }
     }
 
@@ -7421,6 +7423,7 @@ impl App {
         self.recent_folders = snapshot.recent_folders;
         self.suppress_folder_nav_record_once = snapshot.suppress_record_once;
         self.favsearch.nav_stack = snapshot.favsearch_nav_stack;
+        self.tag_view.nav_stack = snapshot.tag_view_nav_stack;
     }
 
     pub(crate) fn attach_archive_convert_nav_history_rollback(
@@ -9129,6 +9132,7 @@ impl App {
         self.tag_view.query.clear();
         self.tag_view.last_executed.clear();
         self.tag_view.last_executed_kind_filter = self.tag_view.kind_filter;
+        self.tag_view.nav_stack.clear();
         self.tag_view.results_paths.clear();
         self.tag_view.summaries.clear();
         self.tag_view.result_count = 0;
@@ -9141,12 +9145,84 @@ impl App {
         }
     }
 
+    pub(crate) fn record_tag_view_nav_open(&mut self, path: &Path) {
+        if !self.tag_view.active {
+            return;
+        }
+        if self
+            .tag_view
+            .nav_stack
+            .last()
+            .is_some_and(|last| crate::folder_tree::path_eq(last, path))
+        {
+            return;
+        }
+        self.tag_view.nav_stack.push(path.to_path_buf());
+        if self.tag_view.nav_stack.len() > MAX_FOLDER_NAV_STACK {
+            self.tag_view.nav_stack.remove(0);
+        }
+    }
+
+    pub(crate) fn tag_view_back(&mut self) {
+        if self.zip_nav_back() {
+            return;
+        }
+        if self.tag_view.nav_stack.is_empty() {
+            return;
+        }
+        let popped = self.tag_view.nav_stack.pop();
+        self.cancel_pending_folder_nav();
+        if let Some(popped_path) = popped
+            && let Some(name) = popped_path.file_name().and_then(|n| n.to_str())
+        {
+            self.select_after_load = Some(name.to_string());
+        }
+        if let Some(top) = self.tag_view.nav_stack.last().cloned() {
+            let _ = self.load_folder_or_convert_archive(top);
+            self.update_tag_view_address();
+        } else {
+            self.execute_tag_view();
+        }
+    }
+
+    pub(crate) fn update_tag_view_address(&mut self) {
+        if !self.tag_view.active {
+            return;
+        }
+        let query = self.tag_view.last_executed.trim();
+        if self.tag_view.nav_stack.is_empty() {
+            self.address = if query.is_empty() {
+                "タグビュー".to_string()
+            } else {
+                format!("タグビュー: {query}")
+            };
+            return;
+        }
+        let trail: Vec<String> = self
+            .tag_view
+            .nav_stack
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+            .collect();
+        let base = if query.is_empty() {
+            "タグビュー".to_string()
+        } else {
+            format!("タグビュー: {query}")
+        };
+        if trail.is_empty() {
+            self.address = base;
+        } else {
+            self.address = format!("{base} > {}", trail.join(" > "));
+        }
+    }
+
     pub(crate) fn execute_tag_view(&mut self) {
         self.tag_view.last_executed = self.tag_view.query.clone();
         self.tag_view.last_executed_kind_filter = self.tag_view.kind_filter;
         self.tag_view.reject_message = None;
         self.tag_view.truncated = false;
         self.tag_view.result_count = 0;
+        self.tag_view.nav_stack.clear();
         self.tag_view.results_paths.clear();
         if let Some(pending) = self.tag_view_pending.take() {
             pending.cancel();
@@ -16422,11 +16498,48 @@ impl App {
                             let fmt = *format;
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
                             let auto_fs = self.settings.auto_fullscreen_zip_pdf;
-                            if let Some(cached) = self.try_archive_cache_lookup(&pf) {
-                                self.open_archive_via_cache(pf, cached, auto_fs);
-                                return None;
+                            let search_rollback = if self.favsearch.active || self.tag_view.active {
+                                Some(self.folder_nav_history_snapshot())
+                            } else {
+                                None
+                            };
+                            if self.favsearch.active {
+                                self.favsearch.nav_stack.push(pf.clone());
                             }
-                            self.request_archive_convert(pf, fmt, auto_fs);
+                            if self.tag_view.active {
+                                self.record_tag_view_nav_open(&pf);
+                            }
+                            let open_outcome =
+                                if let Some(cached) = self.try_archive_cache_lookup(&pf) {
+                                    if self.open_archive_via_cache(pf, cached, auto_fs) {
+                                        FolderOpenOutcome::Loaded
+                                    } else {
+                                        FolderOpenOutcome::Ignored
+                                    }
+                                } else if self.request_archive_convert(pf, fmt, auto_fs) {
+                                    FolderOpenOutcome::ConversionDialogOpened
+                                } else {
+                                    FolderOpenOutcome::Ignored
+                                };
+                            match (open_outcome, search_rollback) {
+                                (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
+                                    self.attach_archive_convert_nav_history_rollback(snapshot);
+                                }
+                                (FolderOpenOutcome::Ignored, Some(snapshot)) => {
+                                    self.restore_folder_nav_history(snapshot);
+                                }
+                                _ => {}
+                            }
+                            if self.favsearch.active
+                                && matches!(open_outcome, FolderOpenOutcome::Loaded)
+                            {
+                                self.update_favsearch_address();
+                            }
+                            if self.tag_view.active
+                                && matches!(open_outcome, FolderOpenOutcome::Loaded)
+                            {
+                                self.update_tag_view_address();
+                            }
                         }
                         Some(GridItem::SearchContainer { path, kind, .. }) => {
                             // Ctrl+G 結果ビュー (Aggregated) でコンテナを Enter
@@ -16490,6 +16603,7 @@ impl App {
                 return None;
             }
             if in_tag_view {
+                self.tag_view_back();
                 return None;
             }
             if self.local_search_blocks_parent_nav() {
@@ -31653,7 +31767,7 @@ impl eframe::App for App {
                 // (= 競合なし、folder_nav が常に勝つ)。`keyboard_nav` / `gamepad_nav` は
                 // 早期 return より前で確定済みなので使える。
                 if let Some(crate::ui_main::AddressBarNav::Direct(path)) = gamepad_nav {
-                    let favsearch_rollback = if self.favsearch.active {
+                    let search_rollback = if self.favsearch.active || self.tag_view.active {
                         Some(self.folder_nav_history_snapshot())
                     } else {
                         None
@@ -31661,12 +31775,15 @@ impl eframe::App for App {
                     if self.favsearch.active {
                         self.favsearch.nav_stack.push(path.clone());
                     }
+                    if self.tag_view.active {
+                        self.record_tag_view_nav_open(&path);
+                    }
                     let open_target = path.clone();
                     let open_outcome = self.load_folder_or_convert_archive(path);
                     if matches!(open_outcome, FolderOpenOutcome::Loaded) {
                         self.advance_drilled_current_path(&open_target);
                     }
-                    match (open_outcome, favsearch_rollback) {
+                    match (open_outcome, search_rollback) {
                         (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
                             self.attach_archive_convert_nav_history_rollback(snapshot);
                         }
@@ -31678,6 +31795,9 @@ impl eframe::App for App {
                     self.clear_pending_folder_nav_steps();
                     if self.favsearch.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
                         self.update_favsearch_address();
+                    }
+                    if self.tag_view.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                        self.update_tag_view_address();
                     }
                 } else if let Some(result) = self.poll_folder_nav() {
                     let folder_nav_wins = keyboard_nav.is_none();
@@ -32186,7 +32306,7 @@ impl eframe::App for App {
                 grid_nav
             };
             if let Some(p) = navigate {
-                let favsearch_rollback = if self.favsearch.active {
+                let search_rollback = if self.favsearch.active || self.tag_view.active {
                     Some(self.folder_nav_history_snapshot())
                 } else {
                     None
@@ -32195,6 +32315,9 @@ impl eframe::App for App {
                 // 実 load が保留/失敗した場合は snapshot で元に戻す。
                 if self.favsearch.active {
                     self.favsearch.nav_stack.push(p.clone());
+                }
+                if self.tag_view.active {
+                    self.record_tag_view_nav_open(&p);
                 }
                 let open_target = p.clone();
                 let open_outcome = self.load_folder_or_convert_archive(p);
@@ -32206,7 +32329,7 @@ impl eframe::App for App {
                 if matches!(open_outcome, FolderOpenOutcome::Loaded) {
                     self.advance_drilled_current_path(&open_target);
                 }
-                let rollback = history_nav_rollback.or(favsearch_rollback);
+                let rollback = history_nav_rollback.or(search_rollback);
                 match (open_outcome, rollback) {
                     (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
                         self.attach_archive_convert_nav_history_rollback(snapshot);
@@ -32222,6 +32345,9 @@ impl eframe::App for App {
                 self.clear_pending_folder_nav_steps();
                 if self.favsearch.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
                     self.update_favsearch_address();
+                }
+                if self.tag_view.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                    self.update_tag_view_address();
                 }
             }
         }

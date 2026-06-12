@@ -11862,6 +11862,65 @@ mod file_operation_selection_tests {
 }
 
 #[cfg(test)]
+mod tag_view_navigation_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    #[test]
+    fn tag_view_nav_open_dedupes_and_close_clears_stack() {
+        let mut app = setup_app();
+        app.tag_view.active = true;
+        let path = PathBuf::from("C:/books/a.zip");
+
+        app.record_tag_view_nav_open(&path);
+        app.record_tag_view_nav_open(&path);
+
+        assert_eq!(app.tag_view.nav_stack, vec![path]);
+
+        app.close_tag_view();
+
+        assert!(
+            app.tag_view.nav_stack.is_empty(),
+            "タグビューを閉じたら仮想階層スタックも破棄する"
+        );
+    }
+
+    #[test]
+    fn tag_view_back_from_opened_container_returns_to_result_grid() {
+        let mut app = setup_app();
+        app.tag_view.active = true;
+        app.tag_view.query = "#猫".to_string();
+        app.tag_view.last_executed = "#猫".to_string();
+        app.tag_view.nav_stack.push(PathBuf::from("C:/books/a.zip"));
+        app.items_are_tag_view = false;
+
+        app.tag_view_back();
+
+        assert!(app.tag_view.nav_stack.is_empty());
+        assert!(
+            app.tag_view_pending.is_some(),
+            "最上位から戻るとタグ検索結果の再構築を開始する"
+        );
+        assert_eq!(app.select_after_load.as_deref(), Some("a.zip"));
+    }
+
+    #[test]
+    fn folder_nav_history_snapshot_restores_tag_view_stack() {
+        let mut app = setup_app();
+        app.tag_view.active = true;
+        let root = PathBuf::from("C:/books/a.zip");
+        let child = PathBuf::from("C:/books/b.zip");
+        app.tag_view.nav_stack.push(root.clone());
+
+        let snapshot = app.folder_nav_history_snapshot();
+        app.tag_view.nav_stack.push(child);
+        app.restore_folder_nav_history(snapshot);
+
+        assert_eq!(app.tag_view.nav_stack, vec![root]);
+    }
+}
+
+#[cfg(test)]
 mod always_visible_selection_cursor_tests {
     use super::phase_c_support::setup_app;
     use super::*;

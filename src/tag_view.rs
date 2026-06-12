@@ -72,6 +72,7 @@ pub(crate) struct TagViewState {
     pub focus_request: bool,
     pub has_focus: bool,
     pub saved_folder: Option<PathBuf>,
+    pub nav_stack: Vec<PathBuf>,
     pub results_paths: Vec<PathBuf>,
     pub summaries: Vec<TagSummary>,
     pub result_count: usize,
