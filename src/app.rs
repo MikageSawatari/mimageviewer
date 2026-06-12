@@ -30281,7 +30281,28 @@ impl App {
     }
 
     fn open_startup_path(&mut self, requested: PathBuf) -> bool {
-        let Some(openable) = crate::folder_tree::resolve_openable_path(&requested) else {
+        // perf 計装 (post-v1.3.0 backlog C-3): 転送パス activate 経路 (稼働中 UI スレッド)
+        // で `resolve_openable_path` が is_file/is_dir + 親探索の FS stat を行う。遅い /
+        // 切断ネットワークパスで stall しうるので、worker 化判断のため所要時間を計測する。
+        // (本コミットは計装のみ。実際の worker 化は計測値を見て別途判断。)
+        let resolve_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
+        let resolved = crate::folder_tree::resolve_openable_path(&requested);
+        if let Some(t0) = resolve_t0 {
+            crate::perf::event(
+                "startup",
+                "open_path_resolve",
+                None,
+                0,
+                &[
+                    (
+                        "ms",
+                        serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("resolved", serde_json::Value::from(resolved.is_some())),
+                ],
+            );
+        }
+        let Some(openable) = resolved else {
             crate::logger::log(format!(
                 "startup open: no openable path for {}",
                 requested.display()

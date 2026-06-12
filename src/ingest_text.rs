@@ -361,9 +361,15 @@ pub fn build_per_source_from_bytes(display_name: &str, bytes: &[u8]) -> PerSourc
     let mut out = PerSourceText::default();
     out.name = normalize_for_match(display_name);
 
+    // PNG メタ (tEXt/iTXt/zTXt) は inflate + 解析が重いので **1 回だけ**実行し、EXIF
+    // UserComment 抑制判定 (origin) と png_prompt の両方で共有する。旧実装は exif 経路で
+    // `_with_origin`、png_text 経路で `build_searchable_from_bytes` を別々に呼び、ZIP 内
+    // 画像のチャンクを 2 回 inflate + 解析していた (ZIP ingest ホットパスの perf。path 版
+    // `build_per_source_for_file` と同じく統合)。
+    let (png_text, ai_origin) = crate::png_metadata::build_searchable_from_bytes_with_origin(bytes);
+
     if let Some(exif) = crate::exif_reader::read_exif_from_bytes(bytes, &[]) {
         let mut buf = String::with_capacity(128);
-        let (_, ai_origin) = crate::png_metadata::build_searchable_from_bytes_with_origin(bytes);
         append_exif(
             &mut buf,
             &exif,
@@ -380,7 +386,6 @@ pub fn build_per_source_from_bytes(display_name: &str, bytes: &[u8]) -> PerSourc
             out.xmp_tweet = normalize_for_match(&buf);
         }
     }
-    let png_text = crate::png_metadata::build_searchable_from_bytes(bytes);
     if !png_text.is_empty() {
         out.png_prompt = normalize_for_match(&png_text);
     }

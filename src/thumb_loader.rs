@@ -1062,9 +1062,26 @@ pub fn process_load_request(
             )
             .map(|e| e.entry_name.clone())
         });
+        let zip_ms = t_zip.elapsed().as_secs_f64() * 1000.0;
+        // perf 計装 (post-v1.3.0 backlog C-4): ZipDir 代表解決は軽量キューに振られるが、
+        // worker 側で enumerate_image_entries (ZIP セントラルディレクトリ読み = 重 I/O) +
+        // ツリー構築する。キュー振り分け再検討のため所要を analyze_perf.py で集計できる
+        // ようイベント化する (本コミットは計装のみ)。
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "thumb",
+                "zipdir_resolve",
+                None,
+                req.input_seq,
+                &[
+                    ("idx", serde_json::Value::from(req.idx)),
+                    ("ms", serde_json::Value::from(zip_ms)),
+                    ("resolved", serde_json::Value::from(name.is_some())),
+                ],
+            );
+        }
         match name {
             Some(name) => {
-                let zip_ms = t_zip.elapsed().as_secs_f64() * 1000.0;
                 crate::logger::log(format!(
                     "    idx={:>4} zipdir_resolve={zip_ms:>6.1}ms  {}",
                     req.idx,

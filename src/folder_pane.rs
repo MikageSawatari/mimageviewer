@@ -85,6 +85,9 @@ pub(crate) struct FolderPaneState {
     user_collapsed: HashSet<String>,
     pending: Vec<FolderPaneScanPending>,
     last_sort_order: SortOrder,
+    /// `refresh_drives` の throttle 用。ペイン表示中は `sync_to_active` から毎フレーム
+    /// 呼ばれるので、`GetLogicalDrives` + 最大 26 回 `GetDriveTypeW` を間引く。
+    last_drive_refresh: Option<std::time::Instant>,
 }
 
 impl Default for FolderPaneState {
@@ -105,6 +108,7 @@ impl Default for FolderPaneState {
             user_collapsed: HashSet::new(),
             pending: Vec::new(),
             last_sort_order: SortOrder::default(),
+            last_drive_refresh: None,
         }
     }
 }
@@ -169,6 +173,20 @@ impl FolderPaneState {
     }
 
     pub(crate) fn refresh_drives(&mut self) {
+        // ペイン表示中は `sync_to_active` から毎フレーム呼ばれる。`available_drives()` は
+        // `GetLogicalDrives` + 最大 26 回 `GetDriveTypeW` syscall + Vec alloc なので、
+        // ~1.5s に throttle する (post-v1.3.0 backlog perf)。ドライブ抜き差しの反映は
+        // 最大 ~1.5s 遅延するが許容範囲 (変化頻度が極小)。
+        const DRIVE_REFRESH_THROTTLE: std::time::Duration = std::time::Duration::from_millis(1500);
+        let now = std::time::Instant::now();
+        if self
+            .last_drive_refresh
+            .is_some_and(|last| now.duration_since(last) < DRIVE_REFRESH_THROTTLE)
+        {
+            return;
+        }
+        self.last_drive_refresh = Some(now);
+
         let drives = crate::known_folders::available_drives();
         if drives == self.drives {
             return;
