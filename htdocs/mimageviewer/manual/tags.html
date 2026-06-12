@@ -51,30 +51,27 @@
   <main class="content">
     <h1 class="page-title">タグ機能</h1>
     <p class="page-desc">
-      画像に「#原神」「#風景」のような独自タグを付けて分類できる機能です。タグは XMP
-      <code>dc:subject</code> に書き込まれるので、Adobe Lightroom・Bridge・ExifTool
-      など写真管理ソフトでも読み取れます。
+      画像・動画・フォルダ・ZIP/PDF・対応アーカイブに「#原神」「#風景」のような
+      mIV 内タグを付けて分類できる機能です。タグは専用の <code>tags.db</code> に保存され、
+      ファイル本体や XMP メタデータは書き換えません。
     </p>
 
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        タグ機能は対応形式 (JPEG / PNG / WebP) の<strong>ファイル本体にメタデータを書き込み</strong>ます。
-        動画ファイル (MP4 / MKV / MOV など) の場合は本体を書き換えず、同じフォルダに同名の
-        <code>.xmp</code> サイドカーファイル (例: <code>video.mp4.xmp</code>) を作成して保存します。
-        初めて使うときは必ず<a href="#precautions">注意事項</a>を確認してください。
+        タグは mImageViewer 内部のカタログに保存される非破壊データです。Lightroom など他ソフトの
+        キーワードとは同期しません。旧バージョンや外部ソフトの <code>#</code> 付き XMP タグは初回起動時に
+        <code>tags.db</code> へ移行されます。
       </div>
     </div>
 
     <h2 id="register">1. タグを登録する</h2>
     <p>使うタグは事前にアプリに登録しておきます:</p>
     <ol>
-      <li>メニュー「タグ」→「タグを編集…」でタグ編集ダイアログを開きます。</li>
-      <li>初回のみ「タグを付与するとファイル内容を書き換えます」警告が表示されます。
-          内容を確認したら「了解しました」にチェックを入れて OK。</li>
+      <li>メニュー「タグ」→「タグの管理…」でタグ編集ダイアログを開きます。</li>
       <li>タグ名を入力 (例: <code>原神</code>、<code>ドール</code>、<code>風景</code>)。
           先頭の <code>#</code> は不要です (自動で付きます)。</li>
-      <li>OK で保存。メニューとツールバーの「タグ:」セクションに並びます。</li>
+      <li>OK で保存。ショートカット表示を ON にしたタグはメニューとツールバーの「タグ:」セクションに並びます。</li>
     </ol>
 
     <h3>タグ名のルール</h3>
@@ -90,19 +87,18 @@
 
     <h3>単一選択の場合 (トグル)</h3>
     <ol>
-      <li>グリッドで対象の画像を 1 つ選択。</li>
+      <li>グリッドで対象の項目を 1 つ選択。</li>
       <li>メニュー「タグ」→ タグ名をクリック、またはツールバーのタグボタンをクリック。</li>
       <li>未付与なら付与、付与済みなら削除されます (トグル)。</li>
     </ol>
 
     <h3>複数選択の場合 (バッチトグル)</h3>
-    <p>レーティングと同じ要領で、グリッドで複数の画像にチェックを入れてからタグボタンを押すと、
+    <p>レーティングと同じ要領で、グリッドで複数の項目にチェックを入れてからタグボタンを押すと、
     チェック済みの画像すべてに対してトグルが走ります。</p>
     <ul>
       <li>チェック方法: <kbd>Space</kbd> でカーソル位置をチェック、<kbd>Shift</kbd>+矢印で範囲チェック、
           <kbd>Ctrl</kbd>+クリックで個別チェック</li>
-      <li>各ファイルごとに独立して付与/削除を判定するので、既に付いているファイルは削除、
-          付いていないファイルは付与される (混在時はトーストに「N 件付与 / M 件削除」と出る)</li>
+      <li>対象すべてにタグが付いている場合は全削除、それ以外は対象すべてに付与します。</li>
       <li>チェックが 1 つも無い場合は単一選択 → なければフルスクリーン中のページにフォールバック</li>
     </ul>
 
@@ -115,25 +111,20 @@
     <a href="shortcuts.html">ショートカットキー</a>の「Undo / Redo」を参照してください。</p>
 
     <h3>タグをすべてクリア</h3>
-    <p>メニュー「タグ」→「選択中のファイルから mIV タグをクリア (N)」で、<code>#</code> で
-    始まる <code>dc:subject</code> 要素をまとめて削除します。</p>
+    <p>メニュー「タグ」→「選択中の項目からタグをクリア (N)」で、選択対象の mIV タグをまとめて削除します。</p>
     <ul>
-      <li><code>#</code> が付かない既存タグ (他ソフトで付けたタグ) は一切触りません。</li>
-      <li>逆に、<strong>他ソフトが <code>#</code> で始まるタグを付けていた場合は巻き込んで削除される</strong>
-          ことに注意してください (通常は問題ありません)。</li>
+      <li>削除されるのは <code>tags.db</code> 内の mIV タグだけです。</li>
+      <li>画像ファイル本体・XMP・他ソフトのキーワードは変更しません。</li>
     </ul>
 
     <h2 id="search">3. タグで検索する</h2>
-    <p>タグは <kbd>Ctrl</kbd>+<kbd>G</kbd> (お気に入り全体) や <kbd>Ctrl</kbd>+<kbd>F</kbd> (現在フォルダ) で
-    <code>#タグ名</code> と入力すれば絞り込めます:</p>
+    <p>タグの発見は専用のタグビューとスマートフィルタで行います。Ctrl+F / Ctrl+G の全文検索には
+    mIV タグは混ぜません。</p>
     <ul>
-      <li>複数タグは AND: <code>#原神 #風景</code></li>
-      <li>除外: <code>-#原神</code></li>
-      <li>Ctrl+G / Ctrl+F 検索バー右の「タグ」ドロップダウンから登録済みタグを選ぶと、クエリ欄に
-          <code>#タグ名</code> が自動挿入されます (タグ名を覚えていなくても OK)。</li>
-      <li>「検索対象」ドロップダウンで「タグ」を選ぶと、タグフィールドだけを対象にします。</li>
-      <li>OR 検索 (<code>□OR</code> チェック) を使うと、<code>klee #klee</code> のようにキーワードとタグの
-          両方を同時に拾えます。</li>
+      <li><kbd>Ctrl</kbd>+<kbd>T</kbd>: タグビューを開きます。空欄ではタグ一覧、タグを入力またはクリックすると該当項目をグリッドに表示します。</li>
+      <li>メニュー「タグ」→「タグビューを開く」でも開けます。</li>
+      <li>タグメニュー・ツールバー・メタデータパネルのタグを右クリックして「このタグで探す」を選ぶと、そのタグのタグビューを直接開きます。</li>
+      <li>現在の一覧をタグで絞りたい場合は、グリッド上部の「絞り込み: タグ」メニューを使います。ショートカットタグに加え、検索欄から全タグを選べます。</li>
     </ul>
     <p>検索機能全般の詳細は<a href="search.html">検索機能ページ</a>を参照してください。</p>
 
@@ -152,9 +143,7 @@
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        グリッドのタグバッジは<strong>アイテム索引</strong>から描画されます。お気に入りダイアログで
-        「アイテム索引」を ON にしたフォルダ配下のみバッジが出ます
-        (OFF のフォルダでも XMP へは書き込まれ、フルスクリーンでは緑で表示されます)。
+        グリッドのタグバッジは <code>tags.db</code> から読み込まれます。お気に入り登録や検索索引の ON/OFF には依存しません。
       </div>
     </div>
 
@@ -163,7 +152,7 @@
     <ul>
       <li><code>1 件に #ドール を付与</code> (未付与 → 付与)</li>
       <li><code>1 件から #ドール を削除</code> (付与済 → 削除)</li>
-      <li><code>#ドール: 3 件付与 / 2 件削除</code> (複数選択で混在する場合)</li>
+      <li><code>3 件に #ドール を付与</code> (複数選択で一括付与)</li>
       <li><code>5 件から mIV タグをクリア</code> (クリア操作)</li>
     </ul>
 
@@ -175,25 +164,17 @@
     </ul>
 
     <h2 id="compatibility">6. 他ソフトとの互換性</h2>
-    <p>タグは XMP <code>dc:subject</code> として書き込みます。これは写真管理ソフトで
-    広く採用されている標準フォーマットです:</p>
-    <ul>
-      <li><strong>Adobe Lightroom / Bridge</strong>: キーワードとして認識されます。</li>
-      <li><strong>ExifTool</strong>: <code>-XMP-dc:Subject</code> で読み取り可能。</li>
-      <li><strong>digiKam</strong> (無料・オープンソース) / <strong>XnView MP</strong>
-          (個人利用無料) など XMP に対応した画像管理ソフトでも読み取れます。</li>
-    </ul>
-    <p>他ソフトで既に <code>dc:subject</code> にタグが入っていても、mImageViewer は
-    <strong>既存要素を保持</strong>したまま <code>#タグ名</code> だけを追加します。</p>
+    <p>現在の mIV タグは mImageViewer 専用の <code>tags.db</code> に保存します。Lightroom・Bridge・ExifTool
+    などの外部キーワード欄へ自動書き込みは行いません。</p>
+    <p>旧バージョンや他ソフトが XMP <code>dc:subject</code> に保存した <code>#</code> 付きタグは、
+    初回起動時に <code>tags.db</code> へ移行されます。移行後の編集は mIV 内タグとして扱われ、外部ファイルには書き戻しません。</p>
 
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        <strong>Windows エクスプローラーの「タグ」欄について:</strong>
-        Windows エクスプローラーのプロパティ画面は XMP ではなく IPTC Keywords を優先して
-        読むため、mImageViewer で付けたタグは<strong>エクスプローラー側には表示されません</strong>。
-        写真管理ソフト (Lightroom / Bridge / digiKam / XnView MP) や ExifTool では
-        問題なく読み取れます。
+        <strong>外部アプリとの共有について:</strong>
+        mIV タグは現在のところ mImageViewer 内で完結します。写真管理ソフトへ渡したい場合は、
+        今後のエクスポート/バックアップ機能の対象です。
       </div>
     </div>
 
@@ -202,62 +183,42 @@
     <div class="box warn">
       <span class="box-icon">⚠️</span>
       <div class="box-body">
-        <strong>ファイル本体を書き換えます:</strong>
-        タグ付与はファイルのメタデータを書き換える操作です。万一書き込みに失敗した場合に備えて、
-        重要なファイルはあらかじめバックアップを取っておくことをおすすめします。
+        <strong>ファイル本体は書き換えません:</strong>
+        タグ付与・削除は <code>tags.db</code> の更新です。元画像や動画、ZIP/PDF は変更されません。
       </div>
     </div>
 
     <h3>対応フォーマット</h3>
     <table>
       <thead>
-        <tr><th>形式</th><th>タグの読み取り</th><th>タグの書き込み</th></tr>
+        <tr><th>形式</th><th>mIV タグ対象</th><th>備考</th></tr>
       </thead>
       <tbody>
-        <tr><td>JPEG (.jpg / .jpeg)</td><td>◯</td><td>◯</td></tr>
-        <tr><td>PNG</td><td>◯</td><td>◯</td></tr>
-        <tr><td>WebP</td><td>◯</td><td>◯</td></tr>
-        <tr><td>動画 (MP4 / MKV / MOV / AVI / WMV / MPG / MPEG)</td><td>◯ (サイドカー)</td><td>◯ (サイドカー)</td></tr>
-        <tr><td>HEIC / HEIF</td><td>◯</td><td>✗</td></tr>
-        <tr><td>TIFF / GIF / BMP / JXL / AVIF / RAW</td><td>条件付</td><td>✗</td></tr>
-        <tr><td>ZIP 内の画像</td><td>◯</td><td>✗</td></tr>
-        <tr><td>PDF</td><td>✗</td><td>✗</td></tr>
+        <tr><td>画像ファイル</td><td>◯</td><td>JPEG / PNG / WebP など表示対象の画像</td></tr>
+        <tr><td>動画ファイル</td><td>◯</td><td>MP4 / MKV / MOV など</td></tr>
+        <tr><td>フォルダ</td><td>◯</td><td>整理用のコンテナとしてタグ付け可能</td></tr>
+        <tr><td>ZIP / PDF ファイル</td><td>◯</td><td>本体ファイルにタグ付け可能</td></tr>
+        <tr><td>RAR / 7z / LZH などの対応アーカイブ</td><td>◯</td><td>変換前アーカイブのパスにタグ付け</td></tr>
+        <tr><td>ZIP 内画像 / PDF ページ</td><td>✗</td><td>ページ単位ではなくコンテナ本体へ付けます</td></tr>
       </tbody>
     </table>
-    <p>書き込み非対応の形式は、メニュー / ツールバーのタグボタンが<strong>グレーアウト</strong>して
-    選択できません。</p>
-
-    <h3>動画ファイルのサイドカー</h3>
-    <p>動画ファイル本体を書き換えると数 GB 規模の書き直しになり実用的でないため、動画では同名の
-    <code>.xmp</code> サイドカー (例: <code>movie.mp4</code> → <code>movie.mp4.xmp</code>) を
-    動画ファイルと同じフォルダに作成し、そこにタグを保存します。Adobe Lightroom / Bridge /
-    Premiere が標準採用している方式と互換なので、それらのソフトでも同じタグが読み書きできます。</p>
-    <p><strong>動画ファイルを別のフォルダ・別のドライブに移動するときは、サイドカーの
-    <code>.xmp</code> ファイルも一緒に移動してください。</strong>サイドカーが分離するとタグが
-    見えなくなります (元の場所に戻すか、新しい場所に <code>.xmp</code> を持っていけば復活します)。</p>
-
-    <h3>読み取り専用ファイル</h3>
-    <p>ファイル属性が「読み取り専用」になっているとタグ書き込みに失敗します。エラーが記録されるだけで
-    他のファイルへの処理は継続されます。</p>
 
     <h3>大量ファイルへの一括処理</h3>
     <p>数百枚以上のファイルへ一括でタグ付与する場合、処理には時間がかかります。処理は
     バックグラウンドで走り、完了すると画面下に結果トースト (<code>N 件に #tag を付与</code> 等) が
-    出ます。完了するまでウィンドウを閉じないでください (残りは破棄されます)。</p>
+    出ます。</p>
 
     <h2 id="search-index">8. 検索インデックスとの関係</h2>
-    <p>タグをファイルに書き込んだ直後、検索インデックスも自動で更新されるので次の Ctrl+G/Ctrl+F で
-    すぐに反映されます。</p>
-    <p>お気に入りの「アイテム索引」が OFF になっているフォルダのファイルにもタグは書き込めますが、
-    検索で即座にヒットさせるには
-    <a href="grid.html#お気に入り">お気に入りダイアログ</a>でアイテム索引を ON にしてください。</p>
+    <p>mIV タグは Ctrl+F / Ctrl+G の全文検索インデックスには投影しません。タグを探すときは
+    <kbd>Ctrl</kbd>+<kbd>T</kbd> のタグビュー、またはスマートフィルタのタグ欄を使います。</p>
+    <p>タグビューは <code>tags.db</code> を直接読むため、お気に入り登録やアイテム索引の ON/OFF に依存せず、タグ編集後すぐに反映されます。</p>
 
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        <strong>他ソフトで付けたタグも検索できます:</strong>
-        アイテム索引を作ると、<code>dc:subject</code> 内の <code>#</code> 始まりのタグを自動で取り込むので、
-        Lightroom 等でつけたタグも Ctrl+G で横断検索できるようになります。
+        <strong>タグビューで見つからない場合:</strong>
+        削除済み・移動済みのパスはタグビューから除外されます。外付けドライブや NAS が未接続の場合は、
+        誤削除を避けるためタグ情報を保持したまま検索結果からは表示しません。
       </div>
     </div>
   </main>

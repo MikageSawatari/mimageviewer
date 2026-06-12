@@ -128,7 +128,7 @@
     <p>ツールバーの下にある「絞り込み:」バーから、サムネイル表示と詳細表示のどちらでも同じ条件で絞り込めます。このバーは「環境設定 → ツールバー」で表示/非表示を切り替えられます。</p>
     <ul>
       <li><strong>種類 / 拡張子：</strong>画像、動画、ZIP、PDF や <code>.jpg</code> / <code>.png</code> などで絞り込みます。</li>
-      <li><strong>★ / タグ：</strong>既存のレーティング条件とタグで絞り込みます。タグは表示中の行から順にバックグラウンドで読み込まれ、未読の項目は候補に残したまま、読み込み完了時に絞り込み結果へ反映されます。</li>
+      <li><strong>★ / タグ：</strong>既存のレーティング条件と <code>tags.db</code> の mIV タグで絞り込みます。タグは表示中の行から順にバックグラウンドで読み込まれ、未読の項目は候補に残したまま、読み込み完了時に絞り込み結果へ反映されます。</li>
       <li><strong>日付 / サイズ / 状態：</strong>更新日時の期間、ファイルサイズ、補・レ・消・隠・文・回、タグ有無・★有無で絞り込みます。状態メニューでは「レ（補正レイヤー）」のように短縮表示と機能名を併記します。</li>
     </ul>
     <p>適用中の条件はチップで表示されます。「全解除」を押すとスマートフィルタと★フィルタをまとめて解除できます。タグや拡張子はフォルダ固有の値なので、別の場所へ移動すると解除されます。</p>
@@ -305,8 +305,8 @@
     <p>選択またはチェックしたファイルを <kbd>Delete</kbd> キーで削除できます。削除前に確認ダイアログが表示されます。
     通常はごみ箱に移動しますが、USB ドライブ、ネットワークドライブ、ゴミ箱を使わない設定のドライブ、ゴミ箱容量を超えるファイルなど、ごみ箱に移動できない可能性がある対象では完全削除になる場合があることを確認ダイアログで警告します。</p>
 
-    <h2 id="メタデータ検索">検索 (Ctrl+F / Ctrl+G / Ctrl+S)</h2>
-    <p>3 種類の検索モードを用途に合わせて使い分けます:</p>
+    <h2 id="メタデータ検索">検索 (Ctrl+F / Ctrl+G / Ctrl+S / Ctrl+T)</h2>
+    <p>4 種類の検索モードを用途に合わせて使い分けます:</p>
     <div class="table-wrap">
       <table>
         <thead>
@@ -316,20 +316,21 @@
           <tr><td><kbd>Ctrl</kbd>+<kbd>F</kbd></td><td>現在表示中の一覧のみ（非再帰）</td><td>今開いているフォルダ / ZIP 内で「どれだっけ」を探す（現在地フィルタ）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>G</kbd></td><td>お気に入り全体（アイテム索引）</td><td>登録済みフォルダを横断して「昔見たあの画像」を探す（アイテム検索）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>お気に入り配下のフォルダ / ZIP / PDF</td><td>過去に訪れたフォルダを名前で呼び出す（<a href="#お気に入り検索">コンテナ検索</a>）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>T</kbd></td><td>mIV タグ付き項目</td><td><code>tags.db</code> のタグから画像・動画・フォルダ・ZIP/PDF を探す（<a href="tags.html">タグビュー</a>）</td></tr>
         </tbody>
       </table>
     </div>
 
-    <p>3 モードの詳細、検索クエリ構文 (AND / OR / NOT / フレーズ / タグ)、絞り込みドロップダウン、
-    インデックスの作り方は<a href="search.html">検索機能ページ</a>にまとめています。</p>
+    <p>Ctrl+S / Ctrl+F / Ctrl+G の詳細、検索クエリ構文 (AND / OR / NOT / フレーズ)、絞り込みドロップダウン、
+    インデックスの作り方は<a href="search.html">検索機能ページ</a>にまとめています。タグで探す場合は
+    <a href="tags.html">タグ機能ページ</a>も参照してください。</p>
 
     <div class="box info">
       <span class="box-icon">💡</span>
       <div class="box-body">
         <strong>OR 検索:</strong>
         検索バー右端の <code>□OR</code> チェックを入れると、語をいずれか 1 つでも含めばヒット扱いになります
-        (除外 <code>-word</code> は常に AND)。例: <code>klee #klee</code> でキーワード・タグどちらか片方で
-        「klee」を含む画像を拾えます。
+        (除外 <code>-word</code> は常に AND)。例: <code>klee クレー</code> でどちらか片方の表記を含む画像を拾えます。
       </div>
     </div>
 
@@ -498,12 +499,12 @@
     <ul>
       <li><strong>コンテナ索引</strong>: フォルダ / ZIP / PDF の<strong>名前</strong>の索引（Ctrl+S コンテナ検索の対象）。
           軽量で容量コストも小さい。</li>
-      <li><strong>アイテム索引</strong>: 画像 / PDF / 動画の<strong>全文</strong>（ファイル名 + EXIF + XMP + AI プロンプト + PDF メタ + 動画メタ + タグ）の索引（Ctrl+G アイテム検索 / グリッドのタグバッジ / タグ書き込み後の即時反映）。
+      <li><strong>アイテム索引</strong>: 画像 / PDF / 動画の<strong>全文</strong>（ファイル名 + EXIF + XMP + AI プロンプト + PDF メタ + 動画メタ + サイドカー）の索引（Ctrl+G アイテム検索）。
           10 万件規模でも高速だがディスク容量を使う。</li>
     </ul>
     <p>進捗はお気に入りダイアログ内の各行 (<code>⏳ 起動中</code> / <code>⏳ スキャン中</code> / <code>✅</code>)
     とウィンドウタイトルバーのサフィックス <code>(インデックス更新中)</code> で確認できます。
-    詳細は<a href="search.html#search-index">検索機能 §8</a>を参照。</p>
+    詳細は<a href="search.html#search-index">検索機能 §9</a>を参照。</p>
 
     <div class="box info">
       <span class="box-icon">ℹ️</span>
@@ -524,7 +525,7 @@
       <li>× ボタンまたは Esc で検索を閉じ、元のフォルダに戻ります。</li>
       <li><strong>コンテナ索引が OFF の場合は検索結果が出ません。</strong>
           お気に入りダイアログでコンテナ索引のチェックを ON にしてください
-          (詳細は<a href="search.html#search-index">検索機能 §8</a>)。</li>
+          (詳細は<a href="search.html#search-index">検索機能 §9</a>)。</li>
     </ul>
 
     <h2>サムネイルキャッシュ</h2>

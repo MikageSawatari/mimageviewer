@@ -51,11 +51,11 @@
   <main class="content">
     <h1 class="page-title">検索機能</h1>
     <p class="page-desc">
-      mImageViewer には 3 種類の検索モード (<kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>) があります。
-      「S はフォルダ・ZIP・PDF を探す / G は画像・PDF・動画 1 件ずつを探す / F は今見ている場所を絞る」と覚えると使い分けが簡単です。
+      mImageViewer には 4 種類の検索モード (<kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> / <kbd>Ctrl</kbd>+<kbd>T</kbd>) があります。
+      「S はフォルダ・ZIP・PDF を探す / G は画像・PDF・動画 1 件ずつを探す / F は今見ている場所を絞る / T はタグで探す」と覚えると使い分けが簡単です。
     </p>
 
-    <h2 id="overview">1. 3 つの検索モードの使い分け</h2>
+    <h2 id="overview">1. 4 つの検索モードの使い分け</h2>
 
     <div class="scroll-x">
       <table>
@@ -80,15 +80,22 @@
             <td><kbd>Ctrl</kbd>+<kbd>F</kbd></td>
             <td><strong>現在地フィルタ</strong></td>
             <td><strong>今表示中のグリッド</strong>のすべてのアイテム</td>
-            <td>フォルダ・ZIP・PDF はファイル名。画像・動画はファイル名 + EXIF / XMP / AI プロンプト / PDF メタ / 動画メタ / タグ / サイドカー</td>
+            <td>フォルダ・ZIP・PDF はファイル名。画像・動画はファイル名 + EXIF / XMP / AI プロンプト / PDF メタ / 動画メタ / サイドカー</td>
             <td>開いているフォルダを絞り込む (Lightroom のフィルタに近い)</td>
           </tr>
           <tr>
             <td><kbd>Ctrl</kbd>+<kbd>G</kbd></td>
             <td><strong>アイテム検索</strong></td>
             <td>お気に入り全体の<strong>画像 / PDF / 動画</strong></td>
-            <td>ファイル名 / EXIF / XMP / AI プロンプト / PDF メタ / 動画メタ / タグ / サイドカー</td>
+            <td>ファイル名 / EXIF / XMP / AI プロンプト / PDF メタ / 動画メタ / サイドカー</td>
             <td>お気に入り横断で 1 枚の画像を掘り出す</td>
+          </tr>
+          <tr>
+            <td><kbd>Ctrl</kbd>+<kbd>T</kbd></td>
+            <td><strong>タグビュー</strong></td>
+            <td><strong>mIV タグ付き項目</strong></td>
+            <td><code>tags.db</code> に保存された mIV タグ</td>
+            <td>タグから画像・動画・フォルダ・ZIP/PDF を探す</td>
           </tr>
         </tbody>
       </table>
@@ -102,6 +109,7 @@
           <li>フォルダ・ZIP・PDF を名前で探したい → <kbd>Ctrl</kbd>+<kbd>S</kbd> (コンテナ検索)</li>
           <li>今開いている場所の中で絞り込みたい → <kbd>Ctrl</kbd>+<kbd>F</kbd> (現在地フィルタ)</li>
           <li>お気に入り全体から画像・動画 1 件を見つけたい → <kbd>Ctrl</kbd>+<kbd>G</kbd> (アイテム検索)</li>
+          <li>タグで横断的に探したい → <kbd>Ctrl</kbd>+<kbd>T</kbd> (タグビュー)</li>
         </ul>
       </div>
     </div>
@@ -150,7 +158,7 @@
     <p>現在地フィルタはグリッドに表示されているすべての種類のアイテムを対象にします:</p>
     <ul>
       <li><strong>フォルダ / ZIP / PDF ファイル</strong>: ファイル名 (basename) でマッチ判定します。</li>
-      <li><strong>画像 / 動画</strong>: 「検索対象」の設定に応じて、ファイル名・EXIF・XMP・AI プロンプト・PDF メタ・動画メタ・タグ・サイドカーを検索します。</li>
+      <li><strong>画像 / 動画</strong>: 「検索対象」の設定に応じて、ファイル名・EXIF・XMP・AI プロンプト・PDF メタ・動画メタ・サイドカーを検索します。</li>
       <li><strong>PDF ファイル</strong>: ファイル名に加え、検索対象が「PDF メタ情報」または「すべて」のときはタイトル・著者・件名・キーワードも対象になります。</li>
     </ul>
     <p>「検索対象」を EXIF など画像専用の次元に設定すると、その情報を持たないフォルダ・ZIP・PDF は
@@ -194,11 +202,22 @@
     <ul>
       <li>CJK (日本語・中国語・韓国語): <strong>2 文字以上</strong></li>
       <li>ASCII / 数字: <strong>3 文字以上</strong></li>
-      <li>タグトークン (<code>#タグ名</code>) はこの制約の対象外 (完全一致のため)</li>
     </ul>
     <p>Ctrl+F と Ctrl+S にはこの制約はありません (直接文字列一致のため短いトークンでも動きます)。</p>
 
-    <h2 id="query-syntax">5. 検索クエリ構文 (3 モード共通)</h2>
+    <h2 id="ctrl-t">5. Ctrl+T: タグビュー</h2>
+    <p><kbd>Ctrl</kbd>+<kbd>T</kbd> で、mImageViewer 内部の <code>tags.db</code> に保存されたタグから項目を探します。
+    タグはファイル本体や XMP には書き込まれず、Ctrl+F / Ctrl+G の全文検索インデックスにも投影されません。
+    タグを探すときはこのタグビュー、またはグリッドのスマートフィルタのタグ欄を使います。</p>
+    <ul>
+      <li>空欄では登録済みタグの一覧を表示します。</li>
+      <li>タグを入力またはクリックすると、そのタグが付いた画像・動画・フォルダ・ZIP/PDF などをグリッドに表示します。</li>
+      <li>タグメニュー・ツールバー・メタデータパネルのタグを右クリックして「このタグで探す」からも開けます。</li>
+      <li>削除済み・移動済みのパスは結果から除外されます。</li>
+    </ul>
+    <p>詳しい使い方は<a href="tags.html">タグ機能</a>を参照してください。</p>
+
+    <h2 id="query-syntax">6. 検索クエリ構文 (Ctrl+S / Ctrl+F / Ctrl+G 共通)</h2>
 
     <div class="scroll-x">
       <table>
@@ -210,8 +229,6 @@
           <tr><td><code>-word</code></td><td>NOT: 含まない (除外は常に AND)</td><td><code>夕焼け -曇り</code></td></tr>
           <tr><td><code>"word1 word2"</code></td><td>フレーズ: 連続する文字列</td><td><code>"golden hour"</code></td></tr>
           <tr><td><code>-"word1 word2"</code></td><td>フレーズの NOT</td><td><code>-"low quality"</code></td></tr>
-          <tr><td><code>#タグ名</code></td><td>タグ検索 (<code>#</code> 込みで一致)</td><td><code>#原神 #風景</code></td></tr>
-          <tr><td><code>-#タグ名</code></td><td>タグの除外</td><td><code>#風景 -#夜景</code></td></tr>
         </tbody>
       </table>
     </div>
@@ -239,14 +256,9 @@
           <td>いずれかの語を含むもの</td>
         </tr>
         <tr>
-          <td><code>klee #klee</code></td>
-          <td>(キーワード "klee" と タグ "#klee") を両方含む</td>
-          <td>キーワードかタグのいずれかで "klee" を含む</td>
-        </tr>
-        <tr>
-          <td><code>klee #klee -sleep -nsfw</code></td>
-          <td>"klee" と "#klee" を両方含み、"sleep" も "nsfw" も含まない</td>
-          <td>"klee" か "#klee" のいずれかを含み、"sleep" も "nsfw" も含まない</td>
+          <td><code>klee paimon -sleep -nsfw</code></td>
+          <td>"klee" と "paimon" を両方含み、"sleep" も "nsfw" も含まない</td>
+          <td>"klee" か "paimon" のいずれかを含み、"sleep" も "nsfw" も含まない</td>
         </tr>
       </tbody>
     </table>
@@ -255,13 +267,13 @@
       <span class="box-icon">💡</span>
       <div class="box-body">
         <strong>いつ OR モードを使う?</strong>
-        同じ対象を別表記で呼ぶ場合 (例: キーワード <code>klee</code> と タグ <code>#klee</code> の両方を見たい、
-        <code>sunset</code> と <code>夕焼け</code> をまとめて拾いたい、など) に便利です。
-        OR にしても除外語は AND なので、<code>klee #klee -nsfw</code> で安全に広く拾えます。
+        同じ対象を別表記で呼ぶ場合 (例: <code>sunset</code> と <code>夕焼け</code> をまとめて拾いたい、
+        <code>klee</code> と <code>クレー</code> のどちらでも見つけたい、など) に便利です。
+        OR にしても除外語は AND なので、<code>klee クレー -nsfw</code> で安全に広く拾えます。
       </div>
     </div>
 
-    <h2 id="filters">6. 絞り込みドロップダウン</h2>
+    <h2 id="filters">7. 絞り込みドロップダウン</h2>
     <p>検索バー右側のドロップダウンで、検索範囲をさらに狭めることができます。
     どのバーがどのドロップダウンを持つかは下表のとおり:</p>
     <p>Ctrl+G の検索バーは横幅が足りないと折り返して表示されます。Ctrl+G のドロップダウンを
@@ -278,7 +290,6 @@
           <tr><td>種別 (画像/PDF/動画)</td><td>—</td><td>—</td><td>◯</td></tr>
           <tr><td>検索対象 (ファイル名/EXIF/XMP/…)</td><td>—</td><td>◯</td><td>◯</td></tr>
           <tr><td>集約トグル</td><td>—</td><td>—</td><td>◯</td></tr>
-          <tr><td>タグピッカー</td><td>—</td><td>◯</td><td>◯</td></tr>
           <tr><td>OR 検索チェック</td><td>◯</td><td>◯</td><td>◯</td></tr>
         </tbody>
       </table>
@@ -298,7 +309,7 @@
     「PDF のタイトルだけで検索したい」「動画の説明文だけ見たい」といった用途に使います。</p>
 
     <h3 id="target">検索対象 (Ctrl+F / Ctrl+G 共通)</h3>
-    <p>どのメタデータソースを検索するかを選びます。「すべて」だと以下 8 ソースの OR:</p>
+    <p>どのメタデータソースを検索するかを選びます。「すべて」だと以下 7 ソースの OR:</p>
     <ul>
       <li><strong>ファイル名</strong>: ファイル名 (拡張子込み)</li>
       <li><strong>EXIF</strong>: カメラ本体の撮影情報 (メーカー・モデル・レンズ・絞り etc.)</li>
@@ -307,22 +318,18 @@
           (Negative Prompt は自動で除外)</li>
       <li><strong>PDF メタ情報</strong>: PDF のタイトル / 著者 / 件名 / キーワード</li>
       <li><strong>動画メタ情報</strong>: FFmpeg が読める動画のタイトル / 作者 / 説明 / URL / チャプター名</li>
-      <li><strong>タグ</strong>: mImageViewer の<a href="tags.html">タグ機能</a>で付けた <code>#タグ名</code></li>
       <li><strong>サイドカー</strong>: 画像と同じ場所に置かれた<strong>同名の JSON / テキストファイル</strong>
           (<code>画像名.json</code> / <code>画像名.txt</code>) の中身。作者名・作品名・元 URL・各種ラベルなどを
-          そのまま全文検索できます。<a href="tags.html">タグ機能</a> (<code>#タグ名</code>) とは別系統で、
-          中身の語をそのままキーワードとして検索します (例: ラベルや作者名)。読み取り専用で、
+          そのまま全文検索できます。mIV タグとは別系統で、中身の語をそのままキーワードとして検索します (例: ラベルや作者名)。読み取り専用で、
           サイドカーファイルを書き換えることはありません。</li>
     </ul>
     <p>単一ソースに絞ると、そのソース以外の情報はノイズとして弾かれます。例えば
     「EXIF のレンズ名だけで探したい」「AI プロンプトに EXIF が混ざって困る」といった場面で使います。</p>
 
-    <h3>タグピッカー (Ctrl+F / Ctrl+G 共通)</h3>
-    <p>検索バー右の「タグ」ドロップダウンから登録済みタグを選ぶと、クエリ欄に <code>#タグ名</code> が
-    自動で追記されます。タグ名の正確な表記を覚えていなくても使えます (<a href="tags.html">タグ機能</a>参照)。
-    ZIP 内を表示中の Ctrl+F はファイル名フィルタに固定されるため、このときタグピッカーは無効になります。</p>
+    <p>mIV タグは全文検索の検索対象には含まれません。タグで探す場合は <kbd>Ctrl</kbd>+<kbd>T</kbd> のタグビュー、
+    またはグリッドのスマートフィルタのタグ欄を使います。</p>
 
-    <h2 id="results">7. 結果の読み方</h2>
+    <h2 id="results">8. 結果の読み方</h2>
 
     <h3>Ctrl+F の結果表示</h3>
     <ul>
@@ -336,7 +343,7 @@
     検索バーの「集約」トグルボタンで切り替えます。</p>
     <ul>
       <li><strong>一覧</strong>: ヒットしたアイテムをサムネイル単位でフラットに並べます。
-          少数ヒットやタグ検索など「直接 1 枚を見たい」用途に向いています。
+          少数ヒットなど「直接 1 枚を見たい」用途に向いています。
           並び順は通常グリッドのソート設定に従います。</li>
       <li><strong>集約</strong>: ヒットを親フォルダ単位でまとめ、フォルダごとにヒット件数バッジ付きのタイルで表示します。
           大量ヒット時に全体像を把握するのに向いています。
@@ -351,7 +358,7 @@
       <li>大量ヒット時は 10000 件で打ち切られます (検索バーに「絞り込みキーワードを追加してください」と出ます)。</li>
     </ul>
 
-    <h2 id="search-index">8. 検索索引の作成と保守</h2>
+    <h2 id="search-index">9. 検索索引の作成と保守</h2>
     <p>mImageViewer は 2 種類の索引を持ちます。どちらも<strong>既定では OFF</strong>で、
     お気に入りダイアログで個別に ON にする必要があります。</p>
 
@@ -369,8 +376,8 @@
           </tr>
           <tr>
             <td><strong>アイテム索引</strong></td>
-            <td>画像 / PDF / 動画の全文: ファイル名 + EXIF + XMP + AI プロンプト + PDF メタ + 動画メタ + タグ + サイドカー</td>
-            <td>Ctrl+G (アイテム検索) / グリッドのタグバッジ / タグ書き込み後の即時反映</td>
+            <td>画像 / PDF / 動画の全文: ファイル名 + EXIF + XMP + AI プロンプト + PDF メタ + 動画メタ + サイドカー</td>
+            <td>Ctrl+G (アイテム検索)</td>
             <td>OFF</td>
           </tr>
         </tbody>
@@ -413,7 +420,7 @@
       </li>
     </ul>
 
-    <h2 id="shortcuts">9. 関連ショートカット</h2>
+    <h2 id="shortcuts">10. 関連ショートカット</h2>
 
     <div class="scroll-x">
       <table>
