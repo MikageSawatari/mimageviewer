@@ -27,7 +27,7 @@ OS 予約ショートカット (例: Alt+F4 / Alt+Tab / Win キー系) は keyma
 
 | キー | 動作 |
 |---|---|
-| <kbd>Backspace</kbd> | 親フォルダへ。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
+| <kbd>Backspace</kbd> | 親フォルダへ。ドライブルート (`C:\` など) ではドライブ一覧へ戻り、元ドライブを選択状態にする。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op。タグビュー (Ctrl+T) 中は no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd>・<kbd>Ctrl</kbd>+<kbd>T</kbd> 再押下)。Ctrl+F フィルタ中は、フィルタを実行したフォルダだけ親移動を no-op にする。検索結果から子フォルダへ入った後は通常どおり親へ戻れる |
 | <kbd>Alt</kbd>+<kbd>↑</kbd> | 親フォルダへ (<kbd>Backspace</kbd> と同じ。Explorer 慣習に合わせた代替ショートカット。ドライブルートではドライブ一覧へ戻る。Ctrl+F フィルタ元フォルダでは no-op) |
 | <kbd>Alt</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | フォルダ履歴を戻る / 進む (フォルダバーの ←/→ と同じ。検索中・ドライブ一覧中は無効) |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> | ツリー順で前のフォルダへ (DFS pre-order、画像なしフォルダは skip_limit までスキップ)。検索中は前のヒットフォルダへ移動 (`global_search_ctrl_nav` / `favsearch_ctrl_nav`)。★固定 中は snapshot 内の前 entry へ |
@@ -41,6 +41,7 @@ OS 予約ショートカット (例: Alt+F4 / Alt+Tab / Win キー系) は keyma
 | <kbd>Shift</kbd>+<kbd>F9</kbd> / <kbd>Shift</kbd>+<kbd>F10</kbd> | チェック済み画像 / 選択中画像から隠蔽マスクを削除 |
 | <kbd>P</kbd> | 選択中アイテムを現在のコンテナの代表サムネに固定 / 解除 (toggle、フォルダバー 📌 の左クリックと同等)。ZIP 内の ZipDir も通常フォルダと同じ cascade で子の pin に追従する。pin 不能アイテム / 検索アグリゲート / zip_nav のない変換キャッシュ状態では silent no-op。**動画フルスクリーンの P と合わせて P = Pin に統一** |
 | <kbd>T</kbd> | 左側のフォルダツリーペインの表示 / 非表示を切り替える。表示時は現在フォルダへツリーカーソルを移す。非表示にする時、ツリーカーソルが別フォルダへ動いていれば <kbd>Enter</kbd> 相当でそのフォルダへ移動してグリッドへ戻る (動いていなければ単に閉じる) |
+| <kbd>Ctrl</kbd>+<kbd>T</kbd> | タグビューを開く / 閉じる。`tags.db` のタグから候補を表示し、選んだタグを持つフォルダ・画像・動画・ZIP/PDF/対応アーカイブを検索結果グリッドに表示する。フルスクリーン中はテキスト注釈モードの <kbd>Ctrl</kbd>+<kbd>T</kbd> を優先する |
 | <kbd>X</kbd> | 選択中の画像 / ZIP 内画像 / PDF ページを比較スロットへピン留め / 同じ画像なら解除 |
 | <kbd>Space</kbd> | 選択中アイテムをチェック ON/OFF。画像 / 動画 / ZIP・PDF 本体 / 変換前アーカイブ / ZIP 内画像 / PDF ページが対象 (**フォルダとドライブ一覧は整理対象外**) |
 | <kbd>Ctrl</kbd>+<kbd>A</kbd> | 表示中のチェック可能なアイテムを全選択 |
@@ -251,7 +252,7 @@ snapshot 中のキー操作は以下のように再定義される:
 | スライドショー末尾 | snapshot 内の次 playable entry へ自動遷移 (= ★5 folder 巡回の主用途) |
 | ★ filter ボタン | 操作可能、ただし top-level grid 表示は snapshot のまま凍結 (= captured folder の中身には作用する) |
 | <kbd>Backspace</kbd> / <kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>Alt</kbd>+<kbd>←</kbd>/<kbd>→</kbd> / フォルダツリー / お気に入りクリック / フォルダパス入力 | 無効、toast「スナップショット中は他のフォルダに移動できません」 |
-| <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> | snapshot 自動解除 + 検索 mode 起動 (= scope mutual exclusion) |
+| <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> / <kbd>Ctrl</kbd>+<kbd>T</kbd> | snapshot 自動解除 + 検索 mode 起動 (= scope mutual exclusion) |
 | `[★固定]` ボタン再クリック | snapshot 解除 (= 元のフォルダ表示に戻る) |
 
 snapshot 末尾到達時は `FsBoundaryHint::NoImageFolder` で boundary hint を表示。

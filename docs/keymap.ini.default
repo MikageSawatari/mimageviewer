@@ -55,6 +55,7 @@
 # GridDeselect.2 = Ctrl+Shift+A ; チェックをすべて解除する
 # GridToggleCheck = Space ; 選択中の項目のチェックを切り替える
 # GridToggleFolderTreePane = T ; フォルダツリーペインの表示を切り替える
+# GridTagView = Ctrl+T ; タグビューを開く
 # GridRotateCw = R ; 選択中の画像を右に90度回転する
 # GridRotateCcw = L ; 選択中の画像を左に90度回転する
 # GridPin = P ; 選択中の項目を代表サムネイルに固定または解除する

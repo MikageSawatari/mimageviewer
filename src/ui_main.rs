@@ -804,6 +804,12 @@ impl App {
                         ui.close();
                     }
 
+                    // タグビュー (Ctrl+T)
+                    if ui.button("タグビュー (Ctrl+T)").clicked() {
+                        self.toggle_tag_view();
+                        ui.close();
+                    }
+
                     // 区切り線
                     ui.separator();
 
@@ -862,6 +868,10 @@ impl App {
                         self.open_tag_editor();
                         ui.close();
                     }
+                    if ui.button("タグビューを開く").clicked() {
+                        self.open_tag_view();
+                        ui.close();
+                    }
                     ui.separator();
                     let selection_count = self.tag_target_path_count();
                     let has_target = selection_count > 0;
@@ -889,10 +899,27 @@ impl App {
                     if tags_snapshot.is_empty() {
                         ui.label(egui::RichText::new("（ピン留めタグなし）").weak());
                     } else {
+                        ui.menu_button("タグビューで探す", |ui| {
+                            for tag in &tags_snapshot {
+                                if ui.button(format!("#{}", tag.name)).clicked() {
+                                    self.open_tag_view_for_tag(&tag.name);
+                                    ui.close();
+                                }
+                            }
+                        });
+                        ui.separator();
                         for tag in &tags_snapshot {
                             let label = format!("#{}", tag.name);
                             let btn = egui::Button::new(label);
-                            if ui.add_enabled(has_target, btn).clicked() {
+                            let resp = ui.add_enabled(has_target, btn);
+                            let clicked = resp.clicked();
+                            resp.context_menu(|ui| {
+                                if ui.button("このタグで探す").clicked() {
+                                    self.open_tag_view_for_tag(&tag.name);
+                                    ui.close();
+                                }
+                            });
+                            if clicked {
                                 self.request_tag_toggle_for_selection(&tag.name);
                                 ui.close();
                             }
@@ -1271,6 +1298,7 @@ impl App {
         let mut toolbar_sort_changed = false;
         let mut toolbar_rating_changed = false;
         let mut toolbar_tag_click: Option<String> = None;
+        let mut toolbar_tag_search: Option<String> = None;
         let mut toolbar_combo_popup_open = false;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -1697,7 +1725,14 @@ impl App {
                     for name in toolbar_tags {
                         let label = format!("#{name}");
                         let resp = ui.add_enabled(has_target, egui::Button::new(label));
-                        if resp.clicked() {
+                        let clicked = resp.clicked();
+                        resp.context_menu(|ui| {
+                            if ui.button("このタグで探す").clicked() {
+                                toolbar_tag_search = Some(name.clone());
+                                ui.close();
+                            }
+                        });
+                        if clicked {
                             toolbar_tag_click = Some(name);
                         }
                     }
@@ -1746,6 +1781,9 @@ impl App {
         // ツールバーのタグ項目クリック
         if let Some(name) = toolbar_tag_click {
             self.request_tag_toggle_for_selection(&name);
+        }
+        if let Some(name) = toolbar_tag_search {
+            self.open_tag_view_for_tag(&name);
         }
 
         // (旧) VST3 プラグイン管理ボタンの click handler はツールバーボタン削除に伴い撤去。
@@ -1990,6 +2028,31 @@ impl App {
             for tag in &self.settings.facet_filter.tags {
                 counts.entry(tag.clone()).or_insert(0);
             }
+            let query_key = crate::tags_db::normalize_tag_key(&self.facet_tag_search_query);
+            let mut choices: BTreeMap<String, (String, usize)> = BTreeMap::new();
+            for (tag_key, count) in &counts {
+                if shortcut_keys.contains(tag_key)
+                    || self.settings.facet_filter.tags.contains(tag_key)
+                {
+                    let display = display_names
+                        .get(tag_key)
+                        .cloned()
+                        .unwrap_or_else(|| tag_key.clone());
+                    choices.insert(tag_key.clone(), (display, *count));
+                }
+            }
+            if !query_key.is_empty() {
+                if let Some(db) = self.tags_db.as_ref() {
+                    for summary in db.find_by_prefix(&self.facet_tag_search_query, 50) {
+                        let display = display_names
+                            .get(&summary.tag_key)
+                            .cloned()
+                            .unwrap_or(summary.tag);
+                        let count = counts.get(&summary.tag_key).copied().unwrap_or(0);
+                        choices.entry(summary.tag_key).or_insert((display, count));
+                    }
+                }
+            }
             ui.horizontal(|ui| {
                 ui.label("一致:");
                 let mut mode = self.settings.facet_filter.tag_mode;
@@ -2030,20 +2093,26 @@ impl App {
                 self.settings.facet_filter.include_untagged = include_untagged;
                 changed = true;
             }
-            if counts.is_empty() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("検索:");
+                let mut output = egui::TextEdit::singleline(&mut self.facet_tag_search_query)
+                    .hint_text("#タグ")
+                    .desired_width(150.0)
+                    .min_size(egui::vec2(150.0, 20.0))
+                    .show(ui);
+                let _ = crate::ui_helpers::singleline_text_edit_context_menu(
+                    ui,
+                    &mut output,
+                    &mut self.facet_tag_search_query,
+                );
+            });
+            ui.separator();
+            if choices.is_empty() {
                 ui.label("タグ候補なし");
             }
-            for (tag_key, count) in counts {
-                if !shortcut_keys.contains(&tag_key)
-                    && !self.settings.facet_filter.tags.contains(&tag_key)
-                {
-                    continue;
-                }
+            for (tag_key, (display, count)) in choices {
                 let mut selected = self.settings.facet_filter.tags.contains(&tag_key);
-                let display = display_names
-                    .get(&tag_key)
-                    .cloned()
-                    .unwrap_or_else(|| tag_key.clone());
                 let text = format!("#{} ({count})", display);
                 if ui.checkbox(&mut selected, text).changed() {
                     if selected {
@@ -2291,9 +2360,10 @@ impl App {
                 .any(|fav| crate::folder_tree::path_eq(&fav.path, p))
         });
 
-        // 検索 (Ctrl+G / Ctrl+S) 中はアドレスバーの ←/→/履歴 を無効化し、⬆/▲▼ を
+        // 検索 (Ctrl+G / Ctrl+S / Ctrl+T) 中はアドレスバーの ←/→/履歴 を無効化し、⬆/▲▼ を
         // 検索仮想階層用に転用する。closure 内で複数のボタン分岐から参照するため事前計算。
-        let search_active = self.global_search.active || self.favsearch.active;
+        let search_active =
+            self.global_search.active || self.favsearch.active || self.tag_view.active;
         // 検索の仮想階層でドリルイン中か (= ⬆ で 1 段戻れる / ▲▼ で前後ヒットへ
         // 動ける状態。最上位ではこれらを disabled にする条件)。
         let search_drilled_in = (self.global_search.active && self.global_search.drill.is_some())
@@ -2305,7 +2375,9 @@ impl App {
         let folder_rating = self.current_folder_rating();
         let thumbnail_count = (!self.global_search.active
             && !self.favsearch.active
+            && !self.tag_view.active
             && !self.items_are_global_search_view
+            && !self.items_are_tag_view
             && self.search_filter.is_none()
             && self.search_pending.is_none())
         .then(|| thumbnail_count_label(&self.items, &self.visible_indices));
@@ -3100,6 +3172,119 @@ impl App {
         }
         if query_changed && self.favsearch.query != self.favsearch.last_executed {
             self.execute_favsearch();
+        }
+    }
+
+    /// タグビュー (Ctrl+T) の検索バーを描画する。
+    pub(crate) fn render_tag_view_bar(&mut self, ctx: &egui::Context) {
+        if !self.tag_view.active {
+            self.tag_view.has_focus = false;
+            return;
+        }
+
+        let raw_enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let escape_pressed = self.dialog_escape_pressed(ctx);
+
+        let mut close_requested = false;
+        let mut query_changed = false;
+        let mut clicked_tag: Option<String> = None;
+
+        egui::TopBottomPanel::top("tag_view_bar").show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("タグビュー:");
+                let mut output = egui::TextEdit::singleline(&mut self.tag_view.query)
+                    .hint_text("#タグ")
+                    .desired_width(260.0)
+                    .min_size(egui::vec2(260.0, 20.0))
+                    .show(ui);
+                let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+                    ui,
+                    &mut output,
+                    &mut self.tag_view.query,
+                );
+                let response = output.response;
+
+                if self.tag_view.focus_request {
+                    self.tag_view.focus_request = false;
+                    response.request_focus();
+                }
+                self.tag_view.has_focus = response.has_focus();
+
+                if response.changed() || menu_changed {
+                    query_changed = true;
+                }
+                if response.lost_focus() && raw_enter_pressed {
+                    query_changed = true;
+                }
+
+                if ui
+                    .small_button("×")
+                    .hover_tip("タグビューを閉じる")
+                    .clicked()
+                {
+                    close_requested = true;
+                }
+
+                if self.tag_view_pending.is_some() {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("検索中...")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(180, 180, 80)),
+                    );
+                } else if let Some(msg) = self.tag_view.reject_message.as_ref() {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(msg)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(190, 80, 80)),
+                    );
+                } else if !self.tag_view.last_executed.trim().is_empty() {
+                    ui.separator();
+                    let suffix = if self.tag_view.truncated {
+                        " 件以上"
+                    } else {
+                        " 件"
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{}{}", self.tag_view.result_count, suffix))
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(140)),
+                    );
+                }
+
+                if self.tag_view.query.trim().is_empty() && !self.tag_view.summaries.is_empty() {
+                    ui.separator();
+                    let summaries: Vec<_> =
+                        self.tag_view.summaries.iter().take(20).cloned().collect();
+                    for summary in summaries {
+                        let label = format!("#{} ({})", summary.tag, summary.count);
+                        if ui.small_button(label).clicked() {
+                            clicked_tag = Some(format!("#{}", summary.tag));
+                        }
+                    }
+                }
+            });
+            ui.add_space(2.0);
+        });
+
+        if let Some(tag) = clicked_tag {
+            self.tag_view.query = tag;
+            self.tag_view.last_executed.clear();
+            query_changed = true;
+        }
+
+        if !self.any_dialog_open() && escape_pressed {
+            close_requested = true;
+        }
+
+        if close_requested {
+            self.close_tag_view();
+            return;
+        }
+        if query_changed && self.tag_view.query != self.tag_view.last_executed {
+            self.execute_tag_view();
         }
     }
 

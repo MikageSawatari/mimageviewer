@@ -1191,7 +1191,7 @@ fn hash_adjust_final_params(
     })
 }
 
-/// 3 種の検索モード。相互排他制御 (`close_other_search_bars`) 用。
+/// 検索モード。相互排他制御 (`close_other_search_bars`) 用。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SearchMode {
     /// Ctrl+F: ローカルフォルダのメタデータ検索
@@ -1200,6 +1200,8 @@ pub(crate) enum SearchMode {
     Favsearch,
     /// Ctrl+G: お気に入り全体のメタデータ検索
     Global,
+    /// Ctrl+T: tags.db 直引きのタグビュー
+    TagView,
 }
 
 /// 非同期メタデータ検索 (Ctrl+F) の状態。
@@ -3375,6 +3377,8 @@ pub struct App {
     /// このフラグが true のときだけ (Codex P2): Ctrl+G から実フォルダ/ZIP/PDF を
     /// 開いた後に rating 変更して合成ビューが書き戻される事故を防ぐ。
     pub(crate) items_are_global_search_view: bool,
+    /// 現在の `items` がタグビュー (Ctrl+T) の一時結果一覧かを示す。
+    pub(crate) items_are_tag_view: bool,
     /// 現在の `items` がドライブ一覧の仮想ビューかを示す。
     /// `current_folder = None` と併用し、通常フォルダの D&D / rating / 代表サムネ探索
     /// を明示的に止める。
@@ -3459,6 +3463,9 @@ pub struct App {
 
     // ── Ctrl+G グローバルメタ検索 UI 状態 (docs §10.3) ──────────────
     pub(crate) global_search: crate::global_search_ui::GlobalSearchState,
+
+    // ── Ctrl+T タグビュー UI 状態 ─────────────────────────────────
+    pub(crate) tag_view: crate::tag_view::TagViewState,
 
     // ── フォルダを開く ダイアログ (アドレスバーを隠したとき用) ───
     pub(crate) show_open_folder_dialog: bool,
@@ -3769,6 +3776,8 @@ pub struct App {
     /// 非同期実行中のお気に入り検索 (Ctrl+S)。`execute_favsearch` で spawn、
     /// `poll_favsearch` で受信 → `start_loading_items` を呼ぶ。
     pub(crate) favsearch_pending: Option<FavSearchPending>,
+    /// 非同期実行中のタグビュー検索 (Ctrl+T)。
+    pub(crate) tag_view_pending: Option<crate::tag_view::TagViewPending>,
     /// フルスクリーン画像の AI/EXIF/XMP メタデータを非同期読み込み中。
     /// `open_fullscreen` で spawn、`poll_metadata_load` で受信してキャッシュに投入。
     /// 20MP JPEG の XMP 読み (`read_tweet_info` が full-file 読む) で UI が
@@ -3805,6 +3814,8 @@ pub struct App {
     pub(crate) details_image_dims_state: LazyColumnState,
     /// フォルダ固有 facet (タグ/拡張子) の適用元。場所が変わったら無界値 facet を解除する。
     pub(crate) facet_filter_scope: Option<PathBuf>,
+    /// facet タグメニュー内の一時検索文字列。設定には保存しない。
+    pub(crate) facet_tag_search_query: String,
 
     /// 第2シグナル (`finalized=true`) を受け取ったが、第1シグナルの ColorImage が
     /// `texture_backlog` でアップロード待ちのため `requested` から remove できなかった
@@ -5696,6 +5707,7 @@ impl App {
             fs_early_dims: std::collections::HashMap::new(),
             items_generation: 0,
             items_are_global_search_view: false,
+            items_are_tag_view: false,
             items_are_drive_list: false,
             show_favorites_editor: false,
             favorite_delete_confirm: None,
@@ -5717,6 +5729,7 @@ impl App {
             name_index_supervisors: std::collections::HashMap::new(),
             activity_gate,
             global_search: crate::global_search_ui::GlobalSearchState::default(),
+            tag_view: crate::tag_view::TagViewState::default(),
             show_open_folder_dialog: false,
             open_folder_input: String::new(),
             open_folder_error: None,
@@ -5833,6 +5846,7 @@ impl App {
             search_query: String::new(),
             search_pending: None,
             favsearch_pending: None,
+            tag_view_pending: None,
             metadata_pending: None,
             tag_prewarm_pending: None,
             tag_prewarm_queued: std::collections::HashSet::new(),
@@ -5847,6 +5861,7 @@ impl App {
             details_lazy_visible_revision: 0,
             details_image_dims_state: LazyColumnState::Disabled,
             facet_filter_scope: None,
+            facet_tag_search_query: String::new(),
             pending_finalize: std::collections::HashSet::new(),
             last_vis_range: (0, 0),
             vis_settle_at: None,
@@ -6399,7 +6414,12 @@ impl App {
     }
 
     pub(crate) fn auto_aspect_cache_target_path(&self) -> Option<PathBuf> {
-        if self.global_search.active || self.favsearch.active || self.items_are_global_search_view {
+        if self.global_search.active
+            || self.favsearch.active
+            || self.tag_view.active
+            || self.items_are_global_search_view
+            || self.items_are_tag_view
+        {
             return None;
         }
         let path = self.effective_folder()?;
@@ -7291,10 +7311,10 @@ impl App {
     }
 
     pub(crate) fn remember_recent_folder(&mut self, path: &Path) {
-        // 検索 (Ctrl+G / Ctrl+S) 中は recent_folders を一切変更しない。
+        // 検索 (Ctrl+G / Ctrl+S / Ctrl+T) 中は recent_folders を一切変更しない。
         // record_folder_nav_transition 以外に archive_convert などが直接呼ぶため、
         // recent_folders を汚さないチョークポイントをここに置く。
-        if self.global_search.active || self.favsearch.active {
+        if self.global_search.active || self.favsearch.active || self.tag_view.active {
             return;
         }
         self.recent_folders
@@ -7314,13 +7334,17 @@ impl App {
     /// ここで扱う履歴はスクロール復元用の `folder_history` とは別物で、
     /// ユーザーがフォルダバーの ←/→ や履歴メニューで辿るためのもの。
     fn record_folder_nav_transition(&mut self, target: &Path) {
-        // 検索 (Ctrl+G / Ctrl+S) 中の移動、および検索クローズによる検索前フォルダへの
+        // 検索 (Ctrl+G / Ctrl+S / Ctrl+T) 中の移動、および検索クローズによる検索前フォルダへの
         // 復帰は履歴 (back/forward/recent) に一切残さない。検索は透明な一時オーバーレイ
         // であり、抜けると検索前の状態に完全復帰する。`suppress_nav_record_for_search_restore`
         // は close_* が active を false にしてから load_folder(saved) を呼ぶ取りこぼしを補う
         // ワンショット (短絡で消費漏れしないよう先に take しておく)。
         let search_restore = std::mem::take(&mut self.suppress_nav_record_for_search_restore);
-        if self.global_search.active || self.favsearch.active || search_restore {
+        if self.global_search.active
+            || self.favsearch.active
+            || self.tag_view.active
+            || search_restore
+        {
             // 古いワンショット抑止が次の通常ナビへ漏れないようここで消費しておく。
             self.suppress_folder_nav_record_once = false;
             return;
@@ -7465,7 +7489,7 @@ impl App {
     /// 再ロードは `load_folder_with_scan` に走らせた `scan` を渡して再 read_dir を避ける。
     /// UI スレッドでの syscall は `metadata()` + 1 回の `read_dir` のみ。
     pub(crate) fn check_external_folder_changes(&mut self) {
-        if self.global_search.active {
+        if self.global_search.active || self.tag_view.active {
             return;
         }
         // 削除進行中はフォーカス復帰による自動再読み込みを抑止する。削除自身が
@@ -7567,6 +7591,10 @@ impl App {
         }
         if self.global_search.active && self.items_are_global_search_view {
             self.rebuild_items_from_global_search();
+            return;
+        }
+        if self.tag_view.active && self.items_are_tag_view {
+            self.execute_tag_view();
             return;
         }
         if let Some(path) = self.current_folder.clone() {
@@ -7693,6 +7721,7 @@ impl App {
 
         if let Some(cur) = self.current_folder.clone() {
             let leaving_search_view = self.items_are_global_search_view
+                || self.items_are_tag_view
                 || crate::folder_tree::path_eq(&cur, &search_results_synthetic_path());
             if !leaving_search_view && !self.items_are_drive_list {
                 self.folder_history
@@ -8957,6 +8986,57 @@ impl App {
         }
     }
 
+    /// タグビュー (Ctrl+T) を開く。
+    pub(crate) fn open_tag_view(&mut self) {
+        self.open_tag_view_with_query(None, true);
+    }
+
+    pub(crate) fn open_tag_view_for_tag(&mut self, tag_name: &str) {
+        let query = crate::tags_db::format_display_tag(tag_name);
+        if query.is_empty() {
+            return;
+        }
+        if self.fullscreen_idx.is_some() {
+            self.close_fullscreen();
+        }
+        self.open_tag_view_with_query(Some(query), false);
+    }
+
+    fn open_tag_view_with_query(&mut self, query: Option<String>, focus_request: bool) {
+        if self.tag_view.active {
+            if let Some(query) = query {
+                self.tag_view.query = query;
+                self.tag_view.last_executed.clear();
+                self.execute_tag_view();
+            }
+            if focus_request {
+                self.tag_view.focus_request = true;
+            }
+            return;
+        }
+        if self.is_snapshot_active() {
+            self.deactivate_snapshot();
+        }
+        self.cancel_pending_folder_nav();
+        self.close_other_search_bars(SearchMode::TagView);
+        self.tag_view.active = true;
+        self.tag_view.focus_request = focus_request;
+        self.tag_view.saved_folder = self.current_folder.clone();
+        if let Some(query) = query {
+            self.tag_view.query = query;
+            self.tag_view.last_executed.clear();
+        }
+        self.execute_tag_view();
+    }
+
+    pub(crate) fn toggle_tag_view(&mut self) {
+        if self.tag_view.active {
+            self.close_tag_view();
+        } else {
+            self.open_tag_view();
+        }
+    }
+
     /// Ctrl+F のローカルメタデータ検索バーを開く。
     /// 他の検索バーが開いていれば閉じる (相互排他)。
     pub(crate) fn open_local_metadata_search(&mut self) {
@@ -8970,8 +9050,8 @@ impl App {
         self.search_focus_request = true;
     }
 
-    /// 指定した検索モード以外の検索バー 3 種をすべて閉じる。
-    /// Ctrl+F / Ctrl+S / Ctrl+G はユーザー操作がややこしくなるため同時には 1 つだけ
+    /// 指定した検索モード以外の検索バーをすべて閉じる。
+    /// Ctrl+F / Ctrl+S / Ctrl+G / Ctrl+T はユーザー操作がややこしくなるため同時には 1 つだけ
     /// アクティブにする方針 (2026-04 ユーザー指摘)。
     pub(crate) fn close_other_search_bars(&mut self, keep: SearchMode) {
         if !matches!(keep, SearchMode::LocalMeta) && self.show_search_bar {
@@ -8988,6 +9068,9 @@ impl App {
         }
         if !matches!(keep, SearchMode::Global) && self.global_search.active {
             self.close_global_search();
+        }
+        if !matches!(keep, SearchMode::TagView) && self.tag_view.active {
+            self.close_tag_view();
         }
     }
 
@@ -9010,6 +9093,155 @@ impl App {
             self.suppress_nav_record_for_search_restore = true;
             self.load_folder(saved);
         }
+    }
+
+    /// タグビューを閉じて、開く前のフォルダに戻る。
+    pub(crate) fn close_tag_view(&mut self) {
+        if !self.tag_view.active {
+            return;
+        }
+        self.cancel_pending_folder_nav();
+        if let Some(pending) = self.tag_view_pending.take() {
+            pending.cancel();
+        }
+        self.tag_view.active = false;
+        self.tag_view.has_focus = false;
+        self.tag_view.query.clear();
+        self.tag_view.last_executed.clear();
+        self.tag_view.results_paths.clear();
+        self.tag_view.summaries.clear();
+        self.tag_view.result_count = 0;
+        self.tag_view.truncated = false;
+        self.tag_view.reject_message = None;
+        self.items_are_tag_view = false;
+        if let Some(saved) = self.tag_view.saved_folder.take() {
+            self.suppress_nav_record_for_search_restore = true;
+            self.load_folder(saved);
+        }
+    }
+
+    pub(crate) fn execute_tag_view(&mut self) {
+        self.tag_view.last_executed = self.tag_view.query.clone();
+        self.tag_view.reject_message = None;
+        self.tag_view.truncated = false;
+        self.tag_view.result_count = 0;
+        self.tag_view.results_paths.clear();
+        if let Some(pending) = self.tag_view_pending.take() {
+            pending.cancel();
+        }
+        let data_dir = crate::data_dir::get();
+        let query = self.tag_view.query.clone();
+        self.tag_view_pending = Some(crate::tag_view::spawn_tag_view_search(data_dir, query));
+    }
+
+    pub(crate) fn poll_tag_view(&mut self) {
+        let Some(pending) = self.tag_view_pending.as_ref() else {
+            return;
+        };
+        match pending.try_recv() {
+            Ok(Ok(result)) => {
+                self.tag_view_pending = None;
+                if result.query == self.tag_view.last_executed {
+                    self.apply_tag_view_result(result);
+                }
+            }
+            Ok(Err(msg)) => {
+                self.tag_view_pending = None;
+                self.tag_view.reject_message = Some(msg);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.tag_view_pending = None;
+            }
+        }
+    }
+
+    fn apply_tag_view_result(&mut self, result: crate::tag_view::TagViewResult) {
+        self.tag_view.summaries = result.summaries;
+        self.tag_view.truncated = result.truncated;
+        self.tag_view.result_count = result.entries.len();
+        self.tag_view.results_paths = result.entries.iter().map(|e| e.path.clone()).collect();
+
+        if result.query.trim().is_empty() {
+            if self.items_are_tag_view {
+                if let Some(saved) = self.tag_view.saved_folder.clone() {
+                    self.suppress_nav_record_for_search_restore = true;
+                    self.load_folder(saved);
+                }
+            }
+            return;
+        }
+
+        let mut items: Vec<GridItem> = Vec::with_capacity(result.entries.len());
+        let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(result.entries.len());
+        let mut video_items: Vec<(usize, PathBuf, u64)> = Vec::new();
+        for entry in result.entries {
+            let idx = items.len();
+            let item = match entry.kind {
+                crate::tag_view::TagViewItemKind::Folder => GridItem::Folder(entry.path.clone()),
+                crate::tag_view::TagViewItemKind::Image => GridItem::Image(entry.path.clone()),
+                crate::tag_view::TagViewItemKind::Video => GridItem::Video(entry.path.clone()),
+                crate::tag_view::TagViewItemKind::ZipFile => GridItem::ZipFile(entry.path.clone()),
+                crate::tag_view::TagViewItemKind::PdfFile => GridItem::PdfFile(entry.path.clone()),
+                crate::tag_view::TagViewItemKind::Archive(format) => GridItem::ConvertibleArchive {
+                    path: entry.path.clone(),
+                    format,
+                },
+            };
+            if matches!(item, GridItem::Video(_)) {
+                video_items.push((idx, entry.path.clone(), entry.file_size.max(0) as u64));
+            }
+            image_metas.push(Some((entry.mtime, entry.file_size)));
+            items.push(item);
+        }
+
+        let pin_map_for_existing: std::collections::HashMap<
+            String,
+            crate::folder_thumb_pins::FolderPinSource,
+        > = if let Some(db) = self.folder_thumb_pin_db.as_ref() {
+            let containers: Vec<&std::path::Path> = items
+                .iter()
+                .filter_map(|it| match it {
+                    GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                        Some(p.as_path())
+                    }
+                    GridItem::ConvertibleArchive { path, .. } => Some(path.as_path()),
+                    _ => None,
+                })
+                .collect();
+            if containers.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                db.lookup_many(containers)
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
+        let existing_keys: std::collections::HashSet<String> = items
+            .iter()
+            .zip(image_metas.iter())
+            .flat_map(|(it, meta)| {
+                folder_thumb_existing_keys_for(
+                    it,
+                    *meta,
+                    &pin_map_for_existing,
+                    self.folder_thumb_pin_db.as_deref(),
+                    Some(self.settings.folder_thumb_sort),
+                    self.settings.folder_thumb_depth,
+                    true,
+                )
+            })
+            .collect();
+        self.start_loading_items(
+            search_results_synthetic_path(),
+            items,
+            image_metas,
+            existing_keys,
+            video_items,
+            None,
+        );
+        self.items_are_tag_view = true;
+        self.address = format!("タグビュー: {}", self.tag_view.query.trim());
     }
 
     /// 検索コンテキスト中の Ctrl+↑↓ ナビゲーション。
@@ -10966,6 +11198,7 @@ impl App {
         // スクロール状態として記録すると、後で戻ったとき誤った位置に復元される。
         if let Some(cur) = self.current_folder.clone() {
             let leaving_search_view = self.items_are_global_search_view
+                || self.items_are_tag_view
                 || crate::folder_tree::path_eq(&cur, &search_results_synthetic_path());
             if !leaving_search_view {
                 self.folder_history
@@ -11629,6 +11862,7 @@ impl App {
         // 既定は「実ビュー」。`replace_search_view_items` (= 合成ビュー経路) は
         // この後で true に上書きする。
         self.items_are_global_search_view = false;
+        self.items_are_tag_view = false;
         self.items_are_drive_list = false;
         // 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) のピン情報を 1 度の lookup_many で取得し、
         // make_load_request からの per-frame DB ヒットを回避する。pin がレアケースで
@@ -12139,9 +12373,12 @@ impl App {
                 _ => {}
             }
         }
-        // current_folder 自身も lookup 対象に含める (検索合成パス / アグリゲートビューは除外)。
+        // current_folder 自身も lookup 対象に含める (検索合成パス / 検索ビューは除外)。
         if let Some(cur) = self.current_folder.as_ref() {
-            if *cur != search_results_synthetic_path() && !self.items_are_global_search_view {
+            if *cur != search_results_synthetic_path()
+                && !self.items_are_global_search_view
+                && !self.items_are_tag_view
+            {
                 container_paths.push(cur.clone());
             }
         }
@@ -12299,8 +12536,8 @@ impl App {
         if !self.settings.show_address_bar_folder_pin {
             return None;
         }
-        // Ctrl+G アグリゲートビューでは container 概念が無いので隠す
-        if self.items_are_global_search_view {
+        // Ctrl+G アグリゲートビュー / Ctrl+T タグ結果では container 概念が無いので隠す
+        if self.items_are_global_search_view || self.items_are_tag_view {
             return None;
         }
         // current_folder 未確定 (起動直後 / 検索結果合成パス) は描画しない
@@ -12399,6 +12636,7 @@ impl App {
     /// **silent no-op 条件** (`compute_folder_pin_button_state` で UI を隠す条件と整合):
     /// - `current_folder` 無し / 検索合成パス
     /// - Ctrl+G アグリゲートビュー (`items_are_global_search_view`)
+    /// - Ctrl+T タグビュー (`items_are_tag_view`)
     /// - RAR/7z/LZH 変換キャッシュ ZIP の drill-down だが `zip_nav` が無い中途半端な状態
     /// - 選択無し / 選択アイテムが pin 不能 (ConvertibleArchive / SearchContainer /
     ///   ZipSeparator、または container を指す `rel=""` ケース)
@@ -12444,7 +12682,7 @@ impl App {
         if container == search_results_synthetic_path() {
             return;
         }
-        if self.items_are_global_search_view {
+        if self.items_are_global_search_view || self.items_are_tag_view {
             return;
         }
         let Some(item) = self.items.get(idx).cloned() else {
@@ -12547,6 +12785,8 @@ impl App {
         if self.items_are_global_search_view
             || self.global_search.active
             || self.favsearch.on_results_grid()
+            || self.items_are_tag_view
+            || self.tag_view.on_results_grid()
         {
             return;
         }
@@ -12575,6 +12815,8 @@ impl App {
         if self.items_are_global_search_view
             || self.global_search.active
             || self.favsearch.on_results_grid()
+            || self.items_are_tag_view
+            || self.tag_view.on_results_grid()
         {
             return;
         }
@@ -12626,12 +12868,12 @@ impl App {
         ui: &mut egui::Ui,
         item: &GridItem,
     ) -> bool {
-        // 親コンテナ未確定 / Ctrl+G アグリゲートビュー / 変換キャッシュ drill-down
+        // 親コンテナ未確定 / Ctrl+G アグリゲートビュー / Ctrl+T タグビュー / 変換キャッシュ drill-down
         // / pin 不能 variant では一切描画しない (separator も打たない)。
         let Some(container) = self.current_folder.clone() else {
             return false;
         };
-        if self.items_are_global_search_view {
+        if self.items_are_global_search_view || self.items_are_tag_view {
             return false;
         }
         if container == search_results_synthetic_path() {
@@ -13336,9 +13578,12 @@ impl App {
         if paths.is_empty() {
             return;
         }
-        // 検索結果ビュー (Ctrl+G 合成 / Ctrl+S favsearch) は current_folder が直前の
+        // 検索結果ビュー (Ctrl+G 合成 / Ctrl+S favsearch / Ctrl+T タグビュー) は current_folder が直前の
         // 実フォルダのまま残る。コピー先が曖昧なので拒否する。
-        let in_search_view = self.items_are_global_search_view || self.favsearch.on_results_grid();
+        let in_search_view = self.items_are_global_search_view
+            || self.favsearch.on_results_grid()
+            || self.tag_view.on_results_grid()
+            || self.items_are_tag_view;
         let dest = if in_search_view {
             None
         } else {
@@ -15755,7 +16000,10 @@ impl App {
         // フルスクリーン起動ショートカットに回らないようにする。
         // (IME が Commit を吐いたフレームで TextEdit が一瞬 lost_focus → *_has_focus
         //  が false になり、次フレームで Enter が grid 側に漏れるレースをガードする)。
-        if (self.show_search_bar || self.favsearch.active || self.global_search.active)
+        if (self.show_search_bar
+            || self.favsearch.active
+            || self.global_search.active
+            || self.tag_view.active)
             && self.ime_input_active()
         {
             return None;
@@ -15774,6 +16022,7 @@ impl App {
             && !self.search_has_focus
             && !self.favsearch.has_focus
             && !self.global_search.has_focus
+            && !self.tag_view.has_focus
             && self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
             && self
@@ -16174,6 +16423,7 @@ impl App {
         // - BS はスタックベースで検索ルートまで戻る (favsearch_back)
         // - Ctrl+↑↓ によるフォルダナビゲーションも無効化
         let in_favsearch = self.favsearch.active;
+        let in_tag_view = self.tag_view.active;
 
         // BS: 親フォルダへ (検索中はスタックを戻る)
         // Ctrl+BS は個別補正の解除に使うので除外する
@@ -16205,6 +16455,9 @@ impl App {
                 // favsearch_back 内で load_folder 済み。navigate 経路には流さない。
                 return None;
             }
+            if in_tag_view {
+                return None;
+            }
             if self.local_search_blocks_parent_nav() {
                 self.cancel_pending_folder_nav();
                 return None;
@@ -16220,6 +16473,7 @@ impl App {
 
         let history_shortcut_allowed = !self.global_search.active
             && !self.favsearch.active
+            && !self.tag_view.active
             && !self.show_search_bar
             && !self.items_are_drive_list
             && !self.is_snapshot_active(); // Codex P2-1: ★固定 中は履歴ナビ block
@@ -16258,6 +16512,8 @@ impl App {
                 self.cancel_pending_folder_nav();
             } else if in_favsearch {
                 self.favsearch_ctrl_nav(true);
+            } else if in_tag_view {
+                self.cancel_pending_folder_nav();
             } else if self.zip_nav_handle_ctrl_updown(true) {
                 // ネスト ZIP 内: ツリーを DFS 前順で次のノードへ (#4 改)。ツリーの端では
                 // false が返り、下の effective_folder 分岐で ZIP を抜けて実フォルダ DFS へ。
@@ -16280,6 +16536,8 @@ impl App {
                 self.cancel_pending_folder_nav();
             } else if in_favsearch {
                 self.favsearch_ctrl_nav(false);
+            } else if in_tag_view {
+                self.cancel_pending_folder_nav();
             } else if self.zip_nav_handle_ctrl_updown(false) {
                 // ネスト ZIP 内: ツリーを DFS 逆前順で前のノードへ (#4 改)。
             } else if let Some(cur) = self.effective_folder() {
@@ -16295,7 +16553,7 @@ impl App {
             // Ctrl+PageUp/Down は image-like のみ巡回 (= page 版)、Ctrl+↑↓ は全 entry。
             if self.is_snapshot_active() {
                 let _ = self.snapshot_navigate_grid_page(true);
-            } else if in_global_search || in_favsearch {
+            } else if in_global_search || in_favsearch || in_tag_view {
                 // 検索ビューは仮想階層なので、実ファイルシステムの兄弟移動は行わない。
             } else if in_local_search {
                 self.cancel_pending_folder_nav();
@@ -16307,7 +16565,7 @@ impl App {
             self.bump_input_seq("grid_sibling_nav", Some("backward"));
             if self.is_snapshot_active() {
                 let _ = self.snapshot_navigate_grid_page(false);
-            } else if in_global_search || in_favsearch {
+            } else if in_global_search || in_favsearch || in_tag_view {
                 // 同上。
             } else if in_local_search {
                 self.cancel_pending_folder_nav();
@@ -16664,6 +16922,7 @@ impl App {
         self.settings.auto_fullscreen_zip_pdf
             && !self.global_search.active
             && !self.favsearch.active
+            && !self.tag_view.active
             && self
                 .current_folder
                 .as_deref()
@@ -17293,6 +17552,7 @@ impl App {
             || self.search_has_focus
             || self.favsearch.has_focus
             || self.global_search.has_focus
+            || self.tag_view.has_focus
     }
 
     /// Ctrl+C / Ctrl+X / Ctrl+V ショートカットを処理する。
@@ -17352,8 +17612,10 @@ impl App {
         if ctrl_v {
             // 検索結果グリッド表示中はペースト無効 (D&D と同じ判定。検索前の実フォルダへ
             // 誤って貼り付けない)。検索から実フォルダを開いた後は有効に戻る。
-            let on_search_results =
-                self.items_are_global_search_view || self.favsearch.on_results_grid();
+            let on_search_results = self.items_are_global_search_view
+                || self.favsearch.on_results_grid()
+                || self.items_are_tag_view
+                || self.tag_view.on_results_grid();
             if !on_search_results && let Some(folder) = self.current_favorite_target() {
                 let rx = crate::ui_dialogs::context_menu::paste_files_from_clipboard(&folder);
                 self.paste_pending.push(rx);
@@ -30915,6 +31177,7 @@ impl eframe::App for App {
         self.poll_local_adjust_segmentation(ctx);
         self.poll_search();
         self.poll_favsearch();
+        self.poll_tag_view();
         self.poll_metadata_load();
         self.poll_details_meta_load(ctx);
         // 360 度パノラマビュー Phase 2a (docs/panorama-360-view-plan.md §4.6.3):
@@ -30958,6 +31221,9 @@ impl eframe::App for App {
             // pending 中は毎フレーム bump して、検索完了後に自然再開させる。
             self.activity_gate.bump();
         }
+        if self.tag_view_pending.is_some() {
+            self.activity_gate.bump();
+        }
         // review #9 対応: ensure_container_mtime_populated が worker thread に
         // 投げた mtime 取得結果を drain する。完了で rebuild が走る。
         self.poll_container_mtime_pending(ctx);
@@ -30966,6 +31232,7 @@ impl eframe::App for App {
         // 実ジョブ残数 (is_busy) を見る。アイドル時の無限 repaint を避けるため。
         if self.search_pending.is_some()
             || self.favsearch_pending.is_some()
+            || self.tag_view_pending.is_some()
             || self.metadata_pending.is_some()
             || self.details_meta_pending.is_some()
             || !self.local_adjust_pending.is_empty()
@@ -31400,6 +31667,10 @@ impl eframe::App for App {
                 self.favsearch.saved_folder = None;
                 self.close_favsearch();
             }
+            if self.tag_view.active {
+                self.tag_view.saved_folder = None;
+                self.close_tag_view();
+            }
             if self.show_search_bar {
                 self.cancel_pending_folder_nav();
                 self.show_search_bar = false;
@@ -31442,6 +31713,7 @@ impl eframe::App for App {
             && !self.any_dialog_open()
             && !self.favsearch.has_focus
             && !self.global_search.has_focus
+            && !self.tag_view.has_focus
             && !self.global_search.active
             && !self.grid_is_pdf_pages()
         {
@@ -31462,6 +31734,7 @@ impl eframe::App for App {
         if !self.address_has_focus
             && !self.search_has_focus
             && !self.favsearch.has_focus
+            && !self.tag_view.has_focus
             && self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
         {
@@ -31489,6 +31762,7 @@ impl eframe::App for App {
             && !self.search_has_focus
             && !self.favsearch.has_focus
             && !self.global_search.has_focus
+            && !self.tag_view.has_focus
             && self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
         {
@@ -31505,6 +31779,7 @@ impl eframe::App for App {
             && !self.search_has_focus
             && !self.favsearch.has_focus
             && !self.global_search.has_focus
+            && !self.tag_view.has_focus
         {
             let ctrl_s = self.keymap.pressed_action(ctx, KeyAction::GlobalFavSearch);
             if ctrl_s {
@@ -31519,6 +31794,7 @@ impl eframe::App for App {
             && !self.any_dialog_open()
             && !self.search_has_focus
             && !self.favsearch.has_focus
+            && !self.tag_view.has_focus
         {
             let ctrl_g = self
                 .keymap
@@ -31529,12 +31805,28 @@ impl eframe::App for App {
             }
         }
 
+        // ── Ctrl+T: タグビュー表示 ─────────────────────────────────
+        if !self.address_has_focus
+            && self.fullscreen_idx.is_none()
+            && !self.any_dialog_open()
+            && !self.search_has_focus
+            && !self.favsearch.has_focus
+            && !self.global_search.has_focus
+            && !self.tag_view.has_focus
+        {
+            let ctrl_t = self.keymap.pressed_action(ctx, KeyAction::GridTagView);
+            if ctrl_t {
+                self.toggle_tag_view();
+            }
+        }
+
         // ── Ctrl+O: フォルダを開く ───────────────────────────────────
         if self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
             && !self.address_has_focus
             && !self.search_has_focus
             && !self.favsearch.has_focus
+            && !self.tag_view.has_focus
         {
             let ctrl_o = self.keymap.pressed_action(ctx, KeyAction::GlobalOpenFolder);
             if ctrl_o {
@@ -31551,6 +31843,7 @@ impl eframe::App for App {
         if !self.address_has_focus
             && !self.search_has_focus
             && !self.favsearch.has_focus
+            && !self.tag_view.has_focus
             && self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
         {
@@ -31593,6 +31886,9 @@ impl eframe::App for App {
 
         // ── Ctrl+G グローバルメタ検索バー (docs §10.3) ────────────────
         self.render_global_search_bar(ctx);
+
+        // ── Ctrl+T タグビュー ───────────────────────────────────────
+        self.render_tag_view_bar(ctx);
 
         // ── スマートフィルタバー (サムネ/詳細共通) ───────────────────
         self.render_facet_filter_bar(ctx);
@@ -32624,7 +32920,7 @@ fn convertible_archive_pinned_cache_key(
 impl App {
     /// サムネイル cache key に full-path を使うべきコンテキストか。
     ///
-    /// Ctrl+S 検索結果 / Ctrl+G 検索結果ビューとドライブルートでは、basename ベースの
+    /// Ctrl+S / Ctrl+G / Ctrl+T 検索結果ビューとドライブルートでは、basename ベースの
     /// cache key だと別スコープの同名項目を誤表示しうる。このメソッドが true を返す
     /// コンテキストでは `make_load_request` が full-path を含むキーを使う。
     /// サムネ読み出し側、`delete_missing` の存続キー、seed 側で必ず同じ判定を共有すること。
@@ -32633,6 +32929,7 @@ impl App {
             .as_deref()
             .is_some_and(use_full_path_cache_keys_for_folder)
             || self.items_are_global_search_view
+            || self.items_are_tag_view
     }
 }
 

@@ -707,6 +707,7 @@ pub enum KeyAction {
     GridDeselect,
     GridToggleCheck,
     GridToggleFolderTreePane,
+    GridTagView,
     GridRotateCw,
     GridRotateCcw,
     GridPin,
@@ -895,6 +896,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeselect,
     KeyAction::GridToggleCheck,
     KeyAction::GridToggleFolderTreePane,
+    KeyAction::GridTagView,
     KeyAction::GridRotateCw,
     KeyAction::GridRotateCcw,
     KeyAction::GridPin,
@@ -1118,6 +1120,7 @@ impl KeyAction {
             GridDeselect => "GridDeselect",
             GridToggleCheck => "GridToggleCheck",
             GridToggleFolderTreePane => "GridToggleFolderTreePane",
+            GridTagView => "GridTagView",
             GridRotateCw => "GridRotateCw",
             GridRotateCcw => "GridRotateCcw",
             GridPin => "GridPin",
@@ -1316,6 +1319,7 @@ impl KeyAction {
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridToggleFolderTreePane => "フォルダツリーペインの表示を切り替える",
+            GridTagView => "タグビューを開く",
             GridRotateCw => "選択中の画像を右に90度回転する",
             GridRotateCcw => "選択中の画像を左に90度回転する",
             GridPin => "選択中の項目を代表サムネイルに固定または解除する",
@@ -1506,6 +1510,7 @@ impl KeyAction {
             | GridDeselect
             | GridToggleCheck
             | GridToggleFolderTreePane
+            | GridTagView
             | GridRotateCw
             | GridRotateCcw
             | GridPin
@@ -1634,6 +1639,7 @@ impl KeyAction {
             | GridDeselect
             | GridToggleCheck
             | GridToggleFolderTreePane
+            | GridTagView
             | GridRotateCw
             | GridRotateCcw
             | GridPin
@@ -1820,6 +1826,7 @@ impl KeyAction {
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridToggleFolderTreePane => ChordList::one(Chord::key(T)),
+            GridTagView => ChordList::one(Chord::ctrl(T)),
             GridRotateCw => ChordList::one(Chord::key(R)),
             GridRotateCcw => ChordList::one(Chord::key(L)),
             GridPin => ChordList::one(Chord::key(P)),

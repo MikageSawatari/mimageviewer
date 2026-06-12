@@ -110,6 +110,7 @@ pub mod susie_loader;
 pub mod sys_memory;
 mod tag_ops;
 mod tag_prewarm;
+mod tag_view;
 pub mod tag_write_worker;
 pub mod tags_db;
 pub mod thumb_loader;

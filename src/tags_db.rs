@@ -400,6 +400,70 @@ impl TagsDb {
         };
         rows.flatten().collect()
     }
+
+    pub fn item_keys_by_tag_prefix(&self, prefix: &str, limit: usize) -> Vec<String> {
+        let key = normalize_tag_key(prefix);
+        if key.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let escaped = escape_like_pattern(&key);
+        let pattern = format!("{escaped}%");
+        let mut stmt = match self.conn.prepare(
+            "SELECT DISTINCT item_key
+             FROM item_tags
+             WHERE tag_key LIKE ?1 ESCAPE '\\'
+             ORDER BY item_key COLLATE NOCASE ASC
+             LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map(params![pattern, limit as i64], |row| row.get(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten().collect()
+    }
+
+    pub fn item_keys_by_tag_exact(&self, tag: &str, limit: usize) -> Vec<String> {
+        let key = normalize_tag_key(tag);
+        if key.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let mut stmt = match self.conn.prepare(
+            "SELECT DISTINCT item_key
+             FROM item_tags
+             WHERE tag_key = ?1
+             ORDER BY item_key COLLATE NOCASE ASC
+             LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map(params![key, limit as i64], |row| row.get(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten().collect()
+    }
+
+    pub fn prune_items(&mut self, item_keys: &[String]) -> Result<usize, rusqlite::Error> {
+        if item_keys.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut removed_tags = 0usize;
+        {
+            let mut delete_tags = tx.prepare("DELETE FROM item_tags WHERE item_key = ?1")?;
+            let mut delete_state = tx.prepare("DELETE FROM tag_item_state WHERE item_key = ?1")?;
+            for key in item_keys {
+                removed_tags += delete_tags.execute([key])?;
+                delete_state.execute([key])?;
+            }
+        }
+        tx.commit()?;
+        Ok(removed_tags)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -554,6 +618,43 @@ mod tests {
         let found = db.find_by_prefix("a_", 10);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].tag, "a_b");
+    }
+
+    #[test]
+    fn item_keys_by_tag_prefix_escapes_like_wildcards() {
+        let mut db = memory_db();
+        db.set_item_tags("c:/a.jpg", ["a_b"], source::EDIT).unwrap();
+        db.set_item_tags("c:/b.jpg", ["abc"], source::EDIT).unwrap();
+        db.set_item_tags("c:/c.jpg", ["a%b"], source::EDIT).unwrap();
+        assert_eq!(
+            db.item_keys_by_tag_prefix("a_", 10),
+            vec!["c:/a.jpg".to_string()]
+        );
+    }
+
+    #[test]
+    fn item_keys_by_tag_exact_does_not_match_prefix_siblings() {
+        let mut db = memory_db();
+        db.set_item_tags("c:/cat.jpg", ["cat"], source::EDIT)
+            .unwrap();
+        db.set_item_tags("c:/catnap.jpg", ["catnap"], source::EDIT)
+            .unwrap();
+        assert_eq!(
+            db.item_keys_by_tag_exact("#cat", 10),
+            vec!["c:/cat.jpg".to_string()]
+        );
+    }
+
+    #[test]
+    fn prune_items_removes_tags_and_decided_state() {
+        let mut db = memory_db();
+        db.set_item_tags("c:/gone.jpg", ["cat"], source::EDIT)
+            .unwrap();
+        assert!(db.has_item_state("c:/gone.jpg"));
+        let removed = db.prune_items(&["c:/gone.jpg".to_string()]).unwrap();
+        assert_eq!(removed, 1);
+        assert!(db.display_tags_for_item("c:/gone.jpg").is_empty());
+        assert!(!db.has_item_state("c:/gone.jpg"));
     }
 
     #[test]

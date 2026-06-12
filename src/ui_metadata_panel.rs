@@ -227,8 +227,9 @@ impl App {
             .cloned()
             .collect();
 
-        // タグボタンクリックを closure 内で検出し、後段で request_tag_toggle を走らせる
+        // タグボタンクリックを closure 内で検出し、後段で self の操作に流す。
         let mut clicked_tag: Option<String> = None;
+        let mut searched_tag: Option<String> = None;
 
         let inner_rect = content_rect.shrink2(egui::vec2(12.0, 8.0));
         let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(inner_rect));
@@ -253,6 +254,7 @@ impl App {
                         &current_tags,
                         taggable_path.is_some(),
                         &mut clicked_tag,
+                        &mut searched_tag,
                     );
                     if tweet_info.is_some()
                         || ai_metadata.is_some()
@@ -332,6 +334,9 @@ impl App {
         // タグボタンクリックの後処理 (closure 外で self を可変借用する)
         if let Some(tag_name) = clicked_tag {
             self.request_tag_toggle_for_selection(&tag_name);
+        }
+        if let Some(tag_name) = searched_tag {
+            self.open_tag_view_for_tag(&tag_name);
         }
 
         true
@@ -428,6 +433,7 @@ fn draw_tag_panel(
     current_tags: &[String],
     is_taggable: bool,
     clicked_tag: &mut Option<String>,
+    searched_tag: &mut Option<String>,
 ) {
     ui.horizontal(|ui| {
         ui.label(
@@ -476,7 +482,14 @@ fn draw_tag_panel(
             } else {
                 format!("クリックで `{with_hash}` を付与")
             });
-            if resp.clicked() {
+            let clicked = resp.clicked();
+            resp.context_menu(|ui| {
+                if ui.button("このタグで探す").clicked() {
+                    *searched_tag = Some(def.name.clone());
+                    ui.close();
+                }
+            });
+            if clicked {
                 *clicked_tag = Some(def.name.clone());
             }
         }
