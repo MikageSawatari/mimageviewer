@@ -47,6 +47,18 @@
 >   1 回 (収束) なので pool 負荷は限定的。非 AI 利用時 (AI 設定 OFF → `ai_at_native` が false)
 >   は再レンダせず 4096px 表示を維持する (range 内ラスターを常に native へ落とすと表示解像度が
 >   下がるため「設定 ON」を AND 条件にしている)。
+>   - **AI 先読みを画像と同等にする (Codex 再々レビュー P2)**: 非表示の先読みページ
+>     (`ai_prefetch_targets`) も Raster PDF なら、`prefetch_final_ai` が
+>     `pdf_prefetch_should_defer_ai` で「現行 4096px に AI を流しても表示時 native 再レンダで
+>     捨てる」状態を検出し、**native 再レンダを通常レーンで先に起動 + AI 先読みを native
+>     着地まで保留**する。これで移動時に native + final AI が揃って画像同様に即表示できる
+>     (4096px への無駄 AI も回避)。`pdf_prefetch_should_defer_ai` は visible 判定と違い
+>     **ズーム / in-flight を見ない** (先読みページは fit で開かれる前提、再レンダ中も保留
+>     継続)。native 再レンダの優先度: `request_pdf_rerender(idx, zoom, priority)` で
+>     **visible/ズーム = priority レーン、先読み = 通常レーン** に振り分け (PDF worker は
+>     priority を先に drain するので、先読みの native 再レンダが visible の再レンダや UI
+>     ナビ enumerate を妨げない)。トレードオフ: 初回パスでネイバーは 4096px→native の 2 回
+>     レンダ (= 画像が neighbor を decode する分の PDF 版。通常レーン・小サイズ・1 回収束)。
 >   - **スコープ**: 対象は `PdfPageContentType::Raster` のページ。可視テキスト / パス /
 >     シェーディングを含むページは `Vector` 判定 (`pdf_loader::analyze_page_content`) で
 >     4096px 固定のまま AI 対象外 (透明 OCR テキストは `is_visible_text` が無視するので

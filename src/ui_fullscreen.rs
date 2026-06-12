@@ -1548,7 +1548,8 @@ impl App {
     fn maybe_rerender_pdf(&mut self, zoom: f32) {
         if let Some(idx) = self.fullscreen_idx {
             if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
-                self.request_pdf_rerender(idx, zoom);
+                // 表示中ページのズーム由来再レンダなので priority レーン (即応)。
+                self.request_pdf_rerender(idx, zoom, true);
             }
         }
     }

@@ -6256,6 +6256,75 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.should_native_rerender_pdf_for_ai(idx));
     }
 
+    /// GitHub issue #1 / Codex P2 (AI 先読み): 非表示 Raster PDF の 4096px レンダに AI を
+    /// 流すと表示時 native 再レンダで捨てるため、native 着地まで AI 先読みを保留する。
+    /// `pdf_prefetch_should_defer_ai` は should_native と違いズーム / in-flight を見ず、
+    /// 「cur が native より十分大きい間」true を返す (native 再レンダ中も保留継続)。
+    #[test]
+    fn pdf_prefetch_defers_ai_until_native() {
+        use crate::ai::ModelKind;
+        use crate::ai::upscale::AiProcessSizeLimit;
+        use crate::grid_item::GridItem;
+        use crate::settings::AiFeatureMode;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.settings.ai_feature_mode = AiFeatureMode::HighQuality;
+        app.settings.ai_upscale_size_limit = Some(AiProcessSizeLimit::square(2048));
+        app.settings.ai_denoise_size_limit = Some(AiProcessSizeLimit::square(2048));
+        app.settings.global_preset.upscale_model = None;
+        app.settings.global_preset.denoise_model = None;
+
+        app.items.push(GridItem::PdfPage {
+            pdf_path: std::path::PathBuf::from("c:/p/doc.pdf"),
+            page_num: 0,
+            content_type: Some(crate::pdf_loader::PdfPageContentType::Raster { w: 100, h: 200 }),
+        });
+        let idx = app.items.len() - 1;
+        // 先読みページなので fs_zoom は無関係 (= ズーム中でも保留判定は変わらない)。
+        app.fs_zoom = 3.0;
+
+        let dummy_tex = ctx.load_texture(
+            "pdf_prefetch_dummy",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        );
+        let set_cur = |app: &mut App, w: usize, h: usize, tex: &egui::TextureHandle| {
+            let px = egui::ColorImage::new([w, h], vec![egui::Color32::WHITE; w * h]);
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex: tex.clone(),
+                    pixels: std::sync::Arc::new(px),
+                    source_dims: None,
+                    load_seq: 0,
+                },
+            );
+        };
+
+        // 4096px 相当 (100x4000) + AI なし: 保留しない (= 通常どおり先読み。AI も走らないが)。
+        set_cur(&mut app, 100, 4000, &dummy_tex);
+        assert!(!app.pdf_prefetch_should_defer_ai(idx));
+
+        // アップスケール ON: 4096px に AI を流さず native 着地まで保留。
+        app.settings.global_preset.upscale_model = Some("auto".to_string());
+        assert!(app.pdf_prefetch_should_defer_ai(idx));
+
+        // 高負荷上限 (4096) でも cur (100x4000) > native → 保留して native へ落とす (P2)。
+        app.settings.ai_upscale_size_limit = Some(AiProcessSizeLimit::square(4096));
+        assert!(app.pdf_prefetch_should_defer_ai(idx));
+        app.settings.ai_upscale_size_limit = Some(AiProcessSizeLimit::square(2048));
+
+        // デノイズだけでも保留。
+        app.settings.global_preset.upscale_model = None;
+        app.settings.global_preset.denoise_model =
+            Some(ModelKind::DenoiseRealplksr.as_str().to_string());
+        assert!(app.pdf_prefetch_should_defer_ai(idx));
+
+        // native 着地 (cur=100x200): 保留解除 → 通常どおり native に AI 先読みが走る。
+        set_cur(&mut app, 100, 200, &dummy_tex);
+        assert!(!app.pdf_prefetch_should_defer_ai(idx));
+    }
+
     /// Ctrl+E / Ctrl+S は、再計算したペアではなく直近に描画された見開きレイアウトを
     /// 優先する。これで「画面は見開きなのに保存対象は片側ページ」のずれを防ぐ。
     #[test]

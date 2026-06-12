@@ -21473,7 +21473,10 @@ impl App {
     ///
     /// ワーカーに直接リクエストを送り、結果は `poll_pdf_rerender` で受け取る。
     /// UI スレッドを一切ブロックしない。
-    pub(crate) fn request_pdf_rerender(&mut self, idx: usize, zoom: f32) {
+    /// `priority=true`: 表示中ページ等の即応再レンダ (PDF worker の priority レーン)。
+    /// `priority=false`: AI 先読み用の非表示ページ native 再レンダ (通常レーン、
+    /// visible の再レンダ / UI ナビを妨げない)。
+    pub(crate) fn request_pdf_rerender(&mut self, idx: usize, zoom: f32, priority: bool) {
         let (pdf_path, page_num, password, content_type) = match self.items.get(idx) {
             Some(GridItem::PdfPage {
                 pdf_path,
@@ -21536,6 +21539,7 @@ impl App {
             page_num,
             target_px,
             password.as_deref(),
+            priority,
         );
 
         // render_page_async は DynamicImage チャネルを返すが、fs_pending は
@@ -22982,6 +22986,18 @@ impl App {
             // 自然に gate される (= 旧設計と同じ「同時 1 ジョブ」ポリシー)。
             if self.has_uncancelled_final_ai_pending() {
                 return;
+            }
+            // Raster PDF が「現行 4096px レンダ → 表示時 native 再レンダ」になるページは、
+            // 4096px に AI 先読みを流しても native 再レンダで捨てられる (GitHub issue #1)。
+            // 代わりに native 再レンダを **通常レーンで先に起動** (visible を妨げない) し、
+            // AI 先読みは native 着地まで保留する。これで画像の先読みと同様、移動時に
+            // native + final AI が揃って即表示できる。
+            if self.pdf_prefetch_should_defer_ai(idx) {
+                // 既に再レンダ中なら二重起動しない (cancel→respawn ループ防止)。
+                if !self.fs_pending.contains_key(&idx) {
+                    self.request_pdf_rerender(idx, 1.0, false);
+                }
+                continue;
             }
             // 先読みは edit_result の表示テクスチャを前倒し upload しない (F2)。AI 入力は CPU
             // ピクセルで足りる。表示に入った時に ensure_edit_result_pixels が lazy アップロード
@@ -26020,38 +26036,46 @@ impl App {
     fn maybe_native_rerender_pdf_for_ai(&mut self, idx: usize) {
         if self.should_native_rerender_pdf_for_ai(idx) {
             // fit 表示 (zoom≈1.0) でだけ到達するので native 基準 (zoom=1.0) で再レンダ。
-            // 再レンダ結果が fs_cache に載るとき bump_input_generation で下流 (edit /
-            // final / AI) cache が無効化され、final AI が native 寸法で再評価される。
-            self.request_pdf_rerender(idx, 1.0);
+            // 表示中ページなので priority レーン (即応)。再レンダ結果が fs_cache に載るとき
+            // bump_input_generation で下流 (edit / final / AI) cache が無効化され、final AI が
+            // native 寸法で再評価される。
+            self.request_pdf_rerender(idx, 1.0, true);
         }
     }
 
-    /// `maybe_native_rerender_pdf_for_ai` の判定部 (副作用なし、単体テスト用に分離)。
-    /// App の現在状態 (items の native 寸法 / fs_cache の現行レンダ寸法 / AI 設定 /
-    /// ズーム / in-flight) を純関数 `pdf_needs_native_rerender_for_ai` へ束ねる。
-    ///
+    /// PDF ラスターページの (native_w, native_h, cur_w, cur_h, upscale_on, denoise_on) を
+    /// 集める。`Raster` content_type かつ fs_cache に Static レンダがあるときだけ `Some`。
     /// AI 有効判定は **`maybe_start_final_ai` と同じ `effective_upscale_request` /
-    /// `effective_denoise_request` を当該ページの `effective_params(idx)` に適用**する。
-    /// グローバルの `ai_upscale_enabled` cache (= fs_idx 用に同期された値) ではなく
-    /// ページ個別設定で判定するので、見開き相方・連続表示の隣接ページ (ページ個別 AI
-    /// 設定が fs_idx と異なりうる) でも final AI ゲートと一致する。
-    pub(crate) fn should_native_rerender_pdf_for_ai(&self, idx: usize) -> bool {
+    /// `effective_denoise_request` を当該ページの `effective_params(idx)` に適用**する
+    /// (グローバル `ai_upscale_enabled` cache = fs_idx 用同期値ではなくページ個別設定。
+    /// 見開き相方・連続表示・先読みの各ページが個別 AI 設定でも final AI ゲートと一致)。
+    fn pdf_ai_rerender_inputs(&self, idx: usize) -> Option<(u32, u32, u32, u32, bool, bool)> {
         let Some(GridItem::PdfPage {
             content_type: Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }),
             ..
         }) = self.items.get(idx)
         else {
-            return false;
+            return None;
         };
-        let (native_w, native_h) = (*w, *h);
         // 現在レンダ済みのピクセル寸法 (final AI ゲートが見る pixels.size と同じ)。
-        let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) else {
-            return false;
+        let FsCacheEntry::Static { pixels, .. } = self.fs_cache.get(&idx)? else {
+            return None;
         };
         let (cur_w, cur_h) = (pixels.size[0] as u32, pixels.size[1] as u32);
         let params = self.effective_params(idx);
         let upscale_on = self.effective_upscale_request(params).is_some();
         let denoise_on = self.effective_denoise_request(params).is_some();
+        Some((*w, *h, cur_w, cur_h, upscale_on, denoise_on))
+    }
+
+    /// `maybe_native_rerender_pdf_for_ai` の判定部 (副作用なし、単体テスト用に分離)。
+    /// 表示中ページ向けに `self.fs_zoom` と in-flight ガード込みで判定する。
+    pub(crate) fn should_native_rerender_pdf_for_ai(&self, idx: usize) -> bool {
+        let Some((native_w, native_h, cur_w, cur_h, upscale_on, denoise_on)) =
+            self.pdf_ai_rerender_inputs(idx)
+        else {
+            return false;
+        };
         crate::ai::upscale::pdf_needs_native_rerender_for_ai(
             self.fs_zoom,
             native_w,
@@ -26064,6 +26088,34 @@ impl App {
             self.settings.ai_denoise_limit(),
             self.fs_pending.contains_key(&idx),
         )
+    }
+
+    /// AI 先読み用: この PDF ラスターページの現行レンダ (4096px) に AI を流すと、表示時の
+    /// native 再レンダで `bump_input_generation` され stale 化して捨てるので、AI 先読みを
+    /// **native レンダ完了まで保留すべき**か (GitHub issue #1, Codex P2)。
+    ///
+    /// `should_native_rerender_pdf_for_ai` と違い **in-flight ガードを持たない**: native
+    /// 再レンダ進行中も「cur がまだ native より大きい」間は true を返し続け、AI 先読みを
+    /// 出さない (in-flight ガードを入れると再レンダ中に 4096px へ AI を流してしまう)。
+    /// ズームも見ない (非表示ページは fit 表示 = zoom 1.0 で開かれる前提)。
+    /// native 着地後 (cur≈native) は false → 通常どおり AI 先読みが native に対して走る。
+    pub(crate) fn pdf_prefetch_should_defer_ai(&self, idx: usize) -> bool {
+        let Some((native_w, native_h, cur_w, cur_h, upscale_on, denoise_on)) =
+            self.pdf_ai_rerender_inputs(idx)
+        else {
+            return false;
+        };
+        let ai_at_native = crate::ai::upscale::ai_would_apply_at_dims(
+            native_w,
+            native_h,
+            upscale_on,
+            self.settings.ai_upscale_limit(),
+            denoise_on,
+            self.settings.ai_denoise_limit(),
+        );
+        let native_long = native_w.max(native_h);
+        let cur_long = cur_w.max(cur_h);
+        ai_at_native && cur_long as f32 > native_long as f32 * 1.1
     }
 
     /// 右上フィードバック表示を設定する (既定の表示時間)。

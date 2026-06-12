@@ -2238,13 +2238,23 @@ pub fn render_page_async(
     page_num: u32,
     target_px: u32,
     password: Option<&str>,
+    priority: bool,
 ) -> (
     Arc<AtomicBool>,
     mpsc::Receiver<std::io::Result<RenderResult>>,
 ) {
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
-    let _ = get_worker().priority_tx.send(WorkerRequest::Render {
+    // 表示中ページの再レンダ等は priority レーン (worker が先に drain する)。
+    // AI 先読み用の native 再レンダ (非表示ページ) は通常レーンに流し、visible の
+    // 再レンダ / UI ナビの enumerate を妨げない (GitHub issue #1 の先読み画像化)。
+    let worker = get_worker();
+    let sender = if priority {
+        &worker.priority_tx
+    } else {
+        &worker.tx
+    };
+    let _ = sender.send(WorkerRequest::Render {
         path: pdf_path.to_path_buf(),
         page_num,
         target_px,
