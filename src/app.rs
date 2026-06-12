@@ -3421,6 +3421,8 @@ pub struct App {
     /// 選択中アイテムへ自由記入タグを付ける/外すダイアログ。
     pub(crate) show_tag_apply: bool,
     pub(crate) tag_apply_input: String,
+    pub(crate) tag_apply_suggestion_key: Option<String>,
+    pub(crate) tag_apply_suggestions: Vec<(String, String, usize)>,
     /// タグ管理ダイアログの改名/統合を tags.db へ反映する一回限り worker。
     pub(crate) tag_maintenance_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// タグ書き込み worker (初回要求時に遅延初期化)。
@@ -5724,6 +5726,8 @@ impl App {
             tag_editor_draft: Vec::new(),
             show_tag_apply: false,
             tag_apply_input: String::new(),
+            tag_apply_suggestion_key: None,
+            tag_apply_suggestions: Vec::new(),
             tag_maintenance_rx: None,
             tag_write_handle: None,
             rating_write_handle: None,
@@ -34997,6 +35001,8 @@ fn grid_tag_badge_start(
     has_comic: bool,
     has_pin: bool,
 ) -> egui::Pos2 {
+    // draw_cell の左上バッジ描画ループと同じ順序・padding で進める。
+    // どちらかの配置を変える場合は、当たり判定がずれないよう両方を更新する。
     let font = egui::FontId::proportional(11.0);
     let pad_x = 4.0;
     let mut x = rect.min.x + 3.0;

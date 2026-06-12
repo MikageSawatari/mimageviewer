@@ -3316,9 +3316,25 @@ impl App {
         if response.clicked() || response.double_clicked() || response.secondary_clicked() {
             self.folder_pane.set_focus_grid();
         }
+        let tag_badge_target = self.grid_tag_badge_target(ui, cell_rect, idx);
+        if let Some((tag_name, badge_rect)) = tag_badge_target.as_ref() {
+            if response.hovered()
+                && ctx
+                    .input(|i| i.pointer.hover_pos())
+                    .is_some_and(|pos| badge_rect.contains(pos))
+            {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                response
+                    .clone()
+                    .on_hover_text(format!("{tag_name} をタグビューで探す"));
+            }
+        }
         if response.clicked()
             && !ctx.input(|i| i.modifiers.ctrl || i.modifiers.shift)
-            && let Some(tag_name) = self.clicked_grid_tag_badge(ui, cell_rect, idx, &response)
+            && let Some((tag_name, badge_rect)) = tag_badge_target
+            && response
+                .interact_pointer_pos()
+                .is_some_and(|pos| badge_rect.contains(pos))
         {
             self.open_tag_view_for_tag(&tag_name);
             return None;
@@ -3486,17 +3502,15 @@ impl App {
         nav
     }
 
-    fn clicked_grid_tag_badge(
+    fn grid_tag_badge_target(
         &self,
         ui: &egui::Ui,
         cell_rect: egui::Rect,
         idx: usize,
-        response: &egui::Response,
-    ) -> Option<String> {
+    ) -> Option<(String, egui::Rect)> {
         if self.items_are_drive_list {
             return None;
         }
-        let pos = response.interact_pointer_pos()?;
         let tags = self.cell_tag_list(idx);
         let tag_name = crate::app::primary_grid_tag_for_badge(tags)?.to_owned();
         let badge_rect = crate::app::grid_tag_badge_hit_rect(
@@ -3510,7 +3524,7 @@ impl App {
             self.cell_has_pin_badge(idx),
             tags,
         )?;
-        badge_rect.contains(pos).then_some(tag_name)
+        Some((tag_name, badge_rect))
     }
 
     fn cell_has_pin_badge(&self, idx: usize) -> bool {

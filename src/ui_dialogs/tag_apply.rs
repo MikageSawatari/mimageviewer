@@ -26,6 +26,8 @@ impl App {
         }
         self.hydrate_tags_cache_for_paths(&paths);
         self.tag_apply_input.clear();
+        self.tag_apply_suggestion_key = None;
+        self.tag_apply_suggestions.clear();
         self.show_tag_apply = true;
     }
 
@@ -46,9 +48,9 @@ impl App {
             .iter()
             .map(|choice| choice.tag_key.clone())
             .collect();
-        let suggestions = tag_suggestions(self, &self.tag_apply_input);
         let normalized_input =
             crate::tags_db::normalize_tag_display_name(self.tag_apply_input.trim());
+        let suggestions = self.cached_tag_apply_suggestions(&normalized_input);
         let input_len = normalized_input.chars().count();
         let input_valid = !normalized_input.is_empty() && input_len <= 64;
         let input_too_long = input_len > 64;
@@ -189,6 +191,7 @@ impl App {
         if let Some(name) = add_tag {
             self.request_tag_add_for_selection(&name);
             self.tag_apply_input.clear();
+            self.tag_apply_suggestion_key = None;
         }
         if let Some(name) = remove_tag {
             self.request_tag_remove_for_selection(&name);
@@ -196,7 +199,29 @@ impl App {
         if close || !open {
             self.show_tag_apply = false;
             self.tag_apply_input.clear();
+            self.tag_apply_suggestion_key = None;
+            self.tag_apply_suggestions.clear();
         }
+    }
+
+    fn cached_tag_apply_suggestions(&mut self, normalized_input: &str) -> Vec<TagChoice> {
+        let cache_key = crate::tags_db::normalize_tag_key(normalized_input);
+        if self.tag_apply_suggestion_key.as_deref() != Some(cache_key.as_str()) {
+            let suggestions = tag_suggestions(self, normalized_input);
+            self.tag_apply_suggestions = suggestions
+                .iter()
+                .map(|choice| (choice.name.clone(), choice.tag_key.clone(), choice.count))
+                .collect();
+            self.tag_apply_suggestion_key = Some(cache_key);
+        }
+        self.tag_apply_suggestions
+            .iter()
+            .map(|(name, tag_key, count)| TagChoice {
+                name: name.clone(),
+                tag_key: tag_key.clone(),
+                count: *count,
+            })
+            .collect()
     }
 }
 
