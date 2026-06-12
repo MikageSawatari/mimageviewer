@@ -625,6 +625,10 @@ fn maybe_handle_version_or_help() -> bool {
     let (mut want_version, mut want_help) = (false, false);
     for a in std::env::args().skip(1) {
         match a.as_str() {
+            // `--` 以降は位置引数 (パス) 扱い。`mimageviewer.exe -- --version` で
+            // `--version` という名前のパスを開けるよう、ここで option 走査を止める
+            // (startup-path パーサの `--` デリミタ対応と整合、Codex P3)。
+            "--" => break,
             "--version" | "-V" => want_version = true,
             "--help" | "-h" => want_help = true,
             _ => {}

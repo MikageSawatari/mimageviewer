@@ -115,6 +115,9 @@ fn maybe_handle_version_or_help(args: &[OsString]) -> bool {
     let (mut want_version, mut want_help) = (false, false);
     for a in args {
         match a.to_str() {
+            // `--` 以降は位置引数 (パス) 扱い。startup-path パーサの `--` デリミタ対応と
+            // 整合させ、`mimageviewer.exe -- --version` をパス指定として扱う (Codex P3)。
+            Some("--") => break,
             Some("--version") | Some("-V") => want_version = true,
             Some("--help") | Some("-h") => want_help = true,
             _ => {}
