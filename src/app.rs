@@ -16035,9 +16035,9 @@ impl App {
         if let Some(nav) = self.handle_folder_pane_keyboard(ctx) {
             return Some(nav);
         }
-        // ペイン開閉トグル (T) は `folder_pane_blocks_grid_keyboard()` の early-return
+        // ペイン開閉トグル (F) は `folder_pane_blocks_grid_keyboard()` の early-return
         // より **前** で処理する。ペイン表示は即フォーカスを奪う (set_folder_tree_pane_visible)
-        // ため、early-return の後ろに置くと「T で開く」はできても「T で閉じる」が
+        // ため、early-return の後ろに置くと「F で開く」はできても「F で閉じる」が
         // 効かない片道トグルになる (ペインにフォーカスがある間は閉じられない)。
         // 閉じる時はカーソルが別フォルダへ動いていれば Enter 相当でそこへ移動する
         // (`toggle_folder_tree_pane_from_key`)。
@@ -31985,6 +31985,19 @@ impl eframe::App for App {
             if ctrl_t {
                 self.toggle_tag_view();
             }
+        }
+
+        // ── T: タグを付ける/外す ───────────────────────────────────
+        if !self.address_has_focus
+            && self.fullscreen_idx.is_none()
+            && !self.any_dialog_open()
+            && !self.search_has_focus
+            && !self.favsearch.has_focus
+            && !self.global_search.has_focus
+            && !self.tag_view.has_focus
+            && self.keymap.pressed_action(ctx, KeyAction::GridTagApply)
+        {
+            self.open_tag_apply_dialog();
         }
 
         // ── Ctrl+O: フォルダを開く ───────────────────────────────────

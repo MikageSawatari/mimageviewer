@@ -66,11 +66,14 @@ impl App {
 
         egui::Window::new("タグを付ける/外す")
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
             .collapsible(false)
             .default_pos(dialog_pos)
+            .min_width(580.0)
+            .default_size(egui::vec2(640.0, 520.0))
             .show(ctx, |ui| {
-                ui.set_min_width(540.0);
+                ui.set_min_width(560.0);
+                ui.set_min_height(420.0);
                 ui.label(
                     egui::RichText::new(format!("対象: {target_count} 件"))
                         .size(11.0)
@@ -168,54 +171,57 @@ impl App {
                 };
                 ui.label(egui::RichText::new(suggestion_title).strong());
                 ui.add_space(2.0);
-                if suggestions.is_empty() {
-                    ui.label(egui::RichText::new("（候補なし）").weak());
+                let available_for_suggestions = ui.available_height();
+                let suggestion_height = if available_for_suggestions.is_finite() {
+                    (available_for_suggestions - 52.0).max(280.0)
                 } else {
+                    360.0
+                };
+                if normalized_input.is_empty() {
                     egui::ScrollArea::vertical()
                         .id_salt("tag_apply_suggestions")
-                        .max_height(180.0)
-                        .auto_shrink([false, true])
+                        .max_height(suggestion_height)
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            if normalized_input.is_empty() {
-                                ui.label(egui::RichText::new("ピン留めしたタグ").strong());
-                                ui.add_space(2.0);
-                                if pinned_choices.is_empty() {
-                                    ui.label(egui::RichText::new("（ピン留めタグなし）").weak());
-                                } else {
-                                    draw_tag_choice_grid(
-                                        ui,
-                                        "tag_apply_pinned_grid",
-                                        &pinned_choices,
-                                        &current_keys,
-                                        &mut add_tag,
-                                        &mut remove_tag,
-                                    );
-                                }
-                                ui.add_space(8.0);
-                                ui.label(egui::RichText::new("最近使ったタグ").strong());
-                                ui.add_space(2.0);
-                                if recent_choices.is_empty() {
-                                    ui.label(egui::RichText::new("（最近使ったタグなし）").weak());
-                                } else {
-                                    draw_tag_choice_grid(
-                                        ui,
-                                        "tag_apply_recent_grid",
-                                        &recent_choices,
-                                        &current_keys,
-                                        &mut add_tag,
-                                        &mut remove_tag,
-                                    );
-                                }
-                            } else {
-                                draw_tag_choice_grid(
-                                    ui,
-                                    "tag_apply_suggestion_grid",
-                                    &suggestions,
+                            ui.columns(2, |columns| {
+                                draw_tag_choice_pane(
+                                    &mut columns[0],
+                                    "ピン留めしたタグ",
+                                    "（ピン留めタグなし）",
+                                    "tag_apply_pinned_rows",
+                                    &pinned_choices,
                                     &current_keys,
                                     &mut add_tag,
                                     &mut remove_tag,
                                 );
-                            }
+                                draw_tag_choice_pane(
+                                    &mut columns[1],
+                                    "最近使ったタグ",
+                                    "（最近使ったタグなし）",
+                                    "tag_apply_recent_rows",
+                                    &recent_choices,
+                                    &current_keys,
+                                    &mut add_tag,
+                                    &mut remove_tag,
+                                );
+                            });
+                        });
+                } else if suggestions.is_empty() {
+                    ui.label(egui::RichText::new("（候補なし）").weak());
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("tag_apply_suggestions")
+                        .max_height(suggestion_height)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            draw_tag_choice_rows(
+                                ui,
+                                "tag_apply_suggestion_rows",
+                                &suggestions,
+                                &current_keys,
+                                &mut add_tag,
+                                &mut remove_tag,
+                            );
                         });
                 }
 
@@ -278,7 +284,26 @@ impl App {
     }
 }
 
-fn draw_tag_choice_grid(
+fn draw_tag_choice_pane(
+    ui: &mut egui::Ui,
+    title: &str,
+    empty_text: &str,
+    id_salt: &'static str,
+    choices: &[TagChoice],
+    current_keys: &HashSet<String>,
+    add_tag: &mut Option<String>,
+    remove_tag: &mut Option<String>,
+) {
+    ui.label(egui::RichText::new(title).strong());
+    ui.add_space(2.0);
+    if choices.is_empty() {
+        ui.label(egui::RichText::new(empty_text).weak());
+    } else {
+        draw_tag_choice_rows(ui, id_salt, choices, current_keys, add_tag, remove_tag);
+    }
+}
+
+fn draw_tag_choice_rows(
     ui: &mut egui::Ui,
     id_salt: &'static str,
     choices: &[TagChoice],
@@ -286,34 +311,50 @@ fn draw_tag_choice_grid(
     add_tag: &mut Option<String>,
     remove_tag: &mut Option<String>,
 ) {
-    egui::Grid::new(id_salt)
-        .striped(true)
-        .num_columns(4)
-        .spacing([8.0, 4.0])
-        .show(ui, |ui| {
-            for choice in choices {
-                let assigned = current_keys.contains(&choice.tag_key);
-                let tag = format!("#{}", choice.name);
-                ui.label(egui::RichText::new(tag).monospace());
-                if choice.count > 0 {
-                    ui.label(format!("{} 件", choice.count));
+    ui.push_id(id_salt, |ui| {
+        let row_h = ui.spacing().interact_size.y;
+        for choice in choices {
+            let assigned = current_keys.contains(&choice.tag_key);
+            let tag = format!("#{}", choice.name);
+            ui.horizontal(|ui| {
+                let spacing = ui.spacing().item_spacing.x * 3.0;
+                let label_w = (ui.available_width() - 144.0 - spacing).max(96.0);
+                ui.add_sized(
+                    [label_w, row_h],
+                    egui::Label::new(egui::RichText::new(&tag).monospace()).truncate(),
+                )
+                .on_hover_text(tag);
+
+                let count_text = if choice.count > 0 {
+                    format!("{}件", choice.count)
                 } else if choice.pinned {
-                    ui.label("ピン留め");
+                    "ピン".to_string()
                 } else {
-                    ui.label("");
-                }
-                if ui.button("付ける").clicked() {
+                    String::new()
+                };
+                ui.add_sized(
+                    [36.0, row_h],
+                    egui::Label::new(egui::RichText::new(count_text).size(11.0).weak()),
+                );
+
+                if ui
+                    .add(egui::Button::new("付ける").min_size(egui::vec2(50.0, row_h)))
+                    .clicked()
+                {
                     *add_tag = Some(choice.name.clone());
                 }
                 if ui
-                    .add_enabled(assigned, egui::Button::new("外す"))
+                    .add_enabled(
+                        assigned,
+                        egui::Button::new("外す").min_size(egui::vec2(42.0, row_h)),
+                    )
                     .clicked()
                 {
                     *remove_tag = Some(choice.name.clone());
                 }
-                ui.end_row();
-            }
-        });
+            });
+        }
+    });
 }
 
 fn current_selection_tags(app: &App, paths: &[PathBuf]) -> Vec<TagChoice> {

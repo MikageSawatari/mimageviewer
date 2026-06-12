@@ -707,6 +707,7 @@ pub enum KeyAction {
     GridDeselect,
     GridToggleCheck,
     GridToggleFolderTreePane,
+    GridTagApply,
     GridTagView,
     GridRotateCw,
     GridRotateCcw,
@@ -898,6 +899,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeselect,
     KeyAction::GridToggleCheck,
     KeyAction::GridToggleFolderTreePane,
+    KeyAction::GridTagApply,
     KeyAction::GridTagView,
     KeyAction::GridRotateCw,
     KeyAction::GridRotateCcw,
@@ -1124,6 +1126,7 @@ impl KeyAction {
             GridDeselect => "GridDeselect",
             GridToggleCheck => "GridToggleCheck",
             GridToggleFolderTreePane => "GridToggleFolderTreePane",
+            GridTagApply => "GridTagApply",
             GridTagView => "GridTagView",
             GridRotateCw => "GridRotateCw",
             GridRotateCcw => "GridRotateCcw",
@@ -1325,6 +1328,7 @@ impl KeyAction {
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridToggleFolderTreePane => "フォルダツリーペインの表示を切り替える",
+            GridTagApply => "タグを付ける/外すダイアログを開く",
             GridTagView => "タグビューを開く",
             GridRotateCw => "選択中の画像を右に90度回転する",
             GridRotateCcw => "選択中の画像を左に90度回転する",
@@ -1518,6 +1522,7 @@ impl KeyAction {
             | GridDeselect
             | GridToggleCheck
             | GridToggleFolderTreePane
+            | GridTagApply
             | GridTagView
             | GridRotateCw
             | GridRotateCcw
@@ -1649,6 +1654,7 @@ impl KeyAction {
             | GridDeselect
             | GridToggleCheck
             | GridToggleFolderTreePane
+            | GridTagApply
             | GridTagView
             | GridRotateCw
             | GridRotateCcw
@@ -1837,7 +1843,8 @@ impl KeyAction {
             GridSelectAll => ChordList::one(Chord::ctrl(A)),
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
-            GridToggleFolderTreePane => ChordList::one(Chord::key(T)),
+            GridToggleFolderTreePane => ChordList::one(Chord::key(F)),
+            GridTagApply => ChordList::one(Chord::key(T)),
             GridTagView => ChordList::one(Chord::ctrl(T)),
             GridRotateCw => ChordList::one(Chord::key(R)),
             GridRotateCcw => ChordList::one(Chord::key(L)),
