@@ -1428,6 +1428,7 @@ impl App {
                     if resp.clicked() {
                         self.set_folder_tree_pane_visible(!active);
                     }
+                    first_section = false;
                 }
                 if show_cols {
                     if !first_section {
@@ -1494,6 +1495,7 @@ impl App {
                                 egui::ComboBox::is_open(ctx, combo.response.id);
                         }
                     }
+                    first_section = false;
                 }
                 if show_aspect {
                     if !first_section {
