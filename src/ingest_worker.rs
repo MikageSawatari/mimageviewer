@@ -533,8 +533,14 @@ mod tests {
         assert_eq!(hits.len(), 0);
     }
 
+    /// タグ刷新 (f64f6b4e〜) で通常 ingest は XMP `dc:subject` の mIV `#` タグを
+    /// FTS 索引へ投影しなくなった (タグは tags.db 専有。`ingest_text.rs` の `tags`
+    /// フィールドは移行時のみ参照し、通常 ingest では populate しない)。
+    /// よってサイドカーに `#` タグを持つ動画を ingest しても、その動画自体は Video
+    /// として索引されるが、`#` タグ文字列では FTS 検索にヒットしない。
+    /// この経路が再び FTS へ漏れない (= 2 索引へ投影しない設計) ことの回帰ガード。
     #[test]
-    fn video_file_ingested_as_video_with_sidecar_tags() {
+    fn video_file_with_sidecar_tags_ingests_but_tag_not_in_fts() {
         let (tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
         let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
@@ -595,8 +601,9 @@ mod tests {
         fts.reload_reader().unwrap();
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, key);
+        // タグ刷新後: `#` タグは FTS へ投影されないので 0 件 (旧挙動は 1 件)。
+        // タグの検索は tags.db / タグビュー側で行う。
+        assert_eq!(hits.len(), 0);
     }
 
     /// Codex P1 回帰: ingest commit 後に reader が確実に reload 済みであること。
