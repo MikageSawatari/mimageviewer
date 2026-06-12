@@ -127,7 +127,17 @@ fn read_png_text_chunks_raw(data: &[u8]) -> std::io::Result<Vec<(String, String)
     let mut chunks = Vec::new();
     let mut pos = 8; // skip signature
 
+    // zlib bomb の多チャンク版への防御 (Codex P2): per-chunk 16 MiB 上限だけでは、
+    // 多数の zTXt/iTXt を並べると N×16 MiB の String が積み上がる。1 ファイルあたりの
+    // 累積テキスト量にも上限を設け、超えたらそれ以降のチャンクを読まない。正規メタは
+    // 全チャンク合計でも数 MB 程度なので 32 MiB は十分広く、攻撃的な合計だけ弾く。
+    const MAX_TOTAL_TEXT_BYTES: usize = 32 * 1024 * 1024;
+    let mut total_text: usize = 0;
+
     while pos + 8 <= data.len() {
+        if total_text >= MAX_TOTAL_TEXT_BYTES {
+            break;
+        }
         let length =
             u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         let chunk_type = &data[pos + 4..pos + 8];
@@ -144,6 +154,7 @@ fn read_png_text_chunks_raw(data: &[u8]) -> std::io::Result<Vec<(String, String)
                 if let Some(null_pos) = chunk_data.iter().position(|&b| b == 0) {
                     let keyword = String::from_utf8_lossy(&chunk_data[..null_pos]).to_string();
                     let text = String::from_utf8_lossy(&chunk_data[null_pos + 1..]).to_string();
+                    total_text = total_text.saturating_add(text.len());
                     chunks.push((keyword, text));
                 }
             }
@@ -155,6 +166,7 @@ fn read_png_text_chunks_raw(data: &[u8]) -> std::io::Result<Vec<(String, String)
                     if null_pos + 2 < chunk_data.len() {
                         let compressed = &chunk_data[null_pos + 2..];
                         if let Ok(text) = decompress_zlib(compressed) {
+                            total_text = total_text.saturating_add(text.len());
                             chunks.push((keyword, text));
                         }
                     }
@@ -187,8 +199,10 @@ fn read_png_text_chunks_raw(data: &[u8]) -> std::io::Result<Vec<(String, String)
 
                         if compression_flag == 0 {
                             let text = String::from_utf8_lossy(text_data).to_string();
+                            total_text = total_text.saturating_add(text.len());
                             chunks.push((keyword, text));
                         } else if let Ok(text) = decompress_zlib(text_data) {
+                            total_text = total_text.saturating_add(text.len());
                             chunks.push((keyword, text));
                         }
                     }
@@ -1784,6 +1798,53 @@ mod tests {
             bomb.len()
         );
         assert!(decompress_zlib(&bomb).is_err());
+    }
+
+    /// zTXt を `n` 個並べた最小 PNG を組む (各 zTXt は `decompressed` バイトの zero に
+    /// 解凍される)。reader は CRC を読み飛ばすのでダミー CRC で足りる。
+    fn build_png_with_ztxt(n: usize, decompressed: usize) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&vec![0u8; decompressed]).unwrap();
+        let compressed = enc.finish().unwrap();
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(b"comment");
+        chunk.push(0); // keyword 終端
+        chunk.push(0); // compression method = zlib
+        chunk.extend_from_slice(&compressed);
+
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        for _ in 0..n {
+            png.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
+            png.extend_from_slice(b"zTXt");
+            png.extend_from_slice(&chunk);
+            png.extend_from_slice(&[0, 0, 0, 0]); // ダミー CRC
+        }
+        png.extend_from_slice(&0u32.to_be_bytes());
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0, 0, 0, 0]);
+        png
+    }
+
+    /// 多チャンク zlib bomb 防御 (Codex P2): 各 16 MiB に解凍される zTXt を 4 個並べても
+    /// (上限なしなら 64 MiB)、ファイル累積上限で早期に読み止め、合計が頭打ちになる。
+    #[test]
+    fn read_png_text_chunks_caps_total_decompressed_across_chunks() {
+        let png = build_png_with_ztxt(4, 16 * 1024 * 1024);
+        let chunks = read_png_text_chunks_from_bytes(&png).unwrap();
+        let total: usize = chunks.iter().map(|(_, t)| t.len()).sum();
+        assert!(
+            chunks.len() < 4,
+            "expected early stop on cumulative budget, got {} chunks",
+            chunks.len()
+        );
+        assert!(
+            total <= 48 * 1024 * 1024,
+            "per-file decompressed total should be bounded, got {total}"
+        );
     }
 
     fn chunks(items: &[(&str, &str)]) -> Vec<(String, String)> {
