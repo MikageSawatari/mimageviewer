@@ -1,6 +1,6 @@
 //! 選択中アイテムへ自由記入タグを付ける/外すダイアログ。
 //!
-//! 「タグの管理」はピン留めタグの語彙管理、このダイアログは現在の選択への
+//! 「ピン留めタグの管理」はピン留めタグの語彙管理、このダイアログは現在の選択への
 //! 付与/削除操作に限定する。
 
 use std::collections::{HashMap, HashSet};
@@ -15,6 +15,7 @@ struct TagChoice {
     name: String,
     tag_key: String,
     count: usize,
+    pinned: bool,
 }
 
 impl App {
@@ -127,8 +128,18 @@ impl App {
                 }
 
                 ui.add_space(10.0);
+                let pinned_choices: Vec<_> = suggestions
+                    .iter()
+                    .filter(|choice| choice.pinned)
+                    .cloned()
+                    .collect();
+                let recent_choices: Vec<_> = suggestions
+                    .iter()
+                    .filter(|choice| !choice.pinned)
+                    .cloned()
+                    .collect();
                 let suggestion_title = if normalized_input.is_empty() {
-                    "最近使ったタグ"
+                    "タグ候補"
                 } else {
                     "候補"
                 };
@@ -142,32 +153,46 @@ impl App {
                         .max_height(180.0)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            egui::Grid::new("tag_apply_suggestion_grid")
-                                .striped(true)
-                                .num_columns(4)
-                                .spacing([8.0, 4.0])
-                                .show(ui, |ui| {
-                                    for choice in &suggestions {
-                                        let pinned = current_keys.contains(&choice.tag_key);
-                                        let tag = format!("#{}", choice.name);
-                                        ui.label(egui::RichText::new(tag).monospace());
-                                        if choice.count > 0 {
-                                            ui.label(format!("{} 件", choice.count));
-                                        } else {
-                                            ui.label("");
-                                        }
-                                        if ui.button("付ける").clicked() {
-                                            add_tag = Some(choice.name.clone());
-                                        }
-                                        if ui
-                                            .add_enabled(pinned, egui::Button::new("外す"))
-                                            .clicked()
-                                        {
-                                            remove_tag = Some(choice.name.clone());
-                                        }
-                                        ui.end_row();
-                                    }
-                                });
+                            if normalized_input.is_empty() {
+                                ui.label(egui::RichText::new("ピン留めしたタグ").strong());
+                                ui.add_space(2.0);
+                                if pinned_choices.is_empty() {
+                                    ui.label(egui::RichText::new("（ピン留めタグなし）").weak());
+                                } else {
+                                    draw_tag_choice_grid(
+                                        ui,
+                                        "tag_apply_pinned_grid",
+                                        &pinned_choices,
+                                        &current_keys,
+                                        &mut add_tag,
+                                        &mut remove_tag,
+                                    );
+                                }
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new("最近使ったタグ").strong());
+                                ui.add_space(2.0);
+                                if recent_choices.is_empty() {
+                                    ui.label(egui::RichText::new("（最近使ったタグなし）").weak());
+                                } else {
+                                    draw_tag_choice_grid(
+                                        ui,
+                                        "tag_apply_recent_grid",
+                                        &recent_choices,
+                                        &current_keys,
+                                        &mut add_tag,
+                                        &mut remove_tag,
+                                    );
+                                }
+                            } else {
+                                draw_tag_choice_grid(
+                                    ui,
+                                    "tag_apply_suggestion_grid",
+                                    &suggestions,
+                                    &current_keys,
+                                    &mut add_tag,
+                                    &mut remove_tag,
+                                );
+                            }
                         });
                 }
 
@@ -210,19 +235,65 @@ impl App {
             let suggestions = tag_suggestions(self, normalized_input);
             self.tag_apply_suggestions = suggestions
                 .iter()
-                .map(|choice| (choice.name.clone(), choice.tag_key.clone(), choice.count))
+                .map(|choice| {
+                    (
+                        choice.name.clone(),
+                        choice.tag_key.clone(),
+                        choice.count,
+                        choice.pinned,
+                    )
+                })
                 .collect();
             self.tag_apply_suggestion_key = Some(cache_key);
         }
         self.tag_apply_suggestions
             .iter()
-            .map(|(name, tag_key, count)| TagChoice {
+            .map(|(name, tag_key, count, pinned)| TagChoice {
                 name: name.clone(),
                 tag_key: tag_key.clone(),
                 count: *count,
+                pinned: *pinned,
             })
             .collect()
     }
+}
+
+fn draw_tag_choice_grid(
+    ui: &mut egui::Ui,
+    id_salt: &'static str,
+    choices: &[TagChoice],
+    current_keys: &HashSet<String>,
+    add_tag: &mut Option<String>,
+    remove_tag: &mut Option<String>,
+) {
+    egui::Grid::new(id_salt)
+        .striped(true)
+        .num_columns(4)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            for choice in choices {
+                let assigned = current_keys.contains(&choice.tag_key);
+                let tag = format!("#{}", choice.name);
+                ui.label(egui::RichText::new(tag).monospace());
+                if choice.count > 0 {
+                    ui.label(format!("{} 件", choice.count));
+                } else if choice.pinned {
+                    ui.label("ピン留め");
+                } else {
+                    ui.label("");
+                }
+                if ui.button("付ける").clicked() {
+                    *add_tag = Some(choice.name.clone());
+                }
+                if ui
+                    .add_enabled(assigned, egui::Button::new("外す"))
+                    .clicked()
+                {
+                    *remove_tag = Some(choice.name.clone());
+                }
+                ui.end_row();
+            }
+        });
 }
 
 fn current_selection_tags(app: &App, paths: &[PathBuf]) -> Vec<TagChoice> {
@@ -245,6 +316,7 @@ fn current_selection_tags(app: &App, paths: &[PathBuf]) -> Vec<TagChoice> {
                     name,
                     tag_key,
                     count: 1,
+                    pinned: false,
                 });
         }
     }
@@ -255,11 +327,11 @@ fn current_selection_tags(app: &App, paths: &[PathBuf]) -> Vec<TagChoice> {
 
 fn tag_suggestions(app: &App, query: &str) -> Vec<TagChoice> {
     let query_key = crate::tags_db::normalize_tag_key(query);
-    let registered: HashMap<String, String> = app
+    let registered: HashMap<String, (String, bool)> = app
         .settings
         .tags
         .iter()
-        .map(|tag| (tag.tag_key.clone(), tag.name.clone()))
+        .map(|tag| (tag.tag_key.clone(), (tag.name.clone(), tag.show_shortcut)))
         .collect();
     let mut summaries = if let Some(db) = app.tags_db.as_ref() {
         if query_key.is_empty() {
@@ -280,20 +352,25 @@ fn tag_suggestions(app: &App, query: &str) -> Vec<TagChoice> {
     let mut out: Vec<TagChoice> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    let add_registered = |out: &mut Vec<TagChoice>, seen: &mut HashSet<String>| {
-        for tag in &app.settings.tags {
-            if !query_key.is_empty() && !tag.tag_key.starts_with(&query_key) {
-                continue;
+    let add_registered =
+        |out: &mut Vec<TagChoice>, seen: &mut HashSet<String>, pinned_only: bool| {
+            for tag in &app.settings.tags {
+                if pinned_only && !tag.show_shortcut {
+                    continue;
+                }
+                if !query_key.is_empty() && !tag.tag_key.starts_with(&query_key) {
+                    continue;
+                }
+                if seen.insert(tag.tag_key.clone()) {
+                    out.push(TagChoice {
+                        name: tag.name.clone(),
+                        tag_key: tag.tag_key.clone(),
+                        count: 0,
+                        pinned: tag.show_shortcut,
+                    });
+                }
             }
-            if seen.insert(tag.tag_key.clone()) {
-                out.push(TagChoice {
-                    name: tag.name.clone(),
-                    tag_key: tag.tag_key.clone(),
-                    count: 0,
-                });
-            }
-        }
-    };
+        };
     let add_summaries = |out: &mut Vec<TagChoice>,
                          seen: &mut HashSet<String>,
                          summaries: &mut Vec<crate::tags_db::TagSummary>| {
@@ -307,23 +384,24 @@ fn tag_suggestions(app: &App, query: &str) -> Vec<TagChoice> {
                 }
                 continue;
             }
-            let name = registered
+            let (name, pinned) = registered
                 .get(&summary.tag_key)
                 .cloned()
-                .unwrap_or_else(|| summary.tag.clone());
+                .unwrap_or_else(|| (summary.tag.clone(), false));
             out.push(TagChoice {
                 name,
                 tag_key: summary.tag_key,
                 count: summary.count,
+                pinned,
             });
         }
     };
 
     if query_key.is_empty() {
+        add_registered(&mut out, &mut seen, true);
         add_summaries(&mut out, &mut seen, &mut summaries);
-        add_registered(&mut out, &mut seen);
     } else {
-        add_registered(&mut out, &mut seen);
+        add_registered(&mut out, &mut seen, false);
         add_summaries(&mut out, &mut seen, &mut summaries);
     }
 

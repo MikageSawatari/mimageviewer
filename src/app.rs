@@ -3422,7 +3422,7 @@ pub struct App {
     pub(crate) show_tag_apply: bool,
     pub(crate) tag_apply_input: String,
     pub(crate) tag_apply_suggestion_key: Option<String>,
-    pub(crate) tag_apply_suggestions: Vec<(String, String, usize)>,
+    pub(crate) tag_apply_suggestions: Vec<(String, String, usize, bool)>,
     /// タグ管理ダイアログの改名/統合を tags.db へ反映する一回限り worker。
     pub(crate) tag_maintenance_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// タグ書き込み worker (初回要求時に遅延初期化)。

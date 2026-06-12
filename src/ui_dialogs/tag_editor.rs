@@ -43,7 +43,7 @@ impl App {
         let mut remove: Option<usize> = None;
         let mut add_empty_row = false;
 
-        egui::Window::new("タグの管理")
+        egui::Window::new("ピン留めタグの管理")
             .open(&mut open)
             .resizable(false)
             .collapsible(false)

@@ -864,7 +864,7 @@ impl App {
 
                 // タグメニュー (docs/tag-feature.md §4.2)
                 let response = ui.menu_button("タグ", |ui| {
-                    if ui.button("タグの管理…").clicked() {
+                    if ui.button("ピン留めタグの管理…").clicked() {
                         self.open_tag_editor();
                         ui.close();
                     }
@@ -1325,13 +1325,15 @@ impl App {
         let show_sort = !tb_sorts.is_empty();
         let show_favs = self.settings.show_toolbar_favorites;
         let show_rating = self.settings.show_toolbar_rating;
+        let show_tags = self.settings.show_toolbar_tags;
         let show_folder_tree_button = self.settings.show_toolbar_folder_tree_button;
         let any_toolbar_section = show_folder_tree_button
             || show_cols
             || show_aspect
             || show_sort
             || show_favs
-            || show_rating;
+            || show_rating
+            || show_tags;
 
         if !any_toolbar_section {
             return None;
@@ -1342,6 +1344,7 @@ impl App {
         let mut toolbar_rating_changed = false;
         let mut toolbar_tag_click: Option<String> = None;
         let mut toolbar_tag_search: Option<String> = None;
+        let mut toolbar_tag_apply = false;
         let mut toolbar_combo_popup_open = false;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -1424,7 +1427,6 @@ impl App {
                     if resp.clicked() {
                         self.set_folder_tree_pane_visible(!active);
                     }
-                    first_section = false;
                 }
                 if show_cols {
                     if !first_section {
@@ -1491,7 +1493,6 @@ impl App {
                                 egui::ComboBox::is_open(ctx, combo.response.id);
                         }
                     }
-                    first_section = false;
                 }
                 if show_aspect {
                     if !first_section {
@@ -1759,12 +1760,19 @@ impl App {
                     .filter(|tag| tag.show_shortcut)
                     .map(|t| t.name.clone())
                     .collect();
-                if self.settings.show_toolbar_tags && !toolbar_tags.is_empty() {
+                if show_tags {
                     if !first_section {
                         ui.separator();
                     }
                     toolbar_label(ui, "タグ:", 42.0);
                     let has_target = self.tag_target_path_count() > 0;
+                    if ui
+                        .add_enabled(has_target, egui::Button::new("設定…"))
+                        .hover_tip("選択中の項目へタグを付ける/外す")
+                        .clicked()
+                    {
+                        toolbar_tag_apply = true;
+                    }
                     for name in toolbar_tags {
                         let label = format!("#{name}");
                         let resp = ui.add_enabled(has_target, egui::Button::new(label));
@@ -1827,6 +1835,9 @@ impl App {
         }
         if let Some(name) = toolbar_tag_search {
             self.open_tag_view_for_tag(&name);
+        }
+        if toolbar_tag_apply {
+            self.open_tag_apply_dialog();
         }
 
         // (旧) VST3 プラグイン管理ボタンの click handler はツールバーボタン削除に伴い撤去。
