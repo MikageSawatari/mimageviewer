@@ -125,3 +125,152 @@ v1.3.0 のリリースレビュー (Claude マルチエージェント + Codex) 
 - レビュー対応で実装済みの項目は git 履歴 (v1.3.0 リリースレビュー対応コミット) を参照。
 - 機能追加アイデアは [feature-expansion-ideas.md](feature-expansion-ideas.md)、
   VST3 個別 TODO は [vst3-todo.md](vst3-todo.md) を参照。
+
+---
+
+## 4. 5ch feedback backlog after v1.3.0
+
+Source thread: https://egg.5ch.io/test/read.cgi/software/1752914772/
+
+### 4.1 Page number overlay
+
+- Source: 743, 744.
+- Request: Always show `(current page) / (total pages)` for comic-reader use.
+- Planned response: Add a small bottom-right page number overlay. It should be possible to turn it off if it is distracting.
+- Suggested default: ON.
+- Display rules:
+  - Single page: `12 / 180`.
+  - Spread: `12-13 / 180`.
+  - Continuous vertical / horizontal reading: show the page nearest the viewport center, e.g. `12 / 180`.
+- Related detailed plan: [page-number-overlay-plan.md](page-number-overlay-plan.md).
+
+### 4.2 Seek bar / page position without covering the image
+
+- Source: 745.
+- Request: The seek bar and page position currently appear only on mouse hover and cover the image. Add an option to show them constantly without overlaying the image.
+- Proposed design:
+  - Keep the current hover seek bar behavior as the default.
+  - Add a lock/pin button at the edge of the fullscreen seek bar.
+  - When locked, reserve a bottom HUD area for the seek bar/page position.
+  - Fit the image into the remaining area above the locked seek bar, so the seek bar does not cover the image.
+  - When unlocked, return to the current overlay-on-hover behavior.
+- Implementation notes:
+  - Avoid making the image area smaller unless the user explicitly locks the seek bar.
+  - Persist the locked/unlocked state in settings.
+  - Coordinate with the page-number overlay so the two do not overlap.
+  - Check fullscreen and windowed/in-window modes separately.
+- Priority: Medium. This is a larger layout change than the page-number overlay.
+
+### 4.3 画像・動画ビューアの別ウィンドウ化
+
+- 出典: 745.
+- 要望:
+  - Leeyes / MangaMeeya のように、ファイル選択ウィンドウと画像・動画表示ウィンドウを分離したい。
+  - 想定される挙動は「フルスクリーンを一時的に別窓化する」ではなく、1 回開いた画像・動画ビューアウィンドウが常駐し、ESC で一覧へ戻ってもビューアウィンドウ自体は残る形。
+  - ビューア側で前後の画像・動画やフォルダへ移動した場合、メインウィンドウ側のサムネイル一覧カーソルも常に同じ項目へ追従する。
+  - 見開き表示では、主カーソルに加えて、同時に開かれている相方ページをサブカーソルとして一覧側にも表示できると望ましい。
+- 設計方針:
+  - `fullscreen_idx` を「閉じたら終わる一時的なフルスクリーン状態」として拡張し続けるより、常駐する単一の `ViewerSession` を導入する方が自然。
+  - `ViewerSession` は少なくとも以下を持つ:
+    - `current_idx`: ビューアの現在項目。メイン一覧カーソル同期の正本。
+    - `secondary_idx`: 見開き表示の相方ページ。通常は `None`。
+    - `presentation`: `MainWindow` / `Windowed` / `Fullscreen` などの表示形態。
+    - `visible`: ビューアを表示中かどうか。ESC では原則としてセッションを破棄しない。
+  - 「別ウィンドウモード」は別機能ではなく、同じ `ViewerSession` の `presentation == Windowed` として扱う。
+  - フルスクリーン表示、メインウィンドウ内表示、別ウィンドウ表示は、同じビューア状態を異なる場所・サイズで見せるだけにする。
+- メインウィンドウ同期:
+  - ビューアの `current_idx` が変わるすべての経路で、メイン側の `selected` / `scroll_to_selected` / 直近選択項目の記録を同時に更新する。
+  - メインウィンドウが表示されている別ウィンドウモードでは、カーソル移動が即時に見えるよう root viewport の repaint を要求する。
+  - フルスクリーンでメインウィンドウが見えない場合も、論理状態としては常に `selected` とスクロール目標を更新する。戻った瞬間に正しい位置を表示できるようにする。
+  - ただし、見えないメイン一覧を毎フレーム重く描画する必要はない。同期すべきなのは選択状態・スクロール目標・フォルダ状態であり、不要なサムネイルロードやフォルダスキャンは増やさない。
+- ナビゲーションとフォルダ移動:
+  - 静止画フルスクリーンの前後移動、ジャンプ、連続読書、Ctrl+↑↓ のフォルダ移動、動画 native presenter 側の前後移動・遅延移動を、共通の「ビューア現在項目を変更してメイン一覧へ同期する」ヘルパーへ寄せる。
+  - 現状の静止画フルスクリーン経路は移動時点で `selected` を更新しているが、動画 native presenter 側の直接移動は閉じるタイミングの同期に寄りがちなので、この要件では明示的な即時同期が必要。
+  - フォルダ移動では、結果のフォルダロードが完了した時点でメイン一覧も新フォルダへ切り替え、ビューアの現在項目と同じ項目へスクロールする。
+- ESC / close の挙動:
+  - `Windowed` で ESC: ビューアウィンドウは閉じず、フォーカスをメインへ戻す、またはビューア操作モードだけ抜ける。
+  - `Fullscreen` で ESC: `ViewerSession` は維持したまま、`presentation` を `Windowed` または直前の表示形態へ戻す。
+  - `MainWindow` 表示で ESC: 一覧表示へ戻す。ただし、ビューアセッションを残すか非表示にするかは設定・仕様として明確化する。
+  - ビューアの完全終了は、ウィンドウの閉じるボタン、専用コマンド、または明示的な `Close viewer` アクションに寄せる。
+- 動画固有の注意点:
+  - 静止画は既存の egui viewport / fullscreen 描画を流用しやすい。
+  - 動画は native presenter / HWND 系の処理があるため、画像と同じ常駐ビューアウィンドウにどう紐づけるかが最大のリスク。
+  - 初期実装では、画像は egui viewport に描画し、動画は native presenter を viewer window の位置・サイズへ追従させる方式が現実的。
+  - 長期的には、画像・動画のどちらも同じ `ViewerSession` にぶら下がり、表示形態の切替だけで windowed / fullscreen を行える状態を目指す。
+- UI 詳細:
+  - 見開き時の `secondary_idx` はサムネイル一覧でサブカーソルとして描画する。主カーソルとは見た目を分け、詳細表示モードでの表現も決める。
+  - キーボード操作は新規操作を `KeyAction` / keymap 経由にする。ビューアにフォーカスがある場合とメイン一覧にフォーカスがある場合の入力先を明確にする。
+  - ゲームパッド、マウスホイール、ドラッグ & ドロップ、F11、ウィンドウの最前面/最小化/閉じる挙動は個別に仕様化する。
+  - 別ウィンドウの位置・サイズ・最後の表示形態は設定へ保存する候補。
+- 推奨フェーズ / 工数感:
+  - フェーズ 1: 静止画のみの常駐 `ViewerSession` + `Windowed` 表示 + メイン一覧カーソル同期。約 1 週間。
+  - フェーズ 2: 見開き `secondary_idx` とサブカーソル表示、フォルダ移動時の同期、ドキュメント更新・スナップショット。追加で数日〜1 週間。
+  - フェーズ 3: 動画 native presenter を常駐 viewer window に統合し、フォーカス・HUD・リサイズ・fullscreen 切替を整理。追加で 1〜2 週間以上。
+  - 複数の独立ビューアウィンドウを同時に開く設計は、単一 `fullscreen_idx` 前提を大きく崩すため別課題。必要なら `ViewerSession` を複数持つ設計として 1〜2 か月級の改修を見込む。
+- 優先度: Low / 設計調査を先行。静止画のみの MVP は中規模、画像・動画の同等対応まで含めると大きめの UI アーキテクチャ変更。
+
+### 4.4 Jump forward/backward by a fixed amount
+
+- Source: 745.
+- Request: Add key operations that jump forward/backward by a configured amount, such as fixed 10 pages or 10% of total pages.
+- Proposed design:
+  - Add commands such as `jump_forward_large` and `jump_backward_large`.
+  - Make them available in `keymap.ini`.
+  - Add settings for jump mode:
+    - Fixed page count.
+    - Percentage of total pages.
+  - Initial default candidate: 10 pages or 10%.
+- Notes:
+  - Clamp to first/last page.
+  - For spread mode, land on a valid display index while respecting existing spread pairing behavior.
+  - For continuous reading, update scroll position to center the target page.
+- Priority: Medium. Useful and relatively contained if implemented through the existing navigation command layer.
+
+### 4.5 Filename-oriented selection mode discoverability
+
+- Source: 745, 747.
+- Request: A mode to select by filename instead of thumbnails.
+- Status: 対応済み扱い (existing detailed view covers the request).
+- Current state:
+  - Covered by the existing detailed view mode.
+  - User was informed that the toolbar column/detail mode and `Alt+-` switch to detailed view.
+- Decision:
+  - Do not add a separate filename-selection mode for now.
+  - Reopen only if later feedback says detailed view is insufficient.
+- Priority: 対応済み / no implementation required.
+
+### 4.6 Customize information shown under the selection cursor
+
+- Source: 745.
+- Request: Customize the information shown under the file selection cursor. Current full path is redundant when the folder bar is visible; user wants update time and file size as possible fields.
+- Proposed design:
+  - Add checkboxes for displayed fields:
+    - File name.
+    - Full path.
+    - Resolution.
+    - File size.
+    - Modified time.
+  - Consider presets instead of too many checkboxes if the preferences page becomes crowded.
+- Notes:
+  - For archive entries, file size and modified time may be missing or archive-entry-specific.
+  - Keep formatting compact to avoid noisy grid UI.
+- Priority: Medium-low.
+
+### 4.7 Show selection cursor initially inside ZIP/archive views
+
+- Source: 745, 747.
+- Request: When opening ZIP, the file selection cursor should be visible initially, matching the folder behavior.
+- Current response: Acknowledged in thread; fix promised.
+- Priority: High for next patch. Small UX consistency bug.
+
+### 4.8 Microsoft Defender false positive follow-up
+
+- Source: 739, 742.
+- Issue: v1.3.0 ZIP package is detected by Microsoft Defender as Trojan, while installer and standalone exe can be downloaded.
+- Current response: Reproduced locally and submitted to Microsoft as a false-positive analysis request.
+- Follow-up:
+  - Track Microsoft analysis result.
+  - If Microsoft confirms false positive, mention it in the next release note or thread reply if needed.
+  - If detection persists, consider repackaging the ZIP and resubmitting.
+  - Code signing may help SmartScreen reputation over time, but Defender malware detections still require false-positive submission.
+- Priority: Release hygiene / support.
