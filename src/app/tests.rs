@@ -2944,6 +2944,91 @@ mod phase_c_drill_nav_tests {
         );
     }
 
+    #[test]
+    fn fullscreen_page_number_label_uses_image_order_for_single_and_spread() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image("c:/book/p001.jpg".into()),
+            GridItem::Image("c:/book/p002.jpg".into()),
+            GridItem::Image("c:/book/p003.jpg".into()),
+            GridItem::Image("c:/book/p004.jpg".into()),
+        ];
+        app.thumbnails = (0..app.items.len())
+            .map(|_| ThumbnailState::Pending)
+            .collect();
+        app.rebuild_visible_indices();
+
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        assert_eq!(
+            app.fullscreen_page_number_label(2).as_deref(),
+            Some("3 / 4")
+        );
+
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        assert_eq!(
+            app.fullscreen_page_number_label(1).as_deref(),
+            Some("1-2 / 4")
+        );
+    }
+
+    #[test]
+    fn fullscreen_page_number_label_ignores_video_and_zip_separators() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let zip = std::path::PathBuf::from(r"C:\book\vol.zip");
+        let pdf = std::path::PathBuf::from(r"C:\book\scan.pdf");
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image("c:/book/p001.jpg".into()),
+            GridItem::Video("c:/book/bonus.mp4".into()),
+            GridItem::ZipSeparator {
+                dir_display: "chapter".to_string(),
+            },
+            GridItem::ZipImage {
+                zip_path: zip,
+                entry_name: "p002.jpg".to_string(),
+            },
+            GridItem::PdfPage {
+                pdf_path: pdf,
+                page_num: 0,
+                content_type: None,
+            },
+        ];
+        app.thumbnails = (0..app.items.len())
+            .map(|_| ThumbnailState::Pending)
+            .collect();
+        app.rebuild_visible_indices();
+
+        assert_eq!(
+            app.fullscreen_page_number_label(3).as_deref(),
+            Some("2 / 3")
+        );
+        assert_eq!(app.fullscreen_page_number_label(1), None);
+        assert_eq!(app.fullscreen_page_number_label(2), None);
+    }
+
+    #[test]
+    fn fullscreen_page_number_label_in_continuous_reading_uses_current_page() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image("c:/book/p001.jpg".into()),
+            GridItem::Image("c:/book/p002.jpg".into()),
+            GridItem::Image("c:/book/p003.jpg".into()),
+        ];
+        app.thumbnails = (0..app.items.len())
+            .map(|_| ThumbnailState::Pending)
+            .collect();
+        app.rebuild_visible_indices();
+        app.reading_flow = crate::settings::ReadingFlow::Vertical;
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+
+        assert_eq!(
+            app.fullscreen_page_number_label(2).as_deref(),
+            Some("3 / 3")
+        );
+    }
+
     /// drilled view 内で deeper subfolder に drill-in → BS で 1 階層戻ったとき、
     /// 直前に居た subfolder の Folder セルにカーソルが復帰すること。
     #[test]

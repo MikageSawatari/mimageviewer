@@ -1562,6 +1562,9 @@ pub struct Settings {
     /// 静止画フルスクリーン下部のページシークバーを常時表示し、画像領域から除外する。
     #[serde(default)]
     pub fullscreen_seek_bar_locked: bool,
+    /// 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。
+    #[serde(default = "default_true")]
+    pub fullscreen_page_number_overlay: bool,
     /// 連結読みのホイール 1 ノッチあたりスクロール量 (画面サイズ比 %)。
     #[serde(default = "default_continuous_reading_wheel_scroll_percent")]
     pub continuous_reading_wheel_scroll_percent: u32,
@@ -2583,6 +2586,7 @@ impl Default for Settings {
             fullscreen_fit_no_upscale: false,
             fullscreen_fit_no_downscale: false,
             fullscreen_seek_bar_locked: false,
+            fullscreen_page_number_overlay: true,
             continuous_reading_wheel_scroll_percent:
                 default_continuous_reading_wheel_scroll_percent(),
             continuous_reading_key_scroll_percent: default_continuous_reading_key_scroll_percent(),
@@ -3925,6 +3929,7 @@ mod tests {
         assert_eq!(s.continuous_reading_gap_px, 20);
         assert_eq!(s.fullscreen_fit_mode, FullscreenFitMode::Page);
         assert!(!s.fullscreen_seek_bar_locked);
+        assert!(s.fullscreen_page_number_overlay);
         assert_eq!(s.continuous_reading_wheel_scroll_percent, 20);
         assert_eq!(s.continuous_reading_key_scroll_percent, 16);
         assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 130);

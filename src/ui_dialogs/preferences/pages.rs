@@ -2563,6 +2563,11 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         "下部ページシークバーを固定表示",
     );
     ui.small("ON のときはフルスクリーン下端にシークバー領域を確保し、画像をその上の領域にフィットします。下部シークバー端の鍵アイコンからも切り替えできます。");
+    ui.checkbox(
+        &mut s.fullscreen_page_number_overlay,
+        "ページ番号を常時表示",
+    );
+    ui.small("フルスクリーン右下に現在ページ / 総ページ数を小さく表示します。");
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label("見開きのページ間隔");

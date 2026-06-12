@@ -1938,6 +1938,32 @@ struct FsSeekInfo {
     other_count: usize,
 }
 
+fn format_fullscreen_page_number_label(total: usize, positions: &[usize]) -> Option<String> {
+    if total == 0 || positions.is_empty() {
+        return None;
+    }
+    let mut pages = positions
+        .iter()
+        .copied()
+        .filter(|&page| (1..=total).contains(&page))
+        .collect::<Vec<_>>();
+    if pages.is_empty() {
+        return None;
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    if pages.len() == 1 {
+        Some(format!("{} / {}", pages[0], total))
+    } else {
+        Some(format!(
+            "{}-{} / {}",
+            pages[0],
+            pages[pages.len() - 1],
+            total
+        ))
+    }
+}
+
 impl App {
     fn fullscreen_viewport_id(&self) -> egui::ViewportId {
         egui::ViewportId::from_hash_of(("fullscreen_viewer", self.fs_viewport_generation))
@@ -1998,6 +2024,92 @@ impl App {
             parts.push(format!("その他 {} 件", info.other_count));
         }
         parts.join("、")
+    }
+
+    pub(crate) fn fullscreen_page_number_label(&mut self, fs_idx: usize) -> Option<String> {
+        if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
+            return None;
+        }
+
+        let display_order = self.current_grid_order().to_vec();
+        let image_indices = build_image_reading_indices(&self.items, &display_order);
+        let total = image_indices.len();
+        let position_for = |idx: usize| {
+            image_indices
+                .iter()
+                .position(|&i| i == idx)
+                .map(|pos| pos + 1)
+        };
+
+        let positions = if self.continuous_reading_active_for_idx(fs_idx) {
+            vec![position_for(fs_idx)?]
+        } else {
+            match self.resolve_visible_spread_pair(fs_idx) {
+                SpreadPair::Single => vec![position_for(fs_idx)?],
+                SpreadPair::Double { left, right } => {
+                    let mut positions = Vec::with_capacity(2);
+                    if let Some(pos) = position_for(left) {
+                        positions.push(pos);
+                    }
+                    if let Some(pos) = position_for(right) {
+                        positions.push(pos);
+                    }
+                    positions
+                }
+            }
+        };
+
+        format_fullscreen_page_number_label(total, &positions)
+    }
+
+    fn draw_fullscreen_page_number_overlay(
+        &mut self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        fs_idx: usize,
+    ) {
+        if !self.settings.fullscreen_page_number_overlay {
+            return;
+        }
+        let Some(label) = self.fullscreen_page_number_label(fs_idx) else {
+            return;
+        };
+
+        let painter = ui.painter();
+        let font = egui::FontId::monospace(13.0);
+        let text_color = egui::Color32::from_rgb(245, 247, 250);
+        let galley = painter.layout_no_wrap(label, font, text_color);
+        let padding = egui::vec2(8.0, 4.0);
+        let size = galley.size() + padding * 2.0;
+        let bottom_avoid = if self.fs_seek_overlay_visible {
+            FS_SEEK_BAR_HEIGHT + 8.0
+        } else {
+            0.0
+        };
+        let min = egui::pos2(
+            (full_rect.right() - 12.0 - size.x).max(full_rect.left() + 8.0),
+            (full_rect.bottom() - 12.0 - bottom_avoid - size.y).max(full_rect.top() + 8.0),
+        );
+        let rect = egui::Rect::from_min_size(min, size).intersect(full_rect);
+        if rect.width() < 12.0 || rect.height() < 8.0 {
+            return;
+        }
+
+        painter.rect_filled(
+            rect,
+            5.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
+        );
+        painter.rect_stroke(
+            rect,
+            5.0,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 32),
+            ),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(rect.min + padding, galley, text_color);
     }
 
     fn seek_to_continuous_page(&mut self, ctx: &egui::Context, target_idx: usize) {
@@ -3217,6 +3329,14 @@ impl App {
                                 self.draw_fullscreen_seek_overlay(ui, ctx, full_rect, fs_idx)
                         {
                             jump_to = Some(seek_target);
+                        }
+                        if !state.is_video {
+                            let page_label_idx = self.fullscreen_idx.unwrap_or(fs_idx);
+                            self.draw_fullscreen_page_number_overlay(
+                                ui,
+                                full_rect,
+                                page_label_idx,
+                            );
                         }
                         fs_overlay_ms = overlay_t0.elapsed().as_secs_f64() * 1000.0;
 
