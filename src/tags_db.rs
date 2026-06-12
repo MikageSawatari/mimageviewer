@@ -401,6 +401,34 @@ impl TagsDb {
         rows.flatten().collect()
     }
 
+    pub fn find_exact(&self, tag: &str) -> Option<TagSummary> {
+        let key = normalize_tag_key(tag);
+        if key.is_empty() {
+            return None;
+        }
+        self.conn
+            .query_row(
+                "SELECT tag, tag_key, COUNT(*) AS c, MAX(applied_at) AS last_at
+                 FROM item_tags
+                 WHERE tag_key = ?1
+                 GROUP BY tag_key
+                 LIMIT 1",
+                [key],
+                |row| {
+                    let count: i64 = row.get(2)?;
+                    Ok(TagSummary {
+                        tag: row.get(0)?,
+                        tag_key: row.get(1)?,
+                        count: count.max(0) as usize,
+                        last_applied_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
     pub fn item_keys_by_tag_prefix(&self, prefix: &str, limit: usize) -> Vec<String> {
         let key = normalize_tag_key(prefix);
         if key.is_empty() || limit == 0 {
@@ -618,6 +646,21 @@ mod tests {
         let found = db.find_by_prefix("a_", 10);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].tag, "a_b");
+    }
+
+    #[test]
+    fn exact_search_returns_single_summary() {
+        let mut db = memory_db();
+        db.set_item_tags("c:/cat.jpg", ["cat"], source::EDIT)
+            .unwrap();
+        db.set_item_tags("c:/cat2.jpg", ["#ＣＡＴ"], source::EDIT)
+            .unwrap();
+        db.set_item_tags("c:/catnap.jpg", ["catnap"], source::EDIT)
+            .unwrap();
+
+        let found = db.find_exact("#cat").unwrap();
+        assert_eq!(found.tag_key, "cat");
+        assert_eq!(found.count, 2);
     }
 
     #[test]

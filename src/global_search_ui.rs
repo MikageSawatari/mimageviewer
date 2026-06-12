@@ -143,6 +143,7 @@ const GLOBAL_SEARCH_STATUS_TEXT_SIZE: f32 = 11.0;
 const GLOBAL_SEARCH_STATUS_MIN_WIDTH: f32 = 48.0;
 const GLOBAL_SEARCH_STATUS_MAX_WIDTH: f32 = 260.0;
 const GLOBAL_SEARCH_STATUS_PADDING_X: f32 = 4.0;
+const GLOBAL_SEARCH_TAG_BRIDGE_LIMIT: usize = 3;
 
 fn global_search_status_width(ui: &egui::Ui, text: &str, color: egui::Color32) -> (f32, bool) {
     let galley = ui.painter().layout_no_wrap(
@@ -199,6 +200,13 @@ pub enum GlobalSearchView {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagBridgeSuggestion {
+    pub tag: String,
+    pub tag_key: String,
+    pub count: usize,
+}
+
 /// Ctrl+G 検索の状態 (App が所有する)。
 pub struct GlobalSearchState {
     /// true のとき、トップバー表示 + 検索結果ビュー有効
@@ -240,6 +248,8 @@ pub struct GlobalSearchState {
     pub truncated: bool,
     /// RejectReason のユーザー向けメッセージ (空クエリ / 短すぎる / NOT-only)
     pub reject_message: Option<String>,
+    /// Ctrl+G クエリと一致する mIV タグ。FTS には混ぜず、タグビューへの誘導だけに使う。
+    pub tag_bridge_suggestions: Vec<TagBridgeSuggestion>,
     /// Ctrl+G 以前の current_folder (戻り先として保存)
     pub saved_folder: Option<PathBuf>,
     /// 絞り込みフィルタ (§19.7)。変更時は自動的に検索を再実行する。
@@ -304,6 +314,7 @@ impl Default for GlobalSearchState {
             done: false,
             truncated: false,
             reject_message: None,
+            tag_bridge_suggestions: Vec::new(),
             saved_folder: None,
             filters: GlobalSearchFilters::default(),
             sort_mode: ContainerSortMode::HitCount,
@@ -413,6 +424,7 @@ impl GlobalSearchState {
         self.done = false;
         self.truncated = false;
         self.reject_message = None;
+        self.tag_bridge_suggestions.clear();
         // **Codex P3-1 対応**: 旧クエリ向けの container mtime 取得 worker を cancel
         // (Drop impl が cancel flag を立てる)。旧 containers は上で .clear() 済みなので、
         // 旧 worker が SMB 越しに走り続けても結果は誰にも適用されない。
@@ -444,6 +456,48 @@ impl GlobalSearchState {
         // drill-down 用に生のヒットも保持 (path で後でフィルタする)
         self.all_hits.push(hit.clone());
     }
+}
+
+pub(crate) fn tag_bridge_suggestions_for_query(
+    db: &crate::tags_db::TagsDb,
+    query: &str,
+    limit: usize,
+) -> Vec<TagBridgeSuggestion> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut seen_terms = HashSet::new();
+    let mut seen_tags = HashSet::new();
+    for token in crate::search_query::parse(query)
+        .into_iter()
+        .filter(|token| token.include)
+    {
+        let term = crate::tags_db::normalize_tag_display_name(&token.needle);
+        let term_key = crate::tags_db::normalize_tag_key(&term);
+        if term_key.is_empty() || !seen_terms.insert(term_key) {
+            continue;
+        }
+
+        let candidates = match db.find_exact(&term) {
+            Some(summary) => vec![summary],
+            None => db.find_by_prefix(&term, limit),
+        };
+        for summary in candidates {
+            if seen_tags.insert(summary.tag_key.clone()) {
+                out.push(TagBridgeSuggestion {
+                    tag: summary.tag,
+                    tag_key: summary.tag_key,
+                    count: summary.count,
+                });
+                if out.len() >= limit {
+                    return out;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// ZIP 内エントリを示すヒットパス (`<zippath>\x1F<entry>`) かを判定する。
@@ -1414,6 +1468,7 @@ impl App {
         self.global_search.query.clear();
         self.global_search.last_executed.clear();
         self.global_search.reject_message = None;
+        self.global_search.tag_bridge_suggestions.clear();
         self.global_search.done = false;
         self.global_search.truncated = false;
         self.global_search.total_valid = 0;
@@ -1452,6 +1507,13 @@ impl App {
     pub(crate) fn spawn_global_search(&mut self) {
         self.global_search.reset_for_new_query();
         self.global_search.last_executed = self.global_search.query.clone();
+        if let Some(db) = self.tags_db.as_ref() {
+            self.global_search.tag_bridge_suggestions = tag_bridge_suggestions_for_query(
+                db,
+                &self.global_search.query,
+                GLOBAL_SEARCH_TAG_BRIDGE_LIMIT,
+            );
+        }
 
         // Codex P2 #3: indexer_manager の有無とは独立に filter の健全化を先に行う。
         // 選択中の favorite が削除された / auto_index_metadata を外された場合、UI ラベルと
@@ -2072,6 +2134,7 @@ impl App {
         let mut filter_changed = false;
         let mut sort_changed = false;
         let mut toggle_changed = false;
+        let mut open_tag_bridge: Option<String> = None;
 
         let combo_popup_height = (ctx.content_rect().height() - 96.0).clamp(240.0, 520.0);
         let mut drill_back = false;
@@ -2314,6 +2377,30 @@ impl App {
                     }
                 }
             });
+            if !self.global_search.tag_bridge_suggestions.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(72.0);
+                    ui.label(
+                        egui::RichText::new("タグ候補:")
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(150)),
+                    )
+                    .on_hover_text(
+                        "mIV タグは Ctrl+G の全文検索には混ぜません。\n\
+                         ここからタグビューを開いて tags.db のタグ付き項目を表示できます。",
+                    );
+                    for suggestion in self.global_search.tag_bridge_suggestions.clone() {
+                        let label = format!("#{} ({}件)", suggestion.tag, suggestion.count);
+                        if ui
+                            .small_button(label)
+                            .on_hover_text("タグビューで表示")
+                            .clicked()
+                        {
+                            open_tag_bridge = Some(suggestion.tag);
+                        }
+                    }
+                });
+            }
             ui.add_space(2.0);
         });
 
@@ -2327,6 +2414,10 @@ impl App {
         if drill_back {
             // ボタン押下は「1 段上げる」で統一 (BS と同じ UX)。
             self.drill_back_one_level();
+        }
+        if let Some(tag) = open_tag_bridge {
+            self.open_tag_view_for_tag(&tag);
+            return;
         }
         if filter_changed {
             // ドロップダウン変更は debounce せず即座に再実行する
@@ -2359,6 +2450,7 @@ impl App {
             self.global_search.truncated = false;
             self.global_search.total_valid = 0;
             self.global_search.total_scanned = 0;
+            self.global_search.tag_bridge_suggestions.clear();
             // **review #5 対応**: 旧クエリ結果に対する self.selected / scroll_offset_y が
             // 残っていると、poll_global_search_events の guard (selected.is_some()
             // || scroll_offset_y > 0.5) が次フレームで aggregate_auto を false に
@@ -2398,6 +2490,48 @@ mod tests {
 
     fn zip_hit(zip: &str, entry: &str) -> String {
         format!("{zip}{SEP}{entry}")
+    }
+
+    fn temp_tags_db() -> (tempfile::TempDir, crate::tags_db::TagsDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::tags_db::TagsDb::open_at(&dir.path().join("tags.db")).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn tag_bridge_suggests_plain_and_hash_queries() {
+        let (_dir, mut db) = temp_tags_db();
+        db.set_item_tags("c:/cat.jpg", ["cat"], crate::tags_db::source::EDIT)
+            .unwrap();
+        db.set_item_tags("c:/cat2.jpg", ["#ＣＡＴ"], crate::tags_db::source::EDIT)
+            .unwrap();
+        db.set_item_tags("c:/catnap.jpg", ["catnap"], crate::tags_db::source::EDIT)
+            .unwrap();
+
+        let plain = tag_bridge_suggestions_for_query(&db, "cat", 3);
+        assert_eq!(plain.len(), 1, "完全一致は prefix sibling を混ぜない");
+        assert_eq!(plain[0].tag_key, "cat");
+        assert_eq!(plain[0].count, 2);
+
+        let hashed = tag_bridge_suggestions_for_query(&db, "#cat", 3);
+        assert_eq!(hashed, plain);
+    }
+
+    #[test]
+    fn tag_bridge_uses_prefix_when_exact_is_missing_and_ignores_excludes() {
+        let (_dir, mut db) = temp_tags_db();
+        db.set_item_tags("c:/cat.jpg", ["cat"], crate::tags_db::source::EDIT)
+            .unwrap();
+        db.set_item_tags("c:/catnap.jpg", ["catnap"], crate::tags_db::source::EDIT)
+            .unwrap();
+
+        let prefix = tag_bridge_suggestions_for_query(&db, "ca", 3);
+        let keys: HashSet<_> = prefix.iter().map(|s| s.tag_key.as_str()).collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains("cat"));
+        assert!(keys.contains("catnap"));
+
+        assert!(tag_bridge_suggestions_for_query(&db, "-cat", 3).is_empty());
     }
 
     #[test]
