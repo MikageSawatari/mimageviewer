@@ -26001,56 +26001,68 @@ impl App {
         }
     }
 
-    /// 表示中 PDF ラスターページが「native 寸法は AI 範囲内なのに 4096px 固定レンダで
-    /// 範囲外」状態なら、native 解像度へ再レンダして final AI を起動する (GitHub issue #1)。
+    /// 指定 PDF ラスターページが「native 寸法は AI 範囲内なのに 4096px 固定レンダで現行が
+    /// native より大きい」状態なら、native 解像度へ再レンダして final AI を起動する
+    /// (GitHub issue #1)。`idx` は fs_idx に限らず、**見開き相方・連続表示の可視ページ**にも
+    /// 個別に適用する (それらも `resolve_fs_processed_texture` で final AI 対象のため)。
     ///
     /// PDF 初回フルスクリーンは content_type 未解析のため `start_fs_load` が 4096px 固定で
     /// レンダし、final AI はレンダ後のピクセルサイズで判定する。よって native がサイズ上限内
-    /// (例: 824×1200) のスキャン PDF でも、4096px レンダ結果 (例: 2812×4095) では範囲外と
-    /// 判定され AI がスキップされる。本 reconcile を毎フレーム評価することで、
-    /// 「初回表示で AI ON」と「開いてサイズ確認後に AI を ON」(issue 本文のシナリオ。
-    /// U/N キーで `ai_upscale_enabled` 等が後から true になるケース) の両方を拾う。
+    /// (例: 824×1200) のスキャン PDF でも、4096px レンダ結果 (例: 2812×4095) では AI が
+    /// スキップ (既定 2048 上限) されるか、約 11.5MP を AI に流す (高負荷上限)。本 reconcile を
+    /// 毎フレーム評価することで「初回表示で AI ON」「開いてサイズ確認後に AI を ON」の両方を
+    /// 拾い、かつ高負荷上限でも native (原寸) へ落としてから AI する。
     ///
-    /// **`sync_upscale_from_preset(fs_idx)` の直後に呼ぶこと** — `ai_upscale_enabled` /
-    /// `ai_denoise_model` が当該ページの最新値である前提。判定は純関数
-    /// `ai::upscale::pdf_needs_native_rerender_for_ai` に委ね、in-flight 中 / ズーム中 /
-    /// 収束後はそれ自身が false を返してループや無駄な再レンダを防ぐ。
-    fn maybe_native_rerender_pdf_for_ai(&mut self, fs_idx: usize) {
-        if self.should_native_rerender_pdf_for_ai(fs_idx) {
+    /// 判定 (`should_native_rerender_pdf_for_ai`) はページ個別 `effective_params(idx)` で
+    /// AI 有効性を見るので、AI 設定が fs_idx と異なる相方ページでも正しい。純関数
+    /// `ai::upscale::pdf_needs_native_rerender_for_ai` が in-flight 中 / ズーム中 / 収束後は
+    /// false を返してループや無駄な再レンダを防ぐ。
+    fn maybe_native_rerender_pdf_for_ai(&mut self, idx: usize) {
+        if self.should_native_rerender_pdf_for_ai(idx) {
             // fit 表示 (zoom≈1.0) でだけ到達するので native 基準 (zoom=1.0) で再レンダ。
             // 再レンダ結果が fs_cache に載るとき bump_input_generation で下流 (edit /
             // final / AI) cache が無効化され、final AI が native 寸法で再評価される。
-            self.request_pdf_rerender(fs_idx, 1.0);
+            self.request_pdf_rerender(idx, 1.0);
         }
     }
 
     /// `maybe_native_rerender_pdf_for_ai` の判定部 (副作用なし、単体テスト用に分離)。
     /// App の現在状態 (items の native 寸法 / fs_cache の現行レンダ寸法 / AI 設定 /
     /// ズーム / in-flight) を純関数 `pdf_needs_native_rerender_for_ai` へ束ねる。
-    pub(crate) fn should_native_rerender_pdf_for_ai(&self, fs_idx: usize) -> bool {
+    ///
+    /// AI 有効判定は **`maybe_start_final_ai` と同じ `effective_upscale_request` /
+    /// `effective_denoise_request` を当該ページの `effective_params(idx)` に適用**する。
+    /// グローバルの `ai_upscale_enabled` cache (= fs_idx 用に同期された値) ではなく
+    /// ページ個別設定で判定するので、見開き相方・連続表示の隣接ページ (ページ個別 AI
+    /// 設定が fs_idx と異なりうる) でも final AI ゲートと一致する。
+    pub(crate) fn should_native_rerender_pdf_for_ai(&self, idx: usize) -> bool {
         let Some(GridItem::PdfPage {
             content_type: Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }),
             ..
-        }) = self.items.get(fs_idx)
+        }) = self.items.get(idx)
         else {
             return false;
         };
+        let (native_w, native_h) = (*w, *h);
         // 現在レンダ済みのピクセル寸法 (final AI ゲートが見る pixels.size と同じ)。
-        let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&fs_idx) else {
+        let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) else {
             return false;
         };
         let (cur_w, cur_h) = (pixels.size[0] as u32, pixels.size[1] as u32);
+        let params = self.effective_params(idx);
+        let upscale_on = self.effective_upscale_request(params).is_some();
+        let denoise_on = self.effective_denoise_request(params).is_some();
         crate::ai::upscale::pdf_needs_native_rerender_for_ai(
             self.fs_zoom,
-            *w,
-            *h,
+            native_w,
+            native_h,
             cur_w,
             cur_h,
-            self.ai_upscale_enabled,
+            upscale_on,
             self.settings.ai_upscale_limit(),
-            self.ai_denoise_model.is_some(),
+            denoise_on,
             self.settings.ai_denoise_limit(),
-            self.fs_pending.contains_key(&fs_idx),
+            self.fs_pending.contains_key(&idx),
         )
     }
 
@@ -30935,12 +30947,6 @@ impl eframe::App for App {
         if let Some(fs_idx) = self.fullscreen_idx {
             // プリセットに基づいてアップスケール設定を同期
             self.sync_upscale_from_preset(fs_idx);
-            // PDF ラスターページが「native は AI 範囲内なのに 4096px レンダで範囲外」
-            // 状態なら native 解像度へ再レンダして AI を起動する (GitHub issue #1)。
-            // sync_upscale_from_preset の **直後** に呼ぶことで ai_upscale_enabled /
-            // ai_denoise_model が当該ページの最新値になっている (前ページ / 前フレームの
-            // stale 状態で判定しない)。
-            self.maybe_native_rerender_pdf_for_ai(fs_idx);
             let continuous_keep_set = if !self.reading_flow.is_paged()
                 && self.fs_vertical_cache_keep_set.contains(&fs_idx)
             {
@@ -30948,14 +30954,39 @@ impl eframe::App for App {
             } else {
                 None
             };
+            // 見開き相方ページ (Double のとき)。reconcile と local_adjust の両方で使う。
+            let spread_other: Option<usize> = match self.resolve_spread_pair(fs_idx) {
+                crate::ui_fullscreen::SpreadPair::Double { left, right } => {
+                    Some(if left == fs_idx { right } else { left })
+                }
+                _ => None,
+            };
+            // PDF ラスターページが「native は AI 範囲内なのに 4096px レンダで現行が native
+            // より大きい」状態なら native 解像度へ再レンダして AI を起動する (issue #1)。
+            // sync_upscale_from_preset の **直後** = fs_idx の AI 設定が最新の地点で評価。
+            // 判定自体はページ個別 effective_params なので、見開き相方・連続表示の可視
+            // ページ (= ui_fullscreen が final AI をかける全ページ) にも個別に適用する。
+            {
+                let mut targets: Vec<usize> = Vec::with_capacity(2);
+                targets.push(fs_idx);
+                if let Some(other) = spread_other {
+                    targets.push(other);
+                }
+                if let Some(keep_set) = continuous_keep_set.as_ref() {
+                    targets.extend(keep_set.iter().copied());
+                }
+                targets.sort_unstable();
+                targets.dedup();
+                for idx in targets {
+                    self.maybe_native_rerender_pdf_for_ai(idx);
+                }
+            }
             if let Some(keep_set) = continuous_keep_set.as_ref() {
                 self.evict_final_pipeline_cache_for_keep_set(keep_set);
             } else {
                 self.evict_final_pipeline_cache(fs_idx);
             }
-            let spread_pair = self.resolve_spread_pair(fs_idx);
-            if let crate::ui_fullscreen::SpreadPair::Double { left, right } = spread_pair {
-                let other = if left == fs_idx { right } else { left };
+            if let Some(other) = spread_other {
                 self.maybe_start_local_adjust_render(other);
             }
             self.maybe_start_local_adjust_render(fs_idx);

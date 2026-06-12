@@ -24,18 +24,29 @@
 >   `request_pdf_rerender` がサイズ上限内のラスターページを native 解像度で再レンダした
 >   時点でしか AI が効かず、「content_type 解析後の自動再レンダは PDF pool 負荷との
 >   トレードオフがありスコープ外」としていた。**v1.3.1 で毎フレームの reconcile を追加**:
->   `App::update` の `maybe_native_rerender_pdf_for_ai`
->   (`sync_upscale_from_preset(fs_idx)` の直後 = AI 設定が当該ページの最新値) が、
->   表示中ページが「native はサイズ上限内なのに現行レンダ寸法では範囲外」なら
+>   `App::update` の `maybe_native_rerender_pdf_for_ai` が、対象ページが「native は
+>   サイズ上限内なのに現行レンダ寸法が native より十分大きい」なら
 >   `request_pdf_rerender(idx, 1.0)` で native へ再レンダする。content_type 到着時
 >   (初回表示で AI ON) に加え、**開いてサイズ確認後に U/N キーで AI を ON にする
->   issue 本文のシナリオ**も毎フレーム評価で拾う (poll_prefetch だけでは AI 後付けを
->   取りこぼし、かつ poll_prefetch は sync より前なので AI 状態が stale になる問題を回避)。
+>   issue 本文のシナリオ**も毎フレーム評価で拾う。
+>   - **対象ページ範囲 (Codex 再レビュー P1)**: fs_idx だけでなく **見開き相方ページ +
+>     連続表示の可視ページ (`fs_vertical_cache_keep_set`)** にも適用する。これらも
+>     `ui_fullscreen` が `resolve_fs_processed_texture` で final AI をかけるため、片側だけ
+>     native 化すると相方が 4096px のまま AI skip になる。AI 有効判定は cache 済み
+>     `ai_upscale_enabled` ではなく **ページ個別 `effective_params(idx)` →
+>     `effective_upscale_request` / `effective_denoise_request`** (= `maybe_start_final_ai`
+>     と同じ) で行うので、ページ個別 AI 設定が異なる相方ページでも final AI ゲートと一致する。
+>   - **高負荷上限でも native へ落とす (Codex 再レビュー P2)**: 条件は
+>     `ai_at_native && cur_long > native_long * 1.1`。`!ai_at_cur` ではないので、上限を
+>     `4096` にして現行 4096px レンダ (例 2812×4095 ≈ 11.5MP) も「AI 対象」になるケースでも、
+>     より小さい native (例 824×1200 ≈ 1MP) へ落としてから AI する。PDFium の補間アップ
+>     スケール出力を AI に流すより軽く・高品質。`1.1` 倍は `request_pdf_rerender` の dedup と
+>     一致し、収束後 (cur≈native) は false で毎フレーム呼んでもループ・無駄打ちなし。
 >   判定は純関数 `ai::upscale::pdf_needs_native_rerender_for_ai` (in-flight 中 / ズーム中 /
->   収束後は false を返してループ・無駄な再レンダを防ぐ。単体テスト + app 配線テストあり)。
->   表示中ページ + fit 表示 (zoom≈1.0) のみに絞るので pool 負荷は限定的。非 AI 利用時は
->   再レンダせず 4096px 表示を維持する (range 内ラスターを常に native へ落とすと表示解像度が
->   下がるため、ズーム経路の `in_ai_range` のみ判定とは違い「設定 ON」も AND 条件にしている)。
+>   収束後は false。単体テスト + app 配線テストあり)。fit 表示 (zoom≈1.0) のみ・1 ページ
+>   1 回 (収束) なので pool 負荷は限定的。非 AI 利用時 (AI 設定 OFF → `ai_at_native` が false)
+>   は再レンダせず 4096px 表示を維持する (range 内ラスターを常に native へ落とすと表示解像度が
+>   下がるため「設定 ON」を AND 条件にしている)。
 >   - **スコープ**: 対象は `PdfPageContentType::Raster` のページ。可視テキスト / パス /
 >     シェーディングを含むページは `Vector` 判定 (`pdf_loader::analyze_page_content`) で
 >     4096px 固定のまま AI 対象外 (透明 OCR テキストは `is_visible_text` が無視するので

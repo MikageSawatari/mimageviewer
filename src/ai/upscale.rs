@@ -169,9 +169,16 @@ pub fn ai_would_apply_at_dims(
 /// cancel→respawn 無限ループを防ぐ)。ズーム中 (`zoom != 1`) は zoom ハンドラ
 /// (`maybe_rerender_pdf`) が native×zoom でレンダ済みなので委ね、fit 表示でだけ働く。
 ///
-/// 再レンダが必要 = 「native 寸法では AI が効く」かつ「現在のレンダ寸法では効かない」。
-/// 収束後 (= native へ落ちて現寸法でも AI が効く) は false を返すので毎フレーム呼んでも
-/// 余分な再レンダや no-op 呼び出しが起きない。非 AI 利用時 (両方 OFF) も false。
+/// 再レンダが必要 = 「native 寸法では AI が効く」**かつ**「現行レンダ寸法が native より
+/// 十分大きい」(`cur_long > native_long * 1.1`):
+/// - cur が範囲外 (既定 2048 上限で 4096px レンダ → 2812×4095 等) → AI を効かせるため必須。
+/// - cur が範囲内でも native より大きい (高負荷上限 4096 等で 2812×4095 も AI 対象) →
+///   native (= 埋め込み原寸 824×1200) へ落としてから AI する方が軽く、PDFium の補間
+///   アップスケール出力を AI に流すより高品質 (Codex P2)。
+///
+/// 1.1 倍は `request_pdf_rerender` の dedup (ratio 0.9..=1.1) と一致。収束後 (cur≈native)
+/// は false を返すので毎フレーム呼んでも余分な再レンダや no-op 呼び出しが起きない。
+/// 非 AI 利用時 (両方 OFF → `ai_at_native` が false) も false。
 #[allow(clippy::too_many_arguments)]
 pub fn pdf_needs_native_rerender_for_ai(
     zoom: f32,
@@ -199,15 +206,9 @@ pub fn pdf_needs_native_rerender_for_ai(
         denoise_on,
         denoise_limit,
     );
-    let ai_at_cur = ai_would_apply_at_dims(
-        cur_w,
-        cur_h,
-        upscale_on,
-        upscale_limit,
-        denoise_on,
-        denoise_limit,
-    );
-    ai_at_native && !ai_at_cur
+    let native_long = native_w.max(native_h);
+    let cur_long = cur_w.max(cur_h);
+    ai_at_native && cur_long as f32 > native_long as f32 * 1.1
 }
 
 /// 1 タイルを推論してスケール倍率を検出する（結果をキャッシュ）。
@@ -985,6 +986,18 @@ mod tests {
     #[test]
     fn needs_rerender_when_ai_on_and_cur_over_limit() {
         let limit = AiProcessSizeLimit::square(2048);
+        assert!(pdf_needs_native_rerender_for_ai(
+            1.0, 824, 1200, 2812, 4095, true, limit, false, limit, false,
+        ));
+    }
+
+    /// Codex P2: 高負荷上限 (4096x4096) では cur (2812x4095) も AI 対象 (range 内) だが、
+    /// native (824x1200) の方が小さいので native へ落としてから AI する (約 11.5MP の
+    /// PDFium 出力ではなく原寸 1MP を AI に流す)。`!ai_at_cur` 判定だと取りこぼす。
+    #[test]
+    fn needs_rerender_when_cur_in_range_but_larger_than_native() {
+        let limit = AiProcessSizeLimit::square(4096);
+        // cur 2812x4095 も 4096 上限では range 内だが native 824x1200 へ落とす。
         assert!(pdf_needs_native_rerender_for_ai(
             1.0, 824, 1200, 2812, 4095, true, limit, false, limit, false,
         ));

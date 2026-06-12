@@ -6163,19 +6163,24 @@ mod favorite_adjustment_defaults_tests {
         }
     }
 
-    /// GitHub issue #1 (app 配線): native は AI 範囲内なのに 4096px レンダで範囲外の
-    /// PDF ラスターページを、非 AI / AI 後付け ON / ズーム / デノイズのみ / 収束の各状態で
-    /// 正しく「native 再レンダ要否」判定する。純関数テストが見ない App フィールド抽出
-    /// (items の native 寸法 / fs_cache の現行レンダ寸法 / ai_upscale_enabled /
-    /// ai_denoise_model / fs_zoom) の回帰ガード。
+    /// GitHub issue #1 (app 配線): native は AI 範囲内なのに 4096px レンダで現行が native
+    /// より大きい PDF ラスターページを、非 AI / アップスケール ON / ページ個別で AI OFF /
+    /// ズーム / デノイズのみ / 高負荷上限 (P2) / 収束の各状態で正しく判定する。AI 有効性を
+    /// **ページ個別 effective_params** で見ること (= 見開き相方の個別設定にも追従する、
+    /// Codex P1) と、純関数テストが見ない App フィールド抽出の回帰ガード。
     #[test]
     fn pdf_native_rerender_decision_tracks_app_state() {
+        use crate::ai::ModelKind;
         use crate::ai::upscale::AiProcessSizeLimit;
         use crate::grid_item::GridItem;
+        use crate::settings::AiFeatureMode;
         let ctx = egui::Context::default();
         let mut app = setup_app();
+        app.settings.ai_feature_mode = AiFeatureMode::HighQuality;
         app.settings.ai_upscale_size_limit = Some(AiProcessSizeLimit::square(2048));
         app.settings.ai_denoise_size_limit = Some(AiProcessSizeLimit::square(2048));
+        app.settings.global_preset.upscale_model = None;
+        app.settings.global_preset.denoise_model = None;
 
         // native 100x200 (両軸 2048 未満 = range 内) の PDF ラスターページ。
         app.items.push(GridItem::PdfPage {
@@ -6186,8 +6191,6 @@ mod favorite_adjustment_defaults_tests {
         let idx = app.items.len() - 1;
         app.fullscreen_idx = Some(idx);
         app.fs_zoom = 1.0;
-        app.ai_upscale_enabled = false;
-        app.ai_denoise_model = None;
 
         // FsCacheEntry の tex は判定に使われない (pixels.size を読む) ので、テスト
         // Context のテクスチャ上限 (2048) を超える pixels でも 1x1 ダミーテクスチャで足りる。
@@ -6196,25 +6199,36 @@ mod favorite_adjustment_defaults_tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
             egui::TextureOptions::LINEAR,
         );
+        let set_cur = |app: &mut App, w: usize, h: usize, tex: &egui::TextureHandle| {
+            let px = egui::ColorImage::new([w, h], vec![egui::Color32::WHITE; w * h]);
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex: tex.clone(),
+                    pixels: std::sync::Arc::new(px),
+                    source_dims: None,
+                    load_seq: 0,
+                },
+            );
+        };
 
         // 4096px 固定レンダ相当の現行ラスター (long 4000 ≥ 2048 → range 外)。
-        let big = egui::ColorImage::new([100, 4000], vec![egui::Color32::WHITE; 100 * 4000]);
-        app.fs_cache.insert(
-            idx,
-            FsCacheEntry::Static {
-                tex: dummy_tex.clone(),
-                pixels: std::sync::Arc::new(big),
-                source_dims: None,
-                load_seq: 0,
-            },
-        );
+        set_cur(&mut app, 100, 4000, &dummy_tex);
 
-        // 非 AI: 再レンダしない (ai_upscale_enabled / ai_denoise_model を読む)。
+        // 非 AI (global_preset に AI なし): 再レンダしない。
         assert!(!app.should_native_rerender_pdf_for_ai(idx));
 
         // 「開いてサイズ確認後にアップスケール ON」= issue 本文のシナリオ。
-        // cur は 4096px のまま AI フラグだけ true → 再レンダ要。
-        app.ai_upscale_enabled = true;
+        // global_preset でアップスケール ON → effective_params 経由で再レンダ要。
+        app.settings.global_preset.upscale_model = Some("auto".to_string());
+        assert!(app.should_native_rerender_pdf_for_ai(idx));
+
+        // Codex P1: ページ個別設定で AI OFF にすると、global が ON でも再レンダしない
+        // (= 見開き相方ページが個別に AI OFF のとき final AI も走らないのと一致)。
+        app.adjustment_page_params
+            .insert(idx, crate::adjustment::AdjustParams::default());
+        assert!(!app.should_native_rerender_pdf_for_ai(idx));
+        app.adjustment_page_params.remove(&idx);
         assert!(app.should_native_rerender_pdf_for_ai(idx));
 
         // ズーム中は zoom ハンドラに委ねる (fs_zoom を読む)。
@@ -6222,23 +6236,23 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.should_native_rerender_pdf_for_ai(idx));
         app.fs_zoom = 1.0;
 
-        // デノイズだけでも range 内なら再レンダ要 (ai_denoise_model を読む)。
-        app.ai_upscale_enabled = false;
-        app.ai_denoise_model = Some(crate::ai::ModelKind::DenoiseRealplksr);
+        // デノイズだけでも range 内なら再レンダ要。
+        app.settings.global_preset.upscale_model = None;
+        app.settings.global_preset.denoise_model =
+            Some(ModelKind::DenoiseRealplksr.as_str().to_string());
         assert!(app.should_native_rerender_pdf_for_ai(idx));
+
+        // Codex P2: 高負荷上限 (4096) では cur (100x4000) も range 内だが native (100x200)
+        // へ落としてから AI する (PDFium 出力ではなく原寸を AI に流す)。
+        app.settings.global_preset.denoise_model = None;
+        app.settings.global_preset.upscale_model = Some("auto".to_string());
+        app.settings.ai_upscale_size_limit = Some(AiProcessSizeLimit::square(4096));
+        assert!(app.should_native_rerender_pdf_for_ai(idx));
+        app.settings.ai_upscale_size_limit = Some(AiProcessSizeLimit::square(2048));
 
         // 収束: 現行レンダが native (100x200, range 内) に落ちたら再レンダ不要
         // (fs_cache の現行レンダ寸法を読む。毎フレーム呼んでも no-op)。
-        let native = egui::ColorImage::new([100, 200], vec![egui::Color32::WHITE; 100 * 200]);
-        app.fs_cache.insert(
-            idx,
-            FsCacheEntry::Static {
-                tex: dummy_tex.clone(),
-                pixels: std::sync::Arc::new(native),
-                source_dims: None,
-                load_seq: 0,
-            },
-        );
+        set_cur(&mut app, 100, 200, &dummy_tex);
         assert!(!app.should_native_rerender_pdf_for_ai(idx));
     }
 
