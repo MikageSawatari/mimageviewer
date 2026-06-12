@@ -354,7 +354,9 @@ Tantivy / Ctrl+S 名前索引へ投影しないため、全文検索 commit 待�
 `tags.db.tag_meta.legacy_tantivy_imported` に置く。
 
 Tantivy 移行に乗らない未索引ファイルは、フォルダ表示時の legacy seed worker が
-XMP `dc:subject` の `#` タグを一度だけ `tags.db` へ取り込む。ユーザーが明示的に
+XMP `dc:subject` の `#` タグを一度だけ `tags.db` へ取り込む。自動 seed では
+大量ファイル処理時のディスク占有を避けるため、メディア本体の読み取りは先頭 2MiB
+までに制限する (動画の同名 `.xmp` sidecar は全体を読む)。ユーザーが明示的に
 「旧XMPタグを取り込む」「旧XMPタグを取り込んでファイルから削除」を実行した場合は、
 `tag_item_state` の有無に関係なく選択中の画像/動画を読み直し、既存 tags.db タグへ
 union する。削除モードでは DB 更新成功後に `#` 要素だけを除去し、非 `#` の外部タグは

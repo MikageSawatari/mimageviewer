@@ -78,7 +78,7 @@ fn run_seed(
             continue;
         }
 
-        let subjects = match crate::xmp_reader::try_read_dc_subject(&path) {
+        let subjects = match crate::xmp_reader::try_read_dc_subject_for_legacy_seed(&path) {
             Ok(subjects) => {
                 result.report.read_items += 1;
                 subjects

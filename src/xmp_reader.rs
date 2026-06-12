@@ -593,21 +593,55 @@ pub fn read_dc_subject(path: &Path) -> Vec<String> {
 /// `read_dc_subject` と同じ内容を返すが、ファイル読み取りエラーを呼び出し側へ返す。
 /// XMP 非対応拡張子・XMP パケット無し・動画 sidecar 不在は「タグなし」として `Ok(Vec::new())`。
 pub fn try_read_dc_subject(path: &Path) -> Result<Vec<String>, std::io::Error> {
-    // 動画ファイルは同名 `.xmp` サイドカー (Lightroom 互換形式) を直接読む。
-    // サイドカーは XMP packet そのものなので extract 不要、parse_dc_subject に直行。
-    if crate::xmp_writer::is_video_for_sidecar(path) {
-        let sidecar = crate::xmp_writer::sidecar_path_for(path);
-        return match std::fs::read(&sidecar) {
-            Ok(bytes) => Ok(parse_dc_subject(&bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e),
-        };
+    if let Some(result) = try_read_dc_subject_video_sidecar(path) {
+        return result;
     }
     if !extension_might_have_xmp(path) {
         return Ok(Vec::new());
     }
     let bytes = std::fs::read(path)?;
     Ok(read_dc_subject_from_bytes(&bytes))
+}
+
+const DC_SUBJECT_LEGACY_SEED_SCAN_LIMIT: u64 = 2 * 1024 * 1024;
+
+/// 自動 legacy seed 用の XMP `dc:subject` 読み取り。
+///
+/// 明示インポートは完全性優先で [`try_read_dc_subject`] を使うが、フォルダ表示時に
+/// 走る自動 seed は大量ファイルを処理し得るため、画像/コンテナ本体は先頭 2MiB
+/// だけ読む。動画 `.xmp` sidecar はメディア本体ではないので通常どおり全体を読む。
+pub fn try_read_dc_subject_for_legacy_seed(path: &Path) -> Result<Vec<String>, std::io::Error> {
+    if let Some(result) = try_read_dc_subject_video_sidecar(path) {
+        return result;
+    }
+    if !extension_might_have_xmp(path) {
+        return Ok(Vec::new());
+    }
+    let bytes = read_prefix(path, DC_SUBJECT_LEGACY_SEED_SCAN_LIMIT)?;
+    Ok(read_dc_subject_from_bytes(&bytes))
+}
+
+fn try_read_dc_subject_video_sidecar(path: &Path) -> Option<Result<Vec<String>, std::io::Error>> {
+    // 動画ファイルは同名 `.xmp` サイドカー (Lightroom 互換形式) を直接読む。
+    // サイドカーは XMP packet そのものなので extract 不要、parse_dc_subject に直行。
+    if !crate::xmp_writer::is_video_for_sidecar(path) {
+        return None;
+    }
+    let sidecar = crate::xmp_writer::sidecar_path_for(path);
+    Some(match std::fs::read(&sidecar) {
+        Ok(bytes) => Ok(parse_dc_subject(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    })
+}
+
+fn read_prefix(path: &Path, limit: u64) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+
+    let f = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity((limit as usize).min(64 * 1024));
+    f.take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// バイト列版。
@@ -1257,13 +1291,9 @@ mod tests {
     /// `<x:xmpmeta>...</x:xmpmeta>` を含む有効な APP1 ペイロードを 1 つ持つ
     /// 最小 JPEG をでっち上げる。`junk_app1_size` バイトのダミー APP1 を
     /// XMP の **前に** 挟むことで、ファイル先頭からの距離を増やせる。
-    fn build_jpeg_with_xmp_at_offset(junk_app1_size: usize) -> Vec<u8> {
+    fn build_jpeg_with_xmp_payload_at_offset(junk_app1_size: usize, xmp: &[u8]) -> Vec<u8> {
         let xmp_id = b"http://ns.adobe.com/xap/1.0/\0";
-        let xmp_payload: Vec<u8> = xmp_id
-            .iter()
-            .chain(SAMPLE_XMP_STR.as_bytes())
-            .copied()
-            .collect();
+        let xmp_payload: Vec<u8> = xmp_id.iter().chain(xmp).copied().collect();
 
         let mut out: Vec<u8> = Vec::new();
         out.extend_from_slice(&[0xFF, 0xD8]); // SOI
@@ -1289,6 +1319,26 @@ mod tests {
         // SOS + EOI (画像本体は無くても extract_xmp_from_jpeg は SOS で打ち切るのでここまでで十分)
         out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9]);
         out
+    }
+
+    fn build_jpeg_with_xmp_at_offset(junk_app1_size: usize) -> Vec<u8> {
+        build_jpeg_with_xmp_payload_at_offset(junk_app1_size, SAMPLE_XMP_STR.as_bytes())
+    }
+
+    fn build_jpeg_with_dc_subject_at_offset(junk_app1_size: usize) -> Vec<u8> {
+        let xml = br#"<?xml version='1.0'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+    <rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'>
+      <dc:subject>
+        <rdf:Bag>
+          <rdf:li>#late-seed</rdf:li>
+        </rdf:Bag>
+      </dc:subject>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#;
+        build_jpeg_with_xmp_payload_at_offset(junk_app1_size, xml)
     }
 
     /// fallback-only コンテナの代用として、ftyp マジックを持つ最小 MP4 風バイト列を作る。
@@ -1453,6 +1503,24 @@ mod tests {
 
         let tags = read_dc_subject_from_bytes(&out);
         assert_eq!(tags, vec!["#nature", "#landscape"]);
+    }
+
+    #[test]
+    fn legacy_seed_dc_subject_path_bounds_jpeg_read() {
+        let bytes =
+            build_jpeg_with_dc_subject_at_offset(DC_SUBJECT_LEGACY_SEED_SCAN_LIMIT as usize + 128);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("late_subject.jpg");
+        std::fs::write(&path, &bytes).expect("write tempfile");
+
+        assert_eq!(
+            try_read_dc_subject_for_legacy_seed(&path).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            try_read_dc_subject(&path).unwrap(),
+            vec!["#late-seed".to_string()]
+        );
     }
 
     // ---- xmp:Rating 読み取り ----
