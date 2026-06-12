@@ -397,7 +397,7 @@ fn open_path_listener_loop(
     use windows::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, NAMED_PIPE_MODE,
-        PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
     use windows::core::PCWSTR;
 
@@ -408,7 +408,12 @@ fn open_path_listener_loop(
             break;
         }
 
-        let pipe_mode = NAMED_PIPE_MODE(PIPE_TYPE_BYTE.0 | PIPE_READMODE_BYTE.0 | PIPE_WAIT.0);
+        // PIPE_REJECT_REMOTE_CLIENTS: named pipe は既定で SMB 経由のリモート接続も
+        // 受け付けるが、これは同一マシン内の単一インスタンス連携専用なのでリモート
+        // クライアントを拒否して攻撃面を縮小する (post-v1.3.0 backlog 堅牢化)。
+        let pipe_mode = NAMED_PIPE_MODE(
+            PIPE_TYPE_BYTE.0 | PIPE_READMODE_BYTE.0 | PIPE_WAIT.0 | PIPE_REJECT_REMOTE_CLIENTS.0,
+        );
         let pipe = unsafe {
             CreateNamedPipeW(
                 PCWSTR(name_wide.as_ptr()),

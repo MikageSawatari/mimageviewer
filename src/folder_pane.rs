@@ -450,6 +450,16 @@ impl FolderPaneState {
         rows: &mut Vec<FolderPaneRow>,
         seen: &mut HashSet<String>,
     ) {
+        // junction / symlink ループや異常に深い階層で render が無限/過大に descend する
+        // のを防ぐ防御的上限 (post-v1.3.0 backlog 堅牢化)。`seen` は正規化パス文字列なので
+        // 別字句パスから同じ実体へ到達する reparse-point ループは捕捉できない (= 手動展開で
+        // 無限に降りられる)。この上限で render 深度を頭打ちにし、上限超の行は描画しない
+        // ので、それ以上の手動展開 (= クリック対象の行) も発生しない。通常のフォルダ階層は
+        // この値に遠く及ばない。
+        const MAX_TREE_DEPTH: usize = 64;
+        if depth > MAX_TREE_DEPTH {
+            return;
+        }
         let key = key_for(path);
         if !seen.insert(key.clone()) {
             return;

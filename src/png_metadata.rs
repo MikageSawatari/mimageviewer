@@ -205,11 +205,24 @@ fn read_png_text_chunks_raw(data: &[u8]) -> std::io::Result<Vec<(String, String)
 }
 
 /// zlib (deflate) 圧縮データを解凍する。
+///
+/// 細工された zTXt/iTXt チャンクが無制限に膨らむ zlib bomb への防御として、解凍出力に
+/// 上限を設ける (untrusted な PNG を読むため。archive_converter の `copy_capped` と同じ
+/// 「超過したら拒否」方針)。AI メタデータ (prompt / workflow JSON) の正規サイズは数 KB〜
+/// 数 MB なので、16 MiB 上限は十分広く、爆弾だけを弾く。
 fn decompress_zlib(data: &[u8]) -> std::io::Result<String> {
-    let mut decoder = flate2::read::ZlibDecoder::new(data);
-    let mut out = String::new();
-    decoder.read_to_string(&mut out)?;
-    Ok(out)
+    const MAX_DECOMPRESSED: u64 = 16 * 1024 * 1024; // 16 MiB
+    let decoder = flate2::read::ZlibDecoder::new(data);
+    let mut buf = Vec::new();
+    // +1 バイト多く読み、上限超なら zlib bomb として拒否する。
+    decoder.take(MAX_DECOMPRESSED + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_DECOMPRESSED {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "zlib decompressed output exceeds cap (possible zlib bomb)",
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -1746,6 +1759,32 @@ fn extract_text_from_ref_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// zlib bomb 防御 (post-v1.3.0 backlog): 上限 (16 MiB) を超える解凍出力は拒否し、
+    /// 正規サイズはそのまま往復できる。
+    #[test]
+    fn decompress_zlib_rejects_bomb_and_roundtrips_small() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        // 正規: 小さいテキストは往復できる。
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all("プロンプト metadata".as_bytes()).unwrap();
+        let small = enc.finish().unwrap();
+        assert_eq!(decompress_zlib(&small).unwrap(), "プロンプト metadata");
+
+        // 爆弾: 17 MiB のゼロは高圧縮率で小さく圧縮されるが、解凍は上限超で拒否される。
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&vec![0u8; 17 * 1024 * 1024]).unwrap();
+        let bomb = enc.finish().unwrap();
+        assert!(
+            bomb.len() < 1024 * 1024,
+            "bomb should compress small (got {} bytes)",
+            bomb.len()
+        );
+        assert!(decompress_zlib(&bomb).is_err());
+    }
 
     fn chunks(items: &[(&str, &str)]) -> Vec<(String, String)> {
         items
