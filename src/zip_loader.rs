@@ -139,6 +139,36 @@ fn should_ignore(name: &str) -> bool {
     name.contains("__MACOSX/") || name.starts_with('.')
 }
 
+fn has_japanese_or_fullwidth_chars(s: &str) -> bool {
+    s.chars().any(|ch| {
+        matches!(
+            ch as u32,
+            0x3040..=0x30ff | 0x3400..=0x9fff | 0xf900..=0xfaff | 0xff00..=0xffef
+        )
+    })
+}
+
+fn decode_zip_entry_name(raw: &[u8], fallback_name: &str) -> String {
+    if let Ok(s) = std::str::from_utf8(raw) {
+        return s.to_string();
+    }
+
+    let (decoded, _, had_errors) = encoding_rs::SHIFT_JIS.decode(raw);
+    if !had_errors && has_japanese_or_fullwidth_chars(&decoded) {
+        return decoded.into_owned();
+    }
+
+    fallback_name.to_string()
+}
+
+fn zip_entry_name(entry: &zip::read::ZipFile<'_>) -> String {
+    decode_zip_entry_name(entry.name_raw(), entry.name())
+}
+
+fn normalized_zip_entry_name(entry: &zip::read::ZipFile<'_>) -> String {
+    zip_entry_name(entry).replace('\\', "/")
+}
+
 /// エントリ名から拡張子を小文字で取り出す。
 /// ファイル名部分に '.' がない場合は None。
 fn lowercase_ext(name: &str) -> Option<String> {
@@ -282,8 +312,7 @@ fn enumerate_recursive<R: Read + Seek>(
         if !entry.is_file() {
             continue;
         }
-        let raw_name = entry.name().to_string();
-        let name = raw_name.replace('\\', "/");
+        let name = normalized_zip_entry_name(&entry);
         if should_ignore(&name) {
             continue;
         }
@@ -376,7 +405,7 @@ fn first_image_recursive<R: Read + Seek>(
         if !entry.is_file() {
             continue;
         }
-        let name = entry.name().to_string().replace('\\', "/");
+        let name = normalized_zip_entry_name(&entry);
         if should_ignore(&name) {
             continue;
         }
@@ -466,7 +495,7 @@ fn read_first_image_recursive<R: Read + Seek>(
         if !entry.is_file() {
             continue;
         }
-        let name = entry.name().to_string().replace('\\', "/");
+        let name = normalized_zip_entry_name(&entry);
         if should_ignore(&name) {
             continue;
         }
@@ -603,13 +632,37 @@ fn read_by_name<R: Read + Seek>(
         Ok(bytes) => Ok(bytes),
         Err(first_err) if first_err.kind() == std::io::ErrorKind::NotFound => {
             let legacy_name = entry_name.replace('/', "\\");
-            if legacy_name == entry_name {
-                return Err(first_err);
+            if legacy_name != entry_name
+                && let Ok(bytes) = read_by_exact_name(archive, &legacy_name)
+            {
+                return Ok(bytes);
             }
-            read_by_exact_name(archive, &legacy_name).map_err(|_| first_err)
+            read_by_decoded_name(archive, entry_name).map_err(|_| first_err)
         }
         Err(err) => Err(err),
     }
+}
+
+fn read_by_decoded_name<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    entry_name: &str,
+) -> std::io::Result<Vec<u8>> {
+    let wanted = entry_name.replace('\\', "/");
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        if normalized_zip_entry_name(&entry) != wanted {
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut bytes)?;
+        return Ok(bytes);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("ZIP entry not found: {entry_name}"),
+    ))
 }
 
 fn read_by_exact_name<R: Read + Seek>(
@@ -819,6 +872,112 @@ mod tests {
             zw.write_all(data).unwrap();
         }
         zw.finish().unwrap();
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffff_u32;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                if crc & 1 == 1 {
+                    crc = (crc >> 1) ^ 0xedb8_8320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        !crc
+    }
+
+    fn push_u16(out: &mut Vec<u8>, value: u16) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// UTF-8 flag を立てず、任意の raw filename bytes を持つ STORE ZIP を作る。
+    fn write_raw_name_store_zip(path: &Path, raw_name: &[u8], data: &[u8]) {
+        let crc = crc32(data);
+        let size = data.len() as u32;
+        let name_len = raw_name.len() as u16;
+        let mut out = Vec::new();
+
+        let local_offset = out.len() as u32;
+        push_u32(&mut out, 0x0403_4b50);
+        push_u16(&mut out, 20); // version needed
+        push_u16(&mut out, 0); // general purpose bit flag: no UTF-8 flag
+        push_u16(&mut out, 0); // stored
+        push_u16(&mut out, 0); // mod time
+        push_u16(&mut out, 0); // mod date
+        push_u32(&mut out, crc);
+        push_u32(&mut out, size);
+        push_u32(&mut out, size);
+        push_u16(&mut out, name_len);
+        push_u16(&mut out, 0); // extra len
+        out.extend_from_slice(raw_name);
+        out.extend_from_slice(data);
+
+        let central_offset = out.len() as u32;
+        push_u32(&mut out, 0x0201_4b50);
+        push_u16(&mut out, 20); // version made by
+        push_u16(&mut out, 20); // version needed
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0);
+        push_u32(&mut out, crc);
+        push_u32(&mut out, size);
+        push_u32(&mut out, size);
+        push_u16(&mut out, name_len);
+        push_u16(&mut out, 0); // extra len
+        push_u16(&mut out, 0); // comment len
+        push_u16(&mut out, 0); // disk start
+        push_u16(&mut out, 0); // internal attrs
+        push_u32(&mut out, 0); // external attrs
+        push_u32(&mut out, local_offset);
+        out.extend_from_slice(raw_name);
+        let central_size = out.len() as u32 - central_offset;
+
+        push_u32(&mut out, 0x0605_4b50);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 1);
+        push_u32(&mut out, central_size);
+        push_u32(&mut out, central_offset);
+        push_u16(&mut out, 0);
+
+        std::fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn cp932_zip_entry_names_are_decoded_and_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("cp932.zip");
+        let display_name = "小さな天使のおしごとは_特典用/小さな天使のおしごとは_特典用_001.jpg";
+        let (raw_name, _, had_errors) = encoding_rs::SHIFT_JIS.encode(display_name);
+        assert!(!had_errors);
+        write_raw_name_store_zip(&zip_path, raw_name.as_ref(), b"IMAGE");
+
+        let entries = enumerate_image_entries(&zip_path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entry_name, display_name);
+        assert_eq!(
+            first_image_entry(&zip_path, None).as_deref(),
+            Some(display_name)
+        );
+        let (first_name, first_bytes) = read_first_image_bytes(&zip_path).unwrap();
+        assert_eq!(first_name, display_name);
+        assert_eq!(first_bytes, b"IMAGE");
+        assert_eq!(read_entry_bytes(&zip_path, display_name).unwrap(), b"IMAGE");
+
+        let mut archive = open_archive(&zip_path).unwrap();
+        assert_eq!(
+            read_entry_from_archive(&mut archive, display_name).unwrap(),
+            b"IMAGE"
+        );
     }
 
     /// 変換キャッシュ ZIP は "inner.zip/p.jpg" のような literal なフラットエントリを

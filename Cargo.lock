@@ -3839,6 +3839,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui_kittest",
+ "encoding_rs",
  "fast_image_resize",
  "ffmpeg-the-third",
  "flate2",

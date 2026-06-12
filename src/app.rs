@@ -11229,7 +11229,9 @@ impl App {
             let leaving_search_view = self.items_are_global_search_view
                 || self.items_are_tag_view
                 || crate::folder_tree::path_eq(&cur, &search_results_synthetic_path());
-            if !leaving_search_view {
+            let has_grid_state_to_save =
+                !self.items.is_empty() || self.selected.is_some() || self.scroll_offset_y != 0.0;
+            if !leaving_search_view && has_grid_state_to_save {
                 self.folder_history
                     .insert(cur, (self.scroll_offset_y, self.selected));
             }

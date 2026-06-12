@@ -2024,6 +2024,37 @@ mod phase_c_folder_nav_history_tests {
         // 通常ビューからの退場では従来どおりスクロール状態を保存する。
         assert_eq!(app.folder_history.get(&d), Some(&(555.0, Some(9))));
     }
+
+    #[test]
+    fn empty_virtual_loading_state_does_not_clear_initial_cursor() {
+        let mut app = setup_app();
+        let zip = app.tmp.path().join("book.zip");
+        std::fs::write(&zip, b"zip").unwrap();
+
+        // load_zip_as_folder は列挙待ちの間、current_folder だけ ZIP に切り替えて
+        // items/selected を空にする。この空状態を folder_history に保存すると、
+        // enumerate 完了後の先頭選択が None で上書きされてカーソルが出ない。
+        app.current_folder = Some(zip.clone());
+        app.items.clear();
+        app.visible_indices.clear();
+        app.selected = None;
+        app.scroll_offset_y = 0.0;
+
+        app.start_loading_items(
+            zip.clone(),
+            vec![GridItem::ZipImage {
+                zip_path: zip,
+                entry_name: "page001.jpg".to_string(),
+            }],
+            vec![Some((0, 1))],
+            HashSet::new(),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(app.selected, Some(0));
+        assert!(app.scroll_to_selected);
+    }
 }
 
 // =======================================================================

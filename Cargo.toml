@@ -163,6 +163,7 @@ ndarray = "0.17"
 # JPEG APP1 / PNG iTXt に入っている。quick-xml で xtw:* 名前空間だけ拾う。
 quick-xml = "0.39"
 unicode-normalization = "0.1"
+encoding_rs = "0.8"
 # URL をブラウザで開くため (「元ツイートを開く」等)。cmd /c start を書くより
 # 安全でクロスプラットフォーム。
 opener = "0.8"

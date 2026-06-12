@@ -136,6 +136,9 @@ RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<h
    - Windows ツール由来などで ZIP 内エントリ名に `\` が含まれる場合も、列挙時は
      `/` に正規化する。読み戻し (`read_entry_bytes` / `read_entry_from_archive`) では
      `/` で見つからない場合だけ `\` 名も試し、古い/非標準寄り ZIP との互換性を保つ。
+   - 日本語 Windows ツール由来で UTF-8 flag が立たず CP932 の raw filename を持つ ZIP は、
+     `zip` crate 既定の CP437 decode では文字化けするため、列挙・先頭画像・読み戻しの
+     共通 helper で UTF-8 → CP932 → crate 既定名の順に解釈する。
    - **v0.7.0 以降: 外側 ZIP 内の .zip エントリは再帰展開され**、
      entry_name は "chapters/ch01.zip/page01.jpg" のように親 ZIP 名を含む
      パスになる。内側 ZIP バイト列は zip_loader 内の LRU キャッシュ (256MB) に
