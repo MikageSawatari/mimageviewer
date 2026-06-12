@@ -2568,6 +2568,19 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         "ページ番号を常時表示",
     );
     ui.small("フルスクリーン右下に現在ページ / 総ページ数を小さく表示します。");
+    ui.horizontal(|ui| {
+        ui.label("固定ジャンプ量");
+        ui.add(
+            egui::DragValue::new(&mut s.fullscreen_fixed_jump_count)
+                .range(
+                    crate::settings::FULLSCREEN_FIXED_JUMP_MIN
+                        ..=crate::settings::FULLSCREEN_FIXED_JUMP_MAX,
+                )
+                .speed(1)
+                .suffix(" 件"),
+        );
+    });
+    ui.small("画像フルスクリーンの Shift+← / Shift+→ で前後へジャンプする件数です。動画フルスクリーンでは Shift+左右は 1 秒シークのままです。");
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label("見開きのページ間隔");

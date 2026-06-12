@@ -11842,6 +11842,19 @@ mod always_visible_selection_cursor_tests {
         app.items.len() - 1
     }
 
+    fn test_zip_nav_for(zip_path: PathBuf, names: &[&str]) -> crate::zip_tree::ZipNavState {
+        let entries: Vec<crate::zip_loader::ZipImageEntry> = names
+            .iter()
+            .map(|n| crate::zip_loader::ZipImageEntry {
+                entry_name: n.to_string(),
+                uncompressed_size: 0,
+                mtime: 0,
+            })
+            .collect();
+        let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
+        crate::zip_tree::ZipNavState::new(tree)
+    }
+
     #[test]
     fn rebuild_visible_indices_selects_first_visible_item_when_none_selected() {
         let mut app = setup_app();
@@ -11875,6 +11888,51 @@ mod always_visible_selection_cursor_tests {
 
         assert_eq!(app.visible_indices, vec![0]);
         assert_eq!(app.selected, None);
+    }
+
+    #[test]
+    fn rebuild_visible_indices_selects_first_pdf_page_when_none_selected() {
+        let mut app = setup_app();
+        let first = push_item(
+            &mut app,
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+        );
+        push_item(
+            &mut app,
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+                page_num: 1,
+                content_type: None,
+            },
+        );
+
+        app.selected = None;
+        app.rebuild_visible_indices();
+
+        assert_eq!(app.selected, Some(first));
+        assert!(app.scroll_to_selected);
+    }
+
+    #[test]
+    fn zip_nav_show_current_level_selects_first_visible_page_initially() {
+        let mut app = setup_app();
+        let zip_path = PathBuf::from(r"C:\books\a.zip");
+        app.current_folder = Some(zip_path.clone());
+        app.zip_nav = Some(test_zip_nav_for(zip_path, &["p001.jpg", "p002.jpg"]));
+        app.selected = None;
+        app.scroll_to_selected = false;
+
+        app.zip_nav_show_current_level();
+
+        assert_eq!(app.selected, Some(0));
+        assert!(
+            matches!(app.items.first(), Some(GridItem::ZipImage { entry_name, .. }) if entry_name == "p001.jpg")
+        );
+        assert!(app.scroll_to_selected);
     }
 }
 

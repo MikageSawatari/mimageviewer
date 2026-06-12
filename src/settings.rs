@@ -1565,6 +1565,9 @@ pub struct Settings {
     /// 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。
     #[serde(default = "default_true")]
     pub fullscreen_page_number_overlay: bool,
+    /// 画像フルスクリーンの固定ジャンプ (Shift+←/→) で移動する件数。
+    #[serde(default = "default_fullscreen_fixed_jump_count")]
+    pub fullscreen_fixed_jump_count: usize,
     /// 連結読みのホイール 1 ノッチあたりスクロール量 (画面サイズ比 %)。
     #[serde(default = "default_continuous_reading_wheel_scroll_percent")]
     pub continuous_reading_wheel_scroll_percent: u32,
@@ -2349,6 +2352,9 @@ fn default_video_playback_speed() -> f64 {
 pub const MIN_GRID_COLS: usize = 1;
 /// グリッド列数の最大値
 pub const MAX_GRID_COLS: usize = 10;
+pub const FULLSCREEN_FIXED_JUMP_MIN: usize = 1;
+pub const FULLSCREEN_FIXED_JUMP_MAX: usize = 100;
+pub const FULLSCREEN_FIXED_JUMP_DEFAULT: usize = 10;
 
 fn default_grid_cols() -> usize {
     4
@@ -2493,6 +2499,9 @@ fn default_continuous_reading_key_scroll_percent() -> u32 {
 fn default_continuous_reading_gamepad_scroll_percent_per_sec() -> u32 {
     130
 }
+fn default_fullscreen_fixed_jump_count() -> usize {
+    FULLSCREEN_FIXED_JUMP_DEFAULT
+}
 fn default_toolbar_cols_items() -> Vec<usize> {
     (MIN_GRID_COLS..=MAX_GRID_COLS).collect()
 }
@@ -2587,6 +2596,7 @@ impl Default for Settings {
             fullscreen_fit_no_downscale: false,
             fullscreen_seek_bar_locked: false,
             fullscreen_page_number_overlay: true,
+            fullscreen_fixed_jump_count: FULLSCREEN_FIXED_JUMP_DEFAULT,
             continuous_reading_wheel_scroll_percent:
                 default_continuous_reading_wheel_scroll_percent(),
             continuous_reading_key_scroll_percent: default_continuous_reading_key_scroll_percent(),
@@ -3597,6 +3607,9 @@ impl Settings {
         self.continuous_reading_gamepad_scroll_percent_per_sec = self
             .continuous_reading_gamepad_scroll_percent_per_sec
             .clamp(10, 300);
+        self.fullscreen_fixed_jump_count = self
+            .fullscreen_fixed_jump_count
+            .clamp(FULLSCREEN_FIXED_JUMP_MIN, FULLSCREEN_FIXED_JUMP_MAX);
         if self.margin_fit_enabled && matches!(self.fullscreen_fit_mode, FullscreenFitMode::Page) {
             self.fullscreen_fit_mode = FullscreenFitMode::MarginFit;
         }
@@ -3930,6 +3943,7 @@ mod tests {
         assert_eq!(s.fullscreen_fit_mode, FullscreenFitMode::Page);
         assert!(!s.fullscreen_seek_bar_locked);
         assert!(s.fullscreen_page_number_overlay);
+        assert_eq!(s.fullscreen_fixed_jump_count, 10);
         assert_eq!(s.continuous_reading_wheel_scroll_percent, 20);
         assert_eq!(s.continuous_reading_key_scroll_percent, 16);
         assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 130);
@@ -4190,6 +4204,7 @@ mod tests {
         assert_eq!(loaded.video_volume, VIDEO_VOLUME_DEFAULT);
         assert_eq!(loaded.video_playback_speed, 1.0);
         assert_eq!(loaded.fullscreen_fit_mode, FullscreenFitMode::Page);
+        assert_eq!(loaded.fullscreen_fixed_jump_count, 10);
         assert_eq!(loaded.continuous_reading_wheel_scroll_percent, 20);
         assert_eq!(loaded.continuous_reading_key_scroll_percent, 16);
         assert_eq!(
@@ -4236,12 +4251,18 @@ mod tests {
         s.continuous_reading_wheel_scroll_percent = 0;
         s.continuous_reading_key_scroll_percent = 999;
         s.continuous_reading_gamepad_scroll_percent_per_sec = 999;
+        s.fullscreen_fixed_jump_count = 999;
         s.sanitize();
         assert_eq!(s.spread_page_gap_px, 200);
         assert_eq!(s.continuous_reading_gap_px, 200);
         assert_eq!(s.continuous_reading_wheel_scroll_percent, 1);
         assert_eq!(s.continuous_reading_key_scroll_percent, 100);
         assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 300);
+        assert_eq!(s.fullscreen_fixed_jump_count, FULLSCREEN_FIXED_JUMP_MAX);
+
+        s.fullscreen_fixed_jump_count = 0;
+        s.sanitize();
+        assert_eq!(s.fullscreen_fixed_jump_count, FULLSCREEN_FIXED_JUMP_MIN);
     }
 
     #[test]

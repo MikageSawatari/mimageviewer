@@ -926,6 +926,49 @@ pub fn adjacent_navigable_idx(
     }
 }
 
+/// items の中で current から `step` 件ぶん前後へ移動した画像ページ
+/// (通常画像 + ZIP 画像 + PDF ページ) の item index を返す。
+pub fn fixed_jump_page_idx(
+    items: &[GridItem],
+    display_order: &[usize],
+    current: usize,
+    step: usize,
+    forward: bool,
+) -> Option<usize> {
+    let nav_indices: Vec<usize> = display_order
+        .iter()
+        .copied()
+        .filter(|&i| {
+            matches!(
+                items.get(i),
+                Some(GridItem::Image(_))
+                    | Some(GridItem::ZipImage { .. })
+                    | Some(GridItem::PdfPage { .. })
+            )
+        })
+        .collect();
+    if nav_indices.is_empty() {
+        return None;
+    }
+    let step = step.max(1);
+    if let Some(pos) = nav_indices.iter().position(|&i| i == current) {
+        let target_pos = if forward {
+            pos.saturating_add(step).min(nav_indices.len() - 1)
+        } else {
+            pos.saturating_sub(step)
+        };
+        if target_pos == pos {
+            None
+        } else {
+            Some(nav_indices[target_pos])
+        }
+    } else if forward {
+        nav_indices.iter().copied().filter(|&i| i > current).min()
+    } else {
+        nav_indices.iter().copied().filter(|&i| i < current).max()
+    }
+}
+
 /// スライドショー送り用の隣接探索。`adjacent_navigable_idx` と同じだが
 /// **`GridItem::Video` を除外**する (スライドショー中は動画をスキップして継続するため)。
 /// `GridItem::ZipSeparator` は仕様どおり残す (章タイトルも同じ間隔で表示する)。
@@ -1475,6 +1518,38 @@ mod tests {
         let vi: Vec<usize> = Vec::new();
         assert_eq!(adjacent_navigable_idx(&items, &vi, 1, 1), None);
         assert_eq!(adjacent_navigable_idx(&items, &vi, 1, -1), None);
+    }
+
+    #[test]
+    fn fixed_jump_page_idx_clamps_to_edges() {
+        let items = img_items(8);
+        let vi = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        assert_eq!(fixed_jump_page_idx(&items, &vi, 2, 3, true), Some(5));
+        assert_eq!(fixed_jump_page_idx(&items, &vi, 2, 10, true), Some(7));
+        assert_eq!(fixed_jump_page_idx(&items, &vi, 2, 10, false), Some(0));
+        assert_eq!(fixed_jump_page_idx(&items, &vi, 7, 3, true), None);
+        assert_eq!(fixed_jump_page_idx(&items, &vi, 0, 3, false), None);
+    }
+
+    #[test]
+    fn fixed_jump_page_idx_respects_display_order_and_skips_non_pages() {
+        let items = vec![
+            GridItem::Folder(std::path::PathBuf::from("/a/folder")),
+            GridItem::Image(std::path::PathBuf::from("/a/one.jpg")),
+            GridItem::Video(std::path::PathBuf::from("/a/two.mp4")),
+            GridItem::ZipSeparator {
+                dir_display: "chapter".into(),
+            },
+            GridItem::Image(std::path::PathBuf::from("/a/three.jpg")),
+            GridItem::PdfPage {
+                pdf_path: std::path::PathBuf::from("/a/book.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+        ];
+        let order = vec![5, 0, 2, 3, 1, 4];
+        assert_eq!(fixed_jump_page_idx(&items, &order, 5, 2, true), Some(4));
+        assert_eq!(fixed_jump_page_idx(&items, &order, 4, 3, false), Some(5));
     }
 
     /// スライドショー送りは Video を飛ばす: image(0) - video(1) - image(2) で

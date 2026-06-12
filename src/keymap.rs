@@ -739,6 +739,8 @@ pub enum KeyAction {
     FsCtrlNavNext,
     FsSiblingPrev,
     FsSiblingNext,
+    FsFixedJumpPrev,
+    FsFixedJumpNext,
     RatingItem1,
     RatingItem2,
     RatingItem3,
@@ -928,6 +930,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsCtrlNavNext,
     KeyAction::FsSiblingPrev,
     KeyAction::FsSiblingNext,
+    KeyAction::FsFixedJumpPrev,
+    KeyAction::FsFixedJumpNext,
     KeyAction::RatingItem1,
     KeyAction::RatingItem2,
     KeyAction::RatingItem3,
@@ -1152,6 +1156,8 @@ impl KeyAction {
             FsCtrlNavNext => "FsCtrlNavNext",
             FsSiblingPrev => "FsSiblingPrev",
             FsSiblingNext => "FsSiblingNext",
+            FsFixedJumpPrev => "FsFixedJumpPrev",
+            FsFixedJumpNext => "FsFixedJumpNext",
             RatingItem1 => "RatingItem1",
             RatingItem2 => "RatingItem2",
             RatingItem3 => "RatingItem3",
@@ -1351,6 +1357,8 @@ impl KeyAction {
             FsCtrlNavNext => "次のフォルダまたは検索結果へ移動する",
             FsSiblingPrev => "前の兄弟フォルダへ移動する",
             FsSiblingNext => "次の兄弟フォルダへ移動する",
+            FsFixedJumpPrev => "設定した件数ぶん前へジャンプする",
+            FsFixedJumpNext => "設定した件数ぶん先へジャンプする",
             RatingItem1 => "現在の画像または動画に星1を付ける",
             RatingItem2 => "現在の画像または動画に星2を付ける",
             RatingItem3 => "現在の画像または動画に星3を付ける",
@@ -1547,6 +1555,8 @@ impl KeyAction {
             | FsContinuousScrollBack
             | FsSpreadShiftLeft
             | FsSpreadShiftRight
+            | FsFixedJumpPrev
+            | FsFixedJumpNext
             | FsSlideshow
             | FsSpaceCheck
             | FsCapture
@@ -1671,6 +1681,8 @@ impl KeyAction {
             | FsCtrlNavNext
             | FsSiblingPrev
             | FsSiblingNext
+            | FsFixedJumpPrev
+            | FsFixedJumpNext
             | RatingItem1
             | RatingItem2
             | RatingItem3
@@ -1858,6 +1870,8 @@ impl KeyAction {
             FsCtrlNavNext => ChordList::one(Chord::ctrl(Down)),
             FsSiblingPrev => ChordList::one(Chord::ctrl(PageUp)),
             FsSiblingNext => ChordList::one(Chord::ctrl(PageDown)),
+            FsFixedJumpPrev => ChordList::one(Chord::shift(Left)),
+            FsFixedJumpNext => ChordList::one(Chord::shift(Right)),
             RatingItem1 => ChordList::one(Chord::key(F1)),
             RatingItem2 => ChordList::one(Chord::key(F2)),
             RatingItem3 => ChordList::one(Chord::key(F3)),

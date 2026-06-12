@@ -2814,6 +2814,8 @@ impl App {
                             self.bump_input_seq("fs_ctrl_nav", None);
                         } else if sibling_nav.is_some() {
                             self.bump_input_seq("fs_sibling_nav", None);
+                        } else if jump_to.is_some() {
+                            self.bump_input_seq("fs_fixed_jump", None);
                         } else if key_action.close {
                             self.bump_input_seq("fs_close_key", None);
                         }
@@ -4371,6 +4373,20 @@ impl App {
         nav
     }
 
+    pub(crate) fn fullscreen_fixed_jump_target(
+        &self,
+        fs_idx: usize,
+        forward: bool,
+    ) -> Option<usize> {
+        crate::ui_helpers::fixed_jump_page_idx(
+            &self.items,
+            self.current_grid_order(),
+            fs_idx,
+            self.settings.fullscreen_fixed_jump_count,
+            forward,
+        )
+    }
+
     /// 現在の見開きモードとインデックスからペア表示を解決する。
     pub(crate) fn resolve_spread_pair(&mut self, idx: usize) -> SpreadPair {
         if !self.spread_mode.is_spread() {
@@ -4600,6 +4616,8 @@ impl App {
             self.bump_input_seq("fs_root_ctrl_nav", None);
         } else if key_action.sibling_nav.is_some() {
             self.bump_input_seq("fs_root_sibling_nav", None);
+        } else if key_action.jump_to.is_some() {
+            self.bump_input_seq("fs_root_fixed_jump", None);
         } else if key_action.close || key_action.close_to_page_list {
             self.bump_input_seq("fs_root_close_key", None);
         }
@@ -4963,6 +4981,10 @@ impl App {
                 .consume_action(ctx, KeyAction::FsSpreadShiftRight);
         let ctrl_page_down = self.keymap.consume_action(ctx, KeyAction::FsSiblingNext);
         let ctrl_page_up = self.keymap.consume_action(ctx, KeyAction::FsSiblingPrev);
+        let fixed_jump_next =
+            !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsFixedJumpNext);
+        let fixed_jump_prev =
+            !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsFixedJumpPrev);
         // PageUp/Down のスクロール用 consume も、実際に連続描画している条件
         // (continuous_reading_active_for_idx) に揃える。reading_flow だけで判定すると、
         // 非対応アイテム/解析/比較中に PageUp/Down を消費しておきながら無反応 (デッドキー) になる。
@@ -5770,6 +5792,17 @@ impl App {
         }
         if ctrl_page_up {
             action.sibling_nav = Some(-1);
+        }
+        if fixed_jump_next || fixed_jump_prev {
+            let forward = fixed_jump_next;
+            if let Some(new_idx) = self.fullscreen_fixed_jump_target(fs_idx, forward) {
+                action.jump_to = Some(new_idx);
+            } else {
+                self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                    at_end: forward,
+                    at: std::time::Instant::now(),
+                });
+            }
         }
 
         if key_home {
