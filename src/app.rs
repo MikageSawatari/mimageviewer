@@ -26001,6 +26001,59 @@ impl App {
         }
     }
 
+    /// 表示中 PDF ラスターページが「native 寸法は AI 範囲内なのに 4096px 固定レンダで
+    /// 範囲外」状態なら、native 解像度へ再レンダして final AI を起動する (GitHub issue #1)。
+    ///
+    /// PDF 初回フルスクリーンは content_type 未解析のため `start_fs_load` が 4096px 固定で
+    /// レンダし、final AI はレンダ後のピクセルサイズで判定する。よって native がサイズ上限内
+    /// (例: 824×1200) のスキャン PDF でも、4096px レンダ結果 (例: 2812×4095) では範囲外と
+    /// 判定され AI がスキップされる。本 reconcile を毎フレーム評価することで、
+    /// 「初回表示で AI ON」と「開いてサイズ確認後に AI を ON」(issue 本文のシナリオ。
+    /// U/N キーで `ai_upscale_enabled` 等が後から true になるケース) の両方を拾う。
+    ///
+    /// **`sync_upscale_from_preset(fs_idx)` の直後に呼ぶこと** — `ai_upscale_enabled` /
+    /// `ai_denoise_model` が当該ページの最新値である前提。判定は純関数
+    /// `ai::upscale::pdf_needs_native_rerender_for_ai` に委ね、in-flight 中 / ズーム中 /
+    /// 収束後はそれ自身が false を返してループや無駄な再レンダを防ぐ。
+    fn maybe_native_rerender_pdf_for_ai(&mut self, fs_idx: usize) {
+        if self.should_native_rerender_pdf_for_ai(fs_idx) {
+            // fit 表示 (zoom≈1.0) でだけ到達するので native 基準 (zoom=1.0) で再レンダ。
+            // 再レンダ結果が fs_cache に載るとき bump_input_generation で下流 (edit /
+            // final / AI) cache が無効化され、final AI が native 寸法で再評価される。
+            self.request_pdf_rerender(fs_idx, 1.0);
+        }
+    }
+
+    /// `maybe_native_rerender_pdf_for_ai` の判定部 (副作用なし、単体テスト用に分離)。
+    /// App の現在状態 (items の native 寸法 / fs_cache の現行レンダ寸法 / AI 設定 /
+    /// ズーム / in-flight) を純関数 `pdf_needs_native_rerender_for_ai` へ束ねる。
+    pub(crate) fn should_native_rerender_pdf_for_ai(&self, fs_idx: usize) -> bool {
+        let Some(GridItem::PdfPage {
+            content_type: Some(crate::pdf_loader::PdfPageContentType::Raster { w, h }),
+            ..
+        }) = self.items.get(fs_idx)
+        else {
+            return false;
+        };
+        // 現在レンダ済みのピクセル寸法 (final AI ゲートが見る pixels.size と同じ)。
+        let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&fs_idx) else {
+            return false;
+        };
+        let (cur_w, cur_h) = (pixels.size[0] as u32, pixels.size[1] as u32);
+        crate::ai::upscale::pdf_needs_native_rerender_for_ai(
+            self.fs_zoom,
+            *w,
+            *h,
+            cur_w,
+            cur_h,
+            self.ai_upscale_enabled,
+            self.settings.ai_upscale_limit(),
+            self.ai_denoise_model.is_some(),
+            self.settings.ai_denoise_limit(),
+            self.fs_pending.contains_key(&fs_idx),
+        )
+    }
+
     /// 右上フィードバック表示を設定する (既定の表示時間)。
     /// 短い確認系トースト (レーティング変更 / スロット適用など) 向け。
     pub(crate) fn show_feedback_toast(&mut self, text: String) {
@@ -28585,45 +28638,13 @@ impl App {
     /// これにより 20MP JPEG 連続 prefetch 時の 500ms 級 UI フリーズを回避する。
     pub(crate) fn poll_prefetch(&mut self, ctx: &egui::Context) {
         // PDF ページの content_type を更新 (render 完了時にワーカーから受信)。
-        //
-        // ラスターページのネイティブ解像度が判明した時点で、表示中ページかつ AI が
-        // 実効適用される (native 寸法がサイズ上限内 + 設定 ON) なら、4096px 固定で
-        // レンダされた現行ラスターを native 解像度で **一度だけ** 再レンダして final AI を
-        // 起動させる。初回フルスクリーンは content_type 未解析のため 4096px 固定で
-        // レンダされ (`start_fs_load`)、final AI はレンダ後のピクセルサイズで判定するため、
-        // この再レンダが無いとサイズ上限内のラスター PDF でも初回表示で AI が掛からない
-        // (GitHub issue #1。従来は docs/ai-processing-size-threshold-plan.md「既知の制限」
-        // として先送りしていた挙動。content_type 解析後の自動再レンダで解消)。
-        // 表示中ページ (`fullscreen_idx`) のみに絞ることで PDF pool への負荷も抑える。
-        let mut pdf_native_rerender: Option<usize> = None;
+        // native 解像度判明後の AI 用 native 再レンダは、AI 設定変更も合わせて拾うため
+        // `App::update` の `maybe_native_rerender_pdf_for_ai` (sync_upscale_from_preset 直後)
+        // で毎フレーム reconcile する (GitHub issue #1)。ここでは content_type を保存するだけ。
         while let Ok((idx, ct)) = self.pdf_content_type_rx.try_recv() {
             if let Some(GridItem::PdfPage { content_type, .. }) = self.items.get_mut(idx) {
                 *content_type = Some(ct);
             }
-            // `ai_upscale_enabled` / `ai_denoise_model` は `sync_upscale_from_preset` で
-            // 現在表示ページの実効設定に同期済み。`fullscreen_idx` 限定なので一致する。
-            // AI が実際に効くケースだけ再レンダし、非 AI 利用時は 4096px 表示を維持する
-            // (range 内ラスターを常に native へ落とすと非 AI ユーザーの表示解像度が下がるため)。
-            if Some(idx) == self.fullscreen_idx
-                && let crate::pdf_loader::PdfPageContentType::Raster { w, h } = ct
-                && crate::ai::upscale::pdf_should_native_rerender_for_ai(
-                    w,
-                    h,
-                    self.ai_upscale_enabled,
-                    self.settings.ai_upscale_limit(),
-                    self.ai_denoise_model.is_some(),
-                    self.settings.ai_denoise_limit(),
-                )
-            {
-                pdf_native_rerender = Some(idx);
-            }
-        }
-        if let Some(idx) = pdf_native_rerender {
-            // `request_pdf_rerender` が content_type (= Raster) を見て native 解像度基準で
-            // 再レンダする。既に native 解像度なら内部 dedup (ratio 0.9..=1.1) で no-op。
-            // 再レンダ結果が fs_cache に載るとき `bump_input_generation` で下流 (edit /
-            // final / AI) cache が無効化され、final AI が native 寸法で再評価される。
-            self.request_pdf_rerender(idx, self.fs_zoom);
         }
 
         // `DimsOnly` は非終端 (後続メッセージあり) なので fs_pending は維持して
@@ -30914,6 +30935,12 @@ impl eframe::App for App {
         if let Some(fs_idx) = self.fullscreen_idx {
             // プリセットに基づいてアップスケール設定を同期
             self.sync_upscale_from_preset(fs_idx);
+            // PDF ラスターページが「native は AI 範囲内なのに 4096px レンダで範囲外」
+            // 状態なら native 解像度へ再レンダして AI を起動する (GitHub issue #1)。
+            // sync_upscale_from_preset の **直後** に呼ぶことで ai_upscale_enabled /
+            // ai_denoise_model が当該ページの最新値になっている (前ページ / 前フレームの
+            // stale 状態で判定しない)。
+            self.maybe_native_rerender_pdf_for_ai(fs_idx);
             let continuous_keep_set = if !self.reading_flow.is_paged()
                 && self.fs_vertical_cache_keep_set.contains(&fs_idx)
             {

@@ -141,28 +141,73 @@ pub fn should_process_rect(width: u32, height: u32, limit: AiProcessSizeLimit) -
     long < limit_long && short < limit_short
 }
 
-/// PDF ラスターページの content_type (native 寸法) 判明後に、native 解像度で再レンダして
-/// final AI を起動すべきか判定する純関数 (GitHub issue #1)。
-///
-/// 初回フルスクリーンは content_type 未解析のため 4096px 固定でレンダされ、final AI は
-/// レンダ後のピクセルサイズで判定するため、サイズ上限内のラスター PDF でも初回表示では
-/// AI がスキップされる。判定には **fs_cache のレンダ後サイズではなく native 寸法 (`native_w`,
-/// `native_h`)** を渡すこと (レンダ後サイズを渡すと常に false になり意味がない)。
-///
-/// AI が実効適用される場合 (= 設定 ON かつ native 寸法がサイズ上限内) のみ true。
-/// 非 AI 利用時に range 内ラスターを native へ落とすと表示解像度が下がるため、
-/// あえて設定 ON を AND 条件にしている。
-pub fn pdf_should_native_rerender_for_ai(
-    native_w: u32,
-    native_h: u32,
+/// 指定寸法の画像に AI (アップスケール / デノイズ) が実効適用されるか。
+/// = 設定 ON かつ寸法がどちらかのサイズ上限内。判定には **実際のピクセル寸法**
+/// (final AI ゲートが見る `fs_cache` の pixels.size と同じ意味の値) を渡す。
+pub fn ai_would_apply_at_dims(
+    w: u32,
+    h: u32,
     upscale_on: bool,
     upscale_limit: AiProcessSizeLimit,
     denoise_on: bool,
     denoise_limit: AiProcessSizeLimit,
 ) -> bool {
-    let upscale_will_apply = upscale_on && should_process_rect(native_w, native_h, upscale_limit);
-    let denoise_will_apply = denoise_on && should_process_rect(native_w, native_h, denoise_limit);
-    upscale_will_apply || denoise_will_apply
+    (upscale_on && should_process_rect(w, h, upscale_limit))
+        || (denoise_on && should_process_rect(w, h, denoise_limit))
+}
+
+/// 表示中 PDF ラスターページを native 解像度へ再レンダして final AI を起動すべきか
+/// 判定する純関数 (GitHub issue #1)。副作用 (`request_pdf_rerender`) は呼び出し側。
+///
+/// 背景: PDF 初回フルスクリーンは content_type 未解析のため 4096px 固定でレンダされ
+/// (`start_fs_load`)、final AI はレンダ後のピクセルサイズで判定する。よって native が
+/// サイズ上限内 (例: 824×1200) のスキャン PDF でも、4096px レンダ結果 (例: 2812×4095)
+/// では範囲外と判定され AI がスキップされる。本判定を **毎フレームの reconcile** で評価し、
+/// 「初回表示」「サイズ確認後に AI を ON」(issue 本文のシナリオ) の両方を拾う。
+///
+/// ループ安全のため、再レンダ中 (`render_in_flight`) は再キックしない (毎フレームの
+/// cancel→respawn 無限ループを防ぐ)。ズーム中 (`zoom != 1`) は zoom ハンドラ
+/// (`maybe_rerender_pdf`) が native×zoom でレンダ済みなので委ね、fit 表示でだけ働く。
+///
+/// 再レンダが必要 = 「native 寸法では AI が効く」かつ「現在のレンダ寸法では効かない」。
+/// 収束後 (= native へ落ちて現寸法でも AI が効く) は false を返すので毎フレーム呼んでも
+/// 余分な再レンダや no-op 呼び出しが起きない。非 AI 利用時 (両方 OFF) も false。
+#[allow(clippy::too_many_arguments)]
+pub fn pdf_needs_native_rerender_for_ai(
+    zoom: f32,
+    native_w: u32,
+    native_h: u32,
+    cur_w: u32,
+    cur_h: u32,
+    upscale_on: bool,
+    upscale_limit: AiProcessSizeLimit,
+    denoise_on: bool,
+    denoise_limit: AiProcessSizeLimit,
+    render_in_flight: bool,
+) -> bool {
+    if render_in_flight {
+        return false;
+    }
+    if (zoom - 1.0).abs() > 0.01 {
+        return false;
+    }
+    let ai_at_native = ai_would_apply_at_dims(
+        native_w,
+        native_h,
+        upscale_on,
+        upscale_limit,
+        denoise_on,
+        denoise_limit,
+    );
+    let ai_at_cur = ai_would_apply_at_dims(
+        cur_w,
+        cur_h,
+        upscale_on,
+        upscale_limit,
+        denoise_on,
+        denoise_limit,
+    );
+    ai_at_native && !ai_at_cur
 }
 
 /// 1 タイルを推論してスケール倍率を検出する（結果をキャッシュ）。
@@ -890,50 +935,31 @@ mod tests {
         assert!(!should_process_rect(4095, 2048, limit));
     }
 
-    /// GitHub issue #1: native 寸法がサイズ上限内 + AI 設定 ON の PDF ラスターは
-    /// native 解像度で再レンダして AI を起動する。
+    /// `ai_would_apply_at_dims`: 設定 ON かつ寸法が range 内のときだけ true。
     #[test]
-    fn pdf_native_rerender_when_ai_applies() {
+    fn ai_applies_at_dims_basic() {
         let limit = AiProcessSizeLimit::square(2048);
-        // issue 添付の native 寸法 824x1200 (両軸 2048 未満) + アップスケール ON → 再レンダ。
-        assert!(pdf_should_native_rerender_for_ai(
-            824, 1200, true, limit, false, limit
-        ));
-        // デノイズだけ ON でも range 内なら再レンダ。
-        assert!(pdf_should_native_rerender_for_ai(
-            824, 1200, false, limit, true, limit
-        ));
-    }
-
-    /// AI 設定が両方 OFF なら、range 内ラスターでも再レンダしない
-    /// (非 AI ユーザーの 4096px 表示解像度を保つ)。
-    #[test]
-    fn pdf_no_native_rerender_when_ai_off() {
-        let limit = AiProcessSizeLimit::square(2048);
-        assert!(!pdf_should_native_rerender_for_ai(
+        // 824x1200 (range 内) + アップスケール ON。
+        assert!(ai_would_apply_at_dims(824, 1200, true, limit, false, limit));
+        // デノイズだけ ON でも range 内なら true。
+        assert!(ai_would_apply_at_dims(824, 1200, false, limit, true, limit));
+        // 両方 OFF なら false。
+        assert!(!ai_would_apply_at_dims(
             824, 1200, false, limit, false, limit
         ));
-    }
-
-    /// native 寸法がサイズ上限超なら、AI 設定 ON でも再レンダしない
-    /// (AI はどのみちスキップされるので 4096px 固定のまま)。
-    #[test]
-    fn pdf_no_native_rerender_when_native_over_limit() {
-        let limit = AiProcessSizeLimit::square(2048);
-        // 3000x4000 は短辺 3000 ≥ 2048 で range 外。
-        assert!(!pdf_should_native_rerender_for_ai(
-            3000, 4000, true, limit, true, limit
+        // range 外 (4096px レンダ後の 2812x4095) は ON でも false。
+        assert!(!ai_would_apply_at_dims(
+            2812, 4095, true, limit, true, limit
         ));
     }
 
-    /// アップスケールとデノイズで別々のサイズ上限を持つケース:
-    /// デノイズ上限だけ広ければデノイズ起動で再レンダする。
+    /// アップスケールとデノイズで別々のサイズ上限を持つケース。
     #[test]
-    fn pdf_native_rerender_respects_separate_limits() {
+    fn ai_applies_at_dims_separate_limits() {
         let upscale_limit = AiProcessSizeLimit::square(1024);
         let denoise_limit = AiProcessSizeLimit::square(2048);
         // 1500x1500: upscale 上限 1024 では range 外、denoise 上限 2048 では range 内。
-        assert!(pdf_should_native_rerender_for_ai(
+        assert!(ai_would_apply_at_dims(
             1500,
             1500,
             true,
@@ -941,14 +967,74 @@ mod tests {
             true,
             denoise_limit
         ));
-        // upscale だけ ON なら range 外なので再レンダしない。
-        assert!(!pdf_should_native_rerender_for_ai(
+        // upscale だけ ON なら range 外なので false。
+        assert!(!ai_would_apply_at_dims(
             1500,
             1500,
             true,
             upscale_limit,
             false,
             denoise_limit
+        ));
+    }
+
+    /// GitHub issue #1 中核ケース: native (824x1200, range 内) を 4096px でレンダした
+    /// 結果 (2812x4095, range 外) を表示中、AI ON なら native へ再レンダが必要。
+    /// 「初回表示で AI ON」「開いてサイズ確認後に AI を ON」(後者は cur=4096 のまま
+    /// AI フラグだけ true になった状態) の両方をこの 1 判定で拾う。
+    #[test]
+    fn needs_rerender_when_ai_on_and_cur_over_limit() {
+        let limit = AiProcessSizeLimit::square(2048);
+        assert!(pdf_needs_native_rerender_for_ai(
+            1.0, 824, 1200, 2812, 4095, true, limit, false, limit, false,
+        ));
+    }
+
+    /// 両方 OFF (非 AI 利用) なら再レンダしない (4096px 表示を保つ)。
+    #[test]
+    fn no_rerender_when_ai_off() {
+        let limit = AiProcessSizeLimit::square(2048);
+        assert!(!pdf_needs_native_rerender_for_ai(
+            1.0, 824, 1200, 2812, 4095, false, limit, false, limit, false,
+        ));
+    }
+
+    /// native もサイズ上限超なら AI はどのみち効かないので再レンダしない。
+    #[test]
+    fn no_rerender_when_native_over_limit() {
+        let limit = AiProcessSizeLimit::square(2048);
+        // native 3000x4000 は短辺 3000 ≥ 2048 で range 外。
+        assert!(!pdf_needs_native_rerender_for_ai(
+            1.0, 3000, 4000, 3000, 4000, true, limit, true, limit, false,
+        ));
+    }
+
+    /// 収束後 (native へ落ちて現寸法でも AI が効く) は再レンダしない。
+    /// 毎フレーム呼んでも余分な再レンダ / no-op が起きないことの回帰ガード。
+    #[test]
+    fn no_rerender_when_already_native() {
+        let limit = AiProcessSizeLimit::square(2048);
+        // cur が既に native (824x1200) = range 内 → ai_at_cur が true → 再レンダ不要。
+        assert!(!pdf_needs_native_rerender_for_ai(
+            1.0, 824, 1200, 824, 1200, true, limit, false, limit, false,
+        ));
+    }
+
+    /// 再レンダ中 (in_flight) は再キックしない (cancel→respawn 無限ループ防止)。
+    #[test]
+    fn no_rerender_while_in_flight() {
+        let limit = AiProcessSizeLimit::square(2048);
+        assert!(!pdf_needs_native_rerender_for_ai(
+            1.0, 824, 1200, 2812, 4095, true, limit, false, limit, true, // render_in_flight
+        ));
+    }
+
+    /// ズーム中 (zoom != 1) は zoom ハンドラに委ねるので reconcile しない。
+    #[test]
+    fn no_rerender_while_zoomed() {
+        let limit = AiProcessSizeLimit::square(2048);
+        assert!(!pdf_needs_native_rerender_for_ai(
+            2.0, 824, 1200, 2812, 4095, true, limit, false, limit, false,
         ));
     }
 }

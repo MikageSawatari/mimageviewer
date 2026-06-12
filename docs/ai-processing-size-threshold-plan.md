@@ -23,14 +23,23 @@
 >   (旧しきい値 2048 でも同じ。Codex P2 指摘、実装前からの既存挙動)。当初はズーム操作で
 >   `request_pdf_rerender` がサイズ上限内のラスターページを native 解像度で再レンダした
 >   時点でしか AI が効かず、「content_type 解析後の自動再レンダは PDF pool 負荷との
->   トレードオフがありスコープ外」としていた。**v1.3.1 で `poll_prefetch` に対処を追加**:
->   content_type が `Raster{w,h}` として届いた時点で、それが**表示中ページ
->   (`fullscreen_idx`) かつ AI が実効適用される (native 寸法がサイズ上限内 + 設定 ON)**
->   なら `request_pdf_rerender(idx, fs_zoom)` を 1 回呼んで native 解像度へ再レンダする。
->   判定は純関数 `ai::upscale::pdf_should_native_rerender_for_ai` (単体テストあり)。
->   表示中ページのみに絞るので pool 負荷は限定的。非 AI 利用時は再レンダせず 4096px
->   表示を維持する (range 内ラスターを常に native へ落とすと表示解像度が下がるため、
->   ズーム経路の `in_ai_range` のみ判定とは違い「設定 ON」も AND 条件にしている)。
+>   トレードオフがありスコープ外」としていた。**v1.3.1 で毎フレームの reconcile を追加**:
+>   `App::update` の `maybe_native_rerender_pdf_for_ai`
+>   (`sync_upscale_from_preset(fs_idx)` の直後 = AI 設定が当該ページの最新値) が、
+>   表示中ページが「native はサイズ上限内なのに現行レンダ寸法では範囲外」なら
+>   `request_pdf_rerender(idx, 1.0)` で native へ再レンダする。content_type 到着時
+>   (初回表示で AI ON) に加え、**開いてサイズ確認後に U/N キーで AI を ON にする
+>   issue 本文のシナリオ**も毎フレーム評価で拾う (poll_prefetch だけでは AI 後付けを
+>   取りこぼし、かつ poll_prefetch は sync より前なので AI 状態が stale になる問題を回避)。
+>   判定は純関数 `ai::upscale::pdf_needs_native_rerender_for_ai` (in-flight 中 / ズーム中 /
+>   収束後は false を返してループ・無駄な再レンダを防ぐ。単体テスト + app 配線テストあり)。
+>   表示中ページ + fit 表示 (zoom≈1.0) のみに絞るので pool 負荷は限定的。非 AI 利用時は
+>   再レンダせず 4096px 表示を維持する (range 内ラスターを常に native へ落とすと表示解像度が
+>   下がるため、ズーム経路の `in_ai_range` のみ判定とは違い「設定 ON」も AND 条件にしている)。
+>   - **スコープ**: 対象は `PdfPageContentType::Raster` のページ。可視テキスト / パス /
+>     シェーディングを含むページは `Vector` 判定 (`pdf_loader::analyze_page_content`) で
+>     4096px 固定のまま AI 対象外 (透明 OCR テキストは `is_visible_text` が無視するので
+>     スキャン PDF は Raster のまま対象)。ベクター混在ページの AI 化は別途要検討。
 > - **メモリ過大ガードは意図的に持たない** (2026-06-10 ユーザー判断、Codex P2 への回答):
 >   空きメモリ量に応じて AI 適用可否を変えると挙動が予測できなくなるため、判定は
 >   サイズ上限のみで決定的にする。最悪ケース (4095x4095 を 4x) のピークは
