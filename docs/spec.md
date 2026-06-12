@@ -861,7 +861,7 @@ Ctrl+F (ローカル検索) はこれらの制約を受けない。
 | ショートカット | 呼称 | 対象 | 検索経路 | 備考 |
 |---|---|---|---|---|
 | Ctrl+S | コンテナ検索 | お気に入り全体のフォルダ / ZIP / PDF を名前で | コンテナ索引 `search_index.db` (SQLite LIKE) | 「種別」ドロップダウン (すべて / フォルダ / ZIP / PDF) で絞れる。動画は対象外 (動画はアイテム) |
-| Ctrl+F | 現在地フィルタ | **現グリッドの表示中アイテムのみ** (非再帰・索引なし) | worker 上のオンデマンド判定 | 構造アイテム (フォルダ / ZIP / PDF) もファイル名で一貫して絞り込む。画像 / 動画は PNG tEXt / JPEG EXIF UserComment の AI 生成メタ + EXIF + XMP + 動画メタ + タグ + 外部メタデータサイドカー、PDF はファイル名 + document info。検索中は item 単位の処理済み数 / 総数を表示する。フィルタ元フォルダでは BS / Alt+↑ / ⬆ による親移動を止めるが、結果から子フォルダへ入った後の BS は通常どおり戻れる。PDF ページ表示中は無効、ZIP 表示中はファイル名フィルタに固定 |
+| Ctrl+F | 現在地フィルタ | **現グリッドの表示中アイテムのみ** (非再帰・索引なし) | worker 上のオンデマンド判定 | 構造アイテム (フォルダ / ZIP / PDF) もファイル名で一貫して絞り込む。画像 / 動画は PNG tEXt / JPEG EXIF UserComment の AI 生成メタ + EXIF + XMP + 動画メタ + 外部メタデータサイドカー、PDF はファイル名 + document info。mIV タグは Ctrl+F の検索本文へ混ぜず、タグビューまたはスマートフィルタのタグ欄で探す。検索中は item 単位の処理済み数 / 総数を表示する。フィルタ元フォルダでは BS / Alt+↑ / ⬆ による親移動を止めるが、結果から子フォルダへ入った後の BS は通常どおり戻れる。PDF ページ表示中は無効、ZIP 表示中はファイル名フィルタに固定 |
 | Ctrl+G | アイテム検索 | **お気に入り全体 (`auto_index_metadata=true`) の画像 / PDF / 動画** | アイテム索引 (Tantivy bigram) で候補絞り込み → STORED 原文を `matches()` で phrase/NOT/AND 正確判定 (streaming) | ZIP はコンテナなので対象外。動画は `video_meta_text`、PDF は `pdf_meta_text`、画像と同名 JSON/TXT は `sidecar_text` (値のみの自由語検索、mIV タグとは別系統) に分けて検索対象フィルタから選べる。mIV タグは Ctrl+G の検索本文へ混ぜず、タグ候補チップからタグビューへ誘導する。結果は一覧 / 集約の 2 ビューを切替でき、ヒットが多いと自動で集約に寄る。検索中はバー / アドレス欄 / 空グリッド中央に「検索中」を表示し、0 件確定と区別する。検索バーは狭い幅では折り返し、Ctrl+G のドロップダウン操作中は背後のグリッドをホイールスクロールしない |
 
 #### AI メタデータ検索の Negative Prompt 除外
@@ -1162,6 +1162,11 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
 ### Phase 5.5 (タグ機能 / v0.8.0) ✅ 完了
 
 設計ドキュメント: [docs/tag-feature.md](tag-feature.md)
+
+現在のタグ実装は [docs/tag-catalog-redesign-plan.md](tag-catalog-redesign-plan.md) の
+`tags.db` 正本モデルへ移行済み。通常のタグ付与/削除はファイル本体や XMP を書き換えず、
+Ctrl+F / Ctrl+G の全文検索にも投影しない。旧 XMP `dc:subject` の `#` タグは移行元としてのみ読み、
+ユーザー明示操作で取り込みまたは取り込み後削除できる。
 
 - [x] XMP `dc:subject` への独自タグ (`#タグ名`) 書き込み (JPEG / PNG / WebP は本体埋め込み、
       動画 (MP4 / MKV / MOV / AVI / WMV / MPG / MPEG) は同名 `.xmp` サイドカーに書き込み、

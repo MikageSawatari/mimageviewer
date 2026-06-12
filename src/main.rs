@@ -109,6 +109,7 @@ pub mod stats;
 pub mod susie_loader;
 pub mod sys_memory;
 mod tag_legacy_seed_worker;
+mod tag_legacy_xmp_worker;
 mod tag_ops;
 mod tag_prewarm;
 mod tag_view;

@@ -898,6 +898,39 @@ impl App {
                         self.request_tag_clear_for_selection();
                         ui.close();
                     }
+                    let legacy_xmp_count = self.legacy_xmp_target_path_count();
+                    let has_legacy_xmp_target = legacy_xmp_count > 0;
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            has_legacy_xmp_target,
+                            egui::Button::new(format!("旧XMPタグを取り込む ({legacy_xmp_count})")),
+                        )
+                        .hover_tip(
+                            "ファイル内に残っている旧mIVの #タグをアプリ内タグへ取り込みます。",
+                        )
+                        .clicked()
+                    {
+                        self.request_legacy_xmp_import_for_selection(
+                            crate::tag_legacy_xmp_worker::LegacyXmpImportMode::ImportOnly,
+                        );
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            has_legacy_xmp_target,
+                            egui::Button::new(format!(
+                                "旧XMPタグを取り込んでファイルから削除 ({legacy_xmp_count})"
+                            )),
+                        )
+                        .hover_tip("取り込み後、ファイル内の旧mIV #タグだけを削除します。")
+                        .clicked()
+                    {
+                        self.request_legacy_xmp_import_for_selection(
+                            crate::tag_legacy_xmp_worker::LegacyXmpImportMode::ImportAndRemove,
+                        );
+                        ui.close();
+                    }
                     ui.separator();
                     let tags_snapshot: Vec<_> = self
                         .settings

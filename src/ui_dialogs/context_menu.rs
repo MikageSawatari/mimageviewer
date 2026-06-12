@@ -89,6 +89,13 @@ fn copy_path_text(ctx: &egui::Context, path: &Path) {
     ctx.copy_text(native_path_text(path));
 }
 
+fn legacy_xmp_context_path(item: &GridItem) -> Option<PathBuf> {
+    match item {
+        GridItem::Image(p) | GridItem::Video(p) => Some(p.clone()),
+        _ => None,
+    }
+}
+
 #[cfg(windows)]
 fn delete_targets_may_permanently_delete(targets: &[(usize, PathBuf)]) -> bool {
     let mut checked_roots: std::collections::HashMap<String, Option<u64>> =
@@ -351,6 +358,14 @@ impl crate::app::App {
                         }
                     });
 
+                    let legacy_xmp_paths = self
+                        .checked
+                        .iter()
+                        .filter_map(|idx| self.items.get(*idx))
+                        .filter_map(legacy_xmp_context_path)
+                        .collect::<Vec<_>>();
+                    self.draw_legacy_xmp_context_entries(ui, legacy_xmp_paths, &mut close);
+
                     // フォルダを開く (disabled)
                     ui.add_enabled(false, egui::Button::new("フォルダを開く"));
 
@@ -441,6 +456,7 @@ impl crate::app::App {
                                     close = true;
                                 }
                             });
+                            self.draw_legacy_xmp_context_entries(ui, vec![p.clone()], &mut close);
                             ui.separator();
                             if ui.button("削除 (ゴミ箱)").clicked() {
                                 self.request_delete_confirm(vec![(idx, p.clone())]);
@@ -820,6 +836,7 @@ impl crate::app::App {
                         // ── アプリケーションで開く ──
                         ui.separator();
                         close_fullscreen |= self.render_open_with_menu(ui, p, &mut close);
+                        self.draw_legacy_xmp_context_entries(ui, vec![p.clone()], &mut close);
                     }
                     GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
                         if ui.button("パスをコピー").clicked() {
@@ -918,6 +935,47 @@ impl crate::app::App {
             self.cached_handlers = None;
         }
         close_fullscreen
+    }
+
+    fn draw_legacy_xmp_context_entries(
+        &mut self,
+        ui: &mut egui::Ui,
+        mut paths: Vec<PathBuf>,
+        close: &mut bool,
+    ) {
+        paths.retain(|path| {
+            crate::xmp_writer::is_writable_format(path)
+                || crate::xmp_writer::is_video_for_sidecar(path)
+        });
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() {
+            return;
+        }
+        let count = paths.len();
+        ui.separator();
+        if ui
+            .button(format!("旧XMPタグを取り込む ({count})"))
+            .on_hover_text("ファイル内に残っている旧mIVの #タグをアプリ内タグへ取り込みます。")
+            .clicked()
+        {
+            self.request_legacy_xmp_import_for_paths(
+                paths.clone(),
+                crate::tag_legacy_xmp_worker::LegacyXmpImportMode::ImportOnly,
+            );
+            *close = true;
+        }
+        if ui
+            .button(format!("旧XMPタグを取り込んでファイルから削除 ({count})"))
+            .on_hover_text("取り込み後、ファイル内の旧mIV #タグだけを削除します。")
+            .clicked()
+        {
+            self.request_legacy_xmp_import_for_paths(
+                paths,
+                crate::tag_legacy_xmp_worker::LegacyXmpImportMode::ImportAndRemove,
+            );
+            *close = true;
+        }
     }
 
     /// 「アプリケーションで開く」サブメニューを描画する。

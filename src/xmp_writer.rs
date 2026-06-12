@@ -25,7 +25,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::NsReader;
 
 use crate::xmp_reader;
@@ -214,6 +214,27 @@ fn apply_tag_op_video_sidecar(path: &Path, op: &TagOp) -> Result<String, WriteEr
     Ok(new_tags)
 }
 
+/// 動画 sidecar から mIV 旧タグを消した結果、実質的に空殻だけが残った場合に削除する。
+///
+/// `dc:subject` に非 mIV タグが残っている、`xmp:Rating` や別プロパティがある、XML が
+/// 読めない、という場合は安全側に倒して削除しない。
+pub fn cleanup_empty_video_sidecar_after_clear(path: &Path) -> Result<bool, WriteError> {
+    if !is_video_for_sidecar(path) {
+        return Ok(false);
+    }
+    let sidecar = sidecar_path_for(path);
+    let bytes = match std::fs::read(&sidecar) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(WriteError::Io(e)),
+    };
+    if video_sidecar_has_content_to_preserve(&bytes) {
+        return Ok(false);
+    }
+    std::fs::remove_file(&sidecar)?;
+    Ok(true)
+}
+
 /// 指定ファイルの `xmp:Rating` を設定する。`rating` が `None` / `Some(0)` なら削除。
 /// 対応形式は JPEG / PNG / WebP。読み取り専用は `ReadOnly` エラー。
 ///
@@ -255,6 +276,156 @@ fn write_atomically(target: &Path, bytes: &[u8]) -> Result<(), WriteError> {
             Err(WriteError::Io(e))
         }
     }
+}
+
+fn video_sidecar_has_content_to_preserve(xmp: &[u8]) -> bool {
+    if !xmp_reader::parse_dc_subject(xmp).is_empty() {
+        return true;
+    }
+    if xmp_reader::parse_xmp_rating(xmp).is_some() {
+        return true;
+    }
+
+    let mut reader = NsReader::from_reader(xmp);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut subject_depth = 0i32;
+    let mut metadata_date_depth = 0i32;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                if subject_depth > 0 {
+                    subject_depth += 1;
+                } else if metadata_date_depth > 0 {
+                    metadata_date_depth += 1;
+                } else if start_element_has_preserved_content(
+                    &e,
+                    &mut subject_depth,
+                    &mut metadata_date_depth,
+                ) {
+                    return true;
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                if subject_depth == 0
+                    && metadata_date_depth == 0
+                    && empty_element_has_preserved_content(&e)
+                {
+                    return true;
+                }
+            }
+            Ok(Event::End(_)) => {
+                if subject_depth > 0 {
+                    subject_depth -= 1;
+                } else if metadata_date_depth > 0 {
+                    metadata_date_depth -= 1;
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if subject_depth == 0 && metadata_date_depth == 0 && has_non_ws(e.as_ref()) {
+                    return true;
+                }
+            }
+            Ok(Event::CData(e)) => {
+                if subject_depth == 0 && metadata_date_depth == 0 && has_non_ws(e.as_ref()) {
+                    return true;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+        buf.clear();
+    }
+    false
+}
+
+fn start_element_has_preserved_content(
+    e: &BytesStart<'_>,
+    subject_depth: &mut i32,
+    metadata_date_depth: &mut i32,
+) -> bool {
+    let name = e.name();
+    let local = local_xml_name(name.as_ref());
+    if local.eq_ignore_ascii_case(b"subject") {
+        *subject_depth = 1;
+        return has_non_namespace_attr(e);
+    }
+    if local.eq_ignore_ascii_case(b"MetadataDate") {
+        *metadata_date_depth = 1;
+        return has_non_namespace_attr(e);
+    }
+    if shell_element_allows_attrs(local) {
+        return shell_attrs_have_preserved_content(e, local);
+    }
+    true
+}
+
+fn empty_element_has_preserved_content(e: &BytesStart<'_>) -> bool {
+    let name = e.name();
+    let local = local_xml_name(name.as_ref());
+    if local.eq_ignore_ascii_case(b"subject") || local.eq_ignore_ascii_case(b"MetadataDate") {
+        return has_non_namespace_attr(e);
+    }
+    if shell_element_allows_attrs(local) {
+        return shell_attrs_have_preserved_content(e, local);
+    }
+    true
+}
+
+fn shell_element_allows_attrs(local: &[u8]) -> bool {
+    local.eq_ignore_ascii_case(b"xmpmeta")
+        || local.eq_ignore_ascii_case(b"RDF")
+        || local.eq_ignore_ascii_case(b"Description")
+}
+
+fn shell_attrs_have_preserved_content(e: &BytesStart<'_>, local: &[u8]) -> bool {
+    for attr in e.attributes().with_checks(false) {
+        let Ok(attr) = attr else {
+            return true;
+        };
+        let key = attr.key.as_ref();
+        if is_namespace_attr(key) {
+            continue;
+        }
+        if local.eq_ignore_ascii_case(b"xmpmeta")
+            && local_xml_name(key).eq_ignore_ascii_case(b"xmptk")
+        {
+            continue;
+        }
+        if local.eq_ignore_ascii_case(b"Description")
+            && local_xml_name(key).eq_ignore_ascii_case(b"about")
+        {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn has_non_namespace_attr(e: &BytesStart<'_>) -> bool {
+    for attr in e.attributes().with_checks(false) {
+        let Ok(attr) = attr else {
+            return true;
+        };
+        if !is_namespace_attr(attr.key.as_ref()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_namespace_attr(key: &[u8]) -> bool {
+    key == b"xmlns" || key.starts_with(b"xmlns:")
+}
+
+fn local_xml_name(name: &[u8]) -> &[u8] {
+    name.rsplit(|ch| *ch == b':').next().unwrap_or(name)
+}
+
+fn has_non_ws(bytes: &[u8]) -> bool {
+    bytes.iter().any(|b| !b.is_ascii_whitespace())
 }
 
 // ---------------------------------------------------------------------------

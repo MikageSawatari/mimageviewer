@@ -274,6 +274,36 @@ impl TagsDb {
             .collect())
     }
 
+    pub fn union_item_tags<I, S>(
+        &mut self,
+        item_key: &str,
+        tags: I,
+        source: &str,
+    ) -> Result<(Vec<String>, usize), rusqlite::Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.rotate_backups_once();
+        let now = now_unix_secs();
+        let normalized = collapse_tags(tags, now);
+        let tx = self.conn.transaction()?;
+        let mut inserted_tags = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO item_tags (item_key, tag, tag_key, applied_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for tag in &normalized {
+                inserted_tags +=
+                    stmt.execute(params![item_key, tag.tag, tag.tag_key, tag.applied_at])?;
+            }
+        }
+        upsert_item_state_tx(&tx, item_key, source, now)?;
+        tx.commit()?;
+        Ok((self.display_tags_for_item(item_key), inserted_tags))
+    }
+
     pub fn toggle_item_tag(
         &mut self,
         item_key: &str,
@@ -886,6 +916,32 @@ mod tests {
             .set_item_tags("c:/a.jpg", ["#ＦＡＴＥ", "fate"], source::EDIT)
             .unwrap();
         assert_eq!(after, vec!["#fate"]);
+    }
+
+    #[test]
+    fn union_item_tags_preserves_existing_and_marks_state() {
+        let mut db = memory_db();
+        db.set_item_tags("c:/a.jpg", ["#Cat"], source::EDIT)
+            .unwrap();
+        let (after, inserted) = db
+            .union_item_tags("c:/a.jpg", ["#ＣＡＴ", "#Dog"], source::XMP_LEGACY)
+            .unwrap();
+        assert_eq!(inserted, 1);
+        assert_eq!(after, vec!["#Cat".to_string(), "#Dog".to_string()]);
+        assert!(db.has_item_state("c:/a.jpg"));
+    }
+
+    #[test]
+    fn union_item_tags_empty_input_marks_state_without_deleting_tags() {
+        let mut db = memory_db();
+        db.set_item_tags("c:/a.jpg", ["#Cat"], source::EDIT)
+            .unwrap();
+        let (after, inserted) = db
+            .union_item_tags("c:/a.jpg", std::iter::empty::<&str>(), source::XMP_LEGACY)
+            .unwrap();
+        assert_eq!(inserted, 0);
+        assert_eq!(after, vec!["#Cat".to_string()]);
+        assert!(db.has_item_state("c:/a.jpg"));
     }
 
     #[test]

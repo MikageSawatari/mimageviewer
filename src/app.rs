@@ -3800,6 +3800,8 @@ pub struct App {
     pub(crate) tag_prewarm_queued: std::collections::HashSet<usize>,
     /// 旧 XMP `#タグ` を `tags.db` へ一度だけ seed する保険 worker。
     pub(crate) tag_legacy_seed_pending: Option<crate::tag_legacy_seed_worker::LegacySeedPending>,
+    /// ユーザー明示の旧 XMP タグ取り込み / 取り込み後削除 worker。
+    pub(crate) tag_legacy_xmp_pending: Option<crate::tag_legacy_xmp_worker::LegacyXmpImportPending>,
     /// バックグラウンドで実行中のゴミ箱移動 (docs/async-architecture.md §5.2.1)。
     /// `start_delete_files` で spawn、`poll_delete_pending` で受信して進捗ダイアログを
     /// 更新、完了時に成功した path を items から一括 remove する。
@@ -5865,6 +5867,7 @@ impl App {
             tag_prewarm_pending: None,
             tag_prewarm_queued: std::collections::HashSet::new(),
             tag_legacy_seed_pending: None,
+            tag_legacy_xmp_pending: None,
             delete_pending: None,
             search_filter: None,
             search_filter_origin_folder: None,
@@ -31345,6 +31348,7 @@ impl eframe::App for App {
         self.update_pano_refinement(ctx);
         self.poll_tag_prewarm_results();
         self.poll_tag_legacy_seed_results();
+        self.poll_legacy_xmp_import_results();
         self.poll_delete_pending();
         self.poll_paste_pending();
         self.poll_new_folder_pending(ctx);
@@ -31404,6 +31408,7 @@ impl eframe::App for App {
                 .as_ref()
                 .is_some_and(|p| p.is_busy())
             || self.tag_legacy_seed_pending.is_some()
+            || self.tag_legacy_xmp_pending.is_some()
             || (self.folder_rating_counter_handle.is_some() && !self.folder_rating_counts_loaded)
         {
             ctx.request_repaint();

@@ -108,6 +108,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | [tags_db.rs](../src/tags_db.rs) | mIV タグ正本。`item_tags` / `tag_item_state` / `tag_meta` と `tag_key` 正規化 helper |
 | [tag_ops.rs](../src/tag_ops.rs) | UI からのタグ操作ファサード。all-or-nothing 判定後に tags.db worker へ投入 |
 | [tag_write_worker.rs](../src/tag_write_worker.rs) | UI → tags.db 更新 worker。通常タグ操作では XMP/Tantivy を更新しない |
+| [tag_legacy_xmp_worker.rs](../src/tag_legacy_xmp_worker.rs) | 旧 XMP `dc:subject` / 動画 `.xmp` に残る `#` タグの明示取り込みと、取り込み後削除 |
 | [xmp_writer.rs](../src/xmp_writer.rs) | 既存 XMP 書換 helper。タグでは旧 `dc:subject` 移行・明示除去用の補助に縮退 |
 
 ---
@@ -351,6 +352,13 @@ Tantivy / Ctrl+S 名前索引へ投影しないため、全文検索 commit 待�
 `tags.db` へコピーする。挿入点は `IndexerManager::new` の `FtsMetaDb` open 後、
 `fts_index` wipe / `FtsIndex::open_at` より前。移行済みフラグは
 `tags.db.tag_meta.legacy_tantivy_imported` に置く。
+
+Tantivy 移行に乗らない未索引ファイルは、フォルダ表示時の legacy seed worker が
+XMP `dc:subject` の `#` タグを一度だけ `tags.db` へ取り込む。ユーザーが明示的に
+「旧XMPタグを取り込む」「旧XMPタグを取り込んでファイルから削除」を実行した場合は、
+`tag_item_state` の有無に関係なく選択中の画像/動画を読み直し、既存 tags.db タグへ
+union する。削除モードでは DB 更新成功後に `#` 要素だけを除去し、非 `#` の外部タグは
+保持する。
 
 ### 4.10 外部メタデータサイドカー (画像のみ、INDEX_VERSION=8)
 

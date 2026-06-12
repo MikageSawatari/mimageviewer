@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use crate::app::App;
 use crate::grid_item::GridItem;
+use crate::tag_legacy_xmp_worker::{LegacyXmpImportMode, LegacyXmpImportReport};
 use crate::tag_write_worker::{
     TagAction, TagJobKind, TagSidecarTarget, TagWriteHandle, TagWriteJob,
 };
@@ -36,6 +37,13 @@ fn tag_target_for_item(item: &GridItem, fullscreen: bool) -> Option<TagTarget> {
             .flatten(),
         path,
     })
+}
+
+fn legacy_xmp_target_for_item(item: &GridItem) -> Option<PathBuf> {
+    match item {
+        GridItem::Image(p) | GridItem::Video(p) => Some(p.clone()),
+        _ => None,
+    }
 }
 
 impl App {
@@ -93,6 +101,75 @@ impl App {
 
     pub(crate) fn tag_target_path_count(&self) -> usize {
         self.tag_targets().len()
+    }
+
+    fn legacy_xmp_targets(&self) -> Vec<PathBuf> {
+        let push_target = |out: &mut Vec<PathBuf>, idx: usize, items: &[GridItem]| {
+            let Some(item) = items.get(idx) else {
+                return;
+            };
+            if let Some(path) = legacy_xmp_target_for_item(item) {
+                out.push(path);
+            }
+        };
+
+        let mut out = Vec::new();
+        if let Some(fs_idx) = self.fullscreen_idx {
+            push_target(&mut out, fs_idx, &self.items);
+        } else {
+            let bulk_intent = match self.selected {
+                Some(sel) => !self.checked.is_empty() && self.checked.contains(&sel),
+                None => !self.checked.is_empty(),
+            };
+            if bulk_intent {
+                let mut indices: Vec<usize> = self.checked.iter().copied().collect();
+                indices.sort_unstable();
+                for idx in indices {
+                    push_target(&mut out, idx, &self.items);
+                }
+            } else if let Some(idx) = self.selected {
+                push_target(&mut out, idx, &self.items);
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    pub(crate) fn legacy_xmp_target_path_count(&self) -> usize {
+        self.legacy_xmp_targets().len()
+    }
+
+    pub(crate) fn request_legacy_xmp_import_for_selection(&mut self, mode: LegacyXmpImportMode) {
+        self.request_legacy_xmp_import_for_paths(self.legacy_xmp_targets(), mode);
+    }
+
+    pub(crate) fn request_legacy_xmp_import_for_paths(
+        &mut self,
+        mut targets: Vec<PathBuf>,
+        mode: LegacyXmpImportMode,
+    ) {
+        if self.tag_legacy_xmp_pending.is_some() {
+            self.show_feedback_toast("旧XMPタグの取り込み処理中です".to_string());
+            return;
+        }
+        targets.retain(|path| {
+            crate::xmp_writer::is_writable_format(path)
+                || crate::xmp_writer::is_video_for_sidecar(path)
+        });
+        targets.sort();
+        targets.dedup();
+        if targets.is_empty() {
+            self.show_feedback_toast("旧XMPタグの取り込み対象がありません".to_string());
+            return;
+        }
+        let count = targets.len();
+        self.tag_legacy_xmp_pending = Some(crate::tag_legacy_xmp_worker::spawn(
+            crate::data_dir::get(),
+            targets,
+            mode,
+        ));
+        self.show_feedback_toast(format!("{} ({count} 件)", mode.progress_label()));
     }
 
     pub(crate) fn request_tag_toggle_for_selection(&mut self, name: &str) {
@@ -502,6 +579,73 @@ impl App {
     }
 }
 
+impl App {
+    pub(crate) fn poll_legacy_xmp_import_results(&mut self) {
+        let received = match self.tag_legacy_xmp_pending.as_ref() {
+            Some(pending) => match pending.rx.try_recv() {
+                Ok(result) => Some((pending.mode, result)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some((
+                    pending.mode,
+                    Err("旧XMPタグの取り込み処理が終了しました".to_string()),
+                )),
+            },
+            None => None,
+        };
+        let Some((mode, result)) = received else {
+            return;
+        };
+        self.tag_legacy_xmp_pending = None;
+
+        match result {
+            Ok(result) => {
+                let report = result.report.clone();
+                let mut changed = false;
+                for (path, tags) in result.cache_updates {
+                    let key = crate::tags_db::item_key_for_path(&path);
+                    self.tags_cache.insert(key, tags.clone());
+                    if let Some(target) =
+                        crate::tag_write_worker::sidecar_target_for_real_file(&path)
+                    {
+                        self.mirror_tag_sidecar_update(&target, &tags);
+                    }
+                    changed = true;
+                }
+                if changed && self.settings.facet_filter.uses_tag_state() {
+                    self.rebuild_visible_indices();
+                }
+                if changed && self.tag_view.active {
+                    self.execute_tag_view();
+                }
+
+                crate::logger::log(format!(
+                    "[TAG] legacy XMP import complete: mode={mode:?} candidates={} read={} \
+                     imported_items={} inserted_tags={} marked_empty={} cleaned_files={} \
+                     deleted_video_sidecars={} read_errors={} db_errors={} write_errors={}",
+                    report.candidate_items,
+                    report.read_items,
+                    report.imported_items,
+                    report.inserted_tags,
+                    report.marked_empty_items,
+                    report.cleaned_files,
+                    report.deleted_video_sidecars,
+                    report.read_errors,
+                    report.db_errors,
+                    report.write_errors
+                ));
+                self.show_feedback_toast(format_legacy_xmp_import_toast(
+                    mode,
+                    &report,
+                    result.errors.len(),
+                ));
+            }
+            Err(e) => {
+                self.show_feedback_toast(format!("旧XMPタグの取り込みに失敗: {e}"));
+            }
+        }
+    }
+}
+
 /// `poll_tag_write_results` 内で worker 1 件分の結果を `pending_tag_undos` に
 /// どう反映するかを表す中間型。借用衝突を避けるため、ハンドルの drain 中はここに
 /// 積み上げて drain 後に `finalize_pending_tag_undos` でまとめて適用する。
@@ -613,9 +757,48 @@ fn format_completion_toast(
     }
 }
 
+fn format_legacy_xmp_import_toast(
+    mode: LegacyXmpImportMode,
+    report: &LegacyXmpImportReport,
+    errors: usize,
+) -> String {
+    let mut msg = if mode.removes_from_file() {
+        if report.cleaned_files > 0 {
+            let sidecar = if report.deleted_video_sidecars > 0 {
+                format!(" / 動画sidecar {} 件削除", report.deleted_video_sidecars)
+            } else {
+                String::new()
+            };
+            format!(
+                "旧XMPタグを取り込み、{} 件のファイルから削除しました{sidecar}",
+                report.cleaned_files
+            )
+        } else if report.imported_items > 0 {
+            format!(
+                "旧XMPタグを取り込みました: {} 件 / 新規 {} 個",
+                report.imported_items, report.inserted_tags
+            )
+        } else {
+            "旧XMPタグは見つかりませんでした".to_string()
+        }
+    } else if report.imported_items > 0 {
+        format!(
+            "旧XMPタグを取り込みました: {} 件 / 新規 {} 個",
+            report.imported_items, report.inserted_tags
+        )
+    } else {
+        "旧XMPタグは見つかりませんでした".to_string()
+    };
+    if errors > 0 {
+        msg.push_str(&format!(" / 失敗 {errors} 件"));
+    }
+    msg
+}
+
 #[cfg(test)]
 mod tests {
-    use super::format_completion_toast;
+    use super::{format_completion_toast, format_legacy_xmp_import_toast};
+    use crate::tag_legacy_xmp_worker::{LegacyXmpImportMode, LegacyXmpImportReport};
 
     #[test]
     fn toast_single_add() {
@@ -683,6 +866,21 @@ mod tests {
         assert_eq!(
             format_completion_toast(None, 0, 0, 0, 3, 2),
             "3 件のタグを元に戻しました"
+        );
+    }
+
+    #[test]
+    fn legacy_xmp_toast_mentions_cleanup_and_errors() {
+        let report = LegacyXmpImportReport {
+            imported_items: 3,
+            inserted_tags: 5,
+            cleaned_files: 2,
+            deleted_video_sidecars: 1,
+            ..LegacyXmpImportReport::default()
+        };
+        assert_eq!(
+            format_legacy_xmp_import_toast(LegacyXmpImportMode::ImportAndRemove, &report, 1),
+            "旧XMPタグを取り込み、2 件のファイルから削除しました / 動画sidecar 1 件削除 / 失敗 1 件"
         );
     }
 }
