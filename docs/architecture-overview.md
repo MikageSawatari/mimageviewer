@@ -156,7 +156,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `search_index_db.rs` | Ctrl+S 用 `search_index.db` (お気に入り配下のフォルダ / ZIP / PDF / 動画名) |
 | `fts_index.rs` | Tantivy 0.26 ラッパ。`IndexDoc` / `Fields` / `QueryFilters` / `build_bigram_and_query` / `search_page`。bigram tokenizer + lower_caser |
 | `fts_meta.rs` | `fts_meta.db` (SQLite) ラッパ。ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たない (Tantivy STORED に集約) |
-| `ingest_text.rs` | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / tags) のビルダー |
+| `ingest_text.rs` | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / sidecar、旧 tags は移行専用) のビルダー |
 | `ingest_worker.rs` | メタ抽出 + Tantivy buffer + バッチ commit + commit 成功フレームでのみ SQLite を更新 (Tantivy First 書き込み順序) |
 | `indexer_manager.rs` | 全お気に入りの `SupervisorHandle` 統括。Ctrl+G ワーカー spawn、App drop 時の停止 |
 | `indexer_supervisor.rs` | メタ索引 supervisor (1 お気に入り 1 本)。初期スキャン + FsWatcher + ingest |
@@ -168,9 +168,10 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `global_search.rs` | Ctrl+G streaming クエリワーカー (Searcher snapshot 固定 + ページング post-filter) |
 | `global_search_ui.rs` | Ctrl+G 検索バー + drill-down ビュー + Aggregated / DrilledInto 集約 |
 | `io_semaphore.rs` | `GlobalIoSemaphore` — UI / PDF / サムネ / インデクサ横断の I/O 同時実行制御 (Low/Normal/High) |
-| `tag_ops.rs` | `#タグ` 要素の Bag 操作ヘルパ (add / remove / clear-hash-prefixed) |
-| `tag_write_worker.rs` | UI → XMP 書き込み worker。書込み成功後に共有 `IndexWriter` 経由で即時 Tantivy 反映 |
-| `xmp_writer.rs` | 既存メタを保持したままの `dc:subject` atomic 書換 (JPEG / PNG / WebP) |
+| `tags_db.rs` | `%APPDATA%/mimageviewer/tags.db`。`item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本 |
+| `tag_ops.rs` | UI からのタグ操作ファサード。6 種の実パス item を対象に all-or-nothing 付与/削除を決め、worker へ投入 |
+| `tag_write_worker.rs` | UI → tags.db 更新 worker。通常タグ操作ではメディア本体 / XMP サイドカー / Tantivy へ書き込まない |
+| `xmp_writer.rs` | 既存 XMP 書換 helper。タグでは旧 `dc:subject` 移行・明示除去系の補助に縮退、rating 書込みでは引き続き使用 |
 
 ### その他
 
@@ -228,7 +229,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `audio_normalize.db` | 動画ファイル単位のノーマライズ測定値 (integrated LUFS / true peak / 算出ゲイン)。主キー `(path_lower, file_size, mtime_ms, target_lufs_milli)`。環境設定 → 動画から全件クリア可能 | `audio_normalize_db.rs` |
 | `rating.db` | レーティング (★1〜5、0 は未登録)。ページ単位 (画像/ZIP 内画像/PDF ページ) とコンテナ (フォルダ/ZIP/PDF 本体) を同一テーブルに格納。キー形式の違い (`::` の有無) で区別 | `rating_db.rs` |
 | `search_index.db` | Ctrl+S 用。お気に入り配下のフォルダ/ZIP/PDF/動画名索引 | `search_index_db.rs` |
-| `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み | `fts_index.rs` → `ingest_worker.rs` / `tag_write_worker.rs` |
+| `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み。旧 `tags` STORED は tags.db 移行専用 | `fts_index.rs` → `ingest_worker.rs` |
 | `fts_meta.db` | ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たず Tantivy STORED に集約 | `fts_meta.rs` |
 | `adjustment.db` | ページ個別補正 (`page_params`) とお気に入り標準補正 (`favorite_params`) | `adjustment_db.rs` |
 | `mask.db` | 消しゴムマスク (deflate 圧縮 1bit/pixel + ベクタオブジェクト JSON) | `mask_db.rs` |

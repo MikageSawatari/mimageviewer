@@ -114,14 +114,6 @@ pub fn is_writable_format(path: &Path) -> bool {
     detect_format(path).is_some()
 }
 
-/// パスの拡張子が **タグ書き込み対応形式** か判定。
-/// JPEG / PNG / WebP は埋め込み XMP に直接書き込み、動画 (mp4/mkv/mov/...) は
-/// サイドカー XMP ファイル (`<path>.xmp`) に書き込む。
-/// タグ系 UI (グレーアウト判定 / 対象パス算出 / prewarm キャッシュ) で使う。
-pub fn is_taggable_format(path: &Path) -> bool {
-    detect_format(path).is_some() || is_video_for_sidecar(path)
-}
-
 /// 動画ファイル拡張子か判定 (XMP サイドカー方式でタグを保存する対象)。
 /// Lightroom / Adobe Bridge / Premiere が同名 `.xmp` サイドカーを認識する標準形式。
 /// 拡張子集合は mIV が再生サポートしている動画 (`SUPPORTED_VIDEO_EXTENSIONS`) と一致させる。

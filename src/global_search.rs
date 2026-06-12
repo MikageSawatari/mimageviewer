@@ -142,8 +142,7 @@ pub fn run(
     }
 
     // 4. 正の include トークンを集めて bigram クエリを組む。
-    //    タグはソース別フィールド `tags` として master の per-source OR に自然に組み込まれる
-    //    (target=All なら tags 含む 6 ソース OR, target=Only([Tags]) ならタグフィールドのみ)。
+    //    mIV タグは tags.db の専用面で扱うため、FTS の `tags` フィールドは移行専用。
     let include_tokens: Vec<&str> = tokens
         .iter()
         .filter(|t| t.include)
@@ -618,12 +617,11 @@ mod tests {
     }
 
     #[test]
-    fn short_tag_token_passes_min_length() {
+    fn short_hash_query_passes_min_length_for_tag_view_bridge() {
         // 1 文字タグ名 `#a` (合計 2 文字) は通常の ASCII 3 文字制約から免除される。
-        // ドキュメント (search.html §4) と整合させるため、tag トークンは常に通す。
+        // FTS タグ検索は廃止済みだが、タグビュー誘導のため `#tag` 入力自体は拒否しない。
         let (_tmp, meta, fts) = setup();
         let fav = Uuid::new_v4();
-        // tags フィールドにだけ `#a` を入れる
         let key = normalize_path(&PathBuf::from("c:/tag.jpg"));
         let norms = PerSourceText {
             name: crate::search_norm::normalize_for_match("tag.jpg"),
@@ -667,7 +665,10 @@ mod tests {
             DoneReason::RejectedQuery(RejectReason::TooShort),
             "短いタグ名は最小長で弾かないこと"
         );
-        assert_eq!(hits.len(), 1, "短い tag でもヒットすること");
+        assert!(
+            hits.is_empty(),
+            "FTS tags は閉じているので #a 自体ではヒットしない"
+        );
     }
 
     #[test]

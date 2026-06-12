@@ -1,5 +1,12 @@
 # タグ機能 設計ドキュメント
 
+> **現行実装メモ (2026-06-12)**:
+> タグ正本は `tags.db` に移行中です。通常タグ操作はメディア本体 / XMP サイドカー /
+> Tantivy `tags` フィールドへ書き込まず、`tags.db:item_tags` だけを更新します。
+> Ctrl+G/Ctrl+F のタグ検索ソースも閉じられており、タグでの絞り込みは facet の
+> タグフィルタが担当します。旧 XMP `dc:subject` ベースの記述は v1.0 仕様の履歴として
+> 残しています。新仕様の詳細は [tag-catalog-redesign-plan.md](tag-catalog-redesign-plan.md) を参照。
+
 mimageviewer に「ハッシュタグ型」の分類タグ機能を追加する。
 Ctrl+G 検索の絞り込みキーとして、ユーザーがあらかじめ登録したタグを
 画像ファイルに付与／削除できるようにする。

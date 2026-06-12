@@ -3,10 +3,10 @@
 //! ## 背景
 //!
 //! Tantivy は 1 Index につき IndexWriter を 1 本しか許さない。
-//! 旧設計は `Arc<Mutex<IndexWriter>>` を全 supervisor + tag worker で共有し、
+//! 旧設計は `Arc<Mutex<IndexWriter>>` を全 supervisor と interactive job で共有し、
 //! 各自 `lock()` していたが、indexer supervisor が 1 回 lock を握ったまま
-//! `session.apply` で 67 秒間ハードに使い続けるため、interactive な
-//! `tag_write_worker` が分単位で starve するバグが発生した
+//! `session.apply` で 67 秒間ハードに使い続けるため、ユーザー操作起点の
+//! interactive job が分単位で starve するバグが発生した
 //! ([panic.log] 2026-04-22 ユーザー再現 + commit 14037af 参照)。
 //!
 //! ## 採用パターン
@@ -16,12 +16,12 @@
 //! `mpsc::Receiver` で応答待ち、ディスパッチャーが `Condvar::wait` で起床して
 //! `Interactive` を先に、無ければ `Background` を pop して 1 件処理する。
 //!
-//! - **`Interactive`** = タグ書き込み (`tag_write_worker`) 等、ユーザー操作起点の小ジョブ。
+//! - **`Interactive`** = ユーザー操作起点の小ジョブ。
 //! - **`Background`** = indexer supervisor の batch ingest など、長時間ジョブの構成要素。
 //!
 //! 大規模 batch も「sub-batch (= 100 件 upsert + 1 commit) を `Background` で 1 ジョブずつ
 //! submit する」設計にすることで、各 sub-batch の境界で dispatcher が Interactive キューを
-//! check できる。タグ書き込みの worst-case 待ち時間 = 1 sub-batch 処理時間 (= 1〜2 秒程度)。
+//! check できる。interactive job の worst-case 待ち時間 = 1 sub-batch 処理時間 (= 1〜2 秒程度)。
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};

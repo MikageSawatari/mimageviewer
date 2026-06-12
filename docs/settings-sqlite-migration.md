@@ -28,6 +28,15 @@
 - `bootstrap_complete` marker で「init_schema 後 / save_full 前に crash」した中身ゼロの DB を Corrupted として bak に倒す
 - Susie pool は init/reload 世代カウンタで stale build が user choice を上書きしないようガード
 
+2026-06-12 追記:
+- タグカタログ再設計に合わせて `tags` テーブルへ `tag_key TEXT` と
+  `show_shortcut INTEGER NOT NULL DEFAULT 1` を追加。
+- 旧 `id/name/sort_index` 行は `normalize_tag_key(name)` で `tag_key` を補完し、
+  同一 `tag_key` は最小 `sort_index` の行へ統合する。既存タグは後方互換として
+  `show_shortcut=1` (= メニュー/ツールバーにピン留め表示)。
+- `TagDef` は `{ id, tag_key, name, show_shortcut }` になり、`FacetFilter.tags` は
+  表示文字列 `#タグ` ではなく `tag_key` を永続化する。
+
 将来の delete (本ロードマップ外):
 - **旧 `*.json` save 経路の物理削除**: spec §9 Phase 6 で「数バージョン後に」と明記。
   現状は `try_load_with_recovery` / `rotate_backups` / `write_atomic` / `quarantine_path` /

@@ -77,7 +77,7 @@ impl Drop for SearchHandle {
 pub struct IndexerManager {
     meta_db: Arc<FtsMetaDb>,
     fts: Arc<FtsIndex>,
-    /// **全 supervisor + tag worker で共有する** Tantivy IndexWriter のディスパッチャー。
+    /// **全 supervisor で共有する** Tantivy IndexWriter のディスパッチャー。
     /// Tantivy は 1 Index につき IndexWriter を 1 本しか許さないため、所有権を専用スレッドに
     /// 集約し、優先度付きキュー (Interactive > Background) でジョブを直列処理する
     /// (`fts_writer_dispatcher` 参照)。旧設計の `Arc<Mutex<IndexWriter>>` 直接共有は
@@ -115,8 +115,8 @@ pub struct StartupDiag {
 /// fts_meta が INDEX_VERSION bump / 旧スキーマを検出して `files` テーブルを drop した場合、
 /// Tantivy 側も一緒に wipe しないと旧 key 形式 (例: `!` separator) で書かれた orphan doc が
 /// 残り続ける (post-filter で弾かれるが容量を食う、かつ将来リカバリ経路が増えたら顕在化し得る)。
-/// このため fts_meta open → `rebuilt_on_open` チェック → 必要なら `fts_index` 削除 → fts open
-/// の順で実行する。
+/// このため fts_meta open → 旧 STORED tags を tags.db へ移行 → `rebuilt_on_open`
+/// チェック → 必要なら `fts_index` 削除 → fts open の順で実行する。
 ///
 /// 本番 `new()` とテスト用 `new_at()` の両方から呼ぶ (Codex P3 指摘: 旧コードでは
 /// `new_at` が wipe を再現していなかったため、version bump の挙動を統合テストで検証できず
@@ -126,6 +126,66 @@ pub struct StartupDiag {
 /// `IndexerManager::new` 内部で各 sub-step の前に呼ばれる。
 /// `None` を渡せば従来の挙動。`Some` の場合は文字列を Mutex に書き込む。
 pub type StartupProgressHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+fn run_legacy_tantivy_tag_import(
+    data_dir: &std::path::Path,
+    fts_dir: &std::path::Path,
+    log_tag: &str,
+    progress: Option<&StartupProgressHook>,
+) {
+    let mut tags_db = match crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")) {
+        Ok(db) => db,
+        Err(e) => {
+            crate::logger::log(format!(
+                "{log_tag}: tags.db open for legacy import failed: {e}"
+            ));
+            return;
+        }
+    };
+    if tags_db
+        .meta(crate::tags_db::LEGACY_TANTIVY_IMPORTED_META)
+        .as_deref()
+        == Some("1")
+    {
+        return;
+    }
+    if let Some(p) = progress {
+        p("旧タグをタグカタログへ移行しています…");
+    }
+    let t_import = std::time::Instant::now();
+    let legacy_docs = match crate::fts_index::collect_legacy_tag_docs_at(fts_dir) {
+        Ok(docs) => docs,
+        Err(e) => {
+            crate::logger::log(format!(
+                "{log_tag}: collect legacy Tantivy tags failed: {e} (continuing)"
+            ));
+            return;
+        }
+    };
+    let report = match tags_db.import_legacy_tantivy_tags(
+        legacy_docs
+            .into_iter()
+            .map(|doc| (doc.item_key, doc.tags_column)),
+    ) {
+        Ok(report) => report,
+        Err(e) => {
+            crate::logger::log(format!(
+                "{log_tag}: import legacy Tantivy tags failed: {e} (continuing)"
+            ));
+            return;
+        }
+    };
+    crate::perf::emit_ms("startup", "legacy_tantivy_tag_import", 0, t_import);
+    crate::logger::log(format!(
+        "{log_tag}: legacy Tantivy tag import: scanned_docs={}, imported_items={}, \
+         inserted_tags={}, skipped_decided_items={}, skipped_already_imported={}",
+        report.scanned_docs,
+        report.imported_items,
+        report.inserted_tags,
+        report.skipped_decided_items,
+        report.skipped_already_imported
+    ));
+}
 
 fn open_stores_with_rebuild_sync(
     data_dir: &std::path::Path,
@@ -145,6 +205,7 @@ fn open_stores_with_rebuild_sync(
     };
     crate::perf::emit_ms("startup", "fts_meta_open", 0, t_meta);
     let fts_dir = data_dir.join("fts_index");
+    run_legacy_tantivy_tag_import(data_dir, &fts_dir, log_tag, progress);
     if meta_db.rebuilt_on_open() {
         if let Some(p) = progress {
             p("古いインデックスを削除しています…");
@@ -503,19 +564,19 @@ impl IndexerManager {
     }
 
     /// `Arc<FtsMetaDb>` を clone して返す。
-    /// 検索 worker や tag worker が status 確認・管理メタ取得のために使う
+    /// 検索 worker が status 確認・管理メタ取得のために使う
     /// (INDEX_VERSION=5 以降、原文は Tantivy 側にあるので fts_meta は管理メタ専用)。
     pub fn clone_fts_meta(&self) -> Arc<FtsMetaDb> {
         Arc::clone(&self.meta_db)
     }
 
-    /// `Arc<FtsIndex>` を clone して返す (タグ書き込み worker 用)。
+    /// `Arc<FtsIndex>` を clone して返す。
     pub fn clone_fts_index(&self) -> Arc<FtsIndex> {
         Arc::clone(&self.fts)
     }
 
     /// 共有 IndexWriter をラップした `FtsWriterDispatcher` の Arc を clone して返す
-    /// (タグ書き込み worker 用)。Tantivy は 1 Index につき writer 1 本しか許さないので、
+    /// Tantivy は 1 Index につき writer 1 本しか許さないので、
     /// worker が独自に `fts.writer()` を呼ぶと LockBusy で失敗する。
     /// 必ずこの dispatcher 経由で `upsert` / `commit` を submit する (priority 指定可能)。
     pub fn clone_shared_writer(&self) -> Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher> {

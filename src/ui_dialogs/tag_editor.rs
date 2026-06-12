@@ -2,8 +2,7 @@
 //!
 //! ユーザがタグ一覧を編集するための UI。お気に入り編集 (`favorites_editor.rs`) と
 //! 同じ構造で、表示名編集 / 並べ替え / 削除 / 末尾への新規追加 をサポート。
-//! XMP 書き換えの注意書きを常時表示する (ダイアログ以外でユーザがタグを
-//! トグル操作しても警告が出ないため、登録段階で 1 回は目に入るようにしている)。
+//! よく使うタグをメニュー / ツールバーへピン留めするための管理 UI。
 
 use eframe::egui;
 
@@ -33,7 +32,7 @@ impl App {
         let mut remove: Option<usize> = None;
         let mut add_empty_row = false;
 
-        egui::Window::new("タグを編集")
+        egui::Window::new("タグの管理")
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -42,18 +41,8 @@ impl App {
                 ui.set_min_width(480.0);
 
                 ui.label(
-                    egui::RichText::new("タグを付与すると画像ファイルのメタデータを書き換えます。")
-                        .color(egui::Color32::from_rgb(200, 170, 60))
-                        .size(11.0),
-                );
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(4.0);
-
-                ui.label(
                     egui::RichText::new(
-                        "登録したタグはメニューとツールバーに表示され、\n\
-                         画像を選択してクリックすると `#タグ名` が付与されます。",
+                        "よく使うタグをピン留めすると、メニューとツールバーに表示されます。",
                     )
                     .size(11.0)
                     .weak(),
@@ -68,11 +57,12 @@ impl App {
                     .show(ui, |ui| {
                         egui::Grid::new("tag_edit_grid")
                             .striped(true)
-                            .num_columns(3)
+                            .num_columns(4)
                             .spacing([8.0, 4.0])
                             .show(ui, |ui| {
                                 ui.label(egui::RichText::new("タグ名").strong());
                                 ui.label(egui::RichText::new("プレビュー").strong());
+                                ui.label(egui::RichText::new("表示").strong());
                                 ui.label(egui::RichText::new("操作").strong());
                                 ui.end_row();
 
@@ -97,6 +87,11 @@ impl App {
                                         egui::RichText::new(preview)
                                             .monospace()
                                             .color(egui::Color32::from_rgb(100, 170, 100)),
+                                    );
+
+                                    ui.checkbox(
+                                        &mut self.tag_editor_draft[i].show_shortcut,
+                                        "ピン留め",
                                     );
 
                                     // 操作
@@ -159,9 +154,7 @@ impl App {
             // バリデーション:
             // - 空行は破棄
             // - 先頭 `#` は剥がす (ユーザが `#` を付けて入力した救済)
-            // - 空白/制御文字は `_` に正規化 — 索引側 `build_tags_column` と同じ規則なので
-            //   タグピッカーが挿入する `#タグ名` と Tantivy 内の表記が必ず一致する
-            // - 重複は先着優先 (正規化後の lowercase でキー判定)
+            // - 重複は先着優先 (tag_key でキー判定)
             let mut seen = std::collections::HashSet::new();
             let mut cleaned: Vec<TagDef> = Vec::new();
             for t in self.tag_editor_draft.drain(..) {
@@ -169,15 +162,23 @@ impl App {
                 while name.starts_with('#') {
                     name.remove(0);
                 }
-                let name = crate::ingest_text::canonicalize_tag_name(&name);
+                let name = crate::tags_db::normalize_tag_display_name(&name);
                 if name.is_empty() {
                     continue;
                 }
-                let key = name.to_lowercase();
-                if !seen.insert(key) {
+                if name.chars().count() > 64 {
                     continue;
                 }
-                cleaned.push(TagDef { id: t.id, name });
+                let tag_key = crate::tags_db::normalize_tag_key(&name);
+                if tag_key.is_empty() || !seen.insert(tag_key.clone()) {
+                    continue;
+                }
+                cleaned.push(TagDef {
+                    id: t.id,
+                    tag_key,
+                    name,
+                    show_shortcut: t.show_shortcut,
+                });
             }
             self.settings.tags = cleaned;
             self.settings.save();

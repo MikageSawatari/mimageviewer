@@ -19,7 +19,7 @@ mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の
 | --- | --- | --- | --- | --- |
 | **Ctrl+S** | コンテナ検索 | フォルダ / ZIP / PDF を名前で横断検索 | お気に入り配下 (再帰) | コンテナ索引 `search_index.db` (SQLite LIKE) |
 | **Ctrl+F** | 現在地フィルタ | 現グリッドの表示中アイテムを名前 / メタ情報で絞り込み | 現在グリッド (非再帰・索引なし) | worker 上の on-demand 判定 |
-| **Ctrl+G** | アイテム検索 | 画像 / PDF / 動画を名前 / タグ / EXIF / AI プロンプト等で横断検索 | お気に入り配下 (再帰) | アイテム索引 (Tantivy bigram) 候補絞り込み + STORED 原文 post-filter の streaming |
+| **Ctrl+G** | アイテム検索 | 画像 / PDF / 動画を名前 / EXIF / AI プロンプト等で横断検索 | お気に入り配下 (再帰) | アイテム索引 (Tantivy bigram) 候補絞り込み + STORED 原文 post-filter の streaming |
 
 - **動画はコンテナ索引 (Ctrl+S) の対象外** — 動画はアイテムなので Ctrl+G で扱う。
 - **ZIP はアイテム索引 (Ctrl+G) の対象外** — ZIP はコンテナなので Ctrl+S で扱う。
@@ -52,10 +52,13 @@ mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の
 
 ### 1.3 タグ機能との関係
 
-[tag-feature.md](tag-feature.md) 参照。タグは XMP `dc:subject` に `#プレフィックス付き`
-要素として書き込み、ingest 時に [fts_index](../src/fts_index.rs) の `tags` フィールドへ
-インデックスする。Ctrl+G の「検索対象=タグ」フィルタや `#原神` クエリはこの
-フィールドをヒットさせる。
+[tag-catalog-redesign-plan.md](tag-catalog-redesign-plan.md) 参照。現行の mIV タグ正本は
+`tags.db` で、Ctrl+G/Ctrl+F の全文検索ソースには混ぜない。`SourceKind::Tags` と
+Tantivy `tags` STORED フィールドは旧 XMP `dc:subject` からの移行用として残すが、
+`SourceKind::ALL` / `SearchTarget::includes(Tags)` / ingest / Ctrl+F fallback からは外す。
+
+「検索結果をタグで絞る」用途は、検索結果グリッドに対して facet タグフィルタを AND 合成する。
+facet のタグ値は表示 `#タグ` ではなく、`tags.db` と同じ `tag_key` (NFKC + lowercase、`#` なし) を保持する。
 
 ---
 
@@ -84,7 +87,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | [search_walker.rs](../src/search_walker.rs) | 起動時の再帰 walk + 3-way diff (FS / `fts_meta.db` の突き合わせ) |
 | [search_watcher.rs](../src/search_watcher.rs) | notify-rs `ReadDirectoryChangesW` ラッパ + 500ms debounce |
 | [ingest_worker.rs](../src/ingest_worker.rs) | メタ抽出 + Tantivy buffer + バッチ commit + fts_meta 状態遷移 |
-| [ingest_text.rs](../src/ingest_text.rs) | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / tags / sidecar) ビルダー |
+| [ingest_text.rs](../src/ingest_text.rs) | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / sidecar、旧 tags は移行専用) ビルダー |
 | [external_metadata.rs](../src/external_metadata.rs) | 外部メタデータサイドカー (画像と同名 .json/.txt) の検出・値抽出・差分署名・逆引き (§4.10) |
 | [name_index_supervisor.rs](../src/name_index_supervisor.rs) | Ctrl+S 用 **名前索引 supervisor** (初期バルク + notify-rs 追従) |
 | [name_bulk_indexer.rs](../src/name_bulk_indexer.rs) | Ctrl+S 用 初期バルクスキャンの本体 |
@@ -102,9 +105,10 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 
 | モジュール | 役割 |
 | --- | --- |
-| [tag_ops.rs](../src/tag_ops.rs) | `#タグ` 要素の Bag 操作ヘルパ (add / remove / clear-hash-prefixed) |
-| [tag_write_worker.rs](../src/tag_write_worker.rs) | UI → XMP 書き込み worker。書込み成功後に共有 `IndexWriter` 経由で即時 Tantivy 反映 |
-| [xmp_writer.rs](../src/xmp_writer.rs) | 既存メタを保持したままの dc:subject atomic 書換 (JPEG / PNG / WebP) |
+| [tags_db.rs](../src/tags_db.rs) | mIV タグ正本。`item_tags` / `tag_item_state` / `tag_meta` と `tag_key` 正規化 helper |
+| [tag_ops.rs](../src/tag_ops.rs) | UI からのタグ操作ファサード。all-or-nothing 判定後に tags.db worker へ投入 |
+| [tag_write_worker.rs](../src/tag_write_worker.rs) | UI → tags.db 更新 worker。通常タグ操作では XMP/Tantivy を更新しない |
+| [xmp_writer.rs](../src/xmp_writer.rs) | 既存 XMP 書換 helper。タグでは旧 `dc:subject` 移行・明示除去用の補助に縮退 |
 
 ---
 
@@ -116,8 +120,9 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | --- | --- | --- | --- |
 | `settings.json` | `FavoriteEntry { id, name, path, auto_index_{structure,metadata,thumbs} }` + `tags: Vec<TagDef>` | [settings.rs](../src/settings.rs) | UUID が欠けている行は起動時に発行し書き戻し |
 | `search_index.db` | Ctrl+S 用フォルダ/ZIP/PDF/動画名 index (SQLite LIKE で引く) | `search_index_db.rs` | `indexed_by_auto` 列で手動/自動エントリを区別 |
-| `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession / tag_write_worker | schema 変更は `schema_is_stale` (STORED 必須含む) で検出し全消去 + 再構築 |
+| `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession | schema 変更は `schema_is_stale` (STORED 必須含む) で検出し全消去 + 再構築。`tags` フィールドは旧タグ移行専用で通常検索対象外 |
 | `fts_meta.db` | `files(path PK, favorite_id, kind, mtime, size, indexed_at, index_version, index_generation, status)` — INDEX_VERSION=5 で `*_norm` 列群を撤去し管理メタ専用に縮小 | `fts_meta.rs` | `INDEX_VERSION` を bump すると `needs_rebuild` が `*_norm` 残存も検出して全再構築を促す |
+| `tags.db` | `item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本 | `tags_db.rs` / `tag_write_worker.rs` | `tag_key` は NFKC + lowercase + `#` なし。旧 XMP/Tantivy タグの移行フラグもここに置く |
 
 **パスキー正規化**: Windows の大文字小文字非区別と区切り文字混在に備え、
 fts_meta.db / Tantivy / 起動時 diff・Ctrl+F on-demand 判定の全経路で `normalize_path`
@@ -139,7 +144,9 @@ separator は `search_norm::ZIP_ENTRY_SEP` = U+001F Unit Separator) を通す。
 ```
 App 起動
   └─ IndexerManager::new
-       ├─ FtsMetaDb + FtsIndex を open (schema 不一致なら全再構築)
+       ├─ FtsMetaDb を open
+       ├─ 旧 Tantivy STORED tags を tags.db へ一度だけ移行 (fts_index wipe より前)
+       ├─ FtsIndex を open (schema 不一致なら全再構築)
        ├─ 起動時 reconciliation (§4.3) を **同期** で実行
        └─ auto_index_metadata=true のお気に入りごとに
             IndexerSupervisor::spawn  (1 お気に入り 1 本、以降ずっと常駐)
@@ -154,10 +161,9 @@ IndexerSupervisor (スレッド 1 本):
   4. 以降 watcher イベント (DebouncedChange) を受け取り小刻みに 3 と同じ処理
   5. App drop で cancel + FsWatcher drop + thread join
 
-IngestSession の writer は IndexerManager が保有する
-Arc<Mutex<IndexWriter>> を共有する (Tantivy の writer は Index あたり 1 本制約)。
-tag_write_worker も同じ writer を共有するため、タグ書き込みと通常 ingest の
-commit は干渉しない。
+IngestSession の writer は IndexerManager が保有する dispatcher 経由で共有する
+(Tantivy の writer は Index あたり 1 本制約)。通常タグ操作は tags.db のみを更新し、
+Tantivy writer には触れない。
 ```
 
 ### 4.2 書き込みプロトコル (Tantivy First, INDEX_VERSION=6)
@@ -329,33 +335,22 @@ SMB / NAS では `ReadDirectoryChangesW` が発火しないケースがあるの
 
 - 動画ファイル本体: ファイル名 + FFmpeg が読めるコンテナメタデータ (title /
   artist / URL / description / comment / chapter title 等) を `video_meta_text` へ。
-- 動画タグ: 本体を直接書き換えず、`<video.ext>.xmp` サイドカーの `dc:subject`
-  を `tags` フィールドへ。Ctrl+F / Ctrl+G の「タグ」対象で画像タグと同じように
-  検索できる。
+- 動画タグ: 現行の mIV タグは `tags.db` 正本。旧 `<video.ext>.xmp` の
+  `dc:subject` は移行元としてのみ扱い、Ctrl+F / Ctrl+G の検索ソースにはしない。
 - フレーム内容 / 音声文字起こし / チャプター以外の本文抽出は対象外。動画再生や
   サムネイル抽出とは独立した低頻度のメタ読み取りだけを行う。
 
-### 4.9 タグ書き込みと即時反映 (INDEX_VERSION=5)
+### 4.9 タグ書き込みと旧タグ移行
 
-[tag_write_worker.rs](../src/tag_write_worker.rs) は UI からの Toggle / Clear 要求を
-1 ファイルずつ serial に処理し、以下のフローで進める:
+[tag_write_worker.rs](../src/tag_write_worker.rs) は UI からの Toggle / Add / Remove /
+Clear 要求を serial に処理し、`tags.db` だけを更新する。通常タグ操作では XMP /
+Tantivy / Ctrl+S 名前索引へ投影しないため、全文検索 commit 待ちや stale snapshot
+競合は発生しない。
 
-1. XMP atomic rewrite (`xmp_writer::apply_tag_op`)
-2. `fts_meta.get(path)` で管理メタ (kind / mtime / size) を取得 + `status == Ok`
-   なら次へ (Pending 中は ingest に任せて skip — race 回避)
-3. `fts.reload_reader()` で最新 commit を含む snapshot を取り、`find_doc_by_path` +
-   `doc_per_source_text` で既存 STORED 値を読み取る
-4. `tags` フィールドだけ差し替えて `IndexDoc` を再構築し、共有 `IndexWriter` で
-   `WriterPriority::Interactive` upsert
-5. 32 件 or 500ms でバッチ commit (reload 同期付き)
-
-UI は commit 完了シグナルを受けたタイミングで toast を出す (commit より前に
-toast を出すと直後の Ctrl+G に新タグが出ない race がある)。
-
-INDEX_VERSION=5 で原文が Tantivy 側に集約された影響で、`tag_write_worker` は
-他ソース原文 (name / exif / xmp_tweet / png_prompt / pdf_meta / video_meta) を **保持したまま**
-tags だけ差し替える必要がある。ここで stale snapshot を読むと ingest が直前に
-commit した最新原文を旧値で潰してしまうため、上記 #2 / #3 の race ガードが必須。
+旧 `dc:subject` 由来の Tantivy STORED `tags` は、起動時に一度だけ
+`tags.db` へコピーする。挿入点は `IndexerManager::new` の `FtsMetaDb` open 後、
+`fts_index` wipe / `FtsIndex::open_at` より前。移行済みフラグは
+`tags.db.tag_meta.legacy_tantivy_imported` に置く。
 
 ### 4.10 外部メタデータサイドカー (画像のみ、INDEX_VERSION=8)
 
@@ -619,7 +614,7 @@ Mutex を横取りし、先に待ち始めたスレッドが秒単位で待た�
 `PdfWorkerPool` / `run_dispatcher`、[io_semaphore.rs](../src/io_semaphore.rs)。
 詳細は [async-architecture.md §5.5](async-architecture.md)。
 
-### 6.9 なぜタグは `dc:subject` + `#プレフィックス` か
+### 6.9 旧タグが `dc:subject` + `#プレフィックス` だった理由
 
 | 選択肢 | 不採用の理由 |
 | --- | --- |
@@ -628,7 +623,8 @@ Mutex を横取りし、先に待ち始めたスレッドが秒単位で待た�
 | `dc:subject` に素の文字列 | 他ソフト由来のタグと mIV 独自タグが区別できず、一括削除で他ソフトのデータを壊す |
 | **`dc:subject` に `#xxx` (採用)** | 業界標準プロパティで他ソフトからも見える。`#` で mIV 管理タグを識別し他ソフト由来を保護 |
 
-副次効果: Ctrl+G で `#原神` とそのまま打てば検索できる (構文拡張不要)。
+現行仕様では通常タグは `tags.db` 正本で、`dc:subject` への書き込みや Ctrl+G
+検索投影は行わない。この節は v1.0 互換タグを移行元として読むための背景メモ。
 
 詳細は [tag-feature.md](tag-feature.md) 参照。
 

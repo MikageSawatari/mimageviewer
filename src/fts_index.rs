@@ -8,9 +8,10 @@
 //!   status=Ok|Failed / index_generation) のみを持つ
 //! - Ctrl+G 候補絞り込み + 検索 worker の post-filter (`doc_text_for_target` で
 //!   STORED 原文を引き、`search_query::matches_with_mode` で AND/OR/phrase/NOT 判定)
-//! - **書き込み順序**: ingest_worker / tag_write_worker は `IndexDoc` を Tantivy に
-//!   投入 → batch commit + reader reload に成功したフレームでのみ `fts_meta` を更新
-//!   する (Tantivy First)。詳細は [search-architecture.md §4.2](../docs/search-architecture.md)
+//! - **書き込み順序**: ingest_worker は `IndexDoc` を Tantivy に投入 → batch commit +
+//!   reader reload に成功したフレームでのみ `fts_meta` を更新する (Tantivy First)。
+//!   通常タグ操作は tags.db のみを書き、Tantivy へ投影しない。
+//!   詳細は [search-architecture.md §4.2](../docs/search-architecture.md)
 //!
 //! ## スキーマ (INDEX_VERSION=9)
 //!
@@ -28,13 +29,13 @@
 //! png_prompt_text  TEXT   bigram | STORED     PNG tEXt/iTXt / EXIF UserComment AI プロンプト
 //! pdf_meta_text    TEXT   bigram | STORED     PDFium document info
 //! video_meta_text  TEXT   bigram | STORED     FFmpeg container metadata (video only)
-//! tags             TEXT   bigram | STORED     XMP dc:subject (#プレフィックス付き)
+//! tags             TEXT   STORED              旧 XMP dc:subject 移行用 (通常検索対象外)
 //! sidecar_text     TEXT   bigram | STORED     外部メタデータサイドカー (JSON/TXT) の値 (image only)
 //! ```
 //!
 //! per-source に分けているのは、「検索対象フィルタ」 (`SearchTarget::Only`) で
 //! "EXIF のみ" / "XMP ツイートのみ" のような絞り込みを post-filter 頼みでなく
-//! ネイティブに行うため。タグも同じく `Only(Tags)` で絞り込み可。
+//! ネイティブに行うため。旧 tags フィールドは残すが通常検索からは外す。
 //!
 //! ## 検索の組み立て方
 //!
@@ -68,7 +69,7 @@ pub const PAGE_SIZE: usize = 500;
 
 /// 検索対象となるメタソース種別 (§19.2 + tag 機能統合)。
 /// `name` は独立フィールドだが、検索 UX 上「ファイル名で検索」も同じ target として扱えるよう enum に含める。
-/// `Tags` は XMP dc:subject 由来のタグ (`#原神` 等) 専用。
+/// `Tags` は旧 XMP dc:subject 由来の移行専用ソース。通常検索には含めない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKind {
     Filename,
@@ -91,7 +92,6 @@ impl SourceKind {
         SourceKind::PngPrompt,
         SourceKind::PdfMeta,
         SourceKind::VideoMeta,
-        SourceKind::Tags,
         SourceKind::Sidecar,
     ];
 }
@@ -110,7 +110,10 @@ impl Default for SearchTarget {
 }
 
 impl SearchTarget {
-    /// 対象ソースのスライス。`All` のときは `SourceKind::ALL` を返す。
+    /// 対象ソースのスライス。`All` のときは通常検索対象だけを返す。
+    ///
+    /// `Only([Tags])` のような旧状態は呼び出し側で `active_sources` / `includes`
+    /// に通して無効化する。
     pub fn sources(&self) -> &[SourceKind] {
         match self {
             SearchTarget::All => SourceKind::ALL,
@@ -118,8 +121,19 @@ impl SearchTarget {
         }
     }
 
+    pub fn active_sources(&self) -> Vec<SourceKind> {
+        self.sources()
+            .iter()
+            .copied()
+            .filter(|source| *source != SourceKind::Tags)
+            .collect()
+    }
+
     /// `source` がこの target に含まれるか。
     pub fn includes(&self, source: SourceKind) -> bool {
+        if source == SourceKind::Tags {
+            return false;
+        }
         match self {
             SearchTarget::All => true,
             SearchTarget::Only(v) => v.contains(&source),
@@ -128,7 +142,10 @@ impl SearchTarget {
 
     /// 有効な対象が 1 件もない (空 Only) — クエリを組んでも絶対にヒットしない。
     pub fn matches_nothing(&self) -> bool {
-        matches!(self, SearchTarget::Only(v) if v.is_empty())
+        match self {
+            SearchTarget::All => false,
+            SearchTarget::Only(v) => v.iter().all(|source| *source == SourceKind::Tags),
+        }
     }
 }
 
@@ -212,6 +229,12 @@ pub struct IndexDoc {
     pub file_size: i64,
     /// ソース別 `normalize_for_match` 適用済みテキスト。
     pub norms: crate::ingest_text::PerSourceText,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyTagDoc {
+    pub item_key: String,
+    pub tags_column: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,7 +445,7 @@ pub fn delete_doc(writer: &IndexWriter, fields: &Fields, path: &str) {
 /// ## フィールド間の OR (§19 分割対応)
 ///
 /// `SearchTarget::All` では `name / exif_text / xmp_tweet_text / png_prompt_text /
-/// pdf_meta_text / video_meta_text / tags` に対して OR を取る
+/// pdf_meta_text / video_meta_text / sidecar_text` に対して OR を取る
 /// (ソースを跨いでトークンが見つかれば OK)。
 /// `SearchTarget::Only([...])` では指定フィールドのみで OR。
 /// トークン 1 つあたり: (AND of bigrams) を各対象フィールドで作り、フィールド間を OR でまとめる。
@@ -456,8 +479,10 @@ pub fn build_bigram_and_query(
         return None;
     }
 
-    let target_sources = filters.target.sources();
-    debug_assert!(!target_sources.is_empty());
+    let target_sources = filters.target.active_sources();
+    if target_sources.is_empty() {
+        return None;
+    }
 
     // OR モード (docs §20): include トークンを Should で束ねて別 BooleanQuery を作り、
     // その全体を Must として token_queries に積む。AND モードは従来どおり各 token を
@@ -484,7 +509,7 @@ pub fn build_bigram_and_query(
         // 各対象フィールドに対して「AND of bigrams」を作り、フィールド間を OR でまとめる
         let mut field_disjuncts: Vec<(Occur, Box<dyn Query>)> =
             Vec::with_capacity(target_sources.len());
-        for &source in target_sources {
+        for &source in &target_sources {
             let field = fields.text_field_for(source);
             let mut bigram_ands: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(bigrams.len());
             for bg in &bigrams {
@@ -621,6 +646,63 @@ pub fn doc_per_source_text(
     })
 }
 
+/// 旧 Tantivy STORED `tags` フィールドから、mIV 旧タグ移行用の行を読む。
+///
+/// 通常検索には使わない。`SourceKind::Tags` を閉じたまま、起動時の一括移行だけが
+/// `#タグ` 列を tags.db へコピーするための read-only helper。
+pub fn collect_legacy_tag_docs_at(dir: &Path) -> tantivy::Result<Vec<LegacyTagDoc>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mmap_dir = tantivy::directory::MmapDirectory::open(dir)?;
+    let exists = Index::exists(&mmap_dir)?;
+    drop(mmap_dir);
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let index = Index::open_in_dir(dir)?;
+    collect_legacy_tag_docs_from_index(&index)
+}
+
+fn collect_legacy_tag_docs_from_index(index: &Index) -> tantivy::Result<Vec<LegacyTagDoc>> {
+    let schema = index.schema();
+    let Ok(path_field) = schema.get_field("path") else {
+        return Ok(Vec::new());
+    };
+    let Ok(tags_field) = schema.get_field("tags") else {
+        return Ok(Vec::new());
+    };
+    if !stored_text_field(&schema, path_field) || !stored_text_field(&schema, tags_field) {
+        return Ok(Vec::new());
+    }
+
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    let mut out = Vec::new();
+    for segment_reader in searcher.segment_readers() {
+        let store = segment_reader.get_store_reader(64)?;
+        for doc in store.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
+            let doc = doc?;
+            let read = |f: Field| -> String {
+                doc.get_first(f)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            };
+            let item_key = read(path_field);
+            let tags_column = read(tags_field);
+            if item_key.is_empty() || tags_column.trim().is_empty() {
+                continue;
+            }
+            out.push(LegacyTagDoc {
+                item_key,
+                tags_column,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// STORED フィールドから target に対応するテキストをスペース連結で取り出す
 /// (post-filter 用)。INDEX_VERSION=5 以降は fts_meta.db ではなくここで原文を取る。
 ///
@@ -635,7 +717,7 @@ pub fn doc_text_for_target(
 ) -> tantivy::Result<String> {
     let doc: TantivyDocument = searcher.doc(addr)?;
     let mut out = String::new();
-    for &src in target.sources() {
+    for src in target.active_sources() {
         let f = fields.text_field_for(src);
         if let Some(v) = doc.get_first(f) {
             if let Some(s) = v.as_str() {
@@ -720,6 +802,11 @@ fn schema_is_stale(schema: &Schema) -> bool {
     false
 }
 
+fn stored_text_field(schema: &Schema, field: Field) -> bool {
+    let entry = schema.get_field_entry(field);
+    matches!(entry.field_type(), FieldType::Str(opts) if opts.is_stored())
+}
+
 /// ディレクトリ配下のファイルを全削除してから、ディレクトリ自体も再作成する。
 /// Tantivy が内部的に持つ .lock / meta.json / segments を一掃するため。
 fn wipe_index_dir(dir: &Path) -> tantivy::Result<()> {
@@ -768,8 +855,7 @@ fn build_schema() -> Schema {
     // 外部メタデータサイドカー (JSON/TXT) の値テキスト (INDEX_VERSION=8)。bigram + STORED。
     // mIV タグとは別系統の読み取り専用フリーテキスト (docs/sidecar-metadata-ingest.md)。
     b.add_text_field("sidecar_text", text_opts.clone());
-    // タグフィールドも bigram tokenize — `原神` キーワード検索で `#原神` タグにヒット、
-    // `#原神` 入力でもヒットする (A-1 設計)。target=Tags ドロップダウンで絞り込み可。
+    // 旧タグ移行用に STORED 原文を残す。通常検索対象には含めない。
     b.add_text_field("tags", text_opts);
     b.build()
 }
@@ -888,6 +974,36 @@ mod tests {
     }
 
     #[test]
+    fn collect_legacy_tag_docs_reads_stored_tags_only() {
+        let (dir, idx) = new_index();
+        let fav = Uuid::new_v4();
+        let mut writer = idx.writer().unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc_with_tags("c:/a.jpg", fav, "#原神 external #風景"),
+        )
+        .unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc_with_tags("c:/b.jpg", fav, ""),
+        )
+        .unwrap();
+        writer.commit().unwrap();
+        idx.reload_reader().unwrap();
+
+        let docs = collect_legacy_tag_docs_at(dir.path()).unwrap();
+        assert_eq!(
+            docs,
+            vec![LegacyTagDoc {
+                item_key: "c:/a.jpg".to_string(),
+                tags_column: "#原神 external #風景".to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn build_schema_exposes_expected_fields() {
         let s = build_schema();
         assert!(s.get_field("path").is_ok());
@@ -911,7 +1027,7 @@ mod tests {
     }
 
     /// 外部メタデータサイドカー: `sidecar_text` のみに語が入った doc が、
-    /// `Target::All` と `Only(Sidecar)` でヒットし、`Only(Tags)` ではヒットしないこと。
+    /// `Target::All` と `Only(Sidecar)` でヒットし、旧 `Only(Tags)` ではクエリを組まないこと。
     /// (mIV タグ系統 `Tags` とサイドカー `Sidecar` の分離検証)
     #[test]
     fn target_sidecar_is_isolated_from_tags() {
@@ -953,7 +1069,7 @@ mod tests {
                 .len(),
             1
         );
-        // Only(Tags) ではヒットしない (別系統)
+        // Only(Tags) は旧 UI / 旧状態のため通常検索では無効。
         let q_tags = build_bigram_and_query(
             idx.fields(),
             &["nonoyama"],
@@ -961,14 +1077,8 @@ mod tests {
                 target: SearchTarget::Only(vec![SourceKind::Tags]),
                 ..Default::default()
             },
-        )
-        .unwrap();
-        assert_eq!(
-            search_page(&searcher, idx.fields(), &q_tags, 0, 10)
-                .unwrap()
-                .len(),
-            0
         );
+        assert!(q_tags.is_none());
     }
 
     #[test]
@@ -1640,10 +1750,9 @@ mod tests {
         assert!(paths.contains("c:/d.mp4"));
     }
 
-    /// target=Only([Tags]) で tags フィールドだけを対象に検索できることを確認する。
-    /// name フィールドに同じトークンがあっても引っかからないこと。
+    /// target=Only([Tags]) は旧状態として受けても通常検索には参加しない。
     #[test]
-    fn target_only_tags_matches_only_tags_field() {
+    fn target_only_tags_is_disabled() {
         let (_tmp, idx) = new_index();
         let fav = Uuid::new_v4();
         let mut writer = idx.writer().unwrap();
@@ -1653,7 +1762,7 @@ mod tests {
             &sample_doc_with_tags("c:/a.jpg", fav, "#原神 #風景"),
         )
         .unwrap();
-        // name フィールドに "原神" を入れた doc は target=Tags では引っかからない
+        // name フィールドに "原神" を入れた doc も旧 Tags target では検索しない
         upsert_doc(
             &writer,
             idx.fields(),
@@ -1663,7 +1772,6 @@ mod tests {
         writer.commit().unwrap();
         idx.reload_reader().unwrap();
 
-        let searcher = idx.searcher();
         let q = build_bigram_and_query(
             idx.fields(),
             &["原神"],
@@ -1671,12 +1779,8 @@ mod tests {
                 target: SearchTarget::Only(vec![SourceKind::Tags]),
                 ..Default::default()
             },
-        )
-        .unwrap();
-        let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
-        let paths: Vec<_> = hits.iter().map(|(p, _, _)| p.as_str()).collect();
-        assert_eq!(hits.len(), 1, "Tags target は tags フィールドのみ対象");
-        assert_eq!(paths[0], "c:/a.jpg");
+        );
+        assert!(q.is_none(), "Tags target は通常検索対象外");
     }
 
     // ---- OR モード (docs §20) ----

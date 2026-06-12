@@ -1078,9 +1078,11 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS favorites_sort ON favorites(sort_index);
 
          CREATE TABLE IF NOT EXISTS tags (
-            id          BLOB PRIMARY KEY,
-            name        TEXT NOT NULL,
-            sort_index  INTEGER NOT NULL
+            id             BLOB PRIMARY KEY,
+            name           TEXT NOT NULL,
+            tag_key        TEXT,
+            show_shortcut  INTEGER NOT NULL DEFAULT 1,
+            sort_index     INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS tags_sort ON tags(sort_index);
 
@@ -1127,6 +1129,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS custom_apps_sort
             ON custom_open_with_apps(sort_index);",
     )?;
+    migrate_tags_table(conn)?;
 
     // schema_meta: schema_version / app_version を冪等に upsert する。
     // migrated_from_json_at は Phase 2 (JSON migration) でセットされる。
@@ -1142,6 +1145,101 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         params![app_version],
     )?;
     Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(1)?;
+        Ok(name)
+    })?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_tags_table(conn: &Connection) -> rusqlite::Result<()> {
+    if !table_has_column(conn, "tags", "tag_key")? {
+        conn.execute("ALTER TABLE tags ADD COLUMN tag_key TEXT", [])?;
+    }
+    if !table_has_column(conn, "tags", "show_shortcut")? {
+        conn.execute(
+            "ALTER TABLE tags ADD COLUMN show_shortcut INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    normalize_tags_table_rows(conn)?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS tags_tag_key ON tags(tag_key)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn normalize_tags_table_rows(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, tag_key, show_shortcut, sort_index
+         FROM tags
+         ORDER BY sort_index ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let id: Vec<u8> = row.get(0)?;
+        let name: String = row.get(1)?;
+        let tag_key: Option<String> = row.get(2)?;
+        let show_shortcut: i64 = row.get(3)?;
+        let sort_index: i64 = row.get(4)?;
+        Ok((
+            id,
+            name,
+            tag_key.unwrap_or_default(),
+            show_shortcut != 0,
+            sort_index,
+        ))
+    })?;
+
+    let mut merged: Vec<(Vec<u8>, String, String, bool, i64)> = Vec::new();
+    let mut key_to_idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for row in rows {
+        let (id, name, tag_key, show_shortcut, sort_index) = row?;
+        let name = crate::tags_db::normalize_tag_display_name(&name);
+        let key = if tag_key.trim().is_empty() {
+            crate::tags_db::normalize_tag_key(&name)
+        } else {
+            crate::tags_db::normalize_tag_key(&tag_key)
+        };
+        if key.is_empty() || name.chars().count() > 64 {
+            continue;
+        }
+        let display = if name.is_empty() { key.clone() } else { name };
+        if let Some(&idx) = key_to_idx.get(&key) {
+            merged[idx].3 |= show_shortcut;
+        } else {
+            key_to_idx.insert(key.clone(), merged.len());
+            merged.push((id, display, key, show_shortcut, sort_index));
+        }
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM tags", [])?;
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO tags (id, name, tag_key, show_shortcut, sort_index)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (idx, (id, name, tag_key, show_shortcut, _old_sort)) in merged.iter().enumerate() {
+            insert.execute(params![
+                id.as_slice(),
+                name,
+                tag_key,
+                *show_shortcut as i64,
+                idx as i64
+            ])?;
+        }
+    }
+    tx.commit()
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,23 +1372,49 @@ fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbErr
 
 fn write_tags(tx: &rusqlite::Transaction<'_>, tags: &[TagDef]) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM tags", [])?;
-    let mut stmt = tx.prepare("INSERT INTO tags (id, name, sort_index) VALUES (?1, ?2, ?3)")?;
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO tags (id, name, tag_key, show_shortcut, sort_index)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
     for (idx, tag) in tags.iter().enumerate() {
-        stmt.execute(params![tag.id.as_bytes().as_slice(), tag.name, idx as i64,])?;
+        let name = crate::tags_db::normalize_tag_display_name(&tag.name);
+        let tag_key = if tag.tag_key.trim().is_empty() {
+            crate::tags_db::normalize_tag_key(&name)
+        } else {
+            crate::tags_db::normalize_tag_key(&tag.tag_key)
+        };
+        if name.is_empty() || tag_key.is_empty() {
+            continue;
+        }
+        stmt.execute(params![
+            tag.id.as_bytes().as_slice(),
+            name,
+            tag_key,
+            tag.show_shortcut as i64,
+            idx as i64,
+        ])?;
     }
     Ok(())
 }
 
 fn read_tags(conn: &Connection) -> Result<Vec<TagDef>, SettingsDbError> {
-    let mut stmt = conn.prepare("SELECT id, name FROM tags ORDER BY sort_index ASC")?;
+    let mut stmt =
+        conn.prepare("SELECT id, name, tag_key, show_shortcut FROM tags ORDER BY sort_index ASC")?;
     let rows = stmt.query_map([], |row| {
         let id_bytes: Vec<u8> = row.get(0)?;
         let name: String = row.get(1)?;
-        Ok((id_bytes, name))
+        let tag_key: Option<String> = row.get(2)?;
+        let show_shortcut: i64 = row.get(3)?;
+        Ok((
+            id_bytes,
+            name,
+            tag_key.unwrap_or_default(),
+            show_shortcut != 0,
+        ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id_bytes, name) = row?;
+        let (id_bytes, name, tag_key, show_shortcut) = row?;
         // Codex P2 v8: 同上。silently new_v4 すると tag id が安定でなくなる。
         let id = Uuid::from_slice(&id_bytes).map_err(|e| {
             SettingsDbError::Corrupted(format!(
@@ -1298,7 +1422,21 @@ fn read_tags(conn: &Connection) -> Result<Vec<TagDef>, SettingsDbError> {
                 id_bytes.len()
             ))
         })?;
-        out.push(TagDef { id, name });
+        let name = crate::tags_db::normalize_tag_display_name(&name);
+        let tag_key = if tag_key.trim().is_empty() {
+            crate::tags_db::normalize_tag_key(&name)
+        } else {
+            crate::tags_db::normalize_tag_key(&tag_key)
+        };
+        if name.is_empty() || tag_key.is_empty() {
+            continue;
+        }
+        out.push(TagDef {
+            id,
+            tag_key,
+            name,
+            show_shortcut,
+        });
     }
     Ok(out)
 }
@@ -2740,6 +2878,43 @@ mod tests {
         db.save_full(&original).unwrap();
         let loaded = db.load_into_settings().unwrap();
         assert_settings_eq(&original, &loaded);
+    }
+
+    #[test]
+    fn migrates_legacy_tags_table_to_tag_key_and_shortcut_columns() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tags (
+                id          BLOB PRIMARY KEY,
+                name        TEXT NOT NULL,
+                sort_index  INTEGER NOT NULL
+             );
+             CREATE INDEX tags_sort ON tags(sort_index);",
+        )
+        .unwrap();
+        let keep_id = Uuid::new_v4();
+        let dup_id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO tags (id, name, sort_index) VALUES (?1, ?2, ?3)",
+            params![keep_id.as_bytes().as_slice(), "#ＦＡＴＥ", 0_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tags (id, name, sort_index) VALUES (?1, ?2, ?3)",
+            params![dup_id.as_bytes().as_slice(), "fate", 1_i64],
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        assert!(table_has_column(&conn, "tags", "tag_key").unwrap());
+        assert!(table_has_column(&conn, "tags", "show_shortcut").unwrap());
+
+        let tags = read_tags(&conn).unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].id, keep_id, "first sort_index row should win");
+        assert_eq!(tags[0].name, "FATE");
+        assert_eq!(tags[0].tag_key, "fate");
+        assert!(tags[0].show_shortcut);
     }
 
     #[test]

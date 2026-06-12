@@ -213,13 +213,19 @@ impl App {
         let sidecar_info = self.get_current_sidecar();
 
         // タグパネル用の情報を先に集める (child_ui の &mut ui closure 前に借用を解消するため)
-        let taggable_path = self.current_taggable_image_path();
+        let taggable_path = self.current_tag_target_path();
         let current_tags: Vec<String> = if taggable_path.is_some() {
             self.get_current_tags_cached()
         } else {
             Vec::new()
         };
-        let defined_tags = self.settings.tags.clone();
+        let defined_tags: Vec<_> = self
+            .settings
+            .tags
+            .iter()
+            .filter(|tag| tag.show_shortcut)
+            .cloned()
+            .collect();
 
         // タグボタンクリックを closure 内で検出し、後段で request_tag_toggle を走らせる
         let mut clicked_tag: Option<String> = None;
@@ -360,40 +366,40 @@ impl App {
         self.sidecar_display_cache.get(&key).cloned().flatten()
     }
 
-    /// 現在のフルスクリーン画像のタグ一覧 (XMP dc:subject) を取得する。
-    /// キャッシュにあればそれを返し、なければ同期的に読み込んでキャッシュする。
-    /// 対応形式外 (ZIP 内画像 / PDF ページ / HEIC 等) は空 Vec を返す。
+    /// 現在のフルスクリーン項目に対応する mIV タグ一覧を取得する。
+    /// ZipImage / PdfPage はコンテナ本体のタグへフォールバックする。
     pub(crate) fn get_current_tags_cached(&mut self) -> Vec<String> {
-        let Some(idx) = self.fullscreen_idx else {
+        let Some(path) = self.current_tag_target_path() else {
             return Vec::new();
         };
-        let Some(key) = self.metadata_cache_key(idx) else {
-            return Vec::new();
-        };
+        let key = crate::tags_db::item_key_for_path(&path);
         if let Some(cached) = self.tags_cache.get(&key) {
             return cached.clone();
         }
-        // タグ対象外 (ZIP/PDF/フォルダ等) は空 Vec をキャッシュして終わり
-        let Some(path) = self.current_taggable_image_path() else {
-            self.tags_cache.insert(key, Vec::new());
-            return Vec::new();
-        };
-        let tags = crate::xmp_reader::read_dc_subject(&path);
+        let tags = self
+            .tags_db
+            .as_ref()
+            .map(|db| db.display_tags_for_item(&key))
+            .unwrap_or_default();
         self.tags_cache.insert(key, tags.clone());
         tags
     }
 
-    /// 現在のフルスクリーン画像/動画がタグ付与対象なら Path を返す。
-    /// ZIP 内・PDF ページ・フォルダなどは None。
-    /// 動画は同名 `.xmp` サイドカー経由で `dc:subject` を読み書きする。
-    fn current_taggable_image_path(&self) -> Option<std::path::PathBuf> {
+    /// 現在のフルスクリーン項目のタグ対象パスを返す。
+    fn current_tag_target_path(&self) -> Option<std::path::PathBuf> {
         use crate::grid_item::GridItem;
         let idx = self.fullscreen_idx?;
-        let p = match self.items.get(idx)? {
-            GridItem::Image(p) | GridItem::Video(p) => p,
-            _ => return None,
-        };
-        crate::xmp_writer::is_taggable_format(p).then(|| p.clone())
+        match self.items.get(idx)? {
+            GridItem::Folder(p)
+            | GridItem::Image(p)
+            | GridItem::Video(p)
+            | GridItem::ZipFile(p)
+            | GridItem::PdfFile(p)
+            | GridItem::ConvertibleArchive { path: p, .. } => Some(p.clone()),
+            GridItem::ZipImage { zip_path, .. } => Some(zip_path.clone()),
+            GridItem::PdfPage { pdf_path, .. } => Some(pdf_path.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -431,15 +437,8 @@ fn draw_tag_panel(
                 .strong(),
         );
         if !is_taggable {
-            ui.label(
-                egui::RichText::new("(対応形式外)")
-                    .size(10.0)
-                    .color(DIM_COLOR),
-            )
-            .on_hover_text(
-                "このファイルはタグ書き込みに対応していません。\n\
-                 JPEG / PNG / WebP のみ対応しています。",
-            );
+            ui.label(egui::RichText::new("(対象外)").size(10.0).color(DIM_COLOR))
+                .on_hover_text("この項目にはタグを付けられません。");
         }
     });
     ui.add_space(4.0);
@@ -449,7 +448,9 @@ fn draw_tag_panel(
     ui.horizontal_wrapped(|ui| {
         for def in defined_tags {
             let with_hash = format!("#{}", def.name);
-            let is_on = current_tags.iter().any(|t| *t == with_hash);
+            let is_on = current_tags
+                .iter()
+                .any(|t| crate::tags_db::normalize_tag_key(t) == def.tag_key);
             let label = egui::RichText::new(&with_hash).color(if is_on {
                 egui::Color32::from_rgb(180, 255, 180)
             } else {

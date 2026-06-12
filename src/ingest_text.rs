@@ -7,7 +7,7 @@
 //!   - PNG tEXt/iTXt (A1111 / ComfyUI AI プロンプト) → `SourceKind::PngPrompt`
 //!   - PDFium document info (PDF のみ) → `SourceKind::PdfMeta`
 //!   - FFmpeg container metadata (動画のみ) → `SourceKind::VideoMeta`
-//!   - XMP `dc:subject` タグ (画像本体 / 動画サイドカー) → `SourceKind::Tags`
+//!   - 外部メタデータサイドカー (JSON/TXT) → `SourceKind::Sidecar`
 //!
 //! ## 設計方針
 //!
@@ -26,8 +26,7 @@ use std::path::Path;
 use crate::fts_index::SourceKind;
 use crate::search_norm::normalize_for_match;
 
-/// 1 ファイル分のソース別検索テキスト (§19.5 + タグ統合)。各フィールドは `normalize_for_match` 適用済み
-/// (tags は元の表記を保ったスペース区切り `#` 込み文字列を格納)。
+/// 1 ファイル分のソース別検索テキスト (§19.5 + タグ統合)。各フィールドは `normalize_for_match` 適用済み。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PerSourceText {
     pub name: String,
@@ -36,8 +35,7 @@ pub struct PerSourceText {
     pub png_prompt: String,
     pub pdf_meta: String,
     pub video_meta: String,
-    /// XMP `dc:subject` 由来のタグ列 (スペース区切り、`#` 込み / 既存タグは `#` なし)。
-    /// Tantivy 側は bigram tokenize、fts_meta 側は同文字列を保存。
+    /// 旧 XMP `dc:subject` 由来のタグ列。通常 ingest では populate せず、既存データ移行時だけ参照する。
     pub tags: String,
     /// 外部メタデータサイドカー (画像と同名の JSON/TXT) の値テキスト (`normalize_for_match` 済み)。
     /// JSON はリーフ値のみ / TXT は全文。mIV タグ (`tags`) とは別系統の読み取り専用
@@ -105,9 +103,8 @@ impl PerSourceText {
     }
 }
 
-/// 1 タグ要素を「空白区切り列に載せられる」安全な形に正規化する。
-/// 空白 / 制御文字は `_` に置換。索引側 (`build_tags_column`) と UI 側 (タグ定義ダイアログ)
-/// の両方で呼んで、保存表記と検索時表記を一致させる唯一の経路にする。
+/// 旧 XMP タグ列を「空白区切り列に載せられる」安全な形に正規化する。
+/// 通常 ingest では使わず、既存 STORED tags など移行専用の互換 helper として残す。
 pub fn canonicalize_tag_name(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -120,8 +117,8 @@ pub fn canonicalize_tag_name(name: &str) -> String {
         .collect()
 }
 
-/// XMP `dc:subject` 由来のタグ列を fts_meta / Tantivy 向けのスペース区切り文字列にする。
-/// 各要素は `canonicalize_tag_name` を通す。
+/// XMP `dc:subject` 由来の旧タグ列をスペース区切り文字列にする。
+/// 各要素は `canonicalize_tag_name` を通す。通常 ingest はこのフィールドを populate しない。
 pub fn build_tags_column(tags: &[String]) -> String {
     let mut out = String::new();
     for t in tags {
@@ -137,9 +134,8 @@ pub fn build_tags_column(tags: &[String]) -> String {
     out
 }
 
-/// `build_tags_column` の逆: スペース区切りのタグ列 (fts_meta.tags_norm 形式) を
-/// `Vec<String>` に戻す。prewarm_grid_tags / tag_write_worker で UI キャッシュに
-/// 載せる時に使う。空白要素は捨てる。
+/// `build_tags_column` の逆: スペース区切りの旧タグ列を `Vec<String>` に戻す。
+/// 空白要素は捨てる。
 pub fn parse_tags_column(s: &str) -> Vec<String> {
     s.split_whitespace().map(|t| t.to_string()).collect()
 }
@@ -154,7 +150,7 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
         out.name = normalize_for_match(name);
     }
 
-    // 2. XMP / PNG / EXIF UserComment AI メタ / dc:subject は同じファイル実体を
+    // 2. XMP / PNG / EXIF UserComment AI メタは同じファイル実体を
     //    複数回読む path-based 版を使うと
     //    AI 生成 PNG (10-30MB) で 3x 倍のディスク読み取りになり、インデクサが
     //    350MB/秒級でディスクを占有してしまう (Codex perf 報告)。
@@ -180,12 +176,6 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
         if ai_origin.is_some_and(|o| o.suppresses_exif_user_comment()) {
             ai_from_exif_user_comment = true;
         }
-        // 2c. XMP dc:subject タグ。動画は本体ではなくサイドカーが authoritative なので
-        //     ここでは触らず後段に任せる (本体に古い XMP が残っていても無視する)。
-        if !is_video_sidecar {
-            let dc_tags = crate::xmp_reader::read_dc_subject_from_bytes(&bytes);
-            out.tags = build_tags_column(&dc_tags);
-        }
     }
 
     // 3. EXIF (rexif が自前で開く。内部パーサーが IFD を読むだけなので全読みしない想定)
@@ -199,11 +189,8 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
         }
     }
 
-    // 4. 動画ファイルは同名 `.xmp` サイドカーを唯一のタグソースとして扱う
-    //    (空ならタグなしと確定させる; 本体に埋め込まれた古い XMP は読まない)。
+    // 4. 動画ファイルは同名 `.xmp` サイドカーではなくコンテナメタだけを検索対象にする。
     if is_video_sidecar {
-        let dc_tags = crate::xmp_reader::read_dc_subject(path);
-        out.tags = build_tags_column(&dc_tags);
         out.video_meta = build_video_metadata_text(path);
     }
 
@@ -314,26 +301,23 @@ fn push_metadata_value(
     }
 }
 
-/// メタ抽出共通のファイル読み込み (XMP / PNG / dc:subject で共有)。
+/// メタ抽出共通のファイル読み込み (XMP / PNG で共有)。
 ///
 /// JPEG / PNG は通常 ≤50MB なので全読み。TIFF / MP4 等の大コンテナは先頭 2MB のみ読む
 /// (`xmp_reader::read_tweet_info` が旧来 512KB に絞っていたのを 2MB に拡張)。
 /// それ以外の拡張子は metadata 検索対象外として `None`。
 ///
-/// 戻り値の `Vec<u8>` は同一ファイルに対して XMP / PNG / dc:subject の 3 パーサーで共有される。
+/// 戻り値の `Vec<u8>` は同一ファイルに対して XMP / PNG パーサーで共有される。
 ///
 /// ## TIFF/MP4 の上限について (Codex P3 指摘対応)
 ///
-/// 旧 `read_dc_subject(path)` は TIFF/MP4 でもフルファイル読みしていたため、たとえば
-/// 4GB の MP4 から dc:subject を拾う経路は I/O 的に致命的だった。本関数で上限を設ける
-/// ことで同じ TIFF/MP4 をインデックス中に通常操作が重くならないようにする。
+/// 旧タグ検索経路では TIFF/MP4 でもフルファイル読みが起き得たため、大容量コンテナは
+/// ここで上限を設けて通常操作を巻き込まないようにする。
 ///
 /// ExifTool / mXD など一般的な XMP writer は uuid atom / IFD0 の先頭付近に packet を
 /// 置くので 512KB で実用上十分だったが、MP4 では XMP packet を末尾 (moov atom の後)
 /// に置く encoder も存在する。`moov` が先頭にくる fast-start 形式なら 2MB 内に XMP も
-/// 収まる想定。2MB を超える場所に XMP が置かれている超大容量動画では dc:subject が
-/// インデックスに載らない可能性があるが、これは許容 (検索対象外でもファイル自体の
-/// 閲覧・再生・ファイル名検索には影響しない)。
+/// 収まる想定。
 fn read_metadata_bytes(path: &Path) -> Option<Vec<u8>> {
     const METADATA_SCAN_LIMIT: u64 = 2 * 1024 * 1024;
     let ext = path
@@ -389,9 +373,6 @@ pub fn build_per_source_from_bytes(display_name: &str, bytes: &[u8]) -> PerSourc
     if !png_text.is_empty() {
         out.png_prompt = normalize_for_match(&png_text);
     }
-    let dc_tags = crate::xmp_reader::read_dc_subject_from_bytes(bytes);
-    out.tags = build_tags_column(&dc_tags);
-
     out
 }
 
@@ -564,11 +545,11 @@ mod tests {
             png_prompt: "prompt text".into(),
             pdf_meta: "".into(),
             video_meta: "video title".into(),
-            tags: "#原神".into(),
+            tags: "".into(),
             sidecar: "".into(),
         };
         let c = pst.combined();
-        assert_eq!(c, "photo.jpg canon 5d prompt text video title #原神");
+        assert_eq!(c, "photo.jpg canon 5d prompt text video title");
     }
 
     #[test]
@@ -616,8 +597,7 @@ mod tests {
 
     #[test]
     fn canonicalize_tag_name_replaces_whitespace_and_control() {
-        // UI の tag_editor と索引の build_tags_column は同じ変換を通すことで、
-        // タグピッカーが挿入した `#タグ名` が索引中の表記と完全一致する。
+        // 旧タグ列の移行用 canonicalize は空白/制御文字を `_` にする。
         assert_eq!(canonicalize_tag_name("foo bar"), "foo_bar");
         assert_eq!(canonicalize_tag_name("tab\there"), "tab_here");
         assert_eq!(canonicalize_tag_name("line\nbreak"), "line_break");

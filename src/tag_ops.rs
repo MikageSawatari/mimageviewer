@@ -1,14 +1,28 @@
 //! タグ付与/削除操作のファサード (docs/tag-feature.md §5)。
 //!
 //! メニュー・ツールバー・メタデータパネルからのタグ操作のエントリーポイント。
-//! XMP 読み書きはすべて `tag_write_worker` に委譲し、UI スレッドは同期 I/O を
-//! 一切行わない。
+//! tags.db 更新はすべて `tag_write_worker` に委譲する。UI 側は all-or-nothing 判定に
+//! 必要な既存タグだけを tags.db から補完し、ファイルメタデータ I/O は行わない。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::app::App;
 use crate::grid_item::GridItem;
 use crate::tag_write_worker::{TagAction, TagJobKind, TagWriteHandle, TagWriteJob};
+
+fn tag_target_path_for_item(item: &GridItem, fullscreen: bool) -> Option<PathBuf> {
+    match item {
+        GridItem::Folder(p)
+        | GridItem::Image(p)
+        | GridItem::Video(p)
+        | GridItem::ZipFile(p)
+        | GridItem::PdfFile(p)
+        | GridItem::ConvertibleArchive { path: p, .. } => Some(p.clone()),
+        GridItem::ZipImage { zip_path, .. } if fullscreen => Some(zip_path.clone()),
+        GridItem::PdfPage { pdf_path, .. } if fullscreen => Some(pdf_path.clone()),
+        _ => None,
+    }
+}
 
 impl App {
     /// タグ書き込みの対象ファイル列。優先順位:
@@ -21,21 +35,21 @@ impl App {
     ///      対象にならない事故を防ぐ。
     ///   3. checked が空なら selected 単体。
     ///   4. selected も無ければ fullscreen_idx (フルスクリーンに居なくても残っていれば)。
-    /// いずれも `Image` (JPEG/PNG/WebP) または `Video` (XMP サイドカー対応形式) のみ。
+    /// いずれも実パスを持つタグ対応 item のみ。ZIP/PDF ページのフルスクリーン中は
+    /// コンテナ自身へフォールバックする。
     pub(crate) fn tag_target_paths(&self) -> Vec<PathBuf> {
-        let push_writable = |out: &mut Vec<PathBuf>, idx: usize, items: &[GridItem]| {
-            let p = match items.get(idx) {
-                Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => p,
-                _ => return,
+        let push_taggable = |out: &mut Vec<PathBuf>, idx: usize, items: &[GridItem], fs: bool| {
+            let Some(item) = items.get(idx) else {
+                return;
             };
-            if crate::xmp_writer::is_taggable_format(p) {
-                out.push(p.clone());
+            if let Some(p) = tag_target_path_for_item(item, fs) {
+                out.push(p);
             }
         };
 
         let mut out: Vec<PathBuf> = Vec::new();
         if let Some(fs_idx) = self.fullscreen_idx {
-            push_writable(&mut out, fs_idx, &self.items);
+            push_taggable(&mut out, fs_idx, &self.items, true);
             return out;
         }
         let bulk_intent = match self.selected {
@@ -46,12 +60,12 @@ impl App {
             let mut indices: Vec<usize> = self.checked.iter().copied().collect();
             indices.sort_unstable(); // worker のジョブ投入順 = トースト集計順を安定化
             for idx in indices {
-                push_writable(&mut out, idx, &self.items);
+                push_taggable(&mut out, idx, &self.items, false);
             }
             return out;
         }
         if let Some(idx) = self.selected {
-            push_writable(&mut out, idx, &self.items);
+            push_taggable(&mut out, idx, &self.items, false);
         }
         out
     }
@@ -62,9 +76,8 @@ impl App {
 
     pub(crate) fn request_tag_toggle_for_selection(&mut self, name: &str) {
         let name_owned = name.to_string();
-        // Toggle は worker 側で XMP を読んで Add/Remove に解決する。
-        // 結果 (付与されたか / 削除されたか) は `poll_tag_write_results` が完了時に
-        // まとめてトースト表示するため、ここでは事前トーストを出さない。
+        // 複数選択は all-or-nothing: 全対象に付与済みなら全削除、それ以外は全付与。
+        // 結果は `poll_tag_write_results` が完了時にまとめてトースト表示する。
         self.tag_toast_label = Some(format!("#{name_owned}"));
         let mode = if self.fullscreen_idx.is_some() {
             "fullscreen"
@@ -85,22 +98,41 @@ impl App {
         if !self.precheck_tag_write_available("toggle") {
             return;
         }
+        self.hydrate_tags_cache_for_paths(&paths);
+        let tag_key = crate::tags_db::normalize_tag_key(&name_owned);
+        let all_have_tag = paths.iter().all(|path| {
+            let key = crate::tags_db::item_key_for_path(path);
+            self.tags_cache.get(&key).is_some_and(|tags| {
+                tags.iter()
+                    .any(|tag| crate::tags_db::normalize_tag_key(tag) == tag_key)
+            })
+        });
+
         // 楽観的 UI 更新: tags_cache を「予想した after」に書き換えてグリッドバッジを
         // 即時反映する。**Undo entry はここでは積まない** — worker 結果が
-        // 「実 disk の before/after」を持って戻った時点で `poll_tag_write_results` が
+        // 「実 DB の before/after」を持って戻った時点で `poll_tag_write_results` が
         // pending_tag_undos から組み立てて確定する (Codex P3 完全対応)。
-        let with_hash = format!("#{name_owned}");
-        let summary = format!("#{name_owned} のトグル");
+        let with_hash = crate::tags_db::format_display_tag(&name_owned);
+        let summary = if all_have_tag {
+            format!("{with_hash} の削除")
+        } else {
+            format!("{with_hash} の付与")
+        };
         self.optimistic_update_tags_cache(&paths, |before| {
-            if before.iter().any(|t| t == &with_hash) {
+            if all_have_tag {
                 before
                     .iter()
-                    .filter(|t| *t != &with_hash)
+                    .filter(|t| crate::tags_db::normalize_tag_key(*t) != tag_key)
                     .cloned()
                     .collect()
             } else {
                 let mut after = before.to_vec();
-                after.push(with_hash.clone());
+                if !after
+                    .iter()
+                    .any(|tag| crate::tags_db::normalize_tag_key(tag) == tag_key)
+                {
+                    after.push(with_hash.clone());
+                }
                 after
             }
         });
@@ -108,7 +140,11 @@ impl App {
         self.register_pending_tag_op(tx_id, summary, paths.len());
         let name_for_jobs = name_owned;
         self.submit_tag_jobs(&paths, "toggle", tx_id, move |_| {
-            TagJobKind::Toggle(name_for_jobs.clone())
+            if all_have_tag {
+                TagJobKind::Remove(name_for_jobs.clone())
+            } else {
+                TagJobKind::Add(name_for_jobs.clone())
+            }
         });
     }
 
@@ -128,15 +164,9 @@ impl App {
         if !self.precheck_tag_write_available("clear") {
             return;
         }
-        // 楽観的 UI 更新: ClearMiv 後の dc:subject は `#` 始まり要素を除いたもの。
+        // 楽観的 UI 更新: tags.db 上の mIV タグを空にする。
         let summary = format!("{count} 件の mIV タグをクリア");
-        self.optimistic_update_tags_cache(&paths, |before| {
-            before
-                .iter()
-                .filter(|t| !t.starts_with('#'))
-                .cloned()
-                .collect()
-        });
+        self.optimistic_update_tags_cache(&paths, |_before| Vec::new());
         self.show_feedback_toast(format!("{count} 件から mIV タグをクリア中"));
         let tx_id = self.next_tag_tx_id();
         self.register_pending_tag_op(tx_id, summary, paths.len());
@@ -150,7 +180,7 @@ impl App {
         self.ensure_tag_write_handle();
         if self.tag_write_handle.is_none() {
             crate::logger::log(format!(
-                "[TAG] '{op_label}' aborted: tag_write_handle unavailable (no indexer_manager)"
+                "[TAG] '{op_label}' aborted: tag_write_handle unavailable"
             ));
             self.show_feedback_toast(TAG_WRITE_UNAVAILABLE_MSG.to_string());
             return false;
@@ -186,26 +216,20 @@ impl App {
         self.ensure_tag_write_handle();
         let Some(h) = self.tag_write_handle.as_ref() else {
             crate::logger::log(format!(
-                "[TAG] submit '{op_label}' aborted: tag_write_handle unavailable (no indexer_manager)"
+                "[TAG] submit '{op_label}' aborted: tag_write_handle unavailable"
             ));
             self.show_feedback_toast(TAG_WRITE_UNAVAILABLE_MSG.to_string());
             return;
         };
         crate::logger::log(format!(
-            "[TAG] submitting '{op_label}' (tx={tx_id}) for {} file(s):",
+            "[TAG] submitting '{op_label}' (tx={tx_id}) for {} item(s):",
             paths.len()
         ));
         for p in paths {
-            let fav_id = find_favorite_id(&self.settings.favorites, p);
-            crate::logger::log(format!(
-                "[TAG]   → {} (favorite_id={:?})",
-                p.display(),
-                fav_id.map(|u| u.to_string())
-            ));
+            crate::logger::log(format!("[TAG]   → {}", p.display()));
             h.submit(TagWriteJob {
                 path: p.clone(),
                 kind: kind_for(p),
-                favorite_id: fav_id,
                 tx_id,
             });
         }
@@ -215,30 +239,42 @@ impl App {
         if self.tag_write_handle.is_some() {
             return;
         }
-        let Some(mgr) = self.indexer_manager.as_ref() else {
-            crate::logger::log(
-                "tag_ops: indexer_manager が未初期化のためタグ書き込み worker を起動できない"
-                    .to_string(),
-            );
+        self.tag_write_handle = Some(TagWriteHandle::spawn());
+    }
+
+    fn hydrate_tags_cache_for_paths(&mut self, paths: &[PathBuf]) {
+        let mut missing: Vec<String> = paths
+            .iter()
+            .map(|path| crate::tags_db::item_key_for_path(path))
+            .filter(|key| !self.tags_cache.contains_key(key))
+            .collect();
+        if missing.is_empty() {
             return;
-        };
-        self.tag_write_handle = Some(TagWriteHandle::spawn(
-            mgr.clone_fts_meta(),
-            mgr.clone_fts_index(),
-            mgr.clone_shared_writer(),
-        ));
+        }
+        missing.sort();
+        missing.dedup();
+        if let Some(db) = self.tags_db.as_ref() {
+            let mut loaded = db.get_many_display_tags(&missing);
+            for key in missing {
+                self.tags_cache
+                    .insert(key.clone(), loaded.remove(&key).unwrap_or_default());
+            }
+        } else {
+            for key in missing {
+                self.tags_cache.insert(key, Vec::new());
+            }
+        }
     }
 }
 
 /// タグ書き込みが無効化されている時のユーザー向けエラー文言。
 /// `submit_tag_jobs` の None 経路でトースト表示する。
-const TAG_WRITE_UNAVAILABLE_MSG: &str =
-    "タグ書き込みが初期化されていません (検索インデックスの起動失敗が原因)";
+const TAG_WRITE_UNAVAILABLE_MSG: &str = "タグ書き込みが初期化されていません";
 
 impl App {
     /// 毎フレーム呼ぶ: tag_write_worker の結果をドレインしてトーストする。
-    /// 成功した各 path については worker が書いた dc:subject をそのまま `tags_cache` に
-    /// 反映する — fts_meta に行があろうと無かろうと grid バッジが即時更新される。
+    /// 成功した各 path については worker が書いた mIV タグ一覧をそのまま `tags_cache` に
+    /// 反映する。
     pub(crate) fn poll_tag_write_results(&mut self) {
         let mut errors: Vec<(PathBuf, String)> = Vec::new();
         let mut added = 0usize;
@@ -248,7 +284,6 @@ impl App {
         let mut noop = 0usize;
         let mut just_completed = false;
         // worker が返してきた (path, 書き込み後タグ列) を後でまとめて tags_cache に反映する。
-        // fts_meta に行が無い favorite (未インデックス) でも、ここで直接書き戻せば
         // 次フレームの `cell_tag_list` が正しい値を拾えるため add/remove 対称になる。
         let mut cache_updates: Vec<(PathBuf, Vec<String>)> = Vec::new();
         // pending_tag_undos に積み上げる: (tx_id, TagChange or failure marker)。
@@ -277,7 +312,7 @@ impl App {
                             TagAction::Restored => {
                                 restored += 1;
                                 crate::logger::log(format!(
-                                    "[TAG]   ✓ restored dc:subject (undo/redo) → {path_disp}"
+                                    "[TAG]   ✓ restored tags (undo/redo) → {path_disp}"
                                 ));
                             }
                             TagAction::NoOp => {
@@ -305,9 +340,9 @@ impl App {
                         if res.tx_id != 0 {
                             pending_updates.push(PendingUpdate::Failure { tx_id: res.tx_id });
                         }
-                        // 楽観更新済みの tags_cache を実 disk 状態 (= worker が読み取った
-                        // tags_before) に巻き戻す。XMP 書き込みは失敗しているのでファイル側は
-                        // 不変だが、グリッドのバッジは予測値で更新済みのため放置すると stale
+                        // 楽観更新済みの tags_cache を実 DB 状態 (= worker が読み取った
+                        // tags_before) に巻き戻す。DB 書き込みは失敗しているので、
+                        // グリッドのバッジは予測値で更新済みのため放置すると stale
                         // 表示になる (Codex P3 指摘)。
                         cache_updates.push((res.path.clone(), res.tags_before));
                         errors.push((res.path, e));
@@ -322,7 +357,7 @@ impl App {
         // これで bulk トグルの途中フレームでも、処理済みのセルからバッジが更新されていく。
         let tags_cache_changed = !cache_updates.is_empty();
         for (path, tags) in cache_updates {
-            let key = crate::adjustment_db::normalize_path(&path);
+            let key = crate::tags_db::item_key_for_path(&path);
             self.tags_cache.insert(key, tags);
         }
         if tags_cache_changed && self.settings.facet_filter.uses_tag_state() {
@@ -474,21 +509,6 @@ fn format_completion_toast(
     }
 }
 
-/// 指定 path を含むお気に入りの id を返す (子孫も一致扱い)。
-/// Windows の大文字小文字非区別に対応するため `is_under` で正規化比較する。
-/// `undo_ops.rs` の Undo/Redo タグ復元ジョブからも使うため `pub(crate)`。
-pub(crate) fn find_favorite_id(
-    favorites: &[crate::settings::FavoriteEntry],
-    path: &Path,
-) -> Option<uuid::Uuid> {
-    for fav in favorites {
-        if crate::search_index_db::is_under(path, &fav.path) {
-            return Some(fav.id);
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::format_completion_toast;
@@ -552,43 +572,5 @@ mod tests {
             format_completion_toast(None, 0, 0, 0, 3, 2),
             "3 件のタグを元に戻しました"
         );
-    }
-
-    #[test]
-    fn recognizes_jpeg_png_webp() {
-        assert!(crate::xmp_writer::is_writable_format(std::path::Path::new(
-            "a.jpg"
-        )));
-        assert!(crate::xmp_writer::is_writable_format(std::path::Path::new(
-            "A.JPG"
-        )));
-        assert!(crate::xmp_writer::is_writable_format(std::path::Path::new(
-            "b.jpeg"
-        )));
-        assert!(crate::xmp_writer::is_writable_format(std::path::Path::new(
-            "c.png"
-        )));
-        assert!(crate::xmp_writer::is_writable_format(std::path::Path::new(
-            "d.webp"
-        )));
-    }
-
-    #[test]
-    fn rejects_non_writable() {
-        assert!(!crate::xmp_writer::is_writable_format(
-            std::path::Path::new("a.heic")
-        ));
-        assert!(!crate::xmp_writer::is_writable_format(
-            std::path::Path::new("b.tiff")
-        ));
-        assert!(!crate::xmp_writer::is_writable_format(
-            std::path::Path::new("c.cr2")
-        ));
-        assert!(!crate::xmp_writer::is_writable_format(
-            std::path::Path::new("d.mp4")
-        ));
-        assert!(!crate::xmp_writer::is_writable_format(
-            std::path::Path::new("no_ext")
-        ));
     }
 }

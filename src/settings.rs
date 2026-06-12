@@ -148,14 +148,21 @@ impl FavoriteEntry {
 pub struct TagDef {
     #[serde(default = "Uuid::new_v4")]
     pub id: Uuid,
+    #[serde(default)]
+    pub tag_key: String,
     pub name: String,
+    #[serde(default = "default_true")]
+    pub show_shortcut: bool,
 }
 
 impl TagDef {
     pub fn new(name: String) -> Self {
+        let name = crate::tags_db::normalize_tag_display_name(&name);
         Self {
             id: Uuid::new_v4(),
+            tag_key: crate::tags_db::normalize_tag_key(&name),
             name,
+            show_shortcut: true,
         }
     }
 
@@ -1700,6 +1707,11 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub sidecar_backup_enabled: bool,
 
+    /// タグをフォルダ側 `mimageviewer.dat` にバックアップする。
+    /// 既定 OFF。中央 `tags.db` が正本で、サイドカーは opt-in の復元補助。
+    #[serde(default)]
+    pub tag_sidecar_backup_enabled: bool,
+
     // ── Susie プラグイン (v0.7.0) ──────────────────────────────
     /// Susie 画像プラグイン機能全体の ON/OFF (デフォルト: true、ワーカー exe が無い環境では自動的に無効化される)。
     #[serde(default = "default_true")]
@@ -2619,6 +2631,7 @@ impl Default for Settings {
             global_preset: crate::adjustment::AdjustParams::default(),
             preset_slots: crate::adjustment::PresetSlots::default(),
             sidecar_backup_enabled: true,
+            tag_sidecar_backup_enabled: false,
             susie_enabled: true,
             susie_allow_parallel: true,
             minimize_to_tray_on_close: false,
@@ -3592,6 +3605,50 @@ impl Settings {
                 fav.id = Uuid::new_v4();
             }
         }
+        self.normalize_tag_settings();
+        self.normalize_facet_tag_filter();
+    }
+
+    fn normalize_tag_settings(&mut self) {
+        let mut cleaned: Vec<TagDef> = Vec::new();
+        let mut by_key: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for mut tag in self.tags.drain(..) {
+            if tag.id.is_nil() {
+                tag.id = Uuid::new_v4();
+            }
+            tag.name = crate::tags_db::normalize_tag_display_name(&tag.name);
+            if tag.tag_key.trim().is_empty() {
+                tag.tag_key = crate::tags_db::normalize_tag_key(&tag.name);
+            } else {
+                tag.tag_key = crate::tags_db::normalize_tag_key(&tag.tag_key);
+            }
+            if tag.name.is_empty() {
+                tag.name = tag.tag_key.clone();
+            }
+            if tag.tag_key.is_empty() || tag.name.chars().count() > 64 {
+                continue;
+            }
+            if let Some(&idx) = by_key.get(&tag.tag_key) {
+                cleaned[idx].show_shortcut |= tag.show_shortcut;
+            } else {
+                by_key.insert(tag.tag_key.clone(), cleaned.len());
+                cleaned.push(tag);
+            }
+        }
+        self.tags = cleaned;
+    }
+
+    fn normalize_facet_tag_filter(&mut self) {
+        if self.facet_filter.tags.is_empty() {
+            return;
+        }
+        self.facet_filter.tags = self
+            .facet_filter
+            .tags
+            .iter()
+            .map(|tag| crate::tags_db::normalize_tag_key(tag))
+            .filter(|tag| !tag.is_empty())
+            .collect();
     }
 
     /// 環境設定ダイアログが**編集しない**フィールドを `src` から取り込む (move)。
@@ -5535,7 +5592,7 @@ mod tests {
                 "facet_filter extensions should survive roundtrip"
             );
             assert!(
-                loaded.facet_filter.tags.contains("#原神"),
+                loaded.facet_filter.tags.contains("原神"),
                 "facet_filter tags should survive roundtrip"
             );
             assert!(

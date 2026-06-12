@@ -184,10 +184,10 @@ pub struct SupervisorParams {
 ///
 /// - `meta_db` と `fts` はどちらも内部で Mutex または同期機構を持つのでスレッド跨ぎで使える
 /// - `io_sem` は全 Supervisor 共通で 1 つ
-/// - `writer` は **全 supervisor + tag worker で共有** する `Arc<FtsWriterDispatcher>`。
+/// - `writer` は **全 supervisor で共有** する `Arc<FtsWriterDispatcher>`。
 ///   Tantivy は 1 Index につき IndexWriter 1 本制約なので、所有権を専用 dispatcher
 ///   スレッドに集約し、各利用者は `WriterPriority` 付きでジョブを submit する
-///   (interactive な tag worker が長時間 background ingest に starve しないように)。
+///   (interactive job が長時間 background ingest に starve しないように)。
 pub fn spawn(
     params: SupervisorParams,
     meta_db: Arc<FtsMetaDb>,

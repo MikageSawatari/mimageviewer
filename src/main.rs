@@ -111,6 +111,7 @@ pub mod sys_memory;
 mod tag_ops;
 mod tag_prewarm;
 pub mod tag_write_worker;
+pub mod tags_db;
 pub mod thumb_loader;
 pub mod tray;
 mod tray_integration;

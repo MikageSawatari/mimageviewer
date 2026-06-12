@@ -3871,6 +3871,7 @@ dependencies = [
  "tray-icon",
  "ttf-parser",
  "turbojpeg",
+ "unicode-normalization",
  "unrar",
  "ureq 2.12.1",
  "uuid",

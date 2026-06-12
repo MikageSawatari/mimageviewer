@@ -1494,8 +1494,31 @@ fn facet_ext_for_item(item: &GridItem) -> String {
     }
 }
 
-fn facet_item_supports_tags(item: &GridItem) -> bool {
-    matches!(item, GridItem::Image(_) | GridItem::Video(_))
+fn tag_item_path(item: &GridItem) -> Option<&Path> {
+    match item {
+        GridItem::Folder(p)
+        | GridItem::Image(p)
+        | GridItem::Video(p)
+        | GridItem::ZipFile(p)
+        | GridItem::PdfFile(p)
+        | GridItem::ConvertibleArchive { path: p, .. } => Some(p.as_path()),
+        _ => None,
+    }
+}
+
+fn item_supports_tags(item: &GridItem) -> bool {
+    tag_item_path(item).is_some()
+}
+
+fn facet_tag_filter_applies(item: &GridItem) -> bool {
+    matches!(
+        item,
+        GridItem::Image(_)
+            | GridItem::Video(_)
+            | GridItem::ZipFile(_)
+            | GridItem::PdfFile(_)
+            | GridItem::ConvertibleArchive { .. }
+    )
 }
 
 /// `current` が `anchor` 配下 (= 同一 or 子孫) かを case-insensitive に判定する。
@@ -1873,17 +1896,15 @@ fn run_metadata_search(
     let use_exif = target.includes(crate::fts_index::SourceKind::Exif);
     let use_xmp = target.includes(crate::fts_index::SourceKind::XmpTweet);
     let use_video_meta = target.includes(crate::fts_index::SourceKind::VideoMeta);
-    let use_tags = target.includes(crate::fts_index::SourceKind::Tags);
     let use_pdf_meta = target.includes(crate::fts_index::SourceKind::PdfMeta);
     // 外部メタデータサイドカー (FS 画像のみ。docs §14-5)。TARGET_CHOICES は Ctrl+F/Ctrl+G
     // で共有されるので、ここで対応しないと「サイドカー」絞り込みが無反応・「すべて」が
     // サイドカーを取りこぼす。
     let use_sidecar = target.includes(crate::fts_index::SourceKind::Sidecar);
-    // Image / Video の fallback 経路は name/png/exif/xmp/video_meta/tags/sidecar のいずれかが
+    // Image / Video の fallback 経路は name/png/exif/xmp/video_meta/sidecar のいずれかが
     // 対象でないと結果が常に空になる。PdfMeta-only 等で無駄な per-file 走査を避ける。
-    // Tags も含めておかないと target=Tags のとき未インデックス画像が全件 skip される。
     let fallback_contributes =
-        use_name || use_png || use_exif || use_xmp || use_video_meta || use_tags || use_sidecar;
+        use_name || use_png || use_exif || use_xmp || use_video_meta || use_sidecar;
 
     // Pass 1: 構造アイテム + ZIP 内画像 (名前照合中心、PDF のみ document info I/O)。
     // 構造アイテムも一貫して絞り込む (§4.1): 名前がマッチしないものは非表示にする。
@@ -2071,20 +2092,6 @@ fn run_metadata_search(
                             }
                             extended_meta.push_str(&exif_part);
                         }
-                    }
-                }
-                // target が Tags を含む場合、未インデックスの画像/動画でも dc:subject を
-                // 直読みして hay に載せる (Ctrl+F で tag 絞り込みを機能させる)。
-                // 動画は read_dc_subject 側で同名 .xmp サイドカーを読む。
-                if use_tags {
-                    let tags_text = crate::ingest_text::build_tags_column(
-                        &crate::xmp_reader::read_dc_subject(path),
-                    );
-                    if !tags_text.is_empty() {
-                        if !extended_meta.is_empty() {
-                            extended_meta.push('\n');
-                        }
-                        extended_meta.push_str(&tags_text);
                     }
                 }
                 if !is_image && use_video_meta {
@@ -2758,10 +2765,10 @@ pub(crate) struct AdjustmentDragSession {
 /// `accumulated` から `UndoEntry::Tag` を組み立てて `meta_undo` に push する。
 ///
 /// この遅延構築によって:
-/// - 外部ツールが XMP を書き換えて `tags_cache` が stale でも、Undo entry は worker が
-///   読んだ真の disk 状態を `before` に持つ → Ctrl+Z 連打で他タグを破壊しない。
-/// - 個別ファイルの XMP 書き込み失敗は `accumulated` に入らない (= Undo の対象外) ので、
-///   実ディスクと Undo stack が乖離しない。
+/// - `tags_cache` が stale でも、Undo entry は worker が読んだ tags.db 状態を
+///   `before` に持つ → Ctrl+Z 連打で他タグを破壊しない。
+/// - 個別 item の tags.db 更新失敗は `accumulated` に入らない (= Undo の対象外) ので、
+///   DB と Undo stack が乖離しない。
 #[derive(Debug, Clone)]
 pub(crate) struct PendingTagUndo {
     pub summary: String,
@@ -3700,13 +3707,13 @@ pub struct App {
     /// チェックボックスの現在値 (Phase 2a)。デフォルト OFF。
     /// ON で「フル解像度(高画質)」を押すと `pano_session_approved_max_pixels` が更新される。
     pub(crate) pano_banner_remember_session: bool,
-    /// タグキャッシュ (docs/tag-feature.md): 正規化キー → XMP dc:subject の要素列。
+    /// タグキャッシュ: tags.db item_key → mIV タグ表示列 (`#タグ`)。
     /// メタデータパネルのタグボタン状態表示 + グリッドのタグバッジで使用。
     /// 充填経路は 3 つ:
-    ///  1. `prewarm_grid_tags` が fts_meta から一括 (同期、フォルダ切替時)
-    ///  2. `tag_prewarm` ワーカーが XMP から背景読み (非インデックスファイル)
-    ///  3. `poll_tag_write_results` が worker の tags_after で上書き (書き込み完了時)
-    /// フォルダ切替時のみ全クリアし、prewarm → 背景プリフェッチで埋め直す。
+    ///  1. `prewarm_grid_tags` が tags.db から一括取得 (フォルダ切替時)
+    ///  2. タグ操作前に不足分だけ `hydrate_tags_cache_for_paths` が補完
+    ///  3. `poll_tag_write_results` が worker の tags_after で上書き (更新完了時)
+    /// フォルダ切替時のみ全クリアし、tags.db から埋め直す。
     pub(crate) tags_cache: std::collections::HashMap<String, Vec<String>>,
     /// tag toast 用: 直近の Toggle 操作で UI が使っていたタグ名 (`#ドール` 等)。
     /// worker 完了時に「N 件に #ドール を付与 / 削除」として表示するのに使う。
@@ -3767,9 +3774,9 @@ pub struct App {
     /// 20MP JPEG の XMP 読み (`read_tweet_info` が full-file 読む) で UI が
     /// 100ms 級にブロックしていた問題を解消する。
     pub(crate) metadata_pending: Option<MetadataLoadPending>,
-    /// グリッド表示用 XMP タグのバックグラウンドプリフェッチ (docs/tag-feature.md)。
-    /// `fts_meta` 未登録ファイル (非インデックス favorite 等) でも grid バッジが表示される
-    /// よう、`prewarm_grid_tags` が spawn する。フォルダ切替時に cancel される。
+    /// XMP rating hydration のバックグラウンドプリフェッチ。
+    /// タグ正本は `tags.db` なので、ここでは XMP `dc:subject` を読まない。
+    /// `prewarm_grid_tags` が必要時に spawn し、フォルダ切替時に cancel される。
     pub(crate) tag_prewarm_pending: Option<crate::tag_prewarm::TagPrewarmPending>,
     /// `tag_prewarm_pending` で処理済み / キャッシュ済みの item idx 集合 (二重 push 防止)。
     /// idx キーで持つことで hot-path の `adjustment_db::normalize_path` 呼び出しを
@@ -3786,7 +3793,7 @@ pub struct App {
     /// キーボード移動 / Shift 範囲選択だけこの順序を見る。
     pub(crate) details_order: Vec<usize>,
     /// 詳細表示で現在画面付近にある idx。サムネ用 `keep_set` を空にしても、
-    /// タグ列 / タグ facet の XMP prewarm はこの集合で可視行だけ進める。
+    /// XMP rating hydration はこの集合で可視行だけ進める。
     pub(crate) details_tag_prewarm_indices: Vec<usize>,
     /// 詳細表示の遅延メタ結果。キーは `metadata_cache_key` 相当の安定キー。
     pub(crate) details_lazy_meta: std::collections::HashMap<String, DetailsLazyMeta>,
@@ -3983,6 +3990,8 @@ pub struct App {
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
     pub(crate) rating_db: Option<crate::rating_db::RatingDb>,
+    /// mIV タグ DB (全体で 1 ファイル)
+    pub(crate) tags_db: Option<crate::tags_db::TagsDb>,
     /// 現在フォルダのアイテムごとのレーティングキャッシュ (idx → 0..=5)
     pub(crate) rating_cache: std::collections::HashMap<usize, u8>,
     /// ユーザが明示的に set_rating した path (normalize 済みキー) の記録。
@@ -4665,10 +4674,9 @@ pub struct App {
     pub(crate) adjustment_drag_session: Option<AdjustmentDragSession>,
     /// タグ操作の保留 Undo 集計バッファ。`request_tag_*_for_selection` が tx_id を発行し
     /// `PendingTagUndo` を入れ、`poll_tag_write_results` が worker 結果 1 件ごとに
-    /// `TagChange` を accumulate する。完了時に「実 disk の before/after」で構築した
+    /// `TagChange` を accumulate する。完了時に「tags.db の before/after」で構築した
     /// UndoEntry を `meta_undo` に push する。
-    /// これにより外部ツールで XMP が書き換わって tags_cache が stale でも、Undo entry は
-    /// worker が読んだ真の disk 状態を持つので Ctrl+Z 連打で他タグを破壊しない。
+    /// これにより tags_cache が stale でも、Undo entry は worker が読んだ DB 状態を持つ。
     pub(crate) pending_tag_undos: std::collections::HashMap<u64, PendingTagUndo>,
     /// 次に発行するタグ操作の tx_id。0 は「Undo 確定不要」を表す予約値なので 1 から始める。
     pub(crate) next_tag_tx_id: u64,
@@ -5523,6 +5531,7 @@ impl App {
 
         let t = std::time::Instant::now();
         let rating_db = crate::rating_db::RatingDb::open().ok();
+        let tags_db = crate::tags_db::TagsDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_rating", 0, t);
 
         let t = std::time::Instant::now();
@@ -5896,6 +5905,7 @@ impl App {
             video_continuous_last_eof: None,
             video_perf_overlay_visible: false,
             rating_db,
+            tags_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,
             user_set_rating_keys: std::collections::HashSet::new(),
@@ -11090,7 +11100,7 @@ impl App {
         // SQLite を叩かずに済む (大量フォルダで初フレームが詰まるのを防ぐ)。
         let prewarm_t0 = std::time::Instant::now();
         self.prewarm_rating_cache();
-        // タグバッジ用も同様に fts_meta から一括 prewarm (indexed favorite のみ)。
+        // タグバッジ用も同様に tags.db から一括 prewarm。
         self.prewarm_grid_tags();
         self.rebuild_visible_indices();
         if crate::perf::is_enabled() {
@@ -18655,10 +18665,9 @@ impl App {
 
         if ignore != Some(FacetField::Tags) {
             let filter = &self.settings.facet_filter;
-            if !filter.tags.is_empty() || filter.include_untagged {
-                if !facet_item_supports_tags(&item) {
-                    return false;
-                }
+            if (!filter.tags.is_empty() || filter.include_untagged)
+                && facet_tag_filter_applies(&item)
+            {
                 if self.cell_tags_loaded(idx) {
                     let tags = self.cell_tag_list(idx);
                     let untagged_match = filter.include_untagged && tags.is_empty();
@@ -18667,10 +18676,12 @@ impl App {
                     } else {
                         match filter.tag_mode {
                             FacetTagMode::Any => filter.tags.iter().any(|wanted| {
-                                tags.iter().any(|tag| tag.eq_ignore_ascii_case(wanted))
+                                tags.iter()
+                                    .any(|tag| crate::tags_db::normalize_tag_key(tag) == *wanted)
                             }),
                             FacetTagMode::All => filter.tags.iter().all(|wanted| {
-                                tags.iter().any(|tag| tag.eq_ignore_ascii_case(wanted))
+                                tags.iter()
+                                    .any(|tag| crate::tags_db::normalize_tag_key(tag) == *wanted)
                             }),
                         }
                     };
@@ -18739,11 +18750,11 @@ impl App {
                     FacetEditFlag::Annotation => self.comic_pages.contains(&idx),
                     FacetEditFlag::Rotation => !self.get_rotation(idx).is_none(),
                     FacetEditFlag::Tagged => {
-                        facet_item_supports_tags(&item)
+                        item_supports_tags(&item)
                             && (!self.cell_tags_loaded(idx) || !self.cell_tag_list(idx).is_empty())
                     }
                     FacetEditFlag::Untagged => {
-                        facet_item_supports_tags(&item)
+                        item_supports_tags(&item)
                             && (!self.cell_tags_loaded(idx) || self.cell_tag_list(idx).is_empty())
                     }
                     FacetEditFlag::Rated => item.accepts_rating() && stars > 0,
@@ -19178,7 +19189,7 @@ impl App {
         // 引く。ストアごと clone してスレッドへ渡す (decrypt は照合対象 PDF だけ遅延)。
         let pdf_passwords = self.pdf_passwords.clone();
         // INDEX_VERSION=5 で fts_meta から原文 (`*_norm`) が無くなったため、Ctrl+F は
-        // 表示中アイテムを on-demand 経路 (PNG / EXIF / XMP / dc:subject 直読み) で
+        // 表示中アイテムを on-demand 経路 (PNG / EXIF / XMP / 動画メタ) で
         // 判定する。`run_metadata_search` は引数として fts_meta を受け取るが現在は
         // 未使用 (将来 Tantivy STORED への切替路の余地として残してある)。
         let fts_meta_clone: Option<std::sync::Arc<crate::fts_meta::FtsMetaDb>> = self
@@ -20096,13 +20107,10 @@ impl App {
 
     /// グリッドのタグバッジ表示用キャッシュを埋める。フォルダ切替時に 1 回呼ぶ。
     ///
-    /// INDEX_VERSION=5 以降、fts_meta.db からのタグ一括取得は廃止し、XMP 直読みを
-    /// `enqueue_visible_tag_prewarms` に任せる。ここでは空キューの worker だけ用意しておき、
-    /// 以降のフレームで画面付近の idx を逐次 push する。大規模フォルダで全 XMP を
-    /// フォルダ開時に読む暴走を防ぐ。
+    /// タグ正本は `tags.db`。フォルダ切替時に表示中の実パス item だけを一括取得し、
+    /// 未タグ item も空 Vec として載せることで facet の「タグなし」を即判定できる。
     ///
-    /// **重要**: `tags_cache` は `ui_metadata_panel::get_current_tags_cached` とも共有で、
-    /// 値が `Some(Vec)` ならキャッシュヒットとして扱われ XMP 直読みをスキップする。
+    /// rating の opt-in XMP ハイドレーションだけは既存 `tag_prewarm` worker を使う。
     pub(crate) fn prewarm_grid_tags(&mut self) {
         // 旧プリフェッチ (別フォルダの残り) は cancel: 以降の XMP 読みを無駄にしない。
         if let Some(pending) = self.tag_prewarm_pending.take() {
@@ -20110,17 +20118,34 @@ impl App {
         }
         self.tag_prewarm_queued.clear();
 
-        // INDEX_VERSION=5 でタグ原文の SQLite 一括取得は廃止。tag_prewarm worker が
-        // XMP dc:subject を 1 ファイルずつバックグラウンドで読み、`keep_range` 分を
-        // 順次 `tags_cache` に載せる。グリッドのタグバッジは worker 完了後に出る。
+        let mut keys = Vec::new();
+        for item in &self.items {
+            if let Some(path) = tag_item_path(item) {
+                keys.push(crate::tags_db::item_key_for_path(path));
+            }
+        }
+        keys.sort();
+        keys.dedup();
 
-        // worker は常に起動 (非インデックスファイルが 1 枚でもあれば必要になるし、
-        // 空ループで 200ms ごとに timeout する程度なので常駐コストは無視できる)。
-        self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+        if let Some(db) = self.tags_db.as_ref() {
+            let mut loaded = db.get_many_display_tags(&keys);
+            for key in keys {
+                self.tags_cache
+                    .insert(key.clone(), loaded.remove(&key).unwrap_or_default());
+            }
+        } else {
+            for key in keys {
+                self.tags_cache.entry(key).or_default();
+            }
+        }
+
+        if self.settings.write_rating_to_xmp {
+            self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+        }
     }
 
-    /// 毎フレーム呼ぶ: 現在の画面付近にある Image/Video のうち、`tags_cache` にまだ無いものを
-    /// `tag_prewarm` worker に push する。
+    /// 毎フレーム呼ぶ: 現在の画面付近にある Image のうち、rating DB が未登録のものを
+    /// XMP rating hydration worker に push する。
     ///
     /// サムネモードは `keep_set` (可視範囲 + prev/next ページの display list 部分列) を使う。
     /// 詳細モードはサムネ要求抑制のため `keep_set` が空なので、`render_details_list` が
@@ -20163,44 +20188,39 @@ impl App {
                 continue;
             }
             let p = match self.items.get(idx) {
-                Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => p,
+                Some(GridItem::Image(p)) => p,
                 _ => {
-                    // 非 Image/Video (Folder/Zip/Pdf 等) はキャッシュ対象外。
+                    // 非 Image は XMP rating hydration 対象外。
                     self.tag_prewarm_queued.insert(idx);
                     continue;
                 }
             };
-            if !crate::xmp_writer::is_taggable_format(p) {
+            if !crate::xmp_writer::is_writable_format(p) {
                 self.tag_prewarm_queued.insert(idx);
                 continue;
             }
-            let cache_key = crate::adjustment_db::normalize_path(p);
-            // fts_meta / 書き込み worker で既に埋まっていれば push 不要だが idx は処理済み扱い。
-            if self.tags_cache.contains_key(&cache_key) {
-                self.tag_prewarm_queued.insert(idx);
-                continue;
-            }
-            self.tag_prewarm_queued.insert(idx);
             // 設定 ON かつ DB で rating 未登録 (= 0) のときだけ XMP から rating も読んで
             // ハイドレートする。既に DB に値がある場合は XMP 読みを節約。
             let read_rating = self.settings.write_rating_to_xmp
                 && self.rating_cache.get(&idx).copied().unwrap_or(0) == 0;
-            pending.push_job(p.clone(), cache_key, read_rating);
+            if !read_rating {
+                self.tag_prewarm_queued.insert(idx);
+                continue;
+            }
+            self.tag_prewarm_queued.insert(idx);
+            pending.push_job(p.clone(), read_rating);
         }
     }
 
-    /// `tag_prewarm` ワーカーからの XMP プリフェッチ結果を UI スレッドで回収する。
-    /// 既に `tags_cache` にエントリがある path (タグ書き込み worker が先に入れた新鮮な
-    /// 状態 / 同フォルダ内で既に読み終えた path) は上書きしない。
+    /// `tag_prewarm` ワーカーからの XMP rating hydration 結果を UI スレッドで回収する。
     /// 毎フレーム `App::update` から呼ぶ。`on_result_drained` で in_flight を減らし、
     /// 残ジョブがあれば呼び出し側が `request_repaint()` する。
     pub(crate) fn poll_tag_prewarm_results(&mut self) {
         let Some(pending) = self.tag_prewarm_pending.as_ref() else {
             return;
         };
-        // このフレームで届いた分だけ drain (or_insert 挙動は stale XMP 防御)。
+        // このフレームで届いた分だけ drain。
         let mut rating_hydrations: Vec<(PathBuf, u8)> = Vec::new();
-        let mut tags_inserted = false;
         loop {
             match pending.rx.try_recv() {
                 Ok(res) => {
@@ -20210,12 +20230,6 @@ impl App {
                         if stars > 0 {
                             rating_hydrations.push((res.path.clone(), stars));
                         }
-                    }
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        self.tags_cache.entry(res.cache_key)
-                    {
-                        entry.insert(res.tags);
-                        tags_inserted = true;
                     }
                     pending.on_result_drained();
                 }
@@ -20231,15 +20245,6 @@ impl App {
         // 期待するのは DB が 0 = 未登録のときだけ)。
         if !rating_hydrations.is_empty() {
             self.hydrate_ratings_from_xmp(rating_hydrations);
-        }
-        if tags_inserted {
-            if self.settings.facet_filter.uses_tag_state() {
-                self.rebuild_visible_indices();
-            } else if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-                && self.settings.details_sort_key == crate::settings::DetailsSortKey::Tags
-            {
-                self.rebuild_details_order();
-            }
         }
     }
 
@@ -20303,13 +20308,13 @@ impl App {
     }
 
     /// 指定 idx の grid cell に描くタグ列。`tags_cache` のみを引く (同期 I/O を避ける)。
-    /// キャッシュに載っていない = fts_meta 未登録 → 空を返す (バッジ非表示)。
+    /// キャッシュに載っていない = 未ロード → 空を返す (バッジ非表示)。
     pub(crate) fn cell_tag_list(&self, idx: usize) -> &[String] {
-        let p = match self.items.get(idx) {
-            Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => p,
+        let p = match self.items.get(idx).and_then(tag_item_path) {
+            Some(p) => p,
             _ => return &[],
         };
-        let key = crate::adjustment_db::normalize_path(p);
+        let key = crate::tags_db::item_key_for_path(p);
         self.tags_cache
             .get(&key)
             .map(|v| v.as_slice())
@@ -20317,11 +20322,11 @@ impl App {
     }
 
     fn cell_tags_loaded(&self, idx: usize) -> bool {
-        let p = match self.items.get(idx) {
-            Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => p,
+        let p = match self.items.get(idx).and_then(tag_item_path) {
+            Some(p) => p,
             _ => return true,
         };
-        let key = crate::adjustment_db::normalize_path(p);
+        let key = crate::tags_db::item_key_for_path(p);
         self.tags_cache.contains_key(&key)
     }
 
@@ -33955,7 +33960,7 @@ pub(crate) fn draw_cell(
     // Some(tex) なら `ThumbnailState::Loaded.tex` の代わりにこちらを描画する
     // (色調補正済みサムネイルテクスチャ)。None または Loaded 以外なら生サムネ。
     adjusted_tex: Option<&egui::TextureHandle>,
-    // 画像セルに表示する XMP dc:subject 由来のタグ (`#原神` 等)。空なら非表示。
+    // 画像セルに表示する mIV タグ (`#原神` 等)。空なら非表示。
     tags: &[String],
     // コンテナセルに出す「フィルタ一致の子孫件数」。None ならバッジ非表示。
     filter_match_count: Option<u32>,

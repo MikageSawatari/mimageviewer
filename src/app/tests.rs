@@ -2322,6 +2322,34 @@ mod phase_c_drill_nav_tests {
         );
     }
 
+    #[test]
+    fn facet_tag_passthrough_for_folder_still_applies_date_filter() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::settings::FacetDatePreset;
+
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Folder(std::path::PathBuf::from("c:/old/folder")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        let old_mtime = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+            .saturating_sub(FacetDatePreset::Last7Days.seconds() + 1);
+        app.image_metas = vec![Some((old_mtime, 0))];
+
+        app.settings
+            .facet_filter
+            .tags
+            .insert(crate::tags_db::normalize_tag_key("原神"));
+        app.settings.facet_filter.date_preset = Some(FacetDatePreset::Last7Days);
+
+        assert!(
+            !app.passes_facet_filter(0, None),
+            "Folder はタグ次元だけ素通りし、date/size/edit 条件は引き続き適用される"
+        );
+    }
+
     fn run_grid_key(app: &mut super::App, modifiers: egui::Modifiers, key: egui::Key) {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {

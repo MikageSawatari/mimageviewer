@@ -9,7 +9,7 @@
 //! - **Rating**: rating_db のキー (lowercased path) で記録。Undo 時に
 //!   `apply_rating_change_to_app` が DB を直接書き換え、grid 内に該当 idx があれば
 //!   `rating_cache` も同期する。
-//! - **Tag**: パスと `dc:subject` の完全リストで記録。Undo 時は
+//! - **Tag**: パスと mIV タグの完全リストで記録。Undo 時は
 //!   `TagJobKind::SetTags(target)` を worker に積むだけ。worker が単一スレッド + FIFO
 //!   なので、ユーザーの操作順序を超えた race は発生しない (詳細は
 //!   `tag_write_worker.rs` 冒頭参照)。
@@ -18,7 +18,6 @@ use std::path::PathBuf;
 
 use crate::adjustment::AdjustParams;
 use crate::app::App;
-use crate::tag_ops::find_favorite_id;
 use crate::tag_write_worker::{TagJobKind, TagWriteJob};
 use crate::undo_stack::{
     AdjustUndoScope, AdjustmentChange, LocalAdjustmentChange, RatingChange, TagChange, UndoEntry,
@@ -45,7 +44,7 @@ impl App {
     }
 
     /// 1 回のタグ操作 (Toggle / ClearMiv / バルク) を Undo スタックに積む。
-    /// `before == after` (= XMP 書き込みは発生しない見込み) はフィルタ済み。
+    /// `before == after` (= DB 更新しても見た目が変わらない変更) はフィルタ済み。
     pub(crate) fn push_tag_undo_entry(&mut self, changes: Vec<TagChange>, summary: String) {
         let filtered: Vec<TagChange> = changes
             .into_iter()
@@ -502,13 +501,11 @@ impl App {
         };
         for c in changes {
             let target = if use_before { &c.before } else { &c.after };
-            let fav_id = find_favorite_id(&self.settings.favorites, &c.path);
             // tx_id=0 は「Undo entry を pending 経由で確定しない」signal。Undo/Redo の
             // SetTags ジョブ自体は新しい undo entry を生まないので 0 で十分。
             h.submit(TagWriteJob {
                 path: c.path.clone(),
                 kind: TagJobKind::SetTags(target.clone()),
-                favorite_id: fav_id,
                 tx_id: 0,
             });
         }

@@ -1,48 +1,28 @@
-//! タグ書き込みのバックグラウンド worker (docs/tag-feature.md §5.6, INDEX_VERSION=5)。
+//! タグ更新のバックグラウンド worker。
 //!
-//! UI からの「タグ X をトグル」「すべてクリア」要求を受け取り、1 ファイルずつ
-//! シリアルに `xmp_writer::apply_tag_op` を実行する。書き込み成功後は
-//! 既存の Tantivy doc を STORED から読み出して `tags` フィールドだけ差し替え、
-//! 共有 Tantivy writer 経由で index を即時更新する (INDEX_VERSION=5 で原文は
-//! 全部 Tantivy 側に集約されたので、ここで他ソース原文は変更しないことを保つ
-//! 必要がある — `upsert_tags_via_dispatcher` 参照)。
-//!
-//! # Tantivy writer 共有
-//!
-//! Tantivy は 1 Index につき IndexWriter を 1 本しか許さないため、`IndexerManager` が
-//! 保有する `Arc<FtsWriterDispatcher>` を共有して使う。タグ書き込みは
-//! `WriterPriority::Interactive` で submit され、background ingest の sub-batch
-//! 境界で必ず割り込めるので、起動直後の大規模スキャン中でも応答性が保たれる。
+//! UI からの「タグ X を付与/削除」「すべてクリア」要求を受け取り、1 item ずつ
+//! シリアルに `tags.db` を更新する。メディア本体 / XMP サイドカー / Tantivy
+//! には通常タグ操作から書き込まない。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use uuid::Uuid;
-
-use crate::fts_index::{Container, FtsIndex, IndexDoc};
-use crate::fts_meta::FtsMetaDb;
-use crate::fts_writer_dispatcher::{FtsWriterDispatcher, WriterPriority};
-use crate::xmp_writer::{TagOp, WriteError};
-
-/// バッチ commit の閾値 (件数と時間の OR)。ingest_worker の BATCH_FLUSH_COUNT=100 / 5s
-/// よりは小さめ — タグ書き込みは UI 操作から来るので Ctrl+G への反映レイテンシを
-/// 500ms 以内に抑えたい。かつ 100 ファイル一括トグルで commit 1 回に畳まれる。
-const BATCH_FLUSH_COUNT: usize = 32;
-const BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
-
-/// UI が worker に渡す操作。XMP ファイル読み出しを伴う Toggle は worker 側で
-/// Add/Remove に解決するので、UI スレッドは同期 I/O を一切行わなくて済む。
+/// UI が worker に渡す操作。
 #[derive(Debug, Clone)]
 pub enum TagJobKind {
-    /// 現在のタグ状態を worker が XMP から読み出し、含まれていれば Remove、
-    /// 含まれていなければ Add を実行する。
+    /// 現在のタグ状態を worker が tags.db から読み出し、含まれていれば Remove、
+    /// 含まれていなければ Add を実行する。単体操作や旧テスト用。
     Toggle(String),
-    /// `#` で始まる全 Bag 要素を削除。
+    /// 指定タグを付与する。
+    Add(String),
+    /// 指定タグを削除する。
+    Remove(String),
+    /// mIV タグをすべて削除。
     ClearMiv,
-    /// `dc:subject` を指定リストで完全置換する。Undo/Redo で「操作直前の状態」に
+    /// mIV タグを指定リストで完全置換する。Undo/Redo で「操作直前の状態」に
     /// 戻すために使う。Toggle の逆操作だと外部ツールでの書き換え後にズレるが、
     /// この置換ジョブなら mIV が記録した状態へ確実に戻せる。
     SetTags(Vec<String>),
@@ -52,9 +32,6 @@ pub enum TagJobKind {
 pub struct TagWriteJob {
     pub path: PathBuf,
     pub kind: TagJobKind,
-    /// 検索インデックス更新用の favorite_id。None なら Tantivy upsert をスキップ
-    /// (次回 notify-rs re-ingest で反映)。
-    pub favorite_id: Option<Uuid>,
     /// Undo entry を最終確定するための取引 ID。同じ user 操作 (1 トグル / 1 クリア) で
     /// 投入された全ジョブは同じ tx_id を共有し、UI 側の `pending_tag_undos` で
     /// 集計される。0 なら Undo 確定不要 (例: Undo/Redo 由来の SetTags ジョブ自体)。
@@ -71,7 +48,7 @@ pub enum TagAction {
     Removed,
     /// ClearMiv: `#` 始まりの要素をまとめて削除した (1 件以上の削除が発生)。
     Cleared,
-    /// SetTags: Undo/Redo による状態復元で `dc:subject` を置き換えた。
+    /// SetTags: Undo/Redo による状態復元で tags.db のタグ一覧を置き換えた。
     Restored,
     /// 実質変化なし (clear した時に元々空だったケース等)。
     NoOp,
@@ -81,16 +58,13 @@ pub enum TagAction {
 pub struct TagWriteResult {
     pub path: PathBuf,
     pub result: Result<TagAction, String>,
-    /// 書き込み**直前**の dc:subject 一覧 (worker が実ファイルから読み出した値)。
+    /// 更新**直前**の mIV タグ一覧。
     /// Undo entry の `before` を確定させるために使う — UI 側の予測 (= tags_cache)
-    /// が外部ツールの XMP 書き換えで stale になっていた場合でも、ここに入る値が
-    /// 真の disk 状態なので Undo は正しく逆操作を組み立てられる。
-    /// 失敗時 (XMP read 自体は成功して write が失敗するケース) も含めて、worker が
-    /// op を解決するために読み取った値をそのまま入れる。read 自体が失敗した場合は空。
+    /// が stale になっていた場合でも、worker が読んだ DB 状態から Undo を組み立てる。
+    /// 失敗時も worker が op を解決するために読み取った値をそのまま入れる。
     pub tags_before: Vec<String>,
-    /// 書き込み後の dc:subject 一覧 (成功時のみ意味あり、失敗時は空)。
-    /// UI 側はこれを `tags_cache` に直接書き戻すことで、fts_meta に行が無い
-    /// (未インデックス favorite 等) ファイルでもグリッドバッジが即時反映される。
+    /// 更新後の mIV タグ一覧 (成功時のみ意味あり、失敗時は空)。
+    /// UI 側はこれを `tags_cache` に直接書き戻すことでグリッドバッジを即時反映する。
     pub tags_after: Vec<String>,
     /// 投入時のトランザクション ID をエコーバック。`TagWriteJob::tx_id` 参照。
     pub tx_id: u64,
@@ -102,23 +76,15 @@ pub struct TagWriteHandle {
     pub total: Arc<AtomicUsize>,
     pub done: Arc<AtomicUsize>,
     pub failures: Arc<AtomicUsize>,
-    /// Tantivy writer バッファに upsert 済みだが、まだ commit されていない dirty ジョブ数。
-    /// `is_busy()` で「XMP 書き込みは終わったが検索索引にはまだ反映されていない」
-    /// 状態を UI に伝えるのに使う (完了 toast が commit より先に出る race を塞ぐ)。
+    /// 旧 FTS 反映時代の互換フィールド。tags.db 専用化後は常に 0。
     pub pending_in_writer: Arc<AtomicUsize>,
     _thread: Option<std::thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
 }
 
 impl TagWriteHandle {
-    /// worker スレッドを起動する。`writer` は `IndexerManager::clone_shared_writer()` 由来の
-    /// `FtsWriterDispatcher` を渡す。タグ書き込みは `WriterPriority::Interactive` で submit され、
-    /// 並行する indexer の Background batch より先に処理される。
-    pub fn spawn(
-        meta: Arc<FtsMetaDb>,
-        fts: Arc<FtsIndex>,
-        writer: Arc<FtsWriterDispatcher>,
-    ) -> Self {
+    /// worker スレッドを起動する。
+    pub fn spawn() -> Self {
         let (job_tx, job_rx) = unbounded::<TagWriteJob>();
         let (result_tx, result_rx) = unbounded::<TagWriteResult>();
         let total = Arc::new(AtomicUsize::new(0));
@@ -137,9 +103,6 @@ impl TagWriteHandle {
                 run_worker(
                     &job_rx,
                     &result_tx,
-                    meta,
-                    fts,
-                    writer,
                     &w_done,
                     &w_failures,
                     &w_pending,
@@ -169,9 +132,8 @@ impl TagWriteHandle {
         self.result_rx.try_recv().ok()
     }
 
-    /// XMP 書き込みと Tantivy commit の両方が完了するまで busy を維持する。
-    /// `done == total` だけでは commit 前に完了 toast が出て、その直後の Ctrl+G で
-    /// 新タグが見えない race が発生するため、`pending_in_writer > 0` も busy 扱いにする。
+    /// tags.db 更新が完了するまで busy を維持する。
+    /// `pending_in_writer` は旧 FTS 反映時代の互換値で、通常は 0。
     pub fn is_busy(&self) -> bool {
         self.total.load(Ordering::Relaxed) != self.done.load(Ordering::Relaxed)
             || self.pending_in_writer.load(Ordering::Relaxed) > 0
@@ -188,11 +150,8 @@ impl TagWriteHandle {
 
 impl Drop for TagWriteHandle {
     fn drop(&mut self) {
-        // T55 (Codex R-TAG-001 / 2026-05-16): on_exit → App::drop → ここの流れで、
-        // worker が在庫ジョブ (XMP 書き込み + Tantivy commit) を drain し切るのを
-        // 待つ。旧コードは shutdown フラグだけ立てて join せずにスレッドを detach
-        // していたため、終了直前にキューされたタグ変更が永久に失われる事故 (rating
-        // worker 側は既に同パターンで join 済み、不整合) になっていた。
+        // on_exit → App::drop → ここの流れで、worker が在庫ジョブを drain し切るのを待つ。
+        // 終了直前にキューされた tags.db 更新を失わないため、rating worker と同じく join する。
         self.shutdown.store(true, Ordering::Relaxed);
         if let Some(thread) = self._thread.take() {
             let _ = thread.join();
@@ -204,18 +163,18 @@ impl Drop for TagWriteHandle {
 fn run_worker(
     job_rx: &Receiver<TagWriteJob>,
     result_tx: &Sender<TagWriteResult>,
-    meta: Arc<FtsMetaDb>,
-    fts: Arc<FtsIndex>,
-    writer: Arc<FtsWriterDispatcher>,
     done: &Arc<AtomicUsize>,
     failures: &Arc<AtomicUsize>,
     pending_in_writer: &Arc<AtomicUsize>,
     shutdown: &Arc<AtomicBool>,
 ) {
-    // バッチ commit 用の pending カウンタ。N 件溜まったら commit / idle で M ms 経ったら
-    // commit / 終了時に必ず flush。これをやらないと N ファイル一括トグルで N 回 fsync。
-    // `pending_in_writer` は UI 側の `is_busy()` と同期した外部ミラー。
-    let mut last_flush = Instant::now();
+    let mut db = match crate::tags_db::TagsDb::open() {
+        Ok(db) => Some(db),
+        Err(e) => {
+            crate::logger::log(format!("tag_write_worker: tags.db open failed: {e}"));
+            None
+        }
+    };
 
     loop {
         if shutdown.load(Ordering::Relaxed) && job_rx.is_empty() {
@@ -223,33 +182,22 @@ fn run_worker(
         }
         let job = match job_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(j) => j,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if pending_in_writer.load(Ordering::Relaxed) > 0
-                    && last_flush.elapsed() >= BATCH_FLUSH_INTERVAL
-                {
-                    flush_commit(&writer, &fts, pending_in_writer);
-                    last_flush = Instant::now();
-                }
-                continue;
-            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
 
-        let (res, dirtied, tags_before, tags_after) = process_job(&job, &meta, &fts, &writer);
+        let (res, tags_before, tags_after) = match db.as_mut() {
+            Some(db) => process_job(&job, db),
+            None => (
+                Err("tags.db を開けませんでした".to_string()),
+                Vec::new(),
+                Vec::new(),
+            ),
+        };
         if res.is_err() {
             failures.fetch_add(1, Ordering::Relaxed);
         }
-        if dirtied {
-            pending_in_writer.fetch_add(1, Ordering::Relaxed);
-        }
-
-        // Flush 判断は結果通知 + done 更新より **先** に行う (race window 抑制)。
-        // 単発トグルを即反映させるため、キューが空なら閾値未満でも flush。
-        let pending_now = pending_in_writer.load(Ordering::Relaxed);
-        if pending_now >= BATCH_FLUSH_COUNT || (pending_now > 0 && job_rx.is_empty()) {
-            flush_commit(&writer, &fts, pending_in_writer);
-            last_flush = Instant::now();
-        }
+        pending_in_writer.store(0, Ordering::Relaxed);
 
         done.fetch_add(1, Ordering::Relaxed);
         let _ = result_tx.send(TagWriteResult {
@@ -260,191 +208,122 @@ fn run_worker(
             tx_id: job.tx_id,
         });
     }
-    // 終了時に残ピンを flush。
-    flush_commit(&writer, &fts, pending_in_writer);
-}
-
-/// dispatcher 経由で commit + reader reload を依頼する。pending が 0 なら no-op。
-/// dispatcher は Interactive 優先度のジョブを Background より先に処理するので、
-/// indexer の長時間 batch 中でも 1 sub-batch (1〜2 秒) 以内に応答が返る。
-fn flush_commit(writer: &FtsWriterDispatcher, fts: &FtsIndex, pending_in_writer: &AtomicUsize) {
-    if pending_in_writer.load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    let t0 = std::time::Instant::now();
-    let res = writer.commit(true /* reload */, WriterPriority::Interactive);
-    let wait_ms = t0.elapsed().as_millis();
-    if wait_ms > 1000 {
-        crate::logger::log(format!(
-            "[TAG] worker: dispatcher commit took {wait_ms} ms (background ingest in flight?)"
-        ));
-    }
-    if let Err(e) = res {
-        crate::logger::log(format!("tag_write_worker: commit failed: {e}"));
-    }
-    let _ = fts; // reload は dispatcher が行う
-    // Reset after commit attempt. 失敗時も pending は 0 に戻して次回 commit を待つ。
     pending_in_writer.store(0, Ordering::Relaxed);
 }
 
 /// ジョブを 1 件処理する。戻り値は:
-/// - `Result<TagAction, WriteError>`: UI 側トースト用の結果ラベル
-/// - `bool` dirtied: dispatcher に upsert を投げたか (呼び出し側がバッチ commit の pending に使う)
-/// - `Vec<String>` tags_before: write **直前** の dc:subject (Undo entry の `before` に使う)
-/// - `Vec<String>` tags_after: 書き込み後の dc:subject 一覧 (エラー時は空)。UI が
-///   `tags_cache` に直接書き戻して、fts_meta 行の有無に依存せず grid バッジを更新するのに使う。
+/// - `Result<TagAction, String>`: UI 側トースト用の結果ラベル
+/// - `Vec<String>` tags_before: 更新直前の mIV タグ一覧 (Undo entry の `before` に使う)
+/// - `Vec<String>` tags_after: 更新後の mIV タグ一覧 (エラー時は空)。
 fn process_job(
     job: &TagWriteJob,
-    meta: &FtsMetaDb,
-    fts: &FtsIndex,
-    writer: &FtsWriterDispatcher,
-) -> (
-    Result<TagAction, WriteError>,
-    bool,
-    Vec<String>,
-    Vec<String>,
-) {
+    db: &mut crate::tags_db::TagsDb,
+) -> (Result<TagAction, String>, Vec<String>, Vec<String>) {
     let path_disp = job.path.display();
-    // Toggle / ClearMiv / SetTags のいずれも、worker 内でまず実ファイルから dc:subject を
-    // 読み出す。この値が Undo entry の `before` (= write 直前の真の disk 状態) になる。
-    // UI 側 (`tags_cache`) の予測値とは独立に確定するので、外部ツールの XMP 書き換えで
-    // cache が stale な場合でも Undo は正しく逆操作を組み立てられる。
-    let tags_before = crate::xmp_reader::read_dc_subject(&job.path);
+    let item_key = crate::tags_db::item_key_for_path(&job.path);
+    let tags_before = db.display_tags_for_item(&item_key);
 
-    let (op, action) = match &job.kind {
+    let result = match &job.kind {
         TagJobKind::Toggle(name) => {
-            let with_hash = format!("#{name}");
-            let already_has = tags_before.iter().any(|t| *t == with_hash);
-            crate::logger::log(format!(
-                "[TAG] worker: read dc:subject → {tags_before:?} (looking for {with_hash:?}) → {} | {path_disp}",
-                if already_has { "REMOVE" } else { "ADD" }
-            ));
-            if already_has {
-                (TagOp::Remove(with_hash), TagAction::Removed)
-            } else {
-                (TagOp::Add(with_hash), TagAction::Added)
+            let with_hash = crate::tags_db::format_display_tag(name);
+            crate::logger::log(format!("[TAG] worker: toggle {with_hash:?} | {path_disp}"));
+            db.toggle_item_tag(&item_key, name)
+                .map(|(outcome, _before, after)| {
+                    let action = match outcome {
+                        crate::tags_db::TagToggleOutcome::Added => TagAction::Added,
+                        crate::tags_db::TagToggleOutcome::Removed => TagAction::Removed,
+                        crate::tags_db::TagToggleOutcome::NoOp => TagAction::NoOp,
+                    };
+                    (action, after)
+                })
+        }
+        TagJobKind::Add(name) => {
+            let wanted = crate::tags_db::format_display_tag(name);
+            let mut next = tags_before.clone();
+            if !next.iter().any(|tag| tag == &wanted) {
+                next.push(wanted);
             }
+            db.set_item_tags(
+                &item_key,
+                next.iter()
+                    .map(|tag| crate::tags_db::strip_display_hash(tag)),
+                crate::tags_db::source::EDIT,
+            )
+            .map(|after| {
+                let action = if after == tags_before {
+                    TagAction::NoOp
+                } else {
+                    TagAction::Added
+                };
+                (action, after)
+            })
+        }
+        TagJobKind::Remove(name) => {
+            let wanted_key = crate::tags_db::normalize_tag_key(name);
+            let next: Vec<String> = tags_before
+                .iter()
+                .filter(|tag| crate::tags_db::normalize_tag_key(tag) != wanted_key)
+                .cloned()
+                .collect();
+            db.set_item_tags(
+                &item_key,
+                next.iter()
+                    .map(|tag| crate::tags_db::strip_display_hash(tag)),
+                crate::tags_db::source::EDIT,
+            )
+            .map(|after| {
+                let action = if after == tags_before {
+                    TagAction::NoOp
+                } else {
+                    TagAction::Removed
+                };
+                (action, after)
+            })
         }
         TagJobKind::ClearMiv => {
-            let had = tags_before.iter().any(|t| t.starts_with('#'));
-            crate::logger::log(format!(
-                "[TAG] worker: ClearMiv read dc:subject → {tags_before:?} (had #-tags={had}) | {path_disp}"
-            ));
-            (
-                TagOp::ClearMiv,
-                if had {
-                    TagAction::Cleared
-                } else {
-                    TagAction::NoOp
-                },
-            )
+            crate::logger::log(format!("[TAG] worker: clear mIV tags | {path_disp}"));
+            db.clear_item_tags(&item_key)
+                .map(|(changed, _before, after)| {
+                    (
+                        if changed {
+                            TagAction::Cleared
+                        } else {
+                            TagAction::NoOp
+                        },
+                        after,
+                    )
+                })
         }
         TagJobKind::SetTags(target) => {
-            // SetTags は Undo/Redo 経路でしか使わないので、disk が既に target に
-            // 一致していても (変化ゼロでも) `Restored` を返す。`NoOp` を返すと
+            // SetTags は Undo/Redo 経路でしか使わないので、DB が既に target に
+            // 一致していても `Restored` を返す。`NoOp` を返すと
             // tag_ops の `format_completion_toast` で「mIV タグをクリア」誤表示になるため。
-            let changed = tags_before != *target;
             crate::logger::log(format!(
-                "[TAG] worker: SetTags current={tags_before:?} target={target:?} (changed={changed}) | {path_disp}"
+                "[TAG] worker: SetTags current={tags_before:?} target={target:?} | {path_disp}"
             ));
-            (TagOp::Set(target.clone()), TagAction::Restored)
+            db.set_item_tags(
+                &item_key,
+                target
+                    .iter()
+                    .map(|tag| crate::tags_db::strip_display_hash(tag)),
+                crate::tags_db::source::EDIT,
+            )
+            .map(|after| (TagAction::Restored, after))
         }
     };
 
-    let new_tags = match crate::xmp_writer::apply_tag_op(&job.path, &op) {
-        Ok(s) => s,
+    match result {
+        Ok((action, tags_after)) => {
+            crate::logger::log(format!(
+                "[TAG] worker: tags.db update OK, tags_after={tags_after:?} | {path_disp}"
+            ));
+            (Ok(action), tags_before, tags_after)
+        }
         Err(e) => {
             crate::logger::log(format!(
-                "[TAG] worker: apply_tag_op FAILED ({e}) | {path_disp}"
+                "[TAG] worker: tags.db update FAILED ({e}) | {path_disp}"
             ));
-            return (Err(e), false, tags_before, Vec::new());
-        }
-    };
-    crate::logger::log(format!(
-        "[TAG] worker: write OK, new tags column = {new_tags:?} | {path_disp}"
-    ));
-    let tags_after = crate::ingest_text::parse_tags_column(&new_tags);
-
-    // 検索インデックス即時更新 (favorite_id がわかる時だけ)。
-    let dirtied = match job.favorite_id {
-        Some(fav_id) => upsert_tags_via_dispatcher(&job.path, fav_id, &new_tags, meta, fts, writer),
-        None => {
-            crate::logger::log(format!(
-                "[TAG] worker: skip fts upsert (no favorite_id) | {path_disp}"
-            ));
-            false
-        }
-    };
-    (Ok(action), dirtied, tags_before, tags_after)
-}
-
-/// 既存の Tantivy doc から他ソースのテキストを引き継ぎつつ、`tags` フィールドだけ
-/// 差し替えて upsert を依頼する。INDEX_VERSION=5 以降は fts_meta.db に norms が
-/// 無くなったため、原文の取り出しは Tantivy 側 (STORED) から行う。
-///
-/// **two-store 依存**: 管理メタ (kind/mtime/file_size) は fts_meta.db、原文は Tantivy
-/// と分かれているので両方を引く。どちらかが欠けるケース (= ingest 進行中で Tantivy
-/// commit 前) は通常 ingest に任せて何もしない (early return)。
-///
-/// 戻り値 `true`: dispatcher に upsert を投げた (呼び出し側は flush の pending に計上)。
-/// 戻り値 `false`: 変更なし / 該当 doc が Tantivy に未投入 (pending) など、writer に触っていない。
-fn upsert_tags_via_dispatcher(
-    path: &std::path::Path,
-    fav_id: Uuid,
-    new_tags: &str,
-    meta: &FtsMetaDb,
-    fts: &FtsIndex,
-    writer: &FtsWriterDispatcher,
-) -> bool {
-    let key = crate::search_index_db::normalize_path(path);
-    // 管理メタ (kind / mtime / file_size) は fts_meta.db から引く。
-    // 行が無い (未インデックス favorite など) なら notify-rs 経由の再 ingest に任せる。
-    let Ok(Some(row)) = meta.get(&key) else {
-        return false;
-    };
-    // 進行中の ingest (status != Ok) は触らない (Codex P2 指摘):
-    // Pending の間に tag-only upsert を入れると、ingest がまだ commit していない最新原文を
-    // 旧 STORED 値で潰してしまう race を起こす。次回の ingest commit に任せる。
-    if row.status != crate::fts_meta::FileStatus::Ok {
-        return false;
-    }
-    // ingest worker の commit 直後でも reader 反映には遅延があり得るので、
-    // 既存 doc を読む前に明示 reload して最新 commit を含む snapshot を取る。
-    let _ = fts.reload_reader();
-    let searcher = fts.searcher();
-    let addr = match crate::fts_index::find_doc_by_path(&searcher, fts.fields(), &key) {
-        Ok(Some(a)) => a,
-        _ => return false,
-    };
-    let mut norms = match crate::fts_index::doc_per_source_text(&searcher, fts.fields(), addr) {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    if norms.tags == new_tags {
-        return false;
-    }
-    norms.tags = new_tags.to_string();
-    let doc = IndexDoc {
-        path: key,
-        container: Container::Fs,
-        zip_entry: String::new(),
-        favorite_id: fav_id,
-        kind: row.kind,
-        mtime: row.mtime,
-        file_size: row.file_size,
-        norms,
-    };
-    let t0 = std::time::Instant::now();
-    let res = writer.upsert(doc, WriterPriority::Interactive);
-    let wait_ms = t0.elapsed().as_millis();
-    if wait_ms > 1000 {
-        crate::logger::log(format!("[TAG] worker: dispatcher upsert took {wait_ms} ms"));
-    }
-    match res {
-        Ok(()) => true,
-        Err(e) => {
-            crate::logger::log(format!("tag_write_worker: upsert_doc: {e}"));
-            false
+            (Err(e.to_string()), tags_before, Vec::new())
         }
     }
 }
@@ -452,10 +331,6 @@ fn upsert_tags_via_dispatcher(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Toggle ロジックは process_job 内で XMP 読みと直結しているため、
-    // 統合テストは実ファイルが必要。単体テストは apply_tag_op 側 (xmp_writer::tests) で
-    // 網羅してあるので、ここでは API 型の sanity check のみ。
 
     #[test]
     fn job_kinds_clone() {
@@ -467,9 +342,7 @@ mod tests {
         assert!(matches!(j3.clone(), TagJobKind::SetTags(_)));
     }
 
-    /// `is_busy()` は `pending_in_writer > 0` も busy 扱いにする。
-    /// これで「XMP 書き込みは done カウントに反映されたが commit 前」の窓で
-    /// UI が完了 toast を出してしまう race を塞ぐ。
+    /// `is_busy()` は互換フィールド `pending_in_writer > 0` も busy 扱いにする。
     #[test]
     fn is_busy_reflects_pending_in_writer() {
         let total = Arc::new(AtomicUsize::new(1));
@@ -494,10 +367,10 @@ mod tests {
         };
 
         // total == done でも、pending_in_writer > 0 なら busy。
-        assert!(handle.is_busy(), "commit 前は busy を維持する");
+        assert!(handle.is_busy(), "pending が残る間は busy を維持する");
 
-        // commit 後 (pending_in_writer = 0) に busy が下がる。
+        // pending クリア後に busy が下がる。
         pending_in_writer.store(0, Ordering::Relaxed);
-        assert!(!handle.is_busy(), "commit 後は busy=false");
+        assert!(!handle.is_busy(), "pending クリア後は busy=false");
     }
 }

@@ -162,6 +162,7 @@ ndarray = "0.17"
 # mXD (mxdownloader) が埋め込む X/Twitter メタデータは XMP RDF パケットとして
 # JPEG APP1 / PNG iTXt に入っている。quick-xml で xtw:* 名前空間だけ拾う。
 quick-xml = "0.39"
+unicode-normalization = "0.1"
 # URL をブラウザで開くため (「元ツイートを開く」等)。cmd /c start を書くより
 # 安全でクロスプラットフォーム。
 opener = "0.8"

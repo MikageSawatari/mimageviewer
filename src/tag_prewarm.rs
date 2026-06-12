@@ -1,20 +1,16 @@
-//! グリッド表示用 XMP `dc:subject` のバックグラウンドプリフェッチ。
+//! XMP rating hydration 用のバックグラウンドプリフェッチ。
 //!
-//! [`App::prewarm_grid_tags`] は第一段階として `fts_meta.db` からタグ列を一括取得するが、
-//! インデックス未構築のお気に入り / インデックス対象外のフォルダに居るファイルは
-//! そこには載らない (行が無い)。そうしたファイルについては **XMP を直接読む** しか
-//! 手段が無く、UI スレッドで同期読みすると HDD で数百ms〜秒オーダーでブロックする。
+//! 旧タグ機能時代は XMP `dc:subject` もここで読んでいたが、タグ正本は `tags.db` に
+//! 移ったため、この worker は設定 ON 時の `xmp:Rating` 取り込みだけを担当する。
 //!
-//! この worker はそれを背景スレッドに逃がす。結果は `mpsc` で UI に返し、
-//! `App::poll_tag_prewarm_results` が `tags_cache` へ反映する。キャッシュ反映は
-//! `entry().or_insert()` で行うので、タグ書き込み worker が先に載せた最新状態を
-//! stale XMP で踏まないようになっている (書き込み worker → cache 先着 → 背景 XMP 後着)。
+//! UI スレッドで同期読みすると HDD で数百 ms〜秒オーダーでブロックし得るため、
+//! この worker が XMP 読みを背景スレッドへ逃がし、結果を `mpsc` で UI に返す。
 //!
 //! # インクリメンタル投入
 //!
 //! `spawn()` は空キューで worker を起動し、UI が毎フレーム
-//! `App::enqueue_visible_tag_prewarms` から `keep_range` (可視範囲 + prev/next ページ)
-//! 分だけを `push_job` でキューに積む。スクロールに追従して必要な分だけ読むため、
+//! `App::enqueue_visible_tag_prewarms` から可視範囲近傍だけを `push_job` でキューに積む。
+//! スクロールに追従して必要な分だけ読むため、
 //! 大規模フォルダで全 XMP を舐める暴走を避ける。
 //!
 //! # キャンセル
@@ -32,8 +28,9 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, unbounded};
 
 /// バックグラウンド XMP プリフェッチのハンドル。`job_tx` は UI が新規ジョブを push する
-/// ための送信端。`rx` は worker が XMP 読みの結果を返す経路 (`App::poll_tag_prewarm_results`
-/// が drain する)。`in_flight` は push 済みだが UI が drain していないジョブ数。
+/// ための送信端。`rx` は worker が XMP rating 読みの結果を返す経路
+/// (`App::poll_tag_prewarm_results` が drain する)。`in_flight` は push 済みだが
+/// UI が drain していないジョブ数。
 pub(crate) struct TagPrewarmPending {
     cancel: Arc<AtomicBool>,
     job_tx: CbSender<PrewarmJob>,
@@ -51,15 +48,11 @@ impl TagPrewarmPending {
 
     /// ジョブを 1 件キューに追加する。worker が順に処理する。
     /// 重複チェックは UI 側 (`tag_prewarm_queued` HashSet) で済ませる想定。
-    /// `read_rating = true` のとき、worker は同じ XMP パケットから xmp:Rating も抽出して
-    /// `TagPrewarmResult::rating` に載せて返す。
-    pub(crate) fn push_job(&self, path: PathBuf, cache_key: String, read_rating: bool) {
+    /// `read_rating = true` のとき、worker は XMP パケットから xmp:Rating を抽出して
+    /// `TagPrewarmResult::rating` に載せて返す。false は互換用で、rating は None。
+    pub(crate) fn push_job(&self, path: PathBuf, read_rating: bool) {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _ = self.job_tx.send(PrewarmJob {
-            path,
-            cache_key,
-            read_rating,
-        });
+        let _ = self.job_tx.send(PrewarmJob { path, read_rating });
     }
 
     /// UI が 1 件 drain した後に呼ぶ。`is_busy` を下げる。
@@ -76,17 +69,13 @@ impl TagPrewarmPending {
 
 struct PrewarmJob {
     path: PathBuf,
-    cache_key: String,
     read_rating: bool,
 }
 
-/// 1 ファイル分のプリフェッチ結果。`cache_key` は `adjustment_db::normalize_path(path)` 相当
-/// (UI 側 `tags_cache` のキー形式に揃える)。
+/// 1 ファイル分のプリフェッチ結果。
 /// `rating` は設定 ON かつ XMP に xmp:Rating が存在した場合のみ `Some` になる。
 pub(crate) struct TagPrewarmResult {
-    pub cache_key: String,
     pub path: PathBuf,
-    pub tags: Vec<String>,
     pub rating: Option<u8>,
 }
 
@@ -110,28 +99,21 @@ pub(crate) fn spawn() -> TagPrewarmPending {
     }
 }
 
-/// ファイルを 1 回だけ read して、XMP パケットから dc:subject と xmp:Rating の
-/// 両方を抜き出す。`read_dc_subject` と同じ冒頭のマジックバイト判定を踏襲する。
-/// XMP パケット抽出も 1 回で済ませる (各 `read_*_from_bytes` を個別に呼ぶと
-/// JPEG APP1 / PNG iTXt 走査が 2 回走り、10 MB JPEG などで CPU が倍になる)。
-fn read_xmp_tags_and_rating(path: &std::path::Path) -> (Vec<String>, Option<u8>) {
-    // 動画はファイル本体に XMP を埋めずサイドカー (.xmp) を使う方式。
-    // タグだけ sidecar から取り、rating は対象外 (動画 rating は本タスクのスコープ外)。
+/// ファイルを 1 回だけ read して、XMP パケットから xmp:Rating を抜き出す。
+fn read_xmp_rating(path: &std::path::Path) -> Option<u8> {
     if crate::xmp_writer::is_video_for_sidecar(path) {
-        return (crate::xmp_reader::read_dc_subject(path), None);
+        return None;
     }
     let Ok(bytes) = std::fs::read(path) else {
-        return (Vec::new(), None);
+        return None;
     };
     if !crate::xmp_reader::has_xmp_capable_magic(&bytes) {
-        return (Vec::new(), None);
+        return None;
     }
     let Some(xmp) = crate::xmp_reader::extract_xmp_packet(&bytes) else {
-        return (Vec::new(), None);
+        return None;
     };
-    let tags = crate::xmp_reader::parse_dc_subject(&xmp);
-    let rating = crate::xmp_reader::parse_xmp_rating(&xmp);
-    (tags, rating)
+    crate::xmp_reader::parse_xmp_rating(&xmp)
 }
 
 fn run_worker(
@@ -148,21 +130,17 @@ fn run_worker(
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                // 設定 ON のときはファイルを 1 回だけ open して dc:subject と xmp:Rating を
-                // 同じ XMP パケットから抜く。I/O コストは従来のタグ読み 1 回と変わらない。
-                let (tags, rating) = if job.read_rating {
-                    read_xmp_tags_and_rating(&job.path)
+                let rating = if job.read_rating {
+                    read_xmp_rating(&job.path)
                 } else {
-                    (crate::xmp_reader::read_dc_subject(&job.path), None)
+                    None
                 };
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
                 if result_tx
                     .send(TagPrewarmResult {
-                        cache_key: job.cache_key,
                         path: job.path,
-                        tags,
                         rating,
                     })
                     .is_err()
@@ -181,22 +159,16 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// 存在しないパスを push しても worker は空タグで結果を返し、エラーにならないこと。
-    /// (read_dc_subject は read 失敗で Vec::new() を返す設計)
+    /// 存在しないパスを push しても worker は rating=None で結果を返し、エラーにならないこと。
     #[test]
-    fn returns_empty_tags_for_nonexistent_path() {
+    fn returns_empty_rating_for_nonexistent_path() {
         let pending = spawn();
-        pending.push_job(
-            PathBuf::from("Z:/does/not/exist.jpg"),
-            "key1".to_string(),
-            false,
-        );
+        pending.push_job(PathBuf::from("Z:/does/not/exist.jpg"), false);
         let start = Instant::now();
         loop {
             match pending.rx.try_recv() {
                 Ok(res) => {
-                    assert_eq!(res.cache_key, "key1");
-                    assert!(res.tags.is_empty());
+                    assert_eq!(res.rating, None);
                     return;
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -217,7 +189,7 @@ mod tests {
         let pending = spawn();
         assert!(!pending.is_busy(), "初期状態は idle");
 
-        pending.push_job(PathBuf::from("Z:/nope/a.jpg"), "ka".to_string(), false);
+        pending.push_job(PathBuf::from("Z:/nope/a.jpg"), false);
         assert!(pending.is_busy(), "push 直後は busy");
 
         // worker が送ってくるのを受け取り、on_result_drained で in_flight を戻す
@@ -245,11 +217,7 @@ mod tests {
     fn cancel_stops_worker_loop() {
         let pending = spawn();
         for i in 0..1000 {
-            pending.push_job(
-                PathBuf::from(format!("Z:/nope/{i}.jpg")),
-                format!("k{i}"),
-                false,
-            );
+            pending.push_job(PathBuf::from(format!("Z:/nope/{i}.jpg")), false);
         }
         pending.cancel();
         drop(pending);

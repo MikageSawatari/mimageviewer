@@ -858,7 +858,7 @@ impl App {
 
                 // タグメニュー (docs/tag-feature.md §4.2)
                 let response = ui.menu_button("タグ", |ui| {
-                    if ui.button("タグを編集…").clicked() {
+                    if ui.button("タグの管理…").clicked() {
                         self.open_tag_editor();
                         ui.close();
                     }
@@ -869,23 +869,26 @@ impl App {
                         .add_enabled(
                             has_target,
                             egui::Button::new(format!(
-                                "選択中のファイルから mIV タグをクリア ({selection_count})"
+                                "選択中の項目からタグをクリア ({selection_count})"
                             )),
                         )
-                        .hover_tip(
-                            "`#` で始まる dc:subject 要素のみ削除します。\n\
-                             他ソフトで付けたタグ (#なし) は触りません。",
-                        )
+                        .hover_tip("mIV 内のタグだけを削除します。")
                         .clicked()
                     {
                         self.request_tag_clear_for_selection();
                         ui.close();
                     }
                     ui.separator();
-                    if self.settings.tags.is_empty() {
-                        ui.label(egui::RichText::new("（タグが未登録）").weak());
+                    let tags_snapshot: Vec<_> = self
+                        .settings
+                        .tags
+                        .iter()
+                        .filter(|tag| tag.show_shortcut)
+                        .cloned()
+                        .collect();
+                    if tags_snapshot.is_empty() {
+                        ui.label(egui::RichText::new("（ピン留めタグなし）").weak());
                     } else {
-                        let tags_snapshot = self.settings.tags.clone();
                         for tag in &tags_snapshot {
                             let label = format!("#{}", tag.name);
                             let btn = egui::Button::new(label);
@@ -1678,19 +1681,20 @@ impl App {
                 }
 
                 // タグセクション (docs/tag-feature.md §4.3)
-                if self.settings.show_toolbar_tags && !self.settings.tags.is_empty() {
+                let toolbar_tags: Vec<_> = self
+                    .settings
+                    .tags
+                    .iter()
+                    .filter(|tag| tag.show_shortcut)
+                    .map(|t| t.name.clone())
+                    .collect();
+                if self.settings.show_toolbar_tags && !toolbar_tags.is_empty() {
                     if !first_section {
                         ui.separator();
                     }
                     toolbar_label(ui, "タグ:", 42.0);
                     let has_target = self.tag_target_path_count() > 0;
-                    let tags_snapshot: Vec<_> = self
-                        .settings
-                        .tags
-                        .iter()
-                        .map(|t| t.name.clone())
-                        .collect();
-                    for name in tags_snapshot {
+                    for name in toolbar_tags {
                         let label = format!("#{name}");
                         let resp = ui.add_enabled(has_target, egui::Button::new(label));
                         if resp.clicked() {
@@ -1970,6 +1974,19 @@ impl App {
         ui.menu_button(facet_menu_label("タグ", active), |ui| {
             prepare_facet_menu_popup(ui);
             let (mut counts, untagged_count) = self.facet_tag_counts();
+            let display_names: std::collections::BTreeMap<String, String> = self
+                .settings
+                .tags
+                .iter()
+                .map(|tag| (tag.tag_key.clone(), tag.name.clone()))
+                .collect();
+            let shortcut_keys: std::collections::BTreeSet<String> = self
+                .settings
+                .tags
+                .iter()
+                .filter(|tag| tag.show_shortcut)
+                .map(|tag| tag.tag_key.clone())
+                .collect();
             for tag in &self.settings.facet_filter.tags {
                 counts.entry(tag.clone()).or_insert(0);
             }
@@ -2016,14 +2033,23 @@ impl App {
             if counts.is_empty() {
                 ui.label("タグ候補なし");
             }
-            for (tag, count) in counts {
-                let mut selected = self.settings.facet_filter.tags.contains(&tag);
-                let text = format!("{tag} ({count})");
+            for (tag_key, count) in counts {
+                if !shortcut_keys.contains(&tag_key)
+                    && !self.settings.facet_filter.tags.contains(&tag_key)
+                {
+                    continue;
+                }
+                let mut selected = self.settings.facet_filter.tags.contains(&tag_key);
+                let display = display_names
+                    .get(&tag_key)
+                    .cloned()
+                    .unwrap_or_else(|| tag_key.clone());
+                let text = format!("#{} ({count})", display);
                 if ui.checkbox(&mut selected, text).changed() {
                     if selected {
-                        self.settings.facet_filter.tags.insert(tag);
+                        self.settings.facet_filter.tags.insert(tag_key);
                     } else {
-                        self.settings.facet_filter.tags.remove(&tag);
+                        self.settings.facet_filter.tags.remove(&tag_key);
                     }
                     changed = true;
                 }
@@ -2136,7 +2162,26 @@ impl App {
             facet_chip(ui, format!("★:{values}"));
         }
         if !filter.tags.is_empty() || filter.include_untagged {
-            let mut parts = filter.tags.iter().take(3).cloned().collect::<Vec<_>>();
+            let display_names: std::collections::BTreeMap<&str, &str> = self
+                .settings
+                .tags
+                .iter()
+                .map(|tag| (tag.tag_key.as_str(), tag.name.as_str()))
+                .collect();
+            let mut parts = filter
+                .tags
+                .iter()
+                .take(3)
+                .map(|tag_key| {
+                    format!(
+                        "#{}",
+                        display_names
+                            .get(tag_key.as_str())
+                            .copied()
+                            .unwrap_or(tag_key.as_str())
+                    )
+                })
+                .collect::<Vec<_>>();
             if filter.include_untagged {
                 parts.push("タグなし".to_string());
             }
@@ -2194,7 +2239,14 @@ impl App {
             let Some(kind) = self.facet_item_kind(idx) else {
                 continue;
             };
-            if !matches!(kind, FacetItemKind::Image | FacetItemKind::Video) {
+            if !matches!(
+                kind,
+                FacetItemKind::Image
+                    | FacetItemKind::Video
+                    | FacetItemKind::Zip
+                    | FacetItemKind::Pdf
+                    | FacetItemKind::Archive
+            ) {
                 continue;
             }
             let tags = self.cell_tag_list(idx);
@@ -2202,7 +2254,10 @@ impl App {
                 untagged += 1;
             } else {
                 for tag in tags {
-                    *counts.entry(tag.clone()).or_insert(0) += 1;
+                    let tag_key = crate::tags_db::normalize_tag_key(tag);
+                    if !tag_key.is_empty() {
+                        *counts.entry(tag_key).or_insert(0) += 1;
+                    }
                 }
             }
         }
@@ -2780,53 +2835,6 @@ impl App {
                     // フォーカスを外してカーソルキーでグリッド操作できるようにする
                     response.surrender_focus();
                     self.search_has_focus = false;
-                }
-
-                // タグピッカー (Ctrl+G と同じ UI、docs/tag-feature.md Phase D)
-                // 登録済みタグを一覧からワンクリックで `#タグ名` として検索クエリに追記する。
-                // ZIP 表示中は検索対象がファイル名固定で `#タグ` が機能しないため
-                // ターゲット dropdown と同様に disabled にする。
-                let tags_snapshot = self.settings.tags.clone();
-                if zip_view {
-                    ui.add_enabled(false, egui::Button::new("# タグ…"))
-                        .on_disabled_hover_text(
-                            "ZIP 内の表示中はファイル名フィルタ固定のため、\n\
-                             タグ検索は利用できません。",
-                        );
-                } else if tags_snapshot.is_empty() {
-                    ui.add_enabled(false, egui::Button::new("# タグ…"))
-                        .on_disabled_hover_text(
-                            "メニュー「タグ」→「タグを編集…」から先にタグを\n\
-                             登録すると、ここから選択できるようになります。",
-                        );
-                } else {
-                    ui.menu_button("# タグ…", |ui| {
-                        ui.set_min_width(160.0);
-                        for t in &tags_snapshot {
-                            let already_in_query = crate::global_search_ui::query_contains_tag(
-                                &self.search_query,
-                                &t.name,
-                            );
-                            let label = if already_in_query {
-                                format!("✓ #{}", t.name)
-                            } else {
-                                format!("  #{}", t.name)
-                            };
-                            if ui.button(label).clicked() {
-                                if !already_in_query {
-                                    crate::global_search_ui::append_tag_to_query(
-                                        &mut self.search_query,
-                                        &t.name,
-                                    );
-                                    // ターゲット変更時と同じく即再検索する。
-                                    if !self.search_query.trim().is_empty() {
-                                        self.execute_search();
-                                    }
-                                }
-                                ui.close();
-                            }
-                        }
-                    });
                 }
 
                 // × ボタン

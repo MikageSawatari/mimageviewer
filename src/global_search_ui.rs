@@ -101,6 +101,7 @@ impl TargetChoice {
     pub fn from_target(t: &SearchTarget) -> Self {
         match t {
             SearchTarget::All => TargetChoice::All,
+            SearchTarget::Only(v) if v.len() == 1 && v[0] == SourceKind::Tags => TargetChoice::All,
             SearchTarget::Only(v) if v.len() == 1 => TargetChoice::Only(v[0]),
             // 複数選択は v1 UI ではサポートしない (内部表現としては可能)。All にフォールバック。
             SearchTarget::Only(_) => TargetChoice::All,
@@ -117,7 +118,6 @@ pub const TARGET_CHOICES: &[TargetChoice] = &[
     TargetChoice::Only(SourceKind::PngPrompt),
     TargetChoice::Only(SourceKind::PdfMeta),
     TargetChoice::Only(SourceKind::VideoMeta),
-    TargetChoice::Only(SourceKind::Tags),
     TargetChoice::Only(SourceKind::Sidecar),
 ];
 
@@ -2098,7 +2098,7 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.label("アイテム検索:").on_hover_text(
                     "Ctrl+G はお気に入りの「アイテム索引」を使い、画像 / PDF / 動画を\n\
-                     ファイル名・タグ・EXIF・AI プロンプト等で横断検索します。\n\
+                     ファイル名・EXIF・AI プロンプト等で横断検索します。\n\
                      アイテム索引が作成されていないお気に入りは対象になりません。\n\
                      お気に入り編集で「アイテムを索引化する」を有効にしてください。",
                 );
@@ -2124,37 +2124,6 @@ impl App {
                 if response.lost_focus() && raw_enter {
                     query_changed = true;
                 }
-                // タグピッカー (docs/tag-feature.md Phase D)
-                // 登録済みタグを一覧からワンクリックで `#タグ名` として検索クエリに追記する
-                let tags_snapshot = self.settings.tags.clone();
-                if tags_snapshot.is_empty() {
-                    ui.add_enabled(false, egui::Button::new("# タグ…"))
-                        .on_hover_text(
-                            "メニュー「タグ」→「タグを編集…」から先にタグを\n\
-                             登録すると、ここから選択できるようになります。",
-                        );
-                } else {
-                    ui.menu_button("# タグ…", |ui| {
-                        ui.set_min_width(160.0);
-                        for t in &tags_snapshot {
-                            let already_in_query =
-                                query_contains_tag(&self.global_search.query, &t.name);
-                            let label = if already_in_query {
-                                format!("✓ #{}", t.name)
-                            } else {
-                                format!("  #{}", t.name)
-                            };
-                            if ui.button(label).clicked() {
-                                if !already_in_query {
-                                    append_tag_to_query(&mut self.global_search.query, &t.name);
-                                    query_changed = true;
-                                }
-                                ui.close();
-                            }
-                        }
-                    });
-                }
-
                 if ui.small_button("×").on_hover_text("検索を閉じる").clicked() {
                     close_requested = true;
                 }
@@ -2414,42 +2383,6 @@ impl App {
             // 集約トグルの切替は items を作り直すだけ (クエリ再実行不要)。
             self.rebuild_items_from_global_search();
         }
-    }
-}
-
-// -----------------------------------------------------------------------
-// タグピッカー用ヘルパー (docs/tag-feature.md Phase D)
-// -----------------------------------------------------------------------
-
-/// 検索クエリに `#tag` トークンが既に含まれているか (完全一致、空白境界必須)。
-/// 大文字小文字は無視する (search_query::parse の小文字化と整合)。
-pub(crate) fn query_contains_tag(query: &str, tag_name: &str) -> bool {
-    let needle = format!("#{}", tag_name).to_lowercase();
-    for tok in query.split_whitespace() {
-        // クォート除外の簡易判定: 完全一致だけ見る
-        let t = tok.trim_start_matches('-').to_lowercase();
-        if t == needle {
-            return true;
-        }
-    }
-    false
-}
-
-/// クエリ末尾に `#tag_name` を追加 (前に空白を 1 個挟む)。
-/// クエリが空なら先頭にそのまま置く。
-pub(crate) fn append_tag_to_query(query: &mut String, tag_name: &str) {
-    let trimmed_end = query.trim_end();
-    if trimmed_end.is_empty() {
-        query.clear();
-        query.push('#');
-        query.push_str(tag_name);
-    } else {
-        // 末尾の余分な空白は保ちつつ 1 文字空白で区切る
-        if !query.ends_with(' ') {
-            query.push(' ');
-        }
-        query.push('#');
-        query.push_str(tag_name);
     }
 }
 
@@ -3222,48 +3155,6 @@ mod tests {
             "img.jpg"
         );
         assert_eq!(k2, expected);
-    }
-
-    // ---- タグピッカーヘルパー (Phase D) ----
-
-    #[test]
-    fn append_tag_to_empty_query() {
-        let mut q = String::new();
-        append_tag_to_query(&mut q, "原神");
-        assert_eq!(q, "#原神");
-    }
-
-    #[test]
-    fn append_tag_to_nonempty_query() {
-        let mut q = String::from("写真");
-        append_tag_to_query(&mut q, "原神");
-        assert_eq!(q, "写真 #原神");
-    }
-
-    #[test]
-    fn append_tag_preserves_trailing_space() {
-        let mut q = String::from("写真 ");
-        append_tag_to_query(&mut q, "原神");
-        assert_eq!(q, "写真 #原神");
-    }
-
-    #[test]
-    fn query_contains_exact_tag_match() {
-        assert!(query_contains_tag("#原神 #風景", "原神"));
-        assert!(query_contains_tag("写真 #原神", "原神"));
-        assert!(query_contains_tag("-#原神", "原神")); // 除外形式でも検出 (重複防止のため)
-    }
-
-    #[test]
-    fn query_contains_rejects_substring() {
-        // #原 は #原神 の一部だが、別のタグ扱い
-        assert!(!query_contains_tag("#原神", "原"));
-    }
-
-    #[test]
-    fn query_contains_case_insensitive() {
-        assert!(query_contains_tag("#HELLO", "hello"));
-        assert!(query_contains_tag("#hello", "HELLO"));
     }
 
     /// Ctrl+G ストリーミング rebuild でサムネを使い回せるよう、
