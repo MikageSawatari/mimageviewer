@@ -94,7 +94,7 @@
             <td><kbd>Ctrl</kbd>+<kbd>T</kbd></td>
             <td><strong>タグビュー</strong></td>
             <td><strong>mIV タグ付き項目</strong></td>
-            <td><code>tags.db</code> に保存された mIV タグ</td>
+            <td>アプリ内カタログに保存された mIV タグ</td>
             <td>タグから画像・動画・フォルダ・ZIP/PDF を探す</td>
           </tr>
         </tbody>
@@ -206,13 +206,13 @@
     <p>Ctrl+F と Ctrl+S にはこの制約はありません (直接文字列一致のため短いトークンでも動きます)。</p>
 
     <h3>タグ候補への橋渡し</h3>
-    <p>mIV タグは Ctrl+G の全文検索結果には混ぜませんが、入力した語が <code>tags.db</code> のタグ名と
+    <p>mIV タグは Ctrl+G の全文検索結果には混ぜませんが、入力した語が mIV タグ名と
     一致または前方一致すると、検索バーの下に「タグ候補」が表示されます。候補ボタンを押すと、
     そのタグの <kbd>Ctrl</kbd>+<kbd>T</kbd> タグビューを開けます。</p>
 
     <h2 id="ctrl-t">5. Ctrl+T: タグビュー</h2>
-    <p><kbd>Ctrl</kbd>+<kbd>T</kbd> で、mImageViewer 内部の <code>tags.db</code> に保存されたタグから項目を探します。
-    タグはファイル本体や XMP には書き込まれず、Ctrl+F / Ctrl+G の全文検索インデックスにも投影されません。
+    <p><kbd>Ctrl</kbd>+<kbd>T</kbd> で、mImageViewer 内部のカタログに保存されたタグから項目を探します。
+    タグはファイル本体や XMP には書き込まれず、Ctrl+F / Ctrl+G の全文検索には含まれません。
     タグを探すときはこのタグビュー、またはグリッドのスマートフィルタのタグ欄を使います。</p>
     <ul>
       <li>空欄では登録済みタグの一覧を表示します。</li>

@@ -52,7 +52,7 @@
     <h1 class="page-title">タグ機能</h1>
     <p class="page-desc">
       画像・動画・フォルダ・ZIP/PDF・対応アーカイブに「#原神」「#風景」のような
-      mIV 内タグを付けて分類できる機能です。タグは専用の <code>tags.db</code> に保存され、
+      mIV 内タグを付けて分類できる機能です。タグは mImageViewer 内部のカタログに保存され、
       ファイル本体や XMP メタデータは書き換えません。
     </p>
 
@@ -60,8 +60,8 @@
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
         タグは mImageViewer 内部のカタログに保存される非破壊データです。Lightroom など他ソフトの
-        キーワードとは同期しません。旧バージョンや外部ソフトの <code>#</code> 付き XMP タグは初回起動時に
-        <code>tags.db</code> へ移行されます。
+        キーワードとは同期しません。旧バージョンや外部ソフトのキーワード欄にある <code>#</code> 付きタグは、
+        初回起動時にアプリ内カタログへ移行されます。
       </div>
     </div>
 
@@ -113,7 +113,7 @@
     <h3>タグをすべてクリア</h3>
     <p>メニュー「タグ」→「選択中の項目からタグをクリア (N)」で、選択対象の mIV タグをまとめて削除します。</p>
     <ul>
-      <li>削除されるのは <code>tags.db</code> 内の mIV タグだけです。</li>
+      <li>削除されるのはアプリ内カタログの mIV タグだけです。</li>
       <li>画像ファイル本体・XMP・他ソフトのキーワードは変更しません。</li>
     </ul>
 
@@ -144,7 +144,7 @@
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        グリッドのタグバッジは <code>tags.db</code> から読み込まれます。お気に入り登録や検索索引の ON/OFF には依存しません。
+        グリッドのタグバッジはアプリ内カタログから読み込まれます。お気に入り登録や検索索引の ON/OFF には依存しません。
       </div>
     </div>
 
@@ -165,10 +165,10 @@
     </ul>
 
     <h2 id="compatibility">6. 他ソフトとの互換性</h2>
-    <p>現在の mIV タグは mImageViewer 専用の <code>tags.db</code> に保存します。Lightroom・Bridge・ExifTool
+    <p>現在の mIV タグは mImageViewer 専用のカタログに保存します。Lightroom・Bridge・ExifTool
     などの外部キーワード欄へ自動書き込みは行いません。</p>
-    <p>旧バージョンや他ソフトが XMP <code>dc:subject</code> に保存した <code>#</code> 付きタグは、
-    初回起動時に <code>tags.db</code> へ移行されます。移行後の編集は mIV 内タグとして扱われ、外部ファイルには書き戻しません。</p>
+    <p>旧バージョンや他ソフトのキーワード欄に保存されていた <code>#</code> 付きタグは、
+    初回起動時にアプリ内カタログへ移行されます。移行後の編集は mIV 内タグとして扱われ、外部ファイルには書き戻しません。</p>
 
     <div class="box info">
       <span class="box-icon">ℹ️</span>
@@ -189,7 +189,7 @@
       <span class="box-icon">⚠️</span>
       <div class="box-body">
         <strong>ファイル本体は書き換えません:</strong>
-        タグ付与・削除は <code>tags.db</code> の更新です。元画像や動画、ZIP/PDF は変更されません。
+        タグ付与・削除は mImageViewer 内部のカタログ更新です。元画像や動画、ZIP/PDF は変更されません。
       </div>
     </div>
 
@@ -214,9 +214,9 @@
     出ます。</p>
 
     <h2 id="search-index">8. 検索インデックスとの関係</h2>
-    <p>mIV タグは Ctrl+F / Ctrl+G の全文検索インデックスには投影しません。タグを探すときは
+    <p>mIV タグは Ctrl+F / Ctrl+G の全文検索には含めません。タグを探すときは
     <kbd>Ctrl</kbd>+<kbd>T</kbd> のタグビュー、またはスマートフィルタのタグ欄を使います。</p>
-    <p>タグビューは <code>tags.db</code> を直接読むため、お気に入り登録やアイテム索引の ON/OFF に依存せず、タグ編集後すぐに反映されます。</p>
+    <p>タグビューはアプリ内カタログを直接読むため、お気に入り登録やアイテム索引の ON/OFF に依存せず、タグ編集後すぐに反映されます。</p>
 
     <div class="box info">
       <span class="box-icon">ℹ️</span>

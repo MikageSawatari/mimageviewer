@@ -34937,16 +34937,93 @@ fn draw_filter_match_badge(painter: &egui::Painter, cell_rect: egui::Rect, count
     painter.galley(text_pos, galley, egui::Color32::WHITE);
 }
 
-/// サムネイル左上 (補/消 バッジの右隣) にタグ (`#xxx #yyy`) を 1 つの緑バッジで描画する。
-/// 幅は `painter.layout_no_wrap` で実測するので CJK / 絵文字でも正確に収まる。
-/// `start.x` 以降、`max_x` まで使えるので、`max_x - start.x` を超える分は文字単位で削って
-/// 末尾を `…` にする。空配列の呼び出しは `draw_cell` 側で弾かれている前提。
-fn draw_tag_badges(painter: &egui::Painter, start: egui::Pos2, max_x: f32, tags: &[String]) {
+pub(crate) fn primary_grid_tag_for_badge(tags: &[String]) -> Option<&str> {
+    tags.iter()
+        .find(|tag| tag.starts_with('#'))
+        .or_else(|| tags.first())
+        .map(String::as_str)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grid_tag_badge_hit_rect(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    has_page_override: bool,
+    has_local_adjust: bool,
+    has_mask: bool,
+    has_conceal: bool,
+    has_comic: bool,
+    has_pin: bool,
+    tags: &[String],
+) -> Option<egui::Rect> {
+    if tags.is_empty() {
+        return None;
+    }
+    let painter = ui.painter();
+    let start = grid_tag_badge_start(
+        painter,
+        rect,
+        has_page_override,
+        has_local_adjust,
+        has_mask,
+        has_conceal,
+        has_comic,
+        has_pin,
+    );
+    let max_x = rect.max.x - 28.0;
+    layout_tag_badge(painter, start, max_x, tags).map(|(rect, _, _)| rect)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grid_tag_badge_start(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    has_page_override: bool,
+    has_local_adjust: bool,
+    has_mask: bool,
+    has_conceal: bool,
+    has_comic: bool,
+    has_pin: bool,
+) -> egui::Pos2 {
+    let font = egui::FontId::proportional(11.0);
+    let pad_x = 4.0;
+    let mut x = rect.min.x + 3.0;
+    let advance = |x: &mut f32, glyph: &str, fg: egui::Color32, painter: &egui::Painter| {
+        let galley = painter.layout_no_wrap(glyph.to_string(), font.clone(), fg);
+        *x += galley.size().x + pad_x * 2.0 + 2.0;
+    };
+    if has_page_override {
+        advance(&mut x, "補", egui::Color32::WHITE, painter);
+    }
+    if has_local_adjust {
+        advance(&mut x, "レ", egui::Color32::WHITE, painter);
+    }
+    if has_mask {
+        advance(&mut x, "消", egui::Color32::WHITE, painter);
+    }
+    if has_conceal {
+        advance(&mut x, "隠", egui::Color32::WHITE, painter);
+    }
+    if has_comic {
+        advance(&mut x, "文", egui::Color32::WHITE, painter);
+    }
+    if has_pin {
+        advance(&mut x, "📌", egui::Color32::from_rgb(60, 40, 10), painter);
+    }
+    egui::pos2(x, rect.min.y + 3.0)
+}
+
+fn layout_tag_badge(
+    painter: &egui::Painter,
+    start: egui::Pos2,
+    max_x: f32,
+    tags: &[String],
+) -> Option<(egui::Rect, std::sync::Arc<egui::Galley>, egui::Color32)> {
     let font = egui::FontId::proportional(11.0);
     let pad_x = 5.0;
     let max_text_w = (max_x - start.x - pad_x * 2.0).max(0.0);
     if max_text_w < 8.0 {
-        return; // 領域不足 → 表示諦め
+        return None; // 領域不足 → 表示諦め
     }
     // `#` 始まり (mIV 付与) を優先、続いて他ソフト由来の裸タグを並べる。
     let mut combined = String::new();
@@ -34963,7 +35040,7 @@ fn draw_tag_badges(painter: &egui::Painter, start: egui::Pos2, max_x: f32, tags:
         combined.push_str(t);
     }
     if combined.is_empty() {
-        return;
+        return None;
     }
 
     // 実測ベースで省略する。CJK は 1 文字 ≒ 11px、ASCII は ≒ 6px と幅が大きく違うので、
@@ -34985,7 +35062,7 @@ fn draw_tag_badges(painter: &egui::Painter, start: egui::Pos2, max_x: f32, tags:
         if galley.size().x > max_text_w {
             galley = painter.layout_no_wrap("…".to_string(), font.clone(), text_color);
             if galley.size().x > max_text_w {
-                return;
+                return None;
             }
         }
     }
@@ -34995,11 +35072,23 @@ fn draw_tag_badges(painter: &egui::Painter, start: egui::Pos2, max_x: f32, tags:
     // 中央寄せのオフセットが負になって文字がバッジ上端より上にはみ出していた。
     let bg_h = galley.size().y + BADGE_TEXT_TOP_PAD + BADGE_TEXT_BOTTOM_PAD;
     let bg_rect = egui::Rect::from_min_size(start, egui::vec2(bg_w, bg_h));
+    Some((bg_rect, galley, text_color))
+}
+
+/// サムネイル左上 (補/消 バッジの右隣) にタグ (`#xxx #yyy`) を 1 つの緑バッジで描画する。
+/// 幅は `painter.layout_no_wrap` で実測するので CJK / 絵文字でも正確に収まる。
+/// `start.x` 以降、`max_x` まで使えるので、`max_x - start.x` を超える分は文字単位で削って
+/// 末尾を `…` にする。空配列の呼び出しは `draw_cell` 側で弾かれている前提。
+fn draw_tag_badges(painter: &egui::Painter, start: egui::Pos2, max_x: f32, tags: &[String]) {
+    let Some((bg_rect, galley, text_color)) = layout_tag_badge(painter, start, max_x, tags) else {
+        return;
+    };
     painter.rect_filled(
         bg_rect,
         3.0,
         egui::Color32::from_rgba_unmultiplied(0, 40, 20, 170),
     );
+    let pad_x = 5.0;
     let text_pos = bg_rect.left_top() + egui::vec2(pad_x, BADGE_TEXT_TOP_PAD);
     painter.galley(text_pos, galley, text_color);
 }

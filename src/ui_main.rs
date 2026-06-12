@@ -3306,6 +3306,13 @@ impl App {
         if response.clicked() || response.double_clicked() || response.secondary_clicked() {
             self.folder_pane.set_focus_grid();
         }
+        if response.clicked()
+            && !ctx.input(|i| i.modifiers.ctrl || i.modifiers.shift)
+            && let Some(tag_name) = self.clicked_grid_tag_badge(ui, cell_rect, idx, &response)
+        {
+            self.open_tag_view_for_tag(&tag_name);
+            return None;
+        }
         if response.clicked() {
             let ctrl = ctx.input(|i| i.modifiers.ctrl);
             let shift = ctx.input(|i| i.modifiers.shift);
@@ -3467,6 +3474,45 @@ impl App {
             }
         }
         nav
+    }
+
+    fn clicked_grid_tag_badge(
+        &self,
+        ui: &egui::Ui,
+        cell_rect: egui::Rect,
+        idx: usize,
+        response: &egui::Response,
+    ) -> Option<String> {
+        if self.items_are_drive_list {
+            return None;
+        }
+        let pos = response.interact_pointer_pos()?;
+        let tags = self.cell_tag_list(idx);
+        let tag_name = crate::app::primary_grid_tag_for_badge(tags)?.to_owned();
+        let badge_rect = crate::app::grid_tag_badge_hit_rect(
+            ui,
+            cell_rect,
+            self.adjustment_page_params.contains_key(&idx),
+            self.local_adjust_pages.contains(&idx),
+            self.mask_pages.contains(&idx),
+            self.conceal_pages.contains(&idx),
+            self.comic_pages.contains(&idx),
+            self.cell_has_pin_badge(idx),
+            tags,
+        )?;
+        badge_rect.contains(pos).then_some(tag_name)
+    }
+
+    fn cell_has_pin_badge(&self, idx: usize) -> bool {
+        if let (Some(pin_container), Some(src)) = (
+            self.pin_container_key(),
+            self.folder_pin_selected_source(idx),
+        ) {
+            let key = crate::path_key::normalize_keep_drive(&pin_container);
+            self.folder_pin_map.get(&key) == Some(&src)
+        } else {
+            false
+        }
     }
 
     /// 現在表示中の場所に対する空白右クリックメニューを開く。
@@ -4185,15 +4231,7 @@ impl App {
                                 // で対応させる)。
                                 // ネスト ZIP では本ごとピン (Model B): book キー + ZipEntry source
                                 // (ルート = zip_path / 本の中 = 実効 prefix)。
-                                let has_pin = if let (Some(pin_container), Some(src)) = (
-                                    self.pin_container_key(),
-                                    self.folder_pin_selected_source(idx),
-                                ) {
-                                    let key = crate::path_key::normalize_keep_drive(&pin_container);
-                                    self.folder_pin_map.get(&key) == Some(&src)
-                                } else {
-                                    false
-                                };
+                                let has_pin = self.cell_has_pin_badge(idx);
                                 crate::app::draw_cell(
                                     ui,
                                     cell_rect,

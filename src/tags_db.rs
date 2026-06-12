@@ -60,6 +60,7 @@ impl TagsDb {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
+        Self::apply_pragmas(&conn)?;
         Self::init_schema(&conn)?;
         Ok(Self {
             conn,
@@ -69,6 +70,16 @@ impl TagsDb {
 
     fn db_path() -> PathBuf {
         crate::data_dir::get().join("tags.db")
+    }
+
+    fn apply_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
+        let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        conn.execute_batch(
+            "PRAGMA synchronous = NORMAL;
+             PRAGMA wal_autocheckpoint = 1000;
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        Ok(())
     }
 
     fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -695,6 +706,7 @@ mod tests {
 
     fn memory_db() -> TagsDb {
         let conn = Connection::open_in_memory().unwrap();
+        TagsDb::apply_pragmas(&conn).unwrap();
         TagsDb::init_schema(&conn).unwrap();
         TagsDb {
             conn,
@@ -706,6 +718,16 @@ mod tests {
     fn normalize_strips_hash_and_nfkc_lowercases_key() {
         assert_eq!(normalize_tag_display_name("  ##ＦＡＴＥ  "), "FATE");
         assert_eq!(normalize_tag_key("  #ＦＡＴＥ  "), "fate");
+    }
+
+    #[test]
+    fn busy_timeout_pragma_is_applied() {
+        let db = memory_db();
+        let timeout_ms: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout_ms, 5000);
     }
 
     #[test]
