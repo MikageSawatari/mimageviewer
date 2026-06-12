@@ -26815,77 +26815,6 @@ impl App {
         self.erase_base_tex_cache.remove(&idx);
     }
 
-    /// 表示中画像の adjustment_cache がない場合、補正を同期適用する。
-    /// 表示中の画像のみ処理し、先読み分はページ切替時に処理する。
-    /// 見開き Double 表示中はペアの両方の idx について実行を許可する。
-    /// `spread_pair` は呼び出し側で計算済みのものを受け取って毎フレームの再計算を避ける。
-    #[allow(dead_code)] // Legacy adjustment cache is kept until P2.4 staged deletion.
-    pub(crate) fn maybe_apply_adjustment(
-        &mut self,
-        ctx: &egui::Context,
-        idx: usize,
-        spread_pair: crate::ui_fullscreen::SpreadPair,
-    ) {
-        // 表示中の画像 (= 見開き時はペアの片方も含む) でなければスキップ。
-        // 先読み分はページ切替時に処理。
-        let in_view = match self.fullscreen_idx {
-            Some(fs) if fs == idx => true,
-            Some(_) => matches!(
-                spread_pair,
-                crate::ui_fullscreen::SpreadPair::Double { left, right }
-                    if left == idx || right == idx
-            ),
-            None => false,
-        };
-        if !in_view {
-            return;
-        }
-        // 既にキャッシュがあればスキップ
-        if self.adjustment_cache.contains_key(&idx) {
-            return;
-        }
-        let bg = self.effective_upscale_bg_mode();
-        // AI 処理中でも fs_cache ベースの仮 adjustment_cache を用意する。
-        // AI 完了時に poll_ai_upscale が adjustment_cache を無効化し、AI 結果で再生成する。
-        // これがないと AI 完了まで「補正前の fs_cache」がそのまま表示され、
-        // 完了瞬間に補正適用で濃度が跳ねて見えてしまう。
-        // 短絡: 個別設定なし かつ グローバルが identity かつ お気に入り標準なし なら何もしない。
-        // 順序はコスト昇順: HashMap 参照 → global_preset 構造体参照 → favorite 解決 (path 正規化)。
-        // `favorite_default_for_idx` は path 正規化+ `find_nearest_favorite` のループで
-        // 一番重いので、`&&` の短絡で前段の cheap 条件が外れたときにスキップされるようにする。
-        if !self.adjustment_page_params.contains_key(&idx)
-            && self.settings.global_preset.is_identity()
-            && self.favorite_default_for_idx(idx).is_none()
-        {
-            return;
-        }
-        // bypass 中は post-filter を考慮せず、色調 + シャープ化で判定する
-        let params_ref = self.effective_params(idx);
-        let apply_pf = !self.post_filter_bypassed
-            && params_ref.post_filter != crate::adjustment::PostFilter::None;
-        if params_ref.is_color_identity() && !apply_pf && params_ref.smart_sharpen == 0 {
-            return;
-        }
-        // ソース画像を取得 (AI アップスケール済み or 元画像)
-        let (source, source_is_upscaled_ai) =
-            if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
-                match self.ai_upscale_cache.get(&(idx, bg)) {
-                    // ai_upscale_cache はアップスケール / デノイズ両方の出力が入るので、
-                    // 「アップスケール出力か」はアップスケール有効フラグで近似する
-                    // (legacy 経路。final pipeline 側はサイズ比較で厳密判定)。
-                    Some(entry) => (Some(entry), self.ai_upscale_enabled),
-                    None => (self.fs_cache.get(&idx), false),
-                }
-            } else {
-                (self.fs_cache.get(&idx), false)
-            };
-        let Some(FsCacheEntry::Static { pixels, .. }) = source else {
-            return;
-        };
-        let pixels = std::sync::Arc::clone(pixels);
-        self.apply_sync_adjustment(ctx, idx, &pixels, source_is_upscaled_ai);
-    }
-
     pub(crate) fn invalidate_compare_prepared_for_idx(&mut self, idx: usize) {
         let prepared_affected = self
             .compare_prepared_pair
@@ -28876,8 +28805,9 @@ impl App {
                             ],
                         );
                     }
-                    // 表示中の画像のみ色調補正を即座に適用（チラつき防止）
-                    // 先読み分は maybe_apply_adjustment に委ねる
+                    // 表示中の画像のみ色調補正を即座に適用（チラつき防止）。
+                    // 先読み分は表示に入った時点で final pipeline
+                    // (ensure_final_composite_texture) が処理する。
                     if self.fullscreen_idx == Some(key) {
                         self.apply_sync_adjustment(ctx, key, &pixels, false);
                     }

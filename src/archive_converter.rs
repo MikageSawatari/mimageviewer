@@ -627,7 +627,9 @@ impl ConvertCtx<'_> {
 
     fn finish_image(&mut self, copied: u64) {
         self.bytes_written = self.bytes_written.saturating_add(copied);
-        self.files_done += 1;
+        // bytes_written と同様 saturating で統一 (到達不能だが >42 億エントリで wrap/panic
+        // しないように)。
+        self.files_done = self.files_done.saturating_add(1);
         self.emit_progress();
     }
 }

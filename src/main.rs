@@ -617,7 +617,84 @@ unsafe extern "system" fn native_exception_handler(
     EXCEPTION_CONTINUE_SEARCH
 }
 
+/// `--version` / `-V` / `--help` / `-h` を処理する。該当すれば文面を親コンソールへ
+/// 出力して `true` を返す (呼び出し側は GUI を開かず exit する)。GUI アプリ
+/// (`windows_subsystem="windows"`) でも `mimageviewer-core.exe --version` でバージョンを
+/// CLI から確認できるようにする (リリース時の版確認用)。
+fn maybe_handle_version_or_help() -> bool {
+    let (mut want_version, mut want_help) = (false, false);
+    for a in std::env::args().skip(1) {
+        match a.as_str() {
+            "--version" | "-V" => want_version = true,
+            "--help" | "-h" => want_help = true,
+            _ => {}
+        }
+    }
+    if want_help {
+        write_to_parent_console(&format!(
+            "mImageViewer {ver}\n\
+             \n\
+             Usage: mimageviewer.exe [OPTIONS] [PATH]\n\
+             \n\
+             Options:\n  \
+             -V, --version  Print version and exit\n  \
+             -h, --help     Print this help and exit\n\
+             \n\
+             PATH  Open the given image file or folder on startup.\n",
+            ver = env!("CARGO_PKG_VERSION"),
+        ));
+        true
+    } else if want_version {
+        write_to_parent_console(&format!("mImageViewer {}\n", env!("CARGO_PKG_VERSION")));
+        true
+    } else {
+        false
+    }
+}
+
+/// 親プロセス (cmd / PowerShell) のコンソールへ文字列を出力する。`windows_subsystem=
+/// "windows"` の GUI exe は既定でコンソールを持たないため、`AttachConsole(ATTACH_PARENT_
+/// PROCESS)` で親コンソールに接続してから、`GetStdHandle(STD_OUTPUT_HANDLE)` の handle へ
+/// `WriteFile` する。`WriteConsoleW` (console 専用) と違い `WriteFile` は console / file /
+/// pipe いずれにも書けるので `--version > ver.txt` のようなリダイレクトでも拾える
+/// (出力は ASCII なので console の code page に依存しない)。Explorer / GUI 起動 (親
+/// コンソールなし・リダイレクトなし) では handle が無効になるので何も出さない。
+#[cfg(windows)]
+fn write_to_parent_console(msg: &str) {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::WriteFile;
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        // リダイレクト時は cmd が STD_OUTPUT を file/pipe に設定済みで、AttachConsole は
+        // それを上書きしない。対話起動時のみ親コンソールへ STD_OUTPUT が向く。
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        let handle: HANDLE = match GetStdHandle(STD_OUTPUT_HANDLE) {
+            Ok(h) if !h.is_invalid() => h,
+            _ => return,
+        };
+        let mut written = 0u32;
+        let _ = WriteFile(
+            handle,
+            Some(msg.as_bytes()),
+            Some(&mut written as *mut u32),
+            None,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn write_to_parent_console(msg: &str) {
+    print!("{msg}");
+}
+
 fn main() -> eframe::Result {
+    // --version / -V / --help / -h: GUI を開かず版 / usage を表示して即終了。
+    // worker モード等の前に処理する (これらは内部フラグで --version と衝突しない)。
+    if maybe_handle_version_or_help() {
+        std::process::exit(0);
+    }
     // main() 入口の Instant を起動時間計測の t=0 とする。
     // --pdf-worker モードでは計測しないので worker 判定の前に取らない。
     // --perf-log 無効時は `emit_startup` が no-op なのでコストはゼロ。

@@ -32,7 +32,7 @@ v1.3.0 のリリースレビュー (Claude マルチエージェント + Codex) 
 | ソート変更後 cold reopen の代表サムネ stale | `app.rs` 非ピン ZipDir の `zipdir_cache_key` 経路 | 非ピン ZipDir の catalog キーが `zipdir:{dir_prefix}` で代表 entry を含まない。ソート変更で別代表になった2枚が同一 `(mtime, file_size)` のとき cold reopen で旧サムネが出る。キーに代表の discriminator を足す。**見た目のみ・低確率** | P3 (cosmetic) |
 | ZipDir サムネのキュー振り分け | `app.rs` `is_heavy_io` 判定 (≈ thumbnail queue routing) | ZipDir 要求は軽量キューだが worker 側で `ZipDirRepresentative` 解決時に ZIP 列挙 (重 I/O) する。`LoadRequest` の解決戦略でも振り分ける | P3 (perf, Codex) |
 | 変換キャッシュ downgrade の UI 不可視 | `archive_cache.rs` `format_from_db` | v1.3.0 で `format="zip"` の行を v1.2.0 にダウングレードすると `list_all` が skip し cache-manager UI に出ない (auto-prune は効くので disk leak はなし)。未リリース機能なので影響軽微。コメント追記 or 未知 format の汎用表示 | P3 (unreleased) |
-| `files_done` 非飽和加算 | `archive_converter.rs` `finish_image` | `bytes_written` は saturating だが `files_done: u32` は素の `+= 1`。>42 億エントリで panic/wrap。到達不能だが `saturating_add` で統一 | P3 |
+| `files_done` 非飽和加算 | `archive_converter.rs` `finish_image` | `bytes_written` は saturating だが `files_done: u32` は素の `+= 1`。>42 億エントリで panic/wrap。到達不能だが `saturating_add` で統一 | 対応済 (v1.3.1) |
 | ネイティブ ZIP entry_name のサニタイズ | `zip_loader.rs` enumerate / `book_container_key` | ネイティブ (非変換) ZIP の entry に `../`・`.`・ドライブ文字が来ても converter (`normalize_entry_name`) と違い拒否しない。**`normalize_path` は字句的で `..` を解決しないため名前空間脱出・実パス衝突は起きない**ことを確認済み (= 実害なし) だが、converter 側と一貫させる防御的サニタイズを入れる余地あり | P3 (defense) |
 
 ### 1.3 フォルダツリーペイン
@@ -50,7 +50,7 @@ v1.3.0 のリリースレビュー (Claude マルチエージェント + Codex) 
 | --- | --- | --- | --- |
 | 名前付きパイプにセキュリティ記述子なし | `single_instance.rs` `CreateNamedPipeW` (lpSecurityAttributes=None) | 既定 ACL なので同一マシンのローカルプロセスが「このパスを開け」を送れる (デコードは bounds-checked でメモリ安全)。単一ユーザーのデスクトップビューアでは低影響だが、ユーザー SID 限定の DACL + `PIPE_REJECT_REMOTE_CLIENTS` で攻撃面を縮小。受信パスの妥当性検証も検討 | P3 (security, 要判断) |
 | `open_startup_path` の UI スレッド FS stat | `app.rs` `open_startup_path` → `folder_tree::resolve_openable_path` | 転送パス activate 経路 (稼働中 UI) で `is_file`/`is_dir` + 親探索が走る。遅い/切断ネットワークパスで stall。worker 化 or 最低限 perf 計装 | P3 (perf) |
-| `--version` / `-V` CLI フラグ未実装 | `main.rs` `main()` 冒頭 (`--pdf-worker` 等の特殊モード判定と同じ場所) | GUI アプリのため未知の引数は無視されて通常起動する。`mimageviewer-core.exe --version` がウィンドウを開いてしまい、CLI からバージョン確認できない (リリース時の版確認は版リソース `(Get-Item).VersionInfo.FileVersion` で代替できるが不便)。`env!("CARGO_PKG_VERSION")` を print して GUI を開かず即 exit する `--version`/`-V` (ついでに `--help`) を追加する。launcher 側にも同フラグを通す | P3 (devex) |
+| `--version` / `-V` CLI フラグ未実装 | `main.rs` `main()` 冒頭 (`--pdf-worker` 等の特殊モード判定と同じ場所) | GUI アプリのため未知の引数は無視されて通常起動する。`mimageviewer-core.exe --version` がウィンドウを開いてしまい、CLI からバージョン確認できない (リリース時の版確認は版リソース `(Get-Item).VersionInfo.FileVersion` で代替できるが不便)。`env!("CARGO_PKG_VERSION")` を print して GUI を開かず即 exit する `--version`/`-V` (ついでに `--help`) を追加する。launcher 側にも同フラグを通す。**実装メモ**: GUI exe (`windows_subsystem="windows"`) は親コンソールを持たないため、`AttachConsole(ATTACH_PARENT_PROCESS)` + `WriteConsoleW` で出力する (`Win32_System_Console` feature を core / launcher の両 Cargo.toml に追加)。core / launcher の両方で処理 | 対応済 (v1.3.1) |
 
 ### 1.5 補正 / AI
 
@@ -69,7 +69,7 @@ v1.3.0 のリリースレビュー (Claude マルチエージェント + Codex) 
 
 | 項目 | 場所 | 内容 |
 | --- | --- | --- |
-| `maybe_apply_adjustment` 削除 | `app.rs` | 呼出元ゼロ (コメント参照のみ)。legacy `adjustment_cache` の「アップスケール近似」(Codex 指摘) もこの dead fn 内。削除する | cleanup |
+| `maybe_apply_adjustment` 削除 | `app.rs` | 呼出元ゼロ (コメント参照のみ)。legacy `adjustment_cache` の「アップスケール近似」(Codex 指摘) もこの dead fn 内。削除する | 対応済 (v1.3.1) |
 
 ---
 

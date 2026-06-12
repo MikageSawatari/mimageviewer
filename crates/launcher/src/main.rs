@@ -68,6 +68,12 @@ fn main() {
 fn run() -> Result<(), String> {
     let user_args: Vec<OsString> = std::env::args_os().skip(1).collect();
 
+    // --version / -V / --help / -h: 版 / usage を表示して終了 (core を spawn しない)。
+    // 既存インスタンスの activate より前に処理する。
+    if maybe_handle_version_or_help(&user_args) {
+        return Ok(());
+    }
+
     #[cfg(windows)]
     if try_activate_existing(&user_args) {
         return Ok(());
@@ -100,6 +106,73 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("spawn core failed ({}): {e}", core_path.display()))?;
 
     Ok(())
+}
+
+/// `--version` / `-V` / `--help` / `-h` を処理する。該当すれば文面を親コンソールへ
+/// 出力して `true` を返す (呼び出し側は core を spawn せず終了する)。GUI exe でも
+/// `mimageviewer.exe --version` でバージョンを CLI から確認できるようにする。
+fn maybe_handle_version_or_help(args: &[OsString]) -> bool {
+    let (mut want_version, mut want_help) = (false, false);
+    for a in args {
+        match a.to_str() {
+            Some("--version") | Some("-V") => want_version = true,
+            Some("--help") | Some("-h") => want_help = true,
+            _ => {}
+        }
+    }
+    if want_help {
+        write_to_parent_console(&format!(
+            "mImageViewer {VERSION}\n\
+             \n\
+             Usage: mimageviewer.exe [OPTIONS] [PATH]\n\
+             \n\
+             Options:\n  \
+             -V, --version  Print version and exit\n  \
+             -h, --help     Print this help and exit\n\
+             \n\
+             PATH  Open the given image file or folder on startup.\n"
+        ));
+        true
+    } else if want_version {
+        write_to_parent_console(&format!("mImageViewer {VERSION}\n"));
+        true
+    } else {
+        false
+    }
+}
+
+/// 親プロセス (cmd / PowerShell) のコンソールへ文字列を出力する。GUI exe
+/// (`windows_subsystem="windows"`) は既定でコンソールを持たないため、
+/// `AttachConsole(ATTACH_PARENT_PROCESS)` で親コンソールに接続してから、
+/// `GetStdHandle(STD_OUTPUT_HANDLE)` の handle へ `WriteFile` する。`WriteFile` は
+/// console / file / pipe いずれにも書けるので `--version > ver.txt` のリダイレクトでも拾える
+/// (出力は ASCII)。親コンソールなし・リダイレクトなしのときは handle 無効で何も出さない。
+#[cfg(windows)]
+fn write_to_parent_console(msg: &str) {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::WriteFile;
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        let handle: HANDLE = match GetStdHandle(STD_OUTPUT_HANDLE) {
+            Ok(h) if !h.is_invalid() => h,
+            _ => return,
+        };
+        let mut written = 0u32;
+        let _ = WriteFile(
+            handle,
+            Some(msg.as_bytes()),
+            Some(&mut written as *mut u32),
+            None,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn write_to_parent_console(msg: &str) {
+    print!("{msg}");
 }
 
 fn appdata_runtime_dir() -> Result<PathBuf, String> {
