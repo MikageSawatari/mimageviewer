@@ -878,6 +878,16 @@ impl App {
                     if ui
                         .add_enabled(
                             has_target,
+                            egui::Button::new(format!("タグを付ける/外す… ({selection_count})")),
+                        )
+                        .clicked()
+                    {
+                        self.open_tag_apply_dialog();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            has_target,
                             egui::Button::new(format!(
                                 "選択中の項目からタグをクリア ({selection_count})"
                             )),

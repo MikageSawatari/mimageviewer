@@ -24,6 +24,7 @@ pub(crate) mod preferences;
 mod rotation_reset;
 pub(crate) mod settings_restore;
 mod stats_dialog;
+mod tag_apply;
 mod tag_editor;
 mod thumb_quality;
 mod thumb_quality_fullscreen;

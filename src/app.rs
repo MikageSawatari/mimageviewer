@@ -3418,6 +3418,9 @@ pub struct App {
     pub(crate) show_tag_editor: bool,
     /// タグ編集ダイアログ中で編集中のタグ一覧 (キャンセルで破棄するため Settings から分離)
     pub(crate) tag_editor_draft: Vec<crate::settings::TagDef>,
+    /// 選択中アイテムへ自由記入タグを付ける/外すダイアログ。
+    pub(crate) show_tag_apply: bool,
+    pub(crate) tag_apply_input: String,
     /// タグ書き込み worker (初回要求時に遅延初期化)。
     pub(crate) tag_write_handle: Option<crate::tag_write_worker::TagWriteHandle>,
     /// レーティング XMP 書き込み worker。設定 ON のとき遅延初期化される。
@@ -5717,6 +5720,8 @@ impl App {
             favorites_total_eta_cache: None,
             show_tag_editor: false,
             tag_editor_draft: Vec::new(),
+            show_tag_apply: false,
+            tag_apply_input: String::new(),
             tag_write_handle: None,
             rating_write_handle: None,
             show_fav_add_dialog: false,
@@ -7135,6 +7140,7 @@ impl App {
         self.show_stats_dialog
             || self.show_favorites_editor
             || self.show_tag_editor
+            || self.show_tag_apply
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
             || self.show_new_folder_dialog
@@ -7167,6 +7173,7 @@ impl App {
         self.show_stats_dialog
             || self.show_favorites_editor
             || self.show_tag_editor
+            || self.show_tag_apply
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
             || self.show_new_folder_dialog
@@ -31590,6 +31597,7 @@ impl eframe::App for App {
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
         self.show_tag_editor_dialog(ctx);
+        self.show_tag_apply_dialog(ctx);
         self.show_fav_add_dialog_window(ctx);
         let open_folder_nav = self.show_open_folder_dialog_window(ctx);
         self.show_new_folder_dialog_window(ctx);

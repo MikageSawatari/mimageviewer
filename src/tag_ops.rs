@@ -148,6 +148,73 @@ impl App {
         });
     }
 
+    pub(crate) fn request_tag_add_for_selection(&mut self, name: &str) {
+        self.request_tag_set_for_selection(name, true);
+    }
+
+    pub(crate) fn request_tag_remove_for_selection(&mut self, name: &str) {
+        self.request_tag_set_for_selection(name, false);
+    }
+
+    fn request_tag_set_for_selection(&mut self, name: &str, add: bool) {
+        let name = crate::tags_db::normalize_tag_display_name(name);
+        if name.is_empty() {
+            return;
+        }
+        let paths = self.tag_target_paths();
+        if paths.is_empty() {
+            return;
+        }
+        if !self.precheck_tag_write_available(if add { "add" } else { "remove" }) {
+            return;
+        }
+        self.hydrate_tags_cache_for_paths(&paths);
+        let tag_key = crate::tags_db::normalize_tag_key(&name);
+        if tag_key.is_empty() {
+            return;
+        }
+
+        let with_hash = crate::tags_db::format_display_tag(&name);
+        self.tag_toast_label = Some(with_hash.clone());
+        let summary = if add {
+            format!("{with_hash} の付与")
+        } else {
+            format!("{with_hash} の削除")
+        };
+        self.optimistic_update_tags_cache(&paths, |before| {
+            if add {
+                let mut after = before.to_vec();
+                if !after
+                    .iter()
+                    .any(|tag| crate::tags_db::normalize_tag_key(tag) == tag_key)
+                {
+                    after.push(with_hash.clone());
+                }
+                after
+            } else {
+                before
+                    .iter()
+                    .filter(|tag| crate::tags_db::normalize_tag_key(*tag) != tag_key)
+                    .cloned()
+                    .collect()
+            }
+        });
+        let tx_id = self.next_tag_tx_id();
+        self.register_pending_tag_op(tx_id, summary, paths.len());
+        self.submit_tag_jobs(
+            &paths,
+            if add { "add" } else { "remove" },
+            tx_id,
+            move |_| {
+                if add {
+                    TagJobKind::Add(name.clone())
+                } else {
+                    TagJobKind::Remove(name.clone())
+                }
+            },
+        );
+    }
+
     pub(crate) fn request_tag_clear_for_selection(&mut self) {
         self.tag_toast_label = None; // clear は付与/削除ラベル不要 (complete 時にクリア件数で集計)
         let paths = self.tag_target_paths();
@@ -242,7 +309,7 @@ impl App {
         self.tag_write_handle = Some(TagWriteHandle::spawn());
     }
 
-    fn hydrate_tags_cache_for_paths(&mut self, paths: &[PathBuf]) {
+    pub(crate) fn hydrate_tags_cache_for_paths(&mut self, paths: &[PathBuf]) {
         let mut missing: Vec<String> = paths
             .iter()
             .map(|path| crate::tags_db::item_key_for_path(path))
@@ -497,11 +564,14 @@ fn format_completion_toast(
     if restored > 0 {
         return format!("{restored} 件のタグを元に戻しました");
     }
-    if cleared > 0 || (noop > 0 && added == 0 && removed == 0) {
+    if cleared > 0 || (noop > 0 && added == 0 && removed == 0 && tag_label.is_none()) {
         let total_clear = cleared + noop;
         return format!("{total_clear} 件から mIV タグをクリア");
     }
     let tag = tag_label.unwrap_or("タグ");
+    if added == 0 && removed == 0 && noop > 0 {
+        return format!("{tag}: {noop} 件は変更なし");
+    }
     match (added, removed) {
         (a, 0) if a > 0 => format!("{a} 件に {tag} を付与"),
         (0, r) if r > 0 => format!("{r} 件から {tag} を削除"),
@@ -550,6 +620,14 @@ mod tests {
         assert_eq!(
             format_completion_toast(None, 0, 0, 3, 0, 2),
             "5 件から mIV タグをクリア"
+        );
+    }
+
+    #[test]
+    fn toast_tag_noop_does_not_say_clear() {
+        assert_eq!(
+            format_completion_toast(Some("#tag"), 0, 0, 0, 0, 2),
+            "#tag: 2 件は変更なし"
         );
     }
 
