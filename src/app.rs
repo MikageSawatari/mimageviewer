@@ -9128,6 +9128,7 @@ impl App {
         self.tag_view.has_focus = false;
         self.tag_view.query.clear();
         self.tag_view.last_executed.clear();
+        self.tag_view.last_executed_kind_filter = self.tag_view.kind_filter;
         self.tag_view.results_paths.clear();
         self.tag_view.summaries.clear();
         self.tag_view.result_count = 0;
@@ -9142,6 +9143,7 @@ impl App {
 
     pub(crate) fn execute_tag_view(&mut self) {
         self.tag_view.last_executed = self.tag_view.query.clone();
+        self.tag_view.last_executed_kind_filter = self.tag_view.kind_filter;
         self.tag_view.reject_message = None;
         self.tag_view.truncated = false;
         self.tag_view.result_count = 0;
@@ -9151,7 +9153,12 @@ impl App {
         }
         let data_dir = crate::data_dir::get();
         let query = self.tag_view.query.clone();
-        self.tag_view_pending = Some(crate::tag_view::spawn_tag_view_search(data_dir, query));
+        let kind_filter = self.tag_view.kind_filter;
+        self.tag_view_pending = Some(crate::tag_view::spawn_tag_view_search(
+            data_dir,
+            query,
+            kind_filter,
+        ));
     }
 
     pub(crate) fn poll_tag_view(&mut self) {
@@ -9161,7 +9168,9 @@ impl App {
         match pending.try_recv() {
             Ok(Ok(result)) => {
                 self.tag_view_pending = None;
-                if result.query == self.tag_view.last_executed {
+                if result.query == self.tag_view.last_executed
+                    && result.kind_filter == self.tag_view.last_executed_kind_filter
+                {
                     self.apply_tag_view_result(result);
                 }
             }

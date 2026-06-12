@@ -12,12 +12,63 @@ use crate::archive_converter::ArchiveFormat;
 use crate::tags_db::TagSummary;
 
 pub const TAG_VIEW_RESULT_LIMIT: usize = 10_000;
+const TAG_VIEW_FILTERED_KEY_SCAN_LIMIT: usize = 50_000;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TagViewKindFilter {
+    #[default]
+    All,
+    Folder,
+    Image,
+    Video,
+    ZipFile,
+    PdfFile,
+    Archive,
+}
+
+pub(crate) const TAG_VIEW_KIND_FILTER_CHOICES: &[TagViewKindFilter] = &[
+    TagViewKindFilter::All,
+    TagViewKindFilter::Image,
+    TagViewKindFilter::Video,
+    TagViewKindFilter::Folder,
+    TagViewKindFilter::ZipFile,
+    TagViewKindFilter::PdfFile,
+    TagViewKindFilter::Archive,
+];
+
+impl TagViewKindFilter {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TagViewKindFilter::All => "すべての種類",
+            TagViewKindFilter::Folder => "フォルダ",
+            TagViewKindFilter::Image => "画像",
+            TagViewKindFilter::Video => "動画",
+            TagViewKindFilter::ZipFile => "ZIP ファイル",
+            TagViewKindFilter::PdfFile => "PDF ファイル",
+            TagViewKindFilter::Archive => "アーカイブ",
+        }
+    }
+
+    fn matches(self, kind: TagViewItemKind) -> bool {
+        match self {
+            TagViewKindFilter::All => true,
+            TagViewKindFilter::Folder => matches!(kind, TagViewItemKind::Folder),
+            TagViewKindFilter::Image => matches!(kind, TagViewItemKind::Image),
+            TagViewKindFilter::Video => matches!(kind, TagViewItemKind::Video),
+            TagViewKindFilter::ZipFile => matches!(kind, TagViewItemKind::ZipFile),
+            TagViewKindFilter::PdfFile => matches!(kind, TagViewItemKind::PdfFile),
+            TagViewKindFilter::Archive => matches!(kind, TagViewItemKind::Archive(_)),
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct TagViewState {
     pub active: bool,
     pub query: String,
     pub last_executed: String,
+    pub kind_filter: TagViewKindFilter,
+    pub last_executed_kind_filter: TagViewKindFilter,
     pub focus_request: bool,
     pub has_focus: bool,
     pub saved_folder: Option<PathBuf>,
@@ -52,6 +103,7 @@ impl TagViewPending {
 #[derive(Clone, Debug)]
 pub(crate) struct TagViewResult {
     pub query: String,
+    pub kind_filter: TagViewKindFilter,
     pub summaries: Vec<TagSummary>,
     pub entries: Vec<TagViewEntry>,
     pub truncated: bool,
@@ -75,14 +127,18 @@ pub(crate) enum TagViewItemKind {
     Archive(ArchiveFormat),
 }
 
-pub(crate) fn spawn_tag_view_search(data_dir: PathBuf, query: String) -> TagViewPending {
+pub(crate) fn spawn_tag_view_search(
+    data_dir: PathBuf,
+    query: String,
+    kind_filter: TagViewKindFilter,
+) -> TagViewPending {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("tag-view-search".to_string())
         .spawn(move || {
-            let result = run_tag_view_search(&data_dir, &query, &cancel_worker);
+            let result = run_tag_view_search(&data_dir, &query, kind_filter, &cancel_worker);
             if !cancel_worker.load(Ordering::Relaxed) {
                 let _ = tx.send(result);
             }
@@ -94,6 +150,7 @@ pub(crate) fn spawn_tag_view_search(data_dir: PathBuf, query: String) -> TagView
 fn run_tag_view_search(
     data_dir: &Path,
     query: &str,
+    kind_filter: TagViewKindFilter,
     cancel: &AtomicBool,
 ) -> Result<TagViewResult, String> {
     let db_path = data_dir.join("tags.db");
@@ -104,25 +161,33 @@ fn run_tag_view_search(
     if trimmed.is_empty() {
         return Ok(TagViewResult {
             query: query.to_string(),
+            kind_filter,
             summaries,
             entries: Vec::new(),
             truncated: false,
         });
     }
 
-    let exact_keys = db.item_keys_by_tag_exact(trimmed, TAG_VIEW_RESULT_LIMIT + 1);
+    let scan_limit = if kind_filter == TagViewKindFilter::All {
+        TAG_VIEW_RESULT_LIMIT
+    } else {
+        TAG_VIEW_FILTERED_KEY_SCAN_LIMIT
+    };
+    let exact_keys = db.item_keys_by_tag_exact(trimmed, scan_limit + 1);
     let keys = if exact_keys.is_empty() {
-        db.item_keys_by_tag_prefix(trimmed, TAG_VIEW_RESULT_LIMIT + 1)
+        db.item_keys_by_tag_prefix(trimmed, scan_limit + 1)
     } else {
         exact_keys
     };
-    let truncated = keys.len() > TAG_VIEW_RESULT_LIMIT;
+    let scan_truncated = keys.len() > scan_limit;
+    let mut truncated = false;
     let mut entries = Vec::with_capacity(keys.len().min(TAG_VIEW_RESULT_LIMIT));
     let mut prune_keys = Vec::new();
-    for key in keys.into_iter().take(TAG_VIEW_RESULT_LIMIT) {
+    for key in keys.into_iter().take(scan_limit) {
         if cancel.load(Ordering::Relaxed) {
             return Ok(TagViewResult {
                 query: query.to_string(),
+                kind_filter,
                 summaries,
                 entries,
                 truncated,
@@ -130,7 +195,15 @@ fn run_tag_view_search(
         }
         let path = PathBuf::from(&key);
         match classify_tag_view_path(path) {
-            ClassifiedTagViewPath::Existing(entry) => entries.push(entry),
+            ClassifiedTagViewPath::Existing(entry) => {
+                if kind_filter.matches(entry.kind) {
+                    if entries.len() >= TAG_VIEW_RESULT_LIMIT {
+                        truncated = true;
+                        break;
+                    }
+                    entries.push(entry);
+                }
+            }
             ClassifiedTagViewPath::Missing(path) => {
                 if should_prune_missing_path(&path) {
                     prune_keys.push(key);
@@ -148,9 +221,13 @@ fn run_tag_view_search(
             Err(e) => crate::logger::log(format!("tag_view: stale item prune failed: {e}")),
         }
     }
+    if scan_truncated {
+        truncated = true;
+    }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(TagViewResult {
         query: query.to_string(),
+        kind_filter,
         summaries,
         entries,
         truncated,
@@ -241,7 +318,13 @@ mod tests {
         db.set_item_tags(&other_key, ["dog"], "test").unwrap();
         drop(db);
 
-        let result = run_tag_view_search(&data_dir, "#cat", &AtomicBool::new(false)).unwrap();
+        let result = run_tag_view_search(
+            &data_dir,
+            "#cat",
+            TagViewKindFilter::All,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
 
         assert_eq!(result.query, "#cat");
         assert_eq!(result.entries.len(), 1);
@@ -266,7 +349,13 @@ mod tests {
                 .any(|e| e.path == PathBuf::from(&other_key))
         );
 
-        let prefix_result = run_tag_view_search(&data_dir, "#ca", &AtomicBool::new(false)).unwrap();
+        let prefix_result = run_tag_view_search(
+            &data_dir,
+            "#ca",
+            TagViewKindFilter::All,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(prefix_result.entries.len(), 2);
         assert!(
             prefix_result
@@ -293,7 +382,13 @@ mod tests {
         db.set_item_tags(&missing_key, ["cat"], "test").unwrap();
         drop(db);
 
-        let result = run_tag_view_search(&data_dir, "#cat", &AtomicBool::new(false)).unwrap();
+        let result = run_tag_view_search(
+            &data_dir,
+            "#cat",
+            TagViewKindFilter::All,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
 
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].path, PathBuf::from(&image_key));
@@ -301,5 +396,41 @@ mod tests {
         let db = crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).unwrap();
         assert!(db.display_tags_for_item(&missing_key).is_empty());
         assert!(!db.has_item_state(&missing_key));
+    }
+
+    #[test]
+    fn tag_view_kind_filter_keeps_only_matching_item_kinds() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let image = temp.path().join("image.jpg");
+        let video = temp.path().join("video.mp4");
+        let zip = temp.path().join("book.zip");
+        std::fs::write(&image, b"jpg").unwrap();
+        std::fs::write(&video, b"mp4").unwrap();
+        std::fs::write(&zip, b"zip").unwrap();
+
+        let image_key = crate::tags_db::item_key_for_path(&image);
+        let video_key = crate::tags_db::item_key_for_path(&video);
+        let zip_key = crate::tags_db::item_key_for_path(&zip);
+        let mut db = crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).unwrap();
+        db.set_item_tags(&image_key, ["cat"], "test").unwrap();
+        db.set_item_tags(&video_key, ["cat"], "test").unwrap();
+        db.set_item_tags(&zip_key, ["cat"], "test").unwrap();
+        drop(db);
+
+        let result = run_tag_view_search(
+            &data_dir,
+            "#cat",
+            TagViewKindFilter::Video,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(result.kind_filter, TagViewKindFilter::Video);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, PathBuf::from(&video_key));
+        assert_eq!(result.entries[0].kind, TagViewItemKind::Video);
     }
 }

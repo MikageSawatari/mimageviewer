@@ -3254,6 +3254,7 @@ impl App {
 
         let mut close_requested = false;
         let mut query_changed = false;
+        let mut filter_changed = false;
         let mut clicked_tag: Option<String> = None;
 
         egui::TopBottomPanel::top("tag_view_bar").show(ctx, |ui| {
@@ -3291,6 +3292,24 @@ impl App {
                     .clicked()
                 {
                     close_requested = true;
+                }
+
+                {
+                    let current = self.tag_view.kind_filter;
+                    let mut next = current;
+                    egui::ComboBox::from_id_salt("tag_view_kind")
+                        .selected_text(current.label())
+                        .width(140.0)
+                        .show_ui(ui, |ui| {
+                            for &choice in crate::tag_view::TAG_VIEW_KIND_FILTER_CHOICES {
+                                ui.selectable_value(&mut next, choice, choice.label());
+                            }
+                        });
+                    if next != current {
+                        self.tag_view.kind_filter = next;
+                        self.tag_view.last_executed.clear();
+                        filter_changed = true;
+                    }
                 }
 
                 if self.tag_view_pending.is_some() {
@@ -3350,7 +3369,10 @@ impl App {
             self.close_tag_view();
             return;
         }
-        if query_changed && self.tag_view.query != self.tag_view.last_executed {
+        if (query_changed || filter_changed)
+            && (self.tag_view.query != self.tag_view.last_executed
+                || self.tag_view.kind_filter != self.tag_view.last_executed_kind_filter)
+        {
             self.execute_tag_view();
         }
     }

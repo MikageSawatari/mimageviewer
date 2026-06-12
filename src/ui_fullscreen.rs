@@ -2071,6 +2071,9 @@ impl App {
         if !self.settings.fullscreen_page_number_overlay {
             return;
         }
+        if self.fullscreen_seek_bar_locked_for_idx(fs_idx, false) {
+            return;
+        }
         let Some(label) = self.fullscreen_page_number_label(fs_idx) else {
             return;
         };
