@@ -3,8 +3,9 @@
 //! `%APPDATA%/mimageviewer/tags.db` を正本にし、タグ名は保存時に `#` を
 //! 持たない。UI 表示だけ `#` を付ける。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use unicode_normalization::UnicodeNormalization;
@@ -45,6 +46,7 @@ pub mod source {
 
 pub struct TagsDb {
     conn: Connection,
+    path: PathBuf,
 }
 
 impl TagsDb {
@@ -59,7 +61,10 @@ impl TagsDb {
         }
         let conn = Connection::open(path)?;
         Self::init_schema(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+        })
     }
 
     fn db_path() -> PathBuf {
@@ -89,6 +94,66 @@ impl TagsDb {
                 value TEXT NOT NULL
              );",
         )
+    }
+
+    pub fn backup_to(&self, target: &Path) -> Result<(), rusqlite::Error> {
+        let target_str = target.to_string_lossy();
+        let escaped = target_str.replace('\'', "''");
+        let sql = format!("VACUUM INTO '{escaped}'");
+        self.conn.execute_batch(&sql)
+    }
+
+    pub fn rotate_backups(&self) -> Result<(), rusqlite::Error> {
+        let Some(data_dir) = self.path.parent() else {
+            return Ok(());
+        };
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+
+        let bak = |n: usize| data_dir.join(format!("tags.db.bak{n}"));
+        let snapshot_tmp = data_dir.join("tags.db.bak.tmp-snapshot");
+        let _ = std::fs::remove_file(&snapshot_tmp);
+
+        self.backup_to(&snapshot_tmp)?;
+
+        let _ = std::fs::remove_file(bak(10));
+        for n in (1..10).rev() {
+            let src = bak(n);
+            let dst = bak(n + 1);
+            if src.exists() {
+                if let Err(e) = std::fs::rename(&src, &dst) {
+                    crate::logger::log(format!(
+                        "tags_db: rotate_backups rename {} -> {} failed: {e}",
+                        src.display(),
+                        dst.display()
+                    ));
+                }
+            }
+        }
+
+        let bak1 = bak(1);
+        if bak1.exists() {
+            std::fs::remove_file(&bak1).map_err(|e| io_sqlite_error("remove tags.db.bak1", e))?;
+        }
+        std::fs::rename(&snapshot_tmp, &bak1)
+            .map_err(|e| io_sqlite_error("rename tags.db snapshot to bak1", e))?;
+        crate::logger::log(format!(
+            "tags_db: rotate_backups snapshot -> {}",
+            bak1.display()
+        ));
+        Ok(())
+    }
+
+    fn rotate_backups_once(&self) {
+        if !mark_backup_needed_for_path(&self.path) {
+            return;
+        }
+        if let Err(e) = self.rotate_backups() {
+            crate::logger::log(format!(
+                "tags_db: rotate_backups failed (continuing with write): {e}"
+            ));
+        }
     }
 
     pub fn get_item_tags(&self, item_key: &str) -> Vec<ItemTag> {
@@ -163,6 +228,7 @@ impl TagsDb {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        self.rotate_backups_once();
         let now = now_unix_secs();
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM item_tags WHERE item_key = ?1", [item_key])?;
@@ -189,6 +255,7 @@ impl TagsDb {
         item_key: &str,
         tag_name: &str,
     ) -> Result<(TagToggleOutcome, Vec<String>, Vec<String>), rusqlite::Error> {
+        self.rotate_backups_once();
         let now = now_unix_secs();
         let tag = normalize_tag_display_name(tag_name);
         let tag_key = normalize_tag_key(&tag);
@@ -224,6 +291,7 @@ impl TagsDb {
         &mut self,
         item_key: &str,
     ) -> Result<(bool, Vec<String>, Vec<String>), rusqlite::Error> {
+        self.rotate_backups_once();
         let now = now_unix_secs();
         let before = self.display_tags_for_item(item_key);
         let tx = self.conn.transaction()?;
@@ -255,6 +323,7 @@ impl TagsDb {
         item_key: &str,
         source: &str,
     ) -> Result<(), rusqlite::Error> {
+        self.rotate_backups_once();
         let now = now_unix_secs();
         let tx = self.conn.transaction()?;
         upsert_item_state_tx(&tx, item_key, source, now)?;
@@ -270,6 +339,7 @@ impl TagsDb {
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), rusqlite::Error> {
+        self.rotate_backups_once();
         self.conn.execute(
             "INSERT INTO tag_meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -294,6 +364,7 @@ impl TagsDb {
             });
         }
 
+        self.rotate_backups_once();
         let now = now_unix_secs();
         let tx = self.conn.transaction()?;
         let mut report = LegacyImportReport::default();
@@ -479,6 +550,7 @@ impl TagsDb {
         if item_keys.is_empty() {
             return Ok(0);
         }
+        self.rotate_backups_once();
         let tx = self.conn.transaction()?;
         let mut removed_tags = 0usize;
         {
@@ -499,6 +571,30 @@ pub enum TagToggleOutcome {
     Added,
     Removed,
     NoOp,
+}
+
+static TAG_BACKUP_DONE_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn mark_backup_needed_for_path(path: &Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    let registry = TAG_BACKUP_DONE_PATHS.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut done) = registry.lock() else {
+        crate::logger::log("tags_db: backup registry poisoned; skipping backup rotation");
+        return false;
+    };
+    done.insert(path.to_path_buf())
+}
+
+fn io_sqlite_error(context: &str, err: std::io::Error) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error {
+            code: rusqlite::ErrorCode::CannotOpen,
+            extended_code: 0,
+        },
+        Some(format!("{context}: {err}")),
+    )
 }
 
 pub fn item_key_for_path(path: &Path) -> String {
@@ -600,7 +696,10 @@ mod tests {
     fn memory_db() -> TagsDb {
         let conn = Connection::open_in_memory().unwrap();
         TagsDb::init_schema(&conn).unwrap();
-        TagsDb { conn }
+        TagsDb {
+            conn,
+            path: PathBuf::new(),
+        }
     }
 
     #[test]
@@ -661,6 +760,25 @@ mod tests {
         let found = db.find_exact("#cat").unwrap();
         assert_eq!(found.tag_key, "cat");
         assert_eq!(found.count, 2);
+    }
+
+    #[test]
+    fn first_write_rotates_tags_db_backup_once_for_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tags.db");
+        let mut db = TagsDb::open_at(&path).unwrap();
+
+        db.set_item_tags("c:/a.jpg", ["alpha"], source::EDIT)
+            .unwrap();
+        assert!(dir.path().join("tags.db.bak1").exists());
+        assert!(!dir.path().join("tags.db.bak2").exists());
+
+        db.set_item_tags("c:/b.jpg", ["beta"], source::EDIT)
+            .unwrap();
+        assert!(!dir.path().join("tags.db.bak2").exists());
+
+        let bak = TagsDb::open_at(&dir.path().join("tags.db.bak1")).unwrap();
+        assert!(bak.display_tags_for_item("c:/a.jpg").is_empty());
     }
 
     #[test]
