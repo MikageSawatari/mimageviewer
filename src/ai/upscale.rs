@@ -156,32 +156,28 @@ pub fn ai_would_apply_at_dims(
         || (denoise_on && should_process_rect(w, h, denoise_limit))
 }
 
-/// 表示中 PDF ラスターページを native 解像度へ再レンダして final AI を起動すべきか
-/// 判定する純関数 (GitHub issue #1)。副作用 (`request_pdf_rerender`) は呼び出し側。
+/// PDF ラスターページの「現行レンダ寸法が、native 再レンダ後の AI 入力寸法より十分
+/// 大きい」かを判定する純関数 (GitHub issue #1)。= 「現行 (4096px 等) のまま AI を流すと、
+/// native 再レンダ後に捨てられる / 重すぎる」状態の中核数式 (ズーム・in-flight・副作用は
+/// 呼び出し側 `App::pdf_native_downscale_pending` が足す)。
 ///
 /// 背景: PDF 初回フルスクリーンは content_type 未解析のため 4096px 固定でレンダされ
 /// (`start_fs_load`)、final AI はレンダ後のピクセルサイズで判定する。よって native が
 /// サイズ上限内 (例: 824×1200) のスキャン PDF でも、4096px レンダ結果 (例: 2812×4095)
-/// では範囲外と判定され AI がスキップされる。本判定を **毎フレームの reconcile** で評価し、
-/// 「初回表示」「サイズ確認後に AI を ON」(issue 本文のシナリオ) の両方を拾う。
+/// では AI がスキップ (既定 2048 上限) されるか、約 11.5MP を AI に流す (高負荷上限)。
 ///
-/// ループ安全のため、再レンダ中 (`render_in_flight`) は再キックしない (毎フレームの
-/// cancel→respawn 無限ループを防ぐ)。ズーム中 (`zoom != 1`) は zoom ハンドラ
-/// (`maybe_rerender_pdf`) が native×zoom でレンダ済みなので委ね、fit 表示でだけ働く。
+/// 真 = 「native 寸法で AI が効く」**かつ**「現行レンダ長辺 > 実 native target 長辺 ×1.1」:
+/// - cur が範囲外 (既定 2048 上限で 4096px → 2812×4095) → AI を効かせるため native 化必須。
+/// - cur が範囲内でも native target より大きい (高負荷上限 4096 で 2812×4095 も AI 対象) →
+///   native (= 埋め込み原寸) へ落としてから AI する方が軽く高品質 (Codex P2)。
 ///
-/// 再レンダが必要 = 「native 寸法では AI が効く」**かつ**「現行レンダ寸法が native より
-/// 十分大きい」(`cur_long > native_long * 1.1`):
-/// - cur が範囲外 (既定 2048 上限で 4096px レンダ → 2812×4095 等) → AI を効かせるため必須。
-/// - cur が範囲内でも native より大きい (高負荷上限 4096 等で 2812×4095 も AI 対象) →
-///   native (= 埋め込み原寸 824×1200) へ落としてから AI する方が軽く、PDFium の補間
-///   アップスケール出力を AI に流すより高品質 (Codex P2)。
-///
-/// 1.1 倍は `request_pdf_rerender` の dedup (ratio 0.9..=1.1) と一致。収束後 (cur≈native)
-/// は false を返すので毎フレーム呼んでも余分な再レンダや no-op 呼び出しが起きない。
-/// 非 AI 利用時 (両方 OFF → `ai_at_native` が false) も false。
-#[allow(clippy::too_many_arguments)]
-pub fn pdf_needs_native_rerender_for_ai(
-    zoom: f32,
+/// **実 native target 長辺** = `max(native_long, render_min_long)`。`render_min_long` は
+/// `request_pdf_rerender` の `target_px` clamp 下限 (`pdf_loader::PDF_RENDER_MIN_LONG_PX`
+/// = 256)。raw native (例 100×200) で比べると、実レンダが 256px に持ち上がるため
+/// `256 > 200×1.1` で永久に真のままになり先読みが収束しない (Codex 再々レビュー P2)。
+/// `1.1` 倍は `request_pdf_rerender` の dedup (ratio 0.9..=1.1) と一致し、収束後 (cur≈
+/// target) は false。非 AI 利用時 (両方 OFF → `ai_at_native` が false) も false。
+pub fn pdf_render_exceeds_native_ai_target(
     native_w: u32,
     native_h: u32,
     cur_w: u32,
@@ -190,14 +186,8 @@ pub fn pdf_needs_native_rerender_for_ai(
     upscale_limit: AiProcessSizeLimit,
     denoise_on: bool,
     denoise_limit: AiProcessSizeLimit,
-    render_in_flight: bool,
+    render_min_long: u32,
 ) -> bool {
-    if render_in_flight {
-        return false;
-    }
-    if (zoom - 1.0).abs() > 0.01 {
-        return false;
-    }
     let ai_at_native = ai_would_apply_at_dims(
         native_w,
         native_h,
@@ -206,9 +196,10 @@ pub fn pdf_needs_native_rerender_for_ai(
         denoise_on,
         denoise_limit,
     );
-    let native_long = native_w.max(native_h);
+    // 実レンダ target 長辺 (clamp 下限を反映)。
+    let native_target_long = native_w.max(native_h).max(render_min_long);
     let cur_long = cur_w.max(cur_h);
-    ai_at_native && cur_long as f32 > native_long as f32 * 1.1
+    ai_at_native && cur_long as f32 > native_target_long as f32 * 1.1
 }
 
 /// 1 タイルを推論してスケール倍率を検出する（結果をキャッシュ）。
@@ -979,75 +970,71 @@ mod tests {
         ));
     }
 
+    const MIN: u32 = crate::pdf_loader::PDF_RENDER_MIN_LONG_PX; // 256
+
     /// GitHub issue #1 中核ケース: native (824x1200, range 内) を 4096px でレンダした
-    /// 結果 (2812x4095, range 外) を表示中、AI ON なら native へ再レンダが必要。
-    /// 「初回表示で AI ON」「開いてサイズ確認後に AI を ON」(後者は cur=4096 のまま
-    /// AI フラグだけ true になった状態) の両方をこの 1 判定で拾う。
+    /// 結果 (2812x4095, range 外) → AI ON なら native へ落とすべき (true)。
     #[test]
-    fn needs_rerender_when_ai_on_and_cur_over_limit() {
+    fn exceeds_when_ai_on_and_cur_over_limit() {
         let limit = AiProcessSizeLimit::square(2048);
-        assert!(pdf_needs_native_rerender_for_ai(
-            1.0, 824, 1200, 2812, 4095, true, limit, false, limit, false,
+        assert!(pdf_render_exceeds_native_ai_target(
+            824, 1200, 2812, 4095, true, limit, false, limit, MIN,
         ));
     }
 
     /// Codex P2: 高負荷上限 (4096x4096) では cur (2812x4095) も AI 対象 (range 内) だが、
     /// native (824x1200) の方が小さいので native へ落としてから AI する (約 11.5MP の
-    /// PDFium 出力ではなく原寸 1MP を AI に流す)。`!ai_at_cur` 判定だと取りこぼす。
+    /// PDFium 出力ではなく原寸 1MP を AI に流す)。
     #[test]
-    fn needs_rerender_when_cur_in_range_but_larger_than_native() {
+    fn exceeds_when_cur_in_range_but_larger_than_native() {
         let limit = AiProcessSizeLimit::square(4096);
-        // cur 2812x4095 も 4096 上限では range 内だが native 824x1200 へ落とす。
-        assert!(pdf_needs_native_rerender_for_ai(
-            1.0, 824, 1200, 2812, 4095, true, limit, false, limit, false,
+        assert!(pdf_render_exceeds_native_ai_target(
+            824, 1200, 2812, 4095, true, limit, false, limit, MIN,
         ));
     }
 
-    /// 両方 OFF (非 AI 利用) なら再レンダしない (4096px 表示を保つ)。
+    /// 両方 OFF (非 AI 利用) なら false (4096px 表示を保つ)。
     #[test]
-    fn no_rerender_when_ai_off() {
+    fn not_exceeds_when_ai_off() {
         let limit = AiProcessSizeLimit::square(2048);
-        assert!(!pdf_needs_native_rerender_for_ai(
-            1.0, 824, 1200, 2812, 4095, false, limit, false, limit, false,
+        assert!(!pdf_render_exceeds_native_ai_target(
+            824, 1200, 2812, 4095, false, limit, false, limit, MIN,
         ));
     }
 
-    /// native もサイズ上限超なら AI はどのみち効かないので再レンダしない。
+    /// native もサイズ上限超なら AI はどのみち効かないので false。
     #[test]
-    fn no_rerender_when_native_over_limit() {
+    fn not_exceeds_when_native_over_limit() {
         let limit = AiProcessSizeLimit::square(2048);
         // native 3000x4000 は短辺 3000 ≥ 2048 で range 外。
-        assert!(!pdf_needs_native_rerender_for_ai(
-            1.0, 3000, 4000, 3000, 4000, true, limit, true, limit, false,
+        assert!(!pdf_render_exceeds_native_ai_target(
+            3000, 4000, 3000, 4000, true, limit, true, limit, MIN,
         ));
     }
 
-    /// 収束後 (native へ落ちて現寸法でも AI が効く) は再レンダしない。
-    /// 毎フレーム呼んでも余分な再レンダ / no-op が起きないことの回帰ガード。
+    /// 収束後 (native へ落ちて現寸法 = native target) は false。
     #[test]
-    fn no_rerender_when_already_native() {
+    fn not_exceeds_when_already_native() {
         let limit = AiProcessSizeLimit::square(2048);
-        // cur が既に native (824x1200) = range 内 → ai_at_cur が true → 再レンダ不要。
-        assert!(!pdf_needs_native_rerender_for_ai(
-            1.0, 824, 1200, 824, 1200, true, limit, false, limit, false,
+        assert!(!pdf_render_exceeds_native_ai_target(
+            824, 1200, 824, 1200, true, limit, false, limit, MIN,
         ));
     }
 
-    /// 再レンダ中 (in_flight) は再キックしない (cancel→respawn 無限ループ防止)。
+    /// Codex 再々レビュー P2 (256px clamp): native 100x200 の実レンダ target 長辺は
+    /// `max(200, 256) = 256`。収束後の cur は 128x256 になるので、raw native (200) と
+    /// 比べると `256 > 200×1.1` で永久に true のままになるが、`render_min_long` を
+    /// 反映すれば `256 > 256×1.1` は false で正しく収束する。4096px 時のみ true。
     #[test]
-    fn no_rerender_while_in_flight() {
+    fn min_clamp_lets_tiny_native_converge() {
         let limit = AiProcessSizeLimit::square(2048);
-        assert!(!pdf_needs_native_rerender_for_ai(
-            1.0, 824, 1200, 2812, 4095, true, limit, false, limit, true, // render_in_flight
+        // 4096px レンダ中 → 落とすべき。
+        assert!(pdf_render_exceeds_native_ai_target(
+            100, 200, 2048, 4096, true, limit, false, limit, MIN,
         ));
-    }
-
-    /// ズーム中 (zoom != 1) は zoom ハンドラに委ねるので reconcile しない。
-    #[test]
-    fn no_rerender_while_zoomed() {
-        let limit = AiProcessSizeLimit::square(2048);
-        assert!(!pdf_needs_native_rerender_for_ai(
-            2.0, 824, 1200, 2812, 4095, true, limit, false, limit, false,
+        // 実 target (128x256) へ落ちたら収束 (= false)。MIN を無視すると true になり退行。
+        assert!(!pdf_render_exceeds_native_ai_target(
+            100, 200, 128, 256, true, limit, false, limit, MIN,
         ));
     }
 }

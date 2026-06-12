@@ -59,6 +59,20 @@
 >     priority を先に drain するので、先読みの native 再レンダが visible の再レンダや UI
 >     ナビ enumerate を妨げない)。トレードオフ: 初回パスでネイバーは 4096px→native の 2 回
 >     レンダ (= 画像が neighbor を decode する分の PDF 版。通常レーン・小サイズ・1 回収束)。
+>   - **表示経路でも 4096px AI を保留 (Codex 4th P2)**: 非表示先読みだけでなく、表示中ページ
+>     でも native 再レンダ待ち/進行中は捨てる 4096px (高負荷上限で ~11.5MP) final AI を
+>     流さない。`ensure_final_composite_texture` が `display_should_defer_final_ai` で保留し、
+>     暫定 (color-adjusted) を complete=false で見せて native 着地後に AI 起動する。保留時は
+>     native 再レンダを priority レーンで保証起動 (reconcile 対象外経路でのハング防止、
+>     in-flight 中は二重起動しない)。KICK / 表示保留 / 先読み保留の 3 判定は
+>     `App::pdf_native_downscale_pending(idx, respect_zoom, gate_in_flight)` に統一
+>     ((t,t)/(t,f)/(f,f))。中核数式は純関数 `ai::upscale::pdf_render_exceeds_native_ai_target`。
+>   - **256px clamp の収束 (Codex 4th P2)**: `request_pdf_rerender` は `target_px` を
+>     `[PDF_RENDER_MIN_LONG_PX(=256), PDF_RENDER_MAX_LONG_PX(=8192)]` に clamp するので、
+>     native 100×200 の実レンダ着地は長辺 256 (128×256)。収束判定を raw `native_long(200)`
+>     で見ると `256 > 200×1.1` で永久に「再レンダ要/AI 保留」のままになり、極小 Raster PDF で
+>     先読みが効かなくなる。純関数に `render_min_long` を渡し **実 target 長辺
+>     `max(native_long, 256)`** と比較して収束させる (テスト `min_clamp_lets_tiny_native_converge`)。
 >   - **スコープ**: 対象は `PdfPageContentType::Raster` のページ。可視テキスト / パス /
 >     シェーディングを含むページは `Vector` 判定 (`pdf_loader::analyze_page_content`) で
 >     4096px 固定のまま AI 対象外 (透明 OCR テキストは `is_visible_text` が無視するので

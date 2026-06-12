@@ -21517,7 +21517,10 @@ impl App {
             }
             _ => 4096.0, // Vector or not yet analyzed
         };
-        let target_px = ((base_px * zoom) as u32).clamp(256, 8192);
+        let target_px = ((base_px * zoom) as u32).clamp(
+            crate::pdf_loader::PDF_RENDER_MIN_LONG_PX,
+            crate::pdf_loader::PDF_RENDER_MAX_LONG_PX,
+        );
 
         // 既に同じ解像度のキャッシュがあれば不要
         if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) {
@@ -25001,13 +25004,28 @@ impl App {
                 (Arc::clone(&adjusted), true, false)
             }
             (Some(key), None) => {
-                // 起動できなかった (= 結果が届く見込みがない) 場合はこの合成を
-                // complete 扱いにする。complete=false のまま置くと早期 return が
-                // 暫定 entry を返し続け、コピー / 書き出しが永久に待つ
-                // (Codex P2 第 2 ラウンド: 同フレーム内の failed 直接 insert や、
-                // runtime 初期化失敗 / モデル不在で何も立てずに return する経路)。
-                let ai_will_arrive =
-                    self.maybe_start_final_ai(idx, key, Arc::clone(&adjusted), params.clone());
+                // Raster PDF が native 再レンダ待ち/進行中 (現行 4096px) のときは、捨てる
+                // 4096px AI (高負荷上限では ~11.5MP) を流さず native 着地まで保留する
+                // (GitHub issue #1, Codex P2)。暫定 (color-adjusted) を complete=false で
+                // 見せ、native 着地 → bump_input_generation → 再合成で AI 起動。fs_pending の
+                // native 再レンダが repaint を維持するので保留は次フレームで再評価される。
+                let ai_will_arrive = if self.display_should_defer_final_ai(idx) {
+                    // native 再レンダを保証起動する。表示中ページは毎フレームの reconcile
+                    // (maybe_native_rerender_pdf_for_ai) も kick するが、reconcile 対象外の
+                    // 経路 (コピー/書き出しの composite 要求等) で保留が永久 true になり
+                    // ハングするのを防ぐ。in-flight 中は二重起動しない。priority レーン。
+                    if !self.fs_pending.contains_key(&idx) {
+                        self.request_pdf_rerender(idx, 1.0, true);
+                    }
+                    true
+                } else {
+                    // 起動できなかった (= 結果が届く見込みがない) 場合はこの合成を
+                    // complete 扱いにする。complete=false のまま置くと早期 return が
+                    // 暫定 entry を返し続け、コピー / 書き出しが永久に待つ
+                    // (Codex P2 第 2 ラウンド: 同フレーム内の failed 直接 insert や、
+                    // runtime 初期化失敗 / モデル不在で何も立てずに return する経路)。
+                    self.maybe_start_final_ai(idx, key, Arc::clone(&adjusted), params.clone())
+                };
                 (Arc::clone(&adjusted), !ai_will_arrive, false)
             }
             (None, _) => (Arc::clone(&adjusted), true, false),
@@ -26029,10 +26047,10 @@ impl App {
     /// 毎フレーム評価することで「初回表示で AI ON」「開いてサイズ確認後に AI を ON」の両方を
     /// 拾い、かつ高負荷上限でも native (原寸) へ落としてから AI する。
     ///
-    /// 判定 (`should_native_rerender_pdf_for_ai`) はページ個別 `effective_params(idx)` で
-    /// AI 有効性を見るので、AI 設定が fs_idx と異なる相方ページでも正しい。純関数
-    /// `ai::upscale::pdf_needs_native_rerender_for_ai` が in-flight 中 / ズーム中 / 収束後は
-    /// false を返してループや無駄な再レンダを防ぐ。
+    /// 判定 (`should_native_rerender_pdf_for_ai` = `pdf_native_downscale_pending(t, t)`) は
+    /// ページ個別 `effective_params(idx)` で AI 有効性を見るので、AI 設定が fs_idx と異なる
+    /// 相方ページでも正しい。in-flight 中 / ズーム中 / 収束後は false を返してループや無駄な
+    /// 再レンダを防ぐ。
     fn maybe_native_rerender_pdf_for_ai(&mut self, idx: usize) {
         if self.should_native_rerender_pdf_for_ai(idx) {
             // fit 表示 (zoom≈1.0) でだけ到達するので native 基準 (zoom=1.0) で再レンダ。
@@ -26068,16 +26086,39 @@ impl App {
         Some((*w, *h, cur_w, cur_h, upscale_on, denoise_on))
     }
 
-    /// `maybe_native_rerender_pdf_for_ai` の判定部 (副作用なし、単体テスト用に分離)。
-    /// 表示中ページ向けに `self.fs_zoom` と in-flight ガード込みで判定する。
-    pub(crate) fn should_native_rerender_pdf_for_ai(&self, idx: usize) -> bool {
+    /// PDF ラスターページが「現行レンダ (4096px 等) のままで、native 再レンダ後の AI 入力
+    /// 寸法より十分大きい」状態か = 「native へ置換予定 / 置換中」(GitHub issue #1)。
+    /// この間は、現行レンダに final AI を流しても native 着地で捨てる / 重すぎる。
+    /// 中核数式は純関数 `ai::upscale::pdf_render_exceeds_native_ai_target`
+    /// (`PDF_RENDER_MIN_LONG_PX` で実レンダ target 長辺に補正)。ここでは 2 つのゲートを足す:
+    ///
+    /// - `respect_zoom`: true なら `fs_zoom != 1` で false (表示中ページは現ズーム基準で
+    ///   レンダされ native へは落とさない)。先読みページは fit で開かれる前提なので false。
+    /// - `gate_in_flight`: true なら再レンダ進行中 (`fs_pending`) は false (再キック抑止)。
+    ///   AI 保留判定では false にして進行中も「保留」を維持する (進行中に 4096px へ AI を
+    ///   流さない)。
+    ///
+    /// 用途別:
+    /// - KICK (`should_native_rerender_pdf_for_ai`) = `(respect_zoom, gate_in_flight)=(t,t)`
+    /// - 表示経路の AI 保留 = `(t, f)` / 先読みの AI 保留・再レンダ起動 = `(f, f)`
+    fn pdf_native_downscale_pending(
+        &self,
+        idx: usize,
+        respect_zoom: bool,
+        gate_in_flight: bool,
+    ) -> bool {
         let Some((native_w, native_h, cur_w, cur_h, upscale_on, denoise_on)) =
             self.pdf_ai_rerender_inputs(idx)
         else {
             return false;
         };
-        crate::ai::upscale::pdf_needs_native_rerender_for_ai(
-            self.fs_zoom,
+        if respect_zoom && (self.fs_zoom - 1.0).abs() > 0.01 {
+            return false;
+        }
+        if gate_in_flight && self.fs_pending.contains_key(&idx) {
+            return false;
+        }
+        crate::ai::upscale::pdf_render_exceeds_native_ai_target(
             native_w,
             native_h,
             cur_w,
@@ -26086,36 +26127,27 @@ impl App {
             self.settings.ai_upscale_limit(),
             denoise_on,
             self.settings.ai_denoise_limit(),
-            self.fs_pending.contains_key(&idx),
+            crate::pdf_loader::PDF_RENDER_MIN_LONG_PX,
         )
     }
 
-    /// AI 先読み用: この PDF ラスターページの現行レンダ (4096px) に AI を流すと、表示時の
-    /// native 再レンダで `bump_input_generation` され stale 化して捨てるので、AI 先読みを
-    /// **native レンダ完了まで保留すべき**か (GitHub issue #1, Codex P2)。
-    ///
-    /// `should_native_rerender_pdf_for_ai` と違い **in-flight ガードを持たない**: native
-    /// 再レンダ進行中も「cur がまだ native より大きい」間は true を返し続け、AI 先読みを
-    /// 出さない (in-flight ガードを入れると再レンダ中に 4096px へ AI を流してしまう)。
-    /// ズームも見ない (非表示ページは fit 表示 = zoom 1.0 で開かれる前提)。
-    /// native 着地後 (cur≈native) は false → 通常どおり AI 先読みが native に対して走る。
+    /// `maybe_native_rerender_pdf_for_ai` の判定部 (KICK、副作用なし、テスト用に分離)。
+    /// 表示中ページ向けに `fs_zoom` と in-flight ガード込み。
+    pub(crate) fn should_native_rerender_pdf_for_ai(&self, idx: usize) -> bool {
+        self.pdf_native_downscale_pending(idx, true, true)
+    }
+
+    /// AI 先読み用: 非表示ページの現行レンダに AI を流すと native 着地で捨てるため保留すべきか。
+    /// ズーム非依存 (先読みは fit で開かれる)・in-flight 非ガード (再レンダ中も保留継続)。
     pub(crate) fn pdf_prefetch_should_defer_ai(&self, idx: usize) -> bool {
-        let Some((native_w, native_h, cur_w, cur_h, upscale_on, denoise_on)) =
-            self.pdf_ai_rerender_inputs(idx)
-        else {
-            return false;
-        };
-        let ai_at_native = crate::ai::upscale::ai_would_apply_at_dims(
-            native_w,
-            native_h,
-            upscale_on,
-            self.settings.ai_upscale_limit(),
-            denoise_on,
-            self.settings.ai_denoise_limit(),
-        );
-        let native_long = native_w.max(native_h);
-        let cur_long = cur_w.max(cur_h);
-        ai_at_native && cur_long as f32 > native_long as f32 * 1.1
+        self.pdf_native_downscale_pending(idx, false, false)
+    }
+
+    /// 表示経路用: 表示中ページの現行レンダ (native へ置換予定/置換中) に final AI を
+    /// 流すべきでないか。`fs_zoom` を尊重 (ズーム中は native へ落とさないので保留しない)、
+    /// in-flight は非ガード (native 再レンダ進行中も保留継続して 4096px に AI を流さない)。
+    pub(crate) fn display_should_defer_final_ai(&self, idx: usize) -> bool {
+        self.pdf_native_downscale_pending(idx, true, false)
     }
 
     /// 右上フィードバック表示を設定する (既定の表示時間)。

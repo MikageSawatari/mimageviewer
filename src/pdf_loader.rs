@@ -2233,6 +2233,14 @@ pub fn check_password_needed(pdf_path: &Path) -> PdfAccessStatus {
 // 公開 API — 非同期版 (UI スレッド用)
 // -----------------------------------------------------------------------
 
+/// PDF レンダ結果の長辺ピクセル下限 (`request_pdf_rerender` の `target_px` clamp 下限)。
+/// native が極小 (例 100x200) でも実レンダ長辺はこの値まで持ち上がるため、AI 用の
+/// native 収束判定は raw native ではなく `max(native_long, この値)` を実 target とする
+/// (GitHub issue #1, Codex P2: そうしないと小 PDF で先読みが永久保留になる)。
+pub const PDF_RENDER_MIN_LONG_PX: u32 = 256;
+/// PDF レンダ結果の長辺ピクセル上限 (テクスチャメモリ保護、`target_px` clamp 上限)。
+pub const PDF_RENDER_MAX_LONG_PX: u32 = 8192;
+
 pub fn render_page_async(
     pdf_path: &Path,
     page_num: u32,
