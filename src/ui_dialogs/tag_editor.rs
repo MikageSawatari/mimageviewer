@@ -221,6 +221,7 @@ impl App {
                 if self.tag_view.active {
                     self.execute_tag_view();
                 }
+                self.invalidate_tag_apply_suggestions();
                 self.show_feedback_toast(message);
             }
             Err(e) => self.show_feedback_toast(format!("タグの改名/統合に失敗: {e}")),

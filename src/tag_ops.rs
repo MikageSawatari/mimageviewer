@@ -535,6 +535,9 @@ impl App {
             let key = crate::tags_db::item_key_for_path(&path);
             self.tags_cache.insert(key, tags);
         }
+        if tags_cache_changed {
+            self.invalidate_tag_apply_suggestions();
+        }
         for (target, tags) in sidecar_updates {
             self.mirror_tag_sidecar_update(&target, &tags);
         }
@@ -616,6 +619,9 @@ impl App {
                 }
                 if changed && self.tag_view.active {
                     self.execute_tag_view();
+                }
+                if changed {
+                    self.invalidate_tag_apply_suggestions();
                 }
 
                 crate::logger::log(format!(

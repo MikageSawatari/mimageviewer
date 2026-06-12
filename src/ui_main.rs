@@ -1345,6 +1345,7 @@ impl App {
         let mut toolbar_tag_click: Option<String> = None;
         let mut toolbar_tag_search: Option<String> = None;
         let mut toolbar_tag_apply = false;
+        let mut toolbar_tag_view_open = false;
         let mut toolbar_combo_popup_open = false;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -1767,11 +1768,18 @@ impl App {
                     toolbar_label(ui, "タグ:", 42.0);
                     let has_target = self.tag_target_path_count() > 0;
                     if ui
-                        .add_enabled(has_target, egui::Button::new("設定…"))
+                        .add_enabled(has_target, egui::Button::new("設定"))
                         .hover_tip("選択中の項目へタグを付ける/外す")
                         .clicked()
                     {
                         toolbar_tag_apply = true;
+                    }
+                    if ui
+                        .button("検索")
+                        .hover_tip("タグビューを開く (Ctrl+T)")
+                        .clicked()
+                    {
+                        toolbar_tag_view_open = true;
                     }
                     for name in toolbar_tags {
                         let label = format!("#{name}");
@@ -1838,6 +1846,9 @@ impl App {
         }
         if toolbar_tag_apply {
             self.open_tag_apply_dialog();
+        }
+        if toolbar_tag_view_open {
+            self.open_tag_view();
         }
 
         // (旧) VST3 プラグイン管理ボタンの click handler はツールバーボタン削除に伴い撤去。

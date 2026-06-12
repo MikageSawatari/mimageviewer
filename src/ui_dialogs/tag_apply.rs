@@ -27,9 +27,13 @@ impl App {
         }
         self.hydrate_tags_cache_for_paths(&paths);
         self.tag_apply_input.clear();
+        self.invalidate_tag_apply_suggestions();
+        self.show_tag_apply = true;
+    }
+
+    pub(crate) fn invalidate_tag_apply_suggestions(&mut self) {
         self.tag_apply_suggestion_key = None;
         self.tag_apply_suggestions.clear();
-        self.show_tag_apply = true;
     }
 
     pub(crate) fn show_tag_apply_dialog(&mut self, ctx: &egui::Context) {
@@ -49,12 +53,6 @@ impl App {
             .iter()
             .map(|choice| choice.tag_key.clone())
             .collect();
-        let normalized_input =
-            crate::tags_db::normalize_tag_display_name(self.tag_apply_input.trim());
-        let suggestions = self.cached_tag_apply_suggestions(&normalized_input);
-        let input_len = normalized_input.chars().count();
-        let input_valid = !normalized_input.is_empty() && input_len <= 64;
-        let input_too_long = input_len > 64;
 
         let mut open = true;
         let mut close = false;
@@ -62,6 +60,7 @@ impl App {
         let mut remove_tag: Option<String> = None;
         let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
+        let ime_active = self.ime_input_active();
         let target_count = paths.len();
         let dialog_pos = ctx.content_rect().min + egui::vec2(70.0, 60.0);
 
@@ -81,11 +80,30 @@ impl App {
 
                 ui.horizontal(|ui| {
                     ui.label("タグ:");
-                    ui.add_sized(
+                    let input_resp = ui.add_sized(
                         [280.0, 22.0],
                         egui::TextEdit::singleline(&mut self.tag_apply_input)
                             .hint_text("作品名・作者名など"),
                     );
+                    if !input_resp.has_focus()
+                        && ctx.input(|i| i.focused)
+                        && !ui.memory(|m| m.focused().is_some())
+                    {
+                        input_resp.request_focus();
+                    }
+                    if ime_active && input_resp.lost_focus() {
+                        input_resp.request_focus();
+                    }
+                    let normalized_input =
+                        crate::tags_db::normalize_tag_display_name(self.tag_apply_input.trim());
+                    let input_len = normalized_input.chars().count();
+                    let input_valid = !normalized_input.is_empty() && input_len <= 64;
+                    if input_valid
+                        && enter_pressed
+                        && (input_resp.has_focus() || input_resp.lost_focus())
+                    {
+                        add_tag = Some(normalized_input.clone());
+                    }
                     if ui
                         .add_enabled(input_valid, egui::Button::new("付ける"))
                         .clicked()
@@ -99,6 +117,10 @@ impl App {
                         remove_tag = Some(normalized_input.clone());
                     }
                 });
+                let normalized_input =
+                    crate::tags_db::normalize_tag_display_name(self.tag_apply_input.trim());
+                let input_len = normalized_input.chars().count();
+                let input_too_long = input_len > 64;
                 if input_too_long {
                     ui.label(
                         egui::RichText::new("タグ名は 64 文字以内にしてください。")
@@ -128,6 +150,7 @@ impl App {
                 }
 
                 ui.add_space(10.0);
+                let suggestions = self.cached_tag_apply_suggestions(&normalized_input);
                 let pinned_choices: Vec<_> = suggestions
                     .iter()
                     .filter(|choice| choice.pinned)
@@ -205,9 +228,6 @@ impl App {
                     }
                 });
 
-                if enter_pressed && input_valid {
-                    add_tag = Some(normalized_input.clone());
-                }
                 if escape_pressed {
                     close = true;
                 }
@@ -216,16 +236,16 @@ impl App {
         if let Some(name) = add_tag {
             self.request_tag_add_for_selection(&name);
             self.tag_apply_input.clear();
-            self.tag_apply_suggestion_key = None;
+            self.invalidate_tag_apply_suggestions();
         }
         if let Some(name) = remove_tag {
             self.request_tag_remove_for_selection(&name);
+            self.invalidate_tag_apply_suggestions();
         }
         if close || !open {
             self.show_tag_apply = false;
             self.tag_apply_input.clear();
-            self.tag_apply_suggestion_key = None;
-            self.tag_apply_suggestions.clear();
+            self.invalidate_tag_apply_suggestions();
         }
     }
 
@@ -326,6 +346,9 @@ fn current_selection_tags(app: &App, paths: &[PathBuf]) -> Vec<TagChoice> {
 }
 
 fn tag_suggestions(app: &App, query: &str) -> Vec<TagChoice> {
+    const QUERY_LIMIT: usize = 24;
+    const RECENT_LIMIT: usize = 24;
+
     let query_key = crate::tags_db::normalize_tag_key(query);
     let registered: HashMap<String, (String, bool)> = app
         .settings
@@ -373,9 +396,11 @@ fn tag_suggestions(app: &App, query: &str) -> Vec<TagChoice> {
         };
     let add_summaries = |out: &mut Vec<TagChoice>,
                          seen: &mut HashSet<String>,
-                         summaries: &mut Vec<crate::tags_db::TagSummary>| {
+                         summaries: &mut Vec<crate::tags_db::TagSummary>,
+                         limit: usize| {
+        let mut added = 0usize;
         for summary in summaries.drain(..) {
-            if out.len() >= 24 {
+            if added >= limit {
                 break;
             }
             if !seen.insert(summary.tag_key.clone()) {
@@ -394,18 +419,20 @@ fn tag_suggestions(app: &App, query: &str) -> Vec<TagChoice> {
                 count: summary.count,
                 pinned,
             });
+            added += 1;
         }
     };
 
     if query_key.is_empty() {
         add_registered(&mut out, &mut seen, true);
-        add_summaries(&mut out, &mut seen, &mut summaries);
+        add_summaries(&mut out, &mut seen, &mut summaries, RECENT_LIMIT);
     } else {
         add_registered(&mut out, &mut seen, false);
-        add_summaries(&mut out, &mut seen, &mut summaries);
+        let remaining = QUERY_LIMIT.saturating_sub(out.len());
+        add_summaries(&mut out, &mut seen, &mut summaries, remaining);
+        out.truncate(QUERY_LIMIT);
     }
 
-    out.truncate(24);
     out
 }
 
