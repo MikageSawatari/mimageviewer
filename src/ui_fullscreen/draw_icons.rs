@@ -98,6 +98,76 @@ pub(crate) fn draw_close_icon(painter: &egui::Painter, c: egui::Pos2, _r: f32) {
     );
 }
 
+/// 下部ページシークバーの固定表示トグル用ロックアイコン。
+pub(super) fn draw_seek_lock_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, locked: bool) {
+    let white = egui::Color32::WHITE;
+    let stroke = egui::Stroke::new(1.7, white);
+    let body = egui::Rect::from_center_size(
+        egui::pos2(c.x, c.y + r * 0.22),
+        egui::vec2(r * 1.45, r * 0.95),
+    );
+    painter.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Outside);
+
+    let stem_bottom = body.top() + r * 0.12;
+    let stem_top = c.y - r * 0.48;
+    let half_w = r * 0.46;
+    if locked {
+        painter.line_segment(
+            [
+                egui::pos2(c.x - half_w, stem_bottom),
+                egui::pos2(c.x - half_w, stem_top),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(c.x + half_w, stem_bottom),
+                egui::pos2(c.x + half_w, stem_top),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(c.x - half_w, stem_top),
+                egui::pos2(c.x + half_w, stem_top),
+            ],
+            stroke,
+        );
+    } else {
+        let shift = r * 0.28;
+        painter.line_segment(
+            [
+                egui::pos2(c.x - half_w - shift, stem_bottom),
+                egui::pos2(c.x - half_w - shift, stem_top),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(c.x - half_w - shift, stem_top),
+                egui::pos2(c.x + half_w - shift, stem_top),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(c.x + half_w - shift, stem_top),
+                egui::pos2(c.x + half_w - shift, stem_top + r * 0.38),
+            ],
+            stroke,
+        );
+    }
+
+    painter.circle_filled(egui::pos2(c.x, c.y + r * 0.18), r * 0.14, white);
+    painter.line_segment(
+        [
+            egui::pos2(c.x, c.y + r * 0.28),
+            egui::pos2(c.x, c.y + r * 0.50),
+        ],
+        egui::Stroke::new(1.4, white),
+    );
+}
+
 /// 目アイコン (= プレビューボタン)。横長楕円 + 中央の瞳孔。
 /// 消しゴム / 隠蔽加工パネルの「押している間だけ最終結果プレビュー」ボタンに使う。
 pub(crate) fn draw_eye_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {

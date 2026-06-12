@@ -2558,6 +2558,11 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         ui.checkbox(&mut s.fullscreen_fit_no_downscale, "縮小しない");
     });
     ui.small("自動フィット時の倍率制限。ホイールなどの手動ズームは制限しません。");
+    ui.checkbox(
+        &mut s.fullscreen_seek_bar_locked,
+        "下部ページシークバーを固定表示",
+    );
+    ui.small("ON のときはフルスクリーン下端にシークバー領域を確保し、画像をその上の領域にフィットします。下部シークバー端の鍵アイコンからも切り替えできます。");
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label("見開きのページ間隔");

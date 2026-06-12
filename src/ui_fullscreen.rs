@@ -1658,6 +1658,24 @@ fn adjustment_panel_rect(full_rect: egui::Rect) -> egui::Rect {
     )
 }
 
+fn fullscreen_seek_panel_rect(full_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(full_rect.left(), full_rect.bottom() - FS_SEEK_BAR_HEIGHT),
+        full_rect.right_bottom(),
+    )
+    .intersect(full_rect)
+}
+
+fn fullscreen_rect_excluding_seek_panel(full_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        full_rect.min,
+        egui::pos2(
+            full_rect.max.x,
+            (full_rect.max.y - FS_SEEK_BAR_HEIGHT).max(full_rect.min.y + 1.0),
+        ),
+    )
+}
+
 /// VST3 コンパクト表示モード時の動画表示領域 (= 右上 1/4 = 幅・高さ各 1/2)。
 /// 残った左下 3/4 は黒背景のままなのでプラグイン GUI ウィンドウを置きやすい。
 fn vst3_compact_image_rect(full_rect: egui::Rect) -> egui::Rect {
@@ -1925,6 +1943,32 @@ impl App {
         egui::ViewportId::from_hash_of(("fullscreen_viewer", self.fs_viewport_generation))
     }
 
+    fn fullscreen_seek_overlay_allowed(&self, fs_idx: usize, is_video: bool) -> bool {
+        !is_video
+            && self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
+            && !self.any_dialog_open()
+            && !self.is_overlay_edit_mode_active()
+            && !self.analysis_mode
+    }
+
+    fn fullscreen_seek_bar_locked_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
+        self.settings.fullscreen_seek_bar_locked
+            && self.fullscreen_seek_overlay_allowed(fs_idx, is_video)
+    }
+
+    fn fullscreen_media_rect(
+        &self,
+        full_rect: egui::Rect,
+        fs_idx: usize,
+        is_video: bool,
+    ) -> egui::Rect {
+        if self.fullscreen_seek_bar_locked_for_idx(fs_idx, is_video) {
+            fullscreen_rect_excluding_seek_panel(full_rect)
+        } else {
+            full_rect
+        }
+    }
+
     fn fullscreen_seek_info(&self, fs_idx: usize) -> Option<FsSeekInfo> {
         let display_order = self.current_grid_order();
         let image_indices = build_image_reading_indices(&self.items, display_order);
@@ -1981,7 +2025,7 @@ impl App {
         // 分析モード中は対象画像に集中するため、下端のページシークバーを出さない
         // (分析パネルの手描き content が下端にあり、clip しないままシークバーへはみ出す
         // 問題も併せて解消される)。
-        if self.any_dialog_open() || self.is_overlay_edit_mode_active() || self.analysis_mode {
+        if !self.fullscreen_seek_overlay_allowed(fs_idx, false) {
             self.fs_seek_drag_active = false;
             return None;
         }
@@ -1991,7 +2035,7 @@ impl App {
             self.fs_seek_drag_active = false;
         }
         const SEEK_HOVER_HEIGHT: f32 = 78.0;
-        const SEEK_BAR_HEIGHT: f32 = FS_SEEK_BAR_HEIGHT;
+        let locked = self.settings.fullscreen_seek_bar_locked;
 
         let bottom_band = egui::Rect::from_min_max(
             egui::pos2(full_rect.left(), full_rect.bottom() - SEEK_HOVER_HEIGHT),
@@ -2002,27 +2046,22 @@ impl App {
                 .hover_pos()
                 .is_some_and(|pos| bottom_band.contains(pos))
         });
-        if !bottom_hover && !self.fs_seek_drag_active {
+        if !locked && !bottom_hover && !self.fs_seek_drag_active {
             return None;
         }
 
-        let panel_rect = egui::Rect::from_min_max(
-            egui::pos2(full_rect.left(), full_rect.bottom() - SEEK_BAR_HEIGHT),
-            full_rect.right_bottom(),
-        )
-        .intersect(full_rect);
+        let panel_rect = fullscreen_seek_panel_rect(full_rect);
         if panel_rect.width() < 160.0 {
             return None;
         }
 
         self.fs_seek_overlay_visible = true;
-        let painter = ui.painter();
-        painter.rect_filled(
+        ui.painter().rect_filled(
             panel_rect,
             0.0,
             egui::Color32::from_rgba_unmultiplied(8, 10, 14, 224),
         );
-        painter.hline(
+        ui.painter().hline(
             panel_rect.x_range(),
             panel_rect.top(),
             egui::Stroke::new(
@@ -2031,12 +2070,41 @@ impl App {
             ),
         );
 
+        let lock_x = panel_rect.right() - BAR_BUTTON_SIZE - 6.0;
+        let lock_y = panel_rect.center().y - BAR_BUTTON_SIZE * 0.5;
+        let lock_resp = draw_bar_button(
+            ui,
+            lock_x,
+            lock_y,
+            "fullscreen_seek_lock",
+            |hovered| bar_button_bg(hovered, locked),
+            locked,
+            |p, c, r| draw_seek_lock_icon(p, c, r, locked),
+        );
+        let lock_resp = lock_resp.hover_tip_dark(if locked {
+            "シークバー固定を解除"
+        } else {
+            "シークバーを固定表示"
+        });
+        if lock_resp.clicked() {
+            self.settings.fullscreen_seek_bar_locked = !locked;
+            self.settings.save();
+            ctx.request_repaint();
+        }
+
+        let content_right = (lock_x - 6.0).max(panel_rect.left());
+        let content_rect = egui::Rect::from_min_max(
+            panel_rect.min,
+            egui::pos2(content_right, panel_rect.bottom()),
+        );
+        let painter = ui.painter();
+
         let all_nav_items_are_images =
             info.media_count == info.image_indices.len() && !info.image_indices.is_empty();
         if !all_nav_items_are_images {
             let summary = Self::fullscreen_mixed_media_summary(&info);
             painter.text(
-                panel_rect.center(),
+                content_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 summary,
                 egui::FontId::proportional(14.0),
@@ -2047,7 +2115,7 @@ impl App {
 
         let total = info.image_indices.len();
         let is_rtl = self.reading_direction == ReadingDirection::Rtl;
-        let inner = panel_rect.shrink2(egui::vec2(12.0, 7.0));
+        let inner = content_rect.shrink2(egui::vec2(12.0, 7.0));
         let font = egui::FontId::monospace(13.0);
         let sample_label = format!("{}/{}", total, total);
         let sample_galley = painter.layout_no_wrap(
@@ -2690,7 +2758,7 @@ impl App {
                         } else if vst3_compact_active {
                             vst3_compact_image_rect(full_rect)
                         } else {
-                            full_rect
+                            self.fullscreen_media_rect(full_rect, fs_idx, state.is_video)
                         };
 
                         // ── 画像 / 動画 / セパレータ描画 ──
@@ -3090,13 +3158,13 @@ impl App {
                                 // overlay の向きが表示とズレる (アプリ全体の overlay 共通制限)。
                                 let crop_image_rect = {
                                     let display_size = egui::vec2(w as f32, h as f32);
-                                    let fit_scale = (full_rect.width() / display_size.x)
-                                        .min(full_rect.height() / display_size.y);
+                                    let fit_scale = (image_rect.width() / display_size.x)
+                                        .min(image_rect.height() / display_size.y);
                                     let (total_scale, center) = match self.fs_zoom_pan() {
                                         Some((zoom, pan)) => {
-                                            (fit_scale * zoom, full_rect.center() + pan)
+                                            (fit_scale * zoom, image_rect.center() + pan)
                                         }
-                                        None => (fit_scale, full_rect.center()),
+                                        None => (fit_scale, image_rect.center()),
                                     };
                                     egui::Rect::from_center_size(
                                         center,
@@ -3131,7 +3199,7 @@ impl App {
                         // 見開き・分析・補正モードでは内部で早期 return する。
                         // 消しゴムモードのマスクオーバーレイより上に載せる (最新状態を拡大)。
                         self.draw_fs_loupe_if_active(
-                            ui, ctx, full_rect, fs_idx,
+                            ui, ctx, image_rect, fs_idx,
                             state.tex.as_ref(), state.thumb_tex.as_ref(),
                             is_spread_double,
                         );
@@ -5689,6 +5757,21 @@ impl App {
         let continuous_active = self
             .fullscreen_idx
             .is_some_and(|idx| self.continuous_reading_active_for_idx(idx));
+        let default_image_rect = self
+            .fullscreen_idx
+            .map(|idx| self.fullscreen_media_rect(full_rect, idx, state.is_video))
+            .unwrap_or(full_rect);
+        let seek_panel_rect = fullscreen_seek_panel_rect(full_rect);
+        let seek_panel_interactive = self.fullscreen_idx.is_some_and(|idx| {
+            self.fullscreen_seek_overlay_allowed(idx, state.is_video)
+                && (self.settings.fullscreen_seek_bar_locked
+                    || self.fs_seek_drag_active
+                    || ctx.input(|i| {
+                        i.pointer
+                            .hover_pos()
+                            .is_some_and(|p| seek_panel_rect.contains(p))
+                    }))
+        });
 
         // VST editor windows are bridge-process native windows. In the
         // cross-process owner-popup case, egui can still report this viewport as
@@ -5818,6 +5901,7 @@ impl App {
                         let in_text_panel = self.text_mode
                             && (self.text_panel_rect(full_rect).contains(p)
                                 || self.text_detail_panel_rect(full_rect).contains(p));
+                        let in_seek_panel = seek_panel_interactive && seek_panel_rect.contains(p);
                         in_right
                             || in_left
                             || in_erase_panel
@@ -5825,6 +5909,7 @@ impl App {
                             || in_conceal_panel
                             || in_export_crop_panel
                             || in_text_panel
+                            || in_seek_panel
                     })
                     .unwrap_or(false)
             });
@@ -5874,7 +5959,7 @@ impl App {
                 Some((self.analysis_zoom, self.analysis_pan)),
             )
         } else {
-            (full_rect, self.fs_zoom_pan())
+            (default_image_rect, self.fs_zoom_pan())
         };
         // pair が準備中 (Shift+C 直後、worker 完了前) は pinned スロットの元サイズで
         // フィット矩形を作る。compare_image_draw_rect はアスペクト比だけで矩形が決まるので
@@ -5908,7 +5993,7 @@ impl App {
         // パネル上で「開始」された中ボタンは無視して下流に流すが、既にドラッグが
         // 走っているときはカーソルがパネルを通過しても継続させる (UX のブレ防止)。
         if !cursor_in_panel || self.fs_middle_zoom_drag.is_some() {
-            self.handle_middle_drag_zoom(ctx, full_rect);
+            self.handle_middle_drag_zoom(ctx, default_image_rect);
         }
 
         // 動画タイルモード中でも Ctrl なし Wheel は前後アイテム移動に使う。
@@ -5971,7 +6056,7 @@ impl App {
                         &mut self.fs_pan,
                         wheel_y,
                         mouse,
-                        full_rect.center(),
+                        default_image_rect.center(),
                     );
                     if changed {
                         self.maybe_rerender_pdf(self.fs_zoom);
@@ -6033,9 +6118,13 @@ impl App {
             let primary_down = fs_response.dragged_by(egui::PointerButton::Primary);
             let primary_released = fs_response.drag_stopped_by(egui::PointerButton::Primary);
             let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+            let pointer_in_seek_panel =
+                pointer_pos.is_some_and(|p| seek_panel_interactive && seek_panel_rect.contains(p));
 
             // 見開き 2 ページ表示中はフリー回転が描画に反映されないため、Ctrl+ドラッグ回転を無効化する
-            if mods.ctrl && !is_spread_double && self.reading_flow.is_paged() {
+            if pointer_in_seek_panel {
+                // 下部シークバー上の入力はバー側のウィジェットに任せる。
+            } else if mods.ctrl && !is_spread_double && self.reading_flow.is_paged() {
                 // Ctrl+ドラッグ → 回転
                 if primary_pressed {
                     if let Some(pos) = pointer_pos {
@@ -6044,7 +6133,7 @@ impl App {
                 } else if primary_down {
                     if let Some((start_pos, start_rot)) = self.fs_rotation_drag_start {
                         if let Some(pos) = pointer_pos {
-                            let center = full_rect.center() + self.fs_pan;
+                            let center = default_image_rect.center() + self.fs_pan;
                             let start_angle =
                                 (start_pos.y - center.y).atan2(start_pos.x - center.x);
                             let cur_angle = (pos.y - center.y).atan2(pos.x - center.x);
@@ -6150,11 +6239,17 @@ impl App {
                                 let in_left_panel = self.adjustment_mode
                                     && pos.x < adjustment_panel_rect(full_rect).max.x
                                     && pos.y >= 60.0;
+                                let in_seek_panel =
+                                    seek_panel_interactive && seek_panel_rect.contains(pos);
                                 // 連続読み中はクリックでのページジャンプを抑制する。連続読みは
                                 // 連続スクロール表示なので、左半分/右半分クリックで別ファイルへ
                                 // 飛ぶのはモデルに反する (特に fs_zoom が一瞬インフレされず
                                 // has_transform=false になった隙のクリックで誤爆する)。
-                                if !in_right_panel && !in_left_panel && !continuous_active {
+                                if !in_right_panel
+                                    && !in_left_panel
+                                    && !in_seek_panel
+                                    && !continuous_active
+                                {
                                     let base = if pos.x > full_rect.center().x { 1 } else { -1 };
                                     nav_delta = self.spread_nav_delta(base);
                                 }
@@ -6184,10 +6279,14 @@ impl App {
             let secondary_down = ctx.input(|i| i.pointer.secondary_down());
             let secondary_released = ctx.input(|i| i.pointer.secondary_released());
             let secondary_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+            let secondary_in_seek_panel =
+                seek_panel_interactive && seek_panel_rect.contains(secondary_pos);
             // 旧 egui HUD は撤去済 (native presenter overlay が右クリックも独自処理)。
             // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
 
-            if secondary_down && self.fs_secondary_press_start.is_none() {
+            if secondary_in_seek_panel {
+                self.fs_secondary_press_start = None;
+            } else if secondary_down && self.fs_secondary_press_start.is_none() {
                 // 押下開始を記録
                 self.fs_secondary_press_start = Some((std::time::Instant::now(), secondary_pos));
             }
@@ -7121,6 +7220,13 @@ impl App {
 
     fn continuous_reading_viewport_len_for_flow(&self, ctx: &egui::Context) -> f32 {
         let viewport = ctx.content_rect();
+        let viewport = self
+            .fullscreen_idx
+            .map(|idx| {
+                let is_video = matches!(self.items.get(idx), Some(GridItem::Video(_)));
+                self.fullscreen_media_rect(viewport, idx, is_video)
+            })
+            .unwrap_or(viewport);
         if self.reading_flow.is_horizontal() {
             viewport.width().max(1.0)
         } else {
@@ -10232,7 +10338,7 @@ impl App {
     /// フルスクリーン UI が「クリーンな状態」(= 上部バー / 左右パネル / HUD / モーダルが
     /// 何も出ていない) か判定する。`true` かつアイドル時間が `CURSOR_HIDE_IDLE_SECS` を
     /// 超えたらマウスカーソルを `CursorIcon::None` で非表示にする。
-    fn fs_ui_is_clean(&self, ctx: &egui::Context, full_rect: egui::Rect, _is_video: bool) -> bool {
+    fn fs_ui_is_clean(&self, ctx: &egui::Context, full_rect: egui::Rect, is_video: bool) -> bool {
         let pointer = ctx.input(|i| i.pointer.hover_pos());
         // Once the cursor is hidden, the last hover position is stale until a real input
         // event arrives. Do not let that passive position keep hover UI "visible" and
@@ -10243,8 +10349,12 @@ impl App {
             && pointer.is_some_and(|p| p.x > full_rect.max.x - full_rect.width() * 0.25);
         // 動画再生中の HUD / speed popup は native presenter overlay 側で管理されるため
         // egui main window のカーソル可視判定からは除外する (= 旧 egui HUD は撤去済)。
+        let locked_seek_bar_visible = self
+            .fullscreen_idx
+            .is_some_and(|idx| self.fullscreen_seek_bar_locked_for_idx(idx, is_video));
         !in_top
             && !in_right
+            && !locked_seek_bar_visible
             && !self.show_metadata_panel
             && !self.metadata_panel_hover_active
             && !self.adjustment_mode
@@ -13819,6 +13929,19 @@ mod tests {
         assert!(!should_handle_fullscreen_wheel(
             false, false, true, false, true
         ));
+    }
+
+    #[test]
+    fn locked_seek_bar_reserves_bottom_media_rect() {
+        let full = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 800.0));
+        let panel = fullscreen_seek_panel_rect(full);
+        let media = fullscreen_rect_excluding_seek_panel(full);
+
+        assert_eq!(panel.top(), 800.0 - FS_SEEK_BAR_HEIGHT);
+        assert_eq!(panel.bottom(), 800.0);
+        assert_eq!(media.top(), 0.0);
+        assert_eq!(media.bottom(), panel.top());
+        assert_eq!(media.width(), full.width());
     }
 
     #[test]
