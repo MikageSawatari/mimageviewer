@@ -3869,6 +3869,7 @@ mod favorite_adjustment_defaults_tests {
             tx,
             crate::undo_stack::TagChange {
                 path: path.clone(),
+                tag_sidecar: None,
                 before: actual_before.clone(),
                 after: actual_after.clone(),
             },
@@ -3904,6 +3905,7 @@ mod favorite_adjustment_defaults_tests {
             tx,
             crate::undo_stack::TagChange {
                 path: path_ok,
+                tag_sidecar: None,
                 before: vec![],
                 after: vec!["#A".into()],
             },
@@ -3950,6 +3952,7 @@ mod favorite_adjustment_defaults_tests {
             tx1,
             crate::undo_stack::TagChange {
                 path: path.clone(),
+                tag_sidecar: None,
                 before: vec!["#A".into()],
                 after: vec!["#A".into(), "#B".into()],
             },
@@ -3963,6 +3966,7 @@ mod favorite_adjustment_defaults_tests {
             tx2,
             crate::undo_stack::TagChange {
                 path: path.clone(),
+                tag_sidecar: None,
                 before: vec!["#A".into(), "#B".into()],
                 after: vec!["#A".into(), "#B".into(), "#C".into()],
             },
@@ -4013,6 +4017,7 @@ mod favorite_adjustment_defaults_tests {
             tx,
             crate::undo_stack::TagChange {
                 path: PathBuf::from("C:/pics/a.jpg"),
+                tag_sidecar: None,
                 before: vec![],
                 after: vec!["#A".into()],
             },

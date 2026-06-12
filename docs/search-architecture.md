@@ -122,7 +122,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | `search_index.db` | Ctrl+S 用フォルダ/ZIP/PDF/動画名 index (SQLite LIKE で引く) | `search_index_db.rs` | `indexed_by_auto` 列で手動/自動エントリを区別 |
 | `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession | schema 変更は `schema_is_stale` (STORED 必須含む) で検出し全消去 + 再構築。`tags` フィールドは旧タグ移行専用で通常検索対象外 |
 | `fts_meta.db` | `files(path PK, favorite_id, kind, mtime, size, indexed_at, index_version, index_generation, status)` — INDEX_VERSION=5 で `*_norm` 列群を撤去し管理メタ専用に縮小 | `fts_meta.rs` | `INDEX_VERSION` を bump すると `needs_rebuild` が `*_norm` 残存も検出して全再構築を促す |
-| `tags.db` | `item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本 | `tags_db.rs` / `tag_write_worker.rs` | `tag_key` は NFKC + lowercase + `#` なし。旧 XMP/Tantivy タグの移行フラグもここに置く |
+| `tags.db` | `item_tags(item_key, tag, tag_key, applied_at)` / `tag_item_state` / `tag_meta`。mIV タグの正本 | `tags_db.rs` / `tag_write_worker.rs` | `tag_key` は NFKC + lowercase + `#` なし。旧 XMP/Tantivy タグの移行フラグと、任意のタグ sidecar backup import 同期状態もここに置く |
 
 **パスキー正規化**: Windows の大文字小文字非区別と区切り文字混在に備え、
 fts_meta.db / Tantivy / 起動時 diff・Ctrl+F on-demand 判定の全経路で `normalize_path`

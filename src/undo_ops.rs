@@ -505,6 +505,7 @@ impl App {
             // SetTags ジョブ自体は新しい undo entry を生まないので 0 で十分。
             h.submit(TagWriteJob {
                 path: c.path.clone(),
+                tag_sidecar: c.tag_sidecar.clone(),
                 kind: TagJobKind::SetTags(target.clone()),
                 tx_id: 0,
             });

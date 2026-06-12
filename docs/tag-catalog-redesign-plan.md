@@ -516,7 +516,7 @@ v1.0 は `#タグ` を **ファイル XMP / 動画 `.xmp`** に書き、同時�
   [src/tag_ops.rs](../src/tag_ops.rs): 読み出し元を `tags.db` に、**6 種対応 (フォルダ含む)**、表示は `#` 付き・
   保存は `#` なし。
 - [src/sidecar.rs](../src/sidecar.rs): `SidecarEntry` に `tags`、`tag_sidecar_backup_enabled` で gate、
-  実ファイル 5 種のキー拡張 (§4.1)。
+  実ファイル 5 種のキー拡張 (§4.1)。**実装済み (2026-06-12)**。
 - [src/ui_metadata_panel.rs](../src/ui_metadata_panel.rs): タグセクション mIV のみ、外部タグ区別表示を削除。
 - 移行: Tantivy `tags` 走査 → `#` 剥がし → `tags.db` 一括コピー (§7.1)。
 

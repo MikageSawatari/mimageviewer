@@ -195,6 +195,9 @@
         <strong>バックアップ:</strong>
         タグを初めて更新する前に <code>tags.db.bak1</code>〜<code>tags.db.bak10</code> の世代バックアップを自動作成します。
         バックアップは <code>tags.db</code> と同じ <code>%APPDATA%\mimageviewer</code> に保存されます。
+        <br>
+        設定で「フォルダにタグのバックアップを保存する」を ON にすると、画像・動画・ZIP/PDF など実ファイルのタグを
+        そのフォルダの <code>mimageviewer.dat</code> にも保存できます。整理用タグを共有先に残したくない場合に備え、この設定は既定で OFF です。
       </div>
     </div>
 
@@ -216,7 +219,7 @@
       <tbody>
         <tr><td>画像ファイル</td><td>◯</td><td>JPEG / PNG / WebP など表示対象の画像</td></tr>
         <tr><td>動画ファイル</td><td>◯</td><td>MP4 / MKV / MOV など</td></tr>
-        <tr><td>フォルダ</td><td>◯</td><td>整理用のコンテナとしてタグ付け可能</td></tr>
+        <tr><td>フォルダ</td><td>◯</td><td>整理用のコンテナとしてタグ付け可能。フォルダ側バックアップの対象外です</td></tr>
         <tr><td>ZIP / PDF ファイル</td><td>◯</td><td>本体ファイルにタグ付け可能</td></tr>
         <tr><td>RAR / 7z / LZH などの対応アーカイブ</td><td>◯</td><td>変換前アーカイブのパスにタグ付け</td></tr>
         <tr><td>ZIP 内画像 / PDF ページ</td><td>✗</td><td>ページ単位ではなくコンテナ本体へ付けます</td></tr>

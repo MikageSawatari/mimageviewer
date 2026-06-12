@@ -8,20 +8,41 @@ use std::path::PathBuf;
 
 use crate::app::App;
 use crate::grid_item::GridItem;
-use crate::tag_write_worker::{TagAction, TagJobKind, TagWriteHandle, TagWriteJob};
+use crate::tag_write_worker::{
+    TagAction, TagJobKind, TagSidecarTarget, TagWriteHandle, TagWriteJob,
+};
 
-fn tag_target_path_for_item(item: &GridItem, fullscreen: bool) -> Option<PathBuf> {
-    match item {
+#[derive(Clone)]
+struct TagTarget {
+    path: PathBuf,
+    tag_sidecar: Option<TagSidecarTarget>,
+}
+
+fn tag_sidecar_target_for_path(path: &std::path::Path) -> Option<TagSidecarTarget> {
+    Some(TagSidecarTarget {
+        folder: path.parent()?.to_path_buf(),
+        rel_key: path.file_name()?.to_string_lossy().to_lowercase(),
+    })
+}
+
+fn tag_target_for_item(item: &GridItem, fullscreen: bool) -> Option<TagTarget> {
+    let (path, sidecar_path) = match item {
         GridItem::Folder(p)
         | GridItem::Image(p)
         | GridItem::Video(p)
         | GridItem::ZipFile(p)
-        | GridItem::PdfFile(p)
-        | GridItem::ConvertibleArchive { path: p, .. } => Some(p.clone()),
-        GridItem::ZipImage { zip_path, .. } if fullscreen => Some(zip_path.clone()),
-        GridItem::PdfPage { pdf_path, .. } if fullscreen => Some(pdf_path.clone()),
-        _ => None,
-    }
+        | GridItem::PdfFile(p) => (p.clone(), !matches!(item, GridItem::Folder(_))),
+        GridItem::ConvertibleArchive { path: p, .. } => (p.clone(), true),
+        GridItem::ZipImage { zip_path, .. } if fullscreen => (zip_path.clone(), true),
+        GridItem::PdfPage { pdf_path, .. } if fullscreen => (pdf_path.clone(), true),
+        _ => return None,
+    };
+    Some(TagTarget {
+        tag_sidecar: sidecar_path
+            .then(|| tag_sidecar_target_for_path(&path))
+            .flatten(),
+        path,
+    })
 }
 
 impl App {
@@ -37,17 +58,17 @@ impl App {
     ///   4. selected も無ければ fullscreen_idx (フルスクリーンに居なくても残っていれば)。
     /// いずれも実パスを持つタグ対応 item のみ。ZIP/PDF ページのフルスクリーン中は
     /// コンテナ自身へフォールバックする。
-    pub(crate) fn tag_target_paths(&self) -> Vec<PathBuf> {
-        let push_taggable = |out: &mut Vec<PathBuf>, idx: usize, items: &[GridItem], fs: bool| {
+    fn tag_targets(&self) -> Vec<TagTarget> {
+        let push_taggable = |out: &mut Vec<TagTarget>, idx: usize, items: &[GridItem], fs: bool| {
             let Some(item) = items.get(idx) else {
                 return;
             };
-            if let Some(p) = tag_target_path_for_item(item, fs) {
-                out.push(p);
+            if let Some(target) = tag_target_for_item(item, fs) {
+                out.push(target);
             }
         };
 
-        let mut out: Vec<PathBuf> = Vec::new();
+        let mut out: Vec<TagTarget> = Vec::new();
         if let Some(fs_idx) = self.fullscreen_idx {
             push_taggable(&mut out, fs_idx, &self.items, true);
             return out;
@@ -70,8 +91,15 @@ impl App {
         out
     }
 
+    pub(crate) fn tag_target_paths(&self) -> Vec<PathBuf> {
+        self.tag_targets()
+            .into_iter()
+            .map(|target| target.path)
+            .collect()
+    }
+
     pub(crate) fn tag_target_path_count(&self) -> usize {
-        self.tag_target_paths().len()
+        self.tag_targets().len()
     }
 
     pub(crate) fn request_tag_toggle_for_selection(&mut self, name: &str) {
@@ -91,10 +119,11 @@ impl App {
             self.fullscreen_idx,
             self.checked.len(),
         ));
-        let paths = self.tag_target_paths();
-        if paths.is_empty() {
+        let targets = self.tag_targets();
+        if targets.is_empty() {
             return;
         }
+        let paths: Vec<PathBuf> = targets.iter().map(|target| target.path.clone()).collect();
         if !self.precheck_tag_write_available("toggle") {
             return;
         }
@@ -139,7 +168,7 @@ impl App {
         let tx_id = self.next_tag_tx_id();
         self.register_pending_tag_op(tx_id, summary, paths.len());
         let name_for_jobs = name_owned;
-        self.submit_tag_jobs(&paths, "toggle", tx_id, move |_| {
+        self.submit_tag_jobs(&targets, "toggle", tx_id, move |_| {
             if all_have_tag {
                 TagJobKind::Remove(name_for_jobs.clone())
             } else {
@@ -161,10 +190,11 @@ impl App {
         if name.is_empty() {
             return;
         }
-        let paths = self.tag_target_paths();
-        if paths.is_empty() {
+        let targets = self.tag_targets();
+        if targets.is_empty() {
             return;
         }
+        let paths: Vec<PathBuf> = targets.iter().map(|target| target.path.clone()).collect();
         if !self.precheck_tag_write_available(if add { "add" } else { "remove" }) {
             return;
         }
@@ -202,7 +232,7 @@ impl App {
         let tx_id = self.next_tag_tx_id();
         self.register_pending_tag_op(tx_id, summary, paths.len());
         self.submit_tag_jobs(
-            &paths,
+            &targets,
             if add { "add" } else { "remove" },
             tx_id,
             move |_| {
@@ -217,14 +247,15 @@ impl App {
 
     pub(crate) fn request_tag_clear_for_selection(&mut self) {
         self.tag_toast_label = None; // clear は付与/削除ラベル不要 (complete 時にクリア件数で集計)
-        let paths = self.tag_target_paths();
-        let count = paths.len();
+        let targets = self.tag_targets();
+        let count = targets.len();
         if count == 0 {
             crate::logger::log(
                 "[TAG] clear requested but tag_target_paths is empty — ignoring".to_string(),
             );
             return;
         }
+        let paths: Vec<PathBuf> = targets.iter().map(|target| target.path.clone()).collect();
         crate::logger::log(format!(
             "[TAG] clear requested for {count} file(s) (mIV tags only)"
         ));
@@ -237,7 +268,7 @@ impl App {
         self.show_feedback_toast(format!("{count} 件から mIV タグをクリア中"));
         let tx_id = self.next_tag_tx_id();
         self.register_pending_tag_op(tx_id, summary, paths.len());
-        self.submit_tag_jobs(&paths, "clear", tx_id, |_| TagJobKind::ClearMiv);
+        self.submit_tag_jobs(&targets, "clear", tx_id, |_| TagJobKind::ClearMiv);
     }
 
     /// `tag_write_handle` を遅延初期化し、利用可能か確認する。
@@ -256,7 +287,7 @@ impl App {
     }
 
     /// タグ書き込みジョブ投入の共通経路。
-    /// - 呼び出し側が `tag_target_paths()` で算出した `paths` をそのまま渡す。
+    /// - 呼び出し側が `tag_targets()` で算出した対象をそのまま渡す。
     /// - `tx_id` は `register_pending_tag_op` で発行したトランザクション ID
     ///   (worker 結果から `pending_tag_undos` を引くためのキー)。Undo 確定不要なら 0。
     /// - 対象 path が 0 件 → 黙って何もしない
@@ -265,12 +296,12 @@ impl App {
     ///   `poll_tag_write_results` が集計結果で出す)
     fn submit_tag_jobs(
         &mut self,
-        paths: &[PathBuf],
+        targets: &[TagTarget],
         op_label: &str,
         tx_id: u64,
         kind_for: impl Fn(&PathBuf) -> TagJobKind,
     ) {
-        if paths.is_empty() {
+        if targets.is_empty() {
             crate::logger::log(format!(
                 "[TAG] submit '{op_label}' aborted: tag_target_paths is empty \
                  (selected={:?} fullscreen_idx={:?} checked_count={})",
@@ -290,12 +321,14 @@ impl App {
         };
         crate::logger::log(format!(
             "[TAG] submitting '{op_label}' (tx={tx_id}) for {} item(s):",
-            paths.len()
+            targets.len()
         ));
-        for p in paths {
+        for target in targets {
+            let p = &target.path;
             crate::logger::log(format!("[TAG]   → {}", p.display()));
             h.submit(TagWriteJob {
                 path: p.clone(),
+                tag_sidecar: target.tag_sidecar.clone(),
                 kind: kind_for(p),
                 tx_id,
             });
@@ -353,6 +386,7 @@ impl App {
         // worker が返してきた (path, 書き込み後タグ列) を後でまとめて tags_cache に反映する。
         // 次フレームの `cell_tag_list` が正しい値を拾えるため add/remove 対称になる。
         let mut cache_updates: Vec<(PathBuf, Vec<String>)> = Vec::new();
+        let mut sidecar_updates: Vec<(TagSidecarTarget, Vec<String>)> = Vec::new();
         // pending_tag_undos に積み上げる: (tx_id, TagChange or failure marker)。
         // tx_id == 0 は「Undo 確定不要」(Undo/Redo 由来の SetTags 等) なのでスキップ。
         let mut pending_updates: Vec<PendingUpdate> = Vec::new();
@@ -395,10 +429,14 @@ impl App {
                                 tx_id: res.tx_id,
                                 change: crate::undo_stack::TagChange {
                                     path: res.path.clone(),
+                                    tag_sidecar: res.tag_sidecar.clone(),
                                     before: res.tags_before,
                                     after: res.tags_after.clone(),
                                 },
                             });
+                        }
+                        if let Some(target) = res.tag_sidecar.clone() {
+                            sidecar_updates.push((target, res.tags_after.clone()));
                         }
                         cache_updates.push((res.path, res.tags_after));
                     }
@@ -426,6 +464,9 @@ impl App {
         for (path, tags) in cache_updates {
             let key = crate::tags_db::item_key_for_path(&path);
             self.tags_cache.insert(key, tags);
+        }
+        for (target, tags) in sidecar_updates {
+            self.mirror_tag_sidecar_update(&target, &tags);
         }
         if tags_cache_changed && self.settings.facet_filter.uses_tag_state() {
             self.rebuild_visible_indices();

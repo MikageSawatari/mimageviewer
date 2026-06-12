@@ -776,6 +776,7 @@ SendTo から渡されたファイル / フォルダは Windows により位置�
 | `pause_indexer_while_minimized` | bool | false | タスクトレイ常駐中にファイル監視 / インデックス更新を一時停止する。OFF でも常駐中は I/O 並列度を絞る |
 | `folder_thumb_depth` | u32 | 3 | フォルダ代表画像の探索最大階層数（0 で直接の子のみ） |
 | `sidecar_backup_enabled` | bool | true | フォルダ直下に `mimageviewer.dat` (Hidden+System 属性の JSON) を作り、補正・消しゴムマスクの設定をバックアップする。フォルダ丸ごと別ドライブへ移動しても設定が保持される。OFF 時は読み書き両方スキップ |
+| `tag_sidecar_backup_enabled` | bool | false | タグをフォルダ直下の `mimageviewer.dat` にもバックアップする。`tags.db` が正本で、この設定は移動時復元用の opt-in。フォルダタグは対象外。OFF 時はタグバックアップの読み書きをスキップ |
 | `folder_tree_pane_visible` | bool | false | 左側の実フォルダツリーペインを表示 |
 | `folder_tree_pane_width_ratio` | f32 | 0.22 | フォルダツリーペインの左右境界位置 (ウィンドウ幅に対する比率)。復元時は最小/最大幅にクランプ |
 | `show_toolbar_favorites` | bool | true | ツールバーにお気に入りを表示 |
@@ -861,7 +862,7 @@ Ctrl+F (ローカル検索) はこれらの制約を受けない。
 |---|---|---|---|---|
 | Ctrl+S | コンテナ検索 | お気に入り全体のフォルダ / ZIP / PDF を名前で | コンテナ索引 `search_index.db` (SQLite LIKE) | 「種別」ドロップダウン (すべて / フォルダ / ZIP / PDF) で絞れる。動画は対象外 (動画はアイテム) |
 | Ctrl+F | 現在地フィルタ | **現グリッドの表示中アイテムのみ** (非再帰・索引なし) | worker 上のオンデマンド判定 | 構造アイテム (フォルダ / ZIP / PDF) もファイル名で一貫して絞り込む。画像 / 動画は PNG tEXt / JPEG EXIF UserComment の AI 生成メタ + EXIF + XMP + 動画メタ + タグ + 外部メタデータサイドカー、PDF はファイル名 + document info。検索中は item 単位の処理済み数 / 総数を表示する。フィルタ元フォルダでは BS / Alt+↑ / ⬆ による親移動を止めるが、結果から子フォルダへ入った後の BS は通常どおり戻れる。PDF ページ表示中は無効、ZIP 表示中はファイル名フィルタに固定 |
-| Ctrl+G | アイテム検索 | **お気に入り全体 (`auto_index_metadata=true`) の画像 / PDF / 動画** | アイテム索引 (Tantivy bigram) で候補絞り込み → STORED 原文を `matches()` で phrase/NOT/AND 正確判定 (streaming) | ZIP はコンテナなので対象外。動画は `video_meta_text` と `tags`、PDF は `pdf_meta_text`、画像と同名 JSON/TXT は `sidecar_text` (値のみの自由語検索、mIV タグとは別系統) に分けて検索対象フィルタから選べる。結果は一覧 / 集約の 2 ビューを切替でき、ヒットが多いと自動で集約に寄る。検索中はバー / アドレス欄 / 空グリッド中央に「検索中」を表示し、0 件確定と区別する。検索バーは狭い幅では折り返し、Ctrl+G のドロップダウン操作中は背後のグリッドをホイールスクロールしない |
+| Ctrl+G | アイテム検索 | **お気に入り全体 (`auto_index_metadata=true`) の画像 / PDF / 動画** | アイテム索引 (Tantivy bigram) で候補絞り込み → STORED 原文を `matches()` で phrase/NOT/AND 正確判定 (streaming) | ZIP はコンテナなので対象外。動画は `video_meta_text`、PDF は `pdf_meta_text`、画像と同名 JSON/TXT は `sidecar_text` (値のみの自由語検索、mIV タグとは別系統) に分けて検索対象フィルタから選べる。mIV タグは Ctrl+G の検索本文へ混ぜず、タグ候補チップからタグビューへ誘導する。結果は一覧 / 集約の 2 ビューを切替でき、ヒットが多いと自動で集約に寄る。検索中はバー / アドレス欄 / 空グリッド中央に「検索中」を表示し、0 件確定と区別する。検索バーは狭い幅では折り返し、Ctrl+G のドロップダウン操作中は背後のグリッドをホイールスクロールしない |
 
 #### AI メタデータ検索の Negative Prompt 除外
 

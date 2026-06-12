@@ -10,6 +10,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagSidecarTarget {
+    pub folder: PathBuf,
+    pub rel_key: String,
+}
+
 /// UI が worker に渡す操作。
 #[derive(Debug, Clone)]
 pub enum TagJobKind {
@@ -32,6 +39,8 @@ pub enum TagJobKind {
 pub struct TagWriteJob {
     pub path: PathBuf,
     pub kind: TagJobKind,
+    /// タグ用 sidecar のミラー先。フォルダタグや仮想ページなど、sidecar 対象外なら None。
+    pub tag_sidecar: Option<TagSidecarTarget>,
     /// Undo entry を最終確定するための取引 ID。同じ user 操作 (1 トグル / 1 クリア) で
     /// 投入された全ジョブは同じ tx_id を共有し、UI 側の `pending_tag_undos` で
     /// 集計される。0 なら Undo 確定不要 (例: Undo/Redo 由来の SetTags ジョブ自体)。
@@ -57,6 +66,8 @@ pub enum TagAction {
 #[derive(Debug, Clone)]
 pub struct TagWriteResult {
     pub path: PathBuf,
+    /// 成功時に UI スレッドで sidecar へミラーするため、投入時の座標をそのまま返す。
+    pub tag_sidecar: Option<TagSidecarTarget>,
     pub result: Result<TagAction, String>,
     /// 更新**直前**の mIV タグ一覧。
     /// Undo entry の `before` を確定させるために使う — UI 側の予測 (= tags_cache)
@@ -202,6 +213,7 @@ fn run_worker(
         done.fetch_add(1, Ordering::Relaxed);
         let _ = result_tx.send(TagWriteResult {
             path: job.path.clone(),
+            tag_sidecar: job.tag_sidecar.clone(),
             result: res.map_err(|e| e.to_string()),
             tags_before,
             tags_after,

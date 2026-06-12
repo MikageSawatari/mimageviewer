@@ -11455,7 +11455,7 @@ impl App {
         // 取り込む。DB にあるエントリは authoritative なので上書きしない。
         // 下の `db.load_page_params` はインポート後に走るので、補填されたエントリも拾える。
         let sidecar_import_t0 = std::time::Instant::now();
-        if self.settings.sidecar_backup_enabled {
+        if self.settings.sidecar_backup_enabled || self.settings.tag_sidecar_backup_enabled {
             let sidecar_folder = if source_path.is_dir() {
                 source_path.clone()
             } else {
@@ -23384,6 +23384,31 @@ impl App {
         self.sidecars.get_mut(folder)
     }
 
+    /// タグ用サイドカーの可変参照を取得する。補正/マスク用とは独立した設定で gate する。
+    fn tag_sidecar_mut(
+        &mut self,
+        folder: &std::path::Path,
+    ) -> Option<&mut crate::sidecar::SidecarFile> {
+        if !self.settings.tag_sidecar_backup_enabled {
+            return None;
+        }
+        if !self.sidecars.contains_key(folder) {
+            let loaded = crate::sidecar::SidecarFile::load(folder);
+            self.sidecars.insert(folder.to_path_buf(), loaded);
+        }
+        self.sidecars.get_mut(folder)
+    }
+
+    pub(crate) fn mirror_tag_sidecar_update(
+        &mut self,
+        target: &crate::tag_write_worker::TagSidecarTarget,
+        tags: &[String],
+    ) {
+        if let Some(sc) = self.tag_sidecar_mut(&target.folder) {
+            sc.set_tags(&target.rel_key, tags);
+        }
+    }
+
     /// 指定 `idx` のページに対応するサイドカーに対し `op` を実行する。
     /// 設定 OFF・idx が画像系でない・フォルダ解決不能のいずれかなら黙って no-op。
     /// 書き込みミラーの 1 行化に使う。
@@ -26151,7 +26176,7 @@ impl App {
         self.evict_final_pipeline_cache_for_keep_set(&keep_set);
     }
 
-    /// サイドカーからまだ DB に無いエントリを取り込み、両 DB を更新する。
+    /// サイドカーからまだ DB に無いエントリを取り込み、中央 DB を更新する。
     /// フォルダ丸ごと移動で中央 DB のパスキーが無効化された場合の復旧経路。
     /// サイドカー自体はメモリに残し、以降の書き込みミラーに使う。
     /// 実際のインポートロジックは [`crate::sidecar::import_to_dbs`] に委譲。
@@ -26164,24 +26189,35 @@ impl App {
     /// `sli_sidecar_import max=456ms` を観測)。そこで:
     ///
     /// 1. `fs::metadata(sidecar)` で mtime を取得 (1 syscall、通常 <1ms)
-    /// 2. `adjustment_db.sidecar_sync` に記録した前回 import 時の mtime と比較
-    /// 3. 一致するなら読まずに return (common case)
+    /// 2. 編集データ用 `adjustment_db.sidecar_sync` とタグ用 `tags.db` sync を
+    ///    それぞれ比較
+    /// 3. 有効な系統がすべて一致するなら読まずに return (common case)
     /// 4. 不一致 / 未登録 / ファイル削除 のときだけ既存の slow-path に入る
     fn import_sidecar_to_dbs(&mut self, sidecar_folder: &std::path::Path) {
+        let import_edits = self.settings.sidecar_backup_enabled;
+        let import_tags = self.settings.tag_sidecar_backup_enabled;
+        if !import_edits && !import_tags {
+            return;
+        }
+
         let sidecar_path = sidecar_folder.join(crate::sidecar::SIDECAR_FILENAME);
         let folder_key = crate::adjustment_db::normalize_path(sidecar_folder);
 
         // Step 1: サイドカーの fs 状態を確認
-        let fs_mtime: Option<i64> = match std::fs::metadata(&sidecar_path) {
+        let fs_mtime: i64 = match std::fs::metadata(&sidecar_path) {
             Ok(m) => m
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64),
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // サイドカー無し: 以前に import 済みの記録があれば消して整合させる
                 // (サイドカーが外部削除されたフォルダに追従)
-                if let Some(db) = &self.adjustment_db {
+                if import_edits && let Some(db) = &self.adjustment_db {
+                    let _ = db.sidecar_sync_clear(&folder_key);
+                }
+                if import_tags && let Some(db) = self.tags_db.as_ref() {
                     let _ = db.sidecar_sync_clear(&folder_key);
                 }
                 return;
@@ -26189,12 +26225,19 @@ impl App {
             Err(_) => return,
         };
 
-        // Step 2: DB 側に記録された mtime と比較
-        if let (Some(db), Some(fs_mt)) = (&self.adjustment_db, fs_mtime) {
-            if db.sidecar_sync_get(&folder_key) == Some(fs_mt) {
-                // 前回 import と同じ mtime → 読む必要なし (common case)
-                return;
-            }
+        // Step 2: DB 側に記録された mtime と比較。タグ用 sync を分けることで、
+        // 補正 sidecar を既に同期済みのフォルダでも、タグバックアップを後から ON に
+        // した時だけ slow-path に入れる。
+        let edits_synced = !import_edits
+            || self.adjustment_db.as_ref().map_or(true, |db| {
+                db.sidecar_sync_get(&folder_key) == Some(fs_mtime)
+            });
+        let tags_synced = !import_tags
+            || self.tags_db.as_ref().map_or(true, |db| {
+                db.sidecar_sync_get(&folder_key) == Some(fs_mtime)
+            });
+        if edits_synced && tags_synced {
+            return;
         }
 
         // Step 3: Slow-path (初回 / 外部変更された場合のみ)
@@ -26226,20 +26269,27 @@ impl App {
             sidecar_folder.to_path_buf(),
             crate::sidecar::SidecarFile::load(sidecar_folder),
         );
-        let Some(sidecar) = self.sidecars.get(sidecar_folder) else {
+        let Some(sidecar) = self.sidecars.remove(sidecar_folder) else {
             return;
         };
         // 空サイドカーでも mtime は記録して次回以降スキップできるようにする
         if !sidecar.items().is_empty() {
             let stats = crate::sidecar::import_to_dbs(
                 sidecar_folder,
-                sidecar,
-                self.adjustment_db.as_ref(),
-                self.mask_db.as_ref(),
-                self.conceal_db.as_ref(),
-                self.local_adjust_db.as_ref(),
-                self.export_crop_db.as_ref(),
-                self.comic_db.as_ref(),
+                &sidecar,
+                import_edits.then_some(()).and(self.adjustment_db.as_ref()),
+                import_edits.then_some(()).and(self.mask_db.as_ref()),
+                import_edits.then_some(()).and(self.conceal_db.as_ref()),
+                import_edits
+                    .then_some(())
+                    .and(self.local_adjust_db.as_ref()),
+                import_edits.then_some(()).and(self.export_crop_db.as_ref()),
+                import_edits.then_some(()).and(self.comic_db.as_ref()),
+                if import_tags {
+                    self.tags_db.as_mut()
+                } else {
+                    None
+                },
             );
             if stats.imported_adjust > 0
                 || stats.imported_mask > 0
@@ -26247,15 +26297,17 @@ impl App {
                 || stats.imported_local_adjust > 0
                 || stats.imported_export_crop > 0
                 || stats.imported_comic > 0
+                || stats.imported_tags > 0
             {
                 crate::logger::log(format!(
-                    "sidecar: imported {} adjust + {} mask + {} conceal + {} local-adjust + {} crop + {} comic entries from {}",
+                    "sidecar: imported {} adjust + {} mask + {} conceal + {} local-adjust + {} crop + {} comic + {} tag entries from {}",
                     stats.imported_adjust,
                     stats.imported_mask,
                     stats.imported_conceal,
                     stats.imported_local_adjust,
                     stats.imported_export_crop,
                     stats.imported_comic,
+                    stats.imported_tags,
                     sidecar_folder.display()
                 ));
             }
@@ -26266,8 +26318,12 @@ impl App {
                 self.comic_docs.clear();
             }
         }
-        if let (Some(db), Some(fs_mt)) = (&self.adjustment_db, fs_mtime) {
-            let _ = db.sidecar_sync_upsert(&folder_key, fs_mt);
+        self.sidecars.insert(sidecar_folder.to_path_buf(), sidecar);
+        if import_edits && let Some(db) = &self.adjustment_db {
+            let _ = db.sidecar_sync_upsert(&folder_key, fs_mtime);
+        }
+        if import_tags && let Some(db) = self.tags_db.as_ref() {
+            let _ = db.sidecar_sync_upsert(&folder_key, fs_mtime);
         }
     }
 

@@ -14,6 +14,7 @@
 //! | `Image(p)`       | `p.parent()`           | `"{filename_lower}"`                          |
 //! | `ZipImage`       | `zip_path.parent()`    | `"{zip_filename_lower}::{entry_name_lower}"`  |
 //! | `PdfPage`        | `pdf_path.parent()`    | `"{pdf_filename_lower}::page_{n}"`            |
+//! | Tag real files    | `path.parent()`        | `"{filename_lower}"`                          |
 //!
 //! 相対キー → 絶対 DB キーへの再構成は [`reconstruct_adjust_key`] / [`reconstruct_mask_key`]。
 //!
@@ -80,6 +81,10 @@ pub struct SidecarEntry {
     /// (serde)。`local_adjust_layers` と同じ二層方式。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comic: Option<Vec<comic_core::AnnotationObject>>,
+    /// mIV タグのフォルダ側バックアップ。中央 `tags.db` が authoritative で、
+    /// インポートは item 単位の all-or-nothing (既存タグ/決定済み状態があれば skip)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
 }
 
 impl SidecarEntry {
@@ -90,6 +95,7 @@ impl SidecarEntry {
             && self.local_adjust_layers.is_none()
             && self.export_crop.is_none()
             && self.comic.is_none()
+            && self.tags.is_none()
     }
 }
 
@@ -322,6 +328,38 @@ impl SidecarFile {
         }
     }
 
+    /// mIV タグをセットする。空/不正タグだけなら削除と同じ扱いにする。
+    pub fn set_tags<I, S>(&mut self, rel_key: &str, tags: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let normalized = crate::tags_db::collapse_tags(tags, 0)
+            .into_iter()
+            .map(|tag| crate::tags_db::format_display_tag(&tag.tag))
+            .collect::<Vec<_>>();
+        if normalized.is_empty() {
+            self.remove_tags(rel_key);
+            return;
+        }
+        let entry = self.items.entry(rel_key.to_string()).or_default();
+        entry.tags = Some(normalized);
+        self.mark_dirty();
+    }
+
+    /// mIV タグのバックアップを取り除く。
+    pub fn remove_tags(&mut self, rel_key: &str) {
+        if let Some(entry) = self.items.get_mut(rel_key) {
+            if entry.tags.is_some() {
+                entry.tags = None;
+                if entry.is_empty() {
+                    self.items.remove(rel_key);
+                }
+                self.mark_dirty();
+            }
+        }
+    }
+
     /// 最後段 crop 設定をセットする。
     pub fn set_export_crop(&mut self, rel_key: &str, settings: crate::export_crop::CropSettings) {
         let entry = self.items.entry(rel_key.to_string()).or_default();
@@ -480,6 +518,7 @@ pub fn reconstruct_virtual_key(folder: &Path, rel_key: &str) -> Option<String> {
 }
 
 /// 相対キーの形が Image / ZipImage / PdfPage のどれかを判別する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelKeyKind {
     Image,
     ZipImage,
@@ -507,19 +546,21 @@ pub struct ImportStats {
     pub imported_local_adjust: usize,
     pub imported_export_crop: usize,
     pub imported_comic: usize,
+    pub imported_tags: usize,
     pub skipped_adjust: usize,
     pub skipped_mask: usize,
     pub skipped_conceal: usize,
     pub skipped_local_adjust: usize,
     pub skipped_export_crop: usize,
     pub skipped_comic: usize,
+    pub skipped_tags: usize,
 }
 
 /// サイドカーの各エントリを中央 DB へインポートする (純粋関数、テスト用に App から分離)。
 ///
 /// 中央 DB に既にエントリがあるものは **上書きしない** (中央が authoritative)。
-/// `adjust_db` / `mask_db` / `conceal_db` に None を渡した場合、その DB 種別へのインポートは
-/// スキップ。`folder` はサイドカーファイルが置かれているフォルダの絶対パス。
+/// `adjust_db` / `mask_db` / `conceal_db` / `tags_db` に None を渡した場合、その DB 種別への
+/// インポートはスキップ。`folder` はサイドカーファイルが置かれているフォルダの絶対パス。
 /// 絶対 DB キーの再構成は [`reconstruct_image_key`] / [`reconstruct_virtual_key`] に従う。
 pub fn import_to_dbs(
     folder: &Path,
@@ -530,10 +571,12 @@ pub fn import_to_dbs(
     local_adjust_db: Option<&crate::local_adjust_db::LocalAdjustDb>,
     export_crop_db: Option<&crate::export_crop::CropDb>,
     comic_db: Option<&crate::comic_db::ComicDb>,
+    mut tags_db: Option<&mut crate::tags_db::TagsDb>,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
     for (rel_key, entry) in sidecar.items() {
-        let abs_key = match classify_rel_key(rel_key) {
+        let rel_kind = classify_rel_key(rel_key);
+        let abs_key = match rel_kind {
             RelKeyKind::Image => reconstruct_image_key(folder, rel_key),
             RelKeyKind::ZipImage | RelKeyKind::PdfPage => {
                 match reconstruct_virtual_key(folder, rel_key) {
@@ -542,6 +585,25 @@ pub fn import_to_dbs(
                 }
             }
         };
+
+        if let (Some(db), Some(tags)) = (tags_db.as_deref_mut(), &entry.tags) {
+            if matches!(rel_kind, RelKeyKind::Image) {
+                if db.has_item_state(&abs_key) || !db.display_tags_for_item(&abs_key).is_empty() {
+                    stats.skipped_tags += 1;
+                } else if !tags.is_empty()
+                    && db
+                        .set_item_tags(
+                            &abs_key,
+                            tags.iter()
+                                .map(|tag| crate::tags_db::strip_display_hash(tag)),
+                            crate::tags_db::source::SIDECAR,
+                        )
+                        .is_ok()
+                {
+                    stats.imported_tags += 1;
+                }
+            }
+        }
 
         if let (Some(db), Some(params)) = (adjust_db, &entry.adjust) {
             if db.get_page_params(&abs_key).is_none() {
@@ -783,7 +845,14 @@ mod tests {
         );
         s.set_local_adjust_layers("img.jpg", vec![sample_local_adjust_layer("layer")]);
         s.set_export_crop("img.jpg", sample_export_crop());
+        s.set_tags("img.jpg", ["#tag"]);
         assert_eq!(s.items().len(), 1);
+        s.remove_tags("img.jpg");
+        assert_eq!(
+            s.items().len(),
+            1,
+            "adjust + mask + conceal + local adjust + crop still present"
+        );
         s.remove_export_crop("img.jpg");
         assert_eq!(
             s.items().len(),
@@ -853,6 +922,20 @@ mod tests {
     }
 
     #[test]
+    fn set_tags_normalizes_and_removes_empty_entries() {
+        let mut s = SidecarFile::new(PathBuf::from("C:/tmp/nonexistent"));
+        s.set_tags("img.jpg", ["#Cat", "dog"]);
+        let entry = s.items().get("img.jpg").unwrap();
+        assert_eq!(
+            entry.tags.as_ref().unwrap(),
+            &vec!["#Cat".to_string(), "#dog".to_string()]
+        );
+
+        s.set_tags("img.jpg", ["   "]);
+        assert!(s.items().is_empty());
+    }
+
+    #[test]
     fn reconstruct_image_key_matches_normalize() {
         let folder = PathBuf::from("C:\\Users\\Foo\\Pictures");
         let key = reconstruct_image_key(&folder, "photo.jpg");
@@ -905,6 +988,7 @@ mod tests {
                 ],
             );
             s.set_export_crop("img.jpg", sample_export_crop());
+            s.set_tags("img.jpg", ["#Cat", "dog"]);
             s.flush();
             assert!(!s.is_dirty());
         }
@@ -925,6 +1009,10 @@ mod tests {
         assert_eq!(
             s2.items().get("img.jpg").unwrap().export_crop,
             Some(sample_export_crop())
+        );
+        assert_eq!(
+            s2.items().get("img.jpg").unwrap().tags.as_ref().unwrap(),
+            &vec!["#Cat".to_string(), "#dog".to_string()]
         );
         let mask = s2
             .items()
@@ -957,7 +1045,7 @@ mod tests {
         let existing_key = reconstruct_image_key(folder, "existing.png");
         db.set_layers(&existing_key, &existing_layers).unwrap();
 
-        let stats = import_to_dbs(folder, &s, None, None, None, Some(&db), None, None);
+        let stats = import_to_dbs(folder, &s, None, None, None, Some(&db), None, None, None);
 
         assert_eq!(stats.imported_local_adjust, 1);
         assert_eq!(stats.skipped_local_adjust, 1);
@@ -989,7 +1077,7 @@ mod tests {
         let existing_key = reconstruct_image_key(folder, "existing.png");
         db.set(&existing_key, existing_crop).unwrap();
 
-        let stats = import_to_dbs(folder, &s, None, None, None, None, Some(&db), None);
+        let stats = import_to_dbs(folder, &s, None, None, None, None, Some(&db), None, None);
 
         assert_eq!(stats.imported_export_crop, 1);
         assert_eq!(stats.skipped_export_crop, 1);
@@ -1024,13 +1112,63 @@ mod tests {
         let existing_key = reconstruct_image_key(folder, "existing.png");
         db.set(&existing_key, &existing).unwrap();
 
-        let stats = import_to_dbs(folder, &s, None, None, None, None, None, Some(&db));
+        let stats = import_to_dbs(folder, &s, None, None, None, None, None, Some(&db), None);
 
         // 中央 DB に無い fresh は import、既に有る existing は上書きしない。
         assert_eq!(stats.imported_comic, 1);
         assert_eq!(stats.skipped_comic, 1);
         assert_eq!(db.get(&fresh_key), Some(imported));
         assert_eq!(db.get(&existing_key), Some(existing));
+    }
+
+    #[test]
+    fn import_to_dbs_imports_tags_without_resurrecting_decided_items() {
+        let sidecar_dir = tempfile::tempdir().unwrap();
+        let folder = sidecar_dir.path();
+        let mut s = SidecarFile::new(folder.to_path_buf());
+        s.set_tags("fresh.png", ["#Cat", "dog"]);
+        s.set_tags("existing.png", ["stale"]);
+        s.set_tags("deleted.png", ["resurrect"]);
+        s.set_tags("book.zip::001.jpg", ["virtual"]);
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut db = crate::tags_db::TagsDb::open_at(&db_dir.path().join("tags.db")).unwrap();
+        let fresh_key = reconstruct_image_key(folder, "fresh.png");
+        let existing_key = reconstruct_image_key(folder, "existing.png");
+        let deleted_key = reconstruct_image_key(folder, "deleted.png");
+        let virtual_key = reconstruct_virtual_key(folder, "book.zip::001.jpg").unwrap();
+        db.set_item_tags(&existing_key, ["current"], crate::tags_db::source::EDIT)
+            .unwrap();
+        db.upsert_item_state(&deleted_key, crate::tags_db::source::EDIT)
+            .unwrap();
+
+        let stats = import_to_dbs(
+            folder,
+            &s,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut db),
+        );
+
+        assert_eq!(stats.imported_tags, 1);
+        assert_eq!(stats.skipped_tags, 2);
+        assert_eq!(
+            db.display_tags_for_item(&fresh_key),
+            vec!["#Cat".to_string(), "#dog".to_string()]
+        );
+        assert_eq!(
+            db.display_tags_for_item(&existing_key),
+            vec!["#current".to_string()]
+        );
+        assert!(db.display_tags_for_item(&deleted_key).is_empty());
+        assert!(
+            db.display_tags_for_item(&virtual_key).is_empty(),
+            "virtual rel keys are edit-data only and must not become item tags"
+        );
     }
 
     #[test]

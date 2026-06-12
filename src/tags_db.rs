@@ -111,6 +111,11 @@ impl TagsDb {
              CREATE TABLE IF NOT EXISTS tag_meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS tag_sidecar_sync (
+                folder_key    TEXT PRIMARY KEY,
+                sidecar_mtime INTEGER NOT NULL
              );",
         )
     }
@@ -425,6 +430,36 @@ impl TagsDb {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    pub fn sidecar_sync_get(&self, folder_key: &str) -> Option<i64> {
+        self.conn
+            .prepare_cached("SELECT sidecar_mtime FROM tag_sidecar_sync WHERE folder_key = ?1")
+            .ok()?
+            .query_row([folder_key], |row| row.get(0))
+            .ok()
+    }
+
+    pub fn sidecar_sync_upsert(
+        &self,
+        folder_key: &str,
+        sidecar_mtime: i64,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO tag_sidecar_sync (folder_key, sidecar_mtime) VALUES (?1, ?2)
+             ON CONFLICT(folder_key) DO UPDATE SET sidecar_mtime = excluded.sidecar_mtime",
+            params![folder_key, sidecar_mtime],
+        )?;
+        Ok(())
+    }
+
+    pub fn sidecar_sync_clear(&self, folder_key: &str) -> Result<(), rusqlite::Error> {
+        self.conn
+            .execute(
+                "DELETE FROM tag_sidecar_sync WHERE folder_key = ?1",
+                [folder_key],
+            )
+            .map(|_| ())
     }
 
     pub fn import_legacy_tantivy_tags<I, K, T>(
@@ -810,6 +845,18 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
         assert_eq!(timeout_ms, 5000);
+    }
+
+    #[test]
+    fn sidecar_sync_roundtrip() {
+        let db = memory_db();
+        assert_eq!(db.sidecar_sync_get("c:/pics"), None);
+        db.sidecar_sync_upsert("c:/pics", 123).unwrap();
+        assert_eq!(db.sidecar_sync_get("c:/pics"), Some(123));
+        db.sidecar_sync_upsert("c:/pics", 456).unwrap();
+        assert_eq!(db.sidecar_sync_get("c:/pics"), Some(456));
+        db.sidecar_sync_clear("c:/pics").unwrap();
+        assert_eq!(db.sidecar_sync_get("c:/pics"), None);
     }
 
     #[test]

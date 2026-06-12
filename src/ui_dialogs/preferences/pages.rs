@@ -2218,10 +2218,15 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
         "フォルダに補正・マスク設定のバックアップを保存する",
     );
     ui.add_space(4.0);
+    ui.checkbox(
+        &mut s.tag_sidecar_backup_enabled,
+        "フォルダにタグのバックアップを保存する",
+    );
+    ui.add_space(4.0);
     ui.label(
         egui::RichText::new(
-            "OFF 中はバックアップの書き込みも既存ファイルの読み込みも行いません\n\
-             (既存の mimageviewer.dat は削除されず残ります)。",
+            "タグのバックアップは既定 OFF です。共有フォルダに整理用タグを残したくない場合は OFF のまま使えます。\n\
+             OFF 中は該当バックアップの書き込みも既存ファイルの読み込みも行いません (既存の mimageviewer.dat は削除されず残ります)。",
         )
         .size(11.0)
         .color(egui::Color32::from_gray(150)),

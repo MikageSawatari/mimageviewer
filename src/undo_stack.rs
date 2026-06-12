@@ -91,13 +91,14 @@ pub struct RatingChange {
     pub after: u8,
 }
 
-/// タグ 1 件の変更記録。`before`/`after` は `dc:subject` のフルリスト。
+/// タグ 1 件の変更記録。`before`/`after` は mIV タグの表示リスト。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagChange {
     pub path: PathBuf,
-    /// 操作直前の `dc:subject` (mIV タグだけでなく全タグを含む)。
+    pub tag_sidecar: Option<crate::tag_write_worker::TagSidecarTarget>,
+    /// 操作直前の mIV タグ。
     pub before: Vec<String>,
-    /// 操作後に**期待される** `dc:subject`。Redo で使う。
+    /// 操作後に**期待される** mIV タグ。Redo で使う。
     pub after: Vec<String>,
 }
 
@@ -266,6 +267,7 @@ mod tests {
         UndoEntry::Tag {
             changes: vec![TagChange {
                 path: PathBuf::from(path),
+                tag_sidecar: None,
                 before: before.into_iter().map(String::from).collect(),
                 after: after.into_iter().map(String::from).collect(),
             }],
