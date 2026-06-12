@@ -88,10 +88,19 @@ v1.3.0 のリリースレビュー (Claude マルチエージェント + Codex) 
 | **FFmpeg LGPL shared** | n7.1.4 (BtbN, 7.1) | `bash scripts/setup-ffmpeg.sh check` | メジャーが上がると DLL 名が変わる (例: avcodec-61→62)。**setup-ffmpeg.sh / `video/ffmpeg_loader.rs` / `build.rs` の3箇所**で DLL 名を揃える。GPL build は使わない。更新時は LGPL 通知 + ソース tarball 配置も更新 (docs/ffmpeg-lgpl-source-distribution.md) |
 | **VST3 SDK / bridge** | (cmake ビルド済 exe) | C++ ソース変更がなければ再ビルド不要 | 更新したら商用プラグイン (Pro-Q 4 等) で実機確認。古い worktree の exe 流用は不可 (protocol 不一致でクラッシュ) |
 
+> **v1.3.1 実施状況 (グループ D)**:
+> - **PDFium**: 150.0.7843 → **151.0.7881** に更新済 (vendor ローカル)。⚠ **PDF 表示の手動動作確認が未実施** (リリース前必須)。
+> - **FFmpeg**: n7.1.4-6 → **n7.1-latest** に更新済 (vendor ローカル、同 7.1 メジャーで DLL 名不変 = build.rs/loader 変更不要)。⚠ **動画再生の手動確認**と **LGPL ソース tarball の mikage.to 配置更新**が未実施 (リリース時)。
+> - **ONNX Runtime**: ort-sys が ms@1.24.2 要求のまま = **据え置き** (更新不要)。
+> - **VST3**: C++ ソース変更なし = 再ビルド不要。
+> - ⚠ **perf smoke (`scripts/perf_smoke.sh`) 未実施** (GUI 手動操作要)。
+
 ### 2.2 Rust クレート
 
 - まず `cargo update` で互換範囲内 (semver マイナー/パッチ) を更新し、`cargo test` +
   検索 bench 回帰 (`scripts/check_bench_regression.py`) + perf smoke (`scripts/perf_smoke.sh`) を回す。
+  → **v1.3.1 で実施済**: `cargo update` (~108 crate)、全 bin テスト 2415 passed、bench 回帰なし。
+    perf smoke は未実施 (上記)。メジャー更新は下表どおり全て **v1.4.0 へ先送り** (rc/メジャーは個別判断)。
 - メジャー更新を個別に検討する主要クレート (現行バージョン):
 
   | クレート | 現行 | メモ |
