@@ -4,10 +4,21 @@
 //! 同じ構造で、表示名編集 / 並べ替え / 削除 / 末尾への新規追加 をサポート。
 //! よく使うタグをメニュー / ツールバーへピン留めするための管理 UI。
 
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
+
 use eframe::egui;
+use uuid::Uuid;
 
 use crate::app::App;
 use crate::settings::TagDef;
+
+#[derive(Clone, Debug)]
+struct RetagOp {
+    old_key: String,
+    new_key: String,
+    new_name: String,
+}
 
 impl App {
     /// ダイアログを開く (呼び出し側で `show_tag_editor = true` にする前に呼ぶ)。
@@ -42,7 +53,7 @@ impl App {
 
                 ui.label(
                     egui::RichText::new(
-                        "よく使うタグをピン留めすると、メニューとツールバーに表示されます。",
+                        "よく使うタグをピン留めすると、メニューとツールバーに表示されます。名前変更は既存タグにも反映され、既存タグ名にすると統合されます。",
                     )
                     .size(11.0)
                     .weak(),
@@ -151,42 +162,240 @@ impl App {
         }
 
         if apply {
-            // バリデーション:
-            // - 空行は破棄
-            // - 先頭 `#` は剥がす (ユーザが `#` を付けて入力した救済)
-            // - 重複は先着優先 (tag_key でキー判定)
-            let mut seen = std::collections::HashSet::new();
-            let mut cleaned: Vec<TagDef> = Vec::new();
-            for t in self.tag_editor_draft.drain(..) {
-                let mut name = t.name.trim().to_string();
-                while name.starts_with('#') {
-                    name.remove(0);
-                }
-                let name = crate::tags_db::normalize_tag_display_name(&name);
-                if name.is_empty() {
-                    continue;
-                }
-                if name.chars().count() > 64 {
-                    continue;
-                }
-                let tag_key = crate::tags_db::normalize_tag_key(&name);
-                if tag_key.is_empty() || !seen.insert(tag_key.clone()) {
-                    continue;
-                }
-                cleaned.push(TagDef {
-                    id: t.id,
-                    tag_key,
-                    name,
-                    show_shortcut: t.show_shortcut,
-                });
+            if self.tag_maintenance_rx.is_some() {
+                self.show_feedback_toast("タグの改名/統合を反映中です".to_string());
+                return;
             }
+            let previous = previous_tag_defs_by_id(&self.settings.tags);
+            let draft = std::mem::take(&mut self.tag_editor_draft);
+            let (cleaned, retag_ops) = build_tag_editor_apply_plan(draft, &previous);
             self.settings.tags = cleaned;
             self.settings.save();
+            if !retag_ops.is_empty() {
+                self.start_tag_maintenance(retag_ops);
+            }
             self.show_tag_editor = false;
-            self.tag_editor_draft.clear();
         } else if cancel || !open {
             self.show_tag_editor = false;
             self.tag_editor_draft.clear();
         }
+    }
+
+    fn start_tag_maintenance(&mut self, ops: Vec<RetagOp>) {
+        let ops = order_retag_ops(ops);
+        let data_dir = crate::data_dir::get();
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("tag-maintenance".to_string())
+            .spawn(move || {
+                let result = run_tag_maintenance(data_dir, ops);
+                let _ = tx.send(result);
+            })
+            .ok();
+        self.tag_maintenance_rx = Some(rx);
+        self.show_feedback_toast("タグの改名/統合を反映中".to_string());
+    }
+
+    pub(crate) fn poll_tag_maintenance_results(&mut self) {
+        let result = match self.tag_maintenance_rx.as_ref() {
+            Some(rx) => match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("タグの改名/統合処理が終了しました".to_string()))
+                }
+            },
+            None => None,
+        };
+        let Some(result) = result else {
+            return;
+        };
+        self.tag_maintenance_rx = None;
+        match result {
+            Ok(message) => {
+                self.tags_cache.clear();
+                self.prewarm_grid_tags();
+                if self.settings.facet_filter.uses_tag_state() {
+                    self.rebuild_visible_indices();
+                }
+                if self.tag_view.active {
+                    self.execute_tag_view();
+                }
+                self.show_feedback_toast(message);
+            }
+            Err(e) => self.show_feedback_toast(format!("タグの改名/統合に失敗: {e}")),
+        }
+    }
+}
+
+fn previous_tag_defs_by_id(tags: &[TagDef]) -> HashMap<Uuid, (String, String)> {
+    tags.iter()
+        .map(|tag| (tag.id, (tag.tag_key.clone(), tag.name.clone())))
+        .collect()
+}
+
+fn build_tag_editor_apply_plan(
+    draft: Vec<TagDef>,
+    previous: &HashMap<Uuid, (String, String)>,
+) -> (Vec<TagDef>, Vec<RetagOp>) {
+    let mut cleaned: Vec<TagDef> = Vec::new();
+    let mut by_key: HashMap<String, usize> = HashMap::new();
+    let mut rows: Vec<(Option<(String, String)>, String)> = Vec::new();
+
+    for t in draft {
+        let Some(name) = normalize_editor_tag_name(&t.name) else {
+            continue;
+        };
+        let tag_key = crate::tags_db::normalize_tag_key(&name);
+        if tag_key.is_empty() {
+            continue;
+        }
+        if let Some(&idx) = by_key.get(&tag_key) {
+            cleaned[idx].show_shortcut |= t.show_shortcut;
+        } else {
+            by_key.insert(tag_key.clone(), cleaned.len());
+            cleaned.push(TagDef {
+                id: t.id,
+                tag_key: tag_key.clone(),
+                name,
+                show_shortcut: t.show_shortcut,
+            });
+        }
+        rows.push((previous.get(&t.id).cloned(), tag_key));
+    }
+
+    let display_by_key: HashMap<String, String> = cleaned
+        .iter()
+        .map(|tag| (tag.tag_key.clone(), tag.name.clone()))
+        .collect();
+    let mut retag_ops = Vec::new();
+    let mut seen_old = HashSet::new();
+    for (previous, new_key) in rows {
+        let Some((old_key, old_name)) = previous else {
+            continue;
+        };
+        if old_key.is_empty() || !seen_old.insert(old_key.clone()) {
+            continue;
+        }
+        let Some(new_name) = display_by_key.get(&new_key).cloned() else {
+            continue;
+        };
+        let old_display = crate::tags_db::normalize_tag_display_name(&old_name);
+        if old_key != new_key || old_display != new_name {
+            retag_ops.push(RetagOp {
+                old_key,
+                new_key,
+                new_name,
+            });
+        }
+    }
+
+    (cleaned, retag_ops)
+}
+
+fn normalize_editor_tag_name(raw: &str) -> Option<String> {
+    let mut name = raw.trim().to_string();
+    while name.starts_with('#') {
+        name.remove(0);
+    }
+    let name = crate::tags_db::normalize_tag_display_name(&name);
+    if name.is_empty() || name.chars().count() > 64 {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn order_retag_ops(ops: Vec<RetagOp>) -> Vec<RetagOp> {
+    let (mut key_ops, display_ops): (Vec<_>, Vec<_>) =
+        ops.into_iter().partition(|op| op.old_key != op.new_key);
+    let mut ordered = Vec::with_capacity(key_ops.len() + display_ops.len());
+    while !key_ops.is_empty() {
+        let old_keys: HashSet<_> = key_ops.iter().map(|op| op.old_key.as_str()).collect();
+        if let Some(pos) = key_ops
+            .iter()
+            .position(|op| !old_keys.contains(op.new_key.as_str()))
+        {
+            ordered.push(key_ops.remove(pos));
+        } else {
+            ordered.extend(key_ops.drain(..));
+        }
+    }
+    ordered.extend(display_ops);
+    ordered
+}
+
+fn run_tag_maintenance(data_dir: std::path::PathBuf, ops: Vec<RetagOp>) -> Result<String, String> {
+    let mut db = crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db"))
+        .map_err(|e| format!("タグDBを開けません: {e}"))?;
+    let mut affected = 0usize;
+    let mut conflicts = 0usize;
+    for op in ops {
+        let report = db
+            .retag_key(&op.old_key, &op.new_name)
+            .map_err(|e| format!("{} -> {}: {e}", op.old_key, op.new_key))?;
+        affected += report.affected_items;
+        conflicts += report.removed_conflicts;
+    }
+    if conflicts > 0 {
+        Ok(format!(
+            "タグの改名/統合を反映: {affected} 件 ({conflicts} 件を統合)"
+        ))
+    } else {
+        Ok(format!("タグの改名を反映: {affected} 件"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tag_with(id: Uuid, key: &str, name: &str, show_shortcut: bool) -> TagDef {
+        TagDef {
+            id,
+            tag_key: key.to_string(),
+            name: name.to_string(),
+            show_shortcut,
+        }
+    }
+
+    #[test]
+    fn apply_plan_keeps_key_and_updates_display_name() {
+        let id = Uuid::new_v4();
+        let previous = previous_tag_defs_by_id(&[tag_with(id, "fate", "FATE", true)]);
+        let (cleaned, ops) =
+            build_tag_editor_apply_plan(vec![tag_with(id, "fate", "Fate", true)], &previous);
+
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(cleaned[0].tag_key, "fate");
+        assert_eq!(cleaned[0].name, "Fate");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].old_key, "fate");
+        assert_eq!(ops[0].new_key, "fate");
+        assert_eq!(ops[0].new_name, "Fate");
+    }
+
+    #[test]
+    fn apply_plan_merges_duplicate_target_keys() {
+        let cat_id = Uuid::new_v4();
+        let dog_id = Uuid::new_v4();
+        let previous = previous_tag_defs_by_id(&[
+            tag_with(cat_id, "cat", "cat", false),
+            tag_with(dog_id, "dog", "dog", true),
+        ]);
+        let (cleaned, ops) = build_tag_editor_apply_plan(
+            vec![
+                tag_with(cat_id, "cat", "dog", false),
+                tag_with(dog_id, "dog", "dog", true),
+            ],
+            &previous,
+        );
+
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(cleaned[0].tag_key, "dog");
+        assert!(cleaned[0].show_shortcut);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].old_key, "cat");
+        assert_eq!(ops[0].new_key, "dog");
     }
 }

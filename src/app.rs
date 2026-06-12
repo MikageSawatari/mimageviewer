@@ -3421,6 +3421,8 @@ pub struct App {
     /// 選択中アイテムへ自由記入タグを付ける/外すダイアログ。
     pub(crate) show_tag_apply: bool,
     pub(crate) tag_apply_input: String,
+    /// タグ管理ダイアログの改名/統合を tags.db へ反映する一回限り worker。
+    pub(crate) tag_maintenance_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// タグ書き込み worker (初回要求時に遅延初期化)。
     pub(crate) tag_write_handle: Option<crate::tag_write_worker::TagWriteHandle>,
     /// レーティング XMP 書き込み worker。設定 ON のとき遅延初期化される。
@@ -5722,6 +5724,7 @@ impl App {
             tag_editor_draft: Vec::new(),
             show_tag_apply: false,
             tag_apply_input: String::new(),
+            tag_maintenance_rx: None,
             tag_write_handle: None,
             rating_write_handle: None,
             show_fav_add_dialog: false,
@@ -31591,6 +31594,7 @@ impl eframe::App for App {
 
         // タグ書き込み worker の結果ポーリング (docs/tag-feature.md §5.6)
         self.poll_tag_write_results();
+        self.poll_tag_maintenance_results();
         self.poll_rating_write_results();
         self.poll_video_upscale_queue(ctx);
 

@@ -25,6 +25,14 @@ pub struct TagSummary {
     pub last_applied_at: i64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetagReport {
+    pub old_key: String,
+    pub new_key: String,
+    pub affected_items: usize,
+    pub removed_conflicts: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LegacyImportReport {
     pub skipped_already_imported: bool,
@@ -310,6 +318,66 @@ impl TagsDb {
         upsert_item_state_tx(&tx, item_key, source::EDIT, now)?;
         tx.commit()?;
         Ok((changed, before, Vec::new()))
+    }
+
+    pub fn retag_key(
+        &mut self,
+        old_key: &str,
+        new_name: &str,
+    ) -> Result<RetagReport, rusqlite::Error> {
+        let old_key = normalize_tag_key(old_key);
+        let new_display = normalize_tag_display_name(new_name);
+        let new_key = normalize_tag_key(&new_display);
+        if old_key.is_empty() || new_key.is_empty() {
+            return Ok(RetagReport::default());
+        }
+
+        self.rotate_backups_once();
+        let now = now_unix_secs();
+        let tx = self.conn.transaction()?;
+        let affected_items = item_keys_for_tag_key_tx(&tx, &old_key)?;
+        let mut removed_conflicts = 0usize;
+
+        if old_key == new_key {
+            tx.execute(
+                "UPDATE item_tags SET tag = ?1 WHERE tag_key = ?2",
+                params![new_display, old_key],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE item_tags
+                 SET tag = ?1, tag_key = ?2
+                 WHERE tag_key = ?3
+                   AND item_key NOT IN (
+                       SELECT item_key FROM item_tags WHERE tag_key = ?2
+                   )",
+                params![new_display, new_key, old_key],
+            )?;
+            removed_conflicts = tx.execute(
+                "DELETE FROM item_tags
+                 WHERE tag_key = ?1
+                   AND item_key IN (
+                       SELECT item_key FROM item_tags WHERE tag_key = ?2
+                   )",
+                params![old_key, new_key],
+            )?;
+            tx.execute(
+                "UPDATE item_tags SET tag = ?1 WHERE tag_key = ?2",
+                params![new_display, new_key],
+            )?;
+        }
+
+        for item_key in &affected_items {
+            upsert_item_state_tx(&tx, item_key, source::EDIT, now)?;
+        }
+        tx.commit()?;
+
+        Ok(RetagReport {
+            old_key,
+            new_key,
+            affected_items: affected_items.len(),
+            removed_conflicts,
+        })
     }
 
     pub fn display_tags_for_item(&self, item_key: &str) -> Vec<String> {
@@ -693,6 +761,20 @@ fn upsert_item_state_tx(
     Ok(())
 }
 
+fn item_keys_for_tag_key_tx(
+    tx: &rusqlite::Transaction<'_>,
+    tag_key: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = tx.prepare(
+        "SELECT DISTINCT item_key
+         FROM item_tags
+         WHERE tag_key = ?1
+         ORDER BY item_key COLLATE NOCASE ASC",
+    )?;
+    let rows = stmt.query_map([tag_key], |row| row.get(0))?;
+    rows.collect()
+}
+
 fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -838,6 +920,38 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(db.display_tags_for_item("c:/gone.jpg").is_empty());
         assert!(!db.has_item_state("c:/gone.jpg"));
+    }
+
+    #[test]
+    fn retag_key_updates_display_when_key_is_unchanged() {
+        let mut db = memory_db();
+        db.set_item_tags("c:/a.jpg", ["ＦＡＴＥ"], source::EDIT)
+            .unwrap();
+
+        let report = db.retag_key("fate", "Fate").unwrap();
+
+        assert_eq!(report.old_key, "fate");
+        assert_eq!(report.new_key, "fate");
+        assert_eq!(report.affected_items, 1);
+        assert_eq!(db.display_tags_for_item("c:/a.jpg"), vec!["#Fate"]);
+    }
+
+    #[test]
+    fn retag_key_merges_into_existing_tag_without_duplicates() {
+        let mut db = memory_db();
+        db.set_item_tags("c:/a.jpg", ["cat"], source::EDIT).unwrap();
+        db.set_item_tags("c:/b.jpg", ["cat", "dog"], source::EDIT)
+            .unwrap();
+
+        let report = db.retag_key("cat", "dog").unwrap();
+
+        assert_eq!(report.old_key, "cat");
+        assert_eq!(report.new_key, "dog");
+        assert_eq!(report.affected_items, 2);
+        assert_eq!(report.removed_conflicts, 1);
+        assert_eq!(db.display_tags_for_item("c:/a.jpg"), vec!["#dog"]);
+        assert_eq!(db.display_tags_for_item("c:/b.jpg"), vec!["#dog"]);
+        assert!(db.item_keys_by_tag_exact("cat", 10).is_empty());
     }
 
     #[test]
