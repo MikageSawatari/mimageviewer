@@ -585,22 +585,29 @@ fn parse_xmp(xml: &[u8]) -> Option<XmpTweetInfo> {
 /// `#` で始まるもの・つかないもの問わず全て返す。呼び出し側が必要に応じて
 /// `#` 接頭辞でフィルタする。
 pub fn read_dc_subject(path: &Path) -> Vec<String> {
+    try_read_dc_subject(path).unwrap_or_default()
+}
+
+/// ファイルの XMP `dc:subject` Bag 要素を読み取る。
+///
+/// `read_dc_subject` と同じ内容を返すが、ファイル読み取りエラーを呼び出し側へ返す。
+/// XMP 非対応拡張子・XMP パケット無し・動画 sidecar 不在は「タグなし」として `Ok(Vec::new())`。
+pub fn try_read_dc_subject(path: &Path) -> Result<Vec<String>, std::io::Error> {
     // 動画ファイルは同名 `.xmp` サイドカー (Lightroom 互換形式) を直接読む。
     // サイドカーは XMP packet そのものなので extract 不要、parse_dc_subject に直行。
     if crate::xmp_writer::is_video_for_sidecar(path) {
         let sidecar = crate::xmp_writer::sidecar_path_for(path);
         return match std::fs::read(&sidecar) {
-            Ok(bytes) => parse_dc_subject(&bytes),
-            Err(_) => Vec::new(),
+            Ok(bytes) => Ok(parse_dc_subject(&bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
         };
     }
     if !extension_might_have_xmp(path) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let Ok(bytes) = std::fs::read(path) else {
-        return Vec::new();
-    };
-    read_dc_subject_from_bytes(&bytes)
+    let bytes = std::fs::read(path)?;
+    Ok(read_dc_subject_from_bytes(&bytes))
 }
 
 /// バイト列版。

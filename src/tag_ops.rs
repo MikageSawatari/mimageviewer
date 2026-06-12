@@ -18,13 +18,6 @@ struct TagTarget {
     tag_sidecar: Option<TagSidecarTarget>,
 }
 
-fn tag_sidecar_target_for_path(path: &std::path::Path) -> Option<TagSidecarTarget> {
-    Some(TagSidecarTarget {
-        folder: path.parent()?.to_path_buf(),
-        rel_key: path.file_name()?.to_string_lossy().to_lowercase(),
-    })
-}
-
 fn tag_target_for_item(item: &GridItem, fullscreen: bool) -> Option<TagTarget> {
     let (path, sidecar_path) = match item {
         GridItem::Folder(p)
@@ -39,7 +32,7 @@ fn tag_target_for_item(item: &GridItem, fullscreen: bool) -> Option<TagTarget> {
     };
     Some(TagTarget {
         tag_sidecar: sidecar_path
-            .then(|| tag_sidecar_target_for_path(&path))
+            .then(|| crate::tag_write_worker::sidecar_target_for_real_file(&path))
             .flatten(),
         path,
     })

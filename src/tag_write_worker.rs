@@ -17,6 +17,13 @@ pub struct TagSidecarTarget {
     pub rel_key: String,
 }
 
+pub fn sidecar_target_for_real_file(path: &std::path::Path) -> Option<TagSidecarTarget> {
+    Some(TagSidecarTarget {
+        folder: path.parent()?.to_path_buf(),
+        rel_key: path.file_name()?.to_string_lossy().to_lowercase(),
+    })
+}
+
 /// UI が worker に渡す操作。
 #[derive(Debug, Clone)]
 pub enum TagJobKind {

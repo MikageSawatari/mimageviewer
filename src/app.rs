@@ -3798,6 +3798,8 @@ pub struct App {
     /// idx キーで持つことで hot-path の `adjustment_db::normalize_path` 呼び出しを
     /// 未処理 idx に対してのみ発生させる。フォルダ切替で `prewarm_grid_tags` が clear する。
     pub(crate) tag_prewarm_queued: std::collections::HashSet<usize>,
+    /// 旧 XMP `#タグ` を `tags.db` へ一度だけ seed する保険 worker。
+    pub(crate) tag_legacy_seed_pending: Option<crate::tag_legacy_seed_worker::LegacySeedPending>,
     /// バックグラウンドで実行中のゴミ箱移動 (docs/async-architecture.md §5.2.1)。
     /// `start_delete_files` で spawn、`poll_delete_pending` で受信して進捗ダイアログを
     /// 更新、完了時に成功した path を items から一括 remove する。
@@ -5862,6 +5864,7 @@ impl App {
             metadata_pending: None,
             tag_prewarm_pending: None,
             tag_prewarm_queued: std::collections::HashSet::new(),
+            tag_legacy_seed_pending: None,
             delete_pending: None,
             search_filter: None,
             search_filter_origin_folder: None,
@@ -13083,6 +13086,9 @@ impl App {
             pending.cancel();
         }
         self.tag_prewarm_queued.clear();
+        if let Some(pending) = self.tag_legacy_seed_pending.take() {
+            pending.cancel();
+        }
 
         // キューに残った旧 idx リクエストを排水。items_gen 差異で最終的には破棄されるが、
         // worker が pop した直後は decode を走らせ始めてしまうので、明示的に捨てる。
@@ -20393,6 +20399,9 @@ impl App {
             pending.cancel();
         }
         self.tag_prewarm_queued.clear();
+        if let Some(pending) = self.tag_legacy_seed_pending.take() {
+            pending.cancel();
+        }
 
         let mut keys = Vec::new();
         for item in &self.items {
@@ -20418,6 +20427,28 @@ impl App {
         if self.settings.write_rating_to_xmp {
             self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
         }
+        self.start_tag_legacy_seed_for_current_items();
+    }
+
+    fn start_tag_legacy_seed_for_current_items(&mut self) {
+        if self.tags_db.is_none() || self.items_are_global_search_view || self.items_are_tag_view {
+            return;
+        }
+        let paths = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                GridItem::Image(path) | GridItem::Video(path) => Some(path.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return;
+        }
+        self.tag_legacy_seed_pending = Some(crate::tag_legacy_seed_worker::spawn(
+            crate::data_dir::get(),
+            paths,
+        ));
     }
 
     /// 毎フレーム呼ぶ: 現在の画面付近にある Image のうち、rating DB が未登録のものを
@@ -20521,6 +20552,63 @@ impl App {
         // 期待するのは DB が 0 = 未登録のときだけ)。
         if !rating_hydrations.is_empty() {
             self.hydrate_ratings_from_xmp(rating_hydrations);
+        }
+    }
+
+    pub(crate) fn poll_tag_legacy_seed_results(&mut self) {
+        let Some(pending) = self.tag_legacy_seed_pending.as_ref() else {
+            return;
+        };
+        match pending.rx.try_recv() {
+            Ok(Ok(result)) => {
+                self.tag_legacy_seed_pending = None;
+                self.apply_tag_legacy_seed_result(result);
+            }
+            Ok(Err(msg)) => {
+                self.tag_legacy_seed_pending = None;
+                crate::logger::log(format!("[TAG] legacy seed failed: {msg}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.tag_legacy_seed_pending = None;
+            }
+        }
+    }
+
+    fn apply_tag_legacy_seed_result(
+        &mut self,
+        result: crate::tag_legacy_seed_worker::LegacySeedResult,
+    ) {
+        let report = result.report.clone();
+        let mut changed = false;
+        for (path, tags) in result.cache_updates {
+            let key = crate::tags_db::item_key_for_path(&path);
+            self.tags_cache.insert(key, tags.clone());
+            if let Some(target) = crate::tag_write_worker::sidecar_target_for_real_file(&path) {
+                self.mirror_tag_sidecar_update(&target, &tags);
+            }
+            changed = true;
+        }
+        if changed && self.settings.facet_filter.uses_tag_state() {
+            self.rebuild_visible_indices();
+        }
+        if report.imported_items > 0
+            || report.marked_empty_items > 0
+            || report.read_errors > 0
+            || report.db_errors > 0
+        {
+            crate::logger::log(format!(
+                "[TAG] legacy seed complete: candidates={} read={} imported_items={} \
+                 inserted_tags={} marked_empty={} skipped_decided={} read_errors={} db_errors={}",
+                report.candidate_items,
+                report.read_items,
+                report.imported_items,
+                report.inserted_tags,
+                report.marked_empty_items,
+                report.skipped_decided_items,
+                report.read_errors,
+                report.db_errors
+            ));
         }
     }
 
@@ -31256,6 +31344,7 @@ impl eframe::App for App {
         self.poll_pano_high_res(ctx);
         self.update_pano_refinement(ctx);
         self.poll_tag_prewarm_results();
+        self.poll_tag_legacy_seed_results();
         self.poll_delete_pending();
         self.poll_paste_pending();
         self.poll_new_folder_pending(ctx);
@@ -31314,6 +31403,7 @@ impl eframe::App for App {
                 .tag_prewarm_pending
                 .as_ref()
                 .is_some_and(|p| p.is_busy())
+            || self.tag_legacy_seed_pending.is_some()
             || (self.folder_rating_counter_handle.is_some() && !self.folder_rating_counts_loaded)
         {
             ctx.request_repaint();
