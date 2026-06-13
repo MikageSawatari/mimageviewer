@@ -12438,6 +12438,64 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn fullscreen_shift_right_large_jump_respects_rtl_direction() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        for i in 0..30 {
+            push_image(&mut app, &format!(r"C:\pics\{i:03}.jpg"));
+        }
+        app.fullscreen_idx = Some(10);
+        app.spread_mode = crate::settings::SpreadMode::Rtl;
+        app.settings.fullscreen_jump_mode = crate::settings::FullscreenJumpMode::Percent;
+        app.settings.fullscreen_jump_percent = 10;
+
+        begin_root_key_pass_with_modifiers(
+            &ctx,
+            egui::Key::ArrowRight,
+            false,
+            egui::Modifiers::SHIFT,
+        );
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled);
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(7),
+            "right-bound spread mode should treat Shift+Right as previous"
+        );
+    }
+
+    #[test]
+    fn fullscreen_shift_left_large_jump_respects_rtl_direction() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        for i in 0..30 {
+            push_image(&mut app, &format!(r"C:\pics\{i:03}.jpg"));
+        }
+        app.fullscreen_idx = Some(10);
+        app.spread_mode = crate::settings::SpreadMode::Rtl;
+        app.settings.fullscreen_jump_mode = crate::settings::FullscreenJumpMode::Percent;
+        app.settings.fullscreen_jump_percent = 10;
+
+        begin_root_key_pass_with_modifiers(
+            &ctx,
+            egui::Key::ArrowLeft,
+            false,
+            egui::Modifiers::SHIFT,
+        );
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled);
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(13),
+            "right-bound spread mode should treat Shift+Left as next"
+        );
+    }
+
+    #[test]
     fn still_image_root_backspace_closes_to_grid() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

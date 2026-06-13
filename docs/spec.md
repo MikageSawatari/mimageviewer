@@ -547,7 +547,7 @@ GUI での編集、競合検知、マウス /
 |------|------|
 | ← / ↑ | 前の画像へ（フォルダはスキップ）。縦連結では ↑、横連結では ← が連結方向の前方へスクロール |
 | → / ↓ | 次の画像へ（同上）。縦連結では ↓、横連結では → が連結方向の後方へスクロール |
-| Shift + ← / → | 画像フルスクリーンで、設定した件数ぶん前 / 次へジャンプ。既定は 10 件 |
+| Shift + ← / → | 画像フルスクリーンで、設定した量だけ前 / 次へジャンプ。既定は全ページの 10%。固定ページ数にも切替可。見開き中は最低 2 ページ進む |
 | PageUp / PageDown | 縦/横連結モードでは画面単位で連結方向へスクロール |
 | 0〜7 | 1〜5: ページ構成、6: 連結方式、7: 横方向、0: ズーム/フィットを切替。ZIP の作品区切り表示上でも有効。7 は見開き中の左開き / 右開きも連動 |
 | S | スライドショー 再生 / 停止 |
@@ -736,7 +736,9 @@ SendTo から渡されたファイル / フォルダは Windows により位置�
 | `fullscreen_seek_bar_locked` | bool | false | 静止画フルスクリーンの下部ページシークバーを固定表示する。ON のときは下端のバー領域を画像フィット範囲から除外する |
 | `fullscreen_page_number_overlay` | bool | true | 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。下部ページシークバーの固定表示中は非表示 |
 | `fullscreen_cursor_hide_delay_secs` | f32 | 1.0 | フルスクリーン表示中、マウス操作が止まってからカーソルを隠すまでの秒数 (0.1〜5.0) |
-| `fullscreen_fixed_jump_count` | usize | 10 | 画像フルスクリーンの Shift+← / Shift+→ で前後へジャンプする件数 (1〜100) |
+| `fullscreen_jump_mode` | FullscreenJumpMode | Percent | 画像フルスクリーンの Shift+← / Shift+→ で前後へジャンプする量の指定方式 (割合 / 固定ページ数) |
+| `fullscreen_jump_percent` | u32 | 10 | `fullscreen_jump_mode = Percent` のとき、画像・ZIP/PDF ページ総数に対してジャンプする割合 (1〜100%) |
+| `fullscreen_fixed_jump_count` | usize | 10 | `fullscreen_jump_mode = FixedPages` のとき、Shift+← / Shift+→ で前後へジャンプする件数 (1〜100)。旧設定互換のため保持 |
 
 ### 8.2 キャッシュ設定
 

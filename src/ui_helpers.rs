@@ -926,16 +926,8 @@ pub fn adjacent_navigable_idx(
     }
 }
 
-/// items の中で current から `step` 件ぶん前後へ移動した画像ページ
-/// (通常画像 + ZIP 画像 + PDF ページ) の item index を返す。
-pub fn fixed_jump_page_idx(
-    items: &[GridItem],
-    display_order: &[usize],
-    current: usize,
-    step: usize,
-    forward: bool,
-) -> Option<usize> {
-    let nav_indices: Vec<usize> = display_order
+fn page_jump_nav_indices(items: &[GridItem], display_order: &[usize]) -> Vec<usize> {
+    display_order
         .iter()
         .copied()
         .filter(|&i| {
@@ -946,7 +938,15 @@ pub fn fixed_jump_page_idx(
                     | Some(GridItem::PdfPage { .. })
             )
         })
-        .collect();
+        .collect()
+}
+
+fn jump_page_idx_from_nav_indices(
+    nav_indices: &[usize],
+    current: usize,
+    step: usize,
+    forward: bool,
+) -> Option<usize> {
     if nav_indices.is_empty() {
         return None;
     }
@@ -967,6 +967,51 @@ pub fn fixed_jump_page_idx(
     } else {
         nav_indices.iter().copied().filter(|&i| i < current).max()
     }
+}
+
+/// ページ総数と比率から、割合ジャンプで使うページ数を返す。
+/// 端数は切り上げ、薄い本でも最低 1 ページは進む。
+pub fn percent_jump_page_step(total_pages: usize, percent: u32) -> usize {
+    if total_pages == 0 {
+        return 1;
+    }
+    let percent = percent.max(1) as usize;
+    (total_pages * percent).div_ceil(100).max(1)
+}
+
+/// items の中で current から `step` 件ぶん前後へ移動した画像ページ
+/// (通常画像 + ZIP 画像 + PDF ページ) の item index を返す。
+pub fn fixed_jump_page_idx(
+    items: &[GridItem],
+    display_order: &[usize],
+    current: usize,
+    step: usize,
+    forward: bool,
+) -> Option<usize> {
+    let nav_indices = page_jump_nav_indices(items, display_order);
+    jump_page_idx_from_nav_indices(&nav_indices, current, step, forward)
+}
+
+/// 設定に応じた大きめジャンプの target を返す。
+pub fn large_jump_page_idx(
+    items: &[GridItem],
+    display_order: &[usize],
+    current: usize,
+    mode: crate::settings::FullscreenJumpMode,
+    percent: u32,
+    fixed_count: usize,
+    min_step: usize,
+    forward: bool,
+) -> Option<usize> {
+    let nav_indices = page_jump_nav_indices(items, display_order);
+    let step = match mode {
+        crate::settings::FullscreenJumpMode::Percent => {
+            percent_jump_page_step(nav_indices.len(), percent)
+        }
+        crate::settings::FullscreenJumpMode::FixedPages => fixed_count.max(1),
+    }
+    .max(min_step.max(1));
+    jump_page_idx_from_nav_indices(&nav_indices, current, step, forward)
 }
 
 /// スライドショー送り用の隣接探索。`adjacent_navigable_idx` と同じだが
@@ -1550,6 +1595,81 @@ mod tests {
         let order = vec![5, 0, 2, 3, 1, 4];
         assert_eq!(fixed_jump_page_idx(&items, &order, 5, 2, true), Some(4));
         assert_eq!(fixed_jump_page_idx(&items, &order, 4, 3, false), Some(5));
+    }
+
+    #[test]
+    fn percent_jump_page_step_rounds_up_and_has_minimum() {
+        assert_eq!(percent_jump_page_step(0, 10), 1);
+        assert_eq!(percent_jump_page_step(1, 10), 1);
+        assert_eq!(percent_jump_page_step(9, 10), 1);
+        assert_eq!(percent_jump_page_step(10, 10), 1);
+        assert_eq!(percent_jump_page_step(11, 10), 2);
+        assert_eq!(percent_jump_page_step(200, 10), 20);
+        assert_eq!(percent_jump_page_step(200, 100), 200);
+    }
+
+    #[test]
+    fn large_jump_page_idx_uses_percent_or_fixed_mode() {
+        let items = img_items(200);
+        let vi: Vec<usize> = (0..200).collect();
+        assert_eq!(
+            large_jump_page_idx(
+                &items,
+                &vi,
+                50,
+                crate::settings::FullscreenJumpMode::Percent,
+                10,
+                3,
+                1,
+                true,
+            ),
+            Some(70)
+        );
+        assert_eq!(
+            large_jump_page_idx(
+                &items,
+                &vi,
+                50,
+                crate::settings::FullscreenJumpMode::FixedPages,
+                10,
+                3,
+                1,
+                true,
+            ),
+            Some(53)
+        );
+    }
+
+    #[test]
+    fn large_jump_page_idx_honors_min_step_for_spread_views() {
+        let items = img_items(9);
+        let vi: Vec<usize> = (0..9).collect();
+        assert_eq!(
+            large_jump_page_idx(
+                &items,
+                &vi,
+                4,
+                crate::settings::FullscreenJumpMode::Percent,
+                10,
+                1,
+                2,
+                true,
+            ),
+            Some(6)
+        );
+        assert_eq!(
+            large_jump_page_idx(
+                &items,
+                &vi,
+                4,
+                crate::settings::FullscreenJumpMode::FixedPages,
+                10,
+                1,
+                2,
+                false,
+            ),
+            Some(2)
+        );
     }
 
     /// スライドショー送りは Video を飛ばす: image(0) - video(1) - image(2) で

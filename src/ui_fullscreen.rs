@@ -3008,7 +3008,7 @@ impl App {
                         } else if sibling_nav.is_some() {
                             self.bump_input_seq("fs_sibling_nav", None);
                         } else if jump_to.is_some() {
-                            self.bump_input_seq("fs_fixed_jump", None);
+                            self.bump_input_seq("fs_large_jump", None);
                         } else if key_action.close {
                             self.bump_input_seq("fs_close_key", None);
                         }
@@ -4633,16 +4633,19 @@ impl App {
         nav
     }
 
-    pub(crate) fn fullscreen_fixed_jump_target(
+    pub(crate) fn fullscreen_large_jump_target(
         &self,
         fs_idx: usize,
         forward: bool,
     ) -> Option<usize> {
-        crate::ui_helpers::fixed_jump_page_idx(
+        crate::ui_helpers::large_jump_page_idx(
             &self.items,
             self.current_grid_order(),
             fs_idx,
+            self.settings.fullscreen_jump_mode,
+            self.settings.fullscreen_jump_percent,
             self.settings.fullscreen_fixed_jump_count,
+            if self.spread_mode.is_spread() { 2 } else { 1 },
             forward,
         )
     }
@@ -4880,7 +4883,7 @@ impl App {
         } else if key_action.sibling_nav.is_some() {
             self.bump_input_seq("fs_root_sibling_nav", None);
         } else if key_action.jump_to.is_some() {
-            self.bump_input_seq("fs_root_fixed_jump", None);
+            self.bump_input_seq("fs_root_large_jump", None);
         } else if key_action.close || key_action.close_to_page_list {
             self.bump_input_seq("fs_root_close_key", None);
         }
@@ -6078,8 +6081,8 @@ impl App {
             action.sibling_nav = Some(-1);
         }
         if fixed_jump_next || fixed_jump_prev {
-            let forward = fixed_jump_next;
-            if let Some(new_idx) = self.fullscreen_fixed_jump_target(fs_idx, forward) {
+            let forward = if fixed_jump_next { !rtl } else { rtl };
+            if let Some(new_idx) = self.fullscreen_large_jump_target(fs_idx, forward) {
                 action.jump_to = Some(new_idx);
             } else {
                 self.fs_boundary_hint = Some(FsBoundaryHint::Edge {

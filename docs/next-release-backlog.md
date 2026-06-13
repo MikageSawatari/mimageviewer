@@ -229,6 +229,7 @@ Source thread: https://egg.5ch.io/test/read.cgi/software/1752914772/
 
 - Source: 745.
 - Request: Add key operations that jump forward/backward by a configured amount, such as fixed 10 pages or 10% of total pages.
+- Status: 対応済み (next patch). `Shift+Left/Right` は keymap action として維持しつつ、設定を `fullscreen_jump_mode` + `fullscreen_jump_percent` + 既存 `fullscreen_fixed_jump_count` に拡張。既定は 10%。固定ページ数にも切替可。
 - Proposed design:
   - Add commands such as `jump_forward_large` and `jump_backward_large`.
   - Make them available in `keymap.ini`.
@@ -290,6 +291,22 @@ Source thread: https://egg.5ch.io/test/read.cgi/software/1752914772/
   - If detection persists, consider repackaging the ZIP and resubmitting.
   - Code signing may help SmartScreen reputation over time, but Defender malware detections still require false-positive submission.
 - Priority: Release hygiene / support.
+
+### 4.9 v1.4.0 large-jump feedback
+
+- Source: 756, 758, 759.
+- Current state: v1.4.0 added `Shift+Left/Right` large page jump with a fixed default of 10 pages.
+- Status: 対応済み (next patch). 既定を 10% に変更し、右綴じでは通常の左右ページ送りと同じく方向を反転。見開き中は最低 2 ページ進む。
+- Next-version fixes promised in thread:
+  - Add percentage-based jump amount, e.g. jump by 10% of total pages, because fixed 10 pages is too small for thick books and too large/noisy for thin books.
+  - Respect reading direction / binding direction for `Shift+Left/Right`; the current implementation appears reversed for right-bound manga.
+- Proposed design:
+  - Extend the jump setting from a fixed page count to a mode + value pair:
+    - Fixed pages.
+    - Percentage of total pages.
+  - Clamp the computed jump amount to at least 1 page and within the book bounds.
+  - `Shift+Left/Right` should reuse the same logical previous/next direction mapping as normal page navigation, then apply the larger step. Do not hard-code physical left/right directly to index +/-.
+- Priority: High for the next patch because both items were acknowledged in thread.
 
 ### 4.10 v1.4.0 seek-bar / cursor / spread-label feedback
 

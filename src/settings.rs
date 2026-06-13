@@ -1196,6 +1196,30 @@ impl FullscreenFitMode {
 }
 
 // -----------------------------------------------------------------------
+// FullscreenJumpMode (Shift+左右の大きめページジャンプ量)
+// -----------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FullscreenJumpMode {
+    #[default]
+    Percent,
+    FixedPages,
+}
+
+impl FullscreenJumpMode {
+    pub fn all() -> &'static [Self] {
+        &[Self::Percent, Self::FixedPages]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Percent => "全体の割合",
+            Self::FixedPages => "固定ページ数",
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // RecentApp (アプリケーションで開く 履歴)
 // -----------------------------------------------------------------------
 
@@ -1591,7 +1615,14 @@ pub struct Settings {
     /// フルスクリーン表示中、マウス操作が止まってからカーソルを隠すまでの秒数。
     #[serde(default = "default_fullscreen_cursor_hide_delay_secs")]
     pub fullscreen_cursor_hide_delay_secs: f32,
-    /// 画像フルスクリーンの固定ジャンプ (Shift+←/→) で移動する件数。
+    /// 画像フルスクリーンの大きめジャンプ (Shift+←/→) の量指定方式。
+    #[serde(default)]
+    pub fullscreen_jump_mode: FullscreenJumpMode,
+    /// 画像フルスクリーンの割合ジャンプ (Shift+←/→) で移動するページ総数比率。
+    #[serde(default = "default_fullscreen_jump_percent")]
+    pub fullscreen_jump_percent: u32,
+    /// 画像フルスクリーンの固定ページジャンプ (Shift+←/→) で移動する件数。
+    /// `fullscreen_jump_mode == FixedPages` のときだけ使う。旧設定互換のため名前は維持する。
     #[serde(default = "default_fullscreen_fixed_jump_count")]
     pub fullscreen_fixed_jump_count: usize,
     /// 連結読みのホイール 1 ノッチあたりスクロール量 (画面サイズ比 %)。
@@ -2397,6 +2428,9 @@ fn default_video_playback_speed() -> f64 {
 pub const MIN_GRID_COLS: usize = 1;
 /// グリッド列数の最大値
 pub const MAX_GRID_COLS: usize = 10;
+pub const FULLSCREEN_JUMP_PERCENT_MIN: u32 = 1;
+pub const FULLSCREEN_JUMP_PERCENT_MAX: u32 = 100;
+pub const FULLSCREEN_JUMP_PERCENT_DEFAULT: u32 = 10;
 pub const FULLSCREEN_FIXED_JUMP_MIN: usize = 1;
 pub const FULLSCREEN_FIXED_JUMP_MAX: usize = 100;
 pub const FULLSCREEN_FIXED_JUMP_DEFAULT: usize = 10;
@@ -2550,6 +2584,9 @@ fn default_continuous_reading_key_scroll_percent() -> u32 {
 fn default_continuous_reading_gamepad_scroll_percent_per_sec() -> u32 {
     130
 }
+fn default_fullscreen_jump_percent() -> u32 {
+    FULLSCREEN_JUMP_PERCENT_DEFAULT
+}
 fn default_fullscreen_fixed_jump_count() -> usize {
     FULLSCREEN_FIXED_JUMP_DEFAULT
 }
@@ -2648,6 +2685,8 @@ impl Default for Settings {
             fullscreen_seek_bar_locked: false,
             fullscreen_page_number_overlay: true,
             fullscreen_cursor_hide_delay_secs: FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
+            fullscreen_jump_mode: FullscreenJumpMode::Percent,
+            fullscreen_jump_percent: FULLSCREEN_JUMP_PERCENT_DEFAULT,
             fullscreen_fixed_jump_count: FULLSCREEN_FIXED_JUMP_DEFAULT,
             continuous_reading_wheel_scroll_percent:
                 default_continuous_reading_wheel_scroll_percent(),
@@ -3661,6 +3700,9 @@ impl Settings {
         self.continuous_reading_gamepad_scroll_percent_per_sec = self
             .continuous_reading_gamepad_scroll_percent_per_sec
             .clamp(10, 300);
+        self.fullscreen_jump_percent = self
+            .fullscreen_jump_percent
+            .clamp(FULLSCREEN_JUMP_PERCENT_MIN, FULLSCREEN_JUMP_PERCENT_MAX);
         self.fullscreen_fixed_jump_count = self
             .fullscreen_fixed_jump_count
             .clamp(FULLSCREEN_FIXED_JUMP_MIN, FULLSCREEN_FIXED_JUMP_MAX);
@@ -4008,6 +4050,8 @@ mod tests {
             s.fullscreen_cursor_hide_delay_secs,
             FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
         );
+        assert_eq!(s.fullscreen_jump_mode, FullscreenJumpMode::Percent);
+        assert_eq!(s.fullscreen_jump_percent, FULLSCREEN_JUMP_PERCENT_DEFAULT);
         assert_eq!(s.fullscreen_fixed_jump_count, 10);
         assert_eq!(s.continuous_reading_wheel_scroll_percent, 20);
         assert_eq!(s.continuous_reading_key_scroll_percent, 16);
@@ -4269,6 +4313,11 @@ mod tests {
         assert_eq!(loaded.video_volume, VIDEO_VOLUME_DEFAULT);
         assert_eq!(loaded.video_playback_speed, 1.0);
         assert_eq!(loaded.fullscreen_fit_mode, FullscreenFitMode::Page);
+        assert_eq!(loaded.fullscreen_jump_mode, FullscreenJumpMode::Percent);
+        assert_eq!(
+            loaded.fullscreen_jump_percent,
+            FULLSCREEN_JUMP_PERCENT_DEFAULT
+        );
         assert_eq!(loaded.fullscreen_fixed_jump_count, 10);
         assert_eq!(loaded.continuous_reading_wheel_scroll_percent, 20);
         assert_eq!(loaded.continuous_reading_key_scroll_percent, 16);
@@ -4316,6 +4365,7 @@ mod tests {
         s.continuous_reading_wheel_scroll_percent = 0;
         s.continuous_reading_key_scroll_percent = 999;
         s.continuous_reading_gamepad_scroll_percent_per_sec = 999;
+        s.fullscreen_jump_percent = 999;
         s.fullscreen_fixed_jump_count = 999;
         s.fullscreen_cursor_hide_delay_secs = 99.0;
         s.sanitize();
@@ -4324,15 +4374,18 @@ mod tests {
         assert_eq!(s.continuous_reading_wheel_scroll_percent, 1);
         assert_eq!(s.continuous_reading_key_scroll_percent, 100);
         assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 300);
+        assert_eq!(s.fullscreen_jump_percent, FULLSCREEN_JUMP_PERCENT_MAX);
         assert_eq!(s.fullscreen_fixed_jump_count, FULLSCREEN_FIXED_JUMP_MAX);
         assert_eq!(
             s.fullscreen_cursor_hide_delay_secs,
             FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS
         );
 
+        s.fullscreen_jump_percent = 0;
         s.fullscreen_fixed_jump_count = 0;
         s.fullscreen_cursor_hide_delay_secs = 0.0;
         s.sanitize();
+        assert_eq!(s.fullscreen_jump_percent, FULLSCREEN_JUMP_PERCENT_MIN);
         assert_eq!(s.fullscreen_fixed_jump_count, FULLSCREEN_FIXED_JUMP_MIN);
         assert_eq!(
             s.fullscreen_cursor_hide_delay_secs,

@@ -109,8 +109,8 @@
 # RatingContainerClear = Shift+F6 ; 現在のフォルダまたはZIP/PDF本体のレーティングを解除する
 
 [FsImage] ; 画像フルスクリーン
-# FsFixedJumpPrev = Shift+Left ; 設定した件数ぶん前へジャンプする
-# FsFixedJumpNext = Shift+Right ; 設定した件数ぶん先へジャンプする
+# FsFixedJumpPrev = Shift+Left ; 設定した量だけ前へジャンプする
+# FsFixedJumpNext = Shift+Right ; 設定した量だけ先へジャンプする
 # FsContinuousScrollForward = PageDown ; 連結表示中に次の画面分へスクロールする
 # FsContinuousScrollBack = PageUp ; 連結表示中に前の画面分へスクロールする
 # FsSpreadShiftLeft = Ctrl+Left ; 見開き表示を左方向へ1ページずらす

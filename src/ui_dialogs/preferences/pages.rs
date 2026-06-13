@@ -1,8 +1,8 @@
 use super::*;
 use crate::settings::{
-    self, AiFeatureMode, CachePolicy, FullscreenFitMode, Parallelism, ReadingDirection,
-    ReadingFlow, SortOrder, SpreadMode, StartupFolderMode, ThumbAspect, ToolbarSectionDisplay,
-    UiTheme,
+    self, AiFeatureMode, CachePolicy, FullscreenFitMode, FullscreenJumpMode, Parallelism,
+    ReadingDirection, ReadingFlow, SortOrder, SpreadMode, StartupFolderMode, ThumbAspect,
+    ToolbarSectionDisplay, UiTheme,
 };
 
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -2585,18 +2585,48 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         s.fullscreen_cursor_hide_delay_secs,
     );
     ui.horizontal(|ui| {
-        ui.label("固定ジャンプ量");
-        ui.add(
-            egui::DragValue::new(&mut s.fullscreen_fixed_jump_count)
-                .range(
-                    crate::settings::FULLSCREEN_FIXED_JUMP_MIN
-                        ..=crate::settings::FULLSCREEN_FIXED_JUMP_MAX,
-                )
-                .speed(1)
-                .suffix(" 件"),
-        );
+        ui.label("ページジャンプ量");
+        egui::ComboBox::from_id_salt("fullscreen_jump_mode")
+            .selected_text(s.fullscreen_jump_mode.label())
+            .show_ui(ui, |ui| {
+                for &mode in FullscreenJumpMode::all() {
+                    ui.selectable_value(&mut s.fullscreen_jump_mode, mode, mode.label());
+                }
+            });
+        match s.fullscreen_jump_mode {
+            FullscreenJumpMode::Percent => {
+                ui.add(
+                    egui::DragValue::new(&mut s.fullscreen_jump_percent)
+                        .range(
+                            crate::settings::FULLSCREEN_JUMP_PERCENT_MIN
+                                ..=crate::settings::FULLSCREEN_JUMP_PERCENT_MAX,
+                        )
+                        .speed(1)
+                        .suffix(" %"),
+                );
+            }
+            FullscreenJumpMode::FixedPages => {
+                ui.add(
+                    egui::DragValue::new(&mut s.fullscreen_fixed_jump_count)
+                        .range(
+                            crate::settings::FULLSCREEN_FIXED_JUMP_MIN
+                                ..=crate::settings::FULLSCREEN_FIXED_JUMP_MAX,
+                        )
+                        .speed(1)
+                        .suffix(" ページ"),
+                );
+            }
+        }
     });
-    ui.small("画像フルスクリーンの Shift+← / Shift+→ で前後へジャンプする件数です。動画フルスクリーンでは Shift+左右は 1 秒シークのままです。");
+    s.fullscreen_jump_percent = s.fullscreen_jump_percent.clamp(
+        crate::settings::FULLSCREEN_JUMP_PERCENT_MIN,
+        crate::settings::FULLSCREEN_JUMP_PERCENT_MAX,
+    );
+    s.fullscreen_fixed_jump_count = s.fullscreen_fixed_jump_count.clamp(
+        crate::settings::FULLSCREEN_FIXED_JUMP_MIN,
+        crate::settings::FULLSCREEN_FIXED_JUMP_MAX,
+    );
+    ui.small("画像フルスクリーンの Shift+← / Shift+→ で前後へジャンプする量です。割合は画像・ZIP/PDF ページの総数から計算します。動画フルスクリーンでは Shift+左右は 1 秒シークのままです。");
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label("見開きのページ間隔");

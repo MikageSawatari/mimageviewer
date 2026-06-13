@@ -464,8 +464,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - BrowserBack/Forward、マウス戻る/進む、ホイール、クリックは固定。
 
 ### FsImage (Ph2) ★
-- FsNextImage `→`,`Shift+→` / FsPrevImage `←`,`Shift+←` / FsNextImageV `↓`,`Shift+↓` /
-  FsPrevImageV `↑`,`Shift+↑` (P)(矢印 = 予約候補) / FsHome/End (予約候補)
+- FsNextImage `→` / FsPrevImage `←` / FsNextImageV `↓`,`Shift+↓` /
+  FsPrevImageV `↑`,`Shift+↑` (P)(矢印 = 予約候補) / FsFixedJumpNext/Prev `Shift+→/←` /
+  FsHome/End (予約候補)
 - FsContinuousScrollForward/Back `PageDown/PageUp` (P)(連続読み時のみ)
 - FsSpreadShiftLeft/Right `Ctrl+←/→` (P)
 - FsSlideshow `S` ★ / FsSpaceCheck `Space` (スライドショー停止またはチェックトグル) ★
