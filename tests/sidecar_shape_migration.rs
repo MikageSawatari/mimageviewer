@@ -106,6 +106,7 @@ fn sidecar_subtract_persists_through_import() {
         None,
         None,
         None,
+        None, // tags_db (152a9ec5 で追加。この test はタグ非対象)
     );
     assert_eq!(stats.imported_mask, 1);
 
