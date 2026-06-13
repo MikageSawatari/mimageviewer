@@ -833,12 +833,6 @@ impl App {
                         ui.close();
                     }
 
-                    // タグビュー (Ctrl+T)
-                    if ui.button("タグビュー (Ctrl+T)").clicked() {
-                        self.toggle_tag_view();
-                        ui.close();
-                    }
-
                     // 区切り線
                     ui.separator();
 
@@ -897,7 +891,7 @@ impl App {
                         self.open_tag_editor();
                         ui.close();
                     }
-                    if ui.button("タグビューを開く").clicked() {
+                    if ui.button("タグビュー (Ctrl+T)").clicked() {
                         self.open_tag_view();
                         ui.close();
                     }
