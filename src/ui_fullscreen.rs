@@ -879,8 +879,6 @@ const NAV_MARKER_EPSILON: f64 = 0.5;
 /// フルスクリーンで上部ホバーバーが表示される画面上端からの距離 (ピクセル)。
 /// `draw_fs_hover_bar` の hover 判定と、`fs_ui_is_clean` のクリーン判定で共有する。
 const TOP_BAR_HOVER_Y: f32 = 60.0;
-// CURSOR_HIDE_IDLE_SECS は `crate::video::native_presenter::CURSOR_HIDE_IDLE_SECS`
-// に集約している (eframe 経路と D3D11 native 経路の両方で同じ閾値を使うため)。
 
 /// 動画のチャプター・ブックマーク・ピンを 1 本の Vec に集約するための種別タグ。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1945,26 +1943,42 @@ fn format_fullscreen_page_number_label(total: usize, positions: &[usize]) -> Opt
     if total == 0 || positions.is_empty() {
         return None;
     }
-    let mut pages = positions
-        .iter()
-        .copied()
-        .filter(|&page| (1..=total).contains(&page))
-        .collect::<Vec<_>>();
+    let mut pages = Vec::with_capacity(positions.len());
+    for page in positions.iter().copied() {
+        if (1..=total).contains(&page) && !pages.contains(&page) {
+            pages.push(page);
+        }
+    }
     if pages.is_empty() {
         return None;
     }
-    pages.sort_unstable();
-    pages.dedup();
     if pages.len() == 1 {
         Some(format!("{} / {}", pages[0], total))
-    } else {
+    } else if pages.windows(2).all(|w| w[0] + 1 == w[1]) {
         Some(format!(
             "{}-{} / {}",
             pages[0],
             pages[pages.len() - 1],
             total
         ))
+    } else {
+        Some(format!(
+            "{} / {}",
+            pages
+                .iter()
+                .map(|page| page.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            total
+        ))
     }
+}
+
+fn image_reading_position(image_indices: &[usize], idx: usize) -> Option<usize> {
+    image_indices
+        .iter()
+        .position(|&image_idx| image_idx == idx)
+        .map(|pos| pos + 1)
 }
 
 impl App {
@@ -2047,34 +2061,34 @@ impl App {
         parts.join("、")
     }
 
-    pub(crate) fn fullscreen_page_number_label(&mut self, fs_idx: usize) -> Option<String> {
-        if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
+    fn fullscreen_page_number_label_for_info(
+        &mut self,
+        page_idx: usize,
+        info: &FsSeekInfo,
+        continuous_reading: bool,
+    ) -> Option<String> {
+        if !self
+            .items
+            .get(page_idx)
+            .is_some_and(GridItem::has_page_data)
+        {
             return None;
         }
 
-        // 毎フレーム呼ばれる (overlay 既定 ON)。display order の clone + 全 items の
-        // filter+collect を避け、シークバーと共有のキャッシュ済み reading indices を使う。
-        let info = self.fullscreen_seek_info_cached(fs_idx)?;
-        let image_indices = &info.image_indices;
-        let total = image_indices.len();
-        let position_for = |idx: usize| {
-            image_indices
-                .iter()
-                .position(|&i| i == idx)
-                .map(|pos| pos + 1)
-        };
-
-        let positions = if self.continuous_reading_active_for_idx(fs_idx) {
-            vec![position_for(fs_idx)?]
+        let total = info.image_indices.len();
+        let positions = if continuous_reading {
+            vec![image_reading_position(&info.image_indices, page_idx)?]
         } else {
-            match self.resolve_visible_spread_pair(fs_idx) {
-                SpreadPair::Single => vec![position_for(fs_idx)?],
+            match self.resolve_visible_spread_pair(page_idx) {
+                SpreadPair::Single => {
+                    vec![image_reading_position(&info.image_indices, page_idx)?]
+                }
                 SpreadPair::Double { left, right } => {
                     let mut positions = Vec::with_capacity(2);
-                    if let Some(pos) = position_for(left) {
+                    if let Some(pos) = image_reading_position(&info.image_indices, left) {
                         positions.push(pos);
                     }
-                    if let Some(pos) = position_for(right) {
+                    if let Some(pos) = image_reading_position(&info.image_indices, right) {
                         positions.push(pos);
                     }
                     positions
@@ -2083,6 +2097,14 @@ impl App {
         };
 
         format_fullscreen_page_number_label(total, &positions)
+    }
+
+    pub(crate) fn fullscreen_page_number_label(&mut self, fs_idx: usize) -> Option<String> {
+        // 毎フレーム呼ばれる (overlay 既定 ON)。display order の clone + 全 items の
+        // filter+collect を避け、シークバーと共有のキャッシュ済み reading indices を使う。
+        let info = self.fullscreen_seek_info_cached(fs_idx)?;
+        let continuous_reading = self.continuous_reading_active_for_idx(fs_idx);
+        self.fullscreen_page_number_label_for_info(fs_idx, &info, continuous_reading)
     }
 
     fn draw_fullscreen_page_number_overlay(
@@ -2256,9 +2278,21 @@ impl App {
 
         let total = info.image_indices.len();
         let is_rtl = self.reading_direction == ReadingDirection::Rtl;
+        let continuous_label_mode = self.continuous_reading_active_for_idx(fs_idx);
         let inner = content_rect.shrink2(egui::vec2(12.0, 7.0));
         let font = egui::FontId::monospace(13.0);
-        let sample_label = format!("{}/{}", total, total);
+        let sample_positions =
+            if !continuous_label_mode && self.spread_mode.is_spread() && total >= 2 {
+                if self.spread_mode.is_rtl() {
+                    vec![total, total - 1]
+                } else {
+                    vec![total - 1, total]
+                }
+            } else {
+                vec![total]
+            };
+        let sample_label = format_fullscreen_page_number_label(total, &sample_positions)
+            .unwrap_or_else(|| format!("{} / {}", total, total));
         let sample_galley = painter.layout_no_wrap(
             sample_label,
             font.clone(),
@@ -2375,7 +2409,10 @@ impl App {
             egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(10, 16, 26, 180)),
         );
 
-        let label = format!("{}/{}", display_pos + 1, total);
+        let label_idx = info.image_indices[display_pos];
+        let label = self
+            .fullscreen_page_number_label_for_info(label_idx, &info, continuous_label_mode)
+            .unwrap_or_else(|| format!("{} / {}", display_pos + 1, total));
         painter.text(
             label_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -2892,7 +2929,7 @@ impl App {
                 // ホイールがあれば「活動中」とみなしタイマをリセットする。キー操作は
                 // カーソルを再表示しない。
                 // `pointer.velocity()` ではなく `delta()` を使う (velocity は静止後も
-                // 慣性を残し、3 秒タイマがいつまでも進まない誤動作になるため)。
+                // 慣性を残し、idle タイマがいつまでも進まない誤動作になるため)。
                 // `open_fullscreen` で Some 初期化されるが、想定外の入場経路で None の
                 // まま到達した場合も safety net として今フレームで起動する。
                 if self.cursor_last_activity.is_none() {
@@ -3937,7 +3974,7 @@ impl App {
                     });
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
 
-                // パネル / HUD が全て非表示で 3 秒以上アイドルならカーソルを隠す。
+                // パネル / HUD が全て非表示で設定秒数以上アイドルならカーソルを隠す。
                 // 動画 native presenter 経路は `update_cursor_icon` で
                 // `CursorIcon::None` → `SetCursor(None)` に解決する (= 完全非表示)。
                 // 静止画 (egui) 経路は winit が `CursorIcon::None` を Windows API で
@@ -3949,7 +3986,7 @@ impl App {
                 //   `cursor_hidden = false` (idle タイマをリセット)。これにより
                 //   一時停止 (HUD 表示中) の間にタイマが古くなり、再開直後に即座に
                 //   カーソルが消える事故を防ぐ。
-                // - clean かつ idle >= 3 秒、または `cursor_hidden` が立っている:
+                // - clean かつ idle >= 設定秒数、または `cursor_hidden` が立っている:
                 //   `CursorIcon::None` を毎フレーム適用 (egui は frame 跨ぎで sticky に
                 //   ならないため)、`cursor_hidden = true` をセット。
                 {
@@ -3968,7 +4005,7 @@ impl App {
                         .cursor_last_activity
                         .map(|t| t.elapsed().as_secs_f32())
                         .unwrap_or(0.0);
-                    let threshold = crate::video::native_presenter::CURSOR_HIDE_IDLE_SECS;
+                    let threshold = self.settings.fullscreen_cursor_hide_delay_secs;
                     if clean && (idle >= threshold || self.cursor_hidden) {
                         if !self.cursor_hidden {
                             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
@@ -3976,7 +4013,7 @@ impl App {
                         ctx.set_cursor_icon(egui::CursorIcon::None);
                         self.cursor_hidden = true;
                     } else if clean {
-                        // カウントダウン中: 残時間後に再描画予約してきっかり 3 秒で隠す。
+                        // カウントダウン中: 残時間後に再描画予約して設定秒数で隠す。
                         let remain = (threshold - idle).max(0.05);
                         ctx.request_repaint_after(std::time::Duration::from_secs_f32(remain));
                     }
@@ -10747,9 +10784,9 @@ impl App {
     }
 
     /// フルスクリーン UI が「クリーンな状態」(= 上部バー / 左右パネル / HUD / モーダルが
-    /// 何も出ていない) か判定する。`true` かつアイドル時間が `CURSOR_HIDE_IDLE_SECS` を
-    /// 超えたらマウスカーソルを `CursorIcon::None` で非表示にする。
-    fn fs_ui_is_clean(&self, ctx: &egui::Context, full_rect: egui::Rect, is_video: bool) -> bool {
+    /// 何も出ていない) か判定する。`true` かつアイドル時間が設定秒数を超えたら
+    /// マウスカーソルを `CursorIcon::None` で非表示にする。
+    fn fs_ui_is_clean(&self, ctx: &egui::Context, full_rect: egui::Rect, _is_video: bool) -> bool {
         let pointer = ctx.input(|i| i.pointer.hover_pos());
         // Once the cursor is hidden, the last hover position is stale until a real input
         // event arrives. Do not let that passive position keep hover UI "visible" and
@@ -10760,12 +10797,8 @@ impl App {
             && pointer.is_some_and(|p| p.x > full_rect.max.x - full_rect.width() * 0.25);
         // 動画再生中の HUD / speed popup は native presenter overlay 側で管理されるため
         // egui main window のカーソル可視判定からは除外する (= 旧 egui HUD は撤去済)。
-        let locked_seek_bar_visible = self
-            .fullscreen_idx
-            .is_some_and(|idx| self.fullscreen_seek_bar_locked_for_idx(idx, is_video));
         !in_top
             && !in_right
-            && !locked_seek_bar_visible
             && !self.show_metadata_panel
             && !self.metadata_panel_hover_active
             && !self.adjustment_mode
@@ -14565,6 +14598,18 @@ mod tests {
         assert_eq!(
             count_seek_overlay_non_image_items(&items, &nav_indices),
             (1, 0)
+        );
+    }
+
+    #[test]
+    fn page_number_formatter_preserves_visual_spread_order() {
+        assert_eq!(
+            format_fullscreen_page_number_label(200, &[2, 3]).as_deref(),
+            Some("2-3 / 200")
+        );
+        assert_eq!(
+            format_fullscreen_page_number_label(200, &[3, 2]).as_deref(),
+            Some("3,2 / 200")
         );
     }
 

@@ -290,3 +290,19 @@ Source thread: https://egg.5ch.io/test/read.cgi/software/1752914772/
   - If detection persists, consider repackaging the ZIP and resubmitting.
   - Code signing may help SmartScreen reputation over time, but Defender malware detections still require false-positive submission.
 - Priority: Release hygiene / support.
+
+### 4.10 v1.4.0 seek-bar / cursor / spread-label feedback
+
+- Source: 760.
+- Requests:
+  - When the bottom seek bar is pinned/fixed, the mouse cursor does not seem to auto-hide. Fix this so the cursor still hides after inactivity.
+  - Add a setting for mouse cursor auto-hide delay. The current behavior appears to be around 3 seconds; user wants a shorter delay.
+  - For spread display in right-bound manga, the bottom-right page number should match the visual page arrangement on screen, e.g. `3,2 / 200` instead of numeric `2-3 / 200`.
+  - The page number shown on the seek bar currently shows only one page such as `2/200`, `4/200`, `6/200`; it should use the same spread-aware label as the bottom-right overlay.
+- Status: 対応済み (next patch). `fullscreen_cursor_hide_delay_secs` を追加し、既定 1.0 秒 / 設定範囲 0.1〜5.0 秒に変更。固定シークバー表示はカーソル可視維持理由にせず、ページ番号は右下 overlay / 下部 seek bar で同じ見開き対応 formatter を使う。
+- Proposed design:
+  - Treat mouse movement/interaction, not pinned HUD visibility, as the reason to keep the cursor visible.
+  - Persist `fullscreen_cursor_hide_delay_secs`.
+  - Default to 1.0 second.
+  - Use the shared formatter for both the bottom-right overlay and the seek-bar page label.
+- Priority: High for cursor auto-hide bug and spread-label consistency; medium for exposing the cursor-hide delay setting.

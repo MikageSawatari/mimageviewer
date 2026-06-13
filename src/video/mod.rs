@@ -295,6 +295,7 @@ pub struct NativeVideoOutputConfig {
     pub initial_tile_overlay: bool,
     pub vst3_available: bool,
     pub checked: bool,
+    pub cursor_hide_delay_secs: f32,
     /// CP7: HUD raise の allowlist 判定 (`foreground_allows_hud_raise`) で参照する
     /// VST editor container HWND の snapshot。App が `dsp_bridge.editor_hwnds_snapshot()` を
     /// 渡す。`None` のとき HUD HWND を作っても raise 判定で常に false (= raise 起動しない)
@@ -1634,6 +1635,7 @@ fn run_native_video_output(
             height,
             test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
             egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", true),
+            cursor_hide_delay_secs: config.cursor_hide_delay_secs,
             hud_event_tx,
         },
     ) {
@@ -2392,6 +2394,7 @@ fn run_native_video_output(
                                                 "MIV_NATIVE_VIDEO_EGUI_OVERLAY",
                                                 true,
                                             ),
+                                            cursor_hide_delay_secs: config.cursor_hide_delay_secs,
                                             hud_event_tx: new_hud_event_tx,
                                         },
                                     );

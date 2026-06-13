@@ -314,7 +314,7 @@ seek して再生開始する。切替元の `VideoPlayer` は cpal stream を�
 buffer を明示クリアしてから native presenter を渡し、前動画の処理済み音声が短く漏れる
 のを抑える。
 
-静止画フルスクリーンでも、動画再生中と同じ idle タイマ (`CURSOR_HIDE_IDLE_SECS`) を使う。
+静止画フルスクリーンでも、動画再生中と同じ `fullscreen_cursor_hide_delay_secs` 設定を使う。
 UI / パネル / ダイアログが出ていない状態でマウス操作が止まると `CursorIcon::None`
 に加えて viewport の `CursorVisible(false)` を送るため、スライドショー再生中も OS カーソルが
 画面上に残らない。スライドショーのタイマー送りやキーによるページ送りではこの idle 状態を

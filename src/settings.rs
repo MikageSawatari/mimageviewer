@@ -1588,6 +1588,9 @@ pub struct Settings {
     /// 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。
     #[serde(default = "default_true")]
     pub fullscreen_page_number_overlay: bool,
+    /// フルスクリーン表示中、マウス操作が止まってからカーソルを隠すまでの秒数。
+    #[serde(default = "default_fullscreen_cursor_hide_delay_secs")]
+    pub fullscreen_cursor_hide_delay_secs: f32,
     /// 画像フルスクリーンの固定ジャンプ (Shift+←/→) で移動する件数。
     #[serde(default = "default_fullscreen_fixed_jump_count")]
     pub fullscreen_fixed_jump_count: usize,
@@ -2132,6 +2135,17 @@ pub fn format_video_volume_db(value: f64) -> String {
     }
 }
 
+pub fn clamp_fullscreen_cursor_hide_delay_secs(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(
+            FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS,
+            FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS,
+        )
+    } else {
+        FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
+    }
+}
+
 /// 音量ノーマライズの target_lufs_milli 既定値 (= -14.000 LUFS、YouTube/Spotify 相当)。
 fn default_audio_normalize_target_lufs_milli() -> i32 {
     -14_000
@@ -2386,6 +2400,9 @@ pub const MAX_GRID_COLS: usize = 10;
 pub const FULLSCREEN_FIXED_JUMP_MIN: usize = 1;
 pub const FULLSCREEN_FIXED_JUMP_MAX: usize = 100;
 pub const FULLSCREEN_FIXED_JUMP_DEFAULT: usize = 10;
+pub const FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS: f32 = 0.1;
+pub const FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS: f32 = 5.0;
+pub const FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS: f32 = 1.0;
 
 fn default_grid_cols() -> usize {
     4
@@ -2420,6 +2437,9 @@ fn default_cache_size_threshold_bytes() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_fullscreen_cursor_hide_delay_secs() -> f32 {
+    FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
 }
 pub(crate) fn default_folder_tree_pane_width_ratio() -> f32 {
     0.22
@@ -2627,6 +2647,7 @@ impl Default for Settings {
             fullscreen_fit_no_downscale: false,
             fullscreen_seek_bar_locked: false,
             fullscreen_page_number_overlay: true,
+            fullscreen_cursor_hide_delay_secs: FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
             fullscreen_fixed_jump_count: FULLSCREEN_FIXED_JUMP_DEFAULT,
             continuous_reading_wheel_scroll_percent:
                 default_continuous_reading_wheel_scroll_percent(),
@@ -3643,6 +3664,8 @@ impl Settings {
         self.fullscreen_fixed_jump_count = self
             .fullscreen_fixed_jump_count
             .clamp(FULLSCREEN_FIXED_JUMP_MIN, FULLSCREEN_FIXED_JUMP_MAX);
+        self.fullscreen_cursor_hide_delay_secs =
+            clamp_fullscreen_cursor_hide_delay_secs(self.fullscreen_cursor_hide_delay_secs);
         if self.margin_fit_enabled && matches!(self.fullscreen_fit_mode, FullscreenFitMode::Page) {
             self.fullscreen_fit_mode = FullscreenFitMode::MarginFit;
         }
@@ -3981,6 +4004,10 @@ mod tests {
         assert_eq!(s.fullscreen_fit_mode, FullscreenFitMode::Page);
         assert!(!s.fullscreen_seek_bar_locked);
         assert!(s.fullscreen_page_number_overlay);
+        assert_eq!(
+            s.fullscreen_cursor_hide_delay_secs,
+            FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
+        );
         assert_eq!(s.fullscreen_fixed_jump_count, 10);
         assert_eq!(s.continuous_reading_wheel_scroll_percent, 20);
         assert_eq!(s.continuous_reading_key_scroll_percent, 16);
@@ -4290,6 +4317,7 @@ mod tests {
         s.continuous_reading_key_scroll_percent = 999;
         s.continuous_reading_gamepad_scroll_percent_per_sec = 999;
         s.fullscreen_fixed_jump_count = 999;
+        s.fullscreen_cursor_hide_delay_secs = 99.0;
         s.sanitize();
         assert_eq!(s.spread_page_gap_px, 200);
         assert_eq!(s.continuous_reading_gap_px, 200);
@@ -4297,10 +4325,26 @@ mod tests {
         assert_eq!(s.continuous_reading_key_scroll_percent, 100);
         assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 300);
         assert_eq!(s.fullscreen_fixed_jump_count, FULLSCREEN_FIXED_JUMP_MAX);
+        assert_eq!(
+            s.fullscreen_cursor_hide_delay_secs,
+            FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS
+        );
 
         s.fullscreen_fixed_jump_count = 0;
+        s.fullscreen_cursor_hide_delay_secs = 0.0;
         s.sanitize();
         assert_eq!(s.fullscreen_fixed_jump_count, FULLSCREEN_FIXED_JUMP_MIN);
+        assert_eq!(
+            s.fullscreen_cursor_hide_delay_secs,
+            FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS
+        );
+
+        s.fullscreen_cursor_hide_delay_secs = f32::NAN;
+        s.sanitize();
+        assert_eq!(
+            s.fullscreen_cursor_hide_delay_secs,
+            FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
+        );
     }
 
     #[test]

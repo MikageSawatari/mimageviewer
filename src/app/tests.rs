@@ -3001,6 +3001,12 @@ mod phase_c_drill_nav_tests {
             app.fullscreen_page_number_label(1).as_deref(),
             Some("1-2 / 4")
         );
+
+        app.spread_mode = crate::settings::SpreadMode::Rtl;
+        assert_eq!(
+            app.fullscreen_page_number_label(1).as_deref(),
+            Some("2,1 / 4")
+        );
     }
 
     #[test]

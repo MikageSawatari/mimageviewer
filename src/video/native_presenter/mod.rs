@@ -61,11 +61,6 @@ pub mod hud_window;
 /// (SwitchSource) ごとに clear して旧動画分のキャッシュを残さない。
 const SHARED_TEXTURE_CACHE_CAPACITY: usize = 8;
 
-/// パネル / HUD が全て隠れた状態でこの秒数経過したらマウスカーソルを非表示にする。
-/// `ui_fullscreen` (eframe) と `native_presenter` (D3D11 + 別 egui_ctx) で共有する。
-/// lib にいる native_presenter から bin の `ui_fullscreen` を参照できないため、
-/// シングルソースをここ (lib 側) に置く。
-pub const CURSOR_HIDE_IDLE_SECS: f32 = 3.0;
 const SEEK_STATUS_DELAY: Duration = Duration::from_millis(150);
 const SEEK_STATUS_MIN_VISIBLE: Duration = Duration::from_millis(300);
 const LIMITER_INDICATOR_VISIBLE: Duration = Duration::from_millis(500);
@@ -128,6 +123,7 @@ pub struct NativePresenterConfig {
     pub height: u32,
     pub test_overlay: bool,
     pub egui_overlay: bool,
+    pub cursor_hide_delay_secs: f32,
     /// HUD overlay HWND の wndproc が拾った mouse / DPI / raise 要求を流す sender。
     /// `Some` のとき、presenter は HUD overlay HWND を作って egui overlay を
     /// その DComp tree にぶら下げる (CP4 反映)。`None` または HUD HWND 作成失敗時は
@@ -430,17 +426,17 @@ struct NativeEguiOverlay {
     width: u32,
     height: u32,
     /// 最終ユーザー活動時刻 / overlay 表示時刻のうち最新のもの。
-    /// `!overlay_visible` 期間中、ここから `CURSOR_HIDE_IDLE_SECS` 経過したら
+    /// `!overlay_visible` 期間中、ここから設定秒数経過したら
     /// `SetCursor(None)` でカーソルを隠す。更新タイミング:
     /// - `push_native_event` (mouse native event): `Some(now)` にリセット。
     /// - `mark_cursor_activity` (eframe 経由の pointer 活動反映): `Some(now)` にリセット。
     /// - `render_once` で `overlay_visible == true` のフレーム: 毎回 `Some(now)` で再 bump
-    ///   (= overlay が見えている間は countdown を 0 にし続け、消えた瞬間から 3 秒測る)。
+    ///   (= overlay が見えている間は countdown を 0 にし続け、消えた瞬間から設定秒数測る)。
     /// `None` は初期状態のみ (フルスクリーン入場直後で初回 render 前)。
     cursor_last_activity: Option<Instant>,
     /// 直前 render で `SetCursor(None)` を打った sticky フラグ。次の活動 / overlay 表示
     /// が起きるまで true を維持し、`wants_periodic_tick()` が false を返して以降の
-    /// 余計な tick を止める。3 秒経過判定後に確実に 1 回 `SetCursor(None)` を打つために
+    /// 余計な tick を止める。idle 判定後に確実に 1 回 `SetCursor(None)` を打つために
     /// 「!cursor_hidden の間は tick 継続」という形で利用する。
     cursor_hidden: bool,
     /// 直近に観測したカーソルの client 座標 (presenter / HUD どちらの wndproc 由来でも、
@@ -458,6 +454,7 @@ struct NativeEguiOverlay {
     /// (= `cursor_hidden` と同じ値) を **HUD wndproc から読める形で共有する atomic**。
     /// `update_cursor_icon` で書き込み、`WM_SETCURSOR` が読み出して隠れた cursor を復帰させる。
     cursor_was_hidden_shared: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cursor_hide_delay_secs: f32,
     /// 音量ノーマライズ UI 状態 (App から `SetNormalizeOverlayState` で配信される)。
     normalize_state: crate::video::normalize_types::NormalizeOverlayState,
 }
@@ -1432,6 +1429,7 @@ impl NativeVideoPresenter {
                         config.hwnd,
                         config.width,
                         config.height,
+                        config.cursor_hide_delay_secs,
                         std::sync::Arc::clone(&cursor_was_hidden),
                     ) {
                         Ok(mut overlay) => {
@@ -1483,6 +1481,7 @@ impl NativeVideoPresenter {
                         config.hwnd,
                         config.width,
                         config.height,
+                        config.cursor_hide_delay_secs,
                         std::sync::Arc::clone(&cursor_was_hidden),
                     ) {
                         Ok(mut overlay) => {
@@ -3549,6 +3548,7 @@ impl NativeEguiOverlay {
         focus_hwnd: HWND,
         width: u32,
         height: u32,
+        cursor_hide_delay_secs: f32,
         cursor_was_hidden_shared: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -3597,6 +3597,8 @@ impl NativeEguiOverlay {
         configure_overlay_fonts(&egui_ctx);
         configure_overlay_style(&egui_ctx);
         let pixels_per_point = pixels_per_point_for_hwnd(dcomp_hwnd);
+        let cursor_hide_delay_secs =
+            crate::settings::clamp_fullscreen_cursor_hide_delay_secs(cursor_hide_delay_secs);
         let this = Self {
             surface,
             visual,
@@ -3700,6 +3702,7 @@ impl NativeEguiOverlay {
             cursor_hidden: false,
             cursor_activity_pos: None,
             cursor_was_hidden_shared,
+            cursor_hide_delay_secs,
             normalize_state: crate::video::normalize_types::NormalizeOverlayState::default(),
         };
         this.configure();
@@ -4566,12 +4569,12 @@ impl NativeEguiOverlay {
             || self.video_is_seeking
             || self.seek_status_visible_since.is_some()
             || self.video_limiter_visible_until.is_some()
-            // カーソル auto-hide のカウントダウン中、および 3 秒経過後でもまだ
+            // カーソル auto-hide のカウントダウン中、および idle 判定後でもまだ
             // SetCursor(None) を 1 度も打てていない場合は tick を継続する。
             // - cursor_last_activity が Some && !cursor_hidden:
-            //   - idle < 3 秒: 経過判定を進めるため tick
-            //   - idle >= 3 秒: 1 回 render_once を走らせて SetCursor(None) を打つため tick
-            //     (250 ms tick 間隔ぴったりに 3 秒境界で wants_periodic_tick が false に
+            //   - idle < 設定秒数: 経過判定を進めるため tick
+            //   - idle >= 設定秒数: 1 回 render_once を走らせて SetCursor(None) を打つため tick
+            //     (250 ms tick 間隔ぴったりに境界で wants_periodic_tick が false に
             //     なって render が走らずカーソルが消えない、というバグを防ぐ)
             // - cursor_hidden = true: 既に隠した → 次の活動 / overlay 表示まで tick 不要。
             //   push_native_event 側で活動検出時に cursor_hidden を false に戻して tick を再開する。
@@ -5247,7 +5250,7 @@ impl NativeEguiOverlay {
     fn render_once(&mut self) -> Result<Vec<NativeOverlayCommand>, String> {
         let render_t0 = Instant::now();
         // カーソル auto-hide のタイマを初回フレームで起動する。push_native_event 由来の
-        // 入力がまだ届いていなくても、フルスクリーン入場後 CURSOR_HIDE_IDLE_SECS 経過で
+        // 入力がまだ届いていなくても、フルスクリーン入場後に設定秒数経過で
         // 隠れるようにするため。
         if self.cursor_last_activity.is_none() {
             self.cursor_last_activity = Some(Instant::now());
@@ -7071,7 +7074,7 @@ impl NativeEguiOverlay {
         self.update_ime_cursor_area(full_output.platform_output.ime);
         // パネル / HUD / トーストなどの「ユーザー操作対象 UI」が
         // 一切出ていない (= cursor_blocking_overlay_visible が false) で、ユーザー
-        // 無操作が CURSOR_HIDE_IDLE_SECS 経過したらカーソルを隠す。
+        // 無操作が設定秒数経過したらカーソルを隠す。
         // チェックマーク (`checked`) は単なる状態インジケータなので blocking には
         // 含めない (= 静止画側 `fs_ui_is_clean` の挙動と揃える)。
         // egui の cursor_icon を SetCursor(None) で上書きする。次回 pointer event
@@ -7080,10 +7083,10 @@ impl NativeEguiOverlay {
         // 状態機械 (シンプル版):
         // - cursor_blocking_overlay_visible == true: 毎フレーム cursor_last_activity を
         //   Some(now) に bump して countdown を 0 に戻す (= 操作対象 UI が消えた
-        //   瞬間から 3 秒測り直す)。`wants_periodic_tick()` も
+        //   瞬間から設定秒数測り直す)。`wants_periodic_tick()` も
         //   毎フレーム true なので pause 中も 250ms ごとに render が走る (P3 トレードオフ)。
         // - cursor_blocking_overlay_visible == false: cursor_last_activity をそのまま
-        //   維持して idle を計算。3 秒経過したらカーソル非表示。
+        //   維持して idle を計算。設定秒数経過したらカーソル非表示。
         // - cursor_should_hide は idle のみで判定 (cursor_hidden 状態の sticky carry は
         //   不要 — pointer activity / overlay 表示で適切にリセットされるため)。
         if cursor_blocking_overlay_visible {
@@ -7093,7 +7096,7 @@ impl NativeEguiOverlay {
         let cursor_should_hide = !cursor_blocking_overlay_visible
             && self
                 .cursor_last_activity
-                .map(|t| t.elapsed().as_secs_f32() >= CURSOR_HIDE_IDLE_SECS)
+                .map(|t| t.elapsed().as_secs_f32() >= self.cursor_hide_delay_secs)
                 .unwrap_or(false);
         let resolved_cursor_icon = if cursor_should_hide {
             egui::CursorIcon::None

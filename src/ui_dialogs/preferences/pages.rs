@@ -2569,6 +2569,22 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     );
     ui.small("フルスクリーン右下に現在ページ / 総ページ数を小さく表示します。");
     ui.horizontal(|ui| {
+        ui.label("マウスカーソルを隠すまで");
+        ui.add(
+            egui::DragValue::new(&mut s.fullscreen_cursor_hide_delay_secs)
+                .range(
+                    crate::settings::FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS
+                        ..=crate::settings::FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS,
+                )
+                .speed(0.1)
+                .fixed_decimals(1)
+                .suffix(" 秒"),
+        );
+    });
+    s.fullscreen_cursor_hide_delay_secs = crate::settings::clamp_fullscreen_cursor_hide_delay_secs(
+        s.fullscreen_cursor_hide_delay_secs,
+    );
+    ui.horizontal(|ui| {
         ui.label("固定ジャンプ量");
         ui.add(
             egui::DragValue::new(&mut s.fullscreen_fixed_jump_count)

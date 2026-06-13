@@ -4689,12 +4689,12 @@ pub struct App {
     /// 画面中央に「スタンプ読み込み中…」を出し、完了で `apply_stamp_choice` を適用する。
     pub(crate) stamp_embed_pending: Option<StampEmbedPending>,
     /// フルスクリーンでマウスカーソルの最終活動時刻 (移動 / クリック / ホイール)。
-    /// パネル / HUD が全て非表示で `CURSOR_HIDE_IDLE_SECS` 経過したらカーソルを隠す。
+    /// パネル / HUD が全て非表示で設定秒数が経過したらカーソルを隠す。
     /// `None` はまだ活動が記録されていない状態 (= 直前に活動があったとみなしカーソル表示)。
-    /// パネル / HUD 表示中もタイマをリセットする (= 表示が消えてから 3 秒測り直し)。
+    /// パネル / HUD 表示中もタイマをリセットする (= 表示が消えてから設定秒数を測り直し)。
     pub(crate) cursor_last_activity: Option<std::time::Instant>,
     /// 直前フレームでカーソルを `CursorIcon::None` で隠した sticky フラグ。
-    /// 隠した後は次のマウス操作 / UI 表示までこの状態を維持する。これにより 3 秒経過直後の
+    /// 隠した後は次のマウス操作 / UI 表示までこの状態を維持する。これにより idle 判定直後の
     /// 1 フレームで隠した後、render が間引かれてもカーソルが復活しない (egui は
     /// 毎フレーム set_cursor_icon を呼ばないと cursor 状態が消えるため、`cursor_hidden`
     /// が true の間は毎フレーム None を打ち続ける)。
@@ -18668,7 +18668,7 @@ impl App {
         // フルスクリーン入場時にカーソル idle タイマをリセット (= 直前まで隠れていた
         // 状態を引き継がないようにする)。前回フルスクリーンを 5 分放置した後に
         // すぐ再入場した場合、Some(<古い時刻>) のままだと 1 フレーム目で
-        // 「3 秒以上経過」と判定されカーソルが即時消える事故を防ぐ。
+        // 「設定秒数以上経過」と判定されカーソルが即時消える事故を防ぐ。
         // NOTE: この無条件リセットは「新規入場」向け。ページ送り / スライドショーなどの
         // fullscreen 内ナビは cursor 状態を保存・復元する
         // `open_fullscreen_from_fs_navigation` のようなラッパーを通すこと。
@@ -22206,6 +22206,7 @@ impl App {
                             self.video_tile_mode_active || self.video_tile_reopen_pending,
                             self.settings.vst3_enabled,
                             self.checked.contains(&idx),
+                            self.settings.fullscreen_cursor_hide_delay_secs,
                             // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
                             Some(self.dsp_bridge.editor_hwnds_snapshot()),
                             self.main_hwnd.unwrap_or(0) as u64,
@@ -36700,6 +36701,7 @@ fn native_video_presenter_config(
     initial_tile_overlay: bool,
     vst3_available: bool,
     checked: bool,
+    cursor_hide_delay_secs: f32,
     editor_hwnds_snapshot: Option<
         std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
     >,
@@ -36722,6 +36724,9 @@ fn native_video_presenter_config(
         // child presenter を指定すると z-order/focus が壊れるため、音声処理だけ継続する。
         vst3_available: vst3_available && placement.is_fullscreen_borderless(),
         checked,
+        cursor_hide_delay_secs: crate::settings::clamp_fullscreen_cursor_hide_delay_secs(
+            cursor_hide_delay_secs,
+        ),
         editor_hwnds_snapshot,
         main_hwnd_for_raise,
         // in-main-window / detached では topmost な HUD overlay HWND を使わず、
