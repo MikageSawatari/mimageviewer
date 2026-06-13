@@ -4,6 +4,29 @@ use uuid::Uuid;
 
 const MAX_FAVORITES: usize = 20;
 
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct DetachedViewerWindowPlacement {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+impl DetachedViewerWindowPlacement {
+    pub fn is_sane(self) -> bool {
+        self.x.is_finite()
+            && self.y.is_finite()
+            && self.w.is_finite()
+            && self.h.is_finite()
+            && self.w >= 320.0
+            && self.h >= 240.0
+            && self.w <= 16_384.0
+            && self.h <= 16_384.0
+    }
+}
+
 // -----------------------------------------------------------------------
 // FavoriteEntry
 // -----------------------------------------------------------------------
@@ -1863,6 +1886,14 @@ pub struct Settings {
     /// 全画面トグルボタンで切り替え、ここに永続化する。
     #[serde(default)]
     pub video_in_window_mode: bool,
+    /// 画像・動画ビューアをメイン一覧から分離した別ウィンドウで開くモード。
+    /// Phase 1 では永続設定とキー操作だけを用意し、実際の detached host は後続で接続する。
+    #[serde(default)]
+    pub detached_viewer_enabled: bool,
+    /// 別ウィンドウビューアの前回位置・サイズ。静止画 egui viewport と native 動画
+    /// top-level window の両方で共有する。
+    #[serde(default)]
+    pub detached_viewer_window_placement: Option<DetachedViewerWindowPlacement>,
 
     // ── VST3 プラグイン処理 (v0.9.0+) ──
     //
@@ -2677,6 +2708,8 @@ impl Default for Settings {
             video_thumb_use_sidecar_image: true,
             video_tile_columns: default_video_tile_columns(),
             video_in_window_mode: false,
+            detached_viewer_enabled: false,
+            detached_viewer_window_placement: None,
             vst3_enabled: false,
             vst3_plugins: Vec::new(),
             vst3_plugin_path: None,
@@ -3727,6 +3760,8 @@ impl Settings {
         self.recent_folders = std::mem::take(&mut src.recent_folders);
         self.window_pos = src.window_pos;
         self.window_size = src.window_size;
+        self.detached_viewer_enabled = src.detached_viewer_enabled;
+        self.detached_viewer_window_placement = src.detached_viewer_window_placement;
         // ── お気に入り / タグ (専用ダイアログで編集) ──
         self.favorites = std::mem::take(&mut src.favorites);
         self.tags = std::mem::take(&mut src.tags);

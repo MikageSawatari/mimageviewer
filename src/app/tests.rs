@@ -11472,25 +11472,26 @@ mod native_video_rating_key_tests {
         assert_eq!(app.current_folder_rating_cache, Some(0));
     }
 
-    /// F11 (VK 0x7A) で `toggle_video_window_mode` 経路が走り、`native_video_mode_switch`
-    /// pending が登録されることを確認する。これは native HWND 経路と、egui 経由で
-    /// `handle_video_input` から仮想 F11 を流す in-window 動画経路 (Codex P1 対応)
-    /// の両方が同じハンドラを共有することの担保。
+    /// F11 (VK 0x7A) で `toggle_video_window_mode` 経路が走っても、
+    /// active `VideoPlayer` がまだ無い場合は orphan pending を作らない。
+    /// 実際の placement switch は `FsCacheEntry::Video` が存在する実再生中 session だけで行う。
     #[test]
-    fn native_video_f11_triggers_window_mode_toggle() {
+    fn native_video_f11_without_player_does_not_register_orphan_switch() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let idx = push_video(&mut app, PathBuf::from(r"C:\clips\movie.mp4"));
         app.fullscreen_idx = Some(idx);
-        let initial = app.settings.video_in_window_mode;
+        app.settings.video_in_window_mode = true;
+        app.native_video_in_window_active = true;
+        app.viewer_presentation = ViewerPresentation::MainWindow;
         assert!(app.native_video_mode_switch.is_none());
 
         app.handle_native_video_key_event(&ctx, idx, native_key(0x7A, false)); // F11
 
-        let pending = app
-            .native_video_mode_switch
-            .expect("F11 should register a mode switch request");
-        assert_eq!(pending.target_in_window, !initial);
+        assert!(
+            app.native_video_mode_switch.is_none(),
+            "F11 must not leave a pending switch when no VideoPlayer exists"
+        );
     }
 
     /// F11 を repeat 付きで送ったときはトグルが走らないことを確認する (長押し連打防止)。
@@ -11508,6 +11509,40 @@ mod native_video_rating_key_tests {
         assert!(
             app.native_video_mode_switch.is_none(),
             "repeat F11 should not trigger window mode toggle"
+        );
+    }
+
+    #[test]
+    fn native_video_f12_toggles_detached_viewer_mode() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_video(&mut app, PathBuf::from(r"C:\clips\movie.mp4"));
+        app.fullscreen_idx = Some(idx);
+        assert!(!app.settings.detached_viewer_enabled);
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x7B, false)); // F12
+
+        assert!(app.settings.detached_viewer_enabled);
+        assert!(
+            app.native_video_mode_switch.is_none(),
+            "F12 must not leave a pending switch when no VideoPlayer exists"
+        );
+    }
+
+    #[test]
+    fn native_video_f12_repeat_is_ignored() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_video(&mut app, PathBuf::from(r"C:\clips\movie.mp4"));
+        app.fullscreen_idx = Some(idx);
+
+        let mut key = native_key(0x7B, false);
+        key.repeat = true;
+        app.handle_native_video_key_event(&ctx, idx, key);
+
+        assert!(
+            !app.settings.detached_viewer_enabled,
+            "repeat F12 should not toggle detached viewer mode"
         );
     }
 }
@@ -11548,6 +11583,13 @@ mod still_window_mode_key_tests {
 
     fn push_image(app: &mut App, path: &str) -> usize {
         app.items.push(GridItem::Image(PathBuf::from(path)));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.items.len() - 1
+    }
+
+    fn push_video(app: &mut App, path: &str) -> usize {
+        app.items.push(GridItem::Video(PathBuf::from(path)));
         app.thumbnails.push(ThumbnailState::Pending);
         app.rebuild_visible_indices();
         app.items.len() - 1
@@ -11624,6 +11666,7 @@ mod still_window_mode_key_tests {
         );
         assert!(app.settings.video_in_window_mode);
         assert!(app.native_video_in_window_active);
+        assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
     }
 
     #[test]
@@ -11643,6 +11686,269 @@ mod still_window_mode_key_tests {
         assert_eq!(app.fullscreen_idx, Some(idx));
         assert!(!app.settings.video_in_window_mode);
         assert!(!app.native_video_in_window_active);
+        assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
+    }
+
+    #[test]
+    fn detached_request_uses_detached_presentation_for_still_image() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.settings.detached_viewer_enabled = true;
+        app.settings.video_in_window_mode = false;
+
+        assert_eq!(
+            app.requested_viewer_presentation_for_open(idx),
+            ViewerPresentation::DetachedWindow
+        );
+        assert_eq!(
+            app.effective_viewer_presentation_for_open(idx),
+            ViewerPresentation::DetachedWindow
+        );
+
+        app.open_fullscreen(idx);
+
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(!app.native_video_in_window_active);
+        assert!(app.viewer_session_is_detached());
+        assert!(!app.viewer_session_blocks_main_window());
+    }
+
+    #[test]
+    fn detached_video_request_uses_detached_presentation() {
+        let mut app = setup_app();
+        let idx = push_video(&mut app, r"C:\clips\movie.mp4");
+        app.settings.detached_viewer_enabled = true;
+        app.settings.video_in_window_mode = false;
+
+        assert_eq!(
+            app.requested_viewer_presentation_for_open(idx),
+            ViewerPresentation::DetachedWindow
+        );
+        assert_eq!(
+            app.effective_viewer_presentation_for_open(idx),
+            ViewerPresentation::DetachedWindow
+        );
+    }
+
+    #[test]
+    fn detached_viewer_root_key_input_is_left_for_main_window() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+
+        begin_root_key_pass(&ctx, egui::Key::F12, false);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(
+            !handled,
+            "detached viewer must not steal root-delivered keys from the grid"
+        );
+        assert!(!app.settings.detached_viewer_enabled);
+        assert!(app.viewer_session_is_detached());
+        assert!(!app.viewer_session_blocks_main_window());
+    }
+
+    #[test]
+    fn detached_viewer_close_ends_session_but_keeps_mode_enabled() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.settings.detached_viewer_enabled = true;
+        app.settings.video_in_window_mode = false;
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+
+        app.handle_fs_navigation(&ctx, true, false, None, None, 0, None, idx);
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(app.settings.detached_viewer_enabled);
+        assert!(!app.viewer_session_is_detached());
+        assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
+    }
+
+    #[test]
+    fn detached_viewer_syncs_to_main_selected_still_image() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_image(&mut app, r"C:\pics\a.jpg");
+        let second = push_image(&mut app, r"C:\pics\b.jpg");
+        app.settings.detached_viewer_enabled = true;
+        app.settings.video_in_window_mode = false;
+        app.selected = Some(first);
+        app.open_fullscreen(first);
+
+        app.selected = Some(second);
+        app.sync_detached_viewer_to_selected(&ctx);
+
+        assert_eq!(app.fullscreen_idx, Some(second));
+        assert_eq!(app.selected, Some(second));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        let stamp = app
+            .last_viewer_sync_stamp
+            .as_ref()
+            .expect("sync should update viewer stamp");
+        assert_eq!(stamp.idx, second);
+        assert_eq!(stamp.items_generation, app.items_generation);
+    }
+
+    #[test]
+    fn detached_viewer_syncs_to_main_selected_video() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_image(&mut app, r"C:\pics\a.jpg");
+        let video = push_video(&mut app, r"C:\clips\movie.mp4");
+        app.settings.detached_viewer_enabled = true;
+        app.settings.video_in_window_mode = false;
+        app.selected = Some(first);
+        app.open_fullscreen(first);
+
+        app.selected = Some(video);
+        app.sync_detached_viewer_to_selected(&ctx);
+
+        assert_eq!(app.fullscreen_idx, Some(video));
+        assert_eq!(app.selected, Some(video));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        let stamp = app
+            .last_viewer_sync_stamp
+            .as_ref()
+            .expect("video sync should update viewer stamp");
+        assert_eq!(stamp.idx, video);
+    }
+
+    #[test]
+    fn detached_viewer_sync_does_not_open_when_session_is_closed() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.settings.detached_viewer_enabled = true;
+        app.selected = Some(idx);
+
+        app.sync_detached_viewer_to_selected(&ctx);
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(app.last_viewer_sync_stamp.is_none());
+    }
+
+    #[test]
+    fn detached_viewer_placement_saves_outer_position_and_inner_size() {
+        let mut app = setup_app();
+        let outer = egui::Rect::from_min_size(egui::pos2(120.0, 140.0), egui::vec2(900.0, 700.0));
+        let inner = egui::Rect::from_min_size(egui::pos2(128.0, 172.0), egui::vec2(860.0, 640.0));
+
+        app.save_detached_viewer_placement_from_logical_rect(outer, Some(inner), false);
+
+        let placement = app
+            .settings
+            .detached_viewer_window_placement
+            .expect("logical placement should be saved");
+        assert_eq!(placement.x, 120.0);
+        assert_eq!(placement.y, 140.0);
+        assert_eq!(placement.w, 860.0);
+        assert_eq!(placement.h, 640.0);
+        assert!(!placement.maximized);
+    }
+
+    #[test]
+    fn detached_viewer_native_geometry_saves_outer_position_and_inner_size() {
+        let mut app = setup_app();
+        app.last_pixels_per_point = 2.0;
+
+        app.save_detached_viewer_placement_from_native_geometry(240, 280, 1280, 720, false);
+
+        let placement = app
+            .settings
+            .detached_viewer_window_placement
+            .expect("native placement should be saved");
+        assert_eq!(placement.x, 120.0);
+        assert_eq!(placement.y, 140.0);
+        assert_eq!(placement.w, 640.0);
+        assert_eq!(placement.h, 360.0);
+        assert!(!placement.maximized);
+    }
+
+    #[test]
+    fn detached_viewer_maximized_save_preserves_restore_placement() {
+        let mut app = setup_app();
+        app.settings.detached_viewer_window_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: 120.0,
+                y: 140.0,
+                w: 860.0,
+                h: 640.0,
+                maximized: false,
+            });
+
+        app.save_detached_viewer_placement_from_native_geometry(0, 0, 3840, 2160, true);
+
+        let placement = app
+            .settings
+            .detached_viewer_window_placement
+            .expect("maximized placement should be saved");
+        assert_eq!(placement.x, 120.0);
+        assert_eq!(placement.y, 140.0);
+        assert_eq!(placement.w, 860.0);
+        assert_eq!(placement.h, 640.0);
+        assert!(placement.maximized);
+    }
+
+    #[test]
+    fn still_image_root_f12_toggles_detached_viewer_mode_without_closing_fullscreen() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        assert!(!app.settings.detached_viewer_enabled);
+
+        begin_root_key_pass(&ctx, egui::Key::F12, false);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(
+            handled,
+            "root-delivered F12 should be handled as fullscreen input"
+        );
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert!(app.settings.detached_viewer_enabled);
+    }
+
+    #[test]
+    fn still_image_root_f12_repeat_is_ignored() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+
+        begin_root_key_pass(&ctx, egui::Key::F12, true);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled, "repeat F12 is still a fullscreen root key");
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert!(!app.settings.detached_viewer_enabled);
+    }
+
+    #[test]
+    fn still_image_root_f12_is_ignored_during_overlay_edit_mode() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.erase_mode = true;
+
+        begin_root_key_pass(&ctx, egui::Key::F12, false);
+        let handled = app.handle_fullscreen_root_key_input(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(handled, "F12 remains a fullscreen root key while editing");
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert!(
+            !app.settings.detached_viewer_enabled,
+            "detached viewer toggle must not fire from overlay edit modes"
+        );
     }
 
     #[test]
@@ -11667,6 +11973,7 @@ mod still_window_mode_key_tests {
             "Backspace on a regular image should close fullscreen and return to the grid"
         );
         assert_eq!(app.selected, Some(idx));
+        assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
     }
 
     #[test]

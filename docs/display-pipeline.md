@@ -205,7 +205,39 @@ ui_fullscreen.rs::render_fullscreen_viewport
 → 結果: FsCacheEntry (Static / Animated / Failed) を fs_cache に格納
 ```
 
-### 2.2.1 動画フルスクリーンとタイルモード
+### 2.2.1 ViewerPresentation / detached viewer
+
+v1.4.0 後の別ウィンドウ対応では、同じ viewer session をどこへ表示するかを
+`ViewerPresentation::{MainWindow, Fullscreen, DetachedWindow}` で扱う。
+
+現時点の実装は、`open_fullscreen` 入場時に `requested_viewer_presentation_for_open`
+で F12 の `detached_viewer_enabled` を反映した要求表示先を導出し、
+`effective_viewer_presentation_for_open` で実表示先を決めて `App.viewer_presentation`
+へ保持する。静止画 / ZIP画像 / PDFページ / 動画は `DetachedWindow` が有効で、
+`render_fullscreen_viewport` の描画本体を装飾付き・taskbar 表示ありの通常 viewport へ
+出す。動画は `NativeVideoPlacement::DetachedWindow` と `NativeVideoWindowMode::WindowedAt`
+で owner なしの通常 top-level HWND を作り、DComp presenter / decoder / audio clock を保持したまま
+`SwitchPlacement` で MainWindow / Fullscreen / Detached を切り替える。
+
+`prepare_viewer_presentation_open` / `prepare_viewer_presentation_close` は、main HWND
+cloak、native 動画の DWM chrome、foreground reclaim など fullscreen takeover 前提の
+処理をまとめた境界。detached viewer では main HWND を cloak せず、fullscreen foreground
+reclaim も予約しない。detached session はメイン一覧をブロックしないため、root viewport 側の
+通常ショートカットやダイアログは継続して扱える。detached 表示の `×` / Esc / Enter は
+`close_fullscreen()` に寄せ、`detached_viewer_enabled` は維持する。
+
+detached session が開いている間は、`App::update` 終端でそのフレームの最終
+`selected` を読み、静止画 / ZIP画像 / PDFページ / 動画であれば viewer 側を同じ項目へ追従させる。
+同期済み判定は `idx` だけでなく `metadata_cache_key` 相当の item key と
+`items_generation` を含む stamp で行う。これによりフォルダ切替や ZIP/PDF 仮想フォルダの
+items rebuild 後に、同じ idx が別項目を指しても再同期できる。detached window が閉じている
+場合は、メイン一覧のカーソル移動だけでは再表示しない。
+
+detached window placement は `settings.detached_viewer_window_placement` に保存する。
+保存値の意味は outer position + inner/client size + maximized flag。最大化中は restore
+placement を上書きせず、`maximized` だけを更新する。
+
+### 2.2.2 動画フルスクリーンとタイルモード
 
 `GridItem::Video` は画像ロードワーカーを使わず、`App::start_fs_load` の動画分岐で
 `FsCacheEntry::Video { player }` を直接 `fs_cache` に挿入する。Windows の native

@@ -660,9 +660,14 @@ fn dispatcher(queue: Arc<(Mutex<JobQueue>, Condvar)>, resource: Resource) {
   Windows では `GpuVideoDevice::release_idle_pools()` で D3D11VA frames pool / idle
   shared output pool / video processor cache も空にする。VST3 bridge / plugin chain は
   復帰遅延と状態巻き戻りを避けるため停止しない。ウィンドウ復帰後は通常ロード経路で再取得。
+  例外として detached viewer session が開いている場合は、close-to-tray でも
+  `close_fullscreen()` を呼ばず、active `fs_cache` / viewer 用 upload backlog / native
+  presenter を維持する。通常 fullscreen / 通常動画は従来通り tray hide 時に終了する。
 - **UI heartbeat watchdog**: `App::update` は SW_HIDE 中に止まるため、`hide_to_tray` で
   watchdog を suspended にし、復帰時に resume する。これにより正常なトレイ常駐を
-  `panic.log` の `UI THREAD HANG suspected` として記録し続けない。
+  `panic.log` の `UI THREAD HANG suspected` として記録し続けない。detached viewer
+  session が開いている場合は、別 viewport / native presenter の event pump を継続するため
+  heartbeat を suspend しない。
 
 設計上の注意:
 - notify-rs の crossbeam-channel (unbounded) は paused 中も受信し続けるので、溜まった

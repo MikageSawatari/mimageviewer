@@ -429,8 +429,10 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 ### MainWindow / Grid chrome (fullscreen 外)
 - GlobalLocalSearch `Ctrl+F` (P) / GlobalFavSearch `Ctrl+S` (P) /
-  GlobalMetadataSearch `Ctrl+G` (P) / GlobalOpenFolder `Ctrl+O` (P)
-  - いずれも dialog / address / search focus / fullscreen 中は既存ガードで無効化される。
+  GlobalMetadataSearch `Ctrl+G` (P) / GlobalOpenFolder `Ctrl+O` (P) /
+  ToggleDetachedViewerMode `F12` (P)
+  - 検索・フォルダを開く系は dialog / address / search focus / fullscreen 中は既存ガードで無効化される。
+  - ToggleDetachedViewerMode は dialog / text focus / IME 変換中 / 静止画 fullscreen 編集サブモードでは抑止し、fullscreen / native 動画では明示 consume する Global action。
 - GridSelectAll `Ctrl+A` (P) / GridDeselect `Ctrl+D`,`Ctrl+Shift+A` (P)
 - GridColumnCount1..10 `Alt+1`..`Alt+0`、GridToggleDetailsView `Alt+-` (P)
 
@@ -494,7 +496,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - VideoToggleWindowMode `F11` (固定)
 - VideoCompareNoop `X/C/Shift+C/Alt+C`、タイル中カーソル、Ctrl+ホイール列数切替は固定。
 - native presenter 側の `native_video_fullscreen_shortcut_key` に載るキーだけ UI へ転送されるため、
-  Ph5 ではこの whitelist と `KeyAction` を同時に更新する。
+  Ph5 ではこの whitelist と `KeyAction` を同時に更新する。Global の
+  `ToggleDetachedViewerMode` は例外的に native 動画転送対象へ含める。
 
 ### Erase (Ph3) ★
 - EraseConfirm `E`,`Esc` / EraseConfirmPolygon `Enter` / EraseUndo `Ctrl+Z` /

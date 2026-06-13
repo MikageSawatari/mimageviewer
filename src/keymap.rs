@@ -703,6 +703,7 @@ pub enum KeyAction {
     GlobalFavSearch,
     GlobalMetadataSearch,
     GlobalOpenFolder,
+    ToggleDetachedViewerMode,
     GridSelectAll,
     GridDeselect,
     GridToggleCheck,
@@ -895,6 +896,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GlobalFavSearch,
     KeyAction::GlobalMetadataSearch,
     KeyAction::GlobalOpenFolder,
+    KeyAction::ToggleDetachedViewerMode,
     KeyAction::GridSelectAll,
     KeyAction::GridDeselect,
     KeyAction::GridToggleCheck,
@@ -1122,6 +1124,7 @@ impl KeyAction {
             GlobalFavSearch => "GlobalFavSearch",
             GlobalMetadataSearch => "GlobalMetadataSearch",
             GlobalOpenFolder => "GlobalOpenFolder",
+            ToggleDetachedViewerMode => "ToggleDetachedViewerMode",
             GridSelectAll => "GridSelectAll",
             GridDeselect => "GridDeselect",
             GridToggleCheck => "GridToggleCheck",
@@ -1324,6 +1327,7 @@ impl KeyAction {
             GlobalFavSearch => "お気に入りフォルダを横断検索する",
             GlobalMetadataSearch => "全フォルダのメタデータを検索する",
             GlobalOpenFolder => "フォルダを開くダイアログを表示する",
+            ToggleDetachedViewerMode => "画像・動画ビューアの別ウィンドウモードを切り替える",
             GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
@@ -1515,9 +1519,11 @@ impl KeyAction {
     pub fn context(self) -> KeyContext {
         use KeyAction::*;
         match self {
-            GlobalLocalSearch | GlobalFavSearch | GlobalMetadataSearch | GlobalOpenFolder => {
-                KeyContext::Global
-            }
+            GlobalLocalSearch
+            | GlobalFavSearch
+            | GlobalMetadataSearch
+            | GlobalOpenFolder
+            | ToggleDetachedViewerMode => KeyContext::Global,
             GridSelectAll
             | GridDeselect
             | GridToggleCheck
@@ -1650,6 +1656,7 @@ impl KeyAction {
             | GlobalFavSearch
             | GlobalMetadataSearch
             | GlobalOpenFolder
+            | ToggleDetachedViewerMode
             | GridSelectAll
             | GridDeselect
             | GridToggleCheck
@@ -1840,6 +1847,7 @@ impl KeyAction {
             GlobalFavSearch => ChordList::one(Chord::ctrl(S)),
             GlobalMetadataSearch => ChordList::one(Chord::ctrl(G)),
             GlobalOpenFolder => ChordList::one(Chord::ctrl(O)),
+            ToggleDetachedViewerMode => ChordList::one(Chord::key(F12)),
             GridSelectAll => ChordList::one(Chord::ctrl(A)),
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
@@ -2248,6 +2256,24 @@ impl Keymap {
         false
     }
 
+    pub fn consume_action_no_repeat(&self, ctx: &egui::Context, action: KeyAction) -> bool {
+        debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        if let Some(chords) = self.overrides.get(&action) {
+            for chord in chords.iter().copied() {
+                if self.consume_chord_no_repeat(ctx, chord) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        for chord in action.default_chords().iter() {
+            if self.consume_chord_no_repeat(ctx, chord) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn pressed_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         if let Some(chords) = self.overrides.get(&action) {
@@ -2322,11 +2348,10 @@ impl Keymap {
 
     pub fn install_global_native_video_shortcuts(&self) {
         let mut chords = Vec::new();
-        for action in KeyAction::all()
-            .iter()
-            .copied()
-            .filter(|action| matches!(action.context(), KeyContext::FsVideo | KeyContext::Rating))
-        {
+        for action in KeyAction::all().iter().copied().filter(|action| {
+            matches!(action.context(), KeyContext::FsVideo | KeyContext::Rating)
+                || *action == KeyAction::ToggleDetachedViewerMode
+        }) {
             if let Some(override_chords) = self.overrides.get(&action) {
                 chords.extend(override_chords.iter().copied());
             } else {
@@ -2491,6 +2516,14 @@ impl Keymap {
     }
 
     fn consume_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
+        self.consume_chord_inner(ctx, chord, true)
+    }
+
+    fn consume_chord_no_repeat(&self, ctx: &egui::Context, chord: Chord) -> bool {
+        self.consume_chord_inner(ctx, chord, false)
+    }
+
+    fn consume_chord_inner(&self, ctx: &egui::Context, chord: Chord, allow_repeat: bool) -> bool {
         if chord.key.is_none() {
             return false;
         }
@@ -2503,9 +2536,10 @@ impl Keymap {
                         egui::Event::Key {
                             key,
                             pressed: true,
+                            repeat,
                             modifiers,
                             ..
-                        } if chord.matches_egui(*key, *modifiers)
+                        } if (allow_repeat || !*repeat) && chord.matches_egui(*key, *modifiers)
                     );
                 if consume {
                     found = true;
@@ -2611,7 +2645,10 @@ pub fn native_video_fullscreen_shortcut_key(
     KeyAction::all()
         .iter()
         .copied()
-        .filter(|action| matches!(action.context(), KeyContext::FsVideo | KeyContext::Rating))
+        .filter(|action| {
+            matches!(action.context(), KeyContext::FsVideo | KeyContext::Rating)
+                || *action == KeyAction::ToggleDetachedViewerMode
+        })
         .any(|action| fallback.matches_vk_action(action, key))
 }
 
@@ -2630,6 +2667,7 @@ fn native_video_fixed_shortcut_key(virtual_key: u32, ctrl: bool, shift: bool) ->
             | 0x27 // Right
             | 0x28 // Down
             | 0x7A // F11
+            | 0x7B // F12
             | 0xA6 // Browser back
             | 0xA7 // Browser forward
     )

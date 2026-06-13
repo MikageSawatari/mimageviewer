@@ -21,18 +21,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_STYLE, GWLP_USERDATA,
     GetClientRect, GetCursorPos, GetForegroundWindow, GetParent, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, HTCLIENT, HWND_TOP, IDC_ARROW, IsWindow, IsWindowVisible,
+    GetWindowThreadProcessId, HTCLIENT, HWND_TOP, IDC_ARROW, IsWindow, IsWindowVisible, IsZoomed,
     LoadCursorW, MA_ACTIVATE, MA_ACTIVATEANDEAT, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage,
-    RegisterClassW, SW_SHOW, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS, WM_APPCOMMAND, WM_CHAR, WM_CLOSE,
-    WM_DESTROY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
-    WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CHILD,
-    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP,
-    WS_VISIBLE,
+    RegisterClassW, SW_SHOW, SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS,
+    WM_APPCOMMAND, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SIZE, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -55,6 +55,9 @@ pub enum NativeVideoImeEvent {
 
 #[derive(Clone, Debug)]
 pub enum NativeVideoWindowEvent {
+    /// 通常のウィンドウ操作 (`×` / Alt+F4 / taskbar close) による close request。
+    /// App 側で viewer session close に接続し、stale `fullscreen_idx` を残さないために使う。
+    CloseRequested,
     KeyDown(NativeVideoKeyEvent),
     KeyUp(NativeVideoKeyEvent),
     Text(char),
@@ -71,6 +74,7 @@ pub enum NativeVideoWindowEvent {
         y: i32,
         w: u32,
         h: u32,
+        maximized: bool,
     },
     /// HUD overlay HWND の `WM_DPICHANGED` で発火。`suggested_rect` は
     /// `WM_DPICHANGED` の lparam で渡される新 DPI 用 RECT。
@@ -128,6 +132,11 @@ pub enum NativeVideoWindowMode {
         width: u32,
         height: u32,
     },
+    /// 通常 top-level window。`rect.left/top` は希望 outer position、
+    /// `rect.right/bottom` は希望 client size から導いた右下 (screen coords)。
+    WindowedAt {
+        rect: RECT,
+    },
     Borderless {
         rect: RECT,
     },
@@ -145,6 +154,7 @@ pub struct NativeVideoWindowConfig {
     /// `false` の場合、HWND は hidden で作成し、呼び出し側が DComp 初期化後に
     /// `show_and_raise` で表示する。native fullscreen presenter の透明期間を避けるため。
     pub initially_visible: bool,
+    pub activate_on_show: bool,
     pub close_on_escape: bool,
     pub post_quit_on_destroy: bool,
     pub event_tx: Option<std::sync::mpsc::Sender<NativeVideoWindowEvent>>,
@@ -156,6 +166,7 @@ impl NativeVideoWindowConfig {
             mode: NativeVideoWindowMode::Windowed { width, height },
             owner_hwnd: 0,
             initially_visible: true,
+            activate_on_show: true,
             close_on_escape: true,
             post_quit_on_destroy: true,
             event_tx: None,
@@ -320,6 +331,32 @@ impl NativeVideoWindow {
                         false,
                     )
                 }
+                NativeVideoWindowMode::WindowedAt { rect } => {
+                    let mut style = WS_OVERLAPPEDWINDOW;
+                    if config.initially_visible {
+                        style |= WS_VISIBLE;
+                    }
+                    let ex_style = WINDOW_EX_STYLE::default();
+                    let client_w = (rect.right - rect.left).max(1);
+                    let client_h = (rect.bottom - rect.top).max(1);
+                    let mut outer = RECT {
+                        left: 0,
+                        top: 0,
+                        right: client_w,
+                        bottom: client_h,
+                    };
+                    AdjustWindowRectEx(&mut outer, style, false, ex_style)
+                        .map_err(|e| format!("AdjustWindowRectEx(WindowedAt): {e:?}"))?;
+                    (
+                        ex_style,
+                        style,
+                        rect.left,
+                        rect.top,
+                        outer.right - outer.left,
+                        outer.bottom - outer.top,
+                        false,
+                    )
+                }
                 NativeVideoWindowMode::Borderless { rect } => {
                     let mut style = WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
                     if config.initially_visible {
@@ -392,9 +429,13 @@ impl NativeVideoWindow {
             };
             crate::dwm_transitions::disable_transitions_for_window(hwnd);
             if config.initially_visible {
-                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = if config.activate_on_show {
+                    ShowWindow(hwnd, SW_SHOW)
+                } else {
+                    ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+                };
             }
-            if config.initially_visible && raise_on_show {
+            if config.initially_visible && raise_on_show && config.activate_on_show {
                 bring_hwnd_to_front(hwnd);
                 log_window_state("created", hwnd);
             } else if !config.initially_visible {
@@ -422,6 +463,30 @@ impl NativeVideoWindow {
         let raised = bring_hwnd_to_front(self.hwnd);
         log_window_state("shown", self.hwnd);
         raised
+    }
+
+    pub fn show_no_activate(&self) -> bool {
+        if self.hwnd.0.is_null() {
+            return false;
+        }
+        unsafe {
+            if !IsWindow(Some(self.hwnd)).as_bool() {
+                return false;
+            }
+            crate::dwm_transitions::disable_transitions_for_window(self.hwnd);
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        log_window_state("shown-noactivate", self.hwnd);
+        true
     }
 
     pub fn destroy(&mut self) {
@@ -996,14 +1061,23 @@ unsafe extern "system" fn wnd_proc(
                                 }
                             }
                         }
-                        let w_u32 = w.max(1) as u32;
-                        let h_u32 = h.max(1) as u32;
+                        let mut client = windows::Win32::Foundation::RECT::default();
+                        let (w_u32, h_u32) = if unsafe { GetClientRect(hwnd, &mut client) }.is_ok()
+                        {
+                            (
+                                (client.right - client.left).max(1) as u32,
+                                (client.bottom - client.top).max(1) as u32,
+                            )
+                        } else {
+                            (w.max(1) as u32, h.max(1) as u32)
+                        };
                         if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
                             let _ = tx.send(NativeVideoWindowEvent::GeometryChanged {
                                 x,
                                 y,
                                 w: w_u32,
                                 h: h_u32,
+                                maximized: unsafe { IsZoomed(hwnd).as_bool() },
                             });
                         }
                     }
@@ -1013,6 +1087,9 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_CLOSE => {
+            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
+                let _ = tx.send(NativeVideoWindowEvent::CloseRequested);
+            }
             unsafe {
                 let _ = DestroyWindow(hwnd);
             }

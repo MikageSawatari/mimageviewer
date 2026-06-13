@@ -13,8 +13,9 @@ fn should_close_fullscreen_for_tray(
     fullscreen_open: bool,
     fs_cache_has_video: bool,
     native_video_pending: bool,
+    detached_viewer_session: bool,
 ) -> bool {
-    fullscreen_open || fs_cache_has_video || native_video_pending
+    !detached_viewer_session && (fullscreen_open || fs_cache_has_video || native_video_pending)
 }
 
 impl App {
@@ -97,7 +98,7 @@ impl App {
             return false;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        self.hide_to_tray();
+        self.hide_to_tray(ctx);
         true
     }
 
@@ -110,14 +111,20 @@ impl App {
     /// サイズ保存について: hide の直前に `GetWindowPlacement` で rect を丸ごと捕獲しておき、
     /// 復帰時に `SetWindowPlacement` で完全復元する。eframe/winit の DPI 丸めを完全に
     /// バイパスできるため、マルチモニタ DPI 環境でも開閉でサイズが変わらない。
-    fn hide_to_tray(&mut self) {
+    fn hide_to_tray(&mut self, ctx: &egui::Context) {
         if !self.window_visible {
             return;
         }
+        let keep_detached_viewer_alive = self.viewer_session_is_detached();
         self.window_visible = false;
         crate::set_ui_heartbeat_suspended(
-            true,
-            "App::update heartbeat suspended while hidden to tray".to_string(),
+            !keep_detached_viewer_alive,
+            if keep_detached_viewer_alive {
+                "App::update heartbeat kept alive for detached viewer while hidden to tray"
+            } else {
+                "App::update heartbeat suspended while hidden to tray"
+            }
+            .to_string(),
         );
 
         // 先に WINDOWPLACEMENT を共有スロットに保存してから hide する。
@@ -153,6 +160,9 @@ impl App {
 
         // GPU リソース解放 (best-effort)
         self.release_gpu_resources();
+        if keep_detached_viewer_alive {
+            ctx.request_repaint();
+        }
         // 終了時と同じ永続化処理を hide のタイミングでも走らせる。
         // トレイメニュー「終了」は hidden 状態では std::process::exit(0) で抜けるため
         // on_exit が呼ばれない可能性があり、ここで確実に flush しておくことでデータロスを防ぐ。
@@ -208,6 +218,7 @@ impl App {
             self.fullscreen_idx.is_some(),
             fs_cache_has_video,
             native_video_pending,
+            self.viewer_session_is_detached(),
         ) {
             crate::logger::log(format!(
                 "tray: closing fullscreen/media session before residency \
@@ -215,6 +226,12 @@ impl App {
                 self.fullscreen_idx, fs_cache_has_video, native_video_pending
             ));
             self.close_fullscreen();
+        } else if self.viewer_session_is_detached() {
+            crate::logger::log(format!(
+                "tray: keeping detached viewer session alive during residency \
+                 fullscreen={:?} fs_video={} native_pending={}",
+                self.fullscreen_idx, fs_cache_has_video, native_video_pending
+            ));
         }
     }
 
@@ -223,6 +240,7 @@ impl App {
     /// ウィンドウ復帰後は通常のロード経路で再取得されるので、描画には影響なし
     /// (短時間の再ロードオーバーヘッドが発生する)。
     fn release_gpu_resources(&mut self) {
+        let keep_detached_viewer_alive = self.viewer_session_is_detached();
         // グリッドサムネ: Loaded → Evicted で TextureHandle を drop。
         // 動画サムネは Windows Shell API 経由で復帰後の再 spawn 経路が無く、
         // Evicted のまま暗灰背景が固定表示されてしまう (= 「全動画黒背景」報告) ので除外。
@@ -236,6 +254,12 @@ impl App {
                 }
                 *state = crate::grid_item::ThumbnailState::Evicted;
             }
+        }
+        if keep_detached_viewer_alive {
+            crate::logger::log(
+                "tray: skipped active viewer GPU/cache release for detached viewer session",
+            );
+            return;
         }
         // フルスクリーン画像キャッシュ (最大サイズ源、20MP RGBA ≈ 80MB/枚)
         self.fs_cache.clear();
@@ -387,17 +411,26 @@ mod tests {
 
     #[test]
     fn tray_residency_closes_fullscreen_sessions() {
-        assert!(should_close_fullscreen_for_tray(true, false, false));
+        assert!(should_close_fullscreen_for_tray(true, false, false, false));
     }
 
     #[test]
     fn tray_residency_closes_video_resources_without_fullscreen_flag() {
-        assert!(should_close_fullscreen_for_tray(false, true, false));
-        assert!(should_close_fullscreen_for_tray(false, false, true));
+        assert!(should_close_fullscreen_for_tray(false, true, false, false));
+        assert!(should_close_fullscreen_for_tray(false, false, true, false));
     }
 
     #[test]
     fn tray_residency_leaves_plain_grid_sessions_open() {
-        assert!(!should_close_fullscreen_for_tray(false, false, false));
+        assert!(!should_close_fullscreen_for_tray(
+            false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn tray_residency_keeps_detached_viewer_sessions_open() {
+        assert!(!should_close_fullscreen_for_tray(true, false, false, true));
+        assert!(!should_close_fullscreen_for_tray(false, true, false, true));
+        assert!(!should_close_fullscreen_for_tray(false, false, true, true));
     }
 }

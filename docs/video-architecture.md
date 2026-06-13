@@ -46,6 +46,26 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 フレームの実体描画は native presenter 内のスレッドが行うため、`tick` で受け取る
 `egui::Context` は実質未使用 (互換のため引数だけ残してある)。
 
+### NativeVideoPlacement と detached viewer
+
+native presenter の表示先は `NativeVideoPlacement` を正本にする。
+
+- `MainWindowChild`: main HWND の child window。メインウィンドウ内に表示する。
+- `FullscreenBorderless`: monitor rect 全体の borderless presenter。fullscreen 専用 HUD overlay HWND、
+  fullscreen backdrop、VST owner 同期の対象。
+- `DetachedWindow`: owner なしの通常 top-level window。`WindowedAt` で outer position と
+  client size を復元し、タスクバー、最小化、最大化、`×` を通常の Windows window として扱う。
+
+F12 の detached mode 切替や表示中動画の host migration は
+`NativeVideoOutputCommand::SwitchPlacement` で行う。decoder / audio / clock は保持し、
+presenter HWND + DComp target だけを作り直して `PlacementSwitched` / `PlacementSwitchFailed`
+を App へ返す。旧 `SwitchWindowMode(bool)` / `WindowModeSwitched` は互換経路として残すが、
+新規の判断は `NativeVideoPlacement` に寄せる。
+
+detached 動画では fullscreen 専用 HUD overlay HWND を作らず、通常 presenter HWND 側の
+egui overlay path を使う。`WM_CLOSE` は `NativeVideoWindowEvent::CloseRequested` として
+App へ転送し、Esc / Enter と同じく `close_fullscreen()` で viewer session を終了する。
+
 ### HUD overlay HWND (v0.9.0+ 後期 — CP1-8 で導入)
 
 VST3 プラグイン GUI がフルスクリーン動画再生中も最前面に維持されるため (= 動画を見ながら EQ
@@ -1506,48 +1526,51 @@ cloaked にしていた場合は、`close_fullscreen` 内で先に uncloak し�
   presenter thread 内の遅延 init エラーは別系統 (`consume_native_init_error`)
   で `tick()` 中に取り込む。
 
-## ウィンドウ内表示モード (in-window モード)
+## 表示配置モード
 
-フルスクリーン表示には 2 つの配置モードがあり、`Settings.video_in_window_mode`
-(既定 false) で切り替える。両モードは「動画 native presenter の置き場所」と
-「静止画フルスクリーンの egui 描画先」の両方に効く。
+viewer session の表示先は `ViewerPresentation::{MainWindow, Fullscreen, DetachedWindow}`
+で扱う。`Settings.video_in_window_mode` は従来互換の「同一ウィンドウ内表示」設定、
+`Settings.detached_viewer_enabled` は F12 で切り替える「別ウィンドウモード」設定。
+detached が有効なときは画像・動画とも `DetachedWindow` を優先し、閉じた session は
+Enter / ダブルクリック等で次に開くまで再表示しない。
 
-| | フルスクリーンモード (既定) | in-window モード |
-| --- | --- | --- |
-| 動画 presenter HWND | ボーダレス `WS_POPUP`、モニタ全面 | `WS_CHILD`、main HWND のクライアント矩形に重ねる |
-| 静止画フルスクリーン | 専用の egui フルスクリーン viewport | main ウィンドウの egui ctx に直接描画 (embedded) |
-| main HWND | presenter 起動まで cloak | cloak しない (子が main に重なる) |
-
-設定は動画・静止画で共有する単一の「in-window モード」フラグ。動画 HUD のトグル
-ボタンと静止画ホバーバーの ⊞ トグルボタンはどちらもこの 1 つの設定を切り替える。
+| | Fullscreen | MainWindow | DetachedWindow |
+| --- | --- | --- | --- |
+| 動画 presenter HWND | ボーダレス `WS_POPUP`、モニタ全面 | `WS_CHILD`、main HWND のクライアント矩形に重ねる | owner なしの通常 top-level window |
+| 静止画 viewer | 専用の egui fullscreen viewport | main ウィンドウの egui ctx に直接描画 (embedded) | 装飾付き egui viewport |
+| main HWND | presenter 起動まで cloak | cloak しない | cloak しない |
+| F11 | MainWindow と切替 | Fullscreen と切替 | 無効 |
 
 ### `native_video_in_window_active` — 実モードフラグ
 
 `Settings.video_in_window_mode` は「ユーザー設定」、`App.native_video_in_window_active`
 は「いま実際に画面に出ているモード」を表す。両者は普段一致するが、動画のライブ
-切り替え中 (Plan B、下記) だけ一時的にずれる。毎フレームの分岐 (動画 presenter /
+切り替え中 (下記) だけ一時的にずれる。毎フレームの分岐 (動画 presenter /
 静止画 embedded / cloak / VST owner) は **実モードフラグ**を見る。
 
-`open_fullscreen` は入場時に全アイテム種別で `native_video_in_window_active =
-settings.video_in_window_mode` を確定する。これにより in-window 動画 ⇔ 静止画を
-ホイールで往復してもモードが一貫する。
+`open_fullscreen` は入場時に `prepare_viewer_presentation_open` を通し、
+現時点の有効な `ViewerPresentation` から `native_video_in_window_active` を確定する。
+`ViewerPresentation::MainWindow` のときだけ true、それ以外は false。detached 動画は
+`NativeVideoPlacement::DetachedWindow` として別 HWND に出るため、in-window active ではない。
 
-### 動画のライブ切り替え (Plan B = デコーダ保持トグル)
+### 動画のライブ切り替え (デコーダ保持 placement switch)
 
 動画再生中にモードを切り替えるとき、`source` (デコーダ / 音声 / clock) を生かした
 まま **window + `NativeVideoPresenter` だけを作り直す**。close+reopen 方式 (Plan A)
 で起きていた音声途切れ・別フレーム混入を回避するため。
 
 - `toggle_video_window_mode` ([src/app/native_video.rs](../src/app/native_video.rs))
-  が `Settings.video_in_window_mode` をフリップし、`request_id` 付きの
-  `NativeVideoOutputCommand::SwitchWindowMode` を presenter スレッドへ送る。
+  は Fullscreen と MainWindow の間だけを切り替える。detached 中の F11 は no-op。
+- F12 の detached mode 切替や main 側同期による host migration は、
+  `switch_native_video_viewer_presentation` が `request_id` 付きの
+  `NativeVideoOutputCommand::SwitchPlacement` を presenter スレッドへ送る。
 - presenter スレッド (`run_native_video_output` in [src/video/mod.rs](../src/video/mod.rs))
   が hidden な新 window + presenter を組み立て、状態 (再生位置 / overlay / VST /
-  checked / SAR) を移してから旧 window と入れ替え、`WindowModeSwitched`
-  / `WindowModeSwitchFailed` を `request_id` 付きで返す。
+  checked / SAR) を移してから旧 window と入れ替え、`PlacementSwitched`
+  / `PlacementSwitchFailed` を `request_id` 付きで返す。
 - App は `request_id` で遅延 / 連打イベントを弾く。`native_video_in_window_active`
-  は切り替え進行中は据え置き、`WindowModeSwitched` 受信時に `apply_window_mode_switched`
-  で更新する (= 旧 child HWND を fullscreen / VST owner と誤認しない)。
+  と `viewer_presentation` は切り替え進行中は据え置き、`PlacementSwitched` 受信時に
+  `apply_video_presentation_switched` で更新する (= 旧 child HWND を fullscreen / VST owner と誤認しない)。
 - 切り替え進行中 (`native_video_mode_switch` Some) は `ensure_native_video_front` /
   VST owner 同期 / VST availability を全停止する。
 

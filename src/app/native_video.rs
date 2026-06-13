@@ -1489,7 +1489,11 @@ impl App {
     /// モードを指し続け、旧 child HWND を fullscreen / VST owner と誤認しない
     /// (Codex P1)。`request_id` で遅延イベントの誤適用を防ぐ (Codex P2)。
     #[cfg(windows)]
-    pub(super) fn toggle_video_window_mode(&mut self) {
+    pub(crate) fn switch_native_video_viewer_presentation(
+        &mut self,
+        target_presentation: ViewerPresentation,
+        activate_on_show: bool,
+    ) {
         let Some(idx) = self.fullscreen_idx else {
             return;
         };
@@ -1507,46 +1511,72 @@ impl App {
                 return;
             }
             crate::logger::log(format!(
-                "[native-video] window mode switch request {} timed out; allowing new toggle",
+                "[native-video] placement switch request {} timed out; allowing new switch",
                 pending.request_id
             ));
         }
-        // 切替方向の基準は「いま意図しているモード」: pending があれば pending.target、
-        // なければ永続設定値。永続設定値は presenter 確定後の `apply_window_mode_switched`
-        // でのみ更新されるので (review #4 対応)、pending 中は pending.target を見る。
-        let current_intent = self
-            .native_video_mode_switch
-            .map(|p| p.target_in_window)
-            .unwrap_or(self.settings.video_in_window_mode);
-        let new_in_window = !current_intent;
+        let new_in_window = matches!(target_presentation, ViewerPresentation::MainWindow);
+        if !matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Video { .. })) {
+            crate::logger::log(format!(
+                "[native-video] placement switch ignored: active video player is not ready \
+                 idx={idx} target={target_presentation:?}"
+            ));
+            return;
+        }
         // フルスクリーン → ウィンドウ 切替時、VST3 GUI が表示中なら自動で隠す。
         // in-window モードは VST を対象外にするため、VST GUI ウィンドウ (owner は
         // フルスクリーン presenter HWND) を残したまま切り替えると、owner HWND の
         // 破棄で VST ウィンドウが宙に浮いて残骸表示になる。presenter がまだ
         // フルスクリーン (= VST owner HWND が有効) なうちに、VST ボタン 1 回ぶんと
         // 同じ hide を行う (`toggle_native_video_vst3_gui` は表示中なら hide 方向)。
-        if new_in_window && self.show_vst3_manager {
+        if !matches!(target_presentation, ViewerPresentation::Fullscreen) && self.show_vst3_manager
+        {
             self.toggle_native_video_vst3_gui();
         }
+        let Some(rect) = self.native_video_rect_for_presentation(target_presentation) else {
+            crate::logger::log(format!(
+                "[native-video] placement switch aborted: rect compute failed target={target_presentation:?}"
+            ));
+            return;
+        };
+        let placement = Self::viewer_presentation_to_native_video_placement(target_presentation);
         // 永続設定は presenter 確定 (`apply_window_mode_switched`) まで触らない
         // (review #4 対応)。途中で crash / Alt+F4 で落ちても、未確定モードが
         // 次回起動時に持ち越されないようにする。実モード
         // (`native_video_in_window_active`) も成功イベントまで据え置く。
         self.native_video_mode_switch_seq = self.native_video_mode_switch_seq.wrapping_add(1);
         let request_id = self.native_video_mode_switch_seq;
-        self.native_video_mode_switch = Some(super::NativeVideoModeSwitchPending {
-            request_id,
-            target_in_window: new_in_window,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
-        });
         // presenter スレッドへライブ切替を依頼 (decoder/audio/clock は保持)。
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
-            player.switch_native_window_mode(request_id, new_in_window);
+            player.switch_native_placement(request_id, placement, rect, activate_on_show);
+            self.native_video_mode_switch = Some(super::NativeVideoModeSwitchPending {
+                request_id,
+                target_presentation,
+                target_in_window: new_in_window,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            });
         }
         crate::logger::log(format!(
-            "[native-video] toggle window mode (plan B) request={request_id} \
-             -> target in_window={new_in_window}"
+            "[native-video] switch placement request={request_id} \
+             -> target={target_presentation:?} activate={activate_on_show}"
         ));
+    }
+
+    pub(super) fn toggle_video_window_mode(&mut self) {
+        if self.viewer_session_is_detached() {
+            self.show_feedback_toast("別ウィンドウ表示中は F11 を無効にしています".to_string());
+            return;
+        }
+        let current_intent = self
+            .native_video_mode_switch
+            .map(|p| p.target_presentation)
+            .unwrap_or(self.viewer_presentation);
+        let target = if matches!(current_intent, ViewerPresentation::MainWindow) {
+            ViewerPresentation::Fullscreen
+        } else {
+            ViewerPresentation::MainWindow
+        };
+        self.switch_native_video_viewer_presentation(target, true);
     }
 
     /// 静止画フルスクリーンのウィンドウ / 全画面 表示を切り替える。
@@ -1564,6 +1594,11 @@ impl App {
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         self.settings.video_in_window_mode = in_window;
         self.native_video_in_window_active = in_window;
+        self.viewer_presentation = if in_window {
+            ViewerPresentation::MainWindow
+        } else {
+            ViewerPresentation::Fullscreen
+        };
         if in_window {
             self.still_fullscreen_viewport_enter_suppress_until = None;
         } else {
@@ -1595,8 +1630,17 @@ impl App {
     /// presenter rebuild 中に crash / Alt+F4 で落ちた場合に「ユーザーが見ていない未確定
     /// モード」が次回起動時に持ち越される。
     #[cfg(windows)]
-    fn apply_window_mode_switched(&mut self, in_window: bool) {
+    fn apply_video_presentation_switched(&mut self, presentation: ViewerPresentation) {
+        let in_window = matches!(presentation, ViewerPresentation::MainWindow);
         self.native_video_in_window_active = in_window;
+        self.viewer_presentation = presentation;
+        self.last_viewer_sync_stamp = if matches!(presentation, ViewerPresentation::DetachedWindow)
+        {
+            self.fullscreen_idx
+                .and_then(|idx| self.viewer_sync_stamp_for_idx(idx))
+        } else {
+            None
+        };
         if self.settings.video_in_window_mode != in_window {
             self.settings.video_in_window_mode = in_window;
             self.settings.save();
@@ -1613,7 +1657,7 @@ impl App {
             self.dsp_bridge.unregister_fullscreen_owner();
         }
         crate::logger::log(format!(
-            "[native-video] window mode switch applied -> in_window={in_window}"
+            "[native-video] presentation switch applied -> {presentation:?}"
         ));
     }
 
@@ -1725,11 +1769,16 @@ impl App {
                 request_id,
                 in_window,
             } => {
+                let presentation = if in_window {
+                    ViewerPresentation::MainWindow
+                } else {
+                    ViewerPresentation::Fullscreen
+                };
                 // presenter は自分のモードについて source of truth。request_id が
                 // 一致しなくても (timeout 後の遅延イベント等) 実モードだけは反映する。
                 // さもないと presenter が実際に切替済みなのに App の
                 // native_video_in_window_active だけ古いまま残る (Codex 再 P2)。
-                self.apply_window_mode_switched(in_window);
+                self.apply_video_presentation_switched(presentation);
                 // pending の解除条件 (review #3 対応):
                 //   - request_id 一致: 通常パス、確定イベント。clear。
                 //   - request_id 不一致でも実モード in_window が pending の
@@ -1775,6 +1824,50 @@ impl App {
                     _ => {
                         crate::logger::log(format!(
                             "[native-video] stale WindowModeSwitchFailed ignored: \
+                             request={request_id}"
+                        ));
+                    }
+                }
+            }
+            crate::video::NativeVideoOutputEvent::PlacementSwitched {
+                request_id,
+                placement,
+            } => {
+                let presentation = Self::native_video_placement_to_viewer_presentation(placement);
+                self.apply_video_presentation_switched(presentation);
+                match self.native_video_mode_switch {
+                    Some(p) if p.request_id == request_id => {
+                        self.native_video_mode_switch = None;
+                    }
+                    Some(p) if p.target_presentation == presentation => {
+                        crate::logger::log(format!(
+                            "[native-video] PlacementSwitched request={request_id} stale but \
+                             presenter converged to pending target {presentation:?}; clearing pending"
+                        ));
+                        self.native_video_mode_switch = None;
+                    }
+                    Some(_) => {
+                        crate::logger::log(format!(
+                            "[native-video] PlacementSwitched request={request_id} did not match \
+                             pending; applied actual presentation {presentation:?}; pending still active"
+                        ));
+                    }
+                    None => {
+                        crate::logger::log(format!(
+                            "[native-video] PlacementSwitched request={request_id} arrived with \
+                             no pending; applied actual presentation {presentation:?}"
+                        ));
+                    }
+                }
+            }
+            crate::video::NativeVideoOutputEvent::PlacementSwitchFailed { request_id } => {
+                match self.native_video_mode_switch {
+                    Some(pending) if pending.request_id == request_id => {
+                        self.revert_failed_window_mode_switch(pending.target_in_window);
+                    }
+                    _ => {
+                        crate::logger::log(format!(
+                            "[native-video] stale PlacementSwitchFailed ignored: \
                              request={request_id}"
                         ));
                     }
@@ -1907,10 +2000,23 @@ impl App {
         fs_idx: usize,
         event: crate::video::native_window::NativeVideoWindowEvent,
     ) {
-        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+        if self.fullscreen_idx != Some(fs_idx) {
+            return;
+        }
+        if matches!(
+            event,
+            crate::video::native_window::NativeVideoWindowEvent::CloseRequested
+        ) {
+            self.close_fullscreen();
+            return;
+        }
+        if self.ime_input_active() {
             return;
         }
         match event {
+            crate::video::native_window::NativeVideoWindowEvent::CloseRequested => {
+                self.close_fullscreen();
+            }
             crate::video::native_window::NativeVideoWindowEvent::KeyDown(key) => {
                 self.handle_native_video_key_event(ctx, fs_idx, key);
             }
@@ -1958,8 +2064,18 @@ impl App {
                 self.native_video_pointer_down = None;
             }
             // 内部処理イベント (presenter thread が直接消費する)。UI には届かない想定。
-            crate::video::native_window::NativeVideoWindowEvent::GeometryChanged { .. }
-            | crate::video::native_window::NativeVideoWindowEvent::DpiChanged { .. }
+            crate::video::native_window::NativeVideoWindowEvent::GeometryChanged {
+                x,
+                y,
+                w,
+                h,
+                maximized,
+            } => {
+                if self.viewer_session_is_detached() {
+                    self.save_detached_viewer_placement_from_native_geometry(x, y, w, h, maximized);
+                }
+            }
+            crate::video::native_window::NativeVideoWindowEvent::DpiChanged { .. }
             | crate::video::native_window::NativeVideoWindowEvent::RequestRaiseHud => {}
         }
     }
@@ -4533,6 +4649,15 @@ impl App {
         {
             return;
         }
+        if self.viewer_session_is_detached()
+            && !key.repeat
+            && !key.shift
+            && !key.ctrl
+            && matches!(key.virtual_key, 0x0D | 0x1B)
+        {
+            self.close_fullscreen();
+            return;
+        }
         let mut hud_activity = true;
         if let Some(rating_key) = self.keymap.native_video_rating_action(&key) {
             if rating_key.container {
@@ -4604,6 +4729,16 @@ impl App {
                     player.seek(0.0);
                 }
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
+            }
+            // F12: detached viewer mode toggle. Keep this as a keymap action
+            // so a future remap works when the native video HWND has focus.
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::ToggleDetachedViewerMode, &key) =>
+            {
+                self.toggle_detached_viewer_mode();
+                hud_activity = false;
             }
             // F11: ウィンドウ / 全画面 切り替え (HUD トグルボタンと同じ動作)。
             // toggle_video_window_mode は presenter rebuild を伴うので

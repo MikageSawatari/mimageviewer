@@ -51,6 +51,7 @@ OS 予約ショートカット (例: Alt+F4 / Alt+Tab / Win キー系) は keyma
 | <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>X</kbd> | チェック済み、または選択中の実ファイルをコピー / カット (**フォルダは対象外** — v1.1.0 で一旦無効化) |
 | <kbd>Ctrl</kbd>+<kbd>V</kbd> | クリップボードのファイルを現在の実フォルダへペースト (**フォルダは skip**)。ZIP/PDF/検索結果グリッドなど実フォルダ以外では無効 |
 | <kbd>Delete</kbd> | チェック済み、または選択中の実ファイルを削除 (通常はゴミ箱。**フォルダは対象外**) |
+| <kbd>F12</kbd> | 画像・動画ビューアの別ウィンドウモード ON/OFF を切り替える。静止画 / ZIP画像 / PDFページは detached viewport、動画は native presenter の detached top-level HWND で表示する |
 | マウス左ドラッグ | グリッドのセルを掴んでエクスプローラ等へファイル D&D 送出 (コピー)。複数チェック選択時はその実パス群をまとめてドラッグ。フォルダ / ZIP・PDF 本体 / 変換前アーカイブも対象。ZIP/PDF 内画像 (仮想フォルダ) とドライブ一覧は対象外 |
 | エクスプローラ等からのドロップ | mIV ウィンドウへファイルをドロップすると現在表示中のフォルダへコピー (**フォルダは v1.1.0 で一旦無効化・skip**)。ZIP/PDF / 検索結果グリッドなど実フォルダ以外を表示中は拒否 |
 | グリッド空白の右クリック | 現在の実フォルダに新しいフォルダを作成、またはクリップボードのファイルをペースト (**フォルダは skip**) |
@@ -85,7 +86,8 @@ OS 予約ショートカット (例: Alt+F4 / Alt+Tab / Win キー系) は keyma
 | マウス左クリック | (画像) ページめくり / (動画) 再生・一時停止トグル |
 | <kbd>F1</kbd>〜<kbd>F5</kbd> / <kbd>F6</kbd> | 表示中アイテムへレーティング 1〜5 / 解除 |
 | <kbd>Shift</kbd>+<kbd>F1</kbd>〜<kbd>F5</kbd> / <kbd>Shift</kbd>+<kbd>F6</kbd> | 現在のコンテナへレーティング 1〜5 / 解除 |
-| <kbd>F11</kbd> | ウィンドウ内表示 ⇔ 全画面表示 を切り替え (右上 × の左のトグルボタンと同等)。静止画は egui 経路 (`toggle_still_window_mode` = 設定 flip のみ)、動画は native presenter 経路 (`toggle_video_window_mode` = presenter rebuild)。消しゴムモード中は無効化 (ホバーバーのトグルボタンも同モード中は非表示、`erase_mask_texture` の ctx-bound 問題回避) |
+| <kbd>F11</kbd> | ウィンドウ内表示 ⇔ 全画面表示 を切り替え (右上 × の左のトグルボタンと同等)。静止画は egui 経路 (`toggle_still_window_mode` = 設定 flip のみ)、動画は native presenter 経路 (`toggle_video_window_mode` = presenter rebuild)。消しゴムモード中、および別ウィンドウ表示中は無効化 (ホバーバーのトグルボタンも非表示) |
+| <kbd>F12</kbd> | 画像・動画ビューアの別ウィンドウモード ON/OFF を切り替える。Global action として keymap 対象。native 動画ウィンドウにフォーカスがある場合も App 側へ転送する。静止画のフルスクリーン編集モード中、IME 変換中、ダイアログ操作中は発火させない |
 
 ## フルスクリーン編集モード共通 (静止画)
 

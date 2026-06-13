@@ -4629,8 +4629,8 @@ impl App {
 
     /// 選択中アイテムの情報をセル直下に表示する。
     pub(crate) fn render_selection_info(&self, ctx: &egui::Context) {
-        // フルスクリーン中は出さない (独自のホバーヘッダーを持つため)。
-        if self.fullscreen_idx.is_some() {
+        // メインウィンドウを専有するビューア中は出さない (独自のホバーヘッダーを持つため)。
+        if self.viewer_session_blocks_main_window() {
             return;
         }
         if self.settings.grid_view_mode == GridViewMode::Details {

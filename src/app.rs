@@ -34,6 +34,23 @@ pub(crate) enum FolderOpenOutcome {
     Ignored,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewerPresentation {
+    /// メインウィンドウ内にビューアを重ねる表示。
+    MainWindow,
+    /// 既存の専用フルスクリーン viewport / native fullscreen presenter。
+    Fullscreen,
+    /// メインウィンドウとは独立した viewer session。
+    DetachedWindow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewerSyncStamp {
+    idx: usize,
+    item_key: String,
+    items_generation: u64,
+}
+
 /// Condvar 付きキュー: ワーカーはキューが空のとき sleep ポーリングではなく wait() で待機し、
 /// push 側が notify_one() で起こす。
 pub(crate) type NotifyQueue = (Mutex<Vec<LoadRequest>>, Condvar);
@@ -3153,14 +3170,16 @@ fn run_fullscreen_video_marker_thumb_decode(
 }
 
 /// Plan B: 進行中のウィンドウ / 全画面トグル 1 件の状態。`toggle_video_window_mode`
-/// が生成し、presenter から `request_id` 一致の `WindowModeSwitched` /
-/// `WindowModeSwitchFailed` イベントが届くまで保持する。
+/// / detached host migration が生成し、presenter から `request_id` 一致の
+/// placement switch イベントが届くまで保持する。
 #[cfg(windows)]
 #[derive(Clone, Copy)]
 pub(crate) struct NativeVideoModeSwitchPending {
     /// このトグルのリクエスト ID (presenter がイベントに echo する)。
     pub request_id: u64,
-    /// 切替先モード (true = in-window / false = fullscreen)。
+    /// 切替先 presentation。
+    pub target_presentation: ViewerPresentation,
+    /// 旧ロジック互換用の切替先モード (true = in-window / false = fullscreen/detached)。
     pub target_in_window: bool,
     /// presenter 無応答時の保険。これを過ぎたら pending を捨てて次トグルを許可する。
     pub deadline: std::time::Instant,
@@ -3333,6 +3352,14 @@ pub struct App {
     // ── フルスクリーン表示・先読みキャッシュ ───────────────────────
     /// Some(idx) = フルスクリーン表示中（self.items のインデックス）
     pub(crate) fullscreen_idx: Option<usize>,
+    /// 現在の viewer session の実表示先。要求値ではなく、実際に採用した表示先を保持する。
+    pub(crate) viewer_presentation: ViewerPresentation,
+    /// detached viewer とメイン選択の同期済み対象。idx 単体ではなく items 世代と項目キーを持つ。
+    pub(crate) last_viewer_sync_stamp: Option<ViewerSyncStamp>,
+    /// detached viewer の次回 host 作成を no-activate にする。メイン選択同期や
+    /// 受動的な画像↔動画 host swap でフォーカスを奪わないための one-shot。
+    #[cfg(windows)]
+    pub(crate) detached_viewer_no_activate_once: bool,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
     pub(crate) fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
     /// 余白カットフィット用の中身 bbox キャッシュ (正規化座標)。idx → Some(bbox) / None(余白なし)。
@@ -5733,6 +5760,10 @@ impl App {
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             show_stats_dialog: false,
             fullscreen_idx: None,
+            viewer_presentation: ViewerPresentation::Fullscreen,
+            last_viewer_sync_stamp: None,
+            #[cfg(windows)]
+            detached_viewer_no_activate_once: false,
             fs_cache: std::collections::HashMap::new(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
@@ -9046,7 +9077,7 @@ impl App {
         if query.is_empty() {
             return;
         }
-        if self.fullscreen_idx.is_some() {
+        if self.viewer_session_blocks_main_window() {
             self.close_fullscreen();
         }
         self.open_tag_view_with_query(Some(query), false);
@@ -16121,11 +16152,12 @@ impl App {
         // 画像系フルスクリーンの進む/戻る (= egui Key 経路に出ない WM_APPCOMMAND /
         // Browser_Forward) が失われる (Codex 2 周目 P2)。fullscreen 中は fullscreen
         // handler 側で drain する。
-        let (browser_back_count, browser_forward_count) = if self.fullscreen_idx.is_some() {
-            (0, 0)
-        } else {
-            crate::take_pending_mouse_nav()
-        };
+        let (browser_back_count, browser_forward_count) =
+            if self.viewer_session_blocks_main_window() {
+                (0, 0)
+            } else {
+                crate::take_pending_mouse_nav()
+            };
 
         // 自動オープン ZIP/PDF からの Esc/Enter で立った「親フォルダ (一覧) へ戻る」予約を
         // 最優先で処理する。フルスクリーン handler が前フレームに立てたもので、ここで通常の
@@ -16178,7 +16210,7 @@ impl App {
             && !self.favsearch.has_focus
             && !self.global_search.has_focus
             && !self.tag_view.has_focus
-            && self.fullscreen_idx.is_none()
+            && !self.viewer_session_blocks_main_window()
             && !self.any_dialog_open()
             && self
                 .keymap
@@ -17575,7 +17607,7 @@ impl App {
         // が立っている) も「フルスクリーン継続中」と同じ扱いにする: 静止画 in-window
         // モードでは holdover が main ctx を覆っているのに、その背後で grid が
         // ホイールスクロール / Ctrl+ホイール列数変更を受け付けてしまうのを防ぐ。
-        if self.fullscreen_idx.is_some()
+        if self.viewer_session_blocks_main_window()
             || self.fs_nav_after_pdf_enumerate.is_some()
             || self.any_dialog_open()
             || ctx.is_popup_open()
@@ -17738,7 +17770,7 @@ impl App {
     /// キャンセルしてしまうのを防ぐため。ユーザーの意図はフルスクリーン継続なので
     /// この待ち中はグリッドショートカットを全部抑止する。
     pub(crate) fn shortcuts_blocked_by_text_input(&self) -> bool {
-        self.fullscreen_idx.is_some()
+        self.viewer_session_blocks_main_window()
             || self.fs_nav_after_pdf_enumerate.is_some()
             || self.any_dialog_open()
             || self.address_has_focus
@@ -17871,6 +17903,350 @@ impl App {
         }
     }
 
+    #[cfg(windows)]
+    fn viewer_item_supports_session(&self, idx: usize) -> bool {
+        matches!(
+            self.items.get(idx),
+            Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. })
+                | Some(GridItem::Video(_))
+        )
+    }
+
+    pub(crate) fn viewer_session_is_detached(&self) -> bool {
+        self.fullscreen_idx.is_some()
+            && matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
+    }
+
+    pub(crate) fn viewer_session_blocks_main_window(&self) -> bool {
+        self.fullscreen_idx.is_some() && !self.viewer_session_is_detached()
+    }
+
+    #[cfg(windows)]
+    fn viewer_item_supports_detached_still(&self, idx: usize) -> bool {
+        matches!(
+            self.items.get(idx),
+            Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. })
+        )
+    }
+
+    #[cfg(windows)]
+    fn viewer_sync_stamp_for_idx(&self, idx: usize) -> Option<ViewerSyncStamp> {
+        if !self.viewer_item_supports_session(idx) {
+            return None;
+        }
+        Some(ViewerSyncStamp {
+            idx,
+            item_key: self.metadata_cache_key(idx)?,
+            items_generation: self.items_generation,
+        })
+    }
+
+    #[cfg(windows)]
+    fn non_detached_viewer_presentation(&self) -> ViewerPresentation {
+        if self.settings.video_in_window_mode {
+            ViewerPresentation::MainWindow
+        } else {
+            ViewerPresentation::Fullscreen
+        }
+    }
+
+    #[cfg(windows)]
+    fn requested_viewer_presentation_for_open(&self, idx: usize) -> ViewerPresentation {
+        if self.settings.detached_viewer_enabled && self.viewer_item_supports_session(idx) {
+            ViewerPresentation::DetachedWindow
+        } else {
+            self.non_detached_viewer_presentation()
+        }
+    }
+
+    #[cfg(windows)]
+    fn effective_viewer_presentation_for_open(&self, idx: usize) -> ViewerPresentation {
+        match self.requested_viewer_presentation_for_open(idx) {
+            ViewerPresentation::DetachedWindow if self.viewer_item_supports_session(idx) => {
+                ViewerPresentation::DetachedWindow
+            }
+            ViewerPresentation::DetachedWindow => self.non_detached_viewer_presentation(),
+            presentation => presentation,
+        }
+    }
+
+    #[cfg(windows)]
+    fn clear_pending_main_foreground_reclaim(&mut self) {
+        self.pending_main_foreground_reclaim = false;
+        self.pending_main_foreground_reclaim_after_hwnd = 0;
+        self.pending_main_foreground_reclaim_force_at = None;
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn viewer_presentation_to_native_video_placement(
+        presentation: ViewerPresentation,
+    ) -> crate::video::NativeVideoPlacement {
+        match presentation {
+            ViewerPresentation::MainWindow => crate::video::NativeVideoPlacement::MainWindowChild,
+            ViewerPresentation::Fullscreen => {
+                crate::video::NativeVideoPlacement::FullscreenBorderless
+            }
+            ViewerPresentation::DetachedWindow => {
+                crate::video::NativeVideoPlacement::DetachedWindow
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_video_placement_to_viewer_presentation(
+        placement: crate::video::NativeVideoPlacement,
+    ) -> ViewerPresentation {
+        match placement {
+            crate::video::NativeVideoPlacement::MainWindowChild => ViewerPresentation::MainWindow,
+            crate::video::NativeVideoPlacement::FullscreenBorderless => {
+                ViewerPresentation::Fullscreen
+            }
+            crate::video::NativeVideoPlacement::DetachedWindow => {
+                ViewerPresentation::DetachedWindow
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn default_detached_viewer_window_placement(
+        &self,
+    ) -> crate::settings::DetachedViewerWindowPlacement {
+        let (x, y) = self
+            .last_outer_rect
+            .map(|rect| (rect.min.x + 48.0, rect.min.y + 48.0))
+            .unwrap_or((80.0, 80.0));
+        crate::settings::DetachedViewerWindowPlacement {
+            x,
+            y,
+            w: 960.0,
+            h: 720.0,
+            maximized: false,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_viewer_window_placement(
+        &self,
+    ) -> crate::settings::DetachedViewerWindowPlacement {
+        self.settings
+            .detached_viewer_window_placement
+            .filter(|p| p.is_sane() && crate::monitor::title_bar_on_some_monitor(p.x, p.y, p.w))
+            .unwrap_or_else(|| self.default_detached_viewer_window_placement())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_viewer_rect_physical(&self) -> windows::Win32::Foundation::RECT {
+        let placement = self.detached_viewer_window_placement();
+        let scale = self.last_pixels_per_point.max(0.5);
+        windows::Win32::Foundation::RECT {
+            left: (placement.x * scale).round() as i32,
+            top: (placement.y * scale).round() as i32,
+            right: ((placement.x + placement.w) * scale).round() as i32,
+            bottom: ((placement.y + placement.h) * scale).round() as i32,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_video_rect_for_presentation(
+        &self,
+        presentation: ViewerPresentation,
+    ) -> Option<windows::Win32::Foundation::RECT> {
+        use windows::Win32::Foundation::{HWND, RECT};
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+
+        match presentation {
+            ViewerPresentation::DetachedWindow => Some(self.detached_viewer_rect_physical()),
+            ViewerPresentation::MainWindow => {
+                let hwnd = HWND(self.main_hwnd.unwrap_or_default() as *mut _);
+                let mut client = RECT::default();
+                if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
+                    return None;
+                }
+                Some(client)
+            }
+            ViewerPresentation::Fullscreen => {
+                let hwnd = HWND(self.main_hwnd.unwrap_or_default() as *mut _);
+                let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+                let mut info = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+                    return None;
+                }
+                Some(info.rcMonitor)
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn take_detached_viewer_activate_on_show(&mut self) -> bool {
+        if self.detached_viewer_no_activate_once {
+            self.detached_viewer_no_activate_once = false;
+            false
+        } else {
+            true
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn save_detached_viewer_placement_from_logical_rect(
+        &mut self,
+        outer_rect: egui::Rect,
+        inner_rect: Option<egui::Rect>,
+        maximized: bool,
+    ) {
+        if maximized {
+            let mut placement = self.detached_viewer_window_placement();
+            placement.maximized = true;
+            self.settings.detached_viewer_window_placement = Some(placement);
+            return;
+        }
+        let size_rect = inner_rect.unwrap_or(outer_rect);
+        if !outer_rect.min.x.is_finite()
+            || !outer_rect.min.y.is_finite()
+            || !size_rect.width().is_finite()
+            || !size_rect.height().is_finite()
+            || size_rect.width() < 320.0
+            || size_rect.height() < 240.0
+        {
+            return;
+        }
+        if !maximized
+            && !crate::monitor::title_bar_on_some_monitor(
+                outer_rect.min.x,
+                outer_rect.min.y,
+                outer_rect.width(),
+            )
+        {
+            return;
+        }
+        self.settings.detached_viewer_window_placement =
+            Some(crate::settings::DetachedViewerWindowPlacement {
+                x: outer_rect.min.x,
+                y: outer_rect.min.y,
+                w: size_rect.width(),
+                h: size_rect.height(),
+                maximized: false,
+            });
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn save_detached_viewer_placement_from_native_geometry(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        maximized: bool,
+    ) {
+        if maximized {
+            let mut placement = self.detached_viewer_window_placement();
+            placement.maximized = true;
+            self.settings.detached_viewer_window_placement = Some(placement);
+            return;
+        }
+        let scale = self.last_pixels_per_point.max(0.5);
+        let placement = crate::settings::DetachedViewerWindowPlacement {
+            x: x as f32 / scale,
+            y: y as f32 / scale,
+            w: w as f32 / scale,
+            h: h as f32 / scale,
+            maximized: false,
+        };
+        if placement.is_sane()
+            && crate::monitor::title_bar_on_some_monitor(placement.x, placement.y, placement.w)
+        {
+            self.settings.detached_viewer_window_placement = Some(placement);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn sync_detached_viewer_to_selected(&mut self, ctx: &egui::Context) {
+        if !self.settings.detached_viewer_enabled || !self.viewer_session_is_detached() {
+            return;
+        }
+        let Some(selected) = self.selected else {
+            return;
+        };
+        let Some(stamp) = self.viewer_sync_stamp_for_idx(selected) else {
+            return;
+        };
+        if self.last_viewer_sync_stamp.as_ref() == Some(&stamp) {
+            return;
+        }
+
+        if self.fullscreen_idx == Some(selected) {
+            self.last_viewer_sync_stamp = Some(stamp);
+            return;
+        }
+
+        self.detached_viewer_no_activate_once = true;
+        self.open_fullscreen_from_fs_navigation(ctx, selected);
+        self.selected = Some(selected);
+        self.scroll_to_selected = true;
+        self.update_last_selected_image();
+        self.last_viewer_sync_stamp = Some(stamp);
+        ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    fn prepare_viewer_presentation_open(&mut self, idx: usize, entering_native_video: bool) {
+        let presentation = self.effective_viewer_presentation_for_open(idx);
+        self.viewer_presentation = presentation;
+        self.last_viewer_sync_stamp = if matches!(presentation, ViewerPresentation::DetachedWindow)
+        {
+            self.viewer_sync_stamp_for_idx(idx)
+        } else {
+            None
+        };
+        // フルスクリーン入場時に「このセッションが in-window モードか」を
+        // 設定値から確定する。動画 (native presenter) でも静止画 (embedded
+        // 描画) でも採用し、毎フレームの分岐が参照する「実モード」として
+        // 記録する。これにより in-window 動画 ⇔ 静止画をホイールで往復しても
+        // モードが一貫する。
+        self.native_video_in_window_active = matches!(presentation, ViewerPresentation::MainWindow);
+        // 新しい fullscreen を開くので、進行中だったトグル切替 pending は破棄する。
+        self.native_video_mode_switch = None;
+
+        if entering_native_video {
+            // Video-to-video source swaps keep the native presenter HWND alive.
+            // Re-cloaking the main HWND for those swaps creates an unnecessary
+            // DWM state transition on every wheel tick and can leak as a
+            // physical-screen-only flicker even though OBS/window capture misses it.
+            //
+            // in-window モード: presenter は main HWND の子として client 領域に
+            // 重なるので main は cloak しない (cloak すると親ごと DWM 合成から
+            // 外れて子も消える)。
+            if matches!(presentation, ViewerPresentation::Fullscreen)
+                && self.native_video_presenter_hwnd().is_none()
+            {
+                self.sync_native_video_main_cloak(true);
+            } else {
+                self.sync_native_video_main_cloak(false);
+            }
+            // 黒 chrome は fullscreen/backdrop viewport を描画した後の update 末尾で
+            // 適用する。ここで先に DWM chrome だけ変えると、通常ウィンドウの
+            // タイトルバーが黒くなってから fullscreen が出る 1-frame race が見える。
+            self.native_video_main_chrome_restore_at = None;
+        } else {
+            self.sync_native_video_main_cloak(false);
+        }
+
+        // 動画フルスクリーン → 別 idx を直接 open する経路 (例: 動画→画像遷移、
+        // open_fullscreen_from_fs_navigation の継続ナビ) では、close_fullscreen を
+        // 経由しないので奪還候補がそのまま残る。継続ナビなら新しい fullscreen が
+        // 引き続き表示されているため reclaim 不要 → ここでクリアする。
+        self.clear_pending_main_foreground_reclaim();
+    }
+
     /// フルスクリーン表示を開始する。
     /// キャッシュ済みなら即座に表示し、そうでなければ読み込みを開始する。
     /// 動画アイテムの場合はサムネイル＋再生ボタンを表示するだけで読み込みは不要。
@@ -17898,34 +18274,7 @@ impl App {
         let entering_native_video_fullscreen =
             matches!(self.items.get(idx), Some(GridItem::Video(_)));
         #[cfg(windows)]
-        {
-            // フルスクリーン入場時に「このセッションが in-window モードか」を
-            // 設定値から確定する。動画 (native presenter) でも静止画 (embedded
-            // 描画) でも採用し、毎フレームの分岐が参照する「実モード」として
-            // 記録する。これにより in-window 動画 ⇔ 静止画をホイールで往復しても
-            // モードが一貫する。
-            self.native_video_in_window_active = self.settings.video_in_window_mode;
-            // 新しい fullscreen を開くので、進行中だったトグル切替 pending は破棄する。
-            self.native_video_mode_switch = None;
-            if entering_native_video_fullscreen {
-                // Video-to-video source swaps keep the native presenter HWND alive.
-                // Re-cloaking the main HWND for those swaps creates an unnecessary
-                // DWM state transition on every wheel tick and can leak as a
-                // physical-screen-only flicker even though OBS/window capture misses it.
-                //
-                // in-window モード: presenter は main HWND の子として client 領域に
-                // 重なるので main は cloak しない (cloak すると親ごと DWM 合成から
-                // 外れて子も消える)。
-                let in_main_window = self.native_video_in_window_active;
-                if !in_main_window && self.native_video_presenter_hwnd().is_none() {
-                    self.sync_native_video_main_cloak(true);
-                } else {
-                    self.sync_native_video_main_cloak(false);
-                }
-            } else {
-                self.sync_native_video_main_cloak(false);
-            }
-        }
+        self.prepare_viewer_presentation_open(idx, entering_native_video_fullscreen);
         // フルスクリーン入場時にカーソル idle タイマをリセット (= 直前まで隠れていた
         // 状態を引き継がないようにする)。前回フルスクリーンを 5 分放置した後に
         // すぐ再入場した場合、Some(<古い時刻>) のままだと 1 フレーム目で
@@ -17936,23 +18285,6 @@ impl App {
         self.cursor_last_activity = Some(std::time::Instant::now());
         self.cursor_hidden = false;
         self.refresh_fullscreen_video_marker_cache(idx);
-        #[cfg(windows)]
-        if entering_native_video_fullscreen {
-            // 黒 chrome は fullscreen/backdrop viewport を描画した後の update 末尾で
-            // 適用する。ここで先に DWM chrome だけ変えると、通常ウィンドウの
-            // タイトルバーが黒くなってから fullscreen が出る 1-frame race が見える。
-            self.native_video_main_chrome_restore_at = None;
-        }
-        // 動画フルスクリーン → 別 idx を直接 open する経路 (例: 動画→画像遷移、
-        // open_fullscreen_from_fs_navigation の継続ナビ) では、close_fullscreen を
-        // 経由しないので奪還候補がそのまま残る。継続ナビなら新しい fullscreen が
-        // 引き続き表示されているため reclaim 不要 → ここでクリアする。
-        #[cfg(windows)]
-        {
-            self.pending_main_foreground_reclaim = false;
-            self.pending_main_foreground_reclaim_after_hwnd = 0;
-            self.pending_main_foreground_reclaim_force_at = None;
-        }
         self.adjust_spread_target = AdjustSpreadTarget::Left;
         // PDF pool の Critical 予約は `pdf_loader::CRITICAL_RESERVATION_ACTIVE` を
         // 常時 ON にする方針 (v1.0.0)。グリッドからの Enter (= Critical な
@@ -21452,21 +21784,34 @@ impl App {
                     return;
                 }
                 #[cfg(windows)]
-                let native_config = native_video_presenter_config(
-                    self.main_hwnd,
-                    vp.file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("video")
-                        .to_string(),
-                    self.video_perf_overlay_visible,
-                    self.video_tile_mode_active || self.video_tile_reopen_pending,
-                    self.settings.vst3_enabled,
-                    self.checked.contains(&idx),
-                    // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
-                    Some(self.dsp_bridge.editor_hwnds_snapshot()),
-                    self.main_hwnd.unwrap_or(0) as u64,
-                    self.native_video_in_window_active,
-                );
+                let native_config = {
+                    let presentation = self.viewer_presentation;
+                    let placement =
+                        Self::viewer_presentation_to_native_video_placement(presentation);
+                    let activate_on_show =
+                        !matches!(presentation, ViewerPresentation::DetachedWindow)
+                            || self.take_detached_viewer_activate_on_show();
+                    self.native_video_rect_for_presentation(presentation)
+                        .and_then(|rect| {
+                            native_video_presenter_config(
+                                self.main_hwnd,
+                                rect,
+                                placement,
+                                activate_on_show,
+                                vp.file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("video")
+                                    .to_string(),
+                                self.video_perf_overlay_visible,
+                                self.video_tile_mode_active || self.video_tile_reopen_pending,
+                                self.settings.vst3_enabled,
+                                self.checked.contains(&idx),
+                                // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
+                                Some(self.dsp_bridge.editor_hwnds_snapshot()),
+                                self.main_hwnd.unwrap_or(0) as u64,
+                            )
+                        })
+                };
                 #[cfg(windows)]
                 let native_config_missing = native_config.is_none();
                 // 動画オープン開始時点で indexer に「いま忙しい」を通知する。
@@ -22273,6 +22618,53 @@ impl App {
         self.close_fullscreen();
     }
 
+    #[cfg(windows)]
+    fn prepare_viewer_presentation_close(&mut self) {
+        self.viewer_presentation = self.non_detached_viewer_presentation();
+        self.last_viewer_sync_stamp = None;
+        self.vst3_deferred_video_open = None;
+        self.native_video_front_synced_hwnd = 0;
+        self.native_video_front_last_raise = None;
+        self.native_video_front_recover_after_external_foreground = false;
+        self.native_video_pointer_down = None;
+        self.schedule_native_video_main_chrome_restore();
+        let native_video_was_active = self.native_video_fullscreen_active_for_main_backdrop();
+        if native_video_was_active || self.native_video_main_cloaked {
+            // SetForegroundWindow cannot reliably target a cloaked HWND. Bring
+            // the main window back into DWM composition before scheduling the
+            // foreground reclaim, while the presenter/backdrop still mask it.
+            self.sync_native_video_main_cloak(false);
+        }
+        if native_video_was_active && let Some(hwnd_raw) = self.main_hwnd {
+            crate::dwm_iconic_thumbnail::sync_video_source(hwnd_raw as u64, None);
+        }
+        // 動画フルスクリーンだったときだけ奪還候補。
+        // mIV が foreground を持っていた瞬間にだけ true にする (ユーザーが他アプリを
+        // 意図的に前面にしていたケースで奪い返さないため)。
+        // foreground=null/pid=0 の不確定ケースは保守的に false 扱い。
+        let foreground_is_ours =
+            crate::video::native_window::foreground_belongs_to_current_process_strict();
+        // in-window モードでは presenter は main の子で、close 時も main が
+        // foreground のまま。fullscreen 用の foreground 奪還は不要なのでスキップ
+        // (Codex P2)。
+        if native_video_was_active && foreground_is_ours && !self.native_video_in_window_active {
+            self.pending_main_foreground_reclaim = true;
+            self.pending_main_foreground_reclaim_after_hwnd =
+                self.native_video_presenter_hwnd().unwrap_or(0);
+            self.pending_main_foreground_reclaim_force_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
+        } else {
+            self.clear_pending_main_foreground_reclaim();
+            if native_video_was_active {
+                crate::logger::log(
+                    "[native-video] foreground_unknown_or_foreign at close_fullscreen, \
+                     skip reclaim"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     /// フルスクリーン表示を終了し、先読みキャッシュを全クリアする。
     ///
     /// `fs_viewport_shown` は意図的に残す: 次フレームの
@@ -22301,52 +22693,7 @@ impl App {
         }
         self.restore_grid_cursor_to_fullscreen_item();
         #[cfg(windows)]
-        {
-            self.vst3_deferred_video_open = None;
-            self.native_video_front_synced_hwnd = 0;
-            self.native_video_front_last_raise = None;
-            self.native_video_front_recover_after_external_foreground = false;
-            self.native_video_pointer_down = None;
-            self.schedule_native_video_main_chrome_restore();
-            let native_video_was_active = self.native_video_fullscreen_active_for_main_backdrop();
-            if native_video_was_active || self.native_video_main_cloaked {
-                // SetForegroundWindow cannot reliably target a cloaked HWND. Bring
-                // the main window back into DWM composition before scheduling the
-                // foreground reclaim, while the presenter/backdrop still mask it.
-                self.sync_native_video_main_cloak(false);
-            }
-            if native_video_was_active && let Some(hwnd_raw) = self.main_hwnd {
-                crate::dwm_iconic_thumbnail::sync_video_source(hwnd_raw as u64, None);
-            }
-            // 動画フルスクリーンだったときだけ奪還候補。
-            // mIV が foreground を持っていた瞬間にだけ true にする (ユーザーが他アプリを
-            // 意図的に前面にしていたケースで奪い返さないため)。
-            // foreground=null/pid=0 の不確定ケースは保守的に false 扱い。
-            let foreground_is_ours =
-                crate::video::native_window::foreground_belongs_to_current_process_strict();
-            // in-window モードでは presenter は main の子で、close 時も main が
-            // foreground のまま。fullscreen 用の foreground 奪還は不要なのでスキップ
-            // (Codex P2)。
-            if native_video_was_active && foreground_is_ours && !self.native_video_in_window_active
-            {
-                self.pending_main_foreground_reclaim = true;
-                self.pending_main_foreground_reclaim_after_hwnd =
-                    self.native_video_presenter_hwnd().unwrap_or(0);
-                self.pending_main_foreground_reclaim_force_at =
-                    Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
-            } else {
-                self.pending_main_foreground_reclaim = false;
-                self.pending_main_foreground_reclaim_after_hwnd = 0;
-                self.pending_main_foreground_reclaim_force_at = None;
-                if native_video_was_active {
-                    crate::logger::log(
-                        "[native-video] foreground_unknown_or_foreign at close_fullscreen, \
-                         skip reclaim"
-                            .to_string(),
-                    );
-                }
-            }
-        }
+        self.prepare_viewer_presentation_close();
         #[cfg(windows)]
         if self.show_vst3_manager || self.settings.vst3_gui_visible {
             self.native_video_owner_synced_hwnd = 0;
@@ -26767,6 +27114,45 @@ impl App {
         self.show_feedback_toast_with_duration(text, crate::ui_fullscreen::FEEDBACK_TOAST_DURATION);
     }
 
+    pub(crate) fn toggle_detached_viewer_mode(&mut self) {
+        self.settings.detached_viewer_enabled = !self.settings.detached_viewer_enabled;
+        self.settings.save();
+        #[cfg(windows)]
+        {
+            if let Some(idx) = self.fullscreen_idx {
+                let target_presentation = if self.settings.detached_viewer_enabled
+                    && self.viewer_item_supports_session(idx)
+                {
+                    ViewerPresentation::DetachedWindow
+                } else {
+                    self.non_detached_viewer_presentation()
+                };
+                if target_presentation != self.viewer_presentation {
+                    if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+                        self.switch_native_video_viewer_presentation(target_presentation, true);
+                    } else if self.viewer_item_supports_detached_still(idx) {
+                        self.viewer_presentation = target_presentation;
+                        self.native_video_in_window_active =
+                            matches!(target_presentation, ViewerPresentation::MainWindow);
+                        self.last_viewer_sync_stamp =
+                            if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
+                                self.viewer_sync_stamp_for_idx(idx)
+                            } else {
+                                None
+                            };
+                        self.fs_opened_at = Some(std::time::Instant::now());
+                        self.fs_focus_grace_elapsed = false;
+                    }
+                }
+            }
+        }
+        self.show_feedback_toast(if self.settings.detached_viewer_enabled {
+            "別ウィンドウモード ON".to_string()
+        } else {
+            "別ウィンドウモード OFF".to_string()
+        });
+    }
+
     /// 右上フィードバック表示を設定する (表示時間を明示指定)。
     /// 複数行の案内文 (例: 動画 pin の操作ガイド) は既定 1.2 秒では読み切れないため、
     /// 長め (4〜5 秒) を渡す。
@@ -31087,10 +31473,16 @@ impl eframe::App for App {
                     );
                     self.sync_after_restore();
                 } else if !is_visible_now && self.window_visible {
+                    let keep_detached_viewer_alive = self.viewer_session_is_detached();
                     self.window_visible = false;
                     crate::set_ui_heartbeat_suspended(
-                        true,
-                        "App::update heartbeat suspended after external window hide".to_string(),
+                        !keep_detached_viewer_alive,
+                        if keep_detached_viewer_alive {
+                            "App::update heartbeat kept alive for detached viewer after external window hide"
+                        } else {
+                            "App::update heartbeat suspended after external window hide"
+                        }
+                        .to_string(),
                     );
                 }
             }
@@ -31703,7 +32095,7 @@ impl eframe::App for App {
         // ViewportCommand::Focus が反映されるまで数フレームかかるため、
         // 500ms のグレース期間中はチェックをスキップする。
         const FS_FOCUS_GRACE_MS: u128 = 500;
-        if self.fullscreen_idx.is_some() {
+        if self.viewer_session_blocks_main_window() {
             if !self.fs_focus_grace_elapsed {
                 self.fs_focus_grace_elapsed = self
                     .fs_opened_at
@@ -31942,6 +32334,8 @@ impl eframe::App for App {
         self.poll_rating_write_results();
         self.poll_video_upscale_queue(ctx);
 
+        let main_viewer_blocked = self.viewer_session_blocks_main_window();
+
         // ── ダイアログ群 ─────────────────────────────────────────────
         self.show_favorites_editor_dialog(ctx);
         self.show_tag_editor_dialog(ctx);
@@ -31969,7 +32363,7 @@ impl eframe::App for App {
         // pump_gui_signals は close/resize シグナルを 1 回 drain するだけなので
         // どちらでも 1 回呼べば OK (= ここでは fullscreen 中は呼ばない)。
         #[cfg(windows)]
-        if self.fullscreen_idx.is_none() {
+        if !main_viewer_blocked {
             self.show_vst3_manager(ctx);
             self.vst3_pump_gui_signals();
         }
@@ -31985,7 +32379,7 @@ impl eframe::App for App {
         //    なる)。テキスト/補正の編集導線はフルスクリーンから起動されるので、ここで
         //    描くと背後 (メインビューポート) に隠れて「DL ボタンを押しても何も起きない」
         //    状態になる (実機 FB 2026-06-06)。
-        if self.fullscreen_idx.is_none() {
+        if !main_viewer_blocked {
             self.show_editing_addon_dialog(ctx);
         }
         self.show_stats_dialog_window(ctx);
@@ -31997,7 +32391,7 @@ impl eframe::App for App {
         self.show_about_dialog_window(ctx);
         self.show_update_dialog_window(ctx);
         self.show_tray_enabled_notice_dialog(ctx);
-        if self.fullscreen_idx.is_none() {
+        if !main_viewer_blocked {
             self.draw_export_dialog(ctx);
             self.draw_export_progress_dialog(ctx);
         }
@@ -32049,9 +32443,24 @@ impl eframe::App for App {
         // export 完了 / 右クリックメニュー操作 → ここで即時 reload → fs が予期せず
         // 閉じてしまう。fullscreen のときは一覧へ戻った次フレーム、または
         // close_fullscreen 側の dirty 消費経路に委ねる。
-        if self.fullscreen_idx.is_none() {
+        if !main_viewer_blocked {
             self.consume_export_folder_refresh_pending();
             self.consume_folder_thumb_pin_dirty();
+        }
+
+        // ── F12: 画像・動画ビューア別ウィンドウモード ───────────────
+        if !self.address_has_focus
+            && !self.search_has_focus
+            && !self.favsearch.has_focus
+            && !self.global_search.has_focus
+            && !self.tag_view.has_focus
+            && !main_viewer_blocked
+            && !self.any_dialog_open()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::ToggleDetachedViewerMode)
+        {
+            self.toggle_detached_viewer_mode();
         }
 
         // ── Ctrl+F: 検索バー表示 ─────────────────────────────────────
@@ -32065,7 +32474,7 @@ impl eframe::App for App {
         // 絞っても得るものが無いため)。グリッドが PdfPage で構成されるときは
         // ショートカットを無反応にする (検索バーは render_search_bar 側で閉じる)。
         if !self.address_has_focus
-            && self.fullscreen_idx.is_none()
+            && !main_viewer_blocked
             && !self.any_dialog_open()
             && !self.favsearch.has_focus
             && !self.global_search.has_focus
@@ -32091,7 +32500,7 @@ impl eframe::App for App {
             && !self.search_has_focus
             && !self.favsearch.has_focus
             && !self.tag_view.has_focus
-            && self.fullscreen_idx.is_none()
+            && !main_viewer_blocked
             && !self.any_dialog_open()
         {
             let ctrl_a = self.keymap.pressed_action(ctx, KeyAction::GridSelectAll);
@@ -32119,7 +32528,7 @@ impl eframe::App for App {
             && !self.favsearch.has_focus
             && !self.global_search.has_focus
             && !self.tag_view.has_focus
-            && self.fullscreen_idx.is_none()
+            && !main_viewer_blocked
             && !self.any_dialog_open()
         {
             let pressed_p = self.keymap.consume_action(ctx, KeyAction::GridPin);
@@ -32130,7 +32539,7 @@ impl eframe::App for App {
 
         // ── Ctrl+S: お気に入り検索バー表示 ───────────────────────────
         if !self.address_has_focus
-            && self.fullscreen_idx.is_none()
+            && !main_viewer_blocked
             && !self.any_dialog_open()
             && !self.search_has_focus
             && !self.favsearch.has_focus
@@ -32146,7 +32555,7 @@ impl eframe::App for App {
 
         // ── Ctrl+G: グローバルメタ検索バー表示 (docs §10.3) ──────────
         if !self.address_has_focus
-            && self.fullscreen_idx.is_none()
+            && !main_viewer_blocked
             && !self.any_dialog_open()
             && !self.search_has_focus
             && !self.favsearch.has_focus
@@ -32163,7 +32572,7 @@ impl eframe::App for App {
 
         // ── Ctrl+T: タグビュー表示 ─────────────────────────────────
         if !self.address_has_focus
-            && self.fullscreen_idx.is_none()
+            && !main_viewer_blocked
             && !self.any_dialog_open()
             && !self.search_has_focus
             && !self.favsearch.has_focus
@@ -32178,7 +32587,7 @@ impl eframe::App for App {
 
         // ── T: タグを付ける/外す ───────────────────────────────────
         if !self.address_has_focus
-            && self.fullscreen_idx.is_none()
+            && !main_viewer_blocked
             && !self.any_dialog_open()
             && !self.search_has_focus
             && !self.favsearch.has_focus
@@ -32190,7 +32599,7 @@ impl eframe::App for App {
         }
 
         // ── Ctrl+O: フォルダを開く ───────────────────────────────────
-        if self.fullscreen_idx.is_none()
+        if !main_viewer_blocked
             && !self.any_dialog_open()
             && !self.address_has_focus
             && !self.search_has_focus
@@ -32213,7 +32622,7 @@ impl eframe::App for App {
             && !self.search_has_focus
             && !self.favsearch.has_focus
             && !self.tag_view.has_focus
-            && self.fullscreen_idx.is_none()
+            && !main_viewer_blocked
             && !self.any_dialog_open()
         {
             if self
@@ -32426,6 +32835,8 @@ impl eframe::App for App {
         if self.items_generation != items_gen_pre_late {
             ctx.request_repaint();
         }
+        #[cfg(windows)]
+        self.sync_detached_viewer_to_selected(ctx);
 
         // 実際に進行中のサムネイル作業がある間だけ repaint を駆動する。
         // 範囲外の `Pending` は「まだ先読み対象に入っていない」正常状態なので、
@@ -35781,6 +36192,9 @@ fn video_resume_for_open(
 #[cfg(windows)]
 fn native_video_presenter_config(
     main_hwnd: Option<isize>,
+    rect: windows::Win32::Foundation::RECT,
+    placement: crate::video::NativeVideoPlacement,
+    activate_on_show: bool,
     fallback_file_name: String,
     perf_overlay_visible: bool,
     initial_tile_overlay: bool,
@@ -35790,47 +36204,8 @@ fn native_video_presenter_config(
         std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
     >,
     main_hwnd_for_raise: u64,
-    in_window: bool,
 ) -> Option<crate::video::NativeVideoOutputConfig> {
-    use windows::Win32::Foundation::{HWND, RECT};
-    use windows::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
-
-    let hwnd = HWND(main_hwnd.unwrap_or_default() as *mut _);
-    // 呼び出し元 (open_fullscreen / start_fs_load) が settings から確定したモードを
-    // 受け取る。true なら presenter を main HWND の子 (`WS_CHILD`) として client
-    // 領域に重ねる (in-window 再生)、false ならモニタ全面 borderless (fullscreen)。
-    let in_main_window = in_window;
-    let rect = if in_main_window {
-        // 子ウィンドウの rect は親クライアント座標。client 全面を覆う。
-        let mut client = RECT::default();
-        if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
-            crate::logger::log(
-                "[native-video] in-main-window: GetClientRect failed; native presenter cannot start",
-            );
-            return None;
-        }
-        client
-    } else {
-        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-        let mut info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-            // None を返すと、呼び出し元 (`start_fs_load`) が `player.fail_native_init()`
-            // で error を立てて UI に「読込失敗」を表示させる。
-            // (fast-swap 経路は意図的に None を渡すため、ここの None と区別するために
-            // 「呼び出し元が config を期待していたか」を呼び出し元側で判断している)
-            crate::logger::log(
-                "[native-video] GetMonitorInfoW failed; native presenter cannot start, video will fail to open",
-            );
-            return None;
-        }
-        info.rcMonitor
-    };
+    let in_main_window = placement.is_main_window_child();
     let sync_interval = std::env::var("MIV_NATIVE_VIDEO_SYNC_INTERVAL")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -35849,10 +36224,12 @@ fn native_video_presenter_config(
         checked,
         editor_hwnds_snapshot,
         main_hwnd_for_raise,
-        // in-main-window では topmost な HUD overlay HWND を使わず、presenter の
-        // DComp tree に egui overlay を載せる従来フォールバック経路を使う。
-        // fullscreen では従来どおり HUD HWND を有効化 (`MIV_HUD_OVERLAY=0` で off)。
-        hud_overlay_enabled: !in_main_window,
+        // in-main-window / detached では topmost な HUD overlay HWND を使わず、
+        // presenter の DComp tree に egui overlay を載せる。fullscreen だけ
+        // 従来どおり HUD HWND を有効化 (`MIV_HUD_OVERLAY=0` で off)。
+        hud_overlay_enabled: placement.is_fullscreen_borderless(),
+        placement,
+        activate_on_show,
         in_main_window,
     })
 }

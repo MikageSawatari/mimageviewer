@@ -21,7 +21,7 @@
 use eframe::egui;
 use std::sync::Arc;
 
-use crate::app::App;
+use crate::app::{App, ViewerPresentation};
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::KeyAction;
@@ -453,6 +453,7 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
             | egui::Key::F5
             | egui::Key::F6
             | egui::Key::F11
+            | egui::Key::F12
     )
 }
 
@@ -526,6 +527,7 @@ fn native_video_vk_from_egui_key(key: egui::Key) -> Option<u32> {
         egui::Key::F5 => 0x74,
         egui::Key::F6 => 0x75,
         egui::Key::F11 => 0x7A,
+        egui::Key::F12 => 0x7B,
         _ => return None,
     })
 }
@@ -2640,7 +2642,8 @@ impl App {
         #[cfg(windows)]
         if self.native_video_backdrop_target_for_fs(fs_idx) {
             let hwnd_ready = self.native_video_presenter_hwnd_for_fs(fs_idx).is_some();
-            let startup_cover = !self.native_video_in_window_active
+            let startup_cover = matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
+                && !self.native_video_in_window_active
                 && !hwnd_ready
                 && self.native_video_presenter_pending_for_fs(fs_idx);
             if startup_cover {
@@ -2688,13 +2691,29 @@ impl App {
         let embedded = self.fullscreen_embedded_still_active();
         #[cfg(not(windows))]
         let embedded = false;
+        #[cfg(windows)]
+        let detached = self.viewer_session_is_detached();
+        #[cfg(not(windows))]
+        let detached = false;
         let main_ctx = ctx;
         #[cfg(windows)]
         let hide_viewport_after_embedded_paint = embedded && self.fs_viewport_shown;
-        let mut fs_builder = self.build_fullscreen_viewport_builder();
         let fs_id = self.fullscreen_viewport_id();
         let need_show = !self.fs_viewport_shown;
-        if need_show && !embedded {
+        #[cfg(windows)]
+        let detached_activate_on_show = if detached && need_show {
+            self.take_detached_viewer_activate_on_show()
+        } else {
+            true
+        };
+        #[cfg(not(windows))]
+        let detached_activate_on_show = true;
+        let mut fs_builder = if detached {
+            self.build_detached_viewer_viewport_builder(fs_idx, detached_activate_on_show)
+        } else {
+            self.build_fullscreen_viewport_builder()
+        };
+        if need_show && !embedded && !detached {
             // 新規 viewport は hidden で作り、DWM transition 抑止属性を当ててから
             // Visible(true) にする。初期 white client と最大化アニメーションの露出を
             // 動画 backdrop と同じ手順で避ける。
@@ -2727,6 +2746,23 @@ impl App {
                 if !embedded {
                     self.update_ime_state(ctx);
                 }
+                #[cfg(windows)]
+                if detached {
+                    let (outer_rect, inner_rect, minimized, maximized) = ctx.input(|i| {
+                        let vp = i.viewport();
+                        (
+                            vp.outer_rect,
+                            vp.inner_rect,
+                            vp.minimized.unwrap_or(false),
+                            vp.maximized.unwrap_or(false),
+                        )
+                    });
+                    if !minimized && let Some(rect) = outer_rect {
+                        self.save_detached_viewer_placement_from_logical_rect(
+                            rect, inner_rect, maximized,
+                        );
+                    }
+                }
                 // IME 変換確定の Enter が multiline 本文欄 (セリフ) に改行として入るのを防ぐ
                 // (egui の既知挙動。実機 FB 2026-06-06)。変換確定自体は Ime::Commit が行うので、
                 // IME がアクティブ (変換中 or 直近 300ms に Ime イベント = Windows の別フレーム
@@ -2749,9 +2785,15 @@ impl App {
                     // embedded のときは専用 viewport を作らないので Visible/Focus は
                     // 送らない (main ウィンドウは既に表示・フォーカス済み)。
                     #[cfg(windows)]
-                    crate::dwm_transitions::disable_transitions_for_thread_windows();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    if !detached {
+                        crate::dwm_transitions::disable_transitions_for_thread_windows();
+                    }
+                    if !detached {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    }
+                    if !detached || detached_activate_on_show {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
                     ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
                 }
 
@@ -3597,7 +3639,8 @@ impl App {
                             // ウィンドウ / 全画面 切り替えボタン: 静止画フルスクリーン
                             // (= 非動画、Windows) のときだけ出す。動画は native HUD 側に
                             // 専用トグルがある。
-                            let show_window_toggle = cfg!(windows) && !is_video_mode;
+                            let show_window_toggle =
+                                cfg!(windows) && !is_video_mode && !detached;
                             let slideshow_was_playing = self.slideshow_playing;
                             // 360 度パノラマビュー: 検出 + アクティブ状態を計算
                             // (docs/panorama-360-view-plan.md §5.3)。is_panorama_mode_active
@@ -3692,7 +3735,7 @@ impl App {
                             }
                             // ウィンドウ / 全画面 切り替えボタンが押された。
                             #[cfg(windows)]
-                            if window_mode_pressed {
+                            if window_mode_pressed && !detached {
                                 self.toggle_still_window_mode();
                                 // 描画先 (embedded ⇔ 専用 viewport) の切替は次フレームの
                                 // render_fullscreen_viewport で起きる。静止画は
@@ -4353,6 +4396,34 @@ impl App {
         self.build_fullscreen_viewport_builder_with_transparency(true)
     }
 
+    fn build_detached_viewer_viewport_builder(
+        &self,
+        fs_idx: usize,
+        active: bool,
+    ) -> egui::ViewportBuilder {
+        let name = self
+            .items
+            .get(fs_idx)
+            .map(|item| item.name().into_owned())
+            .unwrap_or_default();
+        let title = if name.trim().is_empty() {
+            "mimageviewer".to_string()
+        } else {
+            format!("{name} - mimageviewer")
+        };
+
+        let placement = self.detached_viewer_window_placement();
+        egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_decorations(true)
+            .with_transparent(false)
+            .with_taskbar(true)
+            .with_inner_size([placement.w, placement.h])
+            .with_position(egui::pos2(placement.x, placement.y))
+            .with_maximized(placement.maximized)
+            .with_active(active)
+    }
+
     #[cfg(windows)]
     fn fullscreen_backdrop_physical_rect(&self) -> Option<windows::Win32::Foundation::RECT> {
         let center = self.last_outer_rect.map(|r| r.center())?;
@@ -4610,6 +4681,9 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return false;
         };
+        if self.viewer_session_is_detached() {
+            return false;
+        }
         // in-window 静止画 (embedded) では本体 (render_fullscreen_viewport) の
         // handle_fs_key_input が同じ main ctx 上で直接キーを処理する。ここでも
         // 処理するとナビが二重発火するので委譲する。true を返して
@@ -4695,6 +4769,16 @@ impl App {
 
         if Self::consume_pipeline_debug_shortcut(ctx) {
             self.start_pipeline_debug_export(ctx, fs_idx);
+            return action;
+        }
+
+        if !self.ime_input_active()
+            && !self.is_overlay_edit_mode_active()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::ToggleDetachedViewerMode)
+        {
+            self.toggle_detached_viewer_mode();
             return action;
         }
 
@@ -5241,7 +5325,10 @@ impl App {
                     });
                     found
                 });
-                if f11_pressed {
+                if f11_pressed && self.viewer_session_is_detached() {
+                    self.show_feedback_toast("別ウィンドウ表示中は F11 を使用しません".to_string());
+                    ctx.request_repaint();
+                } else if f11_pressed {
                     self.toggle_still_window_mode();
                     // 描画先 (embedded ⇔ 専用 viewport) の切替は次フレームの
                     // render_fullscreen_viewport で起きる。ホバーバーボタンと
@@ -6913,8 +7000,13 @@ impl App {
         fs_idx: usize,
     ) {
         if close_fs {
-            self.handle_fullscreen_close_request();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            let detached = self.viewer_session_is_detached();
+            if detached {
+                self.close_fullscreen();
+            } else {
+                self.handle_fullscreen_close_request();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
             // keep_fullscreen_viewport_alive の cleanup フレーム (Visible(false) 送信) を保証。
             // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、偶発的な
             // input/focus repaint に頼らず明示的に次フレームを起こす。
@@ -13563,6 +13655,14 @@ impl App {
     ) {
         // IME 変換中はショートカットを発火させない
         if self.ime_input_active() {
+            return;
+        }
+
+        if self
+            .keymap
+            .consume_action_no_repeat(ctx, KeyAction::ToggleDetachedViewerMode)
+        {
+            self.toggle_detached_viewer_mode();
             return;
         }
 

@@ -48,6 +48,7 @@
 # GlobalFavSearch = Ctrl+S ; お気に入りフォルダを横断検索する
 # GlobalMetadataSearch = Ctrl+G ; 全フォルダのメタデータを検索する
 # GlobalOpenFolder = Ctrl+O ; フォルダを開くダイアログを表示する
+# ToggleDetachedViewerMode = F12 ; 画像・動画ビューアの別ウィンドウモードを切り替える
 
 [Grid] ; サムネイル一覧
 # GridSelectAll = Ctrl+A ; 表示中のチェック可能な項目をすべてチェックする
