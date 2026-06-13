@@ -3828,7 +3828,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "base64",
  "comic-core",
@@ -3890,7 +3890,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-launcher"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "sha2",
  "windows 0.61.3",

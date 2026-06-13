@@ -45,7 +45,7 @@ v1.3.0 のリリースレビュー (Claude マルチエージェント + Codex) 
 | --- | --- | --- | --- |
 | 毎フレーム `GetDriveTypeW`×最大26 | `folder_pane.rs` `refresh_drives` → `known_folders::available_drives` | ペイン表示中、`sync_to_active` から毎フレーム全ドライブ種別を列挙 + Vec alloc。通常はキャッシュ済みマウント情報で軽いが冗長。`last_drive_refresh` で 1〜2 秒 throttle、または明示トリガ (↻ / combo open) のみに。**`last_drive_refresh` で ~1.5s throttle を実装** | 対応済 (v1.3.1) |
 | scan worker の perf 計装 + thread 構成 | `folder_pane.rs` `ensure_scan` / `scan_real_subfolders` | (1) `scan_real_subfolders` に `perf::event` を入れて低速共有でのスキャン悪化を `analyze_perf.py` で検知できるように (docs/ui-responsiveness.md §4)。(2) ノードごとに `thread::spawn` しているのを dispatcher/pool 方式に寄せるか検討 (現状は短命・cancel 付きで thread leak なし) | P3 (style/perf) |
-| reparse-point / junction の再帰ガード | `folder_pane.rs` `scan_real_subfolders` / `push_visible_rows` の `seen` | `file_type().is_dir()` が junction も通し、render の `seen` は**正規化パス文字列**なので、異なる字句パスで到達するジャンクションループを手動展開で無限に降りられる (自動爆発はしない)。reparse-point を skip、または canonical / file-id 追跡 + 深さ上限。**`push_visible_rows` に表示深度上限 64 を実装** (上限超の行は描画せず手動展開も止まる。junction は引き続き辿れる) | 対応済 (v1.3.1) |
+| reparse-point / junction の再帰ガード | `folder_pane.rs` `scan_real_subfolders` / `push_visible_rows` の `seen` | `file_type().is_dir()` が junction も通し、render の `seen` は**正規化パス文字列**なので、異なる字句パスで到達するジャンクションループを手動展開で無限に降りられる (自動爆発はしない)。reparse-point を skip、または canonical / file-id 追跡 + 深さ上限。**`push_visible_rows` に表示深度上限 64 を実装** (上限超の行は描画せず手動展開も止まる。junction は引き続き辿れる)。⚠ **前提に誤り (2026-06-13 実機検証)**: Rust の `entry.file_type().is_dir()` は junction (name surrogate reparse point) で **`false`** / `is_symlink()=true` を返す (= この cell の「junction も通し」は逆)。よって現状 junction は `scan_real_subfolders` の `!is_dir() continue` で**そもそも子に積まれない**。深度上限はこの時点では実害ガードというより予防。**1.8 で junction を dir 扱いにすると初めて子に積まれ、深度上限が load-bearing になる** | 対応済 (v1.3.1) |
 | フォルダペイン open scan の優先順位整理 | `app.rs` `poll_folder_pane_open` / `start_folder_pane_open` | worker 完了時に nav 優先順位判定の前で即 `load_folder_with_scan` へ流れるため、保留中クリックと同フレームの検索開始 / 別ナビが競合すると古いクリック先が一瞬または副作用込みで適用される余地がある。folder_pane open を通常の nav と同じ優先順位で裁定するか、高優先操作・検索開始時に `cancel_folder_pane_open` する | P3 (UX/priority) |
 
 ### 1.4 起動 / 単一インスタンス / Explorer 連携
@@ -75,6 +75,43 @@ v1.3.0 のリリースレビュー (Claude マルチエージェント + Codex) 
 | 項目 | 場所 | 内容 |
 | --- | --- | --- |
 | `maybe_apply_adjustment` 削除 | `app.rs` | 呼出元ゼロ (コメント参照のみ)。legacy `adjustment_cache` の「アップスケール近似」(Codex 指摘) もこの dead fn 内。削除する | 対応済 (v1.3.1) |
+
+### 1.8 ジャンクション / ディレクトリシンボリックリンク (reparse point) を一覧に出す
+
+ユーザー要望 (2026-06-13): NTFS ジャンクション (例: StabilityMatrix の `…\ComfyUI\output` →
+`…\Images\Text2Img`) や ディレクトリシンボリックリンクが、グリッド / フォルダツリーペイン /
+Ctrl+↑↓ ナビ / カタログのいずれの**一覧にも出ない**。**次バージョンで一覧に表示したい**。
+
+| 項目 | 場所 | 内容 / 対応方針 | 優先 |
+| --- | --- | --- | --- |
+| junction / dir symlink が一覧に出ない | `app.rs` `scan_directory` (~1006) / `folder_pane.rs` `scan_real_subfolders` (~616) / `folder_tree.rs` (~411, ~474) / `catalog.rs` (~589) | 列挙は性能のため `entry.file_type().is_dir()` を使うが、reparse point (name surrogate) は `is_dir()=false` / `is_symlink()=true` を返す。拡張子無しの junction はファイル分岐 (ZIP/PDF/画像/動画) にも入らず**黙って脱落**する。→ **`ft.is_symlink()` のときだけ** `entry.metadata()` の `std::os::windows::fs::MetadataExt::file_attributes() & FILE_ATTRIBUTE_DIRECTORY (0x10)` を見てディレクトリ判定し `GridItem::Folder` として積む。Windows の `DirEntry::metadata()` は FindFirstFile キャッシュ読み = **追加 syscall ゼロ** (scan_directory の既存コメント参照) なので性能ルール (docs/ui-responsiveness.md §1.1) に抵触しない。通常エントリは従来の高速パス維持。**直接フルパス open は `resolve_openable_path` が `Path::is_dir()` でリパースを追うので元々動く** (今回の「開けない」報告の実原因はコピペ混入の不可視末尾文字。`…\output1` 指定で 1 つ上が開く挙動と一致確認) | P2 (user 要望、次版で一覧表示) |
+
+**実装時の注意 (2026-06-13 調査):**
+
+- 実機検証 (`…\ComfyUI\output` junction): `file_type().is_dir()=false` / `is_symlink()=true` /
+  `Path::is_dir()=true` / `read_dir`=261 件。`H:` はローカル物理ディスク (`subst` / `net use` 空 =
+  ネットワーク / SUBST / 昇格セッション別マッピングは無関係)。
+- **再帰ループガードが load-bearing になる** (1.3 line 48 の前提誤りと連動): 現状 junction は
+  `is_dir()=false` で**子に積まれない**ため、junction 経由の無限ループは (手動展開を除き)
+  起きていない。本タスクで junction を dir 扱いにすると**初めて DFS / ツリーの子に入り**、
+  ジャンクションループ (A→B→A・自己参照・親への循環) が実到達可能になる。よって:
+  - `folder_pane.rs` `push_visible_rows` の表示深度上限 64 (v1.3.1) は**維持必須**。
+  - `scan_real_subfolders` と `folder_tree.rs` の Ctrl+↑↓ DFS にも canonical path / file-id
+    (`GetFileInformationByHandle` の volume+index) 追跡または深度上限のループガードを追加する
+    (これらは現状ガード無し)。
+  - カタログ走査 (`catalog.rs`) も無限再帰しないこと。
+- **ダングリング junction** (ターゲット消失) は属性上 DIRECTORY だが `read_dir` で空 / 失敗。
+  一覧には出るが開くと空になる扱いで良いか要判断 (出さない選択もあり)。
+- **ファイルシンボリックリンク**は DIRECTORY ビット無し → 従来どおり拡張子で画像/動画/ZIP/PDF
+  判定に回る (誤ってフォルダ化しない)。
+- 任意: junction / symlink にバッジ表示 (通常フォルダと見分け) を付けるかは UX 判断。
+
+**関連 (任意・防御的、今回の混乱の本当の原因)**: コピペで混入したゼロ幅スペース / BOM /
+双方向制御文字はアドレスバー・「フォルダを開く」ダイアログの `trim()` を素通りし、
+`exists()=false` → 「パスが存在しません」、`is_dir()=false` → `parent()` で 1 つ上へ丸め、と
+なって user を混乱させた (一覧非表示とは別問題)。`ui_dialogs/open_folder.rs` /
+`ui_main.rs` `resolve_folder_bar_nav_path` のパス入力正規化で末尾/全体のゼロ幅・BOM・bidi
+制御文字を除去すると同種の取り違えを防げる (小規模・任意)。
 
 ---
 
@@ -322,5 +359,9 @@ Source thread: https://egg.5ch.io/test/read.cgi/software/1752914772/
   - Treat mouse movement/interaction, not pinned HUD visibility, as the reason to keep the cursor visible.
   - Persist `fullscreen_cursor_hide_delay_secs`.
   - Default to 1.0 second.
+  - Add a shared formatter for fullscreen page labels:
+    - Single page: `12 / 180`.
+    - Normal spread / left-bound visual order: `12-13 / 180` or equivalent existing style.
+    - Right-bound spread: display in visual left-to-right order, e.g. `13,12 / 180`.
   - Use the shared formatter for both the bottom-right overlay and the seek-bar page label.
 - Priority: High for cursor auto-hide bug and spread-label consistency; medium for exposing the cursor-hide delay setting.
