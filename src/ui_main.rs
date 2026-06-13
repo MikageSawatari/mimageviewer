@@ -3842,6 +3842,7 @@ impl App {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         scroll_to: bool,
+        spread_pair_cursor_idx: Option<usize>,
     ) -> Option<PathBuf> {
         let avail_w = ui.available_width().max(1.0);
 
@@ -3931,7 +3932,13 @@ impl App {
                         break;
                     }
 
-                    self.draw_details_row(ui, row_rect, idx, row);
+                    self.draw_details_row(
+                        ui,
+                        row_rect,
+                        idx,
+                        row,
+                        spread_pair_cursor_idx == Some(idx),
+                    );
                     if self.selected == Some(idx) {
                         self.selected_cell_rect = Some(row_rect);
                     }
@@ -4124,7 +4131,14 @@ impl App {
         }
     }
 
-    fn draw_details_row(&mut self, ui: &mut egui::Ui, rect: egui::Rect, idx: usize, row: usize) {
+    fn draw_details_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        idx: usize,
+        row: usize,
+        is_spread_pair_cursor: bool,
+    ) {
         let Some(item) = self.items.get(idx).cloned() else {
             return;
         };
@@ -4159,6 +4173,9 @@ impl App {
             [rect.left_bottom(), rect.right_bottom()],
             egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
         );
+        if is_spread_pair_cursor && !selected {
+            crate::app::draw_spread_pair_cursor(painter, rect, visuals);
+        }
 
         let name = item.name().into_owned();
         let rating = if self.items_are_drive_list {
@@ -4380,8 +4397,10 @@ impl App {
                     return None;
                 }
 
+                let spread_pair_cursor_idx = self.main_grid_spread_pair_cursor_idx();
+
                 if self.settings.grid_view_mode == GridViewMode::Details {
-                    return self.render_details_list(ui, ctx, scroll_to);
+                    return self.render_details_list(ui, ctx, scroll_to, spread_pair_cursor_idx);
                 }
 
                 let cols = self.settings.grid_cols.max(1);
@@ -4545,6 +4564,7 @@ impl App {
                                     cell_rect,
                                     self.selected == Some(idx),
                                     self.checked.contains(&idx),
+                                    spread_pair_cursor_idx == Some(idx),
                                     has_page_override,
                                     has_local_adjust,
                                     has_mask,

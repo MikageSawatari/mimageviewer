@@ -39,12 +39,15 @@ v1.4.0 後に着手する「画像・動画をメイン一覧とは別ウィン�
 - 別ウィンドウ側の前後移動、フォルダ移動、スライドショー、動画連続再生で表示対象が変わった場合、メイン一覧のカーソルも常に追従する。
 - 入力中・ドラッグ中・ダイアログ表示中でも論理同期は止めない。ただしフォーカスは奪わず、進行中の操作対象は開始時の `idx` / path に固定する。
 - 選択項目が Folder / ZipFile / PdfFile / ConvertibleArchive など、直接表示できない項目の場合、ビューアは現在表示を維持する。`Enter` / ダブルクリックでそのコンテナを開き、表示可能項目へ到達した時点で同期する。
+- 見開きで 2 ページ表示している detached session では、メイン一覧側の通常カーソルは現在ページに置き、同時表示中の相方ページがサムネイルグリッド / 詳細一覧の可視範囲内にある場合だけ破線のサブカーソルを描画する。相方が画面外なら描画しない。
+- 同期済み判定は `idx` だけでなく `ViewerItemKey` / `items_generation` も見る。同じ raw idx でも item key または generation が変わった場合は、fast-swap の no-op 経路を通さず viewer を再同期する。
 
 ### 2.4 動画
 
 - 動画は別ウィンドウでも自動再生する。メイン一覧のカーソル移動で動画に切り替わった場合も自動再生する。
 - 高速カーソル移動で動画候補を連続通過する場合は、既存の native video source-swap / pending / most-recent-wins の考え方で最新対象へ集約する。UI スレッドで decoder 完了待ちをしない。
 - 画像から動画、動画から画像へ切り替わる場合も、画面上は同じ別ウィンドウセッションの表示対象が変わったものとして扱う。
+- detached 動画はメインウィンドウを占有しない。fullscreen / in-window 動画用の main backdrop、main HWND cloak、black chrome、foreground reclaim は detached では発火させず、メイン一覧は通常どおり描画・操作できる状態を保つ。
 
 ### 2.5 ウィンドウ管理
 
@@ -187,7 +190,7 @@ enum NativeVideoPlacement {
 ```
 
 - `native_video_presenter_config(..., in_window: bool)` を `NativeVideoPlacement` 受け取りに変更する。
-- 既存の `settings.video_in_window_mode: bool`、`native_video_in_window_active: bool`、`SwitchWindowMode(bool)`、`WindowModeSwitched { in_window: bool }` は、detached 実装では drift の原因になる。互換名を残す場合でも正本は 3 状態 enum に移し、cloak / foreground / settings / presenter rebuild の判断を enum へ寄せる。
+- 旧来の in-window / fullscreen 2 状態だけを扱う bool command / bool event は、detached 実装では drift の原因になる。正本は `NativeVideoPlacement` / `ViewerPresentation` に統一し、cloak / foreground / settings / presenter rebuild の判断を enum へ寄せる。
 - `NativeVideoWindowMode` は既に `Windowed` / `Borderless` / `Child` を持つ。detached は既存 `Windowed` を「owner なし + 保存 rect 指定可」に拡張して使うか、新しい `Detached` variant を足すかを Phase 1 で決める。いずれの場合も App 側の正本は `NativeVideoPlacement` に統一する。
 - detached 動画では:
   - owner HWND は付けない。
@@ -199,9 +202,9 @@ enum NativeVideoPlacement {
   - `GeometryChanged` を使って位置・サイズを保存する。
   - HUD overlay は topmost fullscreen 前提を避ける。detached は in-window と同じく fullscreen 用 HUD overlay HWND を使わず、presenter DComp tree 側の overlay 経路を使う。
   - decorated window の `WM_CLOSE` / `Alt+F4` / taskbar close を App 側へ通知する output event を追加し、`close_viewer_session` へ接続する。現状の native window は `WM_CLOSE` で `DestroyWindow` するだけなので、この event path が無いと stale `fullscreen_idx` / stale presenter HWND が残る。
-- `toggle_video_window_mode` の Plan B を拡張し、`SwitchWindowMode(bool)` ではなく `SwitchPlacement { request_id, placement, ... }` 相当にする。
+- `toggle_video_window_mode` の Plan B を拡張し、bool command ではなく `SwitchPlacement { request_id, placement, ... }` 相当にする。
   - decoder / audio / clock / source は維持する。
-  - `WindowModeSwitched` は `PlacementSwitched` 相当へ拡張する。
+  - 切替完了通知は `PlacementSwitched` に統一する。
   - request id と timeout による stale event 防御は維持する。
 
 画像 detached viewport と動画 native presenter は物理 HWND が異なりうる。
@@ -327,7 +330,7 @@ host swap では target 側の作成・初回描画準備ができてから sour
 
 - `ViewerPresentation` / `NativeVideoPlacement` / helper / settings を追加する。
 - `ViewerItemKey` / `ViewerSyncStamp` を追加し、main → viewer 同期ガードを bare idx ではなく item identity で判定できるようにする。
-- 既存の `video_in_window_mode` / `native_video_in_window_active` / `SwitchWindowMode(bool)` を 3 状態 enum へ寄せる migration 方針を決め、bool と enum が drift しない構造にする。
+- 既存の `video_in_window_mode` / `native_video_in_window_active` を 3 状態 enum へ寄せる migration 方針を決め、bool と enum が drift しない構造にする。
 - `KeyAction::ToggleDetachedViewerMode` を `KeyContext::Global` として追加し、F12 既定割り当てを追加する。
 - keymap の `ALL_ACTIONS`、ini 名、default chord、trigger、ini round-trip / default generation テストを更新する。
 - native presenter の static VK whitelist に F12 を追加し、App 側 native-video key handler に F12 dispatch branch を追加する。
@@ -339,7 +342,7 @@ host swap では target 側の作成・初回描画準備ができてから sour
 - `settings.detached_viewer_enabled`、`KeyAction::ToggleDetachedViewerMode`、F12 既定割り当て、grid / 静止画 viewer / native 動画 viewer での F12 dispatch は実装済み。
 - `ViewerPresentation::{MainWindow, Fullscreen, DetachedWindow}` と `App.viewer_presentation` は導入済み。`requested_viewer_presentation_for_open` は `detached_viewer_enabled` を見て `DetachedWindow` 要求を返す。
 - 静止画 / ZIP画像 / PDFページ / 動画はいずれも `effective_viewer_presentation_for_open` で `DetachedWindow` を実表示先として採用する。
-- native 動画は `NativeVideoPlacement::{MainWindowChild, FullscreenBorderless, DetachedWindow}` を正本にし、旧 `SwitchWindowMode(bool)` は互換イベントとして残すだけにする。
+- native 動画は `NativeVideoPlacement::{MainWindowChild, FullscreenBorderless, DetachedWindow}` を正本にし、旧 bool command / bool event は削除済み。
 
 ### Phase 2: presentation-neutral 化 + 静止画 detached + tray 対応
 
@@ -429,7 +432,7 @@ host swap では target 側の作成・初回描画準備ができてから sour
 初回 ClaudeCode レビューで出た load-bearing 指摘は本計画へ反映済み。
 
 - P0: close-to-tray は `release_media_session_for_tray()` / heartbeat suspend / `release_gpu_resources()` による teardown が load-bearing。detached session 中だけ media session / heartbeat / active viewer cache を維持する分岐を入れた。
-- P1: `video_in_window_mode` / `native_video_in_window_active` / `SwitchWindowMode(bool)` と新 enum を並走させると drift する。実装では `NativeVideoPlacement` を正本にし、旧 bool event は互換受信だけに限定する。
+- P1: `video_in_window_mode` / `native_video_in_window_active` と新 enum を並走させると drift する。実装では `NativeVideoPlacement` を正本にし、旧 bool command / bool event は削除した。
 - P1: `open_fullscreen` / `close_fullscreen` は fullscreen takeover 処理を含むため、detached viewport 配線前に presentation-specific block を切り出す。
 - P1: F12 は static VK whitelist 追加だけでなく、App 側 native-video key handler の dispatch branch が必要。
 - P1: `KeyAction::context()` は単一 context なので、F12 は `Global` action として定義し、各 handler で明示 consume する。
@@ -460,7 +463,7 @@ docs/detached-viewer-implementation-plan.md の更新後レビューをお願い
 重点確認:
 
 - Phase 1〜3 の順序で、enum migration / presentation-neutral extraction / tray survival / still detached / video detached の依存関係に無理がないか。
-- `NativeVideoPlacement` を正本にする方針で、既存の `video_in_window_mode` / `native_video_in_window_active` / `WindowModeSwitched` 由来の drift を避けられるか。
+- `NativeVideoPlacement` を正本にする方針で、既存の `video_in_window_mode` / `native_video_in_window_active` 由来の drift を避けられるか。
 - close-to-tray 中に detached image viewport と detached native video playback を維持するための heartbeat / fs_cache / event pump 方針に不足がないか。
 - end-of-update の main→viewer sync と viewer→main sync の feedback loop 防止が十分か。
 - F12 Global action、static VK whitelist、App-side native dispatch、Enter close の native 転送に漏れがないか。

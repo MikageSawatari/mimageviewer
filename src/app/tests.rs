@@ -11732,6 +11732,29 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn detached_video_does_not_activate_main_backdrop() {
+        let mut app = setup_app();
+        let idx = push_video(&mut app, r"C:\clips\movie.mp4");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.native_video_in_window_active = false;
+
+        assert!(app.viewer_session_is_detached());
+        assert!(!app.viewer_session_blocks_main_window());
+        assert!(
+            !app.native_video_fullscreen_active_for_main_backdrop(),
+            "detached video must leave the main grid drawable"
+        );
+
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        assert!(app.native_video_fullscreen_active_for_main_backdrop());
+
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        app.native_video_in_window_active = true;
+        assert!(app.native_video_fullscreen_active_for_main_backdrop());
+    }
+
+    #[test]
     fn detached_viewer_root_key_input_is_left_for_main_window() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -11820,6 +11843,30 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn detached_native_video_navigation_syncs_main_selection() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let first = push_video(&mut app, r"C:\clips\a.mp4");
+        let second = push_video(&mut app, r"C:\clips\b.mp4");
+        app.settings.detached_viewer_enabled = true;
+        app.settings.video_in_window_mode = false;
+        app.selected = Some(first);
+        app.open_fullscreen(first);
+
+        app.navigate_native_video_fullscreen(&ctx, first, 1);
+
+        assert_eq!(app.fullscreen_idx, Some(second));
+        assert_eq!(app.selected, Some(second));
+        assert!(app.scroll_to_selected);
+        let stamp = app
+            .last_viewer_sync_stamp
+            .as_ref()
+            .expect("viewer navigation should update detached sync stamp");
+        assert_eq!(stamp.idx, second);
+        assert_eq!(stamp.items_generation, app.items_generation);
+    }
+
+    #[test]
     fn detached_viewer_sync_does_not_open_when_session_is_closed() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -11831,6 +11878,49 @@ mod still_window_mode_key_tests {
 
         assert_eq!(app.fullscreen_idx, None);
         assert!(app.last_viewer_sync_stamp.is_none());
+    }
+
+    #[test]
+    fn detached_viewer_sync_reopens_when_same_idx_points_to_new_item_generation() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.settings.detached_viewer_enabled = true;
+        app.selected = Some(idx);
+        app.open_fullscreen(idx);
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+
+        app.fs_zoom = 2.0;
+        app.items[idx] = GridItem::Image(PathBuf::from(r"C:\pics\replacement.jpg"));
+        app.items_generation = app.items_generation.wrapping_add(1);
+        app.sync_detached_viewer_to_selected(&ctx);
+
+        assert_eq!(
+            app.fs_zoom, 1.0,
+            "same raw idx with a new item generation must reopen the viewer"
+        );
+        let stamp = app
+            .last_viewer_sync_stamp
+            .as_ref()
+            .expect("sync should refresh stamp for replacement item");
+        assert_eq!(stamp.idx, idx);
+        assert!(stamp.item_key.contains("replacement.jpg"));
+        assert_eq!(stamp.items_generation, app.items_generation);
+    }
+
+    #[test]
+    fn detached_spread_pair_cursor_points_to_partner_only_while_main_is_visible() {
+        let mut app = setup_app();
+        let left = push_image(&mut app, r"C:\pics\a.jpg");
+        let right = push_image(&mut app, r"C:\pics\b.jpg");
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.fullscreen_idx = Some(left);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+
+        assert_eq!(app.main_grid_spread_pair_cursor_idx(), Some(right));
+
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        assert_eq!(app.main_grid_spread_pair_cursor_idx(), None);
     }
 
     #[test]

@@ -232,6 +232,13 @@ detached session が開いている間は、`App::update` 終端でそのフレ�
 `items_generation` を含む stamp で行う。これによりフォルダ切替や ZIP/PDF 仮想フォルダの
 items rebuild 後に、同じ idx が別項目を指しても再同期できる。detached window が閉じている
 場合は、メイン一覧のカーソル移動だけでは再表示しない。
+同じ raw idx で stamp が変わった場合は、動画 fast-swap の same-idx no-op を通さず
+`open_fullscreen` の通常初期化へ戻して再同期する。
+
+detached session で見開き 2 ページ表示中は、メイン一覧の通常カーソルを現在ページに置き、
+相方ページがグリッド / 詳細一覧の可視範囲内に描画される場合だけ破線のサブカーソルを重ねる。
+相方がスクロール外なら追加描画は行わない。detached 動画はメインウィンドウを占有しないため、
+fullscreen / in-window 動画用の main backdrop や black chrome 判定から除外する。
 
 detached window placement は `settings.detached_viewer_window_placement` に保存する。
 保存値の意味は outer position + inner/client size + maximized flag。最大化中は restore

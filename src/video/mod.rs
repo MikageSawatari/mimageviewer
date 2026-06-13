@@ -339,18 +339,6 @@ pub enum NativeVideoOutputEvent {
     CloseFullscreen,
     /// 動画 HUD のトグルボタン: ウィンドウ内再生 ⇔ 全画面 を切り替える。
     ToggleWindowMode,
-    /// Plan B: `SwitchWindowMode` の window/presenter 再構築が成功した。App は
-    /// これを受けて `native_video_in_window_active` (= 実モード) を更新する。
-    /// `request_id` で古い切替の取りこぼしイベントを弾く。
-    WindowModeSwitched {
-        request_id: u64,
-        in_window: bool,
-    },
-    /// Plan B: `SwitchWindowMode` の window/presenter 再構築に失敗した。presenter は
-    /// 旧 window/presenter を生かしたままなので、App は永続設定を元モードへ revert する。
-    WindowModeSwitchFailed {
-        request_id: u64,
-    },
     PlacementSwitched {
         request_id: u64,
         placement: NativeVideoPlacement,
@@ -553,16 +541,6 @@ enum NativeVideoOutputCommand {
     #[allow(dead_code)]
     SwitchSource {
         payload: Box<SwitchSourcePayload>,
-    },
-    /// Plan B: デコーダ / 音声 / clock (= `source`) を保持したまま、presenter
-    /// ウィンドウ (HWND + DComp) だけをウィンドウ内再生 ⇔ 全画面で作り直す。
-    /// `app/` 経由 (bin 専属) でのみ構築されるため lib build では dead に見える。
-    #[allow(dead_code)]
-    SwitchWindowMode {
-        /// App が採番する単調増加リクエスト ID。presenter は完了/失敗イベントに
-        /// この ID を echo し、App は古い ID のイベントを無視できる (連打/遅延対策)。
-        request_id: u64,
-        in_window: bool,
     },
     #[allow(dead_code)]
     SwitchPlacement {
@@ -936,18 +914,6 @@ impl NativeVideoOutput {
             .command_tx
             .send(NativeVideoOutputCommand::SwitchSource {
                 payload: Box::new(payload),
-            });
-    }
-
-    /// Plan B: ウィンドウ内再生 ⇔ 全画面のライブ切替を presenter スレッドへ依頼する。
-    /// `source` (デコーダ / 音声 / clock) は保持され、HWND + DComp のみ作り直される。
-    #[allow(dead_code)]
-    fn switch_window_mode(&self, request_id: u64, in_window: bool) {
-        let _ = self
-            .command_tx
-            .send(NativeVideoOutputCommand::SwitchWindowMode {
-                request_id,
-                in_window,
             });
     }
 
@@ -1697,23 +1663,21 @@ fn run_native_video_output(
         config.sync_interval
     ));
     let mut presenter_window_published = false;
-    // Plan B: ウィンドウ / 全画面トグル (`SwitchWindowMode`) で presenter を作り直す
+    // Plan B: viewer presentation 切替 (`SwitchPlacement`) で presenter を作り直す
     // とき、新 presenter に再適用するための現行状態。`config.*` は初期値しか持たない
     // ため、command で更新されうる値はここで追跡する。
-    //   - `cur_in_window`: 現在のモード (窓生成分岐 / 親矩形 poll / publish で参照)。
     //   - `cur_checked` / `cur_vst3_available`: HUD ボタン状態 (`SetChecked` /
     //     `SetVst3Available` は `NativeVideoOutput` 側で dedup されるため、再構築後の
     //     新 presenter には command が来ない可能性がある → ここから直接再適用する)。
     //   - `cur_sar`: anamorphic 補正の SAR。`SetVideoSar` は info 到着時に 1 度だけ
     //     送られるので、再構築後は新 presenter へ手動で再適用する必要がある。
     let mut cur_placement = config.placement;
-    let mut cur_in_window = cur_placement.is_main_window_child();
     let mut cur_checked = config.checked;
     let mut cur_vst3_available = config.vst3_available;
     let mut cur_sar: Option<(u32, u32)> = None;
-    // **review #12 対応**: SwitchWindowMode で presenter を作り直したとき再適用が
+    // **review #12 対応**: SwitchPlacement で presenter を作り直したとき再適用が
     // 漏れていた現行値。App 側は loop / continuous / compact を「ユーザー操作時のみ
-    // push」するため、これらを presenter 側で覚えておかないと SwitchWindowMode 後の
+    // push」するため、これらを presenter 側で覚えておかないと SwitchPlacement 後の
     // 新 presenter が default に戻る。
     let mut cur_loop_enabled: Option<bool> = None;
     let mut cur_loop_mode: Option<crate::settings::VideoLoopMode> = None;
@@ -1848,7 +1812,7 @@ fn run_native_video_output(
         &hud_hwnd_out,
         presenter.hud_hwnd(),
         &config,
-        cur_in_window,
+        cur_placement.is_main_window_child(),
         width,
         height,
         run_started,
@@ -2354,18 +2318,6 @@ fn run_native_video_output(
                         source.last_present_source_pts = None;
                     }
                 }
-                NativeVideoOutputCommand::SwitchWindowMode {
-                    request_id,
-                    in_window,
-                } => {
-                    crate::logger::log(format!(
-                        "[native-video] deprecated SwitchWindowMode command ignored request={request_id} in_window={in_window}"
-                    ));
-                    let _ = ui_event_tx.send((
-                        source.source_epoch,
-                        NativeVideoOutputEvent::WindowModeSwitchFailed { request_id },
-                    ));
-                }
                 NativeVideoOutputCommand::SwitchPlacement {
                     request_id,
                     placement,
@@ -2594,7 +2546,6 @@ fn run_native_video_output(
                                             entry.1 = 0;
                                         }
                                         cur_placement = placement;
-                                        cur_in_window = in_window;
                                         last_parent_client_size = (new_width, new_height);
                                         // 旧ウィンドウ由来の stale な native event /
                                         // HUD raise / cursor polling 状態を破棄する
@@ -2627,7 +2578,7 @@ fn run_native_video_output(
                                         let mut nw = new_window;
                                         nw.destroy_silent();
                                         crate::logger::log(format!(
-                                            "[native-video] window mode switch aborted: \
+                                            "[native-video] placement switch aborted: \
                                              presenter rebuild failed: {err}"
                                         ));
                                         let _ = ui_event_tx.send((
@@ -2641,7 +2592,7 @@ fn run_native_video_output(
                             }
                             Err(err) => {
                                 crate::logger::log(format!(
-                                    "[native-video] window mode switch aborted: \
+                                    "[native-video] placement switch aborted: \
                                      window create failed: {err}"
                                 ));
                                 let _ = ui_event_tx.send((
@@ -2659,7 +2610,7 @@ fn run_native_video_output(
         // 監視する。**drain の直前**に置くことで、SetWindowPos が同期発火させる
         // WM_WINDOWPOSCHANGED → GeometryChanged を同じループ反復で drain・処理でき、
         // resize 追従の 1 反復ぶんの遅延を無くす (maximize の「1 つ前」対策)。
-        if cur_in_window {
+        if cur_placement.is_main_window_child() {
             last_parent_client_size = reflow_child_to_parent_client(
                 window.hwnd(),
                 config.owner_hwnd,
@@ -3488,7 +3439,7 @@ fn run_native_video_output(
                             &hud_hwnd_out,
                             presenter.hud_hwnd(),
                             &config,
-                            cur_in_window,
+                            cur_placement.is_main_window_child(),
                             width,
                             height,
                             run_started,
@@ -5086,17 +5037,6 @@ impl VideoPlayer {
     pub(crate) fn switch_native_source(&self, payload: SwitchSourcePayload) {
         if let Some(output) = self.native_output.as_ref() {
             output.switch_source(payload);
-        }
-    }
-
-    /// Plan B: ウィンドウ内再生 ⇔ 全画面のライブ切替。`source` (デコーダ / 音声 /
-    /// clock) を保持したまま presenter ウィンドウだけを作り直すため、音声途切れや
-    /// フレーム混入が起きない (Plan A の close+reopen を置き換える)。
-    #[cfg(windows)]
-    #[allow(dead_code)]
-    pub(crate) fn switch_native_window_mode(&self, request_id: u64, in_window: bool) {
-        if let Some(output) = self.native_output.as_ref() {
-            output.switch_window_mode(request_id, in_window);
         }
     }
 

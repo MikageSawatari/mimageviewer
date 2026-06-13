@@ -855,11 +855,11 @@ impl App {
             self.native_video_front_recover_after_external_foreground = false;
             return;
         }
-        // Plan B: モード切替の進行中は presenter HWND が作り直される最中。新 HWND が
-        // publish 済みでも `WindowModeSwitched` 未処理のフレームでは実モード
+        // Plan B: presentation 切替の進行中は presenter HWND が作り直される最中。新 HWND が
+        // publish 済みでも `PlacementSwitched` 未処理のフレームでは実 presentation
         // (`native_video_in_window_active`) が旧いままなので、ここで owner / HUD を
         // 登録すると新 child HWND を fullscreen / VST owner と誤認しうる (Codex 再 P1)。
-        // 切替完了 (`apply_window_mode_switched`) 後の次フレームで再 sync される。
+        // 切替完了 (`apply_video_presentation_switched`) 後の次フレームで再 sync される。
         //
         // **deadline 過ぎでの強制 clear (review #3 対応)**: presenter スレッドが
         // 応答しない / イベントが失われた等で pending が deadline 過ぎても残った場合、
@@ -872,8 +872,8 @@ impl App {
                 return;
             }
             crate::logger::log(format!(
-                "[native-video] window mode switch request {} exceeded deadline \
-                 without WindowModeSwitched event; clearing pending and resuming \
+                "[native-video] placement switch request {} exceeded deadline \
+                 without PlacementSwitched event; clearing pending and resuming \
                  front sync",
                 pending.request_id
             ));
@@ -1259,6 +1259,9 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn native_video_fullscreen_active_for_main_backdrop(&self) -> bool {
+        if !self.viewer_session_blocks_main_window() {
+            return false;
+        }
         let Some(fs_idx) = self.fullscreen_idx else {
             return false;
         };
@@ -1477,16 +1480,16 @@ impl App {
         }
     }
 
-    /// 動画 HUD のウィンドウ / 全画面トグル (Plan B: デコーダ保持)。永続設定を
-    /// フリップし、`SwitchWindowMode` コマンドで presenter ウィンドウ (HWND +
-    /// DComp) だけを作り直す。`source` (デコーダ / 音声 / clock) は presenter
-    /// スレッド側で保持されるため、Plan A の close+reopen で起きていた音声途切れ・
-    /// 別フレーム混入が起きない。
+    /// 動画 HUD の表示先切替 (Plan B: デコーダ保持)。`SwitchPlacement` コマンドで
+    /// presenter ウィンドウ (HWND + DComp) だけを作り直す。`source` (デコーダ /
+    /// 音声 / clock) は presenter スレッド側で保持されるため、Plan A の
+    /// close+reopen で起きていた音声途切れ・別フレーム混入が起きない。
     ///
     /// `native_video_in_window_active` (= 実モード) はここでは**触らない**。presenter が
-    /// 再構築を完了して `WindowModeSwitched` を返したとき `apply_window_mode_switched`
-    /// で更新する。これにより再構築中も App は「実際に画面に出ているウィンドウ」の
-    /// モードを指し続け、旧 child HWND を fullscreen / VST owner と誤認しない
+    /// 再構築を完了して `PlacementSwitched` を返したとき
+    /// `apply_video_presentation_switched` で更新する。これにより再構築中も App は
+    /// 「実際に画面に出ているウィンドウ」の presentation を指し続け、旧 child HWND を
+    /// fullscreen / VST owner と誤認しない
     /// (Codex P1)。`request_id` で遅延イベントの誤適用を防ぐ (Codex P2)。
     #[cfg(windows)]
     pub(crate) fn switch_native_video_viewer_presentation(
@@ -1515,7 +1518,6 @@ impl App {
                 pending.request_id
             ));
         }
-        let new_in_window = matches!(target_presentation, ViewerPresentation::MainWindow);
         if !matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Video { .. })) {
             crate::logger::log(format!(
                 "[native-video] placement switch ignored: active video player is not ready \
@@ -1540,7 +1542,7 @@ impl App {
             return;
         };
         let placement = Self::viewer_presentation_to_native_video_placement(target_presentation);
-        // 永続設定は presenter 確定 (`apply_window_mode_switched`) まで触らない
+        // 永続設定は presenter 確定 (`apply_video_presentation_switched`) まで触らない
         // (review #4 対応)。途中で crash / Alt+F4 で落ちても、未確定モードが
         // 次回起動時に持ち越されないようにする。実モード
         // (`native_video_in_window_active`) も成功イベントまで据え置く。
@@ -1552,7 +1554,6 @@ impl App {
             self.native_video_mode_switch = Some(super::NativeVideoModeSwitchPending {
                 request_id,
                 target_presentation,
-                target_in_window: new_in_window,
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
             });
         }
@@ -1619,7 +1620,7 @@ impl App {
         ));
     }
 
-    /// Plan B: presenter から `WindowModeSwitched` (切替成功) を受けたときに呼ぶ。
+    /// Plan B: presenter から `PlacementSwitched` (切替成功) を受けたときに呼ぶ。
     /// App 側の実モード (`native_video_in_window_active`) を新モードへ更新し、
     /// presenter HWND が作り直されたことに伴う front 同期 / VST owner の再設定を行う。
     /// `native_video_mode_switch` (pending) の解除は呼び出し側が request_id 照合の
@@ -1661,15 +1662,15 @@ impl App {
         ));
     }
 
-    /// Plan B: presenter から `WindowModeSwitchFailed` を受けたときに呼ぶ。presenter は
+    /// Plan B: presenter から `PlacementSwitchFailed` を受けたときに呼ぶ。presenter は
     /// 旧 window/presenter を生かしたまま。永続設定は toggle 時点では触っていないので
     /// (review #4 対応の deferred save)、ここで戻すべきものは何も無く、pending を
     /// クリアするだけで OK。
     #[cfg(windows)]
-    fn revert_failed_window_mode_switch(&mut self, target_in_window: bool) {
+    fn revert_failed_video_presentation_switch(&mut self, target_presentation: ViewerPresentation) {
         self.native_video_mode_switch = None;
         crate::logger::log(format!(
-            "[native-video] window mode switch failed (target_in_window={target_in_window}); \
+            "[native-video] placement switch failed (target={target_presentation:?}); \
              pending cleared (settings was never persisted, no revert needed)"
         ));
     }
@@ -1765,70 +1766,6 @@ impl App {
             crate::video::NativeVideoOutputEvent::ToggleWindowMode => {
                 self.toggle_video_window_mode();
             }
-            crate::video::NativeVideoOutputEvent::WindowModeSwitched {
-                request_id,
-                in_window,
-            } => {
-                let presentation = if in_window {
-                    ViewerPresentation::MainWindow
-                } else {
-                    ViewerPresentation::Fullscreen
-                };
-                // presenter は自分のモードについて source of truth。request_id が
-                // 一致しなくても (timeout 後の遅延イベント等) 実モードだけは反映する。
-                // さもないと presenter が実際に切替済みなのに App の
-                // native_video_in_window_active だけ古いまま残る (Codex 再 P2)。
-                self.apply_video_presentation_switched(presentation);
-                // pending の解除条件 (review #3 対応):
-                //   - request_id 一致: 通常パス、確定イベント。clear。
-                //   - request_id 不一致でも実モード in_window が pending の
-                //     target_in_window と一致: presenter は既に目的のモードへ
-                //     収束済み (= 後続の switch 要求は no-op になる前提)。clear して
-                //     `ensure_native_video_front` を再開させる。
-                //     旧実装はこのケースで pending が居座り続け、毎フレームの
-                //     ensure_native_video_front が early-return してしまって
-                //     HUD/VST owner 登録が永続的に再開しない不具合があった。
-                //   - request_id 不一致 + target も不一致: presenter が更にもう
-                //     1 段切替中。pending を保持して次イベントを待つ。
-                match self.native_video_mode_switch {
-                    Some(p) if p.request_id == request_id => {
-                        self.native_video_mode_switch = None;
-                    }
-                    Some(p) if p.target_in_window == in_window => {
-                        crate::logger::log(format!(
-                            "[native-video] WindowModeSwitched request={request_id} stale but \
-                             presenter converged to pending target in_window={in_window}; \
-                             clearing pending"
-                        ));
-                        self.native_video_mode_switch = None;
-                    }
-                    Some(_) => {
-                        crate::logger::log(format!(
-                            "[native-video] WindowModeSwitched request={request_id} did not match \
-                             pending; applied actual mode in_window={in_window}; pending still active"
-                        ));
-                    }
-                    None => {
-                        crate::logger::log(format!(
-                            "[native-video] WindowModeSwitched request={request_id} arrived with \
-                             no pending; applied actual mode in_window={in_window}"
-                        ));
-                    }
-                }
-            }
-            crate::video::NativeVideoOutputEvent::WindowModeSwitchFailed { request_id } => {
-                match self.native_video_mode_switch {
-                    Some(pending) if pending.request_id == request_id => {
-                        self.revert_failed_window_mode_switch(pending.target_in_window);
-                    }
-                    _ => {
-                        crate::logger::log(format!(
-                            "[native-video] stale WindowModeSwitchFailed ignored: \
-                             request={request_id}"
-                        ));
-                    }
-                }
-            }
             crate::video::NativeVideoOutputEvent::PlacementSwitched {
                 request_id,
                 placement,
@@ -1863,7 +1800,7 @@ impl App {
             crate::video::NativeVideoOutputEvent::PlacementSwitchFailed { request_id } => {
                 match self.native_video_mode_switch {
                     Some(pending) if pending.request_id == request_id => {
-                        self.revert_failed_window_mode_switch(pending.target_in_window);
+                        self.revert_failed_video_presentation_switch(pending.target_presentation);
                     }
                     _ => {
                         crate::logger::log(format!(
@@ -2003,19 +1940,12 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
-        if matches!(
-            event,
-            crate::video::native_window::NativeVideoWindowEvent::CloseRequested
-        ) {
-            self.close_fullscreen();
-            return;
-        }
-        if self.ime_input_active() {
-            return;
-        }
         match event {
             crate::video::native_window::NativeVideoWindowEvent::CloseRequested => {
                 self.close_fullscreen();
+            }
+            event if self.ime_input_active() => {
+                let _ = event;
             }
             crate::video::native_window::NativeVideoWindowEvent::KeyDown(key) => {
                 self.handle_native_video_key_event(ctx, fs_idx, key);
@@ -5837,6 +5767,8 @@ impl App {
         autoplay_override: Option<bool>,
         ignore_resume: bool,
     ) {
+        self.sync_main_selection_from_viewer_idx(idx);
+
         if self.try_start_video_tile_fast_swap(ctx, idx) {
             return;
         }

@@ -6762,6 +6762,8 @@ impl App {
     }
 
     pub(crate) fn open_fullscreen_from_fs_navigation(&mut self, ctx: &egui::Context, idx: usize) {
+        self.sync_main_selection_from_viewer_idx(idx);
+
         #[cfg(windows)]
         if self.try_start_video_tile_fast_swap(ctx, idx) {
             return;
@@ -7046,9 +7048,6 @@ impl App {
             // wheel 由来 nav_delta 等で別項目を開き直さないようガードする。
             if let Some(new_idx) = jump_to {
                 self.open_fullscreen_from_fs_navigation(ctx, new_idx);
-                self.selected = Some(new_idx);
-                self.scroll_to_selected = true;
-                self.update_last_selected_image();
             } else if nav_delta != 0 {
                 let display_order = self.current_grid_order().to_vec();
                 if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
@@ -7058,9 +7057,6 @@ impl App {
                     nav_delta,
                 ) {
                     self.open_fullscreen_from_fs_navigation(ctx, new_idx);
-                    self.selected = Some(new_idx);
-                    self.scroll_to_selected = true;
-                    self.update_last_selected_image();
                 } else {
                     // 境界到達: 中央にヒントを出す (nav_delta > 0 なら末尾)
                     self.fs_boundary_hint = Some(FsBoundaryHint::Edge {

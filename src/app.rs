@@ -3169,7 +3169,7 @@ fn run_fullscreen_video_marker_thumb_decode(
     result
 }
 
-/// Plan B: 進行中のウィンドウ / 全画面トグル 1 件の状態。`toggle_video_window_mode`
+/// Plan B: 進行中の viewer presentation 切替 1 件の状態。`toggle_video_window_mode`
 /// / detached host migration が生成し、presenter から `request_id` 一致の
 /// placement switch イベントが届くまで保持する。
 #[cfg(windows)]
@@ -3179,8 +3179,6 @@ pub(crate) struct NativeVideoModeSwitchPending {
     pub request_id: u64,
     /// 切替先 presentation。
     pub target_presentation: ViewerPresentation,
-    /// 旧ロジック互換用の切替先モード (true = in-window / false = fullscreen/detached)。
-    pub target_in_window: bool,
     /// presenter 無応答時の保険。これを過ぎたら pending を捨てて次トグルを許可する。
     pub deadline: std::time::Instant,
 }
@@ -5269,8 +5267,8 @@ pub struct App {
     /// 毎フレームの native-video 分岐はこれを参照する (= 設定値ではなく実モード)。
     pub(crate) native_video_in_window_active: bool,
     #[cfg(windows)]
-    /// Plan B: 進行中のウィンドウ / 全画面トグル。`Some` の間は次のトグルを無視し
-    /// (連打防止)、presenter からの `WindowModeSwitched` / `WindowModeSwitchFailed`
+    /// Plan B: 進行中の viewer presentation 切替。`Some` の間は次のトグルを無視し
+    /// (連打防止)、presenter からの `PlacementSwitched` / `PlacementSwitchFailed`
     /// イベントを `request_id` で照合する。これにより遅延イベントが別リクエストを
     /// 巻き戻す事故を防ぐ (Codex P2)。`deadline` 超過は presenter 無応答時の保険。
     native_video_mode_switch: Option<NativeVideoModeSwitchPending>,
@@ -17923,6 +17921,39 @@ impl App {
         self.fullscreen_idx.is_some() && !self.viewer_session_is_detached()
     }
 
+    pub(crate) fn main_grid_spread_pair_cursor_idx(&mut self) -> Option<usize> {
+        if !self.viewer_session_is_detached() {
+            return None;
+        }
+        let fs_idx = self.fullscreen_idx?;
+        match self.resolve_visible_spread_pair(fs_idx) {
+            crate::ui_fullscreen::SpreadPair::Double { left, right } if fs_idx == left => {
+                Some(right)
+            }
+            crate::ui_fullscreen::SpreadPair::Double { left, right } if fs_idx == right => {
+                Some(left)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn sync_main_selection_from_viewer_idx(&mut self, idx: usize) {
+        if self.items.get(idx).is_none() {
+            return;
+        }
+        self.selected = Some(idx);
+        self.scroll_to_selected = true;
+        self.update_last_selected_image();
+        #[cfg(windows)]
+        {
+            self.last_viewer_sync_stamp = if self.viewer_session_is_detached() {
+                self.viewer_sync_stamp_for_idx(idx)
+            } else {
+                None
+            };
+        }
+    }
+
     #[cfg(windows)]
     fn viewer_item_supports_detached_still(&self, idx: usize) -> bool {
         matches!(
@@ -18183,13 +18214,26 @@ impl App {
             return;
         }
 
-        if self.fullscreen_idx == Some(selected) {
-            self.last_viewer_sync_stamp = Some(stamp);
-            return;
-        }
-
+        let item_key_changed = self
+            .last_viewer_sync_stamp
+            .as_ref()
+            .is_some_and(|old| old.idx == selected && old.item_key != stamp.item_key);
         self.detached_viewer_no_activate_once = true;
-        self.open_fullscreen_from_fs_navigation(ctx, selected);
+        if self.fullscreen_idx == Some(selected) {
+            if item_key_changed {
+                self.fs_cache.remove(&selected);
+                if let Some((cancel, _, _)) = self.fs_pending.remove(&selected) {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.fs_upload_backlog
+                    .retain(|(idx, _, _)| *idx != selected);
+            }
+            let cursor_state = self.fullscreen_cursor_state();
+            self.open_fullscreen(selected);
+            self.restore_fullscreen_cursor_state(ctx, cursor_state);
+        } else {
+            self.open_fullscreen_from_fs_navigation(ctx, selected);
+        }
         self.selected = Some(selected);
         self.scroll_to_selected = true;
         self.update_last_selected_image();
@@ -30326,10 +30370,10 @@ impl App {
         }
         // in-window モードでは presenter は WS_CHILD なので VST GUI の owner には
         // しない (z-order / focus が壊れる)。VST owner 同期は全画面モード限定
-        // (Codex #4: Plan B の SwitchWindowMode で child HWND に切り替わった瞬間に
+        // (Codex #4: Plan B の SwitchPlacement で child HWND に切り替わった瞬間に
         //  VST owner が誤って child を指さないようガードする)。
         // さらに、モード切替の進行中 (`native_video_mode_switch` Some) は presenter が
-        // 新 HWND を publish 済みでも `WindowModeSwitched` 未処理で実モードが旧いまま
+        // 新 HWND を publish 済みでも `PlacementSwitched` 未処理で実モードが旧いまま
         // のフレームがあるため、その間は owner 同期自体を止める (Codex 再 P1)。
         #[cfg(windows)]
         if !self.native_video_in_window_active
@@ -30347,7 +30391,7 @@ impl App {
             // イベントは破棄済み presenter 由来なので、新しい presenter に誤適用しない
             // ようバッチを打ち切る (Codex P2: 新 presenter は source_epoch=0 から始まり、
             // 古い epoch=0 のイベントと区別できないため)。
-            // ToggleWindowMode (Plan B) は presenter を破棄せず `SwitchWindowMode`
+            // ToggleWindowMode (Plan B) は presenter を破棄せず `SwitchPlacement`
             // コマンドを送るだけで source_epoch も変わらないため terminal ではない。
             let terminal = matches!(event, crate::video::NativeVideoOutputEvent::CloseFullscreen);
             self.handle_native_video_output_event(ctx, idx, epoch, event);
@@ -30379,15 +30423,14 @@ impl App {
         self.poll_native_video_source_swap_pending(ctx);
         #[cfg(windows)]
         self.poll_native_video_open_pending(ctx);
-        // Plan B: presenter 無応答でモード切替 pending が滞留すると VST owner /
+        // Plan B: presenter 無応答で placement 切替 pending が滞留すると VST owner /
         // availability 同期が永久停止するため、deadline 超過の pending は明示的に
-        // 破棄する (Codex 再 P2: presenter が応答するなら遅延 WindowModeSwitched が
-        // 後から実モードを反映する)。
+        // 破棄する。
         #[cfg(windows)]
         if let Some(pending) = self.native_video_mode_switch {
             if std::time::Instant::now() >= pending.deadline {
                 crate::logger::log(format!(
-                    "[native-video] window mode switch request {} timed out \
+                    "[native-video] placement switch request {} timed out \
                      (no presenter event); clearing pending",
                     pending.request_id
                 ));
@@ -35039,6 +35082,7 @@ pub(crate) fn draw_cell(
     rect: egui::Rect,
     is_selected: bool,
     is_checked: bool,
+    is_spread_pair_cursor: bool,
     has_page_override: bool, // true なら左上に補正済みバッジ「補」を表示
     has_local_adjust: bool,  // true なら左上に補正レイヤーバッジ「レ」を表示
     has_mask: bool,          // true なら左上に消しゴムマスクバッジ「消」を表示
@@ -35521,6 +35565,9 @@ pub(crate) fn draw_cell(
         )
     };
     painter.rect_stroke(rect, 2.0, border, egui::StrokeKind::Middle);
+    if is_spread_pair_cursor && !is_selected {
+        draw_spread_pair_cursor(painter, rect, ui.visuals());
+    }
 
     // チェックマークオーバーレイ
     if is_checked {
@@ -35644,6 +35691,49 @@ pub(crate) fn draw_cell(
         if item.is_container_ratable() && count > 0 {
             draw_filter_match_badge(painter, rect, count);
         }
+    }
+}
+
+pub(crate) fn draw_spread_pair_cursor(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    visuals: &egui::Visuals,
+) {
+    let rect = rect.shrink(3.0);
+    if rect.width() <= 4.0 || rect.height() <= 4.0 {
+        return;
+    }
+    let color = if visuals.dark_mode {
+        egui::Color32::from_rgb(130, 185, 255)
+    } else {
+        egui::Color32::from_rgb(35, 95, 210)
+    };
+    let stroke = egui::Stroke::new(2.0, color);
+    draw_dashed_segment(painter, rect.left_top(), rect.right_top(), stroke);
+    draw_dashed_segment(painter, rect.right_top(), rect.right_bottom(), stroke);
+    draw_dashed_segment(painter, rect.right_bottom(), rect.left_bottom(), stroke);
+    draw_dashed_segment(painter, rect.left_bottom(), rect.left_top(), stroke);
+}
+
+fn draw_dashed_segment(
+    painter: &egui::Painter,
+    start: egui::Pos2,
+    end: egui::Pos2,
+    stroke: egui::Stroke,
+) {
+    let delta = end - start;
+    let len = delta.length();
+    if len <= 0.1 {
+        return;
+    }
+    let dir = delta / len;
+    let dash = 7.0;
+    let gap = 5.0;
+    let mut pos = 0.0;
+    while pos < len {
+        let next = (pos + dash).min(len);
+        painter.line_segment([start + dir * pos, start + dir * next], stroke);
+        pos += dash + gap;
     }
 }
 
