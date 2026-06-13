@@ -3,7 +3,7 @@
 //! `App::update()` から呼ばれるメニューバー・ツールバー・フォルダバー・
 //! グリッド・進捗オーバーレイ・選択情報オーバーレイの描画メソッドを集約。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -54,6 +54,13 @@ enum FavoriteButtonClick {
     None,
     Add,
     Edit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TagViewMenuChoice {
+    pub name: String,
+    pub tag_key: String,
+    pub count: usize,
 }
 
 fn resolve_folder_bar_nav_path(path: &Path) -> Option<PathBuf> {
@@ -241,6 +248,28 @@ fn facet_menu_label(base: &str, active: usize) -> String {
 fn prepare_facet_menu_popup(ui: &mut egui::Ui) {
     ui.set_min_width(180.0);
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+}
+
+fn draw_tag_view_menu_section(
+    ui: &mut egui::Ui,
+    title: &str,
+    choices: &[TagViewMenuChoice],
+    clicked_tag: &mut Option<String>,
+) {
+    ui.label(egui::RichText::new(title).strong());
+    ui.add_space(2.0);
+    if choices.is_empty() {
+        ui.label(egui::RichText::new("なし").weak());
+        return;
+    }
+
+    for choice in choices {
+        let label = format!("#{} ({})", choice.name, choice.count);
+        if ui.button(&label).clicked() {
+            *clicked_tag = Some(crate::tags_db::format_display_tag(&choice.name));
+            ui.close();
+        }
+    }
 }
 
 fn facet_chip(ui: &mut egui::Ui, text: impl Into<String>) {
@@ -2085,28 +2114,17 @@ impl App {
                 .iter()
                 .map(|tag| (tag.tag_key.clone(), tag.name.clone()))
                 .collect();
-            let shortcut_keys: std::collections::BTreeSet<String> = self
-                .settings
-                .tags
-                .iter()
-                .filter(|tag| tag.show_shortcut)
-                .map(|tag| tag.tag_key.clone())
-                .collect();
             for tag in &self.settings.facet_filter.tags {
                 counts.entry(tag.clone()).or_insert(0);
             }
             let query_key = crate::tags_db::normalize_tag_key(&self.facet_tag_search_query);
             let mut choices: BTreeMap<String, (String, usize)> = BTreeMap::new();
             for (tag_key, count) in &counts {
-                if shortcut_keys.contains(tag_key)
-                    || self.settings.facet_filter.tags.contains(tag_key)
-                {
-                    let display = display_names
-                        .get(tag_key)
-                        .cloned()
-                        .unwrap_or_else(|| tag_key.clone());
-                    choices.insert(tag_key.clone(), (display, *count));
-                }
+                let display = display_names
+                    .get(tag_key)
+                    .cloned()
+                    .unwrap_or_else(|| tag_key.clone());
+                choices.insert(tag_key.clone(), (display, *count));
             }
             if !query_key.is_empty() {
                 // find_by_prefix は SQLite の GROUP BY + LIKE。menu closure は毎フレーム
@@ -3202,7 +3220,7 @@ impl App {
                     let current = self.favsearch.favorite_filter;
                     let label_for = |opt: Option<uuid::Uuid>| -> String {
                         match opt {
-                            None => "すべて".to_string(),
+                            None => "すべてのお気に入り".to_string(),
                             Some(id) => self
                                 .settings
                                 .favorite_by_id(id)
@@ -3215,7 +3233,7 @@ impl App {
                         .selected_text(label_for(current))
                         .width(140.0)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut next, None, "すべて");
+                            ui.selectable_value(&mut next, None, "すべてのお気に入り");
                             for fav in &self.settings.favorites {
                                 if !fav.auto_index_structure {
                                     continue;
@@ -3307,6 +3325,97 @@ impl App {
         }
     }
 
+    pub(crate) fn tag_view_menu_sections(
+        &self,
+    ) -> (
+        Vec<TagViewMenuChoice>,
+        Vec<TagViewMenuChoice>,
+        Vec<TagViewMenuChoice>,
+    ) {
+        const RECENT_LIMIT: usize = 20;
+        const POPULAR_LIMIT: usize = 20;
+
+        let summary_by_key: HashMap<&str, &crate::tags_db::TagSummary> = self
+            .tag_view
+            .summaries
+            .iter()
+            .map(|summary| (summary.tag_key.as_str(), summary))
+            .collect();
+        let display_names: HashMap<&str, &str> = self
+            .settings
+            .tags
+            .iter()
+            .map(|tag| (tag.tag_key.as_str(), tag.name.as_str()))
+            .collect();
+        let mut excluded: HashSet<String> = HashSet::new();
+
+        let mut pinned = Vec::new();
+        for tag in self.settings.tags.iter().filter(|tag| tag.show_shortcut) {
+            if tag.tag_key.is_empty() || tag.name.trim().is_empty() {
+                continue;
+            }
+            let count = summary_by_key
+                .get(tag.tag_key.as_str())
+                .map_or(0, |summary| summary.count);
+            pinned.push(TagViewMenuChoice {
+                name: tag.name.clone(),
+                tag_key: tag.tag_key.clone(),
+                count,
+            });
+            excluded.insert(tag.tag_key.clone());
+        }
+        pinned.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+        let choice_for_summary = |summary: &crate::tags_db::TagSummary| -> TagViewMenuChoice {
+            let name = display_names
+                .get(summary.tag_key.as_str())
+                .copied()
+                .unwrap_or(summary.tag.as_str())
+                .to_string();
+            TagViewMenuChoice {
+                name,
+                tag_key: summary.tag_key.clone(),
+                count: summary.count,
+            }
+        };
+
+        let mut recent_source: Vec<_> = self.tag_view.summaries.iter().collect();
+        recent_source.sort_by(|a, b| {
+            b.last_applied_at
+                .cmp(&a.last_applied_at)
+                .then_with(|| a.tag.to_lowercase().cmp(&b.tag.to_lowercase()))
+        });
+        let mut recent = Vec::new();
+        for summary in recent_source {
+            if !excluded.insert(summary.tag_key.clone()) {
+                continue;
+            }
+            recent.push(choice_for_summary(summary));
+            if recent.len() >= RECENT_LIMIT {
+                break;
+            }
+        }
+
+        let mut popular_source: Vec<_> = self.tag_view.summaries.iter().collect();
+        popular_source.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.tag.to_lowercase().cmp(&b.tag.to_lowercase()))
+        });
+        let mut popular = Vec::new();
+        for summary in popular_source {
+            if !excluded.insert(summary.tag_key.clone()) {
+                continue;
+            }
+            popular.push(choice_for_summary(summary));
+            if popular.len() >= POPULAR_LIMIT {
+                break;
+            }
+        }
+
+        (pinned, recent, popular)
+    }
+
     /// タグビュー (Ctrl+T) の検索バーを描画する。
     pub(crate) fn render_tag_view_bar(&mut self, ctx: &egui::Context) {
         if !self.tag_view.active {
@@ -3352,6 +3461,17 @@ impl App {
                     self.tag_view.focus_request = true;
                     self.tag_view.has_focus = true;
                 }
+
+                let (pinned, recent, popular) = self.tag_view_menu_sections();
+                ui.menu_button("一覧▼", |ui| {
+                    ui.set_min_width(260.0);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    draw_tag_view_menu_section(ui, "ピン留めしたタグ", &pinned, &mut clicked_tag);
+                    ui.separator();
+                    draw_tag_view_menu_section(ui, "最近使ったタグ", &recent, &mut clicked_tag);
+                    ui.separator();
+                    draw_tag_view_menu_section(ui, "数が多いタグ", &popular, &mut clicked_tag);
+                });
 
                 if ui
                     .small_button("×")
@@ -3405,18 +3525,6 @@ impl App {
                             .size(11.0)
                             .color(egui::Color32::from_gray(140)),
                     );
-                }
-
-                if self.tag_view.query.trim().is_empty() && !self.tag_view.summaries.is_empty() {
-                    ui.separator();
-                    let summaries: Vec<_> =
-                        self.tag_view.summaries.iter().take(20).cloned().collect();
-                    for summary in summaries {
-                        let label = format!("#{} ({})", summary.tag, summary.count);
-                        if ui.small_button(label).clicked() {
-                            clicked_tag = Some(format!("#{}", summary.tag));
-                        }
-                    }
                 }
             });
             ui.add_space(2.0);

@@ -3428,7 +3428,7 @@ pub struct App {
     /// 現在の選択タグ (name, tag_key, count))。毎フレームの全選択 clone + NFKC を防ぐ。
     #[allow(clippy::type_complexity)]
     pub(crate) tag_apply_selection_cache: Option<(
-        (usize, Option<usize>, Option<usize>),
+        (Vec<usize>, Option<usize>, Option<usize>),
         Vec<PathBuf>,
         Vec<(String, String, usize)>,
     )>,

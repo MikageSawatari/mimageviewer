@@ -289,14 +289,20 @@ impl crate::app::App {
         // 検索結果ビュー中だけ「フォルダに移動」を出す。タグビューも対象 —
         // ディスク中に散在するタグ付きヒットから収納フォルダへ飛ぶのは
         // タグビューの主要動線そのもの (UX レビュー【🟧11】)。
-        let in_search = self.global_search.active || self.favsearch.active || self.tag_view.active;
+        let in_search = self.items_are_global_search_view
+            || self.global_search.drill.is_some()
+            || self.favsearch.on_results_grid()
+            || !self.favsearch.nav_stack.is_empty()
+            || self.items_are_tag_view
+            || !self.tag_view.nav_stack.is_empty();
         // ペーストは「検索結果グリッドを表示中」だけ無効化する (外部 D&D と同じ判定)。
         // 検索前の実フォルダへ誤って貼り付けないため。検索から実フォルダを開いた後は
         // current_favorite_target が確定するのでペースト可に戻す (`active` ではなく
         // on-results-grid で判定する点が重要)。
         let on_search_results = self.items_are_global_search_view
             || self.favsearch.on_results_grid()
-            || self.items_are_tag_view;
+            || self.items_are_tag_view
+            || self.tag_view.on_results_grid();
         let paste_target = if on_search_results {
             None
         } else {

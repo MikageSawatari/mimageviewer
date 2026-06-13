@@ -50,7 +50,7 @@ impl App {
         // ごとの NFKC + ソート) を毎フレーム回すと、5k 件チェック時に入力がもたつく。
         // 選択フィンガープリントが変わるか、タグデータが変わる
         // (invalidate_tag_apply_suggestions) まではキャッシュを使う。
-        let fingerprint = (self.checked.len(), self.selected, self.fullscreen_idx);
+        let fingerprint = tag_apply_selection_fingerprint(self);
         let cache_valid = self
             .tag_apply_selection_cache
             .as_ref()
@@ -334,6 +334,13 @@ fn draw_tag_choice_pane(
     } else {
         draw_tag_choice_rows(ui, id_salt, choices, current_keys, add_tag, remove_tag);
     }
+}
+
+fn tag_apply_selection_fingerprint(app: &App) -> (Vec<usize>, Option<usize>, Option<usize>) {
+    let mut checked: Vec<_> = app.checked.iter().copied().collect();
+    checked.sort_unstable();
+
+    (checked, app.selected, app.fullscreen_idx)
 }
 
 fn draw_tag_choice_rows(

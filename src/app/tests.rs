@@ -11943,6 +11943,57 @@ mod tag_view_navigation_tests {
 
         assert_eq!(app.tag_view.nav_stack, vec![root]);
     }
+
+    #[test]
+    fn tag_view_menu_sections_split_pinned_recent_and_popular_without_duplicates() {
+        let mut app = setup_app();
+        let mut pinned = crate::settings::TagDef::new("Pinned".to_string());
+        pinned.show_shortcut = true;
+        let mut pinned_unused = crate::settings::TagDef::new("Unused".to_string());
+        pinned_unused.show_shortcut = true;
+        app.settings.tags = vec![pinned.clone(), pinned_unused.clone()];
+
+        app.tag_view.summaries.push(crate::tags_db::TagSummary {
+            tag: pinned.name.clone(),
+            tag_key: pinned.tag_key.clone(),
+            count: 5,
+            last_applied_at: 10_000,
+        });
+        for i in 0..21 {
+            app.tag_view.summaries.push(crate::tags_db::TagSummary {
+                tag: format!("tag{i:02}"),
+                tag_key: format!("tag{i:02}"),
+                count: if i == 20 { 999 } else { i + 1 },
+                last_applied_at: 1_000 - i as i64,
+            });
+        }
+
+        let (pinned_choices, recent, popular) = app.tag_view_menu_sections();
+
+        assert_eq!(
+            pinned_choices
+                .iter()
+                .map(|choice| (choice.name.as_str(), choice.count))
+                .collect::<Vec<_>>(),
+            vec![("Pinned", 5), ("Unused", 0)]
+        );
+        assert_eq!(recent.len(), 20);
+        assert_eq!(
+            recent.first().map(|choice| choice.tag_key.as_str()),
+            Some("tag00")
+        );
+        assert_eq!(
+            recent.last().map(|choice| choice.tag_key.as_str()),
+            Some("tag19")
+        );
+        assert_eq!(
+            popular
+                .iter()
+                .map(|choice| choice.tag_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tag20"]
+        );
+    }
 }
 
 #[cfg(test)]
