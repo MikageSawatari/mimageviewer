@@ -2484,6 +2484,15 @@ impl App {
         // ViewportBuilder::with_visible(false) は「initial」可視性しか制御しないため、
         // 一度表示済みのビューポートを隠すには明示的に Visible(false) を送る必要がある。
         // 送信直前に DWM トランジションを無効化して Win11 のフェードアウトを抑止する。
+        #[cfg(windows)]
+        let fs_builder = match self.fs_viewport_presentation {
+            Some(ViewerPresentation::DetachedWindow) => {
+                self.build_detached_viewer_viewport_builder(0, false)
+            }
+            _ => self.build_fullscreen_viewport_builder(),
+        }
+        .with_visible(false);
+        #[cfg(not(windows))]
         let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
         ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
         crate::dwm_transitions::disable_transitions_for_thread_windows();
@@ -2492,6 +2501,7 @@ impl App {
         #[cfg(windows)]
         {
             self.fs_viewport_presentation = None;
+            self.clear_detached_viewer_host_hwnd();
             self.request_main_font_atlas_resync("fullscreen_viewport_cleanup");
         }
         if self.fs_viewport_recreate_after_hide {
@@ -2645,7 +2655,10 @@ impl App {
         //     (`hwnd_ready`) なので backdrop は一切出さない。これにより backdrop の
         //     破棄・再生成 (= 白フラッシュ / 黒被り) がトグルで起きない。
         #[cfg(windows)]
-        if self.native_video_backdrop_target_for_fs(fs_idx) {
+        if self.native_video_backdrop_target_for_fs(fs_idx)
+            && !self.viewer_session_is_detached()
+            && !self.detached_video_host_switch_pending()
+        {
             let hwnd_ready = self.native_video_presenter_hwnd_for_fs(fs_idx).is_some();
             let startup_cover = matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
                 && !self.native_video_in_window_active
@@ -2697,7 +2710,8 @@ impl App {
         #[cfg(not(windows))]
         let embedded = false;
         #[cfg(windows)]
-        let detached = self.viewer_session_is_detached();
+        let detached =
+            self.viewer_session_is_detached() || self.detached_video_host_switch_pending();
         #[cfg(not(windows))]
         let detached = false;
         let main_ctx = ctx;
@@ -2766,18 +2780,24 @@ impl App {
                 }
                 #[cfg(windows)]
                 if detached {
-                    let (outer_rect, inner_rect, minimized, maximized) = ctx.input(|i| {
-                        let vp = i.viewport();
-                        (
-                            vp.outer_rect,
-                            vp.inner_rect,
-                            vp.minimized.unwrap_or(false),
-                            vp.maximized.unwrap_or(false),
-                        )
-                    });
+                    let (outer_rect, inner_rect, pixels_per_point, minimized, maximized) = ctx
+                        .input(|i| {
+                            let vp = i.viewport();
+                            (
+                                vp.outer_rect,
+                                vp.inner_rect,
+                                i.pixels_per_point,
+                                vp.minimized.unwrap_or(false),
+                                vp.maximized.unwrap_or(false),
+                            )
+                        });
                     if !minimized && let Some(rect) = outer_rect {
                         self.save_detached_viewer_placement_from_logical_rect(
                             rect, inner_rect, maximized,
+                        );
+                        self.capture_detached_viewer_host_hwnd_from_logical_rect(
+                            rect,
+                            pixels_per_point,
                         );
                     }
                 }
@@ -4329,6 +4349,7 @@ impl App {
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
+        self.clear_detached_viewer_host_hwnd();
         self.request_main_font_atlas_resync("native_video_backdrop_hide");
     }
 
@@ -4354,6 +4375,7 @@ impl App {
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
+        self.clear_detached_viewer_host_hwnd();
         self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
         self.request_main_font_atlas_resync("fullscreen_viewport_recreate");
     }

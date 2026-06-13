@@ -65,6 +65,18 @@ pub fn set_window_cloaked(hwnd: HWND, cloaked: bool) -> windows::core::Result<()
 }
 
 pub fn raise_visible_thread_window_matching_rect(main_hwnd: HWND, expected: RECT) -> Option<HWND> {
+    let hwnd = find_visible_thread_window_matching_rect(main_hwnd, expected)?;
+    unsafe {
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+        if SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, flags).is_ok() {
+            Some(hwnd)
+        } else {
+            None
+        }
+    }
+}
+
+pub fn find_visible_thread_window_matching_rect(main_hwnd: HWND, expected: RECT) -> Option<HWND> {
     let mut state = RaiseWindowState {
         main_hwnd,
         expected,
@@ -78,12 +90,7 @@ pub fn raise_visible_thread_window_matching_rect(main_hwnd: HWND, expected: RECT
         if state.best_hwnd.0.is_null() {
             return None;
         }
-        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-        if SetWindowPos(state.best_hwnd, Some(HWND_TOP), 0, 0, 0, 0, flags).is_ok() {
-            Some(state.best_hwnd)
-        } else {
-            None
-        }
+        Some(state.best_hwnd)
     }
 }
 

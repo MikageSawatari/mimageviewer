@@ -3183,6 +3183,15 @@ pub(crate) struct NativeVideoModeSwitchPending {
     pub deadline: std::time::Instant,
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) struct DetachedVideoHostSwitchPending {
+    pub target_presentation: ViewerPresentation,
+    pub activate_on_show: bool,
+    pub requested_at: std::time::Instant,
+    pub deadline: std::time::Instant,
+}
+
 /// フレーム末尾で実行する native ファイル D&D の予約。
 ///
 /// egui closure 内から `SHDoDragDrop` を直接呼べない (self 借用衝突・再入) ため、
@@ -4156,6 +4165,18 @@ pub struct App {
     /// 新しい ViewportId で作り直す。
     #[cfg(windows)]
     pub(crate) fs_viewport_presentation: Option<ViewerPresentation>,
+    /// egui detached viewer viewport の top-level HWND。
+    ///
+    /// 動画は別 top-level window を作らず、この HWND の子ウィンドウとして重ねる。
+    /// eframe は child viewport の HWND を公開しないため、viewport の outer rect から
+    /// UI スレッド上の window を列挙して捕捉する。
+    #[cfg(windows)]
+    pub(crate) detached_viewer_host_hwnd: u64,
+    /// F12 で動画を detached へ切り替えるとき、先に egui 側の detached viewer
+    /// viewport を作り、その HWND が捕捉できてから native presenter を子 HWND へ
+    /// 移行するための待機状態。
+    #[cfg(windows)]
+    pub(crate) pending_detached_video_host_switch: Option<DetachedVideoHostSwitchPending>,
     /// in-window 静止画から専用 fullscreen viewport へ切り替える間、
     /// root 側が通常グリッドを描いて背面に露出するのを抑止する期限。
     #[cfg(windows)]
@@ -6036,6 +6057,10 @@ impl App {
             fs_viewport_shown: false,
             #[cfg(windows)]
             fs_viewport_presentation: None,
+            #[cfg(windows)]
+            detached_viewer_host_hwnd: 0,
+            #[cfg(windows)]
+            pending_detached_video_host_switch: None,
             #[cfg(windows)]
             still_fullscreen_viewport_enter_suppress_until: None,
             #[cfg(windows)]
@@ -18095,7 +18120,7 @@ impl App {
                 crate::video::NativeVideoPlacement::FullscreenBorderless
             }
             ViewerPresentation::DetachedWindow => {
-                crate::video::NativeVideoPlacement::DetachedWindow
+                crate::video::NativeVideoPlacement::DetachedViewerChild
             }
         }
     }
@@ -18109,8 +18134,111 @@ impl App {
             crate::video::NativeVideoPlacement::FullscreenBorderless => {
                 ViewerPresentation::Fullscreen
             }
-            crate::video::NativeVideoPlacement::DetachedWindow => {
+            crate::video::NativeVideoPlacement::DetachedViewerChild
+            | crate::video::NativeVideoPlacement::DetachedWindow => {
                 ViewerPresentation::DetachedWindow
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn clear_detached_viewer_host_hwnd(&mut self) {
+        if self.detached_viewer_host_hwnd != 0 {
+            crate::logger::log(format!(
+                "[detached-viewer] clear host hwnd=0x{:x}",
+                self.detached_viewer_host_hwnd
+            ));
+        }
+        self.detached_viewer_host_hwnd = 0;
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_viewer_host_hwnd_alive(&self) -> Option<u64> {
+        let hwnd = self.detached_viewer_host_hwnd;
+        if crate::video::native_window::is_window_alive(hwnd) {
+            Some(hwnd)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_viewer_client_rect_physical(
+        &self,
+    ) -> Option<windows::Win32::Foundation::RECT> {
+        use windows::Win32::Foundation::{HWND, RECT};
+        use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+
+        let hwnd = self.detached_viewer_host_hwnd_alive()?;
+        let mut rect = RECT::default();
+        if unsafe { GetClientRect(HWND(hwnd as *mut _), &mut rect) }.is_err() {
+            return None;
+        }
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        (w > 0 && h > 0).then_some(rect)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_viewer_video_host_ready(&self) -> bool {
+        self.detached_viewer_client_rect_physical().is_some()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn capture_detached_viewer_host_hwnd_from_logical_rect(
+        &mut self,
+        outer_rect: egui::Rect,
+        pixels_per_point: f32,
+    ) {
+        use windows::Win32::Foundation::{HWND, RECT};
+
+        let Some(main_hwnd) = self.main_hwnd else {
+            return;
+        };
+        let scale = pixels_per_point.max(0.5);
+        let expected = RECT {
+            left: (outer_rect.min.x * scale).round() as i32,
+            top: (outer_rect.min.y * scale).round() as i32,
+            right: (outer_rect.max.x * scale).round() as i32,
+            bottom: (outer_rect.max.y * scale).round() as i32,
+        };
+        let Some(hwnd) = crate::dwm_transitions::find_visible_thread_window_matching_rect(
+            HWND(main_hwnd as *mut _),
+            expected,
+        ) else {
+            return;
+        };
+        let hwnd_raw = hwnd.0 as usize as u64;
+        if hwnd_raw != 0 && hwnd_raw != self.detached_viewer_host_hwnd {
+            crate::logger::log(format!(
+                "[detached-viewer] captured host hwnd=0x{hwnd_raw:x} \
+                 rect=({},{})-({},{}) ppp={scale:.2}",
+                expected.left, expected.top, expected.right, expected.bottom
+            ));
+            self.detached_viewer_host_hwnd = hwnd_raw;
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_video_target_for_presentation(
+        &self,
+        presentation: ViewerPresentation,
+    ) -> Option<(
+        crate::video::NativeVideoPlacement,
+        windows::Win32::Foundation::RECT,
+        u64,
+    )> {
+        let placement = Self::viewer_presentation_to_native_video_placement(presentation);
+        match presentation {
+            ViewerPresentation::DetachedWindow => {
+                let owner_hwnd = self.detached_viewer_host_hwnd_alive()?;
+                let rect = self.detached_viewer_client_rect_physical()?;
+                Some((placement, rect, owner_hwnd))
+            }
+            ViewerPresentation::MainWindow | ViewerPresentation::Fullscreen => {
+                let owner_hwnd = self.main_hwnd? as u64;
+                let rect = self.native_video_rect_for_presentation(presentation)?;
+                Some((placement, rect, owner_hwnd))
             }
         }
     }
@@ -21935,31 +22063,41 @@ impl App {
                 #[cfg(windows)]
                 let native_config = {
                     let presentation = self.viewer_presentation;
-                    let placement =
-                        Self::viewer_presentation_to_native_video_placement(presentation);
+                    let target = self.native_video_target_for_presentation(presentation);
+                    if target.is_none()
+                        && matches!(presentation, ViewerPresentation::DetachedWindow)
+                        && self.defer_native_video_open_until_detached_host(
+                            idx,
+                            &vp,
+                            from_grid,
+                            autoplay_override,
+                            ignore_resume,
+                        )
+                    {
+                        return;
+                    }
                     let activate_on_show =
                         !matches!(presentation, ViewerPresentation::DetachedWindow)
                             || self.take_detached_viewer_activate_on_show();
-                    self.native_video_rect_for_presentation(presentation)
-                        .and_then(|rect| {
-                            native_video_presenter_config(
-                                self.main_hwnd,
-                                rect,
-                                placement,
-                                activate_on_show,
-                                vp.file_name()
-                                    .and_then(|name| name.to_str())
-                                    .unwrap_or("video")
-                                    .to_string(),
-                                self.video_perf_overlay_visible,
-                                self.video_tile_mode_active || self.video_tile_reopen_pending,
-                                self.settings.vst3_enabled,
-                                self.checked.contains(&idx),
-                                // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
-                                Some(self.dsp_bridge.editor_hwnds_snapshot()),
-                                self.main_hwnd.unwrap_or(0) as u64,
-                            )
-                        })
+                    target.and_then(|(placement, rect, owner_hwnd)| {
+                        native_video_presenter_config(
+                            owner_hwnd,
+                            rect,
+                            placement,
+                            activate_on_show,
+                            vp.file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("video")
+                                .to_string(),
+                            self.video_perf_overlay_visible,
+                            self.video_tile_mode_active || self.video_tile_reopen_pending,
+                            self.settings.vst3_enabled,
+                            self.checked.contains(&idx),
+                            // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
+                            Some(self.dsp_bridge.editor_hwnds_snapshot()),
+                            self.main_hwnd.unwrap_or(0) as u64,
+                        )
+                    })
                 };
                 #[cfg(windows)]
                 let native_config_missing = native_config.is_none();
@@ -22835,6 +22973,7 @@ impl App {
         // (= フルスクリーン抜けると別動画扱い、stale fs_idx 復活防止)
         #[cfg(windows)]
         {
+            self.pending_detached_video_host_switch = None;
             let fs_idxs: Vec<usize> = self.normalize_ui_states.keys().copied().collect();
             for idx in fs_idxs {
                 self.cleanup_normalize_state_for_fs_idx(idx);
@@ -27268,6 +27407,9 @@ impl App {
         self.settings.save();
         #[cfg(windows)]
         {
+            if !self.settings.detached_viewer_enabled {
+                self.pending_detached_video_host_switch = None;
+            }
             if let Some(idx) = self.fullscreen_idx {
                 let target_presentation = if self.settings.detached_viewer_enabled
                     && self.viewer_item_supports_session(idx)
@@ -30393,7 +30535,7 @@ impl App {
                 #[cfg(windows)]
                 player.set_native_vst3_available(
                     self.settings.vst3_enabled
-                        && !self.native_video_in_window_active
+                        && matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
                         // モード切替の進行中は presenter HWND 再構築中で実モードが
                         // 未確定。VST availability は保守的に false にする (Codex P1)。
                         && self.native_video_mode_switch.is_none(),
@@ -30481,7 +30623,7 @@ impl App {
         // 新 HWND を publish 済みでも `PlacementSwitched` 未処理で実モードが旧いまま
         // のフレームがあるため、その間は owner 同期自体を止める (Codex 再 P1)。
         #[cfg(windows)]
-        if !self.native_video_in_window_active
+        if matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
             && self.native_video_mode_switch.is_none()
             && native_owner_hwnd != 0
             && native_owner_hwnd != self.native_video_owner_synced_hwnd
@@ -30526,6 +30668,8 @@ impl App {
         }
         #[cfg(windows)]
         self.poll_native_video_source_swap_pending(ctx);
+        #[cfg(windows)]
+        self.poll_detached_video_host_switch_pending(ctx);
         #[cfg(windows)]
         self.poll_native_video_open_pending(ctx);
         // Plan B: presenter 無応答で placement 切替 pending が滞留すると VST owner /
@@ -36396,7 +36540,7 @@ fn video_resume_for_open(
 
 #[cfg(windows)]
 fn native_video_presenter_config(
-    main_hwnd: Option<isize>,
+    owner_hwnd: u64,
     rect: windows::Win32::Foundation::RECT,
     placement: crate::video::NativeVideoPlacement,
     activate_on_show: bool,
@@ -36418,14 +36562,14 @@ fn native_video_presenter_config(
         .min(4);
     Some(crate::video::NativeVideoOutputConfig {
         rect,
-        owner_hwnd: main_hwnd.unwrap_or_default() as u64,
+        owner_hwnd,
         fallback_file_name,
         sync_interval,
         perf_overlay_visible,
         initial_tile_overlay,
-        // in-window モードでは VST3 GUI を対象外にする (presenter が WS_CHILD のため
-        // VST editor の owner にすると z-order/focus が壊れる。音声処理は別途継続)。
-        vst3_available: vst3_available && !in_main_window,
+        // child / detached では VST3 GUI を対象外にする。VST editor の owner に
+        // child presenter を指定すると z-order/focus が壊れるため、音声処理だけ継続する。
+        vst3_available: vst3_available && placement.is_fullscreen_borderless(),
         checked,
         editor_hwnds_snapshot,
         main_hwnd_for_raise,

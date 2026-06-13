@@ -256,6 +256,7 @@ struct NativeHoverThumbnailKey {
 pub enum NativeVideoPlacement {
     MainWindowChild,
     FullscreenBorderless,
+    DetachedViewerChild,
     DetachedWindow,
 }
 
@@ -263,6 +264,10 @@ pub enum NativeVideoPlacement {
 impl NativeVideoPlacement {
     pub fn is_main_window_child(&self) -> bool {
         matches!(self, Self::MainWindowChild)
+    }
+
+    pub fn is_child_window(&self) -> bool {
+        matches!(self, Self::MainWindowChild | Self::DetachedViewerChild)
     }
 
     pub fn is_fullscreen_borderless(&self) -> bool {
@@ -273,6 +278,7 @@ impl NativeVideoPlacement {
         match self {
             Self::MainWindowChild => "main-window-child",
             Self::FullscreenBorderless => "fullscreen-borderless",
+            Self::DetachedViewerChild => "detached-viewer-child",
             Self::DetachedWindow => "detached-window",
         }
     }
@@ -546,6 +552,7 @@ enum NativeVideoOutputCommand {
     SwitchPlacement {
         request_id: u64,
         placement: NativeVideoPlacement,
+        owner_hwnd: u64,
         rect: windows::Win32::Foundation::RECT,
         activate_on_show: bool,
     },
@@ -922,6 +929,7 @@ impl NativeVideoOutput {
         &self,
         request_id: u64,
         placement: NativeVideoPlacement,
+        owner_hwnd: u64,
         rect: windows::Win32::Foundation::RECT,
         activate_on_show: bool,
     ) {
@@ -930,6 +938,7 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SwitchPlacement {
                 request_id,
                 placement,
+                owner_hwnd,
                 rect,
                 activate_on_show,
             });
@@ -1525,6 +1534,9 @@ fn native_window_mode_for_placement(
         NativeVideoPlacement::MainWindowChild => {
             crate::video::native_window::NativeVideoWindowMode::Child { rect }
         }
+        NativeVideoPlacement::DetachedViewerChild => {
+            crate::video::native_window::NativeVideoWindowMode::Child { rect }
+        }
         NativeVideoPlacement::FullscreenBorderless => {
             crate::video::native_window::NativeVideoWindowMode::Borderless { rect }
         }
@@ -1538,9 +1550,9 @@ fn native_window_mode_for_placement(
 fn native_window_owner_for_placement(owner_hwnd: u64, placement: NativeVideoPlacement) -> u64 {
     match placement {
         NativeVideoPlacement::DetachedWindow => 0,
-        NativeVideoPlacement::MainWindowChild | NativeVideoPlacement::FullscreenBorderless => {
-            owner_hwnd
-        }
+        NativeVideoPlacement::MainWindowChild
+        | NativeVideoPlacement::DetachedViewerChild
+        | NativeVideoPlacement::FullscreenBorderless => owner_hwnd,
     }
 }
 
@@ -1672,6 +1684,7 @@ fn run_native_video_output(
     //   - `cur_sar`: anamorphic 補正の SAR。`SetVideoSar` は info 到着時に 1 度だけ
     //     送られるので、再構築後は新 presenter へ手動で再適用する必要がある。
     let mut cur_placement = config.placement;
+    let mut cur_owner_hwnd = config.owner_hwnd;
     let mut cur_checked = config.checked;
     let mut cur_vst3_available = config.vst3_available;
     let mut cur_sar: Option<(u32, u32)> = None;
@@ -1690,7 +1703,7 @@ fn run_native_video_output(
         hud_hwnd_out: &Arc<AtomicU64>,
         hud_hwnd: u64,
         config: &NativeVideoOutputConfig,
-        in_window: bool,
+        placement: NativeVideoPlacement,
         width: u32,
         height: u32,
         run_started: Instant,
@@ -1705,15 +1718,16 @@ fn run_native_video_output(
         } else {
             window.show_no_activate()
         };
-        if in_window {
-            // in-window モード: child は show_and_raise が NOACTIVATE で表示するので
+        if placement.is_child_window() {
+            // Child presenter は show_and_raise が NOACTIVATE で表示するので
             // フォーカスを持たない。キーボード入力は presenter child の wndproc が
-            // 処理する (fullscreen の presenter HWND と同じ経路) ため、明示的に
-            // フォーカスを当てる。
+            // 処理するため、明示的にフォーカスを当てる。
             unsafe {
                 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
                 let _ = SetFocus(Some(window.hwnd()));
             }
+        }
+        if placement.is_main_window_child() {
             // main window のリサイズサブクラスがこの child を同期リサイズできるよう
             // child HWND を登録する。
             crate::video::native_window::set_in_window_video_child(window.hwnd().0 as u64);
@@ -1812,7 +1826,7 @@ fn run_native_video_output(
         &hud_hwnd_out,
         presenter.hud_hwnd(),
         &config,
-        cur_placement.is_main_window_child(),
+        cur_placement,
         width,
         height,
         run_started,
@@ -2321,11 +2335,11 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SwitchPlacement {
                     request_id,
                     placement,
+                    owner_hwnd,
                     rect: new_rect,
                     activate_on_show,
                 } => {
-                    let in_window = placement.is_main_window_child();
-                    if placement == cur_placement {
+                    if placement == cur_placement && owner_hwnd == cur_owner_hwnd {
                         // 同一モードへの切替は no-op。App が pending を解除できるよう
                         // 成功イベントだけは返す (Codex #6 + request_id プロトコル)。
                         let _ = ui_event_tx.send((
@@ -2344,8 +2358,7 @@ fn run_native_video_output(
                                 crate::video::native_window::NativeVideoWindowConfig {
                                     mode: new_mode,
                                     owner_hwnd: native_window_owner_for_placement(
-                                        config.owner_hwnd,
-                                        placement,
+                                        owner_hwnd, placement,
                                     ),
                                     initially_visible: false,
                                     activate_on_show,
@@ -2511,11 +2524,13 @@ fn run_native_video_output(
                                         } else {
                                             window.show_no_activate()
                                         };
-                                        if in_window {
+                                        if placement.is_child_window() {
                                             unsafe {
                                                 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
                                                 let _ = SetFocus(Some(window.hwnd()));
                                             }
+                                        }
+                                        if placement.is_main_window_child() {
                                             crate::video::native_window::set_in_window_video_child(
                                                 window.hwnd().0 as u64,
                                             );
@@ -2546,6 +2561,7 @@ fn run_native_video_output(
                                             entry.1 = 0;
                                         }
                                         cur_placement = placement;
+                                        cur_owner_hwnd = owner_hwnd;
                                         last_parent_client_size = (new_width, new_height);
                                         // 旧ウィンドウ由来の stale な native event /
                                         // HUD raise / cursor polling 状態を破棄する
@@ -2610,10 +2626,10 @@ fn run_native_video_output(
         // 監視する。**drain の直前**に置くことで、SetWindowPos が同期発火させる
         // WM_WINDOWPOSCHANGED → GeometryChanged を同じループ反復で drain・処理でき、
         // resize 追従の 1 反復ぶんの遅延を無くす (maximize の「1 つ前」対策)。
-        if cur_placement.is_main_window_child() {
+        if cur_placement.is_child_window() {
             last_parent_client_size = reflow_child_to_parent_client(
                 window.hwnd(),
-                config.owner_hwnd,
+                cur_owner_hwnd,
                 last_parent_client_size,
             );
         }
@@ -3439,7 +3455,7 @@ fn run_native_video_output(
                             &hud_hwnd_out,
                             presenter.hud_hwnd(),
                             &config,
-                            cur_placement.is_main_window_child(),
+                            cur_placement,
                             width,
                             height,
                             run_started,
@@ -5046,11 +5062,12 @@ impl VideoPlayer {
         &self,
         request_id: u64,
         placement: NativeVideoPlacement,
+        owner_hwnd: u64,
         rect: windows::Win32::Foundation::RECT,
         activate_on_show: bool,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.switch_placement(request_id, placement, rect, activate_on_show);
+            output.switch_placement(request_id, placement, owner_hwnd, rect, activate_on_show);
         }
     }
 

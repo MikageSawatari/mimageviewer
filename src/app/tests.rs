@@ -11764,6 +11764,20 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn detached_viewer_video_uses_child_native_placement() {
+        assert_eq!(
+            App::viewer_presentation_to_native_video_placement(ViewerPresentation::DetachedWindow),
+            crate::video::NativeVideoPlacement::DetachedViewerChild
+        );
+        assert_eq!(
+            App::native_video_placement_to_viewer_presentation(
+                crate::video::NativeVideoPlacement::DetachedViewerChild
+            ),
+            ViewerPresentation::DetachedWindow
+        );
+    }
+
+    #[test]
     fn detached_video_does_not_activate_main_backdrop() {
         let mut app = setup_app();
         let idx = push_video(&mut app, r"C:\clips\movie.mp4");

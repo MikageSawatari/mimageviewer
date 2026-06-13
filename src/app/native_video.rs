@@ -85,6 +85,7 @@ pub(crate) struct NativeVideoOpenPending {
     pub(crate) from_grid: bool,
     pub(crate) autoplay_override: Option<bool>,
     pub(crate) ignore_resume: bool,
+    pub(crate) wait_for_detached_host: bool,
     pub(crate) requested_at: std::time::Instant,
     pub(crate) deadline: std::time::Instant,
     pub(crate) input_seq: u64,
@@ -324,6 +325,7 @@ impl App {
             from_grid,
             autoplay_override,
             ignore_resume,
+            wait_for_detached_host: false,
             requested_at: now,
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: self.input_seq,
@@ -354,6 +356,33 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(super) fn defer_native_video_open_until_detached_host(
+        &mut self,
+        idx: usize,
+        path: &std::path::Path,
+        from_grid: bool,
+        autoplay_override: Option<bool>,
+        ignore_resume: bool,
+    ) -> bool {
+        let now = std::time::Instant::now();
+        self.native_video_open_pending = Some(NativeVideoOpenPending {
+            idx,
+            path: path.to_path_buf(),
+            from_grid,
+            autoplay_override,
+            ignore_resume,
+            wait_for_detached_host: true,
+            requested_at: now,
+            deadline: now + std::time::Duration::from_secs(10),
+            input_seq: self.input_seq,
+        });
+        crate::logger::log(format!(
+            "[native-video] defer regular open until detached host is ready: idx={idx}"
+        ));
+        true
+    }
+
+    #[cfg(windows)]
     pub(super) fn poll_native_video_open_pending(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.native_video_open_pending.as_ref() else {
             return;
@@ -363,6 +392,7 @@ impl App {
         let from_grid = pending.from_grid;
         let autoplay_override = pending.autoplay_override;
         let ignore_resume = pending.ignore_resume;
+        let wait_for_detached_host = pending.wait_for_detached_host;
         let requested_at = pending.requested_at;
         let deadline = pending.deadline;
         let input_seq = pending.input_seq;
@@ -372,6 +402,29 @@ impl App {
             || self.fs_cache.contains_key(&idx)
         {
             self.native_video_open_pending = None;
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        if wait_for_detached_host && !self.detached_viewer_video_host_ready() {
+            if now >= deadline {
+                self.native_video_open_pending = None;
+                crate::logger::log(format!(
+                    "[native-video] detached host wait timeout: idx={idx} waited_ms={:.1}",
+                    requested_at.elapsed().as_secs_f64() * 1000.0
+                ));
+                self.show_feedback_toast(
+                    "別ウィンドウの準備に失敗したため動画を開けませんでした".to_string(),
+                );
+                self.close_fullscreen();
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(std::time::Duration::from_millis(16)),
+                );
+            }
             return;
         }
 
@@ -411,7 +464,6 @@ impl App {
             return;
         }
 
-        let now = std::time::Instant::now();
         if now >= deadline {
             self.native_video_open_pending = None;
             crate::logger::log(format!(
@@ -445,6 +497,83 @@ impl App {
                 deadline
                     .saturating_duration_since(now)
                     .min(std::time::Duration::from_millis(100)),
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_video_host_switch_pending(&self) -> bool {
+        self.pending_detached_video_host_switch.is_some()
+    }
+
+    #[cfg(windows)]
+    fn defer_native_video_switch_until_detached_host(
+        &mut self,
+        target_presentation: ViewerPresentation,
+        activate_on_show: bool,
+    ) {
+        let now = std::time::Instant::now();
+        self.pending_detached_video_host_switch = Some(super::DetachedVideoHostSwitchPending {
+            target_presentation,
+            activate_on_show,
+            requested_at: now,
+            deadline: now + std::time::Duration::from_secs(5),
+        });
+        crate::logger::log(format!(
+            "[native-video] defer placement switch until detached host is ready: \
+             target={target_presentation:?} activate={activate_on_show}"
+        ));
+    }
+
+    #[cfg(windows)]
+    pub(super) fn poll_detached_video_host_switch_pending(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_detached_video_host_switch else {
+            return;
+        };
+        let Some(idx) = self.fullscreen_idx else {
+            self.pending_detached_video_host_switch = None;
+            return;
+        };
+        if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+            self.pending_detached_video_host_switch = None;
+            return;
+        }
+        if !matches!(
+            pending.target_presentation,
+            ViewerPresentation::DetachedWindow
+        ) {
+            self.pending_detached_video_host_switch = None;
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        if self.detached_viewer_video_host_ready() {
+            self.pending_detached_video_host_switch = None;
+            crate::logger::log(format!(
+                "[native-video] resume deferred detached placement switch after {:.1}ms",
+                pending.requested_at.elapsed().as_secs_f64() * 1000.0
+            ));
+            self.switch_native_video_viewer_presentation(
+                pending.target_presentation,
+                pending.activate_on_show,
+            );
+            ctx.request_repaint();
+        } else if now >= pending.deadline {
+            self.pending_detached_video_host_switch = None;
+            crate::logger::log(format!(
+                "[native-video] detached placement switch host wait timed out after {:.1}ms",
+                pending.requested_at.elapsed().as_secs_f64() * 1000.0
+            ));
+            self.show_feedback_toast(
+                "別ウィンドウの準備に失敗したため動画表示を切り替えられませんでした".to_string(),
+            );
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(
+                pending
+                    .deadline
+                    .saturating_duration_since(now)
+                    .min(std::time::Duration::from_millis(16)),
             );
         }
     }
@@ -1507,6 +1636,9 @@ impl App {
         if self.video_tile_mode_active {
             return;
         }
+        if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
+            self.pending_detached_video_host_switch = None;
+        }
         // 進行中のトグルがあれば無視する (連打防止 = Codex P2/P3)。deadline 超過は
         // presenter 無応答時の保険 — 過ぎていれば古い pending を捨てて続行する。
         if let Some(pending) = self.native_video_mode_switch {
@@ -1535,13 +1667,21 @@ impl App {
         {
             self.toggle_native_video_vst3_gui();
         }
-        let Some(rect) = self.native_video_rect_for_presentation(target_presentation) else {
+        let Some((placement, rect, owner_hwnd)) =
+            self.native_video_target_for_presentation(target_presentation)
+        else {
+            if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
+                self.defer_native_video_switch_until_detached_host(
+                    target_presentation,
+                    activate_on_show,
+                );
+                return;
+            }
             crate::logger::log(format!(
                 "[native-video] placement switch aborted: rect compute failed target={target_presentation:?}"
             ));
             return;
         };
-        let placement = Self::viewer_presentation_to_native_video_placement(target_presentation);
         // 永続設定は presenter 確定 (`apply_video_presentation_switched`) まで触らない
         // (review #4 対応)。途中で crash / Alt+F4 で落ちても、未確定モードが
         // 次回起動時に持ち越されないようにする。実モード
@@ -1550,7 +1690,13 @@ impl App {
         let request_id = self.native_video_mode_switch_seq;
         // presenter スレッドへライブ切替を依頼 (decoder/audio/clock は保持)。
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
-            player.switch_native_placement(request_id, placement, rect, activate_on_show);
+            player.switch_native_placement(
+                request_id,
+                placement,
+                owner_hwnd,
+                rect,
+                activate_on_show,
+            );
             self.native_video_mode_switch = Some(super::NativeVideoModeSwitchPending {
                 request_id,
                 target_presentation,
@@ -2005,7 +2151,9 @@ impl App {
                 h,
                 maximized,
             } => {
-                if self.viewer_session_is_detached() {
+                if self.viewer_session_is_detached()
+                    && self.detached_viewer_host_hwnd_alive().is_none()
+                {
                     self.save_detached_viewer_placement_from_native_geometry(x, y, w, h, maximized);
                 }
             }
@@ -3478,7 +3626,7 @@ impl App {
         // in-window モードでは VST3 GUI を対象外にする (presenter が WS_CHILD のため)。
         // モード切替の進行中も実モード未確定なので保守的に false にする (Codex 再 P1)。
         let vst3_ok = self.settings.vst3_enabled
-            && !self.native_video_in_window_active
+            && matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
             && self.native_video_mode_switch.is_none();
         player.set_native_vst3_available(vst3_ok);
         player.set_native_video_compact(
@@ -3493,7 +3641,8 @@ impl App {
         };
         // in-window モードでは VST3 を対象外にするため panel を出さない (Codex P2)。
         // モード切替の進行中も実モード未確定なので panel は出さない (Codex 再 P1)。
-        let panel = if self.native_video_in_window_active || self.native_video_mode_switch.is_some()
+        let panel = if !matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
+            || self.native_video_mode_switch.is_some()
         {
             None
         } else {

@@ -215,9 +215,11 @@ v1.4.0 後の別ウィンドウ対応では、同じ viewer session をどこへ
 `effective_viewer_presentation_for_open` で実表示先を決めて `App.viewer_presentation`
 へ保持する。静止画 / ZIP画像 / PDFページ / 動画は `DetachedWindow` が有効で、
 `render_fullscreen_viewport` の描画本体を装飾付き・taskbar 表示ありの通常 viewport へ
-出す。動画は `NativeVideoPlacement::DetachedWindow` と `NativeVideoWindowMode::WindowedAt`
-で owner なしの通常 top-level HWND を作り、DComp presenter / decoder / audio clock を保持したまま
-`SwitchPlacement` で MainWindow / Fullscreen / Detached を切り替える。
+出す。動画もこの egui detached viewport を安定した host として使い、
+`NativeVideoPlacement::DetachedViewerChild` と `NativeVideoWindowMode::Child` で
+host HWND のクライアント領域へ native presenter を重ねる。DComp presenter /
+decoder / audio clock は保持したまま `SwitchPlacement` で MainWindow / Fullscreen /
+Detached を切り替える。
 
 `prepare_viewer_presentation_open` / `prepare_viewer_presentation_close` は、main HWND
 cloak、native 動画の DWM chrome、foreground reclaim など fullscreen takeover 前提の
@@ -258,8 +260,8 @@ items rebuild 後に、同じ idx が別項目を指しても再同期できる�
 
 メイン一覧で `Enter` / 明示 open した項目が、開いている detached session の stamp と
 同一なら、`open_fullscreen` を再実行せず前面化要求だけを出す。静止画 detached viewport
-では `Minimized(false)` / `Visible(true)` / `Focus` を送り、動画 detached presenter では
-presenter raise 要求へ寄せる。同じ raw idx でも item key / generation が変わっている場合は、
+では `Minimized(false)` / `Visible(true)` / `Focus` を送り、動画 child presenter では
+host 内で presenter raise 要求へ寄せる。同じ raw idx でも item key / generation が変わっている場合は、
 通常どおり再オープンして表示状態を更新する。
 
 detached session で見開き 2 ページ表示中は、メイン一覧の通常カーソルを現在ページに置き、

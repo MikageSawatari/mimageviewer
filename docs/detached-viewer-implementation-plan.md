@@ -104,12 +104,13 @@ struct ViewerSession {
 `items` rebuild をまたぐ可能性がある場合は `last_viewer_sync_stamp = None` にするか、新旧の `ViewerItemKey` を比較して必ず再同期する。
 
 `viewer_session_visible` のような独立 bool は、Phase 1 では原則として持たない。
-移行都合で一時的に持つ場合も `viewer_session_visible == fullscreen_idx.is_some()` を不変条件とし、host swap 中も helper 以外から更新しない。
+移行都合で一時的に持つ場合も `viewer_session_visible == fullscreen_idx.is_some()` を不変条件とし、画像/動画切替中も helper 以外から更新しない。
 同様に、`viewer_sync_origin` は `last_viewer_sync_stamp` と責務が重複するため初期設計では追加しない。
 
 `DetachedWindowPlacement` は Win32 の `WINDOWPLACEMENT` 相当の restore rect と maximized flag を保存する。
 最大化中のウィンドウ矩形をそのまま通常 rect として保存しない。
-静止画 egui viewport と native video window の両方で、可能な限り Win32 HWND から placement を取得・復元し、複数 DPI モニターで論理座標の丸め誤差を蓄積させない。
+detached egui viewport を placement の正本とし、native video child の client 座標は保存しない。
+複数 DPI モニターでは viewport 側の logical outer/inner rect から restore rect を更新し、丸め誤差を蓄積させない。
 
 ## 4. 内部設計
 
@@ -176,10 +177,13 @@ detached ではこれらが逆効果になるため、detached viewport を配�
 
 ### 4.4 動画 detached host
 
-動画は native presenter を使うため、静止画の egui viewport と同じ HWND には載せない可能性が高い。
-画面上は 1 つの「別ウィンドウビューア」として扱い、内部では media kind に応じて host を差し替える。
+動画は native presenter を使うが、detached では動画専用 top-level window を作らない。
+静止画 / ZIP画像 / PDFページと同じ egui detached viewport を安定した host とし、動画は
+その client rect 全体へ `WS_CHILD` presenter HWND を重ねる。これにより画像 ↔ 動画の
+切替で top-level window が消えて再表示される経路をなくし、DWM の表示アニメーションや
+保存 rect drift を根本的に抑える。
 
-初期実装案:
+実装方針:
 
 - `NativeVideoPlacement` を導入する。
 
@@ -187,32 +191,38 @@ detached ではこれらが逆効果になるため、detached viewport を配�
 enum NativeVideoPlacement {
     MainWindowChild,
     FullscreenBorderless,
-    DetachedWindow { rect: WindowRect },
+    DetachedViewerChild,
+    DetachedWindow, // 旧 top-level detached 用。通常経路では使わない。
 }
 ```
 
 - `native_video_presenter_config(..., in_window: bool)` を `NativeVideoPlacement` 受け取りに変更する。
 - 旧来の in-window / fullscreen 2 状態だけを扱う bool command / bool event は、detached 実装では drift の原因になる。正本は `NativeVideoPlacement` / `ViewerPresentation` に統一し、cloak / foreground / settings / presenter rebuild の判断を enum へ寄せる。
-- `NativeVideoWindowMode` は既に `Windowed` / `Borderless` / `Child` を持つ。detached は既存 `Windowed` を「owner なし + 保存 rect 指定可」に拡張して使うか、新しい `Detached` variant を足すかを Phase 1 で決める。いずれの場合も App 側の正本は `NativeVideoPlacement` に統一する。
+- `NativeVideoWindowMode` は既に `Windowed` / `Borderless` / `Child` を持つ。detached 動画は
+  `Child { rect }` を使い、owner HWND には egui detached viewport の HWND を渡す。
+- eframe は child viewport HWND を公開しないため、detached viewport の `outer_rect` と
+  `pixels_per_point` から期待物理 rect を作り、UI thread の top-level windows を
+  `find_visible_thread_window_matching_rect` で列挙して host HWND を捕捉する。
+- host HWND が未取得の間は、動画 open / F12 placement switch を pending に積んで次フレーム以降に再開する。
+  ここで動画用 top-level HWND にフォールバックすると、画像 ↔ 動画切替の flicker とサイズ変化が再発するため避ける。
 - detached 動画では:
-  - owner HWND は付けない。
+  - owner HWND は detached egui viewport。
   - main HWND は cloak しない。
   - fullscreen backdrop は出さない。
   - `SyncFromMainSelection` / `HostSwap` で作成・差し替えする場合は `ShowWindow(SW_SHOWNOACTIVATE)` 相当を使い、foreground reclaim / raise を行わない。
   - F11 は無効。
   - `Esc` / `Enter` / 右クリック / `×` は session close。
-  - `GeometryChanged` を使って位置・サイズを保存する。
+  - 位置・サイズ保存は egui detached viewport の `outer_rect` / `inner_rect` を正本にする。native child の `GeometryChanged` は client 座標なので保存に使わない。
   - HUD overlay は topmost fullscreen 前提を避ける。detached は in-window と同じく fullscreen 用 HUD overlay HWND を使わず、presenter DComp tree 側の overlay 経路を使う。
-  - decorated window の `WM_CLOSE` / `Alt+F4` / taskbar close を App 側へ通知する output event を追加し、`close_viewer_session` へ接続する。現状の native window は `WM_CLOSE` で `DestroyWindow` するだけなので、この event path が無いと stale `fullscreen_idx` / stale presenter HWND が残る。
+  - `×` / `Alt+F4` / taskbar close は egui detached viewport の close request として App 側へ届き、`close_viewer_session` へ接続する。native child は session 終了時に `fs_cache` drop で破棄する。
 - `toggle_video_window_mode` の Plan B を拡張し、bool command ではなく `SwitchPlacement { request_id, placement, ... }` 相当にする。
   - decoder / audio / clock / source は維持する。
   - 切替完了通知は `PlacementSwitched` に統一する。
   - request id と timeout による stale event 防御は維持する。
 
-画像 detached viewport と動画 native presenter は物理 HWND が異なりうる。
-画像 ↔ 動画の切替時は、同じ保存 rect を使って差し替え、ユーザーには同じ別ウィンドウセッションの表示対象が変わったように見せる。
-host swap では target 側の作成・初回描画準備ができてから source 側を隠す順序を優先し、真っ黒な 1 フレームやウィンドウ消失感を抑える。
-ただしこの swap がメイン一覧からの同期で発生した場合は、target 作成時も no-activate を維持する。
+画像 detached viewport と動画 native presenter は、top-level host を共有する。
+画像 → 動画では既存 host を維持して動画 child を重ね、動画 → 画像では native child を破棄して
+同じ host に egui 描画を戻す。保存 rect は常に detached egui viewport 側だけが更新する。
 
 ## 5. 同期ルール
 
@@ -285,13 +295,13 @@ host swap では target 側の作成・初回描画準備ができてから sour
 
 ## 7. ウィンドウとフォーカス
 
-- detached window は owner を持たない top-level window とする。
+- detached window は owner を持たない top-level window とする。動画 presenter はその child HWND として作る。
 - open / F12 switch のような明示操作では show/raise してよい。
-- メイン一覧の選択同期だけでは focus / foreground を奪わない。既存 window を raise しないだけでなく、同期に伴う画像 ↔ 動画 host の新規作成でも no-activate で表示する。
+- メイン一覧の選択同期だけでは focus / foreground を奪わない。既存 window を raise しないだけでなく、同期に伴う画像 ↔ 動画切替でも no-activate で表示する。
 - detached window が最小化中なら、選択同期だけで復元しない。
 - detached window 側を操作したときは通常の Windows フォーカス規則に従う。
 - メインウィンドウ最小化とは連動しない。
-- アプリ終了時は全 viewer session を閉じる。detached window は owner-less なので、native video window も含めて exit path (`on_exit` / Drop 相当) で明示的に destroy し、presenter thread を join する。
+- アプリ終了時は全 viewer session を閉じる。detached window は owner-less なので、native video child も含めて exit path (`on_exit` / Drop 相当) で明示的に destroy し、presenter thread を join する。
 - close-to-tray 設定でメインを閉じてもプロセスが継続する場合は、detached window と動画再生も継続する。
 - close-to-tray では、detached session が開いている場合に限り `release_media_session_for_tray()` が `close_fullscreen()` を呼ばないようにする。
 - close-to-tray 中も detached 表示に必要な UI heartbeat / event pump を止めない。静止画 detached は egui viewport を `App::update` から描くため、heartbeat suspend のままでは表示が凍る。native 動画も presenter event / geometry save / source swap completion を App 側が pump できなくなる。
@@ -312,7 +322,7 @@ host swap では target 側の作成・初回描画準備ができてから sour
 - `docs/display-pipeline.md`
   - `ViewerPresentation` と detached viewport を追加する。
 - `docs/video-architecture.md`
-  - `NativeVideoPlacement::DetachedWindow` と HUD overlay 方針を追加する。
+  - `NativeVideoPlacement::DetachedViewerChild` と HUD overlay 方針を追加する。
 - `docs/async-architecture.md`
   - `SwitchPlacement`、placement pending、most-recent-wins、native `WM_CLOSE` output event を追加する。
 - `docs/ui-responsiveness.md`
@@ -345,13 +355,13 @@ host swap では target 側の作成・初回描画準備ができてから sour
 - `settings.detached_viewer_enabled`、`KeyAction::ToggleDetachedViewerMode`、F12 既定割り当て、grid / 静止画 viewer / native 動画 viewer での F12 dispatch は実装済み。
 - `ViewerPresentation::{MainWindow, Fullscreen, DetachedWindow}` と `App.viewer_presentation` は導入済み。`requested_viewer_presentation_for_open` は `detached_viewer_enabled` を見て `DetachedWindow` 要求を返す。
 - 静止画 / ZIP画像 / PDFページ / 動画はいずれも `effective_viewer_presentation_for_open` で `DetachedWindow` を実表示先として採用する。
-- native 動画は `NativeVideoPlacement::{MainWindowChild, FullscreenBorderless, DetachedWindow}` を正本にし、旧 bool command / bool event は削除済み。
+- native 動画は `NativeVideoPlacement::{MainWindowChild, FullscreenBorderless, DetachedViewerChild}` を正本にし、旧 bool command / bool event は削除済み。`DetachedWindow` は旧 top-level detached 用として残すが通常経路では使わない。
 
 ### Phase 2: presentation-neutral 化 + 静止画 detached + tray 対応
 
 - `open_fullscreen` / `close_fullscreen` の presentation-specific block を先に切り出す。
 - main HWND cloak、DWM chrome、foreground reclaim、cursor hide、fullscreen backdrop を `ViewerPresentation` で分岐させる。
-- `ViewerOpenReason` ごとに activation 可否を分岐し、同期由来の detached window 作成・host swap は no-activate にする。
+- `ViewerOpenReason` ごとに activation 可否を分岐し、同期由来の detached window 作成・画像/動画切替は no-activate にする。
 - close-to-tray 中に detached session を維持するため、`release_media_session_for_tray`、UI heartbeat、`release_gpu_resources` の扱いを変更する。
 - 静止画・ZIP画像・PDFページを detached viewport に描画する。
 - close / Esc / Enter / right-click で session close。
@@ -368,33 +378,33 @@ host swap では target 側の作成・初回描画準備ができてから sour
 - detached session が開いている間、`App::update` 終端で最終 `selected` を見て、静止画 / ZIP画像 / PDFページ / 動画なら viewer を追従させる。同期済み判定は `ViewerSyncStamp { idx, item_key, items_generation }` で行い、bare idx のみでは判定しない。
 - detached session が閉じている場合は、メイン一覧のカーソル移動だけでは再表示しない。
 - detached session が同じ `ViewerSyncStamp` の項目を既に表示中の場合、メイン一覧の `Enter` は `open_fullscreen` を再実行せず、静止画 detached viewport / 動画 native presenter の前面化要求だけを行う。
-- 表示中セッションの F12 host migration は実装済み。静止画は egui viewport の表示先を切り替え、動画は `SwitchPlacement` で decoder / audio / clock を保持したまま native HWND を作り直す。
-- 同期由来の detached open / host swap は no-activate で表示し、通常の open / F12 操作では必要に応じて前面化する。
+- 表示中セッションの F12 host migration は実装済み。静止画は egui viewport の表示先を切り替え、動画は `SwitchPlacement` で decoder / audio / clock を保持したまま native child HWND を作り直す。
+- 同期由来の detached open / 画像/動画切替は no-activate で表示し、通常の open / F12 操作では必要に応じて前面化する。
 - detached window placement は `detached_viewer_window_placement` に保存する。意味は「outer position + inner/client size + maximized flag」。最大化中は restore placement を上書きせず、`maximized` だけを更新する。
 - close-to-tray 中に detached session が開いている場合は、`release_media_session_for_tray` で `close_fullscreen()` を呼ばず、UI heartbeat と active viewer cache を維持する。通常 fullscreen / 通常動画は従来通り tray hide 時に閉じる。
 - 静止画/PDF detached と fullscreen の egui viewport を閉じる/作り直す経路では、メイン viewport の font atlas resync を one-shot 予約する。複数 viewport 後に日本語 glyph の部分更新だけが古い高さ 32 の renderer texture へ届くと wgpu validation panic になるため、メイン UI 描画前に 1 フレーム送って `configure_fonts_for_texture_resync` で font atlas full upload を強制する。
 
 ### Phase 3: 動画 detached
 
-- detached native window を通常 top-level window として作る。
+- detached native window は作らず、egui detached viewport を host として捕捉し、native presenter を child HWND として重ねる。
 - `SwitchPlacement` で再生維持したまま MainWindow / Fullscreen / Detached を切り替える。
-- decorated detached native window の `WM_CLOSE` / `Alt+F4` / taskbar close を App へ通知する event path を追加する。
+- egui detached viewport の `WM_CLOSE` / `Alt+F4` / taskbar close を App へ通知する event path を追加する。
 - detached 動画で `Enter` close を使うため、Enter の native key 転送または native wndproc close 処理を追加する。
 - detached 動画で close / Esc / Enter / right-click を session close に接続する。
 - 動画前後移動・連続再生・deferred nav のメイン同期を確実にする。
-- アプリ終了 path で owner-less detached native video window を明示 destroy し、presenter thread を join する。
+- アプリ終了 path で detached viewer host と native video child を明示 destroy し、presenter thread を join する。
 
 進捗メモ:
 
-- `NativeVideoWindowMode::WindowedAt`、`NativeVideoPlacement::DetachedWindow`、`SwitchPlacement` / `PlacementSwitched` / `PlacementSwitchFailed` を追加済み。
-- detached 動画 window は owner なしの通常 top-level window として作成し、F11 は detached 中 no-op、F12 は再生を維持した host migration として扱う。
-- detached 動画 window の `WM_CLOSE` は `NativeVideoWindowEvent::CloseRequested` として App へ転送し、`close_fullscreen()` で session 終了・動画停止に寄せる。detached 動画の Esc / Enter も同じ close 経路に入る。
+- `NativeVideoPlacement::DetachedViewerChild`、`SwitchPlacement` / `PlacementSwitched` / `PlacementSwitchFailed` を追加済み。
+- detached 動画は egui detached viewport の child HWND として作成し、F11 は detached 中 no-op、F12 は再生を維持した host migration として扱う。
+- detached viewer window の `WM_CLOSE` は egui viewport close request として App へ届き、`close_fullscreen()` で session 終了・動画停止に寄せる。detached 動画の Esc / Enter も同じ close 経路に入る。
 - detached 動画では fullscreen 専用 HUD overlay HWND / fullscreen backdrop / VST owner 同期を使わず、通常 presenter HWND 側の overlay path を使う。
 - 残りは Windows 実機での複数ディスプレイ / DPI 差 / close-to-tray / 動画連続再生の確認。
 
 ### Phase 4: 画像・動画横断と見開き
 
-- 画像 ↔ 動画の host 差し替えを同一 geometry で行う。
+- 画像 ↔ 動画を同一 detached host 内で切り替え、動画 child の作成/破棄だけで済ませる。
 - `secondary_idx` とサブカーソル描画を追加する。
 - フォルダ移動・検索結果・ZIP/PDF 仮想フォルダを通した同期を確認する。
 
@@ -414,9 +424,9 @@ host swap では target 側の作成・初回描画準備ができてから sour
 - detached mode ON、session open の状態でカーソル移動すると viewer が追従する。
 - 選択同期は `App::update` 終端の最終 `selected` だけを見て動き、非表示項目やコンテナ項目では viewer を開き直さない。
 - detached session open 中に folder / archive / search result などで `items` rebuild が起き、旧 selected と新 selected の idx が同じでも、`ViewerItemKey` / generation 差で viewer が新しい項目へ再同期する。
-- メイン一覧の同期で画像 ↔ 動画 host swap が発生しても、detached window がメインウィンドウや他アプリから foreground を奪わない。
+- メイン一覧の同期で画像 ↔ 動画切替が発生しても、detached window がメインウィンドウや他アプリから foreground を奪わない。
 - detached viewer の `×` / `Esc` / `Enter` / 右クリックが session close と動画停止になる。
-- decorated detached 動画ウィンドウの `×` / `Alt+F4` / taskbar close が App 側 `close_viewer_session` へ届き、stale `fullscreen_idx` / stale presenter HWND が残らない。
+- detached viewer window の `×` / `Alt+F4` / taskbar close が App 側 `close_viewer_session` へ届き、stale `fullscreen_idx` / stale presenter HWND が残らない。
 - `×` 後も detached mode は維持され、次の open で window が再表示される。
 - 動画再生中に F12 を押しても再生位置・再生状態が維持される。
 - detached 中の F11 が何もしない。
@@ -426,7 +436,7 @@ host swap では target 側の作成・初回描画準備ができてから sour
 - close-to-tray 設定でメインを閉じても detached 静止画 viewport が凍らず、detached 動画再生と presenter event pump が続く。
 - close-to-tray 中に detached active `fs_cache` が破棄されない。
 - アプリ終了では detached window も終了する。
-- アプリ終了 path で owner-less native video window が明示 destroy され、presenter thread が残らない。
+- アプリ終了 path で detached viewer host / native video child が明示 destroy され、presenter thread が残らない。
 - 保存 placement が画面外なら補正される。
 - 最大化中に閉じた detached window を再表示した時、restore rect と maximized flag が分離して復元され、最大化サイズの通常ウィンドウにならない。
 - 画像 ↔ 動画切替で window 位置・サイズが大きく飛ばない。
@@ -441,21 +451,21 @@ host swap では target 側の作成・初回描画準備ができてから sour
 - P1: `open_fullscreen` / `close_fullscreen` は fullscreen takeover 処理を含むため、detached viewport 配線前に presentation-specific block を切り出す。
 - P1: F12 は static VK whitelist 追加だけでなく、App 側 native-video key handler の dispatch branch が必要。
 - P1: `KeyAction::context()` は単一 context なので、F12 は `Global` action として定義し、各 handler で明示 consume する。
-- P1: decorated detached 動画 window の `WM_CLOSE` を App へ返す event path が必要。
+- P1: detached viewer host の `WM_CLOSE` を App へ返し、動画 child を含めて session close へ寄せる event path が必要。
 - P1: main → viewer 同期は `App::update` 終端の単一 choke point に置く。
 - P2: detached 動画 HUD は fullscreen 用 topmost HUD HWND を避け、in-window と同じ DComp overlay path を使う。
 - P2: detached 動画で Enter close を採用するなら Enter の native key 転送も必要。
-- P2: image viewport と native video HWND の host swap には 1 フレーム程度の gap がありうる。必要なら target 表示準備後に source を隠す順序を検討する。
+- P2: image viewport と native video child の切替では、host を維持し、動画 child の作成/破棄だけを行う。host が未捕捉なら open / placement switch を保留する。
 - P2: rect 復元は既存 monitor helper を拡張し、画面外 clamp を実装する。
 
 再レビューで出た実装前固定項目も反映済み。
 
 - P1-A: `last_viewer_synced_selected: Option<usize>` のような bare idx guard では、`items` rebuild 後に同じ idx が別項目を指すケースを見逃す。`ViewerItemKey` / `ViewerSyncStamp` を使うか、rebuild 経路で stamp を無効化する。
-- P1-B: 同期由来の画像 ↔ 動画 host swap では、新規 top-level window 作成そのものが focus を奪う可能性がある。`ViewerOpenReason` に activation 可否を持たせ、egui viewport / native video window とも no-activate 作成を使う。
+- P1-B: 同期由来の画像 ↔ 動画切替では、既存 detached host を維持し、native video child の show / placement switch は no-activate 作成を使う。
 - P2: `viewer_sync_origin` は `ViewerSyncStamp` と責務が重複するため、初期設計では追加しない。
 - P2: `viewer_session_visible` は `fullscreen_idx.is_some()` と一致する不変条件にし、独立状態として drift させない。
 - P2: detached geometry は最大化 rect と restore rect を分け、Win32 `WINDOWPLACEMENT` 相当で保存・復元する。
-- P2: owner-less detached window はアプリ終了時に明示 destroy / presenter thread join が必要。
+- P2: detached viewer host / native video child はアプリ終了時に明示 destroy / presenter thread join が必要。
 - P2: 既存の静止画 F11 は `ViewerPresentation::{MainWindow, Fullscreen}` の遷移として扱い、detached では F11 を無効にする。
 
 更新後に再レビューする場合の依頼文:
@@ -463,7 +473,7 @@ host swap では target 側の作成・初回描画準備ができてから sour
 ```
 docs/detached-viewer-implementation-plan.md の更新後レビューをお願いします。
 
-初回レビューで指摘された close-to-tray teardown、fullscreen_idx/open_fullscreen/close_fullscreen の presentation-specific block、NativeVideoPlacement への enum 集約、F12 native dispatch、decorated detached video window の WM_CLOSE event、end-of-update selection sync を計画に反映しました。
+初回レビューで指摘された close-to-tray teardown、fullscreen_idx/open_fullscreen/close_fullscreen の presentation-specific block、NativeVideoPlacement への enum 集約、F12 native dispatch、detached viewer window の WM_CLOSE event、end-of-update selection sync を計画に反映しました。
 
 重点確認:
 
@@ -472,6 +482,6 @@ docs/detached-viewer-implementation-plan.md の更新後レビューをお願い
 - close-to-tray 中に detached image viewport と detached native video playback を維持するための heartbeat / fs_cache / event pump 方針に不足がないか。
 - end-of-update の main→viewer sync と viewer→main sync の feedback loop 防止が十分か。
 - F12 Global action、static VK whitelist、App-side native dispatch、Enter close の native 転送に漏れがないか。
-- decorated detached native video window の close event と stale presenter / stale fullscreen_idx 防止の設計に穴がないか。
+- detached viewer host の close event と stale presenter / stale fullscreen_idx 防止の設計に穴がないか。
 - 追加すべきテスト、docs、実機検証項目が残っていないか。
 ```

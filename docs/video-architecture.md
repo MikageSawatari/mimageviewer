@@ -53,8 +53,10 @@ native presenter の表示先は `NativeVideoPlacement` を正本にする。
 - `MainWindowChild`: main HWND の child window。メインウィンドウ内に表示する。
 - `FullscreenBorderless`: monitor rect 全体の borderless presenter。fullscreen 専用 HUD overlay HWND、
   fullscreen backdrop、VST owner 同期の対象。
-- `DetachedWindow`: owner なしの通常 top-level window。`WindowedAt` で outer position と
-  client size を復元し、タスクバー、最小化、最大化、`×` を通常の Windows window として扱う。
+- `DetachedViewerChild`: egui detached viewer viewport の child window。画像 / PDF / ZIP画像と
+  同じ top-level host を維持し、その client rect 全体へ native presenter を重ねる。
+- `DetachedWindow`: 旧 detached 動画 top-level 用の placement。通常経路では使わず、detached
+  viewer host が捕捉できるまで動画 open / placement switch を保留する。
 
 F12 の detached mode 切替や表示中動画の host migration は
 `NativeVideoOutputCommand::SwitchPlacement` で行う。decoder / audio / clock は保持し、
@@ -63,8 +65,9 @@ presenter HWND + DComp target だけを作り直して `PlacementSwitched` / `Pl
 新規の判断は `NativeVideoPlacement` に寄せる。
 
 detached 動画では fullscreen 専用 HUD overlay HWND を作らず、通常 presenter HWND 側の
-egui overlay path を使う。`WM_CLOSE` は `NativeVideoWindowEvent::CloseRequested` として
-App へ転送し、Esc / Enter と同じく `close_fullscreen()` で viewer session を終了する。
+egui overlay path を使う。別ウィンドウの `WM_CLOSE` は egui detached viewport 側で扱い、
+Esc / Enter と同じく `close_fullscreen()` で viewer session を終了する。native child 側の
+キー入力は App へ転送し、動画操作 / session close / F12 切替を同じ keymap 経路に通す。
 
 ### HUD overlay HWND (v0.9.0+ 後期 — CP1-8 で導入)
 
@@ -1536,7 +1539,7 @@ Enter / ダブルクリック等で次に開くまで再表示しない。
 
 | | Fullscreen | MainWindow | DetachedWindow |
 | --- | --- | --- | --- |
-| 動画 presenter HWND | ボーダレス `WS_POPUP`、モニタ全面 | `WS_CHILD`、main HWND のクライアント矩形に重ねる | owner なしの通常 top-level window |
+| 動画 presenter HWND | ボーダレス `WS_POPUP`、モニタ全面 | `WS_CHILD`、main HWND のクライアント矩形に重ねる | `WS_CHILD`、egui detached viewer host のクライアント矩形に重ねる |
 | 静止画 viewer | 専用の egui fullscreen viewport | main ウィンドウの egui ctx に直接描画 (embedded) | 装飾付き egui viewport |
 | main HWND | presenter 起動まで cloak | cloak しない | cloak しない |
 | F11 | MainWindow と切替 | Fullscreen と切替 | 無効 |
@@ -1551,7 +1554,8 @@ Enter / ダブルクリック等で次に開くまで再表示しない。
 `open_fullscreen` は入場時に `prepare_viewer_presentation_open` を通し、
 現時点の有効な `ViewerPresentation` から `native_video_in_window_active` を確定する。
 `ViewerPresentation::MainWindow` のときだけ true、それ以外は false。detached 動画は
-`NativeVideoPlacement::DetachedWindow` として別 HWND に出るため、in-window active ではない。
+`NativeVideoPlacement::DetachedViewerChild` として別ウィンドウ host の child HWND に出るが、
+main-window in-window active ではない。
 
 ### 動画のライブ切り替え (デコーダ保持 placement switch)
 
@@ -1564,6 +1568,10 @@ Enter / ダブルクリック等で次に開くまで再表示しない。
 - F12 の detached mode 切替や main 側同期による host migration は、
   `switch_native_video_viewer_presentation` が `request_id` 付きの
   `NativeVideoOutputCommand::SwitchPlacement` を presenter スレッドへ送る。
+- DetachedWindow へ移行する場合、まず egui detached viewport を作成し、その HWND を
+  `find_visible_thread_window_matching_rect` で捕捉する。host が未取得なら open / placement
+  switch は `NativeVideoOpenPending` / `pending_detached_video_host_switch` で保留し、
+  動画用 top-level HWND へはフォールバックしない。
 - presenter スレッド (`run_native_video_output` in [src/video/mod.rs](../src/video/mod.rs))
   が hidden な新 window + presenter を組み立て、状態 (再生位置 / overlay / VST /
   checked / SAR) を移してから旧 window と入れ替え、`PlacementSwitched`
