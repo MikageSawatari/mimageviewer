@@ -103,10 +103,14 @@ fn initial_scan_hits_by_filename() {
     assert_eq!(hits.len(), 1);
 }
 
-/// 動画ファイルも Ctrl+G のメタ索引対象になり、サイドカー XMP のタグで検索できること。
+/// 動画ファイルも Ctrl+G のメタ索引対象になること。ただしタグ刷新 (v1.4.0) 以降、
+/// サイドカー XMP `dc:subject` の mIV `#` タグは FTS 索引へ投影されない
+/// (タグは tags.db / タグビュー専有)。よって動画自体はファイル名等で検索できるが、
+/// `#` タグ文字列では検索ヒットしない。`ingest_worker` 側ユニットテスト
+/// `video_file_with_sidecar_tags_ingests_but_tag_not_in_fts` の e2e 版回帰ガード。
 /// 実動画を fixture に持たずに済むよう、コンテナメタではなく `.xmp` サイドカー経路を使う。
 #[test]
-fn initial_scan_hits_video_sidecar_tags() {
+fn initial_scan_indexes_video_but_sidecar_tag_not_in_fts() {
     let data = FixtureRoot::new();
     let root = FixtureRoot::new();
     let video_path = root.path().join("tagged_movie.mp4");
@@ -144,15 +148,26 @@ fn initial_scan_hits_video_sidecar_tags() {
     let row = meta_db.get(&key).unwrap().unwrap();
     assert_eq!(row.kind, mimageviewer::fts_index::IndexKind::Video);
 
-    let hits = wait_for_search_hits(
+    // 動画はファイル名で検索できる (= FTS に索引済みで、reader が当該ドキュメントの
+    // 最新コミットを見えている)。これでこの後のタグ 0 件が「索引漏れ」ではなく
+    // 「タグ未投影」であることを保証する。
+    let by_name = wait_for_search_hits(
         &mgr,
-        "video_sidecar_marker",
+        "tagged",
         &[fav.id],
         |h| h.iter().any(|g| g.path.contains("tagged_movie.mp4")),
         FS_EVENT_TIMEOUT,
-        "search finds video sidecar tag",
+        "search finds video by filename",
     );
-    assert_eq!(hits.len(), 1);
+    assert_eq!(by_name.len(), 1);
+
+    // タグ刷新後: サイドカー `#` タグは FTS へ投影されないので 0 件 (旧挙動は 1 件)。
+    // タグの検索は tags.db / タグビュー側で行う。
+    let tag_hits = collect_search_hits(&mgr, "video_sidecar_marker", &[fav.id]);
+    assert!(
+        tag_hits.is_empty(),
+        "サイドカー # タグは FTS 非投影のはず (tag_hits={tag_hits:?})"
+    );
 }
 
 // -----------------------------------------------------------------------

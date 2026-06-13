@@ -365,3 +365,26 @@ Source thread: https://egg.5ch.io/test/read.cgi/software/1752914772/
     - Right-bound spread: display in visual left-to-right order, e.g. `13,12 / 180`.
   - Use the shared formatter for both the bottom-right overlay and the seek-bar page label.
 - Priority: High for cursor auto-hide bug and spread-label consistency; medium for exposing the cursor-hide delay setting.
+
+### 4.11 Startup/CLI archive fullscreen open
+
+- Source: 762.
+- Request: When launching from an external filer as `mImageViewer.exe Filename.zip`, skip the thumbnail grid and open the archive directly in fullscreen. User suggested either an option or a command-line option.
+- Current behavior:
+  - The first positional command-line argument is parsed as `startup_open_path`.
+  - ZIP/CBZ/PDF paths are resolved as openable virtual folders and loaded into the normal grid/list view.
+  - The existing `auto_fullscreen_zip_pdf` setting is only applied when opening ZIP/PDF from the grid via Enter, double-click, or gamepad. Startup paths do not set `pending_auto_fs_open`, so this setting does not currently make `mImageViewer.exe book.zip` open fullscreen.
+  - Image/video startup paths do open fullscreen through `startup_file_should_open_fullscreen`, but ZIP/PDF/convertible archive startup paths do not.
+- Proposed design:
+  - Prefer an explicit command-line flag such as `--fullscreen` / `--open-fullscreen` so external filers can opt in per invocation without changing the global setting.
+  - Pass a startup open request struct instead of only `PathBuf`, carrying the requested fullscreen mode.
+  - For ZIP/CBZ/PDF, set the same one-shot auto-open state used by grid opens before loading the virtual folder.
+  - For convertible archives, carry the fullscreen intent through cache lookup / conversion so cached archives can open fullscreen after loading. For uncached archives, decide whether to open fullscreen after conversion completes or only after explicit confirmation.
+  - Separately decide whether the existing global `auto_fullscreen_zip_pdf` should also apply to startup archive paths without the new flag.
+- Tests:
+  - Command-line parser accepts the fullscreen flag before and after the path, including after `--`.
+  - First instance and existing-instance forwarding behave the same.
+  - ZIP/CBZ/PDF startup paths open fullscreen only when requested.
+  - Image/video startup behavior remains unchanged.
+  - Convertible archives are covered for cached and uncached cases.
+- Priority: Future version. Useful for external filer workflows, but keep out of v1.5.0 unless the current release scope expands.
