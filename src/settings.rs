@@ -3646,7 +3646,10 @@ impl Settings {
             if tag.name.is_empty() {
                 tag.name = tag.tag_key.clone();
             }
-            if tag.tag_key.is_empty() || tag.name.chars().count() > 64 {
+            if tag.tag_key.is_empty()
+                || tag.name.chars().count() > 64
+                || crate::tags_db::tag_display_name_has_whitespace(&tag.name)
+            {
                 continue;
             }
             if let Some(&idx) = by_key.get(&tag.tag_key) {

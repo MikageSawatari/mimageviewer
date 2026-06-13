@@ -133,7 +133,10 @@ impl App {
                     let normalized_input =
                         crate::tags_db::normalize_tag_display_name(self.tag_apply_input.trim());
                     let input_len = normalized_input.chars().count();
-                    let input_valid = !normalized_input.is_empty() && input_len <= 64;
+                    let input_has_whitespace =
+                        crate::tags_db::tag_display_name_has_whitespace(&normalized_input);
+                    let input_valid =
+                        !normalized_input.is_empty() && input_len <= 64 && !input_has_whitespace;
                     if input_valid
                         && enter_pressed
                         && (input_resp.has_focus() || input_resp.lost_focus())
@@ -157,9 +160,17 @@ impl App {
                     crate::tags_db::normalize_tag_display_name(self.tag_apply_input.trim());
                 let input_len = normalized_input.chars().count();
                 let input_too_long = input_len > 64;
+                let input_has_whitespace =
+                    crate::tags_db::tag_display_name_has_whitespace(&normalized_input);
                 if input_too_long {
                     ui.label(
                         egui::RichText::new("タグ名は 64 文字以内にしてください。")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(200, 80, 60)),
+                    );
+                } else if input_has_whitespace {
+                    ui.label(
+                        egui::RichText::new("タグ名に空白は使えません。")
                             .size(11.0)
                             .color(egui::Color32::from_rgb(200, 80, 60)),
                     );

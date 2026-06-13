@@ -130,6 +130,16 @@ impl App {
                 if ui.button("＋ タグを追加").clicked() {
                     add_empty_row = true;
                 }
+                if self.tag_editor_draft.iter().any(|tag| {
+                    let name = crate::tags_db::normalize_tag_display_name(&tag.name);
+                    !name.is_empty() && crate::tags_db::tag_display_name_has_whitespace(&name)
+                }) {
+                    ui.label(
+                        egui::RichText::new("タグ名に空白は使えません。")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(200, 80, 60)),
+                    );
+                }
 
                 ui.add_space(8.0);
                 ui.separator();
@@ -300,7 +310,10 @@ fn normalize_editor_tag_name(raw: &str) -> Option<String> {
         name.remove(0);
     }
     let name = crate::tags_db::normalize_tag_display_name(&name);
-    if name.is_empty() || name.chars().count() > 64 {
+    if name.is_empty()
+        || name.chars().count() > 64
+        || crate::tags_db::tag_display_name_has_whitespace(&name)
+    {
         None
     } else {
         Some(name)
@@ -419,6 +432,17 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].old_key, "cat");
         assert_eq!(ops[0].new_key, "dog");
+    }
+
+    #[test]
+    fn apply_plan_drops_whitespace_tag_names() {
+        let id = Uuid::new_v4();
+        let previous = previous_tag_defs_by_id(&[]);
+        let (cleaned, ops) =
+            build_tag_editor_apply_plan(vec![tag_with(id, "", "Blue Archive", true)], &previous);
+
+        assert!(cleaned.is_empty());
+        assert!(ops.is_empty());
     }
 
     fn retag(old_key: &str, new_key: &str, new_name: &str) -> RetagOp {

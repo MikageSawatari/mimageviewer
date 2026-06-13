@@ -184,8 +184,11 @@ fn run_tag_view_search(
     } else {
         TAG_VIEW_FILTERED_KEY_SCAN_LIMIT
     };
+    let terms = parse_tag_view_query_terms(trimmed);
     let exact_keys = db.item_keys_by_tag_exact(trimmed, scan_limit + 1);
-    let keys = if exact_keys.is_empty() {
+    let keys = if terms.len() > 1 && exact_keys.is_empty() {
+        db.item_keys_by_tag_terms_and(&terms, scan_limit + 1)
+    } else if exact_keys.is_empty() {
         db.item_keys_by_tag_prefix(trimmed, scan_limit + 1)
     } else {
         exact_keys
@@ -243,6 +246,29 @@ fn run_tag_view_search(
         entries,
         truncated,
     })
+}
+
+fn parse_tag_view_query_terms(query: &str) -> Vec<String> {
+    dedup_tag_terms(
+        query
+            .split_whitespace()
+            .map(crate::tags_db::normalize_tag_display_name)
+            .collect(),
+    )
+}
+
+fn dedup_tag_terms(terms: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    for term in terms {
+        let key = crate::tags_db::normalize_tag_key(&term);
+        if key.is_empty() || seen.iter().any(|existing| existing == &key) {
+            continue;
+        }
+        seen.push(key);
+        out.push(term);
+    }
+    out
 }
 
 enum ClassifiedTagViewPath {
@@ -425,6 +451,92 @@ mod tests {
                 .entries
                 .iter()
                 .any(|e| entry_key(e) == folder_key && e.kind == TagViewItemKind::Folder)
+        );
+    }
+
+    #[test]
+    fn tag_view_search_intersects_multiple_tags() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let cat_dog = temp.path().join("cat-dog.jpg");
+        let cat_only = temp.path().join("cat-only.jpg");
+        let dog_only = temp.path().join("dog-only.jpg");
+        let cat_dognap = temp.path().join("cat-dognap.jpg");
+        std::fs::write(&cat_dog, b"jpg").unwrap();
+        std::fs::write(&cat_only, b"jpg").unwrap();
+        std::fs::write(&dog_only, b"jpg").unwrap();
+        std::fs::write(&cat_dognap, b"jpg").unwrap();
+
+        let cat_dog_key = crate::tags_db::item_key_for_path(&cat_dog);
+        let cat_dognap_key = crate::tags_db::item_key_for_path(&cat_dognap);
+        let mut db = crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).unwrap();
+        db.set_item_tags(&cat_dog_key, ["cat", "dog"], "test")
+            .unwrap();
+        db.set_item_tags(
+            &crate::tags_db::item_key_for_path(&cat_only),
+            ["cat"],
+            "test",
+        )
+        .unwrap();
+        db.set_item_tags(
+            &crate::tags_db::item_key_for_path(&dog_only),
+            ["dog"],
+            "test",
+        )
+        .unwrap();
+        db.set_item_tags(&cat_dognap_key, ["cat", "dognap"], "test")
+            .unwrap();
+        drop(db);
+
+        let entry_key = |e: &TagViewEntry| crate::tags_db::item_key_for_path(&e.path);
+        let exact_result = run_tag_view_search(
+            &data_dir,
+            "#cat #dog",
+            TagViewKindFilter::All,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            exact_result
+                .entries
+                .iter()
+                .map(entry_key)
+                .collect::<Vec<_>>(),
+            vec![cat_dog_key.clone()]
+        );
+
+        let prefix_result = run_tag_view_search(
+            &data_dir,
+            "#cat #do",
+            TagViewKindFilter::All,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            prefix_result
+                .entries
+                .iter()
+                .map(entry_key)
+                .collect::<Vec<_>>(),
+            vec![cat_dog_key, cat_dognap_key]
+        );
+    }
+
+    #[test]
+    fn tag_view_query_terms_are_whitespace_separated() {
+        assert_eq!(
+            parse_tag_view_query_terms("#cat #dog"),
+            vec!["cat".to_string(), "dog".to_string()]
+        );
+        assert_eq!(
+            parse_tag_view_query_terms("#cat dog"),
+            vec!["cat".to_string(), "dog".to_string()]
+        );
+        assert_eq!(
+            parse_tag_view_query_terms("cat cat #dog"),
+            vec!["cat".to_string(), "dog".to_string()]
         );
     }
 

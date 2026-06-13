@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, types::Value};
 use unicode_normalization::UnicodeNormalization;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -338,7 +338,7 @@ impl TagsDb {
         let tag = normalize_tag_display_name(tag_name);
         let tag_key = normalize_tag_key(&tag);
         let before = self.display_tags_for_item(item_key);
-        if tag_key.is_empty() {
+        if !is_valid_tag_display_name(&tag) {
             return Ok((TagToggleOutcome::NoOp, before.clone(), before));
         }
         let tx = self.conn.transaction()?;
@@ -387,7 +387,7 @@ impl TagsDb {
         let old_key = normalize_tag_key(old_key);
         let new_display = normalize_tag_display_name(new_name);
         let new_key = normalize_tag_key(&new_display);
-        if old_key.is_empty() || new_key.is_empty() {
+        if old_key.is_empty() || !is_valid_tag_display_name(&new_display) {
             return Ok(RetagReport::default());
         }
 
@@ -741,6 +741,67 @@ impl TagsDb {
         rows.flatten().collect()
     }
 
+    pub fn item_keys_by_tag_terms_and(&self, terms: &[String], limit: usize) -> Vec<String> {
+        let mut matches = Vec::new();
+        for term in terms {
+            let key = normalize_tag_key(term);
+            if key.is_empty() || matches.iter().any(|m: &TagQueryMatch| m.key == key) {
+                continue;
+            }
+            if self.find_exact(&key).is_some() {
+                matches.push(TagQueryMatch {
+                    key,
+                    kind: TagQueryMatchKind::Exact,
+                });
+            } else {
+                matches.push(TagQueryMatch {
+                    key,
+                    kind: TagQueryMatchKind::Prefix,
+                });
+            }
+        }
+        if matches.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        if matches.len() == 1 {
+            return match matches[0].kind {
+                TagQueryMatchKind::Exact => self.item_keys_by_tag_exact(&matches[0].key, limit),
+                TagQueryMatchKind::Prefix => self.item_keys_by_tag_prefix(&matches[0].key, limit),
+            };
+        }
+
+        matches.sort_by_key(|m| match m.kind {
+            TagQueryMatchKind::Exact => 0,
+            TagQueryMatchKind::Prefix => 1,
+        });
+
+        let mut sql = String::from("SELECT DISTINCT base.item_key FROM item_tags base WHERE ");
+        let mut values = Vec::new();
+        append_tag_match_sql(&mut sql, "base", &matches[0], &mut values);
+        for (idx, tag_match) in matches.iter().enumerate().skip(1) {
+            let alias = format!("t{idx}");
+            sql.push_str(" AND EXISTS (SELECT 1 FROM item_tags ");
+            sql.push_str(&alias);
+            sql.push_str(" WHERE ");
+            sql.push_str(&alias);
+            sql.push_str(".item_key = base.item_key AND ");
+            append_tag_match_sql(&mut sql, &alias, tag_match, &mut values);
+            sql.push(')');
+        }
+        sql.push_str(" ORDER BY base.item_key COLLATE NOCASE ASC LIMIT ?");
+        values.push(Value::Integer(limit as i64));
+
+        let mut stmt = match self.conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map(rusqlite::params_from_iter(values), |row| row.get(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten().collect()
+    }
+
     pub fn prune_items(&mut self, item_keys: &[String]) -> Result<usize, rusqlite::Error> {
         if item_keys.is_empty() {
             return Ok(0);
@@ -809,12 +870,57 @@ pub fn normalize_tag_key(name: &str) -> String {
     normalize_tag_display_name(name).to_lowercase()
 }
 
+pub fn tag_display_name_has_whitespace(name: &str) -> bool {
+    name.chars().any(char::is_whitespace)
+}
+
+pub fn is_valid_tag_display_name(name: &str) -> bool {
+    let display = normalize_tag_display_name(name);
+    !display.is_empty()
+        && display.chars().count() <= 64
+        && !tag_display_name_has_whitespace(&display)
+}
+
 pub fn format_display_tag(tag: &str) -> String {
     let clean = normalize_tag_display_name(tag);
     if clean.is_empty() {
         String::new()
     } else {
         format!("#{clean}")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TagQueryMatch {
+    key: String,
+    kind: TagQueryMatchKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TagQueryMatchKind {
+    Exact,
+    Prefix,
+}
+
+fn append_tag_match_sql(
+    sql: &mut String,
+    alias: &str,
+    tag_match: &TagQueryMatch,
+    values: &mut Vec<Value>,
+) {
+    sql.push_str(alias);
+    match tag_match.kind {
+        TagQueryMatchKind::Exact => {
+            sql.push_str(".tag_key = ?");
+            values.push(Value::Text(tag_match.key.clone()));
+        }
+        TagQueryMatchKind::Prefix => {
+            sql.push_str(".tag_key LIKE ? ESCAPE '\\'");
+            values.push(Value::Text(format!(
+                "{}%",
+                escape_like_pattern(&tag_match.key)
+            )));
+        }
     }
 }
 
@@ -831,7 +937,10 @@ where
     for tag in tags {
         let display = normalize_tag_display_name(tag.as_ref());
         let tag_key = normalize_tag_key(&display);
-        if tag_key.is_empty() || display.chars().count() > 64 {
+        if tag_key.is_empty()
+            || display.chars().count() > 64
+            || tag_display_name_has_whitespace(&display)
+        {
             continue;
         }
         by_key.insert(
@@ -940,6 +1049,14 @@ mod tests {
     }
 
     #[test]
+    fn tag_validation_rejects_whitespace_inside_name() {
+        assert!(is_valid_tag_display_name("原神"));
+        assert!(!is_valid_tag_display_name("Blue Archive"));
+        assert!(!is_valid_tag_display_name("Blue\tArchive"));
+        assert!(!is_valid_tag_display_name("Blue　Archive"));
+    }
+
+    #[test]
     fn busy_timeout_pragma_is_applied() {
         let db = memory_db();
         let timeout_ms: i64 = db
@@ -988,6 +1105,19 @@ mod tests {
             .set_item_tags("c:/a.jpg", ["#ＦＡＴＥ", "fate"], source::EDIT)
             .unwrap();
         assert_eq!(after, vec!["#fate"]);
+    }
+
+    #[test]
+    fn set_and_toggle_reject_whitespace_tags() {
+        let mut db = memory_db();
+        let after = db
+            .set_item_tags("c:/a.jpg", ["Blue Archive", "原神"], source::EDIT)
+            .unwrap();
+        assert_eq!(after, vec!["#原神"]);
+
+        let (outcome, _, after) = db.toggle_item_tag("c:/a.jpg", "Blue Archive").unwrap();
+        assert_eq!(outcome, TagToggleOutcome::NoOp);
+        assert_eq!(after, vec!["#原神"]);
     }
 
     #[test]
@@ -1082,6 +1212,43 @@ mod tests {
         assert_eq!(
             db.item_keys_by_tag_exact("#cat", 10),
             vec!["c:/cat.jpg".to_string()]
+        );
+    }
+
+    #[test]
+    fn item_keys_by_tag_terms_and_intersects_exact_tags() {
+        let mut db = memory_db();
+        db.set_item_tags("c:/cat-dog.jpg", ["cat", "dog"], source::EDIT)
+            .unwrap();
+        db.set_item_tags("c:/cat-only.jpg", ["cat"], source::EDIT)
+            .unwrap();
+        db.set_item_tags("c:/dog-only.jpg", ["dog"], source::EDIT)
+            .unwrap();
+        db.set_item_tags("c:/cat-dognap.jpg", ["cat", "dognap"], source::EDIT)
+            .unwrap();
+
+        assert_eq!(
+            db.item_keys_by_tag_terms_and(&["#cat".to_string(), "#dog".to_string()], 10),
+            vec!["c:/cat-dog.jpg".to_string()]
+        );
+    }
+
+    #[test]
+    fn item_keys_by_tag_terms_and_uses_prefix_when_no_exact_tag_exists() {
+        let mut db = memory_db();
+        db.set_item_tags("c:/cat-dog.jpg", ["cat", "dog"], source::EDIT)
+            .unwrap();
+        db.set_item_tags("c:/cat-dognap.jpg", ["cat", "dognap"], source::EDIT)
+            .unwrap();
+        db.set_item_tags("c:/cat-only.jpg", ["cat"], source::EDIT)
+            .unwrap();
+
+        assert_eq!(
+            db.item_keys_by_tag_terms_and(&["#cat".to_string(), "#do".to_string()], 10),
+            vec![
+                "c:/cat-dog.jpg".to_string(),
+                "c:/cat-dognap.jpg".to_string()
+            ]
         );
     }
 
