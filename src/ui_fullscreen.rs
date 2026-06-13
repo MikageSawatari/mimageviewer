@@ -1968,7 +1968,7 @@ fn format_fullscreen_page_number_label(total: usize, positions: &[usize]) -> Opt
 }
 
 impl App {
-    fn fullscreen_viewport_id(&self) -> egui::ViewportId {
+    pub(crate) fn fullscreen_viewport_id(&self) -> egui::ViewportId {
         egui::ViewportId::from_hash_of(("fullscreen_viewer", self.fs_viewport_generation))
     }
 
@@ -2489,6 +2489,11 @@ impl App {
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
         self.fs_viewport_shown = false;
+        #[cfg(windows)]
+        {
+            self.fs_viewport_presentation = None;
+            self.request_main_font_atlas_resync("fullscreen_viewport_cleanup");
+        }
         if self.fs_viewport_recreate_after_hide {
             self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
             self.fs_viewport_recreate_after_hide = false;
@@ -2698,6 +2703,19 @@ impl App {
         let main_ctx = ctx;
         #[cfg(windows)]
         let hide_viewport_after_embedded_paint = embedded && self.fs_viewport_shown;
+        #[cfg(windows)]
+        let desired_viewport_presentation = if detached {
+            ViewerPresentation::DetachedWindow
+        } else {
+            ViewerPresentation::Fullscreen
+        };
+        #[cfg(windows)]
+        if !embedded
+            && self.fs_viewport_shown
+            && self.fs_viewport_presentation != Some(desired_viewport_presentation)
+        {
+            self.hide_current_fullscreen_viewport_for_recreate(ctx, fs_idx);
+        }
         let fs_id = self.fullscreen_viewport_id();
         let need_show = !self.fs_viewport_shown;
         #[cfg(windows)]
@@ -2713,10 +2731,10 @@ impl App {
         } else {
             self.build_fullscreen_viewport_builder()
         };
-        if need_show && !embedded && !detached {
+        if need_show && !embedded {
             // 新規 viewport は hidden で作り、DWM transition 抑止属性を当ててから
-            // Visible(true) にする。初期 white client と最大化アニメーションの露出を
-            // 動画 backdrop と同じ手順で避ける。
+            // Visible(true) にする。初期 white client、最大化アニメーション、detached
+            // window の表示フェード露出を動画 backdrop と同じ手順で避ける。
             fs_builder = fs_builder.with_visible(false);
         }
         let fs_viewport_t0 = std::time::Instant::now();
@@ -2785,12 +2803,8 @@ impl App {
                     // embedded のときは専用 viewport を作らないので Visible/Focus は
                     // 送らない (main ウィンドウは既に表示・フォーカス済み)。
                     #[cfg(windows)]
-                    if !detached {
-                        crate::dwm_transitions::disable_transitions_for_thread_windows();
-                    }
-                    if !detached {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    }
+                    crate::dwm_transitions::disable_transitions_for_thread_windows();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     if !detached || detached_activate_on_show {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
@@ -4002,6 +4016,10 @@ impl App {
             // embedded のときは専用 viewport を作っていないので shown フラグは
             // 立てない (close 後の viewport 後始末も走らせない)。
             self.fs_viewport_shown = true;
+            #[cfg(windows)]
+            {
+                self.fs_viewport_presentation = Some(desired_viewport_presentation);
+            }
         }
 
         // ── ナビゲーション & スライドショー処理 ──
@@ -4310,6 +4328,34 @@ impl App {
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
         self.fs_viewport_shown = false;
+        self.fs_viewport_presentation = None;
+        self.request_main_font_atlas_resync("native_video_backdrop_hide");
+    }
+
+    #[cfg(windows)]
+    fn hide_current_fullscreen_viewport_for_recreate(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) {
+        if !self.fs_viewport_shown {
+            return;
+        }
+        let fs_id = self.fullscreen_viewport_id();
+        let builder = match self.fs_viewport_presentation {
+            Some(ViewerPresentation::DetachedWindow) => {
+                self.build_detached_viewer_viewport_builder(fs_idx, false)
+            }
+            _ => self.build_fullscreen_viewport_builder(),
+        }
+        .with_visible(false);
+        ctx.show_viewport_immediate(fs_id, builder, |_ctx, _class| {});
+        crate::dwm_transitions::disable_transitions_for_thread_windows();
+        ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        self.fs_viewport_shown = false;
+        self.fs_viewport_presentation = None;
+        self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
+        self.request_main_font_atlas_resync("fullscreen_viewport_recreate");
     }
 
     #[cfg(windows)]
@@ -4384,6 +4430,7 @@ impl App {
             }
         }
         self.fs_viewport_shown = true;
+        self.fs_viewport_presentation = Some(ViewerPresentation::Fullscreen);
         if close_fs {
             self.handle_fullscreen_close_request();
             ctx.request_repaint();

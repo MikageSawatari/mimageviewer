@@ -11530,6 +11530,38 @@ mod native_video_rating_key_tests {
     }
 
     #[test]
+    fn detached_video_presentation_preserves_non_detached_window_preference() {
+        let mut app = setup_app();
+        let idx = push_video(&mut app, PathBuf::from(r"C:\clips\movie.mp4"));
+        app.fullscreen_idx = Some(idx);
+        app.settings.video_in_window_mode = true;
+        app.native_video_in_window_active = true;
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+
+        app.apply_video_presentation_switched(ViewerPresentation::DetachedWindow);
+
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(
+            !app.native_video_in_window_active,
+            "detached is not a main-window child presentation"
+        );
+        assert!(
+            app.settings.video_in_window_mode,
+            "F12 detached must not overwrite the F11 MainWindow/Fullscreen preference"
+        );
+        assert_eq!(
+            app.non_detached_viewer_presentation(),
+            ViewerPresentation::MainWindow
+        );
+
+        app.apply_video_presentation_switched(ViewerPresentation::Fullscreen);
+        assert!(
+            !app.settings.video_in_window_mode,
+            "real F11 transition to Fullscreen should still persist"
+        );
+    }
+
+    #[test]
     fn native_video_f12_repeat_is_ignored() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -11906,6 +11938,86 @@ mod still_window_mode_key_tests {
         assert_eq!(stamp.idx, idx);
         assert!(stamp.item_key.contains("replacement.jpg"));
         assert_eq!(stamp.items_generation, app.items_generation);
+    }
+
+    #[test]
+    fn detached_grid_enter_reactivates_existing_still_viewer_without_reopening() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.settings.detached_viewer_enabled = true;
+        app.selected = Some(idx);
+        app.open_fullscreen(idx);
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+
+        app.fs_zoom = 2.5;
+        app.fs_suppress_enter_close_until_release = false;
+        begin_root_key_pass(&ctx, egui::Key::Enter, false);
+        let nav = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(nav.is_none());
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert_eq!(
+            app.fs_zoom, 2.5,
+            "same detached item should be focused, not reopened"
+        );
+        assert!(
+            !app.fs_suppress_enter_close_until_release,
+            "grid Enter suppression is only needed when open_fullscreen runs"
+        );
+    }
+
+    #[test]
+    fn detached_grid_enter_reopens_same_idx_after_item_generation_changes() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.settings.detached_viewer_enabled = true;
+        app.selected = Some(idx);
+        app.open_fullscreen(idx);
+
+        app.fs_zoom = 2.5;
+        app.items[idx] = GridItem::Image(PathBuf::from(r"C:\pics\replacement.jpg"));
+        app.items_generation = app.items_generation.wrapping_add(1);
+        begin_root_key_pass(&ctx, egui::Key::Enter, false);
+        let nav = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(nav.is_none());
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert_eq!(
+            app.fs_zoom, 1.0,
+            "changed item generation must still reopen the detached viewer"
+        );
+        let stamp = app
+            .last_viewer_sync_stamp
+            .as_ref()
+            .expect("reopen should refresh detached stamp");
+        assert!(stamp.item_key.contains("replacement.jpg"));
+    }
+
+    #[test]
+    fn detached_grid_enter_reactivates_existing_video_without_reopening() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_video(&mut app, r"C:\clips\a.mp4");
+        app.settings.detached_viewer_enabled = true;
+        app.selected = Some(idx);
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.last_viewer_sync_stamp = app.viewer_sync_stamp_for_idx(idx);
+        app.native_video_front_recover_after_external_foreground = false;
+        app.native_video_front_last_raise = Some(std::time::Instant::now());
+
+        begin_root_key_pass(&ctx, egui::Key::Enter, false);
+        let nav = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(nav.is_none());
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert!(app.native_video_front_recover_after_external_foreground);
+        assert!(app.native_video_front_last_raise.is_none());
     }
 
     #[test]

@@ -226,6 +226,27 @@ reclaim も予約しない。detached session はメイン一覧をブロック�
 通常ショートカットやダイアログは継続して扱える。detached 表示の `×` / Esc / Enter は
 `close_fullscreen()` に寄せ、`detached_viewer_enabled` は維持する。
 
+F11 の MainWindow / Fullscreen 選択は、F12 の detached ON/OFF とは独立した
+non-detached 側の表示設定として保持する。動画の native presenter から
+`DetachedWindow` への `PlacementSwitched` が返っても `settings.video_in_window_mode`
+は更新せず、F12 を OFF にしたときは直前の F11 状態へ戻る。静止画の fullscreen
+viewport と detached viewport は装飾・サイズ・taskbar 表示が異なるため、表示形態が
+変わるときは既存 viewport を隠して ViewportId 世代を進め、新しい表示先として作り直す。
+静止画 / PDF / ZIP 画像の fullscreen viewport と detached viewport はどちらも hidden
+状態で作成し、`DWMWA_TRANSITIONS_FORCEDISABLED` を適用してから `Visible(true)` を送る。
+これにより OBS などの window capture には映らない DWM の表示フェード / 出現アニメーションを
+抑止する。
+
+複数 viewport を閉じる / 作り直す直後は、egui の shared texture namespace と viewport ごとの
+renderer 側 font atlas texture のサイズが一時的にずれることがある。実機では、日本語フォルダ名の
+描画タイミングで `Queue::write_texture` が高さ 32 の古い font atlas texture に `Y 29..44`
+の部分 glyph update を送り、フォント崩れ後に wgpu validation panic するログを確認した。
+`Visible(false)` で fullscreen/detached viewport を隠した経路では
+`request_main_font_atlas_resync` を立て、メイン UI を描く直前に 1 フレームだけ描画を送って
+`configure_fonts_for_texture_resync` を実行する。通常の `configure_fonts` は定義が同一だと
+egui が再読み込みを省略するため、未使用の一意な font family marker を混ぜて font atlas を
+full upload から再開させる。
+
 detached session が開いている間は、`App::update` 終端でそのフレームの最終
 `selected` を読み、静止画 / ZIP画像 / PDFページ / 動画であれば viewer 側を同じ項目へ追従させる。
 同期済み判定は `idx` だけでなく `metadata_cache_key` 相当の item key と
@@ -234,6 +255,12 @@ items rebuild 後に、同じ idx が別項目を指しても再同期できる�
 場合は、メイン一覧のカーソル移動だけでは再表示しない。
 同じ raw idx で stamp が変わった場合は、動画 fast-swap の same-idx no-op を通さず
 `open_fullscreen` の通常初期化へ戻して再同期する。
+
+メイン一覧で `Enter` / 明示 open した項目が、開いている detached session の stamp と
+同一なら、`open_fullscreen` を再実行せず前面化要求だけを出す。静止画 detached viewport
+では `Minimized(false)` / `Visible(true)` / `Focus` を送り、動画 detached presenter では
+presenter raise 要求へ寄せる。同じ raw idx でも item key / generation が変わっている場合は、
+通常どおり再オープンして表示状態を更新する。
 
 detached session で見開き 2 ページ表示中は、メイン一覧の通常カーソルを現在ページに置き、
 相方ページがグリッド / 詳細一覧の可視範囲内に描画される場合だけ破線のサブカーソルを重ねる。

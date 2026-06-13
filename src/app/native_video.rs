@@ -1627,11 +1627,13 @@ impl App {
     /// うえで行う (stale イベントでも実モードだけは反映するため = Codex 再 P2)。
     ///
     /// **永続設定の保存タイミング (review #4 対応)**: `settings.video_in_window_mode`
-    /// はここ (presenter 確定後) で初めて更新・保存する。toggle 時点で save してしまうと、
-    /// presenter rebuild 中に crash / Alt+F4 で落ちた場合に「ユーザーが見ていない未確定
-    /// モード」が次回起動時に持ち越される。
+    /// は MainWindow / Fullscreen への presenter 確定後だけ更新・保存する。
+    /// DetachedWindow は F12 の一時的な別ウィンドウ表示先であり、F11 の
+    /// 「ウィンドウ内表示か全画面表示か」という non-detached 側の好みを上書きしない。
+    /// toggle 時点で save してしまうと、presenter rebuild 中に crash / Alt+F4 で落ちた場合に
+    /// 「ユーザーが見ていない未確定モード」が次回起動時に持ち越される。
     #[cfg(windows)]
-    fn apply_video_presentation_switched(&mut self, presentation: ViewerPresentation) {
+    pub(crate) fn apply_video_presentation_switched(&mut self, presentation: ViewerPresentation) {
         let in_window = matches!(presentation, ViewerPresentation::MainWindow);
         self.native_video_in_window_active = in_window;
         self.viewer_presentation = presentation;
@@ -1642,7 +1644,9 @@ impl App {
         } else {
             None
         };
-        if self.settings.video_in_window_mode != in_window {
+        if !matches!(presentation, ViewerPresentation::DetachedWindow)
+            && self.settings.video_in_window_mode != in_window
+        {
             self.settings.video_in_window_mode = in_window;
             self.settings.save();
         }

@@ -25,6 +25,7 @@ v1.4.0 後に着手する「画像・動画をメイン一覧とは別ウィン�
 
 - 別ウィンドウモード ON でも、別ウィンドウが閉じているだけならカーソル移動では再表示しない。
 - `Enter`、ダブルクリック、既存の「開く」操作で初めて別ウィンドウを開く。
+- 別ウィンドウセッションが開いていて、メイン一覧の選択項目が既に表示中の項目と同一の場合、`Enter` / 明示 open は再オープンせず、必要に応じて別ウィンドウを前面化する。同じ raw idx でも item key / generation が変わっている場合は再オープンする。
 - 別ウィンドウの `×` は、別ウィンドウモード OFF ではなく「現在のビューアセッション終了」とする。
 - 別ウィンドウの `×`、`Esc`、`Enter`、右クリック、`Alt+F4` はすべて同じ終了操作に寄せる。
   - 画像: 表示セッションを終了する。
@@ -124,6 +125,7 @@ struct ViewerSession {
   - `HostSwap`: 同じセッション内で画像 host / 動画 host を差し替えた。
 - `open_viewer_for_idx(ctx, idx, reason)`
   - セッションが無ければ作成する。
+  - detached session が同じ `ViewerSyncStamp` の項目を既に表示中なら、重複オープンではなく前面化だけにする。
   - `detached_viewer_enabled` と現在状態から `ViewerPresentation` を決める。
   - 既存の `open_fullscreen(idx)` 相当のロード・キャッシュ・動画起動を呼ぶ。
   - `reason` に応じて window activation 可否を決める。`ExplicitOpen` / `F12Switch` は必要なら前面化可、`SyncFromMainSelection` / `HostSwap` は前面化しない。
@@ -276,6 +278,7 @@ host swap では target 側の作成・初回描画準備ができてから sour
 - 既存の F11 は以下の扱いにする。
   - `MainWindow` / `Fullscreen`: 既存の静止画 in-window ↔ fullscreen 切替を `ViewerPresentation::{MainWindow, Fullscreen}` の遷移として扱う。
   - `DetachedWindow`: 無効。動画 native presenter 側でも無効。
+- F11 の `MainWindow` / `Fullscreen` 選択は F12 detached ON/OFF から独立した non-detached 側の状態として保持する。`DetachedWindow` への切替完了イベントでは `settings.video_in_window_mode` を保存せず、F12 OFF 時は直前の F11 状態へ戻す。
 - detached session を `×` / `Esc` / `Enter` / 右クリックで閉じても `detached_viewer_enabled` は維持する。次に開く操作をした場合は再び `DetachedWindow` で開く。
 - non-detached の `Fullscreen` での `Esc` は既存どおり一覧へ戻る挙動を維持する。detached だけは `Esc` を session close として扱う。
 - keymap 追加時は `ALL_ACTIONS`、`ini_name`、`default_chords`、`trigger`、ini round-trip / default generation のテストを更新する。
@@ -364,10 +367,12 @@ host swap では target 側の作成・初回描画準備ができてから sour
 - detached 静止画の `×` / `Esc` / `Enter` / 右クリックは `close_fullscreen()` に寄せ、`detached_viewer_enabled` は維持する。detached 中の F11 は no-op にし、ホバーバーの window/fullscreen トグルは非表示にする。
 - detached session が開いている間、`App::update` 終端で最終 `selected` を見て、静止画 / ZIP画像 / PDFページ / 動画なら viewer を追従させる。同期済み判定は `ViewerSyncStamp { idx, item_key, items_generation }` で行い、bare idx のみでは判定しない。
 - detached session が閉じている場合は、メイン一覧のカーソル移動だけでは再表示しない。
+- detached session が同じ `ViewerSyncStamp` の項目を既に表示中の場合、メイン一覧の `Enter` は `open_fullscreen` を再実行せず、静止画 detached viewport / 動画 native presenter の前面化要求だけを行う。
 - 表示中セッションの F12 host migration は実装済み。静止画は egui viewport の表示先を切り替え、動画は `SwitchPlacement` で decoder / audio / clock を保持したまま native HWND を作り直す。
 - 同期由来の detached open / host swap は no-activate で表示し、通常の open / F12 操作では必要に応じて前面化する。
 - detached window placement は `detached_viewer_window_placement` に保存する。意味は「outer position + inner/client size + maximized flag」。最大化中は restore placement を上書きせず、`maximized` だけを更新する。
 - close-to-tray 中に detached session が開いている場合は、`release_media_session_for_tray` で `close_fullscreen()` を呼ばず、UI heartbeat と active viewer cache を維持する。通常 fullscreen / 通常動画は従来通り tray hide 時に閉じる。
+- 静止画/PDF detached と fullscreen の egui viewport を閉じる/作り直す経路では、メイン viewport の font atlas resync を one-shot 予約する。複数 viewport 後に日本語 glyph の部分更新だけが古い高さ 32 の renderer texture へ届くと wgpu validation panic になるため、メイン UI 描画前に 1 フレーム送って `configure_fonts_for_texture_resync` で font atlas full upload を強制する。
 
 ### Phase 3: 動画 detached
 

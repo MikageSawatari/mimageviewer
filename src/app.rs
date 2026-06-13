@@ -4149,10 +4149,27 @@ pub struct App {
     // ── フルスクリーンビューポート ─────────────────────────────
     /// フルスクリーンビューポートが現在表示中か（Visible+Focus 送信済み）
     pub(crate) fs_viewport_shown: bool,
+    /// `fs_viewport_shown` が true のとき、その viewport を作った表示形態。
+    ///
+    /// `Fullscreen` と `DetachedWindow` は装飾・サイズ・taskbar 表示が異なるため、
+    /// 同じ OS window を変形して使い回さず、切替時に古い viewport を隠して
+    /// 新しい ViewportId で作り直す。
+    #[cfg(windows)]
+    pub(crate) fs_viewport_presentation: Option<ViewerPresentation>,
     /// in-window 静止画から専用 fullscreen viewport へ切り替える間、
     /// root 側が通常グリッドを描いて背面に露出するのを抑止する期限。
     #[cfg(windows)]
     pub(crate) still_fullscreen_viewport_enter_suppress_until: Option<std::time::Instant>,
+    /// 複数 viewport を閉じた/作り直したあと、メイン viewport の egui-wgpu renderer が
+    /// 古い小さい font atlas texture を持ったまま部分 glyph update を受けることがある。
+    /// 次のメイン UI 描画前にフォント定義を 1 回だけ入れ直し、font atlas を full upload
+    /// から再開させるための one-shot。
+    #[cfg(windows)]
+    pub(crate) main_font_atlas_resync_pending: bool,
+    #[cfg(windows)]
+    pub(crate) main_font_atlas_resync_generation: u64,
+    #[cfg(windows)]
+    pub(crate) main_font_atlas_resync_reason: Option<&'static str>,
     /// 閉じた後に次回表示用の ViewportId を更新するか。
     ///
     /// Win+Shift+Arrow など OS 側のモニター移動で eframe/winit の viewport state が
@@ -6018,7 +6035,15 @@ impl App {
             slideshow_anchor_idx: None,
             fs_viewport_shown: false,
             #[cfg(windows)]
+            fs_viewport_presentation: None,
+            #[cfg(windows)]
             still_fullscreen_viewport_enter_suppress_until: None,
+            #[cfg(windows)]
+            main_font_atlas_resync_pending: false,
+            #[cfg(windows)]
+            main_font_atlas_resync_generation: 0,
+            #[cfg(windows)]
+            main_font_atlas_resync_reason: None,
             fs_viewport_recreate_after_hide: false,
             fs_viewport_generation: 0,
             fs_opened_at: None,
@@ -16556,6 +16581,10 @@ impl App {
                         | Some(GridItem::ZipSeparator { .. })
                         | Some(GridItem::PdfPage { .. })
                         | Some(GridItem::Video(_)) => {
+                            #[cfg(windows)]
+                            if self.activate_existing_detached_viewer_for_grid_open(ctx, idx) {
+                                return None;
+                            }
                             // 動画も画像と同じくフルスクリーン化 → インライン再生。
                             // Shift+Enter は上の専用分岐で外部プレイヤーへ。
                             // Phase 7.J: Enter からの open はグリッド意図扱い。
@@ -17921,6 +17950,50 @@ impl App {
         self.fullscreen_idx.is_some() && !self.viewer_session_is_detached()
     }
 
+    #[cfg(windows)]
+    pub(crate) fn request_main_font_atlas_resync(&mut self, reason: &'static str) {
+        if !self.main_font_atlas_resync_pending {
+            crate::logger::log(format!(
+                "[ui-fonts] schedule main font atlas resync: {reason}"
+            ));
+        }
+        self.main_font_atlas_resync_pending = true;
+        if self.main_font_atlas_resync_reason.is_none() {
+            self.main_font_atlas_resync_reason = Some(reason);
+        }
+    }
+
+    #[cfg(windows)]
+    fn maybe_defer_for_main_font_atlas_resync(
+        &mut self,
+        ctx: &egui::Context,
+        phase: &'static str,
+    ) -> bool {
+        if !self.main_font_atlas_resync_pending {
+            return false;
+        }
+        if self.viewer_session_blocks_main_window() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return false;
+        }
+
+        self.main_font_atlas_resync_pending = false;
+        self.main_font_atlas_resync_generation =
+            self.main_font_atlas_resync_generation.wrapping_add(1);
+        let generation = self.main_font_atlas_resync_generation;
+        let reason = self
+            .main_font_atlas_resync_reason
+            .take()
+            .unwrap_or("unknown");
+        crate::ui_fonts::configure_fonts_for_texture_resync(ctx, generation);
+        crate::logger::log(format!(
+            "[ui-fonts] defer main paint for font atlas resync: phase={phase} \
+             reason={reason} generation={generation}"
+        ));
+        ctx.request_repaint();
+        true
+    }
+
     pub(crate) fn main_grid_spread_pair_cursor_idx(&mut self) -> Option<usize> {
         if !self.viewer_session_is_detached() {
             return None;
@@ -18239,6 +18312,38 @@ impl App {
         self.update_last_selected_image();
         self.last_viewer_sync_stamp = Some(stamp);
         ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn activate_existing_detached_viewer_for_grid_open(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> bool {
+        if !self.viewer_session_is_detached() || self.fullscreen_idx != Some(idx) {
+            return false;
+        }
+        let Some(stamp) = self.viewer_sync_stamp_for_idx(idx) else {
+            return false;
+        };
+        if self.last_viewer_sync_stamp.as_ref() != Some(&stamp) {
+            return false;
+        }
+
+        if self.viewer_item_supports_detached_still(idx) {
+            let fs_id = self.fullscreen_viewport_id();
+            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Focus);
+        } else if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+            self.native_video_front_recover_after_external_foreground = true;
+            self.native_video_front_last_raise = None;
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+                player.request_presenter_raise();
+            }
+        }
+        ctx.request_repaint();
+        true
     }
 
     #[cfg(windows)]
@@ -31456,6 +31561,11 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
+        #[cfg(windows)]
+        if self.maybe_defer_for_main_font_atlas_resync(ctx, "update_early") {
+            return;
+        }
+
         // メインウィンドウの HWND を最初のフレームで取得 (Win32 ShowWindow 用)。
         // eframe::Frame::window_handle() は raw_window_handle::WindowHandle を返す。
         // Windows では Win32WindowHandle の hwnd フィールドに HWND が入る。
@@ -32353,6 +32463,11 @@ impl eframe::App for App {
                 }
                 return;
             }
+        }
+
+        #[cfg(windows)]
+        if self.maybe_defer_for_main_font_atlas_resync(ctx, "pre_main_ui") {
+            return;
         }
 
         // 補正パネルでスライダーをドラッグ中に true → release で false の遷移を検知し、

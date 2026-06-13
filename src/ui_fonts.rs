@@ -153,9 +153,27 @@ pub fn user_text_font(size: f32) -> egui::FontId {
 }
 
 pub fn configure_fonts(ctx: &egui::Context) {
+    ctx.set_fonts(mimageviewer_font_definitions());
+}
+
+pub fn configure_fonts_for_texture_resync(ctx: &egui::Context, generation: u64) {
+    let mut fonts = mimageviewer_font_definitions();
+    add_font_texture_resync_marker(&mut fonts, generation);
+    ctx.set_fonts(fonts);
+}
+
+fn mimageviewer_font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
     install_mimageviewer_fonts(&mut fonts);
-    ctx.set_fonts(fonts);
+    fonts
+}
+
+fn add_font_texture_resync_marker(fonts: &mut egui::FontDefinitions, generation: u64) {
+    let marker_family = format!("miv-font-atlas-resync-{generation}");
+    fonts.families.insert(
+        egui::FontFamily::Name(Arc::<str>::from(marker_family)),
+        Vec::new(),
+    );
 }
 
 pub fn install_mimageviewer_fonts(fonts: &mut egui::FontDefinitions) {
@@ -600,6 +618,35 @@ mod tests {
                 "{name} fallback should be registered in the user-text family"
             );
         }
+    }
+
+    #[test]
+    fn texture_resync_marker_changes_definitions_without_touching_active_families() {
+        let base = mimageviewer_font_definitions();
+        let mut resync = mimageviewer_font_definitions();
+        add_font_texture_resync_marker(&mut resync, 42);
+
+        assert!(
+            base != resync,
+            "resync marker should force egui to rebuild fonts even when visible fonts are unchanged"
+        );
+        assert_eq!(
+            base.families.get(&egui::FontFamily::Proportional),
+            resync.families.get(&egui::FontFamily::Proportional),
+            "resync marker must not alter the normal proportional fallback chain"
+        );
+        assert_eq!(
+            base.families.get(&egui::FontFamily::Monospace),
+            resync.families.get(&egui::FontFamily::Monospace),
+            "resync marker must not alter the normal monospace fallback chain"
+        );
+        assert!(
+            resync
+                .families
+                .contains_key(&egui::FontFamily::Name(Arc::<str>::from(
+                    "miv-font-atlas-resync-42"
+                )))
+        );
     }
 
     #[test]
