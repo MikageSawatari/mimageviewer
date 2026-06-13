@@ -370,13 +370,14 @@ JPEG など EXIF Orientation を持つ ZIP 内画像は、サムネイル・フ�
 すべての DB は以下の正規化キーで保存:
 
 - **Image**: ファイルパス (小文字 + `\` → `/`)
-- **ZipImage**: `{zip_path 正規化}|{entry_name}` (`|` 区切り)
+- **ZipImage**: `{zip_path 正規化}::{entry_name 小文字}` (`::` 区切り)
   - ネスト ZIP の entry_name は `"chapters/ch01.zip/page01.jpg"` 形式。
     外側 ZIP パスと合わせれば DB 内で一意になる。
-- **PdfPage**: `{pdf_path 正規化}|page={page_num}`
+- **PdfPage**: `{pdf_path 正規化}::page_{page_num}`
 
-新しい永続ストレージを追加する時は、`rotation_db.rs` と `adjustment_db.rs` の
-`normalize_path` / page_key 生成に揃えること。**キー規則がズレると ZIP/PDF の回転や補正が保存されない**。
+新しい永続ストレージを追加する時は、`App::page_path_key` と `adjustment_db.rs` の
+`normalize_path` / `zip_entry_key` 生成に揃えること。`rotation_db.rs` も正規化済みページキーを
+そのまま保存できる API を持つ。**キー規則がズレると ZIP/PDF の回転や補正が保存されない**。
 
 `rating_db.rs` はページ単位 (画像 / ZIP 内画像 / PDF ページ) とコンテナ (フォルダ / ZIP / PDF
 本体 / RAR・7z・LZH 等の変換前アーカイブ / ZipDir) の両方を同じテーブルに格納する。

@@ -860,6 +860,80 @@ mod phase_c_support {
 }
 
 #[cfg(test)]
+mod rotation_key_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use crate::grid_item::{GridItem, ThumbnailState};
+    use crate::rotation_db::Rotation;
+
+    #[test]
+    fn rotation_roundtrips_for_image_zip_image_and_pdf_page() {
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\Books\page001.jpg")),
+            GridItem::ZipImage {
+                zip_path: PathBuf::from(r"C:\Books\comic.zip"),
+                entry_name: "Chapter01/Page002.JPG".to_string(),
+            },
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\Books\scan.pdf"),
+                page_num: 2,
+                content_type: None,
+            },
+        ];
+        app.thumbnails = (0..app.items.len())
+            .map(|_| ThumbnailState::Pending)
+            .collect();
+        app.rebuild_visible_indices();
+
+        app.rotate_image_cw(0);
+        app.rotate_image_cw(1);
+        app.rotate_image_ccw(2);
+
+        assert_eq!(app.get_rotation(0), Rotation::Cw90);
+        assert_eq!(app.get_rotation(1), Rotation::Cw90);
+        assert_eq!(app.get_rotation(2), Rotation::Cw270);
+
+        app.rotation_cache.clear();
+        assert_eq!(app.get_rotation(0), Rotation::Cw90);
+        assert_eq!(app.get_rotation(1), Rotation::Cw90);
+        assert_eq!(app.get_rotation(2), Rotation::Cw270);
+
+        let image_key = app.page_path_key(0).expect("image page key");
+        let zip_key = app.page_path_key(1).expect("zip page key");
+        let pdf_key = app.page_path_key(2).expect("pdf page key");
+        let db = app.rotation_db.as_ref().expect("rotation db");
+        assert_eq!(db.get_key(&image_key), Some(Rotation::Cw90));
+        assert_eq!(db.get_key(&zip_key), Some(Rotation::Cw90));
+        assert_eq!(db.get_key(&pdf_key), Some(Rotation::Cw270));
+    }
+
+    #[test]
+    fn rotation_none_deletes_virtual_page_entries() {
+        let mut app = setup_app();
+        app.items = vec![GridItem::ZipImage {
+            zip_path: PathBuf::from(r"C:\Books\comic.zip"),
+            entry_name: "Page001.jpg".to_string(),
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.rebuild_visible_indices();
+
+        app.rotate_image_cw(0);
+        app.rotate_image_cw(0);
+        app.rotate_image_cw(0);
+        app.rotate_image_cw(0);
+
+        assert_eq!(app.get_rotation(0), Rotation::None);
+        let key = app.page_path_key(0).expect("zip page key");
+        assert_eq!(
+            app.rotation_db.as_ref().and_then(|db| db.get_key(&key)),
+            None,
+            "0度へ戻ったら ZIP ページの回転レコードも削除する"
+        );
+    }
+}
+
+#[cfg(test)]
 mod phase_c_key_tests {
     use super::phase_c_support::setup_app;
     use super::*;

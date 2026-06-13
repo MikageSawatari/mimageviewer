@@ -90,11 +90,18 @@ impl RotationDb {
     /// 画像の回転角度を取得。未登録なら None。
     pub fn get(&self, path: &Path) -> Option<Rotation> {
         let key = normalize_path(path);
+        self.get_key(&key)
+    }
+
+    /// 正規化済みのページキーから回転角度を取得する。未登録なら None。
+    ///
+    /// ZIP/PDF ページのように実ファイルパスだけでは一意にならない対象で使う。
+    pub fn get_key(&self, key: &str) -> Option<Rotation> {
         let mut stmt = self
             .conn
             .prepare_cached("SELECT angle FROM rotations WHERE path = ?1")
             .ok()?;
-        stmt.query_row([&key], |row| {
+        stmt.query_row([key], |row| {
             let deg: i32 = row.get(0)?;
             Ok(Rotation::from_degrees(deg))
         })
@@ -104,9 +111,16 @@ impl RotationDb {
     /// 回転角度を設定する。None (0°) の場合はレコードを削除する。
     pub fn set(&self, path: &Path, rotation: Rotation) -> Result<(), rusqlite::Error> {
         let key = normalize_path(path);
+        self.set_key(&key, rotation)
+    }
+
+    /// 正規化済みのページキーへ回転角度を設定する。
+    ///
+    /// None (0°) の場合はレコードを削除する。
+    pub fn set_key(&self, key: &str, rotation: Rotation) -> Result<(), rusqlite::Error> {
         if rotation.is_none() {
             self.conn
-                .execute("DELETE FROM rotations WHERE path = ?1", [&key])?;
+                .execute("DELETE FROM rotations WHERE path = ?1", [key])?;
         } else {
             self.conn.execute(
                 "INSERT INTO rotations (path, angle) VALUES (?1, ?2)

@@ -557,8 +557,9 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 4. ズーム/パンが有効なフレームでは `image_rect` にクリップして他の UI 領域へのはみ出しを防ぐ
 
 見開きのページ間隔は環境設定から変更でき、既定 4px、0px で左右ページを隙間なく接続する。
-見開き中は `fs_free_rotation` (Ctrl+ドラッグのフリー回転) と `rotation_db` の単独ページ回転 (R/L)
-は描画に反映されないため、Ctrl+ドラッグは `handle_fs_wheel_and_click` 側で no-op にしている。
+見開き中も `rotation_db` の単独ページ回転 (R/L) は左右ページそれぞれに反映する。
+`fs_free_rotation` (Ctrl+ドラッグのフリー回転) は見開きに反映しないため、Ctrl+ドラッグは
+`handle_fs_wheel_and_click` 側で no-op にしている。
 ズーム中または横幅/縦幅/原寸フィット中のパン (非修飾ドラッグ) と Ctrl+ホイールズーム、ダブルクリックリセットのみが見開きで有効。
 
 連結読み (`draw_fs_continuous_reading`) は、`SpreadMode` のページ構成 (単ページ / 見開き)

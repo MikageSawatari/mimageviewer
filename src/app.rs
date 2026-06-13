@@ -20579,18 +20579,27 @@ impl App {
         if let Some(&rot) = self.rotation_cache.get(&idx) {
             return rot;
         }
-        let path = match self.items.get(idx) {
-            Some(GridItem::Image(p)) => p.clone(),
-            Some(GridItem::Video(p)) => p.clone(),
-            _ => return crate::rotation_db::Rotation::None,
+        let Some(key) = self.rotation_key_for_idx(idx) else {
+            return crate::rotation_db::Rotation::None;
         };
         let rot = self
             .rotation_db
             .as_ref()
-            .and_then(|db| db.get(&path))
+            .and_then(|db| db.get_key(&key))
             .unwrap_or(crate::rotation_db::Rotation::None);
         self.rotation_cache.insert(idx, rot);
         rot
+    }
+
+    fn rotation_key_for_idx(&self, idx: usize) -> Option<String> {
+        match self.items.get(idx)? {
+            GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
+                self.page_path_key(idx)
+            }
+            // 旧実装との互換: 動画サムネの回転キーは実パスのまま維持する。
+            GridItem::Video(p) => Some(crate::adjustment_db::normalize_path(p)),
+            _ => None,
+        }
     }
 
     /// 指定 idx の画像を時計回りに 90° 回転する。
@@ -20608,14 +20617,12 @@ impl App {
     }
 
     fn apply_rotation(&mut self, idx: usize, rot: crate::rotation_db::Rotation) {
-        let path = match self.items.get(idx) {
-            Some(GridItem::Image(p)) => p.clone(),
-            Some(GridItem::Video(p)) => p.clone(),
-            _ => return,
+        let Some(key) = self.rotation_key_for_idx(idx) else {
+            return;
         };
         self.rotation_cache.insert(idx, rot);
         if let Some(ref db) = self.rotation_db {
-            let _ = db.set(&path, rot);
+            let _ = db.set_key(&key, rot);
         }
     }
 
