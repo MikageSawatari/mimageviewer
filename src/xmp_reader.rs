@@ -605,11 +605,23 @@ pub fn try_read_dc_subject(path: &Path) -> Result<Vec<String>, std::io::Error> {
 
 const DC_SUBJECT_LEGACY_SEED_SCAN_LIMIT: u64 = 2 * 1024 * 1024;
 
+/// WebP XMP チャンクの読み取り上限。XMP packet がこれを超えることは実運用上ない
+/// (Extended XMP 相当のツイート情報込みでも数百 KB)。壊れた size フィールドで
+/// 巨大確保しないためのガード。
+const WEBP_XMP_CHUNK_READ_LIMIT: u64 = 8 * 1024 * 1024;
+
 /// 自動 legacy seed 用の XMP `dc:subject` 読み取り。
 ///
 /// 明示インポートは完全性優先で [`try_read_dc_subject`] を使うが、フォルダ表示時に
 /// 走る自動 seed は大量ファイルを処理し得るため、画像/コンテナ本体は先頭 2MiB
 /// だけ読む。動画 `.xmp` sidecar はメディア本体ではないので通常どおり全体を読む。
+///
+/// **WebP は例外で RIFF チャンク walk**: mIV v1.0 の WebP 書き込み
+/// (`xmp_writer::apply_tag_op_webp`) は `XMP ` チャンクを RIFF **末尾**に置くため、
+/// 先頭 prefix 読みでは 2MiB 超のタグ付き WebP を必ず取りこぼし、しかも seed は
+/// 「タグなし」を `tag_item_state` に恒久記録してしまう (= 自動移行が二度と走らない)。
+/// RIFF はチャンク構造なのでヘッダだけ seek で辿れば、全読みせず確実に XMP に届く。
+/// JPEG (APP1 は SOS より前) / PNG (mIV は IHDR 直後に iTXt) は先頭 2MiB で確実。
 pub fn try_read_dc_subject_for_legacy_seed(path: &Path) -> Result<Vec<String>, std::io::Error> {
     if let Some(result) = try_read_dc_subject_video_sidecar(path) {
         return result;
@@ -617,8 +629,57 @@ pub fn try_read_dc_subject_for_legacy_seed(path: &Path) -> Result<Vec<String>, s
     if !extension_might_have_xmp(path) {
         return Ok(Vec::new());
     }
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("webp"))
+    {
+        return read_webp_xmp_dc_subject(path);
+    }
     let bytes = read_prefix(path, DC_SUBJECT_LEGACY_SEED_SCAN_LIMIT)?;
     Ok(read_dc_subject_from_bytes(&bytes))
+}
+
+/// WebP の `XMP ` チャンクだけを RIFF チャンク walk で読み、dc:subject を返す。
+/// チャンク数は VP8X/ICCP/ANIM/画像データ/EXIF/XMP 程度で高々数十個、
+/// 各ステップはヘッダ 8 バイト read + payload seek なので I/O はごく小さい。
+/// XMP チャンク不在・RIFF として不正なファイルは「タグなし」(= Ok(空)) を返す。
+fn read_webp_xmp_dc_subject(path: &Path) -> Result<Vec<String>, std::io::Error> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path)?;
+    let mut header = [0u8; 12];
+    if f.read_exact(&mut header).is_err() {
+        return Ok(Vec::new());
+    }
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WEBP" {
+        return Ok(Vec::new());
+    }
+    loop {
+        let mut chunk_header = [0u8; 8];
+        if f.read_exact(&mut chunk_header).is_err() {
+            // EOF (XMP チャンクなし) や途中で切れたファイル: タグなし扱い。
+            return Ok(Vec::new());
+        }
+        let size = u32::from_le_bytes([
+            chunk_header[4],
+            chunk_header[5],
+            chunk_header[6],
+            chunk_header[7],
+        ]) as u64;
+        if &chunk_header[0..4] == b"XMP " {
+            let take = size.min(WEBP_XMP_CHUNK_READ_LIMIT) as usize;
+            let mut xmp = vec![0u8; take];
+            if f.read_exact(&mut xmp).is_err() {
+                return Ok(Vec::new());
+            }
+            return Ok(parse_dc_subject(&xmp));
+        }
+        // チャンク payload (+ 奇数長は 1 バイト pad) を飛ばして次へ。
+        let skip = size + (size & 1);
+        if f.seek(SeekFrom::Current(skip as i64)).is_err() {
+            return Ok(Vec::new());
+        }
+    }
 }
 
 fn try_read_dc_subject_video_sidecar(path: &Path) -> Option<Result<Vec<String>, std::io::Error>> {
@@ -1520,6 +1581,61 @@ mod tests {
         assert_eq!(
             try_read_dc_subject(&path).unwrap(),
             vec!["#late-seed".to_string()]
+        );
+    }
+
+    /// mIV v1.0 の WebP 書き込みは XMP チャンクを RIFF 末尾に置く。2MiB 超の
+    /// タグ付き WebP でも legacy seed がチャンク walk で確実に拾えること
+    /// (prefix 読みのままだと「タグなし」を恒久記録して自動移行が壊れる回帰)。
+    #[test]
+    fn legacy_seed_reads_webp_xmp_chunk_at_riff_tail() {
+        let xml = br#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+    <rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'>
+      <dc:subject><rdf:Bag><rdf:li>#late-webp</rdf:li></rdf:Bag></dc:subject>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#;
+        // 画像データ相当の巨大チャンクの後ろに XMP チャンクを置いた WebP を合成
+        let image_payload_len = DC_SUBJECT_LEGACY_SEED_SCAN_LIMIT as usize + 128;
+        let mut chunks: Vec<u8> = Vec::new();
+        chunks.extend_from_slice(b"VP8 ");
+        chunks.extend_from_slice(&(image_payload_len as u32).to_le_bytes());
+        chunks.extend_from_slice(&vec![0u8; image_payload_len]);
+        chunks.extend_from_slice(b"XMP ");
+        chunks.extend_from_slice(&(xml.len() as u32).to_le_bytes());
+        chunks.extend_from_slice(xml);
+        if xml.len() % 2 == 1 {
+            chunks.push(0);
+        }
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&((chunks.len() + 4) as u32).to_le_bytes());
+        out.extend_from_slice(b"WEBP");
+        out.extend_from_slice(&chunks);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tail_xmp.webp");
+        std::fs::write(&path, &out).expect("write tempfile");
+
+        assert_eq!(
+            try_read_dc_subject_for_legacy_seed(&path).unwrap(),
+            vec!["#late-webp".to_string()]
+        );
+
+        // XMP チャンクの無い WebP は「タグなし」で確定 (エラーにしない)。
+        let mut plain: Vec<u8> = Vec::new();
+        plain.extend_from_slice(b"RIFF");
+        plain.extend_from_slice(&(12u32).to_le_bytes());
+        plain.extend_from_slice(b"WEBP");
+        plain.extend_from_slice(b"VP8 ");
+        plain.extend_from_slice(&(4u32).to_le_bytes());
+        plain.extend_from_slice(&[0u8; 4]);
+        let plain_path = dir.path().join("plain.webp");
+        std::fs::write(&plain_path, &plain).expect("write tempfile");
+        assert_eq!(
+            try_read_dc_subject_for_legacy_seed(&plain_path).unwrap(),
+            Vec::<String>::new()
         );
     }
 

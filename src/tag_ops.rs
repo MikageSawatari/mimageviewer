@@ -47,32 +47,57 @@ fn legacy_xmp_target_for_item(item: &GridItem) -> Option<PathBuf> {
 }
 
 impl App {
-    /// タグ書き込みの対象ファイル列。優先順位:
+    /// 変換アーカイブ (RAR/7z/LZH) 閲覧中のタグ対象 remap。
+    ///
+    /// フルスクリーンの ZipImage フォールバックは `zip_path` (= archive_cache の
+    /// 変換済み ZIP) を返すが、タグの item_key は **元アーカイブのパス** に紐づける
+    /// (docs/tag-catalog-redesign-plan.md §8.3)。さもないとグリッドの
+    /// `ConvertibleArchive` セル (元パスキー) とキーが割れてバッジが出ず、
+    /// キャッシュ削除後のタグビュー prune でタグ行が恒久消失する。
+    /// ★ の `zip_rating_root_path` / ピンの `zip_pin_root_path` と同じ規則。
+    pub(crate) fn remap_tag_target_path(&self, path: PathBuf) -> PathBuf {
+        if let Some(src) = self.archive_source_override.as_ref()
+            && self
+                .current_folder
+                .as_ref()
+                .is_some_and(|cur| crate::folder_tree::path_eq(cur, &path))
+        {
+            src.clone()
+        } else {
+            path
+        }
+    }
+
+    fn remap_tag_target(&self, mut target: TagTarget) -> TagTarget {
+        let remapped = self.remap_tag_target_path(target.path.clone());
+        if remapped != target.path {
+            target.path = remapped;
+            // サイドカーの書き先も元アーカイブの隣に追従させる
+            // (archive_cache フォルダに mimageviewer.dat を作らない)。
+            if target.tag_sidecar.is_some() {
+                target.tag_sidecar =
+                    crate::tag_write_worker::sidecar_target_for_real_file(&target.path);
+            }
+        }
+        target
+    }
+
+    /// 選択解決の共有ポリシー。優先順位:
     ///   1. **フルスクリーン中** (`fullscreen_idx` Some) は常にフルスクリーン中のページのみ。
     ///      古い `checked` がグリッドに残っていても無視する (フルスクリーンで見えているのは
-    ///      1 枚なので、ユーザーの「これにタグ」期待と必ず一致させる)。
+    ///      1 枚なので、ユーザーの「これに操作」期待と必ず一致させる)。
     ///   2. グリッドで `checked` が **selected も含む** 形で揃っていれば、checked 全件を bulk 対象
     ///      にする (典型的な multi-select フロー)。selected が checked に含まれない場合は
     ///      「checked は古い残りもの」とみなして selected 単体に落とす — クリックしたサムネが
     ///      対象にならない事故を防ぐ。
     ///   3. checked が空なら selected 単体。
-    ///   4. selected も無ければ fullscreen_idx (フルスクリーンに居なくても残っていれば)。
-    /// いずれも実パスを持つタグ対応 item のみ。ZIP/PDF ページのフルスクリーン中は
-    /// コンテナ自身へフォールバックする。
-    fn tag_targets(&self) -> Vec<TagTarget> {
-        let push_taggable = |out: &mut Vec<TagTarget>, idx: usize, items: &[GridItem], fs: bool| {
-            let Some(item) = items.get(idx) else {
-                return;
-            };
-            if let Some(target) = tag_target_for_item(item, fs) {
-                out.push(target);
-            }
-        };
-
-        let mut out: Vec<TagTarget> = Vec::new();
+    ///
+    /// タグ操作 (`tag_targets`) と旧XMP取り込み (`legacy_xmp_targets`) の**両方がこの
+    /// 1 実装を使う** — bulk_intent の stale-check が片方だけ改良されると、同じ選択でも
+    /// 対象ファイル集合が割れ、破壊的な XMP 編集が想定外のファイルに当たる。
+    fn selection_target_indices(&self) -> Vec<usize> {
         if let Some(fs_idx) = self.fullscreen_idx {
-            push_taggable(&mut out, fs_idx, &self.items, true);
-            return out;
+            return vec![fs_idx];
         }
         let bulk_intent = match self.selected {
             Some(sel) => !self.checked.is_empty() && self.checked.contains(&sel),
@@ -81,15 +106,23 @@ impl App {
         if bulk_intent {
             let mut indices: Vec<usize> = self.checked.iter().copied().collect();
             indices.sort_unstable(); // worker のジョブ投入順 = トースト集計順を安定化
-            for idx in indices {
-                push_taggable(&mut out, idx, &self.items, false);
-            }
-            return out;
+            return indices;
         }
-        if let Some(idx) = self.selected {
-            push_taggable(&mut out, idx, &self.items, false);
-        }
-        out
+        self.selected.map(|idx| vec![idx]).unwrap_or_default()
+    }
+
+    /// タグ書き込みの対象ファイル列 (`selection_target_indices` の解決結果のうち、
+    /// 実パスを持つタグ対応 item のみ)。ZIP/PDF ページのフルスクリーン中は
+    /// コンテナ自身へフォールバックする (変換アーカイブは元パスへ remap)。
+    fn tag_targets(&self) -> Vec<TagTarget> {
+        let fullscreen = self.fullscreen_idx.is_some();
+        self.selection_target_indices()
+            .into_iter()
+            .filter_map(|idx| {
+                let item = self.items.get(idx)?;
+                tag_target_for_item(item, fullscreen).map(|target| self.remap_tag_target(target))
+            })
+            .collect()
     }
 
     pub(crate) fn tag_target_paths(&self) -> Vec<PathBuf> {
@@ -104,33 +137,11 @@ impl App {
     }
 
     fn legacy_xmp_targets(&self) -> Vec<PathBuf> {
-        let push_target = |out: &mut Vec<PathBuf>, idx: usize, items: &[GridItem]| {
-            let Some(item) = items.get(idx) else {
-                return;
-            };
-            if let Some(path) = legacy_xmp_target_for_item(item) {
-                out.push(path);
-            }
-        };
-
-        let mut out = Vec::new();
-        if let Some(fs_idx) = self.fullscreen_idx {
-            push_target(&mut out, fs_idx, &self.items);
-        } else {
-            let bulk_intent = match self.selected {
-                Some(sel) => !self.checked.is_empty() && self.checked.contains(&sel),
-                None => !self.checked.is_empty(),
-            };
-            if bulk_intent {
-                let mut indices: Vec<usize> = self.checked.iter().copied().collect();
-                indices.sort_unstable();
-                for idx in indices {
-                    push_target(&mut out, idx, &self.items);
-                }
-            } else if let Some(idx) = self.selected {
-                push_target(&mut out, idx, &self.items);
-            }
-        }
+        let mut out: Vec<PathBuf> = self
+            .selection_target_indices()
+            .into_iter()
+            .filter_map(|idx| self.items.get(idx).and_then(legacy_xmp_target_for_item))
+            .collect();
         out.sort();
         out.dedup();
         out
@@ -149,8 +160,13 @@ impl App {
         mut targets: Vec<PathBuf>,
         mode: LegacyXmpImportMode,
     ) {
-        if self.tag_legacy_xmp_pending.is_some() {
-            self.show_feedback_toast("旧XMPタグの取り込み処理中です".to_string());
+        if let Some(pending) = self.tag_legacy_xmp_pending.as_ref() {
+            // 実行中の再実行 = 中止要求。ImportAndRemove はファイルを書き換える
+            // 破壊的バッチなので、必ずユーザーが止められる経路を持つ。
+            pending.cancel();
+            self.show_feedback_toast(
+                "旧XMPタグの取り込みを中止します (処理済み分は反映されます)".to_string(),
+            );
             return;
         }
         targets.retain(|path| {
@@ -169,14 +185,14 @@ impl App {
             targets,
             mode,
         ));
-        self.show_feedback_toast(format!("{} ({count} 件)", mode.progress_label()));
+        self.show_feedback_toast(format!(
+            "{} ({count} 件) — もう一度実行すると中止",
+            mode.progress_label()
+        ));
     }
 
     pub(crate) fn request_tag_toggle_for_selection(&mut self, name: &str) {
         let name_owned = name.to_string();
-        // 複数選択は all-or-nothing: 全対象に付与済みなら全削除、それ以外は全付与。
-        // 結果は `poll_tag_write_results` が完了時にまとめてトースト表示する。
-        self.tag_toast_label = Some(format!("#{name_owned}"));
         let mode = if self.fullscreen_idx.is_some() {
             "fullscreen"
         } else {
@@ -197,6 +213,12 @@ impl App {
         if !self.precheck_tag_write_available("toggle") {
             return;
         }
+        // 複数選択は all-or-nothing: 全対象に付与済みなら全削除、それ以外は全付与。
+        // 結果は `poll_tag_write_results` が完了時にまとめてトースト表示する。
+        // ラベルは worker キュー全体で共有する 1 フィールドなので、**バリデーション通過後**
+        // に設定する。早期 return 経路で上書きすると、in-flight の前バッチの完了トーストが
+        // 誤ったタグ名を名乗る (空 targets での中断 → 古いバッチに新ラベル)。
+        self.tag_toast_label = Some(format!("#{name_owned}"));
         self.hydrate_tags_cache_for_paths(&paths);
         let tag_key = crate::tags_db::normalize_tag_key(&name_owned);
         let all_have_tag = paths.iter().all(|path| {
@@ -642,7 +664,7 @@ impl App {
                 self.show_feedback_toast(format_legacy_xmp_import_toast(
                     mode,
                     &report,
-                    result.errors.len(),
+                    &result.errors,
                 ));
             }
             Err(e) => {
@@ -766,7 +788,7 @@ fn format_completion_toast(
 fn format_legacy_xmp_import_toast(
     mode: LegacyXmpImportMode,
     report: &LegacyXmpImportReport,
-    errors: usize,
+    errors: &[(std::path::PathBuf, String)],
 ) -> String {
     let mut msg = if mode.removes_from_file() {
         if report.cleaned_files > 0 {
@@ -795,8 +817,28 @@ fn format_legacy_xmp_import_toast(
     } else {
         "旧XMPタグは見つかりませんでした".to_string()
     };
-    if errors > 0 {
-        msg.push_str(&format!(" / 失敗 {errors} 件"));
+    if report.cancelled {
+        msg = format!("中止しました — {msg}");
+    }
+    if !errors.is_empty() {
+        // どのファイルが失敗したか分からないと、ImportAndRemove では「# タグが
+        // 残ったままのファイル」を特定できない (v1.0 のタグ書き込み失敗トーストと
+        // 同様にファイル名を上位 3 件まで併記、全件は mimageviewer.log)。
+        let preview = errors
+            .iter()
+            .take(3)
+            .map(|(path, e)| {
+                format!(
+                    "{}: {}",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string()),
+                    e
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" / ");
+        msg.push_str(&format!(" / 失敗 {} 件: {}", errors.len(), preview));
     }
     msg
 }
@@ -884,9 +926,29 @@ mod tests {
             deleted_video_sidecars: 1,
             ..LegacyXmpImportReport::default()
         };
+        let errors = vec![(
+            std::path::PathBuf::from("C:/pics/locked.jpg"),
+            "ファイル更新失敗: アクセス拒否".to_string(),
+        )];
         assert_eq!(
-            format_legacy_xmp_import_toast(LegacyXmpImportMode::ImportAndRemove, &report, 1),
-            "旧XMPタグを取り込み、2 件のファイルから削除しました / 動画sidecar 1 件削除 / 失敗 1 件"
+            format_legacy_xmp_import_toast(LegacyXmpImportMode::ImportAndRemove, &report, &errors),
+            "旧XMPタグを取り込み、2 件のファイルから削除しました / 動画sidecar 1 件削除 \
+             / 失敗 1 件: locked.jpg: ファイル更新失敗: アクセス拒否"
+        );
+    }
+
+    /// 中止時はその旨を明示し、処理済み分の集計も出す。
+    #[test]
+    fn legacy_xmp_toast_mentions_cancellation() {
+        let report = LegacyXmpImportReport {
+            imported_items: 2,
+            inserted_tags: 3,
+            cancelled: true,
+            ..LegacyXmpImportReport::default()
+        };
+        assert_eq!(
+            format_legacy_xmp_import_toast(LegacyXmpImportMode::ImportOnly, &report, &[]),
+            "中止しました — 旧XMPタグを取り込みました: 2 件 / 新規 3 個"
         );
     }
 }

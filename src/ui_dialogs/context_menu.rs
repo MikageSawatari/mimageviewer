@@ -286,14 +286,17 @@ impl crate::app::App {
         let has_checked = !is_folder_context && !self.checked.is_empty();
         let checked_count = self.checked.len();
         let mut nav: Option<ContextMenuAction> = None;
-        // 検索結果ビュー中だけ「フォルダに移動」を出す。
-        let in_search = self.global_search.active || self.favsearch.active;
+        // 検索結果ビュー中だけ「フォルダに移動」を出す。タグビューも対象 —
+        // ディスク中に散在するタグ付きヒットから収納フォルダへ飛ぶのは
+        // タグビューの主要動線そのもの (UX レビュー【🟧11】)。
+        let in_search = self.global_search.active || self.favsearch.active || self.tag_view.active;
         // ペーストは「検索結果グリッドを表示中」だけ無効化する (外部 D&D と同じ判定)。
         // 検索前の実フォルダへ誤って貼り付けないため。検索から実フォルダを開いた後は
         // current_favorite_target が確定するのでペースト可に戻す (`active` ではなく
         // on-results-grid で判定する点が重要)。
-        let on_search_results =
-            self.items_are_global_search_view || self.favsearch.on_results_grid();
+        let on_search_results = self.items_are_global_search_view
+            || self.favsearch.on_results_grid()
+            || self.items_are_tag_view;
         let paste_target = if on_search_results {
             None
         } else {
@@ -748,6 +751,8 @@ impl crate::app::App {
             self.global_search.saved_folder.clone()
         } else if self.favsearch.active {
             self.favsearch.saved_folder.clone()
+        } else if self.tag_view.active {
+            self.tag_view.saved_folder.clone()
         } else {
             None
         };
@@ -760,6 +765,10 @@ impl crate::app::App {
         if self.favsearch.active {
             self.favsearch.saved_folder = None;
             self.close_favsearch();
+        }
+        if self.tag_view.active {
+            self.tag_view.saved_folder = None;
+            self.close_tag_view();
         }
         // 「フォルダに移動」は検索を明示終了して実フォルダへ着地する正当な
         // ナビゲーションなので「検索前フォルダ C → 移動先 X」を履歴に残す。

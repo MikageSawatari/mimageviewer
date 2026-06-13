@@ -4141,6 +4141,31 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.meta_undo.undo_len(), 0);
     }
 
+    /// 変換アーカイブ (RAR/7z/LZH) 閲覧中のフルスクリーンタグ操作は、archive_cache の
+    /// 変換済み ZIP ではなく **元アーカイブのパス** にタグを紐づける
+    /// (docs/tag-catalog-redesign-plan.md §8.3、★ の zip_rating_root_path と同一規則)。
+    /// キャッシュ ZIP キーに紐づくとグリッドの ConvertibleArchive バッジと割れ、
+    /// キャッシュ削除後のタグビュー prune でタグが恒久消失する。
+    #[test]
+    fn fullscreen_tag_target_in_converted_archive_uses_source_archive_path() {
+        let mut app = setup_app();
+        let cache_zip = PathBuf::from(r"C:\appdata\mimageviewer\archive_cache\ab12\book.zip");
+        let source_rar = PathBuf::from(r"D:\comics\book.rar");
+        app.current_folder = Some(cache_zip.clone());
+        app.archive_source_override = Some(source_rar.clone());
+        app.items.push(GridItem::ZipImage {
+            zip_path: cache_zip.clone(),
+            entry_name: "p001.jpg".into(),
+        });
+        app.fullscreen_idx = Some(0);
+
+        assert_eq!(app.tag_target_paths(), vec![source_rar.clone()]);
+
+        // 通常 ZIP (override なし) では従来どおり zip_path 自身がタグ対象。
+        app.archive_source_override = None;
+        assert_eq!(app.tag_target_paths(), vec![cache_zip]);
+    }
+
     /// Codex P2 #1 回帰: グリッド Q / Ctrl+Backspace の一括解除
     /// (`clear_page_params_for_selection`) が capture_adjust_full でラップされ、
     /// N 枚の個別設定が 1 回の Ctrl+Z で全て復元される。

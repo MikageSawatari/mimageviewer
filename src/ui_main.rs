@@ -2109,14 +2109,31 @@ impl App {
                 }
             }
             if !query_key.is_empty() {
-                if let Some(db) = self.tags_db.as_ref() {
-                    for summary in db.find_by_prefix(&self.facet_tag_search_query, 50) {
+                // find_by_prefix は SQLite の GROUP BY + LIKE。menu closure は毎フレーム
+                // 実行されるので、正規化クエリが変わったときだけ引き直す
+                // (tag_apply の cached_tag_apply_suggestions と同じパターン)。
+                let cache_stale = self
+                    .facet_tag_suggestion_cache
+                    .as_ref()
+                    .is_none_or(|(key, _)| *key != query_key);
+                if cache_stale {
+                    let summaries = self
+                        .tags_db
+                        .as_ref()
+                        .map(|db| db.find_by_prefix(&self.facet_tag_search_query, 50))
+                        .unwrap_or_default();
+                    self.facet_tag_suggestion_cache = Some((query_key.clone(), summaries));
+                }
+                if let Some((_, summaries)) = self.facet_tag_suggestion_cache.as_ref() {
+                    for summary in summaries {
                         let display = display_names
                             .get(&summary.tag_key)
                             .cloned()
-                            .unwrap_or(summary.tag);
+                            .unwrap_or_else(|| summary.tag.clone());
                         let count = counts.get(&summary.tag_key).copied().unwrap_or(0);
-                        choices.entry(summary.tag_key).or_insert((display, count));
+                        choices
+                            .entry(summary.tag_key.clone())
+                            .or_insert((display, count));
                     }
                 }
             }
@@ -2368,6 +2385,12 @@ impl App {
     }
 
     fn facet_tag_counts(&mut self) -> (BTreeMap<String, usize>, usize) {
+        // menu closure は開いている間毎フレーム実行される。全可視アイテム × 全タグの
+        // NFKC 正規化を毎フレーム回さないよう、タグ変更 (invalidate_tag_apply_suggestions)
+        // と表示集合変更 (rebuild_visible_indices) まではキャッシュを返す。
+        if let Some((counts, untagged)) = self.facet_tag_counts_cache.as_ref() {
+            return (counts.clone(), *untagged);
+        }
         let indices = self.facet_candidate_indices(FacetField::Tags);
         let mut counts = BTreeMap::new();
         let mut untagged = 0usize;
@@ -2397,6 +2420,7 @@ impl App {
                 }
             }
         }
+        self.facet_tag_counts_cache = Some((counts.clone(), untagged));
         (counts, untagged)
     }
 
@@ -2930,6 +2954,7 @@ impl App {
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
+            self.search_tag_bridge.clear();
             self.cancel_search_pending();
             self.rebuild_visible_indices();
             return;
@@ -2990,6 +3015,7 @@ impl App {
                     self.search_filter = None;
                     self.search_filter_origin_folder = None;
                     self.search_has_focus = false;
+                    self.search_tag_bridge.clear();
                     self.cancel_search_pending();
                     self.rebuild_visible_indices();
                 }
@@ -3040,6 +3066,7 @@ impl App {
                     self.search_filter = None;
                     self.search_filter_origin_folder = None;
                     self.search_has_focus = false;
+                    self.search_tag_bridge.clear();
                     self.cancel_search_pending();
                     self.rebuild_visible_indices();
                 }
@@ -3084,7 +3111,39 @@ impl App {
                     );
                 }
             });
+            // タグ橋渡しチップ (D17): クエリ語が mIV タグに一致したら、タグビューへの
+            // ワンクリック導線を出す (Ctrl+G と同等。タグ自体は Ctrl+F の検索対象外)。
+            let mut open_tag_bridge: Option<String> = None;
+            if !self.search_tag_bridge.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(44.0);
+                    ui.label(
+                        egui::RichText::new("タグ候補:")
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(150)),
+                    )
+                    .on_hover_text(
+                        "mIV タグは Ctrl+F の絞り込み対象には混ぜません。\n\
+                         ここからタグビューを開いて tags.db のタグ付き項目を表示できます。",
+                    );
+                    for suggestion in self.search_tag_bridge.clone() {
+                        let label = format!("#{} ({}件)", suggestion.tag, suggestion.count);
+                        if ui
+                            .small_button(label)
+                            .on_hover_text("タグビューで表示")
+                            .clicked()
+                        {
+                            open_tag_bridge = Some(suggestion.tag);
+                        }
+                    }
+                });
+            }
             ui.add_space(2.0);
+            if let Some(tag) = open_tag_bridge {
+                // open_tag_view_with_query が close_other_search_bars で Ctrl+F バーを
+                // 閉じる (相互排他) ので、ここでの後始末は不要。
+                self.open_tag_view_for_tag(&tag);
+            }
         });
     }
 

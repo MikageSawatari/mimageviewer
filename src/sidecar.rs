@@ -146,6 +146,14 @@ pub struct SidecarFile {
     last_change: Option<Instant>,
 }
 
+/// 実ファイル (フォルダ直下のメディア/コンテナ) のサイドカー相対キー。
+/// `App::sidecar_relative_key` の Image 系と `tag_write_worker` のタグバックアップが
+/// **同じ導出式を共有する** — 式が割れると同じ `.dat` 内でフィールドごとにキーが
+/// 食い違い、インポートで検出不能な不整合になる。
+pub(crate) fn real_file_rel_key(path: &Path) -> Option<String> {
+    Some(path.file_name()?.to_string_lossy().to_lowercase())
+}
+
 impl SidecarFile {
     /// 空のサイドカーを新規作成する (ディスクからは読まない)。
     pub fn new(folder: PathBuf) -> Self {

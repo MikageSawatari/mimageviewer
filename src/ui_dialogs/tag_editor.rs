@@ -311,6 +311,10 @@ fn order_retag_ops(ops: Vec<RetagOp>) -> Vec<RetagOp> {
     let (mut key_ops, display_ops): (Vec<_>, Vec<_>) =
         ops.into_iter().partition(|op| op.old_key != op.new_key);
     let mut ordered = Vec::with_capacity(key_ops.len() + display_ops.len());
+    // 改名サイクルを切るための一時キー経由 hop の「後段」(tmp → 最終キー)。
+    // サイクル構成キーが全て退避し終わった後 (= ordered の末尾) で実行する。
+    let mut deferred: Vec<RetagOp> = Vec::new();
+    let mut tmp_counter = 0usize;
     while !key_ops.is_empty() {
         let old_keys: HashSet<_> = key_ops.iter().map(|op| op.old_key.as_str()).collect();
         if let Some(pos) = key_ops
@@ -319,9 +323,26 @@ fn order_retag_ops(ops: Vec<RetagOp>) -> Vec<RetagOp> {
         {
             ordered.push(key_ops.remove(pos));
         } else {
-            ordered.extend(key_ops.drain(..));
+            // 残りが全て「new_key も別 op の old_key」= 改名サイクル (例: cat↔dog の
+            // 入れ替え)。そのまま順次実行すると retag がマージ (衝突行の hard delete)
+            // になり、2 つのタグが不可逆に合体する。先頭の op を一時キー経由の
+            // 2 hop (old→tmp, 後段で tmp→new) に分割してサイクルを切る。
+            // tmp は U+0001 を含む合成キーで、normalize_tag_key (trim/NFKC/lowercase)
+            // を素通りし、かつユーザー入力と衝突しない。
+            let mut op = key_ops.remove(0);
+            tmp_counter += 1;
+            let tmp = format!("\u{1}retag-tmp-{tmp_counter}");
+            deferred.push(RetagOp {
+                old_key: tmp.clone(),
+                new_key: op.new_key.clone(),
+                new_name: op.new_name.clone(),
+            });
+            op.new_key = tmp.clone();
+            op.new_name = tmp;
+            ordered.push(op);
         }
     }
+    ordered.extend(deferred);
     ordered.extend(display_ops);
     ordered
 }
@@ -398,5 +419,72 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].old_key, "cat");
         assert_eq!(ops[0].new_key, "dog");
+    }
+
+    fn retag(old_key: &str, new_key: &str, new_name: &str) -> RetagOp {
+        RetagOp {
+            old_key: old_key.to_string(),
+            new_key: new_key.to_string(),
+            new_name: new_name.to_string(),
+        }
+    }
+
+    /// 改名サイクル (cat↔dog の入れ替え) は一時キー経由に分割される。
+    /// 分割しないと retag が「マージ」として実行され 2 タグが不可逆に合体する。
+    #[test]
+    fn order_retag_ops_breaks_rename_cycle_via_temp_key() {
+        let ordered = order_retag_ops(vec![retag("cat", "dog", "dog"), retag("dog", "cat", "cat")]);
+
+        assert_eq!(ordered.len(), 3);
+        // hop1: cat → tmp (tmp はユーザー入力と衝突しない U+0001 キー)
+        assert_eq!(ordered[0].old_key, "cat");
+        assert!(ordered[0].new_key.starts_with('\u{1}'));
+        // dog → cat は cat が空いた後に実行できる
+        assert_eq!(ordered[1].old_key, "dog");
+        assert_eq!(ordered[1].new_key, "cat");
+        // hop2: tmp → dog (サイクル解消後)
+        assert_eq!(ordered[2].old_key, ordered[0].new_key);
+        assert_eq!(ordered[2].new_key, "dog");
+        assert_eq!(ordered[2].new_name, "dog");
+    }
+
+    /// 実 DB での swap 適用結果: アイテム集合が入れ替わるだけで合体しない回帰テスト。
+    #[test]
+    fn retag_swap_preserves_distinct_item_sets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = crate::tags_db::TagsDb::open_at(&dir.path().join("tags.db")).expect("open");
+        db.set_item_tags("item_a", ["cat"], "edit").unwrap();
+        db.set_item_tags("item_b", ["dog"], "edit").unwrap();
+
+        let ordered = order_retag_ops(vec![retag("cat", "dog", "dog"), retag("dog", "cat", "cat")]);
+        for op in ordered {
+            db.retag_key(&op.old_key, &op.new_name).expect("retag");
+        }
+
+        assert_eq!(db.display_tags_for_item("item_a"), vec!["#dog"]);
+        assert_eq!(db.display_tags_for_item("item_b"), vec!["#cat"]);
+    }
+
+    /// 3 タグのローテーション (a→b→c→a) も temp 1 個で解消される。
+    #[test]
+    fn order_retag_ops_handles_three_way_rotation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = crate::tags_db::TagsDb::open_at(&dir.path().join("tags.db")).expect("open");
+        db.set_item_tags("item_a", ["a"], "edit").unwrap();
+        db.set_item_tags("item_b", ["b"], "edit").unwrap();
+        db.set_item_tags("item_c", ["c"], "edit").unwrap();
+
+        let ordered = order_retag_ops(vec![
+            retag("a", "b", "b"),
+            retag("b", "c", "c"),
+            retag("c", "a", "a"),
+        ]);
+        for op in ordered {
+            db.retag_key(&op.old_key, &op.new_name).expect("retag");
+        }
+
+        assert_eq!(db.display_tags_for_item("item_a"), vec!["#b"]);
+        assert_eq!(db.display_tags_for_item("item_b"), vec!["#c"]);
+        assert_eq!(db.display_tags_for_item("item_c"), vec!["#a"]);
     }
 }

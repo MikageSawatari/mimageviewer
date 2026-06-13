@@ -391,20 +391,23 @@ impl App {
     }
 
     /// 現在のフルスクリーン項目のタグ対象パスを返す。
+    /// 変換アーカイブ閲覧中はコンテナを元アーカイブパスへ remap する
+    /// (`App::remap_tag_target_path`、tag_ops.rs と同一規則)。
     fn current_tag_target_path(&self) -> Option<std::path::PathBuf> {
         use crate::grid_item::GridItem;
         let idx = self.fullscreen_idx?;
-        match self.items.get(idx)? {
+        let path = match self.items.get(idx)? {
             GridItem::Folder(p)
             | GridItem::Image(p)
             | GridItem::Video(p)
             | GridItem::ZipFile(p)
             | GridItem::PdfFile(p)
-            | GridItem::ConvertibleArchive { path: p, .. } => Some(p.clone()),
-            GridItem::ZipImage { zip_path, .. } => Some(zip_path.clone()),
-            GridItem::PdfPage { pdf_path, .. } => Some(pdf_path.clone()),
-            _ => None,
-        }
+            | GridItem::ConvertibleArchive { path: p, .. } => p.clone(),
+            GridItem::ZipImage { zip_path, .. } => zip_path.clone(),
+            GridItem::PdfPage { pdf_path, .. } => pdf_path.clone(),
+            _ => return None,
+        };
+        Some(self.remap_tag_target_path(path))
     }
 }
 

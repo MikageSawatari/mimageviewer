@@ -20,7 +20,9 @@ pub struct TagSidecarTarget {
 pub fn sidecar_target_for_real_file(path: &std::path::Path) -> Option<TagSidecarTarget> {
     Some(TagSidecarTarget {
         folder: path.parent()?.to_path_buf(),
-        rel_key: path.file_name()?.to_string_lossy().to_lowercase(),
+        // rel_key の導出式は sidecar.rs の正本を共有する (式が割れると同じ .dat 内で
+        // タグだけキーが食い違う)。
+        rel_key: crate::sidecar::real_file_rel_key(path)?,
     })
 }
 
@@ -204,6 +206,21 @@ fn run_worker(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
 
+        // spawn 時の open が一時要因 (AV スキャン / 他プロセスのファイルロック) で
+        // 失敗していても、セッション中ずっと全タグ操作を失敗させない —
+        // ジョブごとに再 open を試みる (worker は初回タグ操作時に 1 度だけ spawn
+        // されるため、ここで回復しないと再起動以外に復旧手段が無い)。
+        if db.is_none() {
+            match crate::tags_db::TagsDb::open() {
+                Ok(reopened) => {
+                    crate::logger::log("tag_write_worker: tags.db reopened after earlier failure");
+                    db = Some(reopened);
+                }
+                Err(e) => {
+                    crate::logger::log(format!("tag_write_worker: tags.db reopen failed: {e}"));
+                }
+            }
+        }
         let (res, tags_before, tags_after) = match db.as_mut() {
             Some(db) => process_job(&job, db),
             None => (

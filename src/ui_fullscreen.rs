@@ -1930,7 +1930,8 @@ pub(crate) struct FsKeyAction {
     pub(crate) jump_to: Option<usize>,
 }
 
-struct FsSeekInfo {
+#[derive(Clone)]
+pub(crate) struct FsSeekInfo {
     image_indices: Vec<usize>,
     current_pos: usize,
     media_count: usize,
@@ -2012,6 +2013,24 @@ impl App {
         })
     }
 
+    /// `fullscreen_seek_info` のフレーム間キャッシュ。
+    ///
+    /// シークバー (locked 時は常時表示) とページ番号 overlay (既定 ON) は毎フレーム
+    /// 描画されるが、中身は全 items の filter+collect ×2。10k ページ級のアーカイブで
+    /// フレームごとに作り直すのは純粋な無駄なので、`cached_nav_indices` と同じ
+    /// 無効化点 (rebuild_visible_indices / rebuild_details_order) でクリアされる
+    /// キャッシュに乗せる。fs_idx (ページ移動) が変わったときだけ作り直す。
+    fn fullscreen_seek_info_cached(&mut self, fs_idx: usize) -> Option<FsSeekInfo> {
+        if let Some((cached_idx, info)) = self.cached_fs_seek_info.as_ref()
+            && *cached_idx == fs_idx
+        {
+            return Some(info.clone());
+        }
+        let info = self.fullscreen_seek_info(fs_idx)?;
+        self.cached_fs_seek_info = Some((fs_idx, info.clone()));
+        Some(info)
+    }
+
     fn fullscreen_mixed_media_summary(info: &FsSeekInfo) -> String {
         let mut parts = Vec::new();
         if !info.image_indices.is_empty() {
@@ -2031,8 +2050,10 @@ impl App {
             return None;
         }
 
-        let display_order = self.current_grid_order().to_vec();
-        let image_indices = build_image_reading_indices(&self.items, &display_order);
+        // 毎フレーム呼ばれる (overlay 既定 ON)。display order の clone + 全 items の
+        // filter+collect を避け、シークバーと共有のキャッシュ済み reading indices を使う。
+        let info = self.fullscreen_seek_info_cached(fs_idx)?;
+        let image_indices = &info.image_indices;
         let total = image_indices.len();
         let position_for = |idx: usize| {
             image_indices
@@ -2133,10 +2154,6 @@ impl App {
         fs_idx: usize,
     ) -> Option<usize> {
         self.fs_seek_overlay_visible = false;
-        let Some(info) = self.fullscreen_seek_info(fs_idx) else {
-            self.fs_seek_drag_active = false;
-            return None;
-        };
         // 分析モード中は対象画像に集中するため、下端のページシークバーを出さない
         // (分析パネルの手描き content が下端にあり、clip しないままシークバーへはみ出す
         // 問題も併せて解消される)。
@@ -2161,6 +2178,8 @@ impl App {
                 .hover_pos()
                 .is_some_and(|pos| bottom_band.contains(pos))
         });
+        // 可視判定 (O(1)) を info 構築より先に行う: 非表示フレームで全 items の
+        // filter+collect を毎フレーム回さない (10k ページ級アーカイブの hot path)。
         if !locked && !bottom_hover && !self.fs_seek_drag_active {
             return None;
         }
@@ -2169,6 +2188,11 @@ impl App {
         if panel_rect.width() < 160.0 {
             return None;
         }
+
+        let Some(info) = self.fullscreen_seek_info_cached(fs_idx) else {
+            self.fs_seek_drag_active = false;
+            return None;
+        };
 
         self.fs_seek_overlay_visible = true;
         ui.painter().rect_filled(
@@ -6548,7 +6572,15 @@ impl App {
             self.capture_fs_nav_holdover(fs_idx);
             return self.snapshot_advance_for_slideshow(/*forward=*/ true);
         }
-        if self.global_search.active || self.favsearch.active || self.show_search_bar {
+        // タグビューも検索結果と同じ扱い: 合成結果ビューに「次のフォルダ」は無いので
+        // false を返し、呼び出し側のループ fallback (先頭へ戻る) に任せる。ゲートから
+        // 漏らすと synthetic な current_folder を起点に DFS が走り、スライドショーが
+        // 黙って止まる (Ctrl+G/S との非対称)。
+        if self.global_search.active
+            || self.favsearch.active
+            || self.show_search_bar
+            || self.tag_view.active
+        {
             return false;
         }
         // ネスト ZIP 内: 手動 Ctrl+↓ (#4 改) と同じく DFS 前順で次の本へ進み、スライド

@@ -740,7 +740,10 @@ fn expand_zip<R: Read + Seek>(
         if !entry.is_file() {
             continue;
         }
-        let raw_name = entry.name().to_string();
+        // CP932 名は zip_loader と同じデコーダで解釈する。生 entry.name() (CP437
+        // mojibake) のまま出力 ZIP に書くと、直接閲覧 (zip_loader 経由) と変換
+        // キャッシュでエントリ名が割れ、キャッシュに mojibake 名が永続化する。
+        let raw_name = crate::zip_loader::zip_entry_name(&entry);
         let normalized = raw_name.replace('\\', "/");
         if should_ignore_entry(&normalized) {
             continue;

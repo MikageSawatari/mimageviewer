@@ -3424,6 +3424,25 @@ pub struct App {
     pub(crate) tag_apply_input: String,
     pub(crate) tag_apply_suggestion_key: Option<String>,
     pub(crate) tag_apply_suggestions: Vec<(String, String, usize, bool)>,
+    /// タグ付与ダイアログの選択スナップショット: (選択フィンガープリント, 対象パス,
+    /// 現在の選択タグ (name, tag_key, count))。毎フレームの全選択 clone + NFKC を防ぐ。
+    #[allow(clippy::type_complexity)]
+    pub(crate) tag_apply_selection_cache: Option<(
+        (usize, Option<usize>, Option<usize>),
+        Vec<PathBuf>,
+        Vec<(String, String, usize)>,
+    )>,
+    /// facet タグメニューのインクリメンタル検索結果キャッシュ (正規化クエリ keyed)。
+    /// egui の menu closure は開いている間毎フレーム実行されるため、キャッシュ無しだと
+    /// `find_by_prefix` (SQLite GROUP BY+LIKE) が毎フレーム UI スレッドで走る。
+    pub(crate) facet_tag_suggestion_cache: Option<(String, Vec<crate::tags_db::TagSummary>)>,
+    /// facet タグメニューの件数集計キャッシュ。タグ変更 (`invalidate_tag_apply_suggestions`)
+    /// と表示集合変更 (`rebuild_visible_indices`) で破棄する。
+    pub(crate) facet_tag_counts_cache: Option<(std::collections::BTreeMap<String, usize>, usize)>,
+    /// Ctrl+F のタグ橋渡し候補 (D17)。Ctrl+G と同様、検索実行時に tags.db を 1 回だけ
+    /// 照会し、一致タグがあれば「タグビューで表示」チップを検索バー下に出す。
+    /// タグは Ctrl+F の検索対象には混ぜない (§5.4 完全分離は不変)。
+    pub(crate) search_tag_bridge: Vec<crate::global_search_ui::TagBridgeSuggestion>,
     /// タグ管理ダイアログの改名/統合を tags.db へ反映する一回限り worker。
     pub(crate) tag_maintenance_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// タグ書き込み worker (初回要求時に遅延初期化)。
@@ -4330,6 +4349,9 @@ pub struct App {
     // ── 見開きペア解決用 nav_indices キャッシュ ────────────────
     /// フレーム内で build_nav_indices の結果をキャッシュ (items/visible_indices 変更でクリア)
     pub(crate) cached_nav_indices: Option<Vec<usize>>,
+    /// フルスクリーンのシークバー/ページ番号 overlay 用 reading-index キャッシュ
+    /// (fs_idx keyed)。`cached_nav_indices` と同じ箇所で無効化する。
+    pub(crate) cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
 
     // ── AI アップスケール ──────────────────────────────────────────
     /// AI ランタイム (ONNX Runtime)
@@ -5733,6 +5755,10 @@ impl App {
             tag_apply_input: String::new(),
             tag_apply_suggestion_key: None,
             tag_apply_suggestions: Vec::new(),
+            tag_apply_selection_cache: None,
+            facet_tag_suggestion_cache: None,
+            facet_tag_counts_cache: None,
+            search_tag_bridge: Vec::new(),
             tag_maintenance_rx: None,
             tag_write_handle: None,
             rating_write_handle: None,
@@ -6028,6 +6054,7 @@ impl App {
             pdf_placeholder_count: None,
             cached_handlers: None,
             cached_nav_indices: None,
+            cached_fs_seek_info: None,
 
             // AI (settings から復元)
             ai_runtime: None,
@@ -9083,6 +9110,7 @@ impl App {
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
+            self.search_tag_bridge.clear();
             self.cancel_search_pending();
             self.rebuild_visible_indices();
         }
@@ -9133,7 +9161,6 @@ impl App {
         self.tag_view.last_executed.clear();
         self.tag_view.last_executed_kind_filter = self.tag_view.kind_filter;
         self.tag_view.nav_stack.clear();
-        self.tag_view.results_paths.clear();
         self.tag_view.summaries.clear();
         self.tag_view.result_count = 0;
         self.tag_view.truncated = false;
@@ -9223,7 +9250,6 @@ impl App {
         self.tag_view.truncated = false;
         self.tag_view.result_count = 0;
         self.tag_view.nav_stack.clear();
-        self.tag_view.results_paths.clear();
         if let Some(pending) = self.tag_view_pending.take() {
             pending.cancel();
         }
@@ -9265,7 +9291,6 @@ impl App {
         self.tag_view.summaries = result.summaries;
         self.tag_view.truncated = result.truncated;
         self.tag_view.result_count = result.entries.len();
-        self.tag_view.results_paths = result.entries.iter().map(|e| e.path.clone()).collect();
 
         if result.query.trim().is_empty() {
             if self.items_are_tag_view {
@@ -9796,6 +9821,15 @@ impl App {
                 }
                 let result = crate::zip_loader::enumerate_image_entries_detailed(&path_w)
                     .map_err(|e| e.to_string());
+                if let Ok(enumeration) = &result {
+                    // CP932 デコード対応で entry_name が変わった ZIP のリリース済み
+                    // per-page キー (★/補正/注釈等) を、結果を UI へ返す**前**に移行する。
+                    // ここで済ませると開いた直後のレーティング読み出しが必ず新キーに当たる。
+                    crate::zip_key_migration::migrate_if_needed(
+                        &path_w,
+                        &enumeration.legacy_renames,
+                    );
+                }
                 let _ = tx.send(result);
             });
 
@@ -11441,7 +11475,11 @@ impl App {
         let prewarm_t0 = std::time::Instant::now();
         self.prewarm_rating_cache();
         // タグバッジ用も同様に tags.db から一括 prewarm。
+        // rating と合算すると tags.db 側の退行が見えないので区間を分けて計測する
+        // (cold tags.db + 大フォルダで UI スレッド同期クエリが伸びる潜在箇所)。
+        let prewarm_tags_t0 = std::time::Instant::now();
         self.prewarm_grid_tags();
+        let prewarm_tags_ms = prewarm_tags_t0.elapsed().as_secs_f64() * 1000.0;
         self.rebuild_visible_indices();
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -11453,6 +11491,13 @@ impl App {
                     "ms",
                     serde_json::Value::from(prewarm_t0.elapsed().as_secs_f64() * 1000.0),
                 )],
+            );
+            crate::perf::event(
+                "nav",
+                "sli_prewarm_tags",
+                None,
+                sli_seq,
+                &[("ms", serde_json::Value::from(prewarm_tags_ms))],
             );
         }
         // 表示モード: DB から読み込み、なければデフォルト値 (本体は apply_spread_for_key)。
@@ -18931,6 +18976,8 @@ impl App {
     /// ページ単位 (Image / ZipImage / PdfPage) + コンテナ (Folder / ZipFile / PdfFile) の両方。
     /// 動画 / セパレータ / ConvertibleArchive などは常に通す。
     pub(crate) fn rebuild_visible_indices(&mut self) {
+        // 表示集合が変わると facet タグ件数も変わる (ui_main::facet_tag_counts)。
+        self.facet_tag_counts_cache = None;
         self.sync_facet_filter_scope();
         let search_filter = self.search_filter.clone();
         // Codex P1-2 fix: effective_rating_filter() で ★一時解除中は [true;6] が返るので
@@ -18975,6 +19022,7 @@ impl App {
             self.details_order.clear();
         }
         self.cached_nav_indices = None;
+        self.cached_fs_seek_info = None;
         // WYSIWYG 原則: 非表示になったアイテムは checked / selected の対象から外す。
         // これで `handle_grid_keys` の `position().unwrap_or(0)` 起因の
         // 「F1 で非表示にした後、矢印キーで一覧先頭に飛ぶ」挙動も解消される。
@@ -19282,6 +19330,7 @@ impl App {
 
     pub(crate) fn rebuild_details_order(&mut self) {
         self.cached_nav_indices = None;
+        self.cached_fs_seek_info = None;
         let mut key = self.settings.details_sort_key;
         let mut ascending = self.settings.details_sort_ascending;
         if !self.details_sort_key_visible(key) {
@@ -19585,10 +19634,22 @@ impl App {
         if tokens.is_empty() {
             self.search_filter = None;
             self.search_filter_origin_folder = None;
+            self.search_tag_bridge.clear();
             self.rebuild_visible_indices();
             return;
         }
         self.search_filter_origin_folder = self.effective_folder();
+        // タグ橋渡し (D17): クエリ語が mIV タグと一致するなら「タグビューで表示」
+        // チップを出す。検索実行時に tags.db を 1 回引くだけで、Ctrl+F の検索対象に
+        // タグを混ぜるわけではない (Ctrl+G と同じ仕組み)。v1.0 で Ctrl+F `#タグ` を
+        // 常用していたユーザーが「ゼロヒット + 無誘導」で迷子になるのを防ぐ。
+        self.search_tag_bridge = self
+            .tags_db
+            .as_ref()
+            .map(|db| {
+                crate::global_search_ui::tag_bridge_suggestions_for_query(db, &self.search_query, 3)
+            })
+            .unwrap_or_default();
 
         // スレッドに渡すスナップショット: items は中身 PathBuf を含むので clone コストは
         // あるが、検索は低頻度操作なので許容範囲。xmp_cache は既読分のルックアップ
@@ -20634,7 +20695,7 @@ impl App {
                 self.tag_prewarm_queued.insert(idx);
                 continue;
             }
-            // 設定 ON かつ DB で rating 未登録 (= 0) のときだけ XMP から rating も読んで
+            // 設定 ON かつ DB で rating 未登録 (= 0) のときだけ XMP から rating を読んで
             // ハイドレートする。既に DB に値がある場合は XMP 読みを節約。
             let read_rating = self.settings.write_rating_to_xmp
                 && self.rating_cache.get(&idx).copied().unwrap_or(0) == 0;
@@ -20643,7 +20704,7 @@ impl App {
                 continue;
             }
             self.tag_prewarm_queued.insert(idx);
-            pending.push_job(p.clone(), read_rating);
+            pending.push_job(p.clone());
         }
     }
 
@@ -23558,10 +23619,7 @@ impl App {
     pub(crate) fn sidecar_relative_key(&self, idx: usize) -> Option<String> {
         let item = self.items.get(idx)?;
         match item {
-            GridItem::Image(p) => {
-                let name = p.file_name()?.to_string_lossy().to_lowercase();
-                Some(name)
-            }
+            GridItem::Image(p) => crate::sidecar::real_file_rel_key(p),
             GridItem::ZipImage {
                 zip_path,
                 entry_name,
@@ -33096,6 +33154,14 @@ impl App {
             }
         }
         self.stop_video_upscale_queue_for_exit();
+        // legacy タグ worker は detach thread なので、終了時はキャンセルを立てて
+        // ファイル境界で止める (特に ImportAndRemove はユーザーファイルを書き換える)。
+        if let Some(pending) = self.tag_legacy_seed_pending.as_ref() {
+            pending.cancel();
+        }
+        if let Some(pending) = self.tag_legacy_xmp_pending.as_ref() {
+            pending.cancel();
+        }
         self.persist_window_state_and_flush();
     }
 }
@@ -35072,15 +35138,25 @@ pub(crate) fn draw_cell(
     // 左上バッジ列: 補 (ページ個別補正) → レ (補正レイヤー) →
     // 消 (消しゴムマスク) → 📌(金、pin) → タグバッジ。
     // 横並びで、収まらなければ末尾省略。
+    // 並び順・表示条件・色・送り幅は `single_char_badges` / `single_char_badge_advance`
+    // が正本 (タグバッジ当たり判定 `grid_tag_badge_start` と共有 — 片方だけ変えると
+    // クリック判定がずれる)。
     {
-        let font = egui::FontId::proportional(11.0);
-        let pad_x = 4.0;
-        let mut x = rect.min.x + 3.0;
-        let y = rect.min.y + 3.0;
+        let font = egui::FontId::proportional(SINGLE_CHAR_BADGE_FONT_SIZE);
+        let pad_x = SINGLE_CHAR_BADGE_PAD_X;
+        let mut x = rect.min.x + SINGLE_CHAR_BADGE_START_OFFSET;
+        let y = rect.min.y + SINGLE_CHAR_BADGE_START_OFFSET;
         // 1 文字バッジ (補/消/📌) を 1 個描いて x を進める。galley 実測ベースで高さ・幅を
         // 決め、固定 16px に CJK / 絵文字が収まらず上が欠ける問題 (タグ/★と同族) を避ける。
         // 📌 は emoji font fallback で metrics が違うが、独立に measure するので影響しない。
-        let mut draw_single_char_badge = |glyph: &str, bg: egui::Color32, fg: egui::Color32| {
+        for (glyph, bg, fg) in single_char_badges(
+            has_page_override,
+            has_local_adjust,
+            has_mask,
+            has_conceal,
+            has_comic,
+            has_pin,
+        ) {
             let galley = painter.layout_no_wrap(glyph.to_string(), font.clone(), fg);
             let bg_w = galley.size().x + pad_x * 2.0;
             let bg_h = galley.size().y + BADGE_TEXT_TOP_PAD + BADGE_TEXT_BOTTOM_PAD;
@@ -35088,53 +35164,7 @@ pub(crate) fn draw_cell(
             painter.rect_filled(badge_rect, 3.0, bg);
             let text_pos = badge_rect.left_top() + egui::vec2(pad_x, BADGE_TEXT_TOP_PAD);
             painter.galley(text_pos, galley, fg);
-            x += bg_w + 2.0;
-        };
-        if has_page_override {
-            draw_single_char_badge(
-                "補",
-                egui::Color32::from_rgb(50, 120, 220),
-                egui::Color32::WHITE,
-            );
-        }
-        if has_local_adjust {
-            draw_single_char_badge(
-                "レ",
-                egui::Color32::from_rgb(60, 150, 130),
-                egui::Color32::WHITE,
-            );
-        }
-        if has_mask {
-            draw_single_char_badge(
-                "消",
-                egui::Color32::from_rgb(200, 80, 40),
-                egui::Color32::WHITE,
-            );
-        }
-        if has_conceal {
-            // 隠蔽加工バッジ: 紫系 (補=青 / 消=オレンジと区別、`docs/conceal-feature-plan.md §12`)
-            draw_single_char_badge(
-                "隠",
-                egui::Color32::from_rgb(153, 102, 204),
-                egui::Color32::WHITE,
-            );
-        }
-        if has_comic {
-            // テキスト注釈バッジ: ピンク系 (補=青 / レ=緑 / 消=オレンジ / 隠=紫 と区別)。
-            draw_single_char_badge(
-                "文",
-                egui::Color32::from_rgb(210, 90, 160),
-                egui::Color32::WHITE,
-            );
-        }
-        if has_pin {
-            // 📌 (金色) — ユーザー設定の pin に関わるアイテムの目印。
-            // アドレスバーの 📌 ボタンの色 (RGB 230,180,90) と統一する。
-            draw_single_char_badge(
-                "📌",
-                egui::Color32::from_rgb(230, 180, 90),
-                egui::Color32::from_rgb(60, 40, 10),
-            );
+            x += bg_w + SINGLE_CHAR_BADGE_GAP_X;
         }
         if !tags.is_empty() {
             // 残り幅 (右端 - 現在 x - 余白) に収まるだけ並べる。チェックマーク領域 (右上 24px)
@@ -35291,6 +35321,74 @@ pub(crate) fn grid_tag_badge_hit_rect(
     layout_tag_badge(painter, start, max_x, tags).map(|(rect, _, _)| rect)
 }
 
+// ── 左上バッジ列のレイアウト定数 + 列定義 (描画と当たり判定の共有正本) ──────────
+
+const SINGLE_CHAR_BADGE_FONT_SIZE: f32 = 11.0;
+const SINGLE_CHAR_BADGE_PAD_X: f32 = 4.0;
+const SINGLE_CHAR_BADGE_GAP_X: f32 = 2.0;
+const SINGLE_CHAR_BADGE_START_OFFSET: f32 = 3.0;
+
+/// 左上の 1 文字バッジ列の正本: 表示条件の順序 + (グリフ, 背景色, 前景色)。
+/// `draw_cell` の描画と `grid_tag_badge_start` の当たり判定が**同じ列**を辿る。
+/// バッジを追加・並べ替えるときはここだけ変えれば両方に効く。
+fn single_char_badges(
+    has_page_override: bool,
+    has_local_adjust: bool,
+    has_mask: bool,
+    has_conceal: bool,
+    has_comic: bool,
+    has_pin: bool,
+) -> Vec<(&'static str, egui::Color32, egui::Color32)> {
+    let mut out = Vec::new();
+    if has_page_override {
+        out.push((
+            "補",
+            egui::Color32::from_rgb(50, 120, 220),
+            egui::Color32::WHITE,
+        ));
+    }
+    if has_local_adjust {
+        out.push((
+            "レ",
+            egui::Color32::from_rgb(60, 150, 130),
+            egui::Color32::WHITE,
+        ));
+    }
+    if has_mask {
+        out.push((
+            "消",
+            egui::Color32::from_rgb(200, 80, 40),
+            egui::Color32::WHITE,
+        ));
+    }
+    if has_conceal {
+        // 隠蔽加工バッジ: 紫系 (補=青 / 消=オレンジと区別、`docs/conceal-feature-plan.md §12`)
+        out.push((
+            "隠",
+            egui::Color32::from_rgb(153, 102, 204),
+            egui::Color32::WHITE,
+        ));
+    }
+    if has_comic {
+        // テキスト注釈バッジ: ピンク系 (補=青 / レ=緑 / 消=オレンジ / 隠=紫 と区別)。
+        out.push((
+            "文",
+            egui::Color32::from_rgb(210, 90, 160),
+            egui::Color32::WHITE,
+        ));
+    }
+    if has_pin {
+        // 📌 (金色) — ユーザー設定の pin に関わるアイテムの目印。
+        // アドレスバーの 📌 ボタンの色 (RGB 230,180,90) と統一する。
+        out.push((
+            "📌",
+            egui::Color32::from_rgb(230, 180, 90),
+            egui::Color32::from_rgb(60, 40, 10),
+        ));
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn grid_tag_badge_start(
     painter: &egui::Painter,
@@ -35302,34 +35400,22 @@ fn grid_tag_badge_start(
     has_comic: bool,
     has_pin: bool,
 ) -> egui::Pos2 {
-    // draw_cell の左上バッジ描画ループと同じ順序・padding で進める。
-    // どちらかの配置を変える場合は、当たり判定がずれないよう両方を更新する。
-    let font = egui::FontId::proportional(11.0);
-    let pad_x = 4.0;
-    let mut x = rect.min.x + 3.0;
-    let advance = |x: &mut f32, glyph: &str, fg: egui::Color32, painter: &egui::Painter| {
+    // draw_cell と同じ列定義 (`single_char_badges`) ・同じ送り幅式で進めるので、
+    // 配置変更は正本側だけで済む。
+    let font = egui::FontId::proportional(SINGLE_CHAR_BADGE_FONT_SIZE);
+    let mut x = rect.min.x + SINGLE_CHAR_BADGE_START_OFFSET;
+    for (glyph, _bg, fg) in single_char_badges(
+        has_page_override,
+        has_local_adjust,
+        has_mask,
+        has_conceal,
+        has_comic,
+        has_pin,
+    ) {
         let galley = painter.layout_no_wrap(glyph.to_string(), font.clone(), fg);
-        *x += galley.size().x + pad_x * 2.0 + 2.0;
-    };
-    if has_page_override {
-        advance(&mut x, "補", egui::Color32::WHITE, painter);
+        x += galley.size().x + SINGLE_CHAR_BADGE_PAD_X * 2.0 + SINGLE_CHAR_BADGE_GAP_X;
     }
-    if has_local_adjust {
-        advance(&mut x, "レ", egui::Color32::WHITE, painter);
-    }
-    if has_mask {
-        advance(&mut x, "消", egui::Color32::WHITE, painter);
-    }
-    if has_conceal {
-        advance(&mut x, "隠", egui::Color32::WHITE, painter);
-    }
-    if has_comic {
-        advance(&mut x, "文", egui::Color32::WHITE, painter);
-    }
-    if has_pin {
-        advance(&mut x, "📌", egui::Color32::from_rgb(60, 40, 10), painter);
-    }
-    egui::pos2(x, rect.min.y + 3.0)
+    egui::pos2(x, rect.min.y + SINGLE_CHAR_BADGE_START_OFFSET)
 }
 
 fn layout_tag_badge(

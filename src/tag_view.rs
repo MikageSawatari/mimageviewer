@@ -73,7 +73,9 @@ pub(crate) struct TagViewState {
     pub has_focus: bool,
     pub saved_folder: Option<PathBuf>,
     pub nav_stack: Vec<PathBuf>,
-    pub results_paths: Vec<PathBuf>,
+    // NOTE: favsearch と違い「結果パスの保持」フィールドは持たない。result_count が
+    // 件数表示の正本で、ナビは通常グリッドの items を直接使う (write-only の
+    // Vec<PathBuf> clone を 10k 件分払っていた dead state を v1.4.0 レビューで削除)。
     pub summaries: Vec<TagSummary>,
     pub result_count: usize,
     pub truncated: bool,
@@ -81,8 +83,16 @@ pub(crate) struct TagViewState {
 }
 
 impl TagViewState {
+    /// 「今まさに結果グリッド (またはタグブラウザ) を表示中」か。
+    ///
+    /// `FavSearchState::on_results_grid` と**同じ意味論** (`nav_stack.is_empty()`) に
+    /// 揃えること。結果からフォルダ/コンテナへドリルインしたら false になり、
+    /// Ctrl+V ペースト・外部 D&D・エクスポート再読込のゲートが実フォルダで再び
+    /// 有効になる (共有ゲートのコメント「検索から実フォルダを開いた後は有効に戻る」
+    /// は Ctrl+G/S と共通の不変条件)。旧実装は「クエリを一度でも実行したか」で、
+    /// ドリルイン後も true のまま貼り付けが拒否され続ける非対称があった。
     pub fn on_results_grid(&self) -> bool {
-        self.active && !self.last_executed.trim().is_empty()
+        self.active && self.nav_stack.is_empty()
     }
 }
 
@@ -241,9 +251,25 @@ enum ClassifiedTagViewPath {
 }
 
 fn classify_tag_view_path(path: PathBuf) -> ClassifiedTagViewPath {
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return ClassifiedTagViewPath::Missing(path);
-    };
+    match std::fs::metadata(&path) {
+        Ok(meta) => existing_tag_view_entry(restore_real_casing(path), meta),
+        Err(_) => {
+            // 大文字小文字を区別するディレクトリ (DevDrive / WSL の case-sensitive
+            // フラグ) では、小文字正規化された item_key の metadata が**実在ファイル
+            // でも**失敗する。そのまま Missing 扱いにすると prune が実在ファイルの
+            // タグを恒久削除してしまうため、親ディレクトリを 1 回だけ走査して
+            // 大小無視一致を探す (見つかれば実 casing の Existing として扱う)。
+            if let Some(real) = find_case_insensitive_sibling(&path)
+                && let Ok(meta) = std::fs::metadata(&real)
+            {
+                return existing_tag_view_entry(real, meta);
+            }
+            ClassifiedTagViewPath::Missing(path)
+        }
+    }
+}
+
+fn existing_tag_view_entry(path: PathBuf, meta: std::fs::Metadata) -> ClassifiedTagViewPath {
     let mtime = crate::ui_helpers::mtime_secs(&meta);
     let file_size = if meta.is_file() { meta.len() as i64 } else { 0 };
     let kind = if meta.is_dir() {
@@ -257,6 +283,50 @@ fn classify_tag_view_path(path: PathBuf) -> ClassifiedTagViewPath {
         mtime,
         file_size,
     })
+}
+
+/// 表示用に実ディスク上の casing を復元する。
+///
+/// tags.db の item_key は小文字正規化されているため、キーから直接 GridItem を作ると
+/// セル名・ツールチップ・クリップボードまで全小文字になる (Ctrl+G/S は実 casing)。
+/// `canonicalize` は Windows で実 casing を返すので、`\\?\` プレフィックスを剥がした
+/// 上で**大小・区切り以外が変わらない場合のみ**採用する (シンボリックリンク解決で
+/// 別パスになった場合は item_key とずれてタグ操作が空振りするため、元のキーを保つ)。
+fn restore_real_casing(path: PathBuf) -> PathBuf {
+    let Ok(canon) = std::fs::canonicalize(&path) else {
+        return path;
+    };
+    let s = canon.to_string_lossy();
+    let stripped: PathBuf = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        canon
+    };
+    if crate::adjustment_db::normalize_path(&stripped)
+        == crate::adjustment_db::normalize_path(&path)
+    {
+        stripped
+    } else {
+        path
+    }
+}
+
+/// 親ディレクトリを走査して、ファイル名が大小無視で一致するエントリを探す。
+/// 祖先側も casing がずれている full case-sensitive 環境は対象外 (1 階層のみ)。
+fn find_case_insensitive_sibling(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let wanted = path.file_name()?.to_string_lossy().to_lowercase();
+    for entry in std::fs::read_dir(parent).ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if entry.file_name().to_string_lossy().to_lowercase() == wanted {
+            return Some(entry.path());
+        }
+    }
+    None
 }
 
 fn should_prune_missing_path(path: &Path) -> bool {
@@ -327,6 +397,8 @@ mod tests {
         )
         .unwrap();
 
+        // entry.path は実 casing 復元済みなので、小文字キーとの比較は item_key 正規化で行う
+        let entry_key = |e: &TagViewEntry| crate::tags_db::item_key_for_path(&e.path);
         assert_eq!(result.query, "#cat");
         assert_eq!(result.entries.len(), 1);
         assert!(!result.truncated);
@@ -335,20 +407,10 @@ mod tests {
             result
                 .entries
                 .iter()
-                .any(|e| e.path == PathBuf::from(&image_key) && e.kind == TagViewItemKind::Image)
+                .any(|e| entry_key(e) == image_key && e.kind == TagViewItemKind::Image)
         );
-        assert!(
-            result
-                .entries
-                .iter()
-                .all(|e| e.path != PathBuf::from(&folder_key))
-        );
-        assert!(
-            !result
-                .entries
-                .iter()
-                .any(|e| e.path == PathBuf::from(&other_key))
-        );
+        assert!(result.entries.iter().all(|e| entry_key(e) != folder_key));
+        assert!(!result.entries.iter().any(|e| entry_key(e) == other_key));
 
         let prefix_result = run_tag_view_search(
             &data_dir,
@@ -362,7 +424,43 @@ mod tests {
             prefix_result
                 .entries
                 .iter()
-                .any(|e| e.path == PathBuf::from(&folder_key) && e.kind == TagViewItemKind::Folder)
+                .any(|e| entry_key(e) == folder_key && e.kind == TagViewItemKind::Folder)
+        );
+    }
+
+    /// 結果の path は tags.db の小文字キーではなく**実ディスク上の casing** を持つ。
+    /// (小文字のままだとセル名・コピー・外部連携が全小文字になる UX 退行 +
+    ///  case-sensitive ディレクトリで prune がタグを誤削除する)
+    #[test]
+    fn tag_view_results_restore_real_path_casing() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let image = temp.path().join("MixedCase.JPG");
+        std::fs::write(&image, b"jpg").unwrap();
+        let image_key = crate::tags_db::item_key_for_path(&image);
+        let mut db = crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).unwrap();
+        db.set_item_tags(&image_key, ["cat"], "test").unwrap();
+        drop(db);
+
+        let result = run_tag_view_search(
+            &data_dir,
+            "#cat",
+            TagViewKindFilter::All,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(
+            result.entries[0].path.file_name().unwrap().to_str(),
+            Some("MixedCase.JPG"),
+            "実 casing が復元される"
+        );
+        // タグ操作の同一性: 復元後パスからも同じ item_key が導出される
+        assert_eq!(
+            crate::tags_db::item_key_for_path(&result.entries[0].path),
+            image_key
         );
     }
 
@@ -392,7 +490,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.entries.len(), 1);
-        assert_eq!(result.entries[0].path, PathBuf::from(&image_key));
+        assert_eq!(
+            crate::tags_db::item_key_for_path(&result.entries[0].path),
+            image_key
+        );
 
         let db = crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db")).unwrap();
         assert!(db.display_tags_for_item(&missing_key).is_empty());
@@ -431,7 +532,10 @@ mod tests {
 
         assert_eq!(result.kind_filter, TagViewKindFilter::Video);
         assert_eq!(result.entries.len(), 1);
-        assert_eq!(result.entries[0].path, PathBuf::from(&video_key));
+        assert_eq!(
+            crate::tags_db::item_key_for_path(&result.entries[0].path),
+            video_key
+        );
         assert_eq!(result.entries[0].kind, TagViewItemKind::Video);
     }
 }

@@ -126,6 +126,65 @@ impl NestedZipCache {
 static NESTED_CACHE: LazyLock<NestedZipCache> =
     LazyLock::new(|| NestedZipCache::new(crate::sys_memory::nested_zip_cache_budget()));
 
+// ── CP932 デコード名 → entry index のキャッシュ ─────────────────────
+//
+// 非 UTF-8 名 ZIP (CP932) では zip crate の `by_name` (CP437/UTF-8 デコード名 keyed)
+// が**必ず**ミスし、デコード名による線形走査へ落ちる。読み戻しはエントリ単位で
+// アーカイブを開き直すため、素朴な走査だと 1 冊のページ送り/サムネ一括生成が
+// O(N²) になる (2,000 ページで ~4M 回の SHIFT_JIS デコード)。
+// 「正規化デコード名 → index」はアーカイブが変わらない限り不変なので、
+// (path, len, mtime) keyed で 1 回だけ構築し、以後は O(1) で引く。
+#[derive(Clone, PartialEq, Eq)]
+struct DecodedNameCacheKey {
+    path: PathBuf,
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+}
+
+const DECODED_NAME_CACHE_MAX_ARCHIVES: usize = 8;
+
+static DECODED_NAME_INDEX_CACHE: LazyLock<
+    Mutex<
+        Vec<(
+            DecodedNameCacheKey,
+            Arc<std::collections::HashMap<String, usize>>,
+        )>,
+    >,
+> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn decoded_name_cache_key(zip_path: &Path) -> Option<DecodedNameCacheKey> {
+    let meta = std::fs::metadata(zip_path).ok()?;
+    Some(DecodedNameCacheKey {
+        path: zip_path.to_path_buf(),
+        len: meta.len(),
+        mtime: meta.modified().ok(),
+    })
+}
+
+fn decoded_name_cache_get(
+    key: &DecodedNameCacheKey,
+) -> Option<Arc<std::collections::HashMap<String, usize>>> {
+    let cache = DECODED_NAME_INDEX_CACHE.lock().ok()?;
+    cache
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, map)| Arc::clone(map))
+}
+
+fn decoded_name_cache_put(
+    key: DecodedNameCacheKey,
+    map: Arc<std::collections::HashMap<String, usize>>,
+) {
+    let Ok(mut cache) = DECODED_NAME_INDEX_CACHE.lock() else {
+        return;
+    };
+    cache.retain(|(k, _)| k.path != key.path);
+    if cache.len() >= DECODED_NAME_CACHE_MAX_ARCHIVES {
+        cache.remove(0); // 最古を捨てる (典型は同時 1〜2 冊なので十分)
+    }
+    cache.push((key, map));
+}
+
 /// 外側のフォルダ/ZIP/PDF を切り替えたときに呼ぶ。
 /// 全エントリを破棄し、古い外側のキャッシュが居残らないようにする。
 pub fn clear_nested_cache() {
@@ -148,7 +207,12 @@ fn has_japanese_or_fullwidth_chars(s: &str) -> bool {
     })
 }
 
-fn decode_zip_entry_name(raw: &[u8], fallback_name: &str) -> String {
+/// 非 UTF-8 フラグの ZIP エントリ名を Shift-JIS (CP932) として解釈する。
+/// zip crate の既定は CP437 で、日本語名が mojibake になる。
+/// **このデコードは ZIP 名を扱う全経路で共有すること** (列挙・読み戻し・
+/// archive_converter の変換出力)。経路ごとに生 `entry.name()` を使うと、
+/// 直接閲覧と変換キャッシュでエントリ名がずれて per-page キーが割れる。
+pub(crate) fn decode_zip_entry_name(raw: &[u8], fallback_name: &str) -> String {
     if let Ok(s) = std::str::from_utf8(raw) {
         return s.to_string();
     }
@@ -161,7 +225,7 @@ fn decode_zip_entry_name(raw: &[u8], fallback_name: &str) -> String {
     fallback_name.to_string()
 }
 
-fn zip_entry_name(entry: &zip::read::ZipFile<'_>) -> String {
+pub(crate) fn zip_entry_name(entry: &zip::read::ZipFile<'_>) -> String {
     decode_zip_entry_name(entry.name_raw(), entry.name())
 }
 
@@ -257,6 +321,12 @@ pub struct ZipEnumeration {
     /// この列挙には**含まれない** (ZIP ネイティブ経路では読めないため)。true の場合、
     /// 呼び出し側が「入れ子を展開した閲覧用キャッシュへの変換」を提案する (v1.3.0)。
     pub has_foreign_archives: bool,
+    /// CP932 デコード対応 (v1.4.0) で **v1.3.x までと entry_name が変わったエントリ**の
+    /// `(旧名, 新名)` ペア。旧名 = zip crate の既定 (CP437) デコード結果で、リリース済みの
+    /// per-page DB キー (★/補正/注釈等) はこの旧名から導出されている。呼び出し側は
+    /// このペアで旧キー → 新キーの一度きり移行を行う (`zip_key_migration`)。
+    /// UTF-8 名 ZIP では常に空。
+    pub legacy_renames: Vec<(String, String)>,
 }
 
 /// ZIP ファイル内の画像エントリをすべて列挙する。
@@ -282,27 +352,34 @@ pub fn enumerate_image_entries_detailed(zip_path: &Path) -> std::io::Result<ZipE
 
     let mut out: Vec<ZipImageEntry> = Vec::new();
     let mut has_foreign = false;
+    let mut legacy_renames: Vec<(String, String)> = Vec::new();
     enumerate_recursive(
         &mut archive,
         zip_path,
         "",
+        "",
         zip_mtime,
         &mut out,
         &mut has_foreign,
+        &mut legacy_renames,
     );
     Ok(ZipEnumeration {
         entries: out,
         has_foreign_archives: has_foreign,
+        legacy_renames,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enumerate_recursive<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     outer_zip_path: &Path,
     prefix: &str,
+    legacy_prefix: &str,
     zip_mtime: i64,
     out: &mut Vec<ZipImageEntry>,
     has_foreign: &mut bool,
+    legacy_renames: &mut Vec<(String, String)>,
 ) {
     let len = archive.len();
     for i in 0..len {
@@ -320,7 +397,14 @@ fn enumerate_recursive<R: Read + Seek>(
             continue;
         };
         let full_name = format!("{prefix}{name}");
+        // v1.3.x までの entry_name (zip crate の CP437 デコード)。CP932 名 ZIP では
+        // 新デコード名と異なり、その差分がリリース済み per-page キーの移行対象になる。
+        let legacy_name = entry.name().replace('\\', "/");
+        let legacy_full = format!("{legacy_prefix}{legacy_name}");
         if is_image_ext(&ext) {
+            if legacy_full != full_name {
+                legacy_renames.push((legacy_full, full_name.clone()));
+            }
             out.push(ZipImageEntry {
                 entry_name: full_name,
                 uncompressed_size: entry.size(),
@@ -362,13 +446,16 @@ fn enumerate_recursive<R: Read + Seek>(
                 continue;
             };
             let new_prefix = format!("{full_name}/");
+            let new_legacy_prefix = format!("{legacy_full}/");
             enumerate_recursive(
                 &mut inner,
                 outer_zip_path,
                 &new_prefix,
+                &new_legacy_prefix,
                 zip_mtime,
                 out,
                 has_foreign,
+                legacy_renames,
             );
         }
     }
@@ -614,19 +701,22 @@ fn read_entry_from_disk(zip_path: &Path, entry_name: &str) -> std::io::Result<Ve
     let file = File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(BufReader::new(file))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    read_by_name(&mut archive, entry_name)
+    read_by_name(&mut archive, entry_name, decoded_name_cache_key(zip_path))
 }
 
 fn read_entry_from_bytes(bytes: &Arc<Vec<u8>>, entry_name: &str) -> std::io::Result<Vec<u8>> {
     let cursor = Cursor::new(bytes.as_slice());
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    read_by_name(&mut archive, entry_name)
+    // メモリ上の子 ZIP は安定したキャッシュキーを持たないので index キャッシュなし
+    // (走査は raw メタのみで解凍を伴わない)。
+    read_by_name(&mut archive, entry_name, None)
 }
 
 fn read_by_name<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
+    cache_key: Option<DecodedNameCacheKey>,
 ) -> std::io::Result<Vec<u8>> {
     match read_by_exact_name(archive, entry_name) {
         Ok(bytes) => Ok(bytes),
@@ -637,7 +727,7 @@ fn read_by_name<R: Read + Seek>(
             {
                 return Ok(bytes);
             }
-            read_by_decoded_name(archive, entry_name).map_err(|_| first_err)
+            read_by_decoded_name(archive, entry_name, cache_key).map_err(|_| first_err)
         }
         Err(err) => Err(err),
     }
@@ -646,23 +736,71 @@ fn read_by_name<R: Read + Seek>(
 fn read_by_decoded_name<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
+    cache_key: Option<DecodedNameCacheKey>,
 ) -> std::io::Result<Vec<u8>> {
     let wanted = entry_name.replace('\\', "/");
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        if normalized_zip_entry_name(&entry) != wanted {
-            continue;
-        }
-        let mut bytes = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut bytes)?;
-        return Ok(bytes);
+    if let Some(key) = cache_key {
+        let map = match decoded_name_cache_get(&key) {
+            Some(map) => map,
+            None => {
+                let map = Arc::new(build_decoded_name_index_map(archive)?);
+                decoded_name_cache_put(key, Arc::clone(&map));
+                map
+            }
+        };
+        return match map.get(&wanted) {
+            Some(&i) => read_by_index(archive, i),
+            None => Err(entry_not_found(entry_name)),
+        };
     }
-    Err(std::io::Error::new(
+    // キャッシュキーなし (メモリ上の子 ZIP): raw メタの 1 パス走査で index を探す。
+    let mut found = None;
+    for i in 0..archive.len() {
+        let entry = archive
+            .by_index_raw(i)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        if normalized_zip_entry_name(&entry) == wanted {
+            found = Some(i);
+            break;
+        }
+    }
+    match found {
+        Some(i) => read_by_index(archive, i),
+        None => Err(entry_not_found(entry_name)),
+    }
+}
+
+fn build_decoded_name_index_map<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> std::io::Result<std::collections::HashMap<String, usize>> {
+    let mut map = std::collections::HashMap::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        // by_index_raw は伸長準備をしない (central directory メタ読みのみで安価)。
+        let entry = archive
+            .by_index_raw(i)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        map.insert(normalized_zip_entry_name(&entry), i);
+    }
+    Ok(map)
+}
+
+fn read_by_index<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    index: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut entry = archive
+        .by_index(index)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn entry_not_found(entry_name: &str) -> std::io::Error {
+    std::io::Error::new(
         std::io::ErrorKind::NotFound,
         format!("ZIP entry not found: {entry_name}"),
-    ))
+    )
 }
 
 fn read_by_exact_name<R: Read + Seek>(
@@ -699,7 +837,9 @@ pub fn read_entry_from_archive(
     archive: &mut ZipArchiveHandle,
     entry_name: &str,
 ) -> std::io::Result<Vec<u8>> {
-    read_by_name(archive, entry_name)
+    // バッチハンドルはパスを保持しないため index キャッシュなし
+    // (ハンドル保持中は central directory が温まっており走査も安価)。
+    read_by_name(archive, entry_name, None)
 }
 
 /// ZIP 内エントリ名からサブディレクトリ名 (親ディレクトリ) を取り出す。
@@ -972,6 +1112,10 @@ mod tests {
         assert_eq!(first_name, display_name);
         assert_eq!(first_bytes, b"IMAGE");
         assert_eq!(read_entry_bytes(&zip_path, display_name).unwrap(), b"IMAGE");
+        // 2 回目は decoded-name → index キャッシュ経由 (O(1)) でも同じ結果になること。
+        assert_eq!(read_entry_bytes(&zip_path, display_name).unwrap(), b"IMAGE");
+        // キャッシュ構築後の不在名は NotFound (誤 index を引かない)。
+        assert!(read_entry_bytes(&zip_path, "不在/missing.jpg").is_err());
 
         let mut archive = open_archive(&zip_path).unwrap();
         assert_eq!(

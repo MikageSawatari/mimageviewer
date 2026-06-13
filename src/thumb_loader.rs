@@ -1053,7 +1053,12 @@ pub fn process_load_request(
     } else if is_zip_dir_thumb {
         let t_zip = std::time::Instant::now();
         let name = req.zip_dir_prefix.as_deref().and_then(|prefix| {
-            let entries = crate::zip_loader::enumerate_image_entries(&req.path).ok()?;
+            let enumeration =
+                crate::zip_loader::enumerate_image_entries_detailed(&req.path).ok()?;
+            // CP932 名 ZIP のリリース済み per-page キー移行 (worker スレッド)。
+            // フォルダ一覧のサムネ生成段階で済ませると、ZIP を開く前にピン/★ が直る。
+            crate::zip_key_migration::migrate_if_needed(&req.path, &enumeration.legacy_renames);
+            let entries = enumeration.entries;
             let tree = crate::zip_tree::ZipTree::build(req.path.clone(), entries);
             tree.representative_for_prefix_str(
                 prefix,

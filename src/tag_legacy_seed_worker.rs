@@ -4,7 +4,6 @@
 //! 保険経路。UI スレッドではファイルを読まず、`tag_item_state` がある item は読み込み前に
 //! skip してタグ削除済み item の復活を防ぐ。
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +57,20 @@ fn run_seed(
     paths: Vec<PathBuf>,
     cancel: &AtomicBool,
 ) -> Result<LegacySeedResult, String> {
+    // バックグラウンドモード: CPU と **ディスク I/O の優先度**を両方下げる。
+    // 初訪フォルダでは未決定ファイル全件の prefix 読みが走るため、サムネイル生成と
+    // 同じディスクを取り合わないようにする (移行はレイテンシ非依存の安全網なので
+    // 遅くなって構わない。件数 cap は付けない — correctness > latency)。
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+        };
+        if SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN).is_err() {
+            crate::logger::log("tag-legacy-seed: SetThreadPriority(background) failed");
+        }
+    }
+
     let mut db = crate::tags_db::TagsDb::open_at(&data_dir.join("tags.db"))
         .map_err(|e| format!("tags.db を開けませんでした: {e}"))?;
     let mut result = LegacySeedResult {
@@ -68,12 +81,19 @@ fn run_seed(
         cache_updates: Vec::new(),
     };
 
-    for path in paths {
+    // 決定済み (tag_item_state あり) の事前フィルタは bulk IN クエリ 1 パスで行う。
+    // フォルダ再訪 (全件決定済み) を per-file 点クエリ × N にしないため。
+    let item_keys: Vec<String> = paths
+        .iter()
+        .map(|path| crate::tags_db::item_key_for_path(path))
+        .collect();
+    let decided = db.keys_with_item_state(&item_keys);
+
+    for (path, item_key) in paths.into_iter().zip(item_keys) {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let item_key = crate::tags_db::item_key_for_path(&path);
-        if db.has_item_state(&item_key) {
+        if decided.contains(&item_key) {
             result.report.skipped_decided_items += 1;
             continue;
         }
@@ -94,37 +114,26 @@ fn run_seed(
         };
 
         let legacy_tags = miv_legacy_tags(subjects);
-        if legacy_tags.is_empty() {
-            match db.upsert_item_state(&item_key, crate::tags_db::source::XMP_LEGACY) {
-                Ok(()) => result.report.marked_empty_items += 1,
-                Err(e) => {
-                    result.report.db_errors += 1;
-                    crate::logger::log(format!(
-                        "[TAG] legacy seed state mark failed: {} ({e})",
-                        path.display()
-                    ));
-                }
-            }
-            continue;
-        }
-
-        let before = db.display_tags_for_item(&item_key);
-        let before_keys = tag_key_set(&before);
-        let mut union = before.clone();
-        union.extend(legacy_tags.iter().cloned());
-        match db.set_item_tags(
+        // XMP 読み取り (遅い I/O) 中に通常編集が同じ item を確定させた可能性があるため、
+        // 反映は tag_item_state を**同一トランザクション内で再チェック**する原子的 union
+        // (`seed_legacy_tags_if_undecided`) で行う。read→全置換だと編集を巻き戻す
+        // (削除タグの復活) TOCTOU がある。
+        match db.seed_legacy_tags_if_undecided(
             &item_key,
-            union
+            legacy_tags
                 .iter()
                 .map(|tag| crate::tags_db::strip_display_hash(tag)),
-            crate::tags_db::source::XMP_LEGACY,
         ) {
-            Ok(after) => {
-                let after_keys = tag_key_set(&after);
-                result.report.inserted_tags += after_keys.difference(&before_keys).count();
-                result.report.imported_items += 1;
-                if after != before {
-                    result.cache_updates.push((path, after));
+            Ok(None) => result.report.skipped_decided_items += 1,
+            Ok(Some((after, inserted))) => {
+                if legacy_tags.is_empty() {
+                    result.report.marked_empty_items += 1;
+                } else {
+                    result.report.imported_items += 1;
+                    result.report.inserted_tags += inserted;
+                    if inserted > 0 {
+                        result.cache_updates.push((path, after));
+                    }
                 }
             }
             Err(e) => {
@@ -140,24 +149,7 @@ fn run_seed(
     Ok(result)
 }
 
-fn miv_legacy_tags(subjects: Vec<String>) -> Vec<String> {
-    crate::tags_db::collapse_tags(
-        subjects
-            .into_iter()
-            .filter(|tag| tag.trim_start().starts_with('#')),
-        0,
-    )
-    .into_iter()
-    .map(|tag| crate::tags_db::format_display_tag(&tag.tag))
-    .collect()
-}
-
-fn tag_key_set(tags: &[String]) -> HashSet<String> {
-    tags.iter()
-        .map(|tag| crate::tags_db::normalize_tag_key(tag))
-        .filter(|key| !key.is_empty())
-        .collect()
-}
+use crate::tags_db::miv_legacy_tags;
 
 #[cfg(test)]
 mod tests {
@@ -178,17 +170,6 @@ mod tests {
   </rdf:RDF>
 </x:xmpmeta>
 <?xpacket end="w"?>"#;
-
-    #[test]
-    fn miv_legacy_tags_filters_hash_tags_only() {
-        let tags = miv_legacy_tags(vec![
-            "#Cat".to_string(),
-            "external".to_string(),
-            " #ＤＯＧ ".to_string(),
-            "#".to_string(),
-        ]);
-        assert_eq!(tags, vec!["#Cat".to_string(), "#DOG".to_string()]);
-    }
 
     #[test]
     fn sidecar_target_for_real_file_uses_lowercase_filename() {
@@ -225,5 +206,40 @@ mod tests {
         assert_eq!(second.report.skipped_decided_items, 1);
         assert!(second.cache_updates.is_empty());
         assert_eq!(db.display_tags_for_item(&key), vec!["#Old".to_string()]);
+    }
+
+    /// TOCTOU 回帰: seed の事前チェック後〜DB 反映前に通常編集が確定した場合、
+    /// seed は何も書かず編集結果を保持する (削除タグの復活・追加タグの巻き戻しを
+    /// 起こさない)。`seed_legacy_tags_if_undecided` がトランザクション内で
+    /// tag_item_state を再チェックすることを直接検証する。
+    #[test]
+    fn seed_does_not_clobber_concurrent_edit() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut db = crate::tags_db::TagsDb::open_at(&data_dir.path().join("tags.db")).unwrap();
+        let item_key = "c:/pics/racy.jpg";
+
+        // seed worker が has_item_state(=false) を確認した直後の想定で、
+        // ユーザー編集が先に確定する (state 行 = edit が立つ)。
+        db.set_item_tags(item_key, ["user-tag"], crate::tags_db::source::EDIT)
+            .unwrap();
+
+        // 遅れて到着した seed の反映は no-op になる。
+        let outcome = db
+            .seed_legacy_tags_if_undecided(item_key, ["Old", "Stale"])
+            .unwrap();
+        assert!(outcome.is_none(), "decided item must be skipped");
+        assert_eq!(
+            db.display_tags_for_item(item_key),
+            vec!["#user-tag".to_string()]
+        );
+
+        // 未決定 item への seed は union として入る (既存タグを消さない)。
+        let undecided = "c:/pics/fresh.jpg";
+        let (after, inserted) = db
+            .seed_legacy_tags_if_undecided(undecided, ["Old"])
+            .unwrap()
+            .expect("undecided item must be seeded");
+        assert_eq!(after, vec!["#Old".to_string()]);
+        assert_eq!(inserted, 1);
     }
 }

@@ -40,6 +40,9 @@ pub struct LegacyXmpImportReport {
     pub read_errors: usize,
     pub db_errors: usize,
     pub write_errors: usize,
+    /// ユーザー操作 (再実行メニュー) またはアプリ終了で中止された。
+    /// 処理済み分は反映済み — トーストでその旨を伝える。
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -51,7 +54,16 @@ pub struct LegacyXmpImportResult {
 
 pub(crate) struct LegacyXmpImportPending {
     pub mode: LegacyXmpImportMode,
+    // ImportAndRemove はユーザーファイルを書き換える破壊的バッチなので、
+    // 必ず中止手段を持つ (再実行メニュー / アプリ終了時にキャンセル)。
+    cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<Result<LegacyXmpImportResult, String>>,
+}
+
+impl LegacyXmpImportPending {
+    pub(crate) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 pub(crate) fn spawn(
@@ -69,7 +81,7 @@ pub(crate) fn spawn(
             let _ = tx.send(result);
         })
         .ok();
-    LegacyXmpImportPending { mode, rx }
+    LegacyXmpImportPending { mode, cancel, rx }
 }
 
 fn run_import(
@@ -91,6 +103,7 @@ fn run_import(
 
     for path in paths {
         if cancel.load(Ordering::Relaxed) {
+            result.report.cancelled = true;
             break;
         }
         let item_key = crate::tags_db::item_key_for_path(&path);
@@ -165,17 +178,7 @@ fn push_error(result: &mut LegacyXmpImportResult, path: &std::path::Path, msg: S
     result.errors.push((path.to_path_buf(), msg));
 }
 
-fn miv_legacy_tags(subjects: Vec<String>) -> Vec<String> {
-    crate::tags_db::collapse_tags(
-        subjects
-            .into_iter()
-            .filter(|tag| tag.trim_start().starts_with('#')),
-        0,
-    )
-    .into_iter()
-    .map(|tag| crate::tags_db::format_display_tag(&tag.tag))
-    .collect()
-}
+use crate::tags_db::miv_legacy_tags;
 
 #[cfg(test)]
 mod tests {
@@ -210,17 +213,6 @@ mod tests {
   </rdf:RDF>
 </x:xmpmeta>
 <?xpacket end="w"?>"#;
-
-    #[test]
-    fn miv_legacy_tags_filters_hash_tags_only() {
-        let tags = miv_legacy_tags(vec![
-            "#Cat".to_string(),
-            "external".to_string(),
-            " #ＤＯＧ ".to_string(),
-            "#".to_string(),
-        ]);
-        assert_eq!(tags, vec!["#Cat".to_string(), "#DOG".to_string()]);
-    }
 
     #[test]
     fn import_and_remove_deletes_video_sidecar_when_only_miv_tags_remain() {

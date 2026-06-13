@@ -134,39 +134,15 @@ impl TagsDb {
         if self.path.as_os_str().is_empty() {
             return Ok(());
         }
-
-        let bak = |n: usize| data_dir.join(format!("tags.db.bak{n}"));
-        let snapshot_tmp = data_dir.join("tags.db.bak.tmp-snapshot");
-        let _ = std::fs::remove_file(&snapshot_tmp);
-
-        self.backup_to(&snapshot_tmp)?;
-
-        let _ = std::fs::remove_file(bak(10));
-        for n in (1..10).rev() {
-            let src = bak(n);
-            let dst = bak(n + 1);
-            if src.exists() {
-                if let Err(e) = std::fs::rename(&src, &dst) {
-                    crate::logger::log(format!(
-                        "tags_db: rotate_backups rename {} -> {} failed: {e}",
-                        src.display(),
-                        dst.display()
-                    ));
-                }
-            }
-        }
-
-        let bak1 = bak(1);
-        if bak1.exists() {
-            std::fs::remove_file(&bak1).map_err(|e| io_sqlite_error("remove tags.db.bak1", e))?;
-        }
-        std::fs::rename(&snapshot_tmp, &bak1)
-            .map_err(|e| io_sqlite_error("rename tags.db snapshot to bak1", e))?;
-        crate::logger::log(format!(
-            "tags_db: rotate_backups snapshot -> {}",
-            bak1.display()
-        ));
-        Ok(())
+        // 世代 rotate のアルゴリズム (T42 の snapshot-first 順序) は settings.db と
+        // 共有の正本 (`db_backup`) を使う。
+        crate::db_backup::rotate_generation_backups(
+            data_dir,
+            "tags.db",
+            &|msg| crate::logger::log(format!("tags_db: {msg}")),
+            &|tmp| self.backup_to(tmp).map_err(|e| e.to_string()),
+        )
+        .map_err(|msg| io_sqlite_error("rotate tags.db backups", std::io::Error::other(msg)))
     }
 
     fn rotate_backups_once(&self) {
@@ -304,6 +280,54 @@ impl TagsDb {
         Ok((self.display_tags_for_item(item_key), inserted_tags))
     }
 
+    /// §7.2 legacy seed 専用の原子的 union。`Ok(None)` = 決定済みで何もしなかった。
+    ///
+    /// 旧 XMP の読み取り (遅いファイル I/O) と DB 反映の間に通常編集
+    /// (tag_write_worker、別コネクション) が割り込むと、読み取り時点の状態に基づく
+    /// 全置換 (`set_item_tags`) は編集を巻き戻す (削除タグの復活 = §7.2 が禁じる事象)。
+    /// よって seed は **同一トランザクション内で `tag_item_state` を再チェック**し、
+    /// 決定済みなら何もしない。反映自体も INSERT OR IGNORE の union で、既存行を
+    /// 削除しない。
+    pub fn seed_legacy_tags_if_undecided<I, S>(
+        &mut self,
+        item_key: &str,
+        tags: I,
+    ) -> Result<Option<(Vec<String>, usize)>, rusqlite::Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.rotate_backups_once();
+        let now = now_unix_secs();
+        let normalized = collapse_tags(tags, now);
+        let tx = self.conn.transaction()?;
+        let decided = tx
+            .query_row(
+                "SELECT 1 FROM tag_item_state WHERE item_key = ?1 LIMIT 1",
+                [item_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if decided {
+            return Ok(None); // tx は drop で rollback (変更なし)
+        }
+        let mut inserted = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO item_tags (item_key, tag, tag_key, applied_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for tag in &normalized {
+                inserted +=
+                    stmt.execute(params![item_key, tag.tag, tag.tag_key, tag.applied_at])?;
+            }
+        }
+        upsert_item_state_tx(&tx, item_key, source::XMP_LEGACY, now)?;
+        tx.commit()?;
+        Ok(Some((self.display_tags_for_item(item_key), inserted)))
+    }
+
     pub fn toggle_item_tag(
         &mut self,
         item_key: &str,
@@ -420,6 +444,33 @@ impl TagsDb {
             .into_iter()
             .map(|t| format_display_tag(&t.tag))
             .collect()
+    }
+
+    /// 指定キーのうち `tag_item_state` 行が存在するものを返す (500 件ずつの IN クエリ)。
+    /// legacy seed worker の事前フィルタ用 — フォルダ再訪時に per-file の点クエリ
+    /// (`has_item_state` × N) を発行しないための bulk 版。
+    pub fn keys_with_item_state(&self, item_keys: &[String]) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for chunk in item_keys.chunks(500) {
+            let placeholders = (0..chunk.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql =
+                format!("SELECT item_key FROM tag_item_state WHERE item_key IN ({placeholders})");
+            let mut stmt = match self.conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+            if let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(0)
+            }) {
+                out.extend(rows.flatten());
+            }
+        }
+        out
     }
 
     pub fn has_item_state(&self, item_key: &str) -> bool {
@@ -795,18 +846,26 @@ where
     by_key.into_values().collect()
 }
 
-pub fn escape_like_pattern(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '%' | '_' | '\\' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            _ => out.push(ch),
-        }
-    }
-    out
+/// SQL LIKE エスケープは [`crate::adjustment_db::escape_like_pattern`] を共有する
+/// (独自コピーを持つと将来のエスケープ修正が片方にしか入らない)。
+pub use crate::adjustment_db::escape_like_pattern;
+
+/// dc:subject 値のうち「mIV v1.0 が付けた legacy タグ」(= `#` 始まり) だけを抽出し、
+/// 表示形 (`#` 付き) で返す。
+///
+/// 自動 seed (`tag_legacy_seed_worker`) と明示インポート (`tag_legacy_xmp_worker`) の
+/// **両方がこの 1 実装を使うこと**。判定規則が分かれると、同じファイルから
+/// 取り込まれるタグ集合が経路によって変わる再現困難な不整合になる。
+pub fn miv_legacy_tags(subjects: Vec<String>) -> Vec<String> {
+    collapse_tags(
+        subjects
+            .into_iter()
+            .filter(|tag| tag.trim_start().starts_with('#')),
+        0,
+    )
+    .into_iter()
+    .map(|tag| format_display_tag(&tag.tag))
+    .collect()
 }
 
 fn upsert_item_state_tx(
@@ -850,6 +909,19 @@ fn now_unix_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 自動 seed と明示インポートが共有する legacy タグ判定の正本テスト
+    /// (旧: 両 worker に同一テストが複製されていた)。
+    #[test]
+    fn miv_legacy_tags_filters_hash_tags_only() {
+        let tags = miv_legacy_tags(vec![
+            "#Cat".to_string(),
+            "external".to_string(),
+            " #ＤＯＧ ".to_string(),
+            "#".to_string(),
+        ]);
+        assert_eq!(tags, vec!["#Cat".to_string(), "#DOG".to_string()]);
+    }
 
     fn memory_db() -> TagsDb {
         let conn = Connection::open_in_memory().unwrap();

@@ -612,78 +612,24 @@ impl SettingsDb {
     /// (= `VACUUM INTO` は別ファイル作成なので main DB は無事)。
     /// crash 後の再起動では bak1 が「前回 session 開始時の状態」のままになる。
     pub fn rotate_backups(&self, data_dir: &Path) -> Result<(), SettingsDbError> {
-        let bak = |n: usize| data_dir.join(format!("settings.db.bak{n}"));
-        // T42 (Codex P2 / 2026-05-16): 旧コードは "bak1 → bak2, ... → bak10 rotate
-        // → VACUUM INTO bak1" の順で、9 連 rename 直後に disk-full 等で VACUUM INTO
-        // が失敗すると bak1 が空白になりチェーンに穴が空いた (= 直近世代が消失)。
-        // 新フロー:
-        //   1. まず VACUUM INTO を temp 名 (settings.db.bak.tmp-snapshot) に書き出す。
-        //      失敗してもまだ bak1..bak10 は元の状態で保たれる。
-        //   2. temp snapshot が手に入ってから bak10 削除 + bak1..bak9 を bak2..bak10 へ
-        //      rotate。
-        //   3. temp snapshot を bak1 に rename (atomic-replace、failure 時は temp を
-        //      残してログのみで返す)。
-        // これで「rotate 完了 + snapshot 失敗」のチェーン穴を構造的に作らない。
-        let snapshot_tmp = data_dir.join("settings.db.bak.tmp-snapshot");
-        // 念のため: 前回 crash で残った snapshot_tmp は消す
-        let _ = std::fs::remove_file(&snapshot_tmp);
-        // 1. VACUUM INTO temp_snapshot。ここで失敗したらまだ既存 bak1..bak10 は無事。
-        self.backup_to(&snapshot_tmp)?;
-        // 2. bak10 を削除 → bak9 → bak10, ..., bak1 → bak2 (新→古の rename)。
-        let _ = std::fs::remove_file(bak(10));
-        for n in (1..10).rev() {
-            let src = bak(n);
-            let dst = bak(n + 1);
-            if src.exists() {
-                if let Err(e) = std::fs::rename(&src, &dst) {
-                    log_diag(&format!(
-                        "settings_db: rotate_backups rename {} -> {} failed: {e}",
-                        src.display(),
-                        dst.display()
-                    ));
-                    // 個別の rename 失敗は abort せず log のみで先に進む
-                    // (= 世代を 1 つスキップしても次の save で再 rotate される)。
-                }
-            }
-        }
-        // 3. temp snapshot を bak1 に rename。前段 rename で bak1 は空のはずだが、
-        //    残っている場合は事前 remove (= rename の安全性確保)。
-        let bak1 = bak(1);
-        if bak1.exists() {
-            if let Err(e) = std::fs::remove_file(&bak1) {
-                log_diag(&format!(
-                    "settings_db: rotate_backups: residual bak1 remove failed: {e}"
-                ));
-                // snapshot は temp に残るので次の rotate 時にリトライ可能
-                return Err(SettingsDbError::Rusqlite(rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error {
-                        code: rusqlite::ErrorCode::CannotOpen,
-                        extended_code: 0,
-                    },
-                    Some(format!("bak1 residual cannot be removed: {e}")),
-                )));
-            }
-        }
-        if let Err(e) = std::fs::rename(&snapshot_tmp, &bak1) {
-            log_diag(&format!(
-                "settings_db: rotate_backups: rename {} -> {} failed: {e}",
-                snapshot_tmp.display(),
-                bak1.display()
-            ));
-            // snapshot_tmp は手元に残るので、ユーザーが手動復旧できる
-            return Err(SettingsDbError::Rusqlite(rusqlite::Error::SqliteFailure(
+        // T42 (Codex P2 / 2026-05-16) の snapshot-first 順序は tags.db と共有の正本
+        // (`crate::db_backup::rotate_generation_backups`) に集約した。フロー詳細と
+        // crash 安全性の根拠はそちらのモジュールコメントを参照。
+        crate::db_backup::rotate_generation_backups(
+            data_dir,
+            "settings.db",
+            &|msg| log_diag(&format!("settings_db: {msg}")),
+            &|tmp| self.backup_to(tmp).map_err(|e| e.to_string()),
+        )
+        .map_err(|msg| {
+            SettingsDbError::Rusqlite(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error {
                     code: rusqlite::ErrorCode::CannotOpen,
                     extended_code: 0,
                 },
-                Some(format!("snapshot tmp rename to bak1 failed: {e}")),
-            )));
-        }
-        log_diag(&format!(
-            "settings_db: rotate_backups: snapshot -> {}",
-            bak1.display()
-        ));
-        Ok(())
+                Some(msg),
+            ))
+        })
     }
 
     /// テスト用: in-memory SQLite を直接開く。

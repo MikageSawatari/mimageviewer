@@ -34,6 +34,10 @@ impl App {
     pub(crate) fn invalidate_tag_apply_suggestions(&mut self) {
         self.tag_apply_suggestion_key = None;
         self.tag_apply_suggestions.clear();
+        self.tag_apply_selection_cache = None;
+        // facet メニュー側のキャッシュも同じタイミング (タグデータ変更) で破棄する。
+        self.facet_tag_suggestion_cache = None;
+        self.facet_tag_counts_cache = None;
     }
 
     pub(crate) fn show_tag_apply_dialog(&mut self, ctx: &egui::Context) {
@@ -41,14 +45,44 @@ impl App {
             return;
         }
 
-        let paths = self.tag_target_paths();
-        if paths.is_empty() {
+        // ダイアログは開いている間毎フレーム描画される。tag_target_paths (選択全件の
+        // PathBuf clone) と current_selection_tags (パスごとの item_key 正規化 + タグ
+        // ごとの NFKC + ソート) を毎フレーム回すと、5k 件チェック時に入力がもたつく。
+        // 選択フィンガープリントが変わるか、タグデータが変わる
+        // (invalidate_tag_apply_suggestions) まではキャッシュを使う。
+        let fingerprint = (self.checked.len(), self.selected, self.fullscreen_idx);
+        let cache_valid = self
+            .tag_apply_selection_cache
+            .as_ref()
+            .is_some_and(|(fp, _, _)| *fp == fingerprint);
+        if !cache_valid {
+            let paths = self.tag_target_paths();
+            self.hydrate_tags_cache_for_paths(&paths);
+            let current = current_selection_tags(self, &paths)
+                .into_iter()
+                .map(|choice| (choice.name, choice.tag_key, choice.count))
+                .collect();
+            self.tag_apply_selection_cache = Some((fingerprint, paths, current));
+        }
+        let (_, cached_paths, cached_tags) = self
+            .tag_apply_selection_cache
+            .as_ref()
+            .expect("tag_apply_selection_cache set above");
+        if cached_paths.is_empty() {
             self.show_tag_apply = false;
+            self.tag_apply_selection_cache = None;
             return;
         }
-        self.hydrate_tags_cache_for_paths(&paths);
-
-        let current_tags = current_selection_tags(self, &paths);
+        let target_count = cached_paths.len();
+        let current_tags: Vec<TagChoice> = cached_tags
+            .iter()
+            .map(|(name, tag_key, count)| TagChoice {
+                name: name.clone(),
+                tag_key: tag_key.clone(),
+                count: *count,
+                pinned: false,
+            })
+            .collect();
         let current_keys: HashSet<String> = current_tags
             .iter()
             .map(|choice| choice.tag_key.clone())
@@ -61,7 +95,6 @@ impl App {
         let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let ime_active = self.ime_input_active();
-        let target_count = paths.len();
         let dialog_pos = ctx.content_rect().min + egui::vec2(70.0, 60.0);
 
         egui::Window::new("タグを付ける/外す")
