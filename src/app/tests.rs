@@ -2381,6 +2381,77 @@ mod phase_c_drill_nav_tests {
         );
     }
 
+    #[test]
+    fn opening_zip_under_facet_filter_suppresses_then_restores_parent_filter() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::settings::FacetItemKind;
+
+        let mut app = setup_app();
+        let parent = std::path::PathBuf::from(r"C:\books");
+        let zip_path = parent.join("vol1.zip");
+
+        app.current_folder = Some(parent.clone());
+        app.items = vec![GridItem::ZipFile(zip_path.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.settings.facet_filter.kinds.insert(FacetItemKind::Zip);
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "ZIP 絞り込みで親 ZIP が見える"
+        );
+
+        app.maybe_suppress_facet_filter_for_opened_container(0);
+        assert!(
+            !app.facet_filter_active(),
+            "ZIP を開いた直後は親の種類フィルタが退避される"
+        );
+        assert!(app.facet_filter_suppressed());
+
+        app.current_folder = Some(zip_path.clone());
+        app.items = vec![GridItem::ZipImage {
+            zip_path: zip_path.clone(),
+            entry_name: "p001.jpg".to_owned(),
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "親の ZIP 種類フィルタで中身の通常画像が消えない"
+        );
+
+        app.settings.facet_filter.exts.insert("jpg".to_owned());
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "退避中でも内側の拡張子フィルタを設定できる"
+        );
+
+        app.current_folder = Some(parent);
+        app.items = vec![GridItem::ZipFile(zip_path)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.rebuild_visible_indices();
+
+        assert!(!app.facet_filter_suppressed());
+        assert!(
+            app.settings
+                .facet_filter
+                .kinds
+                .contains(&FacetItemKind::Zip),
+            "親へ戻ると親階層の ZIP フィルタが復元される"
+        );
+        assert!(
+            app.settings.facet_filter.exts.is_empty(),
+            "内側で設定したフィルタは親へ持ち越さない"
+        );
+        assert_eq!(app.visible_indices, vec![0]);
+    }
+
     fn run_grid_key(app: &mut super::App, modifiers: egui::Modifiers, key: egui::Key) {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
@@ -5997,6 +6068,66 @@ mod favorite_adjustment_defaults_tests {
             app.rating_filter_suppressed_at.is_none(),
             "本より上の階層へ戻ったらフィルタは復元されるべき"
         );
+    }
+
+    #[test]
+    fn opening_zip_book_under_facet_filter_allows_inner_filter_then_restores() {
+        use crate::grid_item::GridItem;
+        use crate::settings::FacetItemKind;
+
+        let mut app = setup_app();
+        let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
+        app.current_folder = Some(zip_path.clone());
+
+        let nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.png"]);
+        app.zip_nav = Some(nav);
+        app.zip_nav_show_current_level();
+
+        app.settings
+            .facet_filter
+            .kinds
+            .insert(FacetItemKind::Folder);
+        app.rebuild_visible_indices();
+
+        let idx = app
+            .items
+            .iter()
+            .position(
+                |it| matches!(it, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "bookA/"),
+            )
+            .expect("root level should contain bookA ZipDir");
+
+        app.maybe_suppress_facet_filter_for_opened_zip_book(idx);
+        app.zip_nav_enter("bookA/");
+        assert!(
+            !app.facet_filter_active(),
+            "ZipDir を開いた直後は親のフォルダ種類フィルタが退避される"
+        );
+        assert!(app.facet_filter_suppressed());
+        assert_eq!(app.visible_indices, vec![0]);
+
+        app.settings.facet_filter.exts.insert("jpg".to_owned());
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.visible_indices,
+            vec![0],
+            "退避中でも本の中で別のフィルタを設定できる"
+        );
+
+        assert!(app.zip_nav_back());
+        assert!(!app.facet_filter_suppressed());
+        assert!(
+            app.settings
+                .facet_filter
+                .kinds
+                .contains(&FacetItemKind::Folder),
+            "本から出ると親階層のフォルダ種類フィルタが復元される"
+        );
+        assert!(
+            app.settings.facet_filter.exts.is_empty(),
+            "本の中で設定したフィルタは親へ持ち越さない"
+        );
+        assert_eq!(app.visible_indices, vec![0, 1]);
     }
 
     /// ★が付いていない本を開いても抑制は起動しない (= フィルタ維持)。

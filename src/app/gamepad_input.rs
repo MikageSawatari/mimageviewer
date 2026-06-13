@@ -784,6 +784,7 @@ impl App {
                     self.pending_auto_fs_open = true;
                 }
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
+                self.maybe_suppress_facet_filter_for_opened_container(idx);
                 Some(AddressBarNav::Direct(p))
             }
             Some(GridItem::Image(_))
@@ -799,6 +800,7 @@ impl App {
             Some(GridItem::ConvertibleArchive { path, format }) => {
                 let auto_fs = self.settings.auto_fullscreen_zip_pdf;
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
+                self.maybe_suppress_facet_filter_for_opened_container(idx);
                 if let Some(cached) = self.try_archive_cache_lookup(&path) {
                     self.open_archive_via_cache(path, cached, auto_fs);
                 } else {
@@ -809,6 +811,7 @@ impl App {
             Some(GridItem::SearchContainer { path, kind, .. }) => {
                 let is_zip = matches!(kind, crate::grid_item::SearchContainerKind::Zip);
                 self.maybe_suppress_rating_filter_for_opened_container_path(&path);
+                self.maybe_suppress_facet_filter_for_opened_container_path(&path);
                 self.drill_into_container(path, is_zip);
                 None
             }
@@ -816,6 +819,7 @@ impl App {
             Some(GridItem::ZipDir { dir_prefix, .. }) => {
                 // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ (Codex P2)。
                 self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
+                self.maybe_suppress_facet_filter_for_opened_zip_book(idx);
                 self.zip_nav_enter(&dir_prefix);
                 None
             }

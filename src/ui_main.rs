@@ -1905,6 +1905,20 @@ impl App {
                 facet_changed |= self.draw_facet_size_menu(ui);
                 facet_changed |= self.draw_facet_edit_menu(ui);
 
+                if self.facet_filter_suppressed() {
+                    let resp = ui
+                        .small_button(
+                            egui::RichText::new("親絞り込み退避中")
+                                .color(egui::Color32::from_rgb(60, 130, 190)),
+                        )
+                        .hover_tip(
+                            "親階層の絞り込み条件を退避中です。\n内側では新しい絞り込みを設定できます。\n親へ戻るか、このバッジをクリックで復元。",
+                        );
+                    if resp.clicked() && self.restore_facet_filter_suppression() {
+                        facet_changed = true;
+                    }
+                }
+
                 if self.facet_filter_active() || self.rating_filter_active() {
                     ui.separator();
                     self.draw_facet_active_chips(ui);
@@ -3648,6 +3662,7 @@ impl App {
                     } else {
                         let p = p.clone();
                         self.maybe_suppress_rating_filter_for_opened_container(idx);
+                        self.maybe_suppress_facet_filter_for_opened_container(idx);
                         nav = Some(p);
                     }
                 }
@@ -3655,6 +3670,7 @@ impl App {
                     // Folder 分岐とは global_search drill-in 判定が違うためここは別のまま。
                     let p = p.clone();
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
+                    self.maybe_suppress_facet_filter_for_opened_container(idx);
                     // 環境設定 ON なら、ページ一覧を経由せず 1 ページ目を即フルスクリーンで開く。
                     if self.settings.auto_fullscreen_zip_pdf {
                         self.pending_auto_fs_open = true;
@@ -3703,6 +3719,7 @@ impl App {
                         self.record_tag_view_nav_open(&pf);
                     }
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
+                    self.maybe_suppress_facet_filter_for_opened_container(idx);
                     let open_outcome = if let Some(cached) = self.try_archive_cache_lookup(&pf) {
                         if self.open_archive_via_cache(pf, cached, auto_fs) {
                             crate::app::FolderOpenOutcome::Loaded
@@ -3741,6 +3758,7 @@ impl App {
                     let is_zip = matches!(kind, crate::grid_item::SearchContainerKind::Zip);
                     // ★コンテナを開いた時の中身空表示対策 (Codex P2)
                     self.maybe_suppress_rating_filter_for_opened_container_path(&p);
+                    self.maybe_suppress_facet_filter_for_opened_container_path(&p);
                     self.drill_into_container(p, is_zip);
                 }
                 // ネスト ZIP ツリーの子コンテナへダブルクリックで降りる (Phase 3)。
@@ -3749,6 +3767,7 @@ impl App {
                     // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ
                     // (Codex P2)。enter 前に抑制を仕込む。
                     self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
+                    self.maybe_suppress_facet_filter_for_opened_zip_book(idx);
                     self.zip_nav_enter(&dp);
                 }
                 None => {}

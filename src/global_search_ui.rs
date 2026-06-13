@@ -1809,6 +1809,7 @@ impl App {
     /// を表示する。
     pub(crate) fn drill_into_container(&mut self, container: PathBuf, is_zip: bool) {
         self.cancel_pending_folder_nav();
+        self.maybe_suppress_facet_filter_for_opened_container_path(&container);
         // ドリルインはユーザーの明示操作 → 自動ビュー切替を止める (§4.3.2 (c))。
         self.global_search.aggregate_auto = false;
         self.global_search.drill = Some(DrillState {
@@ -1824,6 +1825,7 @@ impl App {
     pub(crate) fn drill_into_subfolder(&mut self, sub_path: PathBuf) {
         if let Some(d) = self.global_search.drill.clone() {
             self.cancel_pending_folder_nav();
+            self.maybe_suppress_facet_filter_for_opened_container_path(&sub_path);
             self.global_search.drill = Some(DrillState {
                 current_path: sub_path,
                 ..d
@@ -1892,6 +1894,7 @@ impl App {
         // Ctrl+G drill-back は load_folder を経由しないため、suppression の subtree
         // 外判定が走らない。ユーザー視点では「本から出た」ので復元する (Codex High 指摘)。
         self.restore_rating_filter_suppression();
+        while self.restore_facet_filter_suppression() {}
         // 戻った先で当該 SearchContainer にカーソルを再選択する。
         if let Some(d) = &self.global_search.drill {
             self.global_search.restore_select_path = Some(d.container_root.clone());
@@ -1921,6 +1924,7 @@ impl App {
                 // 戻った先 (parent) で「直前に居たサブフォルダ」にカーソル復帰
                 self.global_search.restore_select_path = Some(d.current_path.clone());
                 self.cancel_pending_folder_nav();
+                self.restore_facet_filter_suppression_for_path(Some(&parent_pb));
                 self.global_search.drill = Some(DrillState {
                     current_path: parent_pb,
                     ..d

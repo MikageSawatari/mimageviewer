@@ -717,7 +717,7 @@ SendTo から渡されたファイル / フォルダは Windows により位置�
 | `details_show_video_duration` | bool | false | 詳細表示モードで遅延ロード列 `動画長さ` を表示するか |
 | `details_show_video_dimensions` | bool | false | 詳細表示モードで遅延ロード列 `動画解像度` を表示するか |
 | `details_show_video_codec` | bool | false | 詳細表示モードで遅延ロード列 `動画コーデック` を表示するか |
-| `facet_filter` | FacetFilter | default | スマートフィルタ条件。種類・拡張子・タグ・日付・サイズ・状態など。タグ/拡張子のようなフォルダ固有値は場所変更時に解除する |
+| `facet_filter` | FacetFilter | default | スマートフィルタ条件。種類・拡張子・タグ・日付・サイズ・状態など。絞り込み中に ZIP/PDF/フォルダなどのコンテナへ入ると親階層の条件を一時退避し、内側では別条件を設定できる。Backspace などで親階層へ戻ると退避した条件を復元する |
 | `thumb_aspect` | ThumbAspect | Square | サムネイル縦横比（16:9 / 3:2 / 4:3 / 1:1 / 3:4 / 2:3 / 9:16）。`thumb_aspect_auto = false` のときに使われる。Auto モード時もこの値は手動値として保持され、Manual に戻すと復活する。 |
 | `thumb_aspect_auto` | bool | false | サムネイル比率の自動選択モード。`true` のときフォルダ内画像の比率に応じてグリッドセル比率を自動で切り替える。フォルダごとの前回確定値は `auto_aspect_cache.db` に保存され、再訪時の初期比率に使われる。キャッシュ復元時は保存時の sample 数と同等以上の実測 sample が集まるまで、途中統計による上書きを抑制する。キャッシュ管理ダイアログの現在フォルダ削除 / 全削除 / 古いキャッシュ削除で、この判定結果も対応する範囲だけ削除される (詳細: [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md))。 |
 | `sort_order` | SortOrder | FileName | ソート順（FileName / Natural / MtimeAsc / MtimeDesc） |

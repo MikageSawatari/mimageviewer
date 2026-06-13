@@ -3076,6 +3076,12 @@ pub(crate) struct FullscreenVideoMarkerCache {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct FacetFilterSuppression {
+    pub(crate) anchor: PathBuf,
+    pub(crate) saved_filter: crate::settings::FacetFilter,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct FullscreenVideoMarkerSnapshot {
     pub(crate) pin_pts: Option<f64>,
     pub(crate) pin_thumbnail: Option<VideoMarkerCachedThumbnail>,
@@ -3883,8 +3889,13 @@ pub struct App {
     details_lazy_visible_revision: u64,
     /// 画像解像度列の readiness。列全体が Ready になるまでソート/フィルタは無効。
     pub(crate) details_image_dims_state: LazyColumnState,
-    /// フォルダ固有 facet (タグ/拡張子) の適用元。場所が変わったら無界値 facet を解除する。
+    /// facet filter の適用元。場所変更時の一時解除 / 復元判定に使う。
     pub(crate) facet_filter_scope: Option<PathBuf>,
+    /// facet filter の階層別退避: ZIP/PDF/フォルダなどのコンテナを絞り込みで見つけて
+    /// 開いたあと、中身が別種別・別拡張子で空表示になる事故を防ぐ。
+    /// anchor 配下へ入ると現在の filter を退避して内側は filter なしで始め、
+    /// 内側で新しい filter を設定できる。anchor 外へ戻ると退避した filter を復元する。
+    pub(crate) facet_filter_suppression_stack: Vec<FacetFilterSuppression>,
     /// facet タグメニュー内の一時検索文字列。設定には保存しない。
     pub(crate) facet_tag_search_query: String,
 
@@ -5979,6 +5990,7 @@ impl App {
             details_lazy_visible_revision: 0,
             details_image_dims_state: LazyColumnState::Disabled,
             facet_filter_scope: None,
+            facet_filter_suppression_stack: Vec::new(),
             facet_tag_search_query: String::new(),
             pending_finalize: std::collections::HashSet::new(),
             last_vis_range: (0, 0),
@@ -10330,6 +10342,9 @@ impl App {
         // SQLite を引くと UI スレッドが詰まる。start_loading_items と同じく事前に
         // バッチ prewarm しておく (Codex P3 perf parity)。
         self.prewarm_rating_cache();
+        // facet filter は visible_indices の構築に直接効くため、ZIP 階層で anchor 外へ
+        // 戻った場合は再構築前に親条件を復元しておく。
+        self.maybe_restore_facet_filter_after_zip_level_change();
         // ★ visible_indices を再構築。これがないと旧レベルの stale index が
         // update_keep_range_and_requests で thumbnails[i] を範囲外参照して panic する (Codex P1)。
         self.rebuild_visible_indices();
@@ -16616,6 +16631,7 @@ impl App {
                             }
                             let p = p.clone();
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
+                            self.maybe_suppress_facet_filter_for_opened_container(idx);
                             return Some(crate::ui_main::AddressBarNav::Direct(p));
                         }
                         Some(GridItem::Video(p)) if shift_enter => {
@@ -16646,6 +16662,7 @@ impl App {
                             let pf = path.clone();
                             let fmt = *format;
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
+                            self.maybe_suppress_facet_filter_for_opened_container(idx);
                             let auto_fs = self.settings.auto_fullscreen_zip_pdf;
                             let search_rollback = if self.favsearch.active || self.tag_view.active {
                                 Some(self.folder_nav_history_snapshot())
@@ -16698,6 +16715,7 @@ impl App {
                             // ★コンテナを開いた時、内部画像が未評価で空表示にならないよう
                             // フィルタを一時解除する (Codex P2)。
                             self.maybe_suppress_rating_filter_for_opened_container_path(&p);
+                            self.maybe_suppress_facet_filter_for_opened_container_path(&p);
                             self.drill_into_container(p, is_zip);
                             return None;
                         }
@@ -16707,6 +16725,7 @@ impl App {
                             // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ
                             // (Codex P2)。enter 前に抑制を仕込む。
                             self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
+                            self.maybe_suppress_facet_filter_for_opened_zip_book(idx);
                             self.zip_nav_enter(&dp);
                         }
                         None => {}
@@ -19760,17 +19779,38 @@ impl App {
         if self.facet_filter_scope == scope {
             return;
         }
-        let had_previous_scope = self.facet_filter_scope.is_some();
+        let previous_scope = self.facet_filter_scope.clone();
         self.facet_filter_scope = scope;
-        if had_previous_scope
-            && (!self.settings.facet_filter.tags.is_empty()
-                || self.settings.facet_filter.include_untagged
-                || !self.settings.facet_filter.exts.is_empty())
-        {
-            self.settings.facet_filter.tags.clear();
-            self.settings.facet_filter.include_untagged = false;
-            self.settings.facet_filter.exts.clear();
-            self.settings.save();
+        self.update_facet_filter_suppression_for_scope_change(previous_scope);
+    }
+
+    fn update_facet_filter_suppression_for_scope_change(
+        &mut self,
+        previous_scope: Option<PathBuf>,
+    ) {
+        let current = self.facet_filter_scope.clone();
+        self.restore_facet_filter_suppression_for_path(current.as_deref());
+
+        if !self.facet_filter_active() {
+            return;
+        }
+        let (Some(prev), Some(cur)) = (previous_scope.as_ref(), current.as_ref()) else {
+            return;
+        };
+        if prev != cur && path_in_subtree_ci(cur, prev) {
+            self.suppress_current_facet_filter_at(
+                cur.clone(),
+                "親の絞り込みを退避しました (戻ると復元)".to_string(),
+            );
+        }
+    }
+
+    pub(crate) fn restore_facet_filter_suppression_for_path(&mut self, current: Option<&Path>) {
+        while let Some(top) = self.facet_filter_suppression_stack.last() {
+            if current.is_some_and(|cur| path_in_subtree_ci(cur, &top.anchor)) {
+                break;
+            }
+            self.restore_facet_filter_suppression();
         }
     }
 
@@ -19815,10 +19855,14 @@ impl App {
         self.settings.facet_filter.is_active()
     }
 
+    pub(crate) fn facet_filter_effectively_active(&self) -> bool {
+        self.facet_filter_active()
+    }
+
     fn passes_facet_filter(&mut self, idx: usize, ignore: Option<FacetField>) -> bool {
         use crate::settings::{FacetEditFlag, FacetTagMode};
 
-        if !self.settings.facet_filter.is_active() {
+        if !self.facet_filter_effectively_active() {
             return true;
         }
         let Some(item) = self.items.get(idx).cloned() else {
@@ -20969,6 +21013,95 @@ impl App {
         self.rating_filter_suppressed_at = None;
     }
 
+    fn suppress_current_facet_filter_at(&mut self, anchor: PathBuf, message: String) {
+        if !self.facet_filter_active() {
+            return;
+        }
+        if self
+            .facet_filter_suppression_stack
+            .last()
+            .is_some_and(|top| top.anchor == anchor)
+        {
+            return;
+        }
+        let saved_filter = std::mem::take(&mut self.settings.facet_filter);
+        self.facet_filter_suppression_stack
+            .push(FacetFilterSuppression {
+                anchor,
+                saved_filter,
+            });
+        self.show_feedback_toast(message);
+    }
+
+    pub(crate) fn maybe_suppress_facet_filter_for_opened_container_path(&mut self, anchor: &Path) {
+        self.suppress_current_facet_filter_at(
+            anchor.to_path_buf(),
+            "親の絞り込みを退避しました (戻ると復元)".to_string(),
+        );
+    }
+
+    pub(crate) fn maybe_suppress_facet_filter_for_opened_container(&mut self, idx: usize) {
+        if !self.facet_filter_active() {
+            return;
+        }
+        if !self.passes_facet_filter(idx, None) {
+            return;
+        }
+        let Some(anchor) = self
+            .items
+            .get(idx)
+            .and_then(|it| it.container_path())
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        self.suppress_current_facet_filter_at(
+            anchor,
+            "親の絞り込みを退避しました (戻ると復元)".to_string(),
+        );
+    }
+
+    pub(crate) fn maybe_suppress_facet_filter_for_opened_zip_book(&mut self, idx: usize) {
+        if !self.facet_filter_active() {
+            return;
+        }
+        if !self.passes_facet_filter(idx, None) {
+            return;
+        }
+        let Some(GridItem::ZipDir {
+            zip_path,
+            dir_prefix,
+            ..
+        }) = self.items.get(idx)
+        else {
+            return;
+        };
+        let root = zip_rating_root_path(
+            zip_path,
+            self.archive_source_override.as_deref(),
+            self.current_folder.as_deref(),
+        );
+        let anchor = book_container_key(root, dir_prefix);
+        self.suppress_current_facet_filter_at(
+            anchor,
+            "親の絞り込みを退避しました (本から戻ると復元)".to_string(),
+        );
+    }
+
+    pub(crate) fn restore_facet_filter_suppression(&mut self) -> bool {
+        if let Some(suppression) = self.facet_filter_suppression_stack.pop() {
+            self.settings.facet_filter = suppression.saved_filter;
+            self.settings.save();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn facet_filter_suppressed(&self) -> bool {
+        !self.facet_filter_suppression_stack.is_empty()
+    }
+
     /// ZIP 階層の移動 (`zip_nav_show_current_level`) 後に呼ぶ: ★付きの本を開いて
     /// 一時解除したフィルタを、その本より上の階層へ戻ったら復元する。
     ///
@@ -20991,6 +21124,20 @@ impl App {
         if !inside {
             self.restore_rating_filter_suppression();
             self.current_folder_rating_cache = None;
+        }
+    }
+
+    fn maybe_restore_facet_filter_after_zip_level_change(&mut self) {
+        let Some((cur_key, _)) = self.current_container_rating_key_and_source() else {
+            return;
+        };
+        while let Some(top) = self.facet_filter_suppression_stack.last() {
+            let anchor_key = crate::adjustment_db::normalize_path(&top.anchor);
+            let inside = cur_key == anchor_key || cur_key.starts_with(&format!("{anchor_key}/"));
+            if inside {
+                break;
+            }
+            self.restore_facet_filter_suppression();
         }
     }
 
