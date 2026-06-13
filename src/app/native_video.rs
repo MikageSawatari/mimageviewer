@@ -1388,6 +1388,9 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn native_video_fullscreen_active_for_main_backdrop(&self) -> bool {
+        if self.viewer_session_is_detached_or_switching() {
+            return false;
+        }
         if !self.viewer_session_blocks_main_window() {
             return false;
         }

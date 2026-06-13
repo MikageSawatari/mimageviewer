@@ -2717,8 +2717,7 @@ impl App {
         //     破棄・再生成 (= 白フラッシュ / 黒被り) がトグルで起きない。
         #[cfg(windows)]
         if self.native_video_backdrop_target_for_fs(fs_idx)
-            && !self.viewer_session_is_detached()
-            && !self.detached_video_host_switch_pending()
+            && !self.viewer_session_is_detached_or_switching()
         {
             let hwnd_ready = self.native_video_presenter_hwnd_for_fs(fs_idx).is_some();
             let startup_cover = matches!(self.viewer_presentation, ViewerPresentation::Fullscreen)
@@ -2771,8 +2770,7 @@ impl App {
         #[cfg(not(windows))]
         let embedded = false;
         #[cfg(windows)]
-        let detached =
-            self.viewer_session_is_detached() || self.detached_video_host_switch_pending();
+        let detached = self.viewer_session_is_detached_or_switching();
         #[cfg(not(windows))]
         let detached = false;
         let main_ctx = ctx;

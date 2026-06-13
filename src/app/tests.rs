@@ -11938,6 +11938,54 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn detached_video_switch_in_flight_counts_as_detached_for_lifecycle() {
+        let mut app = setup_app();
+        let idx = push_video(&mut app, r"C:\clips\movie.mp4");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.native_video_in_window_active = false;
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 42,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+        });
+
+        assert!(
+            !app.viewer_session_is_detached(),
+            "PlacementSwitched has not arrived yet, so the committed presentation is still fullscreen"
+        );
+        assert!(
+            app.viewer_session_is_detached_or_switching(),
+            "the in-flight switch-to-detached frame must keep the detached host viewport alive"
+        );
+        assert!(
+            !app.native_video_fullscreen_active_for_main_backdrop(),
+            "switching to detached must not route through the main fullscreen backdrop"
+        );
+    }
+
+    #[test]
+    fn detached_video_host_wait_counts_as_detached_for_lifecycle() {
+        let mut app = setup_app();
+        let idx = push_video(&mut app, r"C:\clips\movie.mp4");
+        let now = std::time::Instant::now();
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.pending_detached_video_host_switch = Some(DetachedVideoHostSwitchPending {
+            target_presentation: ViewerPresentation::DetachedWindow,
+            activate_on_show: true,
+            requested_at: now,
+            deadline: now + std::time::Duration::from_secs(1),
+        });
+
+        assert!(app.viewer_session_is_detached_or_switching());
+        assert!(
+            !app.native_video_fullscreen_active_for_main_backdrop(),
+            "waiting for the detached host must not activate fullscreen backdrop handling"
+        );
+    }
+
+    #[test]
     fn detached_viewer_root_key_input_is_left_for_main_window() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

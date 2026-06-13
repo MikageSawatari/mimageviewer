@@ -18010,6 +18010,31 @@ impl App {
             && matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
     }
 
+    pub(crate) fn viewer_session_is_detached_or_switching(&self) -> bool {
+        if self.viewer_session_is_detached() {
+            return true;
+        }
+        if self.fullscreen_idx.is_none() {
+            return false;
+        }
+        #[cfg(windows)]
+        {
+            self.detached_video_host_switch_pending()
+                || matches!(
+                    self.native_video_mode_switch,
+                    Some(pending)
+                        if matches!(
+                            pending.target_presentation,
+                            ViewerPresentation::DetachedWindow
+                        )
+                )
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     pub(crate) fn viewer_session_blocks_main_window(&self) -> bool {
         self.fullscreen_idx.is_some() && !self.viewer_session_is_detached()
     }
@@ -32069,7 +32094,7 @@ impl eframe::App for App {
                     );
                     self.sync_after_restore();
                 } else if !is_visible_now && self.window_visible {
-                    let keep_detached_viewer_alive = self.viewer_session_is_detached();
+                    let keep_detached_viewer_alive = self.viewer_session_is_detached_or_switching();
                     self.window_visible = false;
                     crate::set_ui_heartbeat_suspended(
                         !keep_detached_viewer_alive,

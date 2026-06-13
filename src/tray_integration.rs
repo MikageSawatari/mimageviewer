@@ -115,7 +115,7 @@ impl App {
         if !self.window_visible {
             return;
         }
-        let keep_detached_viewer_alive = self.viewer_session_is_detached();
+        let keep_detached_viewer_alive = self.viewer_session_is_detached_or_switching();
         self.window_visible = false;
         crate::set_ui_heartbeat_suspended(
             !keep_detached_viewer_alive,
@@ -218,7 +218,7 @@ impl App {
             self.fullscreen_idx.is_some(),
             fs_cache_has_video,
             native_video_pending,
-            self.viewer_session_is_detached(),
+            self.viewer_session_is_detached_or_switching(),
         ) {
             crate::logger::log(format!(
                 "tray: closing fullscreen/media session before residency \
@@ -226,7 +226,7 @@ impl App {
                 self.fullscreen_idx, fs_cache_has_video, native_video_pending
             ));
             self.close_fullscreen();
-        } else if self.viewer_session_is_detached() {
+        } else if self.viewer_session_is_detached_or_switching() {
             crate::logger::log(format!(
                 "tray: keeping detached viewer session alive during residency \
                  fullscreen={:?} fs_video={} native_pending={}",
@@ -240,7 +240,7 @@ impl App {
     /// ウィンドウ復帰後は通常のロード経路で再取得されるので、描画には影響なし
     /// (短時間の再ロードオーバーヘッドが発生する)。
     fn release_gpu_resources(&mut self) {
-        let keep_detached_viewer_alive = self.viewer_session_is_detached();
+        let keep_detached_viewer_alive = self.viewer_session_is_detached_or_switching();
         // グリッドサムネ: Loaded → Evicted で TextureHandle を drop。
         // 動画サムネは Windows Shell API 経由で復帰後の再 spawn 経路が無く、
         // Evicted のまま暗灰背景が固定表示されてしまう (= 「全動画黒背景」報告) ので除外。
