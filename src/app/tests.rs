@@ -11840,6 +11840,24 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn detached_viewer_cleanup_font_resync_does_not_blank_main_paint() {
+        assert!(
+            !should_defer_main_paint_for_font_atlas_resync(
+                FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP
+            ),
+            "detached viewer close should resync fonts without a one-frame black main window"
+        );
+        assert!(
+            should_defer_main_paint_for_font_atlas_resync("fullscreen_viewport_cleanup"),
+            "normal fullscreen cleanup keeps the conservative font-atlas reset path"
+        );
+        assert!(
+            should_defer_main_paint_for_font_atlas_resync("native_video_backdrop_hide"),
+            "native fullscreen backdrop cleanup keeps the conservative font-atlas reset path"
+        );
+    }
+
+    #[test]
     fn detached_still_viewer_leaves_mouse_nav_for_viewer_when_main_unfocused() {
         let mut app = setup_app();
         let idx = push_image(&mut app, r"C:\pics\a.jpg");

@@ -44,6 +44,8 @@ pub(crate) enum ViewerPresentation {
     DetachedWindow,
 }
 
+pub(crate) const FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP: &str = "detached_viewer_cleanup";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ViewerSyncStamp {
     idx: usize,
@@ -67,6 +69,10 @@ fn should_close_fullscreen_from_main_focus(
         && !native_video_presenter_active
         && !embedded_still
         && !fullscreen_root_key_handled
+}
+
+fn should_defer_main_paint_for_font_atlas_resync(reason: &str) -> bool {
+    reason != FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP
 }
 
 /// Ctrl+↑↓ フォルダナビゲーションの発火元モード。DFS 完了後に mode に応じて
@@ -18042,12 +18048,20 @@ impl App {
             .take()
             .unwrap_or("unknown");
         crate::ui_fonts::configure_fonts_for_texture_resync(ctx, generation);
-        crate::logger::log(format!(
-            "[ui-fonts] defer main paint for font atlas resync: phase={phase} \
-             reason={reason} generation={generation}"
-        ));
+        let defer_main_paint = should_defer_main_paint_for_font_atlas_resync(reason);
+        if defer_main_paint {
+            crate::logger::log(format!(
+                "[ui-fonts] defer main paint for font atlas resync: phase={phase} \
+                 reason={reason} generation={generation}"
+            ));
+        } else {
+            crate::logger::log(format!(
+                "[ui-fonts] resync main font atlas without paint defer: phase={phase} \
+                 reason={reason} generation={generation}"
+            ));
+        }
         ctx.request_repaint();
-        true
+        defer_main_paint
     }
 
     pub(crate) fn main_grid_spread_pair_cursor_idx(&mut self) -> Option<usize> {

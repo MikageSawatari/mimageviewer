@@ -2503,9 +2503,11 @@ impl App {
         #[cfg(not(windows))]
         let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
         #[cfg(windows)]
+        let cleanup_presentation = self.fs_viewport_presentation;
+        #[cfg(windows)]
         crate::logger::log(format!(
             "[viewport] cleanup_visible_false: presentation={:?} recreate={} generation={} host={}",
-            self.fs_viewport_presentation,
+            cleanup_presentation,
             self.fs_viewport_recreate_after_hide,
             self.fs_viewport_generation,
             self.detached_viewer_host_debug_state()
@@ -2518,7 +2520,13 @@ impl App {
         {
             self.fs_viewport_presentation = None;
             self.clear_detached_viewer_host_hwnd();
-            self.request_main_font_atlas_resync("fullscreen_viewport_cleanup");
+            let font_resync_reason =
+                if cleanup_presentation == Some(ViewerPresentation::DetachedWindow) {
+                    crate::app::FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP
+                } else {
+                    "fullscreen_viewport_cleanup"
+                };
+            self.request_main_font_atlas_resync(font_resync_reason);
         }
         if self.fs_viewport_recreate_after_hide {
             self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
