@@ -24,6 +24,7 @@ v1.3.0 のリリースレビュー (Claude マルチエージェント + Codex) 
 | バイト列の二重フルパース | `ingest_text.rs` `build_per_source_from_bytes` | `build_searchable_from_bytes_with_origin` と `build_searchable_from_bytes` を別々に呼び、ZIP 内画像のチャンクを2回 inflate + 解析している。`_with_origin` 1回に統合 (`build_per_source_for_file` 同様)。ZIP ingest ホットパスの perf | 対応済 (v1.3.1) |
 | zlib 解凍爆弾 | `png_metadata.rs` `decompress_zlib` | `read_to_string` に上限がなく、細工した zTXt/iTXt チャンクが無制限に膨らむ。**v1.2.0 以前からの既存**だが untrusted ファイルを読むので `Read::take(CAP)` で上限化。アーカイブ変換の `copy_capped` (v1.3.0) と同じ方針。**per-chunk 16 MiB + per-file 累積 32 MiB 上限**を実装 (回帰テスト付) | 対応済 (v1.3.1) |
 | 既定許可の索引 | `png_metadata.rs` `parse_fooocus_json` / `sui_extra_data` | スキップリストが空のまま全スカラーキーを索引へ入れる default-allow 姿勢。既知のリークはないが、negative を未知キーへ置いた細工 JSON への防御として allow-list 方式が望ましい | 見送り (v1.3.1 判断: 既知リークなし。allow-list 化は正規の未知パラメータを索引から落とす回帰リスク) |
+| EXIF UserComment の AI メタ誤分類 | `png_metadata.rs` `parse_user_comment_metadata` → `parse_a1111_as` (~1322) / `ingest_text.rs` (~415) | `parse_a1111_as` が非空テキストなら常に `Some` を返すため、通常の JPEG EXIF `UserComment` (カメラのコメント等) も AI メタとして解釈され、通常の EXIF 検索から抑制される。`Negative prompt:` / `Steps:` 等の A1111 シグネチャを要求してから AI メタ扱いにする。通常コメントの negative test 追加。**v1.3.0 の AI メタ拡充以来の既存挙動で v1.4.0 新規退行ではない** | P2 (v1.4.0 Codex re-review、既存) |
 
 ### 1.2 ネスト ZIP ツリー / アーカイブ
 
@@ -33,7 +34,9 @@ v1.3.0 のリリースレビュー (Claude マルチエージェント + Codex) 
 | ZipDir サムネのキュー振り分け | `app.rs` `is_heavy_io` 判定 (≈ thumbnail queue routing) | ZipDir 要求は軽量キューだが worker 側で `ZipDirRepresentative` 解決時に ZIP 列挙 (重 I/O) する。`LoadRequest` の解決戦略でも振り分ける。**perf::event("thumb","zipdir_resolve") 計装を追加**(実測→振り分け再検討用)。振り分け本体は計測値を見て別途 | 計装のみ (v1.3.1) |
 | 変換キャッシュ downgrade の UI 不可視 | `archive_cache.rs` `format_from_db` | v1.3.0 で `format="zip"` の行を v1.2.0 にダウングレードすると `list_all` が skip し cache-manager UI に出ない (auto-prune は効くので disk leak はなし)。未リリース機能なので影響軽微。コメント追記 or 未知 format の汎用表示 | P3 (unreleased) |
 | `files_done` 非飽和加算 | `archive_converter.rs` `finish_image` | `bytes_written` は saturating だが `files_done: u32` は素の `+= 1`。>42 億エントリで panic/wrap。到達不能だが `saturating_add` で統一 | 対応済 (v1.3.1) |
-| ネイティブ ZIP entry_name のサニタイズ | `zip_loader.rs` enumerate / `book_container_key` | ネイティブ (非変換) ZIP の entry に `../`・`.`・ドライブ文字が来ても converter (`normalize_entry_name`) と違い拒否しない。**`normalize_path` は字句的で `..` を解決しないため名前空間脱出・実パス衝突は起きない**ことを確認済み (= 実害なし) だが、converter 側と一貫させる防御的サニタイズを入れる余地あり | 見送り (v1.3.1 判断: 実害なし確認済。サニタイズは正規の特殊名エントリを取りこぼす回帰リスク) |
+| ネイティブ ZIP entry_name のサニタイズ | `zip_loader.rs` enumerate / `book_container_key` | ネイティブ (非変換) ZIP の entry に `../`・`.`・ドライブ文字が来ても converter (`normalize_entry_name`) と違い拒否しない。**`normalize_path` は字句的で `..` を解決しないため名前空間脱出・実パス衝突は起きない**ことを確認済み (= 実害なし) だが、converter 側と一貫させる防御的サニタイズを入れる余地あり | 見送り (v1.3.1 判断: 実害なし確認済。サニタイズは正規の特殊名エントリを取りこぼす回帰リスク) (v1.4.0 Codex 再指摘: 合成 rating/spread/pin キーへの影響を懸念。判断は据え置き) |
+| 変換アーカイブ cache パス refresh の UI 同期 I/O | `app.rs` `refresh_converted_archive_cache_paths` (`install_new_items` 経由) → `archive_cache.rs` `peek` (SQLite + `zip_path.exists()`) | ナビゲーション経路で `ConvertibleArchive` アイテムごとに DB lookup + `exists()` の同期 FS I/O。変換アーカイブを多数含むフォルダ + 低速/ネットワークドライブで stall の可能性 (docs/ui-responsiveness.md)。scan/サムネ worker 経路へ移すか非同期 batch 化。**既存コードで v1.4.0 で未変更** | P2 (v1.4.0 Codex re-review、既存) |
+| ZipDir をレーティングフィルタ下で開くと中身が空 | `ui_main.rs` (~3237) / `app.rs` (~16095) `maybe_suppress_rating_filter_for_opened_container` / `grid_item.rs` `container_path()` が ZipDir で `None` | ★フィルタ中にネスト ZIP の「本」(ZipDir) を開いても抑制経路が呼ばれず、中身が空/未レーティング表示になりうる。`rating_path_key` + 合成 book key を使う ZipDir 対応 suppression helper を `zip_nav_enter` 前に追加。**v1.3.0 のネスト ZIP ツリー以来の既存 UX 欠落で v1.4.0 新規退行ではない** | P2 (v1.4.0 Codex re-review、既存) |
 
 ### 1.3 フォルダツリーペイン
 
@@ -58,6 +61,7 @@ v1.3.0 のリリースレビュー (Claude マルチエージェント + Codex) 
 | --- | --- | --- | --- |
 | capture 再補正経路の sharpen | `capture.rs` `run_pixel_job` の re-adjust 分岐 | `effective_smart_sharpen` を経由せず raw `smart_sharpen` を適用。**本番呼出元なし (テスト専用) で latent**。AI アップスケール済みソースに繋ぐなら `output_is_ai_upscaled` を渡すか、テスト専用である旨のコメント | P3 (latent) |
 | lazy-load layers の入場時同期 DB 読み | `app.rs` `ensure_local_adjust_layers_loaded` | フルスクリーン入場の初回フレームで `LocalAdjustDb::get_layers` を UI スレッド同期実行 (= 意図的な tradeoff、フォルダ open 一括 ~2.5s を回避)。数十 MB の単一ページで一過性 hitch の可能性。実測で問題が出たら worker 化 (read-only 経路は既に not-loaded を None 返ししている) | P3 (monitor) |
+| legacy adjustment_cache の upscaled 誤判定 | `app.rs` (~26545) legacy `adjustment_cache` / `effective_smart_sharpen` | `ai_upscale_enabled` が true なら cache 済み AI 結果を一律「upscaled」扱いし、upscale が skip/失敗で denoise だけが cache を生んだ場合に smart sharpen が誤って skip される。AI cache entry に `used_upscale` を保存するか、最終 composite と同様 cache 出力寸法を source と比較する。**既存 latent** (1.7 で削除した `maybe_apply_adjustment` とは別 instance) | P3 (v1.4.0 Codex re-review、既存 latent) |
 
 ### 1.6 ドキュメント / マニュアル整合
 
