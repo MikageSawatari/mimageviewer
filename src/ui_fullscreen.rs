@@ -2413,6 +2413,14 @@ impl App {
         // 見えてちらつくので維持しつつ、ナビロックの holdover (= 直前ページの
         // テクスチャ) があればそれを表示して「黒画面で待たされる」体感を緩和する。
         if self.fs_viewport_shown && self.fs_nav_after_pdf_enumerate.is_some() {
+            #[cfg(windows)]
+            let fs_builder = match self.fs_viewport_presentation {
+                Some(ViewerPresentation::DetachedWindow) => {
+                    self.build_detached_viewer_viewport_builder(0, None)
+                }
+                _ => self.build_fullscreen_viewport_builder(),
+            };
+            #[cfg(not(windows))]
             let fs_builder = self.build_fullscreen_viewport_builder();
             let mut cancel = false;
             // holdover を中央フィットで描画する用のテクスチャ参照をクロージャ前に外出し。
@@ -2487,13 +2495,21 @@ impl App {
         #[cfg(windows)]
         let fs_builder = match self.fs_viewport_presentation {
             Some(ViewerPresentation::DetachedWindow) => {
-                self.build_detached_viewer_viewport_builder(0, false)
+                self.build_detached_viewer_viewport_builder(0, None)
             }
             _ => self.build_fullscreen_viewport_builder(),
         }
         .with_visible(false);
         #[cfg(not(windows))]
         let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
+        #[cfg(windows)]
+        crate::logger::log(format!(
+            "[viewport] cleanup_visible_false: presentation={:?} recreate={} generation={} host={}",
+            self.fs_viewport_presentation,
+            self.fs_viewport_recreate_after_hide,
+            self.fs_viewport_generation,
+            self.detached_viewer_host_debug_state()
+        ));
         ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
@@ -2730,16 +2746,30 @@ impl App {
         {
             self.hide_current_fullscreen_viewport_for_recreate(ctx, fs_idx);
         }
+        #[cfg(windows)]
+        if !embedded
+            && detached
+            && self.fs_viewport_shown
+            && self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
+            && self.detached_viewer_host_lost()
+        {
+            self.reset_detached_viewer_viewport_for_recreate("host_lost_before_render");
+        }
         let fs_id = self.fullscreen_viewport_id();
         let need_show = !self.fs_viewport_shown;
         #[cfg(windows)]
-        let detached_activate_on_show = if detached && need_show {
-            self.take_detached_viewer_activate_on_show()
+        let detached_activate_on_show = if detached {
+            if need_show {
+                Some(self.take_detached_viewer_activate_on_show()).filter(|active| *active)
+            } else {
+                self.detached_viewer_no_activate_once = false;
+                None
+            }
         } else {
-            true
+            Some(true)
         };
         #[cfg(not(windows))]
-        let detached_activate_on_show = true;
+        let detached_activate_on_show = Some(true);
         let mut fs_builder = if detached {
             self.build_detached_viewer_viewport_builder(fs_idx, detached_activate_on_show)
         } else {
@@ -2824,8 +2854,18 @@ impl App {
                     // 送らない (main ウィンドウは既に表示・フォーカス済み)。
                     #[cfg(windows)]
                     crate::dwm_transitions::disable_transitions_for_thread_windows();
+                    #[cfg(windows)]
+                    if detached {
+                        crate::logger::log(format!(
+                            "[detached-viewer] show viewport: fs_idx={fs_idx} activate={:?} \
+                             generation={} host={}",
+                            detached_activate_on_show,
+                            self.fs_viewport_generation,
+                            self.detached_viewer_host_debug_state()
+                        ));
+                    }
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    if !detached || detached_activate_on_show {
+                    if !detached || detached_activate_on_show.unwrap_or(false) {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
                     ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
@@ -2882,6 +2922,13 @@ impl App {
                 if !embedded && ctx.input(|i| i.viewport().close_requested()) {
                     // embedded のときの close_requested は main ウィンドウの × =
                     // アプリ終了要求。フルスクリーン解除ではないので拾わない。
+                    #[cfg(windows)]
+                    crate::logger::log(format!(
+                        "[detached-viewer] viewport close_requested: fs_idx={fs_idx} \
+                         detached={detached} presentation={:?} host={}",
+                        self.fs_viewport_presentation,
+                        self.detached_viewer_host_debug_state()
+                    ));
                     close_fs = true;
                 }
                 fs_setup_ms = setup_t0.elapsed().as_secs_f64() * 1000.0;
@@ -4365,7 +4412,7 @@ impl App {
         let fs_id = self.fullscreen_viewport_id();
         let builder = match self.fs_viewport_presentation {
             Some(ViewerPresentation::DetachedWindow) => {
-                self.build_detached_viewer_viewport_builder(fs_idx, false)
+                self.build_detached_viewer_viewport_builder(fs_idx, None)
             }
             _ => self.build_fullscreen_viewport_builder(),
         }
@@ -4468,7 +4515,7 @@ impl App {
     fn build_detached_viewer_viewport_builder(
         &self,
         fs_idx: usize,
-        active: bool,
+        active: Option<bool>,
     ) -> egui::ViewportBuilder {
         let name = self
             .items
@@ -4482,15 +4529,18 @@ impl App {
         };
 
         let placement = self.detached_viewer_window_placement();
-        egui::ViewportBuilder::default()
+        let mut builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_decorations(true)
             .with_transparent(false)
             .with_taskbar(true)
             .with_inner_size([placement.w, placement.h])
             .with_position(egui::pos2(placement.x, placement.y))
-            .with_maximized(placement.maximized)
-            .with_active(active)
+            .with_maximized(placement.maximized);
+        if let Some(active) = active {
+            builder = builder.with_active(active);
+        }
+        builder
     }
 
     #[cfg(windows)]
@@ -5965,9 +6015,17 @@ impl App {
             }
         }
         if ctrl_d || mouse_forward || browser_forward {
+            crate::logger::log(format!(
+                "[input-nav] source=fullscreen-egui action=ctrl_nav_forward fs_idx={fs_idx} \
+                 ctrl_down={ctrl_d} mouse_forward={mouse_forward} browser_forward={browser_forward}"
+            ));
             action.ctrl_nav = Some(1);
         }
         if ctrl_u || mouse_back || browser_back {
+            crate::logger::log(format!(
+                "[input-nav] source=fullscreen-egui action=ctrl_nav_back fs_idx={fs_idx} \
+                 ctrl_up={ctrl_u} mouse_back={mouse_back} browser_back={browser_back}"
+            ));
             action.ctrl_nav = Some(-1);
         }
         if ctrl_page_down {

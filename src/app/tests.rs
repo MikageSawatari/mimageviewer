@@ -11840,6 +11840,73 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn detached_still_viewer_leaves_mouse_nav_for_viewer_when_main_unfocused() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+
+        assert!(
+            !app.main_keyboard_should_drain_mouse_nav(false),
+            "detached still viewport must consume APPCOMMAND back/forward itself"
+        );
+        assert!(
+            app.main_keyboard_should_drain_mouse_nav(true),
+            "when the main window is focused, mouse back/forward remains a grid command"
+        );
+    }
+
+    #[test]
+    fn detached_video_main_drain_prevents_stale_native_mouse_nav_duplicate() {
+        let mut app = setup_app();
+        let idx = push_video(&mut app, r"C:\clips\movie.mp4");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+
+        assert!(
+            app.main_keyboard_should_drain_mouse_nav(false),
+            "native video has its own Win32 input path, so the global hook counter is drained"
+        );
+    }
+
+    #[test]
+    fn detached_folder_nav_close_preserves_viewport_host_for_reopen() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.detached_viewer_host_hwnd = 0x1234;
+        app.fs_viewport_generation = 77;
+        app.fs_viewport_recreate_after_hide = false;
+        app.pending_main_foreground_reclaim = true;
+        app.pending_main_foreground_reclaim_after_hwnd = 0x5678;
+
+        app.close_fullscreen_for_folder_nav_reopen();
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(!app.viewer_session_is_detached());
+        assert_eq!(app.selected, Some(idx));
+        assert!(app.fs_viewport_shown);
+        assert_eq!(
+            app.fs_viewport_presentation,
+            Some(ViewerPresentation::DetachedWindow)
+        );
+        assert_eq!(app.detached_viewer_host_hwnd, 0x1234);
+        assert_eq!(app.fs_viewport_generation, 77);
+        assert!(
+            !app.fs_viewport_recreate_after_hide,
+            "folder-nav reopen should reuse the detached viewport instead of recreating it"
+        );
+        assert!(
+            !app.pending_main_foreground_reclaim,
+            "internal detached navigation must not steal focus back to the main window"
+        );
+        assert_eq!(app.pending_main_foreground_reclaim_after_hwnd, 0);
+    }
+
+    #[test]
     fn detached_viewer_syncs_to_main_selected_still_image() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

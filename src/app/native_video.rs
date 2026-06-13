@@ -4866,9 +4866,15 @@ impl App {
             }
             // Plain Up / Down: navigate files, matching the egui fullscreen path.
             0x26 if key.ctrl && !key.shift => {
+                crate::logger::log(format!(
+                    "[input-nav] source=native-video-key action=ctrl_nav_back fs_idx={fs_idx} vk=0x26"
+                ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
             }
             0x28 if key.ctrl && !key.shift => {
+                crate::logger::log(format!(
+                    "[input-nav] source=native-video-key action=ctrl_nav_forward fs_idx={fs_idx} vk=0x28"
+                ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
             }
             // Ctrl+PageUp / PageDown: move to the previous / next sibling folder.
@@ -4883,9 +4889,15 @@ impl App {
             // 上で WM_APPCOMMAND を合成 KeyDown に変換した経路。Ctrl+↑/↓ と同じ DFS ナビと
             // 等価に扱う。
             0xA6 => {
+                crate::logger::log(format!(
+                    "[input-nav] source=native-video-key action=ctrl_nav_back fs_idx={fs_idx} vk=0xA6"
+                ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
             }
             0xA7 => {
+                crate::logger::log(format!(
+                    "[input-nav] source=native-video-key action=ctrl_nav_forward fs_idx={fs_idx} vk=0xA7"
+                ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
             }
             _ if self
@@ -5993,11 +6005,17 @@ impl App {
             match event.button {
                 NativeVideoMouseButton::Extra1 => {
                     self.native_video_pointer_down = None;
+                    crate::logger::log(format!(
+                        "[input-nav] source=native-video-mouse action=ctrl_nav_back fs_idx={fs_idx} button=Extra1"
+                    ));
                     self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
                     return;
                 }
                 NativeVideoMouseButton::Extra2 => {
                     self.native_video_pointer_down = None;
+                    crate::logger::log(format!(
+                        "[input-nav] source=native-video-mouse action=ctrl_nav_forward fs_idx={fs_idx} button=Extra2"
+                    ));
                     self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
                     return;
                 }

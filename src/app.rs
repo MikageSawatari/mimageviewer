@@ -16194,17 +16194,18 @@ impl App {
         // 早期 return しても、ブロック中の pending は今フレームで破棄したい
         // (= フォーカス解除後に遅れて Ctrl+↑/↓ として暴発するのを防ぐため、Codex P2)。
         //
-        // ただし **フルスクリーン中は drain しない**。`App::update` は
-        // `handle_keyboard` → `render_fullscreen_viewport` の順で呼ぶため、ここで先に
-        // drain してしまうと fullscreen の `handle_fs_key_input` 側が pending を見られず、
-        // 画像系フルスクリーンの進む/戻る (= egui Key 経路に出ない WM_APPCOMMAND /
-        // Browser_Forward) が失われる (Codex 2 周目 P2)。fullscreen 中は fullscreen
-        // handler 側で drain する。
+        // ただし fullscreen/detached viewer が入力先になる状態では drain しない。
+        // `App::update` は `handle_keyboard` → `render_fullscreen_viewport` の順で呼ぶため、
+        // ここで先に drain してしまうと fullscreen の `handle_fs_key_input` 側が pending を
+        // 見られず、画像系フルスクリーンの進む/戻る (= egui Key 経路に出ない
+        // WM_APPCOMMAND / Browser_Forward) が失われる (Codex 2 周目 P2)。判断の詳細は
+        // `main_keyboard_should_drain_mouse_nav` に集約する。
+        let main_has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         let (browser_back_count, browser_forward_count) =
-            if self.viewer_session_blocks_main_window() {
-                (0, 0)
-            } else {
+            if self.main_keyboard_should_drain_mouse_nav(main_has_focus) {
                 crate::take_pending_mouse_nav()
+            } else {
+                (0, 0)
             };
 
         // 自動オープン ZIP/PDF からの Esc/Enter で立った「親フォルダ (一覧) へ戻る」予約を
@@ -16220,8 +16221,7 @@ impl App {
         }
 
         // ウィンドウにフォーカスがない場合はキー入力を無視
-        let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        if !has_focus {
+        if !main_has_focus {
             return None;
         }
         // フルスクリーン、ダイアログ、テキスト入力中はショートカットを無効化
@@ -16344,6 +16344,20 @@ impl App {
         // 経由) も Ctrl+↑/↓ と等価に扱う。
         let ctrl_up = (ctrl_held && up) || mouse_back || browser_back;
         let ctrl_down = (ctrl_held && down) || mouse_forward || browser_forward;
+        if ctrl_up || ctrl_down {
+            crate::logger::log(format!(
+                "[input-nav] source=grid action={} ctrl_held={ctrl_held} up={up} down={down} \
+                 mouse_back={mouse_back} mouse_forward={mouse_forward} browser_back={} \
+                 browser_forward={}",
+                if ctrl_down {
+                    "ctrl_nav_forward"
+                } else {
+                    "ctrl_nav_back"
+                },
+                browser_back_count,
+                browser_forward_count
+            ));
+        }
         let ctrl_page_up = ctrl_held && page_up;
         let ctrl_page_down = ctrl_held && page_down;
         let alt_up = alt_held && up && !ctrl_held;
@@ -17367,7 +17381,7 @@ impl App {
                         let restore_video_tile = false;
                         if let Some(next_path) = self.favsearch_sibling_path(delta) {
                             self.clear_pending_folder_nav_steps();
-                            self.close_fullscreen();
+                            self.close_fullscreen_for_folder_nav_reopen();
                             self.favsearch.nav_stack = vec![next_path.clone()];
                             self.load_folder(next_path);
                             self.update_favsearch_address();
@@ -17496,7 +17510,7 @@ impl App {
                 // 新フォルダを読み直す (PDF Critical 予約は open_fullscreen で再取得)。
                 // 注: close_fullscreen は slideshow_playing=false にするが、SlideshowNext は
                 // resume_slideshow フラグ (= reopen 側で再開) で復帰するので問題ない。
-                self.close_fullscreen();
+                self.close_fullscreen_for_folder_nav_reopen();
                 self.load_folder_with_scan(path, scanned);
                 let reason = self.reopen_fullscreen_after_folder_nav_load(
                     ctx,
@@ -17537,7 +17551,7 @@ impl App {
                     let restore_video_tile = false;
                     self.favsearch.nav_stack.push(path.clone());
                     if fullscreen {
-                        self.close_fullscreen();
+                        self.close_fullscreen_for_folder_nav_reopen();
                     }
                     self.load_folder_with_scan(path, scanned);
                     self.update_favsearch_address();
@@ -17561,7 +17575,7 @@ impl App {
                         let restore_video_tile = false;
                         if let Some(next_path) = self.favsearch_sibling_path(delta) {
                             self.clear_pending_folder_nav_steps();
-                            self.close_fullscreen();
+                            self.close_fullscreen_for_folder_nav_reopen();
                             self.favsearch.nav_stack = vec![next_path.clone()];
                             self.load_folder(next_path);
                             self.update_favsearch_address();
@@ -17975,6 +17989,23 @@ impl App {
         self.fullscreen_idx.is_some() && !self.viewer_session_is_detached()
     }
 
+    fn main_keyboard_should_drain_mouse_nav(&self, main_has_focus: bool) -> bool {
+        if self.viewer_session_blocks_main_window() {
+            return false;
+        }
+        if self.viewer_session_is_detached() && !main_has_focus {
+            // Static detached viewers rely on the egui viewport handler to consume
+            // APPCOMMAND/BrowserBack input. Native detached video has its own Win32
+            // window proc, so main can drain the global hook counter to prevent a
+            // stale duplicate after the native handler has already moved.
+            return matches!(
+                self.fullscreen_idx.and_then(|idx| self.items.get(idx)),
+                Some(GridItem::Video(_))
+            );
+        }
+        true
+    }
+
     #[cfg(windows)]
     pub(crate) fn request_main_font_atlas_resync(&mut self, reason: &'static str) {
         if !self.main_font_atlas_resync_pending {
@@ -18160,6 +18191,74 @@ impl App {
         } else {
             None
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_viewer_host_lost(&self) -> bool {
+        let hwnd_raw = self.detached_viewer_host_hwnd;
+        if hwnd_raw == 0 {
+            return false;
+        }
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+
+        let hwnd = HWND(hwnd_raw as *mut _);
+        unsafe { !IsWindow(Some(hwnd)).as_bool() }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_viewer_host_debug_state(&self) -> String {
+        let hwnd_raw = self.detached_viewer_host_hwnd;
+        if hwnd_raw == 0 {
+            return "hwnd=0".to_string();
+        }
+
+        use windows::Win32::Foundation::{HWND, RECT};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowRect, IsIconic, IsWindow, IsWindowVisible,
+        };
+
+        let hwnd = HWND(hwnd_raw as *mut _);
+        unsafe {
+            let alive = IsWindow(Some(hwnd)).as_bool();
+            let visible = alive && IsWindowVisible(hwnd).as_bool();
+            let iconic = alive && IsIconic(hwnd).as_bool();
+            let mut rect = RECT::default();
+            let rect_ok = alive && GetWindowRect(hwnd, &mut rect).is_ok();
+            if rect_ok {
+                format!(
+                    "hwnd=0x{hwnd_raw:x} alive={alive} visible={visible} iconic={iconic} \
+                     rect=({},{} {}x{})",
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top
+                )
+            } else {
+                format!(
+                    "hwnd=0x{hwnd_raw:x} alive={alive} visible={visible} iconic={iconic} rect=<none>"
+                )
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn reset_detached_viewer_viewport_for_recreate(&mut self, reason: &'static str) {
+        crate::logger::log(format!(
+            "[detached-viewer] recreate viewport: reason={reason} fullscreen_idx={:?} \
+             viewer_presentation={:?} fs_shown={} fs_presentation={:?} generation={} host={}",
+            self.fullscreen_idx,
+            self.viewer_presentation,
+            self.fs_viewport_shown,
+            self.fs_viewport_presentation,
+            self.fs_viewport_generation,
+            self.detached_viewer_host_debug_state()
+        ));
+        self.fs_viewport_shown = false;
+        self.fs_viewport_presentation = None;
+        self.clear_detached_viewer_host_hwnd();
+        self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
+        self.fs_viewport_recreate_after_hide = false;
     }
 
     #[cfg(windows)]
@@ -22950,6 +23049,44 @@ impl App {
                 );
             }
         }
+    }
+
+    /// フォルダ横断ナビ用にフルスクリーン状態だけを閉じる。
+    ///
+    /// 通常の `close_fullscreen` は次フレームの cleanup で viewport を隠し、必要なら
+    /// ViewportId 世代を進める。Ctrl+↑↓ / 進む戻るボタンのフォルダ移動では直後に
+    /// `open_fullscreen` で再表示するため、detached viewer の OS ウィンドウまで
+    /// 再生成するとサイズ復元やフォーカスで不自然な動きになる。detached のときだけ
+    /// viewport ホストを保持し、中身のセッション状態は `close_fullscreen` と同じく
+    /// 破棄してから次フォルダを開く。
+    pub(crate) fn close_fullscreen_for_folder_nav_reopen(&mut self) {
+        #[cfg(windows)]
+        {
+            let preserve_detached_viewport = self.viewer_session_is_detached()
+                && self.fs_viewport_shown
+                && self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow);
+            if preserve_detached_viewport {
+                let fs_viewport_presentation = self.fs_viewport_presentation;
+                let detached_viewer_host_hwnd = self.detached_viewer_host_hwnd;
+                let fs_viewport_generation = self.fs_viewport_generation;
+                self.close_fullscreen();
+                self.fs_viewport_shown = true;
+                self.fs_viewport_presentation = fs_viewport_presentation;
+                self.detached_viewer_host_hwnd = detached_viewer_host_hwnd;
+                self.fs_viewport_generation = fs_viewport_generation;
+                self.fs_viewport_recreate_after_hide = false;
+                self.clear_pending_main_foreground_reclaim();
+                crate::logger::log(format!(
+                    "[detached-viewer] preserve viewport for folder-nav reopen: selected={:?} \
+                     generation={} host={}",
+                    self.selected,
+                    self.fs_viewport_generation,
+                    self.detached_viewer_host_debug_state()
+                ));
+                return;
+            }
+        }
+        self.close_fullscreen();
     }
 
     /// フルスクリーン表示を終了し、先読みキャッシュを全クリアする。
