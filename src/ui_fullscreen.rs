@@ -11928,16 +11928,22 @@ impl App {
 
     /// フルスクリーン左下に AI 処理ステータスを表示する。
     fn draw_fs_ai_status(&mut self, ui: &mut egui::Ui, fs_idx: usize) {
+        let has_ai_pending = !self.final_ai_pending.is_empty();
         let is_upscaling = self
             .final_ai_pending
             .keys()
             .any(|key| key.edit_key.idx == fs_idx);
+        let is_prefetching_ai = !is_upscaling
+            && self
+                .final_ai_pending
+                .keys()
+                .any(|key| key.edit_key.idx != fs_idx);
         let is_upscaled = self
             .final_ai_cache
             .keys()
             .any(|key| key.edit_key.idx == fs_idx);
         let is_loading = self.fs_pending.contains_key(&fs_idx);
-        let any_busy = is_loading || is_upscaling || !self.final_ai_pending.is_empty();
+        let any_busy = is_loading || has_ai_pending;
 
         let mut lines: Vec<(String, egui::Color32)> = Vec::new();
 
@@ -11950,6 +11956,11 @@ impl App {
             lines.push((
                 format!("AI 処理中 ({})", label),
                 egui::Color32::from_rgb(255, 200, 80),
+            ));
+        } else if is_prefetching_ai && !is_upscaled {
+            lines.push((
+                "AI 先読み中".to_string(),
+                egui::Color32::from_rgb(180, 210, 255),
             ));
         } else if is_upscaled {
             let label = self.ai_model_label(fs_idx, false);

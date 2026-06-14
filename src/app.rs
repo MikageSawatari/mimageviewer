@@ -25949,6 +25949,13 @@ impl App {
         pixels.as_raw().len() as u64
     }
 
+    fn retained_final_ai_cache_bytes(&self) -> u64 {
+        self.retained_final_ai_cache
+            .values()
+            .map(|entry| entry.bytes)
+            .sum()
+    }
+
     fn retained_final_ai_key_for(
         &self,
         idx: usize,
@@ -25979,18 +25986,42 @@ impl App {
         };
         let bytes = Self::retained_final_ai_image_bytes(&pixels);
         if bytes > max_bytes {
+            crate::logger::log(format!(
+                "[AI] Retained final AI skip idx={idx} item={} source={}x{} output={}x{} \
+                 bytes={bytes} max_bytes={max_bytes} reason=too_large",
+                retained_key.item_key, edit_size[0], edit_size[1], pixels.size[0], pixels.size[1],
+            ));
             return;
         }
         self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
-        self.retained_final_ai_cache.insert(
-            retained_key,
-            RetainedFinalAiEntry {
-                pixels,
-                bytes,
-                last_used: self.retained_final_ai_clock,
-            },
-        );
+        let output_size = pixels.size;
+        let retained_key_log = retained_key.clone();
+        let replaced = self
+            .retained_final_ai_cache
+            .insert(
+                retained_key,
+                RetainedFinalAiEntry {
+                    pixels,
+                    bytes,
+                    last_used: self.retained_final_ai_clock,
+                },
+            )
+            .is_some();
         self.prune_retained_final_ai_cache_to_budget(max_entries, max_bytes);
+        if self.retained_final_ai_cache.contains_key(&retained_key_log) {
+            crate::logger::log(format!(
+                "[AI] Retained final AI store idx={idx} item={} source={}x{} output={}x{} \
+                 bytes={bytes} entries={} total_bytes={} max_entries={max_entries} \
+                 max_bytes={max_bytes} replaced={replaced}",
+                retained_key_log.item_key,
+                edit_size[0],
+                edit_size[1],
+                output_size[0],
+                output_size[1],
+                self.retained_final_ai_cache.len(),
+                self.retained_final_ai_cache_bytes(),
+            ));
+        }
     }
 
     fn lookup_retained_final_ai(
@@ -26001,9 +26032,23 @@ impl App {
     ) -> Option<Arc<egui::ColorImage>> {
         let retained_key = self.retained_final_ai_key_for(idx, key, edit_size)?;
         self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
-        let entry = self.retained_final_ai_cache.get_mut(&retained_key)?;
-        entry.last_used = self.retained_final_ai_clock;
-        Some(Arc::clone(&entry.pixels))
+        let (pixels, bytes, output_size) = {
+            let entry = self.retained_final_ai_cache.get_mut(&retained_key)?;
+            entry.last_used = self.retained_final_ai_clock;
+            (Arc::clone(&entry.pixels), entry.bytes, entry.pixels.size)
+        };
+        crate::logger::log(format!(
+            "[AI] Retained final AI hit idx={idx} item={} source={}x{} output={}x{} \
+             bytes={bytes} entries={} total_bytes={}",
+            retained_key.item_key,
+            edit_size[0],
+            edit_size[1],
+            output_size[0],
+            output_size[1],
+            self.retained_final_ai_cache.len(),
+            self.retained_final_ai_cache_bytes(),
+        ));
+        Some(pixels)
     }
 
     fn has_retained_final_ai(&self, idx: usize, key: FinalAiKey, edit_size: [usize; 2]) -> bool {
@@ -26012,11 +26057,7 @@ impl App {
     }
 
     fn prune_retained_final_ai_cache_to_budget(&mut self, max_entries: usize, max_bytes: u64) {
-        let mut total_bytes: u64 = self
-            .retained_final_ai_cache
-            .values()
-            .map(|entry| entry.bytes)
-            .sum();
+        let mut total_bytes = self.retained_final_ai_cache_bytes();
         while self.retained_final_ai_cache.len() > max_entries || total_bytes > max_bytes {
             let Some(oldest_key) = self
                 .retained_final_ai_cache
@@ -26028,6 +26069,17 @@ impl App {
             };
             if let Some(removed) = self.retained_final_ai_cache.remove(&oldest_key) {
                 total_bytes = total_bytes.saturating_sub(removed.bytes);
+                crate::logger::log(format!(
+                    "[AI] Retained final AI evict item={} source={}x{} bytes={} \
+                     entries={} total_bytes={} max_entries={max_entries} max_bytes={max_bytes} \
+                     reason=budget",
+                    oldest_key.item_key,
+                    oldest_key.edit_size[0],
+                    oldest_key.edit_size[1],
+                    removed.bytes,
+                    self.retained_final_ai_cache.len(),
+                    total_bytes,
+                ));
             } else {
                 break;
             }
