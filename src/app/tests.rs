@@ -4943,14 +4943,19 @@ mod favorite_adjustment_defaults_tests {
     #[cfg(windows)]
     #[test]
     fn embedded_container_close_request_allows_parent_return_to_be_consumed() {
+        let tmp = TempDir::new().expect("tempdir");
+        let book = tmp.path().join("book.pdf");
+        std::fs::write(&book, b"%PDF-1.4\n").expect("write test pdf placeholder");
+
         let mut app = setup_app();
         app.items.push(GridItem::PdfPage {
-            pdf_path: std::path::PathBuf::from("c:/manga/book.pdf"),
+            pdf_path: book.clone(),
             page_num: 0,
             content_type: None,
         });
         app.fullscreen_idx = Some(0);
         app.native_video_in_window_active = true;
+        app.current_folder = Some(book.clone());
 
         app.pending_return_to_parent = false;
         assert!(
@@ -4962,6 +4967,26 @@ mod favorite_adjustment_defaults_tests {
         assert!(
             !app.handle_fullscreen_root_key_input(&egui::Context::default()),
             "parent-return reservation must reach handle_keyboard on the next frame"
+        );
+        let nav = app
+            .take_pending_return_to_parent_nav()
+            .expect("parent return request should become a direct nav");
+        assert!(
+            app.apply_fullscreen_close_nav_immediate(nav),
+            "embedded early-return path must apply the parent nav before returning"
+        );
+        assert_eq!(
+            app.current_folder.as_deref(),
+            Some(tmp.path()),
+            "embedded early return should load the parent file list"
+        );
+        assert_eq!(
+            app.fullscreen_idx, None,
+            "parent list load closes fullscreen immediately"
+        );
+        assert!(
+            !app.pending_return_to_parent,
+            "parent return request should not survive after the early-return path consumes it"
         );
     }
 

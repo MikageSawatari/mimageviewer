@@ -6349,6 +6349,30 @@ impl App {
         None
     }
 
+    /// Early-return 経路で `pending_return_to_parent` 由来のナビを消化する。
+    ///
+    /// 通常は App::update 後段の input_nav 合流点で処理するが、Windows の
+    /// in-window 静止画フルスクリーンはグリッド描画を飛ばして return するため、
+    /// そこでナビを捨てないよう同じロード処理を先に適用する。
+    pub(crate) fn apply_fullscreen_close_nav_immediate(
+        &mut self,
+        nav: crate::ui_main::AddressBarNav,
+    ) -> bool {
+        match nav {
+            crate::ui_main::AddressBarNav::Direct(path) => {
+                self.load_folder_or_convert_archive(path);
+                self.clear_pending_folder_nav_steps();
+                true
+            }
+            crate::ui_main::AddressBarNav::DriveList(origin) => {
+                self.enter_drive_list(origin);
+                true
+            }
+            crate::ui_main::AddressBarNav::HistoryBack
+            | crate::ui_main::AddressBarNav::HistoryForward => false,
+        }
+    }
+
     pub(crate) fn local_search_blocks_parent_nav(&self) -> bool {
         self.show_search_bar
             && (self.search_filter.is_some() || self.search_pending.is_some())
@@ -31003,7 +31027,7 @@ impl eframe::App for App {
         // `pending_return_to_parent` を立てる。`handle_keyboard` だけで消化すると、
         // フルスクリーン入力が root 側で処理されたフレームや専用 viewport の repaint だけが
         // 走ったフレームで予約が残るため、描画後に通常の入力ナビへ合流させる。
-        let fullscreen_close_nav = self.take_pending_return_to_parent_nav();
+        let mut fullscreen_close_nav = self.take_pending_return_to_parent_nav();
         #[cfg(windows)]
         let embedded_fs_active =
             embedded_fs_active_before_render || self.fullscreen_embedded_still_active();
@@ -31129,6 +31153,16 @@ impl eframe::App for App {
             // 同じ gate に乗せて grid 描画を skip し、poll_pdf/zip_enumerate で deferred
             // reopen を回す。
             if embedded_fs_active || embedded_fs_pending {
+                // `fullscreen_close_nav` はこの時点で `pending_return_to_parent` から
+                // take 済み。ここは後段の input_nav 合流点より前で return するため、
+                // in-window 静止画フルスクリーンではここで消化しないと親一覧への
+                // 直帰ナビが捨てられてしまう。
+                if let Some(nav) = fullscreen_close_nav.take() {
+                    if self.apply_fullscreen_close_nav_immediate(nav) {
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
                 // Ctrl+↑↓ DFS の結果回収 (native 動画ブロックと同じ理由)。
                 if let Some(result) = self.poll_folder_nav() {
                     if keyboard_nav.is_none() {
