@@ -14,6 +14,9 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+mod build_const_parser;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static CORE_EXE: &[u8] = include_bytes!(env!("MIMV_CORE_EXE"));
@@ -375,7 +378,9 @@ fn cli_flag_takes_value(flag: &str) -> bool {
 #[cfg(windows)]
 fn send_open_path_to_existing(path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_BUSY, GetLastError};
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, GetLastError,
+    };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         OPEN_EXISTING, WriteFile,
@@ -385,6 +390,9 @@ fn send_open_path_to_existing(path: &Path) -> bool {
 
     const OPEN_PATH_MAX_U16: usize = 32_767;
     const OPEN_PATH_PIPE_NAME: &str = env!("MIMV_OPEN_PATH_PIPE_NAME");
+    const OPEN_PATH_CONNECT_ATTEMPTS: usize = 20;
+    const OPEN_PATH_NOT_FOUND_RETRY_MS: u64 = 25;
+    const OPEN_PATH_BUSY_WAIT_MS: u32 = 50;
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     if wide.is_empty() || wide.len() > OPEN_PATH_MAX_U16 {
@@ -397,7 +405,7 @@ fn send_open_path_to_existing(path: &Path) -> bool {
     }
 
     let name_wide = wide_nul(OPEN_PATH_PIPE_NAME);
-    for _ in 0..60 {
+    for attempt in 0..OPEN_PATH_CONNECT_ATTEMPTS {
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(name_wide.as_ptr()),
@@ -429,13 +437,20 @@ fn send_open_path_to_existing(path: &Path) -> bool {
                 return ok;
             }
             Err(_) => {
-                if unsafe { GetLastError() } == ERROR_PIPE_BUSY {
+                let last = unsafe { GetLastError() };
+                if last == ERROR_PIPE_BUSY {
                     unsafe {
-                        let _ = WaitNamedPipeW(PCWSTR(name_wide.as_ptr()), 100);
+                        let _ = WaitNamedPipeW(PCWSTR(name_wide.as_ptr()), OPEN_PATH_BUSY_WAIT_MS);
                     }
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
                 }
+                if last == ERROR_FILE_NOT_FOUND && attempt + 1 < OPEN_PATH_CONNECT_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        OPEN_PATH_NOT_FOUND_RETRY_MS,
+                    ));
+                    continue;
+                }
+                return false;
             }
         }
     }
@@ -467,4 +482,15 @@ fn show_error(msg: &str) {
 #[cfg(not(windows))]
 fn show_error(msg: &str) {
     eprintln!("{msg}");
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn embedded_open_path_pipe_name_keeps_named_pipe_prefix() {
+        assert_eq!(
+            env!("MIMV_OPEN_PATH_PIPE_NAME"),
+            r"\\.\pipe\mImageViewerOpenPath_v1"
+        );
+    }
 }

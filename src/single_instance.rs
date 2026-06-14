@@ -226,6 +226,12 @@ pub fn signal_activate_existing() -> bool {
 const OPEN_PATH_MAX_U16: usize = 32_767;
 #[cfg(windows)]
 const OPEN_PATH_PIPE_BUFFER_BYTES: u32 = 64 * 1024;
+#[cfg(windows)]
+const OPEN_PATH_CONNECT_ATTEMPTS: usize = 20;
+#[cfg(windows)]
+const OPEN_PATH_NOT_FOUND_RETRY_MS: u64 = 25;
+#[cfg(windows)]
+const OPEN_PATH_BUSY_WAIT_MS: u32 = 50;
 
 /// 2 重起動時に既存インスタンスへ「開くパス」を送る。Windows 専用。
 /// 成否に関わらず呼び出し側は `signal_activate_existing()` で前面化も要求する。
@@ -306,7 +312,11 @@ fn send_open_path_message_to_existing(message: &[u8], retry_not_found: bool) -> 
     use windows::core::PCWSTR;
 
     let name_wide = open_path_pipe_name_wide();
-    let max_attempts = if retry_not_found { 60 } else { 1 };
+    let max_attempts = if retry_not_found {
+        OPEN_PATH_CONNECT_ATTEMPTS
+    } else {
+        1
+    };
     for attempt in 0..max_attempts {
         let handle = unsafe {
             CreateFileW(
@@ -334,12 +344,14 @@ fn send_open_path_message_to_existing(message: &[u8], retry_not_found: bool) -> 
                 let last = unsafe { GetLastError() };
                 if last == ERROR_PIPE_BUSY {
                     unsafe {
-                        let _ = WaitNamedPipeW(PCWSTR(name_wide.as_ptr()), 100);
+                        let _ = WaitNamedPipeW(PCWSTR(name_wide.as_ptr()), OPEN_PATH_BUSY_WAIT_MS);
                     }
                     continue;
                 }
                 if retry_not_found && last == ERROR_FILE_NOT_FOUND && attempt + 1 < max_attempts {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        OPEN_PATH_NOT_FOUND_RETRY_MS,
+                    ));
                     continue;
                 }
                 crate::logger::log(format!(

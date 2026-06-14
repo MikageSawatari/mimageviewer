@@ -9,23 +9,10 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
-/// `pub const NAME: &str = "value";` 形式の文字列リテラル定数を抽出する。
-/// `src/single_instance.rs` から single-instance 関連の文字列定数を拾うために使用。
-fn extract_const(src: &str, name: &str) -> Option<String> {
-    for line in src.lines() {
-        let line = line.trim();
-        let prefix = format!("pub const {name}");
-        if !line.starts_with(&prefix) {
-            continue;
-        }
-        let start = line.find('"')?;
-        let end = line[start + 1..].find('"')?;
-        let raw = &line[start + 1..start + 1 + end];
-        // Rust ソース上の `\\` を実際の `\` に展開
-        return Some(raw.replace("\\\\", "\\"));
-    }
-    None
-}
+#[path = "src/build_const_parser.rs"]
+mod build_const_parser;
+
+use build_const_parser::extract_const;
 
 fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -112,6 +99,13 @@ fn main() {
     println!("cargo:rustc-env=MIMV_ACTIVATE_EVENT_NAME={activate_name}");
     println!("cargo:rustc-env=MIMV_OPEN_PATH_PIPE_NAME={open_path_pipe_name}");
     println!("cargo:rerun-if-changed={}", single_instance_rs.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir
+            .join("src")
+            .join("build_const_parser.rs")
+            .display()
+    );
 
     #[cfg(target_os = "windows")]
     {

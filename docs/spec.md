@@ -714,7 +714,9 @@ launcher (`mimageviewer.exe`) とし、launcher から起動された core へ
 
 SendTo から渡されたファイル / フォルダは Windows により位置引数として渡されるため、
 処理規則は上記の起動引数と同じ。既存インスタンスがある場合は launcher 側でも
-最初の位置引数を Named Pipe へ転送してから activate event を送る。
+runtime 展開や本体起動を行う前に、最初の位置引数を Named Pipe へ転送してから
+activate event を送る。Pipe がまだ準備されていない起動直後だけ短く再試行し、
+Explorer の SendTo 起動側が数秒単位で残らないようにする。
 
 ### 8.1 主要設定
 
