@@ -148,10 +148,19 @@ mod windows_impl {
                 };
             }
 
-            match shell_context_menu_for_folder_background(hwnd, folder) {
+            let shell_menu = match shell_context_menu_for_folder_background(hwnd, folder) {
                 Ok(menu) => Some(menu),
                 Err(reason) => return NativeContextMenuResult::Fallback { reason },
+            };
+            if let Some(shell_menu) = shell_menu.as_ref() {
+                let insert_at =
+                    request.miv_items.len() as u32 + u32::from(!request.miv_items.is_empty());
+                if let Err(reason) = query_shell_context_menu(shell_menu, menu.handle(), insert_at)
+                {
+                    return NativeContextMenuResult::Fallback { reason };
+                }
             }
+            shell_menu
         } else if request.paths.is_empty() {
             None
         } else {
@@ -169,19 +178,8 @@ mod windows_impl {
             };
             let insert_at =
                 request.miv_items.len() as u32 + u32::from(!request.miv_items.is_empty());
-            let hr = unsafe {
-                shell_menu.QueryContextMenu(
-                    menu.handle(),
-                    insert_at,
-                    SHELL_ID_FIRST,
-                    SHELL_ID_LAST,
-                    CMF_NORMAL | CMF_EXPLORE | CMF_CANRENAME,
-                )
-            };
-            if hr.is_err() {
-                return NativeContextMenuResult::Fallback {
-                    reason: format!("IContextMenu::QueryContextMenu failed: 0x{:08x}", hr.0),
-                };
+            if let Err(reason) = query_shell_context_menu(&shell_menu, menu.handle(), insert_at) {
+                return NativeContextMenuResult::Fallback { reason };
             }
             Some(shell_menu)
         };
@@ -243,6 +241,30 @@ mod windows_impl {
     fn append_menu_string(menu: HMENU, id: u32, label: &str) -> windows::core::Result<()> {
         let wide = wide_null(label);
         unsafe { AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(wide.as_ptr())) }
+    }
+
+    fn query_shell_context_menu(
+        shell_menu: &IContextMenu,
+        menu: HMENU,
+        insert_at: u32,
+    ) -> Result<(), String> {
+        let hr = unsafe {
+            shell_menu.QueryContextMenu(
+                menu,
+                insert_at,
+                SHELL_ID_FIRST,
+                SHELL_ID_LAST,
+                CMF_NORMAL | CMF_EXPLORE | CMF_CANRENAME,
+            )
+        };
+        if hr.is_err() {
+            Err(format!(
+                "IContextMenu::QueryContextMenu failed: 0x{:08x}",
+                hr.0
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn shell_context_menu_for_paths(paths: &[PathBuf]) -> Result<IContextMenu, String> {
