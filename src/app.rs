@@ -57,8 +57,47 @@ pub(crate) struct FolderNavHistorySnapshot {
     forward_stack: Vec<PathBuf>,
     recent_folders: Vec<PathBuf>,
     suppress_record_once: bool,
+    quick_folder_workspaces: [QuickFolderWorkspace; 2],
+    active_quick_folder_slot: Option<QuickFolderSlotId>,
     favsearch_nav_stack: Vec<PathBuf>,
     tag_view_nav_stack: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuickFolderSlotId {
+    A,
+    B,
+}
+
+impl QuickFolderSlotId {
+    pub(crate) const ALL: [Self; 2] = [Self::A, Self::B];
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::A => 0,
+            Self::B => 1,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::B => "B",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FolderNavHistoryState {
+    pub back_stack: Vec<PathBuf>,
+    pub forward_stack: Vec<PathBuf>,
+    pub suppress_record_once: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct QuickFolderWorkspace {
+    pub target: Option<PathBuf>,
+    pub history: FolderNavHistoryState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2819,6 +2858,10 @@ pub struct App {
     pub(crate) recent_folders: Vec<PathBuf>,
     /// 履歴戻る/進むで発生する次回 load_folder は通常履歴に積まない。
     pub(crate) suppress_folder_nav_record_once: bool,
+    /// フォルダバー A/B クイックフォルダのターゲットと、スロットごとの履歴。
+    pub(crate) quick_folder_workspaces: [QuickFolderWorkspace; 2],
+    /// 現在ナビゲーション履歴を受け持つクイックフォルダスロット。
+    pub(crate) active_quick_folder_slot: Option<QuickFolderSlotId>,
     /// 検索クローズで検索前フォルダへ復帰する `load_folder` を履歴に積まないための
     /// ワンショット。検索中は `global_search.active` / `favsearch.active` で判定できるが、
     /// `close_global_search` / `close_favsearch` は `active` を false にしてから
@@ -4644,6 +4687,10 @@ impl App {
 
         settings.recent_folders.truncate(MAX_RECENT_FOLDERS);
         let recent_folders = settings.recent_folders.clone();
+        let quick_folder_workspaces = std::array::from_fn(|idx| QuickFolderWorkspace {
+            target: settings.quick_folder_slots[idx].clone(),
+            history: FolderNavHistoryState::default(),
+        });
         let keymap = if cfg!(test) {
             crate::keymap::Keymap::empty()
         } else {
@@ -4880,6 +4927,8 @@ impl App {
             folder_nav_forward_stack: Vec::new(),
             recent_folders,
             suppress_folder_nav_record_once: false,
+            quick_folder_workspaces,
+            active_quick_folder_slot: None,
             suppress_nav_record_for_search_restore: false,
             folder_history: std::collections::HashMap::new(),
             show_search_bar: false,
@@ -6399,12 +6448,136 @@ impl App {
         }
     }
 
+    fn active_quick_folder_workspace(&self) -> Option<&QuickFolderWorkspace> {
+        self.active_quick_folder_slot
+            .map(|slot| &self.quick_folder_workspaces[slot.index()])
+    }
+
+    fn active_quick_folder_workspace_mut(&mut self) -> Option<&mut QuickFolderWorkspace> {
+        self.active_quick_folder_slot
+            .map(|slot| &mut self.quick_folder_workspaces[slot.index()])
+    }
+
+    fn push_active_folder_nav_back_stack(&mut self, path: PathBuf) {
+        if let Some(workspace) = self.active_quick_folder_workspace_mut() {
+            Self::push_folder_nav_stack(&mut workspace.history.back_stack, path);
+        } else {
+            Self::push_folder_nav_stack(&mut self.folder_nav_back_stack, path);
+        }
+    }
+
+    fn clear_active_folder_nav_forward_stack(&mut self) {
+        if let Some(workspace) = self.active_quick_folder_workspace_mut() {
+            workspace.history.forward_stack.clear();
+        } else {
+            self.folder_nav_forward_stack.clear();
+        }
+    }
+
+    fn take_active_folder_nav_suppress_record_once(&mut self) -> bool {
+        if let Some(workspace) = self.active_quick_folder_workspace_mut() {
+            std::mem::take(&mut workspace.history.suppress_record_once)
+        } else {
+            std::mem::take(&mut self.suppress_folder_nav_record_once)
+        }
+    }
+
+    pub(crate) fn set_active_folder_nav_suppress_record_once(&mut self, value: bool) {
+        if let Some(workspace) = self.active_quick_folder_workspace_mut() {
+            workspace.history.suppress_record_once = value;
+        } else {
+            self.suppress_folder_nav_record_once = value;
+        }
+    }
+
+    fn sync_quick_folder_settings(&mut self) {
+        self.settings.quick_folder_slots =
+            std::array::from_fn(|idx| self.quick_folder_workspaces[idx].target.clone());
+    }
+
+    pub(crate) fn quick_folder_target(&self, slot: QuickFolderSlotId) -> Option<&PathBuf> {
+        self.quick_folder_workspaces[slot.index()].target.as_ref()
+    }
+
+    pub(crate) fn current_quick_folder_target(&self) -> Option<PathBuf> {
+        if self.items_are_drive_list
+            || self.show_search_bar
+            || self.search_filter.is_some()
+            || self.search_pending.is_some()
+            || self.global_search.active
+            || self.favsearch.active
+            || self.tag_view.active
+            || self.items_are_global_search_view
+            || self.items_are_tag_view
+            || self.is_snapshot_active()
+        {
+            return None;
+        }
+        let target = self.effective_folder()?;
+        if crate::folder_tree::path_eq(&target, &search_results_synthetic_path()) {
+            return None;
+        }
+        Some(target)
+    }
+
+    pub(crate) fn set_quick_folder_slot_target(
+        &mut self,
+        slot: QuickFolderSlotId,
+        target: PathBuf,
+    ) {
+        self.quick_folder_workspaces[slot.index()].target = Some(target);
+        self.active_quick_folder_slot = Some(slot);
+        self.sync_quick_folder_settings();
+    }
+
+    pub(crate) fn clear_quick_folder_slot(&mut self, slot: QuickFolderSlotId) {
+        let workspace = &mut self.quick_folder_workspaces[slot.index()];
+        workspace.target = None;
+        workspace.history = FolderNavHistoryState::default();
+        if self.active_quick_folder_slot == Some(slot) {
+            self.active_quick_folder_slot = None;
+        }
+        self.sync_quick_folder_settings();
+    }
+
+    pub(crate) fn clear_quick_folder_slots(&mut self) {
+        for workspace in &mut self.quick_folder_workspaces {
+            *workspace = QuickFolderWorkspace::default();
+        }
+        self.active_quick_folder_slot = None;
+        self.sync_quick_folder_settings();
+    }
+
+    pub(crate) fn activate_quick_folder_slot(
+        &mut self,
+        slot: QuickFolderSlotId,
+    ) -> Option<PathBuf> {
+        let target = self.quick_folder_target(slot)?.clone();
+        self.cancel_pending_folder_nav();
+        self.active_quick_folder_slot = Some(slot);
+        if self
+            .effective_folder()
+            .is_some_and(|current| crate::folder_tree::path_eq(&current, &target))
+        {
+            return None;
+        }
+        self.set_active_folder_nav_suppress_record_once(true);
+        Some(target)
+    }
+
+    pub(crate) fn update_active_quick_folder_target(&mut self, target: &Path) {
+        if let Some(slot) = self.active_quick_folder_slot {
+            self.quick_folder_workspaces[slot.index()].target = Some(target.to_path_buf());
+            self.sync_quick_folder_settings();
+        }
+    }
+
     /// 明示した移動元 `from` を「戻る」履歴へ積み、「進む」履歴をクリアする。
     /// `record_folder_nav_transition` の自動記録では移動元が正しく取れないケース
     /// (検索から「フォルダに移動」で抜ける等) に、呼び出し側が確定した移動元を渡す。
     pub(crate) fn push_nav_history_entry(&mut self, from: PathBuf) {
-        Self::push_folder_nav_stack(&mut self.folder_nav_back_stack, from);
-        self.folder_nav_forward_stack.clear();
+        self.push_active_folder_nav_back_stack(from);
+        self.clear_active_folder_nav_forward_stack();
     }
 
     pub(crate) fn remember_recent_folder(&mut self, path: &Path) {
@@ -6443,7 +6616,7 @@ impl App {
             || search_restore
         {
             // 古いワンショット抑止が次の通常ナビへ漏れないようここで消費しておく。
-            self.suppress_folder_nav_record_once = false;
+            self.set_active_folder_nav_suppress_record_once(false);
             return;
         }
 
@@ -6452,20 +6625,24 @@ impl App {
             .as_ref()
             .is_some_and(|current| crate::folder_tree::path_eq(current, target))
         {
-            self.suppress_folder_nav_record_once = false;
+            self.update_active_quick_folder_target(target);
+            self.set_active_folder_nav_suppress_record_once(false);
             return;
         }
 
         self.remember_recent_folder(target);
 
-        if std::mem::take(&mut self.suppress_folder_nav_record_once) {
+        if self.take_active_folder_nav_suppress_record_once() {
+            self.update_active_quick_folder_target(target);
             return;
         }
 
         let Some(current) = self.effective_folder() else {
+            self.update_active_quick_folder_target(target);
             return;
         };
         if crate::folder_tree::path_eq(&current, target) {
+            self.update_active_quick_folder_target(target);
             return;
         }
 
@@ -6474,12 +6651,14 @@ impl App {
         // ただし新しい遷移自体は発生しているので forward 履歴はクリアする
         // (新規ナビゲーションが forward 履歴を無効化する原則)。
         if crate::folder_tree::path_eq(&current, &search_results_synthetic_path()) {
-            self.folder_nav_forward_stack.clear();
+            self.clear_active_folder_nav_forward_stack();
+            self.update_active_quick_folder_target(target);
             return;
         }
 
-        Self::push_folder_nav_stack(&mut self.folder_nav_back_stack, current);
-        self.folder_nav_forward_stack.clear();
+        self.push_active_folder_nav_back_stack(current);
+        self.clear_active_folder_nav_forward_stack();
+        self.update_active_quick_folder_target(target);
     }
 
     pub(crate) fn folder_nav_history_snapshot(&self) -> FolderNavHistorySnapshot {
@@ -6488,6 +6667,8 @@ impl App {
             forward_stack: self.folder_nav_forward_stack.clone(),
             recent_folders: self.recent_folders.clone(),
             suppress_record_once: self.suppress_folder_nav_record_once,
+            quick_folder_workspaces: self.quick_folder_workspaces.clone(),
+            active_quick_folder_slot: self.active_quick_folder_slot,
             favsearch_nav_stack: self.favsearch.nav_stack.clone(),
             tag_view_nav_stack: self.tag_view.nav_stack.clone(),
         }
@@ -6498,6 +6679,9 @@ impl App {
         self.folder_nav_forward_stack = snapshot.forward_stack;
         self.recent_folders = snapshot.recent_folders;
         self.suppress_folder_nav_record_once = snapshot.suppress_record_once;
+        self.quick_folder_workspaces = snapshot.quick_folder_workspaces;
+        self.active_quick_folder_slot = snapshot.active_quick_folder_slot;
+        self.sync_quick_folder_settings();
         self.favsearch.nav_stack = snapshot.favsearch_nav_stack;
         self.tag_view.nav_stack = snapshot.tag_view_nav_stack;
     }
@@ -6518,11 +6702,27 @@ impl App {
     }
 
     pub(crate) fn folder_history_back_target(&self) -> Option<&PathBuf> {
-        self.folder_nav_back_stack.last()
+        self.active_quick_folder_workspace()
+            .and_then(|workspace| workspace.history.back_stack.last())
+            .or_else(|| {
+                if self.active_quick_folder_slot.is_some() {
+                    None
+                } else {
+                    self.folder_nav_back_stack.last()
+                }
+            })
     }
 
     pub(crate) fn folder_history_forward_target(&self) -> Option<&PathBuf> {
-        self.folder_nav_forward_stack.last()
+        self.active_quick_folder_workspace()
+            .and_then(|workspace| workspace.history.forward_stack.last())
+            .or_else(|| {
+                if self.active_quick_folder_slot.is_some() {
+                    None
+                } else {
+                    self.folder_nav_forward_stack.last()
+                }
+            })
     }
 
     pub(crate) fn recent_folder_entries(&self) -> &[PathBuf] {
@@ -6530,13 +6730,21 @@ impl App {
     }
 
     pub(crate) fn navigate_folder_history_back(&mut self) -> Option<PathBuf> {
-        let target = self.folder_nav_back_stack.pop()?;
+        let target = if let Some(workspace) = self.active_quick_folder_workspace_mut() {
+            workspace.history.back_stack.pop()?
+        } else {
+            self.folder_nav_back_stack.pop()?
+        };
         if let Some(current) = self.effective_folder()
             && !crate::folder_tree::path_eq(&current, &target)
         {
-            Self::push_folder_nav_stack(&mut self.folder_nav_forward_stack, current);
+            if let Some(workspace) = self.active_quick_folder_workspace_mut() {
+                Self::push_folder_nav_stack(&mut workspace.history.forward_stack, current);
+            } else {
+                Self::push_folder_nav_stack(&mut self.folder_nav_forward_stack, current);
+            }
         }
-        self.suppress_folder_nav_record_once = true;
+        self.set_active_folder_nav_suppress_record_once(true);
         Some(target)
     }
 
@@ -6556,13 +6764,21 @@ impl App {
     }
 
     pub(crate) fn navigate_folder_history_forward(&mut self) -> Option<PathBuf> {
-        let target = self.folder_nav_forward_stack.pop()?;
+        let target = if let Some(workspace) = self.active_quick_folder_workspace_mut() {
+            workspace.history.forward_stack.pop()?
+        } else {
+            self.folder_nav_forward_stack.pop()?
+        };
         if let Some(current) = self.effective_folder()
             && !crate::folder_tree::path_eq(&current, &target)
         {
-            Self::push_folder_nav_stack(&mut self.folder_nav_back_stack, current);
+            if let Some(workspace) = self.active_quick_folder_workspace_mut() {
+                Self::push_folder_nav_stack(&mut workspace.history.back_stack, current);
+            } else {
+                Self::push_folder_nav_stack(&mut self.folder_nav_back_stack, current);
+            }
         }
-        self.suppress_folder_nav_record_once = true;
+        self.set_active_folder_nav_suppress_record_once(true);
         Some(target)
     }
 
@@ -6993,7 +7209,7 @@ impl App {
                     .effective_folder()
                     .is_some_and(|cur| crate::folder_tree::path_eq(&cur, &path))
                 {
-                    self.suppress_folder_nav_record_once = true;
+                    self.set_active_folder_nav_suppress_record_once(true);
                 }
                 // ★固定 ガード等でブロックされたら Ignored を返し、後続の drill 進行に
                 // 流さない (Codex P1)。

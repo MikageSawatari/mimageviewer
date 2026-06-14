@@ -1,7 +1,8 @@
 # Shell file operations and native context menu plan
 
-Status: planning only. This document is intended as the handoff point for a
-future implementation session.
+Status: mixed. Folder A/B quick workspaces were implemented first; the Shell
+file operation and native context menu phases remain planning-only. This
+document is still the handoff point for the remaining implementation sessions.
 
 ## 1. Goal
 
@@ -113,6 +114,8 @@ Remove from context menu:
   makes the file context menu too dense.
 
 ## 5. Folder A/B quick workspaces
+
+Implementation status: implemented before the Shell operation phases.
 
 Purpose:
 

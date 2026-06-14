@@ -1399,6 +1399,8 @@ pub struct Settings {
     pub startup_folder_path: Option<PathBuf>,
     #[serde(default)]
     pub recent_folders: Vec<PathBuf>,
+    #[serde(default = "default_quick_folder_slots")]
+    pub quick_folder_slots: [Option<PathBuf>; 2],
     /// ウィンドウ左上座標 (outer rect)
     #[serde(default)]
     pub window_pos: Option<[f32; 2]>,
@@ -1523,6 +1525,9 @@ pub struct Settings {
     /// フォルダバーに「履歴を戻る/進む」ボタンを表示する。
     #[serde(default = "default_true")]
     pub show_address_bar_history_nav: bool,
+    /// フォルダバーに A/B クイックフォルダボタンを表示する。
+    #[serde(default = "default_true")]
+    pub show_address_bar_quick_folders: bool,
     /// フォルダバーに「親フォルダへ」ボタンを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_parent_button: bool,
@@ -2559,6 +2564,9 @@ fn default_cache_size_threshold_bytes() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn default_quick_folder_slots() -> [Option<PathBuf>; 2] {
+    [None, None]
+}
 fn default_fullscreen_cursor_hide_delay_secs() -> f32 {
     FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
 }
@@ -2768,6 +2776,7 @@ impl Default for Settings {
             startup_folder_mode: StartupFolderMode::default(),
             startup_folder_path: None,
             recent_folders: Vec::new(),
+            quick_folder_slots: default_quick_folder_slots(),
             window_pos: None,
             window_size: None,
             parallelism: Parallelism::default(),
@@ -2836,6 +2845,7 @@ impl Default for Settings {
             show_toolbar_folder: true,
             show_toolbar_folder_tree_button: true,
             show_address_bar_history_nav: true,
+            show_address_bar_quick_folders: true,
             show_toolbar_parent_button: true,
             show_toolbar_prev_folder: true,
             show_toolbar_next_folder: true,
@@ -3960,6 +3970,7 @@ impl Settings {
         // ── ウィンドウ / ナビゲーション状態 ──
         self.last_folder = src.last_folder.take();
         self.recent_folders = std::mem::take(&mut src.recent_folders);
+        self.quick_folder_slots = std::mem::take(&mut src.quick_folder_slots);
         self.window_pos = src.window_pos;
         self.window_size = src.window_size;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
@@ -4159,6 +4170,7 @@ mod tests {
         assert_eq!(s.startup_folder_mode, StartupFolderMode::Previous);
         assert!(s.startup_folder_path.is_none());
         assert!(s.recent_folders.is_empty());
+        assert_eq!(s.quick_folder_slots, [None, None]);
         assert!(s.window_pos.is_none());
         assert!(s.window_size.is_none());
         assert_eq!(s.prefetch_back, 4);
@@ -4202,6 +4214,7 @@ mod tests {
         assert!(s.show_toolbar_folder);
         assert!(s.show_toolbar_folder_tree_button);
         assert!(s.show_address_bar_history_nav);
+        assert!(s.show_address_bar_quick_folders);
         assert!(s.show_toolbar_parent_button);
         assert!(s.show_toolbar_prev_folder);
         assert!(s.show_toolbar_next_folder);
@@ -4394,6 +4407,10 @@ mod tests {
             PathBuf::from(r"D:\Images"),
             PathBuf::from(r"C:\Users\test\Pictures"),
         ];
+        original.quick_folder_slots = [
+            Some(PathBuf::from(r"D:\Images\Source")),
+            Some(PathBuf::from(r"E:\Archive\Dest")),
+        ];
         let json = serde_json::to_string(&original).unwrap();
         let loaded: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.grid_cols, original.grid_cols);
@@ -4404,6 +4421,7 @@ mod tests {
         assert_eq!(loaded.startup_folder_mode, original.startup_folder_mode);
         assert_eq!(loaded.startup_folder_path, original.startup_folder_path);
         assert_eq!(loaded.recent_folders, original.recent_folders);
+        assert_eq!(loaded.quick_folder_slots, original.quick_folder_slots);
     }
 
     #[test]

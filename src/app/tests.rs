@@ -1550,6 +1550,7 @@ mod phase_c_key_tests {
 
 #[cfg(test)]
 mod phase_c_folder_nav_history_tests {
+    use crate::app::QuickFolderSlotId;
     use crate::archive_converter::ArchiveFormat;
     use crate::grid_item::GridItem;
 
@@ -1616,6 +1617,156 @@ mod phase_c_folder_nav_history_tests {
 
         assert!(app.recent_folders.is_empty());
         assert!(app.settings.recent_folders.is_empty());
+    }
+
+    #[test]
+    fn quick_folder_slot_registration_updates_settings() {
+        let mut app = setup_app();
+        let current = PathBuf::from(r"C:\miv-test\source");
+        app.current_folder = Some(current.clone());
+
+        app.set_quick_folder_slot_target(QuickFolderSlotId::A, current.clone());
+
+        assert_eq!(app.active_quick_folder_slot, Some(QuickFolderSlotId::A));
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+                .target
+                .clone(),
+            Some(current.clone())
+        );
+        assert_eq!(app.settings.quick_folder_slots[0], Some(current));
+
+        app.clear_quick_folder_slot(QuickFolderSlotId::A);
+        assert_eq!(app.active_quick_folder_slot, None);
+        assert!(app.quick_folder_workspaces[0].target.is_none());
+        assert_eq!(app.settings.quick_folder_slots, [None, None]);
+    }
+
+    #[test]
+    fn quick_folder_current_target_is_disabled_during_local_search() {
+        let mut app = setup_app();
+        let current = PathBuf::from(r"C:\miv-test\source");
+        app.current_folder = Some(current.clone());
+
+        assert_eq!(app.current_quick_folder_target(), Some(current));
+
+        app.show_search_bar = true;
+        assert_eq!(app.current_quick_folder_target(), None);
+
+        app.show_search_bar = false;
+        app.search_filter = Some(std::collections::HashSet::new());
+        assert_eq!(app.current_quick_folder_target(), None);
+    }
+
+    #[test]
+    fn quick_folder_histories_are_isolated_per_slot() {
+        let mut app = setup_app();
+        let a = PathBuf::from(r"C:\miv-test\a");
+        let a_child = PathBuf::from(r"C:\miv-test\a\child");
+        let b = PathBuf::from(r"C:\miv-test\b");
+        let b_child = PathBuf::from(r"C:\miv-test\b\child");
+
+        app.set_quick_folder_slot_target(QuickFolderSlotId::A, a.clone());
+        app.set_quick_folder_slot_target(QuickFolderSlotId::B, b.clone());
+
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
+        app.current_folder = Some(a.clone());
+        app.record_folder_nav_transition(&a_child);
+        app.current_folder = Some(a_child.clone());
+
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+                .history
+                .back_stack,
+            vec![a.clone()]
+        );
+        assert!(
+            app.quick_folder_workspaces[QuickFolderSlotId::B.index()]
+                .history
+                .back_stack
+                .is_empty()
+        );
+        assert!(app.folder_nav_back_stack.is_empty());
+
+        assert_eq!(
+            app.activate_quick_folder_slot(QuickFolderSlotId::B),
+            Some(b.clone())
+        );
+        app.record_folder_nav_transition(&b);
+        app.current_folder = Some(b.clone());
+        app.record_folder_nav_transition(&b_child);
+        app.current_folder = Some(b_child);
+
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+                .history
+                .back_stack,
+            vec![a.clone()]
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::B.index()]
+                .history
+                .back_stack,
+            vec![b.clone()]
+        );
+
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
+        app.current_folder = Some(a_child.clone());
+        assert_eq!(app.navigate_folder_history_back(), Some(a.clone()));
+        assert!(
+            app.quick_folder_workspaces[QuickFolderSlotId::B.index()]
+                .history
+                .forward_stack
+                .is_empty()
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+                .history
+                .forward_stack,
+            vec![a_child]
+        );
+    }
+
+    #[test]
+    fn quick_folder_history_snapshot_restores_slots_and_active_state() {
+        let mut app = setup_app();
+        let normal_prev = PathBuf::from(r"C:\miv-test\normal-prev");
+        let a = PathBuf::from(r"C:\miv-test\a");
+        let b = PathBuf::from(r"C:\miv-test\b");
+        app.folder_nav_back_stack = vec![normal_prev.clone()];
+        app.set_quick_folder_slot_target(QuickFolderSlotId::A, a.clone());
+        app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+            .history
+            .back_stack = vec![PathBuf::from(r"C:\miv-test\a-prev")];
+        app.set_quick_folder_slot_target(QuickFolderSlotId::B, b.clone());
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
+
+        let snapshot = app.folder_nav_history_snapshot();
+
+        app.folder_nav_back_stack.clear();
+        app.clear_quick_folder_slot(QuickFolderSlotId::A);
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::B);
+
+        app.restore_folder_nav_history(snapshot);
+
+        assert_eq!(app.folder_nav_back_stack, vec![normal_prev]);
+        assert_eq!(app.active_quick_folder_slot, Some(QuickFolderSlotId::A));
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+                .target
+                .clone(),
+            Some(a)
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::B.index()]
+                .target
+                .clone(),
+            Some(b)
+        );
+        assert_eq!(
+            app.settings.quick_folder_slots[0],
+            app.quick_folder_workspaces[0].target.clone()
+        );
     }
 
     #[test]

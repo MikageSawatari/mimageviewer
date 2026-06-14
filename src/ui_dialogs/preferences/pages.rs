@@ -296,6 +296,7 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
 pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
     let mut clear_recent_folders_clicked = false;
+    let mut clear_quick_folders_clicked = false;
 
     ui.label(
         "チェックを外した項目はツールバーから隠れます。\n\
@@ -315,6 +316,16 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ),
     )
     .on_hover_text("移動したフォルダの履歴をブラウザのように戻る / 進むできます。");
+    ui.add_enabled(
+        s.show_toolbar_folder,
+        egui::Checkbox::new(
+            &mut s.show_address_bar_quick_folders,
+            "└ A/B クイックフォルダボタン",
+        ),
+    )
+    .on_hover_text(
+        "コピー元 / コピー先など 2 つの場所を登録して、フォルダバーから素早く切り替えます。",
+    );
     ui.add_enabled(
         s.show_toolbar_folder,
         egui::Checkbox::new(&mut s.show_toolbar_parent_button, "└ 親フォルダボタン (⬆)"),
@@ -352,6 +363,21 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
             }
             ui.label(
                 egui::RichText::new(format!("現在 {} 件", s.recent_folders.len()))
+                    .size(11.0)
+                    .weak(),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("A/B クイックフォルダ登録をクリア").clicked() {
+                clear_quick_folders_clicked = true;
+            }
+            let count = s
+                .quick_folder_slots
+                .iter()
+                .filter(|slot| slot.is_some())
+                .count();
+            ui.label(
+                egui::RichText::new(format!("現在 {} 件", count))
                     .size(11.0)
                     .weak(),
             );
@@ -476,6 +502,10 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     if clear_recent_folders_clicked {
         s.recent_folders.clear();
         state.recent_folders_clear_requested = true;
+    }
+    if clear_quick_folders_clicked {
+        s.quick_folder_slots = [None, None];
+        state.quick_folder_slots_clear_requested = true;
     }
 }
 

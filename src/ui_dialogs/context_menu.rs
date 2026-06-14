@@ -787,7 +787,7 @@ impl crate::app::App {
         // 直後に呼び出し元が行う load_folder(X) では back_stack への二重 push を
         // 避ける (移動元 C は上で明示的に積み済み。X の recent 追加は
         // record_folder_nav_transition 側で行われる)。
-        self.suppress_folder_nav_record_once = true;
+        self.set_active_folder_nav_suppress_record_once(true);
     }
 
     /// フルスクリーン表示中のコンテキストメニューを表示する。

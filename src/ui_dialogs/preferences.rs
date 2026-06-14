@@ -250,6 +250,7 @@ pub(crate) struct PreferencesState {
     pub capture_output_dir_input: String,
     pub startup_folder_path_input: String,
     pub recent_folders_clear_requested: bool,
+    pub quick_folder_slots_clear_requested: bool,
     pub exif_add_tag_input: String,
     /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
     pub exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
@@ -446,6 +447,7 @@ impl PreferencesState {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             recent_folders_clear_requested: false,
+            quick_folder_slots_clear_requested: false,
             exif_add_tag_input: String::new(),
             exif_collapsed_groups: HashSet::new(),
             exif_scroll_to_added: None,
@@ -732,6 +734,7 @@ impl App {
                 #[cfg(windows)]
                 let new_vst3_discovered = state.vst3_discovered.clone();
                 let clear_recent_folders_requested = state.recent_folders_clear_requested;
+                let clear_quick_folder_slots_requested = state.quick_folder_slots_clear_requested;
 
                 // ダイアログを開いた時点の `state.settings` は self.settings の snapshot。
                 // 開いている間に他ダイアログ (お気に入り編集 / タグ編集 / 補正プリセット /
@@ -748,6 +751,9 @@ impl App {
                 self.settings = state.settings;
                 if clear_recent_folders_requested {
                     self.clear_recent_folders();
+                }
+                if clear_quick_folder_slots_requested {
+                    self.clear_quick_folder_slots();
                 }
                 self.settings.save();
 

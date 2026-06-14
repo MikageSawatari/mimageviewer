@@ -197,6 +197,7 @@ impl App {
                 .retain(|p| !crate::folder_tree::path_eq(p, &cached_zip));
             self.remember_recent_folder(&src);
         }
+        self.update_active_quick_folder_target(&src);
         self.archive_source_override = Some(src);
         true
     }
@@ -295,6 +296,7 @@ impl App {
                             .retain(|p| !crate::folder_tree::path_eq(p, &nav));
                         self.remember_recent_folder(&src);
                     }
+                    self.update_active_quick_folder_target(&src);
                     self.archive_source_override = Some(src);
                 }
                 if self.favsearch.active {
