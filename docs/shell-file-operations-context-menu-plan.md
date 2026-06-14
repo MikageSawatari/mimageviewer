@@ -61,9 +61,10 @@ Useful existing facts:
   calls `SHDoDragDrop`.
 - `src/delete_worker.rs` already moves files to the recycle bin with
   `SHFileOperationW`, one path at a time.
-- `src/ui_dialogs/context_menu.rs` currently uses PowerShell for file
-  copy/cut/paste and skips folders for paste/drop because collision handling and
-  recursive folder copies are unsafe in the current implementation.
+- `src/ui_dialogs/context_menu.rs` still uses PowerShell for Explorer-to-mIV
+  dropped-file copy. The old egui file copy/cut/paste clipboard helpers have
+  been removed; folders remain skipped in the drop path until `IFileOperation`
+  supplies Explorer-grade collision handling and recursive-copy safety.
 - `src/app.rs` currently keeps one folder navigation back stack, one forward
   stack, one global recent-folder list, and one `suppress_folder_nav_record_once`
   flag. A/B quick folders should factor this into reusable history state rather
@@ -277,7 +278,9 @@ Reload behavior:
 
 ## 7. Clipboard strategy
 
-The target is to remove PowerShell from copy/cut/paste, but it can be phased.
+The target is to keep file copy/cut/paste on Windows Shell routes and remove
+PowerShell from file organization paths as the remaining drop implementation is
+migrated.
 
 Current status:
 
@@ -285,19 +288,24 @@ Current status:
   verbs through `src/native_context_menu.rs`.
 - Ctrl+V invokes the current real folder's Shell background `paste` verb. Folder
   paste, collision prompts, and progress UI are therefore handled by Windows.
+- egui fallback menus no longer expose file copy/cut/paste. They are limited to
+  mIV-specific commands and virtual-item-safe commands such as path/name copy,
+  rendered image copy, rotation, representative thumbnail pinning, search jump,
+  delete-to-recycle, and new-folder creation on real folder backgrounds.
 - The currently displayed real folder is watched with notify-rs
   (`ReadDirectoryChangesW`) and debounced into `check_external_folder_changes`,
   so Shell menu operations, Ctrl+V paste, and external Explorer edits share the
   same refresh path.
-- The legacy PowerShell clipboard helpers still exist for egui fallback menus
-  and drop/copy internals until the `IFileOperation` migration is complete.
+- The remaining PowerShell file operation path is Explorer-to-mIV dropped-file
+  copy (`copy_paths_into_folder`). It copies files only, skips folders, reports
+  structured `CopyOutcome`, and is intentionally separate from clipboard
+  copy/cut/paste.
 
 Remaining sequence:
 
-1. Replace drop-to-folder and egui fallback paste internals with
-   `IFileOperation`. This removes the remaining PowerShell path and keeps
-   folder support, collision prompts, progress UI, and permanent-delete safety
-   where it matters most.
+1. Replace drop-to-folder internals with `IFileOperation`. This removes the
+   remaining PowerShell path and keeps folder support, collision prompts,
+   progress UI, and permanent-delete safety where it matters most.
 2. If a direct Shell clipboard writer is needed later, use the existing
    `IDataObject` path-building logic from `src/file_drag.rs` and add/override
    `CFSTR_PREFERREDDROPEFFECT` for cut. This likely requires a wrapper
@@ -334,7 +342,11 @@ Current routing details:
   items. It invokes the same canonical Shell `paste` verb as Ctrl+V, covering
   environments where the Shell-populated background menu does not surface Paste.
 - Keyboard Ctrl+C/Ctrl+X/Ctrl+V use the same native helper and canonical Shell
-  `copy`/`cut`/`paste` verbs instead of mIV's custom clipboard writer.
+  `copy`/`cut`/`paste` verbs instead of mIV's custom clipboard writer. If a
+  selected or checked item lacks filesystem identity (ZIP image, PDF page,
+  virtual container, or stale selection), Ctrl+C/X aborts the whole operation
+  and shows a toast instead of silently applying Shell verbs to only the real
+  subset.
 - After Shell verbs and native context menus return, the App resynchronizes
   egui's current Ctrl/Shift/Alt modifier state from Win32 physical key state.
   The same sync also runs before normal frame input handling on Windows, so a
@@ -350,7 +362,8 @@ Current routing details:
   file-operation path. Mixed real + ZIP/PDF virtual selections keep the egui
   fallback.
 - ZIP/PDF pages, ZIP directories, search containers, and other virtual items
-  still use the egui fallback until the Win32 custom virtual menu is implemented.
+  still use the egui mIV-command menu until the Win32 custom virtual menu is
+  implemented.
 
 Windows-only module: `src/native_context_menu.rs`.
 
@@ -407,12 +420,14 @@ Message forwarding:
 Settings:
 
 - `use_native_shell_context_menu` is implemented and defaults on so the Shell
-  menu is visible in development builds immediately. Users can disable it from
-  Settings -> Explorer integration if a Shell extension behaves badly.
+  menu is visible in development builds immediately. It is a right-click menu
+  presentation toggle: turning it off avoids the native right-click menu path,
+  but Ctrl+C/Ctrl+X/Ctrl+V still use Shell verbs.
 - Add a second setting if needed later: `show_miv_commands_in_native_menu`,
   default on.
 - If a Shell menu crashes/hangs reports appear, users can disable the native
-  Shell menu without losing mIV core functionality.
+  right-click menu without losing mIV core functionality, but this does not
+  disable Shell-backed keyboard clipboard operations.
 
 ## 9. Native custom menu for virtual items
 
@@ -519,11 +534,12 @@ Status: implemented.
 
 - Add `src/shell_file_ops.rs`.
 - Implement direct copy/move/delete/rename requests for real paths.
-- Replace `paste_files_from_clipboard` and `copy_paths_into_folder` internals.
+- Replace `copy_paths_into_folder` internals.
 - Re-enable folder paste/drop only through `IFileOperation`.
 - Preserve the current search-view guard so paste/drop cannot target stale
   `current_folder`.
-- Keep old PowerShell paths behind a temporary fallback if needed.
+- Keep a temporary fallback only if the `IFileOperation` drop migration needs
+  it; do not reintroduce egui clipboard copy/cut/paste routes.
 
 ### Phase 3 - Real filesystem native context menu
 

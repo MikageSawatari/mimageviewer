@@ -780,8 +780,13 @@ mod windows_impl {
             return Err("SHParseDisplayName(background folder) returned null PIDL".to_string());
         }
 
-        let desktop = unsafe { SHGetDesktopFolder() }
-            .map_err(|e| format!("SHGetDesktopFolder failed: {e}"))?;
+        let desktop = match unsafe { SHGetDesktopFolder() } {
+            Ok(desktop) => desktop,
+            Err(e) => {
+                unsafe { CoTaskMemFree(Some(pidl as *const core::ffi::c_void)) };
+                return Err(format!("SHGetDesktopFolder failed: {e}"));
+            }
+        };
         let folder_shell: IShellFolder =
             match unsafe { desktop.BindToObject(pidl as *const ITEMIDLIST, None::<&IBindCtx>) } {
                 Ok(folder_shell) => folder_shell,

@@ -49,7 +49,7 @@ OS 予約ショートカット (例: Alt+F4 / Alt+Tab / Win キー系) は keyma
 | <kbd>Ctrl</kbd>+<kbd>A</kbd> | 表示中のチェック可能なアイテムを全選択 |
 | <kbd>Alt</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Alt</kbd>+<kbd>0</kbd> | サムネイル列数を 1〜9 / 10 列に切り替え。詳細表示中はサムネイル表示へ戻してから列数を適用 |
 | <kbd>Alt</kbd>+<kbd>-</kbd> | サムネイル表示 / 詳細表示を切り替え |
-| <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>X</kbd> | チェック済み、または選択中の実ファイル / 実フォルダを Windows Shell のコピー / カット verb へ渡す。ZIP/PDF 内ページなど仮想項目は対象外 |
+| <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>X</kbd> | チェック済み、または選択中の実ファイル / 実フォルダを Windows Shell のコピー / カット verb へ渡す。ZIP/PDF 内ページなど仮想項目が含まれる場合は実ファイルだけを部分コピーせず、トーストで通知して中止する |
 | <kbd>Ctrl</kbd>+<kbd>V</kbd> | Windows Shell の背景ペースト verb で、クリップボードのファイル / フォルダを現在の実フォルダへペースト。ZIP/PDF/検索結果グリッドなど実フォルダ以外では無効 |
 | <kbd>Delete</kbd> | チェック済み、または選択中の実ファイルを削除 (通常はゴミ箱。**フォルダは対象外**) |
 | <kbd>F12</kbd> | 画像・動画ビューアの別ウィンドウモード ON/OFF を切り替える。静止画 / ZIP画像 / PDFページは detached viewport、動画は同じ detached viewport の child native presenter で表示する |

@@ -23,7 +23,7 @@
 //!     中も動画は再生され続け、音飛びも起きない。`App::update` 側の poll が止まる
 //!     だけで、worker 自体は backlog を貯めながら作業を継続している。
 //!   - SHDoDragDrop 復帰直後に `ctx.request_repaint()` を呼ぶ (呼び出し側で実施) と、
-//!     次フレームで `poll_pdf_render` / `poll_paste_pending` /
+//!     次フレームで `poll_pdf_render` / `poll_file_drop_pending` /
 //!     `poll_global_search_events` などが backlog をまとめて処理する。
 //!   - 将来的な改善案: カスタム `IDropSource` を実装して `GiveFeedback` callback
 //!     から mIV の worker poll を周期駆動する。ただし `IDropSource` 内から `App`

@@ -13478,7 +13478,7 @@ mod file_operation_selection_tests {
     }
 
     #[test]
-    fn shell_clipboard_paths_include_real_folders_and_skip_virtual_pages() {
+    fn shell_clipboard_paths_include_real_folders_and_reject_virtual_pages() {
         let mut app = setup_app();
 
         let folder = push_item(&mut app, GridItem::Folder(PathBuf::from(r"C:\books")));
@@ -13493,19 +13493,34 @@ mod file_operation_selection_tests {
 
         app.selected = Some(folder);
         assert_eq!(
-            app.collect_shell_clipboard_paths(),
+            app.collect_shell_clipboard_paths().unwrap(),
             vec![PathBuf::from(r"C:\books")]
         );
 
         app.checked.insert(folder);
         app.checked.insert(image);
         app.checked.insert(zip_page);
+        assert_eq!(
+            app.collect_shell_clipboard_paths(),
+            Err(ShellClipboardSelectionError::UncopyableItem),
+            "mixed real + virtual checked selections must not silently copy only the real subset",
+        );
 
-        let mut paths = app.collect_shell_clipboard_paths();
+        app.checked.remove(&zip_page);
+
+        let mut paths = app.collect_shell_clipboard_paths().unwrap();
         paths.sort();
         assert_eq!(
             paths,
             vec![PathBuf::from(r"C:\books"), PathBuf::from(r"C:\books\a.jpg")]
+        );
+
+        app.checked.clear();
+        app.selected = Some(zip_page);
+        assert_eq!(
+            app.collect_shell_clipboard_paths(),
+            Err(ShellClipboardSelectionError::UncopyableItem),
+            "a selected virtual item should produce the same visible rejection path",
         );
     }
 

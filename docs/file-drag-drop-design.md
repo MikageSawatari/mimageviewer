@@ -65,7 +65,7 @@
   P2 — Ctrl+G / Ctrl+S 検索結果ビュー表示中は `current_folder` が直前の実フォルダの
   ままで誤コピーするため、`items_are_global_search_view` / `favsearch.on_results_grid()`
   を明示チェックして拒否。P3 — `handle_external_file_drop` に紛れ込んでいた
-  `poll_paste_pending` の doc comment を元に戻した。§11 を更新。
+  drop 完了 poll の doc comment を元に戻した。§11 を更新。
 - 2026-05-22: Codex レビュー第 6 回 P1 を反映。再帰ガード `copy_target_inside_src` が
   ドライブルート / UNC 共有ルート (`Path::file_name()` が `None`) を素通りさせていた
   バグを修正 (`C:\A` 表示中の `C:\` ドロップ等)。ルートのときは `dest` 自体がルート
@@ -123,15 +123,16 @@
 | ドラッグ対象パス判定 | `GridItem::drag_source_path()` ([grid_item.rs](../src/grid_item.rs)) | D&D 送出可能な実ファイル / 実フォルダのパス抽出 |
 | 複数選択モデル | `App::checked: HashSet<usize>` | チェックボックス選択。`collect_checked_paths()` で実ファイル / 実フォルダのパス収集 |
 | セルのクリック処理 | `App::handle_cell_interaction()` ([ui_main.rs:1474](../src/ui_main.rs)) | 現状 `egui::Sense::click()` |
-| クリップボード経由コピー | `copy_files_to_clipboard()` ([context_menu.rs:825](../src/ui_dialogs/context_menu.rs)) | **PowerShell 経由なので D&D には流用不可** (後述) |
+| Shell `IDataObject` 生成 | `src/file_drag.rs` | D&D 送出用。クリップボード writer とは別に、同一プロセス内で Shell data object を作る |
 
-### 3.1 既存クリップボード実装が流用できない理由
+### 3.1 クリップボード実装を流用しない理由
 
-`copy_files_to_clipboard()` は PowerShell スクリプトを起動して
-`[System.Windows.Forms.Clipboard]::SetFileDropList()` を呼ぶ方式。これはクリップボードへの
-**非同期書き込み**には使えるが、OLE ドラッグ＆ドロップは **同一プロセス内の `IDataObject` を
-`DoDragDrop` に渡す** 必要があり、別プロセス (PowerShell) では実現できない。D&D は
-ゼロから COM 経路で組む。
+旧実装には PowerShell スクリプトで
+`[System.Windows.Forms.Clipboard]::SetFileDropList()` を呼ぶファイルコピー helper があった。
+これはクリップボードへの **非同期書き込み**には使えても、OLE ドラッグ＆ドロップでは
+**同一プロセス内の `IDataObject` を `DoDragDrop` に渡す** 必要があるため、別プロセス
+(PowerShell) の clipboard writer は流用できない。現在の Ctrl+C/X は Shell verb 経路へ
+一本化済みだが、D&D は引き続き COM 経路で Shell `IDataObject` を組み立てる。
 
 ## 4. 技術アプローチ
 
@@ -828,8 +829,9 @@ CLAUDE.md「コード修正時のドキュメント同時更新」に従い、�
   コピー対象から除外する (Codex 第 5 回 P1)。ドライブルート / UNC 共有ルート
   (`C:\` や `\\server\share`、`Path::file_name()` が `None`) は basename が無く
   コピー先を一意化できないため、`dest` 自体がルート配下かで判定する (Codex 第 6 回 P1)。
-- 操作は **コピーのみ** (送出と同じ方針)。同名既存は上書き (`Copy-Item -Force`、
-  既存の Ctrl+V ペーストと同挙動)。
+- 操作は **コピーのみ** (送出と同じ方針)。現行の外部ドロップ受け取りは
+  `Copy-Item -Force` 経路のため、同名既存ファイルは上書きされる。Ctrl+V の
+  クリップボード貼り付けは Windows Shell paste 経路で、衝突確認と進捗 UI は Windows 側に委ねる。
 
 ### 11.2 実装
 
@@ -870,12 +872,10 @@ mIV ウィンドウを OS のドロップターゲットに登録済みで、efr
   飲んでいた)。
 - UI 側の受け取り経路:
   - 完了は `App::drop_copy_pending: Vec<Receiver<CopyOutcome>>` に積まれ、
-    `poll_paste_pending` が `pending_reload` を立てつつ:
+    `poll_file_drop_pending` が `pending_reload` を立てつつ:
     - `failed > 0` のとき「成功 K / 失敗 N (例: ...)」トーストを出す
     - `notice = Some(_)` のとき (全件除外等) その文面をトーストで出す
     - それ以外 (`failed == 0 && notice == None`) は静かに reload のみ
-  - 既存の `paste_pending: Vec<Receiver<()>>` はクリップボード paste 経路向けで現状維持
-    (出力に構造化情報が要らない単純経路)。
 
 ### 11.3 送出との非干渉
 

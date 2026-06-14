@@ -363,6 +363,11 @@ pub(crate) struct CurrentFolderWatch {
     pub(crate) debounce_until: Option<std::time::Instant>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellClipboardSelectionError {
+    UncopyableItem,
+}
+
 /// ユーザー画像スタンプの埋め込み worker (R2-6) の進行状態。file picker で選んだ画像を
 /// バックグラウンドで `embed_file_stamp` し、完了したら捕捉済みの適用先 (fs_idx / key /
 /// 元寸法 / 差し替え対象) で `apply_stamp_choice` する。worker 完了まで UI は固まらず、
@@ -2650,13 +2655,8 @@ pub struct App {
     /// 繰り返さないよう、ダイアログ単位でキャッシュする。
     pub(crate) delete_confirm_label: Option<String>,
 
-    // ── ペースト後のフォルダ再読み込みフラグ ──────────────────────
+    // ── ファイル操作後のフォルダ再読み込みフラグ ────────────────────
     pub(crate) pending_reload: bool,
-    /// 実行中のペースト worker 完了待ち。完了するごとに `pending_reload` を立てる。
-    /// PowerShell 経由の paste が完了する前に reload しても無駄走査になるため、
-    /// 完了通知を待ってから再読込する (docs/ui-responsiveness.md §4)。
-    pub(crate) paste_pending:
-        Vec<std::sync::mpsc::Receiver<crate::ui_dialogs::context_menu::CopyOutcome>>,
     /// 現在表示中の実フォルダを監視し、外部変更や Shell 標準メニュー操作を
     /// debounce 後に `check_external_folder_changes` へ流す。
     pub(crate) current_folder_watch: Option<CurrentFolderWatch>,
@@ -4863,7 +4863,6 @@ impl App {
             delete_targets: Vec::new(),
             delete_confirm_label: None,
             pending_reload: false,
-            paste_pending: Vec::new(),
             current_folder_watch: None,
             current_folder_watch_failed: None,
             drop_copy_pending: Vec::new(),
@@ -13192,7 +13191,7 @@ impl App {
     /// ドロップされたディレクトリは全て skip し (notice で通知)、ファイルのみコピーする。
     /// 再有効化時の自己再帰ガードは `file_drag::dir_copy_would_recurse` を流用する。
     ///
-    /// 完了時のフォルダ再読み込みは `poll_paste_pending` が `pending_reload` を立てて行う。
+    /// 完了時のフォルダ再読み込みは `poll_file_drop_pending` が `pending_reload` を立てて行う。
     pub(crate) fn handle_external_file_drop(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;
@@ -13296,47 +13295,9 @@ impl App {
         self.show_feedback_toast(format!("{n_total} 件の項目をコピーしています…"));
     }
 
-    /// PowerShell ペースト worker の完了を拾い、完了ごとに `pending_reload` を立てる。
-    /// worker はデタッチ実行なので受信チャネル Disconnected == 完了とみなす (send か drop いずれも).
-    pub(crate) fn poll_paste_pending(&mut self) {
-        if !self.paste_pending.is_empty() {
-            let mut completed: Vec<crate::ui_dialogs::context_menu::CopyOutcome> = Vec::new();
-            self.paste_pending.retain(|rx| match rx.try_recv() {
-                Ok(outcome) => {
-                    completed.push(outcome);
-                    false
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
-                Err(std::sync::mpsc::TryRecvError::Empty) => true,
-            });
-            for outcome in completed {
-                self.pending_reload = true;
-                if outcome.failed > 0 {
-                    let attempted = outcome.attempted;
-                    let failed = outcome.failed;
-                    let succeeded = attempted.saturating_sub(failed);
-                    crate::logger::log(format!(
-                        "paste: outcome attempted={attempted} succeeded={succeeded} failed={failed}"
-                    ));
-                    for err in &outcome.first_errors {
-                        crate::logger::log(format!("paste: error: {err}"));
-                    }
-                    let summary = outcome.first_errors.first().cloned().unwrap_or_default();
-                    let toast = if summary.is_empty() {
-                        format!("貼り付け: 成功 {succeeded} / 失敗 {failed} (詳細はログ参照)")
-                    } else {
-                        format!("貼り付け: 成功 {succeeded} / 失敗 {failed} — 例: {summary}")
-                    };
-                    self.show_feedback_toast(toast);
-                } else if let Some(notice) = outcome.notice {
-                    // 自己再帰 / 同じ場所への貼り付けを skip したケースの通知。
-                    crate::logger::log(format!("paste: notice: {notice}"));
-                    self.show_feedback_toast(notice);
-                }
-            }
-        }
-        // **review #15 対応**: 外部 D&D の copy worker は `CopyOutcome` を返す。
-        // 失敗があればトーストでユーザーに通知する。
+    /// 外部 D&D の copy worker 完了を拾い、完了ごとに `pending_reload` を立てる。
+    /// 失敗があればトーストでユーザーに通知する。
+    pub(crate) fn poll_file_drop_pending(&mut self) {
         if !self.drop_copy_pending.is_empty() {
             let mut completed: Vec<crate::ui_dialogs::context_menu::CopyOutcome> = Vec::new();
             self.drop_copy_pending.retain(|rx| match rx.try_recv() {
@@ -17432,25 +17393,28 @@ impl App {
             || self.tag_view.has_focus
     }
 
-    fn collect_shell_clipboard_paths(&self) -> Vec<PathBuf> {
+    fn collect_shell_clipboard_paths(&self) -> Result<Vec<PathBuf>, ShellClipboardSelectionError> {
         if !self.checked.is_empty() {
-            return self
-                .checked
-                .iter()
-                .filter_map(|&idx| {
-                    self.items
-                        .get(idx)
-                        .and_then(GridItem::drag_source_path)
-                        .map(PathBuf::from)
-                })
-                .collect();
+            let mut paths = Vec::with_capacity(self.checked.len());
+            for &idx in &self.checked {
+                let Some(path) = self.items.get(idx).and_then(GridItem::drag_source_path) else {
+                    return Err(ShellClipboardSelectionError::UncopyableItem);
+                };
+                paths.push(path.to_path_buf());
+            }
+            return Ok(paths);
         }
 
-        self.selected
-            .and_then(|idx| self.items.get(idx))
-            .and_then(GridItem::drag_source_path)
-            .map(|path| vec![path.to_path_buf()])
-            .unwrap_or_default()
+        let Some(idx) = self.selected else {
+            return Ok(Vec::new());
+        };
+        let Some(item) = self.items.get(idx) else {
+            return Ok(Vec::new());
+        };
+        let Some(path) = item.drag_source_path() else {
+            return Err(ShellClipboardSelectionError::UncopyableItem);
+        };
+        Ok(vec![path.to_path_buf()])
     }
 
     fn invoke_shell_clipboard_verb(
@@ -17458,7 +17422,15 @@ impl App {
         ctx: &egui::Context,
         verb: crate::native_context_menu::ShellClipboardVerb,
     ) {
-        let paths = self.collect_shell_clipboard_paths();
+        let paths = match self.collect_shell_clipboard_paths() {
+            Ok(paths) => paths,
+            Err(ShellClipboardSelectionError::UncopyableItem) => {
+                self.show_feedback_toast(
+                    "ZIP内の画像やPDFページはファイルとしてコピー/カットできません".to_string(),
+                );
+                return;
+            }
+        };
         if paths.is_empty() {
             return;
         }
@@ -17469,6 +17441,14 @@ impl App {
             self.show_feedback_toast("OSクリップボード操作を開始できませんでした".to_string());
             return;
         };
+
+        if matches!(
+            verb,
+            crate::native_context_menu::ShellClipboardVerb::Copy
+                | crate::native_context_menu::ShellClipboardVerb::Cut
+        ) {
+            crate::ui_dialogs::context_menu::reserve_clipboard_write_sequence();
+        }
 
         let result = crate::native_context_menu::invoke_shell_file_verb(hwnd, &paths, verb);
         Self::resync_egui_modifiers_from_os(ctx);
@@ -31314,7 +31294,7 @@ impl eframe::App for App {
         self.poll_tag_legacy_seed_results();
         self.poll_legacy_xmp_import_results();
         self.poll_delete_pending();
-        self.poll_paste_pending();
+        self.poll_file_drop_pending();
         self.poll_new_folder_pending(ctx);
         self.poll_capture_pending(ctx);
         self.poll_pipeline_debug_export_pending(ctx);
@@ -31322,7 +31302,7 @@ impl eframe::App for App {
         self.poll_compare_pin_load_pending(ctx);
         self.poll_compare_pin_pending(ctx);
         self.poll_compare_prepare_pending(ctx);
-        if !self.paste_pending.is_empty() || self.new_folder_pending.is_some() {
+        if !self.drop_copy_pending.is_empty() || self.new_folder_pending.is_some() {
             ctx.request_repaint();
         }
         if self.capture_pending.is_some()
@@ -32106,11 +32086,10 @@ impl eframe::App for App {
         // ── DEL キー ──────────────────────────────────────────────────
         self.handle_delete_key(ctx);
 
-        // ── ペースト後のフォルダ再読み込み ────────────────────────
+        // ── 非同期ファイル操作後のフォルダ再読み込み ──────────────
         if self.pending_reload {
             self.pending_reload = false;
             if self.current_folder.is_some() {
-                // 少し遅延してからリロード（ペースト処理の完了を待つ）
                 ctx.request_repaint();
                 // 変換済みアーカイブ閲覧中は元パス文脈を保持して再読み込みする。
                 self.reload_current_folder_preserving_override();

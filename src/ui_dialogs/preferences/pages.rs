@@ -176,8 +176,8 @@ pub(super) fn page_explorer_integration(ui: &mut egui::Ui, state: &mut Preferenc
         "実ファイル/実フォルダでは Windows 標準の右クリックメニューを使う",
     )
     .on_hover_text(
-        "ZIP/PDF 内ページなど仮想アイテムは従来の mIV メニューを使います。\
-         Shell 拡張との相性問題がある場合はオフにしてください。",
+        "右クリック時の表示だけを切り替えます。ZIP/PDF 内ページなど仮想アイテムは mIV 独自メニューを使います。\
+         Ctrl+C/X/V のファイル操作は、この設定に関わらず Windows 標準の動作を使います。",
     );
     ui.add_space(10.0);
 

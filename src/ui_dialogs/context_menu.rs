@@ -324,15 +324,14 @@ impl crate::app::App {
             || !self.favsearch.nav_stack.is_empty()
             || self.items_are_tag_view
             || !self.tag_view.nav_stack.is_empty();
-        // ペーストは「検索結果グリッドを表示中」だけ無効化する (外部 D&D と同じ判定)。
-        // 検索前の実フォルダへ誤って貼り付けないため。検索から実フォルダを開いた後は
-        // current_favorite_target が確定するのでペースト可に戻す (`active` ではなく
-        // on-results-grid で判定する点が重要)。
+        // 実フォルダ背景に対する mIV 管理操作 (新規フォルダ作成など) は
+        // 「検索結果グリッドを表示中」だけ無効化する (外部 D&D と同じ判定)。
+        // 検索前の実フォルダへ誤って作用しないよう、`active` ではなく on-results-grid で判定する。
         let on_search_results = self.items_are_global_search_view
             || self.favsearch.on_results_grid()
             || self.items_are_tag_view
             || self.tag_view.on_results_grid();
-        let paste_target = if on_search_results {
+        let folder_command_target = if on_search_results {
             None
         } else {
             self.current_favorite_target()
@@ -383,20 +382,6 @@ impl crate::app::App {
                     // パスをコピー (disabled)
                     ui.add_enabled(false, egui::Button::new("パスをコピー"));
 
-                    // コピー
-                    if ui.button("コピー").clicked() {
-                        let paths = self.collect_checked_paths();
-                        copy_files_to_clipboard(&paths);
-                        close = true;
-                    }
-
-                    // カット
-                    if ui.button("カット").clicked() {
-                        let paths = self.collect_checked_paths();
-                        cut_files_to_clipboard(&paths);
-                        close = true;
-                    }
-
                     // 回転
                     ui.horizontal(|ui| {
                         if ui.button("左に回転 (L)").clicked() {
@@ -436,21 +421,6 @@ impl crate::app::App {
                         close = true;
                     }
 
-                    // ペースト
-                    if ui
-                        .add_enabled(
-                            paste_target.is_some(),
-                            egui::Button::new("ペースト (Ctrl+V)"),
-                        )
-                        .clicked()
-                    {
-                        if let Some(folder) = paste_target.clone() {
-                            let rx = paste_files_from_clipboard(&folder);
-                            self.paste_pending.push(rx);
-                        }
-                        close = true;
-                    }
-
                     ui.separator();
                     if ui.button("選択解除 (Ctrl+D)").clicked() {
                         self.checked.clear();
@@ -481,14 +451,6 @@ impl crate::app::App {
                                     close = true;
                                 }
                             }
-                            if ui.button("コピー").clicked() {
-                                copy_files_to_clipboard(&[p.clone()]);
-                                close = true;
-                            }
-                            if ui.button("カット").clicked() {
-                                cut_files_to_clipboard(&[p.clone()]);
-                                close = true;
-                            }
                             if ui.button("フォルダを開く").clicked() {
                                 open_folder_in_explorer(p);
                                 close = true;
@@ -516,20 +478,6 @@ impl crate::app::App {
                             ui.separator();
                             if ui.button("削除 (ゴミ箱)").clicked() {
                                 self.request_delete_confirm(vec![(idx, p.clone())]);
-                                close = true;
-                            }
-                            ui.separator();
-                            if ui
-                                .add_enabled(
-                                    paste_target.is_some(),
-                                    egui::Button::new("ペースト (Ctrl+V)"),
-                                )
-                                .clicked()
-                            {
-                                if let Some(folder) = paste_target.clone() {
-                                    let rx = paste_files_from_clipboard(&folder);
-                                    self.paste_pending.push(rx);
-                                }
                                 close = true;
                             }
                         }
@@ -569,26 +517,13 @@ impl crate::app::App {
                             if is_folder_context
                                 && ui
                                     .add_enabled(
-                                        paste_target.is_some(),
+                                        folder_command_target.is_some(),
                                         egui::Button::new("新しいフォルダ…"),
                                     )
                                     .clicked()
                             {
-                                if let Some(folder) = paste_target.clone() {
+                                if let Some(folder) = folder_command_target.clone() {
                                     self.request_new_folder_dialog(folder);
-                                }
-                                close = true;
-                            }
-                            if ui
-                                .add_enabled(
-                                    paste_target.is_some(),
-                                    egui::Button::new("ペースト (Ctrl+V)"),
-                                )
-                                .clicked()
-                            {
-                                if let Some(folder) = paste_target.clone() {
-                                    let rx = paste_files_from_clipboard(&folder);
-                                    self.paste_pending.push(rx);
                                 }
                                 close = true;
                             }
@@ -607,14 +542,6 @@ impl crate::app::App {
                                 ctx.copy_text(name);
                                 close = true;
                             }
-                            if ui.button("コピー").clicked() {
-                                copy_files_to_clipboard(&[p.clone()]);
-                                close = true;
-                            }
-                            if ui.button("カット").clicked() {
-                                cut_files_to_clipboard(&[p.clone()]);
-                                close = true;
-                            }
                             if ui.button("フォルダを開く").clicked() {
                                 open_folder_in_explorer(p);
                                 close = true;
@@ -630,20 +557,6 @@ impl crate::app::App {
                             ui.separator();
                             if ui.button("削除 (ゴミ箱)").clicked() {
                                 self.request_delete_confirm(vec![(idx, p.clone())]);
-                                close = true;
-                            }
-                            ui.separator();
-                            if ui
-                                .add_enabled(
-                                    paste_target.is_some(),
-                                    egui::Button::new("ペースト (Ctrl+V)"),
-                                )
-                                .clicked()
-                            {
-                                if let Some(folder) = paste_target.clone() {
-                                    let rx = paste_files_from_clipboard(&folder);
-                                    self.paste_pending.push(rx);
-                                }
                                 close = true;
                             }
                         }
@@ -722,14 +635,6 @@ impl crate::app::App {
                                 ctx.copy_text(name);
                                 close = true;
                             }
-                            if ui.button("コピー").clicked() {
-                                copy_files_to_clipboard(&[path.clone()]);
-                                close = true;
-                            }
-                            if ui.button("カット").clicked() {
-                                cut_files_to_clipboard(&[path.clone()]);
-                                close = true;
-                            }
                             if ui.button("フォルダを開く").clicked() {
                                 open_folder_in_explorer(path);
                                 close = true;
@@ -742,20 +647,6 @@ impl crate::app::App {
                             ui.separator();
                             if ui.button("削除 (ゴミ箱)").clicked() {
                                 self.request_delete_confirm(vec![(idx, path.clone())]);
-                                close = true;
-                            }
-                            ui.separator();
-                            if ui
-                                .add_enabled(
-                                    paste_target.is_some(),
-                                    egui::Button::new("ペースト (Ctrl+V)"),
-                                )
-                                .clicked()
-                            {
-                                if let Some(folder) = paste_target.clone() {
-                                    let rx = paste_files_from_clipboard(&folder);
-                                    self.paste_pending.push(rx);
-                                }
                                 close = true;
                             }
                         }
@@ -882,7 +773,9 @@ impl crate::app::App {
         is_folder_context: bool,
         has_checked: bool,
     ) -> Option<NativeGridContextMenuTarget> {
-        let paths = if has_checked {
+        let paths = if is_folder_context {
+            vec![self.current_favorite_target()?]
+        } else if has_checked {
             if self.checked.iter().any(|&idx| {
                 self.items
                     .get(idx)
@@ -1639,15 +1532,13 @@ impl crate::app::App {
 /// クリップボード書き込みジョブの最新世代番号。発行時点で seq を取り、worker が
 /// 実際にクリップボードに書く直前にこの値と比較、古ければ書き込みをスキップする。
 /// これで「遅いコピー A の後に速いコピー B をクリック」ケースで A が B を
-/// 上書きするのを防ぐ (画像 decode / PowerShell 起動いずれも対象)。
+/// 上書きするのを防ぐ (画像 decode / Shell ファイルコピーの先行予約が対象)。
 static CLIPBOARD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// クリップボード書き込み (OpenClipboard/SetClipboardData と PowerShell copy/cut) を
-/// 直列化するミューテックス。seq チェックは必ずこの lock 内で実行し、
+/// 画像クリップボード書き込み (OpenClipboard/SetClipboardData) を直列化するミューテックス。
+/// seq チェックは必ずこの lock 内で実行し、
 /// 「チェック通過 → 実際の書き込み」の間に別の writer が割り込まないようにする。
-/// 画像 clipboard の DIB 構築 / PowerShell プロセス実行 (`cmd.status()`) もこの lock の
-/// 配下で行う — 古い writer が遅れて clipboard を上書きする race を閉じる。
-/// paste (clipboard 読み出し + FS 操作) はここには入らない (書き込み競合しないため)。
+/// 古い writer が遅れて clipboard を上書きする race を閉じる。
 static CLIPBOARD_WRITE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 次世代の seq を発行する。発行値が最新 (= CLIPBOARD_SEQ の現在値) かをチェックするには
@@ -1662,69 +1553,10 @@ fn clipboard_seq_is_latest(my_seq: u64) -> bool {
 }
 
 /// Path を PowerShell の単一引用符文字列リテラル (`'...'`、内部の `'` を `''` へ
-/// エスケープ) に変換する。clipboard / paste / drop のスクリプト生成で共用。
+/// エスケープ) に変換する。外部 D&D 受け取りのスクリプト生成で使う。
 #[cfg(windows)]
 fn ps_quote(path: &std::path::Path) -> String {
     format!("'{}'", native_path_text(path).replace('\'', "''"))
-}
-
-/// ファイルをクリップボードにコピー (エクスプローラのコピーと同等)。
-pub fn copy_files_to_clipboard(paths: &[PathBuf]) {
-    #[cfg(windows)]
-    {
-        if paths.is_empty() {
-            return;
-        }
-        let my_seq = bump_clipboard_seq();
-        let arr = paths
-            .iter()
-            .map(|p| ps_quote(p))
-            .collect::<Vec<_>>()
-            .join(",");
-        let script = format!(
-            "Add-Type -AssemblyName System.Windows.Forms\n\
-             $col = New-Object System.Collections.Specialized.StringCollection\n\
-             @({arr}) | ForEach-Object {{ $col.Add($_) | Out-Null }}\n\
-             [System.Windows.Forms.Clipboard]::SetFileDropList($col)\n"
-        );
-        run_ps_script_async_seq(script, None, my_seq);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = paths;
-    }
-}
-
-/// ファイルをクリップボードにカット (移動操作用)。
-pub fn cut_files_to_clipboard(paths: &[PathBuf]) {
-    #[cfg(windows)]
-    {
-        if paths.is_empty() {
-            return;
-        }
-        let my_seq = bump_clipboard_seq();
-        let arr = paths
-            .iter()
-            .map(|p| ps_quote(p))
-            .collect::<Vec<_>>()
-            .join(",");
-        let script = format!(
-            "Add-Type -AssemblyName System.Windows.Forms\n\
-             $col = New-Object System.Collections.Specialized.StringCollection\n\
-             @({arr}) | ForEach-Object {{ $col.Add($_) | Out-Null }}\n\
-             $data = New-Object System.Windows.Forms.DataObject\n\
-             $data.SetFileDropList($col)\n\
-             $ms = New-Object System.IO.MemoryStream(4)\n\
-             $ms.Write([BitConverter]::GetBytes(2), 0, 4)\n\
-             $data.SetData('Preferred DropEffect', $ms)\n\
-             [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)\n"
-        );
-        run_ps_script_async_seq(script, None, my_seq);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = paths;
-    }
 }
 
 /// 画像ファイルの内容をクリップボードにコピーする (Windows)。
@@ -1924,196 +1756,6 @@ fn set_rgba_to_clipboard(width: u32, height: u32, rgba: &[u8], my_seq: u64) {
     }
 }
 
-/// クリップボードにあるファイルを指定フォルダにペースト（コピーまたは移動）する。
-///
-/// PowerShell 起動 + Shell clipboard I/O が数百ms〜秒級になることがあるため、worker で走らせる。
-/// 戻り値は「ペースト完了」を 1 回通知する `mpsc::Receiver`。App は pending に積み、
-/// 完了したらフォルダを再読込する (docs/ui-responsiveness.md §4)。
-/// クリップボード上のファイルを `dest_folder` へ貼り付ける (Ctrl+V / 右クリック)。
-///
-/// **フォルダは対象外** — v1.1.0 で一旦フォルダのクリップボード貼り付けを無効化した
-/// (同名衝突の無確認上書き・自己再帰によるデータ破壊リスクが大きく、Explorer 相当の
-/// 衝突解決 (確認/リネーム/skip) と合わせて将来再導入する方針)。クリップボードにフォルダが
-/// 含まれていても (例: エクスプローラでフォルダをコピー) ディレクトリは全て skip し、
-/// ファイルだけを処理する。これで貼り付け元がどこであれフォルダ再帰コピーの事故を防ぐ。
-///
-/// データ安全策:
-/// - **失敗の可視化**: per-item try/catch + `-ErrorAction Stop` で失敗を数え `CopyOutcome`
-///   で返す (旧実装は `Receiver<()>` で成功 / 失敗を区別できず黙って握りつぶしていた)。
-/// - **clipboard clear はカット成功時のみ**: 失敗 / skip が 1 件でもあれば消さない
-///   (= 部分失敗したカットを再試行できる)。
-/// - **同じ場所へのコピーは skip** (ファイルを自身の上へ `-Force` コピーする自己衝突を回避)。
-///
-/// 既知の制限 (ファイル): コピー先に同名ファイルが既存だと `-Force` で無確認上書きする
-/// (v0.9.0 以来の既存挙動)。フォルダ対応と合わせて将来 衝突解決 UI を入れる予定。
-pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiver<CopyOutcome> {
-    let (tx, rx) = mpsc::channel();
-    #[cfg(windows)]
-    {
-        let dest = ps_quote(dest_folder);
-        let script = format!(
-            "Add-Type -AssemblyName System.Windows.Forms\n\
-             $dest = {dest}\n\
-             $sep = [System.IO.Path]::DirectorySeparatorChar\n\
-             $destFull = ([System.IO.Path]::GetFullPath($dest)).TrimEnd($sep)\n\
-             $data = [System.Windows.Forms.Clipboard]::GetDataObject()\n\
-             if ($data -eq $null -or -not $data.ContainsFileDropList()) {{\n\
-            \x20 Write-Output \"::ATTEMPTED::0\"; Write-Output \"::FAILED::0\"; Write-Output \"::SKIPPED::0\"; exit\n\
-             }}\n\
-             $files = $data.GetFileDropList()\n\
-             $effect = $data.GetData('Preferred DropEffect')\n\
-             $isMove = $false\n\
-             if ($effect -ne $null) {{\n\
-            \x20 $bytes = New-Object byte[] 4\n\
-            \x20 $null = $effect.Read($bytes, 0, 4)\n\
-            \x20 if ([BitConverter]::ToInt32($bytes, 0) -eq 2) {{ $isMove = $true }}\n\
-             }}\n\
-             $attempted = 0; $failed = 0; $skipped = 0\n\
-             $errs = New-Object System.Collections.ArrayList\n\
-             foreach ($f in $files) {{\n\
-            \x20 $attempted++\n\
-            \x20 try {{\n\
-            \x20   $srcFull = ([System.IO.Path]::GetFullPath($f)).TrimEnd($sep)\n\
-            \x20   if ([System.IO.Directory]::Exists($srcFull)) {{\n\
-            \x20     $skipped++; if ($errs.Count -lt 5) {{ [void]$errs.Add(\"フォルダの貼り付けは現在無効です: $f\") }}; continue\n\
-            \x20   }}\n\
-            \x20   $srcParent = [System.IO.Path]::GetDirectoryName($srcFull)\n\
-            \x20   if ($srcParent -ne $null -and ($srcParent -ieq $destFull)) {{\n\
-            \x20     $skipped++; if (-not $isMove -and $errs.Count -lt 5) {{ [void]$errs.Add(\"同じ場所へはコピーできません: $f\") }}; continue\n\
-            \x20   }}\n\
-            \x20   if ($isMove) {{ Move-Item -LiteralPath $f -Destination $dest -Force -ErrorAction Stop }}\n\
-            \x20   else {{ Copy-Item -LiteralPath $f -Destination $dest -Force -ErrorAction Stop }}\n\
-            \x20 }} catch {{\n\
-            \x20   $failed++; if ($errs.Count -lt 5) {{ [void]$errs.Add(\"$($_.Exception.Message): $f\") }}\n\
-            \x20 }}\n\
-             }}\n\
-             Write-Output \"::ATTEMPTED::$attempted\"\n\
-             Write-Output \"::FAILED::$failed\"\n\
-             Write-Output \"::SKIPPED::$skipped\"\n\
-             foreach ($e in $errs) {{ Write-Output \"::ERR::$e\" }}\n\
-             if ($isMove -and $failed -eq 0 -and $skipped -eq 0) {{ [System.Windows.Forms.Clipboard]::Clear() }}\n"
-        );
-        run_paste_script_with_outcome(script, tx);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = dest_folder;
-        let _ = tx; // drop — receiver will get Disconnected
-    }
-    rx
-}
-
-/// `paste_files_from_clipboard` の PowerShell スクリプトを worker スレッドで実行し、
-/// `::ATTEMPTED:: / ::FAILED:: / ::SKIPPED:: / ::ERR::` マーカーを parse して
-/// `CopyOutcome` で返す。clipboard 読み出しに `-STA` が要るので `copy_paths_into_folder`
-/// 用の `run_ps_script_with_outcome` とは別実装 (あちらは attempted を呼び出し側が知る)。
-#[cfg(windows)]
-fn run_paste_script_with_outcome(script: String, on_done: mpsc::Sender<CopyOutcome>) {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("miv_ps_paste_{}_{}.ps1", std::process::id(), seq));
-    let tx_for_worker = on_done.clone();
-    let spawn_result = std::thread::Builder::new()
-        .name("powershell-paste-with-outcome".into())
-        .spawn(move || {
-            let outcome = execute_paste_script(&tmp, &script);
-            let _ = std::fs::remove_file(&tmp);
-            let _ = tx_for_worker.send(outcome);
-        });
-    if let Err(e) = spawn_result {
-        crate::logger::log(format!(
-            "run_paste_script_with_outcome: thread spawn failed: {e}"
-        ));
-        let _ = on_done.send(CopyOutcome::all_failed(
-            1,
-            format!("worker thread spawn failed: {e}"),
-        ));
-    }
-}
-
-#[cfg(windows)]
-fn execute_paste_script(tmp: &std::path::Path, script: &str) -> CopyOutcome {
-    let mut content = vec![0xEF, 0xBB, 0xBF];
-    content.extend_from_slice(script.as_bytes());
-    if let Err(e) = std::fs::write(tmp, &content) {
-        return CopyOutcome::all_failed(1, format!("script file write failed: {e}"));
-    }
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args([
-        "-NoProfile",
-        "-STA",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        &tmp.to_string_lossy(),
-    ]);
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
-    let out = match cmd.output() {
-        Ok(o) => o,
-        Err(e) => return CopyOutcome::all_failed(1, format!("powershell execution failed: {e}")),
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let mut attempted: Option<usize> = None;
-    let mut failed: Option<usize> = None;
-    let mut skipped: usize = 0;
-    let mut first_errors: Vec<String> = Vec::new();
-    for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix("::ATTEMPTED::") {
-            attempted = rest.trim().parse::<usize>().ok();
-        } else if let Some(rest) = line.strip_prefix("::FAILED::") {
-            failed = rest.trim().parse::<usize>().ok();
-        } else if let Some(rest) = line.strip_prefix("::SKIPPED::") {
-            if let Ok(n) = rest.trim().parse::<usize>() {
-                skipped = n;
-            }
-        } else if let Some(rest) = line.strip_prefix("::ERR::") {
-            first_errors.push(rest.to_string());
-        }
-    }
-    // 非ゼロ exit / 必須マーカー (ATTEMPTED, FAILED) 欠落 = スクリプトが完走しなかった
-    // → 全件失敗扱い (copy 経路と同じく、欠落を成功に潰さない)。SKIPPED は notice 用なので
-    // 欠落しても 0 扱いで可。
-    if !out.status.success() || attempted.is_none() || failed.is_none() {
-        let mut errs = if out.status.success() {
-            vec![
-                "powershell did not emit required ::ATTEMPTED::/::FAILED:: markers (script crashed)"
-                    .to_string(),
-            ]
-        } else {
-            vec![format!("powershell exit code {:?}", out.status.code())]
-        };
-        for line in stderr.lines().take(3) {
-            let t = line.trim();
-            if !t.is_empty() {
-                errs.push(t.to_string());
-            }
-        }
-        errs.extend(first_errors.into_iter());
-        let n = attempted.unwrap_or(1).max(1);
-        return CopyOutcome {
-            attempted: n,
-            failed: n,
-            first_errors: errs.into_iter().take(5).collect(),
-            notice: None,
-        };
-    }
-    let attempted = attempted.unwrap_or(0);
-    let failed = failed.unwrap_or(0);
-    let notice = (skipped > 0).then(|| {
-        format!("{skipped} 件をスキップしました (自身の中・同じ場所への貼り付けはできません)")
-    });
-    CopyOutcome {
-        attempted,
-        failed,
-        first_errors: first_errors.into_iter().take(5).collect(),
-        notice,
-    }
-}
-
 /// `copy_paths_into_folder` の完了結果。`failed > 0` のとき呼び出し側はトースト等で
 /// ユーザーに通知すべき。エラー詳細は `first_errors` (先頭最大 5 件) を見る。
 ///
@@ -2129,13 +1771,12 @@ pub struct CopyOutcome {
 
 /// 指定パス群を `dest_folder` へコピーする（エクスプローラ → mIV のドロップ受け取り用）。
 ///
-/// クリップボード経由ではなくパスを直接受け取る点が [`paste_files_from_clipboard`] と
-/// 異なる。同じく PowerShell worker で実行し、完了を `rx` で 1 回通知する。
+/// PowerShell worker で実行し、完了を `rx` で 1 回通知する。
 ///
 /// **フォルダは v1.1.0 で一旦無効化したため、防御層としてここでもディレクトリは skip し
 /// ファイルのみコピーする** (呼び出し側 `handle_external_file_drop` も folder を除外済みだが、
 /// 将来の呼び出し追加で再帰コピーが復活しないよう二重化)。`-Recurse` は付けない (ファイル
-/// 専用)。コピー先に同名ファイルが既存なら上書き（`-Force`、paste と同じ挙動）。
+/// 専用)。コピー先に同名ファイルが既存なら上書き（`-Force`）。
 ///
 /// **review #15 対応**: 旧実装は `-ErrorAction SilentlyContinue` で全エラーを握りつぶし、
 /// `()` 完了通知だけを返していた。Locked file / 権限拒否 / disk full 等の per-file 失敗が
@@ -2325,81 +1966,6 @@ fn execute_copy_script(tmp: &std::path::Path, script: &str, attempted: usize) ->
         first_errors,
         notice: None,
     }
-}
-
-/// clipboard copy/cut (PowerShell で書き込み) 用。seq が古ければ PowerShell 起動を
-/// スキップする。一時ファイル経由・`-STA` (クリップボード API 必須) / `-ExecutionPolicy
-/// Bypass` / `CREATE_NO_WINDOW` で実行し、スクリプトは UTF-8 BOM 付きで書き出す
-/// (日本語パス対応)。一時ファイル名は呼び出しごとにユニーク化して衝突を避ける。
-/// clipboard copy/cut はファイア & フォーゲットなので `on_done` は通常 None。
-#[cfg(windows)]
-fn run_ps_script_async_seq(script: String, on_done: Option<mpsc::Sender<()>>, my_seq: u64) {
-    run_ps_script_inner(script, on_done, Some(my_seq));
-}
-
-#[cfg(windows)]
-fn run_ps_script_inner(
-    script: String,
-    on_done: Option<mpsc::Sender<()>>,
-    clipboard_seq: Option<u64>,
-) {
-    // process id + atomic counter で temp ファイル衝突を回避。
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("miv_ps_{}_{}.ps1", std::process::id(), seq));
-    std::thread::Builder::new()
-        .name("powershell-clipboard-exec".into())
-        .spawn(move || {
-            // clipboard 書き込み系 (copy/cut) は `CLIPBOARD_WRITE_MUTEX` を握ったうえで
-            // seq 再確認 → PowerShell 実行まで lock 内で直列化する。PowerShell プロセス内で
-            // 実際の SetClipboardData が走るため、`cmd.status()` が返るまで lock を離さない
-            // ことで「A の PS 起動後に B が割り込んで先に clipboard を書き、そのあと A が
-            // 遅れて上書きする」race を閉じる。
-            // paste (clipboard 読み出し + FS 操作) は clipboard_seq=None で呼ばれるので
-            // lock を取らない — 書き込み系を不要にブロックしない。
-            let _clipboard_lock = if clipboard_seq.is_some() {
-                Some(
-                    CLIPBOARD_WRITE_MUTEX
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()),
-                )
-            } else {
-                None
-            };
-            if let Some(my_seq) = clipboard_seq {
-                if !clipboard_seq_is_latest(my_seq) {
-                    if let Some(tx) = on_done {
-                        let _ = tx.send(());
-                    }
-                    return;
-                }
-            }
-            // UTF-8 BOM (0xEF 0xBB 0xBF) + スクリプト本文
-            let mut content = vec![0xEF, 0xBB, 0xBF];
-            content.extend_from_slice(script.as_bytes());
-            if std::fs::write(&tmp, &content).is_ok() {
-                let mut cmd = std::process::Command::new("powershell");
-                cmd.args([
-                    "-NoProfile",
-                    "-STA",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    &tmp.to_string_lossy(),
-                ]);
-                {
-                    use std::os::windows::process::CommandExt;
-                    cmd.creation_flags(0x08000000);
-                }
-                let _ = cmd.status();
-                let _ = std::fs::remove_file(&tmp);
-            }
-            // ここで `_clipboard_lock` が drop されロック解放。
-            if let Some(tx) = on_done {
-                let _ = tx.send(());
-            }
-        })
-        .ok();
 }
 
 /// ファイルの親フォルダをエクスプローラで開き、ファイルを選択する。
