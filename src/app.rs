@@ -7039,15 +7039,10 @@ impl App {
             self.current_folder_last_mtime = Some(new_mtime);
             return;
         }
-        let retained_entries = self.retained_final_ai_cache.len();
-        if retained_entries > 0 {
-            self.clear_retained_final_ai_cache();
-            crate::logger::log(format!(
-                "[AI] Retained final AI clear entries={retained_entries} \
-                 reason=external_folder_change folder={}",
-                folder.display()
-            ));
-        }
+        self.clear_retained_final_ai_cache(&format!(
+            "external_folder_change folder={}",
+            folder.display()
+        ));
         // 選択中アイテムのパスを保存 (非選択 / パス取れないアイテムは None)。
         let selected_path: Option<PathBuf> = self
             .selected
@@ -23482,7 +23477,7 @@ impl App {
         }
         self.ai_upscale_cache.clear();
         self.ai_upscale_failed.clear();
-        self.clear_retained_final_ai_cache();
+        self.clear_retained_final_ai_cache("ai_feature_mode_change");
         self.bump_all_ai_generations();
         if let Some(idx) = self.fullscreen_idx {
             self.sync_upscale_from_preset(idx);
@@ -23503,7 +23498,7 @@ impl App {
         }
         self.ai_upscale_cache.clear();
         self.ai_upscale_failed.clear();
-        self.clear_retained_final_ai_cache();
+        self.clear_retained_final_ai_cache("ai_size_limit_change");
         // bump_all_ai_generations が clear_all_final_pipeline_caches を内包する
         // (= final_ai_pending cancel + final_ai_cache / failed / composite 破棄)。
         self.bump_all_ai_generations();
@@ -26055,10 +26050,36 @@ impl App {
         pixels: Arc<egui::ColorImage>,
     ) {
         let Some((max_entries, max_bytes)) = self.retained_final_ai_budget() else {
+            let item_key = self
+                .metadata_cache_key(idx)
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let cleared_entries = self.retained_final_ai_cache.len();
+            let cleared_bytes = self.retained_final_ai_cache_bytes();
             self.retained_final_ai_cache.clear();
+            crate::logger::log(format!(
+                "[AI] Retained final AI skip idx={idx} item={item_key} source={}x{} \
+                 output={}x{} bytes={} reason=disabled max_entries={} max_mib={} \
+                 cleared_entries={cleared_entries} cleared_bytes={cleared_bytes}",
+                edit_size[0],
+                edit_size[1],
+                pixels.size[0],
+                pixels.size[1],
+                Self::retained_final_ai_image_bytes(&pixels),
+                self.settings.retained_final_ai_cache_max_entries,
+                self.settings.retained_final_ai_cache_max_mib,
+            ));
             return;
         };
         let Some(retained_key) = self.retained_final_ai_key_for(idx, key, edit_size) else {
+            crate::logger::log(format!(
+                "[AI] Retained final AI skip idx={idx} source={}x{} output={}x{} \
+                 bytes={} reason=no_item_key",
+                edit_size[0],
+                edit_size[1],
+                pixels.size[0],
+                pixels.size[1],
+                Self::retained_final_ai_image_bytes(&pixels),
+            ));
             return;
         };
         let bytes = Self::retained_final_ai_image_bytes(&pixels);
@@ -26128,6 +26149,39 @@ impl App {
         Some(pixels)
     }
 
+    fn log_retained_final_ai_miss(
+        &self,
+        idx: usize,
+        key: FinalAiKey,
+        edit_size: [usize; 2],
+        reason: &str,
+    ) {
+        let Some(retained_key) = self.retained_final_ai_key_for(idx, key, edit_size) else {
+            crate::logger::log(format!(
+                "[AI] Retained final AI miss idx={idx} source={}x{} hash={} bg={} \
+                 entries={} total_bytes={} reason=no_item_key/{reason}",
+                edit_size[0],
+                edit_size[1],
+                key.color_ai_hash,
+                key.bg,
+                self.retained_final_ai_cache.len(),
+                self.retained_final_ai_cache_bytes(),
+            ));
+            return;
+        };
+        crate::logger::log(format!(
+            "[AI] Retained final AI miss idx={idx} item={} source={}x{} hash={} bg={} \
+             entries={} total_bytes={} reason={reason}",
+            retained_key.item_key,
+            edit_size[0],
+            edit_size[1],
+            key.color_ai_hash,
+            key.bg,
+            self.retained_final_ai_cache.len(),
+            self.retained_final_ai_cache_bytes(),
+        ));
+    }
+
     fn has_retained_final_ai(&self, idx: usize, key: FinalAiKey, edit_size: [usize; 2]) -> bool {
         self.retained_final_ai_key_for(idx, key, edit_size)
             .is_some_and(|retained_key| self.retained_final_ai_cache.contains_key(&retained_key))
@@ -26165,7 +26219,7 @@ impl App {
 
     pub(crate) fn prune_retained_final_ai_cache_to_settings(&mut self) {
         let Some((max_entries, max_bytes)) = self.retained_final_ai_budget() else {
-            self.retained_final_ai_cache.clear();
+            self.clear_retained_final_ai_cache("retained_budget_disabled");
             return;
         };
         self.prune_retained_final_ai_cache_to_budget(max_entries, max_bytes);
@@ -26175,12 +26229,33 @@ impl App {
         let Some(item_key) = self.metadata_cache_key(idx) else {
             return;
         };
+        let before_entries = self.retained_final_ai_cache.len();
+        let before_bytes = self.retained_final_ai_cache_bytes();
         self.retained_final_ai_cache
             .retain(|key, _| key.item_key != item_key);
+        let removed_entries = before_entries.saturating_sub(self.retained_final_ai_cache.len());
+        if removed_entries > 0 {
+            crate::logger::log(format!(
+                "[AI] Retained final AI clear idx={idx} item={item_key} \
+                 removed_entries={removed_entries} entries={} total_bytes={} \
+                 removed_bytes={} reason=idx_final_pipeline_invalidation",
+                self.retained_final_ai_cache.len(),
+                self.retained_final_ai_cache_bytes(),
+                before_bytes.saturating_sub(self.retained_final_ai_cache_bytes()),
+            ));
+        }
     }
 
-    pub(crate) fn clear_retained_final_ai_cache(&mut self) {
+    pub(crate) fn clear_retained_final_ai_cache(&mut self, reason: &str) {
+        let entries = self.retained_final_ai_cache.len();
+        let total_bytes = self.retained_final_ai_cache_bytes();
         self.retained_final_ai_cache.clear();
+        if entries > 0 {
+            crate::logger::log(format!(
+                "[AI] Retained final AI clear entries={entries} total_bytes={total_bytes} \
+                 reason={reason}",
+            ));
+        }
     }
 
     fn final_composite_key_for_pixels(
@@ -26252,6 +26327,7 @@ impl App {
         if self.final_ai_failed.contains(&key) {
             return false;
         }
+        self.log_retained_final_ai_miss(idx, key, source_image.size, "queue_after_retained_lookup");
 
         if self.fullscreen_idx == Some(idx) {
             // display 経路: 編集が進んだ同じ idx の古い key (= stale request) のみ

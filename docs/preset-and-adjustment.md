@@ -509,9 +509,10 @@ AI 完了時に未完了の final composite を捨てて AI 後の画像へ掛�
 `final_ai_cache` が miss しても `retained_final_ai_cache` が hit した場合は、その pixels を
 `final_ai_cache` に戻してから同じ合成経路に入る。保持 LRU は `close_fullscreen()` や
 keep-set eviction では消さず、AI 入力が変わる編集 (`clear_final_pipeline_caches_for_idx`)
-や AI 機能モード / サイズ上限変更で破棄する。保持 LRU の `store` / `hit` / `evict` は
-通常ログ (`mimageviewer.log`) に出るため、同じページへ戻ったときに推論再実行ではなく
-保持結果の復元だったかを後から確認できる。
+や AI 機能モード / サイズ上限変更で破棄する。保持 LRU の `store` / `hit` / `miss` /
+`skip` / `evict` / `clear` は通常ログ (`mimageviewer.log`) に出るため、同じページへ
+戻ったときに推論再実行ではなく保持結果の復元だったか、または保持前に破棄されたかを
+後から確認できる。
 
 ### 3.3 サムネイル補正
 
