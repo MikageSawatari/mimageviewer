@@ -94,6 +94,7 @@ pub mod png_metadata;
 pub mod post_filter;
 pub mod rating_db;
 pub mod rating_write_worker;
+pub mod rotation_db;
 pub mod save_with_metadata;
 pub mod search_index_db;
 pub mod search_norm;

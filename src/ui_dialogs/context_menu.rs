@@ -476,7 +476,8 @@ impl crate::app::App {
                             if matches!(item, GridItem::Image(_)) {
                                 if ui.button("画像をクリップボードにコピー").clicked()
                                 {
-                                    copy_image_to_clipboard(p);
+                                    let rotation = self.get_rotation(idx);
+                                    copy_image_to_clipboard(p, rotation);
                                     close = true;
                                 }
                             }
@@ -661,7 +662,8 @@ impl crate::app::App {
                                 close = true;
                             }
                             if ui.button("画像をクリップボードにコピー").clicked() {
-                                copy_zip_image_to_clipboard(zip_path, entry_name);
+                                let rotation = self.get_rotation(idx);
+                                copy_zip_image_to_clipboard(zip_path, entry_name, rotation);
                                 close = true;
                             }
                         }
@@ -1066,7 +1068,11 @@ impl crate::app::App {
             }
             NativeMivCommand::CopyImageToClipboard => {
                 if let GridItem::Image(path) = &target.item {
-                    copy_image_to_clipboard(path);
+                    let rotation = target
+                        .item_index
+                        .map(|idx| self.get_rotation(idx))
+                        .unwrap_or(crate::rotation_db::Rotation::None);
+                    copy_image_to_clipboard(path, rotation);
                 }
                 None
             }
@@ -1206,7 +1212,8 @@ impl crate::app::App {
                         }
                         if matches!(item, GridItem::Image(_)) {
                             if ui.button("画像をクリップボードにコピー").clicked() {
-                                copy_image_to_clipboard(p);
+                                let rotation = self.get_rotation(idx);
+                                copy_image_to_clipboard(p, rotation);
                                 close = true;
                             }
                         }
@@ -1247,7 +1254,8 @@ impl crate::app::App {
                             close = true;
                         }
                         if ui.button("画像をクリップボードにコピー").clicked() {
-                            copy_zip_image_to_clipboard(zip_path, entry_name);
+                            let rotation = self.get_rotation(idx);
+                            copy_zip_image_to_clipboard(zip_path, entry_name, rotation);
                             close = true;
                         }
                     }
@@ -1727,7 +1735,7 @@ pub fn cut_files_to_clipboard(paths: &[PathBuf]) {
 /// 数百ms〜秒単位かかるため、UI スレッドから同期実行すると右クリック操作で固まる。
 /// 発行時に `CLIPBOARD_SEQ` を bump し、set 直前に最新 seq と比較、自分が古ければ
 /// set をスキップする — 遅い A が速い B を追い越して上書きするのを防ぐ。
-fn copy_image_to_clipboard(path: &std::path::Path) {
+fn copy_image_to_clipboard(path: &std::path::Path, rotation: crate::rotation_db::Rotation) {
     let path = path.to_path_buf();
     let my_seq = bump_clipboard_seq();
     std::thread::Builder::new()
@@ -1738,15 +1746,24 @@ fn copy_image_to_clipboard(path: &std::path::Path) {
                 Err(_) => {
                     #[cfg(windows)]
                     {
-                        match crate::wic_decoder::decode_to_dynamic_image(&path) {
+                        match crate::wic_decoder::decode_to_dynamic_image(&path)
+                            .or_else(|| crate::susie_loader::decode_file(&path, true, None).ok())
+                        {
                             Some(i) => i,
                             None => return,
                         }
                     }
                     #[cfg(not(windows))]
-                    return;
+                    {
+                        match crate::susie_loader::decode_file(&path, true, None) {
+                            Ok(i) => i,
+                            Err(_) => return,
+                        }
+                    }
                 }
             };
+            let img = crate::thumb_loader::apply_exif_orientation(img, &path);
+            let img = crate::capture::rotate_dynamic_image(img, rotation);
             // ここの pre-check は DIB 構築を省くだけの best-effort 短絡。
             // 正式な stale 判定は `set_image_to_clipboard` 内部で
             // `CLIPBOARD_WRITE_MUTEX` を握った状態で行われる。
@@ -1761,7 +1778,11 @@ fn copy_image_to_clipboard(path: &std::path::Path) {
 /// バイト列から画像をデコードしてクリップボードにコピー (ZIP 内画像用)。
 /// ZIP エントリ読み出し + decode + DIB 構築はまとめて worker に回す。
 /// 巨大 ZIP の read_entry_bytes も I/O 待ちで UI を止めるため、そちらも含めてここで吸収する。
-fn copy_zip_image_to_clipboard(zip_path: &std::path::Path, entry_name: &str) {
+fn copy_zip_image_to_clipboard(
+    zip_path: &std::path::Path,
+    entry_name: &str,
+    rotation: crate::rotation_db::Rotation,
+) {
     let zip_path = zip_path.to_path_buf();
     let entry_name = entry_name.to_string();
     let my_seq = bump_clipboard_seq();
@@ -1771,9 +1792,17 @@ fn copy_zip_image_to_clipboard(zip_path: &std::path::Path, entry_name: &str) {
             let Ok(bytes) = crate::zip_loader::read_entry_bytes(&zip_path, &entry_name) else {
                 return;
             };
-            let Ok(img) = image::load_from_memory(&bytes) else {
+            let Some(img) = image::load_from_memory(&bytes)
+                .ok()
+                .or_else(|| crate::wic_decoder::decode_to_dynamic_image_from_bytes(&bytes))
+                .or_else(|| {
+                    crate::susie_loader::decode_bytes(&entry_name, &bytes, true, None).ok()
+                })
+            else {
                 return;
             };
+            let img = crate::thumb_loader::apply_exif_orientation_from_bytes(img, &bytes);
+            let img = crate::capture::rotate_dynamic_image(img, rotation);
             // pre-check は best-effort 短絡 (DIB 構築省略)。正式な stale 判定は
             // `set_image_to_clipboard` 側の mutex 内で行う。
             if !clipboard_seq_is_latest(my_seq) {

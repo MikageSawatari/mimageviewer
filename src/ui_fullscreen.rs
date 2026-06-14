@@ -12849,7 +12849,9 @@ impl App {
                 .ok_or_else(|| "最終合成の完了後に再実行してください".to_string())?,
         };
         let size = pixels.size;
-        let mut job = crate::capture::CapturePixelJob::already_adjusted(basename, pixels);
+        let rotation = self.get_rotation(idx);
+        let mut job = crate::capture::CapturePixelJob::already_adjusted(basename, pixels)
+            .with_rotation(rotation);
         // crop は表示パイプラインでは適用しないので、最終段でここで切り出す。
         if let Some(rect) = self.export_crop_rect_for_pixels(idx, size) {
             job = job.with_crop(rect);
@@ -13089,10 +13091,12 @@ impl App {
         // crop は表示には反映しないので、export の最終段で base_pixels (= final
         // composite。AI アップスケールで source とサイズが違いうる) に対して切り出す。
         let crop = self.export_crop_rect_for_pixels(idx, base_pixels.size);
+        let rotation = self.get_rotation(idx);
         Ok(crate::export_dialog::ExportPagePixels {
             base_pixels,
             conceal_mask: None,
             crop,
+            rotation,
         })
     }
 

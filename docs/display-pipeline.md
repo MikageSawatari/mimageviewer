@@ -458,8 +458,10 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 `ai_upscale_cache` / `fs_cache` へフォールバックし、AI 完了後は cache_key を変えて
 再アップロードする。
 保存・比較・クリップボードのようなピクセル出力経路も、`prepare_capture_pixel_job` で
-同じ最終 composite pixels を取得する。補正レイヤーが有効だが `local_adjust_cache` がまだ
-無い場合、古い結果や下位画像は保存せず、完了後の再実行を促す。
+同じ最終 composite pixels を取得する。EXIF Orientation は decode 済みなのでここでは
+再適用しないが、`rotation_db` の非破壊 90 度回転は GPU 描画専用のため、crop 後の
+ピクセル出力段で焼き込む。補正レイヤーが有効だが `local_adjust_cache` がまだ無い場合、
+古い結果や下位画像は保存せず、完了後の再実行を促す。
 
 右 Ctrl ホールドの元画像プレビューは例外的な一時表示で、派生キャッシュは作り直さない。
 通常の画像 / ZIP 内画像 / PDF ページだけを対象にし、動画には適用しない。表示元は常に

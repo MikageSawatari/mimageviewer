@@ -163,17 +163,19 @@ pub struct ExportPagePixels {
     pub base_pixels: Arc<egui::ColorImage>,
     pub conceal_mask: Option<Arc<Vec<bool>>>,
     pub crop: Option<crate::export_crop::CropRect>,
+    pub rotation: crate::rotation_db::Rotation,
 }
 
 impl ExportPagePixels {
     pub fn render_size(&self) -> [usize; 2] {
         let [w, h] = self.base_pixels.size;
-        if let Some(crop) = self.crop {
+        let size = if let Some(crop) = self.crop {
             let (_, _, crop_w, crop_h) = crop.pixel_bounds(w, h);
             [crop_w, crop_h]
         } else {
             [w.max(1), h.max(1)]
-        }
+        };
+        crate::capture::rotated_size(size, self.rotation)
     }
 }
 
@@ -538,10 +540,20 @@ fn render_export_page_pixels<'a>(
         _ => Cow::Borrowed(page.base_pixels.as_ref()),
     };
     if let Some(crop) = page.crop {
-        return Ok(Cow::Owned(crate::export_crop::crop_color_image(
+        let cropped = crate::export_crop::crop_color_image(rendered.as_ref(), crop)?;
+        if page.rotation.is_none() {
+            return Ok(Cow::Owned(cropped));
+        }
+        return Ok(Cow::Owned(crate::capture::rotate_color_image(
+            &cropped,
+            page.rotation,
+        )));
+    }
+    if !page.rotation.is_none() {
+        return Ok(Cow::Owned(crate::capture::rotate_color_image(
             rendered.as_ref(),
-            crop,
-        )?));
+            page.rotation,
+        )));
     }
     Ok(rendered)
 }
@@ -635,6 +647,7 @@ mod tests {
                 base_pixels: Arc::clone(&pixels),
                 conceal_mask: None,
                 crop: None,
+                rotation: crate::rotation_db::Rotation::None,
             }),
             scale: ExportScale::Full,
             entries: vec![
@@ -687,6 +700,7 @@ mod tests {
                 base_pixels: pixels,
                 conceal_mask: Some(mask),
                 crop: None,
+                rotation: crate::rotation_db::Rotation::None,
             }),
             scale: ExportScale::Full,
             entries: vec![ExportEntry {
@@ -740,6 +754,7 @@ mod tests {
                 max_x: 3.0,
                 max_y: 1.0,
             }),
+            rotation: crate::rotation_db::Rotation::None,
         };
 
         let out = render_export_page_pixels(&page, None).unwrap();
@@ -747,6 +762,32 @@ mod tests {
         assert_eq!(out.size, [2, 1]);
         assert_eq!(out.pixels[0], egui::Color32::from_rgb(0, 255, 0));
         assert_eq!(out.pixels[1], egui::Color32::from_rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn render_export_page_pixels_applies_rotation_after_crop() {
+        let px = |v| egui::Color32::from_rgb(v, 0, 0);
+        let pixels = Arc::new(egui::ColorImage::new(
+            [3, 2],
+            vec![px(1), px(2), px(3), px(4), px(5), px(6)],
+        ));
+        let page = ExportPagePixels {
+            base_pixels: pixels,
+            conceal_mask: None,
+            crop: Some(crate::export_crop::CropRect {
+                min_x: 1.0,
+                min_y: 0.0,
+                max_x: 3.0,
+                max_y: 2.0,
+            }),
+            rotation: crate::rotation_db::Rotation::Cw90,
+        };
+
+        let out = render_export_page_pixels(&page, None).unwrap();
+
+        assert_eq!(out.size, [2, 2]);
+        assert_eq!(out.pixels, vec![px(5), px(2), px(6), px(3)]);
+        assert_eq!(page.render_size(), [2, 2]);
     }
 
     #[test]
@@ -763,6 +804,7 @@ mod tests {
                 max_x: 5.0,
                 max_y: 4.0,
             }),
+            rotation: crate::rotation_db::Rotation::None,
         };
         let right = ExportPagePixels {
             base_pixels: Arc::new(egui::ColorImage::new(
@@ -771,6 +813,7 @@ mod tests {
             )),
             conceal_mask: None,
             crop: None,
+            rotation: crate::rotation_db::Rotation::None,
         };
         let pixels = ExportPixels::Spread { left, right };
 
@@ -827,11 +870,13 @@ mod tests {
                     base_pixels: left,
                     conceal_mask: None,
                     crop: None,
+                    rotation: crate::rotation_db::Rotation::None,
                 },
                 right: ExportPagePixels {
                     base_pixels: right,
                     conceal_mask: None,
                     crop: None,
+                    rotation: crate::rotation_db::Rotation::None,
                 },
             },
             scale: ExportScale::Half,
@@ -882,11 +927,13 @@ mod tests {
                     base_pixels: left,
                     conceal_mask: Some(Arc::new(vec![true])),
                     crop: None,
+                    rotation: crate::rotation_db::Rotation::None,
                 },
                 right: ExportPagePixels {
                     base_pixels: right,
                     conceal_mask: None,
                     crop: None,
+                    rotation: crate::rotation_db::Rotation::None,
                 },
             },
             scale: ExportScale::Full,

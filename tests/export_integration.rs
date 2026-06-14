@@ -21,6 +21,7 @@ fn single_pixels(base_pixels: Arc<egui::ColorImage>) -> ExportPixels {
         base_pixels,
         conceal_mask: None,
         crop: None,
+        rotation: mimageviewer::rotation_db::Rotation::None,
     })
 }
 

@@ -81,6 +81,7 @@ pub struct CapturePixelJob {
     pub params: crate::adjustment::AdjustParams,
     pub conceal: Option<CaptureConceal>,
     pub crop: Option<crate::export_crop::CropRect>,
+    pub rotation: crate::rotation_db::Rotation,
 }
 
 pub enum CapturePixelWork {
@@ -101,6 +102,7 @@ impl CapturePixelJob {
             params: crate::adjustment::AdjustParams::default(),
             conceal: None,
             crop: None,
+            rotation: crate::rotation_db::Rotation::None,
         }
     }
 
@@ -116,6 +118,7 @@ impl CapturePixelJob {
             params,
             conceal: None,
             crop: None,
+            rotation: crate::rotation_db::Rotation::None,
         }
     }
 
@@ -130,6 +133,11 @@ impl CapturePixelJob {
 
     pub fn with_crop(mut self, crop: crate::export_crop::CropRect) -> Self {
         self.crop = Some(crop);
+        self
+    }
+
+    pub fn with_rotation(mut self, rotation: crate::rotation_db::Rotation) -> Self {
+        self.rotation = rotation;
         self
     }
 }
@@ -360,9 +368,63 @@ pub fn run_pixel_job(job: CapturePixelJob) -> Result<(String, u32, u32, Vec<u8>)
     if let Some(crop) = job.crop {
         image = crate::export_crop::crop_color_image(&image, crop)?;
     }
+    if !job.rotation.is_none() {
+        image = rotate_color_image(&image, job.rotation);
+    }
     let width = image.size[0] as u32;
     let height = image.size[1] as u32;
     Ok((job.basename, width, height, color_image_to_rgba(&image)))
+}
+
+pub fn rotated_size(size: [usize; 2], rotation: crate::rotation_db::Rotation) -> [usize; 2] {
+    match rotation {
+        crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
+            [size[1], size[0]]
+        }
+        crate::rotation_db::Rotation::None | crate::rotation_db::Rotation::Cw180 => size,
+    }
+}
+
+pub fn rotate_dynamic_image(
+    image: image::DynamicImage,
+    rotation: crate::rotation_db::Rotation,
+) -> image::DynamicImage {
+    match rotation {
+        crate::rotation_db::Rotation::None => image,
+        crate::rotation_db::Rotation::Cw90 => image.rotate90(),
+        crate::rotation_db::Rotation::Cw180 => image.rotate180(),
+        crate::rotation_db::Rotation::Cw270 => image.rotate270(),
+    }
+}
+
+pub fn rotate_color_image(
+    image: &egui::ColorImage,
+    rotation: crate::rotation_db::Rotation,
+) -> egui::ColorImage {
+    let [w, h] = image.size;
+    if rotation.is_none() || w == 0 || h == 0 {
+        return image.clone();
+    }
+    if image.pixels.len() != w.saturating_mul(h) {
+        return image.clone();
+    }
+
+    let out_size = rotated_size(image.size, rotation);
+    let mut out = vec![egui::Color32::TRANSPARENT; image.pixels.len()];
+    let out_w = out_size[0];
+    for y in 0..h {
+        for x in 0..w {
+            let src = y * w + x;
+            let (dx, dy) = match rotation {
+                crate::rotation_db::Rotation::None => (x, y),
+                crate::rotation_db::Rotation::Cw90 => (h - 1 - y, x),
+                crate::rotation_db::Rotation::Cw180 => (w - 1 - x, h - 1 - y),
+                crate::rotation_db::Rotation::Cw270 => (y, w - 1 - x),
+            };
+            out[dy * out_w + dx] = image.pixels[src];
+        }
+    }
+    egui::ColorImage::new(out_size, out)
 }
 
 pub fn run_pixel_work(work: CapturePixelWork) -> Result<(String, u32, u32, Vec<u8>), String> {
@@ -791,6 +853,59 @@ mod tests {
         assert_eq!((width, height), (2, 1));
         assert_eq!(&rgba[0..4], &[0, 255, 0, 255]);
         assert_eq!(&rgba[4..8], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn rotate_color_image_matches_display_rotation() {
+        use crate::rotation_db::Rotation;
+
+        let px = |v| egui::Color32::from_rgb(v, 0, 0);
+        let src = egui::ColorImage::new([2, 3], vec![px(1), px(2), px(3), px(4), px(5), px(6)]);
+
+        let cw90 = rotate_color_image(&src, Rotation::Cw90);
+        assert_eq!(cw90.size, [3, 2]);
+        assert_eq!(cw90.pixels, vec![px(5), px(3), px(1), px(6), px(4), px(2)]);
+
+        let cw180 = rotate_color_image(&src, Rotation::Cw180);
+        assert_eq!(cw180.size, [2, 3]);
+        assert_eq!(cw180.pixels, vec![px(6), px(5), px(4), px(3), px(2), px(1)]);
+
+        let cw270 = rotate_color_image(&src, Rotation::Cw270);
+        assert_eq!(cw270.size, [3, 2]);
+        assert_eq!(cw270.pixels, vec![px(2), px(4), px(6), px(1), px(3), px(5)]);
+    }
+
+    #[test]
+    fn run_pixel_job_applies_rotation_after_crop() {
+        use crate::rotation_db::Rotation;
+
+        let src = egui::ColorImage::new(
+            [3, 2],
+            vec![
+                egui::Color32::from_rgb(1, 0, 0),
+                egui::Color32::from_rgb(2, 0, 0),
+                egui::Color32::from_rgb(3, 0, 0),
+                egui::Color32::from_rgb(4, 0, 0),
+                egui::Color32::from_rgb(5, 0, 0),
+                egui::Color32::from_rgb(6, 0, 0),
+            ],
+        );
+        let job = CapturePixelJob::already_adjusted("sample".to_string(), Arc::new(src))
+            .with_crop(crate::export_crop::CropRect {
+                min_x: 1.0,
+                min_y: 0.0,
+                max_x: 3.0,
+                max_y: 2.0,
+            })
+            .with_rotation(Rotation::Cw90);
+
+        let (_basename, width, height, rgba) = run_pixel_job(job).unwrap();
+
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(&rgba[0..4], &[5, 0, 0, 255]);
+        assert_eq!(&rgba[4..8], &[2, 0, 0, 255]);
+        assert_eq!(&rgba[8..12], &[6, 0, 0, 255]);
+        assert_eq!(&rgba[12..16], &[3, 0, 0, 255]);
     }
 
     #[test]
