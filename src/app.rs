@@ -1033,6 +1033,7 @@ impl DetailsLazyMeta {
 
 struct DetailsMetaPending {
     visible_revision: u64,
+    target_keys: HashSet<String>,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<DetailsMetaEvent>,
 }
@@ -6377,8 +6378,8 @@ impl App {
     }
 
     /// アイテムの UI 表示用フルパス。変換キャッシュ閲覧中 (`archive_source_override`)
-    /// は ZIP 内アイテムのコンテナ部分をユーザー視点の元アーカイブパスへ置き換える
-    /// (選択情報ツールチップ等に archive_cache の実体パスを漏らさない、実機フィードバック)。
+    /// は ZIP 内アイテムのコンテナ部分をユーザー視点の元アーカイブパスへ置き換える。
+    #[cfg(test)]
     pub(crate) fn user_facing_display_path(&self, item: &GridItem) -> String {
         if let (Some(src), Some(cur)) = (
             self.archive_source_override.as_ref(),
@@ -18782,6 +18783,39 @@ impl App {
             return;
         }
 
+        if matches!(self.details_image_dims_state, LazyColumnState::Disabled) {
+            self.details_image_dims_state = LazyColumnState::NotRequested;
+        }
+
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail {
+            let target_key = self.thumbnail_tooltip_lazy_target_key();
+            let pending_is_stale = self.details_meta_pending.as_ref().is_some_and(|pending| {
+                target_key
+                    .as_ref()
+                    .map(|key| !pending.target_keys.contains(key))
+                    .unwrap_or(true)
+            });
+            if pending_is_stale {
+                if let Some(pending) = self.details_meta_pending.take() {
+                    pending.cancel.store(true, Ordering::Relaxed);
+                }
+                self.details_lazy_visible_revision =
+                    self.details_lazy_visible_revision.wrapping_add(1);
+                self.details_image_dims_state = LazyColumnState::NotRequested;
+                ctx.request_repaint();
+            } else if self.details_meta_pending.is_none()
+                && self.thumbnail_tooltip_needs_lazy_meta_request()
+                && !matches!(
+                    self.details_image_dims_state,
+                    LazyColumnState::NotRequested | LazyColumnState::Loading { .. }
+                )
+            {
+                self.details_lazy_visible_revision =
+                    self.details_lazy_visible_revision.wrapping_add(1);
+                self.details_image_dims_state = LazyColumnState::NotRequested;
+            }
+        }
+
         let mut disconnected = false;
         loop {
             let event = match self.details_meta_pending.as_ref() {
@@ -18826,14 +18860,16 @@ impl App {
                     if revision_matches {
                         self.details_image_dims_state = LazyColumnState::Ready { failed };
                         self.prune_details_lazy_meta_cache();
-                        if matches!(
-                            self.settings.details_sort_key,
-                            crate::settings::DetailsSortKey::ImageDimensions
-                                | crate::settings::DetailsSortKey::Created
-                                | crate::settings::DetailsSortKey::VideoDuration
-                                | crate::settings::DetailsSortKey::VideoDimensions
-                                | crate::settings::DetailsSortKey::VideoCodec
-                        ) {
+                        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+                            && matches!(
+                                self.settings.details_sort_key,
+                                crate::settings::DetailsSortKey::ImageDimensions
+                                    | crate::settings::DetailsSortKey::Created
+                                    | crate::settings::DetailsSortKey::VideoDuration
+                                    | crate::settings::DetailsSortKey::VideoDimensions
+                                    | crate::settings::DetailsSortKey::VideoCodec
+                            )
+                        {
                             self.rebuild_details_order();
                         }
                     } else {
@@ -18876,10 +18912,15 @@ impl App {
     }
 
     pub(crate) fn details_lazy_columns_visible(&self) -> bool {
-        self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-            && self.details_any_lazy_columns_enabled()
-            && !self.items_are_drive_list
-            && !self.items.is_empty()
+        if self.items_are_drive_list || self.items.is_empty() {
+            return false;
+        }
+        match self.settings.grid_view_mode {
+            crate::settings::GridViewMode::Details => self.details_any_lazy_columns_enabled(),
+            crate::settings::GridViewMode::Thumbnail => {
+                self.thumbnail_tooltip_lazy_target_idx().is_some()
+            }
+        }
     }
 
     fn details_any_lazy_columns_enabled(&self) -> bool {
@@ -18888,6 +18929,68 @@ impl App {
             || self.settings.details_show_video_duration
             || self.settings.details_show_video_dimensions
             || self.settings.details_show_video_codec
+    }
+
+    fn thumbnail_tooltip_lazy_target_idx(&self) -> Option<usize> {
+        if self.settings.grid_view_mode != crate::settings::GridViewMode::Thumbnail
+            || self.items_are_drive_list
+            || self.items.is_empty()
+        {
+            return None;
+        }
+        let idx = self.selected?;
+        if idx >= self.items.len() || !self.details_item_requires_lazy_meta(idx) {
+            return None;
+        }
+        Some(idx)
+    }
+
+    fn thumbnail_tooltip_lazy_target_key(&self) -> Option<String> {
+        let idx = self.thumbnail_tooltip_lazy_target_idx()?;
+        self.metadata_cache_key(idx)
+    }
+
+    fn thumbnail_tooltip_needs_lazy_meta_request(&self) -> bool {
+        let Some(idx) = self.thumbnail_tooltip_lazy_target_idx() else {
+            return false;
+        };
+        self.details_lazy_meta_for_idx(idx)
+            .map(|meta| !self.details_lazy_meta_satisfies_idx(idx, meta))
+            .unwrap_or(true)
+    }
+
+    fn lazy_load_created_for_idx(&self, idx: usize) -> bool {
+        let requested = match self.settings.grid_view_mode {
+            crate::settings::GridViewMode::Details => self.settings.details_show_created,
+            crate::settings::GridViewMode::Thumbnail => self.settings.thumb_tooltip_show_created,
+        };
+        requested && self.details_item_supports_created_at(idx)
+    }
+
+    fn lazy_load_image_dims_for_idx(&self, idx: usize) -> bool {
+        let requested = match self.settings.grid_view_mode {
+            crate::settings::GridViewMode::Details => self.settings.details_show_image_dimensions,
+            crate::settings::GridViewMode::Thumbnail => {
+                self.settings.thumb_tooltip_show_image_dimensions
+            }
+        };
+        requested && self.details_item_supports_image_dims(idx)
+    }
+
+    fn lazy_load_video_meta_for_idx(&self, idx: usize) -> bool {
+        let requested = match self.settings.grid_view_mode {
+            crate::settings::GridViewMode::Details => {
+                self.settings.details_show_video_duration
+                    || self.settings.details_show_video_dimensions
+                    || self.settings.details_show_video_codec
+            }
+            crate::settings::GridViewMode::Thumbnail => {
+                self.settings.thumb_tooltip_show_video_duration
+                    || self.settings.thumb_tooltip_show_video_dimensions
+                    || self.settings.thumb_tooltip_show_video_codec
+            }
+        };
+        requested && matches!(self.items.get(idx), Some(GridItem::Video(_)))
     }
 
     pub(crate) fn details_image_dims_sort_ready(&self) -> bool {
@@ -19056,9 +19159,20 @@ impl App {
         }
 
         let generation = self.items_generation;
-        let visible_near: std::collections::HashSet<usize> =
-            self.details_tag_prewarm_indices.iter().copied().collect();
-        let order = self.current_grid_order().to_vec();
+        let (order, visible_near): (Vec<usize>, HashSet<usize>) =
+            if self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail {
+                let order: Vec<usize> = self
+                    .thumbnail_tooltip_lazy_target_idx()
+                    .into_iter()
+                    .collect();
+                let visible_near = order.iter().copied().collect();
+                (order, visible_near)
+            } else {
+                (
+                    self.current_grid_order().to_vec(),
+                    self.details_tag_prewarm_indices.iter().copied().collect(),
+                )
+            };
         let mut visible_targets = Vec::new();
         let mut background_targets = Vec::new();
         let mut cached_done = 0usize;
@@ -19095,14 +19209,16 @@ impl App {
             self.details_image_dims_state = LazyColumnState::Ready {
                 failed: cached_failed,
             };
-            if matches!(
-                self.settings.details_sort_key,
-                crate::settings::DetailsSortKey::ImageDimensions
-                    | crate::settings::DetailsSortKey::Created
-                    | crate::settings::DetailsSortKey::VideoDuration
-                    | crate::settings::DetailsSortKey::VideoDimensions
-                    | crate::settings::DetailsSortKey::VideoCodec
-            ) {
+            if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+                && matches!(
+                    self.settings.details_sort_key,
+                    crate::settings::DetailsSortKey::ImageDimensions
+                        | crate::settings::DetailsSortKey::Created
+                        | crate::settings::DetailsSortKey::VideoDuration
+                        | crate::settings::DetailsSortKey::VideoDimensions
+                        | crate::settings::DetailsSortKey::VideoCodec
+                )
+            {
                 self.rebuild_details_order();
             }
             return;
@@ -19125,6 +19241,12 @@ impl App {
                     self.settings.indexer_speed_profile.io_permits().max(1),
                 ))
             });
+        let target_keys =
+            if self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail {
+                targets.iter().map(|target| target.key.clone()).collect()
+            } else {
+                HashSet::new()
+            };
 
         std::thread::Builder::new()
             .name("details-meta-load".to_string())
@@ -19145,6 +19267,7 @@ impl App {
 
         self.details_meta_pending = Some(DetailsMetaPending {
             visible_revision: self.details_lazy_visible_revision,
+            target_keys,
             cancel,
             rx,
         });
@@ -19175,24 +19298,19 @@ impl App {
     }
 
     fn details_lazy_meta_satisfies_idx(&self, idx: usize, meta: &DetailsLazyMeta) -> bool {
-        if self.settings.details_show_created
-            && self.details_item_supports_created_at(idx)
+        if self.lazy_load_created_for_idx(idx)
             && meta.created_at.is_none()
             && !meta.created_at_failed
         {
             return false;
         }
-        if self.settings.details_show_image_dimensions
-            && self.details_item_supports_image_dims(idx)
+        if self.lazy_load_image_dims_for_idx(idx)
             && meta.image_dims.is_none()
             && !meta.image_dims_failed
         {
             return false;
         }
-        if (self.settings.details_show_video_duration
-            || self.settings.details_show_video_dimensions
-            || self.settings.details_show_video_codec)
-            && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+        if self.lazy_load_video_meta_for_idx(idx)
             && meta.video_duration_secs.is_none()
             && meta.video_dims.is_none()
             && meta.video_codec.is_none()
@@ -19220,13 +19338,9 @@ impl App {
     }
 
     fn details_item_requires_lazy_meta(&self, idx: usize) -> bool {
-        (self.settings.details_show_created && self.details_item_supports_created_at(idx))
-            || (self.settings.details_show_image_dimensions
-                && self.details_item_supports_image_dims(idx))
-            || ((self.settings.details_show_video_duration
-                || self.settings.details_show_video_dimensions
-                || self.settings.details_show_video_codec)
-                && matches!(self.items.get(idx), Some(GridItem::Video(_))))
+        self.lazy_load_created_for_idx(idx)
+            || self.lazy_load_image_dims_for_idx(idx)
+            || self.lazy_load_video_meta_for_idx(idx)
     }
 
     fn details_meta_target_for_idx(
@@ -19248,14 +19362,9 @@ impl App {
         } else {
             crate::io_semaphore::IoPriority::Low
         };
-        let load_image_dims = self.settings.details_show_image_dimensions
-            && self.details_item_supports_image_dims(idx);
-        let load_video_meta = (self.settings.details_show_video_duration
-            || self.settings.details_show_video_dimensions
-            || self.settings.details_show_video_codec)
-            && matches!(self.items.get(idx), Some(GridItem::Video(_)));
-        let load_created_at =
-            self.settings.details_show_created && self.details_item_supports_created_at(idx);
+        let load_image_dims = self.lazy_load_image_dims_for_idx(idx);
+        let load_video_meta = self.lazy_load_video_meta_for_idx(idx);
+        let load_created_at = self.lazy_load_created_for_idx(idx);
         Some(DetailsMetaTarget {
             key,
             item,
@@ -32499,6 +32608,10 @@ impl eframe::App for App {
         let t_pre_grid = frame_t0.elapsed();
         let grid_nav = self.render_grid(ctx);
         let t_grid = frame_t0.elapsed();
+
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail {
+            self.poll_details_meta_load(ctx);
+        }
 
         // 可視外 keep_range のサムネ補正を背後で逐次適用する。
         // 1 フレーム 8 枚: 600px で ~3ms/枚 = 最大 24ms (半フレーム分の UI 予算)。

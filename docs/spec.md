@@ -127,6 +127,7 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 - 設定で指定した **列数** の可変グリッド（行数は画面に応じて自動）
 - 各セルはアスペクト比を維持してサムネイルを表示（余白はセル背景色で埋める）
 - セルサイズ = ウィンドウの残余領域 ÷ 列数
+- 選択中セルの下にはサムネイル情報ツールチップを表示する。既定はファイル名と画像解像度、動画ではファイル名と動画長さ。表示内容は環境設定 → サムネイルで、種類 / サイズ / 更新日時 / 作成日時 / 動画解像度 / 動画コーデック / 場所を含めて切り替えられる。ツールチップ幅はセル幅固定ではなく最大約 2.5 セル分を使い、画面右端ではセル右端に合わせて画面内に収める。動画長さなど未取得の値は選択中の 1 件だけバックグラウンドで遅延取得する
 - **仮想スクロール実装**（下記詳細参照）
 
 ---
@@ -771,6 +772,16 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `facet_filter` | FacetFilter | default | スマートフィルタ条件。種類・拡張子・タグ・日付・サイズ・状態など。絞り込み中に ZIP/PDF/フォルダなどのコンテナへ入ると親階層の条件を一時退避し、内側では別条件を設定できる。Backspace などで親階層へ戻ると退避した条件を復元する |
 | `thumb_aspect` | ThumbAspect | Square | サムネイル縦横比（16:9 / 3:2 / 4:3 / 1:1 / 3:4 / 2:3 / 9:16）。`thumb_aspect_auto = false` のときに使われる。Auto モード時もこの値は手動値として保持され、Manual に戻すと復活する。 |
 | `thumb_aspect_auto` | bool | false | サムネイル比率の自動選択モード。`true` のときフォルダ内画像の比率に応じてグリッドセル比率を自動で切り替える。フォルダごとの前回確定値は `auto_aspect_cache.db` に保存され、再訪時の初期比率に使われる。キャッシュ復元時は保存時の sample 数と同等以上の実測 sample が集まるまで、途中統計による上書きを抑制する。キャッシュ管理ダイアログの現在フォルダ削除 / 全削除 / 古いキャッシュ削除で、この判定結果も対応する範囲だけ削除される (詳細: [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md))。 |
+| `thumb_tooltip_show_filename` | bool | true | サムネイル情報ツールチップにファイル名を表示するか |
+| `thumb_tooltip_show_image_dimensions` | bool | true | サムネイル情報ツールチップに画像解像度を表示するか。サムネイルから取得できない場合は選択中の 1 件だけバックグラウンド取得する |
+| `thumb_tooltip_show_video_duration` | bool | true | サムネイル情報ツールチップに動画長さを表示するか。動画選択時だけバックグラウンド取得する |
+| `thumb_tooltip_show_kind` | bool | false | サムネイル情報ツールチップに種類を表示するか |
+| `thumb_tooltip_show_file_size` | bool | false | サムネイル情報ツールチップにファイルサイズを表示するか |
+| `thumb_tooltip_show_modified` | bool | false | サムネイル情報ツールチップに更新日時を表示するか |
+| `thumb_tooltip_show_created` | bool | false | サムネイル情報ツールチップに作成日時を表示するか。選択中の 1 件だけバックグラウンド取得する |
+| `thumb_tooltip_show_video_dimensions` | bool | false | サムネイル情報ツールチップに動画解像度を表示するか。動画長さと同じ遅延メタデータを使う |
+| `thumb_tooltip_show_video_codec` | bool | false | サムネイル情報ツールチップに動画コーデックを表示するか。動画長さと同じ遅延メタデータを使う |
+| `thumb_tooltip_show_location` | bool | false | サムネイル情報ツールチップに親フォルダ / コンテナ名を表示するか。フルパスではなく短い場所名を表示する |
 | `sort_order` | SortOrder | FileName | ソート順（FileName / Natural / MtimeAsc / MtimeDesc） |
 | `favorites` | Vec\<FavoriteEntry\> | [] | お気に入りフォルダ (`id: Uuid` + name + path + `auto_index_structure` / `auto_index_metadata` / `auto_index_thumbs` の 3 フラグ, v0.8.0〜) |
 | `last_folder` | Option\<PathBuf\> | None | 前回終了した場所。実フォルダの場合はそのパス、ドライブ一覧の場合は空パス sentinel を保存する。起動時の場所が「前回終了した場所」のときに使用する。実フォルダの末端だけ消えている場合は直近の存在する親フォルダへ遡って開く |

@@ -295,14 +295,32 @@ fn refresh_send_to_status(state: &mut PreferencesState) {
 }
 
 pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let s = &mut state.settings;
     ui.checkbox(
-        &mut state.settings.thumb_idle_upgrade,
+        &mut s.thumb_idle_upgrade,
         "アイドル時にキャッシュ由来のサムネイルを高画質化する",
     );
     ui.label(
         "  スクロール停止後、キャッシュ復元 (WebP q=75) のサムネイルを\n  \
          元画像から再デコードして差し替えます。visible 側から順次処理。",
     );
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("サムネイル情報ツールチップ").strong());
+    ui.label(
+        "サムネイル表示で選択中セルの下に表示する内容です。動画長さなどは必要なときにバックグラウンドで読み込みます。",
+    );
+    ui.add_space(4.0);
+    ui.checkbox(&mut s.thumb_tooltip_show_filename, "ファイル名");
+    ui.checkbox(&mut s.thumb_tooltip_show_image_dimensions, "画像解像度");
+    ui.checkbox(&mut s.thumb_tooltip_show_video_duration, "動画長さ");
+    ui.checkbox(&mut s.thumb_tooltip_show_kind, "種類");
+    ui.checkbox(&mut s.thumb_tooltip_show_file_size, "サイズ");
+    ui.checkbox(&mut s.thumb_tooltip_show_modified, "更新日時");
+    ui.checkbox(&mut s.thumb_tooltip_show_created, "作成日時");
+    ui.checkbox(&mut s.thumb_tooltip_show_video_dimensions, "動画解像度");
+    ui.checkbox(&mut s.thumb_tooltip_show_video_codec, "動画コーデック");
+    ui.checkbox(&mut s.thumb_tooltip_show_location, "場所");
 }
 
 pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {

@@ -959,6 +959,60 @@ fn details_ext_kind(path: &Path, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+fn short_path_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+}
+
+fn zip_entry_parent_name(entry_name: &str) -> Option<&str> {
+    let trimmed = entry_name.trim_matches('/');
+    let (parent, _) = trimmed.rsplit_once('/')?;
+    parent.rsplit('/').find(|segment| !segment.is_empty())
+}
+
+fn selection_info_location_label(item: &GridItem) -> Option<String> {
+    match item {
+        GridItem::Folder(path)
+        | GridItem::Image(path)
+        | GridItem::Video(path)
+        | GridItem::ZipFile(path)
+        | GridItem::PdfFile(path)
+        | GridItem::SearchContainer { path, .. }
+        | GridItem::ConvertibleArchive { path, .. } => {
+            short_path_name(path.parent()?).map(|name| format!("場所 {name}"))
+        }
+        GridItem::ZipImage {
+            zip_path,
+            entry_name,
+        } => {
+            let mut label = short_path_name(zip_path)?;
+            if let Some(parent) = zip_entry_parent_name(entry_name) {
+                label.push_str(" > ");
+                label.push_str(parent);
+            }
+            Some(format!("場所 {label}"))
+        }
+        GridItem::ZipDir {
+            zip_path,
+            dir_prefix,
+            ..
+        } => {
+            let mut label = short_path_name(zip_path)?;
+            if let Some(parent) = zip_entry_parent_name(dir_prefix) {
+                label.push_str(" > ");
+                label.push_str(parent);
+            }
+            Some(format!("場所 {label}"))
+        }
+        GridItem::PdfPage { pdf_path, .. } => {
+            short_path_name(pdf_path).map(|name| format!("場所 {name}"))
+        }
+        GridItem::ZipSeparator { .. } => None,
+    }
+}
+
 #[cfg(windows)]
 fn format_details_mtime(secs: i64, show_seconds: bool) -> String {
     if secs <= 0 {
@@ -5357,32 +5411,148 @@ impl App {
         ) {
             return;
         }
-
-        // フルパスを表示する (ファイル名だけだとセル幅の表示と大差なく、置き場所が
-        // 分かりにくいため)。長いパスは下の折り返し表示で複数行に展開する。
-        // 変換キャッシュ閲覧中はユーザー視点の元アーカイブパスに置き換える
-        // (archive_cache の実体パスを漏らさない)。
-        let path = self
-            .items
-            .get(idx)
-            .map(|it| self.user_facing_display_path(it))
-            .unwrap_or_default();
-        // 元画像のピクセル寸法 (ThumbnailState::Loaded.source_dims から取得)
-        let dims_str = match self.thumbnails.get(idx) {
-            Some(ThumbnailState::Loaded {
-                source_dims: Some((w, h)),
-                ..
-            }) => Some(format!("{} × {}", w, h)),
-            _ => None,
-        };
-        let text = match dims_str {
-            Some(d) => format!("{}   {}", d, path),
-            None => path,
+        let Some(item) = self.items.get(idx) else {
+            return;
         };
 
-        // セル幅で配置: セルの左下を基点、セル幅に合わせる
-        let cell_w = cell_rect.width();
-        let area_pos = cell_rect.left_bottom() + egui::vec2(0.0, 4.0);
+        let mut lines = Vec::new();
+        if self.settings.thumb_tooltip_show_filename {
+            let name = item.name().into_owned();
+            if !name.is_empty() {
+                lines.push(name);
+            }
+        }
+
+        let mut fields = Vec::new();
+        if self.settings.thumb_tooltip_show_kind {
+            fields.push(format!("種類 {}", details_kind_label(item)));
+        }
+        if self.settings.thumb_tooltip_show_file_size {
+            let size = self
+                .image_metas
+                .get(idx)
+                .copied()
+                .flatten()
+                .map(|(_, size)| size)
+                .unwrap_or(0);
+            let text = if size > 0 {
+                crate::ui_helpers::format_details_size(
+                    size as u64,
+                    self.settings.details_size_display_mode,
+                )
+            } else {
+                "-".to_string()
+            };
+            fields.push(format!("サイズ {text}"));
+        }
+        if self.settings.thumb_tooltip_show_modified {
+            let text = self
+                .image_metas
+                .get(idx)
+                .copied()
+                .flatten()
+                .map(|(mtime, _)| {
+                    format_details_mtime(mtime, self.settings.details_timestamp_show_seconds)
+                })
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| "-".to_string());
+            fields.push(format!("更新 {text}"));
+        }
+        if self.settings.thumb_tooltip_show_image_dimensions
+            && matches!(
+                item,
+                GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
+            )
+        {
+            let text = match self.thumbnails.get(idx) {
+                Some(ThumbnailState::Loaded {
+                    source_dims: Some((w, h)),
+                    ..
+                }) => format!("{w} × {h}"),
+                _ => {
+                    let lazy = self.details_image_dims_text(idx);
+                    if lazy.is_empty() {
+                        "...".to_string()
+                    } else {
+                        lazy.replace('x', " × ")
+                    }
+                }
+            };
+            fields.push(format!("画像 {text}"));
+        }
+        if self.settings.thumb_tooltip_show_video_duration && matches!(item, GridItem::Video(_)) {
+            let duration_text = self.details_video_duration_text(idx);
+            let display = if duration_text.is_empty() {
+                "..."
+            } else {
+                duration_text.as_str()
+            };
+            fields.push(format!("長さ {display}"));
+        }
+        if self.settings.thumb_tooltip_show_video_dimensions && matches!(item, GridItem::Video(_)) {
+            let text = self.details_video_dims_text(idx);
+            let text = if text.is_empty() {
+                "...".to_string()
+            } else {
+                text.replace('x', " × ")
+            };
+            fields.push(format!("動画 {text}"));
+        }
+        if self.settings.thumb_tooltip_show_video_codec && matches!(item, GridItem::Video(_)) {
+            let codec_text = self.details_video_codec_text(idx);
+            let display = if codec_text.is_empty() {
+                "..."
+            } else {
+                codec_text.as_str()
+            };
+            fields.push(format!("コーデック {display}"));
+        }
+        if self.settings.thumb_tooltip_show_created {
+            let created_text = self.details_created_text(idx);
+            let display = if created_text.is_empty() {
+                "..."
+            } else {
+                created_text.as_str()
+            };
+            fields.push(format!("作成 {display}"));
+        }
+        if self.settings.thumb_tooltip_show_location {
+            if let Some(location) = selection_info_location_label(item) {
+                fields.push(location);
+            }
+        }
+
+        if !fields.is_empty() {
+            lines.push(fields.join("   "));
+        }
+        if lines.is_empty() {
+            return;
+        }
+        let text = lines.join("\n");
+
+        let viewport = ctx.content_rect();
+        let popup_w = (cell_rect.width() * 2.5)
+            .clamp(180.0, 520.0)
+            .min((viewport.width() - 16.0).max(80.0));
+        let min_x = viewport.left() + 8.0;
+        let max_x = viewport.right() - 8.0 - popup_w;
+        let mut x = cell_rect.left();
+        if x + popup_w > viewport.right() - 8.0 {
+            x = cell_rect.right() - popup_w;
+        }
+        x = if max_x >= min_x {
+            x.clamp(min_x, max_x)
+        } else {
+            min_x
+        };
+
+        let row_count = text.lines().count().clamp(1, 3) as f32;
+        let estimated_h = 18.0 * row_count + 18.0;
+        let mut y = cell_rect.bottom() + 4.0;
+        if y + estimated_h > viewport.bottom() - 8.0 {
+            y = (cell_rect.top() - estimated_h - 4.0).max(viewport.top() + 8.0);
+        }
+        let area_pos = egui::pos2(x, y);
 
         egui::Area::new("selection_info".into())
             .order(egui::Order::Middle)
@@ -5422,13 +5592,11 @@ impl App {
                     .stroke(stroke)
                     .shadow(shadow)
                     .show(ui, |ui| {
-                        let inner_width = (cell_w - 12.0).max(40.0);
+                        let inner_width = (popup_w - 12.0).max(40.0);
                         ui.set_min_width(inner_width);
                         ui.set_max_width(inner_width);
-                        // フルパスをセル幅で折り返し、最大 3 行まで表示する。
-                        // パスは空白の無い長い連結文字列なので break_anywhere で
-                        // セグメント途中でも改行させる。3 行を超える分は末尾を
-                        // overflow_character (…) で省略する。
+                        // ファイル名や仮想コンテナ名は空白なしで長くなりやすい。
+                        // 幅を広げた上で最大 3 行に収め、超過分は末尾省略にする。
                         let mut job = egui::text::LayoutJob::single_section(
                             text,
                             egui::TextFormat {

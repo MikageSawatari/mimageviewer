@@ -1497,6 +1497,36 @@ pub struct Settings {
     /// `On` : スクロール停止 + 他の要求が全て完了した後、visible 範囲から順次再デコード
     #[serde(default = "default_true")]
     pub thumb_idle_upgrade: bool,
+    /// サムネイル選択情報ツールチップにファイル名を表示する。
+    #[serde(default = "default_true")]
+    pub thumb_tooltip_show_filename: bool,
+    /// サムネイル選択情報ツールチップに画像解像度を表示する。
+    #[serde(default = "default_true")]
+    pub thumb_tooltip_show_image_dimensions: bool,
+    /// サムネイル選択情報ツールチップに動画長さを表示する。
+    #[serde(default = "default_true")]
+    pub thumb_tooltip_show_video_duration: bool,
+    /// サムネイル選択情報ツールチップに種類を表示する。
+    #[serde(default)]
+    pub thumb_tooltip_show_kind: bool,
+    /// サムネイル選択情報ツールチップにファイルサイズを表示する。
+    #[serde(default)]
+    pub thumb_tooltip_show_file_size: bool,
+    /// サムネイル選択情報ツールチップに更新日時を表示する。
+    #[serde(default)]
+    pub thumb_tooltip_show_modified: bool,
+    /// サムネイル選択情報ツールチップに作成日時を表示する。
+    #[serde(default)]
+    pub thumb_tooltip_show_created: bool,
+    /// サムネイル選択情報ツールチップに動画解像度を表示する。
+    #[serde(default)]
+    pub thumb_tooltip_show_video_dimensions: bool,
+    /// サムネイル選択情報ツールチップに動画コーデックを表示する。
+    #[serde(default)]
+    pub thumb_tooltip_show_video_codec: bool,
+    /// サムネイル選択情報ツールチップに親フォルダ / コンテナ名を表示する。
+    #[serde(default)]
+    pub thumb_tooltip_show_location: bool,
 
     // ── タグ機能 (docs/tag-feature.md) ──────────────────────────
     /// ユーザ定義のタグ一覧 (メニュー / ツールバー に表示される順)。
@@ -2836,6 +2866,16 @@ impl Default for Settings {
             thumb_next_pages: default_thumb_next_pages(),
             thumb_vram_cap_percent: default_thumb_vram_cap_percent(),
             thumb_idle_upgrade: true,
+            thumb_tooltip_show_filename: true,
+            thumb_tooltip_show_image_dimensions: true,
+            thumb_tooltip_show_video_duration: true,
+            thumb_tooltip_show_kind: false,
+            thumb_tooltip_show_file_size: false,
+            thumb_tooltip_show_modified: false,
+            thumb_tooltip_show_created: false,
+            thumb_tooltip_show_video_dimensions: false,
+            thumb_tooltip_show_video_codec: false,
+            thumb_tooltip_show_location: false,
             exif_hidden_tags: default_exif_hidden_tags(),
             skip_zip_if_folder_exists: true,
             skip_image_if_video_exists: true,
@@ -5935,6 +5975,16 @@ mod tests {
             s.facet_filter.edits.insert(FacetEditFlag::Tagged);
             s.thumb_aspect_auto = true;
             s.thumb_aspect = ThumbAspect::Portrait2x3;
+            s.thumb_tooltip_show_filename = false;
+            s.thumb_tooltip_show_image_dimensions = false;
+            s.thumb_tooltip_show_video_duration = false;
+            s.thumb_tooltip_show_kind = true;
+            s.thumb_tooltip_show_file_size = true;
+            s.thumb_tooltip_show_modified = true;
+            s.thumb_tooltip_show_created = true;
+            s.thumb_tooltip_show_video_dimensions = true;
+            s.thumb_tooltip_show_video_codec = true;
+            s.thumb_tooltip_show_location = true;
             s.toolbar_cols_details_visible = false;
             s.toolbar_aspect_auto_visible = false;
             s.toolbar_cols_display = ToolbarSectionDisplay::Dropdown;
@@ -6104,6 +6154,46 @@ mod tests {
                 loaded.thumb_aspect,
                 ThumbAspect::Portrait2x3,
                 "manual thumb_aspect should also be preserved"
+            );
+            assert!(
+                !loaded.thumb_tooltip_show_filename,
+                "thumb tooltip filename flag should survive roundtrip"
+            );
+            assert!(
+                !loaded.thumb_tooltip_show_image_dimensions,
+                "thumb tooltip image dimensions flag should survive roundtrip"
+            );
+            assert!(
+                !loaded.thumb_tooltip_show_video_duration,
+                "thumb tooltip video duration flag should survive roundtrip"
+            );
+            assert!(
+                loaded.thumb_tooltip_show_kind,
+                "thumb tooltip kind flag should survive roundtrip"
+            );
+            assert!(
+                loaded.thumb_tooltip_show_file_size,
+                "thumb tooltip file size flag should survive roundtrip"
+            );
+            assert!(
+                loaded.thumb_tooltip_show_modified,
+                "thumb tooltip modified flag should survive roundtrip"
+            );
+            assert!(
+                loaded.thumb_tooltip_show_created,
+                "thumb tooltip created flag should survive roundtrip"
+            );
+            assert!(
+                loaded.thumb_tooltip_show_video_dimensions,
+                "thumb tooltip video dimensions flag should survive roundtrip"
+            );
+            assert!(
+                loaded.thumb_tooltip_show_video_codec,
+                "thumb tooltip video codec flag should survive roundtrip"
+            );
+            assert!(
+                loaded.thumb_tooltip_show_location,
+                "thumb tooltip location flag should survive roundtrip"
             );
         }
 
