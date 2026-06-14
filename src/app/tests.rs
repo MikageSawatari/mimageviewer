@@ -13214,6 +13214,23 @@ mod file_operation_selection_tests {
             vec![PathBuf::from(r"C:\books"), PathBuf::from(r"C:\books\a.jpg")]
         );
     }
+
+    #[test]
+    fn current_folder_watch_ignores_access_events() {
+        let access = notify::Event {
+            kind: notify::EventKind::Access(notify::event::AccessKind::Read),
+            paths: vec![PathBuf::from(r"C:\books\a.jpg")],
+            attrs: Default::default(),
+        };
+        assert!(!App::current_folder_watch_event_relevant(&access));
+
+        let create = notify::Event {
+            kind: notify::EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![PathBuf::from(r"C:\books\a.jpg")],
+            attrs: Default::default(),
+        };
+        assert!(App::current_folder_watch_event_relevant(&create));
+    }
 }
 
 #[cfg(test)]

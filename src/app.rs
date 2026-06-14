@@ -50,6 +50,7 @@ pub(crate) use prefetch_policy::{
 
 const MAX_FOLDER_NAV_STACK: usize = 100;
 const MAX_RECENT_FOLDERS: usize = 20;
+const CURRENT_FOLDER_WATCH_DEBOUNCE_MS: u64 = 700;
 
 #[derive(Clone)]
 pub(crate) struct FolderNavHistorySnapshot {
@@ -353,6 +354,13 @@ pub(crate) struct UpdateCheckPending {
 
 pub(crate) struct CapturePending {
     pub(crate) rx: mpsc::Receiver<Result<PathBuf, String>>,
+}
+
+pub(crate) struct CurrentFolderWatch {
+    pub(crate) folder: PathBuf,
+    pub(crate) _watcher: notify::RecommendedWatcher,
+    pub(crate) rx: crossbeam_channel::Receiver<notify::Result<notify::Event>>,
+    pub(crate) debounce_until: Option<std::time::Instant>,
 }
 
 /// ユーザー画像スタンプの埋め込み worker (R2-6) の進行状態。file picker で選んだ画像を
@@ -2649,6 +2657,12 @@ pub struct App {
     /// 完了通知を待ってから再読込する (docs/ui-responsiveness.md §4)。
     pub(crate) paste_pending:
         Vec<std::sync::mpsc::Receiver<crate::ui_dialogs::context_menu::CopyOutcome>>,
+    /// 現在表示中の実フォルダを監視し、外部変更や Shell 標準メニュー操作を
+    /// debounce 後に `check_external_folder_changes` へ流す。
+    pub(crate) current_folder_watch: Option<CurrentFolderWatch>,
+    /// watcher 起動に失敗したフォルダ。毎フレーム同じ失敗ログを出さないため、
+    /// フォルダが変わるまで再試行しない。
+    pub(crate) current_folder_watch_failed: Option<PathBuf>,
     /// 外部 D&D 由来の copy worker 完了待ち (review #15 対応)。完了時に
     /// `CopyOutcome` を見て失敗があればトーストでユーザーに通知する。
     pub(crate) drop_copy_pending:
@@ -4849,6 +4863,8 @@ impl App {
             delete_confirm_label: None,
             pending_reload: false,
             paste_pending: Vec::new(),
+            current_folder_watch: None,
+            current_folder_watch_failed: None,
             drop_copy_pending: Vec::new(),
             capture_pending: None,
             pipeline_debug_export_pending: None,
@@ -6778,6 +6794,127 @@ impl App {
             return None;
         }
         self.current_folder.clone()
+    }
+
+    pub(crate) fn poll_current_folder_watch(&mut self, ctx: &egui::Context) {
+        self.ensure_current_folder_watch(ctx);
+
+        let now = std::time::Instant::now();
+        let mut should_check = false;
+        let mut repaint_after = None;
+        {
+            let Some(watch) = self.current_folder_watch.as_mut() else {
+                return;
+            };
+
+            let mut saw_change = false;
+            while let Ok(event) = watch.rx.try_recv() {
+                match event {
+                    Ok(event) => {
+                        if Self::current_folder_watch_event_relevant(&event) {
+                            saw_change = true;
+                        }
+                    }
+                    Err(err) => {
+                        crate::logger::log(format!("current_folder_watch: notify error: {err}"));
+                        saw_change = true;
+                    }
+                }
+            }
+
+            if saw_change {
+                let delay = std::time::Duration::from_millis(CURRENT_FOLDER_WATCH_DEBOUNCE_MS);
+                watch.debounce_until = Some(now + delay);
+                repaint_after = Some(delay);
+            } else if let Some(deadline) = watch.debounce_until {
+                if now >= deadline {
+                    watch.debounce_until = None;
+                    should_check = true;
+                } else {
+                    repaint_after = Some(deadline.saturating_duration_since(now));
+                }
+            }
+        }
+
+        if let Some(delay) = repaint_after {
+            ctx.request_repaint_after(delay);
+        }
+        if should_check {
+            self.check_external_folder_changes();
+        }
+    }
+
+    fn ensure_current_folder_watch(&mut self, ctx: &egui::Context) {
+        let target = self.current_favorite_target();
+        let Some(folder) = target else {
+            self.current_folder_watch = None;
+            self.current_folder_watch_failed = None;
+            return;
+        };
+
+        if self
+            .current_folder_watch
+            .as_ref()
+            .is_some_and(|watch| crate::folder_tree::path_eq(&watch.folder, &folder))
+        {
+            return;
+        }
+
+        self.current_folder_watch = None;
+        if self
+            .current_folder_watch_failed
+            .as_ref()
+            .is_some_and(|failed| crate::folder_tree::path_eq(failed, &folder))
+        {
+            return;
+        }
+        self.current_folder_watch_failed = None;
+
+        match Self::start_current_folder_watch(ctx, folder.clone()) {
+            Ok(watch) => {
+                crate::logger::log(format!(
+                    "current_folder_watch: watching {}",
+                    folder.display()
+                ));
+                self.current_folder_watch = Some(watch);
+            }
+            Err(err) => {
+                crate::logger::log(format!(
+                    "current_folder_watch: failed to watch {}: {err}",
+                    folder.display()
+                ));
+                self.current_folder_watch_failed = Some(folder);
+            }
+        }
+    }
+
+    fn start_current_folder_watch(
+        ctx: &egui::Context,
+        folder: PathBuf,
+    ) -> Result<CurrentFolderWatch, String> {
+        use notify::Watcher;
+
+        let (tx, rx) = crossbeam_channel::unbounded::<notify::Result<notify::Event>>();
+        let repaint_ctx = ctx.clone();
+        let mut watcher = notify::recommended_watcher(move |event| {
+            let _ = tx.send(event);
+            repaint_ctx.request_repaint();
+        })
+        .map_err(|e| format!("recommended_watcher failed: {e}"))?;
+        watcher
+            .watch(&folder, notify::RecursiveMode::NonRecursive)
+            .map_err(|e| format!("watch failed: {e}"))?;
+
+        Ok(CurrentFolderWatch {
+            folder,
+            _watcher: watcher,
+            rx,
+            debounce_until: None,
+        })
+    }
+
+    fn current_folder_watch_event_relevant(event: &notify::Event) -> bool {
+        !matches!(event.kind, notify::EventKind::Access(_))
     }
 
     pub(crate) fn navigate_folder_history_forward(&mut self) -> Option<PathBuf> {
@@ -30648,6 +30785,7 @@ impl eframe::App for App {
             self.check_external_folder_changes();
         }
         self.last_main_focused = main_focused_now;
+        self.poll_current_folder_watch(ctx);
 
         // アイドル 5 秒で dirty なサイドカーをフラッシュ (電源断や強制終了への保険)。
         // 頻繁なフレームで呼ばれるが is_dirty 判定で大半は no-op になる。

@@ -24,6 +24,7 @@ impl ShellClipboardVerb {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeMivCommand {
+    Paste,
     CopyPath,
     CopyFileName,
     CopyImageToClipboard,

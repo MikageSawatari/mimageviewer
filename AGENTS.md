@@ -44,6 +44,10 @@ always-active guidance.
   without validation.
 - Follow existing Rust, egui, and module patterns before introducing new
   abstractions.
+- Avoid temporary workaround fixes for correctness-sensitive behavior. Choose a
+  design that can be made fundamentally correct; if the correct design is larger
+  than expected, document the scope and proceed in coherent steps rather than
+  landing a stopgap that is likely to create follow-up bug reports.
 
 ## UI And Tests
 

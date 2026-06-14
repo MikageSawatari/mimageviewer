@@ -884,6 +884,19 @@ impl crate::app::App {
             return items;
         }
 
+        if target.is_folder_context
+            && target.paths.first().is_some_and(|path| {
+                self.current_favorite_target()
+                    .as_ref()
+                    .is_some_and(|folder| crate::folder_tree::path_eq(folder, path))
+            })
+        {
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::Paste,
+                label: "貼り付け".to_string(),
+            });
+        }
+
         let copy_path_label = if target.is_folder_context {
             "このフォルダのパスをコピー"
         } else {
@@ -970,6 +983,22 @@ impl crate::app::App {
         target: &NativeGridContextMenuTarget,
     ) -> Option<ContextMenuAction> {
         match command {
+            NativeMivCommand::Paste => {
+                if target.is_folder_context
+                    && let (Some(hwnd), Some(folder)) =
+                        (self.main_hwnd, target.paths.first().cloned())
+                {
+                    let result = crate::native_context_menu::invoke_shell_folder_background_verb(
+                        hwnd,
+                        &folder,
+                        crate::native_context_menu::ShellClipboardVerb::Paste,
+                    );
+                    if let Err(err) = result {
+                        crate::logger::log(format!("native_context_menu: mIV Paste failed: {err}"));
+                    }
+                }
+                None
+            }
             NativeMivCommand::CopyPath => {
                 let text = target
                     .paths

@@ -285,6 +285,10 @@ Current status:
   verbs through `src/native_context_menu.rs`.
 - Ctrl+V invokes the current real folder's Shell background `paste` verb. Folder
   paste, collision prompts, and progress UI are therefore handled by Windows.
+- The currently displayed real folder is watched with notify-rs
+  (`ReadDirectoryChangesW`) and debounced into `check_external_folder_changes`,
+  so Shell menu operations, Ctrl+V paste, and external Explorer edits share the
+  same refresh path.
 - The legacy PowerShell clipboard helpers still exist for egui fallback menus
   and drop/copy internals until the `IFileOperation` migration is complete.
 
@@ -326,6 +330,9 @@ Current routing details:
   `IShellFolder::CreateViewObject(IContextMenu)` so Paste/New-style background
   verbs come from Shell instead of treating the current folder as a deletable
   selected object.
+- Background right-click also inserts an mIV "貼り付け" command before Shell
+  items. It invokes the same canonical Shell `paste` verb as Ctrl+V, covering
+  environments where the Shell-populated background menu does not surface Paste.
 - Keyboard Ctrl+C/Ctrl+X/Ctrl+V use the same native helper and canonical Shell
   `copy`/`cut`/`paste` verbs instead of mIV's custom clipboard writer.
 - Checked selections use the Shell menu only when every checked item has a real
