@@ -185,25 +185,20 @@
     </ul>
 
     <h3>右クリックメニュー</h3>
-    <p>サムネイルを右クリックするとコンテキストメニューが表示されます。ドライブ一覧では右クリックメニューは表示されません。</p>
+    <p>サムネイルを右クリックするとコンテキストメニューが表示されます。実ファイル / 実フォルダでは、環境設定の「Windows 標準の右クリックメニューを使う」が ON の場合、Windows Shell 標準メニューの上部に mImageViewer 独自項目を追加して表示します。ドライブ一覧では右クリックメニューは表示されません。</p>
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>メニュー項目</th><th>説明</th></tr>
+          <tr><th>主な項目</th><th>説明</th></tr>
         </thead>
         <tbody>
-          <tr><td>パスをコピー</td><td>ファイルのフルパスをクリップボードにコピー</td></tr>
-          <tr><td>ファイル名をコピー</td><td>ファイル名のみをコピー</td></tr>
-          <tr><td>画像をクリップボードにコピー</td><td>デコードした画像データをコピー（画像のみ）</td></tr>
-          <tr><td>コピー / カット</td><td>ファイルをクリップボードにコピー・カット</td></tr>
-          <tr><td>ペースト（Ctrl+V）</td><td>クリップボードのファイルを現在のフォルダに貼り付け</td></tr>
-          <tr><td>フォルダを開く</td><td>エクスプローラーでファイルの場所を開く</td></tr>
+          <tr><td>mImageViewer: パスをコピー</td><td>ファイルやフォルダのフルパスをクリップボードにコピー</td></tr>
+          <tr><td>mImageViewer: ファイル名をコピー</td><td>ファイル名のみをコピー</td></tr>
+          <tr><td>mImageViewer: 画像をクリップボードにコピー</td><td>デコードした画像データをコピー（画像のみ）</td></tr>
           <tr><td>フォルダに移動</td><td>検索結果（<kbd>Ctrl</kbd>+<kbd>G</kbd> / <kbd>Ctrl</kbd>+<kbd>S</kbd>）でのみ表示。アイテムが入っているフォルダを mImageViewer のグリッドで開きます</td></tr>
-          <tr><td>○○で開く</td><td>直近使用したアプリケーションで開く（最大 3 件）</td></tr>
-          <tr><td>アプリケーションで開く…</td><td>拡張子に関連付けられたアプリ一覧を展開。「アプリケーションを追加…」でリストにないアプリも登録可能</td></tr>
-          <tr><td>左に回転 (L) / 右に回転 (R)</td><td>非破壊回転</td></tr>
-          <tr><td>削除（ゴミ箱）</td><td>ファイルをごみ箱に移動</td></tr>
+          <tr><td>左に回転 (L) / 右に回転 (R)</td><td>mImageViewer の非破壊回転</td></tr>
           <tr><td>📌 代表サムネに固定 / 解除</td><td>そのアイテムを現在のフォルダ / ZIP / PDF / 変換済み RAR・7z・LZH の代表サムネイルに固定します（再クリックで解除）。詳しくは下の「代表サムネイルを手動で指定する」を参照</td></tr>
+          <tr><td>Windows 標準項目</td><td>コピー / カット / ペースト / 名前の変更 / 削除 / プロパティ / 送る / 関連付けアプリなどは Windows Shell が表示します</td></tr>
         </tbody>
       </table>
     </div>
@@ -213,11 +208,11 @@
       <div class="box-body">
         アイテム種別によって表示される項目が異なります。
         <ul style="margin:0.5em 0 0; padding-left:1.2em;">
-          <li><strong>フォルダ：</strong>「パスをコピー」「エクスプローラで開く」「ペースト」</li>
-          <li><strong>ZIP / PDF ファイル：</strong>「パスをコピー」「フォルダを開く」「アプリケーションで開く…」「ペースト」</li>
-          <li><strong>ZIP 内の画像：</strong>「パスをコピー」「ファイル名をコピー」「画像をクリップボードにコピー」</li>
-          <li><strong>PDF のページ：</strong>「パスをコピー」「ページ名をコピー」</li>
-          <li><strong>何もない場所（アイテムのない背景・空フォルダ・検索結果なし）：</strong>「このフォルダのパスをコピー」「このフォルダを開く」（現在表示中のフォルダが対象）</li>
+          <li><strong>実ファイル / 実フォルダ：</strong>Windows 標準メニュー + mImageViewer 独自項目を表示</li>
+          <li><strong>何もない場所（アイテムのない背景・空フォルダ）：</strong>現在フォルダの Windows 背景メニューを表示</li>
+          <li><strong>ZIP 内の画像：</strong>従来の mImageViewer メニューで「パスをコピー」「ファイル名をコピー」「画像をクリップボードにコピー」</li>
+          <li><strong>PDF のページ：</strong>従来の mImageViewer メニューで「パスをコピー」「ページ名をコピー」</li>
+          <li><strong>仮想項目を含む複数チェック：</strong>Windows 標準メニューではなく従来の mImageViewer メニューを表示</li>
         </ul>
       </div>
     </div>

@@ -564,7 +564,7 @@ GUI での編集、競合検知、マウス /
 | Alt + 1〜9 | 列数を 1〜9 に切り替え |
 | Alt + 0 | 列数を 10 に切り替え |
 | Alt + - | サムネイル表示 / 詳細表示を切り替え |
-| 右クリック | コンテキストメニュー。アイテムがない場所では現在表示中フォルダのパスコピー / フォルダを開くメニュー |
+| 右クリック | コンテキストメニュー。実ファイル/実フォルダでは Windows Shell 標準メニューに mIV 独自項目 (パスコピー、画像コピー、検索結果のフォルダ移動、回転、代表サムネ固定など) を追加して表示する。ZIP/PDF 内ページなど仮想項目や Shell メニュー取得に失敗した場合は従来の mIV メニューにフォールバックする。アイテムがない場所では現在表示中フォルダの Shell 背景メニューを表示する |
 
 ### 7.2 フルスクリーン表示モード ✅
 
@@ -717,7 +717,7 @@ RAR / CBR / 7z / CB7 / LZH / LHA は既存の変換設定に従い、確認が�
 これにより、変換アーカイブの確認ダイアログ、★固定中の移動ガード、
 フォルダツリーペインの現在地同期は通常ナビゲーションと同じ規則に従う。
 
-### エクスプローラ連携 (SendTo)
+### エクスプローラ連携
 
 環境設定 → エクスプローラ連携では、Windows の「送る」メニューへ
 `mImageViewer.lnk` を登録 / 削除できる。登録先は per-user の SendTo Known Folder
@@ -732,6 +732,13 @@ SendTo から渡されたファイル / フォルダは Windows により位置�
 runtime 展開や本体起動を行う前に、最初の位置引数を Named Pipe へ転送してから
 activate event を送る。Pipe がまだ準備されていない起動直後だけ短く再試行し、
 Explorer の SendTo 起動側が数秒単位で残らないようにする。
+
+同じ設定ページで `use_native_shell_context_menu` を切り替えられる。既定 ON のとき、
+実ファイル / 実フォルダの右クリックは Win32 `IContextMenu` による Windows 標準メニューを使う。
+mIV 独自項目はメニュー先頭に追加し、Shell 側のコピー / カット / ペースト / 名前変更 /
+プロパティ / 関連付けアプリ / 拡張メニューはそのまま表示する。背景右クリックでは現在フォルダの
+Shell 背景メニューを使う。ZIP/PDF 内ページ、ZIP 内ディレクトリ、検索コンテナ、仮想項目を含む
+チェック選択では従来の mIV メニューを使う。
 
 ### 8.1 主要設定
 
@@ -767,6 +774,7 @@ Explorer の SendTo 起動側が数秒単位で残らないようにする。
 | `startup_folder_path` | Option\<PathBuf\> | None | `startup_folder_mode = Specific` の指定フォルダ。開けない場合は Desktop、Desktop も取得できない場合は前回フォルダへフォールバックする |
 | `recent_folders` | Vec\<PathBuf\> | [] | フォルダバーの履歴▼に表示する最近開いたフォルダ履歴。最大 20 件、検索中の一時移動は記録しない。環境設定 → ツールバーからクリアできる |
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
+| `use_native_shell_context_menu` | bool | true | 実ファイル / 実フォルダの右クリックで Windows Shell 標準メニューを使う。仮想項目や Shell 統合失敗時は従来の mIV メニューへフォールバック |
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ZIP・PDF の開き方) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
 | `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去。初回セットアップと環境設定には、GPU 負荷が高く低スペック環境では OFF 推奨である案内とオンラインマニュアルの処理時間目安へのリンクを表示する |

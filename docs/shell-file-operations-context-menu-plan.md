@@ -1,8 +1,9 @@
 # Shell file operations and native context menu plan
 
-Status: mixed. Folder A/B quick workspaces were implemented first; the Shell
-file operation and native context menu phases remain planning-only. This
-document is still the handoff point for the remaining implementation sessions.
+Status: mixed. Folder A/B quick workspaces and the real-file native Shell
+context menu are implemented. `IFileOperation` copy/move/delete replacement and
+Win32 custom menus for ZIP/PDF virtual items remain for later implementation
+sessions.
 
 ## 1. Goal
 
@@ -78,9 +79,9 @@ Useful existing facts:
 | --- | --- | --- | --- |
 | `Image`, `Video`, `ZipFile`, `PdfFile`, `ConvertibleArchive` | Native mIV + Shell menu | Yes | Real file paths. |
 | `Folder` tile or background current folder | Native mIV + Shell menu | Yes | Re-enable folder copy/paste/delete only through Shell-safe paths. |
-| `SearchContainer` | Start with native mIV custom menu | Maybe later | The stored path is real, but search views need extra "go to folder" semantics and must not paste into stale `current_folder`. |
+| `SearchContainer` | egui fallback for now | Maybe later | The stored path is real, but search views need extra "go to folder" semantics and must not paste into stale `current_folder`. |
 | Checked selection, all real paths | Native mIV + Shell menu | Yes | Include folders only after selection model is updated to allow folder checks. |
-| Checked selection mixed real + virtual | Native mIV custom menu | No Shell menu | Avoid silently applying Shell verbs to only part of the selection. |
+| Checked selection mixed real + virtual | egui fallback for now | No Shell menu | Avoid silently applying Shell verbs to only part of the selection. |
 | `ZipImage` | Native mIV custom menu | No | May offer copy rendered image and virtual path only. |
 | `PdfPage` | Native mIV custom menu | No | May add rendered page image copy as a future command. |
 | `ZipDir` | Native mIV custom menu | No | Virtual nested book/container. |
@@ -301,7 +302,30 @@ Keep the existing image clipboard code separate:
 
 ## 8. Native context menu architecture
 
-Add a Windows-only module, tentatively `src/native_context_menu.rs`.
+Implementation status: implemented for the main grid real-file path. The helper
+is `src/native_context_menu.rs`, and `src/ui_dialogs/context_menu.rs` routes
+real files/folders to it when `Settings::use_native_shell_context_menu` is
+enabled. The implementation inserts mIV commands first, asks Shell to populate
+the rest, uses `TrackPopupMenuEx(..., TPM_RETURNCMD, ...)`, dispatches Shell
+commands with `IContextMenu::InvokeCommand`, and temporarily subclasses the main
+HWND to forward `IContextMenu2` / `IContextMenu3` owner-draw and submenu
+messages.
+
+Current routing details:
+
+- Real file/folder tiles use `IShellItemArray::BindToHandler(BHID_SFUIObject)`
+  for Shell commands.
+- Background right-click on the current real folder uses
+  `IShellFolder::CreateViewObject(IContextMenu)` so Paste/New-style background
+  verbs come from Shell instead of treating the current folder as a deletable
+  selected object.
+- Checked selections use the Shell menu only when every checked item has a real
+  file-operation path. Mixed real + ZIP/PDF virtual selections keep the egui
+  fallback.
+- ZIP/PDF pages, ZIP directories, search containers, and other virtual items
+  still use the egui fallback until the Win32 custom virtual menu is implemented.
+
+Windows-only module: `src/native_context_menu.rs`.
 
 Responsibilities:
 
@@ -355,9 +379,11 @@ Message forwarding:
 
 Settings:
 
-- Add a setting such as `use_native_shell_context_menu`, default off for the
-  first experimental release and on only after manual validation.
-- Add a second setting if needed: `show_miv_commands_in_native_menu`, default on.
+- `use_native_shell_context_menu` is implemented and defaults on so the Shell
+  menu is visible in development builds immediately. Users can disable it from
+  Settings -> Explorer integration if a Shell extension behaves badly.
+- Add a second setting if needed later: `show_miv_commands_in_native_menu`,
+  default on.
 - If a Shell menu crashes/hangs reports appear, users can disable the native
   Shell menu without losing mIV core functionality.
 
@@ -449,6 +475,8 @@ that if it feels better:
 
 ### Phase 1 - Folder A/B quick workspaces
 
+Status: implemented.
+
 - Add reusable `FolderNavHistoryState` helpers.
 - Make A active by default; B is available as a second workspace, and an
   unvisited workspace opens the drive list.
@@ -471,6 +499,8 @@ that if it feels better:
 - Keep old PowerShell paths behind a temporary fallback if needed.
 
 ### Phase 3 - Real filesystem native context menu
+
+Status: implemented for the main grid. Fullscreen can be aligned later.
 
 - Add `src/native_context_menu.rs`.
 - Route real filesystem right-clicks through native `HMENU`.

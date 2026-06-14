@@ -169,6 +169,18 @@ pub(super) fn page_startup_folder(ui: &mut egui::Ui, state: &mut PreferencesStat
 pub(super) fn page_explorer_integration(ui: &mut egui::Ui, state: &mut PreferencesState) {
     refresh_send_to_status_if_needed(state);
 
+    ui.label(egui::RichText::new("右クリックメニュー").strong());
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut state.settings.use_native_shell_context_menu,
+        "実ファイル/実フォルダでは Windows 標準の右クリックメニューを使う",
+    )
+    .on_hover_text(
+        "ZIP/PDF 内ページなど仮想アイテムは従来の mIV メニューを使います。\
+         Shell 拡張との相性問題がある場合はオフにしてください。",
+    );
+    ui.add_space(10.0);
+
     ui.label(
         "Windows の「送る」メニューに mImageViewer を追加します。\n\
          エクスプローラでファイルやフォルダを右クリック → 送る → mImageViewer から開けます。",

@@ -4,7 +4,11 @@ use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
+use crate::app::search_results_synthetic_path;
 use crate::grid_item::GridItem;
+use crate::native_context_menu::{
+    NativeContextMenuRequest, NativeContextMenuResult, NativeMivCommand, NativeMivMenuItem,
+};
 
 /// `show_context_menu` の戻り値。単なる `Option<PathBuf>` ではなくアクション種別を
 /// 表現することで、検索終了などの副作用を呼び出し側 (= 優先度判定後) で発火できる。
@@ -31,6 +35,21 @@ impl ContextMenuAction {
 enum DeleteConfirmKind {
     RecycleBin,
     MayPermanent,
+}
+
+#[derive(Debug)]
+enum NativeGridContextMenuOutcome {
+    Consumed(Option<ContextMenuAction>),
+    Fallback,
+}
+
+#[derive(Clone)]
+struct NativeGridContextMenuTarget {
+    paths: Vec<PathBuf>,
+    item: GridItem,
+    item_index: Option<usize>,
+    is_folder_context: bool,
+    has_checked: bool,
 }
 
 fn delete_confirm_label_for_targets(targets: &[(usize, PathBuf)]) -> String {
@@ -312,6 +331,23 @@ impl crate::app::App {
 
         // 記録済みの座標に固定表示
         let pos = self.context_menu_pos;
+        match self.try_show_native_grid_context_menu(
+            ctx,
+            pos,
+            idx,
+            item.clone(),
+            is_folder_context,
+            has_checked,
+            in_search,
+        ) {
+            NativeGridContextMenuOutcome::Consumed(nav) => {
+                self.context_menu_idx = None;
+                self.cached_handlers = None;
+                ctx.request_repaint();
+                return nav;
+            }
+            NativeGridContextMenuOutcome::Fallback => {}
+        }
 
         let mut open = true;
         egui::Window::new("context_menu")
@@ -741,6 +777,263 @@ impl crate::app::App {
         }
 
         nav
+    }
+
+    fn try_show_native_grid_context_menu(
+        &mut self,
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        idx: usize,
+        item: GridItem,
+        is_folder_context: bool,
+        has_checked: bool,
+        in_search: bool,
+    ) -> NativeGridContextMenuOutcome {
+        if !self.settings.use_native_shell_context_menu {
+            return NativeGridContextMenuOutcome::Fallback;
+        }
+        let Some(hwnd) = self.main_hwnd else {
+            return NativeGridContextMenuOutcome::Fallback;
+        };
+        let Some(target) =
+            self.native_grid_context_menu_target(idx, item, is_folder_context, has_checked)
+        else {
+            return NativeGridContextMenuOutcome::Fallback;
+        };
+        let miv_items = self.native_grid_context_menu_items(&target, in_search);
+        let background_folder = target.is_folder_context.then(|| target.paths[0].clone());
+        let request = NativeContextMenuRequest {
+            hwnd,
+            screen_pos: (pos.x.round() as i32, pos.y.round() as i32),
+            background_folder,
+            paths: if target.is_folder_context {
+                Vec::new()
+            } else {
+                target.paths.clone()
+            },
+            miv_items,
+        };
+        match crate::native_context_menu::show_native_context_menu(request) {
+            NativeContextMenuResult::Canceled | NativeContextMenuResult::ShellCommandInvoked => {
+                NativeGridContextMenuOutcome::Consumed(None)
+            }
+            NativeContextMenuResult::MivCommand(command) => {
+                let nav = self.dispatch_native_grid_context_command(ctx, command, &target);
+                NativeGridContextMenuOutcome::Consumed(nav)
+            }
+            NativeContextMenuResult::Fallback { reason } => {
+                crate::logger::log(format!(
+                    "native_context_menu: fallback to egui menu: {reason}"
+                ));
+                NativeGridContextMenuOutcome::Fallback
+            }
+        }
+    }
+
+    fn native_grid_context_menu_target(
+        &self,
+        idx: usize,
+        item: GridItem,
+        is_folder_context: bool,
+        has_checked: bool,
+    ) -> Option<NativeGridContextMenuTarget> {
+        let paths = if has_checked {
+            if self.checked.iter().any(|&idx| {
+                self.items
+                    .get(idx)
+                    .and_then(GridItem::file_operation_path)
+                    .is_none()
+            }) {
+                return None;
+            }
+            self.collect_checked_paths()
+        } else {
+            vec![item.drag_source_path()?.to_path_buf()]
+        };
+        if paths.is_empty() {
+            return None;
+        }
+        Some(NativeGridContextMenuTarget {
+            paths,
+            item,
+            item_index: (!is_folder_context).then_some(idx),
+            is_folder_context,
+            has_checked,
+        })
+    }
+
+    fn native_grid_context_menu_items(
+        &self,
+        target: &NativeGridContextMenuTarget,
+        in_search: bool,
+    ) -> Vec<NativeMivMenuItem> {
+        let mut items = Vec::new();
+        if target.has_checked {
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::CopyPath,
+                label: "選択項目のパスをコピー".to_string(),
+            });
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::RotateLeft,
+                label: "左に回転 (L)".to_string(),
+            });
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::RotateRight,
+                label: "右に回転 (R)".to_string(),
+            });
+            return items;
+        }
+
+        let copy_path_label = if target.is_folder_context {
+            "このフォルダのパスをコピー"
+        } else {
+            "パスをコピー"
+        };
+        items.push(NativeMivMenuItem {
+            command: NativeMivCommand::CopyPath,
+            label: copy_path_label.to_string(),
+        });
+        if !target.is_folder_context
+            && target
+                .paths
+                .first()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| !name.is_empty())
+        {
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::CopyFileName,
+                label: "ファイル名をコピー".to_string(),
+            });
+        }
+        if matches!(target.item, GridItem::Image(_)) {
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::CopyImageToClipboard,
+                label: "画像をクリップボードにコピー".to_string(),
+            });
+        }
+        if in_search && !target.is_folder_context {
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::JumpToFolder,
+                label: "フォルダに移動".to_string(),
+            });
+        }
+        if matches!(target.item, GridItem::Image(_) | GridItem::Video(_)) {
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::RotateLeft,
+                label: "左に回転 (L)".to_string(),
+            });
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::RotateRight,
+                label: "右に回転 (R)".to_string(),
+            });
+        }
+        if let Some(label) = self.native_folder_pin_context_label(target) {
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::ToggleRepresentativeThumb,
+                label,
+            });
+        }
+        items
+    }
+
+    fn native_folder_pin_context_label(
+        &self,
+        target: &NativeGridContextMenuTarget,
+    ) -> Option<String> {
+        if target.is_folder_context
+            || target.item_index.is_none()
+            || self.items_are_global_search_view
+            || self.items_are_tag_view
+            || self.archive_source_override.is_some() && self.zip_nav.is_none()
+        {
+            return None;
+        }
+        let container = self.current_folder.as_ref()?;
+        if container == &search_results_synthetic_path() {
+            return None;
+        }
+        let source = crate::folder_thumb_pins::source_from_grid_item(container, &target.item)?;
+        let existing = self.folder_thumb_pin_for(container);
+        let label = if existing == Some(&source) {
+            "📌 代表サムネ固定を解除"
+        } else {
+            "📌 代表サムネに固定"
+        };
+        Some(label.to_string())
+    }
+
+    fn dispatch_native_grid_context_command(
+        &mut self,
+        ctx: &egui::Context,
+        command: NativeMivCommand,
+        target: &NativeGridContextMenuTarget,
+    ) -> Option<ContextMenuAction> {
+        match command {
+            NativeMivCommand::CopyPath => {
+                let text = target
+                    .paths
+                    .iter()
+                    .map(|p| native_path_text(p))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ctx.copy_text(text);
+                None
+            }
+            NativeMivCommand::CopyFileName => {
+                let name = target
+                    .paths
+                    .first()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                ctx.copy_text(name);
+                None
+            }
+            NativeMivCommand::CopyImageToClipboard => {
+                if let GridItem::Image(path) = &target.item {
+                    copy_image_to_clipboard(path);
+                }
+                None
+            }
+            NativeMivCommand::JumpToFolder => match &target.item {
+                GridItem::Folder(path) => {
+                    Some(ContextMenuAction::JumpFromSearch(native_nav_path(path)))
+                }
+                _ => target
+                    .paths
+                    .first()
+                    .and_then(|path| parent_folder_for_nav(path))
+                    .map(ContextMenuAction::JumpFromSearch),
+            },
+            NativeMivCommand::RotateLeft => {
+                if target.has_checked {
+                    for idx in self.checked.clone() {
+                        self.rotate_image_ccw(idx);
+                    }
+                } else if let Some(idx) = target.item_index {
+                    self.rotate_image_ccw(idx);
+                }
+                None
+            }
+            NativeMivCommand::RotateRight => {
+                if target.has_checked {
+                    for idx in self.checked.clone() {
+                        self.rotate_image_cw(idx);
+                    }
+                } else if let Some(idx) = target.item_index {
+                    self.rotate_image_cw(idx);
+                }
+                None
+            }
+            NativeMivCommand::ToggleRepresentativeThumb => {
+                if let Some(idx) = target.item_index {
+                    self.toggle_folder_pin_for_idx(idx);
+                }
+                None
+            }
+        }
     }
 
     /// `ContextMenuAction::JumpFromSearch` の副作用を適用する。検索終了 (Ctrl+G /

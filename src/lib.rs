@@ -77,6 +77,7 @@ pub mod logger;
 pub mod mask_db;
 pub mod name_bulk_indexer;
 pub mod name_index_supervisor;
+pub mod native_context_menu;
 pub mod os_theme;
 pub mod panorama;
 pub mod panorama_wgpu;

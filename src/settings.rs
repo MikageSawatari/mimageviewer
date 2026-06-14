@@ -1562,6 +1562,12 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub show_address_bar_folder_pin: bool,
 
+    // ── エクスプローラ連携 ────────────────────────────────────
+    /// 実ファイル / 実フォルダの右クリックに Windows Shell の標準メニューを使う。
+    /// ZIP/PDF 内ページなど仮想アイテムは従来の mIV メニューにフォールバックする。
+    #[serde(default = "default_true")]
+    pub use_native_shell_context_menu: bool,
+
     // ── レーティングフィルタ ───────────────────────────────────
     /// レーティングフィルタ (index 0 = 未評価, 1〜5 = ★の数)。
     /// 選択された星数のアイテムのみ表示。全て true = フィルタなし。
@@ -2855,6 +2861,7 @@ impl Default for Settings {
             show_address_bar_favorite_button: true,
             show_address_bar_history_menu: true,
             show_address_bar_folder_pin: true,
+            use_native_shell_context_menu: true,
             rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),
             toolbar_cols_details_visible: true,
@@ -4223,6 +4230,7 @@ mod tests {
         assert!(s.show_address_bar_favorite_button);
         assert!(s.show_address_bar_history_menu);
         assert!(s.show_address_bar_folder_pin);
+        assert!(s.use_native_shell_context_menu);
         assert!(!s.first_setup_completed);
         assert_eq!(s.ai_feature_mode, AiFeatureMode::Light);
     }
