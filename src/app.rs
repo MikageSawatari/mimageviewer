@@ -154,6 +154,20 @@ fn should_close_fullscreen_from_main_focus(
         && !fullscreen_root_key_handled
 }
 
+fn should_restore_fullscreen_focus_from_main_focus(
+    fs_focus_grace_elapsed: bool,
+    main_viewport_focused: bool,
+    embedded_still: bool,
+    keep_fullscreen_on_app_switch: bool,
+    fullscreen_root_key_handled: bool,
+) -> bool {
+    fs_focus_grace_elapsed
+        && main_viewport_focused
+        && !embedded_still
+        && keep_fullscreen_on_app_switch
+        && !fullscreen_root_key_handled
+}
+
 fn should_defer_main_paint_for_font_atlas_resync(reason: &str) -> bool {
     reason != FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP
 }
@@ -3315,6 +3329,10 @@ pub struct App {
     /// 同期で UI/音声まで止まることがあるため、VST フォーカス復帰の実行だけ
     /// 短く rate limit する。
     pub(crate) fs_last_native_focus_claim_at: Option<std::time::Instant>,
+    /// メインウィンドウへ戻ったときにフルスクリーン側へ Focus を戻した直近時刻。
+    /// Alt+Tab 復帰直後に main viewport が数フレーム focused と報告されても
+    /// Focus/raise コマンドを連投しないための debounce。
+    fs_last_main_focus_restore_at: Option<std::time::Instant>,
     /// フォーカス復帰クリックを検出中で、離されるまで全ての左クリック操作を抑制するフラグ。
     /// 押下 → 離しの間に複数フレームあるため、時間ベースだけでなく状態でも追跡する。
     pub(crate) fs_suppress_primary_until_release: bool,
@@ -5102,6 +5120,7 @@ impl App {
             fs_focus_regained_at: None,
             fs_prev_foreground_hwnd: 0,
             fs_last_native_focus_claim_at: None,
+            fs_last_main_focus_restore_at: None,
             fs_suppress_primary_until_release: false,
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
@@ -18299,6 +18318,53 @@ impl App {
         true
     }
 
+    fn restore_fullscreen_focus_from_main(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        if self.viewer_session_is_detached() {
+            return;
+        }
+
+        const RESTORE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+        let now = std::time::Instant::now();
+        if let Some(last) = self.fs_last_main_focus_restore_at {
+            let elapsed = now.saturating_duration_since(last);
+            if elapsed < RESTORE_DEBOUNCE {
+                ctx.request_repaint_after(RESTORE_DEBOUNCE - elapsed);
+                return;
+            }
+        }
+        self.fs_last_main_focus_restore_at = Some(now);
+
+        let mut restored = false;
+        let mut target = "fullscreen_viewport";
+        if self.fs_viewport_shown {
+            let fs_id = self.fullscreen_viewport_id();
+            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Focus);
+            restored = true;
+        }
+
+        #[cfg(windows)]
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+            self.native_video_front_recover_after_external_foreground = true;
+            self.native_video_front_last_raise = None;
+            player.request_presenter_raise();
+            target = "native_video";
+            restored = true;
+        }
+
+        if restored {
+            self.fs_focus_regained_at = Some(now);
+            crate::logger::log(format!(
+                "[fs-focus] restore fullscreen from main focus target={target} idx={idx}"
+            ));
+        }
+        ctx.request_repaint();
+    }
+
     #[cfg(windows)]
     fn prepare_viewer_presentation_open(&mut self, idx: usize, entering_native_video: bool) {
         let presentation = self.effective_viewer_presentation_for_open(idx);
@@ -18400,6 +18466,7 @@ impl App {
         self.fs_focus_regained_at = None;
         self.fs_prev_foreground_hwnd = 0;
         self.fs_last_native_focus_claim_at = None;
+        self.fs_last_main_focus_restore_at = None;
         self.fs_suppress_primary_until_release = false;
         self.reset_erase_mode();
 
@@ -23160,6 +23227,7 @@ impl App {
         self.fs_focus_regained_at = None;
         self.fs_prev_foreground_hwnd = 0;
         self.fs_last_native_focus_claim_at = None;
+        self.fs_last_main_focus_restore_at = None;
         self.fs_suppress_primary_until_release = false;
         self.fs_secondary_press_start = None;
         self.fs_middle_zoom_drag = None;
@@ -31697,8 +31765,9 @@ impl eframe::App for App {
         // そのままだと両方のウィンドウがキー入力を無視して操作不能に見える。
         // 既定ではメインにフォーカスが来た = ユーザーがサムネイル一覧に戻りたい意図と
         // 解釈し、フルスクリーンを閉じてメインウィンドウで通常操作を再開する。
-        // `fullscreen_keep_on_app_switch` が ON のときは、他アプリへ切り替えて戻った
-        // 場合にも fullscreen session を維持するため、この自動 close を行わない。
+        // `fullscreen_keep_on_app_switch` が ON のときは、他アプリから mIV main へ戻った
+        // 場合にも fullscreen session を維持し、main に来た focus を fullscreen 側へ
+        // 戻す。メインも並行操作したい場合は detached viewer (F12) を使う。
         //
         // ただし open_fullscreen() 直後はフルスクリーンビューポートへの
         // ViewportCommand::Focus が反映されるまで数フレームかかるため、
@@ -31731,6 +31800,14 @@ impl eframe::App for App {
                 fullscreen_root_key_handled,
             ) {
                 self.close_fullscreen();
+            } else if should_restore_fullscreen_focus_from_main_focus(
+                self.fs_focus_grace_elapsed,
+                main_viewport_focused,
+                embedded_still,
+                self.settings.fullscreen_keep_on_app_switch,
+                fullscreen_root_key_handled,
+            ) {
+                self.restore_fullscreen_focus_from_main(ctx);
             }
         }
 

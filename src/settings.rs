@@ -1707,8 +1707,8 @@ pub struct Settings {
     /// 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。
     #[serde(default = "default_true")]
     pub fullscreen_page_number_overlay: bool,
-    /// 他アプリへ切り替えて戻ったとき、メインウィンドウがフォーカスを得ても
-    /// フルスクリーン表示を自動で閉じない。
+    /// 他アプリから mIV のメインウィンドウへ戻ったとき、フルスクリーン表示を
+    /// 自動で閉じずにフルスクリーン側へフォーカスを戻す。
     #[serde(default)]
     pub fullscreen_keep_on_app_switch: bool,
     /// フルスクリーン表示中、マウス操作が止まってからカーソルを隠すまでの秒数。

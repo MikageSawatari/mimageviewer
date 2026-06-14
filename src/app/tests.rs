@@ -12589,6 +12589,29 @@ mod fullscreen_main_focus_guard_tests {
     }
 
     #[test]
+    fn main_focus_guard_restores_fullscreen_when_keep_enabled() {
+        assert!(should_restore_fullscreen_focus_from_main_focus(
+            true, true, false, true, false,
+        ));
+    }
+
+    #[test]
+    fn main_focus_restore_skips_during_grace_embedded_or_root_key() {
+        assert!(!should_restore_fullscreen_focus_from_main_focus(
+            false, true, false, true, false,
+        ));
+        assert!(!should_restore_fullscreen_focus_from_main_focus(
+            true, true, true, true, false,
+        ));
+        assert!(!should_restore_fullscreen_focus_from_main_focus(
+            true, true, false, true, true,
+        ));
+        assert!(!should_restore_fullscreen_focus_from_main_focus(
+            true, true, false, false, false,
+        ));
+    }
+
+    #[test]
     fn main_focus_guard_skips_close_during_grace_or_embedded_mode() {
         assert!(!should_close_fullscreen_from_main_focus(
             false, true, false, false, false, false,

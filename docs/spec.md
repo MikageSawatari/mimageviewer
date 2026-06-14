@@ -788,7 +788,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `fullscreen_fit_no_downscale` | bool | false | 自動フィット時に 100% 未満へ縮小しない。ON の場合、画像が画面外へはみ出す表示でもパンできる |
 | `fullscreen_seek_bar_locked` | bool | false | 静止画フルスクリーンの下部ページシークバーを固定表示する。ON のときは下端のバー領域を画像フィット範囲から除外する |
 | `fullscreen_page_number_overlay` | bool | true | 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。下部ページシークバーの固定表示中は非表示 |
-| `fullscreen_keep_on_app_switch` | bool | false | 他アプリへ切り替えて戻ったとき、メインウィンドウがフォーカスを得てもフルスクリーン表示を自動で閉じない |
+| `fullscreen_keep_on_app_switch` | bool | false | 「メインに戻ったらフルスクリーンへ復帰」。他アプリから mIV のメインウィンドウへ戻ったとき、フルスクリーン表示を自動で閉じずにフルスクリーン側へフォーカスを戻す。メイン一覧も並行操作する場合は F12 別ウィンドウを使う |
 | `fullscreen_cursor_hide_delay_secs` | f32 | 1.0 | フルスクリーン表示中、マウス操作が止まってからカーソルを隠すまでの秒数 (0.1〜5.0) |
 | `fullscreen_jump_mode` | FullscreenJumpMode | Percent | 画像フルスクリーンの Shift+← / Shift+→ で前後へジャンプする量の指定方式 (割合 / 固定ページ数) |
 | `fullscreen_jump_percent` | u32 | 10 | `fullscreen_jump_mode = Percent` のとき、画像・ZIP/PDF ページ総数に対してジャンプする割合 (1〜100%) |

@@ -237,9 +237,11 @@ reclaim も予約しない。detached session はメイン一覧をブロック�
 
 ボーダーレス fullscreen session 中に main viewport がフォーカスを得た場合、既定では
 「一覧へ戻りたい」意図とみなして `close_fullscreen()` する。環境設定
-`fullscreen_keep_on_app_switch` が ON のときは、Alt+Tab などの他アプリ切替から戻った際にも
-fullscreen session を保持するため、この main-focus guard を無効化する。main/root 側へ届いた
-fullscreen 操作用キーは `handle_fullscreen_root_key_input` で先に処理する。
+`fullscreen_keep_on_app_switch` (表示名: 「メインに戻ったらフルスクリーンへ復帰」) が ON
+のときは、Alt+Tab などで mIV の main viewport へ戻っても閉じず、fullscreen viewport /
+native presenter 側へ focus / raise を戻す。main/root 側へ届いた fullscreen 操作用キーは
+`handle_fullscreen_root_key_input` で先に処理する。メイン一覧も並行操作したい場合は
+detached viewer (F12) を使う。
 
 F11 の MainWindow / Fullscreen 選択は、F12 の detached ON/OFF とは独立した
 non-detached 側の表示設定として保持する。動画の native presenter から
