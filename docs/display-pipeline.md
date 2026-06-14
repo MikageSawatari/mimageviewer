@@ -679,7 +679,9 @@ ZIP の章区切り (`ZipSeparator`) は GPU テクスチャ化せず、前後�
   `retained_final_ai_cache_max_entries` / `retained_final_ai_cache_max_mib` の範囲で残る。
   再表示時は `final_ai_cache` miss の後に保持 LRU を参照し、ヒットした pixels を live cache
   へ戻してから final composite を再生成する。AI 入力が変わる編集では該当ページの保持分も
-  破棄し、post_filter / smart_sharpen だけの変更では保持する。保持 LRU の store / hit /
+  破棄し、post_filter / smart_sharpen だけの変更では保持する。fullscreen close / reopen
+  に伴う同じ item の `fs_cache` 再ロードでは live cache だけを作り直し、保持 LRU は残す。
+  保持 LRU の store / hit /
   miss / skip / evict / clear は `mimageviewer.log` に `[AI] Retained final AI ...`
   として記録する。
   ヒット時も元画像ロードと final composite の再生成は必要なので、再入場直後に 1 フレーム程度

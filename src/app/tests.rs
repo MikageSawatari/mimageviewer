@@ -9764,6 +9764,19 @@ mod pipeline_cache_refactor_tests {
         let idx = push_image(&mut app, "C:/pics/bump-input.jpg");
         let (erase_key, local_key, edit_key, final_key) =
             populate_all_idx_caches(&mut app, &ctx, idx, "bump_input");
+        app.insert_retained_final_ai(
+            idx,
+            FinalAiKey {
+                edit_key,
+                color_ai_hash: 0x22,
+                bg: 0,
+            },
+            [1, 1],
+            Arc::new(egui::ColorImage::new(
+                [1, 1],
+                vec![egui::Color32::from_rgb(12, 13, 14)],
+            )),
+        );
 
         app.bump_input_generation(idx);
 
@@ -9779,6 +9792,62 @@ mod pipeline_cache_refactor_tests {
         assert!(
             app.final_ai_cache.is_empty(),
             "bump_input は final_ai も idx 単位で clear する (= clear_edit_result_caches_for_idx 経由)"
+        );
+        assert!(
+            app.retained_final_ai_cache.is_empty(),
+            "AI 入力が実際に変わる input bump では retained final AI も clear する"
+        );
+    }
+
+    /// `poll_prefetch` が `fs_cache` に raw decode を取り込むときは input_generation を
+    /// 進めるが、fullscreen close / reopen で同じ item を再デコードしただけなら
+    /// session またぎ用の retained final AI は残す。ここを通常の
+    /// `bump_input_generation` に寄せると、reopen 直後に retained が消えて AI が再実行される。
+    #[test]
+    fn fs_cache_reload_generation_keeps_retained_final_ai_cache() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/fs-reload.jpg");
+        let (erase_key, local_key, edit_key, final_key) =
+            populate_all_idx_caches(&mut app, &ctx, idx, "fs_reload");
+        app.insert_retained_final_ai(
+            idx,
+            FinalAiKey {
+                edit_key,
+                color_ai_hash: 0x22,
+                bg: 0,
+            },
+            [1, 1],
+            Arc::new(egui::ColorImage::new(
+                [1, 1],
+                vec![egui::Color32::from_rgb(12, 13, 14)],
+            )),
+        );
+        assert!(
+            !app.retained_final_ai_cache.is_empty(),
+            "fixture should populate retained final AI"
+        );
+
+        app.bump_input_generation_for_fs_cache_reload(idx);
+
+        assert!(!app.erase_result_cache.contains_key(&erase_key));
+        assert!(!app.local_adjust_cache.contains_key(&local_key));
+        assert!(!app.conceal_cache.contains_key(&idx));
+        assert!(!app.edit_result_cache.contains_key(&edit_key));
+        assert!(!app.final_composite_cache.contains_key(&final_key));
+        assert!(
+            app.final_ai_cache.is_empty(),
+            "live final AI cache is tied to the old edit generation and must be rebuilt"
+        );
+
+        let next_key = FinalAiKey {
+            edit_key: dummy_edit_key(&app, idx),
+            color_ai_hash: 0x22,
+            bg: 0,
+        };
+        assert!(
+            app.has_retained_final_ai(idx, next_key, [1, 1]),
+            "retained final AI survives raw fs_cache reload and can restore into the new live key"
         );
     }
 

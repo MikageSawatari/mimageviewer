@@ -509,7 +509,9 @@ AI 完了時に未完了の final composite を捨てて AI 後の画像へ掛�
 `final_ai_cache` が miss しても `retained_final_ai_cache` が hit した場合は、その pixels を
 `final_ai_cache` に戻してから同じ合成経路に入る。保持 LRU は `close_fullscreen()` や
 keep-set eviction では消さず、AI 入力が変わる編集 (`clear_final_pipeline_caches_for_idx`)
-や AI 機能モード / サイズ上限変更で破棄する。保持 LRU の `store` / `hit` / `miss` /
+や AI 機能モード / サイズ上限変更で破棄する。fullscreen close / reopen に伴う同じ item の
+`fs_cache` 再ロードは `bump_input_generation_for_fs_cache_reload` で live cache だけを
+無効化し、保持 LRU は残す。保持 LRU の `store` / `hit` / `miss` /
 `skip` / `evict` / `clear` は通常ログ (`mimageviewer.log`) に出るため、同じページへ
 戻ったときに推論再実行ではなく保持結果の復元だったか、または保持前に破棄されたかを
 後から確認できる。
@@ -594,6 +596,9 @@ folder nav close でも呼ばれるため保持 LRU には触らない。AI 機�
 ように全体の実行判定が変わる設定変更では、保持 LRU も全クリアする。フォーカス復帰などで
 現在フォルダの実ディスク内容変更を signature 差分として検出した場合も、同じ path / 同じ
 画像寸法の上書き差し替えで旧 AI pixels を流用しないよう保持 LRU を全クリアする。
+`poll_prefetch` の raw decode 取り込みは `fs_cache` の再構築なので、live cache
+(`edit_result_cache` / `final_ai_cache` / `final_composite_cache`) は旧世代分を捨てるが、
+session またぎの retained final AI は残す。
 
 消しゴムマスク変更時は `erase_mask_generation[idx]` を進め、`erase_result_cache` と
 `local_adjust_cache` / `conceal_cache[idx]` / `edit_result_cache` / final cache を stale 化する。

@@ -24902,13 +24902,28 @@ impl App {
         self.clear_final_pipeline_caches_for_idx(idx);
     }
 
+    fn clear_edit_result_caches_for_idx_preserving_retained_final_ai(&mut self, idx: usize) {
+        self.edit_result_cache.retain(|key, _| key.idx != idx);
+        self.clear_final_pipeline_caches_for_idx_preserving_retained_final_ai(idx);
+    }
+
     fn clear_final_pipeline_caches_for_idx(&mut self, idx: usize) {
+        self.clear_final_pipeline_caches_for_idx_inner(idx, true);
+    }
+
+    fn clear_final_pipeline_caches_for_idx_preserving_retained_final_ai(&mut self, idx: usize) {
+        self.clear_final_pipeline_caches_for_idx_inner(idx, false);
+    }
+
+    fn clear_final_pipeline_caches_for_idx_inner(&mut self, idx: usize, clear_retained: bool) {
         self.cancel_final_ai_for_idx(idx);
         self.final_ai_cache.retain(|key, _| key.edit_key.idx != idx);
         self.final_ai_failed.retain(|key| key.edit_key.idx != idx);
         self.final_composite_cache
             .retain(|key, _| key.edit_key.idx != idx);
-        self.clear_retained_final_ai_for_idx(idx);
+        if clear_retained {
+            self.clear_retained_final_ai_for_idx(idx);
+        }
         // comic は final composite を下地にするので連動破棄 (base_ptr の ABA 回避)。
         self.comic_cache.remove(&idx);
         // 進行中の comic ベイク worker も cancel (stale 結果の upload を防ぐ、Codex P1)。
@@ -25523,6 +25538,7 @@ impl App {
     }
 
     /// 表示入力 (= raw / AI / 補正) が変わったことを idx 単位の世代で表す。
+    #[allow(dead_code)]
     pub(crate) fn bump_input_generation(&mut self, idx: usize) {
         let slot = self.input_generation.entry(idx).or_insert(0);
         *slot = slot.wrapping_add(1);
@@ -25532,6 +25548,23 @@ impl App {
         self.clear_erase_preview(idx);
         self.clear_conceal_caches(idx);
         self.clear_edit_result_caches_for_idx(idx);
+    }
+
+    /// `fs_cache` に raw decode 結果を取り込んだときの世代更新。
+    ///
+    /// 通常の `bump_input_generation` は「AI 入力が実際に変わる編集」用なので
+    /// `retained_final_ai_cache` も捨てる。一方、fullscreen を閉じて再度開いたときの
+    /// raw 再デコードは同じ item の同じ source pixels を戻しているだけなので、
+    /// session またぎ保持用の final AI pixels は残す。
+    pub(crate) fn bump_input_generation_for_fs_cache_reload(&mut self, idx: usize) {
+        let slot = self.input_generation.entry(idx).or_insert(0);
+        *slot = slot.wrapping_add(1);
+        self.cancel_erase_commit_pending_for_idx(idx);
+        self.clear_erase_result_caches_for_idx(idx);
+        self.clear_local_adjust_caches_for_idx(idx);
+        self.clear_erase_preview(idx);
+        self.conceal_cache.remove(&idx);
+        self.clear_edit_result_caches_for_idx_preserving_retained_final_ai(idx);
     }
 
     /// 全 idx の表示入力世代を進める。バルク補正やフォルダ切替などの広域 clear 用。
@@ -27651,8 +27684,8 @@ impl App {
         if self.should_native_rerender_pdf_for_ai(idx) {
             // fit 表示 (zoom≈1.0) でだけ到達するので native 基準 (zoom=1.0) で再レンダ。
             // 表示中ページなので priority レーン (即応)。再レンダ結果が fs_cache に載るとき
-            // bump_input_generation で下流 (edit / final / AI) cache が無効化され、final AI が
-            // native 寸法で再評価される。
+            // fs_cache reload 用の世代更新で下流 (edit / final / AI) cache が無効化され、
+            // final AI が native 寸法で再評価される。
             self.request_pdf_rerender(idx, 1.0, true);
         }
     }
@@ -30558,7 +30591,7 @@ impl App {
                 }
             };
             self.fs_cache.insert(key, entry);
-            self.bump_input_generation(key);
+            self.bump_input_generation_for_fs_cache_reload(key);
             // 360 度パノラマビュー Phase 2a (§3.6.4): worker は tee しなかったが、
             // 画像が 360 候補 (XMP equirect OR aspect 2:1) かつ大画像 (>200 MP) なら
             // バナー表示の判定。state が既に BaseOnly ならそのまま、未設定なら
