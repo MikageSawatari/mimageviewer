@@ -376,7 +376,8 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
 
 **GPU テクスチャ上限の規約 (MAX_TEXTURE_DIM = 8192)**:
 
-- `fs_cache` / `edit_result_cache` / `final_ai_cache` / `final_composite_cache`
+- `fs_cache` / `edit_result_cache` / `final_ai_cache` / `retained_final_ai_cache` /
+  `final_composite_cache`
   (および 360 モード等で残る `ai_upscale_cache` / `adjustment_cache`) に入る pixels は
   **常に 8192px 以内**。worker 側 `clamp_dynamic_for_gpu` で担保される。
 - UI スレッドの `clamp_for_gpu(&ColorImage)` は異常経路の安全網。通常パスでは
@@ -664,6 +665,13 @@ ZIP の章区切り (`ZipSeparator`) は GPU テクスチャ化せず、前後�
   ブラシ stroke 中は 150ms の idle まで重い再合成を遅延し、release 時に確定世代を進める。
 - **AI アップスケール/デノイズ**: final pipeline の別スレッドで推論。完了時に
   `final_ai_cache` に格納し、未完了の `final_composite_cache` を捨てて再合成する。
+- **AI 結果の保持 LRU**: 完了済みの final AI pixels は `retained_final_ai_cache` にも
+  `metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で保持する。通常の
+  `final_ai_cache` は fullscreen keep-set や `close_fullscreen()` で消えるが、保持 LRU は
+  `retained_final_ai_cache_max_entries` / `retained_final_ai_cache_max_mib` の範囲で残る。
+  再表示時は `final_ai_cache` miss の後に保持 LRU を参照し、ヒットした pixels を live cache
+  へ戻してから final composite を再生成する。AI 入力が変わる編集では該当ページの保持分も
+  破棄し、post_filter / smart_sharpen だけの変更では保持する。
 - **AI 先読み (新パイプライン)**: `App::prefetch_final_ai` がフルスクリーン更新ループ
   終盤で呼ばれ、現在ページの `final_ai_pending` (cancel フラグ除く) が空のときだけ
   隣接ページの `final_ai` 推論を 1 件 spawn する。`ai_prefetch_targets` で前後の

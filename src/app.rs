@@ -1606,6 +1606,20 @@ pub(crate) struct FinalAiKey {
     pub(crate) bg: u8,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RetainedFinalAiKey {
+    pub(crate) item_key: String,
+    pub(crate) edit_size: [usize; 2],
+    pub(crate) color_ai_hash: u64,
+    pub(crate) bg: u8,
+}
+
+pub(crate) struct RetainedFinalAiEntry {
+    pub(crate) pixels: Arc<egui::ColorImage>,
+    pub(crate) bytes: u64,
+    pub(crate) last_used: u64,
+}
+
 pub(crate) struct FinalAiPending {
     pub(crate) cancel: Arc<AtomicBool>,
 }
@@ -1619,6 +1633,7 @@ impl Drop for FinalAiPending {
 pub(crate) enum FinalAiResult {
     Ready {
         key: FinalAiKey,
+        source_size: [usize; 2],
         image: egui::ColorImage,
     },
     Cancelled {
@@ -3672,6 +3687,11 @@ pub struct App {
     pub(crate) edit_result_cache: std::collections::HashMap<EditResultKey, EditResultEntry>,
     /// edit_result へ色調補正を掛けた後に AI を適用した pixels cache。
     pub(crate) final_ai_cache: std::collections::HashMap<FinalAiKey, Arc<egui::ColorImage>>,
+    /// フルスクリーン session をまたいで保持する final AI pixels cache。
+    /// live cache とは別に、idx ではなくページの安定キー + AI 入力条件で LRU 管理する。
+    pub(crate) retained_final_ai_cache:
+        std::collections::HashMap<RetainedFinalAiKey, RetainedFinalAiEntry>,
+    pub(crate) retained_final_ai_clock: u64,
     /// final AI 処理中。表示中ページを優先し、古い key は cancel する。
     pub(crate) final_ai_pending: std::collections::HashMap<FinalAiKey, FinalAiPending>,
     /// final AI 失敗 key。モデル不在 / 推論失敗時の無限再試行を避ける。
@@ -5212,6 +5232,8 @@ impl App {
             local_adjust_cache: std::collections::HashMap::new(),
             edit_result_cache: std::collections::HashMap::new(),
             final_ai_cache: std::collections::HashMap::new(),
+            retained_final_ai_cache: std::collections::HashMap::new(),
+            retained_final_ai_clock: 0,
             final_ai_pending: std::collections::HashMap::new(),
             final_ai_failed: std::collections::HashSet::new(),
             ai_job_queue: None,
@@ -23381,6 +23403,7 @@ impl App {
         }
         self.ai_upscale_cache.clear();
         self.ai_upscale_failed.clear();
+        self.clear_retained_final_ai_cache();
         self.bump_all_ai_generations();
         if let Some(idx) = self.fullscreen_idx {
             self.sync_upscale_from_preset(idx);
@@ -23401,6 +23424,7 @@ impl App {
         }
         self.ai_upscale_cache.clear();
         self.ai_upscale_failed.clear();
+        self.clear_retained_final_ai_cache();
         // bump_all_ai_generations が clear_all_final_pipeline_caches を内包する
         // (= final_ai_pending cancel + final_ai_cache / failed / composite 破棄)。
         self.bump_all_ai_generations();
@@ -24095,7 +24119,9 @@ impl App {
             // AI 不要 (= モデル未設定 or skip_px 超) → done
             return true;
         };
-        self.final_ai_cache.contains_key(&key) || self.final_ai_failed.contains(&key)
+        self.final_ai_cache.contains_key(&key)
+            || self.has_retained_final_ai(idx, key, pixels.size)
+            || self.final_ai_failed.contains(&key)
     }
 
     /// 先読み進捗バー用の (done, total) を返す。総 target が 0 ならバー非表示
@@ -24177,6 +24203,12 @@ impl App {
             else {
                 continue;
             };
+            if !self.final_ai_cache.contains_key(&key)
+                && let Some(pixels) = self.lookup_retained_final_ai(idx, key, edit_pixels.size)
+            {
+                self.final_ai_cache.insert(key, pixels);
+                continue;
+            }
             if self.final_ai_cache.contains_key(&key)
                 || self.final_ai_pending.contains_key(&key)
                 || self.final_ai_failed.contains(&key)
@@ -24802,6 +24834,7 @@ impl App {
         self.final_ai_failed.retain(|key| key.edit_key.idx != idx);
         self.final_composite_cache
             .retain(|key, _| key.edit_key.idx != idx);
+        self.clear_retained_final_ai_for_idx(idx);
         // comic は final composite を下地にするので連動破棄 (base_ptr の ABA 回避)。
         self.comic_cache.remove(&idx);
         // 進行中の comic ベイク worker も cancel (stale 結果の upload を防ぐ、Codex P1)。
@@ -25901,6 +25934,124 @@ impl App {
         })
     }
 
+    fn retained_final_ai_budget(&self) -> Option<(usize, u64)> {
+        let max_entries = self.settings.retained_final_ai_cache_max_entries;
+        let max_mib = self.settings.retained_final_ai_cache_max_mib;
+        if max_entries == 0 || max_mib == 0 {
+            return None;
+        }
+        Some((max_entries, max_mib.saturating_mul(1024 * 1024)))
+    }
+
+    fn retained_final_ai_image_bytes(pixels: &egui::ColorImage) -> u64 {
+        pixels.as_raw().len() as u64
+    }
+
+    fn retained_final_ai_key_for(
+        &self,
+        idx: usize,
+        key: FinalAiKey,
+        edit_size: [usize; 2],
+    ) -> Option<RetainedFinalAiKey> {
+        Some(RetainedFinalAiKey {
+            item_key: self.metadata_cache_key(idx)?,
+            edit_size,
+            color_ai_hash: key.color_ai_hash,
+            bg: key.bg,
+        })
+    }
+
+    fn insert_retained_final_ai(
+        &mut self,
+        idx: usize,
+        key: FinalAiKey,
+        edit_size: [usize; 2],
+        pixels: Arc<egui::ColorImage>,
+    ) {
+        let Some((max_entries, max_bytes)) = self.retained_final_ai_budget() else {
+            self.retained_final_ai_cache.clear();
+            return;
+        };
+        let Some(retained_key) = self.retained_final_ai_key_for(idx, key, edit_size) else {
+            return;
+        };
+        let bytes = Self::retained_final_ai_image_bytes(&pixels);
+        if bytes > max_bytes {
+            return;
+        }
+        self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
+        self.retained_final_ai_cache.insert(
+            retained_key,
+            RetainedFinalAiEntry {
+                pixels,
+                bytes,
+                last_used: self.retained_final_ai_clock,
+            },
+        );
+        self.prune_retained_final_ai_cache_to_budget(max_entries, max_bytes);
+    }
+
+    fn lookup_retained_final_ai(
+        &mut self,
+        idx: usize,
+        key: FinalAiKey,
+        edit_size: [usize; 2],
+    ) -> Option<Arc<egui::ColorImage>> {
+        let retained_key = self.retained_final_ai_key_for(idx, key, edit_size)?;
+        self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
+        let entry = self.retained_final_ai_cache.get_mut(&retained_key)?;
+        entry.last_used = self.retained_final_ai_clock;
+        Some(Arc::clone(&entry.pixels))
+    }
+
+    fn has_retained_final_ai(&self, idx: usize, key: FinalAiKey, edit_size: [usize; 2]) -> bool {
+        self.retained_final_ai_key_for(idx, key, edit_size)
+            .is_some_and(|retained_key| self.retained_final_ai_cache.contains_key(&retained_key))
+    }
+
+    fn prune_retained_final_ai_cache_to_budget(&mut self, max_entries: usize, max_bytes: u64) {
+        let mut total_bytes: u64 = self
+            .retained_final_ai_cache
+            .values()
+            .map(|entry| entry.bytes)
+            .sum();
+        while self.retained_final_ai_cache.len() > max_entries || total_bytes > max_bytes {
+            let Some(oldest_key) = self
+                .retained_final_ai_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = self.retained_final_ai_cache.remove(&oldest_key) {
+                total_bytes = total_bytes.saturating_sub(removed.bytes);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn prune_retained_final_ai_cache_to_settings(&mut self) {
+        let Some((max_entries, max_bytes)) = self.retained_final_ai_budget() else {
+            self.retained_final_ai_cache.clear();
+            return;
+        };
+        self.prune_retained_final_ai_cache_to_budget(max_entries, max_bytes);
+    }
+
+    fn clear_retained_final_ai_for_idx(&mut self, idx: usize) {
+        let Some(item_key) = self.metadata_cache_key(idx) else {
+            return;
+        };
+        self.retained_final_ai_cache
+            .retain(|key, _| key.item_key != item_key);
+    }
+
+    pub(crate) fn clear_retained_final_ai_cache(&mut self) {
+        self.retained_final_ai_cache.clear();
+    }
+
     fn final_composite_key_for_pixels(
         &self,
         edit_key: EditResultKey,
@@ -26157,7 +26308,18 @@ impl App {
         let params = self.effective_params(idx).clone();
         let final_key = self.final_composite_key_for_pixels(edit_key, edit_pixels.size, &params);
         let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, &params);
-        let ai_ready = ai_key.and_then(|key| self.final_ai_cache.get(&key).cloned());
+        let ai_ready = if let Some(key) = ai_key {
+            if let Some(pixels) = self.final_ai_cache.get(&key).cloned() {
+                Some(pixels)
+            } else if let Some(pixels) = self.lookup_retained_final_ai(idx, key, edit_pixels.size) {
+                self.final_ai_cache.insert(key, Arc::clone(&pixels));
+                Some(pixels)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // AI が失敗確定 (final_ai_failed) した場合、AI 待ちの暫定 entry (complete=false)
         // を返し続けない。表示画素は同じだが complete が立たないままだと、complete
         // のみ受け付けるコピー / 書き出し (`ensure_final_composite_pixels_with_key`)
@@ -26994,8 +27156,19 @@ impl App {
                 continue;
             }
             match result {
-                FinalAiResult::Ready { key, image } => {
-                    self.final_ai_cache.insert(key, Arc::new(image));
+                FinalAiResult::Ready {
+                    key,
+                    source_size,
+                    image,
+                } => {
+                    let pixels = Arc::new(image);
+                    self.insert_retained_final_ai(
+                        key.edit_key.idx,
+                        key,
+                        source_size,
+                        Arc::clone(&pixels),
+                    );
+                    self.final_ai_cache.insert(key, pixels);
                     self.final_composite_cache.retain(|cache_key, entry| {
                         cache_key.edit_key != key.edit_key || entry.complete
                     });
@@ -33952,6 +34125,7 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
     let runtime = &job.runtime;
     let manager = &job.manager;
     let cancel = &job.cancel;
+    let source_size = job.source.size;
 
     // モデルロードは worker 上で。ロードに失敗したモデルは「使えない」扱いに落とす
     // (UI スレッドで load していた旧設計と最終状態は同じ: 両方不可なら Failed)。
@@ -34002,6 +34176,7 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
                 } else {
                     return FinalAiResult::Ready {
                         key,
+                        source_size,
                         image: denoised,
                     };
                 }
@@ -34031,6 +34206,7 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
             // 安全網に流すと同期ハングし、cache にも 16K 級画像を抱えてしまう。
             Ok(image) => FinalAiResult::Ready {
                 key,
+                source_size,
                 image: clamp_color_image_for_gpu(image),
             },
             Err(err) => {

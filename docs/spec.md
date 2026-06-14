@@ -822,6 +822,8 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `thumb_idle_upgrade` | bool | true | アイドル時にキャッシュ由来サムネイルを高画質化 |
 | `prefetch_back` | usize | 4 | フルスクリーン先読み（前方枚数） |
 | `prefetch_forward` | usize | 12 | フルスクリーン先読み（後方枚数） |
+| `retained_final_ai_cache_max_entries` | usize | 10 | フルスクリーンを閉じた後も保持する final AI 結果 (アップスケール / ノイズ除去後 pixels) の最大枚数。`0` で保持しない。環境設定では 0〜20 |
+| `retained_final_ai_cache_max_mib` | u64 | 512 | 上記保持キャッシュの CPU メモリ上限 (MiB)。`0` で保持しない。環境設定では 0〜8192 MB。枚数とメモリのどちらかを超えると LRU で古い結果から破棄する |
 
 ### 8.4 その他
 

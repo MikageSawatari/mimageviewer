@@ -1819,6 +1819,16 @@ pub struct Settings {
     #[serde(default = "default_ai_upscale_prefetch_forward")]
     pub ai_upscale_prefetch_forward: usize,
 
+    /// AI アップスケール / ノイズ除去: フルスクリーンを閉じた後も保持する結果の最大枚数。
+    /// 0 または `retained_final_ai_cache_max_mib == 0` で保持を無効化する。
+    #[serde(default = "default_retained_final_ai_cache_max_entries")]
+    pub retained_final_ai_cache_max_entries: usize,
+
+    /// AI アップスケール / ノイズ除去: フルスクリーンを閉じた後も保持する結果の上限 (MiB)。
+    /// CPU 側 `ColorImage` の概算 RGBA8 バイト数で管理する。
+    #[serde(default = "default_retained_final_ai_cache_max_mib")]
+    pub retained_final_ai_cache_max_mib: u64,
+
     /// AI アップスケール: スキップしきい値（この値以上の画像はスキップ）
     ///
     /// 旧形式 (単一値)。読み書きは `ai_upscale_limit()` / `ai_upscale_size_limit` 経由に
@@ -2535,6 +2545,12 @@ pub const FULLSCREEN_FIXED_JUMP_DEFAULT: usize = 10;
 pub const FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS: f32 = 0.1;
 pub const FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS: f32 = 5.0;
 pub const FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS: f32 = 1.0;
+pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MIN: usize = 0;
+pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX: usize = 20;
+pub const RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_DEFAULT: usize = 10;
+pub const RETAINED_FINAL_AI_CACHE_MAX_MIB_MIN: u64 = 0;
+pub const RETAINED_FINAL_AI_CACHE_MAX_MIB_MAX: u64 = 8192;
+pub const RETAINED_FINAL_AI_CACHE_MAX_MIB_DEFAULT: u64 = 512;
 
 fn default_grid_cols() -> usize {
     4
@@ -2599,6 +2615,12 @@ fn default_ai_upscale_prefetch_back() -> usize {
 }
 fn default_ai_upscale_prefetch_forward() -> usize {
     2
+}
+fn default_retained_final_ai_cache_max_entries() -> usize {
+    RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_DEFAULT
+}
+fn default_retained_final_ai_cache_max_mib() -> u64 {
+    RETAINED_FINAL_AI_CACHE_MAX_MIB_DEFAULT
 }
 fn default_ai_upscale_skip_px() -> u32 {
     2048
@@ -2879,6 +2901,8 @@ impl Default for Settings {
             ai_upscale_model_override: None,
             ai_upscale_prefetch_back: default_ai_upscale_prefetch_back(),
             ai_upscale_prefetch_forward: default_ai_upscale_prefetch_forward(),
+            retained_final_ai_cache_max_entries: default_retained_final_ai_cache_max_entries(),
+            retained_final_ai_cache_max_mib: default_retained_final_ai_cache_max_mib(),
             ai_upscale_skip_px: default_ai_upscale_skip_px(),
             ai_denoise_skip_px: default_ai_denoise_skip_px(),
             ai_upscale_size_limit: None,
@@ -3855,6 +3879,14 @@ impl Settings {
             .clamp(FULLSCREEN_FIXED_JUMP_MIN, FULLSCREEN_FIXED_JUMP_MAX);
         self.fullscreen_cursor_hide_delay_secs =
             clamp_fullscreen_cursor_hide_delay_secs(self.fullscreen_cursor_hide_delay_secs);
+        self.retained_final_ai_cache_max_entries = self.retained_final_ai_cache_max_entries.clamp(
+            RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MIN,
+            RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX,
+        );
+        self.retained_final_ai_cache_max_mib = self.retained_final_ai_cache_max_mib.clamp(
+            RETAINED_FINAL_AI_CACHE_MAX_MIB_MIN,
+            RETAINED_FINAL_AI_CACHE_MAX_MIB_MAX,
+        );
         if self.margin_fit_enabled && matches!(self.fullscreen_fit_mode, FullscreenFitMode::Page) {
             self.fullscreen_fit_mode = FullscreenFitMode::MarginFit;
         }
@@ -4182,6 +4214,14 @@ mod tests {
         assert!(s.window_size.is_none());
         assert_eq!(s.prefetch_back, 4);
         assert_eq!(s.prefetch_forward, 12);
+        assert_eq!(
+            s.retained_final_ai_cache_max_entries,
+            RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_DEFAULT
+        );
+        assert_eq!(
+            s.retained_final_ai_cache_max_mib,
+            RETAINED_FINAL_AI_CACHE_MAX_MIB_DEFAULT
+        );
         assert_eq!(s.folder_skip_limit, 5);
         assert_eq!(s.sort_order, SortOrder::FileName);
         assert_eq!(s.thumb_px, 512);
@@ -4426,6 +4466,14 @@ mod tests {
         assert_eq!(loaded.thumb_quality, original.thumb_quality);
         assert_eq!(loaded.cache_threshold_ms, original.cache_threshold_ms);
         assert_eq!(loaded.prefetch_back, original.prefetch_back);
+        assert_eq!(
+            loaded.retained_final_ai_cache_max_entries,
+            original.retained_final_ai_cache_max_entries
+        );
+        assert_eq!(
+            loaded.retained_final_ai_cache_max_mib,
+            original.retained_final_ai_cache_max_mib
+        );
         assert_eq!(loaded.startup_folder_mode, original.startup_folder_mode);
         assert_eq!(loaded.startup_folder_path, original.startup_folder_path);
         assert_eq!(loaded.recent_folders, original.recent_folders);
@@ -4492,6 +4540,14 @@ mod tests {
             loaded.video_continuous_mode,
             crate::video::VideoContinuousMode::Off
         );
+        assert_eq!(
+            loaded.retained_final_ai_cache_max_entries,
+            RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_DEFAULT
+        );
+        assert_eq!(
+            loaded.retained_final_ai_cache_max_mib,
+            RETAINED_FINAL_AI_CACHE_MAX_MIB_DEFAULT
+        );
         assert!(!loaded.video_muted);
         assert_eq!(loaded.video_deinterlace, VideoDeinterlaceMode::Auto);
         assert!(!loaded.video_grid_open_starts_from_beginning);
@@ -4531,6 +4587,8 @@ mod tests {
         s.fullscreen_jump_percent = 999;
         s.fullscreen_fixed_jump_count = 999;
         s.fullscreen_cursor_hide_delay_secs = 99.0;
+        s.retained_final_ai_cache_max_entries = 999;
+        s.retained_final_ai_cache_max_mib = 999_999;
         s.sanitize();
         assert_eq!(s.spread_page_gap_px, 200);
         assert_eq!(s.continuous_reading_gap_px, 200);
@@ -4543,10 +4601,20 @@ mod tests {
             s.fullscreen_cursor_hide_delay_secs,
             FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS
         );
+        assert_eq!(
+            s.retained_final_ai_cache_max_entries,
+            RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX
+        );
+        assert_eq!(
+            s.retained_final_ai_cache_max_mib,
+            RETAINED_FINAL_AI_CACHE_MAX_MIB_MAX
+        );
 
         s.fullscreen_jump_percent = 0;
         s.fullscreen_fixed_jump_count = 0;
         s.fullscreen_cursor_hide_delay_secs = 0.0;
+        s.retained_final_ai_cache_max_entries = 0;
+        s.retained_final_ai_cache_max_mib = 0;
         s.sanitize();
         assert_eq!(s.fullscreen_jump_percent, FULLSCREEN_JUMP_PERCENT_MIN);
         assert_eq!(s.fullscreen_fixed_jump_count, FULLSCREEN_FIXED_JUMP_MIN);
@@ -4554,6 +4622,8 @@ mod tests {
             s.fullscreen_cursor_hide_delay_secs,
             FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS
         );
+        assert_eq!(s.retained_final_ai_cache_max_entries, 0);
+        assert_eq!(s.retained_final_ai_cache_max_mib, 0);
 
         s.fullscreen_cursor_hide_delay_secs = f32::NAN;
         s.sanitize();

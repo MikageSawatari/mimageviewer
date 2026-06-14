@@ -746,6 +746,38 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 
     ui.add_space(12.0);
+    ui.label(egui::RichText::new("AI アップスケール結果の保持").strong());
+    ui.add_space(4.0);
+    ui.label(
+        "フルスクリーンを閉じた後も、完了済みの AI アップスケール / ノイズ除去結果を\n\
+         メモリに残す上限です。どちらかを 0 にすると保持しません。",
+    );
+    ui.add_space(4.0);
+
+    ui.horizontal(|ui| {
+        ui.label("最大枚数:");
+        ui.add(
+            egui::DragValue::new(&mut s.retained_final_ai_cache_max_entries)
+                .range(
+                    settings::RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MIN
+                        ..=settings::RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX,
+                )
+                .suffix(" 枚"),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("最大メモリ:");
+        ui.add(
+            egui::DragValue::new(&mut s.retained_final_ai_cache_max_mib)
+                .range(
+                    settings::RETAINED_FINAL_AI_CACHE_MAX_MIB_MIN
+                        ..=settings::RETAINED_FINAL_AI_CACHE_MAX_MIB_MAX,
+                )
+                .suffix(" MB"),
+        );
+    });
+
+    ui.add_space(12.0);
     ui.label(egui::RichText::new("AI 処理のサイズ上限").strong());
     ui.add_space(4.0);
     ui.label("長辺と短辺がどちらも上限未満の画像のみ AI 処理を実行します (上限以上はスキップ)。");

@@ -423,7 +423,7 @@ Source thread: https://egg.5ch.io/test/read.cgi/software/1752914772/
 
 ### 4.13 v1.5.0 nested archive / spread / AI cache feedback
 
-- Source: 766.
+- Source: 766, 768.
 - Context:
   - User verified v1.5.0 fixes related to nested ZIP/RAR handling, fullscreen Ctrl+↑/↓ movement, and spread display.
   - Feedback includes two bug reports and two enhancement requests.
@@ -448,20 +448,26 @@ Source thread: https://egg.5ch.io/test/read.cgi/software/1752914772/
     - Left/right splitting could help with per-texture limits or peak intermediate memory in some designs, but it would add virtual-page complexity across spread pairing, page numbering, cache keys, rotation, crop, adjustments, export/capture, and ordinary landscape images that should not be split.
     - Decision for now: do not implement joined-image left/right split as part of this request. Prefer explicit high-load size-limit options above the current 4096x4096-under class, with clear wording that processing time and memory usage can be large.
     - Keep the final rendered AI output within the existing GPU texture compatibility limit (currently treated as 8192px per side) and validate memory behavior before exposing very large presets.
-- Request 4: keep AI/fullscreen cache after fullscreen is dismissed.
+- Request 4: keep AI/fullscreen cache after fullscreen is dismissed. (implemented: retained final AI LRU)
   - User reports that when AI-upscaled fullscreen cache exists, moving focus or otherwise leaving fullscreen clears the cache.
   - Requested behavior: either keep fullscreen from being dismissed, or keep the AI cache alive after dismissal.
-  - Current likely behavior:
-    - `close_fullscreen()` clears `fs_cache`, `edit_result_cache`, `final_ai_cache`, `final_composite_cache`, legacy `ai_upscale_cache`, and pending fullscreen / AI work.
-    - During fullscreen, final AI cache eviction is keep-set based; after fullscreen closes it is cleared globally.
+  - Follow-up from 768: the cache interpretation was confirmed, and the user additionally wants fullscreen not to be dismissed when switching to another app because they frequently move between multiple apps while mIV stays open.
+  - Implemented behavior:
+    - `close_fullscreen()` still clears live fullscreen caches (`fs_cache`, `edit_result_cache`, `final_ai_cache`, `final_composite_cache`, legacy `ai_upscale_cache`) and pending work.
+    - Completed final AI pixels are also stored in `retained_final_ai_cache`, keyed by page stable key + edit input size + AI/color hash + transparency bg.
+    - The retained layer is LRU-limited by settings (`retained_final_ai_cache_max_entries`, default 10, range 0-20; `retained_final_ai_cache_max_mib`, default 512, range 0-8192 MB).
   - Interpretation:
     - The request likely means: after accidentally leaving fullscreen or switching focus, reopening the same page should not require AI upscale to run again; keep several recently processed fullscreen pages in memory.
     - This is not the archive conversion cache or thumbnail cache. It is the in-memory final display / AI pipeline cache.
-  - Design notes:
-    - A "do not close fullscreen on focus loss" option may be separate from cache retention and should be investigated against current fullscreen focus/viewport behavior.
-    - Keeping final AI results after fullscreen close can consume large memory (4x/full-resolution pages can be tens to hundreds of MB per page), so any retention needs a page-count or byte/megapixel budget and clear eviction rules.
-    - Must avoid stale idx-keyed cache reuse after folder reload, sort/filter changes, or search result item replacement. Prefer path/edit-key based cache keys or clear on any item-generation boundary.
-    - Consider first adding diagnostics / reproduction steps to confirm whether the user sees actual AI recomputation or just GPU texture re-upload from retained pixels.
+  - Follow-up notes:
+    - A "do not close fullscreen on focus loss" option remains separate from cache retention and should still be implemented as a display/fullscreen preference.
+    - Proposed setting label: `他アプリに切り替えてもフルスクリーンを保持する`.
+    - Proposed location: Display Mode / fullscreen-related preferences, near mouse cursor hiding, page overlay, seekbar, and fullscreen behavior options.
+    - Proposed default: off. This preserves the current behavior, avoids surprising users who expect fullscreen to go away on app switch, and is safer for multi-monitor / window stacking workflows.
+    - When enabled, app deactivation / focus loss should not call `close_fullscreen()` solely because another app became active. Explicit user actions such as Esc, close button, normal fullscreen toggle, or opening a different target should still close or replace fullscreen as today.
+    - Verify inactive fullscreen does not remain topmost over the newly focused app; app switching should let the other app be usable while preserving mIV fullscreen state for when focus returns.
+    - This keeps CPU pixels for final AI results, not final composite textures. Reopening can still require final composite rebuild / GPU upload, but avoids AI re-inference.
+    - Retained entries are removed for the page when AI input-changing edits invalidate final pipeline caches; AI feature mode / size-limit changes clear the retained layer globally.
 - Priority:
   - High for bug reports 1 and 2 once reproducible.
   - Medium for request 3 if a bounded high-load threshold option is straightforward; low for any left/right virtual split implementation.

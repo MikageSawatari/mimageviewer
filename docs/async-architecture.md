@@ -268,10 +268,11 @@ pending 中は追加ホイール入力を捨て、queue も delta 累積もし�
   で gate するため、未キャンセル pending がある間は新しい先読みを enqueue しない
   (= キューに先読みが溜まりすぎない)。display ジョブはこの gate の対象外で即 enqueue。
 
-> 注: ここで残る課題は「常駐キャッシュ (`final_ai_cache` / `final_composite_cache`) の
-> 退去が **枚数** (keep_set ≈ 前後 18 idx) ベースで、4x フル解像度 (1 枚 82-156MB) を
-> バイト/メガピクセル予算で縛っていない」点と「ページ送り中に AI 起動をデバウンスして
-> いない」点。VRAM 常駐の根本ガードと高速スクラブ時の起動抑制は別タスク。
+> 注: fullscreen session をまたぐ final AI pixels は `retained_final_ai_cache` で
+> 枚数 + MiB の LRU 管理を行う。これは CPU 側の推論結果保持で、表示中の
+> `final_ai_cache` / `final_composite_cache` や GPU テクスチャの keep-set eviction とは別層。
+> 残る課題は、表示中キャッシュ / GPU 常駐分のバイト予算と、高速ページ送り中の AI 起動
+> デバウンスである。
 
 ### 3.3 フルスクリーン読み込みの優先度制御
 

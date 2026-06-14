@@ -11137,6 +11137,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_pending.insert(ready_key, pending);
         tx.send(FinalAiResult::Ready {
             key: ready_key,
+            source_size: [1, 1],
             image: egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
         })
         .unwrap();
@@ -11155,6 +11156,7 @@ mod pipeline_cache_refactor_tests {
         let unknown_key = mk_key(2);
         tx.send(FinalAiResult::Ready {
             key: unknown_key,
+            source_size: [1, 1],
             image: egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
         })
         .unwrap();
@@ -11183,6 +11185,49 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    #[test]
+    fn retained_final_ai_cache_prunes_by_lru_entry_budget() {
+        let mut app = setup_app();
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\imgs\00.png")),
+            GridItem::Image(PathBuf::from(r"C:\imgs\01.png")),
+            GridItem::Image(PathBuf::from(r"C:\imgs\02.png")),
+        ];
+        app.settings.retained_final_ai_cache_max_entries = 2;
+        app.settings.retained_final_ai_cache_max_mib = 1;
+
+        let mk_key = |idx: usize| FinalAiKey {
+            edit_key: EditResultKey {
+                idx,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+            },
+            color_ai_hash: 42,
+            bg: 0,
+        };
+        let image = || Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]));
+        let edit_size = [10, 10];
+
+        app.insert_retained_final_ai(0, mk_key(0), edit_size, image());
+        app.insert_retained_final_ai(1, mk_key(1), edit_size, image());
+        assert!(
+            app.lookup_retained_final_ai(0, mk_key(0), edit_size)
+                .is_some(),
+            "lookup must refresh idx 0 as most-recently used"
+        );
+        app.insert_retained_final_ai(2, mk_key(2), edit_size, image());
+
+        assert!(app.has_retained_final_ai(0, mk_key(0), edit_size));
+        assert!(
+            !app.has_retained_final_ai(1, mk_key(1), edit_size),
+            "least-recently used entry should be evicted"
+        );
+        assert!(app.has_retained_final_ai(2, mk_key(2), edit_size));
+    }
+
     /// AI 処理サイズ上限の変更 (`apply_ai_size_limit_change`) は final AI cache /
     /// failed / live pending / final composite と旧 AI cache 系を全て無効化する
     /// (Codex P3)。サイズ上限はキャッシュ key に含まれないため、明示破棄しないと
@@ -11191,6 +11236,7 @@ mod pipeline_cache_refactor_tests {
     fn apply_ai_size_limit_change_invalidates_ai_caches() {
         let ctx = egui::Context::default();
         let mut app = setup_app();
+        app.items = vec![GridItem::Image(PathBuf::from(r"C:\imgs\00.png"))];
 
         let edit_key = EditResultKey {
             idx: 0,
@@ -11207,6 +11253,12 @@ mod pipeline_cache_refactor_tests {
         };
         app.final_ai_cache.insert(
             base_key,
+            Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
+        );
+        app.insert_retained_final_ai(
+            0,
+            base_key,
+            [1, 1],
             Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
         );
         app.final_ai_failed.insert(FinalAiKey {
@@ -11259,6 +11311,10 @@ mod pipeline_cache_refactor_tests {
         app.apply_ai_size_limit_change();
 
         assert!(app.final_ai_cache.is_empty(), "final_ai_cache cleared");
+        assert!(
+            app.retained_final_ai_cache.is_empty(),
+            "retained final AI cache cleared"
+        );
         assert!(app.final_ai_failed.is_empty(), "final_ai_failed cleared");
         assert!(app.final_ai_pending.is_empty(), "final_ai_pending cleared");
         assert!(

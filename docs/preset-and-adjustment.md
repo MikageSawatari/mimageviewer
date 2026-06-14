@@ -456,6 +456,7 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
 | `conceal_cache` | `HashMap<idx, ConcealCacheEntry>` | 隠蔽加工合成済みテクスチャ |
 | `edit_result_cache` | `HashMap<EditResultKey, EditResultEntry>` | `raw -> erase -> local_adjust -> conceal` の source 解像度 edit 結果。AdjustParams / AI / post_filter / crop は含めない |
 | `final_ai_cache` | `HashMap<FinalAiKey, Arc<ColorImage>>` | 色調補正後の edit 結果へ AI アップスケール / デノイズを適用した結果 |
+| `retained_final_ai_cache` | `HashMap<RetainedFinalAiKey, RetainedFinalAiEntry>` | fullscreen session をまたいで保持する final AI pixels。`metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で識別し、枚数 / MiB の LRU で退去 |
 | `final_composite_cache` | `HashMap<FinalCompositeKey, FinalCompositeEntry>` | edit 結果に AdjustParams 全項目、final AI、スマートシャープ、post_filter を適用した通常表示用テクスチャ |
 
 描画時 ([display-pipeline.md](display-pipeline.md) を参照) は:
@@ -505,6 +506,10 @@ AI を無駄に再実行してしまう)。
 
 の順で最終表示を作る。AI 未完了中は色調補正済み (+シャープ化済み) の画像を暫定表示し、
 AI 完了時に未完了の final composite を捨てて AI 後の画像へ掛け直して再合成する。
+`final_ai_cache` が miss しても `retained_final_ai_cache` が hit した場合は、その pixels を
+`final_ai_cache` に戻してから同じ合成経路に入る。保持 LRU は `close_fullscreen()` や
+keep-set eviction では消さず、AI 入力が変わる編集 (`clear_final_pipeline_caches_for_idx`)
+や AI 機能モード / サイズ上限変更で破棄する。
 
 ### 3.3 サムネイル補正
 
@@ -579,6 +584,11 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 *「色系」= brightness/contrast/gamma/saturation/temperature/levels/auto_mode
 (ポストフィルタ / シャープ化は final 専用項目で、単独変更なら上記の
 `clear_final_stage_only_caches` 行の扱い。色系と同時に変わった場合は色系変更として扱う)
+
+`retained_final_ai_cache` は、上表で `final_ai_cache` をクリアする idx 単位の変更では同じ
+ページキーの entry を削除する。`clear_all_final_pipeline_caches()` は fullscreen close /
+folder nav close でも呼ばれるため保持 LRU には触らない。AI 機能モードや AI 処理サイズ上限の
+ように全体の実行判定が変わる設定変更では、保持 LRU も全クリアする。
 
 消しゴムマスク変更時は `erase_mask_generation[idx]` を進め、`erase_result_cache` と
 `local_adjust_cache` / `conceal_cache[idx]` / `edit_result_cache` / final cache を stale 化する。

@@ -712,6 +712,10 @@ impl App {
                     self.settings.ai_upscale_limit(),
                     self.settings.ai_denoise_limit(),
                 );
+                let old_retained_final_ai_cache_budget = (
+                    self.settings.retained_final_ai_cache_max_entries,
+                    self.settings.retained_final_ai_cache_max_mib,
+                );
 
                 // VST3 enable 状態 + チェーン構成の変化を検出してホットリロード。
                 let old_vst3_enabled = self.settings.vst3_enabled;
@@ -786,6 +790,13 @@ impl App {
                 );
                 if old_ai_size_limits != new_ai_size_limits {
                     self.apply_ai_size_limit_change();
+                }
+                let new_retained_final_ai_cache_budget = (
+                    self.settings.retained_final_ai_cache_max_entries,
+                    self.settings.retained_final_ai_cache_max_mib,
+                );
+                if old_retained_final_ai_cache_budget != new_retained_final_ai_cache_budget {
+                    self.prune_retained_final_ai_cache_to_settings();
                 }
 
                 // 同名ファイル設定が変更された場合はフォルダを再読み込み
