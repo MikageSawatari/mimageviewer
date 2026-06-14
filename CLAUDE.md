@@ -1380,7 +1380,12 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
       **こちらを使う**)。短縮版が存在するかは `ls docs/release-body-<version>.md` で確認。
       別セッションで Phase 4 を実施する場合もこのファイルの有無で判断できる。
     - どちらの場合も、この body がアプリ内アップデート通知にそのまま表示される。
-      成果物 (3 種類) を Assets として添付する。
+      **Phase 3 の配布成果物 4 種類すべて** を Assets として添付する:
+      `mimageviewer.exe` (単体exe版) / `mImageViewer_setup.exe` (インストーラ版) /
+      `mImageViewer_installer_v<VERSION>.zip` (Vector 申請用 zip) /
+      `mImageViewer_portable_v<VERSION>.zip` (ポータブル版)。過去リリース (v1.5.0 等) は
+      この 4 点を添付済みなので、`gh release view v<前版> --json assets` で添付漏れがないか
+      照合する。
     - 実例: v1.0.0 は短縮版 [docs/release-body-v1.0.0.md](docs/release-body-v1.0.0.md) を使用。
 15. 公開後、別マシンから `mimageviewer.exe` を起動 → 起動時更新通知ダイアログで
     body が想定どおりに表示されることを目視確認 (改行・見出し・リンクの崩れチェック)。
