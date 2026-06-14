@@ -654,6 +654,9 @@ fn draw_details_text(
 
 fn details_kind_label(item: &GridItem) -> String {
     match item {
+        GridItem::Folder(path) if crate::path_key::is_drive_or_share_root(path) => {
+            "ドライブ".to_string()
+        }
         GridItem::Folder(_) => "フォルダ".to_string(),
         GridItem::Image(path) => details_ext_kind(path, "画像"),
         GridItem::Video(path) => details_ext_kind(path, "動画"),
@@ -691,7 +694,14 @@ fn details_ext_kind(path: &Path, fallback: &str) -> String {
     path.extension()
         .and_then(|e| e.to_str())
         .filter(|e| !e.is_empty())
-        .map(|e| format!("{} {}", e.to_ascii_uppercase(), fallback))
+        .map(|e| e.to_ascii_uppercase())
+        .map(|ext| {
+            if ext == fallback {
+                fallback.to_string()
+            } else {
+                format!("{ext} {fallback}")
+            }
+        })
         .unwrap_or_else(|| fallback.to_string())
 }
 
@@ -4123,6 +4133,18 @@ impl App {
             .on_hover_text("FFmpeg で動画情報をバックグラウンド読み込みします")
             .changed();
 
+        ui.separator();
+        ui.label("サイズ表示");
+        for &mode in crate::settings::DetailsSizeDisplayMode::all() {
+            changed |= ui
+                .radio_value(
+                    &mut self.settings.details_size_display_mode,
+                    mode,
+                    mode.label(),
+                )
+                .changed();
+        }
+
         if changed {
             let new_lazy = (
                 self.settings.details_show_created,
@@ -4155,7 +4177,7 @@ impl App {
         ui: &mut egui::Ui,
         rect: egui::Rect,
         idx: usize,
-        row: usize,
+        _row: usize,
         is_spread_pair_cursor: bool,
     ) {
         let Some(item) = self.items.get(idx).cloned() else {
@@ -4168,10 +4190,8 @@ impl App {
             visuals.selection.bg_fill
         } else if checked {
             visuals.widgets.active.bg_fill
-        } else if row % 2 == 0 {
-            visuals.panel_fill
         } else {
-            visuals.faint_bg_color
+            visuals.panel_fill
         };
         let text_color = if selected {
             visuals.selection.stroke.color
@@ -4215,7 +4235,10 @@ impl App {
             .and_then(|m| *m)
             .map(|(mtime, size)| {
                 let size_text = if size > 0 {
-                    crate::ui_helpers::format_bytes(size as u64)
+                    crate::ui_helpers::format_details_size(
+                        size as u64,
+                        self.settings.details_size_display_mode,
+                    )
                 } else {
                     String::new()
                 };

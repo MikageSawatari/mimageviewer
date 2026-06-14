@@ -9,6 +9,26 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+fn path_display_name(path: &Path) -> Cow<'_, str> {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        return Cow::Borrowed(name);
+    }
+    let raw = path.as_os_str().to_string_lossy();
+    let trimmed = raw.trim_end_matches(['\\', '/']);
+    if !trimmed.is_empty() {
+        let bytes = trimmed.as_bytes();
+        if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            Cow::Owned(trimmed.to_ascii_uppercase())
+        } else {
+            Cow::Owned(trimmed.to_string())
+        }
+    } else if !raw.is_empty() {
+        Cow::Owned(raw.into_owned())
+    } else {
+        Cow::Borrowed("")
+    }
+}
+
 #[derive(Clone)]
 pub enum GridItem {
     Folder(PathBuf),
@@ -184,21 +204,15 @@ impl GridItem {
             | GridItem::Image(p)
             | GridItem::Video(p)
             | GridItem::ZipFile(p)
-            | GridItem::PdfFile(p) => {
-                Cow::Borrowed(p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
-            }
-            GridItem::ConvertibleArchive { path, .. } => {
-                Cow::Borrowed(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
-            }
+            | GridItem::PdfFile(p) => path_display_name(p),
+            GridItem::ConvertibleArchive { path, .. } => path_display_name(path),
             GridItem::ZipImage { entry_name, .. } => {
                 Cow::Borrowed(crate::zip_loader::entry_basename(entry_name))
             }
             GridItem::ZipSeparator { dir_display } => Cow::Borrowed(dir_display),
             GridItem::ZipDir { dir_prefix, .. } => Cow::Borrowed(zipdir_display_name(dir_prefix)),
             GridItem::PdfPage { page_num, .. } => Cow::Owned(format!("Page {}", page_num + 1)),
-            GridItem::SearchContainer { path, .. } => {
-                Cow::Borrowed(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
-            }
+            GridItem::SearchContainer { path, .. } => path_display_name(path),
         }
     }
 
@@ -430,6 +444,12 @@ mod tests {
     fn image_name() {
         let item = GridItem::Image(PathBuf::from(r"D:\photos\sunset.jpg"));
         assert_eq!(item.name(), "sunset.jpg");
+    }
+
+    #[test]
+    fn drive_root_name_uses_drive_label() {
+        let item = GridItem::Folder(PathBuf::from(r"c:\"));
+        assert_eq!(item.name(), "C:");
     }
 
     #[test]

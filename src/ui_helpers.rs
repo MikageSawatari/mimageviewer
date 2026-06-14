@@ -427,6 +427,43 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// 詳細表示のサイズ列用フォーマット。固定単位では整数部を 3 桁区切りにする。
+pub fn format_details_size(bytes: u64, mode: crate::settings::DetailsSizeDisplayMode) -> String {
+    use crate::settings::DetailsSizeDisplayMode;
+
+    match mode {
+        DetailsSizeDisplayMode::Optimal => format_details_size_optimal(bytes),
+        DetailsSizeDisplayMode::FixedBytes => format_count(bytes),
+        DetailsSizeDisplayMode::FixedKb => format_grouped_decimal(bytes as f64 / 1024.0, 1, " KB"),
+        DetailsSizeDisplayMode::FixedMb => {
+            format_grouped_decimal(bytes as f64 / (1024.0 * 1024.0), 2, " MB")
+        }
+    }
+}
+
+fn format_details_size_optimal(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", format_count(bytes))
+    } else if bytes < 1024 * 1024 {
+        format_grouped_decimal(bytes as f64 / 1024.0, 1, " KB")
+    } else if bytes < 1024 * 1024 * 1024 {
+        format_grouped_decimal(bytes as f64 / (1024.0 * 1024.0), 1, " MB")
+    } else {
+        format_grouped_decimal(bytes as f64 / (1024.0 * 1024.0 * 1024.0), 2, " GB")
+    }
+}
+
+fn format_grouped_decimal(value: f64, decimals: usize, suffix: &str) -> String {
+    let raw = format!("{value:.decimals$}");
+    let (int_part, frac_part) = raw.split_once('.').unwrap_or((raw.as_str(), ""));
+    let grouped = format_count(int_part.parse::<u64>().unwrap_or(0));
+    if decimals == 0 {
+        format!("{grouped}{suffix}")
+    } else {
+        format!("{grouped}.{frac_part}{suffix}")
+    }
+}
+
 /// 小さいバイト数 (サムネイル単体) を KB / MB の文字列にフォーマット。
 pub fn format_bytes_small(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
@@ -1359,6 +1396,24 @@ mod tests {
         // ≥ 1 MB → MB
         assert_eq!(format_bytes_small(1024 * 1024), "1.00 MB");
         assert_eq!(format_bytes_small(2 * 1024 * 1024 + 512 * 1024), "2.50 MB");
+    }
+
+    #[test]
+    fn format_details_size_modes() {
+        use crate::settings::DetailsSizeDisplayMode as Mode;
+
+        assert_eq!(format_details_size(999, Mode::Optimal), "999 B");
+        assert_eq!(format_details_size(1536, Mode::Optimal), "1.5 KB");
+        assert_eq!(
+            format_details_size(5 * 1024 * 1024, Mode::Optimal),
+            "5.0 MB"
+        );
+        assert_eq!(
+            format_details_size(1_234_567, Mode::FixedBytes),
+            "1,234,567"
+        );
+        assert_eq!(format_details_size(1_234_567, Mode::FixedKb), "1,205.6 KB");
+        assert_eq!(format_details_size(1_234_567, Mode::FixedMb), "1.18 MB");
     }
 
     #[test]

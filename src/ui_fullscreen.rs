@@ -1954,13 +1954,6 @@ fn format_fullscreen_page_number_label(total: usize, positions: &[usize]) -> Opt
     }
     if pages.len() == 1 {
         Some(format!("{} / {}", pages[0], total))
-    } else if pages.windows(2).all(|w| w[0] + 1 == w[1]) {
-        Some(format!(
-            "{}-{} / {}",
-            pages[0],
-            pages[pages.len() - 1],
-            total
-        ))
     } else {
         Some(format!(
             "{} / {}",
@@ -1968,7 +1961,7 @@ fn format_fullscreen_page_number_label(total: usize, positions: &[usize]) -> Opt
                 .iter()
                 .map(|page| page.to_string())
                 .collect::<Vec<_>>()
-                .join(","),
+                .join(", "),
             total
         ))
     }
@@ -14606,11 +14599,11 @@ mod tests {
     fn page_number_formatter_preserves_visual_spread_order() {
         assert_eq!(
             format_fullscreen_page_number_label(200, &[2, 3]).as_deref(),
-            Some("2-3 / 200")
+            Some("2, 3 / 200")
         );
         assert_eq!(
             format_fullscreen_page_number_label(200, &[3, 2]).as_deref(),
-            Some("3,2 / 200")
+            Some("3, 2 / 200")
         );
     }
 

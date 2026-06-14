@@ -316,6 +316,35 @@ impl DetailsSortKey {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DetailsSizeDisplayMode {
+    #[default]
+    Optimal,
+    FixedBytes,
+    FixedKb,
+    FixedMb,
+}
+
+impl DetailsSizeDisplayMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Optimal => "最適",
+            Self::FixedBytes => "固定: バイト",
+            Self::FixedKb => "固定: KB",
+            Self::FixedMb => "固定: MB",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Optimal,
+            Self::FixedBytes,
+            Self::FixedKb,
+            Self::FixedMb,
+        ]
+    }
+}
+
 // -----------------------------------------------------------------------
 // スマートフィルタ (軽量 facet)
 // -----------------------------------------------------------------------
@@ -1272,6 +1301,8 @@ pub struct Settings {
     pub details_sort_key: DetailsSortKey,
     #[serde(default = "default_details_sort_ascending")]
     pub details_sort_ascending: bool,
+    #[serde(default)]
+    pub details_size_display_mode: DetailsSizeDisplayMode,
     #[serde(default = "default_true")]
     pub details_show_rating: bool,
     #[serde(default = "default_true")]
@@ -2619,6 +2650,7 @@ impl Default for Settings {
             grid_view_mode: GridViewMode::default(),
             details_sort_key: DetailsSortKey::default(),
             details_sort_ascending: default_details_sort_ascending(),
+            details_size_display_mode: DetailsSizeDisplayMode::default(),
             details_show_rating: true,
             details_show_tags: true,
             details_show_kind: true,
@@ -3793,6 +3825,7 @@ impl Settings {
         self.grid_view_mode = src.grid_view_mode;
         self.details_sort_key = src.details_sort_key;
         self.details_sort_ascending = src.details_sort_ascending;
+        self.details_size_display_mode = src.details_size_display_mode;
         self.details_show_rating = src.details_show_rating;
         self.details_show_tags = src.details_show_tags;
         self.details_show_kind = src.details_show_kind;
@@ -5656,6 +5689,7 @@ mod tests {
             s.grid_view_mode = GridViewMode::Details;
             s.details_sort_key = DetailsSortKey::Size;
             s.details_sort_ascending = false;
+            s.details_size_display_mode = DetailsSizeDisplayMode::FixedKb;
             s.details_show_rating = false;
             s.details_show_tags = false;
             s.details_show_kind = false;
@@ -5704,6 +5738,11 @@ mod tests {
             assert!(
                 !loaded.details_sort_ascending,
                 "details_sort_ascending should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.details_size_display_mode,
+                DetailsSizeDisplayMode::FixedKb,
+                "details_size_display_mode should survive roundtrip"
             );
             assert!(
                 !loaded.details_show_rating,
