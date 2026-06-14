@@ -235,7 +235,7 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
   2. **フルスクリーンで <kbd>Esc</kbd> / <kbd>Enter</kbd> / 右クリック**
      (`handle_fullscreen_close_request`): `auto_open_for_current_container()`
      (= 設定B & `current_folder` が ZIP/PDF & 非検索) が真なら親一覧 (L1) へ直帰
-     (`pending_return_to_parent` を立て、次フレームの `handle_keyboard` が
+     (`pending_return_to_parent` を立て、`App::update` の入力ナビ合流点が
      `AddressBarNav::Direct(parent)` を発行。L2 を 1 フレームも見せない)。偽なら 1 段だけ
      `close_fullscreen` (モードA のコンテナ → L2、通常画像 → 親グリッド)。
 - **<kbd>Backspace</kbd> は両モード共通で階層を 1 段戻す** (分岐なし):

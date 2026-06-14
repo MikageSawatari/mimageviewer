@@ -4848,9 +4848,9 @@ impl App {
         // handle_keyboard / handle_clipboard_shortcuts (= グリッド用) を抑止する。
         //
         // ただし「ページを直接開く」設定 ON の ZIP/PDF の Esc/右クリックは
-        // `handle_fullscreen_close_request` で `pending_return_to_parent` を立て、次フレームの
-        // `handle_keyboard` が親一覧への AddressBarNav を発行する設計。embedded 中にここで
-        // 常に true を返すと、その予約を永久に消化できず閉じられない。
+        // `handle_fullscreen_close_request` で `pending_return_to_parent` を立て、入力ナビ合流点が
+        // 親一覧への AddressBarNav を発行する設計。embedded 中にここで常に true を返すと、
+        // その予約を消化できず閉じられない。
         #[cfg(windows)]
         if self.fullscreen_embedded_still_active() {
             return !self.pending_return_to_parent;

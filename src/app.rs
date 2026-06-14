@@ -3406,8 +3406,8 @@ pub struct App {
     /// フルスクリーン表示中に Esc/Enter/右クリックで親のファイル一覧へ戻る要求。
     ///
     /// その場で `close_fullscreen` すると一瞬ページ一覧 (L2) が出るため、
-    /// フルスクリーン handler はこの予約だけを立てる。次フレーム冒頭の
-    /// `handle_keyboard` が `AddressBarNav::Direct(parent)` として通常ナビ経路へ流す。
+    /// フルスクリーン handler はこの予約だけを立てる。`App::update` の入力ナビ合流点が
+    /// `AddressBarNav::Direct(parent)` として通常ナビ経路へ流す。
     pub(crate) pending_return_to_parent: bool,
 
     /// PDF メタキャッシュ (v1.0.0) ヒット時、placeholder grid を立てた page_count を覚えておく。
@@ -6333,6 +6333,20 @@ impl App {
             .and_then(|n| n.to_str())
             .map(|s| s.to_string());
         Some(crate::ui_main::AddressBarNav::Direct(parent.to_path_buf()))
+    }
+
+    pub(crate) fn take_pending_return_to_parent_nav(
+        &mut self,
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        if !std::mem::take(&mut self.pending_return_to_parent) {
+            return None;
+        }
+        if let Some(nav) = self.resolve_return_to_parent_nav() {
+            return Some(nav);
+        }
+        // 親が取れない (ドライブ root 等): 予約は消化済みなので通常 close にフォールバック。
+        self.close_fullscreen();
+        None
     }
 
     pub(crate) fn local_search_blocks_parent_nav(&self) -> bool {
@@ -15331,12 +15345,8 @@ impl App {
         // 前フレームに立てたもので、ここで通常のナビ経路 (load → 内部で close_fullscreen)
         // へ流すことで L2 ページ一覧を見せずに L1 へ抜ける。フォーカス/ダイアログ判定より
         // 前に出す (確実に消化するため)。
-        if std::mem::take(&mut self.pending_return_to_parent) {
-            if let Some(nav) = self.resolve_return_to_parent_nav() {
-                return Some(nav);
-            }
-            // 親が取れない (ドライブ root 等): 予約は消化済みなので通常 close にフォールバック。
-            self.close_fullscreen();
+        if let Some(nav) = self.take_pending_return_to_parent_nav() {
+            return Some(nav);
         }
 
         // ウィンドウにフォーカスがない場合はキー入力を無視
@@ -22289,7 +22299,7 @@ impl App {
     /// (`close_fullscreen`: コンテナなら L2 ページ一覧、通常画像なら親フォルダグリッド)。
     ///
     /// L1 へ戻る経路は L2 を 1 フレームも見せないため、その場では close せず
-    /// `pending_return_to_parent` を立てるだけにし、次フレーム冒頭の `handle_keyboard` が
+    /// `pending_return_to_parent` を立てるだけにし、`App::update` の入力ナビ合流点が
     /// 通常のナビ (load → 内部で close_fullscreen) を発行する。BS は階層を 1 段だけ戻す
     /// (= 常に L2) ので本関数を通さず `close_fullscreen` を直接呼ぶ (ui_fullscreen 側)。
     pub(crate) fn handle_fullscreen_close_request(&mut self) {
@@ -30989,6 +30999,11 @@ impl eframe::App for App {
             self.native_video_in_window_active && self.fs_nav_after_pdf_enumerate.is_some();
         self.render_fullscreen_viewport(ctx);
         let t_render_fullscreen_viewport = frame_t0.elapsed();
+        // Esc/Enter/短い右クリックは root/embedded/fullscreen viewport のどこで処理されても
+        // `pending_return_to_parent` を立てる。`handle_keyboard` だけで消化すると、
+        // フルスクリーン入力が root 側で処理されたフレームや専用 viewport の repaint だけが
+        // 走ったフレームで予約が残るため、描画後に通常の入力ナビへ合流させる。
+        let fullscreen_close_nav = self.take_pending_return_to_parent_nav();
         #[cfg(windows)]
         let embedded_fs_active =
             embedded_fs_active_before_render || self.fullscreen_embedded_still_active();
@@ -31541,7 +31556,7 @@ impl eframe::App for App {
         // 優先度 (旧来踏襲): fav_nav > toolbar_fav_nav > keyboard/gamepad_nav > folder_nav
         //                     > address_nav > open_folder_nav > context_nav > grid_nav
         // folder_nav は fav/toolbar/keyboard/gamepad より後、address 以下より先。
-        let input_nav = keyboard_nav.or(gamepad_nav);
+        let input_nav = fullscreen_close_nav.or(keyboard_nav).or(gamepad_nav);
         // フォルダツリーペインの worker scan 完了を回収 (完了したら load_folder_with_scan)。
         self.poll_folder_pane_open(ctx);
         let folder_nav_result = self.poll_folder_nav();

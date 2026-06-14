@@ -4919,14 +4919,27 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(
             app.fullscreen_idx,
             Some(0),
-            "parent return is performed by handle_keyboard on the next frame"
+            "parent return is performed by the input navigation merge"
+        );
+
+        let nav = app
+            .take_pending_return_to_parent_nav()
+            .expect("parent return request should become input navigation");
+        let crate::ui_main::AddressBarNav::Direct(parent) = nav else {
+            panic!("AddressBarNav::Direct を期待");
+        };
+        assert_eq!(parent, std::path::PathBuf::from("c:/manga"));
+        assert_eq!(app.select_after_load.as_deref(), Some("book.pdf"));
+        assert!(
+            !app.pending_return_to_parent,
+            "parent return request should be consumed once it is merged"
         );
     }
 
     /// ウィンドウ内フルスクリーン (embedded still) では root 側キー処理が
     /// `handle_keyboard` を毎フレーム抑止する。ただし「ページを直接開く」設定 ON の
-    /// ZIP/PDF close 要求で `pending_return_to_parent` が立っているときは、次フレームの
-    /// `handle_keyboard` に親一覧へのナビ予約を消費させる必要がある。
+    /// ZIP/PDF close 要求で `pending_return_to_parent` が立っているときは、入力ナビ合流点に
+    /// 親一覧へのナビ予約を消費させる必要がある。
     #[cfg(windows)]
     #[test]
     fn embedded_container_close_request_allows_parent_return_to_be_consumed() {
