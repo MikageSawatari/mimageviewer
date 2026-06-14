@@ -473,7 +473,13 @@ Source thread: https://egg.5ch.io/test/read.cgi/software/1752914772/
       viewer mode; non-detached fullscreen remains the primary input target.
     - This keeps CPU pixels for final AI results, not final composite textures. Reopening can still require final composite rebuild / GPU upload, but avoids AI re-inference.
     - Retained entries are removed for the page when AI input-changing edits invalidate final pipeline caches; AI feature mode / size-limit changes clear the retained layer globally.
+  - **未対応 (次版検討) — PDF ページで retained final AI が効きにくいケース**:
+    - 2026-06-14 の実機ログ確認で、PDF ページ (`PdfPage`) は保持キャッシュのキー自体は安定しているが、巨大ページでは AI アップスケール完了前にジョブがキャンセルされ、`Retained final AI store` まで到達しないケースを確認した。
+    - 例: `2848x4095` の PDF ページで final AI が `tiles=54` として開始されたが、再オープン/遷移に伴うキャンセルで `upscale_cancel after_tile=6` となり、以降も `Retained final AI miss -> Final AI queued` を繰り返した。
+    - 通常画像の「完了済み retained entry が `fs_cache` reload で消える」問題とは別で、**完了前キャンセルのため retained LRU に入らない**のが主因。PDF ではレンダリング自体も約 `265-302ms`、final composite/upload も約 `49ms` かかっており、AI キャッシュが効いても PDF レンダリング遅延は別途残りうる。
+    - 次版方針候補: 表示対象から外れた final AI ジョブを常に即キャンセルするのではなく、PDF の大型ページなど完了すれば再利用価値が高いジョブは、短時間の grace / background priority / retained-store 目的の完走を許可する。ただし GPU/VRAM/CPU メモリ圧迫を避けるため、entries/MiB 上限、ジョブサイズ、ユーザー操作中の優先度を明確に制御する。
+    - 併せて、PDF render cache / page raster cache と retained final AI は別レイヤとして扱う。AI 完了済みピクセルを保持できても、PDF ページの初回 rasterize や GPU upload は残るため、必要なら PDF レンダリング側の保持・キャンセル・ログも別タスクで見る。
 - Priority:
   - High for bug reports 1 and 2 once reproducible.
   - Medium for request 3 if a bounded high-load threshold option is straightforward; low for any left/right virtual split implementation.
-  - Medium for request 4 if it is causing repeated long waits; design carefully because memory pressure risk is high.
+  - Medium for request 4 if it is causing repeated long waits; design carefully because memory pressure risk is high. PDF retained-cache follow-up is High for the next release if large PDFs remain a common workflow.
