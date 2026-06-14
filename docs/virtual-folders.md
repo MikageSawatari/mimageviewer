@@ -242,6 +242,8 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
   - フルスクリーン (ZIP/PDF ページ) → L2 ページ一覧 (`FsKeyAction.close_to_page_list` →
     `close_fullscreen`。`current_folder` がコンテナのまま閉じるので L2 が出る)。
   - L2 ページ一覧 → L1 (通常の grid BS = 親フォルダ)。
+  - 設定Bのまま L2 ページ一覧から再度 Enter/ダブルクリックでページ表示した場合も、
+    Esc/Enter/右クリックは設定どおり L1 へ直帰する (「直接オープン由来」フラグは持たない)。
 - **Ctrl+↑↓ フォルダナビで ZIP/PDF コンテナへ移っても**、退出は同じく設定で決まる
   (連続読書)。`reopen_fullscreen_after_folder_nav_load` はフラグを立てる必要がなく、
   移動先が ZIP/PDF なら次の本も Esc→親一覧 / Backspace→ページ一覧 になる。loose 画像の

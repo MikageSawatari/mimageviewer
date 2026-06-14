@@ -1918,7 +1918,7 @@ struct FsFrameState {
 #[derive(Default)]
 pub(crate) struct FsKeyAction {
     /// Esc / Enter / 右クリック相当。`handle_fullscreen_close_request` を通す
-    /// (= モードB のコンテナページなら L1、それ以外は 1 段 close)。
+    /// (= 「ページを直接開く」設定 ON のコンテナページなら L1、それ以外は 1 段 close)。
     pub(crate) close: bool,
     /// BS = 階層を 1 段だけ戻す。コンテナページなら `close_fullscreen` を直接呼んで
     /// L2 ページ一覧へ (設定で分岐しない)。
@@ -4846,9 +4846,14 @@ impl App {
         // handle_fs_key_input が同じ main ctx 上で直接キーを処理する。ここでも
         // 処理するとナビが二重発火するので委譲する。true を返して
         // handle_keyboard / handle_clipboard_shortcuts (= グリッド用) を抑止する。
+        //
+        // ただし「ページを直接開く」設定 ON の ZIP/PDF の Esc/右クリックは
+        // `handle_fullscreen_close_request` で `pending_return_to_parent` を立て、次フレームの
+        // `handle_keyboard` が親一覧への AddressBarNav を発行する設計。embedded 中にここで
+        // 常に true を返すと、その予約を永久に消化できず閉じられない。
         #[cfg(windows)]
         if self.fullscreen_embedded_still_active() {
-            return true;
+            return !self.pending_return_to_parent;
         }
         let Some(keys) = fullscreen_shortcut_event_summary(ctx) else {
             return false;
@@ -7169,10 +7174,8 @@ impl App {
     ) {
         if close_fs {
             let detached = self.viewer_session_is_detached();
-            if detached {
-                self.close_fullscreen();
-            } else {
-                self.handle_fullscreen_close_request();
+            self.handle_fullscreen_close_request();
+            if !detached {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             // keep_fullscreen_viewport_alive の cleanup フレーム (Visible(false) 送信) を保証。

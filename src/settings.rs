@@ -1721,7 +1721,8 @@ pub struct Settings {
 
     /// ZIP/PDF/対応アーカイブを一覧や起動引数/SendTo から明示的に開いたとき、
     /// ページ一覧を経由せずページを即フルスクリーンで開く。ON のときフルスクリーン中の
-    /// Esc/Enter は親フォルダ (一覧) へ戻り、Backspace でコンテナのページ一覧を表示する。
+    /// Esc/Enter/短い右クリックは親フォルダ (一覧) へ戻り、Backspace でコンテナの
+    /// ページ一覧を表示する。
     /// 既定 OFF (従来どおりページ一覧を表示)。
     #[serde(default)]
     pub auto_fullscreen_zip_pdf: bool,

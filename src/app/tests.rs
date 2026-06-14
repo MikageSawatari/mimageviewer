@@ -1682,9 +1682,9 @@ mod phase_c_folder_nav_history_tests {
 
     #[test]
     fn return_to_parent_uses_source_archive_parent_not_cache_folder() {
-        // 自動オープン ZIP/PDF の ESC で立つ `pending_return_to_parent` を、変換アーカイブ
-        // (current_folder = キャッシュ ZIP, archive_source_override = 元 .lzh) の状態で消化
-        // したとき、キャッシュフォルダではなく元 .lzh の親フォルダへ戻ること。
+        // 「ページを直接開く」設定 ON の ESC で立つ `pending_return_to_parent` を、
+        // 変換アーカイブ (current_folder = キャッシュ ZIP, archive_source_override = 元 .lzh)
+        // の状態で消化したとき、キャッシュフォルダではなく元 .lzh の親フォルダへ戻ること。
         // 実機ログで確認した不具合 (Codex P1): 旧実装は current_folder.parent() を使っており
         // `archive_cache\<hash2>\<hash>` (キャッシュフォルダ) へ飛んでいた。
         let mut app = setup_app();
@@ -4859,15 +4859,15 @@ mod favorite_adjustment_defaults_tests {
         assert!(spread_content_union(None, None, 100.0, 100.0, 200.0).is_none());
     }
 
-    /// モードB「ページをフルスクリーン表示」(auto_fullscreen_zip_pdf=true) で ZIP/PDF ページを
-    /// 見ているときの close 要求 (Esc/Enter/右クリック) は、その場で閉じず「親フォルダ (L1) へ
-    /// 戻る」予約を立てる (= L2 ページ一覧を見せずに L1 へ抜ける、"ESC 2 回分")。判定は設定 +
-    /// コンテナ内かのみ (一時フラグ廃止)。
+    /// 「ページを直接開く」設定 ON で ZIP/PDF ページを見ているときの close 要求
+    /// (Esc/Enter/右クリック) は、その場で閉じず「親フォルダ (L1) へ戻る」予約を
+    /// 立てる (= L2 ページ一覧を見せずに L1 へ抜ける)。判定は設定 + コンテナ内かのみで、
+    /// 直接オープン由来かどうかは見ない。
     #[test]
-    fn mode_b_container_close_request_defers_to_parent() {
+    fn direct_page_mode_container_close_request_defers_to_parent() {
         let mut app = setup_app();
         app.fullscreen_idx = Some(0);
-        app.settings.auto_fullscreen_zip_pdf = true; // モードB
+        app.settings.auto_fullscreen_zip_pdf = true;
         app.current_folder = Some(std::path::PathBuf::from("c:/manga/book.zip")); // コンテナページ
         app.pending_return_to_parent = false;
 
@@ -4875,7 +4875,7 @@ mod favorite_adjustment_defaults_tests {
 
         assert!(
             app.pending_return_to_parent,
-            "モードB+コンテナは親 (L1) へ戻る予約"
+            "設定ON+コンテナは親 (L1) へ戻る予約"
         );
         assert_eq!(
             app.fullscreen_idx,
@@ -4884,11 +4884,79 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
-    /// モードA (設定OFF) / 通常フォルダ (非コンテナ) の close 要求は即座に閉じる
+    /// 別ウィンドウ表示でも Esc/Enter/右クリックは同じ close request 経路を通す。
+    /// 以前は detached だけ `close_fullscreen` に直行し、設定 ON のコンテナページでも
+    /// 親一覧 (L1) ではなくページ一覧 (L2) へ戻っていた。
+    #[test]
+    fn detached_container_close_request_uses_parent_return_route() {
+        let mut app = setup_app();
+        app.items.push(GridItem::PdfPage {
+            pdf_path: std::path::PathBuf::from("c:/manga/book.pdf"),
+            page_num: 0,
+            content_type: None,
+        });
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.current_folder = Some(std::path::PathBuf::from("c:/manga/book.pdf"));
+        app.pending_return_to_parent = false;
+
+        app.handle_fs_navigation(
+            &egui::Context::default(),
+            true,
+            false,
+            None,
+            None,
+            0,
+            None,
+            0,
+        );
+
+        assert!(
+            app.pending_return_to_parent,
+            "detached viewer close must request parent list return in direct-page mode"
+        );
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "parent return is performed by handle_keyboard on the next frame"
+        );
+    }
+
+    /// ウィンドウ内フルスクリーン (embedded still) では root 側キー処理が
+    /// `handle_keyboard` を毎フレーム抑止する。ただし「ページを直接開く」設定 ON の
+    /// ZIP/PDF close 要求で `pending_return_to_parent` が立っているときは、次フレームの
+    /// `handle_keyboard` に親一覧へのナビ予約を消費させる必要がある。
+    #[cfg(windows)]
+    #[test]
+    fn embedded_container_close_request_allows_parent_return_to_be_consumed() {
+        let mut app = setup_app();
+        app.items.push(GridItem::PdfPage {
+            pdf_path: std::path::PathBuf::from("c:/manga/book.pdf"),
+            page_num: 0,
+            content_type: None,
+        });
+        app.fullscreen_idx = Some(0);
+        app.native_video_in_window_active = true;
+
+        app.pending_return_to_parent = false;
+        assert!(
+            app.handle_fullscreen_root_key_input(&egui::Context::default()),
+            "embedded still normally suppresses main-grid keyboard handling"
+        );
+
+        app.pending_return_to_parent = true;
+        assert!(
+            !app.handle_fullscreen_root_key_input(&egui::Context::default()),
+            "parent-return reservation must reach handle_keyboard on the next frame"
+        );
+    }
+
+    /// 設定OFF / 通常フォルダ (非コンテナ) の close 要求は即座に閉じる
     /// (= 1 段だけ戻る: コンテナなら L2 ページ一覧、通常画像なら親グリッド)。
     #[test]
-    fn mode_a_or_non_container_close_request_closes_immediately() {
-        // モードA (設定OFF) でコンテナページ → 即 close (= L2 ページ一覧)。
+    fn setting_off_or_non_container_close_request_closes_immediately() {
+        // 設定OFF でコンテナページ → 即 close (= L2 ページ一覧)。
         let mut app = setup_app();
         app.fullscreen_idx = Some(0);
         app.settings.auto_fullscreen_zip_pdf = false;
@@ -4897,7 +4965,7 @@ mod favorite_adjustment_defaults_tests {
         app.handle_fullscreen_close_request();
         assert!(
             !app.pending_return_to_parent,
-            "モードA は親復帰予約を立てない"
+            "設定OFF は親復帰予約を立てない"
         );
         assert_eq!(app.fullscreen_idx, None, "その場で close");
 
@@ -4914,8 +4982,8 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.fullscreen_idx, None, "その場で close");
     }
 
-    /// Ctrl+↑↓ フォルダナビ用 `auto_open_for_current_container` のゲート判定。
-    /// ZIP/PDF コンテナへ入った & 設定 ON のときだけ自動オープン扱いにする。
+    /// `auto_open_for_current_container` のゲート判定。
+    /// ZIP/PDF コンテナ内 & 設定 ON のときだけ親直帰ルーティングを使う。
     #[test]
     fn auto_open_for_current_container_gating() {
         let mut app = setup_app();

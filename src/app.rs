@@ -3402,11 +3402,12 @@ pub struct App {
     /// 起動引数 / SendTo で立て、`load_zip_as_folder` / `load_pdf_as_folder` が
     /// `mem::take` して `fs_nav_after_pdf_enumerate` へ変換する。
     pub(crate) pending_auto_fs_open: bool,
-    /// モードB「ページをフルスクリーン表示」での Esc/Enter/右クリックで「親フォルダ (一覧)
-    /// へ戻る」要求。
-    /// フルスクリーン handler が立て、次フレーム冒頭の `handle_keyboard` が
-    /// `AddressBarNav::Direct(parent)` として通常のナビ経路へ流す (= L2 ページ一覧を
-    /// 1 フレームも表示せずに L1 へ抜けるため、その場では close せず予約だけ立てる)。
+    /// 「ページを直接開く」設定 ON で ZIP/PDF/変換アーカイブ内のページを
+    /// フルスクリーン表示中に Esc/Enter/右クリックで親のファイル一覧へ戻る要求。
+    ///
+    /// その場で `close_fullscreen` すると一瞬ページ一覧 (L2) が出るため、
+    /// フルスクリーン handler はこの予約だけを立てる。次フレーム冒頭の
+    /// `handle_keyboard` が `AddressBarNav::Direct(parent)` として通常ナビ経路へ流す。
     pub(crate) pending_return_to_parent: bool,
 
     /// PDF メタキャッシュ (v1.0.0) ヒット時、placeholder grid を立てた page_count を覚えておく。
@@ -6314,8 +6315,9 @@ impl App {
         Some(nav)
     }
 
-    /// `pending_return_to_parent` (自動オープン ZIP/PDF の Esc/Enter で立つ「親フォルダ
-    /// (一覧) へ戻る」予約) を消化したときのナビ先を返す。
+    /// `pending_return_to_parent` (「ページを直接開く」設定 ON の ZIP/PDF で
+    /// Esc/Enter/右クリックから立つ「親フォルダ (一覧) へ戻る」予約) を消化したときの
+    /// ナビ先を返す。
     ///
     /// **変換アーカイブ対応 (Codex P1)**: 変換済み RAR/7z/LZH 閲覧中は `current_folder` が
     /// キャッシュ ZIP (`%APPDATA%\...\archive_cache\..\book.zip`) を指す。そのまま
@@ -15324,10 +15326,11 @@ impl App {
                 (0, 0)
             };
 
-        // 自動オープン ZIP/PDF からの Esc/Enter で立った「親フォルダ (一覧) へ戻る」予約を
-        // 最優先で処理する。フルスクリーン handler が前フレームに立てたもので、ここで通常の
-        // ナビ経路 (load → 内部で close_fullscreen) へ流すことで L2 ページ一覧を見せずに
-        // L1 へ抜ける。フォーカス/ダイアログ判定より前に出す (確実に消化するため)。
+        // 「ページを直接開く」設定 ON の ZIP/PDF からの Esc/Enter/右クリックで立った
+        // 「親フォルダ (一覧) へ戻る」予約を最優先で処理する。フルスクリーン handler が
+        // 前フレームに立てたもので、ここで通常のナビ経路 (load → 内部で close_fullscreen)
+        // へ流すことで L2 ページ一覧を見せずに L1 へ抜ける。フォーカス/ダイアログ判定より
+        // 前に出す (確実に消化するため)。
         if std::mem::take(&mut self.pending_return_to_parent) {
             if let Some(nav) = self.resolve_return_to_parent_nav() {
                 return Some(nav);
@@ -16323,9 +16326,8 @@ impl App {
         }
     }
 
-    /// Ctrl+↑↓ フォルダナビで ZIP/PDF コンテナへ入ったとき、grid から開いたとき
-    /// (`auto_fullscreen_zip_pdf`) と同じ「自動オープン」退出ルーティング
-    /// (Esc/Enter→親一覧 / Backspace→ページ一覧) を使うか判定する。
+    /// ZIP/PDF コンテナ内のフルスクリーンで「ページを直接開く」設定の退出ルーティング
+    /// (Esc/Enter/右クリック→親一覧 / Backspace→ページ一覧) を使うか判定する。
     ///
     /// 通常フォルダ (loose 画像) には適用しない。検索 (Ctrl+S / Ctrl+G) 中も、Esc が
     /// 検索を抜けて実親フォルダへ飛ぶ想定外挙動を避けるため適用しない。
@@ -22280,12 +22282,11 @@ impl App {
 
     /// フルスクリーンの「閉じる」要求 (Esc / Enter / 右クリック / ビューポート close) の共通処理。
     ///
-    /// **モードB「ページをフルスクリーン表示」(`auto_fullscreen_zip_pdf`) で ZIP/PDF ページを
-    /// 見ているとき**は、ページ一覧 (L2) を経由せずファイル一覧 (L1) まで戻る (= 入口で L2 を
-    /// スキップしたのと対称、"ESC 2 回分")。判定は `auto_open_for_current_container()`
-    /// (= 設定B & コンテナ内 & 非検索) のみで、入り方を覚える一時フラグは持たない。
-    /// それ以外 (モードA / 通常画像) は 1 段だけ閉じる (`close_fullscreen`: コンテナなら L2
-    /// ページ一覧、通常画像なら親フォルダグリッド)。
+    /// **「ページを直接開く」設定 (`auto_fullscreen_zip_pdf`) が ON で ZIP/PDF ページを
+    /// 見ているとき**は、ページ一覧 (L2) を経由せずファイル一覧 (L1) まで戻る。
+    /// 判定は `auto_open_for_current_container()` (= 設定 ON & コンテナ内 & 非検索) のみで、
+    /// 直接オープン由来かどうかは見ない。それ以外 (設定 OFF / 通常画像) は 1 段だけ閉じる
+    /// (`close_fullscreen`: コンテナなら L2 ページ一覧、通常画像なら親フォルダグリッド)。
     ///
     /// L1 へ戻る経路は L2 を 1 フレームも見せないため、その場では close せず
     /// `pending_return_to_parent` を立てるだけにし、次フレーム冒頭の `handle_keyboard` が
