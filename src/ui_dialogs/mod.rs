@@ -21,6 +21,7 @@ pub(crate) mod new_folder;
 mod open_folder;
 mod pdf_password;
 pub(crate) mod preferences;
+pub(crate) mod rename_item;
 mod rotation_reset;
 pub(crate) mod settings_restore;
 mod stats_dialog;

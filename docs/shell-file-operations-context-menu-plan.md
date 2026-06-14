@@ -338,9 +338,17 @@ Current routing details:
   `IShellFolder::CreateViewObject(IContextMenu)` so Paste/New-style background
   verbs come from Shell instead of treating the current folder as a deletable
   selected object.
-- Background right-click also inserts an mIV "貼り付け" command before Shell
-  items. It invokes the same canonical Shell `paste` verb as Ctrl+V, covering
-  environments where the Shell-populated background menu does not surface Paste.
+- Background right-click also inserts mIV "新しいフォルダ..." and "貼り付け"
+  commands before Shell items. The new-folder command uses mIV's own dialog and
+  reload/select flow, avoiding the Shell "New > Folder" inline-edit assumption
+  that only Explorer views satisfy. Paste invokes the same canonical Shell
+  `paste` verb as Ctrl+V, covering environments where the Shell-populated
+  background menu does not surface Paste.
+- Single real file/folder right-click inserts mIV "名前の変更..." before Shell
+  items. mIV collects the new name, then runs `IFileOperation::RenameItem` on a
+  dedicated STA worker and reloads the visible folder. The Shell context menu is
+  queried without `CMF_CANRENAME` because the Shell `Rename` verb expects an
+  Explorer-style inline edit target that mIV's grid does not provide.
 - Keyboard Ctrl+C/Ctrl+X/Ctrl+V use the same native helper and canonical Shell
   `copy`/`cut`/`paste` verbs instead of mIV's custom clipboard writer. If a
   selected or checked item lacks filesystem identity (ZIP image, PDF page,

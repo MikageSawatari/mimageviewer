@@ -55,6 +55,7 @@
 # GridDeselect.1 = Ctrl+D ; チェックをすべて解除する
 # GridDeselect.2 = Ctrl+Shift+A ; チェックをすべて解除する
 # GridToggleCheck = Space ; 選択中の項目のチェックを切り替える
+# GridDelete = Delete ; 選択中またはチェック済みの実ファイル/実フォルダを削除する
 # GridToggleFolderTreePane = F ; フォルダツリーペインの表示を切り替える
 # GridTagApply = T ; タグを付ける/外すダイアログを開く
 # GridTagView = Ctrl+T ; タグビューを開く

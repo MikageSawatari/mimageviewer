@@ -2643,6 +2643,13 @@ pub struct App {
     pub(crate) new_folder_error: Option<String>,
     pub(crate) new_folder_pending: Option<crate::ui_dialogs::new_folder::NewFolderReceiver>,
 
+    // ── 実ファイル/実フォルダの名前変更ダイアログ ───────────────
+    pub(crate) show_rename_dialog: bool,
+    pub(crate) rename_target: Option<PathBuf>,
+    pub(crate) rename_input: String,
+    pub(crate) rename_error: Option<String>,
+    pub(crate) rename_pending: Option<crate::ui_dialogs::rename_item::RenameReceiver>,
+
     // ── 統合環境設定ダイアログ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
     /// 統合環境設定の一時編集状態
@@ -2681,7 +2688,7 @@ pub struct App {
 
     // ── 削除確認ダイアログ ───────────────────────────────────────
     pub(crate) show_delete_confirm: bool,
-    /// 削除対象のファイルパスリスト
+    /// 削除対象のファイル / フォルダパスリスト
     pub(crate) delete_targets: Vec<(usize, PathBuf)>,
     /// 削除確認ダイアログの文言。ドライブ種別 / ゴミ箱設定 / 容量判定を毎フレーム
     /// 繰り返さないよう、ダイアログ単位でキャッシュする。
@@ -4888,6 +4895,11 @@ impl App {
             new_folder_input: String::new(),
             new_folder_error: None,
             new_folder_pending: None,
+            show_rename_dialog: false,
+            rename_target: None,
+            rename_input: String::new(),
+            rename_error: None,
+            rename_pending: None,
             show_preferences: false,
             show_settings_restore: false,
             settings_restore_state:
@@ -6312,6 +6324,8 @@ impl App {
             || self.show_open_folder_dialog
             || self.show_new_folder_dialog
             || self.new_folder_pending.is_some()
+            || self.show_rename_dialog
+            || self.rename_pending.is_some()
             || self.show_preferences
             || self.show_cache_manager
             || self.show_delete_confirm
@@ -6345,6 +6359,8 @@ impl App {
             || self.show_open_folder_dialog
             || self.show_new_folder_dialog
             || self.new_folder_pending.is_some()
+            || self.show_rename_dialog
+            || self.rename_pending.is_some()
             || self.show_preferences
             || self.show_cache_manager
             || self.show_delete_confirm
@@ -13165,7 +13181,7 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(i, item)| {
-                let path = item.file_operation_path()?;
+                let path = item.drag_source_path()?;
                 if success_set.contains(path) {
                     Some(i)
                 } else {
@@ -31818,13 +31834,17 @@ impl eframe::App for App {
         self.poll_delete_pending();
         self.poll_file_drop_pending();
         self.poll_new_folder_pending(ctx);
+        self.poll_rename_pending(ctx);
         self.poll_capture_pending(ctx);
         self.poll_pipeline_debug_export_pending(ctx);
         self.poll_export_pending(ctx);
         self.poll_compare_pin_load_pending(ctx);
         self.poll_compare_pin_pending(ctx);
         self.poll_compare_prepare_pending(ctx);
-        if !self.drop_copy_pending.is_empty() || self.new_folder_pending.is_some() {
+        if !self.drop_copy_pending.is_empty()
+            || self.new_folder_pending.is_some()
+            || self.rename_pending.is_some()
+        {
             ctx.request_repaint();
         }
         if self.capture_pending.is_some()
@@ -32273,6 +32293,7 @@ impl eframe::App for App {
         self.show_fav_add_dialog_window(ctx);
         let open_folder_nav = self.show_open_folder_dialog_window(ctx);
         self.show_new_folder_dialog_window(ctx);
+        self.show_rename_dialog_window(ctx);
         self.show_cache_manager_dialog(ctx);
         self.show_archive_cache_manager_dialog(ctx);
         self.show_cache_creator_dialog(ctx);

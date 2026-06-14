@@ -348,6 +348,7 @@ impl crate::app::App {
             is_folder_context,
             has_checked,
             in_search,
+            folder_command_target.clone(),
         ) {
             NativeGridContextMenuOutcome::Consumed(nav) => {
                 self.context_menu_idx = None;
@@ -512,20 +513,24 @@ impl crate::app::App {
                                 close = true;
                             }
                             ui.separator();
-                            // フォルダのカット/削除 (整理操作) も v1.1.0 で一旦無効化。
-                            // 背景 (現在フォルダ) コンテキストでは「新しいフォルダ」のみ出す。
-                            if is_folder_context
-                                && ui
+                            if is_folder_context {
+                                if ui
                                     .add_enabled(
                                         folder_command_target.is_some(),
                                         egui::Button::new("新しいフォルダ…"),
                                     )
                                     .clicked()
-                            {
-                                if let Some(folder) = folder_command_target.clone() {
-                                    self.request_new_folder_dialog(folder);
+                                {
+                                    if let Some(folder) = folder_command_target.clone() {
+                                        self.request_new_folder_dialog(folder);
+                                    }
+                                    close = true;
                                 }
-                                close = true;
+                            } else {
+                                if ui.button("削除 (ゴミ箱)").clicked() {
+                                    self.request_delete_confirm(vec![(idx, p.clone())]);
+                                    close = true;
+                                }
                             }
                         }
                         GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
@@ -691,6 +696,7 @@ impl crate::app::App {
         is_folder_context: bool,
         has_checked: bool,
         in_search: bool,
+        folder_command_target: Option<PathBuf>,
     ) -> NativeGridContextMenuOutcome {
         if !self.settings.use_native_shell_context_menu {
             return NativeGridContextMenuOutcome::Fallback;
@@ -699,9 +705,13 @@ impl crate::app::App {
             return NativeGridContextMenuOutcome::Fallback;
         };
         let prepare_t0 = std::time::Instant::now();
-        let Some(target) =
-            self.native_grid_context_menu_target(idx, item, is_folder_context, has_checked)
-        else {
+        let Some(target) = self.native_grid_context_menu_target(
+            idx,
+            item,
+            is_folder_context,
+            has_checked,
+            folder_command_target,
+        ) else {
             return NativeGridContextMenuOutcome::Fallback;
         };
         let miv_items = self.native_grid_context_menu_items(&target, in_search);
@@ -772,9 +782,10 @@ impl crate::app::App {
         item: GridItem,
         is_folder_context: bool,
         has_checked: bool,
+        folder_command_target: Option<PathBuf>,
     ) -> Option<NativeGridContextMenuTarget> {
         let paths = if is_folder_context {
-            vec![self.current_favorite_target()?]
+            vec![folder_command_target?]
         } else if has_checked {
             if self.checked.iter().any(|&idx| {
                 self.items
@@ -830,8 +841,19 @@ impl crate::app::App {
             })
         {
             items.push(NativeMivMenuItem {
+                command: NativeMivCommand::NewFolder,
+                label: "新しいフォルダ...".to_string(),
+            });
+            items.push(NativeMivMenuItem {
                 command: NativeMivCommand::Paste,
                 label: "貼り付け".to_string(),
+            });
+        }
+
+        if !target.is_folder_context && target.paths.len() == 1 {
+            items.push(NativeMivMenuItem {
+                command: NativeMivCommand::Rename,
+                label: "名前の変更...".to_string(),
             });
         }
 
@@ -921,6 +943,14 @@ impl crate::app::App {
         target: &NativeGridContextMenuTarget,
     ) -> Option<ContextMenuAction> {
         match command {
+            NativeMivCommand::NewFolder => {
+                if target.is_folder_context
+                    && let Some(folder) = target.paths.first().cloned()
+                {
+                    self.request_new_folder_dialog(folder);
+                }
+                None
+            }
             NativeMivCommand::Paste => {
                 if target.is_folder_context
                     && let (Some(hwnd), Some(folder)) =
@@ -935,6 +965,15 @@ impl crate::app::App {
                     if let Err(err) = result {
                         crate::logger::log(format!("native_context_menu: mIV Paste failed: {err}"));
                     }
+                }
+                None
+            }
+            NativeMivCommand::Rename => {
+                if !target.is_folder_context
+                    && target.paths.len() == 1
+                    && let Some(path) = target.paths.first().cloned()
+                {
+                    self.request_rename_dialog(path);
                 }
                 None
             }
@@ -1367,11 +1406,14 @@ impl crate::app::App {
         paths
     }
 
-    /// チェック済みアイテムの (idx, path) を収集する (降順ソート)。
+    /// チェック済みアイテムの削除対象 (idx, path) を収集する (降順ソート)。
+    ///
+    /// 通常の UI ではフォルダをチェックできないが、削除は単一選択フォルダも対象にするため、
+    /// ここも実ファイル / 実フォルダを返す `drag_source_path` に揃える。
     pub(crate) fn collect_checked_indexed_paths(&self) -> Vec<(usize, PathBuf)> {
         let mut targets: Vec<(usize, PathBuf)> = Vec::new();
         for &idx in &self.checked {
-            if let Some(path) = self.items.get(idx).and_then(GridItem::file_operation_path) {
+            if let Some(path) = self.items.get(idx).and_then(GridItem::drag_source_path) {
                 targets.push((idx, path.to_path_buf()));
             }
         }
@@ -1495,12 +1537,14 @@ impl crate::app::App {
         }
     }
 
-    /// DEL キーで選択画像を削除するハンドラ。
+    /// DEL キーで選択中またはチェック済みの実ファイル / 実フォルダを削除するハンドラ。
     pub(crate) fn handle_delete_key(&mut self, ctx: &egui::Context) {
         if self.fullscreen_idx.is_some() || self.address_has_focus || self.any_dialog_open() {
             return;
         }
-        let del = ctx.input(|i| i.key_pressed(egui::Key::Delete));
+        let del = self
+            .keymap
+            .pressed_action(ctx, crate::keymap::KeyAction::GridDelete);
         if !del {
             return;
         }
@@ -1514,7 +1558,7 @@ impl crate::app::App {
             let Some(path) = self
                 .items
                 .get(idx)
-                .and_then(GridItem::file_operation_path)
+                .and_then(GridItem::drag_source_path)
                 .map(|p| p.to_path_buf())
             else {
                 return;

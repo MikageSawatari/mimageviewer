@@ -247,14 +247,12 @@ impl GridItem {
         }
     }
 
-    /// ファイル整理系の操作 (コピー / カット / 削除) の対象になる実ファイルのパス。
+    /// ファイル整理系の操作のうち、チェック選択で扱う実ファイルのパス。
     ///
-    /// 画像・動画・ZIP/PDF 本体・変換前アーカイブはディスク上に実体があるため整理対象。
-    /// **フォルダは対象外** — OS / エクスプローラ側で扱う領分にする。v1.1.0 でフォルダの
-    /// コピー/カット/ペーストを試みたが、ペーストの同名衝突・自己再帰・データ破壊リスクが
-    /// 大きく、Explorer 相当の衝突解決 (確認/リネーム/skip) と合わせて将来再導入する方針で
-    /// 一旦無効化した。ZIP/PDF 内ページなど仮想フォルダ内アイテムは独立した実パスを
-    /// 持たないため対象外。
+    /// 画像・動画・ZIP/PDF 本体・変換前アーカイブはディスク上に実体があるため対象。
+    /// **フォルダはチェック対象外** — 単一選択の削除や Shell コピー/カット、D&D では
+    /// [`Self::drag_source_path`] を使って扱う。ZIP/PDF 内ページなど仮想フォルダ内アイテムは
+    /// 独立した実パスを持たないため対象外。
     pub fn file_operation_path(&self) -> Option<&Path> {
         match self {
             Self::Image(p)
@@ -266,7 +264,8 @@ impl GridItem {
         }
     }
 
-    /// D&D (ドラッグでコピー送出) で送出できる実ファイル / 実フォルダのパス。
+    /// Shell 操作 (D&D / コピー / カット / 単一選択削除) で送出できる実ファイル /
+    /// 実フォルダのパス。
     ///
     /// [`Self::file_operation_path`] と同じく、実パスを持つフォルダ / ファイルだけを
     /// 対象にする。対象外:
@@ -290,7 +289,7 @@ impl GridItem {
     /// チェックボックスで選択できるアイテムか。
     ///
     /// 画像・動画・ZIP/PDF 本体・変換前アーカイブに加えて、ZIP/PDF 内ページも
-    /// ページ操作用に対象にする。**フォルダ** (整理対象外)・ZIP セパレータ・
+    /// ページ操作用に対象にする。**フォルダ** (チェック対象外)・ZIP セパレータ・
     /// 検索集約コンテナは対象外。
     pub fn is_checkable(&self) -> bool {
         self.file_operation_path().is_some()
@@ -549,14 +548,14 @@ mod tests {
 
     #[test]
     fn name_root_path() {
-        // ルートパスの場合、file_name() は None → ""
+        // ルートパスの場合もドライブ名を一覧表示名として使う。
         let item = GridItem::Folder(PathBuf::from(r"C:\"));
-        assert_eq!(item.name(), "");
+        assert_eq!(item.name(), "C:");
     }
 
     #[test]
     fn checkable_includes_real_files_except_folders() {
-        // フォルダは整理対象外 (v1.1.0 で一旦無効化、将来 Explorer 相当の衝突解決と再導入)。
+        // フォルダは単一選択の Shell 操作で扱い、複数チェック対象にはしない。
         assert!(!GridItem::Folder(PathBuf::from(r"C:\books")).is_checkable());
         assert!(GridItem::Image(PathBuf::from(r"C:\books\a.jpg")).is_checkable());
         assert!(GridItem::Video(PathBuf::from(r"C:\books\a.mp4")).is_checkable());
@@ -603,7 +602,7 @@ mod tests {
 
     #[test]
     fn file_operation_path_is_only_for_movable_files() {
-        // フォルダは整理対象外 (v1.1.0 で一旦無効化)。
+        // フォルダは複数チェックの file_operation_path ではなく drag_source_path で扱う。
         assert!(
             GridItem::Folder(PathBuf::from(r"C:\books"))
                 .file_operation_path()

@@ -737,6 +737,7 @@ impl App {
                             message: "変換直後にキャッシュが削除されました。再度お試しください。"
                                 .to_string(),
                         };
+                        clear_deferred_fullscreen = true;
                     }
                 }
                 ArchiveConvertMsg::ConvertDone(Err(ConvertError::Cancelled)) => {

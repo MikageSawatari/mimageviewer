@@ -707,6 +707,7 @@ pub enum KeyAction {
     GridSelectAll,
     GridDeselect,
     GridToggleCheck,
+    GridDelete,
     GridToggleFolderTreePane,
     GridTagApply,
     GridTagView,
@@ -900,6 +901,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridSelectAll,
     KeyAction::GridDeselect,
     KeyAction::GridToggleCheck,
+    KeyAction::GridDelete,
     KeyAction::GridToggleFolderTreePane,
     KeyAction::GridTagApply,
     KeyAction::GridTagView,
@@ -1128,6 +1130,7 @@ impl KeyAction {
             GridSelectAll => "GridSelectAll",
             GridDeselect => "GridDeselect",
             GridToggleCheck => "GridToggleCheck",
+            GridDelete => "GridDelete",
             GridToggleFolderTreePane => "GridToggleFolderTreePane",
             GridTagApply => "GridTagApply",
             GridTagView => "GridTagView",
@@ -1331,6 +1334,7 @@ impl KeyAction {
             GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
+            GridDelete => "選択中またはチェック済みの実ファイル/実フォルダを削除する",
             GridToggleFolderTreePane => "フォルダツリーペインの表示を切り替える",
             GridTagApply => "タグを付ける/外すダイアログを開く",
             GridTagView => "タグビューを開く",
@@ -1527,6 +1531,7 @@ impl KeyAction {
             GridSelectAll
             | GridDeselect
             | GridToggleCheck
+            | GridDelete
             | GridToggleFolderTreePane
             | GridTagApply
             | GridTagView
@@ -1660,6 +1665,7 @@ impl KeyAction {
             | GridSelectAll
             | GridDeselect
             | GridToggleCheck
+            | GridDelete
             | GridToggleFolderTreePane
             | GridTagApply
             | GridTagView
@@ -1851,6 +1857,7 @@ impl KeyAction {
             GridSelectAll => ChordList::one(Chord::ctrl(A)),
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridToggleCheck => ChordList::one(Chord::key(Space)),
+            GridDelete => ChordList::one(Chord::key(Delete)),
             GridToggleFolderTreePane => ChordList::one(Chord::key(F)),
             GridTagApply => ChordList::one(Chord::key(T)),
             GridTagView => ChordList::one(Chord::ctrl(T)),

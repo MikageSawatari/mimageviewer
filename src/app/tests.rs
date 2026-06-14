@@ -1944,17 +1944,33 @@ mod phase_c_folder_nav_history_tests {
         let current = PathBuf::from(r"C:\miv-test\current");
         let archive = app.tmp.path().join("book.lzh");
         std::fs::write(&archive, b"lzh").unwrap();
+        let slot = QuickFolderSlotId::A;
 
         app.current_folder = Some(current.clone());
-        app.folder_nav_back_stack = vec![a.clone(), archive.clone()];
-        app.folder_nav_forward_stack = Vec::new();
+        app.quick_folder_workspaces[slot.index()].history.back_stack =
+            vec![a.clone(), archive.clone()];
+        app.quick_folder_workspaces[slot.index()]
+            .history
+            .forward_stack = Vec::new();
         app.recent_folders = vec![current.clone()];
 
         let snapshot = app.folder_nav_history_snapshot();
         assert_eq!(app.navigate_folder_history_back(), Some(archive.clone()));
-        assert_eq!(app.folder_nav_back_stack, vec![a.clone()]);
-        assert_eq!(app.folder_nav_forward_stack, vec![current.clone()]);
-        assert!(app.suppress_folder_nav_record_once);
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()].history.back_stack,
+            vec![a.clone()]
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .forward_stack,
+            vec![current.clone()]
+        );
+        assert!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .suppress_record_once
+        );
 
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
@@ -1980,10 +1996,22 @@ mod phase_c_folder_nav_history_tests {
         app.archive_convert = None;
         app.restore_folder_nav_history(rollback);
 
-        assert_eq!(app.folder_nav_back_stack, vec![a, archive]);
-        assert!(app.folder_nav_forward_stack.is_empty());
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()].history.back_stack,
+            vec![a, archive]
+        );
+        assert!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .forward_stack
+                .is_empty()
+        );
         assert_eq!(app.recent_folders, vec![current]);
-        assert!(!app.suppress_folder_nav_record_once);
+        assert!(
+            !app.quick_folder_workspaces[slot.index()]
+                .history
+                .suppress_record_once
+        );
     }
 
     #[test]
@@ -2232,17 +2260,28 @@ mod phase_c_folder_nav_history_tests {
         let prev = PathBuf::from(r"C:\miv-test\prev");
         let stale_forward = PathBuf::from(r"C:\miv-test\stale-forward");
         let target = PathBuf::from(r"C:\miv-test\target");
-        app.folder_nav_back_stack = vec![prev.clone()];
+        let slot = QuickFolderSlotId::A;
+        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![prev.clone()];
         // 検索前に ← で残っていた forward 履歴を模擬。新規ナビなのでクリアされるべき。
-        app.folder_nav_forward_stack = vec![stale_forward];
+        app.quick_folder_workspaces[slot.index()]
+            .history
+            .forward_stack = vec![stale_forward];
         // 合成検索結果パスを移動元にした記録を試みても back_stack には積まれない。
         app.current_folder = Some(crate::app::search_results_synthetic_path());
 
         app.record_folder_nav_transition(&target);
 
         // 合成 source は back には積まないが forward は無効化する (新規ナビなので)。
-        assert_eq!(app.folder_nav_back_stack, vec![prev]);
-        assert!(app.folder_nav_forward_stack.is_empty());
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()].history.back_stack,
+            vec![prev]
+        );
+        assert!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .forward_stack
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2251,13 +2290,24 @@ mod phase_c_folder_nav_history_tests {
         let older = PathBuf::from(r"C:\miv-test\older");
         let forward = PathBuf::from(r"C:\miv-test\forward");
         let c = PathBuf::from(r"C:\miv-test\pre-search");
-        app.folder_nav_back_stack = vec![older.clone()];
-        app.folder_nav_forward_stack = vec![forward];
+        let slot = QuickFolderSlotId::A;
+        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![older.clone()];
+        app.quick_folder_workspaces[slot.index()]
+            .history
+            .forward_stack = vec![forward];
 
         app.push_nav_history_entry(c.clone());
 
-        assert_eq!(app.folder_nav_back_stack, vec![older, c]);
-        assert!(app.folder_nav_forward_stack.is_empty());
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()].history.back_stack,
+            vec![older, c]
+        );
+        assert!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .forward_stack
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2267,7 +2317,8 @@ mod phase_c_folder_nav_history_tests {
         let x = app.tmp.path().join("jump-target");
         std::fs::create_dir_all(&x).unwrap();
         let older = PathBuf::from(r"C:\miv-test\older");
-        app.folder_nav_back_stack = vec![older.clone()];
+        let slot = QuickFolderSlotId::A;
+        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![older.clone()];
         app.current_folder = Some(crate::app::search_results_synthetic_path());
         app.favsearch.active = true;
         app.favsearch.saved_folder = Some(c.clone());
@@ -2282,11 +2333,14 @@ mod phase_c_folder_nav_history_tests {
                 app.push_nav_history_entry(cc);
             }
         }
-        app.suppress_folder_nav_record_once = true;
+        app.set_active_folder_nav_suppress_record_once(true);
         app.load_folder(x.clone());
 
         // 「検索前フォルダ C → 移動先 X」が積まれ、X で ← を押すと C に戻れる。
-        assert_eq!(app.folder_nav_back_stack, vec![older, c]);
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()].history.back_stack,
+            vec![older, c]
+        );
         assert_eq!(app.recent_folders.first(), Some(&x));
     }
 
@@ -8261,6 +8315,66 @@ mod favorite_adjustment_defaults_tests {
         ));
     }
 
+    /// 変換 worker が成功を返した直後に cache maintenance が ZIP を消した場合も、
+    /// ユーザー操作待ちのエラーに入るため fullscreen 継続予約と nav lock を破棄する。
+    #[test]
+    fn archive_convert_missing_cached_zip_clears_deferred_fullscreen_nav() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let missing_cached_zip = app.tmp.path().join("cache").join("missing.zip");
+        tx.send(
+            crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ConvertDone(Ok((
+                crate::archive_converter::ArchiveImageSummary {
+                    image_count: 1,
+                    total_uncompressed_bytes: 1,
+                    nested_archive_count: 0,
+                },
+                missing_cached_zip,
+                1,
+            ))),
+        )
+        .unwrap();
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: PathBuf::from(r"C:\books\gone.rar"),
+            format: ArchiveFormat::Rar,
+            password: None,
+            password_input: String::new(),
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
+                progress: std::sync::Arc::new(
+                    crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
+                ),
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+            rx,
+            pending_nav: None,
+            nav_history_rollback: None,
+            auto_fullscreen: false,
+            deferred_fullscreen: None,
+            suppress_confirm: true,
+            suppress_confirm_next_time: false,
+        });
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        assert!(app.attach_archive_convert_deferred_fullscreen(false, false));
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(!app.archive_convert_deferred_fullscreen_active());
+        assert!(!app.fs_nav_is_locked());
+        assert!(
+            app.archive_convert
+                .as_ref()
+                .is_some_and(|state| state.pending_nav.is_none())
+        );
+        assert!(matches!(
+            app.archive_convert.as_ref().map(|state| &state.phase),
+            Some(crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Error { message })
+                if message.contains("キャッシュが削除されました")
+        ));
+    }
+
     /// `find_fullscreen_nav_target`: 常にフォルダ先頭の画像系アイテムを返すこと。
     /// Ctrl+↑ でも前フォルダの最後ではなく最初の画像に着地させる仕様変更の回帰ガード。
     /// (旧 API の `forward: bool` 引数は仕様統一に伴って削除済み。)
@@ -13613,10 +13727,11 @@ mod file_operation_selection_tests {
     }
 
     #[test]
-    fn checked_file_operation_paths_skip_folders_and_virtual_pages() {
+    fn checked_file_operation_paths_keep_delete_targets_real_only() {
         let mut app = setup_app();
 
-        // フォルダは整理対象外 (v1.1.0 で一旦無効化) なので checked に入れても除外される。
+        // collect_checked_paths は Shell メニュー用の従来 helper なのでフォルダを除外する。
+        // 削除ターゲット helper は Del キーと同じく実フォルダも受け付ける。
         let folder = push_item(&mut app, GridItem::Folder(PathBuf::from(r"C:\books")));
         let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
         let video = push_item(&mut app, GridItem::Video(PathBuf::from(r"C:\books\a.mp4")));
@@ -13677,9 +13792,35 @@ mod file_operation_selection_tests {
                 (zip, PathBuf::from(r"C:\books\a.zip")),
                 (video, PathBuf::from(r"C:\books\a.mp4")),
                 (image, PathBuf::from(r"C:\books\a.jpg")),
+                (folder, PathBuf::from(r"C:\books")),
             ],
-            "delete targets are sorted by descending index and exclude folders + virtual pages",
+            "delete targets are sorted by descending index and include real folders while excluding virtual pages",
         );
+    }
+
+    #[test]
+    fn delete_key_selected_folder_requests_delete_confirm() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let folder_path = PathBuf::from(r"C:\books");
+        let folder = push_item(&mut app, GridItem::Folder(folder_path.clone()));
+        app.selected = Some(folder);
+
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        app.handle_delete_key(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(app.show_delete_confirm);
+        assert_eq!(app.delete_targets, vec![(folder, folder_path)]);
     }
 
     #[test]

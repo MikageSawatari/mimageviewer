@@ -24,7 +24,9 @@ impl ShellClipboardVerb {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeMivCommand {
+    NewFolder,
     Paste,
+    Rename,
     CopyPath,
     CopyFileName,
     CopyImageToClipboard,
@@ -141,10 +143,10 @@ mod windows_impl {
     };
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows::Win32::UI::Shell::{
-        BHID_SFUIObject, CMF_CANRENAME, CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO,
-        DefSubclassProc, IContextMenu, IContextMenu2, IContextMenu3, IShellFolder,
-        RemoveWindowSubclass, SHCreateShellItemArrayFromIDLists, SHGetDesktopFolder,
-        SHParseDisplayName, SetWindowSubclass,
+        BHID_SFUIObject, CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO, DefSubclassProc,
+        IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, RemoveWindowSubclass,
+        SHCreateShellItemArrayFromIDLists, SHGetDesktopFolder, SHParseDisplayName,
+        SetWindowSubclass,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, MF_SEPARATOR, MF_STRING,
@@ -704,7 +706,7 @@ mod windows_impl {
                 insert_at,
                 SHELL_ID_FIRST,
                 SHELL_ID_LAST,
-                CMF_NORMAL | CMF_EXPLORE | CMF_CANRENAME,
+                CMF_NORMAL | CMF_EXPLORE,
             )
         };
         if hr.is_err() {

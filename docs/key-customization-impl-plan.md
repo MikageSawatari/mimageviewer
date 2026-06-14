@@ -442,14 +442,14 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - GridTreePrev/Next `Ctrl+↑/↓` (P) / GridSiblingPrev/Next `Ctrl+PageUp/Down` (P)
 - GridParentAlt `Alt+↑` (P) / GridHistoryBack/Forward `Alt+←/→` (P)
 - GridHome/End/PageUp/PageDown (P)(予約候補)
-- GridToggleFolderTreePane `F` (P) / GridTagApply `T` (P) / GridTagView `Ctrl+T` (P) / GridRotateCw `R` (P) / GridRotateCcw `L` (P) /
+- GridToggleFolderTreePane `F` (P) / GridDelete `Delete` (P) / GridTagApply `T` (P) / GridTagView `Ctrl+T` (P) / GridRotateCw `R` (P) / GridRotateCcw `L` (P) /
   GridPin `P` (P) / GridCompareX `X` (P)
 - GridApplyErase1/2 `F7/F8` / GridApplyConceal1/2 `F9/F10` /
   GridDeleteErase1/2 `Shift+F7/F8` / GridDeleteConceal1/2 `Shift+F9/F10`
   (family・予約候補)
 - RatingItem1..5/Clear `F1-F6` / RatingContainer1..5/Clear `Shift+F1-F6`
   (専用 `[Rating]` グループ。グリッド / 画像フルスクリーン / 動画フルスクリーンで共有)
-- GridClipboardCopy/Cut/Paste `Ctrl+C/X/V`、GridDeleteFiles `Delete`、D&D、右クリック操作は
+- GridClipboardCopy/Cut/Paste `Ctrl+C/X/V`、D&D、右クリック操作は
   OS/clipboard/マウス経路を含むため本計画では固定。
 - Shift+矢印の範囲選択は GridCursor の派生動作として固定。
 

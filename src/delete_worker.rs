@@ -2,12 +2,12 @@
 //!
 //! ## 設計
 //!
-//! 別スレッドで `SHFileOperationW` をファイル単位で呼び、結果を `DeleteMsg` として
+//! 別スレッドで `SHFileOperationW` をパス単位で呼び、結果を `DeleteMsg` として
 //! `mpsc::Receiver` 経由で UI に返す。
 //!
-//! - **1 ファイルずつ実行**: `SHFileOperationW` の複数パス一括呼び出しは一部のパス
+//! - **1 パスずつ実行**: `SHFileOperationW` の複数パス一括呼び出しは一部のパス
 //!   条件下で `result == 0` を返しつつ実際には削除しない症状が再現したため採用せず
-//!   (2026-04 の v0.8.1 検証で判明)。perf 差は syscall overhead のみで 10-20ms/file。
+//!   (2026-04 の v0.8.1 検証で判明)。perf 差は syscall overhead のみで 10-20ms/path。
 //! - **バッチ = UI 進捗粒度**: 10 件ごとに `DeleteMsg::Batch` を送り進捗更新する
 //!   (100-200ms おき)。
 
@@ -139,7 +139,7 @@ const RECYCLE_FLAGS: u32 = {
     FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_SILENT.0 | FOF_NOERRORUI.0 | FOF_WANTNUKEWARNING.0
 };
 
-/// 単一パスを `SHFileOperationW` で削除する。
+/// 単一パス (ファイルまたはフォルダ) を `SHFileOperationW` で削除する。
 #[cfg(windows)]
 fn recycle_one(path: &std::path::Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;

@@ -104,6 +104,7 @@ pub mod search_watcher;
 pub mod settings;
 pub mod settings_db;
 pub mod settings_restore;
+pub mod shell_file_ops;
 pub mod sidecar;
 pub mod stats;
 pub mod susie_loader;
