@@ -16,6 +16,9 @@ Target outcome:
   delete, rename, properties, and standard "Open with" behavior.
 - Real filesystem item context menus are native Win32 popup menus that combine
   a small mIV command section with the Windows Shell context menu.
+- The folder bar offers A/B quick folder workspaces so file organization can
+  move between a source and destination without turning the whole app into a
+  two-pane file manager.
 - ZIP/PDF virtual items use a Windows-native custom popup menu, not the Shell
   context menu, because they do not have independent filesystem identity.
 - egui context menus remain only as a fallback for non-Windows builds or Shell
@@ -27,6 +30,9 @@ Target outcome:
 Non-goals:
 
 - Do not replace egui or the wgpu thumbnail/fullscreen rendering stack.
+- Do not implement a full two-pane file manager in this phase. A/B quick
+  folders switch one active grid between two workspaces; they do not create two
+  simultaneous selections, two visible grids, or drag targets inside mIV.
 - Do not expose destructive file operations for ZIP entries or PDF pages.
 - Do not implement a full Explorer view or `IExplorerBrowser` host in this
   phase.
@@ -56,6 +62,10 @@ Useful existing facts:
 - `src/ui_dialogs/context_menu.rs` currently uses PowerShell for file
   copy/cut/paste and skips folders for paste/drop because collision handling and
   recursive folder copies are unsafe in the current implementation.
+- `src/app.rs` currently keeps one folder navigation back stack, one forward
+  stack, one global recent-folder list, and one `suppress_folder_nav_record_once`
+  flag. A/B quick folders should factor this into reusable history state rather
+  than duplicating ad hoc path stacks.
 - `GridItem::file_operation_path()` currently excludes folders, while
   `GridItem::drag_source_path()` includes folders.
 - ZIP/PDF virtual items (`ZipImage`, `ZipDir`, `PdfPage`) have stable mIV
@@ -102,7 +112,105 @@ Remove from context menu:
 - Legacy XMP tag import/remove. It already belongs in the top-level tag menu and
   makes the file context menu too dense.
 
-## 5. `IFileOperation` layer
+## 5. Folder A/B quick workspaces
+
+Purpose:
+
+- Make copy-source / paste-destination workflows practical after Shell file
+  operations are added.
+- Avoid the much larger two-pane refactor. The app still has one visible grid,
+  one active item list, one selection model, and one thumbnail pipeline.
+
+Data model:
+
+```rust
+pub enum QuickFolderSlotId {
+    A,
+    B,
+}
+
+pub struct FolderNavHistoryState {
+    pub back_stack: Vec<PathBuf>,
+    pub forward_stack: Vec<PathBuf>,
+    pub suppress_record_once: bool,
+}
+
+pub struct QuickFolderWorkspace {
+    pub target: Option<PathBuf>,
+    pub history: FolderNavHistoryState,
+}
+```
+
+Implementation notes:
+
+- Add two quick workspaces, A and B, plus an
+  `active_quick_folder_slot: Option<QuickFolderSlotId>`.
+- Keep the existing non-A/B navigation as the "normal" history state for users
+  who do not use the quick slots.
+- Persist only the two workspace `target` paths in `Settings`, for example as
+  `[Option<PathBuf>; 2]`. Keep each slot's back/forward history session-local,
+  matching the current folder history behavior.
+- Keep `recent_folders` global. It remains the "recent places" MRU and is not
+  split per A/B workspace.
+- Use the user-visible navigation target, not an implementation cache path:
+  - real folder: the folder path,
+  - ZIP/PDF/convertible archive root: the source container path,
+  - converted RAR/7z/LZH cache: the original archive path via the existing
+    source override/effective-folder logic.
+- Do not store ZIP entry paths, PDF page identities, search-result virtual
+  paths, or tag/favorite temporary views in A/B slots.
+
+Folder history behavior:
+
+- A/B switching itself must not push anything onto any folder history stack.
+  Switching from A to B is a workspace change, not a folder navigation.
+- While A is active, direct address-bar navigation, parent navigation,
+  tree-order navigation, favorite navigation, and Shell-menu "go to folder"
+  transitions update A's target and A's back/forward stacks.
+- While B is active, the same operations update B's target and B's back/forward
+  stacks.
+- With no active A/B slot, existing normal history behavior remains.
+- The left/right folder-history buttons read and mutate the active history
+  state: A's buttons operate on A history, B's on B history, and normal mode
+  uses the existing normal history.
+- Existing snapshot/rollback helpers used by search and archive conversion
+  should snapshot all three history states (normal, A, B), the active slot, and
+  `recent_folders`, so failed or canceled temporary navigation can restore the
+  exact pre-operation state.
+- Pending folder DFS navigation should be canceled before switching active A/B
+  slots, as with other explicit folder loads.
+
+Folder bar UI:
+
+- Place compact `A` and `B` buttons near the existing left/right history
+  buttons.
+- Empty slot left-click: register the current eligible target and make that slot
+  active.
+- Registered slot left-click: switch to that workspace and load its target.
+- Registered slot right-click menu:
+  - "Set to current folder"
+  - "Clear"
+  - "Open in Explorer"
+  - "Copy path"
+- Highlight the active slot. If the current effective target equals a
+  registered inactive slot, show a softer "same target" state so users can see
+  why clicking it would not visibly move.
+- Disable A/B registration and switching while search/favorite/tag temporary
+  views are active. After a user explicitly jumps from a search result into a
+  real folder, A/B works normally again.
+- If a registered target no longer exists, leave the slot unchanged, show a
+  toast, and offer "Clear" from the right-click menu. Do not silently overwrite
+  the slot with a parent fallback.
+
+Settings:
+
+- Add `show_address_bar_quick_folders`, default on, beside the existing folder
+  bar visibility settings.
+- Add `quick_folder_slots`, default `[None, None]`.
+- Add a clear/reset control in the toolbar preferences page near the recent
+  folder history clear control.
+
+## 6. `IFileOperation` layer
 
 Add a Windows-only module, tentatively `src/shell_file_ops.rs`.
 
@@ -165,7 +273,7 @@ Reload behavior:
   Continue to reject or explicitly route the operation to a user-visible target.
 - For delete/move, also clear stale checked indices after the reload.
 
-## 6. Clipboard strategy
+## 7. Clipboard strategy
 
 The target is to remove PowerShell from copy/cut/paste, but it can be phased.
 
@@ -190,7 +298,7 @@ Keep the existing image clipboard code separate:
 - Preserve the existing clipboard sequence guard so slow image decode cannot
   overwrite a newer clipboard action.
 
-## 7. Native context menu architecture
+## 8. Native context menu architecture
 
 Add a Windows-only module, tentatively `src/native_context_menu.rs`.
 
@@ -252,7 +360,7 @@ Settings:
 - If a Shell menu crashes/hangs reports appear, users can disable the native
   Shell menu without losing mIV core functionality.
 
-## 8. Native custom menu for virtual items
+## 9. Native custom menu for virtual items
 
 Do not use the Shell context menu for virtual items. Instead, use the same
 Win32 `HMENU` style but populate it only with mIV commands. This keeps the menu
@@ -303,7 +411,7 @@ Representative thumbnail: pin/unpin
 
 Do not include delete, rename, properties, cut, or paste for virtual items.
 
-## 9. Interaction with fullscreen context menus
+## 10. Interaction with fullscreen context menus
 
 The fullscreen context menu should follow the same item classification:
 
@@ -322,7 +430,7 @@ that if it feels better:
 - Representative thumbnail pin.
 - Source file Shell menu or source file reveal.
 
-## 10. Implementation phases
+## 11. Implementation phases
 
 ### Phase 0 - Windows API spike
 
@@ -338,7 +446,19 @@ that if it feels better:
   `Win32_System_Com_StructuredStorage`, `Win32_System_Memory`, and
   `Win32_System_Ole`.
 
-### Phase 1 - `IFileOperation` worker
+### Phase 1 - Folder A/B quick workspaces
+
+- Add reusable `FolderNavHistoryState` helpers.
+- Keep normal history behavior unchanged for users with no active A/B slot.
+- Add A/B target persistence and session-local per-slot back/forward history.
+- Add folder bar `A` / `B` buttons, right-click management menu, active-slot
+  highlight, and the toolbar preference toggle.
+- Wire A/B navigation through the existing folder load and archive conversion
+  paths. Do not add synchronous `read_dir` work to button handling.
+- Update `folder_nav_history_snapshot` / restore helpers so search and archive
+  rollback include the A/B history states.
+
+### Phase 2 - `IFileOperation` worker
 
 - Add `src/shell_file_ops.rs`.
 - Implement direct copy/move/delete/rename requests for real paths.
@@ -348,7 +468,7 @@ that if it feels better:
   `current_folder`.
 - Keep old PowerShell paths behind a temporary fallback if needed.
 
-### Phase 2 - Real filesystem native context menu
+### Phase 3 - Real filesystem native context menu
 
 - Add `src/native_context_menu.rs`.
 - Route real filesystem right-clicks through native `HMENU`.
@@ -357,21 +477,21 @@ that if it feels better:
 - Dispatch mIV commands back to `App`.
 - Add an experimental setting for native Shell context menus.
 
-### Phase 3 - Virtual native custom menu
+### Phase 4 - Virtual native custom menu
 
 - Replace egui context menu for `ZipImage`, `PdfPage`, `ZipDir`, and mixed
   virtual selections with native custom `HMENU`.
 - Keep operations limited to mIV-safe virtual commands.
 - Add PDF page image-copy only if implemented off the UI thread.
 
-### Phase 4 - Remove duplicated egui paths
+### Phase 5 - Remove duplicated egui paths
 
 - Keep egui menu helpers as fallback only.
 - Remove legacy XMP entries from context menus.
 - Delete or shrink custom "Open with" enumeration if Shell menu covers the real
   file use case.
 
-### Phase 5 - Documentation and release notes
+### Phase 6 - Documentation and release notes
 
 Update, at minimum:
 
@@ -381,14 +501,23 @@ Update, at minimum:
 - `docs/architecture-overview.md`
 - `docs/file-drag-drop-design.md` or this document, depending on final module
   names
+- `htdocs/mimageviewer/manual/settings.html`
 - `htdocs/mimageviewer/manual/grid.html`
 - `htdocs/mimageviewer/manual/fullscreen.html`
 - `htdocs/mimageviewer/manual/shortcuts.html`
 
-## 11. Tests and validation
+## 12. Tests and validation
 
 Automated tests:
 
+- A/B quick folder registration, clearing, persistence of targets, and disabled
+  behavior for ineligible temporary views.
+- A/B history isolation: navigating inside A must not mutate B history, and
+  switching A/B must not push to either history.
+- A/B history snapshot/restore around search navigation and archive conversion
+  cancellation/failure.
+- Archive target normalization: converted archive cache paths must store and
+  reload the source archive path.
 - Item classification: real, virtual, mixed, search container, background.
 - Native menu command ID mapping and dispatch.
 - `IFileOperation` request construction for copy/move/delete/rename.
@@ -418,9 +547,15 @@ Manual Windows tests:
 - High DPI and multi-monitor popup placement.
 - Right-click after D&D and after menu cancel, checking for stuck pointer state.
 - Fullscreen still image, ZIP image, PDF page, and video context menus.
+- File organization smoke test: copy/cut in A, switch to B, paste through Shell
+  operation, switch back to A, and verify each slot's back/forward history still
+  works independently.
 
 Performance checks:
 
+- A/B button clicks may trigger the existing async folder load, but must not add
+  synchronous folder scans, archive enumeration, or thumbnail work to the UI
+  frame.
 - Native menu opening should not perform file content I/O.
 - `IFileOperation` can show modal Shell UI, but long copy/move/delete work must
   not run as blocking filesystem loops in `App::update`.
@@ -430,7 +565,22 @@ Performance checks:
   async navigation/reload paths rather than synchronous `read_dir` in the UI
   frame.
 
-## 12. Risks and mitigations
+## 13. Risks and mitigations
+
+A/B state confusion:
+
+- Risk: users may think A/B are two visible panes or expect two independent
+  selections to remain active.
+- Mitigation: label and tooltip them as quick folder workspaces, keep one grid,
+  and make copy/cut state rely on the Shell clipboard rather than hidden mIV
+  selections.
+
+History leakage:
+
+- Risk: A/B switching can pollute the normal folder back/forward stacks or mix
+  A and B histories.
+- Mitigation: introduce explicit `FolderNavHistoryState` ownership and test
+  switch/navigation cases separately.
 
 Shell extensions run in-process:
 
@@ -464,7 +614,7 @@ Reparse points and recursive folder copies:
   `Copy-Item` / `std::fs` loops. Keep explicit path validation for mIV-chosen
   destinations.
 
-## 13. Reference links
+## 14. Reference links
 
 - Microsoft `IFileOperation`:
   <https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-ifileoperation>
