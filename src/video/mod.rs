@@ -285,6 +285,11 @@ impl NativeVideoPlacement {
 }
 
 #[cfg(windows)]
+fn native_child_should_set_focus(placement: NativeVideoPlacement, activate_on_show: bool) -> bool {
+    placement.is_child_window() && activate_on_show
+}
+
+#[cfg(windows)]
 #[derive(Clone, Debug)]
 pub struct NativeVideoOutputConfig {
     pub rect: windows::Win32::Foundation::RECT,
@@ -1720,7 +1725,7 @@ fn run_native_video_output(
         } else {
             window.show_no_activate()
         };
-        if placement.is_child_window() {
+        if native_child_should_set_focus(placement, config.activate_on_show) {
             // Child presenter は show_and_raise が NOACTIVATE で表示するので
             // フォーカスを持たない。キーボード入力は presenter child の wndproc が
             // 処理するため、明示的にフォーカスを当てる。
@@ -2527,7 +2532,10 @@ fn run_native_video_output(
                                         } else {
                                             window.show_no_activate()
                                         };
-                                        if placement.is_child_window() {
+                                        if native_child_should_set_focus(
+                                            placement,
+                                            activate_on_show,
+                                        ) {
                                             unsafe {
                                                 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
                                                 let _ = SetFocus(Some(window.hwnd()));
@@ -6143,6 +6151,23 @@ fn dummy_audio_rx() -> crossbeam_channel::Receiver<decoder::AudioFrame> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn child_presenter_focus_requires_activation() {
+        assert!(super::native_child_should_set_focus(
+            super::NativeVideoPlacement::DetachedViewerChild,
+            true
+        ));
+        assert!(!super::native_child_should_set_focus(
+            super::NativeVideoPlacement::DetachedViewerChild,
+            false
+        ));
+        assert!(!super::native_child_should_set_focus(
+            super::NativeVideoPlacement::FullscreenBorderless,
+            true
+        ));
+    }
+
     #[test]
     fn frame_step_interval_uses_average_fps() {
         let step = super::frame_step_interval_secs(60.0);

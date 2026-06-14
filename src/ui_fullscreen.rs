@@ -70,6 +70,14 @@ fn should_zoom_fullscreen_wheel(ctrl_held: bool, overlay_edit_mode: bool) -> boo
     ctrl_held || overlay_edit_mode
 }
 
+fn should_suppress_egui_wheel_for_native_detached_video(
+    is_video: bool,
+    detached: bool,
+    native_presenter_active: bool,
+) -> bool {
+    is_video && detached && native_presenter_active
+}
+
 /// 中ボタンドラッグズーム: 縦 N px で倍率 2 倍/半分になる感度 (v0.8.1)。
 /// 100 px で 2 倍 (= 上へ 200 px で 4 倍)。ホイール 1 ノッチ ≈ 10% と比べて粗めだが、
 /// 縦フル (1080 px) ストロークすれば 2^10 ≈ 1000 倍まで届くので十分。
@@ -2446,7 +2454,7 @@ impl App {
             #[cfg(windows)]
             let fs_builder = match self.fs_viewport_presentation {
                 Some(ViewerPresentation::DetachedWindow) => {
-                    self.build_detached_viewer_viewport_builder(0, None)
+                    self.build_detached_viewer_viewport_builder(0, None, false)
                 }
                 _ => self.build_fullscreen_viewport_builder(),
             };
@@ -2525,7 +2533,7 @@ impl App {
         #[cfg(windows)]
         let fs_builder = match self.fs_viewport_presentation {
             Some(ViewerPresentation::DetachedWindow) => {
-                self.build_detached_viewer_viewport_builder(0, None)
+                self.build_detached_viewer_viewport_builder(0, None, false)
             }
             _ => self.build_fullscreen_viewport_builder(),
         }
@@ -2807,7 +2815,11 @@ impl App {
         #[cfg(not(windows))]
         let detached_activate_on_show = Some(true);
         let mut fs_builder = if detached {
-            self.build_detached_viewer_viewport_builder(fs_idx, detached_activate_on_show)
+            self.build_detached_viewer_viewport_builder(
+                fs_idx,
+                detached_activate_on_show,
+                need_show,
+            )
         } else {
             self.build_fullscreen_viewport_builder()
         };
@@ -4448,7 +4460,7 @@ impl App {
         let fs_id = self.fullscreen_viewport_id();
         let builder = match self.fs_viewport_presentation {
             Some(ViewerPresentation::DetachedWindow) => {
-                self.build_detached_viewer_viewport_builder(fs_idx, None)
+                self.build_detached_viewer_viewport_builder(fs_idx, None, false)
             }
             _ => self.build_fullscreen_viewport_builder(),
         }
@@ -4552,6 +4564,7 @@ impl App {
         &self,
         fs_idx: usize,
         active: Option<bool>,
+        apply_placement: bool,
     ) -> egui::ViewportBuilder {
         let name = self
             .items
@@ -4564,15 +4577,18 @@ impl App {
             format!("{name} - mimageviewer")
         };
 
-        let placement = self.detached_viewer_window_placement();
         let mut builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_decorations(true)
             .with_transparent(false)
-            .with_taskbar(true)
-            .with_inner_size([placement.w, placement.h])
-            .with_position(egui::pos2(placement.x, placement.y))
-            .with_maximized(placement.maximized);
+            .with_taskbar(true);
+        if apply_placement {
+            let placement = self.detached_viewer_window_placement();
+            builder = builder
+                .with_inner_size([placement.w, placement.h])
+                .with_position(egui::pos2(placement.x, placement.y))
+                .with_maximized(placement.maximized);
+        }
         if let Some(active) = active {
             builder = builder.with_active(active);
         }
@@ -6442,6 +6458,14 @@ impl App {
         let in_video_tile = false;
         let wheel_y = ctx.input(|i| i.raw_scroll_delta.y);
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+        #[cfg(windows)]
+        let suppress_egui_wheel = should_suppress_egui_wheel_for_native_detached_video(
+            state.is_video,
+            self.viewer_session_is_detached(),
+            self.native_video_presenter_hwnd().is_some(),
+        );
+        #[cfg(not(windows))]
+        let suppress_egui_wheel = false;
         // modal ダイアログ (Ctrl+E など) が開いている間は wheel 由来のページ送りを
         // 抑止する。state.source 等が snapshot 時点で固定されているので、idx だけ
         // 移動すると間違った画像が export される (Codex review CONFIRMED)。
@@ -6453,7 +6477,17 @@ impl App {
             modal_for_keys,
             self.spread_popup_open || self.fit_popup_open,
         );
-        if wheel_y.abs() > 0.5 && handle_wheel_here {
+        if wheel_y.abs() > 0.5 && suppress_egui_wheel {
+            // F12 detached 動画では native presenter child HWND がホイールを
+            // `NavigateItem` / tile 列変更に変換する。親の egui detached viewport にも
+            // 同じ wheel が届く環境があるため、ここでは消費だけして二重ナビを防ぐ。
+            ctx.input_mut(|i| {
+                i.raw_scroll_delta = egui::Vec2::ZERO;
+                i.smooth_scroll_delta = egui::Vec2::ZERO;
+                i.events
+                    .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+            });
+        } else if wheel_y.abs() > 0.5 && handle_wheel_here {
             ctx.input_mut(|i| {
                 i.raw_scroll_delta = egui::Vec2::ZERO;
                 i.smooth_scroll_delta = egui::Vec2::ZERO;
@@ -14377,6 +14411,22 @@ mod tests {
         // 表示モード / フィットのポップアップ表示中は Ctrl+ホイールでも抑制する。
         assert!(!should_handle_fullscreen_wheel(
             false, false, true, false, true
+        ));
+    }
+
+    #[test]
+    fn detached_native_video_suppresses_parent_viewport_wheel() {
+        assert!(should_suppress_egui_wheel_for_native_detached_video(
+            true, true, true
+        ));
+        assert!(!should_suppress_egui_wheel_for_native_detached_video(
+            true, false, true
+        ));
+        assert!(!should_suppress_egui_wheel_for_native_detached_video(
+            false, true, true
+        ));
+        assert!(!should_suppress_egui_wheel_for_native_detached_video(
+            true, true, false
         ));
     }
 

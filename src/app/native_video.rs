@@ -1039,18 +1039,25 @@ impl App {
             return;
         }
         let is_new_hwnd = hwnd != self.native_video_front_synced_hwnd;
+        let fullscreen_presentation =
+            matches!(self.viewer_presentation, ViewerPresentation::Fullscreen);
         if !is_new_hwnd {
             // 既存 HWND が継続しているケースでも、HUD HWND は遅延生成されることがあるので
             // bridge 側の登録値が古い (0) のままにならないよう毎フレーム refresh する。
-            self.dsp_bridge.set_hud_hwnd(hud_hwnd);
             self.sync_native_video_main_cloak(false);
-            // in-window モードでは presenter は main HWND の子なので foreground は
-            // 常に main で正しい。fullscreen 用の foreground 復旧 / VST overlap 調整は
-            // 不要かつ有害 (250ms ごとの AttachThreadInput churn が resize 追従を
-            // 不安定化させる) なので早期 return する。
-            if self.native_video_in_window_active {
+            // foreground 復旧 / VST owner / HUD topmost 保守は fullscreen 専用。
+            // in-window / detached viewer では presenter は通常ウィンドウの child なので、
+            // メイン HWND が foreground であることが正常。ここで presenter を raise すると
+            // F12 別ウィンドウがメイン操作を奪い返してしまう。
+            if !fullscreen_presentation {
+                self.dsp_bridge.unregister_fullscreen_owner();
+                self.dsp_bridge.set_hud_hwnd(0);
+                self.vst_geometry_tracker.clear();
+                self.native_video_front_last_raise = None;
+                self.native_video_front_recover_after_external_foreground = false;
                 return;
             }
+            self.dsp_bridge.set_hud_hwnd(hud_hwnd);
             // PrintScreen / Snipping Tool の範囲選択後や native startup の競合で
             // egui 側の黒 backdrop が presenter HWND より前に残ることがある。
             // UI thread から presenter HWND を直接 SetWindowPos せず、復旧が必要な
@@ -1127,12 +1134,16 @@ impl App {
         // - `set_hud_hwnd(hud_hwnd)`: HUD HWND を「raise allowlist の mIV 既知 HWND」として登録
         //   (= `foreground_allows_hud_raise` で許可される)。**owner 候補には絶対に出さない**
         //   (= `current_gui_owner_hwnd` 内で除外済み)。
-        // in-window モードでは VST editor の owner を presenter にしない
+        // in-window / detached viewer では VST editor の owner を presenter にしない
         // (WS_CHILD を owner にすると z-order/focus が壊れる。Codex P3)。
-        if !self.native_video_in_window_active {
+        if fullscreen_presentation {
             self.dsp_bridge.register_fullscreen_owner(hwnd);
+            self.dsp_bridge.set_hud_hwnd(hud_hwnd);
+        } else {
+            self.dsp_bridge.unregister_fullscreen_owner();
+            self.dsp_bridge.set_hud_hwnd(0);
+            self.vst_geometry_tracker.clear();
         }
-        self.dsp_bridge.set_hud_hwnd(hud_hwnd);
         self.sync_native_video_main_cloak(false);
         // 実機修正 (2026-05-12 P1 致命的問題): cross-process SetWindowPos(VST_HWND) は
         // bridge GUI スレッドをブロックして bridge 自殺 → VST 全消失。clamp 機能完全削除。
@@ -1805,10 +1816,13 @@ impl App {
         self.native_video_front_synced_hwnd = 0;
         self.native_video_front_last_raise = None;
         self.native_video_front_recover_after_external_foreground = false;
-        if in_window {
-            // in-window では VST を対象外にするため、全画面 owner 登録を解除する
-            // (Codex #4)。VST availability / panel は毎フレームの sync_* で false 化。
+        if !matches!(presentation, ViewerPresentation::Fullscreen) {
+            // in-window / detached viewer では VST を対象外にするため、全画面
+            // owner / HUD 登録を解除する (Codex #4)。VST availability / panel は
+            // 毎フレームの sync_* で false 化。
             self.dsp_bridge.unregister_fullscreen_owner();
+            self.dsp_bridge.set_hud_hwnd(0);
+            self.vst_geometry_tracker.clear();
         }
         crate::logger::log(format!(
             "[native-video] presentation switch applied -> {presentation:?}"
