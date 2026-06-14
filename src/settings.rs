@@ -345,6 +345,49 @@ impl DetailsSizeDisplayMode {
     }
 }
 
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+pub enum DetailsColumnId {
+    Name,
+    Rating,
+    Tags,
+    Kind,
+    Size,
+    Modified,
+    Created,
+    State,
+    ImageDimensions,
+    VideoDuration,
+    VideoDimensions,
+    VideoCodec,
+}
+
+impl DetailsColumnId {
+    pub fn default_order() -> &'static [Self] {
+        &[
+            Self::Name,
+            Self::Rating,
+            Self::Tags,
+            Self::Kind,
+            Self::Size,
+            Self::Modified,
+            Self::Created,
+            Self::State,
+            Self::ImageDimensions,
+            Self::VideoDuration,
+            Self::VideoDimensions,
+            Self::VideoCodec,
+        ]
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct DetailsColumnWidth {
+    pub column: DetailsColumnId,
+    pub width: f32,
+}
+
 // -----------------------------------------------------------------------
 // スマートフィルタ (軽量 facet)
 // -----------------------------------------------------------------------
@@ -1303,6 +1346,10 @@ pub struct Settings {
     pub details_sort_ascending: bool,
     #[serde(default)]
     pub details_size_display_mode: DetailsSizeDisplayMode,
+    #[serde(default)]
+    pub details_column_order: Vec<DetailsColumnId>,
+    #[serde(default)]
+    pub details_column_widths: Vec<DetailsColumnWidth>,
     #[serde(default = "default_true")]
     pub details_show_rating: bool,
     #[serde(default = "default_true")]
@@ -2643,6 +2690,40 @@ pub fn default_export_batch_selection() -> [bool; 5] {
     [true, false, false, false, false]
 }
 
+fn sanitize_details_column_order(order: &mut Vec<DetailsColumnId>) {
+    if order.is_empty() {
+        return;
+    }
+
+    let mut cleaned = Vec::with_capacity(DetailsColumnId::default_order().len());
+    for &column in order.iter() {
+        if DetailsColumnId::default_order().contains(&column) && !cleaned.contains(&column) {
+            cleaned.push(column);
+        }
+    }
+    for &column in DetailsColumnId::default_order() {
+        if !cleaned.contains(&column) {
+            cleaned.push(column);
+        }
+    }
+    *order = cleaned;
+}
+
+fn sanitize_details_column_widths(widths: &mut Vec<DetailsColumnWidth>) {
+    let mut by_column = std::collections::BTreeMap::new();
+    for width in widths.drain(..) {
+        if width.column == DetailsColumnId::Name || !width.width.is_finite() {
+            continue;
+        }
+        by_column.insert(width.column, width.width.clamp(40.0, 800.0));
+    }
+    widths.extend(
+        by_column
+            .into_iter()
+            .map(|(column, width)| DetailsColumnWidth { column, width }),
+    );
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -2651,6 +2732,8 @@ impl Default for Settings {
             details_sort_key: DetailsSortKey::default(),
             details_sort_ascending: default_details_sort_ascending(),
             details_size_display_mode: DetailsSizeDisplayMode::default(),
+            details_column_order: Vec::new(),
+            details_column_widths: Vec::new(),
             details_show_rating: true,
             details_show_tags: true,
             details_show_kind: true,
@@ -3756,6 +3839,8 @@ impl Settings {
                 fav.id = Uuid::new_v4();
             }
         }
+        sanitize_details_column_order(&mut self.details_column_order);
+        sanitize_details_column_widths(&mut self.details_column_widths);
         self.normalize_tag_settings();
         self.normalize_facet_tag_filter();
     }
@@ -3826,6 +3911,8 @@ impl Settings {
         self.details_sort_key = src.details_sort_key;
         self.details_sort_ascending = src.details_sort_ascending;
         self.details_size_display_mode = src.details_size_display_mode;
+        self.details_column_order = src.details_column_order.clone();
+        self.details_column_widths = src.details_column_widths.clone();
         self.details_show_rating = src.details_show_rating;
         self.details_show_tags = src.details_show_tags;
         self.details_show_kind = src.details_show_kind;
@@ -5690,6 +5777,21 @@ mod tests {
             s.details_sort_key = DetailsSortKey::Size;
             s.details_sort_ascending = false;
             s.details_size_display_mode = DetailsSizeDisplayMode::FixedKb;
+            s.details_column_order = vec![
+                DetailsColumnId::Size,
+                DetailsColumnId::Name,
+                DetailsColumnId::Modified,
+            ];
+            s.details_column_widths = vec![
+                DetailsColumnWidth {
+                    column: DetailsColumnId::Size,
+                    width: 128.0,
+                },
+                DetailsColumnWidth {
+                    column: DetailsColumnId::Modified,
+                    width: 188.0,
+                },
+            ];
             s.details_show_rating = false;
             s.details_show_tags = false;
             s.details_show_kind = false;
@@ -5743,6 +5845,19 @@ mod tests {
                 loaded.details_size_display_mode,
                 DetailsSizeDisplayMode::FixedKb,
                 "details_size_display_mode should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.details_column_order.first().copied(),
+                Some(DetailsColumnId::Size),
+                "details_column_order should survive roundtrip"
+            );
+            assert!(
+                loaded
+                    .details_column_widths
+                    .iter()
+                    .any(|entry| entry.column == DetailsColumnId::Size
+                        && (entry.width - 128.0).abs() < 0.1),
+                "details_column_widths should survive roundtrip"
             );
             assert!(
                 !loaded.details_show_rating,

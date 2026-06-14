@@ -12,8 +12,8 @@ use eframe::egui;
 use crate::app::{App, FacetField, LazyColumnState};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::settings::{
-    DetailsSortKey, FacetDatePreset, FacetEditFlag, FacetItemKind, FacetSizePreset, FacetTagMode,
-    GridViewMode,
+    DetailsColumnId, DetailsColumnWidth, DetailsSortKey, FacetDatePreset, FacetEditFlag,
+    FacetItemKind, FacetSizePreset, FacetTagMode, GridViewMode,
 };
 // open_external_player はグリッドからは使わなくなった (動画はフルスクリーン化 →
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
@@ -512,6 +512,40 @@ impl DetailsColumn {
         }
     }
 
+    fn id(self) -> DetailsColumnId {
+        match self {
+            Self::Name => DetailsColumnId::Name,
+            Self::Rating => DetailsColumnId::Rating,
+            Self::Tags => DetailsColumnId::Tags,
+            Self::Kind => DetailsColumnId::Kind,
+            Self::Size => DetailsColumnId::Size,
+            Self::Modified => DetailsColumnId::Modified,
+            Self::Created => DetailsColumnId::Created,
+            Self::State => DetailsColumnId::State,
+            Self::ImageDimensions => DetailsColumnId::ImageDimensions,
+            Self::VideoDuration => DetailsColumnId::VideoDuration,
+            Self::VideoDimensions => DetailsColumnId::VideoDimensions,
+            Self::VideoCodec => DetailsColumnId::VideoCodec,
+        }
+    }
+
+    fn from_id(id: DetailsColumnId) -> Self {
+        match id {
+            DetailsColumnId::Name => Self::Name,
+            DetailsColumnId::Rating => Self::Rating,
+            DetailsColumnId::Tags => Self::Tags,
+            DetailsColumnId::Kind => Self::Kind,
+            DetailsColumnId::Size => Self::Size,
+            DetailsColumnId::Modified => Self::Modified,
+            DetailsColumnId::Created => Self::Created,
+            DetailsColumnId::State => Self::State,
+            DetailsColumnId::ImageDimensions => Self::ImageDimensions,
+            DetailsColumnId::VideoDuration => Self::VideoDuration,
+            DetailsColumnId::VideoDimensions => Self::VideoDimensions,
+            DetailsColumnId::VideoCodec => Self::VideoCodec,
+        }
+    }
+
     fn sort_key(self) -> DetailsSortKey {
         match self {
             Self::Name => DetailsSortKey::Name,
@@ -574,38 +608,109 @@ impl DetailsColumn {
     }
 }
 
+fn details_ordered_columns(
+    settings: &crate::settings::Settings,
+    include_hidden: bool,
+) -> Vec<DetailsColumn> {
+    let mut ordered = Vec::with_capacity(DetailsColumn::all().len());
+    let source: Vec<DetailsColumnId> = if settings.details_column_order.is_empty() {
+        DetailsColumnId::default_order().to_vec()
+    } else {
+        settings.details_column_order.clone()
+    };
+    for id in source {
+        let col = DetailsColumn::from_id(id);
+        if !ordered.contains(&col) {
+            ordered.push(col);
+        }
+    }
+    for &col in DetailsColumn::all() {
+        if !ordered.contains(&col) {
+            ordered.push(col);
+        }
+    }
+    ordered
+        .into_iter()
+        .filter(|col| include_hidden || col.visible(settings))
+        .collect()
+}
+
+fn details_column_width(settings: &crate::settings::Settings, col: DetailsColumn) -> f32 {
+    if col == DetailsColumn::Name {
+        return col.default_width();
+    }
+    settings
+        .details_column_widths
+        .iter()
+        .find(|entry| entry.column == col.id())
+        .map(|entry| entry.width)
+        .unwrap_or_else(|| col.default_width())
+        .clamp(40.0, 800.0)
+}
+
+fn set_details_column_width(
+    settings: &mut crate::settings::Settings,
+    col: DetailsColumn,
+    width: f32,
+) -> bool {
+    if col == DetailsColumn::Name {
+        return false;
+    }
+    let width = width.clamp(40.0, 800.0);
+    if let Some(entry) = settings
+        .details_column_widths
+        .iter_mut()
+        .find(|entry| entry.column == col.id())
+    {
+        if (entry.width - width).abs() <= 0.1 {
+            return false;
+        }
+        entry.width = width;
+    } else {
+        settings.details_column_widths.push(DetailsColumnWidth {
+            column: col.id(),
+            width,
+        });
+    }
+    true
+}
+
+fn details_content_width(avail_w: f32, settings: &crate::settings::Settings) -> f32 {
+    let fixed: f32 = details_ordered_columns(settings, false)
+        .into_iter()
+        .filter(|col| *col != DetailsColumn::Name)
+        .map(|col| details_column_width(settings, col))
+        .sum();
+    avail_w.max(DetailsColumn::Name.default_width() + fixed)
+}
+
 fn details_column_rects(
     rect: egui::Rect,
     settings: &crate::settings::Settings,
 ) -> Vec<(DetailsColumn, egui::Rect)> {
-    let mut non_name = DetailsColumn::all()
+    let columns = details_ordered_columns(settings, false);
+    let fixed: f32 = columns
         .iter()
         .copied()
-        .filter(|col| *col != DetailsColumn::Name && col.visible(settings))
-        .map(|col| (col, col.default_width()))
+        .filter(|col| *col != DetailsColumn::Name)
+        .map(|col| details_column_width(settings, col))
+        .sum();
+    let name_width = (rect.width() - fixed).max(DetailsColumn::Name.default_width());
+    let specs = columns
+        .into_iter()
+        .map(|col| {
+            let width = if col == DetailsColumn::Name {
+                name_width
+            } else {
+                details_column_width(settings, col)
+            };
+            (col, width)
+        })
         .collect::<Vec<_>>();
-    let name_min = DetailsColumn::Name.default_width();
-    let fixed: f32 = non_name.iter().map(|(_, width)| *width).sum();
-    if fixed > 0.0 && rect.width() < name_min + fixed {
-        let scale = ((rect.width() - name_min).max(0.0) / fixed).clamp(0.55, 1.0);
-        for (_, width) in &mut non_name {
-            *width *= scale;
-        }
-    }
-    let fixed: f32 = non_name.iter().map(|(_, width)| *width).sum();
-    let name = (rect.width() - fixed).max(96.0);
-    let mut specs = Vec::with_capacity(non_name.len() + 1);
-    specs.push((DetailsColumn::Name, name));
-    specs.extend(non_name);
-
     let mut x = rect.left();
     let mut out = Vec::with_capacity(specs.len());
-    for (pos, (col, width)) in specs.iter().copied().enumerate() {
-        let right = if pos + 1 == specs.len() {
-            rect.right()
-        } else {
-            (x + width).min(rect.right())
-        };
+    for (col, width) in specs.iter().copied() {
+        let right = x + width;
         out.push((
             col,
             egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(right, rect.bottom())),
@@ -613,6 +718,47 @@ fn details_column_rects(
         x = right;
     }
     out
+}
+
+fn details_column_at(
+    columns: &[(DetailsColumn, egui::Rect)],
+    pos: egui::Pos2,
+) -> Option<(DetailsColumn, egui::Rect)> {
+    columns.iter().copied().find(|(_, rect)| rect.contains(pos))
+}
+
+fn reorder_details_column(
+    settings: &mut crate::settings::Settings,
+    dragged: DetailsColumn,
+    target: DetailsColumn,
+    insert_after_target: bool,
+) -> bool {
+    if dragged == target {
+        return false;
+    }
+    let mut columns = details_ordered_columns(settings, true);
+    let Some(from_pos) = columns.iter().position(|col| *col == dragged) else {
+        return false;
+    };
+    let dragged = columns.remove(from_pos);
+    let Some(target_pos) = columns.iter().position(|col| *col == target) else {
+        return false;
+    };
+    let insert_pos = if insert_after_target {
+        target_pos + 1
+    } else {
+        target_pos
+    };
+    columns.insert(insert_pos.min(columns.len()), dragged);
+    let new_order = columns
+        .into_iter()
+        .map(DetailsColumn::id)
+        .collect::<Vec<_>>();
+    if settings.details_column_order == new_order {
+        return false;
+    }
+    settings.details_column_order = new_order;
+    true
 }
 
 fn draw_details_text(
@@ -3874,23 +4020,18 @@ impl App {
         spread_pair_cursor_idx: Option<usize>,
     ) -> Option<PathBuf> {
         let avail_w = ui.available_width().max(1.0);
+        let content_w = details_content_width(avail_w, &self.settings);
 
-        if (avail_w - self.last_cell_size).abs() > 0.5
+        if (content_w - self.last_cell_size).abs() > 0.5
             || (Self::DETAILS_ROW_H - self.last_cell_h).abs() > 0.5
         {
-            self.last_cell_size = avail_w;
+            self.last_cell_size = content_w;
             self.last_cell_h = Self::DETAILS_ROW_H;
         }
 
         if scroll_to {
             self.apply_scroll_to_selected(1, Self::DETAILS_ROW_H);
         }
-
-        let (header_rect, _) = ui.allocate_exact_size(
-            egui::vec2(avail_w, Self::DETAILS_HEADER_H),
-            egui::Sense::hover(),
-        );
-        self.draw_details_header(ui, header_rect);
 
         if self.details_order.len() != self.visible_indices.len() {
             self.rebuild_details_order();
@@ -3913,77 +4054,97 @@ impl App {
         self.scroll_offset_y = self.scroll_offset_y.clamp(0.0, max_offset);
 
         let mut nav: Option<PathBuf> = None;
-        let scroll_output = egui::ScrollArea::vertical()
+        let mut body_inner_rect = egui::Rect::NOTHING;
+        let mut egui_offset_y = self.scroll_offset_y;
+        egui::ScrollArea::horizontal()
+            .id_salt("details_list_horizontal")
             .auto_shrink([false, false])
-            .vertical_scroll_offset(self.scroll_offset_y)
-            .show_viewport(ui, |ui, viewport| {
-                self.last_viewport_h = viewport.height();
-
-                let (content_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(avail_w, total_h), egui::Sense::hover());
-
-                let first_row = (viewport.min.y / Self::DETAILS_ROW_H) as usize;
-                let last_row = ((viewport.max.y / Self::DETAILS_ROW_H) as usize + 2).min(row_count);
-                let prewarm_first = first_row.saturating_sub(8);
-                let prewarm_last = (last_row + 8).min(row_count);
-                self.details_tag_prewarm_indices.clear();
-                self.details_tag_prewarm_indices.extend(
-                    display_order
-                        .get(prewarm_first..prewarm_last)
-                        .unwrap_or(&[])
-                        .iter()
-                        .copied(),
+            .show(ui, |ui| {
+                ui.set_min_width(content_w);
+                let (header_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(content_w, Self::DETAILS_HEADER_H),
+                    egui::Sense::hover(),
                 );
+                self.draw_details_header(ui, header_rect);
 
-                let vis_first_idx = display_order.get(first_row).copied().unwrap_or(0);
-                self.scroll_hint.store(vis_first_idx, Ordering::Relaxed);
-                let vis_end_idx = display_order
-                    .get(last_row.saturating_sub(1).min(row_count.saturating_sub(1)))
-                    .copied()
-                    .map(|i| i + 1)
-                    .unwrap_or(vis_first_idx);
-                self.visible_end_shared
-                    .store(vis_end_idx, Ordering::Relaxed);
+                let scroll_output = egui::ScrollArea::vertical()
+                    .id_salt("details_list_vertical")
+                    .auto_shrink([false, false])
+                    .vertical_scroll_offset(self.scroll_offset_y)
+                    .show_viewport(ui, |ui, viewport| {
+                        self.last_viewport_h = viewport.height();
 
-                for row in first_row..last_row {
-                    let Some(&idx) = display_order.get(row) else {
-                        continue;
-                    };
-                    let row_rect = egui::Rect::from_min_size(
-                        content_rect.min + egui::vec2(0.0, row as f32 * Self::DETAILS_ROW_H),
-                        egui::vec2(avail_w, Self::DETAILS_ROW_H),
-                    );
+                        let (content_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(content_w, total_h),
+                            egui::Sense::hover(),
+                        );
 
-                    if let Some(n) = self.handle_cell_interaction(ui, ctx, row_rect, idx) {
-                        nav = Some(n);
-                    }
-                    if idx >= self.items.len() {
-                        break;
-                    }
+                        let first_row = (viewport.min.y / Self::DETAILS_ROW_H) as usize;
+                        let last_row =
+                            ((viewport.max.y / Self::DETAILS_ROW_H) as usize + 2).min(row_count);
+                        let prewarm_first = first_row.saturating_sub(8);
+                        let prewarm_last = (last_row + 8).min(row_count);
+                        self.details_tag_prewarm_indices.clear();
+                        self.details_tag_prewarm_indices.extend(
+                            display_order
+                                .get(prewarm_first..prewarm_last)
+                                .unwrap_or(&[])
+                                .iter()
+                                .copied(),
+                        );
 
-                    self.draw_details_row(
-                        ui,
-                        row_rect,
-                        idx,
-                        row,
-                        spread_pair_cursor_idx == Some(idx),
-                    );
-                    if self.selected == Some(idx) {
-                        self.selected_cell_rect = Some(row_rect);
-                    }
-                }
+                        let vis_first_idx = display_order.get(first_row).copied().unwrap_or(0);
+                        self.scroll_hint.store(vis_first_idx, Ordering::Relaxed);
+                        let vis_end_idx = display_order
+                            .get(last_row.saturating_sub(1).min(row_count.saturating_sub(1)))
+                            .copied()
+                            .map(|i| i + 1)
+                            .unwrap_or(vis_first_idx);
+                        self.visible_end_shared
+                            .store(vis_end_idx, Ordering::Relaxed);
+
+                        for row in first_row..last_row {
+                            let Some(&idx) = display_order.get(row) else {
+                                continue;
+                            };
+                            let row_rect = egui::Rect::from_min_size(
+                                content_rect.min
+                                    + egui::vec2(0.0, row as f32 * Self::DETAILS_ROW_H),
+                                egui::vec2(content_w, Self::DETAILS_ROW_H),
+                            );
+
+                            if let Some(n) = self.handle_cell_interaction(ui, ctx, row_rect, idx) {
+                                nav = Some(n);
+                            }
+                            if idx >= self.items.len() {
+                                break;
+                            }
+
+                            self.draw_details_row(
+                                ui,
+                                row_rect,
+                                idx,
+                                row,
+                                spread_pair_cursor_idx == Some(idx),
+                            );
+                            if self.selected == Some(idx) {
+                                self.selected_cell_rect = Some(row_rect);
+                            }
+                        }
+                    });
+                body_inner_rect = scroll_output.inner_rect;
+                egui_offset_y = scroll_output.state.offset.y;
             });
 
-        let bg_right_clicked = ui.rect_contains_pointer(scroll_output.inner_rect)
+        let bg_right_clicked = ui.rect_contains_pointer(body_inner_rect)
             && ctx.input(|i| i.pointer.secondary_clicked());
         if bg_right_clicked && self.context_menu_idx.is_none() {
             self.open_current_folder_context_menu(ctx);
         }
 
-        let egui_offset = scroll_output.state.offset.y;
-        if (egui_offset - self.scroll_offset_y).abs() > Self::DETAILS_ROW_H * 0.5 {
+        if (egui_offset_y - self.scroll_offset_y).abs() > Self::DETAILS_ROW_H * 0.5 {
             self.scroll_offset_y =
-                (egui_offset / Self::DETAILS_ROW_H).round() * Self::DETAILS_ROW_H;
+                (egui_offset_y / Self::DETAILS_ROW_H).round() * Self::DETAILS_ROW_H;
         }
 
         let full_rect = ui.max_rect();
@@ -4003,11 +4164,16 @@ impl App {
             egui::Stroke::new(1.0, stroke_color),
         );
 
-        for (col, col_rect) in details_column_rects(rect, &self.settings) {
+        let columns = details_column_rects(rect, &self.settings);
+        for (col, col_rect) in columns.iter().copied() {
+            let mut header_hit = col_rect;
+            if col != DetailsColumn::Name && header_hit.width() > 12.0 {
+                header_hit.max.x -= 6.0;
+            }
             let response = ui.interact(
-                col_rect,
+                header_hit,
                 ui.id().with(("details_header", col)),
-                egui::Sense::click(),
+                egui::Sense::click_and_drag(),
             );
             if response.hovered() {
                 ui.painter().rect_filled(col_rect, 0.0, hover_bg);
@@ -4017,6 +4183,22 @@ impl App {
             let sort_enabled = !lazy_sort || self.details_lazy_sort_ready();
             if response.clicked() && sort_enabled {
                 self.set_details_sort_key(col.sort_key());
+            }
+            if response.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+            if response.drag_stopped()
+                && response
+                    .total_drag_delta()
+                    .is_some_and(|delta| delta.x.abs() >= 12.0)
+                && let Some(pointer_pos) = ui.ctx().input(|i| i.pointer.latest_pos())
+                && let Some((target, target_rect)) = details_column_at(&columns, pointer_pos)
+            {
+                let insert_after = pointer_pos.x > target_rect.center().x;
+                if reorder_details_column(&mut self.settings, col, target, insert_after) {
+                    self.settings.save();
+                    ui.ctx().request_repaint();
+                }
             }
             let sorted = self.settings.details_sort_key == sort_key;
             let mut base_title = col.title().to_string();
@@ -4058,6 +4240,37 @@ impl App {
                 [col_rect.right_top(), col_rect.right_bottom()],
                 egui::Stroke::new(1.0, stroke_color),
             );
+            if col != DetailsColumn::Name {
+                let resize_rect = egui::Rect::from_center_size(
+                    egui::pos2(col_rect.right(), col_rect.center().y),
+                    egui::vec2(8.0, col_rect.height()),
+                );
+                let resize_response = ui.interact(
+                    resize_rect,
+                    ui.id().with(("details_header_resize", col)),
+                    egui::Sense::drag(),
+                );
+                if resize_response.hovered() || resize_response.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    ui.painter().line_segment(
+                        [col_rect.right_top(), col_rect.right_bottom()],
+                        egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                    );
+                }
+                if resize_response.dragged() {
+                    let current = details_column_width(&self.settings, col);
+                    if set_details_column_width(
+                        &mut self.settings,
+                        col,
+                        current + resize_response.drag_delta().x,
+                    ) {
+                        ui.ctx().request_repaint();
+                    }
+                }
+                if resize_response.drag_stopped() {
+                    self.settings.save();
+                }
+            }
             let response = if sort_enabled {
                 response.hover_tip("クリックで 昇順 → 降順 → ソートなし")
             } else {
@@ -5028,6 +5241,55 @@ mod rating_filter_op_tests {
 #[cfg(test)]
 mod compute_cell_size_tests {
     use super::*;
+
+    fn minimal_details_settings() -> crate::settings::Settings {
+        let mut settings = crate::settings::Settings::default();
+        settings.details_show_rating = false;
+        settings.details_show_tags = false;
+        settings.details_show_kind = false;
+        settings.details_show_modified = false;
+        settings.details_show_created = false;
+        settings.details_show_state = false;
+        settings.details_show_image_dimensions = false;
+        settings.details_show_video_duration = false;
+        settings.details_show_video_dimensions = false;
+        settings.details_show_video_codec = false;
+        settings
+    }
+
+    #[test]
+    fn details_content_width_overflows_when_saved_width_needs_it() {
+        let mut settings = minimal_details_settings();
+        assert!(set_details_column_width(
+            &mut settings,
+            DetailsColumn::Size,
+            220.0
+        ));
+
+        let width = details_content_width(200.0, &settings);
+        assert_eq!(width, DetailsColumn::Name.default_width() + 220.0);
+    }
+
+    #[test]
+    fn details_reorder_column_persists_dragged_order() {
+        let mut settings = crate::settings::Settings::default();
+
+        assert!(reorder_details_column(
+            &mut settings,
+            DetailsColumn::Size,
+            DetailsColumn::Name,
+            false
+        ));
+
+        assert_eq!(
+            settings.details_column_order.first().copied(),
+            Some(DetailsColumnId::Size)
+        );
+        assert_eq!(
+            settings.details_column_order.get(1).copied(),
+            Some(DetailsColumnId::Name)
+        );
+    }
 
     #[test]
     fn returns_none_for_non_positive_width() {

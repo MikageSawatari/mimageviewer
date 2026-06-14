@@ -170,6 +170,10 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   `作成日時` は既定で非表示。
   画像は既存のフルスクリーンキャッシュ / サムネイルカタログ / 画像ヘッダ probe、
   動画は FFmpeg probe、作成日時はファイルシステム metadata を worker でバックグラウンド取得する
+- 詳細一覧ヘッダの右端をドラッグすると列幅を変更できる。`名前` 以外の列幅を記憶し、
+  `名前` 列は余った幅を吸収する。記憶した幅が画面に収まらない場合は横スクロールで表示する
+- 詳細一覧ヘッダを横ドラッグして別の列上で離すと、列順を入れ替えられる。
+  非表示列の順序も内部的に保持し、再表示したときに前回の位置へ戻す
 - 列ヘッダをクリックすると、その列で `昇順` → `降順` → `ソートなし` を切り替える。
   `ソートなし` ではツールバーのロード時ソート順を使う。列ヘッダソート中はツールバーの
   ソート操作を無効化する。遅延ロード列は読み込み完了 (Ready) まで列ヘッダでのソートを無効化する
@@ -709,6 +713,8 @@ SendTo から渡されたファイル / フォルダは Windows により位置�
 | `details_sort_key` | DetailsSortKey | Toolbar | 詳細表示モードの列ヘッダソートキー。`Toolbar` はツールバーのロード時ソート順、ほかに Name / Rating / Tags / Kind / Size / Modified / Created / State / ImageDimensions / VideoDuration / VideoDimensions / VideoCodec |
 | `details_sort_ascending` | bool | true | 詳細表示モードの列ソート方向。`true` は昇順、`false` は降順 |
 | `details_size_display_mode` | DetailsSizeDisplayMode | Optimal | 詳細表示モードのサイズ列表示。`Optimal` は B / KB / MB / GB から自動選択、固定モードは Bytes / KB / MB |
+| `details_column_order` | Vec\<DetailsColumnId\> | [] | 詳細表示モードの列順。空なら既定順。列ヘッダの横ドラッグで更新される |
+| `details_column_widths` | Vec\<DetailsColumnWidth\> | [] | 詳細表示モードの列幅。`名前` 以外を列ヘッダ右端ドラッグで更新する |
 | `details_show_rating` | bool | true | 詳細表示モードで `★` 列を表示するか |
 | `details_show_tags` | bool | true | 詳細表示モードで `タグ` 列を表示するか |
 | `details_show_kind` | bool | true | 詳細表示モードで `種類` 列を表示するか |
