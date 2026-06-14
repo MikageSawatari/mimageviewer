@@ -460,11 +460,11 @@ Source thread: https://egg.5ch.io/test/read.cgi/software/1752914772/
     - The request likely means: after accidentally leaving fullscreen or switching focus, reopening the same page should not require AI upscale to run again; keep several recently processed fullscreen pages in memory.
     - This is not the archive conversion cache or thumbnail cache. It is the in-memory final display / AI pipeline cache.
   - Follow-up notes:
-    - A "do not close fullscreen on focus loss" option remains separate from cache retention and should still be implemented as a display/fullscreen preference.
-    - Proposed setting label: `他アプリに切り替えてもフルスクリーンを保持する`.
-    - Proposed location: Display Mode / fullscreen-related preferences, near mouse cursor hiding, page overlay, seekbar, and fullscreen behavior options.
-    - Proposed default: off. This preserves the current behavior, avoids surprising users who expect fullscreen to go away on app switch, and is safer for multi-monitor / window stacking workflows.
-    - When enabled, app deactivation / focus loss should not call `close_fullscreen()` solely because another app became active. Explicit user actions such as Esc, close button, normal fullscreen toggle, or opening a different target should still close or replace fullscreen as today.
+    - "Do not close fullscreen on app switch" is implemented as `fullscreen_keep_on_app_switch`
+      (label: `他アプリに切り替えてもフルスクリーンを保持`, default OFF).
+    - When enabled, the main-focus guard does not call `close_fullscreen()` after Alt+Tab /
+      other-app focus transitions. Explicit user actions such as Esc, close button, normal
+      fullscreen toggle, or opening a different target still close or replace fullscreen as today.
     - Verify inactive fullscreen does not remain topmost over the newly focused app; app switching should let the other app be usable while preserving mIV fullscreen state for when focus returns.
     - This keeps CPU pixels for final AI results, not final composite textures. Reopening can still require final composite rebuild / GPU upload, but avoids AI re-inference.
     - Retained entries are removed for the page when AI input-changing edits invalidate final pipeline caches; AI feature mode / size-limit changes clear the retained layer globally.

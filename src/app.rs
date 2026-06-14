@@ -143,12 +143,14 @@ fn should_close_fullscreen_from_main_focus(
     main_viewport_focused: bool,
     native_video_presenter_active: bool,
     embedded_still: bool,
+    keep_fullscreen_on_app_switch: bool,
     fullscreen_root_key_handled: bool,
 ) -> bool {
     fs_focus_grace_elapsed
         && main_viewport_focused
         && !native_video_presenter_active
         && !embedded_still
+        && !keep_fullscreen_on_app_switch
         && !fullscreen_root_key_handled
 }
 
@@ -31632,8 +31634,10 @@ impl eframe::App for App {
         // ── フルスクリーン中にメインウィンドウへフォーカスが来たら閉じる ──
         // ボーダーレスウィンドウなので Alt-Tab 等でメインに戻れるが、
         // そのままだと両方のウィンドウがキー入力を無視して操作不能に見える。
-        // メインにフォーカスが来た = ユーザーがサムネイル一覧に戻りたい意図と解釈し、
-        // フルスクリーンを閉じてメインウィンドウで通常操作を再開する。
+        // 既定ではメインにフォーカスが来た = ユーザーがサムネイル一覧に戻りたい意図と
+        // 解釈し、フルスクリーンを閉じてメインウィンドウで通常操作を再開する。
+        // `fullscreen_keep_on_app_switch` が ON のときは、他アプリへ切り替えて戻った
+        // 場合にも fullscreen session を維持するため、この自動 close を行わない。
         //
         // ただし open_fullscreen() 直後はフルスクリーンビューポートへの
         // ViewportCommand::Focus が反映されるまで数フレームかかるため、
@@ -31662,6 +31666,7 @@ impl eframe::App for App {
                 main_viewport_focused,
                 native_video_presenter_active,
                 embedded_still,
+                self.settings.fullscreen_keep_on_app_switch,
                 fullscreen_root_key_handled,
             ) {
                 self.close_fullscreen();

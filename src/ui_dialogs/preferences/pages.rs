@@ -2643,6 +2643,11 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         "ページ番号を常時表示",
     );
     ui.small("フルスクリーン右下に現在ページ / 総ページ数を小さく表示します。");
+    ui.checkbox(
+        &mut s.fullscreen_keep_on_app_switch,
+        "他アプリに切り替えてもフルスクリーンを保持",
+    );
+    ui.small("ON のときは、Alt+Tab などで他アプリへ移動して戻ってもフルスクリーン表示を自動で閉じません。");
     ui.horizontal(|ui| {
         ui.label("マウスカーソルを隠すまで");
         ui.add(

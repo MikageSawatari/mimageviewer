@@ -235,6 +235,12 @@ reclaim も予約しない。detached session はメイン一覧をブロック�
 通常ショートカットやダイアログは継続して扱える。detached 表示の `×` / Esc / Enter は
 `close_fullscreen()` に寄せ、`detached_viewer_enabled` は維持する。
 
+ボーダーレス fullscreen session 中に main viewport がフォーカスを得た場合、既定では
+「一覧へ戻りたい」意図とみなして `close_fullscreen()` する。環境設定
+`fullscreen_keep_on_app_switch` が ON のときは、Alt+Tab などの他アプリ切替から戻った際にも
+fullscreen session を保持するため、この main-focus guard を無効化する。main/root 側へ届いた
+fullscreen 操作用キーは `handle_fullscreen_root_key_input` で先に処理する。
+
 F11 の MainWindow / Fullscreen 選択は、F12 の detached ON/OFF とは独立した
 non-detached 側の表示設定として保持する。動画の native presenter から
 `DetachedWindow` への `PlacementSwitched` が返っても `settings.video_in_window_mode`

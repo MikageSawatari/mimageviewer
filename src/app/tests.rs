@@ -12520,24 +12520,31 @@ mod fullscreen_main_focus_guard_tests {
     #[test]
     fn main_focus_guard_closes_after_grace_without_fullscreen_root_key() {
         assert!(should_close_fullscreen_from_main_focus(
-            true, true, false, false, false,
+            true, true, false, false, false, false,
         ));
     }
 
     #[test]
     fn main_focus_guard_skips_close_when_fullscreen_root_key_was_handled() {
         assert!(!should_close_fullscreen_from_main_focus(
-            true, true, false, false, true,
+            true, true, false, false, false, true,
+        ));
+    }
+
+    #[test]
+    fn main_focus_guard_skips_close_when_keep_on_app_switch_enabled() {
+        assert!(!should_close_fullscreen_from_main_focus(
+            true, true, false, false, true, false,
         ));
     }
 
     #[test]
     fn main_focus_guard_skips_close_during_grace_or_embedded_mode() {
         assert!(!should_close_fullscreen_from_main_focus(
-            false, true, false, false, false,
+            false, true, false, false, false, false,
         ));
         assert!(!should_close_fullscreen_from_main_focus(
-            true, true, false, true, false,
+            true, true, false, true, false, false,
         ));
     }
 }

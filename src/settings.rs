@@ -1707,6 +1707,10 @@ pub struct Settings {
     /// 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。
     #[serde(default = "default_true")]
     pub fullscreen_page_number_overlay: bool,
+    /// 他アプリへ切り替えて戻ったとき、メインウィンドウがフォーカスを得ても
+    /// フルスクリーン表示を自動で閉じない。
+    #[serde(default)]
+    pub fullscreen_keep_on_app_switch: bool,
     /// フルスクリーン表示中、マウス操作が止まってからカーソルを隠すまでの秒数。
     #[serde(default = "default_fullscreen_cursor_hide_delay_secs")]
     pub fullscreen_cursor_hide_delay_secs: f32,
@@ -2851,6 +2855,7 @@ impl Default for Settings {
             fullscreen_fit_no_downscale: false,
             fullscreen_seek_bar_locked: false,
             fullscreen_page_number_overlay: true,
+            fullscreen_keep_on_app_switch: false,
             fullscreen_cursor_hide_delay_secs: FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
             fullscreen_jump_mode: FullscreenJumpMode::Percent,
             fullscreen_jump_percent: FULLSCREEN_JUMP_PERCENT_DEFAULT,
@@ -4242,6 +4247,7 @@ mod tests {
         assert_eq!(s.fullscreen_fit_mode, FullscreenFitMode::Page);
         assert!(!s.fullscreen_seek_bar_locked);
         assert!(s.fullscreen_page_number_overlay);
+        assert!(!s.fullscreen_keep_on_app_switch);
         assert_eq!(
             s.fullscreen_cursor_hide_delay_secs,
             FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
@@ -4525,6 +4531,7 @@ mod tests {
         assert_eq!(loaded.video_playback_speed, 1.0);
         assert_eq!(loaded.fullscreen_fit_mode, FullscreenFitMode::Page);
         assert_eq!(loaded.fullscreen_jump_mode, FullscreenJumpMode::Percent);
+        assert!(!loaded.fullscreen_keep_on_app_switch);
         assert_eq!(
             loaded.fullscreen_jump_percent,
             FULLSCREEN_JUMP_PERCENT_DEFAULT
