@@ -17412,13 +17412,60 @@ impl App {
             return;
         };
 
-        match crate::native_context_menu::invoke_shell_file_verb(hwnd, &paths, verb) {
+        let result = crate::native_context_menu::invoke_shell_file_verb(hwnd, &paths, verb);
+        Self::resync_egui_modifiers_from_os(ctx);
+        match result {
             Ok(()) => ctx.request_repaint(),
             Err(err) => {
                 crate::logger::log(format!("shell_clipboard: {verb:?} failed: {err}"));
                 self.show_feedback_toast("OSクリップボード操作に失敗しました".to_string());
             }
         }
+    }
+
+    pub(crate) fn egui_modifiers_from_physical_state(
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) -> egui::Modifiers {
+        egui::Modifiers {
+            alt,
+            ctrl,
+            shift,
+            mac_cmd: false,
+            command: ctrl,
+        }
+    }
+
+    /// Win32 Shell のモーダル処理中に egui/winit が modifier KeyUp を取りこぼすと、
+    /// `i.modifiers.ctrl` などが次の操作まで stale になり得る。Windows では物理
+    /// modifier の hold 状態を OS API から毎フレーム同期し、Shell 復帰直後にも
+    /// 明示同期する。個別の Key event に記録された modifiers はイベント時点の情報
+    /// として残し、離散ショートカットの判定までは書き換えない。
+    pub(crate) fn resync_egui_modifiers_from_os(ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            if !ctx.input(|i| i.viewport().focused).unwrap_or(true) {
+                return;
+            }
+
+            use windows::Win32::UI::Input::KeyboardAndMouse::{
+                GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
+            };
+
+            let key_down = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) < 0 };
+            let modifiers = Self::egui_modifiers_from_physical_state(
+                key_down(VK_CONTROL.0),
+                key_down(VK_SHIFT.0),
+                key_down(VK_MENU.0),
+            );
+            ctx.input_mut(|input| {
+                input.modifiers = modifiers;
+                input.raw.modifiers = modifiers;
+            });
+        }
+        #[cfg(not(windows))]
+        let _ = ctx;
     }
 
     /// Ctrl+C / Ctrl+X / Ctrl+V ショートカットを処理する。
@@ -17478,6 +17525,7 @@ impl App {
                     &folder,
                     crate::native_context_menu::ShellClipboardVerb::Paste,
                 );
+                Self::resync_egui_modifiers_from_os(ctx);
                 match result {
                     Ok(()) => ctx.request_repaint(),
                     Err(err) => {
@@ -31357,6 +31405,8 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_window_title = Some(title);
         }
+
+        Self::resync_egui_modifiers_from_os(ctx);
 
         // スクロールは egui に触れる前に処理（イベントを消費）
         self.process_scroll(ctx);

@@ -13216,6 +13216,20 @@ mod file_operation_selection_tests {
     }
 
     #[test]
+    fn physical_modifier_state_sets_windows_command_alias_and_clears_ctrl() {
+        let ctrl = App::egui_modifiers_from_physical_state(true, false, false);
+        assert!(ctrl.ctrl);
+        assert!(ctrl.command, "Windows/Linux command alias follows Ctrl");
+        assert!(!ctrl.mac_cmd);
+
+        let released = App::egui_modifiers_from_physical_state(false, true, true);
+        assert!(!released.ctrl);
+        assert!(!released.command);
+        assert!(released.shift);
+        assert!(released.alt);
+    }
+
+    #[test]
     fn current_folder_watch_ignores_access_events() {
         let access = notify::Event {
             kind: notify::EventKind::Access(notify::event::AccessKind::Read),

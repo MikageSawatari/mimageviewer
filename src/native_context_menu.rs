@@ -130,7 +130,9 @@ mod windows_impl {
     use super::*;
     use std::ffi::CString;
     use std::os::windows::ffi::OsStrExt;
+    use std::time::Instant;
 
+    use serde_json::Value;
     use windows::Win32::Foundation::{
         HANDLE, HWND, LPARAM, LRESULT, POINT, RPC_E_CHANGED_MODE, WPARAM,
     };
@@ -152,6 +154,149 @@ mod windows_impl {
     use windows::core::{Interface, PCSTR, PCWSTR};
 
     const SUBCLASS_ID: usize = 0x6d69_7643; // "mivC"
+    const SLOW_NATIVE_MENU_STAGE_LOG_MS: f64 = 120.0;
+
+    fn elapsed_ms(t0: Instant) -> f64 {
+        t0.elapsed().as_secs_f64() * 1000.0
+    }
+
+    fn request_target_kind(request: &NativeContextMenuRequest) -> &'static str {
+        if request.background_folder.is_some() {
+            "background"
+        } else if !request.paths.is_empty() {
+            "paths"
+        } else {
+            "miv_only"
+        }
+    }
+
+    fn emit_native_menu_timing(
+        kind: &'static str,
+        key: Option<&str>,
+        ms: f64,
+        path_count: usize,
+        miv_count: usize,
+        extras: &[(&'static str, Value)],
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let mut fields = Vec::with_capacity(3 + extras.len());
+        fields.push(("ms", Value::from(ms)));
+        fields.push(("path_count", Value::from(path_count as u64)));
+        fields.push(("miv_count", Value::from(miv_count as u64)));
+        for (name, value) in extras {
+            fields.push((*name, value.clone()));
+        }
+        crate::perf::event("native_menu", kind, key, 0, &fields);
+    }
+
+    fn log_slow_native_menu_stage(
+        kind: &str,
+        key: &str,
+        ms: f64,
+        path_count: usize,
+        miv_count: usize,
+    ) {
+        if ms >= SLOW_NATIVE_MENU_STAGE_LOG_MS {
+            crate::logger::log(format!(
+                "native_context_menu: slow {kind} {ms:.1}ms target={key} paths={path_count} miv_items={miv_count}"
+            ));
+        }
+    }
+
+    fn shell_context_menu_for_paths_timed(
+        paths: &[PathBuf],
+        key: &'static str,
+        path_count: usize,
+        miv_count: usize,
+    ) -> Result<IContextMenu, String> {
+        let t0 = Instant::now();
+        let result = shell_context_menu_for_paths(paths);
+        let ms = elapsed_ms(t0);
+        emit_native_menu_timing(
+            "show_shell_bind",
+            Some(key),
+            ms,
+            path_count,
+            miv_count,
+            &[("success", Value::from(result.is_ok()))],
+        );
+        log_slow_native_menu_stage("show_shell_bind", key, ms, path_count, miv_count);
+        result
+    }
+
+    fn shell_context_menu_for_folder_background_timed(
+        hwnd: HWND,
+        folder: &std::path::Path,
+        key: &'static str,
+        path_count: usize,
+        miv_count: usize,
+    ) -> Result<IContextMenu, String> {
+        let t0 = Instant::now();
+        let result = shell_context_menu_for_folder_background(hwnd, folder);
+        let ms = elapsed_ms(t0);
+        emit_native_menu_timing(
+            "show_shell_bind",
+            Some(key),
+            ms,
+            path_count,
+            miv_count,
+            &[("success", Value::from(result.is_ok()))],
+        );
+        log_slow_native_menu_stage("show_shell_bind", key, ms, path_count, miv_count);
+        result
+    }
+
+    fn query_shell_context_menu_timed(
+        shell_menu: &IContextMenu,
+        menu: HMENU,
+        insert_at: u32,
+        key: &'static str,
+        path_count: usize,
+        miv_count: usize,
+    ) -> Result<(), String> {
+        let t0 = Instant::now();
+        let result = query_shell_context_menu(shell_menu, menu, insert_at);
+        let ms = elapsed_ms(t0);
+        emit_native_menu_timing(
+            "show_query_shell",
+            Some(key),
+            ms,
+            path_count,
+            miv_count,
+            &[("success", Value::from(result.is_ok()))],
+        );
+        log_slow_native_menu_stage("show_query_shell", key, ms, path_count, miv_count);
+        result
+    }
+
+    fn emit_shell_verb_timing(
+        kind: &'static str,
+        target: &'static str,
+        verb: ShellClipboardVerb,
+        ms: f64,
+        path_count: usize,
+        success: bool,
+    ) {
+        emit_native_menu_timing(
+            kind,
+            Some(verb.canonical_name()),
+            ms,
+            path_count,
+            0,
+            &[
+                ("target", Value::from(target)),
+                ("success", Value::from(success)),
+            ],
+        );
+        if ms >= SLOW_NATIVE_MENU_STAGE_LOG_MS {
+            crate::logger::log(format!(
+                "native_context_menu: slow {kind} {ms:.1}ms target={target} verb={} paths={path_count}",
+                verb.canonical_name()
+            ));
+        }
+    }
 
     pub(super) fn show_native_context_menu(
         request: NativeContextMenuRequest,
@@ -168,11 +313,30 @@ mod windows_impl {
             return NativeContextMenuResult::Canceled;
         }
 
+        let total_t0 = Instant::now();
+        let target_kind = request_target_kind(&request);
+        let path_count = if request.background_folder.is_some() {
+            1
+        } else {
+            request.paths.len()
+        };
+        let miv_count = request.miv_items.len();
+
+        let stage_t0 = Instant::now();
         let _com = match ComStaGuard::new() {
             Ok(guard) => guard,
             Err(reason) => return NativeContextMenuResult::Fallback { reason },
         };
+        emit_native_menu_timing(
+            "show_com_init",
+            Some(target_kind),
+            elapsed_ms(stage_t0),
+            path_count,
+            miv_count,
+            &[],
+        );
 
+        let stage_t0 = Instant::now();
         let menu = match unsafe { CreatePopupMenu() } {
             Ok(menu) => MenuGuard::new(menu),
             Err(e) => {
@@ -181,7 +345,16 @@ mod windows_impl {
                 };
             }
         };
+        emit_native_menu_timing(
+            "show_create_popup",
+            Some(target_kind),
+            elapsed_ms(stage_t0),
+            path_count,
+            miv_count,
+            &[],
+        );
 
+        let stage_t0 = Instant::now();
         for (index, item) in request.miv_items.iter().enumerate() {
             let Some(id) = miv_command_id(index) else {
                 return NativeContextMenuResult::Fallback {
@@ -194,6 +367,14 @@ mod windows_impl {
                 };
             }
         }
+        emit_native_menu_timing(
+            "show_append_miv",
+            Some(target_kind),
+            elapsed_ms(stage_t0),
+            path_count,
+            miv_count,
+            &[],
+        );
 
         let hwnd = HWND(request.hwnd as *mut core::ffi::c_void);
         let shell_menu = if let Some(folder) = request.background_folder.as_ref() {
@@ -205,15 +386,27 @@ mod windows_impl {
                 };
             }
 
-            let shell_menu = match shell_context_menu_for_folder_background(hwnd, folder) {
+            let shell_menu = match shell_context_menu_for_folder_background_timed(
+                hwnd,
+                folder,
+                target_kind,
+                path_count,
+                miv_count,
+            ) {
                 Ok(menu) => Some(menu),
                 Err(reason) => return NativeContextMenuResult::Fallback { reason },
             };
             if let Some(shell_menu) = shell_menu.as_ref() {
                 let insert_at =
                     request.miv_items.len() as u32 + u32::from(!request.miv_items.is_empty());
-                if let Err(reason) = query_shell_context_menu(shell_menu, menu.handle(), insert_at)
-                {
+                if let Err(reason) = query_shell_context_menu_timed(
+                    shell_menu,
+                    menu.handle(),
+                    insert_at,
+                    target_kind,
+                    path_count,
+                    miv_count,
+                ) {
                     return NativeContextMenuResult::Fallback { reason };
                 }
             }
@@ -229,26 +422,64 @@ mod windows_impl {
                 };
             }
 
-            let shell_menu = match shell_context_menu_for_paths(&request.paths) {
+            let shell_menu = match shell_context_menu_for_paths_timed(
+                &request.paths,
+                target_kind,
+                path_count,
+                miv_count,
+            ) {
                 Ok(menu) => menu,
                 Err(reason) => return NativeContextMenuResult::Fallback { reason },
             };
             let insert_at =
                 request.miv_items.len() as u32 + u32::from(!request.miv_items.is_empty());
-            if let Err(reason) = query_shell_context_menu(&shell_menu, menu.handle(), insert_at) {
+            if let Err(reason) = query_shell_context_menu_timed(
+                &shell_menu,
+                menu.handle(),
+                insert_at,
+                target_kind,
+                path_count,
+                miv_count,
+            ) {
                 return NativeContextMenuResult::Fallback { reason };
             }
             Some(shell_menu)
         };
 
+        let stage_t0 = Instant::now();
         let forwarder = shell_menu
             .as_ref()
             .map(ContextMenuMessageForwarder::from_context_menu);
         let _subclass_guard = forwarder
             .as_ref()
             .and_then(|forwarder| MenuSubclassGuard::install(hwnd, forwarder));
+        emit_native_menu_timing(
+            "show_subclass",
+            Some(target_kind),
+            elapsed_ms(stage_t0),
+            path_count,
+            miv_count,
+            &[],
+        );
 
         let (screen_x, screen_y) = cursor_screen_pos().unwrap_or(request.screen_pos);
+        let pre_track_ms = elapsed_ms(total_t0);
+        emit_native_menu_timing(
+            "show_pre_track",
+            Some(target_kind),
+            pre_track_ms,
+            path_count,
+            miv_count,
+            &[],
+        );
+        log_slow_native_menu_stage(
+            "show_pre_track",
+            target_kind,
+            pre_track_ms,
+            path_count,
+            miv_count,
+        );
+        let track_t0 = Instant::now();
         let selected = unsafe {
             TrackPopupMenuEx(
                 menu.handle(),
@@ -260,6 +491,14 @@ mod windows_impl {
             )
             .0 as u32
         };
+        emit_native_menu_timing(
+            "show_track_popup_block",
+            Some(target_kind),
+            elapsed_ms(track_t0),
+            path_count,
+            miv_count,
+            &[("selected_id", Value::from(selected as u64))],
+        );
         if selected == 0 {
             return NativeContextMenuResult::Canceled;
         }
@@ -287,11 +526,48 @@ mod windows_impl {
             hIcon: HANDLE::default(),
             ..Default::default()
         };
+        let stage_t0 = Instant::now();
         match unsafe { shell_menu.InvokeCommand(&invoke) } {
-            Ok(()) => NativeContextMenuResult::ShellCommandInvoked,
-            Err(e) => NativeContextMenuResult::Fallback {
-                reason: format!("IContextMenu::InvokeCommand failed: {e}"),
-            },
+            Ok(()) => {
+                let ms = elapsed_ms(stage_t0);
+                emit_native_menu_timing(
+                    "show_invoke_shell",
+                    Some(target_kind),
+                    ms,
+                    path_count,
+                    miv_count,
+                    &[("success", Value::from(true))],
+                );
+                log_slow_native_menu_stage(
+                    "show_invoke_shell",
+                    target_kind,
+                    ms,
+                    path_count,
+                    miv_count,
+                );
+                NativeContextMenuResult::ShellCommandInvoked
+            }
+            Err(e) => {
+                let ms = elapsed_ms(stage_t0);
+                emit_native_menu_timing(
+                    "show_invoke_shell",
+                    Some(target_kind),
+                    ms,
+                    path_count,
+                    miv_count,
+                    &[("success", Value::from(false))],
+                );
+                log_slow_native_menu_stage(
+                    "show_invoke_shell",
+                    target_kind,
+                    ms,
+                    path_count,
+                    miv_count,
+                );
+                NativeContextMenuResult::Fallback {
+                    reason: format!("IContextMenu::InvokeCommand failed: {e}"),
+                }
+            }
         }
     }
 
@@ -308,12 +584,45 @@ mod windows_impl {
         }
         let _com = ComStaGuard::new()?;
         let hwnd = HWND(hwnd as *mut core::ffi::c_void);
-        let menu = shell_context_menu_for_paths(paths)?;
+        let stage_t0 = Instant::now();
+        let menu_result = shell_context_menu_for_paths(paths);
+        let ms = elapsed_ms(stage_t0);
+        emit_shell_verb_timing(
+            "verb_shell_bind",
+            "paths",
+            verb,
+            ms,
+            paths.len(),
+            menu_result.is_ok(),
+        );
+        let menu = menu_result?;
         let popup = MenuGuard::new(
             unsafe { CreatePopupMenu() }.map_err(|e| format!("CreatePopupMenu failed: {e}"))?,
         );
-        query_shell_context_menu(&menu, popup.handle(), 0)?;
-        invoke_canonical_verb(&menu, hwnd, verb)
+        let stage_t0 = Instant::now();
+        let query_result = query_shell_context_menu(&menu, popup.handle(), 0);
+        let ms = elapsed_ms(stage_t0);
+        emit_shell_verb_timing(
+            "verb_query_shell",
+            "paths",
+            verb,
+            ms,
+            paths.len(),
+            query_result.is_ok(),
+        );
+        query_result?;
+        let stage_t0 = Instant::now();
+        let result = invoke_canonical_verb(&menu, hwnd, verb);
+        let ms = elapsed_ms(stage_t0);
+        emit_shell_verb_timing(
+            "verb_invoke",
+            "paths",
+            verb,
+            ms,
+            paths.len(),
+            result.is_ok(),
+        );
+        result
     }
 
     pub(super) fn invoke_shell_folder_background_verb(
@@ -326,12 +635,38 @@ mod windows_impl {
         }
         let _com = ComStaGuard::new()?;
         let hwnd = HWND(hwnd as *mut core::ffi::c_void);
-        let menu = shell_context_menu_for_folder_background(hwnd, folder)?;
+        let stage_t0 = Instant::now();
+        let menu_result = shell_context_menu_for_folder_background(hwnd, folder);
+        let ms = elapsed_ms(stage_t0);
+        emit_shell_verb_timing(
+            "verb_shell_bind",
+            "background",
+            verb,
+            ms,
+            1,
+            menu_result.is_ok(),
+        );
+        let menu = menu_result?;
         let popup = MenuGuard::new(
             unsafe { CreatePopupMenu() }.map_err(|e| format!("CreatePopupMenu failed: {e}"))?,
         );
-        query_shell_context_menu(&menu, popup.handle(), 0)?;
-        invoke_canonical_verb(&menu, hwnd, verb)
+        let stage_t0 = Instant::now();
+        let query_result = query_shell_context_menu(&menu, popup.handle(), 0);
+        let ms = elapsed_ms(stage_t0);
+        emit_shell_verb_timing(
+            "verb_query_shell",
+            "background",
+            verb,
+            ms,
+            1,
+            query_result.is_ok(),
+        );
+        query_result?;
+        let stage_t0 = Instant::now();
+        let result = invoke_canonical_verb(&menu, hwnd, verb);
+        let ms = elapsed_ms(stage_t0);
+        emit_shell_verb_timing("verb_invoke", "background", verb, ms, 1, result.is_ok());
+        result
     }
 
     fn append_menu_string(menu: HMENU, id: u32, label: &str) -> windows::core::Result<()> {

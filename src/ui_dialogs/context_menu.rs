@@ -52,6 +52,16 @@ struct NativeGridContextMenuTarget {
     has_checked: bool,
 }
 
+fn native_grid_context_menu_target_kind(target: &NativeGridContextMenuTarget) -> &'static str {
+    if target.is_folder_context {
+        "background"
+    } else if target.has_checked {
+        "checked_paths"
+    } else {
+        "item_path"
+    }
+}
+
 fn delete_confirm_label_for_targets(targets: &[(usize, PathBuf)]) -> String {
     let kind = if delete_targets_may_permanently_delete(targets) {
         DeleteConfirmKind::MayPermanent
@@ -795,12 +805,43 @@ impl crate::app::App {
         let Some(hwnd) = self.main_hwnd else {
             return NativeGridContextMenuOutcome::Fallback;
         };
+        let prepare_t0 = std::time::Instant::now();
         let Some(target) =
             self.native_grid_context_menu_target(idx, item, is_folder_context, has_checked)
         else {
             return NativeGridContextMenuOutcome::Fallback;
         };
         let miv_items = self.native_grid_context_menu_items(&target, in_search);
+        let target_kind = native_grid_context_menu_target_kind(&target);
+        let prepare_ms = prepare_t0.elapsed().as_secs_f64() * 1000.0;
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "native_menu",
+                "app_prepare",
+                Some(target_kind),
+                self.input_seq,
+                &[
+                    ("ms", serde_json::Value::from(prepare_ms)),
+                    (
+                        "path_count",
+                        serde_json::Value::from(target.paths.len() as u64),
+                    ),
+                    ("miv_count", serde_json::Value::from(miv_items.len() as u64)),
+                    (
+                        "folder_context",
+                        serde_json::Value::from(target.is_folder_context),
+                    ),
+                    ("checked", serde_json::Value::from(target.has_checked)),
+                ],
+            );
+        }
+        if prepare_ms >= 80.0 {
+            crate::logger::log(format!(
+                "native_context_menu: slow app_prepare {prepare_ms:.1}ms target={target_kind} paths={} miv_items={}",
+                target.paths.len(),
+                miv_items.len()
+            ));
+        }
         let background_folder = target.is_folder_context.then(|| target.paths[0].clone());
         let request = NativeContextMenuRequest {
             hwnd,
@@ -813,7 +854,9 @@ impl crate::app::App {
             },
             miv_items,
         };
-        match crate::native_context_menu::show_native_context_menu(request) {
+        let native_result = crate::native_context_menu::show_native_context_menu(request);
+        Self::resync_egui_modifiers_from_os(ctx);
+        match native_result {
             NativeContextMenuResult::Canceled | NativeContextMenuResult::ShellCommandInvoked => {
                 NativeGridContextMenuOutcome::Consumed(None)
             }
@@ -993,6 +1036,7 @@ impl crate::app::App {
                         &folder,
                         crate::native_context_menu::ShellClipboardVerb::Paste,
                     );
+                    Self::resync_egui_modifiers_from_os(ctx);
                     if let Err(err) = result {
                         crate::logger::log(format!("native_context_menu: mIV Paste failed: {err}"));
                     }

@@ -335,6 +335,17 @@ Current routing details:
   environments where the Shell-populated background menu does not surface Paste.
 - Keyboard Ctrl+C/Ctrl+X/Ctrl+V use the same native helper and canonical Shell
   `copy`/`cut`/`paste` verbs instead of mIV's custom clipboard writer.
+- After Shell verbs and native context menus return, the App resynchronizes
+  egui's current Ctrl/Shift/Alt modifier state from Win32 physical key state.
+  The same sync also runs before normal frame input handling on Windows, so a
+  Shell modal loop that misses a KeyUp cannot leave Ctrl "stuck" in mIV.
+- Native context menu latency is instrumented under the `native_menu` perf-log
+  category. `app_prepare` covers mIV-side routing and command construction;
+  `show_shell_bind`, `show_query_shell`, and `show_pre_track` cover the Shell
+  setup before the popup is shown; `show_track_popup_block` includes the
+  user-visible popup lifetime; `show_invoke_shell` and `verb_*` cover Shell
+  command invocation paths. Slow stages (120 ms or more, 80 ms for
+  `app_prepare`) are also summarized in the normal log.
 - Checked selections use the Shell menu only when every checked item has a real
   file-operation path. Mixed real + ZIP/PDF virtual selections keep the egui
   fallback.
