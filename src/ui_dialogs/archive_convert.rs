@@ -81,6 +81,12 @@ pub(crate) enum ArchivePasswordResume {
     Convert,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ArchiveConvertDeferredFullscreen {
+    pub reopen: crate::app::DeferredFsReopen,
+    pub restore_video_tile: bool,
+}
+
 pub(crate) struct ArchiveConvertState {
     pub src_path: PathBuf,
     pub format: ArchiveFormat,
@@ -98,6 +104,9 @@ pub(crate) struct ArchiveConvertState {
     /// (グリッド Enter / ダブルクリック / ゲームパッド × 設定 ON) のときだけ true。
     /// キャンセル時は state ごと drop されるので stale フラグが残らない。
     pub auto_fullscreen: bool,
+    /// Ctrl+↑↓ 等のフルスクリーン横断ナビ中に、確認なしの自動変換を挟んだ場合の
+    /// 復帰予約。確認ダイアログ / パスワード入力 / エラーに入ったら破棄する。
+    pub deferred_fullscreen: Option<ArchiveConvertDeferredFullscreen>,
     /// true の場合、Scanning のウィンドウを出さず、Confirm を自動通過する。
     /// 変換中の進捗、パスワード入力、エラーは表示する。
     pub suppress_confirm: bool,
@@ -225,10 +234,53 @@ impl App {
             pending_nav: None,
             nav_history_rollback: None,
             auto_fullscreen,
+            deferred_fullscreen: None,
             suppress_confirm,
             suppress_confirm_next_time: false,
         });
         true
+    }
+
+    pub(crate) fn archive_convert_deferred_fullscreen_active(&self) -> bool {
+        self.archive_convert
+            .as_ref()
+            .and_then(|state| state.deferred_fullscreen.as_ref())
+            .is_some()
+    }
+
+    pub(crate) fn attach_archive_convert_deferred_fullscreen(
+        &mut self,
+        restore_video_tile: bool,
+        resume_slideshow: bool,
+    ) -> bool {
+        let resume_to_last_page = self.settings.book_nav_resume.resumes();
+        let Some(state) = self.archive_convert.as_mut() else {
+            return false;
+        };
+        if !state.suppress_confirm {
+            return false;
+        }
+        state.deferred_fullscreen = Some(ArchiveConvertDeferredFullscreen {
+            restore_video_tile,
+            reopen: crate::app::DeferredFsReopen {
+                resume_slideshow,
+                target: None,
+                resume_to_last_page,
+                preserve_after_password_prompt: false,
+            },
+        });
+        true
+    }
+
+    pub(crate) fn clear_archive_convert_deferred_fullscreen(&mut self) {
+        let had_deferred = self
+            .archive_convert
+            .as_mut()
+            .and_then(|state| state.deferred_fullscreen.take())
+            .is_some();
+        if had_deferred {
+            self.release_fs_nav_lock();
+        }
     }
 
     /// 毎フレーム呼ばれるダイアログ描画・メッセージ処理のエントリポイント。
@@ -246,6 +298,7 @@ impl App {
             // 短い間隔で並行 maintenance (clear_all/delete_entry) が先に削除する順序レースが
             // 残るため、navigate 直前にもう一度確認する。消えていたらエラー表示に戻す。
             if !nav.exists() {
+                self.clear_archive_convert_deferred_fullscreen();
                 if let Some(s) = self.archive_convert.as_mut() {
                     s.phase = ArchiveConvertPhase::Error {
                         message: "変換直後にキャッシュが削除されました。再度お試しください。"
@@ -264,6 +317,10 @@ impl App {
                     .as_ref()
                     .map(|s| s.auto_fullscreen)
                     .unwrap_or(false);
+                let deferred_fullscreen = self
+                    .archive_convert
+                    .as_mut()
+                    .and_then(|s| s.deferred_fullscreen.take());
                 // ブロック時に履歴スタックを巻き戻せるよう、state を drop する前に退避する。
                 let nav_history_rollback = self
                     .archive_convert
@@ -286,6 +343,9 @@ impl App {
                     if let Some(snapshot) = nav_history_rollback {
                         self.restore_folder_nav_history(snapshot);
                     }
+                    if deferred_fullscreen.is_some() {
+                        self.release_fs_nav_lock();
+                    }
                     return;
                 }
                 if let Some(src) = src {
@@ -301,6 +361,16 @@ impl App {
                 }
                 if self.favsearch.active {
                     self.update_favsearch_address();
+                }
+                if let Some(deferred) = deferred_fullscreen {
+                    let reason = self.reopen_fullscreen_after_folder_nav_load(
+                        ctx,
+                        deferred.restore_video_tile,
+                        deferred.reopen.resume_slideshow,
+                    );
+                    if reason == "enumerate_defer" {
+                        ctx.request_repaint();
+                    }
                 }
                 return;
             }
@@ -587,9 +657,17 @@ impl App {
                 .archive_convert
                 .as_ref()
                 .and_then(|state| state.nav_history_rollback.clone());
+            let had_deferred_fullscreen = self
+                .archive_convert
+                .as_mut()
+                .and_then(|state| state.deferred_fullscreen.take())
+                .is_some();
             self.archive_convert = None;
             if let Some(snapshot) = nav_history_rollback {
                 self.restore_folder_nav_history(snapshot);
+            }
+            if had_deferred_fullscreen {
+                self.release_fs_nav_lock();
             }
         }
     }
@@ -600,6 +678,7 @@ impl App {
             return;
         };
         let mut start_convert_after_poll = false;
+        let mut clear_deferred_fullscreen = false;
         while let Ok(msg) = state.rx.try_recv() {
             match msg {
                 ArchiveConvertMsg::ScanDone(Ok(summary)) => {
@@ -609,11 +688,13 @@ impl App {
                             message: "このアーカイブには画像ファイルが含まれていません。"
                                 .to_string(),
                         };
+                        clear_deferred_fullscreen = true;
                     } else if state.suppress_confirm {
                         state.phase = ArchiveConvertPhase::Confirm { summary };
                         start_convert_after_poll = true;
                     } else {
                         state.phase = ArchiveConvertPhase::Confirm { summary };
+                        clear_deferred_fullscreen = true;
                     }
                 }
                 ArchiveConvertMsg::ScanDone(Err(ConvertError::PasswordRequired)) => {
@@ -623,6 +704,7 @@ impl App {
                         message: None,
                         resume: ArchivePasswordResume::Scan,
                     };
+                    clear_deferred_fullscreen = true;
                 }
                 ArchiveConvertMsg::ScanDone(Err(ConvertError::BadPassword)) => {
                     state.password = None;
@@ -631,11 +713,13 @@ impl App {
                         message: Some("パスワードが正しくありません".to_string()),
                         resume: ArchivePasswordResume::Scan,
                     };
+                    clear_deferred_fullscreen = true;
                 }
                 ArchiveConvertMsg::ScanDone(Err(e)) => {
                     state.phase = ArchiveConvertPhase::Error {
                         message: format!("スキャン失敗: {e}"),
                     };
+                    clear_deferred_fullscreen = true;
                 }
                 ArchiveConvertMsg::ConvertDone(Ok((_summary, cached_zip, _cached_size))) => {
                     // DB への record は worker 側で convert_lock を握ったまま済ませている
@@ -658,9 +742,13 @@ impl App {
                 ArchiveConvertMsg::ConvertDone(Err(ConvertError::Cancelled)) => {
                     // ユーザーキャンセルならダイアログを即閉じる
                     let nav_history_rollback = state.nav_history_rollback.clone();
+                    let had_deferred = state.deferred_fullscreen.is_some();
                     self.archive_convert = None;
                     if let Some(snapshot) = nav_history_rollback {
                         self.restore_folder_nav_history(snapshot);
+                    }
+                    if had_deferred {
+                        self.release_fs_nav_lock();
                     }
                     return;
                 }
@@ -671,6 +759,7 @@ impl App {
                         message: None,
                         resume: ArchivePasswordResume::Convert,
                     };
+                    clear_deferred_fullscreen = true;
                 }
                 ArchiveConvertMsg::ConvertDone(Err(ConvertError::BadPassword)) => {
                     state.password = None;
@@ -679,13 +768,18 @@ impl App {
                         message: Some("パスワードが正しくありません".to_string()),
                         resume: ArchivePasswordResume::Convert,
                     };
+                    clear_deferred_fullscreen = true;
                 }
                 ArchiveConvertMsg::ConvertDone(Err(e)) => {
                     state.phase = ArchiveConvertPhase::Error {
                         message: format!("変換失敗: {e}"),
                     };
+                    clear_deferred_fullscreen = true;
                 }
             }
+        }
+        if clear_deferred_fullscreen {
+            self.clear_archive_convert_deferred_fullscreen();
         }
         if start_convert_after_poll && self.archive_convert.is_some() {
             self.start_archive_convert();
@@ -725,6 +819,9 @@ impl App {
             state.phase = ArchiveConvertPhase::Error {
                 message: "キャッシュ DB の初期化に失敗しています。".to_string(),
             };
+            if state.deferred_fullscreen.take().is_some() {
+                self.release_fs_nav_lock();
+            }
             return;
         };
         let dst = match db.reserve_cache_zip_path(&state.src_path) {
@@ -733,6 +830,9 @@ impl App {
                 state.phase = ArchiveConvertPhase::Error {
                     message: format!("出力先の作成に失敗: {e}"),
                 };
+                if state.deferred_fullscreen.take().is_some() {
+                    self.release_fs_nav_lock();
+                }
                 return;
             }
         };
@@ -847,6 +947,7 @@ mod tests {
             pending_nav: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
+            deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
         }

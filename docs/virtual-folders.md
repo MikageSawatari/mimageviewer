@@ -118,6 +118,11 @@ RAR/CBR/7z/CB7/LZH/LHA を開くと無圧縮 ZIP に変換し (`archive_cache\<h
   ZIP/PDF と同じコンテナ候補として扱い、`App::load_folder_nav_target` から
   `load_folder_or_convert_archive` へ渡す。分割 RAR は先頭パートのみを候補にし、後続パートは
   フォルダナビで重複停止しない。
+- **フルスクリーン Ctrl+↑↓ 中の未変換アーカイブ**: 変換キャッシュが無くても
+  `archive_convert_without_dialog` により確認なしで変換できる場合は、直前ページの
+  holdover と nav lock を維持し、変換完了後にキャッシュ ZIP を開いてフルスクリーンへ
+  復帰する。確認ダイアログ、パスワード入力、エラー、キャンセルなどユーザー操作が
+  必要な状態へ入った場合は復帰予約を破棄し、従来どおり一覧/ダイアログ操作へ戻す。
 
 ---
 

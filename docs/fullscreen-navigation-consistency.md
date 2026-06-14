@@ -218,6 +218,11 @@ no-op 案内は段階を分ける:
   表示されている間に旧 ZIP/7z の画像だけが残ると現在地を誤認するため、
   `fs_nav_holdover_tex_for_draw` で draw 可否を判定し、PDF/ZIP enumerate defer
   (`fullscreen_idx == None`) の待機窓だけ旧画像を表示する。
+- Ctrl+↑↓ の移動先が未変換 RAR/7z/LZH で、設定により確認なし自動変換できる場合は、
+  `ArchiveConvertState::deferred_fullscreen` でフルスクリーン復帰意図を保持する。
+  変換中も holdover を維持し、変換後の cache ZIP 読み込み完了で通常の
+  `reopen_fullscreen_after_folder_nav_load` に合流する。確認画面、パスワード入力、
+  エラー、キャンセルへ入った場合は復帰意図を破棄する。
 - `FolderNavMode::Favsearch { fullscreen }` で Ctrl+S のグリッド移動と
   フルスクリーン維持を分ける。
 - native 動画の XButton は Win32 / HUD で `Extra1/Extra2` に変換済みなので、

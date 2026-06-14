@@ -1312,6 +1312,11 @@ impl App {
         self.fs_nav_locked_gen.is_some()
     }
 
+    pub(crate) fn fs_nav_deferred_reopen_wait_active(&self) -> bool {
+        self.fs_nav_after_pdf_enumerate.is_some()
+            || self.archive_convert_deferred_fullscreen_active()
+    }
+
     /// 描画側で使ってよい Ctrl+↑↓ nav holdover を返す。
     ///
     /// `fs_holdover_tex` は旧ページの見た目を一時的に残すためのものだが、
@@ -1362,9 +1367,9 @@ impl App {
         let Some(locked_gen) = self.fs_nav_locked_gen else {
             return;
         };
-        // items_generation が進んでいない = まだ items 入れ替えが起きていないので
-        // 旧 fs_idx のテクスチャが残っているのは当然。ここで解除すると holdover が
-        // 失われて「ファイル名のみ表示」のフラッシュが出るので保留する。
+        // items_generation が進んでいない = まだ items 入れ替えが起きていない
+        // (または確認なしアーカイブ変換中) ので旧 fs_idx のテクスチャが残っているのは
+        // 当然。ここで解除すると holdover が失われて一覧/黒画面が露出するので保留する。
         if self.items_generation <= locked_gen {
             return;
         }
@@ -1379,9 +1384,9 @@ impl App {
             // `keep_fullscreen_viewport_alive` (viewport mode) と
             // `render_embedded_fs_nav_holdover` (in-window mode) の defer 描画から
             // 直前ページ画像が消えて真っ黒のフラッシュになる。
-            // `fs_nav_after_pdf_enumerate` が立っている間はユーザーがフルスクリーン
+            // `fs_nav_deferred_reopen_wait_active` の間はユーザーがフルスクリーン
             // 継続を意図しているので、解除を保留して deferred reopen 完了まで待つ。
-            if self.fs_nav_after_pdf_enumerate.is_some() {
+            if self.fs_nav_deferred_reopen_wait_active() {
                 return;
             }
             // 上記以外で fullscreen_idx = None = ユーザーが Esc 等で抜けた。
@@ -2579,11 +2584,12 @@ impl App {
         }
         let fs_id = self.fullscreen_viewport_id();
 
-        // Ctrl+↑↓ で PDF フォルダを挟む遷移中は fullscreen_idx が None のまま
-        // PDF enumerate 完了を待つ。この間ビューポートを隠すとその下のグリッドが
-        // 見えてちらつくので維持しつつ、ナビロックの holdover (= 直前ページの
-        // テクスチャ) があればそれを表示して「黒画面で待たされる」体感を緩和する。
-        if self.fs_viewport_shown && self.fs_nav_after_pdf_enumerate.is_some() {
+        // Ctrl+↑↓ で PDF/ZIP enumerate や確認なしアーカイブ変換を挟む遷移中は
+        // fullscreen_idx が None のまま deferred reopen 完了を待つ。この間ビューポートを
+        // 隠すとその下のグリッドが見えてちらつくので維持しつつ、ナビロックの holdover
+        // (= 直前ページのテクスチャ) があればそれを表示して「黒画面で待たされる」
+        // 体感を緩和する。
+        if self.fs_viewport_shown && self.fs_nav_deferred_reopen_wait_active() {
             #[cfg(windows)]
             let fs_builder = match self.fs_viewport_presentation {
                 Some(ViewerPresentation::DetachedWindow) => {
@@ -2706,7 +2712,8 @@ impl App {
     }
 
     /// in-window 静止画モード (`native_video_in_window_active`) で PDF/ZIP の
-    /// async enumerate 待ち中に、メインウィンドウの `CentralPanel` に黒地 + holdover を
+    /// async enumerate や確認なしアーカイブ変換待ち中に、メインウィンドウの
+    /// `CentralPanel` に黒地 + holdover を
     /// 描画する。viewport モード側 `keep_fullscreen_viewport_alive` の PDF defer
     /// ブランチ (line 1095- area) と対称な役割。これがないと:
     ///   - `apply_folder_nav_result` の `close_fullscreen` で `fullscreen_idx = None`
@@ -2827,7 +2834,7 @@ impl App {
             // 別 viewport で同じ役割を担うので、ここで二重に描かないよう
             // `native_video_in_window_active` で gate する。
             #[cfg(windows)]
-            if self.native_video_in_window_active && self.fs_nav_after_pdf_enumerate.is_some() {
+            if self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active() {
                 self.render_embedded_fs_nav_holdover(ctx);
             }
             return;

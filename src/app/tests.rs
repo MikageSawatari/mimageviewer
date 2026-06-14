@@ -1967,6 +1967,7 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
+            deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
         });
@@ -2009,6 +2010,7 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             nav_history_rollback: None,
             auto_fullscreen: false,
+            deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
         });
@@ -2041,6 +2043,7 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             nav_history_rollback: Some(snapshot),
             auto_fullscreen: false,
+            deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
         });
@@ -2078,6 +2081,7 @@ mod phase_c_folder_nav_history_tests {
             pending_nav: None,
             nav_history_rollback: Some(snapshot),
             auto_fullscreen: false,
+            deferred_fullscreen: None,
             suppress_confirm: false,
             suppress_confirm_next_time: false,
         });
@@ -8155,6 +8159,106 @@ mod favorite_adjustment_defaults_tests {
             app.fs_nav_holdover_tex_for_draw().is_some(),
             "deferred enumerate 中は旧ページ holdover で待機画面を維持する"
         );
+    }
+
+    /// Ctrl+↑↓ フルスクリーンナビ中に未キャッシュの 7z/RAR/LZH を踏んでも、
+    /// 確認なし自動変換なら fullscreen 復帰予約を保持し、一覧への露出を防ぐ。
+    #[test]
+    fn archive_convert_deferred_fullscreen_attaches_only_when_confirm_is_suppressed() {
+        let mut app = setup_app();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: PathBuf::from(r"C:\books\02.7z"),
+            format: ArchiveFormat::SevenZ,
+            password: None,
+            password_input: String::new(),
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            rx,
+            pending_nav: None,
+            nav_history_rollback: None,
+            auto_fullscreen: false,
+            deferred_fullscreen: None,
+            suppress_confirm: true,
+            suppress_confirm_next_time: false,
+        });
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.fullscreen_idx = None;
+
+        assert!(app.attach_archive_convert_deferred_fullscreen(false, false));
+        assert!(app.archive_convert_deferred_fullscreen_active());
+        assert!(app.fs_nav_deferred_reopen_wait_active());
+        assert!(
+            app.fs_nav_is_locked(),
+            "自動変換中は fullscreen nav lock を維持して一覧操作へ戻さない"
+        );
+
+        app.clear_archive_convert_deferred_fullscreen();
+        assert!(!app.archive_convert_deferred_fullscreen_active());
+        assert!(!app.fs_nav_is_locked());
+
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: PathBuf::from(r"C:\books\03.7z"),
+            format: ArchiveFormat::SevenZ,
+            password: None,
+            password_input: String::new(),
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            rx,
+            pending_nav: None,
+            nav_history_rollback: None,
+            auto_fullscreen: false,
+            deferred_fullscreen: None,
+            suppress_confirm: false,
+            suppress_confirm_next_time: false,
+        });
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        assert!(
+            !app.attach_archive_convert_deferred_fullscreen(false, false),
+            "ユーザー確認が必要な変換では fullscreen 継続予約を付けない"
+        );
+        assert!(!app.archive_convert_deferred_fullscreen_active());
+    }
+
+    /// パスワード入力が必要になった場合はユーザー操作待ちになるため、fullscreen 継続予約を
+    /// 破棄して nav lock も解除する。
+    #[test]
+    fn archive_convert_password_prompt_clears_deferred_fullscreen_nav() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(
+            crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Err(
+                crate::archive_converter::ConvertError::PasswordRequired,
+            )),
+        )
+        .unwrap();
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: PathBuf::from(r"C:\books\locked.rar"),
+            format: ArchiveFormat::Rar,
+            password: None,
+            password_input: String::new(),
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            rx,
+            pending_nav: None,
+            nav_history_rollback: None,
+            auto_fullscreen: false,
+            deferred_fullscreen: None,
+            suppress_confirm: true,
+            suppress_confirm_next_time: false,
+        });
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        assert!(app.attach_archive_convert_deferred_fullscreen(false, false));
+
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(!app.archive_convert_deferred_fullscreen_active());
+        assert!(!app.fs_nav_is_locked());
+        assert!(matches!(
+            app.archive_convert.as_ref().map(|state| &state.phase),
+            Some(crate::ui_dialogs::archive_convert::ArchiveConvertPhase::PasswordRequired { .. })
+        ));
     }
 
     /// `find_fullscreen_nav_target`: 常にフォルダ先頭の画像系アイテムを返すこと。

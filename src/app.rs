@@ -4184,7 +4184,8 @@ pub struct App {
 
     // ── フルスクリーン Ctrl+↑↓ ナビロック ─────────────────────────
     /// ナビ中の「次のページがまだ表示できない」ガード。`Some(gen)` の間は
-    /// 新たな Ctrl+↑↓ 入力を無視し、`fs_holdover_tex` を画面に出し続ける。
+    /// 新たな Ctrl+↑↓ 入力を無視し、deferred reopen 待ちでは `fs_holdover_tex` を
+    /// 画面に出し続ける。
     /// `gen` はロック発火時の `items_generation` のスナップショット。items が
     /// 入れ替わる (= `install_new_items` で `items_generation` が進む) まで
     /// ロックを解除しない。これをやらないとナビ発火直後 (DFS 完了前で fs_idx も
@@ -16759,7 +16760,7 @@ impl App {
                 .is_some_and(crate::folder_tree::is_virtual_folder)
     }
 
-    fn reopen_fullscreen_after_folder_nav_load(
+    pub(crate) fn reopen_fullscreen_after_folder_nav_load(
         &mut self,
         ctx: &egui::Context,
         restore_video_tile: bool,
@@ -17060,9 +17061,20 @@ impl App {
                 self.close_fullscreen_for_folder_nav_reopen();
                 let open_outcome = self.load_folder_nav_target(path, scanned);
                 if !matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                    let deferred_conversion =
+                        matches!(open_outcome, FolderOpenOutcome::ConversionDialogOpened)
+                            && self.attach_archive_convert_deferred_fullscreen(
+                                restore_video_tile,
+                                resume_slideshow,
+                            );
                     self.clear_pending_folder_nav_steps();
-                    self.release_fs_nav_lock();
+                    if !deferred_conversion {
+                        self.release_fs_nav_lock();
+                    }
                     let reason = match open_outcome {
+                        FolderOpenOutcome::ConversionDialogOpened if deferred_conversion => {
+                            "conversion_defer"
+                        }
                         FolderOpenOutcome::ConversionDialogOpened => "conversion_dialog",
                         FolderOpenOutcome::Ignored => "open_ignored",
                         FolderOpenOutcome::Loaded => "done",
@@ -17244,12 +17256,12 @@ impl App {
     fn process_scroll(&mut self, ctx: &egui::Context) {
         // ダイアログ / popup / フルスクリーン表示中はスクロールを消費しない
         // (ダイアログや ComboBox popup 内の ScrollArea が正しく動くようにする)。
-        // PDF/ZIP enumerate の deferred reopen 待ち中 (= `fs_nav_after_pdf_enumerate`
-        // が立っている) も「フルスクリーン継続中」と同じ扱いにする: 静止画 in-window
-        // モードでは holdover が main ctx を覆っているのに、その背後で grid が
-        // ホイールスクロール / Ctrl+ホイール列数変更を受け付けてしまうのを防ぐ。
+        // PDF/ZIP enumerate や確認なしアーカイブ変換の deferred reopen 待ち中も
+        // 「フルスクリーン継続中」と同じ扱いにする: 静止画 in-window モードでは
+        // holdover が main ctx を覆っているのに、その背後で grid がホイールスクロール /
+        // Ctrl+ホイール列数変更を受け付けてしまうのを防ぐ。
         if self.viewer_session_blocks_main_window()
-            || self.fs_nav_after_pdf_enumerate.is_some()
+            || self.fs_nav_deferred_reopen_wait_active()
             || self.any_dialog_open()
             || ctx.is_popup_open()
         {
@@ -17404,15 +17416,14 @@ impl App {
     /// 検索バー (Ctrl+F / Ctrl+S / Ctrl+G) のいずれかにフォーカスがある状態で
     /// BS / Enter / Ctrl+C 等が grid に漏れないようにするためのゲート。
     ///
-    /// `fs_nav_after_pdf_enumerate.is_some()` も block 対象に含めるのは、Ctrl+↑↓
-    /// で PDF/ZIP に遷移した直後の async enumerate 待ち (= close_fullscreen で
-    /// `fullscreen_idx = None` の数フレーム) に、グリッド側 Ctrl+↑↓ が
-    /// `FolderNavMode::Grid` で再 enqueue されて in-flight Fullscreen-mode nav を
-    /// キャンセルしてしまうのを防ぐため。ユーザーの意図はフルスクリーン継続なので
-    /// この待ち中はグリッドショートカットを全部抑止する。
+    /// deferred reopen 待ちも block 対象に含めるのは、Ctrl+↑↓ で PDF/ZIP や確認なし
+    /// 変換アーカイブへ遷移した直後 (= close_fullscreen で `fullscreen_idx = None` の
+    /// 数フレーム) に、グリッド側 Ctrl+↑↓ が `FolderNavMode::Grid` で再 enqueue されて
+    /// in-flight Fullscreen-mode nav をキャンセルしてしまうのを防ぐため。ユーザーの
+    /// 意図はフルスクリーン継続なので、この待ち中はグリッドショートカットを全部抑止する。
     pub(crate) fn shortcuts_blocked_by_text_input(&self) -> bool {
         self.viewer_session_blocks_main_window()
-            || self.fs_nav_after_pdf_enumerate.is_some()
+            || self.fs_nav_deferred_reopen_wait_active()
             || self.any_dialog_open()
             || self.address_has_focus
             || self.search_has_focus
@@ -31530,12 +31541,13 @@ impl eframe::App for App {
         //  判定が崩れるため、呼び出し直前にキャプチャする)。
         #[cfg(windows)]
         let embedded_fs_active_before_render = self.fullscreen_embedded_still_active();
-        // PDF/ZIP enumerate defer 中は fullscreen_idx = None でも in-window 用 holdover
-        // を main ctx に描いているので、続くグリッド描画は同じく抑止する必要がある
+        // PDF/ZIP enumerate defer または確認なしアーカイブ変換待ち中は
+        // fullscreen_idx = None でも in-window 用 holdover を main ctx に描いているので、
+        // 続くグリッド描画は同じく抑止する必要がある
         // (両方の CentralPanel が走ると二重描画 + 白フラッシュ)。
         #[cfg(windows)]
         let embedded_fs_pending =
-            self.native_video_in_window_active && self.fs_nav_after_pdf_enumerate.is_some();
+            self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active();
         self.render_fullscreen_viewport(ctx);
         let t_render_fullscreen_viewport = frame_t0.elapsed();
         // Esc/Enter/短い右クリックは root/embedded/fullscreen viewport のどこで処理されても
@@ -31661,10 +31673,11 @@ impl eframe::App for App {
             // グリッド UI (menubar/toolbar/grid) を描くと CentralPanel が二重になる。
             // native 動画 backdrop ブロック (上) と同じくここでグリッド描画を飛ばす。
             //
-            // `embedded_fs_pending` (PDF/ZIP enumerate defer 中) は fullscreen_idx が
-            // None なので embedded_fs_active=false だが、render_fullscreen_viewport が
-            // `render_embedded_fs_nav_holdover` で main ctx に黒地 + holdover を描いて
-            // いるため、後続の render_grid が走ると同じく二重 + 白フラッシュ問題が出る。
+            // `embedded_fs_pending` (PDF/ZIP enumerate defer / 自動変換待ち中) は
+            // fullscreen_idx が None なので embedded_fs_active=false だが、
+            // render_fullscreen_viewport が `render_embedded_fs_nav_holdover` で main ctx に
+            // 黒地 + holdover を描いているため、後続の render_grid が走ると同じく
+            // 二重 + 白フラッシュ問題が出る。
             // 同じ gate に乗せて grid 描画を skip し、poll_pdf/zip_enumerate で deferred
             // reopen を回す。
             if embedded_fs_active || embedded_fs_pending {
@@ -31685,6 +31698,9 @@ impl eframe::App for App {
                         self.chain_folder_nav_if_pending();
                     }
                 }
+                if self.archive_convert.is_some() {
+                    self.show_archive_convert_dialog(ctx);
+                }
                 // apply_folder_nav_result が PDF/ZIP に着地した場合、列挙ワーカー結果の
                 // 回収はグリッド描画 tail の poll_*_enumerate が担う。embedded 早期
                 // return は tail を飛ばすので、ここでも最低限の回収を行う (Codex P2)。
@@ -31698,7 +31714,7 @@ impl eframe::App for App {
                 if self.folder_nav_pending.is_some()
                     || self.pdf_enumerate_pending.is_some()
                     || self.zip_enumerate_pending.is_some()
-                    || self.fs_nav_after_pdf_enumerate.is_some()
+                    || self.fs_nav_deferred_reopen_wait_active()
                     || self.items_generation != items_gen_pre_late
                 {
                     ctx.request_repaint();
