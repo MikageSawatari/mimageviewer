@@ -623,6 +623,13 @@ impl DetailsColumn {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DetailsHeaderDrag {
+    column: DetailsColumn,
+    start: egui::Pos2,
+    latest: egui::Pos2,
+}
+
 fn details_ordered_columns(
     settings: &crate::settings::Settings,
     include_hidden: bool,
@@ -793,6 +800,22 @@ fn reorder_details_column(
     }
     settings.details_column_order = new_order;
     true
+}
+
+fn finish_details_header_drag(
+    settings: &mut crate::settings::Settings,
+    columns: &[(DetailsColumn, egui::Rect)],
+    drag: DetailsHeaderDrag,
+    min_delta_x: f32,
+) -> bool {
+    if (drag.latest.x - drag.start.x).abs() < min_delta_x {
+        return false;
+    }
+    let Some((target, target_rect)) = details_column_at_x(columns, drag.latest.x) else {
+        return false;
+    };
+    let insert_after = drag.latest.x > target_rect.center().x;
+    reorder_details_column(settings, drag.column, target, insert_after)
 }
 
 fn draw_details_text(
@@ -4404,6 +4427,7 @@ impl App {
         );
 
         let columns = details_column_rects(rect, &self.settings);
+        let header_drag_id = ui.id().with("details_header_drag_state");
         for (col, col_rect) in columns.iter().copied() {
             let mut header_hit = col_rect;
             if col != DetailsColumn::Name && header_hit.width() > 12.0 {
@@ -4428,17 +4452,61 @@ impl App {
             if response.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             }
-            if response.drag_stopped()
-                && response
-                    .total_drag_delta()
-                    .is_some_and(|delta| delta.x.abs() >= 12.0)
-                && let Some(pointer_pos) = ui.ctx().input(|i| i.pointer.latest_pos())
-                && let Some((target, target_rect)) = details_column_at_x(&columns, pointer_pos.x)
+            if response.drag_started_by(egui::PointerButton::Primary)
+                && let Some(pos) = ui
+                    .ctx()
+                    .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
             {
-                let insert_after = pointer_pos.x > target_rect.center().x;
-                if reorder_details_column(&mut self.settings, col, target, insert_after) {
-                    self.settings.save();
-                    ui.ctx().request_repaint();
+                let start = ui.ctx().input(|i| i.pointer.press_origin().unwrap_or(pos));
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        header_drag_id,
+                        Some(DetailsHeaderDrag {
+                            column: col,
+                            start,
+                            latest: pos,
+                        }),
+                    )
+                });
+            }
+            if response.dragged_by(egui::PointerButton::Primary)
+                && let Some(pos) = ui
+                    .ctx()
+                    .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
+            {
+                ui.ctx().data_mut(|data| {
+                    let mut drag = data
+                        .get_temp::<Option<DetailsHeaderDrag>>(header_drag_id)
+                        .flatten()
+                        .unwrap_or(DetailsHeaderDrag {
+                            column: col,
+                            start: pos,
+                            latest: pos,
+                        });
+                    if drag.column == col {
+                        drag.latest = pos;
+                    }
+                    data.insert_temp(header_drag_id, Some(drag));
+                });
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                let stopped_drag = ui
+                    .ctx()
+                    .data_mut(|data| data.remove_temp::<Option<DetailsHeaderDrag>>(header_drag_id))
+                    .flatten();
+                if let Some(mut drag) = stopped_drag {
+                    if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
+                        drag.latest = pos;
+                    }
+                    if finish_details_header_drag(&mut self.settings, &columns, drag, 12.0) {
+                        crate::logger::log(format!(
+                            "details header reorder: {:?} -> x {:.1}",
+                            drag.column.id(),
+                            drag.latest.x
+                        ));
+                        self.settings.save();
+                        ui.ctx().request_repaint();
+                    }
                 }
             }
             let sorted =
@@ -5574,6 +5642,48 @@ mod compute_cell_size_tests {
             DetailsColumn::Size,
             DetailsColumn::Name,
             false
+        ));
+
+        let size_pos = settings
+            .details_column_order
+            .iter()
+            .position(|id| *id == DetailsColumnId::Size)
+            .expect("size column is present");
+        let name_pos = settings
+            .details_column_order
+            .iter()
+            .position(|id| *id == DetailsColumnId::Name)
+            .expect("name column is present");
+        assert!(size_pos < name_pos);
+    }
+
+    #[test]
+    fn details_header_drag_uses_recorded_latest_pos_on_release() {
+        let mut settings = crate::settings::Settings::default();
+        let columns = details_column_rects(
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1200.0, 24.0)),
+            &settings,
+        );
+        let size_rect = columns
+            .iter()
+            .find(|(col, _)| *col == DetailsColumn::Size)
+            .map(|(_, rect)| *rect)
+            .expect("size column rect");
+        let name_rect = columns
+            .iter()
+            .find(|(col, _)| *col == DetailsColumn::Name)
+            .map(|(_, rect)| *rect)
+            .expect("name column rect");
+
+        assert!(finish_details_header_drag(
+            &mut settings,
+            &columns,
+            DetailsHeaderDrag {
+                column: DetailsColumn::Size,
+                start: size_rect.center(),
+                latest: egui::pos2(name_rect.left() + 4.0, name_rect.center().y),
+            },
+            12.0,
         ));
 
         let size_pos = settings
