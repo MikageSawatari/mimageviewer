@@ -11228,6 +11228,56 @@ mod pipeline_cache_refactor_tests {
         assert!(app.has_retained_final_ai(2, mk_key(2), edit_size));
     }
 
+    /// 外部アプリが現在フォルダの実ファイルを差し替えた場合、同じ path / 同じ寸法でも
+    /// retained key だけでは内容差分を表せない。signature 差分で自動再ロードする経路では
+    /// 保持 LRU を捨て、旧画像の AI 結果を新画像に流用しない。
+    #[test]
+    fn external_folder_change_clears_retained_final_ai_cache() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("external_refresh");
+        std::fs::create_dir_all(&folder).unwrap();
+        let first_image = folder.join("a.png");
+        std::fs::write(&first_image, b"old").unwrap();
+        let initial_sig = signature_from_scan(&scan_directory(&folder));
+
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        app.current_folder_signature = Some(initial_sig);
+        app.items = vec![GridItem::Image(first_image.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+
+        let key = FinalAiKey {
+            edit_key: EditResultKey {
+                idx: 0,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+            },
+            color_ai_hash: 42,
+            bg: 0,
+        };
+        app.insert_retained_final_ai(
+            0,
+            key,
+            [1, 1],
+            Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
+        );
+        assert!(
+            !app.retained_final_ai_cache.is_empty(),
+            "test setup must populate retained cache"
+        );
+
+        std::fs::write(folder.join("b.png"), b"new").unwrap();
+        app.check_external_folder_changes();
+
+        assert!(
+            app.retained_final_ai_cache.is_empty(),
+            "external folder refresh must not reuse retained AI pixels for changed disk content"
+        );
+    }
+
     /// AI 処理サイズ上限の変更 (`apply_ai_size_limit_change`) は final AI cache /
     /// failed / live pending / final composite と旧 AI cache 系を全て無効化する
     /// (Codex P3)。サイズ上限はキャッシュ key に含まれないため、明示破棄しないと

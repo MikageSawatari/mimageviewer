@@ -590,7 +590,9 @@ Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページで�
 `retained_final_ai_cache` は、上表で `final_ai_cache` をクリアする idx 単位の変更では同じ
 ページキーの entry を削除する。`clear_all_final_pipeline_caches()` は fullscreen close /
 folder nav close でも呼ばれるため保持 LRU には触らない。AI 機能モードや AI 処理サイズ上限の
-ように全体の実行判定が変わる設定変更では、保持 LRU も全クリアする。
+ように全体の実行判定が変わる設定変更では、保持 LRU も全クリアする。フォーカス復帰などで
+現在フォルダの実ディスク内容変更を signature 差分として検出した場合も、同じ path / 同じ
+画像寸法の上書き差し替えで旧 AI pixels を流用しないよう保持 LRU を全クリアする。
 
 消しゴムマスク変更時は `erase_mask_generation[idx]` を進め、`erase_result_cache` と
 `local_adjust_cache` / `conceal_cache[idx]` / `edit_result_cache` / final cache を stale 化する。

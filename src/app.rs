@@ -7020,6 +7020,15 @@ impl App {
             self.current_folder_last_mtime = Some(new_mtime);
             return;
         }
+        let retained_entries = self.retained_final_ai_cache.len();
+        if retained_entries > 0 {
+            self.clear_retained_final_ai_cache();
+            crate::logger::log(format!(
+                "[AI] Retained final AI clear entries={retained_entries} \
+                 reason=external_folder_change folder={}",
+                folder.display()
+            ));
+        }
         // 選択中アイテムのパスを保存 (非選択 / パス取れないアイテムは None)。
         let selected_path: Option<PathBuf> = self
             .selected
