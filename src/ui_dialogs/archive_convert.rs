@@ -202,8 +202,7 @@ impl App {
         // 検索 (Ctrl+G / Ctrl+S) 中は recent_folders を一切変更しない
         // (remember_recent_folder 自体もガード済みだが、retain も検索中は走らせない)。
         if !(self.global_search.active || self.favsearch.active) {
-            self.recent_folders
-                .retain(|p| !crate::folder_tree::path_eq(p, &cached_zip));
+            self.forget_recent_folder(&cached_zip);
             self.remember_recent_folder(&src);
         }
         self.update_active_quick_folder_target(&src);
@@ -352,8 +351,7 @@ impl App {
                     self.address = src.to_string_lossy().to_string();
                     // 検索 (Ctrl+G / Ctrl+S) 中は recent_folders を一切変更しない。
                     if !(self.global_search.active || self.favsearch.active) {
-                        self.recent_folders
-                            .retain(|p| !crate::folder_tree::path_eq(p, &nav));
+                        self.forget_recent_folder(&nav);
                         self.remember_recent_folder(&src);
                     }
                     self.update_active_quick_folder_target(&src);

@@ -1397,8 +1397,14 @@ pub struct Settings {
     pub startup_folder_mode: StartupFolderMode,
     #[serde(default)]
     pub startup_folder_path: Option<PathBuf>,
+    /// 旧形式 (〜v1.5.0) のグローバルな最近開いたフォルダ一覧。v1.6.0 で A/B
+    /// スロット別 (`quick_folder_recent_folders`) へ移行したが、初回移行のシード元 +
+    /// 旧バージョンへのダウングレード互換のため残し、主スロット A の一覧を書き戻す。
     #[serde(default)]
     pub recent_folders: Vec<PathBuf>,
+    /// A/B クイックフォルダごとの最近開いたフォルダ一覧 (v1.6.0+)。
+    #[serde(default = "default_quick_folder_recent_folders")]
+    pub quick_folder_recent_folders: [Vec<PathBuf>; 2],
     #[serde(default = "default_quick_folder_slots")]
     pub quick_folder_slots: [Option<PathBuf>; 2],
     /// ウィンドウ左上座標 (outer rect)
@@ -2623,6 +2629,9 @@ fn default_true() -> bool {
 fn default_quick_folder_slots() -> [Option<PathBuf>; 2] {
     [None, None]
 }
+fn default_quick_folder_recent_folders() -> [Vec<PathBuf>; 2] {
+    [Vec::new(), Vec::new()]
+}
 fn default_fullscreen_cursor_hide_delay_secs() -> f32 {
     FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS
 }
@@ -2838,6 +2847,7 @@ impl Default for Settings {
             startup_folder_mode: StartupFolderMode::default(),
             startup_folder_path: None,
             recent_folders: Vec::new(),
+            quick_folder_recent_folders: default_quick_folder_recent_folders(),
             quick_folder_slots: default_quick_folder_slots(),
             window_pos: None,
             window_size: None,
@@ -4054,6 +4064,7 @@ impl Settings {
         // ── ウィンドウ / ナビゲーション状態 ──
         self.last_folder = src.last_folder.take();
         self.recent_folders = std::mem::take(&mut src.recent_folders);
+        self.quick_folder_recent_folders = std::mem::take(&mut src.quick_folder_recent_folders);
         self.quick_folder_slots = std::mem::take(&mut src.quick_folder_slots);
         self.window_pos = src.window_pos;
         self.window_size = src.window_size;

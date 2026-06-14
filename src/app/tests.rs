@@ -1584,7 +1584,7 @@ mod phase_c_folder_nav_history_tests {
                 .is_empty()
         );
         assert!(app.folder_nav_back_stack.is_empty());
-        assert_eq!(app.recent_folders.first(), Some(&b));
+        assert_eq!(app.recent_folder_entries().first(), Some(&b));
         assert_eq!(app.settings.quick_folder_slots[0], Some(b.clone()));
 
         assert_eq!(app.navigate_folder_history_back(), Some(a.clone()));
@@ -1603,7 +1603,7 @@ mod phase_c_folder_nav_history_tests {
                 .forward_stack,
             vec![b.clone()]
         );
-        assert_eq!(app.recent_folders.first(), Some(&a));
+        assert_eq!(app.recent_folder_entries().first(), Some(&a));
 
         assert_eq!(app.navigate_folder_history_forward(), Some(b.clone()));
         app.record_folder_nav_transition(&b);
@@ -1621,7 +1621,7 @@ mod phase_c_folder_nav_history_tests {
                 .forward_stack
                 .is_empty()
         );
-        assert_eq!(app.recent_folders.first(), Some(&b));
+        assert_eq!(app.recent_folder_entries().first(), Some(&b));
     }
 
     #[test]
@@ -1633,22 +1633,65 @@ mod phase_c_folder_nav_history_tests {
         app.remember_recent_folder(&a);
         app.remember_recent_folder(&b);
 
-        assert_eq!(app.recent_folders, vec![b.clone(), a.clone()]);
+        // 既定ではスロット A がアクティブ。最近開いたフォルダはスロット A の一覧に入り、
+        // 後方互換のため settings.recent_folders にも主スロット A の一覧が反映される。
+        assert_eq!(app.recent_folder_entries(), &[b.clone(), a.clone()]);
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::A.index()].recent_folders,
+            vec![b.clone(), a.clone()]
+        );
+        assert_eq!(
+            app.settings.quick_folder_recent_folders[0],
+            vec![b.clone(), a.clone()]
+        );
         assert_eq!(app.settings.recent_folders, vec![b, a]);
+    }
+
+    #[test]
+    fn recent_folders_are_isolated_between_quick_folder_slots() {
+        let mut app = setup_app();
+        let a = PathBuf::from(r"C:\miv-test\a");
+        let b = PathBuf::from(r"C:\miv-test\b");
+        app.set_quick_folder_slot_target(QuickFolderSlotId::A, a.clone());
+        app.set_quick_folder_slot_target(QuickFolderSlotId::B, b.clone());
+
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
+        app.remember_recent_folder(&a);
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::B);
+        app.remember_recent_folder(&b);
+
+        // 「履歴▼」(= recent_folder_entries) はアクティブスロットごとに分離される。
+        assert_eq!(app.recent_folder_entries(), &[b.clone()]);
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
+        assert_eq!(app.recent_folder_entries(), &[a.clone()]);
+        // 永続化もスロット別。
+        assert_eq!(app.settings.quick_folder_recent_folders[0], vec![a]);
+        assert_eq!(app.settings.quick_folder_recent_folders[1], vec![b]);
     }
 
     #[test]
     fn clear_recent_folders_updates_session_and_settings() {
         let mut app = setup_app();
-        app.recent_folders = vec![
-            PathBuf::from(r"C:\miv-test\a"),
-            PathBuf::from(r"C:\miv-test\b"),
-        ];
-        app.settings.recent_folders = app.recent_folders.clone();
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
+        app.remember_recent_folder(&PathBuf::from(r"C:\miv-test\a"));
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::B);
+        app.remember_recent_folder(&PathBuf::from(r"C:\miv-test\b"));
 
         app.clear_recent_folders();
 
-        assert!(app.recent_folders.is_empty());
+        // 全スロットの一覧がクリアされ、設定にも反映される。
+        assert!(app.recent_folder_entries().is_empty());
+        assert!(
+            app.quick_folder_workspaces
+                .iter()
+                .all(|ws| ws.recent_folders.is_empty())
+        );
+        assert!(
+            app.settings
+                .quick_folder_recent_folders
+                .iter()
+                .all(|list| list.is_empty())
+        );
         assert!(app.settings.recent_folders.is_empty());
     }
 
@@ -2236,22 +2279,24 @@ mod phase_c_folder_nav_history_tests {
         let mut app = setup_app();
         let recent0 = PathBuf::from(r"C:\miv-test\recent0");
         let archive = PathBuf::from(r"C:\miv-test\found.7z");
-        app.recent_folders = vec![recent0.clone()];
+        // 既定アクティブスロット A の最近フォルダ一覧を初期化する。
+        app.quick_folder_workspaces[QuickFolderSlotId::A.index()].recent_folders =
+            vec![recent0.clone()];
 
         // Ctrl+G / Ctrl+S 中は archive_convert などの直接呼び出しでも recent を変えない。
         app.global_search.active = true;
         app.remember_recent_folder(&archive);
-        assert_eq!(app.recent_folders, vec![recent0.clone()]);
+        assert_eq!(app.recent_folder_entries(), &[recent0.clone()]);
 
         app.global_search.active = false;
         app.favsearch.active = true;
         app.remember_recent_folder(&archive);
-        assert_eq!(app.recent_folders, vec![recent0.clone()]);
+        assert_eq!(app.recent_folder_entries(), &[recent0.clone()]);
 
         // 検索を抜ければ通常どおり記録される。
         app.favsearch.active = false;
         app.remember_recent_folder(&archive);
-        assert_eq!(app.recent_folders.first(), Some(&archive));
+        assert_eq!(app.recent_folder_entries().first(), Some(&archive));
     }
 
     #[test]
@@ -2341,7 +2386,7 @@ mod phase_c_folder_nav_history_tests {
             app.quick_folder_workspaces[slot.index()].history.back_stack,
             vec![older, c]
         );
-        assert_eq!(app.recent_folders.first(), Some(&x));
+        assert_eq!(app.recent_folder_entries().first(), Some(&x));
     }
 
     #[test]

@@ -106,6 +106,9 @@ pub(crate) struct FolderNavHistoryState {
 pub(crate) struct QuickFolderWorkspace {
     pub target: Option<PathBuf>,
     pub history: FolderNavHistoryState,
+    /// このスロットで最近開いたフォルダ一覧 (MRU)。スロットごとに独立し、
+    /// 「履歴▼」メニューに表示される。`quick_folder_recent_folders` に永続化される。
+    pub recent_folders: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4757,9 +4760,26 @@ impl App {
 
         settings.recent_folders.truncate(MAX_RECENT_FOLDERS);
         let recent_folders = settings.recent_folders.clone();
-        let quick_folder_workspaces = std::array::from_fn(|idx| QuickFolderWorkspace {
-            target: settings.quick_folder_slots[idx].clone(),
-            history: FolderNavHistoryState::default(),
+        // 旧形式 (〜v1.5.0) はグローバルな recent_folders 1 本だった。A/B スロット別の
+        // quick_folder_recent_folders が未設定 (= 移行前) なら、旧一覧を主スロット A へ
+        // シードして移行する。B は空から始める。
+        let migrate_legacy_recents = settings
+            .quick_folder_recent_folders
+            .iter()
+            .all(|list| list.is_empty())
+            && !settings.recent_folders.is_empty();
+        let quick_folder_workspaces = std::array::from_fn(|idx| {
+            let mut slot_recent = if migrate_legacy_recents && idx == QuickFolderSlotId::A.index() {
+                settings.recent_folders.clone()
+            } else {
+                settings.quick_folder_recent_folders[idx].clone()
+            };
+            slot_recent.truncate(MAX_RECENT_FOLDERS);
+            QuickFolderWorkspace {
+                target: settings.quick_folder_slots[idx].clone(),
+                history: FolderNavHistoryState::default(),
+                recent_folders: slot_recent,
+            }
         });
         let keymap = if cfg!(test) {
             crate::keymap::Keymap::empty()
@@ -6576,6 +6596,33 @@ impl App {
     fn sync_quick_folder_settings(&mut self) {
         self.settings.quick_folder_slots =
             std::array::from_fn(|idx| self.quick_folder_workspaces[idx].target.clone());
+        self.settings.quick_folder_recent_folders =
+            std::array::from_fn(|idx| self.quick_folder_workspaces[idx].recent_folders.clone());
+        // 後方互換: 旧 `recent_folders` には主スロット A の一覧を残す
+        // (旧バージョンへダウングレードしても最近フォルダが空にならないように)。
+        self.settings.recent_folders = self.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+            .recent_folders
+            .clone();
+    }
+
+    /// 最近開いたフォルダ MRU へのエントリ追加 (重複除去 + 先頭挿入 + 上限切り詰め)。
+    fn push_recent_folder_entry(list: &mut Vec<PathBuf>, path: &Path) {
+        list.retain(|p| !crate::folder_tree::path_eq(p, path));
+        list.insert(0, path.to_path_buf());
+        list.truncate(MAX_RECENT_FOLDERS);
+    }
+
+    /// アクティブスロットの最近開いたフォルダ一覧から `path` を取り除く
+    /// (変換キャッシュ ZIP のパスを履歴に残さない等)。
+    pub(crate) fn forget_recent_folder(&mut self, path: &Path) {
+        if let Some(workspace) = self.active_quick_folder_workspace_mut() {
+            workspace
+                .recent_folders
+                .retain(|p| !crate::folder_tree::path_eq(p, path));
+        } else {
+            self.recent_folders
+                .retain(|p| !crate::folder_tree::path_eq(p, path));
+        }
     }
 
     pub(crate) fn quick_folder_target(&self, slot: QuickFolderSlotId) -> Option<&PathBuf> {
@@ -6678,16 +6725,21 @@ impl App {
         if self.global_search.active || self.favsearch.active || self.tag_view.active {
             return;
         }
-        self.recent_folders
-            .retain(|p| !crate::folder_tree::path_eq(p, path));
-        self.recent_folders.insert(0, path.to_path_buf());
-        self.recent_folders.truncate(MAX_RECENT_FOLDERS);
-        self.settings.recent_folders = self.recent_folders.clone();
+        // アクティブな A/B スロットごとに最近開いたフォルダ一覧を分離する。
+        if let Some(workspace) = self.active_quick_folder_workspace_mut() {
+            Self::push_recent_folder_entry(&mut workspace.recent_folders, path);
+        } else {
+            Self::push_recent_folder_entry(&mut self.recent_folders, path);
+        }
+        self.sync_quick_folder_settings();
     }
 
     pub(crate) fn clear_recent_folders(&mut self) {
+        for workspace in &mut self.quick_folder_workspaces {
+            workspace.recent_folders.clear();
+        }
         self.recent_folders.clear();
-        self.settings.recent_folders.clear();
+        self.sync_quick_folder_settings();
     }
 
     /// `load_folder*` 入口で呼ぶ。現在地から `target` への遷移を履歴に記録する。
@@ -6819,7 +6871,12 @@ impl App {
     }
 
     pub(crate) fn recent_folder_entries(&self) -> &[PathBuf] {
-        &self.recent_folders
+        // アクティブな A/B スロットの最近開いたフォルダ一覧を返す。
+        if let Some(workspace) = self.active_quick_folder_workspace() {
+            &workspace.recent_folders
+        } else {
+            &self.recent_folders
+        }
     }
 
     pub(crate) fn navigate_folder_history_back(&mut self) -> Option<PathBuf> {
@@ -11479,7 +11536,7 @@ impl App {
             // 一致するので挙動不変)。recent_folders は open_archive_via_cache が既に元
             // アーカイブを記録済み。
             self.settings.last_folder = Some(self.effective_folder().unwrap_or(source_path));
-            self.settings.recent_folders = self.recent_folders.clone();
+            self.sync_quick_folder_settings();
             self.settings.save();
         }
         if crate::perf::is_enabled() {
@@ -26752,10 +26809,13 @@ impl App {
         //
         // ⚠ サイズ比較の前提 (Codex P2): アップスケール出力は `run_final_ai_job` の
         // `clamp_color_image_for_gpu` で MAX_TEXTURE_DIM (8192) まで縮小されることが
-        // あるが、AI 入力はサイズ上限 (長辺 < 4096) 未満なので縮小後 (長辺 8192) も
-        // 必ず入力より大きい。よって「アップスケール出力 ⇔ サイズが入力と異なる」の
-        // 対応は保たれる。等倍以下へ縮む経路 (1x モデル等) を将来入れる場合は、
-        // final_ai_cache の entry に used_upscale フラグを持たせてこの判定を置き換えること。
+        // あるが、AI 入力はサイズ上限の長辺 (≤ MAX_TEXTURE_DIM = 8192) 未満なので、
+        // クランプ後の長辺 = min(4×入力, 8192) は必ず入力より大きい (入力長辺 L < 8192 の
+        // とき min(4L, 8192) > L が常に成立する)。よって「アップスケール出力 ⇔ サイズが
+        // 入力と異なる」の対応は保たれる。サイズ上限の長辺を 8192 超に拡げる、または
+        // 等倍以下へ縮む経路 (1x モデル等) を入れる場合は、final_ai_cache の entry に
+        // used_upscale フラグを持たせてこの判定を置き換えること
+        // (AI_SIZE_LIMIT_OPTIONS は long_edge_px <= MAX_TEXTURE_DIM をテストで保証している)。
         let output_is_ai_upscaled = base_is_ai && base_pixels.size != edit_pixels.size;
         let sharpen_strength = params.effective_smart_sharpen(output_is_ai_upscaled);
         let t_sharpen0 = perf_on.then(std::time::Instant::now);

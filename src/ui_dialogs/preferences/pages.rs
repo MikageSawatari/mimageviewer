@@ -391,8 +391,13 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
             if ui.button("最近開いたフォルダ履歴をクリア").clicked() {
                 clear_recent_folders_clicked = true;
             }
+            let recent_total: usize = s
+                .quick_folder_recent_folders
+                .iter()
+                .map(|list| list.len())
+                .sum();
             ui.label(
-                egui::RichText::new(format!("現在 {} 件", s.recent_folders.len()))
+                egui::RichText::new(format!("現在 {recent_total} 件 (A/B 合計)"))
                     .size(11.0)
                     .weak(),
             );
@@ -531,6 +536,7 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.checkbox(&mut s.show_toolbar_tags, "タグ");
     if clear_recent_folders_clicked {
         s.recent_folders.clear();
+        s.quick_folder_recent_folders = [Vec::new(), Vec::new()];
         state.recent_folders_clear_requested = true;
     }
     if clear_quick_folders_clicked {
@@ -820,9 +826,10 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(2.0);
     ui.label(
         egui::RichText::new(
-            "アップスケールは処理後の画像 (4 倍) が大きくなるため、大きい上限ほどメモリと\n\
-             処理時間を消費します (4096 x 4096 では一時的に数 GB)。メモリが不足する環境では\n\
-             小さい上限を選んでください。8192px を超えた結果は自動的に縮小されます。",
+            "アップスケールは処理後の画像 (4 倍) を組み立ててから縮小するため、上限が大きい\n\
+             ほどメモリと処理時間が急増します (一時的に 4096 x 4096 で数 GB、8192 x 8192 では\n\
+             10 GB 規模)。メモリが不足する環境では小さい上限を選んでください。最終結果は\n\
+             長辺 8192px 以下へ自動的に縮小されます。",
         )
         .size(11.0)
         .weak(),
@@ -831,13 +838,21 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
 /// AI 処理サイズ上限の候補 (長辺, 短辺, 表示ラベル)。
 /// 判定は `ai::upscale::should_process_rect` (長辺・短辺とも未満なら処理) を参照。
-const AI_SIZE_LIMIT_OPTIONS: [(u32, u32, &str); 6] = [
+///
+/// ⚠ 長辺は `crate::app::MAX_TEXTURE_DIM` (8192) 以下に保つこと。これを超えると
+/// 「アップスケール出力は必ず入力より大きい」前提 (final smart-sharpen の
+/// `output_is_ai_upscaled` 判定) が崩れる (詳細は app.rs の該当コメント)。
+/// 6144 / 8192 クラスは結合見開きスキャンなど大判向けの高負荷オプション。
+const AI_SIZE_LIMIT_OPTIONS: [(u32, u32, &str); 9] = [
     (512, 512, "512 x 512 未満"),
     (1024, 1024, "1024 x 1024 未満"),
     (2048, 1024, "2048 x 1024 未満"),
     (2048, 2048, "2048 x 2048 未満"),
     (4096, 2048, "4096 x 2048 未満"),
     (4096, 4096, "4096 x 4096 未満 (高負荷)"),
+    (6144, 4096, "6144 x 4096 未満 (超高負荷)"),
+    (8192, 4096, "8192 x 4096 未満 (超高負荷)"),
+    (8192, 8192, "8192 x 8192 未満 (超高負荷)"),
 ];
 
 /// 「長辺 x 短辺 未満」候補のコンボボックスを描画し、選択が変わったら Some を返す。
@@ -3056,5 +3071,33 @@ fn open_in_explorer(path: &std::path::Path) {
     #[cfg(not(windows))]
     {
         let _ = path;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AI_SIZE_LIMIT_OPTIONS;
+    use crate::app::MAX_TEXTURE_DIM;
+
+    /// AI サイズ上限プリセットの長辺は GPU テクスチャ上限 (8192) を超えてはならない。
+    /// 超えると final smart-sharpen の `output_is_ai_upscaled`
+    /// (= 「アップスケール出力は必ず入力より大きい」前提) が崩れる (app.rs 該当コメント参照)。
+    /// また表示は「長辺 x 短辺」なので short <= long を保つ。
+    #[test]
+    fn ai_size_limit_presets_stay_within_gpu_texture_limit() {
+        let max = MAX_TEXTURE_DIM as u32;
+        for (long, short, label) in AI_SIZE_LIMIT_OPTIONS {
+            assert!(
+                long <= max,
+                "preset '{label}' long_edge {long} exceeds MAX_TEXTURE_DIM {max}"
+            );
+            assert!(
+                short <= long,
+                "preset '{label}' short_edge {short} exceeds long_edge {long}"
+            );
+        }
+        // 最大プリセットが 8192 x 8192 であること (要望: 8192 まで対応)。
+        let largest = AI_SIZE_LIMIT_OPTIONS.last().copied().unwrap();
+        assert_eq!((largest.0, largest.1), (max, max));
     }
 }
