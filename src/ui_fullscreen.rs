@@ -1312,6 +1312,24 @@ impl App {
         self.fs_nav_locked_gen.is_some()
     }
 
+    /// 描画側で使ってよい Ctrl+↑↓ nav holdover を返す。
+    ///
+    /// `fs_holdover_tex` は旧ページの見た目を一時的に残すためのものだが、
+    /// `items_generation` が進み、かつ新しい `fullscreen_idx` が既に入った後まで
+    /// 実ページ描画の fallback に使うと、タイトル/パスだけ新しいフォルダに進んで
+    /// 画像だけ旧フォルダのまま残る。新 target が有効になった後は loading 表示へ
+    /// 落とし、old image は PDF/ZIP enumerate defer など `fullscreen_idx == None`
+    /// の待機窓だけで使う。
+    pub(crate) fn fs_nav_holdover_tex_for_draw(&self) -> Option<egui::TextureHandle> {
+        let Some(locked_gen) = self.fs_nav_locked_gen else {
+            return None;
+        };
+        if self.fullscreen_idx.is_some() && self.items_generation > locked_gen {
+            return None;
+        }
+        self.fs_holdover_tex.clone()
+    }
+
     /// nav ロックと holdover を強制解除する。`poll_fs_nav_lock` の通常解除条件
     /// (items_generation 進行 + 新ページの tex 用意) に到達しないケース
     /// (DFS が境界に当たって path=None / 画像・動画フォルダに着地できず !hit_image_folder /
@@ -2577,7 +2595,7 @@ impl App {
             let fs_builder = self.build_fullscreen_viewport_builder();
             let mut cancel = false;
             // holdover を中央フィットで描画する用のテクスチャ参照をクロージャ前に外出し。
-            let holdover = self.fs_holdover_tex.clone();
+            let holdover = self.fs_nav_holdover_tex_for_draw();
             ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
                 // 列挙が重い / ワーカー異常停止などで待ちが長くなったときに
                 // ユーザーが黒画面に閉じ込められないよう、Esc とウィンドウ
@@ -2702,7 +2720,7 @@ impl App {
     /// (viewport モードの defer 分岐と同じ挙動)。
     #[cfg(windows)]
     fn render_embedded_fs_nav_holdover(&mut self, ctx: &egui::Context) {
-        let holdover = self.fs_holdover_tex.clone();
+        let holdover = self.fs_nav_holdover_tex_for_draw();
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         let escape_pressed = !self.ime_input_active()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
@@ -2775,7 +2793,7 @@ impl App {
     /// 背面のグリッドが見えないようにする。
     #[cfg(windows)]
     pub(crate) fn render_still_fullscreen_viewport_enter_holdover(&mut self, ctx: &egui::Context) {
-        let holdover = self.fs_holdover_tex.clone();
+        let holdover = self.fs_nav_holdover_tex_for_draw();
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
@@ -4350,17 +4368,7 @@ impl App {
             Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
             _ => None,
         }
-        .or_else(|| {
-            // ナビ ロック中で新ページのサムネ未準備のときは旧ページのテクスチャを
-            // 流用して「ファイル名だけが切り替わる」状態を回避する。サムネが
-            // Loaded になった瞬間 `poll_fs_nav_lock` がロックを解除し holdover が
-            // 解放される。
-            if self.fs_nav_is_locked() {
-                self.fs_holdover_tex.clone()
-            } else {
-                None
-            }
-        });
+        .or_else(|| self.fs_nav_holdover_tex_for_draw());
 
         let mut location_display = self.location_display_for(fs_idx);
         // 動画の場合は decode 経路 (HW/SW) と GPU パスを末尾に追記。
@@ -8789,11 +8797,7 @@ impl App {
         };
         let bg_style = transparent_bg_style(self.fs_transparent_bg_mode, bg_tex.as_ref());
         let painter = ui.painter().with_clip_rect(image_rect);
-        let holdover_for_locked = if self.fs_nav_is_locked() {
-            self.fs_holdover_tex.clone()
-        } else {
-            None
-        };
+        let holdover_for_locked = self.fs_nav_holdover_tex_for_draw();
 
         let process_indices = if original_preview_active {
             std::collections::HashSet::new()
@@ -10681,14 +10685,10 @@ impl App {
                 egui::vec2(scaled_rw, scaled_h),
             );
 
-            // ナビ ロック中は旧ページのテクスチャを左右両方の最終フォールバックとして
-            // 使い、「ファイル名のみ表示」状態を回避する。両ページに同じ holdover が
-            // 出るのは束の間 (poll_fs_nav_lock がサムネ Loaded で解除する) なので許容。
-            let holdover_for_locked = if self.fs_nav_is_locked() {
-                self.fs_holdover_tex.clone()
-            } else {
-                None
-            };
+            // ナビロック中でも、新 target が items に入った後は旧ページを
+            // fallback 描画しない。タイトル/パスだけ先に進み、画像だけ旧フォルダに
+            // 残る状態を避けるため、描画可否は helper に集約する。
+            let holdover_for_locked = self.fs_nav_holdover_tex_for_draw();
             for (rect, idx, rot, location, display_tex) in [
                 (
                     left_rect,
@@ -10736,12 +10736,8 @@ impl App {
                 egui::pos2(image_rect.min.x + half_w + spread_gap, image_rect.min.y),
                 egui::vec2(half_w, image_rect.height()),
             );
-            // フォールバック分岐でも nav ロック中の holdover を渡す (上のパス参照)。
-            let holdover_for_locked = if self.fs_nav_is_locked() {
-                self.fs_holdover_tex.clone()
-            } else {
-                None
-            };
+            // フォールバック分岐でも nav ロック中の holdover 可否は上のパスと同じ。
+            let holdover_for_locked = self.fs_nav_holdover_tex_for_draw();
             for (rect, idx, rot, location, display_tex) in [
                 (
                     left_rect,

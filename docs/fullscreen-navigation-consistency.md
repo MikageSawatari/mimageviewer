@@ -212,6 +212,12 @@ no-op 案内は段階を分ける:
 
 - フルスクリーンの Ctrl+↑↓ は `handle_fullscreen_ctrl_nav_context` に集約し、
   画像系 / native 動画 / Ctrl+S / Ctrl+G が同じ優先順位を使う。
+- Ctrl+↑↓ の遷移中に保持する `fs_holdover_tex` は、旧 target と新 target の間の
+  真っ黒/白フラッシュを避けるための一時表示であり、新しい `fullscreen_idx` が
+  active になった後の実ページ fallback には使わない。新 target のタイトル/パスが
+  表示されている間に旧 ZIP/7z の画像だけが残ると現在地を誤認するため、
+  `fs_nav_holdover_tex_for_draw` で draw 可否を判定し、PDF/ZIP enumerate defer
+  (`fullscreen_idx == None`) の待機窓だけ旧画像を表示する。
 - `FolderNavMode::Favsearch { fullscreen }` で Ctrl+S のグリッド移動と
   フルスクリーン維持を分ける。
 - native 動画の XButton は Win32 / HUD で `Extra1/Extra2` に変換済みなので、

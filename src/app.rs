@@ -23120,10 +23120,11 @@ impl App {
         self.cursor_hidden = false;
         // ※ ここで `fs_nav_locked` / `fs_holdover_tex` を即時クリアしてはいけない:
         //   `apply_folder_nav_result` の Fullscreen 分岐は close_fullscreen → load_folder
-        //   → open_fullscreen と直列に呼ぶので、その途中で lock を捨てると新ページが
-        //   thumb_tex 未準備のまま「ファイル名のみ」表示になる。`poll_fs_nav_lock` 側で
-        //   フルスクリーンが本当に閉じた (= 次フレームに `fullscreen_idx` が None のまま)
-        //   ことを確認してから解除する。
+        //   → open_fullscreen と直列に呼ぶ。途中で lock を捨てると PDF/ZIP enumerate defer
+        //   中の黒画面抑止や連続入力抑止が効かなくなるため、`poll_fs_nav_lock` 側で
+        //   新ページの tex 準備、またはフルスクリーンが本当に閉じたことを確認してから
+        //   解除する。実ページ描画で旧 holdover を使うかどうかは
+        //   `fs_nav_holdover_tex_for_draw` が別途判定する。
         // PDF pool の Critical 予約は v1.0.0 から常時 ON 方針なので、ここで切替えない。
         // フルスクリーン中の Undo スタックはここで破棄。グリッドに戻ったら新しい操作を積む。
         self.clear_meta_undo();

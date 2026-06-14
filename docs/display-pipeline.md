@@ -178,6 +178,13 @@ ui_fullscreen.rs::render_fullscreen_viewport
 戻さずに、初期 white client / サイズ遷移フラッシュを抑える。
 詳細は [docs/ui-responsiveness.md §9](ui-responsiveness.md) を参照。
 
+Ctrl+↑↓ のフォルダ横断では、遷移開始時に `fs_holdover_tex` へ旧ページのテクスチャを
+保持する。ただしこれは、新 target がまだ active になっていない間、または PDF/ZIP
+enumerate defer で `fullscreen_idx == None` の間に限って描く。`items_generation` が進み、
+新しい `fullscreen_idx` が入った後は `fs_nav_holdover_tex_for_draw` が旧テクスチャを
+返さず、サムネ/本画像が来るまで loading 表示に落とす。これにより、タイトルバーや
+パス表示だけ新しい ZIP を指しているのに画像だけ前の 7z のまま残る状態を防ぐ。
+
 フルスクリーンの先読み対象は、`items` 全体ではなく `visible_indices` 由来の display list から
 作る。★フィルタや Ctrl+F で一覧が疎になっているときも、スライドショー / 前後移動と同じ
 次候補を先読みし、フィルタで隠れた画像は対象にしない。

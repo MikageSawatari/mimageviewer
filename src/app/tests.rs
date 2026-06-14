@@ -8074,6 +8074,89 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.fs_nav_locked_gen.is_none());
     }
 
+    /// Ctrl+↑↓ で次のフォルダ/ZIPへ進んだ後、タイトル/パスは新 target を
+    /// 指しているのに旧 archive の画像だけが holdover で残らないこと。
+    #[test]
+    fn fs_nav_holdover_for_draw_stops_after_new_fullscreen_target_is_active() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let old_tex = ctx.load_texture(
+            "fs-nav-old-archive",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/book/02.7z")));
+        app.thumbnails.push(ThumbnailState::Loaded {
+            tex: old_tex.clone(),
+            from_cache: false,
+            rendered_at_px: 64,
+            source_dims: None,
+        });
+        app.fullscreen_idx = Some(0);
+        let locked_gen = app.items_generation;
+        app.fs_nav_locked_gen = Some(locked_gen);
+        app.fs_holdover_tex = Some(old_tex);
+
+        assert!(
+            app.fs_nav_holdover_tex_for_draw().is_some(),
+            "新 target がまだ入る前は旧ページ holdover を使ってよい"
+        );
+
+        // 新しい ZIP の items が導入され、open_fullscreen(0) 相当で title/path は
+        // 新 target を指したが、サムネ/本画像はまだ未ロードという状態を再現する。
+        app.items = vec![GridItem::Image(std::path::PathBuf::from("c:/book/03.zip"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.fullscreen_idx = Some(0);
+        app.items_generation = locked_gen + 1;
+
+        assert!(
+            app.fs_nav_is_locked(),
+            "新ページの tex が未準備なら入力抑止用の nav lock は維持する"
+        );
+        assert!(
+            app.fs_holdover_tex.is_some(),
+            "poll_fs_nav_lock が解除するまで内部 holdover は保持される"
+        );
+        assert!(
+            app.fs_nav_holdover_tex_for_draw().is_none(),
+            "新 target が active になった後は旧 archive 画像を描画 fallback に使わない"
+        );
+    }
+
+    /// PDF/ZIP の async enumerate defer で `fullscreen_idx == None` の間は、従来どおり
+    /// holdover を描けること。ここを消すと列挙待ち中に黒/白フラッシュが戻る。
+    #[test]
+    fn fs_nav_holdover_for_draw_stays_available_during_enumerate_defer() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let old_tex = ctx.load_texture(
+            "fs-nav-enumerate-defer",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+
+        let locked_gen = app.items_generation;
+        app.fs_nav_locked_gen = Some(locked_gen);
+        app.fs_holdover_tex = Some(old_tex);
+        app.fullscreen_idx = None;
+        app.items_generation = locked_gen + 1;
+        app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            resume_slideshow: false,
+            target: None,
+            resume_to_last_page: false,
+            preserve_after_password_prompt: false,
+        });
+
+        assert!(
+            app.fs_nav_holdover_tex_for_draw().is_some(),
+            "deferred enumerate 中は旧ページ holdover で待機画面を維持する"
+        );
+    }
+
     /// `find_fullscreen_nav_target`: 常にフォルダ先頭の画像系アイテムを返すこと。
     /// Ctrl+↑ でも前フォルダの最後ではなく最初の画像に着地させる仕様変更の回帰ガード。
     /// (旧 API の `forward: bool` 引数は仕様統一に伴って削除済み。)
