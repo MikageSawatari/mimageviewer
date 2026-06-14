@@ -56,7 +56,9 @@ impl App {
         ));
 
         let select_requested_file = requested.is_file() && openable.is_dir();
-        let outcome = self.load_folder_or_convert_archive(openable);
+        let auto_fullscreen = startup_openable_should_auto_fullscreen(&self.settings, &openable);
+        let outcome =
+            self.load_folder_or_convert_archive_with_auto_fullscreen(openable, auto_fullscreen);
         if matches!(outcome, FolderOpenOutcome::Ignored) {
             return false;
         }
@@ -100,4 +102,14 @@ impl App {
 
 pub(crate) fn startup_file_should_open_fullscreen(item: &GridItem) -> bool {
     matches!(item, GridItem::Image(_) | GridItem::Video(_))
+}
+
+pub(crate) fn startup_openable_should_auto_fullscreen(
+    settings: &crate::settings::Settings,
+    openable: &Path,
+) -> bool {
+    settings.auto_fullscreen_zip_pdf
+        && openable.is_file()
+        && (crate::folder_tree::is_virtual_folder(openable)
+            || crate::folder_tree::is_convertible_archive_path(openable))
 }

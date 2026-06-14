@@ -142,6 +142,41 @@ fn startup_file_open_keeps_containers_on_navigation_path() {
     ));
 }
 
+#[test]
+fn startup_archive_open_auto_fullscreen_follows_setting_and_file_kind() {
+    let tmp = TempDir::new().expect("tempdir");
+    let zip = tmp.path().join("book.zip");
+    let cbz = tmp.path().join("book.cbz");
+    let pdf = tmp.path().join("scan.pdf");
+    let rar = tmp.path().join("book.rar");
+    let seven_z = tmp.path().join("book.7z");
+    let image = tmp.path().join("cover.jpg");
+    let folder = tmp.path().join("folder");
+    for path in [&zip, &cbz, &pdf, &rar, &seven_z, &image] {
+        std::fs::write(path, b"dummy").unwrap();
+    }
+    std::fs::create_dir(&folder).unwrap();
+
+    let mut settings = crate::settings::Settings::default();
+    settings.auto_fullscreen_zip_pdf = false;
+    assert!(!startup_openable_should_auto_fullscreen(&settings, &zip));
+
+    settings.auto_fullscreen_zip_pdf = true;
+    for path in [&zip, &cbz, &pdf, &rar, &seven_z] {
+        assert!(
+            startup_openable_should_auto_fullscreen(&settings, path),
+            "{} should inherit the explicit archive open fullscreen setting",
+            path.display()
+        );
+    }
+    assert!(!startup_openable_should_auto_fullscreen(&settings, &image));
+    assert!(!startup_openable_should_auto_fullscreen(&settings, &folder));
+    assert!(!startup_openable_should_auto_fullscreen(
+        &settings,
+        &tmp.path().join("missing.zip")
+    ));
+}
+
 // ── cell_has_lower_left_container_badge ───────────────────────────────────
 //
 // レーティング ★ バッジを左下に出す際、コンテナバッジ (folder 名 / "ZIP" / "PDF" /
@@ -4908,6 +4943,34 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.auto_open_for_current_container(), "設定 OFF は対象外");
     }
 
+    #[test]
+    fn pdf_password_prompt_preserves_only_explicit_deferred_reopen() {
+        let mut app = setup_app();
+        app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            resume_slideshow: false,
+            target: None,
+            resume_to_last_page: true,
+            preserve_after_password_prompt: true,
+        });
+        app.prepare_deferred_reopen_for_pdf_password_prompt();
+        assert!(
+            app.fs_nav_after_pdf_enumerate.is_some(),
+            "grid/CLI/SendTo 由来の明示オープン予約はパスワード入力後まで維持"
+        );
+
+        app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            resume_slideshow: false,
+            target: None,
+            resume_to_last_page: false,
+            preserve_after_password_prompt: false,
+        });
+        app.prepare_deferred_reopen_for_pdf_password_prompt();
+        assert!(
+            app.fs_nav_after_pdf_enumerate.is_none(),
+            "Ctrl+↑↓ などナビ由来の予約はパスワード要求時に破棄"
+        );
+    }
+
     /// 読書位置レジュームの記録: 画像本のページだけを対象にし、dedup する。
     #[test]
     fn record_book_resume_targets_book_pages_with_dedup() {
@@ -7826,6 +7889,7 @@ mod favorite_adjustment_defaults_tests {
             resume_slideshow: false,
             target: None,
             resume_to_last_page: false,
+            preserve_after_password_prompt: false,
         });
 
         app.poll_fs_nav_lock();

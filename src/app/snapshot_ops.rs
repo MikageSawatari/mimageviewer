@@ -846,6 +846,7 @@ impl App {
                 resume_slideshow,
                 target,
                 resume_to_last_page: false,
+                preserve_after_password_prompt: false,
             });
             return;
         }

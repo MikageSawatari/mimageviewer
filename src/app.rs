@@ -21,7 +21,9 @@ mod runtime_ops;
 mod snapshot_ops;
 mod startup_ops;
 #[cfg(test)]
-pub(crate) use startup_ops::startup_file_should_open_fullscreen;
+pub(crate) use startup_ops::{
+    startup_file_should_open_fullscreen, startup_openable_should_auto_fullscreen,
+};
 
 use folder_scan::is_miv_upscaled_derivative;
 pub(crate) use folder_scan::{ScannedDir, scan_directory, signature_from_scan};
@@ -156,6 +158,9 @@ pub(crate) struct DeferredFsReopen {
     /// `book_nav_resume` で true/false を決める (位置復元マトリクス)。既定は grid=続き /
     /// nav=先頭で従来挙動を維持。
     pub resume_to_last_page: bool,
+    /// パスワード付き PDF で入力ダイアログを挟んでも、この reopen 意図を維持するか。
+    /// grid / CLI / SendTo の明示オープンは true、Ctrl+↑↓ などのナビ由来は false。
+    pub preserve_after_password_prompt: bool,
 }
 
 /// DFS スレッドから UI スレッドに送るメッセージ。結果 (Option) と、
@@ -3387,9 +3392,9 @@ pub struct App {
     /// するため) ので、単一フィールドで両方を賄える。
     pub(crate) fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
 
-    /// 「ZIP/PDF を grid から開いた瞬間に 1 ページ目をフルスクリーンで開く」(環境設定
-    /// `auto_fullscreen_zip_pdf`) の one-shot 予約。grid の Enter / ダブルクリックで
-    /// ZipFile / PdfFile を開くときに立て、`load_zip_as_folder` / `load_pdf_as_folder` が
+    /// 「ZIP/PDF/対応アーカイブを明示的に開いたらページをフルスクリーンで開く」
+    /// (`auto_fullscreen_zip_pdf`) の one-shot 予約。grid の Enter / ダブルクリックや
+    /// 起動引数 / SendTo で立て、`load_zip_as_folder` / `load_pdf_as_folder` が
     /// `mem::take` して `fs_nav_after_pdf_enumerate` へ変換する。
     pub(crate) pending_auto_fs_open: bool,
     /// モードB「ページをフルスクリーン表示」での Esc/Enter/右クリックで「親フォルダ (一覧)
@@ -6913,10 +6918,22 @@ impl App {
         );
     }
 
+    pub(crate) fn load_folder_or_convert_archive(&mut self, path: PathBuf) -> FolderOpenOutcome {
+        self.load_folder_or_convert_archive_with_auto_fullscreen(path, false)
+    }
+
     /// 通常のフォルダ / ZIP / PDF はそのまま開き、変換対応アーカイブ (RAR/7z/LZH)
     /// は有効なキャッシュがあれば元パス表示を維持したまま開く。未変換なら既存の
     /// 変換確認ダイアログを出す。
-    pub(crate) fn load_folder_or_convert_archive(&mut self, path: PathBuf) -> FolderOpenOutcome {
+    ///
+    /// `auto_fullscreen` は起動引数 / SendTo / 既存インスタンス転送など、
+    /// ユーザーが本ファイルを直接開いた経路だけ true にする。履歴復元や
+    /// アドレスバー移動は従来どおり false で呼ぶ。
+    pub(crate) fn load_folder_or_convert_archive_with_auto_fullscreen(
+        &mut self,
+        path: PathBuf,
+        auto_fullscreen: bool,
+    ) -> FolderOpenOutcome {
         let format = path
             .extension()
             .and_then(|e| e.to_str())
@@ -6931,21 +6948,23 @@ impl App {
                 {
                     self.suppress_folder_nav_record_once = true;
                 }
-                // 履歴の戻る/進む・アドレスバー経由は自動フルスクリーンしない (ZIP/PDF と同じ)。
                 // ★固定 ガード等でブロックされたら Ignored を返し、後続の drill 進行に
                 // 流さない (Codex P1)。
-                return if self.open_archive_via_cache(path, cached, false) {
+                return if self.open_archive_via_cache(path, cached, auto_fullscreen) {
                     FolderOpenOutcome::Loaded
                 } else {
                     FolderOpenOutcome::Ignored
                 };
             } else {
-                return if self.request_archive_convert(path, format, false) {
+                return if self.request_archive_convert(path, format, auto_fullscreen) {
                     FolderOpenOutcome::ConversionDialogOpened
                 } else {
                     FolderOpenOutcome::Ignored
                 };
             }
+        }
+        if auto_fullscreen && path.is_file() && crate::folder_tree::is_virtual_folder(&path) {
+            self.pending_auto_fs_open = true;
         }
         self.load_folder(path);
         FolderOpenOutcome::Loaded
@@ -8744,6 +8763,7 @@ impl App {
                 target: None,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_open_resume.resumes(),
+                preserve_after_password_prompt: true,
             });
         }
 
@@ -9471,6 +9491,7 @@ impl App {
                 target: None,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_open_resume.resumes(),
+                preserve_after_password_prompt: true,
             });
         }
 
@@ -9905,15 +9926,7 @@ impl App {
                         self.pdf_passwords.remove(&pdf_path);
                         self.pdf_passwords.save();
                     }
-                    // Ctrl+↑↓ 由来の deferred fullscreen 意図は破棄する
-                    // (パスワード入力後に再び fullscreen にしたければユーザーが手動で開く)。
-                    self.fs_nav_after_pdf_enumerate = None;
-                    // パスワード保護 PDF + placeholder 無しの場合、`load_pdf_as_folder`
-                    // 経路では `items_generation` が進んでいないため、`poll_fs_nav_lock`
-                    // が `items_generation <= locked_gen` で永久にロック解除しない
-                    // (= holdover が居座る)。defer フラグ破棄と一緒に nav lock も
-                    // 明示 release する (Codex 第 3 ラウンド P2)。
-                    self.release_fs_nav_lock();
+                    self.prepare_deferred_reopen_for_pdf_password_prompt();
                     // PDF メタキャッシュで placeholder grid を立てていた場合、レンダ
                     // できない N セルがそのまま残るので空に戻す (Codex P1 対応)。
                     // 空に戻すと render_grid の中央表示が「表示するファイルがありません」
@@ -9955,6 +9968,24 @@ impl App {
                 );
             }
         }
+    }
+
+    fn prepare_deferred_reopen_for_pdf_password_prompt(&mut self) {
+        let preserve_reopen = self
+            .fs_nav_after_pdf_enumerate
+            .as_ref()
+            .is_some_and(|deferred| deferred.preserve_after_password_prompt);
+        if !preserve_reopen {
+            // Ctrl+↑↓ 由来の deferred fullscreen 意図は破棄する
+            // (パスワード入力後に再び fullscreen にしたければユーザーが手動で開く)。
+            self.fs_nav_after_pdf_enumerate = None;
+        }
+        // パスワード保護 PDF + placeholder 無しの場合、`load_pdf_as_folder`
+        // 経路では `items_generation` が進んでいないため、`poll_fs_nav_lock`
+        // が `items_generation <= locked_gen` で永久にロック解除しない
+        // (= holdover が居座る)。明示オープン由来の reopen は残す場合でも、
+        // パスワード入力中の nav lock はここで解放する。
+        self.release_fs_nav_lock();
     }
 
     /// load_folder と load_zip_as_folder の共通処理。
@@ -16160,6 +16191,7 @@ impl App {
                 target: None,
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_nav_resume.resumes(),
+                preserve_after_password_prompt: false,
             });
             return "enumerate_defer";
         }
@@ -16173,6 +16205,7 @@ impl App {
                 target: None,
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
                 resume_to_last_page: self.settings.book_nav_resume.resumes(),
+                preserve_after_password_prompt: false,
             });
             return "enumerate_defer";
         }

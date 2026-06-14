@@ -121,6 +121,8 @@ impl crate::app::App {
             self.pdf_password_error = None;
             self.pdf_password_pending_path = None;
             self.pdf_password_pending_save = None;
+            self.fs_nav_after_pdf_enumerate = None;
+            self.release_fs_nav_lock();
             // Codex High 指摘: ★付き PDF を開こうとして suppression を立てた直後に
             // パスワードダイアログをキャンセルすると、load_pdf_as_folder の start_loading_items
             // に到達せず suppression が永続化する。実際にはファイルを開けていないので

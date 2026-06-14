@@ -203,16 +203,24 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 
 ### 2.3 自動 1 ページ目フルスクリーン (`auto_fullscreen_zip_pdf`)
 
-環境設定 ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開くと、ページ一覧
-(L2) を経由せず 1 ページ目を直接フルスクリーン (L3) で開く**。MangaMeeya 風の
-「本棚 → 本を開く → 読む → 閉じて本棚」フロー。
+環境設定 ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く、または
+起動引数 / SendTo / 外部ファイラから ZIP/PDF/対応アーカイブを直接開くと、ページ一覧
+(L2) を経由せずページを直接フルスクリーン (L3) で開く**。MangaMeeya 風の
+「本棚 → 本を開く → 読む → 閉じて本棚」フロー。開く位置は `book_open_resume`
+(続きから / 先頭から) に従う。
 
 - グリッド側の open (`ui_main` ダブルクリック / `handle_keyboard` Enter) で
   `pending_auto_fs_open` を立てる (ZipFile/PdfFile のみ。Folder は対象外)。
+- 起動パス / 既存インスタンス転送 (`open_startup_path`) は、解決後の openable が
+  ZIP/CBZ/PDF または RAR/CBR/7z/CB7/LZH/LHA のときだけ同じ明示オープン意図を渡す。
+  変換アーカイブは `archive_convert_without_dialog` など既存の変換設定に従い、
+  キャッシュヒット / 変換確認 / 自動変換の後で同じ deferred fullscreen 経路に入る。
 - `load_zip_as_folder` / `load_pdf_as_folder` がこれを `mem::take` し、enumerate 完了で
   先頭画像を開く既存の遅延機構 `fs_nav_after_pdf_enumerate` (`DeferredFsReopen`) に
   載せ替える。Ctrl+↑↓ フォルダナビと同じ consume 経路 (`finalize_zip_enumerate` /
   `poll_pdf_enumerate`) で `find_fullscreen_nav_target_filtered` が先頭ページを開く。
+- パスワード付き PDF では、grid / 起動パス / SendTo 由来の明示オープン予約だけを
+  入力ダイアログ後まで維持する。Ctrl+↑↓ 由来の deferred reopen は従来どおり破棄する。
 
 ### 退出ルーティング = 「設定で固定分岐」(一時フラグなし)
 

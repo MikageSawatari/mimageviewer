@@ -1713,9 +1713,10 @@ pub struct Settings {
     #[serde(default = "default_continuous_reading_gamepad_scroll_percent_per_sec")]
     pub continuous_reading_gamepad_scroll_percent_per_sec: u32,
 
-    /// ZIP/PDF を一覧から開いたとき、ページ一覧を経由せず 1 ページ目を即フルスクリーンで
-    /// 開く。ON のときフルスクリーン中の Esc/Enter は親フォルダ (一覧) へ戻り、
-    /// Backspace でコンテナのページ一覧を表示する。既定 OFF (従来どおりページ一覧を表示)。
+    /// ZIP/PDF/対応アーカイブを一覧や起動引数/SendTo から明示的に開いたとき、
+    /// ページ一覧を経由せずページを即フルスクリーンで開く。ON のときフルスクリーン中の
+    /// Esc/Enter は親フォルダ (一覧) へ戻り、Backspace でコンテナのページ一覧を表示する。
+    /// 既定 OFF (従来どおりページ一覧を表示)。
     #[serde(default)]
     pub auto_fullscreen_zip_pdf: bool,
 
@@ -1963,8 +1964,9 @@ pub struct Settings {
     /// (位置復元マトリクス「動画 × Ctrl+↑↓ 移動」。既定 = 続きから = 従来挙動)
     #[serde(default)]
     pub video_nav_resume: ResumeMode,
-    /// ZIP/PDF を一覧から開いたとき、保存済み読書位置 (続き) から開くか先頭からか。
-    /// (位置復元マトリクス「ZIP/PDF × 一覧から開く」。既定 = 続きから = 従来挙動)
+    /// ZIP/PDF を一覧や起動引数/SendTo から開いたとき、保存済み読書位置 (続き)
+    /// から開くか先頭からか。
+    /// (位置復元マトリクス「ZIP/PDF × 明示オープン」。既定 = 続きから = 従来挙動)
     #[serde(default)]
     pub book_open_resume: ResumeMode,
     /// ZIP/PDF を Ctrl+↑↓ フォルダナビで移動したとき、続きから開くか先頭からか。

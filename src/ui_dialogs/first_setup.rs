@@ -66,7 +66,7 @@ impl App {
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(8.0);
-            ui.label(egui::RichText::new("ZIP/PDF ファイル").strong());
+            ui.label(egui::RichText::new("ZIP/PDF/対応アーカイブ").strong());
             ui.radio_value(
                 &mut self.settings.auto_fullscreen_zip_pdf,
                 false,

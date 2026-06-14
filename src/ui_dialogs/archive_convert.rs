@@ -163,7 +163,7 @@ impl App {
     /// pending_nav 経路は `show_archive_convert_dialog` 内で直接処理する
     /// (そちらは `archive_convert` のライフサイクルと絡むため)。
     /// `auto_fullscreen` は **明示的なオープン** (グリッド Enter / ダブルクリック /
-    /// ゲームパッド × 設定 ON) のときだけ true。履歴の戻る/進む・アドレスバー経由の
+    /// ゲームパッド / 起動引数・SendTo × 設定 ON) のときだけ true。履歴の戻る/進む・アドレスバー経由の
     /// `load_folder_or_convert_archive` からは false で呼び、ZIP/PDF と挙動を揃える
     /// (ZIP/PDF も明示オープン時のみ自動フルスクリーン)。`load_folder(cache_zip)` →
     /// `load_zip_as_folder` が同フレームで `pending_auto_fs_open` を消化するので stale 化しない。

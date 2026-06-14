@@ -75,7 +75,7 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(14.0);
     ui.separator();
     ui.add_space(8.0);
-    ui.label(egui::RichText::new("ZIP/PDF ファイル").strong());
+    ui.label(egui::RichText::new("ZIP/PDF/対応アーカイブ").strong());
     ui.add_space(4.0);
     ui.radio_value(
         &mut state.settings.auto_fullscreen_zip_pdf,
@@ -91,7 +91,8 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
         egui::RichText::new(
             "ページをフルスクリーン表示する場合、開く位置 (1 ページ目 / 続きから) は\
              「位置の復元」設定に従います。フルスクリーン中の Enter / Esc で元の一覧へ戻り、\
-             Backspace でそのファイルのページ一覧を表示します。",
+             Backspace でそのファイルのページ一覧を表示します。外部ファイラや SendTo から\
+             開いた本にも適用されます。",
         )
         .weak(),
     );

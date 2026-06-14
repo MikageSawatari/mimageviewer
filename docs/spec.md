@@ -683,11 +683,19 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 そのファイルをフルスクリーンで開く。ショートカットへのドラッグ＆ドロップや
 SendTo は Windows が対象パスを位置引数として渡すため、この経路で処理する。
 
+`auto_fullscreen_zip_pdf` が ON の場合、起動引数 / SendTo / 外部ファイラ経由で
+ZIP / CBZ / PDF / 対応アーカイブを直接開いたときも、一覧で Enter / ダブルクリックした
+場合と同じ明示オープンとして扱い、ページ一覧を経由せずフルスクリーン表示へ進む。
+RAR / CBR / 7z / CB7 / LZH / LHA は既存の変換設定に従い、確認が必要なら変換ダイアログ、
+表示しない設定なら自動変換を挟んでから開く。パスワード付き PDF は既存のパスワード
+ダイアログと保存済みパスワードを使い、入力成功後に明示オープン時のフルスクリーン
+予約を継続する。
+
 既存インスタンスが起動中の場合、2 個目のプロセスは Named Pipe
 (`single_instance::OPEN_PATH_PIPE_NAME`) でパスを既存インスタンスへ送信し、
 従来の activate event でウィンドウ復帰も要求してから終了する。既存インスタンスは
-受信パスを UI スレッドの channel に積み、`load_folder_or_convert_archive` と同じ
-ロード経路で開く。これにより、変換アーカイブの確認ダイアログ、★固定中の移動ガード、
+受信パスを UI スレッドの channel に積み、起動時と同じ明示オープン経路で開く。
+これにより、変換アーカイブの確認ダイアログ、★固定中の移動ガード、
 フォルダツリーペインの現在地同期は通常ナビゲーションと同じ規則に従う。
 
 ### エクスプローラ連携 (SendTo)
@@ -738,7 +746,7 @@ SendTo から渡されたファイル / フォルダは Windows により位置�
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ZIP・PDF の開き方) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
 | `ai_feature_mode` | AiFeatureMode | Light | AI 機能の利用範囲。`disabled`=AI なし、`light`=高速汎用 + 漫画トーン保持のみ、`high_quality`=全アップスケールモデル + ノイズ除去。初回セットアップと環境設定には、GPU 負荷が高く低スペック環境では OFF 推奨である案内とオンラインマニュアルの処理時間目安へのリンクを表示する |
-| `auto_fullscreen_zip_pdf` | bool | false | ZIP/PDF を一覧から開いたとき、ページ一覧を経由せずページをフルスクリーンで表示する。開く位置 (1 ページ目 / 続きから) は位置復元マトリクスの `book_open_resume` に従う。フルスクリーン中の Esc/Enter で親一覧 (L1)、Backspace でそのファイルのページ一覧 (L2) へ戻る |
+| `auto_fullscreen_zip_pdf` | bool | false | ZIP/PDF/対応アーカイブを一覧、起動引数、SendTo、外部ファイラ経由で明示的に開いたとき、ページ一覧を経由せずページをフルスクリーンで表示する。開く位置 (1 ページ目 / 続きから) は位置復元マトリクスの `book_open_resume` に従う。フルスクリーン中の Esc/Enter で親一覧 (L1)、Backspace でそのファイルのページ一覧 (L2) へ戻る |
 | `fullscreen_fit_mode` | FullscreenFitMode | Page | フルスクリーンのズーム/フィット基準。ページ全体 / ページ全体+余白カット / 横幅 / 縦幅 / 100%原寸 |
 | `fullscreen_fit_no_upscale` | bool | false | 自動フィット時に 100% を超える拡大をしない。手動ズームは制限しない |
 | `fullscreen_fit_no_downscale` | bool | false | 自動フィット時に 100% 未満へ縮小しない。ON の場合、画像が画面外へはみ出す表示でもパンできる |
