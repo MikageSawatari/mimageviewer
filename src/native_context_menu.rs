@@ -6,6 +6,23 @@
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellClipboardVerb {
+    Copy,
+    Cut,
+    Paste,
+}
+
+impl ShellClipboardVerb {
+    fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Cut => "cut",
+            Self::Paste => "paste",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeMivCommand {
     CopyPath,
     CopyFileName,
@@ -61,6 +78,24 @@ pub fn show_native_context_menu(request: NativeContextMenuRequest) -> NativeCont
     windows_impl::show_native_context_menu(request)
 }
 
+#[cfg(windows)]
+pub fn invoke_shell_file_verb(
+    hwnd: isize,
+    paths: &[PathBuf],
+    verb: ShellClipboardVerb,
+) -> Result<(), String> {
+    windows_impl::invoke_shell_file_verb(hwnd, paths, verb)
+}
+
+#[cfg(windows)]
+pub fn invoke_shell_folder_background_verb(
+    hwnd: isize,
+    folder: &std::path::Path,
+    verb: ShellClipboardVerb,
+) -> Result<(), String> {
+    windows_impl::invoke_shell_folder_background_verb(hwnd, folder, verb)
+}
+
 #[cfg(not(windows))]
 pub fn show_native_context_menu(request: NativeContextMenuRequest) -> NativeContextMenuResult {
     let _ = request;
@@ -69,9 +104,30 @@ pub fn show_native_context_menu(request: NativeContextMenuRequest) -> NativeCont
     }
 }
 
+#[cfg(not(windows))]
+pub fn invoke_shell_file_verb(
+    hwnd: isize,
+    paths: &[PathBuf],
+    verb: ShellClipboardVerb,
+) -> Result<(), String> {
+    let _ = (hwnd, paths, verb);
+    Err("Shell clipboard verbs are available only on Windows".to_string())
+}
+
+#[cfg(not(windows))]
+pub fn invoke_shell_folder_background_verb(
+    hwnd: isize,
+    folder: &std::path::Path,
+    verb: ShellClipboardVerb,
+) -> Result<(), String> {
+    let _ = (hwnd, folder, verb);
+    Err("Shell clipboard verbs are available only on Windows".to_string())
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
+    use std::ffi::CString;
     use std::os::windows::ffi::OsStrExt;
 
     use windows::Win32::Foundation::{
@@ -238,9 +294,67 @@ mod windows_impl {
         }
     }
 
+    pub(super) fn invoke_shell_file_verb(
+        hwnd: isize,
+        paths: &[PathBuf],
+        verb: ShellClipboardVerb,
+    ) -> Result<(), String> {
+        if hwnd == 0 {
+            return Err("main HWND is not available".to_string());
+        }
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let _com = ComStaGuard::new()?;
+        let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+        let menu = shell_context_menu_for_paths(paths)?;
+        let popup = MenuGuard::new(
+            unsafe { CreatePopupMenu() }.map_err(|e| format!("CreatePopupMenu failed: {e}"))?,
+        );
+        query_shell_context_menu(&menu, popup.handle(), 0)?;
+        invoke_canonical_verb(&menu, hwnd, verb)
+    }
+
+    pub(super) fn invoke_shell_folder_background_verb(
+        hwnd: isize,
+        folder: &std::path::Path,
+        verb: ShellClipboardVerb,
+    ) -> Result<(), String> {
+        if hwnd == 0 {
+            return Err("main HWND is not available".to_string());
+        }
+        let _com = ComStaGuard::new()?;
+        let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+        let menu = shell_context_menu_for_folder_background(hwnd, folder)?;
+        let popup = MenuGuard::new(
+            unsafe { CreatePopupMenu() }.map_err(|e| format!("CreatePopupMenu failed: {e}"))?,
+        );
+        query_shell_context_menu(&menu, popup.handle(), 0)?;
+        invoke_canonical_verb(&menu, hwnd, verb)
+    }
+
     fn append_menu_string(menu: HMENU, id: u32, label: &str) -> windows::core::Result<()> {
         let wide = wide_null(label);
         unsafe { AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(wide.as_ptr())) }
+    }
+
+    fn invoke_canonical_verb(
+        shell_menu: &IContextMenu,
+        hwnd: HWND,
+        verb: ShellClipboardVerb,
+    ) -> Result<(), String> {
+        let verb_name = verb.canonical_name();
+        let verb_cstr = CString::new(verb_name).expect("static Shell verb has no NUL");
+        let invoke = CMINVOKECOMMANDINFO {
+            cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+            hwnd,
+            lpVerb: PCSTR(verb_cstr.as_ptr() as *const u8),
+            nShow: SW_SHOWNORMAL.0,
+            hIcon: HANDLE::default(),
+            ..Default::default()
+        };
+        unsafe { shell_menu.InvokeCommand(&invoke) }
+            .map_err(|e| format!("IContextMenu::InvokeCommand({verb_name}) failed: {e}"))
     }
 
     fn query_shell_context_menu(
@@ -519,5 +633,12 @@ mod tests {
         assert_eq!(shell_verb_offset(SHELL_ID_FIRST), Some(0));
         assert_eq!(shell_verb_offset(SHELL_ID_FIRST + 12), Some(12));
         assert_eq!(shell_verb_offset(0), None);
+    }
+
+    #[test]
+    fn shell_clipboard_verbs_use_canonical_shell_names() {
+        assert_eq!(ShellClipboardVerb::Copy.canonical_name(), "copy");
+        assert_eq!(ShellClipboardVerb::Cut.canonical_name(), "cut");
+        assert_eq!(ShellClipboardVerb::Paste.canonical_name(), "paste");
     }
 }

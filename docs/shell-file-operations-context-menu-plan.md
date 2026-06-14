@@ -279,15 +279,22 @@ Reload behavior:
 
 The target is to remove PowerShell from copy/cut/paste, but it can be phased.
 
-Recommended sequence:
+Current status:
 
-1. Replace paste/drop-to-folder internals with `IFileOperation` first. This
-   fixes folder support, collision prompts, progress UI, and permanent-delete
-   safety where it matters most.
-2. For Ctrl+C/Ctrl+X on real filesystem selections, invoke Shell `copy`/`cut`
-   verbs through the native context menu helper or an explicit Shell verb helper
-   rather than writing a partial custom clipboard implementation.
-3. If a direct Shell clipboard writer is needed later, use the existing
+- Ctrl+C/Ctrl+X on real filesystem selections invokes Shell `copy`/`cut`
+  verbs through `src/native_context_menu.rs`.
+- Ctrl+V invokes the current real folder's Shell background `paste` verb. Folder
+  paste, collision prompts, and progress UI are therefore handled by Windows.
+- The legacy PowerShell clipboard helpers still exist for egui fallback menus
+  and drop/copy internals until the `IFileOperation` migration is complete.
+
+Remaining sequence:
+
+1. Replace drop-to-folder and egui fallback paste internals with
+   `IFileOperation`. This removes the remaining PowerShell path and keeps
+   folder support, collision prompts, progress UI, and permanent-delete safety
+   where it matters most.
+2. If a direct Shell clipboard writer is needed later, use the existing
    `IDataObject` path-building logic from `src/file_drag.rs` and add/override
    `CFSTR_PREFERREDDROPEFFECT` for cut. This likely requires a wrapper
    `IDataObject`; avoid that until the verb route is proven insufficient.
@@ -319,6 +326,8 @@ Current routing details:
   `IShellFolder::CreateViewObject(IContextMenu)` so Paste/New-style background
   verbs come from Shell instead of treating the current folder as a deletable
   selected object.
+- Keyboard Ctrl+C/Ctrl+X/Ctrl+V use the same native helper and canonical Shell
+  `copy`/`cut`/`paste` verbs instead of mIV's custom clipboard writer.
 - Checked selections use the Shell menu only when every checked item has a real
   file-operation path. Mixed real + ZIP/PDF virtual selections keep the egui
   fallback.

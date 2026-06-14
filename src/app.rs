@@ -17237,6 +17237,53 @@ impl App {
             || self.tag_view.has_focus
     }
 
+    fn collect_shell_clipboard_paths(&self) -> Vec<PathBuf> {
+        if !self.checked.is_empty() {
+            return self
+                .checked
+                .iter()
+                .filter_map(|&idx| {
+                    self.items
+                        .get(idx)
+                        .and_then(GridItem::drag_source_path)
+                        .map(PathBuf::from)
+                })
+                .collect();
+        }
+
+        self.selected
+            .and_then(|idx| self.items.get(idx))
+            .and_then(GridItem::drag_source_path)
+            .map(|path| vec![path.to_path_buf()])
+            .unwrap_or_default()
+    }
+
+    fn invoke_shell_clipboard_verb(
+        &mut self,
+        ctx: &egui::Context,
+        verb: crate::native_context_menu::ShellClipboardVerb,
+    ) {
+        let paths = self.collect_shell_clipboard_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let Some(hwnd) = self.main_hwnd else {
+            crate::logger::log(format!(
+                "shell_clipboard: {verb:?} skipped; main HWND unavailable"
+            ));
+            self.show_feedback_toast("OSクリップボード操作を開始できませんでした".to_string());
+            return;
+        };
+
+        match crate::native_context_menu::invoke_shell_file_verb(hwnd, &paths, verb) {
+            Ok(()) => ctx.request_repaint(),
+            Err(err) => {
+                crate::logger::log(format!("shell_clipboard: {verb:?} failed: {err}"));
+                self.show_feedback_toast("OSクリップボード操作に失敗しました".to_string());
+            }
+        }
+    }
+
     /// Ctrl+C / Ctrl+X / Ctrl+V ショートカットを処理する。
     fn handle_clipboard_shortcuts(&mut self, ctx: &egui::Context) {
         let main_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
@@ -17271,24 +17318,12 @@ impl App {
         };
 
         if ctrl_c || ctrl_x {
-            let paths = if !self.checked.is_empty() {
-                self.collect_checked_paths()
-            } else if let Some(idx) = self.selected {
-                self.items
-                    .get(idx)
-                    .and_then(GridItem::file_operation_path)
-                    .map(|p| vec![p.to_path_buf()])
-                    .unwrap_or_default()
+            let verb = if ctrl_x {
+                crate::native_context_menu::ShellClipboardVerb::Cut
             } else {
-                vec![]
+                crate::native_context_menu::ShellClipboardVerb::Copy
             };
-            if !paths.is_empty() {
-                if ctrl_x {
-                    crate::ui_dialogs::context_menu::cut_files_to_clipboard(&paths);
-                } else {
-                    crate::ui_dialogs::context_menu::copy_files_to_clipboard(&paths);
-                }
-            }
+            self.invoke_shell_clipboard_verb(ctx, verb);
         }
 
         if ctrl_v {
@@ -17298,9 +17333,20 @@ impl App {
                 || self.favsearch.on_results_grid()
                 || self.items_are_tag_view
                 || self.tag_view.on_results_grid();
-            if !on_search_results && let Some(folder) = self.current_favorite_target() {
-                let rx = crate::ui_dialogs::context_menu::paste_files_from_clipboard(&folder);
-                self.paste_pending.push(rx);
+            if !on_search_results
+                && let (Some(hwnd), Some(folder)) = (self.main_hwnd, self.current_favorite_target())
+            {
+                let result = crate::native_context_menu::invoke_shell_folder_background_verb(
+                    hwnd,
+                    &folder,
+                    crate::native_context_menu::ShellClipboardVerb::Paste,
+                );
+                match result {
+                    Ok(()) => ctx.request_repaint(),
+                    Err(err) => {
+                        crate::logger::log(format!("shell_clipboard: Paste failed: {err}"));
+                    }
+                }
             }
         }
     }

@@ -13182,6 +13182,38 @@ mod file_operation_selection_tests {
             "delete targets are sorted by descending index and exclude folders + virtual pages",
         );
     }
+
+    #[test]
+    fn shell_clipboard_paths_include_real_folders_and_skip_virtual_pages() {
+        let mut app = setup_app();
+
+        let folder = push_item(&mut app, GridItem::Folder(PathBuf::from(r"C:\books")));
+        let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
+        let zip_page = push_item(
+            &mut app,
+            GridItem::ZipImage {
+                zip_path: PathBuf::from(r"C:\books\a.zip"),
+                entry_name: "p001.jpg".to_owned(),
+            },
+        );
+
+        app.selected = Some(folder);
+        assert_eq!(
+            app.collect_shell_clipboard_paths(),
+            vec![PathBuf::from(r"C:\books")]
+        );
+
+        app.checked.insert(folder);
+        app.checked.insert(image);
+        app.checked.insert(zip_page);
+
+        let mut paths = app.collect_shell_clipboard_paths();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from(r"C:\books"), PathBuf::from(r"C:\books\a.jpg")]
+        );
+    }
 }
 
 #[cfg(test)]
