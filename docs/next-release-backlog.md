@@ -368,23 +368,101 @@ Source thread: https://egg.5ch.io/test/read.cgi/software/1752914772/
 
 ### 4.11 Startup/CLI archive fullscreen open
 
-- Source: 762.
+- Source: 762, 764.
 - Request: When launching from an external filer as `mImageViewer.exe Filename.zip`, skip the thumbnail grid and open the archive directly in fullscreen. User suggested either an option or a command-line option.
+- Current response:
+  - Acknowledged in thread after v1.5.0 release.
+  - v1.5.0 does not include this fix.
+  - Plan is to make the existing `Settings -> General -> ZIP/PDF file -> open pages in fullscreen` behavior also apply when opening from an external filer, SendTo, or startup command-line path.
 - Current behavior:
   - The first positional command-line argument is parsed as `startup_open_path`.
   - ZIP/CBZ/PDF paths are resolved as openable virtual folders and loaded into the normal grid/list view.
   - The existing `auto_fullscreen_zip_pdf` setting is only applied when opening ZIP/PDF from the grid via Enter, double-click, or gamepad. Startup paths do not set `pending_auto_fs_open`, so this setting does not currently make `mImageViewer.exe book.zip` open fullscreen.
   - Image/video startup paths do open fullscreen through `startup_file_should_open_fullscreen`, but ZIP/PDF/convertible archive startup paths do not.
 - Proposed design:
-  - Prefer an explicit command-line flag such as `--fullscreen` / `--open-fullscreen` so external filers can opt in per invocation without changing the global setting.
-  - Pass a startup open request struct instead of only `PathBuf`, carrying the requested fullscreen mode.
+  - First make the existing `auto_fullscreen_zip_pdf` setting apply consistently to startup/open-path requests.
   - For ZIP/CBZ/PDF, set the same one-shot auto-open state used by grid opens before loading the virtual folder.
-  - For convertible archives, carry the fullscreen intent through cache lookup / conversion so cached archives can open fullscreen after loading. For uncached archives, decide whether to open fullscreen after conversion completes or only after explicit confirmation.
-  - Separately decide whether the existing global `auto_fullscreen_zip_pdf` should also apply to startup archive paths without the new flag.
+  - For convertible archives, decide whether this setting should apply as well. Cached archives can probably carry the fullscreen intent through cache lookup; uncached archives need a decision about conversion confirmation / progress before opening fullscreen.
+  - A dedicated command-line flag such as `--fullscreen` / `--open-fullscreen` can remain a later enhancement if users need per-invocation override independent of the global setting.
 - Tests:
-  - Command-line parser accepts the fullscreen flag before and after the path, including after `--`.
+  - ZIP/CBZ/PDF startup paths open fullscreen when `auto_fullscreen_zip_pdf=true`.
+  - ZIP/CBZ/PDF startup paths still open the page list when `auto_fullscreen_zip_pdf=false`.
   - First instance and existing-instance forwarding behave the same.
-  - ZIP/CBZ/PDF startup paths open fullscreen only when requested.
   - Image/video startup behavior remains unchanged.
-  - Convertible archives are covered for cached and uncached cases.
+  - Convertible archives are covered for the chosen scope (cached only or cached+uncached).
 - Priority: Future version. Useful for external filer workflows, but keep out of v1.5.0 unless the current release scope expands.
+
+### 4.12 v1.5.0 detail-view and page-label feedback
+
+- Source: 765.
+- Context:
+  - User tried the existing detail view after the v1.5.0 release.
+  - Feedback is mostly about making detail view usable as a filename-oriented selection mode.
+- Bug reports:
+  - Drive-list detail view shows an empty name and kind `Folder`; expected name = drive letter and kind = `Drive`.
+  - ZIP file kind appears as `ZIP ZIP`; expected just `ZIP`.
+- Detail-view requests:
+  - Allow column widths to be changed by mouse drag.
+  - Allow column order to be customized. Current order mentioned by user: name, rating, tags, kind, size, modified time, status.
+  - Revisit row separator styling. Current separator appears every 2 rows and feels odd; user suggested every row or no separator.
+  - Allow modified time to display seconds.
+  - Add KB to automatic size units.
+  - Add an option to display exact byte size without a unit, useful for distinguishing near-identical files.
+- Page-label request:
+  - v1.5.0 page labels use different separators depending on spread direction, e.g. right-bound `3,2 / 200` and left-bound `3-2 / 200`.
+  - User suggests unifying the separator style.
+  - `3,2 / 200` is hard to read; add spacing such as `3 , 2 / 200` or use a spaced hyphen style such as `3 - 2 / 200`.
+- Proposed design notes:
+  - Treat the two detail-view bugs as small correctness fixes.
+  - Column width / column order persistence should align with `details-view-and-filter-plan.md` column operation notes; avoid synchronous metadata work on the UI thread.
+  - Size formatting should be centralized so detail view, tooltips, and any future metadata display do not drift.
+  - Page-label formatting should use the existing shared fullscreen formatter used by the overlay and seek bar.
+- Priority:
+  - High for the two detail-view bugs and page-label readability/consistency.
+  - Medium for configurable column widths/order and detailed size/time formatting.
+
+### 4.13 v1.5.0 nested archive / spread / AI cache feedback
+
+- Source: 766.
+- Context:
+  - User verified v1.5.0 fixes related to nested ZIP/RAR handling, fullscreen Ctrl+↑/↓ movement, and spread display.
+  - Feedback includes two bug reports and two enhancement requests.
+- Bug report 1: Ctrl+↑/↓ skips converted RAR in one direction.
+  - In one of Ctrl+↑ / Ctrl+↓, a ZIP-converted RAR is skipped and navigation jumps to a ZIP archive instead.
+  - Which direction fails depends on sort order.
+  - Suspect area: fullscreen folder navigation / adjacent container traversal when `ConvertibleArchive` is represented by a converted cache ZIP plus `archive_source_override`.
+  - Response plan: acknowledge and investigate/reproduce.
+- Bug report 2: cover-spread mode + landscape pages can produce an extra single page / skipped page.
+  - In cover spread mode, after a non-cover landscape page, the following portrait page can be treated as a cover and shown alone.
+  - Not always reproducible according to the report.
+  - Related symptom: moving backward with Left can sometimes skip one image.
+  - Suspect area: spread pair resolution around cover mode, landscape auto-single display, and backward navigation index calculation.
+  - Response plan: acknowledge and investigate/reproduce.
+- Request 3: allow AI upscale on larger joined landscape scans.
+  - User mentioned splitting landscape images that are actually two-page joined scans down the center, then AI-upscaling per half.
+  - Interpreted need after discussion: the main pain is that combined landscape scans can exceed the AI process threshold, so AI upscale is skipped even when the user is willing to wait for a heavy high-quality pass.
+  - Current status: size-limit options already include up to the 4096x4096-under class, so this request is about images beyond that range.
+  - Design notes:
+    - The AI upscale implementation already processes images in internal tiles, so manually splitting a joined spread into left/right halves is not expected to materially reduce total inference work.
+    - If both halves are displayed together as a spread, final GPU texture memory is also roughly proportional to total pixels either way.
+    - Left/right splitting could help with per-texture limits or peak intermediate memory in some designs, but it would add virtual-page complexity across spread pairing, page numbering, cache keys, rotation, crop, adjustments, export/capture, and ordinary landscape images that should not be split.
+    - Decision for now: do not implement joined-image left/right split as part of this request. Prefer explicit high-load size-limit options above the current 4096x4096-under class, with clear wording that processing time and memory usage can be large.
+    - Keep the final rendered AI output within the existing GPU texture compatibility limit (currently treated as 8192px per side) and validate memory behavior before exposing very large presets.
+- Request 4: keep AI/fullscreen cache after fullscreen is dismissed.
+  - User reports that when AI-upscaled fullscreen cache exists, moving focus or otherwise leaving fullscreen clears the cache.
+  - Requested behavior: either keep fullscreen from being dismissed, or keep the AI cache alive after dismissal.
+  - Current likely behavior:
+    - `close_fullscreen()` clears `fs_cache`, `edit_result_cache`, `final_ai_cache`, `final_composite_cache`, legacy `ai_upscale_cache`, and pending fullscreen / AI work.
+    - During fullscreen, final AI cache eviction is keep-set based; after fullscreen closes it is cleared globally.
+  - Interpretation:
+    - The request likely means: after accidentally leaving fullscreen or switching focus, reopening the same page should not require AI upscale to run again; keep several recently processed fullscreen pages in memory.
+    - This is not the archive conversion cache or thumbnail cache. It is the in-memory final display / AI pipeline cache.
+  - Design notes:
+    - A "do not close fullscreen on focus loss" option may be separate from cache retention and should be investigated against current fullscreen focus/viewport behavior.
+    - Keeping final AI results after fullscreen close can consume large memory (4x/full-resolution pages can be tens to hundreds of MB per page), so any retention needs a page-count or byte/megapixel budget and clear eviction rules.
+    - Must avoid stale idx-keyed cache reuse after folder reload, sort/filter changes, or search result item replacement. Prefer path/edit-key based cache keys or clear on any item-generation boundary.
+    - Consider first adding diagnostics / reproduction steps to confirm whether the user sees actual AI recomputation or just GPU texture re-upload from retained pixels.
+- Priority:
+  - High for bug reports 1 and 2 once reproducible.
+  - Medium for request 3 if a bounded high-load threshold option is straightforward; low for any left/right virtual split implementation.
+  - Medium for request 4 if it is causing repeated long waits; design carefully because memory pressure risk is high.
