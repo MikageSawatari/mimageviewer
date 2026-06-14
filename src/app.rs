@@ -7339,6 +7339,19 @@ impl App {
         self.load_folder_or_convert_archive_with_auto_fullscreen(path, false)
     }
 
+    fn load_folder_nav_target(
+        &mut self,
+        path: PathBuf,
+        pre_scan: Option<ScannedDir>,
+    ) -> FolderOpenOutcome {
+        if path.is_file() && crate::folder_tree::is_convertible_archive_path(&path) {
+            self.load_folder_or_convert_archive(path)
+        } else {
+            self.load_folder_with_scan(path, pre_scan);
+            FolderOpenOutcome::Loaded
+        }
+    }
+
     /// 通常のフォルダ / ZIP / PDF はそのまま開き、変換対応アーカイブ (RAR/7z/LZH)
     /// は有効なキャッシュがあれば元パス表示を維持したまま開く。未変換なら既存の
     /// 変換確認ダイアログを出す。
@@ -17022,7 +17035,13 @@ impl App {
         let scanned = result.scanned;
         match result.mode {
             FolderNavMode::Grid | FolderNavMode::SiblingGrid => {
-                self.load_folder_with_scan(path, scanned);
+                if !matches!(
+                    self.load_folder_nav_target(path, scanned),
+                    FolderOpenOutcome::Loaded
+                ) {
+                    self.clear_pending_folder_nav_steps();
+                    self.release_fs_nav_lock();
+                }
             }
             FolderNavMode::Fullscreen
             | FolderNavMode::SiblingFullscreen
@@ -17039,7 +17058,18 @@ impl App {
                 // 注: close_fullscreen は slideshow_playing=false にするが、SlideshowNext は
                 // resume_slideshow フラグ (= reopen 側で再開) で復帰するので問題ない。
                 self.close_fullscreen_for_folder_nav_reopen();
-                self.load_folder_with_scan(path, scanned);
+                let open_outcome = self.load_folder_nav_target(path, scanned);
+                if !matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                    self.clear_pending_folder_nav_steps();
+                    self.release_fs_nav_lock();
+                    let reason = match open_outcome {
+                        FolderOpenOutcome::ConversionDialogOpened => "conversion_dialog",
+                        FolderOpenOutcome::Ignored => "open_ignored",
+                        FolderOpenOutcome::Loaded => "done",
+                    };
+                    emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
+                    return;
+                }
                 let reason = self.reopen_fullscreen_after_folder_nav_load(
                     ctx,
                     restore_video_tile,
@@ -17072,16 +17102,27 @@ impl App {
                         emit_end(apply_t0, apply_seq, apply_mode_tag, "fs_boundary");
                         return;
                     }
-                    // サブツリー内 — 通常の DFS 移動としてスタックに push
+                    // サブツリー内 — 通常の DFS 移動として開き、成功したらスタックに push
                     #[cfg(windows)]
                     let restore_video_tile = fullscreen && self.video_tile_mode_active;
                     #[cfg(not(windows))]
                     let restore_video_tile = false;
-                    self.favsearch.nav_stack.push(path.clone());
                     if fullscreen {
                         self.close_fullscreen_for_folder_nav_reopen();
                     }
-                    self.load_folder_with_scan(path, scanned);
+                    let open_outcome = self.load_folder_nav_target(path.clone(), scanned);
+                    if !matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                        self.clear_pending_folder_nav_steps();
+                        self.release_fs_nav_lock();
+                        let reason = match open_outcome {
+                            FolderOpenOutcome::ConversionDialogOpened => "conversion_dialog",
+                            FolderOpenOutcome::Ignored => "open_ignored",
+                            FolderOpenOutcome::Loaded => "done",
+                        };
+                        emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
+                        return;
+                    }
+                    self.favsearch.nav_stack.push(path.clone());
                     self.update_favsearch_address();
                     if fullscreen {
                         let reason = self.reopen_fullscreen_after_folder_nav_load(
@@ -17175,11 +17216,12 @@ impl App {
             return Some(idx);
         }
 
-        // 画像系が無い: 先頭の ZIP/PDF ファイルを仮想フォルダとして開いて中身を取り出す。
-        // ZIP/PDF の選び方も同様に「先頭」固定。
+        // 画像系が無い: 先頭のコンテナファイルを開いて中身を取り出す。
+        // ZIP/PDF/変換アーカイブの選び方も同様に「先頭」固定。
         let pick_virtual = |i: usize, items: &[GridItem]| -> Option<PathBuf> {
             match items.get(i) {
                 Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => Some(p.clone()),
+                Some(GridItem::ConvertibleArchive { path, .. }) => Some(path.clone()),
                 _ => None,
             }
         };
@@ -17188,7 +17230,12 @@ impl App {
             .iter()
             .copied()
             .find_map(|i| pick_virtual(i, &self.items))?;
-        self.load_folder(virtual_path);
+        if !matches!(
+            self.load_folder_nav_target(virtual_path, None),
+            FolderOpenOutcome::Loaded
+        ) {
+            return None;
+        }
         find_image(self)
     }
 

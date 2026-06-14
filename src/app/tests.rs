@@ -3382,13 +3382,13 @@ mod phase_c_drill_nav_tests {
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         assert_eq!(
             app.fullscreen_page_number_label(1).as_deref(),
-            Some("1-2 / 4")
+            Some("1, 2 / 4")
         );
 
         app.spread_mode = crate::settings::SpreadMode::Rtl;
         assert_eq!(
             app.fullscreen_page_number_label(1).as_deref(),
-            Some("2,1 / 4")
+            Some("2, 1 / 4")
         );
     }
 
@@ -4854,6 +4854,113 @@ mod favorite_adjustment_defaults_tests {
         );
         assert!(app.continuous_reading_active_for_idx(0));
         assert!(app.continuous_reading_active_for_idx(1));
+    }
+
+    #[test]
+    fn bug766_spread_pair_resyncs_after_landscape_in_cover_mode() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::SpreadPair;
+
+        fn loaded_thumb(
+            ctx: &egui::Context,
+            label: &str,
+            source_dims: (u32, u32),
+        ) -> ThumbnailState {
+            ThumbnailState::Loaded {
+                tex: ctx.load_texture(
+                    label,
+                    egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                    egui::TextureOptions::LINEAR,
+                ),
+                from_cache: false,
+                rendered_at_px: 1,
+                source_dims: Some(source_dims),
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        for k in 0..7 {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/p/{k}.jpg"
+                ))));
+            let dims = if k == 3 { (1600, 900) } else { (900, 1600) };
+            app.thumbnails
+                .push(loaded_thumb(&ctx, &format!("spread-resync-{k}"), dims));
+        }
+        app.visible_indices = (0..7).collect();
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::LtrCover;
+
+        assert_eq!(app.resolve_spread_pair(0), SpreadPair::Single);
+        assert_eq!(
+            app.resolve_spread_pair(1),
+            SpreadPair::Double { left: 1, right: 2 }
+        );
+        assert_eq!(app.resolve_spread_pair(3), SpreadPair::Single);
+        assert_eq!(
+            app.resolve_spread_pair(4),
+            SpreadPair::Double { left: 4, right: 5 },
+            "横長単独ページの次は表紙扱いにせず、次ページと見開きに戻す"
+        );
+        assert_eq!(
+            app.resolve_spread_pair(5),
+            SpreadPair::Double { left: 4, right: 5 }
+        );
+    }
+
+    #[test]
+    fn bug766_spread_nav_delta_uses_display_units_around_landscape() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::settings::SpreadMode;
+
+        fn loaded_thumb(
+            ctx: &egui::Context,
+            label: &str,
+            source_dims: (u32, u32),
+        ) -> ThumbnailState {
+            ThumbnailState::Loaded {
+                tex: ctx.load_texture(
+                    label,
+                    egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                    egui::TextureOptions::LINEAR,
+                ),
+                from_cache: false,
+                rendered_at_px: 1,
+                source_dims: Some(source_dims),
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        for k in 0..7 {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/p/{k}.jpg"
+                ))));
+            let dims = if k == 3 { (1600, 900) } else { (900, 1600) };
+            app.thumbnails
+                .push(loaded_thumb(&ctx, &format!("spread-nav-{k}"), dims));
+        }
+        app.visible_indices = (0..7).collect();
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::LtrCover;
+
+        app.fullscreen_idx = Some(4);
+        assert_eq!(
+            app.spread_nav_delta(-1),
+            -1,
+            "横長単独ページの直後の見開きから戻ると横長ページへ戻る"
+        );
+
+        app.fullscreen_idx = Some(3);
+        assert_eq!(app.spread_nav_delta(1), 1);
+        assert_eq!(app.spread_nav_delta(-1), -2);
+
+        app.fullscreen_idx = Some(1);
+        assert_eq!(app.spread_nav_delta(1), 2);
     }
 
     #[test]

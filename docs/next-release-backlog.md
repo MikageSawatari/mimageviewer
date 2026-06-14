@@ -430,14 +430,14 @@ Source thread: https://egg.5ch.io/test/read.cgi/software/1752914772/
 - Bug report 1: Ctrl+↑/↓ skips converted RAR in one direction.
   - In one of Ctrl+↑ / Ctrl+↓, a ZIP-converted RAR is skipped and navigation jumps to a ZIP archive instead.
   - Which direction fails depends on sort order.
-  - Suspect area: fullscreen folder navigation / adjacent container traversal when `ConvertibleArchive` is represented by a converted cache ZIP plus `archive_source_override`.
-  - Response plan: acknowledge and investigate/reproduce.
+  - Status: fixed in current patch.
+  - Fix: `folder_should_stop` / `sorted_subdirs` now treat RAR/CBR/7z/CB7/LZH/LHA as folder-navigation container candidates (excluding non-first split RAR parts), and folder nav opens them through `load_folder_nav_target` so cached conversions use the same path as ZIP/PDF.
 - Bug report 2: cover-spread mode + landscape pages can produce an extra single page / skipped page.
   - In cover spread mode, after a non-cover landscape page, the following portrait page can be treated as a cover and shown alone.
   - Not always reproducible according to the report.
   - Related symptom: moving backward with Left can sometimes skip one image.
-  - Suspect area: spread pair resolution around cover mode, landscape auto-single display, and backward navigation index calculation.
-  - Response plan: acknowledge and investigate/reproduce.
+  - Status: fixed in current patch.
+  - Fix: spread mode now builds shared display units for normal spread drawing, navigation delta, normalization, and continuous reading. Cover pages, landscape pages, and tail pages are single units, and portrait pairing resumes immediately after a landscape single.
 - Request 3: allow AI upscale on larger joined landscape scans.
   - User mentioned splitting landscape images that are actually two-page joined scans down the center, then AI-upscaling per half.
   - Interpreted need after discussion: the main pain is that combined landscape scans can exceed the AI process threshold, so AI upscale is skipped even when the user is willing to wait for a heavy high-quality pass.

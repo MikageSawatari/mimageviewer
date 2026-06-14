@@ -122,6 +122,12 @@ pub fn is_convertible_archive_path(path: &Path) -> bool {
         .is_some()
 }
 
+fn is_folder_nav_file_candidate(path: &Path) -> bool {
+    is_virtual_folder(path)
+        || (is_convertible_archive_path(path)
+            && !crate::archive_converter::is_non_first_rar_part(path))
+}
+
 // -----------------------------------------------------------------------
 // 画像有無の判定
 // -----------------------------------------------------------------------
@@ -164,6 +170,9 @@ fn folder_qualifies(path: &Path, cancel: Option<&AtomicBool>, include_video: boo
     }
 
     if path.is_file() {
+        if is_convertible_archive_path(path) {
+            return !crate::archive_converter::is_non_first_rar_part(path);
+        }
         if !is_virtual_folder(path) {
             return false;
         }
@@ -429,8 +438,8 @@ pub fn walk_dirs_recursive_with_progress(
 // 共通ユーティリティ
 // -----------------------------------------------------------------------
 
-/// path 配下の "子フォルダ + .zip ファイル" をソート済みで返す。
-/// .zip もナビゲーション対象として扱う (タスク 3)。
+/// path 配下の "子フォルダ + 開けるコンテナファイル" をソート済みで返す。
+/// ZIP/PDF と変換アーカイブもナビゲーション対象として扱う。
 ///
 /// Phase 4 (spec §8): 旧版は内部で `Settings::load()` を呼んでいたが、boot race を
 /// 撲滅するため `FolderTreeOptions` を呼び出し側から受け取る形に変更
@@ -442,7 +451,7 @@ pub fn sorted_subdirs(path: &Path, opts: FolderTreeOptions) -> Vec<PathBuf> {
     // (PathBuf, mtime_secs) を蓄積。ソート時に mtime と name を引く。
     let mut dirs: Vec<(PathBuf, i64)> = Vec::new();
     let mut real_folder_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut zip_candidates: Vec<(PathBuf, i64)> = Vec::new();
+    let mut container_candidates: Vec<(PathBuf, i64)> = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(path) {
         for e in entries.flatten() {
@@ -476,14 +485,14 @@ pub fn sorted_subdirs(path: &Path, opts: FolderTreeOptions) -> Vec<PathBuf> {
                     real_folder_names.insert(name.to_lowercase());
                 }
                 dirs.push((p, mtime));
-            } else if ft.is_file() && is_virtual_folder(&p) {
-                zip_candidates.push((p, mtime));
+            } else if ft.is_file() && is_folder_nav_file_candidate(&p) {
+                container_candidates.push((p, mtime));
             }
         }
     }
 
-    // ZIP フィルタ: 同名フォルダがあればスキップ
-    for (zp, mtime) in zip_candidates {
+    // コンテナフィルタ: 同名フォルダがあればスキップ
+    for (zp, mtime) in container_candidates {
         if skip_zip {
             let stem = zp
                 .file_stem()
@@ -628,6 +637,42 @@ mod tests {
         let cbr = tmp.path().join("book.cbr");
         std::fs::write(&cbr, b"rar").unwrap();
         assert_eq!(resolve_openable_path(&cbr).as_deref(), Some(cbr.as_path()));
+    }
+
+    #[test]
+    fn bug766_folder_should_stop_convertible_archive_true() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rar = tmp.path().join("book.rar");
+        std::fs::write(&rar, b"rar").unwrap();
+
+        assert!(folder_should_stop(&rar, None));
+        assert!(folder_has_still_image(&rar, None));
+    }
+
+    #[test]
+    fn bug766_sorted_subdirs_includes_convertible_archives() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("folder")).unwrap();
+        for name in ["a.zip", "b.pdf", "c.rar", "d.7z", "e.lzh", "c.part02.rar"] {
+            std::fs::write(root.join(name), b"").unwrap();
+        }
+
+        let names: Vec<_> = sorted_subdirs(root, FolderTreeOptions::default())
+            .into_iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+
+        for expected in ["a.zip", "b.pdf", "c.rar", "d.7z", "e.lzh", "folder"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing {expected}: {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n == "c.part02.rar"),
+            "non-first split RAR parts must not become separate Ctrl+↑↓ targets: {names:?}"
+        );
     }
 
     #[test]

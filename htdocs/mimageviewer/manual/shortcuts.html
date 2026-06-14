@@ -82,8 +82,8 @@
           <tr><td><kbd>Page Up</kbd></td><td>1ページ上にスクロール</td></tr>
           <tr><td><kbd>Page Down</kbd></td><td>1ページ下にスクロール</td></tr>
           <tr><td><kbd>BS</kbd></td><td>親フォルダへ移動。検索中 (<kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>) は検索結果の階層を 1 段戻る。タグビュー (<kbd>Ctrl</kbd>+<kbd>T</kbd>) では、結果から開いたフォルダ・ZIP/PDF・アーカイブを 1 段戻る (最上位では何もしない。検索を閉じるには <kbd>Esc</kbd> や検索バーの <span aria-hidden="true">×</span> ボタン)</td></tr>
-          <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd></td><td>ツリー順で前のフォルダへ（★固定中は固定したリストの前へ）</td></tr>
-          <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>ツリー順で次のフォルダへ（★固定中は固定したリストの次へ）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd></td><td>ツリー順で前のフォルダ / ZIP / PDF / 変換アーカイブへ（★固定中は固定したリストの前へ）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>ツリー順で次のフォルダ / ZIP / PDF / 変換アーカイブへ（★固定中は固定したリストの次へ）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd></td><td>前 / 次の兄弟フォルダへ（現在地と同じ親の直下だけを対象にし、子や祖先の階層へは入らない）。グリッド・フルスクリーンで有効、検索中は無効。★固定中は固定したリストの前 / 次の画像・動画へ（フォルダ・ZIP・PDF は飛ばす）</td></tr>
           <tr><td><kbd>F</kbd></td><td>左側のフォルダツリーペインの表示 / 非表示を切り替え。表示時は現在フォルダへツリーカーソルを移動。閉じるときにツリーカーソルを別のフォルダへ動かしていれば、そのフォルダへ移動してサムネイル一覧へ戻ります</td></tr>
           <tr><td><kbd>T</kbd></td><td>選択中アイテムへタグを付ける/外すダイアログを開く</td></tr>
@@ -93,7 +93,7 @@
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        5 ボタンマウスの<strong>戻る／進むボタン</strong>は <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>Ctrl</kbd>+<kbd>↓</kbd> と同じ動作です (履歴ではなく、ツリー順の前／次フォルダへ移動)。グリッド表示・フルスクリーン表示・動画再生中のいずれでも使えます。
+        5 ボタンマウスの<strong>戻る／進むボタン</strong>は <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>Ctrl</kbd>+<kbd>↓</kbd> と同じ動作です (履歴ではなく、ツリー順の前／次フォルダ / ZIP / PDF / 変換アーカイブへ移動)。グリッド表示・フルスクリーン表示・動画再生中のいずれでも使えます。
       </div>
     </div>
 
@@ -259,8 +259,8 @@
           <tr><td><kbd>PageUp</kbd> / <kbd>PageDown</kbd></td><td>縦読み中は画面単位で上下スクロール</td></tr>
           <tr><td><kbd>Home</kbd></td><td>フォルダ内の最初の画像へ</td></tr>
           <tr><td><kbd>End</kbd></td><td>フォルダ内の最後の画像へ</td></tr>
-          <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>フルスクリーンのまま次フォルダの先頭画像へジャンプ</td></tr>
-          <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd></td><td>フルスクリーンのまま前フォルダの末尾画像へジャンプ</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↓</kbd></td><td>フルスクリーンのままツリー順で次のフォルダ / ZIP / PDF / 変換アーカイブへ移動し、先頭画像または動画を表示</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>↑</kbd></td><td>フルスクリーンのままツリー順で前のフォルダ / ZIP / PDF / 変換アーカイブへ移動し、先頭画像または動画を表示</td></tr>
           <tr><td><kbd>F11</kbd></td><td>全画面表示 ⇔ ウィンドウ内表示を切り替え (右上 × の左にあるトグルボタンと同じ動作。画像・動画とも有効。消しゴムモード中は無効。別ウィンドウ表示中は無効)</td></tr>
           <tr><td><kbd>F12</kbd></td><td>別ウィンドウ表示の ON / OFF を切り替え。ON 中は画像・動画を一覧とは独立した別ウィンドウで表示し、一覧のカーソルとビューアが連動する。<kbd>F11</kbd> の全画面 / ウィンドウ内選択は変更しない</td></tr>
           <tr><td><kbd>Esc</kbd> / <kbd>Enter</kbd></td><td>現在表示中の項目にカーソルを戻してグリッド表示に戻る（<kbd>Enter</kbd> は右手側ホームポジションから抜けるための代替キー）。「ZIP/PDF ファイル」を「ページを直接フルスクリーン表示」にしている場合、ZIP/PDF/変換アーカイブ内のページでは親のファイル一覧に戻る。動画再生中は <kbd>Enter</kbd> = 再生 / 一時停止のため <kbd>Esc</kbd> のみ有効</td></tr>

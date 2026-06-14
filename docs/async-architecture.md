@@ -140,7 +140,7 @@ Low が進む。不足する場面は「AC 電源時のみインデックス」�
 
 ### 3.1.5 フォルダナビゲーション (Ctrl+↑↓) のキャンセル + アキュームレート
 
-Ctrl+↑/↓ はフォルダツリーを DFS で辿って次の「画像/動画/ZIP/PDF があるフォルダ」を
+Ctrl+↑/↓ はフォルダツリーを DFS で辿って次の「画像/動画/ZIP/PDF/変換アーカイブがあるフォルダ」を
 見つけるが、キーリピート (30Hz) で連打すると、過去は毎プレスで新スレッドを spawn +
 旧スレッドに cancel を投げる設計だった。ただし `navigate_folder_with_skip` 自体は
 cancel を見ていなかったので、cancel 済みスレッドも DFS を最後まで走り切り、
@@ -171,9 +171,9 @@ Ctrl+↑↓ は 3 つの起点から発火し、DFS 完了時に異なる後処�
 
 | モード | 発火元 | DFS 完了時の処理 |
 | --- | --- | --- |
-| `Grid` | `navigate()` の Ctrl+↑↓ (通常グリッド) | `load_folder(p)` のみ |
-| `Fullscreen` | `handle_fs_navigation` の Ctrl+↑↓ (フルスクリーン中) | `close_fullscreen` → `load_folder(p)` → `open_fullscreen(先頭 image-like idx)` |
-| `Favsearch { root, fullscreen: false }` | `favsearch_ctrl_nav` (お気に入り検索中) | `is_under(p, root)` が真なら `nav_stack.push + load_folder + update_favsearch_address`、偽なら `favsearch_navigate_sibling(±1)` |
+| `Grid` | `navigate()` の Ctrl+↑↓ (通常グリッド) | `load_folder_nav_target(p)` のみ。RAR/7z/LZH などは変換ダイアログまたはキャッシュ経由で開く |
+| `Fullscreen` | `handle_fs_navigation` の Ctrl+↑↓ (フルスクリーン中) | `close_fullscreen` → `load_folder_nav_target(p)` → `open_fullscreen(先頭 image-like idx)` |
+| `Favsearch { root, fullscreen: false }` | `favsearch_ctrl_nav` (お気に入り検索中) | `is_under(p, root)` が真なら `load_folder_nav_target + nav_stack.push + update_favsearch_address`、偽なら `favsearch_navigate_sibling(±1)` |
 | `Favsearch { root, fullscreen: true }` | フルスクリーン中の Ctrl+S スコープナビ | 上記に加えて `close_fullscreen` → `open_fullscreen(先頭 image-like idx)` でフルスクリーンを維持 |
 
 実装上の要点:
@@ -183,6 +183,9 @@ Ctrl+↑↓ は 3 つの起点から発火し、DFS 完了時に異なる後処�
 - `apply_folder_nav_result` がモードに応じて分岐。Fullscreen ブランチで
   `close_fullscreen` を呼ぶが、そこは既に `folder_nav_pending = None` なので
   再帰的な自己キャンセルは起きない。
+- DFS の結果が変換アーカイブファイルの場合は `load_folder_nav_target` が
+  `load_folder_or_convert_archive` に振り分ける。変換確認ダイアログや無視結果では pending を解除し、
+  その時点ではフルスクリーン再オープンや検索 nav_stack 更新を行わない。
 - 連鎖ステップでも同じモードを引き継ぐ。`pending_folder_nav_mode` を App 側に保持し、
   `chain_folder_nav_if_pending` がそれを参照して次の `spawn_folder_nav` に渡す。
 - Favsearch モードでは起点フォルダが `nav_stack.last()` なので、連鎖時には

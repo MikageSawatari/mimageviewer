@@ -1868,7 +1868,12 @@ fn is_landscape(
     // フルサイズキャッシュから判定
     if let Some(entry) = fs_cache.get(&idx) {
         match entry {
-            FsCacheEntry::Static { tex, .. } => {
+            FsCacheEntry::Static {
+                tex, source_dims, ..
+            } => {
+                if let Some([w, h]) = source_dims {
+                    return w > h;
+                }
                 let s = tex.size_vec2();
                 return s.x > s.y;
             }
@@ -1887,11 +1892,121 @@ fn is_landscape(
         }
     }
     // サムネイルから判定
-    if let Some(ThumbnailState::Loaded { tex, .. }) = thumbnails.get(idx) {
+    if let Some(ThumbnailState::Loaded {
+        tex, source_dims, ..
+    }) = thumbnails.get(idx)
+    {
+        if let Some((w, h)) = source_dims {
+            return w > h;
+        }
         let s = tex.size_vec2();
         return s.x > s.y;
     }
     false
+}
+
+#[derive(Clone, Debug)]
+struct SpreadDisplayUnit {
+    nav_start: usize,
+    pages: Vec<usize>,
+}
+
+impl SpreadDisplayUnit {
+    fn anchor_idx(&self) -> usize {
+        self.pages[0]
+    }
+
+    fn nav_end_exclusive(&self) -> usize {
+        self.nav_start + self.pages.len()
+    }
+
+    fn contains_idx(&self, idx: usize) -> bool {
+        self.pages.contains(&idx)
+    }
+
+    fn screen_pages(&self, spread_mode: SpreadMode) -> Vec<usize> {
+        if self.pages.len() == 2 && spread_mode.is_rtl() {
+            vec![self.pages[1], self.pages[0]]
+        } else {
+            self.pages.clone()
+        }
+    }
+
+    fn spread_pair(&self, spread_mode: SpreadMode) -> SpreadPair {
+        if self.pages.len() != 2 {
+            return SpreadPair::Single;
+        }
+        if spread_mode.is_rtl() {
+            SpreadPair::Double {
+                left: self.pages[1],
+                right: self.pages[0],
+            }
+        } else {
+            SpreadPair::Double {
+                left: self.pages[0],
+                right: self.pages[1],
+            }
+        }
+    }
+}
+
+fn build_spread_display_units(
+    nav: &[usize],
+    spread_mode: SpreadMode,
+    fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
+    thumbnails: &[ThumbnailState],
+) -> Vec<SpreadDisplayUnit> {
+    let mut units = Vec::new();
+    let mut pos = 0usize;
+
+    if spread_mode.has_cover() && !nav.is_empty() {
+        units.push(SpreadDisplayUnit {
+            nav_start: 0,
+            pages: vec![nav[0]],
+        });
+        pos = 1;
+    }
+
+    while pos < nav.len() {
+        let current = nav[pos];
+        if is_landscape(current, fs_cache, thumbnails) {
+            units.push(SpreadDisplayUnit {
+                nav_start: pos,
+                pages: vec![current],
+            });
+            pos += 1;
+            continue;
+        }
+
+        if let Some(&partner) = nav.get(pos + 1)
+            && !is_landscape(partner, fs_cache, thumbnails)
+        {
+            units.push(SpreadDisplayUnit {
+                nav_start: pos,
+                pages: vec![current, partner],
+            });
+            pos += 2;
+            continue;
+        }
+
+        units.push(SpreadDisplayUnit {
+            nav_start: pos,
+            pages: vec![current],
+        });
+        pos += 1;
+    }
+
+    units
+}
+
+fn find_spread_display_unit(
+    units: &[SpreadDisplayUnit],
+    idx: usize,
+) -> Option<(usize, &SpreadDisplayUnit)> {
+    units
+        .iter()
+        .enumerate()
+        .find(|(_, unit)| unit.contains_idx(idx))
 }
 
 // ── フルスクリーン状態の中間構造体 ──────────────────────────────────────
@@ -4669,57 +4784,11 @@ impl App {
         let Some(pos) = nav.iter().position(|&i| i == idx) else {
             return SpreadPair::Single;
         };
-
-        // ペアリング開始位置: cover (表紙あり) なら 1 (先頭ページ単独 + 1 ページずれ)。
-        // 「1 ページずらし」(Ctrl+←/→) は cover/非cover を切り替えて表現するので、ここは
-        // mode の has_cover だけを見ればよい (専用の位相ステータスは持たない)。
-        let pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
-
-        // pair_start=1 のとき pos=0 は相方が居ないので常に単独 (= あぶれた先頭ページ)
-        if pair_start == 1 && pos == 0 {
-            return SpreadPair::Single;
-        }
-
-        // 横長画像は単独
-        if is_landscape(idx, &self.fs_cache, &self.thumbnails) {
-            return SpreadPair::Single;
-        }
-
-        // ペア内の位置を計算 (0-indexed from pair_start)
-        let relative = pos - pair_start;
-        let is_first_of_pair = relative % 2 == 0;
-
-        // ペア相手の pos を決定
-        let partner_pos = if is_first_of_pair { pos + 1 } else { pos - 1 };
-
-        // パートナーが存在しない or 横長の場合は単独
-        let partner_idx = match nav.get(partner_pos) {
-            Some(&pidx) => pidx,
-            None => return SpreadPair::Single,
-        };
-        if is_landscape(partner_idx, &self.fs_cache, &self.thumbnails) {
-            return SpreadPair::Single;
-        }
-
-        // 小さい pos のインデックスと大きい pos のインデックス
-        let (small_idx, large_idx) = if is_first_of_pair {
-            (idx, partner_idx)
-        } else {
-            (partner_idx, idx)
-        };
-
-        // LTR: 左=小, 右=大  /  RTL: 左=大, 右=小
-        if self.spread_mode.is_rtl() {
-            SpreadPair::Double {
-                left: large_idx,
-                right: small_idx,
-            }
-        } else {
-            SpreadPair::Double {
-                left: small_idx,
-                right: large_idx,
-            }
-        }
+        let units =
+            build_spread_display_units(&nav, self.spread_mode, &self.fs_cache, &self.thumbnails);
+        find_spread_display_unit(&units, nav[pos])
+            .map(|(_, unit)| unit.spread_pair(self.spread_mode))
+            .unwrap_or(SpreadPair::Single)
     }
 
     /// 現在画面に出ている見開きレイアウトを優先してペアを返す。
@@ -4752,10 +4821,26 @@ impl App {
             Some(i) => i,
             None => return base_delta,
         };
-        // 現在の表示が Single（横長等）なら1ページ送り
-        match self.resolve_spread_pair(fs_idx) {
-            SpreadPair::Single => base_delta,
-            SpreadPair::Double { .. } => base_delta * 2,
+        let nav = self.get_nav_indices();
+        let Some(pos) = nav.iter().position(|&i| i == fs_idx) else {
+            return base_delta;
+        };
+        let units =
+            build_spread_display_units(&nav, self.spread_mode, &self.fs_cache, &self.thumbnails);
+        let Some((unit_pos, unit)) = find_spread_display_unit(&units, fs_idx) else {
+            return base_delta;
+        };
+        let dir = base_delta.signum();
+        if dir == 0 {
+            return 0;
+        }
+        let target_unit_pos = unit_pos as i32 + dir;
+        if (0..units.len() as i32).contains(&target_unit_pos) {
+            units[target_unit_pos as usize].nav_start as i32 - pos as i32
+        } else if dir > 0 {
+            unit.nav_end_exclusive() as i32 - pos as i32
+        } else {
+            unit.nav_start as i32 - 1 - pos as i32
         }
     }
 
@@ -4825,18 +4910,13 @@ impl App {
             return;
         };
         let nav = self.get_nav_indices();
-        let Some(pos) = nav.iter().position(|&i| i == idx) else {
-            return;
-        };
-
-        let pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
-        if pos < pair_start {
-            return; // 表紙位置 (先頭ページ単独)
-        }
-        let relative = pos - pair_start;
-        if relative % 2 != 0 {
-            // ペアの2番目にいるので1番目に戻す
-            let new_idx = nav[pos - 1];
+        let units =
+            build_spread_display_units(&nav, self.spread_mode, &self.fs_cache, &self.thumbnails);
+        if let Some((_, unit)) = find_spread_display_unit(&units, idx) {
+            let new_idx = unit.anchor_idx();
+            if new_idx == idx {
+                return;
+            }
             let cursor_state = self.fullscreen_cursor_state();
             self.open_fullscreen(new_idx);
             self.restore_fullscreen_cursor_state(ctx, cursor_state);
@@ -8044,43 +8124,21 @@ impl App {
         let mut image_units = Vec::new();
 
         if self.spread_mode.is_spread() {
-            let pair_start = if self.spread_mode.has_cover() { 1 } else { 0 };
-            let mut pos = 0usize;
-            while pos < image_indices.len() {
-                let current = image_indices[pos];
-                if (pair_start == 1 && pos == 0)
-                    || is_landscape(current, &self.fs_cache, &self.thumbnails)
-                {
-                    image_units.push(ContinuousReadingUnitSpec::pages(current, vec![current]));
-                    pos += 1;
-                    continue;
-                }
-
-                if (pos - pair_start) % 2 != 0 {
-                    image_units.push(ContinuousReadingUnitSpec::pages(current, vec![current]));
-                    pos += 1;
-                    continue;
-                }
-
-                let Some(&partner) = image_indices.get(pos + 1) else {
-                    image_units.push(ContinuousReadingUnitSpec::pages(current, vec![current]));
-                    pos += 1;
-                    continue;
-                };
-                if is_landscape(partner, &self.fs_cache, &self.thumbnails) {
-                    image_units.push(ContinuousReadingUnitSpec::pages(current, vec![current]));
-                    pos += 1;
-                    continue;
-                }
-
-                let pages = if self.spread_mode.is_rtl() {
-                    vec![partner, current]
-                } else {
-                    vec![current, partner]
-                };
-                image_units.push(ContinuousReadingUnitSpec::pages(current, pages));
-                pos += 2;
-            }
+            image_units.extend(
+                build_spread_display_units(
+                    &image_indices,
+                    self.spread_mode,
+                    &self.fs_cache,
+                    &self.thumbnails,
+                )
+                .into_iter()
+                .map(|unit| {
+                    ContinuousReadingUnitSpec::pages(
+                        unit.anchor_idx(),
+                        unit.screen_pages(self.spread_mode),
+                    )
+                }),
+            );
         } else {
             image_units.extend(
                 image_indices
