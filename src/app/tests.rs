@@ -9526,6 +9526,16 @@ mod pipeline_cache_refactor_tests {
         app.items.len() - 1
     }
 
+    fn push_pdf_page(app: &mut App, path: &str, page_num: u32) -> usize {
+        app.items.push(GridItem::PdfPage {
+            pdf_path: PathBuf::from(path),
+            page_num,
+            content_type: None,
+        });
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.items.len() - 1
+    }
+
     fn dummy_edit_key(app: &App, idx: usize) -> EditResultKey {
         EditResultKey {
             idx,
@@ -11253,12 +11263,23 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
-    fn make_fake_final_ai_pending() -> (FinalAiPending, Arc<std::sync::atomic::AtomicBool>) {
+    fn make_fake_final_ai_pending_with_job_id(
+        job_id: u64,
+    ) -> (FinalAiPending, Arc<std::sync::atomic::AtomicBool>) {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending = FinalAiPending {
+            job_id,
             cancel: Arc::clone(&cancel),
+            retained_key: None,
+            retained_epoch: 0,
+            allow_retained_orphan: false,
+            cancel_on_drop: true,
         };
         (pending, cancel)
+    }
+
+    fn make_fake_final_ai_pending() -> (FinalAiPending, Arc<std::sync::atomic::AtomicBool>) {
+        make_fake_final_ai_pending_with_job_id(0)
     }
 
     /// P5-1: `has_uncancelled_final_ai_pending` は cancel フラグが立っていない
@@ -11364,7 +11385,10 @@ mod pipeline_cache_refactor_tests {
         let (pending, _c) = make_fake_final_ai_pending();
         app.final_ai_pending.insert(ready_key, pending);
         tx.send(FinalAiResult::Ready {
+            job_id: 0,
             key: ready_key,
+            retained_key: None,
+            retained_epoch: 0,
             source_size: [1, 1],
             image: egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
         })
@@ -11375,6 +11399,7 @@ mod pipeline_cache_refactor_tests {
         let (pending, _c) = make_fake_final_ai_pending();
         app.final_ai_pending.insert(failed_key, pending);
         tx.send(FinalAiResult::Failed {
+            job_id: 0,
             key: failed_key,
             error: "boom".to_string(),
         })
@@ -11383,7 +11408,10 @@ mod pipeline_cache_refactor_tests {
         // (3) Unknown: pending に無い key の Ready → 捨てる (cache に入らない)
         let unknown_key = mk_key(2);
         tx.send(FinalAiResult::Ready {
+            job_id: 0,
             key: unknown_key,
+            retained_key: None,
+            retained_epoch: 0,
             source_size: [1, 1],
             image: egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
         })
@@ -11410,6 +11438,210 @@ mod pipeline_cache_refactor_tests {
         assert!(
             !app.final_ai_cache.contains_key(&unknown_key),
             "result for a key not in pending must be dropped (stale)"
+        );
+    }
+
+    #[test]
+    fn session_close_orphans_pdf_final_ai_for_retained_store() {
+        let mut app = setup_app();
+        let idx = push_pdf_page(&mut app, r"C:\books\scan.pdf", 0);
+        let key = FinalAiKey {
+            edit_key: EditResultKey {
+                idx,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+            },
+            color_ai_hash: 0x1234,
+            bg: 0,
+        };
+        let retained_key = app
+            .retained_final_ai_key_for(idx, key, [2848, 4095])
+            .expect("pdf page retained key");
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retained_epoch = app.retained_final_ai_epoch;
+        app.final_ai_pending.insert(
+            key,
+            FinalAiPending {
+                job_id: 44,
+                cancel: Arc::clone(&cancel),
+                retained_key: Some(retained_key),
+                retained_epoch,
+                allow_retained_orphan: true,
+                cancel_on_drop: true,
+            },
+        );
+
+        app.clear_all_final_pipeline_caches_for_session_close();
+
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "PDF retained orphan must keep the worker cancel flag clear"
+        );
+        assert!(
+            app.final_ai_pending.is_empty(),
+            "orphaned job must leave live pending so UI no longer reports it as active"
+        );
+        assert!(
+            app.retained_final_ai_orphans.get(&key) == Some(&44),
+            "orphaned key is tracked until the worker result is harvested"
+        );
+    }
+
+    #[test]
+    fn poll_final_ai_stores_orphan_ready_only_in_retained_cache() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.final_ai_rx = Some(rx);
+        let key = FinalAiKey {
+            edit_key: EditResultKey {
+                idx: 0,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+            },
+            color_ai_hash: 0xCAFE,
+            bg: 0,
+        };
+        let retained_key = RetainedFinalAiKey {
+            item_key: "c:/books/scan.pdf::page_0".to_string(),
+            edit_size: [2848, 4095],
+            color_ai_hash: key.color_ai_hash,
+            bg: key.bg,
+        };
+        app.retained_final_ai_orphans.insert(key, 0);
+        tx.send(FinalAiResult::Ready {
+            job_id: 0,
+            key,
+            retained_key: Some(retained_key.clone()),
+            retained_epoch: app.retained_final_ai_epoch,
+            source_size: retained_key.edit_size,
+            image: egui::ColorImage::new([2, 2], vec![egui::Color32::BLACK; 4]),
+        })
+        .unwrap();
+
+        app.poll_final_ai(&ctx);
+
+        assert!(
+            app.retained_final_ai_cache.contains_key(&retained_key),
+            "orphan Ready should be stored into retained LRU"
+        );
+        assert!(
+            !app.final_ai_cache.contains_key(&key),
+            "orphan Ready must not populate idx-based live cache"
+        );
+        assert!(
+            !app.retained_final_ai_orphans.contains_key(&key),
+            "orphan tracking must be cleared after harvest"
+        );
+    }
+
+    #[test]
+    fn orphan_ready_with_reused_key_does_not_remove_new_live_pending() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.final_ai_rx = Some(rx);
+        let key = FinalAiKey {
+            edit_key: EditResultKey {
+                idx: 0,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+            },
+            color_ai_hash: 0xCAFE,
+            bg: 0,
+        };
+        let retained_key = RetainedFinalAiKey {
+            item_key: "c:/books/old.pdf::page_0".to_string(),
+            edit_size: [2848, 4095],
+            color_ai_hash: key.color_ai_hash,
+            bg: key.bg,
+        };
+        app.retained_final_ai_orphans.insert(key, 1);
+        let (new_pending, _cancel) = make_fake_final_ai_pending_with_job_id(2);
+        app.final_ai_pending.insert(key, new_pending);
+        tx.send(FinalAiResult::Ready {
+            job_id: 1,
+            key,
+            retained_key: Some(retained_key.clone()),
+            retained_epoch: app.retained_final_ai_epoch,
+            source_size: retained_key.edit_size,
+            image: egui::ColorImage::new([2, 2], vec![egui::Color32::BLACK; 4]),
+        })
+        .unwrap();
+
+        app.poll_final_ai(&ctx);
+
+        assert!(
+            app.retained_final_ai_cache.contains_key(&retained_key),
+            "old orphan result should still be harvested into retained LRU"
+        );
+        assert!(
+            app.final_ai_pending
+                .get(&key)
+                .is_some_and(|pending| pending.job_id == 2),
+            "new live pending with the same FinalAiKey must survive"
+        );
+        assert!(
+            !app.final_ai_cache.contains_key(&key),
+            "old orphan result must not populate live cache for the reused key"
+        );
+        assert!(
+            !app.retained_final_ai_orphans.contains_key(&key),
+            "old orphan tracking must be cleared after harvest"
+        );
+    }
+
+    #[test]
+    fn stale_orphan_final_ai_result_does_not_repopulate_retained_cache() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.final_ai_rx = Some(rx);
+        let key = FinalAiKey {
+            edit_key: EditResultKey {
+                idx: 0,
+                source_gen: 0,
+                erase_mask_gen: 0,
+                local_gen: 0,
+                conceal_mask_gen: 0,
+                conceal_gen: 0,
+            },
+            color_ai_hash: 0xBEEF,
+            bg: 0,
+        };
+        let retained_key = RetainedFinalAiKey {
+            item_key: "c:/books/scan.pdf::page_0".to_string(),
+            edit_size: [2848, 4095],
+            color_ai_hash: key.color_ai_hash,
+            bg: key.bg,
+        };
+        let stale_epoch = app.retained_final_ai_epoch;
+        app.retained_final_ai_orphans.insert(key, 0);
+        app.clear_retained_final_ai_cache("test_epoch_bump");
+        tx.send(FinalAiResult::Ready {
+            job_id: 0,
+            key,
+            retained_key: Some(retained_key.clone()),
+            retained_epoch: stale_epoch,
+            source_size: retained_key.edit_size,
+            image: egui::ColorImage::new([2, 2], vec![egui::Color32::BLACK; 4]),
+        })
+        .unwrap();
+
+        app.poll_final_ai(&ctx);
+
+        assert!(
+            !app.retained_final_ai_cache.contains_key(&retained_key),
+            "stale orphan result must not repopulate retained cache after epoch bump"
         );
     }
 

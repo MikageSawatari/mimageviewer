@@ -93,7 +93,7 @@
 | `heavy_io_queue` | `Arc<Mutex<Vec<LoadRequest>>>` | Folder/ZipFile 要求 (本物の同期 I/O のみ)。reload_queue と同じ prefetch suppression gate を共有 |
 | `pdf_pool.queue` | `Arc<(Mutex<JobQueue>, Condvar)>` | PDF ワーカーへのレンダ/列挙要求。`critical` / `high_normal` / `normal` VecDeque + `normal_in_flight` + `workers_busy` + `in_flight_started_at: Vec<Option<Instant>>` (POOL_SIZE 固定、worker_id index) を同一 Mutex で保護。dispatcher は `critical → high_normal → normal` の順で pop し、HighNormal + Normal で `normal_in_flight` 枠 (= `worker_count - 1`) を共有する。**`CRITICAL_RESERVATION_ACTIVE` (v1.0.0 から常時 ON、最低 1 ワーカーを Critical 用に予約)** によってグリッドからの `Enter` (= Critical な `enumerate_pages_async`) がサムネ先読みの in-flight 待ちで詰まらないようにする。HighNormal は `req.priority=true` の可視セル用 (= 画面に見えているサムネ render を画面外先読みより先に処理)。**Context epoch (`CURRENT_CONTEXT_EPOCH`)** で UI ナビゲーション (フォルダ移動 / Ctrl+G 結果差替え) ごとに HighNormal/Normal ジョブを世代管理し、bump で stale を一括 prune + dispatcher pop 時にも stale 判定。Critical と epoch=0 (background) はプルーン対象外。**`CancelWaitPolicy::HarvestOnCancel`** (thumbnail PDF render の cache-savable 経路のみ) では cancel が立っても in-flight IPC の reply を待ち、PDFium が既に処理した render 結果を harvest して cache 保存に進ませる (= 再エントリ時の再 render 地獄を防ぐ)。**`promote_to_high_normal`** で App 側がスクロール後の現可視 PDF を Normal lane から HighNormal lane に昇格 (= prefetch として enqueue された後で可視になったジョブを救う) |
 | `CatchupQueue` (`thumb_loader.rs`) | `Arc<(Mutex<CatchupQueueState>, Condvar)>` | `pdf_meta` 背景書き込みキュー (v1.0.0)。`high: VecDeque<NeighborPrefetch>` (cap 16) + `low: VecDeque<MetaOnly>` (cap 256) + `pending: HashSet<PathBuf>` を同一 Mutex で保護。worker は high → low の順で pop。同 path が low にいる時に高優先が後から来ると **`high` 空き確認後に `low` から remove → `high` に push** で昇格する (lane が満杯のときだけ drop、lane 間は独立)。詳細は [docs/pdf-page-count-cache-plan.md の「最終形」セクション](pdf-page-count-cache-plan.md) |
-| `AiJobQueue` (`app.rs`) | `Arc<(Mutex<AiJobQueueState>, Condvar)>` | final AI (upscale/denoise) ジョブ。`display: VecDeque` (表示中ページ, push_front=LIFO) + `prefetch: VecDeque` (先読み, push_back=FIFO) + `shutdown` を同一 Mutex で保護。`final-ai-worker` が `display → prefetch` の順で pop。enqueue 重複は呼び出し側 `final_ai_pending.contains_key` で dedup。cancel は `final_ai_pending[key].cancel` (Drop でも立つ) を worker が pop 時に確認し、立っていれば推論せず `Cancelled` を返す (= 高速ページ送りで keep_set 外になったジョブは GPU 推論が始まる前に止まる) |
+| `AiJobQueue` (`app.rs`) | `Arc<(Mutex<AiJobQueueState>, Condvar)>` | final AI (upscale/denoise) ジョブ。`display: VecDeque` (表示中ページ, push_front=LIFO) + `prefetch: VecDeque` (先読み, push_back=FIFO) + `shutdown` を同一 Mutex で保護。`final-ai-worker` が `display → prefetch` の順で pop。enqueue 重複は呼び出し側 `final_ai_pending.contains_key` で dedup。cancel は `final_ai_pending[key].cancel` (Drop でも立つ) を worker が pop 時に確認し、立っていれば推論せず `Cancelled` を返す (= 高速ページ送りで keep_set 外になったジョブは GPU 推論が始まる前に止まる)。PDF の表示中 final AI だけは、保持 LRU に入れる価値が高いので session close / keep-set evict 時に最大 1 件まで `retained_final_ai_orphans` へ移し、live pending から外したまま完走を許可する |
 | `texture_backlog` | ローカル Vec (App) | GPU アップロード未完の ColorImage。MAX_TEXTURES_PER_FRAME=8 超過分 |
 
 ワーカーが要求を取り出すときは **優先度 (priority フラグ) → 距離 → forward/backward** でソート。
@@ -260,9 +260,16 @@ pending 中は追加ホイール入力を捨て、queue も delta 累積もし�
   `cancel_final_ai_for_idx` / `evict_final_pipeline_cache` / `clear_*` が立てる。
   `FinalAiPending` の Drop も cancel を立てる。worker は pop 直後とタイル境界
   (`upscale` / `denoise` 内) で確認する。
+- **PDF retained orphan**: PDF ページの display ジョブは、`close_fullscreen()` や
+  keep-set eviction で live 表示対象から外れても、保持 LRU が有効なら最大 1 件だけ
+  `retained_final_ai_orphans` に `FinalAiKey + job_id` で移して cancel せず完走させる。
+  これは「完了前キャンセルで retained LRU に入らない」問題を避けるための例外で、live
+  `final_ai_cache` には戻さず stable item key 付きの `retained_final_ai_cache` だけへ保存する。
+  外部変更や AI 設定変更で retained epoch が進んだ古い結果は store 時に捨てる。
 - **結果回収**: 全ジョブ共有の単一 mpsc (`final_ai_rx`)。`poll_final_ai` が毎フレーム
-  drain し、**pending に残っている key の結果だけ** を適用する (取り消し済み key の結果は
-  捨てる = 旧 per-thread 設計で rx drop により失われていたのと同じ挙動。stale な
+  drain し、**pending に残っている key** または **retained orphan として追跡中の key** の
+  結果だけを、どちらも `job_id` 一致を確認してから適用する。通常の取り消し済み key の結果は
+  捨てる (= 旧 per-thread 設計で rx drop により失われていたのと同じ挙動。stale な
   `final_ai_cache` 挿入を防ぐ)。
 - **同時起動ポリシー**: 先読みは `prefetch_final_ai` が `has_uncancelled_final_ai_pending`
   で gate するため、未キャンセル pending がある間は新しい先読みを enqueue しない
@@ -271,8 +278,9 @@ pending 中は追加ホイール入力を捨て、queue も delta 累積もし�
 > 注: fullscreen session をまたぐ final AI pixels は `retained_final_ai_cache` で
 > 枚数 + MiB の LRU 管理を行う。これは CPU 側の推論結果保持で、表示中の
 > `final_ai_cache` / `final_composite_cache` や GPU テクスチャの keep-set eviction とは別層。
-> 残る課題は、表示中キャッシュ / GPU 常駐分のバイト予算と、高速ページ送り中の AI 起動
-> デバウンスである。
+> PDF retained orphan はこの retained layer へ store するためだけの例外であり、表示中
+> キャッシュ / GPU 常駐分を延命するものではない。残る課題は、表示中キャッシュ / GPU 常駐分の
+> バイト予算と、高速ページ送り中の AI 起動デバウンスである。
 
 ### 3.3 フルスクリーン読み込みの優先度制御
 

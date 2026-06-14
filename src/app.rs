@@ -1640,26 +1640,45 @@ pub(crate) struct RetainedFinalAiEntry {
     pub(crate) last_used: u64,
 }
 
+/// 表示セッションから外れた PDF final AI を、保持 LRU へ入れる目的で完走させる上限。
+///
+/// final AI worker は単一なので、ここを大きくすると「今見ているページ」の AI が
+/// 古い PDF ジョブに待たされる。まずは 1 件だけ救い、連続ページ送り中の back pressure
+/// を強くしすぎない。
+const MAX_RETAINED_FINAL_AI_ORPHAN_JOBS: usize = 1;
+
 pub(crate) struct FinalAiPending {
+    pub(crate) job_id: u64,
     pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) retained_key: Option<RetainedFinalAiKey>,
+    pub(crate) retained_epoch: u64,
+    pub(crate) allow_retained_orphan: bool,
+    pub(crate) cancel_on_drop: bool,
 }
 
 impl Drop for FinalAiPending {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        if self.cancel_on_drop {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 
 pub(crate) enum FinalAiResult {
     Ready {
+        job_id: u64,
         key: FinalAiKey,
+        retained_key: Option<RetainedFinalAiKey>,
+        retained_epoch: u64,
         source_size: [usize; 2],
         image: egui::ColorImage,
     },
     Cancelled {
+        job_id: u64,
         key: FinalAiKey,
     },
     Failed {
+        job_id: u64,
         key: FinalAiKey,
         error: String,
     },
@@ -1679,9 +1698,12 @@ pub(crate) enum AiJobPriority {
 /// 「UI THREAD HANG (推論ロック飢餓)」の止血になる (旧 per-job spawn 設計では
 /// UI スレッドが `is_loaded` / `load_model` を呼んでロックを待っていた)。
 pub(crate) struct AiJob {
+    pub(crate) job_id: u64,
     pub(crate) key: FinalAiKey,
     pub(crate) priority: AiJobPriority,
     pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) retained_key: Option<RetainedFinalAiKey>,
+    pub(crate) retained_epoch: u64,
     pub(crate) runtime: Arc<crate::ai::runtime::AiRuntime>,
     pub(crate) manager: Arc<crate::ai::model_manager::ModelManager>,
     pub(crate) source: Arc<egui::ColorImage>,
@@ -1782,7 +1804,10 @@ fn run_ai_worker(
         // pop 前に cancel された (= 高速ページ送りで keep_set から外れた等) ジョブは
         // 推論せずに Cancelled を返す。これにより無駄な GPU 推論が始まる前に止まる。
         if job.cancel.load(Ordering::Relaxed) {
-            let _ = tx.send(FinalAiResult::Cancelled { key: job.key });
+            let _ = tx.send(FinalAiResult::Cancelled {
+                job_id: job.job_id,
+                key: job.key,
+            });
             continue;
         }
         let result = run_final_ai_job(&job);
@@ -3723,6 +3748,14 @@ pub struct App {
     pub(crate) retained_final_ai_cache:
         std::collections::HashMap<RetainedFinalAiKey, RetainedFinalAiEntry>,
     pub(crate) retained_final_ai_clock: u64,
+    /// retained final AI の無効化世代。外部更新や AI 設定変更後に、古い孤児 job の
+    /// 完了結果が保持 LRU へ戻るのを防ぐ。
+    pub(crate) retained_final_ai_epoch: u64,
+    /// live pending から外したが、retained LRU へ保存する目的で完走を許可した job。
+    pub(crate) retained_final_ai_orphans: std::collections::HashMap<FinalAiKey, u64>,
+    /// final AI job の単調 ID。idx ベースの `FinalAiKey` がフォルダ遷移後に再利用されても、
+    /// 古い orphan 結果が新しい live pending に混ざらないようにする。
+    pub(crate) final_ai_job_seq: u64,
     /// final AI 処理中。表示中ページを優先し、古い key は cancel する。
     pub(crate) final_ai_pending: std::collections::HashMap<FinalAiKey, FinalAiPending>,
     /// final AI 失敗 key。モデル不在 / 推論失敗時の無限再試行を避ける。
@@ -5288,6 +5321,9 @@ impl App {
             final_ai_cache: std::collections::HashMap::new(),
             retained_final_ai_cache: std::collections::HashMap::new(),
             retained_final_ai_clock: 0,
+            retained_final_ai_epoch: 0,
+            retained_final_ai_orphans: std::collections::HashMap::new(),
+            final_ai_job_seq: 0,
             final_ai_pending: std::collections::HashMap::new(),
             final_ai_failed: std::collections::HashSet::new(),
             ai_job_queue: None,
@@ -23465,7 +23501,7 @@ impl App {
         self.cancel_all_comic_bakes();
         self.erase_result_cache.clear();
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches_for_session_close();
         for (cancel, _, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -25079,6 +25115,61 @@ impl App {
         }
     }
 
+    fn maybe_orphan_final_ai_for_retained_store(&mut self, key: FinalAiKey, reason: &str) -> bool {
+        let Some(pending) = self.final_ai_pending.get(&key) else {
+            return false;
+        };
+        let retained_key = pending.retained_key.clone();
+        let should_orphan = pending.allow_retained_orphan
+            && retained_key.is_some()
+            && pending.retained_epoch == self.retained_final_ai_epoch
+            && self.retained_final_ai_budget().is_some()
+            && self.retained_final_ai_orphans.len() < MAX_RETAINED_FINAL_AI_ORPHAN_JOBS;
+        if should_orphan {
+            let Some(mut pending) = self.final_ai_pending.remove(&key) else {
+                return false;
+            };
+            pending.cancel_on_drop = false;
+            let job_id = pending.job_id;
+            let retained_key = retained_key.expect("checked retained_key.is_some()");
+            self.retained_final_ai_orphans.insert(key, job_id);
+            crate::logger::log(format!(
+                "[AI] Final AI retained orphan idx={} item={} source={}x{} \
+                 hash={} bg={} job_id={} reason={reason} orphans={} max_orphans={}",
+                key.edit_key.idx,
+                retained_key.item_key,
+                retained_key.edit_size[0],
+                retained_key.edit_size[1],
+                key.color_ai_hash,
+                key.bg,
+                job_id,
+                self.retained_final_ai_orphans.len(),
+                MAX_RETAINED_FINAL_AI_ORPHAN_JOBS,
+            ));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn cancel_or_orphan_final_ai_for_session(&mut self, key: FinalAiKey, reason: &str) {
+        if self.maybe_orphan_final_ai_for_retained_store(key, reason) {
+            return;
+        }
+        if let Some(pending) = self.final_ai_pending.remove(&key) {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn mark_cancel_or_orphan_final_ai_for_evict(&mut self, key: FinalAiKey, reason: &str) {
+        if self.maybe_orphan_final_ai_for_retained_store(key, reason) {
+            return;
+        }
+        if let Some(pending) = self.final_ai_pending.get(&key) {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
     fn clear_edit_result_caches_for_idx(&mut self, idx: usize) {
         self.edit_result_cache.retain(|key, _| key.idx != idx);
         self.clear_final_pipeline_caches_for_idx(idx);
@@ -25117,6 +25208,18 @@ impl App {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         self.final_ai_pending.clear();
+        self.final_ai_cache.clear();
+        self.final_ai_failed.clear();
+        self.final_composite_cache.clear();
+        self.comic_cache.clear();
+        self.cancel_all_comic_bakes();
+    }
+
+    fn clear_all_final_pipeline_caches_for_session_close(&mut self) {
+        let keys: Vec<FinalAiKey> = self.final_ai_pending.keys().copied().collect();
+        for key in keys {
+            self.cancel_or_orphan_final_ai_for_session(key, "session_close");
+        }
         self.final_ai_cache.clear();
         self.final_ai_failed.clear();
         self.final_composite_cache.clear();
@@ -26263,28 +26366,7 @@ impl App {
         key: FinalAiKey,
         edit_size: [usize; 2],
         pixels: Arc<egui::ColorImage>,
-    ) {
-        let Some((max_entries, max_bytes)) = self.retained_final_ai_budget() else {
-            let item_key = self
-                .metadata_cache_key(idx)
-                .unwrap_or_else(|| "<unknown>".to_string());
-            let cleared_entries = self.retained_final_ai_cache.len();
-            let cleared_bytes = self.retained_final_ai_cache_bytes();
-            self.retained_final_ai_cache.clear();
-            crate::logger::log(format!(
-                "[AI] Retained final AI skip idx={idx} item={item_key} source={}x{} \
-                 output={}x{} bytes={} reason=disabled max_entries={} max_mib={} \
-                 cleared_entries={cleared_entries} cleared_bytes={cleared_bytes}",
-                edit_size[0],
-                edit_size[1],
-                pixels.size[0],
-                pixels.size[1],
-                Self::retained_final_ai_image_bytes(&pixels),
-                self.settings.retained_final_ai_cache_max_entries,
-                self.settings.retained_final_ai_cache_max_mib,
-            ));
-            return;
-        };
+    ) -> bool {
         let Some(retained_key) = self.retained_final_ai_key_for(idx, key, edit_size) else {
             crate::logger::log(format!(
                 "[AI] Retained final AI skip idx={idx} source={}x{} output={}x{} \
@@ -26295,16 +26377,66 @@ impl App {
                 pixels.size[1],
                 Self::retained_final_ai_image_bytes(&pixels),
             ));
-            return;
+            return false;
+        };
+        self.insert_retained_final_ai_with_key(
+            idx,
+            retained_key,
+            self.retained_final_ai_epoch,
+            pixels,
+        )
+    }
+
+    fn insert_retained_final_ai_with_key(
+        &mut self,
+        idx: usize,
+        retained_key: RetainedFinalAiKey,
+        retained_epoch: u64,
+        pixels: Arc<egui::ColorImage>,
+    ) -> bool {
+        let edit_size = retained_key.edit_size;
+        if retained_epoch != self.retained_final_ai_epoch {
+            crate::logger::log(format!(
+                "[AI] Retained final AI skip idx={idx} item={} source={}x{} output={}x{} \
+                 bytes={} reason=stale_epoch result_epoch={} current_epoch={}",
+                retained_key.item_key,
+                edit_size[0],
+                edit_size[1],
+                pixels.size[0],
+                pixels.size[1],
+                Self::retained_final_ai_image_bytes(&pixels),
+                retained_epoch,
+                self.retained_final_ai_epoch,
+            ));
+            return false;
+        }
+        let Some((max_entries, max_bytes)) = self.retained_final_ai_budget() else {
+            let cleared_entries = self.retained_final_ai_cache.len();
+            let cleared_bytes = self.retained_final_ai_cache_bytes();
+            self.retained_final_ai_cache.clear();
+            crate::logger::log(format!(
+                "[AI] Retained final AI skip idx={idx} item={} source={}x{} \
+                 output={}x{} bytes={} reason=disabled max_entries={} max_mib={} \
+                 cleared_entries={cleared_entries} cleared_bytes={cleared_bytes}",
+                retained_key.item_key,
+                edit_size[0],
+                edit_size[1],
+                pixels.size[0],
+                pixels.size[1],
+                Self::retained_final_ai_image_bytes(&pixels),
+                self.settings.retained_final_ai_cache_max_entries,
+                self.settings.retained_final_ai_cache_max_mib,
+            ));
+            return false;
         };
         let bytes = Self::retained_final_ai_image_bytes(&pixels);
         if bytes > max_bytes {
             crate::logger::log(format!(
                 "[AI] Retained final AI skip idx={idx} item={} source={}x{} output={}x{} \
-                 bytes={bytes} max_bytes={max_bytes} reason=too_large",
+                bytes={bytes} max_bytes={max_bytes} reason=too_large",
                 retained_key.item_key, edit_size[0], edit_size[1], pixels.size[0], pixels.size[1],
             ));
-            return;
+            return false;
         }
         self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
         let output_size = pixels.size;
@@ -26334,6 +26466,9 @@ impl App {
                 self.retained_final_ai_cache.len(),
                 self.retained_final_ai_cache_bytes(),
             ));
+            true
+        } else {
+            false
         }
     }
 
@@ -26444,6 +26579,7 @@ impl App {
         let Some(item_key) = self.metadata_cache_key(idx) else {
             return;
         };
+        self.retained_final_ai_epoch = self.retained_final_ai_epoch.wrapping_add(1);
         let before_entries = self.retained_final_ai_cache.len();
         let before_bytes = self.retained_final_ai_cache_bytes();
         self.retained_final_ai_cache
@@ -26462,6 +26598,7 @@ impl App {
     }
 
     pub(crate) fn clear_retained_final_ai_cache(&mut self, reason: &str) {
+        self.retained_final_ai_epoch = self.retained_final_ai_epoch.wrapping_add(1);
         let entries = self.retained_final_ai_cache.len();
         let total_bytes = self.retained_final_ai_cache_bytes();
         self.retained_final_ai_cache.clear();
@@ -26669,6 +26806,14 @@ impl App {
         } else {
             AiJobPriority::Prefetch
         };
+        let retained_key = self.retained_final_ai_key_for(idx, key, source_image.size);
+        let allow_retained_orphan = matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
+            && priority == AiJobPriority::Display
+            && retained_key.is_some()
+            && self.retained_final_ai_budget().is_some();
+        let retained_epoch = self.retained_final_ai_epoch;
+        self.final_ai_job_seq = self.final_ai_job_seq.wrapping_add(1);
+        let job_id = self.final_ai_job_seq;
 
         // per-job thread spawn ではなく、単一 AI ワーカー + 優先度キューに enqueue する。
         // モデルロード / 推論 (= sessions Mutex を握る処理) は worker スレッド上で走るので、
@@ -26677,14 +26822,22 @@ impl App {
         self.final_ai_pending.insert(
             key,
             FinalAiPending {
+                job_id,
                 cancel: Arc::clone(&cancel),
+                retained_key: retained_key.clone(),
+                retained_epoch,
+                allow_retained_orphan,
+                cancel_on_drop: true,
             },
         );
         if let Some(queue) = self.ai_job_queue.as_ref() {
             queue.enqueue(AiJob {
+                job_id,
                 key,
                 priority,
                 cancel,
+                retained_key,
+                retained_epoch,
                 runtime,
                 manager,
                 source: source_image,
@@ -26693,7 +26846,7 @@ impl App {
             });
         }
         crate::logger::log(format!(
-            "[AI] Final AI queued idx={idx} bg={} denoise={:?} upscale={:?} priority={:?}",
+            "[AI] Final AI queued idx={idx} bg={} denoise={:?} upscale={:?} priority={:?} job_id={job_id}",
             key.bg, denoise_model, upscale_model, priority
         ));
         true
@@ -27563,59 +27716,112 @@ impl App {
             // 次回 enqueue 時に作り直し、stuck pending を一掃する。
             crate::logger::log("[AI] final-ai worker disconnected; resetting queue".to_string());
             self.final_ai_pending.clear();
+            self.retained_final_ai_orphans.clear();
             self.ai_job_queue = None;
             self.final_ai_rx = None;
         }
 
         let mut repaint = false;
         for result in completed {
-            let key = match &result {
-                FinalAiResult::Ready { key, .. }
-                | FinalAiResult::Cancelled { key }
-                | FinalAiResult::Failed { key, .. } => *key,
+            let (key, job_id) = match &result {
+                FinalAiResult::Ready { key, job_id, .. }
+                | FinalAiResult::Cancelled { key, job_id }
+                | FinalAiResult::Failed { key, job_id, .. } => (*key, *job_id),
             };
             // pending から既に除去済み (cancel_final_ai_for_idx / clear / evict 経由で
-            // 取り消された) の結果は捨てる。旧 per-thread 設計で rx drop により結果が
-            // 失われていたのと同じ挙動にし、stale な final_ai_cache 挿入を防ぐ。
-            if self.final_ai_pending.remove(&key).is_none() {
+            // 取り消された) の結果は捨てる。retained orphan は job_id も一致したときだけ
+            // 回収する。idx ベースの FinalAiKey がフォルダ遷移後に再利用されても、古い
+            // orphan result が新しい live pending を潰さないようにするため。
+            let live_pending = self
+                .final_ai_pending
+                .get(&key)
+                .is_some_and(|pending| pending.job_id == job_id);
+            let retained_orphan = self
+                .retained_final_ai_orphans
+                .get(&key)
+                .is_some_and(|orphan_job_id| *orphan_job_id == job_id);
+            if !live_pending && !retained_orphan {
                 continue;
+            }
+            if live_pending {
+                self.final_ai_pending.remove(&key);
+            }
+            if retained_orphan {
+                self.retained_final_ai_orphans.remove(&key);
             }
             match result {
                 FinalAiResult::Ready {
+                    job_id,
                     key,
+                    retained_key,
+                    retained_epoch,
                     source_size,
                     image,
                 } => {
                     let pixels = Arc::new(image);
-                    self.insert_retained_final_ai(
-                        key.edit_key.idx,
-                        key,
-                        source_size,
-                        Arc::clone(&pixels),
-                    );
-                    self.final_ai_cache.insert(key, pixels);
-                    self.final_composite_cache.retain(|cache_key, entry| {
-                        cache_key.edit_key != key.edit_key || entry.complete
-                    });
-                    repaint = true;
+                    let retained_stored = if let Some(retained_key) = retained_key {
+                        self.insert_retained_final_ai_with_key(
+                            key.edit_key.idx,
+                            retained_key,
+                            retained_epoch,
+                            Arc::clone(&pixels),
+                        )
+                    } else if live_pending {
+                        self.insert_retained_final_ai(
+                            key.edit_key.idx,
+                            key,
+                            source_size,
+                            Arc::clone(&pixels),
+                        )
+                    } else {
+                        false
+                    };
+                    if live_pending {
+                        self.final_ai_cache.insert(key, pixels);
+                        self.final_composite_cache.retain(|cache_key, entry| {
+                            cache_key.edit_key != key.edit_key || entry.complete
+                        });
+                        repaint = true;
+                    } else if retained_stored {
+                        crate::logger::log(format!(
+                            "[AI] Final AI orphan result stored for retained cache only idx={} \
+                             source={}x{} job_id={job_id}",
+                            key.edit_key.idx, source_size[0], source_size[1]
+                        ));
+                    } else {
+                        crate::logger::log(format!(
+                            "[AI] Final AI orphan result skipped for retained cache only idx={} \
+                             source={}x{} job_id={job_id}",
+                            key.edit_key.idx, source_size[0], source_size[1]
+                        ));
+                    }
                 }
-                FinalAiResult::Cancelled { key } => {
-                    self.final_ai_failed.remove(&key);
+                FinalAiResult::Cancelled { key, .. } => {
+                    if live_pending {
+                        self.final_ai_failed.remove(&key);
+                    }
                 }
-                FinalAiResult::Failed { key, error } => {
-                    self.final_ai_failed.insert(key);
-                    crate::logger::log(format!(
-                        "[AI] Final AI failed idx={} error={error}",
-                        key.edit_key.idx
-                    ));
-                    repaint = true;
+                FinalAiResult::Failed { key, error, job_id } => {
+                    if live_pending {
+                        self.final_ai_failed.insert(key);
+                        crate::logger::log(format!(
+                            "[AI] Final AI failed idx={} job_id={job_id} error={error}",
+                            key.edit_key.idx
+                        ));
+                        repaint = true;
+                    } else {
+                        crate::logger::log(format!(
+                            "[AI] Final AI orphan failed idx={} job_id={job_id} error={error}",
+                            key.edit_key.idx
+                        ));
+                    }
                 }
             }
         }
         if repaint {
             ctx.request_repaint();
         }
-        if !self.final_ai_pending.is_empty() {
+        if !self.final_ai_pending.is_empty() || !self.retained_final_ai_orphans.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
@@ -27642,9 +27848,7 @@ impl App {
             .filter(|key| !keep_set.contains(&key.edit_key.idx))
             .collect();
         for key in to_cancel {
-            if let Some(pending) = self.final_ai_pending.get(&key) {
-                pending.cancel.store(true, Ordering::Relaxed);
-            }
+            self.mark_cancel_or_orphan_final_ai_for_evict(key, "keep_set_evict");
         }
     }
 
@@ -31949,6 +32153,7 @@ impl eframe::App for App {
             || self.local_adjust_prefix_preview_pending.is_some()
             || self.local_adjust_segmentation_pending.is_some()
             || !self.final_ai_pending.is_empty()
+            || !self.retained_final_ai_orphans.is_empty()
             || self
                 .tag_prewarm_pending
                 .as_ref()
@@ -32893,7 +33098,8 @@ impl eframe::App for App {
         // upscale_end 済みの結果が次のユーザー入力まで job_ready にならず、
         // 先読みバーが数秒止まって見えるため、pending 中だけ低頻度に起こす。
         let ai_upscale_poll_delay = (!self.ai_upscale_pending.is_empty()
-            || !self.final_ai_pending.is_empty())
+            || !self.final_ai_pending.is_empty()
+            || !self.retained_final_ai_orphans.is_empty())
         .then_some(std::time::Duration::from_millis(33));
         // `keep_fullscreen_viewport_alive` の cleanup フレーム保証 (Codex P2 — 統一安全網)。
         // close_fullscreen が App::update 内のどこで呼ばれても、次フレームで keep_alive の
@@ -34567,11 +34773,14 @@ fn save_video_resume_position(
 /// 行う**。UI スレッドは種別決定 (`model_path` 存在チェック) までしかやらないので、
 /// 推論 backlog がロックを握っていても UI が固まらない。
 fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
+    let job_id = job.job_id;
     let key = job.key;
     let runtime = &job.runtime;
     let manager = &job.manager;
     let cancel = &job.cancel;
     let source_size = job.source.size;
+    let retained_key = job.retained_key.clone();
+    let retained_epoch = job.retained_epoch;
 
     // モデルロードは worker 上で。ロードに失敗したモデルは「使えない」扱いに落とす
     // (UI スレッドで load していた旧設計と最終状態は同じ: 両方不可なら Failed)。
@@ -34597,6 +34806,7 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
     };
     if denoise_model.is_none() && upscale_model.is_none() {
         return FinalAiResult::Failed {
+            job_id,
             key,
             error: "no usable AI model (load failed)".to_string(),
         };
@@ -34621,7 +34831,10 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
                     dynimg = color_image_to_dynamic(&denoised);
                 } else {
                     return FinalAiResult::Ready {
+                        job_id,
                         key,
+                        retained_key,
+                        retained_epoch,
                         source_size,
                         image: denoised,
                     };
@@ -34629,10 +34842,11 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
             }
             Err(err) => {
                 if cancel.load(Ordering::Relaxed) {
-                    return FinalAiResult::Cancelled { key };
+                    return FinalAiResult::Cancelled { job_id, key };
                 }
                 if upscale_model.is_none() {
                     return FinalAiResult::Failed {
+                        job_id,
                         key,
                         error: err.to_string(),
                     };
@@ -34651,15 +34865,19 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
             // 場合に発生) は worker 側でここで縮小する。UI スレッドの `clamp_for_gpu`
             // 安全網に流すと同期ハングし、cache にも 16K 級画像を抱えてしまう。
             Ok(image) => FinalAiResult::Ready {
+                job_id,
                 key,
+                retained_key,
+                retained_epoch,
                 source_size,
                 image: clamp_color_image_for_gpu(image),
             },
             Err(err) => {
                 if cancel.load(Ordering::Relaxed) {
-                    FinalAiResult::Cancelled { key }
+                    FinalAiResult::Cancelled { job_id, key }
                 } else {
                     FinalAiResult::Failed {
+                        job_id,
                         key,
                         error: err.to_string(),
                     }
@@ -34670,6 +34888,7 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
         // denoise だけ成功し upscale_model=None の分岐は上で return 済みなので論理的に
         // 到達しない。安全網として Failed (= 非 AI 表示へフォールバック) を返す。
         FinalAiResult::Failed {
+            job_id,
             key,
             error: "no upscale model after denoise".to_string(),
         }

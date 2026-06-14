@@ -681,9 +681,16 @@ ZIP の章区切り (`ZipSeparator`) は GPU テクスチャ化せず、前後�
   へ戻してから final composite を再生成する。AI 入力が変わる編集では該当ページの保持分も
   破棄し、post_filter / smart_sharpen だけの変更では保持する。fullscreen close / reopen
   に伴う同じ item の `fs_cache` 再ロードでは live cache だけを作り直し、保持 LRU は残す。
+  PDF ページの display final AI は、巨大ページで完了前に session close / keep-set eviction
+  されると LRU へ store できないため、保持 LRU が有効な場合だけ最大 1 件を
+  `retained_final_ai_orphans` として live pending から外し、cancel せず完走させる。完走結果は
+  stable item key で保持 LRU にだけ store し、古い idx ベースの `final_ai_cache` には戻さない。
+  外部変更や AI 設定変更で retained epoch が進んでいた場合、その orphan 結果は store 時に捨てる。
   保持 LRU の store / hit /
   miss / skip / evict / clear は `mimageviewer.log` に `[AI] Retained final AI ...`
-  として記録する。
+  として記録する。PDF orphan の開始 / 回収は `[AI] Final AI retained orphan ...` /
+  `[AI] Final AI orphan result stored for retained cache only ...` に出る。epoch 不一致や設定無効で
+  store しなかった orphan は `skipped for retained cache only` になる。
   ヒット時も元画像ロードと final composite の再生成は必要なので、再入場直後に 1 フレーム程度
   AI 前の暫定表示が出ることはある。外部アプリによる現在フォルダの実ディスク変更を
   signature 差分で検出した場合は、同じ path / 同じ寸法の差し替えに備えて保持 LRU を全クリアする。

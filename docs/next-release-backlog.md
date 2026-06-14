@@ -473,13 +473,15 @@ Source thread: https://egg.5ch.io/test/read.cgi/software/1752914772/
       viewer mode; non-detached fullscreen remains the primary input target.
     - This keeps CPU pixels for final AI results, not final composite textures. Reopening can still require final composite rebuild / GPU upload, but avoids AI re-inference.
     - Retained entries are removed for the page when AI input-changing edits invalidate final pipeline caches; AI feature mode / size-limit changes clear the retained layer globally.
-  - **未対応 (次版検討) — PDF ページで retained final AI が効きにくいケース**:
+  - **対応済み (post-v1.6.0 patch) — PDF ページで retained final AI が効きにくいケース**:
     - 2026-06-14 の実機ログ確認で、PDF ページ (`PdfPage`) は保持キャッシュのキー自体は安定しているが、巨大ページでは AI アップスケール完了前にジョブがキャンセルされ、`Retained final AI store` まで到達しないケースを確認した。
     - 例: `2848x4095` の PDF ページで final AI が `tiles=54` として開始されたが、再オープン/遷移に伴うキャンセルで `upscale_cancel after_tile=6` となり、以降も `Retained final AI miss -> Final AI queued` を繰り返した。
     - 通常画像の「完了済み retained entry が `fs_cache` reload で消える」問題とは別で、**完了前キャンセルのため retained LRU に入らない**のが主因。PDF ではレンダリング自体も約 `265-302ms`、final composite/upload も約 `49ms` かかっており、AI キャッシュが効いても PDF レンダリング遅延は別途残りうる。
-    - 次版方針候補: 表示対象から外れた final AI ジョブを常に即キャンセルするのではなく、PDF の大型ページなど完了すれば再利用価値が高いジョブは、短時間の grace / background priority / retained-store 目的の完走を許可する。ただし GPU/VRAM/CPU メモリ圧迫を避けるため、entries/MiB 上限、ジョブサイズ、ユーザー操作中の優先度を明確に制御する。
-    - 併せて、PDF render cache / page raster cache と retained final AI は別レイヤとして扱う。AI 完了済みピクセルを保持できても、PDF ページの初回 rasterize や GPU upload は残るため、必要なら PDF レンダリング側の保持・キャンセル・ログも別タスクで見る。
+    - Fix: PDF ページの display final AI は、保持 LRU が有効な場合だけ session close / keep-set eviction 時に最大 1 件を `retained_final_ai_orphans` へ移し、live pending から外したまま cancel せず完走を許可する。完走結果は enqueue 時に捕まえた stable `RetainedFinalAiKey` で `retained_final_ai_cache` だけへ store し、idx ベースの live `final_ai_cache` には戻さない。
+    - Safety: orphan / live pending の回収は `FinalAiKey` だけでなく `job_id` も一致させるため、フォルダ遷移後に同じ idx/key が再利用されても古い PDF 結果が新しい live cache に混ざらない。外部変更 / AI 設定変更 / サイズ上限変更などで `retained_final_ai_epoch` が進んでいた orphan result は store 時に捨てる。orphan 上限は 1 件なので、古い PDF ジョブが現在ページの AI を長く塞ぐリスクを抑える。
+    - Logs: orphan 化は `[AI] Final AI retained orphan ...`、保持専用回収は `[AI] Final AI orphan result stored for retained cache only ...`、保持に入らなかった orphan は `skipped for retained cache only`、epoch 不一致は `[AI] Retained final AI skip ... reason=stale_epoch` で確認できる。
+    - 残り: PDF render cache / page raster cache と retained final AI は別レイヤ。AI 完了済みピクセルを保持できても、PDF ページの初回 rasterize や GPU upload は残るため、必要なら PDF レンダリング側の保持・キャンセル・ログも別タスクで見る。
 - Priority:
   - High for bug reports 1 and 2 once reproducible.
   - Medium for request 3 if a bounded high-load threshold option is straightforward; low for any left/right virtual split implementation.
-  - Medium for request 4 if it is causing repeated long waits; design carefully because memory pressure risk is high. PDF retained-cache follow-up is High for the next release if large PDFs remain a common workflow.
+  - Medium for request 4 if it is causing repeated long waits; design carefully because memory pressure risk is high. PDF retained-cache follow-up is implemented in the post-v1.6.0 patch; remaining PDF raster/upload latency should be tracked separately if it remains visible.

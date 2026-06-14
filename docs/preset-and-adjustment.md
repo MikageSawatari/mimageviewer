@@ -458,7 +458,7 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
 | `conceal_cache` | `HashMap<idx, ConcealCacheEntry>` | 隠蔽加工合成済みテクスチャ |
 | `edit_result_cache` | `HashMap<EditResultKey, EditResultEntry>` | `raw -> erase -> local_adjust -> conceal` の source 解像度 edit 結果。AdjustParams / AI / post_filter / crop は含めない |
 | `final_ai_cache` | `HashMap<FinalAiKey, Arc<ColorImage>>` | 色調補正後の edit 結果へ AI アップスケール / デノイズを適用した結果 |
-| `retained_final_ai_cache` | `HashMap<RetainedFinalAiKey, RetainedFinalAiEntry>` | fullscreen session をまたいで保持する final AI pixels。`metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で識別し、枚数 / MiB の LRU で退去 |
+| `retained_final_ai_cache` | `HashMap<RetainedFinalAiKey, RetainedFinalAiEntry>` | fullscreen session をまたいで保持する final AI pixels。`metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で識別し、枚数 / MiB の LRU で退去。PDF display job は session close / keep-set eviction 時に最大 1 件だけ retained store 目的で完走を許可できる |
 | `final_composite_cache` | `HashMap<FinalCompositeKey, FinalCompositeEntry>` | edit 結果に AdjustParams 全項目、final AI、スマートシャープ、post_filter を適用した通常表示用テクスチャ |
 
 描画時 ([display-pipeline.md](display-pipeline.md) を参照) は:
@@ -513,7 +513,11 @@ AI 完了時に未完了の final composite を捨てて AI 後の画像へ掛�
 keep-set eviction では消さず、AI 入力が変わる編集 (`clear_final_pipeline_caches_for_idx`)
 や AI 機能モード / サイズ上限変更で破棄する。fullscreen close / reopen に伴う同じ item の
 `fs_cache` 再ロードは `bump_input_generation_for_fs_cache_reload` で live cache だけを
-無効化し、保持 LRU は残す。保持 LRU の `store` / `hit` / `miss` /
+無効化し、保持 LRU は残す。PDF ページの display final AI は、完了前に live 表示セッションから
+外れても retained key と retained epoch を job に持たせておき、最大 1 件だけ cancel せず
+完走させられる。この orphan result は保持 LRU にだけ store し、idx ベースの live
+`final_ai_cache` には戻さない。外部変更や AI 設定変更で retained epoch が進んでいた結果は
+store 時に捨てる。保持 LRU の `store` / `hit` / `miss` /
 `skip` / `evict` / `clear` は通常ログ (`mimageviewer.log`) に出るため、同じページへ
 戻ったときに推論再実行ではなく保持結果の復元だったか、または保持前に破棄されたかを
 後から確認できる。
