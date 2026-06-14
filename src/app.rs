@@ -2310,6 +2310,11 @@ pub struct App {
     /// 詳細モードは `update_keep_range_and_requests` が毎フレーム呼ばれるので、
     /// O(n) の eviction とキュー drain を初回だけに抑える。
     pub(crate) details_thumb_suppression_applied: bool,
+    /// 詳細表示のプレビュー列で現在ホバー中の idx。
+    /// 詳細モードでは通常 `keep_set` を空にするが、この 1 件だけを一時保持して
+    /// サムネイルツールチップに使う。
+    pub(crate) details_hover_thumb_idx: Option<usize>,
+    pub(crate) details_hover_thumb_viewport_open: bool,
     /// ワーカー共有用: keep_range の start/end をアトミックに公開。
     /// ワーカーは pick 後にこの範囲を確認し、範囲外のリクエストをスキップする。
     /// (set そのものを共有するのは実装負荷が大きいため bounding box で近似する。
@@ -4702,6 +4707,8 @@ impl App {
             keep_range: (0, 0),
             keep_set: std::collections::HashSet::new(),
             details_thumb_suppression_applied: false,
+            details_hover_thumb_idx: None,
+            details_hover_thumb_viewport_open: false,
             keep_start_shared: Arc::new(AtomicUsize::new(0)),
             keep_end_shared: Arc::new(AtomicUsize::new(0)),
             texture_backlog: Vec::new(),
@@ -10470,6 +10477,7 @@ impl App {
         self.texture_backlog.clear();
         self.keep_range = (0, 0);
         self.keep_set.clear();
+        self.details_hover_thumb_idx = None;
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
@@ -12179,6 +12187,7 @@ impl App {
         self.checked.clear();
         self.keep_range = (0, 0);
         self.keep_set.clear();
+        self.details_hover_thumb_idx = None;
         self.keep_start_shared.store(0, Ordering::Relaxed);
         self.keep_end_shared.store(0, Ordering::Relaxed);
 
@@ -14120,6 +14129,161 @@ impl App {
         // 評価する必要があるので無条件に呼ぶ (内部の早期 return が安価)。
         // 通常の poll 経路は streak 連勝を要求するので immediate=false。
         self.maybe_apply_auto_aspect(false);
+    }
+
+    pub(crate) fn set_details_hover_thumbnail_idx(&mut self, idx: Option<usize>) {
+        if self.settings.grid_view_mode != crate::settings::GridViewMode::Details {
+            self.clear_details_hover_keep();
+            return;
+        }
+
+        if self.details_hover_thumb_idx != idx {
+            if let Some(prev_idx) = self.details_hover_thumb_idx {
+                self.remove_details_hover_thumbnail_request(prev_idx);
+                self.evict_details_hover_thumbnail(prev_idx);
+            }
+            self.details_hover_thumb_idx = idx;
+        }
+
+        let Some(idx) = idx else {
+            self.clear_details_hover_keep();
+            return;
+        };
+        if idx >= self.items.len() {
+            self.clear_details_hover_keep();
+            return;
+        }
+
+        self.keep_set.clear();
+        self.keep_set.insert(idx);
+        self.keep_range = (idx, idx + 1);
+        self.keep_start_shared.store(idx, Ordering::Relaxed);
+        self.keep_end_shared.store(idx + 1, Ordering::Relaxed);
+        self.scroll_hint.store(idx, Ordering::Relaxed);
+        self.visible_end_shared.store(idx + 1, Ordering::Relaxed);
+        let display_px = (320.0 * self.last_pixels_per_point.max(1.0)).round() as u32;
+        self.display_px_shared
+            .store(display_px.clamp(128, 1024), Ordering::Relaxed);
+        self.enqueue_details_hover_thumbnail(idx);
+    }
+
+    fn clear_details_hover_keep(&mut self) {
+        if let Some(idx) = self.details_hover_thumb_idx.take() {
+            self.remove_details_hover_thumbnail_request(idx);
+            self.evict_details_hover_thumbnail(idx);
+        }
+        self.keep_range = (0, 0);
+        self.keep_set.clear();
+        self.keep_start_shared.store(0, Ordering::Relaxed);
+        self.keep_end_shared.store(0, Ordering::Relaxed);
+    }
+
+    fn remove_details_hover_thumbnail_request(&mut self, idx: usize) {
+        if let Some(queue_arc) = self.reload_queue.clone() {
+            let (ref mtx, _) = *queue_arc;
+            let mut q = mtx.lock().unwrap();
+            q.retain(|req| req.idx != idx);
+        }
+        if let Some(queue_arc) = self.heavy_io_queue.clone() {
+            let (ref mtx, _) = *queue_arc;
+            let mut q = mtx.lock().unwrap();
+            q.retain(|req| req.idx != idx);
+        }
+        self.requested.remove(&idx);
+        self.pending_finalize.remove(&idx);
+    }
+
+    fn evict_details_hover_thumbnail(&mut self, idx: usize) {
+        if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+            return;
+        }
+        if matches!(
+            self.thumbnails.get(idx),
+            Some(ThumbnailState::Loaded { .. })
+        ) && let Some(thumb) = self.thumbnails.get_mut(idx)
+        {
+            *thumb = ThumbnailState::Evicted;
+        }
+        self.thumb_pixels.remove(&idx);
+        self.thumb_adjust_tex.remove(&idx);
+    }
+
+    fn enqueue_details_hover_thumbnail(&mut self, idx: usize) {
+        if self.requested.contains_key(&idx) {
+            return;
+        }
+        let Some(state) = self.thumbnails.get(idx) else {
+            return;
+        };
+        if !matches!(state, ThumbnailState::Pending | ThumbnailState::Evicted) {
+            return;
+        }
+
+        let use_full_path_keys = self.use_full_path_cache_keys();
+        let req_opt = if self.items_are_drive_list {
+            self.items.get(idx).and_then(|item| {
+                make_drive_list_pin_load_request(
+                    item,
+                    idx,
+                    self.settings.folder_thumb_sort,
+                    self.settings.folder_thumb_depth,
+                    &self.folder_pin_map,
+                    self.folder_thumb_pin_db.as_deref(),
+                )
+            })
+        } else {
+            let Some((mtime, file_size)) = self.image_metas.get(idx).copied().flatten() else {
+                return;
+            };
+            self.items.get(idx).and_then(|item| {
+                make_load_request(
+                    item,
+                    idx,
+                    mtime,
+                    file_size,
+                    false,
+                    self.pdf_current_password.as_deref(),
+                    Some(self.settings.folder_thumb_sort),
+                    self.settings.folder_thumb_depth,
+                    &self.folder_pin_map,
+                    &self.converted_archive_cache_paths,
+                    self.archive_source_override.as_deref(),
+                    self.current_folder.as_deref(),
+                    self.folder_thumb_pin_db.as_deref(),
+                    self.video_pin_db.as_ref(),
+                    use_full_path_keys,
+                )
+            })
+        };
+
+        let Some(mut req) = req_opt else {
+            return;
+        };
+        if !self.items_are_drive_list
+            && let Some(item) = self.items.get(idx)
+            && self.should_force_cache_for_drive_list_pin(item)
+        {
+            req.force_cache = true;
+        }
+        req.priority = true;
+        req.input_seq = self.input_seq;
+        req.items_gen = self.items_generation;
+        req.context_epoch = crate::pdf_loader::current_render_context_epoch();
+        let is_heavy = self.items.get(idx).is_some_and(|item| item.is_heavy_io());
+        let queue = if is_heavy {
+            self.heavy_io_queue.clone()
+        } else {
+            self.reload_queue.clone()
+        };
+        let Some(queue_arc) = queue else {
+            return;
+        };
+        self.requested.insert(idx, false);
+        let (ref mtx, ref cvar) = *queue_arc;
+        let mut q = mtx.lock().unwrap();
+        q.push(req);
+        drop(q);
+        cvar.notify_one();
     }
 
     /// 段階 B: ページ単位先読み + eviction のメインロジック。
@@ -18107,7 +18271,10 @@ impl App {
         }
         if let Some(meta) = self.details_lazy_meta_for_idx(idx) {
             if let Some(created_at) = meta.created_at {
-                return format_details_timestamp(created_at);
+                return format_details_timestamp(
+                    created_at,
+                    self.settings.details_timestamp_show_seconds,
+                );
             }
             if meta.created_at_failed {
                 return "-".to_string();
@@ -18975,6 +19142,7 @@ impl App {
                 }
             }
             crate::settings::GridViewMode::Thumbnail => {
+                self.clear_details_hover_keep();
                 self.cancel_details_meta_loading();
                 self.details_order.clear();
                 self.details_tag_prewarm_indices.clear();

@@ -161,11 +161,14 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 - ツールバーの列セクションで `詳細` を選ぶか、<kbd>Alt</kbd>+<kbd>-</kbd> で
   `サムネ` / `詳細` を切り替える。<kbd>Alt</kbd>+<kbd>1</kbd>〜<kbd>0</kbd> は
   サムネ表示に戻して列数を切り替える
-- 詳細モードはサムネイルを描画せず、固定行高の一覧で `名前` / `★` / `タグ` /
-  `種類` / `サイズ` / `更新日時` / `状態` を表示する
+- 詳細モードは固定行高の一覧で、既定では左端にプレビューアイコン列を置き、続けて
+  `名前` / `★` / `タグ` / `種類` / `サイズ` / `更新日時` / `状態` を表示する。
+  プレビューアイコンにホバーすると、その 1 件だけサムネイルを読み込み、メインウィンドウ外の
+  画面内に収まるツールチップで表示する
 - 詳細一覧ヘッダの右クリックメニューから、`名前` 以外の既定列と追加列を表示/非表示にできる。
   同じメニューでサイズ列の表示単位を `最適` (既定) / `固定: バイト` / `固定: KB` /
   `固定: MB` から選べる。固定表示では整数部を 3 桁カンマ区切りにする。
+  同じメニューの日時セクションで `秒まで表示` を切り替えられる。
   `作成日時`、`画像解像度`、`動画長さ`、`動画解像度`、`動画コーデック` は遅延ロード列で、
   `作成日時` は既定で非表示。
   画像は既存のフルスクリーンキャッシュ / サムネイルカタログ / 画像ヘッダ probe、
@@ -183,7 +186,8 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   先読み、連結読み、スライドショーは、フィルタ後かつ列ヘッダソート後の表示順を使う。
   Ctrl+↑↓ / Ctrl+PageUp/PageDown のフォルダ横断は別経路で、詳細ソートや facet 条件は
   次フォルダ探索には持ち込まない
-- 詳細モード中は新規サムネイル要求を抑制し、既存サムネイルテクスチャも一度だけ解放する。
+- 詳細モード中は通常の新規サムネイル要求を抑制し、既存サムネイルテクスチャも一度だけ解放する。
+  ただしプレビューアイコンにホバーしている 1 件だけは一時的な保持範囲として worker に要求する。
   ただし動画サムネイルはフォルダロード時の専用 worker で取得するため、サムネモードへ戻った時に
   再表示できるよう保持する。列数・縦横比の設定はサムネモードへ戻った時のために保持する
 - サムネ / 詳細の両モード共通で、ツールバー下のスマートフィルタバーから
@@ -717,12 +721,14 @@ SendTo から渡されたファイル / フォルダは Windows により位置�
 | 設定名 | 型 | デフォルト | 説明 |
 |--------|-----|---------|------|
 | `grid_cols` | usize | 4 | サムネイルグリッド列数（1〜10） |
-| `grid_view_mode` | GridViewMode | Thumbnail | グリッドの表示モード。`Thumbnail` は従来のサムネイルグリッド、`Details` はサムネイルを描画しない詳細一覧 |
+| `grid_view_mode` | GridViewMode | Thumbnail | グリッドの表示モード。`Thumbnail` は従来のサムネイルグリッド、`Details` は行ベースの詳細一覧 |
 | `details_sort_key` | DetailsSortKey | Toolbar | 詳細表示モードの列ヘッダソートキー。`Toolbar` はツールバーのロード時ソート順、ほかに Name / Rating / Tags / Kind / Size / Modified / Created / State / ImageDimensions / VideoDuration / VideoDimensions / VideoCodec |
 | `details_sort_ascending` | bool | true | 詳細表示モードの列ソート方向。`true` は昇順、`false` は降順 |
 | `details_size_display_mode` | DetailsSizeDisplayMode | Optimal | 詳細表示モードのサイズ列表示。`Optimal` は B / KB / MB / GB から自動選択、固定モードは Bytes / KB / MB |
+| `details_timestamp_show_seconds` | bool | false | 詳細表示モードの更新日時 / 作成日時を秒まで表示するか |
 | `details_column_order` | Vec\<DetailsColumnId\> | [] | 詳細表示モードの列順。空なら既定順。列ヘッダの横ドラッグで更新される |
 | `details_column_widths` | Vec\<DetailsColumnWidth\> | [] | 詳細表示モードの列幅。`名前` 以外を列ヘッダ右端ドラッグで更新する |
+| `details_show_preview` | bool | true | 詳細表示モードで左端のプレビューアイコン列を表示するか |
 | `details_show_rating` | bool | true | 詳細表示モードで `★` 列を表示するか |
 | `details_show_tags` | bool | true | 詳細表示モードで `タグ` 列を表示するか |
 | `details_show_kind` | bool | true | 詳細表示モードで `種類` 列を表示するか |

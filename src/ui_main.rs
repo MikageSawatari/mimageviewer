@@ -463,6 +463,7 @@ fn switch_menubar_popup_on_hover(ctx: &egui::Context, responses: &[egui::Respons
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum DetailsColumn {
+    Preview,
     Name,
     Rating,
     Tags,
@@ -480,6 +481,7 @@ enum DetailsColumn {
 impl DetailsColumn {
     fn all() -> &'static [Self] {
         &[
+            Self::Preview,
             Self::Name,
             Self::Rating,
             Self::Tags,
@@ -497,6 +499,7 @@ impl DetailsColumn {
 
     fn title(self) -> &'static str {
         match self {
+            Self::Preview => "",
             Self::Name => "名前",
             Self::Rating => "★",
             Self::Tags => "タグ",
@@ -514,6 +517,7 @@ impl DetailsColumn {
 
     fn id(self) -> DetailsColumnId {
         match self {
+            Self::Preview => DetailsColumnId::Preview,
             Self::Name => DetailsColumnId::Name,
             Self::Rating => DetailsColumnId::Rating,
             Self::Tags => DetailsColumnId::Tags,
@@ -531,6 +535,7 @@ impl DetailsColumn {
 
     fn from_id(id: DetailsColumnId) -> Self {
         match id {
+            DetailsColumnId::Preview => Self::Preview,
             DetailsColumnId::Name => Self::Name,
             DetailsColumnId::Rating => Self::Rating,
             DetailsColumnId::Tags => Self::Tags,
@@ -546,20 +551,21 @@ impl DetailsColumn {
         }
     }
 
-    fn sort_key(self) -> DetailsSortKey {
+    fn sort_key(self) -> Option<DetailsSortKey> {
         match self {
-            Self::Name => DetailsSortKey::Name,
-            Self::Rating => DetailsSortKey::Rating,
-            Self::Tags => DetailsSortKey::Tags,
-            Self::Kind => DetailsSortKey::Kind,
-            Self::Size => DetailsSortKey::Size,
-            Self::Modified => DetailsSortKey::Modified,
-            Self::Created => DetailsSortKey::Created,
-            Self::State => DetailsSortKey::State,
-            Self::ImageDimensions => DetailsSortKey::ImageDimensions,
-            Self::VideoDuration => DetailsSortKey::VideoDuration,
-            Self::VideoDimensions => DetailsSortKey::VideoDimensions,
-            Self::VideoCodec => DetailsSortKey::VideoCodec,
+            Self::Preview => None,
+            Self::Name => Some(DetailsSortKey::Name),
+            Self::Rating => Some(DetailsSortKey::Rating),
+            Self::Tags => Some(DetailsSortKey::Tags),
+            Self::Kind => Some(DetailsSortKey::Kind),
+            Self::Size => Some(DetailsSortKey::Size),
+            Self::Modified => Some(DetailsSortKey::Modified),
+            Self::Created => Some(DetailsSortKey::Created),
+            Self::State => Some(DetailsSortKey::State),
+            Self::ImageDimensions => Some(DetailsSortKey::ImageDimensions),
+            Self::VideoDuration => Some(DetailsSortKey::VideoDuration),
+            Self::VideoDimensions => Some(DetailsSortKey::VideoDimensions),
+            Self::VideoCodec => Some(DetailsSortKey::VideoCodec),
         }
     }
 
@@ -576,6 +582,7 @@ impl DetailsColumn {
 
     fn visible(self, settings: &crate::settings::Settings) -> bool {
         match self {
+            Self::Preview => settings.details_show_preview,
             Self::Name => true,
             Self::Rating => settings.details_show_rating,
             Self::Tags => settings.details_show_tags,
@@ -593,6 +600,7 @@ impl DetailsColumn {
 
     fn default_width(self) -> f32 {
         match self {
+            Self::Preview => 34.0,
             Self::Name => 140.0,
             Self::Rating => 58.0,
             Self::Tags => 160.0,
@@ -604,6 +612,13 @@ impl DetailsColumn {
             Self::VideoDuration => 94.0,
             Self::VideoDimensions => 112.0,
             Self::VideoCodec => 112.0,
+        }
+    }
+
+    fn min_width(self) -> f32 {
+        match self {
+            Self::Preview => 28.0,
+            _ => 40.0,
         }
     }
 }
@@ -645,7 +660,7 @@ fn details_column_width(settings: &crate::settings::Settings, col: DetailsColumn
         .find(|entry| entry.column == col.id())
         .map(|entry| entry.width)
         .unwrap_or_else(|| col.default_width())
-        .clamp(40.0, 800.0)
+        .clamp(col.min_width(), 800.0)
 }
 
 fn set_details_column_width(
@@ -656,7 +671,7 @@ fn set_details_column_width(
     if col == DetailsColumn::Name {
         return false;
     }
-    let width = width.clamp(40.0, 800.0);
+    let width = width.clamp(col.min_width(), 800.0);
     if let Some(entry) = settings
         .details_column_widths
         .iter_mut()
@@ -720,11 +735,30 @@ fn details_column_rects(
     out
 }
 
-fn details_column_at(
+fn details_column_at_x(
     columns: &[(DetailsColumn, egui::Rect)],
-    pos: egui::Pos2,
+    x: f32,
 ) -> Option<(DetailsColumn, egui::Rect)> {
-    columns.iter().copied().find(|(_, rect)| rect.contains(pos))
+    let first = columns.first().copied()?;
+    let last = columns.last().copied()?;
+    if x <= first.1.left() {
+        return Some(first);
+    }
+    if x >= last.1.right() {
+        return Some(last);
+    }
+    columns
+        .iter()
+        .copied()
+        .find(|(_, rect)| x >= rect.left() && x <= rect.right())
+}
+
+fn clamp_details_tooltip_axis(value: f32, min: f32, max: f32) -> f32 {
+    if max < min {
+        min
+    } else {
+        value.clamp(min, max)
+    }
 }
 
 fn reorder_details_column(
@@ -798,6 +832,57 @@ fn draw_details_text(
     );
 }
 
+fn draw_details_preview_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    color: egui::Color32,
+    muted: bool,
+) {
+    if rect.width() < 12.0 || rect.height() < 12.0 {
+        return;
+    }
+    let alpha = if muted { 90 } else { color.a() };
+    let stroke_color =
+        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
+    let icon = egui::Rect::from_center_size(
+        rect.center(),
+        egui::vec2(rect.width().min(17.0), rect.height().min(15.0)),
+    );
+    let stroke = egui::Stroke::new(1.25, stroke_color);
+    painter.rect_stroke(icon, 2.0, stroke, egui::StrokeKind::Inside);
+    painter.circle_filled(
+        egui::pos2(
+            icon.left() + icon.width() * 0.28,
+            icon.top() + icon.height() * 0.32,
+        ),
+        1.7,
+        stroke_color,
+    );
+    let mountain = vec![
+        egui::pos2(
+            icon.left() + icon.width() * 0.16,
+            icon.bottom() - icon.height() * 0.22,
+        ),
+        egui::pos2(
+            icon.left() + icon.width() * 0.42,
+            icon.top() + icon.height() * 0.55,
+        ),
+        egui::pos2(
+            icon.left() + icon.width() * 0.57,
+            icon.bottom() - icon.height() * 0.32,
+        ),
+        egui::pos2(
+            icon.left() + icon.width() * 0.78,
+            icon.top() + icon.height() * 0.44,
+        ),
+        egui::pos2(
+            icon.right() - icon.width() * 0.12,
+            icon.bottom() - icon.height() * 0.22,
+        ),
+    ];
+    painter.add(egui::Shape::line(mountain, stroke));
+}
+
 fn details_kind_label(item: &GridItem) -> String {
     match item {
         GridItem::Folder(path) if crate::path_key::is_drive_or_share_root(path) => {
@@ -852,7 +937,7 @@ fn details_ext_kind(path: &Path, fallback: &str) -> String {
 }
 
 #[cfg(windows)]
-fn format_details_mtime(secs: i64) -> String {
+fn format_details_mtime(secs: i64, show_seconds: bool) -> String {
     if secs <= 0 {
         return String::new();
     }
@@ -879,14 +964,21 @@ fn format_details_mtime(secs: i64) -> String {
     {
         return String::new();
     }
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
-    )
+    if show_seconds {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+        )
+    } else {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
+        )
+    }
 }
 
 #[cfg(not(windows))]
-fn format_details_mtime(secs: i64) -> String {
+fn format_details_mtime(secs: i64, _show_seconds: bool) -> String {
     if secs <= 0 {
         String::new()
     } else {
@@ -4056,6 +4148,7 @@ impl App {
         let mut nav: Option<PathBuf> = None;
         let mut body_inner_rect = egui::Rect::NOTHING;
         let mut egui_offset_y = self.scroll_offset_y;
+        let mut hovered_preview: Option<(usize, egui::Rect)> = None;
         egui::ScrollArea::horizontal()
             .id_salt("details_list_horizontal")
             .auto_shrink([false, false])
@@ -4120,13 +4213,15 @@ impl App {
                                 break;
                             }
 
-                            self.draw_details_row(
+                            if let Some(preview_rect) = self.draw_details_row(
                                 ui,
                                 row_rect,
                                 idx,
                                 row,
                                 spread_pair_cursor_idx == Some(idx),
-                            );
+                            ) {
+                                hovered_preview = Some((idx, preview_rect));
+                            }
                             if self.selected == Some(idx) {
                                 self.selected_cell_rect = Some(row_rect);
                             }
@@ -4149,8 +4244,152 @@ impl App {
 
         let full_rect = ui.max_rect();
         self.draw_feedback_toast(ui, full_rect, ctx);
+        self.render_details_thumbnail_tooltip(ctx, hovered_preview);
 
         nav
+    }
+
+    fn render_details_thumbnail_tooltip(
+        &mut self,
+        ctx: &egui::Context,
+        hovered_preview: Option<(usize, egui::Rect)>,
+    ) {
+        let viewport_id = egui::ViewportId::from_hash_of("details_thumbnail_tooltip");
+        let Some((idx, anchor_rect)) = hovered_preview else {
+            self.set_details_hover_thumbnail_idx(None);
+            if self.details_hover_thumb_viewport_open {
+                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+                self.details_hover_thumb_viewport_open = false;
+            }
+            return;
+        };
+
+        self.set_details_hover_thumbnail_idx(Some(idx));
+
+        let texture = match self.thumbnails.get(idx) {
+            Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
+            _ => None,
+        };
+        let failed = matches!(self.thumbnails.get(idx), Some(ThumbnailState::Failed));
+        let image_size = texture
+            .as_ref()
+            .map(|tex| {
+                let tex_size = tex.size_vec2();
+                let max_side = 320.0;
+                if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+                    egui::vec2(180.0, 120.0)
+                } else {
+                    let scale = (max_side / tex_size.x).min(max_side / tex_size.y).min(1.0);
+                    egui::vec2(tex_size.x * scale, tex_size.y * scale)
+                }
+            })
+            .unwrap_or_else(|| egui::vec2(180.0, 120.0));
+        let padding = 8.0;
+        let viewport_size = image_size + egui::vec2(padding * 2.0, padding * 2.0);
+        let anchor_screen_rect = self.details_anchor_screen_rect(ctx, anchor_rect);
+        let pos = self.details_thumbnail_tooltip_pos(ctx, anchor_screen_rect, viewport_size);
+        let loaded = texture.is_some();
+
+        let builder = egui::ViewportBuilder::default()
+            .with_title("mimageviewer preview")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_transparent(false)
+            .with_taskbar(false)
+            .with_always_on_top()
+            .with_mouse_passthrough(true)
+            .with_position(pos)
+            .with_inner_size(viewport_size)
+            .with_min_inner_size(viewport_size)
+            .with_max_inner_size(viewport_size)
+            .with_visible(true);
+
+        ctx.show_viewport_immediate(viewport_id, builder, move |vp_ctx, _class| {
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(vp_ctx.style().visuals.extreme_bg_color)
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            vp_ctx
+                                .style()
+                                .visuals
+                                .widgets
+                                .noninteractive
+                                .bg_stroke
+                                .color,
+                        ))
+                        .inner_margin(egui::Margin::same(padding as i8)),
+                )
+                .show(vp_ctx, |ui| {
+                    let rect = ui.max_rect().shrink(padding);
+                    if let Some(tex) = texture.as_ref() {
+                        let img_rect = egui::Rect::from_center_size(rect.center(), image_size);
+                        ui.painter().image(
+                            tex.id(),
+                            img_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(if failed {
+                                "表示できません"
+                            } else {
+                                "読み込み中..."
+                            });
+                        });
+                    }
+                });
+        });
+        self.details_hover_thumb_viewport_open = true;
+        if !loaded && !failed {
+            ctx.request_repaint();
+        }
+    }
+
+    fn details_anchor_screen_rect(
+        &self,
+        ctx: &egui::Context,
+        anchor_rect: egui::Rect,
+    ) -> egui::Rect {
+        let origin = ctx
+            .input(|i| i.viewport().inner_rect.map(|rect| rect.min))
+            .or_else(|| self.last_outer_rect.map(|rect| rect.min))
+            .unwrap_or(egui::Pos2::ZERO);
+        egui::Rect::from_min_max(
+            origin + anchor_rect.min.to_vec2(),
+            origin + anchor_rect.max.to_vec2(),
+        )
+    }
+
+    fn details_thumbnail_tooltip_pos(
+        &self,
+        ctx: &egui::Context,
+        anchor_rect: egui::Rect,
+        size: egui::Vec2,
+    ) -> egui::Pos2 {
+        let ppp = self.last_pixels_per_point.max(0.1);
+        let monitor_rect = crate::monitor::get_monitor_logical_rect_at(
+            anchor_rect.center().x * ppp,
+            anchor_rect.center().y * ppp,
+        )
+        .or(self.last_outer_rect)
+        .unwrap_or_else(|| egui::Rect::from_min_size(egui::Pos2::ZERO, ctx.content_rect().size()));
+
+        let margin = 6.0;
+        let gap = 8.0;
+        let min_x = monitor_rect.left() + margin;
+        let max_x = monitor_rect.right() - margin - size.x;
+        let x = clamp_details_tooltip_axis(anchor_rect.center().x - size.x * 0.5, min_x, max_x);
+
+        let above = anchor_rect.top() - gap - size.y;
+        let below = anchor_rect.bottom() + gap;
+        let min_y = monitor_rect.top() + margin;
+        let max_y = monitor_rect.bottom() - margin - size.y;
+        let preferred_y = if above >= min_y { above } else { below };
+        let y = clamp_details_tooltip_axis(preferred_y, min_y, max_y);
+        egui::pos2(x, y)
     }
 
     fn draw_details_header(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -4180,9 +4419,11 @@ impl App {
             }
             let sort_key = col.sort_key();
             let lazy_sort = col.is_lazy();
-            let sort_enabled = !lazy_sort || self.details_lazy_sort_ready();
+            let sort_enabled = sort_key.is_some() && (!lazy_sort || self.details_lazy_sort_ready());
             if response.clicked() && sort_enabled {
-                self.set_details_sort_key(col.sort_key());
+                if let Some(sort_key) = sort_key {
+                    self.set_details_sort_key(sort_key);
+                }
             }
             if response.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -4192,7 +4433,7 @@ impl App {
                     .total_drag_delta()
                     .is_some_and(|delta| delta.x.abs() >= 12.0)
                 && let Some(pointer_pos) = ui.ctx().input(|i| i.pointer.latest_pos())
-                && let Some((target, target_rect)) = details_column_at(&columns, pointer_pos)
+                && let Some((target, target_rect)) = details_column_at_x(&columns, pointer_pos.x)
             {
                 let insert_after = pointer_pos.x > target_rect.center().x;
                 if reorder_details_column(&mut self.settings, col, target, insert_after) {
@@ -4200,7 +4441,8 @@ impl App {
                     ui.ctx().request_repaint();
                 }
             }
-            let sorted = self.settings.details_sort_key == sort_key;
+            let sorted =
+                sort_key.is_some_and(|sort_key| self.settings.details_sort_key == sort_key);
             let mut base_title = col.title().to_string();
             if matches!(
                 col,
@@ -4236,6 +4478,14 @@ impl App {
                 text_color,
                 true,
             );
+            if col == DetailsColumn::Preview {
+                draw_details_preview_icon(
+                    ui.painter(),
+                    col_rect.shrink2(egui::vec2(6.0, 4.0)),
+                    text_color,
+                    false,
+                );
+            }
             ui.painter().line_segment(
                 [col_rect.right_top(), col_rect.right_bottom()],
                 egui::Stroke::new(1.0, stroke_color),
@@ -4273,6 +4523,8 @@ impl App {
             }
             let response = if sort_enabled {
                 response.hover_tip("クリックで 昇順 → 降順 → ソートなし")
+            } else if sort_key.is_none() {
+                response.hover_tip("サムネイルプレビュー")
             } else {
                 response.hover_tip("詳細情報の読み込み完了後に並べ替えできます")
             };
@@ -4296,6 +4548,9 @@ impl App {
             self.settings.details_show_video_codec,
         );
         let mut changed = false;
+        changed |= ui
+            .checkbox(&mut self.settings.details_show_preview, "プレビュー")
+            .changed();
         changed |= ui
             .checkbox(&mut self.settings.details_show_rating, "★")
             .changed();
@@ -4358,6 +4613,15 @@ impl App {
                 .changed();
         }
 
+        ui.separator();
+        ui.label("日時");
+        changed |= ui
+            .checkbox(
+                &mut self.settings.details_timestamp_show_seconds,
+                "秒まで表示",
+            )
+            .changed();
+
         if changed {
             let new_lazy = (
                 self.settings.details_show_created,
@@ -4392,9 +4656,9 @@ impl App {
         idx: usize,
         _row: usize,
         is_spread_pair_cursor: bool,
-    ) {
+    ) -> Option<egui::Rect> {
         let Some(item) = self.items.get(idx).cloned() else {
-            return;
+            return None;
         };
         let visuals = ui.visuals();
         let selected = self.selected == Some(idx);
@@ -4455,13 +4719,34 @@ impl App {
                 } else {
                     String::new()
                 };
-                (size_text, format_details_mtime(mtime))
+                (
+                    size_text,
+                    format_details_mtime(mtime, self.settings.details_timestamp_show_seconds),
+                )
             })
             .unwrap_or_else(|| (String::new(), String::new()));
         let state_text = self.details_state_text(idx);
+        let mut hovered_preview_rect = None;
 
         for (col, col_rect) in details_column_rects(rect, &self.settings) {
             match col {
+                DetailsColumn::Preview => {
+                    let enabled = !matches!(item, GridItem::ZipSeparator { .. });
+                    let response = ui.interact(
+                        col_rect,
+                        ui.id().with(("details_preview_icon", idx)),
+                        egui::Sense::hover(),
+                    );
+                    if enabled && response.hovered() {
+                        hovered_preview_rect = Some(col_rect);
+                    }
+                    draw_details_preview_icon(
+                        ui.painter(),
+                        col_rect.shrink2(egui::vec2(6.0, 5.0)),
+                        text_color,
+                        !enabled,
+                    );
+                }
                 DetailsColumn::Name => draw_details_text(
                     ui,
                     col_rect,
@@ -4560,6 +4845,7 @@ impl App {
                 ),
             }
         }
+        hovered_preview_rect
     }
 
     fn details_state_text(&mut self, idx: usize) -> String {
@@ -4602,6 +4888,14 @@ impl App {
     pub(crate) fn render_grid(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
         let scroll_to = self.scroll_to_selected;
         self.scroll_to_selected = false;
+        if self.settings.grid_view_mode != GridViewMode::Details
+            && self.details_hover_thumb_viewport_open
+        {
+            let viewport_id = egui::ViewportId::from_hash_of("details_thumbnail_tooltip");
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+            self.details_hover_thumb_viewport_open = false;
+            self.set_details_hover_thumbnail_idx(None);
+        }
 
         egui::CentralPanel::default()
             .show(ctx, |ui| -> Option<PathBuf> {
@@ -5244,6 +5538,7 @@ mod compute_cell_size_tests {
 
     fn minimal_details_settings() -> crate::settings::Settings {
         let mut settings = crate::settings::Settings::default();
+        settings.details_show_preview = false;
         settings.details_show_rating = false;
         settings.details_show_tags = false;
         settings.details_show_kind = false;
@@ -5281,14 +5576,17 @@ mod compute_cell_size_tests {
             false
         ));
 
-        assert_eq!(
-            settings.details_column_order.first().copied(),
-            Some(DetailsColumnId::Size)
-        );
-        assert_eq!(
-            settings.details_column_order.get(1).copied(),
-            Some(DetailsColumnId::Name)
-        );
+        let size_pos = settings
+            .details_column_order
+            .iter()
+            .position(|id| *id == DetailsColumnId::Size)
+            .expect("size column is present");
+        let name_pos = settings
+            .details_column_order
+            .iter()
+            .position(|id| *id == DetailsColumnId::Name)
+            .expect("name column is present");
+        assert!(size_pos < name_pos);
     }
 
     #[test]

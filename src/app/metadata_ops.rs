@@ -55,7 +55,7 @@ pub(super) fn format_details_duration(secs: f64) -> String {
 }
 
 #[cfg(windows)]
-pub(super) fn format_details_timestamp(secs: i64) -> String {
+pub(super) fn format_details_timestamp(secs: i64, show_seconds: bool) -> String {
     if secs <= 0 {
         return String::new();
     }
@@ -82,14 +82,21 @@ pub(super) fn format_details_timestamp(secs: i64) -> String {
     {
         return String::new();
     }
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
-    )
+    if show_seconds {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+        )
+    } else {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute
+        )
+    }
 }
 
 #[cfg(not(windows))]
-pub(super) fn format_details_timestamp(secs: i64) -> String {
+pub(super) fn format_details_timestamp(secs: i64, _show_seconds: bool) -> String {
     if secs <= 0 {
         String::new()
     } else {

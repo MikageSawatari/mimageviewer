@@ -349,6 +349,7 @@ impl DetailsSizeDisplayMode {
     serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
 )]
 pub enum DetailsColumnId {
+    Preview,
     Name,
     Rating,
     Tags,
@@ -366,6 +367,7 @@ pub enum DetailsColumnId {
 impl DetailsColumnId {
     pub fn default_order() -> &'static [Self] {
         &[
+            Self::Preview,
             Self::Name,
             Self::Rating,
             Self::Tags,
@@ -1347,9 +1349,13 @@ pub struct Settings {
     #[serde(default)]
     pub details_size_display_mode: DetailsSizeDisplayMode,
     #[serde(default)]
+    pub details_timestamp_show_seconds: bool,
+    #[serde(default)]
     pub details_column_order: Vec<DetailsColumnId>,
     #[serde(default)]
     pub details_column_widths: Vec<DetailsColumnWidth>,
+    #[serde(default = "default_true")]
+    pub details_show_preview: bool,
     #[serde(default = "default_true")]
     pub details_show_rating: bool,
     #[serde(default = "default_true")]
@@ -2705,7 +2711,11 @@ fn sanitize_details_column_order(order: &mut Vec<DetailsColumnId>) {
     }
     for &column in DetailsColumnId::default_order() {
         if !cleaned.contains(&column) {
-            cleaned.push(column);
+            if column == DetailsColumnId::Preview {
+                cleaned.insert(0, column);
+            } else {
+                cleaned.push(column);
+            }
         }
     }
     *order = cleaned;
@@ -2734,8 +2744,10 @@ impl Default for Settings {
             details_sort_key: DetailsSortKey::default(),
             details_sort_ascending: default_details_sort_ascending(),
             details_size_display_mode: DetailsSizeDisplayMode::default(),
+            details_timestamp_show_seconds: false,
             details_column_order: Vec::new(),
             details_column_widths: Vec::new(),
+            details_show_preview: true,
             details_show_rating: true,
             details_show_tags: true,
             details_show_kind: true,
@@ -3913,8 +3925,10 @@ impl Settings {
         self.details_sort_key = src.details_sort_key;
         self.details_sort_ascending = src.details_sort_ascending;
         self.details_size_display_mode = src.details_size_display_mode;
+        self.details_timestamp_show_seconds = src.details_timestamp_show_seconds;
         self.details_column_order = src.details_column_order.clone();
         self.details_column_widths = src.details_column_widths.clone();
+        self.details_show_preview = src.details_show_preview;
         self.details_show_rating = src.details_show_rating;
         self.details_show_tags = src.details_show_tags;
         self.details_show_kind = src.details_show_kind;
@@ -5779,6 +5793,7 @@ mod tests {
             s.details_sort_key = DetailsSortKey::Size;
             s.details_sort_ascending = false;
             s.details_size_display_mode = DetailsSizeDisplayMode::FixedKb;
+            s.details_timestamp_show_seconds = true;
             s.details_column_order = vec![
                 DetailsColumnId::Size,
                 DetailsColumnId::Name,
@@ -5794,6 +5809,7 @@ mod tests {
                     width: 188.0,
                 },
             ];
+            s.details_show_preview = false;
             s.details_show_rating = false;
             s.details_show_tags = false;
             s.details_show_kind = false;
@@ -5848,8 +5864,17 @@ mod tests {
                 DetailsSizeDisplayMode::FixedKb,
                 "details_size_display_mode should survive roundtrip"
             );
+            assert!(
+                loaded.details_timestamp_show_seconds,
+                "details_timestamp_show_seconds should survive roundtrip"
+            );
             assert_eq!(
                 loaded.details_column_order.first().copied(),
+                Some(DetailsColumnId::Preview),
+                "new preview column should be inserted at the default leading position"
+            );
+            assert_eq!(
+                loaded.details_column_order.get(1).copied(),
                 Some(DetailsColumnId::Size),
                 "details_column_order should survive roundtrip"
             );
@@ -5860,6 +5885,10 @@ mod tests {
                     .any(|entry| entry.column == DetailsColumnId::Size
                         && (entry.width - 128.0).abs() < 0.1),
                 "details_column_widths should survive roundtrip"
+            );
+            assert!(
+                !loaded.details_show_preview,
+                "details_show_preview should survive roundtrip"
             );
             assert!(
                 !loaded.details_show_rating,
