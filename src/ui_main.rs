@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 
 use eframe::egui;
 
-use crate::app::{App, FacetField, LazyColumnState, QuickFolderSlotId};
+use crate::app::{App, FacetField, LazyColumnState, QuickFolderSlotId, QuickFolderSwitchTarget};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::settings::{
     DetailsColumnId, DetailsColumnWidth, DetailsSortKey, FacetDatePreset, FacetEditFlag,
@@ -88,36 +88,6 @@ fn normalize_folder_bar_input_path(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
-}
-
-fn native_folder_bar_path_text(path: &Path) -> String {
-    let text = path.to_string_lossy().to_string();
-    #[cfg(windows)]
-    {
-        text.replace('/', "\\")
-    }
-    #[cfg(not(windows))]
-    {
-        text
-    }
-}
-
-fn open_quick_folder_target_in_explorer(path: &Path) {
-    #[cfg(windows)]
-    {
-        let native = native_folder_bar_path_text(path);
-        let mut cmd = std::process::Command::new("explorer.exe");
-        if path.is_dir() {
-            cmd.arg(&native);
-        } else {
-            cmd.arg("/select,").arg(&native);
-        }
-        let _ = cmd.spawn();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-    }
 }
 
 /// 📌 ボタン描画用の状態スナップショット。`render_address_bar` 入口で 1 度算出する。
@@ -2766,7 +2736,6 @@ impl App {
         let parent_nav_target = self.grid_parent_nav_target();
         let back_target = self.folder_history_back_target().cloned();
         let forward_target = self.folder_history_forward_target().cloned();
-        let quick_current_target = self.current_quick_folder_target();
         let quick_folder_targets: [Option<PathBuf>; 2] =
             std::array::from_fn(|idx| self.quick_folder_workspaces[idx].target.clone());
         let active_quick_folder_slot = self.active_quick_folder_slot;
@@ -2896,14 +2865,8 @@ impl App {
                                     crate::folder_tree::path_eq(current, target)
                                 })
                             });
-                            let enabled = !search_active
-                                && !local_search_active
-                                && !snapshot_active
-                                && !drive_list_active
-                                && (target.is_some() || quick_current_target.is_some());
-                            let tooltip = if drive_list_active {
-                                format!("{label}: ドライブ一覧では使用できません")
-                            } else if snapshot_active {
+                            let enabled = !search_active && !local_search_active && !snapshot_active;
+                            let tooltip = if snapshot_active {
                                 format!("{label}: ★固定中は使用できません")
                             } else if search_active {
                                 format!("{label}: 検索中は使用できません")
@@ -2911,16 +2874,11 @@ impl App {
                                 format!("{label}: 現在地検索中は使用できません")
                             } else if let Some(path) = target {
                                 format!(
-                                    "{label}: {}\n左クリック: この場所へ移動\n右クリック: 登録を編集",
-                                    path.to_string_lossy()
-                                )
-                            } else if let Some(path) = quick_current_target.as_ref() {
-                                format!(
-                                    "{label}: 現在の場所を登録\n{}",
+                                    "{label}: {}\n左クリック: この作業場所に切り替え",
                                     path.to_string_lossy()
                                 )
                             } else {
-                                format!("{label}: 登録できる場所がありません")
+                                format!("{label}: 未訪問です\n左クリック: ドライブ一覧へ切り替え")
                             };
                             let mut rich = egui::RichText::new(label).monospace();
                             if is_active {
@@ -2933,70 +2891,32 @@ impl App {
                                 rich = rich.weak();
                             }
                             let response = ui
-                                .add_enabled(enabled, egui::Button::new(rich).min_size(egui::vec2(24.0, 20.0)))
+                                .add_enabled(
+                                    enabled,
+                                    egui::Button::new(rich).min_size(egui::vec2(24.0, 20.0)),
+                                )
                                 .hover_tip(tooltip);
                             if response.clicked() {
-                                if let Some(raw_target) = target.cloned() {
-                                    if let Some(resolved) = resolve_folder_bar_nav_path(&raw_target)
-                                    {
-                                        if self.activate_quick_folder_slot(slot).is_some() {
-                                            result = Some(AddressBarNav::Direct(resolved));
-                                        }
-                                    } else {
-                                        self.show_feedback_toast(format!(
-                                            "{label} の登録先が見つかりません: {}",
-                                            raw_target.to_string_lossy()
-                                        ));
+                                match self.activate_quick_folder_slot(slot) {
+                                    QuickFolderSwitchTarget::Current => {}
+                                    QuickFolderSwitchTarget::DriveList => {
+                                        result = Some(AddressBarNav::DriveList(None));
                                     }
-                                } else if let Some(current) = quick_current_target.clone() {
-                                    self.set_quick_folder_slot_target(slot, current);
-                                    self.show_feedback_toast(format!("{label} に現在の場所を登録しました"));
+                                    QuickFolderSwitchTarget::Folder(raw_target) => {
+                                        if let Some(resolved) =
+                                            resolve_folder_bar_nav_path(&raw_target)
+                                        {
+                                            result = Some(AddressBarNav::Direct(resolved));
+                                        } else {
+                                            self.show_feedback_toast(format!(
+                                                "{label} の最後の場所が見つかりません。ドライブ一覧へ切り替えます: {}",
+                                                raw_target.to_string_lossy()
+                                            ));
+                                            result = Some(AddressBarNav::DriveList(None));
+                                        }
+                                    }
                                 }
                             }
-                            response.context_menu(|ui| {
-                                ui.set_min_width(260.0);
-                                if let Some(current) = quick_current_target.clone() {
-                                    if ui
-                                        .button(format!("現在の場所を {label} に登録"))
-                                        .clicked()
-                                    {
-                                        self.set_quick_folder_slot_target(slot, current);
-                                        ui.close();
-                                    }
-                                } else {
-                                    ui.add_enabled(
-                                        false,
-                                        egui::Button::new(format!(
-                                            "現在の場所を {label} に登録"
-                                        )),
-                                    );
-                                }
-                                if let Some(path) = target.cloned() {
-                                    if ui.button("登録を解除").clicked() {
-                                        self.clear_quick_folder_slot(slot);
-                                        ui.close();
-                                    }
-                                    ui.separator();
-                                    if ui.button("エクスプローラで開く").clicked() {
-                                        open_quick_folder_target_in_explorer(&path);
-                                        ui.close();
-                                    }
-                                    if ui.button("パスをコピー").clicked() {
-                                        ctx.copy_text(native_folder_bar_path_text(&path));
-                                        ui.close();
-                                    }
-                                    ui.separator();
-                                    ui.label(
-                                        egui::RichText::new(path.to_string_lossy().to_string())
-                                            .monospace()
-                                            .small(),
-                                    );
-                                } else {
-                                    ui.add_enabled(false, egui::Button::new("登録を解除"));
-                                    ui.add_enabled(false, egui::Button::new("エクスプローラで開く"));
-                                    ui.add_enabled(false, egui::Button::new("パスをコピー"));
-                                }
-                            });
                         }
                     }
 

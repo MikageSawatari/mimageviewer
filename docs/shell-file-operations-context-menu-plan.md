@@ -146,10 +146,11 @@ pub struct QuickFolderWorkspace {
 
 Implementation notes:
 
-- Add two quick workspaces, A and B, plus an
-  `active_quick_folder_slot: Option<QuickFolderSlotId>`.
-- Keep the existing non-A/B navigation as the "normal" history state for users
-  who do not use the quick slots.
+- Add two quick workspaces, A and B. A is active by default; users switch
+  between A and B rather than registering one-off bookmarks.
+- Keep the existing non-A/B navigation state only as a compatibility/fallback
+  implementation detail. Normal visible navigation uses the active A/B
+  workspace.
 - Persist only the two workspace `target` paths in `Settings`, for example as
   `[Option<PathBuf>; 2]`. Keep each slot's back/forward history session-local,
   matching the current folder history behavior.
@@ -172,7 +173,8 @@ Folder history behavior:
   transitions update A's target and A's back/forward stacks.
 - While B is active, the same operations update B's target and B's back/forward
   stacks.
-- With no active A/B slot, existing normal history behavior remains.
+- At startup the active slot is A. Clearing remembered quick locations resets
+  the active slot to A.
 - The left/right folder-history buttons read and mutate the active history
   state: A's buttons operate on A history, B's on B history, and normal mode
   uses the existing normal history.
@@ -187,23 +189,19 @@ Folder bar UI:
 
 - Place compact `A` and `B` buttons near the existing left/right history
   buttons.
-- Empty slot left-click: register the current eligible target and make that slot
-  active.
-- Registered slot left-click: switch to that workspace and load its target.
-- Registered slot right-click menu:
-  - "Set to current folder"
-  - "Clear"
-  - "Open in Explorer"
-  - "Copy path"
+- Left-click: switch to that workspace. If the workspace has a remembered
+  target, load it; if it has no remembered target yet, show the drive list.
+- Opening a real folder / ZIP / PDF / convertible archive while A or B is
+  active automatically updates that workspace's remembered target.
 - Highlight the active slot. If the current effective target equals a
   registered inactive slot, show a softer "same target" state so users can see
   why clicking it would not visibly move.
-- Disable A/B registration and switching while search/favorite/tag temporary
-  views are active. After a user explicitly jumps from a search result into a
-  real folder, A/B works normally again.
+- Disable A/B switching while search/favorite/tag temporary views are active.
+  After a user explicitly jumps from a search result into a real folder, A/B
+  works normally again.
 - If a registered target no longer exists, leave the slot unchanged, show a
-  toast, and offer "Clear" from the right-click menu. Do not silently overwrite
-  the slot with a parent fallback.
+  toast, and fall back to the drive list. Do not silently overwrite the slot
+  with a parent fallback.
 
 Settings:
 
@@ -452,10 +450,11 @@ that if it feels better:
 ### Phase 1 - Folder A/B quick workspaces
 
 - Add reusable `FolderNavHistoryState` helpers.
-- Keep normal history behavior unchanged for users with no active A/B slot.
+- Make A active by default; B is available as a second workspace, and an
+  unvisited workspace opens the drive list.
 - Add A/B target persistence and session-local per-slot back/forward history.
-- Add folder bar `A` / `B` buttons, right-click management menu, active-slot
-  highlight, and the toolbar preference toggle.
+- Add folder bar `A` / `B` buttons, active-slot highlight, and the toolbar
+  preference toggle.
 - Wire A/B navigation through the existing folder load and archive conversion
   paths. Do not add synchronous `read_dir` work to button handling.
 - Update `folder_nav_history_snapshot` / restore helpers so search and archive
@@ -513,8 +512,8 @@ Update, at minimum:
 
 Automated tests:
 
-- A/B quick folder registration, clearing, persistence of targets, and disabled
-  behavior for ineligible temporary views.
+- A/B quick folder default-active behavior, remembered target clearing,
+  persistence of targets, and disabled behavior for ineligible temporary views.
 - A/B history isolation: navigating inside A must not mutate B history, and
   switching A/B must not push to either history.
 - A/B history snapshot/restore around search navigation and archive conversion

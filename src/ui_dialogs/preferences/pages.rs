@@ -324,7 +324,7 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ),
     )
     .on_hover_text(
-        "コピー元 / コピー先など 2 つの場所を登録して、フォルダバーから素早く切り替えます。",
+        "コピー元 / コピー先など 2 つの作業場所を切り替えます。A/B それぞれが最後に見た場所を覚えます。",
     );
     ui.add_enabled(
         s.show_toolbar_folder,
@@ -368,7 +368,7 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
             );
         });
         ui.horizontal_wrapped(|ui| {
-            if ui.button("A/B クイックフォルダ登録をクリア").clicked() {
+            if ui.button("A/B の記憶した場所をクリア").clicked() {
                 clear_quick_folders_clicked = true;
             }
             let count = s
@@ -377,7 +377,7 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .filter(|slot| slot.is_some())
                 .count();
             ui.label(
-                egui::RichText::new(format!("現在 {} 件", count))
+                egui::RichText::new(format!("記憶済み {} 件", count))
                     .size(11.0)
                     .weak(),
             );

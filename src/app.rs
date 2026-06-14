@@ -87,6 +87,13 @@ impl QuickFolderSlotId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum QuickFolderSwitchTarget {
+    Current,
+    DriveList,
+    Folder(PathBuf),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FolderNavHistoryState {
     pub back_stack: Vec<PathBuf>,
@@ -4928,7 +4935,7 @@ impl App {
             recent_folders,
             suppress_folder_nav_record_once: false,
             quick_folder_workspaces,
-            active_quick_folder_slot: None,
+            active_quick_folder_slot: Some(QuickFolderSlotId::A),
             suppress_nav_record_for_search_restore: false,
             folder_history: std::collections::HashMap::new(),
             show_search_bar: false,
@@ -6499,6 +6506,7 @@ impl App {
         self.quick_folder_workspaces[slot.index()].target.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) fn current_quick_folder_target(&self) -> Option<PathBuf> {
         if self.items_are_drive_list
             || self.show_search_bar
@@ -6520,6 +6528,7 @@ impl App {
         Some(target)
     }
 
+    #[cfg(test)]
     pub(crate) fn set_quick_folder_slot_target(
         &mut self,
         slot: QuickFolderSlotId,
@@ -6530,13 +6539,11 @@ impl App {
         self.sync_quick_folder_settings();
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_quick_folder_slot(&mut self, slot: QuickFolderSlotId) {
         let workspace = &mut self.quick_folder_workspaces[slot.index()];
         workspace.target = None;
         workspace.history = FolderNavHistoryState::default();
-        if self.active_quick_folder_slot == Some(slot) {
-            self.active_quick_folder_slot = None;
-        }
         self.sync_quick_folder_settings();
     }
 
@@ -6544,25 +6551,33 @@ impl App {
         for workspace in &mut self.quick_folder_workspaces {
             *workspace = QuickFolderWorkspace::default();
         }
-        self.active_quick_folder_slot = None;
+        self.active_quick_folder_slot = Some(QuickFolderSlotId::A);
         self.sync_quick_folder_settings();
     }
 
     pub(crate) fn activate_quick_folder_slot(
         &mut self,
         slot: QuickFolderSlotId,
-    ) -> Option<PathBuf> {
-        let target = self.quick_folder_target(slot)?.clone();
+    ) -> QuickFolderSwitchTarget {
+        let target = self.quick_folder_target(slot).cloned();
         self.cancel_pending_folder_nav();
         self.active_quick_folder_slot = Some(slot);
-        if self
-            .effective_folder()
-            .is_some_and(|current| crate::folder_tree::path_eq(&current, &target))
-        {
-            return None;
+        match target {
+            Some(target) => {
+                if !self.items_are_drive_list
+                    && self
+                        .effective_folder()
+                        .is_some_and(|current| crate::folder_tree::path_eq(&current, &target))
+                {
+                    QuickFolderSwitchTarget::Current
+                } else {
+                    self.set_active_folder_nav_suppress_record_once(true);
+                    QuickFolderSwitchTarget::Folder(target)
+                }
+            }
+            None if self.items_are_drive_list => QuickFolderSwitchTarget::Current,
+            None => QuickFolderSwitchTarget::DriveList,
         }
-        self.set_active_folder_nav_suppress_record_once(true);
-        Some(target)
     }
 
     pub(crate) fn update_active_quick_folder_target(&mut self, target: &Path) {
@@ -6680,7 +6695,9 @@ impl App {
         self.recent_folders = snapshot.recent_folders;
         self.suppress_folder_nav_record_once = snapshot.suppress_record_once;
         self.quick_folder_workspaces = snapshot.quick_folder_workspaces;
-        self.active_quick_folder_slot = snapshot.active_quick_folder_slot;
+        self.active_quick_folder_slot = snapshot
+            .active_quick_folder_slot
+            .or(Some(QuickFolderSlotId::A));
         self.sync_quick_folder_settings();
         self.favsearch.nav_stack = snapshot.favsearch_nav_stack;
         self.tag_view.nav_stack = snapshot.tag_view_nav_stack;
