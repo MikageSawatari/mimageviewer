@@ -21059,6 +21059,8 @@ LUT_3D_SIZE 2
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         let left = (1 * 7 + 1) * 4;
+        // (row 0, col 3) * RGBA; `0 * 7` is the explicit row term for readability.
+        #[allow(clippy::erasing_op)]
         let above = (0 * 7 + 3) * 4;
         assert!(out.pixels[left + 2] > src.pixels[left + 2]);
         assert!(out.pixels[left + 2] > out.pixels[left]);
