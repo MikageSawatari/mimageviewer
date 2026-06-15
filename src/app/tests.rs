@@ -11645,6 +11645,163 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    fn enable_pdf_final_ai_params(app: &mut App) {
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+        app.settings.global_preset.upscale_model = Some(
+            crate::ai::ModelKind::UpscaleRealEsrGeneralV3
+                .as_str()
+                .to_string(),
+        );
+    }
+
+    fn pdf_final_ai_key(app: &App, idx: usize, edit_size: [usize; 2]) -> FinalAiKey {
+        let params = app.effective_params(idx).clone();
+        app.final_ai_key_for_pixels(app.current_edit_result_key(idx), edit_size, &params)
+            .expect("AI-enabled PDF test params should produce a final key")
+    }
+
+    #[test]
+    fn pdf_retained_page_cache_promotes_raster_to_final_ai_without_duplicate_store() {
+        let mut app = setup_app();
+        enable_pdf_final_ai_params(&mut app);
+        let idx = push_pdf_page(&mut app, r"C:\books\scan.pdf", 0);
+
+        let raster = Arc::new(egui::ColorImage::new(
+            [4, 4],
+            vec![egui::Color32::from_rgb(10, 20, 30); 16],
+        ));
+        assert!(app.insert_retained_pdf_page_raster(idx, [4, 4], Arc::clone(&raster)));
+        let page_key = app.retained_pdf_page_key_for(idx).unwrap();
+        assert!(
+            matches!(
+                app.retained_pdf_page_cache
+                    .get(&page_key)
+                    .map(|entry| &entry.kind),
+                Some(RetainedPdfPageCacheKind::Raster { .. })
+            ),
+            "first stage should cache the PDF raster"
+        );
+
+        let edit_size = [4, 4];
+        let key = pdf_final_ai_key(&app, idx, edit_size);
+        let final_pixels = Arc::new(egui::ColorImage::new(
+            [8, 8],
+            vec![egui::Color32::from_rgb(40, 50, 60); 64],
+        ));
+        assert!(app.insert_retained_final_ai(idx, key, edit_size, Arc::clone(&final_pixels),));
+
+        assert!(
+            app.retained_final_ai_cache.is_empty(),
+            "PDF final AI should not be stored again in the generic retained final-AI cache"
+        );
+        assert_eq!(
+            app.retained_pdf_page_cache.len(),
+            1,
+            "PDF raster and final AI share one retained page slot"
+        );
+        assert!(
+            matches!(
+                app.retained_pdf_page_cache
+                    .get(&page_key)
+                    .map(|entry| &entry.kind),
+                Some(RetainedPdfPageCacheKind::FinalAi { .. })
+            ),
+            "AI completion should promote the PDF page slot from Raster to FinalAi"
+        );
+        assert!(
+            app.lookup_retained_pdf_page_raster(idx, 4, "test_after_final_ai")
+                .is_none(),
+            "FinalAi promotion should release the raster stage"
+        );
+        assert!(
+            app.lookup_retained_pdf_final_ai_for_key(idx, key, edit_size, "test")
+                .is_some(),
+            "promoted final AI should remain lookupable"
+        );
+    }
+
+    #[test]
+    fn pdf_retained_final_ai_skips_pdf_render_and_restores_composite_directly() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        enable_pdf_final_ai_params(&mut app);
+        let idx = push_pdf_page(&mut app, r"C:\books\direct.pdf", 0);
+        app.fullscreen_idx = Some(idx);
+
+        let edit_size = [4, 4];
+        let key = pdf_final_ai_key(&app, idx, edit_size);
+        let retained_key = app
+            .retained_final_ai_key_for(idx, key, edit_size)
+            .expect("PDF retained final key");
+        let final_pixels = Arc::new(egui::ColorImage::new(
+            [8, 8],
+            vec![egui::Color32::from_rgb(80, 90, 100); 64],
+        ));
+        assert!(app.insert_retained_pdf_final_ai(idx, retained_key, Arc::clone(&final_pixels),));
+
+        app.start_fs_load(idx);
+        assert!(
+            app.fs_pending.is_empty() && app.fs_upload_backlog.is_empty(),
+            "matching retained FinalAi should avoid starting PDF render"
+        );
+
+        let tex = app.restore_retained_pdf_final_ai_composite(&ctx, idx);
+        assert!(
+            tex.is_some(),
+            "retained FinalAi should restore display texture"
+        );
+        assert!(
+            app.final_ai_cache.contains_key(&key),
+            "direct restore should also seed the live final_ai_cache"
+        );
+        assert!(
+            app.final_composite_cache
+                .values()
+                .any(|entry| entry.complete && entry.pixels.size == [8, 8]),
+            "direct restore should build a complete final composite from retained AI pixels"
+        );
+    }
+
+    #[test]
+    fn pdf_retained_page_cache_shares_budget_with_generic_retained_ai() {
+        let mut app = setup_app();
+        let image_idx = push_image(&mut app, r"C:\imgs\00.png");
+        let pdf_idx = push_pdf_page(&mut app, r"C:\books\shared-budget.pdf", 0);
+        app.settings.retained_final_ai_cache_max_entries = 1;
+        app.settings.retained_final_ai_cache_max_mib = 1;
+
+        let edit_size = [1, 1];
+        let image_key = FinalAiKey {
+            edit_key: dummy_edit_key(&app, image_idx),
+            color_ai_hash: 7,
+            bg: 0,
+        };
+        assert!(app.insert_retained_final_ai(
+            image_idx,
+            image_key,
+            edit_size,
+            Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
+        ));
+        assert!(app.has_retained_final_ai(image_idx, image_key, edit_size));
+
+        assert!(app.insert_retained_pdf_page_raster(
+            pdf_idx,
+            [1, 1],
+            Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE])),
+        ));
+
+        assert_eq!(
+            app.retained_cross_session_cache_entries(),
+            1,
+            "generic AI and PDF retained page entries must share one entry budget"
+        );
+        assert!(
+            !app.has_retained_final_ai(image_idx, image_key, edit_size),
+            "oldest generic retained AI entry should be evicted by the PDF page entry"
+        );
+        assert_eq!(app.retained_pdf_page_cache.len(), 1);
+    }
+
     #[test]
     fn retained_final_ai_cache_prunes_by_lru_entry_budget() {
         let mut app = setup_app();

@@ -1640,6 +1640,33 @@ pub(crate) struct RetainedFinalAiEntry {
     pub(crate) last_used: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RetainedPdfPageKey {
+    pub(crate) item_key: String,
+}
+
+pub(crate) enum RetainedPdfPageCacheKind {
+    Raster {
+        pixels: Arc<egui::ColorImage>,
+        source_dims: [usize; 2],
+        /// 実際に保持している raster pixels の長辺。PDFium の結果は target_px と
+        /// 1px 程度ずれることがあるため、lookup は target_px に対する比率で選ぶ。
+        render_long_edge: u32,
+    },
+    FinalAi {
+        pixels: Arc<egui::ColorImage>,
+        edit_size: [usize; 2],
+        color_ai_hash: u64,
+        bg: u8,
+    },
+}
+
+pub(crate) struct RetainedPdfPageEntry {
+    pub(crate) kind: RetainedPdfPageCacheKind,
+    pub(crate) bytes: u64,
+    pub(crate) last_used: u64,
+}
+
 /// 表示セッションから外れた PDF final AI を、保持 LRU へ入れる目的で完走させる上限。
 ///
 /// final AI worker は単一なので、ここを大きくすると「今見ているページ」の AI が
@@ -3748,6 +3775,13 @@ pub struct App {
     pub(crate) retained_final_ai_cache:
         std::collections::HashMap<RetainedFinalAiKey, RetainedFinalAiEntry>,
     pub(crate) retained_final_ai_clock: u64,
+    /// PDF ページの rasterize / final AI 結果を fullscreen session をまたいで保持する CPU pixels cache。
+    ///
+    /// `fs_cache` は idx ベースかつ viewer keep 範囲で落ちるため、PDF ページを安定キーで
+    /// 別保持する。ラスタ結果が入った後に final AI が完了したら同じスロットを上書きし、
+    /// PDF 内で二重保持しない。予算/LRU は `retained_final_ai_cache` と共通。
+    pub(crate) retained_pdf_page_cache:
+        std::collections::HashMap<RetainedPdfPageKey, RetainedPdfPageEntry>,
     /// retained final AI の無効化世代。外部更新や AI 設定変更後に、古い孤児 job の
     /// 完了結果が保持 LRU へ戻るのを防ぐ。
     pub(crate) retained_final_ai_epoch: u64,
@@ -5321,6 +5355,7 @@ impl App {
             final_ai_cache: std::collections::HashMap::new(),
             retained_final_ai_cache: std::collections::HashMap::new(),
             retained_final_ai_clock: 0,
+            retained_pdf_page_cache: std::collections::HashMap::new(),
             retained_final_ai_epoch: 0,
             retained_final_ai_orphans: std::collections::HashMap::new(),
             final_ai_job_seq: 0,
@@ -7150,6 +7185,10 @@ impl App {
             return;
         }
         self.clear_retained_final_ai_cache(&format!(
+            "external_folder_change folder={}",
+            folder.display()
+        ));
+        self.clear_retained_pdf_page_cache(&format!(
             "external_folder_change folder={}",
             folder.display()
         ));
@@ -22410,6 +22449,27 @@ impl App {
             _ => return,
         };
 
+        if pdf_page.is_some() {
+            if self.has_retained_pdf_final_ai_for_current_params(idx) {
+                crate::logger::log(format!(
+                    "[PDF] Retained page final-ai available idx={idx} reason=start_fs_load_skip_pdf_render"
+                ));
+                return;
+            }
+            if let Some((pixels, source_dims)) =
+                self.lookup_retained_pdf_page_raster(idx, 4096, "start_fs_load")
+            {
+                self.enqueue_retained_pdf_page_raster_result(
+                    idx,
+                    pixels,
+                    source_dims,
+                    self.input_seq,
+                    "start_fs_load",
+                );
+                return;
+            }
+        }
+
         // フルスクリーン現在ページ (ユーザーが待っているもの) は Critical、
         // それ以外 (先読み) は Normal。Critical はプールの予約ワーカーで即処理される。
         let pdf_priority = if self.fullscreen_idx == Some(idx) {
@@ -22957,6 +23017,14 @@ impl App {
             crate::pdf_loader::PDF_RENDER_MAX_LONG_PX,
         );
 
+        if self.has_retained_pdf_final_ai_for_current_params(idx) {
+            crate::logger::log(format!(
+                "[PDF] Retained page final-ai available idx={idx} target_px={target_px} \
+                 reason=request_pdf_rerender_skip_pdf_render"
+            ));
+            return;
+        }
+
         // 既に同じ解像度のキャッシュがあれば不要
         if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) {
             let cached_long = pixels.size[0].max(pixels.size[1]) as u32;
@@ -22964,6 +23032,22 @@ impl App {
             if (0.9..=1.1).contains(&ratio) {
                 return;
             }
+        }
+
+        if let Some((pixels, source_dims)) =
+            self.lookup_retained_pdf_page_raster(idx, target_px, "request_pdf_rerender")
+        {
+            if let Some((cancel, _, _)) = self.fs_pending.remove(&idx) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            self.enqueue_retained_pdf_page_raster_result(
+                idx,
+                pixels,
+                source_dims,
+                self.input_seq,
+                "request_pdf_rerender",
+            );
+            return;
         }
 
         // 進行中の再レンダリングがあればキャンセル
@@ -23098,7 +23182,10 @@ impl App {
 
         // まだキャッシュにも pending にもない先読み対象を読み込み開始
         for idx in prefetch_targets {
-            if !self.fs_cache.contains_key(&idx) && !self.fs_pending.contains_key(&idx) {
+            if !self.fs_cache.contains_key(&idx)
+                && !self.fs_pending.contains_key(&idx)
+                && !self.fs_upload_backlog_contains(idx)
+            {
                 crate::logger::log(format!("  prefetch start idx={idx}"));
                 self.start_fs_load(idx);
             }
@@ -24477,8 +24564,14 @@ impl App {
             // AI 先読みは native 着地まで保留する。これで画像の先読みと同様、移動時に
             // native + final AI が揃って即表示できる。
             if self.pdf_prefetch_should_defer_ai(idx) {
+                if let Some((key, pixels, _)) =
+                    self.lookup_retained_pdf_final_ai(idx, "prefetch_final_ai")
+                {
+                    self.final_ai_cache.insert(key, pixels);
+                    continue;
+                }
                 // 既に再レンダ中なら二重起動しない (cancel→respawn ループ防止)。
-                if !self.fs_pending.contains_key(&idx) {
+                if !self.fs_pending.contains_key(&idx) && !self.fs_upload_backlog_contains(idx) {
                     self.request_pdf_rerender(idx, 1.0, false);
                 }
                 continue;
@@ -25113,6 +25206,38 @@ impl App {
                 pending.cancel.store(true, Ordering::Relaxed);
             }
         }
+    }
+
+    fn cancel_final_ai_pending_for_retained_key(
+        &mut self,
+        retained_key: &RetainedFinalAiKey,
+        reason: &str,
+    ) -> usize {
+        let keys: Vec<FinalAiKey> = self
+            .final_ai_pending
+            .iter()
+            .filter(|(_, pending)| pending.retained_key.as_ref() == Some(retained_key))
+            .map(|(key, _)| *key)
+            .collect();
+        let mut cancelled = 0usize;
+        for key in keys {
+            if let Some(pending) = self.final_ai_pending.remove(&key) {
+                pending.cancel.store(true, Ordering::Relaxed);
+                cancelled += 1;
+                crate::logger::log(format!(
+                    "[AI] Final AI pending cancelled by retained cache idx={} item={} \
+                     source={}x{} hash={} bg={} job_id={} reason={reason}",
+                    key.edit_key.idx,
+                    retained_key.item_key,
+                    retained_key.edit_size[0],
+                    retained_key.edit_size[1],
+                    retained_key.color_ai_hash,
+                    retained_key.bg,
+                    pending.job_id,
+                ));
+            }
+        }
+        cancelled
     }
 
     fn maybe_orphan_final_ai_for_retained_store(&mut self, key: FinalAiKey, reason: &str) -> bool {
@@ -26360,6 +26485,492 @@ impl App {
         })
     }
 
+    fn retained_pdf_page_image_bytes(pixels: &egui::ColorImage) -> u64 {
+        pixels.as_raw().len() as u64
+    }
+
+    fn retained_pdf_page_cache_bytes(&self) -> u64 {
+        self.retained_pdf_page_cache
+            .values()
+            .map(|entry| entry.bytes)
+            .sum()
+    }
+
+    fn retained_cross_session_cache_entries(&self) -> usize {
+        self.retained_final_ai_cache.len() + self.retained_pdf_page_cache.len()
+    }
+
+    fn retained_cross_session_cache_bytes(&self) -> u64 {
+        self.retained_final_ai_cache_bytes() + self.retained_pdf_page_cache_bytes()
+    }
+
+    fn retained_pdf_page_key_for(&self, idx: usize) -> Option<RetainedPdfPageKey> {
+        if !matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            return None;
+        }
+        Some(RetainedPdfPageKey {
+            item_key: self.metadata_cache_key(idx)?,
+        })
+    }
+
+    fn retained_pdf_final_ai_matches_current(
+        &self,
+        idx: usize,
+    ) -> Option<(FinalAiKey, [usize; 2])> {
+        self.retained_final_ai_budget()?;
+        let key = self.retained_pdf_page_key_for(idx)?;
+        let entry = self.retained_pdf_page_cache.get(&key)?;
+        let RetainedPdfPageCacheKind::FinalAi {
+            edit_size,
+            color_ai_hash,
+            bg,
+            ..
+        } = &entry.kind
+        else {
+            return None;
+        };
+        let params = self.effective_params(idx);
+        let final_key =
+            self.final_ai_key_for_pixels(self.current_edit_result_key(idx), *edit_size, params)?;
+        (final_key.color_ai_hash == *color_ai_hash && final_key.bg == *bg)
+            .then_some((final_key, *edit_size))
+    }
+
+    fn has_retained_pdf_final_ai_for_current_params(&self, idx: usize) -> bool {
+        self.retained_pdf_final_ai_matches_current(idx).is_some()
+    }
+
+    fn insert_retained_pdf_page_raster(
+        &mut self,
+        idx: usize,
+        source_dims: [usize; 2],
+        pixels: Arc<egui::ColorImage>,
+    ) -> bool {
+        let Some(key) = self.retained_pdf_page_key_for(idx) else {
+            return false;
+        };
+        let Some((max_entries, max_bytes)) = self.retained_final_ai_budget() else {
+            self.clear_retained_pdf_page_cache("retained_pdf_page_budget_disabled");
+            return false;
+        };
+        if self.retained_pdf_final_ai_matches_current(idx).is_some() {
+            crate::logger::log(format!(
+                "[PDF] Retained page keep final-ai idx={idx} item={} raster={}x{} \
+                 source={}x{} reason=raster_store_after_matching_final_ai",
+                key.item_key, pixels.size[0], pixels.size[1], source_dims[0], source_dims[1],
+            ));
+            return true;
+        }
+        let bytes = Self::retained_pdf_page_image_bytes(&pixels);
+        let render_long_edge = pixels.size[0].max(pixels.size[1]) as u32;
+        if render_long_edge == 0 {
+            return false;
+        }
+        if bytes > max_bytes {
+            crate::logger::log(format!(
+                "[PDF] Retained page skip idx={idx} item={} kind=raster raster={}x{} \
+                 source={}x{} bytes={bytes} max_bytes={max_bytes} reason=too_large",
+                key.item_key, pixels.size[0], pixels.size[1], source_dims[0], source_dims[1],
+            ));
+            return false;
+        }
+
+        self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
+        let key_log = key.clone();
+        let raster_size = pixels.size;
+        let replaced_kind = self
+            .retained_pdf_page_cache
+            .get(&key_log)
+            .map(|entry| match entry.kind {
+                RetainedPdfPageCacheKind::Raster { .. } => "raster",
+                RetainedPdfPageCacheKind::FinalAi { .. } => "final_ai",
+            })
+            .unwrap_or("none");
+        let replaced = self
+            .retained_pdf_page_cache
+            .insert(
+                key,
+                RetainedPdfPageEntry {
+                    kind: RetainedPdfPageCacheKind::Raster {
+                        pixels,
+                        source_dims,
+                        render_long_edge,
+                    },
+                    bytes,
+                    last_used: self.retained_final_ai_clock,
+                },
+            )
+            .is_some();
+        self.prune_retained_cross_session_cache_to_budget(max_entries, max_bytes);
+        if self.retained_pdf_page_cache.contains_key(&key_log) {
+            crate::logger::log(format!(
+                "[PDF] Retained page store idx={idx} item={} kind=raster long={} raster={}x{} \
+                 source={}x{} bytes={bytes} entries={} total_bytes={} \
+                 max_entries={max_entries} max_bytes={max_bytes} replaced={replaced} \
+                 replaced_kind={replaced_kind}",
+                key_log.item_key,
+                render_long_edge,
+                raster_size[0],
+                raster_size[1],
+                source_dims[0],
+                source_dims[1],
+                self.retained_pdf_page_cache.len(),
+                self.retained_pdf_page_cache_bytes(),
+            ));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn lookup_retained_pdf_page_raster(
+        &mut self,
+        idx: usize,
+        target_px: u32,
+        reason: &str,
+    ) -> Option<(Arc<egui::ColorImage>, [usize; 2])> {
+        let target_px = target_px.max(1);
+        let Some(key) = self.retained_pdf_page_key_for(idx) else {
+            return None;
+        };
+        let Some((_max_entries, _max_bytes)) = self.retained_final_ai_budget() else {
+            self.log_retained_pdf_page_raster_miss(
+                idx,
+                &key.item_key,
+                target_px,
+                reason,
+                "budget_disabled",
+            );
+            self.clear_retained_pdf_page_cache("retained_pdf_page_budget_disabled");
+            return None;
+        };
+
+        let Some(entry) = self.retained_pdf_page_cache.get(&key) else {
+            self.log_retained_pdf_page_raster_miss(
+                idx,
+                &key.item_key,
+                target_px,
+                reason,
+                "not_found",
+            );
+            return None;
+        };
+        let (render_long_edge, raster_size, source_dims) = match &entry.kind {
+            RetainedPdfPageCacheKind::Raster {
+                pixels,
+                source_dims,
+                render_long_edge,
+            } => {
+                let ratio = *render_long_edge as f32 / target_px as f32;
+                if !(0.9..=1.1).contains(&ratio) {
+                    self.log_retained_pdf_page_raster_miss(
+                        idx,
+                        &key.item_key,
+                        target_px,
+                        reason,
+                        "resolution_mismatch",
+                    );
+                    return None;
+                }
+                (*render_long_edge, pixels.size, *source_dims)
+            }
+            RetainedPdfPageCacheKind::FinalAi { .. } => {
+                self.log_retained_pdf_page_raster_miss(
+                    idx,
+                    &key.item_key,
+                    target_px,
+                    reason,
+                    "final_ai_entry",
+                );
+                return None;
+            }
+        };
+
+        self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
+        let (pixels, bytes) = {
+            let entry = self.retained_pdf_page_cache.get_mut(&key)?;
+            entry.last_used = self.retained_final_ai_clock;
+            let RetainedPdfPageCacheKind::Raster { pixels, .. } = &entry.kind else {
+                return None;
+            };
+            (Arc::clone(pixels), entry.bytes)
+        };
+        crate::logger::log(format!(
+            "[PDF] Retained page hit idx={idx} item={} kind=raster target_px={target_px} \
+             long={} raster={}x{} source={}x{} bytes={bytes} entries={} total_bytes={} \
+             reason={reason}",
+            key.item_key,
+            render_long_edge,
+            raster_size[0],
+            raster_size[1],
+            source_dims[0],
+            source_dims[1],
+            self.retained_pdf_page_cache.len(),
+            self.retained_pdf_page_cache_bytes(),
+        ));
+        Some((pixels, source_dims))
+    }
+
+    fn lookup_retained_pdf_final_ai(
+        &mut self,
+        idx: usize,
+        reason: &str,
+    ) -> Option<(FinalAiKey, Arc<egui::ColorImage>, [usize; 2])> {
+        if self.retained_final_ai_budget().is_none() {
+            self.clear_retained_pdf_page_cache("retained_pdf_page_budget_disabled");
+            return None;
+        }
+        let page_key = self.retained_pdf_page_key_for(idx)?;
+        let (final_key, _) = self.retained_pdf_final_ai_matches_current(idx)?;
+        self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
+        let (pixels, edit_size, bytes, output_size) = {
+            let entry = self.retained_pdf_page_cache.get_mut(&page_key)?;
+            entry.last_used = self.retained_final_ai_clock;
+            let RetainedPdfPageCacheKind::FinalAi {
+                pixels, edit_size, ..
+            } = &entry.kind
+            else {
+                return None;
+            };
+            (Arc::clone(pixels), *edit_size, entry.bytes, pixels.size)
+        };
+        crate::logger::log(format!(
+            "[PDF] Retained page hit idx={idx} item={} kind=final_ai source={}x{} \
+             output={}x{} hash={} bg={} bytes={bytes} entries={} total_bytes={} \
+             reason={reason}",
+            page_key.item_key,
+            edit_size[0],
+            edit_size[1],
+            output_size[0],
+            output_size[1],
+            final_key.color_ai_hash,
+            final_key.bg,
+            self.retained_pdf_page_cache.len(),
+            self.retained_pdf_page_cache_bytes(),
+        ));
+        Some((final_key, pixels, edit_size))
+    }
+
+    fn lookup_retained_pdf_final_ai_for_key(
+        &mut self,
+        idx: usize,
+        key: FinalAiKey,
+        edit_size: [usize; 2],
+        reason: &str,
+    ) -> Option<Arc<egui::ColorImage>> {
+        if self.retained_final_ai_budget().is_none() {
+            self.clear_retained_pdf_page_cache("retained_pdf_page_budget_disabled");
+            return None;
+        }
+        let page_key = self.retained_pdf_page_key_for(idx)?;
+        let Some(entry) = self.retained_pdf_page_cache.get(&page_key) else {
+            return None;
+        };
+        let (entry_edit_size, color_ai_hash, bg, output_size) = match &entry.kind {
+            RetainedPdfPageCacheKind::FinalAi {
+                pixels,
+                edit_size,
+                color_ai_hash,
+                bg,
+            } => (*edit_size, *color_ai_hash, *bg, pixels.size),
+            RetainedPdfPageCacheKind::Raster { .. } => return None,
+        };
+        if entry_edit_size != edit_size || color_ai_hash != key.color_ai_hash || bg != key.bg {
+            crate::logger::log(format!(
+                "[PDF] Retained page miss idx={idx} item={} kind=final_ai source={}x{} \
+                 expected={}x{} hash={} expected_hash={} bg={} expected_bg={} reason={reason}/key_mismatch",
+                page_key.item_key,
+                entry_edit_size[0],
+                entry_edit_size[1],
+                edit_size[0],
+                edit_size[1],
+                color_ai_hash,
+                key.color_ai_hash,
+                bg,
+                key.bg,
+            ));
+            return None;
+        }
+        self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
+        let (pixels, bytes) = {
+            let entry = self.retained_pdf_page_cache.get_mut(&page_key)?;
+            entry.last_used = self.retained_final_ai_clock;
+            let RetainedPdfPageCacheKind::FinalAi { pixels, .. } = &entry.kind else {
+                return None;
+            };
+            (Arc::clone(pixels), entry.bytes)
+        };
+        crate::logger::log(format!(
+            "[PDF] Retained page hit idx={idx} item={} kind=final_ai source={}x{} \
+             output={}x{} hash={} bg={} bytes={bytes} entries={} total_bytes={} reason={reason}",
+            page_key.item_key,
+            edit_size[0],
+            edit_size[1],
+            output_size[0],
+            output_size[1],
+            key.color_ai_hash,
+            key.bg,
+            self.retained_pdf_page_cache.len(),
+            self.retained_pdf_page_cache_bytes(),
+        ));
+        Some(pixels)
+    }
+
+    fn insert_retained_pdf_final_ai(
+        &mut self,
+        idx: usize,
+        retained_key: RetainedFinalAiKey,
+        pixels: Arc<egui::ColorImage>,
+    ) -> bool {
+        let Some(key) = self.retained_pdf_page_key_for(idx) else {
+            return false;
+        };
+        let Some((max_entries, max_bytes)) = self.retained_final_ai_budget() else {
+            self.clear_retained_pdf_page_cache("retained_pdf_page_budget_disabled");
+            return false;
+        };
+        let bytes = Self::retained_pdf_page_image_bytes(&pixels);
+        if bytes > max_bytes {
+            crate::logger::log(format!(
+                "[PDF] Retained page skip idx={idx} item={} kind=final_ai source={}x{} \
+                 output={}x{} hash={} bg={} bytes={bytes} max_bytes={max_bytes} reason=too_large",
+                key.item_key,
+                retained_key.edit_size[0],
+                retained_key.edit_size[1],
+                pixels.size[0],
+                pixels.size[1],
+                retained_key.color_ai_hash,
+                retained_key.bg,
+            ));
+            return false;
+        }
+        self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
+        let replaced_kind = self
+            .retained_pdf_page_cache
+            .get(&key)
+            .map(|entry| match entry.kind {
+                RetainedPdfPageCacheKind::Raster { .. } => "raster",
+                RetainedPdfPageCacheKind::FinalAi { .. } => "final_ai",
+            })
+            .unwrap_or("none");
+        let key_log = key.clone();
+        let output_size = pixels.size;
+        let replaced = self
+            .retained_pdf_page_cache
+            .insert(
+                key,
+                RetainedPdfPageEntry {
+                    kind: RetainedPdfPageCacheKind::FinalAi {
+                        pixels,
+                        edit_size: retained_key.edit_size,
+                        color_ai_hash: retained_key.color_ai_hash,
+                        bg: retained_key.bg,
+                    },
+                    bytes,
+                    last_used: self.retained_final_ai_clock,
+                },
+            )
+            .is_some();
+        self.prune_retained_cross_session_cache_to_budget(max_entries, max_bytes);
+        if self.retained_pdf_page_cache.contains_key(&key_log) {
+            crate::logger::log(format!(
+                "[PDF] Retained page store idx={idx} item={} kind=final_ai source={}x{} \
+                 output={}x{} hash={} bg={} bytes={bytes} entries={} total_bytes={} \
+                 max_entries={max_entries} max_bytes={max_bytes} replaced={replaced} \
+                 replaced_kind={replaced_kind}",
+                key_log.item_key,
+                retained_key.edit_size[0],
+                retained_key.edit_size[1],
+                output_size[0],
+                output_size[1],
+                retained_key.color_ai_hash,
+                retained_key.bg,
+                self.retained_pdf_page_cache.len(),
+                self.retained_pdf_page_cache_bytes(),
+            ));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn log_retained_pdf_page_raster_miss(
+        &self,
+        idx: usize,
+        item_key: &str,
+        target_px: u32,
+        reason: &str,
+        miss_kind: &str,
+    ) {
+        crate::logger::log(format!(
+            "[PDF] Retained page miss idx={idx} item={item_key} kind=raster target_px={target_px} \
+             entries={} total_bytes={} reason={reason}/{miss_kind}",
+            self.retained_pdf_page_cache.len(),
+            self.retained_pdf_page_cache_bytes(),
+        ));
+    }
+
+    pub(crate) fn clear_retained_pdf_page_cache(&mut self, reason: &str) {
+        let entries = self.retained_pdf_page_cache.len();
+        let total_bytes = self.retained_pdf_page_cache_bytes();
+        self.retained_pdf_page_cache.clear();
+        if entries > 0 {
+            crate::logger::log(format!(
+                "[PDF] Retained page clear entries={entries} total_bytes={total_bytes} \
+                 reason={reason}",
+            ));
+        }
+    }
+
+    fn clear_retained_pdf_final_ai_entries(&mut self, reason: &str) {
+        let before_entries = self.retained_pdf_page_cache.len();
+        let before_bytes = self.retained_pdf_page_cache_bytes();
+        self.retained_pdf_page_cache
+            .retain(|_, entry| !matches!(entry.kind, RetainedPdfPageCacheKind::FinalAi { .. }));
+        let removed_entries = before_entries.saturating_sub(self.retained_pdf_page_cache.len());
+        if removed_entries > 0 {
+            crate::logger::log(format!(
+                "[PDF] Retained page clear-final-ai removed_entries={removed_entries} \
+                 entries={} total_bytes={} removed_bytes={} reason={reason}",
+                self.retained_pdf_page_cache.len(),
+                self.retained_pdf_page_cache_bytes(),
+                before_bytes.saturating_sub(self.retained_pdf_page_cache_bytes()),
+            ));
+        }
+    }
+
+    fn enqueue_retained_pdf_page_raster_result(
+        &mut self,
+        idx: usize,
+        pixels: Arc<egui::ColorImage>,
+        source_dims: [usize; 2],
+        load_seq: u64,
+        reason: &str,
+    ) {
+        let result = FsLoadResult::StaticCached {
+            pixels,
+            source_dims,
+        };
+        if let Some(pos) = self
+            .fs_upload_backlog
+            .iter()
+            .position(|(key, _, _)| *key == idx)
+        {
+            self.fs_upload_backlog[pos] = (idx, result, load_seq);
+        } else {
+            self.fs_upload_backlog.push((idx, result, load_seq));
+        }
+        self.fs_early_dims.remove(&idx);
+        crate::logger::log(format!(
+            "[PDF] Retained page enqueue idx={idx} kind=raster backlog={} reason={reason}",
+            self.fs_upload_backlog.len(),
+        ));
+    }
+
+    fn fs_upload_backlog_contains(&self, idx: usize) -> bool {
+        self.fs_upload_backlog.iter().any(|(key, _, _)| *key == idx)
+    }
+
     fn insert_retained_final_ai(
         &mut self,
         idx: usize,
@@ -26410,10 +27021,19 @@ impl App {
             ));
             return false;
         }
+        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            let stored =
+                self.insert_retained_pdf_final_ai(idx, retained_key.clone(), Arc::clone(&pixels));
+            if stored {
+                self.cancel_final_ai_pending_for_retained_key(&retained_key, "pdf_retained_store");
+            }
+            return stored;
+        }
         let Some((max_entries, max_bytes)) = self.retained_final_ai_budget() else {
-            let cleared_entries = self.retained_final_ai_cache.len();
-            let cleared_bytes = self.retained_final_ai_cache_bytes();
+            let cleared_entries = self.retained_cross_session_cache_entries();
+            let cleared_bytes = self.retained_cross_session_cache_bytes();
             self.retained_final_ai_cache.clear();
+            self.clear_retained_pdf_page_cache("retained_budget_disabled");
             crate::logger::log(format!(
                 "[AI] Retained final AI skip idx={idx} item={} source={}x{} \
                  output={}x{} bytes={} reason=disabled max_entries={} max_mib={} \
@@ -26452,12 +27072,14 @@ impl App {
                 },
             )
             .is_some();
-        self.prune_retained_final_ai_cache_to_budget(max_entries, max_bytes);
+        self.prune_retained_cross_session_cache_to_budget(max_entries, max_bytes);
         if self.retained_final_ai_cache.contains_key(&retained_key_log) {
+            let cancelled_pending =
+                self.cancel_final_ai_pending_for_retained_key(&retained_key_log, "retained_store");
             crate::logger::log(format!(
                 "[AI] Retained final AI store idx={idx} item={} source={}x{} output={}x{} \
                  bytes={bytes} entries={} total_bytes={} max_entries={max_entries} \
-                 max_bytes={max_bytes} replaced={replaced}",
+                 max_bytes={max_bytes} replaced={replaced} cancelled_pending={cancelled_pending}",
                 retained_key_log.item_key,
                 edit_size[0],
                 edit_size[1],
@@ -26478,6 +27100,19 @@ impl App {
         key: FinalAiKey,
         edit_size: [usize; 2],
     ) -> Option<Arc<egui::ColorImage>> {
+        if self.retained_final_ai_budget().is_none() {
+            self.retained_final_ai_cache.clear();
+            self.clear_retained_pdf_page_cache("retained_budget_disabled");
+            return None;
+        }
+        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            return self.lookup_retained_pdf_final_ai_for_key(
+                idx,
+                key,
+                edit_size,
+                "final_ai_lookup",
+            );
+        }
         let retained_key = self.retained_final_ai_key_for(idx, key, edit_size)?;
         self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
         let (pixels, bytes, output_size) = {
@@ -26496,6 +27131,7 @@ impl App {
             self.retained_final_ai_cache.len(),
             self.retained_final_ai_cache_bytes(),
         ));
+        self.cancel_final_ai_pending_for_retained_key(&retained_key, "retained_hit");
         Some(pixels)
     }
 
@@ -26533,22 +27169,81 @@ impl App {
     }
 
     fn has_retained_final_ai(&self, idx: usize, key: FinalAiKey, edit_size: [usize; 2]) -> bool {
+        if self.retained_final_ai_budget().is_none() {
+            return false;
+        }
+        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            let Some(page_key) = self.retained_pdf_page_key_for(idx) else {
+                return false;
+            };
+            return self
+                .retained_pdf_page_cache
+                .get(&page_key)
+                .is_some_and(|entry| match &entry.kind {
+                    RetainedPdfPageCacheKind::FinalAi {
+                        edit_size: entry_edit_size,
+                        color_ai_hash,
+                        bg,
+                        ..
+                    } => {
+                        *entry_edit_size == edit_size
+                            && *color_ai_hash == key.color_ai_hash
+                            && *bg == key.bg
+                    }
+                    RetainedPdfPageCacheKind::Raster { .. } => false,
+                });
+        }
         self.retained_final_ai_key_for(idx, key, edit_size)
             .is_some_and(|retained_key| self.retained_final_ai_cache.contains_key(&retained_key))
     }
 
-    fn prune_retained_final_ai_cache_to_budget(&mut self, max_entries: usize, max_bytes: u64) {
-        let mut total_bytes = self.retained_final_ai_cache_bytes();
-        while self.retained_final_ai_cache.len() > max_entries || total_bytes > max_bytes {
-            let Some(oldest_key) = self
+    fn prune_retained_cross_session_cache_to_budget(&mut self, max_entries: usize, max_bytes: u64) {
+        let mut total_bytes = self.retained_cross_session_cache_bytes();
+        while self.retained_cross_session_cache_entries() > max_entries || total_bytes > max_bytes {
+            let oldest_ai = self
                 .retained_final_ai_cache
                 .iter()
                 .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
+                .map(|(key, entry)| (key.clone(), entry.last_used));
+            let oldest_pdf = self
+                .retained_pdf_page_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, entry)| (key.clone(), entry.last_used));
+            let evict_pdf = match (oldest_ai.as_ref(), oldest_pdf.as_ref()) {
+                (None, None) => break,
+                (Some(_), None) => false,
+                (None, Some(_)) => true,
+                (Some((_, ai_last_used)), Some((_, pdf_last_used))) => pdf_last_used < ai_last_used,
             };
-            if let Some(removed) = self.retained_final_ai_cache.remove(&oldest_key) {
+            if evict_pdf {
+                let Some((oldest_key, _)) = oldest_pdf else {
+                    break;
+                };
+                let Some(removed) = self.retained_pdf_page_cache.remove(&oldest_key) else {
+                    break;
+                };
+                total_bytes = total_bytes.saturating_sub(removed.bytes);
+                let removed_kind = match &removed.kind {
+                    RetainedPdfPageCacheKind::Raster { .. } => "raster",
+                    RetainedPdfPageCacheKind::FinalAi { .. } => "final_ai",
+                };
+                crate::logger::log(format!(
+                    "[PDF] Retained page evict item={} kind={} bytes={} entries={} total_bytes={} \
+                     max_entries={max_entries} max_bytes={max_bytes} reason=budget",
+                    oldest_key.item_key,
+                    removed_kind,
+                    removed.bytes,
+                    self.retained_cross_session_cache_entries(),
+                    total_bytes,
+                ));
+            } else {
+                let Some((oldest_key, _)) = oldest_ai else {
+                    break;
+                };
+                let Some(removed) = self.retained_final_ai_cache.remove(&oldest_key) else {
+                    break;
+                };
                 total_bytes = total_bytes.saturating_sub(removed.bytes);
                 crate::logger::log(format!(
                     "[AI] Retained final AI evict item={} source={}x{} bytes={} \
@@ -26558,11 +27253,9 @@ impl App {
                     oldest_key.edit_size[0],
                     oldest_key.edit_size[1],
                     removed.bytes,
-                    self.retained_final_ai_cache.len(),
+                    self.retained_cross_session_cache_entries(),
                     total_bytes,
                 ));
-            } else {
-                break;
             }
         }
     }
@@ -26570,12 +27263,34 @@ impl App {
     pub(crate) fn prune_retained_final_ai_cache_to_settings(&mut self) {
         let Some((max_entries, max_bytes)) = self.retained_final_ai_budget() else {
             self.clear_retained_final_ai_cache("retained_budget_disabled");
+            self.clear_retained_pdf_page_cache("retained_budget_disabled");
             return;
         };
-        self.prune_retained_final_ai_cache_to_budget(max_entries, max_bytes);
+        self.prune_retained_cross_session_cache_to_budget(max_entries, max_bytes);
     }
 
     fn clear_retained_final_ai_for_idx(&mut self, idx: usize) {
+        if let Some(page_key) = self.retained_pdf_page_key_for(idx) {
+            let removed = self
+                .retained_pdf_page_cache
+                .get(&page_key)
+                .is_some_and(|entry| {
+                    matches!(entry.kind, RetainedPdfPageCacheKind::FinalAi { .. })
+                });
+            if removed {
+                let before_bytes = self.retained_pdf_page_cache_bytes();
+                self.retained_pdf_page_cache.remove(&page_key);
+                crate::logger::log(format!(
+                    "[PDF] Retained page clear idx={idx} item={} kind=final_ai \
+                     entries={} total_bytes={} removed_bytes={} reason=idx_final_pipeline_invalidation",
+                    page_key.item_key,
+                    self.retained_pdf_page_cache.len(),
+                    self.retained_pdf_page_cache_bytes(),
+                    before_bytes.saturating_sub(self.retained_pdf_page_cache_bytes()),
+                ));
+            }
+            return;
+        }
         let Some(item_key) = self.metadata_cache_key(idx) else {
             return;
         };
@@ -26599,6 +27314,7 @@ impl App {
 
     pub(crate) fn clear_retained_final_ai_cache(&mut self, reason: &str) {
         self.retained_final_ai_epoch = self.retained_final_ai_epoch.wrapping_add(1);
+        self.clear_retained_pdf_final_ai_entries(reason);
         let entries = self.retained_final_ai_cache.len();
         let total_bytes = self.retained_final_ai_cache_bytes();
         self.retained_final_ai_cache.clear();
@@ -26866,6 +27582,133 @@ impl App {
         }
     }
 
+    fn build_final_composite_texture_from_base(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        final_key: FinalCompositeKey,
+        params: &crate::adjustment::AdjustParams,
+        base_pixels: Arc<egui::ColorImage>,
+        edit_size: [usize; 2],
+        complete: bool,
+        base_is_ai: bool,
+        reason: &str,
+    ) -> egui::TextureHandle {
+        let perf_on = crate::perf::is_enabled();
+        let build_start = perf_on.then(std::time::Instant::now);
+        let output_is_ai_upscaled = base_is_ai && base_pixels.size != edit_size;
+        let sharpen_strength = params.effective_smart_sharpen(output_is_ai_upscaled);
+        let t_sharpen0 = perf_on.then(std::time::Instant::now);
+        let sharpened = if sharpen_strength == 0 {
+            base_pixels
+        } else {
+            Arc::new(crate::adjustment::apply_final_smart_sharpen(
+                &base_pixels,
+                sharpen_strength,
+            ))
+        };
+        let fc_sharpen_ms = t_sharpen0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+
+        let t_post0 = perf_on.then(std::time::Instant::now);
+        let post_filtered = Arc::new(self.apply_final_post_filter(&sharpened, params));
+        let fc_post_ms = t_post0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+        let t_clamp0 = perf_on.then(std::time::Instant::now);
+        let upload = clamp_for_gpu(&post_filtered);
+        let fc_clamp_ms = t_clamp0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+        let tex_opts = if !self.post_filter_bypassed && params.post_filter.needs_nearest_sampler() {
+            egui::TextureOptions::NEAREST
+        } else {
+            egui::TextureOptions::LINEAR
+        };
+        let [fc_w, fc_h] = post_filtered.size;
+        let t_up0 = perf_on.then(std::time::Instant::now);
+        let texture = ctx.load_texture(
+            format!(
+                "final_composite_{}_{}_{}_{}",
+                final_key.edit_key.idx,
+                final_key.edit_key.source_gen,
+                final_key.params_hash,
+                final_key.bg
+            ),
+            upload.into_owned(),
+            tex_opts,
+        );
+        let fc_upload_ms = t_up0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+        self.final_composite_cache.insert(
+            final_key,
+            FinalCompositeEntry {
+                pixels: post_filtered,
+                texture: texture.clone(),
+                complete,
+            },
+        );
+        crate::logger::log(format!(
+            "[PDF] Retained page restored final composite idx={idx} reason={reason} \
+             output={}x{} complete={complete}",
+            fc_w, fc_h,
+        ));
+        if perf_on {
+            crate::perf::event(
+                "fs",
+                "final_composite_build",
+                None,
+                0,
+                &[
+                    (
+                        "ms",
+                        build_start
+                            .map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0)
+                            .into(),
+                    ),
+                    ("edit_ms", 0.0.into()),
+                    ("adjust_ms", 0.0.into()),
+                    ("sharpen_ms", fc_sharpen_ms.into()),
+                    ("post_ms", fc_post_ms.into()),
+                    ("clamp_ms", fc_clamp_ms.into()),
+                    ("upload_ms", fc_upload_ms.into()),
+                    ("w", (fc_w as u64).into()),
+                    ("h", (fc_h as u64).into()),
+                    ("complete", complete.into()),
+                    ("idx", (idx as u64).into()),
+                    ("source", serde_json::Value::from("retained_pdf_final_ai")),
+                ],
+            );
+        }
+        texture
+    }
+
+    fn restore_retained_pdf_final_ai_composite(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        if !matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            return None;
+        }
+        let (ai_key, edit_size) = self.retained_pdf_final_ai_matches_current(idx)?;
+        let params = self.effective_params(idx).clone();
+        let final_key = self.final_composite_key_for_pixels(ai_key.edit_key, edit_size, &params);
+        if let Some(entry) = self.final_composite_cache.get(&final_key) {
+            if entry.complete {
+                return Some(entry.texture.clone());
+            }
+        }
+        let (ai_key, pixels, edit_size) =
+            self.lookup_retained_pdf_final_ai(idx, "restore_final_composite")?;
+        self.final_ai_cache.insert(ai_key, Arc::clone(&pixels));
+        Some(self.build_final_composite_texture_from_base(
+            ctx,
+            idx,
+            final_key,
+            &params,
+            pixels,
+            edit_size,
+            true,
+            true,
+            "retained_pdf_final_ai",
+        ))
+    }
+
     pub(crate) fn ensure_final_composite_texture(
         &mut self,
         ctx: &egui::Context,
@@ -26878,6 +27721,9 @@ impl App {
         // 計時は perf-log 有効時のみ (cache hit 経路は毎フレーム走るので clock 読みを足さない)。
         let perf_on = crate::perf::is_enabled();
         let fc_build_start = perf_on.then(std::time::Instant::now);
+        if let Some(texture) = self.restore_retained_pdf_final_ai_composite(ctx, idx) {
+            return Some(texture);
+        }
         let (edit_key, edit_pixels) = self.ensure_edit_result_pixels(ctx, idx)?;
         let fc_edit_ms = fc_build_start.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
         let params = self.effective_params(idx).clone();
@@ -26936,7 +27782,8 @@ impl App {
                     // (maybe_native_rerender_pdf_for_ai) も kick するが、reconcile 対象外の
                     // 経路 (コピー/書き出しの composite 要求等) で保留が永久 true になり
                     // ハングするのを防ぐ。in-flight 中は二重起動しない。priority レーン。
-                    if !self.fs_pending.contains_key(&idx) {
+                    if !self.fs_pending.contains_key(&idx) && !self.fs_upload_backlog_contains(idx)
+                    {
                         self.request_pdf_rerender(idx, 1.0, true);
                     }
                     true
@@ -30718,6 +31565,60 @@ impl App {
     /// pending の読み込みをポーリングし、完了したものをキャッシュに取り込む。
     ///
     /// **GPU アップロード ペーシング**: デコード完了した `FsLoadResult` は
+    fn build_static_fs_cache_entry(
+        &mut self,
+        ctx: &egui::Context,
+        key: usize,
+        pixels: Arc<egui::ColorImage>,
+        source_dims: [usize; 2],
+        load_seq: u64,
+        perf_key_str: Option<String>,
+        upload_t0: std::time::Instant,
+        result_kind: &'static str,
+        store_retained_pdf_page_raster: bool,
+    ) -> FsCacheEntry {
+        if store_retained_pdf_page_raster {
+            self.insert_retained_pdf_page_raster(key, source_dims, Arc::clone(&pixels));
+        }
+        let upload = clamp_for_gpu(&pixels);
+        let [w, h] = pixels.size;
+        let handle = ctx.load_texture(
+            format!("fs_{key}"),
+            upload.into_owned(),
+            egui::TextureOptions::LINEAR,
+        );
+        let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+        // `load_seq` を使うのは、decode 中に別操作が入っても
+        // ready が load_begin と同じシーケンスに紐づくようにするため。
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "fs",
+                "ready",
+                perf_key_str.as_deref(),
+                load_seq,
+                &[
+                    ("idx", serde_json::Value::from(key)),
+                    ("upload_ms", serde_json::Value::from(upload_ms)),
+                    ("w", serde_json::Value::from(w)),
+                    ("h", serde_json::Value::from(h)),
+                    ("result_kind", serde_json::Value::from(result_kind)),
+                ],
+            );
+        }
+        // 表示中の画像のみ色調補正を即座に適用（チラつき防止）。
+        // 先読み分は表示に入った時点で final pipeline
+        // (ensure_final_composite_texture) が処理する。
+        if self.fullscreen_idx == Some(key) {
+            self.apply_sync_adjustment(ctx, key, &pixels, false);
+        }
+        FsCacheEntry::Static {
+            tex: handle,
+            pixels,
+            source_dims: Some(source_dims),
+            load_seq,
+        }
+    }
+
     /// 一旦 `fs_upload_backlog` に積み、1 フレームあたり最大 1 枚だけ `ctx.load_texture`
     /// する。現在フルスクリーン表示中の idx は即時アップロードして表示遅延ゼロ。
     /// これにより 20MP JPEG 連続 prefetch 時の 500ms 級 UI フリーズを回避する。
@@ -30840,44 +31741,32 @@ impl App {
             let entry = match result {
                 FsLoadResult::Static { ci, source_dims } => {
                     let pixels = std::sync::Arc::new(ci);
-                    let upload = clamp_for_gpu(&pixels);
-                    let [w, h] = pixels.size;
-                    let handle = ctx.load_texture(
-                        format!("fs_{key}"),
-                        upload.into_owned(),
-                        egui::TextureOptions::LINEAR,
-                    );
-                    let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
-                    // `load_seq` を使うのは、decode 中に別操作が入っても
-                    // ready が load_begin と同じシーケンスに紐づくようにするため。
-                    if crate::perf::is_enabled() {
-                        crate::perf::event(
-                            "fs",
-                            "ready",
-                            perf_key_str.as_deref(),
-                            load_seq,
-                            &[
-                                ("idx", serde_json::Value::from(key)),
-                                ("upload_ms", serde_json::Value::from(upload_ms)),
-                                ("w", serde_json::Value::from(w)),
-                                ("h", serde_json::Value::from(h)),
-                                ("result_kind", serde_json::Value::from("static")),
-                            ],
-                        );
-                    }
-                    // 表示中の画像のみ色調補正を即座に適用（チラつき防止）。
-                    // 先読み分は表示に入った時点で final pipeline
-                    // (ensure_final_composite_texture) が処理する。
-                    if self.fullscreen_idx == Some(key) {
-                        self.apply_sync_adjustment(ctx, key, &pixels, false);
-                    }
-                    FsCacheEntry::Static {
-                        tex: handle,
+                    self.build_static_fs_cache_entry(
+                        ctx,
+                        key,
                         pixels,
-                        source_dims: Some(source_dims),
+                        source_dims,
                         load_seq,
-                    }
+                        perf_key_str.clone(),
+                        upload_t0,
+                        "static",
+                        true,
+                    )
                 }
+                FsLoadResult::StaticCached {
+                    pixels,
+                    source_dims,
+                } => self.build_static_fs_cache_entry(
+                    ctx,
+                    key,
+                    pixels,
+                    source_dims,
+                    load_seq,
+                    perf_key_str.clone(),
+                    upload_t0,
+                    "static_cached",
+                    false,
+                ),
                 FsLoadResult::Animated(frames) => {
                     let mut frame_pixels = Vec::with_capacity(frames.len());
                     let textures: Vec<(egui::TextureHandle, f64)> = frames

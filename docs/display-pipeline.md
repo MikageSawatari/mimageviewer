@@ -683,16 +683,24 @@ ZIP の章区切り (`ZipSeparator`) は GPU テクスチャ化せず、前後�
   に伴う同じ item の `fs_cache` 再ロードでは live cache だけを作り直し、保持 LRU は残す。
   PDF ページの display final AI は、巨大ページで完了前に session close / keep-set eviction
   されると LRU へ store できないため、保持 LRU が有効な場合だけ最大 1 件を
-  `retained_final_ai_orphans` として live pending から外し、cancel せず完走させる。完走結果は
-  stable item key で保持 LRU にだけ store し、古い idx ベースの `final_ai_cache` には戻さない。
+  `retained_final_ai_orphans` として live pending から外し、cancel せず完走させる。PDF ページは
+  汎用 `retained_final_ai_cache` へ重複保存せず、PDF ページ専用の統合スロット
+  (`Raster` / `FinalAi` のどちらか 1 つ) へ store する。PDF レンダリングが完了した段階では
+  `Raster` として保持し、その後 final AI が完了したら同じページスロットを `FinalAi` に昇格して
+  raster pixels を解放する。この PDF ページスロットと汎用保持 LRU は同じ枚数 / MiB 予算で
+  合算 LRU 退去される。再表示時に `FinalAi` が条件一致すれば PDF worker を起こさず、AI pixels
+  から `final_composite_cache` を直接復元する。
   外部変更や AI 設定変更で retained epoch が進んでいた場合、その orphan 結果は store 時に捨てる。
-  保持 LRU の store / hit /
+  汎用保持 LRU の store / hit /
   miss / skip / evict / clear は `mimageviewer.log` に `[AI] Retained final AI ...`
   として記録する。PDF orphan の開始 / 回収は `[AI] Final AI retained orphan ...` /
   `[AI] Final AI orphan result stored for retained cache only ...` に出る。epoch 不一致や設定無効で
-  store しなかった orphan は `skipped for retained cache only` になる。
+  store しなかった orphan は `skipped for retained cache only` になる。PDF ページ統合スロットの
+  `Raster` / `FinalAi` の store / hit / miss / evict / clear は `[PDF] Retained page ...` として
+  記録する。
   ヒット時も元画像ロードと final composite の再生成は必要なので、再入場直後に 1 フレーム程度
-  AI 前の暫定表示が出ることはある。外部アプリによる現在フォルダの実ディスク変更を
+  AI 前の暫定表示が出ることはある。ただし PDF の `FinalAi` hit は raw PDF レンダリングを待たずに
+  final composite を復元するため、ラスタ化待ちの低解像度表示を避けられる。外部アプリによる現在フォルダの実ディスク変更を
   signature 差分で検出した場合は、同じ path / 同じ寸法の差し替えに備えて保持 LRU を全クリアする。
 - **AI 先読み (新パイプライン)**: `App::prefetch_final_ai` がフルスクリーン更新ループ
   終盤で呼ばれ、現在ページの `final_ai_pending` (cancel フラグ除く) が空のときだけ

@@ -458,7 +458,8 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
 | `conceal_cache` | `HashMap<idx, ConcealCacheEntry>` | 隠蔽加工合成済みテクスチャ |
 | `edit_result_cache` | `HashMap<EditResultKey, EditResultEntry>` | `raw -> erase -> local_adjust -> conceal` の source 解像度 edit 結果。AdjustParams / AI / post_filter / crop は含めない |
 | `final_ai_cache` | `HashMap<FinalAiKey, Arc<ColorImage>>` | 色調補正後の edit 結果へ AI アップスケール / デノイズを適用した結果 |
-| `retained_final_ai_cache` | `HashMap<RetainedFinalAiKey, RetainedFinalAiEntry>` | fullscreen session をまたいで保持する final AI pixels。`metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で識別し、枚数 / MiB の LRU で退去。PDF display job は session close / keep-set eviction 時に最大 1 件だけ retained store 目的で完走を許可できる |
+| `retained_final_ai_cache` | `HashMap<RetainedFinalAiKey, RetainedFinalAiEntry>` | fullscreen session をまたいで保持する final AI pixels。`metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で識別し、PDF retained page cache と合算した枚数 / MiB の LRU で退去。PDF display job は session close / keep-set eviction 時に最大 1 件だけ retained store 目的で完走を許可できる |
+| PDF retained page cache | `HashMap<item_key, Raster \| FinalAi>` | PDF ページ専用の保持スロット。PDF レンダリング後は `Raster`、final AI 完了後は同じスロットを `FinalAi` に昇格するため、同一ページのラスタ結果とAI結果を二重保持しない。容量は `retained_final_ai_cache` と同じ設定枠に合算する。`FinalAi` hit 時は raw PDF レンダリングを待たずに final composite を直接復元できる |
 | `final_composite_cache` | `HashMap<FinalCompositeKey, FinalCompositeEntry>` | edit 結果に AdjustParams 全項目、final AI、スマートシャープ、post_filter を適用した通常表示用テクスチャ |
 
 描画時 ([display-pipeline.md](display-pipeline.md) を参照) は:
@@ -513,14 +514,20 @@ AI 完了時に未完了の final composite を捨てて AI 後の画像へ掛�
 keep-set eviction では消さず、AI 入力が変わる編集 (`clear_final_pipeline_caches_for_idx`)
 や AI 機能モード / サイズ上限変更で破棄する。fullscreen close / reopen に伴う同じ item の
 `fs_cache` 再ロードは `bump_input_generation_for_fs_cache_reload` で live cache だけを
-無効化し、保持 LRU は残す。PDF ページの display final AI は、完了前に live 表示セッションから
-外れても retained key と retained epoch を job に持たせておき、最大 1 件だけ cancel せず
-完走させられる。この orphan result は保持 LRU にだけ store し、idx ベースの live
-`final_ai_cache` には戻さない。外部変更や AI 設定変更で retained epoch が進んでいた結果は
-store 時に捨てる。保持 LRU の `store` / `hit` / `miss` /
+無効化し、保持 LRU は残す。PDF ページは `retained_final_ai_cache` へ重複保存せず、PDF 専用の
+ページ保持スロットで `Raster` と `FinalAi` を同じ容量枠として扱う。PDF レンダリング後は
+`Raster` を保持し、final AI 完了後は同じ item_key のスロットを `FinalAi` に昇格して
+ラスタ結果を解放する。PDF ページ保持スロットと通常の保持AIは、同じ設定値
+(`retained_final_ai_cache_max_entries` / `retained_final_ai_cache_max_mib`) の合算 LRU で
+退去する。`FinalAi` が現在の `edit_size + color_ai_hash + bg` と一致する場合は、`fs_cache` の
+raw PDF pixels を待たずに final composite を直接復元する。PDF ページの display
+final AI は、完了前に live 表示セッションから外れても retained key と retained epoch を job に
+持たせておき、最大 1 件だけ cancel せず完走させられる。この orphan result は保持スロットにだけ
+store し、idx ベースの live `final_ai_cache` には戻さない。外部変更や AI 設定変更で retained
+epoch が進んでいた結果は store 時に捨てる。保持 LRU の `store` / `hit` / `miss` /
 `skip` / `evict` / `clear` は通常ログ (`mimageviewer.log`) に出るため、同じページへ
 戻ったときに推論再実行ではなく保持結果の復元だったか、または保持前に破棄されたかを
-後から確認できる。
+後から確認できる。PDF ページ保持スロットは `[PDF] Retained page ...` としてログに出る。
 
 ### 3.3 サムネイル補正
 

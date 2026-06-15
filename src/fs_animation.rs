@@ -29,6 +29,14 @@ pub enum FsLoadResult {
         ci: egui::ColorImage,
         source_dims: [usize; 2],
     },
+    /// 保持済み CPU ピクセルから再投入する静止画。
+    ///
+    /// PDF ラスタ保持キャッシュの hit では、大きい `ColorImage` を clone せずに
+    /// `Arc` のまま UI スレッドの upload backlog へ渡す。
+    StaticCached {
+        pixels: std::sync::Arc<egui::ColorImage>,
+        source_dims: [usize; 2],
+    },
     /// 360 度パノラマ用 (Phase 2a、SettleReady or SettleApproved 経路、
     /// docs/panorama-360-view-plan.md §4.6.0)。
     ///
