@@ -24,6 +24,10 @@ mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の
 - **動画はコンテナ索引 (Ctrl+S) の対象外** — 動画はアイテムなので Ctrl+G で扱う。
 - **ZIP はアイテム索引 (Ctrl+G) の対象外** — ZIP はコンテナなので Ctrl+S で扱う。
   ZIP 内画像のメタ検索はどのモードでも行わない (§4.6)。
+- **製本ルート (`Settings.book_root` / 既定 `Pictures\mimageviewer\books`) は
+  Ctrl+S/Ctrl+G の自動索引対象外** — 本ページはコピー済みスナップショットで、並べ替え時に
+  大量リネームが発生するため二重索引と watcher チャーンを避ける。初期スキャンでは既存の
+  残留行を削除候補に落とし、watcher 差分では本棚配下の投入をスキップする。
 - **Ctrl+F は索引を使わない** — 現グリッドの表示中アイテム (構造アイテム含む) を
   その場で判定する。構造アイテム (Folder / ZIP / PDF) もファイル名で一貫して
   絞り込む (§5.2)。
@@ -59,6 +63,13 @@ Tantivy `tags` STORED フィールドは旧 XMP `dc:subject` からの移行用�
 
 「検索結果をタグで絞る」用途は、検索結果グリッドに対して facet タグフィルタを AND 合成する。
 facet のタグ値は表示 `#タグ` ではなく、`tags.db` と同じ `tag_key` (NFKC + lowercase、`#` なし) を保持する。
+
+### 1.4 AI モデル/生成ツール facet (v1.7.0)
+
+スマートフィルタの「モデル」「生成ツール」は、Ctrl+G の Tantivy field ではなく現在グリッドの
+遅延メタデータ facet として実装する。`png_metadata::AiMetadata` から session-local に
+`model_names()` / `generation_tool()` を計算し、現在表示中のアイテム集合へ AND 合成する。
+そのため `INDEX_VERSION` bump は不要で、モデル名の正規化規則は再構築なしに調整できる。
 
 ---
 

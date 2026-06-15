@@ -89,6 +89,11 @@ pub enum AiMetadata {
     Unknown(Vec<(String, String)>),
 }
 
+pub const MODEL_INFO_NONE_LABEL: &str = "(モデル情報なし)";
+pub const TOOL_INFO_NONE_LABEL: &str = "(生成ツール情報なし)";
+pub const NOVELAI_MODEL_LABEL: &str = "(NovelAI)";
+pub const MULTIPLE_MODELS_LABEL: &str = "(複数)";
+
 #[derive(Clone, Debug)]
 struct ParseOutcome {
     meta: AiMetadata,
@@ -248,6 +253,15 @@ fn decompress_zlib(data: &[u8]) -> std::io::Result<String> {
 /// PNG は tEXt/iTXt/zTXt、JPEG/JFIF は EXIF UserComment を見る。
 pub fn extract_metadata(path: &Path) -> Option<AiMetadata> {
     extract_metadata_with_origin(path).map(|(meta, _)| meta)
+}
+
+pub fn metadata_path_may_contain_ai(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "jfif"
+        )
+    })
 }
 
 pub fn extract_metadata_with_origin(path: &Path) -> Option<(AiMetadata, MetadataOrigin)> {
@@ -776,7 +790,12 @@ fn parse_invokeai_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metad
         "vae",
         "app_version",
     ] {
-        if let Some(v) = json.get(key).and_then(json_value_to_text) {
+        let value = if key == "model" {
+            json.get(key).and_then(model_json_value_to_text)
+        } else {
+            json.get(key).and_then(json_value_to_text)
+        };
+        if let Some(v) = value {
             params.push((key.to_string(), v));
         }
     }
@@ -1113,6 +1132,23 @@ fn json_value_to_text(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn model_json_value_to_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(_) => first_json_text(
+            value,
+            &[
+                &["model_name"],
+                &["name"],
+                &["modelName"],
+                &["base"],
+                &["model_weights"],
+            ],
+        )
+        .or_else(|| json_value_to_text(value)),
+        _ => json_value_to_text(value),
+    }
+}
+
 fn scalar_params_from_object(
     obj: &serde_json::Map<String, serde_json::Value>,
     skip: &[&str],
@@ -1301,6 +1337,144 @@ fn append_kv(out: &mut String, k: &str, v: &str) {
     out.push_str(k);
     out.push_str(": ");
     out.push_str(v);
+}
+
+/// 生成ツールの表示名を返す。
+pub fn ai_tool_name(meta: &AiMetadata) -> Option<&'static str> {
+    match meta {
+        AiMetadata::A1111(m) => Some(match m.tool {
+            AiToolKind::A1111 => "A1111/Forge",
+            AiToolKind::NovelAI => "NovelAI",
+            AiToolKind::InvokeAI => "InvokeAI",
+            AiToolKind::SwarmUI => "SwarmUI",
+            AiToolKind::Fooocus => "Fooocus",
+            AiToolKind::EasyDiffusion => "EasyDiffusion",
+            AiToolKind::Midjourney => "Midjourney",
+            AiToolKind::JpegExif => "A1111/Forge",
+        }),
+        AiMetadata::ComfyUI(_) => Some("ComfyUI"),
+        AiMetadata::Unknown(_) => None,
+    }
+}
+
+/// メタデータから代表モデル名を 1 つ返す。
+///
+/// ComfyUI で複数 checkpoint が見つかった場合は `"(複数)"` を返す。facet などで
+/// 複数値として扱いたい場合は [`model_names`] を使う。
+pub fn model_name(meta: &AiMetadata) -> Option<String> {
+    let names = model_names(meta);
+    match names.len() {
+        0 => None,
+        1 => names.into_iter().next(),
+        _ => Some(MULTIPLE_MODELS_LABEL.to_string()),
+    }
+}
+
+/// メタデータから facet 用のモデル名候補を返す。
+///
+/// 正規化は basename 化 + 既知モデル拡張子除去に留める。過度に畳み込むと別モデルを
+/// 混ぜるため、非永続の派生値として軽く扱う。
+pub fn model_names(meta: &AiMetadata) -> Vec<String> {
+    let mut out = Vec::new();
+    match meta {
+        AiMetadata::A1111(m) => {
+            if m.tool == AiToolKind::NovelAI {
+                out.push(NOVELAI_MODEL_LABEL.to_string());
+            } else if m.tool == AiToolKind::InvokeAI {
+                for key in model_param_keys_for_tool(m.tool) {
+                    if let Some(value) = first_param_value(&m.params, key)
+                        && let Some(name) = normalize_model_name(value)
+                    {
+                        out.push(name);
+                        break;
+                    }
+                }
+            } else {
+                for key in model_param_keys_for_tool(m.tool) {
+                    if let Some(value) = first_param_value(&m.params, key)
+                        && let Some(name) = normalize_model_name(value)
+                    {
+                        out.push(name);
+                    }
+                }
+            }
+        }
+        AiMetadata::ComfyUI(m) => {
+            for (key, value) in &m.sampler_params {
+                if key.eq_ignore_ascii_case("model") || key.eq_ignore_ascii_case("ckpt_name") {
+                    if let Some(name) = normalize_model_name(value) {
+                        out.push(name);
+                    }
+                }
+            }
+        }
+        AiMetadata::Unknown(_) => {}
+    }
+    dedup_preserve_order(out)
+}
+
+fn model_param_keys_for_tool(tool: AiToolKind) -> &'static [&'static str] {
+    match tool {
+        AiToolKind::A1111 | AiToolKind::JpegExif | AiToolKind::Midjourney => &["Model", "model"],
+        AiToolKind::SwarmUI => &["model"],
+        AiToolKind::Fooocus => &["base_model", "base_model_name", "refiner_model"],
+        AiToolKind::InvokeAI => &["model_name", "model.name", "model_weights", "model"],
+        AiToolKind::EasyDiffusion => &["use_stable_diffusion_model", "Stable Diffusion model"],
+        AiToolKind::NovelAI => &[],
+    }
+}
+
+fn first_param_value<'a>(params: &'a [(String, String)], wanted: &str) -> Option<&'a str> {
+    params
+        .iter()
+        .find(|(key, value)| key.eq_ignore_ascii_case(wanted) && !value.trim().is_empty())
+        .map(|(_, value)| value.as_str())
+}
+
+fn normalize_model_name(raw: &str) -> Option<String> {
+    let raw = raw.trim().trim_matches('"').trim_matches('\'');
+    if raw.is_empty() {
+        return None;
+    }
+    if matches!(
+        raw.to_ascii_lowercase().as_str(),
+        "none" | "null" | "undefined" | "n/a"
+    ) {
+        return None;
+    }
+
+    let without_hash_suffix = raw
+        .strip_suffix(')')
+        .and_then(|s| s.rsplit_once(" (").map(|(name, _)| name))
+        .unwrap_or(raw);
+    let basename = without_hash_suffix
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(without_hash_suffix)
+        .trim();
+    let lower = basename.to_ascii_lowercase();
+    let stem = [".safetensors", ".ckpt", ".pt", ".pth", ".onnx", ".bin"]
+        .iter()
+        .find_map(|ext| {
+            lower
+                .strip_suffix(ext)
+                .map(|_| &basename[..basename.len() - ext.len()])
+        })
+        .unwrap_or(basename)
+        .trim();
+    (!stem.is_empty()).then(|| stem.to_string())
+}
+
+fn dedup_preserve_order(values: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        let key = value.to_lowercase();
+        if seen.insert(key) {
+            out.push(value);
+        }
+    }
+    out
 }
 
 /// PNG の生 tEXt チャンク群から検索対象文字列を直接構築する高レベルヘルパ。
@@ -1876,6 +2050,119 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "Model" && v == "sd_xl_base")
         );
+    }
+
+    #[test]
+    fn model_name_extracts_a1111_friendly_name() {
+        let raw = "beautiful landscape\n\
+                    Steps: 20, Seed: 12345, Model: C:\\models\\dream-shaper.safetensors, Model hash: abc";
+        let meta = AiMetadata::A1111(parse_a1111(raw).unwrap());
+        assert_eq!(model_name(&meta).as_deref(), Some("dream-shaper"));
+        assert_eq!(model_names(&meta), vec!["dream-shaper"]);
+        assert_eq!(ai_tool_name(&meta), Some("A1111/Forge"));
+    }
+
+    #[test]
+    fn model_name_extracts_swarmui_fooocus_invoke_and_easy_diffusion() {
+        let swarm = expect_prompt_meta(detect_and_parse(&chunks(&[(
+            "parameters",
+            r#"{"sui_image_params":{"prompt":"p","negativeprompt":"n","model":"Official/sd_xl_base_1.0.safetensors"}}"#,
+        )])));
+        assert_eq!(
+            model_name(&AiMetadata::A1111(swarm)).as_deref(),
+            Some("sd_xl_base_1.0")
+        );
+
+        let fooocus = expect_prompt_meta(detect_and_parse(&chunks(&[
+            (
+                "parameters",
+                r#"{"prompt":"p","negative_prompt":"n","base_model":"juggernautXL.safetensors"}"#,
+            ),
+            ("fooocus_scheme", "fooocus"),
+        ])));
+        assert_eq!(
+            model_name(&AiMetadata::A1111(fooocus)).as_deref(),
+            Some("juggernautXL")
+        );
+
+        let invoke = expect_prompt_meta(detect_and_parse(&chunks(&[(
+            "invokeai_metadata",
+            r#"{"positive_prompt":"p","model":"invoke-model.ckpt"}"#,
+        )])));
+        assert_eq!(
+            model_name(&AiMetadata::A1111(invoke)).as_deref(),
+            Some("invoke-model")
+        );
+
+        let invoke_object = expect_prompt_meta(detect_and_parse(&chunks(&[(
+            "invokeai_metadata",
+            r#"{"positive_prompt":"p","model":{"model_name":"object-model.safetensors"}}"#,
+        )])));
+        assert_eq!(
+            model_name(&AiMetadata::A1111(invoke_object)).as_deref(),
+            Some("object-model")
+        );
+
+        let invoke_legacy = expect_prompt_meta(detect_and_parse(&chunks(&[(
+            "sd-metadata",
+            r#"{"image":{"prompt":"p"},"model":"generic","model_weights":"legacy-real.ckpt"}"#,
+        )])));
+        assert_eq!(
+            model_name(&AiMetadata::A1111(invoke_legacy)).as_deref(),
+            Some("legacy-real")
+        );
+
+        let fooocus_refiner_none = expect_prompt_meta(detect_and_parse(&chunks(&[
+            (
+                "parameters",
+                r#"{"prompt":"p","negative_prompt":"n","base_model":"base.safetensors","refiner_model":"None"}"#,
+            ),
+            ("fooocus_scheme", "fooocus"),
+        ])));
+        assert_eq!(
+            model_names(&AiMetadata::A1111(fooocus_refiner_none)),
+            vec!["base"]
+        );
+
+        let easy = expect_prompt_meta(detect_and_parse(&chunks(&[
+            ("prompt", "p"),
+            ("negative_prompt", "n"),
+            (
+                "use_stable_diffusion_model",
+                "C:/models/ed-model.safetensors",
+            ),
+        ])));
+        assert_eq!(
+            model_name(&AiMetadata::A1111(easy)).as_deref(),
+            Some("ed-model")
+        );
+    }
+
+    #[test]
+    fn model_names_extracts_comfyui_checkpoints_and_novelai_label() {
+        let json_str = r#"{
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": "alpha.safetensors"}
+            },
+            "2": {
+                "class_type": "CheckpointLoader",
+                "inputs": {"ckpt_name": "nested/beta.ckpt"}
+            }
+        }"#;
+        let meta =
+            AiMetadata::ComfyUI(parse_comfyui(serde_json::from_str(json_str).unwrap(), None));
+        assert_eq!(model_names(&meta), vec!["alpha", "beta"]);
+        assert_eq!(model_name(&meta).as_deref(), Some(MULTIPLE_MODELS_LABEL));
+
+        let novelai = expect_prompt_meta(detect_and_parse(&chunks(&[
+            ("Software", "NovelAI"),
+            ("Description", "cat"),
+            ("Source", "Stable Diffusion abcdef"),
+            ("Comment", r#"{"uc":"negative"}"#),
+        ])));
+        let meta = AiMetadata::A1111(novelai);
+        assert_eq!(model_name(&meta).as_deref(), Some(NOVELAI_MODEL_LABEL));
     }
 
     #[test]

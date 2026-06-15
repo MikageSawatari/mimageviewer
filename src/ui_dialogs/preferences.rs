@@ -248,6 +248,7 @@ pub(crate) struct PreferencesState {
     // ページ固有の一時状態
     pub manual_threads: usize,
     pub capture_output_dir_input: String,
+    pub book_root_input: String,
     pub startup_folder_path_input: String,
     pub recent_folders_clear_requested: bool,
     pub quick_folder_slots_clear_requested: bool,
@@ -438,6 +439,11 @@ impl PreferencesState {
             manual_threads,
             capture_output_dir_input: s
                 .capture_output_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            book_root_input: s
+                .book_root
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),

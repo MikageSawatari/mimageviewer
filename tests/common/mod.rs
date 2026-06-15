@@ -184,8 +184,14 @@ pub fn make_favorite(name: &str, path: &Path) -> FavoriteEntry {
 pub fn start_indexer_at(data_dir: &Path, favorites: &[FavoriteEntry]) -> IndexerManager {
     // テストでは idle 閾値 0ms にして wait_until_idle を即抜けさせる (活動ゲートの影響を排除)。
     let gate = std::sync::Arc::new(mimageviewer::activity_gate::ActivityGate::new(0));
-    IndexerManager::new_at(data_dir, favorites, IndexerSpeedProfile::Low, gate)
-        .expect("IndexerManager::new_at succeeds")
+    IndexerManager::new_at(
+        data_dir,
+        favorites,
+        IndexerSpeedProfile::Low,
+        gate,
+        Vec::new(),
+    )
+    .expect("IndexerManager::new_at succeeds")
 }
 
 // -----------------------------------------------------------------------
@@ -204,8 +210,13 @@ pub fn start_name_index_at(
     let db = Arc::new(
         SearchIndexDb::open_at(&data_dir.join("search_index.db")).expect("SearchIndexDb::open_at"),
     );
-    let handle =
-        name_index_supervisor::spawn(favorite.id, favorite.path.clone(), Arc::clone(&db), None);
+    let handle = name_index_supervisor::spawn(
+        favorite.id,
+        favorite.path.clone(),
+        Arc::clone(&db),
+        Vec::new(),
+        None,
+    );
     (db, handle)
 }
 

@@ -950,6 +950,10 @@ impl App {
     /// テキスト編集モードに入る。見開き中は左ページへ Single ピボットする
     /// (消しゴム / 隠蔽の enter と同じ作法)。`comic_docs` に作業セットをロードする。
     pub(crate) fn enter_text_mode(&mut self, fs_idx: usize) {
+        if self.idx_is_compiled_book_page(fs_idx) {
+            self.show_feedback_toast("本のページは編集できません".to_string());
+            return;
+        }
         let spread_pair = match self.resolve_spread_pair(fs_idx) {
             SpreadPair::Double { left, right } => Some((left, right)),
             SpreadPair::Single => None,

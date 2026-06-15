@@ -5069,6 +5069,14 @@ impl App {
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::VideoCapture, &key) => {
                 self.save_video_frame_to_file(ctx, fs_idx);
             }
+            // Ctrl+B: add current video frame to the active compiled book.
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoAddToActiveBook, &key) =>
+            {
+                self.add_current_video_frame_to_active_book(ctx, fs_idx);
+            }
             // X / C: comparison view is static-image only. Consume as silent no-op.
             _ if !key.repeat
                 && (self

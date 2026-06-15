@@ -77,6 +77,10 @@ impl App {
     /// Single ページへ pivot し、退場時に spread 状態を復元する。crop は表示 overlay
     /// のみで重い合成が無いため、post_filter バイパスや base cache 準備は行わない。
     pub(crate) fn enter_export_crop_mode(&mut self, fs_idx: usize) {
+        if self.idx_is_compiled_book_page(fs_idx) {
+            self.show_feedback_toast("本のページは編集できません".to_string());
+            return;
+        }
         let spread_pair = match self.resolve_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } => Some((left, right)),
             crate::ui_fullscreen::SpreadPair::Single => None,

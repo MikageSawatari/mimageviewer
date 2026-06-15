@@ -1081,7 +1081,7 @@ impl App {
 
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                let mut top_menu_responses = Vec::with_capacity(6);
+                let mut top_menu_responses = Vec::with_capacity(7);
 
                 let response = ui.menu_button("ファイル", |ui| {
                     if ui.button("フォルダを開く…").clicked() {
@@ -1171,6 +1171,75 @@ impl App {
                                 fav_nav = Some(fav.path.clone());
                                 ui.close();
                             }
+                        }
+                    }
+                });
+                top_menu_responses.push(response.response);
+
+                let response = ui.menu_button("製本", |ui| {
+                    let active_name = self.active_book_name();
+                    ui.label(format!("追加先: {active_name}"));
+                    let has_selection = self.selected.is_some() || !self.checked.is_empty();
+                    if ui
+                        .add_enabled(
+                            has_selection,
+                            egui::Button::new("アクティブな本に追加 (Ctrl+B)"),
+                        )
+                        .clicked()
+                    {
+                        self.add_grid_selection_to_active_book(ctx);
+                        ui.close();
+                    }
+                    if ui.button("本棚フォルダを開く").clicked() {
+                        self.open_books_root();
+                        ui.close();
+                    }
+                    if ui.button("アクティブな本を開く").clicked() {
+                        fav_nav = Some(self.active_book_folder_path());
+                        ui.close();
+                    }
+                    if self.current_folder_is_book_folder()
+                        && ui.button("この本を並べ替え…").clicked()
+                    {
+                        self.open_book_reorder_from_current();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("製本の管理…").clicked() {
+                        self.show_book_manager = true;
+                        self.book_manager_rename_name = active_name.clone();
+                        self.book_list_cache = None;
+                        ui.close();
+                    }
+                    ui.separator();
+                    if self.book_list_cache.is_none() && self.book_op_pending.is_none() {
+                        self.request_book_list_refresh();
+                    }
+                    let rows = self.book_list_cache.clone();
+                    match rows {
+                        Some(rows) if rows.is_empty() => {
+                            ui.label(egui::RichText::new("（本はまだありません）").weak());
+                        }
+                        Some(rows) => {
+                            ui.menu_button("追加先を選ぶ", |ui| {
+                                for row in rows {
+                                    let selected = row.name == active_name;
+                                    let label = if selected {
+                                        format!("✓ {} ({}p)", row.name, row.page_count)
+                                    } else {
+                                        format!("{} ({}p)", row.name, row.page_count)
+                                    };
+                                    if ui.button(label).clicked() {
+                                        self.settings.active_book_name = row.name.clone();
+                                        self.settings.save();
+                                        self.book_manager_rename_name = row.name;
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                        None => {
+                            ui.label(egui::RichText::new("本棚を読み込み中…").weak());
                         }
                     }
                 });
@@ -1527,6 +1596,614 @@ impl App {
         }
 
         (fav_nav, sort_changed)
+    }
+
+    pub(crate) fn open_book_reorder_from_current(&mut self) {
+        let Some(folder) = self.current_folder.clone() else {
+            self.show_feedback_toast("本フォルダを開いてから並べ替えてください".to_string());
+            return;
+        };
+        if !crate::books::is_direct_book_folder(&self.book_root_path(), &folder) {
+            self.show_feedback_toast("本フォルダを開いてから並べ替えてください".to_string());
+            return;
+        }
+        let entries: Vec<crate::books::BookPageEntry> = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                GridItem::Image(path)
+                    if path
+                        .parent()
+                        .is_some_and(|parent| crate::folder_tree::path_eq(parent, &folder)) =>
+                {
+                    let display_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("page")
+                        .to_string();
+                    Some(crate::books::BookPageEntry {
+                        path: path.clone(),
+                        display_name,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        if entries.is_empty() {
+            self.show_feedback_toast("並べ替えできるページがありません".to_string());
+            return;
+        }
+        self.book_reorder = Some(crate::app::BookReorderState {
+            folder,
+            entries,
+            selected: Some(0),
+            dragging: None,
+            thumb_textures: HashMap::new(),
+            thumb_failed: HashSet::new(),
+            thumb_pending_key: None,
+            thumb_rx: None,
+            dirty: false,
+            flush_pending: None,
+            error: None,
+        });
+    }
+
+    pub(crate) fn draw_book_manager(&mut self, ctx: &egui::Context) {
+        if !self.show_book_manager {
+            return;
+        }
+        if self.book_list_cache.is_none() && self.book_op_pending.is_none() {
+            self.request_book_list_refresh();
+        }
+        let mut open = true;
+        let mut open_request: Option<PathBuf> = None;
+        let mut set_active_request: Option<String> = None;
+        let mut rename_request: Option<(String, String)> = None;
+        let mut delete_request: Option<String> = None;
+        let mut refresh_request = false;
+        let default_pos = ctx.content_rect().center() - egui::vec2(250.0, 220.0);
+        egui::Window::new("製本の管理")
+            .collapsible(false)
+            .resizable(true)
+            .default_pos(default_pos)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(660.0);
+                ui.label(format!("本棚: {}", self.book_root_path().display()));
+                ui.horizontal(|ui| {
+                    ui.label("追加先");
+                    ui.strong(self.active_book_name());
+                    if ui.button("開く").clicked() {
+                        open_request = Some(self.active_book_folder_path());
+                    }
+                    if ui.button("本棚フォルダ").clicked() {
+                        open_request = Some(self.book_root_path());
+                    }
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("新しい本");
+                    ui.text_edit_singleline(&mut self.book_manager_new_name);
+                    let name = crate::books::normalize_book_name(&self.book_manager_new_name);
+                    let can_create = !name.trim().is_empty() && self.book_op_pending.is_none();
+                    if ui
+                        .add_enabled(can_create, egui::Button::new("作成"))
+                        .clicked()
+                    {
+                        self.start_book_create(ctx, name);
+                    }
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("本一覧");
+                    if ui
+                        .add_enabled(self.book_op_pending.is_none(), egui::Button::new("更新"))
+                        .clicked()
+                    {
+                        refresh_request = true;
+                    }
+                    if self.book_op_pending.is_some() {
+                        ui.label(egui::RichText::new("処理中…").weak());
+                    }
+                });
+                match self.book_list_cache.clone() {
+                    Some(rows) if rows.is_empty() => {
+                        ui.label(egui::RichText::new("本はまだありません。").weak());
+                    }
+                    Some(rows) => {
+                        let active_name = self.active_book_name();
+                        let row_names: std::collections::BTreeSet<String> =
+                            rows.iter().map(|row| row.name.clone()).collect();
+                        self.book_manager_rename_inputs
+                            .retain(|name, _| row_names.contains(name));
+                        egui::ScrollArea::vertical()
+                            .max_height(360.0)
+                            .show(ui, |ui| {
+                                for row in rows {
+                                    let active = row.name == active_name;
+                                    let confirming = self
+                                        .book_manager_delete_confirm
+                                        .as_ref()
+                                        .is_some_and(|name| name == &row.name);
+                                    ui.horizontal(|ui| {
+                                        if active {
+                                            ui.strong("●");
+                                        } else {
+                                            ui.label(" ");
+                                        }
+                                        ui.label(format!("{}p", row.page_count));
+                                        let input = self
+                                            .book_manager_rename_inputs
+                                            .entry(row.name.clone())
+                                            .or_insert_with(|| row.name.clone());
+                                        ui.add(
+                                            egui::TextEdit::singleline(input).desired_width(220.0),
+                                        );
+                                        let new_name = crate::books::normalize_book_name(input);
+                                        let can_rename = !new_name.is_empty()
+                                            && new_name != row.name
+                                            && self.book_op_pending.is_none();
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("開く").clicked() {
+                                                    open_request = Some(row.path.clone());
+                                                }
+                                                let delete_label = if confirming {
+                                                    "削除確定"
+                                                } else {
+                                                    "削除"
+                                                };
+                                                if ui
+                                                    .add_enabled(
+                                                        self.book_op_pending.is_none(),
+                                                        egui::Button::new(delete_label),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    if confirming {
+                                                        delete_request = Some(row.name.clone());
+                                                    } else {
+                                                        self.book_manager_delete_confirm =
+                                                            Some(row.name.clone());
+                                                    }
+                                                }
+                                                if confirming && ui.button("取消").clicked() {
+                                                    self.book_manager_delete_confirm = None;
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        !active && self.book_op_pending.is_none(),
+                                                        egui::Button::new("追加先"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    set_active_request = Some(row.name.clone());
+                                                    self.book_manager_delete_confirm = None;
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        can_rename,
+                                                        egui::Button::new("名前変更"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    rename_request =
+                                                        Some((row.name.clone(), new_name.clone()));
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+                            });
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("読み込み中…").weak());
+                    }
+                }
+            });
+        if refresh_request {
+            self.book_list_cache = None;
+            self.book_manager_rename_inputs.clear();
+            self.request_book_list_refresh();
+        }
+        if let Some(path) = open_request {
+            if crate::folder_tree::path_eq(&path, &self.book_root_path()) {
+                self.open_books_root();
+            } else {
+                self.load_folder(path);
+            }
+        }
+        if let Some(name) = set_active_request {
+            self.settings.active_book_name = name.clone();
+            self.settings.save();
+            self.book_manager_rename_name = name;
+        }
+        if let Some((old_name, new_name)) = rename_request {
+            self.start_book_rename(ctx, old_name, new_name);
+        }
+        if let Some(name) = delete_request {
+            self.start_book_delete(ctx, name);
+        }
+        if !open {
+            self.show_book_manager = false;
+            self.book_manager_delete_confirm = None;
+            self.book_manager_rename_inputs.clear();
+        }
+    }
+
+    pub(crate) fn draw_book_reorder(&mut self, ctx: &egui::Context) {
+        let mut completed: Option<Result<crate::books::BookOpResult, String>> = None;
+        if let Some(state) = self.book_reorder.as_mut() {
+            if let Some(pending) = state.flush_pending.as_ref() {
+                match pending.rx.try_recv() {
+                    Ok(result) => completed = Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        completed = Some(Err("並べ替え保存が中断されました".to_string()));
+                    }
+                }
+            }
+        } else {
+            return;
+        }
+        if let Some(result) = completed {
+            if let Some(state) = self.book_reorder.as_mut() {
+                state.flush_pending = None;
+            }
+            match result {
+                Ok(crate::books::BookOpResult::Reordered { folder, count }) => {
+                    self.book_reorder = None;
+                    if self
+                        .current_folder
+                        .as_ref()
+                        .is_some_and(|current| crate::folder_tree::path_eq(current, &folder))
+                    {
+                        self.pending_reload = true;
+                    }
+                    self.show_feedback_toast(format!("ページ順を保存しました: {count} ページ"));
+                    return;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    if let Some(state) = self.book_reorder.as_mut() {
+                        state.error = Some(err);
+                    }
+                }
+            }
+        }
+
+        let mut thumb_result: Option<crate::app::BookReorderThumbResult> = None;
+        let mut thumb_disconnected = false;
+        if let Some(state) = self.book_reorder.as_ref()
+            && let Some(rx) = state.thumb_rx.as_ref()
+        {
+            match rx.try_recv() {
+                Ok(result) => thumb_result = Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    thumb_disconnected = true;
+                }
+            }
+        }
+        if let Some(result) = thumb_result {
+            if let Some(state) = self.book_reorder.as_mut() {
+                state.thumb_rx = None;
+                state.thumb_pending_key = None;
+                if let Some(image) = result.image {
+                    let texture = ctx.load_texture(
+                        format!("book-reorder-thumb-{}", result.key),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    state.thumb_textures.insert(result.key, texture);
+                } else {
+                    state.thumb_failed.insert(result.key);
+                }
+            }
+            ctx.request_repaint();
+        } else if thumb_disconnected && let Some(state) = self.book_reorder.as_mut() {
+            state.thumb_rx = None;
+            state.thumb_pending_key = None;
+            ctx.request_repaint();
+        }
+
+        let mut close = false;
+        let mut save_request: Option<(PathBuf, Vec<PathBuf>)> = None;
+        let mut missing_thumb_request: Option<(String, PathBuf)> = None;
+        let mut thumb_by_path: HashMap<String, egui::TextureHandle> = self
+            .book_reorder
+            .as_ref()
+            .map(|state| state.thumb_textures.clone())
+            .unwrap_or_default();
+        for (idx, item) in self.items.iter().enumerate() {
+            let GridItem::Image(path) = item else {
+                continue;
+            };
+            let texture = self.thumb_adjust_tex.get(&idx).cloned().or_else(|| {
+                match self.thumbnails.get(idx) {
+                    Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
+                    _ => None,
+                }
+            });
+            if let Some(texture) = texture {
+                thumb_by_path.insert(crate::search_index_db::normalize_path(path), texture);
+            }
+        }
+        let title = self
+            .book_reorder
+            .as_ref()
+            .and_then(|state| {
+                state
+                    .folder
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|name| format!("ページ並べ替え: {name}"))
+            })
+            .unwrap_or_else(|| "ページ並べ替え".to_string());
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(920.0)
+            .show(ctx, |ui| {
+                let Some(state) = self.book_reorder.as_mut() else {
+                    return;
+                };
+                let busy = state.flush_pending.is_some();
+                if let Some(err) = &state.error {
+                    ui.colored_label(egui::Color32::from_rgb(210, 80, 80), err);
+                }
+                ui.horizontal(|ui| {
+                    let selected = state.selected.unwrap_or(0);
+                    let can_up = !busy && selected > 0 && !state.entries.is_empty();
+                    let can_down = !busy && selected + 1 < state.entries.len();
+                    if ui.add_enabled(can_up, egui::Button::new("↑")).clicked() {
+                        state.entries.swap(selected, selected - 1);
+                        state.selected = Some(selected - 1);
+                        state.dirty = true;
+                    }
+                    if ui.add_enabled(can_down, egui::Button::new("↓")).clicked() {
+                        state.entries.swap(selected, selected + 1);
+                        state.selected = Some(selected + 1);
+                        state.dirty = true;
+                    }
+                    if ui
+                        .add_enabled(!busy && state.dirty, egui::Button::new("保存して終了"))
+                        .clicked()
+                    {
+                        let paths = state.entries.iter().map(|e| e.path.clone()).collect();
+                        save_request = Some((state.folder.clone(), paths));
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("閉じる")).clicked() {
+                        if state.dirty {
+                            let paths = state.entries.iter().map(|e| e.path.clone()).collect();
+                            save_request = Some((state.folder.clone(), paths));
+                        } else {
+                            close = true;
+                        }
+                    }
+                    if busy {
+                        ui.label(egui::RichText::new("保存中…").weak());
+                    }
+                });
+                ui.separator();
+                let tile = egui::vec2(78.0, 98.0);
+                let gap = 8.0;
+                let cols = ((ui.available_width() + gap) / (tile.x + gap))
+                    .floor()
+                    .clamp(4.0, 10.0) as usize;
+                let rows = state.entries.len().div_ceil(cols);
+                let row_height = tile.y + gap;
+                let pointer_released = ui.input(|i| i.pointer.any_released());
+                let mut move_request: Option<(usize, usize)> = None;
+                egui::ScrollArea::vertical().max_height(520.0).show_rows(
+                    ui,
+                    row_height,
+                    rows.max(1),
+                    |ui, row_range| {
+                        egui::Grid::new("book_reorder_thumb_grid")
+                            .num_columns(cols)
+                            .spacing(egui::vec2(gap, gap))
+                            .show(ui, |ui| {
+                                for row in row_range {
+                                    for col in 0..cols {
+                                        let i = row * cols + col;
+                                        let Some(entry) = state.entries.get(i) else {
+                                            ui.allocate_exact_size(tile, egui::Sense::hover());
+                                            continue;
+                                        };
+                                        let (rect, response) = ui.allocate_exact_size(
+                                            tile,
+                                            egui::Sense::click_and_drag(),
+                                        );
+                                        let selected = state.selected == Some(i);
+                                        let dragging = state.dragging == Some(i);
+                                        let fill = if dragging {
+                                            ui.visuals().selection.bg_fill
+                                        } else if selected {
+                                            ui.visuals().widgets.active.bg_fill
+                                        } else {
+                                            ui.visuals().extreme_bg_color
+                                        };
+                                        ui.painter().rect_filled(rect, 4.0, fill);
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            4.0,
+                                            egui::Stroke::new(
+                                                1.0,
+                                                if selected {
+                                                    ui.visuals().selection.stroke.color
+                                                } else {
+                                                    ui.visuals()
+                                                        .widgets
+                                                        .noninteractive
+                                                        .bg_stroke
+                                                        .color
+                                                },
+                                            ),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        let key =
+                                            crate::search_index_db::normalize_path(&entry.path);
+                                        let texture = thumb_by_path.get(&key);
+                                        if texture.is_none()
+                                            && !state.thumb_failed.contains(&key)
+                                            && missing_thumb_request.is_none()
+                                            && state.thumb_rx.is_none()
+                                            && state.thumb_pending_key.is_none()
+                                        {
+                                            missing_thumb_request =
+                                                Some((key.clone(), entry.path.clone()));
+                                        }
+                                        let image_rect = rect.shrink2(egui::vec2(6.0, 18.0));
+                                        if let Some(tex) = texture {
+                                            let tex_size = tex.size_vec2();
+                                            let scale = (image_rect.width() / tex_size.x)
+                                                .min(image_rect.height() / tex_size.y)
+                                                .min(1.0);
+                                            let size =
+                                                egui::vec2(tex_size.x * scale, tex_size.y * scale);
+                                            let img_rect = egui::Rect::from_center_size(
+                                                image_rect.center(),
+                                                size,
+                                            );
+                                            ui.painter().image(
+                                                tex.id(),
+                                                img_rect,
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(0.0, 0.0),
+                                                    egui::pos2(1.0, 1.0),
+                                                ),
+                                                egui::Color32::WHITE,
+                                            );
+                                        } else {
+                                            let placeholder = if state.thumb_failed.contains(&key) {
+                                                "表示不可"
+                                            } else {
+                                                "読込中"
+                                            };
+                                            ui.painter().text(
+                                                image_rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                placeholder,
+                                                egui::FontId::proportional(11.0),
+                                                ui.visuals().weak_text_color(),
+                                            );
+                                        }
+                                        ui.painter().text(
+                                            rect.left_bottom() + egui::vec2(6.0, -5.0),
+                                            egui::Align2::LEFT_BOTTOM,
+                                            format!("{:04}", i + 1),
+                                            egui::FontId::monospace(11.0),
+                                            ui.visuals().text_color(),
+                                        );
+                                        let response = response.on_hover_ui(|ui| {
+                                            if let Some(tex) = texture {
+                                                let tex_size = tex.size_vec2();
+                                                let max_side = 360.0;
+                                                let scale = (max_side / tex_size.x)
+                                                    .min(max_side / tex_size.y)
+                                                    .min(2.5);
+                                                let size = egui::vec2(
+                                                    tex_size.x * scale,
+                                                    tex_size.y * scale,
+                                                );
+                                                let (preview_rect, _) = ui.allocate_exact_size(
+                                                    size,
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().image(
+                                                    tex.id(),
+                                                    preview_rect,
+                                                    egui::Rect::from_min_max(
+                                                        egui::pos2(0.0, 0.0),
+                                                        egui::pos2(1.0, 1.0),
+                                                    ),
+                                                    egui::Color32::WHITE,
+                                                );
+                                            } else {
+                                                ui.label("サムネイル読み込み中");
+                                            }
+                                        });
+                                        if !busy && response.clicked() {
+                                            state.selected = Some(i);
+                                        }
+                                        if !busy && response.drag_started() {
+                                            state.selected = Some(i);
+                                            state.dragging = Some(i);
+                                        }
+                                        if !busy
+                                            && pointer_released
+                                            && response.hovered()
+                                            && let Some(src) = state.dragging
+                                            && src != i
+                                        {
+                                            move_request = Some((src, i));
+                                        }
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    },
+                );
+                if let Some((src, dst)) = move_request {
+                    let entry = state.entries.remove(src);
+                    let dst = if src < dst {
+                        dst.saturating_sub(1)
+                    } else {
+                        dst
+                    };
+                    let dst = dst.min(state.entries.len());
+                    state.entries.insert(dst, entry);
+                    state.selected = Some(dst);
+                    state.dirty = true;
+                    state.dragging = None;
+                } else if pointer_released {
+                    state.dragging = None;
+                }
+            });
+        if let Some((key, path)) = missing_thumb_request {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let key_for_worker = key.clone();
+            let spawn_result = std::thread::Builder::new()
+                .name("book-reorder-thumb".into())
+                .spawn(move || {
+                    let image = crate::thumb_loader::decode_image_for_thumb(&path, 360);
+                    let _ = tx.send(crate::app::BookReorderThumbResult {
+                        key: key_for_worker,
+                        image,
+                    });
+                });
+            if let Some(state) = self.book_reorder.as_mut() {
+                match spawn_result {
+                    Ok(_) => {
+                        state.thumb_rx = Some(rx);
+                        state.thumb_pending_key = Some(key);
+                        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                    }
+                    Err(err) => {
+                        state.error = Some(format!("サムネイル読み込みを開始できません: {err}"));
+                    }
+                }
+            }
+        }
+        if let Some((folder, paths)) = save_request {
+            if let Some(pending) = self.start_book_reorder_flush(ctx, folder, paths) {
+                if let Some(state) = self.book_reorder.as_mut() {
+                    state.flush_pending = Some(pending);
+                    state.error = None;
+                }
+            }
+        }
+        if close {
+            self.book_reorder = None;
+        }
     }
 
     // ── 進捗バー ─────────────────────────────────────────────────────
@@ -2224,6 +2901,8 @@ impl App {
                 ui.label(egui::RichText::new("絞り込み:").small());
                 facet_changed |= self.draw_facet_kind_menu(ui);
                 facet_changed |= self.draw_facet_ext_menu(ui);
+                facet_changed |= self.draw_facet_ai_model_menu(ui);
+                facet_changed |= self.draw_facet_ai_tool_menu(ui);
                 rating_changed |= self.draw_facet_rating_menu(ui);
                 facet_changed |= self.draw_facet_tag_menu(ui);
                 facet_changed |= self.draw_facet_date_menu(ui);
@@ -2406,6 +3085,113 @@ impl App {
             }
         });
         changed
+    }
+
+    fn draw_facet_ai_model_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        let label = facet_menu_label("AIモデル", self.settings.facet_filter.ai_models.len());
+        ui.menu_button(label, |ui| {
+            prepare_facet_menu_popup(ui);
+            self.request_ai_model_facet_load();
+            ui.ctx().request_repaint();
+            if !self.details_lazy_sort_ready() {
+                self.draw_ai_facet_loading_menu(ui);
+                return;
+            }
+            let mut counts = self.facet_ai_model_counts();
+            for model in &self.settings.facet_filter.ai_models {
+                counts.entry(model.clone()).or_insert(0);
+            }
+            if self.settings.facet_filter.ai_models.is_empty() {
+                ui.label("すべて");
+            } else if ui.small_button("AIモデルフィルタを解除").clicked() {
+                self.settings.facet_filter.ai_models.clear();
+                changed = true;
+                ui.close();
+            }
+            ui.separator();
+            if counts.is_empty() {
+                ui.label("候補なし");
+            }
+            for (model, count) in counts {
+                let mut selected = self.settings.facet_filter.ai_models.contains(&model);
+                let text = format!("{model} ({count})");
+                if ui.checkbox(&mut selected, text).changed() {
+                    if selected {
+                        self.settings.facet_filter.ai_models.insert(model);
+                    } else {
+                        self.settings.facet_filter.ai_models.remove(&model);
+                    }
+                    changed = true;
+                }
+            }
+        });
+        changed
+    }
+
+    fn draw_facet_ai_tool_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        let label = facet_menu_label("生成ツール", self.settings.facet_filter.ai_tools.len());
+        ui.menu_button(label, |ui| {
+            prepare_facet_menu_popup(ui);
+            self.request_ai_model_facet_load();
+            ui.ctx().request_repaint();
+            if !self.details_lazy_sort_ready() {
+                self.draw_ai_facet_loading_menu(ui);
+                return;
+            }
+            let mut counts = self.facet_ai_tool_counts();
+            for tool in &self.settings.facet_filter.ai_tools {
+                counts.entry(tool.clone()).or_insert(0);
+            }
+            if self.settings.facet_filter.ai_tools.is_empty() {
+                ui.label("すべて");
+            } else if ui.small_button("生成ツールフィルタを解除").clicked() {
+                self.settings.facet_filter.ai_tools.clear();
+                changed = true;
+                ui.close();
+            }
+            ui.separator();
+            if counts.is_empty() {
+                ui.label("候補なし");
+            }
+            for (tool, count) in counts {
+                let mut selected = self.settings.facet_filter.ai_tools.contains(&tool);
+                let text = format!("{tool} ({count})");
+                if ui.checkbox(&mut selected, text).changed() {
+                    if selected {
+                        self.settings.facet_filter.ai_tools.insert(tool);
+                    } else {
+                        self.settings.facet_filter.ai_tools.remove(&tool);
+                    }
+                    changed = true;
+                }
+            }
+        });
+        changed
+    }
+
+    fn draw_ai_facet_loading_menu(&mut self, ui: &mut egui::Ui) {
+        match self.details_image_dims_state {
+            LazyColumnState::NotRequested => {
+                ui.label("AIメタデータを読み込み準備中");
+            }
+            LazyColumnState::Loading { done, total } => {
+                ui.label(format!("AIメタデータを読み込み中 {done}/{total}"));
+                if ui.small_button("停止").clicked() {
+                    self.cancel_details_meta_loading();
+                }
+            }
+            LazyColumnState::Cancelled => {
+                ui.label("AIメタデータの読み込みを停止中");
+                if ui.small_button("再開").clicked() {
+                    self.resume_details_meta_loading();
+                }
+            }
+            LazyColumnState::Disabled | LazyColumnState::Ready { .. } => {
+                ui.label("AIメタデータを読み込み中");
+            }
+        }
     }
 
     fn draw_facet_rating_menu(&mut self, ui: &mut egui::Ui) -> bool {
@@ -2657,6 +3443,26 @@ impl App {
                 .join(",");
             facet_chip(ui, format!("拡張子:{values}"));
         }
+        if !filter.ai_models.is_empty() {
+            let values = filter
+                .ai_models
+                .iter()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",");
+            facet_chip(ui, format!("AIモデル:{values}"));
+        }
+        if !filter.ai_tools.is_empty() {
+            let values = filter
+                .ai_tools
+                .iter()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",");
+            facet_chip(ui, format!("生成ツール:{values}"));
+        }
         if self.rating_filter_active() {
             let values = (0..6)
                 .filter(|&idx| self.settings.rating_filter[idx])
@@ -2730,6 +3536,29 @@ impl App {
             let ext = self.facet_item_ext(idx);
             if !ext.is_empty() {
                 *counts.entry(ext).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    fn facet_ai_model_counts(&mut self) -> BTreeMap<String, usize> {
+        let indices = self.facet_candidate_indices(FacetField::AiModel);
+        let mut counts = BTreeMap::new();
+        for idx in indices {
+            for model in self.facet_ai_model_values(idx) {
+                *counts.entry(model).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    fn facet_ai_tool_counts(&mut self) -> BTreeMap<String, usize> {
+        let indices = self.facet_candidate_indices(FacetField::AiTool);
+        let mut counts = BTreeMap::new();
+        for idx in indices {
+            let tool = self.facet_ai_tool_value(idx);
+            if !tool.is_empty() {
+                *counts.entry(tool).or_insert(0) += 1;
             }
         }
         counts
@@ -3293,8 +4122,20 @@ impl App {
                             };
                             self.address_has_focus = resp.has_focus();
                             if !is_snap_active && resp.lost_focus() && enter_pressed {
-                                if self.address.trim().is_empty() {
+                                let address_text = self.address.trim();
+                                if address_text.is_empty() {
                                     result = Some(AddressBarNav::DriveList(None));
+                                } else if address_text == "本棚" {
+                                    result = Some(AddressBarNav::Direct(self.book_root_path()));
+                                } else if let Some(book_name) =
+                                    address_text.strip_prefix("本棚 > ")
+                                {
+                                    result = Some(AddressBarNav::Direct(
+                                        crate::books::book_folder(
+                                            &self.book_root_path(),
+                                            book_name.trim(),
+                                        ),
+                                    ));
                                 } else if let Some(resolved) =
                                     resolve_folder_bar_nav_path(&PathBuf::from(&self.address))
                                 {

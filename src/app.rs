@@ -423,6 +423,25 @@ pub(crate) struct CapturePending {
     pub(crate) rx: mpsc::Receiver<Result<PathBuf, String>>,
 }
 
+pub(crate) struct BookReorderState {
+    pub(crate) folder: PathBuf,
+    pub(crate) entries: Vec<crate::books::BookPageEntry>,
+    pub(crate) selected: Option<usize>,
+    pub(crate) dragging: Option<usize>,
+    pub(crate) thumb_textures: std::collections::HashMap<String, egui::TextureHandle>,
+    pub(crate) thumb_failed: std::collections::HashSet<String>,
+    pub(crate) thumb_pending_key: Option<String>,
+    pub(crate) thumb_rx: Option<mpsc::Receiver<BookReorderThumbResult>>,
+    pub(crate) dirty: bool,
+    pub(crate) flush_pending: Option<crate::books::BookOpPending>,
+    pub(crate) error: Option<String>,
+}
+
+pub(crate) struct BookReorderThumbResult {
+    pub(crate) key: String,
+    pub(crate) image: Option<egui::ColorImage>,
+}
+
 pub(crate) struct CurrentFolderWatch {
     pub(crate) folder: PathBuf,
     pub(crate) _watcher: notify::RecommendedWatcher,
@@ -1103,6 +1122,9 @@ pub(crate) struct DetailsLazyMeta {
     pub(crate) source_size: i64,
     pub(crate) created_at: Option<i64>,
     pub(crate) created_at_failed: bool,
+    pub(crate) ai_metadata_checked: bool,
+    pub(crate) ai_models: Vec<String>,
+    pub(crate) ai_tool: Option<String>,
     pub(crate) image_dims: Option<(u32, u32)>,
     pub(crate) image_dims_failed: bool,
     pub(crate) video_duration_secs: Option<f64>,
@@ -1152,6 +1174,7 @@ struct DetailsMetaTarget {
     catalog_key: Option<String>,
     warm_image_dims: Option<(u32, u32)>,
     load_created_at: bool,
+    load_ai_metadata: bool,
     load_image_dims: bool,
     load_video_meta: bool,
     priority: crate::io_semaphore::IoPriority,
@@ -2858,6 +2881,15 @@ pub struct App {
         Vec<std::sync::mpsc::Receiver<crate::ui_dialogs::context_menu::CopyOutcome>>,
     /// Ctrl+S / キャプチャ保存の worker 完了待ち。
     pub(crate) capture_pending: Option<CapturePending>,
+    /// 製本のページ追加 / 作成 / 改名 / 削除 / 一覧更新 worker 完了待ち。
+    pub(crate) book_op_pending: Option<crate::books::BookOpPending>,
+    pub(crate) show_book_manager: bool,
+    pub(crate) book_manager_new_name: String,
+    pub(crate) book_manager_rename_name: String,
+    pub(crate) book_manager_rename_inputs: std::collections::BTreeMap<String, String>,
+    pub(crate) book_manager_delete_confirm: Option<String>,
+    pub(crate) book_list_cache: Option<Vec<crate::books::BookInfo>>,
+    pub(crate) book_reorder: Option<BookReorderState>,
     /// Ctrl+Alt+Shift+D / 画像パイプラインデバッグ出力の worker 完了待ち。
     pub(crate) pipeline_debug_export_pending:
         Option<crate::pipeline_debug::PipelineDebugExportPending>,
@@ -3141,6 +3173,8 @@ pub struct App {
     details_lazy_visible_revision: u64,
     /// 画像解像度列の readiness。列全体が Ready になるまでソート/フィルタは無効。
     pub(crate) details_image_dims_state: LazyColumnState,
+    /// AI モデル/生成ツール facet をユーザーが開いたか、条件が有効なときに遅延メタを読む。
+    pub(crate) ai_model_facet_requested: bool,
     /// facet filter の適用元。場所変更時の一時解除 / 復元判定に使う。
     pub(crate) facet_filter_scope: Option<PathBuf>,
     /// facet filter の階層別退避: ZIP/PDF/フォルダなどのコンテナを絞り込みで見つけて
@@ -5107,6 +5141,14 @@ impl App {
             current_folder_watch_failed: None,
             drop_copy_pending: Vec::new(),
             capture_pending: None,
+            book_op_pending: None,
+            show_book_manager: false,
+            book_manager_new_name: String::new(),
+            book_manager_rename_name: String::new(),
+            book_manager_rename_inputs: std::collections::BTreeMap::new(),
+            book_manager_delete_confirm: None,
+            book_list_cache: None,
+            book_reorder: None,
             pipeline_debug_export_pending: None,
             export_dialog: None,
             export_pending: None,
@@ -5214,6 +5256,7 @@ impl App {
             details_meta_pending: None,
             details_lazy_visible_revision: 0,
             details_image_dims_state: LazyColumnState::Disabled,
+            ai_model_facet_requested: false,
             facet_filter_scope: None,
             facet_filter_suppression_stack: Vec::new(),
             facet_tag_search_query: String::new(),
@@ -6519,6 +6562,8 @@ impl App {
             || self.new_folder_pending.is_some()
             || self.show_rename_dialog
             || self.rename_pending.is_some()
+            || self.show_book_manager
+            || self.book_reorder.is_some()
             || self.show_preferences
             || self.show_cache_manager
             || self.show_delete_confirm
@@ -6554,6 +6599,8 @@ impl App {
             || self.new_folder_pending.is_some()
             || self.show_rename_dialog
             || self.rename_pending.is_some()
+            || self.show_book_manager
+            || self.book_reorder.is_some()
             || self.show_preferences
             || self.show_cache_manager
             || self.show_delete_confirm
@@ -7870,7 +7917,7 @@ impl App {
         }
 
         let sort_t0 = std::time::Instant::now();
-        let sort = self.settings.sort_order;
+        let sort = self.book_sort_order_for_path(&path);
         // folders (Folder / ZipFile / PdfFile / ConvertibleArchive) も sort_order に
         // 従って並べる (Explorer / Finder と同じ慣習で 2 段構成は維持)。
         crate::grid_item::sort_folder_block(&mut folders, &mut folder_metas, sort);
@@ -8098,6 +8145,7 @@ impl App {
                 fav_id,
                 fav_path.to_path_buf(),
                 Arc::clone(db),
+                vec![self.settings.books_root_path()],
                 Some(Arc::clone(&self.activity_gate)),
             );
             self.name_index_supervisors.insert(fav_id, handle);
@@ -8114,6 +8162,7 @@ impl App {
         self.kick_off_vst3_startup_load();
         let favorites = self.settings.favorites.clone();
         let speed = self.settings.indexer_speed_profile;
+        let excluded_roots = vec![self.settings.books_root_path()];
         let activity_gate = Arc::clone(&self.activity_gate);
         let progress = Arc::clone(&self.startup_progress);
         let (tx, rx) = mpsc::channel();
@@ -8129,6 +8178,7 @@ impl App {
                         &favorites,
                         speed,
                         activity_gate,
+                        excluded_roots,
                         Some(hook),
                     );
                     crate::perf::emit_ms("startup", "indexer_manager_new", 0, t);
@@ -8145,6 +8195,7 @@ impl App {
                 &self.settings.favorites,
                 self.settings.indexer_speed_profile,
                 Arc::clone(&self.activity_gate),
+                vec![self.settings.books_root_path()],
                 Some(hook),
             );
             self.startup_done = true;
@@ -8712,6 +8763,7 @@ impl App {
                 fav.id,
                 fav.path.clone(),
                 Arc::clone(&db),
+                vec![self.settings.books_root_path()],
                 Some(Arc::clone(&self.activity_gate)),
             );
             self.name_index_supervisors.insert(fav.id, handle);
@@ -11161,7 +11213,9 @@ impl App {
                 self.archive_source_override = Some(src);
             }
         } else {
-            self.address = source_path.to_string_lossy().to_string();
+            self.address = self
+                .book_address_label_for_path(&source_path)
+                .unwrap_or_else(|| source_path.to_string_lossy().to_string());
             self.archive_source_override = None;
         }
         // Ctrl+G 絞り込みビュー中はブレッドクラム形式を維持する
@@ -11696,7 +11750,7 @@ impl App {
                 .book_resume_db
                 .as_ref()
                 .and_then(|db| db.get(&source_path))
-                .filter(|&p| self.is_book_page_idx(p));
+                .filter(|&p| self.is_readable_page_idx(p));
             if let Some(page) = resume {
                 self.selected = Some(page);
                 self.scroll_to_selected = true;
@@ -11766,11 +11820,13 @@ impl App {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
-        self.details_image_dims_state = if self.details_any_lazy_columns_enabled() {
-            LazyColumnState::NotRequested
-        } else {
-            LazyColumnState::Disabled
-        };
+        self.ai_model_facet_requested = self.facet_ai_filter_active();
+        self.details_image_dims_state =
+            if self.details_any_lazy_columns_enabled() || self.ai_model_facet_should_load() {
+                LazyColumnState::NotRequested
+            } else {
+                LazyColumnState::Disabled
+            };
         // 既定は「実ビュー」。`replace_search_view_items` (= 合成ビュー経路) は
         // この後で true に上書きする。
         self.items_are_global_search_view = false;
@@ -13913,6 +13969,273 @@ impl App {
     pub(crate) fn open_capture_output_dir(&mut self) {
         let output_dir = self.capture_output_dir_path();
         crate::capture::open_output_dir_async(output_dir);
+    }
+
+    pub(crate) fn book_root_path(&self) -> PathBuf {
+        self.settings.books_root_path()
+    }
+
+    pub(crate) fn active_book_name(&self) -> String {
+        self.settings.active_book_name_or_default()
+    }
+
+    pub(crate) fn active_book_folder_path(&self) -> PathBuf {
+        crate::books::book_folder(&self.book_root_path(), &self.active_book_name())
+    }
+
+    pub(crate) fn current_folder_is_book_folder(&self) -> bool {
+        let Some(folder) = self.current_folder.as_ref() else {
+            return false;
+        };
+        crate::books::is_direct_book_folder(&self.book_root_path(), folder)
+    }
+
+    pub(crate) fn book_address_label_for_path(&self, path: &Path) -> Option<String> {
+        let root = self.book_root_path();
+        if crate::folder_tree::path_eq(path, &root) {
+            return Some("本棚".to_string());
+        }
+        if !crate::books::is_direct_book_folder(&root, path) {
+            return None;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(crate::books::DEFAULT_BOOK_NAME);
+        Some(format!("本棚 > {name}"))
+    }
+
+    pub(crate) fn book_sort_order_for_path(&self, path: &Path) -> crate::settings::SortOrder {
+        if crate::books::is_direct_book_folder(&self.book_root_path(), path) {
+            crate::settings::SortOrder::Numeric
+        } else {
+            self.settings.sort_order
+        }
+    }
+
+    pub(crate) fn open_books_root(&mut self) {
+        let root = self.book_root_path();
+        if let Err(err) = std::fs::create_dir_all(&root) {
+            self.show_feedback_toast(format!(
+                "本棚フォルダを作成できません: {}: {err}",
+                root.display()
+            ));
+            return;
+        }
+        self.load_folder(root);
+    }
+
+    pub(crate) fn request_book_list_refresh(&mut self) {
+        if self.book_op_pending.is_some() {
+            return;
+        }
+        let root = self.book_root_path();
+        let (tx, rx) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name("book-list".into())
+            .spawn(move || {
+                let result = crate::books::list_books(&root).map(crate::books::BookOpResult::List);
+                let _ = tx.send(result);
+            }) {
+            Ok(_) => {
+                self.book_op_pending = Some(crate::books::BookOpPending { rx });
+            }
+            Err(err) => {
+                self.show_feedback_toast(format!("本棚一覧 worker を開始できません: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn start_book_create(&mut self, ctx: &egui::Context, name: String) {
+        let root = self.book_root_path();
+        self.start_book_op(ctx, "book-create", move || {
+            crate::books::create_book(&root, &name)
+        });
+    }
+
+    pub(crate) fn start_book_rename(
+        &mut self,
+        ctx: &egui::Context,
+        old_name: String,
+        new_name: String,
+    ) {
+        let root = self.book_root_path();
+        self.start_book_op(ctx, "book-rename", move || {
+            crate::books::rename_book(&root, &old_name, &new_name)
+        });
+    }
+
+    pub(crate) fn start_book_delete(&mut self, ctx: &egui::Context, name: String) {
+        let root = self.book_root_path();
+        self.start_book_op(ctx, "book-delete", move || {
+            crate::books::delete_book(&root, &name)
+        });
+    }
+
+    pub(crate) fn start_book_append(
+        &mut self,
+        ctx: &egui::Context,
+        sources: Vec<crate::books::BookPageSource>,
+    ) {
+        if sources.is_empty() {
+            self.show_feedback_toast("追加するページがありません".to_string());
+            return;
+        }
+        let root = self.book_root_path();
+        let book_name = self.active_book_name();
+        self.start_book_op(ctx, "book-append", move || {
+            crate::books::append_pages(root, book_name, sources)
+        });
+    }
+
+    pub(crate) fn start_book_reorder_flush(
+        &mut self,
+        ctx: &egui::Context,
+        folder: PathBuf,
+        ordered_paths: Vec<PathBuf>,
+    ) -> Option<crate::books::BookOpPending> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name("book-reorder".into())
+            .spawn(move || {
+                let result = crate::books::flush_reorder(folder, ordered_paths);
+                let _ = tx.send(result);
+            }) {
+            Ok(_) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                Some(crate::books::BookOpPending { rx })
+            }
+            Err(err) => {
+                self.show_feedback_toast(format!("並べ替え worker を開始できません: {err}"));
+                None
+            }
+        }
+    }
+
+    fn start_book_op<F>(&mut self, ctx: &egui::Context, thread_name: &'static str, f: F)
+    where
+        F: FnOnce() -> Result<crate::books::BookOpResult, String> + Send + 'static,
+    {
+        if self.book_op_pending.is_some() {
+            self.show_feedback_toast("製本処理中です".to_string());
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name(thread_name.into())
+            .spawn(move || {
+                let _ = tx.send(f());
+            }) {
+            Ok(_) => {
+                self.book_op_pending = Some(crate::books::BookOpPending { rx });
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(err) => {
+                self.show_feedback_toast(format!("製本 worker を開始できません: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn poll_book_op_pending(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.book_op_pending.as_ref() else {
+            return;
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("製本処理が中断されました".to_string())
+            }
+        };
+        self.book_op_pending = None;
+        match result {
+            Ok(crate::books::BookOpResult::Append(summary)) => {
+                self.book_list_cache = None;
+                if self
+                    .current_folder
+                    .as_ref()
+                    .is_some_and(|folder| crate::folder_tree::path_eq(folder, &summary.folder))
+                {
+                    self.pending_reload = true;
+                }
+                crate::logger::log(format!(
+                    "book append: {} added={} folder={}",
+                    summary.book_name,
+                    summary.added,
+                    summary.folder.display()
+                ));
+                self.show_feedback_toast(format!(
+                    "「{}」に {} ページ追加しました",
+                    summary.book_name, summary.added
+                ));
+                if let Some(path) = summary.first_path {
+                    crate::logger::log(format!("book append first page: {}", path.display()));
+                }
+            }
+            Ok(crate::books::BookOpResult::List(rows)) => {
+                self.book_manager_rename_inputs.clear();
+                for row in &rows {
+                    self.book_manager_rename_inputs
+                        .insert(row.name.clone(), row.name.clone());
+                }
+                self.book_list_cache = Some(rows);
+            }
+            Ok(crate::books::BookOpResult::Created { name, path }) => {
+                self.settings.active_book_name = name.clone();
+                self.settings.save();
+                self.book_manager_new_name.clear();
+                self.book_manager_rename_name = name.clone();
+                self.book_manager_rename_inputs
+                    .insert(name.clone(), name.clone());
+                self.book_list_cache = None;
+                self.show_feedback_toast(format!("本を作成しました: {name}"));
+                crate::logger::log(format!("book created: {}", path.display()));
+            }
+            Ok(crate::books::BookOpResult::Renamed { old_name, new_name }) => {
+                if self.settings.active_book_name == old_name {
+                    self.settings.active_book_name = new_name.clone();
+                    self.settings.save();
+                }
+                self.book_manager_rename_name = new_name.clone();
+                self.book_manager_rename_inputs.remove(&old_name);
+                self.book_manager_rename_inputs
+                    .insert(new_name.clone(), new_name.clone());
+                self.book_list_cache = None;
+                self.pending_reload = true;
+                self.show_feedback_toast(format!("本名を変更しました: {old_name} → {new_name}"));
+            }
+            Ok(crate::books::BookOpResult::Deleted { name }) => {
+                if self.settings.active_book_name == name {
+                    self.settings.active_book_name = crate::books::DEFAULT_BOOK_NAME.to_string();
+                    self.settings.save();
+                    self.book_manager_rename_name = self.settings.active_book_name.clone();
+                }
+                self.book_manager_delete_confirm = None;
+                self.book_manager_rename_inputs.remove(&name);
+                self.book_list_cache = None;
+                self.pending_reload = true;
+                self.show_feedback_toast(format!("本を削除しました: {name}"));
+            }
+            Ok(crate::books::BookOpResult::Reordered { folder, count }) => {
+                self.book_list_cache = None;
+                if self
+                    .current_folder
+                    .as_ref()
+                    .is_some_and(|current| crate::folder_tree::path_eq(current, &folder))
+                {
+                    self.pending_reload = true;
+                }
+                self.show_feedback_toast(format!("ページ順を保存しました: {count} ページ"));
+            }
+            Err(err) => {
+                crate::logger::log(format!("book op failed: {err}"));
+                self.show_feedback_toast(format!("製本処理に失敗しました: {err}"));
+            }
+        }
+        ctx.request_repaint();
     }
 
     /// 変換済みアーカイブキャッシュ管理ダイアログのワーカー完了を拾う。
@@ -17953,7 +18276,7 @@ impl App {
 
     /// 指定 idx が画像本のページ (Image / ZipImage / PdfPage) かどうか。
     /// 読書位置レジュームの対象判定に使う (Folder/Zip/Pdf タイル・動画・区切りは対象外)。
-    fn is_book_page_idx(&self, idx: usize) -> bool {
+    fn is_readable_page_idx(&self, idx: usize) -> bool {
         matches!(
             self.items.get(idx),
             Some(GridItem::Image(_))
@@ -17965,7 +18288,7 @@ impl App {
     /// 現在のフルスクリーンページを「最後に読んだページ」として永続記録する。
     /// 画像本のページのみ対象。dedup 付きで連続ページ送り中の重複書き込みを抑える。
     pub(crate) fn record_book_resume(&mut self, idx: usize) {
-        if !self.is_book_page_idx(idx) {
+        if !self.is_readable_page_idx(idx) {
             return;
         }
         // ネスト ZIP の本の中 (スタック深さ ≥ 2) では記録しない: ここでの idx は
@@ -17995,7 +18318,7 @@ impl App {
     pub(crate) fn resume_page_for_container(&self) -> Option<usize> {
         let folder = self.current_folder.as_deref()?;
         let idx = self.book_resume_db.as_ref()?.get(folder)?;
-        if self.is_book_page_idx(idx) {
+        if self.is_readable_page_idx(idx) {
             Some(idx)
         } else {
             None
@@ -19112,7 +19435,9 @@ impl App {
             self.details_image_dims_state = LazyColumnState::NotRequested;
         }
 
-        if self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail {
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail
+            && !self.ai_model_facet_should_load()
+        {
             let target_key = self.thumbnail_tooltip_lazy_target_key();
             let pending_is_stale = self.details_meta_pending.as_ref().is_some_and(|pending| {
                 target_key
@@ -19185,6 +19510,11 @@ impl App {
                     if revision_matches {
                         self.details_image_dims_state = LazyColumnState::Ready { failed };
                         self.prune_details_lazy_meta_cache();
+                        if self.facet_ai_filter_active() {
+                            let ready_state = self.details_image_dims_state;
+                            self.rebuild_visible_indices();
+                            self.details_image_dims_state = ready_state;
+                        }
                         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
                             && matches!(
                                 self.settings.details_sort_key,
@@ -19241,9 +19571,12 @@ impl App {
             return false;
         }
         match self.settings.grid_view_mode {
-            crate::settings::GridViewMode::Details => self.details_any_lazy_columns_enabled(),
+            crate::settings::GridViewMode::Details => {
+                self.details_any_lazy_columns_enabled() || self.ai_model_facet_should_load()
+            }
             crate::settings::GridViewMode::Thumbnail => {
-                self.thumbnail_tooltip_lazy_target_idx().is_some()
+                self.ai_model_facet_should_load()
+                    || self.thumbnail_tooltip_lazy_target_idx().is_some()
             }
         }
     }
@@ -19316,6 +19649,28 @@ impl App {
             }
         };
         requested && matches!(self.items.get(idx), Some(GridItem::Video(_)))
+    }
+
+    fn lazy_load_ai_metadata_for_idx(&self, idx: usize) -> bool {
+        self.ai_model_facet_should_load() && self.details_item_supports_ai_metadata(idx)
+    }
+
+    pub(crate) fn request_ai_model_facet_load(&mut self) {
+        if !self.ai_model_facet_requested {
+            self.ai_model_facet_requested = true;
+            if self.details_meta_pending.is_none() && !self.details_image_dims_state.is_loading() {
+                self.details_image_dims_state = LazyColumnState::NotRequested;
+            }
+        }
+    }
+
+    pub(crate) fn facet_ai_filter_active(&self) -> bool {
+        !self.settings.facet_filter.ai_models.is_empty()
+            || !self.settings.facet_filter.ai_tools.is_empty()
+    }
+
+    fn ai_model_facet_should_load(&self) -> bool {
+        self.ai_model_facet_requested || self.facet_ai_filter_active()
     }
 
     pub(crate) fn details_image_dims_sort_ready(&self) -> bool {
@@ -19484,20 +19839,23 @@ impl App {
         }
 
         let generation = self.items_generation;
-        let (order, visible_near): (Vec<usize>, HashSet<usize>) =
-            if self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail {
-                let order: Vec<usize> = self
-                    .thumbnail_tooltip_lazy_target_idx()
-                    .into_iter()
-                    .collect();
-                let visible_near = order.iter().copied().collect();
-                (order, visible_near)
-            } else {
-                (
-                    self.current_grid_order().to_vec(),
-                    self.details_tag_prewarm_indices.iter().copied().collect(),
-                )
-            };
+        let ai_facet_load = self.ai_model_facet_should_load();
+        let (order, visible_near): (Vec<usize>, HashSet<usize>) = if self.settings.grid_view_mode
+            == crate::settings::GridViewMode::Thumbnail
+            && !ai_facet_load
+        {
+            let order: Vec<usize> = self
+                .thumbnail_tooltip_lazy_target_idx()
+                .into_iter()
+                .collect();
+            let visible_near = order.iter().copied().collect();
+            (order, visible_near)
+        } else {
+            (
+                self.current_grid_order().to_vec(),
+                self.details_tag_prewarm_indices.iter().copied().collect(),
+            )
+        };
         let mut visible_targets = Vec::new();
         let mut background_targets = Vec::new();
         let mut cached_done = 0usize;
@@ -19566,12 +19924,14 @@ impl App {
                     self.settings.indexer_speed_profile.io_permits().max(1),
                 ))
             });
-        let target_keys =
-            if self.settings.grid_view_mode == crate::settings::GridViewMode::Thumbnail {
-                targets.iter().map(|target| target.key.clone()).collect()
-            } else {
-                HashSet::new()
-            };
+        let target_keys = if self.settings.grid_view_mode
+            == crate::settings::GridViewMode::Thumbnail
+            && !ai_facet_load
+        {
+            targets.iter().map(|target| target.key.clone()).collect()
+        } else {
+            HashSet::new()
+        };
 
         std::thread::Builder::new()
             .name("details-meta-load".to_string())
@@ -19629,6 +19989,9 @@ impl App {
         {
             return false;
         }
+        if self.lazy_load_ai_metadata_for_idx(idx) && !meta.ai_metadata_checked {
+            return false;
+        }
         if self.lazy_load_image_dims_for_idx(idx)
             && meta.image_dims.is_none()
             && !meta.image_dims_failed
@@ -19662,8 +20025,19 @@ impl App {
         )
     }
 
+    fn details_item_supports_ai_metadata(&self, idx: usize) -> bool {
+        match self.items.get(idx) {
+            Some(GridItem::Image(path)) => crate::png_metadata::metadata_path_may_contain_ai(path),
+            Some(GridItem::ZipImage { entry_name, .. }) => {
+                crate::png_metadata::metadata_path_may_contain_ai(std::path::Path::new(entry_name))
+            }
+            _ => false,
+        }
+    }
+
     fn details_item_requires_lazy_meta(&self, idx: usize) -> bool {
         self.lazy_load_created_for_idx(idx)
+            || self.lazy_load_ai_metadata_for_idx(idx)
             || self.lazy_load_image_dims_for_idx(idx)
             || self.lazy_load_video_meta_for_idx(idx)
     }
@@ -19690,6 +20064,7 @@ impl App {
         let load_image_dims = self.lazy_load_image_dims_for_idx(idx);
         let load_video_meta = self.lazy_load_video_meta_for_idx(idx);
         let load_created_at = self.lazy_load_created_for_idx(idx);
+        let load_ai_metadata = self.lazy_load_ai_metadata_for_idx(idx);
         Some(DetailsMetaTarget {
             key,
             item,
@@ -19699,6 +20074,7 @@ impl App {
             catalog_key,
             warm_image_dims: self.details_warm_image_dims(idx),
             load_created_at,
+            load_ai_metadata,
             load_image_dims,
             load_video_meta,
             priority,
@@ -19943,9 +20319,9 @@ impl App {
         }
         self.visible_indices = result;
         self.details_thumb_suppression_applied = false;
-        if self.details_any_lazy_columns_enabled() {
+        if self.details_any_lazy_columns_enabled() || self.ai_model_facet_should_load() {
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
-            if self.details_meta_pending.is_none() {
+            if self.details_meta_pending.is_none() && !self.details_image_dims_state.is_ready() {
                 self.details_image_dims_state = LazyColumnState::NotRequested;
             }
         }
@@ -20079,6 +20455,28 @@ impl App {
             }
         }
 
+        let ai_filter_active = !self.settings.facet_filter.ai_models.is_empty()
+            || !self.settings.facet_filter.ai_tools.is_empty();
+        if ai_filter_active && !self.details_lazy_sort_ready() {
+            return true;
+        }
+        if ignore != Some(FacetField::AiModel) && !self.settings.facet_filter.ai_models.is_empty() {
+            let models = self.facet_ai_model_values(idx);
+            if models.is_empty()
+                || !models
+                    .iter()
+                    .any(|model| self.settings.facet_filter.ai_models.contains(model))
+            {
+                return false;
+            }
+        }
+        if ignore != Some(FacetField::AiTool) && !self.settings.facet_filter.ai_tools.is_empty() {
+            let tool = self.facet_ai_tool_value(idx);
+            if tool.is_empty() || !self.settings.facet_filter.ai_tools.contains(&tool) {
+                return false;
+            }
+        }
+
         if ignore != Some(FacetField::Tags) {
             let filter = &self.settings.facet_filter;
             if (!filter.tags.is_empty() || filter.include_untagged)
@@ -20183,6 +20581,38 @@ impl App {
         }
 
         true
+    }
+
+    pub(crate) fn facet_ai_model_values(&self, idx: usize) -> Vec<String> {
+        if !self.details_item_supports_ai_metadata(idx) {
+            return Vec::new();
+        }
+        let Some(meta) = self.details_lazy_meta_for_idx(idx) else {
+            return Vec::new();
+        };
+        if !meta.ai_metadata_checked {
+            return Vec::new();
+        }
+        if meta.ai_models.is_empty() {
+            vec![crate::png_metadata::MODEL_INFO_NONE_LABEL.to_string()]
+        } else {
+            meta.ai_models.clone()
+        }
+    }
+
+    pub(crate) fn facet_ai_tool_value(&self, idx: usize) -> String {
+        if !self.details_item_supports_ai_metadata(idx) {
+            return String::new();
+        }
+        let Some(meta) = self.details_lazy_meta_for_idx(idx) else {
+            return String::new();
+        };
+        if !meta.ai_metadata_checked {
+            return String::new();
+        }
+        meta.ai_tool
+            .clone()
+            .unwrap_or_else(|| crate::png_metadata::TOOL_INFO_NONE_LABEL.to_string())
     }
 
     pub(crate) fn current_grid_order(&self) -> &[usize] {
@@ -20772,6 +21202,10 @@ impl App {
 
     /// 指定 idx の画像を時計回りに 90° 回転する。
     pub(crate) fn rotate_image_cw(&mut self, idx: usize) {
+        if self.idx_is_compiled_book_page(idx) {
+            self.show_feedback_toast("本のページは回転できません".to_string());
+            return;
+        }
         let current = self.get_rotation(idx);
         let new_rot = current.rotate_cw();
         self.apply_rotation(idx, new_rot);
@@ -20779,6 +21213,10 @@ impl App {
 
     /// 指定 idx の画像を反時計回りに 90° 回転する。
     pub(crate) fn rotate_image_ccw(&mut self, idx: usize) {
+        if self.idx_is_compiled_book_page(idx) {
+            self.show_feedback_toast("本のページは回転できません".to_string());
+            return;
+        }
         let current = self.get_rotation(idx);
         let new_rot = current.rotate_ccw();
         self.apply_rotation(idx, new_rot);
@@ -20870,6 +21308,9 @@ impl App {
         if let Some(&v) = self.rating_cache.get(&idx) {
             return v;
         }
+        if self.idx_is_compiled_book_page(idx) {
+            return 0;
+        }
         let accepts = matches!(self.items.get(idx), Some(it) if it.accepts_rating());
         if !accepts {
             return 0;
@@ -20887,6 +21328,10 @@ impl App {
     /// レーティング対象外アイテムの場合は何もしない。
     /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
     pub(crate) fn set_rating(&mut self, idx: usize, stars: u8) {
+        if self.idx_is_compiled_book_page(idx) {
+            self.show_feedback_toast("本のページにはレーティングを付けられません".to_string());
+            return;
+        }
         let accepts = matches!(self.items.get(idx), Some(it) if it.accepts_rating());
         if !accepts {
             return;
@@ -21662,7 +22107,10 @@ impl App {
         }
 
         let mut keys = Vec::new();
-        for item in &self.items {
+        for (idx, item) in self.items.iter().enumerate() {
+            if self.idx_is_compiled_book_page(idx) {
+                continue;
+            }
             if let Some(path) = tag_item_path(item) {
                 keys.push(crate::tags_db::item_key_for_path(path));
             }
@@ -21695,7 +22143,9 @@ impl App {
         let paths = self
             .items
             .iter()
-            .filter_map(|item| match item {
+            .enumerate()
+            .filter(|(idx, _)| !self.idx_is_compiled_book_page(*idx))
+            .filter_map(|(_, item)| match item {
                 GridItem::Image(path) | GridItem::Video(path) => Some(path.clone()),
                 _ => None,
             })
@@ -21746,6 +22196,10 @@ impl App {
         };
         for idx in targets {
             if idx >= self.items.len() {
+                continue;
+            }
+            if self.idx_is_compiled_book_page(idx) {
+                self.tag_prewarm_queued.insert(idx);
                 continue;
             }
             // idx ベースで dedup: 処理済み idx は cache_key 文字列を組み立てずスキップ。
@@ -21932,6 +22386,9 @@ impl App {
     /// 指定 idx の grid cell に描くタグ列。`tags_cache` のみを引く (同期 I/O を避ける)。
     /// キャッシュに載っていない = 未ロード → 空を返す (バッジ非表示)。
     pub(crate) fn cell_tag_list(&self, idx: usize) -> &[String] {
+        if self.idx_is_compiled_book_page(idx) {
+            return &[];
+        }
         let p = match self.items.get(idx).and_then(tag_item_path) {
             Some(p) => p,
             _ => return &[],
@@ -21944,6 +22401,9 @@ impl App {
     }
 
     fn cell_tags_loaded(&self, idx: usize) -> bool {
+        if self.idx_is_compiled_book_page(idx) {
+            return true;
+        }
         let p = match self.items.get(idx).and_then(tag_item_path) {
             Some(p) => p,
             _ => return true,
@@ -21966,10 +22426,15 @@ impl App {
             self.checked
                 .iter()
                 .copied()
-                .filter(|&idx| self.idx_visible(idx) && self.items.get(idx).is_some_and(&pred))
+                .filter(|&idx| {
+                    self.idx_visible(idx)
+                        && !self.idx_is_compiled_book_page(idx)
+                        && self.items.get(idx).is_some_and(&pred)
+                })
                 .collect()
         } else if let Some(idx) = self.selected
             && self.idx_visible(idx)
+            && !self.idx_is_compiled_book_page(idx)
             && self.items.get(idx).is_some_and(&pred)
         {
             vec![idx]
@@ -22123,6 +22588,9 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
+        if self.reject_compiled_book_page_edit(fs_idx) {
+            return;
+        }
         if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
             self.show_feedback_toast("[適用対象なし]".to_string());
             return;
@@ -22158,6 +22626,9 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
+        if self.reject_compiled_book_page_edit(fs_idx) {
+            return;
+        }
         if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
             self.show_feedback_toast("[削除対象なし]".to_string());
             return;
@@ -22186,6 +22657,9 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
+        if self.reject_compiled_book_page_edit(fs_idx) {
+            return;
+        }
         if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
             self.show_feedback_toast("[削除対象なし]".to_string());
             return;
@@ -33260,6 +33734,7 @@ impl eframe::App for App {
         self.poll_new_folder_pending(ctx);
         self.poll_rename_pending(ctx);
         self.poll_capture_pending(ctx);
+        self.poll_book_op_pending(ctx);
         self.poll_pipeline_debug_export_pending(ctx);
         self.poll_export_pending(ctx);
         self.poll_compare_pin_load_pending(ctx);
@@ -33272,6 +33747,7 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         if self.capture_pending.is_some()
+            || self.book_op_pending.is_some()
             || self.pipeline_debug_export_pending.is_some()
             || self.export_pending.is_some()
             || self.compare_pin_load_pending.is_some()
@@ -33721,6 +34197,8 @@ impl eframe::App for App {
         let open_folder_nav = self.show_open_folder_dialog_window(ctx);
         self.show_new_folder_dialog_window(ctx);
         self.show_rename_dialog_window(ctx);
+        self.draw_book_manager(ctx);
+        self.draw_book_reorder(ctx);
         self.show_cache_manager_dialog(ctx);
         self.show_archive_cache_manager_dialog(ctx);
         self.show_cache_creator_dialog(ctx);
@@ -33912,6 +34390,12 @@ impl eframe::App for App {
             let pressed_p = self.keymap.consume_action(ctx, KeyAction::GridPin);
             if pressed_p {
                 self.toggle_folder_pin_from_selection();
+            }
+            if self
+                .keymap
+                .consume_action(ctx, KeyAction::GridAddToActiveBook)
+            {
+                self.add_grid_selection_to_active_book(ctx);
             }
         }
 

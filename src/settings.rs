@@ -580,6 +580,10 @@ pub struct FacetFilter {
     #[serde(default)]
     pub exts: std::collections::BTreeSet<String>,
     #[serde(default)]
+    pub ai_models: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub ai_tools: std::collections::BTreeSet<String>,
+    #[serde(default)]
     pub tags: std::collections::BTreeSet<String>,
     #[serde(default)]
     pub tag_mode: FacetTagMode,
@@ -597,6 +601,8 @@ impl FacetFilter {
     pub fn is_active(&self) -> bool {
         !self.kinds.is_empty()
             || !self.exts.is_empty()
+            || !self.ai_models.is_empty()
+            || !self.ai_tools.is_empty()
             || !self.tags.is_empty()
             || self.include_untagged
             || self.date_preset.is_some()
@@ -1645,6 +1651,12 @@ pub struct Settings {
     /// Ctrl+S キャプチャ保存形式。
     #[serde(default)]
     pub capture_format: crate::capture::CaptureFormat,
+    /// 製本の本棚ルート。None のときは OS の Pictures/mimageviewer/books を使う。
+    #[serde(default)]
+    pub book_root: Option<PathBuf>,
+    /// 製本でページ追加先にする本名。
+    #[serde(default = "default_active_book_name")]
+    pub active_book_name: String,
 
     // ── 隠蔽加工 (Concealment) ─────────────────────────────────
     //
@@ -2626,6 +2638,9 @@ fn default_cache_size_threshold_bytes() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn default_active_book_name() -> String {
+    crate::books::DEFAULT_BOOK_NAME.to_string()
+}
 fn default_quick_folder_slots() -> [Option<PathBuf>; 2] {
     [None, None]
 }
@@ -2895,6 +2910,8 @@ impl Default for Settings {
             slideshow_end_action: SlideshowEndAction::default(),
             capture_output_dir: None,
             capture_format: crate::capture::CaptureFormat::default(),
+            book_root: None,
+            active_book_name: default_active_book_name(),
             default_spread_mode: SpreadMode::default(),
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
@@ -3713,6 +3730,19 @@ fn reset_backup_state_for_test() {
 }
 
 impl Settings {
+    pub fn books_root_path(&self) -> PathBuf {
+        crate::books::settings_books_root(self)
+    }
+
+    pub fn active_book_name_or_default(&self) -> String {
+        let name = crate::books::normalize_book_name(&self.active_book_name);
+        if name.is_empty() {
+            default_active_book_name()
+        } else {
+            name
+        }
+    }
+
     /// 位置復元マトリクス「動画 × 一覧から開く」セル。保存先は互換維持のため既存 bool
     /// `video_grid_open_starts_from_beginning`。FromStart = 先頭から開く。
     pub fn video_open_resume(&self) -> ResumeMode {
@@ -4075,6 +4105,8 @@ impl Settings {
         self.tags = std::mem::take(&mut src.tags);
         // ── 検索インデックス関連 ──
         self.search_index_checks = std::mem::take(&mut src.search_index_checks);
+        // ── 製本 runtime 選択 ──
+        self.active_book_name = std::mem::take(&mut src.active_book_name);
         // ── 「アプリケーションで開く」履歴 ──
         self.recent_open_with_apps = std::mem::take(&mut src.recent_open_with_apps);
         self.custom_open_with_apps = std::mem::take(&mut src.custom_open_with_apps);
@@ -5978,6 +6010,10 @@ mod tests {
             s.details_show_video_codec = true;
             s.facet_filter.kinds.insert(FacetItemKind::Image);
             s.facet_filter.exts.insert("png".to_string());
+            s.facet_filter
+                .ai_models
+                .insert("sd_xl_base_1.0".to_string());
+            s.facet_filter.ai_tools.insert("ComfyUI".to_string());
             s.facet_filter.tags.insert("#原神".to_string());
             s.facet_filter.include_untagged = true;
             s.facet_filter.tag_mode = FacetTagMode::All;
@@ -6106,6 +6142,14 @@ mod tests {
             assert!(
                 loaded.facet_filter.exts.contains("png"),
                 "facet_filter extensions should survive roundtrip"
+            );
+            assert!(
+                loaded.facet_filter.ai_models.contains("sd_xl_base_1.0"),
+                "facet_filter AI model names should survive roundtrip"
+            );
+            assert!(
+                loaded.facet_filter.ai_tools.contains("ComfyUI"),
+                "facet_filter AI tool names should survive roundtrip"
             );
             assert!(
                 loaded.facet_filter.tags.contains("原神"),

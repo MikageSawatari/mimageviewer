@@ -95,6 +95,7 @@ pub struct ScanDiag {
 pub struct ScanParams {
     pub favorite_id: Uuid,
     pub root: PathBuf,
+    pub excluded_roots: Vec<PathBuf>,
     pub cancel: Arc<AtomicBool>,
     /// "今どこを walk してる" を UI に見せるためのレポーター。
     /// None なら通知しない (テスト等で便利)。
@@ -132,6 +133,7 @@ pub fn scan(
     let ScanParams {
         favorite_id,
         root,
+        excluded_roots,
         cancel,
         progress,
     } = params;
@@ -151,6 +153,7 @@ pub fn scan(
         &mut diag,
         0,
         &mut visited,
+        &excluded_roots,
     )?;
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
@@ -209,11 +212,15 @@ fn walk_dir_recursive(
     diag: &mut ScanDiag,
     depth: u32,
     visited: &mut std::collections::HashSet<String>,
+    excluded_roots: &[PathBuf],
 ) -> Result<(), String> {
     // 安全策: シンボリックループ対策 (深さ制限)。通常フォルダは 20 階層あれば十分
     const MAX_DEPTH: u32 = 40;
     if depth > MAX_DEPTH {
         diag.depth_limit_hits += 1;
+        return Ok(());
+    }
+    if crate::books::path_is_under_any(dir, excluded_roots) {
         return Ok(());
     }
     if !crate::fs_entry::mark_directory_visited(dir, visited) {
@@ -260,6 +267,9 @@ fn walk_dir_recursive(
         let path = entry.path();
 
         if folder_tree::is_apple_double(&path) {
+            continue;
+        }
+        if crate::books::path_is_under_any(&path, excluded_roots) {
             continue;
         }
 
@@ -355,6 +365,7 @@ fn walk_dir_recursive(
             diag,
             depth + 1,
             visited,
+            excluded_roots,
         )?;
     }
     Ok(())
@@ -389,6 +400,7 @@ mod tests {
             ScanParams {
                 favorite_id: fav_id,
                 root: root.to_path_buf(),
+                excluded_roots: Vec::new(),
                 cancel,
                 progress: None,
             },
@@ -439,6 +451,48 @@ mod tests {
         assert!(kinds.contains(&CandidateKind::Image));
         assert!(kinds.contains(&CandidateKind::Pdf));
         assert!(kinds.contains(&CandidateKind::Video));
+    }
+
+    #[test]
+    fn excluded_roots_are_not_scanned_and_stale_rows_are_deleted() {
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("p");
+        let books_root = root.join("books");
+        let book = books_root.join("名前なし");
+        fs::create_dir_all(&book).unwrap();
+        make_file(&root, "keep.jpg", b"ok");
+        make_file(&book, "0001_page.png", b"compiled");
+
+        let stale_key = normalize_path(&book.join("0001_page.png"));
+        db.upsert_meta_ok(&stale_key, fav, &root, IndexKind::Image, 1, 1)
+            .unwrap();
+
+        let sem = GlobalIoSemaphore::new(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let r = scan(
+            ScanParams {
+                favorite_id: fav,
+                root: root.clone(),
+                excluded_roots: vec![books_root],
+                cancel,
+                progress: None,
+            },
+            &db,
+            &sem,
+            IoPriority::Normal,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(r.total_scanned, 1, "除外 root 配下のページは候補にしない");
+        assert_eq!(r.to_ingest.len(), 1);
+        assert_eq!(r.to_ingest[0].abs_path, root.join("keep.jpg"));
+        assert_eq!(
+            r.to_delete,
+            vec![stale_key],
+            "除外 root 配下に残った旧行は削除候補に落とす"
+        );
     }
 
     #[test]
@@ -642,6 +696,7 @@ mod tests {
             ScanParams {
                 favorite_id: fav,
                 root,
+                excluded_roots: Vec::new(),
                 cancel,
                 progress: None,
             },
@@ -673,6 +728,7 @@ mod tests {
             ScanParams {
                 favorite_id: fav,
                 root: root.clone(),
+                excluded_roots: Vec::new(),
                 cancel,
                 progress: None,
             },

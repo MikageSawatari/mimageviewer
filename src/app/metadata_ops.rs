@@ -108,6 +108,8 @@ pub(super) fn format_details_timestamp(secs: i64, _show_seconds: bool) -> String
 pub(crate) enum FacetField {
     Kind,
     Ext,
+    AiModel,
+    AiTool,
     Tags,
     Date,
     Size,
@@ -343,6 +345,9 @@ pub(super) fn run_details_meta_load(
         }
 
         let mut created_at = None;
+        let mut ai_metadata_checked = false;
+        let mut ai_models = Vec::new();
+        let mut ai_tool = None;
         let mut dims = if target.load_image_dims {
             target.warm_image_dims
         } else {
@@ -358,6 +363,36 @@ pub(super) fn run_details_meta_load(
                     .ok()
                     .and_then(|m| m.created().ok().and_then(|t| system_time_to_unix_secs(t)))
             };
+        }
+
+        if target.load_ai_metadata {
+            ai_metadata_checked = true;
+            let metadata = match &target.item {
+                GridItem::Image(path) => {
+                    let _permit = io_sem.acquire(target.priority);
+                    crate::png_metadata::extract_metadata(path)
+                }
+                GridItem::ZipImage {
+                    zip_path,
+                    entry_name,
+                } => {
+                    let bytes = {
+                        let _permit = io_sem.acquire(target.priority);
+                        crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok()
+                    };
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    bytes
+                        .as_ref()
+                        .and_then(|bytes| crate::png_metadata::extract_metadata_from_bytes(bytes))
+                }
+                _ => None,
+            };
+            if let Some(meta) = metadata.as_ref() {
+                ai_models = crate::png_metadata::model_names(meta);
+                ai_tool = crate::png_metadata::ai_tool_name(meta).map(str::to_string);
+            }
         }
 
         if target.load_image_dims
@@ -422,6 +457,9 @@ pub(super) fn run_details_meta_load(
             source_size: target.source_size,
             created_at,
             created_at_failed,
+            ai_metadata_checked,
+            ai_models,
+            ai_tool,
             image_dims: dims,
             image_dims_failed,
             video_duration_secs,

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::folder_tree::{is_apple_double, walk_dirs_recursive_with_progress};
+use crate::folder_tree::{is_apple_double, walk_dirs_recursive_with_progress_excluding};
 use crate::indexer_progress::ProgressReporter;
 use crate::search_index_db::{IndexEntry, IndexKind, SearchIndexDb};
 
@@ -83,6 +83,7 @@ pub fn run_bulk_name_index(
     fav_path: &std::path::Path,
     db: &SearchIndexDb,
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
+    excluded_roots: &[PathBuf],
     cancel: &AtomicBool,
     progress: Option<&ProgressReporter>,
 ) -> BulkSummary {
@@ -106,7 +107,7 @@ pub fn run_bulk_name_index(
     let mut found: Vec<PathBuf> = Vec::new();
     let mut read_dir_logger = ReadDirLogger::new();
     let mut had_error = false;
-    walk_dirs_recursive_with_progress(
+    walk_dirs_recursive_with_progress_excluding(
         fav_path,
         &mut found,
         cancel,
@@ -127,6 +128,7 @@ pub fn run_bulk_name_index(
         // ActivityGate を見る。huge folder の file_type 連続呼び出しで indexer が
         // HDD seek を握り続けないようにする。
         activity_gate,
+        excluded_roots,
     );
     if cancel.load(Ordering::Relaxed) {
         summary.cancelled = true;
@@ -167,6 +169,7 @@ pub fn run_bulk_name_index(
             entries,
             "name_bulk_indexer",
             activity_gate.map(|g| (g, cancel)),
+            excluded_roots,
         );
         if had_entry_error {
             // **upsert を skip する** (Codex P2 第 12 レビュー指摘):
@@ -259,6 +262,7 @@ pub fn collect_index_entries(
     entries: std::fs::ReadDir,
     log_prefix: &str,
     yield_check: Option<(&crate::activity_gate::ActivityGate, &AtomicBool)>,
+    excluded_roots: &[PathBuf],
 ) -> (Vec<IndexEntry>, bool) {
     // 数千件規模のフォルダで `file_type()` を per-entry に呼ぶと HDD 上で
     // 数百 ms-1s 単位の I/O 連続が発生し、その間に動画オープン等の高優先 I/O が
@@ -292,6 +296,9 @@ pub fn collect_index_entries(
         };
         let p = entry.path();
         if is_apple_double(&p) {
+            continue;
+        }
+        if crate::books::path_is_under_any(&p, excluded_roots) {
             continue;
         }
         let ft = match entry.file_type() {
@@ -362,7 +369,7 @@ pub fn spawn_bulk(
 ) -> std::thread::JoinHandle<BulkSummary> {
     std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
-        let summary = run_bulk_name_index(&fav_path, &db, None, &cancel, progress.as_ref());
+        let summary = run_bulk_name_index(&fav_path, &db, None, &[], &cancel, progress.as_ref());
         crate::logger::log(format!(
             "name_bulk_indexer: {} done in {} ms (folders={}, entries={}, cancelled={})",
             fav_path.display(),
@@ -403,7 +410,7 @@ mod tests {
 
         let db = SearchIndexDb::open_in_memory().unwrap();
         let cancel = AtomicBool::new(false);
-        let summary = run_bulk_name_index(&root, &db, None, &cancel, None);
+        let summary = run_bulk_name_index(&root, &db, None, &[], &cancel, None);
 
         // folders_visited = root + sub
         assert_eq!(summary.folders_visited, 2);
@@ -415,6 +422,38 @@ mod tests {
         // DB に登録されたエントリを count で確認 (root に 4 件入るはず)
         let count = db.count_for_favorite(&root).unwrap();
         assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn bulk_excludes_configured_roots() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("fav");
+        let books_root = root.join("books");
+        let book = books_root.join("名前なし");
+        mkdir(&book);
+        touch(&root.join("keep.zip"));
+        touch(&book.join("0001_page.png"));
+
+        let db = SearchIndexDb::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        let summary = run_bulk_name_index(&root, &db, None, &[books_root], &cancel, None);
+
+        assert_eq!(summary.folders_visited, 1);
+        assert_eq!(summary.entries_written, 1);
+        let roots = vec![root.clone()];
+        assert_eq!(
+            db.search("books", &roots, None, crate::search_query::MatchMode::And)
+                .unwrap()
+                .len(),
+            0,
+            "除外 root 自体を Folder 行として入れない"
+        );
+        assert_eq!(
+            db.search("keep", &roots, None, crate::search_query::MatchMode::And)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// B2 (Codex P2 レビュー反映): depth 3 のサブツリーが正しく再帰投入されることを
@@ -434,7 +473,7 @@ mod tests {
 
         let db = SearchIndexDb::open_in_memory().unwrap();
         let cancel = AtomicBool::new(false);
-        let summary = run_bulk_name_index(&root, &db, None, &cancel, None);
+        let summary = run_bulk_name_index(&root, &db, None, &[], &cancel, None);
 
         // folders_visited = root + a + b + c = 4
         assert_eq!(summary.folders_visited, 4);
@@ -471,7 +510,7 @@ mod tests {
 
         let db = SearchIndexDb::open_in_memory().unwrap();
         let cancel = AtomicBool::new(true); // 最初から立てておく
-        let summary = run_bulk_name_index(&root, &db, None, &cancel, None);
+        let summary = run_bulk_name_index(&root, &db, None, &[], &cancel, None);
         assert!(summary.cancelled);
     }
 }

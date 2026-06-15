@@ -37,7 +37,7 @@ use std::time::Instant;
 use crossbeam_channel::{Receiver, Sender, bounded, select};
 use uuid::Uuid;
 
-use crate::folder_tree::walk_dirs_recursive_with_progress;
+use crate::folder_tree::walk_dirs_recursive_with_progress_excluding;
 use crate::indexer_progress::ProgressReporter;
 use crate::name_bulk_indexer::{collect_index_entries, run_bulk_name_index};
 use crate::search_index_db::SearchIndexDb;
@@ -109,6 +109,7 @@ pub fn spawn(
     favorite_id: Uuid,
     favorite_root: PathBuf,
     db: Arc<SearchIndexDb>,
+    excluded_roots: Vec<PathBuf>,
     activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
 ) -> NameIndexSupervisorHandle {
     let cancel = Arc::new(AtomicBool::new(false));
@@ -121,6 +122,7 @@ pub fn spawn(
     let stats_cl = Arc::clone(&stats);
     let progress_cl = progress.clone();
     let root_cl = favorite_root.clone();
+    let excluded_roots_cl = excluded_roots.clone();
 
     crate::logger::log(format!(
         "name_index[{favorite_id}]: supervisor starting for {}",
@@ -134,6 +136,7 @@ pub fn spawn(
                 favorite_id,
                 root_cl,
                 db,
+                excluded_roots_cl,
                 activity_gate,
                 cancel_cl,
                 stats_cl,
@@ -160,6 +163,7 @@ fn supervisor_loop(
     favorite_id: Uuid,
     favorite_root: PathBuf,
     db: Arc<SearchIndexDb>,
+    excluded_roots: Vec<PathBuf>,
     activity_gate: Option<Arc<crate::activity_gate::ActivityGate>>,
     cancel: Arc<AtomicBool>,
     stats: Arc<Mutex<NameIndexStats>>,
@@ -182,6 +186,7 @@ fn supervisor_loop(
         favorite_id,
         &favorite_root,
         &db,
+        &excluded_roots,
         activity_gate.as_deref(),
         &cancel,
         &stats,
@@ -202,6 +207,7 @@ fn supervisor_loop(
                             favorite_id,
                             &favorite_root,
                             &db,
+                            &excluded_roots,
                             activity_gate.as_deref(),
                             &cancel,
                             &stats,
@@ -224,6 +230,7 @@ fn supervisor_loop(
                                 favorite_id,
                                 &favorite_root,
                                 &db,
+                                &excluded_roots,
                                 activity_gate.as_deref(),
                                 &cancel,
                                 &stats,
@@ -236,6 +243,7 @@ fn supervisor_loop(
                             &db,
                             &path,
                             kind,
+                            &excluded_roots,
                             &progress,
                             &stats,
                             &cancel,
@@ -258,6 +266,7 @@ fn run_full_scan(
     favorite_id: Uuid,
     favorite_root: &Path,
     db: &SearchIndexDb,
+    excluded_roots: &[PathBuf],
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
     cancel: &AtomicBool,
     stats: &Mutex<NameIndexStats>,
@@ -272,7 +281,14 @@ fn run_full_scan(
         if is_initial { "initial" } else { "rescan" }
     ));
 
-    let summary = run_bulk_name_index(favorite_root, db, activity_gate, cancel, Some(progress));
+    let summary = run_bulk_name_index(
+        favorite_root,
+        db,
+        activity_gate,
+        excluded_roots,
+        cancel,
+        Some(progress),
+    );
 
     let dur_ms = t0.elapsed().as_millis() as u64;
     crate::logger::log(format!(
@@ -336,6 +352,7 @@ fn apply_single_change(
     db: &SearchIndexDb,
     changed_path: &Path,
     kind: ChangeKind,
+    excluded_roots: &[PathBuf],
     progress: &ProgressReporter,
     stats: &Mutex<NameIndexStats>,
     cancel: &AtomicBool,
@@ -344,6 +361,9 @@ fn apply_single_change(
     // 1. favorite 境界チェック (notify-rs の境界外イベントは watcher 設定上来ないはずだが、
     //    防衛的に)。
     if !crate::search_index_db::is_under(changed_path, favorite_root) {
+        return;
+    }
+    if crate::books::path_is_under_any(changed_path, excluded_roots) {
         return;
     }
 
@@ -363,6 +383,7 @@ fn apply_single_change(
                 progress,
                 cancel,
                 activity_gate,
+                excluded_roots,
             );
             stats.lock().unwrap().updates_applied += 1;
         }
@@ -474,6 +495,7 @@ fn handle_existing_path(
     progress: &ProgressReporter,
     cancel: &AtomicBool,
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
+    excluded_roots: &[PathBuf],
 ) {
     // 1. scan_start は最初に取る
     let scan_start = crate::search_index_db::next_write_stamp();
@@ -484,7 +506,14 @@ fn handle_existing_path(
     let parent_refresh_ok = if path_equals(changed_path, favorite_root) {
         true
     } else if let Some(parent) = changed_path.parent() {
-        refresh_parent_listing(favorite_root, db, parent, cancel, activity_gate)
+        refresh_parent_listing(
+            favorite_root,
+            db,
+            parent,
+            cancel,
+            activity_gate,
+            excluded_roots,
+        )
     } else {
         // changed_path に parent が無い (ルートそのもの) — favorite_root 配下なら通常起こらない
         true
@@ -499,6 +528,7 @@ fn handle_existing_path(
             cancel,
             activity_gate,
             progress,
+            excluded_roots,
         );
         // prune は (a) subtree scan が clean に完了し、(b) parent refresh も成功している
         // ときのみ。どちらか欠けると「changed_path 自身の行が古い stamp のまま」「subtree が
@@ -538,6 +568,7 @@ fn refresh_parent_listing(
     // entries ループ内で 64 件ごとに yield する。
     cancel: &AtomicBool,
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
+    excluded_roots: &[PathBuf],
 ) -> bool {
     let entries = match std::fs::read_dir(parent) {
         Ok(e) => e,
@@ -566,6 +597,7 @@ fn refresh_parent_listing(
         entries,
         "name_index parent refresh",
         activity_gate.map(|g| (g, cancel)),
+        excluded_roots,
     );
     if had_entry_error {
         // **upsert を skip する** (Codex P2 第 12 レビュー指摘):
@@ -608,12 +640,13 @@ fn run_subtree_scan(
     cancel: &AtomicBool,
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
     progress: &ProgressReporter,
+    excluded_roots: &[PathBuf],
 ) -> SubtreeScanOutcome {
     let mut subtree_folders: Vec<PathBuf> = Vec::new();
     let mut had_error = false;
 
     // Pass 1: 再帰的に folder を列挙。`on_visit` で activity_gate を待つ + `on_error` で log。
-    walk_dirs_recursive_with_progress(
+    walk_dirs_recursive_with_progress_excluding(
         root_path,
         &mut subtree_folders,
         cancel,
@@ -632,6 +665,7 @@ fn run_subtree_scan(
         },
         // huge folder の entries ループ内でも 64 件ごとに ActivityGate を見る。
         activity_gate,
+        excluded_roots,
     );
 
     if cancel.load(Ordering::Relaxed) {
@@ -662,6 +696,7 @@ fn run_subtree_scan(
             entries,
             "name_index subtree scan Pass 2",
             activity_gate.map(|g| (g, cancel)),
+            excluded_roots,
         );
         if had_entry_error {
             // **upsert を skip する** (Codex P2 第 12 レビュー指摘): 不完全 children で
@@ -735,7 +770,7 @@ mod tests {
 
         let db = Arc::new(SearchIndexDb::open_in_memory().unwrap());
         let fav_id = Uuid::new_v4();
-        let handle = spawn(fav_id, root.clone(), Arc::clone(&db), None);
+        let handle = spawn(fav_id, root.clone(), Arc::clone(&db), Vec::new(), None);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -757,7 +792,7 @@ mod tests {
         let root = tmp.path().join("fav");
         fs::create_dir_all(&root).unwrap();
         let db = Arc::new(SearchIndexDb::open_in_memory().unwrap());
-        let handle = spawn(Uuid::new_v4(), root, db, None);
+        let handle = spawn(Uuid::new_v4(), root, db, Vec::new(), None);
         // drop で無限待ちしないこと
         let t0 = Instant::now();
         drop(handle);
@@ -806,7 +841,7 @@ mod tests {
         fs::write(deep.join("marker.pdf"), b"fake").unwrap();
         let db = SearchIndexDb::open_in_memory().unwrap();
         let cancel = AtomicBool::new(false);
-        crate::name_bulk_indexer::run_bulk_name_index(&root, &db, None, &cancel, None);
+        crate::name_bulk_indexer::run_bulk_name_index(&root, &db, None, &[], &cancel, None);
         let roots = vec![root.clone()];
         assert!(
             count_hits(&db, "marker", &roots) >= 2,
@@ -828,6 +863,7 @@ mod tests {
             &db,
             &deep.join("marker.zip"),
             ChangeKind::Remove,
+            &[],
             &progress,
             &stats,
             &cancel,
@@ -874,6 +910,7 @@ mod tests {
             &db,
             &fav,
             ChangeKind::Upsert,
+            &[],
             &progress,
             &stats,
             &cancel,
@@ -904,7 +941,7 @@ mod tests {
 
         let db = SearchIndexDb::open_in_memory().unwrap();
         let cancel = AtomicBool::new(false);
-        crate::name_bulk_indexer::run_bulk_name_index(&fav, &db, None, &cancel, None);
+        crate::name_bulk_indexer::run_bulk_name_index(&fav, &db, None, &[], &cancel, None);
         let roots = vec![fav.clone()];
         assert!(count_hits(&db, "x.zip", &roots) >= 1);
 
@@ -918,6 +955,7 @@ mod tests {
             &db,
             &fav,
             ChangeKind::Remove,
+            &[],
             &progress,
             &stats,
             &cancel,
@@ -946,7 +984,7 @@ mod tests {
 
         let db = SearchIndexDb::open_in_memory().unwrap();
         let cancel = AtomicBool::new(false);
-        crate::name_bulk_indexer::run_bulk_name_index(&root, &db, None, &cancel, None);
+        crate::name_bulk_indexer::run_bulk_name_index(&root, &db, None, &[], &cancel, None);
         let roots = vec![root.clone()];
         assert!(count_hits(&db, "old.zip", &roots) >= 1);
         assert!(count_hits(&db, "deep", &roots) >= 1);
@@ -964,6 +1002,7 @@ mod tests {
             &db,
             &sub,
             ChangeKind::Upsert,
+            &[],
             &progress,
             &stats,
             &cancel,
@@ -1003,7 +1042,7 @@ mod tests {
 
         let db = SearchIndexDb::open_in_memory().unwrap();
         let cancel_setup = AtomicBool::new(false);
-        crate::name_bulk_indexer::run_bulk_name_index(&root, &db, None, &cancel_setup, None);
+        crate::name_bulk_indexer::run_bulk_name_index(&root, &db, None, &[], &cancel_setup, None);
         let roots = vec![root.clone()];
         assert!(count_hits(&db, "old.zip", &roots) >= 1);
         let before_total = db.count_for_favorite(&root).unwrap();
@@ -1018,6 +1057,7 @@ mod tests {
             &db,
             &sub,
             ChangeKind::Upsert,
+            &[],
             &progress,
             &stats,
             &cancel,

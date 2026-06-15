@@ -658,6 +658,51 @@ pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
             .size(11.0)
             .color(egui::Color32::from_gray(140)),
     );
+
+    ui.separator();
+    ui.label("製本");
+    ui.horizontal_wrapped(|ui| {
+        let edit_width = (ui.available_width() - 190.0).clamp(180.0, 360.0);
+        let mut output = egui::TextEdit::singleline(&mut state.book_root_input)
+            .desired_width(edit_width)
+            .hint_text(crate::books::default_books_root().display().to_string())
+            .show(ui);
+        let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
+            ui,
+            &mut output,
+            &mut state.book_root_input,
+        );
+        let response = output.response;
+        if response.changed() || menu_changed {
+            let trimmed = state.book_root_input.trim();
+            s.book_root = if trimmed.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(trimmed))
+            };
+        }
+        if ui.button("既定に戻す").clicked() {
+            state.book_root_input.clear();
+            s.book_root = None;
+        }
+        if ui.button("フォルダを開く").clicked() {
+            let dir = s
+                .book_root
+                .clone()
+                .unwrap_or_else(crate::books::default_books_root);
+            crate::capture::open_output_dir_async(dir);
+        }
+    });
+
+    let effective = s
+        .book_root
+        .clone()
+        .unwrap_or_else(crate::books::default_books_root);
+    ui.label(
+        egui::RichText::new(format!("本棚: {}", effective.display()))
+            .size(11.0)
+            .color(egui::Color32::from_gray(140)),
+    );
 }
 
 pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) {

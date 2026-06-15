@@ -88,6 +88,8 @@ pub struct IndexerManager {
     /// UI 入力があると `bump` され、ingest ワーカーが unit of work の前にこれで待つ。
     /// `App::update` が ActivityGate を所有し、IndexerManager は `Arc` を受け取って保管する。
     activity_gate: Arc<ActivityGate>,
+    /// アプリ管理下で生成する派生コンテンツなど、検索索引から除外する root。
+    excluded_roots: Vec<std::path::PathBuf>,
     /// お気に入り UUID → Supervisor ハンドル
     supervisors: HashMap<Uuid, SupervisorHandle>,
     /// 有効化されていないお気に入りでも、お気に入り UUID → (name, path) を記憶しておく
@@ -261,6 +263,7 @@ impl IndexerManager {
         favorites: &[FavoriteEntry],
         speed: crate::settings::IndexerSpeedProfile,
         activity_gate: Arc<ActivityGate>,
+        excluded_roots: Vec<std::path::PathBuf>,
         progress: Option<StartupProgressHook>,
     ) -> Option<Self> {
         let data_dir = crate::data_dir::get();
@@ -269,7 +272,15 @@ impl IndexerManager {
                 Some(stores) => stores,
                 None => return None,
             };
-        Self::new_with_stores(meta_db, fts, favorites, speed, activity_gate, progress)
+        Self::new_with_stores(
+            meta_db,
+            fts,
+            favorites,
+            speed,
+            activity_gate,
+            excluded_roots,
+            progress,
+        )
     }
 
     /// テスト用コンストラクタ: `data_dir` 配下に `fts_meta.db` / `fts_index/` を作って初期化する。
@@ -282,6 +293,7 @@ impl IndexerManager {
         favorites: &[FavoriteEntry],
         speed: crate::settings::IndexerSpeedProfile,
         activity_gate: Arc<ActivityGate>,
+        excluded_roots: Vec<std::path::PathBuf>,
     ) -> Option<Self> {
         std::fs::create_dir_all(data_dir).ok();
         let (meta_db, fts) =
@@ -289,7 +301,15 @@ impl IndexerManager {
                 Some(stores) => stores,
                 None => return None,
             };
-        Self::new_with_stores(meta_db, fts, favorites, speed, activity_gate, None)
+        Self::new_with_stores(
+            meta_db,
+            fts,
+            favorites,
+            speed,
+            activity_gate,
+            excluded_roots,
+            None,
+        )
     }
 
     /// `new` / `new_at` 共通の本体。stores を受け取って reconciliation + supervisor spawn を行う。
@@ -299,6 +319,7 @@ impl IndexerManager {
         favorites: &[FavoriteEntry],
         speed: crate::settings::IndexerSpeedProfile,
         activity_gate: Arc<ActivityGate>,
+        excluded_roots: Vec<std::path::PathBuf>,
         progress: Option<StartupProgressHook>,
     ) -> Option<Self> {
         // IndexWriter は dispatcher に owner として渡す (Tantivy は 1 Index 1 writer 制約)。
@@ -353,6 +374,7 @@ impl IndexerManager {
             writer,
             io_sem,
             activity_gate,
+            excluded_roots,
             supervisors: HashMap::new(),
             favorite_info: HashMap::new(),
             reconciliation_in_progress: Arc::new(AtomicBool::new(false)),
@@ -481,6 +503,7 @@ impl IndexerManager {
                 SupervisorParams {
                     favorite_id: f.id,
                     favorite_root: f.path.clone(),
+                    excluded_roots: self.excluded_roots.clone(),
                     enable_metadata_index: true,
                 },
                 Arc::clone(&self.meta_db),
@@ -988,6 +1011,7 @@ mod tests {
             writer,
             io_sem: Arc::clone(&io_sem),
             activity_gate: Arc::new(ActivityGate::new(1000)),
+            excluded_roots: Vec::new(),
             supervisors: HashMap::new(),
             favorite_info: HashMap::new(),
             reconciliation_in_progress: Arc::new(AtomicBool::new(false)),

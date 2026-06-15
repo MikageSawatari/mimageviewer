@@ -63,6 +63,7 @@
 # GridRotateCcw = L ; 選択中の画像を左に90度回転する
 # GridPin = P ; 選択中の項目を代表サムネイルに固定または解除する
 # GridComparePin = X ; 選択中の画像を比較スロットに固定または解除する
+# GridAddToActiveBook = Ctrl+B ; 選択中またはチェック済みのページをアクティブな本へ追加する
 # GridColumnCount1 = Alt+1 ; サムネイル列数を1列にする
 # GridColumnCount2 = Alt+2 ; サムネイル列数を2列にする
 # GridColumnCount3 = Alt+3 ; サムネイル列数を3列にする
@@ -119,6 +120,7 @@
 # FsSlideshow = S ; スライドショーの再生または停止を切り替える
 # FsSpaceCheck = Space ; 現在の画像のチェックを切り替える。スライドショー中は停止する
 # FsCapture = Ctrl+S ; 現在の表示画像をキャプチャ保存する
+# FsAddToActiveBook = Ctrl+B ; 現在のページをアクティブな本へ追加する
 # FsExport = Ctrl+E ; 現在の表示結果を別ファイルへ書き出す
 # FsCompareToggle = X ; 現在の画像を比較スロットに固定または解除する
 # FsCompareCycle = C ; 比較スロットのピン画像と現在画像を切り替えて表示する
@@ -190,6 +192,7 @@
 # VideoTileMode = S ; 動画タイルモードを切り替える
 # VideoBookmark = B ; 現在の再生位置にブックマークを追加する
 # VideoCapture = Ctrl+S ; 現在の動画フレームをキャプチャ保存する
+# VideoAddToActiveBook = Ctrl+B ; 現在の動画フレームをアクティブな本へ追加する
 # VideoCompareToggle = X ; 動画では比較表示キーを何もしない操作として消費する
 # VideoCompareCycle = C ; 動画では比較切り替えキーを何もしない操作として消費する
 # VideoCompareWipe = Shift+C ; 動画ではワイプ比較キーを何もしない操作として消費する

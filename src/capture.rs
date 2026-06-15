@@ -316,6 +316,42 @@ pub fn save_rgba_unique_with_matte(
     ))
 }
 
+pub fn save_rgba_exact_with_matte(
+    path: &Path,
+    format: CaptureFormat,
+    jpeg_matte: JpegMatte,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("capture size is zero".to_string());
+    }
+    let expected_len = width as usize * height as usize * 4;
+    if rgba.len() != expected_len {
+        return Err(format!(
+            "invalid RGBA buffer length: got {}, expected {}",
+            rgba.len(),
+            expected_len
+        ));
+    }
+    let Some(parent) = path.parent() else {
+        return Err(format!("保存先フォルダが不正です: {}", path.display()));
+    };
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("保存先フォルダを作成できません: {}: {e}", parent.display()))?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("保存ファイルを作成できません: {}: {e}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    encode_rgba(&mut writer, format, jpeg_matte, width, height, rgba)?;
+    writer
+        .flush()
+        .map_err(|e| format!("保存ファイルを flush できません: {}: {e}", path.display()))
+}
+
 pub fn run_pixel_job(job: CapturePixelJob) -> Result<(String, u32, u32, Vec<u8>), String> {
     let mut image = job.source.as_ref().clone();
     if let Some(conceal) = job.conceal {

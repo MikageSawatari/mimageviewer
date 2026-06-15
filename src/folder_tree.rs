@@ -440,6 +440,27 @@ pub fn walk_dirs_recursive_with_progress(
     on_error: &mut dyn FnMut(&Path, &std::io::Error),
     yield_check: Option<&crate::activity_gate::ActivityGate>,
 ) {
+    walk_dirs_recursive_with_progress_excluding(
+        path,
+        out,
+        cancel,
+        on_visit,
+        on_error,
+        yield_check,
+        &[],
+    );
+}
+
+/// `walk_dirs_recursive_with_progress` と同じだが、`excluded_roots` 配下には入らない。
+pub fn walk_dirs_recursive_with_progress_excluding(
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+    cancel: &AtomicBool,
+    on_visit: &mut dyn FnMut(&Path),
+    on_error: &mut dyn FnMut(&Path, &std::io::Error),
+    yield_check: Option<&crate::activity_gate::ActivityGate>,
+    excluded_roots: &[PathBuf],
+) {
     let mut visited = HashSet::new();
     walk_dirs_recursive_with_progress_inner(
         path,
@@ -448,6 +469,7 @@ pub fn walk_dirs_recursive_with_progress(
         on_visit,
         on_error,
         yield_check,
+        excluded_roots,
         0,
         &mut visited,
     );
@@ -461,6 +483,7 @@ fn walk_dirs_recursive_with_progress_inner(
     on_visit: &mut dyn FnMut(&Path),
     on_error: &mut dyn FnMut(&Path, &std::io::Error),
     yield_check: Option<&crate::activity_gate::ActivityGate>,
+    excluded_roots: &[PathBuf],
     depth: u32,
     visited: &mut HashSet<String>,
 ) {
@@ -469,6 +492,9 @@ fn walk_dirs_recursive_with_progress_inner(
         return;
     }
     if depth > MAX_WALK_DEPTH || !crate::fs_entry::mark_directory_visited(path, visited) {
+        return;
+    }
+    if crate::books::path_is_under_any(path, excluded_roots) {
         return;
     }
     if !path.is_dir() {
@@ -506,13 +532,18 @@ fn walk_dirs_recursive_with_progress_inner(
                     .map(|ft| crate::fs_entry::classify_dir_entry(&entry, &ft).is_directory())
                     .unwrap_or(false);
                 if is_dir {
+                    let child = entry.path();
+                    if crate::books::path_is_under_any(&child, excluded_roots) {
+                        continue;
+                    }
                     walk_dirs_recursive_with_progress_inner(
-                        &entry.path(),
+                        &child,
                         out,
                         cancel,
                         on_visit,
                         on_error,
                         yield_check,
+                        excluded_roots,
                         depth + 1,
                         visited,
                     );

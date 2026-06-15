@@ -175,6 +175,7 @@ impl Drop for SupervisorHandle {
 pub struct SupervisorParams {
     pub favorite_id: Uuid,
     pub favorite_root: PathBuf,
+    pub excluded_roots: Vec<PathBuf>,
     /// metadata インデックスが有効か (auto_index_metadata)。
     /// false の場合、Supervisor は起動しない (呼び出し側が spawn を呼ばない想定)。
     pub enable_metadata_index: bool,
@@ -209,6 +210,7 @@ pub fn spawn(
 
     let fav_id = params.favorite_id;
     let root = params.favorite_root.clone();
+    let excluded_roots = params.excluded_roots.clone();
     let cancel_cl = Arc::clone(&cancel);
     let stats_cl = Arc::clone(&stats);
     let progress_cl = progress.clone();
@@ -224,6 +226,7 @@ pub fn spawn(
             supervisor_loop(
                 fav_id,
                 root,
+                excluded_roots,
                 meta_db,
                 fts,
                 writer,
@@ -254,6 +257,7 @@ pub fn spawn(
 fn supervisor_loop(
     favorite_id: Uuid,
     favorite_root: PathBuf,
+    excluded_roots: Vec<PathBuf>,
     meta_db: Arc<FtsMetaDb>,
     fts: Arc<FtsIndex>,
     writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
@@ -284,6 +288,7 @@ fn supervisor_loop(
         &session,
         &writer,
         &io_sem,
+        &excluded_roots,
         Arc::clone(&cancel),
         &stats,
         &progress,
@@ -309,6 +314,7 @@ fn supervisor_loop(
                             &session,
                             &writer,
                             &io_sem,
+                            &excluded_roots,
                             Arc::clone(&cancel),
                             &stats,
                             &progress,
@@ -338,6 +344,7 @@ fn supervisor_loop(
                                 &session,
                                 &writer,
                                 &io_sem,
+                                &excluded_roots,
                                 Arc::clone(&cancel),
                                 &stats,
                                 &progress,
@@ -350,6 +357,7 @@ fn supervisor_loop(
                             &session,
                             &writer,
                             &io_sem,
+                            &excluded_roots,
                             &cancel,
                             &stats,
                             &progress,
@@ -377,6 +385,7 @@ fn run_initial_scan(
     session: &IngestSession,
     writer: &crate::fts_writer_dispatcher::FtsWriterDispatcher,
     io_sem: &GlobalIoSemaphore,
+    excluded_roots: &[PathBuf],
     cancel: Arc<AtomicBool>,
     stats: &Mutex<SupervisorStats>,
     progress: &ProgressReporter,
@@ -415,6 +424,7 @@ fn run_initial_scan(
         ScanParams {
             favorite_id,
             root: favorite_root.to_path_buf(),
+            excluded_roots: excluded_roots.to_vec(),
             cancel: Arc::clone(&cancel),
             progress: Some(progress.clone()),
         },
@@ -502,12 +512,16 @@ fn apply_single_change(
     session: &IngestSession,
     writer: &crate::fts_writer_dispatcher::FtsWriterDispatcher,
     io_sem: &GlobalIoSemaphore,
+    excluded_roots: &[PathBuf],
     cancel: &AtomicBool,
     stats: &Mutex<SupervisorStats>,
     progress: &ProgressReporter,
     path: PathBuf,
     kind: ChangeKind,
 ) {
+    if crate::books::path_is_under_any(&path, excluded_roots) {
+        return;
+    }
     // watcher から来るのは abs path。walker と同じ正規化で key を作る。
     let key = crate::search_index_db::normalize_path(&path);
 
@@ -793,6 +807,7 @@ mod tests {
             SupervisorParams {
                 favorite_id: fav_id,
                 favorite_root: fav_root.clone(),
+                excluded_roots: Vec::new(),
                 enable_metadata_index: true,
             },
             Arc::clone(&meta),
@@ -836,6 +851,7 @@ mod tests {
             SupervisorParams {
                 favorite_id: Uuid::new_v4(),
                 favorite_root: fav_root,
+                excluded_roots: Vec::new(),
                 enable_metadata_index: true,
             },
             meta,
@@ -864,6 +880,7 @@ mod tests {
             SupervisorParams {
                 favorite_id: fav_id,
                 favorite_root: fav_root,
+                excluded_roots: Vec::new(),
                 enable_metadata_index: true,
             },
             meta,
@@ -909,6 +926,7 @@ mod tests {
             SupervisorParams {
                 favorite_id: fav_a,
                 favorite_root: root_a,
+                excluded_roots: Vec::new(),
                 enable_metadata_index: true,
             },
             Arc::clone(&meta),
@@ -921,6 +939,7 @@ mod tests {
             SupervisorParams {
                 favorite_id: fav_b,
                 favorite_root: root_b,
+                excluded_roots: Vec::new(),
                 enable_metadata_index: true,
             },
             Arc::clone(&meta),
@@ -962,6 +981,7 @@ mod tests {
             SupervisorParams {
                 favorite_id: fav_id,
                 favorite_root: fav_root.clone(),
+                excluded_roots: Vec::new(),
                 enable_metadata_index: true,
             },
             Arc::clone(&meta),
@@ -1024,6 +1044,7 @@ mod tests {
             SupervisorParams {
                 favorite_id: fav_id,
                 favorite_root: fav_root.clone(),
+                excluded_roots: Vec::new(),
                 enable_metadata_index: true,
             },
             Arc::clone(&meta),
@@ -1082,6 +1103,7 @@ mod tests {
             SupervisorParams {
                 favorite_id: Uuid::new_v4(),
                 favorite_root: fav_root,
+                excluded_roots: Vec::new(),
                 enable_metadata_index: true,
             },
             meta,

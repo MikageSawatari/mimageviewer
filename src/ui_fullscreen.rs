@@ -35,6 +35,12 @@ pub(crate) struct FullscreenCursorState {
     hidden: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BookAddMode {
+    Grid,
+    Fullscreen,
+}
+
 pub(crate) mod draw_icons;
 use self::draw_icons::*;
 
@@ -5430,6 +5436,11 @@ impl App {
         let key_ctrl_s_capture = !is_video_fs
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsCapture);
+        let key_ctrl_b_book = !is_video_fs
+            && self.fs_context_menu_idx.is_none()
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsAddToActiveBook);
         let key_ctrl_e_export = !is_video_fs
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsExport);
@@ -5506,23 +5517,27 @@ impl App {
         // レーティング 1〜5 / 解除 (既定: F1〜F6)
         let rating_key = self.keymap.consume_rating_action(ctx, false);
         if let Some(stars) = rating_key {
-            // Undo 用にフルスクリーン現在ページの before/after を 1 件分積む。
-            let before = self.rating_cache.get(&fs_idx).copied().unwrap_or(0);
-            if before != stars {
-                let summary = if stars == 0 {
-                    "★解除".to_string()
-                } else {
-                    format!("★{stars}")
-                };
-                self.capture_rating_undo(vec![(fs_idx, before, stars)], summary);
-            }
-            self.set_rating(fs_idx, stars);
-            // レーティング変更でフィルタ境界を跨ぐ可能性があるので visible_indices 再計算。
-            self.rebuild_visible_indices();
-            if stars == 0 {
-                self.show_feedback_toast("[★解除]".to_string());
+            if self.reject_compiled_book_page_edit(fs_idx) {
+                // key consumed; do not create phantom undo/toast for immutable book pages.
             } else {
-                self.show_feedback_toast(format!("[{}]", "★".repeat(stars as usize)));
+                // Undo 用にフルスクリーン現在ページの before/after を 1 件分積む。
+                let before = self.rating_cache.get(&fs_idx).copied().unwrap_or(0);
+                if before != stars {
+                    let summary = if stars == 0 {
+                        "★解除".to_string()
+                    } else {
+                        format!("★{stars}")
+                    };
+                    self.capture_rating_undo(vec![(fs_idx, before, stars)], summary);
+                }
+                self.set_rating(fs_idx, stars);
+                // レーティング変更でフィルタ境界を跨ぐ可能性があるので visible_indices 再計算。
+                self.rebuild_visible_indices();
+                if stars == 0 {
+                    self.show_feedback_toast("[★解除]".to_string());
+                } else {
+                    self.show_feedback_toast(format!("[{}]", "★".repeat(stars as usize)));
+                }
             }
         }
         if key_p_pin {
@@ -5543,23 +5558,27 @@ impl App {
         let key_f8 = self.keymap.consume_action(ctx, KeyAction::FsApplyErase2);
         let key_f9 = self.keymap.consume_action(ctx, KeyAction::FsApplyConceal1);
         let key_f10 = self.keymap.consume_action(ctx, KeyAction::FsApplyConceal2);
-        if delete_erase_mask {
-            self.delete_erase_mask_in_viewing_mode();
-        }
-        if delete_conceal_mask {
-            self.delete_conceal_mask_in_viewing_mode();
-        }
-        if key_f7 {
-            self.apply_slot_in_viewing_mode(ctx, 1);
-        }
-        if key_f8 {
-            self.apply_slot_in_viewing_mode(ctx, 2);
-        }
-        if key_f9 {
-            self.apply_conceal_slot_in_viewing_mode(1);
-        }
-        if key_f10 {
-            self.apply_conceal_slot_in_viewing_mode(2);
+        if delete_erase_mask || delete_conceal_mask || key_f7 || key_f8 || key_f9 || key_f10 {
+            if !self.reject_compiled_book_page_edit(fs_idx) {
+                if delete_erase_mask {
+                    self.delete_erase_mask_in_viewing_mode();
+                }
+                if delete_conceal_mask {
+                    self.delete_conceal_mask_in_viewing_mode();
+                }
+                if key_f7 {
+                    self.apply_slot_in_viewing_mode(ctx, 1);
+                }
+                if key_f8 {
+                    self.apply_slot_in_viewing_mode(ctx, 2);
+                }
+                if key_f9 {
+                    self.apply_conceal_slot_in_viewing_mode(1);
+                }
+                if key_f10 {
+                    self.apply_conceal_slot_in_viewing_mode(2);
+                }
+            }
         }
 
         // F11: ウィンドウ表示 ⇔ 全画面表示 トグル (ホバーバー × の左の
@@ -5730,87 +5749,96 @@ impl App {
         // U キー: AI アップスケールモデルをサイクル
         // 現在効いているスコープ (個別 > お気に入り標準 > 標準) を書き換える。
         if (key_u || key_u_shift || key_u_alt) && self.reading_flow.is_paged() {
-            let mut params = self.effective_params(fs_idx).clone();
-            let items =
-                crate::adjustment::upscale_menu_items_for_mode(self.settings.ai_feature_mode);
-            let cur = items
-                .iter()
-                .position(|(_, k)| match (k, params.upscale_model.as_deref()) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => *a == b,
-                    _ => false,
-                });
-            // 制限モードでは保存済みモデルを潰さない:
-            //   - Disabled は「なし」のみ (= items.len() <= 1) で循環の意味が無い。
-            //   - 保存済みモデルがこの AI モードのメニューに無い (cur=None) ときは、
-            //     そのモデルは隠れて保持されているだけ。U で None / 別モデルに上書きすると
-            //     full モードへ戻したときに選択が失われるため、変更せず維持する。
-            if items.len() <= 1 || cur.is_none() {
-                self.show_feedback_toast(format!(
+            if self.reject_compiled_book_page_edit(fs_idx) {
+                // key consumed; immutable book pages keep their baked state.
+            } else {
+                let mut params = self.effective_params(fs_idx).clone();
+                let items =
+                    crate::adjustment::upscale_menu_items_for_mode(self.settings.ai_feature_mode);
+                let cur =
+                    items
+                        .iter()
+                        .position(|(_, k)| match (k, params.upscale_model.as_deref()) {
+                            (None, None) => true,
+                            (Some(a), Some(b)) => *a == b,
+                            _ => false,
+                        });
+                // 制限モードでは保存済みモデルを潰さない:
+                //   - Disabled は「なし」のみ (= items.len() <= 1) で循環の意味が無い。
+                //   - 保存済みモデルがこの AI モードのメニューに無い (cur=None) ときは、
+                //     そのモデルは隠れて保持されているだけ。U で None / 別モデルに上書きすると
+                //     full モードへ戻したときに選択が失われるため、変更せず維持する。
+                if items.len() <= 1 || cur.is_none() {
+                    self.show_feedback_toast(format!(
                     "[U:アップスケール]\nこの AI モード ({}) では変更しません (保存済み選択を維持)",
                     self.settings.ai_feature_mode.label()
                 ));
-            } else {
-                let scope = self.resolve_adjust_scope(fs_idx);
-                let cur = cur.unwrap_or(0);
-                let next = if key_u_alt {
-                    0
-                } else if key_u_shift {
-                    (cur + items.len() - 1) % items.len()
                 } else {
-                    (cur + 1) % items.len()
-                };
-                let (label, key) = items[next];
-                params.upscale_model = key.map(|s| s.to_string());
-                // 切替先がアップスケール **有効** で、かつ画像サイズが
-                // `ai_upscale_size_limit` のサイズ上限以上なら処理がスキップされる。
-                // 「切り替えたのに見た目が変わらない」違和感を避けるため
-                // トーストに 2 行目で明示する。
-                let mut toast = format!("[U:{}アップスケール {}]", scope.label(), label);
-                if key.is_some()
-                    && let Some(crate::fs_animation::FsCacheEntry::Static { pixels, .. }) =
-                        self.fs_cache.get(&fs_idx)
-                {
-                    let w = pixels.size[0] as u32;
-                    let h = pixels.size[1] as u32;
-                    let limit = self.settings.ai_upscale_limit();
-                    if !crate::ai::upscale::should_process_rect(w, h, limit) {
-                        toast.push_str(&format!(
+                    let scope = self.resolve_adjust_scope(fs_idx);
+                    let cur = cur.unwrap_or(0);
+                    let next = if key_u_alt {
+                        0
+                    } else if key_u_shift {
+                        (cur + items.len() - 1) % items.len()
+                    } else {
+                        (cur + 1) % items.len()
+                    };
+                    let (label, key) = items[next];
+                    params.upscale_model = key.map(|s| s.to_string());
+                    // 切替先がアップスケール **有効** で、かつ画像サイズが
+                    // `ai_upscale_size_limit` のサイズ上限以上なら処理がスキップされる。
+                    // 「切り替えたのに見た目が変わらない」違和感を避けるため
+                    // トーストに 2 行目で明示する。
+                    let mut toast = format!("[U:{}アップスケール {}]", scope.label(), label);
+                    if key.is_some()
+                        && let Some(crate::fs_animation::FsCacheEntry::Static { pixels, .. }) =
+                            self.fs_cache.get(&fs_idx)
+                    {
+                        let w = pixels.size[0] as u32;
+                        let h = pixels.size[1] as u32;
+                        let limit = self.settings.ai_upscale_limit();
+                        if !crate::ai::upscale::should_process_rect(w, h, limit) {
+                            toast.push_str(&format!(
                             "\n(解像度が高いためアップスケール処理無効: {w}×{h} は上限 {} 未満の範囲外)",
                             limit.label()
                         ));
+                        }
                     }
+                    self.show_feedback_toast(toast);
+                    self.capture_adjust_full(format!("AI アップスケール: {label}"), |app| {
+                        app.write_params_for_scope(fs_idx, scope, params);
+                        app.clear_all_adjustment_and_ai_caches(fs_idx);
+                    });
                 }
-                self.show_feedback_toast(toast);
-                self.capture_adjust_full(format!("AI アップスケール: {label}"), |app| {
-                    app.write_params_for_scope(fs_idx, scope, params);
-                    app.clear_all_adjustment_and_ai_caches(fs_idx);
-                });
             }
         }
 
         // N キー: AI デノイズをトグル
         if key_n && self.reading_flow.is_paged() {
-            if !self.settings.ai_feature_mode.allows_denoise() {
-                self.show_feedback_toast(format!(
-                    "[N:デノイズ無効]\nAI 機能: {}",
-                    self.settings.ai_feature_mode.label()
-                ));
+            if self.reject_compiled_book_page_edit(fs_idx) {
+                // key consumed; immutable book pages keep their baked state.
             } else {
-                let scope = self.resolve_adjust_scope(fs_idx);
-                let mut params = self.effective_params(fs_idx).clone();
-                if params.denoise_model.is_some() {
-                    params.denoise_model = None;
-                    self.show_feedback_toast(format!("[N:{}デノイズ OFF]", scope.label()));
+                if !self.settings.ai_feature_mode.allows_denoise() {
+                    self.show_feedback_toast(format!(
+                        "[N:デノイズ無効]\nAI 機能: {}",
+                        self.settings.ai_feature_mode.label()
+                    ));
                 } else {
-                    params.denoise_model =
-                        Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string());
-                    self.show_feedback_toast(format!("[N:{}デノイズ ON]", scope.label()));
+                    let scope = self.resolve_adjust_scope(fs_idx);
+                    let mut params = self.effective_params(fs_idx).clone();
+                    if params.denoise_model.is_some() {
+                        params.denoise_model = None;
+                        self.show_feedback_toast(format!("[N:{}デノイズ OFF]", scope.label()));
+                    } else {
+                        params.denoise_model =
+                            Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().to_string());
+                        self.show_feedback_toast(format!("[N:{}デノイズ ON]", scope.label()));
+                    }
+                    self.capture_adjust_full("AI デノイズの切替".to_string(), |app| {
+                        app.write_params_for_scope(fs_idx, scope, params);
+                        app.clear_all_adjustment_and_ai_caches(fs_idx);
+                    });
                 }
-                self.capture_adjust_full("AI デノイズの切替".to_string(), |app| {
-                    app.write_params_for_scope(fs_idx, scope, params);
-                    app.clear_all_adjustment_and_ai_caches(fs_idx);
-                });
             }
         }
 
@@ -5818,41 +5846,52 @@ impl App {
         // post_filter は final AI の後段なので、差分分類 (clear_caches_for_param_change)
         // 経由で final AI cache を保持したまま final composite だけ作り直す。
         if (key_t || key_t_shift || key_t_alt) && self.reading_flow.is_paged() {
-            let scope = self.resolve_adjust_scope(fs_idx);
-            let old_params = self.effective_params(fs_idx).clone();
-            let mut params = old_params.clone();
-            let all = crate::adjustment::PostFilter::ALL;
-            let cur = all
-                .iter()
-                .position(|f| *f == params.post_filter)
-                .unwrap_or(0);
-            let next_idx = if key_t_alt {
-                0
-            } else if key_t_shift {
-                (cur + all.len() - 1) % all.len()
+            if self.reject_compiled_book_page_edit(fs_idx) {
+                // key consumed; immutable book pages keep their baked state.
             } else {
-                (cur + 1) % all.len()
-            };
-            let next = all[next_idx];
-            params.post_filter = next;
-            self.show_feedback_toast(format!("[T: {} / {}]", scope.label(), next.display_label()));
-            self.capture_adjust_full(
-                format!("ポストフィルタ: {}", next.display_label()),
-                |app| {
-                    app.write_params_for_scope(fs_idx, scope, params.clone());
-                    match scope {
-                        AdjustScope::PageOverride => {
-                            app.clear_caches_for_param_change(fs_idx, &old_params, &params)
+                let scope = self.resolve_adjust_scope(fs_idx);
+                let old_params = self.effective_params(fs_idx).clone();
+                let mut params = old_params.clone();
+                let all = crate::adjustment::PostFilter::ALL;
+                let cur = all
+                    .iter()
+                    .position(|f| *f == params.post_filter)
+                    .unwrap_or(0);
+                let next_idx = if key_t_alt {
+                    0
+                } else if key_t_shift {
+                    (cur + all.len() - 1) % all.len()
+                } else {
+                    (cur + 1) % all.len()
+                };
+                let next = all[next_idx];
+                params.post_filter = next;
+                self.show_feedback_toast(format!(
+                    "[T: {} / {}]",
+                    scope.label(),
+                    next.display_label()
+                ));
+                self.capture_adjust_full(
+                    format!("ポストフィルタ: {}", next.display_label()),
+                    |app| {
+                        app.write_params_for_scope(fs_idx, scope, params.clone());
+                        match scope {
+                            AdjustScope::PageOverride => {
+                                app.clear_caches_for_param_change(fs_idx, &old_params, &params)
+                            }
+                            AdjustScope::FavoriteDefault(_) | AdjustScope::Global => {}
                         }
-                        AdjustScope::FavoriteDefault(_) | AdjustScope::Global => {}
-                    }
-                },
-            );
+                    },
+                );
+            }
         }
 
         // Ctrl+数字キー: 保存スロットを現在ページに適用 (= ページ個別化)
         for (slot_idx, &pressed) in slot_keys.iter().enumerate() {
             if pressed && self.reading_flow.is_paged() {
+                if self.reject_compiled_book_page_edit(fs_idx) {
+                    continue;
+                }
                 self.capture_adjust_full(
                     format!(
                         "スロット{}を適用",
@@ -5865,13 +5904,17 @@ impl App {
 
         // Ctrl+Backspace: 個別設定があれば解除、なければフィードバックのみ
         if clear_page_key && self.reading_flow.is_paged() {
-            if self.adjustment_page_params.contains_key(&fs_idx) {
-                self.capture_adjust_full("個別設定の解除".to_string(), |app| {
-                    app.clear_page_params(fs_idx)
-                });
-                self.show_feedback_toast("[個別設定を解除]".to_string());
+            if self.reject_compiled_book_page_edit(fs_idx) {
+                // key consumed; immutable book pages keep their baked state.
             } else {
-                self.show_feedback_toast("[個別設定なし]".to_string());
+                if self.adjustment_page_params.contains_key(&fs_idx) {
+                    self.capture_adjust_full("個別設定の解除".to_string(), |app| {
+                        app.clear_page_params(fs_idx)
+                    });
+                    self.show_feedback_toast("[個別設定を解除]".to_string());
+                } else {
+                    self.show_feedback_toast("[個別設定なし]".to_string());
+                }
             }
         }
 
@@ -6030,6 +6073,9 @@ impl App {
 
         if key_ctrl_s_capture {
             self.save_image_capture_to_file(ctx, fs_idx);
+        }
+        if key_ctrl_b_book {
+            self.add_fullscreen_image_to_active_book(ctx, fs_idx);
         }
         if key_ctrl_e_export {
             self.open_export_dialog_for_current(ctx, fs_idx);
@@ -6493,7 +6539,13 @@ impl App {
                         })
                         .unwrap_or(false)
                 });
-            if edge_hover && !self.analysis_mode && self.reading_flow.is_paged() {
+            if edge_hover
+                && !self.analysis_mode
+                && self.reading_flow.is_paged()
+                && self
+                    .fullscreen_idx
+                    .is_some_and(|idx| !self.idx_is_compiled_book_page(idx))
+            {
                 self.adjustment_mode = true;
             } else if !cursor_in_panel
                 && !edge_hover
@@ -12962,6 +13014,261 @@ impl App {
         Ok(job)
     }
 
+    pub(crate) fn add_grid_selection_to_active_book(&mut self, ctx: &egui::Context) {
+        if self.book_op_pending.is_some() {
+            self.show_feedback_toast("製本処理中です".to_string());
+            return;
+        }
+        let mut indices: Vec<usize> = if self.checked.is_empty() {
+            self.selected.into_iter().collect()
+        } else {
+            self.checked.iter().copied().collect()
+        };
+        indices.sort_unstable();
+        indices.dedup();
+        if indices.is_empty() {
+            self.show_feedback_toast("追加するページを選択してください".to_string());
+            return;
+        }
+
+        let mut sources = Vec::new();
+        let mut skipped = 0usize;
+        for idx in indices {
+            match self.book_page_source_for_idx(ctx, idx, BookAddMode::Grid) {
+                Ok(source) => sources.push(source),
+                Err(err) => {
+                    skipped += 1;
+                    crate::logger::log(format!("book add skip idx={idx}: {err}"));
+                }
+            }
+        }
+        if sources.is_empty() {
+            self.show_feedback_toast("選択中に追加できるページがありません".to_string());
+            return;
+        }
+        let count = sources.len();
+        self.start_book_append(ctx, sources);
+        if skipped > 0 {
+            self.show_feedback_toast(format!(
+                "アクティブな本へ追加中: {count} ページ (除外 {skipped})"
+            ));
+        } else {
+            self.show_feedback_toast(format!("アクティブな本へ追加中: {count} ページ"));
+        }
+    }
+
+    pub(crate) fn add_fullscreen_image_to_active_book(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) {
+        if self.book_op_pending.is_some() {
+            self.show_feedback_toast("製本処理中です".to_string());
+            return;
+        }
+        let source = match self.book_page_source_for_idx(ctx, fs_idx, BookAddMode::Fullscreen) {
+            Ok(source) => source,
+            Err(err) => {
+                self.show_feedback_toast(err);
+                return;
+            }
+        };
+        self.start_book_append(ctx, vec![source]);
+        self.show_feedback_toast("アクティブな本へ追加中".to_string());
+    }
+
+    pub(crate) fn add_current_video_frame_to_active_book(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) {
+        if self.book_op_pending.is_some() {
+            self.show_feedback_toast("製本処理中です".to_string());
+            return;
+        }
+        let Some((path, target_secs)) = self.fs_video_player(fs_idx).and_then(|player| {
+            if player.error().is_some() || player.info().is_none() {
+                None
+            } else {
+                Some((player.path().clone(), player.screenshot_target_secs()))
+            }
+        }) else {
+            self.show_feedback_toast("動画フレームを追加できません".to_string());
+            return;
+        };
+        let format = self.settings.capture_format;
+        let jpeg_matte =
+            crate::capture::JpegMatte::from_fs_transparent_bg_mode(self.fs_transparent_bg_mode);
+        let basename = crate::capture::basename_for_path(&path);
+        let source = crate::books::BookPageSource::VideoFrame {
+            path,
+            target_secs,
+            basename,
+            format,
+            jpeg_matte,
+        };
+        self.start_book_append(ctx, vec![source]);
+        self.show_feedback_toast("動画フレームを本へ追加中".to_string());
+    }
+
+    fn book_page_source_for_idx(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        mode: BookAddMode,
+    ) -> Result<crate::books::BookPageSource, String> {
+        if self.idx_is_compiled_book_page(idx) {
+            return Err("本の中のページは追加できません".to_string());
+        }
+        let item = self
+            .items
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| "このアイテムは追加できません".to_string())?;
+        let needs_render = match mode {
+            BookAddMode::Grid => false,
+            BookAddMode::Fullscreen => self.book_page_needs_render_fullscreen(idx, &item),
+        };
+        match item {
+            GridItem::Image(path) if mode == BookAddMode::Grid => {
+                let original_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "page".to_string());
+                let params = self.effective_params(idx).clone();
+                if params.is_color_identity() {
+                    Ok(crate::books::BookPageSource::File {
+                        src: path,
+                        original_name,
+                    })
+                } else {
+                    Ok(crate::books::BookPageSource::AdjustedFile {
+                        src: path,
+                        original_name,
+                        params,
+                        format: self.settings.capture_format,
+                        jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
+                            self.fs_transparent_bg_mode,
+                        ),
+                    })
+                }
+            }
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } if mode == BookAddMode::Grid => {
+                let original_name = crate::zip_loader::entry_basename(&entry_name).to_string();
+                let params = self.effective_params(idx).clone();
+                if params.is_color_identity() {
+                    Ok(crate::books::BookPageSource::ZipEntry {
+                        zip_path,
+                        entry_name,
+                        original_name,
+                    })
+                } else {
+                    Ok(crate::books::BookPageSource::AdjustedZipEntry {
+                        zip_path,
+                        entry_name,
+                        original_name,
+                        params,
+                        format: self.settings.capture_format,
+                        jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
+                            self.fs_transparent_bg_mode,
+                        ),
+                    })
+                }
+            }
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } if mode == BookAddMode::Grid => {
+                let params = self.effective_params(idx).clone();
+                Ok(crate::books::BookPageSource::AdjustedPdfPage {
+                    pdf_path,
+                    page_num,
+                    password: self.pdf_current_password.clone(),
+                    basename: format!("page_{:04}", page_num + 1),
+                    params,
+                    format: self.settings.capture_format,
+                    jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
+                        self.fs_transparent_bg_mode,
+                    ),
+                })
+            }
+            GridItem::Image(path) if !needs_render => {
+                let original_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "page".to_string());
+                Ok(crate::books::BookPageSource::File {
+                    src: path,
+                    original_name,
+                })
+            }
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } if !needs_render => {
+                let original_name = crate::zip_loader::entry_basename(&entry_name).to_string();
+                Ok(crate::books::BookPageSource::ZipEntry {
+                    zip_path,
+                    entry_name,
+                    original_name,
+                })
+            }
+            GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
+                self.ensure_export_erase_ready(ctx, &[idx])?;
+                self.ensure_export_local_adjust_ready(ctx, &[idx])?;
+                let job = self.prepare_capture_pixel_job(ctx, idx)?;
+                let format = self.settings.capture_format;
+                let jpeg_matte = crate::capture::JpegMatte::from_fs_transparent_bg_mode(
+                    self.fs_transparent_bg_mode,
+                );
+                Ok(crate::books::BookPageSource::Rendered {
+                    work: crate::capture::CapturePixelWork::Single(job),
+                    format,
+                    jpeg_matte,
+                })
+            }
+            _ => Err("このアイテムは本へ追加できません".to_string()),
+        }
+    }
+
+    fn book_page_needs_render_fullscreen(&mut self, idx: usize, item: &GridItem) -> bool {
+        let params_need_render = !self.effective_params(idx).is_identity();
+        matches!(item, GridItem::PdfPage { .. })
+            || params_need_render
+            || self.adjustment_page_params.contains_key(&idx)
+            || self.local_adjust_pages.contains(&idx)
+            || self.mask_pages.contains(&idx)
+            || self.conceal_pages.contains(&idx)
+            || self.comic_pages.contains(&idx)
+            || self.export_crop_pages.contains(&idx)
+            || !self.get_rotation(idx).is_none()
+            || self.ai_upscale_enabled
+            || self.ai_denoise_model.is_some()
+    }
+
+    pub(crate) fn idx_is_compiled_book_page(&self, idx: usize) -> bool {
+        let root = self.book_root_path();
+        match self.items.get(idx) {
+            Some(GridItem::Image(path)) => path
+                .parent()
+                .is_some_and(|parent| crate::books::is_direct_book_folder(&root, parent)),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn reject_compiled_book_page_edit(&mut self, idx: usize) -> bool {
+        if self.idx_is_compiled_book_page(idx) {
+            self.show_feedback_toast("本のページは編集できません".to_string());
+            true
+        } else {
+            false
+        }
+    }
+
     #[allow(dead_code)] // Legacy export variant path; final composite is used in v1.1.0 P1.
     fn capture_job_with_conceal(
         &self,
@@ -14123,6 +14430,9 @@ impl App {
         // 画像モードの B (透過背景循環) とは handle_video_input 先行 consume で分離。
         let bookmark_key = self.keymap.consume_action(ctx, KeyAction::VideoBookmark);
         let save_frame_key = self.keymap.consume_action(ctx, KeyAction::VideoCapture);
+        let add_book_key = self
+            .keymap
+            .consume_action(ctx, KeyAction::VideoAddToActiveBook);
         // Phase 5.5: S キーでタイルモード トグル (動画モード限定)。画像モードの
         // S (スライドショー) とは handle_video_input 先行 consume で分離する。
         let tile_key = self.keymap.consume_action(ctx, KeyAction::VideoTileMode);
@@ -14172,6 +14482,10 @@ impl App {
         }
         if save_frame_key {
             self.save_video_frame_to_file(ctx, fs_idx);
+            return;
+        }
+        if add_book_key {
+            self.add_current_video_frame_to_active_book(ctx, fs_idx);
             return;
         }
         if compare_x || compare_alt_c || compare_shift_c || compare_c {

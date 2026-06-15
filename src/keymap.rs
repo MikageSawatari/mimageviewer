@@ -715,6 +715,7 @@ pub enum KeyAction {
     GridRotateCcw,
     GridPin,
     GridComparePin,
+    GridAddToActiveBook,
     GridColumnCount1,
     GridColumnCount2,
     GridColumnCount3,
@@ -763,6 +764,7 @@ pub enum KeyAction {
     FsSlideshow,
     FsSpaceCheck,
     FsCapture,
+    FsAddToActiveBook,
     FsExport,
     FsCompareToggle,
     FsCompareCycle,
@@ -828,6 +830,7 @@ pub enum KeyAction {
     VideoTileMode,
     VideoBookmark,
     VideoCapture,
+    VideoAddToActiveBook,
     VideoCompareToggle,
     VideoCompareCycle,
     VideoCompareWipe,
@@ -909,6 +912,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridRotateCcw,
     KeyAction::GridPin,
     KeyAction::GridComparePin,
+    KeyAction::GridAddToActiveBook,
     KeyAction::GridColumnCount1,
     KeyAction::GridColumnCount2,
     KeyAction::GridColumnCount3,
@@ -957,6 +961,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsSlideshow,
     KeyAction::FsSpaceCheck,
     KeyAction::FsCapture,
+    KeyAction::FsAddToActiveBook,
     KeyAction::FsExport,
     KeyAction::FsCompareToggle,
     KeyAction::FsCompareCycle,
@@ -1022,6 +1027,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoTileMode,
     KeyAction::VideoBookmark,
     KeyAction::VideoCapture,
+    KeyAction::VideoAddToActiveBook,
     KeyAction::VideoCompareToggle,
     KeyAction::VideoCompareCycle,
     KeyAction::VideoCompareWipe,
@@ -1138,6 +1144,7 @@ impl KeyAction {
             GridRotateCcw => "GridRotateCcw",
             GridPin => "GridPin",
             GridComparePin => "GridComparePin",
+            GridAddToActiveBook => "GridAddToActiveBook",
             GridColumnCount1 => "GridColumnCount1",
             GridColumnCount2 => "GridColumnCount2",
             GridColumnCount3 => "GridColumnCount3",
@@ -1186,6 +1193,7 @@ impl KeyAction {
             FsSlideshow => "FsSlideshow",
             FsSpaceCheck => "FsSpaceCheck",
             FsCapture => "FsCapture",
+            FsAddToActiveBook => "FsAddToActiveBook",
             FsExport => "FsExport",
             FsCompareToggle => "FsCompareToggle",
             FsCompareCycle => "FsCompareCycle",
@@ -1251,6 +1259,7 @@ impl KeyAction {
             VideoTileMode => "VideoTileMode",
             VideoBookmark => "VideoBookmark",
             VideoCapture => "VideoCapture",
+            VideoAddToActiveBook => "VideoAddToActiveBook",
             VideoCompareToggle => "VideoCompareToggle",
             VideoCompareCycle => "VideoCompareCycle",
             VideoCompareWipe => "VideoCompareWipe",
@@ -1342,6 +1351,7 @@ impl KeyAction {
             GridRotateCcw => "選択中の画像を左に90度回転する",
             GridPin => "選択中の項目を代表サムネイルに固定または解除する",
             GridComparePin => "選択中の画像を比較スロットに固定または解除する",
+            GridAddToActiveBook => "選択中またはチェック済みのページをアクティブな本へ追加する",
             GridColumnCount1 => "サムネイル列数を1列にする",
             GridColumnCount2 => "サムネイル列数を2列にする",
             GridColumnCount3 => "サムネイル列数を3列にする",
@@ -1390,6 +1400,7 @@ impl KeyAction {
             FsSlideshow => "スライドショーの再生または停止を切り替える",
             FsSpaceCheck => "現在の画像のチェックを切り替える。スライドショー中は停止する",
             FsCapture => "現在の表示画像をキャプチャ保存する",
+            FsAddToActiveBook => "現在のページをアクティブな本へ追加する",
             FsExport => "現在の表示結果を別ファイルへ書き出す",
             FsCompareToggle => "現在の画像を比較スロットに固定または解除する",
             FsCompareCycle => "比較スロットのピン画像と現在画像を切り替えて表示する",
@@ -1455,6 +1466,7 @@ impl KeyAction {
             VideoTileMode => "動画タイルモードを切り替える",
             VideoBookmark => "現在の再生位置にブックマークを追加する",
             VideoCapture => "現在の動画フレームをキャプチャ保存する",
+            VideoAddToActiveBook => "現在の動画フレームをアクティブな本へ追加する",
             VideoCompareToggle => "動画では比較表示キーを何もしない操作として消費する",
             VideoCompareCycle => "動画では比較切り替えキーを何もしない操作として消費する",
             VideoCompareWipe => "動画ではワイプ比較キーを何もしない操作として消費する",
@@ -1539,6 +1551,7 @@ impl KeyAction {
             | GridRotateCcw
             | GridPin
             | GridComparePin
+            | GridAddToActiveBook
             | GridColumnCount1
             | GridColumnCount2
             | GridColumnCount3
@@ -1576,6 +1589,7 @@ impl KeyAction {
             | FsSlideshow
             | FsSpaceCheck
             | FsCapture
+            | FsAddToActiveBook
             | FsExport
             | FsCompareToggle
             | FsCompareCycle
@@ -1628,8 +1642,8 @@ impl KeyAction {
             VideoExternalPlayer | VideoPlayPause | VideoSeekStart | VideoVolumeUp
             | VideoVolumeDown | VideoNextFile | VideoPrevFile | VideoMute | VideoLoop
             | VideoMarkerPrev | VideoMarkerNext | VideoPin | VideoPerfOverlay | VideoTileMode
-            | VideoBookmark | VideoCapture | VideoCompareToggle | VideoCompareCycle
-            | VideoCompareWipe | VideoCompareDiff => KeyContext::FsVideo,
+            | VideoBookmark | VideoCapture | VideoAddToActiveBook | VideoCompareToggle
+            | VideoCompareCycle | VideoCompareWipe | VideoCompareDiff => KeyContext::FsVideo,
             EraseConfirm | EraseUndo | EraseDeleteShape | EraseToolSelect | EraseToolBrush
             | EraseToolLasso | EraseToolPolygon | EraseToolVLine | EraseToolHLine
             | EraseToolLine | EraseToolRect | EraseToolEllipse | ErasePaintMode
@@ -1673,6 +1687,7 @@ impl KeyAction {
             | GridRotateCcw
             | GridPin
             | GridComparePin
+            | GridAddToActiveBook
             | GridColumnCount1
             | GridColumnCount2
             | GridColumnCount3
@@ -1721,6 +1736,7 @@ impl KeyAction {
             | FsSlideshow
             | FsSpaceCheck
             | FsCapture
+            | FsAddToActiveBook
             | FsExport
             | FsCompareToggle
             | FsCompareCycle
@@ -1785,6 +1801,7 @@ impl KeyAction {
             | VideoTileMode
             | VideoBookmark
             | VideoCapture
+            | VideoAddToActiveBook
             | VideoCompareToggle
             | VideoCompareCycle
             | VideoCompareWipe
@@ -1865,6 +1882,7 @@ impl KeyAction {
             GridRotateCcw => ChordList::one(Chord::key(L)),
             GridPin => ChordList::one(Chord::key(P)),
             GridComparePin => ChordList::one(Chord::key(X)),
+            GridAddToActiveBook => ChordList::one(Chord::ctrl(B)),
             GridColumnCount1 => ChordList::one(Chord::alt(Num1)),
             GridColumnCount2 => ChordList::one(Chord::alt(Num2)),
             GridColumnCount3 => ChordList::one(Chord::alt(Num3)),
@@ -1913,6 +1931,7 @@ impl KeyAction {
             FsSlideshow => ChordList::one(Chord::key(S)),
             FsSpaceCheck => ChordList::one(Chord::key(Space)),
             FsCapture => ChordList::one(Chord::ctrl(S)),
+            FsAddToActiveBook => ChordList::one(Chord::ctrl(B)),
             FsExport => ChordList::one(Chord::ctrl(E)),
             FsCompareToggle => ChordList::one(Chord::key(X)),
             FsCompareCycle => ChordList::one(Chord::key(C)),
@@ -1978,6 +1997,7 @@ impl KeyAction {
             VideoTileMode => ChordList::one(Chord::key(S)),
             VideoBookmark => ChordList::one(Chord::key(B)),
             VideoCapture => ChordList::one(Chord::ctrl(S)),
+            VideoAddToActiveBook => ChordList::one(Chord::ctrl(B)),
             VideoCompareToggle => ChordList::one(Chord::key(X)),
             VideoCompareCycle => ChordList::one(Chord::key(C)),
             VideoCompareWipe => ChordList::one(Chord::shift(C)),

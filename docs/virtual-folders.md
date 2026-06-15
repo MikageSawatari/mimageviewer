@@ -27,6 +27,20 @@ ZIP アーカイブと PDF ドキュメントは「中身のページをフォ�
 `ZipImage/ZipDir/PdfPage` は「内側」= 仮想フォルダのリスト。`SearchContainer` は Ctrl+G 専用ビュー。
 同じリストに外側と内側が混在することはない。
 
+### 製本への追加 (v1.7.0)
+
+`Ctrl+B` / メニュー「製本 > アクティブな本に追加」は、仮想フォルダ内ページも通常ページと同じ
+「コピー型スナップショット」として扱う。
+
+- `GridItem::ZipImage`: グリッド追加で実効カラー補正が恒等なら `zip_loader::read_entry_bytes`
+  で格納 bytes をそのまま抽出し、`0001_元名.ext` 形式で本フォルダへ保存する。非恒等の
+  カラー補正を焼き込む場合だけ worker で decode + encode する。
+- `GridItem::PdfPage`: PDF ページは実ファイルとして存在しないため、表示/export と同じ画素取得経路で
+  `CapturePixelWork` を作り、設定されたキャプチャ形式でエンコード保存する。
+- 本フォルダ内のページ (`Pictures\mimageviewer\books\<本名>\NNNN_...`) は通常の
+  `GridItem::Image` として表示されるが、場所ベースで「本ページ」と判定し、タグ/★/回転/編集/
+  再製本追加を抑制する。
+
 ### ネスト ZIP のツリーナビ (v1.3.0)
 
 ネスト ZIP (ZIP 内に内側 ZIP/サブフォルダ) は、**フラット展開 + `ZipSeparator` をやめ**、
