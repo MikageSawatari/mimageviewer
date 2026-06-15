@@ -572,6 +572,25 @@ pub fn path_eq(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
+/// `resolve_openable_path_detailed` が返した「開けるパス」の実体種別。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenablePathKind {
+    Directory,
+    File,
+}
+
+/// 与えられたパスを「開けるパス」に解決した結果。
+///
+/// `requested_is_file` は、通常画像ファイルを起動引数で受け取ったときに
+/// 親フォルダを開いてそのファイルを選択するために使う。UI スレッドで
+/// `Path::is_file` を再実行しないよう、解決時点の判定をここに載せる。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenablePathResolution {
+    pub path: PathBuf,
+    pub kind: OpenablePathKind,
+    pub requested_is_file: bool,
+}
+
 /// 与えられたパスを「開けるパス」に解決する。
 ///
 /// - 通常のディレクトリならそのまま返す
@@ -585,12 +604,27 @@ pub fn path_eq(a: &Path, b: &Path) -> bool {
 /// 起動時の last_folder 復元やアドレスバー入力で、削除済み・移動済み・取り外された
 /// ドライブのパスでもクラッシュせず最も近い場所を表示するために使う。
 pub fn resolve_openable_path(path: &Path) -> Option<std::path::PathBuf> {
+    resolve_openable_path_detailed(path).map(|r| r.path)
+}
+
+/// `resolve_openable_path` の詳細版。返却 path の種別と、元リクエストが
+/// ファイルだったかを同じ filesystem stat の流れで返す。
+pub fn resolve_openable_path_detailed(path: &Path) -> Option<OpenablePathResolution> {
     // そのまま開けるか
     if path.is_dir() {
-        return Some(path.to_path_buf());
+        return Some(OpenablePathResolution {
+            path: path.to_path_buf(),
+            kind: OpenablePathKind::Directory,
+            requested_is_file: false,
+        });
     }
-    if path.is_file() && (is_virtual_folder(path) || is_convertible_archive_path(path)) {
-        return Some(path.to_path_buf());
+    let requested_is_file = path.is_file();
+    if requested_is_file && (is_virtual_folder(path) || is_convertible_archive_path(path)) {
+        return Some(OpenablePathResolution {
+            path: path.to_path_buf(),
+            kind: OpenablePathKind::File,
+            requested_is_file,
+        });
     }
 
     // 親を再帰的に遡る
@@ -600,7 +634,11 @@ pub fn resolve_openable_path(path: &Path) -> Option<std::path::PathBuf> {
             return None;
         }
         if p.is_dir() {
-            return Some(p.to_path_buf());
+            return Some(OpenablePathResolution {
+                path: p.to_path_buf(),
+                kind: OpenablePathKind::Directory,
+                requested_is_file,
+            });
         }
         current = p.parent();
     }
@@ -686,6 +724,24 @@ mod tests {
         let cbr = tmp.path().join("book.cbr");
         std::fs::write(&cbr, b"rar").unwrap();
         assert_eq!(resolve_openable_path(&cbr).as_deref(), Some(cbr.as_path()));
+
+        let detailed = resolve_openable_path_detailed(&cbr).unwrap();
+        assert_eq!(detailed.path, cbr);
+        assert_eq!(detailed.kind, OpenablePathKind::File);
+        assert!(detailed.requested_is_file);
+    }
+
+    #[test]
+    fn resolve_openable_path_detailed_marks_requested_file_parent_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let image = tmp.path().join("page.jpg");
+        std::fs::write(&image, b"jpg").unwrap();
+
+        let detailed = resolve_openable_path_detailed(&image).unwrap();
+
+        assert_eq!(detailed.path, tmp.path());
+        assert_eq!(detailed.kind, OpenablePathKind::Directory);
+        assert!(detailed.requested_is_file);
     }
 
     #[test]

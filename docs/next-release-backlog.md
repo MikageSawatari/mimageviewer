@@ -35,29 +35,16 @@
   - 低速共有や大量ノード展開で遅い scan / concurrent scan が見えた場合だけ、dispatcher / pool 方式へ寄せる。
 - 優先度: P3。
 
-## 4. 起動 / 単一インスタンス / Explorer 連携
+## 4. 補正 / AI
 
-### 4.1 startup / activation path resolve の worker 化判断
-
-- 背景: 稼働中インスタンスへ渡されたパスを開く経路で、`resolve_openable_path` が
-  `is_file` / `is_dir` / 親探索を行う。
-- 現状: perf 計装済み。遅い / 切断ネットワークパスで stall が見える場合に worker 化する。
-- 方針:
-  - perf log で `startup/open_path_resolve` を確認する。
-  - 問題が見えた場合だけ、パス解決を activation worker に逃がす。
-
----
-
-## 5. 補正 / AI
-
-### 5.1 PDF render / upload latency の保持キャッシュ検討
+### 4.1 PDF render / upload latency の保持キャッシュ検討
 
 - 背景: retained final AI は AI 完了済みピクセルを保持するが、PDF ページの初回 rasterize や GPU upload は別レイヤ。
 - 方針:
   - 実機ログで PDF rasterize / final composite / upload の内訳を確認する。
   - 体感遅延が残る場合、PDF render cache / page raster cache の保持やキャンセル方針を別タスク化する。
 
-### 5.2 legacy `adjustment_cache` の upscaled 誤判定
+### 4.2 legacy `adjustment_cache` の upscaled 誤判定
 
 - 背景: `ai_upscale_enabled` が true だと、legacy `adjustment_cache` 済み AI 結果を一律 upscaled 扱いし得る。
 - リスク: upscale が範囲外 / 失敗で denoise だけが cache を作った場合、smart sharpen が誤って skip される。
@@ -66,7 +53,7 @@
   - または final composite と同じく cache 出力寸法と source 寸法を比較する。
 - 優先度: P3 latent。
 
-### 5.3 capture 再補正経路の sharpen
+### 4.3 capture 再補正経路の sharpen
 
 - 背景: `capture.rs` の re-adjust 分岐が `effective_smart_sharpen` を経由せず raw `smart_sharpen` を適用する。
 - 現状: 本番呼び出し元なしのテスト専用 latent。
@@ -75,7 +62,7 @@
   - テスト専用として維持するなら、その旨をコメントで固定する。
 - 優先度: P3。
 
-### 5.4 local-adjust layers の入場時同期 DB 読み
+### 4.4 local-adjust layers の入場時同期 DB 読み
 
 - 背景: フルスクリーン入場初回フレームで `LocalAdjustDb::get_layers` を同期実行する。
 - 現状: フォルダ open 一括読みを避けるための意図的 tradeoff。
@@ -86,9 +73,9 @@
 
 ---
 
-## 6. リリース前確認 / 依存更新
+## 5. リリース前確認 / 依存更新
 
-### 6.1 ネイティブ依存
+### 5.1 ネイティブ依存
 
 | 対象 | 現状 / 次の確認 | 注意点 |
 | --- | --- | --- |
@@ -97,7 +84,7 @@
 | ONNX Runtime | `ort-sys` 要求 DLL と setup script の VERSION を確認 | C API バージョン一致、`+crt-static` + `load-dynamic` 維持 |
 | VST3 SDK / bridge | C++ ソース変更がなければ再ビルド不要 | 更新時は商用プラグインで実機確認 |
 
-### 6.2 Rust クレート
+### 5.2 Rust クレート
 
 - 通常の `cargo update` は互換範囲でまとめて実施する。
 - メジャー / rc 脱出は個別判断:
@@ -116,7 +103,7 @@
   - perf smoke
   - `dumpbin /dependents` で不要な VC runtime DLL が復活していないこと
 
-### 6.3 Microsoft Defender false positive follow-up
+### 5.3 Microsoft Defender false positive follow-up
 
 - v1.3.0 ZIP package の Defender 誤検知について、Microsoft analysis の結果を確認する。
 - 検出が残る場合は再パッケージングと再提出を検討する。
@@ -124,7 +111,7 @@
 
 ---
 
-## 7. 着手時に読み直す関連ドキュメント
+## 6. 着手時に読み直す関連ドキュメント
 
 | 領域 | ドキュメント |
 | --- | --- |

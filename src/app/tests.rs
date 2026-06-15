@@ -205,21 +205,33 @@ fn startup_archive_open_auto_fullscreen_follows_setting_and_file_kind() {
 
     let mut settings = crate::settings::Settings::default();
     settings.auto_fullscreen_zip_pdf = false;
-    assert!(!startup_openable_should_auto_fullscreen(&settings, &zip));
+    assert!(!startup_openable_should_auto_fullscreen(
+        &settings,
+        &zip,
+        crate::folder_tree::OpenablePathKind::File,
+    ));
 
     settings.auto_fullscreen_zip_pdf = true;
     for path in [&zip, &cbz, &pdf, &rar, &seven_z] {
         assert!(
-            startup_openable_should_auto_fullscreen(&settings, path),
+            startup_openable_should_auto_fullscreen(
+                &settings,
+                path,
+                crate::folder_tree::OpenablePathKind::File,
+            ),
             "{} should inherit the explicit archive open fullscreen setting",
             path.display()
         );
     }
-    assert!(!startup_openable_should_auto_fullscreen(&settings, &image));
-    assert!(!startup_openable_should_auto_fullscreen(&settings, &folder));
     assert!(!startup_openable_should_auto_fullscreen(
         &settings,
-        &tmp.path().join("missing.zip")
+        &image,
+        crate::folder_tree::OpenablePathKind::File,
+    ));
+    assert!(!startup_openable_should_auto_fullscreen(
+        &settings,
+        &folder,
+        crate::folder_tree::OpenablePathKind::Directory,
     ));
 }
 
@@ -937,6 +949,67 @@ mod phase_c_support {
             tmp,
             _lock: lock,
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_open_path_resolve_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+
+    #[test]
+    fn startup_open_path_resolve_shows_delayed_toast() {
+        let mut app = setup_app();
+        let (_tx, rx) = mpsc::channel();
+        app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            requested: PathBuf::from(r"\\server\offline\book.zip"),
+            source: StartupOpenPathSource::Activation,
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+            started_at: std::time::Instant::now() - std::time::Duration::from_millis(500),
+            toast_shown: false,
+        });
+
+        let ctx = egui::Context::default();
+        app.poll_startup_open_path_resolve(&ctx);
+
+        assert!(
+            app.startup_open_path_resolve_pending
+                .as_ref()
+                .is_some_and(|pending| pending.toast_shown)
+        );
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| text == "パスを確認しています…")
+        );
+    }
+
+    #[test]
+    fn startup_open_path_resolve_cancels_previous_pending() {
+        let mut app = setup_app();
+        let (_tx, rx) = mpsc::channel();
+        let old_cancel = Arc::new(AtomicBool::new(false));
+        app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            requested: PathBuf::from(r"\\server\slow\old.zip"),
+            source: StartupOpenPathSource::Activation,
+            cancel: Arc::clone(&old_cancel),
+            rx,
+            started_at: std::time::Instant::now(),
+            toast_shown: false,
+        });
+
+        let ctx = egui::Context::default();
+        let new_target = app.tmp.path().join("new-target");
+        app.start_startup_open_path_resolve(new_target, StartupOpenPathSource::Activation, &ctx);
+
+        assert!(old_cancel.load(Ordering::Relaxed));
+        assert!(app.startup_open_path_resolve_pending.is_some());
     }
 }
 

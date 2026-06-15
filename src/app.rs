@@ -257,6 +257,54 @@ impl Drop for ZipEnumeratePending {
     }
 }
 
+/// 起動引数 / 2 重起動 activation で渡されたパスをどの文脈で開くか。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartupOpenPathSource {
+    InitialStartup,
+    Activation,
+}
+
+impl StartupOpenPathSource {
+    fn perf_tag(self) -> &'static str {
+        match self {
+            Self::InitialStartup => "initial_startup",
+            Self::Activation => "activation",
+        }
+    }
+}
+
+/// `resolve_openable_path_detailed` を UI スレッド外で済ませた結果。
+pub(crate) struct StartupOpenPathResolveResult {
+    requested: PathBuf,
+    resolved: Option<crate::folder_tree::OpenablePathResolution>,
+    elapsed_ms: f64,
+}
+
+/// 起動引数 / 2 重起動 activation のパス解決 worker。
+///
+/// `Path::is_file` / `is_dir` は切断ネットワークパス等で UI を止めうるため、
+/// resolve だけ先に worker へ逃がし、完了後の実ロードだけ UI スレッドで行う。
+pub(crate) struct StartupOpenPathResolvePending {
+    requested: PathBuf,
+    source: StartupOpenPathSource,
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<StartupOpenPathResolveResult>,
+    started_at: std::time::Instant,
+    toast_shown: bool,
+}
+
+impl StartupOpenPathResolvePending {
+    fn elapsed(&self) -> std::time::Duration {
+        self.started_at.elapsed()
+    }
+}
+
+impl Drop for StartupOpenPathResolvePending {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 /// バックグラウンドで走らせる `IndexerManager::new` の状態。
 /// 起動フェーズ判定は `App::startup_init.is_some()` で行う (Loading の間だけ Some)。
 pub(crate) struct StartupInitPending {
@@ -3529,6 +3577,8 @@ pub struct App {
     /// ショートカット D&D / SendTo / CLI で指定された起動時の開く対象。
     /// `Settings` には保存せず、初回 update で通常の起動復元より優先して消費する。
     pub(crate) startup_open_path: Option<PathBuf>,
+    /// 起動引数 / 2 重起動 activation で渡されたパスを UI スレッド外で解決中。
+    pub(crate) startup_open_path_resolve_pending: Option<StartupOpenPathResolvePending>,
 
     // ── UI テーマ (v0.7.0) ──────────────────────────────────────
     /// 直近に ctx に適用した「解決後」のテーマ (Light / Dark)。
@@ -5301,6 +5351,7 @@ impl App {
             analysis_sv_cache: None,
             initialized: false,
             startup_open_path: None,
+            startup_open_path_resolve_pending: None,
             applied_ui_theme: None,
             #[cfg(windows)]
             wgpu_render_state: None,
@@ -33060,8 +33111,9 @@ impl eframe::App for App {
             }
         }
 
-        // 初回フレームで設定された開始フォルダを開く。前回フォルダ / Desktop /
-        // 指定フォルダの優先順位と fallback は known_folders::startup_folder に集約する。
+        // 初回フレームで設定された開始フォルダを開く。起動引数の explicit path は
+        // UI スレッド外で解決し、前回フォルダ / Desktop / 指定フォルダの優先順位と
+        // fallback は known_folders::startup_folder に集約する。
         if !self.initialized {
             self.initialized = true;
 
@@ -33070,30 +33122,13 @@ impl eframe::App for App {
             // テーマ / AI 利用範囲 / ZIP/PDF の開き方をまとめて確認する。
 
             if let Some(path) = self.startup_open_path.take() {
-                if !self.open_startup_path(path) {
-                    if should_start_in_drive_list(&self.settings) {
-                        self.enter_drive_list(None);
-                    } else if let Some(folder) = crate::known_folders::startup_folder(
-                        self.settings.startup_folder_mode,
-                        self.settings.last_folder.as_deref(),
-                        self.settings.startup_folder_path.as_deref(),
-                    ) {
-                        let _ = self.load_folder_or_convert_archive(folder);
-                    }
-                }
-            } else if should_start_in_drive_list(&self.settings) {
-                self.enter_drive_list(None);
-            } else if let Some(folder) = crate::known_folders::startup_folder(
-                self.settings.startup_folder_mode,
-                self.settings.last_folder.as_deref(),
-                self.settings.startup_folder_path.as_deref(),
-            ) {
-                // last_folder には変換アーカイブ (RAR/CBR/7z/LZH) の元パスが入りうるので、
-                // load_folder ではなく load_folder_or_convert_archive を通す。キャッシュが
-                // あれば open_archive_via_cache が元アーカイブを開き直し (current_folder は
-                // キャッシュ ZIP だが address/override は元アーカイブ)、無ければ変換ダイアログを
-                // 出す。通常フォルダ / ネイティブ ZIP/PDF は format=None なので load_folder に委譲され挙動不変。
-                let _ = self.load_folder_or_convert_archive(folder);
+                self.start_startup_open_path_resolve(
+                    path,
+                    StartupOpenPathSource::InitialStartup,
+                    ctx,
+                );
+            } else {
+                self.open_default_startup_target();
             }
 
             // AI ランタイムを初期化
@@ -33114,6 +33149,8 @@ impl eframe::App for App {
 
         #[cfg(windows)]
         self.poll_activation_open_paths(ctx);
+
+        self.poll_startup_open_path_resolve(ctx);
 
         self.track_window_rect(ctx);
 
