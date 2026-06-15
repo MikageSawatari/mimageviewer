@@ -290,13 +290,54 @@ where
 
 /// 深さ優先前順で次のフォルダを返す。
 /// 子があれば最初の子、なければ次の兄弟、なければ祖先の次の兄弟。
+///
+/// ただし `current` 自身やその祖先へ戻る循環 junction / ディレクトリシンボリック
+/// リンクの子には潜らない (葉として扱い、次の子 → 兄弟へ進める)。junction を
+/// フォルダ候補に含めるようにした (v1.6.x) ため、自己参照 junction に潜ると
+/// `loop\loop\…` と 1 ステップずつ無限に前進し、junction 後ろの実フォルダへ
+/// 到達できなくなる。後方 DFS (`last_descendant_dir_inner`) の visited-set ガードと
+/// 対になる前方側の循環対策。
 pub fn next_folder_dfs(current: &Path, opts: FolderTreeOptions) -> Option<PathBuf> {
-    // 1. 子フォルダがあれば最初の子へ
-    if let Some(first_child) = sorted_subdirs(current, opts).into_iter().next() {
-        return Some(first_child);
+    // 1. 子フォルダがあれば最初の (循環でない) 子へ
+    let children = sorted_subdirs(current, opts);
+    if !children.is_empty() {
+        let current_ancestor_keys = canonical_ancestor_keys(current);
+        for child in children {
+            if !directory_descent_creates_cycle(&current_ancestor_keys, &child) {
+                return Some(child);
+            }
+        }
     }
-    // 2. 子がなければ、次の兄弟または祖先の次の兄弟を探す
+    // 2. 子がない / 子がすべて循環なら、次の兄弟または祖先の次の兄弟を探す
     next_sibling_or_ancestor_sibling(current, opts)
+}
+
+/// `current` を canonicalize し、その実体パスと全祖先の正規化キーを返す。
+/// canonicalize に失敗した場合 (壊れた junction / 権限なし) は空 `Vec` を返し、
+/// 循環判定をすべて false に倒して従来の DFS 動作へフォールバックする。
+fn canonical_ancestor_keys(current: &Path) -> Vec<String> {
+    let Ok(real) = std::fs::canonicalize(current) else {
+        return Vec::new();
+    };
+    real.ancestors()
+        .map(crate::path_key::normalize_keep_drive)
+        .collect()
+}
+
+/// `child` ディレクトリへ DFS で潜ると無限ループになるか (= `child` の実体が
+/// `current` 自身またはその祖先へ戻る循環か) を判定する。`current_ancestor_keys`
+/// が空 (= current を解決できなかった) なら常に false。`child` の canonicalize に
+/// 失敗した場合 (壊れた junction / 権限なし) も安全側で false を返し、skip_limit /
+/// 深さ上限のバックストップに委ねる。
+fn directory_descent_creates_cycle(current_ancestor_keys: &[String], child: &Path) -> bool {
+    if current_ancestor_keys.is_empty() {
+        return false;
+    }
+    let Ok(child_real) = std::fs::canonicalize(child) else {
+        return false;
+    };
+    let child_key = crate::path_key::normalize_keep_drive(&child_real);
+    current_ancestor_keys.iter().any(|k| k == &child_key)
 }
 
 /// 深さ優先前順で前のフォルダを返す。
@@ -1216,6 +1257,55 @@ mod tests {
         assert!(
             prev_sibling_folder(a, FolderTreeOptions::default()).is_none(),
             "最初の兄弟 a の前は無い"
+        );
+    }
+
+    /// 自己参照 junction (`root/a_loop` → `root`) の子には潜らず、実在する次の子
+    /// (`root/z_real`) を返す。junction をフォルダ候補に含めた後の循環対策の回帰テスト。
+    /// 修正前は `a_loop\a_loop\…` と無限に前進していた。
+    #[cfg(windows)]
+    #[test]
+    fn next_folder_dfs_skips_self_referential_junction_and_descends_into_real_child() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let real = root.join("z_real");
+        let loop_link = root.join("a_loop");
+        std::fs::create_dir_all(&real).unwrap();
+        // a_loop → root (= current 自身に戻る循環)。権限が無い環境では skip。
+        if std::os::windows::fs::symlink_dir(&root, &loop_link).is_err() {
+            return;
+        }
+
+        let next = next_folder_dfs(&root, FolderTreeOptions::default()).expect("Some");
+        assert!(
+            path_eq(&next, &real),
+            "自己 junction を飛ばして実在の子 z_real へ, got {:?}",
+            next
+        );
+    }
+
+    /// 祖先へ戻る junction (`root/mid/only_loop` → `root`) が唯一の子のとき、そこへ
+    /// 潜らず `mid` の次の兄弟 (`root/other`) へ進む。祖先循環 + 兄弟フォールスルーの検証。
+    #[cfg(windows)]
+    #[test]
+    fn next_folder_dfs_skips_ancestor_junction_and_advances_to_sibling() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let mid = root.join("mid");
+        let other = root.join("other");
+        let loop_link = mid.join("only_loop");
+        std::fs::create_dir_all(&mid).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        // only_loop → root (= 祖先に戻る循環)。権限が無い環境では skip。
+        if std::os::windows::fs::symlink_dir(&root, &loop_link).is_err() {
+            return;
+        }
+
+        let next = next_folder_dfs(&mid, FolderTreeOptions::default()).expect("Some");
+        assert!(
+            path_eq(&next, &other),
+            "祖先 junction には潜らず mid の次兄弟 other へ, got {:?}",
+            next
         );
     }
 }
