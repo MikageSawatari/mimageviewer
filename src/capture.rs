@@ -74,11 +74,14 @@ pub struct CaptureConceal {
     pub preset: crate::conceal::ConcealPreset,
 }
 
+/// Pixel output job for save/copy/compare paths.
+///
+/// `source` must already be the final composite pixels for the page. The capture
+/// worker only applies output-only operations such as conceal, crop, rotation,
+/// and spread composition; it must not re-run AdjustParams / AI / final filters.
 pub struct CapturePixelJob {
     pub basename: String,
     pub source: Arc<egui::ColorImage>,
-    pub source_already_adjusted: bool,
-    pub params: crate::adjustment::AdjustParams,
     pub conceal: Option<CaptureConceal>,
     pub crop: Option<crate::export_crop::CropRect>,
     pub rotation: crate::rotation_db::Rotation,
@@ -98,24 +101,6 @@ impl CapturePixelJob {
         Self {
             basename,
             source,
-            source_already_adjusted: true,
-            params: crate::adjustment::AdjustParams::default(),
-            conceal: None,
-            crop: None,
-            rotation: crate::rotation_db::Rotation::None,
-        }
-    }
-
-    pub fn needs_adjustment(
-        basename: String,
-        source: Arc<egui::ColorImage>,
-        params: crate::adjustment::AdjustParams,
-    ) -> Self {
-        Self {
-            basename,
-            source,
-            source_already_adjusted: false,
-            params,
             conceal: None,
             crop: None,
             rotation: crate::rotation_db::Rotation::None,
@@ -332,22 +317,7 @@ pub fn save_rgba_unique_with_matte(
 }
 
 pub fn run_pixel_job(job: CapturePixelJob) -> Result<(String, u32, u32, Vec<u8>), String> {
-    let mut image = if job.source_already_adjusted {
-        job.source.as_ref().clone()
-    } else {
-        // final pipeline と同じ順: 色調 → スマートシャープ → post_filter。
-        let adjusted = crate::adjustment::apply_adjustments_fast(&job.source, &job.params);
-        let sharpened = if job.params.smart_sharpen == 0 {
-            adjusted
-        } else {
-            crate::adjustment::apply_final_smart_sharpen(&adjusted, job.params.smart_sharpen)
-        };
-        if job.params.post_filter == crate::adjustment::PostFilter::None {
-            sharpened
-        } else {
-            crate::post_filter::apply(&sharpened, job.params.post_filter)
-        }
-    };
+    let mut image = job.source.as_ref().clone();
     if let Some(conceal) = job.conceal {
         let expected = image.size[0]
             .checked_mul(image.size[1])
@@ -762,51 +732,22 @@ mod tests {
     }
 
     #[test]
-    fn run_pixel_job_applies_post_filter_on_worker_path() {
-        let src = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(10, 20, 30)]);
-        let mut params = crate::adjustment::AdjustParams::default();
-        params.post_filter = crate::adjustment::PostFilter::MonoNeutral;
-        let job = CapturePixelJob::needs_adjustment("sample".to_string(), Arc::new(src), params);
+    fn run_pixel_job_uses_final_composite_pixels_as_input() {
+        let src = egui::ColorImage::new(
+            [2, 1],
+            vec![
+                egui::Color32::from_rgb(10, 20, 30),
+                egui::Color32::from_rgb(200, 210, 220),
+            ],
+        );
+        let expected = crate::capture::color_image_to_rgba(&src);
+        let job = CapturePixelJob::already_adjusted("sample".to_string(), Arc::new(src));
 
         let (basename, width, height, rgba) = run_pixel_job(job).unwrap();
 
         assert_eq!(basename, "sample");
-        assert_eq!((width, height), (1, 1));
-        assert_eq!(rgba.len(), 4);
-        assert_eq!(rgba[0], rgba[1]);
-        assert_eq!(rgba[1], rgba[2]);
-        assert_eq!(rgba[3], 255);
-    }
-
-    #[test]
-    fn run_pixel_job_applies_smart_sharpen_on_worker_path() {
-        // 強エッジを跨ぐ 4x1。シャープ化で暗側がより暗く / 明側がより明るくなる。
-        let pixels = vec![
-            egui::Color32::from_rgb(40, 40, 40),
-            egui::Color32::from_rgb(40, 40, 40),
-            egui::Color32::from_rgb(200, 200, 200),
-            egui::Color32::from_rgb(200, 200, 200),
-        ];
-        let src = egui::ColorImage::new([4, 1], pixels);
-        let mut params = crate::adjustment::AdjustParams::default();
-        params.smart_sharpen = 100;
-        let job =
-            CapturePixelJob::needs_adjustment("sample".to_string(), Arc::new(src.clone()), params);
-
-        let (_basename, width, height, rgba) = run_pixel_job(job).unwrap();
-
-        assert_eq!((width, height), (4, 1));
-        assert!(rgba[4] < 40, "dark side of the edge must get darker");
-        assert!(rgba[8] > 200, "bright side of the edge must get brighter");
-
-        // smart_sharpen = 0 なら従来どおり無変化。
-        let job_off = CapturePixelJob::needs_adjustment(
-            "sample".to_string(),
-            Arc::new(src.clone()),
-            crate::adjustment::AdjustParams::default(),
-        );
-        let (_, _, _, rgba_off) = run_pixel_job(job_off).unwrap();
-        assert_eq!(rgba_off, crate::capture::color_image_to_rgba(&src));
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(rgba, expected);
     }
 
     #[test]

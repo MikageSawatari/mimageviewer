@@ -435,8 +435,9 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
   (色調補正と同じ扱い)。legacy `adjustment_cache` には焼き込まず、消しゴム / MI-GAN /
   補正レイヤーの入力は source 解像度の edit pipeline から取るので、シャープ結果が
   編集系の入力へ混入することはない。
-- **コピー / 書き出し**: final composite 経由 (`source_already_adjusted=true`) は自動で
-  反映。worker 側で再補正する fallback 経路 (`capture::run_pixel_job`) にも同順で実装済み。
+- **コピー / 書き出し**: `prepare_capture_pixel_job` が final composite pixels を取得して
+  `capture::run_pixel_job` へ渡すため、表示どおりに反映される。capture worker は
+  AdjustParams / AI / final filter を再実行せず、出力専用の conceal / crop / rotation のみを扱う。
 - **alpha**: unmultiplied RGBA に展開して RGB のみ強調 → 再 premultiply。透明部に
   hidden RGB を作らない (`adjustment::apply_final_smart_sharpen`)。
 - **360 パノラマ settle**: settle 再レンダリングはシャープ化を再現しないため、

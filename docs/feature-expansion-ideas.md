@@ -187,34 +187,24 @@ worker thread で実行する。
 
 ```rust
 struct CapturePixelJob {
-    idx: usize,
     basename: String,
     source: Arc<egui::ColorImage>,
-    source_already_adjusted: bool,
-    params: AdjustParams,
 }
 
 fn prepare_capture_pixel_job(&self, idx: usize) -> Result<CapturePixelJob, CaptureError> {
-    // 1. adjustment_cache があり、かつ post_filter_bypassed でないならそれを使う。
-    //    通常の全画面表示中はここでヒットし、worker は RgbaImage 変換だけで済む。
-    if !self.post_filter_bypassed {
-        if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx) {
-            return Ok(CapturePixelJob::already_adjusted(idx, pixels.clone()));
-        }
-    }
-
-    // 2. なければ ai_upscale_cache または fs_cache の CPU pixels と effective params を clone する。
-    //    worker 側で apply_adjustments_fast() + post_filter::apply() を実行する。
-    let source = self.capture_source_pixels(idx)?;
-    Ok(CapturePixelJob::needs_adjustment(idx, source, self.effective_params(idx).clone()))
+    // 表示と同じ final composite pixels を取得する。
+    // worker 側では AdjustParams / AI / final filter を再実行しない。
+    let basename = self.capture_basename_for_idx(idx)?;
+    let source = self.ensure_final_composite_pixels(idx)?;
+    Ok(CapturePixelJob::already_adjusted(basename, source))
 }
 ```
 
 これにより以下が成立する:
-- 通常表示中の Ctrl+S / クリップボードコピー: `adjustment_cache` ヒットで即時 snapshot (高速)
-- 表示が間に合っていないタイミング: worker 側で保存用に補正・ポストフィルタを実行
-- `post_filter_bypassed` 中 (消しゴム編集中 / 分析モード中) は bypass 済みの `adjustment_cache` を
-  最終出力として信用せず、元ソース + `effective_params` から保存用に再生成する
+- 通常表示中の Ctrl+S / クリップボードコピー: 表示と同じ final composite pixels を snapshot する
+- final composite が間に合っていないタイミング: 古い結果や下位画像は保存せず、完了後の再実行を促す
+- `post_filter_bypassed` 中 (消しゴム編集中 / 分析モード中) も、保存対象は表示用に確定した
+  final composite に揃える
 - Ctrl+S とクリップボードコピーで出力が完全に一致
 
 消しゴムについては「確定済みの inpaint 結果」を保存対象とする。編集中のブラシ / ラッソ /
@@ -670,15 +660,12 @@ Codex 第 1 ラウンドレビュー指摘「Alt+C 差分は WGSL custom shader 
 
 #### 静止画 / ZIP / PDF のピクセル取得
 
-- UI スレッドで `prepare_capture_pixel_job(idx)` を呼び、`Arc<ColorImage>` と `AdjustParams` を
-  clone して worker へ渡す
-- 優先順位:
-  1. `!post_filter_bypassed` かつ `adjustment_cache[idx]` がある → その CPU pixels をそのまま使う
-  2. `ai_upscale_cache[(idx, bg)]` がある → worker で `apply_adjustments_fast` + `post_filter::apply`
-  3. `fs_cache[idx]` がある → 同上
-  4. どれも無い → `source_not_ready` トースト
+- UI スレッドで `prepare_capture_pixel_job(idx)` を呼び、表示と同じ final composite
+  `Arc<ColorImage>` を worker へ渡す
+- final composite が無い場合は `source_not_ready` トースト相当で完了後の再実行を促す
 - worker では App / egui::Context / TextureHandle を触らない。`ColorImage -> RgbaImage` 変換、
-  必要なら補正・ポストフィルタ、PNG/JPEG エンコード、ファイル I/O / clipboard 書き込みだけを行う
+  conceal / crop / rotation / 見開き結合、PNG/JPEG エンコード、ファイル I/O / clipboard
+  書き込みだけを行う。AdjustParams / AI / final filter は worker 側で再実行しない
 - 見開きは左右それぞれ `CapturePixelJob` を作り、worker で結合する。結合順は現在の見開き設定
   (LTR / RTL / Cover) に従う
 - 静止画系のカメラアイコン / clipboard 経路も `prepare_capture_pixel_job(idx)` を必ず経由する。

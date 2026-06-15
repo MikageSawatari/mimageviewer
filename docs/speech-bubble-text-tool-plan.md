@@ -664,7 +664,7 @@ struct AnnotationResultKey { idx, input_gen, conceal_gen, annotation_gen }
 | 経路 | 入口 | ワーカー / 合成 | 現状の合成順 |
 | --- | --- | --- | --- |
 | Ctrl+E エクスポート | `export_page_pixels_for_idx` ([src/ui_fullscreen.rs](src/ui_fullscreen.rs)) | `ExportPagePixels` | base → conceal → crop |
-| キャプチャ保存 / クリップボード / 比較ピン | `prepare_capture_pixel_job` → `capture_job_with_conceal` ([src/ui_fullscreen.rs:8728](src/ui_fullscreen.rs)) | `CapturePixelJob` → `run_pixel_job` ([src/capture.rs:326](src/capture.rs)) | adjust → conceal → crop |
+| キャプチャ保存 / クリップボード / 比較ピン | `prepare_capture_pixel_job` → `capture_job_with_conceal` ([src/ui_fullscreen.rs](src/ui_fullscreen.rs)) | `CapturePixelJob` → `run_pixel_job` ([src/capture.rs](src/capture.rs)) | final composite → conceal → crop |
 
 `ExportPagePixels` と `CapturePixelJob` は**別構造体・別ワーカー関数**なので、注釈段を片方にだけ
 足すと「表示には吹き出しが出るのにキャプチャ保存だと消える」不一致になる。
@@ -673,16 +673,16 @@ struct AnnotationResultKey { idx, input_gen, conceal_gen, annotation_gen }
 
 - 両ジョブに `annotation_overlay: Option<RgbaOverlay>` (alpha 付き・ソース解像度) を追加。
   オーバーレイは §5 の共有ベイク経路で生成し、表示キャッシュと**同一バッファ**を使って WYSIWYG を保証。
-- `capture_job_with_conceal` ([src/ui_fullscreen.rs:8728](src/ui_fullscreen.rs)) に注釈付与を足す
+- `capture_job_with_conceal` ([src/ui_fullscreen.rs](src/ui_fullscreen.rs)) に注釈付与を足す
   (ここが capture 系の合流点。`conceal_composite_mask_for_export` の隣に
   `annotation_overlay_for_export(idx)` を並べる)。
-- `run_pixel_job` ([src/capture.rs:348](src/capture.rs)) の conceal 適用と crop 適用の**間**に
+- `run_pixel_job` ([src/capture.rs](src/capture.rs)) の conceal 適用と crop 適用の**間**に
   annotation overlay の alpha 合成を挿入。Ctrl+E ワーカーにも同じ tail を通す。
 - 注釈オーバーレイ生成は §6.1 の `annotation_page_objects.get(&idx)` を入力にする
   (capture は非編集ページでも走るため)。
 
 `prepare_capture_pixel_job` は補正レイヤー / 消しゴム補完が未反映なら Err で弾く設計
-([src/ui_fullscreen.rs:8669](src/ui_fullscreen.rs)) になっている。注釈は worker ベイクが
+([src/ui_fullscreen.rs](src/ui_fullscreen.rs)) になっている。注釈は worker ベイクが
 未完了でも「注釈抜き下地」で保存されると不一致になるので、**注釈オーバーレイが stale / 生成中の
 ときの保存可否**を要決定 (§10): (a) ベイク完了まで待つ / (b) 同期ベイクしてから保存 / (c) Err で弾く。
 

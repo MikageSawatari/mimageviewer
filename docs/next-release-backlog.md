@@ -37,16 +37,7 @@
 
 ## 4. 補正 / AI
 
-### 4.1 capture 再補正経路の sharpen
-
-- 背景: `capture.rs` の re-adjust 分岐が `effective_smart_sharpen` を経由せず raw `smart_sharpen` を適用する。
-- 現状: 本番呼び出し元なしのテスト専用 latent。
-- 方針:
-  - AI upscaled source へ接続するなら `output_is_ai_upscaled` 相当を渡す。
-  - テスト専用として維持するなら、その旨をコメントで固定する。
-- 優先度: P3。
-
-### 4.2 local-adjust layers の入場時同期 DB 読み
+### 4.1 local-adjust layers の入場時同期 DB 読み
 
 - 背景: フルスクリーン入場初回フレームで `LocalAdjustDb::get_layers` を同期実行する。
 - 現状: フォルダ open 一括読みを避けるための意図的 tradeoff。
