@@ -409,10 +409,11 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
   - デノイズのみの AI 結果 (サイズ不変) には通常どおり掛かる
   - サイズ上限 (`ai_upscale_size_limit`、長辺 x 短辺) で AI がスキップされた
     ページにも掛かる
-  - AI 未完了中の暫定合成 (complete=false、非 AI 画像) には掛かり、AI 完了時の
+  - final composite の AI 未完了中の暫定合成 (complete=false、非 AI 画像) には掛かり、AI 完了時の
     再合成で外れる (= complete フラグの再合成機構にそのまま乗る)
-  - legacy の `apply_sync_adjustment` 経路は `ai_upscale_enabled && ai_upscale_cache hit`
-    で近似 (final pipeline 側は `used_upscale` で厳密判定する)
+  - legacy の `apply_sync_adjustment` / `adjustment_cache` 経路にはスマートシャープを
+    焼き込まない。final composite 完了までの暫定表示用 cache に upscaler 実行有無の
+    判定を持ち込まず、final composite 側だけで適用する
 - **適用位置**: final pipeline の `色調補正 → final AI → スマートシャープ → post_filter`。
   AI 入力には掛けないので、強度変更で final AI は再実行されない
   (`hash_adjust_final_params` には乗るが `hash_adjust_color_ai_params` には乗せない)。
@@ -430,9 +431,10 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
   シャープ化 / post_filter のみの変更・ドラッグではサムネ補正を再生成しない。
 - **サムネイル非反映**: `is_color_identity()` には参加しないため、`thumb_adjust_tex` の
   生成判定・内容に影響しない。
-- **post_filter バイパス (消しゴム / 隠蔽 / 分析) 中も適用したまま** (色調補正と同じ扱い)。
-  消しゴム / MI-GAN / 補正レイヤーの入力は source 解像度の edit pipeline から取るので、
-  シャープ結果が編集系の入力へ混入することはない。
+- **post_filter バイパス (消しゴム / 隠蔽 / 分析) 中も final composite では適用したまま**
+  (色調補正と同じ扱い)。legacy `adjustment_cache` には焼き込まず、消しゴム / MI-GAN /
+  補正レイヤーの入力は source 解像度の edit pipeline から取るので、シャープ結果が
+  編集系の入力へ混入することはない。
 - **コピー / 書き出し**: final composite 経由 (`source_already_adjusted=true`) は自動で
   反映。worker 側で再補正する fallback 経路 (`capture::run_pixel_job`) にも同順で実装済み。
 - **alpha**: unmultiplied RGBA に展開して RGB のみ強調 → 再 premultiply。透明部に
@@ -629,7 +631,7 @@ fn clear_final_pipeline_caches_for_idx(&mut self, idx: usize)
     // final_ai_pending / final_ai_cache / final_ai_failed / final_composite_cache を idx 単位でクリア
 
 fn clear_final_stage_only_caches(&mut self, idx: usize)
-    // final composite (+ legacy adjustment_cache / comic) のみクリア、final AI は保持。
+    // final composite (+ post_filter 用 legacy adjustment_cache / comic) のみクリア、final AI は保持。
     // post_filter / smart_sharpen のような final 専用項目だけが変わったとき用
     // (clear_caches_for_param_change が differs_only_in_final_stage で振り分ける)
 

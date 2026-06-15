@@ -29894,29 +29894,22 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
         pixels: &std::sync::Arc<egui::ColorImage>,
-        source_is_upscaled_ai: bool,
     ) {
         let params = self.effective_params(idx).clone();
-        // post-filter をバイパスする場合: 色調もシャープ化も identity ならスキップ可能
+        // legacy adjustment_cache は final composite 完了までの暫定表示用。
+        // smart_sharpen は final stage 専用なのでここでは適用しない。
         let apply_pf =
             !self.post_filter_bypassed && params.post_filter != crate::adjustment::PostFilter::None;
-        let sharpen_strength = params.effective_smart_sharpen(source_is_upscaled_ai);
-        let apply_sharpen = sharpen_strength != 0;
-        if params.is_color_identity() && !apply_pf && !apply_sharpen {
+        if params.is_color_identity() && !apply_pf {
             return;
         }
         let adjusted = crate::adjustment::apply_adjustments_fast(pixels, &params);
-        // final pipeline と同じ順: 色調 → シャープ化 → post_filter (ソースが AI 由来でも
-        // AI は上流適用済みなので順序は崩れない)。
-        let sharpened = if apply_sharpen {
-            crate::adjustment::apply_final_smart_sharpen(&adjusted, sharpen_strength)
+        // final pipeline と違い、この legacy cache ではシャープ化を含めない。
+        // upscaler 実行有無を保持しない中間 cache へ final-stage 判定を持ち込まないため。
+        let post_filtered = if apply_pf {
+            crate::post_filter::apply(&adjusted, params.post_filter)
         } else {
             adjusted
-        };
-        let post_filtered = if apply_pf {
-            crate::post_filter::apply(&sharpened, params.post_filter)
-        } else {
-            sharpened
         };
         let adjusted_pixels = std::sync::Arc::new(post_filtered);
         let upload = clamp_for_gpu(&adjusted_pixels);
@@ -30001,7 +29994,7 @@ impl App {
     ///
     /// これらは final AI より後段にしか効かず、final AI の入力 (色調補正後の edit 画像)
     /// は不変なので、`final_ai_cache` / pending / failed は保持し、下流の final composite
-    /// (+ legacy adjustment_cache / comic) だけを落とす。これを `clear_adjustment_caches`
+    /// (+ post_filter 用 legacy adjustment_cache / comic) だけを落とす。これを `clear_adjustment_caches`
     /// に流すと、シャープ強度スライダーの変更や T キーのポストフィルタ循環ごとに
     /// final AI が cancel → 再実行されてしまう (Codex P1/P3 2026-06-10)。
     /// `thumb_adjust_tex` もサムネに final 専用項目が乗らないため触らない。
@@ -31842,7 +31835,7 @@ impl App {
         // 先読み分は表示に入った時点で final pipeline
         // (ensure_final_composite_texture) が処理する。
         if self.fullscreen_idx == Some(key) {
-            self.apply_sync_adjustment(ctx, key, &pixels, false);
+            self.apply_sync_adjustment(ctx, key, &pixels);
         }
         FsCacheEntry::Static {
             tex: handle,
@@ -32087,7 +32080,7 @@ impl App {
                         self.pano_quality_state.insert(source_key, state);
                     }
                     if self.fullscreen_idx == Some(key) {
-                        self.apply_sync_adjustment(ctx, key, &pixels, false);
+                        self.apply_sync_adjustment(ctx, key, &pixels);
                     }
                     FsCacheEntry::Static {
                         tex: handle,

@@ -37,23 +37,7 @@
 
 ## 4. 補正 / AI
 
-### 4.1 PDF render / upload latency の保持キャッシュ検討
-
-- 背景: retained final AI は AI 完了済みピクセルを保持するが、PDF ページの初回 rasterize や GPU upload は別レイヤ。
-- 方針:
-  - 実機ログで PDF rasterize / final composite / upload の内訳を確認する。
-  - 体感遅延が残る場合、PDF render cache / page raster cache の保持やキャンセル方針を別タスク化する。
-
-### 4.2 legacy `adjustment_cache` の upscaled 誤判定
-
-- 背景: `ai_upscale_enabled` が true だと、legacy `adjustment_cache` 済み AI 結果を一律 upscaled 扱いし得る。
-- リスク: upscale が範囲外 / 失敗で denoise だけが cache を作った場合、smart sharpen が誤って skip される。
-- 方針:
-  - legacy AI cache entry に `used_upscale` を保存する。
-  - または final composite と同じく cache 出力寸法と source 寸法を比較する。
-- 優先度: P3 latent。
-
-### 4.3 capture 再補正経路の sharpen
+### 4.1 capture 再補正経路の sharpen
 
 - 背景: `capture.rs` の re-adjust 分岐が `effective_smart_sharpen` を経由せず raw `smart_sharpen` を適用する。
 - 現状: 本番呼び出し元なしのテスト専用 latent。
@@ -62,7 +46,7 @@
   - テスト専用として維持するなら、その旨をコメントで固定する。
 - 優先度: P3。
 
-### 4.4 local-adjust layers の入場時同期 DB 読み
+### 4.2 local-adjust layers の入場時同期 DB 読み
 
 - 背景: フルスクリーン入場初回フレームで `LocalAdjustDb::get_layers` を同期実行する。
 - 現状: フォルダ open 一括読みを避けるための意図的 tradeoff。

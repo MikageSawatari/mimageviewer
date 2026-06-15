@@ -12477,6 +12477,63 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    #[test]
+    fn legacy_adjustment_cache_ignores_smart_sharpen_only_params() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/legacy-sharpen-only.jpg");
+        let source = Arc::new(egui::ColorImage::new(
+            [4, 1],
+            vec![
+                egui::Color32::from_rgb(40, 40, 40),
+                egui::Color32::from_rgb(40, 40, 40),
+                egui::Color32::from_rgb(200, 200, 200),
+                egui::Color32::from_rgb(200, 200, 200),
+            ],
+        ));
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.smart_sharpen = 100;
+        app.adjustment_page_params.insert(idx, params);
+
+        app.apply_sync_adjustment(&ctx, idx, &source);
+
+        assert!(
+            !app.adjustment_cache.contains_key(&idx),
+            "legacy adjustment_cache is only a color/post-filter bridge; smart sharpen is final-stage only"
+        );
+    }
+
+    #[test]
+    fn legacy_adjustment_cache_applies_color_without_smart_sharpen() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/legacy-color-sharpen.jpg");
+        let source = Arc::new(egui::ColorImage::new(
+            [4, 1],
+            vec![
+                egui::Color32::from_rgb(40, 40, 40),
+                egui::Color32::from_rgb(40, 40, 40),
+                egui::Color32::from_rgb(200, 200, 200),
+                egui::Color32::from_rgb(200, 200, 200),
+            ],
+        ));
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.brightness = 20.0;
+        params.smart_sharpen = 100;
+        app.adjustment_page_params.insert(idx, params.clone());
+
+        app.apply_sync_adjustment(&ctx, idx, &source);
+
+        let Some(FsCacheEntry::Static { pixels, .. }) = app.adjustment_cache.get(&idx) else {
+            panic!("color adjustment should populate legacy adjustment_cache");
+        };
+        let expected = crate::adjustment::apply_adjustments_fast(&source, &params);
+        assert_eq!(
+            pixels.pixels, expected.pixels,
+            "legacy adjustment_cache must not bake final-stage smart sharpen"
+        );
+    }
+
     /// post_filter のみの変更 (T キー循環 / パネルのコンボ変更) も差分分類で
     /// final AI cache を保持し、サムネ補正テクスチャも温存する (Codex P3 対応)。
     #[test]
