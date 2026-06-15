@@ -16,27 +16,13 @@
 
 | 優先 | 項目 | 主な場所 | 概要 |
 | --- | --- | --- | --- |
-| P2 | 変換アーカイブ cache path refresh の UI 同期 I/O 削減 | `app.rs`, `archive_cache.rs` | `ConvertibleArchive` ごとの SQLite lookup + `exists()` を UI ナビゲーション経路から外す |
 | Medium | AI upscale の render-to-target 最適化 | `src/ai/upscale.rs`, final AI pipeline | 高負荷 AI で 4x 中間バッファを丸ごと持たず、最終サイズへ縮小しながら合成する |
 
 ---
 
 ## 2. アーカイブ / 仮想フォルダ
 
-### 2.1 変換アーカイブ cache path refresh の UI 同期 I/O
-
-- 背景: `refresh_converted_archive_cache_paths` が `ConvertibleArchive` アイテムごとに
-  `archive_cache::peek` を呼び、SQLite lookup と `zip_path.exists()` を UI スレッドで行う。
-- リスク: 変換アーカイブを多数含むフォルダや低速 / ネットワークドライブでナビゲーションが詰まる。
-- 方針:
-  - scan worker またはサムネ worker 側で batch 解決する。
-  - UI では既存の解決済み状態を読むだけにする。
-  - `docs/ui-responsiveness.md` の同期 I/O チェックリストに沿って設計する。
-- 検証:
-  - 多数の RAR/7z/LZH/変換済み ZIP を含むフォルダで、フォルダ表示直後に UI が止まらないこと。
-  - 変換キャッシュの有無表示、クリック時のロード、キャッシュ削除後の再解決が従来どおり動くこと。
-
-### 2.2 変換キャッシュ downgrade の UI 不可視
+### 2.1 変換キャッシュ downgrade の UI 不可視
 
 - 背景: 将来または旧版との行き来で未知 `format` 行が `archive_cache::format_from_db` から
   `None` になり、cache manager UI に出ない。
@@ -45,7 +31,7 @@
   - 未知 format を汎用行として表示する、または意図をコメントで固定する。
   - cache manager 側で削除できる形にするなら、format 文字列の表示名を失わない。
 
-### 2.3 ZipDir サムネ queue routing の再検討
+### 2.2 ZipDir サムネ queue routing の再検討
 
 - 背景: ZipDir サムネ要求は軽量キュー扱いだが、代表解決で ZIP 列挙が走る場合がある。
 - 現状: `zipdir_resolve` 系の perf ログがある前提で、実測を見て振り分け本体を判断する。

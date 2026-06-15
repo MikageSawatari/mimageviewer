@@ -6132,6 +6132,70 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn install_new_items_resolves_converted_archive_cache_paths_async() {
+        use crate::grid_item::GridItem;
+        use std::io::Write;
+
+        let mut app = setup_app();
+        let src = app.tmp.path().join("book.7z");
+        let cached = app.tmp.path().join("book.zip");
+        std::fs::File::create(&src)
+            .unwrap()
+            .write_all(b"archive")
+            .unwrap();
+        std::fs::File::create(&cached)
+            .unwrap()
+            .write_all(b"PK\x03\x04")
+            .unwrap();
+
+        let src_meta = std::fs::metadata(&src).unwrap();
+        let src_mtime = crate::ui_helpers::mtime_secs(&src_meta);
+        let src_size = src_meta.len() as i64;
+        let cached_size = std::fs::metadata(&cached).unwrap().len() as i64;
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &src,
+                src_mtime,
+                src_size,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &cached,
+                cached_size,
+                1,
+                false,
+            )
+            .unwrap();
+
+        app.install_new_items(
+            vec![GridItem::ConvertibleArchive {
+                path: src.clone(),
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            }],
+            vec![Some((src_mtime, src_size))],
+        );
+
+        let key = crate::path_key::normalize_keep_drive(&src);
+        assert!(
+            app.converted_archive_cache_paths.is_empty(),
+            "install_new_items must not synchronously peek archive_cache.db"
+        );
+        assert!(app.converted_archive_cache_paths_pending.is_some());
+
+        let ctx = egui::Context::default();
+        for _ in 0..50 {
+            app.poll_converted_archive_cache_paths(&ctx);
+            if app.converted_archive_cache_paths_pending.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(app.converted_archive_cache_paths_pending.is_none());
+        assert_eq!(app.converted_archive_cache_paths.get(&key), Some(&cached));
+    }
+
+    #[test]
     fn convertible_archive_pin_uses_cached_zip_entry_thumb_request() {
         use crate::folder_thumb_pins::FolderPinSource;
         use crate::grid_item::GridItem;

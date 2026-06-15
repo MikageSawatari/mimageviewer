@@ -214,9 +214,8 @@ impl ArchiveCacheDb {
     /// [`Self::lookup`] の読み取り専用版。`last_access_at` を更新せず、無効エントリの
     /// 掃除もしない (SELECT + `exists()` のみ、書き込みトランザクションなし)。
     ///
-    /// 用途: フォルダ一覧の `ConvertibleArchive` サムネ用一括参照
-    /// (`refresh_converted_archive_cache_paths`)。フォルダを**表示しただけ**で中の
-    /// 全アーカイブに UPDATE を発行して UI スレッドを書き込みで塞がない / LRU prune の
+    /// 用途: フォルダ一覧の `ConvertibleArchive` サムネ用 cache path 解決 worker。
+    /// フォルダを**表示しただけ**で中の全アーカイブに UPDATE を発行しない / LRU prune の
     /// 「最終アクセス」を閲覧していないアーカイブで汚さないため。実際に開く経路
     /// (`try_archive_cache_lookup`) は従来どおり `lookup` を使い、access 時刻を更新する。
     pub fn peek(&self, src_path: &Path, src_mtime: i64, src_size: i64) -> Option<PathBuf> {

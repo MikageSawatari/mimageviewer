@@ -934,6 +934,35 @@ pub(crate) struct FolderPaneOpenPending {
     rx: mpsc::Receiver<ScannedDir>,
 }
 
+/// 親フォルダ上の `ConvertibleArchive` タイル用に、変換済み cache ZIP の対応表を
+/// UI スレッド外で解決している状態。
+pub(crate) struct ConvertedArchiveCachePathsPending {
+    /// 起動時の items 世代。完了時に変わっていれば結果を捨てる。
+    generation: u64,
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<ConvertedArchiveCachePathsResult>,
+}
+
+impl ConvertedArchiveCachePathsPending {
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ConvertedArchiveCachePathsPending {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+struct ConvertedArchiveCachePathsResult {
+    paths: std::collections::HashMap<String, PathBuf>,
+    peeked: usize,
+    hits: usize,
+    elapsed_ms: f64,
+    input_seq: u64,
+}
+
 /// `poll_folder_nav` がワーカー完了を検知したときに返す情報。
 pub(crate) struct FolderNavResult {
     /// DFS が見つけた次フォルダ (None なら DFS が尽きた)。
@@ -3140,6 +3169,8 @@ pub struct App {
     /// 親フォルダ上の `ConvertibleArchive` タイルはこの ZIP の先頭画像 / ピン画像を
     /// `archivethumb:` キーで表示する。
     pub(crate) converted_archive_cache_paths: std::collections::HashMap<String, PathBuf>,
+    /// `converted_archive_cache_paths` を UI スレッド外で構築している worker。
+    pub(crate) converted_archive_cache_paths_pending: Option<ConvertedArchiveCachePathsPending>,
     /// 親コンテナのピン書き換えがあったので、次の機会にフォルダを再ロードして
     /// グリッドサムネに反映する必要があるフラグ (`video_thumb_overrides_dirty` と同じ作法)。
     pub(crate) folder_thumb_pin_dirty: bool,
@@ -5139,6 +5170,7 @@ impl App {
             folder_thumb_pin_db,
             folder_pin_map: std::collections::HashMap::new(),
             converted_archive_cache_paths: std::collections::HashMap::new(),
+            converted_archive_cache_paths_pending: None,
             folder_thumb_pin_dirty: false,
             #[cfg(windows)]
             video_tile_mode_active: false,
@@ -11677,58 +11709,125 @@ impl App {
         // 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) のピン情報を 1 度の lookup_many で取得し、
         // make_load_request からの per-frame DB ヒットを回避する。pin がレアケースで
         // 大半は empty なので、典型的なフォルダで HashMap は数百 bytes に収まる。
-        self.refresh_converted_archive_cache_paths();
+        self.start_converted_archive_cache_paths_refresh();
         self.refresh_folder_pin_map();
     }
 
     /// 現在 items の `ConvertibleArchive` について、有効な変換キャッシュ ZIP を
     /// `make_load_request` から同期参照できる map にまとめる。
     ///
-    /// lookup は `install_new_items` 時に 1 回だけ行う。スクロール中 / 毎フレームの
-    /// サムネ要求で archive_cache.db を叩かないための小さなキャッシュ。
-    fn refresh_converted_archive_cache_paths(&mut self) {
+    /// SQLite `peek` と cache ZIP の `exists()` は worker で行い、UI スレッドは
+    /// 現在の items から `(path, mtime, size)` を snapshot するだけにする。スクロール中 /
+    /// 毎フレームのサムネ要求で archive_cache.db を叩かないための小さなキャッシュ。
+    fn start_converted_archive_cache_paths_refresh(&mut self) {
+        if let Some(pending) = self.converted_archive_cache_paths_pending.take() {
+            pending.cancel();
+        }
         self.converted_archive_cache_paths.clear();
-        let Some(db) = self.archive_cache_db.as_ref() else {
+        let Some(db) = self.archive_cache_db.clone() else {
             return;
         };
-        // UI スレッドで per-archive の SQLite peek + cache ZIP の `exists()` を回す
-        // (install_new_items 時に 1 回)。ローカルディスクなら軽いが、変換アーカイブが
-        // 多数あるフォルダでは累積し得るので perf 計装する (docs/ui-responsiveness.md §4)。
-        let t0 = crate::perf::is_enabled().then(std::time::Instant::now);
-        let mut peeked = 0usize;
-        let mut hits = 0usize;
-        for (idx, item) in self.items.iter().enumerate() {
-            let GridItem::ConvertibleArchive { path, .. } = item else {
-                continue;
-            };
-            let Some((mtime, file_size)) = self.image_metas.get(idx).and_then(|m| *m) else {
-                continue;
-            };
-            peeked += 1;
-            // peek = 読み取り専用 lookup。フォルダを表示しただけで全アーカイブに
-            // last_access UPDATE (書き込みトランザクション) を発行しない (Codex R3 P3)。
-            if let Some(cached_zip) = db.peek(path, mtime, file_size) {
-                hits += 1;
-                self.converted_archive_cache_paths
-                    .insert(crate::path_key::normalize_keep_drive(path), cached_zip);
+        let inputs: Vec<(PathBuf, i64, i64)> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| {
+                let GridItem::ConvertibleArchive { path, .. } = item else {
+                    return None;
+                };
+                let (mtime, file_size) = self.image_metas.get(idx).and_then(|m| *m)?;
+                Some((path.clone(), mtime, file_size))
+            })
+            .collect();
+        if inputs.is_empty() {
+            return;
+        }
+
+        let generation = self.items_generation;
+        let input_seq = self.input_seq;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("archive-cache-peek".to_string())
+            .spawn(move || {
+                let t0 = std::time::Instant::now();
+                let mut paths = std::collections::HashMap::new();
+                let mut peeked = 0usize;
+                let mut hits = 0usize;
+                for (path, mtime, file_size) in inputs {
+                    if worker_cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    peeked += 1;
+                    // peek = 読み取り専用 lookup。フォルダを表示しただけで全アーカイブに
+                    // last_access UPDATE (書き込みトランザクション) を発行しない。
+                    if let Some(cached_zip) = db.peek(&path, mtime, file_size) {
+                        if worker_cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        hits += 1;
+                        paths.insert(crate::path_key::normalize_keep_drive(&path), cached_zip);
+                    }
+                }
+                if !worker_cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(ConvertedArchiveCachePathsResult {
+                        paths,
+                        peeked,
+                        hits,
+                        elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+                        input_seq,
+                    });
+                }
+            });
+        match spawn_result {
+            Ok(_) => {
+                self.converted_archive_cache_paths_pending =
+                    Some(ConvertedArchiveCachePathsPending {
+                        generation,
+                        cancel,
+                        rx,
+                    });
+            }
+            Err(e) => {
+                crate::logger::log(format!("archive_cache_peek spawn failed: {e}"));
             }
         }
-        if let Some(t0) = t0 {
+    }
+
+    fn poll_converted_archive_cache_paths(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.converted_archive_cache_paths_pending.as_ref() else {
+            return;
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.converted_archive_cache_paths_pending = None;
+                return;
+            }
+        };
+        let generation = pending.generation;
+        self.converted_archive_cache_paths_pending = None;
+        if generation != self.items_generation {
+            return;
+        }
+        if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
                 "archive_cache_peek",
                 None,
-                self.input_seq,
+                result.input_seq,
                 &[
-                    (
-                        "ms",
-                        serde_json::Value::from(t0.elapsed().as_secs_f64() * 1000.0),
-                    ),
-                    ("peeked", serde_json::Value::from(peeked)),
-                    ("hits", serde_json::Value::from(hits)),
+                    ("ms", serde_json::Value::from(result.elapsed_ms)),
+                    ("peeked", serde_json::Value::from(result.peeked)),
+                    ("hits", serde_json::Value::from(result.hits)),
+                    ("async", serde_json::Value::from(true)),
                 ],
             );
         }
+        self.converted_archive_cache_paths = result.paths;
+        ctx.request_repaint();
     }
 
     /// Phase C: フォルダピンの source が Video のときに、`video_pins` DB の WebP を
@@ -33011,6 +33110,7 @@ impl eframe::App for App {
         }
         self.poll_cache_maint_pending();
         self.poll_archive_cache_maint_pending();
+        self.poll_converted_archive_cache_paths(ctx);
         self.ensure_folder_rating_counter();
         self.poll_folder_rating_counts();
         // Ctrl+G (docs §10.4): debounce 後に spawn、streaming 受信 → items 更新
@@ -33049,6 +33149,7 @@ impl eframe::App for App {
                 .is_some_and(|p| p.is_busy())
             || self.tag_legacy_seed_pending.is_some()
             || self.tag_legacy_xmp_pending.is_some()
+            || self.converted_archive_cache_paths_pending.is_some()
             || (self.folder_rating_counter_handle.is_some() && !self.folder_rating_counts_loaded)
         {
             ctx.request_repaint();

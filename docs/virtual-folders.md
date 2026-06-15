@@ -278,6 +278,12 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 | ZipDir | Some(representative) または None (`ZipDirRepresentative`) | None | `zipdir:{dir_prefix}` | 通常は部分木代表 entry を直接読む。ZipDir source pin は `zip_dir_prefix` を worker に渡し、同じ sort で部分木代表を選び直す |
 | PdfPage | None | Some(page) | `pdf_page_cache_key(page)` | PDF ワーカーでそのページをレンダリング |
 
+`ConvertibleArchive` の cache ZIP 対応表 (`App.converted_archive_cache_paths`) は
+`install_new_items` で現在 items から path/mtime/size だけを snapshot し、SQLite `peek` と
+cache ZIP の `exists()` は `ConvertedArchiveCachePathsPending` worker で解決する。worker 完了前は
+`make_load_request` が `None` を返し、サムネは Pending のまま次の repaint で再試行される。
+この経路で `make_load_request` から `archive_cache.db` やファイルシステムを直接触らないこと。
+
 **キャッシュキーの命名規則**を勝手に変えないこと。Folder 自動代表は選定
 アルゴリズム世代を明示して、意図したロジック変更時だけ既存キャッシュを外す。
 
