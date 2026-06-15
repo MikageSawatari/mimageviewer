@@ -139,6 +139,7 @@ pub fn scan(
     // 1. FS を walk して候補を集める
     let mut fs_map = std::collections::HashMap::<String, CandidateFile>::new();
     let mut diag = ScanDiag::default();
+    let mut visited = std::collections::HashSet::new();
     walk_dir_recursive(
         &root,
         io_sem,
@@ -149,6 +150,7 @@ pub fn scan(
         &mut fs_map,
         &mut diag,
         0,
+        &mut visited,
     )?;
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
@@ -206,11 +208,15 @@ fn walk_dir_recursive(
     out: &mut std::collections::HashMap<String, CandidateFile>,
     diag: &mut ScanDiag,
     depth: u32,
+    visited: &mut std::collections::HashSet<String>,
 ) -> Result<(), String> {
     // 安全策: シンボリックループ対策 (深さ制限)。通常フォルダは 20 階層あれば十分
     const MAX_DEPTH: u32 = 40;
     if depth > MAX_DEPTH {
         diag.depth_limit_hits += 1;
+        return Ok(());
+    }
+    if !crate::fs_entry::mark_directory_visited(dir, visited) {
         return Ok(());
     }
 
@@ -257,12 +263,13 @@ fn walk_dir_recursive(
             continue;
         }
 
-        if file_type.is_dir() {
+        let entry_kind = crate::fs_entry::classify_dir_entry(&entry, &file_type);
+        if entry_kind.is_directory() {
             subdirs.push(path);
             continue;
         }
-        if !file_type.is_file() {
-            continue; // symlink, device 等はスキップ
+        if !entry_kind.is_file() {
+            continue; // device 等はスキップ
         }
 
         let ext = path
@@ -347,6 +354,7 @@ fn walk_dir_recursive(
             out,
             diag,
             depth + 1,
+            visited,
         )?;
     }
     Ok(())
@@ -555,6 +563,34 @@ mod tests {
         let r = scan_sync(fav, &root, &db);
         assert_eq!(r.total_scanned, 2);
         assert_eq!(r.to_ingest.len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_symlink_subtree_is_scanned_once_without_looping() {
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        make_file(&outside, "linked.jpg", b"1");
+        if std::os::windows::fs::symlink_dir(&outside, root.join("link")).is_err() {
+            return;
+        }
+        if std::os::windows::fs::symlink_dir(&root, root.join("loop")).is_err() {
+            return;
+        }
+
+        let r = scan_sync(fav, &root, &db);
+        assert_eq!(r.total_scanned, 1);
+        assert_eq!(r.to_ingest.len(), 1);
+        assert!(
+            r.to_ingest[0].abs_path.ends_with("link\\linked.jpg")
+                || r.to_ingest[0].abs_path.ends_with("link/linked.jpg"),
+            "linked image should be indexed through the symlink path: {:?}",
+            r.to_ingest[0].abs_path
+        );
     }
 
     #[test]

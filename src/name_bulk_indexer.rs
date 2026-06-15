@@ -305,7 +305,7 @@ pub fn collect_index_entries(
                 continue;
             }
         };
-        let Some(kind) = classify_name_index_kind(&p, &ft) else {
+        let Some(kind) = classify_name_index_kind(&p, &entry, &ft) else {
             continue;
         };
         let name = p
@@ -328,12 +328,14 @@ pub fn collect_index_entries(
 /// `entry.file_type()` 経由で判定する経路に寄せる)。
 pub fn classify_name_index_kind(
     path: &std::path::Path,
+    entry: &std::fs::DirEntry,
     file_type: &std::fs::FileType,
 ) -> Option<IndexKind> {
-    if file_type.is_dir() {
+    let kind = crate::fs_entry::classify_dir_entry(entry, file_type);
+    if kind.is_directory() {
         return Some(IndexKind::Folder);
     }
-    if !file_type.is_file() {
+    if !kind.is_file() {
         return None;
     }
     let ext = path.extension().and_then(|e| e.to_str())?;

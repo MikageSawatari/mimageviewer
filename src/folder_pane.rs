@@ -613,7 +613,7 @@ pub(crate) fn scan_real_subfolders(
             Ok(file_type) => file_type,
             Err(_) => continue,
         };
-        if !file_type.is_dir() {
+        if !crate::fs_entry::classify_dir_entry(&entry, &file_type).is_directory() {
             continue;
         }
         let mtime = if use_mtime {
@@ -864,5 +864,21 @@ mod tests {
         let dirs = scan_real_subfolders(tmp.path(), SortOrder::FileName, None).unwrap();
         let labels: Vec<_> = dirs.iter().map(|path| folder_label(path)).collect();
         assert_eq!(labels, vec!["a", "b"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scan_real_subfolders_includes_windows_directory_symlink() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let target = tmp.path().join("target");
+        let link = tmp.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        if std::os::windows::fs::symlink_dir(&target, &link).is_err() {
+            return;
+        }
+
+        let dirs = scan_real_subfolders(tmp.path(), SortOrder::FileName, None).unwrap();
+        let labels: Vec<_> = dirs.iter().map(|path| folder_label(path)).collect();
+        assert_eq!(labels, vec!["link", "target"]);
     }
 }

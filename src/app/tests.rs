@@ -63,6 +63,52 @@ fn scan_media_names(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
+fn scan_folder_names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = scan_directory(dir)
+        .folders
+        .into_iter()
+        .filter_map(|(item, _)| {
+            if let GridItem::Folder(path) = item {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[cfg(windows)]
+#[test]
+fn scan_directory_lists_windows_directory_symlink_and_file_symlink() {
+    let tmp = TempDir::new().expect("tempdir");
+    let target_dir = tmp.path().join("target-dir");
+    let link_dir = tmp.path().join("link-dir");
+    std::fs::create_dir(&target_dir).unwrap();
+    if std::os::windows::fs::symlink_dir(&target_dir, &link_dir).is_err() {
+        return;
+    }
+    assert_eq!(
+        scan_folder_names(tmp.path()),
+        vec!["link-dir", "target-dir"]
+    );
+
+    let target_image = tmp.path().join("target.jpg");
+    let link_image = tmp.path().join("link-image.jpg");
+    std::fs::write(&target_image, b"image").unwrap();
+    if std::os::windows::fs::symlink_file(&target_image, &link_image).is_err() {
+        return;
+    }
+
+    assert_eq!(
+        scan_media_names(tmp.path()),
+        vec!["link-image.jpg", "target.jpg"]
+    );
+}
+
 #[test]
 fn scan_directory_hides_source_when_upscaled_derivative_sidecar_exists() {
     let tmp = TempDir::new().expect("tempdir");

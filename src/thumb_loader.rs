@@ -1915,10 +1915,11 @@ fn resolve_folder_thumb_image_inner(
             continue;
         };
         let p = entry.path();
-        if ft.is_dir() {
+        let kind = crate::fs_entry::classify_dir_entry(&entry, &ft);
+        if kind.is_directory() {
             let mtime = mtime_for_sort(&entry, sort);
             subdirs.push((p, mtime));
-        } else if ft.is_file() {
+        } else if kind.is_file() {
             if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                 if crate::folder_tree::is_recognized_image_ext(&ext.to_ascii_lowercase()) {
                     let mtime = mtime_for_sort(&entry, sort);

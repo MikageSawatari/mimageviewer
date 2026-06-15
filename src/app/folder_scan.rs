@@ -37,10 +37,13 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     for entry in entries.flatten() {
         // file_type() は FindFirstFile のキャッシュ読み (syscall なし)。
         // metadata() も同様にキャッシュから返るが、失敗しても fallback 0 で続行する。
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let kind = entry
+            .file_type()
+            .map(|ft| crate::fs_entry::classify_dir_entry(&entry, &ft))
+            .unwrap_or(crate::fs_entry::DirEntryKind::Other);
         entry_file_names_ci.insert(entry.file_name().to_string_lossy().to_lowercase());
         let p = entry.path();
-        if is_dir {
+        if kind.is_directory() {
             if crate::video::upscale::paths::has_work_dir_suffix(&p) {
                 continue;
             }
@@ -51,7 +54,9 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
             folders.push((GridItem::Folder(p), Some((mtime, 0))));
         } else if crate::folder_tree::is_apple_double(&p) {
             // macOS/iPhone AppleDouble メタデータ - スキップ
-        } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+        } else if kind.is_file()
+            && let Some(ext) = p.extension().and_then(|e| e.to_str())
+        {
             let ext_lower = ext.to_ascii_lowercase();
             let meta = entry.metadata().ok();
             let mtime = meta

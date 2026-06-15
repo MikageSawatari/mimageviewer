@@ -24,7 +24,7 @@
 | --- | --- |
 | [spec.md](spec.md) | アプリ全体の仕様書 (設定項目・機能一覧) |
 | [feature-expansion-ideas.md](feature-expansion-ideas.md) | v0.10 候補 3 機能 (キャプチャ保存 / 比較ビュー / 動画連続再生) + スクロールバー視認性改善 の詳細仕様。Codex 第 2 ラウンドレビュー反映済、実装状況と設計メモを併記 |
-| [next-release-backlog.md](next-release-backlog.md) | **次リリース検討バックログ (post-v1.3.0)**。v1.3.0 レビューで見送った P3/防御的項目 (検索/AIメタ・ネスト ZIP・フォルダツリーペイン・単一インスタンス・補正) と、しばらく未実施の依存ライブラリ更新 (PDFium / ONNX Runtime / FFmpeg / VST3 SDK / Rust クレート) を恒久管理 |
+| [next-release-backlog.md](next-release-backlog.md) | **次リリース検討バックログ**。未対応の P2/P3・要判断項目、ユーザー要望、依存ライブラリ更新、リリース前確認だけを恒久管理。完了した項目はこのファイルから削除する |
 | [detached-viewer-implementation-plan.md](detached-viewer-implementation-plan.md) | 画像・動画を共通の別ウィンドウビューアとして扱う設計・実装メモ。F12 別ウィンドウモード、別ウィンドウ中 F11 無効、×/Esc/Enter/右クリックで session close、メイン一覧カーソルとの双方向同期、動画 native presenter の `NativeVideoPlacement::DetachedViewerChild` 化、close-to-tray 時の再生継続、ClaudeCode レビュー反映メモを整理 |
 | [details-view-and-filter-plan.md](details-view-and-filter-plan.md) | **Ph1〜Ph4 + Ph5 画像/動画/作成日時遅延列まで実装済み**。ファイル選択画面の詳細表示モード (サムネ無しで名前/サイズ/日付＋★/タグ/編集フラグを行表示) ＋ Excel オートフィルタ風スマートフィルタの設計。現状は列セクションの詳細切替、右クリック列表示メニュー、`details_order` による列ヘッダ 3 トグルソート、種類/拡張子/★/タグ/日付/サイズ/状態の共通 `FacetFilter`、遅延列 worker / 進捗表示、作成日時列、画像解像度列、動画長さ/解像度/コーデック列まで実装済み。EXIF/PDF/アーカイブ系の追加遅延列は後続 |
 | [shell-file-operations-context-menu-plan.md](shell-file-operations-context-menu-plan.md) | **一部実装済み**。Windows Shell の `IFileOperation` とネイティブ右クリックメニューへ寄せるファイル整理機能の実装計画。A/B クイックフォルダと実ファイル/実フォルダの Shell 標準右クリックメニューは実装済み。標準の上書き確認・進捗 UI、仮想 ZIP/PDF アイテム向けの native custom menu は後続 |

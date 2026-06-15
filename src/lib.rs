@@ -56,6 +56,7 @@ pub mod folder_rating_counter;
 pub mod folder_thumb_pins;
 pub mod folder_tree;
 pub mod font_assets;
+pub mod fs_entry;
 pub mod fts_index;
 pub mod fts_meta;
 pub mod fts_writer_dispatcher;

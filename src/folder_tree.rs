@@ -7,6 +7,7 @@
 //!
 //! ZIP ファイルもフォルダの一種としてナビゲーション対象に含める (タスク 3)。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -348,9 +349,23 @@ fn next_sibling_or_ancestor_sibling(path: &Path, opts: FolderTreeOptions) -> Opt
 
 /// path の最も深い最後の子孫フォルダを返す（子がなければ path 自身）。
 fn last_descendant_dir(path: &Path, opts: FolderTreeOptions) -> PathBuf {
+    let mut visited = HashSet::new();
+    last_descendant_dir_inner(path, opts, 0, &mut visited)
+}
+
+fn last_descendant_dir_inner(
+    path: &Path,
+    opts: FolderTreeOptions,
+    depth: u32,
+    visited: &mut HashSet<String>,
+) -> PathBuf {
+    const MAX_DESCEND_DEPTH: u32 = 64;
+    if depth >= MAX_DESCEND_DEPTH || !crate::fs_entry::mark_directory_visited(path, visited) {
+        return path.to_path_buf();
+    }
     let children = sorted_subdirs(path, opts);
     match children.last() {
-        Some(last) => last_descendant_dir(last, opts),
+        Some(last) => last_descendant_dir_inner(last, opts, depth + 1, visited),
         None => path.to_path_buf(),
     }
 }
@@ -384,7 +399,35 @@ pub fn walk_dirs_recursive_with_progress(
     on_error: &mut dyn FnMut(&Path, &std::io::Error),
     yield_check: Option<&crate::activity_gate::ActivityGate>,
 ) {
+    let mut visited = HashSet::new();
+    walk_dirs_recursive_with_progress_inner(
+        path,
+        out,
+        cancel,
+        on_visit,
+        on_error,
+        yield_check,
+        0,
+        &mut visited,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_dirs_recursive_with_progress_inner(
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+    cancel: &AtomicBool,
+    on_visit: &mut dyn FnMut(&Path),
+    on_error: &mut dyn FnMut(&Path, &std::io::Error),
+    yield_check: Option<&crate::activity_gate::ActivityGate>,
+    depth: u32,
+    visited: &mut HashSet<String>,
+) {
+    const MAX_WALK_DEPTH: u32 = 64;
     if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    if depth > MAX_WALK_DEPTH || !crate::fs_entry::mark_directory_visited(path, visited) {
         return;
     }
     if !path.is_dir() {
@@ -417,15 +460,20 @@ pub fn walk_dirs_recursive_with_progress(
                 }
                 processed += 1;
                 // file_type() で GetFileAttributes syscall を避ける (scan_directory と同様)
-                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                let is_dir = entry
+                    .file_type()
+                    .map(|ft| crate::fs_entry::classify_dir_entry(&entry, &ft).is_directory())
+                    .unwrap_or(false);
                 if is_dir {
-                    walk_dirs_recursive_with_progress(
+                    walk_dirs_recursive_with_progress_inner(
                         &entry.path(),
                         out,
                         cancel,
                         on_visit,
                         on_error,
                         yield_check,
+                        depth + 1,
+                        visited,
                     );
                 }
             }
@@ -480,12 +528,13 @@ pub fn sorted_subdirs(path: &Path, opts: FolderTreeOptions) -> Vec<PathBuf> {
             } else {
                 0
             };
-            if ft.is_dir() {
+            let kind = crate::fs_entry::classify_dir_entry(&e, &ft);
+            if kind.is_directory() {
                 if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
                     real_folder_names.insert(name.to_lowercase());
                 }
                 dirs.push((p, mtime));
-            } else if ft.is_file() && is_folder_nav_file_candidate(&p) {
+            } else if kind.is_file() && is_folder_nav_file_candidate(&p) {
                 container_candidates.push((p, mtime));
             }
         }
@@ -673,6 +722,26 @@ mod tests {
             !names.iter().any(|n| n == "c.part02.rar"),
             "non-first split RAR parts must not become separate Ctrl+↑↓ targets: {names:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sorted_subdirs_includes_windows_directory_symlink() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::create_dir(&target).unwrap();
+        if std::os::windows::fs::symlink_dir(&target, &link).is_err() {
+            return;
+        }
+
+        let names: Vec<_> = sorted_subdirs(root, FolderTreeOptions::default())
+            .into_iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+
+        assert_eq!(names, vec!["link", "target"]);
     }
 
     #[test]
