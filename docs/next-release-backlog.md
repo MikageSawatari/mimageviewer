@@ -78,12 +78,6 @@
   - perf smoke
   - `dumpbin /dependents` で不要な VC runtime DLL が復活していないこと
 
-### 5.3 Microsoft Defender false positive follow-up
-
-- v1.3.0 ZIP package の Defender 誤検知について、Microsoft analysis の結果を確認する。
-- 検出が残る場合は再パッケージングと再提出を検討する。
-- 確認結果は必要に応じてリリースノートやユーザー返信へ反映する。
-
 ---
 
 ## 6. 着手時に読み直す関連ドキュメント
