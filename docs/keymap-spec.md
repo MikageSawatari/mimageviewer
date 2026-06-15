@@ -91,7 +91,7 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | <kbd>Backspace</kbd> | フルスクリーンを 1 段閉じてグリッドビューへ戻る。ZIP/PDF/変換アーカイブ内のページでは、そのコンテナのページ一覧 (L2) を表示 (= Esc/Enter の「L1 へ直帰」と対をなす) |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。同じ親の直下だけを対象にし、移動先に image-like があればフルスクリーンを維持して先頭 image-like を開く。なければ一覧へ戻る |
 | マウスホイール | 前 / 次のファイル。縦/横連結モードでは連結方向へスクロール |
-| マウス左クリック | (画像) ページめくり / (動画) 再生・一時停止トグル |
+| マウス左クリック | (画像) ページめくり。LTR では右半分クリックで次 / 左半分クリックで前、RTL では左半分クリックで次 / 右半分クリックで前 / (動画) 再生・一時停止トグル |
 | <kbd>F1</kbd>〜<kbd>F5</kbd> / <kbd>F6</kbd> | 表示中アイテムへレーティング 1〜5 / 解除 |
 | <kbd>Shift</kbd>+<kbd>F1</kbd>〜<kbd>F5</kbd> / <kbd>Shift</kbd>+<kbd>F6</kbd> | 現在のコンテナへレーティング 1〜5 / 解除 |
 | <kbd>F11</kbd> | ウィンドウ内表示 ⇔ 全画面表示 を切り替え (右上 × の左のトグルボタンと同等)。静止画は egui 経路 (`toggle_still_window_mode` = 設定 flip のみ)、動画は native presenter 経路 (`toggle_video_window_mode` = presenter rebuild)。消しゴムモード中、および別ウィンドウ表示中は無効化 (ホバーバーのトグルボタンも非表示) |

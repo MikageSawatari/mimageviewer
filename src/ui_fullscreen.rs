@@ -66,6 +66,11 @@ fn should_handle_fullscreen_wheel(
         && (ctrl_held || !cursor_in_panel)
 }
 
+fn fullscreen_click_nav_base_delta(pos_x: f32, center_x: f32, rtl: bool) -> i32 {
+    let ltr_base = if pos_x > center_x { 1 } else { -1 };
+    if rtl { -ltr_base } else { ltr_base }
+}
+
 fn should_zoom_fullscreen_wheel(ctrl_held: bool, overlay_edit_mode: bool) -> bool {
     ctrl_held || overlay_edit_mode
 }
@@ -6817,7 +6822,11 @@ impl App {
                                     && !in_seek_panel
                                     && !continuous_active
                                 {
-                                    let base = if pos.x > full_rect.center().x { 1 } else { -1 };
+                                    let base = fullscreen_click_nav_base_delta(
+                                        pos.x,
+                                        full_rect.center().x,
+                                        self.spread_mode.is_rtl(),
+                                    );
                                     nav_delta = self.spread_nav_delta(base);
                                 }
                             }
@@ -14510,6 +14519,18 @@ mod tests {
         assert!(!should_handle_fullscreen_wheel(
             false, false, true, false, true
         ));
+    }
+
+    #[test]
+    fn fullscreen_click_nav_delta_ltr_right_is_next() {
+        assert_eq!(fullscreen_click_nav_base_delta(60.0, 50.0, false), 1);
+        assert_eq!(fullscreen_click_nav_base_delta(40.0, 50.0, false), -1);
+    }
+
+    #[test]
+    fn fullscreen_click_nav_delta_rtl_left_is_next() {
+        assert_eq!(fullscreen_click_nav_base_delta(40.0, 50.0, true), 1);
+        assert_eq!(fullscreen_click_nav_base_delta(60.0, 50.0, true), -1);
     }
 
     #[test]
