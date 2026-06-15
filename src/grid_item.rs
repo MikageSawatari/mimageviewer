@@ -163,14 +163,16 @@ impl GridItem {
     }
 
     /// 代表サムネ生成に本物の同期 I/O を伴うか (heavy_io_queue 振り分け用)。
-    /// Folder は `fs::read_dir` 再帰探索、ZipFile / ConvertibleArchive は
-    /// セントラルディレクトリ読み込みで
-    /// メインプロセス内が秒単位ブロックされる。PdfFile は別プロセス IPC 待ちで
-    /// メインプロセス内 CPU を消費しないため通常 reload_queue に振る。
+    /// Folder は `fs::read_dir` 再帰探索、ZipFile / ConvertibleArchive / ZipDir は
+    /// ZIP セントラルディレクトリ読み込みや代表解決を伴う。PdfFile は別プロセス IPC
+    /// 待ちでメインプロセス内 CPU を消費しないため通常 reload_queue に振る。
     pub fn is_heavy_io(&self) -> bool {
         matches!(
             self,
-            Self::Folder(_) | Self::ZipFile(_) | Self::ConvertibleArchive { .. }
+            Self::Folder(_)
+                | Self::ZipFile(_)
+                | Self::ConvertibleArchive { .. }
+                | Self::ZipDir { .. }
         )
     }
 
@@ -523,7 +525,9 @@ mod tests {
         // キーは実パスではなく合成パス (App::rating_path_key の ZipDir arm)。
         assert!(item.is_container_ratable());
         assert!(item.accepts_rating());
-        assert!(!item.is_heavy_io());
+        // サムネ代表解決で ZIP 列挙が走ることがあるため、通常画像/PDF の
+        // regular queue を塞がないよう heavy I/O queue に振る。
+        assert!(item.is_heavy_io());
     }
 
     #[test]

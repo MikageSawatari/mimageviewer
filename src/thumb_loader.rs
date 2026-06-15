@@ -967,7 +967,7 @@ pub fn process_load_request(
     // キャッシュミス or skip_cache: フルデコード (+ 必要なら保存)
     // load_one_cached は from_cache = false を送信する
 
-    // 重い I/O (ZIP/Folder) は専用 I/O ワーカーキューで処理されるため、
+    // 重い I/O (Folder / ZipFile / ConvertibleArchive / ZipDir) は専用 I/O ワーカーキューで処理されるため、
     // セマフォは不要。I/O ワーカー数 (1-2) で自然に同時実行数が制限される。
     //
     // pin 解決時 (`resolve_override` Some) は **prefix 判定をスキップ**し、
@@ -1068,10 +1068,9 @@ pub fn process_load_request(
             .map(|e| e.entry_name.clone())
         });
         let zip_ms = t_zip.elapsed().as_secs_f64() * 1000.0;
-        // perf 計装 (post-v1.3.0 backlog C-4): ZipDir 代表解決は軽量キューに振られるが、
-        // worker 側で enumerate_image_entries (ZIP セントラルディレクトリ読み = 重 I/O) +
-        // ツリー構築する。キュー振り分け再検討のため所要を analyze_perf.py で集計できる
-        // ようイベント化する (本コミットは計装のみ)。
+        // ZipDir 代表解決は enumerate_image_entries (ZIP セントラルディレクトリ読み = 重 I/O) +
+        // ツリー構築を伴うことがあるため heavy_io_queue 側に振る。所要は regressions を
+        // 追えるよう analyze_perf.py で集計できるイベントとして残す。
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "thumb",

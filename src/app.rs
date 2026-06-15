@@ -2472,7 +2472,7 @@ pub struct App {
     /// 永続ワーカーがサムネイルを処理するためのキュー（UI からは push のみ）
     /// 通常画像 (Image, ZipImage, PdfPage) + PdfFile (フォルダ代表画、IPC 待ち) 用
     pub(crate) reload_queue: Option<Arc<NotifyQueue>>,
-    /// 重い同期 I/O (ZipFile, Folder) 用の専用キュー。
+    /// 重い同期 I/O (Folder, ZipFile, ConvertibleArchive, ZipDir) 用の専用キュー。
     /// 専用 I/O ワーカー (2本) が priority 順に取り出す。
     /// PdfFile は別プロセス IPC のため通常キュー側に振り分けて
     /// PDFium pool (POOL_SIZE=5) の並列度を活かす。
@@ -12899,7 +12899,7 @@ impl App {
     ///   正しい値を入れ直すまで保守的に 0 にしておく
     /// - idx-keyed HashMap 群 (rotation / rating / adjustment / thumb_pixels / ai_* / fs_*)
     /// - in-flight pending (fs_pending / ai_upscale_pending) のキャンセル
-    /// - reload_queue / heavy_io_queue の排水: 旧 idx 向け重い I/O (ZIP/Folder 代表画)
+    /// - reload_queue / heavy_io_queue の排水: 旧 idx 向け重い I/O (Folder/ZIP/ZipDir 代表画)
     ///   や PDF レンダ要求が worker スロットを占有し続けるのを防ぐ。次フレームの
     ///   `update_keep_range_and_requests` が新 items に対応した request を再投入する
     ///
@@ -14253,7 +14253,7 @@ impl App {
         for i in 0..regular_threads {
             spawn_worker(i, "w", Arc::clone(&reload_queue));
         }
-        // I/O ワーカー: heavy_io_queue (ZipFile, Folder)
+        // I/O ワーカー: heavy_io_queue (Folder, ZipFile, ConvertibleArchive, ZipDir)
         for i in 0..io_threads {
             spawn_worker(i, "io", Arc::clone(&heavy_io_queue));
         }

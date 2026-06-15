@@ -31,8 +31,8 @@ Failed は単発の終端ステート。デコードエラー時のみ。
 2. **エビクション**: keep_range 外の Loaded を `Evicted` に遷移 (GPU テクスチャを drop)
 3. **要求投入**: keep_range 内の Pending / Evicted に対して `LoadRequest` を作り
    - 通常キュー: `reload_queue` (Image/ZipImage/PdfPage)
-   - 重 I/O キュー: `heavy_io_queue` (Folder/ZipFile/ConvertibleArchive — 全体走査や
-     ZIP セントラルディレクトリ読みが必要。PdfFile は PDF ワーカー IPC なので通常キュー)
+   - 重 I/O キュー: `heavy_io_queue` (Folder/ZipFile/ConvertibleArchive/ZipDir — 全体走査、
+     ZIP セントラルディレクトリ読み、または ZIP 内 prefix の代表解決が必要。PdfFile は PDF ワーカー IPC なので通常キュー)
 4. **アイドル時品質アップグレード**: スクロールが止まって ~1 秒経つと、`from_cache: true` の Loaded に対して `skip_cache: true` で再要求 → 高品質デコード
 
 ### 1.3 ワーカー側の流れ
