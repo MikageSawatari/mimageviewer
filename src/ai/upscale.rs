@@ -69,6 +69,12 @@ pub struct UpscaleResult {
     pub image: egui::ColorImage,
 }
 
+/// final pipeline 向けのアップスケール結果。
+pub struct UpscaledImage {
+    pub image: egui::ColorImage,
+    pub used_upscale: bool,
+}
+
 /// 1 タイル分のタイミング内訳（ベンチマーク用）。
 #[derive(Debug, Clone, Copy)]
 pub struct TileTiming {
@@ -154,6 +160,31 @@ pub fn ai_would_apply_at_dims(
 ) -> bool {
     (upscale_on && should_process_rect(w, h, upscale_limit))
         || (denoise_on && should_process_rect(w, h, denoise_limit))
+}
+
+/// 入力寸法とモデル倍率から、`max_dim` に収まる最終アップスケール寸法を返す。
+///
+/// 4x 全面を作ってから GPU 上限へ縮小する旧経路の丸め (`round`) と揃える。
+pub fn upscale_target_size_for_max_dim(
+    in_w: u32,
+    in_h: u32,
+    scale: u32,
+    max_dim: u32,
+) -> (u32, u32) {
+    let max_dim = max_dim.max(1);
+    let full_w = in_w.saturating_mul(scale).max(1);
+    let full_h = in_h.saturating_mul(scale).max(1);
+    if full_w <= max_dim && full_h <= max_dim {
+        return (full_w, full_h);
+    }
+    let shrink = max_dim as f64 / full_w.max(full_h) as f64;
+    let target_w = ((full_w as f64 * shrink).round() as u32)
+        .max(1)
+        .min(max_dim);
+    let target_h = ((full_h as f64 * shrink).round() as u32)
+        .max(1)
+        .min(max_dim);
+    (target_w, target_h)
 }
 
 /// PDF ラスターページの「現行レンダ寸法が、native 再レンダ後の AI 入力寸法より十分
@@ -254,6 +285,19 @@ pub fn upscale(
     upscale_with_timings(runtime, model_kind, input, cancel, None).map(|(img, _)| img)
 }
 
+/// final pipeline 用: 4x 全面の中間画像を作らず、GPU テクスチャ上限内の
+/// ターゲットサイズへ直接合成する。
+pub fn upscale_to_max_dim(
+    runtime: &AiRuntime,
+    model_kind: ModelKind,
+    input: &image::DynamicImage,
+    cancel: &Arc<AtomicBool>,
+    max_dim: u32,
+) -> Result<UpscaledImage, AiError> {
+    upscale_with_timings_impl(runtime, model_kind, input, cancel, None, Some(max_dim))
+        .map(|(result, _)| result)
+}
+
 /// `upscale` のタイミング計測版。ベンチマーク用。
 ///
 /// `tile_size_override` で既定タイルサイズを上書きできる。
@@ -265,22 +309,47 @@ pub fn upscale_with_timings(
     cancel: &Arc<AtomicBool>,
     tile_size_override: Option<u32>,
 ) -> Result<(egui::ColorImage, UpscaleTimings), AiError> {
+    upscale_with_timings_impl(runtime, model_kind, input, cancel, tile_size_override, None)
+        .map(|(result, timings)| (result.image, timings))
+}
+
+fn upscale_with_timings_impl(
+    runtime: &AiRuntime,
+    model_kind: ModelKind,
+    input: &image::DynamicImage,
+    cancel: &Arc<AtomicBool>,
+    tile_size_override: Option<u32>,
+    target_max_dim: Option<u32>,
+) -> Result<(UpscaledImage, UpscaleTimings), AiError> {
     let t_all = std::time::Instant::now();
     let t_prep = std::time::Instant::now();
 
     let (in_w, in_h) = (input.width(), input.height());
 
     let scale = detect_scale_factor(runtime, model_kind)?;
-    let out_w = in_w * scale;
-    let out_h = in_h * scale;
+    let full_out_w = in_w.saturating_mul(scale).max(1);
+    let full_out_h = in_h.saturating_mul(scale).max(1);
+    let (out_w, out_h) = target_max_dim.map_or((full_out_w, full_out_h), |max_dim| {
+        upscale_target_size_for_max_dim(in_w, in_h, scale, max_dim)
+    });
+    let used_upscale = scale > 1;
 
     let tile_size = tile_size_override.unwrap_or_else(|| {
         model_tile_size(model_kind, effective_backend_for_tile(runtime, model_kind))
     });
 
     crate::logger::log(format!(
-        "[AI] Upscaling {}x{} → {}x{} ({}x) with {:?}, tile={}px overlap={}px",
-        in_w, in_h, out_w, out_h, scale, model_kind, tile_size, TILE_OVERLAP
+        "[AI] Upscaling {}x{} → model {}x{} ({}x) → target {}x{} with {:?}, tile={}px overlap={}px",
+        in_w,
+        in_h,
+        full_out_w,
+        full_out_h,
+        scale,
+        out_w,
+        out_h,
+        model_kind,
+        tile_size,
+        TILE_OVERLAP
     ));
 
     let rgb = input.to_rgb8();
@@ -331,6 +400,10 @@ pub fn upscale_with_timings(
                 ("in_w", serde_json::Value::from(in_w)),
                 ("in_h", serde_json::Value::from(in_h)),
                 ("scale", serde_json::Value::from(scale)),
+                ("full_out_w", serde_json::Value::from(full_out_w)),
+                ("full_out_h", serde_json::Value::from(full_out_h)),
+                ("target_w", serde_json::Value::from(out_w)),
+                ("target_h", serde_json::Value::from(out_h)),
                 ("tiles", serde_json::Value::from(tiles.len())),
                 ("tile_size", serde_json::Value::from(tile_size)),
             ],
@@ -338,14 +411,8 @@ pub fn upscale_with_timings(
     }
 
     // 出力バッファ: RGB float 累積 + 重み累積（ブレンド用）
-    //
-    // ⚠ メモリ過大ガードは**意図的に持たない** (2026-06-10 ユーザー判断、Codex P2 回答):
-    // サイズ上限の最悪ケース (4095x4095 → 4x = 268MP) で累積 4 面 ≈ 4.3 GB、最終
-    // ColorImage と合わせたピークは ≈ 5.4 GB に達するが、空きメモリ量で AI 適用可否を
-    // 変えると挙動が予測できなくなるため、判定はサイズ上限のみで決定的にする。
-    // 高負荷上限を明示的に選んだ環境で実メモリ不足ならクラッシュ (alloc abort) で良い。
-    // `try_reserve` での graceful fail も非決定性を生むため入れない。
-    // 詳細: docs/ai-processing-size-threshold-plan.md「メモリ目安」。
+    // final pipeline では target_max_dim を指定し、4x 全面ではなく最終クランプ後の
+    // サイズへ直接蓄積する。ベンチ/旧経路は従来どおり full_out を target にする。
     let npixels = (out_w * out_h) as usize;
     let mut accum_r = vec![0.0f32; npixels];
     let mut accum_g = vec![0.0f32; npixels];
@@ -388,6 +455,8 @@ pub fn upscale_with_timings(
                         scale,
                         in_w,
                         in_h,
+                        full_out_w,
+                        full_out_h,
                     );
                     let blend_ms = t_blend.elapsed().as_secs_f64() * 1000.0;
                     timings.push(TileTiming {
@@ -502,6 +571,8 @@ pub fn upscale_with_timings(
                 ("tiles", serde_json::Value::from(tiles.len())),
                 ("out_w", serde_json::Value::from(out_w)),
                 ("out_h", serde_json::Value::from(out_h)),
+                ("full_out_w", serde_json::Value::from(full_out_w)),
+                ("full_out_h", serde_json::Value::from(full_out_h)),
                 ("total_ms", serde_json::Value::from(total_ms)),
             ],
         );
@@ -537,7 +608,13 @@ pub fn upscale_with_timings(
         in_h,
     };
 
-    Ok((color_image, timings))
+    Ok((
+        UpscaledImage {
+            image: color_image,
+            used_upscale,
+        },
+        timings,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -797,26 +874,34 @@ fn blend_tile(
     scale: u32,
     img_w: u32,
     img_h: u32,
+    full_out_w: u32,
+    full_out_h: u32,
 ) {
     let tw = tile_out.width as usize;
     let th = tile_out.height as usize;
-    let plane_size = tw * th;
 
     let is_first_x = tile.x == 0;
     let is_first_y = tile.y == 0;
     let is_last_x = tile.x + tile.w >= img_w;
     let is_last_y = tile.y + tile.h >= img_h;
 
-    // ランプ幅（出力ピクセル単位）
+    // ランプ幅（モデル出力ピクセル単位）
     let ramp = (TILE_OVERLAP * scale) as f32;
 
-    let dst_x0 = (tile.x * scale) as usize;
-    let dst_y0 = (tile.y * scale) as usize;
+    let tile_full_x0 = tile.x as f64 * scale as f64;
+    let tile_full_y0 = tile.y as f64 * scale as f64;
+    let tile_full_x1 = tile_full_x0 + tile_out.width as f64;
+    let tile_full_y1 = tile_full_y0 + tile_out.height as f64;
+    let target_x0 = target_span_start(tile_full_x0, out_w, full_out_w);
+    let target_y0 = target_span_start(tile_full_y0, out_h, full_out_h);
+    let target_x1 = target_span_end(tile_full_x1, out_w, full_out_w);
+    let target_y1 = target_span_end(tile_full_y1, out_h, full_out_h);
 
-    for sy in 0..th {
-        let dy = dst_y0 + sy;
-        if dy >= out_h as usize {
-            break;
+    for dy in target_y0..target_y1 {
+        let full_y = target_pixel_to_full(dy, out_h, full_out_h);
+        let sy = full_y - tile_full_y0 as f32;
+        if !(0.0..=(th.saturating_sub(1) as f32)).contains(&sy) {
+            continue;
         }
 
         // Y方向の辺からの距離
@@ -824,14 +909,15 @@ fn blend_tile(
         let dist_bot = if is_last_y {
             ramp
         } else {
-            (th - 1 - sy) as f32
+            th.saturating_sub(1) as f32 - sy
         };
         let wy = (dist_top.min(dist_bot) / ramp).clamp(1e-4, 1.0);
 
-        for sx in 0..tw {
-            let dx = dst_x0 + sx;
-            if dx >= out_w as usize {
-                break;
+        for dx in target_x0..target_x1 {
+            let full_x = target_pixel_to_full(dx, out_w, full_out_w);
+            let sx = full_x - tile_full_x0 as f32;
+            if !(0.0..=(tw.saturating_sub(1) as f32)).contains(&sx) {
+                continue;
             }
 
             // X方向の辺からの距離
@@ -839,20 +925,57 @@ fn blend_tile(
             let dist_right = if is_last_x {
                 ramp
             } else {
-                (tw - 1 - sx) as f32
+                tw.saturating_sub(1) as f32 - sx
             };
             let wx = (dist_left.min(dist_right) / ramp).clamp(1e-4, 1.0);
 
             let weight = wx * wy;
             let dst_idx = dy * out_w as usize + dx;
-            let src_idx = sy * tw + sx;
 
-            accum_r[dst_idx] += tile_out.data[src_idx] * weight;
-            accum_g[dst_idx] += tile_out.data[plane_size + src_idx] * weight;
-            accum_b[dst_idx] += tile_out.data[2 * plane_size + src_idx] * weight;
+            accum_r[dst_idx] += sample_tile_channel(tile_out, 0, sx, sy) * weight;
+            accum_g[dst_idx] += sample_tile_channel(tile_out, 1, sx, sy) * weight;
+            accum_b[dst_idx] += sample_tile_channel(tile_out, 2, sx, sy) * weight;
             accum_w[dst_idx] += weight;
         }
     }
+}
+
+fn target_span_start(full_coord: f64, target_dim: u32, full_dim: u32) -> usize {
+    let scaled = full_coord * target_dim as f64 / full_dim.max(1) as f64;
+    ((scaled.floor() as i64) - 1).clamp(0, target_dim as i64) as usize
+}
+
+fn target_span_end(full_coord: f64, target_dim: u32, full_dim: u32) -> usize {
+    let scaled = full_coord * target_dim as f64 / full_dim.max(1) as f64;
+    ((scaled.ceil() as i64) + 1).clamp(0, target_dim as i64) as usize
+}
+
+fn target_pixel_to_full(target_pos: usize, target_dim: u32, full_dim: u32) -> f32 {
+    ((target_pos as f64 + 0.5) * full_dim.max(1) as f64 / target_dim.max(1) as f64 - 0.5) as f32
+}
+
+fn sample_tile_channel(tile_out: &TileOutput, channel: usize, x: f32, y: f32) -> f32 {
+    let w = tile_out.width as usize;
+    let h = tile_out.height as usize;
+    debug_assert!(w > 0 && h > 0);
+    let plane_size = w * h;
+    let plane = channel.min(2) * plane_size;
+
+    let x0 = x.floor().clamp(0.0, (w - 1) as f32) as usize;
+    let y0 = y.floor().clamp(0.0, (h - 1) as f32) as usize;
+    let x1 = (x0 + 1).min(w - 1);
+    let y1 = (y0 + 1).min(h - 1);
+    let fx = (x - x0 as f32).clamp(0.0, 1.0);
+    let fy = (y - y0 as f32).clamp(0.0, 1.0);
+
+    let idx = |px: usize, py: usize| plane + py * w + px;
+    let v00 = tile_out.data[idx(x0, y0)];
+    let v10 = tile_out.data[idx(x1, y0)];
+    let v01 = tile_out.data[idx(x0, y1)];
+    let v11 = tile_out.data[idx(x1, y1)];
+    let top = v00 + (v10 - v00) * fx;
+    let bottom = v01 + (v11 - v01) * fx;
+    top + (bottom - top) * fy
 }
 
 #[cfg(test)]
@@ -925,6 +1048,30 @@ mod tests {
         assert!(should_process_rect(4095, 2047, limit));
         assert!(!should_process_rect(4096, 2047, limit));
         assert!(!should_process_rect(4095, 2048, limit));
+    }
+
+    #[test]
+    fn upscale_target_size_keeps_full_output_within_limit() {
+        assert_eq!(
+            upscale_target_size_for_max_dim(1000, 500, 4, 8192),
+            (4000, 2000)
+        );
+    }
+
+    #[test]
+    fn upscale_target_size_clamps_square_to_texture_limit() {
+        assert_eq!(
+            upscale_target_size_for_max_dim(4096, 4096, 4, 8192),
+            (8192, 8192)
+        );
+    }
+
+    #[test]
+    fn upscale_target_size_allows_effective_one_x_result() {
+        assert_eq!(
+            upscale_target_size_for_max_dim(8192, 4096, 4, 8192),
+            (8192, 4096)
+        );
     }
 
     /// `ai_would_apply_at_dims`: 設定 ON かつ寸法が range 内のときだけ true。

@@ -826,10 +826,9 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(2.0);
     ui.label(
         egui::RichText::new(
-            "アップスケールは処理後の画像 (4 倍) を組み立ててから縮小するため、上限が大きい\n\
-             ほどメモリと処理時間が急増します (一時的に 4096 x 4096 で数 GB、8192 x 8192 では\n\
-             10 GB 規模)。メモリが不足する環境では小さい上限を選んでください。最終結果は\n\
-             長辺 8192px 以下へ自動的に縮小されます。",
+            "アップスケールは最終結果を長辺 8192px 以下へ直接組み立てますが、上限が大きい\n\
+             ほどタイル数・合成バッファ・処理時間が増えます。メモリが不足する環境では\n\
+             小さい上限を選んでください。",
         )
         .size(11.0)
         .weak(),
@@ -839,9 +838,8 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
 /// AI 処理サイズ上限の候補 (長辺, 短辺, 表示ラベル)。
 /// 判定は `ai::upscale::should_process_rect` (長辺・短辺とも未満なら処理) を参照。
 ///
-/// ⚠ 長辺は `crate::app::MAX_TEXTURE_DIM` (8192) 以下に保つこと。これを超えると
-/// 「アップスケール出力は必ず入力より大きい」前提 (final smart-sharpen の
-/// `output_is_ai_upscaled` 判定) が崩れる (詳細は app.rs の該当コメント)。
+/// ⚠ 長辺は `crate::app::MAX_TEXTURE_DIM` (8192) 以下に保つこと。render-to-target
+/// 後も最終合成バッファは GPU テクスチャ上限内に収める。
 /// 6144 / 8192 クラスは結合見開きスキャンなど大判向けの高負荷オプション。
 const AI_SIZE_LIMIT_OPTIONS: [(u32, u32, &str); 9] = [
     (512, 512, "512 x 512 未満"),
@@ -3080,8 +3078,7 @@ mod tests {
     use crate::app::MAX_TEXTURE_DIM;
 
     /// AI サイズ上限プリセットの長辺は GPU テクスチャ上限 (8192) を超えてはならない。
-    /// 超えると final smart-sharpen の `output_is_ai_upscaled`
-    /// (= 「アップスケール出力は必ず入力より大きい」前提) が崩れる (app.rs 該当コメント参照)。
+    /// render-to-target 後も最終 AI / composite は `MAX_TEXTURE_DIM` 以下に保つ。
     /// また表示は「長辺 x 短辺」なので short <= long を保つ。
     #[test]
     fn ai_size_limit_presets_stay_within_gpu_texture_limit() {

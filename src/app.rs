@@ -1663,8 +1663,15 @@ pub(crate) struct RetainedFinalAiKey {
     pub(crate) bg: u8,
 }
 
+#[derive(Clone)]
+pub(crate) struct FinalAiEntry {
+    pub(crate) pixels: Arc<egui::ColorImage>,
+    pub(crate) used_upscale: bool,
+}
+
 pub(crate) struct RetainedFinalAiEntry {
     pub(crate) pixels: Arc<egui::ColorImage>,
+    pub(crate) used_upscale: bool,
     pub(crate) bytes: u64,
     pub(crate) last_used: u64,
 }
@@ -1684,6 +1691,7 @@ pub(crate) enum RetainedPdfPageCacheKind {
     },
     FinalAi {
         pixels: Arc<egui::ColorImage>,
+        used_upscale: bool,
         edit_size: [usize; 2],
         color_ai_hash: u64,
         bg: u8,
@@ -1728,6 +1736,7 @@ pub(crate) enum FinalAiResult {
         retained_epoch: u64,
         source_size: [usize; 2],
         image: egui::ColorImage,
+        used_upscale: bool,
     },
     Cancelled {
         job_id: u64,
@@ -3800,7 +3809,7 @@ pub struct App {
     /// source 解像度の edit 完了 cache。AdjustParams / AI / post_filter は含まない。
     pub(crate) edit_result_cache: std::collections::HashMap<EditResultKey, EditResultEntry>,
     /// edit_result へ色調補正を掛けた後に AI を適用した pixels cache。
-    pub(crate) final_ai_cache: std::collections::HashMap<FinalAiKey, Arc<egui::ColorImage>>,
+    pub(crate) final_ai_cache: std::collections::HashMap<FinalAiKey, FinalAiEntry>,
     /// フルスクリーン session をまたいで保持する final AI pixels cache。
     /// live cache とは別に、idx ではなくページの安定キー + AI 入力条件で LRU 管理する。
     pub(crate) retained_final_ai_cache:
@@ -24663,10 +24672,10 @@ impl App {
             // AI 先読みは native 着地まで保留する。これで画像の先読みと同様、移動時に
             // native + final AI が揃って即表示できる。
             if self.pdf_prefetch_should_defer_ai(idx) {
-                if let Some((key, pixels, _)) =
+                if let Some((key, entry, _)) =
                     self.lookup_retained_pdf_final_ai(idx, "prefetch_final_ai")
                 {
-                    self.final_ai_cache.insert(key, pixels);
+                    self.final_ai_cache.insert(key, entry);
                     continue;
                 }
                 // 既に再レンダ中なら二重起動しない (cancel→respawn ループ防止)。
@@ -24688,9 +24697,9 @@ impl App {
                 continue;
             };
             if !self.final_ai_cache.contains_key(&key)
-                && let Some(pixels) = self.lookup_retained_final_ai(idx, key, edit_pixels.size)
+                && let Some(entry) = self.lookup_retained_final_ai(idx, key, edit_pixels.size)
             {
-                self.final_ai_cache.insert(key, pixels);
+                self.final_ai_cache.insert(key, entry);
                 continue;
             }
             if self.final_ai_cache.contains_key(&key)
@@ -26814,7 +26823,7 @@ impl App {
         &mut self,
         idx: usize,
         reason: &str,
-    ) -> Option<(FinalAiKey, Arc<egui::ColorImage>, [usize; 2])> {
+    ) -> Option<(FinalAiKey, FinalAiEntry, [usize; 2])> {
         if self.retained_final_ai_budget().is_none() {
             self.clear_retained_pdf_page_cache("retained_pdf_page_budget_disabled");
             return None;
@@ -26822,16 +26831,25 @@ impl App {
         let page_key = self.retained_pdf_page_key_for(idx)?;
         let (final_key, _) = self.retained_pdf_final_ai_matches_current(idx)?;
         self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
-        let (pixels, edit_size, bytes, output_size) = {
+        let (pixels, used_upscale, edit_size, bytes, output_size) = {
             let entry = self.retained_pdf_page_cache.get_mut(&page_key)?;
             entry.last_used = self.retained_final_ai_clock;
             let RetainedPdfPageCacheKind::FinalAi {
-                pixels, edit_size, ..
+                pixels,
+                used_upscale,
+                edit_size,
+                ..
             } = &entry.kind
             else {
                 return None;
             };
-            (Arc::clone(pixels), *edit_size, entry.bytes, pixels.size)
+            (
+                Arc::clone(pixels),
+                *used_upscale,
+                *edit_size,
+                entry.bytes,
+                pixels.size,
+            )
         };
         crate::logger::log(format!(
             "[PDF] Retained page hit idx={idx} item={} kind=final_ai source={}x{} \
@@ -26847,7 +26865,14 @@ impl App {
             self.retained_pdf_page_cache.len(),
             self.retained_pdf_page_cache_bytes(),
         ));
-        Some((final_key, pixels, edit_size))
+        Some((
+            final_key,
+            FinalAiEntry {
+                pixels,
+                used_upscale,
+            },
+            edit_size,
+        ))
     }
 
     fn lookup_retained_pdf_final_ai_for_key(
@@ -26856,7 +26881,7 @@ impl App {
         key: FinalAiKey,
         edit_size: [usize; 2],
         reason: &str,
-    ) -> Option<Arc<egui::ColorImage>> {
+    ) -> Option<FinalAiEntry> {
         if self.retained_final_ai_budget().is_none() {
             self.clear_retained_pdf_page_cache("retained_pdf_page_budget_disabled");
             return None;
@@ -26871,6 +26896,7 @@ impl App {
                 edit_size,
                 color_ai_hash,
                 bg,
+                ..
             } => (*edit_size, *color_ai_hash, *bg, pixels.size),
             RetainedPdfPageCacheKind::Raster { .. } => return None,
         };
@@ -26891,13 +26917,18 @@ impl App {
             return None;
         }
         self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
-        let (pixels, bytes) = {
+        let (pixels, used_upscale, bytes) = {
             let entry = self.retained_pdf_page_cache.get_mut(&page_key)?;
             entry.last_used = self.retained_final_ai_clock;
-            let RetainedPdfPageCacheKind::FinalAi { pixels, .. } = &entry.kind else {
+            let RetainedPdfPageCacheKind::FinalAi {
+                pixels,
+                used_upscale,
+                ..
+            } = &entry.kind
+            else {
                 return None;
             };
-            (Arc::clone(pixels), entry.bytes)
+            (Arc::clone(pixels), *used_upscale, entry.bytes)
         };
         crate::logger::log(format!(
             "[PDF] Retained page hit idx={idx} item={} kind=final_ai source={}x{} \
@@ -26912,14 +26943,28 @@ impl App {
             self.retained_pdf_page_cache.len(),
             self.retained_pdf_page_cache_bytes(),
         ));
-        Some(pixels)
+        Some(FinalAiEntry {
+            pixels,
+            used_upscale,
+        })
     }
 
+    #[cfg(test)]
     fn insert_retained_pdf_final_ai(
         &mut self,
         idx: usize,
         retained_key: RetainedFinalAiKey,
         pixels: Arc<egui::ColorImage>,
+    ) -> bool {
+        self.insert_retained_pdf_final_ai_with_used_upscale(idx, retained_key, pixels, true)
+    }
+
+    fn insert_retained_pdf_final_ai_with_used_upscale(
+        &mut self,
+        idx: usize,
+        retained_key: RetainedFinalAiKey,
+        pixels: Arc<egui::ColorImage>,
+        used_upscale: bool,
     ) -> bool {
         let Some(key) = self.retained_pdf_page_key_for(idx) else {
             return false;
@@ -26961,6 +27006,7 @@ impl App {
                 RetainedPdfPageEntry {
                     kind: RetainedPdfPageCacheKind::FinalAi {
                         pixels,
+                        used_upscale,
                         edit_size: retained_key.edit_size,
                         color_ai_hash: retained_key.color_ai_hash,
                         bg: retained_key.bg,
@@ -27070,12 +27116,24 @@ impl App {
         self.fs_upload_backlog.iter().any(|(key, _, _)| *key == idx)
     }
 
+    #[cfg(test)]
     fn insert_retained_final_ai(
         &mut self,
         idx: usize,
         key: FinalAiKey,
         edit_size: [usize; 2],
         pixels: Arc<egui::ColorImage>,
+    ) -> bool {
+        self.insert_retained_final_ai_with_used_upscale(idx, key, edit_size, pixels, true)
+    }
+
+    fn insert_retained_final_ai_with_used_upscale(
+        &mut self,
+        idx: usize,
+        key: FinalAiKey,
+        edit_size: [usize; 2],
+        pixels: Arc<egui::ColorImage>,
+        used_upscale: bool,
     ) -> bool {
         let Some(retained_key) = self.retained_final_ai_key_for(idx, key, edit_size) else {
             crate::logger::log(format!(
@@ -27094,6 +27152,7 @@ impl App {
             retained_key,
             self.retained_final_ai_epoch,
             pixels,
+            used_upscale,
         )
     }
 
@@ -27103,6 +27162,7 @@ impl App {
         retained_key: RetainedFinalAiKey,
         retained_epoch: u64,
         pixels: Arc<egui::ColorImage>,
+        used_upscale: bool,
     ) -> bool {
         let edit_size = retained_key.edit_size;
         if retained_epoch != self.retained_final_ai_epoch {
@@ -27121,8 +27181,12 @@ impl App {
             return false;
         }
         if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
-            let stored =
-                self.insert_retained_pdf_final_ai(idx, retained_key.clone(), Arc::clone(&pixels));
+            let stored = self.insert_retained_pdf_final_ai_with_used_upscale(
+                idx,
+                retained_key.clone(),
+                Arc::clone(&pixels),
+                used_upscale,
+            );
             if stored {
                 self.cancel_final_ai_pending_for_retained_key(&retained_key, "pdf_retained_store");
             }
@@ -27166,6 +27230,7 @@ impl App {
                 retained_key,
                 RetainedFinalAiEntry {
                     pixels,
+                    used_upscale,
                     bytes,
                     last_used: self.retained_final_ai_clock,
                 },
@@ -27198,7 +27263,7 @@ impl App {
         idx: usize,
         key: FinalAiKey,
         edit_size: [usize; 2],
-    ) -> Option<Arc<egui::ColorImage>> {
+    ) -> Option<FinalAiEntry> {
         if self.retained_final_ai_budget().is_none() {
             self.retained_final_ai_cache.clear();
             self.clear_retained_pdf_page_cache("retained_budget_disabled");
@@ -27214,10 +27279,15 @@ impl App {
         }
         let retained_key = self.retained_final_ai_key_for(idx, key, edit_size)?;
         self.retained_final_ai_clock = self.retained_final_ai_clock.wrapping_add(1);
-        let (pixels, bytes, output_size) = {
+        let (pixels, used_upscale, bytes, output_size) = {
             let entry = self.retained_final_ai_cache.get_mut(&retained_key)?;
             entry.last_used = self.retained_final_ai_clock;
-            (Arc::clone(&entry.pixels), entry.bytes, entry.pixels.size)
+            (
+                Arc::clone(&entry.pixels),
+                entry.used_upscale,
+                entry.bytes,
+                entry.pixels.size,
+            )
         };
         crate::logger::log(format!(
             "[AI] Retained final AI hit idx={idx} item={} source={}x{} output={}x{} \
@@ -27231,7 +27301,10 @@ impl App {
             self.retained_final_ai_cache_bytes(),
         ));
         self.cancel_final_ai_pending_for_retained_key(&retained_key, "retained_hit");
-        Some(pixels)
+        Some(FinalAiEntry {
+            pixels,
+            used_upscale,
+        })
     }
 
     fn log_retained_final_ai_miss(
@@ -27688,15 +27761,14 @@ impl App {
         final_key: FinalCompositeKey,
         params: &crate::adjustment::AdjustParams,
         base_pixels: Arc<egui::ColorImage>,
-        edit_size: [usize; 2],
+        _edit_size: [usize; 2],
         complete: bool,
-        base_is_ai: bool,
+        base_used_upscale: bool,
         reason: &str,
     ) -> egui::TextureHandle {
         let perf_on = crate::perf::is_enabled();
         let build_start = perf_on.then(std::time::Instant::now);
-        let output_is_ai_upscaled = base_is_ai && base_pixels.size != edit_size;
-        let sharpen_strength = params.effective_smart_sharpen(output_is_ai_upscaled);
+        let sharpen_strength = params.effective_smart_sharpen(base_used_upscale);
         let t_sharpen0 = perf_on.then(std::time::Instant::now);
         let sharpened = if sharpen_strength == 0 {
             base_pixels
@@ -27792,18 +27864,18 @@ impl App {
                 return Some(entry.texture.clone());
             }
         }
-        let (ai_key, pixels, edit_size) =
+        let (ai_key, entry, edit_size) =
             self.lookup_retained_pdf_final_ai(idx, "restore_final_composite")?;
-        self.final_ai_cache.insert(ai_key, Arc::clone(&pixels));
+        self.final_ai_cache.insert(ai_key, entry.clone());
         Some(self.build_final_composite_texture_from_base(
             ctx,
             idx,
             final_key,
             &params,
-            pixels,
+            entry.pixels,
             edit_size,
             true,
-            true,
+            entry.used_upscale,
             "retained_pdf_final_ai",
         ))
     }
@@ -27829,11 +27901,11 @@ impl App {
         let final_key = self.final_composite_key_for_pixels(edit_key, edit_pixels.size, &params);
         let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, &params);
         let ai_ready = if let Some(key) = ai_key {
-            if let Some(pixels) = self.final_ai_cache.get(&key).cloned() {
-                Some(pixels)
-            } else if let Some(pixels) = self.lookup_retained_final_ai(idx, key, edit_pixels.size) {
-                self.final_ai_cache.insert(key, Arc::clone(&pixels));
-                Some(pixels)
+            if let Some(entry) = self.final_ai_cache.get(&key).cloned() {
+                Some(entry)
+            } else if let Some(entry) = self.lookup_retained_final_ai(idx, key, edit_pixels.size) {
+                self.final_ai_cache.insert(key, entry.clone());
+                Some(entry)
             } else {
                 None
             }
@@ -27865,8 +27937,8 @@ impl App {
         };
         let fc_adjust_ms = t_adjust0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
 
-        let (base_pixels, complete, base_is_ai) = match (ai_key, ai_ready) {
-            (Some(_), Some(pixels)) => (pixels, true, true),
+        let (base_pixels, complete, base_used_upscale) = match (ai_key, ai_ready) {
+            (Some(_), Some(entry)) => (entry.pixels, true, entry.used_upscale),
             (Some(key), None) if self.final_ai_failed.contains(&key) => {
                 (Arc::clone(&adjusted), true, false)
             }
@@ -27902,21 +27974,10 @@ impl App {
         // 最終表示段スマートシャープ: 色調補正 → final AI → **ここ** → post_filter。
         // AI 入力 (`adjusted`) には掛けない (シャープ強度の変更で AI を再実行させない)。
         // AI アップスケール実行時のスキップは**固定動作** (設定なし): ベースが実際に
-        // アップスケール出力 (= 元よりサイズの大きい AI 結果) のときは常に掛けない。
-        // デノイズのみの AI 結果はサイズ不変なので通常どおり掛かる。AI 未完了の暫定
+        // アップスケーラを使った AI 結果 (`used_upscale=true`) のときは常に掛けない。
+        // デノイズのみの AI 結果は `used_upscale=false` なので通常どおり掛かる。AI 未完了の暫定
         // 合成 (complete=false) は非 AI 画像なので掛かり、AI 完了時の再合成で外れる。
-        //
-        // ⚠ サイズ比較の前提 (Codex P2): アップスケール出力は `run_final_ai_job` の
-        // `clamp_color_image_for_gpu` で MAX_TEXTURE_DIM (8192) まで縮小されることが
-        // あるが、AI 入力はサイズ上限の長辺 (≤ MAX_TEXTURE_DIM = 8192) 未満なので、
-        // クランプ後の長辺 = min(4×入力, 8192) は必ず入力より大きい (入力長辺 L < 8192 の
-        // とき min(4L, 8192) > L が常に成立する)。よって「アップスケール出力 ⇔ サイズが
-        // 入力と異なる」の対応は保たれる。サイズ上限の長辺を 8192 超に拡げる、または
-        // 等倍以下へ縮む経路 (1x モデル等) を入れる場合は、final_ai_cache の entry に
-        // used_upscale フラグを持たせてこの判定を置き換えること
-        // (AI_SIZE_LIMIT_OPTIONS は long_edge_px <= MAX_TEXTURE_DIM をテストで保証している)。
-        let output_is_ai_upscaled = base_is_ai && base_pixels.size != edit_pixels.size;
-        let sharpen_strength = params.effective_smart_sharpen(output_is_ai_upscaled);
+        let sharpen_strength = params.effective_smart_sharpen(base_used_upscale);
         let t_sharpen0 = perf_on.then(std::time::Instant::now);
         let sharpened = if sharpen_strength == 0 {
             base_pixels
@@ -28703,27 +28764,34 @@ impl App {
                     retained_epoch,
                     source_size,
                     image,
+                    used_upscale,
                 } => {
                     let pixels = Arc::new(image);
+                    let entry = FinalAiEntry {
+                        pixels: Arc::clone(&pixels),
+                        used_upscale,
+                    };
                     let retained_stored = if let Some(retained_key) = retained_key {
                         self.insert_retained_final_ai_with_key(
                             key.edit_key.idx,
                             retained_key,
                             retained_epoch,
                             Arc::clone(&pixels),
+                            used_upscale,
                         )
                     } else if live_pending {
-                        self.insert_retained_final_ai(
+                        self.insert_retained_final_ai_with_used_upscale(
                             key.edit_key.idx,
                             key,
                             source_size,
                             Arc::clone(&pixels),
+                            used_upscale,
                         )
                     } else {
                         false
                     };
                     if live_pending {
-                        self.final_ai_cache.insert(key, pixels);
+                        self.final_ai_cache.insert(key, entry);
                         self.final_composite_cache.retain(|cache_key, entry| {
                             cache_key.edit_key != key.edit_key || entry.complete
                         });
@@ -35827,6 +35895,7 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
                         retained_epoch,
                         source_size,
                         image: denoised,
+                        used_upscale: false,
                     };
                 }
             }
@@ -35850,17 +35919,23 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
     }
 
     if let Some(upscale_kind) = upscale_model {
-        match crate::ai::upscale::upscale(runtime, upscale_kind, &dynimg, cancel) {
-            // 4x 出力が GPU テクスチャ上限を超えるケース (サイズ上限 2048 超を許可した
-            // 場合に発生) は worker 側でここで縮小する。UI スレッドの `clamp_for_gpu`
-            // 安全網に流すと同期ハングし、cache にも 16K 級画像を抱えてしまう。
-            Ok(image) => FinalAiResult::Ready {
+        match crate::ai::upscale::upscale_to_max_dim(
+            runtime,
+            upscale_kind,
+            &dynimg,
+            cancel,
+            MAX_TEXTURE_DIM as u32,
+        ) {
+            // 4x 全面が GPU テクスチャ上限を超える場合でも、upscaler 側で最終
+            // ターゲットサイズへ直接合成する。clamp は安全網として残す。
+            Ok(result) => FinalAiResult::Ready {
                 job_id,
                 key,
                 retained_key,
                 retained_epoch,
                 source_size,
-                image: clamp_color_image_for_gpu(image),
+                image: clamp_color_image_for_gpu(result.image),
+                used_upscale: result.used_upscale,
             },
             Err(err) => {
                 if cancel.load(Ordering::Relaxed) {

@@ -394,9 +394,9 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
 - AI アップスケールは `ai_upscale_size_limit` (長辺 x 短辺、既定 2048 x 2048。
   旧 `ai_upscale_skip_px` からの読み替えは `Settings::ai_upscale_limit()`) で
   対象を制限する。`4096 x 2048` 等の大きい上限では ×4 出力が 8192 を超えるため、
-  `run_final_ai_job` (AI worker) が `clamp_color_image_for_gpu` で長辺 8192 以下へ
-  縮小してから `final_ai_cache` に入れる (= UI スレッドの `clamp_for_gpu` 安全網に
-  流さない)。final AI / 旧 AI 経路とも判定は `ai::upscale::should_process_rect`。
+  final pipeline は upscaler に `MAX_TEXTURE_DIM` を渡し、タイル出力を最終クランプ後
+  サイズへ直接合成する。`clamp_color_image_for_gpu` は安全網として残すが、通常は
+  no-op になる。final AI / 旧 AI 経路とも判定は `ai::upscale::should_process_rect`。
 - `apply_adjustments_fast` は pointwise 変換なので入力サイズを保つ → 入力が 8192 以内
   ならば出力も 8192 以内。`edit_result_cache` / final AI 結果を入力に取るので成立する。
 - 消しゴム (MI-GAN) / PDF 再レンダ (`request_pdf_rerender` の `.clamp(256, 8192)`) も
@@ -635,7 +635,7 @@ ZIP の章区切り (`ZipSeparator`) は GPU テクスチャ化せず、前後�
    → apply_adjustments_fast(edit_result)
    ↓
 7. AI アップスケール / デノイズ (Real-ESRGAN / Real-CUGAN / NMKD-Siax / 1x denoise)
-   → final_ai_cache[FinalAiKey]。未完了中は色補正後の画像を暫定表示する。
+   → final_ai_cache[FinalAiKey] (pixels + used_upscale)。未完了中は色補正後の画像を暫定表示する。
    ↓
 8. スマートシャープ (シャープ化スライダー 0..=100、輪郭中心の最終段シャープ)
    → AI アップスケール出力には掛からない (固定動作)。デノイズのみ / AI なしには掛かる。
@@ -672,12 +672,14 @@ ZIP の章区切り (`ZipSeparator`) は GPU テクスチャ化せず、前後�
   出力対象にする。
   ブラシ stroke 中は 150ms の idle まで重い再合成を遅延し、release 時に確定世代を進める。
 - **AI アップスケール/デノイズ**: final pipeline の別スレッドで推論。完了時に
-  `final_ai_cache` に格納し、未完了の `final_composite_cache` を捨てて再合成する。
+  `final_ai_cache` に pixels と `used_upscale` を格納し、未完了の
+  `final_composite_cache` を捨てて再合成する。
 - **AI 結果の保持 LRU**: 完了済みの final AI pixels は `retained_final_ai_cache` にも
-  `metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で保持する。通常の
+  `metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で保持する。entry には
+  smart sharpen 判定用の `used_upscale` も保持する。通常の
   `final_ai_cache` は fullscreen keep-set や `close_fullscreen()` で消えるが、保持 LRU は
   `retained_final_ai_cache_max_entries` / `retained_final_ai_cache_max_mib` の範囲で残る。
-  再表示時は `final_ai_cache` miss の後に保持 LRU を参照し、ヒットした pixels を live cache
+  再表示時は `final_ai_cache` miss の後に保持 LRU を参照し、ヒットした entry を live cache
   へ戻してから final composite を再生成する。AI 入力が変わる編集では該当ページの保持分も
   破棄し、post_filter / smart_sharpen だけの変更では保持する。fullscreen close / reopen
   に伴う同じ item の `fs_cache` 再ロードでは live cache だけを作り直し、保持 LRU は残す。

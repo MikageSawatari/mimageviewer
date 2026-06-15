@@ -9703,10 +9703,13 @@ mod pipeline_cache_refactor_tests {
                 color_ai_hash: 0x22,
                 bg: 0,
             },
-            Arc::new(egui::ColorImage::new(
-                [1, 1],
-                vec![egui::Color32::from_rgb(10, 11, 12)],
-            )),
+            FinalAiEntry {
+                pixels: Arc::new(egui::ColorImage::new(
+                    [1, 1],
+                    vec![egui::Color32::from_rgb(10, 11, 12)],
+                )),
+                used_upscale: true,
+            },
         );
         (edit_key, final_key)
     }
@@ -11501,6 +11504,7 @@ mod pipeline_cache_refactor_tests {
             retained_epoch: 0,
             source_size: [1, 1],
             image: egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            used_upscale: false,
         })
         .unwrap();
 
@@ -11524,6 +11528,7 @@ mod pipeline_cache_refactor_tests {
             retained_epoch: 0,
             source_size: [1, 1],
             image: egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            used_upscale: false,
         })
         .unwrap();
 
@@ -11632,6 +11637,7 @@ mod pipeline_cache_refactor_tests {
             retained_epoch: app.retained_final_ai_epoch,
             source_size: retained_key.edit_size,
             image: egui::ColorImage::new([2, 2], vec![egui::Color32::BLACK; 4]),
+            used_upscale: true,
         })
         .unwrap();
 
@@ -11685,6 +11691,7 @@ mod pipeline_cache_refactor_tests {
             retained_epoch: app.retained_final_ai_epoch,
             source_size: retained_key.edit_size,
             image: egui::ColorImage::new([2, 2], vec![egui::Color32::BLACK; 4]),
+            used_upscale: true,
         })
         .unwrap();
 
@@ -11744,6 +11751,7 @@ mod pipeline_cache_refactor_tests {
             retained_epoch: stale_epoch,
             source_size: retained_key.edit_size,
             image: egui::ColorImage::new([2, 2], vec![egui::Color32::BLACK; 4]),
+            used_upscale: true,
         })
         .unwrap();
 
@@ -12030,7 +12038,10 @@ mod pipeline_cache_refactor_tests {
         };
         app.final_ai_cache.insert(
             base_key,
-            Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
+            FinalAiEntry {
+                pixels: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
+                used_upscale: true,
+            },
         );
         app.insert_retained_final_ai(
             0,
@@ -12476,8 +12487,8 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
-    /// 「AI アップスケール実行時は適用しない」(既定 ON): 合成ベースが実際に
-    /// アップスケール出力 (サイズの変わった AI 結果) のときだけシャープ化を外す。
+    /// 「AI アップスケール実行時は適用しない」(既定 ON): 合成ベースが
+    /// `used_upscale=true` の AI 結果なら、出力サイズが入力と同じでもシャープ化を外す。
     #[test]
     fn smart_sharpen_skips_when_composite_uses_upscaled_ai_result() {
         let ctx = egui::Context::default();
@@ -12517,15 +12528,20 @@ mod pipeline_cache_refactor_tests {
         params.upscale_model = Some("realesr_general_v3".to_string());
         app.adjustment_page_params.insert(idx, params.clone());
 
-        // 2x アップスケール済みの AI 結果 (8x2) を final_ai_cache に直接投入
-        let ai_image = edge_row(8, 2);
+        // render-to-target で入力と同サイズへ着地した upscaler 結果を直接投入
+        let ai_image = edge_row(4, 1);
         let ai_key = FinalAiKey {
             edit_key,
             color_ai_hash: hash_adjust_color_ai_params(&params, app.settings.ai_feature_mode),
             bg: 0,
         };
-        app.final_ai_cache
-            .insert(ai_key, Arc::new(ai_image.clone()));
+        app.final_ai_cache.insert(
+            ai_key,
+            FinalAiEntry {
+                pixels: Arc::new(ai_image.clone()),
+                used_upscale: true,
+            },
+        );
 
         let composite_pixels = |app: &App| {
             app.final_composite_cache
@@ -12535,15 +12551,15 @@ mod pipeline_cache_refactor_tests {
                 .expect("final composite must exist")
         };
 
-        // アップスケール出力 (サイズが入力と異なる) には固定でシャープを掛けない
+        // upscaler 経由の結果には固定でシャープを掛けない
         let _ = app
             .ensure_final_composite_texture(&ctx, idx)
             .expect("composite with upscaled AI result");
         let skipped = composite_pixels(&app);
-        assert_eq!(skipped.size, [8, 2], "AI 結果のサイズで合成される");
+        assert_eq!(skipped.size, [4, 1], "AI 結果のサイズで合成される");
         assert_eq!(
             skipped.pixels, ai_image.pixels,
-            "AI アップスケール出力にはシャープを掛けない (固定動作)"
+            "同サイズへ着地した AI アップスケール出力にもシャープを掛けない (固定動作)"
         );
 
         // 対照: サイズ不変の AI 結果 (デノイズのみ相当) には通常どおりシャープが掛かる
@@ -12557,8 +12573,13 @@ mod pipeline_cache_refactor_tests {
             color_ai_hash: hash_adjust_color_ai_params(&params_dn, app.settings.ai_feature_mode),
             bg: 0,
         };
-        app.final_ai_cache
-            .insert(dn_key, Arc::new(dn_image.clone()));
+        app.final_ai_cache.insert(
+            dn_key,
+            FinalAiEntry {
+                pixels: Arc::new(dn_image.clone()),
+                used_upscale: false,
+            },
+        );
         app.final_composite_cache.clear();
         let _ = app
             .ensure_final_composite_texture(&ctx, idx)

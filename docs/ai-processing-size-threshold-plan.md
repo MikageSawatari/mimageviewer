@@ -1,6 +1,7 @@
 # AI 処理サイズしきい値 修正要件
 
-> ステータス: **実装済み (2026-06-10)**。`final-smart-sharpen-plan.md` とは別管理にする。
+> ステータス: **実装済み (2026-06-10)**。render-to-target 最適化は 2026-06-15 に実装。
+> `final-smart-sharpen-plan.md` とは別管理にする。
 >
 > 実装サマリ:
 >
@@ -9,14 +10,14 @@
 > - `Settings::ai_upscale_size_limit` / `ai_denoise_size_limit` (`Option<AiProcessSizeLimit>`)
 >   を追加。`None` (= 旧設定) は `Settings::ai_upscale_limit()` / `ai_denoise_limit()` が
 >   旧 `*_skip_px` を `N x N` として読み替える。旧フィールドは downgrade 互換のため残置。
-> - 環境設定 UI はラジオボタン → コンボボックス (`AI_SIZE_LIMIT_OPTIONS`、本書の候補 6 種)。
+> - 環境設定 UI はラジオボタン → コンボボックス (`AI_SIZE_LIMIT_OPTIONS`)。
 >   上限変更時は `App::apply_ai_size_limit_change` が final AI cache / failed / pending と
 >   旧 AI cache を無効化する。
-> - 4x 後の縮小は `run_final_ai_job` (AI worker) 内の `clamp_color_image_for_gpu`
->   (premultiplied RGBA8 のまま SIMD リサイズ) で実施。`final_ai_cache` には 8192px 超は
->   入らない。`output_is_ai_upscaled` のサイズ比較は縮小後も成立する (入力長辺 < 4096 <
->   縮小後長辺 8192) — 詳細は `docs/preset-and-adjustment.md` のスマートシャープ節。
-> - 2x モデル追加・streaming downsample・ノイズ除去の原寸適用は本書記載どおり未実装。
+> - final pipeline のアップスケールは 4x 全面 `ColorImage` を作らず、upscaler が
+>   `MAX_TEXTURE_DIM` 以下の target へタイルを直接合成する。`clamp_color_image_for_gpu` は
+>   安全網として残す。`final_ai_cache` entry は pixels と `used_upscale` を持ち、
+>   smart sharpen のスキップ判定はサイズ比較ではなく `used_upscale` を使う。
+> - 2x モデル追加・ノイズ除去の原寸適用は本書記載どおり未実装。
 > - **(旧・既知の制限 → v1.3.1 で解消、GitHub issue #1)**: PDF ページの初回フルスクリーン
 >   レンダは content_type 未解析のため 4096px 固定 (`start_fs_load`)。final AI はレンダ
 >   後のピクセルサイズで判定するので、ラスターページでも初回表示では AI が掛からなかった
@@ -79,12 +80,12 @@
 >     スキャン PDF は Raster のまま対象)。ベクター混在ページの AI 化は別途要検討。
 > - **メモリ過大ガードは意図的に持たない** (2026-06-10 ユーザー判断、Codex P2 への回答):
 >   空きメモリ量に応じて AI 適用可否を変えると挙動が予測できなくなるため、判定は
->   サイズ上限のみで決定的にする。最悪ケース (4095x4095 を 4x) のピークは
->   累積 f32 4 面 ≈ 4.3 GB + 最終 ColorImage ≈ 1.1 GB ≈ **5.4 GB** で、これは設定と
->   画像サイズだけから決定的に見積もれる。高負荷上限 (4096 系) を明示的に選んだ環境で
+>   サイズ上限のみで決定的にする。旧方式では 4x 全面出力の累積 f32 4 面 + 最終
+>   ColorImage がピークを押し上げたが、現行の render-to-target では合成バッファを
+>   最終 target (最大 8192x8192) に抑える。高負荷上限を明示的に選んだ環境で
 >   実メモリが不足した場合のクラッシュは許容仕様。`try_reserve` での graceful fail も
 >   「メモリ次第で AI が掛かったり掛からなかったりする」非決定性を生むため採用しない。
->   UI とマニュアルには「数 GB 消費」の目安を明記して利用者が選択時に判断できるようにする。
+>   UI とマニュアルには高負荷になる旨を明記して利用者が選択時に判断できるようにする。
 
 ## 目的
 
@@ -108,8 +109,8 @@ GPU テクスチャ上限 8192px と、4x アップスケール時の巨大な�
 
 GPU 側は `MAX_TEXTURE_DIM = 8192`。`clamp_for_gpu` は 8192px 超の `ColorImage` を
 UI スレッドで縮小する安全網だが、AI アップスケール後の大画像では重い。
-4x 後に 8192px を超えるケースを許可するなら、UI スレッドの `clamp_for_gpu` に任せず、
-AI worker 側または final AI 結果取り込み前に縮小しておく必要がある。
+final pipeline では upscaler が `MAX_TEXTURE_DIM` 以下の target へ直接合成し、
+UI スレッドの `clamp_for_gpu` に流さない。
 
 ## 現行アップスケールモデル
 
@@ -168,28 +169,30 @@ UI 表記も「4096 x 2048 未満」のようにしておくと境界値の誤�
 4096 x 4096 未満 (高負荷)
 ```
 
-アップスケールは 4x 中間画像が大きくなるため、既定値は従来相当の
+アップスケールは target 合成でもタイル数・合成バッファ・推論時間が大きくなるため、既定値は従来相当の
 `2048 x 2048 未満` のままにする。
 
 ノイズ除去は 1x なので理屈上は `8192 x 8192` まで扱えるが、推論時間とメモリ負荷が大きい。
 初期 UI ではアップスケールと同じ候補に揃え、8192 系は必要なら後で上級者向け候補として追加する。
 
-## 4x 後の縮小
+## 4x 後の最終サイズ合成
 
 現行アップスケールモデルはすべて 4x だが、将来 2x モデルを追加する可能性がある。
 そのため「4x 決め打ち」ではなく、実際の出力サイズで GPU 上限を判定する。
 
 要件:
 
-- final AI 結果の `ColorImage` が `MAX_TEXTURE_DIM` を超える場合、長辺 8192px 以下に縮小する。
-- 縮小は UI スレッドの `clamp_for_gpu` まで遅らせない。
+- final AI 結果の `ColorImage` は `MAX_TEXTURE_DIM` 以下の target サイズへ直接合成する。
+- 4x 全面 `ColorImage` を作ってから縮小する経路へ戻さない。
 - `final_ai_cache` / `final_composite_cache` に極端な 16K 級画像を保持しない。
-- 縮小後も `post_filter` / シャープ化 / GPU upload の順序は保つ。
+- target 合成後も `post_filter` / シャープ化 / GPU upload の順序は保つ。
 
-実装候補:
+実装:
 
-1. `run_final_ai_job` 内で、アップスケール成功直後の `ColorImage` を 8192px 以下へ縮小してから返す。
-2. もしくは `FinalAiResult::Ready` 取り込み時に worker / background 側で縮小済みにする。
+- `run_final_ai_job` は `ai::upscale::upscale_to_max_dim(..., MAX_TEXTURE_DIM)` を呼ぶ。
+- `ai::upscale` はモデル出力座標から target 座標へ逆写像し、既存の overlap weight を
+  target 解像度で累積する。
+- `FinalAiResult::Ready` / `final_ai_cache` / retained cache は `used_upscale` を保持する。
 
 UI スレッドで `image::resize_exact` する経路は避ける。
 
@@ -218,9 +221,10 @@ UI スレッドで `image::resize_exact` する経路は避ける。
 
 ## メモリ目安
 
-現行 `ai::upscale` は、出力サイズ全体に対して RGB 累積 3 面 + weight 1 面の `f32`
-バッファを持ち、最後に `ColorImage` も作る。概算は出力 1 pixel あたり最低 20 bytes
-前後、アルファや一時バッファを含めるとさらに増える。
+`ai::upscale` は、target サイズ全体に対して RGB 累積 3 面 + weight 1 面の `f32`
+バッファを持ち、最後に `ColorImage` も作る。概算は target 1 pixel あたり最低 20 bytes
+前後、アルファやタイル出力を含めるとさらに増える。下の表は旧「4x 全面を作ってから縮小」
+方式なら発生していた中間サイズの目安で、現行方式では target は最大 8192x8192 に抑えられる。
 
 例:
 
@@ -231,11 +235,8 @@ UI スレッドで `image::resize_exact` する経路は避ける。
 4096 x 4096 を 4x        -> 16384 x 16384 = 268 MP  -> 約 5.3 GB 以上
 ```
 
-8192px へ縮小して表示する場合でも、現行方式では一度 4x の全体出力を作る。
-そのため `4096 x 4096 未満` は高スペック向けの上限として扱い、既定値にはしない。
-
-将来さらに大きい入力を扱うなら、4x 全体出力を作らず縮小後サイズへ直接合成する
-streaming downsample が必要になるが、今回の範囲外。
+`4096 x 4096 未満` 以上は、render-to-target 後も最大 8192x8192 の累積バッファと
+多数のタイル推論を使うため、高スペック向けの上限として扱い、既定値にはしない。
 
 ### メモリガード方針 (2026-06-10 決定)
 
@@ -243,9 +244,8 @@ streaming downsample が必要になるが、今回の範囲外。
 空きメモリという実行時状態で AI 適用可否が変わると、同じ画像・同じ設定でも結果が
 変わり挙動を予測できなくなるため。適用可否はサイズ上限 (= ユーザーの明示選択) だけで
 決定的に決まり、実メモリが不足する環境ではクラッシュ (allocator abort) を許容する。
-代わりに UI とマニュアルへ「数 GB 消費」の目安を明記し、利用者が上限選択時に判断
-できるようにする。割り当て箇所のコメント (`src/ai/upscale.rs` の累積バッファ確保) にも
-同じ方針を記載済み。
+代わりに UI とマニュアルへ高負荷になる旨を明記し、利用者が上限選択時に判断
+できるようにする。
 
 ## 8192px 上限について
 
@@ -255,8 +255,8 @@ streaming downsample が必要になるが、今回の範囲外。
 
 5ch などで説明する場合は、
 「互換性のため GPU テクスチャは 1 辺 8192px を上限にしています。
-それ以上は分割描画が必要になり実装がかなり複雑になるため、当面は 4x 後に 8192px 以下へ
-縮小する方向で対応します」
+それ以上は分割描画が必要になり実装がかなり複雑になるため、当面は最終結果を 8192px 以下へ
+直接合成する方向で対応します」
 程度が安全。
 
 ## 実装箇所
@@ -268,10 +268,11 @@ streaming downsample が必要になるが、今回の範囲外。
   - AI 処理しきい値 UI を長辺 x 短辺の候補選択へ変更。
 - `src/ai/upscale.rs`
   - `should_process_rect` を追加し、単体テストを追加。
-  - 必要なら `ColorImage` を 8192px 以下へ縮小する helper を追加。
+  - final pipeline 向けに `upscale_to_max_dim` を追加し、target サイズへ直接合成する。
 - `src/app.rs`
   - `should_process` 呼び出しをすべて新判定へ置き換える。
-  - final AI 結果が 8192px 超のまま cache / texture upload へ流れないようにする。
+  - final AI 結果が 8192px 超のまま cache / texture upload へ流れないようにし、
+    `used_upscale` を cache / retained entry に保持する。
 - `src/ui_adjustment_panel.rs`
   - 「しきい値以上なので AI 無効」表示を新しい長辺 x 短辺表記へ変更。
 
@@ -291,5 +292,4 @@ streaming downsample が必要になるが、今回の範囲外。
 
 - GPU テクスチャ上限そのものを 8192px より上げる。
 - 8192px 超画像の分割テクスチャ描画。
-- 4x 全体出力を作らない streaming downsample。
 - ノイズ除去を、フルスクリーン表示用に 8192px 以下へ縮小される前の原寸画像へ掛ける処理。

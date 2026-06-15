@@ -403,22 +403,16 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
   残る」問題が、保存時正規化 (チェックが勝手に戻る) とも disabled 化 (操作不能) とも
   UX が両立せず、固定動作に変更した (2026-06-10 ユーザー判断。AI 後に追いシャープ
   したい要望が出たら別途検討)。判定は
-  「設定が AI ON か」ではなく **合成ベースが実際にアップスケール出力か**
-  (`base_is_ai && base_pixels.size != edit_pixels.size`)。サイズ比較の前提:
-  アップスケール出力は `run_final_ai_job` の `clamp_color_image_for_gpu` で 8192px
-  まで縮小されることがあるが、AI 入力はサイズ上限の長辺 (≤ MAX_TEXTURE_DIM = 8192)
-  未満なので、クランプ後の長辺 = min(4×入力, 8192) は必ず入力より大きく
-  (入力長辺 L < 8192 なら min(4L,8192) > L)、「アップスケール出力 ⇔ サイズが入力と
-  異なる」は保たれる。サイズ上限の長辺を 8192 超に拡げる、または等倍以下へ縮む経路
-  (1x モデル等) を入れる場合は entry に used_upscale フラグを持たせて置き換える
-  (Codex P2 指摘。`AI_SIZE_LIMIT_OPTIONS` は long_edge ≤ 8192 をテストで保証)。したがって:
+  「設定が AI ON か」ではなく **合成ベースが upscaler 経由の AI 結果か**。
+  `final_ai_cache` / retained entry の `used_upscale` を参照するため、render-to-target で
+  出力サイズが入力と同じになった場合も正しくスキップできる。したがって:
   - デノイズのみの AI 結果 (サイズ不変) には通常どおり掛かる
   - サイズ上限 (`ai_upscale_size_limit`、長辺 x 短辺) で AI がスキップされた
     ページにも掛かる
   - AI 未完了中の暫定合成 (complete=false、非 AI 画像) には掛かり、AI 完了時の
     再合成で外れる (= complete フラグの再合成機構にそのまま乗る)
   - legacy の `apply_sync_adjustment` 経路は `ai_upscale_enabled && ai_upscale_cache hit`
-    で近似 (final pipeline 側がサイズ比較で厳密判定する)
+    で近似 (final pipeline 側は `used_upscale` で厳密判定する)
 - **適用位置**: final pipeline の `色調補正 → final AI → スマートシャープ → post_filter`。
   AI 入力には掛けないので、強度変更で final AI は再実行されない
   (`hash_adjust_final_params` には乗るが `hash_adjust_color_ai_params` には乗せない)。
@@ -457,9 +451,9 @@ final composite の `params_hash` から `post_filter` を外す。モード解�
 | `local_adjust_cache` | `HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>` | 補正レイヤー合成結果。`idx + input_generation + erase_mask_generation + local_adjust_generation` で識別 |
 | `conceal_cache` | `HashMap<idx, ConcealCacheEntry>` | 隠蔽加工合成済みテクスチャ |
 | `edit_result_cache` | `HashMap<EditResultKey, EditResultEntry>` | `raw -> erase -> local_adjust -> conceal` の source 解像度 edit 結果。AdjustParams / AI / post_filter / crop は含めない |
-| `final_ai_cache` | `HashMap<FinalAiKey, Arc<ColorImage>>` | 色調補正後の edit 結果へ AI アップスケール / デノイズを適用した結果 |
-| `retained_final_ai_cache` | `HashMap<RetainedFinalAiKey, RetainedFinalAiEntry>` | fullscreen session をまたいで保持する final AI pixels。`metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で識別し、PDF retained page cache と合算した枚数 / MiB の LRU で退去。PDF display job は session close / keep-set eviction 時に最大 1 件だけ retained store 目的で完走を許可できる |
-| PDF retained page cache | `HashMap<item_key, Raster \| FinalAi>` | PDF ページ専用の保持スロット。PDF レンダリング後は `Raster`、final AI 完了後は同じスロットを `FinalAi` に昇格するため、同一ページのラスタ結果とAI結果を二重保持しない。容量は `retained_final_ai_cache` と同じ設定枠に合算する。`FinalAi` hit 時は raw PDF レンダリングを待たずに final composite を直接復元できる |
+| `final_ai_cache` | `HashMap<FinalAiKey, FinalAiEntry>` | 色調補正後の edit 結果へ AI アップスケール / デノイズを適用した結果。`FinalAiEntry` は `pixels` と smart sharpen 判定用の `used_upscale` を持つ |
+| `retained_final_ai_cache` | `HashMap<RetainedFinalAiKey, RetainedFinalAiEntry>` | fullscreen session をまたいで保持する final AI entry。`metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で識別し、PDF retained page cache と合算した枚数 / MiB の LRU で退去。PDF display job は session close / keep-set eviction 時に最大 1 件だけ retained store 目的で完走を許可できる |
+| PDF retained page cache | `HashMap<item_key, Raster \| FinalAi>` | PDF ページ専用の保持スロット。PDF レンダリング後は `Raster`、final AI 完了後は同じスロットを `FinalAi` に昇格するため、同一ページのラスタ結果とAI結果を二重保持しない。`FinalAi` は `pixels` と `used_upscale` を保持する。容量は `retained_final_ai_cache` と同じ設定枠に合算する。`FinalAi` hit 時は raw PDF レンダリングを待たずに final composite を直接復元できる |
 | `final_composite_cache` | `HashMap<FinalCompositeKey, FinalCompositeEntry>` | edit 結果に AdjustParams 全項目、final AI、スマートシャープ、post_filter を適用した通常表示用テクスチャ |
 
 描画時 ([display-pipeline.md](display-pipeline.md) を参照) は:
@@ -509,7 +503,7 @@ AI を無駄に再実行してしまう)。
 
 の順で最終表示を作る。AI 未完了中は色調補正済み (+シャープ化済み) の画像を暫定表示し、
 AI 完了時に未完了の final composite を捨てて AI 後の画像へ掛け直して再合成する。
-`final_ai_cache` が miss しても `retained_final_ai_cache` が hit した場合は、その pixels を
+`final_ai_cache` が miss しても `retained_final_ai_cache` が hit した場合は、その entry を
 `final_ai_cache` に戻してから同じ合成経路に入る。保持 LRU は `close_fullscreen()` や
 keep-set eviction では消さず、AI 入力が変わる編集 (`clear_final_pipeline_caches_for_idx`)
 や AI 機能モード / サイズ上限変更で破棄する。fullscreen close / reopen に伴う同じ item の
