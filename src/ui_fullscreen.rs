@@ -12141,7 +12141,21 @@ impl App {
             if p.items_gen != self.items_generation {
                 continue;
             }
-            let composed = std::sync::Arc::new(r.pixels);
+            let crate::app::ComicBakeResult {
+                pixels,
+                bake_ms,
+                composite_ms,
+                stamp_decode_ms,
+                stamp_cache_updates,
+                objs,
+                w,
+                h,
+            } = r;
+            let stamp_cache_updates_len = stamp_cache_updates.len();
+            for (key, value) in stamp_cache_updates {
+                self.comic_stamp_cache.entry(key).or_insert(value);
+            }
+            let composed = std::sync::Arc::new(pixels);
             let t_up = std::time::Instant::now();
             let upload = crate::app::clamp_for_gpu(&composed).into_owned();
             let texture = ctx.load_texture(
@@ -12162,13 +12176,21 @@ impl App {
                     None,
                     0,
                     &[
-                        ("ms", (r.bake_ms + r.composite_ms + upload_ms).into()),
-                        ("bake_ms", r.bake_ms.into()),
-                        ("composite_ms", r.composite_ms.into()),
+                        (
+                            "ms",
+                            (stamp_decode_ms + bake_ms + composite_ms + upload_ms).into(),
+                        ),
+                        ("stamp_decode_ms", stamp_decode_ms.into()),
+                        ("bake_ms", bake_ms.into()),
+                        ("composite_ms", composite_ms.into()),
                         ("upload_ms", upload_ms.into()),
-                        ("w", (r.w as u64).into()),
-                        ("h", (r.h as u64).into()),
-                        ("objs", (r.objs as u64).into()),
+                        ("w", (w as u64).into()),
+                        ("h", (h as u64).into()),
+                        ("objs", (objs as u64).into()),
+                        (
+                            "stamp_cache_updates",
+                            (stamp_cache_updates_len as u64).into(),
+                        ),
                         ("preview_scale", (p.preview_scale as u64).into()),
                         ("idx", (i as u64).into()),
                         ("worker", true.into()),

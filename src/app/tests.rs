@@ -15454,6 +15454,52 @@ mod ai_upscale_livelock_tests {
     }
 }
 
+#[test]
+fn comic_worker_stamp_image_builder_decodes_missing_source_once() {
+    use base64::Engine as _;
+
+    let rgba = image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255]).unwrap();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let data: std::sync::Arc<str> = base64::engine::general_purpose::STANDARD
+        .encode(png.into_inner())
+        .into();
+    let source = comic_core::StampSource::Embedded {
+        name: "stamp.png".to_string(),
+        data,
+    };
+    let stamp = comic_core::StampObject {
+        source: source.clone(),
+        half_w: 10.0,
+        half_h: 5.0,
+        ..Default::default()
+    };
+    let objects = vec![
+        comic_core::AnnotationObject::new_stamp(1, (10.0, 10.0), stamp.clone()),
+        comic_core::AnnotationObject::new_stamp(2, (30.0, 10.0), stamp),
+    ];
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut cache = std::collections::HashMap::new();
+
+    let (images, updates, _) =
+        App::build_stamp_images_from_cache_snapshot(&objects, &mut cache, &cancel);
+    assert_eq!(images.len(), 2);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(cache.len(), 1);
+    let key = crate::comic_stamp::stamp_source_key(&source);
+    assert!(cache.get(&key).is_some_and(|v| v.is_some()));
+
+    let (images, updates, _) =
+        App::build_stamp_images_from_cache_snapshot(&objects, &mut cache, &cancel);
+    assert_eq!(images.len(), 2);
+    assert!(
+        updates.is_empty(),
+        "cached source should not be decoded again"
+    );
+}
+
 #[cfg(test)]
 mod pano_settle_size_tests {
     use super::*;

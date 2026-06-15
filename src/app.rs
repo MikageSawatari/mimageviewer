@@ -1549,6 +1549,8 @@ pub(crate) struct ComicBakeResult {
     pub pixels: egui::ColorImage,
     pub bake_ms: f64,
     pub composite_ms: f64,
+    pub stamp_decode_ms: f64,
+    pub stamp_cache_updates: Vec<(String, Option<Arc<comic_core::RgbaOverlay>>)>,
     pub objs: usize,
     pub w: usize,
     pub h: usize,
@@ -4292,8 +4294,9 @@ pub struct App {
     pub(crate) editing_pack_about_loaded: bool,
     /// スタンプ画像のデコードキャッシュ (`stamp_source_key` → 512px straight-alpha
     /// `RgbaOverlay`)。絵文字 SVG / ユーザー画像を 1 度だけデコードし、各ベイクで
-    /// id→Arc の `StampImages` を組み立てる際に再利用する (Inc 4c)。`None` =
-    /// デコード失敗 (ベイカがプレースホルダを描く)。ソースキーは安定なので無効化不要。
+    /// id→Arc の `StampImages` を組み立てる際に再利用する (Inc 4c)。閲覧時の
+    /// cache miss は `comic-bake` worker 側でデコードし、完了時にここへ merge する。
+    /// `None` = デコード失敗 (ベイカがプレースホルダを描く)。ソースキーは安定なので無効化不要。
     pub(crate) comic_stamp_cache:
         std::collections::HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>,
     /// Inc 1 のデモフィクスチャを出すか (環境変数 `MIV_COMIC_DEMO=1` で有効)。
@@ -28415,9 +28418,11 @@ impl App {
     /// canonical (非回転) のまま焼く (D8)。Inc 1 は同期ベイク (conceal と同流儀)。重い
     /// 場合の worker 化 + 1 フレ 1 枚律速は Inc 1-c (§10)。
     /// 与えられたオブジェクト集合からスタンプの `StampImages` (id → `Arc<RgbaOverlay>`) を
-    /// 組み立てる (Inc 4c)。各ソースは `comic_stamp_cache` 経由で 1 度だけデコードし、
-    /// 同じ絵文字/ファイルを使う複数オブジェクトは Arc を共有する。デコード失敗した
-    /// スタンプは map に入れない (= ベイカが `draw_stamp_placeholder` を描く)。
+    /// 組み立てる (Inc 4c)。編集 / export の同期経路用。閲覧時は UI hitch を避けるため、
+    /// `comic-bake` worker 側で cache miss 分をデコードする。
+    /// 各ソースは `comic_stamp_cache` 経由で 1 度だけデコードし、同じ絵文字/ファイルを使う
+    /// 複数オブジェクトは Arc を共有する。デコード失敗したスタンプは map に入れない
+    /// (= ベイカが `draw_stamp_placeholder` を描く)。
     ///
     /// id は `scale_scene` でも保たれ、ソースはスケール非依存 (デコードは 512px ネイティブ、
     /// ベイカが canvas サイズへバイリニア縮小する) なので、元/スケール後どちらの集合から
@@ -28441,6 +28446,46 @@ impl App {
             }
         }
         images
+    }
+
+    fn build_stamp_images_from_cache_snapshot(
+        objects: &[comic_core::AnnotationObject],
+        cache: &mut std::collections::HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> (
+        comic_core::StampImages,
+        Vec<(String, Option<Arc<comic_core::RgbaOverlay>>)>,
+        f64,
+    ) {
+        use comic_core::AnnotationKind;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let mut images = comic_core::StampImages::new();
+        let mut updates = Vec::new();
+        let mut decode_ms = 0.0;
+        for o in objects {
+            if cancel.load(Relaxed) {
+                break;
+            }
+            let AnnotationKind::Stamp(stamp) = &o.kind else {
+                continue;
+            };
+            let key = crate::comic_stamp::stamp_source_key(&stamp.source);
+            let entry = if let Some(entry) = cache.get(&key) {
+                entry.clone()
+            } else {
+                let t_decode = std::time::Instant::now();
+                let decoded = crate::comic_stamp::load_stamp_image(&stamp.source).map(Arc::new);
+                decode_ms += t_decode.elapsed().as_secs_f64() * 1000.0;
+                cache.insert(key.clone(), decoded.clone());
+                updates.push((key, decoded.clone()));
+                decoded
+            };
+            if let Some(img) = entry {
+                images.insert(o.id, img);
+            }
+        }
+        (images, updates, decode_ms)
     }
 
     pub(crate) fn ensure_comic_composite_texture(
@@ -28584,9 +28629,6 @@ impl App {
         // UI は下地 (注釈なし) を表示し続け、完了したら `poll_comic_bake` が GPU upload して
         // `comic_cache` に挿入する。進行中は `draw_comic_bake_overlay` が中央トーストを出す。
         let s_bake = (bw.max(bh) as f32) / src_w.max(src_h).max(1.0);
-        // stamp 画像は decode キャッシュ (&mut self) を使うので UI スレッドで解決してから move。
-        // id はスケール非依存なので unscaled objects から引いてよい。
-        let stamp_images = self.build_stamp_images(&objects);
 
         // 編集中 (text_mode) は **同期ベイク** でライブプレビューする。worker (非同期) だと
         // オブジェクトのドラッグ中は毎フレーム comic_generation が進んで常に未完 → 下地
@@ -28594,6 +28636,9 @@ impl App {
         // preview_scale 1/N + rayon でベイクが軽いので同期で追従できる。閲覧時 (!text_mode、
         // フル解像度・最大数百ms〜1s) だけ worker 化する (フリーズ回避はそちらが本命)。
         if self.text_mode {
+            // 編集中はライブ追従優先。スタンプ選択直後の decode hitch は編集 UI 内の明示操作として
+            // 許容し、通常閲覧では下の worker 経路に寄せる。
+            let stamp_images = self.build_stamp_images(&objects);
             let scaled = if (s_bake - 1.0).abs() > 1e-4 {
                 comic_core::scale_scene(&objects, s_bake)
             } else {
@@ -28630,6 +28675,9 @@ impl App {
         let objs_len = objects.len();
         let fonts_worker = Arc::clone(&fonts);
         let base_worker = Arc::clone(&bake_base);
+        // 閲覧時は stamp key 計算 (Embedded は data hash を含む) も worker 側へ寄せる。
+        // UI 側は既存 cache の HashMap/Arc を浅く clone するだけにする。
+        let mut stamp_cache_snapshot = self.comic_stamp_cache.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_worker = Arc::clone(&cancel);
@@ -28652,6 +28700,15 @@ impl App {
                 } else {
                     objects
                 };
+                let (stamp_images, stamp_cache_updates, stamp_decode_ms) =
+                    Self::build_stamp_images_from_cache_snapshot(
+                        &scaled,
+                        &mut stamp_cache_snapshot,
+                        &cancel_worker,
+                    );
+                if cancel_worker.load(Relaxed) {
+                    return;
+                }
                 let t_bake = std::time::Instant::now();
                 let overlay = comic_core::bake_overlay_with_stamps(
                     &scaled,
@@ -28675,6 +28732,8 @@ impl App {
                     pixels: composed,
                     bake_ms,
                     composite_ms,
+                    stamp_decode_ms,
+                    stamp_cache_updates,
                     objs: objs_len,
                     w: bw,
                     h: bh,
