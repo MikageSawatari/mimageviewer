@@ -598,35 +598,75 @@ pub(crate) fn scan_real_subfolders(
     sort_order: SortOrder,
     cancel: Option<&AtomicBool>,
 ) -> std::io::Result<Vec<PathBuf>> {
+    let perf_start = crate::perf::is_enabled().then(std::time::Instant::now);
+    let mut stats = FolderPaneScanStats::default();
+    let result = scan_real_subfolders_inner(path, sort_order, cancel, &mut stats);
+    if let Some(start) = perf_start {
+        emit_folder_pane_scan_perf(path, sort_order, start, &stats, &result);
+    }
+    result
+}
+
+#[derive(Default)]
+struct FolderPaneScanStats {
+    entries_seen: usize,
+    dirs_returned: usize,
+    entry_errors: usize,
+    file_type_errors: usize,
+    mtime_errors: usize,
+    canceled: bool,
+}
+
+fn scan_real_subfolders_inner(
+    path: &Path,
+    sort_order: SortOrder,
+    cancel: Option<&AtomicBool>,
+    stats: &mut FolderPaneScanStats,
+) -> std::io::Result<Vec<PathBuf>> {
     let mut dirs: Vec<(PathBuf, i64)> = Vec::new();
     let entries = std::fs::read_dir(path)?;
     let use_mtime = matches!(sort_order, SortOrder::DateAsc | SortOrder::DateDesc);
     for entry in entries {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            stats.canceled = true;
             break;
         }
+        stats.entries_seen += 1;
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => continue,
+            Err(_) => {
+                stats.entry_errors += 1;
+                continue;
+            }
         };
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
-            Err(_) => continue,
+            Err(_) => {
+                stats.file_type_errors += 1;
+                continue;
+            }
         };
         if !crate::fs_entry::classify_dir_entry(&entry, &file_type).is_directory() {
             continue;
         }
         let mtime = if use_mtime {
-            entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0)
+            match entry.metadata().and_then(|m| m.modified()) {
+                Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
+                    Ok(d) => d.as_secs() as i64,
+                    Err(_) => {
+                        stats.mtime_errors += 1;
+                        0
+                    }
+                },
+                Err(_) => {
+                    stats.mtime_errors += 1;
+                    0
+                }
+            }
         } else {
             0
         };
+        stats.dirs_returned += 1;
         dirs.push((entry.path(), mtime));
     }
     dirs.sort_by(|a, b| {
@@ -637,6 +677,49 @@ pub(crate) fn scan_real_subfolders(
         })
     });
     Ok(dirs.into_iter().map(|(path, _)| path).collect())
+}
+
+fn emit_folder_pane_scan_perf(
+    path: &Path,
+    sort_order: SortOrder,
+    start: std::time::Instant,
+    stats: &FolderPaneScanStats,
+    result: &std::io::Result<Vec<PathBuf>>,
+) {
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    let use_mtime = matches!(sort_order, SortOrder::DateAsc | SortOrder::DateDesc);
+    let mut fields = vec![
+        ("ms", serde_json::Value::from(ms)),
+        ("entries_seen", serde_json::Value::from(stats.entries_seen)),
+        (
+            "dirs_returned",
+            serde_json::Value::from(stats.dirs_returned),
+        ),
+        ("entry_errors", serde_json::Value::from(stats.entry_errors)),
+        (
+            "file_type_errors",
+            serde_json::Value::from(stats.file_type_errors),
+        ),
+        ("mtime_errors", serde_json::Value::from(stats.mtime_errors)),
+        ("canceled", serde_json::Value::from(stats.canceled)),
+        ("use_mtime", serde_json::Value::from(use_mtime)),
+        ("sort", serde_json::Value::from(format!("{sort_order:?}"))),
+        ("ok", serde_json::Value::from(result.is_ok())),
+    ];
+    if let Err(err) = result {
+        fields.push((
+            "error_kind",
+            serde_json::Value::from(format!("{:?}", err.kind())),
+        ));
+    }
+    let key = path.to_string_lossy();
+    crate::perf::event(
+        "folder_pane",
+        "scan_subfolders",
+        Some(key.as_ref()),
+        0,
+        &fields,
+    );
 }
 
 pub(crate) fn active_filesystem_folder(path: &Path) -> Option<PathBuf> {

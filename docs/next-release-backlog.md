@@ -26,13 +26,13 @@
 
 ## 3. フォルダツリーペイン
 
-### 3.1 scan worker の perf 計装と thread 構成
+### 3.1 folder pane scan worker の thread 構成判断
 
 - 背景: `scan_real_subfolders` はノードごとに短命 thread を spawn する。
-- 現状: cancel 付きで thread leak は見えていないが、低速共有での悪化を追いやすくしたい。
+- 現状: `folder_pane/scan_subfolders` perf event で ms / entry 数 / dir 数 / cancel / error を記録済み。
+  cancel 付きで thread leak は見えていない。
 - 方針:
-  - `scan_real_subfolders` に `perf::event` を追加する。
-  - 実測で問題が出る場合、dispatcher / pool 方式へ寄せる。
+  - 低速共有や大量ノード展開で遅い scan / concurrent scan が見えた場合だけ、dispatcher / pool 方式へ寄せる。
 - 優先度: P3。
 
 ### 3.2 folder pane open scan の優先順位整理

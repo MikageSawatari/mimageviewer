@@ -773,6 +773,7 @@ button_state` / `render_folder_pin_menu_entry` が `None`/false を返してエ�
 - `thumb`  — サムネイル: `enqueue` / `pick` / `skip` / `decode_begin` / `decode_end` / `ready`
 - `pdf`    — PDF ワーカー IPC: `pool_send` / `pool_recv` / `inproc_*` / `enumerate_send`
 - `ai`     — AI: `upscale_begin` / `upscale_tile` / `upscale_end` / `denoise_*` / `job_start` / `job_ready`
+- `folder_pane` — 左フォルダツリーペイン: `scan_subfolders` (子ディレクトリ列挙の ms / 件数 / cancel)
 
 ### 7.4 解析
 
