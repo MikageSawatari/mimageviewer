@@ -926,12 +926,19 @@ pub(crate) struct FolderNavPending {
 /// 数百 ms〜秒) を直接走らせると、ツリーを次々クリックするたびに UI が固まるため
 /// (docs/ui-responsiveness.md §4)。`spawn_folder_nav` の DFS pre-scan と同じ方式。
 pub(crate) struct FolderPaneOpenPending {
-    /// 開く対象 (= 完了時に `load_folder_with_scan(path, Some(scan))` する実ディレクトリ)。
+    /// 開く候補 (= 完了後に通常 nav 優先順位で裁定する実ディレクトリ)。
     path: PathBuf,
     /// 旧 pending を上書き/別 nav 勝利時に立てるキャンセルトークン。
     cancel: Arc<AtomicBool>,
     /// scan worker からの結果チャネル。
     rx: mpsc::Receiver<ScannedDir>,
+}
+
+/// フォルダツリーペインの open scan が完了し、通常 nav と同じ優先順位で
+/// 裁定できるようになった候補。
+pub(crate) struct FolderPaneOpenReady {
+    path: PathBuf,
+    scan: ScannedDir,
 }
 
 /// 親フォルダ上の `ConvertibleArchive` タイル用に、変換済み cache ZIP の対応表を
@@ -16674,14 +16681,16 @@ impl App {
         None
     }
 
-    /// 進行中 / 累積中の Ctrl+↑↓ フォルダナビゲーションを破棄する。
+    /// 進行中 / 累積中のフォルダナビゲーションを破棄する。
     ///
-    /// 検索モードやフルスクリーン状態などの scope が変わると、古い入力を
-    /// 新しい表示状態へ適用すると分かりにくいので明示的に流す。
+    /// Ctrl+↑↓ DFS と folder pane open pre-scan はどちらも「あとからフォルダを開く」
+    /// 入力なので、検索モードやフルスクリーン状態などの scope が変わったら
+    /// 古い入力を新しい表示状態へ適用しないよう明示的に流す。
     pub(crate) fn cancel_pending_folder_nav(&mut self) {
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
+        self.cancel_folder_pane_open();
         self.clear_pending_folder_nav_steps();
         self.release_fs_nav_lock();
     }
@@ -16922,12 +16931,11 @@ impl App {
         }
     }
 
-    /// バックグラウンドフォルダナビゲーションの結果を非同期にポーリングする。
-    /// 結果が到着していれば `Some(FolderNavResult)` を返し、未完了なら `None` を返す。
     /// フォルダツリーペインのクリック/Enter ナビを worker scan 経由で開始する。
     /// UI スレッドで `scan_directory` を直接走らせず、worker で read_dir + メタ取得を
-    /// 済ませてから `poll_folder_pane_open` が `load_folder_with_scan(path, Some(scan))`
-    /// する。対象は実ディレクトリ前提 (フォルダペインは実フォルダのみ表示する)。
+    /// 済ませる。完了結果は `poll_folder_pane_open` で回収し、通常 nav と同じ
+    /// 優先順位で裁定してから開く。対象は実ディレクトリ前提
+    /// (フォルダペインは実フォルダのみ表示する)。
     pub(crate) fn start_folder_pane_open(&mut self, path: PathBuf) {
         // 旧 pending を破棄 (連打で最後のクリックだけ生かす)。
         if let Some(prev) = self.folder_pane_open_pending.take() {
@@ -16957,23 +16965,30 @@ impl App {
         }
     }
 
-    /// `start_folder_pane_open` の worker 完了を毎フレーム回収する。完了したら
-    /// pre-scan 付きで `load_folder_with_scan` し、UI スレッドの read_dir を省く。
-    fn poll_folder_pane_open(&mut self, ctx: &egui::Context) {
+    /// `start_folder_pane_open` の worker 完了を毎フレーム回収する。
+    ///
+    /// 完了してもここでは直接 load せず、通常 nav 優先順位の候補として返す。
+    /// 採用された場合だけ pre-scan 付きで開くことで、UI スレッドの read_dir を省く。
+    fn poll_folder_pane_open(&mut self, ctx: &egui::Context) -> Option<FolderPaneOpenReady> {
         let Some(pending) = self.folder_pane_open_pending.as_ref() else {
-            return;
+            return None;
         };
         match pending.rx.try_recv() {
             Ok(scan) => {
                 let pending = self.folder_pane_open_pending.take().unwrap();
-                self.load_folder_with_scan(pending.path, Some(scan));
+                Some(FolderPaneOpenReady {
+                    path: pending.path,
+                    scan,
+                })
             }
             Err(mpsc::TryRecvError::Empty) => {
                 ctx.request_repaint();
+                None
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 // worker が cancel で send せず終了 (= 自分でキャンセルしたケースのみ)。破棄。
                 self.folder_pane_open_pending = None;
+                None
             }
         }
     }
@@ -33980,16 +33995,31 @@ impl eframe::App for App {
 
         // ── 非同期フォルダナビゲーションのポーリング ────────────────
         // 優先度 (旧来踏襲): fav_nav > toolbar_fav_nav > keyboard/gamepad_nav > folder_nav
-        //                     > address_nav > open_folder_nav > context_nav > grid_nav
+        //                     > address_nav > open_folder_nav > context_nav
+        //                     > folder_pane_open > grid_nav
         // folder_nav は fav/toolbar/keyboard/gamepad より後、address 以下より先。
         let input_nav = fullscreen_close_nav.or(keyboard_nav).or(gamepad_nav);
-        // フォルダツリーペインの worker scan 完了を回収 (完了したら load_folder_with_scan)。
-        self.poll_folder_pane_open(ctx);
         let folder_nav_result = self.poll_folder_nav();
         let folder_nav_wins = folder_nav_result.is_some()
             && fav_nav.is_none()
             && toolbar_fav_nav.is_none()
             && input_nav.is_none();
+        let higher_priority_than_folder_pane = fav_nav.is_some()
+            || toolbar_fav_nav.is_some()
+            || input_nav.is_some()
+            || folder_nav_wins
+            || address_nav.is_some()
+            || open_folder_nav.is_some()
+            || context_nav.is_some();
+        if higher_priority_than_folder_pane {
+            self.cancel_folder_pane_open();
+        }
+        // フォルダツリーペインの worker scan 完了は、通常 nav 優先順位の候補として回収する。
+        let mut folder_pane_open_ready = if higher_priority_than_folder_pane {
+            None
+        } else {
+            self.poll_folder_pane_open(ctx)
+        };
 
         if folder_nav_wins {
             // folder_nav 勝利: モードに応じて load_folder / close+load+open_fullscreen /
@@ -34004,6 +34034,7 @@ impl eframe::App for App {
             // folder_nav が未完了 or 他の高優先 nav 源が勝ったケース
             let higher_priority_direct_nav = fav_nav.or(toolbar_fav_nav);
             let mut history_nav_rollback = None;
+            let mut navigate_pre_scan: Option<ScannedDir> = None;
             let navigate = if higher_priority_direct_nav.is_some() {
                 higher_priority_direct_nav
             } else if let Some(nav) = input_nav.or(address_nav) {
@@ -34042,10 +34073,13 @@ impl eframe::App for App {
             } else if let Some(p) = folder_pane_nav {
                 // フォルダツリーペインのクリック/Enter ナビは worker で scan_directory を
                 // 済ませてから開く (UI スレッドの read_dir が大/遅/ネットワークフォルダで
-                // 固まるのを防ぐ)。同期 load はせず、`poll_folder_pane_open` が完了時に
-                // `load_folder_with_scan(path, Some(scan))` する。対象は実ディレクトリ前提。
+                // 固まるのを防ぐ)。同期 load はせず、完了後に通常 nav 優先順位で裁定する。
+                // 対象は実ディレクトリ前提。
                 self.start_folder_pane_open(p);
                 None
+            } else if let Some(ready) = folder_pane_open_ready.take() {
+                navigate_pre_scan = Some(ready.scan);
+                Some(ready.path)
             } else {
                 grid_nav
             };
@@ -34064,7 +34098,10 @@ impl eframe::App for App {
                     self.record_tag_view_nav_open(&p);
                 }
                 let open_target = p.clone();
-                let open_outcome = self.load_folder_or_convert_archive(p);
+                let open_outcome = match navigate_pre_scan.take() {
+                    Some(scan) => self.load_folder_nav_target(p, Some(scan)),
+                    None => self.load_folder_or_convert_archive(p),
+                };
                 // Ctrl+G 絞り込みビュー中に container (PDF/ZIP/サブフォルダ) を開いたら
                 // current_path を進めておく。BS で「PDF ページ → ヒット一覧 →
                 // Aggregated」の 2 段階で戻れるようにする修正 (2026-04 ユーザー報告)。

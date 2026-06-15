@@ -35,18 +35,6 @@
   - 低速共有や大量ノード展開で遅い scan / concurrent scan が見えた場合だけ、dispatcher / pool 方式へ寄せる。
 - 優先度: P3。
 
-### 3.2 folder pane open scan の優先順位整理
-
-- 背景: folder pane open worker 完了時、通常の nav 優先順位判定より前に
-  `load_folder_with_scan` へ流れる。
-- リスク: 保留中クリックと同フレームの検索開始 / 別ナビが競合すると、古いクリック先が一瞬適用される余地がある。
-- 方針:
-  - folder pane open を通常 nav と同じ優先順位で裁定する。
-  - 高優先操作や検索開始時に `cancel_folder_pane_open` する。
-- 優先度: P3。
-
----
-
 ## 4. 起動 / 単一インスタンス / Explorer 連携
 
 ### 4.1 startup / activation path resolve の worker 化判断

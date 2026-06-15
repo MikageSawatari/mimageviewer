@@ -1595,6 +1595,75 @@ mod phase_c_key_tests {
 }
 
 #[cfg(test)]
+mod folder_pane_open_nav_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+
+    fn empty_scan() -> ScannedDir {
+        ScannedDir {
+            folders: Vec::new(),
+            all_media: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn poll_folder_pane_open_returns_ready_without_loading() {
+        let mut app = setup_app();
+        let target = app.tmp.path().join("pane-target");
+        std::fs::create_dir(&target).expect("create target folder");
+        let current = app.tmp.path().join("current");
+        app.current_folder = Some(current);
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(empty_scan()).expect("send scan");
+        app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            path: target.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        });
+
+        let ctx = egui::Context::default();
+        let ready = app
+            .poll_folder_pane_open(&ctx)
+            .expect("completed pane scan should be returned as a nav candidate");
+
+        assert_eq!(ready.path, target);
+        assert!(ready.scan.folders.is_empty());
+        assert!(ready.scan.all_media.is_empty());
+        assert!(app.folder_pane_open_pending.is_none());
+        assert_ne!(
+            app.current_folder.as_deref(),
+            Some(ready.path.as_path()),
+            "polling a completed pane scan must not bypass normal nav priority"
+        );
+    }
+
+    #[test]
+    fn cancel_pending_folder_nav_cancels_folder_pane_open_scan() {
+        let mut app = setup_app();
+        let target = app.tmp.path().join("pane-target");
+        let (_tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            path: target,
+            cancel: Arc::clone(&cancel),
+            rx,
+        });
+
+        app.cancel_pending_folder_nav();
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.folder_pane_open_pending.is_none());
+    }
+}
+
+#[cfg(test)]
 mod phase_c_folder_nav_history_tests {
     use crate::app::{QuickFolderSlotId, QuickFolderSwitchTarget};
     use crate::archive_converter::ArchiveFormat;
