@@ -1,4 +1,4 @@
-//! 変換済みアーカイブ (RAR / 7z / LZH → ZIP) のキャッシュ管理。
+//! 変換済みアーカイブ (RAR / 7z / LZH / 非 ZIP 入れ子入り ZIP → ZIP) のキャッシュ管理。
 //!
 //! [`archive_converter`] が生成する無圧縮 ZIP を
 //! `<data_dir>/archive_cache/<hash>/<basename>.zip` に保存し、
@@ -81,8 +81,10 @@ pub struct ArchiveCacheEntry {
     pub src_mtime: i64,
     /// 元ファイルのバイトサイズ (記録時点)
     pub src_size: i64,
-    /// 変換形式 (RAR / 7z / LZH)
-    pub format: ArchiveFormat,
+    /// 変換形式 (RAR / 7z / LZH / ZIP)。将来版または旧版由来で不明な DB 値なら None。
+    pub format: Option<ArchiveFormat>,
+    /// DB に保存されていた format 文字列。不明形式でも管理 UI で表示・削除できるよう保持する。
+    pub format_raw: String,
     /// 変換済み ZIP の絶対パス
     pub cached_zip_path: PathBuf,
     /// 変換済み ZIP のバイトサイズ (記録時点)。ファイルが消えていたら 0。
@@ -323,15 +325,14 @@ impl ArchiveCacheDb {
         {
             let src_path = PathBuf::from(&src_str);
             let cached_zip_path = PathBuf::from(&cached_str);
-            let Some(format) = format_from_db(&format_str) else {
-                continue;
-            };
+            let format = format_from_db(&format_str);
             let src_exists = src_path.exists();
             out.push(ArchiveCacheEntry {
                 src_path,
                 src_mtime,
                 src_size,
                 format,
+                format_raw: format_str,
                 cached_zip_path,
                 cached_zip_size,
                 converted_at,
@@ -654,7 +655,57 @@ mod tests {
         assert_eq!(db.lookup(&src, mtime, size), Some(cached.clone()));
         let rows = db.list_all().unwrap();
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].format, Some(ArchiveFormat::Rar));
+        assert_eq!(rows[0].format_raw, "rar");
         assert!(rows[0].password_required);
+    }
+
+    #[test]
+    fn unknown_format_rows_are_listed_and_deletable() {
+        let g = crate::data_dir::TestDataDirGuard::new();
+        let db = ArchiveCacheDb::open().unwrap();
+        let src = g.path().join("future.arc");
+        std::fs::write(&src, b"archive").unwrap();
+        let cached = db.reserve_cache_zip_path(&src).unwrap();
+        std::fs::write(&cached, b"zip").unwrap();
+
+        let meta = std::fs::metadata(&src).unwrap();
+        let src_mtime = crate::ui_helpers::mtime_secs(&meta);
+        let src_size = meta.len() as i64;
+        let key = crate::path_key::normalize(&src);
+        let now = now_secs();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO converted_archives \
+                 (src_path_key, src_path, src_mtime, src_size, format, \
+                  cached_zip_path, cached_zip_size, converted_at, last_access_at, image_count, password_required) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10)",
+                params![
+                    key,
+                    src.to_string_lossy().to_string(),
+                    src_mtime,
+                    src_size,
+                    "future-format",
+                    cached.to_string_lossy().to_string(),
+                    3i64,
+                    now,
+                    1i64,
+                    0i64,
+                ],
+            )
+            .unwrap();
+        }
+
+        let rows = db.list_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].format, None);
+        assert_eq!(rows[0].format_raw, "future-format");
+        assert!(rows[0].src_exists);
+
+        db.delete_entry(&src).unwrap();
+        assert!(!cached.exists());
+        assert!(db.list_all().unwrap().is_empty());
     }
 
     #[test]

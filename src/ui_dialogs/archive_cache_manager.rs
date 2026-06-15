@@ -4,8 +4,8 @@
 //! キャッシュ 1 エントリは数百 MB 〜 GB になりうるため、
 //! ユーザーが一覧から容量を把握して手動で整理できる UI を重視する。
 //!
-//! - 一覧: 元ファイル名 (存在しないものは ✗ + 赤字)・形式 (RAR / 7z / LZH)・
-//!   キャッシュ ZIP サイズ・画像数
+//! - 一覧: 元ファイル名 (存在しないものは ✗ + 赤字)・形式 (RAR / 7z / LZH / ZIP /
+//!   旧形式・不明)・キャッシュ ZIP サイズ・画像数
 //! - 操作: 個別選択削除 / 元ファイル消失を一括削除 / 全削除 / 再読込
 
 #![allow(unused_imports)]
@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use crate::app::App;
+use crate::archive_cache::ArchiveCacheEntry;
 use crate::ui_helpers::{format_bytes, truncate_name};
 
 impl App {
@@ -274,15 +275,9 @@ fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
                                 .color(egui::Color32::from_rgb(180, 60, 60))
                         };
                         ui.label(label).on_hover_text(path_text);
-                        let format_resp = if entry.password_required {
-                            ui.label(format!("{} / PW", entry.format.label()))
-                        } else {
-                            ui.label(entry.format.label())
-                        };
-                        if entry.password_required {
-                            format_resp.on_hover_text(
-                                "パスワード付き RAR から作成したキャッシュです。ZIP キャッシュ自体は暗号化されていません。",
-                            );
+                        let format_resp = ui.label(format_display_text(entry));
+                        if let Some(hover) = format_hover_text(entry) {
+                            format_resp.on_hover_text(hover);
                         }
                         ui.label(format_bytes(entry.cached_zip_size.max(0) as u64));
                         ui.label(format!("{}", entry.image_count));
@@ -290,6 +285,43 @@ fn draw_entry_list(app: &mut App, ui: &mut egui::Ui) {
                     }
                 });
         });
+}
+
+fn format_display_text(entry: &ArchiveCacheEntry) -> String {
+    let mut label = match entry.format {
+        Some(format) => format.label().to_string(),
+        None => {
+            let raw = entry.format_raw.trim();
+            if raw.is_empty() {
+                "旧形式 / 不明".to_string()
+            } else {
+                format!("旧形式 / 不明 ({})", truncate_name(raw, 16))
+            }
+        }
+    };
+    if entry.password_required {
+        label.push_str(" / PW");
+    }
+    label
+}
+
+fn format_hover_text(entry: &ArchiveCacheEntry) -> Option<String> {
+    let mut lines = Vec::new();
+    if entry.format.is_none() {
+        let raw = entry.format_raw.trim();
+        if raw.is_empty() {
+            lines.push("DB の format 値が空です。".to_string());
+        } else {
+            lines.push(format!("DB の format 値: {raw}"));
+        }
+    }
+    if entry.password_required {
+        lines.push(
+            "パスワード付き RAR から作成したキャッシュです。ZIP キャッシュ自体は暗号化されていません。"
+                .to_string(),
+        );
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 fn spawn_delete_selected(app: &mut App, db: std::sync::Arc<crate::archive_cache::ArchiveCacheDb>) {

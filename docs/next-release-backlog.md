@@ -20,16 +20,7 @@
 
 ## 2. アーカイブ / 仮想フォルダ
 
-### 2.1 変換キャッシュ downgrade の UI 不可視
-
-- 背景: 将来または旧版との行き来で未知 `format` 行が `archive_cache::format_from_db` から
-  `None` になり、cache manager UI に出ない。
-- 影響: auto-prune は効くため disk leak ではない。未リリース/互換境界の P3。
-- 方針:
-  - 未知 format を汎用行として表示する、または意図をコメントで固定する。
-  - cache manager 側で削除できる形にするなら、format 文字列の表示名を失わない。
-
-### 2.2 ZipDir サムネ queue routing の再検討
+### 2.1 ZipDir サムネ queue routing の再検討
 
 - 背景: ZipDir サムネ要求は軽量キュー扱いだが、代表解決で ZIP 列挙が走る場合がある。
 - 現状: `zipdir_resolve` 系の perf ログがある前提で、実測を見て振り分け本体を判断する。
