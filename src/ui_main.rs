@@ -897,6 +897,30 @@ fn adjusted_book_reorder_insert_index(src: usize, insert_index: usize, len: usiz
     }
 }
 
+fn book_reorder_drop_target_for_pos(
+    rect: egui::Rect,
+    item_index: usize,
+    len: usize,
+    pointer_pos: Option<egui::Pos2>,
+) -> Option<(usize, f32)> {
+    let pos = pointer_pos?;
+    if !rect.contains(pos) {
+        return None;
+    }
+    let insert_after = pos.x >= rect.center().x;
+    let insert_index = if insert_after {
+        item_index + 1
+    } else {
+        item_index
+    };
+    let indicator_x = if insert_after {
+        rect.right()
+    } else {
+        rect.left()
+    };
+    Some((insert_index.min(len), indicator_x))
+}
+
 fn draw_book_reorder_insert_indicator(ui: &egui::Ui, x: f32, rect: egui::Rect) {
     let y0 = rect.top() + 5.0;
     let y1 = rect.bottom() - 5.0;
@@ -2146,7 +2170,8 @@ impl App {
                 let rows = state.entries.len().div_ceil(cols);
                 let row_height = tile.y + gap;
                 let pointer_released = ui.input(|i| i.pointer.any_released());
-                let pointer_pos = ui.input(|i| i.pointer.interact_pos());
+                let pointer_pos =
+                    ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
                 let mut move_request: Option<(usize, usize)> = None;
                 state.drag_insert_index = None;
                 egui::ScrollArea::vertical().max_height(520.0).show_rows(
@@ -2162,11 +2187,11 @@ impl App {
                                     for col in 0..cols {
                                         let i = row * cols + col;
                                         let Some(entry) = state.entries.get(i) else {
-                                            let (rect, response) =
+                                            let (rect, _) =
                                                 ui.allocate_exact_size(tile, egui::Sense::hover());
                                             if !busy
                                                 && let Some(src) = state.dragging
-                                                && response.hovered()
+                                                && pointer_pos.is_some_and(|pos| rect.contains(pos))
                                             {
                                                 let insert_index = state.entries.len();
                                                 state.drag_insert_index = Some(insert_index);
@@ -2307,19 +2332,20 @@ impl App {
                                         }
                                         if !busy
                                             && let Some(src) = state.dragging
-                                            && response.hovered()
+                                            && let Some((insert_index, indicator_x)) =
+                                                book_reorder_drop_target_for_pos(
+                                                    rect,
+                                                    i,
+                                                    state.entries.len(),
+                                                    pointer_pos,
+                                                )
                                         {
-                                            let insert_after = pointer_pos
-                                                .is_some_and(|pos| pos.x >= rect.center().x);
-                                            let insert_index = if insert_after { i + 1 } else { i };
-                                            state.drag_insert_index =
-                                                Some(insert_index.min(state.entries.len()));
-                                            let x = if insert_after {
-                                                rect.right()
-                                            } else {
-                                                rect.left()
-                                            };
-                                            draw_book_reorder_insert_indicator(ui, x, rect);
+                                            state.drag_insert_index = Some(insert_index);
+                                            draw_book_reorder_insert_indicator(
+                                                ui,
+                                                indicator_x,
+                                                rect,
+                                            );
                                             ui.output_mut(|out| {
                                                 out.cursor_icon = egui::CursorIcon::Text;
                                             });
@@ -6875,6 +6901,43 @@ mod rating_filter_op_tests {
         };
         apply_rating_filter_op(&mut rf, op, 3);
         assert_eq!(rf, crate::settings::default_rating_filter());
+    }
+}
+
+#[cfg(test)]
+mod book_reorder_drag_tests {
+    use super::*;
+
+    #[test]
+    fn drop_target_uses_pointer_position_inside_target_rect() {
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 140.0));
+
+        assert_eq!(
+            book_reorder_drop_target_for_pos(rect, 4, 10, Some(egui::pos2(20.0, 80.0))),
+            Some((4, rect.left()))
+        );
+        assert_eq!(
+            book_reorder_drop_target_for_pos(rect, 4, 10, Some(egui::pos2(95.0, 80.0))),
+            Some((5, rect.right()))
+        );
+    }
+
+    #[test]
+    fn drop_target_ignores_pointer_outside_target_rect() {
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 140.0));
+
+        assert_eq!(
+            book_reorder_drop_target_for_pos(rect, 4, 10, Some(egui::pos2(9.0, 80.0))),
+            None
+        );
+        assert_eq!(book_reorder_drop_target_for_pos(rect, 4, 10, None), None);
+    }
+
+    #[test]
+    fn adjusted_insert_index_accounts_for_removed_source() {
+        assert_eq!(adjusted_book_reorder_insert_index(2, 5, 8), 4);
+        assert_eq!(adjusted_book_reorder_insert_index(5, 2, 8), 2);
+        assert_eq!(adjusted_book_reorder_insert_index(2, 99, 8), 7);
     }
 }
 
