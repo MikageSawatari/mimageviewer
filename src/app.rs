@@ -433,6 +433,9 @@ pub(crate) struct BookReorderState {
     pub(crate) thumb_pending_key: Option<String>,
     pub(crate) thumb_rx: Option<mpsc::Receiver<BookReorderThumbResult>>,
     pub(crate) dirty: bool,
+    pub(crate) discard_confirm: bool,
+    pub(crate) drag_insert_index: Option<usize>,
+    pub(crate) thumb_tile_px: f32,
     pub(crate) flush_pending: Option<crate::books::BookOpPending>,
     pub(crate) error: Option<String>,
 }

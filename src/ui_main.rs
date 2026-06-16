@@ -23,6 +23,10 @@ use crate::ui_helpers::{
     PROGRESS_UPGRADE_COLOR,
 };
 
+const BOOK_REORDER_DEFAULT_TILE_PX: f32 = 78.0;
+const BOOK_REORDER_MIN_TILE_PX: f32 = 64.0;
+const BOOK_REORDER_MAX_TILE_PX: f32 = 132.0;
+
 // ── ★フィルタのツールバー挙動 (Ctrl/Shift/右クリック) ─────────────────
 //
 // 通常クリック: そのバケットをトグル
@@ -873,6 +877,30 @@ fn finish_details_header_drag(
     reorder_details_column(settings, drag.column, target, insert_after)
 }
 
+fn adjusted_book_reorder_insert_index(src: usize, insert_index: usize, len: usize) -> usize {
+    let insert_index = insert_index.min(len);
+    if src < insert_index {
+        insert_index.saturating_sub(1)
+    } else {
+        insert_index
+    }
+}
+
+fn draw_book_reorder_insert_indicator(ui: &egui::Ui, x: f32, rect: egui::Rect) {
+    let y0 = rect.top() + 5.0;
+    let y1 = rect.bottom() - 5.0;
+    if y1 <= y0 {
+        return;
+    }
+    let color = ui.visuals().selection.stroke.color;
+    let stroke = egui::Stroke::new(3.0, color);
+    let cap = 6.0;
+    let painter = ui.painter();
+    painter.line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], stroke);
+    painter.line_segment([egui::pos2(x - cap, y0), egui::pos2(x + cap, y0)], stroke);
+    painter.line_segment([egui::pos2(x - cap, y1), egui::pos2(x + cap, y1)], stroke);
+}
+
 fn draw_details_text(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -1698,6 +1726,9 @@ impl App {
             thumb_pending_key: None,
             thumb_rx: None,
             dirty: false,
+            discard_confirm: false,
+            drag_insert_index: None,
+            thumb_tile_px: BOOK_REORDER_DEFAULT_TILE_PX,
             flush_pending: None,
             error: None,
         });
@@ -2015,30 +2046,61 @@ impl App {
                     ui.colored_label(egui::Color32::from_rgb(210, 80, 80), err);
                 }
                 ui.horizontal(|ui| {
-                    let selected = state.selected.unwrap_or(0);
-                    let can_up = !busy && selected > 0 && !state.entries.is_empty();
-                    let can_down = !busy && selected + 1 < state.entries.len();
-                    if ui.add_enabled(can_up, egui::Button::new("↑")).clicked() {
+                    let selected = state
+                        .selected
+                        .unwrap_or(0)
+                        .min(state.entries.len().saturating_sub(1));
+                    if !state.entries.is_empty() && state.selected != Some(selected) {
+                        state.selected = Some(selected);
+                    }
+                    let can_left = !busy && selected > 0 && !state.entries.is_empty();
+                    let can_right = !busy && selected + 1 < state.entries.len();
+                    if ui
+                        .add_enabled(can_left, egui::Button::new("←"))
+                        .on_hover_text("左へ移動")
+                        .clicked()
+                    {
                         state.entries.swap(selected, selected - 1);
                         state.selected = Some(selected - 1);
                         state.dirty = true;
+                        state.discard_confirm = false;
                     }
-                    if ui.add_enabled(can_down, egui::Button::new("↓")).clicked() {
+                    if ui
+                        .add_enabled(can_right, egui::Button::new("→"))
+                        .on_hover_text("右へ移動")
+                        .clicked()
+                    {
                         state.entries.swap(selected, selected + 1);
                         state.selected = Some(selected + 1);
                         state.dirty = true;
+                        state.discard_confirm = false;
                     }
+                    ui.separator();
+                    let slider = egui::Slider::new(
+                        &mut state.thumb_tile_px,
+                        BOOK_REORDER_MIN_TILE_PX..=BOOK_REORDER_MAX_TILE_PX,
+                    )
+                    .text("サムネ");
+                    ui.add_enabled(!busy, slider);
+                    ui.separator();
                     if ui
-                        .add_enabled(!busy && state.dirty, egui::Button::new("保存して終了"))
+                        .add_enabled(!busy && state.dirty, egui::Button::new("保存して閉じる"))
                         .clicked()
                     {
                         let paths = state.entries.iter().map(|e| e.path.clone()).collect();
                         save_request = Some((state.folder.clone(), paths));
                     }
-                    if ui.add_enabled(!busy, egui::Button::new("閉じる")).clicked() {
+                    let discard_label = if state.dirty {
+                        "編集を破棄"
+                    } else {
+                        "閉じる"
+                    };
+                    if ui
+                        .add_enabled(!busy, egui::Button::new(discard_label))
+                        .clicked()
+                    {
                         if state.dirty {
-                            let paths = state.entries.iter().map(|e| e.path.clone()).collect();
-                            save_request = Some((state.folder.clone(), paths));
+                            state.discard_confirm = true;
                         } else {
                             close = true;
                         }
@@ -2047,8 +2109,25 @@ impl App {
                         ui.label(egui::RichText::new("保存中…").weak());
                     }
                 });
+                if state.discard_confirm {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(210, 120, 40),
+                            "並べ替えの編集内容を破棄しますか？",
+                        );
+                        if ui.add_enabled(!busy, egui::Button::new("破棄")).clicked() {
+                            close = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            state.discard_confirm = false;
+                        }
+                    });
+                }
                 ui.separator();
-                let tile = egui::vec2(78.0, 98.0);
+                state.thumb_tile_px = state
+                    .thumb_tile_px
+                    .clamp(BOOK_REORDER_MIN_TILE_PX, BOOK_REORDER_MAX_TILE_PX);
+                let tile = egui::vec2(state.thumb_tile_px, state.thumb_tile_px + 20.0);
                 let gap = 8.0;
                 let cols = ((ui.available_width() + gap) / (tile.x + gap))
                     .floor()
@@ -2056,7 +2135,9 @@ impl App {
                 let rows = state.entries.len().div_ceil(cols);
                 let row_height = tile.y + gap;
                 let pointer_released = ui.input(|i| i.pointer.any_released());
+                let pointer_pos = ui.input(|i| i.pointer.interact_pos());
                 let mut move_request: Option<(usize, usize)> = None;
+                state.drag_insert_index = None;
                 egui::ScrollArea::vertical().max_height(520.0).show_rows(
                     ui,
                     row_height,
@@ -2070,7 +2151,26 @@ impl App {
                                     for col in 0..cols {
                                         let i = row * cols + col;
                                         let Some(entry) = state.entries.get(i) else {
-                                            ui.allocate_exact_size(tile, egui::Sense::hover());
+                                            let (rect, response) =
+                                                ui.allocate_exact_size(tile, egui::Sense::hover());
+                                            if !busy
+                                                && let Some(src) = state.dragging
+                                                && response.hovered()
+                                            {
+                                                let insert_index = state.entries.len();
+                                                state.drag_insert_index = Some(insert_index);
+                                                draw_book_reorder_insert_indicator(
+                                                    ui,
+                                                    rect.left(),
+                                                    rect,
+                                                );
+                                                ui.output_mut(|out| {
+                                                    out.cursor_icon = egui::CursorIcon::Text;
+                                                });
+                                                if pointer_released {
+                                                    move_request = Some((src, insert_index));
+                                                }
+                                            }
                                             continue;
                                         };
                                         let (rect, response) = ui.allocate_exact_size(
@@ -2192,14 +2292,29 @@ impl App {
                                         if !busy && response.drag_started() {
                                             state.selected = Some(i);
                                             state.dragging = Some(i);
+                                            state.drag_insert_index = Some(i);
                                         }
                                         if !busy
-                                            && pointer_released
-                                            && response.hovered()
                                             && let Some(src) = state.dragging
-                                            && src != i
+                                            && response.hovered()
                                         {
-                                            move_request = Some((src, i));
+                                            let insert_after = pointer_pos
+                                                .is_some_and(|pos| pos.x >= rect.center().x);
+                                            let insert_index = if insert_after { i + 1 } else { i };
+                                            state.drag_insert_index =
+                                                Some(insert_index.min(state.entries.len()));
+                                            let x = if insert_after {
+                                                rect.right()
+                                            } else {
+                                                rect.left()
+                                            };
+                                            draw_book_reorder_insert_indicator(ui, x, rect);
+                                            ui.output_mut(|out| {
+                                                out.cursor_icon = egui::CursorIcon::Text;
+                                            });
+                                            if pointer_released {
+                                                move_request = Some((src, insert_index));
+                                            }
                                         }
                                     }
                                     ui.end_row();
@@ -2207,20 +2322,26 @@ impl App {
                             });
                     },
                 );
-                if let Some((src, dst)) = move_request {
-                    let entry = state.entries.remove(src);
-                    let dst = if src < dst {
-                        dst.saturating_sub(1)
-                    } else {
-                        dst
-                    };
-                    let dst = dst.min(state.entries.len());
-                    state.entries.insert(dst, entry);
-                    state.selected = Some(dst);
-                    state.dirty = true;
+                if let Some((src, insert_index)) = move_request {
+                    let len = state.entries.len();
+                    if src < len {
+                        let dst = adjusted_book_reorder_insert_index(src, insert_index, len);
+                        if src != dst {
+                            let entry = state.entries.remove(src);
+                            let dst = dst.min(state.entries.len());
+                            state.entries.insert(dst, entry);
+                            state.selected = Some(dst);
+                            state.dirty = true;
+                            state.discard_confirm = false;
+                        } else {
+                            state.selected = Some(src);
+                        }
+                    }
                     state.dragging = None;
+                    state.drag_insert_index = None;
                 } else if pointer_released {
                     state.dragging = None;
+                    state.drag_insert_index = None;
                 }
             });
         if let Some((key, path)) = missing_thumb_request {

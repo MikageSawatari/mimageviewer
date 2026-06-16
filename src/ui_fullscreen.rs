@@ -41,6 +41,18 @@ enum BookAddMode {
     Fullscreen,
 }
 
+const BOOK_GRID_VIDEO_HINT: &str =
+    "動画は動画再生中に Ctrl+B を操作すると、そのフレームを本へ追加できます";
+const BOOK_IMAGE_PROCESSING_HINT: &str = "画像処理中です。処理完了後にもう1度操作してください。";
+
+fn friendly_book_add_error(err: String) -> String {
+    if err.contains("最終合成の完了後") {
+        BOOK_IMAGE_PROCESSING_HINT.to_string()
+    } else {
+        err
+    }
+}
+
 pub(crate) mod draw_icons;
 use self::draw_icons::*;
 
@@ -13474,17 +13486,23 @@ impl App {
 
         let mut sources = Vec::new();
         let mut skipped = 0usize;
+        let mut first_error: Option<String> = None;
         for idx in indices {
             match self.book_page_source_for_idx(ctx, idx, BookAddMode::Grid) {
                 Ok(source) => sources.push(source),
                 Err(err) => {
                     skipped += 1;
+                    if first_error.is_none() {
+                        first_error = Some(err.clone());
+                    }
                     crate::logger::log(format!("book add skip idx={idx}: {err}"));
                 }
             }
         }
         if sources.is_empty() {
-            self.show_feedback_toast("選択中に追加できるページがありません".to_string());
+            self.show_feedback_toast(
+                first_error.unwrap_or_else(|| "選択中に追加できるページがありません".to_string()),
+            );
             return;
         }
         let count = sources.len();
@@ -13510,7 +13528,7 @@ impl App {
         let source = match self.book_page_source_for_idx(ctx, fs_idx, BookAddMode::Fullscreen) {
             Ok(source) => source,
             Err(err) => {
-                self.show_feedback_toast(err);
+                self.show_feedback_toast(friendly_book_add_error(err));
                 return;
             }
         };
@@ -13671,6 +13689,9 @@ impl App {
                     format,
                     jpeg_matte,
                 })
+            }
+            GridItem::Video(_) if mode == BookAddMode::Grid => {
+                Err(BOOK_GRID_VIDEO_HINT.to_string())
             }
             _ => Err("このアイテムは本へ追加できません".to_string()),
         }
