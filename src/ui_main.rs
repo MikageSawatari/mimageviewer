@@ -30,7 +30,10 @@ const BOOK_REORDER_THUMB_DECODE_PX: u32 = 360;
 const BOOK_REORDER_THUMB_MAX_IN_FLIGHT: usize = 4;
 const BOOK_REORDER_THUMB_MAX_RECV_PER_FRAME: usize = 32;
 const BOOK_REORDER_THUMB_MAX_UPLOADS_PER_FRAME: usize = 1;
-const BOOK_REORDER_SCROLL_AREA_MAX_HEIGHT: f32 = 520.0;
+const BOOK_REORDER_DEFAULT_WINDOW_W: f32 = 920.0;
+const BOOK_REORDER_DEFAULT_WINDOW_H: f32 = 680.0;
+const BOOK_REORDER_MIN_WINDOW_W: f32 = 560.0;
+const BOOK_REORDER_MIN_WINDOW_H: f32 = 360.0;
 const BOOK_REORDER_SCROLLBAR_RESERVE_PX: f32 = 28.0;
 
 // ── ★フィルタのツールバー挙動 (Ctrl/Shift/右クリック) ─────────────────
@@ -1117,6 +1120,12 @@ fn book_reorder_grid_columns(available_width: f32, tile_width: f32, gap: f32) ->
     let content_width = (available_width - BOOK_REORDER_SCROLLBAR_RESERVE_PX).max(tile_width);
     let natural_columns = ((content_width + gap) / (tile_width + gap)).floor();
     natural_columns.max(4.0) as usize
+}
+
+fn book_reorder_scroll_height(available_height: f32, rows: usize, row_height: f32) -> f32 {
+    let content_height = rows.max(1) as f32 * row_height;
+    let available_height = available_height.max(row_height);
+    content_height.min(available_height).max(row_height)
 }
 
 fn book_reorder_drop_target_for_pos(
@@ -2488,10 +2497,20 @@ impl App {
                     .map(|name| format!("ページ並べ替え: {name}"))
             })
             .unwrap_or_else(|| "ページ並べ替え".to_string());
+        let mut window_open = true;
         egui::Window::new(title)
+            .id(egui::Id::new("book_reorder_window"))
+            .open(&mut window_open)
             .collapsible(false)
             .resizable(true)
-            .default_width(920.0)
+            .default_size(egui::vec2(
+                BOOK_REORDER_DEFAULT_WINDOW_W,
+                BOOK_REORDER_DEFAULT_WINDOW_H,
+            ))
+            .min_size(egui::vec2(
+                BOOK_REORDER_MIN_WINDOW_W,
+                BOOK_REORDER_MIN_WINDOW_H,
+            ))
             .show(ctx, |ui| {
                 let Some(state) = self.book_reorder.as_mut() else {
                     return;
@@ -2659,9 +2678,8 @@ impl App {
                 let cols = book_reorder_grid_columns(scroll_width, tile.x, gap);
                 let rows = state.entries.len().div_ceil(cols);
                 let row_height = tile.y + gap;
-                let scroll_height = (rows.max(1) as f32 * row_height)
-                    .min(BOOK_REORDER_SCROLL_AREA_MAX_HEIGHT)
-                    .max(row_height);
+                let scroll_height =
+                    book_reorder_scroll_height(ui.available_height(), rows, row_height);
                 let pointer_released = ui.input(|i| i.pointer.any_released());
                 let pointer_pos =
                     ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
@@ -2908,6 +2926,21 @@ impl App {
                     state.drag_insert_index = None;
                 }
             });
+        if !window_open
+            && save_request.is_none()
+            && !close
+            && let Some(state) = self.book_reorder.as_ref()
+        {
+            let busy = state.flush_pending.is_some() || state.transfer_pending.is_some();
+            if !busy {
+                if state.dirty {
+                    let paths = state.entries.iter().map(|e| e.path.clone()).collect();
+                    save_request = Some((state.folder.clone(), paths));
+                } else {
+                    close = true;
+                }
+            }
+        }
         if !missing_thumb_requests.is_empty()
             && let Some(state) = self.book_reorder.as_mut()
         {
@@ -7653,6 +7686,14 @@ mod book_reorder_drag_tests {
         assert_eq!(book_reorder_grid_columns(220.0, 78.0, 8.0), 4);
         assert_eq!(book_reorder_grid_columns(900.0, 64.0, 8.0), 12);
         assert_eq!(book_reorder_grid_columns(1540.0, 64.0, 8.0), 21);
+    }
+
+    #[test]
+    fn scroll_height_tracks_resized_reorder_window() {
+        assert_eq!(book_reorder_scroll_height(780.0, 20, 86.0), 780.0);
+        assert_eq!(book_reorder_scroll_height(400.0, 20, 86.0), 400.0);
+        assert_eq!(book_reorder_scroll_height(780.0, 2, 86.0), 172.0);
+        assert_eq!(book_reorder_scroll_height(40.0, 20, 86.0), 86.0);
     }
 
     #[test]
