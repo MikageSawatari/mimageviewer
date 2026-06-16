@@ -5701,6 +5701,58 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.last_book_resume, Some((folder, 0)));
     }
 
+    #[test]
+    fn compiled_book_folder_forces_numeric_sort() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("books");
+        let book = root.join("sample");
+        app.settings.book_root = Some(root.clone());
+        app.settings.sort_order = crate::settings::SortOrder::DateDesc;
+
+        assert_eq!(
+            app.book_sort_order_for_path(&book),
+            crate::settings::SortOrder::Numeric
+        );
+        assert_eq!(
+            app.book_sort_order_for_path(&root),
+            crate::settings::SortOrder::DateDesc,
+            "本棚ルート自体は本一覧なので通常ソート設定を使う"
+        );
+    }
+
+    #[test]
+    fn compiled_book_folder_ignores_non_images_and_keeps_numeric_order() {
+        use crate::grid_item::GridItem;
+
+        let mut app = setup_app();
+        let root = app.tmp.path().join("books");
+        let book = root.join("sample");
+        std::fs::create_dir_all(book.join("subdir")).expect("create test book dirs");
+        std::fs::write(book.join("10_page.jpg"), b"jpg").expect("write image 10");
+        std::fs::write(book.join("2_page.jpg"), b"jpg").expect("write image 2");
+        std::fs::write(book.join("bonus.mp4"), b"video").expect("write video");
+        std::fs::write(book.join("archive.zip"), b"zip").expect("write zip");
+        std::fs::write(book.join("scan.pdf"), b"pdf").expect("write pdf");
+        app.settings.book_root = Some(root);
+        app.settings.sort_order = crate::settings::SortOrder::DateDesc;
+
+        app.load_folder(book);
+
+        let names: Vec<String> = app
+            .items
+            .iter()
+            .map(|item| match item {
+                GridItem::Image(path) => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                _ => panic!("本棚内では画像以外を表示しない"),
+            })
+            .collect();
+        assert_eq!(names, vec!["2_page.jpg", "10_page.jpg"]);
+    }
+
     /// テスト用のネスト ZIP ナビ状態を作る (`C:\test\outer.zip` 固定)。
     fn test_zip_nav(names: &[&str]) -> crate::zip_tree::ZipNavState {
         test_zip_nav_for(std::path::PathBuf::from(r"C:\test\outer.zip"), names)

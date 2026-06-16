@@ -7903,6 +7903,15 @@ impl App {
         let (mut folders, mut folder_metas): (Vec<GridItem>, Vec<Option<(i64, i64)>>) =
             scan.folders.into_iter().unzip();
         let mut all_media = scan.all_media;
+        let is_book_page_folder =
+            crate::books::is_direct_book_folder(&self.book_root_path(), &path);
+        if is_book_page_folder {
+            // 本の中は「番号付き画像だけ」が正本。ユーザーが手動で ZIP/PDF/フォルダ/動画を
+            // 混ぜてもページとして扱わず、通常フォルダ閲覧のコンテナブロックも出さない。
+            folders.clear();
+            folder_metas.clear();
+            all_media.retain(|(_, is_video, _, _)| !*is_video);
+        }
 
         let scan_ms = scan_t0.elapsed().as_secs_f64() * 1000.0;
         let scan_folders = folders.len();
@@ -20698,6 +20707,7 @@ impl App {
 
     pub(crate) fn details_header_sort_active(&self) -> bool {
         self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && !self.current_folder_is_book_folder()
             && self.settings.details_sort_key != crate::settings::DetailsSortKey::Toolbar
     }
 
@@ -20766,7 +20776,7 @@ impl App {
             key = self.settings.details_sort_key;
             ascending = self.settings.details_sort_ascending;
         }
-        if key == crate::settings::DetailsSortKey::Toolbar {
+        if key == crate::settings::DetailsSortKey::Toolbar || self.current_folder_is_book_folder() {
             self.details_order = self.visible_indices.clone();
             return;
         }

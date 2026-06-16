@@ -46,6 +46,9 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   サイズをその場で調整でき、ドラッグ中は挿入先に I 字型インジケータを表示する。左右ボタンで
   1 ページずつ移動でき、「保存して閉じる」で連番ファイル名へ反映し、「編集を破棄」は確認後に
   メモリ上の変更だけを捨てる。
+- 本フォルダ閲覧中はページ順を番号順に固定するため、メニュー/ツールバー/詳細ヘッダの
+  ソート操作は無効化される。手動で混入した ZIP/PDF/フォルダ/動画など、画像以外の項目は
+  本ページとして表示しない。
 
 ### 2.2 フォルダバー
 
@@ -796,7 +799,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `thumb_tooltip_show_video_dimensions` | bool | false | サムネイル情報ツールチップに動画解像度を表示するか。動画長さと同じ遅延メタデータを使う |
 | `thumb_tooltip_show_video_codec` | bool | false | サムネイル情報ツールチップに動画コーデックを表示するか。動画長さと同じ遅延メタデータを使う |
 | `thumb_tooltip_show_location` | bool | false | サムネイル情報ツールチップに親フォルダ / コンテナ名を表示するか。フルパスではなく短い場所名を表示する |
-| `sort_order` | SortOrder | FileName | ソート順（FileName / Natural / MtimeAsc / MtimeDesc） |
+| `sort_order` | SortOrder | FileName | 通常フォルダのソート順（FileName / Numeric / DateAsc / DateDesc）。本フォルダ閲覧中は UI を無効化し、設定値に関わらず番号順固定 |
 | `favorites` | Vec\<FavoriteEntry\> | [] | お気に入りフォルダ (`id: Uuid` + name + path + `auto_index_structure` / `auto_index_metadata` / `auto_index_thumbs` の 3 フラグ, v0.8.0〜) |
 | `last_folder` | Option\<PathBuf\> | None | 前回終了した場所。実フォルダの場合はそのパス、ドライブ一覧の場合は空パス sentinel を保存する。起動時の場所が「前回終了した場所」のときに使用する。実フォルダの末端だけ消えている場合は直近の存在する親フォルダへ遡って開く |
 | `book_root` | Option\<PathBuf\> | None | 製本ルート。`None` のときは `Pictures\mimageviewer\books` を使う。Ctrl+S/Ctrl+G の自動索引対象外。本棚メニューからは Explorer ではなく mIV 内の `本棚` 仮想表示として開く |

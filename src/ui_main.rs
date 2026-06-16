@@ -1218,6 +1218,7 @@ impl App {
         let mut fav_nav: Option<PathBuf> = None;
         let mut settings_changed = false;
         let mut sort_changed = false;
+        let book_sort_locked = self.current_folder_is_book_folder();
         let selected_video_path =
             self.selected
                 .and_then(|idx| self.items.get(idx))
@@ -1599,17 +1600,22 @@ impl App {
                             }
                         }
                     });
-                    ui.menu_button("ソート順", |ui| {
-                        for &order in crate::settings::SortOrder::all() {
-                            let checked = self.settings.sort_order == order;
-                            let prefix = if checked { "✓ " } else { "  " };
-                            if ui.button(format!("{prefix}{}", order.label())).clicked() {
-                                self.settings.sort_order = order;
-                                sort_changed = true;
-                                ui.close();
+                    if book_sort_locked {
+                        ui.add_enabled(false, egui::Button::new("ソート順: 番号順固定"))
+                            .on_hover_text("本棚内はページ番号順で固定されます。");
+                    } else {
+                        ui.menu_button("ソート順", |ui| {
+                            for &order in crate::settings::SortOrder::all() {
+                                let checked = self.settings.sort_order == order;
+                                let prefix = if checked { "✓ " } else { "  " };
+                                if ui.button(format!("{prefix}{}", order.label())).clicked() {
+                                    self.settings.sort_order = order;
+                                    sort_changed = true;
+                                    ui.close();
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                     ui.separator();
                     if ui.button("サムネイルキャッシュ管理").clicked() {
                         let cache_dir = crate::catalog::default_cache_dir();
@@ -2602,6 +2608,7 @@ impl App {
         let show_rating = self.settings.show_toolbar_rating;
         let show_tags = self.settings.show_toolbar_tags;
         let show_folder_tree_button = self.settings.show_toolbar_folder_tree_button;
+        let book_sort_locked = self.current_folder_is_book_folder();
         let any_toolbar_section = show_folder_tree_button
             || show_cols
             || show_aspect
@@ -2867,9 +2874,12 @@ impl App {
                     if !first_section {
                         ui.separator();
                     }
-                    let sort_disabled = self.details_header_sort_active();
+                    let details_sort_disabled = self.details_header_sort_active();
+                    let sort_disabled = details_sort_disabled || book_sort_locked;
                     let sort_label = toolbar_label(ui, "ソート:", 54.0);
-                    if sort_disabled {
+                    if book_sort_locked {
+                        sort_label.hover_tip("本棚内はページ番号順で固定されます。");
+                    } else if details_sort_disabled {
                         sort_label.hover_tip(
                             "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。",
                         );
@@ -2878,7 +2888,11 @@ impl App {
                         match self.settings.toolbar_sort_display {
                             crate::settings::ToolbarSectionDisplay::Buttons => {
                                 for &order in &tb_sorts {
-                                    let selected = self.settings.sort_order == order;
+                                    let selected = if book_sort_locked {
+                                        order == crate::settings::SortOrder::Numeric
+                                    } else {
+                                        self.settings.sort_order == order
+                                    };
                                     if ui
                                         .selectable_label(selected, order.short_label())
                                         .clicked()
@@ -2891,8 +2905,11 @@ impl App {
                                 }
                             }
                             crate::settings::ToolbarSectionDisplay::Dropdown => {
-                                let current_text =
-                                    self.settings.sort_order.short_label().to_string();
+                                let current_text = if book_sort_locked {
+                                    "番号固定".to_string()
+                                } else {
+                                    self.settings.sort_order.short_label().to_string()
+                                };
                                 let combo = egui::ComboBox::from_id_salt("toolbar_sort_combo")
                                     .width(100.0)
                                     .height(TOOLBAR_SORT_COMBO_HEIGHT)
@@ -5647,6 +5664,7 @@ impl App {
         let stroke_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
         let text_color = ui.visuals().strong_text_color();
         let hover_bg = ui.visuals().widgets.hovered.bg_fill;
+        let book_sort_locked = self.current_folder_is_book_folder();
         ui.painter().rect_filled(rect, 0.0, bg);
         ui.painter().line_segment(
             [rect.left_bottom(), rect.right_bottom()],
@@ -5670,7 +5688,9 @@ impl App {
             }
             let sort_key = col.sort_key();
             let lazy_sort = col.is_lazy();
-            let sort_enabled = sort_key.is_some() && (!lazy_sort || self.details_lazy_sort_ready());
+            let sort_enabled = !book_sort_locked
+                && sort_key.is_some()
+                && (!lazy_sort || self.details_lazy_sort_ready());
             if response.clicked() && sort_enabled {
                 if let Some(sort_key) = sort_key {
                     self.set_details_sort_key(sort_key);
@@ -5736,8 +5756,8 @@ impl App {
                     }
                 }
             }
-            let sorted =
-                sort_key.is_some_and(|sort_key| self.settings.details_sort_key == sort_key);
+            let sorted = !book_sort_locked
+                && sort_key.is_some_and(|sort_key| self.settings.details_sort_key == sort_key);
             let mut base_title = col.title().to_string();
             if matches!(
                 col,
@@ -5818,6 +5838,8 @@ impl App {
             }
             let response = if sort_enabled {
                 response.hover_tip("クリックで 昇順 → 降順 → ソートなし")
+            } else if book_sort_locked && sort_key.is_some() {
+                response.hover_tip("本棚内はページ番号順で固定されます")
             } else if sort_key.is_none() {
                 response.hover_tip("サムネイルプレビュー")
             } else {
