@@ -264,9 +264,11 @@ const AI_FACET_MENU_WIDTH: f32 = 520.0;
 const AI_FACET_MENU_VISIBLE_ROWS: usize = 18;
 
 fn ai_facet_choice_body_height(ui: &egui::Ui, choice_count: usize) -> f32 {
-    let row_h = ui.spacing().interact_size.y.max(22.0);
+    let spacing = ui.spacing();
+    let row_h = spacing.interact_size.y.max(22.0);
     let rows = choice_count.min(AI_FACET_MENU_VISIBLE_ROWS).max(1) as f32;
-    row_h * rows + 6.0
+    let gaps = (rows - 1.0).max(0.0) * spacing.item_spacing.y;
+    row_h * rows + gaps + spacing.item_spacing.y * 2.0 + 4.0
 }
 
 fn show_ai_facet_choices<R>(
@@ -274,6 +276,15 @@ fn show_ai_facet_choices<R>(
     choice_count: usize,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
+    if choice_count <= AI_FACET_MENU_VISIBLE_ROWS {
+        return ui
+            .scope(|ui| {
+                ui.set_width(AI_FACET_MENU_WIDTH);
+                add_contents(ui)
+            })
+            .inner;
+    }
+
     let body_height = ai_facet_choice_body_height(ui, choice_count);
     ui.allocate_ui_with_layout(
         egui::vec2(AI_FACET_MENU_WIDTH, body_height),
