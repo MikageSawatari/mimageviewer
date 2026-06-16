@@ -2047,6 +2047,7 @@ impl App {
             selected_keys,
             selection_anchor: Some(0),
             dragging: None,
+            drag_auto_scroll_enabled: false,
             scroll_offset_y: 0.0,
             thumb_textures: HashMap::new(),
             thumb_failed: HashSet::new(),
@@ -2355,6 +2356,7 @@ impl App {
                                 state.entries = summary.source_entries;
                                 state.dirty = false;
                                 state.dragging = None;
+                                state.drag_auto_scroll_enabled = false;
                                 state.drag_insert_index = None;
                                 state.thumb_textures.clear();
                                 state.thumb_failed.clear();
@@ -2591,6 +2593,7 @@ impl App {
                     {
                         state.selected = Some(src);
                         state.dragging = Some(src);
+                        state.drag_auto_scroll_enabled = false;
                         state.drag_insert_index = Some(src);
                     }
                     ui.separator();
@@ -2919,6 +2922,7 @@ impl App {
                                                         state.selected = Some(i);
                                                     }
                                                     state.dragging = Some(i);
+                                                    state.drag_auto_scroll_enabled = true;
                                                     state.drag_insert_index = Some(i);
                                                 }
                                                 if !busy
@@ -2955,6 +2959,7 @@ impl App {
                         if !busy
                             && !pointer_released
                             && state.dragging.is_some()
+                            && state.drag_auto_scroll_enabled
                             && let Some(pos) = pointer_pos
                         {
                             let delta = book_reorder_auto_scroll_delta(
@@ -2981,9 +2986,11 @@ impl App {
                         }
                     }
                     state.dragging = None;
+                    state.drag_auto_scroll_enabled = false;
                     state.drag_insert_index = None;
                 } else if pointer_released {
                     state.dragging = None;
+                    state.drag_auto_scroll_enabled = false;
                     state.drag_insert_index = None;
                 }
             });
@@ -7632,6 +7639,7 @@ mod book_reorder_drag_tests {
             selected_keys,
             selection_anchor: Some(0),
             dragging: None,
+            drag_auto_scroll_enabled: false,
             scroll_offset_y: 0.0,
             thumb_textures: HashMap::new(),
             thumb_failed: HashSet::new(),

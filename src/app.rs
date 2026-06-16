@@ -430,6 +430,7 @@ pub(crate) struct BookReorderState {
     pub(crate) selected_keys: std::collections::HashSet<String>,
     pub(crate) selection_anchor: Option<usize>,
     pub(crate) dragging: Option<usize>,
+    pub(crate) drag_auto_scroll_enabled: bool,
     pub(crate) scroll_offset_y: f32,
     pub(crate) thumb_textures: std::collections::HashMap<String, egui::TextureHandle>,
     pub(crate) thumb_failed: std::collections::HashSet<String>,
