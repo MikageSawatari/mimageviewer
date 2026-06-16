@@ -3,7 +3,7 @@
 //! `App::update()` から呼ばれるメニューバー・ツールバー・フォルダバー・
 //! グリッド・進捗オーバーレイ・選択情報オーバーレイの描画メソッドを集約。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -26,6 +26,10 @@ use crate::ui_helpers::{
 const BOOK_REORDER_DEFAULT_TILE_PX: f32 = 78.0;
 const BOOK_REORDER_MIN_TILE_PX: f32 = 64.0;
 const BOOK_REORDER_MAX_TILE_PX: f32 = 132.0;
+const BOOK_REORDER_THUMB_DECODE_PX: u32 = 360;
+const BOOK_REORDER_THUMB_MAX_IN_FLIGHT: usize = 4;
+const BOOK_REORDER_THUMB_MAX_RECV_PER_FRAME: usize = 32;
+const BOOK_REORDER_THUMB_MAX_UPLOADS_PER_FRAME: usize = 1;
 
 // ── ★フィルタのツールバー挙動 (Ctrl/Shift/右クリック) ─────────────────
 //
@@ -2009,7 +2013,9 @@ impl App {
             dragging: None,
             thumb_textures: HashMap::new(),
             thumb_failed: HashSet::new(),
-            thumb_pending_key: None,
+            thumb_pending_keys: HashSet::new(),
+            thumb_upload_backlog: VecDeque::new(),
+            thumb_tx: None,
             thumb_rx: None,
             dirty: false,
             drag_insert_index: None,
@@ -2315,7 +2321,9 @@ impl App {
                                 state.drag_insert_index = None;
                                 state.thumb_textures.clear();
                                 state.thumb_failed.clear();
-                                state.thumb_pending_key = None;
+                                state.thumb_pending_keys.clear();
+                                state.thumb_upload_backlog.clear();
+                                state.thumb_tx = None;
                                 state.thumb_rx = None;
                                 state.selected_keys.clear();
                                 if state.entries.is_empty() {
@@ -2361,40 +2369,70 @@ impl App {
             }
         }
 
-        let mut thumb_result: Option<crate::app::BookReorderThumbResult> = None;
+        let mut thumb_results = Vec::new();
         let mut thumb_disconnected = false;
         if let Some(state) = self.book_reorder.as_ref()
             && let Some(rx) = state.thumb_rx.as_ref()
         {
-            match rx.try_recv() {
-                Ok(result) => thumb_result = Some(result),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    thumb_disconnected = true;
+            for _ in 0..BOOK_REORDER_THUMB_MAX_RECV_PER_FRAME {
+                match rx.try_recv() {
+                    Ok(result) => thumb_results.push(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        thumb_disconnected = true;
+                        break;
+                    }
                 }
             }
         }
-        if let Some(result) = thumb_result {
-            if let Some(state) = self.book_reorder.as_mut() {
-                state.thumb_rx = None;
-                state.thumb_pending_key = None;
+        if !thumb_results.is_empty()
+            && let Some(state) = self.book_reorder.as_mut()
+        {
+            state.thumb_upload_backlog.extend(thumb_results);
+        }
+        if let Some(state) = self.book_reorder.as_mut() {
+            let mut uploads = 0usize;
+            while let Some(result) = state.thumb_upload_backlog.pop_front() {
                 if let Some(image) = result.image {
+                    if uploads >= BOOK_REORDER_THUMB_MAX_UPLOADS_PER_FRAME {
+                        state
+                            .thumb_upload_backlog
+                            .push_front(crate::app::BookReorderThumbResult {
+                                key: result.key,
+                                image: Some(image),
+                            });
+                        break;
+                    }
                     let texture = ctx.load_texture(
                         format!("book-reorder-thumb-{}", result.key),
                         image,
                         egui::TextureOptions::LINEAR,
                     );
+                    state.thumb_pending_keys.remove(&result.key);
                     state.thumb_textures.insert(result.key, texture);
+                    uploads += 1;
                 } else {
+                    state.thumb_pending_keys.remove(&result.key);
                     state.thumb_failed.insert(result.key);
                 }
             }
-            ctx.request_repaint();
-        } else if thumb_disconnected && let Some(state) = self.book_reorder.as_mut() {
+            if !state.thumb_pending_keys.is_empty() || !state.thumb_upload_backlog.is_empty() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+        }
+        if thumb_disconnected && let Some(state) = self.book_reorder.as_mut() {
+            let backlog_keys = state
+                .thumb_upload_backlog
+                .iter()
+                .map(|result| result.key.clone())
+                .collect::<HashSet<_>>();
+            state
+                .thumb_pending_keys
+                .retain(|key| backlog_keys.contains(key));
+            state.thumb_tx = None;
             state.thumb_rx = None;
-            state.thumb_pending_key = None;
             ctx.request_repaint();
         }
 
@@ -2411,7 +2449,7 @@ impl App {
             String,
             crate::books::BookTransferKind,
         )> = None;
-        let mut missing_thumb_request: Option<(String, PathBuf)> = None;
+        let mut missing_thumb_requests: Vec<(String, PathBuf)> = Vec::new();
         let mut thumb_by_path: HashMap<String, egui::TextureHandle> = self
             .book_reorder
             .as_ref()
@@ -2696,12 +2734,10 @@ impl App {
                                         let texture = thumb_by_path.get(&key);
                                         if texture.is_none()
                                             && !state.thumb_failed.contains(&key)
-                                            && missing_thumb_request.is_none()
-                                            && state.thumb_rx.is_none()
-                                            && state.thumb_pending_key.is_none()
+                                            && !state.thumb_pending_keys.contains(&key)
                                         {
-                                            missing_thumb_request =
-                                                Some((key.clone(), entry.path.clone()));
+                                            missing_thumb_requests
+                                                .push((key.clone(), entry.path.clone()));
                                         }
                                         let image_rect = rect.shrink2(egui::vec2(6.0, 18.0));
                                         if let Some(tex) = texture {
@@ -2842,29 +2878,69 @@ impl App {
                     state.drag_insert_index = None;
                 }
             });
-        if let Some((key, path)) = missing_thumb_request {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let key_for_worker = key.clone();
-            let spawn_result = std::thread::Builder::new()
-                .name("book-reorder-thumb".into())
-                .spawn(move || {
-                    let image = crate::thumb_loader::decode_image_for_thumb(&path, 360);
-                    let _ = tx.send(crate::app::BookReorderThumbResult {
-                        key: key_for_worker,
-                        image,
-                    });
-                });
-            if let Some(state) = self.book_reorder.as_mut() {
-                match spawn_result {
-                    Ok(_) => {
-                        state.thumb_rx = Some(rx);
-                        state.thumb_pending_key = Some(key);
-                        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        if !missing_thumb_requests.is_empty()
+            && let Some(state) = self.book_reorder.as_mut()
+        {
+            if state.thumb_rx.is_none() || state.thumb_tx.is_none() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                state.thumb_tx = Some(tx);
+                state.thumb_rx = Some(rx);
+            }
+            let available =
+                BOOK_REORDER_THUMB_MAX_IN_FLIGHT.saturating_sub(state.thumb_pending_keys.len());
+            let mut scheduled = 0usize;
+            let tx = state.thumb_tx.clone();
+            if let Some(tx) = tx {
+                for (key, path) in missing_thumb_requests {
+                    if scheduled >= available {
+                        break;
                     }
-                    Err(err) => {
-                        state.error = Some(format!("サムネイル読み込みを開始できません: {err}"));
+                    if state.thumb_textures.contains_key(&key)
+                        || state.thumb_failed.contains(&key)
+                        || !state.thumb_pending_keys.insert(key.clone())
+                    {
+                        continue;
+                    }
+                    let tx = tx.clone();
+                    let key_for_worker = key.clone();
+                    let spawn_result = std::thread::Builder::new()
+                        .name("book-reorder-thumb".into())
+                        .spawn(move || {
+                            let image =
+                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    crate::thumb_loader::decode_image_for_thumb(
+                                        &path,
+                                        BOOK_REORDER_THUMB_DECODE_PX,
+                                    )
+                                })) {
+                                    Ok(image) => image,
+                                    Err(_) => {
+                                        crate::logger::log(format!(
+                                            "book reorder thumbnail decode panicked: {}",
+                                            path.display()
+                                        ));
+                                        None
+                                    }
+                                };
+                            let _ = tx.send(crate::app::BookReorderThumbResult {
+                                key: key_for_worker,
+                                image,
+                            });
+                        });
+                    match spawn_result {
+                        Ok(_) => {
+                            scheduled += 1;
+                        }
+                        Err(err) => {
+                            state.thumb_pending_keys.remove(&key);
+                            state.error =
+                                Some(format!("サムネイル読み込みを開始できません: {err}"));
+                        }
                     }
                 }
+            }
+            if scheduled > 0 {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
             }
         }
         if let Some((folder, current_order, selected_paths, target_book, kind)) = transfer_request {
@@ -7434,7 +7510,9 @@ mod book_reorder_drag_tests {
             dragging: None,
             thumb_textures: HashMap::new(),
             thumb_failed: HashSet::new(),
-            thumb_pending_key: None,
+            thumb_pending_keys: HashSet::new(),
+            thumb_upload_backlog: VecDeque::new(),
+            thumb_tx: None,
             thumb_rx: None,
             dirty: false,
             drag_insert_index: None,
