@@ -38,6 +38,14 @@ const BOOK_REORDER_SCROLLBAR_RESERVE_PX: f32 = 28.0;
 const BOOK_REORDER_AUTO_SCROLL_EDGE_PX: f32 = 64.0;
 const BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX: f32 = 34.0;
 
+#[derive(Clone, Copy)]
+enum BookReorderScrollKey {
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+
 // ── ★フィルタのツールバー挙動 (Ctrl/Shift/右クリック) ─────────────────
 //
 // 通常クリック: そのバケットをトグル
@@ -1145,6 +1153,24 @@ fn book_reorder_auto_scroll_delta(pointer_y: f32, viewport_top: f32, viewport_bo
     } else {
         0.0
     }
+}
+
+fn book_reorder_keyboard_scroll_offset(
+    current_offset: f32,
+    content_height: f32,
+    viewport_height: f32,
+    row_height: f32,
+    key: BookReorderScrollKey,
+) -> f32 {
+    let max_offset = (content_height - viewport_height).max(0.0);
+    let page_step = (viewport_height - row_height).max(row_height);
+    match key {
+        BookReorderScrollKey::PageUp => current_offset - page_step,
+        BookReorderScrollKey::PageDown => current_offset + page_step,
+        BookReorderScrollKey::Home => 0.0,
+        BookReorderScrollKey::End => max_offset,
+    }
+    .clamp(0.0, max_offset)
 }
 
 fn book_reorder_drop_target_for_pos(
@@ -2488,6 +2514,7 @@ impl App {
             String,
             crate::books::BookTransferKind,
         )> = None;
+        let mut transfer_combo_open = false;
         let mut missing_thumb_requests: Vec<(String, PathBuf)> = Vec::new();
         let mut thumb_by_path: HashMap<String, egui::TextureHandle> = self
             .book_reorder
@@ -2639,6 +2666,7 @@ impl App {
                             }
                         });
                     if egui::ComboBox::is_open(ctx, combo.response.id) {
+                        transfer_combo_open = true;
                         consume_wheel_input(ctx);
                     }
                     ui.label("へ");
@@ -2722,6 +2750,31 @@ impl App {
                 let row_height = tile.y + gap;
                 let scroll_height =
                     book_reorder_scroll_height(ui.available_height(), rows, row_height);
+                if !transfer_combo_open && state.dragging.is_none() {
+                    let scroll_key = ctx.input_mut(|i| {
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
+                            Some(BookReorderScrollKey::PageUp)
+                        } else if i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
+                            Some(BookReorderScrollKey::PageDown)
+                        } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
+                            Some(BookReorderScrollKey::Home)
+                        } else if i.consume_key(egui::Modifiers::NONE, egui::Key::End) {
+                            Some(BookReorderScrollKey::End)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(key) = scroll_key {
+                        let content_height = rows.max(1) as f32 * row_height;
+                        state.scroll_offset_y = book_reorder_keyboard_scroll_offset(
+                            state.scroll_offset_y,
+                            content_height,
+                            scroll_height,
+                            row_height,
+                            key,
+                        );
+                    }
+                }
                 let pointer_released = ui.input(|i| i.pointer.any_released());
                 let pointer_pos =
                     ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
@@ -7778,6 +7831,54 @@ mod book_reorder_drag_tests {
         assert_eq!(
             book_reorder_auto_scroll_delta(500.0, 100.0, 500.0),
             BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX
+        );
+    }
+
+    #[test]
+    fn keyboard_scroll_moves_reorder_view_without_selection_cursor() {
+        let content_h = 2000.0;
+        let viewport_h = 500.0;
+        let row_h = 86.0;
+
+        assert_eq!(
+            book_reorder_keyboard_scroll_offset(
+                300.0,
+                content_h,
+                viewport_h,
+                row_h,
+                BookReorderScrollKey::PageDown
+            ),
+            714.0
+        );
+        assert_eq!(
+            book_reorder_keyboard_scroll_offset(
+                300.0,
+                content_h,
+                viewport_h,
+                row_h,
+                BookReorderScrollKey::PageUp
+            ),
+            0.0
+        );
+        assert_eq!(
+            book_reorder_keyboard_scroll_offset(
+                300.0,
+                content_h,
+                viewport_h,
+                row_h,
+                BookReorderScrollKey::Home
+            ),
+            0.0
+        );
+        assert_eq!(
+            book_reorder_keyboard_scroll_offset(
+                300.0,
+                content_h,
+                viewport_h,
+                row_h,
+                BookReorderScrollKey::End
+            ),
+            1500.0
         );
     }
 
