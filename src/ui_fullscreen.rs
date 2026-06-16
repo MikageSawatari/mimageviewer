@@ -837,6 +837,12 @@ fn rotated_display_size(size: egui::Vec2, rotation: crate::rotation_db::Rotation
     }
 }
 
+fn fit_display_size_in_rect(rect: egui::Rect, display_size: egui::Vec2) -> egui::Rect {
+    let fit_scale =
+        (rect.width() / display_size.x.max(1.0)).min(rect.height() / display_size.y.max(1.0));
+    egui::Rect::from_center_size(rect.center(), display_size * fit_scale)
+}
+
 fn valid_layout_size_or_fallback(size: egui::Vec2, fallback: egui::Vec2) -> egui::Vec2 {
     if size.x > 0.0 && size.y > 0.0 {
         size
@@ -10995,8 +11001,7 @@ impl App {
                 }
                 _ => tex_size,
             };
-            let fit_scale = (rect.width() / display_size.x).min(rect.height() / display_size.y);
-            let img_rect = egui::Rect::from_center_size(rect.center(), display_size * fit_scale);
+            let img_rect = fit_display_size_in_rect(rect, display_size);
             // 回転中は bbox のズレを避けて背景を適用しない
             if rotation.is_none() {
                 paint_transparent_bg(painter, img_rect, bg_style);
@@ -13111,6 +13116,16 @@ impl App {
         egui::Rect::from_center_size(center, display_size * total_scale)
     }
 
+    fn capture_region_spread_image_rect_for_source(
+        page_rect: egui::Rect,
+        source_size: [usize; 2],
+        rotation: crate::rotation_db::Rotation,
+    ) -> egui::Rect {
+        let tex_size = egui::vec2(source_size[0].max(1) as f32, source_size[1].max(1) as f32);
+        let display_size = rotated_display_size(tex_size, rotation);
+        fit_display_size_in_rect(page_rect, display_size)
+    }
+
     fn capture_region_target_at(
         &mut self,
         ctx: &egui::Context,
@@ -13131,11 +13146,14 @@ impl App {
                 return Err("ページ上をドラッグしてください".to_string());
             };
             let source_size = self.capture_region_source_size_for_idx(ctx, idx)?;
+            let rotation = self.get_rotation(idx);
+            let image_rect =
+                Self::capture_region_spread_image_rect_for_source(page_rect, source_size, rotation);
             return Ok(CaptureRegionTarget {
                 idx,
                 source_size,
-                image_rect: page_rect,
-                rotation: self.get_rotation(idx),
+                image_rect,
+                rotation,
             });
         }
 
@@ -15349,6 +15367,41 @@ mod tests {
                 min_y: 100.0,
                 max_x: 100.0,
                 max_y: 200.0,
+            },
+        );
+    }
+
+    #[test]
+    fn capture_region_spread_target_uses_letterboxed_image_rect() {
+        let page_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 300.0));
+        let image_rect = crate::app::App::capture_region_spread_image_rect_for_source(
+            page_rect,
+            [200, 100],
+            crate::rotation_db::Rotation::None,
+        );
+
+        assert_eq!(image_rect.left(), 0.0);
+        assert_eq!(image_rect.right(), 300.0);
+        assert_eq!(image_rect.top(), 75.0);
+        assert_eq!(image_rect.bottom(), 225.0);
+
+        let target = CaptureRegionTarget {
+            idx: 0,
+            source_size: [200, 100],
+            image_rect,
+            rotation: crate::rotation_db::Rotation::None,
+        };
+        let screen = egui::Rect::from_min_max(egui::pos2(0.0, 75.0), egui::pos2(150.0, 150.0));
+
+        let crop = crate::app::App::capture_region_crop_from_screen(target, screen).unwrap();
+
+        assert_crop_rect_close(
+            crop,
+            crate::export_crop::CropRect {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 100.0,
+                max_y: 50.0,
             },
         );
     }
