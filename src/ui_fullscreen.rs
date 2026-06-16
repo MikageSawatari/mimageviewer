@@ -617,6 +617,44 @@ pub struct FsSpreadLayout {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(crate) struct CaptureRegionTarget {
+    pub(crate) idx: usize,
+    pub(crate) source_size: [usize; 2],
+    pub(crate) image_rect: egui::Rect,
+    pub(crate) rotation: crate::rotation_db::Rotation,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CaptureRegionSelection {
+    pub(crate) anchor_idx: usize,
+    pub(crate) target: Option<CaptureRegionTarget>,
+    pub(crate) start_pos: Option<egui::Pos2>,
+    pub(crate) current_pos: Option<egui::Pos2>,
+    pub(crate) wait_for_release: bool,
+}
+
+impl CaptureRegionSelection {
+    pub(crate) fn new(anchor_idx: usize, wait_for_release: bool) -> Self {
+        Self {
+            anchor_idx,
+            target: None,
+            start_pos: None,
+            current_pos: None,
+            wait_for_release,
+        }
+    }
+
+    fn screen_rect(self) -> Option<egui::Rect> {
+        let start = self.start_pos?;
+        let current = self.current_pos?;
+        Some(egui::Rect::from_min_max(
+            start.min(current),
+            start.max(current),
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct VerticalReadingPage {
     idx: usize,
     rect: egui::Rect,
@@ -1675,6 +1713,22 @@ fn analysis_image_rect(full_rect: egui::Rect) -> egui::Rect {
         full_rect.min,
         egui::pos2(full_rect.max.x - panel_w, full_rect.max.y),
     )
+}
+
+fn capture_region_outside_rects(bounds: egui::Rect, hole: egui::Rect) -> [egui::Rect; 4] {
+    let hole = hole.intersect(bounds);
+    [
+        egui::Rect::from_min_max(bounds.min, egui::pos2(bounds.max.x, hole.min.y)),
+        egui::Rect::from_min_max(egui::pos2(bounds.min.x, hole.max.y), bounds.max),
+        egui::Rect::from_min_max(
+            egui::pos2(bounds.min.x, hole.min.y),
+            egui::pos2(hole.min.x, hole.max.y),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(hole.max.x, hole.min.y),
+            egui::pos2(bounds.max.x, hole.max.y),
+        ),
+    ]
 }
 
 /// 補正パネル (adjustment panel) のオーバーレイ矩形を返す。
@@ -3658,6 +3712,14 @@ impl App {
                         }
 
                         let overlay_t0 = std::time::Instant::now();
+                        self.draw_capture_region_selection_overlay(
+                            ui,
+                            ctx,
+                            full_rect,
+                            image_rect,
+                            fs_idx,
+                            is_spread_double,
+                        );
                         // ── ルーペ (Shift ホールド / M トグル) ──
                         // 見開き・分析・補正モードでは内部で早期 return する。
                         // 消しゴムモードのマスクオーバーレイより上に載せる (最新状態を拡大)。
@@ -3877,7 +3939,9 @@ impl App {
                         };
 
                         // 消しゴム / 隠蔽加工モード中は上部バーを抑制 (自前パネルと競合させない)。
-                        if !self.is_overlay_edit_mode_active() {
+                        if !self.is_overlay_edit_mode_active()
+                            && self.capture_region_selection.is_none()
+                        {
                             let saved_nav = nav_delta;
                             let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
                             // Phase 6: 動画モードかどうかを上ホバーバーに通知する。
@@ -3915,6 +3979,7 @@ impl App {
                             let vst3_panel_open = self.show_vst3_manager;
                             let mut vst3_pressed = false;
                             let mut copy_capture_pressed = false;
+                            let mut copy_capture_region_pressed = false;
                             let mut window_mode_pressed = false;
                             // ウィンドウ / 全画面 切り替えボタン: 静止画フルスクリーン
                             // (= 非動画、Windows) のときだけ出す。動画は native HUD 側に
@@ -3983,6 +4048,7 @@ impl App {
                                 vst3_panel_open,
                                 &mut vst3_pressed,
                                 &mut copy_capture_pressed,
+                                &mut copy_capture_region_pressed,
                                 show_window_toggle,
                                 embedded,
                                 &mut window_mode_pressed,
@@ -3990,6 +4056,9 @@ impl App {
                             );
                             if copy_capture_pressed {
                                 self.copy_image_capture_to_clipboard(ctx, fs_idx);
+                            }
+                            if copy_capture_region_pressed {
+                                self.begin_capture_region_selection(ctx, fs_idx);
                             }
                             // 分析ボタン押下は Z キーと同じ経路へ合流 (副作用込み、Codex P1)。
                             if bar_analysis_pressed && !is_spread_double {
@@ -5054,6 +5123,15 @@ impl App {
 
         if Self::consume_pipeline_debug_shortcut(ctx) {
             self.start_pipeline_debug_export(ctx, fs_idx);
+            return action;
+        }
+
+        if self.capture_region_selection.is_some() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                self.capture_region_selection = None;
+                self.show_feedback_toast("範囲コピーをキャンセルしました".to_string());
+                ctx.request_repaint();
+            }
             return action;
         }
 
@@ -6361,6 +6439,9 @@ impl App {
             .fullscreen_idx
             .map(|idx| self.fullscreen_media_rect(full_rect, idx, state.is_video))
             .unwrap_or(full_rect);
+        if self.capture_region_selection.is_some() {
+            return (0, false);
+        }
         let seek_panel_rect = fullscreen_seek_panel_rect(full_rect);
         let seek_panel_interactive = self.fullscreen_idx.is_some_and(|idx| {
             self.fullscreen_seek_overlay_allowed(idx, state.is_video)
@@ -11039,6 +11120,7 @@ impl App {
         vst3_panel_open: bool,
         vst3_pressed: &mut bool,
         copy_capture_pressed: &mut bool,
+        copy_capture_region_pressed: &mut bool,
         // ウィンドウ / 全画面 切り替えボタン (× の左)。show=表示するか、
         // in_window=現在 in-window 表示中か、pressed=クリックされたか。
         show_window_toggle: bool,
@@ -11162,9 +11244,13 @@ impl App {
                 |p, c, r| draw_camera_icon(p, c, r),
             );
             let camera_resp = camera_resp
-                .hover_tip_dark("クリック: クリップボードにコピー\nCtrl+S: ファイル保存");
+                .hover_tip_dark("クリック: クリップボードにコピー\nCtrl+クリック: 範囲を選んでコピー\nCtrl+S: ファイル保存");
             if camera_resp.clicked() {
-                *copy_capture_pressed = true;
+                if ctx.input(|i| i.modifiers.ctrl) || ctrl_held_via_os() {
+                    *copy_capture_region_pressed = true;
+                } else {
+                    *copy_capture_pressed = true;
+                }
             }
             if camera_resp.hovered() {
                 *nav_delta = 0;
@@ -12933,6 +13019,320 @@ impl App {
         }
     }
 
+    pub(crate) fn begin_capture_region_selection(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.is_overlay_edit_mode_active() || self.analysis_mode {
+            self.show_feedback_toast("通常表示で範囲コピーしてください".to_string());
+            return;
+        }
+        if self.continuous_reading_active_for_idx(fs_idx) {
+            self.show_feedback_toast("連結読み中は範囲コピーを使用できません".to_string());
+            return;
+        }
+        if !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off) {
+            self.show_feedback_toast("比較表示中は範囲コピーを使用できません".to_string());
+            return;
+        }
+        if self.fs_free_rotation.abs() > TRANSFORM_EPSILON {
+            self.show_feedback_toast("自由回転中は範囲コピーを使用できません".to_string());
+            return;
+        }
+        if let Err(err) = self.capture_region_source_size_for_idx(ctx, fs_idx) {
+            self.show_feedback_toast(err);
+            return;
+        }
+
+        let wait_for_release = ctx.input(|i| i.pointer.primary_down());
+        self.capture_region_selection = Some(CaptureRegionSelection::new(fs_idx, wait_for_release));
+        self.fs_pan_drag_start = None;
+        self.fs_rotation_drag_start = None;
+        self.show_feedback_toast("ドラッグでコピー範囲を選択".to_string());
+        ctx.request_repaint();
+    }
+
+    fn capture_region_source_size_for_idx(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Result<[usize; 2], String> {
+        let job = self.prepare_capture_pixel_job_with_output_crop(ctx, idx, None, false)?;
+        Ok(job.source.size)
+    }
+
+    fn capture_region_image_rect_for_source(
+        &self,
+        image_rect: egui::Rect,
+        source_size: [usize; 2],
+        rotation: crate::rotation_db::Rotation,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+        fit_mode: FullscreenFitMode,
+        fit_scale_limits: FullscreenFitScaleLimits,
+        content_bbox: Option<egui::Rect>,
+    ) -> egui::Rect {
+        let tex_size = egui::vec2(source_size[0].max(1) as f32, source_size[1].max(1) as f32);
+        let display_size = rotated_display_size(tex_size, rotation);
+        let margin_bbox = content_bbox.filter(|_| rotation.is_none());
+        let page_fit =
+            || (image_rect.width() / display_size.x).min(image_rect.height() / display_size.y);
+        let (fit_scale, content_center_px) = match fit_mode {
+            FullscreenFitMode::MarginFit if margin_bbox.is_some() => {
+                let bbox = margin_bbox.unwrap();
+                let bbox_w = (bbox.width() * display_size.x).max(1.0);
+                let bbox_h = (bbox.height() * display_size.y).max(1.0);
+                let scale = (image_rect.width() / bbox_w).min(image_rect.height() / bbox_h);
+                let center = egui::vec2(
+                    (bbox.center().x - 0.5) * display_size.x,
+                    (bbox.center().y - 0.5) * display_size.y,
+                );
+                (scale, center)
+            }
+            FullscreenFitMode::Width => (image_rect.width() / display_size.x, egui::Vec2::ZERO),
+            FullscreenFitMode::Height => (image_rect.height() / display_size.y, egui::Vec2::ZERO),
+            FullscreenFitMode::Original => (1.0, egui::Vec2::ZERO),
+            _ => (page_fit(), egui::Vec2::ZERO),
+        };
+        let fit_scale = fit_scale_limits.apply(fit_scale);
+        let (total_scale, base_center) = match zoom_pan {
+            Some((zoom, pan)) => (fit_scale * zoom, image_rect.center() + pan),
+            None => (fit_scale, image_rect.center()),
+        };
+        let center = base_center - content_center_px * total_scale;
+        egui::Rect::from_center_size(center, display_size * total_scale)
+    }
+
+    fn capture_region_target_at(
+        &mut self,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+        is_spread_double: bool,
+        pos: egui::Pos2,
+    ) -> Result<CaptureRegionTarget, String> {
+        if is_spread_double {
+            let Some(layout) = self.fs_spread_layout else {
+                return Err("見開きレイアウトの準備後に再実行してください".to_string());
+            };
+            let (idx, page_rect) = if layout.left_rect.contains(pos) {
+                (layout.left_idx, layout.left_rect)
+            } else if layout.right_rect.contains(pos) {
+                (layout.right_idx, layout.right_rect)
+            } else {
+                return Err("ページ上をドラッグしてください".to_string());
+            };
+            let source_size = self.capture_region_source_size_for_idx(ctx, idx)?;
+            return Ok(CaptureRegionTarget {
+                idx,
+                source_size,
+                image_rect: page_rect,
+                rotation: self.get_rotation(idx),
+            });
+        }
+
+        let source_size = self.capture_region_source_size_for_idx(ctx, fs_idx)?;
+        let rotation = self.get_rotation(fs_idx);
+        let content_bbox = self.fs_margin_bbox(fs_idx);
+        let fit_mode = self.effective_fullscreen_fit_mode();
+        let fit_scale_limits = self.fullscreen_fit_scale_limits();
+        let target_rect = self.capture_region_image_rect_for_source(
+            image_rect,
+            source_size,
+            rotation,
+            self.fs_zoom_pan(),
+            fit_mode,
+            fit_scale_limits,
+            content_bbox,
+        );
+        Ok(CaptureRegionTarget {
+            idx: fs_idx,
+            source_size,
+            image_rect: target_rect,
+            rotation,
+        })
+    }
+
+    fn capture_region_crop_from_screen(
+        target: CaptureRegionTarget,
+        screen_rect: egui::Rect,
+    ) -> Option<crate::export_crop::CropRect> {
+        let clipped = screen_rect.intersect(target.image_rect);
+        if clipped.width() < 3.0 || clipped.height() < 3.0 {
+            return None;
+        }
+        let [src_w, src_h] = target.source_size;
+        let src_wf = src_w.max(1) as f32;
+        let src_hf = src_h.max(1) as f32;
+        let display_w = match target.rotation {
+            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => src_hf,
+            _ => src_wf,
+        };
+        let display_h = match target.rotation {
+            crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => src_wf,
+            _ => src_hf,
+        };
+        let dx0 = ((clipped.left() - target.image_rect.left())
+            / target.image_rect.width().max(1.0)
+            * display_w)
+            .clamp(0.0, display_w);
+        let dx1 = ((clipped.right() - target.image_rect.left())
+            / target.image_rect.width().max(1.0)
+            * display_w)
+            .clamp(0.0, display_w);
+        let dy0 = ((clipped.top() - target.image_rect.top()) / target.image_rect.height().max(1.0)
+            * display_h)
+            .clamp(0.0, display_h);
+        let dy1 = ((clipped.bottom() - target.image_rect.top())
+            / target.image_rect.height().max(1.0)
+            * display_h)
+            .clamp(0.0, display_h);
+        let rect = match target.rotation {
+            crate::rotation_db::Rotation::None => crate::export_crop::CropRect {
+                min_x: dx0,
+                min_y: dy0,
+                max_x: dx1,
+                max_y: dy1,
+            },
+            crate::rotation_db::Rotation::Cw90 => crate::export_crop::CropRect {
+                min_x: dy0,
+                min_y: src_hf - dx1,
+                max_x: dy1,
+                max_y: src_hf - dx0,
+            },
+            crate::rotation_db::Rotation::Cw180 => crate::export_crop::CropRect {
+                min_x: src_wf - dx1,
+                min_y: src_hf - dy1,
+                max_x: src_wf - dx0,
+                max_y: src_hf - dy0,
+            },
+            crate::rotation_db::Rotation::Cw270 => crate::export_crop::CropRect {
+                min_x: src_wf - dy1,
+                min_y: dx0,
+                max_x: src_wf - dy0,
+                max_y: dx1,
+            },
+        }
+        .sanitized(src_w, src_h);
+        if rect.width() < 1.0 || rect.height() < 1.0 {
+            None
+        } else {
+            Some(rect)
+        }
+    }
+
+    fn draw_capture_region_selection_overlay(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+        is_spread_double: bool,
+    ) {
+        let Some(mut selection) = self.capture_region_selection else {
+            return;
+        };
+        if selection.anchor_idx != fs_idx {
+            self.capture_region_selection = None;
+            return;
+        }
+
+        let response = ui.interact(
+            full_rect,
+            egui::Id::new("fs_capture_region_selection"),
+            egui::Sense::click_and_drag(),
+        );
+        let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+        let primary_pressed = response.drag_started_by(egui::PointerButton::Primary)
+            || ctx.input(|i| i.pointer.primary_pressed());
+        let primary_down = ctx.input(|i| i.pointer.primary_down());
+        let primary_released = response.drag_stopped_by(egui::PointerButton::Primary)
+            || ctx.input(|i| i.pointer.primary_released());
+
+        if selection.wait_for_release {
+            if !primary_down {
+                selection.wait_for_release = false;
+            }
+            ui.painter().rect_filled(
+                full_rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+            );
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            self.capture_region_selection = Some(selection);
+            ctx.request_repaint();
+            return;
+        }
+
+        if primary_pressed
+            && selection.target.is_none()
+            && let Some(pos) = pointer_pos
+        {
+            match self.capture_region_target_at(ctx, image_rect, fs_idx, is_spread_double, pos) {
+                Ok(target) => {
+                    let clamped = pos.clamp(target.image_rect.min, target.image_rect.max);
+                    selection.target = Some(target);
+                    selection.start_pos = Some(clamped);
+                    selection.current_pos = Some(clamped);
+                }
+                Err(err) => {
+                    self.show_feedback_toast(err);
+                }
+            }
+        }
+
+        if primary_down && let (Some(target), Some(pos)) = (selection.target, pointer_pos) {
+            selection.current_pos = Some(pos.clamp(target.image_rect.min, target.image_rect.max));
+        }
+
+        let screen_rect = selection.screen_rect();
+        let painter = ui.painter();
+        if let Some(rect) = screen_rect {
+            let rect = rect.intersect(full_rect);
+            for outside in capture_region_outside_rects(full_rect, rect) {
+                if outside.is_positive() {
+                    painter.rect_filled(
+                        outside,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
+                    );
+                }
+            }
+            painter.rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 255, 255)),
+                egui::StrokeKind::Outside,
+            );
+            painter.rect_stroke(
+                rect.expand(2.0),
+                0.0,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 160, 255)),
+                egui::StrokeKind::Outside,
+            );
+        } else {
+            painter.rect_filled(
+                full_rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+            );
+        }
+        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+
+        if primary_released {
+            self.capture_region_selection = None;
+            if let (Some(target), Some(rect)) = (selection.target, screen_rect)
+                && let Some(crop) = Self::capture_region_crop_from_screen(target, rect)
+            {
+                self.copy_image_capture_region_to_clipboard(ctx, target.idx, crop);
+            } else {
+                self.show_feedback_toast("範囲コピーをキャンセルしました".to_string());
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        self.capture_region_selection = Some(selection);
+        ctx.request_repaint();
+    }
+
     pub(crate) fn copy_image_capture_to_clipboard(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let work = match self.prepare_capture_pixel_work(ctx, fs_idx) {
             Ok(work) => work,
@@ -12941,6 +13341,14 @@ impl App {
                 return;
             }
         };
+        self.copy_capture_work_to_clipboard(work, "キャプチャをクリップボードへコピー中");
+    }
+
+    fn copy_capture_work_to_clipboard(
+        &mut self,
+        work: crate::capture::CapturePixelWork,
+        toast: &str,
+    ) {
         let clipboard_seq = crate::ui_dialogs::context_menu::reserve_clipboard_write_sequence();
         std::thread::Builder::new()
             .name("image-capture-clipboard".into())
@@ -12958,7 +13366,27 @@ impl App {
                 }
             })
             .ok();
-        self.show_feedback_toast("キャプチャをクリップボードへコピー中".to_string());
+        self.show_feedback_toast(toast.to_string());
+    }
+
+    pub(crate) fn copy_image_capture_region_to_clipboard(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        crop: crate::export_crop::CropRect,
+    ) {
+        let job = match self.prepare_capture_pixel_job_with_output_crop(ctx, idx, Some(crop), false)
+        {
+            Ok(job) => job,
+            Err(err) => {
+                self.show_feedback_toast(err);
+                return;
+            }
+        };
+        self.copy_capture_work_to_clipboard(
+            crate::capture::CapturePixelWork::Single(job),
+            "選択範囲をクリップボードへコピー中",
+        );
     }
 
     fn prepare_capture_pixel_work(
@@ -12991,6 +13419,16 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Result<crate::capture::CapturePixelJob, String> {
+        self.prepare_capture_pixel_job_with_output_crop(ctx, idx, None, true)
+    }
+
+    fn prepare_capture_pixel_job_with_output_crop(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        override_crop: Option<crate::export_crop::CropRect>,
+        use_stored_crop: bool,
+    ) -> Result<crate::capture::CapturePixelJob, String> {
         let basename = self
             .capture_basename_for_idx(idx)
             .ok_or_else(|| "このアイテムはキャプチャ保存できません".to_string())?;
@@ -13008,7 +13446,10 @@ impl App {
         let mut job = crate::capture::CapturePixelJob::already_adjusted(basename, pixels)
             .with_rotation(rotation);
         // crop は表示パイプラインでは適用しないので、最終段でここで切り出す。
-        if let Some(rect) = self.export_crop_rect_for_pixels(idx, size) {
+        // Ctrl+カメラの範囲コピーは、一回限りの明示選択を優先し、永続 crop とは合成しない。
+        if let Some(rect) = override_crop {
+            job = job.with_crop(rect);
+        } else if use_stored_crop && let Some(rect) = self.export_crop_rect_for_pixels(idx, size) {
             job = job.with_crop(rect);
         }
         Ok(job)
@@ -14833,6 +15274,62 @@ mod tests {
         assert!(!should_handle_fullscreen_wheel(
             false, false, true, false, true
         ));
+    }
+
+    fn assert_crop_rect_close(
+        rect: crate::export_crop::CropRect,
+        expected: crate::export_crop::CropRect,
+    ) {
+        assert!((rect.min_x - expected.min_x).abs() < 0.01, "{rect:?}");
+        assert!((rect.min_y - expected.min_y).abs() < 0.01, "{rect:?}");
+        assert!((rect.max_x - expected.max_x).abs() < 0.01, "{rect:?}");
+        assert!((rect.max_y - expected.max_y).abs() < 0.01, "{rect:?}");
+    }
+
+    #[test]
+    fn capture_region_maps_screen_rect_to_source_crop() {
+        let target = CaptureRegionTarget {
+            idx: 0,
+            source_size: [200, 100],
+            image_rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 100.0)),
+            rotation: crate::rotation_db::Rotation::None,
+        };
+        let screen = egui::Rect::from_min_max(egui::pos2(50.0, 10.0), egui::pos2(150.0, 60.0));
+
+        let crop = crate::app::App::capture_region_crop_from_screen(target, screen).unwrap();
+
+        assert_crop_rect_close(
+            crop,
+            crate::export_crop::CropRect {
+                min_x: 50.0,
+                min_y: 10.0,
+                max_x: 150.0,
+                max_y: 60.0,
+            },
+        );
+    }
+
+    #[test]
+    fn capture_region_maps_cw90_display_rect_back_to_source_crop() {
+        let target = CaptureRegionTarget {
+            idx: 0,
+            source_size: [100, 200],
+            image_rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 100.0)),
+            rotation: crate::rotation_db::Rotation::Cw90,
+        };
+        let left_half = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0));
+
+        let crop = crate::app::App::capture_region_crop_from_screen(target, left_half).unwrap();
+
+        assert_crop_rect_close(
+            crop,
+            crate::export_crop::CropRect {
+                min_x: 0.0,
+                min_y: 100.0,
+                max_x: 100.0,
+                max_y: 200.0,
+            },
+        );
     }
 
     #[test]

@@ -2881,6 +2881,8 @@ pub struct App {
         Vec<std::sync::mpsc::Receiver<crate::ui_dialogs::context_menu::CopyOutcome>>,
     /// Ctrl+S / キャプチャ保存の worker 完了待ち。
     pub(crate) capture_pending: Option<CapturePending>,
+    /// Ctrl+カメラアイコンで開始する、一回限りの範囲コピー選択。
+    pub(crate) capture_region_selection: Option<crate::ui_fullscreen::CaptureRegionSelection>,
     /// 製本のページ追加 / 作成 / 改名 / 削除 / 一覧更新 worker 完了待ち。
     pub(crate) book_op_pending: Option<crate::books::BookOpPending>,
     pub(crate) show_book_manager: bool,
@@ -5141,6 +5143,7 @@ impl App {
             current_folder_watch_failed: None,
             drop_copy_pending: Vec::new(),
             capture_pending: None,
+            capture_region_selection: None,
             book_op_pending: None,
             show_book_manager: false,
             book_manager_new_name: String::new(),
@@ -19108,6 +19111,7 @@ impl App {
         // グリッド側で積み上げた Undo は破棄する。フルスクリーン中の操作は新しい
         // スタックで管理する (画像移動でさらにクリアされる)。
         self.clear_meta_undo();
+        self.capture_region_selection = None;
         self.fullscreen_idx = Some(idx);
         // 本ごとの読書位置レジューム: 画像本のページを開くたびに最後のページを記録
         // (再起動を跨いで復元する。dedup 付きなので連続ページ送りでも書き込みは最小)。
@@ -24013,6 +24017,7 @@ impl App {
         // メニューが残り、カーソル自動非表示やページ送りの抑制が効いたままになるため解除する。
         self.spread_popup_open = false;
         self.fit_popup_open = false;
+        self.capture_region_selection = None;
         // 分析モード (Z) は一覧に戻ったら必ず解除する。さもないと次にフルスクリーンを
         // 開いたとき分析モードのまま起動してしまう (fullscreen_idx がまだ有効なうちに呼ぶ)。
         if self.analysis_mode {
