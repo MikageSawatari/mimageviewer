@@ -704,6 +704,13 @@ pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
             .size(11.0)
             .color(egui::Color32::from_gray(140)),
     );
+    ui.label(
+        egui::RichText::new(
+            "保存先を変更しても既存の本は移動しません。元の場所に通常のフォルダとして残ります。",
+        )
+        .size(11.0)
+        .color(egui::Color32::from_gray(140)),
+    );
 }
 
 pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) {

@@ -153,6 +153,15 @@ h2 {
 }
 h2:first-of-type { margin-top: 0; }
 
+/* 更新履歴ページ: バージョン見出しに添えるリリース日 */
+.ver-date {
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: #b0b0b8;
+  margin-left: 0.6rem;
+  letter-spacing: 0.02em;
+}
+
 h3 {
   font-size: 1rem;
   font-weight: 700;

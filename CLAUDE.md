@@ -1257,8 +1257,12 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 混入・粗い表現があると公開後に取り返しが付かないので、以下の順で進める。
 
 - **README.md の更新履歴セクション** にこのバージョンの新エントリを追加 (旧版と
-  同じ `### vX.Y.Z` ヘッダ + 箇条書きフォーマット)。書き方は CLAUDE.md
+  同じ `### vX.Y.Z (YYYY-MM-DD)` ヘッダ + 箇条書きフォーマット)。書き方は CLAUDE.md
   「マニュアル・製品ページの記述方針」に従う:
+  - **見出しにリリース日を `(YYYY-MM-DD)` 形式で付ける** (他バージョンと揃える)。
+    日付はそのリリースの GitHub タグ公開日 (= Phase 1 で製品ページの「最終更新」に
+    書くのと同じ日)。`gen-changelog-html.py` がこの括弧内の日付をパースして
+    マニュアルの更新履歴ページ (changelog.html) の見出しに併記するので、形式を崩さない
   - 内部実装語 (Tantivy / SQLite / 並行処理用語) は使わない
   - バージョン番号タグ (v0.8.2+ 等) は本文に書かない (見出しに 1 回だけ)
   - 過去のユーザー報告日付 / コミットハッシュは書かない
@@ -1272,7 +1276,8 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   README の該当セクションが 8KB を超えると、後半の項目 (= 末尾に置きがちな新機能 /
   バグ修正) が通知に出ない。リリース前に必ずバイト数を測る:
   ```bash
-  awk '/^### vX\.Y\.Z$/{f=1} /^### v<前版>$/{f=0} f' README.md | wc -c
+  # 見出しは "### vX.Y.Z (YYYY-MM-DD)" 形式なので、版番号の後ろは空白か行末で区切る
+  awk '/^### vX\.Y\.Z( |$)/{f=1} /^### v<前版>( |$)/{f=0} f' README.md | wc -c
   ```
   - **8KB 以内**: README セクションをそのまま Release body に使う (上記)。
   - **8KB 超過**: README はフル版のまま残し、**`docs/release-body-<version>.md` に
@@ -1294,12 +1299,19 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 2. `installer/mimageviewer.iss` — `MyAppVersion`
 3. `installer/readme.txt` — 先頭の版表記・更新履歴リンク (Vector 同梱用)
 3.5. `installer/readme_portable.txt` — 先頭の版表記 (ポータブル版 zip 同梱用、v1.1.0+)
-4. `htdocs/mimageviewer/index.html` — ダウンロードセクションのバージョン表記。
+4. `htdocs/mimageviewer/index.html` — ダウンロードセクションのバージョン表記と
+   **「最終更新: YYYY-MM-DD」の日付** (`.download-info` の `.meta` 行)。日付は今回の
+   リリース日 (= GitHub Release 公開日と揃える) を記入する。
    **ポータブル版のダウンロードリンク URL もバージョンを含む** (`mImageViewer_portable_v<VER>.zip`)
    ので、バージョン表記と一緒に link href も更新すること (単体exe / setup.exe は非バージョン名で固定)。
+4.5. **マニュアルの更新履歴ページを再生成** — Phase 0 で README の更新履歴セクションが
+   承認されたら、`python scripts/gen-changelog-html.py` を実行して
+   `htdocs/mimageviewer/manual/changelog.html` を作り直す。changelog.html は README の
+   `## 更新履歴` から生成される**生成物**なので手で編集しない (編集すると次回再生成で消える)。
+   生成後 `git diff` で最新版エントリが反映されていることを確認する。
 5. `htdocs/mimageviewer/manual/index.html` — マニュアルのバージョン表記
 6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
-   - マニュアル左サイドバーのリンク一覧が全 14 ページで揃っているか
+   - マニュアル左サイドバーのリンク一覧が全 22 ページで揃っているか
      `htdocs/mimageviewer/manual/` 配下で一括確認:
      ```bash
      cd htdocs/mimageviewer/manual && for f in *.html; do
@@ -1308,8 +1320,10 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
          | grep -E 'href="[a-z-]+\.html"' | wc -l
      done
      ```
-     14 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
-     新規ページを追加した際は 14 ページ全部のサイドバーを更新すること。
+     22 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
+     新規ページを追加した際は 22 ページ全部のサイドバーを更新すること
+     (changelog.html のサイドバーは `gen-changelog-html.py` が getting-started.html から
+     コピーするので、他 21 ページのサイドバーを更新してから再生成すれば自動で揃う)。
 
 ### Phase 2: 依存物の確認 + 性能回帰チェック
 
