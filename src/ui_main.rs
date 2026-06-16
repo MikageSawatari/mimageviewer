@@ -35,6 +35,8 @@ const BOOK_REORDER_DEFAULT_WINDOW_H: f32 = 680.0;
 const BOOK_REORDER_MIN_WINDOW_W: f32 = 560.0;
 const BOOK_REORDER_MIN_WINDOW_H: f32 = 360.0;
 const BOOK_REORDER_SCROLLBAR_RESERVE_PX: f32 = 28.0;
+const BOOK_REORDER_AUTO_SCROLL_EDGE_PX: f32 = 64.0;
+const BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX: f32 = 34.0;
 
 // ── ★フィルタのツールバー挙動 (Ctrl/Shift/右クリック) ─────────────────
 //
@@ -1128,6 +1130,23 @@ fn book_reorder_scroll_height(available_height: f32, rows: usize, row_height: f3
     content_height.min(available_height).max(row_height)
 }
 
+fn book_reorder_auto_scroll_delta(pointer_y: f32, viewport_top: f32, viewport_bottom: f32) -> f32 {
+    let height = (viewport_bottom - viewport_top).max(0.0);
+    if height <= 1.0 {
+        return 0.0;
+    }
+    let edge = BOOK_REORDER_AUTO_SCROLL_EDGE_PX.min(height * 0.45).max(1.0);
+    if pointer_y < viewport_top + edge {
+        -((viewport_top + edge - pointer_y) / edge).clamp(0.0, 1.0)
+            * BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX
+    } else if pointer_y > viewport_bottom - edge {
+        ((pointer_y - (viewport_bottom - edge)) / edge).clamp(0.0, 1.0)
+            * BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX
+    } else {
+        0.0
+    }
+}
+
 fn book_reorder_drop_target_for_pos(
     rect: egui::Rect,
     item_index: usize,
@@ -2028,6 +2047,7 @@ impl App {
             selected_keys,
             selection_anchor: Some(0),
             dragging: None,
+            scroll_offset_y: 0.0,
             thumb_textures: HashMap::new(),
             thumb_failed: HashSet::new(),
             thumb_pending_keys: HashSet::new(),
@@ -2553,7 +2573,26 @@ impl App {
                             state.dirty = true;
                         }
                     }
-                    ui.label(format!("選択 {selected_count} ページ"));
+                    let selected_label = if selected_count > 0 {
+                        format!("選択 {selected_count} ページ（ここをドラッグして移動）")
+                    } else {
+                        "選択 0 ページ".to_string()
+                    };
+                    let selected_response = ui
+                        .add_enabled(
+                            !busy && selected_count > 0,
+                            egui::Label::new(selected_label).sense(egui::Sense::click_and_drag()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::Grab)
+                        .on_hover_text("選択ページ全体をドラッグして移動");
+                    if !busy
+                        && selected_response.drag_started()
+                        && let Some(src) = selected_indices.first().copied()
+                    {
+                        state.selected = Some(src);
+                        state.dragging = Some(src);
+                        state.drag_insert_index = Some(src);
+                    }
                     ui.separator();
                     let slider = egui::Slider::new(
                         &mut state.thumb_tile_px,
@@ -2691,7 +2730,9 @@ impl App {
                     |ui| {
                         ui.set_min_width(scroll_width);
                         ui.set_min_height(scroll_height);
-                        egui::ScrollArea::vertical()
+                        let scroll_output = egui::ScrollArea::vertical()
+                            .id_salt("book_reorder_thumb_scroll")
+                            .vertical_scroll_offset(state.scroll_offset_y)
                             .max_height(scroll_height)
                             .auto_shrink([false, false])
                             .show_rows(ui, row_height, rows.max(1), |ui, row_range| {
@@ -2910,6 +2951,26 @@ impl App {
                                         }
                                     });
                             });
+                        state.scroll_offset_y = scroll_output.state.offset.y;
+                        if !busy
+                            && !pointer_released
+                            && state.dragging.is_some()
+                            && let Some(pos) = pointer_pos
+                        {
+                            let delta = book_reorder_auto_scroll_delta(
+                                pos.y,
+                                scroll_output.inner_rect.top(),
+                                scroll_output.inner_rect.bottom(),
+                            );
+                            if delta.abs() > f32::EPSILON {
+                                let max_offset = (scroll_output.content_size.y
+                                    - scroll_output.inner_rect.height())
+                                .max(0.0);
+                                state.scroll_offset_y =
+                                    (state.scroll_offset_y + delta).clamp(0.0, max_offset);
+                                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                            }
+                        }
                     },
                 );
                 if let Some((src, insert_index)) = move_request {
@@ -7571,6 +7632,7 @@ mod book_reorder_drag_tests {
             selected_keys,
             selection_anchor: Some(0),
             dragging: None,
+            scroll_offset_y: 0.0,
             thumb_textures: HashMap::new(),
             thumb_failed: HashSet::new(),
             thumb_pending_keys: HashSet::new(),
@@ -7694,6 +7756,21 @@ mod book_reorder_drag_tests {
         assert_eq!(book_reorder_scroll_height(400.0, 20, 86.0), 400.0);
         assert_eq!(book_reorder_scroll_height(780.0, 2, 86.0), 172.0);
         assert_eq!(book_reorder_scroll_height(40.0, 20, 86.0), 86.0);
+    }
+
+    #[test]
+    fn auto_scroll_delta_activates_near_reorder_edges() {
+        assert_eq!(book_reorder_auto_scroll_delta(200.0, 100.0, 500.0), 0.0);
+        assert!(book_reorder_auto_scroll_delta(112.0, 100.0, 500.0) < 0.0);
+        assert!(book_reorder_auto_scroll_delta(488.0, 100.0, 500.0) > 0.0);
+        assert_eq!(
+            book_reorder_auto_scroll_delta(100.0, 100.0, 500.0),
+            -BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX
+        );
+        assert_eq!(
+            book_reorder_auto_scroll_delta(500.0, 100.0, 500.0),
+            BOOK_REORDER_AUTO_SCROLL_MAX_STEP_PX
+        );
     }
 
     #[test]
