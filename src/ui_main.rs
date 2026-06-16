@@ -30,6 +30,8 @@ const BOOK_REORDER_THUMB_DECODE_PX: u32 = 360;
 const BOOK_REORDER_THUMB_MAX_IN_FLIGHT: usize = 4;
 const BOOK_REORDER_THUMB_MAX_RECV_PER_FRAME: usize = 32;
 const BOOK_REORDER_THUMB_MAX_UPLOADS_PER_FRAME: usize = 1;
+const BOOK_REORDER_SCROLL_AREA_MAX_HEIGHT: f32 = 520.0;
+const BOOK_REORDER_SCROLLBAR_RESERVE_PX: f32 = 28.0;
 
 // ── ★フィルタのツールバー挙動 (Ctrl/Shift/右クリック) ─────────────────
 //
@@ -1109,6 +1111,13 @@ fn move_selected_book_reorder_by(state: &mut crate::app::BookReorderState, delta
         .map(book_reorder_entry_key)
         .collect::<Vec<_>>();
     before != after
+}
+
+fn book_reorder_grid_columns(available_width: f32, tile_width: f32, gap: f32) -> usize {
+    let content_width = (available_width - BOOK_REORDER_SCROLLBAR_RESERVE_PX).max(tile_width);
+    ((content_width + gap) / (tile_width + gap))
+        .floor()
+        .clamp(4.0, 10.0) as usize
 }
 
 fn book_reorder_drop_target_for_pos(
@@ -2647,220 +2656,242 @@ impl App {
                     .clamp(BOOK_REORDER_MIN_TILE_PX, BOOK_REORDER_MAX_TILE_PX);
                 let tile = egui::vec2(state.thumb_tile_px, state.thumb_tile_px + 20.0);
                 let gap = 8.0;
-                let cols = ((ui.available_width() + gap) / (tile.x + gap))
-                    .floor()
-                    .clamp(4.0, 10.0) as usize;
+                let scroll_width = ui.available_width().max(tile.x + gap);
+                let cols = book_reorder_grid_columns(scroll_width, tile.x, gap);
                 let rows = state.entries.len().div_ceil(cols);
                 let row_height = tile.y + gap;
+                let scroll_height = (rows.max(1) as f32 * row_height)
+                    .min(BOOK_REORDER_SCROLL_AREA_MAX_HEIGHT)
+                    .max(row_height);
                 let pointer_released = ui.input(|i| i.pointer.any_released());
                 let pointer_pos =
                     ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
                 let mut move_request: Option<(usize, usize)> = None;
                 state.drag_insert_index = None;
-                egui::ScrollArea::vertical().max_height(520.0).show_rows(
-                    ui,
-                    row_height,
-                    rows.max(1),
-                    |ui, row_range| {
-                        egui::Grid::new("book_reorder_thumb_grid")
-                            .num_columns(cols)
-                            .spacing(egui::vec2(gap, gap))
-                            .show(ui, |ui| {
-                                for row in row_range {
-                                    for col in 0..cols {
-                                        let i = row * cols + col;
-                                        let Some(entry) = state.entries.get(i) else {
-                                            let (rect, _) =
-                                                ui.allocate_exact_size(tile, egui::Sense::hover());
-                                            if !busy
-                                                && let Some(src) = state.dragging
-                                                && pointer_pos.is_some_and(|pos| rect.contains(pos))
-                                            {
-                                                let insert_index = state.entries.len();
-                                                let indicator_x = book_reorder_end_indicator_x(
-                                                    rect,
-                                                    state.entries.len(),
-                                                    cols,
-                                                    gap,
+                ui.allocate_ui_with_layout(
+                    egui::vec2(scroll_width, scroll_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.set_min_width(scroll_width);
+                        ui.set_min_height(scroll_height);
+                        egui::ScrollArea::vertical()
+                            .max_height(scroll_height)
+                            .auto_shrink([false, false])
+                            .show_rows(ui, row_height, rows.max(1), |ui, row_range| {
+                                egui::Grid::new("book_reorder_thumb_grid")
+                                    .num_columns(cols)
+                                    .spacing(egui::vec2(gap, gap))
+                                    .show(ui, |ui| {
+                                        for row in row_range {
+                                            for col in 0..cols {
+                                                let i = row * cols + col;
+                                                let Some(entry) = state.entries.get(i) else {
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        tile,
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    if !busy
+                                                        && let Some(src) = state.dragging
+                                                        && pointer_pos
+                                                            .is_some_and(|pos| rect.contains(pos))
+                                                    {
+                                                        let insert_index = state.entries.len();
+                                                        let indicator_x =
+                                                            book_reorder_end_indicator_x(
+                                                                rect,
+                                                                state.entries.len(),
+                                                                cols,
+                                                                gap,
+                                                            );
+                                                        state.drag_insert_index =
+                                                            Some(insert_index);
+                                                        draw_book_reorder_insert_indicator(
+                                                            ui,
+                                                            indicator_x,
+                                                            rect,
+                                                        );
+                                                        ui.output_mut(|out| {
+                                                            out.cursor_icon =
+                                                                egui::CursorIcon::Text;
+                                                        });
+                                                        if pointer_released {
+                                                            move_request =
+                                                                Some((src, insert_index));
+                                                        }
+                                                    }
+                                                    continue;
+                                                };
+                                                let (rect, response) = ui.allocate_exact_size(
+                                                    tile,
+                                                    egui::Sense::click_and_drag(),
                                                 );
-                                                state.drag_insert_index = Some(insert_index);
-                                                draw_book_reorder_insert_indicator(
-                                                    ui,
-                                                    indicator_x,
-                                                    rect,
+                                                let key = crate::search_index_db::normalize_path(
+                                                    &entry.path,
                                                 );
-                                                ui.output_mut(|out| {
-                                                    out.cursor_icon = egui::CursorIcon::Text;
+                                                let selected = state.selected_keys.contains(&key);
+                                                let dragging = state.dragging.is_some() && selected;
+                                                let fill = if dragging {
+                                                    ui.visuals().selection.bg_fill
+                                                } else if selected {
+                                                    ui.visuals().widgets.active.bg_fill
+                                                } else {
+                                                    ui.visuals().extreme_bg_color
+                                                };
+                                                ui.painter().rect_filled(rect, 4.0, fill);
+                                                ui.painter().rect_stroke(
+                                                    rect,
+                                                    4.0,
+                                                    egui::Stroke::new(
+                                                        1.0,
+                                                        if selected {
+                                                            ui.visuals().selection.stroke.color
+                                                        } else {
+                                                            ui.visuals()
+                                                                .widgets
+                                                                .noninteractive
+                                                                .bg_stroke
+                                                                .color
+                                                        },
+                                                    ),
+                                                    egui::StrokeKind::Inside,
+                                                );
+                                                let texture = thumb_by_path.get(&key);
+                                                if texture.is_none()
+                                                    && !state.thumb_failed.contains(&key)
+                                                    && !state.thumb_pending_keys.contains(&key)
+                                                {
+                                                    missing_thumb_requests
+                                                        .push((key.clone(), entry.path.clone()));
+                                                }
+                                                let image_rect =
+                                                    rect.shrink2(egui::vec2(6.0, 18.0));
+                                                if let Some(tex) = texture {
+                                                    let tex_size = tex.size_vec2();
+                                                    let scale = (image_rect.width() / tex_size.x)
+                                                        .min(image_rect.height() / tex_size.y)
+                                                        .min(1.0);
+                                                    let size = egui::vec2(
+                                                        tex_size.x * scale,
+                                                        tex_size.y * scale,
+                                                    );
+                                                    let img_rect = egui::Rect::from_center_size(
+                                                        image_rect.center(),
+                                                        size,
+                                                    );
+                                                    ui.painter().image(
+                                                        tex.id(),
+                                                        img_rect,
+                                                        egui::Rect::from_min_max(
+                                                            egui::pos2(0.0, 0.0),
+                                                            egui::pos2(1.0, 1.0),
+                                                        ),
+                                                        egui::Color32::WHITE,
+                                                    );
+                                                } else {
+                                                    let placeholder =
+                                                        if state.thumb_failed.contains(&key) {
+                                                            "表示不可"
+                                                        } else {
+                                                            "読込中"
+                                                        };
+                                                    ui.painter().text(
+                                                        image_rect.center(),
+                                                        egui::Align2::CENTER_CENTER,
+                                                        placeholder,
+                                                        egui::FontId::proportional(11.0),
+                                                        ui.visuals().weak_text_color(),
+                                                    );
+                                                }
+                                                ui.painter().text(
+                                                    rect.left_bottom() + egui::vec2(6.0, -5.0),
+                                                    egui::Align2::LEFT_BOTTOM,
+                                                    format!("{:04}", i + 1),
+                                                    egui::FontId::monospace(11.0),
+                                                    ui.visuals().text_color(),
+                                                );
+                                                let response = response.on_hover_ui(|ui| {
+                                                    if let Some(tex) = texture {
+                                                        let tex_size = tex.size_vec2();
+                                                        let max_side = 360.0;
+                                                        let scale = (max_side / tex_size.x)
+                                                            .min(max_side / tex_size.y)
+                                                            .min(2.5);
+                                                        let size = egui::vec2(
+                                                            tex_size.x * scale,
+                                                            tex_size.y * scale,
+                                                        );
+                                                        let (preview_rect, _) = ui
+                                                            .allocate_exact_size(
+                                                                size,
+                                                                egui::Sense::hover(),
+                                                            );
+                                                        ui.painter().image(
+                                                            tex.id(),
+                                                            preview_rect,
+                                                            egui::Rect::from_min_max(
+                                                                egui::pos2(0.0, 0.0),
+                                                                egui::pos2(1.0, 1.0),
+                                                            ),
+                                                            egui::Color32::WHITE,
+                                                        );
+                                                    } else {
+                                                        ui.label("サムネイル読み込み中");
+                                                    }
                                                 });
-                                                if pointer_released {
-                                                    move_request = Some((src, insert_index));
+                                                if !busy && response.clicked() {
+                                                    let (ctrl, shift) = ui.input(|input| {
+                                                        (
+                                                            input.modifiers.ctrl
+                                                                || input.modifiers.command,
+                                                            input.modifiers.shift,
+                                                        )
+                                                    });
+                                                    if shift {
+                                                        book_reorder_select_range(state, i);
+                                                    } else if ctrl {
+                                                        book_reorder_toggle_selection(state, i);
+                                                    } else {
+                                                        book_reorder_select_single(state, i);
+                                                    }
+                                                }
+                                                if !busy && response.drag_started() {
+                                                    if !state.selected_keys.contains(&key) {
+                                                        book_reorder_select_single(state, i);
+                                                    } else {
+                                                        state.selected = Some(i);
+                                                    }
+                                                    state.dragging = Some(i);
+                                                    state.drag_insert_index = Some(i);
+                                                }
+                                                if !busy
+                                                    && let Some(src) = state.dragging
+                                                    && let Some((insert_index, indicator_x)) =
+                                                        book_reorder_drop_target_for_pos(
+                                                            rect,
+                                                            i,
+                                                            state.entries.len(),
+                                                            cols,
+                                                            gap,
+                                                            pointer_pos,
+                                                        )
+                                                {
+                                                    state.drag_insert_index = Some(insert_index);
+                                                    draw_book_reorder_insert_indicator(
+                                                        ui,
+                                                        indicator_x,
+                                                        rect,
+                                                    );
+                                                    ui.output_mut(|out| {
+                                                        out.cursor_icon = egui::CursorIcon::Text;
+                                                    });
+                                                    if pointer_released {
+                                                        move_request = Some((src, insert_index));
+                                                    }
                                                 }
                                             }
-                                            continue;
-                                        };
-                                        let (rect, response) = ui.allocate_exact_size(
-                                            tile,
-                                            egui::Sense::click_and_drag(),
-                                        );
-                                        let key =
-                                            crate::search_index_db::normalize_path(&entry.path);
-                                        let selected = state.selected_keys.contains(&key);
-                                        let dragging = state.dragging.is_some() && selected;
-                                        let fill = if dragging {
-                                            ui.visuals().selection.bg_fill
-                                        } else if selected {
-                                            ui.visuals().widgets.active.bg_fill
-                                        } else {
-                                            ui.visuals().extreme_bg_color
-                                        };
-                                        ui.painter().rect_filled(rect, 4.0, fill);
-                                        ui.painter().rect_stroke(
-                                            rect,
-                                            4.0,
-                                            egui::Stroke::new(
-                                                1.0,
-                                                if selected {
-                                                    ui.visuals().selection.stroke.color
-                                                } else {
-                                                    ui.visuals()
-                                                        .widgets
-                                                        .noninteractive
-                                                        .bg_stroke
-                                                        .color
-                                                },
-                                            ),
-                                            egui::StrokeKind::Inside,
-                                        );
-                                        let texture = thumb_by_path.get(&key);
-                                        if texture.is_none()
-                                            && !state.thumb_failed.contains(&key)
-                                            && !state.thumb_pending_keys.contains(&key)
-                                        {
-                                            missing_thumb_requests
-                                                .push((key.clone(), entry.path.clone()));
+                                            ui.end_row();
                                         }
-                                        let image_rect = rect.shrink2(egui::vec2(6.0, 18.0));
-                                        if let Some(tex) = texture {
-                                            let tex_size = tex.size_vec2();
-                                            let scale = (image_rect.width() / tex_size.x)
-                                                .min(image_rect.height() / tex_size.y)
-                                                .min(1.0);
-                                            let size =
-                                                egui::vec2(tex_size.x * scale, tex_size.y * scale);
-                                            let img_rect = egui::Rect::from_center_size(
-                                                image_rect.center(),
-                                                size,
-                                            );
-                                            ui.painter().image(
-                                                tex.id(),
-                                                img_rect,
-                                                egui::Rect::from_min_max(
-                                                    egui::pos2(0.0, 0.0),
-                                                    egui::pos2(1.0, 1.0),
-                                                ),
-                                                egui::Color32::WHITE,
-                                            );
-                                        } else {
-                                            let placeholder = if state.thumb_failed.contains(&key) {
-                                                "表示不可"
-                                            } else {
-                                                "読込中"
-                                            };
-                                            ui.painter().text(
-                                                image_rect.center(),
-                                                egui::Align2::CENTER_CENTER,
-                                                placeholder,
-                                                egui::FontId::proportional(11.0),
-                                                ui.visuals().weak_text_color(),
-                                            );
-                                        }
-                                        ui.painter().text(
-                                            rect.left_bottom() + egui::vec2(6.0, -5.0),
-                                            egui::Align2::LEFT_BOTTOM,
-                                            format!("{:04}", i + 1),
-                                            egui::FontId::monospace(11.0),
-                                            ui.visuals().text_color(),
-                                        );
-                                        let response = response.on_hover_ui(|ui| {
-                                            if let Some(tex) = texture {
-                                                let tex_size = tex.size_vec2();
-                                                let max_side = 360.0;
-                                                let scale = (max_side / tex_size.x)
-                                                    .min(max_side / tex_size.y)
-                                                    .min(2.5);
-                                                let size = egui::vec2(
-                                                    tex_size.x * scale,
-                                                    tex_size.y * scale,
-                                                );
-                                                let (preview_rect, _) = ui.allocate_exact_size(
-                                                    size,
-                                                    egui::Sense::hover(),
-                                                );
-                                                ui.painter().image(
-                                                    tex.id(),
-                                                    preview_rect,
-                                                    egui::Rect::from_min_max(
-                                                        egui::pos2(0.0, 0.0),
-                                                        egui::pos2(1.0, 1.0),
-                                                    ),
-                                                    egui::Color32::WHITE,
-                                                );
-                                            } else {
-                                                ui.label("サムネイル読み込み中");
-                                            }
-                                        });
-                                        if !busy && response.clicked() {
-                                            let (ctrl, shift) = ui.input(|input| {
-                                                (
-                                                    input.modifiers.ctrl || input.modifiers.command,
-                                                    input.modifiers.shift,
-                                                )
-                                            });
-                                            if shift {
-                                                book_reorder_select_range(state, i);
-                                            } else if ctrl {
-                                                book_reorder_toggle_selection(state, i);
-                                            } else {
-                                                book_reorder_select_single(state, i);
-                                            }
-                                        }
-                                        if !busy && response.drag_started() {
-                                            if !state.selected_keys.contains(&key) {
-                                                book_reorder_select_single(state, i);
-                                            } else {
-                                                state.selected = Some(i);
-                                            }
-                                            state.dragging = Some(i);
-                                            state.drag_insert_index = Some(i);
-                                        }
-                                        if !busy
-                                            && let Some(src) = state.dragging
-                                            && let Some((insert_index, indicator_x)) =
-                                                book_reorder_drop_target_for_pos(
-                                                    rect,
-                                                    i,
-                                                    state.entries.len(),
-                                                    cols,
-                                                    gap,
-                                                    pointer_pos,
-                                                )
-                                        {
-                                            state.drag_insert_index = Some(insert_index);
-                                            draw_book_reorder_insert_indicator(
-                                                ui,
-                                                indicator_x,
-                                                rect,
-                                            );
-                                            ui.output_mut(|out| {
-                                                out.cursor_icon = egui::CursorIcon::Text;
-                                            });
-                                            if pointer_released {
-                                                move_request = Some((src, insert_index));
-                                            }
-                                        }
-                                    }
-                                    ui.end_row();
-                                }
+                                    });
                             });
                     },
                 );
@@ -7614,6 +7645,13 @@ mod book_reorder_drag_tests {
         assert_eq!(adjusted_book_reorder_group_insert_index(&[1, 2], 5, 6), 3);
         assert_eq!(adjusted_book_reorder_group_insert_index(&[3, 4], 1, 6), 1);
         assert_eq!(adjusted_book_reorder_group_insert_index(&[1, 3], 4, 6), 2);
+    }
+
+    #[test]
+    fn grid_columns_reserve_space_for_reorder_scrollbar() {
+        assert_eq!(book_reorder_grid_columns(900.0, 78.0, 8.0), 10);
+        assert_eq!(book_reorder_grid_columns(870.0, 78.0, 8.0), 9);
+        assert_eq!(book_reorder_grid_columns(220.0, 78.0, 8.0), 4);
     }
 
     #[test]
