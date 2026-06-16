@@ -280,6 +280,12 @@ C:\home\mimageviewer_vendor_backup\
 - **Row snapping**: オフセットは常に `cell_size` の整数倍。最大オフセットも
   `ceil((total_h - viewport_h) / cell_size) * cell_size` で行境界に揃える。
 - **Mouse wheel**: `ctx.input_mut` で MouseWheel イベントを消費し、1行分に変換。
+- **Popup / menu wheel passthrough**: `menu_button` / `ComboBox` / popup 内に
+  `ScrollArea` を置く場合、popup が開いている frame では `raw_scroll_delta` /
+  `smooth_scroll_delta` / `Event::MouseWheel` を明示的に消費すること。これを忘れると
+  popup 内をスクロールしたつもりの wheel が背面のサムネイル一覧にも通り、一覧が動く。
+  既存例: `src/ui_main.rs` の `suppress_menu_button_wheel_passthrough` と
+  ツールバー ComboBox の open guard。
 
 ### ダイアログ (egui::Window)
 - **ドラッグ移動**: `anchor()` を使うとウィンドウが固定されドラッグできなくなる。

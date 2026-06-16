@@ -256,12 +256,53 @@ fn prepare_ai_facet_menu_popup(ui: &mut egui::Ui) {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
 }
 
-fn show_ai_facet_choices<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::ScrollArea::vertical()
-        .max_height(320.0)
-        .auto_shrink([false, true])
-        .show(ui, add_contents)
-        .inner
+const AI_FACET_MENU_WIDTH: f32 = 520.0;
+const AI_FACET_MENU_VISIBLE_ROWS: usize = 18;
+
+fn ai_facet_choice_body_height(ui: &egui::Ui, choice_count: usize) -> f32 {
+    let row_h = ui.spacing().interact_size.y.max(22.0);
+    let rows = choice_count.min(AI_FACET_MENU_VISIBLE_ROWS).max(1) as f32;
+    row_h * rows + 6.0
+}
+
+fn show_ai_facet_choices<R>(
+    ui: &mut egui::Ui,
+    choice_count: usize,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let body_height = ai_facet_choice_body_height(ui, choice_count);
+    ui.allocate_ui_with_layout(
+        egui::vec2(AI_FACET_MENU_WIDTH, body_height),
+        egui::Layout::top_down(egui::Align::LEFT),
+        |ui| {
+            ui.set_min_height(body_height);
+            ui.set_width(AI_FACET_MENU_WIDTH);
+            egui::ScrollArea::vertical()
+                .max_height(body_height)
+                .auto_shrink([false, false])
+                .show(ui, add_contents)
+                .inner
+        },
+    )
+    .inner
+}
+
+fn consume_wheel_input(ctx: &egui::Context) {
+    ctx.input_mut(|i| {
+        i.raw_scroll_delta = egui::Vec2::ZERO;
+        i.smooth_scroll_delta = egui::Vec2::ZERO;
+        i.events
+            .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+    });
+}
+
+fn suppress_menu_button_wheel_passthrough(ctx: &egui::Context, response: &egui::Response) {
+    // egui popup/menu の ScrollArea は wheel を使っても raw input が残ることがある。
+    // 背面のサムネイル一覧も同じ frame で描画されるため、menu_button が開いている間は
+    // ここで wheel を消費して背面スクロールへの通り抜けを防ぐ。
+    if egui::Popup::is_id_open(ctx, egui::Popup::default_response_id(response)) {
+        consume_wheel_input(ctx);
+    }
 }
 
 fn draw_tag_view_menu_section(
@@ -2843,12 +2884,7 @@ impl App {
         });
 
         if toolbar_combo_popup_open {
-            ctx.input_mut(|i| {
-                i.raw_scroll_delta = egui::Vec2::ZERO;
-                i.smooth_scroll_delta = egui::Vec2::ZERO;
-                i.events
-                    .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
-            });
+            consume_wheel_input(ctx);
         }
 
         // ツールバーのソート変更は borrow の関係で遅延実行。
@@ -3032,7 +3068,7 @@ impl App {
     fn draw_facet_kind_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let label = facet_menu_label("種類", self.settings.facet_filter.kinds.len());
-        ui.menu_button(label, |ui| {
+        let menu = ui.menu_button(label, |ui| {
             prepare_facet_menu_popup(ui);
             let mut counts = self.facet_kind_counts();
             for kind in &self.settings.facet_filter.kinds {
@@ -3062,13 +3098,14 @@ impl App {
                 }
             }
         });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
         changed
     }
 
     fn draw_facet_ext_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let label = facet_menu_label("拡張子", self.settings.facet_filter.exts.len());
-        ui.menu_button(label, |ui| {
+        let menu = ui.menu_button(label, |ui| {
             prepare_facet_menu_popup(ui);
             let mut counts = self.facet_ext_counts();
             for ext in &self.settings.facet_filter.exts {
@@ -3098,13 +3135,14 @@ impl App {
                 }
             }
         });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
         changed
     }
 
     fn draw_facet_ai_model_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let label = facet_menu_label("AIモデル", self.settings.facet_filter.ai_models.len());
-        ui.menu_button(label, |ui| {
+        let menu = ui.menu_button(label, |ui| {
             prepare_ai_facet_menu_popup(ui);
             self.request_ai_model_facet_load();
             ui.ctx().request_repaint();
@@ -3127,7 +3165,7 @@ impl App {
             if counts.is_empty() {
                 ui.label("候補なし");
             } else {
-                show_ai_facet_choices(ui, |ui| {
+                show_ai_facet_choices(ui, counts.len(), |ui| {
                     for (model, count) in counts {
                         let mut selected = self.settings.facet_filter.ai_models.contains(&model);
                         let text = format!("{model} ({count})");
@@ -3143,13 +3181,14 @@ impl App {
                 });
             }
         });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
         changed
     }
 
     fn draw_facet_ai_tool_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let label = facet_menu_label("生成ツール", self.settings.facet_filter.ai_tools.len());
-        ui.menu_button(label, |ui| {
+        let menu = ui.menu_button(label, |ui| {
             prepare_ai_facet_menu_popup(ui);
             self.request_ai_model_facet_load();
             ui.ctx().request_repaint();
@@ -3172,7 +3211,7 @@ impl App {
             if counts.is_empty() {
                 ui.label("候補なし");
             } else {
-                show_ai_facet_choices(ui, |ui| {
+                show_ai_facet_choices(ui, counts.len(), |ui| {
                     for (tool, count) in counts {
                         let mut selected = self.settings.facet_filter.ai_tools.contains(&tool);
                         let text = format!("{tool} ({count})");
@@ -3188,6 +3227,7 @@ impl App {
                 });
             }
         });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
         changed
     }
 
@@ -3217,7 +3257,7 @@ impl App {
     fn draw_facet_rating_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let active = if self.rating_filter_active() { 1 } else { 0 };
         let mut changed = false;
-        ui.menu_button(facet_menu_label("★", active), |ui| {
+        let menu = ui.menu_button(facet_menu_label("★", active), |ui| {
             prepare_facet_menu_popup(ui);
             if ui.small_button("すべて表示").clicked() {
                 self.settings.rating_filter = crate::settings::default_rating_filter();
@@ -3237,6 +3277,7 @@ impl App {
                 }
             }
         });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
         changed
     }
 
@@ -3244,7 +3285,7 @@ impl App {
         let active = self.settings.facet_filter.tags.len()
             + usize::from(self.settings.facet_filter.include_untagged);
         let mut changed = false;
-        ui.menu_button(facet_menu_label("タグ", active), |ui| {
+        let menu = ui.menu_button(facet_menu_label("タグ", active), |ui| {
             prepare_facet_menu_popup(ui);
             let (mut counts, untagged_count) = self.facet_tag_counts();
             let display_names: std::collections::BTreeMap<String, String> = self
@@ -3365,13 +3406,14 @@ impl App {
                 }
             }
         });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
         changed
     }
 
     fn draw_facet_date_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let active = usize::from(self.settings.facet_filter.date_preset.is_some());
         let mut changed = false;
-        ui.menu_button(facet_menu_label("日付", active), |ui| {
+        let menu = ui.menu_button(facet_menu_label("日付", active), |ui| {
             prepare_facet_menu_popup(ui);
             let current = self.settings.facet_filter.date_preset;
             if ui.selectable_label(current.is_none(), "すべて").clicked() {
@@ -3391,13 +3433,14 @@ impl App {
                 }
             }
         });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
         changed
     }
 
     fn draw_facet_size_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let active = usize::from(self.settings.facet_filter.size_preset.is_some());
         let mut changed = false;
-        ui.menu_button(facet_menu_label("サイズ", active), |ui| {
+        let menu = ui.menu_button(facet_menu_label("サイズ", active), |ui| {
             prepare_facet_menu_popup(ui);
             let current = self.settings.facet_filter.size_preset;
             if ui.selectable_label(current.is_none(), "すべて").clicked() {
@@ -3417,13 +3460,14 @@ impl App {
                 }
             }
         });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
         changed
     }
 
     fn draw_facet_edit_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         let label = facet_menu_label("状態", self.settings.facet_filter.edits.len());
-        ui.menu_button(label, |ui| {
+        let menu = ui.menu_button(label, |ui| {
             prepare_facet_menu_popup(ui);
             if self.settings.facet_filter.edits.is_empty() {
                 ui.label("すべて");
@@ -3445,6 +3489,7 @@ impl App {
                 }
             }
         });
+        suppress_menu_button_wheel_passthrough(ui.ctx(), &menu.response);
         changed
     }
 
