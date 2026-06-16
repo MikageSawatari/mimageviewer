@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -394,7 +394,6 @@ pub fn transfer_pages_between_books(
         .iter()
         .map(|mapping| mapping.to.clone())
         .collect::<Vec<_>>();
-    let mut edit_moves = commit_mappings.clone();
     let mut selected_committed = Vec::new();
     let mut remaining_committed = Vec::new();
     for (old_path, committed_path) in current_order_paths.iter().zip(committed_paths.iter()) {
@@ -443,18 +442,16 @@ pub fn transfer_pages_between_books(
     } else {
         Vec::new()
     };
-    if kind == BookTransferKind::Move {
-        edit_moves.extend(transfer_mappings);
-    }
 
+    let mut compact_mappings = Vec::new();
     let source_after_paths = if kind == BookTransferKind::Move {
         match flush_reorder_paths(source_folder.clone(), remaining_committed) {
-            Ok(compact_mappings) => {
-                let paths = compact_mappings
+            Ok(mappings) => {
+                let paths = mappings
                     .iter()
                     .map(|mapping| mapping.to.clone())
                     .collect::<Vec<_>>();
-                edit_moves.extend(compact_mappings);
+                compact_mappings = mappings;
                 paths
             }
             Err(err) => {
@@ -465,6 +462,14 @@ pub fn transfer_pages_between_books(
         }
     } else {
         committed_paths
+    };
+    // Move may run commit -> transfer -> compaction in one worker. Collapse those
+    // phases into original-key -> final-key mappings before the DB remap layer
+    // applies its simultaneous two-pass move.
+    let edit_moves = if kind == BookTransferKind::Move {
+        compose_book_path_mapping_phases(&[&commit_mappings, &transfer_mappings, &compact_mappings])
+    } else {
+        commit_mappings
     };
     let source_entries = source_after_paths
         .into_iter()
@@ -488,6 +493,43 @@ pub fn transfer_pages_between_books(
         edit_moves,
         edit_copies,
     }))
+}
+
+fn compose_book_path_mapping_phases(phases: &[&[BookPathMapping]]) -> Vec<BookPathMapping> {
+    let mut active: Vec<BookPathMapping> = Vec::new();
+    for phase in phases {
+        if phase.is_empty() {
+            continue;
+        }
+        let mut by_from = phase
+            .iter()
+            .map(|mapping| {
+                (
+                    crate::search_index_db::normalize_path(&mapping.from),
+                    mapping.to.clone(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        for mapping in &mut active {
+            let current_key = crate::search_index_db::normalize_path(&mapping.to);
+            if let Some(next) = by_from.remove(&current_key) {
+                mapping.to = next;
+            }
+        }
+
+        for mapping in *phase {
+            let key = crate::search_index_db::normalize_path(&mapping.from);
+            if by_from.remove(&key).is_some() {
+                active.push(mapping.clone());
+            }
+        }
+    }
+
+    active
+        .into_iter()
+        .filter(|mapping| !crate::folder_tree::path_eq(&mapping.from, &mapping.to))
+        .collect()
 }
 
 fn flush_reorder_paths(
@@ -1557,6 +1599,52 @@ mod tests {
             vec![
                 (source.join("0002_b.jpg"), target.join("0001_b.jpg")),
                 (source.join("0003_c.jpg"), target.join("0002_c.jpg")),
+            ]
+        );
+    }
+
+    #[test]
+    fn transfer_move_after_reorder_reports_net_edit_move_mappings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("books");
+        let source = root.join("src");
+        let target = root.join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let a = source.join("0001_a.jpg");
+        let b = source.join("0002_b.jpg");
+        let c = source.join("0003_c.jpg");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        fs::write(&c, b"c").unwrap();
+
+        let result = transfer_pages_between_books(
+            root,
+            source.clone(),
+            vec![c.clone(), a.clone(), b.clone()],
+            vec![c.clone(), a.clone()],
+            "dst".to_string(),
+            BookTransferKind::Move,
+        )
+        .unwrap();
+        let BookOpResult::Transfer(summary) = result else {
+            panic!("expected transfer result");
+        };
+
+        assert_eq!(fs::read(source.join("0001_b.jpg")).unwrap(), b"b");
+        assert_eq!(fs::read(target.join("0001_c.jpg")).unwrap(), b"c");
+        assert_eq!(fs::read(target.join("0002_a.jpg")).unwrap(), b"a");
+        assert!(summary.edit_copies.is_empty());
+        assert_eq!(
+            summary
+                .edit_moves
+                .iter()
+                .map(|m| (m.from.clone(), m.to.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (c, target.join("0001_c.jpg")),
+                (a, target.join("0002_a.jpg")),
+                (b, source.join("0001_b.jpg")),
             ]
         );
     }
