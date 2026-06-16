@@ -18424,19 +18424,46 @@ impl App {
             .unwrap_or("unknown");
         crate::ui_fonts::configure_fonts_for_texture_resync(ctx, generation);
         let defer_main_paint = should_defer_main_paint_for_font_atlas_resync(reason);
-        if defer_main_paint {
-            crate::logger::log(format!(
-                "[ui-fonts] defer main paint for font atlas resync: phase={phase} \
-                 reason={reason} generation={generation}"
-            ));
-        } else {
+        if !defer_main_paint {
+            // detached cleanup 等、保守的 defer が不要な経路。フォント再アップロードを
+            // 予約しただけで、この pass はそのままメイン UI を描く。
             crate::logger::log(format!(
                 "[ui-fonts] resync main font atlas without paint defer: phase={phase} \
                  reason={reason} generation={generation}"
             ));
+            ctx.request_repaint();
+            return false;
         }
+
+        // 通常 fullscreen / 動画 backdrop / F11 recreate の resync 経路。
+        //
+        // `set_fonts` は「次 pass の begin_pass で適用」される (egui 仕様)。ここで
+        // この pass を `request_discard` で破棄すると、egui の run() が **同じ OS
+        // フレーム内** でもう一度 begin_pass → update() を走らせる。次 pass の
+        // begin_pass で new_font_definitions が適用され、font atlas のフルアップロードが
+        // メイン UI 描画より前に入るため、stale texture への部分更新 panic を避けつつ、
+        // 破棄された pass は paint されないので黒/空白フレームも出ない。
+        // 2 度目の pass は入力 events が空になる (RawInput::take 済み) ので、close や
+        // ナビ等の入力起因処理が二重発火しないのも担保される。
+        ctx.request_discard(format!("font-atlas-resync:{reason}"));
+        if ctx.will_discard() {
+            crate::logger::log(format!(
+                "[ui-fonts] discard pass for font atlas resync (same-frame repass): \
+                 phase={phase} reason={reason} generation={generation}"
+            ));
+            // 同一フレーム内で次 pass が走るので request_repaint は不要。
+            return true;
+        }
+
+        // multi-pass の予算が無い (max_passes 到達 / 他要因の discard と競合等)。
+        // 従来どおりこの pass の描画を飛ばし、次フレームで再描画する安全側フォール
+        // バック (= 1 フレーム黒)。通常運用ではここには来ない想定。
+        crate::logger::log(format!(
+            "[ui-fonts] defer main paint for font atlas resync (no discard budget): \
+             phase={phase} reason={reason} generation={generation}"
+        ));
         ctx.request_repaint();
-        defer_main_paint
+        true
     }
 
     pub(crate) fn main_grid_spread_pair_cursor_idx(&mut self) -> Option<usize> {

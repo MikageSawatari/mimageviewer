@@ -259,10 +259,27 @@ renderer 側 font atlas texture のサイズが一時的にずれることがあ
 描画タイミングで `Queue::write_texture` が高さ 32 の古い font atlas texture に `Y 29..44`
 の部分 glyph update を送り、フォント崩れ後に wgpu validation panic するログを確認した。
 `Visible(false)` で fullscreen/detached viewport を隠した経路では
-`request_main_font_atlas_resync` を立て、メイン UI を描く直前に 1 フレームだけ描画を送って
-`configure_fonts_for_texture_resync` を実行する。通常の `configure_fonts` は定義が同一だと
-egui が再読み込みを省略するため、未使用の一意な font family marker を混ぜて font atlas を
-full upload から再開させる。
+`request_main_font_atlas_resync` を立て、`configure_fonts_for_texture_resync` で font atlas を
+full upload から再開させる。通常の `configure_fonts` は定義が同一だと egui が再読み込みを
+省略するため、未使用の一意な font family marker を混ぜて強制リロードさせる。
+
+`configure_fonts_for_texture_resync` の `set_fonts` は egui 仕様で「次 pass の begin_pass で
+適用」されるため、フル atlas アップロードが効く前にメイン UI を描くと上記 panic が再発する。
+`maybe_defer_for_main_font_atlas_resync` は、`should_defer_main_paint_for_font_atlas_resync` が
+true を返す経路 (`fullscreen_viewport_cleanup` / `native_video_backdrop_hide` /
+`fullscreen_viewport_recreate`) では `ctx.request_discard()` でその pass を破棄し、egui の
+**同一 OS フレーム内 multi-pass** (`max_passes`=2) で `update()` を再走させる。次 pass の
+begin_pass で新フォントが適用され、フル atlas アップロードがメイン UI 描画より前に入る。
+破棄された pass は paint されないので黒/空白フレームは出ず、2 度目の pass は入力 events が空
+(`RawInput::take` 済み) なので close / ナビ等の入力起因処理も二重発火しない。`will_discard()`
+が false (multi-pass 予算なし) の稀なケースだけ、従来どおりこの pass の描画を飛ばして次フレーム
+で再描画する「1 フレーム黒」フォールバックに落ちる。detached cleanup
+(`should_defer_…` が false) は defer せずそのまま描く。
+
+なお、専用ボーダーレス fullscreen viewport を閉じると、別トップレベル窓の `Visible(false)` が
+DWM で反映されるまで約 1 フレームかかるため、メインウィンドウが手前に合成されてから fullscreen
+窓 (黒) が消えるまでの間、メイン周囲に一瞬黒地が残る。これは上記の panic / 黒コンテンツ問題とは
+別の DWM 表示タイミング由来で、単一 viewport 化以外では完全には消せないため現状は許容している。
 
 detached session が開いている間は、`App::update` 終端でそのフレームの最終
 `selected` を読み、静止画 / ZIP画像 / PDFページ / 動画であれば viewer 側を同じ項目へ追従させる。
