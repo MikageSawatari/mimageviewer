@@ -901,6 +901,8 @@ fn book_reorder_drop_target_for_pos(
     rect: egui::Rect,
     item_index: usize,
     len: usize,
+    cols: usize,
+    gap: f32,
     pointer_pos: Option<egui::Pos2>,
 ) -> Option<(usize, f32)> {
     let pos = pointer_pos?;
@@ -913,12 +915,39 @@ fn book_reorder_drop_target_for_pos(
     } else {
         item_index
     };
-    let indicator_x = if insert_after {
+    let indicator_x =
+        book_reorder_insert_indicator_x(rect, item_index, insert_index, len, cols, gap);
+    Some((insert_index.min(len), indicator_x))
+}
+
+fn book_reorder_insert_indicator_x(
+    rect: egui::Rect,
+    item_index: usize,
+    insert_index: usize,
+    len: usize,
+    cols: usize,
+    gap: f32,
+) -> f32 {
+    let cols = cols.max(1);
+    if insert_index <= item_index {
+        if item_index > 0 && item_index % cols != 0 {
+            rect.left() - gap * 0.5
+        } else {
+            rect.left()
+        }
+    } else if insert_index < len && insert_index % cols != 0 {
+        rect.right() + gap * 0.5
+    } else {
         rect.right()
+    }
+}
+
+fn book_reorder_end_indicator_x(rect: egui::Rect, len: usize, cols: usize, gap: f32) -> f32 {
+    if len > 0 && len % cols.max(1) != 0 {
+        rect.left() - gap
     } else {
         rect.left()
-    };
-    Some((insert_index.min(len), indicator_x))
+    }
 }
 
 fn draw_book_reorder_insert_indicator(ui: &egui::Ui, x: f32, rect: egui::Rect) {
@@ -2194,10 +2223,16 @@ impl App {
                                                 && pointer_pos.is_some_and(|pos| rect.contains(pos))
                                             {
                                                 let insert_index = state.entries.len();
+                                                let indicator_x = book_reorder_end_indicator_x(
+                                                    rect,
+                                                    state.entries.len(),
+                                                    cols,
+                                                    gap,
+                                                );
                                                 state.drag_insert_index = Some(insert_index);
                                                 draw_book_reorder_insert_indicator(
                                                     ui,
-                                                    rect.left(),
+                                                    indicator_x,
                                                     rect,
                                                 );
                                                 ui.output_mut(|out| {
@@ -2337,6 +2372,8 @@ impl App {
                                                     rect,
                                                     i,
                                                     state.entries.len(),
+                                                    cols,
+                                                    gap,
                                                     pointer_pos,
                                                 )
                                         {
@@ -6913,11 +6950,11 @@ mod book_reorder_drag_tests {
         let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 140.0));
 
         assert_eq!(
-            book_reorder_drop_target_for_pos(rect, 4, 10, Some(egui::pos2(20.0, 80.0))),
-            Some((4, rect.left()))
+            book_reorder_drop_target_for_pos(rect, 4, 10, 5, 8.0, Some(egui::pos2(20.0, 80.0))),
+            Some((4, rect.left() - 4.0))
         );
         assert_eq!(
-            book_reorder_drop_target_for_pos(rect, 4, 10, Some(egui::pos2(95.0, 80.0))),
+            book_reorder_drop_target_for_pos(rect, 4, 10, 5, 8.0, Some(egui::pos2(95.0, 80.0))),
             Some((5, rect.right()))
         );
     }
@@ -6927,10 +6964,48 @@ mod book_reorder_drag_tests {
         let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 140.0));
 
         assert_eq!(
-            book_reorder_drop_target_for_pos(rect, 4, 10, Some(egui::pos2(9.0, 80.0))),
+            book_reorder_drop_target_for_pos(rect, 4, 10, 5, 8.0, Some(egui::pos2(9.0, 80.0))),
             None
         );
-        assert_eq!(book_reorder_drop_target_for_pos(rect, 4, 10, None), None);
+        assert_eq!(
+            book_reorder_drop_target_for_pos(rect, 4, 10, 5, 8.0, None),
+            None
+        );
+    }
+
+    #[test]
+    fn drop_indicator_uses_single_midpoint_between_adjacent_pages() {
+        let prev = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 140.0));
+        let next = egui::Rect::from_min_max(egui::pos2(118.0, 20.0), egui::pos2(218.0, 140.0));
+        let from_prev =
+            book_reorder_drop_target_for_pos(prev, 1, 8, 4, 8.0, Some(egui::pos2(100.0, 80.0)));
+        let from_next =
+            book_reorder_drop_target_for_pos(next, 2, 8, 4, 8.0, Some(egui::pos2(130.0, 80.0)));
+
+        assert_eq!(from_prev, Some((2, 114.0)));
+        assert_eq!(from_next, Some((2, 114.0)));
+    }
+
+    #[test]
+    fn drop_indicator_stays_attached_at_row_edges() {
+        let row_start = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 140.0));
+        let row_end = egui::Rect::from_min_max(egui::pos2(334.0, 20.0), egui::pos2(434.0, 140.0));
+
+        assert_eq!(
+            book_reorder_drop_target_for_pos(row_start, 4, 9, 4, 8.0, Some(egui::pos2(20.0, 80.0))),
+            Some((4, row_start.left()))
+        );
+        assert_eq!(
+            book_reorder_drop_target_for_pos(row_end, 3, 9, 4, 8.0, Some(egui::pos2(425.0, 80.0))),
+            Some((4, row_end.right()))
+        );
+    }
+
+    #[test]
+    fn end_indicator_from_blank_cell_matches_last_page_edge() {
+        let blank = egui::Rect::from_min_max(egui::pos2(118.0, 20.0), egui::pos2(218.0, 140.0));
+
+        assert_eq!(book_reorder_end_indicator_x(blank, 1, 4, 8.0), 110.0);
     }
 
     #[test]
