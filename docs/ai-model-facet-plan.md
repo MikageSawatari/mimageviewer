@@ -12,6 +12,11 @@
   「モデル」「生成ツール」軸を追加した。複数モデルを持つ ComfyUI はいずれか一致で通す。
 - グローバル Tantivy 索引には入れない。現在グリッドの遅延読み込み済み AI メタデータを使う
   session-local facet として扱うため、`INDEX_VERSION` bump は不要。
+- 実サンプル由来の調整として、ComfyUI の `prompt` / `workflow` JSON に出る `NaN` /
+  `Infinity` / `-Infinity` は ComfyUI 分岐内だけ `null` に置換して best-effort で読む。
+  また Flux 系の `UNETLoader` / `UNETLoaderGGUF` の `unet_name` も主モデル候補として扱う。
+- InvokeAI 新形式の `model` object は、object 全体をモデル名として文字列化せず、
+  `model_name` / `name` / `model_weights` など既知フィールドから実名だけを平坦化する。
 
 ## 0. 背景と目的
 
@@ -67,7 +72,7 @@ stat/decode/probe が要る項目) と同じ仕組みに乗せる:
 | Fooocus / RuinedFooocus | `base_model` / `base_model_name` | 高 | 抽出済み |
 | InvokeAI | `model` (新形式) / `model_weights` (旧 sd-metadata) | 高 | 抽出済み |
 | EasyDiffusion | `use_stable_diffusion_model` (パス → basename) | 中 | パスから basename 化が必要 |
-| **ComfyUI** | ノードグラフの `CheckpointLoaderSimple.ckpt_name` 等 | **低** | **複数チェックポイント / LoRA / refiner があり単一に確定できない**。ベストエフォート (見つかった checkpoint 名を全部集める / 代表 1 つ / 「(複数)」) |
+| **ComfyUI** | ノードグラフの `CheckpointLoaderSimple.ckpt_name` / `UNETLoader.unet_name` 等 | **低** | **複数チェックポイント / LoRA / refiner があり単一に確定できない**。ベストエフォート (見つかった checkpoint / UNET 名を全部集める / 代表 1 つ / 「(複数)」)。`NaN` 等の非標準数値を含む prompt JSON は ComfyUI 分岐内だけ寛容に読む |
 | NovelAI | `Source` に "Stable Diffusion <hash>" のハッシュのみ | 低 | 人間可読なモデル名は取れない。「(NovelAI)」/ハッシュ表示に留める |
 | 非 AI 画像 | — | — | モデル軸では「(なし)」グループ |
 

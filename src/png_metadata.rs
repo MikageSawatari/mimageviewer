@@ -310,16 +310,17 @@ fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome>
 
     // ComfyUI: "prompt" キーの JSON object
     if let Some(json_str) = chunk_value(chunks, "prompt") {
-        // ComfyUI の prompt は JSON 形式
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-            if val.is_object() {
-                let workflow = chunk_value(chunks, "workflow")
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-                return Some(ParseOutcome {
-                    meta: AiMetadata::ComfyUI(parse_comfyui(val, workflow)),
-                    consumed_keys: vec!["prompt", "workflow"],
-                });
-            }
+        // ComfyUI の prompt は JSON 形式。実サンプルには NaN / Infinity を含む
+        // ワークフローがあるため、この分岐だけは文字列外の非標準数値を null にして
+        // best-effort で読む。汎用 JSON 分岐は誤判定を避けるため strict のままにする。
+        if let Some(val) = parse_comfyui_json_value(json_str)
+            && val.is_object()
+        {
+            let workflow = chunk_value(chunks, "workflow").and_then(parse_comfyui_json_value);
+            return Some(ParseOutcome {
+                meta: AiMetadata::ComfyUI(parse_comfyui(val, workflow)),
+                consumed_keys: vec!["prompt", "workflow"],
+            });
         }
     }
 
@@ -461,6 +462,84 @@ fn chunk_value<'a>(chunks: &'a [(String, String)], key: &str) -> Option<&'a str>
 fn parse_json_object(raw: &str) -> Option<serde_json::Value> {
     let val = serde_json::from_str::<serde_json::Value>(raw).ok()?;
     val.is_object().then_some(val)
+}
+
+fn parse_comfyui_json_value(raw: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .or_else(|| {
+            sanitize_json_nonfinite_numbers(raw)
+                .and_then(|sanitized| serde_json::from_str::<serde_json::Value>(&sanitized).ok())
+        })
+}
+
+fn sanitize_json_nonfinite_numbers(raw: &str) -> Option<String> {
+    const TOKENS: &[&str] = &["-Infinity", "+Infinity", "Infinity", "-NaN", "+NaN", "NaN"];
+
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut changed = false;
+
+    while i < raw.len() {
+        let ch = raw[i..].chars().next()?;
+        let ch_len = ch.len_utf8();
+
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            i += ch_len;
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
+            i += ch_len;
+            continue;
+        }
+
+        if let Some(token) = TOKENS.iter().copied().find(|token| {
+            raw[i..].starts_with(token)
+                && json_token_boundary_before(raw, i)
+                && json_token_boundary_after(raw, i + token.len())
+        }) {
+            out.push_str("null");
+            i += token.len();
+            changed = true;
+            continue;
+        }
+
+        out.push(ch);
+        i += ch_len;
+    }
+
+    changed.then_some(out)
+}
+
+fn json_token_boundary_before(raw: &str, index: usize) -> bool {
+    raw[..index]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !json_identifier_char(ch))
+}
+
+fn json_token_boundary_after(raw: &str, index: usize) -> bool {
+    raw[index..]
+        .chars()
+        .next()
+        .is_none_or(|ch| !json_identifier_char(ch))
+}
+
+fn json_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.')
 }
 
 fn parse_parameters_json(
@@ -774,6 +853,10 @@ fn parse_invokeai_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metad
     }
 
     let mut params = Vec::new();
+    if let Some(model) = json.get("model").and_then(model_json_value_to_text) {
+        params.push(("model_name".to_string(), model.clone()));
+        params.push(("model".to_string(), model));
+    }
     for key in [
         "generation_mode",
         "width",
@@ -785,17 +868,13 @@ fn parse_invokeai_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metad
         "steps",
         "scheduler",
         "clip_skip",
-        "model",
+        "model_name",
+        "model_weights",
         "strength",
         "vae",
         "app_version",
     ] {
-        let value = if key == "model" {
-            json.get(key).and_then(model_json_value_to_text)
-        } else {
-            json.get(key).and_then(json_value_to_text)
-        };
-        if let Some(v) = value {
+        if let Some(v) = json.get(key).and_then(json_value_to_text) {
             params.push((key.to_string(), v));
         }
     }
@@ -1140,11 +1219,13 @@ fn model_json_value_to_text(value: &serde_json::Value) -> Option<String> {
                 &["model_name"],
                 &["name"],
                 &["modelName"],
-                &["base"],
                 &["model_weights"],
+                &["key"],
+                &["id"],
+                &["path"],
+                &["base"],
             ],
-        )
-        .or_else(|| json_value_to_text(value)),
+        ),
         _ => json_value_to_text(value),
     }
 }
@@ -1457,15 +1538,23 @@ fn normalize_model_name(raw: &str) -> Option<String> {
         .unwrap_or(without_hash_suffix)
         .trim();
     let lower = basename.to_ascii_lowercase();
-    let stem = [".safetensors", ".ckpt", ".pt", ".pth", ".onnx", ".bin"]
-        .iter()
-        .find_map(|ext| {
-            lower
-                .strip_suffix(ext)
-                .map(|_| &basename[..basename.len() - ext.len()])
-        })
-        .unwrap_or(basename)
-        .trim();
+    let stem = [
+        ".safetensors",
+        ".ckpt",
+        ".pt",
+        ".pth",
+        ".onnx",
+        ".bin",
+        ".gguf",
+    ]
+    .iter()
+    .find_map(|ext| {
+        lower
+            .strip_suffix(ext)
+            .map(|_| &basename[..basename.len() - ext.len()])
+    })
+    .unwrap_or(basename)
+    .trim();
     looks_like_model_name(stem).then(|| stem.to_string())
 }
 
@@ -1908,10 +1997,16 @@ fn parse_comfyui(
                         }
                     }
                 }
-                "CheckpointLoaderSimple" | "CheckpointLoader" => {
-                    if let Some(inputs) = node.get("inputs").and_then(|i| i.as_object()) {
-                        if let Some(name) = inputs.get("ckpt_name").and_then(|v| v.as_str()) {
-                            sampler_params.push(("model".to_string(), name.to_string()));
+                _ if comfyui_model_input_keys(class).is_some() => {
+                    if let Some(inputs) = node.get("inputs").and_then(|i| i.as_object())
+                        && let Some(keys) = comfyui_model_input_keys(class)
+                    {
+                        for key in keys {
+                            if let Some(name) = inputs.get(*key).and_then(|v| v.as_str())
+                                && !name.trim().is_empty()
+                            {
+                                sampler_params.push(("model".to_string(), name.to_string()));
+                            }
                         }
                     }
                 }
@@ -1960,6 +2055,18 @@ fn parse_comfyui(
         extracted_prompts,
         extracted_negatives,
         sampler_params,
+    }
+}
+
+fn comfyui_model_input_keys(class: &str) -> Option<&'static [&'static str]> {
+    if matches!(class, "CheckpointLoaderSimple" | "CheckpointLoader")
+        || class.contains("CheckpointLoader")
+    {
+        Some(&["ckpt_name"])
+    } else if class.contains("UNETLoader") || class.contains("UnetLoader") {
+        Some(&["unet_name"])
+    } else {
+        None
     }
 }
 
@@ -2188,7 +2295,7 @@ mod tests {
             params: vec![
                 (
                     "Model".to_string(),
-                    "!fav_loli_A, Variation seed: 123, Variation seed strength: 0.03".to_string(),
+                    "!fav_style_A, Variation seed: 123, Variation seed strength: 0.03".to_string(),
                 ),
                 ("Model".to_string(), "<lora:sample:1>".to_string()),
                 ("Model".to_string(), "Template: prompt words".to_string()),
@@ -2196,7 +2303,7 @@ mod tests {
             ],
             raw: String::new(),
         });
-        assert_eq!(model_names(&meta), vec!["!fav_loli_A"]);
+        assert_eq!(model_names(&meta), vec!["!fav_style_A"]);
     }
 
     #[test]
@@ -2233,11 +2340,11 @@ mod tests {
 
         let invoke_object = expect_prompt_meta(detect_and_parse(&chunks(&[(
             "invokeai_metadata",
-            r#"{"positive_prompt":"p","model":{"model_name":"object-model.safetensors"}}"#,
+            r#"{"positive_prompt":"p","model":{"base_model":"sdxl","model_name":"juggernautXL_v9.safetensors","model_type":"main"}}"#,
         )])));
         assert_eq!(
             model_name(&AiMetadata::A1111(invoke_object)).as_deref(),
-            Some("object-model")
+            Some("juggernautXL_v9")
         );
 
         let invoke_legacy = expect_prompt_meta(detect_and_parse(&chunks(&[(
@@ -2300,6 +2407,24 @@ mod tests {
         ])));
         let meta = AiMetadata::A1111(novelai);
         assert_eq!(model_name(&meta).as_deref(), Some(NOVELAI_MODEL_LABEL));
+    }
+
+    #[test]
+    fn model_names_extracts_comfyui_unet_loader() {
+        let json_str = r#"{
+            "1": {
+                "class_type": "UNETLoader",
+                "inputs": {"unet_name": "flux/flux1-dev.safetensors"}
+            },
+            "2": {
+                "class_type": "UNETLoaderGGUF",
+                "inputs": {"unet_name": "flux1-fill.gguf"}
+            }
+        }"#;
+        let meta =
+            AiMetadata::ComfyUI(parse_comfyui(serde_json::from_str(json_str).unwrap(), None));
+        assert_eq!(model_names(&meta), vec!["flux1-dev", "flux1-fill"]);
+        assert_eq!(model_name(&meta).as_deref(), Some(MULTIPLE_MODELS_LABEL));
     }
 
     #[test]
@@ -2373,6 +2498,105 @@ mod tests {
         )];
         let result = detect_and_parse(&chunks);
         assert!(matches!(result, Some(AiMetadata::ComfyUI(_))));
+    }
+
+    #[test]
+    fn test_detect_comfyui_accepts_nonfinite_numbers() {
+        let chunks = vec![(
+            "prompt".to_string(),
+            r#"{
+                "1": {
+                    "class_type": "CheckpointLoaderSimple",
+                    "inputs": {"ckpt_name": "nan-model.safetensors"}
+                },
+                "2": {
+                    "class_type": "CLIPTextEncode",
+                    "inputs": {"text": "literal NaN prompt", "clip": ["1", 1]}
+                },
+                "3": {
+                    "class_type": "CLIPTextEncode",
+                    "inputs": {"text": "bad", "clip": ["1", 1]}
+                },
+                "4": {
+                    "class_type": "KSampler",
+                    "inputs": {
+                        "steps": 20,
+                        "cfg": 7.0,
+                        "denoise": NaN,
+                        "positive": ["2", 0],
+                        "negative": ["3", 0],
+                        "model": ["1", 0]
+                    }
+                },
+                "5": {
+                    "class_type": "DPRandomGenerator",
+                    "inputs": {"a": Infinity, "b": -Infinity}
+                }
+            }"#
+            .to_string(),
+        )];
+        let result = detect_and_parse(&chunks).expect("ComfyUI metadata");
+        let AiMetadata::ComfyUI(meta) = result else {
+            panic!("expected ComfyUI");
+        };
+        assert!(
+            meta.extracted_prompts
+                .contains(&"literal NaN prompt".to_string())
+        );
+        assert_eq!(model_names(&AiMetadata::ComfyUI(meta)), vec!["nan-model"]);
+    }
+
+    #[test]
+    fn optional_synthetic_ai_metadata_fixtures_smoke() {
+        let dir = std::env::var_os("MIV_AI_METADATA_FIXTURE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests")
+                    .join("fixtures")
+                    .join("ai_metadata")
+            });
+        if !dir.exists() {
+            return;
+        }
+
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("a1111_hashes_json.png", "A1111/Forge", &["dreamShaper_v8"]),
+            (
+                "a1111_variation_seed.png",
+                "A1111/Forge",
+                &["dreamShaper_v8"],
+            ),
+            ("a1111_batch.png", "A1111/Forge", &["dreamShaper_v8"]),
+            (
+                "a1111_dynamic_prompts_template.png",
+                "A1111/Forge",
+                &["dreamShaper_v8"],
+            ),
+            ("comfyui_nan.png", "ComfyUI", &["dreamShaper_v8"]),
+            ("comfyui_infinity.png", "ComfyUI", &["dreamShaper_v8"]),
+            ("comfyui_unet_loader.png", "ComfyUI", &["flux1-dev"]),
+            ("invokeai_new.png", "InvokeAI", &["juggernautXL_v9"]),
+            (
+                "fooocus_basic.png",
+                "Fooocus",
+                &["juggernautXL_v8Rundiffusion"],
+            ),
+        ];
+
+        for (file, expected_tool, expected_models) in cases {
+            let path = dir.join(file);
+            if !path.exists() {
+                continue;
+            }
+            let meta = extract_metadata(&path).unwrap_or_else(|| panic!("{file}: no metadata"));
+            assert_eq!(ai_tool_name(&meta), Some(*expected_tool), "{file}");
+            let expected_models = expected_models
+                .iter()
+                .map(|model| model.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(model_names(&meta), expected_models, "{file}");
+        }
     }
 
     #[test]
