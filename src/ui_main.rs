@@ -1602,12 +1602,12 @@ impl App {
 
                 let response = ui.menu_button("製本", |ui| {
                     let active_name = self.active_book_name();
-                    ui.label(format!("追加先: {active_name}"));
+                    ui.label(format!("追加先の本: {active_name}"));
                     let has_selection = self.selected.is_some() || !self.checked.is_empty();
                     if ui
                         .add_enabled(
                             has_selection,
-                            egui::Button::new("アクティブな本に追加 (Ctrl+B)"),
+                            egui::Button::new("追加先の本に追加 (Ctrl+B)"),
                         )
                         .clicked()
                     {
@@ -1618,7 +1618,7 @@ impl App {
                         self.open_books_root();
                         ui.close();
                     }
-                    if ui.button("アクティブな本を開く").clicked() {
+                    if ui.button("追加先の本を開く").clicked() {
                         fav_nav = Some(self.active_book_folder_path());
                         ui.close();
                     }
@@ -1645,7 +1645,7 @@ impl App {
                             ui.label(egui::RichText::new("（本はまだありません）").weak());
                         }
                         Some(rows) => {
-                            ui.menu_button("追加先を選ぶ", |ui| {
+                            ui.menu_button("追加先の本を選ぶ", |ui| {
                                 for row in rows {
                                     let selected = row.name == active_name;
                                     let label = if selected {
@@ -2116,7 +2116,7 @@ impl App {
                 ui.set_min_width(660.0);
                 ui.label(format!("本棚: {}", self.book_root_path().display()));
                 ui.horizontal(|ui| {
-                    ui.label("追加先");
+                    ui.label("現在の追加先の本");
                     ui.strong(self.active_book_name());
                     if ui.button("開く").clicked() {
                         open_request = Some(self.active_book_folder_path());
@@ -2168,10 +2168,6 @@ impl App {
                             .show(ui, |ui| {
                                 for row in rows {
                                     let active = row.name == active_name;
-                                    let confirming = self
-                                        .book_manager_delete_confirm
-                                        .as_ref()
-                                        .is_some_and(|name| name == &row.name);
                                     ui.horizontal(|ui| {
                                         if active {
                                             ui.strong("●");
@@ -2196,37 +2192,24 @@ impl App {
                                                 if ui.button("開く").clicked() {
                                                     open_request = Some(row.path.clone());
                                                 }
-                                                let delete_label = if confirming {
-                                                    "削除確定"
-                                                } else {
-                                                    "削除"
-                                                };
                                                 if ui
                                                     .add_enabled(
                                                         self.book_op_pending.is_none(),
-                                                        egui::Button::new(delete_label),
+                                                        egui::Button::new("削除"),
                                                     )
                                                     .clicked()
                                                 {
-                                                    if confirming {
-                                                        delete_request = Some(row.name.clone());
-                                                    } else {
-                                                        self.book_manager_delete_confirm =
-                                                            Some(row.name.clone());
-                                                    }
-                                                }
-                                                if confirming && ui.button("取消").clicked() {
-                                                    self.book_manager_delete_confirm = None;
+                                                    self.book_manager_delete_confirm =
+                                                        Some(row.name.clone());
                                                 }
                                                 if ui
                                                     .add_enabled(
                                                         !active && self.book_op_pending.is_none(),
-                                                        egui::Button::new("追加先"),
+                                                        egui::Button::new("追加先の本にする"),
                                                     )
                                                     .clicked()
                                                 {
                                                     set_active_request = Some(row.name.clone());
-                                                    self.book_manager_delete_confirm = None;
                                                 }
                                                 if ui
                                                     .add_enabled(
@@ -2249,6 +2232,42 @@ impl App {
                     }
                 }
             });
+        if let Some(name) = self.book_manager_delete_confirm.clone() {
+            let mut close_confirm = false;
+            let mut confirmed = false;
+            let response = egui::Modal::new(egui::Id::new("book_manager_delete_confirm_modal"))
+                .show(ctx, |ui| {
+                    ui.set_min_width(420.0);
+                    ui.heading("本を削除");
+                    ui.add_space(8.0);
+                    ui.label(format!("「{name}」を削除します。"));
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("この本に入っているページ画像も削除されます。").weak(),
+                    );
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(self.book_op_pending.is_none(), egui::Button::new("削除"))
+                            .clicked()
+                        {
+                            confirmed = true;
+                            close_confirm = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            close_confirm = true;
+                        }
+                    });
+                });
+            if confirmed {
+                delete_request = Some(name);
+            }
+            if close_confirm || response.should_close() {
+                self.book_manager_delete_confirm = None;
+            }
+        }
         if refresh_request {
             self.book_list_cache = None;
             self.book_manager_rename_inputs.clear();

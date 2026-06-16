@@ -13527,10 +13527,10 @@ impl App {
         self.start_book_append(ctx, sources);
         if skipped > 0 {
             self.show_feedback_toast(format!(
-                "アクティブな本へ追加中: {count} ページ (除外 {skipped})"
+                "追加先の本へ追加中: {count} ページ (除外 {skipped})"
             ));
         } else {
-            self.show_feedback_toast(format!("アクティブな本へ追加中: {count} ページ"));
+            self.show_feedback_toast(format!("追加先の本へ追加中: {count} ページ"));
         }
     }
 
@@ -13551,7 +13551,7 @@ impl App {
             }
         };
         self.start_book_append(ctx, vec![source]);
-        self.show_feedback_toast("アクティブな本へ追加中".to_string());
+        self.show_feedback_toast("追加先の本へ追加中".to_string());
     }
 
     pub(crate) fn add_current_video_frame_to_active_book(
