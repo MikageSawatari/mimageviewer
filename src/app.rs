@@ -427,16 +427,19 @@ pub(crate) struct BookReorderState {
     pub(crate) folder: PathBuf,
     pub(crate) entries: Vec<crate::books::BookPageEntry>,
     pub(crate) selected: Option<usize>,
+    pub(crate) selected_keys: std::collections::HashSet<String>,
+    pub(crate) selection_anchor: Option<usize>,
     pub(crate) dragging: Option<usize>,
     pub(crate) thumb_textures: std::collections::HashMap<String, egui::TextureHandle>,
     pub(crate) thumb_failed: std::collections::HashSet<String>,
     pub(crate) thumb_pending_key: Option<String>,
     pub(crate) thumb_rx: Option<mpsc::Receiver<BookReorderThumbResult>>,
     pub(crate) dirty: bool,
-    pub(crate) discard_confirm: bool,
     pub(crate) drag_insert_index: Option<usize>,
     pub(crate) thumb_tile_px: f32,
     pub(crate) flush_pending: Option<crate::books::BookOpPending>,
+    pub(crate) transfer_target_book: String,
+    pub(crate) transfer_pending: Option<crate::books::BookOpPending>,
     pub(crate) error: Option<String>,
 }
 
@@ -14127,6 +14130,41 @@ impl App {
         }
     }
 
+    pub(crate) fn start_book_transfer(
+        &mut self,
+        ctx: &egui::Context,
+        source_folder: PathBuf,
+        current_order_paths: Vec<PathBuf>,
+        selected_paths: Vec<PathBuf>,
+        target_book_name: String,
+        kind: crate::books::BookTransferKind,
+    ) -> Option<crate::books::BookOpPending> {
+        let root = self.book_root_path();
+        let (tx, rx) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name("book-transfer".into())
+            .spawn(move || {
+                let result = crate::books::transfer_pages_between_books(
+                    root,
+                    source_folder,
+                    current_order_paths,
+                    selected_paths,
+                    target_book_name,
+                    kind,
+                );
+                let _ = tx.send(result);
+            }) {
+            Ok(_) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                Some(crate::books::BookOpPending { rx })
+            }
+            Err(err) => {
+                self.show_feedback_toast(format!("ページ転送 worker を開始できません: {err}"));
+                None
+            }
+        }
+    }
+
     fn start_book_op<F>(&mut self, ctx: &egui::Context, thread_name: &'static str, f: F)
     where
         F: FnOnce() -> Result<crate::books::BookOpResult, String> + Send + 'static,
@@ -14189,6 +14227,23 @@ impl App {
                 if let Some(path) = summary.first_path {
                     crate::logger::log(format!("book append first page: {}", path.display()));
                 }
+            }
+            Ok(crate::books::BookOpResult::Transfer(summary)) => {
+                self.book_list_cache = None;
+                if self.current_folder.as_ref().is_some_and(|current| {
+                    crate::folder_tree::path_eq(current, &summary.source_folder)
+                        || crate::folder_tree::path_eq(current, &summary.target_folder)
+                }) {
+                    self.pending_reload = true;
+                }
+                let verb = match summary.kind {
+                    crate::books::BookTransferKind::Copy => "コピー",
+                    crate::books::BookTransferKind::Move => "移動",
+                };
+                self.show_feedback_toast(format!(
+                    "「{}」へ {} ページ{}しました",
+                    summary.target_book_name, summary.pages, verb
+                ));
             }
             Ok(crate::books::BookOpResult::List(rows)) => {
                 self.book_manager_rename_inputs.clear();

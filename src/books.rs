@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -28,9 +29,26 @@ pub struct BookAppendSummary {
     pub first_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BookTransferKind {
+    Copy,
+    Move,
+}
+
+#[derive(Debug)]
+pub struct BookTransferSummary {
+    pub source_folder: PathBuf,
+    pub target_book_name: String,
+    pub target_folder: PathBuf,
+    pub pages: usize,
+    pub kind: BookTransferKind,
+    pub source_entries: Vec<BookPageEntry>,
+}
+
 #[derive(Debug)]
 pub enum BookOpResult {
     Append(BookAppendSummary),
+    Transfer(BookTransferSummary),
     List(Vec<BookInfo>),
     Created { name: String, path: PathBuf },
     Renamed { old_name: String, new_name: String },
@@ -260,6 +278,135 @@ pub fn append_pages(
 }
 
 pub fn flush_reorder(folder: PathBuf, ordered_paths: Vec<PathBuf>) -> Result<BookOpResult, String> {
+    let count = ordered_paths.len();
+    flush_reorder_paths(folder.clone(), ordered_paths)?;
+    Ok(BookOpResult::Reordered { folder, count })
+}
+
+pub fn transfer_pages_between_books(
+    root: PathBuf,
+    source_folder: PathBuf,
+    current_order_paths: Vec<PathBuf>,
+    selected_paths: Vec<PathBuf>,
+    target_book_name: String,
+    kind: BookTransferKind,
+) -> Result<BookOpResult, String> {
+    if selected_paths.is_empty() {
+        return Err("移動/コピーするページがありません".to_string());
+    }
+    if current_order_paths.is_empty() {
+        return Err("本にページがありません".to_string());
+    }
+    ensure_direct_book_target(&root, &source_folder)?;
+    let target_book_name = normalize_book_name(&target_book_name);
+    let target_folder = book_folder(&root, &target_book_name);
+    if crate::folder_tree::path_eq(&source_folder, &target_folder) {
+        return Err("同じ本への移動/コピーはまだ対応していません".to_string());
+    }
+    fs::create_dir_all(&target_folder).map_err(|e| {
+        format!(
+            "移動先の本フォルダを作成できません: {}: {e}",
+            target_folder.display()
+        )
+    })?;
+    ensure_direct_book_target(&root, &target_folder)?;
+
+    let selected_keys = selected_paths
+        .iter()
+        .map(|path| crate::search_index_db::normalize_path(path))
+        .collect::<HashSet<_>>();
+    let current_keys = current_order_paths
+        .iter()
+        .map(|path| crate::search_index_db::normalize_path(path))
+        .collect::<HashSet<_>>();
+    if !selected_keys.iter().all(|key| current_keys.contains(key)) {
+        return Err("選択ページが現在の本に見つかりません".to_string());
+    }
+    let start = next_page_number(&target_folder)?;
+    if start + selected_paths.len() - 1 > MAX_BOOK_PAGES {
+        return Err(format!(
+            "移動先の本のページ数が上限 {} を超えます (現在 {}, 追加 {})",
+            MAX_BOOK_PAGES,
+            start.saturating_sub(1),
+            selected_paths.len()
+        ));
+    }
+
+    let committed_paths = flush_reorder_paths(source_folder.clone(), current_order_paths.clone())?;
+    let mut selected_committed = Vec::new();
+    let mut remaining_committed = Vec::new();
+    for (old_path, committed_path) in current_order_paths.iter().zip(committed_paths.iter()) {
+        if selected_keys.contains(&crate::search_index_db::normalize_path(old_path)) {
+            selected_committed.push(committed_path.clone());
+        } else {
+            remaining_committed.push(committed_path.clone());
+        }
+    }
+    if selected_committed.is_empty() {
+        return Err("選択ページが現在の本に見つかりません".to_string());
+    }
+
+    let mut completed = Vec::with_capacity(selected_committed.len());
+    for (offset, src) in selected_committed.iter().enumerate() {
+        let dest = destination_for_existing_page(&target_folder, start + offset, src)?;
+        let result = match kind {
+            BookTransferKind::Copy => copy_page_to_destination(src, &dest)
+                .map(|_| CompletedTransfer::Copied { dest: dest.clone() }),
+            BookTransferKind::Move => {
+                move_page_to_destination(src, &dest).map(|mode| CompletedTransfer::Moved {
+                    src: src.clone(),
+                    dest: dest.clone(),
+                    mode,
+                })
+            }
+        };
+        match result {
+            Ok(done) => completed.push(done),
+            Err(err) => {
+                rollback_completed_transfers(&completed);
+                return Err(err);
+            }
+        }
+    }
+
+    let source_after_paths = if kind == BookTransferKind::Move {
+        match flush_reorder_paths(source_folder.clone(), remaining_committed) {
+            Ok(paths) => paths,
+            Err(err) => {
+                return Err(format!(
+                    "ページ移動は完了しましたが、元本の番号整理に失敗しました: {err}"
+                ));
+            }
+        }
+    } else {
+        committed_paths
+    };
+    let source_entries = source_after_paths
+        .into_iter()
+        .map(|path| {
+            let display_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("page")
+                .to_string();
+            BookPageEntry { path, display_name }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(BookOpResult::Transfer(BookTransferSummary {
+        source_folder,
+        target_book_name,
+        target_folder,
+        pages: selected_committed.len(),
+        kind,
+        source_entries,
+    }))
+}
+
+fn flush_reorder_paths(
+    folder: PathBuf,
+    ordered_paths: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
     if ordered_paths.len() > MAX_BOOK_PAGES {
         return Err(format!("本のページ数が上限 {} を超えます", MAX_BOOK_PAGES));
     }
@@ -311,10 +458,7 @@ pub fn flush_reorder(folder: PathBuf, ordered_paths: Vec<PathBuf>) -> Result<Boo
         finalized.push((original.clone(), dest));
     }
 
-    Ok(BookOpResult::Reordered {
-        folder,
-        count: ordered_paths.len(),
-    })
+    Ok(finalized.into_iter().map(|(_, dest)| dest).collect())
 }
 
 fn write_source(source: BookPageSource, dest: &Path) -> Result<(), String> {
@@ -495,6 +639,88 @@ fn copy_file_snapshot(src: &Path, dest: &Path) -> Result<(), String> {
         .map_err(|e| format!("ページを flush できません: {}: {e}", dest.display()))
 }
 
+#[derive(Clone, Copy)]
+enum MoveMode {
+    Rename,
+    CopyDelete,
+}
+
+enum CompletedTransfer {
+    Copied {
+        dest: PathBuf,
+    },
+    Moved {
+        src: PathBuf,
+        dest: PathBuf,
+        mode: MoveMode,
+    },
+}
+
+fn copy_page_to_destination(src: &Path, dest: &Path) -> Result<(), String> {
+    match copy_file_snapshot(src, dest) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(dest);
+            Err(err)
+        }
+    }
+}
+
+fn move_page_to_destination(src: &Path, dest: &Path) -> Result<MoveMode, String> {
+    if dest.exists() {
+        return Err(format!("移動先ページが既に存在します: {}", dest.display()));
+    }
+    match fs::rename(src, dest) {
+        Ok(()) => Ok(MoveMode::Rename),
+        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+            copy_page_to_destination(src, dest)?;
+            if let Err(delete_err) = fs::remove_file(src) {
+                let _ = fs::remove_file(dest);
+                return Err(format!(
+                    "移動元ページを削除できません: {}: {delete_err}",
+                    src.display()
+                ));
+            }
+            Ok(MoveMode::CopyDelete)
+        }
+        Err(err) => Err(format!(
+            "ページを移動できません: {} → {}: {err}",
+            src.display(),
+            dest.display()
+        )),
+    }
+}
+
+fn rollback_completed_transfers(completed: &[CompletedTransfer]) {
+    for item in completed.iter().rev() {
+        match item {
+            CompletedTransfer::Copied { dest } => {
+                let _ = fs::remove_file(dest);
+            }
+            CompletedTransfer::Moved { src, dest, mode } => {
+                rollback_moved_page(src, dest, *mode);
+            }
+        }
+    }
+}
+
+fn rollback_moved_page(src: &Path, dest: &Path, mode: MoveMode) {
+    if src.exists() {
+        let _ = fs::remove_file(dest);
+        return;
+    }
+    match mode {
+        MoveMode::Rename => {
+            let _ = fs::rename(dest, src);
+        }
+        MoveMode::CopyDelete => {
+            if copy_file_snapshot(dest, src).is_ok() {
+                let _ = fs::remove_file(dest);
+            }
+        }
+    }
+}
+
 fn write_bytes_create_new(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     let Some(parent) = dest.parent() else {
         return Err(format!("保存先が不正です: {}", dest.display()));
@@ -560,6 +786,18 @@ fn destination_for_source(
     };
     let name = sanitize_filename(&raw_name, "page");
     let path = folder.join(format!("{page_no:04}_{name}"));
+    if path.exists() {
+        return Err(format!("ページ番号が既に存在します: {}", path.display()));
+    }
+    Ok(path)
+}
+
+fn destination_for_existing_page(
+    folder: &Path,
+    page_no: usize,
+    source_path: &Path,
+) -> Result<PathBuf, String> {
+    let path = folder.join(final_reorder_name(page_no, source_path));
     if path.exists() {
         return Err(format!("ページ番号が既に存在します: {}", path.display()));
     }
@@ -782,5 +1020,70 @@ mod tests {
                     .starts_with(".miv-book-tmp-")
             });
         assert!(!temp_left);
+    }
+
+    #[test]
+    fn transfer_copy_commits_current_order_before_copying_selected_pages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("books");
+        let source = root.join("src");
+        let target = root.join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let a = source.join("0001_a.jpg");
+        let b = source.join("0002_b.jpg");
+        let c = source.join("0003_c.jpg");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        fs::write(&c, b"c").unwrap();
+
+        let result = transfer_pages_between_books(
+            root.clone(),
+            source.clone(),
+            vec![c.clone(), a.clone(), b.clone()],
+            vec![c.clone(), b.clone()],
+            "dst".to_string(),
+            BookTransferKind::Copy,
+        )
+        .unwrap();
+
+        assert!(matches!(result, BookOpResult::Transfer(_)));
+        assert_eq!(fs::read(source.join("0001_c.jpg")).unwrap(), b"c");
+        assert_eq!(fs::read(source.join("0002_a.jpg")).unwrap(), b"a");
+        assert_eq!(fs::read(source.join("0003_b.jpg")).unwrap(), b"b");
+        assert_eq!(fs::read(target.join("0001_c.jpg")).unwrap(), b"c");
+        assert_eq!(fs::read(target.join("0002_b.jpg")).unwrap(), b"b");
+    }
+
+    #[test]
+    fn transfer_move_renames_selected_pages_and_compacts_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("books");
+        let source = root.join("src");
+        let target = root.join("dst");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let a = source.join("0001_a.jpg");
+        let b = source.join("0002_b.jpg");
+        let c = source.join("0003_c.jpg");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        fs::write(&c, b"c").unwrap();
+
+        transfer_pages_between_books(
+            root,
+            source.clone(),
+            vec![a.clone(), b.clone(), c.clone()],
+            vec![b.clone(), c.clone()],
+            "dst".to_string(),
+            BookTransferKind::Move,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(source.join("0001_a.jpg")).unwrap(), b"a");
+        assert!(!source.join("0002_b.jpg").exists());
+        assert!(!source.join("0003_c.jpg").exists());
+        assert_eq!(fs::read(target.join("0001_b.jpg")).unwrap(), b"b");
+        assert_eq!(fs::read(target.join("0002_c.jpg")).unwrap(), b"c");
     }
 }

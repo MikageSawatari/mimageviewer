@@ -888,6 +888,7 @@ fn finish_details_header_drag(
     reorder_details_column(settings, drag.column, target, insert_after)
 }
 
+#[cfg(test)]
 fn adjusted_book_reorder_insert_index(src: usize, insert_index: usize, len: usize) -> usize {
     let insert_index = insert_index.min(len);
     if src < insert_index {
@@ -895,6 +896,215 @@ fn adjusted_book_reorder_insert_index(src: usize, insert_index: usize, len: usiz
     } else {
         insert_index
     }
+}
+
+fn book_reorder_entry_key(entry: &crate::books::BookPageEntry) -> String {
+    crate::search_index_db::normalize_path(&entry.path)
+}
+
+fn book_reorder_select_single(state: &mut crate::app::BookReorderState, index: usize) {
+    state.selected_keys.clear();
+    if let Some(entry) = state.entries.get(index) {
+        state.selected_keys.insert(book_reorder_entry_key(entry));
+        state.selected = Some(index);
+        state.selection_anchor = Some(index);
+    }
+}
+
+fn book_reorder_toggle_selection(state: &mut crate::app::BookReorderState, index: usize) {
+    let Some(entry) = state.entries.get(index) else {
+        return;
+    };
+    let key = book_reorder_entry_key(entry);
+    if !state.selected_keys.remove(&key) {
+        state.selected_keys.insert(key);
+    }
+    if state.selected_keys.is_empty() {
+        state.selected_keys.insert(book_reorder_entry_key(entry));
+    }
+    state.selected = Some(index);
+    state.selection_anchor = Some(index);
+}
+
+fn book_reorder_select_range(state: &mut crate::app::BookReorderState, index: usize) {
+    if state.entries.is_empty() {
+        return;
+    }
+    let anchor = state
+        .selection_anchor
+        .unwrap_or_else(|| state.selected.unwrap_or(index))
+        .min(state.entries.len() - 1);
+    let start = anchor.min(index);
+    let end = anchor.max(index).min(state.entries.len() - 1);
+    state.selected_keys.clear();
+    for entry in &state.entries[start..=end] {
+        state.selected_keys.insert(book_reorder_entry_key(entry));
+    }
+    state.selected = Some(index.min(state.entries.len() - 1));
+}
+
+fn ensure_book_reorder_selection(state: &mut crate::app::BookReorderState) {
+    let live_keys = state
+        .entries
+        .iter()
+        .map(book_reorder_entry_key)
+        .collect::<HashSet<_>>();
+    state.selected_keys.retain(|key| live_keys.contains(key));
+    if state.entries.is_empty() {
+        state.selected = None;
+        state.selection_anchor = None;
+        return;
+    }
+    let selected = state
+        .selected
+        .unwrap_or(0)
+        .min(state.entries.len().saturating_sub(1));
+    if state.selected_keys.is_empty() {
+        book_reorder_select_single(state, selected);
+        return;
+    }
+    state.selected = Some(selected);
+    state.selection_anchor = state
+        .selection_anchor
+        .map(|anchor| anchor.min(state.entries.len().saturating_sub(1)))
+        .or(Some(selected));
+}
+
+fn selected_book_reorder_indices(
+    entries: &[crate::books::BookPageEntry],
+    selected_keys: &HashSet<String>,
+) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            selected_keys
+                .contains(&book_reorder_entry_key(entry))
+                .then_some(idx)
+        })
+        .collect()
+}
+
+fn adjusted_book_reorder_group_insert_index(
+    selected_indices: &[usize],
+    insert_index: usize,
+    len: usize,
+) -> usize {
+    let insert_index = insert_index.min(len);
+    let removed_before = selected_indices
+        .iter()
+        .filter(|idx| **idx < insert_index)
+        .count();
+    insert_index.saturating_sub(removed_before)
+}
+
+fn move_selected_book_reorder_group(
+    state: &mut crate::app::BookReorderState,
+    insert_index: usize,
+) -> bool {
+    let selected_indices = selected_book_reorder_indices(&state.entries, &state.selected_keys);
+    if selected_indices.is_empty() {
+        return false;
+    }
+    let before = state
+        .entries
+        .iter()
+        .map(book_reorder_entry_key)
+        .collect::<Vec<_>>();
+    let focus_key = state
+        .selected
+        .and_then(|idx| state.entries.get(idx))
+        .map(book_reorder_entry_key);
+    let dst = adjusted_book_reorder_group_insert_index(
+        &selected_indices,
+        insert_index,
+        state.entries.len(),
+    );
+    let selected_keys = state.selected_keys.clone();
+    let mut moving = Vec::with_capacity(selected_indices.len());
+    let mut remaining =
+        Vec::with_capacity(state.entries.len().saturating_sub(selected_indices.len()));
+    for entry in state.entries.drain(..) {
+        if selected_keys.contains(&book_reorder_entry_key(&entry)) {
+            moving.push(entry);
+        } else {
+            remaining.push(entry);
+        }
+    }
+    let dst = dst.min(remaining.len());
+    remaining.splice(dst..dst, moving);
+    state.entries = remaining;
+    state.selected = focus_key
+        .as_ref()
+        .and_then(|key| {
+            state
+                .entries
+                .iter()
+                .position(|entry| &book_reorder_entry_key(entry) == key)
+        })
+        .or_else(|| {
+            selected_book_reorder_indices(&state.entries, &state.selected_keys)
+                .first()
+                .copied()
+        });
+    let after = state
+        .entries
+        .iter()
+        .map(book_reorder_entry_key)
+        .collect::<Vec<_>>();
+    before != after
+}
+
+fn move_selected_book_reorder_by(state: &mut crate::app::BookReorderState, delta: i32) -> bool {
+    let selected_indices = selected_book_reorder_indices(&state.entries, &state.selected_keys);
+    if selected_indices.is_empty() {
+        return false;
+    }
+    let focus_key = state
+        .selected
+        .and_then(|idx| state.entries.get(idx))
+        .map(book_reorder_entry_key);
+    let before = state
+        .entries
+        .iter()
+        .map(book_reorder_entry_key)
+        .collect::<Vec<_>>();
+    if delta < 0 {
+        for idx in 1..state.entries.len() {
+            let key = book_reorder_entry_key(&state.entries[idx]);
+            let prev_key = book_reorder_entry_key(&state.entries[idx - 1]);
+            if state.selected_keys.contains(&key) && !state.selected_keys.contains(&prev_key) {
+                state.entries.swap(idx, idx - 1);
+            }
+        }
+    } else if delta > 0 {
+        for idx in (0..state.entries.len().saturating_sub(1)).rev() {
+            let key = book_reorder_entry_key(&state.entries[idx]);
+            let next_key = book_reorder_entry_key(&state.entries[idx + 1]);
+            if state.selected_keys.contains(&key) && !state.selected_keys.contains(&next_key) {
+                state.entries.swap(idx, idx + 1);
+            }
+        }
+    }
+    state.selected = focus_key
+        .as_ref()
+        .and_then(|key| {
+            state
+                .entries
+                .iter()
+                .position(|entry| &book_reorder_entry_key(entry) == key)
+        })
+        .or_else(|| {
+            selected_book_reorder_indices(&state.entries, &state.selected_keys)
+                .first()
+                .copied()
+        });
+    let after = state
+        .entries
+        .iter()
+        .map(book_reorder_entry_key)
+        .collect::<Vec<_>>();
+    before != after
 }
 
 fn book_reorder_drop_target_for_pos(
@@ -1786,22 +1996,31 @@ impl App {
             self.show_feedback_toast("並べ替えできるページがありません".to_string());
             return;
         }
+        let mut selected_keys = HashSet::new();
+        if let Some(first) = entries.first() {
+            selected_keys.insert(book_reorder_entry_key(first));
+        }
         self.book_reorder = Some(crate::app::BookReorderState {
             folder,
             entries,
             selected: Some(0),
+            selected_keys,
+            selection_anchor: Some(0),
             dragging: None,
             thumb_textures: HashMap::new(),
             thumb_failed: HashSet::new(),
             thumb_pending_key: None,
             thumb_rx: None,
             dirty: false,
-            discard_confirm: false,
             drag_insert_index: None,
             thumb_tile_px: BOOK_REORDER_DEFAULT_TILE_PX,
             flush_pending: None,
+            transfer_target_book: String::new(),
+            transfer_pending: None,
             error: None,
         });
+        self.book_list_cache = None;
+        self.request_book_list_refresh();
     }
 
     pub(crate) fn draw_book_manager(&mut self, ctx: &egui::Context) {
@@ -1991,16 +2210,38 @@ impl App {
     }
 
     pub(crate) fn draw_book_reorder(&mut self, ctx: &egui::Context) {
-        let mut completed: Option<Result<crate::books::BookOpResult, String>> = None;
+        enum CompletedBookReorderOp {
+            Flush(Result<crate::books::BookOpResult, String>),
+            Transfer(Result<crate::books::BookOpResult, String>),
+        }
+
+        let mut completed: Option<CompletedBookReorderOp> = None;
         if let Some(state) = self.book_reorder.as_mut() {
             if let Some(pending) = state.flush_pending.as_ref() {
                 match pending.rx.try_recv() {
-                    Ok(result) => completed = Some(result),
+                    Ok(result) => completed = Some(CompletedBookReorderOp::Flush(result)),
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         ctx.request_repaint_after(std::time::Duration::from_millis(100));
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        completed = Some(Err("並べ替え保存が中断されました".to_string()));
+                        completed = Some(CompletedBookReorderOp::Flush(Err(
+                            "並べ替え保存が中断されました".to_string(),
+                        )));
+                    }
+                }
+            }
+            if completed.is_none()
+                && let Some(pending) = state.transfer_pending.as_ref()
+            {
+                match pending.rx.try_recv() {
+                    Ok(result) => completed = Some(CompletedBookReorderOp::Transfer(result)),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        completed = Some(CompletedBookReorderOp::Transfer(Err(
+                            "ページ転送が中断されました".to_string(),
+                        )));
                     }
                 }
             }
@@ -2008,26 +2249,113 @@ impl App {
             return;
         }
         if let Some(result) = completed {
-            if let Some(state) = self.book_reorder.as_mut() {
-                state.flush_pending = None;
-            }
             match result {
-                Ok(crate::books::BookOpResult::Reordered { folder, count }) => {
-                    self.book_reorder = None;
-                    if self
-                        .current_folder
-                        .as_ref()
-                        .is_some_and(|current| crate::folder_tree::path_eq(current, &folder))
-                    {
-                        self.pending_reload = true;
-                    }
-                    self.show_feedback_toast(format!("ページ順を保存しました: {count} ページ"));
-                    return;
-                }
-                Ok(_) => {}
-                Err(err) => {
+                CompletedBookReorderOp::Flush(result) => {
                     if let Some(state) = self.book_reorder.as_mut() {
-                        state.error = Some(err);
+                        state.flush_pending = None;
+                    }
+                    match result {
+                        Ok(crate::books::BookOpResult::Reordered { folder, count }) => {
+                            self.book_reorder = None;
+                            if self.current_folder.as_ref().is_some_and(|current| {
+                                crate::folder_tree::path_eq(current, &folder)
+                            }) {
+                                self.pending_reload = true;
+                            }
+                            self.show_feedback_toast(format!(
+                                "ページ順を保存しました: {count} ページ"
+                            ));
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            if let Some(state) = self.book_reorder.as_ref() {
+                                crate::logger::log(format!(
+                                    "book reorder flush failed for {}: {err}",
+                                    state.folder.display()
+                                ));
+                            }
+                            if let Some(state) = self.book_reorder.as_mut() {
+                                state.error = Some(err.clone());
+                            }
+                            self.show_feedback_toast(format!(
+                                "ページ順の保存に失敗しました: {err}"
+                            ));
+                            ctx.request_repaint();
+                            return;
+                        }
+                    }
+                }
+                CompletedBookReorderOp::Transfer(result) => {
+                    if let Some(state) = self.book_reorder.as_mut() {
+                        state.transfer_pending = None;
+                    }
+                    match result {
+                        Ok(crate::books::BookOpResult::Transfer(summary)) => {
+                            self.book_list_cache = None;
+                            if self.current_folder.as_ref().is_some_and(|current| {
+                                crate::folder_tree::path_eq(current, &summary.source_folder)
+                                    || crate::folder_tree::path_eq(current, &summary.target_folder)
+                            }) {
+                                self.pending_reload = true;
+                            }
+                            let verb = match summary.kind {
+                                crate::books::BookTransferKind::Copy => "コピー",
+                                crate::books::BookTransferKind::Move => "移動",
+                            };
+                            let toast = format!(
+                                "「{}」へ {} ページ{}しました",
+                                summary.target_book_name, summary.pages, verb
+                            );
+                            let mut close_empty_reorder = false;
+                            if let Some(state) = self.book_reorder.as_mut() {
+                                state.entries = summary.source_entries;
+                                state.dirty = false;
+                                state.dragging = None;
+                                state.drag_insert_index = None;
+                                state.thumb_textures.clear();
+                                state.thumb_failed.clear();
+                                state.thumb_pending_key = None;
+                                state.thumb_rx = None;
+                                state.selected_keys.clear();
+                                if state.entries.is_empty() {
+                                    close_empty_reorder = true;
+                                } else {
+                                    let index = state
+                                        .selected
+                                        .unwrap_or(0)
+                                        .min(state.entries.len().saturating_sub(1));
+                                    book_reorder_select_single(state, index);
+                                }
+                            }
+                            if close_empty_reorder {
+                                self.book_reorder = None;
+                            }
+                            self.show_feedback_toast(toast);
+                            ctx.request_repaint();
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            let mut reload_current = false;
+                            if let Some(state) = self.book_reorder.as_ref() {
+                                reload_current =
+                                    self.current_folder.as_ref().is_some_and(|current| {
+                                        crate::folder_tree::path_eq(current, &state.folder)
+                                    });
+                                crate::logger::log(format!(
+                                    "book page transfer failed for {}: {err}",
+                                    state.folder.display()
+                                ));
+                            }
+                            self.book_reorder = None;
+                            if reload_current {
+                                self.pending_reload = true;
+                            }
+                            self.show_feedback_toast(format!("ページ転送に失敗しました: {err}"));
+                            ctx.request_repaint();
+                            return;
+                        }
                     }
                 }
             }
@@ -2070,8 +2398,19 @@ impl App {
             ctx.request_repaint();
         }
 
+        if self.book_list_cache.is_none() && self.book_op_pending.is_none() {
+            self.request_book_list_refresh();
+        }
+        let book_rows = self.book_list_cache.clone().unwrap_or_default();
         let mut close = false;
         let mut save_request: Option<(PathBuf, Vec<PathBuf>)> = None;
+        let mut transfer_request: Option<(
+            PathBuf,
+            Vec<PathBuf>,
+            Vec<PathBuf>,
+            String,
+            crate::books::BookTransferKind,
+        )> = None;
         let mut missing_thumb_request: Option<(String, PathBuf)> = None;
         let mut thumb_by_path: HashMap<String, egui::TextureHandle> = self
             .book_reorder
@@ -2111,40 +2450,45 @@ impl App {
                 let Some(state) = self.book_reorder.as_mut() else {
                     return;
                 };
-                let busy = state.flush_pending.is_some();
+                let busy = state.flush_pending.is_some() || state.transfer_pending.is_some();
+                ensure_book_reorder_selection(state);
                 if let Some(err) = &state.error {
                     ui.colored_label(egui::Color32::from_rgb(210, 80, 80), err);
                 }
                 ui.horizontal(|ui| {
-                    let selected = state
-                        .selected
-                        .unwrap_or(0)
-                        .min(state.entries.len().saturating_sub(1));
-                    if !state.entries.is_empty() && state.selected != Some(selected) {
-                        state.selected = Some(selected);
-                    }
-                    let can_left = !busy && selected > 0 && !state.entries.is_empty();
-                    let can_right = !busy && selected + 1 < state.entries.len();
+                    let selected_indices =
+                        selected_book_reorder_indices(&state.entries, &state.selected_keys);
+                    let selected_count = selected_indices.len();
+                    let selected_index_set =
+                        selected_indices.iter().copied().collect::<HashSet<_>>();
+                    let can_left = !busy
+                        && selected_indices
+                            .iter()
+                            .any(|idx| *idx > 0 && !selected_index_set.contains(&(*idx - 1)));
+                    let can_right = !busy
+                        && selected_indices.iter().any(|idx| {
+                            *idx + 1 < state.entries.len()
+                                && !selected_index_set.contains(&(*idx + 1))
+                        });
                     if ui
                         .add_enabled(can_left, egui::Button::new("←"))
                         .on_hover_text("左へ移動")
                         .clicked()
                     {
-                        state.entries.swap(selected, selected - 1);
-                        state.selected = Some(selected - 1);
-                        state.dirty = true;
-                        state.discard_confirm = false;
+                        if move_selected_book_reorder_by(state, -1) {
+                            state.dirty = true;
+                        }
                     }
                     if ui
                         .add_enabled(can_right, egui::Button::new("→"))
                         .on_hover_text("右へ移動")
                         .clicked()
                     {
-                        state.entries.swap(selected, selected + 1);
-                        state.selected = Some(selected + 1);
-                        state.dirty = true;
-                        state.discard_confirm = false;
+                        if move_selected_book_reorder_by(state, 1) {
+                            state.dirty = true;
+                        }
                     }
+                    ui.label(format!("選択 {selected_count} ページ"));
                     ui.separator();
                     let slider = egui::Slider::new(
                         &mut state.thumb_tile_px,
@@ -2153,46 +2497,112 @@ impl App {
                     .text("サムネ");
                     ui.add_enabled(!busy, slider);
                     ui.separator();
-                    if ui
-                        .add_enabled(!busy && state.dirty, egui::Button::new("保存して閉じる"))
-                        .clicked()
+                    let source_folder = state.folder.clone();
+                    let target_rows = book_rows
+                        .iter()
+                        .filter(|row| !crate::folder_tree::path_eq(&row.path, &source_folder))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !target_rows.is_empty()
+                        && !target_rows
+                            .iter()
+                            .any(|row| row.name == state.transfer_target_book)
                     {
-                        let paths = state.entries.iter().map(|e| e.path.clone()).collect();
-                        save_request = Some((state.folder.clone(), paths));
+                        state.transfer_target_book = target_rows[0].name.clone();
+                    } else if target_rows.is_empty() {
+                        state.transfer_target_book.clear();
                     }
-                    let discard_label = if state.dirty {
-                        "編集を破棄"
+                    ui.label("このページを");
+                    let target_text = if target_rows.is_empty() {
+                        "移動先なし".to_string()
                     } else {
-                        "閉じる"
+                        state.transfer_target_book.clone()
                     };
+                    let combo = egui::ComboBox::from_id_salt("book_reorder_transfer_target")
+                        .width(180.0)
+                        .height(360.0)
+                        .selected_text(target_text)
+                        .show_ui(ui, |ui| {
+                            for row in &target_rows {
+                                ui.selectable_value(
+                                    &mut state.transfer_target_book,
+                                    row.name.clone(),
+                                    format!("{} ({}p)", row.name, row.page_count),
+                                );
+                            }
+                        });
+                    if egui::ComboBox::is_open(ctx, combo.response.id) {
+                        consume_wheel_input(ctx);
+                    }
+                    ui.label("へ");
+                    let target_valid = target_rows
+                        .iter()
+                        .any(|row| row.name == state.transfer_target_book);
+                    let can_transfer = !busy && selected_count > 0 && target_valid;
                     if ui
-                        .add_enabled(!busy, egui::Button::new(discard_label))
+                        .add_enabled(can_transfer, egui::Button::new("コピー"))
                         .clicked()
                     {
+                        let current_order = state
+                            .entries
+                            .iter()
+                            .map(|entry| entry.path.clone())
+                            .collect::<Vec<_>>();
+                        let selected_paths = selected_indices
+                            .iter()
+                            .filter_map(|idx| {
+                                state.entries.get(*idx).map(|entry| entry.path.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        transfer_request = Some((
+                            state.folder.clone(),
+                            current_order,
+                            selected_paths,
+                            state.transfer_target_book.clone(),
+                            crate::books::BookTransferKind::Copy,
+                        ));
+                    }
+                    if ui
+                        .add_enabled(can_transfer, egui::Button::new("移動"))
+                        .clicked()
+                    {
+                        let current_order = state
+                            .entries
+                            .iter()
+                            .map(|entry| entry.path.clone())
+                            .collect::<Vec<_>>();
+                        let selected_paths = selected_indices
+                            .iter()
+                            .filter_map(|idx| {
+                                state.entries.get(*idx).map(|entry| entry.path.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        transfer_request = Some((
+                            state.folder.clone(),
+                            current_order,
+                            selected_paths,
+                            state.transfer_target_book.clone(),
+                            crate::books::BookTransferKind::Move,
+                        ));
+                    }
+                    ui.separator();
+                    if ui.add_enabled(!busy, egui::Button::new("閉じる")).clicked() {
                         if state.dirty {
-                            state.discard_confirm = true;
+                            let paths = state.entries.iter().map(|e| e.path.clone()).collect();
+                            save_request = Some((state.folder.clone(), paths));
                         } else {
                             close = true;
                         }
                     }
                     if busy {
-                        ui.label(egui::RichText::new("保存中…").weak());
+                        let label = if state.transfer_pending.is_some() {
+                            "転送中…"
+                        } else {
+                            "保存中…"
+                        };
+                        ui.label(egui::RichText::new(label).weak());
                     }
                 });
-                if state.discard_confirm {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(210, 120, 40),
-                            "並べ替えの編集内容を破棄しますか？",
-                        );
-                        if ui.add_enabled(!busy, egui::Button::new("破棄")).clicked() {
-                            close = true;
-                        }
-                        if ui.button("キャンセル").clicked() {
-                            state.discard_confirm = false;
-                        }
-                    });
-                }
                 ui.separator();
                 state.thumb_tile_px = state
                     .thumb_tile_px
@@ -2254,8 +2664,10 @@ impl App {
                                             tile,
                                             egui::Sense::click_and_drag(),
                                         );
-                                        let selected = state.selected == Some(i);
-                                        let dragging = state.dragging == Some(i);
+                                        let key =
+                                            crate::search_index_db::normalize_path(&entry.path);
+                                        let selected = state.selected_keys.contains(&key);
+                                        let dragging = state.dragging.is_some() && selected;
                                         let fill = if dragging {
                                             ui.visuals().selection.bg_fill
                                         } else if selected {
@@ -2281,8 +2693,6 @@ impl App {
                                             ),
                                             egui::StrokeKind::Inside,
                                         );
-                                        let key =
-                                            crate::search_index_db::normalize_path(&entry.path);
                                         let texture = thumb_by_path.get(&key);
                                         if texture.is_none()
                                             && !state.thumb_failed.contains(&key)
@@ -2364,10 +2774,26 @@ impl App {
                                             }
                                         });
                                         if !busy && response.clicked() {
-                                            state.selected = Some(i);
+                                            let (ctrl, shift) = ui.input(|input| {
+                                                (
+                                                    input.modifiers.ctrl || input.modifiers.command,
+                                                    input.modifiers.shift,
+                                                )
+                                            });
+                                            if shift {
+                                                book_reorder_select_range(state, i);
+                                            } else if ctrl {
+                                                book_reorder_toggle_selection(state, i);
+                                            } else {
+                                                book_reorder_select_single(state, i);
+                                            }
                                         }
                                         if !busy && response.drag_started() {
-                                            state.selected = Some(i);
+                                            if !state.selected_keys.contains(&key) {
+                                                book_reorder_select_single(state, i);
+                                            } else {
+                                                state.selected = Some(i);
+                                            }
                                             state.dragging = Some(i);
                                             state.drag_insert_index = Some(i);
                                         }
@@ -2405,16 +2831,8 @@ impl App {
                 if let Some((src, insert_index)) = move_request {
                     let len = state.entries.len();
                     if src < len {
-                        let dst = adjusted_book_reorder_insert_index(src, insert_index, len);
-                        if src != dst {
-                            let entry = state.entries.remove(src);
-                            let dst = dst.min(state.entries.len());
-                            state.entries.insert(dst, entry);
-                            state.selected = Some(dst);
+                        if move_selected_book_reorder_group(state, insert_index) {
                             state.dirty = true;
-                            state.discard_confirm = false;
-                        } else {
-                            state.selected = Some(src);
                         }
                     }
                     state.dragging = None;
@@ -2446,6 +2864,21 @@ impl App {
                     Err(err) => {
                         state.error = Some(format!("サムネイル読み込みを開始できません: {err}"));
                     }
+                }
+            }
+        }
+        if let Some((folder, current_order, selected_paths, target_book, kind)) = transfer_request {
+            if let Some(pending) = self.start_book_transfer(
+                ctx,
+                folder,
+                current_order,
+                selected_paths,
+                target_book,
+                kind,
+            ) {
+                if let Some(state) = self.book_reorder.as_mut() {
+                    state.transfer_pending = Some(pending);
+                    state.error = None;
                 }
             }
         }
@@ -6967,6 +7400,67 @@ mod rating_filter_op_tests {
 mod book_reorder_drag_tests {
     use super::*;
 
+    fn reorder_entry(name: &str) -> crate::books::BookPageEntry {
+        crate::books::BookPageEntry {
+            path: PathBuf::from(format!("C:/book/{name}.jpg")),
+            display_name: format!("{name}.jpg"),
+        }
+    }
+
+    fn reorder_state(names: &[&str], selected: &[&str]) -> crate::app::BookReorderState {
+        let entries = names
+            .iter()
+            .map(|name| reorder_entry(name))
+            .collect::<Vec<_>>();
+        let selected_keys = entries
+            .iter()
+            .filter(|entry| {
+                selected.iter().any(|name| {
+                    entry
+                        .path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(|stem| stem == *name)
+                })
+            })
+            .map(book_reorder_entry_key)
+            .collect::<HashSet<_>>();
+        crate::app::BookReorderState {
+            folder: PathBuf::from("C:/book"),
+            entries,
+            selected: Some(0),
+            selected_keys,
+            selection_anchor: Some(0),
+            dragging: None,
+            thumb_textures: HashMap::new(),
+            thumb_failed: HashSet::new(),
+            thumb_pending_key: None,
+            thumb_rx: None,
+            dirty: false,
+            drag_insert_index: None,
+            thumb_tile_px: BOOK_REORDER_DEFAULT_TILE_PX,
+            flush_pending: None,
+            transfer_target_book: String::new(),
+            transfer_pending: None,
+            error: None,
+        }
+    }
+
+    fn reorder_names(state: &crate::app::BookReorderState) -> Vec<String> {
+        state
+            .entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
     #[test]
     fn drop_target_uses_pointer_position_inside_target_rect() {
         let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 140.0));
@@ -7035,6 +7529,33 @@ mod book_reorder_drag_tests {
         assert_eq!(adjusted_book_reorder_insert_index(2, 5, 8), 4);
         assert_eq!(adjusted_book_reorder_insert_index(5, 2, 8), 2);
         assert_eq!(adjusted_book_reorder_insert_index(2, 99, 8), 7);
+    }
+
+    #[test]
+    fn adjusted_group_insert_index_accounts_for_removed_selected_pages() {
+        assert_eq!(adjusted_book_reorder_group_insert_index(&[1, 2], 5, 6), 3);
+        assert_eq!(adjusted_book_reorder_group_insert_index(&[3, 4], 1, 6), 1);
+        assert_eq!(adjusted_book_reorder_group_insert_index(&[1, 3], 4, 6), 2);
+    }
+
+    #[test]
+    fn moving_selected_group_preserves_internal_order() {
+        let mut state = reorder_state(&["a", "b", "c", "d", "e"], &["b", "c"]);
+
+        assert!(move_selected_book_reorder_group(&mut state, 5));
+
+        assert_eq!(reorder_names(&state), ["a", "d", "e", "b", "c"]);
+    }
+
+    #[test]
+    fn arrow_move_treats_adjacent_selection_as_one_block() {
+        let mut state = reorder_state(&["a", "b", "c", "d"], &["b", "c"]);
+
+        assert!(move_selected_book_reorder_by(&mut state, -1));
+        assert_eq!(reorder_names(&state), ["b", "c", "a", "d"]);
+
+        assert!(move_selected_book_reorder_by(&mut state, 1));
+        assert_eq!(reorder_names(&state), ["a", "b", "c", "d"]);
     }
 }
 
