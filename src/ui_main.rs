@@ -1115,9 +1115,8 @@ fn move_selected_book_reorder_by(state: &mut crate::app::BookReorderState, delta
 
 fn book_reorder_grid_columns(available_width: f32, tile_width: f32, gap: f32) -> usize {
     let content_width = (available_width - BOOK_REORDER_SCROLLBAR_RESERVE_PX).max(tile_width);
-    ((content_width + gap) / (tile_width + gap))
-        .floor()
-        .clamp(4.0, 10.0) as usize
+    let natural_columns = ((content_width + gap) / (tile_width + gap)).floor();
+    natural_columns.max(4.0) as usize
 }
 
 fn book_reorder_drop_target_for_pos(
@@ -7652,6 +7651,8 @@ mod book_reorder_drag_tests {
         assert_eq!(book_reorder_grid_columns(900.0, 78.0, 8.0), 10);
         assert_eq!(book_reorder_grid_columns(870.0, 78.0, 8.0), 9);
         assert_eq!(book_reorder_grid_columns(220.0, 78.0, 8.0), 4);
+        assert_eq!(book_reorder_grid_columns(900.0, 64.0, 8.0), 12);
+        assert_eq!(book_reorder_grid_columns(1540.0, 64.0, 8.0), 21);
     }
 
     #[test]
