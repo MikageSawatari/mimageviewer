@@ -5753,6 +5753,86 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(names, vec!["2_page.jpg", "10_page.jpg"]);
     }
 
+    fn wait_for_book_op(app: &mut App, ctx: &egui::Context) {
+        for _ in 0..100 {
+            app.poll_book_op_pending(ctx);
+            if app.book_op_pending.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("book operation did not finish");
+    }
+
+    #[test]
+    fn grid_book_add_without_burn_keeps_byte_copy() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        let src = app.tmp.path().join("source.jpg");
+        let root = app.tmp.path().join("books");
+        std::fs::write(&src, b"not decoded, copied as-is").expect("write source bytes");
+        app.settings.book_root = Some(root.clone());
+        app.settings.active_book_name = "target".to_string();
+        app.items = vec![GridItem::Image(src)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.selected = Some(0);
+        app.rebuild_visible_indices();
+
+        let ctx = egui::Context::default();
+        app.add_grid_selection_to_active_book(&ctx);
+        wait_for_book_op(&mut app, &ctx);
+
+        let mut outputs = std::fs::read_dir(root.join("target"))
+            .expect("read target book")
+            .map(|entry| entry.expect("book page entry").path())
+            .collect::<Vec<_>>();
+        outputs.sort();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            std::fs::read(&outputs[0]).expect("read copied page"),
+            b"not decoded, copied as-is"
+        );
+    }
+
+    #[test]
+    fn grid_book_add_burns_rotation_before_copying_to_book() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use image::GenericImageView;
+
+        let mut app = setup_app();
+        let src = app.tmp.path().join("source.png");
+        let root = app.tmp.path().join("books");
+        let mut image = image::RgbaImage::new(2, 1);
+        image.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        image.put_pixel(1, 0, image::Rgba([0, 0, 255, 255]));
+        image.save(&src).expect("write source image");
+        app.settings.book_root = Some(root.clone());
+        app.settings.active_book_name = "target".to_string();
+        app.items = vec![GridItem::Image(src)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.selected = Some(0);
+        app.rebuild_visible_indices();
+        app.rotate_image_cw(0);
+
+        let ctx = egui::Context::default();
+        app.add_grid_selection_to_active_book(&ctx);
+        wait_for_book_op(&mut app, &ctx);
+
+        let mut outputs = std::fs::read_dir(root.join("target"))
+            .expect("read target book")
+            .map(|entry| entry.expect("book page entry").path())
+            .collect::<Vec<_>>();
+        outputs.sort();
+        assert_eq!(outputs.len(), 1);
+        let output = image::open(&outputs[0]).expect("decode rotated page");
+        assert_eq!(
+            output.dimensions(),
+            (1, 2),
+            "グリッド Ctrl+B でも非破壊回転を焼き込む"
+        );
+    }
+
     /// テスト用のネスト ZIP ナビ状態を作る (`C:\test\outer.zip` 固定)。
     fn test_zip_nav(names: &[&str]) -> crate::zip_tree::ZipNavState {
         test_zip_nav_for(std::path::PathBuf::from(r"C:\test\outer.zip"), names)

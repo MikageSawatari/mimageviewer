@@ -13614,7 +13614,8 @@ impl App {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "page".to_string());
                 let params = self.effective_params(idx).clone();
-                if params.is_color_identity() {
+                let rotation = self.get_rotation(idx);
+                if params.is_color_identity() && rotation.is_none() {
                     Ok(crate::books::BookPageSource::File {
                         src: path,
                         original_name,
@@ -13624,6 +13625,7 @@ impl App {
                         src: path,
                         original_name,
                         params,
+                        rotation,
                         format: self.settings.capture_format,
                         jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
                             self.fs_transparent_bg_mode,
@@ -13637,7 +13639,8 @@ impl App {
             } if mode == BookAddMode::Grid => {
                 let original_name = crate::zip_loader::entry_basename(&entry_name).to_string();
                 let params = self.effective_params(idx).clone();
-                if params.is_color_identity() {
+                let rotation = self.get_rotation(idx);
+                if params.is_color_identity() && rotation.is_none() {
                     Ok(crate::books::BookPageSource::ZipEntry {
                         zip_path,
                         entry_name,
@@ -13649,6 +13652,7 @@ impl App {
                         entry_name,
                         original_name,
                         params,
+                        rotation,
                         format: self.settings.capture_format,
                         jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
                             self.fs_transparent_bg_mode,
@@ -13660,12 +13664,14 @@ impl App {
                 pdf_path, page_num, ..
             } if mode == BookAddMode::Grid => {
                 let params = self.effective_params(idx).clone();
+                let rotation = self.get_rotation(idx);
                 Ok(crate::books::BookPageSource::AdjustedPdfPage {
                     pdf_path,
                     page_num,
                     password: self.pdf_current_password.clone(),
                     basename: format!("page_{:04}", page_num + 1),
                     params,
+                    rotation,
                     format: self.settings.capture_format,
                     jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
                         self.fs_transparent_bg_mode,

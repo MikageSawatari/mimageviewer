@@ -51,6 +51,7 @@ pub enum BookPageSource {
         src: PathBuf,
         original_name: String,
         params: crate::adjustment::AdjustParams,
+        rotation: crate::rotation_db::Rotation,
         format: crate::capture::CaptureFormat,
         jpeg_matte: crate::capture::JpegMatte,
     },
@@ -64,6 +65,7 @@ pub enum BookPageSource {
         entry_name: String,
         original_name: String,
         params: crate::adjustment::AdjustParams,
+        rotation: crate::rotation_db::Rotation,
         format: crate::capture::CaptureFormat,
         jpeg_matte: crate::capture::JpegMatte,
     },
@@ -73,6 +75,7 @@ pub enum BookPageSource {
         password: Option<String>,
         basename: String,
         params: crate::adjustment::AdjustParams,
+        rotation: crate::rotation_db::Rotation,
         format: crate::capture::CaptureFormat,
         jpeg_matte: crate::capture::JpegMatte,
     },
@@ -320,12 +323,13 @@ fn write_source(source: BookPageSource, dest: &Path) -> Result<(), String> {
         BookPageSource::AdjustedFile {
             src,
             params,
+            rotation,
             format,
             jpeg_matte,
             ..
         } => {
             let image = decode_file_color_image(&src)?;
-            write_adjusted_color_image(dest, image, &params, format, jpeg_matte)
+            write_adjusted_color_image(dest, image, &params, rotation, format, jpeg_matte)
         }
         BookPageSource::ZipEntry {
             zip_path,
@@ -340,6 +344,7 @@ fn write_source(source: BookPageSource, dest: &Path) -> Result<(), String> {
             zip_path,
             entry_name,
             params,
+            rotation,
             format,
             jpeg_matte,
             ..
@@ -347,13 +352,14 @@ fn write_source(source: BookPageSource, dest: &Path) -> Result<(), String> {
             let bytes = crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
                 .map_err(|e| format!("ZIP 内画像を読み取れません: {}: {e}", entry_name))?;
             let image = decode_bytes_color_image(&entry_name, &bytes)?;
-            write_adjusted_color_image(dest, image, &params, format, jpeg_matte)
+            write_adjusted_color_image(dest, image, &params, rotation, format, jpeg_matte)
         }
         BookPageSource::AdjustedPdfPage {
             pdf_path,
             page_num,
             password,
             params,
+            rotation,
             format,
             jpeg_matte,
             ..
@@ -370,7 +376,7 @@ fn write_source(source: BookPageSource, dest: &Path) -> Result<(), String> {
             )
             .map_err(|e| format!("PDF ページを描画できません: {}: {e}", pdf_path.display()))?;
             let image = dynamic_image_to_color_image(&result.image);
-            write_adjusted_color_image(dest, image, &params, format, jpeg_matte)
+            write_adjusted_color_image(dest, image, &params, rotation, format, jpeg_matte)
         }
         BookPageSource::Rendered {
             work,
@@ -444,10 +450,14 @@ fn write_adjusted_color_image(
     dest: &Path,
     image: egui::ColorImage,
     params: &crate::adjustment::AdjustParams,
+    rotation: crate::rotation_db::Rotation,
     format: crate::capture::CaptureFormat,
     jpeg_matte: crate::capture::JpegMatte,
 ) -> Result<(), String> {
-    let adjusted = crate::adjustment::apply_adjustments_fast(&image, params);
+    let mut adjusted = crate::adjustment::apply_adjustments_fast(&image, params);
+    if !rotation.is_none() {
+        adjusted = crate::capture::rotate_color_image(&adjusted, rotation);
+    }
     let rgba = crate::capture::color_image_to_rgba(&adjusted);
     crate::capture::save_rgba_exact_with_matte(
         dest,
