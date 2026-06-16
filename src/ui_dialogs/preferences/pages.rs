@@ -659,9 +659,15 @@ pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
             .size(11.0)
             .color(egui::Color32::from_gray(140)),
     );
+}
 
-    ui.separator();
-    ui.label("製本");
+pub(super) fn page_book(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let s = &mut state.settings;
+
+    ui.label("製本した本（本棚）の保存先フォルダを設定します。");
+    ui.add_space(8.0);
+
+    ui.label("本棚の保存先");
     ui.horizontal_wrapped(|ui| {
         let edit_width = (ui.available_width() - 190.0).clamp(180.0, 360.0);
         let mut output = egui::TextEdit::singleline(&mut state.book_root_input)

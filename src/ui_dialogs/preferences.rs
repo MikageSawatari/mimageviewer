@@ -49,6 +49,8 @@ pub(crate) enum PreferencesPage {
     AiBackend,
     Cache,
     Folder,
+    /// v1.7.0: 製本（本棚の保存先ルート）
+    Book,
     DuplicateFiles,
     ExifDisplay,
     SpreadMode,
@@ -89,6 +91,7 @@ impl PreferencesPage {
             Self::AiBackend => "AI バックエンド",
             Self::Cache => "キャッシュ",
             Self::Folder => "フォルダ",
+            Self::Book => "製本",
             Self::DuplicateFiles => "同名ファイル",
             Self::ExifDisplay => "EXIF表示",
             Self::SpreadMode => "表示モード",
@@ -160,6 +163,11 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "フォルダ",
         page: Some(PreferencesPage::Folder),
+        children: &[],
+    },
+    TreeCategory {
+        label: "製本",
+        page: Some(PreferencesPage::Book),
         children: &[],
     },
     TreeCategory {
@@ -1186,6 +1194,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::AiBackend => page_ai_backend(ui, state),
         PreferencesPage::Cache => page_cache(ui, state),
         PreferencesPage::Folder => page_folder(ui, state),
+        PreferencesPage::Book => page_book(ui, state),
         PreferencesPage::DuplicateFiles => page_duplicate_files(ui, state),
         PreferencesPage::ExifDisplay => page_exif_display(ui, state, enter_pressed),
         PreferencesPage::SpreadMode => page_spread_mode(ui, state),
