@@ -44,13 +44,61 @@ enum BookAddMode {
 const BOOK_GRID_VIDEO_HINT: &str =
     "動画は動画再生中に Ctrl+B を操作すると、そのフレームを本へ追加できます";
 const BOOK_IMAGE_PROCESSING_HINT: &str = "画像処理中です。処理完了後にもう1度操作してください。";
+const BOOK_ADD_UNSUPPORTED_ITEM_HINT: &str =
+    "画像・ページのみ追加できます。ZIP/PDF は開いて中のページを選択してください";
+const BOOK_ADD_MIXED_UNSUPPORTED_HINT: &str = "画像・ページ以外が選ばれているため追加できません";
+const BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT: &str =
+    "追加先に設定されている本のページは、同じ本に追加できません";
 
 fn friendly_book_add_error(err: String) -> String {
-    if err.contains("最終合成の完了後") {
+    if err.contains("最終合成の完了後")
+        || err.contains("エクスポートしてください")
+        || err.contains("Ctrl+E")
+    {
         BOOK_IMAGE_PROCESSING_HINT.to_string()
+    } else if is_unsupported_book_add_error(&err) {
+        BOOK_ADD_UNSUPPORTED_ITEM_HINT.to_string()
     } else {
         err
     }
+}
+
+fn is_unsupported_book_add_error(err: &str) -> bool {
+    err.contains("このアイテム")
+}
+
+fn grid_book_add_rejection_message(errors: &[String], accepted_count: usize) -> String {
+    if accepted_count > 0 {
+        if errors
+            .iter()
+            .all(|err| err == BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT)
+        {
+            return BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT.to_string();
+        }
+        return BOOK_ADD_MIXED_UNSUPPORTED_HINT.to_string();
+    }
+
+    let Some(first) = errors.first() else {
+        return "選択中に追加できるページがありません".to_string();
+    };
+
+    if errors.len() == 1 {
+        return friendly_book_add_error(first.clone());
+    }
+    if errors
+        .iter()
+        .all(|err| err == BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT)
+    {
+        return BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT.to_string();
+    }
+    if errors.iter().all(|err| err == BOOK_GRID_VIDEO_HINT) {
+        return BOOK_GRID_VIDEO_HINT.to_string();
+    }
+    if errors.iter().any(|err| is_unsupported_book_add_error(err)) {
+        return BOOK_ADD_MIXED_UNSUPPORTED_HINT.to_string();
+    }
+
+    friendly_book_add_error(first.clone())
 }
 
 pub(crate) mod draw_icons;
@@ -13498,40 +13546,28 @@ impl App {
         indices.sort_unstable();
         indices.dedup();
         if indices.is_empty() {
-            self.show_feedback_toast("追加するページを選択してください".to_string());
+            self.show_feedback_toast("追加する画像・ページを選択してください".to_string());
             return;
         }
 
         let mut sources = Vec::new();
-        let mut skipped = 0usize;
-        let mut first_error: Option<String> = None;
+        let mut errors = Vec::new();
         for idx in indices {
             match self.book_page_source_for_idx(ctx, idx, BookAddMode::Grid) {
                 Ok(source) => sources.push(source),
                 Err(err) => {
-                    skipped += 1;
-                    if first_error.is_none() {
-                        first_error = Some(err.clone());
-                    }
+                    errors.push(err.clone());
                     crate::logger::log(format!("book add skip idx={idx}: {err}"));
                 }
             }
         }
-        if sources.is_empty() {
-            self.show_feedback_toast(
-                first_error.unwrap_or_else(|| "選択中に追加できるページがありません".to_string()),
-            );
+        if !errors.is_empty() {
+            self.show_feedback_toast(grid_book_add_rejection_message(&errors, sources.len()));
             return;
         }
         let count = sources.len();
         self.start_book_append(ctx, sources);
-        if skipped > 0 {
-            self.show_feedback_toast(format!(
-                "追加先の本へ追加中: {count} ページ (除外 {skipped})"
-            ));
-        } else {
-            self.show_feedback_toast(format!("追加先の本へ追加中: {count} ページ"));
-        }
+        self.show_feedback_toast(format!("追加先の本へ追加中: {count} ページ"));
     }
 
     pub(crate) fn add_fullscreen_image_to_active_book(
@@ -13585,7 +13621,7 @@ impl App {
             jpeg_matte,
         };
         self.start_book_append(ctx, vec![source]);
-        self.show_feedback_toast("動画フレームを本へ追加中".to_string());
+        self.show_feedback_toast("動画フレームを追加先の本へ追加中".to_string());
     }
 
     fn book_page_source_for_idx(
@@ -13594,14 +13630,27 @@ impl App {
         idx: usize,
         mode: BookAddMode,
     ) -> Result<crate::books::BookPageSource, String> {
-        if self.idx_is_compiled_book_page(idx) {
-            return Err("本の中のページは追加できません".to_string());
-        }
         let item = self
             .items
             .get(idx)
             .cloned()
             .ok_or_else(|| "このアイテムは追加できません".to_string())?;
+        if let GridItem::Image(path) = &item
+            && let Some(book_folder) = self.compiled_book_page_folder(path)
+        {
+            if crate::folder_tree::path_eq(&book_folder, &self.active_book_folder_path()) {
+                return Err(BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT.to_string());
+            }
+            let original_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "page".to_string());
+            return Ok(crate::books::BookPageSource::File {
+                src: path.clone(),
+                original_name,
+            });
+        }
         let needs_render = match mode {
             BookAddMode::Grid => false,
             BookAddMode::Fullscreen => self.book_page_needs_render_fullscreen(idx, &item),
@@ -13737,13 +13786,17 @@ impl App {
     }
 
     pub(crate) fn idx_is_compiled_book_page(&self, idx: usize) -> bool {
-        let root = self.book_root_path();
         match self.items.get(idx) {
-            Some(GridItem::Image(path)) => path
-                .parent()
-                .is_some_and(|parent| crate::books::is_direct_book_folder(&root, parent)),
+            Some(GridItem::Image(path)) => self.compiled_book_page_folder(path).is_some(),
             _ => false,
         }
+    }
+
+    fn compiled_book_page_folder(&self, path: &std::path::Path) -> Option<std::path::PathBuf> {
+        let root = self.book_root_path();
+        path.parent()
+            .filter(|parent| crate::books::is_direct_book_folder(&root, parent))
+            .map(std::path::Path::to_path_buf)
     }
 
     pub(crate) fn reject_compiled_book_page_edit(&mut self, idx: usize) -> bool {
@@ -15290,6 +15343,32 @@ mod tests {
             true,
             Some((ZOOM_NEAR_ONE + 0.01, egui::Vec2::ZERO))
         ));
+    }
+
+    #[test]
+    fn book_add_messages_reject_partial_grid_adds() {
+        assert_eq!(
+            grid_book_add_rejection_message(&[BOOK_ADD_UNSUPPORTED_ITEM_HINT.to_string()], 1),
+            BOOK_ADD_MIXED_UNSUPPORTED_HINT
+        );
+        assert_eq!(
+            grid_book_add_rejection_message(&[BOOK_GRID_VIDEO_HINT.to_string()], 0),
+            BOOK_GRID_VIDEO_HINT
+        );
+        assert_eq!(
+            grid_book_add_rejection_message(&[BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT.to_string()], 1),
+            BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT
+        );
+        assert_eq!(
+            grid_book_add_rejection_message(&[BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT.to_string()], 0),
+            BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT
+        );
+        assert_eq!(
+            friendly_book_add_error(
+                "補正レイヤーの反映中です。少し待ってから Ctrl+E を再実行してください".to_string()
+            ),
+            BOOK_IMAGE_PROCESSING_HINT
+        );
     }
 
     #[test]

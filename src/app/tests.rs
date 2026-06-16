@@ -5833,6 +5833,98 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    #[test]
+    fn grid_book_add_rejects_mixed_invalid_items_without_partial_copy() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        let src = app.tmp.path().join("source.jpg");
+        let folder = app.tmp.path().join("folder");
+        let root = app.tmp.path().join("books");
+        std::fs::write(&src, b"image bytes").expect("write source bytes");
+        std::fs::create_dir(&folder).expect("create folder item");
+        app.settings.book_root = Some(root.clone());
+        app.settings.active_book_name = "target".to_string();
+        app.items = vec![GridItem::Image(src), GridItem::Folder(folder)];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.checked.insert(0);
+        app.checked.insert(1);
+        app.rebuild_visible_indices();
+
+        let ctx = egui::Context::default();
+        app.add_grid_selection_to_active_book(&ctx);
+
+        assert!(
+            app.book_op_pending.is_none(),
+            "追加不可項目が混在したら worker を開始しない"
+        );
+        assert!(!root.join("target").exists(), "一部だけ追加してしまわない");
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some("画像・ページ以外が選ばれているため追加できません")
+        );
+    }
+
+    #[test]
+    fn grid_book_add_rejects_page_from_same_active_book() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        let root = app.tmp.path().join("books");
+        let book = root.join("source");
+        let page = book.join("0001_page.jpg");
+        std::fs::create_dir_all(&book).expect("create source book");
+        std::fs::write(&page, b"book page").expect("write book page");
+        app.settings.book_root = Some(root);
+        app.settings.active_book_name = "source".to_string();
+        app.items = vec![GridItem::Image(page)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.selected = Some(0);
+        app.rebuild_visible_indices();
+
+        let ctx = egui::Context::default();
+        app.add_grid_selection_to_active_book(&ctx);
+
+        assert!(app.book_op_pending.is_none());
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some("追加先に設定されている本のページは、同じ本に追加できません")
+        );
+    }
+
+    #[test]
+    fn grid_book_add_copies_page_from_other_book_to_active_book() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let mut app = setup_app();
+        let root = app.tmp.path().join("books");
+        let source_book = root.join("source");
+        let page = source_book.join("0001_page.jpg");
+        std::fs::create_dir_all(&source_book).expect("create source book");
+        std::fs::write(&page, b"compiled book page bytes").expect("write book page");
+        app.settings.book_root = Some(root.clone());
+        app.settings.active_book_name = "target".to_string();
+        app.items = vec![GridItem::Image(page)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.selected = Some(0);
+        app.rebuild_visible_indices();
+
+        let ctx = egui::Context::default();
+        app.add_grid_selection_to_active_book(&ctx);
+        wait_for_book_op(&mut app, &ctx);
+
+        let mut outputs = std::fs::read_dir(root.join("target"))
+            .expect("read target book")
+            .map(|entry| entry.expect("book page entry").path())
+            .collect::<Vec<_>>();
+        outputs.sort();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            std::fs::read(&outputs[0]).expect("read copied page"),
+            b"compiled book page bytes"
+        );
+    }
+
     /// テスト用のネスト ZIP ナビ状態を作る (`C:\test\outer.zip` 固定)。
     fn test_zip_nav(names: &[&str]) -> crate::zip_tree::ZipNavState {
         test_zip_nav_for(std::path::PathBuf::from(r"C:\test\outer.zip"), names)
