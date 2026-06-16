@@ -1443,6 +1443,10 @@ fn normalize_model_name(raw: &str) -> Option<String> {
         return None;
     }
 
+    let raw = strip_model_param_suffix(raw).trim();
+    if !looks_like_model_name(raw) {
+        return None;
+    }
     let without_hash_suffix = raw
         .strip_suffix(')')
         .and_then(|s| s.rsplit_once(" (").map(|(name, _)| name))
@@ -1462,7 +1466,80 @@ fn normalize_model_name(raw: &str) -> Option<String> {
         })
         .unwrap_or(basename)
         .trim();
-    (!stem.is_empty()).then(|| stem.to_string())
+    looks_like_model_name(stem).then(|| stem.to_string())
+}
+
+fn strip_model_param_suffix(raw: &str) -> &str {
+    let mut end = raw.len();
+    for marker in [
+        ", Hashes:",
+        ", Variation seed:",
+        ", Variation seed strength:",
+        ", Batch size:",
+        ", Batch pos:",
+        "\r\nTemplate:",
+        "\nTemplate:",
+        "\r\nNegative Template:",
+        "\nNegative Template:",
+        " Template:",
+        " Negative Template:",
+        "\r\n",
+        "\n",
+    ] {
+        if let Some(pos) = raw.find(marker) {
+            end = end.min(pos);
+        }
+    }
+    &raw[..end]
+}
+
+fn looks_like_model_name(candidate: &str) -> bool {
+    let candidate = candidate.trim();
+    if candidate.is_empty() || candidate.chars().count() > 160 {
+        return false;
+    }
+    let lower = candidate.to_ascii_lowercase();
+    if [
+        "prompt:",
+        "negative prompt:",
+        "template:",
+        "negative template:",
+        "variation seed:",
+        "batch size:",
+        "batch pos:",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+    {
+        return false;
+    }
+    if [
+        "<lora:",
+        "<lyco:",
+        "<hypernet:",
+        " template:",
+        " negative template:",
+        " prompt:",
+        " negative prompt:",
+        "variation seed:",
+        "batch size:",
+        "batch pos:",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return false;
+    }
+    if candidate
+        .chars()
+        .any(|ch| matches!(ch, '\r' | '\n' | '{' | '}'))
+    {
+        return false;
+    }
+    !candidate
+        .chars()
+        .next()
+        .is_some_and(|ch| matches!(ch, ',' | ')' | '(' | '[' | ']' | '<' | '{' | '}'))
 }
 
 fn dedup_preserve_order(values: Vec<String>) -> Vec<String> {
@@ -1677,6 +1754,7 @@ fn parse_params_line(line: &str) -> Vec<(String, String)> {
         "Size",
         "Model hash",
         "Model",
+        "Hashes",
         "VAE hash",
         "VAE",
         "Denoising strength",
@@ -1689,6 +1767,16 @@ fn parse_params_line(line: &str) -> Vec<(String, String)> {
         "TI hashes",
         "Version",
         "RNG",
+        "Variation seed",
+        "Variation seed strength",
+        "Seed resize from",
+        "Seed resize to",
+        "Eta",
+        "Eta noise seed delta",
+        "Batch size",
+        "Batch pos",
+        "Template",
+        "Negative Template",
         "ADetailer model",
         "ADetailer confidence",
         "ADetailer dilate erode",
@@ -1716,21 +1804,14 @@ fn parse_params_line(line: &str) -> Vec<(String, String)> {
             let rest = &remaining[value_start..];
 
             // 次のキーの位置を探す
-            let mut next_key_pos = rest.len();
-            for &nk in &known_keys {
-                let pat = format!(", {nk}: ");
-                if let Some(pos) = rest.find(&pat) {
-                    if pos < next_key_pos {
-                        next_key_pos = pos;
-                    }
-                }
-            }
+            let (next_key_pos, next_remaining_pos) =
+                next_params_key_boundary(rest, &known_keys).unwrap_or((rest.len(), rest.len()));
 
             let value = rest[..next_key_pos].trim().to_string();
             params.push((key.to_string(), value));
 
             if next_key_pos < rest.len() {
-                remaining = &rest[next_key_pos + 2..]; // skip ", "
+                remaining = &rest[next_remaining_pos..];
             } else {
                 break;
             }
@@ -1745,6 +1826,22 @@ fn parse_params_line(line: &str) -> Vec<(String, String)> {
     }
 
     params
+}
+
+fn next_params_key_boundary(rest: &str, known_keys: &[&str]) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for &key in known_keys {
+        for (sep, sep_len) in [(", ", 2usize), ("\n", 1usize), ("\r\n", 2usize)] {
+            let pat = format!("{sep}{key}: ");
+            if let Some(pos) = rest.find(&pat) {
+                let candidate = (pos, pos + sep_len);
+                if best.is_none_or(|(best_pos, _)| pos < best_pos) {
+                    best = Some(candidate);
+                }
+            }
+        }
+    }
+    best
 }
 
 // ---------------------------------------------------------------------------
@@ -2060,6 +2157,46 @@ mod tests {
         assert_eq!(model_name(&meta).as_deref(), Some("dream-shaper"));
         assert_eq!(model_names(&meta), vec!["dream-shaper"]);
         assert_eq!(ai_tool_name(&meta), Some("A1111/Forge"));
+    }
+
+    #[test]
+    fn model_name_stops_at_a1111_suffix_params() {
+        let raw = "simple prompt\n\
+                    Steps: 20, Seed: 1, Model: Anything-V3.0, Batch size: 8, Batch pos: 0";
+        let meta = AiMetadata::A1111(parse_a1111(raw).unwrap());
+        assert_eq!(model_names(&meta), vec!["Anything-V3.0"]);
+
+        let raw = "simple prompt\n\
+                    Steps: 20, Seed: 1, Model: MistBlossom_v1, Hashes: {\"model\": \"\"}, Version: ComfyUI";
+        let meta = AiMetadata::A1111(parse_a1111(raw).unwrap());
+        assert_eq!(model_names(&meta), vec!["MistBlossom_v1"]);
+
+        let raw = "simple prompt\n\
+                    Steps: 20, Seed: 1, Model: sampleModel_v31\n\
+                    Template: (best quality:1.2), character tags\n\
+                    Negative Template: low quality";
+        let meta = AiMetadata::A1111(parse_a1111(raw).unwrap());
+        assert_eq!(model_names(&meta), vec!["sampleModel_v31"]);
+    }
+
+    #[test]
+    fn model_name_rejects_prompt_like_fragments() {
+        let meta = AiMetadata::A1111(A1111Metadata {
+            tool: AiToolKind::A1111,
+            prompt: "p".to_string(),
+            negative_prompt: String::new(),
+            params: vec![
+                (
+                    "Model".to_string(),
+                    "!fav_loli_A, Variation seed: 123, Variation seed strength: 0.03".to_string(),
+                ),
+                ("Model".to_string(), "<lora:sample:1>".to_string()),
+                ("Model".to_string(), "Template: prompt words".to_string()),
+                ("Model".to_string(), "), prompt fragment".to_string()),
+            ],
+            raw: String::new(),
+        });
+        assert_eq!(model_names(&meta), vec!["!fav_loli_A"]);
     }
 
     #[test]

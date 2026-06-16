@@ -250,6 +250,20 @@ fn prepare_facet_menu_popup(ui: &mut egui::Ui) {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
 }
 
+fn prepare_ai_facet_menu_popup(ui: &mut egui::Ui) {
+    ui.set_min_width(260.0);
+    ui.set_max_width(520.0);
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+}
+
+fn show_ai_facet_choices<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::ScrollArea::vertical()
+        .max_height(320.0)
+        .auto_shrink([false, true])
+        .show(ui, add_contents)
+        .inner
+}
+
 fn draw_tag_view_menu_section(
     ui: &mut egui::Ui,
     title: &str,
@@ -3091,7 +3105,7 @@ impl App {
         let mut changed = false;
         let label = facet_menu_label("AIモデル", self.settings.facet_filter.ai_models.len());
         ui.menu_button(label, |ui| {
-            prepare_facet_menu_popup(ui);
+            prepare_ai_facet_menu_popup(ui);
             self.request_ai_model_facet_load();
             ui.ctx().request_repaint();
             if !self.details_lazy_sort_ready() {
@@ -3112,18 +3126,21 @@ impl App {
             ui.separator();
             if counts.is_empty() {
                 ui.label("候補なし");
-            }
-            for (model, count) in counts {
-                let mut selected = self.settings.facet_filter.ai_models.contains(&model);
-                let text = format!("{model} ({count})");
-                if ui.checkbox(&mut selected, text).changed() {
-                    if selected {
-                        self.settings.facet_filter.ai_models.insert(model);
-                    } else {
-                        self.settings.facet_filter.ai_models.remove(&model);
+            } else {
+                show_ai_facet_choices(ui, |ui| {
+                    for (model, count) in counts {
+                        let mut selected = self.settings.facet_filter.ai_models.contains(&model);
+                        let text = format!("{model} ({count})");
+                        if ui.checkbox(&mut selected, text).changed() {
+                            if selected {
+                                self.settings.facet_filter.ai_models.insert(model);
+                            } else {
+                                self.settings.facet_filter.ai_models.remove(&model);
+                            }
+                            changed = true;
+                        }
                     }
-                    changed = true;
-                }
+                });
             }
         });
         changed
@@ -3133,7 +3150,7 @@ impl App {
         let mut changed = false;
         let label = facet_menu_label("生成ツール", self.settings.facet_filter.ai_tools.len());
         ui.menu_button(label, |ui| {
-            prepare_facet_menu_popup(ui);
+            prepare_ai_facet_menu_popup(ui);
             self.request_ai_model_facet_load();
             ui.ctx().request_repaint();
             if !self.details_lazy_sort_ready() {
@@ -3154,18 +3171,21 @@ impl App {
             ui.separator();
             if counts.is_empty() {
                 ui.label("候補なし");
-            }
-            for (tool, count) in counts {
-                let mut selected = self.settings.facet_filter.ai_tools.contains(&tool);
-                let text = format!("{tool} ({count})");
-                if ui.checkbox(&mut selected, text).changed() {
-                    if selected {
-                        self.settings.facet_filter.ai_tools.insert(tool);
-                    } else {
-                        self.settings.facet_filter.ai_tools.remove(&tool);
+            } else {
+                show_ai_facet_choices(ui, |ui| {
+                    for (tool, count) in counts {
+                        let mut selected = self.settings.facet_filter.ai_tools.contains(&tool);
+                        let text = format!("{tool} ({count})");
+                        if ui.checkbox(&mut selected, text).changed() {
+                            if selected {
+                                self.settings.facet_filter.ai_tools.insert(tool);
+                            } else {
+                                self.settings.facet_filter.ai_tools.remove(&tool);
+                            }
+                            changed = true;
+                        }
                     }
-                    changed = true;
-                }
+                });
             }
         });
         changed
