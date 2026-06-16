@@ -17910,6 +17910,10 @@ impl App {
 
     /// マウスホイールイベントを消費し、行単位でスナップしたオフセットに変換する。
     /// Ctrl+ホイールの場合はグリッド列数を変更する。
+    ///
+    /// 呼び出し位置に注意: メニュー/ツールバー/アドレスバー/ファセットバー等を描いた後、
+    /// グリッド描画の直前で呼ぶ。これより早いと popup 内 ScrollArea の wheel が背面の
+    /// サムネイル一覧にも通り抜ける。
     fn process_scroll(&mut self, ctx: &egui::Context) {
         // ダイアログ / popup / フルスクリーン表示中はスクロールを消費しない
         // (ダイアログや ComboBox popup 内の ScrollArea が正しく動くようにする)。
@@ -33919,9 +33923,7 @@ impl eframe::App for App {
 
         Self::resync_egui_modifiers_from_os(ctx);
 
-        // スクロールは egui に触れる前に処理（イベントを消費）
-        self.process_scroll(ctx);
-        let t_title_scroll = frame_t0.elapsed();
+        let t_title_mods = frame_t0.elapsed();
 
         // フルスクリーンのキーが main/root 側に届いた場合は、main focus guard より先に
         // 処理する。F11 の window/fullscreen 切替など、main が focused になること自体が
@@ -34560,8 +34562,13 @@ impl eframe::App for App {
         // ── スマートフィルタバー (サムネ/詳細共通) ───────────────────
         self.render_facet_filter_bar(ctx);
         self.render_details_lazy_status_bar(ctx);
-        self.suppress_popup_wheel_before_grid(ctx);
         let folder_pane_nav = self.render_folder_pane(ctx);
+
+        // グローバルな一覧ホイール処理は、メニュー/ツールバー/アドレス/ファセット等の
+        // popup を描いた後、グリッド描画の直前で行う。早すぎると popup 内 ScrollArea の
+        // wheel が背面のサムネイル一覧にも通り抜ける。
+        self.suppress_popup_wheel_before_grid(ctx);
+        self.process_scroll(ctx);
 
         // ── サムネイルグリッド ────────────────────────────────────────
         let t_pre_grid = frame_t0.elapsed();
@@ -34945,15 +34952,15 @@ impl eframe::App for App {
                         ),
                     ),
                     (
-                        "title_scroll_ms",
+                        "title_mods_ms",
                         serde_json::Value::from(
-                            (t_title_scroll - t_fullscreen_work).as_secs_f64() * 1000.0,
+                            (t_title_mods - t_fullscreen_work).as_secs_f64() * 1000.0,
                         ),
                     ),
                     (
                         "root_input_ms",
                         serde_json::Value::from(
-                            (t_root_input - t_title_scroll).as_secs_f64() * 1000.0,
+                            (t_root_input - t_title_mods).as_secs_f64() * 1000.0,
                         ),
                     ),
                     (

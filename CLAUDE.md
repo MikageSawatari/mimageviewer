@@ -284,8 +284,10 @@ C:\home\mimageviewer_vendor_backup\
   `ScrollArea` を置く場合、popup が開いている frame では `raw_scroll_delta` /
   `smooth_scroll_delta` / `Event::MouseWheel` を明示的に消費すること。これを忘れると
   popup 内をスクロールしたつもりの wheel が背面のサムネイル一覧にも通り、一覧が動く。
-  既存例: `src/ui_main.rs` の `suppress_menu_button_wheel_passthrough` と
-  ツールバー ComboBox の open guard。
+  さらに、グローバルな一覧ホイール処理 (`App::process_scroll`) はメニュー/ツールバー/
+  アドレスバー/ファセットバーを描いた後、グリッド描画の直前で呼ぶこと。早く呼ぶと
+  popup が wheel を処理する前に背面グリッドが先に動く。既存例: `src/ui_main.rs` の
+  `suppress_menu_button_wheel_passthrough` とツールバー ComboBox の open guard。
 
 ### ダイアログ (egui::Window)
 - **ドラッグ移動**: `anchor()` を使うとウィンドウが固定されドラッグできなくなる。
