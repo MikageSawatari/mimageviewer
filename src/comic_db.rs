@@ -110,6 +110,29 @@ impl ComicDb {
         Ok(())
     }
 
+    pub fn copy_entry_key(&self, from_key: &str, to_key: &str) -> rusqlite::Result<()> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO comic_entries (page_path, doc_version, doc_json)
+             SELECT ?2, doc_version, doc_json FROM comic_entries WHERE page_path = ?1
+             ON CONFLICT(page_path) DO UPDATE SET
+                doc_version = excluded.doc_version,
+                doc_json = excluded.doc_json",
+            rusqlite::params![from_key, to_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn move_entry_key(&self, from_key: &str, to_key: &str) -> rusqlite::Result<()> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.copy_entry_key(from_key, to_key)?;
+        self.delete(from_key)
+    }
+
     /// 指定プレフィックスで始まるキー集合を返す。フォルダ単位の「このフォルダ内で注釈を
     /// 持つページ」列挙（グリッドのバッジ用）に使う。conceal の `load_conceal_keys` と同形。
     pub fn load_comic_keys(&self, prefix: &str) -> std::collections::HashSet<String> {

@@ -526,6 +526,7 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
         &mut s.show_toolbar_folder_tree_button,
         "ツリー（フォルダツリー表示切り替え）",
     );
+    ui.checkbox(&mut s.show_toolbar_bookshelf, "本棚");
     ui.checkbox(&mut s.show_toolbar_rating, "レーティング (★ フィルタ)");
     ui.checkbox(
         &mut s.show_toolbar_facet_filter,

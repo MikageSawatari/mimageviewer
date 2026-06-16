@@ -27,6 +27,13 @@ pub struct BookAppendSummary {
     pub folder: PathBuf,
     pub added: usize,
     pub first_path: Option<PathBuf>,
+    pub edit_copies: Vec<BookPathMapping>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BookPathMapping {
+    pub from: PathBuf,
+    pub to: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +50,8 @@ pub struct BookTransferSummary {
     pub pages: usize,
     pub kind: BookTransferKind,
     pub source_entries: Vec<BookPageEntry>,
+    pub edit_moves: Vec<BookPathMapping>,
+    pub edit_copies: Vec<BookPathMapping>,
 }
 
 #[derive(Debug)]
@@ -50,10 +59,23 @@ pub enum BookOpResult {
     Append(BookAppendSummary),
     Transfer(BookTransferSummary),
     List(Vec<BookInfo>),
-    Created { name: String, path: PathBuf },
-    Renamed { old_name: String, new_name: String },
-    Deleted { name: String },
-    Reordered { folder: PathBuf, count: usize },
+    Created {
+        name: String,
+        path: PathBuf,
+    },
+    Renamed {
+        old_name: String,
+        new_name: String,
+        edit_moves: Vec<BookPathMapping>,
+    },
+    Deleted {
+        name: String,
+    },
+    Reordered {
+        folder: PathBuf,
+        count: usize,
+        edit_moves: Vec<BookPathMapping>,
+    },
 }
 
 pub struct BookOpPending {
@@ -105,6 +127,11 @@ pub enum BookPageSource {
     VideoFrame {
         path: PathBuf,
         target_secs: f64,
+        basename: String,
+        format: crate::capture::CaptureFormat,
+        jpeg_matte: crate::capture::JpegMatte,
+    },
+    ClipboardImage {
         basename: String,
         format: crate::capture::CaptureFormat,
         jpeg_matte: crate::capture::JpegMatte,
@@ -207,7 +234,11 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
     let old_name = normalize_book_name(old_name);
     let new_name = normalize_book_name(new_name);
     if old_name == new_name {
-        return Ok(BookOpResult::Renamed { old_name, new_name });
+        return Ok(BookOpResult::Renamed {
+            old_name,
+            new_name,
+            edit_moves: Vec::new(),
+        });
     }
     let from = book_folder(root, &old_name);
     let to = book_folder(root, &new_name);
@@ -222,7 +253,21 @@ pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOp
             to.display()
         )
     })?;
-    Ok(BookOpResult::Renamed { old_name, new_name })
+    let edit_moves = book_page_paths(&to)?
+        .into_iter()
+        .filter_map(|new_path| {
+            let name = new_path.file_name()?.to_owned();
+            Some(BookPathMapping {
+                from: from.join(name),
+                to: new_path,
+            })
+        })
+        .collect();
+    Ok(BookOpResult::Renamed {
+        old_name,
+        new_name,
+        edit_moves,
+    })
 }
 
 pub fn delete_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
@@ -260,9 +305,16 @@ pub fn append_pages(
     }
 
     let mut first_path = None;
+    let mut edit_copies = Vec::new();
     for (offset, source) in sources.into_iter().enumerate() {
         let page_no = start + offset;
         let dest = destination_for_source(&folder, page_no, &source)?;
+        if let Some(src) = source_edit_copy_path(&root, &folder, &source) {
+            edit_copies.push(BookPathMapping {
+                from: src,
+                to: dest.clone(),
+            });
+        }
         write_source(source, &dest)?;
         if first_path.is_none() {
             first_path = Some(dest);
@@ -274,13 +326,18 @@ pub fn append_pages(
         folder,
         added,
         first_path,
+        edit_copies,
     }))
 }
 
 pub fn flush_reorder(folder: PathBuf, ordered_paths: Vec<PathBuf>) -> Result<BookOpResult, String> {
-    let count = ordered_paths.len();
-    flush_reorder_paths(folder.clone(), ordered_paths)?;
-    Ok(BookOpResult::Reordered { folder, count })
+    let edit_moves = flush_reorder_paths(folder.clone(), ordered_paths)?;
+    let count = edit_moves.len();
+    Ok(BookOpResult::Reordered {
+        folder,
+        count,
+        edit_moves,
+    })
 }
 
 pub fn transfer_pages_between_books(
@@ -332,7 +389,12 @@ pub fn transfer_pages_between_books(
         ));
     }
 
-    let committed_paths = flush_reorder_paths(source_folder.clone(), current_order_paths.clone())?;
+    let commit_mappings = flush_reorder_paths(source_folder.clone(), current_order_paths.clone())?;
+    let committed_paths = commit_mappings
+        .iter()
+        .map(|mapping| mapping.to.clone())
+        .collect::<Vec<_>>();
+    let mut edit_moves = commit_mappings.clone();
     let mut selected_committed = Vec::new();
     let mut remaining_committed = Vec::new();
     for (old_path, committed_path) in current_order_paths.iter().zip(committed_paths.iter()) {
@@ -347,6 +409,7 @@ pub fn transfer_pages_between_books(
     }
 
     let mut completed = Vec::with_capacity(selected_committed.len());
+    let mut transfer_mappings = Vec::with_capacity(selected_committed.len());
     for (offset, src) in selected_committed.iter().enumerate() {
         let dest = destination_for_existing_page(&target_folder, start + offset, src)?;
         let result = match kind {
@@ -361,7 +424,13 @@ pub fn transfer_pages_between_books(
             }
         };
         match result {
-            Ok(done) => completed.push(done),
+            Ok(done) => {
+                transfer_mappings.push(BookPathMapping {
+                    from: src.clone(),
+                    to: dest.clone(),
+                });
+                completed.push(done);
+            }
             Err(err) => {
                 rollback_completed_transfers(&completed);
                 return Err(err);
@@ -369,9 +438,25 @@ pub fn transfer_pages_between_books(
         }
     }
 
+    let edit_copies = if kind == BookTransferKind::Copy {
+        transfer_mappings.clone()
+    } else {
+        Vec::new()
+    };
+    if kind == BookTransferKind::Move {
+        edit_moves.extend(transfer_mappings);
+    }
+
     let source_after_paths = if kind == BookTransferKind::Move {
         match flush_reorder_paths(source_folder.clone(), remaining_committed) {
-            Ok(paths) => paths,
+            Ok(compact_mappings) => {
+                let paths = compact_mappings
+                    .iter()
+                    .map(|mapping| mapping.to.clone())
+                    .collect::<Vec<_>>();
+                edit_moves.extend(compact_mappings);
+                paths
+            }
             Err(err) => {
                 return Err(format!(
                     "ページ移動は完了しましたが、元本の番号整理に失敗しました: {err}"
@@ -400,13 +485,15 @@ pub fn transfer_pages_between_books(
         pages: selected_committed.len(),
         kind,
         source_entries,
+        edit_moves,
+        edit_copies,
     }))
 }
 
 fn flush_reorder_paths(
     folder: PathBuf,
     ordered_paths: Vec<PathBuf>,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<Vec<BookPathMapping>, String> {
     if ordered_paths.len() > MAX_BOOK_PAGES {
         return Err(format!("本のページ数が上限 {} を超えます", MAX_BOOK_PAGES));
     }
@@ -458,7 +545,10 @@ fn flush_reorder_paths(
         finalized.push((original.clone(), dest));
     }
 
-    Ok(finalized.into_iter().map(|(_, dest)| dest).collect())
+    Ok(finalized
+        .into_iter()
+        .map(|(from, to)| BookPathMapping { from, to })
+        .collect())
 }
 
 fn write_source(source: BookPageSource, dest: &Path) -> Result<(), String> {
@@ -550,7 +640,28 @@ fn write_source(source: BookPageSource, dest: &Path) -> Result<(), String> {
                 &frame.rgba,
             )
         }
+        BookPageSource::ClipboardImage {
+            format, jpeg_matte, ..
+        } => {
+            let (width, height, rgba) = read_clipboard_rgba_image()?;
+            crate::capture::save_rgba_exact_with_matte(
+                dest, format, jpeg_matte, width, height, &rgba,
+            )
+        }
     }
+}
+
+fn source_edit_copy_path(
+    root: &Path,
+    dest_folder: &Path,
+    source: &BookPageSource,
+) -> Option<PathBuf> {
+    let src = match source {
+        BookPageSource::File { src, .. } | BookPageSource::AdjustedFile { src, .. } => src,
+        _ => return None,
+    };
+    let source_book = containing_book_folder(root, src)?;
+    (!crate::folder_tree::path_eq(&source_book, dest_folder)).then(|| src.clone())
 }
 
 fn decode_file_color_image(path: &Path) -> Result<egui::ColorImage, String> {
@@ -617,6 +728,267 @@ fn dynamic_image_to_color_image(img: &image::DynamicImage) -> egui::ColorImage {
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
+}
+
+#[cfg(windows)]
+fn read_clipboard_rgba_image() -> Result<(u32, u32, Vec<u8>), String> {
+    use windows::Win32::Foundation::{HGLOBAL, HWND};
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5};
+
+    unsafe {
+        if OpenClipboard(Some(HWND::default())).is_err() {
+            return Err("クリップボードを開けません".to_string());
+        }
+
+        let result = (|| {
+            let hmem = GetClipboardData(CF_DIB.0 as u32)
+                .or_else(|_| GetClipboardData(CF_DIBV5.0 as u32))
+                .map_err(|_| "クリップボードに画像がありません".to_string())?;
+            if hmem.is_invalid() {
+                return Err("クリップボードに画像がありません".to_string());
+            }
+            let global = HGLOBAL(hmem.0);
+            let size = GlobalSize(global);
+            if size == 0 {
+                return Err("クリップボード画像が空です".to_string());
+            }
+            let ptr = GlobalLock(global) as *const u8;
+            if ptr.is_null() {
+                return Err("クリップボード画像を読み取れません".to_string());
+            }
+            let bytes = std::slice::from_raw_parts(ptr, size);
+            let decoded = decode_cf_dib_rgba(bytes);
+            let _ = GlobalUnlock(global);
+            decoded
+        })();
+
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+#[cfg(not(windows))]
+fn read_clipboard_rgba_image() -> Result<(u32, u32, Vec<u8>), String> {
+    Err("この環境ではクリップボード画像を読み取れません".to_string())
+}
+
+fn decode_cf_dib_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    const BI_RGB: u32 = 0;
+    const BI_BITFIELDS: u32 = 3;
+
+    let header_size = read_u32_le(bytes, 0)? as usize;
+    if header_size < 40 || bytes.len() < header_size {
+        return Err("クリップボード画像のヘッダーが不正です".to_string());
+    }
+    let width_i = read_i32_le(bytes, 4)?;
+    let height_i = read_i32_le(bytes, 8)?;
+    if width_i <= 0 || height_i == 0 || height_i == i32::MIN {
+        return Err("クリップボード画像のサイズが不正です".to_string());
+    }
+    let width = width_i as u32;
+    let top_down = height_i < 0;
+    let height = if top_down {
+        (-height_i) as u32
+    } else {
+        height_i as u32
+    };
+    let planes = read_u16_le(bytes, 12)?;
+    let bit_count = read_u16_le(bytes, 14)?;
+    let compression = read_u32_le(bytes, 16)?;
+    if planes != 1 {
+        return Err("クリップボード画像の形式が不正です".to_string());
+    }
+    if !matches!(bit_count, 16 | 24 | 32) {
+        return Err("対応していないクリップボード画像形式です".to_string());
+    }
+    if compression != BI_RGB && compression != BI_BITFIELDS {
+        return Err("対応していないクリップボード画像形式です".to_string());
+    }
+    if compression == BI_RGB && bit_count == 16 {
+        return Err("対応していないクリップボード画像形式です".to_string());
+    }
+
+    let color_table_bytes = color_table_bytes(bytes, bit_count)?;
+    let (pixel_offset, masks) = if compression == BI_BITFIELDS {
+        let masks = dib_bitfield_masks(bytes, header_size)?;
+        let offset = if header_size == 40 {
+            40usize
+                .checked_add(12)
+                .and_then(|v| v.checked_add(color_table_bytes))
+                .ok_or_else(|| "クリップボード画像のサイズが大きすぎます".to_string())?
+        } else {
+            header_size
+                .checked_add(color_table_bytes)
+                .ok_or_else(|| "クリップボード画像のサイズが大きすぎます".to_string())?
+        };
+        (offset, Some(masks))
+    } else {
+        (
+            header_size
+                .checked_add(color_table_bytes)
+                .ok_or_else(|| "クリップボード画像のサイズが大きすぎます".to_string())?,
+            None,
+        )
+    };
+
+    let stride = dib_stride(width, bit_count)?;
+    let needed = (height as usize)
+        .checked_sub(1)
+        .and_then(|last| last.checked_mul(stride))
+        .and_then(|v| v.checked_add((width as usize * bit_count as usize).div_ceil(8)))
+        .and_then(|v| v.checked_add(pixel_offset))
+        .ok_or_else(|| "クリップボード画像のサイズが大きすぎます".to_string())?;
+    if bytes.len() < needed {
+        return Err("クリップボード画像のデータが不足しています".to_string());
+    }
+
+    let pixel_count = width
+        .checked_mul(height)
+        .ok_or_else(|| "クリップボード画像のサイズが大きすぎます".to_string())?;
+    let mut rgba = vec![
+        0u8;
+        (pixel_count as usize)
+            .checked_mul(4)
+            .ok_or_else(|| "クリップボード画像のサイズが大きすぎます".to_string())?
+    ];
+    let mut any_alpha = bit_count != 32;
+    for y in 0..height {
+        let src_y = if top_down { y } else { height - 1 - y };
+        let row = pixel_offset + src_y as usize * stride;
+        for x in 0..width {
+            let dst = (y as usize * width as usize + x as usize) * 4;
+            match (bit_count, masks) {
+                (24, _) => {
+                    let src = row + x as usize * 3;
+                    rgba[dst] = bytes[src + 2];
+                    rgba[dst + 1] = bytes[src + 1];
+                    rgba[dst + 2] = bytes[src];
+                    rgba[dst + 3] = 255;
+                }
+                (32, Some((red, green, blue, alpha))) => {
+                    let src = row + x as usize * 4;
+                    let value = u32::from_le_bytes([
+                        bytes[src],
+                        bytes[src + 1],
+                        bytes[src + 2],
+                        bytes[src + 3],
+                    ]);
+                    rgba[dst] = mask_channel_to_u8(value, red);
+                    rgba[dst + 1] = mask_channel_to_u8(value, green);
+                    rgba[dst + 2] = mask_channel_to_u8(value, blue);
+                    rgba[dst + 3] = if alpha == 0 {
+                        255
+                    } else {
+                        let a = mask_channel_to_u8(value, alpha);
+                        any_alpha |= a != 0;
+                        a
+                    };
+                }
+                (32, None) => {
+                    let src = row + x as usize * 4;
+                    rgba[dst] = bytes[src + 2];
+                    rgba[dst + 1] = bytes[src + 1];
+                    rgba[dst + 2] = bytes[src];
+                    rgba[dst + 3] = bytes[src + 3];
+                    any_alpha |= bytes[src + 3] != 0;
+                }
+                (16, Some((red, green, blue, alpha))) => {
+                    let src = row + x as usize * 2;
+                    let value = u16::from_le_bytes([bytes[src], bytes[src + 1]]) as u32;
+                    rgba[dst] = mask_channel_to_u8(value, red);
+                    rgba[dst + 1] = mask_channel_to_u8(value, green);
+                    rgba[dst + 2] = mask_channel_to_u8(value, blue);
+                    rgba[dst + 3] = if alpha == 0 {
+                        255
+                    } else {
+                        mask_channel_to_u8(value, alpha)
+                    };
+                }
+                _ => return Err("対応していないクリップボード画像形式です".to_string()),
+            }
+        }
+    }
+
+    if !any_alpha {
+        for px in rgba.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+    }
+    Ok((width, height, rgba))
+}
+
+fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16, String> {
+    let slice = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| "クリップボード画像のヘッダーが不正です".to_string())?;
+    Ok(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    let slice = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| "クリップボード画像のヘッダーが不正です".to_string())?;
+    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_i32_le(bytes: &[u8], offset: usize) -> Result<i32, String> {
+    Ok(read_u32_le(bytes, offset)? as i32)
+}
+
+fn color_table_bytes(bytes: &[u8], bit_count: u16) -> Result<usize, String> {
+    let clr_used = read_u32_le(bytes, 32)? as usize;
+    if clr_used == 0 || bit_count > 8 {
+        return Ok(0);
+    }
+    clr_used
+        .checked_mul(4)
+        .ok_or_else(|| "クリップボード画像のサイズが大きすぎます".to_string())
+}
+
+fn dib_bitfield_masks(bytes: &[u8], header_size: usize) -> Result<(u32, u32, u32, u32), String> {
+    if header_size >= 56 {
+        Ok((
+            read_u32_le(bytes, 40)?,
+            read_u32_le(bytes, 44)?,
+            read_u32_le(bytes, 48)?,
+            read_u32_le(bytes, 52)?,
+        ))
+    } else if header_size == 40 {
+        Ok((
+            read_u32_le(bytes, 40)?,
+            read_u32_le(bytes, 44)?,
+            read_u32_le(bytes, 48)?,
+            0,
+        ))
+    } else {
+        Err("クリップボード画像のマスク情報が不正です".to_string())
+    }
+}
+
+fn dib_stride(width: u32, bit_count: u16) -> Result<usize, String> {
+    let bits = (width as usize)
+        .checked_mul(bit_count as usize)
+        .ok_or_else(|| "クリップボード画像のサイズが大きすぎます".to_string())?;
+    bits.checked_add(31)
+        .map(|v| (v / 32) * 4)
+        .ok_or_else(|| "クリップボード画像のサイズが大きすぎます".to_string())
+}
+
+fn mask_channel_to_u8(value: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 0;
+    }
+    let shift = mask.trailing_zeros();
+    let bits = mask.count_ones();
+    let raw = ((value & mask) >> shift) as u64;
+    let max = if bits >= 32 {
+        u32::MAX as u64
+    } else {
+        (1u64 << bits) - 1
+    };
+    ((raw * 255 + max / 2) / max) as u8
 }
 
 fn copy_file_snapshot(src: &Path, dest: &Path) -> Result<(), String> {
@@ -783,6 +1155,13 @@ fn destination_for_source(
             crate::capture::basename_from_text(basename),
             format.extension()
         ),
+        BookPageSource::ClipboardImage {
+            basename, format, ..
+        } => format!(
+            "{}.{}",
+            crate::capture::basename_from_text(basename),
+            format.extension()
+        ),
     };
     let name = sanitize_filename(&raw_name, "page");
     let path = folder.join(format!("{page_no:04}_{name}"));
@@ -840,7 +1219,11 @@ fn next_page_number(folder: &Path) -> Result<usize, String> {
 }
 
 fn book_page_count(folder: &Path) -> Result<usize, String> {
-    let mut count = 0usize;
+    Ok(book_page_paths(folder)?.len())
+}
+
+fn book_page_paths(folder: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
     for entry in fs::read_dir(folder)
         .map_err(|e| format!("本フォルダを読み取れません: {}: {e}", folder.display()))?
     {
@@ -848,10 +1231,16 @@ fn book_page_count(folder: &Path) -> Result<usize, String> {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         if page_number_from_name(&name).is_some() && is_supported_book_image_path(&path) {
-            count += 1;
+            paths.push(path);
         }
     }
-    Ok(count)
+    paths.sort_by_key(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(page_number_from_name)
+            .unwrap_or(MAX_BOOK_PAGES + 1)
+    });
+    Ok(paths)
 }
 
 fn page_number_from_name(name: &str) -> Option<usize> {
@@ -985,6 +1374,50 @@ mod tests {
     }
 
     #[test]
+    fn decode_cf_dib_rgba_reads_bottom_up_24bpp() {
+        let mut dib = vec![0u8; 40 + 8];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&2i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&1i32.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&24u16.to_le_bytes());
+        dib[40..43].copy_from_slice(&[0, 0, 255]);
+        dib[43..46].copy_from_slice(&[0, 255, 0]);
+
+        let (width, height, rgba) = decode_cf_dib_rgba(&dib).unwrap();
+
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(
+            rgba,
+            vec![
+                255, 0, 0, 255, //
+                0, 255, 0, 255,
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_cf_dib_rgba_reads_top_down_32bpp_bitfields() {
+        let mut dib = vec![0u8; 56 + 4];
+        dib[0..4].copy_from_slice(&56u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&3u32.to_le_bytes());
+        dib[40..44].copy_from_slice(&0x00ff_0000u32.to_le_bytes());
+        dib[44..48].copy_from_slice(&0x0000_ff00u32.to_le_bytes());
+        dib[48..52].copy_from_slice(&0x0000_00ffu32.to_le_bytes());
+        dib[52..56].copy_from_slice(&0xff00_0000u32.to_le_bytes());
+        dib[56..60].copy_from_slice(&[255, 0, 0, 128]);
+
+        let (width, height, rgba) = decode_cf_dib_rgba(&dib).unwrap();
+
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(rgba, vec![0, 0, 255, 128]);
+    }
+
+    #[test]
     fn create_book_rejects_existing_name() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path().join("books");
@@ -1047,12 +1480,37 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(result, BookOpResult::Transfer(_)));
+        let BookOpResult::Transfer(summary) = result else {
+            panic!("expected transfer result");
+        };
         assert_eq!(fs::read(source.join("0001_c.jpg")).unwrap(), b"c");
         assert_eq!(fs::read(source.join("0002_a.jpg")).unwrap(), b"a");
         assert_eq!(fs::read(source.join("0003_b.jpg")).unwrap(), b"b");
         assert_eq!(fs::read(target.join("0001_c.jpg")).unwrap(), b"c");
         assert_eq!(fs::read(target.join("0002_b.jpg")).unwrap(), b"b");
+        assert_eq!(
+            summary
+                .edit_copies
+                .iter()
+                .map(|m| (m.from.clone(), m.to.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (source.join("0001_c.jpg"), target.join("0001_c.jpg")),
+                (source.join("0003_b.jpg"), target.join("0002_b.jpg")),
+            ]
+        );
+        assert_eq!(
+            summary
+                .edit_moves
+                .iter()
+                .map(|m| (m.from.clone(), m.to.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (c, source.join("0001_c.jpg")),
+                (a, source.join("0002_a.jpg")),
+                (b, source.join("0003_b.jpg")),
+            ]
+        );
     }
 
     #[test]
@@ -1070,7 +1528,7 @@ mod tests {
         fs::write(&b, b"b").unwrap();
         fs::write(&c, b"c").unwrap();
 
-        transfer_pages_between_books(
+        let result = transfer_pages_between_books(
             root,
             source.clone(),
             vec![a.clone(), b.clone(), c.clone()],
@@ -1079,11 +1537,95 @@ mod tests {
             BookTransferKind::Move,
         )
         .unwrap();
+        let BookOpResult::Transfer(summary) = result else {
+            panic!("expected transfer result");
+        };
 
         assert_eq!(fs::read(source.join("0001_a.jpg")).unwrap(), b"a");
         assert!(!source.join("0002_b.jpg").exists());
         assert!(!source.join("0003_c.jpg").exists());
         assert_eq!(fs::read(target.join("0001_b.jpg")).unwrap(), b"b");
         assert_eq!(fs::read(target.join("0002_c.jpg")).unwrap(), b"c");
+        assert!(summary.edit_copies.is_empty());
+        assert_eq!(
+            summary
+                .edit_moves
+                .iter()
+                .filter(|m| m.from != m.to)
+                .map(|m| (m.from.clone(), m.to.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (source.join("0002_b.jpg"), target.join("0001_b.jpg")),
+                (source.join("0003_c.jpg"), target.join("0002_c.jpg")),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_book_page_reports_edit_copy_mapping() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("books");
+        let source = root.join("src");
+        fs::create_dir_all(&source).unwrap();
+        let page = source.join("0001_a.jpg");
+        fs::write(&page, b"a").unwrap();
+
+        let result = append_pages(
+            root.clone(),
+            "dst".to_string(),
+            vec![BookPageSource::File {
+                src: page.clone(),
+                original_name: "0001_a.jpg".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let BookOpResult::Append(summary) = result else {
+            panic!("expected append result");
+        };
+        assert_eq!(
+            fs::read(root.join("dst").join("0001_0001_a.jpg")).unwrap(),
+            b"a"
+        );
+        assert_eq!(
+            summary
+                .edit_copies
+                .iter()
+                .map(|m| (m.from.clone(), m.to.clone()))
+                .collect::<Vec<_>>(),
+            vec![(page, root.join("dst").join("0001_0001_a.jpg"))]
+        );
+    }
+
+    #[test]
+    fn rename_book_reports_edit_move_mappings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("books");
+        let source = root.join("old");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("0001_a.jpg"), b"a").unwrap();
+        fs::write(source.join("0002_b.jpg"), b"b").unwrap();
+
+        let result = rename_book(&root, "old", "new").unwrap();
+
+        let BookOpResult::Renamed { edit_moves, .. } = result else {
+            panic!("expected rename result");
+        };
+        assert_eq!(
+            edit_moves
+                .iter()
+                .map(|m| (m.from.clone(), m.to.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    root.join("old").join("0001_a.jpg"),
+                    root.join("new").join("0001_a.jpg")
+                ),
+                (
+                    root.join("old").join("0002_b.jpg"),
+                    root.join("new").join("0002_b.jpg")
+                ),
+            ]
+        );
     }
 }

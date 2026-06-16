@@ -89,10 +89,6 @@ impl App {
     /// (消しゴムと同じ振る舞い、`conceal_spread_ctx` に元状態を保存)、
     /// `reset_conceal_mode` で復元する。
     pub(crate) fn enter_conceal_mode(&mut self, fs_idx: usize) {
-        if self.idx_is_compiled_book_page(fs_idx) {
-            self.show_feedback_toast("本のページは編集できません".to_string());
-            return;
-        }
         // 見開き → Single ピボット (消しゴムの enter_erase_mode と同じ作法)
         let spread_pair = match self.resolve_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } => Some((left, right)),

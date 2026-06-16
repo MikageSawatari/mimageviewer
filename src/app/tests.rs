@@ -2365,6 +2365,17 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder_last_mtime = Some(SystemTime::now());
         assert_eq!(app.current_favorite_target(), Some(dir));
 
+        let books_root = app.tmp.path().join("books");
+        let book_dir = books_root.join("test");
+        std::fs::create_dir_all(&book_dir).unwrap();
+        app.settings.book_root = Some(books_root.clone());
+        app.current_folder = Some(books_root);
+        app.current_folder_last_mtime = Some(SystemTime::now());
+        assert_eq!(app.current_favorite_target(), None);
+        app.current_folder = Some(book_dir);
+        app.current_folder_last_mtime = Some(SystemTime::now());
+        assert_eq!(app.current_favorite_target(), None);
+
         let zip = app.tmp.path().join("book.zip");
         std::fs::write(&zip, b"zip").unwrap();
         app.current_folder = Some(zip);

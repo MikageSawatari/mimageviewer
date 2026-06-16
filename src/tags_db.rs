@@ -379,6 +379,58 @@ impl TagsDb {
         Ok((changed, before, Vec::new()))
     }
 
+    pub fn copy_item_key(&mut self, from_key: &str, to_key: &str) -> Result<(), rusqlite::Error> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.rotate_backups_once();
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM item_tags WHERE item_key = ?1", [to_key])?;
+        tx.execute("DELETE FROM tag_item_state WHERE item_key = ?1", [to_key])?;
+        tx.execute(
+            "INSERT INTO item_tags (item_key, tag, tag_key, applied_at)
+             SELECT ?2, tag, tag_key, applied_at
+             FROM item_tags
+             WHERE item_key = ?1",
+            params![from_key, to_key],
+        )?;
+        tx.execute(
+            "INSERT INTO tag_item_state (item_key, decided_at, source)
+             SELECT ?2, decided_at, source
+             FROM tag_item_state
+             WHERE item_key = ?1",
+            params![from_key, to_key],
+        )?;
+        tx.commit()
+    }
+
+    pub fn move_item_key(&mut self, from_key: &str, to_key: &str) -> Result<(), rusqlite::Error> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.rotate_backups_once();
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM item_tags WHERE item_key = ?1", [to_key])?;
+        tx.execute("DELETE FROM tag_item_state WHERE item_key = ?1", [to_key])?;
+        tx.execute(
+            "INSERT INTO item_tags (item_key, tag, tag_key, applied_at)
+             SELECT ?2, tag, tag_key, applied_at
+             FROM item_tags
+             WHERE item_key = ?1",
+            params![from_key, to_key],
+        )?;
+        tx.execute(
+            "INSERT INTO tag_item_state (item_key, decided_at, source)
+             SELECT ?2, decided_at, source
+             FROM tag_item_state
+             WHERE item_key = ?1",
+            params![from_key, to_key],
+        )?;
+        tx.execute("DELETE FROM item_tags WHERE item_key = ?1", [from_key])?;
+        tx.execute("DELETE FROM tag_item_state WHERE item_key = ?1", [from_key])?;
+        tx.commit()
+    }
+
     pub fn retag_key(
         &mut self,
         old_key: &str,

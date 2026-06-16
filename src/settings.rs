@@ -1564,6 +1564,9 @@ pub struct Settings {
     /// ツールバーに「ツリー」ボタンを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder_tree_button: bool,
+    /// ツールバーに「本棚」セクションを表示する。
+    #[serde(default = "default_true")]
+    pub show_toolbar_bookshelf: bool,
     /// フォルダバーに「履歴を戻る/進む」ボタンを表示する。
     #[serde(default = "default_true")]
     pub show_address_bar_history_nav: bool,
@@ -2944,6 +2947,7 @@ impl Default for Settings {
             folder_tree_pane_width_ratio: default_folder_tree_pane_width_ratio(),
             show_toolbar_folder: true,
             show_toolbar_folder_tree_button: true,
+            show_toolbar_bookshelf: true,
             show_address_bar_history_nav: true,
             show_address_bar_quick_folders: true,
             show_toolbar_parent_button: true,
@@ -4342,6 +4346,7 @@ mod tests {
         assert_eq!(s.continuous_reading_key_scroll_percent, 16);
         assert_eq!(s.continuous_reading_gamepad_scroll_percent_per_sec, 130);
         assert!(s.show_toolbar_favorites);
+        assert!(s.show_toolbar_tags);
         assert!(!s.folder_tree_pane_visible);
         assert_eq!(
             s.folder_tree_pane_width_ratio,
@@ -4349,6 +4354,7 @@ mod tests {
         );
         assert!(s.show_toolbar_folder);
         assert!(s.show_toolbar_folder_tree_button);
+        assert!(s.show_toolbar_bookshelf);
         assert!(s.show_address_bar_history_nav);
         assert!(s.show_address_bar_quick_folders);
         assert!(s.show_toolbar_parent_button);
@@ -6037,6 +6043,7 @@ mod tests {
             s.toolbar_cols_display = ToolbarSectionDisplay::Dropdown;
             s.toolbar_aspect_display = ToolbarSectionDisplay::Dropdown;
             s.toolbar_sort_display = ToolbarSectionDisplay::Dropdown;
+            s.show_toolbar_bookshelf = false;
             s.show_toolbar_facet_filter = false;
             s.save();
 
@@ -6200,6 +6207,10 @@ mod tests {
                 loaded.toolbar_sort_display,
                 ToolbarSectionDisplay::Dropdown,
                 "toolbar_sort_display should survive roundtrip"
+            );
+            assert!(
+                !loaded.show_toolbar_bookshelf,
+                "show_toolbar_bookshelf (false override) should survive roundtrip"
             );
             assert!(
                 !loaded.show_toolbar_facet_filter,

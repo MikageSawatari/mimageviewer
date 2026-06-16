@@ -123,6 +123,35 @@ impl AdjustmentDb {
         Ok(())
     }
 
+    pub fn copy_page_params_key(
+        &self,
+        from_key: &str,
+        to_key: &str,
+    ) -> Result<(), rusqlite::Error> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO page_params (page_path, params_json)
+             SELECT ?2, params_json FROM page_params WHERE page_path = ?1
+             ON CONFLICT(page_path) DO UPDATE SET params_json = excluded.params_json",
+            rusqlite::params![from_key, to_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn move_page_params_key(
+        &self,
+        from_key: &str,
+        to_key: &str,
+    ) -> Result<(), rusqlite::Error> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.copy_page_params_key(from_key, to_key)?;
+        self.remove_page_params(from_key)
+    }
+
     /// 複数ページに同じパラメータを一括書込する (「全画像に適用」ボタン用)。
     ///
     /// 削除判定 (= グローバルと等価かどうか) は呼び出し側の責務。

@@ -865,6 +865,31 @@ impl MaskDb {
         Ok(())
     }
 
+    pub fn copy_entry_key(&self, from_key: &str, to_key: &str) -> rusqlite::Result<()> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO masks (path, mask_data, width, height, vectors)
+             SELECT ?2, mask_data, width, height, vectors FROM masks WHERE path = ?1
+             ON CONFLICT(path) DO UPDATE SET
+                mask_data = excluded.mask_data,
+                width = excluded.width,
+                height = excluded.height,
+                vectors = excluded.vectors",
+            rusqlite::params![from_key, to_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn move_entry_key(&self, from_key: &str, to_key: &str) -> rusqlite::Result<()> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.copy_entry_key(from_key, to_key)?;
+        self.delete(from_key)
+    }
+
     /// 名前付きスロットにマスクを保存する。`set` と異なりビットマップ全 false でも保存する。
     pub fn set_slot(
         &self,

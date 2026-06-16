@@ -97,10 +97,7 @@ impl App {
     /// 対象ファイル集合が割れ、破壊的な XMP 編集が想定外のファイルに当たる。
     fn selection_target_indices(&self) -> Vec<usize> {
         if let Some(fs_idx) = self.fullscreen_idx {
-            return (!self.idx_is_compiled_book_page(fs_idx))
-                .then_some(fs_idx)
-                .into_iter()
-                .collect();
+            return vec![fs_idx];
         }
         let bulk_intent = match self.selected {
             Some(sel) => !self.checked.is_empty() && self.checked.contains(&sel),
@@ -108,14 +105,10 @@ impl App {
         };
         if bulk_intent {
             let mut indices: Vec<usize> = self.checked.iter().copied().collect();
-            indices.retain(|&idx| !self.idx_is_compiled_book_page(idx));
             indices.sort_unstable(); // worker のジョブ投入順 = トースト集計順を安定化
             return indices;
         }
-        self.selected
-            .filter(|&idx| !self.idx_is_compiled_book_page(idx))
-            .map(|idx| vec![idx])
-            .unwrap_or_default()
+        self.selected.map(|idx| vec![idx]).unwrap_or_default()
     }
 
     /// タグ書き込みの対象ファイル列 (`selection_target_indices` の解決結果のうち、
@@ -127,7 +120,12 @@ impl App {
             .into_iter()
             .filter_map(|idx| {
                 let item = self.items.get(idx)?;
-                tag_target_for_item(item, fullscreen).map(|target| self.remap_tag_target(target))
+                tag_target_for_item(item, fullscreen).map(|mut target| {
+                    if self.idx_is_compiled_book_page(idx) {
+                        target.tag_sidecar = None;
+                    }
+                    self.remap_tag_target(target)
+                })
             })
             .collect()
     }
@@ -147,6 +145,7 @@ impl App {
         let mut out: Vec<PathBuf> = self
             .selection_target_indices()
             .into_iter()
+            .filter(|&idx| !self.idx_is_compiled_book_page(idx))
             .filter_map(|idx| self.items.get(idx).and_then(legacy_xmp_target_for_item))
             .collect();
         out.sort();

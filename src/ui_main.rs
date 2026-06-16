@@ -1604,14 +1604,19 @@ impl App {
                     let active_name = self.active_book_name();
                     ui.label(format!("追加先の本: {active_name}"));
                     let has_selection = self.selected.is_some() || !self.checked.is_empty();
-                    if ui
-                        .add_enabled(
-                            has_selection,
-                            egui::Button::new("追加先の本に追加 (Ctrl+B)"),
-                        )
-                        .clicked()
-                    {
+                    let add_resp = ui
+                        .add_enabled(has_selection, egui::Button::new("追加先の本に追加"))
+                        .hover_tip(if has_selection {
+                            "選択中またはチェック済みの画像・ページを追加先の本へ追加"
+                        } else {
+                            "追加する画像・ページを選択してください"
+                        });
+                    if add_resp.clicked() {
                         self.add_grid_selection_to_active_book(ctx);
+                        ui.close();
+                    }
+                    if ui.button("クリップボードの画像を本に追加").clicked() {
+                        self.add_clipboard_image_to_active_book(ctx);
                         ui.close();
                     }
                     if ui.button("本棚フォルダを開く").clicked() {
@@ -1622,9 +1627,15 @@ impl App {
                         fav_nav = Some(self.active_book_folder_path());
                         ui.close();
                     }
-                    if self.current_folder_is_book_folder()
-                        && ui.button("この本を並べ替え…").clicked()
-                    {
+                    let can_reorder_book = self.current_folder_is_book_folder();
+                    let reorder_resp = ui
+                        .add_enabled(can_reorder_book, egui::Button::new("この本を並べ替え…"))
+                        .hover_tip(if can_reorder_book {
+                            "現在開いている本のページ順を変更"
+                        } else {
+                            "本を開くと使用できます"
+                        });
+                    if reorder_resp.clicked() {
                         self.open_book_reorder_from_current();
                         ui.close();
                     }
@@ -2344,7 +2355,12 @@ impl App {
                         state.flush_pending = None;
                     }
                     match result {
-                        Ok(crate::books::BookOpResult::Reordered { folder, count }) => {
+                        Ok(crate::books::BookOpResult::Reordered {
+                            folder,
+                            count,
+                            edit_moves,
+                        }) => {
+                            self.apply_book_page_edit_moves(&edit_moves);
                             self.book_reorder = None;
                             if self.current_folder.as_ref().is_some_and(|current| {
                                 crate::folder_tree::path_eq(current, &folder)
@@ -2381,6 +2397,8 @@ impl App {
                     }
                     match result {
                         Ok(crate::books::BookOpResult::Transfer(summary)) => {
+                            self.apply_book_page_edit_moves(&summary.edit_moves);
+                            self.apply_book_page_edit_copies(&summary.edit_copies);
                             self.book_list_cache = None;
                             if self.current_folder.as_ref().is_some_and(|current| {
                                 crate::folder_tree::path_eq(current, &summary.source_folder)
@@ -3320,8 +3338,16 @@ impl App {
         let show_rating = self.settings.show_toolbar_rating;
         let show_tags = self.settings.show_toolbar_tags;
         let show_folder_tree_button = self.settings.show_toolbar_folder_tree_button;
+        let show_bookshelf = self.settings.show_toolbar_bookshelf;
         let book_sort_locked = self.current_folder_is_book_folder();
+        if show_bookshelf && self.book_list_cache.is_none() && self.book_op_pending.is_none() {
+            self.request_book_list_refresh();
+        }
+        let active_book_name = self.active_book_name();
+        let toolbar_book_rows = self.book_list_cache.clone();
+        let has_book_add_target = self.selected.is_some() || !self.checked.is_empty();
         let any_toolbar_section = show_folder_tree_button
+            || show_bookshelf
             || show_cols
             || show_aspect
             || show_sort
@@ -3336,6 +3362,9 @@ impl App {
         let mut toolbar_fav_nav: Option<PathBuf> = None;
         let mut toolbar_sort_changed = false;
         let mut toolbar_rating_changed = false;
+        let mut toolbar_book_add = false;
+        let mut toolbar_book_open_active = false;
+        let mut toolbar_book_target_name: Option<String> = None;
         let mut toolbar_tag_click: Option<String> = None;
         let mut toolbar_tag_search: Option<String> = None;
         let mut toolbar_tag_apply = false;
@@ -3421,6 +3450,56 @@ impl App {
                         .on_hover_text("左側に実フォルダツリーを表示");
                     if resp.clicked() {
                         self.set_folder_tree_pane_visible(!active);
+                    }
+                    first_section = false;
+                }
+                if show_bookshelf {
+                    if !first_section {
+                        ui.separator();
+                    }
+                    toolbar_label(ui, "本棚:", 46.0);
+                    let combo = egui::ComboBox::from_id_salt("toolbar_book_target_combo")
+                        .width(160.0)
+                        .height(320.0)
+                        .selected_text(active_book_name.clone())
+                        .show_ui(ui, |ui| {
+                            apply_toolbar_style(ui);
+                            match toolbar_book_rows.as_ref() {
+                                Some(rows) if rows.is_empty() => {
+                                    ui.label(egui::RichText::new("本はまだありません").weak());
+                                }
+                                Some(rows) => {
+                                    for row in rows {
+                                        let selected = row.name == active_book_name;
+                                        let label = format!("{} ({}p)", row.name, row.page_count);
+                                        if ui.selectable_label(selected, label).clicked() {
+                                            toolbar_book_target_name = Some(row.name.clone());
+                                            ui.close();
+                                        }
+                                    }
+                                }
+                                None => {
+                                    ui.label(egui::RichText::new("本棚を読み込み中…").weak());
+                                }
+                            }
+                        });
+                    toolbar_combo_popup_open |= egui::ComboBox::is_open(ctx, combo.response.id);
+                    let add_resp = ui
+                        .add_enabled(has_book_add_target, egui::Button::new("追加"))
+                        .hover_tip(if has_book_add_target {
+                            "選択中またはチェック済みの画像・ページを追加先の本へ追加"
+                        } else {
+                            "追加する画像・ページを選択してください"
+                        });
+                    if add_resp.clicked() {
+                        toolbar_book_add = true;
+                    }
+                    if ui
+                        .button("開く")
+                        .hover_tip(format!("追加先の本「{}」を開く", active_book_name))
+                        .clicked()
+                    {
+                        toolbar_book_open_active = true;
                     }
                     first_section = false;
                 }
@@ -3809,6 +3888,18 @@ impl App {
 
         if toolbar_combo_popup_open {
             consume_wheel_input(ctx);
+        }
+
+        if let Some(name) = toolbar_book_target_name {
+            self.settings.active_book_name = name.clone();
+            self.settings.save();
+            self.book_manager_rename_name = name;
+        }
+        if toolbar_book_add {
+            self.add_grid_selection_to_active_book(ctx);
+        }
+        if toolbar_book_open_active {
+            toolbar_fav_nav = Some(self.active_book_folder_path());
         }
 
         // ツールバーのソート変更は borrow の関係で遅延実行。

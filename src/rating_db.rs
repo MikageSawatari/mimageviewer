@@ -102,6 +102,29 @@ impl RatingDb {
         Ok(())
     }
 
+    pub fn copy_entry_key(&self, from_key: &str, to_key: &str) -> Result<(), rusqlite::Error> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO ratings (path, stars)
+             SELECT ?2, stars FROM ratings WHERE path = ?1
+             ON CONFLICT(path) DO UPDATE SET stars = excluded.stars",
+            rusqlite::params![from_key, to_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn move_entry_key(&self, from_key: &str, to_key: &str) -> Result<(), rusqlite::Error> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.copy_entry_key(from_key, to_key)?;
+        self.conn
+            .execute("DELETE FROM ratings WHERE path = ?1", [from_key])?;
+        Ok(())
+    }
+
     /// 全レコードを削除 (リセット)。
     pub fn clear_all(&self) -> Result<usize, rusqlite::Error> {
         self.conn.execute("DELETE FROM ratings", [])

@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>製本・本棚 — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>製本・本棚</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html" class="active">製本・本棚</a>
+        <a href="search.html">検索機能</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">製本・本棚</h1>
+    <p class="page-desc">
+      画像、ZIP/PDF 内のページ、動画フレーム、クリップボード画像を 1 冊の本へ集め、
+      番号順の画像フォルダとして整理する機能です。元ファイルを参照し続けるプレイリストではなく、
+      追加時点のページをコピーして本棚に保存します。
+    </p>
+
+    <h2>基本の考え方</h2>
+    <p>
+      本棚ルート直下の各フォルダが 1 冊の本です。ページは
+      <code>0001_元名.ext</code> のような番号付き画像ファイルとして保存されます。
+      Explorer でフォルダごとコピーしたり ZIP 化しても、番号順に並べればページ順が保たれます。
+    </p>
+    <p>
+      本棚ルートと本フォルダは、通常のお気に入りや Ctrl+S / Ctrl+G の自動検索対象にはしません。
+      本の中ではソート操作も番号順に固定され、手動で混入した ZIP・PDF・フォルダ・動画などの画像以外はページとして表示されません。
+    </p>
+
+    <h2>追加先の本</h2>
+    <p>
+      「追加先の本」は、次にページを追加する本です。メニュー「製本」またはツールバーの
+      <strong>本棚:</strong> セクションで切り替えられます。
+    </p>
+    <ul>
+      <li><strong>追加先の本に追加：</strong>選択中またはチェック済みの画像・ページを追加先の本へ追加します。</li>
+      <li><strong>クリップボードの画像を本に追加：</strong>クリップボード上の画像を、新しいページとして追加します。</li>
+      <li><strong>追加先の本を開く：</strong>現在の追加先の本を mImageViewer 内で開きます。</li>
+      <li><strong>本棚フォルダを開く：</strong>本棚ルートを Explorer ではなく mImageViewer 内で開きます。</li>
+      <li><strong>製本の管理：</strong>本の作成、名前変更、削除、追加先の本の切り替えを行います。</li>
+    </ul>
+    <p>
+      追加対象に画像・ページ以外が混在している場合は、一部だけ追加せず全体を中止します。
+      本ページを別の本へ追加する場合は、画像ファイルと一緒にタグ・★・補正・消しゴム・隠蔽加工・注釈などの
+      mImageViewer 内部編集情報もコピーされます。同じ本へ同じページを追加する操作は中止されます。
+    </p>
+
+    <h2>保存される内容</h2>
+    <p>
+      通常画像や ZIP 内画像は、焼き込む補正や回転が無い場合は再エンコードせず、
+      元ファイルまたは ZIP 内の格納 bytes をそのまま保存します。補正や回転が有効なページ、PDF ページ、
+      動画フレーム、クリップボード画像は、表示結果を焼き込んだ画像として保存されます。
+    </p>
+    <p>
+      追加後の本ページにも、mImageViewer 内部のタグ・★・画像補正・消しゴム・補正レイヤー・隠蔽加工・テキスト注釈を重ねられます。
+      本ページは外部サイドカーを作らず、グローバル補正やお気に入り別補正を継承しません。
+      投稿前に一部を隠す、セリフを差し替える、といった後段加工に使えます。
+    </p>
+    <p>
+      本ページの回転はページ順や見開きの意味が変わりやすいため、初期版では本棚内での後からの回転操作は無効です。
+      必要な回転は追加時に焼き込まれます。
+    </p>
+
+    <h2>本の並べ替え</h2>
+    <p>
+      本を開いているときに「この本を並べ替え」を選ぶと、専用ウィンドウでページ順を編集できます。
+      小サムネイルをドラッグして挿入位置へ移動し、ホバーで拡大プレビューを確認できます。
+      <kbd>Ctrl</kbd>クリックで複数選択、<kbd>Shift</kbd>クリックで範囲選択ができます。
+    </p>
+    <ul>
+      <li><strong>ドラッグ移動：</strong>選択ページをまとめて挿入位置へ移動します。ドラッグ中は端へ近づくと自動スクロールします。</li>
+      <li><strong>左右ボタン：</strong>選択ページを 1 ブロックとして前後へ移動します。</li>
+      <li><strong>別の本へコピー / 移動：</strong>上部の本一覧から移動先を選び、選択ページを別の本へコピーまたは移動します。</li>
+      <li><strong>サムネサイズ：</strong>上部スライダーで並べ替え画面のサムネイルサイズを調整できます。</li>
+      <li><strong>キーボード：</strong><kbd>PageUp</kbd> / <kbd>PageDown</kbd> / <kbd>Home</kbd> / <kbd>End</kbd> で一覧をスクロールできます。</li>
+    </ul>
+    <p>
+      並べ替えウィンドウは閉じる時に順序を保存します。別の本へ移動・コピーする場合は、現在の並び順を先に確定してから処理します。
+      ページを移動・コピーした場合も、対象ページの mImageViewer 内部編集情報は移動先へ引き継がれます。
+    </p>
+
+    <h2>検索とお気に入り</h2>
+    <p>
+      本棚はページを整理するための出力先なので、お気に入りとして登録できません。
+      本棚の上位フォルダをお気に入りに登録している場合でも、本棚ルート以下は Ctrl+S / Ctrl+G の自動索引から除外されます。
+      本の中で探したい場合は、通常のツールバー検索や Ctrl+F の現在フォルダ検索を使います。
+    </p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

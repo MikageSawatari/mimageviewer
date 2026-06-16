@@ -503,6 +503,35 @@ impl CropDb {
         Ok(())
     }
 
+    pub fn copy_entry_key(&self, from_key: &str, to_key: &str) -> Result<(), rusqlite::Error> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO export_crop_pages
+                (page_path, min_x, min_y, max_x, max_y, aspect_mode, updated_at)
+             SELECT ?2, min_x, min_y, max_x, max_y, aspect_mode, unixepoch()
+             FROM export_crop_pages WHERE page_path = ?1
+             ON CONFLICT(page_path) DO UPDATE SET
+                min_x = excluded.min_x,
+                min_y = excluded.min_y,
+                max_x = excluded.max_x,
+                max_y = excluded.max_y,
+                aspect_mode = excluded.aspect_mode,
+                updated_at = unixepoch()",
+            rusqlite::params![from_key, to_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn move_entry_key(&self, from_key: &str, to_key: &str) -> Result<(), rusqlite::Error> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.copy_entry_key(from_key, to_key)?;
+        self.remove(from_key)
+    }
+
     pub fn load_keys(&self, prefix: &str) -> HashSet<String> {
         self.load_by_prefix(prefix).into_keys().collect()
     }

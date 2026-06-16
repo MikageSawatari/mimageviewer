@@ -123,6 +123,32 @@ impl ConcealDb {
         Ok(())
     }
 
+    pub fn copy_entry_key(&self, from_key: &str, to_key: &str) -> rusqlite::Result<()> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO conceal_entries (page_path, bitmap_w, bitmap_h, bitmap_data, shapes)
+             SELECT ?2, bitmap_w, bitmap_h, bitmap_data, shapes
+             FROM conceal_entries WHERE page_path = ?1
+             ON CONFLICT(page_path) DO UPDATE SET
+                bitmap_w = excluded.bitmap_w,
+                bitmap_h = excluded.bitmap_h,
+                bitmap_data = excluded.bitmap_data,
+                shapes = excluded.shapes",
+            rusqlite::params![from_key, to_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn move_entry_key(&self, from_key: &str, to_key: &str) -> rusqlite::Result<()> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.copy_entry_key(from_key, to_key)?;
+        self.delete(from_key)
+    }
+
     /// 名前付きスロットにマスクを保存する。`set` と異なりビットマップ全 false でも保存する
     /// (= 「ベクタだけのマスク」をスロットに保管できる)。
     pub fn set_slot(

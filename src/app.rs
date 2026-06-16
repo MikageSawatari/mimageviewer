@@ -7143,7 +7143,11 @@ impl App {
         {
             return None;
         }
-        self.current_folder.clone()
+        let target = self.current_folder.clone()?;
+        if crate::books::path_is_under_or_equal(&target, &self.book_root_path()) {
+            return None;
+        }
+        Some(target)
     }
 
     pub(crate) fn poll_current_folder_watch(&mut self, ctx: &egui::Context) {
@@ -14169,6 +14173,178 @@ impl App {
         }
     }
 
+    pub(crate) fn apply_book_page_edit_copies(
+        &mut self,
+        mappings: &[crate::books::BookPathMapping],
+    ) {
+        let mappings = Self::normalized_book_page_edit_mappings(mappings);
+        if mappings.is_empty() {
+            return;
+        }
+        let mut errors = Vec::new();
+        for (from, to) in mappings {
+            self.copy_book_page_edit_key(&from, &to, &mut errors);
+        }
+        self.finish_book_page_edit_mapping("copy", errors);
+    }
+
+    pub(crate) fn apply_book_page_edit_moves(
+        &mut self,
+        mappings: &[crate::books::BookPathMapping],
+    ) {
+        let mappings = Self::normalized_book_page_edit_mappings(mappings);
+        if mappings.is_empty() {
+            return;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let temp_mappings = mappings
+            .iter()
+            .enumerate()
+            .map(|(i, (from, to))| {
+                (
+                    from.clone(),
+                    format!("__miv_book_edit_tmp__/{pid}/{stamp}/{i}"),
+                    to.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut errors = Vec::new();
+        for (from, temp, _) in &temp_mappings {
+            self.move_book_page_edit_key(from, temp, &mut errors);
+        }
+        for (_, temp, to) in &temp_mappings {
+            self.move_book_page_edit_key(temp, to, &mut errors);
+        }
+        self.finish_book_page_edit_mapping("move", errors);
+    }
+
+    fn normalized_book_page_edit_mappings(
+        mappings: &[crate::books::BookPathMapping],
+    ) -> Vec<(String, String)> {
+        mappings
+            .iter()
+            .filter_map(|mapping| {
+                let from = crate::adjustment_db::normalize_path(&mapping.from);
+                let to = crate::adjustment_db::normalize_path(&mapping.to);
+                (from != to).then_some((from, to))
+            })
+            .collect()
+    }
+
+    fn copy_book_page_edit_key(&mut self, from: &str, to: &str, errors: &mut Vec<String>) {
+        if let Some(db) = &self.adjustment_db
+            && let Err(e) = db.copy_page_params_key(from, to)
+        {
+            errors.push(format!("adjustment: {e}"));
+        }
+        if let Some(db) = &self.local_adjust_db
+            && let Err(e) = db.copy_entry_key(from, to)
+        {
+            errors.push(format!("local_adjust: {e}"));
+        }
+        if let Some(db) = &self.export_crop_db
+            && let Err(e) = db.copy_entry_key(from, to)
+        {
+            errors.push(format!("crop: {e}"));
+        }
+        if let Some(db) = &self.mask_db
+            && let Err(e) = db.copy_entry_key(from, to)
+        {
+            errors.push(format!("erase: {e}"));
+        }
+        if let Some(db) = &self.conceal_db
+            && let Err(e) = db.copy_entry_key(from, to)
+        {
+            errors.push(format!("conceal: {e}"));
+        }
+        if let Some(db) = &self.comic_db
+            && let Err(e) = db.copy_entry_key(from, to)
+        {
+            errors.push(format!("comic: {e}"));
+        }
+        if let Some(db) = &self.rating_db
+            && let Err(e) = db.copy_entry_key(from, to)
+        {
+            errors.push(format!("rating: {e}"));
+        }
+        if let Some(db) = self.tags_db.as_mut()
+            && let Err(e) = db.copy_item_key(from, to)
+        {
+            errors.push(format!("tags: {e}"));
+        }
+    }
+
+    fn move_book_page_edit_key(&mut self, from: &str, to: &str, errors: &mut Vec<String>) {
+        if let Some(db) = &self.adjustment_db
+            && let Err(e) = db.move_page_params_key(from, to)
+        {
+            errors.push(format!("adjustment: {e}"));
+        }
+        if let Some(db) = &self.local_adjust_db
+            && let Err(e) = db.move_entry_key(from, to)
+        {
+            errors.push(format!("local_adjust: {e}"));
+        }
+        if let Some(db) = &self.export_crop_db
+            && let Err(e) = db.move_entry_key(from, to)
+        {
+            errors.push(format!("crop: {e}"));
+        }
+        if let Some(db) = &self.mask_db
+            && let Err(e) = db.move_entry_key(from, to)
+        {
+            errors.push(format!("erase: {e}"));
+        }
+        if let Some(db) = &self.conceal_db
+            && let Err(e) = db.move_entry_key(from, to)
+        {
+            errors.push(format!("conceal: {e}"));
+        }
+        if let Some(db) = &self.comic_db
+            && let Err(e) = db.move_entry_key(from, to)
+        {
+            errors.push(format!("comic: {e}"));
+        }
+        if let Some(db) = &self.rating_db
+            && let Err(e) = db.move_entry_key(from, to)
+        {
+            errors.push(format!("rating: {e}"));
+        }
+        if let Some(db) = self.tags_db.as_mut()
+            && let Err(e) = db.move_item_key(from, to)
+        {
+            errors.push(format!("tags: {e}"));
+        }
+    }
+
+    fn finish_book_page_edit_mapping(&mut self, op: &str, errors: Vec<String>) {
+        self.clear_page_edit_state();
+        self.rating_cache.clear();
+        self.tags_cache.clear();
+        if errors.is_empty() {
+            return;
+        }
+        let preview = errors
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" / ");
+        crate::logger::log(format!(
+            "book page edit metadata {op} partially failed ({}): {preview}",
+            errors.len()
+        ));
+        self.show_feedback_toast(format!(
+            "本ページの編集情報の引き継ぎに一部失敗しました ({} 件)",
+            errors.len()
+        ));
+    }
+
     fn start_book_op<F>(&mut self, ctx: &egui::Context, thread_name: &'static str, f: F)
     where
         F: FnOnce() -> Result<crate::books::BookOpResult, String> + Send + 'static,
@@ -14210,6 +14386,7 @@ impl App {
         self.book_op_pending = None;
         match result {
             Ok(crate::books::BookOpResult::Append(summary)) => {
+                self.apply_book_page_edit_copies(&summary.edit_copies);
                 self.book_list_cache = None;
                 if self
                     .current_folder
@@ -14233,6 +14410,8 @@ impl App {
                 }
             }
             Ok(crate::books::BookOpResult::Transfer(summary)) => {
+                self.apply_book_page_edit_moves(&summary.edit_moves);
+                self.apply_book_page_edit_copies(&summary.edit_copies);
                 self.book_list_cache = None;
                 if self.current_folder.as_ref().is_some_and(|current| {
                     crate::folder_tree::path_eq(current, &summary.source_folder)
@@ -14268,7 +14447,12 @@ impl App {
                 self.show_feedback_toast(format!("本を作成しました: {name}"));
                 crate::logger::log(format!("book created: {}", path.display()));
             }
-            Ok(crate::books::BookOpResult::Renamed { old_name, new_name }) => {
+            Ok(crate::books::BookOpResult::Renamed {
+                old_name,
+                new_name,
+                edit_moves,
+            }) => {
+                self.apply_book_page_edit_moves(&edit_moves);
                 if self.settings.active_book_name == old_name {
                     self.settings.active_book_name = new_name.clone();
                     self.settings.save();
@@ -14293,7 +14477,12 @@ impl App {
                 self.pending_reload = true;
                 self.show_feedback_toast(format!("本を削除しました: {name}"));
             }
-            Ok(crate::books::BookOpResult::Reordered { folder, count }) => {
+            Ok(crate::books::BookOpResult::Reordered {
+                folder,
+                count,
+                edit_moves,
+            }) => {
+                self.apply_book_page_edit_moves(&edit_moves);
                 self.book_list_cache = None;
                 if self
                     .current_folder
@@ -21415,9 +21604,6 @@ impl App {
         if let Some(&v) = self.rating_cache.get(&idx) {
             return v;
         }
-        if self.idx_is_compiled_book_page(idx) {
-            return 0;
-        }
         let accepts = matches!(self.items.get(idx), Some(it) if it.accepts_rating());
         if !accepts {
             return 0;
@@ -21435,14 +21621,11 @@ impl App {
     /// レーティング対象外アイテムの場合は何もしない。
     /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
     pub(crate) fn set_rating(&mut self, idx: usize, stars: u8) {
-        if self.idx_is_compiled_book_page(idx) {
-            self.show_feedback_toast("本のページにはレーティングを付けられません".to_string());
-            return;
-        }
         let accepts = matches!(self.items.get(idx), Some(it) if it.accepts_rating());
         if !accepts {
             return;
         }
+        let book_page = self.idx_is_compiled_book_page(idx);
         let stars = stars.min(5);
         let key = match self.rating_path_key(idx) {
             Some(k) => k,
@@ -21469,7 +21652,7 @@ impl App {
         }
         // 設定 ON + Image (JPEG/PNG/WebP) のときだけ XMP にも書き込む。
         // コンテナや ZIP 内画像・PDF ページには書き込み先がないので DB 止まり。
-        if self.settings.write_rating_to_xmp {
+        if self.settings.write_rating_to_xmp && !book_page {
             let writable_path: Option<PathBuf> = match self.items.get(idx) {
                 Some(GridItem::Image(p)) if crate::xmp_writer::is_writable_format(p) => {
                     Some(p.clone())
@@ -22214,10 +22397,7 @@ impl App {
         }
 
         let mut keys = Vec::new();
-        for (idx, item) in self.items.iter().enumerate() {
-            if self.idx_is_compiled_book_page(idx) {
-                continue;
-            }
+        for item in &self.items {
             if let Some(path) = tag_item_path(item) {
                 keys.push(crate::tags_db::item_key_for_path(path));
             }
@@ -22493,9 +22673,6 @@ impl App {
     /// 指定 idx の grid cell に描くタグ列。`tags_cache` のみを引く (同期 I/O を避ける)。
     /// キャッシュに載っていない = 未ロード → 空を返す (バッジ非表示)。
     pub(crate) fn cell_tag_list(&self, idx: usize) -> &[String] {
-        if self.idx_is_compiled_book_page(idx) {
-            return &[];
-        }
         let p = match self.items.get(idx).and_then(tag_item_path) {
             Some(p) => p,
             _ => return &[],
@@ -22508,9 +22685,6 @@ impl App {
     }
 
     fn cell_tags_loaded(&self, idx: usize) -> bool {
-        if self.idx_is_compiled_book_page(idx) {
-            return true;
-        }
         let p = match self.items.get(idx).and_then(tag_item_path) {
             Some(p) => p,
             _ => return true,
@@ -22533,15 +22707,10 @@ impl App {
             self.checked
                 .iter()
                 .copied()
-                .filter(|&idx| {
-                    self.idx_visible(idx)
-                        && !self.idx_is_compiled_book_page(idx)
-                        && self.items.get(idx).is_some_and(&pred)
-                })
+                .filter(|&idx| self.idx_visible(idx) && self.items.get(idx).is_some_and(&pred))
                 .collect()
         } else if let Some(idx) = self.selected
             && self.idx_visible(idx)
-            && !self.idx_is_compiled_book_page(idx)
             && self.items.get(idx).is_some_and(&pred)
         {
             vec![idx]
@@ -22695,9 +22864,6 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
-        if self.reject_compiled_book_page_edit(fs_idx) {
-            return;
-        }
         if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
             self.show_feedback_toast("[適用対象なし]".to_string());
             return;
@@ -22733,9 +22899,6 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
-        if self.reject_compiled_book_page_edit(fs_idx) {
-            return;
-        }
         if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
             self.show_feedback_toast("[削除対象なし]".to_string());
             return;
@@ -22764,9 +22927,6 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
-        if self.reject_compiled_book_page_edit(fs_idx) {
-            return;
-        }
         if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
             self.show_feedback_toast("[削除対象なし]".to_string());
             return;
@@ -25471,6 +25631,9 @@ impl App {
     where
         F: FnOnce(&mut crate::sidecar::SidecarFile, &str),
     {
+        if self.idx_is_compiled_book_page(idx) {
+            return;
+        }
         if let Some((folder, rel)) = self.sidecar_coords(idx) {
             if let Some(sc) = self.sidecar_mut(&folder) {
                 op(sc, &rel);
@@ -30024,6 +30187,9 @@ impl App {
         if let Some(p) = self.adjustment_page_params.get(&idx) {
             return p;
         }
+        if self.idx_is_compiled_book_page(idx) {
+            return Self::book_page_default_adjust_params();
+        }
         if let Some(p) = self.favorite_default_for_idx(idx) {
             return p;
         }
@@ -30034,8 +30200,17 @@ impl App {
     /// 個別設定の冗長判定 (個別を保存する意味があるか) に使う。
     /// お気に入り配下なら favorite 標準、そうでなければ global。
     pub(crate) fn effective_default_for_idx(&self, idx: usize) -> &crate::adjustment::AdjustParams {
+        if self.idx_is_compiled_book_page(idx) {
+            return Self::book_page_default_adjust_params();
+        }
         self.favorite_default_for_idx(idx)
             .unwrap_or(&self.settings.global_preset)
+    }
+
+    fn book_page_default_adjust_params() -> &'static crate::adjustment::AdjustParams {
+        static DEFAULT: std::sync::OnceLock<crate::adjustment::AdjustParams> =
+            std::sync::OnceLock::new();
+        DEFAULT.get_or_init(crate::adjustment::AdjustParams::default)
     }
 
     /// 指定 idx が属するお気に入り (最も近い祖先) の標準パラメータへの参照を返す。
@@ -30047,6 +30222,9 @@ impl App {
 
     /// 指定 idx が属するお気に入り (最も近い祖先) の id を返す。
     pub(crate) fn current_favorite_id_for_idx(&self, idx: usize) -> Option<uuid::Uuid> {
+        if self.idx_is_compiled_book_page(idx) {
+            return None;
+        }
         let item = self.items.get(idx)?;
         let container_path: std::path::PathBuf = match item {
             GridItem::Image(p) => p.parent()?.to_path_buf(),
@@ -30062,6 +30240,9 @@ impl App {
     /// 個別設定 → お気に入り標準 → global の順で最初に存在する層を選ぶ。
     pub(crate) fn resolve_adjust_scope(&self, fs_idx: usize) -> crate::ui_fullscreen::AdjustScope {
         use crate::ui_fullscreen::AdjustScope;
+        if self.idx_is_compiled_book_page(fs_idx) {
+            return AdjustScope::PageOverride;
+        }
         if self.adjustment_page_params.contains_key(&fs_idx) {
             return AdjustScope::PageOverride;
         }

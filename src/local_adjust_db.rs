@@ -81,6 +81,30 @@ impl LocalAdjustDb {
         Ok(())
     }
 
+    pub fn copy_entry_key(&self, from_key: &str, to_key: &str) -> Result<(), rusqlite::Error> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO local_adjust_pages (page_path, layers_json, updated_at)
+             SELECT ?2, layers_json, unixepoch()
+             FROM local_adjust_pages WHERE page_path = ?1
+             ON CONFLICT(page_path) DO UPDATE SET
+                layers_json = excluded.layers_json,
+                updated_at = unixepoch()",
+            rusqlite::params![from_key, to_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn move_entry_key(&self, from_key: &str, to_key: &str) -> Result<(), rusqlite::Error> {
+        if from_key == to_key {
+            return Ok(());
+        }
+        self.copy_entry_key(from_key, to_key)?;
+        self.remove_layers(from_key)
+    }
+
     /// 指定プレフィックスで始まるページキー集合を返す。
     ///
     /// フォルダロード時の hydrate や、サムネイル上のバッジ判定に使う。

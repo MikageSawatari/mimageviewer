@@ -162,10 +162,6 @@ impl App {
     }
 
     pub(crate) fn enter_erase_mode(&mut self, fs_idx: usize) {
-        if self.idx_is_compiled_book_page(fs_idx) {
-            self.show_feedback_toast("本のページは編集できません".to_string());
-            return;
-        }
         // 見開きから入った場合は左ページへピボット。Single 起動 / 片側のみのページ
         // (表紙・末尾奇数・横長画像) では `resolve_spread_pair` が Single を返すので
         // ピボット処理はスキップされる。
@@ -2703,9 +2699,6 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
-        if self.reject_compiled_book_page_edit(fs_idx) {
-            return;
-        }
 
         let pixels = match self.resolve_erase_input_pixels(fs_idx) {
             Some(pixels) => pixels,
