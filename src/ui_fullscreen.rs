@@ -970,6 +970,22 @@ fn valid_layout_size_or_fallback(size: egui::Vec2, fallback: egui::Vec2) -> egui
     }
 }
 
+fn layout_size_is_valid(size: egui::Vec2) -> bool {
+    size.x > 0.0 && size.y > 0.0
+}
+
+fn processed_layout_size_changes_aspect(processed: egui::Vec2, raw: egui::Vec2) -> bool {
+    if !layout_size_is_valid(processed) {
+        return false;
+    }
+    if !layout_size_is_valid(raw) {
+        return true;
+    }
+    let processed_aspect = processed.x / processed.y;
+    let raw_aspect = raw.x / raw.y;
+    ((processed_aspect - raw_aspect).abs() / raw_aspect.abs().max(0.001)) > 0.002
+}
+
 fn choose_layout_base_size(
     processed: Option<egui::Vec2>,
     raw: Option<egui::Vec2>,
@@ -978,7 +994,16 @@ fn choose_layout_base_size(
     prefer_processed: bool,
 ) -> egui::Vec2 {
     let selected = if prefer_processed {
-        processed.or(raw)
+        match (processed, raw) {
+            (Some(processed), Some(raw))
+                if processed_layout_size_changes_aspect(processed, raw) =>
+            {
+                Some(processed)
+            }
+            (_, Some(raw)) => Some(raw),
+            (Some(processed), None) => Some(processed),
+            (None, None) => None,
+        }
     } else {
         raw.or(processed)
     }
@@ -15866,7 +15891,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_base_size_prefers_processed_when_requested() {
+    fn layout_base_size_keeps_raw_when_processed_has_same_aspect() {
         let raw = Some(egui::vec2(100.0, 50.0));
         let processed = Some(egui::vec2(400.0, 200.0));
         let fallback = egui::vec2(10.0, 10.0);
@@ -15879,7 +15904,7 @@ mod tests {
                 crate::rotation_db::Rotation::None,
                 true,
             ),
-            egui::vec2(400.0, 200.0)
+            egui::vec2(100.0, 50.0)
         );
         assert_eq!(
             choose_layout_base_size(
@@ -15890,6 +15915,24 @@ mod tests {
                 false,
             ),
             egui::vec2(100.0, 50.0)
+        );
+    }
+
+    #[test]
+    fn layout_base_size_prefers_processed_when_aspect_changes() {
+        let raw = Some(egui::vec2(100.0, 50.0));
+        let processed = Some(egui::vec2(200.0, 200.0));
+        let fallback = egui::vec2(10.0, 10.0);
+
+        assert_eq!(
+            choose_layout_base_size(
+                processed,
+                raw,
+                fallback,
+                crate::rotation_db::Rotation::None,
+                true,
+            ),
+            egui::vec2(200.0, 200.0)
         );
     }
 
