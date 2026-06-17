@@ -22469,6 +22469,14 @@ impl App {
     /// 直前に開いていた実フォルダを誤って書き換えないよう false を返す。
     /// 成功時は rating_cache も同期し、visible_indices を rebuild する。
     pub(crate) fn set_current_folder_rating(&mut self, stars: u8) -> bool {
+        self.set_current_folder_rating_internal(stars, true)
+    }
+
+    pub(crate) fn preview_current_folder_rating(&mut self, stars: u8) -> bool {
+        self.set_current_folder_rating_internal(stars, false)
+    }
+
+    fn set_current_folder_rating_internal(&mut self, stars: u8, capture_undo: bool) -> bool {
         let Some((key, _)) = self.current_container_rating_key_and_source() else {
             return false;
         };
@@ -22478,7 +22486,7 @@ impl App {
             .current_folder_rating_cache
             .or_else(|| self.rating_db.as_ref().map(|db| db.get(&key)))
             .unwrap_or(0);
-        if before != stars {
+        if capture_undo && before != stars {
             self.capture_container_rating_undo(before, stars);
         }
         if let Some(db) = self.rating_db.as_ref() {

@@ -547,6 +547,9 @@ enum NativeVideoOutputCommand {
     SetRingPickerOverlay {
         overlay: Option<native_presenter::NativeOverlayRingPicker>,
     },
+    SetRingGuideOverlay {
+        overlay: Option<native_presenter::NativeOverlayRingGuide>,
+    },
     // SetNavigationPreview/SwitchSource は `app/` 経由でのみ構築される (= bin 専属の
     // `app` 経路。lib.rs では `app` が stub のため lib 視点では dead variant)。
     #[allow(dead_code)]
@@ -915,6 +918,12 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetRingPickerOverlay { overlay });
+    }
+
+    fn set_ring_guide_overlay(&self, overlay: Option<native_presenter::NativeOverlayRingGuide>) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetRingGuideOverlay { overlay });
     }
 
     #[allow(dead_code)]
@@ -2196,6 +2205,9 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetRingPickerOverlay { overlay } => {
                     presenter.set_overlay_ring_picker(overlay);
+                }
+                NativeVideoOutputCommand::SetRingGuideOverlay { overlay } => {
+                    presenter.set_overlay_ring_guide(overlay);
                 }
                 NativeVideoOutputCommand::SetNavigationPreview { preview } => {
                     pending_navigation_preview_clear_at = None;
@@ -5226,6 +5238,16 @@ impl VideoPlayer {
     ) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_ring_picker_overlay(overlay);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_ring_guide_overlay(
+        &self,
+        overlay: Option<native_presenter::NativeOverlayRingGuide>,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_ring_guide_overlay(overlay);
         }
     }
 

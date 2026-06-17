@@ -10,8 +10,9 @@ use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleas
 use crate::grid_item::GridItem;
 use crate::ring_shortcut::{
     MOUSE_FLICK_MOVE_THRESHOLD_PX, MouseBackForwardActionId, MouseFlickOutcome, MouseFlickState,
-    PostFilterDrillState, RingActionId, RingDirection, RingPickerRowId, RingPickerState,
-    RingShortcutContext, WheelPairActionId, mouse_flick_guide_delay, mouse_flick_menu_delay,
+    PostFilterDrillState, RingActionId, RingDirection, RingPickerOriginalState, RingPickerRowId,
+    RingPickerState, RingShortcutContext, WheelPairActionId, mouse_flick_guide_delay,
+    mouse_flick_menu_delay,
 };
 use crate::settings::{
     FullscreenFitMode, GridViewMode, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
@@ -42,6 +43,7 @@ const GRID_PICKER_ROWS: &[RingPickerRowId] = &[
 const IMAGE_PICKER_ROWS: &[RingPickerRowId] = &[
     RingPickerRowId::SpreadMode,
     RingPickerRowId::ReadingFlow,
+    RingPickerRowId::ReadingDirection,
     RingPickerRowId::FitMode,
     RingPickerRowId::ItemRating,
     RingPickerRowId::ContainerRating,
@@ -402,6 +404,7 @@ impl App {
         self.mouse_ring_flick = Some(MouseFlickState::new(context, Instant::now(), pos));
         self.mouse_ring_grid_target_idx = grid_target_idx;
         self.mouse_ring_suppress_context_menu_once = false;
+        self.sync_native_video_ring_guide_overlay(ctx);
         ctx.request_repaint_after(mouse_flick_guide_delay());
     }
 
@@ -415,6 +418,7 @@ impl App {
         };
         if existing.context != context {
             self.cancel_mouse_ring_flick();
+            self.clear_native_video_ring_guide_overlay(ctx);
             return MouseFlickOutcome::None;
         }
 
@@ -429,7 +433,34 @@ impl App {
                     .unwrap_or(fallback_pos),
             )
         });
+        self.update_mouse_ring_flick_at(
+            ctx,
+            context,
+            pointer_pos,
+            secondary_down,
+            secondary_released,
+        )
+    }
 
+    pub(crate) fn update_native_mouse_ring_flick(
+        &mut self,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        pos: egui::Pos2,
+        secondary_down: bool,
+        secondary_released: bool,
+    ) -> MouseFlickOutcome {
+        self.update_mouse_ring_flick_at(ctx, context, pos, secondary_down, secondary_released)
+    }
+
+    fn update_mouse_ring_flick_at(
+        &mut self,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        pointer_pos: egui::Pos2,
+        secondary_down: bool,
+        secondary_released: bool,
+    ) -> MouseFlickOutcome {
         let (moved, elapsed, current_pos, armed, direction) = {
             let Some(flick) = self.mouse_ring_flick.as_mut() else {
                 return MouseFlickOutcome::None;
@@ -451,6 +482,7 @@ impl App {
             let fired = armed || direction.is_some();
             self.mouse_ring_flick = None;
             self.mouse_ring_grid_target_idx = None;
+            self.clear_native_video_ring_guide_overlay(ctx);
             if fired {
                 self.mouse_ring_suppress_context_menu_once = true;
                 if let Some(direction) = direction
@@ -471,16 +503,19 @@ impl App {
 
         if !secondary_down {
             self.cancel_mouse_ring_flick();
+            self.clear_native_video_ring_guide_overlay(ctx);
             return MouseFlickOutcome::None;
         }
 
         if !armed && moved < MOUSE_FLICK_MOVE_THRESHOLD_PX && elapsed >= mouse_flick_menu_delay() {
             self.mouse_ring_flick = None;
             self.mouse_ring_suppress_context_menu_once = true;
+            self.clear_native_video_ring_guide_overlay(ctx);
             ctx.request_repaint();
             return MouseFlickOutcome::LongPressMenu(current_pos);
         }
 
+        self.sync_native_video_ring_guide_overlay(ctx);
         self.request_mouse_ring_flick_repaint(ctx);
         MouseFlickOutcome::None
     }
@@ -692,6 +727,7 @@ impl App {
             RingPickerRowId::ContainerRating => rating_label(picker.container_rating),
             RingPickerRowId::SpreadMode => picker.spread_mode.label().to_string(),
             RingPickerRowId::ReadingFlow => picker.reading_flow.label().to_string(),
+            RingPickerRowId::ReadingDirection => picker.reading_direction.label().to_string(),
             RingPickerRowId::FitMode => picker.fit_mode.label().to_string(),
             RingPickerRowId::PostFilter => {
                 format!("{}  Aで選択", picker.post_filter.display_label())
@@ -872,11 +908,13 @@ impl App {
                     if let Some(dir) = button_dir(action.button) {
                         self.gamepad_state
                             .mark_west_ring_direction(ring_direction_from_pad_dir(dir));
+                        self.sync_native_video_ring_guide_overlay(ctx);
                         ctx.request_repaint();
                     } else if action.button == PadButton::East
                         && action.kind == PadActionKind::Press
                     {
                         self.gamepad_state.cancel_west_ring();
+                        self.clear_native_video_ring_guide_overlay(ctx);
                         ctx.request_repaint();
                     }
                     return None;
@@ -895,7 +933,10 @@ impl App {
                     PadButton::East if action.kind == PadActionKind::Press => {
                         self.handle_gamepad_back(ctx)
                     }
-                    PadButton::West if action.kind == PadActionKind::Press => None,
+                    PadButton::West if action.kind == PadActionKind::Press => {
+                        self.sync_native_video_ring_guide_overlay(ctx);
+                        None
+                    }
                     PadButton::Select if action.kind == PadActionKind::Press => {
                         self.handle_gamepad_select(ctx);
                         None
@@ -939,6 +980,7 @@ impl App {
             if let Some(direction) = ring_direction_from_stick(stick) {
                 self.gamepad_state.mark_west_ring_direction(direction);
             }
+            self.sync_native_video_ring_guide_overlay(ctx);
             return true;
         }
         let Some(fs_idx) = self.fullscreen_idx else {
@@ -1119,6 +1161,7 @@ impl App {
     }
 
     fn finish_gamepad_west_release(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
+        self.clear_native_video_ring_guide_overlay(ctx);
         match self.gamepad_state.finish_west_release() {
             WestReleaseOutcome::Picker => {
                 self.open_gamepad_ring_picker(ctx);
@@ -1134,6 +1177,7 @@ impl App {
         let mut picker = self.build_ring_picker_state(context);
         picker.clamp_row(picker_rows_for_context(context).len());
         self.ring_picker = Some(picker);
+        self.clear_native_video_ring_guide_overlay(ctx);
         ctx.request_repaint();
         self.sync_native_video_picker_overlay(ctx);
         self.maybe_show_x_picker_hint(ctx, context);
@@ -1142,37 +1186,74 @@ impl App {
     fn build_ring_picker_state(&mut self, context: RingShortcutContext) -> RingPickerState {
         let fs_idx = self.fullscreen_idx;
         let params = fs_idx.map(|idx| self.effective_params(idx).clone());
-        let item_rating = self.current_picker_item_rating(context);
+        let item_rating_records = self.current_picker_item_rating_records(context);
+        let item_rating = if item_rating_records.len() == 1 {
+            item_rating_records[0].1
+        } else {
+            0
+        };
         let container_rating = self.current_folder_rating();
+        let grid_cols = self.settings.grid_cols.clamp(
+            crate::settings::MIN_GRID_COLS,
+            crate::settings::MAX_GRID_COLS,
+        );
+        let sort_order = self.settings.sort_order;
+        let thumb_aspect_auto = self.settings.thumb_aspect_auto;
+        let thumb_aspect = self.settings.thumb_aspect;
+        let spread_mode = self.spread_mode;
+        let reading_flow = self.reading_flow;
+        let reading_direction = self.reading_direction;
+        let fit_mode = self
+            .settings
+            .fullscreen_fit_mode
+            .effective_for_flow(self.reading_flow);
+        let post_filter = params
+            .as_ref()
+            .map(|p| p.post_filter)
+            .unwrap_or(PostFilter::None);
+        let upscale_model_key = params.and_then(|p| p.upscale_model);
+        let video_volume = self.settings.video_volume;
+        let video_playback_speed = self.video_playback_speed;
+        let video_continuous_mode = self.video_continuous_mode;
+        let original = RingPickerOriginalState {
+            grid_cols,
+            sort_order,
+            thumb_aspect_auto,
+            thumb_aspect,
+            item_rating_records,
+            container_rating,
+            spread_mode,
+            reading_flow,
+            reading_direction,
+            fit_mode,
+            post_filter,
+            upscale_model_key: upscale_model_key.clone(),
+            video_volume,
+            video_playback_speed,
+            video_continuous_mode,
+        };
         RingPickerState {
             context,
+            original,
             row: 0,
             dirty_rows: Vec::new(),
             x_close_armed: false,
             drill: None,
-            grid_cols: self.settings.grid_cols.clamp(
-                crate::settings::MIN_GRID_COLS,
-                crate::settings::MAX_GRID_COLS,
-            ),
-            sort_order: self.settings.sort_order,
-            thumb_aspect_auto: self.settings.thumb_aspect_auto,
-            thumb_aspect: self.settings.thumb_aspect,
+            grid_cols,
+            sort_order,
+            thumb_aspect_auto,
+            thumb_aspect,
             item_rating,
             container_rating,
-            spread_mode: self.spread_mode,
-            reading_flow: self.reading_flow,
-            fit_mode: self
-                .settings
-                .fullscreen_fit_mode
-                .effective_for_flow(self.reading_flow),
-            post_filter: params
-                .as_ref()
-                .map(|p| p.post_filter)
-                .unwrap_or(PostFilter::None),
-            upscale_model_key: params.and_then(|p| p.upscale_model),
-            video_volume: self.settings.video_volume,
-            video_playback_speed: self.video_playback_speed,
-            video_continuous_mode: self.video_continuous_mode,
+            spread_mode,
+            reading_flow,
+            reading_direction,
+            fit_mode,
+            post_filter,
+            upscale_model_key,
+            video_volume,
+            video_playback_speed,
+            video_continuous_mode,
         }
     }
 
@@ -1192,20 +1273,22 @@ impl App {
         ctx.request_repaint();
     }
 
-    fn current_picker_item_rating(&mut self, context: RingShortcutContext) -> u8 {
+    fn current_picker_item_rating_records(
+        &mut self,
+        context: RingShortcutContext,
+    ) -> Vec<(usize, u8)> {
         match context {
             RingShortcutContext::Grid => {
                 let targets = self.ratable_targets();
-                if targets.len() == 1 {
-                    self.get_rating(targets[0])
-                } else {
-                    0
-                }
+                targets
+                    .into_iter()
+                    .map(|idx| (idx, self.get_rating(idx)))
+                    .collect()
             }
             RingShortcutContext::ImageFullscreen | RingShortcutContext::VideoFullscreen => self
                 .fullscreen_idx
-                .map(|idx| self.get_rating(idx))
-                .unwrap_or(0),
+                .map(|idx| vec![(idx, self.get_rating(idx))])
+                .unwrap_or_default(),
         }
     }
 
@@ -1332,7 +1415,7 @@ impl App {
             PadDir::Left | PadDir::Right => {
                 if let Some(row) = self.current_ring_picker_row_kind() {
                     let delta = if dir == PadDir::Right { 1 } else { -1 };
-                    self.change_ring_picker_value(row, delta);
+                    self.change_ring_picker_value(ctx, row, delta);
                     if let Some(picker) = self.ring_picker.as_mut() {
                         picker.x_close_armed = false;
                     }
@@ -1343,7 +1426,7 @@ impl App {
         }
     }
 
-    fn change_ring_picker_value(&mut self, row: RingPickerRowId, delta: i32) {
+    fn change_ring_picker_value(&mut self, ctx: &egui::Context, row: RingPickerRowId, delta: i32) {
         let ai_mode = self.settings.ai_feature_mode;
         let Some(picker) = self.ring_picker.as_mut() else {
             return;
@@ -1397,6 +1480,10 @@ impl App {
                 picker.fit_mode = picker.fit_mode.effective_for_flow(picker.reading_flow);
                 mark_picker_dirty(picker, row);
             }
+            RingPickerRowId::ReadingDirection => {
+                picker.reading_direction = picker.reading_direction.next();
+                mark_picker_dirty(picker, row);
+            }
             RingPickerRowId::FitMode => {
                 picker.fit_mode = cycle_value(
                     FullscreenFitMode::selectable_for_flow(picker.reading_flow),
@@ -1441,6 +1528,167 @@ impl App {
                     cycle_value(MODES, picker.video_continuous_mode, delta);
                 mark_picker_dirty(picker, row);
             }
+        }
+        self.preview_ring_picker_row(ctx, row);
+    }
+
+    fn preview_ring_picker_row(&mut self, ctx: &egui::Context, row: RingPickerRowId) {
+        let Some(picker) = self.ring_picker.clone() else {
+            return;
+        };
+        match picker.context {
+            RingShortcutContext::Grid => self.preview_grid_picker_row(&picker, row),
+            RingShortcutContext::ImageFullscreen => {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.preview_image_picker_row(ctx, fs_idx, &picker, row);
+                }
+            }
+            RingShortcutContext::VideoFullscreen => {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.preview_video_picker_row(ctx, fs_idx, &picker, row);
+                }
+            }
+        }
+    }
+
+    fn preview_grid_picker_row(&mut self, picker: &RingPickerState, row: RingPickerRowId) {
+        match row {
+            RingPickerRowId::GridColumns if self.settings.grid_cols != picker.grid_cols => {
+                self.set_grid_view_mode(GridViewMode::Thumbnail);
+                self.settings.grid_cols = picker.grid_cols;
+                self.scroll_to_selected = true;
+                self.settings.save();
+            }
+            RingPickerRowId::GridSortOrder if self.settings.sort_order != picker.sort_order => {
+                self.settings.sort_order = picker.sort_order;
+                self.rebuild_visible_indices();
+                self.settings.save();
+            }
+            RingPickerRowId::GridThumbAspect
+                if self.settings.thumb_aspect_auto != picker.thumb_aspect_auto
+                    || self.settings.thumb_aspect != picker.thumb_aspect =>
+            {
+                self.apply_picker_thumb_aspect(picker.thumb_aspect_auto, picker.thumb_aspect);
+            }
+            RingPickerRowId::ItemRating => {
+                self.preview_picker_item_rating(picker, picker.item_rating);
+            }
+            RingPickerRowId::ContainerRating
+                if self.current_folder_rating() != picker.container_rating =>
+            {
+                self.preview_current_folder_rating(picker.container_rating);
+            }
+            _ => {}
+        }
+    }
+
+    fn preview_image_picker_row(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        picker: &RingPickerState,
+        row: RingPickerRowId,
+    ) {
+        let layout_supported = self.vertical_reading_supported_idx(fs_idx);
+        match row {
+            RingPickerRowId::SpreadMode
+                if layout_supported && self.spread_mode != picker.spread_mode =>
+            {
+                self.apply_fullscreen_spread_mode(ctx, fs_idx, picker.spread_mode);
+            }
+            RingPickerRowId::ReadingFlow
+                if layout_supported && self.reading_flow != picker.reading_flow =>
+            {
+                self.set_reading_flow_for_fullscreen(ctx, fs_idx, picker.reading_flow);
+            }
+            RingPickerRowId::ReadingDirection
+                if layout_supported && self.reading_direction != picker.reading_direction =>
+            {
+                self.set_reading_direction_for_fullscreen(ctx, fs_idx, picker.reading_direction);
+            }
+            RingPickerRowId::FitMode if layout_supported => {
+                let fit = picker.fit_mode.effective_for_flow(self.reading_flow);
+                if self
+                    .settings
+                    .fullscreen_fit_mode
+                    .effective_for_flow(self.reading_flow)
+                    != fit
+                {
+                    self.set_fullscreen_fit_mode_for_current(ctx, fs_idx, fit);
+                }
+            }
+            RingPickerRowId::ItemRating => {
+                self.preview_picker_item_rating(picker, picker.item_rating);
+            }
+            RingPickerRowId::ContainerRating
+                if self.current_folder_rating() != picker.container_rating =>
+            {
+                self.preview_current_folder_rating(picker.container_rating);
+            }
+            // PostFilter / UpscaleModel remain commit-only to avoid expensive redraws per repeat.
+            _ => {}
+        }
+    }
+
+    fn preview_video_picker_row(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        picker: &RingPickerState,
+        row: RingPickerRowId,
+    ) {
+        match row {
+            RingPickerRowId::VideoVolume
+                if (self.settings.video_volume - picker.video_volume).abs() > 1.0e-9 =>
+            {
+                #[cfg(windows)]
+                self.handle_native_video_set_volume_command(ctx, fs_idx, picker.video_volume, true);
+                #[cfg(not(windows))]
+                {
+                    self.settings.video_volume =
+                        crate::settings::clamp_video_volume(picker.video_volume);
+                    self.settings.save();
+                }
+            }
+            RingPickerRowId::VideoPlaybackSpeed
+                if (self.video_playback_speed - picker.video_playback_speed).abs() > 1.0e-9 =>
+            {
+                #[cfg(windows)]
+                self.handle_video_playback_speed_command(ctx, fs_idx, picker.video_playback_speed);
+                #[cfg(not(windows))]
+                {
+                    let speed =
+                        crate::video::clock::clamp_playback_speed(picker.video_playback_speed);
+                    self.video_playback_speed = speed;
+                    self.settings.video_playback_speed = speed;
+                    self.settings.save();
+                }
+            }
+            RingPickerRowId::VideoContinuousMode
+                if self.video_continuous_mode != picker.video_continuous_mode =>
+            {
+                self.set_video_continuous_mode_common(ctx, fs_idx, picker.video_continuous_mode);
+            }
+            _ => {}
+        }
+    }
+
+    fn preview_picker_item_rating(&mut self, picker: &RingPickerState, stars: u8) {
+        if picker.original.item_rating_records.is_empty() {
+            return;
+        }
+        let mut touched = Vec::with_capacity(picker.original.item_rating_records.len());
+        for &(idx, _) in &picker.original.item_rating_records {
+            self.set_rating(idx, stars);
+            touched.push(idx);
+        }
+        if self.global_search.active {
+            self.refresh_global_search_hit_stars(&touched);
+        }
+        if self.global_search.active && self.items_are_global_search_view {
+            self.rebuild_items_from_global_search();
+        } else {
+            self.rebuild_visible_indices();
         }
     }
 
@@ -1516,6 +1764,30 @@ impl App {
         let _ = ctx;
     }
 
+    fn sync_native_video_ring_guide_overlay(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            let context = self.current_ring_shortcut_context();
+            let overlay = (context == RingShortcutContext::VideoFullscreen)
+                .then(|| self.native_video_ring_guide_overlay(context))
+                .flatten();
+            self.set_native_video_ring_guide_overlay(overlay);
+            self.request_native_video_hud_repaint(ctx);
+        }
+        #[cfg(not(windows))]
+        let _ = ctx;
+    }
+
+    fn clear_native_video_ring_guide_overlay(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            self.set_native_video_ring_guide_overlay(None);
+            self.request_native_video_hud_repaint(ctx);
+        }
+        #[cfg(not(windows))]
+        let _ = ctx;
+    }
+
     #[cfg(windows)]
     fn native_video_picker_overlay(
         &self,
@@ -1566,6 +1838,67 @@ impl App {
         }
     }
 
+    #[cfg(windows)]
+    fn native_video_ring_guide_overlay(
+        &self,
+        context: RingShortcutContext,
+    ) -> Option<crate::video::native_presenter::NativeOverlayRingGuide> {
+        if context != RingShortcutContext::VideoFullscreen || self.ring_picker.is_some() {
+            return None;
+        }
+        let (selected, heading, detail) = if self.settings.ring_shortcuts.gamepad_ring_enabled
+            && self.gamepad_state.west_ring_active()
+        {
+            let selected = self.gamepad_state.west_ring_direction();
+            let (heading, detail) = ring_guide_heading_detail(
+                &self.settings.ring_shortcuts.profile(context).slots,
+                context,
+                selected,
+                "X",
+                "方向なしで離すとピッカー",
+            );
+            (selected, heading, detail)
+        } else if self.settings.ring_shortcuts.mouse_flick_enabled {
+            let flick = self.mouse_ring_flick.as_ref()?;
+            if flick.context != context || !flick.guide_visible() {
+                return None;
+            }
+            let selected = mouse_flick_direction(flick);
+            let (heading, detail) = ring_guide_heading_detail(
+                &self.settings.ring_shortcuts.profile(context).slots,
+                context,
+                selected,
+                "右ドラッグ",
+                "中央で離すと取消",
+            );
+            (selected, heading, detail)
+        } else {
+            return None;
+        };
+        Some(crate::video::native_presenter::NativeOverlayRingGuide {
+            heading,
+            detail,
+            selected_slot: selected.map(RingDirection::slot_index),
+            slots: RingDirection::all()
+                .iter()
+                .map(|&direction| {
+                    let action = self
+                        .settings
+                        .ring_shortcuts
+                        .profile(context)
+                        .slots
+                        .get(direction.slot_index())
+                        .cloned()
+                        .unwrap_or_default();
+                    crate::video::native_presenter::NativeOverlayRingGuideSlot {
+                        short_label: ring_direction_short_label(direction).to_string(),
+                        action_label: action.label_for_context(context).to_string(),
+                    }
+                })
+                .collect(),
+        })
+    }
+
     fn commit_ring_picker(&mut self, ctx: &egui::Context) {
         let Some(picker) = self.ring_picker.take() else {
             return;
@@ -1574,21 +1907,231 @@ impl App {
             self.clear_native_video_picker_overlay(ctx);
         }
         self.gamepad_state.cancel_west_ring();
+        self.commit_live_picker_undo(&picker);
         self.apply_ring_picker_state(ctx, picker);
         ctx.request_repaint();
     }
 
     fn cancel_ring_picker(&mut self, ctx: &egui::Context) {
-        let was_video_picker = self
-            .ring_picker
-            .as_ref()
-            .is_some_and(|picker| picker.context == RingShortcutContext::VideoFullscreen);
-        self.ring_picker = None;
+        let Some(picker) = self.ring_picker.take() else {
+            return;
+        };
+        let was_video_picker = picker.context == RingShortcutContext::VideoFullscreen;
+        self.restore_live_picker_original(ctx, &picker);
         if was_video_picker {
             self.clear_native_video_picker_overlay(ctx);
         }
         self.gamepad_state.cancel_west_ring();
         ctx.request_repaint();
+    }
+
+    fn commit_live_picker_undo(&mut self, picker: &RingPickerState) {
+        if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
+            let records: Vec<(usize, u8, u8)> = picker
+                .original
+                .item_rating_records
+                .iter()
+                .filter_map(|&(idx, before)| {
+                    (before != picker.item_rating).then_some((idx, before, picker.item_rating))
+                })
+                .collect();
+            if !records.is_empty() {
+                let summary = if records.len() > 1 {
+                    if picker.item_rating == 0 {
+                        format!("★解除を {} 件に適用", records.len())
+                    } else {
+                        format!("★{} を {} 件に付与", picker.item_rating, records.len())
+                    }
+                } else if picker.item_rating == 0 {
+                    "★解除".to_string()
+                } else {
+                    format!("★{}", picker.item_rating)
+                };
+                self.capture_rating_undo(records, summary);
+            }
+        }
+        if picker
+            .dirty_rows
+            .contains(&RingPickerRowId::ContainerRating)
+            && picker.original.container_rating != picker.container_rating
+        {
+            self.capture_container_rating_undo(
+                picker.original.container_rating,
+                picker.container_rating,
+            );
+        }
+    }
+
+    fn restore_live_picker_original(&mut self, ctx: &egui::Context, picker: &RingPickerState) {
+        match picker.context {
+            RingShortcutContext::Grid => self.restore_grid_picker_original(picker),
+            RingShortcutContext::ImageFullscreen => {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.restore_image_picker_original(ctx, fs_idx, picker);
+                }
+            }
+            RingShortcutContext::VideoFullscreen => {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.restore_video_picker_original(ctx, fs_idx, picker);
+                }
+            }
+        }
+    }
+
+    fn restore_grid_picker_original(&mut self, picker: &RingPickerState) {
+        let original = &picker.original;
+        if picker.dirty_rows.contains(&RingPickerRowId::GridColumns)
+            && self.settings.grid_cols != original.grid_cols
+        {
+            self.set_grid_view_mode(GridViewMode::Thumbnail);
+            self.settings.grid_cols = original.grid_cols;
+            self.scroll_to_selected = true;
+            self.settings.save();
+        }
+        if picker.dirty_rows.contains(&RingPickerRowId::GridSortOrder)
+            && self.settings.sort_order != original.sort_order
+        {
+            self.settings.sort_order = original.sort_order;
+            self.rebuild_visible_indices();
+            self.settings.save();
+        }
+        if picker
+            .dirty_rows
+            .contains(&RingPickerRowId::GridThumbAspect)
+            && (self.settings.thumb_aspect_auto != original.thumb_aspect_auto
+                || self.settings.thumb_aspect != original.thumb_aspect)
+        {
+            self.apply_picker_thumb_aspect(original.thumb_aspect_auto, original.thumb_aspect);
+        }
+        if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
+            self.restore_picker_item_ratings(&original.item_rating_records);
+        }
+        if picker
+            .dirty_rows
+            .contains(&RingPickerRowId::ContainerRating)
+            && self.current_folder_rating() != original.container_rating
+        {
+            self.preview_current_folder_rating(original.container_rating);
+        }
+    }
+
+    fn restore_image_picker_original(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        picker: &RingPickerState,
+    ) {
+        let original = &picker.original;
+        let layout_supported = self.vertical_reading_supported_idx(fs_idx);
+        if picker.dirty_rows.contains(&RingPickerRowId::SpreadMode)
+            && layout_supported
+            && self.spread_mode != original.spread_mode
+        {
+            self.apply_fullscreen_spread_mode(ctx, fs_idx, original.spread_mode);
+        }
+        if picker.dirty_rows.contains(&RingPickerRowId::ReadingFlow)
+            && layout_supported
+            && self.reading_flow != original.reading_flow
+        {
+            self.set_reading_flow_for_fullscreen(ctx, fs_idx, original.reading_flow);
+        }
+        if (picker
+            .dirty_rows
+            .contains(&RingPickerRowId::ReadingDirection)
+            || picker.dirty_rows.contains(&RingPickerRowId::SpreadMode))
+            && layout_supported
+            && self.reading_direction != original.reading_direction
+        {
+            self.set_reading_direction_for_fullscreen(ctx, fs_idx, original.reading_direction);
+        }
+        if (picker.dirty_rows.contains(&RingPickerRowId::FitMode)
+            || picker.dirty_rows.contains(&RingPickerRowId::ReadingFlow))
+            && layout_supported
+            && self
+                .settings
+                .fullscreen_fit_mode
+                .effective_for_flow(self.reading_flow)
+                != original.fit_mode.effective_for_flow(self.reading_flow)
+        {
+            self.set_fullscreen_fit_mode_for_current(
+                ctx,
+                fs_idx,
+                original.fit_mode.effective_for_flow(self.reading_flow),
+            );
+        }
+        if picker.dirty_rows.contains(&RingPickerRowId::ItemRating) {
+            self.restore_picker_item_ratings(&original.item_rating_records);
+        }
+        if picker
+            .dirty_rows
+            .contains(&RingPickerRowId::ContainerRating)
+            && self.current_folder_rating() != original.container_rating
+        {
+            self.preview_current_folder_rating(original.container_rating);
+        }
+    }
+
+    fn restore_video_picker_original(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        picker: &RingPickerState,
+    ) {
+        let original = &picker.original;
+        if picker.dirty_rows.contains(&RingPickerRowId::VideoVolume)
+            && (self.settings.video_volume - original.video_volume).abs() > 1.0e-9
+        {
+            #[cfg(windows)]
+            self.handle_native_video_set_volume_command(ctx, fs_idx, original.video_volume, true);
+            #[cfg(not(windows))]
+            {
+                self.settings.video_volume =
+                    crate::settings::clamp_video_volume(original.video_volume);
+                self.settings.save();
+            }
+        }
+        if picker
+            .dirty_rows
+            .contains(&RingPickerRowId::VideoPlaybackSpeed)
+            && (self.video_playback_speed - original.video_playback_speed).abs() > 1.0e-9
+        {
+            #[cfg(windows)]
+            self.handle_video_playback_speed_command(ctx, fs_idx, original.video_playback_speed);
+            #[cfg(not(windows))]
+            {
+                let speed =
+                    crate::video::clock::clamp_playback_speed(original.video_playback_speed);
+                self.video_playback_speed = speed;
+                self.settings.video_playback_speed = speed;
+                self.settings.save();
+            }
+        }
+        if picker
+            .dirty_rows
+            .contains(&RingPickerRowId::VideoContinuousMode)
+            && self.video_continuous_mode != original.video_continuous_mode
+        {
+            self.set_video_continuous_mode_common(ctx, fs_idx, original.video_continuous_mode);
+        }
+    }
+
+    fn restore_picker_item_ratings(&mut self, records: &[(usize, u8)]) {
+        if records.is_empty() {
+            return;
+        }
+        let mut touched = Vec::with_capacity(records.len());
+        for &(idx, stars) in records {
+            self.set_rating(idx, stars);
+            touched.push(idx);
+        }
+        if self.global_search.active {
+            self.refresh_global_search_hit_stars(&touched);
+        }
+        if self.global_search.active && self.items_are_global_search_view {
+            self.rebuild_items_from_global_search();
+        } else {
+            self.rebuild_visible_indices();
+        }
     }
 
     fn apply_ring_picker_state(&mut self, ctx: &egui::Context, picker: RingPickerState) {
@@ -1693,6 +2236,13 @@ impl App {
                 && self.reading_flow != picker.reading_flow
             {
                 self.set_reading_flow_for_fullscreen(ctx, fs_idx, picker.reading_flow);
+            }
+            if picker
+                .dirty_rows
+                .contains(&RingPickerRowId::ReadingDirection)
+                && self.reading_direction != picker.reading_direction
+            {
+                self.set_reading_direction_for_fullscreen(ctx, fs_idx, picker.reading_direction);
             }
             let fit = picker.fit_mode.effective_for_flow(self.reading_flow);
             if picker.dirty_rows.contains(&RingPickerRowId::FitMode)
@@ -2985,6 +3535,27 @@ fn ring_direction_short_label(direction: RingDirection) -> &'static str {
     }
 }
 
+fn ring_guide_heading_detail(
+    slots: &[RingActionId],
+    context: RingShortcutContext,
+    selected: Option<RingDirection>,
+    fallback_heading: &str,
+    fallback_detail: &str,
+) -> (String, String) {
+    if let Some(direction) = selected {
+        let action = slots
+            .get(direction.slot_index())
+            .cloned()
+            .unwrap_or_default();
+        (
+            ring_direction_short_label(direction).to_string(),
+            action.label_for_context(context).to_string(),
+        )
+    } else {
+        (fallback_heading.to_string(), fallback_detail.to_string())
+    }
+}
+
 fn deadzone(value: f32) -> f32 {
     if value.abs() < DEADZONE { 0.0 } else { value }
 }
@@ -3280,7 +3851,11 @@ mod tests {
         assert_eq!(picker_rows_for_context(RingShortcutContext::Grid).len(), 5);
         assert_eq!(
             picker_rows_for_context(RingShortcutContext::ImageFullscreen).len(),
-            7
+            8
+        );
+        assert!(
+            picker_rows_for_context(RingShortcutContext::ImageFullscreen)
+                .contains(&crate::ring_shortcut::RingPickerRowId::ReadingDirection)
         );
         assert_eq!(
             picker_rows_for_context(RingShortcutContext::VideoFullscreen).len(),

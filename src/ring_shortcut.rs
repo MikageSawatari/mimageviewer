@@ -724,6 +724,7 @@ pub enum PickerCommand {
     SetContainerRating(u8),
     SetSpreadMode(crate::settings::SpreadMode),
     SetReadingFlow(crate::settings::ReadingFlow),
+    SetReadingDirection(crate::settings::ReadingDirection),
     SetFitMode(crate::settings::FullscreenFitMode),
     SetPostFilter(crate::adjustment::PostFilter),
     SetUpscaleModel(crate::ai::ModelKind),
@@ -741,6 +742,7 @@ pub enum RingPickerRowId {
     ContainerRating,
     SpreadMode,
     ReadingFlow,
+    ReadingDirection,
     FitMode,
     PostFilter,
     UpscaleModel,
@@ -759,6 +761,7 @@ impl RingPickerRowId {
             Self::ContainerRating => "コンテナ評価",
             Self::SpreadMode => "見開き",
             Self::ReadingFlow => "連結方式",
+            Self::ReadingDirection => "読み方向",
             Self::FitMode => "フィット",
             Self::PostFilter => "ポストフィルタ",
             Self::UpscaleModel => "アップスケール",
@@ -770,8 +773,28 @@ impl RingPickerRowId {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct RingPickerOriginalState {
+    pub grid_cols: usize,
+    pub sort_order: crate::settings::SortOrder,
+    pub thumb_aspect_auto: bool,
+    pub thumb_aspect: crate::settings::ThumbAspect,
+    pub item_rating_records: Vec<(usize, u8)>,
+    pub container_rating: u8,
+    pub spread_mode: crate::settings::SpreadMode,
+    pub reading_flow: crate::settings::ReadingFlow,
+    pub reading_direction: crate::settings::ReadingDirection,
+    pub fit_mode: crate::settings::FullscreenFitMode,
+    pub post_filter: crate::adjustment::PostFilter,
+    pub upscale_model_key: Option<String>,
+    pub video_volume: f64,
+    pub video_playback_speed: f64,
+    pub video_continuous_mode: crate::video::VideoContinuousMode,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct RingPickerState {
     pub context: RingShortcutContext,
+    pub original: RingPickerOriginalState,
     pub row: usize,
     pub dirty_rows: Vec<RingPickerRowId>,
     pub x_close_armed: bool,
@@ -784,6 +807,7 @@ pub struct RingPickerState {
     pub container_rating: u8,
     pub spread_mode: crate::settings::SpreadMode,
     pub reading_flow: crate::settings::ReadingFlow,
+    pub reading_direction: crate::settings::ReadingDirection,
     pub fit_mode: crate::settings::FullscreenFitMode,
     pub post_filter: crate::adjustment::PostFilter,
     pub upscale_model_key: Option<String>,

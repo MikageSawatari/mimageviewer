@@ -2124,6 +2124,15 @@ impl App {
                 if mouse.x < 340 {
                     self.sync_native_video_timeline_markers(fs_idx);
                 }
+                if self.mouse_ring_flick.is_some() {
+                    let _ = self.update_native_mouse_ring_flick(
+                        ctx,
+                        crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+                        egui::pos2(mouse.x as f32, mouse.y as f32),
+                        true,
+                        false,
+                    );
+                }
                 // navigation preview の HUD 全画面化で OS が届ける zero-delta (位置不変) move では
                 // hud activity を入れない。`mark_native_video_hud_activity` は overlay の位置ゲートを
                 // バイパスして `player.mark_cursor_activity()` で auto-hide 済みカーソルを復活させて
@@ -2169,6 +2178,9 @@ impl App {
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseLeave => {
                 self.native_video_pointer_down = None;
+                self.cancel_mouse_ring_flick();
+                self.set_native_video_ring_guide_overlay(None);
+                self.request_native_video_hud_repaint(ctx);
             }
             // 内部処理イベント (presenter thread が直接消費する)。UI には届かない想定。
             crate::video::native_window::NativeVideoWindowEvent::GeometryChanged {
@@ -5388,6 +5400,19 @@ impl App {
         }
     }
 
+    #[cfg(windows)]
+    pub(crate) fn set_native_video_ring_guide_overlay(
+        &self,
+        overlay: Option<crate::video::native_presenter::NativeOverlayRingGuide>,
+    ) {
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_ring_guide_overlay(overlay);
+        }
+    }
+
     /// ←→ ホットキーの相対シーク。先頭 / 末尾に達してシークが発行されなかった
     /// 場合 (= `seek_relative` が `AtStart` / `AtEnd` を返した場合) は、
     /// overlay トーストで「動画先頭です」「動画末尾です」と通知する。
@@ -6040,7 +6065,31 @@ impl App {
         use crate::video::native_window::NativeVideoMouseButton;
 
         self.mark_native_video_hud_activity(ctx);
-        if event.button == NativeVideoMouseButton::Right && !event.down && !event.double_click {
+        if event.button == NativeVideoMouseButton::Right && !event.double_click {
+            let pos = egui::pos2(event.x as f32, event.y as f32);
+            if event.down {
+                if self.settings.ring_shortcuts.mouse_flick_enabled {
+                    self.start_mouse_ring_flick(
+                        ctx,
+                        crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+                        pos,
+                        None,
+                    );
+                }
+                return;
+            }
+            if self.mouse_ring_flick.is_some() {
+                let outcome = self.update_native_mouse_ring_flick(
+                    ctx,
+                    crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+                    pos,
+                    false,
+                    true,
+                );
+                if matches!(outcome, crate::ring_shortcut::MouseFlickOutcome::Fired) {
+                    return;
+                }
+            }
             self.close_fullscreen();
             return;
         }

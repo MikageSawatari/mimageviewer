@@ -395,6 +395,10 @@ struct NativeEguiOverlay {
     /// HUD HWND の region に含めないと SetWindowRgn で中央パネルがクリップされる。
     /// `None` ならピッカー非表示または未描画。
     last_drawn_ring_picker_rect: Option<egui::Rect>,
+    /// 直近 egui run で描画したリングガイド overlay の actual rect。
+    /// X+方向リング / 右ドラッグフリックのガイドは App 側が入力を処理し、native overlay は
+    /// 表示専用。HUD HWND の region に含めるために実描画 rect を記録する。
+    last_drawn_ring_guide_rect: Option<egui::Rect>,
     hover_thumbnail: Option<NativeOverlayThumbnail>,
     hover_texture: Option<egui::TextureHandle>,
     hover_texture_key: Option<(u32, u32, u64)>,
@@ -413,6 +417,7 @@ struct NativeEguiOverlay {
     navigation_preview_texture: Option<(u64, egui::TextureHandle)>,
     tile_overlay: Option<NativeOverlayTileOverlay>,
     ring_picker_overlay: Option<NativeOverlayRingPicker>,
+    ring_guide_overlay: Option<NativeOverlayRingGuide>,
     tile_textures: HashMap<usize, (u64, egui::TextureHandle)>,
     jump_textures: HashMap<usize, (u64, egui::TextureHandle)>,
     top_bar_visible: bool,
@@ -826,6 +831,20 @@ pub struct NativeOverlayRingPickerDrill {
     pub item_line: String,
     pub selected_line: String,
     pub footer: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeOverlayRingGuide {
+    pub heading: String,
+    pub detail: String,
+    pub selected_slot: Option<usize>,
+    pub slots: Vec<NativeOverlayRingGuideSlot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeOverlayRingGuideSlot {
+    pub short_label: String,
+    pub action_label: String,
 }
 
 #[derive(Clone, Debug)]
@@ -2909,6 +2928,12 @@ impl NativeVideoPresenter {
         }
     }
 
+    pub fn set_overlay_ring_guide(&mut self, guide: Option<NativeOverlayRingGuide>) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_ring_guide_overlay(guide);
+        }
+    }
+
     pub fn set_overlay_navigation_preview(
         &mut self,
         preview: Option<NativeOverlayNavigationPreview>,
@@ -3710,6 +3735,7 @@ impl NativeEguiOverlay {
             last_drawn_bookmark_editor_rect: None,
             last_drawn_bulk_bookmark_dialog_rect: None,
             last_drawn_ring_picker_rect: None,
+            last_drawn_ring_guide_rect: None,
             hover_thumbnail: None,
             hover_texture: None,
             hover_texture_key: None,
@@ -3724,6 +3750,7 @@ impl NativeEguiOverlay {
             navigation_preview_texture: None,
             tile_overlay: None,
             ring_picker_overlay: None,
+            ring_guide_overlay: None,
             tile_textures: HashMap::new(),
             jump_textures: HashMap::new(),
             top_bar_visible: false,
@@ -4457,6 +4484,15 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
+    fn set_ring_guide_overlay(&mut self, guide: Option<NativeOverlayRingGuide>) {
+        if self.ring_guide_overlay == guide {
+            return;
+        }
+        self.ring_guide_overlay = guide;
+        self.last_drawn_ring_guide_rect = None;
+        self.dirty = true;
+    }
+
     fn set_navigation_preview(&mut self, preview: Option<NativeOverlayNavigationPreview>) {
         if self.navigation_preview.is_none() && preview.is_none() {
             return;
@@ -4936,6 +4972,22 @@ impl NativeEguiOverlay {
             }
         }
 
+        if self.ring_picker_overlay.is_none()
+            && let Some(guide) = self.ring_guide_overlay.as_ref()
+        {
+            let rect = self.last_drawn_ring_guide_rect.unwrap_or_else(|| {
+                self::overlay_draw::native_ring_guide_overlay_rect(
+                    width_points,
+                    height_points,
+                    guide,
+                )
+            });
+            let rect_px = rect_to_px(rect.expand(4.0));
+            if rect_px.left < rect_px.right && rect_px.top < rect_px.bottom {
+                regions.push(rect_px);
+            }
+        }
+
         // VST3 panel: ドラッグ可能化 (= 2026-05-12 A) に伴い、`last_drawn_vst3_panel_rect`
         // (実描画後の actual rect) を優先で region に使う。`None` の場合は `native_vst3_panel_rect`
         // (デフォルト位置) に fallback。これで panel がデフォルト位置にあってもドラッグ後でも
@@ -5380,6 +5432,7 @@ impl NativeEguiOverlay {
         let mut last_emitted_vst3_panel_pos = self.last_emitted_vst3_panel_pos;
         let tile_overlay = self.tile_overlay.clone();
         let ring_picker_overlay = self.ring_picker_overlay.clone();
+        let ring_guide_overlay = self.ring_guide_overlay.clone();
         let tile_texture_ids: HashMap<usize, egui::TextureId> = self
             .tile_textures
             .iter()
@@ -5410,6 +5463,7 @@ impl NativeEguiOverlay {
         let bookmark_title_edit_visible = bookmark_title_edit.is_some();
         let bulk_bookmark_dialog_visible = bulk_bookmark_dialog.is_some();
         let ring_picker_visible = ring_picker_overlay.is_some();
+        let ring_guide_visible = ring_guide_overlay.is_some() && !ring_picker_visible;
         let side_panel_visible = !tile_overlay_visible
             && !navigation_preview_visible
             && (jump_panel_visible || right_panel_visible);
@@ -5440,6 +5494,7 @@ impl NativeEguiOverlay {
             || bulk_bookmark_dialog_visible
             || vst3_panel_visible
             || ring_picker_visible
+            || ring_guide_visible
             || normalize_scanning;
         // カーソル auto-hide の判定用: チェックマークのような「受動表示」(ユーザーが
         // 操作する対象ではなく単なる状態インジケータ) は countdown をブロックしない。
@@ -5470,6 +5525,7 @@ impl NativeEguiOverlay {
             || bulk_bookmark_dialog_visible
             || vst3_panel_visible
             || ring_picker_visible
+            || ring_guide_visible
             || normalize_scanning
             || in_top_activation_zone
             || in_bottom_activation_zone;
@@ -5492,6 +5548,7 @@ impl NativeEguiOverlay {
         let mut last_drawn_bookmark_editor_rect: Option<egui::Rect> = None;
         let mut last_drawn_bulk_bookmark_dialog_rect: Option<egui::Rect> = None;
         let mut last_drawn_ring_picker_rect: Option<egui::Rect> = None;
+        let mut last_drawn_ring_guide_rect: Option<egui::Rect> = None;
         if !overlay_visible {
             self.set_visual_attached(false)?;
             last_seek_target_secs = None;
@@ -5563,6 +5620,13 @@ impl NativeEguiOverlay {
                         overlay_height_points,
                         picker,
                     );
+                } else if let Some(guide) = ring_guide_overlay.as_ref() {
+                    last_drawn_ring_guide_rect = draw_native_ring_guide_overlay(
+                        ctx,
+                        overlay_width_points,
+                        overlay_height_points,
+                        guide,
+                    );
                 }
                 return;
             }
@@ -5585,6 +5649,13 @@ impl NativeEguiOverlay {
                         overlay_width_points,
                         overlay_height_points,
                         picker,
+                    );
+                } else if let Some(guide) = ring_guide_overlay.as_ref() {
+                    last_drawn_ring_guide_rect = draw_native_ring_guide_overlay(
+                        ctx,
+                        overlay_width_points,
+                        overlay_height_points,
+                        guide,
                     );
                 }
                 return;
@@ -5662,6 +5733,13 @@ impl NativeEguiOverlay {
                     overlay_width_points,
                     overlay_height_points,
                     picker,
+                );
+            } else if let Some(guide) = ring_guide_overlay.as_ref() {
+                last_drawn_ring_guide_rect = draw_native_ring_guide_overlay(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    guide,
                 );
             }
             if right_panel_visible && let Some(metadata) = video_metadata.as_ref() {
@@ -7148,6 +7226,7 @@ impl NativeEguiOverlay {
         self.last_drawn_bookmark_editor_rect = last_drawn_bookmark_editor_rect;
         self.last_drawn_bulk_bookmark_dialog_rect = last_drawn_bulk_bookmark_dialog_rect;
         self.last_drawn_ring_picker_rect = last_drawn_ring_picker_rect;
+        self.last_drawn_ring_guide_rect = last_drawn_ring_guide_rect;
         self.video_speed_popup_open = video_speed_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.bookmark_title_edit = bookmark_title_edit;

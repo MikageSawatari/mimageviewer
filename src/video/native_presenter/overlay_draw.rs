@@ -7,10 +7,11 @@ use crate::ui_helpers::HoverTipExt;
 use super::{
     NativeBookmarkTitleEdit, NativeBulkBookmarkDialog, NativeFrameStepHold, NativeOverlayCommand,
     NativeOverlayJumpEntry, NativeOverlayMetadata, NativeOverlayNavigationPreview,
-    NativeOverlayPerfSample, NativeOverlayPerfSnapshot, NativeOverlayRingPicker,
-    NativeOverlayThumbnail, NativeOverlayTileOverlay, NativeOverlayTimelineMarker,
-    NativeOverlayTimelineMarkerKind, NativeOverlayToast, NativeOverlayVst3ChainSlot,
-    NativeOverlayVst3Panel, NativeOverlayVst3Slot, NativeOverlayVst3SlotState,
+    NativeOverlayPerfSample, NativeOverlayPerfSnapshot, NativeOverlayRingGuide,
+    NativeOverlayRingPicker, NativeOverlayThumbnail, NativeOverlayTileOverlay,
+    NativeOverlayTimelineMarker, NativeOverlayTimelineMarkerKind, NativeOverlayToast,
+    NativeOverlayVst3ChainSlot, NativeOverlayVst3Panel, NativeOverlayVst3Slot,
+    NativeOverlayVst3SlotState,
 };
 
 const NATIVE_PERF_GRAPH_SECS: f32 = 6.0;
@@ -1775,6 +1776,131 @@ pub(super) fn draw_native_toast(
             );
         });
     drawn_rect
+}
+
+pub(super) fn native_ring_guide_overlay_rect(
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    _guide: &NativeOverlayRingGuide,
+) -> egui::Rect {
+    let margin = 16.0;
+    let usable_w = (overlay_width_points - margin * 2.0).max(120.0);
+    let usable_h = (overlay_height_points - margin * 2.0).max(120.0);
+    let radius = (overlay_width_points.min(overlay_height_points) * 0.18).clamp(72.0, 132.0);
+    let size = ((radius + 56.0) * 2.0).min(usable_w).min(usable_h);
+    egui::Rect::from_center_size(
+        egui::pos2(overlay_width_points * 0.5, overlay_height_points * 0.5),
+        egui::vec2(size, size),
+    )
+}
+
+pub(super) fn draw_native_ring_guide_overlay(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    guide: &NativeOverlayRingGuide,
+) -> Option<egui::Rect> {
+    let outer_rect =
+        native_ring_guide_overlay_rect(overlay_width_points, overlay_height_points, guide);
+    let radius = ((outer_rect.width().min(outer_rect.height()) - 104.0) * 0.5).clamp(58.0, 132.0);
+    let area_response = egui::Area::new(egui::Id::new("native_video_ring_guide_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(outer_rect.min)
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.set_min_size(outer_rect.size());
+            let panel_rect = egui::Rect::from_min_size(ui.min_rect().min, outer_rect.size());
+            let center = panel_rect.center();
+            let painter = ui.painter();
+            painter.circle_filled(
+                center,
+                radius + 48.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 128),
+            );
+            painter.circle_stroke(
+                center,
+                radius + 48.0,
+                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(56)),
+            );
+
+            for (idx, unit) in native_ring_direction_units().iter().enumerate() {
+                let pos = center + *unit * radius;
+                let is_selected = guide.selected_slot == Some(idx);
+                let fill = if is_selected {
+                    egui::Color32::from_rgb(72, 126, 190)
+                } else {
+                    egui::Color32::from_black_alpha(170)
+                };
+                let stroke = if is_selected {
+                    egui::Stroke::new(2.0, egui::Color32::WHITE)
+                } else {
+                    egui::Stroke::new(1.0, egui::Color32::from_white_alpha(120))
+                };
+                let circle_r = if is_selected { 25.0 } else { 21.0 };
+                painter.circle_filled(pos, circle_r, fill);
+                painter.circle_stroke(pos, circle_r, stroke);
+                let label = guide
+                    .slots
+                    .get(idx)
+                    .map(|slot| slot.short_label.as_str())
+                    .unwrap_or("");
+                painter.text(
+                    pos,
+                    egui::Align2::CENTER_CENTER,
+                    truncate_overlay_text(label, 4),
+                    egui::FontId::proportional(if is_selected { 14.0 } else { 12.5 }),
+                    egui::Color32::WHITE,
+                );
+            }
+
+            let label_rect = egui::Rect::from_center_size(center, egui::vec2(230.0, 56.0));
+            painter.rect_filled(
+                label_rect,
+                8.0,
+                egui::Color32::from_black_alpha(if guide.selected_slot.is_some() {
+                    205
+                } else {
+                    175
+                }),
+            );
+            painter.rect_stroke(
+                label_rect,
+                8.0,
+                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(110)),
+                egui::StrokeKind::Outside,
+            );
+            painter.text(
+                center + egui::vec2(0.0, -11.0),
+                egui::Align2::CENTER_CENTER,
+                truncate_overlay_text(&guide.heading, 18),
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_white_alpha(220),
+            );
+            painter.text(
+                center + egui::vec2(0.0, 11.0),
+                egui::Align2::CENTER_CENTER,
+                truncate_overlay_text(&guide.detail, 24),
+                egui::FontId::proportional(16.0),
+                egui::Color32::WHITE,
+            );
+        });
+
+    Some(area_response.response.rect)
+}
+
+fn native_ring_direction_units() -> &'static [egui::Vec2; 8] {
+    const D: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    const UNITS: [egui::Vec2; 8] = [
+        egui::Vec2::new(0.0, -1.0),
+        egui::Vec2::new(D, -D),
+        egui::Vec2::new(1.0, 0.0),
+        egui::Vec2::new(D, D),
+        egui::Vec2::new(0.0, 1.0),
+        egui::Vec2::new(-D, D),
+        egui::Vec2::new(-1.0, 0.0),
+        egui::Vec2::new(-D, -D),
+    ];
+    &UNITS
 }
 
 pub(super) fn native_ring_picker_overlay_rect(
