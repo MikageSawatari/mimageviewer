@@ -3418,6 +3418,11 @@ impl App {
                 // ツールバー本体に toolbar スタイルを適用 (Yu Gothic の glyph 上寄り問題を
                 // FontTweak.y_offset で補正)。詳細: src/ui_fonts.rs の TOOLBAR_TEXT_FAMILY_NAME。
                 apply_toolbar_style(ui);
+                // `horizontal_wrapped` では既定の wrap mode が Button 内テキストにも伝播する。
+                // 右端の残り幅が小さいと「日付↑」などがボタン内部で縦に折れ、ツールバー
+                // 全体が不自然に膨らむ。ツールバー本体だけはボタン内を折らず、ボタン単位で
+                // 次行へ流す。
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
 
                 // ツールバー用ラベル: ComboBox / selectable_label と同じ高さで描画
                 // して縦位置を揃える。
@@ -3675,27 +3680,31 @@ impl App {
                             "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。",
                         );
                     }
-                    ui.add_enabled_ui(!sort_disabled, |ui| {
-                        match self.settings.toolbar_sort_display {
-                            crate::settings::ToolbarSectionDisplay::Buttons => {
-                                for &order in &tb_sorts {
-                                    let selected = if book_sort_locked {
-                                        order == crate::settings::SortOrder::Numeric
-                                    } else {
-                                        self.settings.sort_order == order
-                                    };
-                                    if ui
-                                        .selectable_label(selected, order.short_label())
-                                        .clicked()
-                                        && !selected
-                                    {
-                                        self.settings.sort_order = order;
-                                        self.settings.save();
-                                        toolbar_sort_changed = true;
-                                    }
+                    match self.settings.toolbar_sort_display {
+                        crate::settings::ToolbarSectionDisplay::Buttons => {
+                            // `add_enabled_ui` でボタン群全体を包むと、右端の残り幅だけを持つ
+                            // 子 UI 内で折り返されて縦に積まれる。各ボタンを親の
+                            // `horizontal_wrapped` に直接載せ、幅不足時はツールバー全体の
+                            // 次行へ自然に流す。
+                            for &order in &tb_sorts {
+                                let selected = if book_sort_locked {
+                                    order == crate::settings::SortOrder::Numeric
+                                } else {
+                                    self.settings.sort_order == order
+                                };
+                                let resp = ui.add_enabled(
+                                    !sort_disabled,
+                                    egui::Button::selectable(selected, order.short_label()),
+                                );
+                                if resp.clicked() && !selected {
+                                    self.settings.sort_order = order;
+                                    self.settings.save();
+                                    toolbar_sort_changed = true;
                                 }
                             }
-                            crate::settings::ToolbarSectionDisplay::Dropdown => {
+                        }
+                        crate::settings::ToolbarSectionDisplay::Dropdown => {
+                            ui.add_enabled_ui(!sort_disabled, |ui| {
                                 let current_text = if book_sort_locked {
                                     "番号固定".to_string()
                                 } else {
@@ -3722,9 +3731,9 @@ impl App {
                                     });
                                 toolbar_combo_popup_open |=
                                     egui::ComboBox::is_open(ctx, combo.response.id);
-                            }
+                            });
                         }
-                    });
+                    }
                     first_section = false;
                 }
                 if show_rating {
