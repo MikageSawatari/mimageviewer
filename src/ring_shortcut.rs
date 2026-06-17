@@ -1098,7 +1098,7 @@ impl MouseFlickState {
     }
 
     pub fn guide_visible(&self) -> bool {
-        self.armed || self.elapsed() >= mouse_flick_guide_delay()
+        self.armed || self.elapsed() >= mouse_flick_menu_delay()
     }
 }
 
@@ -1145,6 +1145,29 @@ mod tests {
             defaults.video.slots[RingDirection::DownRight.slot_index()],
             RingActionId::VideoBookmark
         );
+    }
+
+    #[test]
+    fn mouse_flick_static_guide_waits_until_long_press() {
+        let pos = egui::pos2(10.0, 20.0);
+        let flick = MouseFlickState::new(
+            RingShortcutContext::ImageFullscreen,
+            Instant::now() - mouse_flick_guide_delay() - Duration::from_millis(1),
+            pos,
+        );
+        assert!(!flick.guide_visible());
+
+        let flick = MouseFlickState::new(
+            RingShortcutContext::ImageFullscreen,
+            Instant::now() - mouse_flick_menu_delay() - Duration::from_millis(1),
+            pos,
+        );
+        assert!(flick.guide_visible());
+
+        let mut flick =
+            MouseFlickState::new(RingShortcutContext::ImageFullscreen, Instant::now(), pos);
+        flick.armed = true;
+        assert!(flick.guide_visible());
     }
 
     #[test]

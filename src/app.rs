@@ -2897,7 +2897,7 @@ pub struct App {
 
     // ── フルスクリーン右クリックコンテキストメニュー ─────────
     /// フルスクリーン右クリック判定用: 押下開始時刻と座標。
-    /// 移動なし release はコンテキストメニュー、移動ありはフリック / 取消へ分岐する。
+    /// 短い移動なし release は close、長押しはコンテキストメニュー / リングへ分岐する。
     pub(crate) fs_secondary_press_start: Option<(std::time::Instant, egui::Pos2)>,
     /// フルスクリーン用コンテキストメニューの対象アイテムインデックス
     pub(crate) fs_context_menu_idx: Option<usize>,
@@ -4735,8 +4735,8 @@ pub struct App {
     native_video_pointer_down: Option<NativeVideoPointerDown>,
     #[cfg(windows)]
     /// Native fullscreen presenter 上の右クリック候補。egui 側の pointer 状態とは
-    /// 別に release 時の移動量だけでコンテキストメニューを判定する。
-    native_video_secondary_press_start: Option<egui::Pos2>,
+    /// 別に release 時の押下時間と移動量で close / 長押しメニューを判定する。
+    native_video_secondary_press_start: Option<(std::time::Instant, egui::Pos2)>,
     #[cfg(windows)]
     /// App へ転送された直近の native 動画 `MouseMove` の client 座標。実機修正
     /// (2026-06-06): navigation preview の HUD 全画面化で OS が届ける zero-delta (位置不変)

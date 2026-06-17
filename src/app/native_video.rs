@@ -2168,6 +2168,7 @@ impl App {
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseLeave => {
                 self.native_video_pointer_down = None;
+                self.native_video_secondary_press_start = None;
                 self.cancel_mouse_ring_flick();
                 self.set_native_video_ring_guide_overlay(None);
                 self.request_native_video_hud_repaint(ctx);
@@ -6057,7 +6058,11 @@ impl App {
         self.mark_native_video_hud_activity(ctx);
         if event.button == NativeVideoMouseButton::Right && !event.double_click {
             let pos = egui::pos2(event.x as f32, event.y as f32);
+            if !event.down && self.fs_context_menu_idx.is_some() {
+                return;
+            }
             if event.down {
+                self.native_video_last_move_client = Some((event.x, event.y));
                 if self.settings.ring_shortcuts.mouse_flick_enabled {
                     self.start_mouse_ring_flick(
                         ctx,
@@ -6066,7 +6071,9 @@ impl App {
                         None,
                     );
                 } else {
-                    self.native_video_secondary_press_start = Some(pos);
+                    self.native_video_secondary_press_start =
+                        Some((std::time::Instant::now(), pos));
+                    ctx.request_repaint_after(std::time::Duration::from_millis(400));
                 }
                 return;
             }
@@ -6085,6 +6092,11 @@ impl App {
                 ) {
                     return;
                 }
+                if matches!(outcome, crate::ring_shortcut::MouseFlickOutcome::ShortTap) {
+                    self.handle_fullscreen_close_request();
+                    ctx.request_repaint();
+                    return;
+                }
                 if let crate::ring_shortcut::MouseFlickOutcome::LongPressMenu(menu_pos) = outcome {
                     self.fs_context_menu_idx = Some(fs_idx);
                     self.fs_context_menu_pos = menu_pos;
@@ -6092,15 +6104,20 @@ impl App {
                     return;
                 }
             }
-            if let Some(start_pos) = self.native_video_secondary_press_start.take() {
+            if let Some((start_time, start_pos)) = self.native_video_secondary_press_start.take() {
                 if pos.distance(start_pos) < 20.0 {
-                    self.fs_context_menu_idx = Some(fs_idx);
-                    self.fs_context_menu_pos = pos;
+                    if start_time.elapsed() >= std::time::Duration::from_millis(400) {
+                        self.fs_context_menu_idx = Some(fs_idx);
+                        self.fs_context_menu_pos = pos;
+                    } else {
+                        self.handle_fullscreen_close_request();
+                    }
                     ctx.request_repaint();
                 }
                 return;
             }
-            self.close_fullscreen();
+            self.handle_fullscreen_close_request();
+            ctx.request_repaint();
             return;
         }
         if !event.double_click && event.down {
@@ -6154,6 +6171,36 @@ impl App {
             return;
         }
         self.handle_native_video_toggle_play_command(ctx, fs_idx);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn maybe_open_native_video_secondary_long_press_menu(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) {
+        if self.settings.ring_shortcuts.mouse_flick_enabled || self.fs_context_menu_idx.is_some() {
+            return;
+        }
+        let Some((start_time, pos)) = self.native_video_secondary_press_start else {
+            return;
+        };
+        let current_pos = self
+            .native_video_last_move_client
+            .map(|(x, y)| egui::pos2(x as f32, y as f32))
+            .unwrap_or(pos);
+        if current_pos.distance(pos) >= 20.0 {
+            return;
+        }
+        let remaining = std::time::Duration::from_millis(400).saturating_sub(start_time.elapsed());
+        if remaining.is_zero() {
+            self.native_video_secondary_press_start = None;
+            self.fs_context_menu_idx = Some(fs_idx);
+            self.fs_context_menu_pos = pos;
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(remaining);
+        }
     }
 
     #[cfg(windows)]

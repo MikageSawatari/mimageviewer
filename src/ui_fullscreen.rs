@@ -4254,6 +4254,10 @@ impl App {
                         if bar_rotate_ccw { self.rotate_image_ccw(fs_idx); }
 
                         // ── フルスクリーン用コンテキストメニュー ──
+                        #[cfg(windows)]
+                        if state.is_video {
+                            self.maybe_open_native_video_secondary_long_press_menu(ctx, fs_idx);
+                        }
                         if self.show_fs_context_menu(ctx) {
                             close_fs = true;
                         }
@@ -6551,6 +6555,7 @@ impl App {
         prev_foreground_hwnd: usize,
     ) -> (i32, bool) {
         let mut nav_delta = 0i32;
+        let mut close = false;
 
         // レンダラが連続読みを描画しているか。クリックのページジャンプ抑制と、連続読み中の
         // デッドな pan-drag (fs_pan に書いても縦/横描画は fs_vertical_scroll しか見ないため
@@ -7136,8 +7141,7 @@ impl App {
                 }
                 match self.update_mouse_ring_flick(ctx, self.current_ring_shortcut_context()) {
                     crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
-                        self.fs_context_menu_idx = self.fullscreen_idx;
-                        self.fs_context_menu_pos = secondary_pos;
+                        close = true;
                     }
                     crate::ring_shortcut::MouseFlickOutcome::LongPressMenu(pos) => {
                         self.fs_context_menu_idx = self.fullscreen_idx;
@@ -7171,9 +7175,12 @@ impl App {
                     self.fs_secondary_press_start = None;
                 } else if secondary_released {
                     if moved < 20.0 {
-                        // 移動なしの右クリック → グリッドと同じくコンテキストメニュー。
-                        self.fs_context_menu_idx = self.fullscreen_idx;
-                        self.fs_context_menu_pos = current_pos;
+                        if elapsed >= std::time::Duration::from_millis(400) {
+                            self.fs_context_menu_idx = self.fullscreen_idx;
+                            self.fs_context_menu_pos = current_pos;
+                        } else {
+                            close = true;
+                        }
                     }
                     self.fs_secondary_press_start = None;
                 } else if moved >= 20.0 {
@@ -7183,7 +7190,7 @@ impl App {
             }
         }
 
-        (nav_delta, false)
+        (nav_delta, close)
     }
 
     // ── ナビゲーション & スライドショー ─────────────────────────────────

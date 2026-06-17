@@ -347,11 +347,12 @@ impl App {
         };
 
         if secondary_released {
-            let ring_visible = armed || elapsed >= mouse_flick_guide_delay();
+            let long_press = elapsed >= mouse_flick_menu_delay();
+            let ring_visible = armed || long_press;
             self.mouse_ring_flick = None;
-            self.mouse_ring_grid_target_idx = None;
             self.clear_native_video_ring_guide_overlay(ctx);
             if let Some(direction) = direction {
+                self.mouse_ring_grid_target_idx = None;
                 self.mouse_ring_suppress_context_menu_once = true;
                 if let Some(nav) =
                     self.trigger_ring_shortcut_action(ctx, context, direction, "mouse-flick")
@@ -364,13 +365,20 @@ impl App {
             if moved < MOUSE_FLICK_MOVE_THRESHOLD_PX {
                 self.mouse_ring_suppress_context_menu_once = true;
                 ctx.request_repaint();
-                return MouseFlickOutcome::LongPressMenu(pointer_pos);
+                return if long_press {
+                    self.mouse_ring_grid_target_idx = None;
+                    MouseFlickOutcome::Cancelled
+                } else {
+                    MouseFlickOutcome::ShortTap
+                };
             }
             if ring_visible {
+                self.mouse_ring_grid_target_idx = None;
                 self.mouse_ring_suppress_context_menu_once = true;
                 ctx.request_repaint();
                 return MouseFlickOutcome::Cancelled;
             }
+            self.mouse_ring_grid_target_idx = None;
             ctx.request_repaint();
             return MouseFlickOutcome::None;
         }
