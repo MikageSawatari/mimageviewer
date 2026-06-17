@@ -177,7 +177,17 @@ fn map_gilrs_event(event: EventType) -> Option<PadEvent> {
                 Button::RightTrigger2 => Some(PadAxis::RightTrigger),
                 _ => None,
             };
-            axis.map(|axis| PadEvent::AxisChanged(axis, value.clamp(0.0, 1.0)))
+            if let Some(axis) = axis {
+                Some(PadEvent::AxisChanged(axis, value.clamp(0.0, 1.0)))
+            } else {
+                map_button(button).map(|button| {
+                    if value >= 0.5 {
+                        PadEvent::ButtonPressed(button)
+                    } else {
+                        PadEvent::ButtonReleased(button)
+                    }
+                })
+            }
         }
         EventType::AxisChanged(axis, value, _) => {
             map_axis(axis).map(|axis| PadEvent::AxisChanged(axis, value.clamp(-1.0, 1.0)))
@@ -268,23 +278,27 @@ impl Default for GamepadInputState {
 }
 
 impl GamepadInputState {
-    pub fn set_button_down(&mut self, button: PadButton, down: bool, now: Instant) {
-        if down {
-            self.buttons.insert(button);
+    pub fn set_button_down(&mut self, button: PadButton, down: bool, now: Instant) -> bool {
+        let changed = if down {
+            self.buttons.insert(button)
+        } else {
+            self.buttons.remove(&button)
+        };
+        if down && changed {
             if button == PadButton::North {
                 self.y_modifier_used = false;
             }
             if button == PadButton::West {
                 self.reset_west_ring_state();
             }
-        } else {
-            self.buttons.remove(&button);
+        } else if !down {
             self.repeat_next.remove(&button);
         }
-        if down && is_repeatable_button(button) {
+        if down && changed && is_repeatable_button(button) {
             self.repeat_next
                 .insert(button, now + Duration::from_millis(300));
         }
+        changed
     }
 
     /// 保持中のボタン / 軸 / リピート / step タイマをすべてクリアする。
@@ -414,6 +428,7 @@ impl GamepadInputState {
         if self.button_down(PadButton::West) {
             self.west_ring_direction = None;
             self.west_tap_suppressed = true;
+            self.require_directional_neutral();
         }
     }
 
@@ -559,6 +574,22 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_west_press_does_not_reset_ring_direction() {
+        let mut state = GamepadInputState::default();
+        let now = Instant::now();
+        assert!(state.set_button_down(PadButton::West, true, now));
+        state.mark_west_ring_direction(RingDirection::DownLeft);
+
+        assert!(!state.set_button_down(PadButton::West, true, now));
+        state.set_button_down(PadButton::West, false, now);
+
+        assert_eq!(
+            state.finish_west_release(),
+            WestReleaseOutcome::Ring(RingDirection::DownLeft)
+        );
+    }
+
+    #[test]
     fn west_release_after_suppress_does_not_fire() {
         let mut state = GamepadInputState::default();
         let now = Instant::now();
@@ -567,6 +598,27 @@ mod tests {
         state.suppress_pending_actions();
         state.set_button_down(PadButton::West, false, now);
 
+        assert_eq!(state.finish_west_release(), WestReleaseOutcome::Suppressed);
+    }
+
+    #[test]
+    fn cancel_west_ring_requires_directional_neutral() {
+        let mut state = GamepadInputState::default();
+        let now = Instant::now();
+        state.set_button_down(PadButton::West, true, now);
+        state.set_button_down(PadButton::DPadRight, true, now);
+        state.mark_west_ring_direction(RingDirection::Right);
+
+        state.cancel_west_ring();
+
+        assert!(state.directional_neutral_required());
+        assert!(state.dpad_direction_down());
+        assert!(!state.due_button_repeat(
+            PadButton::DPadRight,
+            now + std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(95)
+        ));
+        state.set_button_down(PadButton::West, false, now);
         assert_eq!(state.finish_west_release(), WestReleaseOutcome::Suppressed);
     }
 

@@ -32,6 +32,8 @@ const RIGHT_STICK_ZOOM_MULTIPLIER: f32 = 2.0;
 const GAMEPAD_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 const X_PICKER_HINT_TOAST_SECS: f32 = 4.0;
 const GAMEPAD_LIST_VISIBLE_ROWS: usize = 12;
+const RING_STICK_COMMIT_THRESHOLD: f32 = 0.50;
+const RING_STICK_HYSTERESIS_DEGREES: f32 = 8.0;
 
 const GRID_PICKER_ROWS: &[RingPickerRowId] = &[
     RingPickerRowId::GridColumns,
@@ -891,19 +893,21 @@ impl App {
             match event {
                 PadEvent::ButtonPressed(button) => {
                     saw_input_event = true;
-                    self.gamepad_state.set_button_down(button, true, now);
-                    actions.push(PadAction {
-                        button,
-                        kind: PadActionKind::Press,
-                    });
+                    if self.gamepad_state.set_button_down(button, true, now) {
+                        actions.push(PadAction {
+                            button,
+                            kind: PadActionKind::Press,
+                        });
+                    }
                 }
                 PadEvent::ButtonReleased(button) => {
                     saw_input_event = true;
-                    self.gamepad_state.set_button_down(button, false, now);
-                    actions.push(PadAction {
-                        button,
-                        kind: PadActionKind::Release,
-                    });
+                    if self.gamepad_state.set_button_down(button, false, now) {
+                        actions.push(PadAction {
+                            button,
+                            kind: PadActionKind::Release,
+                        });
+                    }
                 }
                 PadEvent::AxisChanged(axis, value) => {
                     saw_input_event = true;
@@ -1075,7 +1079,9 @@ impl App {
                     return None;
                 }
                 if let Some(dir) = button_dir(action.button) {
-                    if self.handle_gamepad_folder_tree_direction(dir) {
+                    if self.fullscreen_idx.is_none()
+                        && self.handle_gamepad_folder_tree_direction(dir)
+                    {
                         return None;
                     }
                     self.handle_gamepad_direction(ctx, dir, action.kind == PadActionKind::Repeat);
@@ -1179,7 +1185,10 @@ impl App {
     fn current_ring_gamepad_direction(&self) -> Option<RingDirection> {
         ring_direction_from_dpad_buttons(&self.gamepad_state).or_else(|| {
             let stick = stick_pair(&self.gamepad_state, PadAxis::LeftX, PadAxis::LeftY);
-            ring_direction_from_stick(stick)
+            ring_direction_from_stick_with_hysteresis(
+                stick,
+                self.gamepad_state.west_ring_direction(),
+            )
         })
     }
 
@@ -4291,11 +4300,32 @@ fn dominant_stick_dir(stick: egui::Vec2) -> Option<PadDir> {
 }
 
 fn ring_direction_from_stick(stick: egui::Vec2) -> Option<RingDirection> {
-    if stick.length_sq() == 0.0 {
+    if stick.length_sq() < RING_STICK_COMMIT_THRESHOLD * RING_STICK_COMMIT_THRESHOLD {
         return None;
     }
     let degrees = stick.y.atan2(stick.x).to_degrees();
-    Some(if (-22.5..22.5).contains(&degrees) {
+    Some(ring_direction_from_angle_degrees(degrees))
+}
+
+fn ring_direction_from_stick_with_hysteresis(
+    stick: egui::Vec2,
+    previous: Option<RingDirection>,
+) -> Option<RingDirection> {
+    if stick.length_sq() < RING_STICK_COMMIT_THRESHOLD * RING_STICK_COMMIT_THRESHOLD {
+        return None;
+    }
+    let degrees = stick.y.atan2(stick.x).to_degrees();
+    if let Some(previous) = previous {
+        let sticky_width = 22.5 + RING_STICK_HYSTERESIS_DEGREES;
+        if angular_distance_deg(degrees, ring_direction_input_angle_deg(previous)) <= sticky_width {
+            return Some(previous);
+        }
+    }
+    Some(ring_direction_from_angle_degrees(degrees))
+}
+
+fn ring_direction_from_angle_degrees(degrees: f32) -> RingDirection {
+    if (-22.5..22.5).contains(&degrees) {
         RingDirection::Right
     } else if (22.5..67.5).contains(&degrees) {
         RingDirection::UpRight
@@ -4311,7 +4341,24 @@ fn ring_direction_from_stick(stick: egui::Vec2) -> Option<RingDirection> {
         RingDirection::Down
     } else {
         RingDirection::DownRight
-    })
+    }
+}
+
+fn ring_direction_input_angle_deg(direction: RingDirection) -> f32 {
+    match direction {
+        RingDirection::Right => 0.0,
+        RingDirection::UpRight => 45.0,
+        RingDirection::Up => 90.0,
+        RingDirection::UpLeft => 135.0,
+        RingDirection::Left => 180.0,
+        RingDirection::DownLeft => -135.0,
+        RingDirection::Down => -90.0,
+        RingDirection::DownRight => -45.0,
+    }
+}
+
+fn angular_distance_deg(a: f32, b: f32) -> f32 {
+    ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs()
 }
 
 fn mouse_flick_direction(flick: &MouseFlickState) -> Option<RingDirection> {
@@ -4603,6 +4650,7 @@ mod tests {
         cycle_video_playback_speed, gamepad_grid_nav_target_pos, mouse_flick_direction,
         picker_rows_for_context, post_filter_group_index, post_filter_item_index_in_group,
         rating_label, ring_direction_from_dpad_buttons, ring_direction_from_stick,
+        ring_direction_from_stick_with_hysteresis,
     };
     use crate::adjustment::PostFilter;
     use crate::gamepad::{GamepadInputState, PadButton};
@@ -4717,6 +4765,29 @@ mod tests {
             Some(RingDirection::Down)
         );
         assert_eq!(ring_direction_from_stick(egui::vec2(0.0, 0.0)), None);
+        assert_eq!(ring_direction_from_stick(egui::vec2(0.49, 0.0)), None);
+        assert_eq!(
+            ring_direction_from_stick(egui::vec2(0.50, 0.0)),
+            Some(RingDirection::Right)
+        );
+    }
+
+    #[test]
+    fn ring_stick_hysteresis_keeps_previous_sector_near_boundary() {
+        assert_eq!(
+            ring_direction_from_stick_with_hysteresis(
+                egui::vec2(25.0_f32.to_radians().cos(), 25.0_f32.to_radians().sin()),
+                Some(RingDirection::Right)
+            ),
+            Some(RingDirection::Right)
+        );
+        assert_eq!(
+            ring_direction_from_stick_with_hysteresis(
+                egui::vec2(32.0_f32.to_radians().cos(), 32.0_f32.to_radians().sin()),
+                Some(RingDirection::Right)
+            ),
+            Some(RingDirection::UpRight)
+        );
     }
 
     #[test]
