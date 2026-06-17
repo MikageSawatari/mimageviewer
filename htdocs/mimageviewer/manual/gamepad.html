@@ -52,12 +52,12 @@
 
   <main class="content">
     <h1 class="page-title">ゲームパッド操作</h1>
-    <p class="page-desc">画像・動画を閲覧するための固定ゲームパッド割り当てです。編集、削除、レーティング、チェック切り替え、エクスポートなどの操作はゲームパッドには割り当てていません。</p>
+    <p class="page-desc">画像・動画を閲覧するための固定ゲームパッド割り当てです。基本操作は固定で、<kbd>X</kbd> リングだけ環境設定から厳選アクションを差し替えられます。</p>
 
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
-        Xbox 系の <kbd>A</kbd>/<kbd>B</kbd>/<kbd>X</kbd>/<kbd>Y</kbd>、方向パッド、左右スティック、<kbd>LB</kbd>/<kbd>RB</kbd>、<kbd>LT</kbd>/<kbd>RT</kbd>、<kbd>Select</kbd>/<kbd>Start</kbd> を想定しています。ゲームパッド操作の割り当て変更 UI は現在ありません。
+        Xbox 系の <kbd>A</kbd>/<kbd>B</kbd>/<kbd>X</kbd>/<kbd>Y</kbd>、方向パッド、左右スティック、<kbd>LB</kbd>/<kbd>RB</kbd>、<kbd>LT</kbd>/<kbd>RT</kbd>、<kbd>Select</kbd>/<kbd>Start</kbd> を想定しています。削除や外部エクスポートなどの破壊的な操作はゲームパッドには割り当てていません。
       </div>
     </div>
 
@@ -71,8 +71,24 @@
           <tr><td><kbd>A</kbd></td><td>決定 / 開く / 次へ / 再生</td></tr>
           <tr><td><kbd>B</kbd></td><td>戻る / 閉じる</td></tr>
           <tr><td><kbd>LB</kbd> / <kbd>RB</kbd></td><td>前 / 次のフォルダへ移動。キーボードの <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>Ctrl</kbd>+<kbd>↓</kbd> と同じツリー順ナビゲーションです</td></tr>
+          <tr><td><kbd>X</kbd></td><td>方向と組み合わせるとリングショートカット、方向なしで離すとピッカーパネルを開きます</td></tr>
           <tr><td><kbd>Y</kbd></td><td>モードにより、単体操作または修飾ボタンとして使用します。<kbd>Y</kbd> を押しながら方向操作した場合、離したときの <kbd>Y</kbd> 単体操作は発火しません</td></tr>
           <tr><td><kbd>Start</kbd></td><td>お気に入りフォルダを登録順に移動。現在地がどのお気に入りにも含まれない場合は 1 つ目へ移動し、以後は押すたびに次のお気に入りへ進みます</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>リングショートカットとピッカー</h2>
+    <p><kbd>X</kbd> を押しながら方向パッドまたは左スティックで 8 方向を選び、<kbd>X</kbd> を離すと現在の画面に対応した一発アクションを実行します。グリッド、画像フルスクリーン、動画フルスクリーンで別々の割り当てを持ち、環境設定の「リングショートカット」で変更できます。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>入力</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>X</kbd>+方向</td><td>選んだ方向のリングスロットを実行。画像フルスクリーンでは、既定で右上スロットがメタデータパネル切り替えです</td></tr>
+          <tr><td><kbd>X</kbd> 単体</td><td>列数、ソート、レーティング、見開き、フィット、ポストフィルタ、動画音量などの多状態項目を選ぶピッカーパネルを開きます</td></tr>
+          <tr><td>ピッカー中の方向 / <kbd>A</kbd> / <kbd>B</kbd> / <kbd>X</kbd></td><td>上下で項目選択、左右で値変更または詳細候補へ移動。<kbd>A</kbd> または次の <kbd>X</kbd> で確定、<kbd>B</kbd> で取り消します</td></tr>
         </tbody>
       </table>
     </div>
@@ -104,7 +120,7 @@
           <tr><td>方向パッド</td><td>ページ送り。左右は現在の見開き方向に従い、キーボードの左右キーと同じ意味になります。縦読み中は上下で縦スクロールします</td></tr>
           <tr><td><kbd>A</kbd></td><td>次のページへ移動</td></tr>
           <tr><td><kbd>B</kbd></td><td>フルスクリーンを閉じる</td></tr>
-          <tr><td><kbd>X</kbd></td><td>メタデータパネルの表示を切り替え。見開き 2 ページ表示中は無効です</td></tr>
+          <tr><td><kbd>X</kbd></td><td>リングショートカット / ピッカーパネル。メタデータパネル切り替えは、既定で画像リングの右上スロットに入っています</td></tr>
           <tr><td><kbd>Select</kbd></td><td>見開きモードを順に切り替え。単ページ → 見開き 左→右 → 見開き 左→右（表紙あり） → 見開き 右→左 → 見開き 右→左（表紙あり）</td></tr>
           <tr><td><kbd>Y</kbd>+方向パッド左右</td><td>見開きを 1 ページずらす。キーボードの <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> と同じで、左右の意味は見開き方向に従います</td></tr>
           <tr><td>左スティック</td><td>拡大中の画像をパン</td></tr>

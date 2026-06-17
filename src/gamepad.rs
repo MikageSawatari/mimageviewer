@@ -5,6 +5,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::ring_shortcut::RingDirection;
+
 #[cfg(not(test))]
 use gilrs::{Axis, Button, EventType, Gilrs};
 
@@ -226,12 +228,21 @@ enum TriggerRange {
     MinusOneToOne,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WestReleaseOutcome {
+    Picker,
+    Ring(RingDirection),
+    Suppressed,
+}
+
 pub struct GamepadInputState {
     buttons: HashSet<PadButton>,
     axes: [f32; 6],
     trigger_ranges: [TriggerRange; 2],
     repeat_next: HashMap<PadButton, Instant>,
     y_modifier_used: bool,
+    west_ring_direction: Option<RingDirection>,
+    west_tap_suppressed: bool,
     analog_last_tick: Option<Instant>,
     left_stick_next_step: Option<Instant>,
     trigger_next_step: Option<Instant>,
@@ -245,6 +256,8 @@ impl Default for GamepadInputState {
             trigger_ranges: [TriggerRange::Unknown; 2],
             repeat_next: HashMap::new(),
             y_modifier_used: false,
+            west_ring_direction: None,
+            west_tap_suppressed: false,
             analog_last_tick: None,
             left_stick_next_step: None,
             trigger_next_step: None,
@@ -258,6 +271,9 @@ impl GamepadInputState {
             self.buttons.insert(button);
             if button == PadButton::North {
                 self.y_modifier_used = false;
+            }
+            if button == PadButton::West {
+                self.reset_west_ring_state();
             }
         } else {
             self.buttons.remove(&button);
@@ -277,6 +293,7 @@ impl GamepadInputState {
         self.axes = [0.0; 6];
         self.repeat_next.clear();
         self.y_modifier_used = false;
+        self.reset_west_ring_state();
         self.analog_last_tick = None;
         self.left_stick_next_step = None;
         self.trigger_next_step = None;
@@ -291,6 +308,10 @@ impl GamepadInputState {
         self.repeat_next.clear();
         if self.buttons.contains(&PadButton::North) {
             self.y_modifier_used = true;
+        }
+        if self.buttons.contains(&PadButton::West) {
+            self.west_tap_suppressed = true;
+            self.west_ring_direction = None;
         }
     }
 
@@ -368,6 +389,43 @@ impl GamepadInputState {
         self.y_modifier_used
     }
 
+    pub fn west_ring_active(&self) -> bool {
+        self.button_down(PadButton::West) && !self.west_tap_suppressed
+    }
+
+    pub fn west_ring_direction(&self) -> Option<RingDirection> {
+        if self.west_ring_active() {
+            self.west_ring_direction
+        } else {
+            None
+        }
+    }
+
+    pub fn mark_west_ring_direction(&mut self, direction: RingDirection) {
+        if self.west_ring_active() {
+            self.west_ring_direction = Some(direction);
+        }
+    }
+
+    pub fn cancel_west_ring(&mut self) {
+        if self.button_down(PadButton::West) {
+            self.west_ring_direction = None;
+            self.west_tap_suppressed = true;
+        }
+    }
+
+    pub fn finish_west_release(&mut self) -> WestReleaseOutcome {
+        let outcome = if self.west_tap_suppressed {
+            WestReleaseOutcome::Suppressed
+        } else if let Some(direction) = self.west_ring_direction {
+            WestReleaseOutcome::Ring(direction)
+        } else {
+            WestReleaseOutcome::Picker
+        };
+        self.reset_west_ring_state();
+        outcome
+    }
+
     pub fn analog_dt(&mut self, active: bool, now: Instant) -> f32 {
         if !active {
             self.analog_last_tick = None;
@@ -394,6 +452,11 @@ impl GamepadInputState {
         self.buttons
             .iter()
             .any(|&button| is_repeatable_button(button))
+    }
+
+    fn reset_west_ring_state(&mut self) {
+        self.west_ring_direction = None;
+        self.west_tap_suppressed = false;
     }
 }
 
@@ -429,5 +492,48 @@ fn step_due(
             *next_step = Some(now + interval);
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GamepadInputState, PadButton, WestReleaseOutcome};
+    use crate::ring_shortcut::RingDirection;
+    use std::time::Instant;
+
+    #[test]
+    fn west_release_without_direction_opens_picker() {
+        let mut state = GamepadInputState::default();
+        let now = Instant::now();
+        state.set_button_down(PadButton::West, true, now);
+        state.set_button_down(PadButton::West, false, now);
+
+        assert_eq!(state.finish_west_release(), WestReleaseOutcome::Picker);
+    }
+
+    #[test]
+    fn west_release_with_direction_fires_ring() {
+        let mut state = GamepadInputState::default();
+        let now = Instant::now();
+        state.set_button_down(PadButton::West, true, now);
+        state.mark_west_ring_direction(RingDirection::UpRight);
+        state.set_button_down(PadButton::West, false, now);
+
+        assert_eq!(
+            state.finish_west_release(),
+            WestReleaseOutcome::Ring(RingDirection::UpRight)
+        );
+    }
+
+    #[test]
+    fn west_release_after_suppress_does_not_fire() {
+        let mut state = GamepadInputState::default();
+        let now = Instant::now();
+        state.set_button_down(PadButton::West, true, now);
+        state.mark_west_ring_direction(RingDirection::Right);
+        state.suppress_pending_actions();
+        state.set_button_down(PadButton::West, false, now);
+
+        assert_eq!(state.finish_west_release(), WestReleaseOutcome::Suppressed);
     }
 }

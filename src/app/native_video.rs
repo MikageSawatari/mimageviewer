@@ -5370,6 +5370,19 @@ impl App {
         }
     }
 
+    #[cfg(windows)]
+    pub(crate) fn set_native_video_ring_picker_overlay(
+        &self,
+        overlay: Option<crate::video::native_presenter::NativeOverlayRingPicker>,
+    ) {
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_ring_picker_overlay(overlay);
+        }
+    }
+
     /// ←→ ホットキーの相対シーク。先頭 / 末尾に達してシークが発行されなかった
     /// 場合 (= `seek_relative` が `AtStart` / `AtEnd` を返した場合) は、
     /// overlay トーストで「動画先頭です」「動画末尾です」と通知する。

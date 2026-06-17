@@ -1613,6 +1613,11 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub use_native_shell_context_menu: bool,
 
+    /// マウス右フリック / ゲームパッド X リングの割り当て。
+    /// 入力処理とは独立した設定本体。未知 id や context 不一致は load sanitize で無効化する。
+    #[serde(default)]
+    pub ring_shortcuts: crate::ring_shortcut::RingShortcutSettings,
+
     // ── レーティングフィルタ ───────────────────────────────────
     /// レーティングフィルタ (index 0 = 未評価, 1〜5 = ★の数)。
     /// 選択された星数のアイテムのみ表示。全て true = フィルタなし。
@@ -2960,6 +2965,7 @@ impl Default for Settings {
             show_address_bar_history_menu: true,
             show_address_bar_folder_pin: true,
             use_native_shell_context_menu: true,
+            ring_shortcuts: crate::ring_shortcut::RingShortcutSettings::default(),
             rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),
             toolbar_cols_details_visible: true,
@@ -3951,6 +3957,7 @@ impl Settings {
         self.video_volume = clamp_video_volume(self.video_volume);
         self.video_playback_speed =
             crate::video::clock::clamp_playback_speed(self.video_playback_speed);
+        self.ring_shortcuts.sanitize();
         self.spread_page_gap_px = self.spread_page_gap_px.min(200);
         self.continuous_reading_gap_px = self.continuous_reading_gap_px.min(200);
         self.continuous_reading_wheel_scroll_percent =
@@ -4554,6 +4561,9 @@ mod tests {
             Some(PathBuf::from(r"D:\Images\Source")),
             Some(PathBuf::from(r"E:\Archive\Dest")),
         ];
+        original.ring_shortcuts.mouse_flick_enabled = true;
+        original.ring_shortcuts.gamepad_ring_enabled = false;
+        original.ring_shortcuts.grid.slots[0] = crate::ring_shortcut::RingActionId::GridHistoryBack;
         let json = serde_json::to_string(&original).unwrap();
         let loaded: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.grid_cols, original.grid_cols);
@@ -4573,6 +4583,7 @@ mod tests {
         assert_eq!(loaded.startup_folder_path, original.startup_folder_path);
         assert_eq!(loaded.recent_folders, original.recent_folders);
         assert_eq!(loaded.quick_folder_slots, original.quick_folder_slots);
+        assert_eq!(loaded.ring_shortcuts, original.ring_shortcuts);
     }
 
     #[test]
@@ -4618,6 +4629,12 @@ mod tests {
         assert_eq!(loaded.thumb_quality, 75);
         assert_eq!(loaded.video_volume, VIDEO_VOLUME_DEFAULT);
         assert_eq!(loaded.video_playback_speed, 1.0);
+        assert!(!loaded.ring_shortcuts.mouse_flick_enabled);
+        assert!(loaded.ring_shortcuts.gamepad_ring_enabled);
+        assert_eq!(
+            loaded.ring_shortcuts.grid.slots[crate::ring_shortcut::RingDirection::Up.slot_index()],
+            crate::ring_shortcut::RingActionId::AddToBook
+        );
         assert_eq!(loaded.fullscreen_fit_mode, FullscreenFitMode::Page);
         assert_eq!(loaded.fullscreen_jump_mode, FullscreenJumpMode::Percent);
         assert!(!loaded.fullscreen_keep_on_app_switch);
@@ -4648,6 +4665,44 @@ mod tests {
         assert_eq!(loaded.video_deinterlace, VideoDeinterlaceMode::Auto);
         assert!(!loaded.video_grid_open_starts_from_beginning);
         assert!(loaded.favorites.is_empty());
+    }
+
+    #[test]
+    fn ring_shortcuts_sanitize_unknown_and_context_mismatch() {
+        let json = r#"{
+            "ring_shortcuts": {
+                "mouse_flick_enabled": true,
+                "gamepad_ring_enabled": false,
+                "grid": { "slots": ["future_action", "video_capture"] },
+                "image": { "slots": ["video_capture"] },
+                "video": { "slots": ["image_capture"] }
+            }
+        }"#;
+        let mut loaded: Settings = serde_json::from_str(json).unwrap();
+        loaded.sanitize();
+
+        assert!(loaded.ring_shortcuts.mouse_flick_enabled);
+        assert!(!loaded.ring_shortcuts.gamepad_ring_enabled);
+        assert_eq!(
+            loaded.ring_shortcuts.grid.slots.len(),
+            crate::ring_shortcut::RING_SHORTCUT_SLOT_COUNT
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.grid.slots[0],
+            crate::ring_shortcut::RingActionId::None
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.grid.slots[1],
+            crate::ring_shortcut::RingActionId::None
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.image.slots[0],
+            crate::ring_shortcut::RingActionId::None
+        );
+        assert_eq!(
+            loaded.ring_shortcuts.video.slots[0],
+            crate::ring_shortcut::RingActionId::None
+        );
     }
 
     /// JSON 手編集等で `folder_skip_limit` が UI レンジ (1..=30) 外に
@@ -6045,6 +6100,11 @@ mod tests {
             s.toolbar_sort_display = ToolbarSectionDisplay::Dropdown;
             s.show_toolbar_bookshelf = false;
             s.show_toolbar_facet_filter = false;
+            s.ring_shortcuts.mouse_flick_enabled = true;
+            s.ring_shortcuts.gamepad_ring_enabled = false;
+            s.ring_shortcuts.x_picker_hint_shown = true;
+            s.ring_shortcuts.image.slots[crate::ring_shortcut::RingDirection::Right.slot_index()] =
+                crate::ring_shortcut::RingActionId::ImageCapture;
             s.save();
 
             reset_backup_state_for_test();
@@ -6215,6 +6275,24 @@ mod tests {
             assert!(
                 !loaded.show_toolbar_facet_filter,
                 "show_toolbar_facet_filter (false override) should survive roundtrip"
+            );
+            assert!(
+                loaded.ring_shortcuts.mouse_flick_enabled,
+                "ring shortcut mouse toggle should survive roundtrip"
+            );
+            assert!(
+                !loaded.ring_shortcuts.gamepad_ring_enabled,
+                "ring shortcut gamepad toggle should survive roundtrip"
+            );
+            assert!(
+                loaded.ring_shortcuts.x_picker_hint_shown,
+                "ring shortcut X picker hint flag should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.ring_shortcuts.image.slots
+                    [crate::ring_shortcut::RingDirection::Right.slot_index()],
+                crate::ring_shortcut::RingActionId::ImageCapture,
+                "ring shortcut slots should survive roundtrip"
             );
             assert_eq!(
                 loaded.thumb_aspect,

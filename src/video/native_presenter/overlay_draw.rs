@@ -7,10 +7,10 @@ use crate::ui_helpers::HoverTipExt;
 use super::{
     NativeBookmarkTitleEdit, NativeBulkBookmarkDialog, NativeFrameStepHold, NativeOverlayCommand,
     NativeOverlayJumpEntry, NativeOverlayMetadata, NativeOverlayNavigationPreview,
-    NativeOverlayPerfSample, NativeOverlayPerfSnapshot, NativeOverlayThumbnail,
-    NativeOverlayTileOverlay, NativeOverlayTimelineMarker, NativeOverlayTimelineMarkerKind,
-    NativeOverlayToast, NativeOverlayVst3ChainSlot, NativeOverlayVst3Panel, NativeOverlayVst3Slot,
-    NativeOverlayVst3SlotState,
+    NativeOverlayPerfSample, NativeOverlayPerfSnapshot, NativeOverlayRingPicker,
+    NativeOverlayThumbnail, NativeOverlayTileOverlay, NativeOverlayTimelineMarker,
+    NativeOverlayTimelineMarkerKind, NativeOverlayToast, NativeOverlayVst3ChainSlot,
+    NativeOverlayVst3Panel, NativeOverlayVst3Slot, NativeOverlayVst3SlotState,
 };
 
 const NATIVE_PERF_GRAPH_SECS: f32 = 6.0;
@@ -1775,6 +1775,135 @@ pub(super) fn draw_native_toast(
             );
         });
     drawn_rect
+}
+
+pub(super) fn native_ring_picker_overlay_rect(
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    picker: &NativeOverlayRingPicker,
+) -> egui::Rect {
+    let margin = 16.0;
+    let usable_w = (overlay_width_points - margin * 2.0).max(120.0);
+    let usable_h = (overlay_height_points - margin * 2.0).max(120.0);
+    let row_h = 32.0;
+    let desired_w = (overlay_width_points * 0.60).clamp(340.0, 560.0);
+    let panel_w = desired_w.min(usable_w);
+    let desired_h = if picker.drill.is_some() {
+        188.0
+    } else {
+        96.0 + row_h * picker.rows.len() as f32
+    };
+    let panel_h = desired_h.min(usable_h);
+    egui::Rect::from_center_size(
+        egui::pos2(overlay_width_points * 0.5, overlay_height_points * 0.5),
+        egui::vec2(panel_w, panel_h),
+    )
+}
+
+pub(super) fn draw_native_ring_picker_overlay(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    picker: &NativeOverlayRingPicker,
+) -> Option<egui::Rect> {
+    let panel_rect =
+        native_ring_picker_overlay_rect(overlay_width_points, overlay_height_points, picker);
+    let selected_row = picker.selected_row.min(picker.rows.len().saturating_sub(1));
+
+    let area_response = egui::Area::new(egui::Id::new("native_video_ring_picker_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(panel_rect.min)
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.set_min_size(panel_rect.size());
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 224))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90),
+                ))
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::same(14))
+                .show(ui, |ui| {
+                    let inner_w = (panel_rect.width() - 28.0).max(1.0);
+                    ui.set_width(inner_w);
+                    ui.label(
+                        egui::RichText::new(truncate_overlay_text(&picker.title, 36))
+                            .size(17.0)
+                            .color(egui::Color32::WHITE),
+                    );
+                    ui.add_space(6.0);
+                    if let Some(drill) = picker.drill.as_ref() {
+                        ui.label(
+                            egui::RichText::new(truncate_overlay_text(&drill.title, 36))
+                                .size(14.0)
+                                .color(egui::Color32::from_white_alpha(200)),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(truncate_overlay_text(&drill.group_line, 44))
+                                .size(16.0)
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.label(
+                            egui::RichText::new(truncate_overlay_text(&drill.item_line, 44))
+                                .size(17.0)
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(truncate_overlay_text(&drill.selected_line, 48))
+                                .size(13.0)
+                                .color(egui::Color32::from_white_alpha(210)),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(truncate_overlay_text(&drill.footer, 54))
+                                .size(12.0)
+                                .color(egui::Color32::from_white_alpha(190)),
+                        );
+                    } else {
+                        let row_h = 32.0;
+                        for (idx, row) in picker.rows.iter().enumerate() {
+                            let selected = idx == selected_row;
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), row_h),
+                                egui::Sense::hover(),
+                            );
+                            let fill = if selected {
+                                egui::Color32::from_rgb(56, 94, 138)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            ui.painter().rect_filled(rect, 5.0, fill);
+                            let label_pos = egui::pos2(rect.min.x + 10.0, rect.center().y);
+                            let value_pos = egui::pos2(rect.max.x - 10.0, rect.center().y);
+                            ui.painter().text(
+                                label_pos,
+                                egui::Align2::LEFT_CENTER,
+                                truncate_overlay_text(&row.label, 16),
+                                egui::FontId::proportional(14.5),
+                                egui::Color32::from_white_alpha(if selected { 245 } else { 205 }),
+                            );
+                            ui.painter().text(
+                                value_pos,
+                                egui::Align2::RIGHT_CENTER,
+                                truncate_overlay_text(&row.value, 32),
+                                egui::FontId::proportional(14.5),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(truncate_overlay_text(&picker.footer, 54))
+                                .size(12.0)
+                                .color(egui::Color32::from_white_alpha(190)),
+                        );
+                    }
+                });
+        });
+
+    Some(area_response.response.rect)
 }
 
 /// 音量ノーマライズ スキャン中の進捗パネル (中央表示)。

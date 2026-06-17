@@ -5893,6 +5893,23 @@ impl App {
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
         let response = ui.interact(cell_rect, ui.id().with(idx), egui::Sense::click_and_drag());
         let mut nav = None;
+        if !self.items_are_drive_list
+            && self.settings.ring_shortcuts.mouse_flick_enabled
+            && let Some(pos) = ctx.input(|i| {
+                i.pointer
+                    .secondary_pressed()
+                    .then(|| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
+                    .flatten()
+            })
+            && cell_rect.contains(pos)
+        {
+            self.start_mouse_ring_flick(
+                ctx,
+                crate::ring_shortcut::RingShortcutContext::Grid,
+                pos,
+                Some(idx),
+            );
+        }
         if response.clicked() || response.double_clicked() || response.secondary_clicked() {
             self.folder_pane.set_focus_grid();
         }
@@ -6092,7 +6109,10 @@ impl App {
             }
         }
         // 右クリック → コンテキストメニュー
-        if !self.items_are_drive_list && response.secondary_clicked() {
+        if !self.items_are_drive_list
+            && response.secondary_clicked()
+            && !self.mouse_ring_context_menu_suppressed(ctx)
+        {
             self.selected = Some(idx);
             self.update_last_selected_image();
             self.context_menu_idx = Some(idx);
@@ -6162,10 +6182,63 @@ impl App {
 
     /// 現在表示中の場所に対する空白右クリックメニューを開く。
     fn open_current_folder_context_menu(&mut self, ctx: &egui::Context) {
+        let pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+        self.open_current_folder_context_menu_at(ctx, pos);
+    }
+
+    fn open_current_folder_context_menu_at(&mut self, ctx: &egui::Context, pos: egui::Pos2) {
         if self.current_folder.is_some() {
             self.context_menu_idx = Some(usize::MAX);
-            self.context_menu_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+            self.context_menu_pos = pos;
             ctx.request_repaint();
+        }
+    }
+
+    fn start_grid_background_mouse_ring_flick_if_pressed(
+        &mut self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+    ) {
+        if !self.settings.ring_shortcuts.mouse_flick_enabled || self.items_are_drive_list {
+            return;
+        }
+        if self.mouse_ring_flick.is_some() {
+            return;
+        }
+        if let Some(pos) = ctx.input(|i| {
+            i.pointer
+                .secondary_pressed()
+                .then(|| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
+                .flatten()
+        }) && rect.contains(pos)
+        {
+            self.start_mouse_ring_flick(
+                ctx,
+                crate::ring_shortcut::RingShortcutContext::Grid,
+                pos,
+                None,
+            );
+        }
+    }
+
+    fn update_grid_mouse_ring_flick(&mut self, ctx: &egui::Context) {
+        match self.update_mouse_ring_flick(ctx, crate::ring_shortcut::RingShortcutContext::Grid) {
+            crate::ring_shortcut::MouseFlickOutcome::LongPressMenu(pos) => {
+                if let Some(idx) = self.mouse_ring_grid_target_idx.take()
+                    && idx < self.items.len()
+                    && !self.items_are_drive_list
+                {
+                    self.selected = Some(idx);
+                    self.update_last_selected_image();
+                    self.context_menu_idx = Some(idx);
+                    self.context_menu_pos = pos;
+                } else {
+                    self.open_current_folder_context_menu_at(ctx, pos);
+                }
+            }
+            crate::ring_shortcut::MouseFlickOutcome::ShortTap
+            | crate::ring_shortcut::MouseFlickOutcome::Fired
+            | crate::ring_shortcut::MouseFlickOutcome::None => {}
         }
     }
 
@@ -6301,11 +6374,18 @@ impl App {
                 egui_offset_y = scroll_output.state.offset.y;
             });
 
+        self.start_grid_background_mouse_ring_flick_if_pressed(ctx, body_inner_rect);
+        self.update_grid_mouse_ring_flick(ctx);
+
         let bg_right_clicked = ui.rect_contains_pointer(body_inner_rect)
             && ctx.input(|i| i.pointer.secondary_clicked());
-        if bg_right_clicked && self.context_menu_idx.is_none() {
+        if bg_right_clicked
+            && self.context_menu_idx.is_none()
+            && !self.mouse_ring_context_menu_suppressed(ctx)
+        {
             self.open_current_folder_context_menu(ctx);
         }
+        self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
 
         if (egui_offset_y - self.scroll_offset_y).abs() > Self::DETAILS_ROW_H * 0.5 {
             self.scroll_offset_y =
@@ -6313,6 +6393,9 @@ impl App {
         }
 
         let full_rect = ui.max_rect();
+        self.draw_mouse_ring_flick_overlay(ui, full_rect);
+        self.draw_gamepad_ring_overlay(ui, full_rect);
+        self.draw_gamepad_picker_overlay(ui, full_rect);
         self.draw_feedback_toast(ui, full_rect, ctx);
         self.render_details_thumbnail_tooltip(ctx, hovered_preview);
 
@@ -7038,13 +7121,20 @@ impl App {
                     };
                     ui.centered_and_justified(|ui| ui.label(msg));
                     // 空フォルダでも右クリックでフォルダ操作可能にする
+                    self.start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
+                    self.update_grid_mouse_ring_flick(ctx);
                     if ui.rect_contains_pointer(ui.max_rect())
                         && ctx.input(|i| i.pointer.secondary_clicked())
+                        && !self.mouse_ring_context_menu_suppressed(ctx)
                     {
                         self.open_current_folder_context_menu(ctx);
                     }
                     let full_rect = ui.max_rect();
+                    self.draw_mouse_ring_flick_overlay(ui, full_rect);
+                    self.draw_gamepad_ring_overlay(ui, full_rect);
+                    self.draw_gamepad_picker_overlay(ui, full_rect);
                     self.draw_feedback_toast(ui, full_rect, ctx);
+                    self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
                     return None;
                 }
 
@@ -7056,13 +7146,20 @@ impl App {
                             "検索結果なし"
                         });
                     });
+                    self.start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
+                    self.update_grid_mouse_ring_flick(ctx);
                     if ui.rect_contains_pointer(ui.max_rect())
                         && ctx.input(|i| i.pointer.secondary_clicked())
+                        && !self.mouse_ring_context_menu_suppressed(ctx)
                     {
                         self.open_current_folder_context_menu(ctx);
                     }
                     let full_rect = ui.max_rect();
+                    self.draw_mouse_ring_flick_overlay(ui, full_rect);
+                    self.draw_gamepad_ring_overlay(ui, full_rect);
+                    self.draw_gamepad_picker_overlay(ui, full_rect);
                     self.draw_feedback_toast(ui, full_rect, ctx);
+                    self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
                     return None;
                 }
 
@@ -7288,11 +7385,20 @@ impl App {
                 // 全体を背景として扱う。content Ui の `ui_contains_pointer()` だと、
                 // サムネイル総高さが viewport より低いときに最後の行より下の余白を
                 // 拾えないため、`scroll_output.inner_rect` を使う。
+                self.start_grid_background_mouse_ring_flick_if_pressed(
+                    ctx,
+                    scroll_output.inner_rect,
+                );
+                self.update_grid_mouse_ring_flick(ctx);
                 let bg_right_clicked = ui.rect_contains_pointer(scroll_output.inner_rect)
                     && ctx.input(|i| i.pointer.secondary_clicked());
-                if bg_right_clicked && self.context_menu_idx.is_none() {
+                if bg_right_clicked
+                    && self.context_menu_idx.is_none()
+                    && !self.mouse_ring_context_menu_suppressed(ctx)
+                {
                     self.open_current_folder_context_menu(ctx);
                 }
+                self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
 
                 // スクロールバードラッグによるオフセット変化を読み戻す。
                 // egui が内部で管理するオフセットと自前オフセットを同期させる。
@@ -7307,6 +7413,9 @@ impl App {
                 // show_feedback_toast でセットされたテキストをグリッド画面でも描画する。
                 // フルスクリーン側は render_fullscreen_viewport が別途呼ぶ。
                 let full_rect = ui.max_rect();
+                self.draw_mouse_ring_flick_overlay(ui, full_rect);
+                self.draw_gamepad_ring_overlay(ui, full_rect);
+                self.draw_gamepad_picker_overlay(ui, full_rect);
                 self.draw_feedback_toast(ui, full_rect, ctx);
 
                 nav

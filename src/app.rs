@@ -2497,6 +2497,7 @@ pub struct App {
     pub(crate) keymap: crate::keymap::Keymap,
     pub(crate) gamepad: crate::gamepad::GamepadRuntime,
     pub(crate) gamepad_state: crate::gamepad::GamepadInputState,
+    pub(crate) ring_picker: Option<crate::ring_shortcut::RingPickerState>,
     pub(crate) tx: mpsc::Sender<ThumbMsg>,
     pub(crate) rx: mpsc::Receiver<ThumbMsg>,
     /// フォルダ移動時に true にセットすると旧ロードタスクが中断する
@@ -2853,6 +2854,14 @@ pub struct App {
     pub(crate) context_menu_idx: Option<usize>,
     /// コンテキストメニューの表示座標 (右クリック時に記録)
     pub(crate) context_menu_pos: egui::Pos2,
+    /// マウス右ドラッグのリングフリック状態。グリッド / フルスクリーンで共通。
+    pub(crate) mouse_ring_flick: Option<crate::ring_shortcut::MouseFlickState>,
+    /// グリッドで右フリックを開始したセル。背景開始なら None。
+    pub(crate) mouse_ring_grid_target_idx: Option<usize>,
+    /// フリック成立 / 長押しメニュー後の release が従来右クリックメニューを再発火しないための抑止。
+    pub(crate) mouse_ring_suppress_context_menu_once: bool,
+    /// グリッドのリングアクションから発生したナビゲーションをフレーム後段に合流させる予約。
+    pub(crate) mouse_ring_nav: Option<crate::ui_main::AddressBarNav>,
 
     // ── フルスクリーン右クリックコンテキストメニュー ─────────
     /// 右クリック長押し検出用: 押下開始時刻と座標
@@ -5031,6 +5040,7 @@ impl App {
             keymap,
             gamepad: crate::gamepad::GamepadRuntime::new(),
             gamepad_state: crate::gamepad::GamepadInputState::default(),
+            ring_picker: None,
             tx,
             rx,
             cancel_token: Arc::new(AtomicBool::new(false)),
@@ -5141,6 +5151,10 @@ impl App {
             checked: std::collections::HashSet::new(),
             context_menu_idx: None,
             context_menu_pos: egui::Pos2::ZERO,
+            mouse_ring_flick: None,
+            mouse_ring_grid_target_idx: None,
+            mouse_ring_suppress_context_menu_once: false,
+            mouse_ring_nav: None,
             fs_secondary_press_start: None,
             fs_middle_zoom_drag: None,
             fs_context_menu_idx: None,
@@ -24449,6 +24463,9 @@ impl App {
         self.fs_last_main_focus_restore_at = None;
         self.fs_suppress_primary_until_release = false;
         self.fs_secondary_press_start = None;
+        self.mouse_ring_flick = None;
+        self.mouse_ring_grid_target_idx = None;
+        self.mouse_ring_suppress_context_menu_once = false;
         self.fs_middle_zoom_drag = None;
         self.fs_seek_drag_active = false;
         self.fs_seek_overlay_visible = false;
@@ -33083,12 +33100,21 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) {
+        let mode = self.video_continuous_mode.cycle();
+        self.set_video_continuous_mode_common(ctx, fs_idx, mode);
+    }
+
+    pub(crate) fn set_video_continuous_mode_common(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        mode: crate::video::VideoContinuousMode,
+    ) {
         if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
             return;
         }
-        self.video_continuous_mode = self.video_continuous_mode.cycle();
+        self.video_continuous_mode = mode;
         self.video_continuous_last_eof = None;
-        let mode = self.video_continuous_mode;
         if self.settings.video_continuous_mode != mode {
             self.settings.video_continuous_mode = mode;
             self.settings.save();
@@ -34863,7 +34889,11 @@ impl eframe::App for App {
         //                     > address_nav > open_folder_nav > context_nav
         //                     > folder_pane_open > grid_nav
         // folder_nav は fav/toolbar/keyboard/gamepad より後、address 以下より先。
-        let input_nav = fullscreen_close_nav.or(keyboard_nav).or(gamepad_nav);
+        let mouse_ring_nav = self.mouse_ring_nav.take();
+        let input_nav = fullscreen_close_nav
+            .or(keyboard_nav)
+            .or(gamepad_nav)
+            .or(mouse_ring_nav);
         let folder_nav_result = self.poll_folder_nav();
         let folder_nav_wins = folder_nav_result.is_some()
             && fav_nav.is_none()

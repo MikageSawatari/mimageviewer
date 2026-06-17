@@ -1,4 +1,7 @@
 use super::*;
+use crate::ring_shortcut::{
+    RingActionId, RingDirection, RingShortcutContext, RingShortcutSettings,
+};
 use crate::settings::{
     self, AiFeatureMode, CachePolicy, FullscreenFitMode, FullscreenJumpMode, Parallelism,
     ReadingDirection, ReadingFlow, SortOrder, SpreadMode, StartupFolderMode, ThumbAspect,
@@ -659,6 +662,132 @@ pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
             .size(11.0)
             .color(egui::Color32::from_gray(140)),
     );
+}
+
+pub(super) fn page_ring_shortcut(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let settings = &mut state.settings.ring_shortcuts;
+
+    ui.checkbox(
+        &mut settings.gamepad_ring_enabled,
+        "ゲームパッドの X リング/ピッカーを有効にする",
+    )
+    .on_hover_text("ON のとき、X 単体でピッカーパネル、X+方向でリングショートカットを使います。");
+    ui.checkbox(
+        &mut settings.mouse_flick_enabled,
+        "マウス右ドラッグでフリックを有効にする",
+    )
+    .on_hover_text("OFF のときも、右短タップの既存動作はそのまま使えます。");
+    ui.small("マウス右ドラッグは誤操作を避けるため既定 OFF、ゲームパッドは既定 ON です。");
+    ui.small("X 単体で開くピッカーパネルの項目は固定で、この画面では変更しません。");
+
+    ui.add_space(10.0);
+    for &context in RingShortcutContext::all() {
+        ring_shortcut_context_editor(ui, settings, context);
+    }
+}
+
+fn ring_shortcut_context_editor(
+    ui: &mut egui::Ui,
+    settings: &mut RingShortcutSettings,
+    context: RingShortcutContext,
+) {
+    ui.separator();
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(context.label()).strong());
+        if ui.button("既定に戻す").clicked() {
+            settings.reset_profile(context);
+        }
+    });
+
+    let available = RingActionId::available_for_context(context);
+    ui.horizontal_top(|ui| {
+        {
+            let profile = settings.profile_mut(context);
+            profile.sanitize(context);
+            egui::Grid::new(("ring_shortcut_slots", context))
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    for &direction in RingDirection::all() {
+                        let idx = direction.slot_index();
+                        ui.label(direction.label());
+                        let selected = profile.slots[idx].label_for_context(context);
+                        egui::ComboBox::from_id_salt(("ring_shortcut_slot", context, direction))
+                            .width(190.0)
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                for action in &available {
+                                    ui.selectable_value(
+                                        &mut profile.slots[idx],
+                                        action.clone(),
+                                        action.label_for_context(context),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+                    }
+                });
+        }
+
+        ui.add_space(16.0);
+        let preview_profile = settings.profile(context).clone();
+        ring_shortcut_preview(ui, &preview_profile, context);
+    });
+}
+
+fn ring_shortcut_preview(
+    ui: &mut egui::Ui,
+    profile: &crate::ring_shortcut::RingShortcutProfile,
+    context: RingShortcutContext,
+) {
+    ui.vertical(|ui| {
+        ui.label(egui::RichText::new("プレビュー").strong());
+        egui::Grid::new(("ring_shortcut_preview", context))
+            .num_columns(3)
+            .spacing([4.0, 4.0])
+            .show(ui, |ui| {
+                const CELLS: [Option<RingDirection>; 9] = [
+                    Some(RingDirection::UpLeft),
+                    Some(RingDirection::Up),
+                    Some(RingDirection::UpRight),
+                    Some(RingDirection::Left),
+                    None,
+                    Some(RingDirection::Right),
+                    Some(RingDirection::DownLeft),
+                    Some(RingDirection::Down),
+                    Some(RingDirection::DownRight),
+                ];
+
+                for (i, cell) in CELLS.iter().enumerate() {
+                    match cell {
+                        Some(direction) => {
+                            let idx = direction.slot_index();
+                            let action = profile
+                                .slots
+                                .get(idx)
+                                .unwrap_or(&RingActionId::None)
+                                .label_for_context(context);
+                            let text = format!("{}\n{}", direction.label(), action);
+                            ui.add_sized(
+                                [96.0, 42.0],
+                                egui::Label::new(egui::RichText::new(text).size(11.0)).wrap(),
+                            );
+                        }
+                        None => {
+                            ui.add_sized(
+                                [96.0, 42.0],
+                                egui::Label::new(egui::RichText::new("中央\n取消").size(11.0))
+                                    .wrap(),
+                            );
+                        }
+                    }
+                    if (i + 1) % 3 == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
+    });
 }
 
 pub(super) fn page_book(ui: &mut egui::Ui, state: &mut PreferencesState) {

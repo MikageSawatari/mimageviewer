@@ -1211,7 +1211,7 @@ impl App {
     /// 透過がある画像でのみ B キーの背景切替が意味を持つ (不透明画像は背景が画像の裏に
     /// 隠れて見た目が変わらない)。Static 以外 (アニメ / 動画 / 未ロード) は判定せず `true` を
     /// 返し、従来どおり切替を許可する (誤って無効化しないため)。
-    fn fs_image_has_alpha(&self, idx: usize) -> bool {
+    pub(crate) fn fs_image_has_alpha(&self, idx: usize) -> bool {
         match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { pixels, .. }) => pixels.pixels.iter().any(|p| p.a() < 255),
             _ => true,
@@ -4201,6 +4201,9 @@ impl App {
                         }
 
                         // ── 右上フィードバックトースト ──
+                        self.draw_mouse_ring_flick_overlay(ui, full_rect);
+                        self.draw_gamepad_ring_overlay(ui, full_rect);
+                        self.draw_gamepad_picker_overlay(ui, full_rect);
                         self.draw_feedback_toast(ui, full_rect, ctx);
 
                         // ── スタンプ埋め込み worker の進行表示 (中央「読み込み中」) ──
@@ -7019,6 +7022,7 @@ impl App {
             && !self.fit_popup_open
         {
             let secondary_down = ctx.input(|i| i.pointer.secondary_down());
+            let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
             let secondary_released = ctx.input(|i| i.pointer.secondary_released());
             let secondary_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
             let secondary_in_seek_panel =
@@ -7026,14 +7030,38 @@ impl App {
             // 旧 egui HUD は撤去済 (native presenter overlay が右クリックも独自処理)。
             // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
 
-            if secondary_in_seek_panel {
+            if self.settings.ring_shortcuts.mouse_flick_enabled {
+                if secondary_in_seek_panel {
+                    self.cancel_mouse_ring_flick();
+                } else if secondary_pressed {
+                    self.start_mouse_ring_flick(
+                        ctx,
+                        self.current_ring_shortcut_context(),
+                        secondary_pos,
+                        None,
+                    );
+                }
+                match self.update_mouse_ring_flick(ctx, self.current_ring_shortcut_context()) {
+                    crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
+                        close = true;
+                    }
+                    crate::ring_shortcut::MouseFlickOutcome::LongPressMenu(pos) => {
+                        self.fs_context_menu_idx = self.fullscreen_idx;
+                        self.fs_context_menu_pos = pos;
+                    }
+                    crate::ring_shortcut::MouseFlickOutcome::Fired
+                    | crate::ring_shortcut::MouseFlickOutcome::None => {}
+                }
+            } else if secondary_in_seek_panel {
                 self.fs_secondary_press_start = None;
             } else if secondary_down && self.fs_secondary_press_start.is_none() {
                 // 押下開始を記録
                 self.fs_secondary_press_start = Some((std::time::Instant::now(), secondary_pos));
             }
 
-            if let Some((start_time, start_pos)) = self.fs_secondary_press_start {
+            if !self.settings.ring_shortcuts.mouse_flick_enabled
+                && let Some((start_time, start_pos)) = self.fs_secondary_press_start
+            {
                 let elapsed = start_time.elapsed();
                 let current_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or(start_pos));
                 let moved = current_pos.distance(start_pos);
@@ -7596,6 +7624,7 @@ impl App {
                 ctx.request_repaint_after(remaining);
             }
         }
+        self.request_mouse_ring_flick_repaint(ctx);
 
         // アニメーション: 次フレームの時刻まで待ってから再描画
         if !is_video {
@@ -8083,7 +8112,7 @@ impl App {
             )
     }
 
-    fn set_fullscreen_fit_mode_for_current(
+    pub(crate) fn set_fullscreen_fit_mode_for_current(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
