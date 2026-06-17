@@ -128,6 +128,19 @@ pub(crate) enum ViewerPresentation {
     DetachedWindow,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DetachedViewerBorderlessTransition {
+    pub(crate) target_borderless: bool,
+    pub(crate) phase: DetachedViewerBorderlessTransitionPhase,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DetachedViewerBorderlessTransitionPhase {
+    PrimeBlackFrame,
+    ApplyWindowMode,
+    Settle { until: std::time::Instant },
+}
+
 pub(crate) const FONT_ATLAS_RESYNC_REASON_DETACHED_VIEWER_CLEANUP: &str = "detached_viewer_cleanup";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3543,6 +3556,9 @@ pub struct App {
     #[cfg(windows)]
     pub(crate) detached_viewer_restore_placement:
         Option<crate::settings::DetachedViewerWindowPlacement>,
+    /// F12 別ウィンドウの仮想フルスクリーン切替中に、直前フレームを黒で安定させる状態。
+    #[cfg(windows)]
+    pub(crate) detached_viewer_borderless_transition: Option<DetachedViewerBorderlessTransition>,
     /// F12 で動画を detached へ切り替えるとき、先に egui 側の detached viewer
     /// viewport を作り、その HWND が捕捉できてから native presenter を子 HWND へ
     /// 移行するための待機状態。
@@ -5512,6 +5528,8 @@ impl App {
             detached_viewer_borderless_fullscreen: false,
             #[cfg(windows)]
             detached_viewer_restore_placement: None,
+            #[cfg(windows)]
+            detached_viewer_borderless_transition: None,
             #[cfg(windows)]
             pending_detached_video_host_switch: None,
             #[cfg(windows)]
@@ -19548,6 +19566,7 @@ impl App {
     pub(crate) fn clear_detached_viewer_borderless_fullscreen_state(&mut self) {
         self.detached_viewer_borderless_fullscreen = false;
         self.detached_viewer_restore_placement = None;
+        self.detached_viewer_borderless_transition = None;
     }
 
     #[cfg(windows)]
@@ -19555,8 +19574,33 @@ impl App {
         if !self.viewer_session_is_detached() {
             return;
         }
+        if self.detached_viewer_borderless_transition.is_some() {
+            return;
+        }
+        let target_borderless = !self.detached_viewer_borderless_fullscreen;
+        if target_borderless {
+            self.detached_viewer_restore_placement = Some(self.detached_viewer_window_placement());
+        }
+        self.detached_viewer_borderless_transition = Some(DetachedViewerBorderlessTransition {
+            target_borderless,
+            phase: DetachedViewerBorderlessTransitionPhase::PrimeBlackFrame,
+        });
+        self.show_feedback_toast(if target_borderless {
+            "別ウィンドウを仮想フルスクリーンにしました".to_string()
+        } else {
+            "別ウィンドウを通常表示に戻しました".to_string()
+        });
+        ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    fn apply_detached_viewer_borderless_target(
+        &mut self,
+        ctx: &egui::Context,
+        target_borderless: bool,
+    ) {
         let viewport_id = self.fullscreen_viewport_id();
-        if self.detached_viewer_borderless_fullscreen {
+        if !target_borderless {
             let placement = self
                 .detached_viewer_restore_placement
                 .take()
@@ -19576,9 +19620,7 @@ impl App {
             if placement.maximized {
                 ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(true));
             }
-            self.show_feedback_toast("別ウィンドウを通常表示に戻しました".to_string());
         } else {
-            self.detached_viewer_restore_placement = Some(self.detached_viewer_window_placement());
             let rect = self.detached_viewer_borderless_target_rect();
             self.detached_viewer_borderless_fullscreen = true;
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(false));
@@ -19586,9 +19628,45 @@ impl App {
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::OuterPosition(rect.min));
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::InnerSize(rect.size()));
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
-            self.show_feedback_toast("別ウィンドウを仮想フルスクリーンにしました".to_string());
         }
         ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn step_detached_viewer_borderless_transition(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> bool {
+        let Some(mut transition) = self.detached_viewer_borderless_transition.take() else {
+            return false;
+        };
+        match transition.phase {
+            DetachedViewerBorderlessTransitionPhase::PrimeBlackFrame => {
+                transition.phase = DetachedViewerBorderlessTransitionPhase::ApplyWindowMode;
+                self.detached_viewer_borderless_transition = Some(transition);
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                true
+            }
+            DetachedViewerBorderlessTransitionPhase::ApplyWindowMode => {
+                self.apply_detached_viewer_borderless_target(ctx, transition.target_borderless);
+                transition.phase = DetachedViewerBorderlessTransitionPhase::Settle {
+                    until: std::time::Instant::now() + std::time::Duration::from_millis(96),
+                };
+                self.detached_viewer_borderless_transition = Some(transition);
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                true
+            }
+            DetachedViewerBorderlessTransitionPhase::Settle { until } => {
+                if std::time::Instant::now() < until {
+                    self.detached_viewer_borderless_transition = Some(transition);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                    true
+                } else {
+                    ctx.request_repaint();
+                    false
+                }
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -19656,7 +19734,9 @@ impl App {
         inner_rect: Option<egui::Rect>,
         maximized: bool,
     ) {
-        if self.detached_viewer_borderless_fullscreen {
+        if self.detached_viewer_borderless_fullscreen
+            || self.detached_viewer_borderless_transition.is_some()
+        {
             return;
         }
         if maximized {
@@ -19703,7 +19783,9 @@ impl App {
         h: u32,
         maximized: bool,
     ) {
-        if self.detached_viewer_borderless_fullscreen {
+        if self.detached_viewer_borderless_fullscreen
+            || self.detached_viewer_borderless_transition.is_some()
+        {
             return;
         }
         if maximized {

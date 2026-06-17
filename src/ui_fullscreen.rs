@@ -3366,6 +3366,11 @@ impl App {
                         let nav_locked = nav_delta != 0;
                         fs_input_ms = input_t0.elapsed().as_secs_f64() * 1000.0;
 
+                        #[cfg(windows)]
+                        if detached && self.step_detached_viewer_borderless_transition(ctx) {
+                            return;
+                        }
+
                         // ── 分析/補正モード: 見開き中は無効 ──
                         // 分析モードは画像エリアを左側に制限する（右パネルと重ならないよう）。
                         // 補正モードは左パネルを画像の上にオーバーレイする（画像位置は移動しない）。
