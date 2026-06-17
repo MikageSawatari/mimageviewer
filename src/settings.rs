@@ -4828,7 +4828,7 @@ mod tests {
         loaded.sanitize();
 
         assert!(loaded.ring_shortcuts.mouse_flick_enabled);
-        assert!(!loaded.ring_shortcuts.gamepad_ring_enabled);
+        assert!(loaded.ring_shortcuts.gamepad_ring_enabled);
         assert_eq!(
             loaded.ring_shortcuts.shift_wheel_pair,
             crate::ring_shortcut::WheelPairActionId::None
@@ -6468,8 +6468,8 @@ mod tests {
                 "ring shortcut mouse toggle should survive roundtrip"
             );
             assert!(
-                !loaded.ring_shortcuts.gamepad_ring_enabled,
-                "ring shortcut gamepad toggle should survive roundtrip"
+                loaded.ring_shortcuts.gamepad_ring_enabled,
+                "legacy false gamepad X ring toggle should be normalized"
             );
             assert_eq!(
                 loaded.ring_shortcuts.shift_wheel_pair,

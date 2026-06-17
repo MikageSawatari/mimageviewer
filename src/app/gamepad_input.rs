@@ -210,10 +210,7 @@ fn app_window_is_foreground() -> bool {
 
 impl App {
     pub(crate) fn draw_gamepad_ring_overlay(&self, ui: &mut egui::Ui, full_rect: egui::Rect) {
-        if !self.settings.ring_shortcuts.gamepad_ring_enabled
-            || self.ring_picker.is_some()
-            || !self.gamepad_state.west_ring_active()
-        {
+        if self.ring_picker.is_some() || !self.gamepad_state.west_ring_active() {
             return;
         }
         let context = self.current_ring_shortcut_context();
@@ -1050,14 +1047,10 @@ impl App {
         }
         match action.kind {
             PadActionKind::Release if action.button == PadButton::West => {
-                if self.settings.ring_shortcuts.gamepad_ring_enabled {
-                    if let Some(direction) = self.current_ring_gamepad_direction() {
-                        self.gamepad_state.mark_west_ring_direction(direction);
-                    }
-                    return self.finish_gamepad_west_release(ctx);
+                if let Some(direction) = self.current_ring_gamepad_direction() {
+                    self.gamepad_state.mark_west_ring_direction(direction);
                 }
-                self.gamepad_state.finish_west_release();
-                None
+                self.finish_gamepad_west_release(ctx)
             }
             PadActionKind::Release if action.button == PadButton::North => {
                 if !self.gamepad_state.y_modifier_used() {
@@ -1067,9 +1060,7 @@ impl App {
             }
             PadActionKind::Release => None,
             PadActionKind::Press | PadActionKind::Repeat => {
-                if self.settings.ring_shortcuts.gamepad_ring_enabled
-                    && self.gamepad_state.west_ring_active()
-                {
+                if self.gamepad_state.west_ring_active() {
                     if let Some(dir) = button_dir(action.button) {
                         let direction = self
                             .current_ring_gamepad_direction()
@@ -1151,9 +1142,7 @@ impl App {
         if self.consume_gamepad_directional_neutral_gate(now) {
             return false;
         }
-        if self.settings.ring_shortcuts.gamepad_ring_enabled
-            && self.gamepad_state.west_ring_active()
-        {
+        if self.gamepad_state.west_ring_active() {
             if let Some(direction) = self.current_ring_gamepad_direction() {
                 self.gamepad_state.mark_west_ring_direction(direction);
             }
@@ -2521,36 +2510,34 @@ impl App {
         if context != RingShortcutContext::VideoFullscreen || self.ring_picker.is_some() {
             return None;
         }
-        let (selected, heading, detail, center_client_px) =
-            if self.settings.ring_shortcuts.gamepad_ring_enabled
-                && self.gamepad_state.west_ring_active()
-            {
-                let selected = self.gamepad_state.west_ring_direction();
-                let (heading, detail) = ring_guide_heading_detail(
-                    &self.settings.ring_shortcuts.profile(context).slots,
-                    context,
-                    selected,
-                    "X",
-                    "方向なしで離すとピッカー",
-                );
-                (selected, heading, detail, None)
-            } else if self.settings.ring_shortcuts.mouse_flick_enabled {
-                let flick = self.mouse_ring_flick.as_ref()?;
-                if flick.context != context || !flick.guide_visible() {
-                    return None;
-                }
-                let selected = mouse_flick_direction(flick);
-                let (heading, detail) = ring_guide_heading_detail(
-                    &self.settings.ring_shortcuts.profile(context).slots,
-                    context,
-                    selected,
-                    "右ドラッグ",
-                    "中央で離すと取消",
-                );
-                (selected, heading, detail, Some(flick.start_pos))
-            } else {
+        let (selected, heading, detail, center_client_px) = if self.gamepad_state.west_ring_active()
+        {
+            let selected = self.gamepad_state.west_ring_direction();
+            let (heading, detail) = ring_guide_heading_detail(
+                &self.settings.ring_shortcuts.profile(context).slots,
+                context,
+                selected,
+                "X",
+                "方向なしで離すとピッカー",
+            );
+            (selected, heading, detail, None)
+        } else if self.settings.ring_shortcuts.mouse_flick_enabled {
+            let flick = self.mouse_ring_flick.as_ref()?;
+            if flick.context != context || !flick.guide_visible() {
                 return None;
-            };
+            }
+            let selected = mouse_flick_direction(flick);
+            let (heading, detail) = ring_guide_heading_detail(
+                &self.settings.ring_shortcuts.profile(context).slots,
+                context,
+                selected,
+                "右ドラッグ",
+                "中央で離すと取消",
+            );
+            (selected, heading, detail, Some(flick.start_pos))
+        } else {
+            return None;
+        };
         Some(crate::video::native_presenter::NativeOverlayRingGuide {
             heading,
             detail,

@@ -668,16 +668,11 @@ pub(super) fn page_ring_shortcut(ui: &mut egui::Ui, state: &mut PreferencesState
     let settings = &mut state.settings.ring_shortcuts;
 
     ui.checkbox(
-        &mut settings.gamepad_ring_enabled,
-        "ゲームパッドの X リング/ピッカーを有効にする",
-    )
-    .on_hover_text("ON のとき、X 単体でピッカーパネル、X+方向でリングショートカットを使います。");
-    ui.checkbox(
         &mut settings.mouse_flick_enabled,
         "マウス右ドラッグでフリックを有効にする",
     )
     .on_hover_text("OFF のときも、右短タップの既存動作はそのまま使えます。");
-    ui.small("マウス右ドラッグは誤操作を避けるため既定 OFF、ゲームパッドは既定 ON です。");
+    ui.small("ゲームパッド X は常にリング/ピッカーとして使えます。マウス右ドラッグは誤操作を避けるため既定 OFF です。");
     ui.small("X 単体で開くピッカーパネルの項目は固定で、この画面では変更しません。");
 
     ui.add_space(10.0);

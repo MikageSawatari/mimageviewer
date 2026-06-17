@@ -720,6 +720,8 @@ impl Default for RingShortcutProfile {
 pub struct RingShortcutSettings {
     #[serde(default)]
     pub mouse_flick_enabled: bool,
+    // Compatibility only: X ring/picker is always enabled. Old saved `false`
+    // values are normalized during Settings::load()/sanitize().
     #[serde(default = "default_true")]
     pub gamepad_ring_enabled: bool,
     // Compatibility only: Shift/Alt wheel customization is postponed.
@@ -802,6 +804,7 @@ impl RingShortcutSettings {
     }
 
     pub fn sanitize(&mut self) {
+        self.gamepad_ring_enabled = true;
         self.grid.sanitize(RingShortcutContext::Grid);
         self.image.sanitize(RingShortcutContext::ImageFullscreen);
         self.video.sanitize(RingShortcutContext::VideoFullscreen);

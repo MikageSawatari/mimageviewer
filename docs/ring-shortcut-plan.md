@@ -181,11 +181,11 @@
 
 - **場所**: 環境設定に新ページ `PreferencesPage::RingShortcut` (ラベル「リングショートカット」) を追加
   ([preferences.rs](../src/ui_dialogs/preferences.rs) の enum + ツリー + `page_*` パターンに沿う)。
-- **有効/無効トグルを 2 つ持つ (Codex P2-2 / P2-d)**: 「ゲームパッドの X リング/ピッカーを有効化」
-  = **既定 ON**、「マウス右ドラッグでフリックを有効化」= **既定 OFF** (マウスは上積み機能で、右ドラッグ
-  誤操作による状態変更を避けるため opt-in)。グリッドの移動なし右クリックメニューは
-  トグルに関係なく常に有効。フルスクリーンの右クリックメニューは短押し close と衝突するため、
-  右フリック OFF 時の長押しで表示する。
+- **有効/無効トグルはマウス右ドラッグのみ持つ**: 「マウス右ドラッグでフリックを有効化」=
+  **既定 OFF** (マウスは上積み機能で、右ドラッグ誤操作による状態変更を避けるため opt-in)。
+  ゲームパッド X リング/ピッカーは常時有効とし、方向ごとの無効化はスロット「なし」で行う。
+  グリッドの移動なし右クリックメニューはトグルに関係なく常に有効。フルスクリーンの
+  右クリックメニューは短押し close と衝突するため、右フリック OFF 時の長押しで表示する。
 - 個別スロットを「なし」にすればその方向だけ無効化できる (全スロット「なし」でそのリングは実質無効)。
 - **本体**: `グリッド / 画像フルスクリーン / 動画フルスクリーン` を見出し or タブで分け、各 8 スロットを
   **8 行リスト** (`方向ラベル ↑上 / ↗右上 / →右 … ＋ プルダウン`) で編集。右側に**リングプレビュー**
@@ -535,7 +535,7 @@ set・列数 set 等は既存 `KeyAction` を流用できる。
 | メタデータ表示 | リング 1 枠へ移設 + 初回トースト案内 (機能は残す) |
 | 新規: apply 層 | `RingActionId` / `PickerCommand` + App apply API (§7) |
 | 新規 UI | リング描画オーバーレイ / パッド専用ピッカーパネル (modal・編集セッション) |
-| `Settings` | `#[serde(default)] ring_shortcuts` 追加 = 8 スロット×3 context + トグル2 + 初回案内フラグ + shift/alt wheel pair + `mouse_buttons_*` profile + 旧 `mouse_back_forward_action` / `mouse_nav_prompt_done` (§8) |
+| `Settings` | `#[serde(default)] ring_shortcuts` 追加 = 8 スロット×3 context + マウス右ドラッグトグル + 初回案内フラグ + shift/alt wheel pair + `mouse_buttons_*` profile + 互換用 `gamepad_ring_enabled` / 旧 `mouse_back_forward_action` / `mouse_nav_prompt_done` (§8) |
 
 ## 10. ドキュメント / マニュアル更新 (確定後)
 
@@ -596,7 +596,7 @@ set・列数 set 等は既存 `KeyAction` を流用できる。
 (§4.1 / §4.2)、編集モード起動を Phase 1 から除外 (§7)、settings `serde(default)` + sanitize (§8)、
 ドキュメント対象拡張 (§10)、フェーズ再分割 + 入力退行チェックリスト (§11)。
 
-**マウス右ドラッグ フリック = 既定 OFF / パッドリング = 既定 ON で確定 (Codex P2-d)。**
+**マウス右ドラッグ フリック = 既定 OFF / パッドリング = 常時有効で確定 (Codex P2-d)。**
 
 **マウスボタン拡張は確定 (§5.2 / §5.3)**: 戻る/進む をカスタマイズ化 (既定 Alt+←/→ + アップ
 グレード移行ダイアログ)。Shift / Alt + ホイールのペアバインドは、グリッド / 画像フルスクリーン /
@@ -616,7 +616,7 @@ ImageFS/VideoFS でも `AddressBarNav::HistoryBack/Forward` へ流す方針に�
 未知値の serde 失敗を防ぐ (§8)、表記ゆれ掃除 (ImageFS/VideoFS 統一・履歴行・§7 候補に
 読み方向)。
 
-**Codex 第6回レビュー反映済み**: §8/§9 の保存対象を全列挙 (8 スロット×3 + トグル2 + 互換用 shift/alt wheel pair +
+**Codex 第6回レビュー反映済み**: §8/§9 の保存対象を全列挙 (8 スロット×3 + マウス右ドラッグトグル + 互換用 `gamepad_ring_enabled` / shift/alt wheel pair +
 `mouse_buttons_*` + 旧 `mouse_back_forward_action` / `mouse_nav_prompt_done`)、`WheelPairActionId` も `Unknown` 安全化を明記、
 読み方向 picker は実装側 (`ring_shortcut.rs`) 未追加なので §11 Phase 3 で追加と明記、残った略記
 (`FS / 動画`・`FS/video`) を掃除。
