@@ -3507,9 +3507,12 @@ pub struct App {
     // ── フルスクリーン表示モード ──────────────────────────────
     /// 表示モード DB (フォルダごとのページ構成 / 連結方式永続化)
     pub(crate) spread_db: Option<crate::spread_db::SpreadDb>,
-    /// 現在のフォルダのページ構成。見開きの「1 ページずらし」(Ctrl+←/→) も
-    /// cover/非cover の切替としてこの値に反映され、`spread_db` でフォルダ単位に永続化される。
+    /// 現在のフォルダの基本ページ構成。表紙あり/なし・LTR/RTL は `spread_db` で
+    /// フォルダ単位に永続化される。
     pub(crate) spread_mode: crate::settings::SpreadMode,
+    /// Ctrl+←/→ の「1 ページずらし」用セッション内アンカー。
+    /// 保存はせず、この idx から先だけ見開きの組み始めを一時的にずらす。
+    pub(crate) spread_shift_anchor_idx: Option<usize>,
     /// 現在の連結方式（ページ単位 / 縦連結 / 横連結）。
     pub(crate) reading_flow: crate::settings::ReadingFlow,
     /// 横連結時の読書方向。
@@ -5510,6 +5513,7 @@ impl App {
             last_book_resume: None,
             spread_db,
             spread_mode: crate::settings::SpreadMode::default(),
+            spread_shift_anchor_idx: None,
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             spread_popup_open: false,
@@ -7779,6 +7783,7 @@ impl App {
         } else {
             self.spread_mode = stored_spread;
         }
+        self.spread_shift_anchor_idx = None;
         if self.spread_mode.is_rtl() {
             self.reading_direction = crate::settings::ReadingDirection::Rtl;
         } else if matches!(

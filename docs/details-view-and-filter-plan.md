@@ -666,7 +666,7 @@ Excel 風チェックリストは、毎フレーム全件集計しない。ポ�
 
 | 列 | cost | ソート/フィルタ条件 | 備考 |
 | --- | --- | --- | --- |
-| 画像解像度 | LazyIo | Ready 後 | catalog/source_dims 優先 |
+| 画像解像度 | LazyIo | Ready 後 | catalog/source_dims 優先。ZIP 内画像は entry bytes のヘッダ probe にフォールバック |
 | 動画長さ | LazyIo | Ready 後 | FFmpeg probe |
 | 動画解像度 | LazyIo | Ready 後 | 動画長さと同じ probe で取得 |
 | 動画コーデック | LazyIo | Ready 後 | 文字列 facet |
@@ -781,8 +781,9 @@ ClaudeCode 案の Ph1〜Ph5 をベースに、遅延列の枠組みを早める�
 4. **Ph4 遅延列基盤**:
    `DetailsLazyMeta`、`DetailsMetaPending`、進捗 UI、遅延列表示、Ready まで sort/filter disabled。
    実装済み。初期実装では `作成日時`、`画像解像度` と動画メタ列を対象にする。
-   画像解像度は `fs_cache.source_dims`、catalog `source_dims`、通常画像ヘッダ probe の順で
-   非同期に埋める。作成日時は filesystem metadata、動画長さ/解像度/コーデックは FFmpeg probe を worker で実行する。
+   画像解像度は `fs_cache.source_dims`、catalog `source_dims`、通常画像ヘッダ probe、
+   ZIP 内画像の entry bytes ヘッダ probe の順で非同期に埋める。作成日時は filesystem metadata、
+   動画長さ/解像度/コーデックは FFmpeg probe を worker で実行する。
 5. **Ph5 遅延列の中身を順次追加**:
    作成日時、画像解像度、動画長さ/解像度/コーデックは実装済み。残りは
    EXIF → PDF ページ数 → アーカイブ内枚数の順で追加する。

@@ -348,6 +348,7 @@ pub(super) fn run_details_meta_load(
         let mut ai_metadata_checked = false;
         let mut ai_models = Vec::new();
         let mut ai_tool = None;
+        let mut zip_entry_bytes: Option<Vec<u8>> = None;
         let mut dims = if target.load_image_dims {
             target.warm_image_dims
         } else {
@@ -376,14 +377,15 @@ pub(super) fn run_details_meta_load(
                     zip_path,
                     entry_name,
                 } => {
-                    let bytes = {
+                    if zip_entry_bytes.is_none() {
                         let _permit = io_sem.acquire(target.priority);
-                        crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok()
-                    };
+                        zip_entry_bytes =
+                            crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok();
+                    }
                     if cancel.load(Ordering::Relaxed) {
                         return;
                     }
-                    bytes
+                    zip_entry_bytes
                         .as_ref()
                         .and_then(|bytes| crate::png_metadata::extract_metadata_from_bytes(bytes))
                 }
@@ -430,6 +432,25 @@ pub(super) fn run_details_meta_load(
             dims = probed.map(|[w, h]| (w as u32, h as u32));
         }
 
+        if target.load_image_dims
+            && dims.is_none()
+            && let GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } = &target.item
+        {
+            if zip_entry_bytes.is_none() {
+                let _permit = io_sem.acquire(target.priority);
+                zip_entry_bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok();
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            dims = zip_entry_bytes
+                .as_deref()
+                .and_then(probe_image_dims_from_bytes);
+        }
+
         if target.load_video_meta
             && let GridItem::Video(path) = &target.item
         {
@@ -440,7 +461,7 @@ pub(super) fn run_details_meta_load(
         }
 
         let image_dims_failed = matches!(
-            target.item,
+            &target.item,
             GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
         ) && target.load_image_dims
             && dims.is_none();
@@ -495,6 +516,18 @@ pub(super) fn run_details_meta_load(
         return;
     }
     let _ = tx.send(DetailsMetaEvent::Finished { generation, failed });
+}
+
+fn probe_image_dims_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let (mut w, mut h) = reader.into_dimensions().ok()?;
+    let orientation = crate::thumb_loader::read_exif_orientation_from_bytes(bytes);
+    if matches!(orientation, 5..=8) {
+        std::mem::swap(&mut w, &mut h);
+    }
+    Some((w, h))
 }
 
 pub(super) fn details_duration_to_secs(duration: i64) -> Option<f64> {
@@ -904,4 +937,28 @@ pub(super) fn exif_hay(info: &crate::exif_reader::ExifInfo, skip_user_comment: b
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_image_dims_from_bytes_reads_png_dimensions() {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::new(13, 7));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+
+        assert_eq!(
+            probe_image_dims_from_bytes(&cursor.into_inner()),
+            Some((13, 7))
+        );
+    }
+
+    #[test]
+    fn probe_image_dims_from_bytes_rejects_invalid_data() {
+        assert_eq!(probe_image_dims_from_bytes(b"not an image"), None);
+    }
 }

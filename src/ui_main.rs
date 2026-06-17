@@ -6357,6 +6357,8 @@ impl App {
                 );
                 self.draw_details_header(ui, header_rect);
 
+                let old_scroll_style = ui.spacing().scroll;
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                 let scroll_output = egui::ScrollArea::vertical()
                     .id_salt("details_list_vertical")
                     .auto_shrink([false, false])
@@ -6424,6 +6426,7 @@ impl App {
                             }
                         }
                     });
+                ui.spacing_mut().scroll = old_scroll_style;
                 body_inner_rect = scroll_output.inner_rect;
                 egui_offset_y = scroll_output.state.offset.y;
             });
@@ -7486,6 +7489,9 @@ impl App {
             return;
         }
         if self.settings.grid_view_mode == GridViewMode::Details {
+            return;
+        }
+        if self.items_are_drive_list {
             return;
         }
 

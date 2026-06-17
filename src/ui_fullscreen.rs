@@ -2213,13 +2213,27 @@ impl SpreadDisplayUnit {
 fn build_spread_display_units(
     nav: &[usize],
     spread_mode: SpreadMode,
+    shift_anchor_idx: Option<usize>,
     fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
     thumbnails: &[ThumbnailState],
 ) -> Vec<SpreadDisplayUnit> {
+    build_spread_display_units_with_landscape(nav, spread_mode, shift_anchor_idx, |idx| {
+        is_landscape(idx, fs_cache, thumbnails)
+    })
+}
+
+fn build_spread_display_units_with_landscape(
+    nav: &[usize],
+    spread_mode: SpreadMode,
+    shift_anchor_idx: Option<usize>,
+    mut is_landscape_idx: impl FnMut(usize) -> bool,
+) -> Vec<SpreadDisplayUnit> {
     let mut units = Vec::new();
     let mut pos = 0usize;
+    let shift_anchor_pos = shift_anchor_idx.and_then(|idx| nav.iter().position(|&n| n == idx));
+    let prefix_end = shift_anchor_pos.unwrap_or(nav.len());
 
-    if spread_mode.has_cover() && !nav.is_empty() {
+    if spread_mode.has_cover() && prefix_end > 0 {
         units.push(SpreadDisplayUnit {
             nav_start: 0,
             pages: vec![nav[0]],
@@ -2227,36 +2241,58 @@ fn build_spread_display_units(
         pos = 1;
     }
 
-    while pos < nav.len() {
-        let current = nav[pos];
-        if is_landscape(current, fs_cache, thumbnails) {
-            units.push(SpreadDisplayUnit {
-                nav_start: pos,
-                pages: vec![current],
-            });
-            pos += 1;
-            continue;
-        }
+    append_spread_display_units_until(nav, &mut units, &mut pos, prefix_end, &mut is_landscape_idx);
 
-        if let Some(&partner) = nav.get(pos + 1)
-            && !is_landscape(partner, fs_cache, thumbnails)
-        {
-            units.push(SpreadDisplayUnit {
-                nav_start: pos,
-                pages: vec![current, partner],
-            });
-            pos += 2;
-            continue;
-        }
-
-        units.push(SpreadDisplayUnit {
-            nav_start: pos,
-            pages: vec![current],
-        });
-        pos += 1;
+    if let Some(anchor_pos) = shift_anchor_pos {
+        pos = anchor_pos;
+        append_spread_display_units_until(
+            nav,
+            &mut units,
+            &mut pos,
+            nav.len(),
+            &mut is_landscape_idx,
+        );
     }
 
     units
+}
+
+fn append_spread_display_units_until(
+    nav: &[usize],
+    units: &mut Vec<SpreadDisplayUnit>,
+    pos: &mut usize,
+    end_pos: usize,
+    is_landscape_idx: &mut impl FnMut(usize) -> bool,
+) {
+    while *pos < end_pos {
+        let current = nav[*pos];
+        if is_landscape_idx(current) {
+            units.push(SpreadDisplayUnit {
+                nav_start: *pos,
+                pages: vec![current],
+            });
+            *pos += 1;
+            continue;
+        }
+
+        if *pos + 1 < end_pos {
+            let partner = nav[*pos + 1];
+            if !is_landscape_idx(partner) {
+                units.push(SpreadDisplayUnit {
+                    nav_start: *pos,
+                    pages: vec![current, partner],
+                });
+                *pos += 2;
+                continue;
+            }
+        }
+
+        units.push(SpreadDisplayUnit {
+            nav_start: *pos,
+            pages: vec![current],
+        });
+        *pos += 1;
+    }
 }
 
 fn find_spread_display_unit(
@@ -2267,6 +2303,24 @@ fn find_spread_display_unit(
         .iter()
         .enumerate()
         .find(|(_, unit)| unit.contains_idx(idx))
+}
+
+fn spread_offset_nudge_from_units(
+    nav: &[usize],
+    units: &[SpreadDisplayUnit],
+    fs_idx: usize,
+    dir: i32,
+) -> Option<(usize, usize)> {
+    let current_start = find_spread_display_unit(units, fs_idx)
+        .map(|(_, unit)| unit.nav_start)
+        .or_else(|| nav.iter().position(|&i| i == fs_idx))?;
+    let new_pos = current_start as i32 + dir;
+    if new_pos < 0 || new_pos as usize >= nav.len() {
+        return None;
+    }
+    let new_pos = new_pos as usize;
+    let new_idx = nav[new_pos];
+    Some((new_idx, new_idx))
 }
 
 // ── フルスクリーン状態の中間構造体 ──────────────────────────────────────
@@ -4402,6 +4456,7 @@ impl App {
                             if !spread_changed_from_direction {
                                 self.update_reading_direction_from_spread_mode(self.spread_mode);
                             }
+                            self.spread_shift_anchor_idx = None;
                             self.persist_current_spread_mode();
                             if !self.reading_flow.is_paged() {
                                 self.reset_continuous_reading_transform();
@@ -5142,8 +5197,13 @@ impl App {
         let Some(pos) = nav.iter().position(|&i| i == idx) else {
             return SpreadPair::Single;
         };
-        let units =
-            build_spread_display_units(&nav, self.spread_mode, &self.fs_cache, &self.thumbnails);
+        let units = build_spread_display_units(
+            &nav,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+            &self.fs_cache,
+            &self.thumbnails,
+        );
         find_spread_display_unit(&units, nav[pos])
             .map(|(_, unit)| unit.spread_pair(self.spread_mode))
             .unwrap_or(SpreadPair::Single)
@@ -5183,8 +5243,13 @@ impl App {
         let Some(pos) = nav.iter().position(|&i| i == fs_idx) else {
             return base_delta;
         };
-        let units =
-            build_spread_display_units(&nav, self.spread_mode, &self.fs_cache, &self.thumbnails);
+        let units = build_spread_display_units(
+            &nav,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+            &self.fs_cache,
+            &self.thumbnails,
+        );
         let Some((unit_pos, unit)) = find_spread_display_unit(&units, fs_idx) else {
             return base_delta;
         };
@@ -5202,38 +5267,25 @@ impl App {
         }
     }
 
-    /// Ctrl+←/→ の「見開き 1 ページずらし」。現在ページ (`fs_idx`) を読み順で `dir`
-    /// (+1=前方 / -1=後方) に 1 つ動かし、その新ページがペアの先頭になるよう
-    /// **見開きモード (cover/非cover)** を決めて返す。専用の位相ステータスを持たず
-    /// `spread_mode` を直接切り替えるので、ホバーバー/ポップアップ/数字キーと表示状態が
-    /// 一致し、`spread_db` でフォルダ単位に永続化される。
+    /// Ctrl+←/→ の「見開き 1 ページずらし」。現在の表示ユニット先頭を読み順で `dir`
+    /// (+1=前方 / -1=後方) に 1 つ動かし、その新ページから先を一時的な見開き先頭にする。
     ///
-    /// 戻り値 `(new_idx, new_mode)`。移動先が範囲外なら `None` (= 端で no-op)。
+    /// 戻り値 `(new_idx, anchor_idx)`。移動先が範囲外なら `None` (= 端で no-op)。
     /// 純粋ロジック (副作用なし) なのでユニットテスト可能。
     pub(crate) fn compute_spread_offset_nudge(
         &mut self,
         fs_idx: usize,
         dir: i32,
-    ) -> Option<(usize, crate::settings::SpreadMode)> {
-        use crate::settings::SpreadMode;
+    ) -> Option<(usize, usize)> {
         let nav = self.get_nav_indices();
-        let pos = nav.iter().position(|&i| i == fs_idx)?;
-        let new_pos = pos as i32 + dir;
-        if new_pos < 0 || new_pos as usize >= nav.len() {
-            return None;
-        }
-        let new_pos = new_pos as usize;
-        let new_idx = nav[new_pos];
-        // new_pos がペアの先頭 (pair_start = new_pos % 2) になるよう、現在の読み方向を保った
-        // まま cover/非cover を選ぶ (cover = pair_start 1 = 先頭ページ単独 + 1 ページずれ)。
-        let want_cover = new_pos % 2 == 1;
-        let new_mode = match (self.spread_mode.is_rtl(), want_cover) {
-            (false, false) => SpreadMode::Ltr,
-            (false, true) => SpreadMode::LtrCover,
-            (true, false) => SpreadMode::Rtl,
-            (true, true) => SpreadMode::RtlCover,
-        };
-        Some((new_idx, new_mode))
+        let units = build_spread_display_units(
+            &nav,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+            &self.fs_cache,
+            &self.thumbnails,
+        );
+        spread_offset_nudge_from_units(&nav, &units, fs_idx, dir)
     }
 
     pub(crate) fn fullscreen_cursor_state(&self) -> FullscreenCursorState {
@@ -5268,8 +5320,13 @@ impl App {
             return;
         };
         let nav = self.get_nav_indices();
-        let units =
-            build_spread_display_units(&nav, self.spread_mode, &self.fs_cache, &self.thumbnails);
+        let units = build_spread_display_units(
+            &nav,
+            self.spread_mode,
+            self.spread_shift_anchor_idx,
+            &self.fs_cache,
+            &self.thumbnails,
+        );
         if let Some((_, unit)) = find_spread_display_unit(&units, idx) {
             let new_idx = unit.anchor_idx();
             if new_idx == idx {
@@ -6511,21 +6568,15 @@ impl App {
         if nav_prev && !ctrl_u {
             action.nav_delta = self.spread_nav_delta(-1);
         }
-        // Ctrl+←/→: 見開きモードでは「1 ページずらし」(現在ページを軸に見開きを 1 ページ
-        // ぶんずらす)、Single モードでは 1 ページ移動。RTL は左右の意味を反転 (plain 矢印と同じ)。
+        // Ctrl+←/→: 見開きモードでは「1 ページずらし」(現在の表示ユニット先頭を
+        // 1 ページぶんずらす)、Single モードでは 1 ページ移動。RTL は左右の意味を反転 (plain 矢印と同じ)。
         let ctrl_nudge_next = (ctrl_right && !rtl) || (ctrl_left && rtl);
         let ctrl_nudge_prev = (ctrl_left && !rtl) || (ctrl_right && rtl);
         if ctrl_nudge_next || ctrl_nudge_prev {
             let dir = if ctrl_nudge_next { 1 } else { -1 };
             if self.spread_mode.is_spread() {
-                if let Some((new_idx, new_mode)) = self.compute_spread_offset_nudge(fs_idx, dir) {
-                    // 見開きモード (cover/非cover) を直接切り替えて 1 ページずらす。
-                    // フォルダ単位で永続化 (spread_db)。new_idx は新モードでペア先頭なので
-                    // normalize は no-op。
-                    self.spread_mode = new_mode;
-                    self.update_reading_direction_from_spread_mode(new_mode);
-                    self.persist_current_spread_mode();
-                    self.persist_current_reading_flow();
+                if let Some((new_idx, anchor_idx)) = self.compute_spread_offset_nudge(fs_idx, dir) {
+                    self.spread_shift_anchor_idx = Some(anchor_idx);
                     self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
                     action.jump_to = Some(new_idx);
                     self.show_feedback_toast("見開きを1ページずらしました".to_string());
@@ -8454,9 +8505,13 @@ impl App {
         mode: SpreadMode,
     ) {
         if mode == self.spread_mode {
+            if self.spread_shift_anchor_idx.take().is_some() {
+                self.normalize_spread_position(ctx);
+            }
             return;
         }
         self.spread_mode = mode;
+        self.spread_shift_anchor_idx = None;
         self.update_reading_direction_from_spread_mode(mode);
         self.spread_popup_open = false;
         self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
@@ -8485,6 +8540,7 @@ impl App {
             return;
         }
         self.reading_flow = flow;
+        self.spread_shift_anchor_idx = None;
         self.reset_continuous_reading_transform();
         self.set_default_fullscreen_fit_for_flow(ctx, fs_idx, flow);
         if !flow.is_paged() {
@@ -8510,6 +8566,7 @@ impl App {
             return false;
         }
         self.spread_mode = new_mode;
+        self.spread_shift_anchor_idx = None;
         self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
         true
     }
@@ -8584,6 +8641,7 @@ impl App {
                 build_spread_display_units(
                     &image_indices,
                     self.spread_mode,
+                    self.spread_shift_anchor_idx,
                     &self.fs_cache,
                     &self.thumbnails,
                 )
@@ -15618,6 +15676,89 @@ mod tests {
             (actual - expected).abs() < 0.01,
             "actual={actual}, expected={expected}"
         );
+    }
+
+    fn spread_unit_summary(units: &[SpreadDisplayUnit]) -> Vec<(usize, Vec<usize>)> {
+        units
+            .iter()
+            .map(|unit| (unit.nav_start, unit.pages.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn spread_display_units_repair_after_landscape_without_shift_anchor() {
+        let nav = [0, 1, 2, 3, 4, 5, 6, 7];
+
+        let cover_units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::LtrCover, None, |idx| {
+                idx == 3
+            });
+        assert_eq!(
+            spread_unit_summary(&cover_units),
+            vec![
+                (0, vec![0]),
+                (1, vec![1, 2]),
+                (3, vec![3]),
+                (4, vec![4, 5]),
+                (6, vec![6, 7])
+            ]
+        );
+    }
+
+    #[test]
+    fn spread_display_units_repair_from_shift_anchor_after_landscape() {
+        let nav = [0, 1, 2, 3, 4, 5, 6, 7];
+
+        let shifted_units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::LtrCover, Some(5), |idx| {
+                idx == 3
+            });
+        assert_eq!(
+            spread_unit_summary(&shifted_units),
+            vec![
+                (0, vec![0]),
+                (1, vec![1, 2]),
+                (3, vec![3]),
+                (4, vec![4]),
+                (5, vec![5, 6]),
+                (7, vec![7])
+            ]
+        );
+    }
+
+    #[test]
+    fn spread_offset_nudge_uses_visible_unit_start_from_right_page() {
+        let nav = [0, 1, 2, 3, 4, 5];
+        let units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::LtrCover, None, |_| false);
+
+        assert_eq!(
+            spread_offset_nudge_from_units(&nav, &units, 2, 1),
+            Some((2, 2))
+        );
+    }
+
+    #[test]
+    fn spread_offset_nudge_sets_anchor_after_landscape() {
+        let nav = [0, 1, 2, 3, 4, 5, 6, 7];
+        let units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::LtrCover, None, |idx| {
+                idx == 3
+            });
+
+        assert_eq!(
+            spread_offset_nudge_from_units(&nav, &units, 4, 1),
+            Some((5, 5))
+        );
+
+        let shifted_units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::LtrCover, Some(5), |idx| {
+                idx == 3
+            });
+        let (_, before_anchor_unit) = find_spread_display_unit(&shifted_units, 4).unwrap();
+        assert_eq!(before_anchor_unit.pages, vec![4]);
+        let (_, shifted_unit) = find_spread_display_unit(&shifted_units, 5).unwrap();
+        assert_eq!(shifted_unit.pages, vec![5, 6]);
     }
 
     #[test]

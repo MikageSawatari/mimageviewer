@@ -5484,11 +5484,11 @@ mod favorite_adjustment_defaults_tests {
         );
 
         // Ctrl+→ 1 回 → [1,2]
-        let (new_idx, new_mode) = app
+        let (new_idx, anchor_idx) = app
             .compute_spread_offset_nudge(0, 1)
             .expect("前方ずらしは範囲内");
         assert_eq!(new_idx, 1);
-        app.spread_mode = new_mode;
+        app.spread_shift_anchor_idx = Some(anchor_idx);
         app.fullscreen_idx = Some(new_idx);
         assert_eq!(
             app.resolve_spread_pair(new_idx),
@@ -5497,11 +5497,11 @@ mod favorite_adjustment_defaults_tests {
         );
 
         // もう 1 回 → [2,3]
-        let (new_idx, new_mode) = app
+        let (new_idx, anchor_idx) = app
             .compute_spread_offset_nudge(1, 1)
             .expect("前方ずらしは範囲内");
         assert_eq!(new_idx, 2);
-        app.spread_mode = new_mode;
+        app.spread_shift_anchor_idx = Some(anchor_idx);
         app.fullscreen_idx = Some(new_idx);
         assert_eq!(
             app.resolve_spread_pair(new_idx),
@@ -5532,11 +5532,11 @@ mod favorite_adjustment_defaults_tests {
             SpreadPair::Double { left: 1, right: 2 }
         );
 
-        let (new_idx, new_mode) = app
+        let (new_idx, anchor_idx) = app
             .compute_spread_offset_nudge(1, -1)
             .expect("後方ずらしは範囲内");
         assert_eq!(new_idx, 0);
-        app.spread_mode = new_mode;
+        app.spread_shift_anchor_idx = Some(anchor_idx);
         assert_eq!(
             app.resolve_spread_pair(new_idx),
             SpreadPair::Double { left: 0, right: 1 }
@@ -5567,11 +5567,11 @@ mod favorite_adjustment_defaults_tests {
             "RTL は 左=大 idx, 右=小 idx"
         );
 
-        let (new_idx, new_mode) = app
+        let (new_idx, anchor_idx) = app
             .compute_spread_offset_nudge(0, 1)
             .expect("ずらしは範囲内");
         assert_eq!(new_idx, 1);
-        app.spread_mode = new_mode;
+        app.spread_shift_anchor_idx = Some(anchor_idx);
         assert_eq!(
             app.resolve_spread_pair(1),
             SpreadPair::Double { left: 2, right: 1 },
@@ -5595,10 +5595,18 @@ mod favorite_adjustment_defaults_tests {
         app.visible_indices = vec![0, 1];
         app.cached_nav_indices = None;
         app.spread_mode = SpreadMode::Ltr;
-        app.fullscreen_idx = Some(1);
+        app.fullscreen_idx = Some(0);
+
+        let (new_idx, anchor_idx) = app
+            .compute_spread_offset_nudge(0, 1)
+            .expect("2ページ見開きから末尾単独表示へのずらしは有効");
+        assert_eq!(new_idx, 1);
+        app.spread_shift_anchor_idx = Some(anchor_idx);
+        app.fullscreen_idx = Some(new_idx);
+
         assert!(
             app.compute_spread_offset_nudge(1, 1).is_none(),
-            "末尾から前方ずらしは範囲外"
+            "末尾単独表示から前方ずらしは範囲外"
         );
         assert!(
             app.compute_spread_offset_nudge(0, -1).is_none(),

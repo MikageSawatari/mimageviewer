@@ -3609,11 +3609,9 @@ impl App {
             return;
         };
         if self.spread_mode.is_spread() {
-            if let Some((new_idx, new_mode)) = self.compute_spread_offset_nudge(fs_idx, nudge_dir) {
-                self.spread_mode = new_mode;
-                self.update_reading_direction_from_spread_mode(new_mode);
-                self.persist_current_spread_mode();
-                self.persist_current_reading_flow();
+            if let Some((new_idx, anchor_idx)) = self.compute_spread_offset_nudge(fs_idx, nudge_dir)
+            {
+                self.spread_shift_anchor_idx = Some(anchor_idx);
                 self.adjust_spread_target = AdjustSpreadTarget::Left;
                 self.bump_input_seq("gamepad_fs_nudge", Some(&format!("idx={new_idx}")));
                 self.handle_fs_navigation(
