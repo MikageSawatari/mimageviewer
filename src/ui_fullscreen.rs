@@ -3127,8 +3127,10 @@ impl App {
                 detached_activate_on_show,
                 need_show,
             )
-        } else {
+        } else if state.is_video {
             self.build_fullscreen_viewport_builder()
+        } else {
+            self.build_still_fullscreen_viewport_builder()
         };
         if need_show && !embedded {
             // 新規 viewport は hidden で作り、DWM transition 抑止属性を当ててから
@@ -3181,6 +3183,23 @@ impl App {
                             rect, inner_rect, maximized,
                         );
                         self.capture_detached_viewer_host_hwnd_from_logical_rect(
+                            rect,
+                            pixels_per_point,
+                        );
+                    }
+                }
+                #[cfg(windows)]
+                if !embedded && !detached && !fs_state_is_video {
+                    let (outer_rect, pixels_per_point, minimized) = ctx.input(|i| {
+                        let vp = i.viewport();
+                        (
+                            vp.outer_rect,
+                            i.pixels_per_point,
+                            vp.minimized.unwrap_or(false),
+                        )
+                    });
+                    if !minimized && let Some(rect) = outer_rect {
+                        self.sync_fullscreen_viewport_virtual_desktop_from_logical_rect(
                             rect,
                             pixels_per_point,
                         );
@@ -4911,7 +4930,11 @@ impl App {
     }
 
     fn build_fullscreen_viewport_builder(&self) -> egui::ViewportBuilder {
-        self.build_fullscreen_viewport_builder_with_transparency(true)
+        self.build_fullscreen_viewport_builder_with_transparency_and_taskbar(true, false)
+    }
+
+    fn build_still_fullscreen_viewport_builder(&self) -> egui::ViewportBuilder {
+        self.build_fullscreen_viewport_builder_with_transparency_and_taskbar(true, true)
     }
 
     fn build_detached_viewer_viewport_builder(
@@ -4931,17 +4954,27 @@ impl App {
             format!("{name} - mimageviewer")
         };
 
+        let borderless = self.detached_viewer_borderless_fullscreen;
+
         let mut builder = egui::ViewportBuilder::default()
             .with_title(title)
-            .with_decorations(true)
+            .with_decorations(!borderless)
             .with_transparent(false)
             .with_taskbar(true);
         if apply_placement {
-            let placement = self.detached_viewer_window_placement();
-            builder = builder
-                .with_inner_size([placement.w, placement.h])
-                .with_position(egui::pos2(placement.x, placement.y))
-                .with_maximized(placement.maximized);
+            if borderless {
+                let rect = self.detached_viewer_borderless_target_rect();
+                builder = builder
+                    .with_inner_size([rect.width(), rect.height()])
+                    .with_position(rect.min)
+                    .with_maximized(false);
+            } else {
+                let placement = self.detached_viewer_window_placement();
+                builder = builder
+                    .with_inner_size([placement.w, placement.h])
+                    .with_position(egui::pos2(placement.x, placement.y))
+                    .with_maximized(placement.maximized);
+            }
         }
         if let Some(active) = active {
             builder = builder.with_active(active);
@@ -4966,22 +4999,32 @@ impl App {
         &self,
         transparent: bool,
     ) -> egui::ViewportBuilder {
+        self.build_fullscreen_viewport_builder_with_transparency_and_taskbar(transparent, false)
+    }
+
+    fn build_fullscreen_viewport_builder_with_transparency_and_taskbar(
+        &self,
+        transparent: bool,
+        taskbar: bool,
+    ) -> egui::ViewportBuilder {
         let center = self.last_outer_rect.map(|r| r.center());
         let ppp = self.last_pixels_per_point;
 
         let monitor_rect =
             center.and_then(|c| crate::monitor::get_monitor_logical_rect_at(c.x * ppp, c.y * ppp));
 
-        let b = egui::ViewportBuilder::default()
+        let rect = monitor_rect.unwrap_or_else(|| {
+            self.last_outer_rect.unwrap_or_else(|| {
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 720.0))
+            })
+        });
+
+        egui::ViewportBuilder::default()
             .with_decorations(false)
             .with_transparent(transparent)
-            .with_taskbar(false);
-        match monitor_rect {
-            Some(rect) => b
-                .with_position(rect.min)
-                .with_inner_size([rect.width(), rect.height()]),
-            None => b.with_fullscreen(true),
-        }
+            .with_taskbar(taskbar)
+            .with_position(rect.min)
+            .with_inner_size([rect.width().max(1.0), rect.height().max(1.0)])
     }
 
     // ── 見開きペアリング ────────────────────────────────────────────────
@@ -5801,8 +5844,8 @@ impl App {
             }
         }
 
-        // F11: ウィンドウ表示 ⇔ 全画面表示 トグル (ホバーバー × の左の
-        // 「ウィンドウ / 全画面 切り替え」ボタンと同じ動作)。
+        // F11: 通常表示ではウィンドウ表示 ⇔ 全画面表示、F12 別ウィンドウでは
+        // 装飾なしの仮想フルスクリーンをトグルする。
         //
         // 消しゴムモード中は本関数冒頭の `if self.erase_mode { return ... }` で
         // 早期 return するため自動的に無効化される (ホバーバーのトグルボタン自体も
@@ -5844,8 +5887,7 @@ impl App {
                     found
                 });
                 if f11_pressed && self.viewer_session_is_detached() {
-                    self.show_feedback_toast("別ウィンドウ表示中は F11 を使用しません".to_string());
-                    ctx.request_repaint();
+                    self.toggle_detached_viewer_borderless_fullscreen(ctx);
                 } else if f11_pressed {
                     self.toggle_still_window_mode();
                     // 描画先 (embedded ⇔ 専用 viewport) の切替は次フレームの

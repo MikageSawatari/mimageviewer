@@ -13,17 +13,44 @@
 //!
 //! Windows 11 で効きが不安定という報告があるため、失敗は無視 (ベストエフォート)。
 
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, S_OK};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_COLOR_DEFAULT,
     DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
 };
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+};
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumThreadWindows, GetWindowRect, HWND_TOP, IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SetWindowPos,
 };
-use windows::core::BOOL;
+use windows::core::{BOOL, Result};
+
+struct ComInitScope {
+    needs_uninit: bool,
+}
+
+impl ComInitScope {
+    fn init_sta() -> Self {
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        Self {
+            needs_uninit: hr == S_OK,
+        }
+    }
+}
+
+impl Drop for ComInitScope {
+    fn drop(&mut self) {
+        if self.needs_uninit {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+}
 
 /// 自スレッドの全トップレベルウィンドウに対して DWM トランジションを無効化する。
 ///
@@ -73,6 +100,19 @@ pub fn raise_visible_thread_window_matching_rect(main_hwnd: HWND, expected: RECT
         } else {
             None
         }
+    }
+}
+
+pub fn move_window_to_desktop_of(owner_hwnd: HWND, target_hwnd: HWND) -> Result<()> {
+    if owner_hwnd.0.is_null() || target_hwnd.0.is_null() || owner_hwnd == target_hwnd {
+        return Ok(());
+    }
+    let _com = ComInitScope::init_sta();
+    unsafe {
+        let manager: IVirtualDesktopManager =
+            CoCreateInstance(&VirtualDesktopManager, None, CLSCTX_ALL)?;
+        let desktop_id = manager.GetWindowDesktopId(owner_hwnd)?;
+        manager.MoveWindowToDesktop(target_hwnd, &desktop_id)
     }
 }
 

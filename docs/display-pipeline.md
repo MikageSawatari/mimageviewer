@@ -246,13 +246,21 @@ detached viewer (F12) を使う。
 F11 の MainWindow / Fullscreen 選択は、F12 の detached ON/OFF とは独立した
 non-detached 側の表示設定として保持する。動画の native presenter から
 `DetachedWindow` への `PlacementSwitched` が返っても `settings.video_in_window_mode`
-は更新せず、F12 を OFF にしたときは直前の F11 状態へ戻る。静止画の fullscreen
-viewport と detached viewport は装飾・サイズ・taskbar 表示が異なるため、表示形態が
+は更新せず、F12 を OFF にしたときは直前の F11 状態へ戻る。静止画 detached 中の
+F11 は non-detached 設定を更新せず、通常配置を保持したまま装飾なし・モニター全体の
+仮想フルスクリーンをトグルする。動画 detached 中の F11 は無効のままにする。
+静止画の fullscreen viewport と detached viewport は装飾・サイズ・taskbar 表示が異なるため、表示形態が
 変わるときは既存 viewport を隠して ViewportId 世代を進め、新しい表示先として作り直す。
 静止画 / PDF / ZIP 画像の fullscreen viewport と detached viewport はどちらも hidden
 状態で作成し、`DWMWA_TRANSITIONS_FORCEDISABLED` を適用してから `Visible(true)` を送る。
 これにより OBS などの window capture には映らない DWM の表示フェード / 出現アニメーションを
 抑止する。
+
+静止画 fullscreen viewport は true fullscreen API へフォールバックせず、対象モニターの
+論理矩形へ装飾なし viewport を配置する。Windows 11 仮想デスクトップで静止画 fullscreen
+viewport が現在デスクトップへ付いてくる症状を避けるため、捕捉できた fullscreen viewport
+HWND は main HWND と同じ仮想デスクトップへ best-effort で同期する。動画 fullscreen は
+native presenter 経路であり、この egui viewport 同期の対象外。
 
 複数 viewport を閉じる / 作り直す直後は、egui の shared texture namespace と viewport ごとの
 renderer 側 font atlas texture のサイズが一時的にずれることがある。実機では、日本語フォルダ名の

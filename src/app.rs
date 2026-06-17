@@ -3524,6 +3524,11 @@ pub struct App {
     /// 新しい ViewportId で作り直す。
     #[cfg(windows)]
     pub(crate) fs_viewport_presentation: Option<ViewerPresentation>,
+    /// 通常フルスクリーン viewport をメインウィンドウと同じ仮想デスクトップへ
+    /// 関連付けた HWND。Windows 11 の仮想デスクトップ切替時に fullscreen 窓が
+    /// 現在デスクトップへ付いてくる症状を抑えるため、捕捉できた window にだけ適用する。
+    #[cfg(windows)]
+    pub(crate) fs_viewport_virtual_desktop_synced_hwnd: u64,
     /// egui detached viewer viewport の top-level HWND。
     ///
     /// 動画は別 top-level window を作らず、この HWND の子ウィンドウとして重ねる。
@@ -3531,6 +3536,13 @@ pub struct App {
     /// UI スレッド上の window を列挙して捕捉する。
     #[cfg(windows)]
     pub(crate) detached_viewer_host_hwnd: u64,
+    /// F12 別ウィンドウを F11 で装飾なしの仮想フルスクリーンにしているか。
+    #[cfg(windows)]
+    pub(crate) detached_viewer_borderless_fullscreen: bool,
+    /// 仮想フルスクリーンを解除したときに戻す通常ウィンドウ配置。
+    #[cfg(windows)]
+    pub(crate) detached_viewer_restore_placement:
+        Option<crate::settings::DetachedViewerWindowPlacement>,
     /// F12 で動画を detached へ切り替えるとき、先に egui 側の detached viewer
     /// viewport を作り、その HWND が捕捉できてから native presenter を子 HWND へ
     /// 移行するための待機状態。
@@ -5493,7 +5505,13 @@ impl App {
             #[cfg(windows)]
             fs_viewport_presentation: None,
             #[cfg(windows)]
+            fs_viewport_virtual_desktop_synced_hwnd: 0,
+            #[cfg(windows)]
             detached_viewer_host_hwnd: 0,
+            #[cfg(windows)]
+            detached_viewer_borderless_fullscreen: false,
+            #[cfg(windows)]
+            detached_viewer_restore_placement: None,
             #[cfg(windows)]
             pending_detached_video_host_switch: None,
             #[cfg(windows)]
@@ -19336,6 +19354,7 @@ impl App {
         ));
         self.fs_viewport_shown = false;
         self.fs_viewport_presentation = None;
+        self.fs_viewport_virtual_desktop_synced_hwnd = 0;
         self.clear_detached_viewer_host_hwnd();
         self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
         self.fs_viewport_recreate_after_hide = false;
@@ -19399,6 +19418,47 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn sync_fullscreen_viewport_virtual_desktop_from_logical_rect(
+        &mut self,
+        outer_rect: egui::Rect,
+        pixels_per_point: f32,
+    ) {
+        use windows::Win32::Foundation::{HWND, RECT};
+
+        let Some(main_hwnd) = self.main_hwnd else {
+            return;
+        };
+        let scale = pixels_per_point.max(0.5);
+        let expected = RECT {
+            left: (outer_rect.min.x * scale).round() as i32,
+            top: (outer_rect.min.y * scale).round() as i32,
+            right: (outer_rect.max.x * scale).round() as i32,
+            bottom: (outer_rect.max.y * scale).round() as i32,
+        };
+        let Some(hwnd) = crate::dwm_transitions::find_visible_thread_window_matching_rect(
+            HWND(main_hwnd as *mut _),
+            expected,
+        ) else {
+            return;
+        };
+        let hwnd_raw = hwnd.0 as usize as u64;
+        if hwnd_raw == 0 || hwnd_raw == self.fs_viewport_virtual_desktop_synced_hwnd {
+            return;
+        }
+        let owner = HWND(main_hwnd as *mut _);
+        if let Err(err) = crate::dwm_transitions::move_window_to_desktop_of(owner, hwnd) {
+            crate::logger::log(format!(
+                "[fullscreen] virtual desktop sync failed hwnd=0x{hwnd_raw:x}: {err:?}"
+            ));
+        } else {
+            crate::logger::log(format!(
+                "[fullscreen] virtual desktop synced hwnd=0x{hwnd_raw:x}"
+            ));
+        }
+        self.fs_viewport_virtual_desktop_synced_hwnd = hwnd_raw;
+    }
+
+    #[cfg(windows)]
     pub(crate) fn native_video_target_for_presentation(
         &self,
         presentation: ViewerPresentation,
@@ -19447,6 +19507,88 @@ impl App {
             .detached_viewer_window_placement
             .filter(|p| p.is_sane() && crate::monitor::title_bar_on_some_monitor(p.x, p.y, p.w))
             .unwrap_or_else(|| self.default_detached_viewer_window_placement())
+    }
+
+    #[cfg(windows)]
+    fn detached_viewer_monitor_rect_logical(&self) -> Option<egui::Rect> {
+        use windows::Win32::Foundation::{HWND, RECT};
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+        if let Some(hwnd_raw) = self.detached_viewer_host_hwnd_alive() {
+            let mut rect = RECT::default();
+            if unsafe { GetWindowRect(HWND(hwnd_raw as *mut _), &mut rect) }.is_ok() {
+                let x = (rect.left + rect.right) as f32 * 0.5;
+                let y = (rect.top + rect.bottom) as f32 * 0.5;
+                if let Some(monitor_rect) = crate::monitor::get_monitor_logical_rect_at(x, y) {
+                    return Some(monitor_rect);
+                }
+            }
+        }
+
+        let placement = self.detached_viewer_window_placement();
+        let scale = self.last_pixels_per_point.max(0.5);
+        let x = (placement.x + placement.w * 0.5) * scale;
+        let y = (placement.y + placement.h * 0.5) * scale;
+        crate::monitor::get_monitor_logical_rect_at(x, y)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_viewer_borderless_target_rect(&self) -> egui::Rect {
+        self.detached_viewer_monitor_rect_logical()
+            .unwrap_or_else(|| {
+                let placement = self.detached_viewer_window_placement();
+                egui::Rect::from_min_size(
+                    egui::pos2(placement.x, placement.y),
+                    egui::vec2(placement.w, placement.h),
+                )
+            })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn clear_detached_viewer_borderless_fullscreen_state(&mut self) {
+        self.detached_viewer_borderless_fullscreen = false;
+        self.detached_viewer_restore_placement = None;
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn toggle_detached_viewer_borderless_fullscreen(&mut self, ctx: &egui::Context) {
+        if !self.viewer_session_is_detached() {
+            return;
+        }
+        let viewport_id = self.fullscreen_viewport_id();
+        if self.detached_viewer_borderless_fullscreen {
+            let placement = self
+                .detached_viewer_restore_placement
+                .take()
+                .unwrap_or_else(|| self.detached_viewer_window_placement());
+            self.detached_viewer_borderless_fullscreen = false;
+            self.settings.detached_viewer_window_placement = Some(placement);
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(false));
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Decorations(true));
+            ctx.send_viewport_cmd_to(
+                viewport_id,
+                egui::ViewportCommand::OuterPosition(egui::pos2(placement.x, placement.y)),
+            );
+            ctx.send_viewport_cmd_to(
+                viewport_id,
+                egui::ViewportCommand::InnerSize(egui::vec2(placement.w, placement.h)),
+            );
+            if placement.maximized {
+                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(true));
+            }
+            self.show_feedback_toast("別ウィンドウを通常表示に戻しました".to_string());
+        } else {
+            self.detached_viewer_restore_placement = Some(self.detached_viewer_window_placement());
+            let rect = self.detached_viewer_borderless_target_rect();
+            self.detached_viewer_borderless_fullscreen = true;
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Maximized(false));
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Decorations(false));
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::OuterPosition(rect.min));
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::InnerSize(rect.size()));
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+            self.show_feedback_toast("別ウィンドウを仮想フルスクリーンにしました".to_string());
+        }
+        ctx.request_repaint();
     }
 
     #[cfg(windows)]
@@ -19514,6 +19656,9 @@ impl App {
         inner_rect: Option<egui::Rect>,
         maximized: bool,
     ) {
+        if self.detached_viewer_borderless_fullscreen {
+            return;
+        }
         if maximized {
             let mut placement = self.detached_viewer_window_placement();
             placement.maximized = true;
@@ -19558,6 +19703,9 @@ impl App {
         h: u32,
         maximized: bool,
     ) {
+        if self.detached_viewer_borderless_fullscreen {
+            return;
+        }
         if maximized {
             let mut placement = self.detached_viewer_window_placement();
             placement.maximized = true;
@@ -24876,6 +25024,8 @@ impl App {
     fn prepare_viewer_presentation_close(&mut self) {
         self.viewer_presentation = self.non_detached_viewer_presentation();
         self.last_viewer_sync_stamp = None;
+        self.fs_viewport_virtual_desktop_synced_hwnd = 0;
+        self.clear_detached_viewer_borderless_fullscreen_state();
         self.vst3_deferred_video_open = None;
         self.native_video_front_synced_hwnd = 0;
         self.native_video_front_last_raise = None;
@@ -24937,11 +25087,16 @@ impl App {
             if preserve_detached_viewport {
                 let fs_viewport_presentation = self.fs_viewport_presentation;
                 let detached_viewer_host_hwnd = self.detached_viewer_host_hwnd;
+                let detached_viewer_borderless_fullscreen =
+                    self.detached_viewer_borderless_fullscreen;
+                let detached_viewer_restore_placement = self.detached_viewer_restore_placement;
                 let fs_viewport_generation = self.fs_viewport_generation;
                 self.close_fullscreen();
                 self.fs_viewport_shown = true;
                 self.fs_viewport_presentation = fs_viewport_presentation;
                 self.detached_viewer_host_hwnd = detached_viewer_host_hwnd;
+                self.detached_viewer_borderless_fullscreen = detached_viewer_borderless_fullscreen;
+                self.detached_viewer_restore_placement = detached_viewer_restore_placement;
                 self.fs_viewport_generation = fs_viewport_generation;
                 self.fs_viewport_recreate_after_hide = false;
                 self.clear_pending_main_foreground_reclaim();
@@ -30817,6 +30972,7 @@ impl App {
         {
             if !self.settings.detached_viewer_enabled {
                 self.pending_detached_video_host_switch = None;
+                self.clear_detached_viewer_borderless_fullscreen_state();
             }
             if let Some(idx) = self.fullscreen_idx {
                 let target_presentation = if self.settings.detached_viewer_enabled
@@ -30827,6 +30983,9 @@ impl App {
                     self.non_detached_viewer_presentation()
                 };
                 if target_presentation != self.viewer_presentation {
+                    if !matches!(target_presentation, ViewerPresentation::DetachedWindow) {
+                        self.clear_detached_viewer_borderless_fullscreen_state();
+                    }
                     if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
                         self.switch_native_video_viewer_presentation(target_presentation, true);
                     } else if self.viewer_item_supports_detached_still(idx) {

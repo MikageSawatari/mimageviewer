@@ -8,7 +8,7 @@ v1.4.0 後に着手する「画像・動画をメイン一覧とは別ウィン�
 - 画像・動画を同じ操作モデルで別ウィンドウ表示できるようにする。
 - 別ウィンドウが開いている間は、メイン一覧のカーソルとビューアの表示対象を常に同期する。
 - 動画だけ従来挙動になる状態は避ける。動画も初回リリース範囲に含める。
-- 別ウィンドウからのフルスクリーン化は初期仕様に含めない。
+- 静止画の別ウィンドウは `F11` で装飾なし・モニター全体表示の仮想フルスクリーンへ切り替えられる。動画の別ウィンドウでは F11 を無効のままにする。
 - 複数の独立ビューアウィンドウは対象外。常に 1 セッション、1 表示対象。
 
 ## 2. ユーザー向け仕様
@@ -19,7 +19,7 @@ v1.4.0 後に着手する「画像・動画をメイン一覧とは別ウィン�
 - 別ウィンドウモード ON 中に画像・動画を開くと、別ウィンドウで表示する。
 - 別ウィンドウモード OFF 中は、従来の同一ウィンドウ / フルスクリーン系の表示を使う。
 - 再生中・表示中に `F12` を押した場合は、可能な限り再生位置・再生状態・現在ページを維持したまま表示先だけ切り替える。
-- 別ウィンドウモード中の `F11` は無効にする。必要なら短い通知だけ出し、フルスクリーン化はしない。
+- 静止画の別ウィンドウモード中に `F11` を押すと、真の fullscreen API ではなく、通常の別ウィンドウ配置を保持したまま装飾なしで対象モニター全体を覆う仮想フルスクリーンをトグルする。動画の別ウィンドウモード中の `F11` は無効にする。
 
 ### 2.2 セッション開始と終了
 
@@ -169,11 +169,11 @@ detached ではこれらが逆効果になるため、detached viewport を配�
 
 - 静止画・ZIP画像・PDFページは既存の `ui_fullscreen.rs::render_fullscreen_viewport` の描画本体を再利用する。
 - `ViewerPresentation::DetachedWindow` 用に、装飾付き・taskbar 表示あり・通常ウィンドウサイズの `ViewportBuilder` を追加する。
-- 既存の fullscreen viewport builder は borderless / taskbar false のまま維持する。
+- 静止画 fullscreen viewport は true fullscreen へフォールバックせず、対象モニター矩形に装飾なし viewport を配置する。Windows 11 仮想デスクトップで viewport が現在デスクトップへ付いてくる症状を避けるため、捕捉できた fullscreen viewport HWND を main HWND と同じ仮想デスクトップへ明示同期する。
 - `SyncFromMainSelection` / `HostSwap` で新規 detached viewport を作る場合は、`ViewportBuilder::with_active(false)` 相当を使い、作成そのものでフォーカスを奪わない。
 - detached viewport の close request は `close_viewer_session("detached-close")` に接続する。
 - `Esc` / `Enter` / 右クリックも `close_viewer_session` に接続する。
-- detached 中は F11 を処理しない。
+- 静止画 detached 中の F11 は、通常配置を保存したまま仮想フルスクリーンをトグルする。仮想フルスクリーン中は fullscreen 相当の矩形を通常ウィンドウ配置として保存しない。動画 detached 中の F11 は処理しない。
 
 ### 4.4 動画 detached host
 
@@ -210,7 +210,7 @@ enum NativeVideoPlacement {
   - main HWND は cloak しない。
   - fullscreen backdrop は出さない。
   - `SyncFromMainSelection` / `HostSwap` で作成・差し替えする場合は `ShowWindow(SW_SHOWNOACTIVATE)` 相当を使い、foreground reclaim / raise を行わない。
-  - F11 は無効。
+  - 動画 detached 中の F11 は無効。
   - `Esc` / `Enter` / 右クリック / `×` は session close。
   - 位置・サイズ保存は egui detached viewport の `outer_rect` / `inner_rect` を正本にする。native child の `GeometryChanged` は client 座標なので保存に使わない。
   - HUD overlay は topmost fullscreen 前提を避ける。detached は in-window と同じく fullscreen 用 HUD overlay HWND を使わず、presenter DComp tree 側の overlay 経路を使う。
@@ -287,7 +287,7 @@ enum NativeVideoPlacement {
 - detached 動画で `Enter` を session close にする場合、Enter (`0x0D`) も native presenter から App へ届く必要がある。static whitelist へ追加するか、detached placement の native wndproc 側で close event として扱う。
 - 既存の F11 は以下の扱いにする。
   - `MainWindow` / `Fullscreen`: 既存の静止画 in-window ↔ fullscreen 切替を `ViewerPresentation::{MainWindow, Fullscreen}` の遷移として扱う。
-  - `DetachedWindow`: 無効。動画 native presenter 側でも無効。
+  - `DetachedWindow`: 静止画は仮想フルスクリーンをトグルし、動画 native presenter 側では無効。
 - F11 の `MainWindow` / `Fullscreen` 選択は F12 detached ON/OFF から独立した non-detached 側の状態として保持する。`DetachedWindow` への切替完了イベントでは `settings.video_in_window_mode` を保存せず、F12 OFF 時は直前の F11 状態へ戻す。
 - detached session を `×` / `Esc` / `Enter` / 右クリックで閉じても `detached_viewer_enabled` は維持する。次に開く操作をした場合は再び `DetachedWindow` で開く。
 - non-detached の `Fullscreen` での `Esc` は既存どおり一覧へ戻る挙動を維持する。detached だけは `Esc` を session close として扱う。
@@ -318,7 +318,7 @@ enum NativeVideoPlacement {
   - 「アプリケーションウィンドウは 1 つ」の記述を更新する。
   - F12 / detached mode / close-to-tray 時の再生継続を追加する。
 - `docs/keymap-spec.md`
-  - F12 と detached 中 F11 無効を追加する。
+  - F12 と、静止画 detached 中 F11 仮想フルスクリーン / 動画 detached 中 F11 無効を追加する。
 - `docs/display-pipeline.md`
   - `ViewerPresentation` と detached viewport を追加する。
 - `docs/video-architecture.md`
@@ -348,7 +348,7 @@ enum NativeVideoPlacement {
 - keymap の `ALL_ACTIONS`、ini 名、default chord、trigger、ini round-trip / default generation テストを更新する。
 - native presenter の static VK whitelist に F12 を追加し、App 側 native-video key handler に F12 dispatch branch を追加する。
 - F12 で設定だけ切り替わる状態を先に作る。
-- F11 の detached 無効化ガードを追加する。
+- F11 は静止画 detached では仮想フルスクリーンをトグルし、動画 detached では無効化する。
 
 進捗メモ:
 
@@ -374,7 +374,7 @@ enum NativeVideoPlacement {
 - `close_fullscreen` の native 動画 fullscreen close cleanup / foreground reclaim 予約は `prepare_viewer_presentation_close` へ切り出し済み。
 - 静止画 / ZIP画像 / PDFページの detached viewport は実装済み。既存の `render_fullscreen_viewport` 描画本体を、装飾付き・taskbar 表示あり・通常サイズの viewport に出す。
 - detached 静止画 session 中はメインウィンドウをブロックしない。メイン root に届いたキーは fullscreen root handler が横取りせず、グリッド側へ流す。
-- detached 静止画の `×` / `Esc` / `Enter` / 右クリックは `close_fullscreen()` に寄せ、`detached_viewer_enabled` は維持する。detached 中の F11 は no-op にし、ホバーバーの window/fullscreen トグルは非表示にする。
+- detached 静止画の `×` / `Esc` / `Enter` / 右クリックは `close_fullscreen()` に寄せ、`detached_viewer_enabled` は維持する。detached 静止画の F11 は仮想フルスクリーンをトグルし、ホバーバーの window/fullscreen トグルは非表示にする。
 - detached session が開いている間、`App::update` 終端で最終 `selected` を見て、静止画 / ZIP画像 / PDFページ / 動画なら viewer を追従させる。同期済み判定は `ViewerSyncStamp { idx, item_key, items_generation }` で行い、bare idx のみでは判定しない。
 - detached session が閉じている場合は、メイン一覧のカーソル移動だけでは再表示しない。
 - detached session が同じ `ViewerSyncStamp` の項目を既に表示中の場合、メイン一覧の `Enter` は `open_fullscreen` を再実行せず、静止画 detached viewport / 動画 native presenter の前面化要求だけを行う。
@@ -397,7 +397,7 @@ enum NativeVideoPlacement {
 進捗メモ:
 
 - `NativeVideoPlacement::DetachedViewerChild`、`SwitchPlacement` / `PlacementSwitched` / `PlacementSwitchFailed` を追加済み。
-- detached 動画は egui detached viewport の child HWND として作成し、F11 は detached 中 no-op、F12 は再生を維持した host migration として扱う。
+- detached 動画は egui detached viewport の child HWND として作成し、F11 は detached 動画中 no-op、F12 は再生を維持した host migration として扱う。
 - detached viewer window の `WM_CLOSE` は egui viewport close request として App へ届き、`close_fullscreen()` で session 終了・動画停止に寄せる。detached 動画の Esc / Enter も同じ close 経路に入る。
 - detached 動画では fullscreen 専用 HUD overlay HWND / fullscreen backdrop / VST owner 同期を使わず、通常 presenter HWND 側の overlay path を使う。
 - 残りは Windows 実機での複数ディスプレイ / DPI 差 / close-to-tray / 動画連続再生の確認。
@@ -429,7 +429,7 @@ enum NativeVideoPlacement {
 - detached viewer window の `×` / `Alt+F4` / taskbar close が App 側 `close_viewer_session` へ届き、stale `fullscreen_idx` / stale presenter HWND が残らない。
 - `×` 後も detached mode は維持され、次の open で window が再表示される。
 - 動画再生中に F12 を押しても再生位置・再生状態が維持される。
-- detached 中の F11 が何もしない。
+- detached 静止画中の F11 で仮想フルスクリーンへ入り、再度 F11 で通常配置へ戻る。detached 動画中の F11 は何もしない。
 - スライドショー / 動画連続再生で viewer が進むとメイン一覧カーソルも進む。
 - メインを最小化しても detached 動画再生が続く。
 - plain minimize と close-to-tray を区別して検証する。
@@ -466,7 +466,7 @@ enum NativeVideoPlacement {
 - P2: `viewer_session_visible` は `fullscreen_idx.is_some()` と一致する不変条件にし、独立状態として drift させない。
 - P2: detached geometry は最大化 rect と restore rect を分け、Win32 `WINDOWPLACEMENT` 相当で保存・復元する。
 - P2: detached viewer host / native video child はアプリ終了時に明示 destroy / presenter thread join が必要。
-- P2: 既存の静止画 F11 は `ViewerPresentation::{MainWindow, Fullscreen}` の遷移として扱い、detached では F11 を無効にする。
+- P2: 既存の静止画 F11 は `ViewerPresentation::{MainWindow, Fullscreen}` の遷移として扱い、detached 静止画では non-detached 設定を変えず仮想フルスクリーンだけをトグルする。
 
 更新後に再レビューする場合の依頼文:
 
